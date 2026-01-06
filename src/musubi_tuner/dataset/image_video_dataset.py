@@ -71,6 +71,8 @@ ARCHITECTURE_HUNYUAN_VIDEO = "hv"
 ARCHITECTURE_HUNYUAN_VIDEO_FULL = "hunyuan_video"
 ARCHITECTURE_WAN = "wan"
 ARCHITECTURE_WAN_FULL = "wan"
+ARCHITECTURE_LTXV2 = "ltxv2"
+ARCHITECTURE_LTXV2_FULL = "ltxv2_v1"
 ARCHITECTURE_FRAMEPACK = "fp"
 ARCHITECTURE_FRAMEPACK_FULL = "framepack"
 ARCHITECTURE_FLUX_KONTEXT = "fk"
@@ -238,6 +240,16 @@ def save_latent_cache_wan(
         sd[f"f_indices_{dtype_str}"] = torch.tensor(f_indices, dtype=torch.int32)
 
     save_latent_cache_common(item_info, sd, ARCHITECTURE_WAN_FULL)
+
+
+def save_latent_cache_ltxv2(item_info: ItemInfo, latent: torch.Tensor):
+    assert latent.dim() == 4, "latent should be 4D tensor (channel, frame, height, width)"
+
+    _, F, H, W = latent.shape
+    dtype_str = dtype_to_str(latent.dtype)
+    sd = {f"latents_{F}x{H}x{W}_{dtype_str}": latent.detach().cpu().contiguous()}
+
+    save_latent_cache_common(item_info, sd, ARCHITECTURE_LTXV2_FULL)
 
 
 def save_latent_cache_framepack(
@@ -435,6 +447,21 @@ def save_text_encoder_output_cache_wan(item_info: ItemInfo, embed: torch.Tensor)
     save_text_encoder_output_cache_common(item_info, sd, ARCHITECTURE_WAN_FULL)
 
 
+def save_text_encoder_output_cache_ltxv2(item_info: ItemInfo, embed: torch.Tensor, mask: torch.Tensor):
+    assert embed.dim() == 1 or embed.dim() == 2, (
+        f"embed should be 2D tensor (feature, hidden_size) or (hidden_size,), got {embed.shape}"
+    )
+    assert mask is None or mask.dim() == 1, f"mask should be 1D tensor (feature), got {mask.shape}"
+
+    sd = {}
+    dtype_str = dtype_to_str(embed.dtype)
+    sd[f"text_{dtype_str}"] = embed.detach().cpu()
+    if mask is not None:
+        sd["text_mask"] = mask.detach().cpu()
+
+    save_text_encoder_output_cache_common(item_info, sd, ARCHITECTURE_LTXV2_FULL)
+
+
 def save_text_encoder_output_cache_framepack(
     item_info: ItemInfo, llama_vec: torch.Tensor, llama_attention_mask: torch.Tensor, clip_l_pooler: torch.Tensor
 ):
@@ -553,6 +580,7 @@ class BucketSelector:
     ARCHITECTURE_STEPS_MAP = {
         ARCHITECTURE_HUNYUAN_VIDEO: RESOLUTION_STEPS_HUNYUAN,
         ARCHITECTURE_WAN: RESOLUTION_STEPS_WAN,
+        ARCHITECTURE_LTXV2: RESOLUTION_STEPS_WAN,
         ARCHITECTURE_FRAMEPACK: RESOLUTION_STEPS_FRAMEPACK,
         ARCHITECTURE_FLUX_KONTEXT: RESOLUTION_STEPS_FLUX_KONTEXT,
         ARCHITECTURE_QWEN_IMAGE: RESOLUTION_STEPS_QWEN_IMAGE,
@@ -861,6 +889,10 @@ class BucketBatchManager:
         varlen_keys = set()
         for item_info in bucket[start:end]:
             sd_latent = load_file(item_info.latent_cache_path)
+            audio_latent_cache_path = getattr(item_info, "audio_latent_cache_path", None)
+            if audio_latent_cache_path is not None and os.path.exists(audio_latent_cache_path):
+                sd_audio = load_file(audio_latent_cache_path)
+                sd_latent = {**sd_latent, **sd_audio}
             sd_te = load_file(item_info.text_encoder_output_cache_path)
             sd = {**sd_latent, **sd_te}
 
@@ -876,7 +908,7 @@ class BucketBatchManager:
                     pass
                 else:
                     content_key = content_key.rsplit("_", 1)[0]  # remove dtype
-                    if content_key.startswith("latents_"):
+                    if content_key.startswith("latents_") or content_key.startswith("audio_latents_"):
                         content_key = content_key.rsplit("_", 1)[0]  # remove FxHxW
 
                 if content_key not in batch_tensor_data:
@@ -1858,6 +1890,8 @@ class ImageDataset(BaseDataset):
                 logger.warning(f"Text encoder output cache file not found: {text_encoder_output_cache_file}")
                 continue
 
+            audio_latent_cache_file = os.path.join(self.cache_directory, f"{item_key}_{self.architecture}_audio.safetensors")
+
             bucket_reso = bucket_selector.get_bucket_resolution(image_size)
 
             if self.architecture == ARCHITECTURE_FRAMEPACK or self.architecture == ARCHITECTURE_WAN:
@@ -1880,6 +1914,7 @@ class ImageDataset(BaseDataset):
 
             item_info = ItemInfo(item_key, "", image_size, bucket_reso, latent_cache_path=cache_file)
             item_info.text_encoder_output_cache_path = text_encoder_output_cache_file
+            item_info.audio_latent_cache_path = audio_latent_cache_file if os.path.exists(audio_latent_cache_file) else None
 
             bucket = bucketed_item_info.get(bucket_reso, [])
             for _ in range(self.num_repeats):
