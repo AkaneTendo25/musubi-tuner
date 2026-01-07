@@ -308,9 +308,10 @@ def main() -> None:
 
     cache_latents.encode_datasets(list(datasets), encode_fn, args)
 
-    if getattr(args, "ltx2_audio_video", False):
+    audio_video = getattr(args, "ltx_mode", "video") == "av" or getattr(args, "ltx2_audio_video", False)
+    if audio_video:
         if getattr(args, "ltx2_checkpoint", None) is None:
-            raise ValueError("--ltx2_checkpoint is required when --ltx2_audio_video is set")
+            raise ValueError("--ltx2_checkpoint is required when --ltx_mode av is used")
 
         audio_dtype = torch.float16 if args.ltx2_audio_dtype is None else str_to_dtype(args.ltx2_audio_dtype)
         from musubi_tuner.ltx_2.loader.single_gpu_model_builder import SingleGPUModelBuilder
@@ -369,6 +370,13 @@ def main() -> None:
 
 
 def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
+    parser.add_argument(
+        "--ltx_mode",
+        type=str,
+        default="video",
+        choices=["video", "av", "audio"],
+        help="Caching modality. Use 'av' to also cache audio latents.",
+    )
     parser.add_argument(
         "--ltx2_audio_video",
         action="store_true",

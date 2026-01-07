@@ -272,9 +272,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
 
         args.dit_dtype = model_utils.dtype_to_str(self.dit_dtype)
 
-        ltx_mode = getattr(args, "ltx_mode", None)
-        if ltx_mode is None:
-            ltx_mode = "av" if getattr(args, "ltx2_audio_video", False) else "video"
+        ltx_mode = getattr(args, "ltx_mode", "video")
         if ltx_mode not in {"video", "av", "audio"}:
             raise ValueError(f"Invalid ltx_mode: {ltx_mode}")
         self._ltx_mode = ltx_mode
@@ -348,7 +346,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
         return transformer
 
     def load_vae(self, args: argparse.Namespace, vae_dtype: torch.dtype, vae_path: str):
-        """Load VAE for LTX2 (compatible with WAN VAE)"""
+        """Load VAE for LTX2"""
         logger.info(f"Loading VAE from {vae_path}")
         from musubi_tuner.ltx_2.loader.single_gpu_model_builder import SingleGPUModelBuilder
         from musubi_tuner.ltx_2.model.video_vae import VideoDecoderConfigurator, VAE_DECODER_COMFY_KEYS_FILTER
@@ -618,11 +616,9 @@ class LTX2NetworkTrainer(NetworkTrainer):
 
         video_conditioning_enabled = None
         if first_frame_p > 0.0:
-            video_conditioning_enabled = (torch.rand((latents.shape[0],), device=accelerator.device) < first_frame_p).to(
-                dtype=torch.bool
-            )
-            if not bool(video_conditioning_enabled.any()):
-                video_conditioning_enabled = None
+            enable_conditioning = bool(torch.rand((), device=accelerator.device) < first_frame_p)
+            if enable_conditioning:
+                video_conditioning_enabled = torch.ones((latents.shape[0],), device=accelerator.device, dtype=torch.bool)
 
         model_noisy_video = noisy_model_input
         if video_conditioning_enabled is not None and model_noisy_video.shape[2] > 0:
@@ -747,7 +743,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
             if audio_latents is None:
                 raise ValueError(
                     "LTXAV training requires audio latents in batch['audio_latents']. "
-                    "Run the LTX-2 latents caching script with --ltx2_audio_video and ensure *_ltx2_audio.safetensors exist."
+                    "Run the LTX-2 latents caching script with --ltx_mode av and ensure *_ltx2_audio.safetensors exist."
                 )
             if not isinstance(audio_latents, torch.Tensor):
                 raise TypeError(f"Expected audio_latents to be a torch.Tensor, got: {type(audio_latents)}")
@@ -940,12 +936,6 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 param["negative_prompt_attention_mask"] = neg_mask
             sample_parameters.append(param)
 
-        # Reference trainer behavior: load Gemma to precompute embeddings, then unload it to free VRAM.
-        # Musubi training uses cached embeddings, so we don't need to keep Gemma resident after this.
-        self._text_encoder = None
-        if accelerator.device.type == "cuda":
-            torch.cuda.empty_cache()
-
         return sample_parameters
 
     def do_inference(
@@ -1095,14 +1085,9 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
     parser.add_argument(
         "--ltx_mode",
         type=str,
-        default=None,
+        default="video",
         choices=["video", "av", "audio"],
-        help="Training modality. If not set, derives from --ltx2_audio_video.",
-    )
-    parser.add_argument(
-        "--ltx2_audio_video",
-        action="store_true",
-        help="Use LTXAV model for audio-video generation",
+        help="Training modality.",
     )
     parser.add_argument(
         "--video_loss_weight",

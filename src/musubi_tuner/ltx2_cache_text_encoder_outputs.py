@@ -70,6 +70,8 @@ def main() -> None:
     parser = ltx2_setup_parser(parser)
     args = parser.parse_args()
 
+    audio_video = getattr(args, "ltx_mode", "video") == "av" or getattr(args, "ltx2_audio_video", False)
+
     device = torch.device(args.device if args.device is not None else ("cuda" if torch.cuda.is_available() else "cpu"))
 
     blueprint_generator = BlueprintGenerator(ConfigSanitizer())
@@ -112,8 +114,8 @@ def main() -> None:
         else args.ltx2_checkpoint
     )
 
-    configurator = AVGemmaTextEncoderModelConfigurator if args.ltx2_audio_video else VideoGemmaTextEncoderModelConfigurator
-    key_ops = AV_GEMMA_TEXT_ENCODER_KEY_OPS if args.ltx2_audio_video else VIDEO_ONLY_GEMMA_TEXT_ENCODER_KEY_OPS
+    configurator = AVGemmaTextEncoderModelConfigurator if audio_video else VideoGemmaTextEncoderModelConfigurator
+    key_ops = AV_GEMMA_TEXT_ENCODER_KEY_OPS if audio_video else VIDEO_ONLY_GEMMA_TEXT_ENCODER_KEY_OPS
 
     text_encoder = SingleGPUModelBuilder(
         model_path=str(text_encoder_checkpoint),
@@ -140,7 +142,7 @@ def main() -> None:
             batch,
             device=device,
             autocast_dtype=autocast_dtype,
-            audio_video=args.ltx2_audio_video,
+            audio_video=audio_video,
         )
 
     # Text caching is CPU-heavy (tokenization, python-side preprocessing). On Windows, high num_workers
@@ -167,7 +169,7 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         "--ltx2_checkpoint",
         type=str,
         default=None,
-        help="LTX-2 checkpoint (.safetensors) containing Gemma connector weights (Gemma backend only)",
+        help="Path to LTX-2 checkpoint (.safetensors)",
     )
     parser.add_argument(
         "--ltx2_text_encoder_checkpoint",
@@ -182,9 +184,16 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         help="Local directory containing Gemma weights/tokenizer (Gemma backend only)",
     )
     parser.add_argument(
+        "--ltx_mode",
+        type=str,
+        default="video",
+        choices=["video", "av", "audio"],
+        help="Caching modality. Use 'av' to cache audio-video prompt embeddings.",
+    )
+    parser.add_argument(
         "--ltx2_audio_video",
         action="store_true",
-        help="If set, cache concatenated [video_ctx, audio_ctx] along last dim (required by LTXAV).",
+        help="If set, cache audio-video prompt embeddings (alias for --ltx_mode av).",
     )
     parser.add_argument(
         "--mixed_precision",
