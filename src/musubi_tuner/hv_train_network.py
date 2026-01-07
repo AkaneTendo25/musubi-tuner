@@ -2176,18 +2176,30 @@ class NetworkTrainer:
                 # torch.compiler.cudagraph_mark_step_begin() # for cudagraphs
 
                 latents = batch["latents"]
+                if isinstance(latents, dict):
+                    if "latents" not in latents:
+                        raise ValueError("batch['latents'] is a dict but missing key 'latents'")
+                    latents_tensor = latents["latents"]
+                else:
+                    latents_tensor = latents
 
                 with accelerator.accumulate(training_model):
                     accelerator.unwrap_model(network).on_step_start()
 
-                    latents = self.scale_shift_latents(latents)
+                    latents_tensor = self.scale_shift_latents(latents_tensor)
 
                     # Sample noise that we'll add to the latents
-                    noise = torch.randn_like(latents)
+                    noise = torch.randn_like(latents_tensor)
 
                     # calculate model input and timesteps
                     noisy_model_input, timesteps = self.get_noisy_model_input_and_timesteps(
-                        args, noise, latents, batch["timesteps"], noise_scheduler, accelerator.device, dit_dtype
+                        args,
+                        noise,
+                        latents_tensor,
+                        batch["timesteps"],
+                        noise_scheduler,
+                        accelerator.device,
+                        dit_dtype,
                     )
 
                     weighting = compute_loss_weighting_for_sd3(
@@ -2195,17 +2207,80 @@ class NetworkTrainer:
                     )
 
                     model_pred, target = self.call_dit(
-                        args, accelerator, transformer, latents, batch, noise, noisy_model_input, timesteps, network_dtype
+                        args,
+                        accelerator,
+                        transformer,
+                        latents_tensor,
+                        batch,
+                        noise,
+                        noisy_model_input,
+                        timesteps,
+                        network_dtype,
                     )
-                    loss = torch.nn.functional.mse_loss(model_pred.to(network_dtype), target, reduction="none")
+                    dict_output = isinstance(model_pred, dict)
+                    if dict_output:
+                        out = model_pred
 
-                    if weighting is not None:
+                        def _masked_mse(
+                            pred: torch.Tensor,
+                            tgt: torch.Tensor,
+                            mask: torch.Tensor | None,
+                        ) -> torch.Tensor:
+                            per_elem = torch.nn.functional.mse_loss(pred.to(network_dtype), tgt, reduction="none")
+                            if weighting is not None:
+                                w = weighting
+                                if isinstance(w, torch.Tensor) and w.dim() != per_elem.dim():
+                                    while w.dim() > per_elem.dim() and w.shape[-1] == 1:
+                                        w = w.squeeze(-1)
+                                per_elem = per_elem * w
+                            if mask is None:
+                                return per_elem.mean()
+
+                            mask = mask.to(device=per_elem.device)
+                            if per_elem.dim() == 5 and mask.dim() == 2:
+                                mask = mask.view(mask.shape[0], 1, mask.shape[1], 1, 1)
+                            elif per_elem.dim() == 5 and mask.dim() == 1:
+                                mask = mask.view(mask.shape[0], 1, 1, 1, 1)
+                            elif per_elem.dim() == 4 and mask.dim() == 2:
+                                mask = mask.view(mask.shape[0], 1, mask.shape[1], 1)
+                            elif per_elem.dim() == 4 and mask.dim() == 1:
+                                mask = mask.view(mask.shape[0], 1, 1, 1)
+                            elif per_elem.dim() == 3 and mask.dim() == 2:
+                                mask = mask.unsqueeze(-1)
+                            elif per_elem.dim() == 3 and mask.dim() == 1:
+                                mask = mask.view(mask.shape[0], 1, 1)
+
+                            mask_f = mask.to(dtype=per_elem.dtype)
+                            denom = mask_f.mean()
+                            if denom.item() == 0:
+                                return per_elem.mean()
+                            return (per_elem * mask_f).div(denom).mean()
+
+                        video_pred = out["video_pred"]
+                        video_target = out["video_target"]
+                        video_loss_mask = out.get("video_loss_mask")
+                        video_loss = _masked_mse(video_pred, video_target, video_loss_mask)
+                        video_weight = float(out.get("video_loss_weight", 1.0))
+                        loss = video_loss * video_weight
+
+                        audio_pred = out.get("audio_pred")
+                        audio_target = out.get("audio_target")
+                        audio_loss_mask = out.get("audio_loss_mask")
+                        if audio_pred is not None and audio_target is not None:
+                            audio_loss = _masked_mse(audio_pred, audio_target, audio_loss_mask)
+                            audio_weight = float(out.get("audio_loss_weight", 1.0))
+                            loss = loss + audio_loss * audio_weight
+                    else:
+                        loss = torch.nn.functional.mse_loss(model_pred.to(network_dtype), target, reduction="none")
+
+                    if not dict_output and weighting is not None:
                         loss = loss * weighting
                     # loss = loss.mean([1, 2, 3])
                     # # min snr gamma, scale v pred loss like noise pred, v pred like loss, debiased estimation etc.
                     # loss = self.post_process_loss(loss, args, timesteps, noise_scheduler)
 
-                    loss = loss.mean()  # mean loss over all elements in batch
+                    if not dict_output:
+                        loss = loss.mean()  # mean loss over all elements in batch
 
                     accelerator.backward(loss)
                     if accelerator.sync_gradients:

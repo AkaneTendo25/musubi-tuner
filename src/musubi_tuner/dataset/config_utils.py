@@ -38,6 +38,7 @@ class BaseDatasetParams:
     batch_size: int = 1
     num_repeats: int = 1
     cache_directory: Optional[str] = None
+    reference_cache_directory: Optional[str] = None
     debug_dataset: bool = False
     architecture: str = "no_default"  # short style like "hv" or "wan"
 
@@ -115,11 +116,12 @@ class ConfigSanitizer:
         "resolution": functools.partial(__validate_and_convert_scalar_or_twodim.__func__, int),
         "enable_bucket": bool,
         "bucket_no_upscale": bool,
+        "cache_directory": str,
+        "reference_cache_directory": str,
     }
     IMAGE_DATASET_DISTINCT_SCHEMA = {
         "image_directory": str,
         "image_jsonl_file": str,
-        "cache_directory": str,
         "control_directory": str,
         "fp_latent_window_size": int,
         "fp_1f_clean_indices": [int],
@@ -138,7 +140,6 @@ class ConfigSanitizer:
         "frame_stride": int,
         "frame_sample": int,
         "max_frames": int,
-        "cache_directory": str,
         "source_fps": float,
         "fp_latent_window_size": int,
     }

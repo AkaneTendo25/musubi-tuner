@@ -1,6 +1,6 @@
-# LTXV2 / LTXAV Training (Current State)
+# LTXV2 / LTXAV Training
 
-This document describes the current state of the **LTXV2** training pipeline implemented in this repository.
+This document describes the **LTXV2** (video) and **LTXAV** (audio-video) training pipeline implemented in this repository.
 
 - Trainer entry point: `ltxv2_train_network.py` (repo root)
 - Implementation: `src/musubi_tuner/ltxv2_train_network.py`
@@ -47,9 +47,9 @@ This writes **sidecar** cache files next to the video latent cache:
 
 - `*_ltxv2_audio.safetensors`
 
-Keys currently written by the stub cache:
+Keys written by the audio cache:
 
-- `audio_latents_{F}x1x1_{dtype}`
+- `audio_latents_{T}x{F}x{C}_{dtype}`
 - `audio_lengths_{int_dtype}`
 
 At batch assembly time, these become:
@@ -75,6 +75,45 @@ At batch assembly time, these become:
 
 For AV (`--ltxv2_audio_video` in the caching script), the cached `text` embedding is concatenated as `[video_ctx, audio_ctx]` along the last dimension.
 `OfficialLTXV2Wrapper` will automatically split this into per-modality contexts.
+
+## Dataset + cache directory structure
+
+Training is designed around a dataset config (`--dataset_config`) that points to raw media + captions and a cache directory.
+The caching scripts populate that cache directory with `.safetensors` files which are then merged into the training batch.
+
+### Typical raw dataset layout
+
+The exact dataset format depends on your dataset config, but a common layout is:
+
+```
+dataset_root/
+  videos/
+    000001.mp4
+    000001.txt
+    000002.mp4
+    000002.txt
+  audio/                    # optional (T2AV)
+    000001.wav
+    000002.wav
+```
+
+Notes:
+
+- Captions are taken from the dataset config (often sidecar `.txt` files).
+- Audio caching resolves audio files by default using the same basename as the video/image item key. You can override this using `--audio_dir` and `--audio_ext` when running `ltxv2_cache_audio_latents.py`.
+
+### Typical cache directory layout
+
+The dataset config usually specifies a `cache_directory`. After caching, you should expect files like:
+
+```
+cache_directory/
+  000001_1024x0576_ltxv2.safetensors          # video latents
+  000001_ltxv2_te.safetensors                 # text encoder outputs
+  000001_ltxv2_audio.safetensors              # audio latents (AV only)
+```
+
+The dataset loader merges the latent cache, optional audio sidecar, and text cache into one training batch.
 
 ## Vendored package keep list
 
@@ -119,51 +158,17 @@ Video-only training uses `--ltx_mode video`.
 
 Audio-video training uses `--ltx_mode av`.
 
-### Required explicit timestep format
-
-**You must set `--ltxv2_timestep_format` explicitly.**
-
-Supported values:
-
-- `flowmatch_1_1000`
-- `legacy_0_1000`
-- `sd3_0_1`
-
-The trainer normalizes the provided timesteps to the model’s expected `0..1` range.
-
-### Example: video-only (T5)
+### Example: video-only (T2V)
 
 ```bash
 accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 ltxv2_train_network.py \
   --dataset_config /path/to/dataset.toml \
   --ltx_mode video \
-  --ltxv2_backend official \
   --ltxv2_model /path/to/ltxv2_dit.safetensors \
   --vae /path/to/ltx2_checkpoint.safetensors \
-  --text_encoder google/t5-v1_1-xxl \
-  --text_encoder_backend t5 \
-  --tokenizer google/t5-v1_1-xxl \
-  --max_length 256 \
-  --ltxv2_timestep_format flowmatch_1_1000 \
-  --network_module musubi_tuner.networks.lora_ltxv2 \
-  --network_dim 16 \
-  --network_alpha 16
-```
-
-### Example: video-only (Gemma)
-
-```bash
-accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 ltxv2_train_network.py \
-  --dataset_config /path/to/dataset.toml \
-  --ltx_mode video \
-  --ltxv2_backend official \
-  --ltxv2_model /path/to/ltxv2_dit.safetensors \
-  --vae /path/to/ltx2_checkpoint.safetensors \
-  --text_encoder google/gemma-3-12b-it \
-  --text_encoder_backend gemma \
-  --tokenizer google/gemma-3-12b-it \
-  --max_length 256 \
-  --ltxv2_timestep_format flowmatch_1_1000 \
+  --ltx2_checkpoint /path/to/ltx2_checkpoint.safetensors \
+  --gemma_root /path/to/local/gemma_root \
+  --ltxv2_first_frame_conditioning_p 0.1 \
   --network_module musubi_tuner.networks.lora_ltxv2 \
   --network_dim 16 \
   --network_alpha 16
@@ -175,48 +180,81 @@ accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 ltxv2_t
 accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 ltxv2_train_network.py \
   --dataset_config /path/to/dataset.toml \
   --ltx_mode av \
-  --ltxv2_backend official \
   --ltxv2_model /path/to/ltxav_dit.safetensors \
   --vae /path/to/ltx2_checkpoint.safetensors \
-  --text_encoder google/gemma-3-12b-it \
-  --text_encoder_backend gemma \
-  --tokenizer google/gemma-3-12b-it \
-  --max_length 256 \
-  --ltxv2_timestep_format flowmatch_1_1000 \
+  --ltx2_checkpoint /path/to/ltx2_checkpoint.safetensors \
+  --gemma_root /path/to/local/gemma_root \
+  --ltxv2_first_frame_conditioning_p 0.1 \
+  --audio_loss_weight 1.0 \
   --network_module musubi_tuner.networks.lora_ltxv2 \
   --network_dim 16 \
   --network_alpha 16
 ```
 
+## End-to-end example workflow
+
+### Step 1: cache video latents
+
+```bash
+python ltxv2_cache_latents.py \
+  --dataset_config /path/to/dataset.toml \
+  --vae /path/to/ltx2_checkpoint.safetensors \
+  --vae_dtype bf16
+```
+
+### Step 2: cache text encoder outputs
+
+Video-only (T2V):
+
+```bash
+python ltxv2_cache_text_encoder_outputs.py \
+  --dataset_config /path/to/dataset.toml \
+  --ltx2_checkpoint /path/to/ltx2_checkpoint.safetensors \
+  --gemma_root /path/to/local/gemma_root \
+  --mixed_precision bf16
+```
+
+Audio-video (T2AV): cache concatenated `[video_ctx, audio_ctx]` embeddings:
+
+```bash
+python ltxv2_cache_text_encoder_outputs.py \
+  --dataset_config /path/to/dataset.toml \
+  --ltxv2_audio_video \
+  --ltx2_checkpoint /path/to/ltx2_checkpoint.safetensors \
+  --gemma_root /path/to/local/gemma_root \
+  --mixed_precision bf16
+```
+
+### Step 3: cache audio latents (T2AV only)
+
+```bash
+python -m musubi_tuner.ltxv2_cache_audio_latents \
+  --dataset_config /path/to/dataset.toml \
+  --ltx2_checkpoint /path/to/ltx2_checkpoint.safetensors \
+  --audio_dir /path/to/dataset_root/audio \
+  --audio_ext .wav \
+  --audio_dtype fp16
+```
+
+### Step 4: train
+
+Use the training commands above (T2V or T2AV).
+
 ## Preview sampling (`--sample_prompts`)
 
 If `--sample_prompts` is provided, the trainer will:
 
-- Load tokenizer and text encoder according to `--text_encoder_backend`
+- Load the official Gemma text encoder using `--ltx2_checkpoint` + `--gemma_root`
 - Encode prompt(s) to hidden states
 - Run a FlowMatchDiscreteScheduler denoising loop
 - Decode latents with the VAE and save preview output
-
-The preview path uses the same `--ltxv2_timestep_format` normalization as training.
 
 ## Loss weighting
 
 LTXV2 supports the following loss weights:
 
-- `--video_loss_weight` (applied in `call_dit` by scaling both prediction and target by `sqrt(weight)` so MSE is effectively multiplied by `weight`)
-- `--audio_loss_weight` (reserved; audio loss is not implemented yet)
-
-## Cache key compatibility
-
-Preferred cached text keys:
-
-- `text` / `text_mask`
-
-Legacy keys:
-
-- `t5` / `t5_mask`
-
-If legacy keys are detected during training, the trainer emits a one-time warning.
+- `--video_loss_weight`
+- `--audio_loss_weight` (AV only)
 
 ## Known limitations
 

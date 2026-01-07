@@ -71,8 +71,8 @@ ARCHITECTURE_HUNYUAN_VIDEO = "hv"
 ARCHITECTURE_HUNYUAN_VIDEO_FULL = "hunyuan_video"
 ARCHITECTURE_WAN = "wan"
 ARCHITECTURE_WAN_FULL = "wan"
-ARCHITECTURE_LTXV2 = "ltxv2"
-ARCHITECTURE_LTXV2_FULL = "ltxv2_v1"
+ARCHITECTURE_LTX2 = "ltx2"
+ARCHITECTURE_LTX2_FULL = "ltx2_v1"
 ARCHITECTURE_FRAMEPACK = "fp"
 ARCHITECTURE_FRAMEPACK_FULL = "framepack"
 ARCHITECTURE_FLUX_KONTEXT = "fk"
@@ -242,14 +242,14 @@ def save_latent_cache_wan(
     save_latent_cache_common(item_info, sd, ARCHITECTURE_WAN_FULL)
 
 
-def save_latent_cache_ltxv2(item_info: ItemInfo, latent: torch.Tensor):
+def save_latent_cache_ltx2(item_info: ItemInfo, latent: torch.Tensor):
     assert latent.dim() == 4, "latent should be 4D tensor (channel, frame, height, width)"
 
     _, F, H, W = latent.shape
     dtype_str = dtype_to_str(latent.dtype)
     sd = {f"latents_{F}x{H}x{W}_{dtype_str}": latent.detach().cpu().contiguous()}
 
-    save_latent_cache_common(item_info, sd, ARCHITECTURE_LTXV2_FULL)
+    save_latent_cache_common(item_info, sd, ARCHITECTURE_LTX2_FULL)
 
 
 def save_latent_cache_framepack(
@@ -447,7 +447,7 @@ def save_text_encoder_output_cache_wan(item_info: ItemInfo, embed: torch.Tensor)
     save_text_encoder_output_cache_common(item_info, sd, ARCHITECTURE_WAN_FULL)
 
 
-def save_text_encoder_output_cache_ltxv2(item_info: ItemInfo, embed: torch.Tensor, mask: torch.Tensor):
+def save_text_encoder_output_cache_ltx2(item_info: ItemInfo, embed: torch.Tensor, mask: torch.Tensor):
     assert embed.dim() == 1 or embed.dim() == 2, (
         f"embed should be 2D tensor (feature, hidden_size) or (hidden_size,), got {embed.shape}"
     )
@@ -459,7 +459,44 @@ def save_text_encoder_output_cache_ltxv2(item_info: ItemInfo, embed: torch.Tenso
     if mask is not None:
         sd["text_mask"] = mask.detach().cpu()
 
-    save_text_encoder_output_cache_common(item_info, sd, ARCHITECTURE_LTXV2_FULL)
+    save_text_encoder_output_cache_common(item_info, sd, ARCHITECTURE_LTX2_FULL)
+
+
+def save_text_encoder_output_cache_ltx2_official(
+    item_info: ItemInfo,
+    *,
+    video_prompt_embeds: torch.Tensor,
+    prompt_attention_mask: torch.Tensor,
+    audio_prompt_embeds: Optional[torch.Tensor] = None,
+):
+    assert video_prompt_embeds.dim() == 1 or video_prompt_embeds.dim() == 2, (
+        f"video_prompt_embeds should be 2D tensor (feature, hidden_size) or (hidden_size,), got {video_prompt_embeds.shape}"
+    )
+    assert prompt_attention_mask is None or prompt_attention_mask.dim() == 1, (
+        f"prompt_attention_mask should be 1D tensor (feature), got {prompt_attention_mask.shape}"
+    )
+    if audio_prompt_embeds is not None:
+        assert audio_prompt_embeds.dim() == 1 or audio_prompt_embeds.dim() == 2, (
+            f"audio_prompt_embeds should be 2D tensor (feature, hidden_size) or (hidden_size,), got {audio_prompt_embeds.shape}"
+        )
+
+    sd = {}
+    dtype_str = dtype_to_str(video_prompt_embeds.dtype)
+
+    sd[f"video_prompt_embeds_{dtype_str}"] = video_prompt_embeds.detach().cpu()
+    if audio_prompt_embeds is not None:
+        sd[f"audio_prompt_embeds_{dtype_str}"] = audio_prompt_embeds.detach().cpu()
+    if prompt_attention_mask is not None:
+        sd["prompt_attention_mask"] = prompt_attention_mask.detach().cpu()
+
+    text = video_prompt_embeds
+    if audio_prompt_embeds is not None:
+        text = torch.cat([video_prompt_embeds, audio_prompt_embeds], dim=-1)
+    sd[f"text_{dtype_str}"] = text.detach().cpu()
+    if prompt_attention_mask is not None:
+        sd["text_mask"] = prompt_attention_mask.detach().cpu()
+
+    save_text_encoder_output_cache_common(item_info, sd, ARCHITECTURE_LTX2_FULL)
 
 
 def save_text_encoder_output_cache_framepack(
@@ -569,6 +606,7 @@ def save_text_encoder_output_cache_common(item_info: ItemInfo, sd: dict[str, tor
 class BucketSelector:
     RESOLUTION_STEPS_HUNYUAN = 16
     RESOLUTION_STEPS_WAN = 16
+    RESOLUTION_STEPS_LTX2 = 32
     RESOLUTION_STEPS_FRAMEPACK = 16
     RESOLUTION_STEPS_FLUX_KONTEXT = 16
     RESOLUTION_STEPS_QWEN_IMAGE = 16
@@ -580,7 +618,7 @@ class BucketSelector:
     ARCHITECTURE_STEPS_MAP = {
         ARCHITECTURE_HUNYUAN_VIDEO: RESOLUTION_STEPS_HUNYUAN,
         ARCHITECTURE_WAN: RESOLUTION_STEPS_WAN,
-        ARCHITECTURE_LTXV2: RESOLUTION_STEPS_WAN,
+        ARCHITECTURE_LTX2: RESOLUTION_STEPS_LTX2,
         ARCHITECTURE_FRAMEPACK: RESOLUTION_STEPS_FRAMEPACK,
         ARCHITECTURE_FLUX_KONTEXT: RESOLUTION_STEPS_FLUX_KONTEXT,
         ARCHITECTURE_QWEN_IMAGE: RESOLUTION_STEPS_QWEN_IMAGE,
@@ -604,6 +642,8 @@ class BucketSelector:
 
         if not enable_bucket:
             # only define one bucket
+            if resolution[0] % self.reso_steps != 0 or resolution[1] % self.reso_steps != 0:
+                raise ValueError(f"resolution must be divisible by {self.reso_steps} for architecture={architecture}: {resolution}")
             self.bucket_resolutions = [resolution]
             self.no_upscale = False
         else:
@@ -810,7 +850,11 @@ def load_video(
 
 class BucketBatchManager:
     def __init__(
-        self, bucketed_item_info: dict[tuple[Any], list[ItemInfo]], batch_size: int, num_timestep_buckets: Optional[int] = None
+        self,
+        bucketed_item_info: dict[tuple[Any], list[ItemInfo]],
+        batch_size: int,
+        num_timestep_buckets: Optional[int] = None,
+        architecture: Optional[str] = None,
     ):
         self.batch_size = batch_size
         self.buckets = bucketed_item_info
@@ -818,6 +862,7 @@ class BucketBatchManager:
         self.bucket_resos.sort()
         self.num_timestep_buckets = num_timestep_buckets
         self.timestep_pool = None
+        self.architecture = architecture
 
         # indices for enumerating batches. each batch is reso + batch_idx. reso is (width, height) or (width, height, frames)
         self.bucket_batch_indices: list[tuple[tuple[Any], int]] = []
@@ -893,6 +938,20 @@ class BucketBatchManager:
             if audio_latent_cache_path is not None and os.path.exists(audio_latent_cache_path):
                 sd_audio = load_file(audio_latent_cache_path)
                 sd_latent = {**sd_latent, **sd_audio}
+
+            reference_latent_cache_path = getattr(item_info, "reference_latent_cache_path", None)
+            if reference_latent_cache_path is not None:
+                if not os.path.exists(reference_latent_cache_path):
+                    raise FileNotFoundError(f"Reference latent cache file not found: {reference_latent_cache_path}")
+                sd_ref = load_file(reference_latent_cache_path)
+                sd_ref_latents = {}
+                for key, value in sd_ref.items():
+                    if key.startswith("latents_"):
+                        sd_ref_latents["ref_" + key] = value
+                if not sd_ref_latents:
+                    raise ValueError(f"No latent tensors found in reference cache: {reference_latent_cache_path}")
+                sd_latent = {**sd_latent, **sd_ref_latents}
+
             sd_te = load_file(item_info.text_encoder_output_cache_path)
             sd = {**sd_latent, **sd_te}
 
@@ -908,7 +967,11 @@ class BucketBatchManager:
                     pass
                 else:
                     content_key = content_key.rsplit("_", 1)[0]  # remove dtype
-                    if content_key.startswith("latents_") or content_key.startswith("audio_latents_"):
+                    if (
+                        content_key.startswith("latents_")
+                        or content_key.startswith("audio_latents_")
+                        or content_key.startswith("ref_latents_")
+                    ):
                         content_key = content_key.rsplit("_", 1)[0]  # remove FxHxW
 
                 if content_key not in batch_tensor_data:
@@ -926,6 +989,63 @@ class BucketBatchManager:
             batch_tensor_data["timesteps"] = self.timestep_pool[idx][: end - start]  # use the pre-generated timesteps
         else:
             batch_tensor_data["timesteps"] = None
+
+        if self.architecture in {ARCHITECTURE_LTX2, ARCHITECTURE_LTX2_FULL}:
+            latents = batch_tensor_data.get("latents")
+            if isinstance(latents, torch.Tensor) and latents.dim() == 5:
+                bsz, _c, frames, height, width = latents.shape
+                seq_len = frames * height * width
+                batch_tensor_data["latents"] = {
+                    "latents": latents,
+                    "num_frames": torch.full((bsz,), frames, dtype=torch.int32),
+                    "height": torch.full((bsz,), height, dtype=torch.int32),
+                    "width": torch.full((bsz,), width, dtype=torch.int32),
+                    "fps": torch.full((bsz,), 24.0, dtype=torch.float32),
+                }
+
+            ref_latents = batch_tensor_data.get("ref_latents")
+            if isinstance(ref_latents, torch.Tensor) and ref_latents.dim() == 5:
+                bsz, _c, frames, height, width = ref_latents.shape
+                batch_tensor_data["ref_latents"] = {
+                    "latents": ref_latents,
+                    "num_frames": torch.full((bsz,), frames, dtype=torch.int32),
+                    "height": torch.full((bsz,), height, dtype=torch.int32),
+                    "width": torch.full((bsz,), width, dtype=torch.int32),
+                    "fps": torch.full((bsz,), 24.0, dtype=torch.float32),
+                }
+
+            audio_latents_tensor = batch_tensor_data.get("audio_latents")
+            if isinstance(audio_latents_tensor, torch.Tensor) and audio_latents_tensor.dim() == 4:
+                batch_tensor_data["audio_latents"] = {"latents": audio_latents_tensor}
+
+            video_prompt_embeds = batch_tensor_data.get("video_prompt_embeds")
+            audio_prompt_embeds = batch_tensor_data.get("audio_prompt_embeds")
+            prompt_attention_mask = batch_tensor_data.get("prompt_attention_mask")
+
+            conditions: dict[str, torch.Tensor] = {}
+            if isinstance(video_prompt_embeds, torch.Tensor):
+                conditions["video_prompt_embeds"] = video_prompt_embeds
+                if isinstance(audio_prompt_embeds, torch.Tensor):
+                    conditions["audio_prompt_embeds"] = audio_prompt_embeds
+                if isinstance(prompt_attention_mask, torch.Tensor):
+                    conditions["prompt_attention_mask"] = prompt_attention_mask
+
+            if not conditions:
+                text = batch_tensor_data.get("text")
+                text_mask = batch_tensor_data.get("text_mask")
+                if isinstance(text, torch.Tensor):
+                    if isinstance(text_mask, torch.Tensor):
+                        conditions["prompt_attention_mask"] = text_mask
+
+                    if isinstance(audio_latents_tensor, torch.Tensor) and text.shape[-1] % 2 == 0:
+                        half = text.shape[-1] // 2
+                        conditions["video_prompt_embeds"] = text[..., :half]
+                        conditions["audio_prompt_embeds"] = text[..., half:]
+                    else:
+                        conditions["video_prompt_embeds"] = text
+
+            if conditions:
+                batch_tensor_data["conditions"] = conditions
 
         return batch_tensor_data
 
@@ -1501,6 +1621,7 @@ class BaseDataset(torch.utils.data.Dataset):
         enable_bucket: bool = False,
         bucket_no_upscale: bool = False,
         cache_directory: Optional[str] = None,
+        reference_cache_directory: Optional[str] = None,
         debug_dataset: bool = False,
         architecture: str = "no_default",
     ):
@@ -1511,6 +1632,7 @@ class BaseDataset(torch.utils.data.Dataset):
         self.enable_bucket = enable_bucket
         self.bucket_no_upscale = bucket_no_upscale
         self.cache_directory = cache_directory
+        self.reference_cache_directory = reference_cache_directory
         self.debug_dataset = debug_dataset
         self.architecture = architecture
         self.seed = None
@@ -1552,6 +1674,17 @@ class BaseDataset(torch.utils.data.Dataset):
         basename = os.path.splitext(os.path.basename(item_info.item_key))[0]
         assert self.cache_directory is not None, "cache_directory is required / cache_directoryは必須です"
         return os.path.join(self.cache_directory, f"{basename}_{w:04d}x{h:04d}_{self.architecture}.safetensors")
+
+    def get_reference_latent_cache_path(self, item_info: ItemInfo) -> str:
+        w, h = item_info.original_size
+        basename = os.path.splitext(os.path.basename(item_info.item_key))[0]
+        assert self.reference_cache_directory is not None, (
+            "reference_cache_directory is required / reference_cache_directoryは必須です"
+        )
+        return os.path.join(
+            self.reference_cache_directory,
+            f"{basename}_{w:04d}x{h:04d}_{self.architecture}.safetensors",
+        )
 
     def get_text_encoder_output_cache_path(self, item_info: ItemInfo) -> str:
         basename = os.path.splitext(os.path.basename(item_info.item_key))[0]
@@ -1666,6 +1799,7 @@ class ImageDataset(BaseDataset):
         image_jsonl_file: Optional[str] = None,
         control_directory: Optional[str] = None,
         cache_directory: Optional[str] = None,
+        reference_cache_directory: Optional[str] = None,
         fp_latent_window_size: Optional[int] = 9,
         fp_1f_clean_indices: Optional[list[int]] = None,
         fp_1f_target_index: Optional[int] = None,
@@ -1684,6 +1818,7 @@ class ImageDataset(BaseDataset):
             enable_bucket,
             bucket_no_upscale,
             cache_directory,
+            reference_cache_directory,
             debug_dataset,
             architecture,
         )
@@ -1764,6 +1899,9 @@ class ImageDataset(BaseDataset):
 
                     item_info = ItemInfo(item_key, caption, original_size, bucket_reso, content=image)
                     item_info.latent_cache_path = self.get_latent_cache_path(item_info)
+
+                    if self.reference_cache_directory is not None:
+                        item_info.reference_latent_cache_path = self.get_reference_latent_cache_path(item_info)
 
                     # for VLM, which require image in addition to text, like Qwen-Image-Edit
                     item_info.text_encoder_output_cache_path = self.get_text_encoder_output_cache_path(item_info)
@@ -1922,7 +2060,12 @@ class ImageDataset(BaseDataset):
             bucketed_item_info[bucket_reso] = bucket
 
         # prepare batch manager
-        self.batch_manager = BucketBatchManager(bucketed_item_info, self.batch_size, num_timestep_buckets=num_timestep_buckets)
+        self.batch_manager = BucketBatchManager(
+            bucketed_item_info,
+            self.batch_size,
+            num_timestep_buckets=num_timestep_buckets,
+            architecture=self.architecture,
+        )
         self.batch_manager.show_bucket_info()
 
         self.num_train_items = sum([len(bucket) for bucket in bucketed_item_info.values()])
@@ -1945,6 +2088,7 @@ class ImageDataset(BaseDataset):
 class VideoDataset(BaseDataset):
     TARGET_FPS_HUNYUAN = 24.0
     TARGET_FPS_WAN = 16.0
+    TARGET_FPS_LTX2 = 24.0
     TARGET_FPS_FRAMEPACK = 30.0
     TARGET_FPS_FLUX_KONTEXT = 1.0  # VideoDataset is not used for Flux Kontext, but this is a placeholder
     TARGET_FPS_HUNYUAN_VIDEO_1_5 = 24.0
@@ -1967,6 +2111,7 @@ class VideoDataset(BaseDataset):
         video_jsonl_file: Optional[str] = None,
         control_directory: Optional[str] = None,
         cache_directory: Optional[str] = None,
+        reference_cache_directory: Optional[str] = None,
         fp_latent_window_size: Optional[int] = 9,
         debug_dataset: bool = False,
         architecture: str = "no_default",
@@ -1979,6 +2124,7 @@ class VideoDataset(BaseDataset):
             enable_bucket,
             bucket_no_upscale,
             cache_directory,
+            reference_cache_directory,
             debug_dataset,
             architecture,
         )
@@ -1996,6 +2142,8 @@ class VideoDataset(BaseDataset):
             self.target_fps = VideoDataset.TARGET_FPS_HUNYUAN
         elif self.architecture == ARCHITECTURE_WAN:
             self.target_fps = VideoDataset.TARGET_FPS_WAN
+        elif self.architecture == ARCHITECTURE_LTX2:
+            self.target_fps = VideoDataset.TARGET_FPS_LTX2
         elif self.architecture == ARCHITECTURE_FRAMEPACK:
             self.target_fps = VideoDataset.TARGET_FPS_FRAMEPACK
         elif self.architecture == ARCHITECTURE_FLUX_KONTEXT:
@@ -2154,7 +2302,14 @@ class VideoDataset(BaseDataset):
                         item_info = ItemInfo(
                             item_key, caption, original_frame_size, batch_key, frame_count=target_frame, content=cropped_video
                         )
+                        item_info.source_item_key = video_key
+                        item_info.source_total_frames = frame_count
+                        item_info.chunk_start_frame = crop_pos
+                        item_info.chunk_num_frames = target_frame
                         item_info.latent_cache_path = self.get_latent_cache_path(item_info)
+
+                        if self.reference_cache_directory is not None:
+                            item_info.reference_latent_cache_path = self.get_reference_latent_cache_path(item_info)
                         item_info.control_content = cropped_control  # None is allowed
                         item_info.fp_latent_window_size = self.fp_latent_window_size
 
@@ -2255,7 +2410,12 @@ class VideoDataset(BaseDataset):
             bucketed_item_info[bucket_reso] = bucket
 
         # prepare batch manager
-        self.batch_manager = BucketBatchManager(bucketed_item_info, self.batch_size, num_timestep_buckets=num_timestep_buckets)
+        self.batch_manager = BucketBatchManager(
+            bucketed_item_info,
+            self.batch_size,
+            num_timestep_buckets=num_timestep_buckets,
+            architecture=self.architecture,
+        )
         self.batch_manager.show_bucket_info()
 
         self.num_train_items = sum([len(bucket) for bucket in bucketed_item_info.values()])

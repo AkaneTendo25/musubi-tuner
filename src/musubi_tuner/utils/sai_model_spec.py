@@ -16,7 +16,7 @@ from musubi_tuner.dataset.image_video_dataset import (
     ARCHITECTURE_FLUX_KONTEXT,
     ARCHITECTURE_QWEN_IMAGE,
     ARCHITECTURE_KANDINSKY5,
-    ARCHITECTURE_LTXV2,
+    ARCHITECTURE_LTX2,
     ARCHITECTURE_Z_IMAGE,
 )
 
@@ -79,7 +79,7 @@ ARCH_QWEN_IMAGE_EDIT_2511 = "Qwen-Image-Edit-2511"
 CUSTOM_ARCH_QWEN_IMAGE_EDIT_PLUS = "@@Qwen-Image-Edit-Plus@@"  # special custom architecture name for Qwen-Image-Edit-Plus
 CUSTOM_ARCH_QWEN_IMAGE_EDIT_2511 = "@@Qwen-Image-Edit-2511@@"  # special custom architecture name for Qwen-Image-Edit-2511
 ARCH_KANDINSKY5 = "Kandinsky-5"
-ARCH_LTXV2 = "LTXV2"
+ARCH_LTX2 = "LTX2"
 
 ARCH_HUNYUAN_VIDEO_1_5 = "hunyuan-video-1.5"
 ARCH_Z_IMAGE = "Z-Image"
@@ -93,7 +93,7 @@ IMPL_FLUX_KONTEXT = "https://github.com/black-forest-labs/flux"
 IMPL_QWEN_IMAGE = "https://github.com/QwenLM/Qwen-Image"
 IMPL_QWEN_IMAGE_EDIT = IMPL_QWEN_IMAGE
 IMPL_KANDINSKY5 = "https://github.com/kandinskylab/kandinsky-5"
-IMPL_LTXV2 = "https://github.com/Lightricks/LTX-Video"
+IMPL_LTX2 = "https://github.com/Lightricks/LTX-Video"
 
 IMPL_HUNYUAN_VIDEO_1_5 = "https://github.com/Tencent-Hunyuan/HunyuanVideo-1.5"
 IMPL_Z_IMAGE = "https://github.com/Tongyi-MAI/Z-Image"
@@ -187,9 +187,9 @@ def build_metadata(
     elif architecture == ARCHITECTURE_KANDINSKY5:
         arch = ARCH_KANDINSKY5
         impl = IMPL_KANDINSKY5
-    elif architecture == ARCHITECTURE_LTXV2:
-        arch = ARCH_LTXV2
-        impl = IMPL_LTXV2
+    elif architecture == ARCHITECTURE_LTX2:
+        arch = ARCH_LTX2
+        impl = IMPL_LTX2
     elif architecture == ARCHITECTURE_HUNYUAN_VIDEO_1_5:
         arch = ARCH_HUNYUAN_VIDEO_1_5
         impl = IMPL_HUNYUAN_VIDEO_1_5
