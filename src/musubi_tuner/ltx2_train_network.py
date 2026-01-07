@@ -20,6 +20,8 @@ from musubi_tuner.hv_train_network import (
 )
 from musubi_tuner.utils import model_utils
 from musubi_tuner.utils.safetensors_utils import MemoryEfficientSafeOpen
+from musubi_tuner.modules.fp8_optimization_utils import apply_fp8_monkey_patch
+from musubi_tuner.utils.lora_utils import load_safetensors_with_lora_and_fp8
 
 # LTX-2 latent normalization defaults.
 # These are identity stats (mean=0, std=1). We keep them as a safe fallback and
@@ -50,13 +52,24 @@ def detect_ltx2_dtype(model_path: str) -> torch.dtype:
         if not keys:
             raise ValueError(f"Unable to detect LTX-2 dtype; no tensors found in {model_path}")
 
+        floating_dtypes: list[torch.dtype] = []
+        fp8_dtype: torch.dtype | None = None
+
+        # Avoid loading tensors: inspect header dtype for each key.
         for key in keys:
-            tensor = handle.get_tensor(key)
-            if tensor.is_floating_point():
-                dtype = tensor.dtype
-                break
-        else:
-            dtype = handle.get_tensor(keys[0]).dtype
+            meta = handle.header.get(key)
+            if not isinstance(meta, dict) or "dtype" not in meta:
+                continue
+            dt = handle._get_torch_dtype(meta["dtype"])  # noqa: SLF001
+            if not isinstance(dt, torch.dtype):
+                continue
+            if dt.is_floating_point:
+                floating_dtypes.append(dt)
+                if dt.itemsize == 1:
+                    fp8_dtype = dt
+                    break
+
+        dtype = fp8_dtype or (floating_dtypes[0] if floating_dtypes else handle.get_tensor(keys[0]).dtype)
 
     logger.info("Detected LTX-2 dtype: %s", dtype)
     return dtype
@@ -137,6 +150,7 @@ def load_ltx2_model(
     torch_dtype: Optional[torch.dtype] = None,
     attn_mode: str = "torch",
     audio_video: bool = False,
+    fp8_scaled: bool = False,
     **_: Any,
 ):
     """Load LTX-2 (video or audio-video) transformer
@@ -166,7 +180,33 @@ def load_ltx2_model(
         audio_video=audio_video,
         patch_size=1,
     )
-    model = model.to(device=target_device)
+
+    if fp8_scaled:
+        fp8_calc_device = target_device if load_device == target_device else torch.device("cpu")
+        sd = load_safetensors_with_lora_and_fp8(
+            model_files=model_path,
+            lora_weights_list=None,
+            lora_multipliers=None,
+            fp8_optimization=True,
+            calc_device=fp8_calc_device,
+            move_to_device=(load_device == target_device),
+            dit_weight_dtype=None,
+            target_keys=["transformer_blocks"],
+            exclude_keys=list(KEEP_FP8_HIGH_PRECISION_TOKENS),
+        )
+        from musubi_tuner.ltx_2.model.transformer.model_configurator import LTXV_MODEL_COMFY_RENAMING_MAP
+
+        renamed_sd: dict[str, torch.Tensor] = {}
+        for k, v in sd.items():
+            nk = LTXV_MODEL_COMFY_RENAMING_MAP.apply_to_key(k)
+            renamed_sd[nk if nk is not None else k] = v
+        sd = renamed_sd
+        base_model = model.model if hasattr(model, "model") else model
+        apply_fp8_monkey_patch(base_model, sd, use_scaled_mm=False)
+        base_model.load_state_dict(sd, strict=False, assign=True)
+
+    if load_device == target_device:
+        model = model.to(device=target_device)
     return model
 
 
@@ -265,6 +305,14 @@ class LTX2NetworkTrainer(NetworkTrainer):
         """Handle LTX-2-specific command line arguments"""
         self.dit_dtype = detect_ltx2_dtype(args.ltx2_checkpoint)
 
+        if getattr(args, "fp8_scaled", False):
+            assert getattr(args, "fp8_base", False), "fp8_scaled requires fp8_base / fp8_scaledはfp8_baseが必要です"
+
+        if getattr(args, "fp8_scaled", False) and self.dit_dtype is not None and self.dit_dtype.itemsize == 1:
+            raise ValueError(
+                "DiT weights is already in fp8 format, cannot scale to fp8. Please use fp16/bf16 weights / DiTの重みはすでにfp8形式です。fp8にスケーリングできません。fp16/bf16の重みを使用してください"
+            )
+
         if self.dit_dtype == torch.float16:
             assert args.mixed_precision in ["fp16", "no"], "LTX-2 weights are fp16; mixed precision must be fp16 or no"
         elif self.dit_dtype == torch.bfloat16:
@@ -338,12 +386,20 @@ class LTX2NetworkTrainer(NetworkTrainer):
             torch_dtype=dit_weight_dtype,
             attn_mode=attn_mode,
             audio_video=self._audio_video,
+            fp8_scaled=bool(getattr(args, "fp8_scaled", False)),
         )
 
         transformer.eval()
         transformer.requires_grad_(False)
 
         return transformer
+
+    def compile_transformer(self, args: argparse.Namespace, transformer):
+        base_model = transformer.model if hasattr(transformer, "model") else transformer
+        target_blocks = []
+        if hasattr(base_model, "transformer_blocks"):
+            target_blocks.append(base_model.transformer_blocks)
+        return model_utils.compile_transformer(args, transformer, target_blocks, disable_linear=self.blocks_to_swap > 0)
 
     def load_vae(self, args: argparse.Namespace, vae_dtype: torch.dtype, vae_path: str):
         """Load VAE for LTX2"""
@@ -1107,6 +1163,12 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         type=float,
         default=0.1,
         help="Probability of first-frame conditioning during training (keep frame 0 clean and set its timestep to 0).",
+    )
+
+    parser.add_argument(
+        "--fp8_scaled",
+        action="store_true",
+        help="use scaled fp8 for DiT / DiTにスケーリングされたfp8を使う",
     )
 
     return parser

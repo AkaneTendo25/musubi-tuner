@@ -1,6 +1,7 @@
 from enum import Enum
 
 import torch
+from musubi_tuner.modules.custom_offloading_utils import ModelOffloader
 from musubi_tuner.ltx_2.guidance.perturbations import BatchedPerturbationConfig
 from musubi_tuner.ltx_2.model.transformer.adaln import AdaLayerNormSingle
 from musubi_tuner.ltx_2.model.transformer.attention import AttentionCallable, AttentionFunction
@@ -63,6 +64,10 @@ class LTXModel(torch.nn.Module):
     ):
         super().__init__()
         self._enable_gradient_checkpointing = False
+        self.activation_cpu_offloading = False
+        self.blocks_to_swap = None
+        self.offloader = None
+        self.num_blocks = 0
         self.use_middle_indices_grid = use_middle_indices_grid
         self.rope_type = rope_type
         self.double_precision_rope = double_precision_rope
@@ -113,6 +118,8 @@ class LTXModel(torch.nn.Module):
             norm_eps=norm_eps,
             attention_type=attention_type,
         )
+
+        self.num_blocks = len(self.transformer_blocks)
 
     def _init_video(
         self,
@@ -317,6 +324,63 @@ class LTXModel(torch.nn.Module):
         """
         self._enable_gradient_checkpointing = enable
 
+    def enable_gradient_checkpointing(self, activation_cpu_offloading: bool = False) -> None:
+        self.set_gradient_checkpointing(True)
+        self.activation_cpu_offloading = activation_cpu_offloading
+
+    def disable_gradient_checkpointing(self) -> None:
+        self.set_gradient_checkpointing(False)
+        self.activation_cpu_offloading = False
+
+    def enable_block_swap(
+        self,
+        blocks_to_swap: int,
+        device: torch.device,
+        supports_backward: bool,
+        use_pinned_memory: bool = False,
+    ) -> None:
+        self.blocks_to_swap = int(blocks_to_swap)
+        self.num_blocks = len(self.transformer_blocks)
+
+        assert self.blocks_to_swap <= self.num_blocks - 1, (
+            f"Cannot swap more than {self.num_blocks - 1} blocks. Requested {self.blocks_to_swap} blocks to swap."
+        )
+
+        self.offloader = ModelOffloader(
+            "ltx2_block",
+            self.transformer_blocks,
+            self.num_blocks,
+            self.blocks_to_swap,
+            supports_backward,
+            device,
+            use_pinned_memory,
+        )
+
+    def switch_block_swap_for_inference(self) -> None:
+        if self.blocks_to_swap and self.offloader is not None:
+            self.offloader.set_forward_only(True)
+            self.prepare_block_swap_before_forward()
+
+    def switch_block_swap_for_training(self) -> None:
+        if self.blocks_to_swap and self.offloader is not None:
+            self.offloader.set_forward_only(False)
+            self.prepare_block_swap_before_forward()
+
+    def move_to_device_except_swap_blocks(self, device: torch.device) -> None:
+        if self.blocks_to_swap:
+            saved_blocks = self.transformer_blocks
+            self.transformer_blocks = torch.nn.ModuleList()
+
+        self.to(device)
+
+        if self.blocks_to_swap:
+            self.transformer_blocks = saved_blocks
+
+    def prepare_block_swap_before_forward(self) -> None:
+        if self.blocks_to_swap is None or self.blocks_to_swap == 0 or self.offloader is None:
+            return
+        self.offloader.prepare_block_devices_before_forward(self.transformer_blocks)
+
     def _process_transformer_blocks(
         self,
         video: TransformerArgs | None,
@@ -326,11 +390,11 @@ class LTXModel(torch.nn.Module):
         """Process transformer blocks for LTXAV."""
 
         # Process transformer blocks
-        for block in self.transformer_blocks:
+        for block_idx, block in enumerate(self.transformer_blocks):
+            if self.blocks_to_swap and self.offloader is not None:
+                self.offloader.wait_for_block(block_idx)
+
             if self._enable_gradient_checkpointing and self.training:
-                # Use gradient checkpointing to save memory during training.
-                # With use_reentrant=False, we can pass dataclasses directly -
-                # PyTorch will track all tensor leaves in the computation graph.
                 video, audio = torch.utils.checkpoint.checkpoint(
                     block,
                     video,
@@ -345,6 +409,9 @@ class LTXModel(torch.nn.Module):
                     perturbations=perturbations,
                 )
 
+            if self.blocks_to_swap and self.offloader is not None:
+                self.offloader.submit_move_blocks_forward(self.transformer_blocks, block_idx)
+
         return video, audio
 
     def _process_output(
@@ -357,9 +424,7 @@ class LTXModel(torch.nn.Module):
     ) -> torch.Tensor:
         """Process output for LTXV."""
         # Apply scale-shift modulation
-        scale_shift_values = (
-            scale_shift_table[None, None].to(device=x.device, dtype=x.dtype) + embedded_timestep[:, :, None]
-        )
+        scale_shift_values = scale_shift_table[None, None].to(device=x.device, dtype=x.dtype) + embedded_timestep[:, :, None]
         shift, scale = scale_shift_values[:, :, 0], scale_shift_values[:, :, 1]
 
         x = norm_out(x)
@@ -391,9 +456,7 @@ class LTXModel(torch.nn.Module):
 
         # Process output
         vx = (
-            self._process_output(
-                self.scale_shift_table, self.norm_out, self.proj_out, video_out.x, video_out.embedded_timestep
-            )
+            self._process_output(self.scale_shift_table, self.norm_out, self.proj_out, video_out.x, video_out.embedded_timestep)
             if video_out is not None
             else None
         )

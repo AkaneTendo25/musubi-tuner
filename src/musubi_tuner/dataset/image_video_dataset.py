@@ -932,6 +932,9 @@ class BucketBatchManager:
 
         batch_tensor_data = {}
         varlen_keys = set()
+
+        audio_latents_per_item = []
+        audio_lengths_per_item = []
         for item_info in bucket[start:end]:
             sd_latent = load_file(item_info.latent_cache_path)
             audio_latent_cache_path = getattr(item_info, "audio_latent_cache_path", None)
@@ -955,8 +958,20 @@ class BucketBatchManager:
             sd_te = load_file(item_info.text_encoder_output_cache_path)
             sd = {**sd_latent, **sd_te}
 
+            item_audio_latents = None
+            item_audio_lengths = None
+            for key, value in sd.items():
+                if key.startswith("audio_latents_"):
+                    item_audio_latents = value
+                elif key.startswith("audio_lengths_"):
+                    item_audio_lengths = value
+            audio_latents_per_item.append(item_audio_latents)
+            audio_lengths_per_item.append(item_audio_lengths)
+
             # TODO refactor this
             for key in sd.keys():
+                if key.startswith("audio_latents_") or key.startswith("audio_lengths_"):
+                    continue
                 is_varlen_key = key.startswith("varlen_")  # varlen keys are not stacked
                 content_key = key
 
@@ -984,6 +999,88 @@ class BucketBatchManager:
         for key in batch_tensor_data.keys():
             if key not in varlen_keys:
                 batch_tensor_data[key] = torch.stack(batch_tensor_data[key])
+
+        if self.architecture in {ARCHITECTURE_LTX2, ARCHITECTURE_LTX2_FULL}:
+            present_audio = [x for x in audio_latents_per_item if isinstance(x, torch.Tensor)]
+            if present_audio:
+                ref = present_audio[0]
+                if not isinstance(ref, torch.Tensor) or ref.dim() != 3:
+                    raise ValueError(
+                        f"Expected cached audio latents to be 3D [C, T, F] before stacking, got: {getattr(ref, 'shape', None)}"
+                    )
+
+                channels = int(ref.shape[0])
+                mel_bins = int(ref.shape[2])
+                dtype = ref.dtype
+                device = ref.device
+
+                lengths = []
+                max_t = 0
+                for i, lat in enumerate(audio_latents_per_item):
+                    if isinstance(lat, torch.Tensor):
+                        t = int(lat.shape[1])
+                        length_val = t
+                        cached_len = audio_lengths_per_item[i]
+                        if isinstance(cached_len, torch.Tensor) and cached_len.numel() == 1:
+                            length_val = int(cached_len.view(-1)[0].item())
+                        length_val = max(0, min(length_val, t))
+                    else:
+                        length_val = 0
+                        t = 0
+                    lengths.append(length_val)
+                    max_t = max(max_t, t)
+
+                if max_t <= 0:
+                    max_t = 1
+
+                padded = []
+                for i, lat in enumerate(audio_latents_per_item):
+                    if isinstance(lat, torch.Tensor):
+                        if lat.dim() != 3:
+                            raise ValueError(f"Expected audio latents to be 3D [C, T, F], got {tuple(lat.shape)}")
+                        if int(lat.shape[0]) != channels or int(lat.shape[2]) != mel_bins:
+                            raise ValueError(
+                                "Audio latents shape mismatch in batch: "
+                                f"expected [C={channels}, *, F={mel_bins}], got {tuple(lat.shape)}"
+                            )
+
+                        t = int(lat.shape[1])
+                        use_t = min(t, max_t)
+                        out = torch.zeros((channels, max_t, mel_bins), device=device, dtype=dtype)
+                        if use_t > 0:
+                            out[:, :use_t, :] = lat[:, :use_t, :].to(device=device, dtype=dtype)
+                        padded.append(out)
+                        lengths[i] = int(min(max(0, lengths[i]), max_t))
+                    else:
+                        padded.append(torch.zeros((channels, max_t, mel_bins), device=device, dtype=dtype))
+
+                batch_tensor_data["audio_latents"] = torch.stack(padded)
+                batch_tensor_data["audio_lengths"] = torch.tensor(lengths, device=device, dtype=torch.int32)
+
+            else:
+                ref = None
+                for item_info in bucket:
+                    audio_latent_cache_path = getattr(item_info, "audio_latent_cache_path", None)
+                    if audio_latent_cache_path is None or not os.path.exists(audio_latent_cache_path):
+                        continue
+                    sd_audio = load_file(audio_latent_cache_path)
+                    for key, value in sd_audio.items():
+                        if key.startswith("audio_latents_"):
+                            ref = value
+                            break
+                    if isinstance(ref, torch.Tensor):
+                        break
+
+                if isinstance(ref, torch.Tensor) and ref.dim() == 3:
+                    channels = int(ref.shape[0])
+                    mel_bins = int(ref.shape[2])
+                    dtype = ref.dtype
+                    device = ref.device
+
+                    bsz = end - start
+                    max_t = 1
+                    batch_tensor_data["audio_latents"] = torch.zeros((bsz, channels, max_t, mel_bins), device=device, dtype=dtype)
+                    batch_tensor_data["audio_lengths"] = torch.zeros((bsz,), device=device, dtype=torch.int32)
 
         if self.timestep_pool is not None:
             batch_tensor_data["timesteps"] = self.timestep_pool[idx][: end - start]  # use the pre-generated timesteps

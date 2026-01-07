@@ -41,6 +41,48 @@ class LTX2Wrapper(nn.Module):
             audio_latent_downsample_factor=audio_latent_downsample_factor,
             is_causal=is_causal_audio,
         )
+        self.patch_size = patch_size
+
+    def enable_gradient_checkpointing(self, activation_cpu_offloading: bool = False):
+        if hasattr(self.model, "enable_gradient_checkpointing"):
+            return self.model.enable_gradient_checkpointing(activation_cpu_offloading)
+        if hasattr(self.model, "set_gradient_checkpointing"):
+            self.model.set_gradient_checkpointing(True)
+            if hasattr(self.model, "activation_cpu_offloading"):
+                self.model.activation_cpu_offloading = activation_cpu_offloading
+            return None
+        raise AttributeError("Underlying LTX2 model does not support gradient checkpointing")
+
+    def disable_gradient_checkpointing(self):
+        if hasattr(self.model, "disable_gradient_checkpointing"):
+            return self.model.disable_gradient_checkpointing()
+        if hasattr(self.model, "set_gradient_checkpointing"):
+            self.model.set_gradient_checkpointing(False)
+            if hasattr(self.model, "activation_cpu_offloading"):
+                self.model.activation_cpu_offloading = False
+            return None
+        raise AttributeError("Underlying LTX2 model does not support gradient checkpointing")
+
+    def enable_block_swap(
+        self, blocks_to_swap: int, device: torch.device, supports_backward: bool, use_pinned_memory: bool = False
+    ):
+        return self.model.enable_block_swap(blocks_to_swap, device, supports_backward, use_pinned_memory)
+
+    def move_to_device_except_swap_blocks(self, device: torch.device):
+        return self.model.move_to_device_except_swap_blocks(device)
+
+    def prepare_block_swap_before_forward(self):
+        return self.model.prepare_block_swap_before_forward()
+
+    def switch_block_swap_for_inference(self):
+        if hasattr(self.model, "switch_block_swap_for_inference"):
+            return self.model.switch_block_swap_for_inference()
+        return None
+
+    def switch_block_swap_for_training(self):
+        if hasattr(self.model, "switch_block_swap_for_training"):
+            return self.model.switch_block_swap_for_training()
+        return None
 
     def __getattr__(self, name: str):
         try:
