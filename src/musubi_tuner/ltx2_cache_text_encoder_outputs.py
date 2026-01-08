@@ -91,6 +91,10 @@ def main() -> None:
     else:
         dtype = torch.float32
 
+    if getattr(args, "gemma_load_in_8bit", False) or getattr(args, "gemma_load_in_4bit", False):
+        if device.type != "cuda":
+            raise ValueError("Gemma 8-bit/4-bit loading requires --device cuda")
+
     autocast_dtype = torch.float16 if args.mixed_precision == "fp16" else torch.bfloat16 if args.mixed_precision == "bf16" else None
 
     if args.gemma_root is None:
@@ -117,11 +121,30 @@ def main() -> None:
     configurator = AVGemmaTextEncoderModelConfigurator if audio_video else VideoGemmaTextEncoderModelConfigurator
     key_ops = AV_GEMMA_TEXT_ENCODER_KEY_OPS if audio_video else VIDEO_ONLY_GEMMA_TEXT_ENCODER_KEY_OPS
 
+    bnb_compute_dtype = None
+    bnb_compute_dtype_arg = getattr(args, "gemma_bnb_4bit_compute_dtype", "auto")
+    if bnb_compute_dtype_arg == "auto":
+        bnb_compute_dtype = dtype
+    elif bnb_compute_dtype_arg == "fp16":
+        bnb_compute_dtype = torch.float16
+    elif bnb_compute_dtype_arg == "bf16":
+        bnb_compute_dtype = torch.bfloat16
+    elif bnb_compute_dtype_arg == "fp32":
+        bnb_compute_dtype = torch.float32
+
     text_encoder = SingleGPUModelBuilder(
         model_path=str(text_encoder_checkpoint),
         model_class_configurator=configurator,
         model_sd_ops=key_ops,
-        module_ops=module_ops_from_gemma_root(args.gemma_root),
+        module_ops=module_ops_from_gemma_root(
+            args.gemma_root,
+            torch_dtype=dtype,
+            load_in_8bit=bool(getattr(args, "gemma_load_in_8bit", False)),
+            load_in_4bit=bool(getattr(args, "gemma_load_in_4bit", False)),
+            bnb_4bit_quant_type=str(getattr(args, "gemma_bnb_4bit_quant_type", "nf4")),
+            bnb_4bit_use_double_quant=not bool(getattr(args, "gemma_bnb_4bit_disable_double_quant", False)),
+            bnb_4bit_compute_dtype=bnb_compute_dtype,
+        ),
     ).build(device=device, dtype=dtype)
     text_encoder.eval()
 
@@ -201,6 +224,36 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         default="no",
         choices=["no", "fp16", "bf16"],
         help="Mixed precision mode",
+    )
+
+    parser.add_argument(
+        "--gemma_load_in_8bit",
+        action="store_true",
+        help="Load Gemma LLM in 8-bit (bitsandbytes). CUDA only.",
+    )
+    parser.add_argument(
+        "--gemma_load_in_4bit",
+        action="store_true",
+        help="Load Gemma LLM in 4-bit (bitsandbytes). CUDA only.",
+    )
+    parser.add_argument(
+        "--gemma_bnb_4bit_quant_type",
+        type=str,
+        default="nf4",
+        choices=["nf4", "fp4"],
+        help="bitsandbytes 4-bit quant type (nf4 or fp4)",
+    )
+    parser.add_argument(
+        "--gemma_bnb_4bit_disable_double_quant",
+        action="store_true",
+        help="Disable bitsandbytes double quant for 4-bit loading.",
+    )
+    parser.add_argument(
+        "--gemma_bnb_4bit_compute_dtype",
+        type=str,
+        default="auto",
+        choices=["auto", "fp16", "bf16", "fp32"],
+        help="Compute dtype for 4-bit (auto uses --mixed_precision dtype)",
     )
     return parser
 

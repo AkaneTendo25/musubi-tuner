@@ -952,12 +952,32 @@ class LTX2NetworkTrainer(NetworkTrainer):
             configurator = AVGemmaTextEncoderModelConfigurator if self._audio_video else VideoGemmaTextEncoderModelConfigurator
             key_ops = AV_GEMMA_TEXT_ENCODER_KEY_OPS if self._audio_video else VIDEO_ONLY_GEMMA_TEXT_ENCODER_KEY_OPS
 
+            mixed_precision = getattr(accelerator, "mixed_precision", "no")
+            if mixed_precision == "bf16":
+                text_encoder_dtype = torch.bfloat16
+            elif mixed_precision == "fp16":
+                text_encoder_dtype = torch.float16
+            else:
+                text_encoder_dtype = torch.float32
+
+            if getattr(args, "gemma_load_in_8bit", False) or getattr(args, "gemma_load_in_4bit", False):
+                if accelerator.device.type != "cuda":
+                    raise ValueError("Gemma 8-bit/4-bit loading requires CUDA")
+
             self._text_encoder = SingleGPUModelBuilder(
                 model_path=str(args.ltx2_checkpoint),
                 model_class_configurator=configurator,
                 model_sd_ops=key_ops,
-                module_ops=module_ops_from_gemma_root(args.gemma_root),
-            ).build(device=accelerator.device, dtype=torch.float32)
+                module_ops=module_ops_from_gemma_root(
+                    args.gemma_root,
+                    torch_dtype=text_encoder_dtype,
+                    load_in_8bit=bool(getattr(args, "gemma_load_in_8bit", False)),
+                    load_in_4bit=bool(getattr(args, "gemma_load_in_4bit", False)),
+                    bnb_4bit_quant_type=str(getattr(args, "gemma_bnb_4bit_quant_type", "nf4")),
+                    bnb_4bit_use_double_quant=not bool(getattr(args, "gemma_bnb_4bit_disable_double_quant", False)),
+                    bnb_4bit_compute_dtype=text_encoder_dtype,
+                ),
+            ).build(device=accelerator.device, dtype=text_encoder_dtype)
             self._text_encoder.eval()
 
         def encode_prompt(prompt_text: str) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -991,6 +1011,16 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 param["negative_prompt_embeds"] = neg_embeds
                 param["negative_prompt_attention_mask"] = neg_mask
             sample_parameters.append(param)
+
+        if self._text_encoder is not None:
+            if hasattr(self._text_encoder, "model"):
+                self._text_encoder.model = None
+            if hasattr(self._text_encoder, "tokenizer"):
+                self._text_encoder.tokenizer = None
+            if hasattr(self._text_encoder, "feature_extractor_linear"):
+                self._text_encoder.feature_extractor_linear = None
+            if accelerator.device.type == "cuda":
+                torch.cuda.empty_cache()
 
         return sample_parameters
 
@@ -1132,6 +1162,29 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         default=None,
         help="Local directory containing Gemma weights/tokenizer (used for sample prompts)",
     )
+    parser.add_argument(
+        "--gemma_load_in_8bit",
+        action="store_true",
+        help="Load Gemma LLM in 8-bit (bitsandbytes). CUDA only.",
+    )
+    parser.add_argument(
+        "--gemma_load_in_4bit",
+        action="store_true",
+        help="Load Gemma LLM in 4-bit (bitsandbytes). CUDA only.",
+    )
+    parser.add_argument(
+        "--gemma_bnb_4bit_quant_type",
+        type=str,
+        default="nf4",
+        choices=["nf4", "fp4"],
+        help="bitsandbytes 4-bit quant type (nf4 or fp4)",
+    )
+    parser.add_argument(
+        "--gemma_bnb_4bit_disable_double_quant",
+        action="store_true",
+        help="Disable bitsandbytes double quant for 4-bit loading.",
+    )
+
     parser.add_argument(
         "--network_module",
         type=str,

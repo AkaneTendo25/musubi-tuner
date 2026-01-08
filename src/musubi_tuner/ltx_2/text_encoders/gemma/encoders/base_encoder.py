@@ -51,9 +51,9 @@ class GemmaTextEncoderModelBase(torch.nn.Module):
         return self.feature_extractor_linear(normed_concated_encoded_text_features.to(encoded_text_features_dtype))
 
     def _convert_to_additive_mask(self, attention_mask: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
-        return (attention_mask - 1).to(dtype).reshape(
-            (attention_mask.shape[0], 1, -1, attention_mask.shape[-1])
-        ) * torch.finfo(dtype).max
+        return (attention_mask - 1).to(dtype).reshape((attention_mask.shape[0], 1, -1, attention_mask.shape[-1])) * torch.finfo(
+            dtype
+        ).max
 
     def _preprocess_text(self, text: str, padding_side: str = "left") -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """
@@ -161,6 +161,23 @@ class GemmaTextEncoderModelBase(torch.nn.Module):
     def forward(self, text: str, padding_side: str = "left") -> tuple[torch.Tensor, torch.Tensor]:
         raise NotImplementedError("This method is not implemented for the base class")
 
+    def to(self, *args, **kwargs):
+        model = getattr(self, "model", None)
+        is_quantized = False
+        if model is not None:
+            is_quantized = bool(getattr(model, "is_loaded_in_8bit", False)) or bool(getattr(model, "is_loaded_in_4bit", False))
+
+        if not is_quantized:
+            return super().to(*args, **kwargs)
+
+        stored_model = self._modules.pop("model", None)
+        try:
+            return super().to(*args, **kwargs)
+        finally:
+            if stored_model is not None:
+                self._modules["model"] = stored_model
+                self.model = stored_model
+
 
 def _norm_and_concat_padded_batch(
     encoded_text: torch.Tensor,
@@ -238,14 +255,53 @@ def _find_matching_dir(root_path: str, pattern: str) -> str:
     return str(matches[0].parent)
 
 
-def module_ops_from_gemma_root(gemma_root: str) -> tuple[ModuleOps, ...]:
+def module_ops_from_gemma_root(
+    gemma_root: str,
+    *,
+    torch_dtype: torch.dtype = torch.bfloat16,
+    load_in_8bit: bool = False,
+    load_in_4bit: bool = False,
+    bnb_4bit_quant_type: str = "nf4",
+    bnb_4bit_use_double_quant: bool = True,
+    bnb_4bit_compute_dtype: torch.dtype | None = None,
+) -> tuple[ModuleOps, ...]:
     gemma_path = _find_matching_dir(gemma_root, "model*.safetensors")
     tokenizer_path = _find_matching_dir(gemma_root, "tokenizer.model")
 
     def load_gemma(module: GemmaTextEncoderModelBase) -> GemmaTextEncoderModelBase:
-        module.model = Gemma3ForConditionalGeneration.from_pretrained(
-            gemma_path, local_files_only=True, torch_dtype=torch.bfloat16
-        )
+        if load_in_8bit and load_in_4bit:
+            raise ValueError("Only one of load_in_8bit or load_in_4bit can be enabled")
+
+        if load_in_8bit or load_in_4bit:
+            if not torch.cuda.is_available():
+                raise ValueError("8-bit/4-bit Gemma loading requires CUDA")
+
+            from transformers import BitsAndBytesConfig
+
+            if load_in_8bit:
+                quantization_config = BitsAndBytesConfig(load_in_8bit=True)
+            else:
+                compute_dtype = bnb_4bit_compute_dtype if bnb_4bit_compute_dtype is not None else torch_dtype
+                quantization_config = BitsAndBytesConfig(
+                    load_in_4bit=True,
+                    bnb_4bit_quant_type=bnb_4bit_quant_type,
+                    bnb_4bit_use_double_quant=bnb_4bit_use_double_quant,
+                    bnb_4bit_compute_dtype=compute_dtype,
+                )
+
+            module.model = Gemma3ForConditionalGeneration.from_pretrained(
+                gemma_path,
+                local_files_only=True,
+                torch_dtype=torch_dtype,
+                quantization_config=quantization_config,
+                device_map={"": "cuda"},
+            )
+        else:
+            module.model = Gemma3ForConditionalGeneration.from_pretrained(
+                gemma_path,
+                local_files_only=True,
+                torch_dtype=torch_dtype,
+            )
         module._gemma_root = module._gemma_root or gemma_root
         return module
 
