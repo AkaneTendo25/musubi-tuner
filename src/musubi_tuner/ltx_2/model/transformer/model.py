@@ -5,6 +5,7 @@ from musubi_tuner.modules.custom_offloading_utils import ModelOffloader
 from musubi_tuner.ltx_2.guidance.perturbations import BatchedPerturbationConfig
 from musubi_tuner.ltx_2.model.transformer.adaln import AdaLayerNormSingle
 from musubi_tuner.ltx_2.model.transformer.attention import AttentionCallable, AttentionFunction
+from musubi_tuner.ltx_2.model.transformer.fp8_device_utils import ensure_fp8_modules_on_device
 from musubi_tuner.ltx_2.model.transformer.modality import Modality
 from musubi_tuner.ltx_2.model.transformer.rope import LTXRopeType
 from musubi_tuner.ltx_2.model.transformer.text_projection import PixArtAlphaTextProjection
@@ -393,6 +394,13 @@ class LTXModel(torch.nn.Module):
         for block_idx, block in enumerate(self.transformer_blocks):
             if self.blocks_to_swap and self.offloader is not None:
                 self.offloader.wait_for_block(block_idx)
+                target_device = None
+                if video is not None and isinstance(video.x, torch.Tensor):
+                    target_device = video.x.device
+                elif audio is not None and isinstance(audio.x, torch.Tensor):
+                    target_device = audio.x.device
+                if target_device is not None:
+                    ensure_fp8_modules_on_device(block, target_device)
 
             if self._enable_gradient_checkpointing and self.training:
                 video, audio = torch.utils.checkpoint.checkpoint(

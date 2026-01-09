@@ -3,6 +3,7 @@ from dataclasses import dataclass, replace
 import torch
 from musubi_tuner.ltx_2.guidance.perturbations import BatchedPerturbationConfig, PerturbationType
 from musubi_tuner.ltx_2.model.transformer.attention import Attention, AttentionCallable, AttentionFunction
+from musubi_tuner.ltx_2.model.transformer.fp8_device_utils import ensure_fp8_modules_on_device
 from musubi_tuner.ltx_2.model.transformer.feed_forward import FeedForward
 from musubi_tuner.ltx_2.model.transformer.rope import LTXRopeType
 from musubi_tuner.ltx_2.model.transformer.transformer_args import TransformerArgs
@@ -139,6 +140,13 @@ class BasicAVTransformerBlock(torch.nn.Module):
         audio: TransformerArgs | None,
         perturbations: BatchedPerturbationConfig | None = None,
     ) -> tuple[TransformerArgs | None, TransformerArgs | None]:
+        target_device = None
+        if video is not None and isinstance(video.x, torch.Tensor):
+            target_device = video.x.device
+        elif audio is not None and isinstance(audio.x, torch.Tensor):
+            target_device = audio.x.device
+        if target_device is not None:
+            ensure_fp8_modules_on_device(self, target_device)
         batch_size = video.x.shape[0]
         if perturbations is None:
             perturbations = BatchedPerturbationConfig.empty(batch_size)

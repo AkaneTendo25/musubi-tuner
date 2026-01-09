@@ -5,7 +5,7 @@ import os
 import re
 from typing import Any, Dict, List, Optional, Tuple, Union
 import torch
-from accelerate import Accelerator
+from accelerate import Accelerator, PartialState
 from tqdm import tqdm
 import logging
 
@@ -17,8 +17,12 @@ from musubi_tuner.hv_train_network import (
     load_prompts,
     read_config_from_file,
     setup_parser_common,
+    should_sample_images,
 )
+from musubi_tuner.hv_generate_video import save_images_grid, save_videos_grid
+from musubi_tuner.utils.device_utils import clean_memory_on_device
 from musubi_tuner.utils import model_utils
+from musubi_tuner.ltx_2.model.transformer.fp8_device_utils import ensure_fp8_modules_on_device
 from musubi_tuner.utils.safetensors_utils import MemoryEfficientSafeOpen
 from musubi_tuner.modules.fp8_optimization_utils import apply_fp8_monkey_patch
 from musubi_tuner.utils.lora_utils import load_safetensors_with_lora_and_fp8
@@ -170,16 +174,21 @@ def load_ltx2_model(
     target_device = torch.device(device)
     load_device = torch.device(load_device)
 
-    from musubi_tuner.networks.lora_ltx2 import load_ltx2_wrapper
-
-    logger.info("Loading LTX-2 transformer via LTX2Wrapper: %s", model_path)
-    model = load_ltx2_wrapper(
-        model_path,
-        device=load_device,
-        dtype=torch_dtype or torch.float32,
-        audio_video=audio_video,
-        patch_size=1,
+    from musubi_tuner.ltx_2.loader.sft_loader import SafetensorsModelStateDictLoader
+    from musubi_tuner.ltx_2.model.transformer.model_configurator import (
+        LTXModelConfigurator,
+        LTXVideoOnlyModelConfigurator,
+        LTXV_MODEL_COMFY_RENAMING_MAP,
     )
+    from musubi_tuner.networks.lora_ltx2 import LTX2Wrapper
+
+    logger.info("Loading LTX-2 transformer via state dict: %s", model_path)
+    loader = SafetensorsModelStateDictLoader()
+    config = loader.metadata(model_path)
+    configurator = LTXModelConfigurator if audio_video else LTXVideoOnlyModelConfigurator
+
+    with torch.device("meta"):
+        base_model = configurator.from_config(config)
 
     if fp8_scaled:
         fp8_calc_device = target_device if load_device == target_device else torch.device("cpu")
@@ -194,17 +203,31 @@ def load_ltx2_model(
             target_keys=["transformer_blocks"],
             exclude_keys=list(KEEP_FP8_HIGH_PRECISION_TOKENS),
         )
-        from musubi_tuner.ltx_2.model.transformer.model_configurator import LTXV_MODEL_COMFY_RENAMING_MAP
+    else:
+        sd = load_safetensors_with_lora_and_fp8(
+            model_files=model_path,
+            lora_weights_list=None,
+            lora_multipliers=None,
+            fp8_optimization=False,
+            calc_device=load_device,
+            move_to_device=True,
+            dit_weight_dtype=torch_dtype,
+            target_keys=None,
+            exclude_keys=None,
+        )
 
-        renamed_sd: dict[str, torch.Tensor] = {}
-        for k, v in sd.items():
-            nk = LTXV_MODEL_COMFY_RENAMING_MAP.apply_to_key(k)
-            renamed_sd[nk if nk is not None else k] = v
-        sd = renamed_sd
-        base_model = model.model if hasattr(model, "model") else model
+    renamed_sd: dict[str, torch.Tensor] = {}
+    for k, v in sd.items():
+        nk = LTXV_MODEL_COMFY_RENAMING_MAP.apply_to_key(k)
+        renamed_sd[nk if nk is not None else k] = v
+    sd = renamed_sd
+
+    if fp8_scaled:
         apply_fp8_monkey_patch(base_model, sd, use_scaled_mm=False)
-        base_model.load_state_dict(sd, strict=False, assign=True)
+    base_model.load_state_dict(sd, strict=False, assign=True)
+    base_model = base_model.to(load_device)
 
+    model = LTX2Wrapper(base_model, patch_size=1)
     if load_device == target_device:
         model = model.to(device=target_device)
     return model
@@ -237,6 +260,29 @@ class LTX2NetworkTrainer(NetworkTrainer):
             return timesteps
 
         return timesteps / 1000.0
+
+    def _ensure_fp8_buffers_on_device(self, model: torch.nn.Module) -> None:
+        if not any(True for _ in model.parameters()):
+            return
+        ensure_fp8_modules_on_device(model, next(model.parameters()).device)
+
+    class _DeferredVAE:
+        def __init__(self) -> None:
+            self._deferred = True
+            self.temporal_downsample_factor = 8
+            self.spatial_downsample_factor = 32
+
+        def to_device(self, _device) -> None:
+            return None
+
+        def to_dtype(self, _dtype) -> None:
+            return None
+
+        def eval(self) -> None:
+            return None
+
+        def requires_grad_(self, _requires_grad: bool = True):
+            return self
 
     @staticmethod
     def _shifted_logit_normal_shift_for_sequence_length(
@@ -304,6 +350,25 @@ class LTX2NetworkTrainer(NetworkTrainer):
     def handle_model_specific_args(self, args: argparse.Namespace) -> None:
         """Handle LTX-2-specific command line arguments"""
         self.dit_dtype = detect_ltx2_dtype(args.ltx2_checkpoint)
+        if self.dit_dtype is not None and self.dit_dtype.itemsize == 1:
+            if args.mixed_precision == "fp16":
+                compute_dtype = torch.float16
+            elif args.mixed_precision == "bf16":
+                compute_dtype = torch.bfloat16
+            else:
+                compute_dtype = torch.float32
+            logger.warning(
+                "LTX-2 weights are fp8; overriding compute dtype to %s for training stability.",
+                compute_dtype,
+            )
+            self.dit_dtype = compute_dtype
+        elif self.dit_dtype == torch.float32 and args.mixed_precision in ["fp16", "bf16"]:
+            compute_dtype = torch.float16 if args.mixed_precision == "fp16" else torch.bfloat16
+            logger.warning(
+                "LTX-2 weights are fp32; casting compute dtype to %s to reduce memory usage.",
+                compute_dtype,
+            )
+            self.dit_dtype = compute_dtype
 
         if getattr(args, "fp8_scaled", False):
             assert getattr(args, "fp8_base", False), "fp8_scaled requires fp8_base / fp8_scaledはfp8_baseが必要です"
@@ -379,11 +444,14 @@ class LTX2NetworkTrainer(NetworkTrainer):
 
         self._dit_attn_mode = attn_mode
 
+        torch_dtype_to_use = dit_weight_dtype or self.dit_dtype or torch.float32
+        if dit_weight_dtype is None:
+            logger.info("LTX-2 weight dtype not set; using %s for loading", torch_dtype_to_use)
         transformer = load_ltx2_model(
             model_path=dit_path,
             device=accelerator.device,
             load_device=loading_device,
-            torch_dtype=dit_weight_dtype,
+            torch_dtype=torch_dtype_to_use,
             attn_mode=attn_mode,
             audio_video=self._audio_video,
             fp8_scaled=bool(getattr(args, "fp8_scaled", False)),
@@ -401,7 +469,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
             target_blocks.append(base_model.transformer_blocks)
         return model_utils.compile_transformer(args, transformer, target_blocks, disable_linear=self.blocks_to_swap > 0)
 
-    def load_vae(self, args: argparse.Namespace, vae_dtype: torch.dtype, vae_path: str):
+    def _load_vae_impl(self, args: argparse.Namespace, vae_dtype: torch.dtype, vae_path: str):
         """Load VAE for LTX2"""
         logger.info(f"Loading VAE from {vae_path}")
         from musubi_tuner.ltx_2.loader.single_gpu_model_builder import SingleGPUModelBuilder
@@ -467,6 +535,12 @@ class LTX2NetworkTrainer(NetworkTrainer):
         vae = _LTX2VideoVAE(decoder)
         self._update_latent_norm_base_from_vae(vae)
         return vae
+
+    def load_vae(self, args: argparse.Namespace, vae_dtype: torch.dtype, vae_path: str):
+        if getattr(args, "sample_prompts", None):
+            logger.info("LTX-2 sampling: deferring VAE load until sampling")
+            return self._DeferredVAE()
+        return self._load_vae_impl(args, vae_dtype, vae_path)
 
     def _update_latent_norm_base_from_vae(self, vae) -> None:
         """Update latent normalization statistics from VAE config"""
@@ -768,6 +842,8 @@ class LTX2NetworkTrainer(NetworkTrainer):
             perturbations = BatchedPerturbationConfig.empty(bsz)
             base_model = transformer.model if hasattr(transformer, "model") else transformer
 
+            if getattr(args, "fp8_base", False) or getattr(args, "fp8_scaled", False):
+                self._ensure_fp8_buffers_on_device(base_model)
             with accelerator.autocast():
                 pred_tokens, _ = base_model(video_modality, None, perturbations)
 
@@ -839,6 +915,8 @@ class LTX2NetworkTrainer(NetworkTrainer):
             if frames > 0:
                 video_loss_mask_frames[video_conditioning_enabled, 0] = False
 
+        if getattr(args, "fp8_base", False) or getattr(args, "fp8_scaled", False):
+            self._ensure_fp8_buffers_on_device(transformer)
         with accelerator.autocast():
             model_pred = transformer(
                 model_input,
@@ -929,100 +1007,409 @@ class LTX2NetworkTrainer(NetworkTrainer):
         sample_prompts: str,
     ) -> Optional[List[Dict]]:
         """Process sample prompts for inference preview during training"""
+        logger.info("LTX-2 sampling: deferring Gemma encoding until sampling")
         prompts = load_prompts(sample_prompts)
         if not prompts:
             return None
 
-        if self._text_encoder is None:
-            if getattr(args, "gemma_root", None) is None:
-                raise ValueError("--gemma_root is required for LTX-2 sample prompts")
-            if getattr(args, "ltx2_checkpoint", None) is None:
-                raise ValueError("--ltx2_checkpoint is required for LTX-2 sample prompts")
-            from musubi_tuner.ltx_2.loader.single_gpu_model_builder import SingleGPUModelBuilder
-            from musubi_tuner.ltx_2.text_encoders.gemma.encoders.av_encoder import (
-                AVGemmaTextEncoderModelConfigurator,
-                AV_GEMMA_TEXT_ENCODER_KEY_OPS,
-            )
-            from musubi_tuner.ltx_2.text_encoders.gemma.encoders.base_encoder import module_ops_from_gemma_root
-            from musubi_tuner.ltx_2.text_encoders.gemma.encoders.video_only_encoder import (
-                VIDEO_ONLY_GEMMA_TEXT_ENCODER_KEY_OPS,
-                VideoGemmaTextEncoderModelConfigurator,
-            )
-
-            configurator = AVGemmaTextEncoderModelConfigurator if self._audio_video else VideoGemmaTextEncoderModelConfigurator
-            key_ops = AV_GEMMA_TEXT_ENCODER_KEY_OPS if self._audio_video else VIDEO_ONLY_GEMMA_TEXT_ENCODER_KEY_OPS
-
-            mixed_precision = getattr(accelerator, "mixed_precision", "no")
-            if mixed_precision == "bf16":
-                text_encoder_dtype = torch.bfloat16
-            elif mixed_precision == "fp16":
-                text_encoder_dtype = torch.float16
-            else:
-                text_encoder_dtype = torch.float32
-
-            if getattr(args, "gemma_load_in_8bit", False) or getattr(args, "gemma_load_in_4bit", False):
-                if accelerator.device.type != "cuda":
-                    raise ValueError("Gemma 8-bit/4-bit loading requires CUDA")
-
-            self._text_encoder = SingleGPUModelBuilder(
-                model_path=str(args.ltx2_checkpoint),
-                model_class_configurator=configurator,
-                model_sd_ops=key_ops,
-                module_ops=module_ops_from_gemma_root(
-                    args.gemma_root,
-                    torch_dtype=text_encoder_dtype,
-                    load_in_8bit=bool(getattr(args, "gemma_load_in_8bit", False)),
-                    load_in_4bit=bool(getattr(args, "gemma_load_in_4bit", False)),
-                    bnb_4bit_quant_type=str(getattr(args, "gemma_bnb_4bit_quant_type", "nf4")),
-                    bnb_4bit_use_double_quant=not bool(getattr(args, "gemma_bnb_4bit_disable_double_quant", False)),
-                    bnb_4bit_compute_dtype=text_encoder_dtype,
-                ),
-            ).build(device=accelerator.device, dtype=text_encoder_dtype)
-            self._text_encoder.eval()
-
-        def encode_prompt(prompt_text: str) -> Tuple[torch.Tensor, torch.Tensor]:
-            with accelerator.autocast(), torch.no_grad():
-                out = self._text_encoder(prompt_text, padding_side="left")
-                if self._audio_video:
-                    embed = torch.cat([out.video_encoding, out.audio_encoding], dim=-1)
-                else:
-                    embed = out.video_encoding
-                mask = out.attention_mask
-            return embed.squeeze(0).detach().cpu(), mask.squeeze(0).detach().cpu()
+        default_height = int(getattr(args, "height", 512))
+        default_width = int(getattr(args, "width", 768))
+        default_frame_count = int(getattr(args, "sample_num_frames", 45))
+        default_guidance_scale = float(getattr(args, "guidance_scale", self.default_guidance_scale))
+        default_discrete_flow_shift = getattr(args, "discrete_flow_shift", None)
 
         sample_parameters = []
         for prompt_data in prompts:
             prompt_text = prompt_data.get("prompt", "")
-            prompt_embeds, prompt_mask = encode_prompt(prompt_text)
-            param = {
-                "prompt": prompt_text,
-                "negative_prompt": prompt_data.get("negative_prompt", ""),
-                "height": prompt_data.get("height", args.height),
-                "width": prompt_data.get("width", args.width),
-                "num_frames": prompt_data.get("num_frames", 45),
-                "seed": prompt_data.get("seed", 0),
-                "prompt_embeds": prompt_embeds,
-                "prompt_attention_mask": prompt_mask,
-            }
-
-            negative_prompt = param["negative_prompt"]
-            if negative_prompt:
-                neg_embeds, neg_mask = encode_prompt(negative_prompt)
-                param["negative_prompt_embeds"] = neg_embeds
-                param["negative_prompt_attention_mask"] = neg_mask
+            param = prompt_data.copy()
+            param.setdefault("prompt", prompt_text)
+            param.setdefault("negative_prompt", prompt_data.get("negative_prompt", ""))
+            if "frame_count" not in param and "num_frames" in param:
+                param["frame_count"] = param["num_frames"]
+            param.setdefault("height", prompt_data.get("height", default_height))
+            param.setdefault("width", prompt_data.get("width", default_width))
+            param.setdefault("frame_count", prompt_data.get("frame_count", default_frame_count))
+            param.setdefault("sample_steps", prompt_data.get("sample_steps", 20))
+            param.setdefault("guidance_scale", prompt_data.get("guidance_scale", default_guidance_scale))
+            if default_discrete_flow_shift is not None:
+                param.setdefault("discrete_flow_shift", prompt_data.get("discrete_flow_shift", default_discrete_flow_shift))
+            param.setdefault("seed", prompt_data.get("seed", 0))
             sample_parameters.append(param)
 
-        if self._text_encoder is not None:
-            if hasattr(self._text_encoder, "model"):
-                self._text_encoder.model = None
-            if hasattr(self._text_encoder, "tokenizer"):
-                self._text_encoder.tokenizer = None
-            if hasattr(self._text_encoder, "feature_extractor_linear"):
-                self._text_encoder.feature_extractor_linear = None
-            if accelerator.device.type == "cuda":
-                torch.cuda.empty_cache()
-
         return sample_parameters
+
+    def _build_text_encoder(self, args: argparse.Namespace, accelerator: Accelerator) -> torch.dtype:
+        logger.info("Loading Gemma text encoder for LTX-2 sampling")
+        if getattr(args, "gemma_root", None) is None:
+            raise ValueError("--gemma_root is required for LTX-2 sample prompts")
+        if getattr(args, "ltx2_checkpoint", None) is None:
+            raise ValueError("--ltx2_checkpoint is required for LTX-2 sample prompts")
+        from musubi_tuner.ltx_2.loader.single_gpu_model_builder import SingleGPUModelBuilder
+        from musubi_tuner.ltx_2.text_encoders.gemma.encoders.av_encoder import (
+            AVGemmaTextEncoderModelConfigurator,
+            AV_GEMMA_TEXT_ENCODER_KEY_OPS,
+        )
+        from musubi_tuner.ltx_2.text_encoders.gemma.encoders.base_encoder import module_ops_from_gemma_root
+        from musubi_tuner.ltx_2.text_encoders.gemma.encoders.video_only_encoder import (
+            VIDEO_ONLY_GEMMA_TEXT_ENCODER_KEY_OPS,
+            VideoGemmaTextEncoderModelConfigurator,
+        )
+
+        configurator = AVGemmaTextEncoderModelConfigurator if self._audio_video else VideoGemmaTextEncoderModelConfigurator
+        key_ops = AV_GEMMA_TEXT_ENCODER_KEY_OPS if self._audio_video else VIDEO_ONLY_GEMMA_TEXT_ENCODER_KEY_OPS
+
+        mixed_precision = getattr(accelerator, "mixed_precision", "no")
+        if mixed_precision == "bf16":
+            text_encoder_dtype = torch.bfloat16
+        elif mixed_precision == "fp16":
+            text_encoder_dtype = torch.float16
+        else:
+            text_encoder_dtype = torch.float32
+
+        if getattr(args, "gemma_load_in_8bit", False) or getattr(args, "gemma_load_in_4bit", False):
+            if accelerator.device.type != "cuda":
+                raise ValueError("Gemma 8-bit/4-bit loading requires CUDA")
+
+        self._text_encoder = SingleGPUModelBuilder(
+            model_path=str(args.ltx2_checkpoint),
+            model_class_configurator=configurator,
+            model_sd_ops=key_ops,
+            module_ops=module_ops_from_gemma_root(
+                args.gemma_root,
+                torch_dtype=text_encoder_dtype,
+                load_in_8bit=bool(getattr(args, "gemma_load_in_8bit", False)),
+                load_in_4bit=bool(getattr(args, "gemma_load_in_4bit", False)),
+                bnb_4bit_quant_type=str(getattr(args, "gemma_bnb_4bit_quant_type", "nf4")),
+                bnb_4bit_use_double_quant=not bool(getattr(args, "gemma_bnb_4bit_disable_double_quant", False)),
+                bnb_4bit_compute_dtype=text_encoder_dtype,
+            ),
+        ).build(device=accelerator.device, dtype=text_encoder_dtype)
+        self._text_encoder.eval()
+        return text_encoder_dtype
+
+    def _encode_prompt_text(
+        self,
+        accelerator: Accelerator,
+        prompt_text: str,
+        text_encoder_dtype: torch.dtype,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        with accelerator.autocast(), torch.no_grad():
+            out = self._text_encoder(prompt_text, padding_side="left")
+            if self._audio_video:
+                embed = torch.cat([out.video_encoding, out.audio_encoding], dim=-1)
+            else:
+                embed = out.video_encoding
+            mask = out.attention_mask
+        return embed.squeeze(0).detach().cpu(), mask.squeeze(0).detach().cpu()
+
+    def _cleanup_text_encoder(self, accelerator: Accelerator) -> None:
+        if self._text_encoder is None:
+            return
+        if hasattr(self._text_encoder, "model"):
+            self._text_encoder.model = None
+        if hasattr(self._text_encoder, "tokenizer"):
+            self._text_encoder.tokenizer = None
+        if hasattr(self._text_encoder, "feature_extractor_linear"):
+            self._text_encoder.feature_extractor_linear = None
+        self._text_encoder = None
+        if accelerator.device.type == "cuda":
+            torch.cuda.empty_cache()
+
+    def sample_images(
+        self,
+        accelerator: Accelerator,
+        args: argparse.Namespace,
+        epoch,
+        steps,
+        vae,
+        transformer,
+        sample_parameters,
+        dit_dtype,
+    ):
+        """LTX-2 sampling with optional DiT offloading between prompts."""
+        if not should_sample_images(args, steps, epoch):
+            return
+
+        logger.info("")
+        logger.info(f"generating sample images at step / サンプル画像生成 ステップ: {steps}")
+        if sample_parameters is None:
+            logger.error(f"No prompt file / プロンプトファイルがありません: {args.sample_prompts}")
+            return
+
+        distributed_state = PartialState()  # for multi gpu distributed inference
+
+        transformer = accelerator.unwrap_model(transformer)
+        transformer.switch_block_swap_for_inference()
+        original_device = next(transformer.parameters()).device
+        offload = bool(getattr(args, "offloading", False))
+        transformer_offloaded = offload and accelerator.device.type == "cuda"
+        if transformer_offloaded:
+            transformer.to("cpu")
+            clean_memory_on_device(accelerator.device)
+        if getattr(transformer, "blocks_to_swap", 0) and original_device.type == "cpu" and not transformer_offloaded:
+            if hasattr(transformer, "move_to_device_except_swap_blocks"):
+                transformer.move_to_device_except_swap_blocks(accelerator.device)
+            else:
+                transformer.to(accelerator.device)
+            clean_memory_on_device(accelerator.device)
+            original_device = accelerator.device
+
+        save_dir = os.path.join(args.output_dir, "sample")
+        os.makedirs(save_dir, exist_ok=True)
+
+        rng_state = torch.get_rng_state()
+        cuda_rng_state = None
+        try:
+            cuda_rng_state = torch.cuda.get_rng_state() if torch.cuda.is_available() else None
+        except Exception:
+            pass
+
+        def ensure_transformer_on_device() -> None:
+            if transformer_offloaded:
+                if hasattr(transformer, "move_to_device_except_swap_blocks"):
+                    transformer.move_to_device_except_swap_blocks(accelerator.device)
+                else:
+                    transformer.to(accelerator.device)
+                clean_memory_on_device(accelerator.device)
+
+        def offload_transformer_if_needed() -> None:
+            if transformer_offloaded:
+                transformer.to("cpu")
+                clean_memory_on_device(accelerator.device)
+
+        def prepare_embeddings_for_sample(sample_parameter: Dict) -> None:
+            if sample_parameter.get("prompt_embeds") is not None:
+                return
+            text_encoder_dtype = self._build_text_encoder(args, accelerator)
+            prompt_text = sample_parameter.get("prompt", "")
+            prompt_embeds, prompt_mask = self._encode_prompt_text(accelerator, prompt_text, text_encoder_dtype)
+            sample_parameter["prompt_embeds"] = prompt_embeds
+            sample_parameter["prompt_attention_mask"] = prompt_mask
+            negative_prompt = sample_parameter.get("negative_prompt", None)
+            if negative_prompt:
+                neg_embeds, neg_mask = self._encode_prompt_text(accelerator, negative_prompt, text_encoder_dtype)
+                sample_parameter["negative_prompt_embeds"] = neg_embeds
+                sample_parameter["negative_prompt_attention_mask"] = neg_mask
+            self._cleanup_text_encoder(accelerator)
+
+        def cleanup_embeddings(sample_parameter: Dict) -> None:
+            sample_parameter.pop("prompt_embeds", None)
+            sample_parameter.pop("prompt_attention_mask", None)
+            sample_parameter.pop("negative_prompt_embeds", None)
+            sample_parameter.pop("negative_prompt_attention_mask", None)
+
+        if distributed_state.num_processes <= 1:
+            with torch.no_grad(), accelerator.autocast():
+                for sample_parameter in sample_parameters:
+                    if transformer_offloaded:
+                        offload_transformer_if_needed()
+                        prepare_embeddings_for_sample(sample_parameter)
+                        vae_dtype = torch.float16 if args.vae_dtype is None else model_utils.str_to_dtype(args.vae_dtype)
+                        vae_for_sampling = self._load_vae_impl(args, vae_dtype=vae_dtype, vae_path=args.vae)
+                        ensure_transformer_on_device()
+                        self.sample_image_inference(
+                            accelerator, args, transformer, dit_dtype, vae_for_sampling, save_dir, sample_parameter, epoch, steps
+                        )
+                        offload_transformer_if_needed()
+                        cleanup_embeddings(sample_parameter)
+                        vae_for_sampling.to_device("cpu")
+                        clean_memory_on_device(accelerator.device)
+                    else:
+                        self.sample_image_inference(
+                            accelerator, args, transformer, dit_dtype, vae, save_dir, sample_parameter, epoch, steps
+                        )
+                    clean_memory_on_device(accelerator.device)
+        else:
+            per_process_params = []
+            for i in range(distributed_state.num_processes):
+                per_process_params.append(sample_parameters[i :: distributed_state.num_processes])
+
+            with torch.no_grad():
+                with distributed_state.split_between_processes(per_process_params) as sample_parameter_lists:
+                    for sample_parameter in sample_parameter_lists[0]:
+                        if transformer_offloaded:
+                            offload_transformer_if_needed()
+                            prepare_embeddings_for_sample(sample_parameter)
+                            vae_dtype = torch.float16 if args.vae_dtype is None else model_utils.str_to_dtype(args.vae_dtype)
+                            vae_for_sampling = self._load_vae_impl(args, vae_dtype=vae_dtype, vae_path=args.vae)
+                            ensure_transformer_on_device()
+                            self.sample_image_inference(
+                                accelerator,
+                                args,
+                                transformer,
+                                dit_dtype,
+                                vae_for_sampling,
+                                save_dir,
+                                sample_parameter,
+                                epoch,
+                                steps,
+                            )
+                            offload_transformer_if_needed()
+                            cleanup_embeddings(sample_parameter)
+                            vae_for_sampling.to_device("cpu")
+                            clean_memory_on_device(accelerator.device)
+                        else:
+                            self.sample_image_inference(
+                                accelerator, args, transformer, dit_dtype, vae, save_dir, sample_parameter, epoch, steps
+                            )
+                        clean_memory_on_device(accelerator.device)
+
+        torch.set_rng_state(rng_state)
+        if cuda_rng_state is not None:
+            torch.cuda.set_rng_state(cuda_rng_state)
+
+        if transformer_offloaded and next(transformer.parameters()).device != accelerator.device:
+            if hasattr(transformer, "move_to_device_except_swap_blocks"):
+                transformer.move_to_device_except_swap_blocks(accelerator.device)
+            else:
+                transformer.to(accelerator.device)
+            clean_memory_on_device(accelerator.device)
+
+        transformer.switch_block_swap_for_training()
+        clean_memory_on_device(accelerator.device)
+
+    def sample_image_inference(
+        self,
+        accelerator: Accelerator,
+        args: argparse.Namespace,
+        transformer,
+        dit_dtype: torch.dtype,
+        vae,
+        save_dir: str,
+        sample_parameter: Dict,
+        epoch,
+        steps,
+    ):
+        """LTX-2-specific sampling with proper frame/size rounding."""
+        loaded_vae = False
+        if vae is None or getattr(vae, "_deferred", False):
+            vae_dtype = torch.float16 if args.vae_dtype is None else model_utils.str_to_dtype(args.vae_dtype)
+            vae = self._load_vae_impl(args, vae_dtype=vae_dtype, vae_path=args.vae)
+            loaded_vae = True
+
+        sample_steps = sample_parameter.get("sample_steps", 20)
+        width = sample_parameter.get("width", 768)
+        height = sample_parameter.get("height", 512)
+        frame_count = sample_parameter.get("frame_count", 45)
+        guidance_scale = sample_parameter.get("guidance_scale", self.default_guidance_scale)
+        discrete_flow_shift = sample_parameter.get("discrete_flow_shift", 5.0)
+        seed = sample_parameter.get("seed")
+        prompt: str = sample_parameter.get("prompt", "")
+        cfg_scale = sample_parameter.get("cfg_scale", None)
+        negative_prompt = sample_parameter.get("negative_prompt", None)
+
+        spatial_factor = int(getattr(vae, "spatial_downsample_factor", 32))
+        temporal_factor = int(getattr(vae, "temporal_downsample_factor", 8))
+        width = (width // spatial_factor) * spatial_factor
+        height = (height // spatial_factor) * spatial_factor
+        frame_count = (frame_count - 1) // temporal_factor * temporal_factor + 1
+
+        loaded_text_encoder = False
+        if sample_parameter.get("prompt_embeds") is None:
+            text_encoder_dtype = self._build_text_encoder(args, accelerator)
+            prompt_embeds, prompt_mask = self._encode_prompt_text(accelerator, prompt, text_encoder_dtype)
+            sample_parameter["prompt_embeds"] = prompt_embeds
+            sample_parameter["prompt_attention_mask"] = prompt_mask
+            if negative_prompt:
+                neg_embeds, neg_mask = self._encode_prompt_text(accelerator, negative_prompt, text_encoder_dtype)
+                sample_parameter["negative_prompt_embeds"] = neg_embeds
+                sample_parameter["negative_prompt_attention_mask"] = neg_mask
+            loaded_text_encoder = True
+
+        device = accelerator.device
+        if seed is not None:
+            torch.manual_seed(seed)
+            torch.cuda.manual_seed(seed)
+            generator = torch.Generator(device=device).manual_seed(seed)
+        else:
+            torch.seed()
+            torch.cuda.seed()
+            generator = torch.Generator(device=device).manual_seed(torch.initial_seed())
+
+        logger.info(f"prompt: {prompt}")
+        logger.info(f"height: {height}")
+        logger.info(f"width: {width}")
+        logger.info(f"frame count: {frame_count}")
+        logger.info(f"sample steps: {sample_steps}")
+        logger.info(f"guidance scale: {guidance_scale}")
+        logger.info(f"discrete flow shift: {discrete_flow_shift}")
+        if seed is not None:
+            logger.info(f"seed: {seed}")
+
+        do_classifier_free_guidance = False
+        if negative_prompt is not None:
+            do_classifier_free_guidance = True
+            logger.info(f"negative prompt: {negative_prompt}")
+            logger.info(f"cfg scale: {cfg_scale}")
+
+        has_self_ref_orig_mod = getattr(transformer, "_orig_mod", None) is transformer
+        was_train = transformer.training if not has_self_ref_orig_mod else True
+        if not has_self_ref_orig_mod:
+            transformer.eval()
+
+        video = self.do_inference(
+            accelerator,
+            args,
+            sample_parameter,
+            vae,
+            dit_dtype,
+            transformer,
+            discrete_flow_shift,
+            sample_steps,
+            width,
+            height,
+            frame_count,
+            generator,
+            do_classifier_free_guidance,
+            guidance_scale,
+            cfg_scale,
+        )
+
+        if not has_self_ref_orig_mod:
+            transformer.train(was_train)
+
+        if video is None:
+            logger.error("No video generated / 生成された動画がありません")
+            return
+
+        ts_str = time.strftime("%Y%m%d%H%M%S", time.localtime())
+        num_suffix = f"e{epoch:06d}" if epoch is not None else f"{steps:06d}"
+        seed_suffix = "" if seed is None else f"_{seed}"
+        prompt_idx = sample_parameter.get("enum", 0)
+        save_path = (
+            f"{'' if args.output_name is None else args.output_name + '_'}{num_suffix}_{prompt_idx:02d}_{ts_str}{seed_suffix}"
+        )
+
+        wandb_tracker = None
+        try:
+            wandb_tracker = accelerator.get_tracker("wandb")
+            try:
+                import wandb
+            except ImportError:
+                raise ImportError("No wandb / wandb がインストールされていないようです")
+        except:
+            wandb = None
+
+        if video.shape[2] == 1:
+            image_paths = save_images_grid(video, save_dir, save_path, create_subdir=False)
+            if wandb_tracker is not None and wandb is not None:
+                for image_path in image_paths:
+                    wandb_tracker.log({f"sample_{prompt_idx}": wandb.Image(image_path)}, step=steps)
+        else:
+            video_path = os.path.join(save_dir, save_path) + ".mp4"
+            save_videos_grid(video, video_path)
+            if wandb_tracker is not None and wandb is not None:
+                wandb_tracker.log({f"sample_{prompt_idx}": wandb.Video(video_path)}, step=steps)
+
+        if loaded_text_encoder:
+            sample_parameter.pop("prompt_embeds", None)
+            sample_parameter.pop("prompt_attention_mask", None)
+            sample_parameter.pop("negative_prompt_embeds", None)
+            sample_parameter.pop("negative_prompt_attention_mask", None)
+            self._cleanup_text_encoder(accelerator)
+        if loaded_vae:
+            vae.to_device("cpu")
+            clean_memory_on_device(device)
 
     def do_inference(
         self,
@@ -1186,12 +1573,6 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
     )
 
     parser.add_argument(
-        "--network_module",
-        type=str,
-        default="musubi_tuner.networks.lora_ltx2",
-        help="Network module for LoRA (default: lora_ltx2)",
-    )
-    parser.add_argument(
         "--ltx_mode",
         type=str,
         default="video",
@@ -1222,6 +1603,29 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         "--fp8_scaled",
         action="store_true",
         help="use scaled fp8 for DiT / DiTにスケーリングされたfp8を使う",
+    )
+    parser.add_argument(
+        "--height",
+        type=int,
+        default=512,
+        help="Default sample height for LTX-2 preview generation.",
+    )
+    parser.add_argument(
+        "--width",
+        type=int,
+        default=768,
+        help="Default sample width for LTX-2 preview generation.",
+    )
+    parser.add_argument(
+        "--sample_num_frames",
+        type=int,
+        default=45,
+        help="Default frame count for LTX-2 preview generation.",
+    )
+    parser.add_argument(
+        "--offloading",
+        action="store_true",
+        help="Offload LTX-2 DiT to CPU between sampling prompts to save VRAM.",
     )
 
     return parser

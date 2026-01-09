@@ -2,6 +2,7 @@ from enum import Enum
 from typing import Protocol
 
 import torch
+from musubi_tuner.ltx_2.model.transformer.fp8_device_utils import ensure_fp8_modules_on_device
 from musubi_tuner.ltx_2.model.transformer.rope import LTXRopeType, apply_rotary_emb
 
 memory_efficient_attention = None
@@ -177,6 +178,9 @@ class Attention(torch.nn.Module):
         pe: torch.Tensor | None = None,
         k_pe: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        ensure_fp8_modules_on_device(self.to_q, x.device)
+        ensure_fp8_modules_on_device(self.to_k, x.device)
+        ensure_fp8_modules_on_device(self.to_v, x.device)
         q = self.to_q(x)
         context = x if context is None else context
         k = self.to_k(context)

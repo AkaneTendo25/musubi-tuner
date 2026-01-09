@@ -86,6 +86,8 @@ class TransformerArgsPreprocessor:
         """Prepare attention mask."""
         if attention_mask is None or torch.is_floating_point(attention_mask):
             return attention_mask
+        if attention_mask.dtype == torch.bool:
+            attention_mask = attention_mask.to(torch.int64)
 
         return (attention_mask - 1).to(x_dtype).reshape(
             (attention_mask.shape[0], 1, -1, attention_mask.shape[-1])
