@@ -117,10 +117,20 @@ class TransformerArgsPreprocessor:
         )
         return pe
 
+    def _ensure_modules_on_device(self, device: torch.device) -> None:
+        if self.patchify_proj.weight.device != device:
+            self.patchify_proj.to(device)
+        if self.caption_projection.linear_1.weight.device != device:
+            self.caption_projection.to(device)
+        adaln_param = next(self.adaln.parameters(), None)
+        if adaln_param is not None and adaln_param.device != device:
+            self.adaln.to(device)
+
     def prepare(
         self,
         modality: Modality,
     ) -> TransformerArgs:
+        self._ensure_modules_on_device(modality.latent.device)
         x = self.patchify_proj(modality.latent)
         timestep, embedded_timestep = self._prepare_timestep(modality.timesteps, x.shape[0], modality.latent.dtype)
         context, attention_mask = self._prepare_context(modality.context, x, modality.context_mask)

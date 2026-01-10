@@ -1,11 +1,20 @@
+from dataclasses import replace
 from enum import Enum
 
+import logging
 import torch
-from musubi_tuner.modules.custom_offloading_utils import ModelOffloader
+import torch.nn as nn
+from musubi_tuner.ltx_2.model.transformer.offloading_utils import (
+    LTX2BlockSwapManager,
+    LTX2ModelOffloader,
+)
 from musubi_tuner.ltx_2.guidance.perturbations import BatchedPerturbationConfig
 from musubi_tuner.ltx_2.model.transformer.adaln import AdaLayerNormSingle
 from musubi_tuner.ltx_2.model.transformer.attention import AttentionCallable, AttentionFunction
-from musubi_tuner.ltx_2.model.transformer.fp8_device_utils import ensure_fp8_modules_on_device
+from musubi_tuner.ltx_2.model.transformer.fp8_device_utils import (
+    ensure_fp8_modules_on_device,
+    move_fp8_scale_weights,
+)
 from musubi_tuner.ltx_2.model.transformer.modality import Modality
 from musubi_tuner.ltx_2.model.transformer.rope import LTXRopeType
 from musubi_tuner.ltx_2.model.transformer.text_projection import PixArtAlphaTextProjection
@@ -16,6 +25,63 @@ from musubi_tuner.ltx_2.model.transformer.transformer_args import (
     TransformerArgsPreprocessor,
 )
 from musubi_tuner.ltx_2.utils import to_denoised
+
+logger = logging.getLogger(__name__)
+
+
+def _move_non_linear_params(module: nn.Module, device: torch.device) -> None:
+    """Move non-linear params/buffers to device; Linear weights are handled by offloader."""
+    non_blocking = device.type != "cpu"
+    for submodule in module.modules():
+        if isinstance(submodule, nn.Linear):
+            if submodule.bias is not None and submodule.bias.device != device:
+                submodule.bias = nn.Parameter(submodule.bias.to(device, non_blocking=non_blocking))
+            continue
+        for _, param in submodule.named_parameters(recurse=False):
+            if isinstance(param, torch.Tensor) and param.device != device:
+                param.data = param.data.to(device, non_blocking=non_blocking)
+        for name, buf in submodule.named_buffers(recurse=False):
+            if isinstance(buf, torch.Tensor) and buf.device != device:
+                setattr(submodule, name, buf.to(device, non_blocking=non_blocking))
+
+
+def _log_cuda_memory(tag: str) -> None:
+    if not torch.cuda.is_available():
+        return
+    allocated = torch.cuda.memory_allocated() / (1024**3)
+    reserved = torch.cuda.memory_reserved() / (1024**3)
+    logger.info("LTX-2 swap mem [%s]: cuda_allocated=%.2fGB cuda_reserved=%.2fGB", tag, allocated, reserved)
+
+
+def _move_transformer_args(
+    args: TransformerArgs | None, device: torch.device
+) -> TransformerArgs | None:
+    if args is None:
+        return None
+    if args.x.device == device:
+        return args
+    non_blocking = device.type != "cpu"
+    def _move_tensor(value):
+        if value is None:
+            return None
+        if isinstance(value, torch.Tensor):
+            return value.to(device, non_blocking=non_blocking)
+        if isinstance(value, (tuple, list)):
+            return type(value)(_move_tensor(v) for v in value)
+        return value
+
+    return replace(
+        args,
+        x=_move_tensor(args.x),
+        context=_move_tensor(args.context),
+        context_mask=_move_tensor(args.context_mask),
+        timesteps=_move_tensor(args.timesteps),
+        embedded_timestep=_move_tensor(args.embedded_timestep),
+        positional_embeddings=_move_tensor(args.positional_embeddings),
+        cross_positional_embeddings=_move_tensor(args.cross_positional_embeddings),
+        cross_scale_shift_timestep=_move_tensor(args.cross_scale_shift_timestep),
+        cross_gate_timestep=_move_tensor(args.cross_gate_timestep),
+    )
 
 
 class LTXModelType(Enum):
@@ -68,6 +134,7 @@ class LTXModel(torch.nn.Module):
         self.activation_cpu_offloading = False
         self.blocks_to_swap = None
         self.offloader = None
+        self._ltx2_block_swap = None
         self.num_blocks = 0
         self.use_middle_indices_grid = use_middle_indices_grid
         self.rope_type = rope_type
@@ -340,22 +407,43 @@ class LTXModel(torch.nn.Module):
         supports_backward: bool,
         use_pinned_memory: bool = False,
     ) -> None:
+        swap_mode = getattr(self, "swap_mode", "default")
+        _log_cuda_memory("before_enable_block_swap")
         self.blocks_to_swap = int(blocks_to_swap)
         self.num_blocks = len(self.transformer_blocks)
 
+        if swap_mode in {"aggressive", "aggressive_no_offload"}:
+            self._ltx2_block_swap = LTX2BlockSwapManager.build(
+                depth=self.num_blocks,
+                blocks_to_swap=self.blocks_to_swap,
+                swap_device="cpu",
+            )
+            self.offloader = None
+            _log_cuda_memory("after_enable_block_swap")
+            return
+
+        supports_backward_for_offload = supports_backward
+        if swap_mode == "aggressive":
+            supports_backward_for_offload = False
+            if supports_backward:
+                logger.warning(
+                    "LTX-2 aggressive swap uses forward-only swapping during training; "
+                    "enable gradient checkpointing + activation CPU offload to avoid OOM."
+                )
         assert self.blocks_to_swap <= self.num_blocks - 1, (
             f"Cannot swap more than {self.num_blocks - 1} blocks. Requested {self.blocks_to_swap} blocks to swap."
         )
 
-        self.offloader = ModelOffloader(
+        self.offloader = LTX2ModelOffloader(
             "ltx2_block",
             self.transformer_blocks,
             self.num_blocks,
             self.blocks_to_swap,
-            supports_backward,
+            supports_backward_for_offload,
             device,
             use_pinned_memory,
         )
+        _log_cuda_memory("after_enable_block_swap")
 
     def switch_block_swap_for_inference(self) -> None:
         if self.blocks_to_swap and self.offloader is not None:
@@ -368,6 +456,32 @@ class LTXModel(torch.nn.Module):
             self.prepare_block_swap_before_forward()
 
     def move_to_device_except_swap_blocks(self, device: torch.device) -> None:
+        swap_mode = getattr(self, "swap_mode", "default")
+        if self.blocks_to_swap and swap_mode in {"aggressive", "aggressive_no_offload"}:
+            target_device = torch.device(device)
+            # Move non-block modules/params to the target device.
+            saved_blocks = self.transformer_blocks
+            self.transformer_blocks = torch.nn.ModuleList()
+            self.to(target_device)
+            self.transformer_blocks = saved_blocks
+
+            managed_indices = set()
+            if self._ltx2_block_swap is not None:
+                managed_indices = set(self._ltx2_block_swap.block_indices)
+            else:
+                managed_indices = set(
+                    range(max(0, len(self.transformer_blocks) - self.blocks_to_swap), len(self.transformer_blocks))
+                )
+
+            # Move non-managed blocks to GPU; keep managed blocks on CPU.
+            cpu_device = torch.device("cpu")
+            for idx, block in enumerate(self.transformer_blocks):
+                if idx in managed_indices:
+                    block.to(cpu_device)
+                else:
+                    block.to(target_device)
+            return
+
         if self.blocks_to_swap:
             saved_blocks = self.transformer_blocks
             self.transformer_blocks = torch.nn.ModuleList()
@@ -381,6 +495,10 @@ class LTXModel(torch.nn.Module):
         if self.blocks_to_swap is None or self.blocks_to_swap == 0 or self.offloader is None:
             return
         self.offloader.prepare_block_devices_before_forward(self.transformer_blocks)
+        cpu_device = torch.device("cpu")
+        for block in self.transformer_blocks[self.num_blocks - self.blocks_to_swap :]:
+            _move_non_linear_params(block, cpu_device)
+            move_fp8_scale_weights(block, cpu_device)
 
     def _process_transformer_blocks(
         self,
@@ -390,35 +508,114 @@ class LTXModel(torch.nn.Module):
     ) -> tuple[TransformerArgs, TransformerArgs]:
         """Process transformer blocks for LTXAV."""
 
+        swap_manager = self._ltx2_block_swap
+        swap_active = False
+        compute_device = None
+        if swap_manager is not None:
+            if video is not None and isinstance(video.x, torch.Tensor):
+                compute_device = video.x.device
+            elif audio is not None and isinstance(audio.x, torch.Tensor):
+                compute_device = audio.x.device
+            if compute_device is not None:
+                swap_active = swap_manager.activate(
+                    self.transformer_blocks,
+                    compute_device,
+                    self.training and torch.is_grad_enabled(),
+                )
+
         # Process transformer blocks
         for block_idx, block in enumerate(self.transformer_blocks):
+            if swap_active and swap_manager is not None and swap_manager.is_managed_block(block_idx):
+                swap_manager.stream_in(block, compute_device)
+
             if self.blocks_to_swap and self.offloader is not None:
                 self.offloader.wait_for_block(block_idx)
+
+            gpu_device = None
+            if self.offloader is not None:
+                gpu_device = self.offloader.device
+            elif swap_active and compute_device is not None:
+                gpu_device = compute_device
+            elif video is not None and isinstance(video.x, torch.Tensor):
+                gpu_device = video.x.device
+            elif audio is not None and isinstance(audio.x, torch.Tensor):
+                gpu_device = audio.x.device
+
+            if (
+                self.activation_cpu_offloading
+                and self.training
+                and gpu_device is not None
+                and gpu_device.type != "cpu"
+            ):
+                cpu_device = torch.device("cpu")
+                if self._enable_gradient_checkpointing:
+                    video = _move_transformer_args(video, cpu_device)
+                    audio = _move_transformer_args(audio, cpu_device)
+
+                    def _run_block(video_args, audio_args, perturbations_args):
+                        video_args = _move_transformer_args(video_args, gpu_device)
+                        audio_args = _move_transformer_args(audio_args, gpu_device)
+                        _move_non_linear_params(block, gpu_device)
+                        ensure_fp8_modules_on_device(block, gpu_device)
+                        return block(
+                            video=video_args,
+                            audio=audio_args,
+                            perturbations=perturbations_args,
+                        )
+
+                    video, audio = torch.utils.checkpoint.checkpoint(
+                        _run_block,
+                        video,
+                        audio,
+                        perturbations,
+                        use_reentrant=False,
+                    )
+                else:
+                    video = _move_transformer_args(video, gpu_device)
+                    audio = _move_transformer_args(audio, gpu_device)
+                    _move_non_linear_params(block, gpu_device)
+                    ensure_fp8_modules_on_device(block, gpu_device)
+                    video, audio = block(
+                        video=video,
+                        audio=audio,
+                        perturbations=perturbations,
+                    )
+
+                video = _move_transformer_args(video, cpu_device)
+                audio = _move_transformer_args(audio, cpu_device)
+            else:
                 target_device = None
                 if video is not None and isinstance(video.x, torch.Tensor):
                     target_device = video.x.device
                 elif audio is not None and isinstance(audio.x, torch.Tensor):
                     target_device = audio.x.device
                 if target_device is not None:
+                    _move_non_linear_params(block, target_device)
                     ensure_fp8_modules_on_device(block, target_device)
 
-            if self._enable_gradient_checkpointing and self.training:
-                video, audio = torch.utils.checkpoint.checkpoint(
-                    block,
-                    video,
-                    audio,
-                    perturbations,
-                    use_reentrant=False,
-                )
-            else:
-                video, audio = block(
-                    video=video,
-                    audio=audio,
-                    perturbations=perturbations,
-                )
+                if self._enable_gradient_checkpointing and self.training:
+                    video, audio = torch.utils.checkpoint.checkpoint(
+                        block,
+                        video,
+                        audio,
+                        perturbations,
+                        use_reentrant=False,
+                    )
+                else:
+                    video, audio = block(
+                        video=video,
+                        audio=audio,
+                        perturbations=perturbations,
+                    )
+
+            if swap_active and swap_manager is not None and swap_manager.is_managed_block(block_idx):
+                swap_manager.stream_out(block)
 
             if self.blocks_to_swap and self.offloader is not None:
                 self.offloader.submit_move_blocks_forward(self.transformer_blocks, block_idx)
+                if not self.offloader.forward_only and block_idx < self.blocks_to_swap:
+                    _move_non_linear_params(block, torch.device("cpu"))
+                    move_fp8_scale_weights(block, torch.device("cpu"))
 
         return video, audio
 
@@ -461,6 +658,18 @@ class LTXModel(torch.nn.Module):
             audio=audio_args,
             perturbations=perturbations,
         )
+
+        if self.activation_cpu_offloading and self.training:
+            target_device = None
+            if self.offloader is not None:
+                target_device = self.offloader.device
+            elif video_out is not None and isinstance(video_out.x, torch.Tensor):
+                target_device = video_out.x.device
+            elif audio_out is not None and isinstance(audio_out.x, torch.Tensor):
+                target_device = audio_out.x.device
+            if target_device is not None and target_device.type != "cpu":
+                video_out = _move_transformer_args(video_out, target_device)
+                audio_out = _move_transformer_args(audio_out, target_device)
 
         # Process output
         vx = (
@@ -536,3 +745,4 @@ class X0Model(torch.nn.Module):
         denoised_video = to_denoised(video.latent, vx, video.timesteps) if vx is not None else None
         denoised_audio = to_denoised(audio.latent, ax, audio.timesteps) if ax is not None else None
         return denoised_video, denoised_audio
+logger = logging.getLogger(__name__)

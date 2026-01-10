@@ -55,3 +55,20 @@ def ensure_fp8_modules_on_device(module: torch.nn.Module, target_device: torch.d
                         weight = getattr(orig_module, "weight", None)
                         if isinstance(weight, torch.Tensor) and scale_weight.device != weight.device:
                             orig_module.scale_weight = scale_weight.to(device=weight.device)
+
+
+def move_fp8_scale_weights(module: torch.nn.Module, target_device: torch.device) -> None:
+    non_blocking = target_device.type != "cpu"
+    for submodule in module.modules():
+        scale_weight = getattr(submodule, "scale_weight", None)
+        if isinstance(scale_weight, torch.Tensor) and scale_weight.device != target_device:
+            submodule.scale_weight = scale_weight.to(device=target_device, non_blocking=non_blocking)
+        org_forward = getattr(submodule, "org_forward", None)
+        if callable(org_forward):
+            orig_module = getattr(org_forward, "__self__", None)
+            if isinstance(orig_module, torch.nn.Module):
+                scale_weight = getattr(orig_module, "scale_weight", None)
+                if isinstance(scale_weight, torch.Tensor) and scale_weight.device != target_device:
+                    orig_module.scale_weight = scale_weight.to(
+                        device=target_device, non_blocking=non_blocking
+                    )

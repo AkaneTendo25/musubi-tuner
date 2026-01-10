@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import logging
+import types
 from typing import Dict, List, Optional
 
 import torch
@@ -15,6 +16,47 @@ from musubi_tuner.ltx_2.types import AudioLatentShape, SpatioTemporalScaleFactor
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
+
+
+def _patch_lora_load_state_dict_for_audio(network: lora.LoRANetwork) -> lora.LoRANetwork:
+    original = network.load_state_dict
+
+    def _filter_audio_keys(keys: List[str]) -> List[str]:
+        return [k for k in keys if "audio_" not in k]
+
+    def _load_state_dict(self, state_dict, strict: bool = True):
+        result = original(state_dict, strict=False)
+        missing = list(getattr(result, "missing_keys", []))
+        unexpected = list(getattr(result, "unexpected_keys", []))
+        non_audio_missing = _filter_audio_keys(missing)
+        non_audio_unexpected = _filter_audio_keys(unexpected)
+        if non_audio_missing:
+            raise RuntimeError(
+                f"Missing non-audio LoRA keys in state_dict: {non_audio_missing[:10]}"
+            )
+        if non_audio_unexpected:
+            raise RuntimeError(
+                f"Unexpected non-audio LoRA keys in state_dict: {non_audio_unexpected[:10]}"
+            )
+        if missing and not non_audio_missing:
+            logger.warning(
+                "LTX2 LoRA: missing audio keys in checkpoint; initializing audio LoRA weights."
+            )
+        if unexpected and not non_audio_unexpected:
+            logger.warning(
+                "LTX2 LoRA: unexpected audio keys in checkpoint; ignoring audio LoRA weights."
+            )
+        try:
+            incompatible = torch.nn.modules.module._IncompatibleKeys(  # type: ignore[attr-defined]
+                missing_keys=non_audio_missing,
+                unexpected_keys=non_audio_unexpected,
+            )
+            return incompatible
+        except Exception:
+            return result
+
+    network.load_state_dict = types.MethodType(_load_state_dict, network)
+    return network
 
 
 class LTX2Wrapper(nn.Module):
@@ -311,7 +353,7 @@ def create_arch_network(
 
     kwargs["exclude_patterns"] = _build_exclude_patterns(kwargs.get("exclude_patterns"), audio_video=audio_video)
 
-    return lora.create_network(
+    net = lora.create_network(
         LTX2_TARGET_REPLACE_MODULES,
         "lora_unet",
         multiplier,
@@ -323,6 +365,7 @@ def create_arch_network(
         neuron_dropout=neuron_dropout,
         **kwargs,
     )
+    return _patch_lora_load_state_dict_for_audio(net)
 
 
 def create_arch_network_from_weights(
@@ -341,7 +384,7 @@ def create_arch_network_from_weights(
 
     kwargs["exclude_patterns"] = _build_exclude_patterns(kwargs.get("exclude_patterns"), audio_video=audio_video)
 
-    return lora.create_network_from_weights(
+    net = lora.create_network_from_weights(
         LTX2_TARGET_REPLACE_MODULES,
         multiplier,
         weights_sd,
@@ -350,3 +393,4 @@ def create_arch_network_from_weights(
         for_inference,
         **kwargs,
     )
+    return _patch_lora_load_state_dict_for_audio(net)

@@ -1,16 +1,29 @@
 from enum import Enum
 from typing import Protocol
 
+import logging
 import torch
 from musubi_tuner.ltx_2.model.transformer.fp8_device_utils import ensure_fp8_modules_on_device
 from musubi_tuner.ltx_2.model.transformer.rope import LTXRopeType, apply_rotary_emb
 
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
+
 memory_efficient_attention = None
 flash_attn_interface = None
+flash_attention_2 = None
+flash_attn_varlen_func = None
 try:
     from xformers.ops import memory_efficient_attention
 except ImportError:
     memory_efficient_attention = None
+try:
+    from flash_attn import flash_attn_func as flash_attention_2
+    from flash_attn.flash_attn_interface import flash_attn_varlen_func as _flash_attn_varlen_func
+    flash_attn_varlen_func = _flash_attn_varlen_func
+except ImportError:
+    flash_attention_2 = None
+    flash_attn_varlen_func = None
 try:
     # FlashAttention3 and XFormersAttention cannot be used together
     if memory_efficient_attention is None:
@@ -116,9 +129,91 @@ class FlashAttention3(AttentionCallable):
         return out
 
 
+class FlashAttention2(AttentionCallable):
+    def _pack_varlen(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
+        # mask is attention bias or boolean mask; normalize to [B, Lk] boolean valid mask
+        if mask.dtype == torch.bool:
+            valid = mask
+        else:
+            valid = mask == 0
+        while valid.dim() > 2:
+            valid = valid.squeeze(1)
+
+        bsz, q_len, heads, dim_head = q.shape
+        k_len = k.shape[1]
+        if valid.shape[1] != k_len:
+            raise ValueError(f"FlashAttention2 varlen expects mask length {k_len}, got {valid.shape[1]}")
+
+        seqlens_k = valid.sum(dim=1).to(dtype=torch.int32)
+        max_seqlen_k = int(seqlens_k.max().item()) if seqlens_k.numel() else k_len
+        if max_seqlen_k == 0:
+            raise ValueError("FlashAttention2 varlen received an all-masked context.")
+
+        q_packed = q.reshape(bsz * q_len, heads, dim_head)
+        cu_seqlens_q = torch.arange(
+            0,
+            (bsz + 1) * q_len,
+            step=q_len,
+            device=q.device,
+            dtype=torch.int32,
+        )
+
+        k_list = [k[i, valid[i]] for i in range(bsz)]
+        v_list = [v[i, valid[i]] for i in range(bsz)]
+        k_packed = torch.cat(k_list, dim=0)
+        v_packed = torch.cat(v_list, dim=0)
+
+        cu_seqlens_k = torch.zeros((bsz + 1,), device=k.device, dtype=torch.int32)
+        cu_seqlens_k[1:] = torch.cumsum(seqlens_k, dim=0)
+
+        return (
+            q_packed,
+            k_packed,
+            v_packed,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            q_len,
+            max_seqlen_k,
+        )
+
+    def __call__(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        heads: int,
+        mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if flash_attention_2 is None:
+            raise RuntimeError("FlashAttention2 was selected but `flash_attn` is not installed.")
+        if mask is not None and flash_attn_varlen_func is None:
+            logger.warning("FlashAttention2 does not support attention masks; falling back to PyTorch SDPA.")
+            return PytorchAttention()(q, k, v, heads, mask)
+
+        b, _, dim_head = q.shape
+        dim_head //= heads
+
+        q, k, v = (t.view(b, -1, heads, dim_head) for t in (q, k, v))
+        if mask is not None:
+            q_packed, k_packed, v_packed, cu_q, cu_k, max_q, max_k = self._pack_varlen(q, k, v, mask)
+            out = flash_attn_varlen_func(q_packed, k_packed, v_packed, cu_q, cu_k, max_q, max_k)
+            out = out.view(b, max_q, heads, dim_head)
+        else:
+            out = flash_attention_2(q.to(v.dtype), k.to(v.dtype), v)
+        out = out.reshape(b, -1, heads * dim_head)
+        return out
+
+
 class AttentionFunction(Enum):
     PYTORCH = "pytorch"
     XFORMERS = "xformers"
+    FLASH_ATTENTION_2 = "flash_attention_2"
     FLASH_ATTENTION_3 = "flash_attention_3"
     DEFAULT = "default"
 
@@ -129,6 +224,8 @@ class AttentionFunction(Enum):
             return PytorchAttention()(q, k, v, heads, mask)
         elif self is AttentionFunction.XFORMERS:
             return XFormersAttention()(q, k, v, heads, mask)
+        elif self is AttentionFunction.FLASH_ATTENTION_2:
+            return FlashAttention2()(q, k, v, heads, mask)
         elif self is AttentionFunction.FLASH_ATTENTION_3:
             return FlashAttention3()(q, k, v, heads, mask)
         else:

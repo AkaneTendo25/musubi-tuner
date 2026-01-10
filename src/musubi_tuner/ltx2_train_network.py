@@ -3,8 +3,11 @@
 import argparse
 import os
 import re
+import time
+import wave
 from typing import Any, Dict, List, Optional, Tuple, Union
 import torch
+import torch.nn.functional as F
 from accelerate import Accelerator, PartialState
 from tqdm import tqdm
 import logging
@@ -155,6 +158,7 @@ def load_ltx2_model(
     attn_mode: str = "torch",
     audio_video: bool = False,
     fp8_scaled: bool = False,
+    load_weights_on_cpu: bool = False,
     **_: Any,
 ):
     """Load LTX-2 (video or audio-video) transformer
@@ -171,8 +175,21 @@ def load_ltx2_model(
     Returns:
         Loaded LTX-2 transformer model
     """
+    def _cast_non_fp8_params(model: torch.nn.Module, target_dtype: torch.dtype) -> None:
+        for module in model.modules():
+            is_fp8_linear = isinstance(module, torch.nn.Linear) and hasattr(module, "scale_weight")
+            if is_fp8_linear:
+                continue
+            for _, param in module.named_parameters(recurse=False):
+                if isinstance(param, torch.Tensor) and param.dtype == torch.float32:
+                    param.data = param.data.to(dtype=target_dtype)
+            for name, buf in module.named_buffers(recurse=False):
+                if isinstance(buf, torch.Tensor) and buf.dtype == torch.float32:
+                    setattr(module, name, buf.to(dtype=target_dtype))
+
     target_device = torch.device(device)
     load_device = torch.device(load_device)
+    state_device = torch.device("cpu") if load_weights_on_cpu else load_device
 
     from musubi_tuner.ltx_2.loader.sft_loader import SafetensorsModelStateDictLoader
     from musubi_tuner.ltx_2.model.transformer.model_configurator import (
@@ -183,22 +200,39 @@ def load_ltx2_model(
     from musubi_tuner.networks.lora_ltx2 import LTX2Wrapper
 
     logger.info("Loading LTX-2 transformer via state dict: %s", model_path)
+    if load_weights_on_cpu:
+        logger.info("LTX-2 load path: load weights on CPU, then move to %s", target_device)
+    else:
+        logger.info("LTX-2 load path: load weights on %s", load_device)
     loader = SafetensorsModelStateDictLoader()
     config = loader.metadata(model_path)
+    attn_mode = (attn_mode or "torch").lower()
+    attn_type = None
+    if attn_mode in {"xformers", "xformers-attn"}:
+        attn_type = "xformers"
+    elif attn_mode in {"flash3", "flash_attention_3"}:
+        attn_type = "flash_attention_3"
+    elif attn_mode in {"flash", "flash_attention_2"}:
+        attn_type = "flash_attention_2"
+    elif attn_mode in {"torch", "sdpa"}:
+        attn_type = "pytorch"
+    if attn_type is not None:
+        config.setdefault("transformer", {})
+        config["transformer"]["attention_type"] = attn_type
     configurator = LTXModelConfigurator if audio_video else LTXVideoOnlyModelConfigurator
 
     with torch.device("meta"):
         base_model = configurator.from_config(config)
 
     if fp8_scaled:
-        fp8_calc_device = target_device if load_device == target_device else torch.device("cpu")
+        fp8_calc_device = target_device if (not load_weights_on_cpu and load_device == target_device) else torch.device("cpu")
         sd = load_safetensors_with_lora_and_fp8(
             model_files=model_path,
             lora_weights_list=None,
             lora_multipliers=None,
             fp8_optimization=True,
             calc_device=fp8_calc_device,
-            move_to_device=(load_device == target_device),
+            move_to_device=not load_weights_on_cpu and load_device == target_device,
             dit_weight_dtype=None,
             target_keys=["transformer_blocks"],
             exclude_keys=list(KEEP_FP8_HIGH_PRECISION_TOKENS),
@@ -209,8 +243,8 @@ def load_ltx2_model(
             lora_weights_list=None,
             lora_multipliers=None,
             fp8_optimization=False,
-            calc_device=load_device,
-            move_to_device=True,
+            calc_device=state_device,
+            move_to_device=not load_weights_on_cpu,
             dit_weight_dtype=torch_dtype,
             target_keys=None,
             exclude_keys=None,
@@ -225,11 +259,21 @@ def load_ltx2_model(
     if fp8_scaled:
         apply_fp8_monkey_patch(base_model, sd, use_scaled_mm=False)
     base_model.load_state_dict(sd, strict=False, assign=True)
+    if torch_dtype is not None:
+        _cast_non_fp8_params(base_model, torch_dtype)
     base_model = base_model.to(load_device)
 
     model = LTX2Wrapper(base_model, patch_size=1)
     if load_device == target_device:
         model = model.to(device=target_device)
+    if torch.cuda.is_available():
+        allocated = torch.cuda.memory_allocated() / (1024**3)
+        reserved = torch.cuda.memory_reserved() / (1024**3)
+        logger.info(
+            "LTX-2 load mem [after_load_ltx2_model]: cuda_allocated=%.2fGB cuda_reserved=%.2fGB",
+            allocated,
+            reserved,
+        )
     return model
 
 
@@ -241,6 +285,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
         self._text_encoder = None
         self._dit_attn_mode: Optional[str] = None
         self._latent_norm_cache: Dict = {}
+        self._warned_missing_audio = False
 
         # Initialize latent normalization
         mean = torch.tensor(LTX2_LATENTS_MEAN, dtype=torch.float32).view(1, -1, 1, 1, 1)
@@ -390,6 +435,23 @@ class LTX2NetworkTrainer(NetworkTrainer):
             raise ValueError(f"Invalid ltx_mode: {ltx_mode}")
         self._ltx_mode = ltx_mode
         self._audio_video = self._ltx_mode == "av"
+        self._ltx2_swap_mode = getattr(args, "ltx2_swap_mode", "default")
+        if self._ltx2_swap_mode == "aggressive":
+            if not getattr(args, "gradient_checkpointing", False):
+                logger.warning(
+                    "LTX-2 aggressive swap requires gradient checkpointing; enabling it."
+                )
+                args.gradient_checkpointing = True
+            if not getattr(args, "gradient_checkpointing_cpu_offload", False):
+                logger.warning(
+                    "LTX-2 aggressive swap benefits from activation CPU offload; enabling it."
+                )
+                args.gradient_checkpointing_cpu_offload = True
+        elif self._ltx2_swap_mode == "aggressive_no_offload":
+            if not getattr(args, "gradient_checkpointing", False):
+                logger.warning(
+                    "LTX-2 aggressive_no_offload swap works best with gradient checkpointing enabled."
+                )
         self.default_guidance_scale = 1.0
 
         args.weighting_scheme = "none"
@@ -455,7 +517,10 @@ class LTX2NetworkTrainer(NetworkTrainer):
             attn_mode=attn_mode,
             audio_video=self._audio_video,
             fp8_scaled=bool(getattr(args, "fp8_scaled", False)),
+            load_weights_on_cpu=True,
         )
+        if hasattr(transformer, "model") and hasattr(transformer.model, "__dict__"):
+            transformer.model.swap_mode = self._ltx2_swap_mode
 
         transformer.eval()
         transformer.requires_grad_(False)
@@ -535,6 +600,50 @@ class LTX2NetworkTrainer(NetworkTrainer):
         vae = _LTX2VideoVAE(decoder)
         self._update_latent_norm_base_from_vae(vae)
         return vae
+
+    def _load_audio_components(
+        self, args: argparse.Namespace, audio_dtype: torch.dtype, checkpoint_path: str
+    ):
+        logger.info("Loading LTX-2 audio decoder/vocoder from %s", checkpoint_path)
+        from musubi_tuner.ltx_2.loader.single_gpu_model_builder import SingleGPUModelBuilder
+        from musubi_tuner.ltx_2.model.audio_vae.model_configurator import (
+            AudioDecoderConfigurator,
+            VocoderConfigurator,
+            AUDIO_VAE_DECODER_COMFY_KEYS_FILTER,
+            VOCODER_COMFY_KEYS_FILTER,
+        )
+
+        audio_decoder = SingleGPUModelBuilder(
+            model_path=str(checkpoint_path),
+            model_class_configurator=AudioDecoderConfigurator,
+            model_sd_ops=AUDIO_VAE_DECODER_COMFY_KEYS_FILTER,
+        ).build(device=torch.device("cpu"), dtype=audio_dtype)
+        vocoder = SingleGPUModelBuilder(
+            model_path=str(checkpoint_path),
+            model_class_configurator=VocoderConfigurator,
+            model_sd_ops=VOCODER_COMFY_KEYS_FILTER,
+        ).build(device=torch.device("cpu"), dtype=audio_dtype)
+
+        audio_decoder.eval()
+        vocoder.eval()
+        return audio_decoder, vocoder
+
+    @staticmethod
+    def _save_audio_wav(path: str, audio: torch.Tensor, sample_rate: int) -> None:
+        audio = audio.detach().cpu().float()
+        if audio.dim() == 1:
+            audio = audio.unsqueeze(0)
+        if audio.shape[0] == 1:
+            audio = audio.repeat(2, 1)
+        if audio.shape[0] > 2:
+            audio = audio[:2, :]
+        audio_int16 = (audio.clamp(-1, 1) * 32767.0).to(torch.int16)
+        interleaved = audio_int16.t().contiguous().numpy().tobytes()
+        with wave.open(path, "wb") as wav:
+            wav.setnchannels(audio_int16.shape[0])
+            wav.setsampwidth(2)
+            wav.setframerate(sample_rate)
+            wav.writeframes(interleaved)
 
     def load_vae(self, args: argparse.Namespace, vae_dtype: torch.dtype, vae_path: str):
         if getattr(args, "sample_prompts", None):
@@ -728,18 +837,6 @@ class LTX2NetworkTrainer(NetworkTrainer):
                     f"Spatial mismatch: latents HxW={latents.shape[3]}x{latents.shape[4]} vs ref_latents HxW={ref_latents.shape[3]}x{ref_latents.shape[4]}"
                 )
 
-        caption_channels = getattr(transformer, "caption_channels", None)
-        if caption_channels is None and hasattr(transformer, "caption_projection"):
-            caption_channels = getattr(getattr(transformer, "caption_projection", None), "in_features", None)
-        if caption_channels is not None:
-            expected_last_dim = int(caption_channels) * (2 if self._audio_video else 1)
-            if text_embeds.shape[-1] != expected_last_dim:
-                raise ValueError(
-                    f"Text embedding dim mismatch for {'LTXAV' if self._audio_video else 'LTXV'}: "
-                    f"got {text_embeds.shape[-1]}, expected {expected_last_dim}. "
-                    f"(caption_channels={caption_channels})"
-                )
-
         first_frame_p = float(getattr(args, "ltx2_first_frame_conditioning_p", 0.0))
         if not (0.0 <= first_frame_p <= 1.0):
             raise ValueError(f"ltx2_first_frame_conditioning_p must be in [0,1]. Got: {first_frame_p}")
@@ -865,39 +962,69 @@ class LTX2NetworkTrainer(NetworkTrainer):
         audio_latents = None
         audio_noise = None
         noisy_audio = None
+        audio_enabled_for_batch = False
         if self._ltx_mode == "av":
             audio_latents = batch.get("audio_latents")
             if isinstance(audio_latents, dict):
-                if "latents" not in audio_latents:
-                    raise ValueError("batch['audio_latents'] is a dict but missing key 'latents'")
-                audio_latents = audio_latents["latents"]
+                audio_latents = audio_latents.get("latents")
 
             if audio_latents is None:
-                raise ValueError(
-                    "LTXAV training requires audio latents in batch['audio_latents']. "
-                    "Run the LTX-2 latents caching script with --ltx_mode av and ensure *_ltx2_audio.safetensors exist."
-                )
-            if not isinstance(audio_latents, torch.Tensor):
+                if not self._warned_missing_audio:
+                    logger.warning(
+                        "LTXAV mode: missing audio latents in this batch; falling back to video-only for mixed datasets."
+                    )
+                    self._warned_missing_audio = True
+            if audio_latents is None:
+                audio_enabled_for_batch = False
+            elif not isinstance(audio_latents, torch.Tensor):
                 raise TypeError(f"Expected audio_latents to be a torch.Tensor, got: {type(audio_latents)}")
-            if audio_latents.dim() != 4:
-                raise ValueError(f"Expected audio_latents to be 4D [B, C, T, F], got shape: {tuple(audio_latents.shape)}")
-            if audio_latents.shape[0] != latents.shape[0]:
-                raise ValueError(
-                    f"Batch size mismatch: latents batch={latents.shape[0]} vs audio_latents batch={audio_latents.shape[0]}"
-                )
+            else:
+                if audio_latents.dim() != 4:
+                    raise ValueError(f"Expected audio_latents to be 4D [B, C, T, F], got shape: {tuple(audio_latents.shape)}")
+                if audio_latents.shape[0] != latents.shape[0]:
+                    raise ValueError(
+                        f"Batch size mismatch: latents batch={latents.shape[0]} vs audio_latents batch={audio_latents.shape[0]}"
+                    )
 
-            audio_latents = audio_latents.to(device=accelerator.device, dtype=network_dtype)
-            audio_noise = torch.randn_like(audio_latents)
-            sigma_audio = sigma.view(-1, 1, 1, 1)
-            noisy_audio = (1.0 - sigma_audio) * audio_latents + sigma_audio * audio_noise
+                audio_enabled_for_batch = True
+                audio_latents = audio_latents.to(device=accelerator.device, dtype=network_dtype)
+                audio_noise = torch.randn_like(audio_latents)
+                sigma_audio = sigma.view(-1, 1, 1, 1)
+                noisy_audio = (1.0 - sigma_audio) * audio_latents + sigma_audio * audio_noise
         elif self._ltx_mode == "audio":
             raise NotImplementedError(
                 "Audio-only training mode is not implemented yet. "
                 "It requires official LTXAV audio-only forward semantics and audio latent caching."
             )
 
+        if self._audio_video and not audio_enabled_for_batch and text_embeds.shape[-1] % 2 == 0:
+            text_embeds = text_embeds[..., : text_embeds.shape[-1] // 2]
+
+        caption_channels = getattr(transformer, "caption_channels", None)
+        if caption_channels is None:
+            base_model = transformer.model if hasattr(transformer, "model") else transformer
+            if hasattr(base_model, "caption_projection"):
+                caption_channels = getattr(getattr(base_model, "caption_projection", None), "in_features", None)
+        if caption_channels is not None:
+            if self._audio_video and not audio_enabled_for_batch:
+                expected_last_dim = int(caption_channels)
+                if text_embeds.shape[-1] != expected_last_dim:
+                    raise ValueError(
+                        "Text embedding dim mismatch for LTXAV fallback to video-only: "
+                        f"got {text_embeds.shape[-1]}, expected {expected_last_dim}. "
+                        f"(caption_channels={caption_channels})"
+                    )
+            else:
+                expected_last_dim = int(caption_channels) * (2 if self._audio_video else 1)
+                if text_embeds.shape[-1] != expected_last_dim:
+                    raise ValueError(
+                        f"Text embedding dim mismatch for {'LTXAV' if self._audio_video else 'LTXV'}: "
+                        f"got {text_embeds.shape[-1]}, expected {expected_last_dim}. "
+                        f"(caption_channels={caption_channels})"
+                    )
+
         model_input = model_noisy_video
-        if self._ltx_mode == "av":
+        if self._ltx_mode == "av" and audio_enabled_for_batch:
             model_input = [model_noisy_video, noisy_audio]
 
         video_conditioning_mask_tokens = None
@@ -946,7 +1073,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
         if out["video_loss_weight"] < 0.0:
             raise ValueError(f"video_loss_weight must be >= 0. Got: {out['video_loss_weight']}")
 
-        if self._ltx_mode == "av":
+        if self._ltx_mode == "av" and audio_enabled_for_batch:
             if audio_pred is None:
                 raise ValueError("AV mode expected an audio prediction but got None")
             audio_target = audio_noise - audio_latents
@@ -1141,7 +1268,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
         transformer = accelerator.unwrap_model(transformer)
         transformer.switch_block_swap_for_inference()
         original_device = next(transformer.parameters()).device
-        offload = bool(getattr(args, "offloading", False))
+        offload = bool(getattr(args, "sample_with_offloading", False))
         transformer_offloaded = offload and accelerator.device.type == "cuda"
         if transformer_offloaded:
             transformer.to("cpu")
@@ -1287,6 +1414,16 @@ class LTX2NetworkTrainer(NetworkTrainer):
             vae = self._load_vae_impl(args, vae_dtype=vae_dtype, vae_path=args.vae)
             loaded_vae = True
 
+        audio_decoder = None
+        vocoder = None
+        loaded_audio = False
+        if self._audio_video and getattr(args, "ltx_mode", "video") == "av":
+            audio_dtype = torch.float16 if args.vae_dtype is None else model_utils.str_to_dtype(args.vae_dtype)
+            audio_decoder, vocoder = self._load_audio_components(
+                args, audio_dtype=audio_dtype, checkpoint_path=args.ltx2_checkpoint
+            )
+            loaded_audio = True
+
         sample_steps = sample_parameter.get("sample_steps", 20)
         width = sample_parameter.get("width", 768)
         height = sample_parameter.get("height", 512)
@@ -1347,7 +1484,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
         if not has_self_ref_orig_mod:
             transformer.eval()
 
-        video = self.do_inference(
+        video, audio_waveform = self.do_inference(
             accelerator,
             args,
             sample_parameter,
@@ -1363,6 +1500,11 @@ class LTX2NetworkTrainer(NetworkTrainer):
             do_classifier_free_guidance,
             guidance_scale,
             cfg_scale,
+            audio_decoder=audio_decoder,
+            vocoder=vocoder,
+            offload_transformer_for_decode=bool(getattr(args, "sample_with_offloading", False)),
+            transformer_offload_device=torch.device("cpu"),
+            restore_transformer_device=True,
         )
 
         if not has_self_ref_orig_mod:
@@ -1400,6 +1542,10 @@ class LTX2NetworkTrainer(NetworkTrainer):
             save_videos_grid(video, video_path)
             if wandb_tracker is not None and wandb is not None:
                 wandb_tracker.log({f"sample_{prompt_idx}": wandb.Video(video_path)}, step=steps)
+        if audio_waveform is not None:
+            wav_path = os.path.join(save_dir, save_path) + ".wav"
+            sample_rate = int(getattr(vocoder, "output_sample_rate", 24000)) if vocoder is not None else 24000
+            self._save_audio_wav(wav_path, audio_waveform, sample_rate)
 
         if loaded_text_encoder:
             sample_parameter.pop("prompt_embeds", None)
@@ -1409,6 +1555,10 @@ class LTX2NetworkTrainer(NetworkTrainer):
             self._cleanup_text_encoder(accelerator)
         if loaded_vae:
             vae.to_device("cpu")
+            clean_memory_on_device(device)
+        if loaded_audio:
+            audio_decoder.to("cpu")
+            vocoder.to("cpu")
             clean_memory_on_device(device)
 
     def do_inference(
@@ -1430,11 +1580,18 @@ class LTX2NetworkTrainer(NetworkTrainer):
         cfg_scale: Optional[float],
         image_path: Optional[str] = None,
         control_video_path: Optional[str] = None,
+        audio_decoder: Optional[torch.nn.Module] = None,
+        vocoder: Optional[torch.nn.Module] = None,
+        offload_transformer_for_decode: bool = False,
+        transformer_offload_device: Optional[torch.device] = None,
+        restore_transformer_device: bool = True,
     ):
         """Generate sample video during training using LTX-2 denoising loop"""
         from musubi_tuner.modules.scheduling_flow_match_discrete import FlowMatchDiscreteScheduler
+        from musubi_tuner.ltx_2.types import AudioLatentShape, VideoPixelShape
 
         transformer_device = next(transformer.parameters()).device
+        transformer_offload_device = transformer_offload_device or torch.device("cpu")
         original_vae_device = getattr(vae, "device", torch.device("cpu"))
         original_vae_dtype = getattr(vae, "dtype", torch.float32)
         vae.to_device(transformer_device)
@@ -1451,6 +1608,21 @@ class LTX2NetworkTrainer(NetworkTrainer):
         prompt_mask = sample_parameter.get("prompt_attention_mask")
         if prompt_mask is not None and prompt_mask.dim() == 1:
             prompt_mask = prompt_mask.unsqueeze(0)
+        if prompt_mask is not None:
+            mask_len = prompt_mask.shape[-1]
+            embed_len = prompt_embeds.shape[1]
+            if mask_len != embed_len:
+                logger.warning(
+                    "Sample prompt mask length %s != embeds length %s; aligning mask for sampling.",
+                    mask_len,
+                    embed_len,
+                )
+                if mask_len > embed_len:
+                    # padding_side="left" in the Gemma encoder, keep rightmost tokens.
+                    prompt_mask = prompt_mask[:, -embed_len:]
+                else:
+                    pad = embed_len - mask_len
+                    prompt_mask = F.pad(prompt_mask, (pad, 0), value=1)
         prompt_mask = prompt_mask.to(device=transformer_device, dtype=torch.int64) if prompt_mask is not None else None
 
         # Setup scheduler
@@ -1474,6 +1646,39 @@ class LTX2NetworkTrainer(NetworkTrainer):
             generator=generator,
         )
 
+        audio_latents = None
+        if self._audio_video and audio_decoder is not None and vocoder is not None:
+            frame_rate = sample_parameter.get("frame_rate", 25)
+            video_shape = VideoPixelShape(
+                batch=1,
+                frames=int(frame_count),
+                height=int(height),
+                width=int(width),
+                fps=float(frame_rate),
+            )
+            channels = int(getattr(audio_decoder, "z_channels", 8))
+            mel_bins = int(getattr(audio_decoder, "mel_bins", 16) or 16)
+            sample_rate = int(getattr(audio_decoder, "sample_rate", 16000))
+            hop_length = int(getattr(audio_decoder, "mel_hop_length", 160))
+            audio_downsample = int(
+                getattr(getattr(audio_decoder, "patchifier", None), "audio_latent_downsample_factor", 4)
+            )
+            audio_shape = AudioLatentShape.from_video_pixel_shape(
+                video_shape,
+                channels=channels,
+                mel_bins=mel_bins,
+                sample_rate=sample_rate,
+                hop_length=hop_length,
+                audio_latent_downsample_factor=audio_downsample,
+            )
+            audio_frames = max(int(audio_shape.frames), 1)
+            audio_latents = torch.randn(
+                (1, channels, audio_frames, mel_bins),
+                dtype=torch.float32,
+                device=transformer_device,
+                generator=generator,
+            )
+
         # Denoising loop
         with torch.no_grad():
             for t in tqdm(timesteps, desc="LTX-2 preview", leave=False):
@@ -1481,14 +1686,22 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 latent_model_input = torch.cat([latents, latents], dim=0) if do_classifier_free_guidance else latents
                 latent_model_input = latent_model_input.to(dtype=dit_dtype)
 
+                audio_model_input = None
+                if audio_latents is not None:
+                    audio_model_input = (
+                        torch.cat([audio_latents, audio_latents], dim=0)
+                        if do_classifier_free_guidance
+                        else audio_latents
+                    )
+                    audio_model_input = audio_model_input.to(dtype=dit_dtype)
+
                 # Prepare timestep
                 timestep_tensor = t.expand(latent_model_input.shape[0]).to(device=transformer_device, dtype=dit_dtype)
                 timestep_for_model = self._normalize_timesteps_for_model(timestep_tensor)
 
                 # Model prediction
-                # Handle LTXAV model input format
-                if self._audio_video:
-                    model_input = [latent_model_input]  # Video only for inference
+                if self._audio_video and audio_model_input is not None:
+                    model_input = [latent_model_input, audio_model_input]
                 else:
                     model_input = latent_model_input
 
@@ -1501,17 +1714,32 @@ class LTX2NetworkTrainer(NetworkTrainer):
                     transformer_options={},
                 )
 
-                # Handle LTXAV output format
+                audio_pred = None
                 if isinstance(model_pred, (list, tuple)):
-                    model_pred = model_pred[0]  # Use video prediction
+                    video_pred, audio_pred = model_pred
+                else:
+                    video_pred = model_pred
 
                 # Apply guidance if needed
                 if do_classifier_free_guidance:
-                    noise_uncond, noise_cond = model_pred.chunk(2)
-                    model_pred = noise_uncond + guidance_scale * (noise_cond - noise_uncond)
+                    noise_uncond, noise_cond = video_pred.chunk(2)
+                    video_pred = noise_uncond + guidance_scale * (noise_cond - noise_uncond)
+                    if audio_pred is not None:
+                        audio_uncond, audio_cond = audio_pred.chunk(2)
+                        audio_pred = audio_uncond + guidance_scale * (audio_cond - audio_uncond)
 
-                model_pred = model_pred.to(dtype=latents.dtype)
-                latents = scheduler.step(model_pred, t, latents, return_dict=False)[0]
+                video_pred = video_pred.to(dtype=latents.dtype)
+                latents = scheduler.step(video_pred, t, latents, return_dict=False)[0]
+                if audio_pred is not None and audio_latents is not None:
+                    audio_pred = audio_pred.to(dtype=audio_latents.dtype)
+                    audio_latents = scheduler.step(audio_pred, t, audio_latents, return_dict=False)[0]
+
+        if offload_transformer_for_decode and transformer_device != transformer_offload_device:
+            if hasattr(transformer, "move_to_device_except_swap_blocks"):
+                transformer.move_to_device_except_swap_blocks(transformer_offload_device)
+            else:
+                transformer.to(transformer_offload_device)
+            clean_memory_on_device(transformer_device)
 
         # Decode latents
         with torch.no_grad():
@@ -1521,6 +1749,35 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 if video.dim() == 4:  # [C, T, H, W]
                     video = video.unsqueeze(0)  # [1, C, T, H, W]
 
+        audio_waveform = None
+        if audio_latents is not None and audio_decoder is not None and vocoder is not None:
+            audio_decoder.to(transformer_device)
+            vocoder.to(transformer_device)
+            with torch.no_grad():
+                decode_dtype = getattr(audio_decoder, "dtype", None)
+                if decode_dtype is None:
+                    try:
+                        decode_dtype = next(audio_decoder.parameters()).dtype
+                    except StopIteration:
+                        decode_dtype = audio_latents.dtype
+                decoded_audio = audio_decoder(audio_latents.to(dtype=decode_dtype))
+                vocoder_dtype = getattr(vocoder, "dtype", None)
+                if vocoder_dtype is None:
+                    try:
+                        vocoder_dtype = next(vocoder.parameters()).dtype
+                    except StopIteration:
+                        vocoder_dtype = decoded_audio.dtype
+                audio_waveform = vocoder(decoded_audio.to(dtype=vocoder_dtype)).squeeze(0).float().cpu()
+            audio_decoder.to("cpu")
+            vocoder.to("cpu")
+
+        if offload_transformer_for_decode and restore_transformer_device and transformer_device != transformer_offload_device:
+            if hasattr(transformer, "move_to_device_except_swap_blocks"):
+                transformer.move_to_device_except_swap_blocks(transformer_device)
+            else:
+                transformer.to(transformer_device)
+            clean_memory_on_device(transformer_device)
+
         # Normalize to [0, 1]
         video = (video / 2 + 0.5).clamp(0, 1).to(torch.float32).to("cpu")
 
@@ -1528,7 +1785,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
         vae.to_device(original_vae_device)
         vae.to_dtype(original_vae_dtype)
 
-        return video
+        return video, audio_waveform
 
 
 # ======== Argument parser setup ========
@@ -1623,9 +1880,20 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         help="Default frame count for LTX-2 preview generation.",
     )
     parser.add_argument(
-        "--offloading",
+        "--sample_with_offloading",
         action="store_true",
         help="Offload LTX-2 DiT to CPU between sampling prompts to save VRAM.",
+    )
+    parser.add_argument(
+        "--ltx2_swap_mode",
+        type=str,
+        default="default",
+        choices=["default", "aggressive", "aggressive_no_offload"],
+        help=(
+            "Block swap strategy for LTX-2. Aggressive enables forward-only swapping for "
+            "training and turns on activation CPU offload; aggressive_no_offload keeps "
+            "other settings unchanged."
+        ),
     )
 
     return parser
