@@ -278,6 +278,8 @@ class Attention(torch.nn.Module):
         ensure_fp8_modules_on_device(self.to_q, x.device)
         ensure_fp8_modules_on_device(self.to_k, x.device)
         ensure_fp8_modules_on_device(self.to_v, x.device)
+        if isinstance(self.to_out, torch.nn.Sequential) and self.to_out:
+            ensure_fp8_modules_on_device(self.to_out[0], x.device)
         q = self.to_q(x)
         context = x if context is None else context
         k = self.to_k(context)

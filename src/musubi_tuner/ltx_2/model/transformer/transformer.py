@@ -18,6 +18,27 @@ class TransformerConfig:
     context_dim: int
 
 
+def _move_non_linear_params(module: torch.nn.Module, device: torch.device) -> None:
+    """Move non-linear params/buffers to device; Linear weights are handled by offloader."""
+    non_blocking = device.type != "cpu"
+    for submodule in module.modules():
+        if isinstance(submodule, torch.nn.Linear):
+            # Move bias and scale_weight if they exist and are on wrong device
+            if submodule.bias is not None and submodule.bias.device != device:
+                submodule.bias.data = submodule.bias.data.to(device, non_blocking=non_blocking)
+            if hasattr(submodule, "scale_weight") and submodule.scale_weight is not None and submodule.scale_weight.device != device:
+                submodule.scale_weight.data = submodule.scale_weight.data.to(device, non_blocking=non_blocking)
+            continue
+        
+        # For non-linear modules, we only move its DIRECT parameters/buffers to avoid recursing into Linear children
+        for param in submodule.parameters(recurse=False):
+            if param.device != device:
+                param.data = param.data.to(device, non_blocking=non_blocking)
+        for buf in submodule.buffers(recurse=False):
+            if buf.device != device:
+                buf.data = buf.data.to(device, non_blocking=non_blocking)
+
+
 class BasicAVTransformerBlock(torch.nn.Module):
     def __init__(
         self,
@@ -146,6 +167,7 @@ class BasicAVTransformerBlock(torch.nn.Module):
         elif audio is not None and isinstance(audio.x, torch.Tensor):
             target_device = audio.x.device
         if target_device is not None:
+            _move_non_linear_params(self, target_device)
             ensure_fp8_modules_on_device(self, target_device)
         batch_size = video.x.shape[0]
         if perturbations is None:

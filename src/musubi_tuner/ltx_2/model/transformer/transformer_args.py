@@ -1,4 +1,5 @@
 from dataclasses import dataclass, replace
+import logging
 
 import torch
 from musubi_tuner.ltx_2.model.transformer.adaln import AdaLayerNormSingle
@@ -10,6 +11,9 @@ from musubi_tuner.ltx_2.model.transformer.rope import (
     precompute_freqs_cis,
 )
 from musubi_tuner.ltx_2.model.transformer.text_projection import PixArtAlphaTextProjection
+
+logger = logging.getLogger(__name__)
+_LOGGED_PREPROCESSOR_DEVICES = False
 
 
 @dataclass(frozen=True)
@@ -125,6 +129,16 @@ class TransformerArgsPreprocessor:
         adaln_param = next(self.adaln.parameters(), None)
         if adaln_param is not None and adaln_param.device != device:
             self.adaln.to(device)
+        global _LOGGED_PREPROCESSOR_DEVICES
+        if not _LOGGED_PREPROCESSOR_DEVICES:
+            adaln_param = next(self.adaln.parameters(), None)
+            logger.info(
+                "LTX-2 preprocessor devices: patchify_proj=%s caption_projection=%s adaln=%s",
+                self.patchify_proj.weight.device,
+                self.caption_projection.linear_1.weight.device,
+                adaln_param.device if adaln_param is not None else "n/a",
+            )
+            _LOGGED_PREPROCESSOR_DEVICES = True
 
     def prepare(
         self,

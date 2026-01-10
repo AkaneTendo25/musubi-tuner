@@ -13,6 +13,8 @@ from musubi_tuner.modules.custom_offloading_utils import (
 )
 
 logger = logging.getLogger(__name__)
+_LOGGED_SWAP_BYTES = False
+_LOGGED_FIRST_PARAM = False
 
 
 def _log_cuda_memory(tag: str) -> None:
@@ -25,6 +27,40 @@ def _log_cuda_memory(tag: str) -> None:
 
 def _tensor_bytes(tensor: torch.Tensor) -> int:
     return tensor.numel() * tensor.element_size()
+
+
+def _module_cuda_bytes(module: nn.Module) -> int:
+    total = 0
+    for tensor in module.parameters():
+        if isinstance(tensor, torch.Tensor) and tensor.device.type == "cuda":
+            total += _tensor_bytes(tensor)
+    for tensor in module.buffers():
+        if isinstance(tensor, torch.Tensor) and tensor.device.type == "cuda":
+            total += _tensor_bytes(tensor)
+    return total
+
+
+def _log_block_cuda_bytes(blocks: List[nn.Module], split_idx: int) -> None:
+    kept = blocks[:split_idx]
+    swapped = blocks[split_idx:]
+    kept_bytes = sum(_module_cuda_bytes(block) for block in kept)
+    swapped_bytes = sum(_module_cuda_bytes(block) for block in swapped)
+    logger.info(
+        "LTX-2 swap mem [blocks_cuda_bytes]: kept=%.2fMB swapped=%.2fMB",
+        kept_bytes / (1024**2),
+        swapped_bytes / (1024**2),
+    )
+
+
+def _log_first_param(blocks: List[nn.Module]) -> None:
+    for block in blocks:
+        for param in block.parameters():
+            logger.info(
+                "LTX-2 swap diag [first_param]: dtype=%s device=%s",
+                param.dtype,
+                param.device,
+            )
+            return
 
 
 def _summarize_block_tensors(block: nn.Module, label: str) -> None:
@@ -52,7 +88,7 @@ def _module_on_device(module: nn.Module, device: torch.device) -> bool:
 
 
 class LTX2BlockSwapManager:
-    """Stream full blocks between devices (SimpleTuner-style) for LTX-2."""
+    """Stream full blocks between devices for LTX-2."""
 
     def __init__(self, block_indices: List[int], offload_device: torch.device):
         self.block_indices = set(block_indices)
@@ -167,6 +203,7 @@ class LTX2ModelOffloader(ModelOffloader):
     """LTX-2 local offloader that avoids GPU preloading for swap blocks."""
 
     def prepare_block_devices_before_forward(self, blocks: list[nn.Module]) -> None:
+        global _LOGGED_SWAP_BYTES, _LOGGED_FIRST_PARAM
         if self.blocks_to_swap is None or self.blocks_to_swap == 0:
             return
 
@@ -182,18 +219,26 @@ class LTX2ModelOffloader(ModelOffloader):
                     _summarize_block_tensors(blocks[swap_idx], "before_swap_block")
         _log_cuda_memory("before_prepare_blocks")
 
-        for block in blocks[0 : self.num_blocks - self.blocks_to_swap]:
+        split_idx = max(0, self.num_blocks - self.blocks_to_swap)
+        for block in blocks[0 : split_idx]:
             block.to(self.device)
             weighs_to_device(block, self.device)
 
         cpu_device = torch.device("cpu")
-        for block in blocks[self.num_blocks - self.blocks_to_swap :]:
-            block.to(cpu_device)
-            weighs_to_device(block, cpu_device)
+        for block in blocks[split_idx :]:
+            block.to(self.device)  # Move whole block to GPU first to keep norms/embeddings there
+            weighs_to_device(block, cpu_device) # Move only Linear weights back to CPU
 
         _synchronize_device(self.device)
         _clean_memory_on_device(self.device)
         _log_cuda_memory("after_prepare_blocks")
+        if not _LOGGED_SWAP_BYTES:
+            split_idx = max(0, self.num_blocks - self.blocks_to_swap)
+            _log_block_cuda_bytes(blocks, split_idx)
+            _LOGGED_SWAP_BYTES = True
+        if not _LOGGED_FIRST_PARAM:
+            _log_first_param(blocks)
+            _LOGGED_FIRST_PARAM = True
         if diag_enabled:
             keep_idx = 0
             swap_idx = max(0, self.num_blocks - self.blocks_to_swap)

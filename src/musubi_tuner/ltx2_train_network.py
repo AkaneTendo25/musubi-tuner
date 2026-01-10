@@ -435,23 +435,6 @@ class LTX2NetworkTrainer(NetworkTrainer):
             raise ValueError(f"Invalid ltx_mode: {ltx_mode}")
         self._ltx_mode = ltx_mode
         self._audio_video = self._ltx_mode == "av"
-        self._ltx2_swap_mode = getattr(args, "ltx2_swap_mode", "default")
-        if self._ltx2_swap_mode == "aggressive":
-            if not getattr(args, "gradient_checkpointing", False):
-                logger.warning(
-                    "LTX-2 aggressive swap requires gradient checkpointing; enabling it."
-                )
-                args.gradient_checkpointing = True
-            if not getattr(args, "gradient_checkpointing_cpu_offload", False):
-                logger.warning(
-                    "LTX-2 aggressive swap benefits from activation CPU offload; enabling it."
-                )
-                args.gradient_checkpointing_cpu_offload = True
-        elif self._ltx2_swap_mode == "aggressive_no_offload":
-            if not getattr(args, "gradient_checkpointing", False):
-                logger.warning(
-                    "LTX-2 aggressive_no_offload swap works best with gradient checkpointing enabled."
-                )
         self.default_guidance_scale = 1.0
 
         args.weighting_scheme = "none"
@@ -519,8 +502,6 @@ class LTX2NetworkTrainer(NetworkTrainer):
             fp8_scaled=bool(getattr(args, "fp8_scaled", False)),
             load_weights_on_cpu=True,
         )
-        if hasattr(transformer, "model") and hasattr(transformer.model, "__dict__"):
-            transformer.model.swap_mode = self._ltx2_swap_mode
 
         transformer.eval()
         transformer.requires_grad_(False)
@@ -1837,6 +1818,12 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         help="Training modality.",
     )
     parser.add_argument(
+        "--separate_audio_buckets",
+        action="store_true",
+        default=None,
+        help="Split LTX-2 buckets by audio presence to avoid mixed audio/non-audio batches.",
+    )
+    parser.add_argument(
         "--video_loss_weight",
         type=float,
         default=1.0,
@@ -1883,17 +1870,6 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         "--sample_with_offloading",
         action="store_true",
         help="Offload LTX-2 DiT to CPU between sampling prompts to save VRAM.",
-    )
-    parser.add_argument(
-        "--ltx2_swap_mode",
-        type=str,
-        default="default",
-        choices=["default", "aggressive", "aggressive_no_offload"],
-        help=(
-            "Block swap strategy for LTX-2. Aggressive enables forward-only swapping for "
-            "training and turns on activation CPU offload; aggressive_no_offload keeps "
-            "other settings unchanged."
-        ),
     )
 
     return parser

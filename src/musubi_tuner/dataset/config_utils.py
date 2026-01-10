@@ -39,6 +39,7 @@ class BaseDatasetParams:
     num_repeats: int = 1
     cache_directory: Optional[str] = None
     reference_cache_directory: Optional[str] = None
+    separate_audio_buckets: bool = False
     debug_dataset: bool = False
     architecture: str = "no_default"  # short style like "hv" or "wan"
 
@@ -118,6 +119,7 @@ class ConfigSanitizer:
         "bucket_no_upscale": bool,
         "cache_directory": str,
         "reference_cache_directory": str,
+        "separate_audio_buckets": bool,
     }
     IMAGE_DATASET_DISTINCT_SCHEMA = {
         "image_directory": str,
@@ -305,6 +307,7 @@ def generate_dataset_group_by_blueprint(
         caption_extension: "{dataset.caption_extension}"
         enable_bucket: {dataset.enable_bucket}
         bucket_no_upscale: {dataset.bucket_no_upscale}
+        separate_audio_buckets: {getattr(dataset, "separate_audio_buckets", False)}
         cache_directory: "{dataset.cache_directory}"
         debug_dataset: {dataset.debug_dataset}
     """

@@ -1058,29 +1058,8 @@ class BucketBatchManager:
                 batch_tensor_data["audio_lengths"] = torch.tensor(lengths, device=device, dtype=torch.int32)
 
             else:
-                ref = None
-                for item_info in bucket:
-                    audio_latent_cache_path = getattr(item_info, "audio_latent_cache_path", None)
-                    if audio_latent_cache_path is None or not os.path.exists(audio_latent_cache_path):
-                        continue
-                    sd_audio = load_file(audio_latent_cache_path)
-                    for key, value in sd_audio.items():
-                        if key.startswith("audio_latents_"):
-                            ref = value
-                            break
-                    if isinstance(ref, torch.Tensor):
-                        break
-
-                if isinstance(ref, torch.Tensor) and ref.dim() == 3:
-                    channels = int(ref.shape[0])
-                    mel_bins = int(ref.shape[2])
-                    dtype = ref.dtype
-                    device = ref.device
-
-                    bsz = end - start
-                    max_t = 1
-                    batch_tensor_data["audio_latents"] = torch.zeros((bsz, channels, max_t, mel_bins), device=device, dtype=dtype)
-                    batch_tensor_data["audio_lengths"] = torch.zeros((bsz,), device=device, dtype=torch.int32)
+                # Skip allocating placeholder audio tensors when the batch has no audio.
+                pass
 
         if self.timestep_pool is not None:
             batch_tensor_data["timesteps"] = self.timestep_pool[idx][: end - start]  # use the pre-generated timesteps
@@ -1719,6 +1698,7 @@ class BaseDataset(torch.utils.data.Dataset):
         bucket_no_upscale: bool = False,
         cache_directory: Optional[str] = None,
         reference_cache_directory: Optional[str] = None,
+        separate_audio_buckets: bool = False,
         debug_dataset: bool = False,
         architecture: str = "no_default",
     ):
@@ -1730,6 +1710,7 @@ class BaseDataset(torch.utils.data.Dataset):
         self.bucket_no_upscale = bucket_no_upscale
         self.cache_directory = cache_directory
         self.reference_cache_directory = reference_cache_directory
+        self.separate_audio_buckets = separate_audio_buckets
         self.debug_dataset = debug_dataset
         self.architecture = architecture
         self.seed = None
@@ -1747,8 +1728,32 @@ class BaseDataset(torch.utils.data.Dataset):
             "num_repeats": self.num_repeats,
             "enable_bucket": bool(self.enable_bucket),
             "bucket_no_upscale": bool(self.bucket_no_upscale),
+            "separate_audio_buckets": bool(self.separate_audio_buckets),
         }
         return metadata
+
+    def get_audio_latent_cache_path_from_latent_cache_path(self, latent_cache_path: str) -> str:
+        base_dir = os.path.dirname(latent_cache_path)
+        base_name = os.path.basename(latent_cache_path)
+        suffix = f"_{self.architecture}.safetensors"
+        if base_name.endswith(suffix):
+            base_name = base_name[: -len(suffix)] + f"_{self.architecture}_audio.safetensors"
+            return os.path.join(base_dir, base_name)
+        stem, _ext = os.path.splitext(base_name)
+        return os.path.join(base_dir, f"{stem}_{self.architecture}_audio.safetensors")
+
+    def get_audio_latent_cache_path(self, item_info: ItemInfo) -> str:
+        latent_cache_path = getattr(item_info, "latent_cache_path", None)
+        if not latent_cache_path:
+            latent_cache_path = self.get_latent_cache_path(item_info)
+        return self.get_audio_latent_cache_path_from_latent_cache_path(latent_cache_path)
+
+    def _append_audio_bucket_key(self, bucket_key: tuple[Any, ...], has_audio: bool) -> tuple[Any, ...]:
+        if not self.separate_audio_buckets:
+            return bucket_key
+        if self.architecture not in {ARCHITECTURE_LTX2, ARCHITECTURE_LTX2_FULL}:
+            return bucket_key
+        return (*bucket_key, bool(has_audio))
 
     def get_all_latent_cache_files(self):
         return glob.glob(os.path.join(self.cache_directory, f"*_{self.architecture}.safetensors"))
@@ -1897,6 +1902,7 @@ class ImageDataset(BaseDataset):
         control_directory: Optional[str] = None,
         cache_directory: Optional[str] = None,
         reference_cache_directory: Optional[str] = None,
+        separate_audio_buckets: bool = False,
         fp_latent_window_size: Optional[int] = 9,
         fp_1f_clean_indices: Optional[list[int]] = None,
         fp_1f_target_index: Optional[int] = None,
@@ -1916,6 +1922,7 @@ class ImageDataset(BaseDataset):
             bucket_no_upscale,
             cache_directory,
             reference_cache_directory,
+            separate_audio_buckets,
             debug_dataset,
             architecture,
         )
@@ -2125,7 +2132,7 @@ class ImageDataset(BaseDataset):
                 logger.warning(f"Text encoder output cache file not found: {text_encoder_output_cache_file}")
                 continue
 
-            audio_latent_cache_file = os.path.join(self.cache_directory, f"{item_key}_{self.architecture}_audio.safetensors")
+            audio_latent_cache_file = self.get_audio_latent_cache_path_from_latent_cache_path(cache_file)
 
             bucket_reso = bucket_selector.get_bucket_resolution(image_size)
 
@@ -2147,9 +2154,11 @@ class ImageDataset(BaseDataset):
                     control_shape = control_key.rsplit("_", 3)[-2]  # FxHxW
                     bucket_reso = tuple(list(bucket_reso) + [control_shape])  # (int, int, str)
 
+            has_audio = os.path.exists(audio_latent_cache_file)
+            bucket_reso = self._append_audio_bucket_key(tuple(bucket_reso), has_audio)
             item_info = ItemInfo(item_key, "", image_size, bucket_reso, latent_cache_path=cache_file)
             item_info.text_encoder_output_cache_path = text_encoder_output_cache_file
-            item_info.audio_latent_cache_path = audio_latent_cache_file if os.path.exists(audio_latent_cache_file) else None
+            item_info.audio_latent_cache_path = audio_latent_cache_file if has_audio else None
 
             bucket = bucketed_item_info.get(bucket_reso, [])
             for _ in range(self.num_repeats):
@@ -2209,6 +2218,7 @@ class VideoDataset(BaseDataset):
         control_directory: Optional[str] = None,
         cache_directory: Optional[str] = None,
         reference_cache_directory: Optional[str] = None,
+        separate_audio_buckets: bool = False,
         fp_latent_window_size: Optional[int] = 9,
         debug_dataset: bool = False,
         architecture: str = "no_default",
@@ -2222,6 +2232,7 @@ class VideoDataset(BaseDataset):
             bucket_no_upscale,
             cache_directory,
             reference_cache_directory,
+            separate_audio_buckets,
             debug_dataset,
             architecture,
         )
@@ -2498,8 +2509,12 @@ class VideoDataset(BaseDataset):
 
             bucket_reso = bucket_selector.get_bucket_resolution(image_size)
             bucket_reso = (*bucket_reso, frame_count)
+            audio_latent_cache_file = self.get_audio_latent_cache_path_from_latent_cache_path(cache_file)
+            has_audio = os.path.exists(audio_latent_cache_file)
+            bucket_reso = self._append_audio_bucket_key(tuple(bucket_reso), has_audio)
             item_info = ItemInfo(item_key, "", image_size, bucket_reso, frame_count=frame_count, latent_cache_path=cache_file)
             item_info.text_encoder_output_cache_path = text_encoder_output_cache_file
+            item_info.audio_latent_cache_path = audio_latent_cache_file if has_audio else None
 
             bucket = bucketed_item_info.get(bucket_reso, [])
             for _ in range(self.num_repeats):
