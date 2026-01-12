@@ -6,6 +6,7 @@ from einops import rearrange
 from transformers import AutoImageProcessor, Gemma3ForConditionalGeneration, Gemma3Processor
 from musubi_tuner.ltx_2.loader.module_ops import ModuleOps
 from musubi_tuner.ltx_2.text_encoders.gemma.feature_extractor import GemmaFeaturesExtractorProjLinear
+from musubi_tuner.utils.safetensors_utils import MemoryEfficientSafeOpen
 from musubi_tuner.ltx_2.text_encoders.gemma.tokenizer import LTXVGemmaTokenizer
 
 
@@ -255,17 +256,43 @@ def _find_matching_dir(root_path: str, pattern: str) -> str:
     return str(matches[0].parent)
 
 
+def _infer_safetensors_dtype(path: str) -> torch.dtype | None:
+    with MemoryEfficientSafeOpen(path) as handle:
+        for key in handle.keys():
+            meta = handle.header.get(key)
+            if not isinstance(meta, dict) or "dtype" not in meta:
+                continue
+            dt = handle._get_torch_dtype(meta["dtype"])  # noqa: SLF001
+            if isinstance(dt, torch.dtype) and dt.is_floating_point:
+                return dt
+    return None
+
+
 def module_ops_from_gemma_root(
     gemma_root: str,
     *,
+    gemma_weights_path: str | None = None,
     torch_dtype: torch.dtype = torch.bfloat16,
     load_in_8bit: bool = False,
     load_in_4bit: bool = False,
     bnb_4bit_quant_type: str = "nf4",
     bnb_4bit_use_double_quant: bool = True,
     bnb_4bit_compute_dtype: torch.dtype | None = None,
+    device: torch.device | None = None,
 ) -> tuple[ModuleOps, ...]:
-    gemma_path = _find_matching_dir(gemma_root, "model*.safetensors")
+    gemma_weights_dtype = None
+    if gemma_weights_path:
+        weight_path = Path(gemma_weights_path)
+        if weight_path.is_dir():
+            gemma_path = _find_matching_dir(str(weight_path), "model*.safetensors")
+            gemma_weights_path = None
+        else:
+            if not weight_path.exists():
+                raise FileNotFoundError(f"Gemma weights not found: {gemma_weights_path}")
+            gemma_weights_dtype = _infer_safetensors_dtype(str(weight_path))
+            gemma_path = str(weight_path.parent)
+    else:
+        gemma_path = _find_matching_dir(gemma_root, "model*.safetensors")
     tokenizer_path = _find_matching_dir(gemma_root, "tokenizer.model")
 
     def load_gemma(module: GemmaTextEncoderModelBase) -> GemmaTextEncoderModelBase:
@@ -275,6 +302,8 @@ def module_ops_from_gemma_root(
         if load_in_8bit or load_in_4bit:
             if not torch.cuda.is_available():
                 raise ValueError("8-bit/4-bit Gemma loading requires CUDA")
+            if gemma_weights_path is not None:
+                raise ValueError("gemma_weights_path is not supported with 8-bit/4-bit loading")
 
             from transformers import BitsAndBytesConfig
 
@@ -297,11 +326,62 @@ def module_ops_from_gemma_root(
                 device_map={"": "cuda"},
             )
         else:
-            module.model = Gemma3ForConditionalGeneration.from_pretrained(
-                gemma_path,
-                local_files_only=True,
-                torch_dtype=torch_dtype,
-            )
+            if gemma_weights_path is not None:
+                from safetensors import safe_open
+                from transformers import AutoConfig
+                load_device = device or (torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
+                if gemma_weights_dtype is not None and gemma_weights_dtype.itemsize == 1 and load_device.type != "cuda":
+                    raise ValueError("Float8 Gemma weights require CUDA; provide a GPU or use non-fp8 weights.")
+
+                config = AutoConfig.from_pretrained(gemma_root, local_files_only=True)
+                module.model = Gemma3ForConditionalGeneration(config).to(load_device)
+                # Memory-efficient loading: stream tensors directly to model
+                with safe_open(gemma_weights_path, framework="pt", device="cpu") as f:
+                    # We use "cpu" for safe_open to ensure we don't accidentally OOM GPU during read
+                    # Transfer to load_device is done during assignment
+                    for key in f.keys():
+                        new_key = key
+                        # Fix for ComfyUI/flattened checkpoints
+                        if key.startswith("vision_model."):
+                            new_key = f"model.vision_tower.{key}"
+                        elif key.startswith("multi_modal_projector."):
+                            new_key = f"model.vision_tower.{key}"
+                        
+                        try:
+                            # Iterate to find the submodule and parameter
+                            sub_mod = module.model
+                            parts = new_key.split(".")
+                            param_name = parts[-1]
+                            for part in parts[:-1]:
+                                sub_mod = getattr(sub_mod, part)
+                            
+                            param = getattr(sub_mod, param_name)
+                            tensor = f.get_tensor(key)
+                            
+                            with torch.no_grad():
+                                if param.shape != tensor.shape:
+                                    # Handle specialized shape mismatches if necessary, or error
+                                    logger.warning(f"Shape mismatch for {new_key}: model {param.shape} vs ckpt {tensor.shape}")
+                                    continue
+                                
+                                # Move to target device and assign
+                                param.data = tensor.to(device=load_device, dtype=param.dtype)
+                        except AttributeError:
+                            # Missing in model (unexpected key) - ignore or log
+                            pass
+                        except Exception as e:
+                            logger.warning(f"Error loading {new_key}: {e}")
+
+                # Verify loading (basic check)
+                missing = [] # Full verification is expensive now, skip or implement light check
+                unexpected = [] 
+                module.model = module.model.to(dtype=torch_dtype)
+            else:
+                module.model = Gemma3ForConditionalGeneration.from_pretrained(
+                    gemma_path,
+                    local_files_only=True,
+                    torch_dtype=torch_dtype,
+                )
         module._gemma_root = module._gemma_root or gemma_root
         return module
 

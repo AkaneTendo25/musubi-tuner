@@ -1,10 +1,15 @@
 """LTX-2 LoRA Training Implementation."""
 
 import argparse
+import gc
 import os
 import re
+import subprocess
+import sys
+import tempfile
 import time
 import wave
+from fractions import Fraction
 from typing import Any, Dict, List, Optional, Tuple, Union
 import torch
 import torch.nn.functional as F
@@ -26,9 +31,9 @@ from musubi_tuner.hv_generate_video import save_images_grid, save_videos_grid
 from musubi_tuner.utils.device_utils import clean_memory_on_device
 from musubi_tuner.utils import model_utils
 from musubi_tuner.ltx_2.model.transformer.fp8_device_utils import ensure_fp8_modules_on_device
-from musubi_tuner.utils.safetensors_utils import MemoryEfficientSafeOpen
-from musubi_tuner.modules.fp8_optimization_utils import apply_fp8_monkey_patch
-from musubi_tuner.utils.lora_utils import load_safetensors_with_lora_and_fp8
+from musubi_tuner.utils.safetensors_utils import MemoryEfficientSafeOpen        
+from musubi_tuner.modules.fp8_optimization_utils import apply_fp8_monkey_patch  
+from musubi_tuner.utils.lora_utils import load_safetensors_with_lora_and_fp8    
 
 # LTX-2 latent normalization defaults.
 # These are identity stats (mean=0, std=1). We keep them as a safe fallback and
@@ -298,6 +303,59 @@ class LTX2NetworkTrainer(NetworkTrainer):
         self._audio_video: bool = False
         self._ltx_mode: str = "video"
         self.default_guidance_scale = 1.0
+        self._audio_preview_config: Optional[Dict[str, int | float]] = None
+
+    def _get_audio_preview_config(self, args: argparse.Namespace, transformer) -> Dict[str, int | float]:
+        if self._audio_preview_config is not None:
+            return self._audio_preview_config
+
+        from musubi_tuner.ltx_2.loader.sft_loader import SafetensorsModelStateDictLoader
+        from musubi_tuner.ltx_2.model.audio_vae.audio_vae import LATENT_DOWNSAMPLE_FACTOR
+
+        if getattr(args, "ltx2_checkpoint", None) is None:
+            raise ValueError("--ltx2_checkpoint is required for audio preview config")
+
+        config = SafetensorsModelStateDictLoader().metadata(str(args.ltx2_checkpoint))
+        audio_vae_cfg = config.get("audio_vae", {})
+        model_cfg = audio_vae_cfg.get("model", {}).get("params", {})
+        ddconfig = model_cfg.get("ddconfig", {})
+        preprocessing_cfg = audio_vae_cfg.get("preprocessing", {})
+        stft_cfg = preprocessing_cfg.get("stft", {})
+        mel_cfg = preprocessing_cfg.get("mel", {})
+
+        sample_rate = int(model_cfg.get("sampling_rate", 16000))
+        hop_length = int(stft_cfg.get("hop_length", 160))
+        channels = int(ddconfig.get("z_channels", 8))
+        mel_bins = ddconfig.get("mel_bins") or mel_cfg.get("n_mel_channels") or 64
+        mel_bins = int(mel_bins)
+
+        audio_patchify_proj = getattr(transformer, "audio_patchify_proj", None)
+        audio_in_features = getattr(audio_patchify_proj, "in_features", None)
+        if isinstance(audio_in_features, int) and channels > 0:
+            inferred_mel = audio_in_features // channels
+            if inferred_mel > 0 and inferred_mel != mel_bins:
+                logger.warning(
+                    "Sampling: overriding audio mel_bins from %s to %s to match audio_patchify_proj.in_features=%s",
+                    mel_bins,
+                    inferred_mel,
+                    audio_in_features,
+                )
+                mel_bins = inferred_mel
+            elif audio_in_features % channels != 0:
+                logger.warning(
+                    "Sampling: audio_patchify_proj.in_features=%s is not divisible by audio channels=%s; audio preview may fail.",
+                    audio_in_features,
+                    channels,
+                )
+
+        self._audio_preview_config = {
+            "sample_rate": sample_rate,
+            "hop_length": hop_length,
+            "channels": channels,
+            "mel_bins": mel_bins,
+            "audio_latent_downsample_factor": int(LATENT_DOWNSAMPLE_FACTOR),
+        }
+        return self._audio_preview_config
 
     def _normalize_timesteps_for_model(self, timesteps: torch.Tensor) -> torch.Tensor:
         """Normalize timesteps to the model's expected 0..1 sigma range."""
@@ -583,9 +641,14 @@ class LTX2NetworkTrainer(NetworkTrainer):
         return vae
 
     def _load_audio_components(
-        self, args: argparse.Namespace, audio_dtype: torch.dtype, checkpoint_path: str
+        self,
+        args: argparse.Namespace,
+        audio_dtype: torch.dtype,
+        checkpoint_path: str,
+        device: Optional[torch.device] = None,
     ):
-        logger.info("Loading LTX-2 audio decoder/vocoder from %s", checkpoint_path)
+        device = device or torch.device("cpu")
+        logger.info("Loading LTX-2 audio decoder/vocoder from %s (device=%s)", checkpoint_path, device)
         from musubi_tuner.ltx_2.loader.single_gpu_model_builder import SingleGPUModelBuilder
         from musubi_tuner.ltx_2.model.audio_vae.model_configurator import (
             AudioDecoderConfigurator,
@@ -598,12 +661,12 @@ class LTX2NetworkTrainer(NetworkTrainer):
             model_path=str(checkpoint_path),
             model_class_configurator=AudioDecoderConfigurator,
             model_sd_ops=AUDIO_VAE_DECODER_COMFY_KEYS_FILTER,
-        ).build(device=torch.device("cpu"), dtype=audio_dtype)
+        ).build(device=device, dtype=audio_dtype)
         vocoder = SingleGPUModelBuilder(
             model_path=str(checkpoint_path),
             model_class_configurator=VocoderConfigurator,
             model_sd_ops=VOCODER_COMFY_KEYS_FILTER,
-        ).build(device=torch.device("cpu"), dtype=audio_dtype)
+        ).build(device=device, dtype=audio_dtype)
 
         audio_decoder.eval()
         vocoder.eval()
@@ -625,6 +688,148 @@ class LTX2NetworkTrainer(NetworkTrainer):
             wav.setsampwidth(2)
             wav.setframerate(sample_rate)
             wav.writeframes(interleaved)
+
+    def _decode_audio_preview_subprocess(
+        self,
+        *,
+        audio_latents: torch.Tensor,
+        output_path: str,
+        checkpoint_path: str,
+    ) -> None:
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        with tempfile.NamedTemporaryFile(suffix="_ltx2_audio_latents.pt", delete=False) as tmp:
+            tmp_path = tmp.name
+        try:
+            torch.save({"latents": audio_latents.detach().cpu()}, tmp_path)
+            cmd = [
+                sys.executable,
+                "-m",
+                "musubi_tuner.ltx2_audio_preview",
+                "--checkpoint",
+                checkpoint_path,
+                "--input",
+                tmp_path,
+                "--output",
+                output_path,
+                "--device",
+                "cpu",
+                "--dtype",
+                "fp32",
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                logger.warning(
+                    "Audio preview subprocess failed (code=%s): %s",
+                    result.returncode,
+                    (result.stderr or result.stdout).strip(),
+                )
+        finally:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+    @staticmethod
+    def _cleanup_cuda(device: torch.device) -> None:
+        clean_memory_on_device(device)
+        if device.type == "cuda":
+            try:
+                torch.cuda.ipc_collect()
+            except Exception:
+                pass
+        gc.collect()
+
+    @staticmethod
+    def _mux_video_audio(video_path: str, audio_path: str, output_path: str) -> None:
+        if not os.path.exists(video_path) or not os.path.exists(audio_path):
+            return
+        try:
+            import av
+            import numpy as np
+        except Exception as exc:
+            logger.warning("Sampling: unable to mux audio/video (PyAV missing?): %s", exc)
+            return
+
+        with wave.open(audio_path, "rb") as wav_in:
+            sample_rate = wav_in.getframerate()
+            channels = wav_in.getnchannels()
+            frames = wav_in.readframes(wav_in.getnframes())
+        audio = np.frombuffer(frames, dtype=np.int16)
+        if channels > 1:
+            audio = audio.reshape(-1, channels)
+        else:
+            audio = audio.reshape(-1, 1)
+        if audio.shape[1] == 1:
+            audio = np.repeat(audio, 2, axis=1)
+        elif audio.shape[1] > 2:
+            audio = audio[:, :2]
+
+        container_in = av.open(video_path)
+        video_stream_in = next((s for s in container_in.streams if s.type == "video"), None)
+        if video_stream_in is None:
+            container_in.close()
+            return
+
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        container_out = av.open(output_path, mode="w")
+        video_stream_out = container_out.add_stream(
+            "libx264",
+            rate=video_stream_in.average_rate or video_stream_in.base_rate or 24,
+        )
+        video_stream_out.width = video_stream_in.width
+        video_stream_out.height = video_stream_in.height
+        video_stream_out.pix_fmt = "yuv420p"
+
+        audio_stream = container_out.add_stream("aac", rate=sample_rate)
+        audio_stream.codec_context.sample_rate = sample_rate
+        audio_stream.codec_context.layout = "stereo"
+        audio_stream.codec_context.time_base = Fraction(1, sample_rate)
+
+        for frame in container_in.decode(video_stream_in):
+            for packet in video_stream_out.encode(frame):
+                container_out.mux(packet)
+        for packet in video_stream_out.encode():
+            container_out.mux(packet)
+
+        frame_in = av.AudioFrame.from_ndarray(audio.reshape(1, -1), format="s16", layout="stereo")
+        frame_in.sample_rate = sample_rate
+        target_format = audio_stream.codec_context.format or "fltp"
+        target_layout = audio_stream.codec_context.layout or "stereo"
+        target_rate = audio_stream.codec_context.sample_rate or sample_rate
+        audio_resampler = av.audio.resampler.AudioResampler(
+            format=target_format,
+            layout=target_layout,
+            rate=target_rate,
+        )
+        audio_next_pts = 0
+        for rframe in audio_resampler.resample(frame_in):
+            if rframe.pts is None:
+                rframe.pts = audio_next_pts
+            audio_next_pts += rframe.samples
+            rframe.sample_rate = sample_rate
+            for packet in audio_stream.encode(rframe):
+                container_out.mux(packet)
+        for packet in audio_stream.encode():
+            container_out.mux(packet)
+
+        container_out.close()
+        container_in.close()
+
+    @staticmethod
+    def _override_attention_function(transformer, attention_function):
+        from musubi_tuner.ltx_2.model.transformer.attention import Attention
+
+        overrides = []
+        for module in transformer.modules():
+            if isinstance(module, Attention):
+                overrides.append((module, module.attention_function))
+                module.attention_function = attention_function
+        return overrides
+
+    @staticmethod
+    def _restore_attention_function(overrides) -> None:
+        for module, attention_function in overrides:
+            module.attention_function = attention_function
 
     def load_vae(self, args: argparse.Namespace, vae_dtype: torch.dtype, vae_path: str):
         if getattr(args, "sample_prompts", None):
@@ -718,7 +923,13 @@ class LTX2NetworkTrainer(NetworkTrainer):
         if conditions is not None:
             if not isinstance(conditions, dict):
                 raise TypeError(f"Expected batch['conditions'] to be a dict, got: {type(conditions)}")
-            if self._audio_video:
+            if self._ltx_mode == "audio":
+                text_embeds = conditions.get("audio_prompt_embeds")
+                if text_embeds is None:
+                    text_embeds = conditions.get("prompt_embeds")
+                if text_embeds is None:
+                    text_embeds = conditions.get("video_prompt_embeds")
+            elif self._audio_video:
                 video_prompt_embeds = conditions.get("video_prompt_embeds")
                 audio_prompt_embeds = conditions.get("audio_prompt_embeds")
                 if video_prompt_embeds is not None and audio_prompt_embeds is not None:
@@ -732,6 +943,8 @@ class LTX2NetworkTrainer(NetworkTrainer):
         else:
             text_embeds = batch.get("text")
             text_mask = batch.get("text_mask")
+            if self._ltx_mode == "audio" and isinstance(text_embeds, torch.Tensor) and text_embeds.shape[-1] % 2 == 0:
+                text_embeds = text_embeds[..., text_embeds.shape[-1] // 2 :]
 
         if text_embeds is None:
             raise ValueError(
@@ -815,8 +1028,109 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 raise ValueError(f"Channel mismatch: latents C={latents.shape[1]} vs ref_latents C={ref_latents.shape[1]}")
             if ref_latents.shape[3] != latents.shape[3] or ref_latents.shape[4] != latents.shape[4]:
                 raise ValueError(
-                    f"Spatial mismatch: latents HxW={latents.shape[3]}x{latents.shape[4]} vs ref_latents HxW={ref_latents.shape[3]}x{ref_latents.shape[4]}"
+                    f"Spatial mismatch: latents HxW={latents.shape[3]}x{latents.shape[4]} vs ref_latents HxW={ref_latents.shape[3]}x{ref_latents.shape[4]}"     
                 )
+
+        if self._ltx_mode == "audio":
+            audio_latents = batch.get("audio_latents")
+            if isinstance(audio_latents, dict):
+                audio_latents = audio_latents.get("latents")
+            if audio_latents is None:
+                raise ValueError("audio_latents are required for --ltx_mode audio")
+            if not isinstance(audio_latents, torch.Tensor):
+                raise TypeError(f"Expected audio_latents to be a torch.Tensor, got: {type(audio_latents)}")
+            if audio_latents.dim() != 4:
+                raise ValueError(f"Expected audio_latents to be 4D [B, C, T, F], got shape: {tuple(audio_latents.shape)}")
+            if audio_latents.shape[0] != latents.shape[0]:
+                raise ValueError(
+                    f"Batch size mismatch: latents batch={latents.shape[0]} vs audio_latents batch={audio_latents.shape[0]}"
+                )
+
+            audio_latents = audio_latents.to(device=accelerator.device, dtype=network_dtype)
+            audio_noise = torch.randn_like(audio_latents)
+            sigma_audio = sigma.view(-1, 1, 1, 1)
+            noisy_audio = (1.0 - sigma_audio) * audio_latents + sigma_audio * audio_noise
+
+            dummy_video = torch.zeros(
+                (latents.shape[0], latents.shape[1], 1, 1, 1),
+                device=accelerator.device,
+                dtype=network_dtype,
+            )
+
+            if getattr(args, "fp8_base", False) or getattr(args, "fp8_scaled", False):
+                self._ensure_fp8_buffers_on_device(transformer)
+            with accelerator.autocast():
+                model_pred = transformer(
+                    [dummy_video, noisy_audio],
+                    timestep=model_timesteps,
+                    context=text_embeds,
+                    attention_mask=text_mask,
+                    frame_rate=frame_rate,
+                    transformer_options={"patches_replace": {}},
+                    audio_only=True,
+                )
+
+            video_pred = model_pred
+            audio_pred = None
+            if isinstance(model_pred, (list, tuple)):
+                if len(model_pred) != 2:
+                    raise ValueError(f"Expected audio-only model to return [video_pred, audio_pred], got {len(model_pred)} outputs")
+                video_pred, audio_pred = model_pred
+            if audio_pred is None:
+                raise ValueError("Audio-only mode expected an audio prediction but got None")
+
+            video_target = torch.zeros_like(video_pred)
+            out_audio: Dict[str, Any] = {
+                "video_pred": video_pred,
+                "video_target": video_target,
+                "video_loss_weight": 0.0,
+            }
+
+            audio_target = audio_noise - audio_latents
+            audio_seq_len = int(audio_latents.shape[2])
+            audio_loss_mask = torch.ones(
+                (audio_latents.shape[0], audio_seq_len),
+                device=accelerator.device,
+                dtype=torch.bool,
+            )
+
+            audio_lengths = batch.get("audio_lengths")
+            if isinstance(audio_lengths, dict):
+                audio_lengths = audio_lengths.get("lengths")
+            if isinstance(audio_lengths, torch.Tensor):
+                if audio_lengths.dim() == 0:
+                    audio_lengths = audio_lengths.view(1)
+                if audio_lengths.dim() != 1:
+                    raise ValueError(f"Expected audio_lengths to be 1D [B] or scalar, got shape: {tuple(audio_lengths.shape)}")
+                if audio_lengths.numel() == 1 and audio_latents.shape[0] != 1:
+                    audio_lengths = audio_lengths.expand(audio_latents.shape[0])
+                if audio_lengths.shape[0] != audio_latents.shape[0]:
+                    raise ValueError(
+                        f"Batch size mismatch: audio_latents batch={audio_latents.shape[0]} vs audio_lengths batch={audio_lengths.shape[0]}"
+                    )
+
+                audio_lengths = audio_lengths.to(device=accelerator.device)
+                if audio_lengths.dtype.is_floating_point:
+                    audio_lengths = audio_lengths.to(dtype=torch.int64)
+                else:
+                    audio_lengths = audio_lengths.to(dtype=torch.int64)
+
+                audio_lengths = audio_lengths.clamp(min=0, max=audio_seq_len)
+                t = torch.arange(audio_seq_len, device=accelerator.device).view(1, -1)
+                audio_loss_mask = t < audio_lengths.view(-1, 1)
+
+            out_audio.update(
+                {
+                    "audio_pred": audio_pred,
+                    "audio_target": audio_target,
+                    "audio_loss_mask": audio_loss_mask,
+                    "audio_loss_weight": float(getattr(args, "audio_loss_weight", 1.0)),
+                }
+            )
+            if out_audio["audio_loss_weight"] < 0.0:
+                raise ValueError(f"audio_loss_weight must be >= 0. Got: {out_audio['audio_loss_weight']}")
+
+            return out_audio, torch.tensor(0.0, device=accelerator.device)
 
         first_frame_p = float(getattr(args, "ltx2_first_frame_conditioning_p", 0.0))
         if not (0.0 <= first_frame_p <= 1.0):
@@ -972,11 +1286,6 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 audio_noise = torch.randn_like(audio_latents)
                 sigma_audio = sigma.view(-1, 1, 1, 1)
                 noisy_audio = (1.0 - sigma_audio) * audio_latents + sigma_audio * audio_noise
-        elif self._ltx_mode == "audio":
-            raise NotImplementedError(
-                "Audio-only training mode is not implemented yet. "
-                "It requires official LTXAV audio-only forward semantics and audio latent caching."
-            )
 
         if self._audio_video and not audio_enabled_for_batch and text_embeds.shape[-1] % 2 == 0:
             text_embeds = text_embeds[..., : text_embeds.shape[-1] // 2]
@@ -1178,20 +1487,44 @@ class LTX2NetworkTrainer(NetworkTrainer):
             if accelerator.device.type != "cuda":
                 raise ValueError("Gemma 8-bit/4-bit loading requires CUDA")
 
+        build_device = accelerator.device
+        is_quantized_load = getattr(args, "gemma_load_in_8bit", False) or getattr(args, "gemma_load_in_4bit", False)
+
         self._text_encoder = SingleGPUModelBuilder(
             model_path=str(args.ltx2_checkpoint),
             model_class_configurator=configurator,
             model_sd_ops=key_ops,
             module_ops=module_ops_from_gemma_root(
                 args.gemma_root,
+                gemma_weights_path=getattr(args, "gemma_safetensors", None),
                 torch_dtype=text_encoder_dtype,
                 load_in_8bit=bool(getattr(args, "gemma_load_in_8bit", False)),
                 load_in_4bit=bool(getattr(args, "gemma_load_in_4bit", False)),
                 bnb_4bit_quant_type=str(getattr(args, "gemma_bnb_4bit_quant_type", "nf4")),
                 bnb_4bit_use_double_quant=not bool(getattr(args, "gemma_bnb_4bit_disable_double_quant", False)),
                 bnb_4bit_compute_dtype=text_encoder_dtype,
+                device=build_device,
             ),
-        ).build(device=accelerator.device, dtype=text_encoder_dtype)
+        ).build(device=build_device, dtype=text_encoder_dtype)
+        text_model = getattr(self._text_encoder, "model", None)
+        is_quantized = False
+        if text_model is not None:
+            is_quantized = bool(getattr(text_model, "is_loaded_in_8bit", False)) or bool(
+                getattr(text_model, "is_loaded_in_4bit", False)
+            )
+        if not is_quantized and accelerator.device.type != "cpu":
+            self._text_encoder.to(accelerator.device)
+        text_model = getattr(self._text_encoder, "model", None)
+        if text_model is not None:
+            try:
+                first_param = next(text_model.parameters())
+                logger.info(
+                    "Gemma text encoder device: %s dtype: %s",
+                    first_param.device,
+                    first_param.dtype,
+                )
+            except StopIteration:
+                pass
         self._text_encoder.eval()
         return text_encoder_dtype
 
@@ -1253,6 +1586,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
         transformer_offloaded = offload and accelerator.device.type == "cuda"
         if transformer_offloaded:
             transformer.to("cpu")
+            logger.info("Sampling offload: moved transformer to CPU before prompt loop")
             clean_memory_on_device(accelerator.device)
         if getattr(transformer, "blocks_to_swap", 0) and original_device.type == "cpu" and not transformer_offloaded:
             if hasattr(transformer, "move_to_device_except_swap_blocks"):
@@ -1274,6 +1608,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
 
         def ensure_transformer_on_device() -> None:
             if transformer_offloaded:
+                logger.info("Sampling offload: moving transformer to GPU for denoise")
                 if hasattr(transformer, "move_to_device_except_swap_blocks"):
                     transformer.move_to_device_except_swap_blocks(accelerator.device)
                 else:
@@ -1282,6 +1617,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
 
         def offload_transformer_if_needed() -> None:
             if transformer_offloaded:
+                logger.info("Sampling offload: moving transformer back to CPU")
                 transformer.to("cpu")
                 clean_memory_on_device(accelerator.device)
 
@@ -1289,6 +1625,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
             if sample_parameter.get("prompt_embeds") is not None:
                 return
             text_encoder_dtype = self._build_text_encoder(args, accelerator)
+            logger.info("Sampling offload: loaded text encoder for prompt embeds")
             prompt_text = sample_parameter.get("prompt", "")
             prompt_embeds, prompt_mask = self._encode_prompt_text(accelerator, prompt_text, text_encoder_dtype)
             sample_parameter["prompt_embeds"] = prompt_embeds
@@ -1299,6 +1636,8 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 sample_parameter["negative_prompt_embeds"] = neg_embeds
                 sample_parameter["negative_prompt_attention_mask"] = neg_mask
             self._cleanup_text_encoder(accelerator)
+            logger.info("Sampling offload: unloaded text encoder after prompt embeds")
+            self._cleanup_cuda(accelerator.device)
 
         def cleanup_embeddings(sample_parameter: Dict) -> None:
             sample_parameter.pop("prompt_embeds", None)
@@ -1313,6 +1652,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
                         offload_transformer_if_needed()
                         prepare_embeddings_for_sample(sample_parameter)
                         vae_dtype = torch.float16 if args.vae_dtype is None else model_utils.str_to_dtype(args.vae_dtype)
+                        logger.info("Sampling offload: loading VAE for sampling")
                         vae_for_sampling = self._load_vae_impl(args, vae_dtype=vae_dtype, vae_path=args.vae)
                         ensure_transformer_on_device()
                         self.sample_image_inference(
@@ -1321,12 +1661,14 @@ class LTX2NetworkTrainer(NetworkTrainer):
                         offload_transformer_if_needed()
                         cleanup_embeddings(sample_parameter)
                         vae_for_sampling.to_device("cpu")
-                        clean_memory_on_device(accelerator.device)
+                        logger.info("Sampling offload: moved VAE back to CPU after sampling")
+                        self._cleanup_cuda(accelerator.device)
                     else:
                         self.sample_image_inference(
                             accelerator, args, transformer, dit_dtype, vae, save_dir, sample_parameter, epoch, steps
                         )
                     clean_memory_on_device(accelerator.device)
+                    self._cleanup_cuda(accelerator.device)
         else:
             per_process_params = []
             for i in range(distributed_state.num_processes):
@@ -1339,6 +1681,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
                             offload_transformer_if_needed()
                             prepare_embeddings_for_sample(sample_parameter)
                             vae_dtype = torch.float16 if args.vae_dtype is None else model_utils.str_to_dtype(args.vae_dtype)
+                            logger.info("Sampling offload: loading VAE for sampling")
                             vae_for_sampling = self._load_vae_impl(args, vae_dtype=vae_dtype, vae_path=args.vae)
                             ensure_transformer_on_device()
                             self.sample_image_inference(
@@ -1355,12 +1698,13 @@ class LTX2NetworkTrainer(NetworkTrainer):
                             offload_transformer_if_needed()
                             cleanup_embeddings(sample_parameter)
                             vae_for_sampling.to_device("cpu")
-                            clean_memory_on_device(accelerator.device)
+                            logger.info("Sampling offload: moved VAE back to CPU after sampling")
+                            self._cleanup_cuda(accelerator.device)
                         else:
                             self.sample_image_inference(
                                 accelerator, args, transformer, dit_dtype, vae, save_dir, sample_parameter, epoch, steps
                             )
-                        clean_memory_on_device(accelerator.device)
+                        self._cleanup_cuda(accelerator.device)
 
         torch.set_rng_state(rng_state)
         if cuda_rng_state is not None:
@@ -1371,10 +1715,11 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 transformer.move_to_device_except_swap_blocks(accelerator.device)
             else:
                 transformer.to(accelerator.device)
+            logger.info("Sampling offload: restored transformer to training device")
             clean_memory_on_device(accelerator.device)
 
         transformer.switch_block_swap_for_training()
-        clean_memory_on_device(accelerator.device)
+        self._cleanup_cuda(accelerator.device)
 
     def sample_image_inference(
         self,
@@ -1398,12 +1743,29 @@ class LTX2NetworkTrainer(NetworkTrainer):
         audio_decoder = None
         vocoder = None
         loaded_audio = False
-        if self._audio_video and getattr(args, "ltx_mode", "video") == "av":
+        disable_audio_preview = bool(getattr(args, "sample_disable_audio", False))
+        use_audio_subprocess = bool(getattr(args, "sample_with_offloading", False))
+        enable_audio_preview = self._audio_video and not disable_audio_preview
+        if (
+            self._audio_video
+            and getattr(args, "ltx_mode", "video") == "av"
+            and not disable_audio_preview
+            and not use_audio_subprocess
+        ):
             audio_dtype = torch.float16 if args.vae_dtype is None else model_utils.str_to_dtype(args.vae_dtype)
-            audio_decoder, vocoder = self._load_audio_components(
-                args, audio_dtype=audio_dtype, checkpoint_path=args.ltx2_checkpoint
-            )
-            loaded_audio = True
+            audio_device = accelerator.device
+            try:
+                audio_decoder, vocoder = self._load_audio_components(
+                    args,
+                    audio_dtype=audio_dtype,
+                    checkpoint_path=args.ltx2_checkpoint,
+                    device=audio_device,
+                )
+                loaded_audio = True
+            except Exception as exc:
+                logger.warning("Sampling audio decoder load failed; continuing without audio preview: %s", exc)
+                audio_decoder, vocoder = None, None
+                loaded_audio = False
 
         sample_steps = sample_parameter.get("sample_steps", 20)
         width = sample_parameter.get("width", 768)
@@ -1465,6 +1827,15 @@ class LTX2NetworkTrainer(NetworkTrainer):
         if not has_self_ref_orig_mod:
             transformer.eval()
 
+        ts_str = time.strftime("%Y%m%d%H%M%S", time.localtime())
+        num_suffix = f"e{epoch:06d}" if epoch is not None else f"{steps:06d}"
+        seed_suffix = "" if seed is None else f"_{seed}"
+        prompt_idx = sample_parameter.get("enum", 0)
+        save_path = (
+            f"{'' if args.output_name is None else args.output_name + '_'}{num_suffix}_{prompt_idx:02d}_{ts_str}{seed_suffix}"
+        )
+        wav_path = os.path.join(save_dir, save_path) + ".wav"
+
         video, audio_waveform = self.do_inference(
             accelerator,
             args,
@@ -1486,6 +1857,9 @@ class LTX2NetworkTrainer(NetworkTrainer):
             offload_transformer_for_decode=bool(getattr(args, "sample_with_offloading", False)),
             transformer_offload_device=torch.device("cpu"),
             restore_transformer_device=True,
+            audio_output_path=wav_path if enable_audio_preview else None,
+            use_audio_subprocess=use_audio_subprocess,
+            enable_audio_preview=enable_audio_preview,
         )
 
         if not has_self_ref_orig_mod:
@@ -1494,14 +1868,6 @@ class LTX2NetworkTrainer(NetworkTrainer):
         if video is None:
             logger.error("No video generated / 生成された動画がありません")
             return
-
-        ts_str = time.strftime("%Y%m%d%H%M%S", time.localtime())
-        num_suffix = f"e{epoch:06d}" if epoch is not None else f"{steps:06d}"
-        seed_suffix = "" if seed is None else f"_{seed}"
-        prompt_idx = sample_parameter.get("enum", 0)
-        save_path = (
-            f"{'' if args.output_name is None else args.output_name + '_'}{num_suffix}_{prompt_idx:02d}_{ts_str}{seed_suffix}"
-        )
 
         wandb_tracker = None
         try:
@@ -1513,6 +1879,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
         except:
             wandb = None
 
+        video_path = None
         if video.shape[2] == 1:
             image_paths = save_images_grid(video, save_dir, save_path, create_subdir=False)
             if wandb_tracker is not None and wandb is not None:
@@ -1527,6 +1894,16 @@ class LTX2NetworkTrainer(NetworkTrainer):
             wav_path = os.path.join(save_dir, save_path) + ".wav"
             sample_rate = int(getattr(vocoder, "output_sample_rate", 24000)) if vocoder is not None else 24000
             self._save_audio_wav(wav_path, audio_waveform, sample_rate)
+            if getattr(args, "sample_merge_audio", False) and video_path is not None:
+                merged_path = os.path.join(save_dir, save_path) + "_av.mp4"
+                self._mux_video_audio(video_path, wav_path, merged_path)
+        elif getattr(args, "sample_merge_audio", False) and video_path is not None:
+            wav_path = os.path.join(save_dir, save_path) + ".wav"
+            if os.path.exists(wav_path):
+                merged_path = os.path.join(save_dir, save_path) + "_av.mp4"
+                self._mux_video_audio(video_path, wav_path, merged_path)
+            merged_path = os.path.join(save_dir, save_path) + "_av.mp4"
+            self._mux_video_audio(video_path, wav_path, merged_path)
 
         if loaded_text_encoder:
             sample_parameter.pop("prompt_embeds", None)
@@ -1566,6 +1943,9 @@ class LTX2NetworkTrainer(NetworkTrainer):
         offload_transformer_for_decode: bool = False,
         transformer_offload_device: Optional[torch.device] = None,
         restore_transformer_device: bool = True,
+        audio_output_path: Optional[str] = None,
+        use_audio_subprocess: bool = False,
+        enable_audio_preview: bool = False,
     ):
         """Generate sample video during training using LTX-2 denoising loop"""
         from musubi_tuner.modules.scheduling_flow_match_discrete import FlowMatchDiscreteScheduler
@@ -1575,7 +1955,9 @@ class LTX2NetworkTrainer(NetworkTrainer):
         transformer_offload_device = transformer_offload_device or torch.device("cpu")
         original_vae_device = getattr(vae, "device", torch.device("cpu"))
         original_vae_dtype = getattr(vae, "dtype", torch.float32)
-        vae.to_device(transformer_device)
+        # Keep VAE off GPU during denoise when offloading is enabled.
+        if not offload_transformer_for_decode:
+            vae.to_device(transformer_device)
         vae.to_dtype(original_vae_dtype)
 
         # Get text embeddings
@@ -1587,8 +1969,11 @@ class LTX2NetworkTrainer(NetworkTrainer):
         prompt_embeds = prompt_embeds.to(device=transformer_device, dtype=dit_dtype)
 
         prompt_mask = sample_parameter.get("prompt_attention_mask")
-        if prompt_mask is not None and prompt_mask.dim() == 1:
-            prompt_mask = prompt_mask.unsqueeze(0)
+        if prompt_mask is not None:
+            if prompt_mask.dim() == 1:
+                prompt_mask = prompt_mask.unsqueeze(0)
+            elif prompt_mask.dim() > 2:
+                prompt_mask = prompt_mask.view(prompt_mask.shape[0], -1)
         if prompt_mask is not None:
             mask_len = prompt_mask.shape[-1]
             embed_len = prompt_embeds.shape[1]
@@ -1604,12 +1989,43 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 else:
                     pad = embed_len - mask_len
                     prompt_mask = F.pad(prompt_mask, (pad, 0), value=1)
+            if prompt_mask.shape[-1] != prompt_embeds.shape[1]:
+                logger.warning(
+                    "Sample prompt mask still mismatched after alignment (mask=%s, embeds=%s); disabling mask for sampling.",
+                    prompt_mask.shape[-1],
+                    prompt_embeds.shape[1],
+                )
+                prompt_mask = None
         prompt_mask = prompt_mask.to(device=transformer_device, dtype=torch.int64) if prompt_mask is not None else None
+
+        attention_overrides = []
+        if getattr(args, "sample_disable_flash_attn", False):
+            from musubi_tuner.ltx_2.model.transformer.attention import AttentionFunction
+
+            logger.info("Sampling: disabling FlashAttention for preview")
+            attention_overrides = self._override_attention_function(
+                transformer, AttentionFunction.PYTORCH
+            )
+            if prompt_mask is not None:
+                logger.info("Sampling: disabling prompt attention mask for preview")
+                prompt_mask = None
+
+        enable_audio_preview = bool(enable_audio_preview and self._audio_video)
+        if not enable_audio_preview and prompt_embeds.shape[-1] % 2 == 0:
+            logger.warning(
+                "Sampling: audio preview disabled; using video-only prompt embeddings (half of dim=%s).",
+                prompt_embeds.shape[-1],
+            )
+            prompt_embeds = prompt_embeds[..., : prompt_embeds.shape[-1] // 2]
 
         # Setup scheduler
         scheduler = FlowMatchDiscreteScheduler(shift=discrete_flow_shift or 1.0)
         scheduler.set_timesteps(sample_steps, device=transformer_device)
         timesteps = scheduler.timesteps
+        audio_scheduler = None
+        if enable_audio_preview:
+            audio_scheduler = FlowMatchDiscreteScheduler(shift=discrete_flow_shift or 1.0)
+            audio_scheduler.set_timesteps(sample_steps, device=transformer_device)
 
         # Calculate latent dimensions
         vae_scale_factor_temporal = getattr(vae, "temporal_downsample_factor", 4)
@@ -1628,7 +2044,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
         )
 
         audio_latents = None
-        if self._audio_video and audio_decoder is not None and vocoder is not None:
+        if enable_audio_preview:
             frame_rate = sample_parameter.get("frame_rate", 25)
             video_shape = VideoPixelShape(
                 batch=1,
@@ -1637,13 +2053,12 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 width=int(width),
                 fps=float(frame_rate),
             )
-            channels = int(getattr(audio_decoder, "z_channels", 8))
-            mel_bins = int(getattr(audio_decoder, "mel_bins", 16) or 16)
-            sample_rate = int(getattr(audio_decoder, "sample_rate", 16000))
-            hop_length = int(getattr(audio_decoder, "mel_hop_length", 160))
-            audio_downsample = int(
-                getattr(getattr(audio_decoder, "patchifier", None), "audio_latent_downsample_factor", 4)
-            )
+            audio_cfg = self._get_audio_preview_config(args, transformer)
+            channels = int(audio_cfg["channels"])
+            mel_bins = int(audio_cfg["mel_bins"])
+            sample_rate = int(audio_cfg["sample_rate"])
+            hop_length = int(audio_cfg["hop_length"])
+            audio_downsample = int(audio_cfg["audio_latent_downsample_factor"])
             audio_shape = AudioLatentShape.from_video_pixel_shape(
                 video_shape,
                 channels=channels,
@@ -1713,16 +2128,25 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 latents = scheduler.step(video_pred, t, latents, return_dict=False)[0]
                 if audio_pred is not None and audio_latents is not None:
                     audio_pred = audio_pred.to(dtype=audio_latents.dtype)
-                    audio_latents = scheduler.step(audio_pred, t, audio_latents, return_dict=False)[0]
+                    if audio_scheduler is None:
+                        audio_scheduler = FlowMatchDiscreteScheduler(shift=discrete_flow_shift or 1.0)
+                        audio_scheduler.set_timesteps(sample_steps, device=transformer_device)
+                    audio_latents = audio_scheduler.step(
+                        audio_pred, t, audio_latents, return_dict=False
+                    )[0]
 
         if offload_transformer_for_decode and transformer_device != transformer_offload_device:
             if hasattr(transformer, "move_to_device_except_swap_blocks"):
                 transformer.move_to_device_except_swap_blocks(transformer_offload_device)
             else:
                 transformer.to(transformer_offload_device)
-            clean_memory_on_device(transformer_device)
+            logger.info("Sampling offload: moved transformer to CPU for VAE decode")
+            self._cleanup_cuda(transformer_device)
 
         # Decode latents
+        if offload_transformer_for_decode:
+            logger.info("Sampling offload: moving VAE to GPU for decode")
+            vae.to_device(transformer_device)
         with torch.no_grad():
             video = vae.decode([latents.squeeze(0)])
             if isinstance(video, list) and video:
@@ -1731,32 +2155,58 @@ class LTX2NetworkTrainer(NetworkTrainer):
                     video = video.unsqueeze(0)  # [1, C, T, H, W]
 
         audio_waveform = None
-        if audio_latents is not None and audio_decoder is not None and vocoder is not None:
-            audio_decoder.to(transformer_device)
-            vocoder.to(transformer_device)
-            with torch.no_grad():
-                decode_dtype = getattr(audio_decoder, "dtype", None)
-                if decode_dtype is None:
-                    try:
-                        decode_dtype = next(audio_decoder.parameters()).dtype
-                    except StopIteration:
-                        decode_dtype = audio_latents.dtype
-                decoded_audio = audio_decoder(audio_latents.to(dtype=decode_dtype))
-                vocoder_dtype = getattr(vocoder, "dtype", None)
-                if vocoder_dtype is None:
-                    try:
-                        vocoder_dtype = next(vocoder.parameters()).dtype
-                    except StopIteration:
-                        vocoder_dtype = decoded_audio.dtype
-                audio_waveform = vocoder(decoded_audio.to(dtype=vocoder_dtype)).squeeze(0).float().cpu()
-            audio_decoder.to("cpu")
-            vocoder.to("cpu")
+        if audio_latents is not None:
+            if use_audio_subprocess and audio_output_path is not None:
+                logger.info("Sampling offload: decoding audio in subprocess")
+                self._decode_audio_preview_subprocess(
+                    audio_latents=audio_latents,
+                    output_path=audio_output_path,
+                    checkpoint_path=str(args.ltx2_checkpoint),
+                )
+            elif audio_decoder is not None and vocoder is not None:
+                if offload_transformer_for_decode:
+                    logger.info("Sampling offload: moving VAE back to CPU before audio decode")
+                    vae.to_device(original_vae_device)
+                    clean_memory_on_device(transformer_device)
+                decode_device = None
+                try:
+                    decode_device = next(audio_decoder.parameters()).device
+                except StopIteration:
+                    decode_device = transformer_device
+                if decode_device.type == "cpu":
+                    logger.info("Sampling offload: decoding audio on CPU")
+                    audio_latents = audio_latents.to("cpu")
+                else:
+                    audio_decoder.to(transformer_device)
+                    vocoder.to(transformer_device)
+                with torch.no_grad():
+                    decode_dtype = getattr(audio_decoder, "dtype", None)
+                    if decode_dtype is None:
+                        try:
+                            decode_dtype = next(audio_decoder.parameters()).dtype
+                        except StopIteration:
+                            decode_dtype = audio_latents.dtype
+                    decoded_audio = audio_decoder(audio_latents.to(dtype=decode_dtype))
+                    vocoder_dtype = getattr(vocoder, "dtype", None)
+                    if vocoder_dtype is None:
+                        try:
+                            vocoder_dtype = next(vocoder.parameters()).dtype
+                        except StopIteration:
+                            vocoder_dtype = decoded_audio.dtype
+                    audio_waveform = vocoder(decoded_audio.to(dtype=vocoder_dtype)).squeeze(0).float().cpu()
+                audio_decoder.to("cpu")
+                vocoder.to("cpu")
+            else:
+                logger.warning("Sampling: audio preview requested but no decoder/vocoder available; skipping audio decode.")
 
+        if attention_overrides:
+            self._restore_attention_function(attention_overrides)
         if offload_transformer_for_decode and restore_transformer_device and transformer_device != transformer_offload_device:
             if hasattr(transformer, "move_to_device_except_swap_blocks"):
                 transformer.move_to_device_except_swap_blocks(transformer_device)
             else:
                 transformer.to(transformer_device)
+            logger.info("Sampling offload: restored transformer to GPU after decode")
             clean_memory_on_device(transformer_device)
 
         # Normalize to [0, 1]
@@ -1786,6 +2236,12 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         type=str,
         default=None,
         help="Local directory containing Gemma weights/tokenizer (used for sample prompts)",
+    )
+    parser.add_argument(
+        "--gemma_safetensors",
+        type=str,
+        default=None,
+        help="Optional Gemma weights .safetensors file for sampling (tokenizer/config still from --gemma_root).",
     )
     parser.add_argument(
         "--gemma_load_in_8bit",
@@ -1870,6 +2326,21 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         "--sample_with_offloading",
         action="store_true",
         help="Offload LTX-2 DiT to CPU between sampling prompts to save VRAM.",
+    )
+    parser.add_argument(
+        "--sample_disable_audio",
+        action="store_true",
+        help="Disable audio decoding during LTX-2 preview sampling (AV mode).",
+    )
+    parser.add_argument(
+        "--sample_disable_flash_attn",
+        action="store_true",
+        help="Disable FlashAttention during LTX-2 preview sampling (use SDPA).",
+    )
+    parser.add_argument(
+        "--sample_merge_audio",
+        action="store_true",
+        help="Mux sample audio into the sample video (outputs *_av.mp4).",
     )
 
     return parser

@@ -169,7 +169,12 @@ class BasicAVTransformerBlock(torch.nn.Module):
         if target_device is not None:
             _move_non_linear_params(self, target_device)
             ensure_fp8_modules_on_device(self, target_device)
-        batch_size = video.x.shape[0]
+        if video is not None and isinstance(video.x, torch.Tensor):
+            batch_size = video.x.shape[0]
+        elif audio is not None and isinstance(audio.x, torch.Tensor):
+            batch_size = audio.x.shape[0]
+        else:
+            raise ValueError("Expected video or audio tensor inputs for transformer block")
         if perturbations is None:
             perturbations = BatchedPerturbationConfig.empty(batch_size)
 

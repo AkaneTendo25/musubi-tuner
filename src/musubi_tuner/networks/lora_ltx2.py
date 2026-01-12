@@ -141,6 +141,9 @@ class LTX2Wrapper(nn.Module):
         attention_mask=None,
         frame_rate: int = 25,
         transformer_options=None,
+        audio_only: bool = False,
+        video_enabled: Optional[bool] = None,
+        audio_enabled: Optional[bool] = None,
         **kwargs,
     ):
         if isinstance(x, (list, tuple)):
@@ -149,6 +152,20 @@ class LTX2Wrapper(nn.Module):
             video_latents, audio_latents = x
         else:
             video_latents, audio_latents = x, None
+
+        if audio_only:
+            if audio_latents is None:
+                raise ValueError("audio_only=True requires audio_latents")
+            if video_latents is None:
+                in_channels = getattr(self.model, "in_channels", None)
+                if in_channels is None:
+                    raise ValueError("audio_only=True requires model.in_channels to create dummy video latents")
+                bsz = int(audio_latents.shape[0])
+                video_latents = torch.zeros(
+                    (bsz, int(in_channels), 1, 1, 1),
+                    device=audio_latents.device,
+                    dtype=audio_latents.dtype,
+                )
 
         if not isinstance(video_latents, torch.Tensor) or video_latents.dim() != 5:
             raise ValueError(f"Expected video latents shape [B, C, F, H, W], got: {getattr(video_latents, 'shape', None)}")
@@ -204,13 +221,13 @@ class LTX2Wrapper(nn.Module):
 
         video_context = context
         audio_context = context
-        if audio_latents is not None and isinstance(context, torch.Tensor) and context.shape[-1] % 2 == 0:
+        if not audio_only and audio_latents is not None and isinstance(context, torch.Tensor) and context.shape[-1] % 2 == 0:
             half = context.shape[-1] // 2
             video_context = context[..., :half]
             audio_context = context[..., half:]
 
         video_modality = Modality(
-            enabled=True,
+            enabled=(not audio_only if video_enabled is None else bool(video_enabled)),
             latent=video_tokens,
             timesteps=video_timesteps,
             positions=video_positions,
@@ -236,7 +253,7 @@ class LTX2Wrapper(nn.Module):
             audio_positions = self._audio_patchifier.get_patch_grid_bounds(audio_shape, device=audio_latents.device)
 
             audio_modality = Modality(
-                enabled=True,
+                enabled=(True if audio_enabled is None else bool(audio_enabled)),
                 latent=audio_tokens,
                 timesteps=audio_timesteps,
                 positions=audio_positions.to(dtype=audio_latents.dtype),

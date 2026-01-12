@@ -138,6 +138,7 @@ def main() -> None:
         model_sd_ops=key_ops,
         module_ops=module_ops_from_gemma_root(
             args.gemma_root,
+            gemma_weights_path=getattr(args, "gemma_safetensors", None),
             torch_dtype=dtype,
             load_in_8bit=bool(getattr(args, "gemma_load_in_8bit", False)),
             load_in_4bit=bool(getattr(args, "gemma_load_in_4bit", False)),
@@ -205,6 +206,12 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         type=str,
         default=None,
         help="Local directory containing Gemma weights/tokenizer (Gemma backend only)",
+    )
+    parser.add_argument(
+        "--gemma_safetensors",
+        type=str,
+        default=None,
+        help="Optional Gemma weights .safetensors file (tokenizer/config still from --gemma_root).",
     )
     parser.add_argument(
         "--ltx_mode",

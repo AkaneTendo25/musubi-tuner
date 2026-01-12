@@ -24,10 +24,12 @@ from musubi_tuner.dataset.image_video_dataset import (
     ARCHITECTURE_LTX2,
     BaseDataset,
     ItemInfo,
+    AudioDataset,
     VideoDataset,
     save_latent_cache_ltx2,
 )
 from musubi_tuner.utils.model_utils import str_to_dtype
+from musubi_tuner.utils.safetensors_utils import MemoryEfficientSafeOpen
 
 
 logger = logging.getLogger(__name__)
@@ -86,6 +88,28 @@ def encode_and_save_batch(vae, batch: List[ItemInfo]) -> None:
 
     for idx, item in enumerate(batch):
         save_latent_cache_ltx2(item, latents[idx])
+
+
+def save_dummy_latent_cache_ltx2(item: ItemInfo, *, channels: int, dtype: torch.dtype) -> None:
+    latent = torch.zeros((channels, 1, 1, 1), dtype=dtype)
+    save_latent_cache_ltx2(item, latent)
+
+
+def infer_video_in_channels_from_checkpoint(model_path: str) -> Optional[int]:
+    if not os.path.isfile(model_path):
+        raise FileNotFoundError(f"LTX-2 checkpoint not found: {model_path}")
+
+    with MemoryEfficientSafeOpen(model_path) as handle:
+        for key in handle.keys():
+            if not key.endswith("patchify_proj.weight"):
+                continue
+            if key.endswith("audio_patchify_proj.weight"):
+                continue
+            weight = handle.get_tensor(key)
+            if weight.ndim < 2:
+                continue
+            return int(weight.shape[1])
+    return None
 
 
 def _audio_cache_path(item_info: ItemInfo) -> str:
@@ -286,32 +310,64 @@ def main() -> None:
         cache_latents.show_datasets(list(datasets), args.debug_mode, args.console_width, args.console_back, args.console_num_images)
         return
 
-    if args.vae is None:
+    ltx_mode = getattr(args, "ltx_mode", "video")
+    audio_only = ltx_mode == "audio"
+    audio_video = ltx_mode == "av" or getattr(args, "ltx2_audio_video", False)
+
+    if not audio_only:
+        if args.vae is None:
+            if getattr(args, "ltx2_checkpoint", None) is None:
+                raise ValueError("--vae is required (or provide --ltx2_checkpoint for integrated checkpoints)")
+            logger.info("--vae not provided; using --ltx2_checkpoint as VAE checkpoint")
+            args.vae = args.ltx2_checkpoint
+
+        vae_dtype = torch.bfloat16 if args.vae_dtype is None else str_to_dtype(args.vae_dtype)
+        from musubi_tuner.ltx_2.loader.single_gpu_model_builder import SingleGPUModelBuilder
+        from musubi_tuner.ltx_2.model.video_vae import VideoEncoderConfigurator, VAE_ENCODER_COMFY_KEYS_FILTER
+
+        vae = SingleGPUModelBuilder(
+            model_path=str(args.vae),
+            model_class_configurator=VideoEncoderConfigurator,
+            model_sd_ops=VAE_ENCODER_COMFY_KEYS_FILTER,
+        ).build(device=device, dtype=vae_dtype)
+        vae.eval()
+
+        def encode_fn(batch: List[ItemInfo]) -> None:
+            encode_and_save_batch(vae, batch)
+
+        cache_latents.encode_datasets(list(datasets), encode_fn, args)
+
+    if audio_only:
         if getattr(args, "ltx2_checkpoint", None) is None:
-            raise ValueError("--vae is required (or provide --ltx2_checkpoint for integrated checkpoints)")
-        logger.info("--vae not provided; using --ltx2_checkpoint as VAE checkpoint")
-        args.vae = args.ltx2_checkpoint
+            raise ValueError("--ltx2_checkpoint is required when --ltx_mode audio is used")
 
-    vae_dtype = torch.bfloat16 if args.vae_dtype is None else str_to_dtype(args.vae_dtype)
-    from musubi_tuner.ltx_2.loader.single_gpu_model_builder import SingleGPUModelBuilder
-    from musubi_tuner.ltx_2.model.video_vae import VideoEncoderConfigurator, VAE_ENCODER_COMFY_KEYS_FILTER
+        audio_dtype = torch.float16 if args.ltx2_audio_dtype is None else str_to_dtype(args.ltx2_audio_dtype)
+        dummy_dtype = audio_dtype if args.audio_dummy_video_dtype is None else str_to_dtype(args.audio_dummy_video_dtype)
+        dummy_channels = args.audio_dummy_video_channels
+        if dummy_channels is None:
+            dummy_channels = infer_video_in_channels_from_checkpoint(args.ltx2_checkpoint)
+            if dummy_channels is None:
+                raise ValueError(
+                    "Unable to infer video input channels from --ltx2_checkpoint; "
+                    "set --audio_dummy_video_channels explicitly."
+                )
+        dummy_channels = int(dummy_channels)
 
-    vae = SingleGPUModelBuilder(
-        model_path=str(args.vae),
-        model_class_configurator=VideoEncoderConfigurator,
-        model_sd_ops=VAE_ENCODER_COMFY_KEYS_FILTER,
-    ).build(device=device, dtype=vae_dtype)
-    vae.eval()
+        audio_datasets = [ds for ds in datasets if isinstance(ds, AudioDataset)]
+        non_audio_datasets = [ds for ds in datasets if not isinstance(ds, AudioDataset)]
+        if non_audio_datasets:
+            raise ValueError("Audio-only caching only supports audio datasets in the dataset config")
+        if not audio_datasets:
+            raise ValueError("Audio-only caching requires at least one audio dataset")
 
-    def encode_fn(batch: List[ItemInfo]) -> None:
-        encode_and_save_batch(vae, batch)
+        def encode_dummy(batch: List[ItemInfo]) -> None:
+            for item in batch:
+                save_dummy_latent_cache_ltx2(item, channels=dummy_channels, dtype=dummy_dtype)
 
-    cache_latents.encode_datasets(list(datasets), encode_fn, args)
-
-    audio_video = getattr(args, "ltx_mode", "video") == "av" or getattr(args, "ltx2_audio_video", False)
-    if audio_video:
+        cache_latents.encode_datasets(list(audio_datasets), encode_dummy, args)
+    if audio_video or audio_only:
         if getattr(args, "ltx2_checkpoint", None) is None:
-            raise ValueError("--ltx2_checkpoint is required when --ltx_mode av is used")
+            raise ValueError("--ltx2_checkpoint is required when audio latents are cached")
 
         audio_dtype = torch.float16 if args.ltx2_audio_dtype is None else str_to_dtype(args.ltx2_audio_dtype)
         from musubi_tuner.ltx_2.loader.single_gpu_model_builder import SingleGPUModelBuilder
@@ -337,7 +393,7 @@ def main() -> None:
         processor.eval()
 
         for ds in datasets:
-            if not isinstance(ds, VideoDataset):
+            if not isinstance(ds, (VideoDataset, AudioDataset)):
                 continue
             num_workers = args.num_workers if args.num_workers is not None else max(1, (os.cpu_count() or 2) - 1)
             for _bucket_key, batch in ds.retrieve_latent_cache_batches(num_workers):
@@ -345,12 +401,15 @@ def main() -> None:
                     audio_cache_path = _audio_cache_path(item_info)
                     if args.skip_existing and os.path.exists(audio_cache_path):
                         continue
-                    audio_path = _resolve_audio_path(
-                        item_info,
-                        source=args.ltx2_audio_source,
-                        audio_dir=args.ltx2_audio_dir,
-                        audio_ext=args.ltx2_audio_ext,
-                    )
+                    if isinstance(ds, AudioDataset):
+                        audio_path = getattr(item_info, "audio_path", None) or item_info.item_key
+                    else:
+                        audio_path = _resolve_audio_path(
+                            item_info,
+                            source=args.ltx2_audio_source,
+                            audio_dir=args.ltx2_audio_dir,
+                            audio_ext=args.ltx2_audio_ext,
+                        )
                     try:
                         encode_and_save_audio_cache(
                             encoder,
@@ -375,7 +434,7 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         type=str,
         default="video",
         choices=["video", "av", "audio"],
-        help="Caching modality. Use 'av' to also cache audio latents.",
+        help="Caching modality. Use 'av' for AV, or 'audio' for audio-only datasets.",
     )
     parser.add_argument(
         "--ltx2_audio_video",
@@ -403,6 +462,13 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         help="Audio file extension when --ltx2_audio_source=audio_files (default: .wav)",
     )
     parser.add_argument("--ltx2_audio_dtype", type=str, default=None)
+    parser.add_argument(
+        "--audio_dummy_video_channels",
+        type=int,
+        default=None,
+        help="Override dummy video channels for audio-only caching (auto-detected by default).",
+    )
+    parser.add_argument("--audio_dummy_video_dtype", type=str, default=None)
     return parser
 
 
