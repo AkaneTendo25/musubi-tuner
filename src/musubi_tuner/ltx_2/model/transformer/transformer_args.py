@@ -58,20 +58,52 @@ class TransformerArgsPreprocessor:
         self.rope_type = rope_type
 
     def _prepare_timestep(
-        self, timestep: torch.Tensor, batch_size: int, hidden_dtype: torch.dtype
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Prepare timestep embeddings."""
+        self, timestep: torch.Tensor, batch_size: int, hidden_dtype: torch.dtype,
+        use_unique_optimization: bool = True
+    ) -> tuple:
+        """Prepare timestep embeddings.
+        
+        When use_unique_optimization is True (default), computes embeddings only for unique timestep
+        values and returns a tuple format for lazy expansion. This drastically reduces VRAM during
+        inference when many tokens share the same timestep.
+        
+        Returns:
+            If optimized: tuple of (unique_emb, inverse_indices_1d, batch_size, num_tokens)
+            If not optimized: regular tensor [batch_size, num_tokens, dim]
+        """
+        timestep_scaled = timestep * self.timestep_scale_multiplier
+        
+        # Get original shape for reconstruction
+        orig_shape = timestep_scaled.shape
+        B = batch_size
+        T = orig_shape[1] if len(orig_shape) > 1 else 1
 
-        timestep = timestep * self.timestep_scale_multiplier
-        timestep, embedded_timestep = self.adaln(
-            timestep.flatten(),
-            hidden_dtype=hidden_dtype,
-        )
-
-        # Second dimension is 1 or number of tokens (if timestep_per_token)
-        timestep = timestep.view(batch_size, -1, timestep.shape[-1])
-        embedded_timestep = embedded_timestep.view(batch_size, -1, embedded_timestep.shape[-1])
-        return timestep, embedded_timestep
+        if use_unique_optimization:
+            # Pre-compute embeddings only for unique timestep values
+            unique_timesteps, inverse_indices_1d = torch.unique(timestep_scaled.flatten(), return_inverse=True)
+            
+            # Compute embeddings for unique timesteps only
+            unique_emb, unique_embedded = self.adaln(
+                unique_timesteps,
+                hidden_dtype=hidden_dtype,
+            )
+            del unique_timesteps
+            
+            # Store as tuple, expand on-demand in get_ada_values
+            timestep_out = (unique_emb, inverse_indices_1d, B, T)
+            embedded_timestep_out = (unique_embedded, inverse_indices_1d, B, T)
+            return timestep_out, embedded_timestep_out
+        else:
+            # Standard mode: compute full embeddings
+            timestep_emb, embedded_timestep = self.adaln(
+                timestep_scaled.flatten(),
+                hidden_dtype=hidden_dtype,
+            )
+            
+            # Second dimension is 1 or number of tokens (if timestep_per_token)
+            timestep_emb = timestep_emb.view(batch_size, -1, timestep_emb.shape[-1])
+            embedded_timestep = embedded_timestep.view(batch_size, -1, embedded_timestep.shape[-1])
+            return timestep_emb, embedded_timestep
 
     def _prepare_context(
         self,

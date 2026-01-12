@@ -125,14 +125,53 @@ class BasicAVTransformerBlock(torch.nn.Module):
         self.norm_eps = norm_eps
 
     def get_ada_values(
-        self, scale_shift_table: torch.Tensor, batch_size: int, timestep: torch.Tensor, indices: slice
+        self, scale_shift_table: torch.Tensor, batch_size: int, timestep, indices: slice, num_tokens: int = None
     ) -> tuple[torch.Tensor, ...]:
+        """Get adaptive normalization values from scale_shift_table and timestep embeddings.
+        
+        Supports two modes:
+        1. Regular mode: timestep is a tensor [B, num_tokens, dim]
+        2. Optimized mode: timestep is tuple (unique_emb, inverse_indices_1d, orig_batch_size, orig_num_tokens)
+           This mode computes ada values only on unique embeddings and expands using inverse indices,
+           drastically reducing VRAM usage during inference when many tokens share the same timestep.
+        
+        Optimization source: Kijai's ComfyUI patch
+        https://github.com/Comfy-Org/ComfyUI/commit/ac4daffd80cecbc56ee0e31f2b521114fa0f8e08
+        """
         num_ada_params = scale_shift_table.shape[0]
 
-        ada_values = (
-            scale_shift_table[indices].unsqueeze(0).unsqueeze(0).to(device=timestep.device, dtype=timestep.dtype)
-            + timestep.reshape(batch_size, timestep.shape[1], num_ada_params, -1)[:, :, indices, :]
-        ).unbind(dim=2)
+        # Check if timestep is in optimized tuple format
+        if isinstance(timestep, tuple) and len(timestep) == 4:
+            unique_emb, inverse_indices_1d, orig_batch_size, orig_num_tokens = timestep
+
+            # Compute ada values on unique embeddings only  
+            unique_reshaped = unique_emb.reshape(len(unique_emb), num_ada_params, -1)[:, indices, :]
+            table_values = scale_shift_table[indices].unsqueeze(0).to(device=unique_emb.device, dtype=unique_emb.dtype)
+            unique_ada = (table_values + unique_reshaped).unbind(dim=1)
+
+            # Expand each ada value using inverse indices
+            ada_values = tuple(
+                unique_val[inverse_indices_1d].view(orig_batch_size, orig_num_tokens, -1)
+                for unique_val in unique_ada
+            )
+            return ada_values
+
+        # Standard mode: timestep is a full tensor
+        # Reshape and process embeddings
+        timestep_reshaped = timestep.reshape(batch_size, timestep.shape[1], num_ada_params, -1)[:, :, indices, :]
+
+        table_values = scale_shift_table[indices].unsqueeze(0).unsqueeze(0).to(device=timestep.device, dtype=timestep.dtype)
+
+        # Expand timestep to match target sequence length if needed (for efficiency)
+        if num_tokens is not None and timestep.shape[1] < num_tokens:
+            repeats = num_tokens // timestep.shape[1]
+            if repeats > 1:
+                if repeats * timestep.shape[1] == num_tokens:
+                    timestep_reshaped = torch.repeat_interleave(timestep_reshaped, repeats, dim=1)
+                else:
+                    timestep_reshaped = torch.repeat_interleave(timestep_reshaped, repeats + 1, dim=1)[:, :num_tokens]
+
+        ada_values = (table_values + timestep_reshaped).unbind(dim=2)
         return ada_values
 
     def get_av_ca_ada_values(
@@ -142,12 +181,15 @@ class BasicAVTransformerBlock(torch.nn.Module):
         scale_shift_timestep: torch.Tensor,
         gate_timestep: torch.Tensor,
         num_scale_shift_values: int = 4,
+        num_tokens: int = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         scale_shift_ada_values = self.get_ada_values(
-            scale_shift_table[:num_scale_shift_values, :], batch_size, scale_shift_timestep, slice(None, None)
+            scale_shift_table[:num_scale_shift_values, :], batch_size, scale_shift_timestep, slice(None, None),
+            num_tokens=num_tokens
         )
         gate_ada_values = self.get_ada_values(
-            scale_shift_table[num_scale_shift_values:, :], batch_size, gate_timestep, slice(None, None)
+            scale_shift_table[num_scale_shift_values:, :], batch_size, gate_timestep, slice(None, None),
+            num_tokens=num_tokens
         )
 
         scale_shift_chunks = [t.squeeze(2) for t in scale_shift_ada_values]
@@ -189,7 +231,7 @@ class BasicAVTransformerBlock(torch.nn.Module):
 
         if run_vx:
             vshift_msa, vscale_msa, vgate_msa = self.get_ada_values(
-                self.scale_shift_table, vx.shape[0], video.timesteps, slice(0, 3)
+                self.scale_shift_table, vx.shape[0], video.timesteps, slice(0, 3), num_tokens=vx.shape[1]
             )
             if not perturbations.all_in_batch(PerturbationType.SKIP_VIDEO_SELF_ATTN, self.idx):
                 norm_vx = rms_norm(vx, eps=self.norm_eps) * (1 + vscale_msa) + vshift_msa
@@ -202,7 +244,7 @@ class BasicAVTransformerBlock(torch.nn.Module):
 
         if run_ax:
             ashift_msa, ascale_msa, agate_msa = self.get_ada_values(
-                self.audio_scale_shift_table, ax.shape[0], audio.timesteps, slice(0, 3)
+                self.audio_scale_shift_table, ax.shape[0], audio.timesteps, slice(0, 3), num_tokens=ax.shape[1]
             )
 
             if not perturbations.all_in_batch(PerturbationType.SKIP_AUDIO_SELF_ATTN, self.idx):
@@ -230,6 +272,7 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 ax.shape[0],
                 audio.cross_scale_shift_timestep,
                 audio.cross_gate_timestep,
+                num_tokens=ax.shape[1],
             )
 
             (
@@ -243,6 +286,7 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 vx.shape[0],
                 video.cross_scale_shift_timestep,
                 video.cross_gate_timestep,
+                num_tokens=vx.shape[1],
             )
 
             if run_a2v:
@@ -289,7 +333,7 @@ class BasicAVTransformerBlock(torch.nn.Module):
 
         if run_vx:
             vshift_mlp, vscale_mlp, vgate_mlp = self.get_ada_values(
-                self.scale_shift_table, vx.shape[0], video.timesteps, slice(3, None)
+                self.scale_shift_table, vx.shape[0], video.timesteps, slice(3, None), num_tokens=vx.shape[1]
             )
             vx_scaled = rms_norm(vx, eps=self.norm_eps) * (1 + vscale_mlp) + vshift_mlp
             vx = vx + self.ff(vx_scaled) * vgate_mlp
@@ -298,7 +342,7 @@ class BasicAVTransformerBlock(torch.nn.Module):
 
         if run_ax:
             ashift_mlp, ascale_mlp, agate_mlp = self.get_ada_values(
-                self.audio_scale_shift_table, ax.shape[0], audio.timesteps, slice(3, None)
+                self.audio_scale_shift_table, ax.shape[0], audio.timesteps, slice(3, None), num_tokens=ax.shape[1]
             )
             ax_scaled = rms_norm(ax, eps=self.norm_eps) * (1 + ascale_mlp) + ashift_mlp
             ax = ax + self.audio_ff(ax_scaled) * agate_mlp

@@ -642,9 +642,14 @@ class LTXModel(torch.nn.Module):
         norm_out: torch.nn.LayerNorm,
         proj_out: torch.nn.Linear,
         x: torch.Tensor,
-        embedded_timestep: torch.Tensor,
+        embedded_timestep,
     ) -> torch.Tensor:
         """Process output for LTXV."""
+        # Handle tuple-format embedded_timestep from unique timestep optimization
+        if isinstance(embedded_timestep, tuple) and len(embedded_timestep) == 4:
+            unique_embedded, inverse_indices_1d, B, T = embedded_timestep
+            embedded_timestep = unique_embedded[inverse_indices_1d].view(B, T, -1)
+        
         # Apply scale-shift modulation
         scale_shift_values = scale_shift_table[None, None].to(device=x.device, dtype=x.dtype) + embedded_timestep[:, :, None]
         shift, scale = scale_shift_values[:, :, 0], scale_shift_values[:, :, 1]

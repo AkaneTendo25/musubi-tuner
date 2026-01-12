@@ -628,6 +628,29 @@ class LTX2NetworkTrainer(NetworkTrainer):
                     outs.append(video.squeeze(0))
                 return outs
 
+            def tiled_decode(self, z, tiling_config=None):
+                """Decode latents using tiled processing to reduce VRAM usage.
+                
+                Args:
+                    z: Latent tensor [C, T, H, W] or [B, C, T, H, W]
+                    tiling_config: TilingConfig object for spatial/temporal tiling
+                    
+                Returns:
+                    Decoded video tensor [B, C, T, H, W]
+                """
+                if z.dim() == 4:
+                    z = z.unsqueeze(0)
+                z = z.to(device=self.device, dtype=self.dtype)
+                
+                # Collect all chunks from tiled decode generator
+                chunks = []
+                for frame_chunk in self.decoder.tiled_decode(z, tiling_config):
+                    chunks.append(frame_chunk)
+                
+                # Concatenate along temporal dimension
+                video = torch.cat(chunks, dim=2)  # [B, C, T, H, W]
+                return video
+
         decoder = SingleGPUModelBuilder(
             model_path=str(vae_path),
             model_class_configurator=VideoDecoderConfigurator,
@@ -1791,9 +1814,19 @@ class LTX2NetworkTrainer(NetworkTrainer):
             sample_parameter["prompt_embeds"] = prompt_embeds
             sample_parameter["prompt_attention_mask"] = prompt_mask
             if negative_prompt:
-                neg_embeds, neg_mask = self._encode_prompt_text(accelerator, negative_prompt, text_encoder_dtype)
+                neg_embeds, neg_mask = self._encode_prompt_text(
+                    accelerator, negative_prompt, text_encoder_dtype
+                )
                 sample_parameter["negative_prompt_embeds"] = neg_embeds
                 sample_parameter["negative_prompt_attention_mask"] = neg_mask
+            loaded_text_encoder = True
+        elif negative_prompt and sample_parameter.get("negative_prompt_embeds") is None:
+            text_encoder_dtype = self._build_text_encoder(args, accelerator)
+            neg_embeds, neg_mask = self._encode_prompt_text(
+                accelerator, negative_prompt, text_encoder_dtype
+            )
+            sample_parameter["negative_prompt_embeds"] = neg_embeds
+            sample_parameter["negative_prompt_attention_mask"] = neg_mask
             loaded_text_encoder = True
 
         device = accelerator.device
@@ -1902,8 +1935,6 @@ class LTX2NetworkTrainer(NetworkTrainer):
             if os.path.exists(wav_path):
                 merged_path = os.path.join(save_dir, save_path) + "_av.mp4"
                 self._mux_video_audio(video_path, wav_path, merged_path)
-            merged_path = os.path.join(save_dir, save_path) + "_av.mp4"
-            self._mux_video_audio(video_path, wav_path, merged_path)
 
         if loaded_text_encoder:
             sample_parameter.pop("prompt_embeds", None)
@@ -1969,11 +2000,44 @@ class LTX2NetworkTrainer(NetworkTrainer):
         prompt_embeds = prompt_embeds.to(device=transformer_device, dtype=dit_dtype)
 
         prompt_mask = sample_parameter.get("prompt_attention_mask")
+        def _normalize_prompt_mask(mask: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+            if mask is None:
+                return None
+            if mask.dim() == 1:
+                return mask.unsqueeze(0)
+            if mask.dim() > 2:
+                return mask.view(mask.shape[0], -1)
+            return mask
+
+        if do_classifier_free_guidance:
+            negative_prompt_embeds = sample_parameter.get("negative_prompt_embeds")
+            negative_prompt_mask = sample_parameter.get("negative_prompt_attention_mask")
+            if negative_prompt_embeds is not None:
+                if negative_prompt_embeds.dim() == 2:
+                    negative_prompt_embeds = negative_prompt_embeds.unsqueeze(0)
+                negative_prompt_embeds = negative_prompt_embeds.to(
+                    device=transformer_device, dtype=dit_dtype
+                )
+                prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds], dim=0)
+                prompt_mask = _normalize_prompt_mask(prompt_mask)
+                negative_prompt_mask = _normalize_prompt_mask(negative_prompt_mask)
+                if prompt_mask is not None and negative_prompt_mask is not None:
+                    prompt_mask = torch.cat([negative_prompt_mask, prompt_mask], dim=0)
+                elif prompt_mask is not None:
+                    logger.warning(
+                        "Sampling: negative prompt mask missing; duplicating prompt mask."
+                    )
+                    prompt_mask = torch.cat([prompt_mask, prompt_mask], dim=0)
+            else:
+                logger.warning(
+                    "Sampling: negative prompt embeddings missing; duplicating prompt embeds."
+                )
+                prompt_embeds = torch.cat([prompt_embeds, prompt_embeds], dim=0)
+                prompt_mask = _normalize_prompt_mask(prompt_mask)
+                if prompt_mask is not None:
+                    prompt_mask = torch.cat([prompt_mask, prompt_mask], dim=0)
         if prompt_mask is not None:
-            if prompt_mask.dim() == 1:
-                prompt_mask = prompt_mask.unsqueeze(0)
-            elif prompt_mask.dim() > 2:
-                prompt_mask = prompt_mask.view(prompt_mask.shape[0], -1)
+            prompt_mask = _normalize_prompt_mask(prompt_mask)
         if prompt_mask is not None:
             mask_len = prompt_mask.shape[-1]
             embed_len = prompt_embeds.shape[1]
@@ -2018,14 +2082,12 @@ class LTX2NetworkTrainer(NetworkTrainer):
             )
             prompt_embeds = prompt_embeds[..., : prompt_embeds.shape[-1] // 2]
 
-        # Setup scheduler
-        scheduler = FlowMatchDiscreteScheduler(shift=discrete_flow_shift or 1.0)
-        scheduler.set_timesteps(sample_steps, device=transformer_device)
-        timesteps = scheduler.timesteps
-        audio_scheduler = None
-        if enable_audio_preview:
-            audio_scheduler = FlowMatchDiscreteScheduler(shift=discrete_flow_shift or 1.0)
-            audio_scheduler.set_timesteps(sample_steps, device=transformer_device)
+        # Setup LTX-2 specific scheduler and stepper
+        from musubi_tuner.modules.ltx2_scheduler import LTX2Scheduler, EulerDiffusionStep, X0PredictionWrapper
+        
+        ltx2_scheduler = LTX2Scheduler(shift=1.0)  # LTX-2 uses shift=1.0 (no shift)
+        sigmas = ltx2_scheduler.execute(steps=sample_steps).to(device=transformer_device, dtype=torch.float32)
+        stepper = EulerDiffusionStep()
 
         # Calculate latent dimensions
         vae_scale_factor_temporal = getattr(vae, "temporal_downsample_factor", 4)
@@ -2075,9 +2137,11 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 generator=generator,
             )
 
-        # Denoising loop
+        # Denoising loop using LTX-2 scheduler with sigmas
         with torch.no_grad():
-            for t in tqdm(timesteps, desc="LTX-2 preview", leave=False):
+            for step_idx in tqdm(range(len(sigmas) - 1), desc="LTX-2 preview", leave=False):
+                sigma = sigmas[step_idx]
+                
                 # Expand for CFG if needed
                 latent_model_input = torch.cat([latents, latents], dim=0) if do_classifier_free_guidance else latents
                 latent_model_input = latent_model_input.to(dtype=dit_dtype)
@@ -2091,9 +2155,8 @@ class LTX2NetworkTrainer(NetworkTrainer):
                     )
                     audio_model_input = audio_model_input.to(dtype=dit_dtype)
 
-                # Prepare timestep
-                timestep_tensor = t.expand(latent_model_input.shape[0]).to(device=transformer_device, dtype=dit_dtype)
-                timestep_for_model = self._normalize_timesteps_for_model(timestep_tensor)
+                # Prepare timestep (sigma in [0, 1])
+                timestep_for_model = sigma.expand(latent_model_input.shape[0]).to(device=transformer_device, dtype=dit_dtype)
 
                 # Model prediction
                 if self._audio_video and audio_model_input is not None:
@@ -2124,16 +2187,17 @@ class LTX2NetworkTrainer(NetworkTrainer):
                         audio_uncond, audio_cond = audio_pred.chunk(2)
                         audio_pred = audio_uncond + guidance_scale * (audio_cond - audio_uncond)
 
+                # Convert velocity prediction to x0 (denoised sample) using X0PredictionWrapper
                 video_pred = video_pred.to(dtype=latents.dtype)
-                latents = scheduler.step(video_pred, t, latents, return_dict=False)[0]
+                video_x0 = X0PredictionWrapper.velocity_to_x0(latents, video_pred, sigma.item())
+                
+                # Euler step to next latent
+                latents = stepper.step(latents, video_x0, sigmas, step_idx)
+                
                 if audio_pred is not None and audio_latents is not None:
                     audio_pred = audio_pred.to(dtype=audio_latents.dtype)
-                    if audio_scheduler is None:
-                        audio_scheduler = FlowMatchDiscreteScheduler(shift=discrete_flow_shift or 1.0)
-                        audio_scheduler.set_timesteps(sample_steps, device=transformer_device)
-                    audio_latents = audio_scheduler.step(
-                        audio_pred, t, audio_latents, return_dict=False
-                    )[0]
+                    audio_x0 = X0PredictionWrapper.velocity_to_x0(audio_latents, audio_pred, sigma.item())
+                    audio_latents = stepper.step(audio_latents, audio_x0, sigmas, step_idx)
 
         if offload_transformer_for_decode and transformer_device != transformer_offload_device:
             if hasattr(transformer, "move_to_device_except_swap_blocks"):
@@ -2148,11 +2212,43 @@ class LTX2NetworkTrainer(NetworkTrainer):
             logger.info("Sampling offload: moving VAE to GPU for decode")
             vae.to_device(transformer_device)
         with torch.no_grad():
-            video = vae.decode([latents.squeeze(0)])
-            if isinstance(video, list) and video:
-                video = video[0]
+            use_tiled_vae = getattr(args, "sample_tiled_vae", False)
+            if use_tiled_vae:
+                from musubi_tuner.ltx_2.model.video_vae import TilingConfig, SpatialTilingConfig, TemporalTilingConfig
+                tile_size = getattr(args, "sample_vae_tile_size", 512)
+                tile_overlap = getattr(args, "sample_vae_tile_overlap", 64)
+                temporal_tile_size = getattr(args, "sample_vae_temporal_tile_size", 0)
+                temporal_tile_overlap = getattr(args, "sample_vae_temporal_tile_overlap", 8)
+                
+                # Use configured temporal tiling, or 9999 frames (all at once) if disabled
+                effective_temporal_size = temporal_tile_size if temporal_tile_size > 0 else 9999
+                effective_temporal_overlap = temporal_tile_overlap if temporal_tile_size > 0 else 0
+                
+                tiling_config = TilingConfig(
+                    spatial_config=SpatialTilingConfig(
+                        tile_size_in_pixels=tile_size,
+                        tile_overlap_in_pixels=tile_overlap,
+                    ),
+                    temporal_config=TemporalTilingConfig(
+                        tile_size_in_frames=effective_temporal_size,
+                        tile_overlap_in_frames=effective_temporal_overlap,
+                    ),
+                )
+                if temporal_tile_size > 0:
+                    logger.info("Using tiled VAE decode (spatial=%dx%d, temporal=%d/%d)", 
+                               tile_size, tile_overlap, temporal_tile_size, temporal_tile_overlap)
+                else:
+                    logger.info("Using tiled VAE decode (spatial=%dx%d, no temporal tiling)", 
+                               tile_size, tile_overlap)
+                video = vae.tiled_decode(latents.squeeze(0), tiling_config)
                 if video.dim() == 4:  # [C, T, H, W]
                     video = video.unsqueeze(0)  # [1, C, T, H, W]
+            else:
+                video = vae.decode([latents.squeeze(0)])
+                if isinstance(video, list) and video:
+                    video = video[0]
+                    if video.dim() == 4:  # [C, T, H, W]
+                        video = video.unsqueeze(0)  # [1, C, T, H, W]
 
         audio_waveform = None
         if audio_latents is not None:
@@ -2341,6 +2437,35 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         "--sample_merge_audio",
         action="store_true",
         help="Mux sample audio into the sample video (outputs *_av.mp4).",
+    )
+    parser.add_argument(
+        "--sample_tiled_vae",
+        action="store_true",
+        help="Enable tiled VAE decoding during sampling to reduce VRAM usage.",
+    )
+    parser.add_argument(
+        "--sample_vae_tile_size",
+        type=int,
+        default=512,
+        help="Spatial tile size in pixels for tiled VAE decode (default: 512).",
+    )
+    parser.add_argument(
+        "--sample_vae_tile_overlap",
+        type=int,
+        default=64,
+        help="Spatial tile overlap in pixels for tiled VAE decode (default: 64).",
+    )
+    parser.add_argument(
+        "--sample_vae_temporal_tile_size",
+        type=int,
+        default=0,
+        help="Temporal tile size in frames for tiled VAE decode. 0=no temporal tiling (default: 0).",
+    )
+    parser.add_argument(
+        "--sample_vae_temporal_tile_overlap",
+        type=int,
+        default=8,
+        help="Temporal tile overlap in frames for tiled VAE decode (default: 8).",
     )
 
     return parser
