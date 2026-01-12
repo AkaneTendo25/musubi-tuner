@@ -68,6 +68,37 @@ def weighs_to_device(layer: nn.Module, device: torch.device):
                     p.data = p.data.to(device, non_blocking=non_blocking)
 
 
+def params_to_device(layer: nn.Module, device: torch.device, include_norms: bool = False):
+    """Move module parameters to device, optionally including normalization layers.
+    
+    Args:
+        layer: Module to process
+        device: Target device
+        include_norms: If True, also move RMSNorm/LayerNorm weights (more VRAM savings, more overhead)
+    """
+    non_blocking = device.type != "cpu"
+    
+    # Patterns for normalization layers
+    norm_patterns = ("RMSNorm", "LayerNorm", "GroupNorm", "BatchNorm")
+    
+    for module in layer.modules():
+        class_name = module.__class__.__name__
+        
+        # Linear layers
+        if class_name.endswith("Linear"):
+            for attr in ["weight", "bias", "scale_weight"]:
+                p = getattr(module, attr, None)
+                if p is not None and isinstance(p, (torch.Tensor, torch.nn.Parameter)):
+                    p.data = p.data.to(device, non_blocking=non_blocking)
+        
+        # Normalization layers (if enabled)
+        elif include_norms and class_name.endswith(norm_patterns):
+            for attr in ["weight", "bias"]:
+                p = getattr(module, attr, None)
+                if p is not None and isinstance(p, (torch.Tensor, torch.nn.Parameter)):
+                    p.data = p.data.to(device, non_blocking=non_blocking)
+
+
 class Offloader:
     """
     common offloading class

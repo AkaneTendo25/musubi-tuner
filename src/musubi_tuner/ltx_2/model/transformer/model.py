@@ -27,6 +27,7 @@ from musubi_tuner.ltx_2.model.transformer.transformer_args import (
     TransformerArgsPreprocessor,
 )
 from musubi_tuner.ltx_2.utils import to_denoised
+from musubi_tuner.utils.model_utils import create_cpu_offloading_wrapper
 
 logger = logging.getLogger(__name__)
 
@@ -73,12 +74,13 @@ def _move_transformer_args(
         return None
     if args.x.device == device:
         return args
-    non_blocking = device.type != "cpu"
+    # Note: We use synchronous moves (non_blocking=False) for checkpoint recomputation
+    # to ensure data is fully available before computation. Async moves can cause issues.
     def _move_tensor(value):
         if value is None:
             return None
         if isinstance(value, torch.Tensor):
-            return value.to(device, non_blocking=non_blocking)
+            return value.to(device)
         if isinstance(value, (tuple, list)):
             return type(value)(_move_tensor(v) for v in value)
         return value
@@ -420,6 +422,7 @@ class LTXModel(torch.nn.Module):
         device: torch.device,
         supports_backward: bool,
         use_pinned_memory: bool = False,
+        swap_norms: bool = False,
     ) -> None:
         swap_mode = getattr(self, "swap_mode", "default")
         _log_cuda_memory("before_enable_block_swap")
@@ -456,6 +459,7 @@ class LTXModel(torch.nn.Module):
             supports_backward_for_offload,
             device,
             use_pinned_memory,
+            swap_norms=swap_norms,
         )
         _log_cuda_memory("after_enable_block_swap")
 
@@ -563,24 +567,19 @@ class LTXModel(torch.nn.Module):
                 and gpu_device.type != "cpu"
             ):
                 cpu_device = torch.device("cpu")
+                
+                # Move inputs to GPU (they might be on CPU from previous block's offload)
+                video = _move_transformer_args(video, gpu_device)
+                audio = _move_transformer_args(audio, gpu_device)
+                
+                # Ensure block params are on GPU
+                _move_non_linear_params(block, gpu_device)
+                ensure_fp8_modules_on_device(block, gpu_device)
+                
                 if self._enable_gradient_checkpointing:
-                    video = _move_transformer_args(video, cpu_device)
-                    audio = _move_transformer_args(audio, cpu_device)
-
-                    def _run_block(video_args, audio_args, perturbations_args):
-                        video_args = _move_transformer_args(video_args, gpu_device)
-                        audio_args = _move_transformer_args(audio_args, gpu_device)
-                        _move_non_linear_params(block, gpu_device)
-                        ensure_fp8_modules_on_device(block, gpu_device)
-                        res = block(
-                            video=video_args,
-                            audio=audio_args,
-                            perturbations=perturbations_args,
-                        )
-                        return res
-
+                    # Run block with gradient checkpointing
                     video, audio = torch.utils.checkpoint.checkpoint(
-                        _run_block,
+                        block,
                         video,
                         audio,
                         perturbations,
@@ -588,16 +587,13 @@ class LTXModel(torch.nn.Module):
                         determinism_check="none",
                     )
                 else:
-                    video = _move_transformer_args(video, gpu_device)
-                    audio = _move_transformer_args(audio, gpu_device)
-                    _move_non_linear_params(block, gpu_device)
-                    ensure_fp8_modules_on_device(block, gpu_device)
                     video, audio = block(
                         video=video,
                         audio=audio,
                         perturbations=perturbations,
                     )
-
+                
+                # Move outputs to CPU after block completes to save GPU memory
                 video = _move_transformer_args(video, cpu_device)
                 audio = _move_transformer_args(audio, cpu_device)
             else:
@@ -650,12 +646,22 @@ class LTXModel(torch.nn.Module):
             unique_embedded, inverse_indices_1d, B, T = embedded_timestep
             embedded_timestep = unique_embedded[inverse_indices_1d].view(B, T, -1)
         
-        # Apply scale-shift modulation
-        scale_shift_values = scale_shift_table[None, None].to(device=x.device, dtype=x.dtype) + embedded_timestep[:, :, None]
+        # AdaLN Structural Fix: Force modulation to happen in Float32 to prevent overflow (10^18 issue)
+        # This is strictly required for stability when large activations meet scale factors.
+        x_32 = x.to(torch.float32)
+        embedded_32 = embedded_timestep.to(torch.float32)
+        
+        # Apply scale-shift modulation in float32
+        scale_shift_values = scale_shift_table[None, None].to(device=x.device, dtype=torch.float32) + embedded_32[:, :, None]
         shift, scale = scale_shift_values[:, :, 0], scale_shift_values[:, :, 1]
 
-        x = norm_out(x)
-        x = x * (1 + scale) + shift
+        # LayerNorm in float32 (using functional to avoid in-place module dtype modification)
+        x_32 = torch.nn.functional.layer_norm(x_32, norm_out.normalized_shape, eps=norm_out.eps)
+        
+        x_32 = x_32 * (1 + scale) + shift
+        
+        # Back to original dtype for projection
+        x = x_32.to(x.dtype)
         x = proj_out(x)
         return x
 

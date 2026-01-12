@@ -10,6 +10,7 @@ from musubi_tuner.modules.custom_offloading_utils import (
     _clean_memory_on_device,
     _synchronize_device,
     weighs_to_device,
+    params_to_device,
 )
 
 logger = logging.getLogger(__name__)
@@ -202,6 +203,10 @@ class LTX2BlockSwapManager:
 class LTX2ModelOffloader(ModelOffloader):
     """LTX-2 local offloader that avoids GPU preloading for swap blocks."""
 
+    def __init__(self, *args, swap_norms: bool = False, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.swap_norms = swap_norms
+
     def prepare_block_devices_before_forward(self, blocks: list[nn.Module]) -> None:
         global _LOGGED_SWAP_BYTES, _LOGGED_FIRST_PARAM
         if self.blocks_to_swap is None or self.blocks_to_swap == 0:
@@ -226,8 +231,14 @@ class LTX2ModelOffloader(ModelOffloader):
 
         cpu_device = torch.device("cpu")
         for block in blocks[split_idx :]:
-            block.to(self.device)  # Move whole block to GPU first to keep norms/embeddings there
-            weighs_to_device(block, cpu_device) # Move only Linear weights back to CPU
+            if self.swap_norms:
+                # Move whole block to GPU, then swap Linear AND norm weights to CPU
+                block.to(self.device)
+                params_to_device(block, cpu_device, include_norms=True)
+            else:
+                # Original behavior: Move whole block to GPU, only swap Linear weights
+                block.to(self.device)
+                weighs_to_device(block, cpu_device)
 
         _synchronize_device(self.device)
         _clean_memory_on_device(self.device)

@@ -71,6 +71,18 @@ def ensure_fp8_modules_on_device(module: torch.nn.Module, target_device: torch.d
                     if isinstance(scale_weight, torch.Tensor) and isinstance(weight, torch.Tensor):
                         if scale_weight.device != weight.device:
                             orig_module.scale_weight = scale_weight.to(device=weight.device)
+            # Move LoRA module weights (lora_down, lora_up) to target device
+            lora_down = getattr(forward_self, "lora_down", None)
+            lora_up = getattr(forward_self, "lora_up", None)
+            if isinstance(lora_down, torch.nn.Module):
+                lora_down_weight = getattr(lora_down, "weight", None)
+                if isinstance(lora_down_weight, torch.Tensor) and lora_down_weight.device != target_device:
+                    lora_down.to(target_device)
+            if isinstance(lora_up, torch.nn.Module):
+                lora_up_weight = getattr(lora_up, "weight", None)
+                if isinstance(lora_up_weight, torch.Tensor) and lora_up_weight.device != target_device:
+                    lora_up.to(target_device)
+
 
 
 def move_fp8_scale_weights(module: torch.nn.Module, target_device: torch.device) -> None:

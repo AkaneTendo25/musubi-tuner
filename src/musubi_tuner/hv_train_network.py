@@ -1768,7 +1768,8 @@ class NetworkTrainer:
                 f"enable swap {blocks_to_swap} blocks to CPU from device: {accelerator.device}, use pinned memory: {args.use_pinned_memory_for_block_swap}"
             )
             transformer.enable_block_swap(
-                blocks_to_swap, accelerator.device, supports_backward=True, use_pinned_memory=args.use_pinned_memory_for_block_swap
+                blocks_to_swap, accelerator.device, supports_backward=True, use_pinned_memory=args.use_pinned_memory_for_block_swap,
+                swap_norms=getattr(args, 'swap_norms', False)
             )
             transformer.move_to_device_except_swap_blocks(accelerator.device)
 
@@ -2286,7 +2287,38 @@ class NetworkTrainer:
                         loss = loss.mean()  # mean loss over all elements in batch
 
                     accelerator.backward(loss)
+                    
+                    # DEBUG: Check if LoRA parameters have gradients (Every Step)
+                    if True: # global_step % 1 == 0:
+                        unwrapped_net = accelerator.unwrap_model(network)
+                        lora_modules = getattr(unwrapped_net, "unet_loras", [])
+                        if lora_modules:
+                            sample_loras = lora_modules[:3]
+                            for lora in sample_loras:
+                                logger.info(
+                                    f"[DEBUG] LoRA {lora.lora_name}: "
+                                    f"up.requires_grad={lora.lora_up.weight.requires_grad}, "
+                                    f"down.requires_grad={lora.lora_down.weight.requires_grad}"
+                                )
+                                up_grad = lora.lora_up.weight.grad
+                                down_grad = lora.lora_down.weight.grad
+                                up_has_grad = up_grad is not None and up_grad.abs().sum().item() > 0
+                                down_has_grad = down_grad is not None and down_grad.abs().sum().item() > 0
+                                logger.info(
+                                    f"[DEBUG] LoRA grad check {lora.lora_name}: "
+                                    f"up_has_grad={up_has_grad}, down_has_grad={down_has_grad}"
+                                )
+                                if up_grad is not None:
+                                    logger.info(f"  up grad norm: {up_grad.norm().item():.6f}")
+                                if down_grad is not None:
+                                    logger.info(f"  down grad norm: {down_grad.norm().item():.6f}")
+                        else:
+                            logger.warning("[DEBUG] No unet_loras found in network")
+
                     if accelerator.sync_gradients:
+
+
+
                         # self.all_reduce_network(accelerator, network)  # sync DDP grad manually
                         state = accelerate.PartialState()
                         if state.distributed_type != accelerate.DistributedType.NO:
@@ -2763,6 +2795,12 @@ def setup_parser_common() -> argparse.ArgumentParser:
         " / ブロックスワッピングにピン留めメモリを使用する。これによりCPUとGPU間のデータ転送が高速化される可能性があるが、Windowsではより多くの共有GPUメモリを使用する。",
     )
     parser.add_argument(
+        "--swap_norms",
+        action="store_true",
+        help="Also swap RMSNorm/LayerNorm weights to CPU along with Linear weights during block swap. Saves more VRAM but increases CPU-GPU transfer overhead. LTX-2 only."
+        " / ブロックスワップ時にLinear重みに加えてRMSNorm/LayerNormの重みもCPUにスワップする。VRAMをさらに節約するが、CPU-GPU転送オーバーヘッドが増加する。LTX-2専用。",
+    )
+    parser.add_argument(
         "--img_in_txt_in_offloading",
         action="store_true",
         help="offload img_in and txt_in to cpu / img_inとtxt_inをCPUにオフロードする",
@@ -2780,10 +2818,11 @@ def setup_parser_common() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--timestep_sampling",
-        choices=["sigma", "uniform", "sigmoid", "shift", "flux_shift", "qwen_shift", "logsnr", "qinglong_flux", "qinglong_qwen"],
+        choices=["sigma", "uniform", "sigmoid", "shift", "flux_shift", "qwen_shift", "logsnr", "qinglong_flux", "qinglong_qwen", "shifted_logit_normal"],
         default="sigma",
-        help="Method to sample timesteps: sigma-based, uniform random, sigmoid of random normal, shift of sigmoid and flux shift."
-        " / タイムステップをサンプリングする方法：sigma、random uniform、random normalのsigmoid、sigmoidのシフト、flux shift。",
+        help="Method to sample timesteps: sigma-based, uniform random, sigmoid of random normal, shift of sigmoid, flux shift, "
+        "or shifted_logit_normal (sequence-length-adaptive, official LTX-2 method)."
+        " / タイムステップをサンプリングする方法：sigma、random uniform、random normalのsigmoid、sigmoidのシフト、flux shift、shifted_logit_normal。",
     )
     parser.add_argument(
         "--discrete_flow_shift",

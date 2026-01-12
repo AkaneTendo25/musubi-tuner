@@ -208,6 +208,7 @@ class BasicAVTransformerBlock(torch.nn.Module):
             target_device = video.x.device
         elif audio is not None and isinstance(audio.x, torch.Tensor):
             target_device = audio.x.device
+        
         if target_device is not None:
             _move_non_linear_params(self, target_device)
             ensure_fp8_modules_on_device(self, target_device)
@@ -234,7 +235,8 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 self.scale_shift_table, vx.shape[0], video.timesteps, slice(0, 3), num_tokens=vx.shape[1]
             )
             if not perturbations.all_in_batch(PerturbationType.SKIP_VIDEO_SELF_ATTN, self.idx):
-                norm_vx = rms_norm(vx, eps=self.norm_eps) * (1 + vscale_msa) + vshift_msa
+                # AdaLN Structural Fix: Force modulation to happen in Float32 to prevent overflow (10^18 issue)
+                norm_vx = (rms_norm(vx, eps=self.norm_eps).to(torch.float32) * (1 + vscale_msa.to(torch.float32)) + vshift_msa.to(torch.float32)).to(vx.dtype)
                 v_mask = perturbations.mask_like(PerturbationType.SKIP_VIDEO_SELF_ATTN, self.idx, vx)
                 vx = vx + self.attn1(norm_vx, pe=video.positional_embeddings) * vgate_msa * v_mask
 
@@ -248,7 +250,8 @@ class BasicAVTransformerBlock(torch.nn.Module):
             )
 
             if not perturbations.all_in_batch(PerturbationType.SKIP_AUDIO_SELF_ATTN, self.idx):
-                norm_ax = rms_norm(ax, eps=self.norm_eps) * (1 + ascale_msa) + ashift_msa
+                # AdaLN Structural Fix
+                norm_ax = (rms_norm(ax, eps=self.norm_eps).to(torch.float32) * (1 + ascale_msa.to(torch.float32)) + ashift_msa.to(torch.float32)).to(ax.dtype)
                 a_mask = perturbations.mask_like(PerturbationType.SKIP_AUDIO_SELF_ATTN, self.idx, ax)
                 ax = ax + self.audio_attn1(norm_ax, pe=audio.positional_embeddings) * agate_msa * a_mask
 
@@ -290,8 +293,9 @@ class BasicAVTransformerBlock(torch.nn.Module):
             )
 
             if run_a2v:
-                vx_scaled = vx_norm3 * (1 + scale_ca_video_hidden_states_a2v) + shift_ca_video_hidden_states_a2v
-                ax_scaled = ax_norm3 * (1 + scale_ca_audio_hidden_states_a2v) + shift_ca_audio_hidden_states_a2v
+                # AdaLN Structural Fix
+                vx_scaled = (vx_norm3.to(torch.float32) * (1 + scale_ca_video_hidden_states_a2v.to(torch.float32)) + shift_ca_video_hidden_states_a2v.to(torch.float32)).to(vx.dtype)
+                ax_scaled = (ax_norm3.to(torch.float32) * (1 + scale_ca_audio_hidden_states_a2v.to(torch.float32)) + shift_ca_audio_hidden_states_a2v.to(torch.float32)).to(ax.dtype)
                 a2v_mask = perturbations.mask_like(PerturbationType.SKIP_A2V_CROSS_ATTN, self.idx, vx)
                 vx = vx + (
                     self.audio_to_video_attn(
@@ -305,8 +309,9 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 )
 
             if run_v2a:
-                ax_scaled = ax_norm3 * (1 + scale_ca_audio_hidden_states_v2a) + shift_ca_audio_hidden_states_v2a
-                vx_scaled = vx_norm3 * (1 + scale_ca_video_hidden_states_v2a) + shift_ca_video_hidden_states_v2a
+                # AdaLN Structural Fix
+                ax_scaled = (ax_norm3.to(torch.float32) * (1 + scale_ca_audio_hidden_states_v2a.to(torch.float32)) + shift_ca_audio_hidden_states_v2a.to(torch.float32)).to(ax.dtype)
+                vx_scaled = (vx_norm3.to(torch.float32) * (1 + scale_ca_video_hidden_states_v2a.to(torch.float32)) + shift_ca_video_hidden_states_v2a.to(torch.float32)).to(vx.dtype)
                 v2a_mask = perturbations.mask_like(PerturbationType.SKIP_V2A_CROSS_ATTN, self.idx, ax)
                 ax = ax + (
                     self.video_to_audio_attn(
@@ -335,7 +340,8 @@ class BasicAVTransformerBlock(torch.nn.Module):
             vshift_mlp, vscale_mlp, vgate_mlp = self.get_ada_values(
                 self.scale_shift_table, vx.shape[0], video.timesteps, slice(3, None), num_tokens=vx.shape[1]
             )
-            vx_scaled = rms_norm(vx, eps=self.norm_eps) * (1 + vscale_mlp) + vshift_mlp
+            # AdaLN Structural Fix
+            vx_scaled = (rms_norm(vx, eps=self.norm_eps).to(torch.float32) * (1 + vscale_mlp.to(torch.float32)) + vshift_mlp.to(torch.float32)).to(vx.dtype)
             vx = vx + self.ff(vx_scaled) * vgate_mlp
 
             del vshift_mlp, vscale_mlp, vgate_mlp
@@ -344,7 +350,8 @@ class BasicAVTransformerBlock(torch.nn.Module):
             ashift_mlp, ascale_mlp, agate_mlp = self.get_ada_values(
                 self.audio_scale_shift_table, ax.shape[0], audio.timesteps, slice(3, None), num_tokens=ax.shape[1]
             )
-            ax_scaled = rms_norm(ax, eps=self.norm_eps) * (1 + ascale_mlp) + ashift_mlp
+            # AdaLN Structural Fix
+            ax_scaled = (rms_norm(ax, eps=self.norm_eps).to(torch.float32) * (1 + ascale_mlp.to(torch.float32)) + ashift_mlp.to(torch.float32)).to(ax.dtype)
             ax = ax + self.audio_ff(ax_scaled) * agate_mlp
 
             del ashift_mlp, ascale_mlp, agate_mlp

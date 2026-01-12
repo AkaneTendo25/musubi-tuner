@@ -302,7 +302,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
         self._num_timesteps: int = 1000
         self._audio_video: bool = False
         self._ltx_mode: str = "video"
-        self.default_guidance_scale = 1.0
+        self.default_guidance_scale = 3.0
         self._audio_preview_config: Optional[Dict[str, int | float]] = None
 
     def _get_audio_preview_config(self, args: argparse.Namespace, transformer) -> Dict[str, int | float]:
@@ -396,6 +396,11 @@ class LTX2NetworkTrainer(NetworkTrainer):
         min_shift: float = 0.95,
         max_shift: float = 2.05,
     ) -> float:
+        """Calculate shift value for shifted logit-normal timestep sampling.
+
+        This matches the official LTX-2 trainer implementation where the shift
+        is linearly interpolated based on sequence length.
+        """
         m = (max_shift - min_shift) / float(max_tokens - min_tokens)
         b = min_shift - m * float(min_tokens)
         return m * float(seq_length) + b
@@ -406,10 +411,11 @@ class LTX2NetworkTrainer(NetworkTrainer):
         noise: torch.Tensor,
         latents: torch.Tensor,
         timesteps: Optional[List[float]],
-        noise_scheduler,  # noqa: ARG002
+        noise_scheduler,
         device: torch.device,
         dtype: torch.dtype,
     ):
+        # For non-video latents, use parent implementation
         if latents.dim() != 5:
             return super().get_noisy_model_input_and_timesteps(args, noise, latents, timesteps, noise_scheduler, device, dtype)
 
@@ -422,9 +428,34 @@ class LTX2NetworkTrainer(NetworkTrainer):
         frames, height, width = latents.shape[2], latents.shape[3], latents.shape[4]
         seq_len = int(frames * height * width)
 
-        shift = self._shifted_logit_normal_shift_for_sequence_length(seq_len)
-        normal_samples = torch.randn((batch_size,), device=device, dtype=torch.float32) + float(shift)
-        sigmas = torch.sigmoid(normal_samples)
+        # Get timestep sampling mode (default to shifted_logit_normal for LTX-2)
+        timestep_sampling = getattr(args, "timestep_sampling", "shifted_logit_normal")
+
+        # For LTX-2, treat "sigma" as "shifted_logit_normal" (backward compatibility)
+        if timestep_sampling == "sigma":
+            timestep_sampling = "shifted_logit_normal"
+
+        if timestep_sampling == "shifted_logit_normal":
+            # Official LTX-2 implementation: shifted logit-normal distribution
+            # Shift is computed based on sequence length
+            shift = self._shifted_logit_normal_shift_for_sequence_length(seq_len)
+            std = getattr(args, "logit_std", 1.0)
+            normal_samples = torch.randn((batch_size,), device=device, dtype=torch.float32) * std + float(shift)
+            sigmas = torch.sigmoid(normal_samples)
+        elif timestep_sampling == "uniform":
+            # Uniform sampling from [0, 1]
+            sigmas = torch.rand((batch_size,), device=device, dtype=torch.float32)
+        else:
+            # For other sampling modes, use parent implementation
+            return super().get_noisy_model_input_and_timesteps(args, noise, latents, timesteps, noise_scheduler, device, dtype)
+
+        # Apply min/max timestep constraints if specified
+        min_timestep = getattr(args, "min_timestep", None)
+        max_timestep = getattr(args, "max_timestep", None)
+        if min_timestep is not None or max_timestep is not None:
+            min_sigma = (min_timestep / 1000.0) if min_timestep is not None else 0.0
+            max_sigma = (max_timestep / 1000.0) if max_timestep is not None else 1.0
+            sigmas = sigmas * (max_sigma - min_sigma) + min_sigma
 
         sigmas_expanded = sigmas.view(-1, 1, 1, 1, 1)
         noisy_model_input = (1.0 - sigmas_expanded) * latents.to(dtype=torch.float32) + sigmas_expanded * noise.to(
@@ -735,7 +766,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 "--output",
                 output_path,
                 "--device",
-                "cpu",
+                "auto",
                 "--dtype",
                 "fp32",
             ]
@@ -837,6 +868,85 @@ class LTX2NetworkTrainer(NetworkTrainer):
 
         container_out.close()
         container_in.close()
+
+    @staticmethod
+    def _ensure_lora_enabled_for_sampling(transformer) -> int:
+        try:
+            from musubi_tuner.networks.lora import LoRAModule
+        except Exception:
+            return 0
+
+        lora_count = 0
+        for module in transformer.modules():
+            if not isinstance(module, torch.nn.Linear):
+                continue
+            bound = getattr(module.forward, "__self__", None)
+            if bound is None or not isinstance(bound, LoRAModule):
+                continue
+            bound.enabled = True
+            lora_count += 1
+        return lora_count
+
+    @staticmethod
+    def _get_lora_norm_samples(transformer, limit: int = 5) -> list[str]:
+        try:
+            from musubi_tuner.networks.lora import LoRAModule
+        except Exception:
+            return []
+
+        stats = []
+        for name, module in transformer.named_modules():
+            if not isinstance(module, torch.nn.Linear):
+                continue
+            bound = getattr(module.forward, "__self__", None)
+            if bound is None or not isinstance(bound, LoRAModule):
+                continue
+            try:
+                up = bound.lora_up
+                down = bound.lora_down
+                if isinstance(up, torch.nn.ModuleList):
+                    up_norm = sum(u.weight.norm().item() for u in up)
+                else:
+                    up_norm = up.weight.norm().item()
+                if isinstance(down, torch.nn.ModuleList):
+                    down_norm = sum(d.weight.norm().item() for d in down)
+                else:
+                    down_norm = down.weight.norm().item()
+                stats.append(f"{name}: up_norm={up_norm:.6f}, down_norm={down_norm:.6f}")
+            except Exception:
+                continue
+            if len(stats) >= limit:
+                break
+        return stats
+
+    @staticmethod
+    def _collect_lora_modules(transformer) -> list:
+        try:
+            from musubi_tuner.networks.lora import LoRAModule
+        except Exception:
+            return []
+        modules = []
+        for module in transformer.modules():
+            if not isinstance(module, torch.nn.Linear):
+                continue
+            bound = getattr(module.forward, "__self__", None)
+            if bound is None or not isinstance(bound, LoRAModule):
+                continue
+            modules.append(bound)
+        return modules
+
+    @staticmethod
+    def _temporarily_disable_lora(lora_modules: list) -> list[float]:
+        prev = []
+        for mod in lora_modules:
+            prev.append(getattr(mod, "multiplier", 1.0))
+            mod.multiplier = 0.0
+        return prev
+
+    @staticmethod
+    def _restore_lora(lora_modules: list, prev: list[float]) -> None:
+        for mod, value in zip(lora_modules, prev):
+            mod.multiplier = value
 
     @staticmethod
     def _override_attention_function(transformer, attention_function):
@@ -1757,6 +1867,15 @@ class LTX2NetworkTrainer(NetworkTrainer):
         steps,
     ):
         """LTX-2-specific sampling with proper frame/size rounding."""
+        lora_count = self._ensure_lora_enabled_for_sampling(transformer)
+        if lora_count:
+            logger.info("Sampling: LoRA modules active in transformer: %s", lora_count)
+            lora_stats = self._get_lora_norm_samples(transformer)
+            for stat in lora_stats:
+                logger.info("Sampling LoRA norm: %s", stat)
+        else:
+            logger.warning("Sampling: no LoRA modules detected on transformer")
+
         loaded_vae = False
         if vae is None or getattr(vae, "_deferred", False):
             vae_dtype = torch.float16 if args.vae_dtype is None else model_utils.str_to_dtype(args.vae_dtype)
@@ -2063,7 +2182,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
         prompt_mask = prompt_mask.to(device=transformer_device, dtype=torch.int64) if prompt_mask is not None else None
 
         attention_overrides = []
-        if getattr(args, "sample_disable_flash_attn", False):
+        if getattr(args, "sample_disable_flash_attn", True):
             from musubi_tuner.ltx_2.model.transformer.attention import AttentionFunction
 
             logger.info("Sampling: disabling FlashAttention for preview")
@@ -2136,6 +2255,55 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 device=transformer_device,
                 generator=generator,
             )
+
+        if getattr(args, "sample_lora_sanity_check", False) and sigmas.numel() > 0:
+            sigma = sigmas[0]
+            latent_model_input = torch.cat([latents, latents], dim=0) if do_classifier_free_guidance else latents
+            latent_model_input = latent_model_input.to(dtype=dit_dtype)
+            audio_model_input = None
+            if audio_latents is not None:
+                audio_model_input = (
+                    torch.cat([audio_latents, audio_latents], dim=0)
+                    if do_classifier_free_guidance
+                    else audio_latents
+                )
+                audio_model_input = audio_model_input.to(dtype=dit_dtype)
+            timestep_for_model = sigma.expand(latent_model_input.shape[0]).to(
+                device=transformer_device, dtype=dit_dtype
+            )
+            model_input = (
+                [latent_model_input, audio_model_input]
+                if self._audio_video and audio_model_input is not None
+                else latent_model_input
+            )
+            lora_modules = self._collect_lora_modules(transformer)
+            if lora_modules:
+                with torch.no_grad():
+                    pred_on = transformer(
+                        model_input,
+                        timestep=timestep_for_model.unsqueeze(1),
+                        context=prompt_embeds,
+                        attention_mask=prompt_mask,
+                        frame_rate=sample_parameter.get("frame_rate", 25),
+                        transformer_options={},
+                    )
+                    prev = self._temporarily_disable_lora(lora_modules)
+                    pred_off = transformer(
+                        model_input,
+                        timestep=timestep_for_model.unsqueeze(1),
+                        context=prompt_embeds,
+                        attention_mask=prompt_mask,
+                        frame_rate=sample_parameter.get("frame_rate", 25),
+                        transformer_options={},
+                    )
+                    self._restore_lora(lora_modules, prev)
+                if isinstance(pred_on, (list, tuple)):
+                    pred_on = pred_on[0]
+                    pred_off = pred_off[0]
+                delta = (pred_on - pred_off).abs().mean().item()
+                logger.info("Sampling LoRA delta check: mean|on-off|=%.6f", delta)
+            else:
+                logger.warning("Sampling LoRA delta check skipped: no LoRA modules found.")
 
         # Denoising loop using LTX-2 scheduler with sigmas
         with torch.no_grad():
@@ -2437,6 +2605,11 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         "--sample_merge_audio",
         action="store_true",
         help="Mux sample audio into the sample video (outputs *_av.mp4).",
+    )
+    parser.add_argument(
+        "--sample_lora_sanity_check",
+        action="store_true",
+        help="Run a one-step LoRA on/off delta check during sampling.",
     )
     parser.add_argument(
         "--sample_tiled_vae",

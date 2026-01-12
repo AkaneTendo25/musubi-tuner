@@ -7,8 +7,43 @@ def rms_norm(x: torch.Tensor, weight: torch.Tensor | None = None, eps: float = 1
     """Root-mean-square (RMS) normalize `x` over its last dimension.
     Thin wrapper around `torch.nn.functional.rms_norm` that infers the normalized
     shape and forwards `weight` and `eps`.
+    
+    NOTE: Modified to run in Float32 to prevent overflows/NaNs in mixed precision training.
     """
-    return torch.nn.functional.rms_norm(x, (x.shape[-1],), weight=weight, eps=eps)
+    input_dtype = x.dtype
+    # Force Float32 for stability
+    # This prevents 'inf' gradients caused by overflow in squared sum calculation
+    x = x.to(torch.float32)
+    if weight is not None:
+        weight = weight.to(torch.float32)
+
+    res = torch.nn.functional.rms_norm(x, (x.shape[-1],), weight=weight, eps=eps)
+
+    return res.to(input_dtype)
+
+
+
+
+class RMSNorm(torch.nn.Module):
+    """
+    Robust RMSNorm module that uses the stabilized functional wrapper.
+    Replaces torch.nn.RMSNorm to ensure mixed-precision compatibility (F8/F32/BF16).
+    """
+    def __init__(self, dim: int, eps: float = 1e-6, elementwise_affine: bool = True):
+        super().__init__()
+        self.normalized_shape = (dim,)
+        self.eps = eps
+        self.elementwise_affine = elementwise_affine
+        if self.elementwise_affine:
+            self.weight = torch.nn.Parameter(torch.ones(dim))
+        else:
+            self.register_parameter("weight", None)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return rms_norm(x, self.weight, self.eps)
+
+    def extra_repr(self) -> str:
+        return f"{self.normalized_shape}, eps={self.eps}, elementwise_affine={self.elementwise_affine}"
 
 
 def check_config_value(config: dict, key: str, expected: Any) -> None:  # noqa: ANN401

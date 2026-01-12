@@ -258,8 +258,9 @@ class Attention(torch.nn.Module):
         self.heads = heads
         self.dim_head = dim_head
 
-        self.q_norm = torch.nn.RMSNorm(inner_dim, eps=norm_eps)
-        self.k_norm = torch.nn.RMSNorm(inner_dim, eps=norm_eps)
+        from musubi_tuner.ltx_2.utils import RMSNorm
+        self.q_norm = RMSNorm(inner_dim, eps=norm_eps)
+        self.k_norm = RMSNorm(inner_dim, eps=norm_eps)
 
         self.to_q = torch.nn.Linear(query_dim, inner_dim, bias=True)
         self.to_k = torch.nn.Linear(context_dim, inner_dim, bias=True)

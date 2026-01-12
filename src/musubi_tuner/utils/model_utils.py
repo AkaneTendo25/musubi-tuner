@@ -5,6 +5,7 @@ from typing import Any, Callable, Optional
 import logging
 import safetensors.torch
 import torch
+from dataclasses import is_dataclass, fields, replace as dataclass_replace
 
 logger = logging.getLogger(__name__)
 
@@ -155,6 +156,10 @@ def str_to_dtype(s: Optional[str], default_dtype: Optional[torch.dtype] = None) 
 
 
 def to_device(x: Any, device: torch.device) -> Any:
+    """Recursively moves torch.Tensor objects (and containers thereof) to device.
+    
+    Supports: Tensor, list, tuple, dict, and frozen dataclass objects.
+    """
     if isinstance(x, torch.Tensor):
         return x.to(device)
     elif isinstance(x, list):
@@ -163,6 +168,10 @@ def to_device(x: Any, device: torch.device) -> Any:
         return tuple(to_device(elem, device) for elem in x)
     elif isinstance(x, dict):
         return {k: to_device(v, device) for k, v in x.items()}
+    elif is_dataclass(x) and not isinstance(x, type):
+        # Handle frozen dataclass instances (e.g., TransformerArgs)
+        field_updates = {f.name: to_device(getattr(x, f.name), device) for f in fields(x)}
+        return dataclass_replace(x, **field_updates)
     else:
         return x
 
@@ -172,7 +181,7 @@ def to_cpu(x: Any) -> Any:
     Recursively moves torch.Tensor objects (and containers thereof) to CPU.
 
     Args:
-        x: A torch.Tensor, or a (possibly nested) list, tuple, or dict containing tensors.
+        x: A torch.Tensor, or a (possibly nested) list, tuple, dict, or dataclass containing tensors.
 
     Returns:
         The same structure as x, with all torch.Tensor objects moved to CPU.
@@ -186,6 +195,10 @@ def to_cpu(x: Any) -> Any:
         return tuple(to_cpu(elem) for elem in x)
     elif isinstance(x, dict):
         return {k: to_cpu(v) for k, v in x.items()}
+    elif is_dataclass(x) and not isinstance(x, type):
+        # Handle frozen dataclass instances (e.g., TransformerArgs)
+        field_updates = {f.name: to_cpu(getattr(x, f.name)) for f in fields(x)}
+        return dataclass_replace(x, **field_updates)
     else:
         return x
 

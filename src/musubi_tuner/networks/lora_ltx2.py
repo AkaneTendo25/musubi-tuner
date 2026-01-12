@@ -106,9 +106,9 @@ class LTX2Wrapper(nn.Module):
         raise AttributeError("Underlying LTX2 model does not support gradient checkpointing")
 
     def enable_block_swap(
-        self, blocks_to_swap: int, device: torch.device, supports_backward: bool, use_pinned_memory: bool = False
+        self, blocks_to_swap: int, device: torch.device, supports_backward: bool, use_pinned_memory: bool = False, swap_norms: bool = False
     ):
-        return self.model.enable_block_swap(blocks_to_swap, device, supports_backward, use_pinned_memory)
+        return self.model.enable_block_swap(blocks_to_swap, device, supports_backward, use_pinned_memory, swap_norms=swap_norms)
 
     def move_to_device_except_swap_blocks(self, device: torch.device):
         return self.model.move_to_device_except_swap_blocks(device)
@@ -316,41 +316,38 @@ def load_ltx2_wrapper(
     return LTX2Wrapper(model, patch_size=patch_size)
 
 
+# Target module class names to search for LoRA-applicable layers
+# Only BasicAVTransformerBlock is targeted - it contains all attention modules:
+#   - attn1 (video self-attention), attn2 (video cross-attention to text)
+#   - audio_attn1, audio_attn2 (audio attention)
+#   - audio_to_video_attn, video_to_audio_attn (cross-modal attention)
+#   - ff, audio_ff (feed-forward, if included via patterns)
 LTX2_TARGET_REPLACE_MODULES = [
     "BasicAVTransformerBlock",
-    "PixArtAlphaTextProjection",
+]
+
+# Default: attention layers only (matches official LTX-2 trainer defaults)
+# These patterns match attention projection layers inside BasicAVTransformerBlock:
+#   attn1.to_k, attn1.to_q, attn1.to_v, attn1.to_out.0 (video self-attention)
+#   attn2.to_k, attn2.to_q, attn2.to_v, attn2.to_out.0 (video cross-attention)
+#   audio_attn1.*, audio_attn2.* (audio attention)
+#   audio_to_video_attn.*, video_to_audio_attn.* (cross-modal attention)
+# To also train feed-forward layers, add patterns: r".*\.ff\..*", r".*\.audio_ff\..*"
+LTX2_DEFAULT_INCLUDE_PATTERNS = [
+    r".*\.to_k$",
+    r".*\.to_q$",
+    r".*\.to_v$",
+    r".*\.to_out\.0$",
 ]
 
 
-def _build_exclude_patterns(raw_patterns: Optional[str], audio_video: bool = False) -> List[str]:
+def _build_exclude_patterns(raw_patterns: Optional[str], audio_video: bool = False) -> List[str]:  # noqa: ARG001
+    """Build exclude patterns list. Only uses user-provided patterns if specified."""
     if raw_patterns is None:
-        patterns: List[str] = []
-    else:
-        patterns = ast.literal_eval(raw_patterns)
-        if not isinstance(patterns, list):
-            raise ValueError("exclude_patterns must evaluate to a list")
-
-    patterns.extend(
-        [
-            r".*(norm|norm_out|scale_shift_table|patchify_proj|proj_out).*",
-            r".*patchifier.*",
-            r".*adaln_single\.emb.*",
-        ]
-    )
-
-    if audio_video:
-        patterns.extend(
-            [
-                r".*audio_scale_shift_table.*",
-                r".*audio_patchify_proj.*",
-                r".*audio_proj_out.*",
-                r".*audio_norm_out.*",
-                r".*audio_adaln_single\.emb.*",
-                r".*a_patchifier.*",
-                r".*av_ca.*adaln_single\.emb.*",
-            ]
-        )
-
+        return []
+    patterns = ast.literal_eval(raw_patterns)
+    if not isinstance(patterns, list):
+        raise ValueError("exclude_patterns must evaluate to a list")
     return patterns
 
 
@@ -369,6 +366,8 @@ def create_arch_network(
         audio_video = unet.__class__.__name__ == "LTXAVModel" or hasattr(unet, "audio_patchify_proj")
 
     kwargs["exclude_patterns"] = _build_exclude_patterns(kwargs.get("exclude_patterns"), audio_video=audio_video)
+    if kwargs.get("include_patterns") is None:
+        kwargs["include_patterns"] = LTX2_DEFAULT_INCLUDE_PATTERNS
 
     net = lora.create_network(
         LTX2_TARGET_REPLACE_MODULES,
