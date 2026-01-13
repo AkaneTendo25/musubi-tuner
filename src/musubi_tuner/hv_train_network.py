@@ -1847,7 +1847,10 @@ class NetworkTrainer:
             accelerator.print(f"load network weights from {args.network_weights}: {info}")
 
         if args.gradient_checkpointing:
-            transformer.enable_gradient_checkpointing(args.gradient_checkpointing_cpu_offload)
+            if getattr(args, "blockwise_checkpointing", False):
+                transformer.enable_gradient_checkpointing(args.gradient_checkpointing_cpu_offload, weight_cpu_offloading=True)
+            else:
+                transformer.enable_gradient_checkpointing(args.gradient_checkpointing_cpu_offload)
             network.enable_gradient_checkpointing()  # may have no effect
 
         # prepare optimizer, data loader etc.
@@ -2297,21 +2300,34 @@ class NetworkTrainer:
                             for lora in sample_loras:
                                 logger.info(
                                     f"[DEBUG] LoRA {lora.lora_name}: "
-                                    f"up.requires_grad={lora.lora_up.weight.requires_grad}, "
-                                    f"down.requires_grad={lora.lora_down.weight.requires_grad}"
+                                    f"up_norm={lora.lora_up.weight.norm().item():.4f}, "
+                                    f"down_norm={lora.lora_down.weight.norm().item():.4f}"
                                 )
                                 up_grad = lora.lora_up.weight.grad
                                 down_grad = lora.lora_down.weight.grad
-                                up_has_grad = up_grad is not None and up_grad.abs().sum().item() > 0
-                                down_has_grad = down_grad is not None and down_grad.abs().sum().item() > 0
-                                logger.info(
-                                    f"[DEBUG] LoRA grad check {lora.lora_name}: "
-                                    f"up_has_grad={up_has_grad}, down_has_grad={down_has_grad}"
-                                )
+                                
+                                up_has_grad = up_grad is not None
+                                down_has_grad = down_grad is not None
+                                
+                                up_stat = "None"
                                 if up_grad is not None:
-                                    logger.info(f"  up grad norm: {up_grad.norm().item():.6f}")
+                                    up_norm = up_grad.norm().item()
+                                    up_nan = torch.isnan(up_grad).any().item()
+                                    up_inf = torch.isinf(up_grad).any().item()
+                                    up_stat = f"norm={up_norm:.6f} nan={up_nan} inf={up_inf}"
+
+                                down_stat = "None"
                                 if down_grad is not None:
-                                    logger.info(f"  down grad norm: {down_grad.norm().item():.6f}")
+                                    down_norm = down_grad.norm().item()
+                                    down_nan = torch.isnan(down_grad).any().item()
+                                    down_inf = torch.isinf(down_grad).any().item()
+                                    down_stat = f"norm={down_norm:.6f} nan={down_nan} inf={down_inf}"
+
+                                logger.info(
+                                    f"[DEBUG] LoRA Grad {lora.lora_name}:\n"
+                                    f"  UP  : {up_stat}\n"
+                                    f"  DOWN: {down_stat}"
+                                )
                         else:
                             logger.warning("[DEBUG] No unet_loras found in network")
 

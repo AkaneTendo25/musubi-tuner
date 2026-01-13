@@ -128,6 +128,7 @@ accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 ltx2_tr
 - `--blocks_to_swap X`: Offloads X transformer blocks to CPU (max 47 for 48-block model). Higher values save more VRAM but increase CPU↔GPU overhead.
 - `--gradient_checkpointing`: Reduces VRAM by recomputing activations during backward pass.
 - `--gradient_checkpointing_cpu_offload`: Offloads activations to CPU during gradient checkpointing recomputation.
+- `--blockwise_checkpointing`: **(Recommended for Low VRAM)** Enables granular block-level gradient checkpointing with weight offloading. This aggressively saves VRAM by keeping only the active block's weights on GPU during forward/backward passes. Handles recursive inputs (like `timesteps`) and LoRA training correctly.
 - `--use_pinned_memory_for_block_swap`: Uses pinned memory for faster CPU↔GPU block transfers.
 - `--swap_norms`: Also swaps RMSNorm/LayerNorm weights to CPU. Extra memory savings.
 
@@ -147,8 +148,8 @@ accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 ltx2_tr
   --fp8_scaled ^
   --blocks_to_swap 47 ^
   --use_pinned_memory_for_block_swap ^
-  --gradient_checkpointing ^
-  --gradient_checkpointing_cpu_offload ^
+  --blockwise_checkpointing ^
+  --swap_norms ^
   --flash_attn ^
   --network_module networks.lora_ltx2 ^
   --network_dim 16 ^
@@ -163,12 +164,11 @@ accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 ltx2_tr
 **Tips for low-VRAM training:**
 - Use `--fp8_base --fp8_scaled`
 - Use `--blocks_to_swap 47` (keeps only 1 block on GPU)
+- Use `--blockwise_checkpointing` (replaces standard gradient_checkpointing for better savings)
 - Use smaller LoRA rank (`--network_dim 16` instead of 32)
 - Use smaller training resolutions (e.g., 512x320)
 - Reduce `--sample_vae_temporal_tile_size` to 24 or lower
-- Use `--gradient_checkpointing` - trades compute for memory
-- Enable `--gradient_checkpointing_cpu_offload` - additional activation offloading
-- Use `--swap_norms` - swap normalization layers
+- Enable `--swap_norms` - swap normalization layers
 - Use `--use_pinned_memory_for_block_swap` - faster transfers
 
 #### Audio-Video Support

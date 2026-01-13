@@ -85,9 +85,9 @@ class LTX2Wrapper(nn.Module):
         )
         self.patch_size = patch_size
 
-    def enable_gradient_checkpointing(self, activation_cpu_offloading: bool = False):
+    def enable_gradient_checkpointing(self, activation_cpu_offloading: bool = False, **kwargs):
         if hasattr(self.model, "enable_gradient_checkpointing"):
-            return self.model.enable_gradient_checkpointing(activation_cpu_offloading)
+            return self.model.enable_gradient_checkpointing(activation_cpu_offloading, **kwargs)
         if hasattr(self.model, "set_gradient_checkpointing"):
             self.model.set_gradient_checkpointing(True)
             if hasattr(self.model, "activation_cpu_offloading"):

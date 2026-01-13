@@ -2640,6 +2640,11 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         default=8,
         help="Temporal tile overlap in frames for tiled VAE decode (default: 8).",
     )
+    parser.add_argument(
+        "--blockwise_checkpointing",
+        action="store_true",
+        help="Enable block-wise weight offloading during backward (ultra-low VRAM).",
+    )
 
     return parser
 

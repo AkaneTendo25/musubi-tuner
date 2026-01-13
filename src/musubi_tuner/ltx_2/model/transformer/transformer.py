@@ -1,13 +1,36 @@
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, replace, fields
+from typing import Any
 
 import torch
+import torch.utils.checkpoint as checkpoint
+
+from musubi_tuner.utils.model_utils import create_cpu_offloading_wrapper
+from musubi_tuner.modules.custom_offloading_utils import weighs_to_device
+from musubi_tuner.modules.block_level_checkpointing import block_checkpoint
 from musubi_tuner.ltx_2.guidance.perturbations import BatchedPerturbationConfig, PerturbationType
+from musubi_tuner.ltx_2.model.transformer.adaln import AdaLayerNormSingle
 from musubi_tuner.ltx_2.model.transformer.attention import Attention, AttentionCallable, AttentionFunction
 from musubi_tuner.ltx_2.model.transformer.fp8_device_utils import ensure_fp8_modules_on_device
 from musubi_tuner.ltx_2.model.transformer.feed_forward import FeedForward
 from musubi_tuner.ltx_2.model.transformer.rope import LTXRopeType
 from musubi_tuner.ltx_2.model.transformer.transformer_args import TransformerArgs
 from musubi_tuner.ltx_2.utils import rms_norm
+
+
+
+def _unpack_transformer_args(args: TransformerArgs | None) -> tuple[list[Any], bool]:
+    # Returns (values, is_none). Unpacks all fields.
+    if args is None:
+        return [], True
+    return [getattr(args, f.name) for f in fields(args)], False
+
+
+def _reconstruct_transformer_args(values: list[Any], is_none: bool) -> TransformerArgs | None:
+    if is_none:
+        return None
+    field_names = [f.name for f in fields(TransformerArgs)]
+    kwargs = dict(zip(field_names, values))
+    return TransformerArgs(**kwargs)
 
 
 @dataclass
@@ -18,22 +41,34 @@ class TransformerConfig:
     context_dim: int
 
 
-def _move_non_linear_params(module: torch.nn.Module, device: torch.device) -> None:
-    """Move non-linear params/buffers to device; Linear weights are handled by offloader."""
+def _move_non_linear_params(module: torch.nn.Module, device: torch.device, skip_trainable: bool = True) -> None:
+    """Move non-linear params/buffers to device; Linear weights are handled by offloader.
+    
+    Args:
+        module: Module to process
+        device: Target device
+        skip_trainable: If True AND target is CPU, skip parameters with requires_grad=True
+    """
     non_blocking = device.type != "cpu"
+    # Only skip trainable parameters when moving TO CPU (offloading), not when loading TO GPU
+    should_skip_trainable = skip_trainable and device.type == "cpu"
+    
     for submodule in module.modules():
         if isinstance(submodule, torch.nn.Linear):
             # Move bias and scale_weight if they exist and are on wrong device
             if submodule.bias is not None and submodule.bias.device != device:
-                submodule.bias.data = submodule.bias.data.to(device, non_blocking=non_blocking)
+                if not (should_skip_trainable and submodule.bias.requires_grad):
+                    submodule.bias.data = submodule.bias.data.to(device, non_blocking=non_blocking)
             if hasattr(submodule, "scale_weight") and submodule.scale_weight is not None and submodule.scale_weight.device != device:
-                submodule.scale_weight.data = submodule.scale_weight.data.to(device, non_blocking=non_blocking)
+                if not (should_skip_trainable and submodule.scale_weight.requires_grad):
+                    submodule.scale_weight.data = submodule.scale_weight.data.to(device, non_blocking=non_blocking)
             continue
         
         # For non-linear modules, we only move its DIRECT parameters/buffers to avoid recursing into Linear children
         for param in submodule.parameters(recurse=False):
             if param.device != device:
-                param.data = param.data.to(device, non_blocking=non_blocking)
+                if not (should_skip_trainable and param.requires_grad):
+                    param.data = param.data.to(device, non_blocking=non_blocking)
         for buf in submodule.buffers(recurse=False):
             if buf.device != device:
                 buf.data = buf.data.to(device, non_blocking=non_blocking)
@@ -124,6 +159,11 @@ class BasicAVTransformerBlock(torch.nn.Module):
 
         self.norm_eps = norm_eps
 
+    def enable_gradient_checkpointing(self, activation_cpu_offloading: bool = False, weight_cpu_offloading: bool = False) -> None:
+        self.gradient_checkpointing = True
+        self.activation_cpu_offloading = activation_cpu_offloading
+        self.weight_cpu_offloading = weight_cpu_offloading
+
     def get_ada_values(
         self, scale_shift_table: torch.Tensor, batch_size: int, timestep, indices: slice, num_tokens: int = None
     ) -> tuple[torch.Tensor, ...]:
@@ -197,7 +237,137 @@ class BasicAVTransformerBlock(torch.nn.Module):
 
         return (*scale_shift_chunks, *gate_ada_values)
 
-    def forward(  # noqa: PLR0915
+    def forward(
+        self,
+        video: TransformerArgs | None,
+        audio: TransformerArgs | None,
+        perturbations: BatchedPerturbationConfig | None = None,
+    ) -> tuple[TransformerArgs | None, TransformerArgs | None]:
+        if self.training and self.gradient_checkpointing:
+            # Define load and offload functions for this block
+            def load_weights(b, d):
+                weighs_to_device(b, d)
+                # Move non-linear params (RMSNorm, etc.) and FP8/LoRA modules
+                _move_non_linear_params(b, d)
+                ensure_fp8_modules_on_device(b, d)
+                # Manually move scale_shift tables as weighs_to_device only targets Linear layers
+                # and these are Parameters of the block itself.
+                for attr in [
+                    "scale_shift_table",
+                    "audio_scale_shift_table",
+                    "scale_shift_table_a2v_ca_audio",
+                    "scale_shift_table_a2v_ca_video",
+                ]:
+                    p = getattr(b, attr, None)
+                    if p is not None:
+                        # Skip if already on device to avoid overhead
+                        if p.device != d:
+                            p.data = p.data.to(d, non_blocking=True)
+            
+            def offload_weights(b, d):
+                cpu_device = torch.device("cpu")
+                # When offloading to CPU, we should also move these tables back
+                # Reuse the same logic but targeting CPU (d)
+                weighs_to_device(b, d)
+                for attr in [
+                    "scale_shift_table",
+                    "audio_scale_shift_table",
+                    "scale_shift_table_a2v_ca_audio",
+                    "scale_shift_table_a2v_ca_video",
+                ]:
+                    p = getattr(b, attr, None)
+                    if p is not None:
+                        if p.device != d:
+                            p.data = p.data.to(d, non_blocking=True)
+                _move_non_linear_params(b, cpu_device)
+                ensure_fp8_modules_on_device(b, cpu_device)
+
+            # Prepare arguments for checkpointing (both standard and block-level need flattened tensors)
+            video_vals, video_none = _unpack_transformer_args(video)
+            audio_vals, audio_none = _unpack_transformer_args(audio)
+            vid_len = len(video_vals)
+
+            def checkpoint_wrapper(*inputs):
+                v_vals = list(inputs[:vid_len])
+                a_vals = list(inputs[vid_len:])
+                v_args = _reconstruct_transformer_args(v_vals, video_none)
+                a_args = _reconstruct_transformer_args(a_vals, audio_none)
+                return self._forward(v_args, a_args, perturbations)
+
+            flat_inputs = tuple(video_vals + audio_vals)
+
+            if self.weight_cpu_offloading or self.activation_cpu_offloading:
+                # Determine offloading hooks based on configuration
+                load_fn = load_weights if self.weight_cpu_offloading else None
+                offload_fn = offload_weights if self.weight_cpu_offloading else None
+
+                # Use custom block checkpointing
+                # With our updated block_checkpoint, this will:
+                # 1. Offload all tensor inputs in flat_inputs to CPU
+                # 2. Re-load them to GPU during backward
+                # 3. Handle weight offloading hooks if provided
+                # 4. Return TENSORS (because autograd strips objects)
+                
+                outputs = block_checkpoint(
+                    checkpoint_wrapper,
+                    *flat_inputs,
+                    block=self,
+                    load_fn=load_fn,
+                    offload_fn=offload_fn,
+                )
+                
+                # Reconstruct TransformerArgs from returned tensors
+                # block_checkpoint/autograd returns a tuple of tensors.
+                # output structure corresponds to what checkpoint_wrapper returns.
+                # wrapper returns self._forward -> (video_out, audio_out)
+                # each is TransformerArgs which has .x tensor.
+                # So outputs will correspond to (video_out.x, audio_out.x) 
+                
+                # Note: BlockCheckpointFunction logic flattens outputs. 
+                # If _forward returns (v, a), and v.x is tensor, a.x is tensor/None...
+                # We need to ensure we map them back correctly.
+                
+                # Let's peek at expected returns of _forward: tuple[TransformerArgs|None, TransformerArgs|None]
+                # If audio is None, we get (v, None).
+                
+                # Check if outputs are already TransformerArgs (No-Grad path returns objects directly)
+                is_obj = False
+                if len(outputs) > 0 and isinstance(outputs[0], TransformerArgs):
+                    is_obj = True
+                elif len(outputs) > 1 and isinstance(outputs[1], TransformerArgs):
+                    is_obj = True
+                
+                if is_obj:
+                    # In no-grad mode, block_checkpoint returns the objects directly
+                    return outputs
+
+                # Re-wrapping logic for Tensors (Grad path):
+                res_v_x = outputs[0] if len(outputs) > 0 else None
+                res_a_x = outputs[1] if len(outputs) > 1 else None
+                
+                out_video = None
+                if video is not None:
+                     # Use dataclasses.replace to create new object with updated x
+                     if isinstance(res_v_x, torch.Tensor):
+                         out_video = replace(video, x=res_v_x)
+                     else:
+                         out_video = video
+                
+                out_audio = None
+                if audio is not None:
+                     if res_a_x is not None and isinstance(res_a_x, torch.Tensor):
+                         out_audio = replace(audio, x=res_a_x)
+                     else:
+                         out_audio = audio
+                      
+                return out_video, out_audio
+            else:
+                # Standard gradient checkpointing
+                return checkpoint.checkpoint(checkpoint_wrapper, *flat_inputs, use_reentrant=False, determinism_check="none")
+        
+        return self._forward(video, audio, perturbations)
+
+    def _forward(  # noqa: PLR0915
         self,
         video: TransformerArgs | None,
         audio: TransformerArgs | None,
@@ -355,5 +525,13 @@ class BasicAVTransformerBlock(torch.nn.Module):
             ax = ax + self.audio_ff(ax_scaled) * agate_mlp
 
             del ashift_mlp, ascale_mlp, agate_mlp
+
+        # Offload weights to CPU at the end of _forward.
+        # This runs during forward pass. During backward, the backward hook handles offloading.
+        if self.activation_cpu_offloading:
+            cpu_device = torch.device("cpu")
+            weighs_to_device(self, cpu_device)
+            _move_non_linear_params(self, cpu_device)
+            ensure_fp8_modules_on_device(self, cpu_device)
 
         return replace(video, x=vx) if video is not None else None, replace(audio, x=ax) if audio is not None else None

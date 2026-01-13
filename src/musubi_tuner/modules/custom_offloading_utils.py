@@ -58,14 +58,40 @@ def swap_weight_devices_no_cuda(device: torch.device, layer_to_cpu: nn.Module, l
     _synchronize_device(device)
 
 
-def weighs_to_device(layer: nn.Module, device: torch.device):
+def weighs_to_device(layer: nn.Module, device: torch.device, skip_trainable: bool = True):
+    """Move layer weights to device.
+    
+    Args:
+        layer: Module to process
+        device: Target device
+        skip_trainable: If True AND target is CPU, skip parameters with requires_grad=True
+                        (e.g., LoRA weights need to stay on GPU for optimizer)
+    """
     non_blocking = device.type != "cpu"
+    # Only skip trainable parameters when moving TO CPU (offloading), not when loading TO GPU
+    should_skip_trainable = skip_trainable and device.type == "cpu"
+    
     for module in layer.modules():
         if module.__class__.__name__.endswith("Linear"):
             for attr in ["weight", "bias", "scale_weight"]:
                 p = getattr(module, attr, None)
                 if p is not None and isinstance(p, (torch.Tensor, torch.nn.Parameter)):
+                    # Skip trainable parameters only when offloading to CPU
+                    if should_skip_trainable and hasattr(p, 'requires_grad') and p.requires_grad:
+                        continue
                     p.data = p.data.to(device, non_blocking=non_blocking)
+            
+            # LoRA Handling for monkey-patched modules
+            # Skip LoRA modules only when offloading to CPU
+            if should_skip_trainable:
+                continue
+            forward_self = getattr(getattr(module, "forward", None), "__self__", None)
+            if forward_self is not None and forward_self is not module:
+                for lora_name in ["lora_down", "lora_up"]:
+                    lora_mod = getattr(forward_self, lora_name, None)
+                    if isinstance(lora_mod, torch.nn.Module):
+                        lora_mod.to(device)
+
 
 
 def params_to_device(layer: nn.Module, device: torch.device, include_norms: bool = False):
@@ -208,6 +234,26 @@ class Offloader:
                     # Fallback: if no counterpart for this module/attribute, ensure it's on the target device
                     if cuda_param.device.type != device.type:
                         cuda_param.data = cuda_param.data.to(device)
+
+                # LoRA Handling for monkey-patched modules
+                if module_to_cpu is not None:
+                    cuda_forward_self = getattr(getattr(module_to_cuda, "forward", None), "__self__", None)
+                    cpu_forward_self = getattr(getattr(module_to_cpu, "forward", None), "__self__", None)
+
+                    if cuda_forward_self is not None and cuda_forward_self is not module_to_cuda and cpu_forward_self is not None:
+                        for lora_name in ["lora_down", "lora_up"]:
+                            cuda_lora = getattr(cuda_forward_self, lora_name, None)
+                            cpu_lora = getattr(cpu_forward_self, lora_name, None)
+
+                            if isinstance(cuda_lora, torch.nn.Module) and isinstance(cpu_lora, torch.nn.Module):
+                                for attr_name_lora in ["weight", "bias"]:
+                                    cuda_p = getattr(cuda_lora, attr_name_lora, None)
+                                    cpu_p = getattr(cpu_lora, attr_name_lora, None)
+
+                                    if hasattr(cuda_p, "data") and hasattr(cpu_p, "data"):
+                                        weight_swap_jobs.append(
+                                            (cpu_lora, cuda_lora, cpu_p.data, cuda_p.data, attr_name_lora)
+                                        )
 
         with T.section("synchronize before swap"):
             torch.cuda.current_stream().synchronize()  # this prevents the illegal loss value by ensuring offloading layer's calculation is done
@@ -357,7 +403,7 @@ class Offloader:
 
             dev = self.device.index if self.device.index is not None else torch.cuda.current_device()
             torch.cuda.set_device(dev)
-
+            
             sync_event = self.swap_weight_devices(block_to_cpu, block_to_cuda)
 
             if self.debug:

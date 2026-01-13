@@ -406,15 +406,24 @@ class LTXModel(torch.nn.Module):
             enable: Whether to enable gradient checkpointing
         """
         self._enable_gradient_checkpointing = enable
+        # Note: If simply toggling enable, we don't change offloading status
+        # But for safety/simplicity we can update blocks with current state
+        offload = getattr(self, "activation_cpu_offloading", False)
+        for block in self.transformer_blocks:
+             if enable:
+                 block.enable_gradient_checkpointing(offload)
+             else:
+                 block.gradient_checkpointing = False
+                 block.activation_cpu_offloading = False
 
-    def enable_gradient_checkpointing(self, activation_cpu_offloading: bool = False) -> None:
-        self.set_gradient_checkpointing(True)
-        self.activation_cpu_offloading = activation_cpu_offloading
-        _disable_checkpoint_determinism_check()
+    # NOTE: enable_gradient_checkpointing is defined later in the file with extended signature
 
     def disable_gradient_checkpointing(self) -> None:
         self.set_gradient_checkpointing(False)
         self.activation_cpu_offloading = False
+        for block in self.transformer_blocks:
+            block.gradient_checkpointing = False
+            block.activation_cpu_offloading = False
 
     def enable_block_swap(
         self,
@@ -521,7 +530,7 @@ class LTXModel(torch.nn.Module):
         audio: TransformerArgs | None,
         perturbations: BatchedPerturbationConfig,
     ) -> tuple[TransformerArgs, TransformerArgs]:
-        """Process transformer blocks for LTXAV."""
+        """Process transformer blocks with optional offloading and block swapping."""
 
         swap_manager = self._ltx2_block_swap
         swap_active = False
@@ -542,85 +551,33 @@ class LTXModel(torch.nn.Module):
             if video is not None and isinstance(video.x, torch.Tensor):
                 _clean_memory_on_device(video.x.device)
 
+        gpu_device = None
+        if video is not None and isinstance(video.x, torch.Tensor):
+            gpu_device = video.x.device
+        elif audio is not None and isinstance(audio.x, torch.Tensor):
+            gpu_device = audio.x.device
+            
+        cpu_device = torch.device("cpu")
+
+        # If offloading is enabled, move initial inputs to CPU so the first block's checkpoint saves CPU tensors
+        if self.activation_cpu_offloading and self.training:
+            video = _move_transformer_args(video, cpu_device)
+            audio = _move_transformer_args(audio, cpu_device)
+
         # Process transformer blocks
         for block_idx, block in enumerate(self.transformer_blocks):
-            if swap_active and swap_manager is not None and swap_manager.is_managed_block(block_idx):
-                swap_manager.stream_in(block, compute_device)
-
-            if self.blocks_to_swap and self.offloader is not None:
+            if self.blocks_to_swap > 0 and self.offloader is not None:
                 self.offloader.wait_for_block(block_idx)
-
-            gpu_device = None
-            if self.offloader is not None:
-                gpu_device = self.offloader.device
-            elif swap_active and compute_device is not None:
-                gpu_device = compute_device
-            elif video is not None and isinstance(video.x, torch.Tensor):
-                gpu_device = video.x.device
-            elif audio is not None and isinstance(audio.x, torch.Tensor):
-                gpu_device = audio.x.device
-
-            if (
-                self.activation_cpu_offloading
-                and self.training
-                and gpu_device is not None
-                and gpu_device.type != "cpu"
+            elif (
+                self.blocks_to_swap > 0
+                and self._ltx2_block_swap is not None
+                and block_idx in self._ltx2_block_swap.block_indices
             ):
-                cpu_device = torch.device("cpu")
-                
-                # Move inputs to GPU (they might be on CPU from previous block's offload)
-                video = _move_transformer_args(video, gpu_device)
-                audio = _move_transformer_args(audio, gpu_device)
-                
-                # Ensure block params are on GPU
-                _move_non_linear_params(block, gpu_device)
-                ensure_fp8_modules_on_device(block, gpu_device)
-                
-                if self._enable_gradient_checkpointing:
-                    # Run block with gradient checkpointing
-                    video, audio = torch.utils.checkpoint.checkpoint(
-                        block,
-                        video,
-                        audio,
-                        perturbations,
-                        use_reentrant=False,
-                        determinism_check="none",
-                    )
-                else:
-                    video, audio = block(
-                        video=video,
-                        audio=audio,
-                        perturbations=perturbations,
-                    )
-                
-                # Move outputs to CPU after block completes to save GPU memory
-                video = _move_transformer_args(video, cpu_device)
-                audio = _move_transformer_args(audio, cpu_device)
-            else:
-                target_device = None
-                if video is not None and isinstance(video.x, torch.Tensor):
-                    target_device = video.x.device
-                elif audio is not None and isinstance(audio.x, torch.Tensor):
-                    target_device = audio.x.device
-                if target_device is not None:
-                    _move_non_linear_params(block, target_device)
-                    ensure_fp8_modules_on_device(block, target_device)
+                self._ltx2_block_swap.param_swap(block_idx)
 
-                if self._enable_gradient_checkpointing and self.training:
-                    video, audio = torch.utils.checkpoint.checkpoint(
-                        block,
-                        video,
-                        audio,
-                        perturbations,
-                        use_reentrant=False,
-                        determinism_check="none",
-                    )
-                else:
-                    video, audio = block(
-                        video=video,
-                        audio=audio,
-                        perturbations=perturbations,
-                    )
+             # Execute block (it now handles checkpointing internally)
+            # If offloading is on, block expects CPU inputs (for checkpoint savings) and returns CPU outputs
+            video, audio = block(video, audio, perturbations)
 
             if swap_active and swap_manager is not None and swap_manager.is_managed_block(block_idx):
                 swap_manager.stream_out(block)
@@ -664,6 +621,23 @@ class LTXModel(torch.nn.Module):
         x = x_32.to(x.dtype)
         x = proj_out(x)
         return x
+
+    def enable_gradient_checkpointing(self, activation_cpu_offloading: bool = False, weight_cpu_offloading: bool = False) -> None:
+        """
+        Enable gradient checkpointing with optional CPU offloading.
+        
+        Args:
+            activation_cpu_offloading: If True, offload activations to CPU (save memory).
+            weight_cpu_offloading: If True, use block-level weight offloading (ultra-low VRAM).
+        """
+        self._enable_gradient_checkpointing = True
+        self.activation_cpu_offloading = activation_cpu_offloading
+        self.weight_cpu_offloading = weight_cpu_offloading
+        _disable_checkpoint_determinism_check()
+        
+        for block in self.transformer_blocks:
+            if hasattr(block, "enable_gradient_checkpointing"):
+                block.enable_gradient_checkpointing(activation_cpu_offloading, weight_cpu_offloading)
 
     def forward(
         self, video: Modality | None, audio: Modality | None, perturbations: BatchedPerturbationConfig
