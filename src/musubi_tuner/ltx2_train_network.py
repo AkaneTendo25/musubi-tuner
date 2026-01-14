@@ -1754,36 +1754,51 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 transformer.to("cpu")
                 clean_memory_on_device(accelerator.device)
 
-        def prepare_embeddings_for_sample(sample_parameter: Dict) -> None:
-            if sample_parameter.get("prompt_embeds") is not None:
-                return
-            text_encoder_dtype = self._build_text_encoder(args, accelerator)
-            logger.info("Sampling offload: loaded text encoder for prompt embeds")
-            prompt_text = sample_parameter.get("prompt", "")
-            prompt_embeds, prompt_mask = self._encode_prompt_text(accelerator, prompt_text, text_encoder_dtype)
-            sample_parameter["prompt_embeds"] = prompt_embeds
-            sample_parameter["prompt_attention_mask"] = prompt_mask
-            negative_prompt = sample_parameter.get("negative_prompt", None)
-            if negative_prompt:
-                neg_embeds, neg_mask = self._encode_prompt_text(accelerator, negative_prompt, text_encoder_dtype)
-                sample_parameter["negative_prompt_embeds"] = neg_embeds
-                sample_parameter["negative_prompt_attention_mask"] = neg_mask
-            self._cleanup_text_encoder(accelerator)
-            logger.info("Sampling offload: unloaded text encoder after prompt embeds")
-            self._cleanup_cuda(accelerator.device)
-
         def cleanup_embeddings(sample_parameter: Dict) -> None:
             sample_parameter.pop("prompt_embeds", None)
             sample_parameter.pop("prompt_attention_mask", None)
             sample_parameter.pop("negative_prompt_embeds", None)
             sample_parameter.pop("negative_prompt_attention_mask", None)
 
+        def prepare_all_embeddings_batch(sample_params_list: List[Dict]) -> None:
+            """Load text encoder once and encode ALL prompts before unloading."""
+            # Check if any prompt needs embeddings
+            needs_encoding = any(p.get("prompt_embeds") is None for p in sample_params_list)
+            if not needs_encoding:
+                return
+
+            text_encoder_dtype = self._build_text_encoder(args, accelerator)
+            logger.info("Sampling batch: loaded text encoder for %d prompts", len(sample_params_list))
+
+            for sample_parameter in sample_params_list:
+                if sample_parameter.get("prompt_embeds") is not None:
+                    continue  # Already has embeddings
+
+                prompt_text = sample_parameter.get("prompt", "")
+                prompt_embeds, prompt_mask = self._encode_prompt_text(accelerator, prompt_text, text_encoder_dtype)
+                sample_parameter["prompt_embeds"] = prompt_embeds
+                sample_parameter["prompt_attention_mask"] = prompt_mask
+
+                negative_prompt = sample_parameter.get("negative_prompt", None)
+                if negative_prompt:
+                    neg_embeds, neg_mask = self._encode_prompt_text(accelerator, negative_prompt, text_encoder_dtype)
+                    sample_parameter["negative_prompt_embeds"] = neg_embeds
+                    sample_parameter["negative_prompt_attention_mask"] = neg_mask
+
+            self._cleanup_text_encoder(accelerator)
+            logger.info("Sampling batch: unloaded text encoder after encoding all prompts")
+            self._cleanup_cuda(accelerator.device)
+
         if distributed_state.num_processes <= 1:
+            # Batch encode all prompts upfront when offloading is enabled
+            if transformer_offloaded:
+                offload_transformer_if_needed()
+                prepare_all_embeddings_batch(sample_parameters)
+
             with torch.no_grad(), accelerator.autocast():
                 for sample_parameter in sample_parameters:
                     if transformer_offloaded:
                         offload_transformer_if_needed()
-                        prepare_embeddings_for_sample(sample_parameter)
                         vae_dtype = torch.float16 if args.vae_dtype is None else model_utils.str_to_dtype(args.vae_dtype)
                         logger.info("Sampling offload: loading VAE for sampling")
                         vae_for_sampling = self._load_vae_impl(args, vae_dtype=vae_dtype, vae_path=args.vae)
@@ -1792,7 +1807,6 @@ class LTX2NetworkTrainer(NetworkTrainer):
                             accelerator, args, transformer, dit_dtype, vae_for_sampling, save_dir, sample_parameter, epoch, steps
                         )
                         offload_transformer_if_needed()
-                        cleanup_embeddings(sample_parameter)
                         vae_for_sampling.to_device("cpu")
                         logger.info("Sampling offload: moved VAE back to CPU after sampling")
                         self._cleanup_cuda(accelerator.device)
@@ -1802,6 +1816,11 @@ class LTX2NetworkTrainer(NetworkTrainer):
                         )
                     clean_memory_on_device(accelerator.device)
                     self._cleanup_cuda(accelerator.device)
+
+            # Cleanup embeddings after all samples are done
+            if transformer_offloaded:
+                for sample_parameter in sample_parameters:
+                    cleanup_embeddings(sample_parameter)
         else:
             per_process_params = []
             for i in range(distributed_state.num_processes):
@@ -1809,10 +1828,16 @@ class LTX2NetworkTrainer(NetworkTrainer):
 
             with torch.no_grad():
                 with distributed_state.split_between_processes(per_process_params) as sample_parameter_lists:
-                    for sample_parameter in sample_parameter_lists[0]:
+                    my_sample_params = sample_parameter_lists[0]
+                    
+                    # Batch encode all prompts for this process upfront
+                    if transformer_offloaded:
+                        offload_transformer_if_needed()
+                        prepare_all_embeddings_batch(my_sample_params)
+
+                    for sample_parameter in my_sample_params:
                         if transformer_offloaded:
                             offload_transformer_if_needed()
-                            prepare_embeddings_for_sample(sample_parameter)
                             vae_dtype = torch.float16 if args.vae_dtype is None else model_utils.str_to_dtype(args.vae_dtype)
                             logger.info("Sampling offload: loading VAE for sampling")
                             vae_for_sampling = self._load_vae_impl(args, vae_dtype=vae_dtype, vae_path=args.vae)
@@ -1829,7 +1854,6 @@ class LTX2NetworkTrainer(NetworkTrainer):
                                 steps,
                             )
                             offload_transformer_if_needed()
-                            cleanup_embeddings(sample_parameter)
                             vae_for_sampling.to_device("cpu")
                             logger.info("Sampling offload: moved VAE back to CPU after sampling")
                             self._cleanup_cuda(accelerator.device)
@@ -1838,6 +1862,11 @@ class LTX2NetworkTrainer(NetworkTrainer):
                                 accelerator, args, transformer, dit_dtype, vae, save_dir, sample_parameter, epoch, steps
                             )
                         self._cleanup_cuda(accelerator.device)
+
+                    # Cleanup embeddings after all samples for this process
+                    if transformer_offloaded:
+                        for sample_parameter in my_sample_params:
+                            cleanup_embeddings(sample_parameter)
 
         torch.set_rng_state(rng_state)
         if cuda_rng_state is not None:
@@ -2349,11 +2378,13 @@ class LTX2NetworkTrainer(NetworkTrainer):
 
                 # Apply guidance if needed
                 if do_classifier_free_guidance:
+                    # Use cfg_scale for CFG when available, otherwise fall back to guidance_scale
+                    effective_cfg_scale = cfg_scale if cfg_scale is not None else guidance_scale
                     noise_uncond, noise_cond = video_pred.chunk(2)
-                    video_pred = noise_uncond + guidance_scale * (noise_cond - noise_uncond)
+                    video_pred = noise_uncond + effective_cfg_scale * (noise_cond - noise_uncond)
                     if audio_pred is not None:
                         audio_uncond, audio_cond = audio_pred.chunk(2)
-                        audio_pred = audio_uncond + guidance_scale * (audio_cond - audio_uncond)
+                        audio_pred = audio_uncond + effective_cfg_scale * (audio_cond - audio_uncond)
 
                 # Convert velocity prediction to x0 (denoised sample) using X0PredictionWrapper
                 video_pred = video_pred.to(dtype=latents.dtype)
