@@ -920,35 +920,6 @@ class LTX2NetworkTrainer(NetworkTrainer):
         return stats
 
     @staticmethod
-    def _collect_lora_modules(transformer) -> list:
-        try:
-            from musubi_tuner.networks.lora import LoRAModule
-        except Exception:
-            return []
-        modules = []
-        for module in transformer.modules():
-            if not isinstance(module, torch.nn.Linear):
-                continue
-            bound = getattr(module.forward, "__self__", None)
-            if bound is None or not isinstance(bound, LoRAModule):
-                continue
-            modules.append(bound)
-        return modules
-
-    @staticmethod
-    def _temporarily_disable_lora(lora_modules: list) -> list[float]:
-        prev = []
-        for mod in lora_modules:
-            prev.append(getattr(mod, "multiplier", 1.0))
-            mod.multiplier = 0.0
-        return prev
-
-    @staticmethod
-    def _restore_lora(lora_modules: list, prev: list[float]) -> None:
-        for mod, value in zip(lora_modules, prev):
-            mod.multiplier = value
-
-    @staticmethod
     def _override_attention_function(transformer, attention_function):
         from musubi_tuner.ltx_2.model.transformer.attention import Attention
 
@@ -2285,55 +2256,6 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 generator=generator,
             )
 
-        if getattr(args, "sample_lora_sanity_check", False) and sigmas.numel() > 0:
-            sigma = sigmas[0]
-            latent_model_input = torch.cat([latents, latents], dim=0) if do_classifier_free_guidance else latents
-            latent_model_input = latent_model_input.to(dtype=dit_dtype)
-            audio_model_input = None
-            if audio_latents is not None:
-                audio_model_input = (
-                    torch.cat([audio_latents, audio_latents], dim=0)
-                    if do_classifier_free_guidance
-                    else audio_latents
-                )
-                audio_model_input = audio_model_input.to(dtype=dit_dtype)
-            timestep_for_model = sigma.expand(latent_model_input.shape[0]).to(
-                device=transformer_device, dtype=dit_dtype
-            )
-            model_input = (
-                [latent_model_input, audio_model_input]
-                if self._audio_video and audio_model_input is not None
-                else latent_model_input
-            )
-            lora_modules = self._collect_lora_modules(transformer)
-            if lora_modules:
-                with torch.no_grad():
-                    pred_on = transformer(
-                        model_input,
-                        timestep=timestep_for_model.unsqueeze(1),
-                        context=prompt_embeds,
-                        attention_mask=prompt_mask,
-                        frame_rate=sample_parameter.get("frame_rate", 25),
-                        transformer_options={},
-                    )
-                    prev = self._temporarily_disable_lora(lora_modules)
-                    pred_off = transformer(
-                        model_input,
-                        timestep=timestep_for_model.unsqueeze(1),
-                        context=prompt_embeds,
-                        attention_mask=prompt_mask,
-                        frame_rate=sample_parameter.get("frame_rate", 25),
-                        transformer_options={},
-                    )
-                    self._restore_lora(lora_modules, prev)
-                if isinstance(pred_on, (list, tuple)):
-                    pred_on = pred_on[0]
-                    pred_off = pred_off[0]
-                delta = (pred_on - pred_off).abs().mean().item()
-                logger.info("Sampling LoRA delta check: mean|on-off|=%.6f", delta)
-            else:
-                logger.warning("Sampling LoRA delta check skipped: no LoRA modules found.")
-
         # Denoising loop using LTX-2 scheduler with sigmas
         with torch.no_grad():
             for step_idx in tqdm(range(len(sigmas) - 1), desc="LTX-2 preview", leave=False):
@@ -2650,11 +2572,7 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         action="store_true",
         help="Mux sample audio into the sample video (outputs *_av.mp4).",
     )
-    parser.add_argument(
-        "--sample_lora_sanity_check",
-        action="store_true",
-        help="Run a one-step LoRA on/off delta check during sampling.",
-    )
+
     parser.add_argument(
         "--sample_tiled_vae",
         action="store_true",
