@@ -326,19 +326,65 @@ LTX2_TARGET_REPLACE_MODULES = [
     "BasicAVTransformerBlock",
 ]
 
-# Default: attention layers only (matches official LTX-2 trainer defaults)
-# These patterns match attention projection layers inside BasicAVTransformerBlock:
-#   attn1.to_k, attn1.to_q, attn1.to_v, attn1.to_out.0 (video self-attention)
-#   attn2.to_k, attn2.to_q, attn2.to_v, attn2.to_out.0 (video cross-attention)
-#   audio_attn1.*, audio_attn2.* (audio attention)
-#   audio_to_video_attn.*, video_to_audio_attn.* (cross-modal attention)
-# To also train feed-forward layers, add patterns: r".*\.ff\..*", r".*\.audio_ff\..*"
-LTX2_DEFAULT_INCLUDE_PATTERNS = [
+# LoRA target presets for different training modes
+# These patterns match layers inside BasicAVTransformerBlock.
+#
+# Available modules (from official LTX-2 docs):
+#
+# VIDEO MODULES:
+#   - attn1.to_k, attn1.to_q, attn1.to_v, attn1.to_out.0  (video self-attention)
+#   - attn2.to_k, attn2.to_q, attn2.to_v, attn2.to_out.0  (video cross-attention to text)
+#   - ff.net.0.proj, ff.net.2                             (video feed-forward)
+#
+# AUDIO MODULES:
+#   - audio_attn1.to_k, audio_attn1.to_q, etc.            (audio self-attention)
+#   - audio_attn2.to_k, audio_attn2.to_q, etc.            (audio cross-attention to text)
+#   - audio_ff.net.0.proj, audio_ff.net.2                 (audio feed-forward)
+#
+# CROSS-MODAL MODULES:
+#   - audio_to_video_attn.to_k, etc.                      (audio-to-video cross-attention)
+#   - video_to_audio_attn.to_k, etc.                      (video-to-audio cross-attention)
+#
+# Using short patterns like "to_k" matches ALL attention modules across video, audio,
+# and cross-modal branches. This is the recommended approach for audio-video training.
+
+# t2v: Text-to-video (attention only)
+# Official LTX-2 trainer default. Trains all attention projections (Q, K, V, Out)
+# across video, audio, and cross-modal attention blocks.
+LTX2_INCLUDE_PATTERNS_T2V = [
     r".*\.to_k$",
     r".*\.to_q$",
     r".*\.to_v$",
     r".*\.to_out\.0$",
 ]
+
+# v2v: Video-to-video / IC-LoRA (attention + feed-forward)
+# Recommended for IC-LoRA and reference-based generation. Adds FFN layers
+# for more expressive capacity when learning from reference videos.
+LTX2_INCLUDE_PATTERNS_V2V = [
+    r".*\.to_k$",
+    r".*\.to_q$",
+    r".*\.to_v$",
+    r".*\.to_out\.0$",
+    r".*\.ff\.net\.0\.proj$",
+    r".*\.ff\.net\.2$",
+    r".*\.audio_ff\.net\.0\.proj$",
+    r".*\.audio_ff\.net\.2$",
+]
+
+# full: All linear layers in transformer blocks
+# Maximum expressiveness, but larger LoRA file and more VRAM usage.
+LTX2_INCLUDE_PATTERNS_FULL = None  # None means no filtering, all Linear layers matched
+
+# Mapping from preset name to include patterns
+LTX2_LORA_TARGET_PRESETS = {
+    "t2v": LTX2_INCLUDE_PATTERNS_T2V,
+    "v2v": LTX2_INCLUDE_PATTERNS_V2V,
+    "full": LTX2_INCLUDE_PATTERNS_FULL,
+}
+
+# Default preset (for backwards compatibility)
+LTX2_DEFAULT_INCLUDE_PATTERNS = LTX2_INCLUDE_PATTERNS_T2V
 
 
 def _build_exclude_patterns(raw_patterns: Optional[str], audio_video: bool = False) -> List[str]:  # noqa: ARG001
@@ -349,6 +395,18 @@ def _build_exclude_patterns(raw_patterns: Optional[str], audio_video: bool = Fal
     if not isinstance(patterns, list):
         raise ValueError("exclude_patterns must evaluate to a list")
     return patterns
+
+
+def _get_include_patterns_for_preset(preset: Optional[str]) -> Optional[List[str]]:
+    """Get include patterns for a given preset name."""
+    if preset is None:
+        return LTX2_DEFAULT_INCLUDE_PATTERNS
+    if preset not in LTX2_LORA_TARGET_PRESETS:
+        raise ValueError(
+            f"Unknown lora_target_preset: {preset!r}. "
+            f"Valid presets: {list(LTX2_LORA_TARGET_PRESETS.keys())}"
+        )
+    return LTX2_LORA_TARGET_PRESETS[preset]
 
 
 def create_arch_network(
@@ -366,8 +424,20 @@ def create_arch_network(
         audio_video = unet.__class__.__name__ == "LTXAVModel" or hasattr(unet, "audio_patchify_proj")
 
     kwargs["exclude_patterns"] = _build_exclude_patterns(kwargs.get("exclude_patterns"), audio_video=audio_video)
+
+    # Handle lora_target_preset: use preset patterns unless include_patterns is explicitly set
+    lora_target_preset = kwargs.pop("lora_target_preset", None)
     if kwargs.get("include_patterns") is None:
-        kwargs["include_patterns"] = LTX2_DEFAULT_INCLUDE_PATTERNS
+        preset_patterns = _get_include_patterns_for_preset(lora_target_preset)
+        kwargs["include_patterns"] = preset_patterns
+        if lora_target_preset is not None:
+            logger.info(f"Using LoRA target preset '{lora_target_preset}' with patterns: {preset_patterns}")
+    else:
+        if lora_target_preset is not None:
+            logger.warning(
+                f"Both lora_target_preset='{lora_target_preset}' and include_patterns are set. "
+                "Using explicit include_patterns, ignoring preset."
+            )
 
     net = lora.create_network(
         LTX2_TARGET_REPLACE_MODULES,

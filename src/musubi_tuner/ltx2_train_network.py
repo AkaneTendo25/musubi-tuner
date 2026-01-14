@@ -2538,6 +2538,19 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         help="Training modality.",
     )
     parser.add_argument(
+        "--lora_target_preset",
+        type=str,
+        default="t2v",
+        choices=["t2v", "v2v", "full"],
+        help=(
+            "LoRA target preset: "
+            "'t2v' = text-to-video (attention only, official default), "
+            "'v2v' = video-to-video/IC-LoRA (attention + feed-forward), "
+            "'full' = all linear layers. "
+            "Can be overridden by --network_args include_patterns=..."
+        ),
+    )
+    parser.add_argument(
         "--separate_audio_buckets",
         action="store_true",
         default=None,
@@ -2674,6 +2687,16 @@ def main() -> None:
 
     if args.vae_dtype is None:
         args.vae_dtype = "bfloat16"
+
+    # Inject lora_target_preset into network_args (LTX-2 specific)
+    lora_target_preset = getattr(args, "lora_target_preset", None)
+    if lora_target_preset is not None:
+        if args.network_args is None:
+            args.network_args = []
+        # Only add if not already specified in network_args
+        if not any(arg.startswith("lora_target_preset=") for arg in args.network_args):
+            args.network_args.append(f"lora_target_preset={lora_target_preset}")
+            logger.info(f"Using LoRA target preset: {lora_target_preset}")
 
     trainer = LTX2NetworkTrainer()
     trainer.train(args)

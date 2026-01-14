@@ -6,7 +6,7 @@ import torch.utils.checkpoint as checkpoint
 
 from musubi_tuner.utils.model_utils import create_cpu_offloading_wrapper
 from musubi_tuner.modules.custom_offloading_utils import weighs_to_device
-from musubi_tuner.modules.block_level_checkpointing import block_checkpoint
+from musubi_tuner.ltx_2.model.transformer.block_level_checkpointing import block_checkpoint
 from musubi_tuner.ltx_2.guidance.perturbations import BatchedPerturbationConfig, PerturbationType
 from musubi_tuner.ltx_2.model.transformer.adaln import AdaLayerNormSingle
 from musubi_tuner.ltx_2.model.transformer.attention import Attention, AttentionCallable, AttentionFunction
