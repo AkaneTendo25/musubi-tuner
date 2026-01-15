@@ -298,11 +298,11 @@ class Offloader:
                 if self.staging_buffer_a is None:
                     # Create staging buffer as pinned memory (as shared GPU ram). We specify device for correct pinning on multi-GPU systems
                     self.staging_buffer_a = [
-                        torch.empty_like(cuda_data_view, device="cpu").pin_memory(device=device)
+                        torch.empty_like(cuda_data_view, device="cpu")
                         for _, _, cuda_data_view, _, _ in weight_swap_jobs
                     ]
                     self.staging_buffer_b = [
-                        torch.empty_like(cuda_data_view, device="cpu").pin_memory(device=device)
+                        torch.empty_like(cuda_data_view, device="cpu")
                         for _, _, cuda_data_view, _, _ in weight_swap_jobs
                     ]
 

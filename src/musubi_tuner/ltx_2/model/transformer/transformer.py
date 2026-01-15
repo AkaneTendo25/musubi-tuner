@@ -158,6 +158,10 @@ class BasicAVTransformerBlock(torch.nn.Module):
             self.scale_shift_table_a2v_ca_video = torch.nn.Parameter(torch.empty(5, video.dim))
 
         self.norm_eps = norm_eps
+        self.gradient_checkpointing = False
+        self.activation_cpu_offloading = False
+        self.weight_cpu_offloading = False
+        self.use_pinned_memory = False
 
     def enable_gradient_checkpointing(self, activation_cpu_offloading: bool = False, weight_cpu_offloading: bool = False) -> None:
         self.gradient_checkpointing = True
@@ -496,14 +500,14 @@ class BasicAVTransformerBlock(torch.nn.Module):
         # This runs during forward pass. During backward, the backward hook handles offloading.
         if self.activation_cpu_offloading:
             cpu_device = torch.device("cpu")
-            weighs_to_device(self, cpu_device, use_pinned=True)
+            weighs_to_device(self, cpu_device, use_pinned=self.use_pinned_memory)
             _move_non_linear_params(self, cpu_device)
             ensure_fp8_modules_on_device(self, cpu_device)
 
         return replace(video, x=vx) if video is not None else None, replace(audio, x=ax) if audio is not None else None
 
     def _load_weights(self, b: torch.nn.Module, d: torch.device) -> None:
-        weighs_to_device(b, d, use_pinned=True)
+        weighs_to_device(b, d, use_pinned=self.use_pinned_memory)
         # Move non-linear params (RMSNorm, etc.) and FP8/LoRA modules
         _move_non_linear_params(b, d)
         ensure_fp8_modules_on_device(b, d)
@@ -525,7 +529,7 @@ class BasicAVTransformerBlock(torch.nn.Module):
         cpu_device = torch.device("cpu")
         # When offloading to CPU, we should also move these tables back
         # Reuse the same logic but targeting CPU (d)
-        weighs_to_device(b, d, use_pinned=True)
+        weighs_to_device(b, d, use_pinned=self.use_pinned_memory)
         for attr in [
             "scale_shift_table",
             "audio_scale_shift_table",
