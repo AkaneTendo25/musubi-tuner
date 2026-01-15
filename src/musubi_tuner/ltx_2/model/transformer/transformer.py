@@ -244,43 +244,9 @@ class BasicAVTransformerBlock(torch.nn.Module):
         perturbations: BatchedPerturbationConfig | None = None,
     ) -> tuple[TransformerArgs | None, TransformerArgs | None]:
         if self.training and self.gradient_checkpointing:
-            # Define load and offload functions for this block
-            def load_weights(b, d):
-                weighs_to_device(b, d)
-                # Move non-linear params (RMSNorm, etc.) and FP8/LoRA modules
-                _move_non_linear_params(b, d)
-                ensure_fp8_modules_on_device(b, d)
-                # Manually move scale_shift tables as weighs_to_device only targets Linear layers
-                # and these are Parameters of the block itself.
-                for attr in [
-                    "scale_shift_table",
-                    "audio_scale_shift_table",
-                    "scale_shift_table_a2v_ca_audio",
-                    "scale_shift_table_a2v_ca_video",
-                ]:
-                    p = getattr(b, attr, None)
-                    if p is not None:
-                        # Skip if already on device to avoid overhead
-                        if p.device != d:
-                            p.data = p.data.to(d, non_blocking=True)
-            
-            def offload_weights(b, d):
-                cpu_device = torch.device("cpu")
-                # When offloading to CPU, we should also move these tables back
-                # Reuse the same logic but targeting CPU (d)
-                weighs_to_device(b, d)
-                for attr in [
-                    "scale_shift_table",
-                    "audio_scale_shift_table",
-                    "scale_shift_table_a2v_ca_audio",
-                    "scale_shift_table_a2v_ca_video",
-                ]:
-                    p = getattr(b, attr, None)
-                    if p is not None:
-                        if p.device != d:
-                            p.data = p.data.to(d, non_blocking=True)
-                _move_non_linear_params(b, cpu_device)
-                ensure_fp8_modules_on_device(b, cpu_device)
+            # Define load and offload functions for this block (proxies to class methods)
+            load_weights = self._load_weights
+            offload_weights = self._offload_weights
 
             # Prepare arguments for checkpointing (both standard and block-level need flattened tensors)
             video_vals, video_none = _unpack_transformer_args(video)
@@ -530,8 +496,48 @@ class BasicAVTransformerBlock(torch.nn.Module):
         # This runs during forward pass. During backward, the backward hook handles offloading.
         if self.activation_cpu_offloading:
             cpu_device = torch.device("cpu")
-            weighs_to_device(self, cpu_device)
+            weighs_to_device(self, cpu_device, use_pinned=True)
             _move_non_linear_params(self, cpu_device)
             ensure_fp8_modules_on_device(self, cpu_device)
 
         return replace(video, x=vx) if video is not None else None, replace(audio, x=ax) if audio is not None else None
+
+    def _load_weights(self, b: torch.nn.Module, d: torch.device) -> None:
+        weighs_to_device(b, d, use_pinned=True)
+        # Move non-linear params (RMSNorm, etc.) and FP8/LoRA modules
+        _move_non_linear_params(b, d)
+        ensure_fp8_modules_on_device(b, d)
+        # Manually move scale_shift tables as weighs_to_device only targets Linear layers
+        # and these are Parameters of the block itself.
+        for attr in [
+            "scale_shift_table",
+            "audio_scale_shift_table",
+            "scale_shift_table_a2v_ca_audio",
+            "scale_shift_table_a2v_ca_video",
+        ]:
+            p = getattr(b, attr, None)
+            if p is not None:
+                # Skip if already on device to avoid overhead
+                if p.device != d:
+                    p.data = p.data.to(d, non_blocking=True)
+
+    def _offload_weights(self, b: torch.nn.Module, d: torch.device) -> None:
+        cpu_device = torch.device("cpu")
+        # When offloading to CPU, we should also move these tables back
+        # Reuse the same logic but targeting CPU (d)
+        weighs_to_device(b, d, use_pinned=True)
+        for attr in [
+            "scale_shift_table",
+            "audio_scale_shift_table",
+            "scale_shift_table_a2v_ca_audio",
+            "scale_shift_table_a2v_ca_video",
+        ]:
+            p = getattr(b, attr, None)
+            if p is not None:
+                if p.device != d:
+                    if d.type == "cpu":
+                        p.data = p.data.to(d, non_blocking=True).pin_memory()
+                    else:
+                        p.data = p.data.to(d, non_blocking=True)
+        _move_non_linear_params(b, cpu_device)
+        ensure_fp8_modules_on_device(b, cpu_device)

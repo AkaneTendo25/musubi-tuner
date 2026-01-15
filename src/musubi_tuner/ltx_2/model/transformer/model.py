@@ -564,8 +564,23 @@ class LTXModel(torch.nn.Module):
             video = _move_transformer_args(video, cpu_device)
             audio = _move_transformer_args(audio, cpu_device)
 
+        # Async Stream Setup (Phase 2)
+        if not hasattr(self, "_transfer_stream"):
+            # Create stream on GPU device if available
+            self._transfer_stream = torch.cuda.Stream(device=gpu_device)
+        transfer_stream = self._transfer_stream
+        
+        target_device = gpu_device if gpu_device else torch.device("cuda")
+
         # Process transformer blocks
         for block_idx, block in enumerate(self.transformer_blocks):
+            # Phase 2: Wait for prefetch (if active)
+            # If previous block triggered prefetch for this block, wait for it here.
+            # Using wait_stream ensures kernels submitted to compute stream (block execution)
+            # will wait for transfers submitted to transfer stream to complete.
+            if getattr(block, "weight_cpu_offloading", False):
+                torch.cuda.current_stream().wait_stream(transfer_stream)
+
             if self.blocks_to_swap > 0 and self.offloader is not None:
                 self.offloader.wait_for_block(block_idx)
             elif (
@@ -575,8 +590,20 @@ class LTXModel(torch.nn.Module):
             ):
                 self._ltx2_block_swap.param_swap(block_idx)
 
-             # Execute block (it now handles checkpointing internally)
-            # If offloading is on, block expects CPU inputs (for checkpoint savings) and returns CPU outputs
+            # Phase 2: Prefetch Next Block
+            # Trigger load for N+1 on Transfer Stream while N is about to compute
+            if getattr(block, "weight_cpu_offloading", False) and block_idx + 1 < len(self.transformer_blocks):
+                 next_block = self.transformer_blocks[block_idx + 1]
+                 # Only prefetch if next block also wants it
+                 if getattr(next_block, "weight_cpu_offloading", False):
+                      with torch.cuda.stream(transfer_stream):
+                          # Safe to call because it checks p.device internally
+                          # If already loaded, it's a fast no-op.
+                          # If on CPU, it triggers H2D copy.
+                          next_block._load_weights(next_block, target_device)
+
+             # Execute block (it now handles checkpointing i.e. load/compute/offload)
+             # If offloading is on, block expects CPU inputs (for checkpoint savings) and returns CPU outputs
             video, audio = block(video, audio, perturbations)
 
             if swap_active and swap_manager is not None and swap_manager.is_managed_block(block_idx):

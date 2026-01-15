@@ -58,14 +58,17 @@ def swap_weight_devices_no_cuda(device: torch.device, layer_to_cpu: nn.Module, l
     _synchronize_device(device)
 
 
-def weighs_to_device(layer: nn.Module, device: torch.device, skip_trainable: bool = True):
+# Cache for pinned buffers to avoid reallocation overhead: {param_id: pinned_tensor}
+_pinned_buffer_cache = {}
+
+def weighs_to_device(layer: nn.Module, device: torch.device, skip_trainable: bool = True, use_pinned: bool = False):
     """Move layer weights to device.
     
     Args:
         layer: Module to process
         device: Target device
         skip_trainable: If True AND target is CPU, skip parameters with requires_grad=True
-                        (e.g., LoRA weights need to stay on GPU for optimizer)
+        use_pinned: If True and target is CPU, use cached pinned memory.
     """
     non_blocking = device.type != "cpu"
     # Only skip trainable parameters when moving TO CPU (offloading), not when loading TO GPU
@@ -79,10 +82,21 @@ def weighs_to_device(layer: nn.Module, device: torch.device, skip_trainable: boo
                     # Skip trainable parameters only when offloading to CPU
                     if should_skip_trainable and hasattr(p, 'requires_grad') and p.requires_grad:
                         continue
-                    p.data = p.data.to(device, non_blocking=non_blocking)
+                    
+                    if use_pinned and device.type == "cpu":
+                        # Reuse or allocate pinned buffer
+                        pid = id(p)
+                        if pid not in _pinned_buffer_cache:
+                            # Allocate new pinned buffer
+                            _pinned_buffer_cache[pid] = torch.empty_like(p, device="cpu", pin_memory=True)
+                        
+                        target_buffer = _pinned_buffer_cache[pid]
+                        target_buffer.copy_(p.data, non_blocking=non_blocking)
+                        p.data = target_buffer
+                    else:
+                        p.data = p.data.to(device, non_blocking=non_blocking)
             
             # LoRA Handling for monkey-patched modules
-            # Skip LoRA modules only when offloading to CPU
             if should_skip_trainable:
                 continue
             forward_self = getattr(getattr(module, "forward", None), "__self__", None)
@@ -94,13 +108,14 @@ def weighs_to_device(layer: nn.Module, device: torch.device, skip_trainable: boo
 
 
 
-def params_to_device(layer: nn.Module, device: torch.device, include_norms: bool = False):
+def params_to_device(layer: nn.Module, device: torch.device, include_norms: bool = False, use_pinned: bool = False):
     """Move module parameters to device, optionally including normalization layers.
     
     Args:
         layer: Module to process
         device: Target device
         include_norms: If True, also move RMSNorm/LayerNorm weights (more VRAM savings, more overhead)
+        use_pinned: If True and target is CPU, pin memory. If target is GPU, assumes source is pinned for async transfer.
     """
     non_blocking = device.type != "cpu"
     
@@ -115,14 +130,32 @@ def params_to_device(layer: nn.Module, device: torch.device, include_norms: bool
             for attr in ["weight", "bias", "scale_weight"]:
                 p = getattr(module, attr, None)
                 if p is not None and isinstance(p, (torch.Tensor, torch.nn.Parameter)):
-                    p.data = p.data.to(device, non_blocking=non_blocking)
+                    if device.type == "cpu" and use_pinned:
+                        # Reuse or allocate pinned buffer
+                        pid = id(p)
+                        if pid not in _pinned_buffer_cache:
+                            _pinned_buffer_cache[pid] = torch.empty_like(p, device="cpu", pin_memory=True)
+                        target_buffer = _pinned_buffer_cache[pid]
+                        target_buffer.copy_(p.data, non_blocking=non_blocking)
+                        p.data = target_buffer
+                    else:
+                        p.data = p.data.to(device, non_blocking=non_blocking)
         
         # Normalization layers (if enabled)
         elif include_norms and class_name.endswith(norm_patterns):
             for attr in ["weight", "bias"]:
                 p = getattr(module, attr, None)
                 if p is not None and isinstance(p, (torch.Tensor, torch.nn.Parameter)):
-                    p.data = p.data.to(device, non_blocking=non_blocking)
+                    if device.type == "cpu" and use_pinned:
+                        # Reuse or allocate pinned buffer
+                        pid = id(p)
+                        if pid not in _pinned_buffer_cache:
+                            _pinned_buffer_cache[pid] = torch.empty_like(p, device="cpu", pin_memory=True)
+                        target_buffer = _pinned_buffer_cache[pid]
+                        target_buffer.copy_(p.data, non_blocking=non_blocking)
+                        p.data = target_buffer
+                    else:
+                        p.data = p.data.to(device, non_blocking=non_blocking)
 
 
 class Offloader:

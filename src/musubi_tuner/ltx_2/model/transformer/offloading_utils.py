@@ -227,18 +227,18 @@ class LTX2ModelOffloader(ModelOffloader):
         split_idx = max(0, self.num_blocks - self.blocks_to_swap)
         for block in blocks[0 : split_idx]:
             block.to(self.device)
-            weighs_to_device(block, self.device)
+            weighs_to_device(block, self.device, use_pinned=True)
 
         cpu_device = torch.device("cpu")
         for block in blocks[split_idx :]:
             if self.swap_norms:
                 # Move whole block to GPU, then swap Linear AND norm weights to CPU
                 block.to(self.device)
-                params_to_device(block, cpu_device, include_norms=True)
+                params_to_device(block, cpu_device, include_norms=True, use_pinned=True)
             else:
                 # Original behavior: Move whole block to GPU, only swap Linear weights
                 block.to(self.device)
-                weighs_to_device(block, cpu_device)
+                weighs_to_device(block, cpu_device, use_pinned=True)
 
         _synchronize_device(self.device)
         _clean_memory_on_device(self.device)
