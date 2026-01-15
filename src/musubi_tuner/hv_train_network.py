@@ -1290,6 +1290,10 @@ class NetworkTrainer:
 
         self.default_guidance_scale = 6.0
 
+    def post_save_checkpoint_hook(self, args, ckpt_file, ckpt_name, accelerator, force_sync_upload=False):
+        """Hook called after checkpoint is saved. Override in subclasses for architecture-specific processing."""
+        pass
+
     @property
     def i2v_training(self) -> bool:
         return self._i2v_training
@@ -1847,10 +1851,18 @@ class NetworkTrainer:
             accelerator.print(f"load network weights from {args.network_weights}: {info}")
 
         if args.gradient_checkpointing:
+            blocks_to_ckpt = getattr(args, "blocks_to_checkpoint", -1)
             if getattr(args, "blockwise_checkpointing", False):
-                transformer.enable_gradient_checkpointing(args.gradient_checkpointing_cpu_offload, weight_cpu_offloading=True)
+                transformer.enable_gradient_checkpointing(
+                    args.gradient_checkpointing_cpu_offload, 
+                    weight_cpu_offloading=True,
+                    blocks_to_checkpoint=blocks_to_ckpt
+                )
             else:
-                transformer.enable_gradient_checkpointing(args.gradient_checkpointing_cpu_offload)
+                transformer.enable_gradient_checkpointing(
+                    args.gradient_checkpointing_cpu_offload,
+                    blocks_to_checkpoint=blocks_to_ckpt
+                )
             network.enable_gradient_checkpointing()  # may have no effect
 
         # prepare optimizer, data loader etc.
@@ -2140,6 +2152,10 @@ class NetworkTrainer:
             metadata_to_save.update(sai_metadata)
 
             unwrapped_nw.save_weights(ckpt_file, save_dtype, metadata_to_save)
+
+            # Call post-save hook for architecture-specific processing
+            self.post_save_checkpoint_hook(args, ckpt_file, ckpt_name, accelerator, force_sync_upload)
+
             if args.huggingface_repo_id is not None:
                 huggingface_utils.upload(args, ckpt_file, "/" + ckpt_name, force_sync_upload=force_sync_upload)
 

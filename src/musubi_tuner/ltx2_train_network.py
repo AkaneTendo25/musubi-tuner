@@ -538,6 +538,25 @@ class LTX2NetworkTrainer(NetworkTrainer):
         """LTX-2 doesn't currently support control conditioning"""
         return False
 
+    def post_save_checkpoint_hook(self, args, ckpt_file, ckpt_name, accelerator, force_sync_upload=False):
+        """Convert saved LoRA to ComfyUI format"""
+        if not getattr(args, 'convert_to_comfy', True):
+            return
+
+        try:
+            from musubi_tuner.ltx_2.convert_lora_to_comfy import convert_lora_to_comfy
+            comfy_ckpt_name = ckpt_name.replace('.safetensors', '_comfy.safetensors')
+            comfy_ckpt_file = os.path.join(args.output_dir, comfy_ckpt_name)
+            convert_lora_to_comfy(ckpt_file, comfy_ckpt_file, verbose=False)
+            accelerator.print(f"Saved ComfyUI-compatible LoRA: {comfy_ckpt_file}")
+
+            # Upload ComfyUI version to HuggingFace if enabled
+            if args.huggingface_repo_id is not None:
+                from musubi_tuner.utils import huggingface_utils
+                huggingface_utils.upload(args, comfy_ckpt_file, "/" + comfy_ckpt_name, force_sync_upload=force_sync_upload)
+        except Exception as e:
+            accelerator.print(f"Warning: Failed to convert LoRA to ComfyUI format: {e}")
+
     # ======== Model loading ========
 
     def load_transformer(
@@ -2609,6 +2628,21 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         "--blockwise_checkpointing",
         action="store_true",
         help="Enable block-wise weight offloading during backward (ultra-low VRAM).",
+    )
+    parser.add_argument(
+        "--blocks_to_checkpoint",
+        type=int,
+        default=-1,
+        help="Number of blocks to checkpoint. -1 = all (default), 0 = none, N = last N blocks. "
+             "Use with --blockwise_checkpointing to trade VRAM for speed on 12-16GB cards.",
+    )
+    parser.add_argument(
+        "--no_convert_to_comfy",
+        action="store_false",
+        dest="convert_to_comfy",
+        default=True,
+        help="Disable automatic conversion of saved LoRA to ComfyUI format. "
+             "By default, a *_comfy.safetensors file is created alongside the original.",
     )
 
     return parser
