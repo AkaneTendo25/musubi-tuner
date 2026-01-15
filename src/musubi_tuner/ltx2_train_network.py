@@ -1241,7 +1241,10 @@ class LTX2NetworkTrainer(NetworkTrainer):
             raise ValueError(f"ltx2_first_frame_conditioning_p must be in [0,1]. Got: {first_frame_p}")
 
         video_conditioning_enabled = None
-        if first_frame_p > 0.0:
+        # Skip first-frame conditioning for single-frame samples (images)
+        # since there are no subsequent frames to generate from frame 0
+        num_frames = latents.shape[2]
+        if first_frame_p > 0.0 and num_frames > 1:
             enable_conditioning = bool(torch.rand((), device=accelerator.device) < first_frame_p)
             if enable_conditioning:
                 video_conditioning_enabled = torch.ones((latents.shape[0],), device=accelerator.device, dtype=torch.bool)

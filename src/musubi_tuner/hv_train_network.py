@@ -2291,8 +2291,8 @@ class NetworkTrainer:
 
                     accelerator.backward(loss)
                     
-                    # DEBUG: Check if LoRA parameters have gradients (Every Step)
-                    if True: # global_step % 1 == 0:
+                    # DEBUG: Check if LoRA parameters have gradients (requires LTX2_DEBUG env var)
+                    if os.environ.get("LTX2_DEBUG"):
                         unwrapped_net = accelerator.unwrap_model(network)
                         lora_modules = getattr(unwrapped_net, "unet_loras", [])
                         if lora_modules:
@@ -2305,9 +2305,6 @@ class NetworkTrainer:
                                 )
                                 up_grad = lora.lora_up.weight.grad
                                 down_grad = lora.lora_down.weight.grad
-                                
-                                up_has_grad = up_grad is not None
-                                down_has_grad = down_grad is not None
                                 
                                 up_stat = "None"
                                 if up_grad is not None:
@@ -2328,8 +2325,6 @@ class NetworkTrainer:
                                     f"  UP  : {up_stat}\n"
                                     f"  DOWN: {down_stat}"
                                 )
-                        else:
-                            logger.warning("[DEBUG] No unet_loras found in network")
 
                     if accelerator.sync_gradients:
 
