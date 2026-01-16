@@ -19,7 +19,7 @@ SharedEpoch = Optional["Synchronized[int]"]
 
 import toml
 import voluptuous
-from voluptuous import Any, ExactSequence, MultipleInvalid, Object, Schema
+from voluptuous import Any, ExactSequence, MultipleInvalid, Object, Optional as VOptional, Schema
 
 from musubi_tuner.dataset.image_video_dataset import DatasetGroup, ImageDataset, VideoDataset, AudioDataset
 
@@ -195,6 +195,7 @@ class ConfigSanitizer:
             {
                 "general": self.general_schema,
                 "datasets": [self.dataset_schema],
+                VOptional("validation_datasets"): [self.dataset_schema],
             }
         )
         self.argparse_schema = self.__merge_dict(

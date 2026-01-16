@@ -523,7 +523,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
         if ltx_mode not in {"video", "av", "audio"}:
             raise ValueError(f"Invalid ltx_mode: {ltx_mode}")
         self._ltx_mode = ltx_mode
-        self._audio_video = self._ltx_mode == "av"
+        self._audio_video = self._ltx_mode in {"av", "audio"}
         self.default_guidance_scale = 1.0
 
         args.weighting_scheme = "none"
@@ -1662,7 +1662,9 @@ class LTX2NetworkTrainer(NetworkTrainer):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         with accelerator.autocast(), torch.no_grad():
             out = self._text_encoder(prompt_text, padding_side="left")
-            if self._audio_video:
+            if self._ltx_mode == "audio":
+                embed = out.audio_encoding if hasattr(out, "audio_encoding") else out.video_encoding
+            elif self._audio_video:
                 embed = torch.cat([out.video_encoding, out.audio_encoding], dim=-1)
             else:
                 embed = out.video_encoding
@@ -1912,12 +1914,11 @@ class LTX2NetworkTrainer(NetworkTrainer):
         loaded_audio = False
         disable_audio_preview = bool(getattr(args, "sample_disable_audio", False))
         use_audio_subprocess = False
-        enable_audio_preview = self._audio_video and not disable_audio_preview
-        if (
-            self._audio_video
-            and getattr(args, "ltx_mode", "video") == "av"
-            and not disable_audio_preview
-        ):
+        audio_only_preview = bool(getattr(args, "sample_audio_only", False))
+        if audio_only_preview and getattr(args, "ltx_mode", "video") not in {"av", "audio"}:
+            raise ValueError("--sample_audio_only requires --ltx_mode av or audio")
+        enable_audio_preview = (self._audio_video or audio_only_preview) and not disable_audio_preview
+        if enable_audio_preview and getattr(args, "ltx_mode", "video") in {"av", "audio"}:
             # Align with LTX-v2 audio decode path (bf16 by default).
             audio_dtype = torch.bfloat16 if args.vae_dtype is None else model_utils.str_to_dtype(args.vae_dtype)
             audio_device = accelerator.device
@@ -2037,12 +2038,13 @@ class LTX2NetworkTrainer(NetworkTrainer):
             audio_output_path=wav_path if enable_audio_preview else None,
             use_audio_subprocess=use_audio_subprocess,
             enable_audio_preview=enable_audio_preview,
+            decode_video=not audio_only_preview,
         )
 
         if not has_self_ref_orig_mod:
             transformer.train(was_train)
 
-        if video is None:
+        if video is None and not audio_only_preview:
             logger.error("No video generated / 生成された動画がありません")
             return
 
@@ -2057,16 +2059,17 @@ class LTX2NetworkTrainer(NetworkTrainer):
             wandb = None
 
         video_path = None
-        if video.shape[2] == 1:
-            image_paths = save_images_grid(video, save_dir, save_path, create_subdir=False)
-            if wandb_tracker is not None and wandb is not None:
-                for image_path in image_paths:
-                    wandb_tracker.log({f"sample_{prompt_idx}": wandb.Image(image_path)}, step=steps)
-        else:
-            video_path = os.path.join(save_dir, save_path) + ".mp4"
-            save_videos_grid(video, video_path)
-            if wandb_tracker is not None and wandb is not None:
-                wandb_tracker.log({f"sample_{prompt_idx}": wandb.Video(video_path)}, step=steps)
+        if video is not None:
+            if video.shape[2] == 1:
+                image_paths = save_images_grid(video, save_dir, save_path, create_subdir=False)
+                if wandb_tracker is not None and wandb is not None:
+                    for image_path in image_paths:
+                        wandb_tracker.log({f"sample_{prompt_idx}": wandb.Image(image_path)}, step=steps)
+            else:
+                video_path = os.path.join(save_dir, save_path) + ".mp4"
+                save_videos_grid(video, video_path)
+                if wandb_tracker is not None and wandb is not None:
+                    wandb_tracker.log({f"sample_{prompt_idx}": wandb.Video(video_path)}, step=steps)
         if audio_waveform is not None:
             wav_path = os.path.join(save_dir, save_path) + ".wav"
             sample_rate = int(getattr(vocoder, "output_sample_rate", 24000)) if vocoder is not None else 24000
@@ -2121,6 +2124,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
         audio_output_path: Optional[str] = None,
         use_audio_subprocess: bool = False,
         enable_audio_preview: bool = False,
+        decode_video: bool = True,
     ):
         """Generate sample video during training using LTX-2 denoising loop"""
         from musubi_tuner.modules.scheduling_flow_match_discrete import FlowMatchDiscreteScheduler
@@ -2218,7 +2222,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 logger.info("Sampling: disabling prompt attention mask for preview")
                 prompt_mask = None
 
-        enable_audio_preview = bool(enable_audio_preview and self._audio_video)
+        enable_audio_preview = bool(enable_audio_preview)
         if not enable_audio_preview and prompt_embeds.shape[-1] % 2 == 0:
             logger.warning(
                 "Sampling: audio preview disabled; using video-only prompt embeddings (half of dim=%s).",
@@ -2354,47 +2358,50 @@ class LTX2NetworkTrainer(NetworkTrainer):
             self._cleanup_cuda(transformer_device)
 
         # Decode latents
-        if offload_transformer_for_decode:
-            logger.info("Sampling offload: moving VAE to GPU for decode")
-            vae.to_device(transformer_device)
-        with torch.no_grad():
-            use_tiled_vae = getattr(args, "sample_tiled_vae", False)
-            if use_tiled_vae:
-                from musubi_tuner.ltx_2.model.video_vae import TilingConfig, SpatialTilingConfig, TemporalTilingConfig
-                tile_size = getattr(args, "sample_vae_tile_size", 512)
-                tile_overlap = getattr(args, "sample_vae_tile_overlap", 64)
-                temporal_tile_size = getattr(args, "sample_vae_temporal_tile_size", 0)
-                temporal_tile_overlap = getattr(args, "sample_vae_temporal_tile_overlap", 8)
-                
-                # Use configured temporal tiling, or 9999 frames (all at once) if disabled
-                effective_temporal_size = temporal_tile_size if temporal_tile_size > 0 else 9999
-                effective_temporal_overlap = temporal_tile_overlap if temporal_tile_size > 0 else 0
-                
-                tiling_config = TilingConfig(
-                    spatial_config=SpatialTilingConfig(
-                        tile_size_in_pixels=tile_size,
-                        tile_overlap_in_pixels=tile_overlap,
-                    ),
-                    temporal_config=TemporalTilingConfig(
-                        tile_size_in_frames=effective_temporal_size,
-                        tile_overlap_in_frames=effective_temporal_overlap,
-                    ),
-                )
-                if temporal_tile_size > 0:
-                    logger.info("Using tiled VAE decode (spatial=%dx%d, temporal=%d/%d)", 
-                               tile_size, tile_overlap, temporal_tile_size, temporal_tile_overlap)
-                else:
-                    logger.info("Using tiled VAE decode (spatial=%dx%d, no temporal tiling)", 
-                               tile_size, tile_overlap)
-                video = vae.tiled_decode(latents.squeeze(0), tiling_config)
-                if video.dim() == 4:  # [C, T, H, W]
-                    video = video.unsqueeze(0)  # [1, C, T, H, W]
-            else:
-                video = vae.decode([latents.squeeze(0)])
-                if isinstance(video, list) and video:
-                    video = video[0]
+        if not decode_video:
+            video = None
+        else:
+            if offload_transformer_for_decode:
+                logger.info("Sampling offload: moving VAE to GPU for decode")
+                vae.to_device(transformer_device)
+            with torch.no_grad():
+                use_tiled_vae = getattr(args, "sample_tiled_vae", False)
+                if use_tiled_vae:
+                    from musubi_tuner.ltx_2.model.video_vae import TilingConfig, SpatialTilingConfig, TemporalTilingConfig
+                    tile_size = getattr(args, "sample_vae_tile_size", 512)
+                    tile_overlap = getattr(args, "sample_vae_tile_overlap", 64)
+                    temporal_tile_size = getattr(args, "sample_vae_temporal_tile_size", 0)
+                    temporal_tile_overlap = getattr(args, "sample_vae_temporal_tile_overlap", 8)
+                    
+                    # Use configured temporal tiling, or 9999 frames (all at once) if disabled
+                    effective_temporal_size = temporal_tile_size if temporal_tile_size > 0 else 9999
+                    effective_temporal_overlap = temporal_tile_overlap if temporal_tile_size > 0 else 0
+                    
+                    tiling_config = TilingConfig(
+                        spatial_config=SpatialTilingConfig(
+                            tile_size_in_pixels=tile_size,
+                            tile_overlap_in_pixels=tile_overlap,
+                        ),
+                        temporal_config=TemporalTilingConfig(
+                            tile_size_in_frames=effective_temporal_size,
+                            tile_overlap_in_frames=effective_temporal_overlap,
+                        ),
+                    )
+                    if temporal_tile_size > 0:
+                        logger.info("Using tiled VAE decode (spatial=%dx%d, temporal=%d/%d)", 
+                                   tile_size, tile_overlap, temporal_tile_size, temporal_tile_overlap)
+                    else:
+                        logger.info("Using tiled VAE decode (spatial=%dx%d, no temporal tiling)", 
+                                   tile_size, tile_overlap)
+                    video = vae.tiled_decode(latents.squeeze(0), tiling_config)
                     if video.dim() == 4:  # [C, T, H, W]
                         video = video.unsqueeze(0)  # [1, C, T, H, W]
+                else:
+                    video = vae.decode([latents.squeeze(0)])
+                    if isinstance(video, list) and video:
+                        video = video[0]
+                        if video.dim() == 4:  # [C, T, H, W]
+                            video = video.unsqueeze(0)  # [1, C, T, H, W]
 
         audio_waveform = None
         if audio_latents is not None:
@@ -2565,6 +2572,11 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         "--sample_disable_audio",
         action="store_true",
         help="Disable audio decoding during LTX-2 preview sampling (AV mode).",
+    )
+    parser.add_argument(
+        "--sample_audio_only",
+        action="store_true",
+        help="Generate audio-only previews during sampling (skip video decode/save).",
     )
     parser.add_argument(
         "--sample_disable_flash_attn",
