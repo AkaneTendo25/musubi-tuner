@@ -86,7 +86,11 @@ def weighs_to_device(layer: nn.Module, device: torch.device, skip_trainable: boo
                     if use_pinned and device.type == "cpu":
                         # Reuse or allocate pinned buffer
                         pid = id(p)
-                        if pid not in _pinned_buffer_cache:
+                        if (
+                            pid not in _pinned_buffer_cache
+                            or _pinned_buffer_cache[pid].shape != p.data.shape
+                            or _pinned_buffer_cache[pid].dtype != p.data.dtype
+                        ):
                             # Allocate new pinned buffer
                             _pinned_buffer_cache[pid] = torch.empty_like(p, device="cpu", pin_memory=True)
                         
@@ -133,7 +137,11 @@ def params_to_device(layer: nn.Module, device: torch.device, include_norms: bool
                     if device.type == "cpu" and use_pinned:
                         # Reuse or allocate pinned buffer
                         pid = id(p)
-                        if pid not in _pinned_buffer_cache:
+                        if (
+                            pid not in _pinned_buffer_cache
+                            or _pinned_buffer_cache[pid].shape != p.data.shape
+                            or _pinned_buffer_cache[pid].dtype != p.data.dtype
+                        ):
                             _pinned_buffer_cache[pid] = torch.empty_like(p, device="cpu", pin_memory=True)
                         target_buffer = _pinned_buffer_cache[pid]
                         target_buffer.copy_(p.data, non_blocking=non_blocking)

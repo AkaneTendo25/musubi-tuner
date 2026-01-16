@@ -377,6 +377,26 @@ LTX2_INCLUDE_PATTERNS_V2V = [
     r".*\.audio_ff\.net\.2$",
 ]
 
+# audio: Audio-only LoRA (audio attention/FFN + audio-side cross-modal)
+# Targets audio self/cross-attn, audio FFN, and video_to_audio_attn (audio queries video).
+# Excludes audio_to_video_attn to avoid altering the video branch.
+LTX2_INCLUDE_PATTERNS_AUDIO = [
+    r".*\.audio_attn1\.to_k$",
+    r".*\.audio_attn1\.to_q$",
+    r".*\.audio_attn1\.to_v$",
+    r".*\.audio_attn1\.to_out\.0$",
+    r".*\.audio_attn2\.to_k$",
+    r".*\.audio_attn2\.to_q$",
+    r".*\.audio_attn2\.to_v$",
+    r".*\.audio_attn2\.to_out\.0$",
+    r".*\.audio_ff\.net\.0\.proj$",
+    r".*\.audio_ff\.net\.2$",
+    r".*\.video_to_audio_attn\.to_k$",
+    r".*\.video_to_audio_attn\.to_q$",
+    r".*\.video_to_audio_attn\.to_v$",
+    r".*\.video_to_audio_attn\.to_out\.0$",
+]
+
 # full: All linear layers in transformer blocks
 # Maximum expressiveness, but larger LoRA file and more VRAM usage.
 LTX2_INCLUDE_PATTERNS_FULL = None  # None means no filtering, all Linear layers matched
@@ -385,6 +405,7 @@ LTX2_INCLUDE_PATTERNS_FULL = None  # None means no filtering, all Linear layers 
 LTX2_LORA_TARGET_PRESETS = {
     "t2v": LTX2_INCLUDE_PATTERNS_T2V,
     "v2v": LTX2_INCLUDE_PATTERNS_V2V,
+    "audio": LTX2_INCLUDE_PATTERNS_AUDIO,
     "full": LTX2_INCLUDE_PATTERNS_FULL,
 }
 

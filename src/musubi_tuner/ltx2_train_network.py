@@ -1874,6 +1874,9 @@ class LTX2NetworkTrainer(NetworkTrainer):
             clean_memory_on_device(accelerator.device)
 
         transformer.switch_block_swap_for_training()
+        # Ensure block-swap layout is re-applied after sampling to avoid VRAM creep.
+        if hasattr(transformer, "move_to_device_except_swap_blocks"):
+            transformer.move_to_device_except_swap_blocks(accelerator.device)
         self._cleanup_cuda(accelerator.device)
 
     def sample_image_inference(
@@ -1908,15 +1911,15 @@ class LTX2NetworkTrainer(NetworkTrainer):
         vocoder = None
         loaded_audio = False
         disable_audio_preview = bool(getattr(args, "sample_disable_audio", False))
-        use_audio_subprocess = bool(getattr(args, "sample_with_offloading", False))
+        use_audio_subprocess = False
         enable_audio_preview = self._audio_video and not disable_audio_preview
         if (
             self._audio_video
             and getattr(args, "ltx_mode", "video") == "av"
             and not disable_audio_preview
-            and not use_audio_subprocess
         ):
-            audio_dtype = torch.float16 if args.vae_dtype is None else model_utils.str_to_dtype(args.vae_dtype)
+            # Align with LTX-v2 audio decode path (bf16 by default).
+            audio_dtype = torch.bfloat16 if args.vae_dtype is None else model_utils.str_to_dtype(args.vae_dtype)
             audio_device = accelerator.device
             try:
                 audio_decoder, vocoder = self._load_audio_components(
@@ -2395,44 +2398,22 @@ class LTX2NetworkTrainer(NetworkTrainer):
 
         audio_waveform = None
         if audio_latents is not None:
-            if use_audio_subprocess and audio_output_path is not None:
-                logger.info("Sampling offload: decoding audio in subprocess")
-                self._decode_audio_preview_subprocess(
-                    audio_latents=audio_latents,
-                    output_path=audio_output_path,
-                    checkpoint_path=str(args.ltx2_checkpoint),
-                )
-            elif audio_decoder is not None and vocoder is not None:
+            if audio_decoder is not None and vocoder is not None:
                 if offload_transformer_for_decode:
                     logger.info("Sampling offload: moving VAE back to CPU before audio decode")
                     vae.to_device(original_vae_device)
                     clean_memory_on_device(transformer_device)
-                decode_device = None
-                try:
-                    decode_device = next(audio_decoder.parameters()).device
-                except StopIteration:
-                    decode_device = transformer_device
+
+                decode_device = transformer_device
                 if decode_device.type == "cpu":
                     logger.info("Sampling offload: decoding audio on CPU")
-                    audio_latents = audio_latents.to("cpu")
-                else:
-                    audio_decoder.to(transformer_device)
-                    vocoder.to(transformer_device)
+                audio_decoder.to(decode_device)
+                vocoder.to(decode_device)
                 with torch.no_grad():
-                    decode_dtype = getattr(audio_decoder, "dtype", None)
-                    if decode_dtype is None:
-                        try:
-                            decode_dtype = next(audio_decoder.parameters()).dtype
-                        except StopIteration:
-                            decode_dtype = audio_latents.dtype
-                    decoded_audio = audio_decoder(audio_latents.to(dtype=decode_dtype))
-                    vocoder_dtype = getattr(vocoder, "dtype", None)
-                    if vocoder_dtype is None:
-                        try:
-                            vocoder_dtype = next(vocoder.parameters()).dtype
-                        except StopIteration:
-                            vocoder_dtype = decoded_audio.dtype
-                    audio_waveform = vocoder(decoded_audio.to(dtype=vocoder_dtype)).squeeze(0).float().cpu()
+                    decode_dtype = torch.bfloat16
+                    audio_latents = audio_latents.to(device=decode_device, dtype=decode_dtype)
+                    decoded_audio = audio_decoder(audio_latents)
+                    audio_waveform = vocoder(decoded_audio).squeeze(0).float().cpu()
                 audio_decoder.to("cpu")
                 vocoder.to("cpu")
             else:
@@ -2516,11 +2497,12 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         "--lora_target_preset",
         type=str,
         default="t2v",
-        choices=["t2v", "v2v", "full"],
+        choices=["t2v", "v2v", "audio", "full"],
         help=(
             "LoRA target preset: "
             "'t2v' = text-to-video (attention only, official default), "
             "'v2v' = video-to-video/IC-LoRA (attention + feed-forward), "
+            "'audio' = audio-only (audio attn/ffn + audio-side cross-modal), "
             "'full' = all linear layers. "
             "Can be overridden by --network_args include_patterns=..."
         ),
@@ -2547,7 +2529,7 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
     parser.add_argument(
         "--ltx2_first_frame_conditioning_p",
         type=float,
-        default=0.1,
+        default=0.5,
         help="Probability of first-frame conditioning during training (keep frame 0 clean and set its timestep to 0).",
     )
 
@@ -2659,6 +2641,10 @@ def main() -> None:
     args = parser.parse_args()
     args = read_config_from_file(args, parser)
 
+    explicit_lora_preset = any(
+        arg == "--lora_target_preset" or arg.startswith("--lora_target_preset=") for arg in sys.argv
+    )
+
     if getattr(args, "dit", None) is not None and args.dit != args.ltx2_checkpoint:
         logger.warning("Ignoring --dit for LTX-2; using --ltx2_checkpoint instead")
     args.dit = args.ltx2_checkpoint
@@ -2675,6 +2661,12 @@ def main() -> None:
         args.vae_dtype = "bfloat16"
 
     # Inject lora_target_preset into network_args (LTX-2 specific)
+    if getattr(args, "ltx_mode", "video") == "audio" and not explicit_lora_preset:
+        if args.network_args is None:
+            args.network_args = []
+        if not any(arg.startswith("include_patterns=") for arg in args.network_args):
+            args.lora_target_preset = "audio"
+
     lora_target_preset = getattr(args, "lora_target_preset", None)
     if lora_target_preset is not None:
         if args.network_args is None:
