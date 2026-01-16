@@ -1858,6 +1858,11 @@ class NetworkTrainer:
                     weight_cpu_offloading=True,
                     blocks_to_checkpoint=blocks_to_ckpt
                 )
+                if args.use_pinned_memory_for_block_swap and hasattr(transformer, "transformer_blocks"):
+                    # LTX-2 blockwise checkpointing uses per-block use_pinned_memory for CPU<->GPU transfers.
+                    for block in transformer.transformer_blocks:
+                        if hasattr(block, "use_pinned_memory"):
+                            block.use_pinned_memory = True
             else:
                 transformer.enable_gradient_checkpointing(
                     args.gradient_checkpointing_cpu_offload,
