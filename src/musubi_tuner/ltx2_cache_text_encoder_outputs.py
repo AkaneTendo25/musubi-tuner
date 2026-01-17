@@ -123,7 +123,7 @@ def _precache_sample_prompts(
 
     cache_path = args.sample_prompts_cache or _resolve_default_sample_prompts_cache(datasets)
 
-    sample_parameters: list[dict] = []
+    prompt_cache: list[dict] = []
     for prompt_dict in prompts:
         param = prompt_dict.copy()
         prompt_text = param.get("prompt", "")
@@ -135,8 +135,11 @@ def _precache_sample_prompts(
             autocast_dtype=autocast_dtype,
             device=device,
         )
-        param["prompt_embeds"] = prompt_embeds
-        param["prompt_attention_mask"] = prompt_mask
+        cache_entry = {
+            "prompt": prompt_text,
+            "prompt_embeds": prompt_embeds,
+            "prompt_attention_mask": prompt_mask,
+        }
 
         negative_prompt = param.get("negative_prompt")
         if negative_prompt:
@@ -148,16 +151,17 @@ def _precache_sample_prompts(
                 autocast_dtype=autocast_dtype,
                 device=device,
             )
-            param["negative_prompt_embeds"] = neg_embeds
-            param["negative_prompt_attention_mask"] = neg_mask
+            cache_entry["negative_prompt"] = negative_prompt
+            cache_entry["negative_prompt_embeds"] = neg_embeds
+            cache_entry["negative_prompt_attention_mask"] = neg_mask
 
-        sample_parameters.append(param)
+        prompt_cache.append(cache_entry)
 
     payload = {
-        "version": 1,
+        "version": 2,
         "ltx_mode": ltx_mode,
         "audio_video": audio_video,
-        "sample_parameters": sample_parameters,
+        "prompt_cache": prompt_cache,
     }
     torch.save(payload, cache_path)
     logger.info("Saved precached sample prompts to %s", cache_path)

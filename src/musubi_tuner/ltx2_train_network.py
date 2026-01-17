@@ -1580,15 +1580,41 @@ class LTX2NetworkTrainer(NetworkTrainer):
         if not os.path.exists(cache_path):
             raise FileNotFoundError(f"Precached sample prompt embeddings not found: {cache_path}")
         payload = torch.load(cache_path, map_location="cpu")
-        if not isinstance(payload, dict) or "sample_parameters" not in payload:
+        if not isinstance(payload, dict):
             raise ValueError(f"Invalid sample prompt cache format: {cache_path}")
-        cached_params = payload.get("sample_parameters")
+        cached_params = payload.get("prompt_cache") or payload.get("sample_parameters")
         if not isinstance(cached_params, list) or not cached_params:
             raise ValueError(f"No sample prompts found in cache: {cache_path}")
-        for idx, param in enumerate(cached_params):
-            if not isinstance(param, dict) or param.get("prompt_embeds") is None or param.get("prompt_attention_mask") is None:
+
+        if args.sample_prompts is None:
+            raise ValueError("--sample_prompts is required when --use_precached_sample_prompts is set")
+        prompts = load_prompts(args.sample_prompts)
+        if not prompts:
+            raise ValueError(f"No prompts found in {args.sample_prompts}")
+
+        sample_params = self._apply_sample_defaults(args, prompts)
+        if len(sample_params) != len(cached_params):
+            raise ValueError(
+                "Sample prompt count does not match precached embeddings "
+                f"(prompts={len(sample_params)} cache={len(cached_params)})."
+            )
+        for idx, param in enumerate(sample_params):
+            cache_entry = cached_params[idx]
+            if not isinstance(cache_entry, dict):
+                raise ValueError(f"Invalid cache entry at {idx} ({cache_path})")
+            if cache_entry.get("prompt_embeds") is None or cache_entry.get("prompt_attention_mask") is None:
                 raise ValueError(f"Missing prompt embeddings in cache entry {idx} ({cache_path})")
-        return self._apply_sample_defaults(args, cached_params)
+            param["prompt_embeds"] = cache_entry["prompt_embeds"]
+            param["prompt_attention_mask"] = cache_entry["prompt_attention_mask"]
+            if param.get("negative_prompt"):
+                if cache_entry.get("negative_prompt_embeds") is None or cache_entry.get(
+                    "negative_prompt_attention_mask"
+                ) is None:
+                    raise ValueError(f"Missing negative prompt embeddings in cache entry {idx} ({cache_path})")
+                param["negative_prompt_embeds"] = cache_entry["negative_prompt_embeds"]
+                param["negative_prompt_attention_mask"] = cache_entry["negative_prompt_attention_mask"]
+
+        return sample_params
 
     def _resolve_default_sample_prompts_cache(self, args: argparse.Namespace) -> str:
         from musubi_tuner.dataset import config_utils
