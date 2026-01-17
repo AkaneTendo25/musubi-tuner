@@ -3,8 +3,8 @@ Block-Level Gradient Checkpointing with CPU Offloading
 
 This module provides custom gradient checkpointing that gives full control over
 weight loading/offloading during both forward and backward passes. Unlike
-torch.utils.checkpoint.checkpoint, this implementation ensures only one block's
-weights are on GPU at any time during backward.
+torch.utils.checkpoint.checkpoint, this implementation lets callers load/offload
+block weights per recompute to limit VRAM usage.
 
 Key Features:
 - Block-by-block processing during backward (not all at once)
@@ -56,14 +56,74 @@ def _to_device_recursive(arg, device, non_blocking=True):
 
 
 def _detach_cpu_recursive(arg):
-    """Recursively detach tensors and move to CPU."""
+    """Recursively detach tensors and move to CPU (pin if possible)."""
     if isinstance(arg, torch.Tensor):
-        return arg.detach().cpu()
+        cpu_tensor = arg.detach().cpu()
+        if torch.cuda.is_available():
+            try:
+                return cpu_tensor.pin_memory()
+            except RuntimeError:
+                return cpu_tensor
+        return cpu_tensor
     elif isinstance(arg, (list, tuple)):
         return type(arg)(_detach_cpu_recursive(x) for x in arg)
     elif isinstance(arg, dict):
         return {k: _detach_cpu_recursive(v) for k, v in arg.items()}
     return arg
+
+
+def _get_autocast_state() -> Tuple[bool, torch.dtype]:
+    """Return (enabled, dtype) for autocast in a version-safe way."""
+    try:
+        enabled = torch.is_autocast_enabled("cuda")
+        dtype = torch.get_autocast_dtype("cuda")
+    except TypeError:
+        enabled = torch.is_autocast_enabled()
+        dtype = torch.get_autocast_dtype()
+    return enabled, dtype
+
+
+def _build_output_spec(outputs) -> Tuple[bool, List[Tuple[str, int]]]:
+    """Build output spec to preserve exact tensor output ordering."""
+    output_spec: List[Tuple[str, int]] = []
+    if isinstance(outputs, tuple):
+        for idx, out in enumerate(outputs):
+            if out is None:
+                continue
+            if isinstance(out, torch.Tensor):
+                output_spec.append(("tensor", idx))
+            elif hasattr(out, "x") and isinstance(out.x, torch.Tensor):
+                output_spec.append(("x", idx))
+        return True, output_spec
+    if isinstance(outputs, torch.Tensor):
+        output_spec.append(("tensor", 0))
+    elif hasattr(outputs, "x") and isinstance(outputs.x, torch.Tensor):
+        output_spec.append(("x", 0))
+    return False, output_spec
+
+
+def _extract_outputs_by_spec(outputs, output_spec: List[Tuple[str, int]]) -> List[torch.Tensor]:
+    """Extract tensor outputs using a stored output spec."""
+    if isinstance(outputs, tuple):
+        source = outputs
+    else:
+        source = (outputs,)
+    out_tensors: List[torch.Tensor] = []
+    for kind, idx in output_spec:
+        if idx >= len(source):
+            raise ValueError("Checkpoint output spec is out of range for recomputed outputs")
+        out = source[idx]
+        if kind == "tensor":
+            if not isinstance(out, torch.Tensor):
+                raise ValueError("Checkpoint output spec expected a tensor output")
+            out_tensors.append(out)
+        elif kind == "x":
+            if not (hasattr(out, "x") and isinstance(out.x, torch.Tensor)):
+                raise ValueError("Checkpoint output spec expected an object with .x tensor")
+            out_tensors.append(out.x)
+        else:
+            raise ValueError(f"Unknown output spec kind: {kind}")
+    return out_tensors
 
 
 class BlockCheckpointFunction(torch.autograd.Function):
@@ -84,18 +144,17 @@ class BlockCheckpointFunction(torch.autograd.Function):
         if preserve_rng_state:
             ctx.cpu_rng_state = torch.get_rng_state()
             if torch.cuda.is_available():
-                ctx.cuda_rng_state = torch.cuda.get_rng_state()
+                ctx.cuda_rng_state = torch.cuda.get_rng_state_all()
         
         # Save Autocast state
-        ctx.autocast_enabled = torch.is_autocast_enabled('cuda') if torch.cuda.is_available() else False
-        ctx.autocast_dtype = torch.get_autocast_dtype('cuda') if torch.cuda.is_available() else torch.float16
+        ctx.autocast_enabled, ctx.autocast_dtype = _get_autocast_state()
 
         # Detect target device - we need CUDA for computation even if inputs arrive on CPU
         # (which happens with activation_cpu_offloading)
         input_device = _get_device_from_args(args)
         if input_device.type == 'cpu' and torch.cuda.is_available():
             # Inputs are on CPU (from offloading), but computation must happen on GPU
-            target_device = torch.device('cuda')
+            target_device = torch.device('cuda', torch.cuda.current_device())
         else:
             target_device = input_device
         ctx.target_device = target_device
@@ -131,22 +190,12 @@ class BlockCheckpointFunction(torch.autograd.Function):
         
         # Extract output tensors
         # Gradient checkpointing REQUIRES tensor outputs to track gradients.
-        output_tensors = []
-        if isinstance(outputs, tuple):
-            ctx.num_outputs = len(outputs)
-            for out in outputs:
-                if out is None:
-                    pass  # Skip None outputs
-                elif hasattr(out, 'x') and isinstance(out.x, torch.Tensor):
-                    output_tensors.append(out.x.detach().requires_grad_(out.x.requires_grad))
-                elif isinstance(out, torch.Tensor):
-                    output_tensors.append(out.detach().requires_grad_(out.requires_grad))
-        else:
-            ctx.num_outputs = 1
-            if isinstance(outputs, torch.Tensor):
-                output_tensors.append(outputs.detach().requires_grad_(outputs.requires_grad))
-            elif hasattr(outputs, 'x') and isinstance(outputs.x, torch.Tensor):
-                output_tensors.append(outputs.x.detach().requires_grad_(outputs.x.requires_grad))
+        ctx.outputs_is_tuple, ctx.output_spec = _build_output_spec(outputs)
+        output_tensors = _extract_outputs_by_spec(outputs, ctx.output_spec)
+        output_tensors = [
+            out.detach().requires_grad_(out.is_floating_point())
+            for out in output_tensors
+        ]
         
         # FAIL FAST: If no tensor outputs, checkpointing cannot work correctly
         if not output_tensors:
@@ -185,7 +234,7 @@ class BlockCheckpointFunction(torch.autograd.Function):
         
         for arg in ctx.saved_args:
             if isinstance(arg, torch.Tensor):
-                arg_gpu = arg.to(target_device)
+                arg_gpu = arg.to(target_device, non_blocking=True)
                 detached = arg_gpu.detach().requires_grad_(True)
                 inputs.append(detached)
                 detached_inputs.append(detached)
@@ -198,10 +247,10 @@ class BlockCheckpointFunction(torch.autograd.Function):
         # Restore RNG state
         if ctx.preserve_rng_state:
             rng_state = torch.get_rng_state()
-            cuda_rng_state = torch.cuda.get_rng_state() if torch.cuda.is_available() else None
+            cuda_rng_state = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
             torch.set_rng_state(ctx.cpu_rng_state)
             if torch.cuda.is_available():
-                torch.cuda.set_rng_state(ctx.cuda_rng_state)
+                torch.cuda.set_rng_state_all(ctx.cuda_rng_state)
         
         # Recompute forward with gradients
         with torch.enable_grad():
@@ -215,27 +264,17 @@ class BlockCheckpointFunction(torch.autograd.Function):
         if ctx.preserve_rng_state:
             torch.set_rng_state(rng_state)
             if cuda_rng_state is not None:
-                torch.cuda.set_rng_state(cuda_rng_state)
+                torch.cuda.set_rng_state_all(cuda_rng_state)
         
         # Extract output tensors for grad computation
-        output_tensors = []
-        if isinstance(outputs, tuple):
-            for out in outputs:
-                if out is not None and hasattr(out, 'x') and isinstance(out.x, torch.Tensor):
-                    output_tensors.append(out.x)
-                elif isinstance(out, torch.Tensor):
-                    output_tensors.append(out)
-        elif isinstance(outputs, torch.Tensor):
-            output_tensors.append(outputs)
-        elif hasattr(outputs, 'x') and isinstance(outputs.x, torch.Tensor):
-            output_tensors.append(outputs.x)
+        output_tensors = _extract_outputs_by_spec(outputs, ctx.output_spec)
         
         # Compute gradients
         if output_tensors:
             valid_grads = []
             valid_outputs = []
             for i, out in enumerate(output_tensors):
-                if out.requires_grad and i < len(grad_outputs) and grad_outputs[i] is not None:
+                if i < len(grad_outputs) and grad_outputs[i] is not None:
                     valid_grads.append(grad_outputs[i])
                     valid_outputs.append(out)
             

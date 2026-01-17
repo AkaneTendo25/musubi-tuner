@@ -331,6 +331,9 @@ def main() -> None:
             model_sd_ops=VAE_ENCODER_COMFY_KEYS_FILTER,
         ).build(device=device, dtype=vae_dtype)
         vae.eval()
+        if args.vae_chunk_size is not None:
+            vae.set_chunk_size_for_causal_conv_3d(args.vae_chunk_size)
+            logger.info("Set chunk_size to %s for CausalConv3d in VAE", args.vae_chunk_size)
 
         def encode_fn(batch: List[ItemInfo]) -> None:
             encode_and_save_batch(vae, batch)
@@ -442,6 +445,7 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         help="Enable audio-video caching. Video latents are the same; audio latents are cached separately.",
     )
     parser.add_argument("--ltx2_checkpoint", type=str, default=None, help="Path to LTX-2 checkpoint (.safetensors)")
+    parser.add_argument("--vae_chunk_size", type=int, default=None, help="chunk size for CausalConv3d in VAE")
     parser.add_argument(
         "--ltx2_audio_source",
         type=str,

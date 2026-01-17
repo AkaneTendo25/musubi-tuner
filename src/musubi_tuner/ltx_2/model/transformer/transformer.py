@@ -498,7 +498,7 @@ class BasicAVTransformerBlock(torch.nn.Module):
 
         # Offload weights to CPU at the end of _forward.
         # This runs during forward pass. During backward, the backward hook handles offloading.
-        if self.activation_cpu_offloading:
+        if self.activation_cpu_offloading and not self.weight_cpu_offloading:
             cpu_device = torch.device("cpu")
             weighs_to_device(self, cpu_device, use_pinned=self.use_pinned_memory)
             _move_non_linear_params(self, cpu_device)
@@ -507,6 +507,10 @@ class BasicAVTransformerBlock(torch.nn.Module):
         return replace(video, x=vx) if video is not None else None, replace(audio, x=ax) if audio is not None else None
 
     def _load_weights(self, b: torch.nn.Module, d: torch.device) -> None:
+        if all((p.device == d) for p in b.parameters(recurse=True)) and all(
+            (buf.device == d) for buf in b.buffers(recurse=True)
+        ):
+            return
         weighs_to_device(b, d, use_pinned=self.use_pinned_memory)
         # Move non-linear params (RMSNorm, etc.) and FP8/LoRA modules
         _move_non_linear_params(b, d)

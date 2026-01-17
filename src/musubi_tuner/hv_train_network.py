@@ -124,13 +124,13 @@ def prepare_accelerator(args: argparse.Namespace) -> Accelerator:
         if log_with in ["tensorboard", "all"]:
             if logging_dir is None:
                 raise ValueError(
-                    "logging_dir is required when log_with is tensorboard / Tensorboard??????logging_dir?????????"
+                    "logging_dir is required when log_with is tensorboard / Tensorboardを使う場合、logging_dirを指定してください"
                 )
         if log_with in ["wandb", "all"]:
             try:
                 import wandb
             except ImportError:
-                raise ImportError("No wandb / wandb ?????????????????")
+                raise ImportError("No wandb / wandb がインストールされていないようです")
             if logging_dir is not None:
                 os.makedirs(logging_dir, exist_ok=True)
                 os.environ["WANDB_DIR"] = logging_dir
@@ -263,7 +263,7 @@ def line_to_prompt_dict(line: str) -> dict:
                 continue
 
         except ValueError as ex:
-            logger.error(f"Exception in parsing / ?????: {parg}")
+            logger.error(f"Exception in parsing / 解析エラー: {parg}")
             logger.error(ex)
 
     return prompt_dict
@@ -326,9 +326,9 @@ def get_sigmas(noise_scheduler, timesteps, device, n_dim=4, dtype=torch.float32)
 
     # if sum([(schedule_timesteps == t) for t in timesteps]) < len(timesteps):
     if any([(schedule_timesteps == t).sum() == 0 for t in timesteps]):
-        # raise ValueError("Some timesteps are not in the schedule / ???timesteps????????????????")
+        # raise ValueError("Some timesteps are not in the schedule / 一部のtimestepsがスケジュールに含まれていません")
         # round to nearest timestep
-        logger.warning("Some timesteps are not in the schedule / ???timesteps????????????????")
+        logger.warning("Some timesteps are not in the schedule / 一部のtimestepsがスケジュールに含まれていません")
         step_indices = [torch.argmin(torch.abs(schedule_timesteps - t)).item() for t in timesteps]
     else:
         step_indices = [(schedule_timesteps == t).nonzero().item() for t in timesteps]
@@ -379,7 +379,7 @@ class NetworkTrainer:
         self.num_timestep_buckets: Optional[int] = None  # for get_bucketed_timestep()
         self.vae_frame_stride = 4  # all architectures require frames to be divisible by 4, except Qwen-Image-Layered
 
-    # TODO ?????????????
+    # TODO 他のスクリプトと共通化する
     def generate_step_logs(
         self,
         args: argparse.Namespace,
@@ -451,7 +451,7 @@ class NetworkTrainer:
             try:
                 import bitsandbytes as bnb
             except ImportError:
-                raise ImportError("No bitsandbytes / bitsandbytes?????????????????")
+                raise ImportError("No bitsandbytes / bitsandbytesがインストールされていないようです")
 
             if optimizer_type == "AdamW8bit".lower():
                 logger.info(f"use 8-bit AdamW optimizer | {optimizer_kwargs}")
@@ -464,7 +464,7 @@ class NetworkTrainer:
                 optimizer_kwargs["relative_step"] = True  # default
             if not optimizer_kwargs["relative_step"] and optimizer_kwargs.get("warmup_init", False):
                 logger.info(
-                    "set relative_step to True because warmup_init is True / warmup_init?True???relative_step?True????"
+                    "set relative_step to True because warmup_init is True / warmup_initがTrueのためrelative_stepをTrueにします"
                 )
                 optimizer_kwargs["relative_step"] = True
             logger.info(f"use Adafactor optimizer | {optimizer_kwargs}")
@@ -472,23 +472,23 @@ class NetworkTrainer:
             if optimizer_kwargs["relative_step"]:
                 logger.info("relative_step is true / relative_step?true??")
                 if lr != 0.0:
-                    logger.warning("learning rate is used as initial_lr / ????learning rate?initial_lr?????????")
+                    logger.warning("learning rate is used as initial_lr / 指定したlearning rateはinitial_lrとして使用されます")
                 args.learning_rate = None
 
                 if args.lr_scheduler != "adafactor":
-                    logger.info("use adafactor_scheduler / ???????adafactor_scheduler??????")
-                args.lr_scheduler = f"adafactor:{lr}"  # ?????????
+                    logger.info("use adafactor_scheduler / スケジューラにadafactor_schedulerを使用します")
+                args.lr_scheduler = f"adafactor:{lr}"  # ちょっと微妙だけど
 
                 lr = None
             else:
                 if args.max_grad_norm != 0.0:
                     logger.warning(
-                        "because max_grad_norm is set, clip_grad_norm is enabled. consider set to 0 / max_grad_norm??????????clip_grad_norm?????????0??????????????????????"
+                        "because max_grad_norm is set, clip_grad_norm is enabled. consider set to 0 / max_grad_normが設定されているためclip_grad_normが有効になります。0に設定して無効にしたほうがいいかもしれません"
                     )
                 if args.lr_scheduler != "constant_with_warmup":
-                    logger.warning("constant_with_warmup will be good / ???????constant_with_warmup??????????")
+                    logger.warning("constant_with_warmup will be good / スケジューラはconstant_with_warmupが良いかもしれません")
                 if optimizer_kwargs.get("clip_threshold", 1.0) != 1.0:
-                    logger.warning("clip_threshold=1.0 will be good / clip_threshold?1.0??????????")
+                    logger.warning("clip_threshold=1.0 will be good / clip_thresholdは1.0が良いかもしれません")
 
             optimizer_class = transformers.optimization.Adafactor
             optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
@@ -499,7 +499,7 @@ class NetworkTrainer:
             optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
 
         if optimizer is None:
-            # ???optimizer???
+            # 任意のoptimizerを使う
             case_sensitive_optimizer_type = args.optimizer_type  # not lower
             logger.info(f"use {case_sensitive_optimizer_type} | {optimizer_kwargs}")
 
@@ -596,7 +596,7 @@ class NetworkTrainer:
 
         if name.startswith("adafactor"):
             assert type(optimizer) == transformers.optimization.Adafactor, (
-                "adafactor scheduler must be used with Adafactor optimizer / adafactor scheduler?Adafactor??????????????????"
+                "adafactor scheduler must be used with Adafactor optimizer / adafactor schedulerはAdafactorオプティマイザと同時に使ってください"
             )
             initial_lr = float(name.split(":")[1])
             # logger.info(f"adafactor scheduler init lr {initial_lr}")
@@ -745,7 +745,7 @@ class NetworkTrainer:
         results = loop.run_until_complete(asyncio.gather(*[download(filename=filename.rfilename) for filename in list_files]))
         if len(results) == 0:
             raise ValueError(
-                "No files found in the specified repo id/path/revision / ??????????ID/??/?????????????????????"
+                "No files found in the specified repo id/path/revision / 指定されたリポジトリID/パス/リビジョンにファイルが見つかりませんでした"
             )
         dirname = os.path.dirname(results[0])
         accelerator.load_state(dirname)
@@ -952,7 +952,7 @@ class NetworkTrainer:
                         break
                 if len(available_t) < batch_size:
                     logger.warning(
-                        f"Could not sample {batch_size} valid timesteps in {max_loops} loops / {max_loops}????{batch_size}???????????????????????????"
+                        f"Could not sample {batch_size} valid timesteps in {max_loops} loops / {max_loops}ループで{batch_size}個の有効なタイムステップをサンプリングできませんでした"
                     )
                     available_t = compute_sampling_timesteps(timesteps)
                 else:
@@ -1076,9 +1076,9 @@ class NetworkTrainer:
             return
 
         logger.info("")
-        logger.info(f"generating sample images at step / ???????? ????: {steps}")
+        logger.info(f"generating sample images at step / サンプル画像生成 ステップ: {steps}")
         if sample_parameters is None:
-            logger.error(f"No prompt file / ???????????????: {args.sample_prompts}")
+            logger.error(f"No prompt file / プロンプトファイルがありません: {args.sample_prompts}")
             return
 
         distributed_state = PartialState()  # for multi gpu distributed inference. this is a singleton, so it's safe to use it here
@@ -1152,7 +1152,7 @@ class NetworkTrainer:
         if self.i2v_training:
             image_path = sample_parameter.get("image_path", None)
             if image_path is None:
-                logger.error("No image_path for i2v model / i2v??????????????image_path?????")
+                logger.error("No image_path for i2v model / i2vモデルのサンプル画像生成にはimage_pathが必要です")
                 return
         else:
             image_path = None
@@ -1161,7 +1161,7 @@ class NetworkTrainer:
             control_video_path = sample_parameter.get("control_video_path", None)
             if control_video_path is None:
                 logger.error(
-                    "No control_video_path for control model / control??????????????control_video_path?????"
+                    "No control_video_path for control model / controlモデルのサンプル画像生成にはcontrol_video_pathが必要です"
                 )
                 return
         else:
@@ -1232,7 +1232,7 @@ class NetworkTrainer:
 
         # Save video
         if video is None:
-            logger.error("No video generated / ?????????????")
+            logger.error("No video generated / 生成された動画がありません")
             return
 
         ts_str = time.strftime("%Y%m%d%H%M%S", time.localtime())
@@ -1249,8 +1249,8 @@ class NetworkTrainer:
             try:
                 import wandb
             except ImportError:
-                raise ImportError("No wandb / wandb ?????????????????")
-        except:  # wandb ???
+                raise ImportError("No wandb / wandb がインストールされていないようです")
+        except:  # wandb 無効時
             wandb = None
 
         if video.shape[2] == 1:
@@ -1645,28 +1645,28 @@ class NetworkTrainer:
             if args.cuda_allow_tf32:
                 torch.backends.cuda.matmul.allow_tf32 = True
                 torch.backends.cudnn.allow_tf32 = True
-                logger.info("Enabled TF32 on CUDA / CUDA?TF32????????")
+                logger.info("Enabled TF32 on CUDA / CUDAでTF32を有効化しました")
             if args.cuda_cudnn_benchmark:
                 torch.backends.cudnn.benchmark = True
-                logger.info("Enabled cuDNN benchmark / cuDNN??????????????")
+                logger.info("Enabled cuDNN benchmark / cuDNNベンチマークを有効化しました")
 
         # check required arguments
         if args.dataset_config is None:
-            raise ValueError("dataset_config is required / dataset_config?????")
+            raise ValueError("dataset_config is required / dataset_configが必要です")
         if args.dit is None:
-            raise ValueError("path to DiT model is required / DiT???????????")
-        assert not args.fp8_scaled or args.fp8_base, "fp8_scaled requires fp8_base / fp8_scaled?fp8_base?????"
+            raise ValueError("path to DiT model is required / DiTモデルのパスが必要です")
+        assert not args.fp8_scaled or args.fp8_base, "fp8_scaled requires fp8_base / fp8_scaledはfp8_baseが必要です"
 
         if args.sage_attn:
             raise ValueError(
                 "SageAttention doesn't support training currently. Please use `--sdpa` or `--xformers` etc. instead."
-                " / SageAttention????????????????????`--sdpa`?`--xformers`??????????????????"
+                " / SageAttentionは現在学習をサポートしていないようです。`--sdpa`や`--xformers`などの他のオプションを使ってください"
             )
 
         if args.disable_numpy_memmap:
             logger.info(
                 "Disabling numpy memory mapping for model loading (for Wan, FramePack and Qwen-Image). This may lead to higher memory usage but can speed up loading in some cases."
-                " / ?????????numpy????????????????Wan?FramePack?Qwen-Image?????????????????????????????????????????????????????????"
+                " / SageAttentionは現在学習をサポートしていないようです。`--sdpa`や`--xformers`などの他のオプションを使ってください"
             )
 
         # check model specific arguments
@@ -1720,7 +1720,7 @@ class NetworkTrainer:
         if train_dataset_group.num_train_items == 0:
             raise ValueError(
                 "No training items found in the dataset. Please ensure that the latent/Text Encoder cache has been created beforehand."
-                " / ???????????????????latent/Text Encoder??????????????????????"
+                " / SageAttentionは現在学習をサポートしていないようです。`--sdpa`や`--xformers`などの他のオプションを使ってください"
             )
 
         ds_for_collator = train_dataset_group if args.max_data_loader_n_workers == 0 else None
@@ -1739,7 +1739,7 @@ class NetworkTrainer:
         accelerator = prepare_accelerator(args)
         if args.mixed_precision is None:
             args.mixed_precision = accelerator.mixed_precision
-            logger.info(f"mixed precision set to {args.mixed_precision} / mixed precision?{args.mixed_precision}???")
+            logger.info(f"mixed precision set to {args.mixed_precision} / mixed precisionを{args.mixed_precision}に設定")
         is_main_process = accelerator.is_main_process
 
         # prepare dtype
@@ -1784,7 +1784,7 @@ class NetworkTrainer:
             attn_mode = "flash3"
         else:
             raise ValueError(
-                "either --sdpa, --flash-attn, --flash3, --sage-attn or --xformers must be specified / --sdpa, --flash-attn, --flash3, --sage-attn, --xformers??????????????"
+                "either --sdpa, --flash-attn, --flash3, --sage-attn or --xformers must be specified / --sdpa, --flash-attn, --flash3, --sage-attn, --xformersのいずれかを指定してください"
             )
         transformer = self.load_transformer(
             accelerator, args, args.dit, attn_mode, args.split_attn, loading_device, dit_weight_dtype
@@ -1932,7 +1932,7 @@ class NetworkTrainer:
                 len(train_dataloader) / accelerator.num_processes / args.gradient_accumulation_steps
             )
             accelerator.print(
-                f"override steps. steps for {args.max_train_epochs} epochs is / ??????????????: {args.max_train_steps}"
+                f"override steps. steps for {args.max_train_epochs} epochs is / 指定エポックまでのステップ数: {args.max_train_steps}"
             )
 
         # send max_train_steps to train_dataset_group
@@ -1948,14 +1948,14 @@ class NetworkTrainer:
         args.full_fp16 = args.full_bf16 = False  # temporary disabled because stochastic rounding is not supported yet
         if args.full_fp16:
             assert args.mixed_precision == "fp16", (
-                "full_fp16 requires mixed precision='fp16' / full_fp16??????mixed_precision='fp16'??????????"
+                "full_fp16 requires mixed precision='fp16' / full_fp16を使う場合はmixed_precision='fp16'を指定してください。"
             )
             accelerator.print("enable full fp16 training.")
             network_dtype = weight_dtype
             network.to(network_dtype)
         elif args.full_bf16:
             assert args.mixed_precision == "bf16", (
-                "full_bf16 requires mixed precision='bf16' / full_bf16??????mixed_precision='bf16'??????????"
+                "full_bf16 requires mixed precision='bf16' / full_bf16を使う場合はmixed_precision='bf16'を指定してください。"
             )
             accelerator.print("enable full bf16 training.")
             network_dtype = weight_dtype
@@ -2033,23 +2033,23 @@ class NetworkTrainer:
         # resume from local or huggingface. accelerator.step is set
         self.resume_from_local_or_hf_if_specified(accelerator, args)  # accelerator.load_state(args.resume)
 
-        # epoch??????
+        # epoch数を計算する
         num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
         num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
 
-        # ????
+        # 学習する
         # total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
 
-        accelerator.print("running training / ????")
-        accelerator.print(f"  num train items / ????????: {train_dataset_group.num_train_items}")
-        accelerator.print(f"  num batches per epoch / 1epoch?????: {len(train_dataloader)}")
+        accelerator.print("running training / 学習開始")
+        accelerator.print(f"  num train items / 学習画像、動画数: {train_dataset_group.num_train_items}")
+        accelerator.print(f"  num batches per epoch / 1epochのバッチ数: {len(train_dataloader)}")
         accelerator.print(f"  num epochs / epoch?: {num_train_epochs}")
         accelerator.print(
-            f"  batch size per device / ??????: {', '.join([str(d.batch_size) for d in train_dataset_group.datasets])}"
+            f"  batch size per device / バッチサイズ: {', '.join([str(d.batch_size) for d in train_dataset_group.datasets])}"
         )
-        # accelerator.print(f"  total train batch size (with parallel & distributed & accumulation) / ????????????????????: {total_batch_size}")
-        accelerator.print(f"  gradient accumulation steps / ???????????? = {args.gradient_accumulation_steps}")
-        accelerator.print(f"  total optimization steps / ???????: {args.max_train_steps}")
+        # accelerator.print(f"  total train batch size (with parallel & distributed & accumulation) / 総バッチサイズ（並列学習、勾配合計含む）: {total_batch_size}")
+        accelerator.print(f"  gradient accumulation steps / 勾配を合計するステップ数 = {args.gradient_accumulation_steps}")
+        accelerator.print(f"  total optimization steps / 学習ステップ数: {args.max_train_steps}")
 
         # TODO refactor metadata creation and move to util
         metadata = {
@@ -2688,65 +2688,65 @@ def setup_parser_common() -> argparse.ArgumentParser:
         "--config_file",
         type=str,
         default=None,
-        help="using .toml instead of args to pass hyperparameter / ????????????????.toml???????",
+        help="using .toml instead of args to pass hyperparameter / ハイパーパラメータを引数ではなく.tomlファイルで渡す",
     )
     parser.add_argument(
         "--dataset_config",
         type=pathlib.Path,
         default=None,
-        help="config file for dataset / ?????????????",
+        help="config file for dataset / データセットの設定ファイル",
     )
 
     # model settings
     parser.add_argument(
         "--sdpa",
         action="store_true",
-        help="use sdpa for CrossAttention (requires PyTorch 2.0) / CrossAttention?sdpa????PyTorch 2.0????",
+        help="use sdpa for CrossAttention (requires PyTorch 2.0) / CrossAttentionにsdpaを使う（PyTorch 2.0が必要）",
     )
     parser.add_argument(
         "--flash_attn",
         action="store_true",
-        help="use FlashAttention for CrossAttention, requires FlashAttention / CrossAttention?FlashAttention????FlashAttention???",
+        help="use FlashAttention for CrossAttention, requires FlashAttention / CrossAttentionにFlashAttentionを使う、FlashAttentionが必要",
     )
     parser.add_argument(
         "--sage_attn",
         action="store_true",
-        help="use SageAttention. requires SageAttention / SageAttention????SageAttention???",
+        help="use SageAttention. requires SageAttention / SageAttentionを使う。SageAttentionが必要",
     )
     parser.add_argument(
         "--xformers",
         action="store_true",
-        help="use xformers for CrossAttention, requires xformers / CrossAttention?xformers????xformers???",
+        help="use xformers for CrossAttention, requires xformers / CrossAttentionにxformersを使う、xformersが必要",
     )
     parser.add_argument(
         "--flash3",
         action="store_true",
         help="use FlashAttention 3 for CrossAttention, requires FlashAttention 3, HunyuanVideo does not support this yet"
-        " / CrossAttention?FlashAttention 3????FlashAttention 3????HunyuanVideo?????",
+        " / torch.compileの動的形状モード（デフォルト: None、autoと同じ動作）",
     )
     parser.add_argument(
         "--split_attn",
         action="store_true",
         help="use split attention for attention calculation (split batch size=1, affects memory usage and speed)"
-        " / attention????????????????=1?????????????????",
+        " / attentionを分割して計算する（バッチサイズ=1に分割、メモリ使用量と速度に影響）",
     )
     parser.add_argument(
         "--compile",
         action="store_true",
-        help="Enable torch.compile (requires Triton) / torch.compile???????Triton????",
+        help="Enable torch.compile (requires Triton) / torch.compileを有効にする（Tritonが必要）",
     )
     parser.add_argument(
         "--compile_backend",
         type=str,
         default="inductor",
-        help="torch.compile backend (default: inductor) / torch.compile?????????????: inductor?",
+        help="torch.compile backend (default: inductor) / torch.compileのバックエンド（デフォルト: inductor）",
     )
     parser.add_argument(
         "--compile_mode",
         type=str,
-        default="default",  # ?????????
+        default="default",  # 学習用のデフォルト
         choices=["default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"],
-        help="torch.compile mode (default: default) / torch.compile??????????: default?",
+        help="torch.compile mode (default: default) / torch.compileのモード（デフォルト: default）",
     )
     parser.add_argument(
         "--compile_dynamic",
@@ -2754,151 +2754,151 @@ def setup_parser_common() -> argparse.ArgumentParser:
         default=None,
         choices=["true", "false", "auto"],
         help="Dynamic shapes mode for torch.compile (default: None, same as auto)"
-        " / torch.compile??????????????: None?auto??????",
+        " / torch.compileの動的形状モード（デフォルト: None、autoと同じ動作）",
     )
     parser.add_argument(
         "--compile_fullgraph",
         action="store_true",
-        help="Enable fullgraph mode in torch.compile / torch.compile???????????????",
+        help="Enable fullgraph mode in torch.compile / torch.compileでフルグラフモードを有効にする",
     )
     parser.add_argument(
         "--compile_cache_size_limit",
         type=int,
         default=None,
-        help="Set torch._dynamo.config.cache_size_limit (default: PyTorch default, typically 8-32) / torch._dynamo.config.cache_size_limit?????????: PyTorch?????????8-32?",
+        help="Set torch._dynamo.config.cache_size_limit (default: PyTorch default, typically 8-32) / torch._dynamo.config.cache_size_limitを設定（デフォルト: PyTorchのデフォルト、通常8-32）",
     )
     parser.add_argument(
         "--cuda_allow_tf32",
         action="store_true",
-        help="Allow TF32 on Ampere or higher GPUs / Ampere???GPU?TF32?????",
+        help="Allow TF32 on Ampere or higher GPUs / Ampere以降のGPUでTF32を許可する",
     )
     parser.add_argument(
         "--cuda_cudnn_benchmark",
         action="store_true",
-        help="Enable cudnn benchmark for possibly faster training / cudnn??????????????????????",
+        help="Enable cudnn benchmark for possibly faster training / cudnnのベンチマークを有効にして学習の高速化を図る",
     )
 
     # training settings
-    parser.add_argument("--max_train_steps", type=int, default=1600, help="training steps / ???????")
+    parser.add_argument("--max_train_steps", type=int, default=1600, help="training steps / 学習ステップ数")
     parser.add_argument(
         "--max_train_epochs",
         type=int,
         default=None,
-        help="training epochs (overrides max_train_steps) / ????????max_train_steps????????",
+        help="training epochs (overrides max_train_steps) / 学習エポック数（max_train_stepsを上書きします）",
     )
     parser.add_argument(
         "--max_data_loader_n_workers",
         type=int,
         default=8,
-        help="max num workers for DataLoader (lower is less main RAM usage, faster epoch start and slower data loading) / DataLoader????????????????????????????????????????????????????????????",
+        help="max num workers for DataLoader (lower is less main RAM usage, faster epoch start and slower data loading) / DataLoaderの最大プロセス数（小さい値ではメインメモリの使用量が減りエポック間の待ち時間が減りますが、データ読み込みは遅くなります）",
     )
     parser.add_argument(
         "--persistent_data_loader_workers",
         action="store_true",
-        help="persistent DataLoader workers (useful for reduce time gap between epoch, but may use more memory) / DataLoader ??????????? (?????????????????????????????????????????)",
+        help="persistent DataLoader workers (useful for reduce time gap between epoch, but may use more memory) / DataLoader のワーカーを持続させる (エポック間の時間差を少なくするのに有効だが、より多くのメモリを消費する可能性がある)",
     )
-    parser.add_argument("--seed", type=int, default=None, help="random seed for training / ???????seed")
+    parser.add_argument("--seed", type=int, default=None, help="random seed for training / 学習時の乱数のseed")
     parser.add_argument(
-        "--gradient_checkpointing", action="store_true", help="enable gradient checkpointing / gradient checkpointing??????"
+        "--gradient_checkpointing", action="store_true", help="enable gradient checkpointing / gradient checkpointingを有効にする"
     )
     parser.add_argument(
         "--gradient_checkpointing_cpu_offload",
         action="store_true",
-        help="enable CPU offloading of activation for gradient checkpointing / gradient checkpointing??????CPU???????????",
+        help="enable CPU offloading of activation for gradient checkpointing / gradient checkpointing時に活性化のCPUオフロードを有効にする",
     )
     parser.add_argument(
         "--gradient_accumulation_steps",
         type=int,
         default=1,
-        help="Number of updates steps to accumulate before performing a backward/update pass / ????????????????????????",
+        help="Number of updates steps to accumulate before performing a backward/update pass / 学習時に逆伝播をする前に勾配を合計するステップ数",
     )
     parser.add_argument(
         "--mixed_precision",
         type=str,
         default=None,
         choices=["no", "fp16", "bf16"],
-        help="use mixed precision / ??????????????",
+        help="use mixed precision / 混合精度を使う場合、その精度",
     )
 
     parser.add_argument(
         "--logging_dir",
         type=str,
         default=None,
-        help="enable logging and output TensorBoard log to this directory / ???????????????????TensorBoard?????????",
+        help="enable logging and output TensorBoard log to this directory / ログ出力を有効にしてこのディレクトリにTensorBoard用のログを出力する",
     )
     parser.add_argument(
         "--log_with",
         type=str,
         default=None,
         choices=["tensorboard", "wandb", "all"],
-        help="what logging tool(s) to use (if 'all', TensorBoard and WandB are both used) / ???????????? (all??????TensorBoard?WandB?????????)",
+        help="what logging tool(s) to use (if 'all', TensorBoard and WandB are both used) / ログ出力に使用するツール (allを指定するとTensorBoardとWandBの両方が使用される)",
     )
     parser.add_argument(
-        "--log_prefix", type=str, default=None, help="add prefix for each log directory / ????????????????????"
+        "--log_prefix", type=str, default=None, help="add prefix for each log directory / ログディレクトリ名の先頭に追加する文字列"
     )
     parser.add_argument(
         "--log_tracker_name",
         type=str,
         default=None,
-        help="name of tracker to use for logging, default is script-specific default name / ?????????tracker??????????????????????",
+        help="name of tracker to use for logging, default is script-specific default name / ログ出力に使用するtrackerの名前、省略時はスクリプトごとのデフォルト名",
     )
     parser.add_argument(
         "--wandb_run_name",
         type=str,
         default=None,
-        help="The name of the specific wandb session / wandb ????????????????",
+        help="The name of the specific wandb session / wandb ログに表示される特定の実行の名前",
     )
     parser.add_argument(
         "--log_tracker_config",
         type=str,
         default=None,
-        help="path to tracker config file to use for logging / ?????????tracker??????????",
+        help="path to tracker config file to use for logging / ログ出力に使用するtrackerの設定ファイルのパス",
     )
     parser.add_argument(
         "--wandb_api_key",
         type=str,
         default=None,
-        help="specify WandB API key to log in before starting training (optional). / WandB API??????????????????????????",
+        help="specify WandB API key to log in before starting training (optional). / WandB APIキーを指定して学習開始前にログインする（オプション）",
     )
-    parser.add_argument("--log_config", action="store_true", help="log training configuration / ????????????")
+    parser.add_argument("--log_config", action="store_true", help="log training configuration / 学習設定をログに出力する")
 
     parser.add_argument(
         "--ddp_timeout",
         type=int,
         default=None,
-        help="DDP timeout (min, None for default of accelerate) / DDP??????????None?accelerate???????",
+        help="DDP timeout (min, None for default of accelerate) / DDPのタイムアウト（分、Noneでaccelerateのデフォルト）",
     )
     parser.add_argument(
         "--ddp_gradient_as_bucket_view",
         action="store_true",
-        help="enable gradient_as_bucket_view for DDP / DDP?gradient_as_bucket_view??????",
+        help="enable gradient_as_bucket_view for DDP / DDPでgradient_as_bucket_viewを有効にする",
     )
     parser.add_argument(
         "--ddp_static_graph",
         action="store_true",
-        help="enable static_graph for DDP / DDP?static_graph??????",
+        help="enable static_graph for DDP / DDPでstatic_graphを有効にする",
     )
 
     parser.add_argument(
         "--sample_every_n_steps",
         type=int,
         default=None,
-        help="generate sample images every N steps / ?????????????????????????",
+        help="generate sample images every N steps / 学習中のモデルで指定ステップごとにサンプル出力する",
     )
     parser.add_argument(
-        "--sample_at_first", action="store_true", help="generate sample images before training / ????????????"
+        "--sample_at_first", action="store_true", help="generate sample images before training / 学習前にサンプル出力する"
     )
     parser.add_argument(
         "--sample_every_n_epochs",
         type=int,
         default=None,
-        help="generate sample images every N epochs (overwrites n_steps) / ?????????????????????????????????????????",
+        help="generate sample images every N epochs (overwrites n_steps) / 学習中のモデルで指定エポックごとにサンプル出力する（ステップ数指定を上書きします）",
     )
     parser.add_argument(
         "--sample_prompts",
         type=str,
         default=None,
-        help="file for prompts to generate sample images / ????????????????????????",
+        help="file for prompts to generate sample images / 学習中モデルのサンプル出力用プロンプトのファイル",
     )
     parser.add_argument(
         "--validate_every_n_steps",
@@ -2918,7 +2918,7 @@ def setup_parser_common() -> argparse.ArgumentParser:
         "--optimizer_type",
         type=str,
         default="",
-        help="Optimizer to use / ??????????: AdamW (default), AdamW8bit, AdaFactor. "
+        help="Optimizer to use / オプティマイザの種類: AdamW (default), AdamW8bit, AdaFactor. "
         "Also, you can use any optimizer by specifying the full path to the class, like 'torch.optim.AdamW', 'bitsandbytes.optim.AdEMAMix8bit' or 'bitsandbytes.optim.PagedAdEMAMix8bit' etc. / ",
     )
     parser.add_argument(
@@ -2926,81 +2926,81 @@ def setup_parser_common() -> argparse.ArgumentParser:
         type=str,
         default=None,
         nargs="*",
-        help='additional arguments for optimizer (like "weight_decay=0.01 betas=0.9,0.999 ...") / ??????????????? "weight_decay=0.01 betas=0.9,0.999 ..."?',
+        help='additional arguments for optimizer (like "weight_decay=0.01 betas=0.9,0.999 ...") / オプティマイザの追加引数（例： "weight_decay=0.01 betas=0.9,0.999 ..."）',
     )
-    parser.add_argument("--learning_rate", type=float, default=2.0e-6, help="learning rate / ???")
+    parser.add_argument("--learning_rate", type=float, default=2.0e-6, help="learning rate / 学習率")
     parser.add_argument(
         "--max_grad_norm",
         default=1.0,
         type=float,
-        help="Max gradient norm, 0 for no clipping / ????????norm?0?clipping?????",
+        help="Max gradient norm, 0 for no clipping / 勾配正規化の最大norm、0でclippingを行わない",
     )
 
     parser.add_argument(
         "--lr_scheduler",
         type=str,
         default="constant",
-        help="scheduler to use for learning rate / ??????????: linear, cosine, cosine_with_restarts, polynomial, constant (default), constant_with_warmup, adafactor, rex",
+        help="scheduler to use for learning rate / 学習率のスケジューラ: linear, cosine, cosine_with_restarts, polynomial, constant (default), constant_with_warmup, adafactor, rex",
     )
     parser.add_argument(
         "--lr_warmup_steps",
         type=int_or_float,
         default=0,
         help="Int number of steps for the warmup in the lr scheduler (default is 0) or float with ratio of train steps"
-        " / ???????????????????????????????0???????????????1???float?????",
+        " / torch.compileの動的形状モード（デフォルト: None、autoと同じ動作）",
     )
     parser.add_argument(
         "--lr_decay_steps",
         type=int_or_float,
         default=0,
         help="Int number of steps for the decay in the lr scheduler (default is 0) or float (<1) with ratio of train steps"
-        " / ???????????????????????????0???????????????1???float?????",
+        " / torch.compileの動的形状モード（デフォルト: None、autoと同じ動作）",
     )
     parser.add_argument(
         "--lr_scheduler_num_cycles",
         type=int,
         default=1,
-        help="Number of restarts for cosine scheduler with restarts / cosine with restarts???????????????",
+        help="Number of restarts for cosine scheduler with restarts / cosine with restartsスケジューラでのリスタート回数",
     )
     parser.add_argument(
         "--lr_scheduler_power",
         type=float,
         default=1,
-        help="Polynomial power for polynomial scheduler / polynomial????????polynomial power",
+        help="Polynomial power for polynomial scheduler / polynomialスケジューラでのpolynomial power",
     )
     parser.add_argument(
         "--lr_scheduler_timescale",
         type=int,
         default=None,
         help="Inverse sqrt timescale for inverse sqrt scheduler,defaults to `num_warmup_steps`"
-        + " / ?????????????????????????`num_warmup_steps`",
+        + " / 逆平方根スケジューラのタイムスケール、デフォルトは`num_warmup_steps`",
     )
     parser.add_argument(
         "--lr_scheduler_min_lr_ratio",
         type=float,
         default=None,
         help="The minimum learning rate as a ratio of the initial learning rate for cosine with min lr scheduler, warmup decay scheduler and rex scheduler"
-        + " / ???????????????????????cosine with min lr ???????warmup decay ???????rex ?????? ???",
+        + " / 逆平方根スケジューラのタイムスケール、デフォルトは`num_warmup_steps`",
     )
-    parser.add_argument("--lr_scheduler_type", type=str, default="", help="custom scheduler module / ??????????")
+    parser.add_argument("--lr_scheduler_type", type=str, default="", help="custom scheduler module / 使用するスケジューラ")
     parser.add_argument(
         "--lr_scheduler_args",
         type=str,
         default=None,
         nargs="*",
-        help='additional arguments for scheduler (like "T_max=100") / ?????????????? "T_max100"?',
+        help='additional arguments for scheduler (like "T_max=100") / スケジューラの追加引数（例： "T_max100"）',
     )
 
-    parser.add_argument("--fp8_base", action="store_true", help="use fp8 for base model / base model?fp8???")
-    # parser.add_argument("--full_fp16", action="store_true", help="fp16 training including gradients / ??????fp16?????")
-    # parser.add_argument("--full_bf16", action="store_true", help="bf16 training including gradients / ??????bf16?????")
+    parser.add_argument("--fp8_base", action="store_true", help="use fp8 for base model / base modelにfp8を使う")
+    # parser.add_argument("--full_fp16", action="store_true", help="fp16 training including gradients / 勾配も含めてfp16で学習する")
+    # parser.add_argument("--full_bf16", action="store_true", help="bf16 training including gradients / 勾配も含めてbf16で学習する")
 
     parser.add_argument(
         "--dynamo_backend",
         type=str,
         default="NO",
         choices=[e.value for e in DynamoBackend],
-        help="dynamo backend type (default is None) / dynamo?backend?????????? None?",
+        help="dynamo backend type (default is None) / dynamoのbackendの種類（デフォルトは None）",
     )
 
     parser.add_argument(
@@ -3008,49 +3008,49 @@ def setup_parser_common() -> argparse.ArgumentParser:
         type=str,
         default=None,
         choices=["default", "reduce-overhead", "max-autotune"],
-        help="dynamo mode (default is default) / dynamo??????????? default?",
+        help="dynamo mode (default is default) / dynamoのモード（デフォルトは default）",
     )
 
     parser.add_argument(
         "--dynamo_fullgraph",
         action="store_true",
-        help="use fullgraph mode for dynamo / dynamo?fullgraph??????",
+        help="use fullgraph mode for dynamo / dynamoのfullgraphモードを使う",
     )
 
     parser.add_argument(
         "--dynamo_dynamic",
         action="store_true",
-        help="use dynamic mode for dynamo / dynamo?dynamic??????",
+        help="use dynamic mode for dynamo / dynamoのdynamicモードを使う",
     )
 
     parser.add_argument(
         "--blocks_to_swap",
         type=int,
         default=None,
-        help="number of blocks to swap in the model, max XXX / ??????????????XXX",
+        help="number of blocks to swap in the model, max XXX / モデル内のブロックの数、最大XXX",
     )
     parser.add_argument(
         "--use_pinned_memory_for_block_swap",
         action="store_true",
         help="use pinned memory for block swapping, which may speed up data transfer between CPU and GPU but uses more shared GPU memory on Windows"
-        " / ?????????????????????????????CPU?GPU??????????????????????Windows?????????GPU?????????",
+        " / torch.compileの動的形状モード（デフォルト: None、autoと同じ動作）",
     )
     parser.add_argument(
         "--swap_norms",
         action="store_true",
         help="Also swap RMSNorm/LayerNorm weights to CPU along with Linear weights during block swap. Saves more VRAM but increases CPU-GPU transfer overhead. LTX-2 only."
-        " / ??????????Linear??????RMSNorm/LayerNorm????CPU????????VRAM??????????CPU-GPU???????????????LTX-2???",
+        " / torch.compileの動的形状モード（デフォルト: None、autoと同じ動作）",
     )
     parser.add_argument(
         "--img_in_txt_in_offloading",
         action="store_true",
-        help="offload img_in and txt_in to cpu / img_in?txt_in?CPU????????",
+        help="offload img_in and txt_in to cpu / img_inとtxt_inをCPUにオフロードする",
     )
     parser.add_argument(
         "--disable_numpy_memmap",
         action="store_true",
         help="Disable numpy memory mapping for model loading. Only for Wan, FramePack and Qwen-Image. Increases RAM usage but speeds up model loading in some cases."
-        " / ?????????numpy????????????????Wan?FramePack?Qwen-Image??????RAM??????????????????????????????????",
+        " / torch.compileの動的形状モード（デフォルト: None、autoと同じ動作）",
     )
 
     # parser.add_argument("--flow_shift", type=float, default=7.0, help="Shift factor for flow matching schedulers")
@@ -3063,56 +3063,56 @@ def setup_parser_common() -> argparse.ArgumentParser:
         default="sigma",
         help="Method to sample timesteps: sigma-based, uniform random, sigmoid of random normal, shift of sigmoid, flux shift, "
         "or shifted_logit_normal (sequence-length-adaptive, official LTX-2 method)."
-        " / ???????????????????sigma?random uniform?random normal?sigmoid?sigmoid?????flux shift?shifted_logit_normal?",
+        " / torch.compileの動的形状モード（デフォルト: None、autoと同じ動作）",
     )
     parser.add_argument(
         "--discrete_flow_shift",
         type=float,
         default=1.0,
-        help="Discrete flow shift for the Euler Discrete Scheduler, default is 1.0. / Euler Discrete Scheduler????????????????1.0?",
+        help="Discrete flow shift for the Euler Discrete Scheduler, default is 1.0. / Euler Discrete Schedulerの離散フローシフト、デフォルトは1.0。",
     )
     parser.add_argument(
         "--sigmoid_scale",
         type=float,
         default=1.0,
-        help='Scale factor for sigmoid timestep sampling (only used when timestep-sampling is "sigmoid" or "shift"). / sigmoid?????????????????timestep-sampling?"sigmoid"???"shift"?????????',
+        help='Scale factor for sigmoid timestep sampling (only used when timestep-sampling is "sigmoid" or "shift"). / sigmoidタイムステップサンプリングの倍率（timestep-samplingが"sigmoid"または"shift"の場合のみ有効）。',
     )
     parser.add_argument(
         "--weighting_scheme",
         type=str,
         default="none",
         choices=["logit_normal", "mode", "cosmap", "sigma_sqrt", "none"],
-        help="weighting scheme for timestep distribution. Default is none / ?????????????????????????none",
+        help="weighting scheme for timestep distribution. Default is none / タイムステップ分布の重み付けスキーム、デフォルトはnone",
     )
     parser.add_argument(
         "--logit_mean",
         type=float,
         default=0.0,
-        help="mean to use when using the `'logit_normal'` weighting scheme / `'logit_normal'`??????????????????",
+        help="mean to use when using the `'logit_normal'` weighting scheme / `'logit_normal'`重み付けスキームを使用する場合の平均",
     )
     parser.add_argument(
         "--logit_std",
         type=float,
         default=1.0,
-        help="std to use when using the `'logit_normal'` weighting scheme / `'logit_normal'`????????????????std",
+        help="std to use when using the `'logit_normal'` weighting scheme / `'logit_normal'`重み付けスキームを使用する場合のstd",
     )
     parser.add_argument(
         "--mode_scale",
         type=float,
         default=1.29,
-        help="Scale of mode weighting scheme. Only effective when using the `'mode'` as the `weighting_scheme` / ????????????????",
+        help="Scale of mode weighting scheme. Only effective when using the `'mode'` as the `weighting_scheme` / モード重み付けスキームのスケール",
     )
     parser.add_argument(
         "--min_timestep",
         type=int,
         default=None,
-        help="set minimum time step for training (0~999, default is 0) / ????time step??????????0~999??????????????(0)? ",
+        help="set minimum time step for training (0~999, default is 0) / 学習時のtime stepの最小値を設定する（0~999で指定、省略時はデフォルト値(0)） ",
     )
     parser.add_argument(
         "--max_timestep",
         type=int,
         default=None,
-        help="set maximum time step for training (1~1000, default is 1000) / ????time step??????????1~1000??????????????(1000)?",
+        help="set maximum time step for training (1~1000, default is 1000) / 学習時のtime stepの最大値を設定する（1~1000で指定、省略時はデフォルト値(1000)）",
     )
     parser.add_argument(
         "--preserve_distribution_shape",
@@ -3120,8 +3120,8 @@ def setup_parser_common() -> argparse.ArgumentParser:
         help="If specified, constrains timestep sampling to [min_timestep, max_timestep] "
         "using rejection sampling, preserving the original distribution shape. "
         "By default, the [0, 1] range is scaled, which distorts the distribution. Only effective when `timestep_sampling` is not 'sigma'."
-        " / ?????????????????????[???????????????????]??????????????????"
-        "????????[0, 1]??????????????????????????timestep_sampling?sigma????????",
+        " / 指定すると拒否サンプリングでtimestep samplingを[min_timestep, max_timestep]に制限し、元の分布形状を保持します。"
+        "デフォルトでは[0, 1]範囲をスケーリングするため分布が歪みます。`timestep_sampling`が'sigma'以外のときのみ有効です。"
     )
     parser.add_argument(
         "--num_timestep_buckets",
@@ -3131,9 +3131,9 @@ def setup_parser_common() -> argparse.ArgumentParser:
             "Number of buckets for timestep sampling. Default is None, which disables bucketing. "
             "Set to 2 or more to enable stratified sampling. This forces timesteps to be sampled "
             "uniformly from the [0, 1] range, which can improve training stability, especially for small datasets."
-            " / timestep???????????????????None???????????????"
-            "2????????????????????????????[0, 1]?????????????????????????"
-            "??????????????????????????????????"
+            " / timestepサンプリングのバケット数。デフォルトはNoneで無効です。"
+            "2以上で層化サンプリングを有効にします。"
+            "[0, 1]範囲から一様にサンプルされるため、特に小規模データセットで学習の安定性が向上します。"
         ),
     )
 
@@ -3142,134 +3142,134 @@ def setup_parser_common() -> argparse.ArgumentParser:
         type=str,
         default=None,
         choices=["image", "console"],
-        help="show timesteps in image or console, and return to console / ???????????????????????????????",
+        help="show timesteps in image or console, and return to console / タイムステップを画像またはコンソールに表示し、コンソールに戻る",
     )
 
     # network settings
     parser.add_argument(
-        "--no_metadata", action="store_true", help="do not save metadata in output model / ??????????????????"
+        "--no_metadata", action="store_true", help="do not save metadata in output model / メタデータを出力先モデルに保存しない"
     )
     parser.add_argument(
-        "--network_weights", type=str, default=None, help="pretrained weights for network / ???????????????"
+        "--network_weights", type=str, default=None, help="pretrained weights for network / 学習するネットワークの初期重み"
     )
     parser.add_argument(
-        "--network_module", type=str, default=None, help="network module to train / ?????????????????"
+        "--network_module", type=str, default=None, help="network module to train / 学習対象のネットワークのモジュール"
     )
     parser.add_argument(
         "--network_dim",
         type=int,
         default=None,
-        help="network dimensions (depends on each network) / ????????????????????????????",
+        help="network dimensions (depends on each network) / モジュールの次元数（ネットワークにより定義は異なります）",
     )
     parser.add_argument(
         "--network_alpha",
         type=float,
         default=1,
-        help="alpha for LoRA weight scaling, default 1 (same as network_dim for same behavior as old version) / LoRa??????alpha???????1?????????????????network_dim????????",
+        help="alpha for LoRA weight scaling, default 1 (same as network_dim for same behavior as old version) / LoRaの重み調整のalpha値、デフォルト1（旧バージョンと同じ動作をするにはnetwork_dimと同じ値を指定）",
     )
     parser.add_argument(
         "--network_dropout",
         type=float,
         default=None,
-        help="Drops neurons out of training every step (0 or None is default behavior (no dropout), 1 would drop all neurons) / ????????????????drop???0???None?dropout???1????????dropout?",
+        help="Drops neurons out of training every step (0 or None is default behavior (no dropout), 1 would drop all neurons) / 訓練時に毎ステップでニューロンをdropする（0またはNoneはdropoutなし、1は全ニューロンをdropout）",
     )
     parser.add_argument(
         "--network_args",
         type=str,
         default=None,
         nargs="*",
-        help="additional arguments for network (key=value) / ?????????????",
+        help="additional arguments for network (key=value) / ネットワークへの追加の引数",
     )
     parser.add_argument(
         "--training_comment",
         type=str,
         default=None,
-        help="arbitrary comment string stored in metadata / ????????????????????",
+        help="arbitrary comment string stored in metadata / メタデータに記録する任意のコメント文字列",
     )
     parser.add_argument(
         "--dim_from_weights",
         action="store_true",
-        help="automatically determine dim (rank) from network_weights / dim (rank)?network_weights????????????????",
+        help="automatically determine dim (rank) from network_weights / dim (rank)をnetwork_weightsで指定した重みから自動で決定する",
     )
     parser.add_argument(
         "--scale_weight_norms",
         type=float,
         default=None,
-        help="Scale the weight of each key pair to help prevent overtraing via exploding gradients. (1 is a good starting point) / ?????????????????????1???????????",
+        help="Scale the weight of each key pair to help prevent overtraing via exploding gradients. (1 is a good starting point) / 重みの値をスケーリングして勾配爆発を防ぐ（1が初期値としては適当）",
     )
     parser.add_argument(
         "--base_weights",
         type=str,
         default=None,
         nargs="*",
-        help="network weights to merge into the model before training / ??????????????????network???????",
+        help="network weights to merge into the model before training / 学習前にあらかじめモデルにマージするnetworkの重みファイル",
     )
     parser.add_argument(
         "--base_weights_multiplier",
         type=float,
         default=None,
         nargs="*",
-        help="multiplier for network weights to merge into the model before training / ??????????????????network??????",
+        help="multiplier for network weights to merge into the model before training / 学習前にあらかじめモデルにマージするnetworkの重みの倍率",
     )
 
     # save and load settings
     parser.add_argument(
-        "--output_dir", type=str, default=None, help="directory to output trained model / ????????????????"
+        "--output_dir", type=str, default=None, help="directory to output trained model / 学習後のモデル出力先ディレクトリ"
     )
     parser.add_argument(
         "--output_name",
         type=str,
         default=None,
-        help="base name of trained model file / ???????????????????",
+        help="base name of trained model file / 学習後のモデルの拡張子を除くファイル名",
     )
-    parser.add_argument("--resume", type=str, default=None, help="saved state to resume training / ??????????state")
+    parser.add_argument("--resume", type=str, default=None, help="saved state to resume training / 学習再開するモデルのstate")
 
     parser.add_argument(
         "--save_every_n_epochs",
         type=int,
         default=None,
-        help="save checkpoint every N epochs / ?????????????????????",
+        help="save checkpoint every N epochs / 学習中のモデルを指定エポックごとに保存する",
     )
     parser.add_argument(
         "--save_every_n_steps",
         type=int,
         default=None,
-        help="save checkpoint every N steps / ?????????????????????",
+        help="save checkpoint every N steps / 学習中のモデルを指定ステップごとに保存する",
     )
     parser.add_argument(
         "--save_last_n_epochs",
         type=int,
         default=None,
-        help="save last N checkpoints when saving every N epochs (remove older checkpoints) / ?????????????????????N?????????????????????????",
+        help="save last N checkpoints when saving every N epochs (remove older checkpoints) / 指定エポックごとにモデルを保存するとき最大Nエポック保存する（古いチェックポイントは削除する）",
     )
     parser.add_argument(
         "--save_last_n_epochs_state",
         type=int,
         default=None,
-        help="save last N checkpoints of state (overrides the value of --save_last_n_epochs)/ ??N????state??????--save_last_n_epochs??????????",
+        help="save last N checkpoints of state (overrides the value of --save_last_n_epochs)/ 最大Nエポックstateを保存する（--save_last_n_epochsの指定を上書きする）",
     )
     parser.add_argument(
         "--save_last_n_steps",
         type=int,
         default=None,
-        help="save checkpoints until N steps elapsed (remove older checkpoints if N steps elapsed) / ???????????????????????????????????????????????????????",
+        help="save checkpoints until N steps elapsed (remove older checkpoints if N steps elapsed) / 指定ステップごとにモデルを保存するとき、このステップ数経過するまで保存する（このステップ数経過したら削除する）",
     )
     parser.add_argument(
         "--save_last_n_steps_state",
         type=int,
         default=None,
-        help="save states until N steps elapsed (remove older states if N steps elapsed, overrides --save_last_n_steps) / ?????????state???????????????????????????????????????????--save_last_n_steps???????",
+        help="save states until N steps elapsed (remove older states if N steps elapsed, overrides --save_last_n_steps) / 指定ステップごとにstateを保存するとき、このステップ数経過するまで保存する（このステップ数経過したら削除する。--save_last_n_stepsを上書きする）",
     )
     parser.add_argument(
         "--save_state",
         action="store_true",
-        help="save training state additionally (including optimizer states etc.) when saving model / optimizer??????????state???????????????",
+        help="save training state additionally (including optimizer states etc.) when saving model / optimizerなど学習状態も含めたstateをモデル保存時に追加で保存する",
     )
     parser.add_argument(
         "--save_state_on_train_end",
         action="store_true",
         help="save training state (including optimizer states etc.) on train end even if --save_state is not specified"
-        " / --save_state???????optimizer??????????state???????????",
+        " / --save_stateが未指定時にもoptimizerなど学習状態も含めたstateを学習終了時に保存する",
     )
 
     # SAI Model spec
@@ -3277,43 +3277,43 @@ def setup_parser_common() -> argparse.ArgumentParser:
         "--metadata_title",
         type=str,
         default=None,
-        help="title for model metadata (default is output_name) / ????????????????????????output_name",
+        help="title for model metadata (default is output_name) / メタデータに書き込まれるモデルタイトル、省略時はoutput_name",
     )
     parser.add_argument(
         "--metadata_author",
         type=str,
         default=None,
-        help="author name for model metadata / ??????????????????",
+        help="author name for model metadata / メタデータに書き込まれるモデル作者名",
     )
     parser.add_argument(
         "--metadata_description",
         type=str,
         default=None,
-        help="description for model metadata / ?????????????????",
+        help="description for model metadata / メタデータに書き込まれるモデル説明",
     )
     parser.add_argument(
         "--metadata_license",
         type=str,
         default=None,
-        help="license for model metadata / ????????????????????",
+        help="license for model metadata / メタデータに書き込まれるモデルライセンス",
     )
     parser.add_argument(
         "--metadata_tags",
         type=str,
         default=None,
-        help="tags for model metadata, separated by comma / ????????????????????????",
+        help="tags for model metadata, separated by comma / メタデータに書き込まれるモデルタグ、カンマ区切り",
     )
     parser.add_argument(
         "--metadata_reso",
         type=str,
         default=None,
-        help="resolution for model metadata (e.g., `1024,1024`) / ????????????????????: `1024,1024`?",
+        help="resolution for model metadata (e.g., `1024,1024`) / メタデータに書き込まれるモデル解像度（例: `1024,1024`）",
     )
     parser.add_argument(
         "--metadata_arch",
         type=str,
         default=None,
-        help="architecture for model metadata / ??????????????????????",
+        help="architecture for model metadata / メタデータに書き込まれるモデルアーキテクチャ",
     )
 
     # huggingface settings
@@ -3321,43 +3321,43 @@ def setup_parser_common() -> argparse.ArgumentParser:
         "--huggingface_repo_id",
         type=str,
         default=None,
-        help="huggingface repo name to upload / huggingface???????????????",
+        help="huggingface repo name to upload / huggingfaceにアップロードするリポジトリ名",
     )
     parser.add_argument(
         "--huggingface_repo_type",
         type=str,
         default=None,
-        help="huggingface repo type to upload / huggingface?????????????????",
+        help="huggingface repo type to upload / huggingfaceにアップロードするリポジトリの種類",
     )
     parser.add_argument(
         "--huggingface_path_in_repo",
         type=str,
         default=None,
-        help="huggingface model path to upload files / huggingface????????????????",
+        help="huggingface model path to upload files / huggingfaceにアップロードするファイルのパス",
     )
-    parser.add_argument("--huggingface_token", type=str, default=None, help="huggingface token / huggingface?????")
+    parser.add_argument("--huggingface_token", type=str, default=None, help="huggingface token / huggingfaceのトークン")
     parser.add_argument(
         "--huggingface_repo_visibility",
         type=str,
         default=None,
-        help="huggingface repository visibility ('public' for public, 'private' or None for private) / huggingface????????????????????'public'????'private'???None?????",
+        help="huggingface repository visibility ('public' for public, 'private' or None for private) / huggingfaceにアップロードするリポジトリの公開設定（'public'で公開、'private'またはNoneで非公開）",
     )
     parser.add_argument(
-        "--save_state_to_huggingface", action="store_true", help="save state to huggingface / huggingface?state?????"
+        "--save_state_to_huggingface", action="store_true", help="save state to huggingface / huggingfaceにstateを保存する"
     )
     parser.add_argument(
         "--resume_from_huggingface",
         action="store_true",
-        help="resume from huggingface (ex: --resume {repo_id}/{path_in_repo}:{revision}:{repo_type}) / huggingface?????????(?: --resume {repo_id}/{path_in_repo}:{revision}:{repo_type})",
+        help="resume from huggingface (ex: --resume {repo_id}/{path_in_repo}:{revision}:{repo_type}) / huggingfaceから学習を再開する(例: --resume {repo_id}/{path_in_repo}:{revision}:{repo_type})",
     )
     parser.add_argument(
         "--async_upload",
         action="store_true",
-        help="upload to huggingface asynchronously / huggingface?????????????",
+        help="upload to huggingface asynchronously / huggingfaceに非同期でアップロードする",
     )
 
-    parser.add_argument("--dit", type=str, help="DiT checkpoint path / DiT????????????")
-    parser.add_argument("--vae", type=str, help="VAE checkpoint path / VAE????????????")
+    parser.add_argument("--dit", type=str, help="DiT checkpoint path / DiTのチェックポイントのパス")
+    parser.add_argument("--vae", type=str, help="VAE checkpoint path / VAEのチェックポイントのパス")
     parser.add_argument("--vae_dtype", type=str, default=None, help="data type for VAE, default is float16")
 
     return parser
@@ -3402,15 +3402,15 @@ def hv_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     # model settings
     parser.add_argument("--dit_dtype", type=str, default=None, help="data type for DiT, default is bfloat16")
     parser.add_argument("--dit_in_channels", type=int, default=16, help="input channels for DiT, default is 16, skyreels I2V is 32")
-    parser.add_argument("--fp8_llm", action="store_true", help="use fp8 for LLM / LLM?fp8???")
-    parser.add_argument("--text_encoder1", type=str, help="Text Encoder 1 directory / ?????????1???????")
-    parser.add_argument("--text_encoder2", type=str, help="Text Encoder 2 directory / ?????????2???????")
+    parser.add_argument("--fp8_llm", action="store_true", help="use fp8 for LLM / LLMにfp8を使う")
+    parser.add_argument("--text_encoder1", type=str, help="Text Encoder 1 directory / テキストエンコーダ1のディレクトリ")
+    parser.add_argument("--text_encoder2", type=str, help="Text Encoder 2 directory / テキストエンコーダ2のディレクトリ")
     parser.add_argument("--text_encoder_dtype", type=str, default=None, help="data type for Text Encoder, default is float16")
     parser.add_argument(
         "--vae_tiling",
         action="store_true",
         help="enable spatial tiling for VAE, default is False. If vae_spatial_tile_sample_min_size is set, this is automatically enabled."
-        " / VAE?????????????????????False?vae_spatial_tile_sample_min_size???????????????????????",
+        " / VAEの空間タイリングを有効にする、デフォルトはFalse。vae_spatial_tile_sample_min_sizeが設定されている場合、自動的に有効になります。",
     )
     parser.add_argument("--vae_chunk_size", type=int, default=None, help="chunk size for CausalConv3d in VAE")
     parser.add_argument(
