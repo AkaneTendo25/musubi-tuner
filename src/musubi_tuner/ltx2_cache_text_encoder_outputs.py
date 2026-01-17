@@ -8,6 +8,7 @@ Uses the standard musubi-tuner dataset config so cached files match the trainer.
 from __future__ import annotations
 
 import argparse
+import os
 
 import logging
 from contextlib import nullcontext
@@ -25,6 +26,8 @@ from musubi_tuner.dataset.image_video_dataset import (
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
+
+DEFAULT_SAMPLE_PROMPTS_CACHE = "ltx2_sample_prompts_cache.pt"
 
 
 def encode_and_save_batch_official_gemma(
@@ -65,12 +68,108 @@ def encode_and_save_batch_official_gemma(
             )
 
 
+def _encode_prompt_text_ltx2(
+    text_encoder,
+    prompt_text: str,
+    *,
+    audio_video: bool,
+    ltx_mode: str,
+    autocast_dtype: torch.dtype | None,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if autocast_dtype is not None and device.type == "cuda":
+        autocast_context = torch.cuda.amp.autocast(dtype=autocast_dtype)
+    else:
+        autocast_context = nullcontext()
+    with torch.no_grad(), autocast_context:
+        out = text_encoder(prompt_text, padding_side="left")
+        if ltx_mode == "audio":
+            embed = out.audio_encoding if hasattr(out, "audio_encoding") else out.video_encoding
+        elif audio_video:
+            embed = torch.cat([out.video_encoding, out.audio_encoding], dim=-1)
+        else:
+            embed = out.video_encoding
+        mask = out.attention_mask
+    return embed.squeeze(0).detach().cpu(), mask.squeeze(0).detach().cpu()
+
+
+def _resolve_default_sample_prompts_cache(datasets: list) -> str:
+    if not datasets:
+        raise ValueError("No datasets available to resolve sample prompt cache directory")
+    cache_dir = getattr(datasets[0], "cache_directory", None)
+    if not cache_dir:
+        raise ValueError("First dataset has no cache_directory; set cache_directory in dataset config")
+    return os.path.join(cache_dir, DEFAULT_SAMPLE_PROMPTS_CACHE)
+
+
+def _precache_sample_prompts(
+    args: argparse.Namespace,
+    *,
+    datasets: list,
+    text_encoder,
+    audio_video: bool,
+    ltx_mode: str,
+    autocast_dtype: torch.dtype | None,
+    device: torch.device,
+) -> None:
+    from musubi_tuner.hv_train_network import load_prompts
+
+    if args.sample_prompts is None:
+        raise ValueError("--sample_prompts is required when --precache_sample_prompts is set")
+
+    prompts = load_prompts(args.sample_prompts)
+    if not prompts:
+        raise ValueError(f"No prompts found in {args.sample_prompts}")
+
+    cache_path = args.sample_prompts_cache or _resolve_default_sample_prompts_cache(datasets)
+
+    sample_parameters: list[dict] = []
+    for prompt_dict in prompts:
+        param = prompt_dict.copy()
+        prompt_text = param.get("prompt", "")
+        prompt_embeds, prompt_mask = _encode_prompt_text_ltx2(
+            text_encoder,
+            prompt_text,
+            audio_video=audio_video,
+            ltx_mode=ltx_mode,
+            autocast_dtype=autocast_dtype,
+            device=device,
+        )
+        param["prompt_embeds"] = prompt_embeds
+        param["prompt_attention_mask"] = prompt_mask
+
+        negative_prompt = param.get("negative_prompt")
+        if negative_prompt:
+            neg_embeds, neg_mask = _encode_prompt_text_ltx2(
+                text_encoder,
+                negative_prompt,
+                audio_video=audio_video,
+                ltx_mode=ltx_mode,
+                autocast_dtype=autocast_dtype,
+                device=device,
+            )
+            param["negative_prompt_embeds"] = neg_embeds
+            param["negative_prompt_attention_mask"] = neg_mask
+
+        sample_parameters.append(param)
+
+    payload = {
+        "version": 1,
+        "ltx_mode": ltx_mode,
+        "audio_video": audio_video,
+        "sample_parameters": sample_parameters,
+    }
+    torch.save(payload, cache_path)
+    logger.info("Saved precached sample prompts to %s", cache_path)
+
+
 def main() -> None:
     parser = cache_text_encoder_outputs.setup_parser_common()
     parser = ltx2_setup_parser(parser)
     args = parser.parse_args()
 
-    audio_video = getattr(args, "ltx_mode", "video") == "av" or getattr(args, "ltx2_audio_video", False)
+    ltx_mode = getattr(args, "ltx_mode", "video")
+    audio_video = ltx_mode == "av" or getattr(args, "ltx2_audio_video", False)
 
     device = torch.device(args.device if args.device is not None else ("cuda" if torch.cuda.is_available() else "cpu"))
 
@@ -173,6 +272,17 @@ def main() -> None:
     # often hurts throughput or appears to hang due to thread contention. Default to 1 unless specified.
     num_workers = 1 if args.num_workers is None else args.num_workers
 
+    if getattr(args, "precache_sample_prompts", False):
+        _precache_sample_prompts(
+            args,
+            datasets=datasets,
+            text_encoder=text_encoder,
+            audio_video=audio_video,
+            ltx_mode=ltx_mode,
+            autocast_dtype=autocast_dtype,
+            device=device,
+        )
+
     cache_text_encoder_outputs.process_text_encoder_batches(
         num_workers,
         args.skip_existing,
@@ -231,6 +341,26 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         default="no",
         choices=["no", "fp16", "bf16"],
         help="Mixed precision mode",
+    )
+    parser.add_argument(
+        "--precache_sample_prompts",
+        action="store_true",
+        help="Also cache Gemma embeddings for sample prompts and save to --sample_prompts_cache.",
+    )
+    parser.add_argument(
+        "--sample_prompts",
+        type=str,
+        default=None,
+        help="Sample prompt file used for --precache_sample_prompts.",
+    )
+    parser.add_argument(
+        "--sample_prompts_cache",
+        type=str,
+        default=None,
+        help=(
+            "Path to write precached sample prompt embeddings (.pt). Defaults to "
+            "the first dataset's cache_directory/ltx2_sample_prompts_cache.pt"
+        ),
     )
 
     parser.add_argument(

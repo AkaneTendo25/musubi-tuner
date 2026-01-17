@@ -6,7 +6,7 @@ from einops import rearrange
 from torch import nn
 from musubi_tuner.ltx_2.model.common.normalization import PixelNorm
 from musubi_tuner.ltx_2.model.transformer.timestep_embedding import PixArtAlphaCombinedTimestepSizeEmbeddings
-from musubi_tuner.ltx_2.model.video_vae.convolution import make_conv_nd
+from musubi_tuner.ltx_2.model.video_vae.convolution import CausalConv3d, make_conv_nd
 from musubi_tuner.ltx_2.model.video_vae.enums import LogVarianceType, NormLayerType, PaddingModeType
 from musubi_tuner.ltx_2.model.video_vae.ops import PerChannelStatistics, patchify, unpatchify
 from musubi_tuner.ltx_2.model.video_vae.resnet import ResnetBlock3D, UNetMidBlock3D
@@ -177,10 +177,9 @@ class VideoEncoder(nn.Module):
         super().__init__()
 
         self.patch_size = patch_size
-        self.norm_layer = norm_layer
-        self.latent_channels = out_channels
         self.latent_log_var = latent_log_var
         self._norm_num_groups = self._DEFAULT_NORM_NUM_GROUPS
+        self.chunk_size = None
 
         # Per-channel statistics for normalizing latents
         self.per_channel_statistics = PerChannelStatistics(latent_channels=out_channels)
@@ -309,6 +308,16 @@ class VideoEncoder(nn.Module):
         # Split into means and logvar, then normalize means
         means, _ = torch.chunk(sample, 2, dim=1)
         return self.per_channel_statistics.normalize(means)
+
+    def set_chunk_size_for_causal_conv_3d(self, chunk_size: int | None) -> None:
+        """
+        Sets the chunk size for all CausalConv3d modules in the encoder.
+        This enables memory-efficient processing by splitting the temporal dimension.
+        """
+        self.chunk_size = chunk_size
+        for module in self.modules():
+            if isinstance(module, CausalConv3d):
+                module.chunk_size = chunk_size
 
 
 def _make_decoder_block(
@@ -449,6 +458,7 @@ class VideoDecoder(nn.Module):
         self.causal = causal
         self.timestep_conditioning = timestep_conditioning
         self._norm_num_groups = self._DEFAULT_NORM_NUM_GROUPS
+        self.chunk_size = None
 
         # Per-channel statistics for denormalizing latents
         self.per_channel_statistics = PerChannelStatistics(latent_channels=in_channels)
@@ -613,6 +623,16 @@ class VideoDecoder(nn.Module):
         sample = unpatchify(sample, patch_size_hw=self.patch_size, patch_size_t=1)
 
         return sample
+
+    def set_chunk_size_for_causal_conv_3d(self, chunk_size: int | None) -> None:
+        """
+        Sets the chunk size for all CausalConv3d modules in the decoder.
+        This enables memory-efficient processing by splitting the temporal dimension.
+        """
+        self.chunk_size = chunk_size
+        for module in self.modules():
+            if isinstance(module, CausalConv3d):
+                module.chunk_size = chunk_size
 
     def _prepare_tiles(
         self,
@@ -921,4 +941,12 @@ def map_spatial_slice(begin: int, end: int, left_ramp: int, right_ramp: int, sca
     left_ramp = left_ramp * scale
     right_ramp = right_ramp * scale
 
+    return slice(start, stop), compute_trapezoidal_mask_1d(stop - start, left_ramp, right_ramp, False)
+
+
+def map_spatial_slice_downscale(begin: int, end: int, left_ramp: int, right_ramp: int, scale: int) -> Tuple[slice, torch.Tensor]:
+    start = begin // scale
+    stop = end // scale
+    left_ramp = left_ramp // scale
+    right_ramp = right_ramp // scale
     return slice(start, stop), compute_trapezoidal_mask_1d(stop - start, left_ramp, right_ramp, False)

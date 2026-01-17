@@ -58,7 +58,7 @@ def _load_datasets(args: argparse.Namespace) -> Sequence[BaseDataset]:
     return cast(Sequence[BaseDataset], dataset_group.datasets)
 
 
-def encode_and_save_batch(vae, batch: List[ItemInfo]) -> None:
+def encode_and_save_batch(vae, batch: List[ItemInfo], tiling_config=None) -> None:
     contents = torch.stack([torch.from_numpy(item.content) for item in batch])
     if contents.ndim == 4:
         contents = contents.unsqueeze(1)
@@ -83,7 +83,10 @@ def encode_and_save_batch(vae, batch: List[ItemInfo]) -> None:
         raise ValueError(f"Image or video size too small: {item.item_key} (and others), size: {item.original_size}")
 
     with _amp_context(device, vae_dtype), torch.no_grad():
-        latents = vae(contents)
+        if tiling_config is not None and hasattr(vae, "tiled_encode"):
+            latents = vae.tiled_encode(contents, tiling_config)
+        else:
+            latents = vae(contents)
         latents = latents.to(device=device, dtype=vae_dtype)
 
     for idx, item in enumerate(batch):
@@ -335,8 +338,21 @@ def main() -> None:
             vae.set_chunk_size_for_causal_conv_3d(args.vae_chunk_size)
             logger.info("Set chunk_size to %s for CausalConv3d in VAE", args.vae_chunk_size)
 
+        from musubi_tuner.ltx_2.model.video_vae.tiling import TilingConfig, SpatialTilingConfig
+
+        tiling_config = None
+        if args.vae_spatial_tile_size is not None:
+             logger.info("Enabling spatial tiling: size=%s, overlap=%s", 
+                         args.vae_spatial_tile_size, args.vae_spatial_tile_overlap)
+             tiling_config = TilingConfig(
+                 spatial_config=SpatialTilingConfig(
+                     tile_size_in_pixels=args.vae_spatial_tile_size,
+                     tile_overlap_in_pixels=args.vae_spatial_tile_overlap
+                 )
+             )
+
         def encode_fn(batch: List[ItemInfo]) -> None:
-            encode_and_save_batch(vae, batch)
+            encode_and_save_batch(vae, batch, tiling_config)
 
         cache_latents.encode_datasets(list(datasets), encode_fn, args)
 
@@ -446,6 +462,8 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
     )
     parser.add_argument("--ltx2_checkpoint", type=str, default=None, help="Path to LTX-2 checkpoint (.safetensors)")
     parser.add_argument("--vae_chunk_size", type=int, default=None, help="chunk size for CausalConv3d in VAE")
+    parser.add_argument("--vae_spatial_tile_size", type=int, default=None, help="Spatial tile size in pixels (e.g. 512)")
+    parser.add_argument("--vae_spatial_tile_overlap", type=int, default=64, help="Spatial tile overlap in pixels (default 64)")
     parser.add_argument(
         "--ltx2_audio_source",
         type=str,

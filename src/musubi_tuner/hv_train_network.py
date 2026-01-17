@@ -55,6 +55,67 @@ logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
 
+def _log_cuda_memory_stats(tag: str, *, latents_shape: Optional[tuple] = None) -> None:
+    if not torch.cuda.is_available():
+        return
+    alloc = torch.cuda.memory_allocated() / (1024**2)
+    reserved = torch.cuda.memory_reserved() / (1024**2)
+    max_alloc = torch.cuda.max_memory_allocated() / (1024**2)
+    max_reserved = torch.cuda.max_memory_reserved() / (1024**2)
+    free_mb = None
+    total_mb = None
+    try:
+        free_b, total_b = torch.cuda.mem_get_info()
+        free_mb = free_b / (1024**2)
+        total_mb = total_b / (1024**2)
+    except Exception:
+        pass
+    if latents_shape is not None:
+        if free_mb is not None and total_mb is not None:
+            logger.info(
+                "CUDA mem [%s] alloc=%.0fMB reserved=%.0fMB max_alloc=%.0fMB max_reserved=%.0fMB free=%.0fMB total=%.0fMB latents=%s",
+                tag,
+                alloc,
+                reserved,
+                max_alloc,
+                max_reserved,
+                free_mb,
+                total_mb,
+                latents_shape,
+            )
+        else:
+            logger.info(
+                "CUDA mem [%s] alloc=%.0fMB reserved=%.0fMB max_alloc=%.0fMB max_reserved=%.0fMB latents=%s",
+                tag,
+                alloc,
+                reserved,
+                max_alloc,
+                max_reserved,
+                latents_shape,
+            )
+    else:
+        if free_mb is not None and total_mb is not None:
+            logger.info(
+                "CUDA mem [%s] alloc=%.0fMB reserved=%.0fMB max_alloc=%.0fMB max_reserved=%.0fMB free=%.0fMB total=%.0fMB",
+                tag,
+                alloc,
+                reserved,
+                max_alloc,
+                max_reserved,
+                free_mb,
+                total_mb,
+            )
+        else:
+            logger.info(
+                "CUDA mem [%s] alloc=%.0fMB reserved=%.0fMB max_alloc=%.0fMB max_reserved=%.0fMB",
+                tag,
+                alloc,
+                reserved,
+                max_alloc,
+                max_reserved,
+            )
+
+
 SS_METADATA_KEY_BASE_MODEL_VERSION = "ss_base_model_version"
 SS_METADATA_KEY_NETWORK_MODULE = "ss_network_module"
 SS_METADATA_KEY_NETWORK_DIM = "ss_network_dim"
@@ -177,6 +238,14 @@ def prepare_accelerator(args: argparse.Namespace) -> Accelerator:
         kwargs_handlers=kwargs_handlers,
     )
     print("accelerator device:", accelerator.device)
+    if (
+        args.log_cuda_memory_every_n_steps is not None
+        and args.log_cuda_memory_every_n_steps > 0
+        and accelerator.device.type == "cuda"
+    ):
+        props = torch.cuda.get_device_properties(accelerator.device)
+        total_mb = props.total_memory / (1024**2)
+        logger.info("CUDA device: %s (%s) total=%.0fMB", accelerator.device, props.name, total_mb)
     return accelerator
 
 
@@ -1642,6 +1711,11 @@ class NetworkTrainer:
 
     def train(self, args):
         if torch.cuda.is_available():
+            if args.cuda_memory_fraction is not None:
+                if not (0.0 < args.cuda_memory_fraction <= 1.0):
+                    raise ValueError("--cuda_memory_fraction must be in (0, 1]")
+                torch.cuda.set_per_process_memory_fraction(args.cuda_memory_fraction)
+                logger.info("Set per-process CUDA memory fraction to %.4f", args.cuda_memory_fraction)
             if args.cuda_allow_tf32:
                 torch.backends.cuda.matmul.allow_tf32 = True
                 torch.backends.cudnn.allow_tf32 = True
@@ -1758,8 +1832,9 @@ class NetworkTrainer:
         vae_dtype = torch.float16 if args.vae_dtype is None else model_utils.str_to_dtype(args.vae_dtype)
         sample_parameters = None
         vae = None
-        if args.sample_prompts:
-            sample_parameters = self.process_sample_prompts(args, accelerator, args.sample_prompts)
+        if args.sample_prompts or getattr(args, "precache_sample_prompts", False) or getattr(args, "use_precached_sample_prompts", False):
+            sample_prompt_path = args.sample_prompts or ""
+            sample_parameters = self.process_sample_prompts(args, accelerator, sample_prompt_path)
 
             # Load VAE model for sampling images: VAE is loaded to cpu to save gpu memory
             vae = self.load_vae(args, vae_dtype=vae_dtype, vae_path=args.vae)
@@ -2385,6 +2460,14 @@ class NetworkTrainer:
 
             for step, batch in enumerate(train_dataloader):
                 # torch.compiler.cudagraph_mark_step_begin() # for cudagraphs
+                if (
+                    args.log_cuda_memory_every_n_steps is not None
+                    and args.log_cuda_memory_every_n_steps > 0
+                    and accelerator.device.type == "cuda"
+                    and step % args.gradient_accumulation_steps == 0
+                    and global_step % args.log_cuda_memory_every_n_steps == 0
+                ):
+                    torch.cuda.reset_peak_memory_stats()
 
                 latents = batch["latents"]
                 if isinstance(latents, dict):
@@ -2393,6 +2476,7 @@ class NetworkTrainer:
                     latents_tensor = latents["latents"]
                 else:
                     latents_tensor = latents
+                latents_shape = tuple(latents_tensor.shape)
 
                 with accelerator.accumulate(training_model):
                     accelerator.unwrap_model(network).on_step_start()
@@ -2563,6 +2647,13 @@ class NetworkTrainer:
                         progress_bar.reset()  # exclude first step from progress bar, because it may take long due to initializations
                     progress_bar.update(1)
                     global_step += 1
+                    if (
+                        args.log_cuda_memory_every_n_steps is not None
+                        and args.log_cuda_memory_every_n_steps > 0
+                        and accelerator.device.type == "cuda"
+                        and global_step % args.log_cuda_memory_every_n_steps == 0
+                    ):
+                        _log_cuda_memory_stats(f"step_{global_step}", latents_shape=latents_shape)
 
                     # to avoid calling optimizer_eval_fn() too frequently, we call it only when we need to sample images or save the model
                     should_sampling = should_sample_images(args, global_step, epoch=None)
@@ -2777,6 +2868,12 @@ def setup_parser_common() -> argparse.ArgumentParser:
         action="store_true",
         help="Enable cudnn benchmark for possibly faster training / cudnnのベンチマークを有効にして学習の高速化を図る",
     )
+    parser.add_argument(
+        "--cuda_memory_fraction",
+        type=float,
+        default=None,
+        help="Limit per-process CUDA memory usage (0-1). Must be set before CUDA allocations.",
+    )
 
     # training settings
     parser.add_argument("--max_train_steps", type=int, default=1600, help="training steps / 学習ステップ数")
@@ -2861,6 +2958,12 @@ def setup_parser_common() -> argparse.ArgumentParser:
         help="specify WandB API key to log in before starting training (optional). / WandB APIキーを指定して学習開始前にログインする（オプション）",
     )
     parser.add_argument("--log_config", action="store_true", help="log training configuration / 学習設定をログに出力する")
+    parser.add_argument(
+        "--log_cuda_memory_every_n_steps",
+        type=int,
+        default=None,
+        help="log CUDA memory stats every N optimizer steps (alloc/reserved/max).",
+    )
 
     parser.add_argument(
         "--ddp_timeout",

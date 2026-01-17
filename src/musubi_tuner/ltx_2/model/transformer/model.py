@@ -1,5 +1,6 @@
 from dataclasses import replace
 from enum import Enum
+from typing import Optional
 
 import logging
 import torch
@@ -559,10 +560,12 @@ class LTXModel(torch.nn.Module):
             
         cpu_device = torch.device("cpu")
 
-        # If offloading is enabled, move initial inputs to CPU so the first block's checkpoint saves CPU tensors
+        # If offloading is enabled for all blocks, move initial inputs to CPU so the first block's checkpoint saves CPU tensors
         if self.activation_cpu_offloading and self.training:
-            video = _move_transformer_args(video, cpu_device)
-            audio = _move_transformer_args(audio, cpu_device)
+            checkpoint_start = getattr(self, "_checkpoint_start_idx", 0)
+            if checkpoint_start == 0:
+                video = _move_transformer_args(video, cpu_device)
+                audio = _move_transformer_args(audio, cpu_device)
 
         # Async Stream Setup (Phase 2)
         if not hasattr(self, "_transfer_stream"):
@@ -602,8 +605,8 @@ class LTXModel(torch.nn.Module):
                           # If on CPU, it triggers H2D copy.
                           next_block._load_weights(next_block, target_device)
 
-             # Execute block (it now handles checkpointing i.e. load/compute/offload)
-             # If offloading is on, block expects CPU inputs (for checkpoint savings) and returns CPU outputs
+            # Execute block (it now handles checkpointing i.e. load/compute/offload)
+            # If offloading is on, block expects CPU inputs (for checkpoint savings) and returns CPU outputs
             video, audio = block(video, audio, perturbations)
 
             if swap_active and swap_manager is not None and swap_manager.is_managed_block(block_idx):
@@ -649,7 +652,12 @@ class LTXModel(torch.nn.Module):
         x = proj_out(x)
         return x
 
-    def enable_gradient_checkpointing(self, activation_cpu_offloading: bool = False, weight_cpu_offloading: bool = False) -> None:
+    def enable_gradient_checkpointing(
+        self,
+        activation_cpu_offloading: bool = False,
+        weight_cpu_offloading: bool = False,
+        blocks_to_checkpoint: Optional[int] = None,
+    ) -> None:
         """
         Enable gradient checkpointing with optional CPU offloading.
         
@@ -657,12 +665,36 @@ class LTXModel(torch.nn.Module):
             activation_cpu_offloading: If True, offload activations to CPU (save memory).
             weight_cpu_offloading: If True, use block-level weight offloading (ultra-low VRAM).
         """
-        self._enable_gradient_checkpointing = True
-        self.activation_cpu_offloading = activation_cpu_offloading
-        self.weight_cpu_offloading = weight_cpu_offloading
+        if blocks_to_checkpoint == 0:
+            self._enable_gradient_checkpointing = False
+            self.activation_cpu_offloading = False
+            self.weight_cpu_offloading = False
+        else:
+            self._enable_gradient_checkpointing = True
+            self.activation_cpu_offloading = activation_cpu_offloading
+            self.weight_cpu_offloading = weight_cpu_offloading
         _disable_checkpoint_determinism_check()
-        
-        for block in self.transformer_blocks:
+
+        if blocks_to_checkpoint is None or blocks_to_checkpoint == -1:
+            checkpoint_start = 0
+        else:
+            checkpoint_start = max(0, len(self.transformer_blocks) - int(blocks_to_checkpoint))
+        self._checkpoint_start_idx = checkpoint_start
+
+        for idx, block in enumerate(self.transformer_blocks):
+            if blocks_to_checkpoint == 0:
+                block.gradient_checkpointing = False
+                block.activation_cpu_offloading = False
+                block.weight_cpu_offloading = False
+                continue
+
+            if idx < checkpoint_start:
+                # Use standard checkpointing (no CPU/weight offload) for early blocks.
+                block.gradient_checkpointing = True
+                block.activation_cpu_offloading = False
+                block.weight_cpu_offloading = False
+                continue
+
             if hasattr(block, "enable_gradient_checkpointing"):
                 block.enable_gradient_checkpointing(activation_cpu_offloading, weight_cpu_offloading)
 

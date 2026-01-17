@@ -87,11 +87,13 @@ class LTX2Wrapper(nn.Module):
 
     def enable_gradient_checkpointing(self, activation_cpu_offloading: bool = False, **kwargs):
         if hasattr(self.model, "enable_gradient_checkpointing"):
-            # LTX2 core model does not accept blocks_to_checkpoint; ignore if passed.
+            # LTX2 core model supports blocks_to_checkpoint when provided.
             weight_cpu_offloading = kwargs.get("weight_cpu_offloading", False)
+            blocks_to_checkpoint = kwargs.get("blocks_to_checkpoint", None)
             return self.model.enable_gradient_checkpointing(
                 activation_cpu_offloading,
                 weight_cpu_offloading=weight_cpu_offloading,
+                blocks_to_checkpoint=blocks_to_checkpoint,
             )
         if hasattr(self.model, "set_gradient_checkpointing"):
             self.model.set_gradient_checkpointing(True)

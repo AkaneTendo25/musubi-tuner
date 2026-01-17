@@ -278,6 +278,7 @@ class CausalConv3d(nn.Module):
 
         self.in_channels = in_channels
         self.out_channels = out_channels
+        self.chunk_size = None
 
         kernel_size = (kernel_size, kernel_size, kernel_size)
         self.time_kernel_size = kernel_size[0]
@@ -301,15 +302,109 @@ class CausalConv3d(nn.Module):
         )
 
     def forward(self, x: torch.Tensor, causal: bool = True) -> torch.Tensor:
-        if causal:
-            first_frame_pad = x[:, :, :1, :, :].repeat((1, 1, self.time_kernel_size - 1, 1, 1))
-            x = torch.concatenate((first_frame_pad, x), dim=2)
-        else:
-            first_frame_pad = x[:, :, :1, :, :].repeat((1, 1, (self.time_kernel_size - 1) // 2, 1, 1))
-            last_frame_pad = x[:, :, -1:, :, :].repeat((1, 1, (self.time_kernel_size - 1) // 2, 1, 1))
-            x = torch.concatenate((first_frame_pad, x, last_frame_pad), dim=2)
-        x = self.conv(x)
-        return x
+        if self.chunk_size is None:
+            if causal:
+                first_frame_pad = x[:, :, :1, :, :].repeat((1, 1, self.time_kernel_size - 1, 1, 1))
+                x = torch.concatenate((first_frame_pad, x), dim=2)
+            else:
+                first_frame_pad = x[:, :, :1, :, :].repeat((1, 1, (self.time_kernel_size - 1) // 2, 1, 1))
+                last_frame_pad = x[:, :, -1:, :, :].repeat((1, 1, (self.time_kernel_size - 1) // 2, 1, 1))
+                x = torch.concatenate((first_frame_pad, x, last_frame_pad), dim=2)
+            x = self.conv(x)
+            return x
+
+        # Chunked execution
+        if not causal:
+             # Non-causal chunking (halo exchange)
+             outputs = []
+             frames = x.shape[2]
+             
+             # Calculate halo size based on kernel size
+             # For k=3, halo is 1 frame on each side. For k=5, halo is 2 frames.
+             halo_size = (self.time_kernel_size - 1) // 2
+             
+             # Pad the entire input first to handle boundary conditions simply
+             # Pad left with first frame, right with last frame
+             first_frame_pad = x[:, :, :1, :, :].repeat((1, 1, halo_size, 1, 1))
+             last_frame_pad = x[:, :, -1:, :, :].repeat((1, 1, halo_size, 1, 1))
+             padded_x = torch.cat((first_frame_pad, x, last_frame_pad), dim=2)
+             
+             # Adjust total frames to iterate over the *original* x
+             chunk_size = self.chunk_size
+             stride_t = self.conv.stride[0]
+             
+             # Validate chunk size
+             if chunk_size % stride_t != 0:
+                 chunk_size = (chunk_size // stride_t) * stride_t
+                 if chunk_size == 0: 
+                    chunk_size = stride_t # fallback
+             
+             for i in range(0, frames, chunk_size):
+                 # Define the window on the original x
+                 start_idx = i
+                 end_idx = min(i + chunk_size, frames)
+                 
+                 # Map these indices to the padded_x
+                 # padded_x starts at -halo_size relative to x
+                 # So x[0] is at padded_x[halo_size]
+                 
+                 # We need a chunk that includes the halo context
+                 pad_start = start_idx # + halo_size - halo_size
+                 pad_end = end_idx + 2 * halo_size # + halo_size + halo_size
+                 
+                 # Extract chunk with halos
+                 # Dimensions: [B, C, chunk_size + 2*halo, H, W]
+                 chunk_with_halo = padded_x[:, :, pad_start : pad_end, :, :]
+                 
+                 # Convolve
+                 out_chunk = self.conv(chunk_with_halo)
+                 
+                 # Append (no cropping needed if stride=1 and padding=0, effectively 'valid' mode on time)
+                 # Wait, self.conv has padding=(0, H_pad, W_pad). It doesn't pad time (dim 0 of kernel).
+                 # So output depth = (Input - Kernel) / Stride + 1
+                 # Input depth = chunk_size + 2*halo
+                 # Kernel depth = 2*halo + 1
+                 # Result depth = (chunk_size + 2*halo - (2*halo + 1)) / 1 + 1 = chunk_size
+                 # This holds for stride=1.
+                 # If stride > 1, we trust PyTorch striding.
+                 outputs.append(out_chunk)
+                 
+             return torch.cat(outputs, dim=2)
+
+        # Causal Chunking
+        outputs = []
+        frames = x.shape[2]
+        # Pad with first frame for the very beginning
+        # We maintain a 'buffer' of previous frames needed for the next chunk
+        # Initial buffer is the first frame repeated
+        buffer = x[:, :, :1, :, :].repeat((1, 1, self.time_kernel_size - 1, 1, 1))
+        
+        # Ensure chunk size is valid w.r.t stride
+        stride_t = self.conv.stride[0]
+        chunk_size = self.chunk_size
+        if chunk_size % stride_t != 0:
+            chunk_size = (chunk_size // stride_t) * stride_t
+            if chunk_size == 0: 
+                chunk_size = stride_t
+        
+        for i in range(0, frames, chunk_size):
+            chunk = x[:, :, i : i + chunk_size, :, :]
+            
+            # Concat with buffer (previous context)
+            input_chunk = torch.cat([buffer, chunk], dim=2)
+            
+            # Run conv
+            out_chunk = self.conv(input_chunk)
+            outputs.append(out_chunk)
+            
+            # Update buffer for next iteration
+            # We need the last (time_kernel_size - 1) frames of the current *original input* chunk
+            # to serve as padding for the next chunk.
+            # input_chunk has shape [B, C, buffer_len + chunk_len, H, W]
+            # We want the last (k-1) frames of input_chunk to be the buffer for the next.
+            buffer = input_chunk[:, :, -(self.time_kernel_size - 1):, :, :]
+            
+        return torch.cat(outputs, dim=2)
 
     @property
     def weight(self) -> torch.Tensor:

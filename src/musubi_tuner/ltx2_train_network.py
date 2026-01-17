@@ -41,6 +41,8 @@ from musubi_tuner.utils.lora_utils import load_safetensors_with_lora_and_fp8
 LTX2_LATENTS_MEAN = [0.0]
 LTX2_LATENTS_STD = [1.0]
 
+DEFAULT_SAMPLE_PROMPTS_CACHE = "ltx2_sample_prompts_cache.pt"
+
 # Modules to keep in high precision for FP8 quantization
 KEEP_FP8_HIGH_PRECISION_TOKENS = (
     "norm",
@@ -955,7 +957,10 @@ class LTX2NetworkTrainer(NetworkTrainer):
             module.attention_function = attention_function
 
     def load_vae(self, args: argparse.Namespace, vae_dtype: torch.dtype, vae_path: str):
-        if getattr(args, "sample_prompts", None):
+        use_precached = bool(getattr(args, "use_precached_sample_prompts", False)) or bool(
+            getattr(args, "precache_sample_prompts", False)
+        )
+        if getattr(args, "sample_prompts", None) or use_precached:
             logger.info("LTX-2 sampling: deferring VAE load until sampling")
             return self._DeferredVAE()
         return self._load_vae_impl(args, vae_dtype, vae_path)
@@ -1543,18 +1548,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
         # LTX-2 typically doesn't require normalization, but can be enabled if needed
         return latents
 
-    def process_sample_prompts(
-        self,
-        args: argparse.Namespace,
-        accelerator: Accelerator,
-        sample_prompts: str,
-    ) -> Optional[List[Dict]]:
-        """Process sample prompts for inference preview during training"""
-        logger.info("LTX-2 sampling: deferring Gemma encoding until sampling")
-        prompts = load_prompts(sample_prompts)
-        if not prompts:
-            return None
-
+    def _apply_sample_defaults(self, args: argparse.Namespace, prompts: List[Dict]) -> List[Dict]:
         default_height = int(getattr(args, "height", 512))
         default_width = int(getattr(args, "width", 768))
         default_frame_count = int(getattr(args, "sample_num_frames", 45))
@@ -1580,6 +1574,60 @@ class LTX2NetworkTrainer(NetworkTrainer):
             sample_parameters.append(param)
 
         return sample_parameters
+
+    def _load_precached_sample_prompts(self, args: argparse.Namespace) -> List[Dict]:
+        cache_path = getattr(args, "sample_prompts_cache", None) or self._resolve_default_sample_prompts_cache(args)
+        if not os.path.exists(cache_path):
+            raise FileNotFoundError(f"Precached sample prompt embeddings not found: {cache_path}")
+        payload = torch.load(cache_path, map_location="cpu")
+        if not isinstance(payload, dict) or "sample_parameters" not in payload:
+            raise ValueError(f"Invalid sample prompt cache format: {cache_path}")
+        cached_params = payload.get("sample_parameters")
+        if not isinstance(cached_params, list) or not cached_params:
+            raise ValueError(f"No sample prompts found in cache: {cache_path}")
+        for idx, param in enumerate(cached_params):
+            if not isinstance(param, dict) or param.get("prompt_embeds") is None or param.get("prompt_attention_mask") is None:
+                raise ValueError(f"Missing prompt embeddings in cache entry {idx} ({cache_path})")
+        return self._apply_sample_defaults(args, cached_params)
+
+    def _resolve_default_sample_prompts_cache(self, args: argparse.Namespace) -> str:
+        from musubi_tuner.dataset import config_utils
+        from musubi_tuner.dataset.config_utils import BlueprintGenerator, ConfigSanitizer
+        from musubi_tuner.dataset.image_video_dataset import ARCHITECTURE_LTX2
+
+        if not getattr(args, "dataset_config", None):
+            raise ValueError("--dataset_config is required to resolve the sample prompt cache directory")
+        user_config = config_utils.load_user_config(args.dataset_config)
+        blueprint = BlueprintGenerator(ConfigSanitizer()).generate(user_config, args, architecture=ARCHITECTURE_LTX2)
+        dataset_group = config_utils.generate_dataset_group_by_blueprint(blueprint.dataset_group)
+        datasets = dataset_group.datasets
+        if not datasets:
+            raise ValueError("No datasets available to resolve sample prompt cache directory")
+        cache_dir = getattr(datasets[0], "cache_directory", None)
+        if not cache_dir:
+            raise ValueError("First dataset has no cache_directory; set cache_directory in dataset config")
+        return os.path.join(cache_dir, DEFAULT_SAMPLE_PROMPTS_CACHE)
+
+    def process_sample_prompts(
+        self,
+        args: argparse.Namespace,
+        accelerator: Accelerator,
+        sample_prompts: str,
+    ) -> Optional[List[Dict]]:
+        """Process sample prompts for inference preview during training"""
+        use_precached = bool(getattr(args, "use_precached_sample_prompts", False)) or bool(
+            getattr(args, "precache_sample_prompts", False)
+        )
+        if use_precached:
+            logger.info("LTX-2 sampling: using precached Gemma embeddings for sample prompts")
+            return self._load_precached_sample_prompts(args)
+
+        logger.info("LTX-2 sampling: deferring Gemma encoding until sampling")
+        prompts = load_prompts(sample_prompts)
+        if not prompts:
+            return None
+
+        return self._apply_sample_defaults(args, prompts)
 
     def _build_text_encoder(self, args: argparse.Namespace, accelerator: Accelerator) -> torch.dtype:
         logger.info("Loading Gemma text encoder for LTX-2 sampling")
@@ -1702,7 +1750,10 @@ class LTX2NetworkTrainer(NetworkTrainer):
         logger.info("")
         logger.info(f"generating sample images at step / サンプル画像生成 ステップ: {steps}")
         if sample_parameters is None:
-            logger.error(f"No prompt file / プロンプトファイルがありません: {args.sample_prompts}")
+            if getattr(args, "use_precached_sample_prompts", False) or getattr(args, "precache_sample_prompts", False):
+                logger.error("No precached sample prompt embeddings found. Check --sample_prompts_cache.")
+            else:
+                logger.error(f"No prompt file / ???????????????: {args.sample_prompts}")
             return
 
         distributed_state = PartialState()  # for multi gpu distributed inference
@@ -2567,6 +2618,25 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         "--sample_with_offloading",
         action="store_true",
         help="Offload LTX-2 DiT to CPU between sampling prompts to save VRAM.",
+    )
+    parser.add_argument(
+        "--precache_sample_prompts",
+        action="store_true",
+        help="Use precached Gemma embeddings for sample prompts (no Gemma load during training).",
+    )
+    parser.add_argument(
+        "--use_precached_sample_prompts",
+        action="store_true",
+        help="Use precached Gemma embeddings for sample prompts (no Gemma load during training).",
+    )
+    parser.add_argument(
+        "--sample_prompts_cache",
+        type=str,
+        default=None,
+        help=(
+            "Path to precached sample prompt embeddings (.pt). Defaults to "
+            "the first dataset's cache_directory/ltx2_sample_prompts_cache.pt"
+        ),
     )
     parser.add_argument(
         "--sample_disable_audio",
