@@ -584,10 +584,10 @@ class LTXModel(torch.nn.Module):
             if getattr(block, "weight_cpu_offloading", False):
                 torch.cuda.current_stream().wait_stream(transfer_stream)
 
-            if self.blocks_to_swap > 0 and self.offloader is not None:
+            if (self.blocks_to_swap or 0) > 0 and self.offloader is not None:
                 self.offloader.wait_for_block(block_idx)
             elif (
-                self.blocks_to_swap > 0
+                (self.blocks_to_swap or 0) > 0
                 and self._ltx2_block_swap is not None
                 and block_idx in self._ltx2_block_swap.block_indices
             ):
