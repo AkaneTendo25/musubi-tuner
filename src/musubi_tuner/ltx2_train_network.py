@@ -165,6 +165,9 @@ def load_ltx2_model(
     attn_mode: str = "torch",
     audio_video: bool = False,
     fp8_scaled: bool = False,
+    fp8_upcast: bool = False,
+    fp8_upcast_stochastic: bool = False,
+    fp8_upcast_seed: int = 0,
     load_weights_on_cpu: bool = False,
     **_: Any,
 ):
@@ -203,6 +206,7 @@ def load_ltx2_model(
         LTXModelConfigurator,
         LTXVideoOnlyModelConfigurator,
         LTXV_MODEL_COMFY_RENAMING_MAP,
+        amend_forward_with_upcast,
     )
     from musubi_tuner.networks.lora_ltx2 import LTX2Wrapper
 
@@ -269,6 +273,19 @@ def load_ltx2_model(
     if torch_dtype is not None:
         _cast_non_fp8_params(base_model, torch_dtype)
     base_model = base_model.to(load_device)
+    if fp8_upcast or fp8_upcast_stochastic:
+        # Upcast FP8 linear weights during forward for stability.
+        # This is optional and not enabled by default in upstream configs.
+        base_model = amend_forward_with_upcast(
+            base_model,
+            with_stochastic_rounding=bool(fp8_upcast_stochastic),
+            seed=int(fp8_upcast_seed),
+        )
+        logger.info(
+            "Enabled FP8 upcast during linear forward (stochastic=%s, seed=%s).",
+            bool(fp8_upcast_stochastic),
+            int(fp8_upcast_seed),
+        )
 
     model = LTX2Wrapper(base_model, patch_size=1)
     if load_device == target_device:
@@ -358,6 +375,87 @@ class LTX2NetworkTrainer(NetworkTrainer):
             "audio_latent_downsample_factor": int(LATENT_DOWNSAMPLE_FACTOR),
         }
         return self._audio_preview_config
+
+    def _get_video_temporal_downsample(self) -> int:
+        vae = getattr(self, "vae", None)
+        return int(getattr(vae, "temporal_downsample_factor", 8))
+
+    def _calculate_expected_audio_latent_length(
+        self,
+        args: argparse.Namespace,
+        transformer,
+        latent_frames: int,
+        frame_rate: float,
+    ) -> int:
+        audio_cfg = self._get_audio_preview_config(args, transformer)
+        video_temporal_factor = self._get_video_temporal_downsample()
+        video_frames = max((latent_frames - 1) * video_temporal_factor + 1, 1)
+        duration_s = float(video_frames) / max(float(frame_rate), 1.0)
+        latents_per_second = (
+            float(audio_cfg["sample_rate"])
+            / float(audio_cfg["hop_length"])
+            / float(audio_cfg["audio_latent_downsample_factor"])
+        )
+        return max(int(duration_s * latents_per_second), 1)
+
+    def _adjust_audio_latent_duration(
+        self,
+        audio_latents: torch.Tensor,
+        expected_length: int,
+    ) -> torch.Tensor:
+        actual_length = int(audio_latents.shape[2])
+        if actual_length == expected_length:
+            return audio_latents
+        if actual_length > expected_length:
+            logger.warning(
+                "Trimming audio latents from %s to %s frames to match video duration.",
+                actual_length,
+                expected_length,
+            )
+            return audio_latents[:, :, :expected_length, :]
+        padding_length = expected_length - actual_length
+        logger.warning(
+            "Padding audio latents from %s to %s frames (+%s) to match video duration.",
+            actual_length,
+            expected_length,
+            padding_length,
+        )
+        padding = torch.zeros(
+            audio_latents.shape[0],
+            audio_latents.shape[1],
+            padding_length,
+            audio_latents.shape[3],
+            device=audio_latents.device,
+            dtype=audio_latents.dtype,
+        )
+        return torch.cat([audio_latents, padding], dim=2)
+
+    def _build_empty_audio_latents(
+        self,
+        args: argparse.Namespace,
+        transformer,
+        latents: torch.Tensor,
+        frame_rate: float,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        audio_cfg = self._get_audio_preview_config(args, transformer)
+        expected_length = self._calculate_expected_audio_latent_length(
+            args,
+            transformer,
+            latent_frames=int(latents.shape[2]),
+            frame_rate=frame_rate,
+        )
+        return torch.zeros(
+            (
+                latents.shape[0],
+                int(audio_cfg["channels"]),
+                expected_length,
+                int(audio_cfg["mel_bins"]),
+            ),
+            device=device,
+            dtype=dtype,
+        )
 
     def _normalize_timesteps_for_model(self, timesteps: torch.Tensor) -> torch.Tensor:
         """Normalize timesteps to the model's expected 0..1 sigma range."""
@@ -530,6 +628,26 @@ class LTX2NetworkTrainer(NetworkTrainer):
 
         args.weighting_scheme = "none"
 
+        if getattr(args, "swap_keep_attn", False):
+            os.environ["MUSUBI_TUNER_SWAP_KEEP_ATTN"] = "1"
+        if getattr(args, "attn_stability", False):
+            os.environ["MUSUBI_TUNER_FORCE_PYTORCH_AUDIO_CTX_ATTN"] = "1"
+            os.environ["MUSUBI_TUNER_AUDIO_CTX_ATTN_SWAP_ONLY"] = "1"
+            os.environ["MUSUBI_TUNER_FORCE_PYTORCH_CROSS_ATTN"] = "1"
+            os.environ["MUSUBI_TUNER_CROSS_ATTN_SWAP_ONLY"] = "1"
+        if getattr(args, "attn_stability_fp32", False):
+            os.environ["MUSUBI_TUNER_AUDIO_CTX_ATTN_FP32"] = "1"
+            os.environ["MUSUBI_TUNER_AUDIO_CTX_ATTN_SWAP_ONLY"] = "1"
+            os.environ["MUSUBI_TUNER_CROSS_ATTN_FP32"] = "1"
+            os.environ["MUSUBI_TUNER_CROSS_ATTN_SWAP_ONLY"] = "1"
+        if getattr(args, "safe_swap_attn", False):
+            os.environ["MUSUBI_TUNER_SWAP_KEEP_ATTN"] = "1"
+            os.environ["MUSUBI_TUNER_FORCE_PYTORCH_AUDIO_CTX_ATTN"] = "1"
+            os.environ["MUSUBI_TUNER_AUDIO_CTX_ATTN_SWAP_ONLY"] = "1"
+            os.environ["MUSUBI_TUNER_FORCE_PYTORCH_CROSS_ATTN"] = "1"
+            os.environ["MUSUBI_TUNER_CROSS_ATTN_SWAP_ONLY"] = "1"
+            os.environ["MUSUBI_TUNER_ATTN_FP32_RETRY"] = "1"
+
     @property
     def i2v_training(self) -> bool:
         """LTX-2 doesn't currently support I2V conditioning"""
@@ -610,6 +728,9 @@ class LTX2NetworkTrainer(NetworkTrainer):
             attn_mode=attn_mode,
             audio_video=self._audio_video,
             fp8_scaled=bool(getattr(args, "fp8_scaled", False)),
+            fp8_upcast=bool(getattr(args, "fp8_upcast", False)),
+            fp8_upcast_stochastic=bool(getattr(args, "fp8_upcast_stochastic", False)),
+            fp8_upcast_seed=int(getattr(args, "fp8_upcast_seed", 0)),
             load_weights_on_cpu=True,
         )
 
@@ -1027,6 +1148,31 @@ class LTX2NetworkTrainer(NetworkTrainer):
         Returns:
             Tuple of (model_prediction, target) for loss computation
         """
+        diag_enabled = os.getenv("MUSUBI_TUNER_NAN_DIAG", "0") == "1"
+
+        def _check_finite(tag: str, tensor: Optional[torch.Tensor]) -> None:
+            if tensor is None:
+                return
+            if not torch.isfinite(tensor).all():
+                bad = (~torch.isfinite(tensor)).sum().item()
+                logger.error("%s has non-finite values (count=%s). Aborting to avoid NaN loss.", tag, bad)
+                raise RuntimeError(f"{tag} contains non-finite values")
+
+        def _log_stats(tag: str, tensor: Optional[torch.Tensor]) -> None:
+            if not diag_enabled or tensor is None:
+                return
+            with torch.no_grad():
+                t = tensor.detach().float()
+                logger.info(
+                    "DIAG %s: shape=%s min=%.6f max=%.6f mean=%.6f std=%.6f",
+                    tag,
+                    tuple(t.shape),
+                    float(t.min().item()),
+                    float(t.max().item()),
+                    float(t.mean().item()),
+                    float(t.std().item()),
+                )
+
         if not isinstance(batch, dict):
             raise TypeError(f"Expected batch to be a dict, got: {type(batch)}")
 
@@ -1043,6 +1189,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
             )
         if not torch.isfinite(latents).all():
             raise ValueError("Non-finite (NaN/Inf) detected in latents")
+        _log_stats("latents", latents)
 
         if timesteps is None or not isinstance(timesteps, torch.Tensor):
             raise TypeError(f"Expected timesteps to be a torch.Tensor, got: {type(timesteps)}")
@@ -1088,6 +1235,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
             raise ValueError(f"Batch size mismatch: latents batch={latents.shape[0]} vs text batch={text_embeds.shape[0]}")
 
         text_embeds = text_embeds.to(device=accelerator.device, dtype=network_dtype)
+        _log_stats("text_embeds", text_embeds)
 
         # Check for NaN values
         if torch.isnan(text_embeds).any():
@@ -1222,30 +1370,31 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 dtype=torch.bool,
             )
 
-            audio_lengths = batch.get("audio_lengths")
-            if isinstance(audio_lengths, dict):
-                audio_lengths = audio_lengths.get("lengths")
-            if isinstance(audio_lengths, torch.Tensor):
-                if audio_lengths.dim() == 0:
-                    audio_lengths = audio_lengths.view(1)
-                if audio_lengths.dim() != 1:
-                    raise ValueError(f"Expected audio_lengths to be 1D [B] or scalar, got shape: {tuple(audio_lengths.shape)}")
-                if audio_lengths.numel() == 1 and audio_latents.shape[0] != 1:
-                    audio_lengths = audio_lengths.expand(audio_latents.shape[0])
-                if audio_lengths.shape[0] != audio_latents.shape[0]:
-                    raise ValueError(
-                        f"Batch size mismatch: audio_latents batch={audio_latents.shape[0]} vs audio_lengths batch={audio_lengths.shape[0]}"
-                    )
+            if getattr(args, "use_audio_length_mask", False):
+                audio_lengths = batch.get("audio_lengths")
+                if isinstance(audio_lengths, dict):
+                    audio_lengths = audio_lengths.get("lengths")
+                if isinstance(audio_lengths, torch.Tensor):
+                    if audio_lengths.dim() == 0:
+                        audio_lengths = audio_lengths.view(1)
+                    if audio_lengths.dim() != 1:
+                        raise ValueError(f"Expected audio_lengths to be 1D [B] or scalar, got shape: {tuple(audio_lengths.shape)}")
+                    if audio_lengths.numel() == 1 and audio_latents.shape[0] != 1:
+                        audio_lengths = audio_lengths.expand(audio_latents.shape[0])
+                    if audio_lengths.shape[0] != audio_latents.shape[0]:
+                        raise ValueError(
+                            f"Batch size mismatch: audio_latents batch={audio_latents.shape[0]} vs audio_lengths batch={audio_lengths.shape[0]}"
+                        )
 
-                audio_lengths = audio_lengths.to(device=accelerator.device)
-                if audio_lengths.dtype.is_floating_point:
-                    audio_lengths = audio_lengths.to(dtype=torch.int64)
-                else:
-                    audio_lengths = audio_lengths.to(dtype=torch.int64)
+                    audio_lengths = audio_lengths.to(device=accelerator.device)
+                    if audio_lengths.dtype.is_floating_point:
+                        audio_lengths = audio_lengths.to(dtype=torch.int64)
+                    else:
+                        audio_lengths = audio_lengths.to(dtype=torch.int64)
 
-                audio_lengths = audio_lengths.clamp(min=0, max=audio_seq_len)
-                t = torch.arange(audio_seq_len, device=accelerator.device).view(1, -1)
-                audio_loss_mask = t < audio_lengths.view(-1, 1)
+                    audio_lengths = audio_lengths.clamp(min=0, max=audio_seq_len)
+                    t = torch.arange(audio_seq_len, device=accelerator.device).view(1, -1)
+                    audio_loss_mask = t < audio_lengths.view(-1, 1)
 
             out_audio.update(
                 {
@@ -1389,6 +1538,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
         audio_noise = None
         noisy_audio = None
         audio_enabled_for_batch = False
+        audio_loss_mask = None
         if self._ltx_mode == "av":
             audio_latents = batch.get("audio_latents")
             if isinstance(audio_latents, dict):
@@ -1397,11 +1547,10 @@ class LTX2NetworkTrainer(NetworkTrainer):
             if audio_latents is None:
                 if not self._warned_missing_audio:
                     logger.warning(
-                        "LTXAV mode: missing audio latents in this batch; falling back to video-only for mixed datasets."
+                        "LTXAV mode: missing audio latents in this batch; skipping audio branch. "
+                        "Provide cached audio latents to train audio generation."
                     )
                     self._warned_missing_audio = True
-            if audio_latents is None:
-                audio_enabled_for_batch = False
             elif not isinstance(audio_latents, torch.Tensor):
                 raise TypeError(f"Expected audio_latents to be a torch.Tensor, got: {type(audio_latents)}")
             else:
@@ -1411,15 +1560,37 @@ class LTX2NetworkTrainer(NetworkTrainer):
                     raise ValueError(
                         f"Batch size mismatch: latents batch={latents.shape[0]} vs audio_latents batch={audio_latents.shape[0]}"
                     )
+                audio_latents = audio_latents.to(device=accelerator.device, dtype=network_dtype)
+                _check_finite("audio_latents", audio_latents)
+                _log_stats("audio_latents", audio_latents)
+                expected_length = self._calculate_expected_audio_latent_length(
+                    args,
+                    transformer,
+                    latent_frames=int(latents.shape[2]),
+                    frame_rate=float(frame_rate),
+                )
+                audio_latents = self._adjust_audio_latent_duration(audio_latents, expected_length)
+                audio_loss_mask = torch.ones(
+                    (audio_latents.shape[0], audio_latents.shape[2]),
+                    device=accelerator.device,
+                    dtype=torch.bool,
+                )
 
                 audio_enabled_for_batch = True
-                audio_latents = audio_latents.to(device=accelerator.device, dtype=network_dtype)
                 audio_noise = torch.randn_like(audio_latents)
                 sigma_audio = sigma.view(-1, 1, 1, 1)
                 noisy_audio = (1.0 - sigma_audio) * audio_latents + sigma_audio * audio_noise
+                _check_finite("noisy_audio", noisy_audio)
+                _log_stats("noisy_audio", noisy_audio)
 
-        if self._audio_video and not audio_enabled_for_batch and text_embeds.shape[-1] % 2 == 0:
-            text_embeds = text_embeds[..., : text_embeds.shape[-1] // 2]
+        if self._ltx_mode == "av" and not audio_enabled_for_batch:
+            if conditions is not None:
+                video_prompt_embeds = conditions.get("video_prompt_embeds")
+                if isinstance(video_prompt_embeds, torch.Tensor):
+                    text_embeds = video_prompt_embeds
+            elif isinstance(text_embeds, torch.Tensor) and text_embeds.shape[-1] % 2 == 0:
+                half = text_embeds.shape[-1] // 2
+                text_embeds = text_embeds[..., :half]
 
         caption_channels = getattr(transformer, "caption_channels", None)
         if caption_channels is None:
@@ -1427,29 +1598,22 @@ class LTX2NetworkTrainer(NetworkTrainer):
             if hasattr(base_model, "caption_projection"):
                 caption_channels = getattr(getattr(base_model, "caption_projection", None), "in_features", None)
         if caption_channels is not None:
-            if self._audio_video and not audio_enabled_for_batch:
-                expected_last_dim = int(caption_channels)
-                if text_embeds.shape[-1] != expected_last_dim:
-                    raise ValueError(
-                        "Text embedding dim mismatch for LTXAV fallback to video-only: "
-                        f"got {text_embeds.shape[-1]}, expected {expected_last_dim}. "
-                        f"(caption_channels={caption_channels})"
-                    )
-            else:
-                expected_last_dim = int(caption_channels) * (2 if self._audio_video else 1)
-                if text_embeds.shape[-1] != expected_last_dim:
-                    raise ValueError(
-                        f"Text embedding dim mismatch for {'LTXAV' if self._audio_video else 'LTXV'}: "
-                        f"got {text_embeds.shape[-1]}, expected {expected_last_dim}. "
-                        f"(caption_channels={caption_channels})"
-                    )
+            expected_last_dim = int(caption_channels) * (2 if audio_enabled_for_batch else 1)
+            if text_embeds.shape[-1] != expected_last_dim:
+                raise ValueError(
+                    f"Text embedding dim mismatch for {'LTXAV' if self._audio_video else 'LTXV'}: "
+                    f"got {text_embeds.shape[-1]}, expected {expected_last_dim}. "
+                    f"(caption_channels={caption_channels})"
+                )
 
         model_input = model_noisy_video
         if self._ltx_mode == "av" and audio_enabled_for_batch:
             model_input = [model_noisy_video, noisy_audio]
+        _log_stats("noisy_video", model_noisy_video)
+        _log_stats("timesteps", timesteps)
 
         video_conditioning_mask_tokens = None
-        video_loss_mask_frames = None
+        video_loss_mask = None
         if video_conditioning_enabled is not None:
             bsz, _c, frames, height, width = latents.shape
             seq_len = frames * height * width
@@ -1459,9 +1623,9 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 video_conditioning_mask_tokens[video_conditioning_enabled, :first_frame_tokens] = True
             transformer_options = {"patches_replace": {}, "video_conditioning_mask": video_conditioning_mask_tokens}
 
-            video_loss_mask_frames = torch.ones((bsz, frames), device=accelerator.device, dtype=torch.bool)
+            video_loss_mask = torch.ones((bsz, 1, frames, 1, 1), device=accelerator.device, dtype=torch.bool)
             if frames > 0:
-                video_loss_mask_frames[video_conditioning_enabled, 0] = False
+                video_loss_mask[video_conditioning_enabled, :, 0:1, :, :] = False
 
         if getattr(args, "fp8_base", False) or getattr(args, "fp8_scaled", False):
             self._ensure_fp8_buffers_on_device(transformer)
@@ -1481,13 +1645,19 @@ class LTX2NetworkTrainer(NetworkTrainer):
             if len(model_pred) != 2:
                 raise ValueError(f"Expected AV model to return [video_pred, audio_pred], got {len(model_pred)} outputs")
             video_pred, audio_pred = model_pred
+        _check_finite("video_pred", video_pred)
+        _check_finite("audio_pred", audio_pred)
+        _log_stats("video_pred", video_pred)
+        _log_stats("audio_pred", audio_pred)
 
         video_target = noise - latents
+        _check_finite("video_target", video_target)
+        _log_stats("video_target", video_target)
 
         out: Dict[str, Any] = {
             "video_pred": video_pred,
             "video_target": video_target,
-            "video_loss_mask": video_loss_mask_frames,
+            "video_loss_mask": video_loss_mask,
             "video_loss_weight": float(getattr(args, "video_loss_weight", 1.0)),
         }
 
@@ -1498,38 +1668,42 @@ class LTX2NetworkTrainer(NetworkTrainer):
             if audio_pred is None:
                 raise ValueError("AV mode expected an audio prediction but got None")
             audio_target = audio_noise - audio_latents
+            _check_finite("audio_target", audio_target)
+            _log_stats("audio_target", audio_target)
 
             audio_seq_len = int(audio_latents.shape[2])
-            audio_loss_mask = torch.ones(
-                (audio_latents.shape[0], audio_seq_len),
-                device=accelerator.device,
-                dtype=torch.bool,
-            )
+            if audio_loss_mask is None:
+                audio_loss_mask = torch.ones(
+                    (audio_latents.shape[0], audio_seq_len),
+                    device=accelerator.device,
+                    dtype=torch.bool,
+                )
 
-            audio_lengths = batch.get("audio_lengths")
-            if isinstance(audio_lengths, dict):
-                audio_lengths = audio_lengths.get("lengths")
-            if isinstance(audio_lengths, torch.Tensor):
-                if audio_lengths.dim() == 0:
-                    audio_lengths = audio_lengths.view(1)
-                if audio_lengths.dim() != 1:
-                    raise ValueError(f"Expected audio_lengths to be 1D [B] or scalar, got shape: {tuple(audio_lengths.shape)}")
-                if audio_lengths.numel() == 1 and audio_latents.shape[0] != 1:
-                    audio_lengths = audio_lengths.expand(audio_latents.shape[0])
-                if audio_lengths.shape[0] != audio_latents.shape[0]:
-                    raise ValueError(
-                        f"Batch size mismatch: audio_latents batch={audio_latents.shape[0]} vs audio_lengths batch={audio_lengths.shape[0]}"
-                    )
+            if getattr(args, "use_audio_length_mask", False):
+                audio_lengths = batch.get("audio_lengths")
+                if isinstance(audio_lengths, dict):
+                    audio_lengths = audio_lengths.get("lengths")
+                if isinstance(audio_lengths, torch.Tensor):
+                    if audio_lengths.dim() == 0:
+                        audio_lengths = audio_lengths.view(1)
+                    if audio_lengths.dim() != 1:
+                        raise ValueError(f"Expected audio_lengths to be 1D [B] or scalar, got shape: {tuple(audio_lengths.shape)}")
+                    if audio_lengths.numel() == 1 and audio_latents.shape[0] != 1:
+                        audio_lengths = audio_lengths.expand(audio_latents.shape[0])
+                    if audio_lengths.shape[0] != audio_latents.shape[0]:
+                        raise ValueError(
+                            f"Batch size mismatch: audio_latents batch={audio_latents.shape[0]} vs audio_lengths batch={audio_lengths.shape[0]}"
+                        )
 
-                audio_lengths = audio_lengths.to(device=accelerator.device)
-                if audio_lengths.dtype.is_floating_point:
-                    audio_lengths = audio_lengths.to(dtype=torch.int64)
-                else:
-                    audio_lengths = audio_lengths.to(dtype=torch.int64)
+                    audio_lengths = audio_lengths.to(device=accelerator.device)
+                    if audio_lengths.dtype.is_floating_point:
+                        audio_lengths = audio_lengths.to(dtype=torch.int64)
+                    else:
+                        audio_lengths = audio_lengths.to(dtype=torch.int64)
 
-                audio_lengths = audio_lengths.clamp(min=0, max=audio_seq_len)
-                t = torch.arange(audio_seq_len, device=accelerator.device).view(1, -1)
-                audio_loss_mask = t < audio_lengths.view(-1, 1)
+                    audio_lengths = audio_lengths.clamp(min=0, max=audio_seq_len)
+                    t = torch.arange(audio_seq_len, device=accelerator.device).view(1, -1)
+                    audio_loss_mask = t < audio_lengths.view(-1, 1)
             out.update(
                 {
                     "audio_pred": audio_pred,
@@ -1540,6 +1714,14 @@ class LTX2NetworkTrainer(NetworkTrainer):
             )
             if out["audio_loss_weight"] < 0.0:
                 raise ValueError(f"audio_loss_weight must be >= 0. Got: {out['audio_loss_weight']}")
+
+        if diag_enabled:
+            item_keys = batch.get("item_keys")
+            if isinstance(item_keys, list) and item_keys:
+                logger.info("DIAG item_keys: %s", item_keys[:5])
+            latent_paths = batch.get("latent_cache_paths")
+            if isinstance(latent_paths, list) and latent_paths:
+                logger.info("DIAG latent_cache_paths: %s", latent_paths[:3])
 
         return out, torch.tensor(0.0, device=accelerator.device)
 
@@ -2613,14 +2795,55 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
     parser.add_argument(
         "--ltx2_first_frame_conditioning_p",
         type=float,
-        default=0.5,
+        default=0.1,
         help="Probability of first-frame conditioning during training (keep frame 0 clean and set its timestep to 0).",
+    )
+    parser.add_argument(
+        "--use_audio_length_mask",
+        action="store_true",
+        help="Apply audio loss masking using audio_lengths (disabled by default to match official trainer).",
     )
 
     parser.add_argument(
         "--fp8_scaled",
         action="store_true",
         help="use scaled fp8 for DiT / DiTにスケーリングされたfp8を使う",
+    )
+    parser.add_argument(
+        "--fp8_upcast",
+        action="store_true",
+        help="Upcast FP8 linear weights to compute dtype during forward for stability.",
+    )
+    parser.add_argument(
+        "--fp8_upcast_stochastic",
+        action="store_true",
+        help="Use stochastic rounding when upcasting FP8 weights during forward.",
+    )
+    parser.add_argument(
+        "--fp8_upcast_seed",
+        type=int,
+        default=0,
+        help="Seed for stochastic FP8 upcast rounding (when enabled).",
+    )
+    parser.add_argument(
+        "--swap_keep_attn",
+        action="store_true",
+        help="Keep attention weights on GPU during block swapping to improve stability.",
+    )
+    parser.add_argument(
+        "--attn_stability",
+        action="store_true",
+        help="Force PyTorch attention for audio context and A/V cross-attn in swapped blocks.",
+    )
+    parser.add_argument(
+        "--attn_stability_fp32",
+        action="store_true",
+        help="Force FP32 attention for audio context and A/V cross-attn in swapped blocks.",
+    )
+    parser.add_argument(
+        "--safe_swap_attn",
+        action="store_true",
+        help="Keep attention on GPU + use PyTorch for audio/cross attn in swapped blocks.",
     )
     parser.add_argument(
         "--height",

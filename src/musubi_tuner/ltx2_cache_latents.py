@@ -28,6 +28,7 @@ from musubi_tuner.dataset.image_video_dataset import (
     VideoDataset,
     save_latent_cache_ltx2,
 )
+from musubi_tuner.ltx_2.model.audio_vae.audio_vae import LATENT_DOWNSAMPLE_FACTOR
 from musubi_tuner.utils.model_utils import str_to_dtype
 from musubi_tuner.utils.safetensors_utils import MemoryEfficientSafeOpen
 
@@ -139,6 +140,37 @@ def _resolve_audio_path(
     if audio_dir is not None:
         return os.path.join(audio_dir, base + audio_ext)
     return os.path.join(os.path.dirname(item_info.item_key), base + audio_ext)
+
+
+def _expected_audio_latent_length_for_item(
+    item_info: ItemInfo,
+    encoder,
+    *,
+    fps: float,
+) -> Optional[int]:
+    frame_count = getattr(item_info, "frame_count", None)
+    if not isinstance(frame_count, int) or frame_count <= 0:
+        return None
+    sample_rate = int(getattr(encoder, "sample_rate", 16000))
+    hop_length = int(getattr(encoder, "mel_hop_length", 160))
+    latents_per_second = float(sample_rate) / float(hop_length) / float(LATENT_DOWNSAMPLE_FACTOR)
+    duration_s = float(frame_count) / max(float(fps), 1.0)
+    return max(int(duration_s * latents_per_second), 1)
+
+
+def _align_audio_latents_to_video(audio_latents: torch.Tensor, expected_length: int) -> torch.Tensor:
+    actual_length = int(audio_latents.shape[1])
+    if actual_length == expected_length:
+        return audio_latents.contiguous()
+    if actual_length > expected_length:
+        return audio_latents[:, :expected_length, :].contiguous()
+    padding_length = expected_length - actual_length
+    padding = torch.zeros(
+        (audio_latents.shape[0], padding_length, audio_latents.shape[2]),
+        device=audio_latents.device,
+        dtype=audio_latents.dtype,
+    )
+    return torch.cat([audio_latents, padding], dim=1).contiguous()
 
 
 def encode_and_save_audio_cache(
@@ -268,9 +300,21 @@ def encode_and_save_audio_cache(
         latents = encoder(mel)
 
     latents = latents[0].detach().cpu().contiguous()
-    time_steps = latents.shape[1]
-    mel_bins = latents.shape[2]
-    channels = latents.shape[0]
+    original_steps = int(latents.shape[1])
+    expected_steps = _expected_audio_latent_length_for_item(
+        item_info,
+        encoder,
+        fps=float(VideoDataset.TARGET_FPS_LTX2),
+    )
+    if expected_steps is not None:
+        latents = _align_audio_latents_to_video(latents, expected_steps)
+        effective_steps = min(original_steps, expected_steps)
+    else:
+        effective_steps = original_steps
+
+    time_steps = int(latents.shape[1])
+    mel_bins = int(latents.shape[2])
+    channels = int(latents.shape[0])
 
     dtype_str = (
         cache_latents.dtype_to_str(dtype)
@@ -278,7 +322,7 @@ def encode_and_save_audio_cache(
         else ("fp16" if dtype == torch.float16 else "bf16" if dtype == torch.bfloat16 else "fp32")
     )
 
-    audio_lengths = torch.tensor(time_steps, dtype=torch.int32)
+    audio_lengths = torch.tensor(effective_steps, dtype=torch.int32)
     int_dtype_str = cache_latents.dtype_to_str(audio_lengths.dtype) if hasattr(cache_latents, "dtype_to_str") else "int32"
 
     audio_cache_path = _audio_cache_path(item_info)

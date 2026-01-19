@@ -968,6 +968,11 @@ class BucketBatchManager:
 
         audio_latents_per_item = []
         audio_lengths_per_item = []
+        diag_collect_keys = os.getenv("MUSUBI_TUNER_NAN_DIAG", "0") == "1"
+        item_keys = []
+        latent_cache_paths = []
+        audio_cache_paths = []
+        text_cache_paths = []
         for item_info in bucket[start:end]:
             sd_latent = load_file(item_info.latent_cache_path)
             audio_latent_cache_path = getattr(item_info, "audio_latent_cache_path", None)
@@ -1000,6 +1005,12 @@ class BucketBatchManager:
                     item_audio_lengths = value
             audio_latents_per_item.append(item_audio_latents)
             audio_lengths_per_item.append(item_audio_lengths)
+
+            if diag_collect_keys:
+                item_keys.append(item_info.item_key)
+                latent_cache_paths.append(item_info.latent_cache_path)
+                audio_cache_paths.append(audio_latent_cache_path)
+                text_cache_paths.append(item_info.text_encoder_output_cache_path)
 
             # TODO refactor this
             for key in sd.keys():
@@ -1155,6 +1166,12 @@ class BucketBatchManager:
 
             if conditions:
                 batch_tensor_data["conditions"] = conditions
+
+        if diag_collect_keys:
+            batch_tensor_data["item_keys"] = item_keys
+            batch_tensor_data["latent_cache_paths"] = latent_cache_paths
+            batch_tensor_data["audio_cache_paths"] = audio_cache_paths
+            batch_tensor_data["text_cache_paths"] = text_cache_paths
 
         return batch_tensor_data
 

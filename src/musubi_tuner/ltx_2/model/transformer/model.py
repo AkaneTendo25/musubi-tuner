@@ -1,6 +1,7 @@
 from dataclasses import replace
 from enum import Enum
 from typing import Optional
+import os
 
 import logging
 import torch
@@ -533,6 +534,16 @@ class LTXModel(torch.nn.Module):
     ) -> tuple[TransformerArgs, TransformerArgs]:
         """Process transformer blocks with optional offloading and block swapping."""
 
+        nan_block_diag = os.getenv("MUSUBI_TUNER_NAN_BLOCK_DIAG", "0") == "1"
+        strict_swap_sync = os.getenv("MUSUBI_TUNER_SWAP_STRICT_SYNC", "0") == "1"
+        force_pytorch_attn = os.getenv("MUSUBI_TUNER_SWAP_FORCE_PYTORCH_ATTN", "0") == "1"
+        force_cross_pytorch = os.getenv("MUSUBI_TUNER_FORCE_PYTORCH_CROSS_ATTN", "0") == "1"
+        force_cross_fp32 = os.getenv("MUSUBI_TUNER_CROSS_ATTN_FP32", "0") == "1"
+        cross_attn_swap_only = os.getenv("MUSUBI_TUNER_CROSS_ATTN_SWAP_ONLY", "1") == "1"
+        force_audio_ctx_pytorch = os.getenv("MUSUBI_TUNER_FORCE_PYTORCH_AUDIO_CTX_ATTN", "0") == "1"
+        force_audio_ctx_fp32 = os.getenv("MUSUBI_TUNER_AUDIO_CTX_ATTN_FP32", "0") == "1"
+        audio_ctx_swap_only = os.getenv("MUSUBI_TUNER_AUDIO_CTX_ATTN_SWAP_ONLY", "1") == "1"
+
         swap_manager = self._ltx2_block_swap
         swap_active = False
         compute_device = None
@@ -567,47 +578,122 @@ class LTXModel(torch.nn.Module):
                 video = _move_transformer_args(video, cpu_device)
                 audio = _move_transformer_args(audio, cpu_device)
 
-        # Async Stream Setup (Phase 2)
-        if not hasattr(self, "_transfer_stream"):
-            # Create stream on GPU device if available
-            self._transfer_stream = torch.cuda.Stream(device=gpu_device)
-        transfer_stream = self._transfer_stream
-        
+        use_async_prefetch = os.getenv("MUSUBI_TUNER_SWAP_ASYNC_PREFETCH", "1") == "1"
+        transfer_stream = None
         target_device = gpu_device if gpu_device else torch.device("cuda")
+        if use_async_prefetch:
+            # Async Stream Setup (Phase 2)
+            if not hasattr(self, "_transfer_stream"):
+                # Create stream on GPU device if available
+                self._transfer_stream = torch.cuda.Stream(device=gpu_device)
+            transfer_stream = self._transfer_stream
 
         # Process transformer blocks
         for block_idx, block in enumerate(self.transformer_blocks):
+            swap_start = max(0, len(self.transformer_blocks) - int(self.blocks_to_swap or 0))
+            in_swap_range = bool(self.blocks_to_swap) and block_idx >= swap_start
+            if force_pytorch_attn and in_swap_range and not getattr(block, "_forced_pytorch_attn", False):
+                from musubi_tuner.ltx_2.model.transformer.attention import Attention, AttentionFunction
+
+                for mod in block.modules():
+                    if isinstance(mod, Attention):
+                        mod.attention_function = AttentionFunction.PYTORCH
+                block._forced_pytorch_attn = True
+                logger.info("Forced PyTorch attention for swapped block %s", block_idx)
+
+            if force_cross_pytorch or force_cross_fp32:
+                enable_cross = (not cross_attn_swap_only) or in_swap_range
+                block._force_pytorch_cross_attn = bool(force_cross_pytorch and enable_cross)
+                block._force_fp32_cross_attn = bool(force_cross_fp32 and enable_cross)
+            if force_audio_ctx_pytorch or force_audio_ctx_fp32:
+                enable_audio_ctx = (not audio_ctx_swap_only) or in_swap_range
+                block._force_pytorch_audio_ctx_attn = bool(force_audio_ctx_pytorch and enable_audio_ctx)
+                block._force_fp32_audio_ctx_attn = bool(force_audio_ctx_fp32 and enable_audio_ctx)
+
             # Phase 2: Wait for prefetch (if active)
             # If previous block triggered prefetch for this block, wait for it here.
             # Using wait_stream ensures kernels submitted to compute stream (block execution)
             # will wait for transfers submitted to transfer stream to complete.
-            if getattr(block, "weight_cpu_offloading", False):
+            if transfer_stream is not None and getattr(block, "weight_cpu_offloading", False):
                 torch.cuda.current_stream().wait_stream(transfer_stream)
 
             if self.blocks_to_swap > 0 and self.offloader is not None:
                 self.offloader.wait_for_block(block_idx)
+                if strict_swap_sync and torch.cuda.is_available():
+                    torch.cuda.current_stream().synchronize()
             elif (
                 self.blocks_to_swap > 0
                 and self._ltx2_block_swap is not None
                 and block_idx in self._ltx2_block_swap.block_indices
             ):
                 self._ltx2_block_swap.param_swap(block_idx)
+                if strict_swap_sync and torch.cuda.is_available():
+                    torch.cuda.current_stream().synchronize()
 
             # Phase 2: Prefetch Next Block
             # Trigger load for N+1 on Transfer Stream while N is about to compute
-            if getattr(block, "weight_cpu_offloading", False) and block_idx + 1 < len(self.transformer_blocks):
-                 next_block = self.transformer_blocks[block_idx + 1]
-                 # Only prefetch if next block also wants it
-                 if getattr(next_block, "weight_cpu_offloading", False):
-                      with torch.cuda.stream(transfer_stream):
-                          # Safe to call because it checks p.device internally
-                          # If already loaded, it's a fast no-op.
-                          # If on CPU, it triggers H2D copy.
-                          next_block._load_weights(next_block, target_device)
+            if (
+                transfer_stream is not None
+                and getattr(block, "weight_cpu_offloading", False)
+                and block_idx + 1 < len(self.transformer_blocks)
+            ):
+                next_block = self.transformer_blocks[block_idx + 1]
+                # Only prefetch if next block also wants it
+                if getattr(next_block, "weight_cpu_offloading", False):
+                    with torch.cuda.stream(transfer_stream):
+                        # Safe to call because it checks p.device internally
+                        # If already loaded, it's a fast no-op.
+                        # If on CPU, it triggers H2D copy.
+                        next_block._load_weights(next_block, target_device)
 
             # Execute block (it now handles checkpointing i.e. load/compute/offload)
             # If offloading is on, block expects CPU inputs (for checkpoint savings) and returns CPU outputs
             video, audio = block(video, audio, perturbations)
+
+            if nan_block_diag:
+                vx = video.x if video is not None and isinstance(video.x, torch.Tensor) else None
+                ax = audio.x if audio is not None and isinstance(audio.x, torch.Tensor) else None
+
+                def _summarize_block_devices(b: torch.nn.Module) -> tuple[int, int, int, int]:
+                    params_cpu = params_cuda = buffers_cpu = buffers_cuda = 0
+                    for p in b.parameters():
+                        if p.device.type == "cpu":
+                            params_cpu += 1
+                        elif p.device.type == "cuda":
+                            params_cuda += 1
+                    for buf in b.buffers():
+                        if buf.device.type == "cpu":
+                            buffers_cpu += 1
+                        elif buf.device.type == "cuda":
+                            buffers_cuda += 1
+                    return params_cpu, params_cuda, buffers_cpu, buffers_cuda
+
+                def _log_block_diag(branch: str):
+                    params_cpu, params_cuda, buffers_cpu, buffers_cuda = _summarize_block_devices(block)
+                    swap_start = max(0, len(self.transformer_blocks) - int(self.blocks_to_swap or 0))
+                    in_swap_range = bool(self.blocks_to_swap) and block_idx >= swap_start
+                    logger.error(
+                        "NaN/Inf after block %s (%s). swap_range=%s..%s in_swap_range=%s swap_mode=%s offloader=%s "
+                        "params_cpu=%s params_cuda=%s buffers_cpu=%s buffers_cuda=%s",
+                        block_idx,
+                        branch,
+                        swap_start,
+                        len(self.transformer_blocks) - 1,
+                        in_swap_range,
+                        getattr(self, "swap_mode", "default"),
+                        self.offloader is not None,
+                        params_cpu,
+                        params_cuda,
+                        buffers_cpu,
+                        buffers_cuda,
+                    )
+
+                if vx is not None and not torch.isfinite(vx).all():
+                    _log_block_diag("video")
+                    raise RuntimeError(f"Non-finite video activations after block {block_idx}")
+                if ax is not None and not torch.isfinite(ax).all():
+                    _log_block_diag("audio")
+                    raise RuntimeError(f"Non-finite audio activations after block {block_idx}")
 
             if swap_active and swap_manager is not None and swap_manager.is_managed_block(block_idx):
                 swap_manager.stream_out(block)

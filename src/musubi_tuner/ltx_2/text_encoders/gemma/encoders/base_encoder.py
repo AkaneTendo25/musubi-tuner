@@ -1,5 +1,8 @@
 import functools
+import logging
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 import torch
 from einops import rearrange
@@ -269,7 +272,7 @@ def _infer_safetensors_dtype(path: str) -> torch.dtype | None:
 
 
 def module_ops_from_gemma_root(
-    gemma_root: str,
+    gemma_root: str | None,
     *,
     gemma_weights_path: str | None = None,
     torch_dtype: torch.dtype = torch.bfloat16,
@@ -291,8 +294,14 @@ def module_ops_from_gemma_root(
                 raise FileNotFoundError(f"Gemma weights not found: {gemma_weights_path}")
             gemma_weights_dtype = _infer_safetensors_dtype(str(weight_path))
             gemma_path = str(weight_path.parent)
-    else:
+
+        if gemma_root is None:
+            gemma_root = gemma_path
+    elif gemma_root is not None:
         gemma_path = _find_matching_dir(gemma_root, "model*.safetensors")
+    else:
+        raise ValueError("Either gemma_root or gemma_weights_path must be provided")
+
     tokenizer_path = _find_matching_dir(gemma_root, "tokenizer.model")
 
     def load_gemma(module: GemmaTextEncoderModelBase) -> GemmaTextEncoderModelBase:
@@ -334,18 +343,54 @@ def module_ops_from_gemma_root(
                     raise ValueError("Float8 Gemma weights require CUDA; provide a GPU or use non-fp8 weights.")
 
                 config = AutoConfig.from_pretrained(gemma_root, local_files_only=True)
-                module.model = Gemma3ForConditionalGeneration(config).to(load_device)
+                
+                # Initialize on meta device to avoid immediate allocation
+                with torch.device("meta"):
+                    module.model = Gemma3ForConditionalGeneration(config).to(dtype=torch_dtype)
+
+                logger.info(f"Loading custom Gemma weights from {gemma_weights_path}...")
+                
                 # Memory-efficient loading: stream tensors directly to model
                 with safe_open(gemma_weights_path, framework="pt", device="cpu") as f:
-                    # We use "cpu" for safe_open to ensure we don't accidentally OOM GPU during read
-                    # Transfer to load_device is done during assignment
-                    for key in f.keys():
+                    keys = list(f.keys())
+                    total_keys = len(keys)
+                    logger.info(f"Found {total_keys} tensors in safetensors file")
+                    
+                    # Print first 5 keys from safetensors for debugging
+                    logger.info(f"First 5 safetensors keys: {keys[:5]}")
+                    
+                    # Get model's expected keys for comparison
+                    model_keys = set(name for name, _ in module.model.named_parameters())
+                    logger.info(f"Model expects {len(model_keys)} parameters")
+                    logger.info(f"First 5 model keys: {list(model_keys)[:5]}")
+                    
+                    unmatched_keys = []
+                    
+                    for i, key in enumerate(keys):
+                        if i % 100 == 0:
+                            logger.info(f"Loading Gemma weights: {i}/{total_keys}...")
+                        
+                        # Skip ComfyUI quantization metadata keys (not actual weights)
+                        if key.endswith(".comfy_quant") or key.endswith(".weight_scale") or key.endswith(".weight_scale_2"):
+                            continue
+                            
                         new_key = key
-                        # Fix for ComfyUI/flattened checkpoints
-                        if key.startswith("vision_model."):
+                        
+                        # Key mapping for ComfyUI/flattened checkpoints
+                        # ComfyUI uses model.* but HuggingFace Gemma3ForConditionalGeneration uses model.language_model.*
+                        if key.startswith("model.embed_tokens."):
+                            new_key = key.replace("model.embed_tokens.", "model.language_model.embed_tokens.", 1)
+                        elif key.startswith("model.layers."):
+                            new_key = key.replace("model.layers.", "model.language_model.layers.", 1)
+                        elif key.startswith("model.norm."):
+                            new_key = key.replace("model.norm.", "model.language_model.norm.", 1)
+                        elif key.startswith("vision_model."):
                             new_key = f"model.vision_tower.{key}"
                         elif key.startswith("multi_modal_projector."):
-                            new_key = f"model.vision_tower.{key}"
+                            new_key = f"model.{key}"
+                        elif key.startswith("language_model."):
+                            # Some checkpoints use language_model.* instead of model.language_model.*
+                            new_key = f"model.{key}"
                         
                         try:
                             # Iterate to find the submodule and parameter
@@ -356,26 +401,69 @@ def module_ops_from_gemma_root(
                                 sub_mod = getattr(sub_mod, part)
                             
                             param = getattr(sub_mod, param_name)
+                            
+                            # Skip if already loaded (unlikely in this loop but good safety)
+                            if param.device.type != "meta":
+                                pass
+
                             tensor = f.get_tensor(key)
                             
+                            # DEBUG: Log first tensor info
+                            if i < 5:
+                                print(f"DEBUG: Tensor {key} -> {new_key} - shape={tensor.shape}, dtype={tensor.dtype}, size_mb={tensor.numel() * tensor.element_size() / 1024 / 1024:.2f}", flush=True)
+
                             with torch.no_grad():
                                 if param.shape != tensor.shape:
                                     # Handle specialized shape mismatches if necessary, or error
                                     logger.warning(f"Shape mismatch for {new_key}: model {param.shape} vs ckpt {tensor.shape}")
                                     continue
                                 
-                                # Move to target device and assign
-                                param.data = tensor.to(device=load_device, dtype=param.dtype)
+                                # FP8 weights must be cast to compute dtype (BF16) since FP8 doesn't support all ops
+                                # The memory savings from FP8 are only on disk, not in VRAM
+                                if tensor.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+                                    tensor = tensor.to(torch_dtype)
+                                
+                                # Materialize param on target device
+                                new_param = torch.nn.Parameter(
+                                    tensor.to(device=load_device), 
+                                    requires_grad=param.requires_grad
+                                )
+                                # Replace the meta parameter with the materialized one
+                                setattr(sub_mod, param_name, new_param)
+                                
                         except AttributeError:
-                            # Missing in model (unexpected key) - ignore or log
+                            # Missing in model (unexpected key) - track for debugging
+                            if i < 20:  # Only log first 20 unmatched
+                                unmatched_keys.append((key, new_key))
                             pass
                         except Exception as e:
                             logger.warning(f"Error loading {new_key}: {e}")
-
-                # Verify loading (basic check)
-                missing = [] # Full verification is expensive now, skip or implement light check
-                unexpected = [] 
-                module.model = module.model.to(dtype=torch_dtype)
+                # Log unmatched keys for debugging
+                if unmatched_keys:
+                    logger.info(f"First {len(unmatched_keys)} unmatched safetensors keys (original -> attempted):")
+                    for orig, attempted in unmatched_keys:
+                        logger.info(f"  {orig} -> {attempted}")
+                
+                # Count how many params are still on meta (not loaded from safetensors)
+                meta_count = sum(1 for p in module.model.parameters() if p.device.type == "meta")
+                total_params = sum(1 for _ in module.model.parameters())
+                logger.info(f"Loaded {total_params - meta_count}/{total_params} parameters from safetensors. {meta_count} still on meta.")
+                
+                if meta_count > 0:
+                    # Log first few model keys that are still on meta
+                    meta_keys = [name for name, p in module.model.named_parameters() if p.device.type == "meta"]
+                    logger.warning(f"{meta_count} parameters were NOT found in safetensors and will be materialized as random tensors!")
+                    logger.info(f"First 10 missing model keys: {meta_keys[:10]}")
+                
+                # Materialize any remaining meta parameters (e.g. buffers or unused params) to avoid errors later
+                # NOTE: This may allocate memory for any missing weights. If your safetensors is incomplete,
+                # these will be random tensors in torch_dtype.
+                module.model.to_empty(device=load_device)
+                
+                logger.info("Custom Gemma weights loaded.")
+                
+                # DO NOT cast to torch_dtype here - that would upcast quantized weights to full precision!
+                # module.model = module.model.to(dtype=torch_dtype)
             else:
                 module.model = Gemma3ForConditionalGeneration.from_pretrained(
                     gemma_path,
@@ -383,6 +471,11 @@ def module_ops_from_gemma_root(
                     torch_dtype=torch_dtype,
                 )
         module._gemma_root = module._gemma_root or gemma_root
+        
+        # Ensure model is in eval mode
+        if module.model is not None:
+             module.model.eval()
+             
         return module
 
     def load_tokenizer(module: GemmaTextEncoderModelBase) -> GemmaTextEncoderModelBase:

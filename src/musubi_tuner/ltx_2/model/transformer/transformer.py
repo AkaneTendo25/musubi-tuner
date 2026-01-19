@@ -1,5 +1,7 @@
 from dataclasses import dataclass, replace, fields
 from typing import Any
+import logging
+import os
 
 import torch
 import torch.utils.checkpoint as checkpoint
@@ -15,6 +17,8 @@ from musubi_tuner.ltx_2.model.transformer.feed_forward import FeedForward
 from musubi_tuner.ltx_2.model.transformer.rope import LTXRopeType
 from musubi_tuner.ltx_2.model.transformer.transformer_args import TransformerArgs
 from musubi_tuner.ltx_2.utils import rms_norm
+
+logger = logging.getLogger(__name__)
 
 
 
@@ -343,6 +347,98 @@ class BasicAVTransformerBlock(torch.nn.Module):
         audio: TransformerArgs | None,
         perturbations: BatchedPerturbationConfig | None = None,
     ) -> tuple[TransformerArgs | None, TransformerArgs | None]:
+        sublayer_diag = os.getenv("MUSUBI_TUNER_NAN_SUBLAYER_DIAG", "0") == "1"
+        v2a_diag = os.getenv("MUSUBI_TUNER_V2A_DIAG", "0") == "1"
+        attn_retry_fp32 = os.getenv("MUSUBI_TUNER_ATTN_FP32_RETRY", "0") == "1"
+        force_pytorch_cross_attn = (
+            os.getenv("MUSUBI_TUNER_FORCE_PYTORCH_CROSS_ATTN", "0") == "1"
+            or getattr(self, "_force_pytorch_cross_attn", False)
+        )
+        force_fp32_cross_attn = (
+            os.getenv("MUSUBI_TUNER_CROSS_ATTN_FP32", "0") == "1"
+            or getattr(self, "_force_fp32_cross_attn", False)
+        )
+        force_pytorch_audio_ctx = (
+            os.getenv("MUSUBI_TUNER_FORCE_PYTORCH_AUDIO_CTX_ATTN", "0") == "1"
+            or getattr(self, "_force_pytorch_audio_ctx_attn", False)
+        )
+        force_fp32_audio_ctx = (
+            os.getenv("MUSUBI_TUNER_AUDIO_CTX_ATTN_FP32", "0") == "1"
+            or getattr(self, "_force_fp32_audio_ctx_attn", False)
+        )
+
+        def _check_finite_local(tag: str, tensor: torch.Tensor | None) -> None:
+            if not sublayer_diag or tensor is None:
+                return
+            if not torch.isfinite(tensor).all():
+                raise RuntimeError(f"Non-finite {tag} in block {self.idx}")
+
+        def _log_stats(tag: str, tensor: torch.Tensor | None) -> None:
+            if not v2a_diag or tensor is None:
+                return
+            if not isinstance(tensor, torch.Tensor) or tensor.numel() == 0:
+                logger.info("V2A_DIAG %s: empty", tag)
+                return
+            t = tensor.detach()
+            try:
+                tmin = float(t.min().item())
+                tmax = float(t.max().item())
+                tmean = float(t.mean().item())
+                tstd = float(t.std().item())
+            except Exception:
+                tmin = tmax = tmean = tstd = float("nan")
+            finite = bool(torch.isfinite(t).all().item())
+            logger.info(
+                "V2A_DIAG %s: shape=%s min=%.6f max=%.6f mean=%.6f std=%.6f finite=%s",
+                tag,
+                tuple(t.shape),
+                tmin,
+                tmax,
+                tmean,
+                tstd,
+                finite,
+            )
+
+        def _attn_with_retry(
+            attn_module: torch.nn.Module,
+            x_in: torch.Tensor,
+            *,
+            context: torch.Tensor | None = None,
+            mask: torch.Tensor | None = None,
+            pe: torch.Tensor | None = None,
+            k_pe: torch.Tensor | None = None,
+            force_fp32: bool = False,
+            force_pytorch: bool = False,
+        ) -> torch.Tensor:
+            original_fn = None
+            if force_pytorch:
+                original_fn = getattr(attn_module, "attention_function", None)
+                attn_module.attention_function = AttentionFunction.PYTORCH
+            try:
+                if force_fp32:
+                    x_fp32 = x_in.to(torch.float32)
+                    ctx_fp32 = context.to(torch.float32) if isinstance(context, torch.Tensor) else None
+                    pe_fp32 = pe.to(torch.float32) if isinstance(pe, torch.Tensor) else None
+                    k_pe_fp32 = k_pe.to(torch.float32) if isinstance(k_pe, torch.Tensor) else None
+                    out = attn_module(x_fp32, context=ctx_fp32, mask=mask, pe=pe_fp32, k_pe=k_pe_fp32)
+                    out = out.to(dtype=x_in.dtype)
+                else:
+                    out = attn_module(x_in, context=context, mask=mask, pe=pe, k_pe=k_pe)
+                if not attn_retry_fp32:
+                    return out
+                if torch.isfinite(out).all():
+                    return out
+                logger.warning("LTX-2 attn retry in fp32 for block %s", self.idx)
+                x_fp32 = x_in.to(torch.float32)
+                ctx_fp32 = context.to(torch.float32) if isinstance(context, torch.Tensor) else None
+                pe_fp32 = pe.to(torch.float32) if isinstance(pe, torch.Tensor) else None
+                k_pe_fp32 = k_pe.to(torch.float32) if isinstance(k_pe, torch.Tensor) else None
+                out = attn_module(x_fp32, context=ctx_fp32, mask=mask, pe=pe_fp32, k_pe=k_pe_fp32)
+                return out.to(dtype=x_in.dtype)
+            finally:
+                if force_pytorch and original_fn is not None:
+                    attn_module.attention_function = original_fn
+
         target_device = None
         if video is not None and isinstance(video.x, torch.Tensor):
             target_device = video.x.device
@@ -371,6 +467,7 @@ class BasicAVTransformerBlock(torch.nn.Module):
         run_v2a = run_ax and (video is not None and video.enabled and vx.numel() > 0)
 
         if run_vx:
+            _check_finite_local("video_in", vx)
             vshift_msa, vscale_msa, vgate_msa = self.get_ada_values(
                 self.scale_shift_table, vx.shape[0], video.timesteps, slice(0, 3), num_tokens=vx.shape[1]
             )
@@ -378,13 +475,23 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 # AdaLN Structural Fix: Force modulation to happen in Float32 to prevent overflow (10^18 issue)
                 norm_vx = (rms_norm(vx, eps=self.norm_eps).to(torch.float32) * (1 + vscale_msa.to(torch.float32)) + vshift_msa.to(torch.float32)).to(vx.dtype)
                 v_mask = perturbations.mask_like(PerturbationType.SKIP_VIDEO_SELF_ATTN, self.idx, vx)
-                vx = vx + self.attn1(norm_vx, pe=video.positional_embeddings) * vgate_msa * v_mask
+                attn1_out = _attn_with_retry(self.attn1, norm_vx, pe=video.positional_embeddings)
+                vx = vx + attn1_out * vgate_msa * v_mask
+                _check_finite_local("video_after_attn1", vx)
 
-            vx = vx + self.attn2(rms_norm(vx, eps=self.norm_eps), context=video.context, mask=video.context_mask)
+            attn2_out = _attn_with_retry(
+                self.attn2,
+                rms_norm(vx, eps=self.norm_eps),
+                context=video.context,
+                mask=video.context_mask,
+            )
+            vx = vx + attn2_out
+            _check_finite_local("video_after_attn2", vx)
 
             del vshift_msa, vscale_msa, vgate_msa
 
         if run_ax:
+            _check_finite_local("audio_in", ax)
             ashift_msa, ascale_msa, agate_msa = self.get_ada_values(
                 self.audio_scale_shift_table, ax.shape[0], audio.timesteps, slice(0, 3), num_tokens=ax.shape[1]
             )
@@ -393,9 +500,20 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 # AdaLN Structural Fix
                 norm_ax = (rms_norm(ax, eps=self.norm_eps).to(torch.float32) * (1 + ascale_msa.to(torch.float32)) + ashift_msa.to(torch.float32)).to(ax.dtype)
                 a_mask = perturbations.mask_like(PerturbationType.SKIP_AUDIO_SELF_ATTN, self.idx, ax)
-                ax = ax + self.audio_attn1(norm_ax, pe=audio.positional_embeddings) * agate_msa * a_mask
+                audio_attn1_out = _attn_with_retry(self.audio_attn1, norm_ax, pe=audio.positional_embeddings)
+                ax = ax + audio_attn1_out * agate_msa * a_mask
+                _check_finite_local("audio_after_attn1", ax)
 
-            ax = ax + self.audio_attn2(rms_norm(ax, eps=self.norm_eps), context=audio.context, mask=audio.context_mask)
+            audio_attn2_out = _attn_with_retry(
+                self.audio_attn2,
+                rms_norm(ax, eps=self.norm_eps),
+                context=audio.context,
+                mask=audio.context_mask,
+                force_fp32=force_fp32_audio_ctx,
+                force_pytorch=force_pytorch_audio_ctx,
+            )
+            ax = ax + audio_attn2_out
+            _check_finite_local("audio_after_attn2", ax)
 
             del ashift_msa, ascale_msa, agate_msa
 
@@ -438,31 +556,43 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 ax_scaled = (ax_norm3.to(torch.float32) * (1 + scale_ca_audio_hidden_states_a2v.to(torch.float32)) + shift_ca_audio_hidden_states_a2v.to(torch.float32)).to(ax.dtype)
                 a2v_mask = perturbations.mask_like(PerturbationType.SKIP_A2V_CROSS_ATTN, self.idx, vx)
                 vx = vx + (
-                    self.audio_to_video_attn(
+                    _attn_with_retry(
+                        self.audio_to_video_attn,
                         vx_scaled,
                         context=ax_scaled,
                         pe=video.cross_positional_embeddings,
                         k_pe=audio.cross_positional_embeddings,
+                        force_fp32=force_fp32_cross_attn,
+                        force_pytorch=force_pytorch_cross_attn,
                     )
                     * gate_out_a2v
                     * a2v_mask
                 )
+                _check_finite_local("video_after_a2v", vx)
 
             if run_v2a:
                 # AdaLN Structural Fix
                 ax_scaled = (ax_norm3.to(torch.float32) * (1 + scale_ca_audio_hidden_states_v2a.to(torch.float32)) + shift_ca_audio_hidden_states_v2a.to(torch.float32)).to(ax.dtype)
                 vx_scaled = (vx_norm3.to(torch.float32) * (1 + scale_ca_video_hidden_states_v2a.to(torch.float32)) + shift_ca_video_hidden_states_v2a.to(torch.float32)).to(vx.dtype)
                 v2a_mask = perturbations.mask_like(PerturbationType.SKIP_V2A_CROSS_ATTN, self.idx, ax)
+                _log_stats("v2a_ax_scaled", ax_scaled)
+                _log_stats("v2a_vx_scaled", vx_scaled)
+                _log_stats("v2a_gate_out", gate_out_v2a)
                 ax = ax + (
-                    self.video_to_audio_attn(
+                    _attn_with_retry(
+                        self.video_to_audio_attn,
                         ax_scaled,
                         context=vx_scaled,
                         pe=audio.cross_positional_embeddings,
                         k_pe=video.cross_positional_embeddings,
+                        force_fp32=force_fp32_cross_attn,
+                        force_pytorch=force_pytorch_cross_attn,
                     )
                     * gate_out_v2a
                     * v2a_mask
                 )
+                _log_stats("v2a_out", ax)
+                _check_finite_local("audio_after_v2a", ax)
 
             del gate_out_a2v, gate_out_v2a
             del (
@@ -483,6 +613,7 @@ class BasicAVTransformerBlock(torch.nn.Module):
             # AdaLN Structural Fix
             vx_scaled = (rms_norm(vx, eps=self.norm_eps).to(torch.float32) * (1 + vscale_mlp.to(torch.float32)) + vshift_mlp.to(torch.float32)).to(vx.dtype)
             vx = vx + self.ff(vx_scaled) * vgate_mlp
+            _check_finite_local("video_after_ff", vx)
 
             del vshift_mlp, vscale_mlp, vgate_mlp
 
@@ -493,6 +624,7 @@ class BasicAVTransformerBlock(torch.nn.Module):
             # AdaLN Structural Fix
             ax_scaled = (rms_norm(ax, eps=self.norm_eps).to(torch.float32) * (1 + ascale_mlp.to(torch.float32)) + ashift_mlp.to(torch.float32)).to(ax.dtype)
             ax = ax + self.audio_ff(ax_scaled) * agate_mlp
+            _check_finite_local("audio_after_ff", ax)
 
             del ashift_mlp, ascale_mlp, agate_mlp
 
@@ -500,14 +632,16 @@ class BasicAVTransformerBlock(torch.nn.Module):
         # This runs during forward pass. During backward, the backward hook handles offloading.
         if self.activation_cpu_offloading:
             cpu_device = torch.device("cpu")
-            weighs_to_device(self, cpu_device, use_pinned=self.use_pinned_memory)
+            use_pinned = self.use_pinned_memory and os.getenv("MUSUBI_TUNER_SWAP_PINNED", "1") == "1"
+            weighs_to_device(self, cpu_device, use_pinned=use_pinned)
             _move_non_linear_params(self, cpu_device)
             ensure_fp8_modules_on_device(self, cpu_device)
 
         return replace(video, x=vx) if video is not None else None, replace(audio, x=ax) if audio is not None else None
 
     def _load_weights(self, b: torch.nn.Module, d: torch.device) -> None:
-        weighs_to_device(b, d, use_pinned=self.use_pinned_memory)
+        use_pinned = self.use_pinned_memory and os.getenv("MUSUBI_TUNER_SWAP_PINNED", "1") == "1"
+        weighs_to_device(b, d, use_pinned=use_pinned)
         # Move non-linear params (RMSNorm, etc.) and FP8/LoRA modules
         _move_non_linear_params(b, d)
         ensure_fp8_modules_on_device(b, d)
@@ -529,7 +663,8 @@ class BasicAVTransformerBlock(torch.nn.Module):
         cpu_device = torch.device("cpu")
         # When offloading to CPU, we should also move these tables back
         # Reuse the same logic but targeting CPU (d)
-        weighs_to_device(b, d, use_pinned=self.use_pinned_memory)
+        use_pinned = self.use_pinned_memory and os.getenv("MUSUBI_TUNER_SWAP_PINNED", "1") == "1"
+        weighs_to_device(b, d, use_pinned=use_pinned)
         for attr in [
             "scale_shift_table",
             "audio_scale_shift_table",
@@ -540,7 +675,9 @@ class BasicAVTransformerBlock(torch.nn.Module):
             if p is not None:
                 if p.device != d:
                     if d.type == "cpu":
-                        p.data = p.data.to(d, non_blocking=True).pin_memory()
+                        p.data = p.data.to(d, non_blocking=True)
+                        if use_pinned:
+                            p.data = p.data.pin_memory()
                     else:
                         p.data = p.data.to(d, non_blocking=True)
         _move_non_linear_params(b, cpu_device)

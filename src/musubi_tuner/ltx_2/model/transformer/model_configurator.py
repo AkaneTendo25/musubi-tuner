@@ -1,5 +1,7 @@
 import torch
 from musubi_tuner.ltx_2.loader.fuse_loras import fused_add_round_launch
+import logging
+
 from musubi_tuner.ltx_2.loader.module_ops import ModuleOps
 from musubi_tuner.ltx_2.loader.sd_ops import KeyValueOperationResult, SDOps
 from musubi_tuner.ltx_2.model.model_protocol import ModelConfigurator
@@ -118,6 +120,10 @@ def _naive_weight_or_bias_downcast(key: str, value: torch.Tensor) -> list[KeyVal
     return [KeyValueOperationResult(key, value.to(dtype=torch.float8_e4m3fn))]
 
 
+logger = logging.getLogger(__name__)
+_LOGGED_UPCAST_FALLBACK = False
+
+
 def _upcast_and_round(
     weight: torch.Tensor, dtype: torch.dtype, with_stochastic_rounding: bool = False, seed: int = 0
 ) -> torch.Tensor:
@@ -127,7 +133,17 @@ def _upcast_and_round(
     """
     if not with_stochastic_rounding:
         return weight.to(dtype)
-    return fused_add_round_launch(torch.zeros_like(weight, dtype=dtype), weight, seed)
+    try:
+        return fused_add_round_launch(torch.zeros_like(weight, dtype=dtype), weight, seed)
+    except RuntimeError as exc:
+        global _LOGGED_UPCAST_FALLBACK
+        if not _LOGGED_UPCAST_FALLBACK:
+            _LOGGED_UPCAST_FALLBACK = True
+            logger.warning(
+                "FP8 stochastic upcast fallback to plain cast (no triton). Error: %s",
+                exc,
+            )
+        return weight.to(dtype)
 
 
 def replace_fwd_with_upcast(layer: torch.nn.Linear, with_stochastic_rounding: bool = False, seed: int = 0) -> None:

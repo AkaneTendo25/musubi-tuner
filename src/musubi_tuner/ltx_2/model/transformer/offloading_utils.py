@@ -16,6 +16,36 @@ from musubi_tuner.modules.custom_offloading_utils import (
 logger = logging.getLogger(__name__)
 _LOGGED_SWAP_BYTES = False
 _LOGGED_FIRST_PARAM = False
+_SKIP_AUDIO_SWAP = os.getenv("MUSUBI_TUNER_SWAP_SKIP_AUDIO", "1") == "1"
+_SKIP_CROSS_ATTN_SWAP = os.getenv("MUSUBI_TUNER_SWAP_KEEP_CROSS_ATTN", "0") == "1"
+_SKIP_ATTN_SWAP = os.getenv("MUSUBI_TUNER_SWAP_KEEP_ATTN", "0") == "1"
+
+
+def _should_skip_swap(name: str) -> bool:
+    if _SKIP_AUDIO_SWAP and "audio" in name:
+        return True
+    if _SKIP_ATTN_SWAP and "attn" in name:
+        return True
+    if _SKIP_CROSS_ATTN_SWAP and ("audio_to_video_attn" in name or "video_to_audio_attn" in name):
+        return True
+    return False
+
+
+def _move_block_params_excluding_audio(
+    block: nn.Module,
+    device: torch.device,
+    *,
+    include_norms: bool,
+    use_pinned: bool,
+) -> None:
+    for name, module in block.named_modules():
+        if _should_skip_swap(name):
+            continue
+        if include_norms:
+            params_to_device(module, device, include_norms=True, use_pinned=use_pinned)
+        else:
+            if module.__class__.__name__.endswith("Linear"):
+                weighs_to_device(module, device, use_pinned=use_pinned)
 
 
 def _log_cuda_memory(tag: str) -> None:
@@ -224,21 +254,38 @@ class LTX2ModelOffloader(ModelOffloader):
                     _summarize_block_tensors(blocks[swap_idx], "before_swap_block")
         _log_cuda_memory("before_prepare_blocks")
 
+        use_pinned = self.use_pinned_memory and os.getenv("MUSUBI_TUNER_SWAP_PINNED", "1") == "1"
         split_idx = max(0, self.num_blocks - self.blocks_to_swap)
         for block in blocks[0 : split_idx]:
             block.to(self.device)
-            weighs_to_device(block, self.device, use_pinned=self.use_pinned_memory)
+            weighs_to_device(block, self.device, use_pinned=use_pinned)
 
         cpu_device = torch.device("cpu")
         for block in blocks[split_idx :]:
             if self.swap_norms:
                 # Move whole block to GPU, then swap Linear AND norm weights to CPU
                 block.to(self.device)
-                params_to_device(block, cpu_device, include_norms=True, use_pinned=self.use_pinned_memory)
+                if _SKIP_AUDIO_SWAP or _SKIP_CROSS_ATTN_SWAP:
+                    _move_block_params_excluding_audio(
+                        block,
+                        cpu_device,
+                        include_norms=True,
+                        use_pinned=use_pinned,
+                    )
+                else:
+                    params_to_device(block, cpu_device, include_norms=True, use_pinned=use_pinned)
             else:
                 # Original behavior: Move whole block to GPU, only swap Linear weights
                 block.to(self.device)
-                weighs_to_device(block, cpu_device, use_pinned=self.use_pinned_memory)
+                if _SKIP_AUDIO_SWAP or _SKIP_CROSS_ATTN_SWAP:
+                    _move_block_params_excluding_audio(
+                        block,
+                        cpu_device,
+                        include_norms=False,
+                        use_pinned=use_pinned,
+                    )
+                else:
+                    weighs_to_device(block, cpu_device, use_pinned=use_pinned)
 
         _synchronize_device(self.device)
         _clean_memory_on_device(self.device)

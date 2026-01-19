@@ -194,14 +194,16 @@ def main() -> None:
     else:
         dtype = torch.float32
 
+
+
     if getattr(args, "gemma_load_in_8bit", False) or getattr(args, "gemma_load_in_4bit", False):
         if device.type != "cuda":
             raise ValueError("Gemma 8-bit/4-bit loading requires --device cuda")
 
     autocast_dtype = torch.float16 if args.mixed_precision == "fp16" else torch.bfloat16 if args.mixed_precision == "bf16" else None
 
-    if args.gemma_root is None:
-        raise ValueError("--gemma_root is required for LTX-2 Gemma text caching")
+    if args.gemma_root is None and getattr(args, "gemma_safetensors", None) is None:
+        raise ValueError("--gemma_root (or --gemma_safetensors) is required for LTX-2 Gemma text caching")
     if args.ltx2_checkpoint is None and getattr(args, "ltx2_text_encoder_checkpoint", None) is None:
         raise ValueError("--ltx2_checkpoint is required for LTX-2 Gemma text caching")
     from musubi_tuner.ltx_2.loader.single_gpu_model_builder import SingleGPUModelBuilder

@@ -1759,6 +1759,9 @@ class NetworkTrainer:
             args.seed = random.randint(0, 2**32)
         set_seed(args.seed)
 
+        loss_diag_enabled = os.getenv("MUSUBI_TUNER_LOSS_DIAG", "0") == "1"
+        loss_diag_every = int(os.getenv("MUSUBI_TUNER_LOSS_DIAG_EVERY", "10"))
+
         # Load dataset config
         if args.num_timestep_buckets is not None:
             logger.info(f"Using timestep bucketing. Number of buckets: {args.num_timestep_buckets}")
@@ -2348,6 +2351,11 @@ class NetworkTrainer:
                     if dict_output:
                         out = model_pred
 
+                        video_loss = None
+                        audio_loss = None
+                        video_weight = None
+                        audio_weight = None
+
                         def _masked_mse(
                             pred: torch.Tensor,
                             tgt: torch.Tensor,
@@ -2402,6 +2410,25 @@ class NetworkTrainer:
                         if weighting is not None:
                             loss = loss * weighting
                         loss = loss.mean()
+
+                    if loss_diag_enabled and global_step % max(loss_diag_every, 1) == 0:
+                        weight_stats = ""
+                        if isinstance(weighting, torch.Tensor):
+                            weight_stats = (
+                                f" weighting(mean={weighting.float().mean().item():.6f}"
+                                f" min={weighting.float().min().item():.6f}"
+                                f" max={weighting.float().max().item():.6f})"
+                            )
+                        logger.info(
+                            "LOSS_DIAG step=%s video_loss=%s video_weight=%s audio_loss=%s audio_weight=%s total=%s%s",
+                            global_step,
+                            f"{video_loss.item():.6f}" if isinstance(video_loss, torch.Tensor) else "n/a",
+                            f"{video_weight:.3f}" if isinstance(video_weight, float) else "n/a",
+                            f"{audio_loss.item():.6f}" if isinstance(audio_loss, torch.Tensor) else "n/a",
+                            f"{audio_weight:.3f}" if isinstance(audio_weight, float) else "n/a",
+                            f"{loss.item():.6f}" if isinstance(loss, torch.Tensor) else str(loss),
+                            weight_stats,
+                        )
 
                     total_loss += loss.detach().item()
                     total_count += 1

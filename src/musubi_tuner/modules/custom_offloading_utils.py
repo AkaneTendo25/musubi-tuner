@@ -256,7 +256,6 @@ class Offloader:
                     cuda_param = getattr(module_to_cuda, attr_name, None)
                     if cuda_param is None or not isinstance(cuda_param, (torch.nn.Parameter, torch.Tensor)):
                         continue
-                    
                     if module_to_cpu is not None:
                         cpu_param = getattr(module_to_cpu, attr_name, None)
                         if (
