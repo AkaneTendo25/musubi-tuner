@@ -1,5 +1,7 @@
 # LTX-2
 
+Status: LTX-2 support is work in progress and may be incomplete or unstable.
+
 This guide details the three-step process for training LTX-2 LoRA models:
 1. **Caching Latents** (Video/Image + Audio)
 2. **Caching Text Encoder Outputs** (Prompts)
@@ -11,8 +13,8 @@ This guide details the three-step process for training LTX-2 LoRA models:
 |------|--------------|-------|
 | `video` | Images | Treated as 1-frame samples (`F=1`) |
 | `video` | Videos | Standard video training |
-| `av` | Videos with audio | Audio extracted from video or separate `.wav` files |
-| `audio` | Audio only | Video latents are dummy placeholders; only audio loss is used |
+| `av` | Videos with audio | Audio extracted from video or external audio files |
+| `audio` | Audio only | Dataset must be audio-only; video latents are dummy placeholders |
 
 ---
 
@@ -35,15 +37,18 @@ python ltx2_cache_latents.py ^
 
 ### Key Arguments
 - `--ltx_mode av`: Enables Audio-Video processing. Caches both `*_ltx2.safetensors` (video) and `*_ltx2_audio.safetensors` (audio) latents.
-- `--ltx2_audio_source video`: Extracts audio directly from the video file. Use `wav` if you have separate audio files.
-- `--vae_dtype bf16`: Recommended precision for VAE latents.
+- `--ltx2_audio_video`: Alias for `--ltx_mode av`.
+- `--ltx2_audio_source video|audio_files`: Use audio from the video or from external files.
+- `--ltx2_audio_dir`, `--ltx2_audio_ext`: Optional when using `--ltx2_audio_source audio_files` (default extension: `.wav`).
+- `--ltx2_checkpoint`: Required for `--ltx_mode av` or `--ltx_mode audio`.
+- `--vae_dtype`: Data type for VAE latents (default comes from the cache script).
 
 ### Output Files
 
 | File Pattern | Contents |
 |--------------|----------|
 | `*_ltx2.safetensors` | Video latents: `latents_{F}x{H}x{W}_{dtype}` |
-| `*_ltx2_audio.safetensors` | Audio latents: `audio_latents_{T}x{mel_bins}x{C}_{dtype}`, `audio_lengths_int32` |
+| `*_ltx2_audio.safetensors` | Audio latents: `audio_latents_{T}x{mel_bins}x{channels}_{dtype}`, `audio_lengths_int32` |
 
 ### Memory Optimization for Caching
 If you encounter Out-Of-Memory (OOM) errors during caching (especially with higher resolutions like 1080p), use VAE chunking and spatial tiling:
@@ -64,7 +69,7 @@ python ltx2_cache_latents.py ^
 
 ## 2. Caching Text Encoder Outputs
 
-This step pre-computes text embeddings using the Gemma-3-12B model.
+This step pre-computes text embeddings using the Gemma text encoder.
 
 **Script:** `ltx2_cache_text_encoder_outputs.py`
 
@@ -73,7 +78,7 @@ This step pre-computes text embeddings using the Gemma-3-12B model.
 python ltx2_cache_text_encoder_outputs.py ^
   --dataset_config dataset.toml ^
   --ltx2_checkpoint /path/to/ltx-2.safetensors ^
-  --gemma_root /path/to/gemma-3-12b-it ^
+  --gemma_root /path/to/gemma ^
   --gemma_load_in_8bit ^
   --device cuda ^
   --mixed_precision bf16 ^
@@ -82,17 +87,19 @@ python ltx2_cache_text_encoder_outputs.py ^
 ```
 
 ### Key Arguments
-- `--gemma_root`: Path to the local Gemma-3-12b-it model folder (Hugging Face format).
+- `--gemma_root`: Path to the local Gemma model folder (Hugging Face format).
 - `--gemma_load_in_8bit`: Loads Gemma in 8-bit quantization.
 - `--gemma_load_in_4bit`: Loads Gemma in 4-bit quantization.
 - `--gemma_safetensors`: Optional. Load Gemma weights from a single `.safetensors` file (tokenizer/config still come from `--gemma_root`).
+- `--ltx2_checkpoint`: Required. Use `--ltx2_text_encoder_checkpoint` to override for text encoder connector weights.
 - `--ltx_mode av`: MUST match the mode used in latent caching. Concatenates video and audio prompt embeddings.
+- 8-bit/4-bit loading requires `--device cuda`.
 
 ### Output Files
 
 | File Pattern | Contents |
 |--------------|----------|
-| `*_ltx2_te.safetensors` | `video_prompt_embeds_{dtype}`, `audio_prompt_embeds_{dtype}` (av only), `prompt_attention_mask` |
+| `*_ltx2_te.safetensors` | `video_prompt_embeds_{dtype}`, `audio_prompt_embeds_{dtype}` (av only), `prompt_attention_mask`, `text_{dtype}`, `text_mask` |
 
 ---
 
@@ -108,7 +115,7 @@ accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 ltx2_tr
   --mixed_precision bf16 ^
   --dataset_config dataset.toml ^
   --gemma_load_in_8bit ^
-  --gemma_root /path/to/gemma-3-12b-it ^
+  --gemma_root /path/to/gemma ^
   --separate_audio_buckets ^
   --ltx2_checkpoint /path/to/ltx-2.safetensors ^
   --ltx_mode av ^
@@ -139,17 +146,14 @@ accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 ltx2_tr
 ### Key Arguments
 
 #### Memory Optimization
-- `--fp8_base`, `--fp8_scaled`: Casts base model weights to FP8. Essential for training on 24GB VRAM.
+- `--fp8_base`, `--fp8_scaled`: Casts base model weights to FP8.
 - `--blocks_to_swap X`: Offloads X transformer blocks to CPU (max 47 for 48-block model). Higher values save more VRAM but increase CPU↔GPU overhead.
-- `--gradient_checkpointing`: Reduces VRAM by recomputing activations during backward pass. **Required** for blockwise checkpointing.
-- `--gradient_checkpointing_cpu_offload`: Offloads activations to CPU during gradient checkpointing recomputation (activation-only offload).
-- `--blockwise_checkpointing`: Enables block-level gradient checkpointing with optional weight offloading for checkpointed blocks. Requires `--gradient_checkpointing`.
-- `--blocks_to_checkpoint N`: Number of blocks to checkpoint. `-1` = all, `0` = none, `N` = last N blocks.
-- `--fp8_offload_upcast`: **Optional**. Allow FP8 weights to be offloaded to CPU by upcasting to bf16 (fallback to fp16) and restoring on GPU. This can reduce VRAM but may affect training stability.
-- `--fp8_offload_restore_bf16`: **Optional**. When used with `--fp8_offload_upcast`, keep restored weights in bf16 on GPU to avoid FP8 round‑trip noise (uses more VRAM).
-- `--fp8_offload_restore_stochastic`: **Experimental**. Add stochastic rounding noise before restoring FP8 weights (may increase noise; use for testing).
 - `--use_pinned_memory_for_block_swap`: Uses pinned memory for faster CPU↔GPU block transfers.
-- `--swap_norms`: Also swaps RMSNorm/LayerNorm weights to CPU. Extra memory savings.
+- `--swap_norms`: Also swaps RMSNorm/LayerNorm weights to CPU.
+- `--gradient_checkpointing`: Reduces VRAM by recomputing activations during backward pass. Required for `--blockwise_checkpointing`.
+- `--gradient_checkpointing_cpu_offload`: Offloads activations to CPU during gradient checkpointing recomputation.
+- `--blockwise_checkpointing`: Enables block-level weight offloading during backward pass.
+- `--blocks_to_checkpoint N`: Number of blocks to checkpoint. `-1` = all, `0` = none, `N` = last N blocks.
 
 #### Aggressive VRAM Optimization (8-16GB GPUs)
 
@@ -162,7 +166,7 @@ accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 ltx2_tr
   --ltx2_checkpoint /path/to/ltx-2.safetensors ^
   --ltx_mode av ^
   --gemma_load_in_8bit ^
-  --gemma_root /path/to/gemma-3-12b-it ^
+  --gemma_root /path/to/gemma ^
   --fp8_base ^
   --fp8_scaled ^
   --blocks_to_swap 47 ^
@@ -201,12 +205,12 @@ accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 ltx2_tr
 - `--audio_loss_weight`: Weight for audio loss in AV mode (default: 1.0).
 
 #### Timestep Sampling
-- `--timestep_sampling shifted_logit_normal`: **(Recommended)** Official LTX-2 method. Uses a shifted logit-normal distribution where the shift is computed based on sequence length (frames × height × width). This is the default for LTX-2.
+- `--timestep_sampling shifted_logit_normal`: Default LTX-2 method. Uses a shifted logit-normal distribution where the shift is computed based on sequence length (frames × height × width).
 - `--timestep_sampling uniform`: Simple uniform sampling from [0, 1]. Alternative if you want simpler behavior.
 - `--logit_std`: Standard deviation for the logit-normal distribution (default: 1.0). Only used with `shifted_logit_normal`.
 - `--min_timestep` / `--max_timestep`: Optional timestep range constraints.
 
-**Note:** The `shifted_logit_normal` mode matches the official Lightricks LTX-2 trainer exactly. The shift is linearly interpolated from 0.95 (at 1024 tokens) to 2.05 (at 4096 tokens) based on sequence length.
+**Note:** The `shifted_logit_normal` shift is linearly interpolated from 0.95 (at 1024 tokens) to 2.05 (at 4096 tokens) based on sequence length.
 
 #### LoRA Targets
 By default, LoRA targets attention layers only (`to_q`, `to_k`, `to_v`, `to_out.0`), matching the official LTX-2 trainer. This applies to all attention types: self-attention, cross-attention, and cross-modal attention (in AV mode).
@@ -217,10 +221,10 @@ To target additional layers (e.g., FFN), use `--network_args`:
 ```
 
 #### Sampling with Tiled VAE
-- `--sample_tiled_vae`: **Required** for high resolution previews.
+- `--sample_tiled_vae`: Enable tiled VAE decoding during sampling to reduce VRAM usage.
 - `--sample_vae_tile_size 512`: Spatial tile size.
 - `--sample_vae_tile_overlap 64`: Spatial overlap (pixels).
-- `--sample_vae_temporal_tile_size 48`: Number of frames to decode at once. Set to 33 or lower if OOM.
+- `--sample_vae_temporal_tile_size 0`: Temporal tile size (0 disables temporal tiling).
 - `--sample_vae_temporal_tile_overlap 8`: Temporal overlap (frames).
 - `--sample_merge_audio`: Merges generated audio into the `.mp4`.
 
@@ -254,7 +258,8 @@ cache_directory/
 |-------|-------|----------|
 | Missing cache keys during training | Caching incomplete | Run both `ltx2_cache_latents.py` and `ltx2_cache_text_encoder_outputs.py` |
 | Missing `*_ltx2_audio.safetensors` | Audio caching skipped | Re-run latent caching with `--ltx_mode av` |
-| `embeddings_connector` uninitialized | Incorrect checkpoint | Ensure `--ltx2_checkpoint` contains `model.diffusion_model.video_embeddings_connector.*` keys |
-| Gemma OOM | Model too large | Use `--gemma_load_in_8bit` or `--gemma_load_in_4bit` |
-| Sampling OOM | VAE decode too large | Enable `--sample_tiled_vae` and reduce `--sample_vae_temporal_tile_size` |
+| Gemma connector weights missing | Incorrect checkpoint | Ensure `--ltx2_checkpoint` (or `--ltx2_text_encoder_checkpoint`) contains Gemma connector weights |
+| Gemma OOM | Model too large | Use `--gemma_load_in_8bit` or `--gemma_load_in_4bit` with `--device cuda` |
+| Audio caching fails | torchaudio missing | Install torchaudio before running `ltx2_cache_latents.py` |
+| Sampling OOM | VAE decode too large | Enable `--sample_tiled_vae` or reduce `--sample_vae_temporal_tile_size` |
 
