@@ -1,5 +1,6 @@
 import functools
 import logging
+import os
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -283,6 +284,8 @@ def module_ops_from_gemma_root(
     bnb_4bit_compute_dtype: torch.dtype | None = None,
     device: torch.device | None = None,
 ) -> tuple[ModuleOps, ...]:
+    if os.getenv("LTX2_REQUIRE_GEMMA_ROOT", "0") == "1" and gemma_root is None:
+        raise ValueError("gemma_root is required for this configuration")
     gemma_weights_dtype = None
     if gemma_weights_path:
         weight_path = Path(gemma_weights_path)
@@ -555,3 +558,4 @@ def _pad_inputs_for_attention_alignment(
             model_inputs["token_type_ids"] = _cat_with_padding(model_inputs["token_type_ids"], padding_length, 0)
 
     return model_inputs
+

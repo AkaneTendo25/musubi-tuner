@@ -34,11 +34,7 @@ from musubi_tuner.ltx_2.model.transformer.fp8_device_utils import ensure_fp8_mod
 from musubi_tuner.utils.safetensors_utils import MemoryEfficientSafeOpen        
 from musubi_tuner.modules.fp8_optimization_utils import apply_fp8_monkey_patch  
 from musubi_tuner.utils.lora_utils import load_safetensors_with_lora_and_fp8    
-from musubi_tuner.modules.custom_offloading_utils import (
-    set_fp8_offload_upcast,
-    set_fp8_offload_restore_bf16,
-    set_fp8_offload_restore_stochastic,
-)
+from musubi_tuner.ltx_2.env import apply_ltx2_tweaks
 
 # LTX-2 latent normalization defaults.
 # These are identity stats (mean=0, std=1). We keep them as a safe fallback and
@@ -633,74 +629,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
 
         args.weighting_scheme = "none"
 
-        if getattr(args, "swap_keep_attn", False):
-            os.environ["MUSUBI_TUNER_SWAP_KEEP_ATTN"] = "1"
-        if getattr(args, "attn_stability", False):
-            os.environ["MUSUBI_TUNER_FORCE_PYTORCH_AUDIO_CTX_ATTN"] = "1"
-            os.environ["MUSUBI_TUNER_AUDIO_CTX_ATTN_SWAP_ONLY"] = "1"
-            os.environ["MUSUBI_TUNER_FORCE_PYTORCH_CROSS_ATTN"] = "1"
-            os.environ["MUSUBI_TUNER_CROSS_ATTN_SWAP_ONLY"] = "1"
-        if getattr(args, "attn_stability_fp32", False):
-            os.environ["MUSUBI_TUNER_AUDIO_CTX_ATTN_FP32"] = "1"
-            os.environ["MUSUBI_TUNER_AUDIO_CTX_ATTN_SWAP_ONLY"] = "1"
-            os.environ["MUSUBI_TUNER_CROSS_ATTN_FP32"] = "1"
-            os.environ["MUSUBI_TUNER_CROSS_ATTN_SWAP_ONLY"] = "1"
-        if getattr(args, "safe_swap_attn", False):
-            os.environ["MUSUBI_TUNER_SWAP_KEEP_ATTN"] = "1"
-            os.environ["MUSUBI_TUNER_FORCE_PYTORCH_AUDIO_CTX_ATTN"] = "1"
-            os.environ["MUSUBI_TUNER_AUDIO_CTX_ATTN_SWAP_ONLY"] = "1"
-            os.environ["MUSUBI_TUNER_FORCE_PYTORCH_CROSS_ATTN"] = "1"
-            os.environ["MUSUBI_TUNER_CROSS_ATTN_SWAP_ONLY"] = "1"
-            os.environ["MUSUBI_TUNER_ATTN_FP32_RETRY"] = "1"
-        if getattr(args, "fp8_swap_safe", False):
-            os.environ["MUSUBI_TUNER_SWAP_FP8_SYNC"] = "1"
-            os.environ["MUSUBI_TUNER_SWAP_FP8_SYNC_STRICT"] = "1"
-            os.environ["MUSUBI_TUNER_SWAP_STRICT_SYNC"] = "1"
-            os.environ["MUSUBI_TUNER_SWAP_KEEP_ATTN"] = "1"
-            os.environ["MUSUBI_TUNER_FORCE_PYTORCH_AUDIO_CTX_ATTN"] = "1"
-            os.environ["MUSUBI_TUNER_AUDIO_CTX_ATTN_SWAP_ONLY"] = "1"
-            os.environ["MUSUBI_TUNER_FORCE_PYTORCH_CROSS_ATTN"] = "1"
-            os.environ["MUSUBI_TUNER_CROSS_ATTN_SWAP_ONLY"] = "1"
-            os.environ["MUSUBI_TUNER_ATTN_FP32_RETRY"] = "1"
-            args.fp8_upcast = True
-        if getattr(args, "swap_fp8_sync", False):
-            os.environ["MUSUBI_TUNER_SWAP_FP8_SYNC"] = "1"
-        if getattr(args, "swap_fp8_sync_strict", False):
-            os.environ["MUSUBI_TUNER_SWAP_FP8_SYNC_STRICT"] = "1"
-        if getattr(args, "swap_keep_attn", False):
-            os.environ["MUSUBI_TUNER_SWAP_KEEP_ATTN"] = "1"
-        if getattr(args, "swap_keep_cross_attn", False):
-            os.environ["MUSUBI_TUNER_SWAP_KEEP_CROSS_ATTN"] = "1"
-        if getattr(args, "swap_keep_audio", False):
-            os.environ["MUSUBI_TUNER_SWAP_SKIP_AUDIO"] = "1"
-        if getattr(args, "swap_async_prefetch", False):
-            os.environ["MUSUBI_TUNER_SWAP_ASYNC_PREFETCH"] = "1"
-        if getattr(args, "swap_no_async_prefetch", False):
-            os.environ["MUSUBI_TUNER_SWAP_ASYNC_PREFETCH"] = "0"
-        if getattr(args, "swap_pinned", False):
-            os.environ["MUSUBI_TUNER_SWAP_PINNED"] = "1"
-        if getattr(args, "swap_no_pinned", False):
-            os.environ["MUSUBI_TUNER_SWAP_PINNED"] = "0"
-        if getattr(args, "swap_force_pytorch_attn", False):
-            os.environ["MUSUBI_TUNER_SWAP_FORCE_PYTORCH_ATTN"] = "1"
-        if getattr(args, "attn_fp32_retry", False):
-            os.environ["MUSUBI_TUNER_ATTN_FP32_RETRY"] = "1"
-        if getattr(args, "force_pytorch_audio_ctx_attn", False):
-            os.environ["MUSUBI_TUNER_FORCE_PYTORCH_AUDIO_CTX_ATTN"] = "1"
-        if getattr(args, "audio_ctx_attn_fp32", False):
-            os.environ["MUSUBI_TUNER_AUDIO_CTX_ATTN_FP32"] = "1"
-        if getattr(args, "force_pytorch_cross_attn", False):
-            os.environ["MUSUBI_TUNER_FORCE_PYTORCH_CROSS_ATTN"] = "1"
-        if getattr(args, "cross_attn_fp32", False):
-            os.environ["MUSUBI_TUNER_CROSS_ATTN_FP32"] = "1"
-        if getattr(args, "cross_attn_swap_only", False):
-            os.environ["MUSUBI_TUNER_CROSS_ATTN_SWAP_ONLY"] = "1"
-        if getattr(args, "audio_ctx_attn_swap_only", False):
-            os.environ["MUSUBI_TUNER_AUDIO_CTX_ATTN_SWAP_ONLY"] = "1"
-        if getattr(args, "nan_sublayer_diag", False):
-            os.environ["MUSUBI_TUNER_NAN_SUBLAYER_DIAG"] = "1"
-        if getattr(args, "nan_block_diag", False):
-            os.environ["MUSUBI_TUNER_NAN_BLOCK_DIAG"] = "1"
+        apply_ltx2_tweaks(args)
 
     @property
     def i2v_training(self) -> bool:
@@ -1202,11 +1131,12 @@ class LTX2NetworkTrainer(NetworkTrainer):
         Returns:
             Tuple of (model_prediction, target) for loss computation
         """
-        diag_enabled = os.getenv("MUSUBI_TUNER_NAN_DIAG", "0") == "1"
+        diag_enabled = os.getenv("LTX2_NAN_DIAG", "0") == "1"
+        skip_nonfinite = bool(getattr(args, "skip_nonfinite_steps", False))
         nonfinite_flag = {"hit": False, "tag": None}
 
         def _check_finite(tag: str, tensor: Optional[torch.Tensor]) -> None:
-            if tensor is None:
+            if not skip_nonfinite or tensor is None:
                 return
             if not torch.isfinite(tensor).all():
                 bad = (~torch.isfinite(tensor)).sum().item()
@@ -1620,13 +1550,14 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 audio_latents = audio_latents.to(device=accelerator.device, dtype=network_dtype)
                 _check_finite("audio_latents", audio_latents)
                 _log_stats("audio_latents", audio_latents)
-                expected_length = self._calculate_expected_audio_latent_length(
-                    args,
-                    transformer,
-                    latent_frames=int(latents.shape[2]),
-                    frame_rate=float(frame_rate),
-                )
-                audio_latents = self._adjust_audio_latent_duration(audio_latents, expected_length)
+                if getattr(args, "align_audio_latents_train", False):
+                    expected_length = self._calculate_expected_audio_latent_length(
+                        args,
+                        transformer,
+                        latent_frames=int(latents.shape[2]),
+                        frame_rate=float(frame_rate),
+                    )
+                    audio_latents = self._adjust_audio_latent_duration(audio_latents, expected_length)
                 audio_loss_mask = torch.ones(
                     (audio_latents.shape[0], audio_latents.shape[2]),
                     device=accelerator.device,
@@ -1641,7 +1572,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 _log_stats("noisy_audio", noisy_audio)
 
         if self._ltx_mode == "av" and not audio_enabled_for_batch:
-            if conditions is not None:
+            if getattr(args, "av_use_video_prompt_embeds", False) and conditions is not None:
                 video_prompt_embeds = conditions.get("video_prompt_embeds")
                 if isinstance(video_prompt_embeds, torch.Tensor):
                     text_embeds = video_prompt_embeds
@@ -1649,7 +1580,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 half = text_embeds.shape[-1] // 2
                 text_embeds = text_embeds[..., :half]
 
-        if nonfinite_flag["hit"]:
+        if skip_nonfinite and nonfinite_flag["hit"]:
             return {"_skip_step": True, "skip_reason": nonfinite_flag["tag"]}, torch.tensor(
                 0.0, device=accelerator.device
             )
@@ -1685,9 +1616,14 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 video_conditioning_mask_tokens[video_conditioning_enabled, :first_frame_tokens] = True
             transformer_options = {"patches_replace": {}, "video_conditioning_mask": video_conditioning_mask_tokens}
 
-            video_loss_mask = torch.ones((bsz, 1, frames, 1, 1), device=accelerator.device, dtype=torch.bool)
-            if frames > 0:
-                video_loss_mask[video_conditioning_enabled, :, 0:1, :, :] = False
+            if getattr(args, "video_loss_mask_5d", False):
+                video_loss_mask = torch.ones((bsz, 1, frames, 1, 1), device=accelerator.device, dtype=torch.bool)
+                if frames > 0:
+                    video_loss_mask[video_conditioning_enabled, :, 0:1, :, :] = False
+            else:
+                video_loss_mask = torch.ones((bsz, frames), device=accelerator.device, dtype=torch.bool)
+                if frames > 0:
+                    video_loss_mask[video_conditioning_enabled, 0] = False
 
         if getattr(args, "fp8_base", False) or getattr(args, "fp8_scaled", False):
             self._ensure_fp8_buffers_on_device(transformer)
@@ -1712,7 +1648,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
         _log_stats("video_pred", video_pred)
         _log_stats("audio_pred", audio_pred)
 
-        if nonfinite_flag["hit"]:
+        if skip_nonfinite and nonfinite_flag["hit"]:
             return {"_skip_step": True, "skip_reason": nonfinite_flag["tag"]}, torch.tensor(
                 0.0, device=accelerator.device
             )
@@ -2557,7 +2493,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
             prompt_embeds = prompt_embeds[..., : prompt_embeds.shape[-1] // 2]
 
         # Setup LTX-2 specific scheduler and stepper
-        from musubi_tuner.modules.ltx2_scheduler import LTX2Scheduler, EulerDiffusionStep, X0PredictionWrapper
+        from musubi_tuner.ltx_2.model.ltx2_scheduler import LTX2Scheduler, EulerDiffusionStep, X0PredictionWrapper
         
         ltx2_scheduler = LTX2Scheduler(shift=1.0)  # LTX-2 uses shift=1.0 (no shift)
         sigmas = ltx2_scheduler.execute(steps=sample_steps).to(device=transformer_device, dtype=torch.float32)
@@ -2866,146 +2802,9 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         help="Probability of first-frame conditioning during training (keep frame 0 clean and set its timestep to 0).",
     )
     parser.add_argument(
-        "--use_audio_length_mask",
-        action="store_true",
-        help="Apply audio loss masking using audio_lengths (disabled by default to match official trainer).",
-    )
-
-    parser.add_argument(
         "--fp8_scaled",
         action="store_true",
         help="use scaled fp8 for DiT / DiTにスケーリングされたfp8を使う",
-    )
-    parser.add_argument(
-        "--fp8_upcast",
-        action="store_true",
-        help="Upcast FP8 linear weights to compute dtype during forward for stability.",
-    )
-    parser.add_argument(
-        "--fp8_upcast_stochastic",
-        action="store_true",
-        help="Use stochastic rounding when upcasting FP8 weights during forward.",
-    )
-    parser.add_argument(
-        "--fp8_upcast_seed",
-        type=int,
-        default=0,
-        help="Seed for stochastic FP8 upcast rounding (when enabled).",
-    )
-    parser.add_argument(
-        "--swap_keep_attn",
-        action="store_true",
-        help="Keep attention weights on GPU during block swapping to improve stability.",
-    )
-    parser.add_argument(
-        "--attn_stability",
-        action="store_true",
-        help="Force PyTorch attention for audio context and A/V cross-attn in swapped blocks.",
-    )
-    parser.add_argument(
-        "--attn_stability_fp32",
-        action="store_true",
-        help="Force FP32 attention for audio context and A/V cross-attn in swapped blocks.",
-    )
-    parser.add_argument(
-        "--safe_swap_attn",
-        action="store_true",
-        help="Keep attention on GPU + use PyTorch for audio/cross attn in swapped blocks.",
-    )
-    parser.add_argument(
-        "--fp8_swap_safe",
-        action="store_true",
-        help="Enable FP8 swap safety (fp8 upcast + strict FP8 swap sync + safe swap attn).",
-    )
-    parser.add_argument(
-        "--swap_fp8_sync",
-        action="store_true",
-        help="Enable FP8 swap sync (ensure fp8 weights are on device after swap-in).",
-    )
-    parser.add_argument(
-        "--swap_fp8_sync_strict",
-        action="store_true",
-        help="Strict FP8 swap sync (CUDA synchronize after FP8 swap-in).",
-    )
-    parser.add_argument(
-        "--swap_keep_cross_attn",
-        action="store_true",
-        help="Keep cross-attention weights on GPU during block swapping.",
-    )
-    parser.add_argument(
-        "--swap_keep_audio",
-        action="store_true",
-        help="Keep audio-related weights on GPU during block swapping.",
-    )
-    parser.add_argument(
-        "--swap_async_prefetch",
-        action="store_true",
-        help="Enable async swap prefetch stream.",
-    )
-    parser.add_argument(
-        "--swap_no_async_prefetch",
-        action="store_true",
-        help="Disable async swap prefetch stream.",
-    )
-    parser.add_argument(
-        "--swap_pinned",
-        action="store_true",
-        help="Enable pinned-memory swapping.",
-    )
-    parser.add_argument(
-        "--swap_no_pinned",
-        action="store_true",
-        help="Disable pinned-memory swapping.",
-    )
-    parser.add_argument(
-        "--swap_force_pytorch_attn",
-        action="store_true",
-        help="Force PyTorch attention for swapped blocks.",
-    )
-    parser.add_argument(
-        "--attn_fp32_retry",
-        action="store_true",
-        help="Retry attention in FP32 when non-finite values are detected.",
-    )
-    parser.add_argument(
-        "--force_pytorch_audio_ctx_attn",
-        action="store_true",
-        help="Force PyTorch attention for audio context attention.",
-    )
-    parser.add_argument(
-        "--audio_ctx_attn_fp32",
-        action="store_true",
-        help="Force FP32 for audio context attention.",
-    )
-    parser.add_argument(
-        "--force_pytorch_cross_attn",
-        action="store_true",
-        help="Force PyTorch for A/V cross-attention.",
-    )
-    parser.add_argument(
-        "--cross_attn_fp32",
-        action="store_true",
-        help="Force FP32 for A/V cross-attention.",
-    )
-    parser.add_argument(
-        "--cross_attn_swap_only",
-        action="store_true",
-        help="Apply cross-attn forcing only in swapped blocks.",
-    )
-    parser.add_argument(
-        "--audio_ctx_attn_swap_only",
-        action="store_true",
-        help="Apply audio context forcing only in swapped blocks.",
-    )
-    parser.add_argument(
-        "--nan_sublayer_diag",
-        action="store_true",
-        help="Log sublayer-level non-finite diagnostics.",
-    )
-    parser.add_argument(
-        "--nan_block_diag",
-        action="store_true",
-        help="Log block-level non-finite diagnostics.",
     )
     parser.add_argument(
         "--height",
@@ -3100,36 +2899,6 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         help="Temporal tile overlap in frames for tiled VAE decode (default: 8).",
     )
     parser.add_argument(
-        "--fp8_offload_upcast",
-        action="store_true",
-        default=True,
-        help="Allow FP8 weights to be offloaded to CPU by upcasting to bf16 (default: enabled).",
-    )
-    parser.add_argument(
-        "--fp8_offload_keep_fp8",
-        action="store_false",
-        dest="fp8_offload_upcast",
-        help="Keep FP8 weights on GPU during offload (disable CPU upcast).",
-    )
-    parser.add_argument(
-        "--fp8_offload_restore_bf16",
-        action="store_true",
-        default=True,
-        help="Keep FP8-offloaded weights in bf16 on GPU after restore (default: enabled).",
-    )
-    parser.add_argument(
-        "--fp8_offload_restore_fp8",
-        action="store_false",
-        dest="fp8_offload_restore_bf16",
-        help="Restore FP8-offloaded weights back to FP8 on GPU (slower, more noise).",
-    )
-    parser.add_argument(
-        "--fp8_offload_restore_stochastic",
-        action="store_true",
-        default=False,
-        help="Experimental: add stochastic rounding noise before restoring FP8 weights (default: disabled).",
-    )
-    parser.add_argument(
         "--blockwise_checkpointing",
         action="store_true",
         help="Enable block-wise weight offloading during backward (ultra-low VRAM).",
@@ -3163,18 +2932,17 @@ def main() -> None:
 
     args = parser.parse_args()
     args = read_config_from_file(args, parser)
-    set_fp8_offload_upcast(getattr(args, "fp8_offload_upcast", False))
-    set_fp8_offload_restore_bf16(getattr(args, "fp8_offload_restore_bf16", False))
-    set_fp8_offload_restore_stochastic(getattr(args, "fp8_offload_restore_stochastic", False))
-    if getattr(args, "blockwise_checkpointing", False) and int(getattr(args, "blocks_to_swap", 0) or 0) > 0:
-        if int(getattr(args, "blocks_to_checkpoint", -1)) == -1:
-            args.blocks_to_checkpoint = int(getattr(args, "blocks_to_swap", 0) or 0)
-        logger.warning(
-            "Using blockwise checkpointing with block swap enabled (slower but lower VRAM). "
-            "blocks_to_checkpoint=%s blocks_to_swap=%s",
-            args.blocks_to_checkpoint,
-            args.blocks_to_swap,
-        )
+    apply_ltx2_tweaks(args)
+    if getattr(args, "auto_blocks_to_checkpoint", False):
+        if getattr(args, "blockwise_checkpointing", False) and int(getattr(args, "blocks_to_swap", 0) or 0) > 0:
+            if int(getattr(args, "blocks_to_checkpoint", -1)) == -1:
+                args.blocks_to_checkpoint = int(getattr(args, "blocks_to_swap", 0) or 0)
+            logger.warning(
+                "Using blockwise checkpointing with block swap enabled (slower but lower VRAM). "
+                "blocks_to_checkpoint=%s blocks_to_swap=%s",
+                args.blocks_to_checkpoint,
+                args.blocks_to_swap,
+            )
 
     explicit_lora_preset = any(
         arg == "--lora_target_preset" or arg.startswith("--lora_target_preset=") for arg in sys.argv
@@ -3217,3 +2985,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

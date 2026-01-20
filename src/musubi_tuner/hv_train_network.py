@@ -1759,8 +1759,8 @@ class NetworkTrainer:
             args.seed = random.randint(0, 2**32)
         set_seed(args.seed)
 
-        loss_diag_enabled = os.getenv("MUSUBI_TUNER_LOSS_DIAG", "0") == "1"
-        loss_diag_every = int(os.getenv("MUSUBI_TUNER_LOSS_DIAG_EVERY", "10"))
+        loss_diag_enabled = os.getenv("LTX2_LOSS_DIAG", "0") == "1"
+        loss_diag_every = int(os.getenv("LTX2_LOSS_DIAG_EVERY", "10"))
 
         # Load dataset config
         if args.num_timestep_buckets is not None:
@@ -1984,7 +1984,14 @@ class NetworkTrainer:
                     args.gradient_checkpointing_cpu_offload,
                     blocks_to_checkpoint=blocks_to_ckpt
                 )
-            network.enable_gradient_checkpointing()  # may have no effect
+            try:
+                network.enable_gradient_checkpointing(
+                    args.gradient_checkpointing_cpu_offload,
+                    weight_cpu_offloading=bool(getattr(args, "blockwise_checkpointing", False)),
+                    blocks_to_checkpoint=blocks_to_ckpt,
+                )
+            except TypeError:
+                network.enable_gradient_checkpointing()
 
         # prepare optimizer, data loader etc.
         accelerator.print("prepare optimizer, data loader etc.")
@@ -2643,7 +2650,7 @@ class NetworkTrainer:
                     accelerator.backward(loss)
                     
                     # DEBUG: Check if LoRA parameters have gradients (requires LTX2_DEBUG env var)
-                    if os.environ.get("LTX2_DEBUG"):
+                    if os.environ.get("LTX2_DEBUG", "0") == "1":
                         unwrapped_net = accelerator.unwrap_model(network)
                         lora_modules = getattr(unwrapped_net, "unet_loras", [])
                         if lora_modules:

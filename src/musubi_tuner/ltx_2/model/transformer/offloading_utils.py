@@ -5,7 +5,7 @@ import torch.nn as nn
 
 from typing import Iterable, List, Optional
 
-from musubi_tuner.modules.custom_offloading_utils import (
+from musubi_tuner.ltx_2.model.ltx2_custom_offloading_utils import (
     ModelOffloader,
     _clean_memory_on_device,
     _synchronize_device,
@@ -16,9 +16,9 @@ from musubi_tuner.modules.custom_offloading_utils import (
 logger = logging.getLogger(__name__)
 _LOGGED_SWAP_BYTES = False
 _LOGGED_FIRST_PARAM = False
-_SKIP_AUDIO_SWAP = os.getenv("MUSUBI_TUNER_SWAP_SKIP_AUDIO", "1") == "1"
-_SKIP_CROSS_ATTN_SWAP = os.getenv("MUSUBI_TUNER_SWAP_KEEP_CROSS_ATTN", "0") == "1"
-_SKIP_ATTN_SWAP = os.getenv("MUSUBI_TUNER_SWAP_KEEP_ATTN", "0") == "1"
+_SKIP_AUDIO_SWAP = os.getenv("LTX2_SWAP_SKIP_AUDIO", "1") == "1"
+_SKIP_CROSS_ATTN_SWAP = os.getenv("LTX2_SWAP_KEEP_CROSS_ATTN", "0") == "1"
+_SKIP_ATTN_SWAP = os.getenv("LTX2_SWAP_KEEP_ATTN", "0") == "1"
 
 
 def _should_skip_swap(name: str) -> bool:
@@ -244,7 +244,7 @@ class LTX2ModelOffloader(ModelOffloader):
 
         if self.debug:
             print(f"[{self.block_type}] Prepare block devices before forward (LTX2)")
-        diag_enabled = os.getenv("MUSUBI_TUNER_LTX2_SWAP_DIAG", "0") == "1"
+        diag_enabled = os.getenv("LTX2_SWAP_DIAG", "0") == "1"
         if diag_enabled:
             keep_idx = 0
             swap_idx = max(0, self.num_blocks - self.blocks_to_swap)
@@ -254,7 +254,7 @@ class LTX2ModelOffloader(ModelOffloader):
                     _summarize_block_tensors(blocks[swap_idx], "before_swap_block")
         _log_cuda_memory("before_prepare_blocks")
 
-        use_pinned = self.use_pinned_memory and os.getenv("MUSUBI_TUNER_SWAP_PINNED", "1") == "1"
+        use_pinned = self.use_pinned_memory and os.getenv("LTX2_SWAP_PINNED", "1") == "1"
         split_idx = max(0, self.num_blocks - self.blocks_to_swap)
         for block in blocks[0 : split_idx]:
             block.to(self.device)
@@ -304,3 +304,4 @@ class LTX2ModelOffloader(ModelOffloader):
                 _summarize_block_tensors(blocks[keep_idx], "after_keep_block")
                 if swap_idx < len(blocks):
                     _summarize_block_tensors(blocks[swap_idx], "after_swap_block")
+

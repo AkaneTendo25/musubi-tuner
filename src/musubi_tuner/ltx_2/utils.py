@@ -1,6 +1,61 @@
-from typing import Any
+from dataclasses import fields, is_dataclass, replace as dataclass_replace
+from typing import Any, Callable
 
 import torch
+
+
+
+def to_device(x: Any, device: torch.device) -> Any:
+    """Recursively moves torch.Tensor objects (and containers thereof) to device.
+
+    Supports: Tensor, list, tuple, dict, and frozen dataclass objects.
+    """
+    if isinstance(x, torch.Tensor):
+        return x.to(device)
+    if isinstance(x, list):
+        return [to_device(elem, device) for elem in x]
+    if isinstance(x, tuple):
+        return tuple(to_device(elem, device) for elem in x)
+    if isinstance(x, dict):
+        return {k: to_device(v, device) for k, v in x.items()}
+    if is_dataclass(x) and not isinstance(x, type):
+        field_updates = {f.name: to_device(getattr(x, f.name), device) for f in fields(x)}
+        return dataclass_replace(x, **field_updates)
+    return x
+
+
+def to_cpu(x: Any) -> Any:
+    """Recursively moves torch.Tensor objects (and containers thereof) to CPU."""
+    if isinstance(x, torch.Tensor):
+        return x.cpu()
+    if isinstance(x, list):
+        return [to_cpu(elem) for elem in x]
+    if isinstance(x, tuple):
+        return tuple(to_cpu(elem) for elem in x)
+    if isinstance(x, dict):
+        return {k: to_cpu(v) for k, v in x.items()}
+    if is_dataclass(x) and not isinstance(x, type):
+        field_updates = {f.name: to_cpu(getattr(x, f.name)) for f in fields(x)}
+        return dataclass_replace(x, **field_updates)
+    return x
+
+
+def create_cpu_offloading_wrapper(func: Callable, device: torch.device) -> Callable:
+    """
+    Create a wrapper function that offloads inputs to CPU before calling the original function
+    and moves outputs back to the specified device.
+    """
+
+    def wrapper(orig_func: Callable) -> Callable:
+        def custom_forward(*inputs):
+            nonlocal device, orig_func
+            cuda_inputs = to_device(inputs, device)
+            outputs = orig_func(*cuda_inputs)
+            return to_cpu(outputs)
+
+        return custom_forward
+
+    return wrapper(func)
 
 
 def rms_norm(x: torch.Tensor, weight: torch.Tensor | None = None, eps: float = 1e-6) -> torch.Tensor:

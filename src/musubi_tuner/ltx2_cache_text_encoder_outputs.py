@@ -22,6 +22,7 @@ from musubi_tuner.dataset.image_video_dataset import (
     ItemInfo,
     save_text_encoder_output_cache_ltx2_official,
 )
+from musubi_tuner.ltx_2.env import apply_ltx2_tweaks
 
 
 logger = logging.getLogger(__name__)
@@ -171,6 +172,7 @@ def main() -> None:
     parser = cache_text_encoder_outputs.setup_parser_common()
     parser = ltx2_setup_parser(parser)
     args = parser.parse_args()
+    apply_ltx2_tweaks(args)
 
     ltx_mode = getattr(args, "ltx_mode", "video")
     audio_video = ltx_mode == "av" or getattr(args, "ltx2_audio_video", False)
@@ -183,7 +185,21 @@ def main() -> None:
     blueprint = blueprint_generator.generate(user_config, args, architecture=ARCHITECTURE_LTX2)
     train_dataset_group = config_utils.generate_dataset_group_by_blueprint(blueprint.dataset_group)
 
-    datasets = train_dataset_group.datasets
+    datasets = list(train_dataset_group.datasets)
+
+    if user_config.get("validation_datasets"):
+        logger.info("Load validation datasets from dataset config")
+        validation_user_config = {
+            "general": user_config.get("general", {}),
+            "datasets": user_config.get("validation_datasets", []),
+        }
+        validation_blueprint = blueprint_generator.generate(
+            validation_user_config, args, architecture=ARCHITECTURE_LTX2
+        )
+        validation_dataset_group = config_utils.generate_dataset_group_by_blueprint(
+            validation_blueprint.dataset_group
+        )
+        datasets.extend(validation_dataset_group.datasets)
 
     all_cache_files_for_dataset, all_cache_paths_for_dataset = cache_text_encoder_outputs.prepare_cache_files_and_paths(datasets)
 
@@ -202,7 +218,10 @@ def main() -> None:
 
     autocast_dtype = torch.float16 if args.mixed_precision == "fp16" else torch.bfloat16 if args.mixed_precision == "bf16" else None
 
-    if args.gemma_root is None and getattr(args, "gemma_safetensors", None) is None:
+    if getattr(args, "require_gemma_root", False):
+        if args.gemma_root is None:
+            raise ValueError("--gemma_root is required for LTX-2 Gemma text caching")
+    elif args.gemma_root is None and getattr(args, "gemma_safetensors", None) is None:
         raise ValueError("--gemma_root (or --gemma_safetensors) is required for LTX-2 Gemma text caching")
     if args.ltx2_checkpoint is None and getattr(args, "ltx2_text_encoder_checkpoint", None) is None:
         raise ValueError("--ltx2_checkpoint is required for LTX-2 Gemma text caching")

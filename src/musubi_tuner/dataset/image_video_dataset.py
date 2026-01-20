@@ -968,7 +968,7 @@ class BucketBatchManager:
 
         audio_latents_per_item = []
         audio_lengths_per_item = []
-        diag_collect_keys = os.getenv("MUSUBI_TUNER_NAN_DIAG", "0") == "1"
+        diag_collect_keys = os.getenv("LTX2_NAN_DIAG", "0") == "1"
         item_keys = []
         latent_cache_paths = []
         audio_cache_paths = []
@@ -3199,3 +3199,4 @@ class DatasetGroup(torch.utils.data.ConcatDataset):
     def set_max_train_steps(self, max_train_steps):
         for dataset in self.datasets:
             dataset.set_max_train_steps(max_train_steps)
+

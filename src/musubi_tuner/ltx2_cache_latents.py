@@ -29,6 +29,7 @@ from musubi_tuner.dataset.image_video_dataset import (
     save_latent_cache_ltx2,
 )
 from musubi_tuner.ltx_2.model.audio_vae.audio_vae import LATENT_DOWNSAMPLE_FACTOR
+from musubi_tuner.ltx_2.env import get_ltx2_env
 from musubi_tuner.utils.model_utils import str_to_dtype
 from musubi_tuner.utils.safetensors_utils import MemoryEfficientSafeOpen
 
@@ -56,7 +57,23 @@ def _load_datasets(args: argparse.Namespace) -> Sequence[BaseDataset]:
     user_config = config_utils.load_user_config(args.dataset_config)
     blueprint = blueprint_generator.generate(user_config, args, architecture=ARCHITECTURE_LTX2)
     dataset_group = config_utils.generate_dataset_group_by_blueprint(blueprint.dataset_group)
-    return cast(Sequence[BaseDataset], dataset_group.datasets)
+    datasets = list(dataset_group.datasets)
+
+    if user_config.get("validation_datasets"):
+        logger.info("Load validation datasets from dataset config")
+        validation_user_config = {
+            "general": user_config.get("general", {}),
+            "datasets": user_config.get("validation_datasets", []),
+        }
+        validation_blueprint = blueprint_generator.generate(
+            validation_user_config, args, architecture=ARCHITECTURE_LTX2
+        )
+        validation_dataset_group = config_utils.generate_dataset_group_by_blueprint(
+            validation_blueprint.dataset_group
+        )
+        datasets.extend(validation_dataset_group.datasets)
+
+    return cast(Sequence[BaseDataset], datasets)
 
 
 def encode_and_save_batch(vae, batch: List[ItemInfo], tiling_config=None) -> None:
@@ -301,14 +318,18 @@ def encode_and_save_audio_cache(
 
     latents = latents[0].detach().cpu().contiguous()
     original_steps = int(latents.shape[1])
-    expected_steps = _expected_audio_latent_length_for_item(
-        item_info,
-        encoder,
-        fps=float(VideoDataset.TARGET_FPS_LTX2),
-    )
-    if expected_steps is not None:
-        latents = _align_audio_latents_to_video(latents, expected_steps)
-        effective_steps = min(original_steps, expected_steps)
+    align_audio = get_ltx2_env().align_audio_latents_cache
+    if align_audio:
+        expected_steps = _expected_audio_latent_length_for_item(
+            item_info,
+            encoder,
+            fps=float(VideoDataset.TARGET_FPS_LTX2),
+        )
+        if expected_steps is not None:
+            latents = _align_audio_latents_to_video(latents, expected_steps)
+            effective_steps = min(original_steps, expected_steps)
+        else:
+            effective_steps = original_steps
     else:
         effective_steps = original_steps
 

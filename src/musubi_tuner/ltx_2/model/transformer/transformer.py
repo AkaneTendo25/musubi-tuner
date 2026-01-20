@@ -6,8 +6,8 @@ import os
 import torch
 import torch.utils.checkpoint as checkpoint
 
-from musubi_tuner.utils.model_utils import create_cpu_offloading_wrapper
-from musubi_tuner.modules.custom_offloading_utils import weighs_to_device
+from musubi_tuner.ltx_2.utils import create_cpu_offloading_wrapper
+from musubi_tuner.ltx_2.model.ltx2_custom_offloading_utils import weighs_to_device
 from musubi_tuner.ltx_2.model.transformer.block_level_checkpointing import block_checkpoint
 from musubi_tuner.ltx_2.guidance.perturbations import BatchedPerturbationConfig, PerturbationType
 from musubi_tuner.ltx_2.model.transformer.adaln import AdaLayerNormSingle
@@ -347,23 +347,23 @@ class BasicAVTransformerBlock(torch.nn.Module):
         audio: TransformerArgs | None,
         perturbations: BatchedPerturbationConfig | None = None,
     ) -> tuple[TransformerArgs | None, TransformerArgs | None]:
-        sublayer_diag = os.getenv("MUSUBI_TUNER_NAN_SUBLAYER_DIAG", "0") == "1"
-        v2a_diag = os.getenv("MUSUBI_TUNER_V2A_DIAG", "0") == "1"
-        attn_retry_fp32 = os.getenv("MUSUBI_TUNER_ATTN_FP32_RETRY", "0") == "1"
+        sublayer_diag = os.getenv("LTX2_NAN_SUBLAYER_DIAG", "0") == "1"
+        v2a_diag = os.getenv("LTX2_V2A_DIAG", "0") == "1"
+        attn_retry_fp32 = os.getenv("LTX2_ATTN_FP32_RETRY", "0") == "1"
         force_pytorch_cross_attn = (
-            os.getenv("MUSUBI_TUNER_FORCE_PYTORCH_CROSS_ATTN", "0") == "1"
+            os.getenv("LTX2_FORCE_PYTORCH_CROSS_ATTN", "0") == "1"
             or getattr(self, "_force_pytorch_cross_attn", False)
         )
         force_fp32_cross_attn = (
-            os.getenv("MUSUBI_TUNER_CROSS_ATTN_FP32", "0") == "1"
+            os.getenv("LTX2_CROSS_ATTN_FP32", "0") == "1"
             or getattr(self, "_force_fp32_cross_attn", False)
         )
         force_pytorch_audio_ctx = (
-            os.getenv("MUSUBI_TUNER_FORCE_PYTORCH_AUDIO_CTX_ATTN", "0") == "1"
+            os.getenv("LTX2_FORCE_PYTORCH_AUDIO_CTX_ATTN", "0") == "1"
             or getattr(self, "_force_pytorch_audio_ctx_attn", False)
         )
         force_fp32_audio_ctx = (
-            os.getenv("MUSUBI_TUNER_AUDIO_CTX_ATTN_FP32", "0") == "1"
+            os.getenv("LTX2_AUDIO_CTX_ATTN_FP32", "0") == "1"
             or getattr(self, "_force_fp32_audio_ctx_attn", False)
         )
 
@@ -633,7 +633,7 @@ class BasicAVTransformerBlock(torch.nn.Module):
         # This runs during forward pass. During backward, the backward hook handles offloading.
         if self.activation_cpu_offloading:
             cpu_device = torch.device("cpu")
-            use_pinned = self.use_pinned_memory and os.getenv("MUSUBI_TUNER_SWAP_PINNED", "1") == "1"
+            use_pinned = self.use_pinned_memory and os.getenv("LTX2_SWAP_PINNED", "1") == "1"
             weighs_to_device(self, cpu_device, use_pinned=use_pinned)
             _move_non_linear_params(self, cpu_device)
             ensure_fp8_modules_on_device(self, cpu_device)
@@ -641,7 +641,7 @@ class BasicAVTransformerBlock(torch.nn.Module):
         return replace(video, x=vx) if video is not None else None, replace(audio, x=ax) if audio is not None else None
 
     def _load_weights(self, b: torch.nn.Module, d: torch.device) -> None:
-        use_pinned = self.use_pinned_memory and os.getenv("MUSUBI_TUNER_SWAP_PINNED", "1") == "1"
+        use_pinned = self.use_pinned_memory and os.getenv("LTX2_SWAP_PINNED", "1") == "1"
         weighs_to_device(b, d, use_pinned=use_pinned)
         # Move non-linear params (RMSNorm, etc.) and FP8/LoRA modules
         _move_non_linear_params(b, d)
@@ -664,7 +664,7 @@ class BasicAVTransformerBlock(torch.nn.Module):
         cpu_device = torch.device("cpu")
         # When offloading to CPU, we should also move these tables back
         # Reuse the same logic but targeting CPU (d)
-        use_pinned = self.use_pinned_memory and os.getenv("MUSUBI_TUNER_SWAP_PINNED", "1") == "1"
+        use_pinned = self.use_pinned_memory and os.getenv("LTX2_SWAP_PINNED", "1") == "1"
         weighs_to_device(b, d, use_pinned=use_pinned)
         for attr in [
             "scale_shift_table",
@@ -683,3 +683,4 @@ class BasicAVTransformerBlock(torch.nn.Module):
                         p.data = p.data.to(d, non_blocking=True)
         _move_non_linear_params(b, cpu_device)
         ensure_fp8_modules_on_device(b, cpu_device)
+

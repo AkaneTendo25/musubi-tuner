@@ -11,7 +11,7 @@ from musubi_tuner.ltx_2.model.transformer.offloading_utils import (
     LTX2BlockSwapManager,
     LTX2ModelOffloader,
 )
-from musubi_tuner.modules.custom_offloading_utils import _clean_memory_on_device
+from musubi_tuner.ltx_2.model.ltx2_custom_offloading_utils import _clean_memory_on_device
 from musubi_tuner.ltx_2.guidance.perturbations import BatchedPerturbationConfig
 from musubi_tuner.ltx_2.model.transformer.adaln import AdaLayerNormSingle
 from musubi_tuner.ltx_2.model.transformer.attention import AttentionCallable, AttentionFunction
@@ -29,7 +29,7 @@ from musubi_tuner.ltx_2.model.transformer.transformer_args import (
     TransformerArgsPreprocessor,
 )
 from musubi_tuner.ltx_2.utils import to_denoised
-from musubi_tuner.utils.model_utils import create_cpu_offloading_wrapper
+from musubi_tuner.ltx_2.utils import create_cpu_offloading_wrapper
 
 logger = logging.getLogger(__name__)
 
@@ -534,17 +534,17 @@ class LTXModel(torch.nn.Module):
     ) -> tuple[TransformerArgs, TransformerArgs]:
         """Process transformer blocks with optional offloading and block swapping."""
 
-        nan_block_diag = os.getenv("MUSUBI_TUNER_NAN_BLOCK_DIAG", "0") == "1"
-        strict_swap_sync = os.getenv("MUSUBI_TUNER_SWAP_STRICT_SYNC", "0") == "1"
-        force_pytorch_attn = os.getenv("MUSUBI_TUNER_SWAP_FORCE_PYTORCH_ATTN", "0") == "1"
-        force_cross_pytorch = os.getenv("MUSUBI_TUNER_FORCE_PYTORCH_CROSS_ATTN", "0") == "1"
-        force_cross_fp32 = os.getenv("MUSUBI_TUNER_CROSS_ATTN_FP32", "0") == "1"
-        cross_attn_swap_only = os.getenv("MUSUBI_TUNER_CROSS_ATTN_SWAP_ONLY", "1") == "1"
-        force_audio_ctx_pytorch = os.getenv("MUSUBI_TUNER_FORCE_PYTORCH_AUDIO_CTX_ATTN", "0") == "1"
-        force_audio_ctx_fp32 = os.getenv("MUSUBI_TUNER_AUDIO_CTX_ATTN_FP32", "0") == "1"
-        audio_ctx_swap_only = os.getenv("MUSUBI_TUNER_AUDIO_CTX_ATTN_SWAP_ONLY", "1") == "1"
-        fp8_swap_sync = os.getenv("MUSUBI_TUNER_SWAP_FP8_SYNC", "1") == "1"
-        fp8_swap_sync_strict = os.getenv("MUSUBI_TUNER_SWAP_FP8_SYNC_STRICT", "0") == "1"
+        nan_block_diag = os.getenv("LTX2_NAN_BLOCK_DIAG", "0") == "1"
+        strict_swap_sync = os.getenv("LTX2_SWAP_STRICT_SYNC", "0") == "1"
+        force_pytorch_attn = os.getenv("LTX2_SWAP_FORCE_PYTORCH_ATTN", "0") == "1"
+        force_cross_pytorch = os.getenv("LTX2_FORCE_PYTORCH_CROSS_ATTN", "0") == "1"
+        force_cross_fp32 = os.getenv("LTX2_CROSS_ATTN_FP32", "0") == "1"
+        cross_attn_swap_only = os.getenv("LTX2_CROSS_ATTN_SWAP_ONLY", "1") == "1"
+        force_audio_ctx_pytorch = os.getenv("LTX2_FORCE_PYTORCH_AUDIO_CTX_ATTN", "0") == "1"
+        force_audio_ctx_fp32 = os.getenv("LTX2_AUDIO_CTX_ATTN_FP32", "0") == "1"
+        audio_ctx_swap_only = os.getenv("LTX2_AUDIO_CTX_ATTN_SWAP_ONLY", "1") == "1"
+        fp8_swap_sync = os.getenv("LTX2_SWAP_FP8_SYNC", "1") == "1"
+        fp8_swap_sync_strict = os.getenv("LTX2_SWAP_FP8_SYNC_STRICT", "0") == "1"
 
         swap_manager = self._ltx2_block_swap
         swap_active = False
@@ -580,7 +580,7 @@ class LTXModel(torch.nn.Module):
                 video = _move_transformer_args(video, cpu_device)
                 audio = _move_transformer_args(audio, cpu_device)
 
-        use_async_prefetch = os.getenv("MUSUBI_TUNER_SWAP_ASYNC_PREFETCH", "1") == "1"
+        use_async_prefetch = os.getenv("LTX2_SWAP_ASYNC_PREFETCH", "1") == "1"
         transfer_stream = None
         target_device = gpu_device if gpu_device else torch.device("cuda")
         if use_async_prefetch:
@@ -829,15 +829,16 @@ class LTXModel(torch.nn.Module):
                 video_out = _move_transformer_args(video_out, target_device)
                 audio_out = _move_transformer_args(audio_out, target_device)
 
-        # Ensure outputs are on the same device as output projections
-        if video_out is not None and isinstance(video_out.x, torch.Tensor):
-            proj_device = self.proj_out.weight.device
-            if video_out.x.device != proj_device:
-                video_out = _move_transformer_args(video_out, proj_device)
-        if audio_out is not None and isinstance(audio_out.x, torch.Tensor):
-            proj_device = self.audio_proj_out.weight.device
-            if audio_out.x.device != proj_device:
-                audio_out = _move_transformer_args(audio_out, proj_device)
+        # Ensure outputs are on the same device as output projections (optional)
+        if os.getenv("LTX2_ALIGN_OUTPUT_DEVICE", "0") == "1":
+            if video_out is not None and isinstance(video_out.x, torch.Tensor):
+                proj_device = self.proj_out.weight.device
+                if video_out.x.device != proj_device:
+                    video_out = _move_transformer_args(video_out, proj_device)
+            if audio_out is not None and isinstance(audio_out.x, torch.Tensor):
+                proj_device = self.audio_proj_out.weight.device
+                if audio_out.x.device != proj_device:
+                    audio_out = _move_transformer_args(audio_out, proj_device)
 
         # Process output
         vx = (
@@ -914,3 +915,4 @@ class X0Model(torch.nn.Module):
         denoised_audio = to_denoised(audio.latent, ax, audio.timesteps) if ax is not None else None
         return denoised_video, denoised_audio
 logger = logging.getLogger(__name__)
+
