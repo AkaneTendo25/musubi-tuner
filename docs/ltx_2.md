@@ -141,9 +141,13 @@ accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 ltx2_tr
 #### Memory Optimization
 - `--fp8_base`, `--fp8_scaled`: Casts base model weights to FP8. Essential for training on 24GB VRAM.
 - `--blocks_to_swap X`: Offloads X transformer blocks to CPU (max 47 for 48-block model). Higher values save more VRAM but increase CPU↔GPU overhead.
-- `--gradient_checkpointing`: Reduces VRAM by recomputing activations during backward pass.
-- `--gradient_checkpointing_cpu_offload`: Offloads activations to CPU during gradient checkpointing recomputation.
-- `--blockwise_checkpointing`: **(Recommended for Low VRAM)** Enables granular block-level gradient checkpointing with weight offloading. This aggressively saves VRAM by keeping only the active block's weights on GPU during forward/backward passes. Handles recursive inputs (like `timesteps`) and LoRA training correctly.
+- `--gradient_checkpointing`: Reduces VRAM by recomputing activations during backward pass. **Required** for blockwise checkpointing.
+- `--gradient_checkpointing_cpu_offload`: Offloads activations to CPU during gradient checkpointing recomputation (activation-only offload).
+- `--blockwise_checkpointing`: Enables block-level gradient checkpointing with optional weight offloading for checkpointed blocks. Requires `--gradient_checkpointing`.
+- `--blocks_to_checkpoint N`: Number of blocks to checkpoint. `-1` = all, `0` = none, `N` = last N blocks.
+- `--fp8_offload_upcast`: **Optional**. Allow FP8 weights to be offloaded to CPU by upcasting to bf16 (fallback to fp16) and restoring on GPU. This can reduce VRAM but may affect training stability.
+- `--fp8_offload_restore_bf16`: **Optional**. When used with `--fp8_offload_upcast`, keep restored weights in bf16 on GPU to avoid FP8 round‑trip noise (uses more VRAM).
+- `--fp8_offload_restore_stochastic`: **Experimental**. Add stochastic rounding noise before restoring FP8 weights (may increase noise; use for testing).
 - `--use_pinned_memory_for_block_swap`: Uses pinned memory for faster CPU↔GPU block transfers.
 - `--swap_norms`: Also swaps RMSNorm/LayerNorm weights to CPU. Extra memory savings.
 
@@ -164,7 +168,9 @@ accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 ltx2_tr
   --blocks_to_swap 47 ^
   --use_pinned_memory_for_block_swap ^
   --gradient_checkpointing ^
+  --gradient_checkpointing_cpu_offload ^
   --blockwise_checkpointing ^
+  --blocks_to_checkpoint 47 ^
   --flash_attn ^
   --network_module networks.lora_ltx2 ^
   --network_dim 16 ^
@@ -179,7 +185,8 @@ accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 ltx2_tr
 **Tips for low-VRAM training:**
 - Use `--fp8_base --fp8_scaled`
 - Use `--blocks_to_swap 47` (keeps only 1 block on GPU)
-- Use `--blockwise_checkpointing` (replaces standard gradient_checkpointing for better savings)
+- Use `--blockwise_checkpointing` with `--gradient_checkpointing` (activation recompute + per-block weight offload)
+- Use `--blocks_to_checkpoint -1` if you are not using block swap and want to checkpoint all blocks
 - Use smaller LoRA rank (`--network_dim 16` instead of 32)
 - Use smaller training resolutions (e.g., 512x320)
 - Reduce `--sample_vae_temporal_tile_size` to 24 or lower

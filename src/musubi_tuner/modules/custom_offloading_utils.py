@@ -4,6 +4,7 @@ from contextlib import contextmanager
 import gc
 import time
 from typing import Optional
+import logging
 import torch
 import torch.nn as nn
 
@@ -60,6 +61,37 @@ def swap_weight_devices_no_cuda(device: torch.device, layer_to_cpu: nn.Module, l
 
 # Cache for pinned buffers to avoid reallocation overhead: {param_id: pinned_tensor}
 _pinned_buffer_cache = {}
+_LOGGED_FP8_UPCAST = False
+_ALLOW_FP8_OFFLOAD_UPCAST = True
+_FP8_OFFLOAD_RESTORE_BF16 = True
+_FP8_OFFLOAD_RESTORE_STOCHASTIC = False
+_FP8_ORIG_DTYPE = {}
+_FP8_CPU_CACHE = {}
+_FP8_DTYPES = tuple(
+    dt for dt in (getattr(torch, "float8_e4m3fn", None), getattr(torch, "float8_e5m2", None)) if dt is not None
+)
+
+
+def _is_fp8_dtype(dtype: torch.dtype) -> bool:
+    return dtype in _FP8_DTYPES
+
+
+def set_fp8_offload_upcast(enable: bool) -> None:
+    """Allow FP8 weights to be offloaded to CPU by upcasting to bf16."""
+    global _ALLOW_FP8_OFFLOAD_UPCAST
+    _ALLOW_FP8_OFFLOAD_UPCAST = bool(enable)
+
+
+def set_fp8_offload_restore_bf16(enable: bool) -> None:
+    """Keep FP8-offloaded weights in bf16 on GPU after restore (avoid FP8 round-trip)."""
+    global _FP8_OFFLOAD_RESTORE_BF16
+    _FP8_OFFLOAD_RESTORE_BF16 = bool(enable)
+
+
+def set_fp8_offload_restore_stochastic(enable: bool) -> None:
+    """Apply experimental stochastic rounding noise before restoring FP8 weights."""
+    global _FP8_OFFLOAD_RESTORE_STOCHASTIC
+    _FP8_OFFLOAD_RESTORE_STOCHASTIC = bool(enable)
 
 def weighs_to_device(layer: nn.Module, device: torch.device, skip_trainable: bool = True, use_pinned: bool = False):
     """Move layer weights to device.
@@ -79,6 +111,62 @@ def weighs_to_device(layer: nn.Module, device: torch.device, skip_trainable: boo
             for attr in ["weight", "bias", "scale_weight"]:
                 p = getattr(module, attr, None)
                 if p is not None and isinstance(p, (torch.Tensor, torch.nn.Parameter)):
+                    if device.type != "cpu" and id(p) in _FP8_ORIG_DTYPE:
+                        # Restore FP8-offloaded weights to GPU.
+                        # If restore_bf16 is enabled, keep bf16 and drop FP8 tracking to avoid extra overhead.
+                        if _FP8_OFFLOAD_RESTORE_BF16:
+                            p.data = p.data.to(device, non_blocking=non_blocking)
+                            _FP8_ORIG_DTYPE.pop(id(p), None)
+                            continue
+                        target_dtype = _FP8_ORIG_DTYPE[id(p)]
+                        if (
+                            _FP8_OFFLOAD_RESTORE_STOCHASTIC
+                            and target_dtype in _FP8_DTYPES
+                            and torch.is_floating_point(p.data)
+                        ):
+                            # Experimental: add small relative noise before FP8 cast to reduce bias.
+                            t = p.data.to(device=device, dtype=torch.float32, non_blocking=non_blocking)
+                            noise = torch.empty_like(t).uniform_(-0.5, 0.5)
+                            t = t + noise * (t.abs() + 1.0) * 1e-3
+                            p.data = t.to(dtype=target_dtype)
+                        else:
+                            p.data = p.data.to(device, dtype=target_dtype, non_blocking=non_blocking)
+                        continue
+                    if device.type == "cpu" and _is_fp8_dtype(p.dtype):
+                        if not _ALLOW_FP8_OFFLOAD_UPCAST:
+                            continue
+                        # Explicit opt-in: upcast FP8 to bf16 on CPU, then restore FP8 on GPU.
+                        global _LOGGED_FP8_UPCAST
+                        if not _LOGGED_FP8_UPCAST:
+                            logging.getLogger(__name__).warning(
+                                "FP8 offload upcast enabled: FP8 weights are cast to bf16 on CPU."
+                            )
+                            _LOGGED_FP8_UPCAST = True
+                        if not _FP8_OFFLOAD_RESTORE_BF16 or _FP8_OFFLOAD_RESTORE_STOCHASTIC:
+                            _FP8_ORIG_DTYPE[id(p)] = p.dtype
+                        # Cache fp8 weights on CPU as bf16 (pin if requested) to avoid CPU float8 tensors.
+                        try:
+                            if use_pinned:
+                                buf = _FP8_CPU_CACHE.get(id(p))
+                                if buf is None or buf.shape != p.data.shape or buf.dtype != torch.bfloat16:
+                                    buf = torch.empty_like(p.data, device="cpu", dtype=torch.bfloat16, pin_memory=True)
+                                    _FP8_CPU_CACHE[id(p)] = buf
+                                buf.copy_(p.data.to(dtype=torch.bfloat16), non_blocking=non_blocking)
+                                p.data = buf
+                            else:
+                                p.data = p.data.to(device, dtype=torch.bfloat16, non_blocking=non_blocking)
+                        except Exception:
+                            # Fallback to fp16 if bf16 conversion fails
+                            if use_pinned:
+                                buf = _FP8_CPU_CACHE.get(id(p))
+                                if buf is None or buf.shape != p.data.shape or buf.dtype != torch.float16:
+                                    buf = torch.empty_like(p.data, device="cpu", dtype=torch.float16, pin_memory=True)
+                                    _FP8_CPU_CACHE[id(p)] = buf
+                                buf.copy_(p.data.to(dtype=torch.float16), non_blocking=non_blocking)
+                                p.data = buf
+                            else:
+                                p.data = p.data.to(device, dtype=torch.float16, non_blocking=non_blocking)
+                        continue
                     # Skip trainable parameters only when offloading to CPU
                     if should_skip_trainable and hasattr(p, 'requires_grad') and p.requires_grad:
                         continue
@@ -302,7 +390,23 @@ class Offloader:
             # Minimize using pinned memory for lower shared GPU RAM usage
             stream = self.stream
             with torch.cuda.stream(stream):
-                if self.staging_buffer_a is None:
+                def _staging_buffer_valid() -> bool:
+                    if self.staging_buffer_a is None or self.staging_buffer_b is None:
+                        return False
+                    if len(self.staging_buffer_a) != len(weight_swap_jobs):
+                        return False
+                    if len(self.staging_buffer_b) != len(weight_swap_jobs):
+                        return False
+                    for sbuf_a, sbuf_b, (_, _, cuda_data_view, _, _) in zip(
+                        self.staging_buffer_a, self.staging_buffer_b, weight_swap_jobs
+                    ):
+                        if sbuf_a.shape != cuda_data_view.shape or sbuf_a.dtype != cuda_data_view.dtype:
+                            return False
+                        if sbuf_b.shape != cuda_data_view.shape or sbuf_b.dtype != cuda_data_view.dtype:
+                            return False
+                    return True
+
+                if not _staging_buffer_valid():
                     # Create staging buffer as pinned memory (as shared GPU ram). We specify device for correct pinning on multi-GPU systems
                     self.staging_buffer_a = [
                         torch.empty_like(cuda_data_view, device="cpu")
@@ -359,7 +463,17 @@ class Offloader:
 
         else:
             # Use pinned memory for faster transfer between CPU and GPU, but it requires more memory
-            if self.pinned_buffer is None:
+            def _pinned_buffer_valid() -> bool:
+                if self.pinned_buffer is None:
+                    return False
+                if len(self.pinned_buffer) != len(weight_swap_jobs):
+                    return False
+                for buf, (_, _, cuda_data_view, _, _) in zip(self.pinned_buffer, weight_swap_jobs):
+                    if buf.shape != cuda_data_view.shape or buf.dtype != cuda_data_view.dtype:
+                        return False
+                return True
+
+            if not _pinned_buffer_valid():
                 with torch.cuda.stream(self.stream):
                     # Create pinned buffer as pinned memory (as shared GPU ram). We specify device for correct pinning on multi-GPU systems
                     self.pinned_buffer = [
@@ -371,15 +485,30 @@ class Offloader:
 
             events = [torch.cuda.Event() for _ in weight_swap_jobs]  # Waiting events for GPU to CPU non-blocking copy
 
-            # Copy weights to CPU
-            for event, module_pin_buf, (parent_to_cpu, parent_to_cuda, cuda_data_view, cpu_data_view, attr_name) in zip(
-                events, self.pinned_buffer, weight_swap_jobs
-            ):
-                # CUDA to CPU, non-blocking copy
-                with torch.cuda.stream(self.stream):
-                    with T.section("cuda to cpu"):
-                        module_pin_buf.copy_(cuda_data_view, non_blocking=True)
-                        event.record(self.stream)
+            def _copy_weights_to_cpu():
+                for event, module_pin_buf, (parent_to_cpu, parent_to_cuda, cuda_data_view, cpu_data_view, attr_name) in zip(
+                    events, self.pinned_buffer, weight_swap_jobs
+                ):
+                    # CUDA to CPU, non-blocking copy
+                    with torch.cuda.stream(self.stream):
+                        with T.section("cuda to cpu"):
+                            module_pin_buf.copy_(cuda_data_view, non_blocking=True)
+                            event.record(self.stream)
+
+            # Copy weights to CPU (retry once if pinned buffer shape mismatch slips through)
+            try:
+                _copy_weights_to_cpu()
+            except RuntimeError as e:
+                if "must match the size of tensor" in str(e):
+                    with torch.cuda.stream(self.stream):
+                        self.pinned_buffer = [
+                            torch.empty_like(cuda_data_view, device="cpu").pin_memory(device=device)
+                            for _, _, cuda_data_view, _, _ in weight_swap_jobs
+                        ]
+                    self.stream.synchronize()
+                    _copy_weights_to_cpu()
+                else:
+                    raise
 
             # CPU to CUDA
             for event, (parent_to_cpu, parent_to_cuda, cuda_data_view, cpu_data_view, attr_name) in zip(events, weight_swap_jobs):

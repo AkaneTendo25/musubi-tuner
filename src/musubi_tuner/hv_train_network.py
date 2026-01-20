@@ -1961,6 +1961,19 @@ class NetworkTrainer:
                     weight_cpu_offloading=True,
                     blocks_to_checkpoint=blocks_to_ckpt
                 )
+                if hasattr(transformer, "transformer_blocks"):
+                    total_blocks = len(transformer.transformer_blocks)
+                    if blocks_to_ckpt is None or int(blocks_to_ckpt) == -1:
+                        ckpt_start = 0
+                    else:
+                        ckpt_start = max(0, total_blocks - int(blocks_to_ckpt))
+                    logger.info(
+                        "Blockwise checkpointing: blocks_to_checkpoint=%s (range %s..%s of %s).",
+                        blocks_to_ckpt,
+                        ckpt_start,
+                        max(0, total_blocks - 1),
+                        total_blocks,
+                    )
                 if args.use_pinned_memory_for_block_swap and hasattr(transformer, "transformer_blocks"):
                     # LTX-2 blockwise checkpointing uses per-block use_pinned_memory for CPU<->GPU transfers.
                     for block in transformer.transformer_blocks:
@@ -2350,6 +2363,13 @@ class NetworkTrainer:
                     dict_output = isinstance(model_pred, dict)
                     if dict_output:
                         out = model_pred
+                        if out.get("_skip_step"):
+                            logger.warning(
+                                "Skipping step due to non-finite tensor (%s).",
+                                out.get("skip_reason", "unknown"),
+                            )
+                            optimizer.zero_grad(set_to_none=True)
+                            continue
 
                         video_loss = None
                         audio_loss = None
@@ -2361,7 +2381,11 @@ class NetworkTrainer:
                             tgt: torch.Tensor,
                             mask: torch.Tensor | None,
                         ) -> torch.Tensor:
-                            per_elem = torch.nn.functional.mse_loss(pred.to(network_dtype), tgt, reduction="none")
+                            if isinstance(tgt, torch.Tensor):
+                                pred = pred.to(device=tgt.device, dtype=network_dtype)
+                            else:
+                                pred = pred.to(dtype=network_dtype)
+                            per_elem = torch.nn.functional.mse_loss(pred, tgt, reduction="none")
                             if weighting is not None:
                                 w = weighting
                                 if isinstance(w, torch.Tensor) and w.dim() != per_elem.dim():
@@ -2406,7 +2430,11 @@ class NetworkTrainer:
                             audio_weight = float(out.get("audio_loss_weight", 1.0))
                             loss = loss + audio_loss * audio_weight
                     else:
-                        loss = torch.nn.functional.mse_loss(model_pred.to(network_dtype), target, reduction="none")
+                        if isinstance(target, torch.Tensor):
+                            model_pred = model_pred.to(device=target.device, dtype=network_dtype)
+                        else:
+                            model_pred = model_pred.to(dtype=network_dtype)
+                        loss = torch.nn.functional.mse_loss(model_pred, target, reduction="none")
                         if weighting is not None:
                             loss = loss * weighting
                         loss = loss.mean()
@@ -2548,7 +2576,11 @@ class NetworkTrainer:
                             tgt: torch.Tensor,
                             mask: torch.Tensor | None,
                         ) -> torch.Tensor:
-                            per_elem = torch.nn.functional.mse_loss(pred.to(network_dtype), tgt, reduction="none")
+                            if isinstance(tgt, torch.Tensor):
+                                pred = pred.to(device=tgt.device, dtype=network_dtype)
+                            else:
+                                pred = pred.to(dtype=network_dtype)
+                            per_elem = torch.nn.functional.mse_loss(pred, tgt, reduction="none")
                             if weighting is not None:
                                 w = weighting
                                 if isinstance(w, torch.Tensor) and w.dim() != per_elem.dim():
@@ -2593,7 +2625,11 @@ class NetworkTrainer:
                             audio_weight = float(out.get("audio_loss_weight", 1.0))
                             loss = loss + audio_loss * audio_weight
                     else:
-                        loss = torch.nn.functional.mse_loss(model_pred.to(network_dtype), target, reduction="none")
+                        if isinstance(target, torch.Tensor):
+                            model_pred = model_pred.to(device=target.device, dtype=network_dtype)
+                        else:
+                            model_pred = model_pred.to(dtype=network_dtype)
+                        loss = torch.nn.functional.mse_loss(model_pred, target, reduction="none")
 
                     if not dict_output and weighting is not None:
                         loss = loss * weighting

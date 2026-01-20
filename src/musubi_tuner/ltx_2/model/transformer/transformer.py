@@ -371,7 +371,8 @@ class BasicAVTransformerBlock(torch.nn.Module):
             if not sublayer_diag or tensor is None:
                 return
             if not torch.isfinite(tensor).all():
-                raise RuntimeError(f"Non-finite {tag} in block {self.idx}")
+                logger.error("Non-finite detected: %s in block %s", tag, self.idx)
+                return
 
         def _log_stats(tag: str, tensor: torch.Tensor | None) -> None:
             if not v2a_diag or tensor is None:

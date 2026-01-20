@@ -543,6 +543,8 @@ class LTXModel(torch.nn.Module):
         force_audio_ctx_pytorch = os.getenv("MUSUBI_TUNER_FORCE_PYTORCH_AUDIO_CTX_ATTN", "0") == "1"
         force_audio_ctx_fp32 = os.getenv("MUSUBI_TUNER_AUDIO_CTX_ATTN_FP32", "0") == "1"
         audio_ctx_swap_only = os.getenv("MUSUBI_TUNER_AUDIO_CTX_ATTN_SWAP_ONLY", "1") == "1"
+        fp8_swap_sync = os.getenv("MUSUBI_TUNER_SWAP_FP8_SYNC", "1") == "1"
+        fp8_swap_sync_strict = os.getenv("MUSUBI_TUNER_SWAP_FP8_SYNC_STRICT", "0") == "1"
 
         swap_manager = self._ltx2_block_swap
         swap_active = False
@@ -630,6 +632,12 @@ class LTXModel(torch.nn.Module):
                 if strict_swap_sync and torch.cuda.is_available():
                     torch.cuda.current_stream().synchronize()
 
+            if fp8_swap_sync and in_swap_range and torch.cuda.is_available():
+                # Ensure fp8 weights + scale_weight are on the compute device after swap-in.
+                ensure_fp8_modules_on_device(block, gpu_device)
+                if fp8_swap_sync_strict:
+                    torch.cuda.current_stream().synchronize()
+
             # Phase 2: Prefetch Next Block
             # Trigger load for N+1 on Transfer Stream while N is about to compute
             if (
@@ -699,7 +707,10 @@ class LTXModel(torch.nn.Module):
                 swap_manager.stream_out(block)
 
             if self.blocks_to_swap and self.offloader is not None:
-                self.offloader.submit_move_blocks_forward(self.transformer_blocks, block_idx)
+                # If blockwise checkpointing is handling weight offload for this block,
+                # skip swap prefetch to avoid loading extra blocks and spiking VRAM.
+                if not getattr(block, "weight_cpu_offloading", False):
+                    self.offloader.submit_move_blocks_forward(self.transformer_blocks, block_idx)
                 if not self.offloader.forward_only:
                     pass # Keep non-linear params on GPU for backward pass
 
@@ -722,7 +733,7 @@ class LTXModel(torch.nn.Module):
         # AdaLN Structural Fix: Force modulation to happen in Float32 to prevent overflow (10^18 issue)
         # This is strictly required for stability when large activations meet scale factors.
         x_32 = x.to(torch.float32)
-        embedded_32 = embedded_timestep.to(torch.float32)
+        embedded_32 = embedded_timestep.to(device=x.device, dtype=torch.float32)
         
         # Apply scale-shift modulation in float32
         scale_shift_values = scale_shift_table[None, None].to(device=x.device, dtype=torch.float32) + embedded_32[:, :, None]
@@ -817,6 +828,16 @@ class LTXModel(torch.nn.Module):
             if target_device is not None and target_device.type != "cpu":
                 video_out = _move_transformer_args(video_out, target_device)
                 audio_out = _move_transformer_args(audio_out, target_device)
+
+        # Ensure outputs are on the same device as output projections
+        if video_out is not None and isinstance(video_out.x, torch.Tensor):
+            proj_device = self.proj_out.weight.device
+            if video_out.x.device != proj_device:
+                video_out = _move_transformer_args(video_out, proj_device)
+        if audio_out is not None and isinstance(audio_out.x, torch.Tensor):
+            proj_device = self.audio_proj_out.weight.device
+            if audio_out.x.device != proj_device:
+                audio_out = _move_transformer_args(audio_out, proj_device)
 
         # Process output
         vx = (
