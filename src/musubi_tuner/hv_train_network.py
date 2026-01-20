@@ -460,9 +460,17 @@ class NetworkTrainer:
         keys_scaled=None,
         mean_norm=None,
         maximum_norm=None,
+        video_loss=None,
+        audio_loss=None,
     ):
         network_train_unet_only = True
         logs = {"loss/current": current_loss, "loss/average": avr_loss}
+
+        # Log separate video/audio losses for modality tracking
+        if video_loss is not None:
+            logs["loss/video"] = video_loss
+        if audio_loss is not None:
+            logs["loss/audio"] = audio_loss
 
         if keys_scaled is not None:
             logs["max_norm/keys_scaled"] = keys_scaled
@@ -2575,6 +2583,8 @@ class NetworkTrainer:
                         network_dtype,
                     )
                     dict_output = isinstance(model_pred, dict)
+                    video_loss_value = None  # For tracking in wandb/tensorboard
+                    audio_loss_value = None  # For tracking in wandb/tensorboard
                     if dict_output:
                         out = model_pred
 
@@ -2623,6 +2633,9 @@ class NetworkTrainer:
                         video_loss = _masked_mse(video_pred, video_target, video_loss_mask)
                         video_weight = float(out.get("video_loss_weight", 1.0))
                         loss = video_loss * video_weight
+                        # Capture video loss for logging (only if weight > 0)
+                        if video_weight > 0:
+                            video_loss_value = video_loss.detach().item()
 
                         audio_pred = out.get("audio_pred")
                         audio_target = out.get("audio_target")
@@ -2631,6 +2644,9 @@ class NetworkTrainer:
                             audio_loss = _masked_mse(audio_pred, audio_target, audio_loss_mask)
                             audio_weight = float(out.get("audio_loss_weight", 1.0))
                             loss = loss + audio_loss * audio_weight
+                            # Capture audio loss for logging (only if weight > 0)
+                            if audio_weight > 0:
+                                audio_loss_value = audio_loss.detach().item()
                     else:
                         if isinstance(target, torch.Tensor):
                             model_pred = model_pred.to(device=target.device, dtype=network_dtype)
@@ -2760,7 +2776,8 @@ class NetworkTrainer:
 
                 if len(accelerator.trackers) > 0:
                     logs = self.generate_step_logs(
-                        args, current_loss, avr_loss, lr_scheduler, lr_descriptions, optimizer, keys_scaled, mean_norm, maximum_norm
+                        args, current_loss, avr_loss, lr_scheduler, lr_descriptions, optimizer, keys_scaled, mean_norm, maximum_norm,
+                        video_loss=video_loss_value, audio_loss=audio_loss_value,
                     )
                     accelerator.log(logs, step=global_step)
 
