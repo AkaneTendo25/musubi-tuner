@@ -273,6 +273,9 @@ def encode_datasets(datasets: list[BaseDataset], encode: callable, args: argpars
             if not supports_alpha:
                 # make sure content has 3 channels
                 for item in batch:
+                    if item.content is None:
+                        # audio-only datasets have no visual content
+                        continue
                     if isinstance(item.content, np.ndarray):
                         if item.content.shape[-1] == 4:
                             item.content = item.content[..., :3]

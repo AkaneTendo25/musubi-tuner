@@ -382,6 +382,14 @@ def main() -> None:
     audio_only = ltx_mode == "audio"
     audio_video = ltx_mode == "av" or getattr(args, "ltx2_audio_video", False)
 
+    # Auto-detect audio-only mode if all datasets are AudioDataset
+    audio_datasets = [ds for ds in datasets if isinstance(ds, AudioDataset)]
+    non_audio_datasets = [ds for ds in datasets if not isinstance(ds, AudioDataset)]
+    if not audio_only and audio_datasets and not non_audio_datasets:
+        logger.info("All datasets are audio-only; automatically switching to --ltx_mode audio")
+        audio_only = True
+
+
     if not audio_only:
         if args.vae is None:
             if getattr(args, "ltx2_checkpoint", None) is None:
@@ -437,8 +445,7 @@ def main() -> None:
                 )
         dummy_channels = int(dummy_channels)
 
-        audio_datasets = [ds for ds in datasets if isinstance(ds, AudioDataset)]
-        non_audio_datasets = [ds for ds in datasets if not isinstance(ds, AudioDataset)]
+        # Validate datasets (use variables defined during auto-detection)
         if non_audio_datasets:
             raise ValueError("Audio-only caching only supports audio datasets in the dataset config")
         if not audio_datasets:
