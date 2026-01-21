@@ -2301,6 +2301,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
             use_audio_subprocess=use_audio_subprocess,
             enable_audio_preview=enable_audio_preview,
             decode_video=not audio_only_preview,
+            audio_only=audio_only_preview,
         )
 
         if not has_self_ref_orig_mod:
@@ -2387,6 +2388,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
         use_audio_subprocess: bool = False,
         enable_audio_preview: bool = False,
         decode_video: bool = True,
+        audio_only: bool = False,
     ):
         """Generate sample video during training using LTX-2 denoising loop"""
         from musubi_tuner.modules.scheduling_flow_match_discrete import FlowMatchDiscreteScheduler
@@ -2581,6 +2583,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
                     attention_mask=prompt_mask,
                     frame_rate=sample_parameter.get("frame_rate", 25),
                     transformer_options={},
+                    audio_only=audio_only,
                 )
 
                 audio_pred = None
@@ -2699,7 +2702,8 @@ class LTX2NetworkTrainer(NetworkTrainer):
             clean_memory_on_device(transformer_device)
 
         # Normalize to [0, 1]
-        video = (video / 2 + 0.5).clamp(0, 1).to(torch.float32).to("cpu")
+        if video is not None:
+            video = (video / 2 + 0.5).clamp(0, 1).to(torch.float32).to("cpu")
 
         # Restore VAE state
         vae.to_device(original_vae_device)
