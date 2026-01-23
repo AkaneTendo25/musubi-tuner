@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import os
 from contextlib import nullcontext
+import glob
 from typing import List, Optional, Sequence, cast
 
 import logging
@@ -23,11 +24,12 @@ from musubi_tuner.dataset.config_utils import BlueprintGenerator, ConfigSanitize
 from musubi_tuner.dataset.image_video_dataset import (
     ARCHITECTURE_LTX2,
     BaseDataset,
+    ImageDataset,
     ItemInfo,
-    AudioDataset,
     VideoDataset,
     save_latent_cache_ltx2,
 )
+from musubi_tuner.dataset.audio_dataset import AudioDataset
 from musubi_tuner.ltx_2.model.audio_vae.audio_vae import LATENT_DOWNSAMPLE_FACTOR
 from musubi_tuner.ltx_2.env import get_ltx2_env
 from musubi_tuner.utils.model_utils import str_to_dtype
@@ -378,15 +380,56 @@ def main() -> None:
         cache_latents.show_datasets(list(datasets), args.debug_mode, args.console_width, args.console_back, args.console_num_images)
         return
 
-    ltx_mode = getattr(args, "ltx_mode", "video")
-    audio_only = ltx_mode == "audio"
+    ltx_mode = getattr(args, "ltx_mode", "auto")
+    if ltx_mode == "auto":
+        logger.info("Analyzing datasets for cache modality auto-detection...")
+        has_video_datasets = False
+        has_audio_datasets = False
+
+        for i, dataset in enumerate(datasets):
+            if isinstance(dataset, AudioDataset):
+                has_audio_datasets = True
+                logger.info("Dataset [%s]: AudioDataset -> Audio caching required", i)
+            elif isinstance(dataset, (VideoDataset, ImageDataset)):
+                has_video_datasets = True
+                dataset_type = "ImageDataset" if isinstance(dataset, ImageDataset) else "VideoDataset"
+                logger.info("Dataset [%s]: %s -> Video caching required", i, dataset_type)
+
+                if isinstance(dataset, VideoDataset):
+                    video_dir = getattr(dataset, "video_directory", None)
+                    if video_dir and os.path.exists(video_dir):
+                        video_files = glob.glob(os.path.join(video_dir, "*.*"))
+                        if args.ltx2_audio_source == "video" and any(
+                            f.endswith((".mp4", ".avi", ".mov", ".mkv", ".webm"))
+                            for f in video_files
+                        ):
+                            has_audio_datasets = True
+                            logger.info(
+                                "Dataset [%s]: Video with audio -> Audio caching required", i
+                            )
+
+        if has_video_datasets and has_audio_datasets:
+            args.ltx_mode = "av"
+            logger.info("Auto-detection result: Video + Audio detected (ltx_mode=av)")
+        elif has_audio_datasets:
+            args.ltx_mode = "a"
+            logger.info("Auto-detection result: Audio-only detected (ltx_mode=a)")
+        else:
+            args.ltx_mode = "v"
+            logger.info("Auto-detection result: Video/Image-only detected (ltx_mode=v)")
+        ltx_mode = args.ltx_mode
+
+    audio_datasets = [ds for ds in datasets if isinstance(ds, AudioDataset)]
+    non_audio_datasets = [ds for ds in datasets if not isinstance(ds, AudioDataset)]
+
+    audio_only = ltx_mode == "a"
     audio_video = ltx_mode == "av" or getattr(args, "ltx2_audio_video", False)
 
     # Auto-detect audio-only mode if all datasets are AudioDataset
     audio_datasets = [ds for ds in datasets if isinstance(ds, AudioDataset)]
     non_audio_datasets = [ds for ds in datasets if not isinstance(ds, AudioDataset)]
     if not audio_only and audio_datasets and not non_audio_datasets:
-        logger.info("All datasets are audio-only; automatically switching to --ltx_mode audio")
+        logger.info("All datasets are audio-only; automatically switching to --ltx_mode a")
         audio_only = True
 
 
@@ -427,11 +470,13 @@ def main() -> None:
         def encode_fn(batch: List[ItemInfo]) -> None:
             encode_and_save_batch(vae, batch, tiling_config)
 
-        cache_latents.encode_datasets(list(datasets), encode_fn, args)
+        datasets_to_encode = non_audio_datasets if non_audio_datasets else list(datasets)
+        if datasets_to_encode:
+            cache_latents.encode_datasets(list(datasets_to_encode), encode_fn, args)
 
     if audio_only:
         if getattr(args, "ltx2_checkpoint", None) is None:
-            raise ValueError("--ltx2_checkpoint is required when --ltx_mode audio is used")
+            raise ValueError("--ltx2_checkpoint is required when --ltx_mode a is used")
 
         audio_dtype = torch.float16 if args.ltx2_audio_dtype is None else str_to_dtype(args.ltx2_audio_dtype)
         dummy_dtype = audio_dtype if args.audio_dummy_video_dtype is None else str_to_dtype(args.audio_dummy_video_dtype)
@@ -523,9 +568,9 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
     parser.add_argument(
         "--ltx_mode",
         type=str,
-        default="video",
-        choices=["video", "av", "audio"],
-        help="Caching modality. Use 'av' for AV, or 'audio' for audio-only datasets.",
+        default="auto",
+        choices=["v", "av", "a", "auto"],
+        help="Caching modality: v=video, a=audio-only, av=audio+video, auto=detect from datasets.",
     )
     parser.add_argument(
         "--ltx2_audio_video",

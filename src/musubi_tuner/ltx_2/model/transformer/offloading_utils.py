@@ -31,6 +31,25 @@ def _should_skip_swap(name: str) -> bool:
     return False
 
 
+def _move_non_linear_params(block: nn.Module, device: torch.device) -> None:
+    """Move non-linear params/buffers to device; Linear weights are handled by offloader."""
+    non_blocking = device.type != "cpu"
+    for submodule in block.modules():
+        if isinstance(submodule, nn.Linear):
+            # Keep Linear weights on CPU; move bias/scale_weight if present.
+            if submodule.bias is not None and submodule.bias.device != device:
+                submodule.bias.data = submodule.bias.data.to(device, non_blocking=non_blocking)
+            if hasattr(submodule, "scale_weight") and submodule.scale_weight is not None and submodule.scale_weight.device != device:
+                submodule.scale_weight.data = submodule.scale_weight.data.to(device, non_blocking=non_blocking)
+            continue
+        for param in submodule.parameters(recurse=False):
+            if param.device != device:
+                param.data = param.data.to(device, non_blocking=non_blocking)
+        for buf in submodule.buffers(recurse=False):
+            if buf.device != device:
+                buf.data = buf.data.to(device, non_blocking=non_blocking)
+
+
 def _move_block_params_excluding_audio(
     block: nn.Module,
     device: torch.device,
@@ -275,8 +294,8 @@ class LTX2ModelOffloader(ModelOffloader):
                 else:
                     params_to_device(block, cpu_device, include_norms=True, use_pinned=use_pinned)
             else:
-                # Original behavior: Move whole block to GPU, only swap Linear weights
-                block.to(self.device)
+                # Move only non-linear params/buffers to GPU to avoid peak VRAM spikes.
+                _move_non_linear_params(block, self.device)
                 if _SKIP_AUDIO_SWAP or _SKIP_CROSS_ATTN_SWAP:
                     _move_block_params_excluding_audio(
                         block,

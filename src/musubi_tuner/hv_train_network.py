@@ -2571,99 +2571,211 @@ class NetworkTrainer:
                         args.weighting_scheme, noise_scheduler, timesteps, accelerator.device, dit_dtype
                     )
 
-                    model_pred, target = self.call_dit(
-                        args,
-                        accelerator,
-                        transformer,
-                        latents_tensor,
-                        batch,
-                        noise,
-                        noisy_model_input,
-                        timesteps,
-                        network_dtype,
+                    split_av_passes = bool(getattr(args, "split_av_passes", False)) and bool(
+                        getattr(self, "supports_split_av_passes", False)
                     )
-                    dict_output = isinstance(model_pred, dict)
-                    video_loss_value = None  # For tracking in wandb/tensorboard
-                    audio_loss_value = None  # For tracking in wandb/tensorboard
-                    if dict_output:
-                        out = model_pred
+                    if getattr(args, "ltx_mode", "v") != "av":
+                        split_av_passes = False
 
-                        def _masked_mse(
-                            pred: torch.Tensor,
-                            tgt: torch.Tensor,
-                            mask: torch.Tensor | None,
-                        ) -> torch.Tensor:
-                            if isinstance(tgt, torch.Tensor):
-                                pred = pred.to(device=tgt.device, dtype=network_dtype)
-                            else:
-                                pred = pred.to(dtype=network_dtype)
-                            per_elem = torch.nn.functional.mse_loss(pred, tgt, reduction="none")
-                            if weighting is not None:
-                                w = weighting
-                                if isinstance(w, torch.Tensor) and w.dim() != per_elem.dim():
-                                    while w.dim() > per_elem.dim() and w.shape[-1] == 1:
-                                        w = w.squeeze(-1)
-                                per_elem = per_elem * w
-                            if mask is None:
-                                return per_elem.mean()
+                    def _masked_mse(
+                        pred: torch.Tensor,
+                        tgt: torch.Tensor,
+                        mask: torch.Tensor | None,
+                    ) -> torch.Tensor:
+                        if isinstance(tgt, torch.Tensor):
+                            pred = pred.to(device=tgt.device, dtype=network_dtype)
+                        else:
+                            pred = pred.to(dtype=network_dtype)
+                        per_elem = torch.nn.functional.mse_loss(pred, tgt, reduction="none")
+                        if weighting is not None:
+                            w = weighting
+                            if isinstance(w, torch.Tensor) and w.dim() != per_elem.dim():
+                                while w.dim() > per_elem.dim() and w.shape[-1] == 1:
+                                    w = w.squeeze(-1)
+                            per_elem = per_elem * w
+                        if mask is None:
+                            return per_elem.mean()
 
-                            mask = mask.to(device=per_elem.device)
-                            if per_elem.dim() == 5 and mask.dim() == 2:
-                                mask = mask.view(mask.shape[0], 1, mask.shape[1], 1, 1)
-                            elif per_elem.dim() == 5 and mask.dim() == 1:
-                                mask = mask.view(mask.shape[0], 1, 1, 1, 1)
-                            elif per_elem.dim() == 4 and mask.dim() == 2:
-                                mask = mask.view(mask.shape[0], 1, mask.shape[1], 1)
-                            elif per_elem.dim() == 4 and mask.dim() == 1:
-                                mask = mask.view(mask.shape[0], 1, 1, 1)
-                            elif per_elem.dim() == 3 and mask.dim() == 2:
-                                mask = mask.unsqueeze(-1)
-                            elif per_elem.dim() == 3 and mask.dim() == 1:
-                                mask = mask.view(mask.shape[0], 1, 1)
+                        mask = mask.to(device=per_elem.device)
+                        if per_elem.dim() == 5 and mask.dim() == 2:
+                            mask = mask.view(mask.shape[0], 1, mask.shape[1], 1, 1)
+                        elif per_elem.dim() == 5 and mask.dim() == 1:
+                            mask = mask.view(mask.shape[0], 1, 1, 1, 1)
+                        elif per_elem.dim() == 4 and mask.dim() == 2:
+                            mask = mask.view(mask.shape[0], 1, mask.shape[1], 1)
+                        elif per_elem.dim() == 4 and mask.dim() == 1:
+                            mask = mask.view(mask.shape[0], 1, 1, 1)
+                        elif per_elem.dim() == 3 and mask.dim() == 2:
+                            mask = mask.unsqueeze(-1)
+                        elif per_elem.dim() == 3 and mask.dim() == 1:
+                            mask = mask.view(mask.shape[0], 1, 1)
 
-                            mask_f = mask.to(dtype=per_elem.dtype)
-                            denom = mask_f.mean()
-                            if denom.item() == 0:
-                                return per_elem.mean()
-                            return (per_elem * mask_f).div(denom).mean()
+                        mask_f = mask.to(dtype=per_elem.dtype)
+                        denom = mask_f.mean()
+                        if denom.item() == 0:
+                            return per_elem.mean()
+                        return (per_elem * mask_f).div(denom).mean()
 
+                    def _compute_loss_from_out(out: dict) -> tuple[torch.Tensor, float | None, float | None, bool | None]:
                         video_pred = out["video_pred"]
                         video_target = out["video_target"]
                         video_loss_mask = out.get("video_loss_mask")
                         video_loss = _masked_mse(video_pred, video_target, video_loss_mask)
                         video_weight = float(out.get("video_loss_weight", 1.0))
-                        loss = video_loss * video_weight
-                        # Capture video loss for logging (only if weight > 0)
-                        if video_weight > 0:
-                            video_loss_value = video_loss.detach().item()
+                        loss_val = video_loss * video_weight
+                        video_loss_value = video_loss.detach().item() if video_weight > 0 else None
 
+                        audio_loss_value = None
                         audio_pred = out.get("audio_pred")
                         audio_target = out.get("audio_target")
                         audio_loss_mask = out.get("audio_loss_mask")
                         if audio_pred is not None and audio_target is not None:
                             audio_loss = _masked_mse(audio_pred, audio_target, audio_loss_mask)
                             audio_weight = float(out.get("audio_loss_weight", 1.0))
-                            loss = loss + audio_loss * audio_weight
-                            # Capture audio loss for logging (only if weight > 0)
+                            loss_val = loss_val + audio_loss * audio_weight
                             if audio_weight > 0:
                                 audio_loss_value = audio_loss.detach().item()
-                    else:
-                        if isinstance(target, torch.Tensor):
-                            model_pred = model_pred.to(device=target.device, dtype=network_dtype)
-                        else:
-                            model_pred = model_pred.to(dtype=network_dtype)
-                        loss = torch.nn.functional.mse_loss(model_pred, target, reduction="none")
 
-                    if not dict_output and weighting is not None:
+                        audio_enabled_for_batch = out.get("audio_enabled_for_batch")
+                        return loss_val, video_loss_value, audio_loss_value, audio_enabled_for_batch
+
+                    dict_output = False
+                    audio_enabled_for_batch = None
+                    video_loss_value = None  # For tracking in wandb/tensorboard
+                    audio_loss_value = None  # For tracking in wandb/tensorboard
+                    modality_label = "v"
+
+                    if split_av_passes:
+                        model_pred, target = self.call_dit(
+                            args,
+                            accelerator,
+                            transformer,
+                            latents_tensor,
+                            batch,
+                            noise,
+                            noisy_model_input,
+                            timesteps,
+                            network_dtype,
+                            force_video=True,
+                            force_audio=False,
+                        )
+                        dict_output = isinstance(model_pred, dict)
+                        if dict_output:
+                            out = model_pred
+                            audio_enabled_for_batch = out.get("audio_enabled_for_batch")
+                            if out.get("_skip_step"):
+                                logger.warning(
+                                    "Skipping step due to non-finite tensor (%s).",
+                                    out.get("skip_reason", "unknown"),
+                                )
+                                optimizer.zero_grad(set_to_none=True)
+                                continue
+                            loss, video_loss_value, _, _ = _compute_loss_from_out(out)
+                        else:
+                            if isinstance(target, torch.Tensor):
+                                model_pred = model_pred.to(device=target.device, dtype=network_dtype)
+                            else:
+                                model_pred = model_pred.to(dtype=network_dtype)
+                            loss = torch.nn.functional.mse_loss(model_pred, target, reduction="none")
+                            if weighting is not None:
+                                loss = loss * weighting
+                            loss = loss.mean()
+                        accelerator.backward(loss)
+
+                        audio_latents = batch.get("audio_latents")
+                        if isinstance(audio_latents, dict):
+                            audio_latents = audio_latents.get("latents")
+                        if isinstance(audio_latents, torch.Tensor):
+                            model_pred, target = self.call_dit(
+                                args,
+                                accelerator,
+                                transformer,
+                                latents_tensor,
+                                batch,
+                                noise,
+                                noisy_model_input,
+                                timesteps,
+                                network_dtype,
+                                force_video=False,
+                                force_audio=True,
+                            )
+                            dict_output = isinstance(model_pred, dict)
+                            if dict_output:
+                                out = model_pred
+                                audio_enabled_for_batch = out.get("audio_enabled_for_batch")
+                                if out.get("_skip_step"):
+                                    logger.warning(
+                                        "Skipping step due to non-finite tensor (%s).",
+                                        out.get("skip_reason", "unknown"),
+                                    )
+                                    optimizer.zero_grad(set_to_none=True)
+                                    continue
+                                loss_audio, _, audio_loss_value, audio_enabled = _compute_loss_from_out(out)
+                                if audio_enabled:
+                                    accelerator.backward(loss_audio)
+                                    loss = loss + loss_audio
+                                    modality_label = "av"
+                            else:
+                                if isinstance(target, torch.Tensor):
+                                    model_pred = model_pred.to(device=target.device, dtype=network_dtype)
+                                else:
+                                    model_pred = model_pred.to(dtype=network_dtype)
+                                loss_audio = torch.nn.functional.mse_loss(model_pred, target, reduction="none")
+                                if weighting is not None:
+                                    loss_audio = loss_audio * weighting
+                                loss_audio = loss_audio.mean()
+                                accelerator.backward(loss_audio)
+                                loss = loss + loss_audio
+                                modality_label = "av"
+                    else:
+                        model_pred, target = self.call_dit(
+                            args,
+                            accelerator,
+                            transformer,
+                            latents_tensor,
+                            batch,
+                            noise,
+                            noisy_model_input,
+                            timesteps,
+                            network_dtype,
+                        )
+                        dict_output = isinstance(model_pred, dict)
+                        if dict_output:
+                            out = model_pred
+                            audio_enabled_for_batch = out.get("audio_enabled_for_batch")
+                            if out.get("_skip_step"):
+                                logger.warning(
+                                    "Skipping step due to non-finite tensor (%s).",
+                                    out.get("skip_reason", "unknown"),
+                                )
+                                optimizer.zero_grad(set_to_none=True)
+                                continue
+                            loss, video_loss_value, audio_loss_value, _ = _compute_loss_from_out(out)
+                            if getattr(args, "ltx_mode", "v") == "a":
+                                modality_label = "a"
+                            elif audio_enabled_for_batch:
+                                modality_label = "av"
+                        else:
+                            if isinstance(target, torch.Tensor):
+                                model_pred = model_pred.to(device=target.device, dtype=network_dtype)
+                            else:
+                                model_pred = model_pred.to(dtype=network_dtype)
+                            loss = torch.nn.functional.mse_loss(model_pred, target, reduction="none")
+                            if weighting is not None:
+                                loss = loss * weighting
+                            loss = loss.mean()
+
+                    if not split_av_passes and not dict_output and weighting is not None:
                         loss = loss * weighting
                     # loss = loss.mean([1, 2, 3])
                     # # min snr gamma, scale v pred loss like noise pred, v pred like loss, debiased estimation etc.
                     # loss = self.post_process_loss(loss, args, timesteps, noise_scheduler)
 
-                    if not dict_output:
+                    if not split_av_passes and not dict_output:
                         loss = loss.mean()  # mean loss over all elements in batch
 
-                    accelerator.backward(loss)
+                    if not split_av_passes:
+                        accelerator.backward(loss)
                     
                     # DEBUG: Check if LoRA parameters have gradients (requires LTX2_DEBUG env var)
                     if os.environ.get("LTX2_DEBUG", "0") == "1":
@@ -2769,6 +2881,13 @@ class NetworkTrainer:
                 loss_recorder.add(epoch=epoch, step=step, loss=current_loss)
                 avr_loss: float = loss_recorder.moving_average
                 logs = {"avr_loss": avr_loss}  # , "lr": lr_scheduler.get_last_lr()[0]}
+                logs["mode"] = modality_label
+                if audio_enabled_for_batch is not None:
+                    logs["aud"] = int(bool(audio_enabled_for_batch))
+                if isinstance(audio_loss_value, float):
+                    logs["loss_a"] = audio_loss_value
+                if isinstance(video_loss_value, float):
+                    logs["loss_v"] = video_loss_value
                 progress_bar.set_postfix(**logs)
 
                 if args.scale_weight_norms:

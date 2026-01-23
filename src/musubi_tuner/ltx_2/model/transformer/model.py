@@ -580,7 +580,7 @@ class LTXModel(torch.nn.Module):
                 video = _move_transformer_args(video, cpu_device)
                 audio = _move_transformer_args(audio, cpu_device)
 
-        use_async_prefetch = os.getenv("LTX2_SWAP_ASYNC_PREFETCH", "1") == "1"
+        use_async_prefetch = os.getenv("LTX2_SWAP_ASYNC_PREFETCH", "0") == "1"
         transfer_stream = None
         target_device = gpu_device if gpu_device else torch.device("cuda")
         if use_async_prefetch:

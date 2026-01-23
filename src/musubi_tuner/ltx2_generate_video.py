@@ -13,6 +13,7 @@ from safetensors.torch import load_file
 
 from musubi_tuner.hv_generate_video import setup_parser_compile
 from musubi_tuner.ltx2_train_network import LTX2NetworkTrainer
+from musubi_tuner.ltx_2.env import apply_ltx2_tweaks
 from musubi_tuner.networks import lora_ltx2
 from musubi_tuner.utils.device_utils import clean_memory_on_device
 
@@ -98,9 +99,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--ltx_mode",
         type=str,
-        default="video",
-        choices=["video", "av", "audio"],
-        help="Inference mode (use 'av' for audio+video sampling).",
+        default="auto",
+        choices=["v", "av", "a", "auto"],
+        help="Inference mode: v=video, a=audio-only, av=audio+video, auto=defaults to v.",
     )
     parser.add_argument(
         "--attn_mode",
@@ -202,6 +203,7 @@ def _merge_lora_weights(
 
 def main() -> None:
     args = parse_args()
+    apply_ltx2_tweaks(args)
     args.dit = args.ltx2_checkpoint
     args.vae = args.ltx2_checkpoint
     if args.vae_dtype is None:

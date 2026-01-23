@@ -30,15 +30,15 @@ class LTX2Env:
 
     # Allow FP8 weights to be offloaded to CPU by upcasting to bf16.
     # recommended=True | old SHA=False | current=True
-    fp8_offload_upcast: bool = True
+    fp8_offload_upcast: bool = False
 
     # Keep FP8-offloaded weights in bf16 on GPU after restore (avoid FP8 round-trip).
     # recommended=True | old SHA=False | current=True
-    fp8_offload_restore_bf16: bool = True
+    fp8_offload_restore_bf16: bool = False
 
     # Allow FP8 CPU offload only when blockwise checkpointing is enabled.
     # recommended=False | old SHA=False | current=False
-    blockwise_fp8_offload_upcast: bool = True
+    blockwise_fp8_offload_upcast: bool = False
 
     # Add stochastic noise before restoring FP8 weights (experimental).
     # recommended=False | old SHA=False | current=False

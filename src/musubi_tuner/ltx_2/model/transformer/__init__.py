@@ -6,6 +6,7 @@ from musubi_tuner.ltx_2.model.transformer.model_configurator import (
     LTXV_MODEL_COMFY_RENAMING_WITH_TRANSFORMER_LINEAR_DOWNCAST_MAP,
     UPCAST_DURING_INFERENCE,
     LTXModelConfigurator,
+    LTXAudioOnlyModelConfigurator,
     LTXVideoOnlyModelConfigurator,
     UpcastWithStochasticRounding,
 )
@@ -16,6 +17,7 @@ __all__ = [
     "UPCAST_DURING_INFERENCE",
     "LTXModel",
     "LTXModelConfigurator",
+    "LTXAudioOnlyModelConfigurator",
     "LTXVideoOnlyModelConfigurator",
     "Modality",
     "UpcastWithStochasticRounding",

@@ -84,13 +84,13 @@ def _encode_prompt_text_ltx2(
         autocast_context = nullcontext()
     with torch.no_grad(), autocast_context:
         out = text_encoder(prompt_text, padding_side="left")
-        if ltx_mode == "audio":
-            embed = out.audio_encoding if hasattr(out, "audio_encoding") else out.video_encoding
-        elif audio_video:
-            embed = torch.cat([out.video_encoding, out.audio_encoding], dim=-1)
-        else:
-            embed = out.video_encoding
-        mask = out.attention_mask
+    if ltx_mode == "a":
+        embed = out.audio_encoding if hasattr(out, "audio_encoding") else out.video_encoding
+    elif audio_video:
+        embed = torch.cat([out.video_encoding, out.audio_encoding], dim=-1)
+    else:
+        embed = out.video_encoding
+    mask = out.attention_mask
     return embed.squeeze(0).detach().cpu(), mask.squeeze(0).detach().cpu()
 
 
@@ -174,8 +174,7 @@ def main() -> None:
     args = parser.parse_args()
     apply_ltx2_tweaks(args)
 
-    ltx_mode = getattr(args, "ltx_mode", "video")
-    audio_video = ltx_mode == "av" or getattr(args, "ltx2_audio_video", False)
+    ltx_mode = getattr(args, "ltx_mode", "auto")
 
     device = torch.device(args.device if args.device is not None else ("cuda" if torch.cuda.is_available() else "cpu"))
 
@@ -200,6 +199,41 @@ def main() -> None:
             validation_blueprint.dataset_group
         )
         datasets.extend(validation_dataset_group.datasets)
+
+    if ltx_mode == "auto":
+        import glob
+        from musubi_tuner.dataset.image_video_dataset import ImageDataset, VideoDataset
+        from musubi_tuner.dataset.audio_dataset import AudioDataset
+
+        logger.info("Analyzing datasets for text encoder auto-detection...")
+        has_video = False
+        has_audio = False
+
+        for dataset in datasets:
+            if isinstance(dataset, AudioDataset):
+                has_audio = True
+                continue
+            if isinstance(dataset, (ImageDataset, VideoDataset)):
+                has_video = True
+            if isinstance(dataset, VideoDataset):
+                cache_dir = getattr(dataset, "cache_directory", None)
+                if cache_dir:
+                    audio_caches = glob.glob(os.path.join(cache_dir, "*_ltx2_audio.safetensors"))
+                    if audio_caches:
+                        has_audio = True
+
+        if has_video and has_audio:
+            args.ltx_mode = "av"
+            logger.info("Auto-detection result: Video + Audio detected (ltx_mode=av)")
+        elif has_audio:
+            args.ltx_mode = "a"
+            logger.info("Auto-detection result: Audio-only detected (ltx_mode=a)")
+        else:
+            args.ltx_mode = "v"
+            logger.info("Auto-detection result: Video/Image-only detected (ltx_mode=v)")
+        ltx_mode = args.ltx_mode
+
+    audio_video = ltx_mode == "av" or getattr(args, "ltx2_audio_video", False)
 
     all_cache_files_for_dataset, all_cache_paths_for_dataset = cache_text_encoder_outputs.prepare_cache_files_and_paths(datasets)
 
@@ -351,9 +385,9 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
     parser.add_argument(
         "--ltx_mode",
         type=str,
-        default="video",
-        choices=["video", "av", "audio"],
-        help="Caching modality. Use 'av' to cache audio-video prompt embeddings.",
+        default="auto",
+        choices=["v", "av", "a", "auto"],
+        help="Caching modality: v=video, a=audio-only, av=audio+video, auto=detect from datasets.",
     )
     parser.add_argument(
         "--ltx2_audio_video",

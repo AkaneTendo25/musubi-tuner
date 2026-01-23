@@ -2,6 +2,7 @@
 
 import argparse
 import gc
+import glob
 import os
 import re
 import subprocess
@@ -35,6 +36,45 @@ from musubi_tuner.utils.safetensors_utils import MemoryEfficientSafeOpen
 from musubi_tuner.modules.fp8_optimization_utils import apply_fp8_monkey_patch  
 from musubi_tuner.utils.lora_utils import load_safetensors_with_lora_and_fp8    
 from musubi_tuner.ltx_2.env import apply_ltx2_tweaks
+
+
+def _resolve_auto_ltx_mode(args: argparse.Namespace) -> str:
+    if not getattr(args, "dataset_config", None):
+        raise ValueError("--dataset_config is required for --ltx_mode auto")
+
+    from musubi_tuner.dataset import config_utils
+    from musubi_tuner.dataset.config_utils import BlueprintGenerator, ConfigSanitizer
+    from musubi_tuner.dataset.image_video_dataset import ARCHITECTURE_LTX2, ImageDataset, VideoDataset
+    from musubi_tuner.dataset.audio_dataset import AudioDataset
+
+    user_config = config_utils.load_user_config(args.dataset_config)
+    blueprint = BlueprintGenerator(ConfigSanitizer()).generate(
+        user_config, args, architecture=ARCHITECTURE_LTX2
+    )
+    dataset_group = config_utils.generate_dataset_group_by_blueprint(blueprint.dataset_group)
+    datasets = list(dataset_group.datasets)
+
+    has_video = False
+    has_audio = False
+
+    for dataset in datasets:
+        if isinstance(dataset, AudioDataset):
+            has_audio = True
+            continue
+        if isinstance(dataset, (ImageDataset, VideoDataset)):
+            has_video = True
+        if isinstance(dataset, VideoDataset):
+            cache_dir = getattr(dataset, "cache_directory", None)
+            if cache_dir:
+                audio_caches = glob.glob(os.path.join(cache_dir, "*_ltx2_audio.safetensors"))
+                if audio_caches:
+                    has_audio = True
+
+    if has_video and has_audio:
+        return "av"
+    if has_audio:
+        return "a"
+    return "v"
 
 # LTX-2 latent normalization defaults.
 # These are identity stats (mean=0, std=1). We keep them as a safe fallback and
@@ -164,7 +204,7 @@ def load_ltx2_model(
     load_device: Union[str, torch.device] = "cpu",
     torch_dtype: Optional[torch.dtype] = None,
     attn_mode: str = "torch",
-    audio_video: bool = False,
+    ltx_mode: str = "v",
     fp8_scaled: bool = False,
     fp8_upcast: bool = False,
     fp8_upcast_stochastic: bool = False,
@@ -172,7 +212,7 @@ def load_ltx2_model(
     load_weights_on_cpu: bool = False,
     **_: Any,
 ):
-    """Load LTX-2 (video or audio-video) transformer
+    """Load LTX-2 transformer for the requested modality
 
     Args:
         model_path: Path to safetensors model weights
@@ -180,7 +220,7 @@ def load_ltx2_model(
         load_device: Device to load weights into
         torch_dtype: Data type for model parameters
         attn_mode: Attention implementation (torch, flash, flash3, xformers)
-        audio_video: If True, load LTXAV model; if False, load LTXV model
+        ltx_mode: "v", "av", or "a" to select video-only, audio-video, or audio-only model
         **_: Additional arguments (ignored)
 
     Returns:
@@ -204,6 +244,7 @@ def load_ltx2_model(
 
     from musubi_tuner.ltx_2.loader.sft_loader import SafetensorsModelStateDictLoader
     from musubi_tuner.ltx_2.model.transformer.model_configurator import (
+        LTXAudioOnlyModelConfigurator,
         LTXModelConfigurator,
         LTXVideoOnlyModelConfigurator,
         LTXV_MODEL_COMFY_RENAMING_MAP,
@@ -231,7 +272,14 @@ def load_ltx2_model(
     if attn_type is not None:
         config.setdefault("transformer", {})
         config["transformer"]["attention_type"] = attn_type
-    configurator = LTXModelConfigurator if audio_video else LTXVideoOnlyModelConfigurator
+    if ltx_mode == "av":
+        configurator = LTXModelConfigurator
+    elif ltx_mode == "a":
+        configurator = LTXAudioOnlyModelConfigurator
+    elif ltx_mode == "v":
+        configurator = LTXVideoOnlyModelConfigurator
+    else:
+        raise ValueError(f"Invalid ltx_mode: {ltx_mode}")
 
     with torch.device("meta"):
         base_model = configurator.from_config(config)
@@ -303,6 +351,7 @@ def load_ltx2_model(
 
 
 class LTX2NetworkTrainer(NetworkTrainer):
+    supports_split_av_passes: bool = True
     """Trainer for LTX-2 models with LoRA support"""
 
     def __init__(self) -> None:
@@ -321,7 +370,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
         self._flow_target: str = "noise"  # LTX-2 predicts noise
         self._num_timesteps: int = 1000
         self._audio_video: bool = False
-        self._ltx_mode: str = "video"
+        self._ltx_mode: str = "v"
         self.default_guidance_scale = 3.0
         self._audio_preview_config: Optional[Dict[str, int | float]] = None
 
@@ -620,16 +669,22 @@ class LTX2NetworkTrainer(NetworkTrainer):
 
         args.dit_dtype = model_utils.dtype_to_str(self.dit_dtype)
 
-        ltx_mode = getattr(args, "ltx_mode", "video")
-        if ltx_mode not in {"video", "av", "audio"}:
+        ltx_mode = getattr(args, "ltx_mode", "auto")
+        if ltx_mode == "auto":
+            ltx_mode = _resolve_auto_ltx_mode(args)
+            args.ltx_mode = ltx_mode
+        if ltx_mode not in {"v", "av", "a"}:
             raise ValueError(f"Invalid ltx_mode: {ltx_mode}")
         self._ltx_mode = ltx_mode
-        self._audio_video = self._ltx_mode in {"av", "audio"}
+        self._audio_video = self._ltx_mode in {"av", "a"}
         self.default_guidance_scale = 1.0
 
         args.weighting_scheme = "none"
 
         apply_ltx2_tweaks(args)
+
+        if getattr(args, "separate_audio_buckets", None) is None:
+            args.separate_audio_buckets = self._audio_video
 
     @property
     def i2v_training(self) -> bool:
@@ -709,7 +764,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
             load_device=loading_device,
             torch_dtype=torch_dtype_to_use,
             attn_mode=attn_mode,
-            audio_video=self._audio_video,
+            ltx_mode=self._ltx_mode,
             fp8_scaled=bool(getattr(args, "fp8_scaled", False)),
             fp8_upcast=bool(getattr(args, "fp8_upcast", False)),
             fp8_upcast_stochastic=bool(getattr(args, "fp8_upcast_stochastic", False)),
@@ -1114,6 +1169,9 @@ class LTX2NetworkTrainer(NetworkTrainer):
         noisy_model_input: torch.Tensor,
         timesteps: torch.Tensor,
         network_dtype: torch.dtype,
+        *,
+        force_video: Optional[bool] = None,
+        force_audio: Optional[bool] = None,
     ) -> Tuple[object, torch.Tensor]:
         """Forward pass through LTX-2 (video or audio-video) model
 
@@ -1163,6 +1221,13 @@ class LTX2NetworkTrainer(NetworkTrainer):
         if not isinstance(batch, dict):
             raise TypeError(f"Expected batch to be a dict, got: {type(batch)}")
 
+        audio_only_override = bool(force_audio) and force_video is False
+        video_only_override = bool(force_video) and force_audio is False
+        if audio_only_override and video_only_override:
+            raise ValueError("force_video and force_audio cannot both be True")
+
+        audio_only_mode = self._ltx_mode == "a" or audio_only_override
+
         if latents is None or not isinstance(latents, torch.Tensor):
             raise TypeError(f"Expected latents to be a torch.Tensor, got: {type(latents)}")
         if latents.dim() != 5:
@@ -1185,7 +1250,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
         if conditions is not None:
             if not isinstance(conditions, dict):
                 raise TypeError(f"Expected batch['conditions'] to be a dict, got: {type(conditions)}")
-            if self._ltx_mode == "audio":
+            if audio_only_mode:
                 text_embeds = conditions.get("audio_prompt_embeds")
                 if text_embeds is None:
                     text_embeds = conditions.get("prompt_embeds")
@@ -1205,7 +1270,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
         else:
             text_embeds = batch.get("text")
             text_mask = batch.get("text_mask")
-            if self._ltx_mode == "audio" and isinstance(text_embeds, torch.Tensor) and text_embeds.shape[-1] % 2 == 0:
+            if audio_only_mode and isinstance(text_embeds, torch.Tensor) and text_embeds.shape[-1] % 2 == 0:
                 text_embeds = text_embeds[..., text_embeds.shape[-1] // 2 :]
 
         if text_embeds is None:
@@ -1277,7 +1342,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
             ref_latents = ref_latents.get("latents")
 
         if ref_latents is not None:
-            if self._audio_video or self._ltx_mode != "video":
+            if self._audio_video or self._ltx_mode != "v":
                 raise ValueError("Reference latent conditioning is only supported for video-only LTX-2 training")
             if not isinstance(ref_latents, torch.Tensor):
                 raise TypeError(f"Expected ref_latents to be a torch.Tensor, got: {type(ref_latents)}")
@@ -1294,12 +1359,26 @@ class LTX2NetworkTrainer(NetworkTrainer):
                     f"Spatial mismatch: latents HxW={latents.shape[3]}x{latents.shape[4]} vs ref_latents HxW={ref_latents.shape[3]}x{ref_latents.shape[4]}"     
                 )
 
-        if self._ltx_mode == "audio":
+        if audio_only_mode:
             audio_latents = batch.get("audio_latents")
             if isinstance(audio_latents, dict):
                 audio_latents = audio_latents.get("latents")
             if audio_latents is None:
-                raise ValueError("audio_latents are required for --ltx_mode audio")
+                if self._ltx_mode == "a":
+                    raise ValueError("audio_latents are required for --ltx_mode a")
+                dummy_video = torch.zeros(
+                    (latents.shape[0], latents.shape[1], 1, 1, 1),
+                    device=accelerator.device,
+                    dtype=network_dtype,
+                )
+                out_audio: Dict[str, Any] = {
+                    "video_pred": dummy_video,
+                    "video_target": dummy_video,
+                    "video_loss_weight": 0.0,
+                    "audio_loss_weight": 0.0,
+                    "audio_enabled_for_batch": False,
+                }
+                return out_audio, torch.tensor(0.0, device=accelerator.device)
             if not isinstance(audio_latents, torch.Tensor):
                 raise TypeError(f"Expected audio_latents to be a torch.Tensor, got: {type(audio_latents)}")
             if audio_latents.dim() != 4:
@@ -1324,13 +1403,15 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 self._ensure_fp8_buffers_on_device(transformer)
             with accelerator.autocast():
                 model_pred = transformer(
-                    [dummy_video, noisy_audio],
+                    [None, noisy_audio],
                     timestep=model_timesteps,
                     context=text_embeds,
                     attention_mask=text_mask,
                     frame_rate=frame_rate,
                     transformer_options={"patches_replace": {}},
                     audio_only=True,
+                    video_enabled=False,
+                    audio_enabled=True,
                 )
 
             video_pred = model_pred
@@ -1342,11 +1423,14 @@ class LTX2NetworkTrainer(NetworkTrainer):
             if audio_pred is None:
                 raise ValueError("Audio-only mode expected an audio prediction but got None")
 
+            if video_pred is None:
+                video_pred = torch.zeros_like(dummy_video)
             video_target = torch.zeros_like(video_pred)
             out_audio: Dict[str, Any] = {
                 "video_pred": video_pred,
                 "video_target": video_target,
                 "video_loss_weight": 0.0,
+                "audio_enabled_for_batch": True,
             }
 
             audio_target = audio_noise - audio_latents
@@ -1515,6 +1599,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 "video_target": target_velocity,
                 "video_loss_mask": target_loss_mask,
                 "video_loss_weight": float(getattr(args, "video_loss_weight", 1.0)),
+                "audio_enabled_for_batch": False,
             }
             if out_v2v["video_loss_weight"] < 0.0:
                 raise ValueError(f"video_loss_weight must be >= 0. Got: {out_v2v['video_loss_weight']}")
@@ -1530,6 +1615,8 @@ class LTX2NetworkTrainer(NetworkTrainer):
             audio_latents = batch.get("audio_latents")
             if isinstance(audio_latents, dict):
                 audio_latents = audio_latents.get("latents")
+            if video_only_override:
+                audio_latents = None
 
             if audio_latents is None:
                 if not self._warned_missing_audio:
@@ -1662,6 +1749,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
             "video_target": video_target,
             "video_loss_mask": video_loss_mask,
             "video_loss_weight": float(getattr(args, "video_loss_weight", 1.0)),
+            "audio_enabled_for_batch": bool(audio_enabled_for_batch),
         }
 
         if out["video_loss_weight"] < 0.0:
@@ -1921,7 +2009,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         with accelerator.autocast(), torch.no_grad():
             out = self._text_encoder(prompt_text, padding_side="left")
-            if self._ltx_mode == "audio":
+            if self._ltx_mode == "a":
                 embed = out.audio_encoding if hasattr(out, "audio_encoding") else out.video_encoding
             elif self._audio_video:
                 embed = torch.cat([out.video_encoding, out.audio_encoding], dim=-1)
@@ -2177,10 +2265,10 @@ class LTX2NetworkTrainer(NetworkTrainer):
         disable_audio_preview = bool(getattr(args, "sample_disable_audio", False))
         use_audio_subprocess = False
         audio_only_preview = bool(getattr(args, "sample_audio_only", False))
-        if audio_only_preview and getattr(args, "ltx_mode", "video") not in {"av", "audio"}:
-            raise ValueError("--sample_audio_only requires --ltx_mode av or audio")
+        if audio_only_preview and getattr(args, "ltx_mode", "v") not in {"av", "a"}:
+            raise ValueError("--sample_audio_only requires --ltx_mode av or a")
         enable_audio_preview = (self._audio_video or audio_only_preview) and not disable_audio_preview
-        if enable_audio_preview and getattr(args, "ltx_mode", "video") in {"av", "audio"}:
+        if enable_audio_preview and getattr(args, "ltx_mode", "v") in {"av", "a"}:
             # Align with LTX-v2 audio decode path (bf16 by default).
             audio_dtype = torch.bfloat16 if args.vae_dtype is None else model_utils.str_to_dtype(args.vae_dtype)
             audio_device = accelerator.device
@@ -2762,9 +2850,14 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
     parser.add_argument(
         "--ltx_mode",
         type=str,
-        default="video",
-        choices=["video", "av", "audio"],
-        help="Training modality.",
+        default="auto",
+        choices=["v", "av", "a", "auto"],
+        help="Training modality: v=video, a=audio-only, av=audio+video, auto=detect from datasets.",
+    )
+    parser.add_argument(
+        "--split_av_passes",
+        action="store_true",
+        help="When using --ltx_mode av, run separate video-only and audio-only passes per batch (lower peak activations, slower).",
     )
     parser.add_argument(
         "--lora_target_preset",
@@ -2968,7 +3061,7 @@ def main() -> None:
         args.vae_dtype = "bfloat16"
 
     # Inject lora_target_preset into network_args (LTX-2 specific)
-    if getattr(args, "ltx_mode", "video") == "audio" and not explicit_lora_preset:
+    if getattr(args, "ltx_mode", "v") == "a" and not explicit_lora_preset:
         if args.network_args is None:
             args.network_args = []
         if not any(arg.startswith("include_patterns=") for arg in args.network_args):
