@@ -204,6 +204,11 @@ def load_ltx2_model(
     torch_dtype: Optional[torch.dtype] = None,
     attn_mode: str = "torch",
     ltx_mode: str = "v",
+    split_attn_target: Optional[str] = None,
+    split_attn_mode: Optional[str] = None,
+    split_attn_chunk_size: int = 0,
+    ffn_chunk_target: Optional[str] = None,
+    ffn_chunk_size: int = 0,
     fp8_base: bool = False,
     fp8_scaled: bool = False,
     fp8_upcast: bool = False,
@@ -279,6 +284,21 @@ def load_ltx2_model(
     if attn_type is not None:
         config.setdefault("transformer", {})
         config["transformer"]["attention_type"] = attn_type
+    if split_attn_target is not None:
+        config.setdefault("transformer", {})
+        config["transformer"]["split_attn_target"] = split_attn_target
+    if split_attn_mode is not None:
+        config.setdefault("transformer", {})
+        config["transformer"]["split_attn_mode"] = split_attn_mode
+    if split_attn_chunk_size is not None:
+        config.setdefault("transformer", {})
+        config["transformer"]["split_attn_chunk_size"] = int(split_attn_chunk_size)
+    if ffn_chunk_target is not None:
+        config.setdefault("transformer", {})
+        config["transformer"]["ffn_chunk_target"] = ffn_chunk_target
+    if ffn_chunk_size is not None:
+        config.setdefault("transformer", {})
+        config["transformer"]["ffn_chunk_size"] = int(ffn_chunk_size)
     if ltx_mode == "av":
         configurator = LTXModelConfigurator
     elif ltx_mode == "a":
@@ -761,6 +781,11 @@ class LTX2NetworkTrainer(NetworkTrainer):
             torch_dtype=torch_dtype_to_use,
             attn_mode=attn_mode,
             ltx_mode=self._ltx_mode,
+            split_attn_target=getattr(args, "split_attn_target", None),
+            split_attn_mode=getattr(args, "split_attn_mode", None),
+            split_attn_chunk_size=int(getattr(args, "split_attn_chunk_size", 0) or 0),
+            ffn_chunk_target=getattr(args, "ffn_chunk_target", None),
+            ffn_chunk_size=int(getattr(args, "ffn_chunk_size", 0) or 0),
             fp8_base=bool(getattr(args, "fp8_base", False)),
             fp8_scaled=bool(getattr(args, "fp8_scaled", False)),
             fp8_upcast=bool(getattr(args, "fp8_upcast", False)),
@@ -2855,6 +2880,42 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         "--split_av_passes",
         action="store_true",
         help="When using --ltx_mode av, run separate video-only and audio-only passes per batch (lower peak activations, slower).",
+    )
+    parser.add_argument(
+        "--split_attn_target",
+        type=str,
+        default=None,
+        choices=["none", "all", "self", "cross", "text_cross", "av_cross", "video", "audio"],
+        help=(
+            "Enable split attention for selected modules. "
+            "Targets: none/all/self/cross/text_cross/av_cross/video/audio."
+        ),
+    )
+    parser.add_argument(
+        "--split_attn_mode",
+        type=str,
+        default=None,
+        choices=["batch", "query"],
+        help="Split attention mode: batch (split by batch) or query (split by query length).",
+    )
+    parser.add_argument(
+        "--split_attn_chunk_size",
+        type=int,
+        default=0,
+        help="Chunk size for split_attn_mode=query. 0 uses the internal default (1024).",
+    )
+    parser.add_argument(
+        "--ffn_chunk_target",
+        type=str,
+        default=None,
+        choices=["none", "all", "video", "audio"],
+        help="Enable FFN chunking for selected modules. Targets: none/all/video/audio.",
+    )
+    parser.add_argument(
+        "--ffn_chunk_size",
+        type=int,
+        default=0,
+        help="Chunk size for FFN chunking. 0 disables chunking.",
     )
     parser.add_argument(
         "--lora_target_preset",
