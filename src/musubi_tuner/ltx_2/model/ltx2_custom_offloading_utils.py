@@ -3,10 +3,13 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 import gc
 import time
+import os
 from typing import Optional
 import logging
 import torch
 import torch.nn as nn
+
+logger = logging.getLogger(__name__)
 
 
 # Keep these functions here for portability, and private to avoid confusion with the ones in device_utils.py
@@ -63,6 +66,7 @@ def swap_weight_devices_no_cuda(device: torch.device, layer_to_cpu: nn.Module, l
 _pinned_buffer_cache = {}
 _LOGGED_FP8_UPCAST = False
 _ALLOW_FP8_OFFLOAD_UPCAST = True
+_ALLOW_FP8_CPU_OFFLOAD = False
 _FP8_OFFLOAD_RESTORE_BF16 = True
 _FP8_OFFLOAD_RESTORE_STOCHASTIC = False
 _FP8_ORIG_DTYPE = {}
@@ -70,6 +74,25 @@ _FP8_CPU_CACHE = {}
 _FP8_DTYPES = tuple(
     dt for dt in (getattr(torch, "float8_e4m3fn", None), getattr(torch, "float8_e5m2", None)) if dt is not None
 )
+
+
+def register_fp8_param_dtypes(module: nn.Module) -> None:
+    """Register FP8 original dtypes for modules with FP8 scale weights.
+
+    Needed if some step cast FP8 weights to bf16 before we recorded their dtype.
+    """
+    for submodule in module.modules():
+        if not submodule.__class__.__name__.endswith("Linear"):
+            continue
+        scale_weight = getattr(submodule, "scale_weight", None)
+        if not isinstance(scale_weight, torch.Tensor):
+            continue
+        for attr in ("weight", "bias"):
+            p = getattr(submodule, attr, None)
+            if p is None or not isinstance(p, (torch.Tensor, torch.nn.Parameter)):
+                continue
+            if id(p) not in _FP8_ORIG_DTYPE:
+                _FP8_ORIG_DTYPE[id(p)] = getattr(torch, "float8_e4m3fn", p.dtype)
 
 
 def _is_fp8_dtype(dtype: torch.dtype) -> bool:
@@ -80,6 +103,11 @@ def set_fp8_offload_upcast(enable: bool) -> None:
     """Allow FP8 weights to be offloaded to CPU by upcasting to bf16."""
     global _ALLOW_FP8_OFFLOAD_UPCAST
     _ALLOW_FP8_OFFLOAD_UPCAST = bool(enable)
+
+def set_fp8_offload_allow_fp8_cpu(enable: bool) -> None:
+    """Allow FP8 weights to be offloaded to CPU without upcasting."""
+    global _ALLOW_FP8_CPU_OFFLOAD
+    _ALLOW_FP8_CPU_OFFLOAD = bool(enable)
 
 
 def set_fp8_offload_restore_bf16(enable: bool) -> None:
@@ -102,6 +130,7 @@ def weighs_to_device(layer: nn.Module, device: torch.device, skip_trainable: boo
         skip_trainable: If True AND target is CPU, skip parameters with requires_grad=True
         use_pinned: If True and target is CPU, use cached pinned memory.
     """
+    global _LOGGED_FP8_UPCAST
     non_blocking = device.type != "cpu"
     # Only skip trainable parameters when moving TO CPU (offloading), not when loading TO GPU
     should_skip_trainable = skip_trainable and device.type == "cpu"
@@ -132,11 +161,29 @@ def weighs_to_device(layer: nn.Module, device: torch.device, skip_trainable: boo
                         else:
                             p.data = p.data.to(device, dtype=target_dtype, non_blocking=non_blocking)
                         continue
+                    if device.type != "cpu" and id(p) not in _FP8_ORIG_DTYPE:
+                        scale_weight = getattr(module, "scale_weight", None)
+                        if isinstance(scale_weight, torch.Tensor) and _is_fp8_dtype(getattr(torch, "float8_e4m3fn", torch.float16)):
+                            # Fallback: fp8 scale_weight exists but dtype tracking missing; cast back to fp8.
+                            try:
+                                p.data = p.data.to(device=device, dtype=torch.float8_e4m3fn, non_blocking=non_blocking)
+                                continue
+                            except Exception:
+                                pass
                     if device.type == "cpu" and _is_fp8_dtype(p.dtype):
                         if not _ALLOW_FP8_OFFLOAD_UPCAST:
+                            if _ALLOW_FP8_CPU_OFFLOAD:
+                                try:
+                                    p.data = p.data.to(device, non_blocking=non_blocking)
+                                except Exception as exc:
+                                    if not _LOGGED_FP8_UPCAST:
+                                        logging.getLogger(__name__).warning(
+                                            "FP8 CPU offload failed (%s). Keep on GPU or enable FP8 offload upcast.",
+                                            exc,
+                                        )
+                                        _LOGGED_FP8_UPCAST = True
                             continue
                         # Explicit opt-in: upcast FP8 to bf16 on CPU, then restore FP8 on GPU.
-                        global _LOGGED_FP8_UPCAST
                         if not _LOGGED_FP8_UPCAST:
                             logging.getLogger(__name__).warning(
                                 "FP8 offload upcast enabled: FP8 weights are cast to bf16 on CPU."
@@ -282,6 +329,7 @@ class Offloader:
 
         self.debug = debug
         self.debug_block_count = 0
+        self._diag_blocks = {}
 
         self.thread_pool = ThreadPoolExecutor(max_workers=1)
         self.futures = {}
@@ -563,6 +611,21 @@ class Offloader:
         return sync_event
 
     def _submit_move_blocks(self, blocks, block_idx_to_cpu, block_idx_to_cuda):
+        diag_enabled = os.getenv("LTX2_SWAP_DIAG", "0") == "1"
+        verbose_enabled = os.getenv("LTX2_SWAP_DIAG_VERBOSE", "0") == "1"
+
+        def _module_bytes(module: nn.Module) -> tuple[int, int]:
+            cuda_bytes = 0
+            cpu_bytes = 0
+            for tensor in list(module.parameters()) + list(module.buffers()):
+                if isinstance(tensor, torch.Tensor):
+                    size = tensor.numel() * tensor.element_size()
+                    if tensor.device.type == "cuda":
+                        cuda_bytes += size
+                    elif tensor.device.type == "cpu":
+                        cpu_bytes += size
+            return cuda_bytes, cpu_bytes
+
         def move_blocks(bidx_to_cpu, block_to_cpu, bidx_to_cuda, block_to_cuda):
             if self.debug:
                 start_time = time.perf_counter()
@@ -584,6 +647,20 @@ class Offloader:
         block_to_cpu = blocks[block_idx_to_cpu]
         block_to_cuda = blocks[block_idx_to_cuda]
 
+        if diag_enabled and verbose_enabled:
+            cpu_cuda, cpu_cpu = _module_bytes(block_to_cpu)
+            cuda_cuda, cuda_cpu = _module_bytes(block_to_cuda)
+            logger.info(
+                "LTX-2 swap diag [pre-submit]: block_to_cpu=%s cuda=%.2fMB cpu=%.2fMB | block_to_cuda=%s cuda=%.2fMB cpu=%.2fMB",
+                block_idx_to_cpu,
+                cpu_cuda / (1024 ** 2),
+                cpu_cpu / (1024 ** 2),
+                block_idx_to_cuda,
+                cuda_cuda / (1024 ** 2),
+                cuda_cpu / (1024 ** 2),
+            )
+            self._diag_blocks[block_idx_to_cuda] = block_to_cuda
+
         self.futures[block_idx_to_cuda] = self.thread_pool.submit(
             move_blocks, block_idx_to_cpu, block_to_cpu, block_idx_to_cuda, block_to_cuda
         )
@@ -604,6 +681,25 @@ class Offloader:
         if self.cuda_available and sync_event is not None:
             # this does not wait CPU side, so the log below should be immediate when pinned memory is used
             torch.cuda.current_stream().wait_event(sync_event)
+
+        if os.getenv("LTX2_SWAP_DIAG", "0") == "1" and os.getenv("LTX2_SWAP_DIAG_VERBOSE", "0") == "1":
+            block_to_cuda = self._diag_blocks.pop(block_idx, None)
+            if block_to_cuda is not None:
+                cuda_bytes = 0
+                cpu_bytes = 0
+                for tensor in list(block_to_cuda.parameters()) + list(block_to_cuda.buffers()):
+                    if isinstance(tensor, torch.Tensor):
+                        size = tensor.numel() * tensor.element_size()
+                        if tensor.device.type == "cuda":
+                            cuda_bytes += size
+                        elif tensor.device.type == "cpu":
+                            cpu_bytes += size
+                logger.info(
+                    "LTX-2 swap diag [post-wait]: block_idx=%s cuda=%.2fMB cpu=%.2fMB",
+                    block_idx,
+                    cuda_bytes / (1024 ** 2),
+                    cpu_bytes / (1024 ** 2),
+                )
 
         if self.debug:
             print(f"[{self.block_type}] Waited for block {block_idx}: {time.perf_counter() - start_time:.2f}s")

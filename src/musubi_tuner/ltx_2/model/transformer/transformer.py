@@ -4,15 +4,15 @@ import logging
 import os
 
 import torch
+import torch.nn as nn
 import torch.utils.checkpoint as checkpoint
 
 from musubi_tuner.ltx_2.utils import create_cpu_offloading_wrapper
-from musubi_tuner.ltx_2.model.ltx2_custom_offloading_utils import weighs_to_device
+from musubi_tuner.modules.custom_offloading_utils import weighs_to_device
 from musubi_tuner.ltx_2.model.transformer.block_level_checkpointing import block_checkpoint
 from musubi_tuner.ltx_2.guidance.perturbations import BatchedPerturbationConfig, PerturbationType
 from musubi_tuner.ltx_2.model.transformer.adaln import AdaLayerNormSingle
 from musubi_tuner.ltx_2.model.transformer.attention import Attention, AttentionCallable, AttentionFunction
-from musubi_tuner.ltx_2.model.transformer.fp8_device_utils import ensure_fp8_modules_on_device
 from musubi_tuner.ltx_2.model.transformer.feed_forward import FeedForward
 from musubi_tuner.ltx_2.model.transformer.rope import LTXRopeType
 from musubi_tuner.ltx_2.model.transformer.transformer_args import TransformerArgs
@@ -78,6 +78,40 @@ def _move_non_linear_params(module: torch.nn.Module, device: torch.device, skip_
                 buf.data = buf.data.to(device, non_blocking=non_blocking)
 
 
+def _should_split_attn(split_target: str | None, role: str) -> bool:
+    target = (split_target or "none").lower()
+    if target in {"none", "off", "false", "0"}:
+        return False
+    if target == "all":
+        return True
+    if target == "self":
+        return role in {"video_self", "audio_self"}
+    if target == "cross":
+        return role in {"video_text_cross", "audio_text_cross", "av_cross_a2v", "av_cross_v2a"}
+    if target == "text_cross":
+        return role in {"video_text_cross", "audio_text_cross"}
+    if target == "av_cross":
+        return role in {"av_cross_a2v", "av_cross_v2a"}
+    if target == "video":
+        return role in {"video_self", "video_text_cross", "av_cross_a2v"}
+    if target == "audio":
+        return role in {"audio_self", "audio_text_cross", "av_cross_v2a"}
+    return False
+
+
+def _ffn_chunk_size(ffn_target: str | None, role: str, chunk_size: int) -> int:
+    target = (ffn_target or "none").lower()
+    if chunk_size <= 0 or target in {"none", "off", "false", "0"}:
+        return 0
+    if target == "all":
+        return chunk_size
+    if target == "video":
+        return chunk_size if role == "video" else 0
+    if target == "audio":
+        return chunk_size if role == "audio" else 0
+    return 0
+
+
 class BasicAVTransformerBlock(torch.nn.Module):
     def __init__(
         self,
@@ -87,11 +121,19 @@ class BasicAVTransformerBlock(torch.nn.Module):
         rope_type: LTXRopeType = LTXRopeType.INTERLEAVED,
         norm_eps: float = 1e-6,
         attention_function: AttentionFunction | AttentionCallable = AttentionFunction.DEFAULT,
+        split_attn_target: str | None = None,
+        split_attn_mode: str | None = None,
+        split_attn_chunk_size: int = 0,
+        ffn_chunk_target: str | None = None,
+        ffn_chunk_size: int = 0,
     ):
         super().__init__()
 
         self.idx = idx
         if video is not None:
+            video_self_split = split_attn_mode if _should_split_attn(split_attn_target, "video_self") else None
+            video_cross_split = split_attn_mode if _should_split_attn(split_attn_target, "video_text_cross") else None
+            video_ffn_chunk = _ffn_chunk_size(ffn_chunk_target, "video", ffn_chunk_size)
             self.attn1 = Attention(
                 query_dim=video.dim,
                 heads=video.heads,
@@ -100,6 +142,8 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 rope_type=rope_type,
                 norm_eps=norm_eps,
                 attention_function=attention_function,
+                split_attn_mode=video_self_split,
+                split_attn_chunk_size=split_attn_chunk_size,
             )
             self.attn2 = Attention(
                 query_dim=video.dim,
@@ -109,11 +153,16 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 rope_type=rope_type,
                 norm_eps=norm_eps,
                 attention_function=attention_function,
+                split_attn_mode=video_cross_split,
+                split_attn_chunk_size=split_attn_chunk_size,
             )
-            self.ff = FeedForward(video.dim, dim_out=video.dim)
+            self.ff = FeedForward(video.dim, dim_out=video.dim, chunk_size=video_ffn_chunk)
             self.scale_shift_table = torch.nn.Parameter(torch.empty(6, video.dim))
 
         if audio is not None:
+            audio_self_split = split_attn_mode if _should_split_attn(split_attn_target, "audio_self") else None
+            audio_cross_split = split_attn_mode if _should_split_attn(split_attn_target, "audio_text_cross") else None
+            audio_ffn_chunk = _ffn_chunk_size(ffn_chunk_target, "audio", ffn_chunk_size)
             self.audio_attn1 = Attention(
                 query_dim=audio.dim,
                 heads=audio.heads,
@@ -122,6 +171,8 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 rope_type=rope_type,
                 norm_eps=norm_eps,
                 attention_function=attention_function,
+                split_attn_mode=audio_self_split,
+                split_attn_chunk_size=split_attn_chunk_size,
             )
             self.audio_attn2 = Attention(
                 query_dim=audio.dim,
@@ -131,11 +182,15 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 rope_type=rope_type,
                 norm_eps=norm_eps,
                 attention_function=attention_function,
+                split_attn_mode=audio_cross_split,
+                split_attn_chunk_size=split_attn_chunk_size,
             )
-            self.audio_ff = FeedForward(audio.dim, dim_out=audio.dim)
+            self.audio_ff = FeedForward(audio.dim, dim_out=audio.dim, chunk_size=audio_ffn_chunk)
             self.audio_scale_shift_table = torch.nn.Parameter(torch.empty(6, audio.dim))
 
         if audio is not None and video is not None:
+            a2v_split = split_attn_mode if _should_split_attn(split_attn_target, "av_cross_a2v") else None
+            v2a_split = split_attn_mode if _should_split_attn(split_attn_target, "av_cross_v2a") else None
             # Q: Video, K,V: Audio
             self.audio_to_video_attn = Attention(
                 query_dim=video.dim,
@@ -145,6 +200,8 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 rope_type=rope_type,
                 norm_eps=norm_eps,
                 attention_function=attention_function,
+                split_attn_mode=a2v_split,
+                split_attn_chunk_size=split_attn_chunk_size,
             )
 
             # Q: Audio, K,V: Video
@@ -156,6 +213,8 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 rope_type=rope_type,
                 norm_eps=norm_eps,
                 attention_function=attention_function,
+                split_attn_mode=v2a_split,
+                split_attn_chunk_size=split_attn_chunk_size,
             )
 
             self.scale_shift_table_a2v_ca_audio = torch.nn.Parameter(torch.empty(5, audio.dim))
@@ -252,94 +311,111 @@ class BasicAVTransformerBlock(torch.nn.Module):
         perturbations: BatchedPerturbationConfig | None = None,
     ) -> tuple[TransformerArgs | None, TransformerArgs | None]:
         if self.training and self.gradient_checkpointing:
-            # Define load and offload functions for this block (proxies to class methods)
-            load_weights = self._load_weights
-            offload_weights = self._offload_weights
-
-            # Prepare arguments for checkpointing (both standard and block-level need flattened tensors)
-            video_vals, video_none = _unpack_transformer_args(video)
-            audio_vals, audio_none = _unpack_transformer_args(audio)
-            vid_len = len(video_vals)
-
-            def checkpoint_wrapper(*inputs):
-                v_vals = list(inputs[:vid_len])
-                a_vals = list(inputs[vid_len:])
-                v_args = _reconstruct_transformer_args(v_vals, video_none)
-                a_args = _reconstruct_transformer_args(a_vals, audio_none)
-                return self._forward(v_args, a_args, perturbations)
-
-            flat_inputs = tuple(video_vals + audio_vals)
-
-            if self.weight_cpu_offloading or self.activation_cpu_offloading:
-                # Determine offloading hooks based on configuration
-                load_fn = load_weights if self.weight_cpu_offloading else None
-                offload_fn = offload_weights if self.weight_cpu_offloading else None
-
-                # Use custom block checkpointing
-                # With our updated block_checkpoint, this will:
-                # 1. Offload all tensor inputs in flat_inputs to CPU
-                # 2. Re-load them to GPU during backward
-                # 3. Handle weight offloading hooks if provided
-                # 4. Return TENSORS (because autograd strips objects)
-                
-                outputs = block_checkpoint(
-                    checkpoint_wrapper,
-                    *flat_inputs,
-                    block=self,
-                    load_fn=load_fn,
-                    offload_fn=offload_fn,
-                )
-                
-                # Reconstruct TransformerArgs from returned tensors
-                # block_checkpoint/autograd returns a tuple of tensors.
-                # output structure corresponds to what checkpoint_wrapper returns.
-                # wrapper returns self._forward -> (video_out, audio_out)
-                # each is TransformerArgs which has .x tensor.
-                # So outputs will correspond to (video_out.x, audio_out.x) 
-                
-                # Note: BlockCheckpointFunction logic flattens outputs. 
-                # If _forward returns (v, a), and v.x is tensor, a.x is tensor/None...
-                # We need to ensure we map them back correctly.
-                
-                # Let's peek at expected returns of _forward: tuple[TransformerArgs|None, TransformerArgs|None]
-                # If audio is None, we get (v, None).
-                
-                # Check if outputs are already TransformerArgs (No-Grad path returns objects directly)
-                is_obj = False
-                if len(outputs) > 0 and isinstance(outputs[0], TransformerArgs):
-                    is_obj = True
-                elif len(outputs) > 1 and isinstance(outputs[1], TransformerArgs):
-                    is_obj = True
-                
-                if is_obj:
-                    # In no-grad mode, block_checkpoint returns the objects directly
-                    return outputs
-
-                # Re-wrapping logic for Tensors (Grad path):
-                res_v_x = outputs[0] if len(outputs) > 0 else None
-                res_a_x = outputs[1] if len(outputs) > 1 else None
-                
-                out_video = None
-                if video is not None:
-                     # Use dataclasses.replace to create new object with updated x
-                     if isinstance(res_v_x, torch.Tensor):
-                         out_video = replace(video, x=res_v_x)
-                     else:
-                         out_video = video
-                
-                out_audio = None
-                if audio is not None:
-                     if res_a_x is not None and isinstance(res_a_x, torch.Tensor):
-                         out_audio = replace(audio, x=res_a_x)
-                     else:
-                         out_audio = audio
-                      
-                return out_video, out_audio
-            else:
-                # Standard gradient checkpointing
-                return checkpoint.checkpoint(checkpoint_wrapper, *flat_inputs, use_reentrant=False, determinism_check="none")
-        
+            if self.weight_cpu_offloading:
+                return self._block_checkpoint_forward(video, audio, perturbations)
+            return self._checkpoint_forward(video, audio, perturbations)
         return self._forward(video, audio, perturbations)
+
+    def _checkpoint_forward(
+        self,
+        video: TransformerArgs | None,
+        audio: TransformerArgs | None,
+        perturbations: BatchedPerturbationConfig | None = None,
+    ) -> tuple[TransformerArgs | None, TransformerArgs | None]:
+        video_vals, video_none = _unpack_transformer_args(video)
+        audio_vals, audio_none = _unpack_transformer_args(audio)
+        vid_len = len(video_vals)
+
+        def checkpoint_wrapper(*inputs):
+            swap_wait_fn = getattr(self, "swap_wait_fn", None)
+            if callable(swap_wait_fn):
+                swap_wait_fn()
+            v_vals = list(inputs[:vid_len])
+            a_vals = list(inputs[vid_len:])
+            v_args = _reconstruct_transformer_args(v_vals, video_none)
+            a_args = _reconstruct_transformer_args(a_vals, audio_none)
+            return self._forward(v_args, a_args, perturbations)
+
+        flat_inputs = tuple(video_vals + audio_vals)
+        forward_fn = checkpoint_wrapper
+        if self.activation_cpu_offloading:
+            target_device = None
+            for t in flat_inputs:
+                if isinstance(t, torch.Tensor):
+                    target_device = t.device
+                    break
+            if target_device is not None:
+                forward_fn = create_cpu_offloading_wrapper(forward_fn, target_device)
+        return checkpoint.checkpoint(forward_fn, *flat_inputs, use_reentrant=False, determinism_check="none")
+
+    def _block_checkpoint_forward(
+        self,
+        video: TransformerArgs | None,
+        audio: TransformerArgs | None,
+        perturbations: BatchedPerturbationConfig | None = None,
+    ) -> tuple[TransformerArgs | None, TransformerArgs | None]:
+        # Define load and offload functions for this block (proxies to class methods)
+        load_weights = self._load_weights
+        offload_weights = self._offload_weights
+
+        # Prepare arguments for checkpointing (both standard and block-level need flattened tensors)
+        video_vals, video_none = _unpack_transformer_args(video)
+        audio_vals, audio_none = _unpack_transformer_args(audio)
+        vid_len = len(video_vals)
+
+        def checkpoint_wrapper(*inputs):
+            swap_wait_fn = getattr(self, "swap_wait_fn", None)
+            if callable(swap_wait_fn):
+                swap_wait_fn()
+            v_vals = list(inputs[:vid_len])
+            a_vals = list(inputs[vid_len:])
+            v_args = _reconstruct_transformer_args(v_vals, video_none)
+            a_args = _reconstruct_transformer_args(a_vals, audio_none)
+            return self._forward(v_args, a_args, perturbations)
+
+        flat_inputs = tuple(video_vals + audio_vals)
+
+        # Determine offloading hooks based on configuration
+        load_fn = load_weights if self.weight_cpu_offloading else None
+        offload_fn = offload_weights if self.weight_cpu_offloading else None
+
+        outputs = block_checkpoint(
+            checkpoint_wrapper,
+            *flat_inputs,
+            block=self,
+            load_fn=load_fn,
+            offload_fn=offload_fn,
+        )
+
+        # Check if outputs are already TransformerArgs (No-Grad path returns objects directly)
+        is_obj = False
+        if len(outputs) > 0 and isinstance(outputs[0], TransformerArgs):
+            is_obj = True
+        elif len(outputs) > 1 and isinstance(outputs[1], TransformerArgs):
+            is_obj = True
+
+        if is_obj:
+            return outputs
+
+        # Re-wrapping logic for Tensors (Grad path):
+        res_v_x = outputs[0] if len(outputs) > 0 else None
+        res_a_x = outputs[1] if len(outputs) > 1 else None
+
+        out_video = None
+        if video is not None:
+            if isinstance(res_v_x, torch.Tensor):
+                out_video = replace(video, x=res_v_x)
+            else:
+                out_video = video
+
+        out_audio = None
+        if audio is not None:
+            if res_a_x is not None and isinstance(res_a_x, torch.Tensor):
+                out_audio = replace(audio, x=res_a_x)
+            else:
+                out_audio = audio
+
+        return out_video, out_audio
 
     def _forward(  # noqa: PLR0915
         self,
@@ -445,10 +521,6 @@ class BasicAVTransformerBlock(torch.nn.Module):
             target_device = video.x.device
         elif audio is not None and isinstance(audio.x, torch.Tensor):
             target_device = audio.x.device
-        
-        if target_device is not None:
-            _move_non_linear_params(self, target_device)
-            ensure_fp8_modules_on_device(self, target_device)
         if video is not None and isinstance(video.x, torch.Tensor):
             batch_size = video.x.shape[0]
         elif audio is not None and isinstance(audio.x, torch.Tensor):
@@ -629,23 +701,12 @@ class BasicAVTransformerBlock(torch.nn.Module):
 
             del ashift_mlp, ascale_mlp, agate_mlp
 
-        # Offload weights to CPU at the end of _forward.
-        # This runs during forward pass. During backward, the backward hook handles offloading.
-        if self.activation_cpu_offloading:
-            cpu_device = torch.device("cpu")
-            use_pinned = self.use_pinned_memory and os.getenv("LTX2_SWAP_PINNED", "1") == "1"
-            weighs_to_device(self, cpu_device, use_pinned=use_pinned)
-            _move_non_linear_params(self, cpu_device)
-            ensure_fp8_modules_on_device(self, cpu_device)
-
         return replace(video, x=vx) if video is not None else None, replace(audio, x=ax) if audio is not None else None
 
     def _load_weights(self, b: torch.nn.Module, d: torch.device) -> None:
-        use_pinned = self.use_pinned_memory and os.getenv("LTX2_SWAP_PINNED", "1") == "1"
-        weighs_to_device(b, d, use_pinned=use_pinned)
+        weighs_to_device(b, d)
         # Move non-linear params (RMSNorm, etc.) and FP8/LoRA modules
         _move_non_linear_params(b, d)
-        ensure_fp8_modules_on_device(b, d)
         # Manually move scale_shift tables as weighs_to_device only targets Linear layers
         # and these are Parameters of the block itself.
         for attr in [
@@ -664,8 +725,7 @@ class BasicAVTransformerBlock(torch.nn.Module):
         cpu_device = torch.device("cpu")
         # When offloading to CPU, we should also move these tables back
         # Reuse the same logic but targeting CPU (d)
-        use_pinned = self.use_pinned_memory and os.getenv("LTX2_SWAP_PINNED", "1") == "1"
-        weighs_to_device(b, d, use_pinned=use_pinned)
+        weighs_to_device(b, d)
         for attr in [
             "scale_shift_table",
             "audio_scale_shift_table",
@@ -677,10 +737,7 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 if p.device != d:
                     if d.type == "cpu":
                         p.data = p.data.to(d, non_blocking=True)
-                        if use_pinned:
-                            p.data = p.data.pin_memory()
                     else:
                         p.data = p.data.to(d, non_blocking=True)
         _move_non_linear_params(b, cpu_device)
-        ensure_fp8_modules_on_device(b, cpu_device)
 

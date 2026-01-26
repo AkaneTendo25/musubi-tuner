@@ -64,6 +64,11 @@ class LTXModelConfigurator(ModelConfigurator[LTXModel]):
             av_ca_timestep_scale_multiplier=config.get("av_ca_timestep_scale_multiplier", 1),
             rope_type=LTXRopeType(config.get("rope_type", "interleaved")),
             double_precision_rope=config.get("frequencies_precision", False) == "float64",
+            split_attn_target=config.get("split_attn_target", None),
+            split_attn_mode=config.get("split_attn_mode", None),
+            split_attn_chunk_size=config.get("split_attn_chunk_size", 0),
+            ffn_chunk_target=config.get("ffn_chunk_target", None),
+            ffn_chunk_size=config.get("ffn_chunk_size", 0),
         )
 
 
@@ -110,6 +115,11 @@ class LTXVideoOnlyModelConfigurator(ModelConfigurator[LTXModel]):
             use_middle_indices_grid=config.get("use_middle_indices_grid", True),
             rope_type=LTXRopeType(config.get("rope_type", "interleaved")),
             double_precision_rope=config.get("frequencies_precision", False) == "float64",
+            split_attn_target=config.get("split_attn_target", None),
+            split_attn_mode=config.get("split_attn_mode", None),
+            split_attn_chunk_size=config.get("split_attn_chunk_size", 0),
+            ffn_chunk_target=config.get("ffn_chunk_target", None),
+            ffn_chunk_size=config.get("ffn_chunk_size", 0),
         )
 
 
@@ -161,6 +171,11 @@ class LTXAudioOnlyModelConfigurator(ModelConfigurator[LTXModel]):
             audio_positional_embedding_max_pos=config.get("audio_positional_embedding_max_pos", [20]),
             rope_type=LTXRopeType(config.get("rope_type", "interleaved")),
             double_precision_rope=config.get("frequencies_precision", False) == "float64",
+            split_attn_target=config.get("split_attn_target", None),
+            split_attn_mode=config.get("split_attn_mode", None),
+            split_attn_chunk_size=config.get("split_attn_chunk_size", 0),
+            ffn_chunk_target=config.get("ffn_chunk_target", None),
+            ffn_chunk_size=config.get("ffn_chunk_size", 0),
         )
 
 

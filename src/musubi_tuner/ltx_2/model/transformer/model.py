@@ -7,22 +7,22 @@ import logging
 import torch
 import torch.nn as nn
 import torch.utils.checkpoint as checkpoint
-from musubi_tuner.ltx_2.model.transformer.offloading_utils import (
-    LTX2BlockSwapManager,
-    LTX2ModelOffloader,
+from musubi_tuner.modules.custom_offloading_utils import (
+    ModelOffloader as GenericModelOffloader,
+    weighs_to_device,
 )
-from musubi_tuner.ltx_2.model.ltx2_custom_offloading_utils import _clean_memory_on_device
 from musubi_tuner.ltx_2.guidance.perturbations import BatchedPerturbationConfig
 from musubi_tuner.ltx_2.model.transformer.adaln import AdaLayerNormSingle
 from musubi_tuner.ltx_2.model.transformer.attention import AttentionCallable, AttentionFunction
-from musubi_tuner.ltx_2.model.transformer.fp8_device_utils import (
-    ensure_fp8_modules_on_device,
-    move_fp8_scale_weights,
-)
 from musubi_tuner.ltx_2.model.transformer.modality import Modality
 from musubi_tuner.ltx_2.model.transformer.rope import LTXRopeType
 from musubi_tuner.ltx_2.model.transformer.text_projection import PixArtAlphaTextProjection
-from musubi_tuner.ltx_2.model.transformer.transformer import BasicAVTransformerBlock, TransformerConfig
+from musubi_tuner.ltx_2.model.transformer.transformer import (
+    BasicAVTransformerBlock,
+    TransformerConfig,
+    _unpack_transformer_args,
+    _reconstruct_transformer_args,
+)
 from musubi_tuner.ltx_2.model.transformer.transformer_args import (
     MultiModalTransformerArgsPreprocessor,
     TransformerArgs,
@@ -32,6 +32,28 @@ from musubi_tuner.ltx_2.utils import to_denoised
 from musubi_tuner.ltx_2.utils import create_cpu_offloading_wrapper
 
 logger = logging.getLogger(__name__)
+
+def _align_fp8_scale_weights(block: torch.nn.Module) -> None:
+    for mod in block.modules():
+        scale = getattr(mod, "scale_weight", None)
+        weight = getattr(mod, "weight", None)
+        if isinstance(scale, torch.Tensor) and isinstance(weight, torch.Tensor):
+            if scale.device != weight.device:
+                mod.scale_weight = scale.to(device=weight.device, non_blocking=True)
+
+
+def _ensure_block_weights_on_device(block: torch.nn.Module, device: torch.device) -> None:
+    needs_move = False
+    for mod in block.modules():
+        if mod.__class__.__name__.endswith("Linear"):
+            w = getattr(mod, "weight", None)
+            if isinstance(w, torch.Tensor) and w.device != device:
+                needs_move = True
+                break
+    if not needs_move:
+        return
+    weighs_to_device(block, device)
+    _align_fp8_scale_weights(block)
 
 
 def _move_non_linear_params(module: nn.Module, device: torch.device) -> None:
@@ -145,6 +167,11 @@ class LTXModel(torch.nn.Module):
         av_ca_timestep_scale_multiplier: int = 1,
         rope_type: LTXRopeType = LTXRopeType.INTERLEAVED,
         double_precision_rope: bool = False,
+        split_attn_target: str | None = None,
+        split_attn_mode: str | None = None,
+        split_attn_chunk_size: int = 0,
+        ffn_chunk_target: str | None = None,
+        ffn_chunk_size: int = 0,
     ):
         super().__init__()
         self._enable_gradient_checkpointing = False
@@ -159,6 +186,11 @@ class LTXModel(torch.nn.Module):
         self.timestep_scale_multiplier = timestep_scale_multiplier
         self.positional_embedding_theta = positional_embedding_theta
         self.model_type = model_type
+        self.split_attn_target = split_attn_target
+        self.split_attn_mode = split_attn_mode
+        self.split_attn_chunk_size = split_attn_chunk_size
+        self.ffn_chunk_target = ffn_chunk_target
+        self.ffn_chunk_size = ffn_chunk_size
         cross_pe_max_pos = None
         if model_type.is_video_enabled():
             if positional_embedding_max_pos is None:
@@ -202,6 +234,11 @@ class LTXModel(torch.nn.Module):
             audio_cross_attention_dim=audio_cross_attention_dim,
             norm_eps=norm_eps,
             attention_type=attention_type,
+            split_attn_target=self.split_attn_target,
+            split_attn_mode=self.split_attn_mode,
+            split_attn_chunk_size=self.split_attn_chunk_size,
+            ffn_chunk_target=self.ffn_chunk_target,
+            ffn_chunk_size=self.ffn_chunk_size,
         )
 
         self.num_blocks = len(self.transformer_blocks)
@@ -363,6 +400,11 @@ class LTXModel(torch.nn.Module):
         audio_cross_attention_dim: int,
         norm_eps: float,
         attention_type: AttentionFunction | AttentionCallable,
+        split_attn_target: str | None = None,
+        split_attn_mode: str | None = None,
+        split_attn_chunk_size: int = 0,
+        ffn_chunk_target: str | None = None,
+        ffn_chunk_size: int = 0,
     ) -> None:
         """Initialize transformer blocks for LTX."""
         video_config = (
@@ -394,6 +436,11 @@ class LTXModel(torch.nn.Module):
                     rope_type=self.rope_type,
                     norm_eps=norm_eps,
                     attention_function=attention_type,
+                    split_attn_target=split_attn_target,
+                    split_attn_mode=split_attn_mode,
+                    split_attn_chunk_size=split_attn_chunk_size,
+                    ffn_chunk_target=ffn_chunk_target,
+                    ffn_chunk_size=ffn_chunk_size,
                 )
                 for idx in range(num_layers)
             ]
@@ -435,42 +482,28 @@ class LTXModel(torch.nn.Module):
         use_pinned_memory: bool = False,
         swap_norms: bool = False,
     ) -> None:
-        swap_mode = getattr(self, "swap_mode", "default")
         _log_cuda_memory("before_enable_block_swap")
-        self.blocks_to_swap = int(blocks_to_swap)
         self.num_blocks = len(self.transformer_blocks)
-
-        if swap_mode in {"aggressive", "aggressive_no_offload"}:
-            self._ltx2_block_swap = LTX2BlockSwapManager.build(
-                depth=self.num_blocks,
-                blocks_to_swap=self.blocks_to_swap,
-                swap_device="cpu",
-            )
-            self.offloader = None
-            _log_cuda_memory("after_enable_block_swap")
-            return
-
-        supports_backward_for_offload = supports_backward
-        if swap_mode == "aggressive":
-            supports_backward_for_offload = False
-            if supports_backward:
-                logger.warning(
-                    "LTX-2 aggressive swap uses forward-only swapping during training; "
-                    "enable gradient checkpointing + activation CPU offload to avoid OOM."
-                )
+        self.blocks_to_swap = int(blocks_to_swap)
         assert self.blocks_to_swap <= self.num_blocks - 1, (
             f"Cannot swap more than {self.num_blocks - 1} blocks. Requested {self.blocks_to_swap} blocks to swap."
         )
 
-        self.offloader = LTX2ModelOffloader(
+        self._ltx2_block_swap = None
+        self.offloader = GenericModelOffloader(
             "ltx2_block",
             self.transformer_blocks,
             self.num_blocks,
             self.blocks_to_swap,
-            supports_backward_for_offload,
+            supports_backward,
             device,
             use_pinned_memory,
-            swap_norms=swap_norms,
+        )
+        logger.info(
+            "LTX-2: Block swap enabled. Swapping %s blocks out of %s. Supports backward: %s",
+            self.blocks_to_swap,
+            self.num_blocks,
+            supports_backward,
         )
         _log_cuda_memory("after_enable_block_swap")
 
@@ -485,32 +518,6 @@ class LTXModel(torch.nn.Module):
             self.prepare_block_swap_before_forward()
 
     def move_to_device_except_swap_blocks(self, device: torch.device) -> None:
-        swap_mode = getattr(self, "swap_mode", "default")
-        if self.blocks_to_swap and swap_mode in {"aggressive", "aggressive_no_offload"}:
-            target_device = torch.device(device)
-            # Move non-block modules/params to the target device.
-            saved_blocks = self.transformer_blocks
-            self.transformer_blocks = torch.nn.ModuleList()
-            self.to(target_device)
-            self.transformer_blocks = saved_blocks
-
-            managed_indices = set()
-            if self._ltx2_block_swap is not None:
-                managed_indices = set(self._ltx2_block_swap.block_indices)
-            else:
-                managed_indices = set(
-                    range(max(0, len(self.transformer_blocks) - self.blocks_to_swap), len(self.transformer_blocks))
-                )
-
-            # Move non-managed blocks to GPU; keep managed blocks on CPU.
-            cpu_device = torch.device("cpu")
-            for idx, block in enumerate(self.transformer_blocks):
-                if idx in managed_indices:
-                    block.to(cpu_device)
-                else:
-                    block.to(target_device)
-            return
-
         if self.blocks_to_swap:
             saved_blocks = self.transformer_blocks
             self.transformer_blocks = torch.nn.ModuleList()
@@ -524,7 +531,51 @@ class LTXModel(torch.nn.Module):
         if self.blocks_to_swap is None or self.blocks_to_swap == 0 or self.offloader is None:
             return
         self.offloader.prepare_block_devices_before_forward(self.transformer_blocks)
+        for block in self.transformer_blocks:
+            _align_fp8_scale_weights(block)
         # Note: Non-linear params are handled by the offloader (kept on GPU)
+        if os.getenv("LTX2_SWAP_BLOCK_DEVICE_DIAG", "0") == "1":
+            try:
+                gpu_blocks = 0
+                cpu_blocks = 0
+                gpu_weight_blocks = 0
+                cpu_weight_blocks = 0
+                for block in self.transformer_blocks:
+                    dev = None
+                    for p in block.parameters():
+                        if isinstance(p, torch.Tensor):
+                            dev = p.device
+                            break
+                    if dev is None:
+                        continue
+                    if dev.type == "cuda":
+                        gpu_blocks += 1
+                    elif dev.type == "cpu":
+                        cpu_blocks += 1
+                    # Track Linear weight devices explicitly (more accurate for swap)
+                    weight_dev = None
+                    for mod in block.modules():
+                        if mod.__class__.__name__.endswith("Linear"):
+                            w = getattr(mod, "weight", None)
+                            if isinstance(w, torch.Tensor):
+                                weight_dev = w.device
+                                break
+                    if weight_dev is not None:
+                        if weight_dev.type == "cuda":
+                            gpu_weight_blocks += 1
+                        elif weight_dev.type == "cpu":
+                            cpu_weight_blocks += 1
+                logger.info(
+                    "LTX-2 swap diag: blocks_to_swap=%s num_blocks=%s gpu_blocks=%s cpu_blocks=%s gpu_weight_blocks=%s cpu_weight_blocks=%s",
+                    self.blocks_to_swap,
+                    self.num_blocks,
+                    gpu_blocks,
+                    cpu_blocks,
+                    gpu_weight_blocks,
+                    cpu_weight_blocks,
+                )
+            except Exception:
+                pass
 
     def _process_transformer_blocks(
         self,
@@ -535,35 +586,6 @@ class LTXModel(torch.nn.Module):
         """Process transformer blocks with optional offloading and block swapping."""
 
         nan_block_diag = os.getenv("LTX2_NAN_BLOCK_DIAG", "0") == "1"
-        strict_swap_sync = os.getenv("LTX2_SWAP_STRICT_SYNC", "0") == "1"
-        force_pytorch_attn = os.getenv("LTX2_SWAP_FORCE_PYTORCH_ATTN", "0") == "1"
-        force_cross_pytorch = os.getenv("LTX2_FORCE_PYTORCH_CROSS_ATTN", "0") == "1"
-        force_cross_fp32 = os.getenv("LTX2_CROSS_ATTN_FP32", "0") == "1"
-        cross_attn_swap_only = os.getenv("LTX2_CROSS_ATTN_SWAP_ONLY", "1") == "1"
-        force_audio_ctx_pytorch = os.getenv("LTX2_FORCE_PYTORCH_AUDIO_CTX_ATTN", "0") == "1"
-        force_audio_ctx_fp32 = os.getenv("LTX2_AUDIO_CTX_ATTN_FP32", "0") == "1"
-        audio_ctx_swap_only = os.getenv("LTX2_AUDIO_CTX_ATTN_SWAP_ONLY", "1") == "1"
-        fp8_swap_sync = os.getenv("LTX2_SWAP_FP8_SYNC", "1") == "1"
-        fp8_swap_sync_strict = os.getenv("LTX2_SWAP_FP8_SYNC_STRICT", "0") == "1"
-
-        swap_manager = self._ltx2_block_swap
-        swap_active = False
-        compute_device = None
-        if swap_manager is not None:
-            if video is not None and isinstance(video.x, torch.Tensor):
-                compute_device = video.x.device
-            elif audio is not None and isinstance(audio.x, torch.Tensor):
-                compute_device = audio.x.device
-            if compute_device is not None:
-                swap_active = swap_manager.activate(
-                    self.transformer_blocks,
-                    compute_device,
-                    self.training and torch.is_grad_enabled(),
-                )
-
-        if (swap_active and swap_manager is not None) or (self.blocks_to_swap and self.offloader is not None):
-            if video is not None and isinstance(video.x, torch.Tensor):
-                _clean_memory_on_device(video.x.device)
 
         gpu_device = None
         if video is not None and isinstance(video.x, torch.Tensor):
@@ -572,6 +594,21 @@ class LTXModel(torch.nn.Module):
             gpu_device = audio.x.device
             
         cpu_device = torch.device("cpu")
+        vram_block_diag = (
+            gpu_device is not None
+            and gpu_device.type == "cuda"
+            and torch.cuda.is_available()
+            and os.getenv("LTX2_VRAM_BLOCK_DIAG", "0") == "1"
+        )
+        vram_block_detail = os.getenv("LTX2_VRAM_BLOCK_DETAIL", "0") == "1"
+        vram_block_peaks: list[tuple[int, int]] = []
+        vram_total_bytes = None
+        if vram_block_diag:
+            device_index = gpu_device.index if gpu_device.index is not None else torch.cuda.current_device()
+            vram_total_bytes = torch.cuda.get_device_properties(device_index).total_memory
+        
+        if self.blocks_to_swap and self.offloader is not None:
+            self.prepare_block_swap_before_forward()
 
         # If offloading is enabled for all blocks, move initial inputs to CPU so the first block's checkpoint saves CPU tensors
         if self.activation_cpu_offloading and self.training:
@@ -580,83 +617,66 @@ class LTXModel(torch.nn.Module):
                 video = _move_transformer_args(video, cpu_device)
                 audio = _move_transformer_args(audio, cpu_device)
 
-        use_async_prefetch = os.getenv("LTX2_SWAP_ASYNC_PREFETCH", "0") == "1"
-        transfer_stream = None
-        target_device = gpu_device if gpu_device else torch.device("cuda")
-        if use_async_prefetch:
-            # Async Stream Setup (Phase 2)
-            if not hasattr(self, "_transfer_stream"):
-                # Create stream on GPU device if available
-                self._transfer_stream = torch.cuda.Stream(device=gpu_device)
-            transfer_stream = self._transfer_stream
-
         # Process transformer blocks
         for block_idx, block in enumerate(self.transformer_blocks):
-            swap_start = max(0, len(self.transformer_blocks) - int(self.blocks_to_swap or 0))
-            in_swap_range = bool(self.blocks_to_swap) and block_idx >= swap_start
-            if force_pytorch_attn and in_swap_range and not getattr(block, "_forced_pytorch_attn", False):
-                from musubi_tuner.ltx_2.model.transformer.attention import Attention, AttentionFunction
+            def _run_block(v_args, a_args):
+                if self.blocks_to_swap and self.offloader is not None:
+                    self.offloader.wait_for_block(block_idx)
+                    _align_fp8_scale_weights(block)
+                return block._forward(v_args, a_args, perturbations)
 
-                for mod in block.modules():
-                    if isinstance(mod, Attention):
-                        mod.attention_function = AttentionFunction.PYTORCH
-                block._forced_pytorch_attn = True
-                logger.info("Forced PyTorch attention for swapped block %s", block_idx)
+            do_checkpoint = (
+                self.training
+                and getattr(self, "_enable_gradient_checkpointing", False)
+                and block_idx >= getattr(self, "_checkpoint_start_idx", 0)
+            )
 
-            if force_cross_pytorch or force_cross_fp32:
-                enable_cross = (not cross_attn_swap_only) or in_swap_range
-                block._force_pytorch_cross_attn = bool(force_cross_pytorch and enable_cross)
-                block._force_fp32_cross_attn = bool(force_cross_fp32 and enable_cross)
-            if force_audio_ctx_pytorch or force_audio_ctx_fp32:
-                enable_audio_ctx = (not audio_ctx_swap_only) or in_swap_range
-                block._force_pytorch_audio_ctx_attn = bool(force_audio_ctx_pytorch and enable_audio_ctx)
-                block._force_fp32_audio_ctx_attn = bool(force_audio_ctx_fp32 and enable_audio_ctx)
+            if vram_block_diag:
+                torch.cuda.synchronize(gpu_device)
+                torch.cuda.reset_peak_memory_stats(gpu_device)
+                vram_baseline = torch.cuda.memory_allocated(gpu_device)
+                if do_checkpoint:
+                    video_vals, video_none = _unpack_transformer_args(video)
+                    audio_vals, audio_none = _unpack_transformer_args(audio)
+                    vid_len = len(video_vals)
 
-            # Phase 2: Wait for prefetch (if active)
-            # If previous block triggered prefetch for this block, wait for it here.
-            # Using wait_stream ensures kernels submitted to compute stream (block execution)
-            # will wait for transfers submitted to transfer stream to complete.
-            if transfer_stream is not None and getattr(block, "weight_cpu_offloading", False):
-                torch.cuda.current_stream().wait_stream(transfer_stream)
+                    def _cp_wrapper(*inputs):
+                        v_vals = list(inputs[:vid_len])
+                        a_vals = list(inputs[vid_len:])
+                        v_args = _reconstruct_transformer_args(v_vals, video_none)
+                        a_args = _reconstruct_transformer_args(a_vals, audio_none)
+                        return _run_block(v_args, a_args)
 
-            if (self.blocks_to_swap or 0) > 0 and self.offloader is not None:
-                self.offloader.wait_for_block(block_idx)
-                if strict_swap_sync and torch.cuda.is_available():
-                    torch.cuda.current_stream().synchronize()
-            elif (
-                (self.blocks_to_swap or 0) > 0
-                and self._ltx2_block_swap is not None
-                and block_idx in self._ltx2_block_swap.block_indices
-            ):
-                self._ltx2_block_swap.param_swap(block_idx)
-                if strict_swap_sync and torch.cuda.is_available():
-                    torch.cuda.current_stream().synchronize()
+                    flat_inputs = tuple(video_vals + audio_vals)
+                    out_video, out_audio = checkpoint.checkpoint(
+                        _cp_wrapper, *flat_inputs, use_reentrant=False, determinism_check="none"
+                    )
+                    video, audio = out_video, out_audio
+                else:
+                    video, audio = _run_block(video, audio)
+                torch.cuda.synchronize(gpu_device)
+                vram_peak = torch.cuda.max_memory_allocated(gpu_device)
+                vram_block_peaks.append((block_idx, max(0, int(vram_peak - vram_baseline))))
+            else:
+                if do_checkpoint:
+                    video_vals, video_none = _unpack_transformer_args(video)
+                    audio_vals, audio_none = _unpack_transformer_args(audio)
+                    vid_len = len(video_vals)
 
-            if fp8_swap_sync and in_swap_range and torch.cuda.is_available():
-                # Ensure fp8 weights + scale_weight are on the compute device after swap-in.
-                ensure_fp8_modules_on_device(block, gpu_device)
-                if fp8_swap_sync_strict:
-                    torch.cuda.current_stream().synchronize()
+                    def _cp_wrapper(*inputs):
+                        v_vals = list(inputs[:vid_len])
+                        a_vals = list(inputs[vid_len:])
+                        v_args = _reconstruct_transformer_args(v_vals, video_none)
+                        a_args = _reconstruct_transformer_args(a_vals, audio_none)
+                        return _run_block(v_args, a_args)
 
-            # Phase 2: Prefetch Next Block
-            # Trigger load for N+1 on Transfer Stream while N is about to compute
-            if (
-                transfer_stream is not None
-                and getattr(block, "weight_cpu_offloading", False)
-                and block_idx + 1 < len(self.transformer_blocks)
-            ):
-                next_block = self.transformer_blocks[block_idx + 1]
-                # Only prefetch if next block also wants it
-                if getattr(next_block, "weight_cpu_offloading", False):
-                    with torch.cuda.stream(transfer_stream):
-                        # Safe to call because it checks p.device internally
-                        # If already loaded, it's a fast no-op.
-                        # If on CPU, it triggers H2D copy.
-                        next_block._load_weights(next_block, target_device)
-
-            # Execute block (it now handles checkpointing i.e. load/compute/offload)
-            # If offloading is on, block expects CPU inputs (for checkpoint savings) and returns CPU outputs
-            video, audio = block(video, audio, perturbations)
+                    flat_inputs = tuple(video_vals + audio_vals)
+                    out_video, out_audio = checkpoint.checkpoint(
+                        _cp_wrapper, *flat_inputs, use_reentrant=False, determinism_check="none"
+                    )
+                    video, audio = out_video, out_audio
+                else:
+                    video, audio = _run_block(video, audio)
 
             if nan_block_diag:
                 vx = video.x if video is not None and isinstance(video.x, torch.Tensor) else None
@@ -703,16 +723,26 @@ class LTXModel(torch.nn.Module):
                     _log_block_diag("audio")
                     raise RuntimeError(f"Non-finite audio activations after block {block_idx}")
 
-            if swap_active and swap_manager is not None and swap_manager.is_managed_block(block_idx):
-                swap_manager.stream_out(block)
-
             if self.blocks_to_swap and self.offloader is not None:
                 # If blockwise checkpointing is handling weight offload for this block,
                 # skip swap prefetch to avoid loading extra blocks and spiking VRAM.
                 if not getattr(block, "weight_cpu_offloading", False):
                     self.offloader.submit_move_blocks_forward(self.transformer_blocks, block_idx)
-                if not self.offloader.forward_only:
-                    pass # Keep non-linear params on GPU for backward pass
+
+        if vram_block_diag and vram_block_detail and vram_block_peaks:
+            def _fmt_entry(entry: tuple[int, int]) -> str:
+                idx, bytes_used = entry
+                mb = bytes_used / (1024 ** 2)
+                if vram_total_bytes:
+                    pct = (bytes_used / vram_total_bytes) * 100.0
+                    return f"{idx}:{mb:.1f}MB({pct:.2f}%)"
+                return f"{idx}:{mb:.1f}MB"
+
+            top = sorted(vram_block_peaks, key=lambda x: x[1], reverse=True)
+            top_summary = ", ".join(_fmt_entry(e) for e in top[:10])
+            full_summary = ", ".join(_fmt_entry(e) for e in vram_block_peaks)
+            logger.info("LTX-2 VRAM block peaks (top 10): %s", top_summary)
+            logger.info("LTX-2 VRAM block peaks (all): %s", full_summary)
 
         return video, audio
 
@@ -784,7 +814,7 @@ class LTXModel(torch.nn.Module):
                 block.activation_cpu_offloading = False
                 block.weight_cpu_offloading = False
                 continue
-
+            
             if idx < checkpoint_start:
                 # Use standard checkpointing (no CPU/weight offload) for early blocks.
                 block.gradient_checkpointing = True
@@ -810,12 +840,38 @@ class LTXModel(torch.nn.Module):
 
         video_args = self.video_args_preprocessor.prepare(video) if video is not None else None
         audio_args = self.audio_args_preprocessor.prepare(audio) if audio is not None else None
+
+        vram_diag = os.getenv("LTX2_VRAM_BLOCK_DIAG", "0") == "1"
+        vram_device = None
+        if vram_diag and torch.cuda.is_available():
+            if video_args is not None and isinstance(video_args.x, torch.Tensor):
+                vram_device = video_args.x.device
+            elif audio_args is not None and isinstance(audio_args.x, torch.Tensor):
+                vram_device = audio_args.x.device
+            if vram_device is not None and vram_device.type == "cuda":
+                torch.cuda.synchronize(vram_device)
+                torch.cuda.reset_peak_memory_stats(vram_device)
+                vram_baseline = torch.cuda.memory_allocated(vram_device)
+            else:
+                vram_diag = False
         # Process transformer blocks
         video_out, audio_out = self._process_transformer_blocks(
             video=video_args,
             audio=audio_args,
             perturbations=perturbations,
         )
+        if vram_diag and vram_device is not None:
+            torch.cuda.synchronize(vram_device)
+            vram_peak = torch.cuda.max_memory_allocated(vram_device)
+            vram_delta = max(0, int(vram_peak - vram_baseline))
+            logger.info(
+                "LTX-2 VRAM forward peak: baseline=%.2fMB peak=%.2fMB delta=%.2fMB",
+                vram_baseline / (1024 ** 2),
+                vram_peak / (1024 ** 2),
+                vram_delta / (1024 ** 2),
+            )
+            # reset peak stats for backward measurement
+            torch.cuda.reset_peak_memory_stats(vram_device)
 
         if self.activation_cpu_offloading and self.training:
             target_device = None
@@ -857,6 +913,24 @@ class LTXModel(torch.nn.Module):
             if audio_out is not None
             else None
         )
+        if vram_diag and vram_device is not None:
+            def _log_backward_peak(_grad):
+                try:
+                    torch.cuda.synchronize(vram_device)
+                    peak = torch.cuda.max_memory_allocated(vram_device)
+                    logger.info(
+                        "LTX-2 VRAM backward peak: peak=%.2fMB",
+                        peak / (1024 ** 2),
+                    )
+                except Exception:
+                    pass
+                return _grad
+
+            if vx is not None and isinstance(vx, torch.Tensor) and vx.requires_grad:
+                vx.register_hook(_log_backward_peak)
+            elif ax is not None and isinstance(ax, torch.Tensor) and ax.requires_grad:
+                ax.register_hook(_log_backward_peak)
+
         return vx, ax
 
 

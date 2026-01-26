@@ -16,17 +16,24 @@ from musubi_tuner.ltx_2.model.ltx2_custom_offloading_utils import (
 logger = logging.getLogger(__name__)
 _LOGGED_SWAP_BYTES = False
 _LOGGED_FIRST_PARAM = False
-_SKIP_AUDIO_SWAP = os.getenv("LTX2_SWAP_SKIP_AUDIO", "1") == "1"
-_SKIP_CROSS_ATTN_SWAP = os.getenv("LTX2_SWAP_KEEP_CROSS_ATTN", "0") == "1"
-_SKIP_ATTN_SWAP = os.getenv("LTX2_SWAP_KEEP_ATTN", "0") == "1"
+def _swap_env_flags() -> tuple[bool, bool, bool]:
+    skip_audio = os.getenv("LTX2_SWAP_SKIP_AUDIO", "1") == "1"
+    skip_cross = os.getenv("LTX2_SWAP_KEEP_CROSS_ATTN", "0") == "1"
+    skip_attn = os.getenv("LTX2_SWAP_KEEP_ATTN", "0") == "1"
+    return skip_audio, skip_cross, skip_attn
+
+
+def _swap_full_block_enabled() -> bool:
+    return os.getenv("LTX2_SWAP_FULL_BLOCK", "0") == "1"
 
 
 def _should_skip_swap(name: str) -> bool:
-    if _SKIP_AUDIO_SWAP and "audio" in name:
+    skip_audio, skip_cross, skip_attn = _swap_env_flags()
+    if skip_audio and "audio" in name:
         return True
-    if _SKIP_ATTN_SWAP and "attn" in name:
+    if skip_attn and "attn" in name:
         return True
-    if _SKIP_CROSS_ATTN_SWAP and ("audio_to_video_attn" in name or "video_to_audio_attn" in name):
+    if skip_cross and ("audio_to_video_attn" in name or "video_to_audio_attn" in name):
         return True
     return False
 
@@ -265,6 +272,13 @@ class LTX2ModelOffloader(ModelOffloader):
             print(f"[{self.block_type}] Prepare block devices before forward (LTX2)")
         diag_enabled = os.getenv("LTX2_SWAP_DIAG", "0") == "1"
         if diag_enabled:
+            skip_audio, skip_cross, skip_attn = _swap_env_flags()
+            logger.info(
+                "LTX-2 swap diag [flags]: skip_audio=%s skip_cross_attn=%s skip_attn=%s",
+                skip_audio,
+                skip_cross,
+                skip_attn,
+            )
             keep_idx = 0
             swap_idx = max(0, self.num_blocks - self.blocks_to_swap)
             if blocks:
@@ -275,16 +289,43 @@ class LTX2ModelOffloader(ModelOffloader):
 
         use_pinned = self.use_pinned_memory and os.getenv("LTX2_SWAP_PINNED", "1") == "1"
         split_idx = max(0, self.num_blocks - self.blocks_to_swap)
+        if _swap_full_block_enabled():
+            for block in blocks[0 : split_idx]:
+                block.to(self.device)
+                params_to_device(block, self.device, include_norms=True, use_pinned=use_pinned)
+            cpu_device = torch.device("cpu")
+            for block in blocks[split_idx :]:
+                block.to(self.device)
+                params_to_device(block, cpu_device, include_norms=True, use_pinned=use_pinned)
+            _synchronize_device(self.device)
+            _clean_memory_on_device(self.device)
+            _log_cuda_memory("after_prepare_blocks")
+            if not _LOGGED_SWAP_BYTES:
+                split_idx = max(0, self.num_blocks - self.blocks_to_swap)
+                _log_block_cuda_bytes(blocks, split_idx)
+                _LOGGED_SWAP_BYTES = True
+            if not _LOGGED_FIRST_PARAM:
+                _log_first_param(blocks)
+                _LOGGED_FIRST_PARAM = True
+            if diag_enabled:
+                keep_idx = 0
+                swap_idx = max(0, self.num_blocks - self.blocks_to_swap)
+                if blocks:
+                    _summarize_block_tensors(blocks[keep_idx], "after_keep_block")
+                    if swap_idx < len(blocks):
+                        _summarize_block_tensors(blocks[swap_idx], "after_swap_block")
+            return
         for block in blocks[0 : split_idx]:
             block.to(self.device)
             weighs_to_device(block, self.device, use_pinned=use_pinned)
 
         cpu_device = torch.device("cpu")
+        skip_audio, skip_cross, _ = _swap_env_flags()
         for block in blocks[split_idx :]:
             if self.swap_norms:
                 # Move whole block to GPU, then swap Linear AND norm weights to CPU
                 block.to(self.device)
-                if _SKIP_AUDIO_SWAP or _SKIP_CROSS_ATTN_SWAP:
+                if skip_audio or skip_cross:
                     _move_block_params_excluding_audio(
                         block,
                         cpu_device,
@@ -296,7 +337,7 @@ class LTX2ModelOffloader(ModelOffloader):
             else:
                 # Move only non-linear params/buffers to GPU to avoid peak VRAM spikes.
                 _move_non_linear_params(block, self.device)
-                if _SKIP_AUDIO_SWAP or _SKIP_CROSS_ATTN_SWAP:
+                if skip_audio or skip_cross:
                     _move_block_params_excluding_audio(
                         block,
                         cpu_device,

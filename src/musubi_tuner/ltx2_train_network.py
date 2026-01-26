@@ -31,7 +31,6 @@ from musubi_tuner.hv_train_network import (
 from musubi_tuner.hv_generate_video import save_images_grid, save_videos_grid
 from musubi_tuner.utils.device_utils import clean_memory_on_device
 from musubi_tuner.utils import model_utils
-from musubi_tuner.ltx_2.model.transformer.fp8_device_utils import ensure_fp8_modules_on_device
 from musubi_tuner.utils.safetensors_utils import MemoryEfficientSafeOpen        
 from musubi_tuner.modules.fp8_optimization_utils import apply_fp8_monkey_patch  
 from musubi_tuner.utils.lora_utils import load_safetensors_with_lora_and_fp8    
@@ -205,11 +204,13 @@ def load_ltx2_model(
     torch_dtype: Optional[torch.dtype] = None,
     attn_mode: str = "torch",
     ltx_mode: str = "v",
+    fp8_base: bool = False,
     fp8_scaled: bool = False,
     fp8_upcast: bool = False,
     fp8_upcast_stochastic: bool = False,
     fp8_upcast_seed: int = 0,
     load_weights_on_cpu: bool = False,
+    blocks_to_swap: int = 0,
     **_: Any,
 ):
     """Load LTX-2 transformer for the requested modality
@@ -232,23 +233,29 @@ def load_ltx2_model(
             if is_fp8_linear:
                 continue
             for _, param in module.named_parameters(recurse=False):
-                if isinstance(param, torch.Tensor) and param.dtype == torch.float32:
+                if isinstance(param, torch.Tensor) and param.dtype != target_dtype:
                     param.data = param.data.to(dtype=target_dtype)
             for name, buf in module.named_buffers(recurse=False):
-                if isinstance(buf, torch.Tensor) and buf.dtype == torch.float32:
+                if isinstance(buf, torch.Tensor) and buf.dtype != target_dtype:
                     setattr(module, name, buf.to(dtype=target_dtype))
+
+    def _detect_fp8_state_dict(state_dict: dict[str, torch.Tensor]) -> bool:
+        for tensor in state_dict.values():
+            if isinstance(tensor, torch.Tensor) and tensor.dtype in (
+                torch.float8_e4m3fn,
+                getattr(torch, "float8_e5m2", torch.float8_e4m3fn),
+            ):
+                return True
+        return False
 
     target_device = torch.device(device)
     load_device = torch.device(load_device)
-    state_device = torch.device("cpu") if load_weights_on_cpu else load_device
-
     from musubi_tuner.ltx_2.loader.sft_loader import SafetensorsModelStateDictLoader
     from musubi_tuner.ltx_2.model.transformer.model_configurator import (
         LTXAudioOnlyModelConfigurator,
         LTXModelConfigurator,
         LTXVideoOnlyModelConfigurator,
         LTXV_MODEL_COMFY_RENAMING_MAP,
-        amend_forward_with_upcast,
     )
     from musubi_tuner.networks.lora_ltx2 import LTX2Wrapper
 
@@ -284,31 +291,27 @@ def load_ltx2_model(
     with torch.device("meta"):
         base_model = configurator.from_config(config)
 
-    if fp8_scaled:
-        fp8_calc_device = target_device if (not load_weights_on_cpu and load_device == target_device) else torch.device("cpu")
-        sd = load_safetensors_with_lora_and_fp8(
-            model_files=model_path,
-            lora_weights_list=None,
-            lora_multipliers=None,
-            fp8_optimization=True,
-            calc_device=fp8_calc_device,
-            move_to_device=not load_weights_on_cpu and load_device == target_device,
-            dit_weight_dtype=None,
-            target_keys=["transformer_blocks"],
-            exclude_keys=list(KEEP_FP8_HIGH_PRECISION_TOKENS),
-        )
+    use_fp8_scaled = bool(fp8_scaled)
+    use_fp8_base = bool(fp8_base)
+    use_fp8 = use_fp8_scaled or use_fp8_base
+    if use_fp8_scaled:
+        load_dtype = None
+    elif use_fp8_base:
+        load_dtype = torch.float8_e4m3fn
     else:
-        sd = load_safetensors_with_lora_and_fp8(
-            model_files=model_path,
-            lora_weights_list=None,
-            lora_multipliers=None,
-            fp8_optimization=False,
-            calc_device=state_device,
-            move_to_device=not load_weights_on_cpu,
-            dit_weight_dtype=torch_dtype,
-            target_keys=None,
-            exclude_keys=None,
-        )
+        load_dtype = torch_dtype
+
+    sd = load_safetensors_with_lora_and_fp8(
+        model_files=model_path,
+        lora_weights_list=None,
+        lora_multipliers=None,
+        fp8_optimization=use_fp8_scaled,
+        calc_device=target_device,
+        move_to_device=(load_device == target_device),
+        dit_weight_dtype=load_dtype,
+        target_keys=["transformer_blocks"] if use_fp8_scaled else None,
+        exclude_keys=list(KEEP_FP8_HIGH_PRECISION_TOKENS) if use_fp8_scaled else None,
+    )
 
     renamed_sd: dict[str, torch.Tensor] = {}
     for k, v in sd.items():
@@ -316,25 +319,19 @@ def load_ltx2_model(
         renamed_sd[nk if nk is not None else k] = v
     sd = renamed_sd
 
-    if fp8_scaled:
+    is_fp8_ckpt = _detect_fp8_state_dict(sd)
+    if is_fp8_ckpt:
+        logger.info("LTX-2 checkpoint already contains fp8 weights; using as-is.")
         apply_fp8_monkey_patch(base_model, sd, use_scaled_mm=False)
+    elif use_fp8_scaled:
+        apply_fp8_monkey_patch(base_model, sd, use_scaled_mm=False)
+
     base_model.load_state_dict(sd, strict=False, assign=True)
     if torch_dtype is not None:
         _cast_non_fp8_params(base_model, torch_dtype)
     base_model = base_model.to(load_device)
     if fp8_upcast or fp8_upcast_stochastic:
-        # Upcast FP8 linear weights during forward for stability.
-        # This is optional and not enabled by default in upstream configs.
-        base_model = amend_forward_with_upcast(
-            base_model,
-            with_stochastic_rounding=bool(fp8_upcast_stochastic),
-            seed=int(fp8_upcast_seed),
-        )
-        logger.info(
-            "Enabled FP8 upcast during linear forward (stochastic=%s, seed=%s).",
-            bool(fp8_upcast_stochastic),
-            int(fp8_upcast_seed),
-        )
+        logger.warning("LTX-2 fp8 upcast flags ignored to match Wan/Kandinsky fp8 flow.")
 
     model = LTX2Wrapper(base_model, patch_size=1)
     if load_device == target_device:
@@ -515,9 +512,8 @@ class LTX2NetworkTrainer(NetworkTrainer):
         return timesteps / 1000.0
 
     def _ensure_fp8_buffers_on_device(self, model: torch.nn.Module) -> None:
-        if not any(True for _ in model.parameters()):
-            return
-        ensure_fp8_modules_on_device(model, next(model.parameters()).device)
+        # No-op to match the generic (Wan/HV) pipeline.
+        return
 
     class _DeferredVAE:
         def __init__(self) -> None:
@@ -765,11 +761,13 @@ class LTX2NetworkTrainer(NetworkTrainer):
             torch_dtype=torch_dtype_to_use,
             attn_mode=attn_mode,
             ltx_mode=self._ltx_mode,
+            fp8_base=bool(getattr(args, "fp8_base", False)),
             fp8_scaled=bool(getattr(args, "fp8_scaled", False)),
             fp8_upcast=bool(getattr(args, "fp8_upcast", False)),
             fp8_upcast_stochastic=bool(getattr(args, "fp8_upcast_stochastic", False)),
             fp8_upcast_seed=int(getattr(args, "fp8_upcast_seed", 0)),
             load_weights_on_cpu=True,
+            blocks_to_swap=int(getattr(args, "blocks_to_swap", 0) or 0),
         )
 
         transformer.eval()
@@ -1301,8 +1299,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
             if text_mask.shape[0] != latents.shape[0]:
                 raise ValueError(f"Batch size mismatch: latents batch={latents.shape[0]} vs text_mask batch={text_mask.shape[0]}")
             text_mask = text_mask.to(device=accelerator.device)
-            if args.gradient_checkpointing:
-                text_mask = text_mask.to(torch.bool)
+            text_mask = text_mask.to(torch.bool)
 
         # Move latents to device
         latents = latents.to(device=accelerator.device, dtype=network_dtype)

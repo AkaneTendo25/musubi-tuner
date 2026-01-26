@@ -2,8 +2,8 @@ from enum import Enum
 from typing import Protocol
 
 import logging
+import os
 import torch
-from musubi_tuner.ltx_2.model.transformer.fp8_device_utils import ensure_fp8_modules_on_device
 from musubi_tuner.ltx_2.model.transformer.rope import LTXRopeType, apply_rotary_emb
 
 logger = logging.getLogger(__name__)
@@ -247,10 +247,14 @@ class Attention(torch.nn.Module):
         norm_eps: float = 1e-6,
         rope_type: LTXRopeType = LTXRopeType.INTERLEAVED,
         attention_function: AttentionCallable | AttentionFunction = AttentionFunction.DEFAULT,
+        split_attn_mode: str | None = None,
+        split_attn_chunk_size: int = 0,
     ) -> None:
         super().__init__()
         self.rope_type = rope_type
         self.attention_function = attention_function
+        self.split_attn_mode = split_attn_mode
+        self.split_attn_chunk_size = split_attn_chunk_size
 
         inner_dim = dim_head * heads
         context_dim = query_dim if context_dim is None else context_dim
@@ -268,6 +272,29 @@ class Attention(torch.nn.Module):
 
         self.to_out = torch.nn.Sequential(torch.nn.Linear(inner_dim, query_dim, bias=True), torch.nn.Identity())
 
+    def _slice_mask_for_batch(self, mask: torch.Tensor | None, idx: int, batch_size: int) -> torch.Tensor | None:
+        if mask is None:
+            return None
+        if mask.shape[0] == batch_size:
+            return mask[idx : idx + 1]
+        return mask
+
+    def _slice_mask_for_query(
+        self, mask: torch.Tensor | None, start: int, end: int, q_len: int
+    ) -> torch.Tensor | None:
+        if mask is None:
+            return None
+        if mask.ndim == 4 and mask.shape[-2] == q_len:
+            return mask[..., start:end, :]
+        if mask.ndim == 3 and mask.shape[1] == q_len:
+            return mask[:, start:end, :]
+        if mask.ndim == 2 and mask.shape[0] == q_len:
+            return mask[start:end, :]
+        return mask
+
+    def _run_attention(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: torch.Tensor | None) -> torch.Tensor:
+        return self.attention_function(q, k, v, self.heads, mask)
+
     def forward(
         self,
         x: torch.Tensor,
@@ -276,12 +303,37 @@ class Attention(torch.nn.Module):
         pe: torch.Tensor | None = None,
         k_pe: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        ensure_fp8_modules_on_device(self.to_q, x.device)
-        ensure_fp8_modules_on_device(self.to_k, x.device)
-        ensure_fp8_modules_on_device(self.to_v, x.device)
-        if isinstance(self.to_out, torch.nn.Sequential) and self.to_out:
-            ensure_fp8_modules_on_device(self.to_out[0], x.device)
+        if os.getenv("LTX2_FP8_DEVICE_DIAG", "0") == "1":
+            try:
+                org_fwd = getattr(self.to_q, "org_forward", None)
+                orig = getattr(org_fwd, "__self__", None) if callable(org_fwd) else None
+                w = getattr(orig, "weight", None)
+                sw = getattr(orig, "scale_weight", None)
+                if isinstance(w, torch.Tensor) and isinstance(sw, torch.Tensor):
+                    if w.device != sw.device or w.device != x.device:
+                        logger.error(
+                            "LTX-2 fp8 device diag: to_q weight=%s scale=%s input=%s",
+                            w.device,
+                            sw.device,
+                            x.device,
+                        )
+            except Exception:
+                pass
         q = self.to_q(x)
+        if os.getenv("LTX2_FP8_DEVICE_DIAG", "0") == "1":
+            try:
+                w = getattr(self.to_q, "weight", None)
+                sw = getattr(self.to_q, "scale_weight", None)
+                if isinstance(w, torch.Tensor) and isinstance(sw, torch.Tensor):
+                    if w.device != sw.device or w.device != x.device:
+                        logger.error(
+                            "LTX-2 fp8 device diag: to_q weight=%s scale=%s input=%s",
+                            w.device,
+                            sw.device,
+                            x.device,
+                        )
+            except Exception:
+                pass
         context = x if context is None else context
         k = self.to_k(context)
         v = self.to_v(context)
@@ -293,6 +345,27 @@ class Attention(torch.nn.Module):
             q = apply_rotary_emb(q, pe, self.rope_type)
             k = apply_rotary_emb(k, pe if k_pe is None else k_pe, self.rope_type)
 
-        # attention_function can be an enum *or* a custom callable
-        out = self.attention_function(q, k, v, self.heads, mask)
+        split_mode = (self.split_attn_mode or "").lower()
+        if split_mode == "batch":
+            outs = []
+            for i in range(q.shape[0]):
+                mask_i = self._slice_mask_for_batch(mask, i, q.shape[0])
+                out_i = self._run_attention(q[i : i + 1], k[i : i + 1], v[i : i + 1], mask_i)
+                outs.append(out_i)
+            out = torch.cat(outs, dim=0)
+        elif split_mode == "query":
+            chunk_size = int(self.split_attn_chunk_size) if self.split_attn_chunk_size else 1024
+            if chunk_size <= 0:
+                chunk_size = 1024
+            outs = []
+            q_len = q.shape[1]
+            for start in range(0, q_len, chunk_size):
+                end = min(start + chunk_size, q_len)
+                mask_chunk = self._slice_mask_for_query(mask, start, end, q_len)
+                out_chunk = self._run_attention(q[:, start:end], k, v, mask_chunk)
+                outs.append(out_chunk)
+            out = torch.cat(outs, dim=1)
+        else:
+            # attention_function can be an enum *or* a custom callable
+            out = self._run_attention(q, k, v, mask)
         return self.to_out(out)

@@ -116,6 +116,41 @@ def _log_cuda_memory_stats(tag: str, *, latents_shape: Optional[tuple] = None) -
             )
 
 
+def _cuda_memory_snapshot_supported() -> bool:
+    return (
+        torch.cuda.is_available()
+        and hasattr(torch.cuda, "memory")
+        and hasattr(torch.cuda.memory, "_record_memory_history")
+        and hasattr(torch.cuda.memory, "_dump_snapshot")
+    )
+
+
+def _start_cuda_memory_history(max_entries: int) -> None:
+    if not _cuda_memory_snapshot_supported():
+        return
+    try:
+        torch.cuda.memory._record_memory_history(
+            enabled="all",
+            context="all",
+            stacks="all",
+            max_entries=max_entries,
+            device=None,
+            clear_history=False,
+        )
+    except TypeError:
+        # Fallback for older signatures
+        torch.cuda.memory._record_memory_history()
+
+
+def _dump_cuda_memory_snapshot(path: str) -> None:
+    if not _cuda_memory_snapshot_supported():
+        return
+    try:
+        torch.cuda.memory._dump_snapshot(path)
+    except Exception as ex:
+        logger.warning("Failed to dump CUDA memory snapshot to %s: %s", path, ex)
+
+
 SS_METADATA_KEY_BASE_MODEL_VERSION = "ss_base_model_version"
 SS_METADATA_KEY_NETWORK_MODULE = "ss_network_module"
 SS_METADATA_KEY_NETWORK_DIM = "ss_network_dim"
@@ -533,6 +568,10 @@ class NetworkTrainer:
             if optimizer_type == "AdamW8bit".lower():
                 logger.info(f"use 8-bit AdamW optimizer | {optimizer_kwargs}")
                 optimizer_class = bnb.optim.AdamW8bit
+                optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
+            elif optimizer_type == "PagedAdamW8bit".lower():
+                logger.info(f"use paged 8-bit AdamW optimizer | {optimizer_kwargs}")
+                optimizer_class = bnb.optim.PagedAdamW8bit
                 optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
 
         elif optimizer_type == "Adafactor".lower():
@@ -1827,6 +1866,16 @@ class NetworkTrainer:
             logger.info(f"mixed precision set to {args.mixed_precision} / mixed precisionを{args.mixed_precision}に設定")
         is_main_process = accelerator.is_main_process
 
+        mem_snapshot_dir = None
+        last_mem_alloc_mb = None
+        last_mem_reserved_mb = None
+        if is_main_process and args.record_cuda_memory_history and _cuda_memory_snapshot_supported():
+            max_entries = args.cuda_memory_history_max_entries or 100000
+            _start_cuda_memory_history(max_entries)
+            mem_snapshot_dir = args.logging_dir or args.output_dir or "."
+            os.makedirs(mem_snapshot_dir, exist_ok=True)
+            logger.info("Enabled CUDA memory history (max_entries=%s), snapshots dir=%s", max_entries, mem_snapshot_dir)
+
         # prepare dtype
         weight_dtype = torch.float32
         if args.mixed_precision == "fp16":
@@ -2852,6 +2901,23 @@ class NetworkTrainer:
                         and global_step % args.log_cuda_memory_every_n_steps == 0
                     ):
                         _log_cuda_memory_stats(f"step_{global_step}", latents_shape=latents_shape)
+                        if is_main_process and mem_snapshot_dir and _cuda_memory_snapshot_supported():
+                            alloc_mb = torch.cuda.memory_allocated() / (1024**2)
+                            reserved_mb = torch.cuda.memory_reserved() / (1024**2)
+                            spike_mb = args.dump_cuda_memory_snapshot_on_spike_mb or 0
+                            if spike_mb > 0:
+                                if last_mem_reserved_mb is not None and (reserved_mb - last_mem_reserved_mb) >= spike_mb:
+                                    snap_path = os.path.join(mem_snapshot_dir, f"cuda_memory_snapshot_step_{global_step}_spike.pickle")
+                                    _dump_cuda_memory_snapshot(snap_path)
+                                elif last_mem_alloc_mb is not None and (alloc_mb - last_mem_alloc_mb) >= spike_mb:
+                                    snap_path = os.path.join(mem_snapshot_dir, f"cuda_memory_snapshot_step_{global_step}_spike.pickle")
+                                    _dump_cuda_memory_snapshot(snap_path)
+                            if args.dump_cuda_memory_snapshot_every_n_steps and args.dump_cuda_memory_snapshot_every_n_steps > 0:
+                                if global_step % args.dump_cuda_memory_snapshot_every_n_steps == 0:
+                                    snap_path = os.path.join(mem_snapshot_dir, f"cuda_memory_snapshot_step_{global_step}.pickle")
+                                    _dump_cuda_memory_snapshot(snap_path)
+                            last_mem_alloc_mb = alloc_mb
+                            last_mem_reserved_mb = reserved_mb
 
                     # to avoid calling optimizer_eval_fn() too frequently, we call it only when we need to sample images or save the model
                     should_sampling = should_sample_images(args, global_step, epoch=None)
@@ -3170,6 +3236,29 @@ def setup_parser_common() -> argparse.ArgumentParser:
         default=None,
         help="log CUDA memory stats every N optimizer steps (alloc/reserved/max).",
     )
+    parser.add_argument(
+        "--record_cuda_memory_history",
+        action="store_true",
+        help="record CUDA memory history for snapshotting (torch.cuda.memory._record_memory_history).",
+    )
+    parser.add_argument(
+        "--cuda_memory_history_max_entries",
+        type=int,
+        default=None,
+        help="max entries for CUDA memory history (default: 100000 when recording is enabled).",
+    )
+    parser.add_argument(
+        "--dump_cuda_memory_snapshot_every_n_steps",
+        type=int,
+        default=None,
+        help="dump CUDA memory snapshot every N steps (requires --record_cuda_memory_history).",
+    )
+    parser.add_argument(
+        "--dump_cuda_memory_snapshot_on_spike_mb",
+        type=float,
+        default=None,
+        help="dump CUDA memory snapshot when alloc/reserved jumps by this many MB (requires --record_cuda_memory_history).",
+    )
 
     parser.add_argument(
         "--ddp_timeout",
@@ -3227,7 +3316,7 @@ def setup_parser_common() -> argparse.ArgumentParser:
         "--optimizer_type",
         type=str,
         default="",
-        help="Optimizer to use / オプティマイザの種類: AdamW (default), AdamW8bit, AdaFactor. "
+        help="Optimizer to use / オプティマイザの種類: AdamW (default), AdamW8bit, PagedAdamW8bit, AdaFactor. "
         "Also, you can use any optimizer by specifying the full path to the class, like 'torch.optim.AdamW', 'bitsandbytes.optim.AdEMAMix8bit' or 'bitsandbytes.optim.PagedAdEMAMix8bit' etc. / ",
     )
     parser.add_argument(
