@@ -92,6 +92,29 @@ def parse_args() -> argparse.Namespace:
         default=5.0,
         help="Discrete flow shift for FlowMatch scheduler",
     )
+    parser.add_argument(
+        "--sample_two_stage",
+        action="store_true",
+        help="Enable two-stage sampling (half-res pass + upsample + refinement). Requires --sample_upsampler.",
+    )
+    parser.add_argument(
+        "--sample_upsampler",
+        type=str,
+        default=None,
+        help="Path to LTX-2 spatial upsampler checkpoint for two-stage sampling.",
+    )
+    parser.add_argument(
+        "--sample_distilled_lora",
+        type=str,
+        default=None,
+        help="Optional distilled LoRA for stage-2 refinement in two-stage sampling.",
+    )
+    parser.add_argument(
+        "--sample_distilled_lora_strength",
+        type=float,
+        default=1.0,
+        help="Strength for --sample_distilled_lora (default: 1.0).",
+    )
     parser.add_argument("--seed", type=int, default=None, help="Seed for generation")
 
     parser.add_argument("--mixed_precision", type=str, default="bf16", choices=["no", "fp16", "bf16"])
