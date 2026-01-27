@@ -1,5 +1,4 @@
 import contextlib
-import os
 import torch
 
 _LOGGED_MISMATCH = False
@@ -47,18 +46,6 @@ def ensure_fp8_modules_on_device(module: torch.nn.Module, target_device: torch.d
         if not only_lora:
             weight = getattr(submodule, "weight", None)
             if hasattr(submodule, "weight") and weight is not None and isinstance(weight, torch.Tensor):
-                if (
-                    weight.device == target_device
-                    and target_device.type == "cuda"
-                    and os.getenv("LTX2_FP8_FORCE_DTYPE", "1") == "1"
-                    and hasattr(submodule, "scale_weight")
-                    and isinstance(getattr(submodule, "scale_weight", None), torch.Tensor)
-                    and weight.dtype not in (getattr(torch, "float8_e4m3fn", None), getattr(torch, "float8_e5m2", None))
-                ):
-                    try:
-                        weight.data = weight.data.to(dtype=torch.float8_e4m3fn)
-                    except Exception:
-                        pass
                 if weight.device != target_device:
                     # Skip trainable parameters only when offloading to CPU
                     if should_skip_trainable and hasattr(weight, 'requires_grad') and weight.requires_grad:
@@ -72,17 +59,6 @@ def ensure_fp8_modules_on_device(module: torch.nn.Module, target_device: torch.d
                         if not (should_skip_trainable and hasattr(weight, 'requires_grad') and weight.requires_grad):
                             submodule.to(target_device)
                             weight = submodule.weight
-                            if (
-                                target_device.type == "cuda"
-                                and os.getenv("LTX2_FP8_RESTORE_ON_DEVICE", "1") == "1"
-                                and hasattr(submodule, "scale_weight")
-                                and isinstance(getattr(submodule, "scale_weight", None), torch.Tensor)
-                                and weight.dtype not in (getattr(torch, "float8_e4m3fn", None), getattr(torch, "float8_e5m2", None))
-                            ):
-                                try:
-                                    weight.data = weight.data.to(dtype=torch.float8_e4m3fn)
-                                except Exception:
-                                    pass
             scale_weight = getattr(submodule, "scale_weight", None)
             if isinstance(scale_weight, torch.Tensor) and isinstance(weight, torch.Tensor):
                 if scale_weight.device != weight.device:
@@ -182,50 +158,3 @@ def move_fp8_scale_weights(module: torch.nn.Module, target_device: torch.device)
                         device=target_device, non_blocking=non_blocking
                     )
 
-
-def force_fp8_on_device(module: torch.nn.Module, device: torch.device) -> None:
-    """Cast FP8-capable weights to FP8 if they already live on the target device."""
-    if device.type != "cuda":
-        return
-    fp8_dtype = getattr(torch, "float8_e4m3fn", None)
-    if fp8_dtype is None:
-        return
-    for submodule in module.modules():
-        weight = getattr(submodule, "weight", None)
-        scale_weight = getattr(submodule, "scale_weight", None)
-        if (
-            isinstance(weight, torch.Tensor)
-            and isinstance(scale_weight, torch.Tensor)
-            and weight.device == device
-            and weight.dtype != fp8_dtype
-        ):
-            try:
-                weight.data = weight.data.to(dtype=fp8_dtype)
-            except Exception:
-                pass
-        if isinstance(scale_weight, torch.Tensor) and scale_weight.device == device and scale_weight.dtype == fp8_dtype:
-            try:
-                scale_weight.data = scale_weight.data.to(dtype=torch.float32)
-            except Exception:
-                pass
-        org_forward = getattr(submodule, "org_forward", None)
-        if callable(org_forward):
-            orig_module = getattr(org_forward, "__self__", None)
-            if isinstance(orig_module, torch.nn.Module):
-                weight = getattr(orig_module, "weight", None)
-                scale_weight = getattr(orig_module, "scale_weight", None)
-                if (
-                    isinstance(weight, torch.Tensor)
-                    and isinstance(scale_weight, torch.Tensor)
-                    and weight.device == device
-                    and weight.dtype != fp8_dtype
-                ):
-                    try:
-                        weight.data = weight.data.to(dtype=fp8_dtype)
-                    except Exception:
-                        pass
-                if isinstance(scale_weight, torch.Tensor) and scale_weight.device == device and scale_weight.dtype == fp8_dtype:
-                    try:
-                        scale_weight.data = scale_weight.data.to(dtype=torch.float32)
-                    except Exception:
-                        pass

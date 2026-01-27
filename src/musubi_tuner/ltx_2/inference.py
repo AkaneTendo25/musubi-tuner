@@ -511,8 +511,7 @@ def do_inference(
     from musubi_tuner.ltx_2.model.ltx2_scheduler import LTX2Scheduler, EulerDiffusionStep, X0PredictionWrapper
 
     transformer_device = next(transformer.parameters()).device
-    if getattr(args, "fp8_base", False) or getattr(args, "fp8_scaled", False):
-        trainer._ensure_fp8_buffers_on_device(transformer)
+    # FP8 device reconciliation removed.
     transformer_offload_device = transformer_offload_device or torch.device("cpu")
     original_vae_device = getattr(vae, "device", torch.device("cpu"))
     original_vae_dtype = getattr(vae, "dtype", torch.float32)

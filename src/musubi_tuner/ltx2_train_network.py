@@ -314,6 +314,8 @@ def load_ltx2_model(
     use_fp8_scaled = bool(fp8_scaled)
     use_fp8_base = bool(fp8_base)
     use_fp8 = use_fp8_scaled or use_fp8_base
+    if use_fp8_scaled and torch_dtype is not None:
+        raise ValueError("fp8_scaled requires torch_dtype=None for LTX-2 weights.")
     if use_fp8_scaled:
         load_dtype = None
     elif use_fp8_base:
@@ -530,15 +532,6 @@ class LTX2NetworkTrainer(NetworkTrainer):
             return timesteps
 
         return timesteps / 1000.0
-
-    def _ensure_fp8_buffers_on_device(self, model: torch.nn.Module) -> None:
-        if not any(True for _ in model.parameters()):
-            return
-        from musubi_tuner.ltx_2.model.transformer.fp8_device_utils import ensure_fp8_modules_on_device
-        try:
-            ensure_fp8_modules_on_device(model, next(model.parameters()).device)
-        except StopIteration:
-            return
 
     class _DeferredVAE:
         def __init__(self) -> None:
@@ -779,6 +772,10 @@ class LTX2NetworkTrainer(NetworkTrainer):
         torch_dtype_to_use = dit_weight_dtype or self.dit_dtype or torch.float32
         if dit_weight_dtype is None:
             logger.info("LTX-2 weight dtype not set; using %s for loading", torch_dtype_to_use)
+        if getattr(args, "fp8_scaled", False):
+            torch_dtype_to_use = None
+        if getattr(args, "fp8_base", False) and not getattr(args, "fp8_scaled", False):
+            logger.warning("fp8_base is ignored without fp8_scaled for LTX-2 (WAN-style behavior).")
         transformer = load_ltx2_model(
             model_path=dit_path,
             device=accelerator.device,
@@ -1232,13 +1229,14 @@ class LTX2NetworkTrainer(NetworkTrainer):
         nonfinite_flag = {"hit": False, "tag": None}
 
         def _check_finite(tag: str, tensor: Optional[torch.Tensor]) -> None:
-            if not skip_nonfinite or tensor is None:
+            if tensor is None:
                 return
             if not torch.isfinite(tensor).all():
                 bad = (~torch.isfinite(tensor)).sum().item()
                 logger.error("%s has non-finite values (count=%s).", tag, bad)
-                nonfinite_flag["hit"] = True
-                nonfinite_flag["tag"] = tag
+                if skip_nonfinite:
+                    nonfinite_flag["hit"] = True
+                    nonfinite_flag["tag"] = tag
                 return
 
         def _log_stats(tag: str, tensor: Optional[torch.Tensor]) -> None:
@@ -1437,8 +1435,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 dtype=network_dtype,
             )
 
-            if getattr(args, "fp8_base", False) or getattr(args, "fp8_scaled", False):
-                self._ensure_fp8_buffers_on_device(transformer)
+            # FP8 device reconciliation removed.
             with accelerator.autocast():
                 model_pred = transformer(
                     [None, noisy_audio],
@@ -1623,8 +1620,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
             perturbations = BatchedPerturbationConfig.empty(bsz)
             base_model = transformer.model if hasattr(transformer, "model") else transformer
 
-            if getattr(args, "fp8_base", False) or getattr(args, "fp8_scaled", False):
-                self._ensure_fp8_buffers_on_device(base_model)
+            # FP8 device reconciliation removed.
             with accelerator.autocast():
                 pred_tokens, _ = base_model(video_modality, None, perturbations)
 
@@ -1750,8 +1746,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 if frames > 0:
                     video_loss_mask[video_conditioning_enabled, 0] = False
 
-        if getattr(args, "fp8_base", False) or getattr(args, "fp8_scaled", False):
-            self._ensure_fp8_buffers_on_device(transformer)
+        # FP8 device reconciliation removed.
         with accelerator.autocast():
             model_pred = transformer(
                 model_input,
@@ -2168,7 +2163,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
                             buf.data = buf.data.to(device=accelerator.device)
                 except Exception:
                     pass
-                self._ensure_fp8_buffers_on_device(transformer)
+                # FP8 device reconciliation removed.
                 try:
                     from musubi_tuner.modules.custom_offloading_utils import weighs_to_device as _weights_to_device
                     from musubi_tuner.ltx_2.model.transformer.fp8_device_utils import move_fp8_scale_weights as _move_fp8_scales
