@@ -113,9 +113,20 @@ class LTX2Wrapper(nn.Module):
         raise AttributeError("Underlying LTX2 model does not support gradient checkpointing")
 
     def enable_block_swap(
-        self, blocks_to_swap: int, device: torch.device, supports_backward: bool, use_pinned_memory: bool = False, swap_norms: bool = False
+        self,
+        blocks_to_swap: int,
+        device: torch.device,
+        supports_backward: bool,
+        use_pinned_memory: bool = False,
+        swap_norms: bool = False,
     ):
-        return self.model.enable_block_swap(blocks_to_swap, device, supports_backward, use_pinned_memory, swap_norms=swap_norms)
+        return self.model.enable_block_swap(
+            blocks_to_swap,
+            device,
+            supports_backward,
+            use_pinned_memory,
+            swap_norms=swap_norms,
+        )
 
     def move_to_device_except_swap_blocks(self, device: torch.device):
         return self.model.move_to_device_except_swap_blocks(device)
@@ -453,12 +464,18 @@ LTX2_DEFAULT_INCLUDE_PATTERNS = LTX2_INCLUDE_PATTERNS_T2V
 
 
 def _build_exclude_patterns(raw_patterns: Optional[str], audio_video: bool = False) -> List[str]:  # noqa: ARG001
-    """Build exclude patterns list. Only uses user-provided patterns if specified."""
+    """Build exclude patterns list, including connector exclusions."""
+    patterns: List[str] = [
+        r".*text_embedding_projection\.aggregate_embed.*",
+        r".*embeddings_connector\..*",
+        r".*audio_embeddings_connector\..*",
+    ]
     if raw_patterns is None:
-        return []
-    patterns = ast.literal_eval(raw_patterns)
-    if not isinstance(patterns, list):
+        return patterns
+    user_patterns = ast.literal_eval(raw_patterns)
+    if not isinstance(user_patterns, list):
         raise ValueError("exclude_patterns must evaluate to a list")
+    patterns.extend(user_patterns)
     return patterns
 
 

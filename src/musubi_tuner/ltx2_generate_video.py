@@ -97,7 +97,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mixed_precision", type=str, default="bf16", choices=["no", "fp16", "bf16"])
     parser.add_argument("--vae_dtype", type=str, default=None, help="VAE dtype (default: bfloat16)")
     parser.add_argument(
-        "--ltx_mode",
+        "--ltx2_mode",
+        dest="ltx_mode",
         type=str,
         default="auto",
         choices=["v", "av", "a", "auto"],

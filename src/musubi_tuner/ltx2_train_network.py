@@ -39,7 +39,7 @@ from musubi_tuner.ltx_2.env import apply_ltx2_tweaks
 
 def _resolve_auto_ltx_mode(args: argparse.Namespace) -> str:
     if not getattr(args, "dataset_config", None):
-        raise ValueError("--dataset_config is required for --ltx_mode auto")
+        raise ValueError("--dataset_config is required for --ltx2_mode auto")
 
     from musubi_tuner.dataset import config_utils
     from musubi_tuner.dataset.config_utils import BlueprintGenerator, ConfigSanitizer
@@ -532,8 +532,13 @@ class LTX2NetworkTrainer(NetworkTrainer):
         return timesteps / 1000.0
 
     def _ensure_fp8_buffers_on_device(self, model: torch.nn.Module) -> None:
-        # No-op to match the generic (Wan/HV) pipeline.
-        return
+        if not any(True for _ in model.parameters()):
+            return
+        from musubi_tuner.ltx_2.model.transformer.fp8_device_utils import ensure_fp8_modules_on_device
+        try:
+            ensure_fp8_modules_on_device(model, next(model.parameters()).device)
+        except StopIteration:
+            return
 
     class _DeferredVAE:
         def __init__(self) -> None:
@@ -905,7 +910,13 @@ class LTX2NetworkTrainer(NetworkTrainer):
         device: Optional[torch.device] = None,
     ):
         device = device or torch.device("cpu")
-        logger.info("Loading LTX-2 audio decoder/vocoder from %s (device=%s)", checkpoint_path, device)
+        cpu_device = torch.device("cpu")
+        logger.info(
+            "Loading LTX-2 audio decoder/vocoder from %s (load_device=%s, target_device=%s)",
+            checkpoint_path,
+            cpu_device,
+            device,
+        )
         from musubi_tuner.ltx_2.loader.single_gpu_model_builder import SingleGPUModelBuilder
         from musubi_tuner.ltx_2.model.audio_vae.model_configurator import (
             AudioDecoderConfigurator,
@@ -918,12 +929,16 @@ class LTX2NetworkTrainer(NetworkTrainer):
             model_path=str(checkpoint_path),
             model_class_configurator=AudioDecoderConfigurator,
             model_sd_ops=AUDIO_VAE_DECODER_COMFY_KEYS_FILTER,
-        ).build(device=device, dtype=audio_dtype)
+        ).build(device=cpu_device, dtype=audio_dtype)
         vocoder = SingleGPUModelBuilder(
             model_path=str(checkpoint_path),
             model_class_configurator=VocoderConfigurator,
             model_sd_ops=VOCODER_COMFY_KEYS_FILTER,
-        ).build(device=device, dtype=audio_dtype)
+        ).build(device=cpu_device, dtype=audio_dtype)
+
+        if device.type != "cpu":
+            audio_decoder.to(device)
+            vocoder.to(device)
 
         audio_decoder.eval()
         vocoder.eval()
@@ -969,7 +984,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 "--output",
                 output_path,
                 "--device",
-                "auto",
+                "cpu",
                 "--dtype",
                 "fp32",
             ]
@@ -1324,7 +1339,8 @@ class LTX2NetworkTrainer(NetworkTrainer):
             if text_mask.shape[0] != latents.shape[0]:
                 raise ValueError(f"Batch size mismatch: latents batch={latents.shape[0]} vs text_mask batch={text_mask.shape[0]}")
             text_mask = text_mask.to(device=accelerator.device)
-            text_mask = text_mask.to(torch.bool)
+            if args.gradient_checkpointing:
+                text_mask = text_mask.to(torch.bool)
 
         # Move latents to device
         latents = latents.to(device=accelerator.device, dtype=network_dtype)
@@ -1387,7 +1403,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 audio_latents = audio_latents.get("latents")
             if audio_latents is None:
                 if self._ltx_mode == "a":
-                    raise ValueError("audio_latents are required for --ltx_mode a")
+                    raise ValueError("audio_latents are required for --ltx2_mode a")
                 dummy_video = torch.zeros(
                     (latents.shape[0], latents.shape[1], 1, 1, 1),
                     device=accelerator.device,
@@ -2082,6 +2098,35 @@ class LTX2NetworkTrainer(NetworkTrainer):
         transformer = accelerator.unwrap_model(transformer)
         transformer.switch_block_swap_for_inference()
         original_device = next(transformer.parameters()).device
+        saved_swap_state = None
+        if (getattr(args, "fp8_base", False) or getattr(args, "fp8_scaled", False)) and getattr(transformer, "blocks_to_swap", 0):
+            saved_swap_state = {
+                "blocks_to_swap": int(getattr(transformer, "blocks_to_swap", 0) or 0),
+                "use_pinned": bool(getattr(args, "use_pinned_memory_for_block_swap", False)),
+            }
+            logger.info("Sampling: disabling block swap temporarily to avoid FP8 CPU/GPU mismatch")
+            base_model = transformer.model if hasattr(transformer, "model") else transformer
+            transformer.blocks_to_swap = 0
+            transformer.offloader = None
+            base_model.blocks_to_swap = 0
+            base_model.offloader = None
+            if hasattr(transformer, "_ltx2_block_swap"):
+                transformer._ltx2_block_swap = None
+            if hasattr(base_model, "_ltx2_block_swap"):
+                base_model._ltx2_block_swap = None
+            base_model.to(accelerator.device)
+            transformer.to(accelerator.device)
+            try:
+                from musubi_tuner.modules.custom_offloading_utils import weighs_to_device as _weights_to_device
+                from musubi_tuner.ltx_2.model.transformer.fp8_device_utils import move_fp8_scale_weights as _move_fp8_scales
+                blocks = getattr(base_model, "transformer_blocks", None)
+                if blocks is not None:
+                    for block in blocks:
+                        _weights_to_device(block, accelerator.device)
+                        _move_fp8_scales(block, accelerator.device)
+            except Exception:
+                pass
+            clean_memory_on_device(accelerator.device)
         offload = bool(getattr(args, "sample_with_offloading", False))
         transformer_offloaded = offload and accelerator.device.type == "cuda"
         if transformer_offloaded:
@@ -2109,11 +2154,32 @@ class LTX2NetworkTrainer(NetworkTrainer):
         def ensure_transformer_on_device() -> None:
             if transformer_offloaded:
                 logger.info("Sampling offload: moving transformer to GPU for denoise")
-                if hasattr(transformer, "move_to_device_except_swap_blocks"):
-                    transformer.move_to_device_except_swap_blocks(accelerator.device)
-                else:
-                    transformer.to(accelerator.device)
+                base_model = transformer.model if hasattr(transformer, "model") else transformer
+                base_model.to(accelerator.device)
+                transformer.to(accelerator.device)
                 clean_memory_on_device(accelerator.device)
+            if getattr(args, "fp8_base", False) or getattr(args, "fp8_scaled", False):
+                try:
+                    for param in transformer.parameters():
+                        if isinstance(param, torch.Tensor) and param.device != accelerator.device:
+                            param.data = param.data.to(device=accelerator.device)
+                    for buf in transformer.buffers():
+                        if isinstance(buf, torch.Tensor) and buf.device != accelerator.device:
+                            buf.data = buf.data.to(device=accelerator.device)
+                except Exception:
+                    pass
+                self._ensure_fp8_buffers_on_device(transformer)
+                try:
+                    from musubi_tuner.modules.custom_offloading_utils import weighs_to_device as _weights_to_device
+                    from musubi_tuner.ltx_2.model.transformer.fp8_device_utils import move_fp8_scale_weights as _move_fp8_scales
+                    base_model = transformer.model if hasattr(transformer, "model") else transformer
+                    blocks = getattr(base_model, "transformer_blocks", None)
+                    if blocks is not None:
+                        for block in blocks:
+                            _weights_to_device(block, accelerator.device)
+                            _move_fp8_scales(block, accelerator.device)
+                except Exception:
+                    pass
 
         def offload_transformer_if_needed() -> None:
             if transformer_offloaded:
@@ -2156,53 +2222,15 @@ class LTX2NetworkTrainer(NetworkTrainer):
             logger.info("Sampling batch: unloaded text encoder after encoding all prompts")
             self._cleanup_cuda(accelerator.device)
 
-        if distributed_state.num_processes <= 1:
-            # Batch encode all prompts upfront when offloading is enabled
-            if transformer_offloaded:
-                offload_transformer_if_needed()
-                prepare_all_embeddings_batch(sample_parameters)
+        try:
+            if distributed_state.num_processes <= 1:
+                # Batch encode all prompts upfront when offloading is enabled
+                if transformer_offloaded:
+                    offload_transformer_if_needed()
+                    prepare_all_embeddings_batch(sample_parameters)
 
-            with torch.no_grad(), accelerator.autocast():
-                for sample_parameter in sample_parameters:
-                    if transformer_offloaded:
-                        offload_transformer_if_needed()
-                        vae_dtype = torch.float16 if args.vae_dtype is None else model_utils.str_to_dtype(args.vae_dtype)
-                        logger.info("Sampling offload: loading VAE for sampling")
-                        vae_for_sampling = self._load_vae_impl(args, vae_dtype=vae_dtype, vae_path=args.vae)
-                        ensure_transformer_on_device()
-                        self.sample_image_inference(
-                            accelerator, args, transformer, dit_dtype, vae_for_sampling, save_dir, sample_parameter, epoch, steps
-                        )
-                        offload_transformer_if_needed()
-                        vae_for_sampling.to_device("cpu")
-                        logger.info("Sampling offload: moved VAE back to CPU after sampling")
-                        self._cleanup_cuda(accelerator.device)
-                    else:
-                        self.sample_image_inference(
-                            accelerator, args, transformer, dit_dtype, vae, save_dir, sample_parameter, epoch, steps
-                        )
-                    clean_memory_on_device(accelerator.device)
-                    self._cleanup_cuda(accelerator.device)
-
-            # Cleanup embeddings after all samples are done
-            if transformer_offloaded:
-                for sample_parameter in sample_parameters:
-                    cleanup_embeddings(sample_parameter)
-        else:
-            per_process_params = []
-            for i in range(distributed_state.num_processes):
-                per_process_params.append(sample_parameters[i :: distributed_state.num_processes])
-
-            with torch.no_grad():
-                with distributed_state.split_between_processes(per_process_params) as sample_parameter_lists:
-                    my_sample_params = sample_parameter_lists[0]
-                    
-                    # Batch encode all prompts for this process upfront
-                    if transformer_offloaded:
-                        offload_transformer_if_needed()
-                        prepare_all_embeddings_batch(my_sample_params)
-
-                    for sample_parameter in my_sample_params:
+                with torch.no_grad(), accelerator.autocast():
+                    for sample_parameter in sample_parameters:
                         if transformer_offloaded:
                             offload_transformer_if_needed()
                             vae_dtype = torch.float16 if args.vae_dtype is None else model_utils.str_to_dtype(args.vae_dtype)
@@ -2210,15 +2238,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
                             vae_for_sampling = self._load_vae_impl(args, vae_dtype=vae_dtype, vae_path=args.vae)
                             ensure_transformer_on_device()
                             self.sample_image_inference(
-                                accelerator,
-                                args,
-                                transformer,
-                                dit_dtype,
-                                vae_for_sampling,
-                                save_dir,
-                                sample_parameter,
-                                epoch,
-                                steps,
+                                accelerator, args, transformer, dit_dtype, vae_for_sampling, save_dir, sample_parameter, epoch, steps
                             )
                             offload_transformer_if_needed()
                             vae_for_sampling.to_device("cpu")
@@ -2228,30 +2248,85 @@ class LTX2NetworkTrainer(NetworkTrainer):
                             self.sample_image_inference(
                                 accelerator, args, transformer, dit_dtype, vae, save_dir, sample_parameter, epoch, steps
                             )
+                        clean_memory_on_device(accelerator.device)
                         self._cleanup_cuda(accelerator.device)
 
-                    # Cleanup embeddings after all samples for this process
-                    if transformer_offloaded:
+                # Cleanup embeddings after all samples are done
+                if transformer_offloaded:
+                    for sample_parameter in sample_parameters:
+                        cleanup_embeddings(sample_parameter)
+            else:
+                per_process_params = []
+                for i in range(distributed_state.num_processes):
+                    per_process_params.append(sample_parameters[i :: distributed_state.num_processes])
+
+                with torch.no_grad():
+                    with distributed_state.split_between_processes(per_process_params) as sample_parameter_lists:
+                        my_sample_params = sample_parameter_lists[0]
+                        
+                        # Batch encode all prompts for this process upfront
+                        if transformer_offloaded:
+                            offload_transformer_if_needed()
+                            prepare_all_embeddings_batch(my_sample_params)
+
                         for sample_parameter in my_sample_params:
-                            cleanup_embeddings(sample_parameter)
+                            if transformer_offloaded:
+                                offload_transformer_if_needed()
+                                vae_dtype = torch.float16 if args.vae_dtype is None else model_utils.str_to_dtype(args.vae_dtype)
+                                logger.info("Sampling offload: loading VAE for sampling")
+                                vae_for_sampling = self._load_vae_impl(args, vae_dtype=vae_dtype, vae_path=args.vae)
+                                ensure_transformer_on_device()
+                                self.sample_image_inference(
+                                    accelerator,
+                                    args,
+                                    transformer,
+                                    dit_dtype,
+                                    vae_for_sampling,
+                                    save_dir,
+                                    sample_parameter,
+                                    epoch,
+                                    steps,
+                                )
+                                offload_transformer_if_needed()
+                                vae_for_sampling.to_device("cpu")
+                                logger.info("Sampling offload: moved VAE back to CPU after sampling")
+                                self._cleanup_cuda(accelerator.device)
+                            else:
+                                self.sample_image_inference(
+                                    accelerator, args, transformer, dit_dtype, vae, save_dir, sample_parameter, epoch, steps
+                                )
+                            self._cleanup_cuda(accelerator.device)
 
-        torch.set_rng_state(rng_state)
-        if cuda_rng_state is not None:
-            torch.cuda.set_rng_state(cuda_rng_state)
+                        # Cleanup embeddings after all samples for this process
+                        if transformer_offloaded:
+                            for sample_parameter in my_sample_params:
+                                cleanup_embeddings(sample_parameter)
+        finally:
+            torch.set_rng_state(rng_state)
+            if cuda_rng_state is not None:
+                torch.cuda.set_rng_state(cuda_rng_state)
 
-        if transformer_offloaded and next(transformer.parameters()).device != accelerator.device:
+            if transformer_offloaded and next(transformer.parameters()).device != accelerator.device:
+                if hasattr(transformer, "move_to_device_except_swap_blocks"):
+                    transformer.move_to_device_except_swap_blocks(accelerator.device)
+                else:
+                    transformer.to(accelerator.device)
+                logger.info("Sampling offload: restored transformer to training device")
+                clean_memory_on_device(accelerator.device)
+
+            if saved_swap_state is not None:
+                transformer.enable_block_swap(
+                    saved_swap_state["blocks_to_swap"],
+                    accelerator.device,
+                    supports_backward=True,
+                    use_pinned_memory=saved_swap_state["use_pinned"],
+                )
+
+            transformer.switch_block_swap_for_training()
+            # Ensure block-swap layout is re-applied after sampling to avoid VRAM creep.
             if hasattr(transformer, "move_to_device_except_swap_blocks"):
                 transformer.move_to_device_except_swap_blocks(accelerator.device)
-            else:
-                transformer.to(accelerator.device)
-            logger.info("Sampling offload: restored transformer to training device")
-            clean_memory_on_device(accelerator.device)
-
-        transformer.switch_block_swap_for_training()
-        # Ensure block-swap layout is re-applied after sampling to avoid VRAM creep.
-        if hasattr(transformer, "move_to_device_except_swap_blocks"):
-            transformer.move_to_device_except_swap_blocks(accelerator.device)
-        self._cleanup_cuda(accelerator.device)
+            self._cleanup_cuda(accelerator.device)
 
     def sample_image_inference(
         self,
@@ -2285,27 +2360,45 @@ class LTX2NetworkTrainer(NetworkTrainer):
         vocoder = None
         loaded_audio = False
         disable_audio_preview = bool(getattr(args, "sample_disable_audio", False))
-        use_audio_subprocess = False
+        use_audio_subprocess = os.name == "nt"
         audio_only_preview = bool(getattr(args, "sample_audio_only", False))
         if audio_only_preview and getattr(args, "ltx_mode", "v") not in {"av", "a"}:
-            raise ValueError("--sample_audio_only requires --ltx_mode av or a")
+            raise ValueError("--sample_audio_only requires --ltx2_mode av or a")
         enable_audio_preview = (self._audio_video or audio_only_preview) and not disable_audio_preview
         if enable_audio_preview and getattr(args, "ltx_mode", "v") in {"av", "a"}:
-            # Align with LTX-v2 audio decode path (bf16 by default).
-            audio_dtype = torch.bfloat16 if args.vae_dtype is None else model_utils.str_to_dtype(args.vae_dtype)
-            audio_device = accelerator.device
-            try:
-                audio_decoder, vocoder = self._load_audio_components(
-                    args,
-                    audio_dtype=audio_dtype,
-                    checkpoint_path=args.ltx2_checkpoint,
-                    device=audio_device,
-                )
-                loaded_audio = True
-            except Exception as exc:
-                logger.warning("Sampling audio decoder load failed; continuing without audio preview: %s", exc)
-                audio_decoder, vocoder = None, None
-                loaded_audio = False
+            if use_audio_subprocess:
+                logger.info("Sampling audio: using subprocess decoder on Windows; skipping in-process load")
+            else:
+                # Align with LTX-v2 audio decode path (bf16 by default).
+                audio_dtype = torch.bfloat16 if args.vae_dtype is None else model_utils.str_to_dtype(args.vae_dtype)
+                audio_device = accelerator.device
+                try:
+                    if accelerator.device.type == "cuda" and next(transformer.parameters()).device.type == "cuda":
+                        logger.info("Sampling audio: offloading transformer to CPU before audio decoder/vocoder load")
+                        if hasattr(transformer, "move_to_device_except_swap_blocks"):
+                            transformer.move_to_device_except_swap_blocks("cpu")
+                        else:
+                            transformer.to("cpu")
+                        clean_memory_on_device(accelerator.device)
+                    audio_decoder, vocoder = self._load_audio_components(
+                        args,
+                        audio_dtype=audio_dtype,
+                        checkpoint_path=args.ltx2_checkpoint,
+                        device=audio_device,
+                    )
+                    loaded_audio = True
+                except Exception as exc:
+                    logger.warning("Sampling audio decoder load failed; continuing without audio preview: %s", exc)
+                    audio_decoder, vocoder = None, None
+                    loaded_audio = False
+                finally:
+                    if accelerator.device.type == "cuda" and next(transformer.parameters()).device.type != accelerator.device:
+                        logger.info("Sampling audio: restoring transformer to GPU after audio decoder/vocoder load")
+                        if hasattr(transformer, "move_to_device_except_swap_blocks"):
+                            transformer.move_to_device_except_swap_blocks(accelerator.device)
+                        else:
+                            transformer.to(accelerator.device)
+                        clean_memory_on_device(accelerator.device)
 
         sample_steps = sample_parameter.get("sample_steps", 20)
         width = sample_parameter.get("width", 768)
@@ -2505,6 +2598,8 @@ class LTX2NetworkTrainer(NetworkTrainer):
         from musubi_tuner.ltx_2.types import AudioLatentShape, VideoPixelShape
 
         transformer_device = next(transformer.parameters()).device
+        if getattr(args, "fp8_base", False) or getattr(args, "fp8_scaled", False):
+            self._ensure_fp8_buffers_on_device(transformer)
         transformer_offload_device = transformer_offload_device or torch.device("cpu")
         original_vae_device = getattr(vae, "device", torch.device("cpu"))
         original_vae_dtype = getattr(vae, "dtype", torch.float32)
@@ -2739,48 +2834,78 @@ class LTX2NetworkTrainer(NetworkTrainer):
             if offload_transformer_for_decode:
                 logger.info("Sampling offload: moving VAE to GPU for decode")
                 vae.to_device(transformer_device)
-            with torch.no_grad():
-                use_tiled_vae = getattr(args, "sample_tiled_vae", False)
-                if use_tiled_vae:
-                    from musubi_tuner.ltx_2.model.video_vae import TilingConfig, SpatialTilingConfig, TemporalTilingConfig
-                    tile_size = getattr(args, "sample_vae_tile_size", 512)
-                    tile_overlap = getattr(args, "sample_vae_tile_overlap", 64)
-                    temporal_tile_size = getattr(args, "sample_vae_temporal_tile_size", 0)
-                    temporal_tile_overlap = getattr(args, "sample_vae_temporal_tile_overlap", 8)
-                    
-                    # Use configured temporal tiling, or 9999 frames (all at once) if disabled
-                    effective_temporal_size = temporal_tile_size if temporal_tile_size > 0 else 9999
-                    effective_temporal_overlap = temporal_tile_overlap if temporal_tile_size > 0 else 0
-                    
-                    tiling_config = TilingConfig(
-                        spatial_config=SpatialTilingConfig(
-                            tile_size_in_pixels=tile_size,
-                            tile_overlap_in_pixels=tile_overlap,
-                        ),
-                        temporal_config=TemporalTilingConfig(
-                            tile_size_in_frames=effective_temporal_size,
-                            tile_overlap_in_frames=effective_temporal_overlap,
-                        ),
-                    )
-                    if temporal_tile_size > 0:
-                        logger.info("Using tiled VAE decode (spatial=%dx%d, temporal=%d/%d)", 
-                                   tile_size, tile_overlap, temporal_tile_size, temporal_tile_overlap)
-                    else:
-                        logger.info("Using tiled VAE decode (spatial=%dx%d, no temporal tiling)", 
-                                   tile_size, tile_overlap)
-                    video = vae.tiled_decode(latents.squeeze(0), tiling_config)
-                    if video.dim() == 4:  # [C, T, H, W]
-                        video = video.unsqueeze(0)  # [1, C, T, H, W]
-                else:
-                    video = vae.decode([latents.squeeze(0)])
-                    if isinstance(video, list) and video:
-                        video = video[0]
-                        if video.dim() == 4:  # [C, T, H, W]
-                            video = video.unsqueeze(0)  # [1, C, T, H, W]
+            else:
+                vae.to_device(transformer_device)
+
+            def _decode_video() -> torch.Tensor:
+                with torch.no_grad():
+                    use_tiled_vae = getattr(args, "sample_tiled_vae", False)
+                    if use_tiled_vae:
+                        from musubi_tuner.ltx_2.model.video_vae import TilingConfig, SpatialTilingConfig, TemporalTilingConfig
+                        tile_size = getattr(args, "sample_vae_tile_size", 512)
+                        tile_overlap = getattr(args, "sample_vae_tile_overlap", 64)
+                        temporal_tile_size = getattr(args, "sample_vae_temporal_tile_size", 0)
+                        temporal_tile_overlap = getattr(args, "sample_vae_temporal_tile_overlap", 8)
+
+                        # Use configured temporal tiling, or 9999 frames (all at once) if disabled
+                        effective_temporal_size = temporal_tile_size if temporal_tile_size > 0 else 9999
+                        effective_temporal_overlap = temporal_tile_overlap if temporal_tile_size > 0 else 0
+
+                        tiling_config = TilingConfig(
+                            spatial_config=SpatialTilingConfig(
+                                tile_size_in_pixels=tile_size,
+                                tile_overlap_in_pixels=tile_overlap,
+                            ),
+                            temporal_config=TemporalTilingConfig(
+                                tile_size_in_frames=effective_temporal_size,
+                                tile_overlap_in_frames=effective_temporal_overlap,
+                            ),
+                        )
+                        if temporal_tile_size > 0:
+                            logger.info(
+                                "Using tiled VAE decode (spatial=%dx%d, temporal=%d/%d)",
+                                tile_size,
+                                tile_overlap,
+                                temporal_tile_size,
+                                temporal_tile_overlap,
+                            )
+                        else:
+                            logger.info(
+                                "Using tiled VAE decode (spatial=%dx%d, no temporal tiling)",
+                                tile_size,
+                                tile_overlap,
+                            )
+                        out = vae.tiled_decode(latents.squeeze(0), tiling_config)
+                        if out.dim() == 4:  # [C, T, H, W]
+                            out = out.unsqueeze(0)  # [1, C, T, H, W]
+                        return out
+
+                    out = vae.decode([latents.squeeze(0)])
+                    if isinstance(out, list) and out:
+                        out = out[0]
+                        if out.dim() == 4:  # [C, T, H, W]
+                            out = out.unsqueeze(0)  # [1, C, T, H, W]
+                    return out
+
+            try:
+                video = _decode_video()
+            except torch.OutOfMemoryError as exc:
+                if not offload_transformer_for_decode:
+                    raise
+                logger.warning("Sampling decode OOM on GPU; retrying on CPU: %s", exc)
+                vae.to_device(original_vae_device)
+                clean_memory_on_device(transformer_device)
+                video = _decode_video()
 
         audio_waveform = None
         if audio_latents is not None:
-            if audio_decoder is not None and vocoder is not None:
+            if use_audio_subprocess and audio_output_path:
+                self._decode_audio_preview_subprocess(
+                    audio_latents=audio_latents,
+                    output_path=audio_output_path,
+                    checkpoint_path=args.ltx2_checkpoint,
+                )
+            elif audio_decoder is not None and vocoder is not None:
                 if offload_transformer_for_decode:
                     logger.info("Sampling offload: moving VAE back to CPU before audio decode")
                     vae.to_device(original_vae_device)
@@ -2870,7 +2995,7 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
     )
 
     parser.add_argument(
-        "--ltx_mode",
+        "--ltx2_mode",
         type=str,
         default="auto",
         choices=["v", "av", "a", "auto"],
@@ -2879,7 +3004,7 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
     parser.add_argument(
         "--split_av_passes",
         action="store_true",
-        help="When using --ltx_mode av, run separate video-only and audio-only passes per batch (lower peak activations, slower).",
+        help="When using --ltx2_mode av, run separate video-only and audio-only passes per batch (lower peak activations, slower).",
     )
     parser.add_argument(
         "--split_attn_target",

@@ -30,8 +30,9 @@ def _is_norm_module(module: torch.nn.Module) -> bool:
 
 
 def ensure_fp8_modules_on_device(module: torch.nn.Module, target_device: torch.device, only_lora: bool = False, skip_trainable: bool = True) -> None:
-    # No-op to match the generic (Wan/HV) pipeline.
-    return
+    global _LOGGED_MISMATCH
+    if not _FP8_SYNC_ENABLED:
+        return
     # Only skip trainable parameters when moving TO CPU (offloading), not when loading TO GPU
     should_skip_trainable = skip_trainable and target_device.type == "cpu"
     
