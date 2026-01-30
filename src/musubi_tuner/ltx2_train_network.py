@@ -2487,12 +2487,22 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 prompt_mask = None
 
         enable_audio_preview = bool(enable_audio_preview)
-        if not enable_audio_preview and prompt_embeds.shape[-1] % 2 == 0:
-            logger.warning(
-                "Sampling: audio preview disabled; using video-only prompt embeddings (half of dim=%s).",
-                prompt_embeds.shape[-1],
-            )
-            prompt_embeds = prompt_embeds[..., : prompt_embeds.shape[-1] // 2]
+        if not enable_audio_preview:
+            expected_embed_dim = None
+            try:
+                caption_proj = getattr(transformer, "caption_projection", None)
+                if caption_proj is not None and hasattr(caption_proj, "linear_1"):
+                    expected_embed_dim = int(caption_proj.linear_1.in_features)
+            except Exception:
+                expected_embed_dim = None
+
+            current_dim = int(prompt_embeds.shape[-1])
+            if expected_embed_dim is not None and current_dim == expected_embed_dim * 2:
+                logger.warning(
+                    "Sampling: audio preview disabled; using video-only prompt embeddings (half of dim=%s).",
+                    current_dim,
+                )
+                prompt_embeds = prompt_embeds[..., : expected_embed_dim]
 
         # Setup LTX-2 specific scheduler and stepper
         from musubi_tuner.ltx_2.model.ltx2_scheduler import LTX2Scheduler, EulerDiffusionStep, X0PredictionWrapper
@@ -2760,10 +2770,18 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
     )
 
     parser.add_argument(
+        "--ltx2_mode",
+        dest="ltx_mode",
+        type=str,
+        default="video",
+        choices=["video", "av", "audio", "v", "a", "va"],
+        help="Training modality (alias for --ltx_mode).",
+    )
+    parser.add_argument(
         "--ltx_mode",
         type=str,
         default="video",
-        choices=["video", "av", "audio"],
+        choices=["video", "av", "audio", "v", "a", "va"],
         help="Training modality.",
     )
     parser.add_argument(
@@ -2936,6 +2954,10 @@ def main() -> None:
 
     args = parser.parse_args()
     args = read_config_from_file(args, parser)
+    if hasattr(args, "ltx_mode"):
+        short_map = {"v": "video", "a": "audio", "va": "av"}
+        if args.ltx_mode in short_map:
+            args.ltx_mode = short_map[args.ltx_mode]
     apply_ltx2_tweaks(args)
     if getattr(args, "auto_blocks_to_checkpoint", False):
         if getattr(args, "blockwise_checkpointing", False) and int(getattr(args, "blocks_to_swap", 0) or 0) > 0:

@@ -128,9 +128,22 @@ def convert_lora_to_comfy(input_path, output_path=None, verbose=False):
 
     print(f"Input LoRA has {len(trained_state_dict)} keys")
 
+    # Collect alpha and rank per LoRA module to fold scale into weights
+    lora_alpha = {}
+    lora_rank = {}
+    for key, tensor in trained_state_dict.items():
+        if key.endswith(".lora_down.weight"):
+            lora_name = key.rsplit(".", 2)[0]
+            if lora_name not in lora_rank:
+                lora_rank[lora_name] = tensor.shape[0]
+        elif key.endswith(".alpha"):
+            lora_name = key.rsplit(".", 1)[0]
+            lora_alpha[lora_name] = tensor
+
     # Convert keys
     comfy_state_dict = {}
     skipped_alpha = 0
+    folded_alpha = 0
     converted = 0
     failed = 0
 
@@ -146,6 +159,17 @@ def convert_lora_to_comfy(input_path, output_path=None, verbose=False):
                 failed += 1
                 print(f"Failed to convert key: {key}")
         else:
+            # Fold alpha scale into lora_B (up) weights, since Comfy ignores alpha keys.
+            if key.endswith(".lora_up.weight"):
+                lora_name = key.rsplit(".", 2)[0]
+                alpha = lora_alpha.get(lora_name, None)
+                rank = lora_rank.get(lora_name, None)
+                if alpha is not None and rank is not None and rank != 0:
+                    scale = float(alpha.item()) / float(rank)
+                    tensor = tensor * scale
+                    folded_alpha += 1
+                    if verbose:
+                        print(f"Folded alpha for {lora_name}: alpha={float(alpha.item())} rank={rank} scale={scale}")
             comfy_state_dict[new_key] = tensor
             converted += 1
             if verbose:
@@ -154,6 +178,7 @@ def convert_lora_to_comfy(input_path, output_path=None, verbose=False):
     print(f"\nConversion summary:")
     print(f"  Converted: {converted} keys")
     print(f"  Skipped alpha keys: {skipped_alpha}")
+    print(f"  Folded alpha into lora_B: {folded_alpha}")
     print(f"  Failed: {failed} keys")
     print(f"  Output LoRA has {len(comfy_state_dict)} keys")
 

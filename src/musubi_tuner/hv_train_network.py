@@ -534,6 +534,18 @@ class NetworkTrainer:
                 logger.info(f"use 8-bit AdamW optimizer | {optimizer_kwargs}")
                 optimizer_class = bnb.optim.AdamW8bit
                 optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
+            elif optimizer_type == "PagedAdamW8bit".lower():
+                logger.info(f"use 8-bit PagedAdamW optimizer | {optimizer_kwargs}")
+                optimizer_class = getattr(bnb.optim, "PagedAdamW8bit", None)
+                if optimizer_class is None:
+                    raise ValueError("bitsandbytes.optim.PagedAdamW8bit is not available in this bitsandbytes build")
+                optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
+            elif optimizer_type == "PagedAdam8bit".lower():
+                logger.info(f"use 8-bit PagedAdam optimizer | {optimizer_kwargs}")
+                optimizer_class = getattr(bnb.optim, "PagedAdam8bit", None)
+                if optimizer_class is None:
+                    raise ValueError("bitsandbytes.optim.PagedAdam8bit is not available in this bitsandbytes build")
+                optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
 
         elif optimizer_type == "Adafactor".lower():
             # Adafactor: check relative_step and warmup_init
@@ -2769,6 +2781,9 @@ class NetworkTrainer:
                 loss_recorder.add(epoch=epoch, step=step, loss=current_loss)
                 avr_loss: float = loss_recorder.moving_average
                 logs = {"avr_loss": avr_loss}  # , "lr": lr_scheduler.get_last_lr()[0]}
+                if dict_output:
+                    logs["loss_v"] = video_loss_value if video_loss_value is not None else "n/a"
+                    logs["loss_a"] = audio_loss_value if audio_loss_value is not None else "n/a"
                 progress_bar.set_postfix(**logs)
 
                 if args.scale_weight_norms:

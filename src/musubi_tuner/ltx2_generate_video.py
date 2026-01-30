@@ -96,10 +96,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mixed_precision", type=str, default="bf16", choices=["no", "fp16", "bf16"])
     parser.add_argument("--vae_dtype", type=str, default=None, help="VAE dtype (default: bfloat16)")
     parser.add_argument(
+        "--ltx2_mode",
+        dest="ltx_mode",
+        type=str,
+        default="video",
+        choices=["video", "av", "audio", "v", "a", "va"],
+        help="Generation modality (alias for --ltx_mode).",
+    )
+    parser.add_argument(
         "--ltx_mode",
         type=str,
         default="video",
-        choices=["video", "av", "audio"],
+        choices=["video", "av", "audio", "v", "a", "va"],
         help="Inference mode (use 'av' for audio+video sampling).",
     )
     parser.add_argument(
@@ -127,6 +135,9 @@ def parse_args() -> argparse.Namespace:
     setup_parser_compile(parser)
 
     args = parser.parse_args()
+    short_map = {"v": "video", "a": "audio", "va": "av"}
+    if getattr(args, "ltx_mode", None) in short_map:
+        args.ltx_mode = short_map[args.ltx_mode]
     if args.prompt is None and args.from_file is None:
         raise ValueError("Either --prompt or --from_file must be specified")
     if args.gemma_root is None:

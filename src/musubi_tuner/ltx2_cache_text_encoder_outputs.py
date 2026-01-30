@@ -174,6 +174,10 @@ def main() -> None:
     args = parser.parse_args()
     apply_ltx2_tweaks(args)
 
+    short_map = {"v": "video", "a": "audio", "va": "av"}
+    if getattr(args, "ltx_mode", None) in short_map:
+        args.ltx_mode = short_map[args.ltx_mode]
+
     ltx_mode = getattr(args, "ltx_mode", "video")
     audio_video = ltx_mode == "av" or getattr(args, "ltx2_audio_video", False)
 
@@ -349,10 +353,18 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         help="Optional Gemma weights .safetensors file (tokenizer/config still from --gemma_root).",
     )
     parser.add_argument(
+        "--ltx2_mode",
+        dest="ltx_mode",
+        type=str,
+        default="video",
+        choices=["video", "av", "audio", "v", "a", "va"],
+        help="Caching modality (alias for --ltx_mode).",
+    )
+    parser.add_argument(
         "--ltx_mode",
         type=str,
         default="video",
-        choices=["video", "av", "audio"],
+        choices=["video", "av", "audio", "v", "a", "va"],
         help="Caching modality. Use 'av' to cache audio-video prompt embeddings.",
     )
     parser.add_argument(

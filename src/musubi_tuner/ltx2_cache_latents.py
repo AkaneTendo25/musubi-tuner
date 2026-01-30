@@ -365,6 +365,9 @@ def main() -> None:
     parser = cache_latents.setup_parser_common()
     parser = ltx2_setup_parser(parser)
     args = parser.parse_args()
+    short_map = {"v": "video", "a": "audio", "va": "av"}
+    if getattr(args, "ltx_mode", None) in short_map:
+        args.ltx_mode = short_map[args.ltx_mode]
 
     if args.disable_cudnn_backend:
         logger.info("Disabling cuDNN PyTorch backend.")
@@ -521,10 +524,18 @@ def main() -> None:
 
 def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     parser.add_argument(
+        "--ltx2_mode",
+        dest="ltx_mode",
+        type=str,
+        default="video",
+        choices=["video", "av", "audio", "v", "a", "va"],
+        help="Caching modality (alias for --ltx_mode).",
+    )
+    parser.add_argument(
         "--ltx_mode",
         type=str,
         default="video",
-        choices=["video", "av", "audio"],
+        choices=["video", "av", "audio", "v", "a", "va"],
         help="Caching modality. Use 'av' for AV, or 'audio' for audio-only datasets.",
     )
     parser.add_argument(
