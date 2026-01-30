@@ -22,13 +22,15 @@ def ensure_fp8_modules_on_device(module: torch.nn.Module, target_device: torch.d
     global _LOGGED_MISMATCH
     # Only skip trainable parameters when moving TO CPU (offloading), not when loading TO GPU
     should_skip_trainable = skip_trainable and target_device.type == "cpu"
+    # Avoid pulling swapped FP8 weights back to GPU during swap-managed training.
+    avoid_weight_move = bool(getattr(module, "swap_weight_offload", False)) and target_device.type == "cuda"
     
-    allow_weight_move = isinstance(module, torch.nn.Linear) or module.__class__.__name__.endswith("Linear")
     for submodule in module.modules():
         if only_lora:
             allow_weight_move = False
             allow_norm_move = False
         else:
+            allow_weight_move = isinstance(submodule, torch.nn.Linear) or submodule.__class__.__name__.endswith("Linear")
             allow_norm_move = _is_norm_module(submodule)
 
         if not only_lora:
@@ -42,7 +44,7 @@ def ensure_fp8_modules_on_device(module: torch.nn.Module, target_device: torch.d
                     print(
                         f"[LTX-2 fp8] weight on {weight.device}, target {target_device}: {submodule.__class__.__name__}"
                     )
-                if allow_weight_move or allow_norm_move:
+                if (allow_weight_move or allow_norm_move) and not avoid_weight_move:
                     if not (should_skip_trainable and hasattr(weight, 'requires_grad') and weight.requires_grad):
                         submodule.to(target_device)
                         weight = submodule.weight

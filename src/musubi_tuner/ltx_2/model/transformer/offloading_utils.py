@@ -48,6 +48,35 @@ def _move_block_params_excluding_audio(
                 weighs_to_device(module, device, use_pinned=use_pinned)
 
 
+def _is_norm_module(module: nn.Module) -> bool:
+    name = module.__class__.__name__
+    return name.endswith("RMSNorm") or name.endswith("LayerNorm") or name.endswith("GroupNorm") or name.endswith("BatchNorm")
+
+
+def _move_non_linear_params(block: nn.Module, device: torch.device, *, include_norms: bool) -> None:
+    """Move non-linear params/buffers to device without touching Linear weights."""
+    non_blocking = device.type != "cpu"
+    for module in block.modules():
+        if module.__class__.__name__.endswith("Linear"):
+            continue
+        if not include_norms and _is_norm_module(module):
+            continue
+        for param in module.parameters(recurse=False):
+            if param.device != device:
+                param.data = param.data.to(device, non_blocking=non_blocking)
+        for buf in module.buffers(recurse=False):
+            if buf.device != device:
+                buf.data = buf.data.to(device, non_blocking=non_blocking)
+
+
+def _mark_swap_weight_offload(block: nn.Module, enabled: bool) -> None:
+    """Tag block and its Linear submodules to avoid FP8 sync pulling weights to GPU."""
+    setattr(block, "swap_weight_offload", bool(enabled))
+    for module in block.modules():
+        if module.__class__.__name__.endswith("Linear"):
+            setattr(module, "swap_weight_offload", bool(enabled))
+
+
 def _log_cuda_memory(tag: str) -> None:
     if not torch.cuda.is_available():
         return
@@ -163,6 +192,9 @@ class LTX2BlockSwapManager:
         if compute_device == self.offload_device:
             return False
         blocks_list = list(blocks)
+        # Mark managed blocks so FP8 device sync avoids pulling weights onto GPU.
+        for idx, block in enumerate(blocks_list):
+            _mark_swap_weight_offload(block, idx in self.block_indices)
         self._ensure_backward_hooks(blocks_list, compute_device, grad_enabled)
         self.mark_blocks_for_offload(blocks_list)
         return True
@@ -257,14 +289,15 @@ class LTX2ModelOffloader(ModelOffloader):
         use_pinned = self.use_pinned_memory and os.getenv("LTX2_SWAP_PINNED", "1") == "1"
         split_idx = max(0, self.num_blocks - self.blocks_to_swap)
         for block in blocks[0 : split_idx]:
+            _mark_swap_weight_offload(block, False)
             block.to(self.device)
             weighs_to_device(block, self.device, use_pinned=use_pinned)
 
         cpu_device = torch.device("cpu")
         for block in blocks[split_idx :]:
+            _mark_swap_weight_offload(block, True)
             if self.swap_norms:
-                # Move whole block to GPU, then swap Linear AND norm weights to CPU
-                block.to(self.device)
+                # Keep Linear+norm weights on CPU; move remaining non-linear params to GPU.
                 if _SKIP_AUDIO_SWAP or _SKIP_CROSS_ATTN_SWAP:
                     _move_block_params_excluding_audio(
                         block,
@@ -274,9 +307,9 @@ class LTX2ModelOffloader(ModelOffloader):
                     )
                 else:
                     params_to_device(block, cpu_device, include_norms=True, use_pinned=use_pinned)
+                _move_non_linear_params(block, self.device, include_norms=False)
             else:
-                # Original behavior: Move whole block to GPU, only swap Linear weights
-                block.to(self.device)
+                # Keep Linear weights on CPU; move non-linear params/buffers to GPU.
                 if _SKIP_AUDIO_SWAP or _SKIP_CROSS_ATTN_SWAP:
                     _move_block_params_excluding_audio(
                         block,
@@ -286,6 +319,7 @@ class LTX2ModelOffloader(ModelOffloader):
                     )
                 else:
                     weighs_to_device(block, cpu_device, use_pinned=use_pinned)
+                _move_non_linear_params(block, self.device, include_norms=True)
 
         _synchronize_device(self.device)
         _clean_memory_on_device(self.device)

@@ -447,6 +447,13 @@ class LTXModel(torch.nn.Module):
                 swap_device="cpu",
             )
             self.offloader = None
+            swap_start = max(0, self.num_blocks - self.blocks_to_swap)
+            for idx, block in enumerate(self.transformer_blocks):
+                enabled = idx >= swap_start
+                setattr(block, "swap_weight_offload", enabled)
+                for module in block.modules():
+                    if module.__class__.__name__.endswith("Linear"):
+                        setattr(module, "swap_weight_offload", enabled)
             _log_cuda_memory("after_enable_block_swap")
             return
 
@@ -472,6 +479,13 @@ class LTXModel(torch.nn.Module):
             use_pinned_memory,
             swap_norms=swap_norms,
         )
+        swap_start = max(0, self.num_blocks - self.blocks_to_swap)
+        for idx, block in enumerate(self.transformer_blocks):
+            enabled = idx >= swap_start
+            setattr(block, "swap_weight_offload", enabled)
+            for module in block.modules():
+                if module.__class__.__name__.endswith("Linear"):
+                    setattr(module, "swap_weight_offload", enabled)
         _log_cuda_memory("after_enable_block_swap")
 
     def switch_block_swap_for_inference(self) -> None:
@@ -519,6 +533,15 @@ class LTXModel(torch.nn.Module):
 
         if self.blocks_to_swap:
             self.transformer_blocks = saved_blocks
+            # Ensure swapped blocks stay on CPU to avoid transient full-model GPU spikes.
+            swap_start = max(0, len(self.transformer_blocks) - int(self.blocks_to_swap or 0))
+            cpu_device = torch.device("cpu")
+            target_device = torch.device(device)
+            for idx, block in enumerate(self.transformer_blocks):
+                if idx >= swap_start:
+                    block.to(cpu_device)
+                else:
+                    block.to(target_device)
 
     def prepare_block_swap_before_forward(self) -> None:
         if self.blocks_to_swap is None or self.blocks_to_swap == 0 or self.offloader is None:
@@ -580,7 +603,7 @@ class LTXModel(torch.nn.Module):
                 video = _move_transformer_args(video, cpu_device)
                 audio = _move_transformer_args(audio, cpu_device)
 
-        use_async_prefetch = os.getenv("LTX2_SWAP_ASYNC_PREFETCH", "1") == "1"
+        use_async_prefetch = os.getenv("LTX2_SWAP_ASYNC_PREFETCH")
         transfer_stream = None
         target_device = gpu_device if gpu_device else torch.device("cuda")
         if use_async_prefetch:

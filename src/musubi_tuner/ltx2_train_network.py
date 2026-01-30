@@ -2970,6 +2970,13 @@ def main() -> None:
                 args.blocks_to_swap,
             )
 
+    blocks_to_swap = int(getattr(args, "blocks_to_swap", 0) or 0)
+    has_bw_checkpointing = getattr(args, "blockwise_checkpointing", False)
+    if blocks_to_swap > 0 and has_bw_checkpointing:
+        if os.environ.get("LTX2_SWAP_TRAIN_FULL") is None:
+            os.environ["LTX2_SWAP_TRAIN_FULL"] = "1"
+            logger.info("Auto-enabled LTX2_SWAP_TRAIN_FULL=1 (blockwise checkpointing with block swap)")
+
     explicit_lora_preset = any(
         arg == "--lora_target_preset" or arg.startswith("--lora_target_preset=") for arg in sys.argv
     )

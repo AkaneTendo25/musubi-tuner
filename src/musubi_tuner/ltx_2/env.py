@@ -4,6 +4,7 @@ import os
 from dataclasses import dataclass
 
 from musubi_tuner.ltx_2.model.ltx2_custom_offloading_utils import (
+    set_fp8_offload_keep_fp8,
     set_fp8_offload_restore_bf16,
     set_fp8_offload_restore_stochastic,
     set_fp8_offload_upcast,
@@ -30,11 +31,15 @@ class LTX2Env:
 
     # Allow FP8 weights to be offloaded to CPU by upcasting to bf16.
     # recommended=True | old SHA=False | current=True
-    fp8_offload_upcast: bool = True
+    fp8_offload_upcast: bool = False
 
     # Keep FP8-offloaded weights in bf16 on GPU after restore (avoid FP8 round-trip).
     # recommended=True | old SHA=False | current=True
-    fp8_offload_restore_bf16: bool = True
+    fp8_offload_restore_bf16: bool = False
+
+    # Keep FP8 weights in FP8 on CPU (avoid bf16 upcast and GPU re-cast cost).
+    # recommended=False | old SHA=False | current=False
+    fp8_offload_keep_fp8: bool = False
 
     # Allow FP8 CPU offload only when blockwise checkpointing is enabled.
     # recommended=False | old SHA=False | current=False
@@ -212,6 +217,7 @@ def apply_ltx2_tweaks(args) -> None:
     args.fp8_offload_upcast = t.fp8_offload_upcast
     args.fp8_offload_restore_bf16 = t.fp8_offload_restore_bf16
     args.fp8_offload_restore_stochastic = t.fp8_offload_restore_stochastic
+    args.fp8_offload_keep_fp8 = t.fp8_offload_keep_fp8
 
     args.swap_keep_attn = t.swap_keep_attn
     args.swap_keep_cross_attn = t.swap_keep_cross_attn
@@ -258,6 +264,7 @@ def apply_ltx2_tweaks(args) -> None:
     set_fp8_offload_upcast(fp8_offload_enabled)
     set_fp8_offload_restore_bf16(t.fp8_offload_restore_bf16)
     set_fp8_offload_restore_stochastic(t.fp8_offload_restore_stochastic)
+    set_fp8_offload_keep_fp8(t.fp8_offload_keep_fp8)
 
     # Apply env vars consumed in transformer/offloading code.
     _set_env_bool("LTX2_SWAP_KEEP_ATTN", t.swap_keep_attn)
@@ -267,6 +274,7 @@ def apply_ltx2_tweaks(args) -> None:
     _set_env_bool("LTX2_SWAP_PINNED", t.swap_pinned)
     _set_env_bool("LTX2_SWAP_FP8_SYNC", t.swap_fp8_sync)
     _set_env_bool("LTX2_SWAP_FP8_SYNC_STRICT", t.swap_fp8_sync_strict)
+    _set_env_bool("LTX2_FP8_OFFLOAD_KEEP_FP8", t.fp8_offload_keep_fp8)
     _set_env_bool("LTX2_SWAP_STRICT_SYNC", t.fp8_swap_safe)
     _set_env_bool("LTX2_SWAP_FORCE_PYTORCH_ATTN", t.swap_force_pytorch_attn)
     _set_env_bool(

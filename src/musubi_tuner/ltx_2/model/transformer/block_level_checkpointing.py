@@ -27,6 +27,7 @@ Usage:
 import torch
 from typing import Callable, List, Any, Optional, Tuple
 import logging
+from musubi_tuner.ltx_2.model.transformer.fp8_device_utils import ensure_fp8_modules_on_device
 
 logger = logging.getLogger(__name__)
 
@@ -120,6 +121,8 @@ class BlockCheckpointFunction(torch.autograd.Function):
         # === CRITICAL: Load weights for this block before forward ===
         if load_fn is not None:
             load_fn(block, target_device)
+        # Ensure FP8 weights/scale are on compute device for recompute correctness.
+        ensure_fp8_modules_on_device(block, target_device, skip_trainable=False)
         
         # Run forward with no_grad using GPU args
         with torch.no_grad():
@@ -178,6 +181,8 @@ class BlockCheckpointFunction(torch.autograd.Function):
         # === CRITICAL: Load weights for this block ===
         if load_fn is not None:
             load_fn(block, target_device)
+        # Ensure FP8 weights/scale are on compute device before recompute.
+        ensure_fp8_modules_on_device(block, target_device, skip_trainable=False)
         
         # Restore inputs from CPU to Target Device and enable grad tracking
         inputs = []

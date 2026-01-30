@@ -2,6 +2,7 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 import gc
+import os
 import time
 from typing import Optional
 import logging
@@ -65,6 +66,7 @@ _LOGGED_FP8_UPCAST = False
 _ALLOW_FP8_OFFLOAD_UPCAST = True
 _FP8_OFFLOAD_RESTORE_BF16 = True
 _FP8_OFFLOAD_RESTORE_STOCHASTIC = False
+_FP8_OFFLOAD_KEEP_FP8 = False
 _FP8_ORIG_DTYPE = {}
 _FP8_CPU_CACHE = {}
 _FP8_DTYPES = tuple(
@@ -92,6 +94,12 @@ def set_fp8_offload_restore_stochastic(enable: bool) -> None:
     """Apply experimental stochastic rounding noise before restoring FP8 weights."""
     global _FP8_OFFLOAD_RESTORE_STOCHASTIC
     _FP8_OFFLOAD_RESTORE_STOCHASTIC = bool(enable)
+
+
+def set_fp8_offload_keep_fp8(enable: bool) -> None:
+    """Keep FP8 weights in FP8 on CPU to avoid bf16 round-trips."""
+    global _FP8_OFFLOAD_KEEP_FP8
+    _FP8_OFFLOAD_KEEP_FP8 = bool(enable)
 
 def weighs_to_device(layer: nn.Module, device: torch.device, skip_trainable: bool = True, use_pinned: bool = False):
     """Move layer weights to device.
@@ -133,6 +141,12 @@ def weighs_to_device(layer: nn.Module, device: torch.device, skip_trainable: boo
                             p.data = p.data.to(device, dtype=target_dtype, non_blocking=non_blocking)
                         continue
                     if device.type == "cpu" and _is_fp8_dtype(p.dtype):
+                        if _FP8_OFFLOAD_KEEP_FP8:
+                            try:
+                                p.data = p.data.to(device, non_blocking=non_blocking)
+                            except Exception:
+                                p.data = p.data.to(device)
+                            continue
                         if not _ALLOW_FP8_OFFLOAD_UPCAST:
                             continue
                         # Explicit opt-in: upcast FP8 to bf16 on CPU, then restore FP8 on GPU.
@@ -707,7 +721,8 @@ class ModelOffloader(Offloader):
         if self.blocks_to_swap is None or self.blocks_to_swap == 0:
             return
 
-        if not self.forward_only:
+        aggressive_train_swap = os.getenv("LTX2_SWAP_TRAIN_FULL", "0") == "1"
+        if not self.forward_only and not aggressive_train_swap:
             # if backward is enabled, we do not swap blocks in forward pass more than blocks_to_swap, because it should be on GPU
             if block_idx >= self.blocks_to_swap:
                 return
@@ -716,17 +731,23 @@ class ModelOffloader(Offloader):
             self._submit_move_blocks(blocks, block_idx_to_cpu, block_idx_to_cuda)
             return
 
-        # We use two strategies here for forward-only offloading:
+        # We use two strategies here for forward-only offloading (or aggressive training swap):
         # 1. If blocks_to_swap is less than half of num_blocks, we swap the num_blocks blocks without wrapping around.
         #   This reduces the number of swaps, so it is especially useful for small blocks_to_swap or lightweight models like Qwen-Image
         # 2. If blocks_to_swap is more than half of num_blocks, we swap the blocks with wrapping around.
         #   This is the common strategy used in most offloading implementations. It transfers all blocks in a wrapping manner.
         #   This is useful for large blocks_to_swap or heavyweight models like Wan/HunyuanVideo, where the transfer time is less significant compared to computation time.
+        #
+        # LTX2_SWAP_NO_WRAPAROUND=1 forces strategy 1 (no wrap-around) regardless of blocks_to_swap count.
+        # This can reduce VRAM spikes when swapping many blocks.
 
         # current block to swap out (to CPU)
         block_idx_to_cpu = block_idx
 
-        if self.blocks_to_swap < (self.num_blocks // 2):
+        no_wraparound = os.getenv("LTX2_SWAP_NO_WRAPAROUND", "1") == "1"
+        use_strategy_1 = self.blocks_to_swap < (self.num_blocks // 2) or no_wraparound
+
+        if use_strategy_1:
             # strategy 1: no wrap around
             # If the current block is in the middle blocks that are not swapped, do nothing
             if self.blocks_to_swap <= block_idx < self.num_blocks - self.blocks_to_swap:

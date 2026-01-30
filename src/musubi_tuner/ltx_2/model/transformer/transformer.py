@@ -270,7 +270,9 @@ class BasicAVTransformerBlock(torch.nn.Module):
 
             flat_inputs = tuple(video_vals + audio_vals)
 
-            if self.weight_cpu_offloading or self.activation_cpu_offloading:
+            # Only use block-level checkpointing when explicit CPU weight offloading is enabled
+            # (i.e., blockwise checkpointing flag).
+            if self.weight_cpu_offloading:
                 # Determine offloading hooks based on configuration
                 load_fn = load_weights if self.weight_cpu_offloading else None
                 offload_fn = offload_weights if self.weight_cpu_offloading else None
