@@ -238,6 +238,17 @@ def load_ltx2_model(
 
     if fp8_scaled:
         fp8_calc_device = target_device if (not load_weights_on_cpu and load_device == target_device) else torch.device("cpu")
+        fp8_calc_override = os.getenv("LTX2_FP8_CALC_DEVICE", "").strip().lower()
+        if fp8_calc_override in {"1", "true", "yes", "cuda", "gpu"}:
+            if target_device.type == "cuda":
+                fp8_calc_device = target_device
+                logger.info("LTX-2 fp8: forcing FP8 quantization on %s (LTX2_FP8_CALC_DEVICE=%s).", target_device, fp8_calc_override)
+            else:
+                logger.warning(
+                    "LTX-2 fp8: LTX2_FP8_CALC_DEVICE=%s requested GPU, but target device is %s; using CPU.",
+                    fp8_calc_override,
+                    target_device,
+                )
         sd = load_safetensors_with_lora_and_fp8(
             model_files=model_path,
             lora_weights_list=None,
@@ -268,12 +279,24 @@ def load_ltx2_model(
         renamed_sd[nk if nk is not None else k] = v
     sd = renamed_sd
 
+    def _trace_vram_ltx2(tag):
+        if torch.cuda.is_available():
+            a = torch.cuda.memory_allocated() / (1024**3)
+            r = torch.cuda.memory_reserved() / (1024**3)
+            m = torch.cuda.max_memory_allocated() / (1024**3)
+            logger.info(f"[VRAM_TRACE_LTX2] {tag}: alloc={a:.2f}GB res={r:.2f}GB max={m:.2f}GB")
+
+    _trace_vram_ltx2("AFTER state dict loading (sd on CPU)")
     if fp8_scaled:
         apply_fp8_monkey_patch(base_model, sd, use_scaled_mm=False)
+    _trace_vram_ltx2("AFTER apply_fp8_monkey_patch")
     base_model.load_state_dict(sd, strict=False, assign=True)
+    _trace_vram_ltx2("AFTER load_state_dict (model still on meta/cpu)")
     if torch_dtype is not None:
         _cast_non_fp8_params(base_model, torch_dtype)
+    _trace_vram_ltx2(f"AFTER _cast_non_fp8_params, BEFORE base_model.to({load_device})")
     base_model = base_model.to(load_device)
+    _trace_vram_ltx2(f"AFTER base_model.to({load_device})")
     if fp8_upcast or fp8_upcast_stochastic:
         # Upcast FP8 linear weights during forward for stability.
         # This is optional and not enabled by default in upstream configs.
@@ -289,15 +312,19 @@ def load_ltx2_model(
         )
 
     model = LTX2Wrapper(base_model, patch_size=1)
+    _trace_vram_ltx2("AFTER LTX2Wrapper creation")
     if load_device == target_device:
         model = model.to(device=target_device)
+        _trace_vram_ltx2(f"AFTER model.to({target_device}) [load_device==target_device]")
     if torch.cuda.is_available():
         allocated = torch.cuda.memory_allocated() / (1024**3)
         reserved = torch.cuda.memory_reserved() / (1024**3)
+        max_alloc = torch.cuda.max_memory_allocated() / (1024**3)
         logger.info(
-            "LTX-2 load mem [after_load_ltx2_model]: cuda_allocated=%.2fGB cuda_reserved=%.2fGB",
+            "LTX-2 load mem [after_load_ltx2_model]: cuda_allocated=%.2fGB cuda_reserved=%.2fGB max_allocated=%.2fGB",
             allocated,
             reserved,
+            max_alloc,
         )
     return model
 

@@ -264,6 +264,26 @@ class BasicAVTransformerBlock(torch.nn.Module):
             def checkpoint_wrapper(*inputs):
                 v_vals = list(inputs[:vid_len])
                 a_vals = list(inputs[vid_len:])
+
+                # When activation_cpu_offloading is enabled but weight_cpu_offloading is not,
+                # inputs may arrive on CPU (from model-level CPU offloading). Move them to GPU
+                # before running the forward pass, since LoRA and other trainable weights are on GPU.
+                if self.activation_cpu_offloading and not self.weight_cpu_offloading:
+                    target_device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+
+                    def _move_to_device(val):
+                        """Recursively move tensors to target device, handling tuples."""
+                        if isinstance(val, torch.Tensor):
+                            return val.to(target_device) if val.device.type == "cpu" else val
+                        elif isinstance(val, tuple):
+                            return tuple(_move_to_device(v) for v in val)
+                        elif isinstance(val, list):
+                            return [_move_to_device(v) for v in val]
+                        return val
+
+                    v_vals = [_move_to_device(v) for v in v_vals]
+                    a_vals = [_move_to_device(a) for a in a_vals]
+
                 v_args = _reconstruct_transformer_args(v_vals, video_none)
                 a_args = _reconstruct_transformer_args(a_vals, audio_none)
                 return self._forward(v_args, a_args, perturbations)

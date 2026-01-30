@@ -62,6 +62,16 @@ def swap_weight_devices_no_cuda(device: torch.device, layer_to_cpu: nn.Module, l
 
 # Cache for pinned buffers to avoid reallocation overhead: {param_id: pinned_tensor}
 _pinned_buffer_cache = {}
+_FIRST_SWAP_TRACED = False  # Flag for first-swap VRAM tracing
+
+def _trace_first_swap_vram(tag: str):
+    """Trace VRAM during first swap operation."""
+    global _FIRST_SWAP_TRACED
+    if torch.cuda.is_available():
+        a = torch.cuda.memory_allocated() / (1024**3)
+        r = torch.cuda.memory_reserved() / (1024**3)
+        m = torch.cuda.max_memory_allocated() / (1024**3)
+        print(f"[VRAM_FIRST_SWAP] {tag}: alloc={a:.2f}GB res={r:.2f}GB max={m:.2f}GB")
 _LOGGED_FP8_UPCAST = False
 _ALLOW_FP8_OFFLOAD_UPCAST = True
 _FP8_OFFLOAD_RESTORE_BF16 = True
@@ -311,6 +321,7 @@ class Offloader:
         self.pinned_buffer = None
 
     def swap_weight_devices_cuda(self, device: torch.device, layer_to_cpu: nn.Module, layer_to_cuda: nn.Module):
+        global _FIRST_SWAP_TRACED
         assert layer_to_cpu.__class__ == layer_to_cuda.__class__
 
         debug_print = False
@@ -421,6 +432,8 @@ class Offloader:
                     return True
 
                 if not _staging_buffer_valid():
+                    if not _FIRST_SWAP_TRACED:
+                        _trace_first_swap_vram("BEFORE staging buffer creation")
                     # Create staging buffer as pinned memory (as shared GPU ram). We specify device for correct pinning on multi-GPU systems
                     self.staging_buffer_a = [
                         torch.empty_like(cuda_data_view, device="cpu")
@@ -430,6 +443,9 @@ class Offloader:
                         torch.empty_like(cuda_data_view, device="cpu")
                         for _, _, cuda_data_view, _, _ in weight_swap_jobs
                     ]
+                    if not _FIRST_SWAP_TRACED:
+                        _trace_first_swap_vram("AFTER staging buffer creation (CPU buffers)")
+                        _FIRST_SWAP_TRACED = True
 
                 # Copy weights to staging buffers and record events
                 event_b = None
@@ -488,6 +504,8 @@ class Offloader:
                 return True
 
             if not _pinned_buffer_valid():
+                if not _FIRST_SWAP_TRACED:
+                    _trace_first_swap_vram("BEFORE pinned buffer creation")
                 with torch.cuda.stream(self.stream):
                     # Create pinned buffer as pinned memory (as shared GPU ram). We specify device for correct pinning on multi-GPU systems
                     self.pinned_buffer = [
@@ -495,6 +513,9 @@ class Offloader:
                         for _, _, cuda_data_view, _, _ in weight_swap_jobs
                     ]
                 self.stream.synchronize()
+                if not _FIRST_SWAP_TRACED:
+                    _trace_first_swap_vram("AFTER pinned buffer creation")
+                    _FIRST_SWAP_TRACED = True
             released_pinned_buffer = []
 
             events = [torch.cuda.Event() for _ in weight_swap_jobs]  # Waiting events for GPU to CPU non-blocking copy

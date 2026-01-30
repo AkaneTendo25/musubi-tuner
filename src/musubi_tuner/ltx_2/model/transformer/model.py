@@ -499,13 +499,24 @@ class LTXModel(torch.nn.Module):
             self.prepare_block_swap_before_forward()
 
     def move_to_device_except_swap_blocks(self, device: torch.device) -> None:
+        import torch  # ensure available
+        def _trace_vram(tag):
+            if torch.cuda.is_available():
+                a = torch.cuda.memory_allocated() / (1024**3)
+                r = torch.cuda.memory_reserved() / (1024**3)
+                m = torch.cuda.max_memory_allocated() / (1024**3)
+                print(f"[VRAM_TRACE_MOVE] {tag}: alloc={a:.2f}GB res={r:.2f}GB max={m:.2f}GB")
+
+        _trace_vram("START move_to_device_except_swap_blocks")
         swap_mode = getattr(self, "swap_mode", "default")
         if self.blocks_to_swap and swap_mode in {"aggressive", "aggressive_no_offload"}:
             target_device = torch.device(device)
             # Move non-block modules/params to the target device.
             saved_blocks = self.transformer_blocks
             self.transformer_blocks = torch.nn.ModuleList()
+            _trace_vram("BEFORE self.to(device) [aggressive mode, blocks detached]")
             self.to(target_device)
+            _trace_vram("AFTER self.to(device) [aggressive mode]")
             self.transformer_blocks = saved_blocks
 
             managed_indices = set()
@@ -523,13 +534,18 @@ class LTXModel(torch.nn.Module):
                     block.to(cpu_device)
                 else:
                     block.to(target_device)
+                if idx % 10 == 0:
+                    _trace_vram(f"AFTER moving block {idx} (managed={idx in managed_indices})")
+            _trace_vram("END move_to_device_except_swap_blocks [aggressive]")
             return
 
         if self.blocks_to_swap:
             saved_blocks = self.transformer_blocks
             self.transformer_blocks = torch.nn.ModuleList()
+            _trace_vram("BEFORE self.to(device) [default mode, blocks detached]")
 
         self.to(device)
+        _trace_vram("AFTER self.to(device) [non-block params moved]")
 
         if self.blocks_to_swap:
             self.transformer_blocks = saved_blocks
@@ -537,11 +553,15 @@ class LTXModel(torch.nn.Module):
             swap_start = max(0, len(self.transformer_blocks) - int(self.blocks_to_swap or 0))
             cpu_device = torch.device("cpu")
             target_device = torch.device(device)
+            print(f"[VRAM_TRACE_MOVE] Moving blocks: 0-{swap_start-1} to GPU, {swap_start}-{len(self.transformer_blocks)-1} to CPU")
             for idx, block in enumerate(self.transformer_blocks):
                 if idx >= swap_start:
                     block.to(cpu_device)
                 else:
                     block.to(target_device)
+                if idx % 5 == 0 or idx == swap_start - 1 or idx == swap_start:
+                    _trace_vram(f"AFTER moving block {idx} ({'CPU' if idx >= swap_start else 'GPU'})")
+        _trace_vram("END move_to_device_except_swap_blocks")
 
     def prepare_block_swap_before_forward(self) -> None:
         if self.blocks_to_swap is None or self.blocks_to_swap == 0 or self.offloader is None:

@@ -49,6 +49,19 @@ from musubi_tuner.hv_generate_video import save_images_grid, save_videos_grid, r
 
 import logging
 
+
+def _log_vram(tag: str, logger=None):
+    """Log VRAM usage at a specific point for debugging spikes."""
+    if torch.cuda.is_available():
+        alloc = torch.cuda.memory_allocated() / (1024**3)
+        reserved = torch.cuda.memory_reserved() / (1024**3)
+        max_alloc = torch.cuda.max_memory_allocated() / (1024**3)
+        msg = f"[VRAM_TRACE] {tag}: allocated={alloc:.2f}GB reserved={reserved:.2f}GB max_allocated={max_alloc:.2f}GB"
+        if logger:
+            logger.info(msg)
+        else:
+            print(msg)
+
 from musubi_tuner.utils import huggingface_utils, model_utils, train_utils, sai_model_spec
 
 logger = logging.getLogger(__name__)
@@ -1869,6 +1882,12 @@ class NetworkTrainer:
         self.blocks_to_swap = blocks_to_swap
         loading_device = "cpu" if blocks_to_swap > 0 else accelerator.device
 
+        # Reset VRAM tracking for spike analysis
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+            logger.info("[VRAM_TRACE] Reset peak memory stats before DiT loading")
+        _log_vram("BEFORE DiT loading", logger)
+
         logger.info(f"Loading DiT model from {args.dit}")
         if args.sdpa:
             attn_mode = "torch"
@@ -1889,6 +1908,7 @@ class NetworkTrainer:
         )
         transformer.eval()
         transformer.requires_grad_(False)
+        _log_vram("AFTER load_transformer (model on CPU)", logger)
 
         if blocks_to_swap > 0:
             logger.info(
@@ -1898,7 +1918,9 @@ class NetworkTrainer:
                 blocks_to_swap, accelerator.device, supports_backward=True, use_pinned_memory=args.use_pinned_memory_for_block_swap,
                 swap_norms=getattr(args, 'swap_norms', False)
             )
+            _log_vram("AFTER enable_block_swap (offloader created)", logger)
             transformer.move_to_device_except_swap_blocks(accelerator.device)
+            _log_vram("AFTER move_to_device_except_swap_blocks #1 (18 blocks to GPU)", logger)
 
         # load network model for differential training
         sys.path.append(os.path.dirname(__file__))
@@ -1961,12 +1983,14 @@ class NetworkTrainer:
                 )
         if network is None:
             return
+        _log_vram("AFTER LoRA network creation", logger)
 
         if hasattr(network_module, "prepare_network"):
             network.prepare_network(args)
 
         # apply network to DiT
         network.apply_to(None, transformer, apply_text_encoder=False, apply_unet=True)
+        _log_vram("AFTER network.apply_to (LoRA applied to transformer)", logger)
 
         if args.network_weights is not None:
             # FIXME consider alpha of weights: this assumes that the alpha is not changed
@@ -2082,13 +2106,18 @@ class NetworkTrainer:
         if dit_weight_dtype != dit_dtype and dit_weight_dtype is not None:
             logger.info(f"casting model to {dit_weight_dtype}")
             transformer.to(dit_weight_dtype)
+        _log_vram("BEFORE accelerator.prepare(transformer)", logger)
 
         if blocks_to_swap > 0:
             transformer = accelerator.prepare(transformer, device_placement=[not blocks_to_swap > 0])
+            _log_vram("AFTER accelerator.prepare(transformer) with device_placement=[False]", logger)
             accelerator.unwrap_model(transformer).move_to_device_except_swap_blocks(accelerator.device)  # reduce peak memory usage
+            _log_vram("AFTER move_to_device_except_swap_blocks #2", logger)
             accelerator.unwrap_model(transformer).prepare_block_swap_before_forward()
+            _log_vram("AFTER prepare_block_swap_before_forward", logger)
         else:
             transformer = accelerator.prepare(transformer)
+            _log_vram("AFTER accelerator.prepare(transformer) without block swap", logger)
 
         if args.compile:
             transformer = self.compile_transformer(args, transformer)
@@ -2541,6 +2570,10 @@ class NetworkTrainer:
             accelerator.unwrap_model(network).on_epoch_start(transformer)
 
             for step, batch in enumerate(train_dataloader):
+                # VRAM spike tracing for first iteration
+                _is_first_step = (epoch == epoch_to_start and step == 0)
+                if _is_first_step:
+                    _log_vram("FIRST_ITER: before batch processing", logger)
                 # torch.compiler.cudagraph_mark_step_begin() # for cudagraphs
                 if (
                     args.log_cuda_memory_every_n_steps is not None
@@ -2583,6 +2616,8 @@ class NetworkTrainer:
                         args.weighting_scheme, noise_scheduler, timesteps, accelerator.device, dit_dtype
                     )
 
+                    if _is_first_step:
+                        _log_vram("FIRST_ITER: BEFORE call_dit (forward pass)", logger)
                     model_pred, target = self.call_dit(
                         args,
                         accelerator,
@@ -2594,6 +2629,8 @@ class NetworkTrainer:
                         timesteps,
                         network_dtype,
                     )
+                    if _is_first_step:
+                        _log_vram("FIRST_ITER: AFTER call_dit (forward pass)", logger)
                     dict_output = isinstance(model_pred, dict)
                     video_loss_value = None  # For tracking in wandb/tensorboard
                     audio_loss_value = None  # For tracking in wandb/tensorboard
@@ -2675,7 +2712,11 @@ class NetworkTrainer:
                     if not dict_output:
                         loss = loss.mean()  # mean loss over all elements in batch
 
+                    if _is_first_step:
+                        _log_vram("FIRST_ITER: BEFORE backward", logger)
                     accelerator.backward(loss)
+                    if _is_first_step:
+                        _log_vram("FIRST_ITER: AFTER backward", logger)
                     
                     # DEBUG: Check if LoRA parameters have gradients (requires LTX2_DEBUG env var)
                     if os.environ.get("LTX2_DEBUG", "0") == "1":
@@ -2727,9 +2768,15 @@ class NetworkTrainer:
                             params_to_clip = accelerator.unwrap_model(network).get_trainable_params()
                             accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
 
+                    if _is_first_step:
+                        _log_vram("FIRST_ITER: BEFORE optimizer.step", logger)
                     optimizer.step()
+                    if _is_first_step:
+                        _log_vram("FIRST_ITER: AFTER optimizer.step", logger)
                     lr_scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
+                    if _is_first_step:
+                        _log_vram("FIRST_ITER: AFTER zero_grad (end of first step)", logger)
 
                 if args.scale_weight_norms:
                     keys_scaled, mean_norm, maximum_norm = accelerator.unwrap_model(network).apply_max_norm_regularization(
