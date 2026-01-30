@@ -416,12 +416,18 @@ LTX2_DEFAULT_INCLUDE_PATTERNS = LTX2_INCLUDE_PATTERNS_T2V
 
 
 def _build_exclude_patterns(raw_patterns: Optional[str], audio_video: bool = False) -> List[str]:  # noqa: ARG001
-    """Build exclude patterns list. Only uses user-provided patterns if specified."""
+    """Build exclude patterns list, including connector exclusions."""
+    patterns: List[str] = [
+        r".*text_embedding_projection\.aggregate_embed.*",
+        r".*embeddings_connector\..*",
+        r".*audio_embeddings_connector\..*",
+    ]
     if raw_patterns is None:
-        return []
-    patterns = ast.literal_eval(raw_patterns)
-    if not isinstance(patterns, list):
+        return patterns
+    user_patterns = ast.literal_eval(raw_patterns)
+    if not isinstance(user_patterns, list):
         raise ValueError("exclude_patterns must evaluate to a list")
+    patterns.extend(user_patterns)
     return patterns
 
 
