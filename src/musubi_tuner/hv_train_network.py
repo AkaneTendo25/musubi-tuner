@@ -49,32 +49,55 @@ from musubi_tuner.hv_generate_video import save_images_grid, save_videos_grid, r
 
 import logging
 
-
-def _log_vram(tag: str, logger=None):
-    """Log VRAM usage at a specific point for debugging spikes."""
-    if torch.cuda.is_available():
-        alloc = torch.cuda.memory_allocated() / (1024**3)
-        reserved = torch.cuda.memory_reserved() / (1024**3)
-        max_alloc = torch.cuda.max_memory_allocated() / (1024**3)
-        msg = f"[VRAM_TRACE] {tag}: allocated={alloc:.2f}GB reserved={reserved:.2f}GB max_allocated={max_alloc:.2f}GB"
-        if logger:
-            logger.info(msg)
-        else:
-            print(msg)
-
 from musubi_tuner.utils import huggingface_utils, model_utils, train_utils, sai_model_spec
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
+# Global tracker for all-time peak VRAM since app launch
+_global_peak_alloc_mb: float = 0.0
+_global_peak_reserved_mb: float = 0.0
+
+
+def _update_global_peak() -> tuple[float, float]:
+    """Update and return global peak memory stats since app launch."""
+    global _global_peak_alloc_mb, _global_peak_reserved_mb
+    if not torch.cuda.is_available():
+        return _global_peak_alloc_mb, _global_peak_reserved_mb
+    torch.cuda.synchronize()
+    current_max_alloc = torch.cuda.max_memory_allocated() / (1024**2)
+    current_max_reserved = torch.cuda.max_memory_reserved() / (1024**2)
+    _global_peak_alloc_mb = max(_global_peak_alloc_mb, current_max_alloc)
+    _global_peak_reserved_mb = max(_global_peak_reserved_mb, current_max_reserved)
+    return _global_peak_alloc_mb, _global_peak_reserved_mb
+
+
+def _log_vram(tag: str, logger=None):
+    """Log VRAM usage at a specific point for debugging spikes."""
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+        alloc = torch.cuda.memory_allocated() / (1024**3)
+        reserved = torch.cuda.memory_reserved() / (1024**3)
+        max_alloc = torch.cuda.max_memory_allocated() / (1024**3)
+        # Update global peak tracker
+        global_peak_alloc, global_peak_reserved = _update_global_peak()
+        msg = f"[VRAM_TRACE] {tag}: allocated={alloc:.2f}GB reserved={reserved:.2f}GB max_allocated={max_alloc:.2f}GB PEAK_SINCE_START={global_peak_reserved/1024:.2f}GB"
+        if logger:
+            logger.info(msg)
+        else:
+            print(msg)
+
 
 def _log_cuda_memory_stats(tag: str, *, latents_shape: Optional[tuple] = None) -> None:
     if not torch.cuda.is_available():
         return
+    torch.cuda.synchronize()  # Ensure all GPU ops complete before reading stats
     alloc = torch.cuda.memory_allocated() / (1024**2)
     reserved = torch.cuda.memory_reserved() / (1024**2)
     max_alloc = torch.cuda.max_memory_allocated() / (1024**2)
     max_reserved = torch.cuda.max_memory_reserved() / (1024**2)
+    # Update global peak tracker
+    global_peak_alloc, global_peak_reserved = _update_global_peak()
     free_mb = None
     total_mb = None
     try:
@@ -86,46 +109,54 @@ def _log_cuda_memory_stats(tag: str, *, latents_shape: Optional[tuple] = None) -
     if latents_shape is not None:
         if free_mb is not None and total_mb is not None:
             logger.info(
-                "CUDA mem [%s] alloc=%.0fMB reserved=%.0fMB max_alloc=%.0fMB max_reserved=%.0fMB free=%.0fMB total=%.0fMB latents=%s",
+                "CUDA mem [%s] alloc=%.0fMB reserved=%.0fMB max_alloc=%.0fMB max_reserved=%.0fMB "
+                "PEAK_SINCE_START=%.0fMB free=%.0fMB total=%.0fMB latents=%s",
                 tag,
                 alloc,
                 reserved,
                 max_alloc,
                 max_reserved,
+                global_peak_reserved,
                 free_mb,
                 total_mb,
                 latents_shape,
             )
         else:
             logger.info(
-                "CUDA mem [%s] alloc=%.0fMB reserved=%.0fMB max_alloc=%.0fMB max_reserved=%.0fMB latents=%s",
+                "CUDA mem [%s] alloc=%.0fMB reserved=%.0fMB max_alloc=%.0fMB max_reserved=%.0fMB "
+                "PEAK_SINCE_START=%.0fMB latents=%s",
                 tag,
                 alloc,
                 reserved,
                 max_alloc,
                 max_reserved,
+                global_peak_reserved,
                 latents_shape,
             )
     else:
         if free_mb is not None and total_mb is not None:
             logger.info(
-                "CUDA mem [%s] alloc=%.0fMB reserved=%.0fMB max_alloc=%.0fMB max_reserved=%.0fMB free=%.0fMB total=%.0fMB",
+                "CUDA mem [%s] alloc=%.0fMB reserved=%.0fMB max_alloc=%.0fMB max_reserved=%.0fMB "
+                "PEAK_SINCE_START=%.0fMB free=%.0fMB total=%.0fMB",
                 tag,
                 alloc,
                 reserved,
                 max_alloc,
                 max_reserved,
+                global_peak_reserved,
                 free_mb,
                 total_mb,
             )
         else:
             logger.info(
-                "CUDA mem [%s] alloc=%.0fMB reserved=%.0fMB max_alloc=%.0fMB max_reserved=%.0fMB",
+                "CUDA mem [%s] alloc=%.0fMB reserved=%.0fMB max_alloc=%.0fMB max_reserved=%.0fMB "
+                "PEAK_SINCE_START=%.0fMB",
                 tag,
                 alloc,
                 reserved,
                 max_alloc,
                 max_reserved,
+                global_peak_reserved,
             )
 
 
@@ -2582,6 +2613,7 @@ class NetworkTrainer:
                     and step % args.gradient_accumulation_steps == 0
                     and global_step % args.log_cuda_memory_every_n_steps == 0
                 ):
+                    _update_global_peak()  # Capture peak before reset for global tracking
                     torch.cuda.reset_peak_memory_stats()
 
                 latents = batch["latents"]
