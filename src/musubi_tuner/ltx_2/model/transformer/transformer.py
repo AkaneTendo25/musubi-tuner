@@ -20,6 +20,10 @@ from musubi_tuner.ltx_2.utils import rms_norm
 
 logger = logging.getLogger(__name__)
 
+# Thread-local storage for tracking last loaded swapped block during backward
+import threading
+_swap_backward_state = threading.local()
+
 
 
 def _unpack_transformer_args(args: TransformerArgs | None) -> tuple[list[Any], bool]:
@@ -265,12 +269,58 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 v_vals = list(inputs[:vid_len])
                 a_vals = list(inputs[vid_len:])
 
+                # Determine target device from inputs
+                target_device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+                for inp in inputs:
+                    if isinstance(inp, torch.Tensor) and inp.device.type == "cuda":
+                        target_device = inp.device
+                        break
+
+                # For swapped blocks, handle loading during backward recomputation
+                # Key insight: During FORWARD, offloader loads block to GPU before checkpoint_wrapper runs
+                # During BACKWARD recomputation, block is on CPU (was unloaded after forward)
+                # So we detect backward by checking if block is on CPU
+                if getattr(self, 'swap_weight_offload', False):
+                    first_param = next(self.parameters(), None)
+                    block_on_cpu = first_param is not None and first_param.device.type == "cpu"
+
+                    if block_on_cpu:
+                        # Block is on CPU → we're in backward recomputation
+                        # Unload previous block before loading current to prevent VRAM accumulation
+                        prev_block = getattr(_swap_backward_state, 'last_loaded_block', None)
+                        if prev_block is not None and prev_block is not self:
+                            prev_block.to("cpu")
+                            if torch.cuda.is_available():
+                                torch.cuda.synchronize()
+
+                        # Load this block to GPU
+                        self.to(target_device)
+
+                        # Track for unloading on next iteration
+                        _swap_backward_state.last_loaded_block = self
+                        _swap_backward_state.last_loaded_idx = self.idx
+                    else:
+                        # Block is on GPU → we're in forward pass (offloader loaded it)
+                        # Reset backward state to prevent stale data affecting next backward
+                        _swap_backward_state.last_loaded_block = None
+                        _swap_backward_state.last_loaded_idx = -1
+
+                    ensure_fp8_modules_on_device(self, target_device)
+
+                # For non-swapped (permanent) blocks: unload any pending swapped block from backward
+                # This handles transition from swapped blocks (18) to permanent blocks (17→0)
+                elif getattr(_swap_backward_state, 'last_loaded_block', None) is not None:
+                    prev_block = _swap_backward_state.last_loaded_block
+                    prev_block.to("cpu")
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    _swap_backward_state.last_loaded_block = None
+                    _swap_backward_state.last_loaded_idx = -1
+
                 # When activation_cpu_offloading is enabled but weight_cpu_offloading is not,
                 # inputs may arrive on CPU (from model-level CPU offloading). Move them to GPU
                 # before running the forward pass, since LoRA and other trainable weights are on GPU.
                 if self.activation_cpu_offloading and not self.weight_cpu_offloading:
-                    target_device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-
                     def _move_to_device(val):
                         """Recursively move tensors to target device, handling tuples."""
                         if isinstance(val, torch.Tensor):
@@ -290,12 +340,12 @@ class BasicAVTransformerBlock(torch.nn.Module):
 
             flat_inputs = tuple(video_vals + audio_vals)
 
-            # Only use block-level checkpointing when explicit CPU weight offloading is enabled
-            # (i.e., blockwise checkpointing flag).
+            # Use block-level checkpointing ONLY when explicit CPU weight offloading is enabled
+            # (i.e., --blockwise_checkpointing flag). Block swap is handled separately.
             if self.weight_cpu_offloading:
                 # Determine offloading hooks based on configuration
-                load_fn = load_weights if self.weight_cpu_offloading else None
-                offload_fn = offload_weights if self.weight_cpu_offloading else None
+                load_fn = load_weights
+                offload_fn = offload_weights
 
                 # Use custom block checkpointing
                 # With our updated block_checkpoint, this will:

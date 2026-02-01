@@ -224,28 +224,34 @@ def weighs_to_device(layer: nn.Module, device: torch.device, skip_trainable: boo
 
 
 
-def params_to_device(layer: nn.Module, device: torch.device, include_norms: bool = False, use_pinned: bool = False):
+def params_to_device(layer: nn.Module, device: torch.device, include_norms: bool = False, use_pinned: bool = False, skip_trainable: bool = True):
     """Move module parameters to device, optionally including normalization layers.
-    
+
     Args:
         layer: Module to process
         device: Target device
         include_norms: If True, also move RMSNorm/LayerNorm weights (more VRAM savings, more overhead)
         use_pinned: If True and target is CPU, pin memory. If target is GPU, assumes source is pinned for async transfer.
+        skip_trainable: If True AND target is CPU, skip parameters with requires_grad=True (protects LoRA params)
     """
     non_blocking = device.type != "cpu"
-    
+    # Only skip trainable parameters when moving TO CPU (offloading), not when loading TO GPU
+    should_skip_trainable = skip_trainable and device.type == "cpu"
+
     # Patterns for normalization layers
     norm_patterns = ("RMSNorm", "LayerNorm", "GroupNorm", "BatchNorm")
-    
+
     for module in layer.modules():
         class_name = module.__class__.__name__
-        
+
         # Linear layers
         if class_name.endswith("Linear"):
             for attr in ["weight", "bias", "scale_weight"]:
                 p = getattr(module, attr, None)
                 if p is not None and isinstance(p, (torch.Tensor, torch.nn.Parameter)):
+                    # Skip trainable (LoRA) parameters when offloading to CPU
+                    if should_skip_trainable and hasattr(p, 'requires_grad') and p.requires_grad:
+                        continue
                     if device.type == "cpu" and use_pinned:
                         # Reuse or allocate pinned buffer
                         pid = id(p)
@@ -266,6 +272,9 @@ def params_to_device(layer: nn.Module, device: torch.device, include_norms: bool
             for attr in ["weight", "bias"]:
                 p = getattr(module, attr, None)
                 if p is not None and isinstance(p, (torch.Tensor, torch.nn.Parameter)):
+                    # Skip trainable (LoRA) parameters when offloading to CPU
+                    if should_skip_trainable and hasattr(p, 'requires_grad') and p.requires_grad:
+                        continue
                     if device.type == "cpu" and use_pinned:
                         # Reuse or allocate pinned buffer
                         pid = id(p)
@@ -607,7 +616,7 @@ class Offloader:
 
             dev = self.device.index if self.device.index is not None else torch.cuda.current_device()
             torch.cuda.set_device(dev)
-            
+
             sync_event = self.swap_weight_devices(block_to_cpu, block_to_cuda)
 
             if self.debug:
@@ -622,6 +631,64 @@ class Offloader:
         self.futures[block_idx_to_cuda] = self.thread_pool.submit(
             move_blocks, block_idx_to_cpu, block_to_cpu, block_idx_to_cuda, block_to_cuda
         )
+
+    def _submit_load_block(self, blocks, block_idx):
+        """Single-direction load: move ENTIRE block from CPU to GPU without swapping another out."""
+        def load_block(bidx, block):
+            if self.debug:
+                start_time = time.perf_counter()
+                print(f"[{self.block_type}] Load block {bidx} to {'CUDA' if self.cuda_available else 'device'}")
+
+            dev = self.device.index if self.device.index is not None else torch.cuda.current_device()
+            torch.cuda.set_device(dev)
+
+            # Move ENTIRE block to GPU (all params and buffers, not just Linear weights)
+            block.to(self.device)
+
+            if self.cuda_available:
+                torch.cuda.current_stream().synchronize()
+                sync_event = torch.cuda.current_stream().record_event()
+            else:
+                sync_event = None
+
+            if self.debug:
+                print(f"[{self.block_type}] Loaded block {bidx} in {time.perf_counter() - start_time:.2f}s")
+            return bidx, bidx, sync_event
+
+        block = blocks[block_idx]
+        self.futures[block_idx] = self.thread_pool.submit(load_block, block_idx, block)
+
+    def _submit_unload_block(self, blocks, block_idx, sync: bool = True):
+        """Single-direction unload: move ENTIRE block from GPU to CPU.
+
+        Args:
+            blocks: List of blocks
+            block_idx: Index of block to unload
+            sync: If True, wait for unload to complete (default True to prevent VRAM accumulation)
+        """
+        def unload_block(bidx, block):
+            if self.debug:
+                start_time = time.perf_counter()
+                print(f"[{self.block_type}] Unload block {bidx} to CPU")
+
+            # Move ENTIRE block to CPU
+            block.to("cpu")
+
+            # Synchronize to ensure transfer is complete
+            if self.cuda_available:
+                torch.cuda.synchronize()
+
+            if self.debug:
+                print(f"[{self.block_type}] Unloaded block {bidx} in {time.perf_counter() - start_time:.2f}s")
+            return bidx, bidx, None
+
+        block = blocks[block_idx]
+        if sync:
+            # Synchronous unload to prevent VRAM accumulation
+            unload_block(block_idx, block)
+        else:
+            # Async unload (original behavior)
+            self.thread_pool.submit(unload_block, block_idx, block)
 
     def _wait_blocks_move(self, block_idx):
         if block_idx not in self.futures:
@@ -743,6 +810,8 @@ class ModelOffloader(Offloader):
             return
 
         aggressive_train_swap = os.getenv("LTX2_SWAP_TRAIN_FULL", "0") == "1"
+        split_idx = max(0, self.num_blocks - self.blocks_to_swap)
+
         if not self.forward_only and not aggressive_train_swap:
             # if backward is enabled, we do not swap blocks in forward pass more than blocks_to_swap, because it should be on GPU
             if block_idx >= self.blocks_to_swap:
@@ -752,7 +821,32 @@ class ModelOffloader(Offloader):
             self._submit_move_blocks(blocks, block_idx_to_cpu, block_idx_to_cuda)
             return
 
-        # We use two strategies here for forward-only offloading (or aggressive training swap):
+        # Training mode with aggressive swap: Stream ENTIRE blocks through GPU
+        # - Blocks 0 to split_idx-1: Stay on GPU permanently (for fast backward)
+        # - Blocks split_idx to N-1: Stream through (load → compute → unload)
+        # Uses full block moves (block.to(device)) instead of Linear-only swaps
+        if not self.forward_only and aggressive_train_swap:
+            # Early blocks stay on GPU - do not swap them
+            if block_idx < split_idx:
+                # Preload the first swapped block when we're about to reach it
+                if block_idx == split_idx - 1 and split_idx < self.num_blocks:
+                    self._submit_load_block(blocks, split_idx)
+                return
+
+            # Swap range: after executing block N, unload it and load N+1
+            # Use full block moves instead of Linear-only swaps for complete VRAM savings
+            self._submit_unload_block(blocks, block_idx)
+
+            # Load next block to GPU
+            if block_idx + 1 < self.num_blocks:
+                self._submit_load_block(blocks, block_idx + 1)
+            else:
+                # Last block - load first swapped block for backward pass
+                self._submit_load_block(blocks, split_idx)
+            return
+
+        # Forward-only (inference) mode: Use traditional swap strategies
+        # We use two strategies here for forward-only offloading:
         # 1. If blocks_to_swap is less than half of num_blocks, we swap the num_blocks blocks without wrapping around.
         #   This reduces the number of swaps, so it is especially useful for small blocks_to_swap or lightweight models like Qwen-Image
         # 2. If blocks_to_swap is more than half of num_blocks, we swap the blocks with wrapping around.

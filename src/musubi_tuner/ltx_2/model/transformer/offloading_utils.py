@@ -12,6 +12,7 @@ from musubi_tuner.ltx_2.model.ltx2_custom_offloading_utils import (
     weighs_to_device,
     params_to_device,
 )
+from musubi_tuner.ltx_2.model.transformer.fp8_device_utils import set_block_swap_active
 
 logger = logging.getLogger(__name__)
 _LOGGED_SWAP_BYTES = False
@@ -19,6 +20,15 @@ _LOGGED_FIRST_PARAM = False
 _SKIP_AUDIO_SWAP = os.getenv("LTX2_SWAP_SKIP_AUDIO", "1") == "1"
 _SKIP_CROSS_ATTN_SWAP = os.getenv("LTX2_SWAP_KEEP_CROSS_ATTN", "0") == "1"
 _SKIP_ATTN_SWAP = os.getenv("LTX2_SWAP_KEEP_ATTN", "0") == "1"
+
+
+def _swap_full_block_enabled() -> bool:
+    """Enable full block swap (move ALL params to CPU, not just Linear weights).
+
+    This significantly reduces VRAM but may be slower due to more data transfer.
+    Set LTX2_SWAP_FULL_BLOCK=1 to enable.
+    """
+    return os.getenv("LTX2_SWAP_FULL_BLOCK", "1") == "1"
 
 
 def _should_skip_swap(name: str) -> bool:
@@ -70,10 +80,16 @@ def _move_non_linear_params(block: nn.Module, device: torch.device, *, include_n
 
 
 def _mark_swap_weight_offload(block: nn.Module, enabled: bool) -> None:
-    """Tag block and its Linear submodules to avoid FP8 sync pulling weights to GPU."""
+    """Tag block and ALL its submodules to avoid FP8 sync pulling weights to GPU."""
     setattr(block, "swap_weight_offload", bool(enabled))
     for module in block.modules():
-        if module.__class__.__name__.endswith("Linear"):
+        # Mark Linear, RMSNorm, LayerNorm, and other modules that have weights
+        class_name = module.__class__.__name__
+        if (class_name.endswith("Linear") or
+            class_name.endswith("RMSNorm") or
+            class_name.endswith("LayerNorm") or
+            class_name.endswith("GroupNorm") or
+            class_name.endswith("BatchNorm")):
             setattr(module, "swap_weight_offload", bool(enabled))
 
 
@@ -268,6 +284,53 @@ class LTX2ModelOffloader(ModelOffloader):
     def __init__(self, *args, swap_norms: bool = False, **kwargs):
         super().__init__(*args, **kwargs)
         self.swap_norms = swap_norms
+        self._aggressive_backward_handles = []
+
+    def _setup_aggressive_backward_hooks(self, blocks: List[nn.Module]) -> None:
+        """Setup backward hooks to unload swapped blocks after backward pass.
+
+        Loading during backward is handled by checkpoint_wrapper in transformer.py.
+        This hook only handles unloading after each block's backward is complete.
+        """
+        # Remove existing backward hooks from base class
+        if hasattr(self, 'remove_handles'):
+            for handle in self.remove_handles:
+                try:
+                    handle.remove()
+                except Exception:
+                    pass
+            self.remove_handles = []
+
+        # Remove any previous aggressive hooks
+        for handle in self._aggressive_backward_handles:
+            try:
+                handle.remove()
+            except Exception:
+                pass
+        self._aggressive_backward_handles = []
+
+        split_idx = max(0, self.num_blocks - self.blocks_to_swap)
+
+        for block_idx, block in enumerate(blocks):
+            # Only add hooks for swapped blocks (split_idx to num_blocks-1)
+            if block_idx < split_idx:
+                continue
+
+            # Capture block_idx and device in closure
+            def make_post_hook(idx, device):
+                def post_hook(module, grad_input, grad_output):
+                    # Unload block to CPU after backward to free VRAM
+                    module.to("cpu")
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    return None
+                return post_hook
+
+            # Register post-hook to unload after backward
+            post_handle = block.register_full_backward_hook(make_post_hook(block_idx, self.device))
+            self._aggressive_backward_handles.append(post_handle)
+
+        logger.info(f"Registered backward unload hooks for {len(blocks) - split_idx} swapped blocks")
 
     def prepare_block_devices_before_forward(self, blocks: list[nn.Module]) -> None:
         global _LOGGED_SWAP_BYTES, _LOGGED_FIRST_PARAM
@@ -288,42 +351,94 @@ class LTX2ModelOffloader(ModelOffloader):
 
         use_pinned = self.use_pinned_memory and os.getenv("LTX2_SWAP_PINNED", "1") == "1"
         split_idx = max(0, self.num_blocks - self.blocks_to_swap)
-        for block in blocks[0 : split_idx]:
-            _mark_swap_weight_offload(block, False)
-            block.to(self.device)
-            weighs_to_device(block, self.device, use_pinned=use_pinned)
-
         cpu_device = torch.device("cpu")
-        for block in blocks[split_idx :]:
-            _mark_swap_weight_offload(block, True)
-            if self.swap_norms:
-                # Keep Linear+norm weights on CPU; move remaining non-linear params to GPU.
-                if _SKIP_AUDIO_SWAP or _SKIP_CROSS_ATTN_SWAP:
-                    _move_block_params_excluding_audio(
-                        block,
-                        cpu_device,
-                        include_norms=True,
-                        use_pinned=use_pinned,
-                    )
+
+        # Full block swap mode: move ALL params to CPU for swapped blocks (maximum VRAM savings)
+        if _swap_full_block_enabled():
+            logger.info(f"LTX-2 swap: FULL BLOCK MODE - blocks 0-{split_idx-1} to GPU, {split_idx}-{len(blocks)-1} to CPU")
+            _log_cuda_memory("full_block_swap_START")
+
+            # Debug: count params on each device before
+            gpu_params_before = sum(1 for b in blocks for p in b.parameters() if p.is_cuda)
+            cpu_params_before = sum(1 for b in blocks for p in b.parameters() if not p.is_cuda)
+            logger.info(f"BEFORE swap: GPU params={gpu_params_before}, CPU params={cpu_params_before}")
+
+            for idx, block in enumerate(blocks[0 : split_idx]):
+                _mark_swap_weight_offload(block, False)
+                block.to(self.device)
+                params_to_device(block, self.device, include_norms=True, use_pinned=use_pinned)
+            _log_cuda_memory(f"full_block_swap_AFTER_GPU_blocks_0_to_{split_idx-1}")
+
+            for idx, block in enumerate(blocks[split_idx :], start=split_idx):
+                _mark_swap_weight_offload(block, True)
+                block.to(cpu_device)
+                params_to_device(block, cpu_device, include_norms=True, use_pinned=use_pinned)
+            _log_cuda_memory(f"full_block_swap_AFTER_CPU_blocks_{split_idx}_to_{len(blocks)-1}")
+
+            # Debug: count params on each device after
+            gpu_params_after = sum(1 for b in blocks for p in b.parameters() if p.is_cuda)
+            cpu_params_after = sum(1 for b in blocks for p in b.parameters() if not p.is_cuda)
+            logger.info(f"AFTER swap: GPU params={gpu_params_after}, CPU params={cpu_params_after}")
+        else:
+            # Partial swap: keep non-linear params on GPU (faster but uses more VRAM)
+            for block in blocks[0 : split_idx]:
+                _mark_swap_weight_offload(block, False)
+                block.to(self.device)
+                weighs_to_device(block, self.device, use_pinned=use_pinned)
+
+            for block in blocks[split_idx :]:
+                _mark_swap_weight_offload(block, True)
+                if self.swap_norms:
+                    # Keep Linear+norm weights on CPU; move remaining non-linear params to GPU.
+                    if _SKIP_AUDIO_SWAP or _SKIP_CROSS_ATTN_SWAP:
+                        _move_block_params_excluding_audio(
+                            block,
+                            cpu_device,
+                            include_norms=True,
+                            use_pinned=use_pinned,
+                        )
+                    else:
+                        params_to_device(block, cpu_device, include_norms=True, use_pinned=use_pinned)
+                    _move_non_linear_params(block, self.device, include_norms=False)
                 else:
-                    params_to_device(block, cpu_device, include_norms=True, use_pinned=use_pinned)
-                _move_non_linear_params(block, self.device, include_norms=False)
-            else:
-                # Keep Linear weights on CPU; move non-linear params/buffers to GPU.
-                if _SKIP_AUDIO_SWAP or _SKIP_CROSS_ATTN_SWAP:
-                    _move_block_params_excluding_audio(
-                        block,
-                        cpu_device,
-                        include_norms=False,
-                        use_pinned=use_pinned,
-                    )
-                else:
-                    weighs_to_device(block, cpu_device, use_pinned=use_pinned)
-                _move_non_linear_params(block, self.device, include_norms=True)
+                    # Keep Linear weights on CPU; move non-linear params/buffers to GPU.
+                    if _SKIP_AUDIO_SWAP or _SKIP_CROSS_ATTN_SWAP:
+                        _move_block_params_excluding_audio(
+                            block,
+                            cpu_device,
+                            include_norms=False,
+                            use_pinned=use_pinned,
+                        )
+                    else:
+                        weighs_to_device(block, cpu_device, use_pinned=use_pinned)
+                    _move_non_linear_params(block, self.device, include_norms=True)
 
         _synchronize_device(self.device)
         _clean_memory_on_device(self.device)
         _log_cuda_memory("after_prepare_blocks")
+
+        # Preload first swapped block if training with aggressive swap
+        # This ensures block split_idx is on GPU when forward pass reaches it
+        aggressive_train_swap = os.getenv("LTX2_SWAP_TRAIN_FULL", "0") == "1"
+        if aggressive_train_swap:
+            # Setup backward hooks to unload blocks after backward pass
+            # Loading during backward is handled by checkpoint_wrapper in transformer.py
+            self._setup_aggressive_backward_hooks(blocks)
+            # Enable block swap active flag (used by ensure_fp8_modules_on_device)
+            set_block_swap_active(True)
+            logger.info("Block swap active: backward hooks registered for unloading")
+
+        if aggressive_train_swap and split_idx < len(blocks):
+            # If split_idx == 0, all blocks are swapped - preload block 0
+            # If split_idx > 0, preload will be handled by submit_move_blocks_forward
+            # when block split_idx-1 finishes. But for safety, still preload here.
+            if split_idx == 0:
+                logger.info(f"Preloading first swapped block {split_idx} to GPU (full block move)")
+                # Use full block move for consistency with aggressive swap mode
+                blocks[split_idx].to(self.device)
+                _synchronize_device(self.device)
+                _log_cuda_memory(f"after_preload_block_{split_idx}")
+
         if not _LOGGED_SWAP_BYTES:
             split_idx = max(0, self.num_blocks - self.blocks_to_swap)
             _log_block_cuda_bytes(blocks, split_idx)

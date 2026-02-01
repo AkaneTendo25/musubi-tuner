@@ -238,7 +238,7 @@ def load_ltx2_model(
 
     if fp8_scaled:
         fp8_calc_device = target_device if (not load_weights_on_cpu and load_device == target_device) else torch.device("cpu")
-        fp8_calc_override = os.getenv("LTX2_FP8_CALC_DEVICE", "").strip().lower()
+        fp8_calc_override = os.getenv("LTX2_FP8_CALC_DEVICE", "cuda").strip().lower()
         if fp8_calc_override in {"1", "true", "yes", "cuda", "gpu"}:
             if target_device.type == "cuda":
                 fp8_calc_device = target_device
@@ -495,7 +495,32 @@ class LTX2NetworkTrainer(NetworkTrainer):
     def _ensure_fp8_buffers_on_device(self, model: torch.nn.Module) -> None:
         if not any(True for _ in model.parameters()):
             return
-        ensure_fp8_modules_on_device(model, next(model.parameters()).device)
+        target_device = next(model.parameters()).device
+
+        # If block swap is enabled, we must NOT call ensure_fp8_modules_on_device on the entire model
+        # because it would move all swapped blocks from CPU to GPU, defeating block swapping.
+        # Instead, process only non-swapped parts of the model.
+        base_model = model.model if hasattr(model, "model") else model
+        blocks_to_swap = getattr(base_model, "blocks_to_swap", 0) or 0
+
+        if blocks_to_swap > 0 and hasattr(base_model, "transformer_blocks"):
+            # Process non-block components (patchify, adaln, caption_projection, etc.)
+            for name, child in base_model.named_children():
+                if name == "transformer_blocks":
+                    continue  # Skip transformer blocks - they are managed by block swap
+                ensure_fp8_modules_on_device(child, target_device)
+
+            # Only process non-swapped blocks (those that should always be on GPU)
+            num_blocks = len(base_model.transformer_blocks)
+            swap_start = max(0, num_blocks - blocks_to_swap)
+            for idx, block in enumerate(base_model.transformer_blocks):
+                if idx < swap_start:
+                    # This block should be on GPU - ensure FP8 modules are on device
+                    ensure_fp8_modules_on_device(block, target_device)
+                # Skip swapped blocks - they are managed by the block swap mechanism
+        else:
+            # No block swap - process entire model as before
+            ensure_fp8_modules_on_device(model, target_device)
 
     class _DeferredVAE:
         def __init__(self) -> None:
@@ -2999,10 +3024,17 @@ def main() -> None:
 
     blocks_to_swap = int(getattr(args, "blocks_to_swap", 0) or 0)
     has_bw_checkpointing = getattr(args, "blockwise_checkpointing", False)
-    if blocks_to_swap > 0 and has_bw_checkpointing:
-        if os.environ.get("LTX2_SWAP_TRAIN_FULL") is None:
-            os.environ["LTX2_SWAP_TRAIN_FULL"] = "1"
-            logger.info("Auto-enabled LTX2_SWAP_TRAIN_FULL=1 (blockwise checkpointing with block swap)")
+    # Auto-enable LTX2_SWAP_TRAIN_FULL for proper block swapping during training
+    if blocks_to_swap > 0:
+        current_val = os.environ.get("LTX2_SWAP_TRAIN_FULL")
+        # Always set to "1" for training with block swap (override any previous value)
+        os.environ["LTX2_SWAP_TRAIN_FULL"] = "1"
+        if current_val is None:
+            logger.info("Auto-enabled LTX2_SWAP_TRAIN_FULL=1 (blocks_to_swap=%d)", blocks_to_swap)
+        elif current_val != "1":
+            logger.info("Overriding LTX2_SWAP_TRAIN_FULL from '%s' to '1' (blocks_to_swap=%d)", current_val, blocks_to_swap)
+        else:
+            logger.info("LTX2_SWAP_TRAIN_FULL=1 already set (blocks_to_swap=%d)", blocks_to_swap)
 
     explicit_lora_preset = any(
         arg == "--lora_target_preset" or arg.startswith("--lora_target_preset=") for arg in sys.argv
