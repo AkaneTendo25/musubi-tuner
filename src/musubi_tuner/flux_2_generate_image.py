@@ -10,18 +10,15 @@ from typing import Tuple, Optional, List, Any, Dict
 import torch
 from safetensors.torch import load_file, save_file
 from safetensors import safe_open
-from tqdm import tqdm
 
+from musubi_tuner.flux_2 import flux2_utils
+from musubi_tuner.flux_2 import flux2_models
 from musubi_tuner.utils import model_utils
 from musubi_tuner.utils.lora_utils import filter_lora_state_dict
-from musubi_tuner.zimage import zimage_config, zimage_model, zimage_utils
-from musubi_tuner.zimage import zimage_autoencoder
-from musubi_tuner.zimage.zimage_autoencoder import AutoencoderKL
-
 
 lycoris_available = find_spec("lycoris") is not None
 
-from musubi_tuner.networks import lora_qwen_image
+from musubi_tuner.networks import lora_flux_2
 from musubi_tuner.utils.device_utils import clean_memory_on_device
 from musubi_tuner.hv_generate_video import get_time_flag, save_images_grid, setup_parser_compile, synchronize_device
 from musubi_tuner.wan_generate_video import merge_lora_weights
@@ -40,14 +37,20 @@ class GenerationSettings:
 
 def parse_args() -> argparse.Namespace:
     """parse command line arguments"""
-    parser = argparse.ArgumentParser(description="Z-Image inference script")
+    parser = argparse.ArgumentParser(description="FLUX.2 inference script")
+
+    # WAN arguments
+    # parser.add_argument("--ckpt_dir", type=str, default=None, help="The path to the checkpoint directory (Wan 2.1 official).")
+    # parser.add_argument(
+    #     "--sample_solver", type=str, default="unipc", choices=["unipc", "dpm++", "vanilla"], help="The solver used to sample."
+    # )
 
     parser.add_argument("--dit", type=str, default=None, help="DiT directory or path")
     parser.add_argument(
         "--disable_numpy_memmap", action="store_true", help="Disable numpy memmap when loading safetensors. Default is False."
     )
-    parser.add_argument("--vae", type=str, default=None, help="VAE directory or path")
-    parser.add_argument("--text_encoder", type=str, required=True, help="Text Encoder 1 (Qwen2.5-VL) directory or path")
+    parser.add_argument("--vae", type=str, default=None, help="AE directory or path")
+    parser.add_argument("--text_encoder", type=str, required=True, help="Text Encoder Mistral 3/Qwen 3 directory or path")
 
     # LoRA
     parser.add_argument("--lora_weight", type=str, nargs="*", required=False, default=None, help="LoRA weight path")
@@ -63,36 +66,59 @@ def parse_args() -> argparse.Namespace:
 
     # inference
     parser.add_argument(
-        "--cpu_noise", action="store_true", help="Use CPU to generate noise (compatible with ComfyUI). Default is False."
-    )
-    parser.add_argument(
-        "--guidance_scale",
-        type=float,
-        default=0.0,
-        help="Guidance scale for classifier free guidance. Default is 0.0 (no guidance).",
+        "--guidance_scale", type=float, default=4.0, help="Guidance scale for classifier free guidance. Default is 4.0."
     )
     parser.add_argument("--prompt", type=str, default=None, help="prompt for generation")
-    parser.add_argument("--negative_prompt", type=str, default=None, help="negative prompt for generation")
-    parser.add_argument("--image_size", type=int, nargs=2, default=[256, 256], help="image size, height and width")
-    parser.add_argument("--infer_steps", type=int, default=25, help="number of inference steps, default is 25")
-    parser.add_argument("--save_path", type=str, required=True, help="path to save generated image(s)")
-    parser.add_argument("--seed", type=int, default=None, help="Seed for evaluation.")
     parser.add_argument(
-        "--embedded_cfg_scale", type=float, default=2.5, help="Embedded CFG scale (distilled CFG Scale), default is 2.5"
+        "--negative_prompt",
+        type=str,
+        default=None,
+        help="negative prompt for generation, default is None (` ` for non-distilled model)",
     )
+
+    parser.add_argument("--image_size", type=int, nargs=2, default=[1024, 1024], help="image size, height and width")
+    parser.add_argument(
+        "--control_image_path",
+        nargs="*",
+        type=str,
+        default=None,
+        help="path to control (reference) image(s) for Flux 2 image edit",
+    )
+    parser.add_argument(
+        "--no_resize_control", action="store_true", help="Do not resize control image (default is to resize if too large)"
+    )
+    parser.add_argument("--infer_steps", type=int, default=50, help="number of inference steps, default is 25")
+    parser.add_argument("--save_path", type=str, required=True, help="path to save generated video")
+    parser.add_argument("--seed", type=int, default=None, help="Seed for evaluation.")
+    # parser.add_argument(
+    #     "--cpu_noise", action="store_true", help="Use CPU to generate noise (compatible with ComfyUI). Default is False."
+    # )
+    parser.add_argument(
+        "--embedded_cfg_scale",
+        type=float,
+        default=4.0,
+        help="Embeded CFG scale (distilled CFG Scale), default is 4.0. All klein models ignore this.",
+    )
+    # parser.add_argument("--video_path", type=str, default=None, help="path to video for video2video inference")
+    # parser.add_argument(
+    #     "--image_path",
+    #     type=str,
+    #     default=None,
+    #     help="path to image for image2video inference. If `;;;` is used, it will be used as section images. The notation is same as `--prompt`.",
+    # )
 
     # Flow Matching
     parser.add_argument(
         "--flow_shift",
         type=float,
-        default=3.0,
-        help="Shift factor for flow matching schedulers. Default is 3.0.",
+        default=None,
+        help="Shift factor for flow matching schedulers. Default is None (FLUX.2 default).",
     )
 
     parser.add_argument("--fp8", action="store_true", help="use fp8 for DiT model")
     parser.add_argument("--fp8_scaled", action="store_true", help="use scaled fp8 for DiT, only for fp8")
-    parser.add_argument("--fp8_llm", action="store_true", help="use fp8 for language model")
-    parser.add_argument("--text_encoder_cpu", action="store_true", help="Inference on CPU for Text Encoder (Qwen2.5-VL)")
+
+    parser.add_argument("--fp8_text_encoder", action="store_true", help="use fp8 for Text Encoder (Mistral 3)")
     parser.add_argument(
         "--device", type=str, default=None, help="device to use for inference. If None, use CUDA if available, otherwise use CPU"
     )
@@ -102,11 +128,6 @@ def parse_args() -> argparse.Namespace:
         default="torch",
         choices=["flash", "torch", "sageattn", "xformers", "sdpa"],  #  "flash2", "flash3",
         help="attention mode",
-    )
-    parser.add_argument(
-        "--use_32bit_attention",
-        action="store_true",
-        help="use 32-bit precision for attention computations in DiT model even when using mixed precision (original behavior)",
     )
     parser.add_argument("--blocks_to_swap", type=int, default=0, help="number of blocks to swap in the model")
     parser.add_argument(
@@ -128,14 +149,11 @@ def parse_args() -> argparse.Namespace:
     )
     setup_parser_compile(parser)
 
-    # arguments for batch and interactive modes
+    # New arguments for batch and interactive modes
     parser.add_argument("--from_file", type=str, default=None, help="Read prompts from a file")
     parser.add_argument("--interactive", action="store_true", help="Interactive mode: read prompts from console")
-    parser.add_argument(
-        "--bell",
-        action="store_true",
-        help="Ring bell when done. For interactive mode, ring bell on each iteration. For other modes, ring bell at the end.",
-    )
+
+    flux2_utils.add_model_version_args(parser)
 
     args = parser.parse_args()
 
@@ -163,13 +181,19 @@ def parse_prompt_line(line: str) -> Dict[str, Any]:
         Dict[str, Any]: Dictionary of argument overrides
     """
     # TODO common function with hv_train_network.line_to_prompt_dict
-    parts = line.split(" --")
-    prompt = parts[0].strip()
+    if line.strip().startswith("--"):  # No prompt
+        parts = (" " + line.strip()).split(" --")
+        prompt = None
+    else:
+        parts = line.split(" --")
+        prompt = parts[0].strip()
+        parts = parts[1:]
 
     # Create dictionary of overrides
-    overrides = {"prompt": prompt}
+    overrides = {} if prompt is None else {"prompt": prompt}
+    overrides["control_image_path"] = []
 
-    for part in parts[1:]:
+    for part in parts:
         if not part.strip():
             continue
         option_parts = part.split(" ", 1)
@@ -189,8 +213,20 @@ def parse_prompt_line(line: str) -> Dict[str, Any]:
             overrides["guidance_scale"] = float(value)
         elif option == "fs":
             overrides["flow_shift"] = float(value)
+        elif option == "i":
+            overrides["image_path"] = value
+        # elif option == "im":
+        #     overrides["image_mask_path"] = value
+        # elif option == "cn":
+        #     overrides["control_path"] = value
         elif option == "n":
             overrides["negative_prompt"] = value
+        elif option == "ci":  # control_image_path
+            overrides["control_image_path"].append(value)
+
+    # If no control_image_path was provided, remove the empty list
+    if not overrides["control_image_path"]:
+        del overrides["control_image_path"]
 
     return overrides
 
@@ -219,7 +255,7 @@ def apply_overrides(args: argparse.Namespace, overrides: Dict[str, Any]) -> argp
 
 
 def check_inputs(args: argparse.Namespace) -> Tuple[int, int]:
-    """Validate image size
+    """Validate video size and length
 
     Args:
         args: command line arguments
@@ -230,7 +266,7 @@ def check_inputs(args: argparse.Namespace) -> Tuple[int, int]:
     height = args.image_size[0]
     width = args.image_size[1]
 
-    if height % (zimage_config.ZIMAGE_VAE_SCALE_FACTOR * 2) != 0 or width % (zimage_config.ZIMAGE_VAE_SCALE_FACTOR * 2) != 0:
+    if height % 16 != 0 or width % 16 != 0:
         raise ValueError(f"`height` and `width` have to be divisible by 16 but are {height} and {width}.")
 
     return height, width
@@ -241,16 +277,17 @@ def check_inputs(args: argparse.Namespace) -> Tuple[int, int]:
 
 def load_dit_model(
     args: argparse.Namespace, device: torch.device, dit_weight_dtype: Optional[torch.dtype] = None
-) -> zimage_model.ZImageTransformer2DModel:
+) -> flux2_models.Flux2:
     """load DiT model
 
     Args:
         args: command line arguments
         device: device to use
+        dit_dtype: data type for the model
         dit_weight_dtype: data type for the model weights. None for as-is
 
     Returns:
-        zimage_model.ZImageTransformer2DModel: DiT model instance
+        flux2_models.Flux2: DiT model
     """
     # If LyCORIS is enabled, we will load the model to CPU and then merge LoRA weights (static method)
 
@@ -275,25 +312,26 @@ def load_dit_model(
     elif args.lycoris:
         loading_weight_dtype = torch.bfloat16  # lycoris requires bfloat16 or float16, because it merges weights
 
-    model = zimage_model.load_zimage_model(
+    model_version_info = flux2_utils.FLUX2_MODEL_INFO[args.model_version]
+    model = flux2_utils.load_flow_model(
         device,
+        model_version_info,
         args.dit,
         args.attn_mode,
         False,
         loading_device,
         loading_weight_dtype,
         args.fp8_scaled and not args.lycoris,
-        lora_weights_list=lora_weights_list,
-        lora_multipliers=args.lora_multiplier,
-        disable_numpy_memmap=args.disable_numpy_memmap,
-        use_16bit_for_attention=not args.use_32bit_attention,
+        lora_weights_list,
+        args.lora_multiplier,
+        args.disable_numpy_memmap,
     )
 
     # merge LoRA weights
     if args.lycoris:
         if args.lora_weight is not None and len(args.lora_weight) > 0:
             merge_lora_weights(
-                lora_qwen_image,
+                lora_flux_2,
                 model,
                 args.lora_weight,
                 args.lora_multiplier,
@@ -318,8 +356,8 @@ def load_dit_model(
             state_dict = optimize_state_dict_with_fp8(
                 state_dict,
                 device,
-                zimage_model.FP8_OPTIMIZATION_TARGET_KEYS,
-                zimage_model.FP8_OPTIMIZATION_EXCLUDE_KEYS,
+                flux2_models.FP8_OPTIMIZATION_TARGET_KEYS,
+                flux2_models.FP8_OPTIMIZATION_EXCLUDE_KEYS,
                 move_to_device=move_to_device,
             )
             apply_fp8_monkey_patch(model, state_dict, use_scaled_mm=False)  # args.scaled_mm)
@@ -327,9 +365,9 @@ def load_dit_model(
             info = model.load_state_dict(state_dict, strict=True, assign=True)
             logger.info(f"Loaded FP8 optimized weights: {info}")
 
-    # if we only want to save the model, we can skip the rest
+    # if we only want to save the model, we can skip the rest of the setup but still return the model
     if args.save_merged_model:
-        return None
+        return model
 
     if not args.fp8_scaled:
         # simple cast to dit_weight_dtype
@@ -359,7 +397,7 @@ def load_dit_model(
 
     if args.compile:
         model = model_utils.compile_transformer(
-            args, model, [model.noise_refiner, model.context_refiner, model.layers], disable_linear=args.blocks_to_swap > 0
+            args, model, [model.double_blocks, model.single_blocks], disable_linear=args.blocks_to_swap > 0
         )
 
     model.eval().requires_grad_(False)
@@ -368,51 +406,84 @@ def load_dit_model(
     return model
 
 
-# endregion
+def decode_latent(ae: flux2_models.AutoEncoder, latent: torch.Tensor, device: torch.device) -> torch.Tensor:
+    logger.info("Decoding image...")
+    if latent.ndim == 3:
+        latent = latent.unsqueeze(0)  # add batch dimension
 
-
-def decode_latent(vae: AutoencoderKL, latent: torch.Tensor, device: torch.device) -> torch.Tensor:
-    logger.info(f"Decoding image. Latent shape {latent.shape}, device {device}")
-    if latent.ndim == 3:  # CHW
-        latent = latent.unsqueeze(0)  # add batch dimension if not present
-
-    latent = zimage_utils.shift_scale_latents_for_decode(latent.to(vae.dtype))
-
-    vae.to(device)
+    ae.to(device)
     with torch.no_grad():
-        pixels = vae.decode(latent.to(device))  # decode to pixels, -1 to 1
-    pixels = pixels.to("cpu", dtype=torch.float32)  # move to CPU and convert to float32 (bfloat16 is not supported by numpy)
-    vae.to("cpu")
+        pixels = ae.decode(latent.to(device, ae.dtype))  # decode to pixels
+    pixels = pixels.to("cpu")
+    ae.to("cpu")
 
     logger.info(f"Decoded. Pixel shape {pixels.shape}")
     return pixels[0]  # remove batch dimension
 
 
+def prepare_image_inputs(
+    args: argparse.Namespace, device: torch.device, ae: flux2_models.AutoEncoder
+) -> Tuple[int, int, Optional[List[torch.Tensor]]]:
+    """Prepare image-related inputs for FLUX.2: AE encoding."""
+    height, width = check_inputs(args)
+
+    if args.control_image_path is not None and len(args.control_image_path):
+        limit_size = (1024, 1024) if len(args.control_image_path) > 1 else (2024, 2024)
+        if args.no_resize_control:
+            limit_size = None
+
+        img_ctx_prep = []
+        for image_path in args.control_image_path:
+            image_tensor, _, _ = flux2_utils.preprocess_control_image(image_path, limit_size)
+            img_ctx_prep.append(image_tensor)
+
+        # AE encoding
+        logger.info("Encoding control image to latent space with AE")
+        ae_original_device = ae.device
+        ae.to(device)
+
+        control_latent = []
+        with torch.no_grad():
+            # Encode each reference image
+            for img in img_ctx_prep:
+                encoded = ae.encode(img.to(device, dtype=ae.dtype))[0]  # C, H, W
+                control_latent.append(encoded.to(torch.bfloat16).to("cpu"))
+
+        ae.to(ae_original_device)  # Move VAE back to its original device
+        clean_memory_on_device(device)
+    else:
+        control_latent = None
+
+    return height, width, control_latent
+
+
 def prepare_text_inputs(
     args: argparse.Namespace, device: torch.device, shared_models: Optional[Dict] = None
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    """Prepare text-related inputs for I2V: LLM encoding."""
+    """Prepare text-related inputs for I2V: LLM and TextEncoder encoding."""
+    model_version_info = flux2_utils.FLUX2_MODEL_INFO[args.model_version]
 
     # load text encoder: conds_cache holds cached encodings for prompts without padding
     conds_cache = {}
-    llm_device = torch.device("cpu") if args.text_encoder_cpu else device
     if shared_models is not None:
-        tokenizer = shared_models.get("tokenizer")
-        text_encoder = shared_models.get("text_encoder")
+        text_embedder = shared_models.get("text_embedder")
         if "conds_cache" in shared_models:  # Use shared cache if available
             conds_cache = shared_models["conds_cache"]
-
         # text_encoder is on device (batched inference) or CPU (interactive inference)
     else:  # Load if not in shared_models
-        vl_dtype = torch.bfloat16 if not args.fp8_llm else torch.float8_e4m3fn
-        tokenizer, text_encoder = zimage_utils.load_qwen3(args.text_encoder, dtype=vl_dtype, device=llm_device, disable_mmap=True)
+        te_dtype = torch.float8_e4m3fn if args.fp8_text_encoder else torch.bfloat16
+        text_embedder = flux2_utils.load_text_embedder(
+            model_version_info, args.text_encoder, dtype=te_dtype, device=device, disable_mmap=True
+        )
 
     # Store original devices to move back later if they were shared. This does nothing if shared_models is None
-    text_encoder_original_device = text_encoder.device if text_encoder else None
+    text_encoder_original_device = text_embedder.device if text_embedder else None
+
+    logger.info("Encoding prompt with Text Encoders")
 
     # Ensure text_encoder is not None before proceeding
-    if not text_encoder or not tokenizer:
-        raise ValueError("Text encoder or tokenizer is not loaded properly.")
+    if not text_embedder:
+        raise ValueError("Text embedder is not loaded properly.")
 
     # Define a function to move models to device if needed
     # This is to avoid moving models if not needed, especially in interactive mode
@@ -426,7 +497,7 @@ def prepare_text_inputs(
             return
         model_is_moved = True
 
-        logger.info(f"Moving DiT and Text Encoder to appropriate device: {device} or CPU")
+        logger.info(f"Moving DiT and Text Encoders to appropriate device: {device} or CPU")
         if shared_models and "model" in shared_models:  # DiT model is shared
             if args.blocks_to_swap > 0:
                 logger.info("Waiting for 5 seconds to finish block swap")
@@ -435,192 +506,206 @@ def prepare_text_inputs(
             model.to("cpu")
             clean_memory_on_device(device)  # clean memory on device before moving models
 
-        text_encoder.to(llm_device)  # If text_encoder_cpu is True, this will be CPU
-
-    logger.info("Encoding prompt with Text Encoder.")
+        text_embedder.to(device)
 
     prompt = args.prompt
-
-    # cache_key includes this because embed may be changed if resize_control_to_image_size is True
-    cache_key = prompt
-
-    if cache_key in conds_cache:
-        embed, mask = conds_cache[cache_key]
+    if prompt in conds_cache:
+        ctx_vec = conds_cache[prompt]
     else:
         move_models_to_device_if_needed()
 
-        embed, mask = zimage_utils.get_text_embeds(tokenizer, text_encoder, prompt)
-        embed = embed.cpu()
-        mask = mask.cpu()
-
-        conds_cache[cache_key] = (embed, mask)
+        with torch.no_grad(), torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+            ctx_vec = text_embedder([prompt])  # [1, 512, 15360]
+        ctx_vec = ctx_vec.cpu()
+        conds_cache[prompt] = ctx_vec
 
     negative_prompt = args.negative_prompt
-    if negative_prompt is not None:
-        cache_key = negative_prompt
-        if cache_key in conds_cache:
-            negative_embed, negative_mask = conds_cache[cache_key]
+    negative_ctx_vec = None
+    if not model_version_info.guidance_distilled:
+        if negative_prompt is None:
+            negative_prompt = " "  # for non-distilled model, use empty string as negative prompt
+        if negative_prompt in conds_cache:
+            negative_ctx_vec = conds_cache[negative_prompt]
         else:
             move_models_to_device_if_needed()
 
-            negative_embed, negative_mask = zimage_utils.get_text_embeds(tokenizer, text_encoder, negative_prompt)
-            negative_embed = negative_embed.cpu()
-            negative_mask = negative_mask.cpu()
+            with torch.no_grad(), torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+                negative_ctx_vec = text_embedder([negative_prompt])  # [1, 512, 15360]
+            negative_ctx_vec = negative_ctx_vec.cpu()
+            conds_cache[negative_prompt] = negative_ctx_vec
 
-            conds_cache[cache_key] = (negative_embed, negative_mask)
-    else:
-        negative_embed = None
-        negative_mask = None
-
-    if not (shared_models and "text_encoder" in shared_models):  # if loaded locally
-        # There is a bug text_encoder is not freed from GPU memory when text encoder is fp8. Needs gc.collect()
-        del tokenizer, text_encoder
-        gc.collect()  # This may force Text Encoder to be freed from GPU memory
+    if not (shared_models and "text_embedder" in shared_models):  # if loaded locally
+        del text_embedder
     else:  # if shared, move back to original device (likely CPU)
-        if text_encoder:
-            text_encoder.to(text_encoder_original_device)
+        if text_embedder:
+            text_embedder.to(text_encoder_original_device)
 
+    gc.collect()  # Force cleanup of Text Encoder from GPU memory
     clean_memory_on_device(device)
 
-    arg_c = {"embed": embed, "mask": mask, "prompt": prompt}
-    arg_null = {"embed": negative_embed, "mask": negative_mask, "prompt": negative_prompt}
+    arg_c = {"ctx_vec": ctx_vec, "prompt": prompt}
+    if negative_ctx_vec is None:
+        arg_null = None
+    else:
+        arg_null = {"ctx_vec": negative_ctx_vec, "prompt": negative_prompt}
 
     return arg_c, arg_null
+
+
+def prepare_i2v_inputs(
+    args: argparse.Namespace, device: torch.device, ae: flux2_models.AutoEncoder, shared_models: Optional[Dict] = None
+) -> Tuple[int, int, Dict[str, Any], Optional[torch.Tensor]]:
+    """Prepare inputs for image2video generation: image encoding, text encoding, and AE encoding.
+
+    Args:
+        args: command line arguments
+        device: device to use
+        ae: AE model instance
+        shared_models: dictionary containing pre-loaded models (mainly for DiT)
+
+    Returns:
+        Tuple[int, int, Dict[str, Any], Optional[torch.Tensor]]: (height, width, context, end_latent)
+    """
+    # prepare image inputs
+    height, width, control_latent = prepare_image_inputs(args, device, ae)
+
+    # prepare text inputs
+    ctx_nctx = prepare_text_inputs(args, device, shared_models)
+
+    return height, width, ctx_nctx, control_latent
 
 
 def generate(
     args: argparse.Namespace,
     gen_settings: GenerationSettings,
     shared_models: Optional[Dict] = None,
-    precomputed_text_data: Optional[Dict] = None,
-) -> torch.Tensor:
+    precomputed_image_data: Optional[tuple[int, int, Optional[torch.Tensor]]] = None,
+    precomputed_text_data: Optional[tuple[Dict, Dict]] = None,
+) -> tuple[Optional[flux2_models.AutoEncoder], torch.Tensor]:  # AE can be Optional
     """main function for generation
 
     Args:
         args: command line arguments
-        gen_settings: generation settings
         shared_models: dictionary containing pre-loaded models (mainly for DiT)
-        precomputed_text_data: Optional dictionary with precomputed text data
+        precomputed_image_data: Optional tuple with precomputed image data (height, width, control_latent)
+        precomputed_text_data: Optional tuple with precomputed text data (context, context_null)
 
     Returns:
-        torch.Tensor generated latents
+        tuple: (flux2_models.AutoEncoder model (vae) or None, torch.Tensor generated latent)
     """
+    model_version_info = flux2_utils.FLUX2_MODEL_INFO[args.model_version]
     device, dit_weight_dtype = (gen_settings.device, gen_settings.dit_weight_dtype)
+    vae_instance_for_return = None
 
     # prepare seed
     seed = args.seed if args.seed is not None else random.randint(0, 2**32 - 1)
     args.seed = seed  # set seed to args for saving
 
-    if precomputed_text_data is not None:
-        logger.info("Using precomputed text data.")
-        context = precomputed_text_data["context"]
-        context_null = precomputed_text_data["context_null"]
-    else:
-        logger.info("No precomputed data. Preparing image and text inputs.")
-        context, context_null = prepare_text_inputs(args, device, shared_models)
+    if precomputed_image_data is not None and precomputed_text_data is not None:
+        logger.info("Using precomputed image and text data.")
+        height, width, control_latent = precomputed_image_data
+        ctx_nctx = precomputed_text_data
 
+        # VAE is not loaded here if data is precomputed; decoding VAE is handled by caller (e.g., process_batch_prompts)
+        # vae_instance_for_return remains None
+    else:
+        # Load VAE if not precomputed (for single/interactive mode)
+        # shared_models for single/interactive might contain text/image encoders, but not VAE after `load_shared_models` change.
+        # So, VAE will be loaded here for single/interactive.
+        logger.info("No precomputed data. Preparing image and text inputs.")
+        if shared_models and "ae" in shared_models:  # Should not happen with new load_shared_models
+            vae_instance_for_return = shared_models["ae"]
+        else:
+            # the dtype of VAE weights is float32, but we can load it as bfloat16 for better performance in future
+            vae_instance_for_return = flux2_utils.load_ae(args.vae, dtype=torch.float32, device=device, disable_mmap=True)
+
+        height, width, ctx_nctx, control_latent = prepare_i2v_inputs(args, device, vae_instance_for_return, shared_models)
+
+        vae_instance_for_return.to("cpu")
+
+    context, context_null = ctx_nctx  # unpack
     if shared_models is None or "model" not in shared_models:
         # load DiT model
         model = load_dit_model(args, device, dit_weight_dtype)
 
-        # if we only want to save the model, we can skip the rest
         if args.save_merged_model:
-            return None
+            return None, None
 
         if shared_models is not None:
             shared_models["model"] = model
     else:
         # use shared model
-        model: zimage_model.ZImageTransformer2DModel = shared_models["model"]
+        model: flux2_models.Flux = shared_models["model"]
         model.move_to_device_except_swap_blocks(device)  # Handles block swap correctly
         model.prepare_block_swap_before_forward()
 
     # set random generator
-    seed_g = torch.Generator(device="cpu" if args.cpu_noise else device)
+    seed_g = torch.Generator(device="cpu")
     seed_g.manual_seed(seed)
 
-    height, width = check_inputs(args)
     logger.info(f"Image size: {height}x{width} (HxW), infer_steps: {args.infer_steps}")
 
     # image generation ######
+    logger.info(f"Prompt: {context['prompt']}, Negative Prompt: {context_null['prompt'] if context_null is not None else 'N/A'}")
+    ctx_vec = context["ctx_vec"].to(device, dtype=torch.bfloat16)
+    ctx, ctx_ids = flux2_utils.prc_txt(ctx_vec)
+    if context_null is None:
+        negative_ctx_vec = None
+        ctx_null, ctx_null_ids = None, None
+    else:
+        negative_ctx_vec = context_null["ctx_vec"].to(device, dtype=torch.bfloat16)
+        ctx_null, ctx_null_ids = flux2_utils.prc_txt(negative_ctx_vec)
 
-    logger.info(f"Prompt: {context['prompt']}")
+    # make first noise with packed shape
+    # original: b,16,2*h//16,2*w//16, packed: b,h//16*w//16,16*2*2
+    packed_latent_height, packed_latent_width = height // 16, width // 16
+    noise_dtype = torch.float32
+    noise = torch.randn(1, 128, packed_latent_height, packed_latent_width, dtype=noise_dtype, generator=seed_g, device="cpu").to(
+        device, dtype=torch.bfloat16
+    )
+    x, x_ids = flux2_utils.prc_img(noise)
 
-    embed = context["embed"].to(device, dtype=torch.bfloat16)
-    mask = context["mask"].to(device, dtype=torch.bfloat16)
-    negative_embed = context_null["embed"].to(device, dtype=torch.bfloat16) if context_null["embed"] is not None else None
-    negative_mask = context_null["mask"].to(device, dtype=torch.bfloat16) if context_null["mask"] is not None else None
+    # prompt upsampling is not supported
 
-    # 4. Prepare latent variables
-    vae_scale = zimage_config.ZIMAGE_VAE_SCALE_FACTOR * 2
-    height_latent = 2 * (int(height) // vae_scale)  # divisible by 16
-    width_latent = 2 * (int(width) // vae_scale)
-    shape = (1, model.in_channels, height_latent, width_latent)
+    if control_latent is not None:
+        ref_tokens, ref_ids = flux2_utils.pack_control_latent(control_latent)
+        del control_latent  # free memory
+        ref_tokens = ref_tokens.to(device, dtype=torch.bfloat16)
+        ref_ids = ref_ids.to(device)
+    else:
+        ref_tokens = None
+        ref_ids = None
 
-    latents = torch.randn(shape, generator=seed_g, device="cpu" if args.cpu_noise else device, dtype=torch.float32).to(device)
-    image_sequence_length = (height_latent // model.all_patch_size[0]) * (width_latent // model.all_patch_size[0])
-
-    # The batch size is 1, so we can trim embeds as the length of the prompt
-    embed, _ = zimage_utils.trim_pad_embeds_and_mask(image_sequence_length, embed, mask)
-    mask = None  # No attention mask needed after trimming
-    if negative_embed is not None:
-        negative_embed, _ = zimage_utils.trim_pad_embeds_and_mask(image_sequence_length, negative_embed, negative_mask)
-        negative_mask = None
-
-    # 5. Prepare timesteps
-    num_inference_steps = args.infer_steps
-    timesteps, sigmas = zimage_utils.get_timesteps_sigmas(num_inference_steps, args.flow_shift)
-    timesteps = timesteps.to(device)
-    sigmas = sigmas.to(device)
-
-    # 6. Denoising loop
-    do_cfg = args.guidance_scale > 1.0  # 0 for no CFG
-    if do_cfg and negative_embed is None:
-        logger.warning("CFG is enabled but negative prompt is not provided. Using unconditional generation with zeros.")
-        negative_embed = torch.zeros_like(embed)
-        negative_mask = None
-
-    with tqdm(total=num_inference_steps, desc="Denoising steps") as pbar:
-        for i, t in enumerate(timesteps):
-            # cfg_truncation is not supported currently
-            timestep = t.expand(latents.shape[0])  # No effect since batch size is 1
-            timestep = (1000 - timestep) / 1000  # Reverse timestep for z-image
-
-            latent_model_input = latents.to(model.dtype)
-            latent_model_input = latent_model_input.unsqueeze(2)  # Add frame dimension
-
-            # with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=True), torch.no_grad():
-            with torch.no_grad():
-                model_out = model(latent_model_input, timestep, embed, mask)
-
-            if do_cfg:
-                # with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=True), torch.no_grad():
-                with torch.no_grad():
-                    neg_model_out = model(latent_model_input, timestep, negative_embed, negative_mask)
-                noise_pred = model_out + args.guidance_scale * (model_out - neg_model_out)
-            else:
-                noise_pred = model_out
-
-            noise_pred = -noise_pred.squeeze(2)  # Remove frame dimension and invert sign (because z-image predicts negative noise)
-            latents = zimage_utils.step(noise_pred.to(torch.float32), latents, sigmas, i)
-
-            pbar.update(1)
-
-    # Only clean up shared models if they were created within this function
-    if shared_models is None:
-        # free memory
-        del model
-        synchronize_device(device)
-
-        # wait for 5 seconds until block swap is done
-        if args.blocks_to_swap > 0:
-            logger.info("Waiting for 5 seconds to finish block swap")
-            time.sleep(5)
-
-        gc.collect()
-        clean_memory_on_device(device)
-
-    return latents
+    # denoise
+    timesteps = flux2_utils.get_schedule(args.infer_steps, x.shape[1], args.flow_shift)
+    if model_version_info.guidance_distilled:
+        x = flux2_utils.denoise(
+            model,
+            x,
+            x_ids,
+            ctx,
+            ctx_ids,
+            timesteps=timesteps,
+            guidance=args.embedded_cfg_scale,
+            img_cond_seq=ref_tokens,
+            img_cond_seq_ids=ref_ids,
+        )
+    else:
+        x = flux2_utils.denoise_cfg(
+            model,
+            x,
+            x_ids,
+            ctx,
+            ctx_ids,
+            ctx_null,
+            ctx_null_ids,
+            timesteps=timesteps,
+            guidance=args.guidance_scale,
+            img_cond_seq=ref_tokens,
+            img_cond_seq_ids=ref_ids,
+        )
+    x = torch.cat(flux2_utils.scatter_ids(x, x_ids)).squeeze(2)
+    return vae_instance_for_return, x
 
 
 def save_latent(latent: torch.Tensor, args: argparse.Namespace, height: int, width: int) -> str:
@@ -640,6 +725,7 @@ def save_latent(latent: torch.Tensor, args: argparse.Namespace, height: int, wid
     time_flag = get_time_flag()
 
     seed = args.seed
+
     latent_path = f"{save_path}/{time_flag}_{seed}_latent.safetensors"
 
     if args.no_metadata:
@@ -654,8 +740,8 @@ def save_latent(latent: torch.Tensor, args: argparse.Namespace, height: int, wid
             "embedded_cfg_scale": f"{args.embedded_cfg_scale}",
             "guidance_scale": f"{args.guidance_scale}",
         }
-        if args.negative_prompt is not None:
-            metadata["negative_prompt"] = f"{args.negative_prompt}"
+        # if args.negative_prompt is not None:
+        #     metadata["negative_prompt"] = f"{args.negative_prompt}"
 
     sd = {"latent": latent.contiguous()}
     save_file(sd, latent_path, metadata=metadata)
@@ -668,7 +754,7 @@ def save_images(sample: torch.Tensor, args: argparse.Namespace, original_base_na
     """Save images to directory
 
     Args:
-        sample: Image tensor
+        sample: Video tensor
         args: command line arguments
         original_base_name: Original base name (if latents are loaded from files)
 
@@ -682,7 +768,8 @@ def save_images(sample: torch.Tensor, args: argparse.Namespace, original_base_na
     seed = args.seed
     original_name = "" if original_base_name is None else f"_{original_base_name}"
     image_name = f"{time_flag}_{seed}{original_name}"
-    sample = sample.unsqueeze(0).unsqueeze(2)  # CHW -> BCFHW, where B=1, C=3, F=1, H, W
+    sample = sample.unsqueeze(0).unsqueeze(2)  # C,HW -> BCTHW, where B=1, C=3, T=1
+    sample = sample.to(torch.float32)  # convert to float32 for numpy conversion
     save_images_grid(sample, save_path, image_name, rescale=True, create_subdir=False)
     logger.info(f"Sample images saved to: {save_path}/{image_name}")
 
@@ -691,7 +778,7 @@ def save_images(sample: torch.Tensor, args: argparse.Namespace, original_base_na
 
 def save_output(
     args: argparse.Namespace,
-    vae: AutoencoderKL,
+    ae: flux2_models.AutoEncoder,  # Expect a VAE instance for decoding
     latent: torch.Tensor,
     device: torch.device,
     original_base_names: Optional[List[str]] = None,
@@ -705,9 +792,9 @@ def save_output(
         device: device to use
         original_base_names: original base names (if latents are loaded from files)
     """
-    height, width = latent.shape[-2], latent.shape[-1]  # BCHW
-    height *= zimage_config.ZIMAGE_VAE_SCALE_FACTOR
-    width *= zimage_config.ZIMAGE_VAE_SCALE_FACTOR
+    height, width = latent.shape[-2], latent.shape[-1]  # BCTHW
+    height *= 16
+    width *= 16
     # print(f"Saving output. Latent shape {latent.shape}; pixel shape {height}x{width}")
     if args.output_type == "latent" or args.output_type == "latent_images":
         # save latent
@@ -715,18 +802,15 @@ def save_output(
     if args.output_type == "latent":
         return
 
-    if vae is None:
-        logger.error("VAE is None, cannot decode latents for saving video/images.")
+    if ae is None:
+        logger.error("AE is None, cannot decode latents for saving video/images.")
         return
 
-    video = decode_latent(vae, latent, device)
+    video = decode_latent(ae, latent, device)
 
     if args.output_type == "images" or args.output_type == "latent_images":
         # save images
-        if original_base_names is not None:
-            original_name = f"_{original_base_names[0]}"
-        else:
-            original_name = None
+        original_name = "" if original_base_names is None else f"_{original_base_names[0]}"
         save_images(video, args, original_name)
 
 
@@ -767,12 +851,15 @@ def load_shared_models(args: argparse.Namespace) -> Dict:
         Dict: Dictionary of shared models (text/image encoders)
     """
     shared_models = {}
+    model_version_info = flux2_utils.FLUX2_MODEL_INFO[args.model_version]
+
     # Load text encoders to CPU
-    # vl_dtype = torch.float8_e4m3fn if args.fp8_vl else torch.bfloat16
-    vl_dtype = torch.bfloat16  # Default dtype for Text Encoder
-    tokenizer, text_encoder = zimage_utils.load_qwen3(args.text_encoder, dtype=vl_dtype, device="cpu", disable_mmap=True)
-    shared_models["tokenizer"] = tokenizer
-    shared_models["text_encoder"] = text_encoder
+    m3_dtype = torch.float8_e4m3fn if args.fp8_text_encoder else torch.bfloat16
+    text_embedder = flux2_utils.load_text_embedder(
+        model_version_info, args.text_encoder, dtype=m3_dtype, device="cpu", disable_mmap=True
+    )
+    shared_models["text_embedder"] = text_embedder
+
     return shared_models
 
 
@@ -787,53 +874,62 @@ def process_batch_prompts(prompts_data: List[Dict], args: argparse.Namespace) ->
         logger.warning("No valid prompts found")
         return
 
+    model_version_info = flux2_utils.FLUX2_MODEL_INFO[args.model_version]
     gen_settings = get_generation_settings(args)
     dit_weight_dtype = gen_settings.dit_weight_dtype
     device = gen_settings.device
 
-    # 1. Prepare VAE
-    logger.info("Loading VAE for batch generation...")
-    vae_for_batch = zimage_autoencoder.load_autoencoder_kl(args.vae, device="cpu", disable_mmap=True)
-    vae_for_batch.eval()
+    # 1. Precompute Image Data (AE and Image Encoders)
+    logger.info("Loading AE and Image Encoders for batch image preprocessing...")
+    ae_for_batch = flux2_utils.load_ae(args.vae, dtype=torch.float32, device=device, disable_mmap=True)
 
+    all_precomputed_image_data = []
     all_prompt_args_list = [apply_overrides(args, pd) for pd in prompts_data]  # Create all arg instances first
-    for prompt_args in all_prompt_args_list:
-        check_inputs(prompt_args)  # Validate each prompt's height/width
+
+    logger.info("Preprocessing images and AE encoding for all prompts...")
+
+    # AE and Image Encoder to device for this phase, because we do not want to offload them to CPU
+    ae_for_batch.to(device)
+
+    for i, prompt_args_item in enumerate(all_prompt_args_list):
+        logger.info(f"Image preprocessing for prompt {i + 1}/{len(all_prompt_args_list)}: {prompt_args_item.prompt}")
+        # prepare_image_inputs will move ae/image_encoder to device temporarily
+        image_data = prepare_image_inputs(prompt_args_item, device, ae_for_batch)
+        all_precomputed_image_data.append(image_data)
+
+    # Models should be back on GPU because prepare_image_inputs moved them to the original device
+    ae_for_batch.to("cpu")  # Move AE back to CPU
+    clean_memory_on_device(device)
 
     # 2. Precompute Text Data (Text Encoder)
     logger.info("Loading Text Encoder for batch text preprocessing...")
 
-    # Text Encoder loaded to CPU by load_text_encoder
-    # vl_dtype = torch.float8_e4m3fn if args.fp8_vl else torch.bfloat16
-    vl_dtype = torch.bfloat16  # Default dtype for Text Encoder
-    tokenizer_batch, text_encoder_batch = zimage_utils.load_qwen3(
-        args.text_encoder, dtype=vl_dtype, device="cpu", disable_mmap=True
+    # Text Encoders loaded to CPU by load_text_encoder
+    m3_dtype = torch.float8_e4m3fn if args.fp8_text_encoder else torch.bfloat16
+    text_embedder_batch = flux2_utils.load_text_embedder(
+        model_version_info, args.text_encoder, dtype=m3_dtype, device=device, disable_mmap=True
     )
 
-    # Text Encoder to device for this phase
-    llm_device = torch.device("cpu") if args.text_encoder_cpu else device
-    text_encoder_batch.to(llm_device)  # Moved into prepare_text_inputs logic
+    # Text Encoders to device for this phase
+    text_embedder_batch.to(device)  # Moved into prepare_text_inputs logic
 
     all_precomputed_text_data = []
     conds_cache_batch = {}
 
     logger.info("Preprocessing text and LLM/TextEncoder encoding for all prompts...")
     temp_shared_models_txt = {
-        "tokenizer": tokenizer_batch,
-        "text_encoder": text_encoder_batch,  # on GPU
+        "text_embedder": text_embedder_batch,  # on GPU
         "conds_cache": conds_cache_batch,
     }
 
     for i, prompt_args_item in enumerate(all_prompt_args_list):
         logger.info(f"Text preprocessing for prompt {i + 1}/{len(all_prompt_args_list)}: {prompt_args_item.prompt}")
-
-        # prepare_text_inputs will move text_encoders to device temporarily, and handles edit or not
-        context, context_null = prepare_text_inputs(prompt_args_item, device, temp_shared_models_txt)
-        text_data = {"context": context, "context_null": context_null}
-        all_precomputed_text_data.append(text_data)
+        # prepare_text_inputs will move text_encoders to device temporarily
+        ctx_nctx = prepare_text_inputs(prompt_args_item, device, temp_shared_models_txt)
+        all_precomputed_text_data.append(ctx_nctx)
 
     # Models should be removed from device after prepare_text_inputs
-    del tokenizer_batch, text_encoder_batch, temp_shared_models_txt, conds_cache_batch
+    del text_embedder_batch, temp_shared_models_txt, conds_cache_batch
     gc.collect()  # Force cleanup of Text Encoder from GPU memory
     clean_memory_on_device(device)
 
@@ -843,8 +939,25 @@ def process_batch_prompts(prompts_data: List[Dict], args: argparse.Namespace) ->
     first_prompt_args = all_prompt_args_list[0]
     dit_model = load_dit_model(first_prompt_args, device, dit_weight_dtype)  # Load directly to target device if possible
 
-    if first_prompt_args.save_merged_model:
-        logger.info("Merged DiT model saved. Skipping generation.")
+    if first_prompt_args.lora_weight is not None and len(first_prompt_args.lora_weight) > 0:
+        logger.info("Merging LoRA weights into DiT model...")
+        merge_lora_weights(
+            lora_flux_2,
+            dit_model,
+            first_prompt_args.lora_weight,
+            first_prompt_args.lora_multiplier,
+            first_prompt_args.include_patterns,
+            first_prompt_args.exclude_patterns,
+            device,
+            first_prompt_args.lycoris,
+            first_prompt_args.save_merged_model,
+        )
+        if first_prompt_args.save_merged_model:
+            logger.info("Merged DiT model saved. Skipping generation.")
+            del dit_model
+            gc.collect()  # Force cleanup of DiT from GPU memory
+            clean_memory_on_device(device)
+            return
 
     shared_models_for_generate = {"model": dit_model}  # Pass DiT via shared_models
 
@@ -853,21 +966,24 @@ def process_batch_prompts(prompts_data: List[Dict], args: argparse.Namespace) ->
     logger.info("Generating latents for all prompts...")
     with torch.no_grad():
         for i, prompt_args_item in enumerate(all_prompt_args_list):
+            current_image_data = all_precomputed_image_data[i]
             current_text_data = all_precomputed_text_data[i]
-            height, width = check_inputs(prompt_args_item)  # Get height/width for each prompt
 
             logger.info(f"Generating latent for prompt {i + 1}/{len(all_prompt_args_list)}: {prompt_args_item.prompt}")
             try:
                 # generate is called with precomputed data, so it won't load VAE/Text/Image encoders.
                 # It will use the DiT model from shared_models_for_generate.
                 # The VAE instance returned by generate will be None here.
-                latent = generate(prompt_args_item, gen_settings, shared_models_for_generate, current_text_data)
+                _, latent = generate(
+                    prompt_args_item, gen_settings, shared_models_for_generate, current_image_data, current_text_data
+                )
 
                 if latent is None:  # and prompt_args_item.save_merged_model:  # Should be caught earlier
                     continue
 
                 # Save latent if needed (using data from precomputed_image_data for H/W)
                 if prompt_args_item.output_type in ["latent", "latent_images"]:
+                    height, width, _ = current_image_data
                     save_latent(latent, prompt_args_item, height, width)
 
                 all_latents.append(latent)
@@ -884,14 +1000,14 @@ def process_batch_prompts(prompts_data: List[Dict], args: argparse.Namespace) ->
 
     del shared_models_for_generate["model"]
     del dit_model
-    gc.collect()
+    gc.collect()  # Force cleanup of DiT from GPU memory
     clean_memory_on_device(device)
     synchronize_device(device)  # Ensure memory is freed before loading VAE for decoding
 
     # 4. Decode latents and save outputs (using vae_for_batch)
     if args.output_type != "latent":
         logger.info("Decoding latents to videos/images using batched VAE...")
-        vae_for_batch.to(device)  # Move VAE to device for decoding
+        ae_for_batch.to(device)  # Move VAE to device for decoding
 
         for i, latent in enumerate(all_latents):
             if latent is None:  # Skip failed generations
@@ -909,11 +1025,11 @@ def process_batch_prompts(prompts_data: List[Dict], args: argparse.Namespace) ->
             # save_output expects latent to be [BCTHW] or [CTHW]. generate returns [BCTHW] (batch size 1).
             # latent[0] is correct if generate returns it with batch dim.
             # The latent from generate is (1, C, T, H, W)
-            save_output(current_args, vae_for_batch, latent[0], device)  # Pass vae_for_batch
+            save_output(current_args, ae_for_batch, latent[0], device)  # Pass vae_for_batch
 
-        vae_for_batch.to("cpu")  # Move VAE back to CPU
+        ae_for_batch.to("cpu")  # Move VAE back to CPU
 
-    del vae_for_batch
+    del ae_for_batch
     clean_memory_on_device(device)
 
 
@@ -927,11 +1043,6 @@ def process_interactive(args: argparse.Namespace) -> None:
     device = gen_settings.device
     shared_models = load_shared_models(args)
     shared_models["conds_cache"] = {}  # Initialize empty cache for interactive mode
-
-    # Load VAE for interactive mode
-    logger.info("Loading VAE for interactive mode...")
-    vae = zimage_autoencoder.load_autoencoder_kl(args.vae, device="cpu", disable_mmap=True)
-    vae.eval()
 
     print("Interactive mode. Enter prompts (Ctrl+D or Ctrl+Z (Windows) to exit):")
 
@@ -968,7 +1079,7 @@ def process_interactive(args: argparse.Namespace) -> None:
                 # Generate latent
                 # For interactive, precomputed data is None. shared_models contains text/image encoders.
                 # generate will load VAE internally.
-                latent = generate(prompt_args, gen_settings, shared_models)
+                returned_vae, latent = generate(prompt_args, gen_settings, shared_models)
 
                 # # If not one_frame_inference, move DiT model to CPU after generation
                 # if prompt_args.blocks_to_swap > 0:
@@ -979,10 +1090,7 @@ def process_interactive(args: argparse.Namespace) -> None:
 
                 # Save latent and video
                 # returned_vae from generate will be used for decoding here.
-                save_output(prompt_args, vae, latent[0], device)
-
-                if args.bell:
-                    print("\a")
+                save_output(prompt_args, returned_vae, latent[0], device)
 
             except KeyboardInterrupt:
                 print("\nInterrupted. Continue (Ctrl+D or Ctrl+Z (Windows) to exit)")
@@ -995,7 +1103,7 @@ def process_interactive(args: argparse.Namespace) -> None:
 def get_generation_settings(args: argparse.Namespace) -> GenerationSettings:
     device = torch.device(args.device)
 
-    dit_weight_dtype = torch.bfloat16  # default from Z-Image official inference code
+    dit_weight_dtype = torch.bfloat16  # default
     if args.fp8_scaled:
         dit_weight_dtype = None  # various precision weights, so don't cast to specific dtype
     elif args.fp8:
@@ -1026,6 +1134,8 @@ def main():
         latents_list = []
         seeds = []
 
+        # assert len(args.latent_path) == 1, "Only one latent path is supported for now"
+
         for latent_path in args.latent_path:
             original_base_names.append(os.path.splitext(os.path.basename(latent_path))[0])
             seed = 0
@@ -1050,8 +1160,8 @@ def main():
             seeds.append(seed)
             logger.info(f"Loaded latent from {latent_path}. Shape: {latents.shape}")
 
-            if latents.ndim == 4:  # [BCHW]
-                latents = latents.squeeze(0)  # [CHW]
+            if latents.ndim == 5:  # [BCTHW]
+                latents = latents.squeeze(0)  # [CTHW]
 
             latents_list.append(latents)
 
@@ -1060,9 +1170,8 @@ def main():
         for i, latent in enumerate(latents_list):
             args.seed = seeds[i]
 
-            vae = zimage_autoencoder.load_autoencoder_kl(args.vae, device, disable_mmap=True)
-            vae.eval()
-            save_output(args, vae, latent, device, original_base_names)
+            ae = flux2_utils.load_ae(args.vae, dtype=torch.float32, device=device, disable_mmap=True)
+            save_output(args, ae, latent, device, original_base_names)
 
     elif args.from_file:
         # Batch mode from file
@@ -1075,9 +1184,6 @@ def main():
         prompts_data = preprocess_prompts_for_batch(prompt_lines, args)
         process_batch_prompts(prompts_data, args)
 
-        if args.bell:
-            print("\a")  # Bell sound
-
     elif args.interactive:
         # Interactive mode
         process_interactive(args)
@@ -1087,18 +1193,19 @@ def main():
 
         # Generate latent
         gen_settings = get_generation_settings(args)
-
         # For single mode, precomputed data is None, shared_models is None.
-        # generate will load all necessary models (VAE, Text/Image Encoder, DiT).
-        latent = generate(args, gen_settings)
+        # generate will load all necessary models (VAE, Text/Image Encoders, DiT).
+        returned_vae, latent = generate(args, gen_settings)
+
+        if args.blocks_to_swap > 0:
+            logger.info("Waiting for 5 seconds to finish block swap")
+            time.sleep(5)
+        gc.collect()  # Force cleanup of DiT from GPU memory
+        clean_memory_on_device(device)  # clean memory on device before moving models
 
         # Save latent and video
-        vae = zimage_autoencoder.load_autoencoder_kl(args.vae, device, disable_mmap=True)
-        vae.eval()
-        save_output(args, vae, latent, device)
-
-        if args.bell:
-            print("\a")  # Bell sound
+        # returned_vae from generate will be used for decoding here.
+        save_output(args, returned_vae, latent[0], device)
 
     logger.info("Done!")
 

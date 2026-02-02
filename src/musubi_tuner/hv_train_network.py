@@ -491,6 +491,7 @@ class NetworkTrainer:
         self.timestep_range_pool = []
         self.num_timestep_buckets: Optional[int] = None  # for get_bucketed_timestep()
         self.vae_frame_stride = 4  # all architectures require frames to be divisible by 4, except Qwen-Image-Layered
+        self.default_discrete_flow_shift = 14.5  # default value for discrete flow shift for all models TODO may be None is better
 
     # TODO 他のスクリプトと共通化する
     def generate_step_logs(
@@ -603,7 +604,7 @@ class NetworkTrainer:
             logger.info(f"use Adafactor optimizer | {optimizer_kwargs}")
 
             if optimizer_kwargs["relative_step"]:
-                logger.info("relative_step is true / relative_step?true??")
+                logger.info("relative_step is true / relative_stepがtrueです")
                 if lr != 0.0:
                     logger.warning("learning rate is used as initial_lr / 指定したlearning rateはinitial_lrとして使用されます")
                 args.learning_rate = None
@@ -955,6 +956,7 @@ class NetworkTrainer:
             or args.timestep_sampling == "logsnr"
             or args.timestep_sampling == "qinglong_flux"
             or args.timestep_sampling == "qinglong_qwen"
+            or args.timestep_sampling == "flux2_shift"
         ):
 
             def compute_sampling_timesteps(org_timesteps: Optional[torch.Tensor]) -> torch.Tensor:
@@ -990,6 +992,8 @@ class NetworkTrainer:
                         # we are pre-packed so must adjust for packed size
                         if args.timestep_sampling == "flux_shift":
                             mu = train_utils.get_lin_function(y1=0.5, y2=1.15)((h // 2) * (w // 2))
+                        elif args.timestep_sampling == "flux2_shift":
+                            mu = train_utils.get_lin_function(y1=0.5, y2=1.15)(h * w)
                         elif args.timestep_sampling == "qwen_shift":
                             mu = train_utils.get_lin_function(x1=256, y1=0.5, x2=8192, y2=0.9)((h // 2) * (w // 2))
                         # def time_shift(mu: float, sigma: float, t: torch.Tensor):
@@ -1269,7 +1273,7 @@ class NetworkTrainer:
         height = sample_parameter.get("height", 256)
         frame_count = sample_parameter.get("frame_count", 1)
         guidance_scale = sample_parameter.get("guidance_scale", self.default_guidance_scale)
-        discrete_flow_shift = sample_parameter.get("discrete_flow_shift", 14.5)
+        discrete_flow_shift = sample_parameter.get("discrete_flow_shift", self.default_discrete_flow_shift)
         seed = sample_parameter.get("seed")
         prompt: str = sample_parameter.get("prompt", "")
         cfg_scale = sample_parameter.get("cfg_scale", None)  # None for architecture default
@@ -1804,7 +1808,7 @@ class NetworkTrainer:
         if args.disable_numpy_memmap:
             logger.info(
                 "Disabling numpy memory mapping for model loading (for Wan, FramePack and Qwen-Image). This may lead to higher memory usage but can speed up loading in some cases."
-                " / SageAttentionは現在学習をサポートしていないようです。`--sdpa`や`--xformers`などの他のオプションを使ってください"
+                " / モデル読み込み時のnumpyメモリマッピングを無効にします（Wan、FramePack、Qwen-Imageでのみ有効）。これによりメモリ使用量が増える可能性がありますが、場合によっては読み込みが高速化されることがあります"
             )
 
         # check model specific arguments
@@ -1861,7 +1865,7 @@ class NetworkTrainer:
         if train_dataset_group.num_train_items == 0:
             raise ValueError(
                 "No training items found in the dataset. Please ensure that the latent/Text Encoder cache has been created beforehand."
-                " / SageAttentionは現在学習をサポートしていないようです。`--sdpa`や`--xformers`などの他のオプションを使ってください"
+                " / データセットに学習データがありません。latent/Text Encoderキャッシュを事前に作成したか確認してください"
             )
 
         ds_for_collator = train_dataset_group if args.max_data_loader_n_workers == 0 else None
@@ -2221,7 +2225,7 @@ class NetworkTrainer:
         accelerator.print("running training / 学習開始")
         accelerator.print(f"  num train items / 学習画像、動画数: {train_dataset_group.num_train_items}")
         accelerator.print(f"  num batches per epoch / 1epochのバッチ数: {len(train_dataloader)}")
-        accelerator.print(f"  num epochs / epoch?: {num_train_epochs}")
+        accelerator.print(f"  num epochs / epoch数: {num_train_epochs}")
         accelerator.print(
             f"  batch size per device / バッチサイズ: {', '.join([str(d.batch_size) for d in train_dataset_group.datasets])}"
         )
@@ -2994,7 +2998,7 @@ def setup_parser_common() -> argparse.ArgumentParser:
         "--flash3",
         action="store_true",
         help="use FlashAttention 3 for CrossAttention, requires FlashAttention 3, HunyuanVideo does not support this yet"
-        " / torch.compileの動的形状モード（デフォルト: None、autoと同じ動作）",
+        " / CrossAttentionにFlashAttention 3を使う、FlashAttention 3が必要。HunyuanVideoは未対応。",
     )
     parser.add_argument(
         "--split_attn",
@@ -3231,14 +3235,14 @@ def setup_parser_common() -> argparse.ArgumentParser:
         type=int_or_float,
         default=0,
         help="Int number of steps for the warmup in the lr scheduler (default is 0) or float with ratio of train steps"
-        " / torch.compileの動的形状モード（デフォルト: None、autoと同じ動作）",
+        " / 学習率のスケジューラをウォームアップするステップ数（デフォルト0）、または学習ステップの比率（1未満のfloat値の場合）",
     )
     parser.add_argument(
         "--lr_decay_steps",
         type=int_or_float,
         default=0,
         help="Int number of steps for the decay in the lr scheduler (default is 0) or float (<1) with ratio of train steps"
-        " / torch.compileの動的形状モード（デフォルト: None、autoと同じ動作）",
+        " / 学習率のスケジューラを減衰させるステップ数（デフォルト0）、または学習ステップの比率（1未満のfloat値の場合）",
     )
     parser.add_argument(
         "--lr_scheduler_num_cycles",
@@ -3264,7 +3268,7 @@ def setup_parser_common() -> argparse.ArgumentParser:
         type=float,
         default=None,
         help="The minimum learning rate as a ratio of the initial learning rate for cosine with min lr scheduler, warmup decay scheduler and rex scheduler"
-        + " / 逆平方根スケジューラのタイムスケール、デフォルトは`num_warmup_steps`",
+        + " / 初期学習率の比率としての最小学習率を指定する、cosine with min lr スケジューラ、warmup decay スケジューラ、rex スケジューラ で有効",
     )
     parser.add_argument("--lr_scheduler_type", type=str, default="", help="custom scheduler module / 使用するスケジューラ")
     parser.add_argument(
@@ -3317,7 +3321,7 @@ def setup_parser_common() -> argparse.ArgumentParser:
         "--use_pinned_memory_for_block_swap",
         action="store_true",
         help="use pinned memory for block swapping, which may speed up data transfer between CPU and GPU but uses more shared GPU memory on Windows"
-        " / torch.compileの動的形状モード（デフォルト: None、autoと同じ動作）",
+        " / ブロックスワッピングにピン留めメモリを使用する。これによりCPUとGPU間のデータ転送が高速化される可能性があるが、Windowsではより多くの共有GPUメモリを使用する。",
     )
     parser.add_argument(
         "--swap_norms",
@@ -3333,8 +3337,8 @@ def setup_parser_common() -> argparse.ArgumentParser:
     parser.add_argument(
         "--disable_numpy_memmap",
         action="store_true",
-        help="Disable numpy memory mapping for model loading. Only for Wan, FramePack and Qwen-Image. Increases RAM usage but speeds up model loading in some cases."
-        " / torch.compileの動的形状モード（デフォルト: None、autoと同じ動作）",
+        help="Disable numpy memory mapping for model loading. Only for Wan, FramePack, Qwen-Image and FLUX.2. Increases RAM usage but speeds up model loading in some cases."
+        " / モデル読み込み時のnumpyメモリマッピングを無効にします。Wan、FramePack、Qwen-Image、FLUX.2で有効です。RAM使用量が増えますが、場合によってはモデルの読み込
     )
 
     # parser.add_argument("--flow_shift", type=float, default=7.0, help="Shift factor for flow matching schedulers")
@@ -3343,7 +3347,7 @@ def setup_parser_common() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--timestep_sampling",
-        choices=["sigma", "uniform", "sigmoid", "shift", "flux_shift", "qwen_shift", "logsnr", "qinglong_flux", "qinglong_qwen", "shifted_logit_normal"],
+        choices=["sigma", "uniform", "sigmoid", "shift", "flux_shift", "flux2_shift", "qwen_shift", "logsnr", "qinglong_flux", "qinglong_qwen", "shifted_logit_normal"],
         default="sigma",
         help="Method to sample timesteps: sigma-based, uniform random, sigmoid of random normal, shift of sigmoid, flux shift, "
         "or shifted_logit_normal (sequence-length-adaptive, official LTX-2 method)."
@@ -3404,8 +3408,8 @@ def setup_parser_common() -> argparse.ArgumentParser:
         help="If specified, constrains timestep sampling to [min_timestep, max_timestep] "
         "using rejection sampling, preserving the original distribution shape. "
         "By default, the [0, 1] range is scaled, which distorts the distribution. Only effective when `timestep_sampling` is not 'sigma'."
-        " / 指定すると拒否サンプリングでtimestep samplingを[min_timestep, max_timestep]に制限し、元の分布形状を保持します。"
-        "デフォルトでは[0, 1]範囲をスケーリングするため分布が歪みます。`timestep_sampling`が'sigma'以外のときのみ有効です。"
+        " / 指定すると、タイムステップのサンプリングを[最小タイムステップ、最大タイムステップ]に制約し、元の分布形状を保持します。"
+        "デフォルトでは、[0, 1]の範囲がスケーリングされ、分布が歪むことがあります。timestep_samplingがsigma以外で有効です。",
     )
     parser.add_argument(
         "--num_timestep_buckets",
@@ -3415,9 +3419,9 @@ def setup_parser_common() -> argparse.ArgumentParser:
             "Number of buckets for timestep sampling. Default is None, which disables bucketing. "
             "Set to 2 or more to enable stratified sampling. This forces timesteps to be sampled "
             "uniformly from the [0, 1] range, which can improve training stability, especially for small datasets."
-            " / timestepサンプリングのバケット数。デフォルトはNoneで無効です。"
-            "2以上で層化サンプリングを有効にします。"
-            "[0, 1]範囲から一様にサンプルされるため、特に小規模データセットで学習の安定性が向上します。"
+            " / timestepサンプリングのバケット数。デフォルトはNoneで、バケット化を無効にします。"
+            "2以上に設定すると、層化抽出が有効になり、タイムステップが[0, 1]の範囲から均等にサンプリングされるようになります。"
+            "これは、特に小規模なデータセットでの学習の安定性向上が期待できます。"
         ),
     )
 
