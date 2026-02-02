@@ -268,6 +268,120 @@ class Attention(torch.nn.Module):
 
         self.to_out = torch.nn.Sequential(torch.nn.Linear(inner_dim, query_dim, bias=True), torch.nn.Identity())
 
+        # Split attention settings (configured after model load)
+        self.split_attn_mode: str | None = None  # "batch" or "query"
+        self.split_attn_chunk_size: int = 0  # chunk size for query mode (0 = use default 1024)
+
+    def _split_attention_batch(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Split attention by batch dimension - processes each batch item separately.
+
+        This reduces peak memory by computing attention for one batch item at a time
+        instead of the full batch simultaneously.
+        """
+        batch_size = q.shape[0]
+
+        # Guard against empty tensors
+        if batch_size == 0:
+            return self.attention_function(q, k, v, self.heads, mask)
+
+        # Determine if mask has a batch dimension that should be sliced
+        # Non-batched masks like [Lq, Lk] should be reused for all batch items
+        mask_has_batch_dim = False
+        if mask is not None:
+            # Check if first dimension matches batch size
+            # Batched masks: [B, Lk], [B, Lq, Lk], [B, H, Lq, Lk]
+            # Non-batched masks: [Lq, Lk], [1, Lq, Lk], [1, 1, Lq, Lk]
+            if mask.shape[0] == batch_size and batch_size > 1:
+                mask_has_batch_dim = True
+            elif mask.shape[0] == 1:
+                # Explicitly single-batch mask, reuse for all
+                mask_has_batch_dim = False
+            elif mask.ndim == 2:
+                # [Lq, Lk] - no batch dim
+                mask_has_batch_dim = False
+            else:
+                # Ambiguous case (batch_size == 1) - assume batched
+                mask_has_batch_dim = True
+
+        outputs = []
+        for i in range(batch_size):
+            q_i = q[i : i + 1]
+            k_i = k[i : i + 1]
+            v_i = v[i : i + 1]
+
+            if mask is None:
+                mask_i = None
+            elif mask_has_batch_dim:
+                mask_i = mask[i : i + 1]
+            else:
+                # Non-batched mask - reuse for all batch items
+                mask_i = mask
+
+            out_i = self.attention_function(q_i, k_i, v_i, self.heads, mask_i)
+            outputs.append(out_i)
+        return torch.cat(outputs, dim=0)
+
+    def _split_attention_query(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Split attention by query sequence length - processes query in chunks.
+
+        Each query chunk attends to the full K/V sequence. This is mathematically
+        equivalent to computing full attention, just with lower peak memory.
+        """
+        chunk_size = self.split_attn_chunk_size if self.split_attn_chunk_size > 0 else 1024
+        q_len = q.shape[1]
+        k_len = k.shape[1]
+
+        # Guard against empty tensors or small sequences
+        if q_len == 0 or q_len <= chunk_size:
+            return self.attention_function(q, k, v, self.heads, mask)
+
+        outputs = []
+        for start in range(0, q_len, chunk_size):
+            end = min(start + chunk_size, q_len)
+            q_chunk = q[:, start:end]
+
+            # Handle mask chunking carefully:
+            # - Cross-attention masks typically mask KEY positions (text padding): [B, Lk] or [B, 1, Lk]
+            #   These should NOT be chunked - same keys are attended to by all query chunks
+            # - Self-attention masks with per-query masking: [Lq, Lk], [B, Lq, Lk], [B, H, Lq, Lk]
+            #   These need the query dimension (Lq) chunked
+            mask_chunk = mask
+            if mask is not None:
+                if mask.ndim == 2:
+                    # Could be [Lq, Lk] (self-attn) or [B, Lk] (cross-attn key mask)
+                    if mask.shape[0] == q_len and mask.shape[1] == k_len:
+                        # [Lq, Lk] - chunk query dimension
+                        mask_chunk = mask[start:end, :]
+                    # else: [B, Lk] key mask - don't chunk, use as-is
+                elif mask.ndim == 3:
+                    # Could be [B, Lq, Lk] or [B, 1, Lk]
+                    if mask.shape[1] == q_len:
+                        # [B, Lq, Lk] - chunk query dimension
+                        mask_chunk = mask[:, start:end, :]
+                    # else: [B, 1, Lk] or [B, H, Lk] key mask - don't chunk
+                elif mask.ndim == 4:
+                    # Could be [B, H, Lq, Lk] or [B, 1, 1, Lk]
+                    if mask.shape[2] == q_len:
+                        # [B, H, Lq, Lk] - chunk query dimension
+                        mask_chunk = mask[:, :, start:end, :]
+                    # else: [B, 1, 1, Lk] key mask - don't chunk
+
+            out_chunk = self.attention_function(q_chunk, k, v, self.heads, mask_chunk)
+            outputs.append(out_chunk)
+        return torch.cat(outputs, dim=1)
+
     def forward(
         self,
         x: torch.Tensor,
@@ -293,6 +407,13 @@ class Attention(torch.nn.Module):
             q = apply_rotary_emb(q, pe, self.rope_type)
             k = apply_rotary_emb(k, pe if k_pe is None else k_pe, self.rope_type)
 
-        # attention_function can be an enum *or* a custom callable
-        out = self.attention_function(q, k, v, self.heads, mask)
+        # Apply split attention if configured
+        split_mode = getattr(self, "split_attn_mode", None)
+        if split_mode == "batch":
+            out = self._split_attention_batch(q, k, v, mask)
+        elif split_mode == "query":
+            out = self._split_attention_query(q, k, v, mask)
+        else:
+            # attention_function can be an enum *or* a custom callable
+            out = self.attention_function(q, k, v, self.heads, mask)
         return self.to_out(out)

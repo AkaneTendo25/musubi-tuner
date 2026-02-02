@@ -158,6 +158,93 @@ def detect_ltx2_config(model_path: str) -> Dict[str, Any]:
     return config
 
 
+def _apply_memory_optimization_settings(
+    model: torch.nn.Module,
+    ffn_chunk_target: Optional[str] = None,
+    ffn_chunk_size: int = 0,
+    split_attn_target: Optional[str] = None,
+    split_attn_mode: Optional[str] = None,
+    split_attn_chunk_size: int = 0,
+) -> None:
+    """Apply FFN chunking and split attention settings to transformer blocks.
+
+    Args:
+        model: LTXModel or similar with transformer_blocks
+        ffn_chunk_target: Which FFN modules to apply chunking to (none/all/video/audio)
+        ffn_chunk_size: Chunk size for FFN (0 = disabled)
+        split_attn_target: Which attention modules to apply split attention to
+                          (none/all/self/cross/text_cross/av_cross/video/audio)
+        split_attn_mode: Split attention mode (batch/query)
+        split_attn_chunk_size: Chunk size for query-based split attention (0 = default 1024)
+    """
+    from musubi_tuner.ltx_2.model.transformer.feed_forward import FeedForward
+    from musubi_tuner.ltx_2.model.transformer.attention import Attention
+
+    if not hasattr(model, "transformer_blocks"):
+        logger.warning("Model does not have transformer_blocks; skipping memory optimization settings")
+        return
+
+    # Apply FFN chunking
+    if ffn_chunk_target and ffn_chunk_target != "none" and ffn_chunk_size > 0:
+        ffn_count = 0
+        for block in model.transformer_blocks:
+            # Video FFN
+            if ffn_chunk_target in ("all", "video") and hasattr(block, "ff"):
+                block.ff.chunk_size = ffn_chunk_size
+                ffn_count += 1
+            # Audio FFN
+            if ffn_chunk_target in ("all", "audio") and hasattr(block, "audio_ff"):
+                block.audio_ff.chunk_size = ffn_chunk_size
+                ffn_count += 1
+        if ffn_count > 0:
+            logger.info("Applied FFN chunking (chunk_size=%d) to %d FeedForward modules (target=%s)",
+                       ffn_chunk_size, ffn_count, ffn_chunk_target)
+
+    # Apply split attention settings
+    if split_attn_target and split_attn_target != "none" and split_attn_mode:
+        attn_count = 0
+        for block in model.transformer_blocks:
+            # Video self-attention (attn1)
+            if split_attn_target in ("all", "self", "video") and hasattr(block, "attn1"):
+                block.attn1.split_attn_mode = split_attn_mode
+                block.attn1.split_attn_chunk_size = split_attn_chunk_size
+                attn_count += 1
+
+            # Video text cross-attention (attn2)
+            if split_attn_target in ("all", "cross", "text_cross", "video") and hasattr(block, "attn2"):
+                block.attn2.split_attn_mode = split_attn_mode
+                block.attn2.split_attn_chunk_size = split_attn_chunk_size
+                attn_count += 1
+
+            # Audio self-attention
+            if split_attn_target in ("all", "self", "audio") and hasattr(block, "audio_attn1"):
+                block.audio_attn1.split_attn_mode = split_attn_mode
+                block.audio_attn1.split_attn_chunk_size = split_attn_chunk_size
+                attn_count += 1
+
+            # Audio text cross-attention
+            if split_attn_target in ("all", "cross", "text_cross", "audio") and hasattr(block, "audio_attn2"):
+                block.audio_attn2.split_attn_mode = split_attn_mode
+                block.audio_attn2.split_attn_chunk_size = split_attn_chunk_size
+                attn_count += 1
+
+            # Audio-to-video cross-attention
+            if split_attn_target in ("all", "cross", "av_cross") and hasattr(block, "audio_to_video_attn"):
+                block.audio_to_video_attn.split_attn_mode = split_attn_mode
+                block.audio_to_video_attn.split_attn_chunk_size = split_attn_chunk_size
+                attn_count += 1
+
+            # Video-to-audio cross-attention
+            if split_attn_target in ("all", "cross", "av_cross") and hasattr(block, "video_to_audio_attn"):
+                block.video_to_audio_attn.split_attn_mode = split_attn_mode
+                block.video_to_audio_attn.split_attn_chunk_size = split_attn_chunk_size
+                attn_count += 1
+
+        if attn_count > 0:
+            logger.info("Applied split attention (mode=%s, chunk_size=%d) to %d Attention modules (target=%s)",
+                       split_attn_mode, split_attn_chunk_size, attn_count, split_attn_target)
+
+
 def load_ltx2_model(
     model_path: str,
     device: Union[str, torch.device] = "cpu",
@@ -165,6 +252,11 @@ def load_ltx2_model(
     torch_dtype: Optional[torch.dtype] = None,
     attn_mode: str = "torch",
     audio_video: bool = False,
+    split_attn_target: Optional[str] = None,
+    split_attn_mode: Optional[str] = None,
+    split_attn_chunk_size: int = 0,
+    ffn_chunk_target: Optional[str] = None,
+    ffn_chunk_size: int = 0,
     fp8_scaled: bool = False,
     fp8_upcast: bool = False,
     fp8_upcast_stochastic: bool = False,
@@ -231,6 +323,21 @@ def load_ltx2_model(
     if attn_type is not None:
         config.setdefault("transformer", {})
         config["transformer"]["attention_type"] = attn_type
+    if split_attn_target is not None:
+        config.setdefault("transformer", {})
+        config["transformer"]["split_attn_target"] = split_attn_target
+    if split_attn_mode is not None:
+        config.setdefault("transformer", {})
+        config["transformer"]["split_attn_mode"] = split_attn_mode
+    if split_attn_chunk_size is not None:
+        config.setdefault("transformer", {})
+        config["transformer"]["split_attn_chunk_size"] = int(split_attn_chunk_size)
+    if ffn_chunk_target is not None:
+        config.setdefault("transformer", {})
+        config["transformer"]["ffn_chunk_target"] = ffn_chunk_target
+    if ffn_chunk_size is not None:
+        config.setdefault("transformer", {})
+        config["transformer"]["ffn_chunk_size"] = int(ffn_chunk_size)
     configurator = LTXModelConfigurator if audio_video else LTXVideoOnlyModelConfigurator
 
     with torch.device("meta"):
@@ -313,6 +420,17 @@ def load_ltx2_model(
 
     model = LTX2Wrapper(base_model, patch_size=1)
     _trace_vram_ltx2("AFTER LTX2Wrapper creation")
+
+    # Apply FFN chunking and split attention settings
+    _apply_memory_optimization_settings(
+        base_model,
+        ffn_chunk_target=ffn_chunk_target,
+        ffn_chunk_size=ffn_chunk_size,
+        split_attn_target=split_attn_target,
+        split_attn_mode=split_attn_mode,
+        split_attn_chunk_size=split_attn_chunk_size,
+    )
+
     if load_device == target_device:
         model = model.to(device=target_device)
         _trace_vram_ltx2(f"AFTER model.to({target_device}) [load_device==target_device]")
@@ -762,6 +880,11 @@ class LTX2NetworkTrainer(NetworkTrainer):
             torch_dtype=torch_dtype_to_use,
             attn_mode=attn_mode,
             audio_video=self._audio_video,
+            split_attn_target=getattr(args, "split_attn_target", None),
+            split_attn_mode=getattr(args, "split_attn_mode", None),
+            split_attn_chunk_size=int(getattr(args, "split_attn_chunk_size", 0) or 0),
+            ffn_chunk_target=getattr(args, "ffn_chunk_target", None),
+            ffn_chunk_size=int(getattr(args, "ffn_chunk_size", 0) or 0),
             fp8_scaled=bool(getattr(args, "fp8_scaled", False)),
             fp8_upcast=bool(getattr(args, "fp8_upcast", False)),
             fp8_upcast_stochastic=bool(getattr(args, "fp8_upcast_stochastic", False)),
@@ -2835,6 +2958,42 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         default="video",
         choices=["video", "av", "audio", "v", "a", "va"],
         help="Training modality.",
+    )
+    parser.add_argument(
+        "--split_attn_target",
+        type=str,
+        default=None,
+        choices=["none", "all", "self", "cross", "text_cross", "av_cross", "video", "audio"],
+        help=(
+            "Enable split attention for selected modules. "
+            "Targets: none/all/self/cross/text_cross/av_cross/video/audio."
+        ),
+    )
+    parser.add_argument(
+        "--split_attn_mode",
+        type=str,
+        default=None,
+        choices=["batch", "query"],
+        help="Split attention mode: batch (split by batch) or query (split by query length).",
+    )
+    parser.add_argument(
+        "--split_attn_chunk_size",
+        type=int,
+        default=0,
+        help="Chunk size for split_attn_mode=query. 0 uses the internal default (1024).",
+    )
+    parser.add_argument(
+        "--ffn_chunk_target",
+        type=str,
+        default=None,
+        choices=["none", "all", "video", "audio"],
+        help="Enable FFN chunking for selected modules. Targets: none/all/video/audio.",
+    )
+    parser.add_argument(
+        "--ffn_chunk_size",
+        type=int,
+        default=0,
+        help="Chunk size for FFN chunking. 0 disables chunking.",
     )
     parser.add_argument(
         "--lora_target_preset",
