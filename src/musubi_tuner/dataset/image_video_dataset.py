@@ -93,6 +93,13 @@ ARCHITECTURE_HUNYUAN_VIDEO_1_5 = "hv15"
 ARCHITECTURE_HUNYUAN_VIDEO_1_5_FULL = "hunyuan_video_1_5"
 ARCHITECTURE_Z_IMAGE = "zi"
 ARCHITECTURE_Z_IMAGE_FULL = "z_image"
+ARCHITECTURE_ACESTEP = "as"
+ARCHITECTURE_ACESTEP_FULL = "acestep"
+
+AUDIO_EXTENSIONS = [
+    ".wav", ".mp3", ".flac", ".ogg", ".m4a", ".opus", ".aac",
+    ".WAV", ".MP3", ".FLAC", ".OGG", ".M4A", ".OPUS", ".AAC",
+]
 
 
 def glob_images(directory, base="*", caption_extension=None):
@@ -132,6 +139,33 @@ def glob_videos(directory, base="*"):
     video_paths = list(set(video_paths))  # remove duplicates
     video_paths.sort()
     return video_paths
+
+
+def glob_audio(directory, base="*", caption_extension=None):
+    audio_paths = []
+    for ext in AUDIO_EXTENSIONS:
+        if base == "*":
+            audio_paths.extend(glob.glob(os.path.join(glob.escape(directory), base + ext)))
+        else:
+            audio_paths.extend(glob.glob(glob.escape(os.path.join(directory, base + ext))))
+    audio_paths = list(set(audio_paths))  # remove duplicates
+
+    # check for caption files and only keep audio with captions
+    if caption_extension is not None:
+        caption_paths = glob.glob(os.path.join(glob.escape(directory), "*" + caption_extension))
+        caption_bases = set()
+        for caption_path in caption_paths:
+            caption_base = os.path.splitext(os.path.basename(caption_path))[0]
+            caption_bases.add(caption_base)
+        filtered_audio_paths = []
+        for audio_path in audio_paths:
+            audio_base = os.path.splitext(os.path.basename(audio_path))[0]
+            if audio_base in caption_bases:
+                filtered_audio_paths.append(audio_path)
+        audio_paths = filtered_audio_paths
+
+    audio_paths.sort()
+    return audio_paths
 
 
 def divisible_by(num: int, divisor: int) -> int:
@@ -431,6 +465,42 @@ def save_latent_cache_z_image(item_info: ItemInfo, latent: torch.Tensor):
     save_latent_cache_common(item_info, sd, ARCHITECTURE_Z_IMAGE_FULL)
 
 
+def save_latent_cache_acestep(
+    item_info: ItemInfo,
+    target_latents: torch.Tensor,
+    attention_mask: torch.Tensor,
+    context_latents: Optional[torch.Tensor] = None,
+):
+    """ACE-Step architecture for audio generation.
+
+    Args:
+        item_info: Item info with cache path
+        target_latents: Audio latents [T, 64] (time, channels)
+        attention_mask: Valid audio mask [T]
+        context_latents: Optional context latents [T, 128]
+    """
+    assert target_latents.dim() == 2, "target_latents should be 2D tensor (time, channels)"
+    assert attention_mask.dim() == 1, "attention_mask should be 1D tensor (time)"
+
+    T, C = target_latents.shape
+    dtype_str = dtype_to_str(target_latents.dtype)
+
+    # Use latents_ prefix to match BucketBatchManager's key processing
+    # This produces "latents" key in batch (same as other architectures)
+    sd = {
+        f"latents_{T}x{C}_{dtype_str}": target_latents.detach().cpu().contiguous(),
+        "attention_mask": attention_mask.detach().cpu().contiguous(),
+    }
+
+    if context_latents is not None:
+        assert context_latents.dim() == 2, "context_latents should be 2D tensor (time, channels)"
+        T_ctx, C_ctx = context_latents.shape
+        # Use latents_context_ prefix so BucketBatchManager processes it to "latents_context"
+        sd[f"latents_context_{T_ctx}x{C_ctx}_{dtype_str}"] = context_latents.detach().cpu().contiguous()
+
+    save_latent_cache_common(item_info, sd, ARCHITECTURE_ACESTEP_FULL)
+
+
 def save_latent_cache_common(item_info: ItemInfo, sd: dict[str, torch.Tensor], arch_fullname: str):
     metadata = {
         "architecture": arch_fullname,
@@ -557,6 +627,21 @@ def save_text_encoder_output_cache_z_image(item_info: ItemInfo, embed: torch.Ten
     sd[f"varlen_llm_embed_{dtype_str}"] = embed.detach().cpu()
 
     save_text_encoder_output_cache_common(item_info, sd, ARCHITECTURE_Z_IMAGE_FULL)
+
+
+def save_text_encoder_output_cache_acestep(
+    item_info: ItemInfo, hidden_states: torch.Tensor, attention_mask: torch.Tensor
+):
+    """ACE-Step architecture - text encoder output for conditioning."""
+    assert hidden_states.dim() == 2, f"hidden_states should be 2D tensor (seq_len, hidden_size), got {hidden_states.shape}"
+    assert attention_mask.dim() == 1, f"attention_mask should be 1D tensor (seq_len), got {attention_mask.shape}"
+
+    sd = {}
+    dtype_str = dtype_to_str(hidden_states.dtype)
+    sd[f"encoder_hidden_states_{dtype_str}"] = hidden_states.detach().cpu()
+    sd["encoder_attention_mask"] = attention_mask.detach().cpu()
+
+    save_text_encoder_output_cache_common(item_info, sd, ARCHITECTURE_ACESTEP_FULL)
 
 
 def save_text_encoder_output_cache_common(item_info: ItemInfo, sd: dict[str, torch.Tensor], arch_fullname: str):
@@ -2400,10 +2485,212 @@ class VideoDataset(BaseDataset):
         return self.batch_manager[idx]
 
 
+class AudioDataset(BaseDataset):
+    """Dataset for ACE-Step audio training."""
+
+    def __init__(
+        self,
+        resolution: Tuple[int, int],
+        caption_extension: Optional[str],
+        batch_size: int,
+        num_repeats: int,
+        enable_bucket: bool,
+        bucket_no_upscale: bool,
+        audio_directory: Optional[str] = None,
+        audio_jsonl_file: Optional[str] = None,
+        cache_directory: Optional[str] = None,
+        lyrics_extension: Optional[str] = None,
+        max_duration: Optional[float] = 240.0,
+        min_duration: Optional[float] = 5.0,
+        debug_dataset: bool = False,
+        architecture: str = ARCHITECTURE_ACESTEP,
+    ):
+        super(AudioDataset, self).__init__(
+            resolution,
+            caption_extension,
+            batch_size,
+            num_repeats,
+            enable_bucket,
+            bucket_no_upscale,
+            cache_directory,
+            debug_dataset,
+            architecture,
+        )
+        self.audio_directory = audio_directory
+        self.audio_jsonl_file = audio_jsonl_file
+        self.lyrics_extension = lyrics_extension
+        self.max_duration = max_duration
+        self.min_duration = min_duration
+
+        if self.cache_directory is None:
+            self.cache_directory = self.audio_directory
+
+        self.batch_manager = None
+        self.num_train_items = 0
+
+        # Audio files will be discovered during caching
+        self.audio_files: list[str] = []
+        if audio_directory is not None:
+            self.audio_files = glob_audio(audio_directory, caption_extension=caption_extension)
+
+    def get_metadata(self):
+        metadata = super().get_metadata()
+        if self.audio_directory is not None:
+            metadata["audio_directory"] = os.path.basename(self.audio_directory)
+        if self.audio_jsonl_file is not None:
+            metadata["audio_jsonl_file"] = os.path.basename(self.audio_jsonl_file)
+        metadata["max_duration"] = self.max_duration
+        metadata["min_duration"] = self.min_duration
+        return metadata
+
+    def get_total_audio_count(self):
+        return len(self.audio_files)
+
+    def get_latent_cache_path(self, item_info: ItemInfo) -> str:
+        """Override to use audio-specific cache path format."""
+        basename = os.path.splitext(os.path.basename(item_info.item_key))[0]
+        assert self.cache_directory is not None, "cache_directory is required"
+        return os.path.join(self.cache_directory, f"{basename}_{self.architecture}.safetensors")
+
+    def retrieve_latent_cache_batches(self, num_workers: int):
+        """Retrieve audio files for latent caching."""
+        for audio_path in self.audio_files:
+            # Load caption
+            caption = ""
+            if self.caption_extension is not None:
+                caption_path = os.path.splitext(audio_path)[0] + self.caption_extension
+                if os.path.exists(caption_path):
+                    with open(caption_path, "r", encoding="utf-8") as f:
+                        caption = f.read().strip()
+
+            # Load lyrics if available
+            lyrics = ""
+            if self.lyrics_extension is not None:
+                lyrics_path = os.path.splitext(audio_path)[0] + self.lyrics_extension
+                if os.path.exists(lyrics_path):
+                    with open(lyrics_path, "r", encoding="utf-8") as f:
+                        lyrics = f.read().strip()
+
+            # Create ItemInfo
+            # For audio, original_size represents (duration_in_frames, 1)
+            item_info = ItemInfo(audio_path, caption, (0, 0), (0, 0))
+            item_info.latent_cache_path = self.get_latent_cache_path(item_info)
+            item_info.text_encoder_output_cache_path = self.get_text_encoder_output_cache_path(item_info)
+
+            # Store lyrics as additional info (can be accessed during text encoding)
+            item_info.lyrics = lyrics
+
+            yield [item_info]
+
+    def retrieve_text_encoder_output_cache_batches(self, num_workers: int):
+        """Retrieve batches for text encoder output caching."""
+        batch: list[ItemInfo] = []
+
+        for audio_path in self.audio_files:
+            # Load caption
+            caption = ""
+            if self.caption_extension is not None:
+                caption_path = os.path.splitext(audio_path)[0] + self.caption_extension
+                if os.path.exists(caption_path):
+                    with open(caption_path, "r", encoding="utf-8") as f:
+                        caption = f.read().strip()
+
+            # Load lyrics if available
+            lyrics = ""
+            if self.lyrics_extension is not None:
+                lyrics_path = os.path.splitext(audio_path)[0] + self.lyrics_extension
+                if os.path.exists(lyrics_path):
+                    with open(lyrics_path, "r", encoding="utf-8") as f:
+                        lyrics = f.read().strip()
+
+            item_info = ItemInfo(audio_path, caption, (0, 0), (0, 0))
+            item_info.text_encoder_output_cache_path = self.get_text_encoder_output_cache_path(item_info)
+            item_info.lyrics = lyrics
+
+            batch.append(item_info)
+
+            if len(batch) >= self.batch_size:
+                yield batch
+                batch = []
+
+        if len(batch) > 0:
+            yield batch
+
+    def prepare_for_training(self, num_timestep_buckets: Optional[int] = None):
+        """Prepare dataset for training from cached latents."""
+        cache_files = self.get_all_latent_cache_files()
+        if len(cache_files) == 0:
+            logger.warning(f"No latent cache files found in {self.cache_directory}")
+            return
+
+        # Group by duration/length (simple approach - treat all as same bucket for audio)
+        bucketed_item_info: dict[tuple, list[ItemInfo]] = {}
+
+        for cache_file in cache_files:
+            # Check text encoder output cache exists
+            basename = os.path.basename(cache_file)
+            item_key = basename.replace(f"_{self.architecture}.safetensors", "")
+            text_encoder_cache_file = os.path.join(
+                self.cache_directory, f"{item_key}_{self.architecture}_te.safetensors"
+            )
+            if not os.path.exists(text_encoder_cache_file):
+                logger.warning(f"Text encoder output cache file not found: {text_encoder_cache_file}")
+                continue
+
+            # Load latent to get shape
+            with safetensors_utils.MemoryEfficientSafeOpen(cache_file) as f:
+                metadata = f.metadata()
+                # Find the latents key (latents_TxC_dtype format)
+                latent_key = None
+                for key in f.keys():
+                    if key.startswith("latents_") and not key.startswith("latents_control"):
+                        latent_key = key
+                        break
+
+                if latent_key is None:
+                    logger.warning(f"No latents found in {cache_file}")
+                    continue
+
+                # Extract dimensions from key: latents_TxC_dtype
+                parts = latent_key.split("_")
+                dim_part = parts[1]  # TxC (index 1 after "latents_")
+                T, C = map(int, dim_part.split("x"))
+
+            # Use (T, C) as bucket key for audio
+            bucket_reso = (T, C)
+            item_info = ItemInfo(item_key, "", (T, C), bucket_reso, frame_count=T, latent_cache_path=cache_file)
+            item_info.text_encoder_output_cache_path = text_encoder_cache_file
+
+            bucket = bucketed_item_info.get(bucket_reso, [])
+            for _ in range(self.num_repeats):
+                bucket.append(item_info)
+            bucketed_item_info[bucket_reso] = bucket
+
+        # Prepare batch manager
+        self.batch_manager = BucketBatchManager(bucketed_item_info, self.batch_size, num_timestep_buckets=num_timestep_buckets)
+        self.batch_manager.show_bucket_info()
+
+        self.num_train_items = sum([len(bucket) for bucket in bucketed_item_info.values()])
+
+    def shuffle_buckets(self):
+        random.seed(self.seed + self.current_epoch)
+        if self.batch_manager is not None:
+            self.batch_manager.shuffle()
+
+    def __len__(self):
+        if self.batch_manager is None:
+            return 100  # dummy value
+        return len(self.batch_manager)
+
+    def __getitem__(self, idx):
+        super().__getitem__(idx)
+        return self.batch_manager[idx]
+
+
 class DatasetGroup(torch.utils.data.ConcatDataset):
-    def __init__(self, datasets: Sequence[Union[ImageDataset, VideoDataset]]):
+    def __init__(self, datasets: Sequence[Union[ImageDataset, VideoDataset, AudioDataset]]):
         super().__init__(datasets)
-        self.datasets: list[Union[ImageDataset, VideoDataset]] = datasets
+        self.datasets: list[Union[ImageDataset, VideoDataset, AudioDataset]] = datasets
         self.num_train_items = 0
         for dataset in self.datasets:
             self.num_train_items += dataset.num_train_items
