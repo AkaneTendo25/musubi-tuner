@@ -477,10 +477,8 @@ class AceStepNetworkTrainer(NetworkTrainer):
             generator = torch.Generator(device=device).manual_seed(actual_seed)
 
         logger.info(f"prompt: {prompt}")
-        logger.info(f"actual seed being used: {actual_seed}")
+        logger.info(f"seed: {actual_seed}")
         logger.info(f"sample steps: {sample_steps}")
-        if seed is not None:
-            logger.info(f"seed: {seed}")
 
         # Check for self-referencing _orig_mod (compiled model)
         has_self_ref_orig_mod = getattr(transformer, "_orig_mod", None) is transformer

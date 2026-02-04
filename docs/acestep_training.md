@@ -24,6 +24,35 @@ For flash attention (recommended for faster training):
 pip install flash-attn --no-build-isolation
 ```
 
+## Captioning Guide
+
+Based on official ACE-Step guidelines. Caption dimensions:
+
+| Dimension | Examples |
+|-----------|----------|
+| Style/Genre | pop, rock, jazz, electronic, hip-hop, lo-fi, synthwave |
+| Emotion | melancholic, uplifting, energetic, dreamy, dark, euphoric |
+| Instruments | acoustic guitar, piano, synth pads, 808 drums, strings |
+| Timbre | warm, bright, crisp, airy, punchy, lush, raw, polished |
+| Era | 80s synth-pop, 90s grunge, 2010s EDM, vintage soul |
+| Production | lo-fi, high-fidelity, live recording, studio-polished |
+| Vocals | female vocal, male vocal, breathy, powerful, raspy |
+| Tempo | slow tempo, mid-tempo, fast-paced, groovy, driving |
+
+**Principles:**
+- Specific beats vague ("sad piano ballad with female breathy vocal" > "a sad song")
+- Combine dimensions (style + emotion + instruments + timbre)
+- Texture words affect mixing (warm, crisp, airy, punchy)
+- Avoid conflicting styles in same caption
+- Don't include BPM/key in caption (use metadata parameters instead)
+
+**Lyrics structure tags:**
+- `[Intro]`, `[Verse]`, `[Chorus]`, `[Bridge]`, `[Outro]`
+- `[Instrumental]`, `[Guitar Solo]`, `[Piano Interlude]`
+- `[Build]`, `[Drop]`, `[Breakdown]`, `[Fade Out]`
+
+See [ACE-Step Tutorial](https://github.com/ACE-Step/ACE-Step-1.5/blob/main/docs/en/Tutorial.md) for complete guide.
+
 ## Dataset Setup
 
 Create a folder with your audio files and matching caption files:
@@ -86,6 +115,19 @@ python acestep_cache_latents.py \
     --batch_size 1
 ```
 
+For long audio files with limited VRAM, use chunked encoding:
+
+```bash
+python acestep_cache_latents.py \
+    --dataset_config acestep_dataset.toml \
+    --vae checkpoints/vae \
+    --max_duration 240 \
+    --vae_chunk_seconds 30 \
+    --vae_chunk_overlap 2.0
+```
+
+Chunking uses overlapping segments with cosine crossfade blending for seamless results.
+
 ### 4. Train LoRA
 
 With flash attention (recommended):
@@ -95,9 +137,12 @@ accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 acestep
     --dit checkpoints/acestep-v15-turbo \
     --output_dir output/acestep_lora \
     --network_module networks.lora_acestep \
-    --network_dim 16 \
-    --network_alpha 16 \
+    --network_dim 64 \
+    --network_alpha 128 \
+    --network_dropout 0.1 \
     --optimizer_type AdamW8Bit \
+    --lr_scheduler cosine \
+    --lr_warmup_steps 100 \
     --log_config \
     --log_with tensorboard \
     --logging_dir logs \
@@ -148,12 +193,42 @@ Supported fields:
 - `audio_duration`: Duration in seconds (default: 30.0)
 - `seed`: Random seed for reproducible generation (optional, random if omitted)
 
+## Lyrics Support
+
+For tracks with vocals, create `.lyrics` files alongside your audio:
+
+```
+training_data/
+├── song1.wav
+├── song1.txt        # Caption: "Pop song with female vocals, upbeat tempo"
+├── song1.lyrics     # Lyrics: "[Verse]\nLyrics here..."
+```
+
+Add to your dataset config:
+
+```toml
+[general]
+caption_extension = ".txt"
+lyrics_extension = ".lyrics"
+```
+
+If no `.lyrics` file exists, the track is treated as instrumental.
+
+## LoRA Configuration
+
+Official ACE-Step LoRA settings:
+
+- `--network_dim 64` - LoRA rank
+- `--network_alpha 128` - scaling factor (alpha/dim = 2.0)
+- `--network_dropout 0.1` - dropout for regularization
+
+The scale `alpha/dim` controls LoRA influence. Higher = stronger effect.
+
 ## Tips
 
-- **Flash Attention**: Use `--flash_attn` for ~30% faster training (requires `pip install flash-attn`)
-- **VRAM**: Use `--gradient_checkpointing` to reduce memory usage (~40% reduction)
-- **LoRA dim**: Start with 16, increase to 32-64 for more complex styles
-- **Steps**: 1000-2000 steps is usually enough for style fine-tuning
-- **Captions**: Be descriptive - include genre, instruments, mood, tempo
-- **Audio length**: 30-120 seconds works well, longer files use more memory
-- **Learning rate**: 1e-4 to 5e-5 work well for most cases
+- Use `--flash_attn` for faster training
+- Use `--gradient_checkpointing` to reduce VRAM (~40%)
+- Use `--lr_scheduler cosine --lr_warmup_steps 100`
+- Use `--vae_chunk_seconds 30` for long files with limited VRAM
+- 1000-2000 steps is usually enough
+- Audio length 30-120 seconds works well
