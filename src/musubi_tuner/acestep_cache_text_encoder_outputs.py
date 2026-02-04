@@ -25,12 +25,23 @@ logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
 
+def _get_embed_tokens_layer(text_encoder):
+    if hasattr(text_encoder, "embed_tokens"):
+        return text_encoder.embed_tokens
+    if hasattr(text_encoder, "model") and hasattr(text_encoder.model, "embed_tokens"):
+        return text_encoder.model.embed_tokens
+    if hasattr(text_encoder, "get_input_embeddings"):
+        return text_encoder.get_input_embeddings()
+    return None
+
+
 def encode_and_save_batch(
     tokenizer,
     text_encoder,
     batch: list[ItemInfo],
     device: torch.device,
     max_length: int,
+    condition_encoder=None,
 ):
     """Encode a batch of prompts and save their text encoder outputs.
 
@@ -44,16 +55,98 @@ def encode_and_save_batch(
     for item in batch:
         caption = item.caption
         lyrics = getattr(item, "lyrics", "")
+        item_bpm = getattr(item, "bpm", None)
+        item_key = getattr(item, "keyscale", None)
+        item_timesig = getattr(item, "timesignature", None)
+        item_duration = getattr(item, "duration", None)
+        if isinstance(item_timesig, str):
+            item_timesig = int(item_timesig) if item_timesig.isdigit() else None
 
-        # Encode using ACE-Step format
-        hidden_states, attention_mask = acestep_utils.encode_text_for_acestep(
-            tokenizer,
-            text_encoder,
-            caption,
-            lyrics,
-            max_length=max_length,
-            device=str(device),
-        )
+        # Align with the original trainer flow by caching condition-encoder outputs
+        # (not raw text encoder outputs) when DiT is provided.
+        if condition_encoder is not None:
+            # Text branch: prompt only. Lyrics are encoded separately for lyric branch.
+            formatted_prompt = acestep_utils.format_text_for_acestep(
+                caption,
+                "",
+                bpm=item_bpm,
+                key=item_key,
+                time_signature=item_timesig,
+                duration=item_duration,
+            )
+            if "\n\n# Lyrics\n" in formatted_prompt:
+                formatted_prompt = formatted_prompt.split("\n\n# Lyrics\n", 1)[0]
+
+            text_inputs = tokenizer(
+                formatted_prompt,
+                max_length=max_length,
+                padding="max_length",
+                truncation=True,
+                return_tensors="pt",
+            )
+            text_input_ids = text_inputs["input_ids"].to(device)
+            text_attention_mask = text_inputs["attention_mask"].to(device)
+
+            with torch.no_grad():
+                text_outputs = text_encoder(text_input_ids)
+                if hasattr(text_outputs, "last_hidden_state"):
+                    text_hidden_states = text_outputs.last_hidden_state
+                elif isinstance(text_outputs, tuple):
+                    text_hidden_states = text_outputs[0]
+                else:
+                    text_hidden_states = text_outputs
+
+            # Format lyrics with language header like official handler
+            lyrics_text = acestep_utils.format_lyrics_for_acestep(lyrics, language="unknown")
+            lyric_inputs = tokenizer(
+                lyrics_text,
+                max_length=2048,  # Official uses 2048 for lyrics
+                padding="max_length",
+                truncation=True,
+                return_tensors="pt",
+            )
+            lyric_input_ids = lyric_inputs["input_ids"].to(device)
+            lyric_attention_mask = lyric_inputs["attention_mask"].to(device)
+
+            with torch.no_grad():
+                encoder_dtype = next(condition_encoder.parameters()).dtype
+                text_hidden_states = text_hidden_states.to(device=device, dtype=encoder_dtype)
+                text_attention_mask = text_attention_mask.to(device=device)
+
+                embed_tokens = _get_embed_tokens_layer(text_encoder)
+                if embed_tokens is not None:
+                    lyric_hidden_states = embed_tokens(lyric_input_ids).to(device=device, dtype=encoder_dtype)
+                else:
+                    logger.warning("text_encoder has no embedding layer accessor; using zero lyric embeddings")
+                    lyric_hidden_states = torch.zeros(
+                        lyric_input_ids.shape[0],
+                        lyric_input_ids.shape[1],
+                        text_hidden_states.shape[-1],
+                        device=device,
+                        dtype=encoder_dtype,
+                    )
+                lyric_attention_mask = lyric_attention_mask.to(device=device)
+                refer_audio_hidden = torch.zeros(1, 1, 64, device=device, dtype=encoder_dtype)
+                refer_audio_order_mask = torch.zeros(1, device=device, dtype=torch.long)
+
+                hidden_states, attention_mask = condition_encoder(
+                    text_hidden_states=text_hidden_states,
+                    text_attention_mask=text_attention_mask,
+                    lyric_hidden_states=lyric_hidden_states,
+                    lyric_attention_mask=lyric_attention_mask,
+                    refer_audio_acoustic_hidden_states_packed=refer_audio_hidden,
+                    refer_audio_order_mask=refer_audio_order_mask,
+                )
+        else:
+            # Fallback mode: cache raw text encoder outputs.
+            hidden_states, attention_mask = acestep_utils.encode_text_for_acestep(
+                tokenizer,
+                text_encoder,
+                caption,
+                lyrics,
+                max_length=max_length,
+                device=str(device),
+            )
 
         # Remove batch dimension and move to CPU
         hidden_states = hidden_states.squeeze(0).cpu()  # [L, D]
@@ -101,6 +194,19 @@ def main():
     )
     text_encoder.eval()
 
+    condition_encoder = None
+    model = None
+    if args.dit is not None:
+        logger.info(f"Loading ACE-Step DiT condition encoder from {args.dit}")
+        model, _ = acestep_utils.load_acestep_model(
+            args.dit,
+            device=str(device),
+            dtype=torch.bfloat16,
+            attn_mode=args.attn_mode,
+        )
+        condition_encoder = model.encoder
+        condition_encoder.eval()
+
     # Get max length from args
     max_length = args.max_length
 
@@ -108,8 +214,15 @@ def main():
     logger.info("Encoding prompts with Qwen3 text encoder")
 
     def encode_for_text_encoder(batch: list[ItemInfo]):
-        nonlocal tokenizer, text_encoder
-        encode_and_save_batch(tokenizer, text_encoder, batch, device, max_length)
+        nonlocal tokenizer, text_encoder, condition_encoder
+        encode_and_save_batch(
+            tokenizer,
+            text_encoder,
+            batch,
+            device,
+            max_length,
+            condition_encoder=condition_encoder,
+        )
 
     cache_text_encoder_outputs.process_text_encoder_batches(
         args.num_workers,
@@ -123,6 +236,8 @@ def main():
 
     # Clean up
     del tokenizer, text_encoder
+    if model is not None:
+        del model
 
     # Remove cache files not in dataset
     cache_text_encoder_outputs.post_process_cache_files(
@@ -145,6 +260,18 @@ def acestep_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentPa
         type=int,
         default=TEXT_ENCODER_MAX_LENGTH,
         help=f"Maximum token length (default: {TEXT_ENCODER_MAX_LENGTH})",
+    )
+    parser.add_argument(
+        "--dit",
+        type=str,
+        default=None,
+        help="Optional ACE-Step DiT path to cache condition-encoder outputs like the original trainer",
+    )
+    parser.add_argument(
+        "--attn_mode",
+        type=str,
+        default="sdpa",
+        help="Attention mode used when loading --dit (sdpa, flash_attn, eager)",
     )
     return parser
 

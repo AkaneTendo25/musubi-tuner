@@ -39,6 +39,7 @@ def load_acestep_model(
 
     Returns:
         Tuple of (model, config_dict)
+        config_dict includes 'silence_latent' if found in checkpoint
     """
     # Map attn_mode to valid transformers attn_implementation values
     attn_map = {
@@ -69,6 +70,21 @@ def load_acestep_model(
         "is_turbo": getattr(model.config, "is_turbo", True),
         "hidden_size": getattr(model.config, "hidden_size", 1024),
     }
+
+    # Load silence_latent from separate .pt file (following official ACE-Step handler)
+    # silence_latent is NOT a model attribute - it's stored separately
+    silence_latent_path = os.path.join(model_path, "silence_latent.pt")
+    if os.path.exists(silence_latent_path):
+        logger.info(f"Loading silence_latent from {silence_latent_path}")
+        # Official handler loads and transposes: torch.load(path).transpose(1, 2)
+        # Original shape: [1, 64, T] -> transposed: [1, T, 64]
+        silence_latent = torch.load(silence_latent_path, weights_only=True).transpose(1, 2)
+        silence_latent = silence_latent.to(device=device, dtype=dtype)
+        config_dict["silence_latent"] = silence_latent
+        logger.info(f"Loaded silence_latent with shape {silence_latent.shape}")
+    else:
+        logger.warning(f"silence_latent.pt not found at {silence_latent_path}, will use zeros as fallback")
+        config_dict["silence_latent"] = None
 
     logger.info(f"ACE-Step model loaded: is_turbo={config_dict['is_turbo']}")
 
@@ -177,6 +193,27 @@ def format_text_for_acestep(
     return formatted
 
 
+def format_lyrics_for_acestep(
+    lyrics: str,
+    language: str = "unknown",
+) -> str:
+    """Format lyrics using ACE-Step's format for lyric branch encoding.
+
+    The lyrics are encoded separately through embed_tokens (not the full text encoder),
+    and must be in this specific format with language header and endoftext token.
+
+    Args:
+        lyrics: Song lyrics (or "[Instrumental]" for instrumental tracks)
+        language: Language code (e.g., "en", "zh", "ja", "unknown")
+
+    Returns:
+        Formatted lyrics string for tokenization
+    """
+    if not lyrics or not lyrics.strip() or lyrics.strip().lower() == "[instrumental]":
+        lyrics = "[Instrumental]"
+    return f"# Languages\n{language}\n\n# Lyric\n{lyrics}<|endoftext|>"
+
+
 def encode_text_for_acestep(
     tokenizer,
     text_encoder: nn.Module,
@@ -263,26 +300,37 @@ def sample_discrete_timestep(
 
 
 def get_silence_latent(
-    model: nn.Module,
+    silence_latent: Optional[torch.Tensor],
     device: torch.device,
     dtype: torch.dtype,
+    latent_length: int = 750,
 ) -> torch.Tensor:
-    """Get the silence latent from the model.
+    """Get or create silence latent tensor.
 
     Args:
-        model: ACE-Step model
+        silence_latent: Pre-loaded silence latent from config_dict, or None
         device: Target device
         dtype: Target dtype
+        latent_length: Required length in time dimension (default 750 = 30 seconds at 25Hz)
 
     Returns:
-        Silence latent tensor
+        Silence latent tensor of shape [1, latent_length, 64]
     """
-    if hasattr(model, "silence_latent"):
-        return model.silence_latent.to(device=device, dtype=dtype)
+    if silence_latent is not None:
+        silence = silence_latent.to(device=device, dtype=dtype)
+        # Pad or truncate to required length
+        if silence.shape[1] < latent_length:
+            pad_len = latent_length - silence.shape[1]
+            silence = torch.cat([
+                silence,
+                torch.zeros(1, pad_len, 64, device=device, dtype=dtype)
+            ], dim=1)
+        silence = silence[:, :latent_length, :]
+        return silence
     else:
         # Return zeros as fallback
-        logger.warning("Model does not have silence_latent, using zeros")
-        return torch.zeros(1, 64, device=device, dtype=dtype)
+        logger.warning("silence_latent not provided, using zeros")
+        return torch.zeros(1, latent_length, 64, device=device, dtype=dtype)
 
 
 def compute_flow_matching_loss(

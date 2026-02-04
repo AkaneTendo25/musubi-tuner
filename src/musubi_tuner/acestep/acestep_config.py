@@ -37,7 +37,7 @@ DEFAULT_LORA_DROPOUT = 0.1
 # Text encoder configuration
 TEXT_ENCODER_MAX_LENGTH = 256
 
-# SFT format template for text encoding
+# SFT format template for text encoding (must end with <|endoftext|> like official)
 SFT_GEN_PROMPT = """# Instruction
 {0}
 
@@ -45,4 +45,5 @@ SFT_GEN_PROMPT = """# Instruction
 {1}
 
 # Metas
-{2}"""
+{2}<|endoftext|>
+"""

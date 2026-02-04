@@ -21,6 +21,8 @@ from musubi_tuner.dataset.image_video_dataset import (
     ARCHITECTURE_FLUX_2_KLEIN_9B,
     ARCHITECTURE_KANDINSKY5,
     ARCHITECTURE_Z_IMAGE,
+    ARCHITECTURE_ACESTEP,
+    ARCHITECTURE_ACESTEP_FULL
 )
 
 logger = logging.getLogger(__name__)
@@ -88,6 +90,8 @@ ARCH_QWEN_IMAGE_LAYERED = "Qwen-Image-Layered"
 ARCH_KANDINSKY5 = "Kandinsky-5"
 ARCH_HUNYUAN_VIDEO_1_5 = "hunyuan-video-1.5"
 ARCH_Z_IMAGE = "Z-Image"
+ARCH_ACESTEP = "ACE-Step"
+ARCH_ACESTEP_FULL = "ACE-Step-Full"
 
 ADAPTER_LORA = "lora"
 
@@ -102,6 +106,7 @@ IMPL_QWEN_IMAGE_LAYERED = "https://github.com/QwenLM/Qwen-Image-Layered"
 IMPL_KANDINSKY5 = "https://github.com/kandinskylab/kandinsky-5"
 IMPL_HUNYUAN_VIDEO_1_5 = "https://github.com/Tencent-Hunyuan/HunyuanVideo-1.5"
 IMPL_Z_IMAGE = "https://github.com/Tongyi-MAI/Z-Image"
+IMPL_ACESTEP = "https://github.com/ace-step/ACE-Step-1.5"
 
 PRED_TYPE_EPSILON = "epsilon"
 # PRED_TYPE_V = "v"
@@ -213,6 +218,9 @@ def build_metadata(
     elif architecture == ARCHITECTURE_Z_IMAGE:
         arch = ARCH_Z_IMAGE
         impl = IMPL_Z_IMAGE
+    elif architecture == ARCHITECTURE_ACESTEP:
+        arch = ARCH_ACESTEP
+        impl = IMPL_ACESTEP
     else:
         raise ValueError(f"Unknown architecture: {architecture}")
 

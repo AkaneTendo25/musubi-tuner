@@ -11,7 +11,6 @@ from typing import List, Optional
 
 import torch
 import torchaudio
-import librosa
 
 from musubi_tuner.dataset import config_utils
 from musubi_tuner.dataset.config_utils import BlueprintGenerator, ConfigSanitizer
@@ -20,11 +19,7 @@ from musubi_tuner.dataset.image_video_dataset import (
     ARCHITECTURE_ACESTEP,
     save_latent_cache_acestep,
 )
-from musubi_tuner.acestep.acestep_config import (
-    ACESTEP_SAMPLE_RATE,
-    ACESTEP_MAX_DURATION_SECONDS,
-    ACESTEP_LATENT_CHANNELS,
-)
+from musubi_tuner.acestep.acestep_config import ACESTEP_SAMPLE_RATE, ACESTEP_MAX_DURATION_SECONDS, ACESTEP_LATENT_CHANNELS
 from musubi_tuner.acestep import acestep_utils
 import musubi_tuner.cache_latents as cache_latents
 
@@ -47,11 +42,22 @@ def load_and_preprocess_audio(
     Returns:
         Audio tensor [2, samples] (stereo)
     """
-    # Load with librosa (supports MP3, WAV, FLAC, etc.)
-    audio_np, sample_rate = librosa.load(audio_path, sr=target_sample_rate, mono=False)
+    # Prefer torchaudio (matches original trainer path). If backend lacks MP3 support,
+    # fallback to librosa so MP3 datasets still work.
+    try:
+        waveform, sample_rate = torchaudio.load(audio_path)
+        waveform = waveform.float()
 
-    # Convert to tensor
-    waveform = torch.from_numpy(audio_np).float()
+        # Resample to target sample rate if needed.
+        if sample_rate != target_sample_rate:
+            resampler = torchaudio.transforms.Resample(sample_rate, target_sample_rate)
+            waveform = resampler(waveform)
+    except Exception as e:
+        logger.warning(f"torchaudio failed for {audio_path}: {e}. Falling back to librosa.")
+        import librosa
+
+        audio_np, _ = librosa.load(audio_path, sr=target_sample_rate, mono=False)
+        waveform = torch.from_numpy(audio_np).float()
 
     # Handle mono/stereo
     if waveform.dim() == 1:
@@ -99,9 +105,6 @@ def encode_and_save_batch(vae, batch: List[ItemInfo], device: torch.device, max_
             T = latents.shape[1]
             attention_mask = torch.ones(T, dtype=torch.bool)
 
-            # Create context latents (silence/zeros for unconditional training)
-            context_latents = torch.zeros(T, 128)
-
             # Remove batch dimension
             target_latents = latents.squeeze(0).cpu()  # [T, 64]
 
@@ -115,7 +118,7 @@ def encode_and_save_batch(vae, batch: List[ItemInfo], device: torch.device, max_
                 item_info=item,
                 target_latents=target_latents,
                 attention_mask=attention_mask,
-                context_latents=context_latents,
+                context_latents=None,  # Let the trainer build silence+chunk context from the model.
             )
 
         except Exception as e:
