@@ -515,13 +515,22 @@ class AceStepNetworkTrainer(NetworkTrainer):
             logger.error("No audio generated")
             return
 
-        ts_str = time.strftime("%Y%m%d%H%M%S", time.localtime())
-        num_suffix = f"e{epoch:06d}" if epoch is not None else f"{steps:06d}"
-        seed_suffix = "" if seed is None else f"_{seed}"
+        # Build descriptive filename: {name}_step{steps}_p{idx}_seed{seed}
+        # Derive name from output_name or output_dir basename
+        if args.output_name:
+            base_name = args.output_name
+        elif args.output_dir:
+            base_name = os.path.basename(args.output_dir.rstrip("/\\"))
+        else:
+            base_name = "sample"
+
         prompt_idx = sample_parameter.get("enum", 0)
+        step_str = f"step{steps:06d}" if epoch is None else f"ep{epoch:04d}_step{steps:06d}"
+        seed_str = f"seed{actual_seed}"
+
         save_path = os.path.join(
             save_dir,
-            f"{'' if args.output_name is None else args.output_name + '_'}{num_suffix}_{prompt_idx:02d}_{ts_str}{seed_suffix}"
+            f"{base_name}_{step_str}_p{prompt_idx:02d}_{seed_str}"
         )
 
         self.save_audio_sample(audio, save_path)

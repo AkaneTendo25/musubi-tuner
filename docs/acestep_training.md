@@ -131,7 +131,8 @@ Sample prompts JSON format:
     {
         "prompt": "Electronic dance music with heavy bass and synth leads",
         "lyrics": "[Instrumental]",
-        "audio_duration": 30.0
+        "audio_duration": 30.0,
+        "seed": 42
     },
     {
         "prompt": "Acoustic folk song with warm guitar",
@@ -145,6 +146,7 @@ Supported fields:
 - `prompt` (required): Music description
 - `lyrics`: Song lyrics or `"[Instrumental]"` for instrumental tracks
 - `audio_duration`: Duration in seconds (default: 30.0)
+- `seed`: Random seed for reproducible generation (optional, random if omitted)
 
 ## Tips
 
