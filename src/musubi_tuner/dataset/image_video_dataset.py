@@ -2486,7 +2486,18 @@ class VideoDataset(BaseDataset):
 
 
 class AudioDataset(BaseDataset):
-    """Dataset for ACE-Step audio training."""
+    """Dataset for ACE-Step audio training.
+
+    Requires JSON metadata files with the following structure:
+    {
+        "caption": "Music description...",
+        "lyrics": "[Verse]\\nLyrics here...",
+        "bpm": 120,
+        "keyscale": "C major",
+        "timesignature": "4",
+        "duration": 180
+    }
+    """
 
     def __init__(
         self,
@@ -2499,12 +2510,16 @@ class AudioDataset(BaseDataset):
         audio_directory: Optional[str] = None,
         audio_jsonl_file: Optional[str] = None,
         cache_directory: Optional[str] = None,
-        lyrics_extension: Optional[str] = None,
+        lyrics_extension: Optional[str] = None,  # Deprecated, use JSON instead
         max_duration: Optional[float] = 240.0,
         min_duration: Optional[float] = 5.0,
         debug_dataset: bool = False,
         architecture: str = ARCHITECTURE_ACESTEP,
     ):
+        # Default to .json for ACE-Step
+        if caption_extension is None:
+            caption_extension = ".json"
+
         super(AudioDataset, self).__init__(
             resolution,
             caption_extension,
@@ -2518,7 +2533,7 @@ class AudioDataset(BaseDataset):
         )
         self.audio_directory = audio_directory
         self.audio_jsonl_file = audio_jsonl_file
-        self.lyrics_extension = lyrics_extension
+        self.lyrics_extension = lyrics_extension  # Kept for backward compat, but JSON preferred
         self.max_duration = max_duration
         self.min_duration = min_duration
 
@@ -2532,6 +2547,60 @@ class AudioDataset(BaseDataset):
         self.audio_files: list[str] = []
         if audio_directory is not None:
             self.audio_files = glob_audio(audio_directory, caption_extension=caption_extension)
+
+    def _load_metadata_from_json(self, audio_path: str) -> dict:
+        """Load metadata from JSON file for an audio file.
+
+        Returns dict with keys: caption, lyrics, bpm, keyscale, timesignature, duration
+        """
+        metadata = {
+            "caption": "",
+            "lyrics": "",
+            "bpm": None,
+            "keyscale": None,
+            "timesignature": None,
+            "duration": None,
+        }
+
+        if self.caption_extension is None:
+            return metadata
+
+        caption_path = os.path.splitext(audio_path)[0] + self.caption_extension
+        if not os.path.exists(caption_path):
+            logger.warning(f"Metadata file not found: {caption_path}")
+            return metadata
+
+        try:
+            with open(caption_path, "r", encoding="utf-8") as f:
+                content = f.read().strip()
+
+            # Try JSON first
+            if self.caption_extension.lower() == ".json" or content.startswith("{"):
+                data = json.loads(content)
+                metadata["caption"] = data.get("caption", "")
+                metadata["lyrics"] = data.get("lyrics", "")
+                metadata["bpm"] = data.get("bpm")
+                metadata["keyscale"] = data.get("keyscale")
+                metadata["timesignature"] = data.get("timesignature")
+                metadata["duration"] = data.get("duration")
+            else:
+                # Fallback: plain text caption (not recommended)
+                metadata["caption"] = content
+                logger.warning(f"Plain text caption detected for {audio_path}. JSON format recommended for better training.")
+
+                # Try loading lyrics from separate file if lyrics_extension set
+                if self.lyrics_extension is not None:
+                    lyrics_path = os.path.splitext(audio_path)[0] + self.lyrics_extension
+                    if os.path.exists(lyrics_path):
+                        with open(lyrics_path, "r", encoding="utf-8") as f:
+                            metadata["lyrics"] = f.read().strip()
+
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse JSON metadata for {audio_path}: {e}")
+        except Exception as e:
+            logger.error(f"Failed to load metadata for {audio_path}: {e}")
+
+        return metadata
 
     def get_metadata(self):
         metadata = super().get_metadata()
@@ -2555,30 +2624,21 @@ class AudioDataset(BaseDataset):
     def retrieve_latent_cache_batches(self, num_workers: int):
         """Retrieve audio files for latent caching."""
         for audio_path in self.audio_files:
-            # Load caption
-            caption = ""
-            if self.caption_extension is not None:
-                caption_path = os.path.splitext(audio_path)[0] + self.caption_extension
-                if os.path.exists(caption_path):
-                    with open(caption_path, "r", encoding="utf-8") as f:
-                        caption = f.read().strip()
-
-            # Load lyrics if available
-            lyrics = ""
-            if self.lyrics_extension is not None:
-                lyrics_path = os.path.splitext(audio_path)[0] + self.lyrics_extension
-                if os.path.exists(lyrics_path):
-                    with open(lyrics_path, "r", encoding="utf-8") as f:
-                        lyrics = f.read().strip()
+            # Load metadata from JSON
+            metadata = self._load_metadata_from_json(audio_path)
 
             # Create ItemInfo
             # For audio, original_size represents (duration_in_frames, 1)
-            item_info = ItemInfo(audio_path, caption, (0, 0), (0, 0))
+            item_info = ItemInfo(audio_path, metadata["caption"], (0, 0), (0, 0))
             item_info.latent_cache_path = self.get_latent_cache_path(item_info)
             item_info.text_encoder_output_cache_path = self.get_text_encoder_output_cache_path(item_info)
 
-            # Store lyrics as additional info (can be accessed during text encoding)
-            item_info.lyrics = lyrics
+            # Store all metadata as additional attributes
+            item_info.lyrics = metadata["lyrics"]
+            item_info.bpm = metadata["bpm"]
+            item_info.keyscale = metadata["keyscale"]
+            item_info.timesignature = metadata["timesignature"]
+            item_info.duration = metadata["duration"]
 
             yield [item_info]
 
@@ -2587,25 +2647,18 @@ class AudioDataset(BaseDataset):
         batch: list[ItemInfo] = []
 
         for audio_path in self.audio_files:
-            # Load caption
-            caption = ""
-            if self.caption_extension is not None:
-                caption_path = os.path.splitext(audio_path)[0] + self.caption_extension
-                if os.path.exists(caption_path):
-                    with open(caption_path, "r", encoding="utf-8") as f:
-                        caption = f.read().strip()
+            # Load metadata from JSON
+            metadata = self._load_metadata_from_json(audio_path)
 
-            # Load lyrics if available
-            lyrics = ""
-            if self.lyrics_extension is not None:
-                lyrics_path = os.path.splitext(audio_path)[0] + self.lyrics_extension
-                if os.path.exists(lyrics_path):
-                    with open(lyrics_path, "r", encoding="utf-8") as f:
-                        lyrics = f.read().strip()
-
-            item_info = ItemInfo(audio_path, caption, (0, 0), (0, 0))
+            item_info = ItemInfo(audio_path, metadata["caption"], (0, 0), (0, 0))
             item_info.text_encoder_output_cache_path = self.get_text_encoder_output_cache_path(item_info)
-            item_info.lyrics = lyrics
+
+            # Store all metadata as additional attributes
+            item_info.lyrics = metadata["lyrics"]
+            item_info.bpm = metadata["bpm"]
+            item_info.keyscale = metadata["keyscale"]
+            item_info.timesignature = metadata["timesignature"]
+            item_info.duration = metadata["duration"]
 
             batch.append(item_info)
 

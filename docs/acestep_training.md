@@ -7,10 +7,14 @@ Train LoRA adapters for [ACE-Step 1.5](https://huggingface.co/ACE-Step/Ace-Step1
 - Python 3.10+
 - CUDA GPU with 12GB+ VRAM (24GB+ recommended for larger batches)
 - ~10GB disk space for models
-- Audio files (.wav, .mp3, .flac) with caption .txt files
+- Audio files (.wav, .mp3, .flac) with metadata .json files
 
-Install dependencies:
+### Installation
+
+First, install musubi-tuner as usual (see main README), then add ACE-Step specific dependencies:
+
 ```bash
+# Additional dependencies for ACE-Step branch
 pip install vector_quantize_pytorch
 ```
 
@@ -55,22 +59,50 @@ See [ACE-Step Tutorial](https://github.com/ACE-Step/ACE-Step-1.5/blob/main/docs/
 
 ## Dataset Setup
 
-Create a folder with your audio files and matching caption files:
+Create a folder with your audio files and matching JSON metadata files:
 
 ```
 training_data/
 ├── song1.wav
-├── song1.txt      # Caption describing the music
+├── song1.json     # Metadata (caption, lyrics, bpm, key, etc.)
 ├── song2.mp3
-├── song2.txt
+├── song2.json
 └── ...
 ```
+
+### JSON Metadata Format
+
+Each audio file requires a `.json` file with the same name:
+
+```json
+{
+    "caption": "Electronic dance music with heavy bass and synth leads, energetic and driving",
+    "lyrics": "[Intro]\n[Synth arpeggio]\n\n[Verse]\nDancing in the night...\n\n[Chorus]\nFeel the beat drop",
+    "bpm": 128,
+    "keyscale": "F minor",
+    "timesignature": "4",
+    "duration": 180
+}
+```
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `caption` | Yes | Detailed music description (style, instruments, mood, etc.) |
+| `lyrics` | No | Song lyrics with structure tags, or `"[Instrumental]"` |
+| `bpm` | No | Beats per minute |
+| `keyscale` | No | Musical key (e.g., "C major", "F# minor") |
+| `timesignature` | No | Time signature (e.g., "4", "3", "6") |
+| `duration` | No | Duration in seconds |
+
+The metadata is formatted into the SFT prompt that ACE-Step was trained on, providing stronger conditioning for better learning.
+
+### Dataset Config
 
 Create dataset config (e.g., `acestep_dataset.toml`):
 
 ```toml
 [general]
-caption_extension = ".txt"
+caption_extension = ".json"
 
 [[datasets]]
 audio_directory = "path/to/your/training_data"
@@ -176,12 +208,18 @@ Sample prompts JSON format:
     {
         "prompt": "Electronic dance music with heavy bass and synth leads",
         "lyrics": "[Instrumental]",
+        "bpm": 128,
+        "keyscale": "F minor",
+        "timesignature": "4",
+        "duration": 30.0,
         "audio_duration": 30.0,
         "seed": 42
     },
     {
         "prompt": "Acoustic folk song with warm guitar",
         "lyrics": "[Verse]\nSinging in the morning light\n[Chorus]\nOh the world is bright",
+        "bpm": 95,
+        "keyscale": "G major",
         "audio_duration": 30.0
     }
 ]
@@ -190,29 +228,12 @@ Sample prompts JSON format:
 Supported fields:
 - `prompt` (required): Music description
 - `lyrics`: Song lyrics or `"[Instrumental]"` for instrumental tracks
-- `audio_duration`: Duration in seconds (default: 30.0)
+- `bpm`: Beats per minute (optional, shows as "N/A" if omitted)
+- `keyscale`: Musical key (optional, e.g., "C major", "F# minor")
+- `timesignature`: Time signature (optional, e.g., "4", "3")
+- `duration`: Duration for metadata formatting (optional)
+- `audio_duration`: Actual generation duration in seconds (default: 30.0)
 - `seed`: Random seed for reproducible generation (optional, random if omitted)
-
-## Lyrics Support
-
-For tracks with vocals, create `.lyrics` files alongside your audio:
-
-```
-training_data/
-├── song1.wav
-├── song1.txt        # Caption: "Pop song with female vocals, upbeat tempo"
-├── song1.lyrics     # Lyrics: "[Verse]\nLyrics here..."
-```
-
-Add to your dataset config:
-
-```toml
-[general]
-caption_extension = ".txt"
-lyrics_extension = ".lyrics"
-```
-
-If no `.lyrics` file exists, the track is treated as instrumental.
 
 ## LoRA Configuration
 

@@ -16,6 +16,7 @@ from .acestep_config import (
     TEXT_ENCODER_MAX_LENGTH,
     SFT_GEN_PROMPT,
     ACESTEP_SAMPLE_RATE,
+    DEFAULT_DIT_INSTRUCTION,
 )
 
 import logging
@@ -148,7 +149,7 @@ def load_text_encoder(
 def format_text_for_acestep(
     caption: str,
     lyrics: str = "",
-    instruction: str = "Generate music based on the description.",
+    instruction: str = DEFAULT_DIT_INSTRUCTION,
     bpm: Optional[int] = None,
     key: Optional[str] = None,
     time_signature: Optional[int] = None,
@@ -156,10 +157,12 @@ def format_text_for_acestep(
 ) -> str:
     """Format text using ACE-Step's SFT format.
 
+    Must match the exact format used by the original ACE-Step trainer for proper conditioning.
+
     Args:
         caption: Music description/prompt
         lyrics: Song lyrics (optional)
-        instruction: Task instruction
+        instruction: Task instruction (default matches original ACE-Step)
         bpm: Beats per minute (optional)
         key: Musical key (optional)
         time_signature: Time signature (optional)
@@ -168,18 +171,19 @@ def format_text_for_acestep(
     Returns:
         Formatted text string
     """
-    # Build metas string
-    metas_parts = []
-    if bpm is not None:
-        metas_parts.append(f"- bpm: {bpm}")
-    if time_signature is not None:
-        metas_parts.append(f"- timesignature: {time_signature}")
-    if key is not None:
-        metas_parts.append(f"- keyscale: {key}")
-    if duration is not None:
-        metas_parts.append(f"- duration: {duration:.1f} seconds")
+    # Build metas string - MUST include all fields like original trainer
+    # Original uses "N/A" for missing values, always includes all fields
+    bpm_str = str(bpm) if bpm is not None else "N/A"
+    timesig_str = str(time_signature) if time_signature is not None else "N/A"
+    key_str = key if key is not None else "N/A"
+    duration_str = f"{duration:.1f} seconds" if duration is not None else "N/A"
 
-    metas_str = "\n".join(metas_parts) if metas_parts else "- No specific metadata"
+    metas_str = (
+        f"- bpm: {bpm_str}\n"
+        f"- timesignature: {timesig_str}\n"
+        f"- keyscale: {key_str}\n"
+        f"- duration: {duration_str}"
+    )
 
     # Format using SFT template
     formatted = SFT_GEN_PROMPT.format(instruction, caption, metas_str)

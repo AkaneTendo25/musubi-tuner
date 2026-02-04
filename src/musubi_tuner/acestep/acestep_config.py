@@ -37,6 +37,9 @@ DEFAULT_LORA_DROPOUT = 0.1
 # Text encoder configuration
 TEXT_ENCODER_MAX_LENGTH = 256
 
+# Default instruction - must match original ACE-Step trainer
+DEFAULT_DIT_INSTRUCTION = "Fill the audio semantic mask based on the given conditions:"
+
 # SFT format template for text encoding (must end with <|endoftext|> like official)
 SFT_GEN_PROMPT = """# Instruction
 {0}
