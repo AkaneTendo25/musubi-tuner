@@ -1,4 +1,8 @@
 # LoRA module for ACE-Step 1.5 DiT decoder
+#
+# This module creates LoRA with ComfyUI-compatible key names.
+# The key format is: lora_unet_decoder_{module_path}.{lora_down|lora_up|alpha}
+# This matches the ACE-Step model structure in ComfyUI: decoder.layers.N.self_attn.q_proj etc.
 
 import ast
 import re
@@ -91,9 +95,12 @@ def create_arch_network(
     # Enable verbose to see what modules are being targeted
     kwargs["verbose"] = True
 
-    return lora.create_network(
+    # Use "lora_unet_decoder" prefix for ComfyUI compatibility
+    # This produces keys like: lora_unet_decoder_layers_0_self_attn_q_proj.lora_down.weight
+    # which map to ComfyUI model path: decoder.layers.0.self_attn.q_proj.weight
+    network = lora.create_network(
         ACESTEP_TARGET_REPLACE_MODULES,
-        "lora_unet",
+        "lora_unet_decoder",  # ComfyUI-compatible prefix
         multiplier,
         network_dim,
         network_alpha,
@@ -103,6 +110,10 @@ def create_arch_network(
         neuron_dropout=neuron_dropout,
         **kwargs,
     )
+
+    logger.info("Created ACE-Step LoRA with ComfyUI-compatible key format (lora_unet_decoder_*)")
+
+    return network
 
 
 def create_arch_network_from_weights(
@@ -115,6 +126,9 @@ def create_arch_network_from_weights(
 ) -> lora.LoRANetwork:
     """Create LoRA network from saved weights.
 
+    Supports both old format (lora_unet_*) and new ComfyUI-compatible format (lora_unet_decoder_*).
+    Old format weights are automatically converted to new format for compatibility.
+
     Args:
         multiplier: LoRA multiplier
         weights_sd: State dict with LoRA weights
@@ -126,6 +140,19 @@ def create_arch_network_from_weights(
     Returns:
         LoRANetwork instance
     """
+    # Check if this is old format (lora_unet_ without decoder_) and convert if needed
+    sample_key = next(iter(weights_sd.keys()), "")
+    if sample_key.startswith("lora_unet_") and not sample_key.startswith("lora_unet_decoder_"):
+        logger.info("Converting old LoRA format to ComfyUI-compatible format")
+        converted_sd = {}
+        for key, value in weights_sd.items():
+            if key.startswith("lora_unet_"):
+                new_key = "lora_unet_decoder_" + key[len("lora_unet_"):]
+                converted_sd[new_key] = value
+            else:
+                converted_sd[key] = value
+        weights_sd = converted_sd
+
     # Target the decoder if available
     if unet is not None and hasattr(unet, "decoder"):
         target_model = unet.decoder
