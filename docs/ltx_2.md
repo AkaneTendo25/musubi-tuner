@@ -50,19 +50,15 @@ python ltx2_cache_latents.py ^
 | `*_ltx2_audio.safetensors` | Audio latents: `audio_latents_{T}x{mel_bins}x{channels}_{dtype}`, `audio_lengths_int32` |
 
 ### Memory Optimization for Caching
-If you encounter Out-Of-Memory (OOM) errors during caching (especially with higher resolutions like 1080p), use VAE chunking and spatial tiling:
+If you encounter Out-Of-Memory (OOM) errors during caching (especially with higher resolutions like 1080p), use VAE temporal chunking:
 
 ```bash
 python ltx2_cache_latents.py ^
   ...
-  --vae_chunk_size 16 ^
-  --vae_spatial_tile_size 512 ^
-  --vae_spatial_tile_overlap 64
+  --vae_chunk_size 16
 ```
 
 - `--vae_chunk_size`: Processes video in temporal chunks (e.g., 16 or 32 frames at a time). Default: `None` (all frames).
-- `--vae_spatial_tile_size`: Processes video in spatial tiles (e.g., 512x512 pixels). Default: `None` (full image).
-- `--vae_spatial_tile_overlap`: Overlap between spatial tiles (pixels). Default: `64`.
 
 ---
 
