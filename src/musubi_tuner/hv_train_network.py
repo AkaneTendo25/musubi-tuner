@@ -832,14 +832,15 @@ class NetworkTrainer:
             **lr_scheduler_kwargs,
         )
 
-    def resume_from_local_or_hf_if_specified(self, accelerator: Accelerator, args: argparse.Namespace) -> bool:
+    def resume_from_local_or_hf_if_specified(self, accelerator: Accelerator, args: argparse.Namespace) -> int:
+        """Resume training state. Returns the recovered global_step (0 if not resuming)."""
         if not args.resume:
-            return False
+            return 0
 
         if not args.resume_from_huggingface:
             logger.info(f"resume training from local state: {args.resume}")
             accelerator.load_state(args.resume)
-            return True
+            return self._recover_global_step(args.resume)
 
         logger.info(f"resume training from huggingface state: {args.resume}")
         repo_id = args.resume.split("/")[0] + "/" + args.resume.split("/")[1]
@@ -884,7 +885,20 @@ class NetworkTrainer:
         dirname = os.path.dirname(results[0])
         accelerator.load_state(dirname)
 
-        return True
+        return self._recover_global_step(dirname)
+
+    @staticmethod
+    def _recover_global_step(state_dir: str) -> int:
+        """Read global_step from the LR scheduler state saved by accelerate."""
+        scheduler_path = os.path.join(state_dir, "scheduler.bin")
+        try:
+            scheduler_state = torch.load(scheduler_path, map_location="cpu", weights_only=True)
+            global_step = int(scheduler_state["last_epoch"])
+            logger.info(f"recovered global_step={global_step} from {scheduler_path}")
+            return global_step
+        except Exception as e:
+            logger.warning(f"could not recover global_step from {scheduler_path}: {e}  (starting from step 0)")
+            return 0
 
     def get_bucketed_timestep(self) -> float:
         if self.num_timestep_buckets is None or self.num_timestep_buckets <= 1:
@@ -2212,12 +2226,13 @@ class NetworkTrainer:
         accelerator.register_save_state_pre_hook(save_model_hook)
         accelerator.register_load_state_pre_hook(load_model_hook)
 
-        # resume from local or huggingface. accelerator.step is set
-        self.resume_from_local_or_hf_if_specified(accelerator, args)  # accelerator.load_state(args.resume)
-
         # epoch数を計算する
         num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
         num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
+
+        # resume from local or huggingface — must be after num_update_steps_per_epoch is known
+        initial_global_step = self.resume_from_local_or_hf_if_specified(accelerator, args)
+        epoch_to_start = initial_global_step // num_update_steps_per_epoch if initial_global_step > 0 else 0
 
         # 学習する
         # total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
@@ -2232,6 +2247,8 @@ class NetworkTrainer:
         # accelerator.print(f"  total train batch size (with parallel & distributed & accumulation) / 総バッチサイズ（並列学習、勾配合計含む）: {total_batch_size}")
         accelerator.print(f"  gradient accumulation steps / 勾配を合計するステップ数 = {args.gradient_accumulation_steps}")
         accelerator.print(f"  total optimization steps / 学習ステップ数: {args.max_train_steps}")
+        if initial_global_step > 0:
+            accelerator.print(f"  resuming from step {initial_global_step}, epoch {epoch_to_start + 1}/{num_train_epochs}")
 
         # TODO refactor metadata creation and move to util
         metadata = {
@@ -2331,11 +2348,12 @@ class NetworkTrainer:
                 init_kwargs=init_kwargs,
             )
 
-        # TODO skip until initial step
-        progress_bar = tqdm(range(args.max_train_steps), smoothing=0, disable=not accelerator.is_local_main_process, desc="steps")
+        progress_bar = tqdm(
+            range(args.max_train_steps), initial=initial_global_step, smoothing=0,
+            disable=not accelerator.is_local_main_process, desc="steps",
+        )
 
-        epoch_to_start = 0
-        global_step = 0
+        global_step = initial_global_step
         noise_scheduler = FlowMatchDiscreteScheduler(shift=args.discrete_flow_shift, reverse=True, solver="euler")
 
         loss_recorder = train_utils.LossRecorder()
@@ -2574,8 +2592,8 @@ class NetworkTrainer:
             network.train()
             optimizer_train_fn()
 
-        # For --sample_at_first
-        if should_sample_images(args, global_step, epoch=0):
+        # For --sample_at_first (skip on resume — samples were already generated)
+        if global_step == 0 and should_sample_images(args, global_step, epoch=0):
             optimizer_eval_fn()
             self.sample_images(accelerator, args, 0, global_step, vae, transformer, sample_parameters, dit_dtype)
             optimizer_train_fn()
