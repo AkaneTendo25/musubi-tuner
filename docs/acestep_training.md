@@ -260,6 +260,9 @@ accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 acestep
 |----------|---------|-------------|
 | `--is_turbo` | `auto` | `auto` reads from model config, `true`/`false` to override |
 | `--acestep_shift` | auto | Timestep shift (default: 3.0 for turbo, 1.0 for base). Must be set to `1.0` for `turbo-shift1` |
+| `--fp8_base` | off | Load DiT weights in fp8. Halves VRAM usage but may reduce quality |
+| `--fp8_scaled` | off | Use scaled fp8 for DiT decoder layers (requires `--fp8_base`). Better quality than `--fp8_base` alone |
+
 ## Audio Sampling During Training
 
 Add these flags to generate audio samples during training:
@@ -325,10 +328,34 @@ Official ACE-Step LoRA settings:
 
 The scale `alpha/dim` controls LoRA influence. Higher = stronger effect.
 
+## Memory Optimization
+
+- `--fp8_base` and `--fp8_scaled` options reduce DiT VRAM usage (specify both together). Decoder layers are stored in fp8 with per-block scales; encoder and norms stay in bf16. Quality may degrade slightly.
+- `--gradient_checkpointing` reduces VRAM by ~40%.
+- `--vae_chunk_seconds 30` enables chunked VAE encoding for long audio files with limited VRAM.
+
+Example with FP8:
+
+```bash
+accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 acestep_train_network.py \
+    --dataset_config acestep_dataset.toml \
+    --dit checkpoints/acestep-v15-turbo \
+    --fp8_base --fp8_scaled \
+    --output_dir output/acestep_lora \
+    --network_module networks.lora_acestep \
+    --network_dim 64 --network_alpha 128 --network_dropout 0.1 \
+    --optimizer_type AdamW8Bit \
+    --lr_scheduler cosine --lr_warmup_steps 100 \
+    --max_train_steps 2000 --learning_rate 5e-5 \
+    --mixed_precision bf16 --flash_attn --gradient_checkpointing \
+    --save_every_n_steps 500
+```
+
 ## Tips
 
 - Use `--flash_attn` for faster training
 - Use `--gradient_checkpointing` to reduce VRAM (~40%)
+- Use `--fp8_base --fp8_scaled` to reduce DiT VRAM usage
 - Use `--lr_scheduler cosine --lr_warmup_steps 100`
 - Use `--vae_chunk_seconds 30` for long files with limited VRAM
 - 1000-2000 steps is usually enough

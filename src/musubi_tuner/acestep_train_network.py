@@ -597,11 +597,14 @@ class AceStepNetworkTrainer(NetworkTrainer):
         """Load AceStepConditionGenerationModel."""
         logger.info(f"Loading ACE-Step model from {dit_path}")
 
+        fp8_scaled = getattr(args, "fp8_scaled", False)
         model, config = acestep_utils.load_acestep_model(
             dit_path,
             device=loading_device,
-            dtype=dit_weight_dtype or torch.bfloat16,
+            dtype=torch.bfloat16,
             attn_mode=attn_mode,
+            fp8_scaled=fp8_scaled,
+            dit_weight_dtype=dit_weight_dtype,
         )
 
         # Auto-detect is_turbo from model config
@@ -900,6 +903,11 @@ def acestep_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentPa
         help="Override timestep shift value (default: auto-detect from model type: 3.0 for turbo, 1.0 for base)",
     )
     parser.add_argument(
+        "--fp8_scaled",
+        action="store_true",
+        help="use scaled fp8 for DiT (requires --fp8_base)",
+    )
+    parser.add_argument(
         "--max_duration",
         type=float,
         default=240.0,
@@ -921,10 +929,6 @@ def main():
         args.mixed_precision = "bf16"
 
     # Set defaults for base trainer arguments not used by ACE-Step
-    if not hasattr(args, "fp8_scaled"):
-        args.fp8_scaled = False
-    if not hasattr(args, "fp8_base"):
-        args.fp8_base = False
     if not hasattr(args, "fp8_llm"):
         args.fp8_llm = False
     if not hasattr(args, "disable_numpy_memmap"):

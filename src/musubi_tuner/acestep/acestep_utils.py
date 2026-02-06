@@ -7,9 +7,12 @@ Functions for loading ACE-Step models, VAE, and text encoder.
 import os
 from typing import Optional, Tuple, Dict, Any, List
 
+import glob
+
 import torch
 import torch.nn as nn
-from transformers import AutoModel, AutoTokenizer
+from accelerate import init_empty_weights
+from transformers import AutoConfig, AutoModel, AutoTokenizer
 
 from .acestep_config import (
     TURBO_SHIFT3_TIMESTEPS,
@@ -17,6 +20,8 @@ from .acestep_config import (
     SFT_GEN_PROMPT,
     ACESTEP_SAMPLE_RATE,
     DEFAULT_DIT_INSTRUCTION,
+    ACESTEP_FP8_TARGET_KEYS,
+    ACESTEP_FP8_EXCLUDE_KEYS,
 )
 
 import logging
@@ -24,19 +29,44 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+def _find_safetensors_file(model_path: str) -> str:
+    """Find the safetensors file in model directory.
+
+    Returns a single file path. For split weights (model-00001-of-00002.safetensors),
+    returns the first file; load_safetensors_with_lora_and_fp8 handles split detection.
+    """
+    # Check for single model.safetensors
+    single = os.path.join(model_path, "model.safetensors")
+    if os.path.exists(single):
+        return single
+    # Check for split or other safetensors files
+    pattern = os.path.join(model_path, "*.safetensors")
+    files = sorted(glob.glob(pattern))
+    if files:
+        return files[0]
+    raise FileNotFoundError(f"No safetensors files found in {model_path}")
+
+
 def load_acestep_model(
     model_path: str,
     device: str = "cpu",
     dtype: torch.dtype = torch.bfloat16,
     attn_mode: str = "sdpa",
+    fp8_scaled: bool = False,
+    dit_weight_dtype: Optional[torch.dtype] = None,
 ) -> Tuple[nn.Module, Dict[str, Any]]:
     """Load ACE-Step model from checkpoint.
+
+    Uses split architecture/weights loading to support FP8 quantization during loading,
+    avoiding bf16 VRAM peak. Follows the same pattern as HunyuanVideo 1.5 model loading.
 
     Args:
         model_path: Path to ACE-Step checkpoint directory
         device: Device to load model on
         dtype: Model dtype (bfloat16 recommended)
         attn_mode: Attention implementation ("sdpa", "flash_attention_2", "eager")
+        fp8_scaled: Whether to use scaled FP8 quantization (per-block with scales)
+        dit_weight_dtype: Weight dtype override. float8_e4m3fn for fp8_base, None for fp8_scaled, bf16 for normal.
 
     Returns:
         Tuple of (model, config_dict)
@@ -56,22 +86,54 @@ def load_acestep_model(
     attn_impl = attn_map.get(attn_mode, "sdpa")
 
     logger.info(f"Loading ACE-Step model from {model_path}")
-    model = AutoModel.from_pretrained(
-        model_path,
-        trust_remote_code=True,
-        torch_dtype=dtype,
-        attn_implementation=attn_impl,
+
+    # Step 1: Load config only (no weights)
+    config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+
+    # Step 2: Create empty model on meta device (zero memory)
+    with init_empty_weights():
+        model = AutoModel.from_config(
+            config,
+            trust_remote_code=True,
+            dtype=dtype,
+            attn_implementation=attn_impl,
+        )
+
+    # Step 3: Find safetensors file (split detection handled by loader)
+    model_file = _find_safetensors_file(model_path)
+
+    # Step 4: Load weights (with optional FP8 quantization during loading)
+    from musubi_tuner.utils.lora_utils import load_safetensors_with_lora_and_fp8
+
+    sd = load_safetensors_with_lora_and_fp8(
+        model_files=model_file,
+        lora_weights_list=None,
+        lora_multipliers=None,
+        fp8_optimization=fp8_scaled,
+        calc_device=torch.device(device),
+        move_to_device=True,
+        dit_weight_dtype=None if fp8_scaled else (dit_weight_dtype or dtype),
+        target_keys=ACESTEP_FP8_TARGET_KEYS if fp8_scaled else None,
+        exclude_keys=ACESTEP_FP8_EXCLUDE_KEYS if fp8_scaled else None,
     )
 
-    model = model.to(device)
+    # Step 5: Apply FP8 monkey patch (scaled mode only)
+    if fp8_scaled:
+        from musubi_tuner.modules.fp8_optimization_utils import apply_fp8_monkey_patch
+
+        apply_fp8_monkey_patch(model, sd, use_scaled_mm=False)
+
+    # Step 6: Load weights into model
+    model.load_state_dict(sd, strict=True, assign=True)
+    model.to(device)
     model.eval()
 
     # Extract config info
     config_dict = {
-        "is_turbo": getattr(model.config, "is_turbo", True),
-        "hidden_size": getattr(model.config, "hidden_size", 1024),
-        "timestep_mu": getattr(model.config, "timestep_mu", -0.4),
-        "timestep_sigma": getattr(model.config, "timestep_sigma", 1.0),
+        "is_turbo": getattr(config, "is_turbo", True),
+        "hidden_size": getattr(config, "hidden_size", 1024),
+        "timestep_mu": getattr(config, "timestep_mu", -0.4),
+        "timestep_sigma": getattr(config, "timestep_sigma", 1.0),
     }
 
     # Load silence_latent from separate .pt file (following official ACE-Step handler)

@@ -56,6 +56,10 @@ def compute_shifted_timesteps(num_steps: int, shift: float) -> list:
         timesteps.append(t)
     return timesteps
 
+# FP8 optimization target/exclude patterns (for load_safetensors_with_lora_and_fp8)
+ACESTEP_FP8_TARGET_KEYS = ["decoder"]
+ACESTEP_FP8_EXCLUDE_KEYS = ["encoder", "norm", "_emb", "null_condition", "embedding"]
+
 # Default LoRA configuration
 DEFAULT_LORA_TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj"]
 DEFAULT_LORA_RANK = 8
