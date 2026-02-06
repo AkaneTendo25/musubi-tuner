@@ -383,13 +383,13 @@ def main() -> None:
 
     ltx_mode = getattr(args, "ltx_mode", "video")
     audio_only = ltx_mode == "audio"
-    audio_video = ltx_mode == "av" or getattr(args, "ltx2_audio_video", False)
+    audio_video = ltx_mode == "av"
 
     # Auto-detect audio-only mode if all datasets are AudioDataset
     audio_datasets = [ds for ds in datasets if isinstance(ds, AudioDataset)]
     non_audio_datasets = [ds for ds in datasets if not isinstance(ds, AudioDataset)]
     if not audio_only and audio_datasets and not non_audio_datasets:
-        logger.info("All datasets are audio-only; automatically switching to --ltx_mode audio")
+        logger.info("All datasets are audio-only; automatically switching to --ltx2_mode audio")
         audio_only = True
 
 
@@ -434,7 +434,7 @@ def main() -> None:
 
     if audio_only:
         if getattr(args, "ltx2_checkpoint", None) is None:
-            raise ValueError("--ltx2_checkpoint is required when --ltx_mode audio is used")
+            raise ValueError("--ltx2_checkpoint is required when --ltx2_mode audio is used")
 
         audio_dtype = torch.float16 if args.ltx2_audio_dtype is None else str_to_dtype(args.ltx2_audio_dtype)
         dummy_dtype = audio_dtype if args.audio_dummy_video_dtype is None else str_to_dtype(args.audio_dummy_video_dtype)
@@ -524,24 +524,12 @@ def main() -> None:
 
 def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     parser.add_argument(
-        "--ltx2_mode",
+        "--ltx2_mode", "--ltx_mode",
         dest="ltx_mode",
         type=str,
         default="video",
         choices=["video", "av", "audio", "v", "a", "va"],
-        help="Caching modality (alias for --ltx_mode).",
-    )
-    parser.add_argument(
-        "--ltx_mode",
-        type=str,
-        default="video",
-        choices=["video", "av", "audio", "v", "a", "va"],
-        help="Caching modality. Use 'av' for AV, or 'audio' for audio-only datasets.",
-    )
-    parser.add_argument(
-        "--ltx2_audio_video",
-        action="store_true",
-        help="Enable audio-video caching. Video latents are the same; audio latents are cached separately.",
+        help="Caching modality: 'video' (default), 'av' for audio+video, 'audio' for audio-only.",
     )
     parser.add_argument("--ltx2_checkpoint", type=str, default=None, help="Path to LTX-2 checkpoint (.safetensors)")
     parser.add_argument("--vae_chunk_size", type=int, default=None, help="chunk size for CausalConv3d in VAE")
@@ -552,7 +540,7 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         type=str,
         default="video",
         choices=["video", "audio_files"],
-        help="Audio source for caching when --ltx2_audio_video is set.",
+        help="Audio source for caching when --ltx2_mode is 'av' or 'audio'.",
     )
     parser.add_argument(
         "--ltx2_audio_dir",

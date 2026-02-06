@@ -2,7 +2,6 @@ import math
 from functools import lru_cache
 
 import numpy
-import scipy
 import torch
 from musubi_tuner.ltx_2.components.protocols import SchedulerProtocol
 
@@ -108,6 +107,8 @@ class BetaScheduler(SchedulerProtocol):
         Returns:
             A tensor of sigmas.
         """
+        import scipy.stats  # lazy import - only needed for BetaScheduler
+
         model_sampling_sigmas = _precalculate_model_sampling_sigmas(self.shift, self.timesteps_length)
         total_timesteps = len(model_sampling_sigmas) - 1
         ts = 1 - numpy.linspace(0, 1, steps, endpoint=False)

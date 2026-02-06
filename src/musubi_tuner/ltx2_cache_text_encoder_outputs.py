@@ -179,7 +179,8 @@ def main() -> None:
         args.ltx_mode = short_map[args.ltx_mode]
 
     ltx_mode = getattr(args, "ltx_mode", "video")
-    audio_video = ltx_mode == "av" or getattr(args, "ltx2_audio_video", False)
+    # For audio-only or AV mode, we need the AV encoder to get audio encodings
+    audio_video = ltx_mode in ("av", "audio")
 
     device = torch.device(args.device if args.device is not None else ("cuda" if torch.cuda.is_available() else "cpu"))
 
@@ -225,8 +226,8 @@ def main() -> None:
     if getattr(args, "require_gemma_root", False):
         if args.gemma_root is None:
             raise ValueError("--gemma_root is required for LTX-2 Gemma text caching")
-    elif args.gemma_root is None and getattr(args, "gemma_safetensors", None) is None:
-        raise ValueError("--gemma_root (or --gemma_safetensors) is required for LTX-2 Gemma text caching")
+    elif args.gemma_root is None:
+        raise ValueError("--gemma_root is required for LTX-2 Gemma text caching")
     if args.ltx2_checkpoint is None and getattr(args, "ltx2_text_encoder_checkpoint", None) is None:
         raise ValueError("--ltx2_checkpoint is required for LTX-2 Gemma text caching")
     from musubi_tuner.ltx_2.loader.single_gpu_model_builder import SingleGPUModelBuilder
@@ -266,7 +267,6 @@ def main() -> None:
         model_sd_ops=key_ops,
         module_ops=module_ops_from_gemma_root(
             args.gemma_root,
-            gemma_weights_path=getattr(args, "gemma_safetensors", None),
             torch_dtype=dtype,
             load_in_8bit=bool(getattr(args, "gemma_load_in_8bit", False)),
             load_in_4bit=bool(getattr(args, "gemma_load_in_4bit", False)),
@@ -347,30 +347,12 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         help="Local directory containing Gemma weights/tokenizer (Gemma backend only)",
     )
     parser.add_argument(
-        "--gemma_safetensors",
-        type=str,
-        default=None,
-        help="Optional Gemma weights .safetensors file (tokenizer/config still from --gemma_root).",
-    )
-    parser.add_argument(
-        "--ltx2_mode",
+        "--ltx2_mode", "--ltx_mode",
         dest="ltx_mode",
         type=str,
         default="video",
         choices=["video", "av", "audio", "v", "a", "va"],
-        help="Caching modality (alias for --ltx_mode).",
-    )
-    parser.add_argument(
-        "--ltx_mode",
-        type=str,
-        default="video",
-        choices=["video", "av", "audio", "v", "a", "va"],
-        help="Caching modality. Use 'av' to cache audio-video prompt embeddings.",
-    )
-    parser.add_argument(
-        "--ltx2_audio_video",
-        action="store_true",
-        help="If set, cache audio-video prompt embeddings (alias for --ltx_mode av).",
+        help="Caching modality: 'video' (default), 'av' for audio+video, 'audio' for audio-only.",
     )
     parser.add_argument(
         "--mixed_precision",

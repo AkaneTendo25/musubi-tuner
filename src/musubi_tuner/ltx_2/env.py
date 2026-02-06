@@ -125,6 +125,10 @@ class LTX2Env:
     # recommended=False | old SHA=True | current=True
     swap_pinned: bool = False
 
+    # Swap RMSNorm/LayerNorm weights to CPU during block swap (VRAM saver).
+    # recommended=False | old SHA=False | current=False
+    swap_norms: bool = False
+
     # Log sublayer-level non-finite diagnostics.
     # recommended=False | old SHA=False | current=False
     nan_sublayer_diag: bool = False
@@ -241,6 +245,7 @@ def apply_ltx2_tweaks(args) -> None:
     args.swap_no_async_prefetch = not t.swap_async_prefetch
     args.swap_pinned = t.swap_pinned
     args.swap_no_pinned = not t.swap_pinned
+    args.swap_norms = t.swap_norms
 
     args.nan_sublayer_diag = t.nan_sublayer_diag
     args.nan_block_diag = t.nan_block_diag

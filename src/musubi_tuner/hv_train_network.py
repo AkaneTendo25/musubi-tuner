@@ -3324,12 +3324,6 @@ def setup_parser_common() -> argparse.ArgumentParser:
         " / ブロックスワッピングにピン留めメモリを使用する。これによりCPUとGPU間のデータ転送が高速化される可能性があるが、Windowsではより多くの共有GPUメモリを使用する。",
     )
     parser.add_argument(
-        "--swap_norms",
-        action="store_true",
-        help="Also swap RMSNorm/LayerNorm weights to CPU along with Linear weights during block swap. Saves more VRAM but increases CPU-GPU transfer overhead. LTX-2 only."
-        " / torch.compileの動的形状モード（デフォルト: None、autoと同じ動作）",
-    )
-    parser.add_argument(
         "--img_in_txt_in_offloading",
         action="store_true",
         help="offload img_in and txt_in to cpu / img_inとtxt_inをCPUにオフロードする",

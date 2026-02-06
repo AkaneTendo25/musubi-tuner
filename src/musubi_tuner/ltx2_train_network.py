@@ -35,6 +35,14 @@ from musubi_tuner.utils.safetensors_utils import MemoryEfficientSafeOpen
 from musubi_tuner.modules.fp8_optimization_utils import apply_fp8_monkey_patch  
 from musubi_tuner.utils.lora_utils import load_safetensors_with_lora_and_fp8    
 from musubi_tuner.ltx_2.env import apply_ltx2_tweaks
+from musubi_tuner.ltx2_inference import (
+    LTX2Inferencer,
+    InferenceConfig,
+    save_audio_wav,
+    mux_video_audio,
+    cleanup_cuda,
+    STAGE_2_DISTILLED_SIGMA_VALUES,
+)
 
 # LTX-2 latent normalization defaults.
 # These are identity stats (mean=0, std=1). We keep them as a safe fallback and
@@ -2056,7 +2064,6 @@ class LTX2NetworkTrainer(NetworkTrainer):
             model_sd_ops=key_ops,
             module_ops=module_ops_from_gemma_root(
                 args.gemma_root,
-                gemma_weights_path=getattr(args, "gemma_safetensors", None),
                 torch_dtype=text_encoder_dtype,
                 load_in_8bit=bool(getattr(args, "gemma_load_in_8bit", False)),
                 load_in_4bit=bool(getattr(args, "gemma_load_in_4bit", False)),
@@ -2221,6 +2228,34 @@ class LTX2NetworkTrainer(NetworkTrainer):
             logger.info("Sampling batch: unloaded text encoder after encoding all prompts")
             self._cleanup_cuda(accelerator.device)
 
+        # Check if using precached prompts (don't cleanup precached embeddings - they're reused)
+        use_precached = bool(getattr(args, "use_precached_sample_prompts", False)) or bool(
+            getattr(args, "precache_sample_prompts", False)
+        )
+
+        # Pre-load audio components only in NON-offloading mode (high VRAM)
+        # With offloading: audio will be loaded lazily during decode phase when transformer is on CPU
+        # Without offloading: pre-load to GPU since everything fits in VRAM
+        audio_decoder = None
+        vocoder = None
+        disable_audio_preview = bool(getattr(args, "sample_disable_audio", False))
+        audio_only_preview = bool(getattr(args, "sample_audio_only", False))
+        enable_audio_preview = (self._audio_video or audio_only_preview) and not disable_audio_preview
+        if not transformer_offloaded and enable_audio_preview and getattr(args, "ltx_mode", "video") in {"av", "audio"}:
+            # High VRAM mode: pre-load audio to GPU
+            audio_dtype = torch.bfloat16 if args.vae_dtype is None else model_utils.str_to_dtype(args.vae_dtype)
+            try:
+                audio_decoder, vocoder = self._load_audio_components(
+                    args,
+                    audio_dtype=audio_dtype,
+                    checkpoint_path=args.ltx2_checkpoint,
+                    device=accelerator.device,
+                )
+                logger.info("Sampling: pre-loaded audio decoder/vocoder to GPU (high VRAM mode)")
+            except Exception as exc:
+                logger.warning("Sampling audio decoder load failed; continuing without audio preview: %s", exc)
+                audio_decoder, vocoder = None, None
+
         if distributed_state.num_processes <= 1:
             # Batch encode all prompts upfront when offloading is enabled
             if transformer_offloaded:
@@ -2236,7 +2271,8 @@ class LTX2NetworkTrainer(NetworkTrainer):
                         vae_for_sampling = self._load_vae_impl(args, vae_dtype=vae_dtype, vae_path=args.vae)
                         ensure_transformer_on_device()
                         self.sample_image_inference(
-                            accelerator, args, transformer, dit_dtype, vae_for_sampling, save_dir, sample_parameter, epoch, steps
+                            accelerator, args, transformer, dit_dtype, vae_for_sampling, save_dir, sample_parameter, epoch, steps,
+                            audio_decoder=audio_decoder, vocoder=vocoder,
                         )
                         offload_transformer_if_needed()
                         vae_for_sampling.to_device("cpu")
@@ -2244,13 +2280,14 @@ class LTX2NetworkTrainer(NetworkTrainer):
                         self._cleanup_cuda(accelerator.device)
                     else:
                         self.sample_image_inference(
-                            accelerator, args, transformer, dit_dtype, vae, save_dir, sample_parameter, epoch, steps
+                            accelerator, args, transformer, dit_dtype, vae, save_dir, sample_parameter, epoch, steps,
+                            audio_decoder=audio_decoder, vocoder=vocoder,
                         )
                     clean_memory_on_device(accelerator.device)
                     self._cleanup_cuda(accelerator.device)
 
-            # Cleanup embeddings after all samples are done
-            if transformer_offloaded:
+            # Cleanup embeddings after all samples are done (but NOT if precached - they're reused)
+            if transformer_offloaded and not use_precached:
                 for sample_parameter in sample_parameters:
                     cleanup_embeddings(sample_parameter)
         else:
@@ -2284,6 +2321,8 @@ class LTX2NetworkTrainer(NetworkTrainer):
                                 sample_parameter,
                                 epoch,
                                 steps,
+                                audio_decoder=audio_decoder,
+                                vocoder=vocoder,
                             )
                             offload_transformer_if_needed()
                             vae_for_sampling.to_device("cpu")
@@ -2291,12 +2330,13 @@ class LTX2NetworkTrainer(NetworkTrainer):
                             self._cleanup_cuda(accelerator.device)
                         else:
                             self.sample_image_inference(
-                                accelerator, args, transformer, dit_dtype, vae, save_dir, sample_parameter, epoch, steps
+                                accelerator, args, transformer, dit_dtype, vae, save_dir, sample_parameter, epoch, steps,
+                                audio_decoder=audio_decoder, vocoder=vocoder,
                             )
                         self._cleanup_cuda(accelerator.device)
 
-                    # Cleanup embeddings after all samples for this process
-                    if transformer_offloaded:
+                    # Cleanup embeddings after all samples for this process (but NOT if precached)
+                    if transformer_offloaded and not use_precached:
                         for sample_parameter in my_sample_params:
                             cleanup_embeddings(sample_parameter)
 
@@ -2329,6 +2369,8 @@ class LTX2NetworkTrainer(NetworkTrainer):
         sample_parameter: Dict,
         epoch,
         steps,
+        audio_decoder=None,
+        vocoder=None,
     ):
         """LTX-2-specific sampling with proper frame/size rounding."""
         lora_count = self._ensure_lora_enabled_for_sampling(transformer)
@@ -2346,31 +2388,35 @@ class LTX2NetworkTrainer(NetworkTrainer):
             vae = self._load_vae_impl(args, vae_dtype=vae_dtype, vae_path=args.vae)
             loaded_vae = True
 
-        audio_decoder = None
-        vocoder = None
+        # Use pre-loaded audio components if provided, otherwise load here (fallback for non-offload mode)
         loaded_audio = False
         disable_audio_preview = bool(getattr(args, "sample_disable_audio", False))
         use_audio_subprocess = False
         audio_only_preview = bool(getattr(args, "sample_audio_only", False))
         if audio_only_preview and getattr(args, "ltx_mode", "video") not in {"av", "audio"}:
-            raise ValueError("--sample_audio_only requires --ltx_mode av or audio")
+            raise ValueError("--sample_audio_only requires --ltx2_mode av or audio")
         enable_audio_preview = (self._audio_video or audio_only_preview) and not disable_audio_preview
-        if enable_audio_preview and getattr(args, "ltx_mode", "video") in {"av", "audio"}:
-            # Align with LTX-v2 audio decode path (bf16 by default).
-            audio_dtype = torch.bfloat16 if args.vae_dtype is None else model_utils.str_to_dtype(args.vae_dtype)
-            audio_device = accelerator.device
-            try:
-                audio_decoder, vocoder = self._load_audio_components(
-                    args,
-                    audio_dtype=audio_dtype,
-                    checkpoint_path=args.ltx2_checkpoint,
-                    device=audio_device,
-                )
-                loaded_audio = True
-            except Exception as exc:
-                logger.warning("Sampling audio decoder load failed; continuing without audio preview: %s", exc)
-                audio_decoder, vocoder = None, None
-                loaded_audio = False
+
+        # Only load audio components here if NOT in offloading mode and not pre-loaded
+        # In offloading mode, audio is loaded lazily during decode phase (after transformer is on CPU)
+        sample_with_offloading = bool(getattr(args, "sample_with_offloading", False))
+        if audio_decoder is None and vocoder is None and enable_audio_preview and getattr(args, "ltx_mode", "video") in {"av", "audio"}:
+            if not sample_with_offloading:
+                # High VRAM mode: load audio to GPU now (everything fits)
+                audio_dtype = torch.bfloat16 if args.vae_dtype is None else model_utils.str_to_dtype(args.vae_dtype)
+                try:
+                    audio_decoder, vocoder = self._load_audio_components(
+                        args,
+                        audio_dtype=audio_dtype,
+                        checkpoint_path=args.ltx2_checkpoint,
+                        device=accelerator.device,
+                    )
+                    loaded_audio = True
+                except Exception as exc:
+                    logger.warning("Sampling audio decoder load failed; continuing without audio preview: %s", exc)
+                    audio_decoder, vocoder = None, None
+                    loaded_audio = False
+            # else: offloading mode - audio will be loaded lazily during decode phase
 
         sample_steps = sample_parameter.get("sample_steps", 20)
         width = sample_parameter.get("width", 768)
@@ -2451,33 +2497,69 @@ class LTX2NetworkTrainer(NetworkTrainer):
         )
         wav_path = os.path.join(save_dir, save_path) + ".wav"
 
-        video, audio_waveform = self.do_inference(
-            accelerator,
-            args,
-            sample_parameter,
-            vae,
-            dit_dtype,
-            transformer,
-            discrete_flow_shift,
-            sample_steps,
-            width,
-            height,
-            frame_count,
-            generator,
-            do_classifier_free_guidance,
-            guidance_scale,
-            cfg_scale,
-            audio_decoder=audio_decoder,
-            vocoder=vocoder,
-            offload_transformer_for_decode=bool(getattr(args, "sample_with_offloading", False)),
-            transformer_offload_device=torch.device("cpu"),
-            restore_transformer_device=True,
-            audio_output_path=wav_path if enable_audio_preview else None,
-            use_audio_subprocess=use_audio_subprocess,
-            enable_audio_preview=enable_audio_preview,
-            decode_video=not audio_only_preview,
-            audio_only=audio_only_preview,
-        )
+        # Check if two-stage inference is enabled
+        use_two_stage = bool(getattr(args, "sample_two_stage", False))
+        spatial_upsampler_path = getattr(args, "spatial_upsampler_path", None)
+        distilled_lora_path = getattr(args, "distilled_lora_path", None)
+
+        if use_two_stage:
+            if not spatial_upsampler_path:
+                logger.warning("Two-stage inference requested but --spatial_upsampler_path not set; falling back to single-stage")
+                use_two_stage = False
+
+        if use_two_stage:
+            video, audio_waveform = self.do_inference_two_stage(
+                accelerator=accelerator,
+                args=args,
+                sample_parameter=sample_parameter,
+                vae=vae,
+                dit_dtype=dit_dtype,
+                transformer=transformer,
+                width=width,
+                height=height,
+                frame_count=frame_count,
+                sample_steps=sample_steps,
+                guidance_scale=guidance_scale,
+                cfg_scale=cfg_scale,
+                seed=seed,
+                generator=generator,
+                spatial_upsampler_path=spatial_upsampler_path,
+                distilled_lora_path=distilled_lora_path,
+                stage2_steps=int(getattr(args, "sample_stage2_steps", 3)),
+                audio_decoder=audio_decoder,
+                vocoder=vocoder,
+                enable_audio_preview=enable_audio_preview,
+                decode_video=not audio_only_preview,
+                audio_only=audio_only_preview,
+            )
+        else:
+            video, audio_waveform = self.do_inference(
+                accelerator,
+                args,
+                sample_parameter,
+                vae,
+                dit_dtype,
+                transformer,
+                discrete_flow_shift,
+                sample_steps,
+                width,
+                height,
+                frame_count,
+                generator,
+                do_classifier_free_guidance,
+                guidance_scale,
+                cfg_scale,
+                audio_decoder=audio_decoder,
+                vocoder=vocoder,
+                offload_transformer_for_decode=bool(getattr(args, "sample_with_offloading", False)),
+                transformer_offload_device=torch.device("cpu"),
+                restore_transformer_device=True,
+                audio_output_path=wav_path if enable_audio_preview else None,
+                use_audio_subprocess=use_audio_subprocess,
+                enable_audio_preview=enable_audio_preview,
+                decode_video=not audio_only_preview,
+                audio_only=audio_only_preview,
+            )
 
         if not has_self_ref_orig_mod:
             transformer.train(was_train)
@@ -2679,11 +2761,10 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 )
                 prompt_embeds = prompt_embeds[..., : expected_embed_dim]
 
-        # Setup LTX-2 specific scheduler and stepper
-        from musubi_tuner.ltx_2.model.ltx2_scheduler import LTX2Scheduler, EulerDiffusionStep, X0PredictionWrapper
-        
-        ltx2_scheduler = LTX2Scheduler(shift=1.0)  # LTX-2 uses shift=1.0 (no shift)
-        sigmas = ltx2_scheduler.execute(steps=sample_steps).to(device=transformer_device, dtype=torch.float32)
+        # Setup LTX-2 specific stepper
+        from musubi_tuner.ltx_2.model.ltx2_scheduler import EulerDiffusionStep, X0PredictionWrapper
+        from musubi_tuner.ltx_2.components.schedulers import LTX2Scheduler
+
         stepper = EulerDiffusionStep()
 
         # Calculate latent dimensions
@@ -2701,6 +2782,10 @@ class LTX2NetworkTrainer(NetworkTrainer):
             device=transformer_device,
             generator=generator,
         )
+
+        # Setup scheduler - official pipeline does NOT pass latent, uses default MAX_SHIFT_ANCHOR=4096
+        ltx2_scheduler = LTX2Scheduler()
+        sigmas = ltx2_scheduler.execute(steps=sample_steps).to(device=transformer_device, dtype=torch.float32)
 
         audio_latents = None
         if enable_audio_preview:
@@ -2777,26 +2862,35 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 else:
                     video_pred = model_pred
 
-                # Apply guidance if needed
-                if do_classifier_free_guidance:
-                    # Use cfg_scale for CFG when available, otherwise fall back to guidance_scale
-                    effective_cfg_scale = cfg_scale if cfg_scale is not None else guidance_scale
-                    noise_uncond, noise_cond = video_pred.chunk(2)
-                    video_pred = noise_uncond + effective_cfg_scale * (noise_cond - noise_uncond)
-                    if audio_pred is not None:
-                        audio_uncond, audio_cond = audio_pred.chunk(2)
-                        audio_pred = audio_uncond + effective_cfg_scale * (audio_cond - audio_uncond)
-
-                # Convert velocity prediction to x0 (denoised sample) using X0PredictionWrapper
+                # IMPORTANT: Convert velocity to x0 FIRST, then apply CFG to x0
+                # This matches the official LTX-2 pipeline where X0Model wraps velocity model
+                # and CFG is applied to denoised (x0) outputs, not velocity predictions
                 video_pred = video_pred.to(dtype=latents.dtype)
-                video_x0 = X0PredictionWrapper.velocity_to_x0(latents, video_pred, sigma.item())
-                
+
+                if do_classifier_free_guidance:
+                    effective_cfg_scale = cfg_scale if cfg_scale is not None else guidance_scale
+                    # Split velocity predictions for CFG
+                    vel_uncond, vel_cond = video_pred.chunk(2)
+                    # Convert each to x0
+                    x0_uncond = X0PredictionWrapper.velocity_to_x0(latents, vel_uncond, sigma.item())
+                    x0_cond = X0PredictionWrapper.velocity_to_x0(latents, vel_cond, sigma.item())
+                    # Apply CFG to x0 (official formula)
+                    video_x0 = x0_uncond + effective_cfg_scale * (x0_cond - x0_uncond)
+                else:
+                    video_x0 = X0PredictionWrapper.velocity_to_x0(latents, video_pred, sigma.item())
+
                 # Euler step to next latent
                 latents = stepper.step(latents, video_x0, sigmas, step_idx)
-                
+
                 if audio_pred is not None and audio_latents is not None:
                     audio_pred = audio_pred.to(dtype=audio_latents.dtype)
-                    audio_x0 = X0PredictionWrapper.velocity_to_x0(audio_latents, audio_pred, sigma.item())
+                    if do_classifier_free_guidance:
+                        aud_vel_uncond, aud_vel_cond = audio_pred.chunk(2)
+                        aud_x0_uncond = X0PredictionWrapper.velocity_to_x0(audio_latents, aud_vel_uncond, sigma.item())
+                        aud_x0_cond = X0PredictionWrapper.velocity_to_x0(audio_latents, aud_vel_cond, sigma.item())
+                        audio_x0 = aud_x0_uncond + effective_cfg_scale * (aud_x0_cond - aud_x0_uncond)
+                    else:
+                        audio_x0 = X0PredictionWrapper.velocity_to_x0(audio_latents, audio_pred, sigma.item())
                     audio_latents = stepper.step(audio_latents, audio_x0, sigmas, step_idx)
 
         if offload_transformer_for_decode and transformer_device != transformer_offload_device:
@@ -2854,7 +2948,24 @@ class LTX2NetworkTrainer(NetworkTrainer):
                             video = video.unsqueeze(0)  # [1, C, T, H, W]
 
         audio_waveform = None
+        loaded_audio_lazily = False
         if audio_latents is not None:
+            # Lazy-load audio components in offloading mode (they weren't pre-loaded to save RAM)
+            if audio_decoder is None and vocoder is None and offload_transformer_for_decode:
+                # Transformer is on CPU now, GPU has room for audio decoder
+                audio_dtype = torch.bfloat16 if args.vae_dtype is None else model_utils.str_to_dtype(args.vae_dtype)
+                try:
+                    logger.info("Sampling offload: lazy-loading audio decoder/vocoder to GPU")
+                    audio_decoder, vocoder = self._load_audio_components(
+                        args,
+                        audio_dtype=audio_dtype,
+                        checkpoint_path=args.ltx2_checkpoint,
+                        device=transformer_device,
+                    )
+                    loaded_audio_lazily = True
+                except Exception as exc:
+                    logger.warning("Sampling audio decoder load failed; skipping audio decode: %s", exc)
+
             if audio_decoder is not None and vocoder is not None:
                 if offload_transformer_for_decode:
                     logger.info("Sampling offload: moving VAE back to CPU before audio decode")
@@ -2896,6 +3007,123 @@ class LTX2NetworkTrainer(NetworkTrainer):
 
         return video, audio_waveform
 
+    def do_inference_two_stage(
+        self,
+        accelerator: Accelerator,
+        args: argparse.Namespace,
+        sample_parameter: Dict,
+        vae,
+        dit_dtype: torch.dtype,
+        transformer,
+        width: int,
+        height: int,
+        frame_count: int,
+        sample_steps: int,
+        guidance_scale: float,
+        cfg_scale: Optional[float],
+        seed: Optional[int],
+        generator: torch.Generator,
+        spatial_upsampler_path: str,
+        distilled_lora_path: Optional[str] = None,
+        stage2_steps: int = 4,
+        audio_decoder: Optional[torch.nn.Module] = None,
+        vocoder: Optional[torch.nn.Module] = None,
+        enable_audio_preview: bool = False,
+        decode_video: bool = True,
+        audio_only: bool = False,
+    ):
+        """Generate sample video using two-stage inference (half-res + upsample + refine)."""
+        device = accelerator.device
+
+        # Create inferencer
+        inferencer = LTX2Inferencer(
+            transformer=transformer,
+            vae=vae,
+            device=device,
+            dit_dtype=dit_dtype,
+            audio_video_mode=self._audio_video,
+        )
+
+        # Load upsampler
+        inferencer.load_spatial_upsampler(spatial_upsampler_path, device=torch.device("cpu"))
+
+        # Load distilled LoRA if provided
+        if distilled_lora_path:
+            inferencer.load_distilled_lora(distilled_lora_path)
+
+        # Get prompt embeddings from sample_parameter
+        prompt_embeds = sample_parameter.get("prompt_embeds")
+        prompt_mask = sample_parameter.get("prompt_attention_mask")
+        negative_embeds = sample_parameter.get("negative_prompt_embeds")
+        negative_mask = sample_parameter.get("negative_prompt_attention_mask")
+
+        # Build audio config if needed
+        audio_config = None
+        if enable_audio_preview and self._audio_video:
+            audio_config = self._get_audio_preview_config(args, transformer)
+
+        # Prepare tiled VAE config
+        tiled_vae_config = None
+        if getattr(args, "sample_tiled_vae", False):
+            tiled_vae_config = {
+                "tile_size": getattr(args, "sample_vae_tile_size", 512),
+                "tile_overlap": getattr(args, "sample_vae_tile_overlap", 64),
+                "temporal_tile_size": getattr(args, "sample_vae_temporal_tile_size", 0) or 9999,
+                "temporal_tile_overlap": getattr(args, "sample_vae_temporal_tile_overlap", 8),
+            }
+
+        # Build inference config
+        config = InferenceConfig(
+            prompt=sample_parameter.get("prompt", ""),
+            negative_prompt=sample_parameter.get("negative_prompt"),
+            width=width,
+            height=height,
+            frame_count=frame_count,
+            frame_rate=sample_parameter.get("frame_rate", 25.0),
+            sample_steps=sample_steps,
+            guidance_scale=guidance_scale,
+            cfg_scale=cfg_scale,
+            seed=seed,
+            two_stage=True,
+            spatial_upsampler_path=spatial_upsampler_path,
+            distilled_lora_path=distilled_lora_path,
+            stage2_steps=stage2_steps,
+            enable_audio=enable_audio_preview,
+            audio_only=audio_only,
+            prompt_embeds=prompt_embeds,
+            prompt_attention_mask=prompt_mask,
+            negative_prompt_embeds=negative_embeds,
+            negative_prompt_attention_mask=negative_mask,
+            offload_between_stages=bool(getattr(args, "sample_with_offloading", False)),
+            extra={"audio_config": audio_config} if audio_config else {},
+        )
+
+        # Disable flash attention for sampling if requested
+        attention_overrides = []
+        if getattr(args, "sample_disable_flash_attn", True):
+            from musubi_tuner.ltx_2.model.transformer.attention import AttentionFunction
+            logger.info("Two-stage sampling: disabling FlashAttention for preview")
+            attention_overrides = self._override_attention_function(
+                transformer, AttentionFunction.PYTORCH
+            )
+
+        try:
+            # Run two-stage inference
+            video, audio_waveform = inferencer.generate(
+                config=config,
+                audio_decoder=audio_decoder,
+                vocoder=vocoder,
+                decode_video=decode_video,
+                use_tiled_vae=bool(tiled_vae_config),
+                tiled_vae_config=tiled_vae_config,
+            )
+        finally:
+            # Restore attention settings
+            if attention_overrides:
+                self._restore_attention_function(attention_overrides)
+
+        return video, audio_waveform
+
 
 # ======== Argument parser setup ========
 
@@ -2914,12 +3142,6 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         type=str,
         default=None,
         help="Local directory containing Gemma weights/tokenizer (used for sample prompts)",
-    )
-    parser.add_argument(
-        "--gemma_safetensors",
-        type=str,
-        default=None,
-        help="Optional Gemma weights .safetensors file for sampling (tokenizer/config still from --gemma_root).",
     )
     parser.add_argument(
         "--gemma_load_in_8bit",
@@ -2945,15 +3167,8 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
     )
 
     parser.add_argument(
-        "--ltx2_mode",
+        "--ltx2_mode", "--ltx_mode",
         dest="ltx_mode",
-        type=str,
-        default="video",
-        choices=["video", "av", "audio", "v", "a", "va"],
-        help="Training modality (alias for --ltx_mode).",
-    )
-    parser.add_argument(
-        "--ltx_mode",
         type=str,
         default="video",
         choices=["video", "av", "audio", "v", "a", "va"],
@@ -3100,6 +3315,31 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         "--sample_merge_audio",
         action="store_true",
         help="Mux sample audio into the sample video (outputs *_av.mp4).",
+    )
+
+    # Two-stage inference arguments
+    parser.add_argument(
+        "--sample_two_stage",
+        action="store_true",
+        help="Enable two-stage inference: generate at half resolution, then upsample and refine.",
+    )
+    parser.add_argument(
+        "--spatial_upsampler_path",
+        type=str,
+        default=None,
+        help="Path to spatial upsampler model (ltx-2-spatial-upscaler-x2-1.0.safetensors) for two-stage inference.",
+    )
+    parser.add_argument(
+        "--distilled_lora_path",
+        type=str,
+        default=None,
+        help="Path to distilled LoRA (ltx-2-19b-distilled-lora-384.safetensors) for two-stage refinement.",
+    )
+    parser.add_argument(
+        "--sample_stage2_steps",
+        type=int,
+        default=3,
+        help="Number of denoising steps for stage 2 refinement (default: 3, official uses 3 steps with 4 sigma values).",
     )
 
     parser.add_argument(
