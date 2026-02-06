@@ -7,6 +7,12 @@ This guide details the three-step process for training LTX-2 LoRA models:
 2. **Caching Text Encoder Outputs** (Prompts)
 3. **Training**
 
+## Installation
+
+See the [Installation Guide](https://github.com/AkaneTendo25/musubi-tuner/discussions/19) for detailed setup instructions (Windows/Linux, dependencies, flash-attn, troubleshooting).
+
+---
+
 ## Supported Dataset Types
 
 | Mode | Dataset Type | Notes |
@@ -249,6 +255,111 @@ Two-stage inference generates at half resolution, then upsamples and refines for
 
 ---
 
+## Dataset Configuration
+
+The dataset config is a TOML file with `[general]` defaults and `[[datasets]]` entries.
+
+### Video Dataset Options
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `video_directory` | string | — | Path to video/image directory |
+| `video_jsonl_file` | string | — | Path to JSONL metadata file |
+| `resolution` | int or [int, int] | [960, 544] | Target resolution |
+| `target_frames` | [int] | [1] | List of target frame counts |
+| `frame_extraction` | string | `"head"` | Frame extraction mode |
+| `max_frames` | int | 129 | Maximum number of frames |
+| `source_fps` | float | auto-detected | Source video FPS. Auto-detected from video container metadata when not set. Use this to override auto-detection. |
+| `target_fps` | float | 24.0 | Target training FPS. Frames are resampled to this rate. When audio is present and the source video has a different FPS, the audio waveform is automatically time-stretched (pitch-preserving) to match the target video duration. |
+| `batch_size` | int | 1 | Batch size |
+| `num_repeats` | int | 1 | Dataset repetitions |
+| `enable_bucket` | bool | false | Enable resolution bucketing |
+| `cache_directory` | string | — | Latent cache output directory |
+| `separate_audio_buckets` | bool | false | Keep audio/non-audio items in separate batches |
+
+### Example TOML
+
+```toml
+[general]
+resolution = [768, 512]
+caption_extension = ".txt"
+batch_size = 1
+enable_bucket = true
+cache_directory = "cache"
+
+[[datasets]]
+video_directory = "videos"
+target_frames = [1, 17, 33, 49]
+target_fps = 24    # optional, defaults to 24
+```
+
+### Frame Rate (FPS) Handling
+
+LTX-2 was trained on 24fps video. During latent caching, the source FPS is **auto-detected** from each video's container metadata and frames are resampled to `target_fps` (default: 24). This ensures the model sees video at the correct temporal rate regardless of the source material.
+
+#### How It Works
+
+1. For each video file, the source FPS is read from the container metadata (`average_rate` or `base_rate`).
+2. If the source FPS differs from `target_fps` by more than 1%, frames are resampled (dropped) to match `target_fps`.
+3. If the source and target FPS are within 1% of each other (e.g., 23.976 vs 24), no resampling is done — this avoids spurious frame drops from NTSC rounding (23.976, 29.97, 59.94, etc.).
+4. If audio is present (`--ltx2_mode av`), the audio waveform is automatically time-stretched (pitch-preserving) to match the resampled video duration.
+
+#### Common Scenarios
+
+**Default — no FPS config needed (recommended for most users):**
+```toml
+[[datasets]]
+video_directory = "videos"
+target_frames = [1, 17, 33, 49]
+# source_fps: auto-detected per video
+# target_fps: defaults to 24
+```
+A 60fps video produces 240 frames per 10 seconds (not 600). A 30fps video produces 240 frames per 10 seconds (not 300). A 24fps video is passed through as-is. Mixed-FPS datasets work correctly — each video is resampled independently.
+
+**Training at a non-standard frame rate (e.g., 60fps):**
+```toml
+[[datasets]]
+video_directory = "videos_60fps"
+target_frames = [1, 17, 33, 49]
+target_fps = 60
+```
+Set `target_fps` to the desired training rate. Videos at 60fps (or 59.94fps) pass through without resampling. Videos at other frame rates are resampled to 60fps. Note: LTX-2 was trained on 24fps content, so non-24fps training is experimental.
+
+**Overriding auto-detection (e.g., variable frame rate videos):**
+```toml
+[[datasets]]
+video_directory = "videos"
+target_frames = [1, 17, 33, 49]
+source_fps = 30
+```
+If auto-detection gives wrong results (common with variable frame rate / VFR recordings from phones), set `source_fps` explicitly. This applies to **all** videos in that dataset entry, so group videos by FPS into separate `[[datasets]]` blocks if needed.
+
+**Image directories:**
+
+Image directories have no FPS metadata. No resampling is applied — all images are loaded as individual frames regardless of `target_fps`.
+
+#### Log Messages
+
+During latent caching, log messages confirm what's happening for each video:
+```
+Auto-detected source FPS: 60.00 for my_video.mp4
+Resampling my_video.mp4: 60.00 FPS -> 24.00 FPS
+```
+If you see **no** "Resampling" line for a video, it means source and target FPS matched (within 1%) and all frames were kept as-is. If you see unexpected frame counts in your cached latents, check these log lines first.
+
+#### Quick Reference
+
+| Your situation | What to set | What happens |
+|---|---|---|
+| Mixed FPS dataset, want 24fps training | Nothing (defaults work) | Each video auto-detected, resampled to 24fps |
+| All videos are 24fps | Nothing | Auto-detected as 24fps, no resampling (within 1%) |
+| All videos are 60fps, want 60fps training | `target_fps = 60` | Auto-detected as 60fps, no resampling |
+| All videos are 60fps, want 24fps training | Nothing | Auto-detected as 60fps, resampled to 24fps |
+| VFR videos with wrong detection | `source_fps = 30` (your actual FPS) | Overrides auto-detection |
+| Image directory | Nothing | No FPS concept, all images loaded |
+
+---
+
 ## Directory Structure
 
 ### Raw Dataset Layout (Example)
@@ -282,4 +393,14 @@ cache_directory/
 | Audio caching fails | torchaudio missing | Install torchaudio before running `ltx2_cache_latents.py` |
 | Sampling OOM | VAE decode too large | Enable `--sample_tiled_vae` or reduce `--sample_vae_temporal_tile_size` |
 | Crash with block swap (esp. RTX 5090) | `--use_pinned_memory_for_block_swap` bug | Remove `--use_pinned_memory_for_block_swap` from training arguments |
+| Wrong frame count in cached latents | Auto-detected FPS incorrect (e.g., VFR video) | Set `source_fps` explicitly in TOML config to override auto-detection |
+| Too few frames from high-FPS video | FPS resampling working correctly (e.g., 60fps→24fps = 40% of frames) | This is expected behavior. Set `target_fps = 60` if you want to keep all frames |
+| Audio/video out of sync after caching | Source FPS mismatch causing wrong time-stretch | Check "Auto-detected source FPS" log line; set `source_fps` explicitly if wrong |
+
+---
+
+## Useful Links
+
+- [Installation Guide](https://github.com/AkaneTendo25/musubi-tuner/discussions/19) — Setup instructions, dependencies, flash-attn, troubleshooting
+- [Optimizers Guide](https://github.com/AkaneTendo25/musubi-tuner/discussions/21) — Optimizer comparison, recommended settings, memory usage tips
 

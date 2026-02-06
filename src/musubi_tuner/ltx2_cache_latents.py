@@ -197,6 +197,7 @@ def encode_and_save_audio_cache(
     *,
     audio_path: str,
     dtype: torch.dtype,
+    target_fps: float = 24.0,
 ) -> None:
     try:
         import torchaudio
@@ -303,6 +304,18 @@ def encode_and_save_audio_cache(
         if end_sample > start_sample:
             waveform = waveform[:, start_sample:end_sample]
 
+    # Pitch-preserving time stretch when source audio duration doesn't match target video duration
+    frame_count = getattr(item_info, "frame_count", None)
+    if isinstance(frame_count, int) and frame_count > 0 and waveform.shape[-1] > 0:
+        expected_duration = float(frame_count) / max(float(target_fps), 1.0)
+        actual_duration = float(waveform.shape[-1]) / float(sample_rate)
+        if actual_duration > 0 and abs(actual_duration - expected_duration) / actual_duration > 0.01:
+            from musubi_tuner.audio_utils import time_stretch_preserve_pitch
+
+            target_samples = int(expected_duration * sample_rate)
+            if target_samples > 0:
+                waveform = time_stretch_preserve_pitch(waveform, sample_rate, target_samples)
+
     waveform = waveform.unsqueeze(0)
     encoder_param = next(encoder.parameters())
     device = encoder_param.device
@@ -323,7 +336,7 @@ def encode_and_save_audio_cache(
         expected_steps = _expected_audio_latent_length_for_item(
             item_info,
             encoder,
-            fps=float(VideoDataset.TARGET_FPS_LTX2),
+            fps=target_fps,
         )
         if expected_steps is not None:
             latents = _align_audio_latents_to_video(latents, expected_steps)
@@ -489,6 +502,7 @@ def main() -> None:
         for ds in datasets:
             if not isinstance(ds, (VideoDataset, AudioDataset)):
                 continue
+            ds_target_fps = getattr(ds, "target_fps", VideoDataset.TARGET_FPS_LTX2)
             num_workers = args.num_workers if args.num_workers is not None else max(1, (os.cpu_count() or 2) - 1)
             for _bucket_key, batch in ds.retrieve_latent_cache_batches(num_workers):
                 for item_info in batch:
@@ -511,6 +525,7 @@ def main() -> None:
                             item_info,
                             audio_path=audio_path,
                             dtype=audio_dtype,
+                            target_fps=float(ds_target_fps),
                         )
                     except Exception as e:
                         logger.warning(

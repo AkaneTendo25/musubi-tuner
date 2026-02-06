@@ -811,7 +811,26 @@ def load_video(
     """
     bucket_reso: if given, resize the video to the bucket resolution, (width, height)
     """
-    if source_fps is None or target_fps is None:
+    # auto-detect source FPS from video container when not explicitly set
+    if source_fps is None and target_fps is not None and os.path.isfile(video_path):
+        try:
+            with av.open(video_path) as probe_container:
+                stream = probe_container.streams.video[0]
+                detected = stream.average_rate or stream.base_rate
+                if detected and float(detected) > 0:
+                    source_fps = float(detected)
+                    logger.info(f"Auto-detected source FPS: {source_fps:.2f} for {os.path.basename(video_path)}")
+        except Exception:
+            pass  # detection failed, fall through to no-conversion branch
+
+    # skip resampling when source and target FPS are nearly equal (within 1%)
+    needs_resampling = (
+        source_fps is not None
+        and target_fps is not None
+        and abs(source_fps - target_fps) / max(source_fps, target_fps) > 0.01
+    )
+
+    if not needs_resampling:
         if os.path.isfile(video_path):
             container = av.open(video_path)
             video = []
@@ -855,6 +874,7 @@ def load_video(
                 video.append(image)
     else:
         # drop frames to match the target fps TODO commonize this code with the above if this works
+        logger.info(f"Resampling {os.path.basename(video_path)}: {source_fps:.2f} FPS -> {target_fps:.2f} FPS")
         frame_index_delta = target_fps / source_fps  # example: 16 / 30 = 0.5333
         if os.path.isfile(video_path):
             container = av.open(video_path)
@@ -930,6 +950,7 @@ class BucketBatchManager:
         batch_size: int,
         num_timestep_buckets: Optional[int] = None,
         architecture: Optional[str] = None,
+        target_fps: float = 24.0,
     ):
         self.batch_size = batch_size
         self.buckets = bucketed_item_info
@@ -938,6 +959,7 @@ class BucketBatchManager:
         self.num_timestep_buckets = num_timestep_buckets
         self.timestep_pool = None
         self.architecture = architecture
+        self.target_fps = target_fps
 
         # indices for enumerating batches. each batch is reso + batch_idx. reso is (width, height) or (width, height, frames)
         self.bucket_batch_indices: list[tuple[tuple[Any], int]] = []
@@ -1162,7 +1184,7 @@ class BucketBatchManager:
                     "num_frames": torch.full((bsz,), frames, dtype=torch.int32),
                     "height": torch.full((bsz,), height, dtype=torch.int32),
                     "width": torch.full((bsz,), width, dtype=torch.int32),
-                    "fps": torch.full((bsz,), 24.0, dtype=torch.float32),
+                    "fps": torch.full((bsz,), self.target_fps, dtype=torch.float32),
                 }
 
             ref_latents = batch_tensor_data.get("ref_latents")
@@ -1173,7 +1195,7 @@ class BucketBatchManager:
                     "num_frames": torch.full((bsz,), frames, dtype=torch.int32),
                     "height": torch.full((bsz,), height, dtype=torch.int32),
                     "width": torch.full((bsz,), width, dtype=torch.int32),
-                    "fps": torch.full((bsz,), 24.0, dtype=torch.float32),
+                    "fps": torch.full((bsz,), self.target_fps, dtype=torch.float32),
                 }
 
             audio_latents_tensor = batch_tensor_data.get("audio_latents")
@@ -2703,6 +2725,7 @@ class VideoDataset(BaseDataset):
         target_frames: Optional[list[int]] = None,
         max_frames: Optional[int] = None,
         source_fps: Optional[float] = None,
+        target_fps: Optional[float] = None,
         video_directory: Optional[str] = None,
         video_jsonl_file: Optional[str] = None,
         control_directory: Optional[str] = None,
@@ -2742,7 +2765,7 @@ class VideoDataset(BaseDataset):
         elif self.architecture == ARCHITECTURE_WAN:
             self.target_fps = VideoDataset.TARGET_FPS_WAN
         elif self.architecture == ARCHITECTURE_LTX2:
-            self.target_fps = VideoDataset.TARGET_FPS_LTX2
+            self.target_fps = target_fps if target_fps is not None else VideoDataset.TARGET_FPS_LTX2
         elif self.architecture == ARCHITECTURE_FRAMEPACK:
             self.target_fps = VideoDataset.TARGET_FPS_FRAMEPACK
         elif self.architecture == ARCHITECTURE_FLUX_KONTEXT:
@@ -2810,10 +2833,7 @@ class VideoDataset(BaseDataset):
     def retrieve_latent_cache_batches(self, num_workers: int):
         buckset_selector = BucketSelector(self.resolution, architecture=self.architecture)
         self.datasource.set_bucket_selector(buckset_selector)
-        if self.source_fps is not None:
-            self.datasource.set_source_and_target_fps(self.source_fps, self.target_fps)
-        else:
-            self.datasource.set_source_and_target_fps(None, None)  # no conversion
+        self.datasource.set_source_and_target_fps(self.source_fps, self.target_fps)
 
         executor = ThreadPoolExecutor(max_workers=num_workers)
 
@@ -3018,6 +3038,7 @@ class VideoDataset(BaseDataset):
             self.batch_size,
             num_timestep_buckets=num_timestep_buckets,
             architecture=self.architecture,
+            target_fps=self.target_fps,
         )
         self.batch_manager.show_bucket_info()
 

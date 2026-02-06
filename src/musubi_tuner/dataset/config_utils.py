@@ -72,6 +72,7 @@ class VideoDatasetParams(BaseDatasetParams):
     frame_sample: Optional[int] = 1
     max_frames: Optional[int] = 129
     source_fps: Optional[float] = None
+    target_fps: Optional[float] = None
 
     # FramePack dependent parameters
     fp_latent_window_size: Optional[int] = 9
@@ -154,6 +155,7 @@ class ConfigSanitizer:
         "frame_sample": int,
         "max_frames": int,
         "source_fps": float,
+        "target_fps": float,
         "fp_latent_window_size": int,
     }
 
@@ -381,6 +383,7 @@ def generate_dataset_group_by_blueprint(
         frame_sample: {dataset.frame_sample}
         max_frames: {dataset.max_frames}
         source_fps: {dataset.source_fps}
+        target_fps: {getattr(dataset, "target_fps", None)}
         fp_latent_window_size: {dataset.fp_latent_window_size}
     \n"""
                 ),
