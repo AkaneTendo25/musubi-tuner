@@ -115,15 +115,37 @@ min_duration = 5.0
 
 ## Quick Start
 
-### 1. Download Models (~10GB)
+### 1. Download Models
+
+The main [ACE-Step/Ace-Step1.5](https://huggingface.co/ACE-Step/Ace-Step1.5) repo bundles the turbo DiT, VAE, and text encoder (~10GB):
 
 ```bash
 python -c "from huggingface_hub import snapshot_download; snapshot_download('ACE-Step/Ace-Step1.5', local_dir='./checkpoints')"
 ```
 
-The DiT checkpoint must include `silence_latent.pt` (for example:
-`checkpoints/acestep-v15-turbo/silence_latent.pt`). It is required for the
-original ACE-Step text2music training flow.
+This gives you `checkpoints/acestep-v15-turbo/`, `checkpoints/vae/`, and `checkpoints/Qwen3-Embedding-0.6B/`.
+
+To use a different DiT variant, download it from its own repo:
+
+```bash
+# Example: download base model
+python -c "from huggingface_hub import snapshot_download; snapshot_download('ACE-Step/acestep-v15-base', local_dir='./checkpoints/acestep-v15-base')"
+```
+
+The DiT checkpoint must include `silence_latent.pt` (e.g. `checkpoints/acestep-v15-turbo/silence_latent.pt`). It is required for the ACE-Step text2music training flow. The VAE and text encoder are shared across all variants.
+
+**Available DiT checkpoints:**
+
+| HuggingFace repo | `is_turbo` | Shift | Inference steps | Notes |
+|------------------|-----------|-------|-----------------|-------|
+| [ACE-Step/Ace-Step1.5](https://huggingface.co/ACE-Step/Ace-Step1.5) (`acestep-v15-turbo/`) | true | 3.0 | 8 | Main repo, turbo (same weights as turbo-shift3) |
+| [ACE-Step/acestep-v15-turbo-shift3](https://huggingface.co/ACE-Step/acestep-v15-turbo-shift3) | true | 3.0 | 8 | Turbo, distilled with shift=3.0 |
+| [ACE-Step/acestep-v15-turbo-shift1](https://huggingface.co/ACE-Step/acestep-v15-turbo-shift1) | true | 1.0 | 8 | Turbo, distilled with shift=1.0 (needs `--acestep_shift 1.0`) |
+| [ACE-Step/acestep-v15-turbo-continuous](https://huggingface.co/ACE-Step/acestep-v15-turbo-continuous) | true | 3.0 | 8 | Turbo, continuous distillation variant |
+| [ACE-Step/acestep-v15-sft](https://huggingface.co/ACE-Step/acestep-v15-sft) | false | 1.0 | 60 | Supervised fine-tuned, full diffusion |
+| [ACE-Step/acestep-v15-base](https://huggingface.co/ACE-Step/acestep-v15-base) | false | 1.0 | 60 | Base pre-trained model, full diffusion |
+
+The `is_turbo` flag is auto-detected from the model's `config.json`. The shift value is **not** stored in the config — it defaults to 3.0 for turbo and 1.0 for base/sft. For `turbo-shift1`, you must explicitly pass `--acestep_shift 1.0`.
 
 ### 2. Cache Text Encoder Outputs
 
@@ -135,7 +157,7 @@ python acestep_cache_text_encoder_outputs.py \
     --batch_size 8
 ```
 
-`--dit` is recommended: it caches ACE-Step condition-encoder outputs (closer to the original trainer flow).
+`--dit` is recommended: it caches ACE-Step condition-encoder outputs (closer to the original trainer flow). Use the same `--dit` path you will use for training. The condition encoder architecture is shared across all variants.
 
 ### 3. Cache Audio Latents
 
@@ -162,7 +184,8 @@ Chunking uses overlapping segments with cosine crossfade blending for seamless r
 
 ### 4. Train LoRA
 
-With flash attention (recommended):
+#### Turbo model (default)
+
 ```bash
 accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 acestep_train_network.py \
     --dataset_config acestep_dataset.toml \
@@ -187,6 +210,56 @@ accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 acestep
     --save_every_n_steps 500 \
     --save_state
 ```
+
+#### Base or SFT model
+
+Change `--dit` to point to a base or sft checkpoint. The trainer auto-detects `is_turbo=false` from the model config:
+
+```bash
+accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 acestep_train_network.py \
+    --dataset_config acestep_dataset.toml \
+    --dit checkpoints/acestep-v15-base \
+    --output_dir output/acestep_base_lora \
+    --network_module networks.lora_acestep \
+    --network_dim 64 \
+    --network_alpha 128 \
+    --network_dropout 0.1 \
+    --optimizer_type AdamW8Bit \
+    --lr_scheduler cosine \
+    --lr_warmup_steps 100 \
+    --log_config \
+    --log_with tensorboard \
+    --logging_dir logs \
+    --max_data_loader_n_workers 1 \
+    --max_train_steps 2000 \
+    --learning_rate 5e-5 \
+    --mixed_precision bf16 \
+    --flash_attn \
+    --gradient_checkpointing \
+    --save_every_n_steps 500 \
+    --save_state
+```
+
+For sft, replace `--dit checkpoints/acestep-v15-base` with `--dit checkpoints/acestep-v15-sft`. When using base/sft, also update `sample_steps` in your sample prompts JSON from `8` to `60` (see Audio Sampling section below).
+
+#### Turbo-shift1
+
+The `turbo-shift1` checkpoint needs an explicit shift override since the config doesn't store the shift value:
+
+```bash
+accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 acestep_train_network.py \
+    --dataset_config acestep_dataset.toml \
+    --dit checkpoints/acestep-v15-turbo-shift1 \
+    --acestep_shift 1.0 \
+    ... (same flags as turbo)
+```
+
+#### Model-type arguments
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--is_turbo` | `auto` | `auto` reads from model config, `true`/`false` to override |
+| `--acestep_shift` | auto | Timestep shift (default: 3.0 for turbo, 1.0 for base). Must be set to `1.0` for `turbo-shift1` |
 ## Audio Sampling During Training
 
 Add these flags to generate audio samples during training:
@@ -213,6 +286,7 @@ Sample prompts JSON format:
         "timesignature": "4",
         "duration": 30.0,
         "audio_duration": 30.0,
+        "sample_steps": 8,
         "seed": 42
     },
     {
@@ -220,7 +294,9 @@ Sample prompts JSON format:
         "lyrics": "[Verse]\nSinging in the morning light\n[Chorus]\nOh the world is bright",
         "bpm": 95,
         "keyscale": "G major",
-        "audio_duration": 30.0
+        "audio_duration": 30.0,
+        "sample_steps": 8,
+        "seed": 42
     }
 ]
 ```
@@ -233,7 +309,11 @@ Supported fields:
 - `timesignature`: Time signature (optional, e.g., "4", "3")
 - `duration`: Duration for metadata formatting (optional)
 - `audio_duration`: Actual generation duration in seconds (default: 30.0)
+- `sample_steps`: Number of denoising steps (default: 8 for turbo, 60 for base/sft)
+- `guidance_scale`: Override CFG guidance scale per prompt (default: 0.0 for turbo, 7.0 for base/sft)
 - `seed`: Random seed for reproducible generation (optional, random if omitted)
+
+For non-turbo models, set `sample_steps` to 60 (or higher) for good quality samples. Using only 8 steps with a base/sft model will produce poor results.
 
 ## LoRA Configuration
 

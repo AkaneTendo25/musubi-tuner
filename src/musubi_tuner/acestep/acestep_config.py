@@ -28,6 +28,34 @@ TURBO_SHIFT3_TIMESTEPS = [
     0.3,
 ]
 
+# Default inference settings per model type
+BASE_MODEL_DEFAULTS = {
+    "shift": 1.0,
+    "guidance_scale": 7.0,
+    "inference_steps": 60,
+}
+
+TURBO_MODEL_DEFAULTS = {
+    "shift": 3.0,
+    "guidance_scale": 0.0,
+    "inference_steps": 8,
+}
+
+
+def compute_shifted_timesteps(num_steps: int, shift: float) -> list:
+    """Compute discrete timestep schedule with shift applied.
+
+    Base timesteps: t_i = 1 - i/N for i in 0..N-1
+    Shifted: t_shifted = shift * t / (1 + (shift - 1) * t)
+    """
+    timesteps = []
+    for i in range(num_steps):
+        t = 1.0 - i / num_steps
+        if shift != 1.0:
+            t = shift * t / (1.0 + (shift - 1.0) * t)
+        timesteps.append(t)
+    return timesteps
+
 # Default LoRA configuration
 DEFAULT_LORA_TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj"]
 DEFAULT_LORA_RANK = 8

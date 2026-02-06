@@ -15,10 +15,11 @@ from accelerate import Accelerator
 from musubi_tuner.dataset.image_video_dataset import ARCHITECTURE_ACESTEP, ARCHITECTURE_ACESTEP_FULL
 from musubi_tuner.acestep import acestep_utils
 from musubi_tuner.acestep.acestep_config import (
-    ACESTEP_LATENT_CHANNELS,
     ACESTEP_SAMPLE_RATE,
     ACESTEP_LATENT_HZ,
-    TURBO_SHIFT3_TIMESTEPS,
+    BASE_MODEL_DEFAULTS,
+    TURBO_MODEL_DEFAULTS,
+    compute_shifted_timesteps,
 )
 from musubi_tuner.hv_train_network import (
     NetworkTrainer,
@@ -54,6 +55,12 @@ class AceStepNetworkTrainer(NetworkTrainer):
         self._vae_path: str = None
         self._text_encoder_path: str = None
         self._is_turbo: bool = True
+        self._is_turbo_auto: bool = True
+        self._acestep_shift: Optional[float] = None
+        self._shift: float = 3.0
+        self._discrete_timesteps: list = compute_shifted_timesteps(8, 3.0)
+        self._timestep_mu: float = -0.4
+        self._timestep_sigma: float = 1.0
         self._silence_latent: Optional[torch.Tensor] = None  # Loaded from silence_latent.pt
 
     # region model specific
@@ -83,16 +90,26 @@ class AceStepNetworkTrainer(NetworkTrainer):
         self._model_path = args.dit
         self._vae_path = args.vae
         self._text_encoder_path = getattr(args, "text_encoder", None)
-        self._is_turbo = getattr(args, "is_turbo", True)
 
-        # ACE-Step uses discrete timesteps for turbo model
+        # Parse is_turbo: "auto" | "true" | "false"
+        is_turbo_str = str(getattr(args, "is_turbo", "auto")).lower()
+        if is_turbo_str == "auto":
+            self._is_turbo_auto = True
+            self._is_turbo = True  # provisional default, finalized in load_transformer
+        else:
+            self._is_turbo_auto = False
+            self._is_turbo = is_turbo_str in ("true", "1", "yes")
+
+        self._acestep_shift = getattr(args, "acestep_shift", None)  # None = auto
+
+        # Provisional defaults (finalized in load_transformer when we have model config)
         self.default_discrete_flow_shift = 3.0
-        self.default_guidance_scale = 0.0  # No CFG for turbo
+        self.default_guidance_scale = 0.0
 
         self._i2v_training = False
         self._control_training = False
 
-        logger.info(f"ACE-Step training mode: {'turbo' if self._is_turbo else 'base'}")
+        logger.info(f"ACE-Step args: is_turbo={is_turbo_str}, acestep_shift={self._acestep_shift}")
 
     def process_sample_prompts(
         self,
@@ -265,10 +282,9 @@ class AceStepNetworkTrainer(NetworkTrainer):
     ):
         """Generate audio sample during training.
 
-        For ACE-Step turbo model:
-        - Uses 8-step discrete timesteps with ODE solver
-        - No CFG (classifier-free guidance disabled)
-        - Returns audio as [B, C, F, H, W] format for compatibility (F=1, audio as 2D)
+        For ACE-Step turbo model: 8-step discrete timesteps, no CFG.
+        For ACE-Step base/sft model: configurable steps (default 60), CFG enabled.
+        Returns audio as [B, C, F, H, W] format for compatibility (F=1, audio as 2D).
 
         This implementation follows the official ACE-Step generate_audio method.
         """
@@ -337,10 +353,14 @@ class AceStepNetworkTrainer(NetworkTrainer):
         # Use model.generate_audio to match original ACE-Step inference path exactly.
         # This avoids subtle drift from hand-rolled denoising loops.
         seed = generator.initial_seed() if generator is not None else None
-        t_schedule = torch.tensor(TURBO_SHIFT3_TIMESTEPS, device=device, dtype=dtype)
-        num_steps = min(sample_steps, len(t_schedule)) if sample_steps else len(t_schedule)
-        t_schedule = t_schedule[:num_steps]
-        logger.info(f"Running model.generate_audio with {num_steps} steps (seed={seed})")
+
+        # Compute timestep schedule for the requested steps and shift
+        t_schedule = torch.tensor(
+            compute_shifted_timesteps(sample_steps, discrete_flow_shift),
+            device=device, dtype=dtype,
+        )
+        logger.info(f"Running model.generate_audio: {len(t_schedule)} steps, "
+                    f"shift={discrete_flow_shift}, is_turbo={self._is_turbo}, seed={seed}")
         with torch.no_grad():
             gen_outputs = model.generate_audio(
                 text_hidden_states=text_hidden_states,
@@ -355,9 +375,9 @@ class AceStepNetworkTrainer(NetworkTrainer):
                 silence_latent=silence_latent,
                 attention_mask=attention_mask,
                 seed=seed,
-                fix_nfe=num_steps,
+                fix_nfe=len(t_schedule),
                 infer_method="ode",
-                shift=3.0,
+                shift=discrete_flow_shift,
                 timesteps=t_schedule,
             )
         latents = gen_outputs["target_latents"]
@@ -461,7 +481,13 @@ class AceStepNetworkTrainer(NetworkTrainer):
         import time
         import os
 
-        sample_steps = sample_parameter.get("sample_steps", 8)  # Default to 8 steps for turbo
+        # Use model-type defaults, allow per-prompt override
+        if self._is_turbo:
+            default_steps = TURBO_MODEL_DEFAULTS["inference_steps"]  # 8
+        else:
+            default_steps = BASE_MODEL_DEFAULTS["inference_steps"]  # 60
+
+        sample_steps = sample_parameter.get("sample_steps", default_steps)
         seed = sample_parameter.get("seed")
         prompt = sample_parameter.get("prompt", "")
 
@@ -494,14 +520,14 @@ class AceStepNetworkTrainer(NetworkTrainer):
             vae,
             dit_dtype,
             transformer,
-            discrete_flow_shift=3.0,  # Turbo shift
+            discrete_flow_shift=self._shift,
             sample_steps=sample_steps,
             width=0,  # Not used for audio
             height=0,  # Not used for audio
             frame_count=0,  # Not used for audio
             generator=generator,
-            do_classifier_free_guidance=False,  # Turbo doesn't use CFG
-            guidance_scale=1.0,
+            do_classifier_free_guidance=not self._is_turbo,  # CFG for base only
+            guidance_scale=sample_parameter.get("guidance_scale", self.default_guidance_scale),
             cfg_scale=None,
         )
 
@@ -578,9 +604,39 @@ class AceStepNetworkTrainer(NetworkTrainer):
             attn_mode=attn_mode,
         )
 
-        self._is_turbo = config.get("is_turbo", True)
+        # Auto-detect is_turbo from model config
+        if self._is_turbo_auto:
+            self._is_turbo = config.get("is_turbo", True)
         # Store silence_latent from checkpoint (loaded from silence_latent.pt)
         self._silence_latent = config.get("silence_latent", None)
+
+        # Store timestep distribution parameters from model config (for non-turbo training)
+        self._timestep_mu = config.get("timestep_mu", -0.4)
+        self._timestep_sigma = config.get("timestep_sigma", 1.0)
+
+        # Determine shift value
+        if self._acestep_shift is not None:
+            shift = self._acestep_shift
+        elif self._is_turbo:
+            shift = TURBO_MODEL_DEFAULTS["shift"]  # 3.0
+        else:
+            shift = BASE_MODEL_DEFAULTS["shift"]  # 1.0
+        self._shift = shift
+
+        # Compute discrete timestep schedule for this shift
+        self._discrete_timesteps = compute_shifted_timesteps(8, self._shift)
+
+        # Set defaults based on model type
+        if self._is_turbo:
+            self.default_discrete_flow_shift = self._shift
+            self.default_guidance_scale = 0.0
+        else:
+            self.default_discrete_flow_shift = self._shift
+            self.default_guidance_scale = BASE_MODEL_DEFAULTS["guidance_scale"]  # 7.0
+
+        logger.info(f"ACE-Step: is_turbo={self._is_turbo}, shift={self._shift}, "
+                    f"guidance_scale={self.default_guidance_scale}, "
+                    f"timestep_mu={self._timestep_mu}, timestep_sigma={self._timestep_sigma}")
 
         # Add gradient checkpointing method compatible with base trainer
         def _enable_gradient_checkpointing(cpu_offload: bool = False):
@@ -744,18 +800,41 @@ class AceStepNetworkTrainer(NetworkTrainer):
             # context_latents = [src_latents, chunk_masks] -> [B, T, 128]
             context_latents = torch.cat([silence, chunk_masks], dim=-1)
 
+        # Classifier-free guidance dropout: randomly replace conditions with null embedding.
+        # Original ACE-Step forward() uses cfg_ratio=0.15 to train the model to handle
+        # both conditioned and unconditioned generation.
+        if encoder_hidden_states is not None and hasattr(transformer, "null_condition_emb"):
+            cfg_ratio = 0.15
+            cfg_mask = torch.where(
+                torch.rand(size=(bsz,), device=accelerator.device, dtype=network_dtype) < cfg_ratio,
+                torch.zeros(size=(bsz,), device=accelerator.device, dtype=network_dtype),
+                torch.ones(size=(bsz,), device=accelerator.device, dtype=network_dtype),
+            ).view(-1, 1, 1)
+            null_emb = transformer.null_condition_emb.to(dtype=network_dtype)
+            encoder_hidden_states = torch.where(
+                cfg_mask > 0,
+                encoder_hidden_states,
+                null_emb.expand_as(encoder_hidden_states),
+            )
+
         # Prepare inputs
         latents = latents.to(accelerator.device, dtype=network_dtype)  # x0 (data)
         noise = noise.to(accelerator.device, dtype=network_dtype)  # x1 (noise)
 
-        # Sample discrete timesteps for turbo model (must recompute noisy input with these!)
-        # Original ACE-Step trainer: t, r = sample_discrete_timestep(bsz, device, dtype)
+        # Sample timesteps matching the original ACE-Step trainer distribution.
+        # Turbo: discrete schedule (train on exact inference timesteps for LoRA efficiency)
+        # Non-turbo: logit-normal distribution matching original sample_t_r(use_meanflow=False)
         if self._is_turbo:
-            t, r = acestep_utils.sample_discrete_timestep(bsz, accelerator.device, network_dtype)
+            t, r = acestep_utils.sample_discrete_timestep(
+                bsz, accelerator.device, network_dtype,
+                timestep_schedule=self._discrete_timesteps,
+            )
         else:
-            # For non-turbo, use provided timesteps (normalized to 0-1)
-            t = (timesteps.to(accelerator.device, dtype=network_dtype) / 1000.0).clamp(0, 1)
-            r = t
+            t, r = acestep_utils.sample_logit_normal_timestep(
+                bsz, accelerator.device, network_dtype,
+                timestep_mu=self._timestep_mu,
+                timestep_sigma=self._timestep_sigma,
+            )
 
         # Recompute noisy model input with correct timesteps (flow matching interpolation)
         # Original ACE-Step: xt = t * x1 + (1 - t) * x0 = t * noise + (1 - t) * latents
@@ -767,13 +846,13 @@ class AceStepNetworkTrainer(NetworkTrainer):
             noisy_model_input = noisy_model_input.detach().requires_grad_(True)
 
         # Forward through decoder
-        # The ACE-Step model has a decoder attribute that processes the latents
+        # Original ACE-Step forward() passes timestep_r=t (not r), matching use_meanflow=False
         with accelerator.autocast():
             if hasattr(transformer, "decoder"):
                 decoder_outputs = transformer.decoder(
                     hidden_states=noisy_model_input,
                     timestep=t,
-                    timestep_r=r,
+                    timestep_r=t,
                     attention_mask=attention_mask,
                     encoder_hidden_states=encoder_hidden_states,
                     encoder_attention_mask=encoder_attention_mask,
@@ -810,9 +889,15 @@ def acestep_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentPa
     )
     parser.add_argument(
         "--is_turbo",
-        action="store_true",
-        default=True,
-        help="Use turbo model discrete timesteps (default: True)",
+        type=str,
+        default="auto",
+        help="Model type: 'true' for turbo, 'false' for base/sft, 'auto' to detect from model config (default: auto)",
+    )
+    parser.add_argument(
+        "--acestep_shift",
+        type=float,
+        default=None,
+        help="Override timestep shift value (default: auto-detect from model type: 3.0 for turbo, 1.0 for base)",
     )
     parser.add_argument(
         "--max_duration",

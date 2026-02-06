@@ -5,7 +5,7 @@ Functions for loading ACE-Step models, VAE, and text encoder.
 """
 
 import os
-from typing import Optional, Tuple, Dict, Any
+from typing import Optional, Tuple, Dict, Any, List
 
 import torch
 import torch.nn as nn
@@ -70,6 +70,8 @@ def load_acestep_model(
     config_dict = {
         "is_turbo": getattr(model.config, "is_turbo", True),
         "hidden_size": getattr(model.config, "hidden_size", 1024),
+        "timestep_mu": getattr(model.config, "timestep_mu", -0.4),
+        "timestep_sigma": getattr(model.config, "timestep_sigma", 1.0),
     }
 
     # Load silence_latent from separate .pt file (following official ACE-Step handler)
@@ -273,31 +275,70 @@ def encode_text_for_acestep(
     return hidden_states, attention_mask
 
 
-def sample_discrete_timestep(
+def sample_logit_normal_timestep(
     batch_size: int,
     device: torch.device,
     dtype: torch.dtype = torch.bfloat16,
+    timestep_mu: float = -0.4,
+    timestep_sigma: float = 1.0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Sample timesteps from discrete turbo shift=3 schedule.
+    """Sample timesteps from logit-normal distribution (original ACE-Step training).
 
-    For turbo model training, randomly samples from 8 discrete timesteps.
+    Matches the official ACE-Step sample_t_r() with use_meanflow=False exactly:
+        t1 = sigmoid(randn * sigma + mu)
+        t2 = sigmoid(randn * sigma + mu)
+        t = max(t1, t2)   # order statistic shifts distribution toward higher t
+        r = t              # use_meanflow=False forces r = t
 
     Args:
         batch_size: Number of samples
         device: Device for output
         dtype: Output dtype
+        timestep_mu: Mean for logit-normal sampling (default: -0.4 from ACE-Step config)
+        timestep_sigma: Std for logit-normal sampling (default: 1.0 from ACE-Step config)
 
     Returns:
-        Tuple of (t, r) timestep tensors (both same value for turbo)
+        Tuple of (t, r) timestep tensors (both same value, matching use_meanflow=False)
     """
+    t1 = torch.sigmoid(torch.randn((batch_size,), device=device, dtype=dtype) * timestep_sigma + timestep_mu)
+    t2 = torch.sigmoid(torch.randn((batch_size,), device=device, dtype=dtype) * timestep_sigma + timestep_mu)
+    t = torch.maximum(t1, t2)
+    r = t
+    return t, r
+
+
+def sample_discrete_timestep(
+    batch_size: int,
+    device: torch.device,
+    dtype: torch.dtype = torch.bfloat16,
+    timestep_schedule: Optional[List[float]] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Sample timesteps from a discrete schedule.
+
+    Randomly samples from the provided discrete timestep schedule,
+    defaulting to TURBO_SHIFT3_TIMESTEPS if none is provided.
+
+    Args:
+        batch_size: Number of samples
+        device: Device for output
+        dtype: Output dtype
+        timestep_schedule: List of discrete timestep values to sample from.
+            If None, uses TURBO_SHIFT3_TIMESTEPS (shift=3.0, 8 steps).
+
+    Returns:
+        Tuple of (t, r) timestep tensors (both same value)
+    """
+    if timestep_schedule is None:
+        timestep_schedule = TURBO_SHIFT3_TIMESTEPS
+
     # Randomly select indices for each sample in batch
-    indices = torch.randint(0, len(TURBO_SHIFT3_TIMESTEPS), (batch_size,), device=device)
+    indices = torch.randint(0, len(timestep_schedule), (batch_size,), device=device)
 
     # Convert to tensor and index
-    timesteps_tensor = torch.tensor(TURBO_SHIFT3_TIMESTEPS, device=device, dtype=dtype)
+    timesteps_tensor = torch.tensor(timestep_schedule, device=device, dtype=dtype)
     t = timesteps_tensor[indices]
 
-    # r = t for turbo model
+    # r = t
     r = t
 
     return t, r
