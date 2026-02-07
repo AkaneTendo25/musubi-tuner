@@ -550,6 +550,9 @@ class NetworkTrainer:
                 if "effective_lr" in optimizer.param_groups[i]:
                     logs[f"lr/d*eff_lr/{lr_desc}"] = optimizer.param_groups[i]["d"] * optimizer.param_groups[i]["effective_lr"]
 
+            if args.optimizer_type.lower() == "automagic" and optimizer is not None:
+                logs[f"lr/automagic_avg"] = optimizer.get_avg_learning_rate()
+
         return logs
 
     def get_optimizer(self, args, trainable_params: list[torch.nn.Parameter]) -> tuple[str, str, torch.optim.Optimizer]:
@@ -632,6 +635,12 @@ class NetworkTrainer:
             optimizer_class = torch.optim.AdamW
             optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
 
+        elif optimizer_type == "automagic":
+            from musubi_tuner.optimizers.automagic import Automagic
+            logger.info(f"use Automagic optimizer | lr={lr} | {optimizer_kwargs}")
+            optimizer_class = Automagic
+            optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
+
         if optimizer is None:
             # 任意のoptimizerを使う
             case_sensitive_optimizer_type = args.optimizer_type  # not lower
@@ -662,7 +671,7 @@ class NetworkTrainer:
         return optimizer_name, optimizer_args, optimizer, train_fn, eval_fn
 
     def is_schedulefree_optimizer(self, optimizer: torch.optim.Optimizer, args: argparse.Namespace) -> bool:
-        return args.optimizer_type.lower().endswith("schedulefree".lower())  # or args.optimizer_schedulefree_wrapper
+        return args.optimizer_type.lower().endswith("schedulefree".lower()) or args.optimizer_type.lower() == "automagic"
 
     def get_dummy_scheduler(self, optimizer: torch.optim.Optimizer) -> Any:
         # dummy scheduler for schedulefree optimizer. supports only empty step(), get_last_lr() and optimizers.

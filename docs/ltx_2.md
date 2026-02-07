@@ -360,6 +360,81 @@ If you see **no** "Resampling" line for a video, it means source and target FPS 
 
 ---
 
+## Validation Datasets
+
+You can configure a separate validation dataset to track validation loss (`val_loss`) during training. This helps detect overfitting and compare training runs. Validation datasets use **exactly the same schema** as training datasets — any format that works for `[[datasets]]` works for `[[validation_datasets]]`.
+
+### Configuration
+
+Add a `[[validation_datasets]]` section to your existing TOML config file:
+
+```toml
+[general]
+resolution = [768, 512]
+caption_extension = ".txt"
+batch_size = 1
+enable_bucket = true
+
+# Training data
+[[datasets]]
+video_directory = "videos/train"
+cache_directory = "cache/train"
+target_frames = [1, 17, 33, 49]
+
+# Validation data
+[[validation_datasets]]
+video_directory = "videos/val"
+cache_directory = "cache/val"
+target_frames = [1, 17, 33, 49]
+```
+
+The `cache_directory` for validation must be different from the training cache directory.
+
+### Caching
+
+Validation datasets are automatically picked up by the caching scripts — no extra flags needed. Run the same caching commands you use for training:
+
+```bash
+python ltx2_cache_latents.py --dataset_config dataset.toml --ltx2_checkpoint /path/to/ltx-2.safetensors --ltx2_mode av ...
+python ltx2_cache_text_encoder_outputs.py --dataset_config dataset.toml --ltx2_checkpoint /path/to/ltx-2.safetensors --ltx2_mode av ...
+```
+
+Both scripts detect the `[[validation_datasets]]` section and cache latents/text embeddings for validation data alongside training data.
+
+### Training Arguments
+
+| Argument | Type | Default | Description |
+|----------|------|---------|-------------|
+| `--validate_every_n_steps` | int | None | Run validation every N training steps |
+| `--validate_every_n_epochs` | int | None | Run validation every N epochs |
+
+At least one of these must be set for validation to run. If neither is set, validation is skipped even if `[[validation_datasets]]` is configured.
+
+### Example
+
+```bash
+accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 ltx2_train_network.py ^
+  --dataset_config dataset.toml ^
+  --validate_every_n_steps 100 ^
+  ... (other training args)
+```
+
+### How It Works
+
+1. A separate validation dataloader is created with `batch_size=1` and `shuffle=False` (deterministic order).
+2. At the configured interval, the model switches to eval mode and runs inference on all validation samples with `torch.no_grad()`.
+3. The average MSE loss is computed and logged as `val_loss` to TensorBoard/WandB.
+4. The model is restored to training mode and training continues.
+
+### Tips
+
+- **Keep validation sets small.** Aim for 5-20% of your main dataset size. Validation runs on every sample each time, so 10-50 clips is usually enough. Large validation sets slow down training.
+- **Use held-out data.** Validation data should be different from the training set for meaningful overfitting detection. In extreme cases, using a small subset of the training data is acceptable — it will still help catch divergence, but won't reliably detect overfitting.
+- **Monitor the gap.** If `val_loss` starts increasing while training loss keeps decreasing, you're overfitting — consider stopping or reducing the learning rate.
+- **Same preprocessing.** Validation data goes through the same frame extraction, FPS resampling, and resolution bucketing as training data.
+
+---
+
 ## Directory Structure
 
 ### Raw Dataset Layout (Example)
