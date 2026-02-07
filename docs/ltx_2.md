@@ -523,7 +523,7 @@ sample_slider_range = [-2.0, -1.0, 0.0, 1.0, 2.0]
 - `neg_cache_dir`: Directory containing cached negative latents
 - `text_cache_dir`: Directory containing cached text encoder outputs. Defaults to `pos_cache_dir` if omitted.
 
-Pairs are matched by filename: for each `{name}_{W}x{H}_ltx2_v1.safetensors` in the positive directory, a matching file must exist in the negative directory. Unmatched files are skipped with a warning.
+Pairs are matched by filename: for each `{name}_{W}x{H}_ltx2.safetensors` in the positive directory, a matching file must exist in the negative directory. Unmatched files are skipped with a warning.
 
 ##### Example Command (Reference)
 

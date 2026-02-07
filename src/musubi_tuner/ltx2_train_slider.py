@@ -176,7 +176,7 @@ def _find_text_tensor(sd: dict) -> torch.Tensor:
     raise KeyError(f"No text key found in {list(sd.keys())}")
 
 
-_LATENT_BASENAME_RE = re.compile(r"^(.+)_\d{4}x\d{4}_ltx2_v1\.safetensors$")
+_LATENT_BASENAME_RE = re.compile(r"^(.+)_\d{4}x\d{4}_ltx2\.safetensors$")
 
 
 class PairedSliderDataset(torch.utils.data.Dataset):
@@ -186,7 +186,7 @@ class PairedSliderDataset(torch.utils.data.Dataset):
         self.text_cache_dir = text_cache_dir or pos_cache_dir
 
         # Find latent cache files in pos_cache_dir
-        pos_files = sorted(glob.glob(os.path.join(pos_cache_dir, "*_ltx2_v1.safetensors")))
+        pos_files = sorted(glob.glob(os.path.join(pos_cache_dir, "*_ltx2.safetensors")))
         # Exclude text encoder caches (*_te.safetensors) and audio (*_audio.safetensors)
         pos_files = [f for f in pos_files if not f.endswith("_te.safetensors") and not f.endswith("_audio.safetensors")]
 
@@ -199,13 +199,13 @@ class PairedSliderDataset(torch.utils.data.Dataset):
                 continue
 
             # Text cache uses stem without WxH dimensions:
-            #   latent: {stem}_{W:04d}x{H:04d}_ltx2_v1.safetensors
-            #   text:   {stem}_ltx2_v1_te.safetensors
+            #   latent: {stem}_{W:04d}x{H:04d}_ltx2.safetensors
+            #   text:   {stem}_ltx2_te.safetensors
             m = _LATENT_BASENAME_RE.match(basename)
             if not m:
                 logger.warning("Cannot parse latent filename %s, skipping", basename)
                 continue
-            te_basename = f"{m.group(1)}_ltx2_v1_te.safetensors"
+            te_basename = f"{m.group(1)}_ltx2_te.safetensors"
             te_path = os.path.join(self.text_cache_dir, te_basename)
             if not os.path.exists(te_path):
                 logger.warning("No text cache for %s, skipping", basename)
