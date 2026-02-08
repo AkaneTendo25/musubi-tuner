@@ -2,10 +2,11 @@
 
 Status: LTX-2 support is work in progress and may be incomplete or unstable.
 
-This guide details the three-step process for training LTX-2 LoRA models:
+This guide details the process for training LTX-2 LoRA models:
 1. **Caching Latents** (Video/Image + Audio)
 2. **Caching Text Encoder Outputs** (Prompts)
 3. **Training**
+4. **Slider LoRA Training** (Controllable direction sliders)
 
 ## Installation
 
@@ -520,6 +521,164 @@ cache_directory/
 | Wrong frame count in cached latents | Auto-detected FPS incorrect (e.g., VFR video) | Set `source_fps` explicitly in TOML config to override auto-detection |
 | Too few frames from high-FPS video | FPS resampling working correctly (e.g., 60fps→24fps = 40% of frames) | This is expected behavior. Set `target_fps = 60` if you want to keep all frames |
 | Audio/video out of sync after caching | Source FPS mismatch causing wrong time-stretch | Check "Auto-detected source FPS" log line; set `source_fps` explicitly if wrong |
+
+---
+
+## 4. Slider LoRA Training
+
+Slider LoRAs learn a controllable direction in model output space (e.g., "detailed" vs "blurry"). At inference, you scale the LoRA multiplier to control the effect strength and direction: `+1.0` enhances, `-1.0` erases, `0.0` is the base model, and values like `+2.0` or `-0.5` work too.
+
+**Script:** `ltx2_train_slider.py`
+
+Two modes are available:
+
+| Mode | Input | Use Case |
+|------|-------|----------|
+| `text` | Prompt pairs only (no dataset) | Quick concept sliders from text descriptions |
+| `reference` | Pre-cached latent pairs | Precise control from paired positive/negative images |
+
+### 4a. Text-Only Mode
+
+Learns a slider direction from positive/negative prompt pairs. No images or dataset config needed.
+
+#### Slider Config (`ltx2_slider.toml`)
+
+```toml
+mode = "text"
+guidance_strength = 1.0
+sample_slider_range = [-2.0, -1.0, 0.0, 1.0, 2.0]
+
+[[targets]]
+positive = "extremely detailed, sharp, high resolution, 8k"
+negative = "blurry, out of focus, low quality, soft"
+target_class = ""      # empty = affect all content
+weight = 1.0
+```
+
+- `guidance_strength`: Scales the directional offset applied to targets. Higher values = stronger direction signal but may overshoot.
+- `target_class`: The conditioning prompt used during training passes. Empty string means the slider affects all content regardless of prompt. Set to e.g. `"a portrait"` to restrict the slider's effect to a specific subject.
+- `weight`: Per-target loss weight. Useful when training multiple directions simultaneously.
+- `sample_slider_range`: Multiplier values used for preview samples during training.
+
+Multiple `[[targets]]` blocks can be defined to train several directions at once (e.g., detail + lighting).
+
+#### Example Command (Text-Only)
+
+```bash
+accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 ltx2_train_slider.py ^
+  --mixed_precision bf16 ^
+  --ltx2_checkpoint /path/to/ltx-2.safetensors ^
+  --gemma_root /path/to/gemma ^
+  --gemma_load_in_8bit ^
+  --fp8_base --fp8_scaled ^
+  --gradient_checkpointing ^
+  --blocks_to_swap 10 ^
+  --network_module networks.lora_ltx2 ^
+  --network_dim 16 --network_alpha 16 ^
+  --lora_target_preset t2v ^
+  --learning_rate 1e-4 ^
+  --optimizer_type AdamW8bit ^
+  --lr_scheduler constant_with_warmup --lr_warmup_steps 20 ^
+  --max_train_steps 500 ^
+  --output_dir output --output_name detail_slider ^
+  --slider_config ltx2_slider.toml ^
+  --latent_frames 1 ^
+  --latent_height 512 --latent_width 768
+```
+
+#### Text-Only Arguments
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--slider_config` | (required) | Path to slider TOML config file |
+| `--latent_frames` | 1 | Number of latent frames (1=image, >1=video) |
+| `--latent_height` | 512 | Pixel height for synthetic latents |
+| `--latent_width` | 768 | Pixel width for synthetic latents |
+| `--guidance_strength` | (from TOML) | Override `guidance_strength` from config |
+| `--sample_slider_range` | (from TOML) | Override as comma-separated values, e.g. `"-2,-1,0,1,2"` |
+
+All standard training arguments (`--fp8_base`, `--blocks_to_swap`, `--gradient_checkpointing`, etc.) work the same as regular training. `--dataset_config` is not needed for text-only mode.
+
+### 4b. Reference Mode
+
+Learns a slider direction from paired positive/negative images (or videos). Requires pre-cached latents.
+
+#### Step 1: Prepare Paired Data
+
+Create two directories with matching filenames — one with positive-attribute images, one with negative:
+
+```
+positive_images/        negative_images/
+  img_001.png             img_001.png      # same subject, different attribute
+  img_002.png             img_002.png
+  img_003.png             img_003.png
+```
+
+Each positive image must have a corresponding negative image with the same filename. The images should depict the same subject but differ in the target attribute (e.g., smiling vs neutral face, detailed vs blurry).
+
+#### Step 2: Cache Latents and Text
+
+Create a dataset config for each directory and run the caching scripts. Both directories can share the same text captions (since the direction comes from the images, not the text).
+
+```bash
+# Cache positive latents
+python ltx2_cache_latents.py --dataset_config positive_dataset.toml --ltx2_checkpoint /path/to/ltx-2.safetensors
+
+# Cache negative latents
+python ltx2_cache_latents.py --dataset_config negative_dataset.toml --ltx2_checkpoint /path/to/ltx-2.safetensors
+
+# Cache text (once, for either directory — text is shared)
+python ltx2_cache_text_encoder_outputs.py --dataset_config positive_dataset.toml --ltx2_checkpoint /path/to/ltx-2.safetensors --gemma_root /path/to/gemma
+```
+
+#### Step 3: Configure and Train
+
+##### Slider Config (`ltx2_slider_reference.toml`)
+
+```toml
+mode = "reference"
+pos_cache_dir = "path/to/positive/cache"
+neg_cache_dir = "path/to/negative/cache"
+text_cache_dir = "path/to/positive/cache"   # can be same as pos (text is shared)
+sample_slider_range = [-2.0, -1.0, 0.0, 1.0, 2.0]
+```
+
+- `pos_cache_dir`: Directory containing cached positive latents (output of `ltx2_cache_latents.py`)
+- `neg_cache_dir`: Directory containing cached negative latents
+- `text_cache_dir`: Directory containing cached text encoder outputs. Defaults to `pos_cache_dir` if omitted.
+
+Pairs are matched by filename: for each `{name}_{W}x{H}_ltx2.safetensors` in the positive directory, a matching file must exist in the negative directory. Unmatched files are skipped with a warning.
+
+##### Example Command (Reference)
+
+```bash
+accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 ltx2_train_slider.py ^
+  --mixed_precision bf16 ^
+  --ltx2_checkpoint /path/to/ltx-2.safetensors ^
+  --fp8_base --fp8_scaled ^
+  --gradient_checkpointing ^
+  --blocks_to_swap 10 ^
+  --network_module networks.lora_ltx2 ^
+  --network_dim 16 --network_alpha 16 ^
+  --lora_target_preset t2v ^
+  --learning_rate 1e-4 ^
+  --optimizer_type AdamW8bit ^
+  --lr_scheduler constant_with_warmup --lr_warmup_steps 20 ^
+  --max_train_steps 500 ^
+  --output_dir output --output_name smile_slider ^
+  --slider_config ltx2_slider_reference.toml
+```
+
+Note: `--gemma_root` is not needed for reference mode (text embeddings are loaded from cache). `--dataset_config`, `--latent_frames/height/width` are also not used.
+
+### Slider Tips
+
+- **Start small**: `--network_dim 8` or `16` with `--max_train_steps 200-500` is usually sufficient.
+- **Monitor loss**: Loss should decrease steadily. If it diverges, reduce `--learning_rate`.
+- **Preview samples**: Add `--sample_prompts sampling_prompts.txt --sample_every_n_steps 50` to generate previews at each slider strength during training. Requires `--gemma_root` for text encoding.
+- **Guidance strength**: For text-only mode, `1.0` is a safe default. Values of `2.0-3.0` produce stronger but potentially less stable sliders.
+- **Multiple targets**: Text-only mode supports multiple `[[targets]]` blocks. Each step randomly selects one target, so all directions get trained evenly.
+- **Inference**: Use the trained LoRA with any multiplier value. Positive multipliers enhance the positive attribute, negative multipliers enhance the negative attribute. Values beyond `[-1, +1]` extrapolate the effect.
 
 ---
 
