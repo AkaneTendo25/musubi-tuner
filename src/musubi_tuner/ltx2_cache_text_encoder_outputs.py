@@ -29,6 +29,7 @@ logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
 DEFAULT_SAMPLE_PROMPTS_CACHE = "ltx2_sample_prompts_cache.pt"
+DEFAULT_PRESERVATION_CACHE = "ltx2_preservation_cache.pt"
 
 
 def encode_and_save_batch_official_gemma(
@@ -166,6 +167,66 @@ def _precache_sample_prompts(
     }
     torch.save(payload, cache_path)
     logger.info("Saved precached sample prompts to %s", cache_path)
+
+
+def _precache_preservation_prompts(
+    args: argparse.Namespace,
+    *,
+    datasets: list,
+    text_encoder,
+    audio_video: bool,
+    autocast_dtype: torch.dtype | None,
+    device: torch.device,
+) -> None:
+    """Encode blank/class prompts for preservation techniques and save to disk."""
+    blank = getattr(args, "blank_preservation", False)
+    dop = getattr(args, "dop", False)
+    dop_class = getattr(args, "dop_class_prompt", "") or ""
+
+    if not blank and not dop:
+        logger.warning("--precache_preservation_prompts set but neither --blank_preservation nor --dop enabled, skipping.")
+        return
+
+    cache_path = getattr(args, "preservation_prompts_cache", None)
+    if not cache_path:
+        if not datasets:
+            raise ValueError("No datasets available to resolve preservation cache directory")
+        cache_dir = getattr(datasets[0], "cache_directory", None)
+        if not cache_dir:
+            raise ValueError("First dataset has no cache_directory; set cache_directory in dataset config")
+        cache_path = os.path.join(cache_dir, DEFAULT_PRESERVATION_CACHE)
+
+    payload: dict = {"version": 1, "audio_video": audio_video}
+
+    # Always encode as video-only for preservation (even in AV mode)
+    def _encode_video_only(prompt_text: str) -> tuple[torch.Tensor, torch.Tensor]:
+        embed, mask = _encode_prompt_text_ltx2(
+            text_encoder, prompt_text,
+            audio_video=audio_video, ltx_mode="video",  # force video-only encoding
+            autocast_dtype=autocast_dtype, device=device,
+        )
+        # In AV mode the encoder still concatenates; take video half
+        if audio_video and embed.shape[-1] % 2 == 0:
+            embed = embed[..., : embed.shape[-1] // 2]
+        return embed, mask
+
+    if blank:
+        embed, mask = _encode_video_only("")
+        payload["blank_embed"] = embed
+        payload["blank_mask"] = mask
+        logger.info("Preservation cache: encoded blank prompt  embed=%s", tuple(embed.shape))
+
+    if dop:
+        if not dop_class:
+            logger.warning("--dop set but no --dop_class_prompt provided, encoding empty string.")
+        embed, mask = _encode_video_only(dop_class)
+        payload["dop_embed"] = embed
+        payload["dop_mask"] = mask
+        payload["dop_class_prompt"] = dop_class
+        logger.info("Preservation cache: encoded DOP class prompt %r  embed=%s", dop_class, tuple(embed.shape))
+
+    torch.save(payload, cache_path)
+    logger.info("Saved preservation prompt cache to %s", cache_path)
 
 
 def main() -> None:
@@ -312,6 +373,16 @@ def main() -> None:
             device=device,
         )
 
+    if getattr(args, "precache_preservation_prompts", False):
+        _precache_preservation_prompts(
+            args,
+            datasets=datasets,
+            text_encoder=text_encoder,
+            audio_video=audio_video,
+            autocast_dtype=autocast_dtype,
+            device=device,
+        )
+
     cache_text_encoder_outputs.process_text_encoder_batches(
         num_workers,
         args.skip_existing,
@@ -379,6 +450,38 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         help=(
             "Path to write precached sample prompt embeddings (.pt). Defaults to "
             "the first dataset's cache_directory/ltx2_sample_prompts_cache.pt"
+        ),
+    )
+
+    # -- Preservation prompt precaching --
+    parser.add_argument(
+        "--precache_preservation_prompts",
+        action="store_true",
+        help="Cache Gemma embeddings for preservation prompts (blank/DOP class) and save to --preservation_prompts_cache.",
+    )
+    parser.add_argument(
+        "--blank_preservation",
+        action="store_true",
+        help="Include blank prompt in preservation cache (for --blank_preservation during training).",
+    )
+    parser.add_argument(
+        "--dop",
+        action="store_true",
+        help="Include DOP class prompt in preservation cache (for --dop during training).",
+    )
+    parser.add_argument(
+        "--dop_class_prompt",
+        type=str,
+        default="",
+        help="Class prompt for DOP preservation, e.g. 'woman' (without trigger word).",
+    )
+    parser.add_argument(
+        "--preservation_prompts_cache",
+        type=str,
+        default=None,
+        help=(
+            "Path to write precached preservation prompt embeddings (.pt). Defaults to "
+            "the first dataset's cache_directory/ltx2_preservation_cache.pt"
         ),
     )
 

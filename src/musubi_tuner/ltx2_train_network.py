@@ -478,6 +478,141 @@ class LTX2NetworkTrainer(NetworkTrainer):
         self.default_guidance_scale = 3.0
         self._audio_preview_config: Optional[Dict[str, int | float]] = None
 
+        # Preservation / regularization (off by default — zero overhead)
+        self._preservation_active: bool = False
+        self._preservation_helper = None
+        self._last_dit_inputs: Optional[Dict[str, Any]] = None
+
+    # ------------------------------------------------------------------
+    # Preservation / regularization hooks
+    # ------------------------------------------------------------------
+
+    def pre_train_hook(self, args: argparse.Namespace, accelerator: Accelerator) -> None:
+        self._setup_preservation(args, accelerator)
+
+    def _setup_preservation(self, args: argparse.Namespace, accelerator: Accelerator) -> None:
+        """Parse preservation CLI flags and prepare helper.  No-op when no flags are set."""
+        blank = getattr(args, "blank_preservation", False)
+        dop = getattr(args, "dop", False)
+        prior_div = getattr(args, "prior_divergence", False)
+
+        if not (blank or dop or prior_div):
+            return
+
+        from musubi_tuner.preservation import PreservationConfig, PreservationHelper, parse_preservation_args
+
+        blank_kw = parse_preservation_args(getattr(args, "blank_preservation_args", None))
+        dop_kw = parse_preservation_args(getattr(args, "dop_args", None))
+        prior_kw = parse_preservation_args(getattr(args, "prior_divergence_args", None))
+
+        cfg = PreservationConfig(
+            blank_preservation=blank,
+            blank_multiplier=float(blank_kw.get("multiplier", 1.0)),
+            dop=dop,
+            dop_multiplier=float(dop_kw.get("multiplier", 1.0)),
+            dop_class_prompt=dop_kw.get("class", ""),
+            prior_divergence=prior_div,
+            prior_divergence_multiplier=float(prior_kw.get("multiplier", 0.1)),
+        )
+
+        # Warn about DOP without class prompt (acts identical to blank preservation)
+        if dop and not cfg.dop_class_prompt:
+            logger.warning(
+                "DOP enabled but no class prompt specified (--dop_args class=<prompt>). "
+                "This will use an empty prompt, which is identical to blank preservation."
+            )
+
+        helper = PreservationHelper(cfg)
+        helper.encode_prompts(self, args, accelerator)
+
+        self._preservation_helper = helper
+        self._preservation_active = True
+
+        # Log VRAM impact: each technique adds extra transformer forward passes per step
+        extra_fwd = 0
+        extra_bwd = 0
+        if blank:
+            extra_fwd += 2  # no-grad OFF + with-grad ON
+            extra_bwd += 1
+        if dop:
+            extra_fwd += 2
+            extra_bwd += 1
+        if prior_div:
+            extra_fwd += 1  # no-grad OFF only
+        logger.info(
+            "Preservation enabled: blank=%s (x%.2f), dop=%s (class=%r, x%.2f), prior_div=%s (x%.3f)",
+            cfg.blank_preservation, cfg.blank_multiplier,
+            cfg.dop, cfg.dop_class_prompt, cfg.dop_multiplier,
+            cfg.prior_divergence, cfg.prior_divergence_multiplier,
+        )
+        logger.warning(
+            "Preservation adds +%d forward passes and +%d backward passes per training step. "
+            "This significantly increases VRAM usage and step time.",
+            extra_fwd, extra_bwd,
+        )
+
+    def compute_prior_divergence_addition(
+        self,
+        args: argparse.Namespace,
+        accelerator: Accelerator,
+        transformer: torch.nn.Module,
+        network: torch.nn.Module,
+        video_pred: torch.Tensor,
+        network_dtype: torch.dtype,
+    ) -> Optional[torch.Tensor]:
+        """Return ``-MSE(video_pred, prior_pred) * mult`` or None."""
+        if not self._preservation_active or self._preservation_helper is None:
+            return None
+        cfg = self._preservation_helper.config
+        if not cfg.prior_divergence:
+            return None
+        dit_inputs = self._last_dit_inputs
+        if dit_inputs is None:
+            return None
+
+        prior_pred = self._preservation_helper.compute_prior_divergence(
+            self, transformer, network, accelerator, dit_inputs, network_dtype,
+        )
+        div_loss = -F.mse_loss(video_pred.float(), prior_pred.float()) * cfg.prior_divergence_multiplier
+        if not torch.isfinite(div_loss):
+            logger.warning("Prior divergence loss is non-finite (%.4g), skipping.", div_loss.item())
+            return None
+        return div_loss
+
+    def preservation_backward(
+        self,
+        args: argparse.Namespace,
+        accelerator: Accelerator,
+        transformer: torch.nn.Module,
+        network: torch.nn.Module,
+        network_dtype: torch.dtype,
+    ) -> Dict[str, float]:
+        """Run preservation backward passes for blank and DOP.  Returns loss dict for logging."""
+        if not self._preservation_active or self._preservation_helper is None:
+            return {}
+        dit_inputs = self._last_dit_inputs
+        self._last_dit_inputs = None  # clear for next step
+        if dit_inputs is None:
+            return {}
+
+        losses: Dict[str, float] = {}
+        helper = self._preservation_helper
+        cfg = helper.config
+
+        if cfg.blank_preservation:
+            val = helper.compute_preservation_backward(
+                "blank", self, transformer, network, accelerator, dit_inputs, network_dtype,
+            )
+            losses["loss/blank_pres"] = val
+
+        if cfg.dop:
+            val = helper.compute_preservation_backward(
+                "dop", self, transformer, network, accelerator, dit_inputs, network_dtype,
+            )
+            losses["loss/dop"] = val
+
+        return losses
+
     def _get_audio_preview_config(self, args: argparse.Namespace, transformer) -> Dict[str, int | float]:
         if self._audio_preview_config is not None:
             return self._audio_preview_config
@@ -1577,6 +1712,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
             if out_audio["audio_loss_weight"] < 0.0:
                 raise ValueError(f"audio_loss_weight must be >= 0. Got: {out_audio['audio_loss_weight']}")
 
+            self._last_dit_inputs = None  # audio-only path — skip preservation
             return out_audio, torch.tensor(0.0, device=accelerator.device)
 
         first_frame_p = float(getattr(args, "ltx2_first_frame_conditioning_p", 0.0))
@@ -1702,6 +1838,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
             if out_v2v["video_loss_weight"] < 0.0:
                 raise ValueError(f"video_loss_weight must be >= 0. Got: {out_v2v['video_loss_weight']}")
 
+            self._last_dit_inputs = None  # reference-latent path — skip preservation
             return out_v2v, torch.tensor(0.0, device=accelerator.device)
 
         audio_latents = None
@@ -1808,6 +1945,19 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 if frames > 0:
                     video_loss_mask[video_conditioning_enabled, 0] = False
 
+        resolved_transformer_options = transformer_options if video_conditioning_mask_tokens is not None else {"patches_replace": {}}
+
+        # Store inputs for preservation techniques (no-op when flag is off)
+        if self._preservation_active:
+            self._last_dit_inputs = {
+                "model_input": model_input,
+                "model_timesteps": model_timesteps,
+                "text_embeds": text_embeds,
+                "text_mask": text_mask,
+                "frame_rate": frame_rate,
+                "transformer_options": resolved_transformer_options,
+            }
+
         if getattr(args, "fp8_base", False) or getattr(args, "fp8_scaled", False):
             self._ensure_fp8_buffers_on_device(transformer)
         with accelerator.autocast():
@@ -1817,7 +1967,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 context=text_embeds,
                 attention_mask=text_mask,
                 frame_rate=frame_rate,
-                transformer_options=transformer_options if video_conditioning_mask_tokens is not None else {"patches_replace": {}},
+                transformer_options=resolved_transformer_options,
             )
 
         video_pred = model_pred
@@ -3390,6 +3540,54 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         default=True,
         help="Disable automatic conversion of saved LoRA to ComfyUI format. "
              "By default, a *_comfy.safetensors file is created alongside the original.",
+    )
+
+    # -- Preservation / regularization flags --
+    parser.add_argument(
+        "--blank_preservation",
+        action="store_true",
+        help="Regularize LoRA to not change blank-prompt output (MSE between LoRA ON/OFF with empty prompt).",
+    )
+    parser.add_argument(
+        "--blank_preservation_args",
+        type=str,
+        nargs="*",
+        help="Key=value args for blank preservation, e.g. multiplier=0.5",
+    )
+    parser.add_argument(
+        "--dop",
+        action="store_true",
+        help="Differential Output Preservation: regularize LoRA to not change class-prompt output.",
+    )
+    parser.add_argument(
+        "--dop_args",
+        type=str,
+        nargs="*",
+        help="Key=value args for DOP, e.g. class=woman multiplier=1.0",
+    )
+    parser.add_argument(
+        "--prior_divergence",
+        action="store_true",
+        help="Encourage LoRA output to diverge from base model on training prompts.",
+    )
+    parser.add_argument(
+        "--prior_divergence_args",
+        type=str,
+        nargs="*",
+        help="Key=value args for prior divergence, e.g. multiplier=0.1",
+    )
+    parser.add_argument(
+        "--use_precached_preservation",
+        action="store_true",
+        help="Load preservation embeddings from precached .pt file instead of loading Gemma. "
+             "Run ltx2_cache_text_encoder_outputs.py with --precache_preservation_prompts first.",
+    )
+    parser.add_argument(
+        "--preservation_prompts_cache",
+        type=str,
+        default=None,
+        help="Path to precached preservation prompt embeddings (.pt). "
+             "Defaults to <cache_directory>/ltx2_preservation_cache.pt. Requires --use_precached_preservation.",
     )
 
     return parser

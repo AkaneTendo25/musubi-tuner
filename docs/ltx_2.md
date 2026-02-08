@@ -202,6 +202,54 @@ accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 ltx2_tr
 - `--video_loss_weight`: Weight for video loss (default: 1.0).
 - `--audio_loss_weight`: Weight for audio loss in AV mode (default: 1.0).
 
+#### Preservation & Regularization
+
+Three optional techniques to improve LoRA quality by constraining how the LoRA changes the base model. All are disabled by default with zero overhead.
+
+**Blank Prompt Preservation** — Prevents the LoRA from altering the model's blank-prompt output (used as the CFG baseline during inference):
+```bash
+--blank_preservation --blank_preservation_args multiplier=1.0
+```
+
+**Differential Output Preservation (DOP)** — Prevents the LoRA from altering class-prompt output, scoping the LoRA effect to the trigger word only:
+```bash
+--dop --dop_args class=woman multiplier=1.0
+```
+The `class` parameter should be a general description without your trigger word (e.g., `woman`, `cat`, `landscape`).
+
+**Prior Divergence** — Encourages the LoRA to produce outputs that differ from the base model on training prompts, preventing weak/timid LoRAs:
+```bash
+--prior_divergence --prior_divergence_args multiplier=0.1
+```
+
+All three can be combined:
+```bash
+--blank_preservation --blank_preservation_args multiplier=0.5 ^
+--dop --dop_args class=woman multiplier=1.0 ^
+--prior_divergence --prior_divergence_args multiplier=0.1
+```
+
+| Technique | Extra forwards/step | Extra backwards/step | Recommended multiplier |
+|-----------|-------------------|---------------------|----------------------|
+| `--blank_preservation` | +2 | +1 | 0.5 - 1.0 |
+| `--dop` | +2 | +1 | 0.5 - 1.0 |
+| `--prior_divergence` | +1 | 0 | 0.05 - 0.1 |
+
+**VRAM note:** Each technique adds transformer forward passes per step. Using all three adds +5 forwards and +2 backwards. This significantly increases VRAM usage and step time. Not recommended with `--blocks_to_swap` on low-VRAM GPUs.
+
+**Precaching preservation prompts:** Blank preservation and DOP require Gemma to encode their prompts at training startup. To avoid loading Gemma during training, precache the embeddings during the text encoder caching step:
+```bash
+python ltx2_cache_text_encoder_outputs.py --dataset_config ... --ltx2_checkpoint ... --gemma_root ... ^
+  --precache_preservation_prompts --blank_preservation --dop --dop_class_prompt "woman"
+```
+Then add the `--use_precached_preservation` flag during training:
+```bash
+python ltx2_train_network.py ... ^
+  --blank_preservation --dop --dop_args class=woman ^
+  --use_precached_preservation
+```
+The cache file is saved to `<cache_directory>/ltx2_preservation_cache.pt` by default (same directory as your dataset cache). Use `--preservation_prompts_cache <path>` to override the location in either command. Prior divergence does not need precaching (it uses the training batch's own embeddings).
+
 #### Timestep Sampling
 - `--timestep_sampling shifted_logit_normal`: Default LTX-2 method. Uses a shifted logit-normal distribution where the shift is computed based on sequence length (frames × height × width).
 - `--timestep_sampling uniform`: Simple uniform sampling from [0, 1]. Alternative if you want simpler behavior.
@@ -468,6 +516,7 @@ cache_directory/
 | Audio caching fails | torchaudio missing | Install torchaudio before running `ltx2_cache_latents.py` |
 | Sampling OOM | VAE decode too large | Enable `--sample_tiled_vae` or reduce `--sample_vae_temporal_tile_size` |
 | Crash with block swap (esp. RTX 5090) | `--use_pinned_memory_for_block_swap` bug | Remove `--use_pinned_memory_for_block_swap` from training arguments |
+| `stack expects each tensor to be equal size` during AV training | Mixed audio/non-audio videos in the same batch — text embeddings are 7680-dim for AV items vs 3840-dim for video-only, and `torch.stack` fails | Add `--separate_audio_buckets` to training args. This is **required** when your dataset has a mix of videos with and without audio at `batch_size > 1`. At `batch_size=1` the flag has no effect. When all videos have audio (or all don't), the flag is also unnecessary |
 | Wrong frame count in cached latents | Auto-detected FPS incorrect (e.g., VFR video) | Set `source_fps` explicitly in TOML config to override auto-detection |
 | Too few frames from high-FPS video | FPS resampling working correctly (e.g., 60fps→24fps = 40% of frames) | This is expected behavior. Set `target_fps = 60` if you want to keep all frames |
 | Audio/video out of sync after caching | Source FPS mismatch causing wrong time-stretch | Check "Auto-detected source FPS" log line; set `source_fps` explicitly if wrong |
