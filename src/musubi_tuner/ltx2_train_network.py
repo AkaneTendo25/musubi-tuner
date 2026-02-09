@@ -483,12 +483,17 @@ class LTX2NetworkTrainer(NetworkTrainer):
         self._preservation_helper = None
         self._last_dit_inputs: Optional[Dict[str, Any]] = None
 
+        # CREPA (off by default)
+        self._crepa = None
+
     # ------------------------------------------------------------------
     # Preservation / regularization hooks
     # ------------------------------------------------------------------
 
-    def pre_train_hook(self, args: argparse.Namespace, accelerator: Accelerator) -> None:
+    def pre_train_hook(self, args: argparse.Namespace, accelerator: Accelerator,
+                       transformer=None, network=None) -> None:
         self._setup_preservation(args, accelerator)
+        self._setup_crepa(args, accelerator, transformer)
 
     def _setup_preservation(self, args: argparse.Namespace, accelerator: Accelerator) -> None:
         """Parse preservation CLI flags and prepare helper.  No-op when no flags are set."""
@@ -550,6 +555,60 @@ class LTX2NetworkTrainer(NetworkTrainer):
             "This significantly increases VRAM usage and step time.",
             extra_fwd, extra_bwd,
         )
+
+    def _setup_crepa(self, args: argparse.Namespace, accelerator: Accelerator,
+                     transformer=None) -> None:
+        """Parse CREPA CLI flags and install hooks.  No-op when ``--crepa`` is not set."""
+        if not getattr(args, "crepa", False):
+            return
+        if transformer is None:
+            logger.warning("CREPA enabled but transformer not available — skipping setup")
+            return
+
+        from musubi_tuner.crepa import CREPAConfig, CREPAModule, parse_crepa_args
+
+        kw = parse_crepa_args(getattr(args, "crepa_args", None))
+
+        # Build config — convert types from string values
+        cfg_kwargs: Dict[str, Any] = {}
+        _int_keys = {"student_block_idx", "teacher_block_idx", "num_neighbors", "warmup_steps", "max_steps"}
+        _float_keys = {"lambda_crepa", "tau"}
+        _bool_keys = {"normalize"}
+        for k, v in kw.items():
+            if k in _int_keys:
+                cfg_kwargs[k] = int(v)
+            elif k in _float_keys:
+                cfg_kwargs[k] = float(v)
+            elif k in _bool_keys:
+                cfg_kwargs[k] = v.lower() in ("true", "1", "yes")
+            else:
+                cfg_kwargs[k] = v
+
+        # Auto-fill max_steps for schedule
+        if "max_steps" not in cfg_kwargs and hasattr(args, "max_train_steps"):
+            cfg_kwargs["max_steps"] = args.max_train_steps
+
+        config = CREPAConfig(**cfg_kwargs)
+
+        unwrapped = accelerator.unwrap_model(transformer)
+        module = CREPAModule(config, unwrapped)
+
+        # Determine dtype from model
+        first_param = next(iter(unwrapped.parameters()), None)
+        dtype = first_param.dtype if first_param is not None else torch.float32
+
+        module.setup(accelerator.device, dtype)
+
+        # Try to load existing projector weights (for resume)
+        if args.output_dir:
+            proj_path = os.path.join(args.output_dir, "crepa_projector.safetensors")
+            if os.path.exists(proj_path):
+                from safetensors.torch import load_file
+                sd = load_file(proj_path)
+                module.load_state_dict(sd)
+                logger.info("CREPA: resumed projector weights from %s", proj_path)
+
+        self._crepa = module
 
     def compute_prior_divergence_addition(
         self,
@@ -955,7 +1014,19 @@ class LTX2NetworkTrainer(NetworkTrainer):
         return False
 
     def post_save_checkpoint_hook(self, args, ckpt_file, ckpt_name, accelerator, force_sync_upload=False):
-        """Convert saved LoRA to ComfyUI format"""
+        """Convert saved LoRA to ComfyUI format and save CREPA projector."""
+        # Save CREPA projector weights alongside LoRA checkpoint
+        if self._crepa is not None:
+            try:
+                from safetensors.torch import save_file
+                proj_sd = self._crepa.state_dict()
+                if proj_sd:
+                    proj_file = os.path.join(args.output_dir, "crepa_projector.safetensors")
+                    save_file(proj_sd, proj_file)
+                    accelerator.print(f"Saved CREPA projector: {proj_file}")
+            except Exception as e:
+                accelerator.print(f"Warning: Failed to save CREPA projector: {e}")
+
         if not getattr(args, 'convert_to_comfy', True):
             return
 
@@ -3588,6 +3659,21 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         default=None,
         help="Path to precached preservation prompt embeddings (.pt). "
              "Defaults to <cache_directory>/ltx2_preservation_cache.pt. Requires --use_precached_preservation.",
+    )
+
+    # -- CREPA (Cross-frame Representation Alignment) --
+    parser.add_argument(
+        "--crepa",
+        action="store_true",
+        help="Enable CREPA temporal consistency regularization (arxiv 2506.09229). "
+             "Aligns DiT hidden states across video frames via a small projector MLP.",
+    )
+    parser.add_argument(
+        "--crepa_args",
+        type=str,
+        nargs="*",
+        help="Key=value args for CREPA, e.g. student_block_idx=16 teacher_block_idx=32 "
+             "lambda_crepa=0.1 tau=1.0 num_neighbors=2 schedule=constant normalize=true",
     )
 
     return parser

@@ -41,7 +41,10 @@
 	}
 
 	function updateConfig(key, value) {
-		projectConfig.update((c) => { if (c) c[key] = value; return c; });
+		projectConfig.update((c) => {
+			if (!c) return c;
+			return { ...c, [key]: value };
+		});
 		saveProjectDebounced();
 	}
 

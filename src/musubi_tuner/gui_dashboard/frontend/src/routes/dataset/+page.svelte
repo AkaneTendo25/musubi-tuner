@@ -30,12 +30,13 @@
 				source_fps: null,
 				target_fps: null
 			};
+			const ds = { ...(c.dataset || {}) };
 			if (isValidation) {
-				c.dataset.validation_datasets = [...(c.dataset.validation_datasets || []), entry];
+				ds.validation_datasets = [...(ds.validation_datasets || []), entry];
 			} else {
-				c.dataset.datasets = [...(c.dataset.datasets || []), entry];
+				ds.datasets = [...(ds.datasets || []), entry];
 			}
-			return c;
+			return { ...c, dataset: ds };
 		});
 		saveProjectDebounced();
 	}
@@ -43,12 +44,13 @@
 	function removeDataset(index, isValidation = false) {
 		projectConfig.update((c) => {
 			if (!c) return c;
+			const ds = { ...(c.dataset || {}) };
 			if (isValidation) {
-				c.dataset.validation_datasets = c.dataset.validation_datasets.filter((_, i) => i !== index);
+				ds.validation_datasets = (ds.validation_datasets || []).filter((_, i) => i !== index);
 			} else {
-				c.dataset.datasets = c.dataset.datasets.filter((_, i) => i !== index);
+				ds.datasets = (ds.datasets || []).filter((_, i) => i !== index);
 			}
-			return c;
+			return { ...c, dataset: ds };
 		});
 		saveProjectDebounced();
 	}
@@ -56,8 +58,7 @@
 	function updateGeneral(key, value) {
 		projectConfig.update((c) => {
 			if (!c) return c;
-			c.dataset.general[key] = value;
-			return c;
+			return { ...c, dataset: { ...(c.dataset || {}), general: { ...(c.dataset?.general || {}), [key]: value } } };
 		});
 		saveProjectDebounced();
 	}

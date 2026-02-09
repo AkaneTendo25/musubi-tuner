@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException, Request
 
-from musubi_tuner.gui_dashboard.command_builder import export_dataset_toml
+from musubi_tuner.gui_dashboard.toml_export import export_dataset_toml
 from musubi_tuner.gui_dashboard.project_schema import DatasetConfig, ProjectConfig
 
 router = APIRouter(prefix="/api/dataset", tags=["dataset"])
@@ -54,7 +54,7 @@ async def preview_toml(request: Request):
     """Return what the TOML file would look like without writing it."""
     config = _get_config(request)
 
-    from musubi_tuner.gui_dashboard.command_builder import _write_toml_fallback, build_dataset_toml_path
+    from musubi_tuner.gui_dashboard.toml_export import _write_toml_fallback, build_dataset_toml_path
     import io
 
     # Generate TOML content as string
@@ -64,7 +64,7 @@ async def preview_toml(request: Request):
         "bucket_no_upscale": config.dataset.general.bucket_no_upscale,
     }
 
-    from musubi_tuner.gui_dashboard.command_builder import _toml_value
+    from musubi_tuner.gui_dashboard.toml_export import _toml_value
 
     datasets = []
     for entry in config.dataset.datasets:

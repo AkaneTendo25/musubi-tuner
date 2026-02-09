@@ -3,6 +3,7 @@ import { writable, get } from 'svelte/store';
 export const processStatuses = writable({
 	cache_latents: { state: 'idle', exit_code: null },
 	cache_text: { state: 'idle', exit_code: null },
+	cache_dino: { state: 'idle', exit_code: null },
 	training: { state: 'idle', exit_code: null },
 	inference: { state: 'idle', exit_code: null },
 	slider_training: { state: 'idle', exit_code: null }
@@ -11,6 +12,7 @@ export const processStatuses = writable({
 export const processLogs = writable({
 	cache_latents: [],
 	cache_text: [],
+	cache_dino: [],
 	training: [],
 	inference: [],
 	slider_training: []

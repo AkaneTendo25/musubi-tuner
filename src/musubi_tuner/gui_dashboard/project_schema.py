@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Literal, Optional
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class GeneralConfig(BaseModel):
@@ -67,6 +67,9 @@ class CachingConfig(BaseModel):
     ltx2_audio_source: Literal["video", "audio_files"] = "video"
     ltx2_audio_dir: str = ""
     ltx2_audio_ext: str = ".wav"
+    # DINOv2 feature caching (for CREPA dino mode)
+    dino_model: Literal["dinov2_vits14", "dinov2_vitb14", "dinov2_vitl14", "dinov2_vitg14"] = "dinov2_vitb14"
+    dino_batch_size: int = 16
 
 
 class TrainingConfig(BaseModel):
@@ -194,6 +197,19 @@ class TrainingConfig(BaseModel):
     use_precached_preservation: bool = False
     preservation_prompts_cache: str = ""
 
+    # CREPA
+    crepa: bool = False
+    crepa_mode: Literal["backbone", "dino"] = "backbone"
+    crepa_student_block_idx: int = 16
+    crepa_teacher_block_idx: int = 32
+    crepa_dino_model: Literal["dinov2_vits14", "dinov2_vitb14", "dinov2_vitl14", "dinov2_vitg14"] = "dinov2_vitb14"
+    crepa_lambda: float = 0.1
+    crepa_tau: float = 1.0
+    crepa_num_neighbors: int = 2
+    crepa_schedule: Literal["constant", "linear", "cosine"] = "constant"
+    crepa_warmup_steps: int = 0
+    crepa_normalize: bool = True
+
     # Loss weighting
     video_loss_weight: float = 1.0
     audio_loss_weight: float = 1.0
@@ -243,6 +259,8 @@ class SliderTargetConfig(BaseModel):
 
 
 class SliderConfig(BaseModel):
+    model_config = ConfigDict(extra="ignore")  # old projects may have fields that moved to TrainingConfig
+
     # Mode
     mode: Literal["text", "reference"] = "text"
 
@@ -258,43 +276,16 @@ class SliderConfig(BaseModel):
     # Sampling
     sample_slider_range: str = "-2,-1,0,1,2"
 
-    # Model (shared with training)
-    ltx2_checkpoint: str = ""
-    gemma_root: str = ""
-    fp8_base: bool = False
-    fp8_scaled: bool = False
-    flash_attn: bool = True
-    gemma_load_in_8bit: bool = False
-    gemma_load_in_4bit: bool = False
-    mixed_precision: str = "bf16"
-
-    # LoRA
-    network_dim: int = 16
-    network_alpha: int = 16
-
-    # Optimizer
-    learning_rate: float = 1e-4
-    optimizer_type: str = "adamw8bit"
-    optimizer_args: str = ""
+    # Slider-specific overrides (empty = inherit from training config)
     max_train_steps: int = 500
-    gradient_accumulation_steps: int = 1
-    max_grad_norm: float = 1.0
-
-    # Memory
-    blocks_to_swap: Optional[int] = None
-    gradient_checkpointing: bool = True
-
-    # Output
-    output_dir: str = ""
     output_name: str = "ltx2_slider"
-    save_every_n_steps: Optional[int] = None
-    seed: Optional[int] = None
 
 
 class ProjectConfig(BaseModel):
     version: int = 1
     name: str = "New Project"
     project_dir: str = ""
+    model_dir: str = ""  # directory where downloaded models are stored
     dataset: DatasetConfig = Field(default_factory=DatasetConfig)
     caching: CachingConfig = Field(default_factory=CachingConfig)
     training: TrainingConfig = Field(default_factory=TrainingConfig)

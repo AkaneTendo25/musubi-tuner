@@ -214,9 +214,17 @@ def _gather_scan_roots() -> list[Path]:
 @router.get("/scan-checkpoints")
 async def scan_checkpoints(
     type: str = Query(..., description="Type: 'ltx2' or 'gemma'"),
+    extra_paths: str = Query("", description="Comma-separated extra directories to scan"),
 ):
     """Scan common locations for model checkpoints."""
     roots = _gather_scan_roots()
+    if extra_paths:
+        for p in extra_paths.split(","):
+            p = p.strip()
+            if p:
+                pp = Path(p)
+                if pp.is_dir():
+                    roots.append(pp)
     if type == "ltx2":
         return {"results": _scan_ltx_checkpoints(roots)}
     elif type == "gemma":
@@ -231,24 +239,14 @@ async def scan_checkpoints(
 
 # Predefined download sources
 _DOWNLOAD_PRESETS: dict[str, dict] = {
-    "ltxv-2b": {
-        "label": "LTXV 0.9.7 (video-only)",
-        "repo": "Lightricks/LTX-Video-0.9.7-dev",
-        "filename": "ltx-video-2b-v0.9.7.safetensors",
-    },
-    "ltxv-13b": {
-        "label": "LTXV 13B (video-only)",
-        "repo": "Lightricks/LTX-Video-13b-0.9.7-dev",
-        "filename": "ltx-video-13b-v0.9.7.safetensors",
-    },
     "ltxav": {
-        "label": "LTXAV (audio+video)",
-        "repo": "Lightricks/LTXV-Audio-v0.9.1",
-        "filename": "ltxv-audio-v0.9.1.safetensors",
+        "label": "LTXAV 19B (audio+video)",
+        "repo": "Lightricks/LTX-2",
+        "filename": "ltx-2-19b-dev.safetensors",
     },
-    "gemma-2b": {
-        "label": "Gemma 2 2B IT",
-        "repo": "google/gemma-2-2b-it",
+    "gemma-unsloth": {
+        "label": "Gemma 3 12B IT (unsloth)",
+        "repo": "unsloth/gemma-3-12b-it",
     },
 }
 

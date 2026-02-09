@@ -4,168 +4,16 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
-from typing import Optional
-
-try:
-    import tomli_w
-except ImportError:
-    tomli_w = None
-
-try:
-    import tomllib
-except ImportError:
-    try:
-        import tomli as tomllib
-    except ImportError:
-        tomllib = None
 
 from musubi_tuner.gui_dashboard.project_schema import ProjectConfig
-
-
-def _write_dataset_toml(config: ProjectConfig, output_path: Path) -> Path:
-    """Generate dataset_config.toml from project config and return path."""
-    doc: dict = {}
-
-    # General section
-    doc["general"] = {
-        "enable_bucket": config.dataset.general.enable_bucket,
-        "bucket_no_upscale": config.dataset.general.bucket_no_upscale,
-    }
-
-    # Datasets
-    datasets = []
-    for entry in config.dataset.datasets:
-        d: dict = {}
-        # Directory or JSONL source
-        if entry.jsonl_file:
-            key_prefix = {"video": "video", "image": "image", "audio": "audio"}[entry.type]
-            d[f"{key_prefix}_jsonl_file"] = entry.jsonl_file
-        else:
-            if entry.type == "video":
-                d["video_directory"] = entry.directory
-            elif entry.type == "image":
-                d["image_directory"] = entry.directory
-            elif entry.type == "audio":
-                d["audio_directory"] = entry.directory
-
-        d["cache_directory"] = entry.cache_directory
-        if entry.reference_cache_directory:
-            d["reference_cache_directory"] = entry.reference_cache_directory
-        if entry.control_directory:
-            d["control_directory"] = entry.control_directory
-        if entry.type != "audio":
-            d["resolution"] = [entry.resolution_w, entry.resolution_h]
-        d["batch_size"] = entry.batch_size
-        d["num_repeats"] = entry.num_repeats
-        d["caption_extension"] = entry.caption_extension
-
-        if entry.type == "video":
-            d["target_frames"] = [entry.target_frames]
-            d["frame_extraction"] = entry.frame_extraction
-            if entry.frame_sample is not None:
-                d["frame_sample"] = entry.frame_sample
-            if entry.max_frames is not None:
-                d["max_frames"] = entry.max_frames
-            if entry.frame_stride is not None:
-                d["frame_stride"] = entry.frame_stride
-            if entry.source_fps is not None:
-                d["source_fps"] = entry.source_fps
-            if entry.target_fps is not None:
-                d["target_fps"] = entry.target_fps
-
-        datasets.append(d)
-    doc["datasets"] = datasets
-
-    # Validation datasets
-    if config.dataset.validation_datasets:
-        val_datasets = []
-        for entry in config.dataset.validation_datasets:
-            d = {}
-            if entry.jsonl_file:
-                key_prefix = {"video": "video", "image": "image", "audio": "audio"}[entry.type]
-                d[f"{key_prefix}_jsonl_file"] = entry.jsonl_file
-            else:
-                if entry.type == "video":
-                    d["video_directory"] = entry.directory
-                elif entry.type == "image":
-                    d["image_directory"] = entry.directory
-                elif entry.type == "audio":
-                    d["audio_directory"] = entry.directory
-
-            d["cache_directory"] = entry.cache_directory
-            if entry.reference_cache_directory:
-                d["reference_cache_directory"] = entry.reference_cache_directory
-            if entry.control_directory:
-                d["control_directory"] = entry.control_directory
-            if entry.type != "audio":
-                d["resolution"] = [entry.resolution_w, entry.resolution_h]
-            d["batch_size"] = entry.batch_size
-            d["num_repeats"] = entry.num_repeats
-            d["caption_extension"] = entry.caption_extension
-
-            if entry.type == "video":
-                d["target_frames"] = [entry.target_frames]
-                d["frame_extraction"] = entry.frame_extraction
-                if entry.frame_sample is not None:
-                    d["frame_sample"] = entry.frame_sample
-                if entry.max_frames is not None:
-                    d["max_frames"] = entry.max_frames
-                if entry.frame_stride is not None:
-                    d["frame_stride"] = entry.frame_stride
-                if entry.source_fps is not None:
-                    d["source_fps"] = entry.source_fps
-                if entry.target_fps is not None:
-                    d["target_fps"] = entry.target_fps
-
-            val_datasets.append(d)
-        doc["validation_datasets"] = val_datasets
-
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    if tomli_w is not None:
-        output_path.write_bytes(tomli_w.dumps(doc).encode("utf-8"))
-    else:
-        # Fallback: write TOML manually
-        _write_toml_fallback(doc, output_path)
-
-    return output_path
-
-
-def _write_toml_fallback(doc: dict, path: Path):
-    """Simple TOML writer for when tomli_w is not available."""
-    lines = []
-
-    if "general" in doc:
-        lines.append("[general]")
-        for k, v in doc["general"].items():
-            lines.append(f"{k} = {_toml_value(v)}")
-        lines.append("")
-
-    for section_name in ("datasets", "validation_datasets"):
-        if section_name not in doc:
-            continue
-        for entry in doc[section_name]:
-            lines.append(f"[[{section_name}]]")
-            for k, v in entry.items():
-                lines.append(f"{k} = {_toml_value(v)}")
-            lines.append("")
-
-    path.write_text("\n".join(lines), encoding="utf-8")
-
-
-def _toml_value(v) -> str:
-    if isinstance(v, bool):
-        return "true" if v else "false"
-    if isinstance(v, int):
-        return str(v)
-    if isinstance(v, float):
-        return str(v)
-    if isinstance(v, str):
-        return f'"{v}"'
-    if isinstance(v, list):
-        items = ", ".join(_toml_value(i) for i in v)
-        return f"[{items}]"
-    return str(v)
+from musubi_tuner.gui_dashboard.toml_export import (
+    _toml_value,
+    _write_slider_toml,
+    _write_toml_fallback,
+    build_dataset_toml_path,
+    build_slider_toml_path,
+    export_dataset_toml,
+)
 
 
 def _find_script(name: str) -> str:
@@ -176,14 +24,6 @@ def _find_script(name: str) -> str:
     if script.exists():
         return str(script)
     raise FileNotFoundError(f"Script not found: {name}")
-
-
-def build_dataset_toml_path(config: ProjectConfig) -> Path:
-    return Path(config.project_dir) / "dataset_config.toml"
-
-
-def export_dataset_toml(config: ProjectConfig) -> Path:
-    return _write_dataset_toml(config, build_dataset_toml_path(config))
 
 
 def build_cache_latents_cmd(config: ProjectConfig) -> list[str]:
@@ -535,6 +375,33 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
     if t.training_comment:
         cmd += ["--training_comment", t.training_comment]
 
+    # CREPA
+    if t.crepa:
+        cmd.append("--crepa")
+        args_parts = []
+        if t.crepa_mode != "backbone":
+            args_parts.append(f"mode={t.crepa_mode}")
+        if t.crepa_student_block_idx != 16:
+            args_parts.append(f"student_block_idx={t.crepa_student_block_idx}")
+        if t.crepa_mode == "backbone" and t.crepa_teacher_block_idx != 32:
+            args_parts.append(f"teacher_block_idx={t.crepa_teacher_block_idx}")
+        if t.crepa_mode == "dino" and t.crepa_dino_model != "dinov2_vitb14":
+            args_parts.append(f"dino_model={t.crepa_dino_model}")
+        if t.crepa_lambda != 0.1:
+            args_parts.append(f"lambda_crepa={t.crepa_lambda}")
+        if t.crepa_tau != 1.0:
+            args_parts.append(f"tau={t.crepa_tau}")
+        if t.crepa_num_neighbors != 2:
+            args_parts.append(f"num_neighbors={t.crepa_num_neighbors}")
+        if t.crepa_schedule != "constant":
+            args_parts.append(f"schedule={t.crepa_schedule}")
+        if t.crepa_warmup_steps != 0:
+            args_parts.append(f"warmup_steps={t.crepa_warmup_steps}")
+        if not t.crepa_normalize:
+            args_parts.append("normalize=false")
+        if args_parts:
+            cmd += ["--crepa_args"] + args_parts
+
     # Preservation
     if t.blank_preservation:
         cmd.append("--blank_preservation")
@@ -584,53 +451,20 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
     return cmd
 
 
-def _write_slider_toml(config: ProjectConfig, output_path: Path) -> Path:
-    """Generate slider_config.toml from project config and return path."""
-    s = config.slider
-    doc: dict = {
-        "mode": s.mode,
-        "guidance_strength": s.guidance_strength,
-    }
-
-    # Parse sample_slider_range
-    try:
-        doc["sample_slider_range"] = [float(x.strip()) for x in s.sample_slider_range.split(",")]
-    except (ValueError, AttributeError):
-        doc["sample_slider_range"] = [-2.0, -1.0, 0.0, 1.0, 2.0]
-
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    # Write TOML with targets as [[targets]] array
-    lines = []
-    for k, v in doc.items():
-        lines.append(f"{k} = {_toml_value(v)}")
-    lines.append("")
-
-    for target in s.targets:
-        lines.append("[[targets]]")
-        lines.append(f'positive = "{target.positive}"')
-        lines.append(f'negative = "{target.negative}"')
-        if target.target_class:
-            lines.append(f'target_class = "{target.target_class}"')
-        lines.append(f"weight = {target.weight}")
-        lines.append("")
-
-    output_path.write_text("\n".join(lines), encoding="utf-8")
-    return output_path
-
-
-def build_slider_toml_path(config: ProjectConfig) -> Path:
-    return Path(config.project_dir) / "slider_config.toml"
-
-
 def build_slider_training_cmd(config: ProjectConfig) -> list[str]:
-    """Build CLI args for slider LoRA training via accelerate launch."""
+    """Build CLI args for slider LoRA training via accelerate launch.
+
+    Shared settings (model, LoRA, optimizer, memory, output) are inherited
+    from the training config.  Only slider-specific values (steps, output name,
+    slider config, latent dims) come from ``config.slider``.
+    """
     s = config.slider
+    t = config.training
     slider_toml = _write_slider_toml(config, build_slider_toml_path(config))
 
     cmd = [
         sys.executable, "-m", "accelerate.commands.launch",
-        "--mixed_precision", s.mixed_precision,
+        "--mixed_precision", t.mixed_precision,
         "--num_processes", "1",
         "--num_machines", "1",
         _find_script("ltx2_train_slider.py"),
@@ -639,56 +473,77 @@ def build_slider_training_cmd(config: ProjectConfig) -> list[str]:
     # Slider config
     cmd += ["--slider_config", str(slider_toml)]
 
-    # Model
-    cmd += ["--ltx2_checkpoint", s.ltx2_checkpoint]
-    if s.gemma_root:
-        cmd += ["--gemma_root", s.gemma_root]
-    if s.fp8_base:
+    # Model — from training config
+    cmd += ["--ltx2_checkpoint", t.ltx2_checkpoint]
+    if t.gemma_root:
+        cmd += ["--gemma_root", t.gemma_root]
+    if t.fp8_base:
         cmd.append("--fp8_base")
-    if s.fp8_scaled:
+    if t.fp8_scaled:
         cmd.append("--fp8_scaled")
-    if s.flash_attn:
+    if t.flash_attn:
         cmd.append("--flash_attn")
-    if s.gemma_load_in_8bit:
+    if t.gemma_load_in_8bit:
         cmd.append("--gemma_load_in_8bit")
-    if s.gemma_load_in_4bit:
+    if t.gemma_load_in_4bit:
         cmd.append("--gemma_load_in_4bit")
 
-    # Text mode latent dimensions
+    # Text mode latent dimensions — slider-specific
     if s.mode == "text":
         cmd += ["--latent_frames", str(s.latent_frames)]
         cmd += ["--latent_height", str(s.latent_height)]
         cmd += ["--latent_width", str(s.latent_width)]
 
-    # LoRA
-    cmd += ["--network_dim", str(s.network_dim)]
-    cmd += ["--network_alpha", str(s.network_alpha)]
+    # LoRA — from training config
+    cmd += ["--network_dim", str(t.network_dim)]
+    cmd += ["--network_alpha", str(t.network_alpha)]
 
-    # Optimizer
-    cmd += ["--learning_rate", str(s.learning_rate)]
-    cmd += ["--optimizer_type", s.optimizer_type]
-    if s.optimizer_args:
-        cmd += ["--optimizer_args"] + s.optimizer_args.split()
-    cmd += ["--gradient_accumulation_steps", str(s.gradient_accumulation_steps)]
-    cmd += ["--max_grad_norm", str(s.max_grad_norm)]
+    # Optimizer — from training config
+    cmd += ["--learning_rate", str(t.learning_rate)]
+    cmd += ["--optimizer_type", t.optimizer_type]
+    if t.optimizer_args:
+        cmd += ["--optimizer_args"] + t.optimizer_args.split()
+    cmd += ["--gradient_accumulation_steps", str(t.gradient_accumulation_steps)]
+    cmd += ["--max_grad_norm", str(t.max_grad_norm)]
 
-    # Schedule
+    # Schedule — slider override for steps
     cmd += ["--max_train_steps", str(s.max_train_steps)]
-    if s.seed is not None:
-        cmd += ["--seed", str(s.seed)]
+    if t.seed is not None:
+        cmd += ["--seed", str(t.seed)]
 
-    # Memory
-    if s.blocks_to_swap is not None:
-        cmd += ["--blocks_to_swap", str(s.blocks_to_swap)]
-    if s.gradient_checkpointing:
+    # Memory — from training config
+    if t.blocks_to_swap is not None:
+        cmd += ["--blocks_to_swap", str(t.blocks_to_swap)]
+    if t.gradient_checkpointing:
         cmd.append("--gradient_checkpointing")
 
-    # Output
-    if s.output_dir:
-        cmd += ["--output_dir", s.output_dir]
+    # Output — dir from training, name from slider
+    if t.output_dir:
+        cmd += ["--output_dir", t.output_dir]
     if s.output_name:
         cmd += ["--output_name", s.output_name]
-    if s.save_every_n_steps:
-        cmd += ["--save_every_n_steps", str(s.save_every_n_steps)]
+    if t.save_every_n_steps:
+        cmd += ["--save_every_n_steps", str(t.save_every_n_steps)]
+
+    return cmd
+
+
+def build_cache_dino_cmd(config: ProjectConfig) -> list[str]:
+    """Build CLI args for ltx2_cache_dino_features.py."""
+    toml_path = export_dataset_toml(config)
+    c = config.caching
+
+    cmd = [
+        sys.executable,
+        _find_script("ltx2_cache_dino_features.py"),
+        "--dataset_config", str(toml_path),
+        "--dino_model", c.dino_model,
+        "--dino_batch_size", str(c.dino_batch_size),
+    ]
+
+    if c.device:
+        cmd += ["--device", c.device]
+    if c.skip_existing:
+        cmd.append("--skip_existing")
 
     return cmd

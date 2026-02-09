@@ -1032,6 +1032,7 @@ class BucketBatchManager:
 
         audio_latents_per_item = []
         audio_lengths_per_item = []
+        dino_features_per_item = []
         diag_collect_keys = os.getenv("LTX2_NAN_DIAG", "0") == "1"
         item_keys = []
         latent_cache_paths = []
@@ -1043,6 +1044,13 @@ class BucketBatchManager:
             if audio_latent_cache_path is not None and os.path.exists(audio_latent_cache_path):
                 sd_audio = load_file(audio_latent_cache_path)
                 sd_latent = {**sd_latent, **sd_audio}
+
+            dino_cache_path = getattr(item_info, "dino_feature_cache_path", None)
+            if dino_cache_path is not None and os.path.exists(dino_cache_path):
+                sd_dino = load_file(dino_cache_path)
+                dino_features_per_item.append(sd_dino["dino_features"])  # [T_pixel, N_patches, D_dino]
+            else:
+                dino_features_per_item.append(None)
 
             reference_latent_cache_path = getattr(item_info, "reference_latent_cache_path", None)
             if reference_latent_cache_path is not None:
@@ -1227,6 +1235,22 @@ class BucketBatchManager:
                         conditions["audio_prompt_embeds"] = text[..., half:]
                     else:
                         conditions["video_prompt_embeds"] = text
+
+            # DINOv2 features (pre-cached, for CREPA dino mode)
+            if any(d is not None for d in dino_features_per_item):
+                if all(d is not None for d in dino_features_per_item):
+                    # Pad to max T_pixel and stack
+                    # Features are [T, N_patches, D] (patch tokens)
+                    max_t = max(d.shape[0] for d in dino_features_per_item)
+                    padded = []
+                    for d in dino_features_per_item:
+                        if d.shape[0] < max_t:
+                            # Pad along T dim only; N_patches and D are constant
+                            pad_shape = [max_t - d.shape[0]] + list(d.shape[1:])
+                            pad = torch.zeros(pad_shape, dtype=d.dtype)
+                            d = torch.cat([d, pad], dim=0)
+                        padded.append(d)
+                    conditions["dino_features"] = torch.stack(padded)  # [B, T_pixel, N_patches, D_dino]
 
             if conditions:
                 batch_tensor_data["conditions"] = conditions
@@ -2075,6 +2099,17 @@ class BaseDataset(torch.utils.data.Dataset):
             latent_cache_path = self.get_latent_cache_path(item_info)
         return self.get_audio_latent_cache_path_from_latent_cache_path(latent_cache_path)
 
+    def get_dino_feature_cache_path_from_latent_cache_path(self, latent_cache_path: str) -> str:
+        """Derive DINOv2 feature cache path: ``*_ltx2.safetensors`` → ``*_ltx2_dino.safetensors``."""
+        base_dir = os.path.dirname(latent_cache_path)
+        base_name = os.path.basename(latent_cache_path)
+        suffix = f"_{self.architecture}.safetensors"
+        if base_name.endswith(suffix):
+            base_name = base_name[: -len(suffix)] + f"_{self.architecture}_dino.safetensors"
+            return os.path.join(base_dir, base_name)
+        stem, _ext = os.path.splitext(base_name)
+        return os.path.join(base_dir, f"{stem}_{self.architecture}_dino.safetensors")
+
     def _append_audio_bucket_key(self, bucket_key: tuple[Any, ...], has_audio: bool) -> tuple[Any, ...]:
         if not self.separate_audio_buckets:
             return bucket_key
@@ -2497,6 +2532,9 @@ class ImageDataset(BaseDataset):
             item_info = ItemInfo(item_key, "", image_size, bucket_reso, latent_cache_path=cache_file)
             item_info.text_encoder_output_cache_path = text_encoder_output_cache_file
             item_info.audio_latent_cache_path = audio_latent_cache_file if has_audio else None
+
+            dino_cache_file = self.get_dino_feature_cache_path_from_latent_cache_path(cache_file)
+            item_info.dino_feature_cache_path = dino_cache_file if os.path.exists(dino_cache_file) else None
 
             bucket = bucketed_item_info.get(bucket_reso, [])
             for _ in range(self.num_repeats):
@@ -3026,6 +3064,9 @@ class VideoDataset(BaseDataset):
             item_info = ItemInfo(item_key, "", image_size, bucket_reso, frame_count=frame_count, latent_cache_path=cache_file)
             item_info.text_encoder_output_cache_path = text_encoder_output_cache_file
             item_info.audio_latent_cache_path = audio_latent_cache_file if has_audio else None
+
+            dino_cache_file = self.get_dino_feature_cache_path_from_latent_cache_path(cache_file)
+            item_info.dino_feature_cache_path = dino_cache_file if os.path.exists(dino_cache_file) else None
 
             bucket = bucketed_item_info.get(bucket_reso, [])
             for _ in range(self.num_repeats):

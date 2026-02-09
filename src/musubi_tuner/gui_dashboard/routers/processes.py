@@ -10,6 +10,7 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from sse_starlette.sse import EventSourceResponse
 
 from musubi_tuner.gui_dashboard.command_builder import (
+    build_cache_dino_cmd,
     build_cache_latents_cmd,
     build_cache_text_cmd,
     build_inference_cmd,
@@ -20,7 +21,7 @@ from musubi_tuner.gui_dashboard.process_manager import ProcessManager, ProcessSt
 
 router = APIRouter(tags=["processes"])
 
-VALID_TYPES = ("cache_latents", "cache_text", "training", "inference", "slider_training")
+VALID_TYPES = ("cache_latents", "cache_text", "cache_dino", "training", "inference", "slider_training")
 
 
 def _get_pm(request: Request) -> ProcessManager:
@@ -45,6 +46,8 @@ def _build_cmd(proc_type: str, config):
         return build_cache_latents_cmd(config)
     elif proc_type == "cache_text":
         return build_cache_text_cmd(config)
+    elif proc_type == "cache_dino":
+        return build_cache_dino_cmd(config)
     elif proc_type == "training":
         return build_training_cmd(config)
     elif proc_type == "inference":

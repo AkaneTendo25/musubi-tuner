@@ -175,11 +175,8 @@
 				success = 'Saved';
 				setTimeout(() => success = '', 2000);
 				projectConfig.update((c) => {
-					if (c) {
-						if (!c.training) c.training = {};
-						c.training.sample_prompts = filePath;
-					}
-					return c;
+					if (!c) return c;
+					return { ...c, training: { ...(c.training || {}), sample_prompts: filePath } };
 				});
 				saveProjectDebounced();
 			} else {

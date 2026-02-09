@@ -92,6 +92,20 @@ export async function loadProjectFromPath(path) {
 	return data.config;
 }
 
+/**
+ * Immutably update a section of the project config.
+ * Returns a new object so Svelte's writable store notifies subscribers.
+ * Usage: updateSection('training', 'crepa', true)
+ *        updateSection('caching', 'skip_existing', false)
+ */
+export function updateSection(section, key, value) {
+	projectConfig.update((c) => {
+		if (!c) return c;
+		return { ...c, [section]: { ...(c[section] || {}), [key]: value } };
+	});
+	saveProjectDebounced();
+}
+
 export function saveProjectDebounced() {
 	if (_saveTimer) clearTimeout(_saveTimer);
 	_saveTimer = setTimeout(async () => {

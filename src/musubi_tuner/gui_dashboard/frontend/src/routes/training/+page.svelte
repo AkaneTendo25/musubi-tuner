@@ -7,14 +7,11 @@
 	import CheckpointInput from '$lib/components/CheckpointInput.svelte';
 	import ProcessControls from '$lib/components/ProcessControls.svelte';
 	import CommandPanel from '$lib/components/CommandPanel.svelte';
-	import { projectConfig, projectLoaded, saveProjectDebounced } from '$lib/stores/project.js';
+	import { projectConfig, projectLoaded, updateSection } from '$lib/stores/project.js';
 	import { processStatuses, startProcess, stopProcess } from '$lib/stores/processes.js';
 	import { goto } from '$app/navigation';
 
-	function update(key, value) {
-		projectConfig.update((c) => { if (!c) return c; c.training[key] = value; return c; });
-		saveProjectDebounced();
-	}
+	function update(key, value) { updateSection('training', key, value); }
 
 	let t = $derived($projectConfig?.training || {});
 	let trainingStatus = $derived($processStatuses.training || { state: 'idle', exit_code: null });
@@ -37,8 +34,8 @@
 			<div class="space-y-3">
 				<FormGroup title="Model">
 					<div class="space-y-2 pt-2">
-						<CheckpointInput label="LTX-2 Checkpoint" value={t.ltx2_checkpoint || ''} onchange={(v) => update('ltx2_checkpoint', v)} showFiles scanType="ltx2" tooltip="Path to LTX-2 checkpoint" />
-						<CheckpointInput label="Gemma Root" value={t.gemma_root || ''} onchange={(v) => update('gemma_root', v)} scanType="gemma" tooltip="Gemma text encoder directory" />
+						<CheckpointInput label="LTX-2 Checkpoint" value={t.ltx2_checkpoint || ''} onchange={(v) => update('ltx2_checkpoint', v)} showFiles tooltip="Path to LTX-2 checkpoint" />
+						<CheckpointInput label="Gemma Root" value={t.gemma_root || ''} onchange={(v) => update('gemma_root', v)} tooltip="Gemma text encoder directory" />
 						<div class="grid grid-cols-2 gap-2">
 							<FormSelect label="Mode" value={t.ltx2_mode || 'video'} options={['video', 'av', 'audio']} onchange={(e) => update('ltx2_mode', e.target.value)} tooltip="Video/AV/Audio" />
 							<FormSelect label="Precision" value={t.mixed_precision || 'bf16'} options={['no', 'fp16', 'bf16']} onchange={(e) => update('mixed_precision', e.target.value)} tooltip="Mixed precision mode" />

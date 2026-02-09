@@ -3,7 +3,6 @@
 	import FormSelect from '$lib/components/FormSelect.svelte';
 	import FormToggle from '$lib/components/FormToggle.svelte';
 	import FormGroup from '$lib/components/FormGroup.svelte';
-	import CheckpointInput from '$lib/components/CheckpointInput.svelte';
 	import PathInput from '$lib/components/PathInput.svelte';
 	import ProcessControls from '$lib/components/ProcessControls.svelte';
 	import CommandPanel from '$lib/components/CommandPanel.svelte';
@@ -13,9 +12,7 @@
 	function update(key, value) {
 		projectConfig.update((c) => {
 			if (!c) return c;
-			if (!c.slider) c.slider = {};
-			c.slider[key] = value;
-			return c;
+			return { ...c, slider: { ...(c.slider || {}), [key]: value } };
 		});
 		saveProjectDebounced();
 	}
@@ -23,11 +20,9 @@
 	function updateTarget(index, key, value) {
 		projectConfig.update((c) => {
 			if (!c) return c;
-			if (!c.slider) c.slider = {};
-			if (!c.slider.targets) c.slider.targets = [{}];
-			if (!c.slider.targets[index]) c.slider.targets[index] = {};
-			c.slider.targets[index][key] = value;
-			return c;
+			const targets = [...(c.slider?.targets || [{}])];
+			targets[index] = { ...(targets[index] || {}), [key]: value };
+			return { ...c, slider: { ...(c.slider || {}), targets } };
 		});
 		saveProjectDebounced();
 	}
@@ -35,10 +30,8 @@
 	function addTarget() {
 		projectConfig.update((c) => {
 			if (!c) return c;
-			if (!c.slider) c.slider = {};
-			if (!c.slider.targets) c.slider.targets = [];
-			c.slider.targets = [...c.slider.targets, { positive: '', negative: '', target_class: '', weight: 1.0 }];
-			return c;
+			const targets = [...(c.slider?.targets || []), { positive: '', negative: '', target_class: '', weight: 1.0 }];
+			return { ...c, slider: { ...(c.slider || {}), targets } };
 		});
 		saveProjectDebounced();
 	}
@@ -46,21 +39,22 @@
 	function removeTarget(index) {
 		projectConfig.update((c) => {
 			if (!c?.slider?.targets) return c;
-			c.slider.targets = c.slider.targets.filter((_, i) => i !== index);
-			if (c.slider.targets.length === 0) c.slider.targets = [{ positive: '', negative: '', target_class: '', weight: 1.0 }];
-			return c;
+			let targets = c.slider.targets.filter((_, i) => i !== index);
+			if (targets.length === 0) targets = [{ positive: '', negative: '', target_class: '', weight: 1.0 }];
+			return { ...c, slider: { ...(c.slider || {}), targets } };
 		});
 		saveProjectDebounced();
 	}
 
 	function updateTraining(key, value) {
-		projectConfig.update((c) => { if (!c) return c; if (!c.training) c.training = {}; c.training[key] = value; return c; });
+		projectConfig.update((c) => {
+			if (!c) return c;
+			return { ...c, training: { ...(c.training || {}), [key]: value } };
+		});
 		saveProjectDebounced();
 	}
 
-	let t = $derived($projectConfig?.training || {});
-	let s = $derived($projectConfig?.slider || {});
-	let targets = $derived(s.targets || [{ positive: '', negative: '', target_class: '', weight: 1.0 }]);
+	let targets = $derived($projectConfig?.slider?.targets || [{ positive: '', negative: '', target_class: '', weight: 1.0 }]);
 	let sliderStatus = $derived($processStatuses.slider_training || { state: 'idle', exit_code: null });
 </script>
 
@@ -75,25 +69,64 @@
 			<p class="text-[12px]" style="color: var(--text-muted);">Advanced training enhancements and specialized LoRA types.</p>
 		</div>
 
-		<!-- CREPA — coming soon -->
-		<div class="p-5" style="background: var(--bg-surface); border: 1px solid var(--border-subtle); border-radius: var(--radius-md); position: relative; overflow: hidden;">
-			<div style="position: absolute; top: 0; left: 0; right: 0; height: 1px; background: linear-gradient(90deg, transparent, var(--accent), var(--secondary, var(--accent)), transparent); opacity: 0.4;"></div>
-			<div class="flex items-center gap-3 mb-3">
-				<div class="w-8 h-8 flex items-center justify-center flex-shrink-0" style="background: var(--accent-muted); border-radius: var(--radius-sm);">
-					<svg class="w-4 h-4" style="color: var(--accent);" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.5"><path d="M3.75 13.5l10.5-11.25L12 10.5h8.25L9.75 21.75 12 13.5H3.75z"/></svg>
+		<!-- CREPA -->
+		<div style="background: var(--bg-surface); border: 1px solid var(--border-subtle); border-radius: var(--radius-md); position: relative; overflow: hidden;">
+			<div style="position: absolute; top: 0; left: 0; right: 0; height: 2px; background: linear-gradient(90deg, transparent, var(--accent), var(--secondary, var(--accent)), transparent); opacity: 0.5;"></div>
+
+			<div class="p-5 pb-0">
+				<div class="flex items-center gap-3 mb-2">
+					<div class="w-8 h-8 flex items-center justify-center flex-shrink-0" style="background: var(--accent-muted); border-radius: var(--radius-sm);">
+						<svg class="w-4 h-4" style="color: var(--accent);" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.5"><path d="M3.75 13.5l10.5-11.25L12 10.5h8.25L9.75 21.75 12 13.5H3.75z"/></svg>
+					</div>
+					<div>
+						<div class="text-[13px] font-semibold" style="color: var(--text-primary);">CREPA</div>
+						<div class="text-[11px]" style="color: var(--text-muted);">Cross-frame Representation Alignment (arxiv 2506.09229)</div>
+					</div>
+					<div class="ml-auto">
+						<FormToggle checked={$projectConfig?.training?.crepa ?? false} onchange={(e) => updateTraining('crepa', e.target.checked)} />
+					</div>
 				</div>
-				<div>
-					<div class="text-[13px] font-semibold" style="color: var(--text-primary);">CREPA</div>
-					<div class="text-[11px]" style="color: var(--text-muted);">Cross-frame Representation Alignment for Fine-tuning Video Diffusion Models</div>
+				<p class="text-[12px] leading-relaxed mb-3" style="color: var(--text-secondary);">
+					Aligns intermediate DiT representations across video frames during fine-tuning, improving temporal consistency. A small projector MLP is trained alongside LoRA.
+				</p>
+			</div>
+
+			<div class="p-5 pt-0 space-y-3">
+				<!-- Teacher signal mode -->
+				<div class="p-3" style="background: var(--bg-elevated); border-radius: var(--radius-sm); border: 1px solid var(--border-subtle);">
+					<div class="text-[11px] font-semibold mb-2" style="color: var(--text-primary);">Teacher Signal</div>
+					<FormSelect label="Mode" value={$projectConfig?.training?.crepa_mode || 'backbone'} onchange={(e) => updateTraining('crepa_mode', e.target.value)} options={[{value: 'backbone', label: 'Backbone (deeper block)'}, {value: 'dino', label: 'DINOv2 (pre-cached)'}]} tooltip="backbone: deeper transformer block as teacher. dino: pre-cached DINOv2 features (zero VRAM, must cache first on Caching tab)." />
+
+					{#if ($projectConfig?.training?.crepa_mode || 'backbone') === 'backbone'}
+						<div class="grid grid-cols-2 gap-2 mt-2">
+							<FormField label="Student Block" type="number" value={$projectConfig?.training?.crepa_student_block_idx ?? 16} oninput={(e) => updateTraining('crepa_student_block_idx', Number(e.target.value))} min={0} max={47} tooltip="Early block whose hidden states are aligned to the teacher (default 16)" />
+							<FormField label="Teacher Block" type="number" value={$projectConfig?.training?.crepa_teacher_block_idx ?? 32} oninput={(e) => updateTraining('crepa_teacher_block_idx', Number(e.target.value))} min={0} max={47} tooltip="Deeper block providing the teacher signal (default 32, must be > student)" />
+						</div>
+					{:else}
+						<div class="grid grid-cols-2 gap-2 mt-2">
+							<FormField label="Student Block" type="number" value={$projectConfig?.training?.crepa_student_block_idx ?? 16} oninput={(e) => updateTraining('crepa_student_block_idx', Number(e.target.value))} min={0} max={47} tooltip="DiT block whose hidden states are projected into DINOv2 space (default 16)" />
+							<FormSelect label="DINOv2 Model" value={$projectConfig?.training?.crepa_dino_model || 'dinov2_vitb14'} onchange={(e) => updateTraining('crepa_dino_model', e.target.value)} options={[{value: 'dinov2_vits14', label: 'ViT-S/14 (384d)'}, {value: 'dinov2_vitb14', label: 'ViT-B/14 (768d)'}, {value: 'dinov2_vitl14', label: 'ViT-L/14 (1024d)'}, {value: 'dinov2_vitg14', label: 'ViT-G/14 (1536d)'}]} tooltip="DINOv2 model variant. Must match the model used during caching." />
+						</div>
+					{/if}
 				</div>
-				<div class="ml-auto inline-flex items-center gap-1.5 px-2 py-1 text-[10px] font-medium" style="background: var(--bg-elevated); border-radius: var(--radius-full); color: var(--text-muted);">
-					<svg class="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
-					Coming soon
+
+				<!-- Loss parameters -->
+				<div class="p-3" style="background: var(--bg-elevated); border-radius: var(--radius-sm); border: 1px solid var(--border-subtle);">
+					<div class="text-[11px] font-semibold mb-2" style="color: var(--text-primary);">Loss Parameters</div>
+					<div class="grid grid-cols-3 gap-2 mb-2">
+						<FormField label="Lambda" type="number" value={$projectConfig?.training?.crepa_lambda ?? 0.1} oninput={(e) => updateTraining('crepa_lambda', Number(e.target.value))} step="0.01" min={0} tooltip="CREPA loss weight (default 0.1)" />
+						<FormField label="Tau" type="number" value={$projectConfig?.training?.crepa_tau ?? 1.0} oninput={(e) => updateTraining('crepa_tau', Number(e.target.value))} step="0.1" min={0.01} tooltip="Temporal neighbor decay factor (default 1.0)" />
+						<FormField label="Neighbors" type="number" value={$projectConfig?.training?.crepa_num_neighbors ?? 2} oninput={(e) => updateTraining('crepa_num_neighbors', Number(e.target.value))} min={1} max={8} tooltip="K frames on each side for alignment (default 2)" />
+					</div>
+					<div class="grid grid-cols-3 gap-2">
+						<FormSelect label="Schedule" value={$projectConfig?.training?.crepa_schedule || 'constant'} onchange={(e) => updateTraining('crepa_schedule', e.target.value)} options={[{value: 'constant', label: 'Constant'}, {value: 'linear', label: 'Linear decay'}, {value: 'cosine', label: 'Cosine decay'}]} tooltip="Lambda schedule over training" />
+						<FormField label="Warmup Steps" type="number" value={$projectConfig?.training?.crepa_warmup_steps ?? 0} oninput={(e) => updateTraining('crepa_warmup_steps', Number(e.target.value))} min={0} tooltip="Steps before CREPA loss reaches full strength" />
+						<div class="flex items-end pb-0.5">
+							<FormToggle label="Normalize" checked={$projectConfig?.training?.crepa_normalize ?? true} onchange={(e) => updateTraining('crepa_normalize', e.target.checked)} tooltip="L2-normalize features before similarity computation" />
+						</div>
+					</div>
 				</div>
 			</div>
-			<p class="text-[12px] leading-relaxed" style="color: var(--text-secondary);">
-				Aligns intermediate representations across video frames during fine-tuning, improving temporal consistency and reducing flickering artifacts in generated videos.
-			</p>
 		</div>
 
 		<!-- Preservation & Regularization -->
@@ -117,26 +150,26 @@
 				<div class="p-3" style="background: var(--bg-elevated); border-radius: var(--radius-sm); border: 1px solid var(--border-subtle);">
 					<div class="flex items-center justify-between mb-1">
 						<span class="text-[12px] font-semibold" style="color: var(--text-primary);">Blank Preservation</span>
-						<FormToggle checked={t.blank_preservation ?? false} onchange={(e) => updateTraining('blank_preservation', e.target.checked)} />
+						<FormToggle checked={$projectConfig?.training?.blank_preservation ?? false} onchange={(e) => updateTraining('blank_preservation', e.target.checked)} />
 					</div>
 					<p class="text-[11px] leading-relaxed mb-2" style="color: var(--text-muted);">
 						Regularizes by training on blank (empty) prompts alongside real data, preserving the model's base generation capabilities.
 					</p>
-					<FormField label="Multiplier" type="number" value={t.blank_preservation_multiplier ?? 1.0} oninput={(e) => updateTraining('blank_preservation_multiplier', Number(e.target.value))} step="0.1" min={0} tooltip="Loss weight for blank preservation (default 1.0)" />
+					<FormField label="Multiplier" type="number" value={$projectConfig?.training?.blank_preservation_multiplier ?? 1.0} oninput={(e) => updateTraining('blank_preservation_multiplier', Number(e.target.value))} step="0.1" min={0} tooltip="Loss weight for blank preservation (default 1.0)" />
 				</div>
 
 				<!-- DOP -->
 				<div class="p-3" style="background: var(--bg-elevated); border-radius: var(--radius-sm); border: 1px solid var(--border-subtle);">
 					<div class="flex items-center justify-between mb-1">
 						<span class="text-[12px] font-semibold" style="color: var(--text-primary);">DOP (Differential Output Preservation)</span>
-						<FormToggle checked={t.dop ?? false} onchange={(e) => updateTraining('dop', e.target.checked)} />
+						<FormToggle checked={$projectConfig?.training?.dop ?? false} onchange={(e) => updateTraining('dop', e.target.checked)} />
 					</div>
 					<p class="text-[11px] leading-relaxed mb-2" style="color: var(--text-muted);">
 						Preserves the model's output distribution for a specified class by penalizing deviations from the original model during training.
 					</p>
 					<div class="grid grid-cols-2 gap-2">
-						<FormField label="Class Prompt" value={t.dop_class || ''} oninput={(e) => updateTraining('dop_class', e.target.value)} placeholder="woman" tooltip="Target class prompt for output preservation" />
-						<FormField label="Multiplier" type="number" value={t.dop_multiplier ?? 1.0} oninput={(e) => updateTraining('dop_multiplier', Number(e.target.value))} step="0.1" min={0} tooltip="Loss weight for DOP (default 1.0)" />
+						<FormField label="Class Prompt" value={$projectConfig?.training?.dop_class || ''} oninput={(e) => updateTraining('dop_class', e.target.value)} placeholder="woman" tooltip="Target class prompt for output preservation" />
+						<FormField label="Multiplier" type="number" value={$projectConfig?.training?.dop_multiplier ?? 1.0} oninput={(e) => updateTraining('dop_multiplier', Number(e.target.value))} step="0.1" min={0} tooltip="Loss weight for DOP (default 1.0)" />
 					</div>
 				</div>
 
@@ -144,24 +177,24 @@
 				<div class="p-3" style="background: var(--bg-elevated); border-radius: var(--radius-sm); border: 1px solid var(--border-subtle);">
 					<div class="flex items-center justify-between mb-1">
 						<span class="text-[12px] font-semibold" style="color: var(--text-primary);">Prior Divergence</span>
-						<FormToggle checked={t.prior_divergence ?? false} onchange={(e) => updateTraining('prior_divergence', e.target.checked)} />
+						<FormToggle checked={$projectConfig?.training?.prior_divergence ?? false} onchange={(e) => updateTraining('prior_divergence', e.target.checked)} />
 					</div>
 					<p class="text-[11px] leading-relaxed mb-2" style="color: var(--text-muted);">
 						KL-divergence regularization that penalizes the trained model from diverging too far from the original pretrained model weights.
 					</p>
-					<FormField label="Multiplier" type="number" value={t.prior_divergence_multiplier ?? 0.1} oninput={(e) => updateTraining('prior_divergence_multiplier', Number(e.target.value))} step="0.01" min={0} tooltip="KL-divergence regularization strength (default 0.1)" />
+					<FormField label="Multiplier" type="number" value={$projectConfig?.training?.prior_divergence_multiplier ?? 0.1} oninput={(e) => updateTraining('prior_divergence_multiplier', Number(e.target.value))} step="0.01" min={0} tooltip="KL-divergence regularization strength (default 0.1)" />
 				</div>
 
 				<!-- Precaching options -->
 				<div class="p-3" style="background: var(--bg-elevated); border-radius: var(--radius-sm); border: 1px solid var(--border-subtle);">
 					<div class="flex items-center justify-between mb-1">
 						<span class="text-[12px] font-semibold" style="color: var(--text-primary);">Precached Preservation</span>
-						<FormToggle checked={t.use_precached_preservation ?? false} onchange={(e) => updateTraining('use_precached_preservation', e.target.checked)} />
+						<FormToggle checked={$projectConfig?.training?.use_precached_preservation ?? false} onchange={(e) => updateTraining('use_precached_preservation', e.target.checked)} />
 					</div>
 					<p class="text-[11px] leading-relaxed mb-2" style="color: var(--text-muted);">
 						Use pre-cached text encoder outputs for preservation prompts (must be cached during the caching step).
 					</p>
-					<PathInput label="Cache Dir" value={t.preservation_prompts_cache || ''} oninput={(e) => updateTraining('preservation_prompts_cache', e.target.value)} showFiles tooltip="Directory with cached preservation embeddings" />
+					<PathInput label="Cache Dir" value={$projectConfig?.training?.preservation_prompts_cache || ''} oninput={(e) => updateTraining('preservation_prompts_cache', e.target.value)} showFiles tooltip="Directory with cached preservation embeddings" />
 				</div>
 			</div>
 		</div>
@@ -185,69 +218,32 @@
 
 			<!-- Config -->
 			<div class="p-5 space-y-4">
-				<!-- Two-column layout -->
+				<p class="text-[11px] leading-relaxed" style="color: var(--text-muted);">
+					Model, LoRA, optimizer, memory, and output settings are inherited from the Training tab. Only slider-specific settings are shown here.
+				</p>
+
 				<div class="grid grid-cols-1 xl:grid-cols-2 gap-4">
-					<!-- Left: Model + Output -->
+					<!-- Left: Slider settings -->
 					<div class="space-y-3">
-						<FormGroup title="Model">
+						<FormGroup title="Slider Settings">
 							<div class="space-y-2 pt-2">
-								<CheckpointInput label="LTX-2 Checkpoint" value={s.ltx2_checkpoint || ''} onchange={(v) => update('ltx2_checkpoint', v)} showFiles scanType="ltx2" tooltip="Path to LTX-2 checkpoint" />
-								<CheckpointInput label="Gemma Root" value={s.gemma_root || ''} onchange={(v) => update('gemma_root', v)} scanType="gemma" tooltip="Gemma text encoder directory" />
-								<div class="flex flex-wrap gap-x-4 gap-y-1">
-									<FormToggle label="FP8 Base" checked={s.fp8_base ?? false} onchange={(e) => update('fp8_base', e.target.checked)} tooltip="FP8 precision" />
-									<FormToggle label="Flash Attn" checked={s.flash_attn ?? true} onchange={(e) => update('flash_attn', e.target.checked)} tooltip="Flash attention" />
-									<FormToggle label="Gemma 8b" checked={s.gemma_load_in_8bit ?? false} onchange={(e) => update('gemma_load_in_8bit', e.target.checked)} tooltip="8-bit quantization" />
-									<FormToggle label="Gemma 4b" checked={s.gemma_load_in_4bit ?? false} onchange={(e) => update('gemma_load_in_4bit', e.target.checked)} tooltip="4-bit quantization" />
-								</div>
-							</div>
-						</FormGroup>
-
-						<FormGroup title="LoRA & Training">
-							<div class="space-y-2 pt-2">
-								<div class="grid grid-cols-3 gap-2">
-									<FormField label="Dim" type="number" value={s.network_dim ?? 16} oninput={(e) => update('network_dim', Number(e.target.value))} min={1} tooltip="LoRA rank" />
-									<FormField label="Alpha" type="number" value={s.network_alpha ?? 16} oninput={(e) => update('network_alpha', Number(e.target.value))} min={1} tooltip="LoRA alpha" />
-									<FormField label="Steps" type="number" value={s.max_train_steps ?? 500} oninput={(e) => update('max_train_steps', Number(e.target.value))} min={1} tooltip="Training steps" />
-								</div>
-								<div class="grid grid-cols-3 gap-2">
-									<FormField label="LR" value={s.learning_rate ?? 1e-4} oninput={(e) => update('learning_rate', Number(e.target.value))} tooltip="Learning rate" />
-									<FormField label="Optimizer" value={s.optimizer_type || 'adamw8bit'} oninput={(e) => update('optimizer_type', e.target.value)} tooltip="Optimizer type" />
-									<FormField label="Grad Accum" type="number" value={s.gradient_accumulation_steps ?? 1} oninput={(e) => update('gradient_accumulation_steps', Number(e.target.value))} min={1} tooltip="Gradient accumulation" />
-								</div>
 								<div class="grid grid-cols-2 gap-2">
-									<FormField label="Blocks to Swap" type="number" value={s.blocks_to_swap ?? ''} oninput={(e) => update('blocks_to_swap', e.target.value ? Number(e.target.value) : null)} placeholder="0" min={0} max={40} tooltip="CPU offload blocks" />
-									<FormField label="Seed" type="number" value={s.seed ?? ''} oninput={(e) => update('seed', e.target.value ? Number(e.target.value) : null)} placeholder="Random" tooltip="Random seed" />
+									<FormField label="Steps" type="number" value={$projectConfig?.slider?.max_train_steps ?? 500} oninput={(e) => update('max_train_steps', Number(e.target.value))} min={1} tooltip="Slider training steps (typically less than full training)" />
+									<FormField label="Output Name" value={$projectConfig?.slider?.output_name || 'ltx2_slider'} oninput={(e) => update('output_name', e.target.value)} tooltip="Output filename prefix for slider LoRA" />
 								</div>
-								<FormToggle label="Gradient Checkpointing" checked={s.gradient_checkpointing ?? true} onchange={(e) => update('gradient_checkpointing', e.target.checked)} tooltip="Save VRAM with checkpointing" />
-							</div>
-						</FormGroup>
-
-						<FormGroup title="Output">
-							<div class="space-y-2 pt-2">
-								<FormField label="Output Dir" value={s.output_dir || ''} oninput={(e) => update('output_dir', e.target.value)} placeholder="output" tooltip="Output directory" />
-								<div class="grid grid-cols-2 gap-2">
-									<FormField label="Name" value={s.output_name || 'ltx2_slider'} oninput={(e) => update('output_name', e.target.value)} tooltip="Output filename prefix" />
-									<FormField label="Save Every N Steps" type="number" value={s.save_every_n_steps ?? ''} oninput={(e) => update('save_every_n_steps', e.target.value ? Number(e.target.value) : null)} placeholder="None" tooltip="Checkpoint interval" />
+								<FormField label="Guidance Strength" type="number" value={$projectConfig?.slider?.guidance_strength ?? 1.0} oninput={(e) => update('guidance_strength', Number(e.target.value))} step="0.1" min={0} tooltip="Guidance strength for text-mode training" />
+								<div class="grid grid-cols-3 gap-2">
+									<FormField label="Frames" type="number" value={$projectConfig?.slider?.latent_frames ?? 1} oninput={(e) => update('latent_frames', Number(e.target.value))} min={1} tooltip="Latent frames (1=image, >1=video)" />
+									<FormField label="Height" type="number" value={$projectConfig?.slider?.latent_height ?? 512} oninput={(e) => update('latent_height', Number(e.target.value))} min={64} step={64} tooltip="Synthetic latent height" />
+									<FormField label="Width" type="number" value={$projectConfig?.slider?.latent_width ?? 768} oninput={(e) => update('latent_width', Number(e.target.value))} min={64} step={64} tooltip="Synthetic latent width" />
 								</div>
+								<FormField label="Sample Slider Range" value={$projectConfig?.slider?.sample_slider_range || '-2,-1,0,1,2'} oninput={(e) => update('sample_slider_range', e.target.value)} tooltip="Comma-separated multiplier values for preview sampling" />
 							</div>
 						</FormGroup>
 					</div>
 
-					<!-- Right: Slider-specific settings + Targets -->
+					<!-- Right: Targets -->
 					<div class="space-y-3">
-						<FormGroup title="Slider Settings">
-							<div class="space-y-2 pt-2">
-								<FormField label="Guidance Strength" type="number" value={s.guidance_strength ?? 1.0} oninput={(e) => update('guidance_strength', Number(e.target.value))} step="0.1" min={0} tooltip="Guidance strength for text-mode training" />
-								<div class="grid grid-cols-3 gap-2">
-									<FormField label="Frames" type="number" value={s.latent_frames ?? 1} oninput={(e) => update('latent_frames', Number(e.target.value))} min={1} tooltip="Latent frames (1=image, >1=video)" />
-									<FormField label="Height" type="number" value={s.latent_height ?? 512} oninput={(e) => update('latent_height', Number(e.target.value))} min={64} step={64} tooltip="Synthetic latent height" />
-									<FormField label="Width" type="number" value={s.latent_width ?? 768} oninput={(e) => update('latent_width', Number(e.target.value))} min={64} step={64} tooltip="Synthetic latent width" />
-								</div>
-								<FormField label="Sample Slider Range" value={s.sample_slider_range || '-2,-1,0,1,2'} oninput={(e) => update('sample_slider_range', e.target.value)} tooltip="Comma-separated multiplier values for preview sampling" />
-							</div>
-						</FormGroup>
-
-						<!-- Targets editor -->
 						<FormGroup title="Slider Targets">
 							<div class="space-y-3 pt-2">
 								<p class="text-[11px] leading-relaxed" style="color: var(--text-muted);">
