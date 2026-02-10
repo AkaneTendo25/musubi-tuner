@@ -12,6 +12,15 @@
 	let error = $state('');
 	let creating = $state(false);
 	let systemInfo = $state(null);
+	let cwd = $state('');
+
+	// Update project directory when name changes
+	$effect(() => {
+		if (cwd && newProjectName) {
+			const sanitized = newProjectName.replace(/[<>:"/\\|?*]/g, '_').replace(/\s+/g, '_');
+			newProjectDir = `${cwd}/projects/${sanitized}`;
+		}
+	});
 
 	onMount(async () => {
 		try {
@@ -20,8 +29,8 @@
 				fetch('/api/fs/cwd'),
 			]);
 			if (infoRes.ok) systemInfo = await infoRes.json();
-			if (cwdRes.ok && !newProjectDir) {
-				newProjectDir = (await cwdRes.json()).cwd || '';
+			if (cwdRes.ok) {
+				cwd = (await cwdRes.json()).cwd || '';
 			}
 		} catch {}
 	});
@@ -50,12 +59,14 @@
 
 	// VRAM estimation helpers
 	function gemmaSize(cfg) {
-		if (cfg?.gemma_load_in_4bit) return 5;
-		if (cfg?.gemma_load_in_8bit) return 9;
-		return 18;
+		// Gemma 3 12B: ~24GB fp16, ~12GB 8bit, ~6GB 4bit
+		if (cfg?.gemma_load_in_4bit) return 6;
+		if (cfg?.gemma_load_in_8bit) return 12;
+		return 24;
 	}
 
 	function vaeSize(cfg) {
+		// LTX-2 VAE: ~1.5GB bf16/fp16, ~3GB fp32
 		const dtype = cfg?.vae_dtype || 'bfloat16';
 		return dtype === 'float32' ? 3.0 : 1.5;
 	}
@@ -65,8 +76,10 @@
 		if (!cfg?.caching) return null;
 		const c = cfg.caching;
 		const vae = vaeSize(c);
-		const tiling = c.vae_spatial_tile_size ? -0.5 : 0;
-		const buffer = 2.5;
+		// VAE chunking/tiling saves ~50-70% of activation memory
+		const tiling = (c.vae_chunk_size || c.vae_spatial_tile_size) ? -0.8 : 0;
+		// Buffer for intermediate tensors
+		const buffer = tiling ? 1.5 : 2.5;
 		const total = vae + buffer + tiling;
 		return {
 			total: Math.max(total, 1),
@@ -81,7 +94,8 @@
 		if (!cfg?.caching) return null;
 		const c = cfg.caching;
 		const gemma = gemmaSize(c);
-		const buffer = 1.5;
+		// Buffer for embeddings and intermediate tensors
+		const buffer = 2.0;
 		const total = gemma + buffer;
 		return {
 			total: Math.max(total, 1),
@@ -95,35 +109,105 @@
 	function estimateTraining(cfg) {
 		if (!cfg?.training) return null;
 		const t = cfg.training;
-		const ditFull = t.fp8_base ? 4.5 : 9.0;
-		const swap = (t.blocks_to_swap || 0) * 0.2;
-		const dit = Math.max(ditFull - swap, 1.0);
+		const ds = cfg?.dataset?.datasets?.[0] || {};
 
-		// Text encoder: not loaded if using precached sample prompts and no preservation prompts
+		// LTX-2 19B base model: ~38GB fp16, ~19GB bf16, ~9.5GB fp8
+		let ditBase = t.fp8_base ? 9.5 : (t.mixed_precision === 'fp16' ? 38 : 19);
+
+		// Block swapping: each block ~0.4GB for bf16, ~0.2GB for fp8
+		const blockSize = t.fp8_base ? 0.2 : 0.4;
+		const swapSavings = (t.blocks_to_swap || 0) * blockSize;
+		const dit = Math.max(ditBase - swapSavings, 0.5);
+
+		// Gemma text encoder (NOT loaded if precached and no preservation techniques)
 		const needsGemma = !t.use_precached_sample_prompts || t.blank_preservation || t.dop || t.prior_divergence;
 		const gemma = needsGemma ? gemmaSize(t) : 0;
 
-		const lora = ((t.network_dim || 16) / 16) * 0.15;
-		const optim = lora * 2;
-		const activations = t.gradient_checkpointing !== false ? 3 : 8;
+		// VAE is NEVER loaded during training (only during sampling, and only if not offloaded)
+		// Training only uses pre-cached latents
+		const vae = 0;
 
-		// Offloading: img_in_txt_in_offloading saves ~1GB
-		const offloadSave = t.img_in_txt_in_offloading ? 1.0 : 0;
-		const total = dit + gemma + lora + optim + activations - offloadSave;
+		// LoRA parameters: scales with rank and target layers
+		const rank = t.network_dim || 16;
+		const targetMultiplier = { t2v: 1.0, v2v: 1.4, audio: 0.8, full: 2.0 }[t.lora_target_preset] || 1.0;
+		const loraParams = rank * rank * targetMultiplier * 0.000012; // ~0.2GB for rank 32 t2v
 
+		// Optimizer states: AdamW stores 2x params (momentum + variance)
+		const optimMultiplier = (t.optimizer_type || 'adamw8bit').includes('8bit') ? 1.5 : 2.0;
+		const optimStates = loraParams * optimMultiplier;
+
+		// Activations: more realistic calculation
+		// Base activation memory scales with: hidden_dim × num_layers × sequence_length × batch_size
+		const res = (ds.resolution_w || 768) * (ds.resolution_h || 512) / (768 * 512); // normalized to 768x512
+		const frames = Math.min(ds.target_frames || 33, 129);
+		const batchSize = ds.batch_size || 1;
+
+		// Sequence length for transformer: (H/patchsize) × (W/patchsize) × frames
+		// For LTX-2: patch_size=2 for video, so 768x512 → 384x256 → ~98k patches for 1 frame
+		// At 33 frames: ~3.2M patches (sequence length)
+		const patchesPerFrame = res * (384 * 256); // base is 384x256 patches
+		const seqLen = patchesPerFrame * frames;
+
+		// Activation memory: hidden_dim (3840 for LTXAV) × layers (48) × seq_len × batch × dtype(2 bytes)
+		// But we only store activations for layers being recomputed
+		// With gradient checkpointing: store ~10-15% of layers
+		const hiddenDim = 3840;
+		const numLayers = 48 - (t.blocks_to_swap || 0);
+		let activations = (hiddenDim * numLayers * seqLen * batchSize * 2) / (1024**3); // bytes → GB
+
+		// Gradient checkpointing: only store activations for checkpoint layers (~10%)
+		if (t.gradient_checkpointing !== false) {
+			activations *= 0.1;
+			// Blockwise checkpointing: even more aggressive
+			if (t.blockwise_checkpointing) activations *= 0.5;
+			// CPU offloading: offload checkpointed activations to CPU (minimal VRAM)
+			if (t.gradient_checkpointing_cpu_offload) activations *= 0.2;
+		}
+
+		// Add gradient storage for LoRA params
+		const loraGrads = loraParams;
+
+		// Gradient accumulation: we accumulate gradients before optimizer step
+		// This doesn't increase activation memory, but we need to store accumulated grads
+		const gradAccum = t.gradient_accumulation_steps || 1;
+		const gradAccumOverhead = gradAccum > 1 ? loraGrads * 0.5 : 0;
+
+		// Preservation techniques: each adds extra forward passes (more activations)
+		let preservationOverhead = 0;
+		if (t.blank_preservation) preservationOverhead += activations * 0.5; // 2 extra forwards
+		if (t.dop) preservationOverhead += activations * 0.5;
+		if (t.prior_divergence) preservationOverhead += activations * 0.25; // 1 extra forward
+
+		// CREPA: projector params (~33M for backbone mode) + feature buffers
+		const crepaOverhead = t.crepa ? 0.15 : 0;
+
+		// Offloading savings
+		let offloadSave = 0;
+		if (t.img_in_txt_in_offloading) offloadSave += 1.2;
+		if (t.sample_with_offloading) offloadSave += 0; // only affects sampling, not training
+
+		// Total
+		const total = dit + gemma + vae + loraParams + optimStates + activations + loraGrads + gradAccumOverhead + preservationOverhead + crepaOverhead - offloadSave;
+
+		// Build parts breakdown
 		const parts = [
 			{ label: 'DiT', value: dit, color: 'var(--accent)' },
 		];
 		if (gemma > 0) parts.push({ label: 'Gemma', value: gemma, color: 'var(--info)' });
-		parts.push({ label: 'LoRA+Opt', value: lora + optim, color: 'var(--warning)' });
-		parts.push({ label: 'Activ.', value: activations, color: 'var(--success)' });
+		parts.push({ label: 'LoRA', value: loraParams, color: 'var(--warning)' });
+		parts.push({ label: 'Optimizer', value: optimStates, color: 'var(--warning)' });
+		parts.push({ label: 'Activ.', value: activations + loraGrads, color: 'var(--success)' });
+		if (gradAccumOverhead > 0) parts.push({ label: 'GradAccum', value: gradAccumOverhead, color: 'var(--info)' });
+		if (preservationOverhead > 0) parts.push({ label: 'Preserv.', value: preservationOverhead, color: 'var(--danger)' });
+		if (crepaOverhead > 0) parts.push({ label: 'CREPA', value: crepaOverhead, color: 'var(--secondary, var(--info))' });
 
 		return {
 			total: Math.max(total, 2),
 			parts,
-			swap,
+			swap: swapSavings,
 			offloadSave,
 			noGemma: !needsGemma,
+			noPrecache: needsGemma,
 		};
 	}
 
@@ -213,7 +297,7 @@
 				<div class="text-[11px] font-semibold uppercase tracking-wider" style="color: var(--text-muted); font-family: var(--font-label);">New Project</div>
 				<div class="space-y-3">
 					<FormField label="Project Name" bind:value={newProjectName} placeholder="My LTX-2 LoRA" tooltip="Display name for your project" />
-					<PathInput label="Project Directory" bind:value={newProjectDir} placeholder="Path to store project files" tooltip="Directory where project.json and configs will be saved" />
+					<PathInput label="Project Directory" bind:value={newProjectDir} placeholder="{cwd ? cwd + '/projects/Project_Name' : 'Path to store project files'}" tooltip="Directory where project.json and configs will be saved" />
 					<button
 						onclick={handleCreate}
 						disabled={!newProjectDir || creating}
@@ -247,13 +331,12 @@
 								</button>
 								<button
 									onclick={() => removeRecentProject(proj.path)}
-									title="Remove from list"
-									class="flex-shrink-0 w-6 h-6 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity"
-									style="color: var(--text-muted); border-radius: var(--radius-sm);"
-									onmouseenter={(e) => { e.currentTarget.style.color = 'var(--danger)'; }}
-									onmouseleave={(e) => { e.currentTarget.style.color = 'var(--text-muted)'; }}
+									class="flex-shrink-0 px-2 py-0.5 text-[10px] font-medium opacity-0 group-hover:opacity-100 transition-opacity"
+									style="color: var(--text-muted); background: var(--bg-elevated); border: 1px solid var(--border); border-radius: var(--radius-sm);"
+									onmouseenter={(e) => { e.currentTarget.style.color = 'var(--danger)'; e.currentTarget.style.borderColor = 'var(--danger)'; }}
+									onmouseleave={(e) => { e.currentTarget.style.color = 'var(--text-muted)'; e.currentTarget.style.borderColor = 'var(--border)'; }}
 								>
-									<svg class="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path d="M6 18L18 6M6 6l12 12"/></svg>
+									Remove
 								</button>
 							</div>
 						{/each}

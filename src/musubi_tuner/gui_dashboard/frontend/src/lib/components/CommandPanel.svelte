@@ -1,6 +1,5 @@
 <script>
 	import { projectConfig } from '$lib/stores/project.js';
-	import { get } from 'svelte/store';
 	import { onMount, onDestroy } from 'svelte';
 
 	let { processType, defaultFilename = 'command.bat' } = $props();
@@ -14,16 +13,10 @@
 	let copied = $state(false);
 	let showOverwriteConfirm = $state(false);
 
-	// Polling-based config change detection
-	let _pollTimer = null;
-	let _lastConfigHash = '';
-
-	function configHash() {
-		try {
-			const c = get(projectConfig);
-			return c ? JSON.stringify(c) : '';
-		} catch { return ''; }
-	}
+	// Pending buffer approach
+	let lastFetchedSnapshot = '';
+	let lastChangeTime = 0;
+	let checkInterval = null;
 
 	async function fetchCommand() {
 		loading = true;
@@ -32,6 +25,8 @@
 			if (res.ok) {
 				const data = await res.json();
 				command = data.command;
+				// Update last fetched snapshot
+				lastFetchedSnapshot = $projectConfig ? JSON.stringify($projectConfig) : '';
 			} else {
 				const err = await res.json();
 				command = `Error: ${err.detail}`;
@@ -43,24 +38,46 @@
 		initialLoad = false;
 	}
 
-	function pollCheck() {
-		const hash = configHash();
-		if (hash !== _lastConfigHash) {
-			_lastConfigHash = hash;
-			fetchCommand();
+	function checkForUpdates() {
+		const currentSnapshot = $projectConfig ? JSON.stringify($projectConfig) : '';
+
+		// If config changed since last fetch
+		if (currentSnapshot && currentSnapshot !== lastFetchedSnapshot) {
+			const timeSinceChange = Date.now() - lastChangeTime;
+
+			// Wait at least 500ms since last change before fetching
+			if (timeSinceChange >= 500) {
+				console.log('[CommandPanel] Config changed, fetching command...');
+				fetchCommand();
+			} else {
+				// Still changing, show loading indicator
+				loading = true;
+			}
 		}
 	}
 
+	// Track config changes and mark change time
+	$effect(() => {
+		const cfg = $projectConfig;
+		if (cfg) {
+			const currentSnapshot = JSON.stringify(cfg);
+			if (currentSnapshot !== lastFetchedSnapshot) {
+				lastChangeTime = Date.now();
+				loading = true; // Show loading immediately
+			}
+		}
+	});
+
 	onMount(() => {
-		// Fetch immediately on mount
-		_lastConfigHash = configHash();
+		// Initial fetch
 		fetchCommand();
-		// Poll every 1 second for config changes
-		_pollTimer = setInterval(pollCheck, 1000);
+
+		// Check for updates every 200ms
+		checkInterval = setInterval(checkForUpdates, 200);
 	});
 
 	onDestroy(() => {
-		if (_pollTimer) clearInterval(_pollTimer);
+		if (checkInterval) clearInterval(checkInterval);
 	});
 
 	// Build filename with project name

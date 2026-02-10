@@ -99,9 +99,12 @@ export async function loadProjectFromPath(path) {
  *        updateSection('caching', 'skip_existing', false)
  */
 export function updateSection(section, key, value) {
+	console.log(`[updateSection] ${section}.${key} =`, value);
 	projectConfig.update((c) => {
 		if (!c) return c;
-		return { ...c, [section]: { ...(c[section] || {}), [key]: value } };
+		const updated = { ...c, [section]: { ...(c[section] || {}), [key]: value } };
+		console.log('[updateSection] Store updated');
+		return updated;
 	});
 	saveProjectDebounced();
 }

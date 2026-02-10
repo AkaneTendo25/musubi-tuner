@@ -3463,6 +3463,25 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         default=1.0,
         help="Weight applied to the audio diffusion loss.",
     )
+    parser.add_argument(
+        "--min_audio_batches_per_accum",
+        type=int,
+        default=0,
+        help=(
+            "Minimum number of audio-bearing microbatches per gradient accumulation window. "
+            "0 disables quota sampling and preserves existing random sampling behavior."
+        ),
+    )
+    parser.add_argument(
+        "--audio_batch_probability",
+        type=float,
+        default=None,
+        help=(
+            "Probability of selecting an audio-bearing batch when both audio/non-audio batches remain. "
+            "Mutually exclusive with --min_audio_batches_per_accum. "
+            "Unset keeps existing random sampling behavior."
+        ),
+    )
 
     parser.add_argument(
         "--ltx2_first_frame_conditioning_p",

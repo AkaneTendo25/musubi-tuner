@@ -49,11 +49,10 @@ async def create_project(body: dict, request: Request):
     if not config.project_dir:
         raise HTTPException(status_code=400, detail="project_dir is required")
 
-    # Derive filename from project name
-    filename = _slugify(config.name) + ".json"
-    project_json = Path(config.project_dir) / filename
+    # Keep canonical filename for compatibility with directory-based loading.
+    project_json = Path(config.project_dir) / "project.json"
 
-    # If that exact file exists, add a numeric suffix
+    # If canonical file exists, add a numeric suffix based on project name.
     if project_json.exists():
         for i in range(2, 100):
             candidate = Path(config.project_dir) / f"{_slugify(config.name)}_{i}.json"

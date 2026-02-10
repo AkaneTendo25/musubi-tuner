@@ -46,12 +46,20 @@
 		saveProjectDebounced();
 	}
 
-	function updateTraining(key, value) {
+	function updateTraining(key, value, options = {}) {
 		projectConfig.update((c) => {
 			if (!c) return c;
-			return { ...c, training: { ...(c.training || {}), [key]: value } };
+			const updated = { ...c, training: { ...(c.training || {}), [key]: value } };
+			if (options.immediate) {
+				updated._immediate = Date.now();
+			}
+			return updated;
 		});
 		saveProjectDebounced();
+	}
+
+	function updateTrainingImmediate(key, value) {
+		updateTraining(key, value, { immediate: true });
 	}
 
 	let targets = $derived($projectConfig?.slider?.targets || [{ positive: '', negative: '', target_class: '', weight: 1.0 }]);
@@ -83,7 +91,7 @@
 						<div class="text-[11px]" style="color: var(--text-muted);">Cross-frame Representation Alignment (arxiv 2506.09229)</div>
 					</div>
 					<div class="ml-auto">
-						<FormToggle checked={$projectConfig?.training?.crepa ?? false} onchange={(e) => updateTraining('crepa', e.target.checked)} />
+						<FormToggle checked={$projectConfig?.training?.crepa ?? false} onchange={(e) => updateTrainingImmediate('crepa', e.target.checked)} />
 					</div>
 				</div>
 				<p class="text-[12px] leading-relaxed mb-3" style="color: var(--text-secondary);">
@@ -95,19 +103,13 @@
 				<!-- Teacher signal mode -->
 				<div class="p-3" style="background: var(--bg-elevated); border-radius: var(--radius-sm); border: 1px solid var(--border-subtle);">
 					<div class="text-[11px] font-semibold mb-2" style="color: var(--text-primary);">Teacher Signal</div>
-					<FormSelect label="Mode" value={$projectConfig?.training?.crepa_mode || 'backbone'} onchange={(e) => updateTraining('crepa_mode', e.target.value)} options={[{value: 'backbone', label: 'Backbone (deeper block)'}, {value: 'dino', label: 'DINOv2 (pre-cached)'}]} tooltip="backbone: deeper transformer block as teacher. dino: pre-cached DINOv2 features (zero VRAM, must cache first on Caching tab)." />
+					<FormSelect label="Mode" value={$projectConfig?.training?.crepa_mode || 'backbone'} onchange={(e) => updateTrainingImmediate('crepa_mode', e.target.value)} options={[{value: 'backbone', label: 'Backbone (deeper block)'}, {value: 'dino', label: 'DINOv2 (pre-cached)'}]} tooltip="backbone: deeper transformer block as teacher. dino: pre-cached DINOv2 features (zero VRAM, must cache first on Caching tab)." />
 
-					{#if ($projectConfig?.training?.crepa_mode || 'backbone') === 'backbone'}
-						<div class="grid grid-cols-2 gap-2 mt-2">
-							<FormField label="Student Block" type="number" value={$projectConfig?.training?.crepa_student_block_idx ?? 16} oninput={(e) => updateTraining('crepa_student_block_idx', Number(e.target.value))} min={0} max={47} tooltip="Early block whose hidden states are aligned to the teacher (default 16)" />
-							<FormField label="Teacher Block" type="number" value={$projectConfig?.training?.crepa_teacher_block_idx ?? 32} oninput={(e) => updateTraining('crepa_teacher_block_idx', Number(e.target.value))} min={0} max={47} tooltip="Deeper block providing the teacher signal (default 32, must be > student)" />
-						</div>
-					{:else}
-						<div class="grid grid-cols-2 gap-2 mt-2">
-							<FormField label="Student Block" type="number" value={$projectConfig?.training?.crepa_student_block_idx ?? 16} oninput={(e) => updateTraining('crepa_student_block_idx', Number(e.target.value))} min={0} max={47} tooltip="DiT block whose hidden states are projected into DINOv2 space (default 16)" />
-							<FormSelect label="DINOv2 Model" value={$projectConfig?.training?.crepa_dino_model || 'dinov2_vitb14'} onchange={(e) => updateTraining('crepa_dino_model', e.target.value)} options={[{value: 'dinov2_vits14', label: 'ViT-S/14 (384d)'}, {value: 'dinov2_vitb14', label: 'ViT-B/14 (768d)'}, {value: 'dinov2_vitl14', label: 'ViT-L/14 (1024d)'}, {value: 'dinov2_vitg14', label: 'ViT-G/14 (1536d)'}]} tooltip="DINOv2 model variant. Must match the model used during caching." />
-						</div>
-					{/if}
+					<div class="grid grid-cols-2 gap-2 mt-2">
+						<FormField label="Student Block" type="number" value={$projectConfig?.training?.crepa_student_block_idx ?? 16} oninput={(e) => updateTraining('crepa_student_block_idx', Number(e.target.value))} min={0} max={47} tooltip={($projectConfig?.training?.crepa_mode || 'backbone') === 'backbone' ? 'Early block whose hidden states are aligned to the teacher (default 16)' : 'DiT block whose hidden states are projected into DINOv2 space (default 16)'} />
+						<FormField label="Teacher Block" type="number" value={$projectConfig?.training?.crepa_teacher_block_idx ?? 32} oninput={(e) => updateTraining('crepa_teacher_block_idx', Number(e.target.value))} min={0} max={47} disabled={($projectConfig?.training?.crepa_mode || 'backbone') !== 'backbone'} tooltip="Deeper block providing the teacher signal (default 32, must be > student)" />
+					</div>
+					<FormSelect label="DINOv2 Model" value={$projectConfig?.training?.crepa_dino_model || 'dinov2_vitb14'} onchange={(e) => updateTrainingImmediate('crepa_dino_model', e.target.value)} options={[{value: 'dinov2_vits14', label: 'ViT-S/14 (384d)'}, {value: 'dinov2_vitb14', label: 'ViT-B/14 (768d)'}, {value: 'dinov2_vitl14', label: 'ViT-L/14 (1024d)'}, {value: 'dinov2_vitg14', label: 'ViT-G/14 (1536d)'}]} disabled={($projectConfig?.training?.crepa_mode || 'backbone') !== 'dino'} tooltip="DINOv2 model variant. Must match the model used during caching." />
 				</div>
 
 				<!-- Loss parameters -->
@@ -119,10 +121,10 @@
 						<FormField label="Neighbors" type="number" value={$projectConfig?.training?.crepa_num_neighbors ?? 2} oninput={(e) => updateTraining('crepa_num_neighbors', Number(e.target.value))} min={1} max={8} tooltip="K frames on each side for alignment (default 2)" />
 					</div>
 					<div class="grid grid-cols-3 gap-2">
-						<FormSelect label="Schedule" value={$projectConfig?.training?.crepa_schedule || 'constant'} onchange={(e) => updateTraining('crepa_schedule', e.target.value)} options={[{value: 'constant', label: 'Constant'}, {value: 'linear', label: 'Linear decay'}, {value: 'cosine', label: 'Cosine decay'}]} tooltip="Lambda schedule over training" />
+						<FormSelect label="Schedule" value={$projectConfig?.training?.crepa_schedule || 'constant'} onchange={(e) => updateTrainingImmediate('crepa_schedule', e.target.value)} options={[{value: 'constant', label: 'Constant'}, {value: 'linear', label: 'Linear decay'}, {value: 'cosine', label: 'Cosine decay'}]} tooltip="Lambda schedule over training" />
 						<FormField label="Warmup Steps" type="number" value={$projectConfig?.training?.crepa_warmup_steps ?? 0} oninput={(e) => updateTraining('crepa_warmup_steps', Number(e.target.value))} min={0} tooltip="Steps before CREPA loss reaches full strength" />
 						<div class="flex items-end pb-0.5">
-							<FormToggle label="Normalize" checked={$projectConfig?.training?.crepa_normalize ?? true} onchange={(e) => updateTraining('crepa_normalize', e.target.checked)} tooltip="L2-normalize features before similarity computation" />
+							<FormToggle label="Normalize" checked={$projectConfig?.training?.crepa_normalize ?? true} onchange={(e) => updateTrainingImmediate('crepa_normalize', e.target.checked)} tooltip="L2-normalize features before similarity computation" />
 						</div>
 					</div>
 				</div>
@@ -150,7 +152,7 @@
 				<div class="p-3" style="background: var(--bg-elevated); border-radius: var(--radius-sm); border: 1px solid var(--border-subtle);">
 					<div class="flex items-center justify-between mb-1">
 						<span class="text-[12px] font-semibold" style="color: var(--text-primary);">Blank Preservation</span>
-						<FormToggle checked={$projectConfig?.training?.blank_preservation ?? false} onchange={(e) => updateTraining('blank_preservation', e.target.checked)} />
+						<FormToggle checked={$projectConfig?.training?.blank_preservation ?? false} onchange={(e) => updateTrainingImmediate('blank_preservation', e.target.checked)} />
 					</div>
 					<p class="text-[11px] leading-relaxed mb-2" style="color: var(--text-muted);">
 						Regularizes by training on blank (empty) prompts alongside real data, preserving the model's base generation capabilities.
@@ -162,7 +164,7 @@
 				<div class="p-3" style="background: var(--bg-elevated); border-radius: var(--radius-sm); border: 1px solid var(--border-subtle);">
 					<div class="flex items-center justify-between mb-1">
 						<span class="text-[12px] font-semibold" style="color: var(--text-primary);">DOP (Differential Output Preservation)</span>
-						<FormToggle checked={$projectConfig?.training?.dop ?? false} onchange={(e) => updateTraining('dop', e.target.checked)} />
+						<FormToggle checked={$projectConfig?.training?.dop ?? false} onchange={(e) => updateTrainingImmediate('dop', e.target.checked)} />
 					</div>
 					<p class="text-[11px] leading-relaxed mb-2" style="color: var(--text-muted);">
 						Preserves the model's output distribution for a specified class by penalizing deviations from the original model during training.
@@ -177,7 +179,7 @@
 				<div class="p-3" style="background: var(--bg-elevated); border-radius: var(--radius-sm); border: 1px solid var(--border-subtle);">
 					<div class="flex items-center justify-between mb-1">
 						<span class="text-[12px] font-semibold" style="color: var(--text-primary);">Prior Divergence</span>
-						<FormToggle checked={$projectConfig?.training?.prior_divergence ?? false} onchange={(e) => updateTraining('prior_divergence', e.target.checked)} />
+						<FormToggle checked={$projectConfig?.training?.prior_divergence ?? false} onchange={(e) => updateTrainingImmediate('prior_divergence', e.target.checked)} />
 					</div>
 					<p class="text-[11px] leading-relaxed mb-2" style="color: var(--text-muted);">
 						KL-divergence regularization that penalizes the trained model from diverging too far from the original pretrained model weights.
@@ -189,7 +191,7 @@
 				<div class="p-3" style="background: var(--bg-elevated); border-radius: var(--radius-sm); border: 1px solid var(--border-subtle);">
 					<div class="flex items-center justify-between mb-1">
 						<span class="text-[12px] font-semibold" style="color: var(--text-primary);">Precached Preservation</span>
-						<FormToggle checked={$projectConfig?.training?.use_precached_preservation ?? false} onchange={(e) => updateTraining('use_precached_preservation', e.target.checked)} />
+						<FormToggle checked={$projectConfig?.training?.use_precached_preservation ?? false} onchange={(e) => updateTrainingImmediate('use_precached_preservation', e.target.checked)} />
 					</div>
 					<p class="text-[11px] leading-relaxed mb-2" style="color: var(--text-muted);">
 						Use pre-cached text encoder outputs for preservation prompts (must be cached during the caching step).
@@ -256,13 +258,12 @@
 											{#if targets.length > 1}
 												<button
 													onclick={() => removeTarget(i)}
-													class="w-5 h-5 flex items-center justify-center"
-													style="color: var(--text-muted); border-radius: var(--radius-sm);"
-													onmouseenter={(e) => { e.currentTarget.style.color = 'var(--danger)'; }}
-													onmouseleave={(e) => { e.currentTarget.style.color = 'var(--text-muted)'; }}
-													title="Remove target"
+													class="px-2 py-0.5 text-[10px] font-medium"
+													style="color: var(--text-muted); background: var(--bg-elevated); border: 1px solid var(--border); border-radius: var(--radius-sm);"
+													onmouseenter={(e) => { e.currentTarget.style.color = 'var(--danger)'; e.currentTarget.style.borderColor = 'var(--danger)'; }}
+													onmouseleave={(e) => { e.currentTarget.style.color = 'var(--text-muted)'; e.currentTarget.style.borderColor = 'var(--border)'; }}
 												>
-													<svg class="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path d="M6 18L18 6M6 6l12 12"/></svg>
+													Remove
 												</button>
 											{/if}
 										</div>

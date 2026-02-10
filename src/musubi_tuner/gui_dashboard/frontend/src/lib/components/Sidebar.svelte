@@ -89,13 +89,12 @@
 			{#if $projectLoaded}
 				<button
 					onclick={async () => { await closeProject(); window.location.href = '/'; }}
-					class="w-5 h-5 flex items-center justify-center flex-shrink-0"
-					style="color: var(--text-muted); border-radius: var(--radius-sm);"
-					onmouseenter={(e) => { e.currentTarget.style.color = 'var(--danger)'; }}
-					onmouseleave={(e) => { e.currentTarget.style.color = 'var(--text-muted)'; }}
-					title="Close project"
+					class="flex-shrink-0 px-2 py-0.5 text-[10px] font-medium"
+					style="color: var(--text-muted); background: var(--bg-elevated); border: 1px solid var(--border); border-radius: var(--radius-sm);"
+					onmouseenter={(e) => { e.currentTarget.style.color = 'var(--danger)'; e.currentTarget.style.borderColor = 'var(--danger)'; }}
+					onmouseleave={(e) => { e.currentTarget.style.color = 'var(--text-muted)'; e.currentTarget.style.borderColor = 'var(--border)'; }}
 				>
-					<svg class="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path d="M6 18L18 6M6 6l12 12"/></svg>
+					Close
 				</button>
 			{/if}
 		</div>

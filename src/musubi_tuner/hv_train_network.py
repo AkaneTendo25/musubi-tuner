@@ -40,6 +40,11 @@ from musubi_tuner.hunyuan_model.models import load_transformer, get_rotary_pos_e
 import musubi_tuner.hunyuan_model.text_encoder as text_encoder_module
 from musubi_tuner.hunyuan_model.vae import load_vae, VAE_VER
 import musubi_tuner.hunyuan_model.vae as vae_module
+from musubi_tuner.dataset.audio_quota_sampler import (
+    build_audio_sampler,
+    split_concat_indices_by_audio,
+    sync_dataset_group_epoch_without_loading,
+)
 from musubi_tuner.modules.lr_schedulers import RexLR
 from musubi_tuner.modules.scheduling_flow_match_discrete import FlowMatchDiscreteScheduler
 import musubi_tuner.networks.lora as lora_module
@@ -2119,14 +2124,50 @@ class NetworkTrainer:
         # num workers for data loader: if 0, persistent_workers is not available
         n_workers = min(args.max_data_loader_n_workers, os.cpu_count())  # cpu_count or max_data_loader_n_workers
 
-        train_dataloader = torch.utils.data.DataLoader(
-            train_dataset_group,
-            batch_size=1,
-            shuffle=True,
-            collate_fn=collator,
-            num_workers=n_workers,
-            persistent_workers=args.persistent_data_loader_workers,
+        train_audio_sampler, train_audio_sampler_mode, train_audio_sampler_stats = build_audio_sampler(
+            dataset_group=train_dataset_group,
+            gradient_accumulation_steps=int(args.gradient_accumulation_steps),
+            min_audio_batches_per_accum=int(getattr(args, "min_audio_batches_per_accum", 0) or 0),
+            audio_batch_probability=getattr(args, "audio_batch_probability", None),
+            seed=int(args.seed),
         )
+
+        if train_audio_sampler_mode == "quota":
+            logger.info(
+                "Audio quota sampler enabled: min_audio_batches_per_accum=%d, accumulation_steps=%d, "
+                "audio_batches=%d, non_audio_batches=%d",
+                train_audio_sampler_stats["min_audio_batches_per_accum"],
+                train_audio_sampler_stats["accumulation_steps"],
+                train_audio_sampler_stats["audio_batches"],
+                train_audio_sampler_stats["non_audio_batches"],
+            )
+        elif train_audio_sampler_mode == "probability":
+            logger.info(
+                "Audio probability sampler enabled: audio_batch_probability=%.3f, audio_batches=%d, non_audio_batches=%d",
+                train_audio_sampler_stats["audio_batch_probability"],
+                train_audio_sampler_stats["audio_batches"],
+                train_audio_sampler_stats["non_audio_batches"],
+            )
+
+        if train_audio_sampler is None:
+            train_dataloader = torch.utils.data.DataLoader(
+                train_dataset_group,
+                batch_size=1,
+                shuffle=True,
+                collate_fn=collator,
+                num_workers=n_workers,
+                persistent_workers=args.persistent_data_loader_workers,
+            )
+        else:
+            train_dataloader = torch.utils.data.DataLoader(
+                train_dataset_group,
+                batch_size=1,
+                shuffle=False,
+                sampler=train_audio_sampler,
+                collate_fn=collator,
+                num_workers=n_workers,
+                persistent_workers=args.persistent_data_loader_workers,
+            )
         if validation_dataset_group is not None:
             validation_dataloader = torch.utils.data.DataLoader(
                 validation_dataset_group,
@@ -2377,7 +2418,8 @@ class NetworkTrainer:
         noise_scheduler = FlowMatchDiscreteScheduler(shift=args.discrete_flow_shift, reverse=True, solver="euler")
 
         loss_recorder = train_utils.LossRecorder()
-        del train_dataset_group
+        if train_audio_sampler is None:
+            del train_dataset_group
 
         # function for saving/removing
         save_dtype = dit_dtype
@@ -2655,6 +2697,18 @@ class NetworkTrainer:
         for epoch in range(epoch_to_start, num_train_epochs):
             accelerator.print(f"\nepoch {epoch + 1}/{num_train_epochs}")
             current_epoch.value = epoch + 1
+            if train_audio_sampler is not None:
+                sync_dataset_group_epoch_without_loading(train_dataset_group, epoch + 1, logger=logger)
+                audio_indices, non_audio_indices = split_concat_indices_by_audio(train_dataset_group)
+                if len(audio_indices) == 0:
+                    raise ValueError(
+                        f"No audio-bearing batches available at epoch {epoch + 1} while "
+                        f"{'--min_audio_batches_per_accum' if train_audio_sampler_mode == 'quota' else '--audio_batch_probability'} is enabled."
+                    )
+                if hasattr(train_audio_sampler, "update_groups"):
+                    train_audio_sampler.update_groups(audio_indices, non_audio_indices)
+                if hasattr(train_audio_sampler, "set_epoch"):
+                    train_audio_sampler.set_epoch(epoch)
 
             metadata["ss_epoch"] = str(epoch + 1)
 

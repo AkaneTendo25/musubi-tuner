@@ -254,13 +254,12 @@
 								{#if entries.length > 1}
 									<button
 										onclick={() => removeEntry(i)}
-										class="w-6 h-6 flex items-center justify-center"
-										style="color: var(--text-muted); border-radius: var(--radius-sm);"
-										onmouseenter={(e) => { e.currentTarget.style.color = 'var(--danger)'; }}
-										onmouseleave={(e) => { e.currentTarget.style.color = 'var(--text-muted)'; }}
-										title="Remove"
+										class="px-2 py-0.5 text-[10px] font-medium"
+										style="color: var(--text-muted); background: var(--bg-elevated); border: 1px solid var(--border); border-radius: var(--radius-sm);"
+										onmouseenter={(e) => { e.currentTarget.style.color = 'var(--danger)'; e.currentTarget.style.borderColor = 'var(--danger)'; }}
+										onmouseleave={(e) => { e.currentTarget.style.color = 'var(--text-muted)'; e.currentTarget.style.borderColor = 'var(--border)'; }}
 									>
-										<svg class="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path d="M6 18L18 6M6 6l12 12"/></svg>
+										Remove
 									</button>
 								{/if}
 							</div>
