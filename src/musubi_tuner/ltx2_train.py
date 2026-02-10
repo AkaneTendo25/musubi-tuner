@@ -194,6 +194,63 @@ def _masked_mse(
     return (per_elem * mask_f).div(denom).mean()
 
 
+def _normalize_ltx2_batch_for_call_dit(batch: dict) -> dict:
+    """Normalize legacy text-embedding batch keys for LTX-2 call_dit compatibility."""
+    if not isinstance(batch, dict):
+        return batch
+
+    conditions = batch.get("conditions")
+    conditions_dict = conditions if isinstance(conditions, dict) else None
+
+    def _first_tensor(keys: tuple[str, ...]) -> Optional[torch.Tensor]:
+        if conditions_dict is not None:
+            for key in keys:
+                value = conditions_dict.get(key)
+                if isinstance(value, torch.Tensor):
+                    return value
+        for key in keys:
+            value = batch.get(key)
+            if isinstance(value, torch.Tensor):
+                return value
+        return None
+
+    video_prompt_embeds = _first_tensor(("video_prompt_embeds", "video_prompt"))
+    audio_prompt_embeds = _first_tensor(("audio_prompt_embeds", "audio_prompt"))
+    prompt_embeds = _first_tensor(("prompt_embeds", "text", "prompt"))
+    prompt_attention_mask = _first_tensor(("prompt_attention_mask", "text_mask", "prompt_mask", "attention_mask"))
+
+    if video_prompt_embeds is None:
+        video_prompt_embeds = prompt_embeds
+
+    if video_prompt_embeds is None and audio_prompt_embeds is None and prompt_embeds is None:
+        if not isinstance(conditions, dict):
+            return batch
+        return batch
+
+    normalized = batch
+    if conditions_dict is None:
+        normalized = dict(normalized)
+        conditions_dict = {}
+    else:
+        conditions_dict = dict(conditions_dict)
+        if normalized is batch:
+            normalized = dict(normalized)
+
+    if isinstance(video_prompt_embeds, torch.Tensor):
+        conditions_dict.setdefault("video_prompt_embeds", video_prompt_embeds)
+    if isinstance(audio_prompt_embeds, torch.Tensor):
+        conditions_dict.setdefault("audio_prompt_embeds", audio_prompt_embeds)
+    if isinstance(prompt_embeds, torch.Tensor):
+        conditions_dict.setdefault("prompt_embeds", prompt_embeds)
+        normalized.setdefault("text", prompt_embeds)
+    if isinstance(prompt_attention_mask, torch.Tensor):
+        conditions_dict.setdefault("prompt_attention_mask", prompt_attention_mask)
+        normalized.setdefault("text_mask", prompt_attention_mask)
+
+    normalized["conditions"] = conditions_dict
+    return normalized
+
+
 def ltx2_finetune_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     parser.add_argument(
         "--fused_backward_pass",
@@ -249,18 +306,7 @@ def ltx2_finetune_setup_parser(parser: argparse.ArgumentParser) -> argparse.Argu
         default=None,
         help="Path to validation dataset config (TOML). If not set, validation is disabled.",
     )
-    parser.add_argument(
-        "--validate_every_n_steps",
-        type=int,
-        default=None,
-        help="Run validation every N training steps",
-    )
-    parser.add_argument(
-        "--validate_every_n_epochs",
-        type=int,
-        default=1,
-        help="Run validation every N epochs. Default: 1",
-    )
+    # Note: --validate_every_n_steps and --validate_every_n_epochs are already defined in setup_parser_common()
     parser.add_argument(
         "--num_validation_batches",
         type=int,
@@ -299,7 +345,16 @@ def main() -> None:
     if args.vae_dtype is None:
         args.vae_dtype = "bfloat16"
 
+    short_map = {"v": "video", "a": "audio", "va": "av"}
+    if getattr(args, "ltx_mode", None) in short_map:
+        args.ltx_mode = short_map[args.ltx_mode]
+
     trainer.handle_model_specific_args(args)
+    if getattr(args, "ltx_mode", "video") == "av" and not getattr(args, "av_use_video_prompt_embeds", False):
+        logger.info(
+            "Enabling av_use_video_prompt_embeds for AV mode compatibility when batches have no audio latents."
+        )
+        args.av_use_video_prompt_embeds = True
 
     if args.seed is None:
         args.seed = random.randint(0, 2**32)
@@ -563,9 +618,9 @@ def main() -> None:
         "ss_sigmoid_scale": args.sigmoid_scale,
         "ss_discrete_flow_shift": args.discrete_flow_shift,
         "ss_ltx_mode": args.ltx_mode,
-        "ss_split_av_passes": bool(args.split_av_passes),
-        "ss_video_loss_weight": args.video_loss_weight,
-        "ss_audio_loss_weight": args.audio_loss_weight,
+        "ss_split_av_passes": bool(getattr(args, "split_av_passes", False)),
+        "ss_video_loss_weight": getattr(args, "video_loss_weight", 1.0),
+        "ss_audio_loss_weight": getattr(args, "audio_loss_weight", 1.0),
         "ss_use_ema": args.use_ema,
         "ss_ema_decay": args.ema_decay if args.use_ema else None,
     }
@@ -732,6 +787,7 @@ def main() -> None:
             for batch in val_dataloader:
                 if max_batches is not None and num_batches >= max_batches:
                     break
+                batch = _normalize_ltx2_batch_for_call_dit(batch)
 
                 latents = batch["latents"]
                 if isinstance(latents, dict):
@@ -857,6 +913,8 @@ def main() -> None:
     accelerator.print(f"  num examples / サンプル数: {num_train_items}")
     accelerator.print(f"  num batches per epoch / 1epochのバッチ数: {len(train_dataloader)}")
     accelerator.print(f"  num epochs / epoch数: {num_train_epochs}")
+    # Note: batch_size is hardcoded to 1 in DataLoader (line 337)
+    args.train_batch_size = 1
     accelerator.print(f"  batch size per device / バッチサイズ: {args.train_batch_size}")
     accelerator.print(
         f"  total train batch size (with parallel & accumulation) / 総バッチサイズ: {args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps}"
@@ -872,6 +930,7 @@ def main() -> None:
         transformer.train()
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(transformer):
+                batch = _normalize_ltx2_batch_for_call_dit(batch)
                 latents = batch["latents"]
                 if isinstance(latents, dict):
                     if "latents" not in latents:

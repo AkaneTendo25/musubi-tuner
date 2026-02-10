@@ -2196,8 +2196,8 @@ class NetworkTrainer:
         # prepare training model. accelerator does some magic here
 
         # experimental feature: train the model with gradients in fp16/bf16
+        # Stochastic rounding is now supported via copy_stochastic in optimizer_utils.py
         network_dtype = torch.float32
-        args.full_fp16 = args.full_bf16 = False  # temporary disabled because stochastic rounding is not supported yet
         if args.full_fp16:
             assert args.mixed_precision == "fp16", (
                 "full_fp16 requires mixed precision='fp16' / full_fp16を使う場合はmixed_precision='fp16'を指定してください。"
@@ -3441,8 +3441,8 @@ def setup_parser_common() -> argparse.ArgumentParser:
     )
 
     parser.add_argument("--fp8_base", action="store_true", help="use fp8 for base model / base modelにfp8を使う")
-    # parser.add_argument("--full_fp16", action="store_true", help="fp16 training including gradients / 勾配も含めてfp16で学習する")
-    # parser.add_argument("--full_bf16", action="store_true", help="bf16 training including gradients / 勾配も含めてbf16で学習する")
+    parser.add_argument("--full_fp16", action="store_true", help="fp16 training including gradients (uses stochastic rounding) / 勾配も含めてfp16で学習する")
+    parser.add_argument("--full_bf16", action="store_true", help="bf16 training including gradients (uses stochastic rounding) / 勾配も含めてbf16で学習する")
 
     parser.add_argument(
         "--dynamo_backend",
