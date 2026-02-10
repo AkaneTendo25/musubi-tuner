@@ -1,4 +1,5 @@
 <script>
+	import { slide } from 'svelte/transition';
 	let { title, collapsed = $bindable(false), children } = $props();
 </script>
 
@@ -14,7 +15,7 @@
 		<svg class="w-3.5 h-3.5 transition-transform {collapsed ? '' : 'rotate-180'}" style="color: var(--text-muted)" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5"><path d="M19 9l-7 7-7-7"/></svg>
 	</button>
 	{#if !collapsed}
-		<div class="px-4 pb-3 space-y-2.5" style="border-top: 1px solid var(--border-subtle);">
+		<div transition:slide={{ duration: 200 }} class="px-4 pb-3 space-y-2.5" style="border-top: 1px solid var(--border-subtle);">
 			{@render children()}
 		</div>
 	{/if}

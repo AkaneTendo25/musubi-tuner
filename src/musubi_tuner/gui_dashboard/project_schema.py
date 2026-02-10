@@ -60,6 +60,9 @@ class CachingConfig(BaseModel):
     precache_sample_prompts: bool = False
     sample_prompts: str = ""
     precache_preservation_prompts: bool = False
+    # VAE I2V latent precaching
+    precache_sample_latents: bool = False
+    sample_latents_cache: str = ""
     blank_preservation: bool = False
     dop: bool = False
     dop_class_prompt: str = ""
@@ -67,8 +70,7 @@ class CachingConfig(BaseModel):
     ltx2_audio_source: Literal["video", "audio_files"] = "video"
     ltx2_audio_dir: str = ""
     ltx2_audio_ext: str = ".wav"
-    # DINOv2 feature caching (for CREPA dino mode)
-    dino_model: Literal["dinov2_vits14", "dinov2_vitb14", "dinov2_vitl14", "dinov2_vitg14"] = "dinov2_vitb14"
+    # DINOv2 feature caching (for CREPA dino mode - model selection in training.crepa_dino_model)
     dino_batch_size: int = 16
 
 
@@ -157,6 +159,8 @@ class TrainingConfig(BaseModel):
     sample_prompts: str = ""
     use_precached_sample_prompts: bool = False
     sample_prompts_cache: str = ""
+    use_precached_sample_latents: bool = False
+    sample_latents_cache: str = ""
     height: int = 512
     width: int = 768
     sample_num_frames: int = 45

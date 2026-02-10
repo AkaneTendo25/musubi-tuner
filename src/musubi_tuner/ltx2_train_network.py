@@ -12,6 +12,7 @@ import wave
 from fractions import Fraction
 from typing import Any, Dict, List, Optional, Tuple, Union
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from accelerate import Accelerator, PartialState
 from tqdm import tqdm
@@ -51,6 +52,7 @@ LTX2_LATENTS_MEAN = [0.0]
 LTX2_LATENTS_STD = [1.0]
 
 DEFAULT_SAMPLE_PROMPTS_CACHE = "ltx2_sample_prompts_cache.pt"
+DEFAULT_SAMPLE_LATENTS_CACHE = "ltx2_sample_latents_cache.pt"
 
 # Modules to keep in high precision for FP8 quantization
 KEEP_FP8_HIGH_PRECISION_TOKENS = (
@@ -2187,10 +2189,39 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 "Sample prompt count does not match precached embeddings "
                 f"(prompts={len(sample_params)} cache={len(cached_params)})."
             )
+
+        def _normalize_text(value: Optional[str]) -> str:
+            if value is None:
+                return ""
+            return " ".join(str(value).split())
+
         for idx, param in enumerate(sample_params):
             cache_entry = cached_params[idx]
             if not isinstance(cache_entry, dict):
                 raise ValueError(f"Invalid cache entry at {idx} ({cache_path})")
+
+            expected_prompt = _normalize_text(param.get("prompt", ""))
+            cached_prompt = _normalize_text(cache_entry.get("prompt", ""))
+            if expected_prompt != cached_prompt:
+                raise ValueError(
+                    "Prompt text mismatch with precached embeddings at index "
+                    f"{idx} ({cache_path}). Rebuild sample prompt cache or disable "
+                    "--use_precached_sample_prompts.\n"
+                    f"Current: {param.get('prompt', '')}\n"
+                    f"Cached : {cache_entry.get('prompt', '')}"
+                )
+
+            expected_negative = _normalize_text(param.get("negative_prompt", ""))
+            cached_negative = _normalize_text(cache_entry.get("negative_prompt", ""))
+            if expected_negative != cached_negative:
+                raise ValueError(
+                    "Negative prompt mismatch with precached embeddings at index "
+                    f"{idx} ({cache_path}). Rebuild sample prompt cache or disable "
+                    "--use_precached_sample_prompts.\n"
+                    f"Current: {param.get('negative_prompt', '')}\n"
+                    f"Cached : {cache_entry.get('negative_prompt', '')}"
+                )
+
             if cache_entry.get("prompt_embeds") is None or cache_entry.get("prompt_attention_mask") is None:
                 raise ValueError(f"Missing prompt embeddings in cache entry {idx} ({cache_path})")
             param["prompt_embeds"] = cache_entry["prompt_embeds"]
@@ -2204,6 +2235,29 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 param["negative_prompt_attention_mask"] = cache_entry["negative_prompt_attention_mask"]
 
         return sample_params
+
+    def _load_precached_sample_latents(self, args: argparse.Namespace, sample_params: List[Dict]) -> None:
+        """Load precached I2V conditioning latents and merge into sample_params (in-place)."""
+        cache_path = getattr(args, "sample_latents_cache", None) or self._resolve_default_sample_latents_cache(args)
+        if not os.path.exists(cache_path):
+            raise FileNotFoundError(f"Precached I2V latents not found: {cache_path}")
+
+        logger.info(f"Loading precached I2V conditioning latents from {cache_path}")
+        try:
+            latent_payload = torch.load(cache_path, map_location="cpu")
+            latent_cache = latent_payload.get("latent_cache", [])
+
+            # Match latents with prompts by index
+            matched_count = 0
+            for entry in latent_cache:
+                prompt_idx = entry.get("prompt_index")
+                if prompt_idx is not None and 0 <= prompt_idx < len(sample_params):
+                    sample_params[prompt_idx]["conditioning_latent"] = entry["conditioning_latent"]
+                    matched_count += 1
+
+            logger.info(f"Loaded {matched_count}/{len(latent_cache)} I2V conditioning latents")
+        except Exception as e:
+            raise RuntimeError(f"Failed to load I2V latents cache: {e}")
 
     def _resolve_default_sample_prompts_cache(self, args: argparse.Namespace) -> str:
         from musubi_tuner.dataset import config_utils
@@ -2223,6 +2277,25 @@ class LTX2NetworkTrainer(NetworkTrainer):
             raise ValueError("First dataset has no cache_directory; set cache_directory in dataset config")
         return os.path.join(cache_dir, DEFAULT_SAMPLE_PROMPTS_CACHE)
 
+    def _resolve_default_sample_latents_cache(self, args: argparse.Namespace) -> str:
+        """Resolve default path for sample latents cache (same directory as prompts cache)."""
+        from musubi_tuner.dataset import config_utils
+        from musubi_tuner.dataset.config_utils import BlueprintGenerator, ConfigSanitizer
+        from musubi_tuner.dataset.image_video_dataset import ARCHITECTURE_LTX2
+
+        if not getattr(args, "dataset_config", None):
+            raise ValueError("--dataset_config is required to resolve the sample latents cache directory")
+        user_config = config_utils.load_user_config(args.dataset_config)
+        blueprint = BlueprintGenerator(ConfigSanitizer()).generate(user_config, args, architecture=ARCHITECTURE_LTX2)
+        dataset_group = config_utils.generate_dataset_group_by_blueprint(blueprint.dataset_group)
+        datasets = dataset_group.datasets
+        if not datasets:
+            raise ValueError("No datasets available to resolve sample latents cache directory")
+        cache_dir = getattr(datasets[0], "cache_directory", None)
+        if not cache_dir:
+            raise ValueError("First dataset has no cache_directory; set cache_directory in dataset config")
+        return os.path.join(cache_dir, DEFAULT_SAMPLE_LATENTS_CACHE)
+
     def process_sample_prompts(
         self,
         args: argparse.Namespace,
@@ -2235,14 +2308,21 @@ class LTX2NetworkTrainer(NetworkTrainer):
         )
         if use_precached:
             logger.info("LTX-2 sampling: using precached Gemma embeddings for sample prompts")
-            return self._load_precached_sample_prompts(args)
+            sample_params = self._load_precached_sample_prompts(args)
+        else:
+            logger.info("LTX-2 sampling: deferring Gemma encoding until sampling")
+            prompts = load_prompts(sample_prompts)
+            if not prompts:
+                return None
+            sample_params = self._apply_sample_defaults(args, prompts)
 
-        logger.info("LTX-2 sampling: deferring Gemma encoding until sampling")
-        prompts = load_prompts(sample_prompts)
-        if not prompts:
-            return None
+        # Load precached I2V latents if requested (independent of text embedding caching)
+        use_precached_latents = bool(getattr(args, "use_precached_sample_latents", False))
+        if use_precached_latents:
+            logger.info("LTX-2 sampling: using precached I2V conditioning latents")
+            self._load_precached_sample_latents(args, sample_params)
 
-        return self._apply_sample_defaults(args, prompts)
+        return sample_params
 
     def _build_text_encoder(self, args: argparse.Namespace, accelerator: Accelerator) -> torch.dtype:
         logger.info("Loading Gemma text encoder for LTX-2 sampling")
@@ -2579,6 +2659,88 @@ class LTX2NetworkTrainer(NetworkTrainer):
             transformer.move_to_device_except_swap_blocks(accelerator.device)
         self._cleanup_cuda(accelerator.device)
 
+    def _load_and_encode_conditioning_image(
+        self,
+        image_path: str,
+        target_height: int,
+        target_width: int,
+        vae_checkpoint_path: str,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Load image from disk and encode through VAE for I2V conditioning.
+
+        Args:
+            image_path: Path to conditioning image (absolute or relative to working directory)
+            target_height: Target video height (image will be resized)
+            target_width: Target video width (image will be resized)
+            vae_checkpoint_path: Path to VAE checkpoint
+            device: Target device
+            dtype: Target dtype
+
+        Returns:
+            Encoded image latent tensor [1, C, 1, H_latent, W_latent]
+        """
+        from PIL import Image
+        import torchvision.transforms.functional as TF
+
+        if not os.path.exists(image_path):
+            raise FileNotFoundError(f"I2V conditioning image not found: {image_path}")
+
+        logger.info(f"Loading I2V conditioning image: {image_path}")
+
+        # Load and resize image with official-style "cover + center crop" behavior.
+        # This preserves aspect ratio (unlike direct resize) and matches LTX-2 validation sampler.
+        image = Image.open(image_path).convert("RGB")
+        current_width, current_height = image.size
+        if current_height != target_height or current_width != target_width:
+            aspect_ratio = current_width / current_height
+            target_aspect_ratio = target_width / target_height
+
+            if aspect_ratio > target_aspect_ratio:
+                resize_height = target_height
+                resize_width = max(target_width, int(round(target_height * aspect_ratio)))
+            else:
+                resize_width = target_width
+                resize_height = max(target_height, int(round(target_width / aspect_ratio)))
+
+            image = image.resize((resize_width, resize_height), Image.LANCZOS)
+            left = max((resize_width - target_width) // 2, 0)
+            top = max((resize_height - target_height) // 2, 0)
+            image = image.crop((left, top, left + target_width, top + target_height))
+
+        # Convert to tensor and normalize to [-1, 1]
+        image_tensor = TF.to_tensor(image).unsqueeze(0)  # [1, 3, H, W]
+        image_tensor = (image_tensor * 2.0 - 1.0).to(device=device, dtype=dtype)
+
+        # Add temporal dimension for VAE encoder: [B, C, T, H, W]
+        image_tensor = image_tensor.unsqueeze(2)  # [1, 3, 1, H, W]
+
+        # Load VAE encoder (training only loads decoder, we need encoder for I2V)
+        # Same approach as ltx2_cache_latents.py
+        from musubi_tuner.ltx_2.loader.single_gpu_model_builder import SingleGPUModelBuilder
+        from musubi_tuner.ltx_2.model.video_vae import VideoEncoderConfigurator, VAE_ENCODER_COMFY_KEYS_FILTER
+
+        logger.info("Loading VAE encoder for I2V conditioning")
+        vae_encoder = SingleGPUModelBuilder(
+            model_path=str(vae_checkpoint_path),
+            model_class_configurator=VideoEncoderConfigurator,
+            model_sd_ops=VAE_ENCODER_COMFY_KEYS_FILTER,
+        ).build(device=device, dtype=dtype)
+        vae_encoder.eval()
+
+        # Encode through VAE encoder
+        with torch.no_grad():
+            latent = vae_encoder(image_tensor)  # [1, C, 1, H_latent, W_latent]
+
+        logger.info(f"Encoded I2V conditioning image to latent shape: {latent.shape}")
+
+        # Clean up encoder to free VRAM
+        del vae_encoder
+        clean_memory_on_device(device)
+
+        return latent
+
     def sample_image_inference(
         self,
         accelerator: Accelerator,
@@ -2594,6 +2756,58 @@ class LTX2NetworkTrainer(NetworkTrainer):
         vocoder=None,
     ):
         """LTX-2-specific sampling with proper frame/size rounding."""
+
+        # ===== PHASE 1: I2V Image Encoding (if needed) =====
+        # Do this FIRST, before loading any other models, to respect --sample_with_offloading
+        # This ensures only VAE encoder is in VRAM during encoding, then it's cleaned up completely
+        conditioning_latent = None
+        image_path = sample_parameter.get("image_path", None)
+
+        # Check if we have a precached conditioning latent first
+        if "conditioning_latent" in sample_parameter:
+            conditioning_latent = sample_parameter["conditioning_latent"]
+            if conditioning_latent is not None:
+                device = accelerator.device
+                conditioning_latent = conditioning_latent.to(device=device, dtype=dit_dtype)
+                logger.info(f"I2V: Using precached conditioning latent (shape: {conditioning_latent.shape})")
+                image_path = None  # Skip encoding since we have precached latent
+
+        if image_path:
+            logger.info("=" * 60)
+            logger.info("I2V CONDITIONING: Loading and encoding image (Phase 1)")
+            logger.info("=" * 60)
+            try:
+                vae_checkpoint = getattr(args, "vae", None) or getattr(args, "ltx2_checkpoint", None)
+                if not vae_checkpoint:
+                    raise ValueError("VAE checkpoint path required for I2V conditioning (--vae or --ltx2_checkpoint)")
+
+                # Get target dimensions (need to calculate them early)
+                device = accelerator.device
+                # Use default VAE factors if vae not loaded yet
+                spatial_factor = 32
+                temporal_factor = 8
+                width = sample_parameter.get("width", 768)
+                height = sample_parameter.get("height", 512)
+                width = (width // spatial_factor) * spatial_factor
+                height = (height // spatial_factor) * spatial_factor
+
+                conditioning_latent = self._load_and_encode_conditioning_image(
+                    image_path=image_path,
+                    target_height=height,
+                    target_width=width,
+                    vae_checkpoint_path=vae_checkpoint,
+                    device=device,
+                    dtype=dit_dtype,
+                )
+                logger.info("I2V: Conditioning image loaded and encoded successfully")
+                logger.info("=" * 60)
+            except Exception as e:
+                logger.error(f"I2V: Failed to load conditioning image '{image_path}': {e}")
+                logger.warning("I2V: Continuing without image conditioning")
+                logger.info("=" * 60)
+                conditioning_latent = None
+
+        # ===== PHASE 2: Normal Sampling Setup =====
         lora_count = self._ensure_lora_enabled_for_sampling(transformer)
         if lora_count:
             logger.info("Sampling: LoRA modules active in transformer: %s", lora_count)
@@ -2649,6 +2863,12 @@ class LTX2NetworkTrainer(NetworkTrainer):
         prompt: str = sample_parameter.get("prompt", "")
         cfg_scale = sample_parameter.get("cfg_scale", None)
         negative_prompt = sample_parameter.get("negative_prompt", None)
+        effective_cfg_scale = cfg_scale if cfg_scale is not None else guidance_scale
+        do_classifier_free_guidance = float(effective_cfg_scale) != 1.0
+        if do_classifier_free_guidance and negative_prompt is None:
+            # Official CFG path still uses unconditional embedding (empty prompt).
+            negative_prompt = ""
+            sample_parameter["negative_prompt"] = negative_prompt
 
         spatial_factor = int(getattr(vae, "spatial_downsample_factor", 32))
         temporal_factor = int(getattr(vae, "temporal_downsample_factor", 8))
@@ -2662,14 +2882,14 @@ class LTX2NetworkTrainer(NetworkTrainer):
             prompt_embeds, prompt_mask = self._encode_prompt_text(accelerator, prompt, text_encoder_dtype)
             sample_parameter["prompt_embeds"] = prompt_embeds
             sample_parameter["prompt_attention_mask"] = prompt_mask
-            if negative_prompt:
+            if do_classifier_free_guidance and sample_parameter.get("negative_prompt_embeds") is None:
                 neg_embeds, neg_mask = self._encode_prompt_text(
                     accelerator, negative_prompt, text_encoder_dtype
                 )
                 sample_parameter["negative_prompt_embeds"] = neg_embeds
                 sample_parameter["negative_prompt_attention_mask"] = neg_mask
             loaded_text_encoder = True
-        elif negative_prompt and sample_parameter.get("negative_prompt_embeds") is None:
+        elif do_classifier_free_guidance and sample_parameter.get("negative_prompt_embeds") is None:
             text_encoder_dtype = self._build_text_encoder(args, accelerator)
             neg_embeds, neg_mask = self._encode_prompt_text(
                 accelerator, negative_prompt, text_encoder_dtype
@@ -2698,9 +2918,10 @@ class LTX2NetworkTrainer(NetworkTrainer):
         if seed is not None:
             logger.info(f"seed: {seed}")
 
-        do_classifier_free_guidance = False
-        if negative_prompt is not None:
-            do_classifier_free_guidance = True
+        # (I2V encoding now happens at the start of the method, before any model loading)
+
+        do_classifier_free_guidance = float(effective_cfg_scale) != 1.0
+        if do_classifier_free_guidance:
             logger.info(f"negative prompt: {negative_prompt}")
             logger.info(f"cfg scale: {cfg_scale}")
 
@@ -2745,6 +2966,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 seed=seed,
                 generator=generator,
                 spatial_upsampler_path=spatial_upsampler_path,
+                conditioning_latent=conditioning_latent,
                 distilled_lora_path=distilled_lora_path,
                 stage2_steps=int(getattr(args, "sample_stage2_steps", 3)),
                 audio_decoder=audio_decoder,
@@ -2780,6 +3002,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 enable_audio_preview=enable_audio_preview,
                 decode_video=not audio_only_preview,
                 audio_only=audio_only_preview,
+                conditioning_latent=conditioning_latent,
             )
 
         if not has_self_ref_orig_mod:
@@ -2867,6 +3090,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
         enable_audio_preview: bool = False,
         decode_video: bool = True,
         audio_only: bool = False,
+        conditioning_latent: Optional[torch.Tensor] = None,
     ):
         """Generate sample video during training using LTX-2 denoising loop"""
         from musubi_tuner.modules.scheduling_flow_match_discrete import FlowMatchDiscreteScheduler
@@ -3004,6 +3228,59 @@ class LTX2NetworkTrainer(NetworkTrainer):
             generator=generator,
         )
 
+        # Setup I2V conditioning mask if provided
+        denoise_mask = None
+        clean_latent = None
+        i2v_conditioning_mask_tokens = None
+        use_i2v_token_timestep_mask = bool(getattr(args, "sample_i2v_token_timestep_mask", True))
+        if conditioning_latent is not None:
+            # Validate conditioning_latent shape
+            if conditioning_latent.dim() != 5:
+                logger.warning(f"I2V: conditioning_latent has wrong dimensions {conditioning_latent.shape}, expected [B,C,T,H,W]. Skipping I2V conditioning.")
+            elif conditioning_latent.shape[2] != 1:
+                logger.warning(f"I2V: conditioning_latent has {conditioning_latent.shape[2]} frames, expected 1. Skipping I2V conditioning.")
+            elif latents.shape[2] < 1:
+                logger.warning(f"I2V: Video latents have no temporal frames. Skipping I2V conditioning.")
+            elif conditioning_latent.shape[1] != latents.shape[1]:
+                logger.warning(f"I2V: Channel dimension mismatch - conditioning {conditioning_latent.shape[1]} vs latents {latents.shape[1]}. Skipping I2V conditioning.")
+            elif conditioning_latent.shape[-2:] != latents.shape[-2:]:
+                logger.warning(f"I2V: Spatial dimension mismatch - conditioning {conditioning_latent.shape[-2:]} vs latents {latents.shape[-2:]}. Skipping I2V conditioning.")
+            else:
+                try:
+                    cond_on_device = conditioning_latent.to(device=latents.device, dtype=latents.dtype)
+
+                    # CRITICAL: Initialize first frame of latents with conditioning image
+                    # This ensures the first frame starts as the conditioning, not random noise
+                    latents[:, :, 0:1, :, :] = cond_on_device
+
+                    # Create denoise_mask: 0.0 for first frame (locked), 1.0 for others (denoised)
+                    denoise_mask = torch.ones_like(latents)
+                    denoise_mask[:, :, 0:1, :, :] = 0.0
+
+                    # Store clean conditioning latent (will be blended back at each step)
+                    clean_latent = torch.zeros_like(latents)
+                    clean_latent[:, :, 0:1, :, :] = cond_on_device
+
+                    if use_i2v_token_timestep_mask:
+                        bsz, _c, frames, h_lat, w_lat = latents.shape
+                        seq_len = frames * h_lat * w_lat
+                        first_frame_tokens = h_lat * w_lat
+                        i2v_conditioning_mask_tokens = torch.zeros(
+                            (bsz, seq_len),
+                            device=latents.device,
+                            dtype=torch.bool,
+                        )
+                        if first_frame_tokens > 0:
+                            i2v_conditioning_mask_tokens[:, :first_frame_tokens] = True
+                        logger.info("I2V: enabled token timestep mask for conditioned first-frame tokens")
+
+                    logger.info(f"I2V: Initialized first frame conditioning (shape: {conditioning_latent.shape})")
+                except Exception as e:
+                    logger.error(f"I2V: Failed to setup conditioning: {e}", exc_info=True)
+                    denoise_mask = None
+                    clean_latent = None
+                    i2v_conditioning_mask_tokens = None
+
         # Setup scheduler - official pipeline does NOT pass latent, uses default MAX_SHIFT_ANCHOR=4096
         ltx2_scheduler = LTX2Scheduler()
         sigmas = ltx2_scheduler.execute(steps=sample_steps).to(device=transformer_device, dtype=torch.float32)
@@ -3061,6 +3338,16 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 # Prepare timestep (sigma in [0, 1])
                 timestep_for_model = sigma.expand(latent_model_input.shape[0]).to(device=transformer_device, dtype=dit_dtype)
 
+                resolved_transformer_options = {"patches_replace": {}}
+                if i2v_conditioning_mask_tokens is not None:
+                    video_conditioning_mask_tokens = i2v_conditioning_mask_tokens
+                    if do_classifier_free_guidance:
+                        video_conditioning_mask_tokens = torch.cat(
+                            [video_conditioning_mask_tokens, video_conditioning_mask_tokens],
+                            dim=0,
+                        )
+                    resolved_transformer_options["video_conditioning_mask"] = video_conditioning_mask_tokens
+
                 # Model prediction
                 if self._audio_video and audio_model_input is not None:
                     model_input = [latent_model_input, audio_model_input]
@@ -3073,7 +3360,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
                     context=prompt_embeds,
                     attention_mask=prompt_mask,
                     frame_rate=sample_parameter.get("frame_rate", 25),
-                    transformer_options={},
+                    transformer_options=resolved_transformer_options,
                     audio_only=audio_only,
                 )
 
@@ -3088,20 +3375,32 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 # and CFG is applied to denoised (x0) outputs, not velocity predictions
                 video_pred = video_pred.to(dtype=latents.dtype)
 
+                sigma_for_video = denoise_mask * sigma if denoise_mask is not None else sigma
+
                 if do_classifier_free_guidance:
                     effective_cfg_scale = cfg_scale if cfg_scale is not None else guidance_scale
                     # Split velocity predictions for CFG
                     vel_uncond, vel_cond = video_pred.chunk(2)
                     # Convert each to x0
-                    x0_uncond = X0PredictionWrapper.velocity_to_x0(latents, vel_uncond, sigma.item())
-                    x0_cond = X0PredictionWrapper.velocity_to_x0(latents, vel_cond, sigma.item())
+                    x0_uncond = X0PredictionWrapper.velocity_to_x0(latents, vel_uncond, sigma_for_video)
+                    x0_cond = X0PredictionWrapper.velocity_to_x0(latents, vel_cond, sigma_for_video)
                     # Apply CFG to x0 (official formula)
                     video_x0 = x0_uncond + effective_cfg_scale * (x0_cond - x0_uncond)
                 else:
-                    video_x0 = X0PredictionWrapper.velocity_to_x0(latents, video_pred, sigma.item())
+                    video_x0 = X0PredictionWrapper.velocity_to_x0(latents, video_pred, sigma_for_video)
+
+                if denoise_mask is not None and clean_latent is not None:
+                    # Official LTX-2 ordering: blend denoised x0 before Euler step.
+                    video_x0 = video_x0 * denoise_mask + clean_latent * (1.0 - denoise_mask)
 
                 # Euler step to next latent
                 latents = stepper.step(latents, video_x0, sigmas, step_idx)
+
+                # CRITICAL: Hard-lock conditioned frames after Euler step
+                # The Euler step performs gradual correction, but I2V requires absolute locking
+                if denoise_mask is not None and clean_latent is not None:
+                    # Restore locked frames: where denoise_mask == 0.0, force latents = clean_latent
+                    latents = latents * denoise_mask + clean_latent * (1.0 - denoise_mask)
 
                 if audio_pred is not None and audio_latents is not None:
                     audio_pred = audio_pred.to(dtype=audio_latents.dtype)
@@ -3113,6 +3412,12 @@ class LTX2NetworkTrainer(NetworkTrainer):
                     else:
                         audio_x0 = X0PredictionWrapper.velocity_to_x0(audio_latents, audio_pred, sigma.item())
                     audio_latents = stepper.step(audio_latents, audio_x0, sigmas, step_idx)
+
+        # Free I2V conditioning tensors to reclaim memory before VAE decode
+        if denoise_mask is not None or clean_latent is not None:
+            del denoise_mask, clean_latent
+            if transformer_device.type == "cuda":
+                torch.cuda.empty_cache()
 
         if offload_transformer_for_decode and transformer_device != transformer_offload_device:
             if hasattr(transformer, "move_to_device_except_swap_blocks"):
@@ -3252,6 +3557,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
         enable_audio_preview: bool = False,
         decode_video: bool = True,
         audio_only: bool = False,
+        conditioning_latent: Optional[torch.Tensor] = None,
     ):
         """Generate sample video using two-stage inference (half-res + upsample + refine)."""
         device = accelerator.device
@@ -3315,6 +3621,8 @@ class LTX2NetworkTrainer(NetworkTrainer):
             prompt_attention_mask=prompt_mask,
             negative_prompt_embeds=negative_embeds,
             negative_prompt_attention_mask=negative_mask,
+            conditioning_latent=conditioning_latent,
+            use_i2v_token_timestep_mask=bool(getattr(args, "sample_i2v_token_timestep_mask", True)),
             offload_between_stages=bool(getattr(args, "sample_with_offloading", False)),
             extra={"audio_config": audio_config} if audio_config else {},
         )
@@ -3537,6 +3845,17 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         ),
     )
     parser.add_argument(
+        "--use_precached_sample_latents",
+        action="store_true",
+        help="Use precached I2V conditioning latents for sample prompts (no VAE encoder load during training).",
+    )
+    parser.add_argument(
+        "--sample_latents_cache",
+        type=str,
+        default=None,
+        help="Path to precached I2V conditioning latents (.pt) for sample prompts.",
+    )
+    parser.add_argument(
         "--sample_disable_audio",
         action="store_true",
         help="Disable audio decoding during LTX-2 preview sampling (AV mode).",
@@ -3550,6 +3869,15 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         "--sample_disable_flash_attn",
         action="store_true",
         help="Disable FlashAttention during LTX-2 preview sampling (use SDPA).",
+    )
+    parser.add_argument(
+        "--sample_i2v_token_timestep_mask",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Use official-style I2V token timestep masking during sampling "
+            "(conditioned first-frame tokens use timestep=0 via video_conditioning_mask)."
+        ),
     )
     parser.add_argument(
         "--sample_merge_audio",

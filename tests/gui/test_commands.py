@@ -166,12 +166,13 @@ class TestTrainingCmd:
         assert "--network_alpha" in cmd
         assert "--output_dir" in cmd
         assert "--output_name" in cmd
-        assert "--gui" in cmd  # Always appended
+        # GUI is no longer forced by command builder.
+        assert "--gui" not in cmd
 
-    def test_training_always_has_gui_flag(self, tmp_path):
+    def test_training_does_not_force_gui_flag(self, tmp_path):
         config = _make_config(str(tmp_path))
         cmd = build_training_cmd(config)
-        assert "--gui" in cmd
+        assert "--gui" not in cmd
 
     def test_lora_settings(self, tmp_path):
         config = _make_config(

@@ -17,7 +17,7 @@ from fastapi.responses import FileResponse, HTMLResponse, Response
 
 from musubi_tuner.gui_dashboard.process_manager import ProcessManager
 from musubi_tuner.gui_dashboard.project_schema import ProjectConfig
-from musubi_tuner.gui_dashboard.routers import datasets, filesystem, processes, projects, system
+from musubi_tuner.gui_dashboard.routers import datasets, filesystem, processes, projects, stats, system
 from musubi_tuner.gui_dashboard.routers.metrics import create_metrics_router, mount_samples_dir
 
 logger = logging.getLogger(__name__)
@@ -53,6 +53,7 @@ def create_management_app(project_path: Optional[str] = None) -> FastAPI:
     app.include_router(processes.router)
     app.include_router(filesystem.router)
     app.include_router(system.router)
+    app.include_router(stats.router)
 
     # Metrics router — dynamically bound to training output_dir
     @app.get("/data/metrics.parquet")

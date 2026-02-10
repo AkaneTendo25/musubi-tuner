@@ -127,22 +127,5 @@
 				<CommandPanel processType="cache_text" defaultFilename="cache_text.bat" />
 			</div>
 		</div>
-
-		<!-- DINOv2 Features (for CREPA dino mode) -->
-		<div class="space-y-3">
-			<span class="text-[11px] font-medium uppercase tracking-wider" style="color: var(--text-muted);">Cache DINOv2 Features (CREPA)</span>
-			<p class="text-[11px] leading-relaxed" style="color: var(--text-secondary);">
-				Extract per-frame DINOv2 CLS tokens for CREPA dino mode. Only needed if you plan to use CREPA with mode=dino. Runs after latent caching.
-			</p>
-
-			<div class="grid grid-cols-2 gap-3">
-				<FormSelect label="DINOv2 Model" value={caching.dino_model || 'dinov2_vitb14'} onchange={(e) => updateCaching('dino_model', e.target.value)} options={[{value: 'dinov2_vits14', label: 'ViT-S/14 (384d)'}, {value: 'dinov2_vitb14', label: 'ViT-B/14 (768d)'}, {value: 'dinov2_vitl14', label: 'ViT-L/14 (1024d)'}, {value: 'dinov2_vitg14', label: 'ViT-G/14 (1536d)'}]} tooltip="DINOv2 model variant. ViT-B/14 is recommended (good balance of quality and speed)." />
-				<FormField label="Batch Size" type="number" value={caching.dino_batch_size ?? 16} oninput={(e) => updateCaching('dino_batch_size', Number(e.target.value))} min={1} tooltip="Frames per DINOv2 forward pass (reduce if OOM)" />
-			</div>
-
-			<ProcessControls processType="cache_dino" status={dinoStatus} onStart={() => startProcess('cache_dino')} onStop={() => stopProcess('cache_dino')} />
-			<ProcessConsole lines={dinoLogs} />
-			<CommandPanel processType="cache_dino" defaultFilename="cache_dino.bat" />
-		</div>
 	</div>
 {/if}

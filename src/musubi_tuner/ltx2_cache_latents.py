@@ -374,6 +374,137 @@ def encode_and_save_audio_cache(
     save_file(sd, audio_cache_path, metadata=metadata)
 
 
+def _precache_sample_latents(args: argparse.Namespace, device: torch.device) -> None:
+    """Cache I2V conditioning image latents for sample prompts."""
+    from musubi_tuner.hv_train_network import load_prompts
+    from PIL import Image
+    import torchvision.transforms.functional as TF
+    import os
+
+    if args.sample_prompts is None:
+        raise ValueError("--sample_prompts is required when --precache_sample_latents is set")
+
+    prompts = load_prompts(args.sample_prompts)
+    if not prompts:
+        raise ValueError(f"No prompts found in {args.sample_prompts}")
+
+    # Filter prompts that have image_path
+    prompts_with_images = [(i, p) for i, p in enumerate(prompts) if p.get("image_path")]
+    if not prompts_with_images:
+        logger.info("No I2V images found in sample prompts - nothing to cache")
+        return
+
+    logger.info(f"Found {len(prompts_with_images)} prompts with I2V images")
+
+    # Load VAE encoder
+    from musubi_tuner.ltx_2.loader.single_gpu_model_builder import SingleGPUModelBuilder
+    from musubi_tuner.ltx_2.model.video_vae import VideoEncoderConfigurator, VAE_ENCODER_COMFY_KEYS_FILTER
+
+    vae_checkpoint = getattr(args, "vae", None) or getattr(args, "ltx2_checkpoint", None)
+    if not vae_checkpoint:
+        raise ValueError("VAE checkpoint required for I2V latent precaching (--vae or --ltx2_checkpoint)")
+
+    vae_dtype = torch.bfloat16  # Standard for LTX-2
+    logger.info("Loading VAE encoder for I2V image precaching")
+    vae_encoder = SingleGPUModelBuilder(
+        model_path=str(vae_checkpoint),
+        model_class_configurator=VideoEncoderConfigurator,
+        model_sd_ops=VAE_ENCODER_COMFY_KEYS_FILTER,
+    ).build(device=device, dtype=vae_dtype)
+    vae_encoder.eval()
+
+    # Cache latents
+    latent_cache: list[dict] = []
+    spatial_factor = 32  # LTX-2 VAE spatial downsample factor
+
+    for idx, prompt_dict in prompts_with_images:
+        image_path = prompt_dict["image_path"]
+        try:
+            if not os.path.exists(image_path):
+                logger.warning(f"I2V image not found, skipping prompt #{idx}: {image_path}")
+                continue
+
+            # Get dimensions from prompt or use defaults
+            width = prompt_dict.get("width", 768)
+            height = prompt_dict.get("height", 512)
+            width = (width // spatial_factor) * spatial_factor
+            height = (height // spatial_factor) * spatial_factor
+
+            # Load and encode image
+            logger.info(f"Encoding I2V image for prompt #{idx}: {os.path.basename(image_path)}")
+            image = Image.open(image_path).convert("RGB")
+
+            # Match official LTX-2 image-conditioning preprocessing:
+            # resize-to-cover while preserving aspect ratio, then center-crop.
+            current_width, current_height = image.size
+            if current_height != height or current_width != width:
+                aspect_ratio = current_width / current_height
+                target_aspect_ratio = width / height
+
+                if aspect_ratio > target_aspect_ratio:
+                    resize_height = height
+                    resize_width = max(width, int(round(height * aspect_ratio)))
+                else:
+                    resize_width = width
+                    resize_height = max(height, int(round(width / aspect_ratio)))
+
+                image = image.resize((resize_width, resize_height), Image.LANCZOS)
+                left = max((resize_width - width) // 2, 0)
+                top = max((resize_height - height) // 2, 0)
+                image = image.crop((left, top, left + width, top + height))
+
+            image_tensor = TF.to_tensor(image).unsqueeze(0)  # [1, 3, H, W]
+            image_tensor = (image_tensor * 2.0 - 1.0).to(device=device, dtype=vae_dtype)
+            image_tensor = image_tensor.unsqueeze(2)  # [1, 3, 1, H, W]
+
+            with torch.no_grad():
+                conditioning_latent = vae_encoder(image_tensor)
+
+            latent_cache.append({
+                "prompt_index": idx,
+                "image_path": image_path,
+                "conditioning_latent": conditioning_latent.cpu(),
+            })
+            logger.info(f"Encoded I2V latent for prompt #{idx}: {conditioning_latent.shape}")
+
+        except Exception as e:
+            logger.error(f"Failed to encode I2V image for prompt #{idx} '{image_path}': {e}")
+
+    # Clean up VAE encoder
+    del vae_encoder
+    from musubi_tuner.utils.device_utils import clean_memory_on_device
+    clean_memory_on_device(device)
+    logger.info("VAE encoder cleaned up")
+
+    # Determine cache path
+    if args.sample_latents_cache:
+        cache_path = args.sample_latents_cache
+    else:
+        # Default: use first dataset's cache directory
+        try:
+            datasets = _load_datasets(args)
+            if datasets:
+                cache_dir = getattr(datasets[0], "cache_directory", None)
+                if cache_dir:
+                    os.makedirs(cache_dir, exist_ok=True)
+                    cache_path = os.path.join(cache_dir, "ltx2_sample_latents_cache.pt")
+                else:
+                    cache_path = "ltx2_sample_latents_cache.pt"
+            else:
+                cache_path = "ltx2_sample_latents_cache.pt"
+        except Exception as e:
+            logger.warning(f"Could not load datasets for cache path resolution: {e}")
+            cache_path = "ltx2_sample_latents_cache.pt"
+
+    # Save cache
+    payload = {
+        "version": 1,
+        "latent_cache": latent_cache,
+    }
+    torch.save(payload, cache_path)
+    logger.info(f"Saved {len(latent_cache)} I2V conditioning latents to {cache_path}")
+
+
 def main() -> None:
     parser = cache_latents.setup_parser_common()
     parser = ltx2_setup_parser(parser)
@@ -387,6 +518,12 @@ def main() -> None:
         torch.backends.cudnn.enabled = False
 
     device = torch.device(args.device) if args.device else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # Handle I2V sample latent precaching if requested
+    if getattr(args, "precache_sample_latents", False):
+        _precache_sample_latents(args, device)
+        logger.info("I2V sample latent precaching complete")
+        return  # Exit after precaching
 
     datasets = _load_datasets(args)
 
@@ -577,6 +714,23 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         help="Override dummy video channels for audio-only caching (auto-detected by default).",
     )
     parser.add_argument("--audio_dummy_video_dtype", type=str, default=None)
+    parser.add_argument(
+        "--precache_sample_latents",
+        action="store_true",
+        help="Cache I2V conditioning image latents for sample prompts.",
+    )
+    parser.add_argument(
+        "--sample_prompts",
+        type=str,
+        default=None,
+        help="Sample prompts file (for --precache_sample_latents).",
+    )
+    parser.add_argument(
+        "--sample_latents_cache",
+        type=str,
+        default=None,
+        help="Path to save I2V conditioning latents cache (default: cache_dir/ltx2_sample_latents_cache.pt).",
+    )
     return parser
 
 

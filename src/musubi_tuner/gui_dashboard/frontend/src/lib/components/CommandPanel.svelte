@@ -1,5 +1,5 @@
 <script>
-	import { projectConfig } from '$lib/stores/project.js';
+	import { projectConfig, saveProjectNow } from '$lib/stores/project.js';
 	import { onMount, onDestroy } from 'svelte';
 
 	let { processType, defaultFilename = 'command.bat' } = $props();
@@ -19,14 +19,19 @@
 	let checkInterval = null;
 
 	async function fetchCommand() {
+		// Capture snapshot BEFORE request - this is what we're actually fetching for
+		const snapshotBeingFetched = $projectConfig ? JSON.stringify($projectConfig) : '';
 		loading = true;
 		try {
+			// CRITICAL: Save config to backend FIRST so command preview uses latest values
+			await saveProjectNow();
+
 			const res = await fetch(`/api/processes/${processType}/command-preview`);
 			if (res.ok) {
 				const data = await res.json();
 				command = data.command;
-				// Update last fetched snapshot
-				lastFetchedSnapshot = $projectConfig ? JSON.stringify($projectConfig) : '';
+				// Update to the snapshot that was actually used for this command
+				lastFetchedSnapshot = snapshotBeingFetched;
 			} else {
 				const err = await res.json();
 				command = `Error: ${err.detail}`;
@@ -173,20 +178,24 @@
 	</div>
 
 	<!-- Command display -->
-	{#if initialLoad}
-		<div class="p-3" style="background: var(--console-bg);">
-			<div class="space-y-2 animate-pulse">
-				<div class="h-3 rounded" style="background: var(--border); width: 80%;"></div>
-				<div class="h-3 rounded" style="background: var(--border); width: 60%;"></div>
-				<div class="h-3 rounded" style="background: var(--border); width: 70%;"></div>
+	<div class="relative" style="min-height: 100px;">
+		{#if initialLoad}
+			<div class="absolute inset-0 p-3" style="background: var(--console-bg);">
+				<div class="space-y-2 animate-pulse">
+					<div class="h-3 rounded" style="background: var(--border); width: 80%;"></div>
+					<div class="h-3 rounded" style="background: var(--border); width: 60%;"></div>
+					<div class="h-3 rounded" style="background: var(--border); width: 70%;"></div>
+					<div class="h-3 rounded" style="background: var(--border); width: 85%;"></div>
+					<div class="h-3 rounded" style="background: var(--border); width: 50%;"></div>
+				</div>
 			</div>
-		</div>
-	{:else}
-		<pre
-			class="text-[11px] leading-5 p-3 overflow-auto max-h-48 whitespace-pre-wrap break-all font-mono"
-			style="background: var(--console-bg); color: var(--console-text); margin: 0; border-radius: 0; box-shadow: inset 0 2px 6px rgba(0,0,0,.3);"
-		>{command || 'No command available'}</pre>
-	{/if}
+		{:else}
+			<pre
+				class="text-[11px] leading-5 p-3 overflow-auto max-h-48 whitespace-pre-wrap break-all font-mono transition-opacity duration-200"
+				style="background: var(--console-bg); color: var(--console-text); margin: 0; border-radius: 0; box-shadow: inset 0 2px 6px rgba(0,0,0,.3); opacity: {loading ? 0.5 : 1};"
+			>{command || 'No command available'}</pre>
+		{/if}
+	</div>
 
 	<!-- Footer with save/copy -->
 	<div class="px-3 py-2 flex items-center gap-2" style="border-top: 1px solid var(--border-subtle);">

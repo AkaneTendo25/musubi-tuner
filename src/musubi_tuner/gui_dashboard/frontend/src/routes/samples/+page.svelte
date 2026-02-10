@@ -290,12 +290,17 @@
 							<FormField label="Guidance" type="number" bind:value={entry.g} step="0.1" min={0} tooltip="Guidance scale" />
 						</div>
 
-						<div class="grid grid-cols-3 sm:grid-cols-6 gap-2">
+						<div class="grid grid-cols-3 sm:grid-cols-6 gap-2 mb-2">
 							<FormField label="CFG Scale" type="number" bind:value={entry.l} step="0.1" placeholder="None" tooltip="CFG scale (optional)" />
 							<FormField label="Flow Shift" type="number" bind:value={entry.fs} step="0.1" tooltip="Flow shift" />
 							<div class="col-span-1 sm:col-span-4">
 								<FormField label="Negative" bind:value={entry.n} placeholder="Optional negative prompt" tooltip="Negative prompt" />
 							</div>
+						</div>
+
+						<!-- I2V conditioning -->
+						<div>
+							<FormField label="I2V Image (optional)" bind:value={entry.i} placeholder="path/to/first_frame.jpg" tooltip="Image-to-Video: path to conditioning image for first frame" />
 						</div>
 					</div>
 				{/each}

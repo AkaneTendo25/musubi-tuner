@@ -1,6 +1,7 @@
 <script>
 	import FormField from '$lib/components/FormField.svelte';
 	import PathInput from '$lib/components/PathInput.svelte';
+	import StatsPanel from '$lib/components/StatsPanel.svelte';
 	import { projectConfig, projectLoaded, createProject, loadProjectFromPath, saveProjectDebounced, recentProjects, removeRecentProject, closeProject } from '$lib/stores/project.js';
 	import { processStatuses } from '$lib/stores/processes.js';
 	import { status } from '$lib/stores/status.js';
@@ -109,94 +110,100 @@
 	function estimateTraining(cfg) {
 		if (!cfg?.training) return null;
 		const t = cfg.training;
-		const ds = cfg?.dataset?.datasets?.[0] || {};
+		const allDatasets = cfg?.dataset?.datasets || [];
+		const ds = allDatasets.find((d) => d?.type === 'video' || d?.type === 'image') || allDatasets[0] || {};
 
-		// LTX-2 19B base model: ~38GB fp16, ~19GB bf16, ~9.5GB fp8
-		let ditBase = t.fp8_base ? 9.5 : (t.mixed_precision === 'fp16' ? 38 : 19);
+		// Steady-state training memory:
+		// - DiT stays resident (partially on CPU with block swap)
+		// - VAE/Gemma are NOT resident during main train loop (cached latents/text are used)
+		const precision = String(t.mixed_precision || 'bf16').toLowerCase();
+		const isFp8 = !!t.fp8_base;
+		let ditBase = isFp8 ? 9.5 : (precision === 'no' ? 38 : 19);
 
-		// Block swapping: each block ~0.4GB for bf16, ~0.2GB for fp8
-		const blockSize = t.fp8_base ? 0.2 : 0.4;
-		const swapSavings = (t.blocks_to_swap || 0) * blockSize;
-		const dit = Math.max(ditBase - swapSavings, 0.5);
+		const totalBlocks = 48;
+		const blocksToSwap = Math.min(Math.max(Number(t.blocks_to_swap || 0), 0), totalBlocks - 1);
+		const blockSize = ditBase / totalBlocks;
+		const swapSavings = blocksToSwap * blockSize * 0.95; // account for offloader/runtime overhead
+		const dit = Math.max(ditBase - swapSavings, 1.0);
 
-		// Gemma text encoder (NOT loaded if precached and no preservation techniques)
-		const needsGemma = !t.use_precached_sample_prompts || t.blank_preservation || t.dop || t.prior_divergence;
-		const gemma = needsGemma ? gemmaSize(t) : 0;
-
-		// VAE is NEVER loaded during training (only during sampling, and only if not offloaded)
-		// Training only uses pre-cached latents
+		const gemma = 0;
 		const vae = 0;
 
-		// LoRA parameters: scales with rank and target layers
-		const rank = t.network_dim || 16;
-		const targetMultiplier = { t2v: 1.0, v2v: 1.4, audio: 0.8, full: 2.0 }[t.lora_target_preset] || 1.0;
-		const loraParams = rank * rank * targetMultiplier * 0.000012; // ~0.2GB for rank 32 t2v
+		// LoRA memory scales approximately linearly with rank.
+		const rank = Math.max(Number(t.network_dim || 16), 1);
+		const targetMultiplier = { t2v: 1.0, v2v: 1.2, audio: 0.8, full: 1.8 }[t.lora_target_preset] || 1.0;
+		const loraParams = 0.12 * (rank / 16) * targetMultiplier;
 
-		// Optimizer states: AdamW stores 2x params (momentum + variance)
-		const optimMultiplier = (t.optimizer_type || 'adamw8bit').includes('8bit') ? 1.5 : 2.0;
+		const optType = String(t.optimizer_type || 'adamw8bit').toLowerCase();
+		const is8bitOpt = optType.includes('8bit');
+		const isScheduleFree = optType.includes('schedulefree') || optType === 'automagic';
+		const optimMultiplier = is8bitOpt ? 0.9 : (isScheduleFree ? 1.2 : 2.0);
 		const optimStates = loraParams * optimMultiplier;
+		const loraGrads = loraParams * 0.7;
 
-		// Activations: more realistic calculation
-		// Base activation memory scales with: hidden_dim × num_layers × sequence_length × batch_size
-		const res = (ds.resolution_w || 768) * (ds.resolution_h || 512) / (768 * 512); // normalized to 768x512
-		const frames = Math.min(ds.target_frames || 33, 129);
-		const batchSize = ds.batch_size || 1;
+		// Activation estimate based on latent token count used by DiT:
+		// seq_len ~= latent_frames * latent_height * latent_width
+		const resolutionW = Math.max(Number(ds.resolution_w || 768), 64);
+		const resolutionH = Math.max(Number(ds.resolution_h || 512), 64);
+		const sourceFrames = Math.max(Number(ds.target_frames || 33), 1);
+		const batchSize = Math.max(Number(ds.batch_size || 1), 1);
 
-		// Sequence length for transformer: (H/patchsize) × (W/patchsize) × frames
-		// For LTX-2: patch_size=2 for video, so 768x512 → 384x256 → ~98k patches for 1 frame
-		// At 33 frames: ~3.2M patches (sequence length)
-		const patchesPerFrame = res * (384 * 256); // base is 384x256 patches
-		const seqLen = patchesPerFrame * frames;
+		// Mirrors ltx2 sampling/training latent geometry defaults:
+		// temporal_downsample_factor ~= 4, spatial_downsample_factor ~= 8.
+		const latentFrames = Math.max(1, Math.floor((sourceFrames - 1) / 4) + 1);
+		const latentHeight = Math.max(1, Math.floor(resolutionH / 8));
+		const latentWidth = Math.max(1, Math.floor(resolutionW / 8));
 
-		// Activation memory: hidden_dim (3840 for LTXAV) × layers (48) × seq_len × batch × dtype(2 bytes)
-		// But we only store activations for layers being recomputed
-		// With gradient checkpointing: store ~10-15% of layers
-		const hiddenDim = 3840;
-		const numLayers = 48 - (t.blocks_to_swap || 0);
-		let activations = (hiddenDim * numLayers * seqLen * batchSize * 2) / (1024**3); // bytes → GB
+		let seqTokens = latentFrames * latentHeight * latentWidth;
+		const mode = String(t.ltx2_mode || 'video');
+		if (mode === 'av') seqTokens *= 1.25;
+		if (mode === 'audio') seqTokens *= 0.65;
 
-		// Gradient checkpointing: only store activations for checkpoint layers (~10%)
-		if (t.gradient_checkpointing !== false) {
-			activations *= 0.1;
-			// Blockwise checkpointing: even more aggressive
-			if (t.blockwise_checkpointing) activations *= 0.5;
-			// CPU offloading: offload checkpointed activations to CPU (minimal VRAM)
-			if (t.gradient_checkpointing_cpu_offload) activations *= 0.2;
+		const hiddenDim = mode === 'video' ? 3072 : 3840;
+		const bytesPerValue = isFp8 ? 1 : 2;
+		const perLayerGb = (seqTokens * hiddenDim * batchSize * bytesPerValue) / (1024 ** 3);
+
+		let savedLayers;
+		if (t.gradient_checkpointing === false) {
+			savedLayers = 14;
+		} else {
+			savedLayers = t.blockwise_checkpointing ? 3 : 6;
 		}
 
-		// Add gradient storage for LoRA params
-		const loraGrads = loraParams;
+		let activations = perLayerGb * savedLayers;
+		if (t.blockwise_checkpointing) activations *= 0.85;
+		if ((t.ffn_chunk_size || 0) > 0) activations *= 0.90;
+		if (t.split_attn_mode || t.split_attn_target) activations *= 0.92;
 
-		// Gradient accumulation: we accumulate gradients before optimizer step
-		// This doesn't increase activation memory, but we need to store accumulated grads
-		const gradAccum = t.gradient_accumulation_steps || 1;
-		const gradAccumOverhead = gradAccum > 1 ? loraGrads * 0.5 : 0;
+		let activationBuffers = 0.8 + Math.max(0, batchSize - 1) * 0.35;
+		if (t.img_in_txt_in_offloading) activationBuffers = Math.max(0.2, activationBuffers - 0.35);
 
-		// Preservation techniques: each adds extra forward passes (more activations)
+		const activationTotal = Math.max(0.3, activations + activationBuffers);
+
+		const gradAccum = Math.max(Number(t.gradient_accumulation_steps || 1), 1);
+		const gradAccumOverhead = gradAccum > 1 ? loraGrads * 0.4 : 0;
+
 		let preservationOverhead = 0;
-		if (t.blank_preservation) preservationOverhead += activations * 0.5; // 2 extra forwards
-		if (t.dop) preservationOverhead += activations * 0.5;
-		if (t.prior_divergence) preservationOverhead += activations * 0.25; // 1 extra forward
+		if (t.blank_preservation) preservationOverhead += activationTotal * 0.35;
+		if (t.dop) preservationOverhead += activationTotal * 0.35;
+		if (t.prior_divergence) preservationOverhead += activationTotal * 0.15;
 
-		// CREPA: projector params (~33M for backbone mode) + feature buffers
-		const crepaOverhead = t.crepa ? 0.15 : 0;
+		const crepaOverhead = t.crepa ? (String(t.crepa_mode || 'backbone') === 'dino' ? 0.08 : 0.15) : 0;
 
-		// Offloading savings
-		let offloadSave = 0;
-		if (t.img_in_txt_in_offloading) offloadSave += 1.2;
-		if (t.sample_with_offloading) offloadSave += 0; // only affects sampling, not training
+		const total = dit + gemma + vae + loraParams + optimStates + loraGrads + activationTotal + gradAccumOverhead + preservationOverhead + crepaOverhead;
 
-		// Total
-		const total = dit + gemma + vae + loraParams + optimStates + activations + loraGrads + gradAccumOverhead + preservationOverhead + crepaOverhead - offloadSave;
+		// Temporary spikes that are not part of steady-state train-loop VRAM.
+		const samplingEnabled = !!t.sample_prompts && !!(t.sample_at_first || t.sample_every_n_steps || t.sample_every_n_epochs);
+		const samplingSpike = samplingEnabled;
+		const preservationGemmaSpike = !!(t.blank_preservation || t.dop) && !t.use_precached_preservation;
 
 		// Build parts breakdown
 		const parts = [
 			{ label: 'DiT', value: dit, color: 'var(--accent)' },
 		];
-		if (gemma > 0) parts.push({ label: 'Gemma', value: gemma, color: 'var(--info)' });
 		parts.push({ label: 'LoRA', value: loraParams, color: 'var(--warning)' });
 		parts.push({ label: 'Optimizer', value: optimStates, color: 'var(--warning)' });
-		parts.push({ label: 'Activ.', value: activations + loraGrads, color: 'var(--success)' });
+		parts.push({ label: 'Activ.', value: activationTotal + loraGrads, color: 'var(--success)' });
 		if (gradAccumOverhead > 0) parts.push({ label: 'GradAccum', value: gradAccumOverhead, color: 'var(--info)' });
 		if (preservationOverhead > 0) parts.push({ label: 'Preserv.', value: preservationOverhead, color: 'var(--danger)' });
 		if (crepaOverhead > 0) parts.push({ label: 'CREPA', value: crepaOverhead, color: 'var(--secondary, var(--info))' });
@@ -205,9 +212,9 @@
 			total: Math.max(total, 2),
 			parts,
 			swap: swapSavings,
-			offloadSave,
-			noGemma: !needsGemma,
-			noPrecache: needsGemma,
+			noGemma: true,
+			samplingSpike,
+			preservationGemmaSpike,
 		};
 	}
 
@@ -405,6 +412,9 @@
 			</div>
 		{/if}
 
+		<!-- Project Statistics -->
+		<StatsPanel />
+
 		<!-- Config summary row -->
 		<div class="grid grid-cols-4 sm:grid-cols-8 gap-x-3 gap-y-2 px-1">
 			<div>
@@ -599,7 +609,13 @@
 							<span class="text-[9px] mt-0.5" style="color: var(--success);">-{vramTrain.swap.toFixed(1)}G swap</span>
 						{/if}
 						{#if vramTrain.noGemma}
-							<span class="text-[9px] mt-0.5" style="color: var(--info);">prompts precached</span>
+							<span class="text-[9px] mt-0.5" style="color: var(--info);">steady-state: cached latents/text (no VAE/Gemma)</span>
+						{/if}
+						{#if vramTrain.samplingSpike}
+							<span class="text-[9px] mt-0.5" style="color: var(--text-muted);">sampling can spike VRAM (temporary VAE/Gemma load)</span>
+						{/if}
+						{#if vramTrain.preservationGemmaSpike}
+							<span class="text-[9px] mt-0.5" style="color: var(--text-muted);">preservation prompt encoding loads Gemma once (if not precached)</span>
 						{/if}
 					</div>
 				{/if}
@@ -607,7 +623,7 @@
 			{#if vramTrain && vramTrain.total > vramTotal}
 				<div class="mt-2 text-[10px] px-2 py-1 flex items-center gap-1.5" style="color: var(--danger); background: var(--danger-muted); border-radius: var(--radius-sm);">
 					<svg class="w-3 h-3 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"/></svg>
-					Training may exceed VRAM — try FP8, quantization, or blocks_to_swap.
+					Training may exceed VRAM — try FP8, quantization, blocks_to_swap, or lower resolution/frames.
 				</div>
 			{/if}
 		</div>

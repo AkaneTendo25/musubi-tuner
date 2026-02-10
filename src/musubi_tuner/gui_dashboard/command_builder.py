@@ -58,6 +58,13 @@ def build_cache_latents_cmd(config: ProjectConfig) -> list[str]:
             if c.ltx2_audio_ext:
                 cmd += ["--ltx2_audio_ext", c.ltx2_audio_ext]
 
+    # I2V latent precaching
+    if c.precache_sample_latents and c.sample_prompts:
+        cmd.append("--precache_sample_latents")
+        cmd += ["--sample_prompts", c.sample_prompts]
+        if c.sample_latents_cache:
+            cmd += ["--sample_latents_cache", c.sample_latents_cache]
+
     return cmd
 
 
@@ -323,6 +330,10 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
         cmd.append("--use_precached_sample_prompts")
     if t.sample_prompts_cache:
         cmd += ["--sample_prompts_cache", t.sample_prompts_cache]
+    if t.use_precached_sample_latents:
+        cmd.append("--use_precached_sample_latents")
+    if t.sample_latents_cache:
+        cmd += ["--sample_latents_cache", t.sample_latents_cache]
     cmd += ["--height", str(t.height)]
     cmd += ["--width", str(t.width)]
     cmd += ["--sample_num_frames", str(t.sample_num_frames)]
@@ -445,9 +456,6 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
         cmd.append("--persistent_data_loader_workers")
     cmd += ["--ltx2_first_frame_conditioning_p", str(t.ltx2_first_frame_conditioning_p)]
 
-    # GUI flag so training writes dashboard data
-    cmd.append("--gui")
-
     return cmd
 
 
@@ -532,12 +540,13 @@ def build_cache_dino_cmd(config: ProjectConfig) -> list[str]:
     """Build CLI args for ltx2_cache_dino_features.py."""
     toml_path = export_dataset_toml(config)
     c = config.caching
+    t = config.training
 
     cmd = [
         sys.executable,
         _find_script("ltx2_cache_dino_features.py"),
         "--dataset_config", str(toml_path),
-        "--dino_model", c.dino_model,
+        "--dino_model", t.crepa_dino_model,  # Use training model setting, not caching
         "--dino_batch_size", str(c.dino_batch_size),
     ]
 
