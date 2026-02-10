@@ -18,6 +18,7 @@ import torch
 from safetensors.torch import save_file
 
 import musubi_tuner.cache_latents as cache_latents
+from musubi_tuner.audio_io_utils import coerce_decoded_audio_to_channels_first
 from musubi_tuner.dataset import config_utils
 from musubi_tuner.dataset.config_utils import BlueprintGenerator, ConfigSanitizer
 from musubi_tuner.dataset.image_video_dataset import (
@@ -224,13 +225,15 @@ def encode_and_save_audio_cache(
             sample_rate: Optional[int] = int(getattr(audio_stream, "rate", 0)) or None
 
             for frame in container.decode(audio=0):
-                # Typically returns shape [samples, channels] or [channels, samples]
-                arr = frame.to_ndarray()
-                if arr.ndim == 1:
-                    arr = arr[None, :]
-                elif arr.shape[0] > arr.shape[1]:
-                    # assume [samples, channels]
-                    arr = arr.T
+                # PyAV can return packed interleaved 1D data for stereo;
+                # normalize everything to [channels, samples].
+                frame_channels = None
+                try:
+                    frame_channels = int(len(frame.layout.channels))  # type: ignore[arg-type]
+                except Exception:
+                    frame_channels = int(getattr(audio_stream, "channels", 0)) or None
+
+                arr = coerce_decoded_audio_to_channels_first(frame.to_ndarray(), channels=frame_channels)
 
                 if sample_rate is None:
                     sample_rate = int(getattr(frame, "sample_rate", 0)) or None
