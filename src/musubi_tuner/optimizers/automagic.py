@@ -170,6 +170,18 @@ class Automagic(torch.optim.Optimizer):
         lrs = self.get_learning_rates()
         return sum(lrs) / len(lrs)
 
+    def get_lr_tensor(self):
+        """Return per-parameter avg learning rates as a 1D tensor for histogram logging."""
+        lrs = []
+        for group in self.param_groups:
+            for p in group["params"]:
+                state = self.state.get(p, {})
+                if 'avg_lr' in state:
+                    lrs.append(state['avg_lr'])
+        if not lrs:
+            return None
+        return torch.stack(lrs)
+
     @torch.no_grad()
     def step(self, closure=None):
         """
