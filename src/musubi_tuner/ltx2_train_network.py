@@ -1646,7 +1646,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
             if isinstance(latents_info, dict):
                 frame_rate = latents_info.get("fps", None)
         if frame_rate is None:
-            frame_rate = 24
+            frame_rate = 25
         if isinstance(frame_rate, torch.Tensor):
             frame_rate = frame_rate.item() if frame_rate.numel() == 1 else frame_rate[0].item()
 
@@ -1840,7 +1840,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
 
             frame_rate_v2v = frame_rate
             if frame_rate_v2v is None:
-                frame_rate_v2v = 24
+                frame_rate_v2v = 25
 
             ref_frames = int(ref_latents.shape[2])
             tgt_frames = int(latents.shape[2])

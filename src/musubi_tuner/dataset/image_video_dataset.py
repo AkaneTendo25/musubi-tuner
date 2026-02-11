@@ -2744,7 +2744,7 @@ class AudioDataset(BaseDataset):
 class VideoDataset(BaseDataset):
     TARGET_FPS_HUNYUAN = 24.0
     TARGET_FPS_WAN = 16.0
-    TARGET_FPS_LTX2 = 24.0
+    TARGET_FPS_LTX2 = 25.0
     TARGET_FPS_FRAMEPACK = 30.0
     TARGET_FPS_FLUX_KONTEXT = 1.0  # VideoDataset is not used for Flux Kontext, but this is a placeholder
     TARGET_FPS_HUNYUAN_VIDEO_1_5 = 24.0

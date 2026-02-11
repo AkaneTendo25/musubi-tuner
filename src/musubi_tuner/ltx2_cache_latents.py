@@ -198,7 +198,7 @@ def encode_and_save_audio_cache(
     *,
     audio_path: str,
     dtype: torch.dtype,
-    target_fps: float = 24.0,
+    target_fps: float = 25.0,
 ) -> None:
     try:
         import torchaudio
