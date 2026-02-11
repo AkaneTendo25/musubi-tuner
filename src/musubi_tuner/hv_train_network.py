@@ -2214,7 +2214,7 @@ class NetworkTrainer:
 
                     loss = loss.mean()  # mean loss over all elements in batch
 
-                    accelerator.backward(loss)
+                    accelerator.backward(loss.float())
                     if accelerator.sync_gradients:
                         # self.all_reduce_network(accelerator, network)  # sync DDP grad manually
                         state = accelerate.PartialState()
