@@ -6,9 +6,10 @@ import json
 import math
 import os
 import random
+import re
 import time
 from multiprocessing import Value
-from typing import Optional
+from typing import Any, Optional
 
 import toml
 import torch
@@ -40,6 +41,14 @@ import logging
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
+
+
+def _is_attention_geometry_param(param_name: str) -> bool:
+    # Attention geometry parameters most tied to motion priors.
+    return re.search(
+        r"(?:^|\.)(?:attn\d+|audio_attn\d+|audio_to_video_attn|video_to_audio_attn)\.(?:to_q|to_k|q_norm|k_norm)\.",
+        param_name,
+    ) is not None
 
 
 class EMAModel:
@@ -251,6 +260,538 @@ def _normalize_ltx2_batch_for_call_dit(batch: dict) -> dict:
     return normalized
 
 
+def _clone_to_cpu(value: Any) -> Any:
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().clone()
+    if isinstance(value, dict):
+        return {k: _clone_to_cpu(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_clone_to_cpu(v) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_clone_to_cpu(v) for v in value)
+    return copy.deepcopy(value)
+
+
+def _move_to_device(value: Any, device: torch.device, *, dtype: Optional[torch.dtype] = None) -> Any:
+    if isinstance(value, torch.Tensor):
+        out = value.to(device=device)
+        if dtype is not None and out.dtype.is_floating_point:
+            out = out.to(dtype=dtype)
+        return out
+    if isinstance(value, dict):
+        return {k: _move_to_device(v, device, dtype=dtype) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_move_to_device(v, device, dtype=dtype) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_move_to_device(v, device, dtype=dtype) for v in value)
+    return value
+
+
+def _build_temporal_pair_mask(video_loss_mask: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+    if video_loss_mask is None:
+        return None
+    if not isinstance(video_loss_mask, torch.Tensor):
+        return None
+    if video_loss_mask.dim() == 2:
+        if video_loss_mask.shape[1] < 2:
+            return None
+        pair = video_loss_mask[:, 1:] & video_loss_mask[:, :-1]
+        return pair.unsqueeze(1).unsqueeze(-1).unsqueeze(-1)
+    if video_loss_mask.dim() == 5:
+        if video_loss_mask.shape[2] < 2:
+            return None
+        return video_loss_mask[:, :, 1:, :, :] & video_loss_mask[:, :, :-1, :, :]
+    return None
+
+
+def _build_motion_anchor_latents(
+    latents: torch.Tensor,
+    anchor_frames: int,
+    jitter_std: float,
+) -> torch.Tensor:
+    if latents.dim() != 5:
+        raise ValueError(f"Expected 5D latents for motion anchor, got shape: {tuple(latents.shape)}")
+
+    frames = int(latents.shape[2])
+    if anchor_frames <= 1:
+        return latents.clone()
+
+    if frames >= anchor_frames:
+        anchor_latents = latents[:, :, :anchor_frames, :, :].clone()
+    elif frames == 1:
+        anchor_latents = latents.repeat(1, 1, anchor_frames, 1, 1).clone()
+    else:
+        repeats = int(math.ceil(anchor_frames / float(frames)))
+        anchor_latents = latents.repeat(1, 1, repeats, 1, 1)[:, :, :anchor_frames, :, :].clone()
+
+    if jitter_std > 0 and anchor_latents.shape[2] > 1:
+        jitter = torch.randn_like(anchor_latents) * float(jitter_std)
+        jitter[:, :, 0, :, :] = 0
+        anchor_latents = anchor_latents + jitter
+
+    return anchor_latents
+
+
+def _extract_motion_anchor_batch(batch: dict) -> dict:
+    # Keep only fields used by call_dit for text conditioning / frame rate.
+    keep_keys = (
+        "conditions",
+        "text",
+        "text_mask",
+        "frame_rate",
+        "ref_latents",
+        "reference_latents",
+        "audio_latents",
+        "audio_lengths",
+    )
+    return {k: _clone_to_cpu(batch[k]) for k in keep_keys if k in batch}
+
+
+def _build_motion_anchor_cache(
+    trainer: LTX2NetworkTrainer,
+    args: argparse.Namespace,
+    accelerator: Accelerator,
+    transformer: torch.nn.Module,
+    train_dataloader: torch.utils.data.DataLoader,
+    noise_scheduler: Any,
+    attention_modules: Optional[list[tuple[str, torch.nn.Module]]] = None,
+) -> list[dict[str, Any]]:
+    cache_size = int(getattr(args, "motion_preservation_anchor_cache_size", 0) or 0)
+    if cache_size <= 0:
+        return []
+
+    anchor_frames = int(getattr(args, "motion_preservation_anchor_frames", 0) or 0)
+    if anchor_frames <= 1:
+        raise ValueError("motion_preservation_anchor_frames must be >= 2")
+    jitter_std = float(getattr(args, "motion_preservation_jitter_std", 0.0) or 0.0)
+    use_attn_pres = bool(getattr(args, "motion_attention_preservation", False) and attention_modules)
+    max_queries = int(getattr(args, "motion_attention_preservation_queries", 32) or 32)
+    max_keys = int(getattr(args, "motion_attention_preservation_keys", 64) or 64)
+
+    entries: list[dict[str, Any]] = []
+    max_attempts = max(cache_size * 4, cache_size)
+    attempt = 0
+    original_first_frame_p = float(getattr(args, "ltx2_first_frame_conditioning_p", 0.0))
+    was_training = transformer.training
+
+    logger.info(
+        "Building motion anchor cache from base model outputs: size=%d frames=%d jitter_std=%.4f",
+        cache_size,
+        anchor_frames,
+        jitter_std,
+    )
+
+    transformer.eval()
+    setattr(args, "ltx2_first_frame_conditioning_p", 0.0)
+
+    try:
+        with torch.no_grad():
+            for batch in train_dataloader:
+                if len(entries) >= cache_size or attempt >= max_attempts:
+                    break
+                attempt += 1
+
+                batch = _normalize_ltx2_batch_for_call_dit(batch)
+                latents = batch.get("latents")
+                if isinstance(latents, dict):
+                    latents = latents.get("latents")
+                if not isinstance(latents, torch.Tensor):
+                    continue
+                if latents.dim() != 5:
+                    continue
+
+                latents_tensor = trainer.scale_shift_latents(latents)
+                anchor_latents = _build_motion_anchor_latents(latents_tensor, anchor_frames, jitter_std)
+                anchor_noise = torch.randn_like(anchor_latents)
+
+                batch_timesteps = batch.get("timesteps")
+                if not isinstance(batch_timesteps, torch.Tensor):
+                    continue
+
+                anchor_noisy_input, anchor_model_timesteps = trainer.get_noisy_model_input_and_timesteps(
+                    args,
+                    anchor_noise,
+                    anchor_latents,
+                    batch_timesteps,
+                    noise_scheduler,
+                    accelerator.device,
+                    trainer.dit_dtype,
+                )
+
+                teacher_attn_maps = None
+                if use_attn_pres:
+                    with _AttentionMapRecorder(
+                        attention_modules or [],
+                        max_queries=max_queries,
+                        max_keys=max_keys,
+                        capture_grad=False,
+                    ) as attn_recorder:
+                        teacher_pred, _ = trainer.call_dit(
+                            args,
+                            accelerator,
+                            transformer,
+                            anchor_latents,
+                            batch,
+                            anchor_noise,
+                            anchor_noisy_input,
+                            anchor_model_timesteps,
+                            trainer.dit_dtype,
+                        )
+                    if attn_recorder.maps:
+                        teacher_attn_maps = {
+                            k: v.detach().to(dtype=torch.float16).cpu()
+                            for k, v in attn_recorder.maps.items()
+                        }
+                else:
+                    teacher_pred, _ = trainer.call_dit(
+                        args,
+                        accelerator,
+                        transformer,
+                        anchor_latents,
+                        batch,
+                        anchor_noise,
+                        anchor_noisy_input,
+                        anchor_model_timesteps,
+                        trainer.dit_dtype,
+                    )
+
+                if not isinstance(teacher_pred, dict):
+                    continue
+                if teacher_pred.get("_skip_step"):
+                    continue
+
+                entries.append(
+                    {
+                        "anchor_latents": _clone_to_cpu(anchor_latents),
+                        "anchor_noise": _clone_to_cpu(anchor_noise),
+                        "anchor_noisy_input": _clone_to_cpu(anchor_noisy_input),
+                        "anchor_model_timesteps": _clone_to_cpu(anchor_model_timesteps),
+                        "anchor_batch": _extract_motion_anchor_batch(batch),
+                        "teacher_video_pred": _clone_to_cpu(teacher_pred["video_pred"]),
+                        "teacher_attention_maps": teacher_attn_maps,
+                    }
+                )
+    finally:
+        setattr(args, "ltx2_first_frame_conditioning_p", original_first_frame_p)
+        if was_training:
+            transformer.train()
+
+    if len(entries) < cache_size:
+        logger.warning(
+            "Built %d/%d motion anchors (max_attempts=%d).",
+            len(entries),
+            cache_size,
+            max_attempts,
+        )
+    else:
+        logger.info("Built %d motion anchors.", len(entries))
+
+    return entries
+
+
+def _extract_attn1_block_index(module_name: str) -> Optional[int]:
+    match = re.search(r"(?:^|\.)(?:model\.)?transformer_blocks\.(\d+)\.attn1$", module_name)
+    if match is None:
+        return None
+    return int(match.group(1))
+
+
+def _sample_sequence_indices(length: int, count: int, *, device: torch.device) -> torch.Tensor:
+    if length <= 0:
+        return torch.empty((0,), dtype=torch.long, device=device)
+    if count <= 0 or count >= length:
+        return torch.arange(length, device=device, dtype=torch.long)
+    idx = torch.linspace(0, length - 1, steps=count, device=device)
+    idx = idx.round().to(torch.long)
+    return torch.unique(idx, sorted=True)
+
+
+def _collect_motion_attention_modules(
+    transformer: torch.nn.Module,
+    block_spec: Optional[str],
+) -> list[tuple[str, torch.nn.Module]]:
+    from musubi_tuner.ltx_2.model.transformer.attention import Attention
+
+    block_filter = _parse_block_index_spec(block_spec)
+    apply_filter = len(block_filter) > 0
+    out: list[tuple[str, torch.nn.Module]] = []
+    for module_name, module in transformer.named_modules():
+        if not isinstance(module, Attention):
+            continue
+        block_index = _extract_attn1_block_index(module_name)
+        if block_index is None:
+            continue
+        if apply_filter and block_index not in block_filter:
+            continue
+        out.append((module_name, module))
+    return out
+
+
+class _AttentionMapRecorder:
+    def __init__(
+        self,
+        modules: list[tuple[str, torch.nn.Module]],
+        *,
+        max_queries: int,
+        max_keys: int,
+        capture_grad: bool,
+    ) -> None:
+        self.modules = modules
+        self.max_queries = max(1, int(max_queries))
+        self.max_keys = max(1, int(max_keys))
+        self.capture_grad = capture_grad
+        self.maps: dict[str, torch.Tensor] = {}
+        self._handles: list[Any] = []
+
+    def _record(self, name: str, module: torch.nn.Module, args: tuple[Any, ...], kwargs: Optional[dict[str, Any]]) -> None:
+        if not args:
+            return
+        x = args[0]
+        if not isinstance(x, torch.Tensor) or x.dim() != 3:
+            return
+
+        context = kwargs.get("context") if kwargs else None
+        pe = kwargs.get("pe") if kwargs else None
+        k_pe = kwargs.get("k_pe") if kwargs else None
+
+        if context is None and len(args) > 1 and isinstance(args[1], torch.Tensor):
+            context = args[1]
+        if pe is None and len(args) > 3 and isinstance(args[3], torch.Tensor):
+            pe = args[3]
+        if k_pe is None and len(args) > 4 and isinstance(args[4], torch.Tensor):
+            k_pe = args[4]
+
+        if context is None:
+            context = x
+        if not isinstance(context, torch.Tensor) or context.dim() != 3:
+            return
+
+        q = module.q_norm(module.to_q(x))
+        k = module.k_norm(module.to_k(context))
+
+        if isinstance(pe, torch.Tensor):
+            from musubi_tuner.ltx_2.model.transformer.rope import apply_rotary_emb
+
+            q = apply_rotary_emb(q, pe, module.rope_type)
+            k = apply_rotary_emb(k, pe if not isinstance(k_pe, torch.Tensor) else k_pe, module.rope_type)
+
+        bsz = q.shape[0]
+        q = q.view(bsz, -1, module.heads, module.dim_head).transpose(1, 2)
+        k = k.view(bsz, -1, module.heads, module.dim_head).transpose(1, 2)
+        if q.shape[2] == 0 or k.shape[2] == 0:
+            return
+
+        q_idx = _sample_sequence_indices(q.shape[2], self.max_queries, device=q.device)
+        k_idx = _sample_sequence_indices(k.shape[2], self.max_keys, device=k.device)
+        if q_idx.numel() == 0 or k_idx.numel() == 0:
+            return
+
+        q_sample = q[:, :, q_idx, :].to(torch.float32)
+        k_sample = k[:, :, k_idx, :].to(torch.float32)
+        logits = torch.matmul(q_sample, k_sample.transpose(-1, -2)) / math.sqrt(float(module.dim_head))
+        attn = torch.softmax(logits, dim=-1).mean(dim=1)  # [B, Q, K], average over heads
+
+        if not self.capture_grad:
+            attn = attn.detach()
+        self.maps[name] = attn
+
+    def _build_hook(self, name: str):
+        def _hook(module: torch.nn.Module, args: tuple[Any, ...], kwargs: dict[str, Any]) -> None:
+            self._record(name, module, args, kwargs)
+
+        return _hook
+
+    def _build_legacy_hook(self, name: str):
+        def _hook(module: torch.nn.Module, args: tuple[Any, ...]) -> None:
+            self._record(name, module, args, None)
+
+        return _hook
+
+    def __enter__(self) -> "_AttentionMapRecorder":
+        self.maps = {}
+        self._handles = []
+        for name, module in self.modules:
+            try:
+                handle = module.register_forward_pre_hook(self._build_hook(name), with_kwargs=True)
+            except TypeError:
+                handle = module.register_forward_pre_hook(self._build_legacy_hook(name))
+            self._handles.append(handle)
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        for handle in self._handles:
+            handle.remove()
+        self._handles = []
+        return False
+
+
+def _parse_block_index_spec(spec: Optional[str]) -> set[int]:
+    if not spec:
+        return set()
+
+    out: set[int] = set()
+    for raw in spec.split(","):
+        token = raw.strip()
+        if not token:
+            continue
+        if "-" in token:
+            start_s, end_s = token.split("-", 1)
+            start = int(start_s.strip())
+            end = int(end_s.strip())
+            if end < start:
+                raise ValueError(f"Invalid block range in freeze_block_indices: {token!r}")
+            out.update(range(start, end + 1))
+        else:
+            out.add(int(token))
+    return out
+
+
+def _parse_block_lr_rules(specs: Optional[list[str]]) -> list[tuple[int, Optional[int], float]]:
+    if not specs:
+        return []
+
+    rules: list[tuple[int, Optional[int], float]] = []
+    for raw in specs:
+        text = raw.strip()
+        if not text:
+            continue
+        if ":" not in text:
+            raise ValueError(f"Invalid block_lr_scales entry {text!r}. Expected format like 0-11:0.1")
+
+        range_part, scale_part = text.split(":", 1)
+        scale = float(scale_part.strip())
+        if scale < 0.0:
+            raise ValueError(f"block_lr_scales must use non-negative scales, got {scale} in {text!r}")
+
+        range_part = range_part.strip()
+        if "-" in range_part:
+            start_s, end_s = range_part.split("-", 1)
+            start = int(start_s.strip())
+            end_raw = end_s.strip()
+            end: Optional[int] = None if end_raw == "" else int(end_raw)
+            if end is not None and end < start:
+                raise ValueError(f"Invalid block_lr_scales range {range_part!r} in {text!r}")
+            rules.append((start, end, scale))
+        else:
+            idx = int(range_part)
+            rules.append((idx, idx, scale))
+    return rules
+
+
+def _extract_transformer_block_index(param_name: str) -> Optional[int]:
+    # Works for both "transformer_blocks.X.*" and "model.transformer_blocks.X.*".
+    match = re.search(r"(?:^|\.)(?:model\.)?transformer_blocks\.(\d+)\.", param_name)
+    if match is None:
+        return None
+    return int(match.group(1))
+
+
+def _resolve_block_lr_scale(block_index: int, rules: list[tuple[int, Optional[int], float]]) -> Optional[float]:
+    for start, end, scale in rules:
+        if end is None:
+            if block_index >= start:
+                return scale
+        elif start <= block_index <= end:
+            return scale
+    return None
+
+
+def _build_full_ft_param_groups(
+    transformer: torch.nn.Module,
+    base_lr: float,
+    *,
+    freeze_early_blocks: int,
+    freeze_block_indices_spec: Optional[str],
+    block_lr_scales_spec: Optional[list[str]],
+    non_block_lr_scale: float,
+    attn_geometry_lr_scale: float,
+    freeze_attn_geometry: bool,
+) -> tuple[list[dict[str, Any]], list[list[str]], dict[str, Any]]:
+    if base_lr <= 0:
+        raise ValueError(f"learning_rate must be > 0 for full fine-tune, got {base_lr}")
+    if freeze_early_blocks < 0:
+        raise ValueError("freeze_early_blocks must be >= 0")
+    if non_block_lr_scale < 0.0:
+        raise ValueError("non_block_lr_scale must be >= 0")
+    if attn_geometry_lr_scale < 0.0:
+        raise ValueError("attn_geometry_lr_scale must be >= 0")
+
+    block_lr_rules = _parse_block_lr_rules(block_lr_scales_spec)
+    frozen_blocks = set(range(freeze_early_blocks))
+    frozen_blocks.update(_parse_block_index_spec(freeze_block_indices_spec))
+
+    grouped_params: dict[float, list[torch.nn.Parameter]] = {}
+    grouped_names: dict[float, list[str]] = {}
+    frozen_param_count = 0
+    trainable_param_count = 0
+    frozen_attn_geometry_count = 0
+    trainable_attn_geometry_count = 0
+    trainable_by_block: dict[str, int] = {}
+
+    for name, param in transformer.named_parameters():
+        if not param.requires_grad:
+            continue
+
+        block_index = _extract_transformer_block_index(name)
+        if block_index is not None and block_index in frozen_blocks:
+            param.requires_grad_(False)
+            frozen_param_count += 1
+            if _is_attention_geometry_param(name):
+                frozen_attn_geometry_count += 1
+            continue
+
+        if block_index is None:
+            scale = float(non_block_lr_scale)
+        else:
+            scale = _resolve_block_lr_scale(block_index, block_lr_rules)
+            if scale is None:
+                scale = 1.0
+            trainable_by_block[str(block_index)] = trainable_by_block.get(str(block_index), 0) + 1
+
+        is_attn_geometry = _is_attention_geometry_param(name)
+        if is_attn_geometry:
+            if freeze_attn_geometry:
+                param.requires_grad_(False)
+                frozen_param_count += 1
+                frozen_attn_geometry_count += 1
+                continue
+            scale *= float(attn_geometry_lr_scale)
+
+        if scale <= 0.0:
+            param.requires_grad_(False)
+            frozen_param_count += 1
+            if is_attn_geometry:
+                frozen_attn_geometry_count += 1
+            continue
+
+        grouped_params.setdefault(scale, []).append(param)
+        grouped_names.setdefault(scale, []).append(name)
+        trainable_param_count += 1
+        if is_attn_geometry:
+            trainable_attn_geometry_count += 1
+
+    if trainable_param_count == 0:
+        raise ValueError("No trainable parameters remain after freeze/lr-scale settings.")
+
+    # Keep order deterministic by scale value.
+    scales = sorted(grouped_params.keys())
+    param_groups = [{"params": grouped_params[s], "lr": base_lr * s} for s in scales]
+    param_name_groups = [grouped_names[s] for s in scales]
+
+    stats = {
+        "frozen_param_count": frozen_param_count,
+        "trainable_param_count": trainable_param_count,
+        "num_lr_groups": len(scales),
+        "lr_scales": scales,
+        "frozen_blocks": sorted(frozen_blocks),
+        "block_lr_rules": block_lr_rules,
+        "trainable_by_block": trainable_by_block,
+        "frozen_attn_geometry_count": frozen_attn_geometry_count,
+        "trainable_attn_geometry_count": trainable_attn_geometry_count,
+    }
+    return param_groups, param_name_groups, stats
+
+
 def ltx2_finetune_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     parser.add_argument(
         "--fused_backward_pass",
@@ -313,6 +854,130 @@ def ltx2_finetune_setup_parser(parser: argparse.ArgumentParser) -> argparse.Argu
         default=None,
         help="Number of validation batches to use (None = all)",
     )
+    parser.add_argument(
+        "--motion_preservation",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Full-FT motion preservation via base-model output rehearsal anchors. "
+            "Designed for image-only training to keep existing motion behavior."
+        ),
+    )
+    parser.add_argument(
+        "--motion_preservation_multiplier",
+        type=float,
+        default=0.5,
+        help="Weight for motion preservation loss.",
+    )
+    parser.add_argument(
+        "--motion_preservation_mode",
+        type=str,
+        default="temporal",
+        choices=["temporal", "full"],
+        help="temporal: match frame-to-frame deltas. full: match full output tensors.",
+    )
+    parser.add_argument(
+        "--motion_preservation_anchor_frames",
+        type=int,
+        default=8,
+        help="Number of frames for synthetic motion rehearsal anchors (must be >=2).",
+    )
+    parser.add_argument(
+        "--motion_preservation_anchor_cache_size",
+        type=int,
+        default=32,
+        help="Number of base-model rehearsal anchors cached at training start.",
+    )
+    parser.add_argument(
+        "--motion_preservation_interval",
+        type=int,
+        default=1,
+        help="Apply motion preservation every N micro-steps.",
+    )
+    parser.add_argument(
+        "--motion_preservation_jitter_std",
+        type=float,
+        default=0.01,
+        help="Std of per-frame latent jitter when expanding single-frame latents into anchor clips.",
+    )
+    parser.add_argument(
+        "--motion_attention_preservation",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Regularize sampled self-attention maps on rehearsal anchors against base-model attention maps.",
+    )
+    parser.add_argument(
+        "--motion_attention_preservation_weight",
+        type=float,
+        default=0.1,
+        help="Weight for attention-map preservation loss on rehearsal anchors.",
+    )
+    parser.add_argument(
+        "--motion_attention_preservation_loss",
+        type=str,
+        default="kl",
+        choices=["kl", "mse"],
+        help="Loss type for attention-map preservation.",
+    )
+    parser.add_argument(
+        "--motion_attention_preservation_queries",
+        type=int,
+        default=32,
+        help="Number of sampled query tokens per attention map.",
+    )
+    parser.add_argument(
+        "--motion_attention_preservation_keys",
+        type=int,
+        default=64,
+        help="Number of sampled key tokens per attention map.",
+    )
+    parser.add_argument(
+        "--motion_attention_preservation_blocks",
+        type=str,
+        default=None,
+        help="Optional comma/range block filter for attention-map preservation, e.g. 12-23.",
+    )
+    parser.add_argument(
+        "--freeze_early_blocks",
+        type=int,
+        default=0,
+        help="Freeze transformer blocks [0, N) during full fine-tuning to protect base motion priors.",
+    )
+    parser.add_argument(
+        "--freeze_block_indices",
+        type=str,
+        default=None,
+        help="Additional comma-separated block indices/ranges to freeze, e.g. 0-7,10,12-15.",
+    )
+    parser.add_argument(
+        "--block_lr_scales",
+        type=str,
+        nargs="*",
+        default=None,
+        help=(
+            "Per-block LR scale rules for full fine-tuning. "
+            "Format: start-end:scale, start-:scale, or idx:scale. "
+            "Examples: 0-11:0.1 12-23:0.4 24-:1.0"
+        ),
+    )
+    parser.add_argument(
+        "--non_block_lr_scale",
+        type=float,
+        default=1.0,
+        help="LR scale for non-transformer-block parameters in full fine-tuning.",
+    )
+    parser.add_argument(
+        "--attn_geometry_lr_scale",
+        type=float,
+        default=1.0,
+        help="Additional LR scale for attention geometry params (to_q/to_k/q_norm/k_norm).",
+    )
+    parser.add_argument(
+        "--freeze_attn_geometry",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Freeze attention geometry params (to_q/to_k/q_norm/k_norm) during full fine-tuning.",
+    )
     return parser
 
 
@@ -355,6 +1020,31 @@ def main() -> None:
             "Enabling av_use_video_prompt_embeds for AV mode compatibility when batches have no audio latents."
         )
         args.av_use_video_prompt_embeds = True
+
+    if args.motion_preservation and getattr(args, "ltx_mode", "video") != "video":
+        logger.warning("motion_preservation is only supported for video mode in full fine-tune. Disabling it.")
+        args.motion_preservation = False
+    if args.motion_preservation and int(args.motion_preservation_interval) <= 0:
+        raise ValueError("motion_preservation_interval must be >= 1")
+    if args.motion_preservation and int(args.motion_preservation_anchor_frames) <= 1:
+        raise ValueError("motion_preservation_anchor_frames must be >= 2")
+    if args.motion_preservation and float(args.motion_preservation_multiplier) < 0.0:
+        raise ValueError("motion_preservation_multiplier must be >= 0")
+    if args.motion_attention_preservation and not args.motion_preservation:
+        logger.warning("motion_attention_preservation requires motion_preservation anchors. Disabling it.")
+        args.motion_attention_preservation = False
+    if args.motion_attention_preservation and float(args.motion_attention_preservation_weight) < 0.0:
+        raise ValueError("motion_attention_preservation_weight must be >= 0")
+    if args.motion_attention_preservation and int(args.motion_attention_preservation_queries) <= 0:
+        raise ValueError("motion_attention_preservation_queries must be >= 1")
+    if args.motion_attention_preservation and int(args.motion_attention_preservation_keys) <= 0:
+        raise ValueError("motion_attention_preservation_keys must be >= 1")
+    if int(getattr(args, "freeze_early_blocks", 0) or 0) < 0:
+        raise ValueError("freeze_early_blocks must be >= 0")
+    if float(getattr(args, "non_block_lr_scale", 1.0) or 0.0) < 0.0:
+        raise ValueError("non_block_lr_scale must be >= 0")
+    if float(getattr(args, "attn_geometry_lr_scale", 1.0) or 0.0) < 0.0:
+        raise ValueError("attn_geometry_lr_scale must be >= 0")
 
     if args.seed is None:
         args.seed = random.randint(0, 2**32)
@@ -503,9 +1193,36 @@ def main() -> None:
             )
 
     # optimizer
-    name_and_params = list(transformer.named_parameters())
-    params_to_optimize = [{"params": [p for _, p in name_and_params], "lr": args.learning_rate}]
-    param_names = [[n for n, _ in name_and_params]]
+    params_to_optimize, param_names, ft_group_stats = _build_full_ft_param_groups(
+        transformer,
+        args.learning_rate,
+        freeze_early_blocks=int(getattr(args, "freeze_early_blocks", 0) or 0),
+        freeze_block_indices_spec=getattr(args, "freeze_block_indices", None),
+        block_lr_scales_spec=getattr(args, "block_lr_scales", None),
+        non_block_lr_scale=float(getattr(args, "non_block_lr_scale", 1.0) or 0.0),
+        attn_geometry_lr_scale=float(getattr(args, "attn_geometry_lr_scale", 1.0) or 0.0),
+        freeze_attn_geometry=bool(getattr(args, "freeze_attn_geometry", False)),
+    )
+    logger.info(
+        "Full-FT parameter groups: trainable=%d frozen=%d groups=%d scales=%s",
+        ft_group_stats["trainable_param_count"],
+        ft_group_stats["frozen_param_count"],
+        ft_group_stats["num_lr_groups"],
+        ft_group_stats["lr_scales"],
+    )
+    if ft_group_stats["frozen_blocks"]:
+        logger.info("Full-FT frozen blocks: %s", ft_group_stats["frozen_blocks"])
+    if ft_group_stats["block_lr_rules"]:
+        logger.info("Full-FT block LR rules: %s", ft_group_stats["block_lr_rules"])
+    if bool(getattr(args, "freeze_attn_geometry", False)) or float(getattr(args, "attn_geometry_lr_scale", 1.0)) != 1.0:
+        logger.info(
+            "Attention geometry protection: freeze=%s lr_scale=%.4f trainable=%d frozen=%d",
+            bool(getattr(args, "freeze_attn_geometry", False)),
+            float(getattr(args, "attn_geometry_lr_scale", 1.0)),
+            int(ft_group_stats.get("trainable_attn_geometry_count", 0)),
+            int(ft_group_stats.get("frozen_attn_geometry_count", 0)),
+        )
+
     optimizer_name, optimizer_args, optimizer, optimizer_train_fn, optimizer_eval_fn = trainer.get_optimizer(
         args, params_to_optimize
     )
@@ -623,6 +1340,26 @@ def main() -> None:
         "ss_audio_loss_weight": getattr(args, "audio_loss_weight", 1.0),
         "ss_use_ema": args.use_ema,
         "ss_ema_decay": args.ema_decay if args.use_ema else None,
+        "ss_motion_preservation": bool(getattr(args, "motion_preservation", False)),
+        "ss_motion_preservation_mode": getattr(args, "motion_preservation_mode", "temporal"),
+        "ss_motion_preservation_multiplier": getattr(args, "motion_preservation_multiplier", 0.0),
+        "ss_motion_preservation_anchor_frames": getattr(args, "motion_preservation_anchor_frames", 0),
+        "ss_motion_preservation_anchor_cache_size": getattr(args, "motion_preservation_anchor_cache_size", 0),
+        "ss_motion_preservation_interval": getattr(args, "motion_preservation_interval", 1),
+        "ss_motion_attention_preservation": bool(getattr(args, "motion_attention_preservation", False)),
+        "ss_motion_attention_preservation_weight": getattr(args, "motion_attention_preservation_weight", 0.0),
+        "ss_motion_attention_preservation_loss": getattr(args, "motion_attention_preservation_loss", "kl"),
+        "ss_motion_attention_preservation_queries": getattr(args, "motion_attention_preservation_queries", 0),
+        "ss_motion_attention_preservation_keys": getattr(args, "motion_attention_preservation_keys", 0),
+        "ss_motion_attention_preservation_blocks": getattr(args, "motion_attention_preservation_blocks", None),
+        "ss_freeze_early_blocks": getattr(args, "freeze_early_blocks", 0),
+        "ss_freeze_block_indices": getattr(args, "freeze_block_indices", None),
+        "ss_block_lr_scales": getattr(args, "block_lr_scales", None),
+        "ss_non_block_lr_scale": getattr(args, "non_block_lr_scale", 1.0),
+        "ss_attn_geometry_lr_scale": getattr(args, "attn_geometry_lr_scale", 1.0),
+        "ss_freeze_attn_geometry": bool(getattr(args, "freeze_attn_geometry", False)),
+        "ss_full_ft_lr_group_scales": ft_group_stats.get("lr_scales"),
+        "ss_full_ft_frozen_blocks_applied": ft_group_stats.get("frozen_blocks"),
     }
 
     datasets_metadata = []
@@ -663,6 +1400,23 @@ def main() -> None:
             config=train_utils.get_sanitized_config_or_none(args),
             init_kwargs=init_kwargs,
         )
+        # Log full-FT block-level LR setup once so TensorBoard has explicit
+        # traces of configured scales/groups even before the first optimizer step.
+        setup_logs: dict[str, float] = {
+            "setup/frozen_param_count": float(ft_group_stats.get("frozen_param_count", 0)),
+            "setup/trainable_param_count": float(ft_group_stats.get("trainable_param_count", 0)),
+            "setup/num_lr_groups": float(ft_group_stats.get("num_lr_groups", 0)),
+            "setup/frozen_attn_geometry_count": float(ft_group_stats.get("frozen_attn_geometry_count", 0)),
+            "setup/trainable_attn_geometry_count": float(ft_group_stats.get("trainable_attn_geometry_count", 0)),
+            "setup/attn_geometry_lr_scale": float(getattr(args, "attn_geometry_lr_scale", 1.0)),
+        }
+        for i, scale in enumerate(ft_group_stats.get("lr_scales", [])):
+            setup_logs[f"setup/lr_scale/group_{i}"] = float(scale)
+        for i, group in enumerate(params_to_optimize):
+            params = list(group.get("params", []))
+            setup_logs[f"setup/group_{i}_param_count"] = float(len(params))
+            setup_logs[f"setup/group_{i}_param_numel"] = float(sum(int(p.numel()) for p in params))
+        accelerator.log(setup_logs, step=0)
 
     progress_bar = tqdm(range(args.max_train_steps), smoothing=0, disable=not accelerator.is_local_main_process, desc="steps")
 
@@ -924,12 +1678,51 @@ def main() -> None:
 
     optimizer_train_fn()
 
+    motion_anchor_cache: list[dict[str, Any]] = []
+    motion_micro_step = 0
+    motion_attention_modules: list[tuple[str, torch.nn.Module]] = []
+    if args.motion_attention_preservation:
+        motion_attention_modules = _collect_motion_attention_modules(
+            transformer,
+            getattr(args, "motion_attention_preservation_blocks", None),
+        )
+        if not motion_attention_modules:
+            logger.warning(
+                "motion_attention_preservation requested but no matching attn1 modules were found; disabling it."
+            )
+            args.motion_attention_preservation = False
+        else:
+            logger.info(
+                "Motion attention preservation enabled on %d attn1 modules (queries=%d keys=%d, loss=%s)",
+                len(motion_attention_modules),
+                int(getattr(args, "motion_attention_preservation_queries", 32) or 32),
+                int(getattr(args, "motion_attention_preservation_keys", 64) or 64),
+                getattr(args, "motion_attention_preservation_loss", "kl"),
+            )
+    metadata["ss_motion_attention_preservation_active"] = str(bool(args.motion_attention_preservation))
+    metadata["ss_motion_attention_preservation_module_count"] = str(len(motion_attention_modules))
+
+    if args.motion_preservation:
+        motion_anchor_cache = _build_motion_anchor_cache(
+            trainer=trainer,
+            args=args,
+            accelerator=accelerator,
+            transformer=transformer,
+            train_dataloader=train_dataloader,
+            noise_scheduler=noise_scheduler,
+            attention_modules=motion_attention_modules,
+        )
+        if not motion_anchor_cache:
+            logger.warning("motion_preservation requested but no anchors were built; disabling.")
+            args.motion_preservation = False
+
     for epoch in range(epoch_to_start, num_train_epochs):
         current_epoch.value = epoch + 1
         metadata["ss_epoch"] = str(epoch + 1)
         transformer.train()
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(transformer):
+                motion_micro_step += 1
                 batch = _normalize_ltx2_batch_for_call_dit(batch)
                 latents = batch["latents"]
                 if isinstance(latents, dict):
@@ -1019,6 +1812,141 @@ def main() -> None:
                         loss = loss * w
                     loss = loss.mean()
 
+                motion_pres_loss = None
+                attn_pres_loss = None
+                if (
+                    args.motion_preservation
+                    and motion_anchor_cache
+                    and (motion_micro_step % int(args.motion_preservation_interval) == 0)
+                ):
+                    anchor = random.choice(motion_anchor_cache)
+                    anchor_latents = _move_to_device(
+                        anchor["anchor_latents"], accelerator.device, dtype=trainer.dit_dtype
+                    )
+                    anchor_noise = _move_to_device(
+                        anchor["anchor_noise"], accelerator.device, dtype=trainer.dit_dtype
+                    )
+                    anchor_noisy_input = _move_to_device(
+                        anchor["anchor_noisy_input"], accelerator.device, dtype=trainer.dit_dtype
+                    )
+                    anchor_model_timesteps = _move_to_device(
+                        anchor["anchor_model_timesteps"], accelerator.device
+                    )
+                    anchor_batch = _move_to_device(
+                        anchor["anchor_batch"], accelerator.device, dtype=trainer.dit_dtype
+                    )
+                    teacher_video_pred = _move_to_device(
+                        anchor["teacher_video_pred"], accelerator.device, dtype=trainer.dit_dtype
+                    )
+
+                    original_first_frame_p = float(getattr(args, "ltx2_first_frame_conditioning_p", 0.0))
+                    setattr(args, "ltx2_first_frame_conditioning_p", 0.0)
+                    try:
+                        if args.motion_attention_preservation and motion_attention_modules:
+                            with _AttentionMapRecorder(
+                                motion_attention_modules,
+                                max_queries=int(getattr(args, "motion_attention_preservation_queries", 32) or 32),
+                                max_keys=int(getattr(args, "motion_attention_preservation_keys", 64) or 64),
+                                capture_grad=True,
+                            ) as attn_recorder:
+                                motion_pred, _ = trainer.call_dit(
+                                    args,
+                                    accelerator,
+                                    transformer,
+                                    anchor_latents,
+                                    anchor_batch,
+                                    anchor_noise,
+                                    anchor_noisy_input,
+                                    anchor_model_timesteps,
+                                    trainer.dit_dtype,
+                                )
+                            student_attn_maps = attn_recorder.maps
+                        else:
+                            student_attn_maps = {}
+                            motion_pred, _ = trainer.call_dit(
+                                args,
+                                accelerator,
+                                transformer,
+                                anchor_latents,
+                                anchor_batch,
+                                anchor_noise,
+                                anchor_noisy_input,
+                                anchor_model_timesteps,
+                                trainer.dit_dtype,
+                            )
+                    finally:
+                        setattr(args, "ltx2_first_frame_conditioning_p", original_first_frame_p)
+
+                    if isinstance(motion_pred, dict) and not motion_pred.get("_skip_step"):
+                        student_video_pred = motion_pred["video_pred"]
+                        if (
+                            args.motion_preservation_mode == "temporal"
+                            and student_video_pred.dim() == 5
+                            and teacher_video_pred.dim() == 5
+                            and student_video_pred.shape[2] > 1
+                        ):
+                            student_delta = student_video_pred[:, :, 1:, :, :] - student_video_pred[:, :, :-1, :, :]
+                            teacher_delta = teacher_video_pred[:, :, 1:, :, :] - teacher_video_pred[:, :, :-1, :, :]
+                            pair_mask = _build_temporal_pair_mask(motion_pred.get("video_loss_mask"))
+                            motion_pres_loss = _masked_mse(
+                                student_delta,
+                                teacher_delta,
+                                pair_mask,
+                                weighting=None,
+                                dtype=trainer.dit_dtype,
+                            )
+                        else:
+                            motion_pres_loss = _masked_mse(
+                                student_video_pred,
+                                teacher_video_pred,
+                                motion_pred.get("video_loss_mask"),
+                                weighting=None,
+                                dtype=trainer.dit_dtype,
+                            )
+                        motion_pres_loss = motion_pres_loss * float(args.motion_preservation_multiplier)
+                        loss = loss + motion_pres_loss
+
+                        teacher_attn_maps = anchor.get("teacher_attention_maps")
+                        if (
+                            args.motion_attention_preservation
+                            and isinstance(teacher_attn_maps, dict)
+                            and student_attn_maps
+                        ):
+                            teacher_attn_maps = _move_to_device(
+                                teacher_attn_maps, accelerator.device, dtype=torch.float32
+                            )
+                            per_block_losses: list[torch.Tensor] = []
+                            for module_name, student_map in student_attn_maps.items():
+                                teacher_map = teacher_attn_maps.get(module_name)
+                                if not isinstance(teacher_map, torch.Tensor):
+                                    continue
+                                if teacher_map.shape != student_map.shape:
+                                    continue
+
+                                student_dist = student_map.to(torch.float32)
+                                teacher_dist = teacher_map.to(device=student_dist.device, dtype=torch.float32)
+                                student_dist = student_dist.clamp_min(1e-6)
+                                teacher_dist = teacher_dist.clamp_min(1e-6)
+                                student_dist = student_dist / student_dist.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+                                teacher_dist = teacher_dist / teacher_dist.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+
+                                if getattr(args, "motion_attention_preservation_loss", "kl") == "kl":
+                                    block_loss = torch.nn.functional.kl_div(
+                                        student_dist.log(),
+                                        teacher_dist,
+                                        reduction="batchmean",
+                                    )
+                                else:
+                                    block_loss = torch.nn.functional.mse_loss(student_dist, teacher_dist)
+                                per_block_losses.append(block_loss)
+
+                            if per_block_losses:
+                                attn_pres_loss = (
+                                    torch.stack(per_block_losses).mean()
+                                    * float(getattr(args, "motion_attention_preservation_weight", 0.0))
+                                )
+                                loss = loss + attn_pres_loss
+
                 accelerator.backward(loss)
                 if not args.fused_backward_pass:
                     if accelerator.sync_gradients and args.max_grad_norm != 0.0:
@@ -1042,11 +1970,21 @@ def main() -> None:
                 # Update progress bar with current metrics
                 current_lr = lr_scheduler.get_last_lr()[0] if hasattr(lr_scheduler, "get_last_lr") else args.learning_rate
                 logs = {"loss": current_loss, "lr": current_lr}
+                lr_scales = ft_group_stats.get("lr_scales", [])
+                for i, param_group in enumerate(optimizer.param_groups):
+                    lr_value = param_group.get("lr", current_lr)
+                    logs[f"lr/group_{i}"] = float(lr_value)
+                    if i < len(lr_scales):
+                        logs[f"lr_scale/group_{i}"] = float(lr_scales[i])
                 if dict_output:
                     if "video_pred" in out:
                         logs["v_loss"] = video_loss.item()
                     if audio_pred is not None:
                         logs["a_loss"] = audio_loss.item()
+                if motion_pres_loss is not None:
+                    logs["motion_pres"] = motion_pres_loss.detach().item()
+                if attn_pres_loss is not None:
+                    logs["attn_pres"] = attn_pres_loss.detach().item()
                 progress_bar.set_postfix(**logs)
                 accelerator.log(logs, step=global_step)
 
