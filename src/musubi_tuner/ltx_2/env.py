@@ -197,6 +197,10 @@ class LTX2Env:
     # recommended=True | old SHA=True | current=False
     require_gemma_root: bool = True
 
+    # Skip no-op attention masks to enable Flash Attention on cross-attn.
+    # recommended=False | old SHA=False | current=False
+    skip_noop_attn_mask: bool = False
+
 
 DEFAULT_ENV = LTX2Env()
 
@@ -258,6 +262,7 @@ def apply_ltx2_tweaks(args) -> None:
     args.skip_nonfinite_steps = t.skip_nonfinite_steps
     args.auto_blocks_to_checkpoint = t.auto_blocks_to_checkpoint
     args.require_gemma_root = t.require_gemma_root
+    args.skip_noop_attn_mask = t.skip_noop_attn_mask
 
     # Apply global FP8 offload behavior.
     fp8_offload_enabled = t.fp8_offload_upcast
@@ -310,3 +315,4 @@ def apply_ltx2_tweaks(args) -> None:
     _set_env_bool("LTX2_V2A_DIAG", t.v2a_diag)
     _set_env_bool("LTX2_ALIGN_OUTPUT_DEVICE", t.align_output_device)
     _set_env_bool("LTX2_REQUIRE_GEMMA_ROOT", t.require_gemma_root)
+    _set_env_bool("LTX2_SKIP_NOOP_ATTN_MASK", t.skip_noop_attn_mask)
