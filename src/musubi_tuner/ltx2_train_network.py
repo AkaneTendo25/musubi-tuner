@@ -3,6 +3,7 @@
 import argparse
 import gc
 import os
+import random
 import re
 import subprocess
 import sys
@@ -1629,6 +1630,18 @@ class LTX2NetworkTrainer(NetworkTrainer):
             text_mask = text_mask.to(device=accelerator.device)
             if args.gradient_checkpointing:
                 text_mask = text_mask.to(torch.bool)
+
+        # Caption dropout: zero out text conditioning with probability p (for CFG training)
+        caption_dropout_rate = getattr(args, "caption_dropout_rate", 0.0)
+        if caption_dropout_rate > 0.0 and self.training:
+            text_embeds = text_embeds.clone()
+            if text_mask is not None:
+                text_mask = text_mask.clone()
+            for i in range(text_embeds.shape[0]):
+                if random.random() < caption_dropout_rate:
+                    text_embeds[i] = 0
+                    if text_mask is not None:
+                        text_mask[i] = False
 
         # Move latents to device
         latents = latents.to(device=accelerator.device, dtype=network_dtype)
@@ -4021,6 +4034,15 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         nargs="*",
         help="Key=value args for CREPA, e.g. student_block_idx=16 teacher_block_idx=32 "
              "lambda_crepa=0.1 tau=1.0 num_neighbors=2 schedule=constant normalize=true",
+    )
+
+    # -- Caption dropout --
+    parser.add_argument(
+        "--caption_dropout_rate",
+        type=float,
+        default=0.0,
+        help="Probability of dropping the caption for each sample (0.0 = disabled). "
+             "Zeros out text embeddings and mask to train unconditional generation for CFG.",
     )
 
     return parser

@@ -623,6 +623,7 @@ def main() -> None:
         "ss_audio_loss_weight": getattr(args, "audio_loss_weight", 1.0),
         "ss_use_ema": args.use_ema,
         "ss_ema_decay": args.ema_decay if args.use_ema else None,
+        "ss_caption_dropout_rate": getattr(args, "caption_dropout_rate", 0.0),
     }
 
     datasets_metadata = []
