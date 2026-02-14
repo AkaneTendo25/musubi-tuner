@@ -304,34 +304,6 @@ def _build_temporal_pair_mask(video_loss_mask: Optional[torch.Tensor]) -> Option
     return None
 
 
-def _build_motion_anchor_latents(
-    latents: torch.Tensor,
-    anchor_frames: int,
-    jitter_std: float,
-) -> torch.Tensor:
-    if latents.dim() != 5:
-        raise ValueError(f"Expected 5D latents for motion anchor, got shape: {tuple(latents.shape)}")
-
-    frames = int(latents.shape[2])
-    if anchor_frames <= 1:
-        return latents.clone()
-
-    if frames >= anchor_frames:
-        anchor_latents = latents[:, :, :anchor_frames, :, :].clone()
-    elif frames == 1:
-        anchor_latents = latents.repeat(1, 1, anchor_frames, 1, 1).clone()
-    else:
-        repeats = int(math.ceil(anchor_frames / float(frames)))
-        anchor_latents = latents.repeat(1, 1, repeats, 1, 1)[:, :, :anchor_frames, :, :].clone()
-
-    if jitter_std > 0 and anchor_latents.shape[2] > 1:
-        jitter = torch.randn_like(anchor_latents) * float(jitter_std)
-        jitter[:, :, 0, :, :] = 0
-        anchor_latents = anchor_latents + jitter
-
-    return anchor_latents
-
-
 def _extract_motion_anchor_batch(batch: dict) -> dict:
     # Keep only fields used by call_dit for text conditioning / frame rate.
     keep_keys = (
@@ -347,6 +319,26 @@ def _extract_motion_anchor_batch(batch: dict) -> dict:
     return {k: _clone_to_cpu(batch[k]) for k in keep_keys if k in batch}
 
 
+def _fused_step_pending_grads(
+    optimizer: Any,
+    accelerator: Accelerator,
+    max_grad_norm: float,
+) -> None:
+    """Run one fused-style parameter step for any pending grads.
+
+    Used when fused backward hooks defer stepping on the first backward pass
+    and no second backward pass happens.
+    """
+    for param_group in optimizer.param_groups:
+        for parameter in param_group.get("params", []):
+            if parameter is None or parameter.grad is None:
+                continue
+            if accelerator.sync_gradients and max_grad_norm != 0.0:
+                accelerator.clip_grad_norm_(parameter, max_grad_norm)
+            optimizer.step_param(parameter, param_group)
+            parameter.grad = None
+
+
 def _build_motion_anchor_cache(
     trainer: LTX2NetworkTrainer,
     args: argparse.Namespace,
@@ -360,10 +352,6 @@ def _build_motion_anchor_cache(
     if cache_size <= 0:
         return []
 
-    anchor_frames = int(getattr(args, "motion_preservation_anchor_frames", 0) or 0)
-    if anchor_frames <= 1:
-        raise ValueError("motion_preservation_anchor_frames must be >= 2")
-    jitter_std = float(getattr(args, "motion_preservation_jitter_std", 0.0) or 0.0)
     use_attn_pres = bool(getattr(args, "motion_attention_preservation", False) and attention_modules)
     max_queries = int(getattr(args, "motion_attention_preservation_queries", 32) or 32)
     max_keys = int(getattr(args, "motion_attention_preservation_keys", 64) or 64)
@@ -371,14 +359,13 @@ def _build_motion_anchor_cache(
     entries: list[dict[str, Any]] = []
     max_attempts = max(cache_size * 4, cache_size)
     attempt = 0
+    single_frame_dataset_anchor_count = 0
     original_first_frame_p = float(getattr(args, "ltx2_first_frame_conditioning_p", 0.0))
     was_training = transformer.training
 
     logger.info(
-        "Building motion anchor cache from base model outputs: size=%d frames=%d jitter_std=%.4f",
+        "Building motion anchor cache from base model outputs: source=dataset size=%d (replay on real dataset conditioning)",
         cache_size,
-        anchor_frames,
-        jitter_std,
     )
 
     transformer.eval()
@@ -401,7 +388,9 @@ def _build_motion_anchor_cache(
                     continue
 
                 latents_tensor = trainer.scale_shift_latents(latents)
-                anchor_latents = _build_motion_anchor_latents(latents_tensor, anchor_frames, jitter_std)
+                anchor_latents = latents_tensor.clone()
+                if int(anchor_latents.shape[2]) <= 1:
+                    single_frame_dataset_anchor_count += 1
                 anchor_noise = torch.randn_like(anchor_latents)
 
                 batch_timesteps = batch.get("timesteps")
@@ -485,6 +474,12 @@ def _build_motion_anchor_cache(
         )
     else:
         logger.info("Built %d motion anchors.", len(entries))
+    if getattr(args, "motion_preservation_mode", "temporal") == "temporal" and single_frame_dataset_anchor_count > 0:
+        logger.info(
+            "Dataset anchor replay: %d/%d anchors are single-frame; temporal mode falls back to full-output replay for those anchors.",
+            single_frame_dataset_anchor_count,
+            len(entries),
+        )
 
     return entries
 
@@ -859,7 +854,7 @@ def ltx2_finetune_setup_parser(parser: argparse.ArgumentParser) -> argparse.Argu
         action=argparse.BooleanOptionalAction,
         default=False,
         help=(
-            "Full-FT motion preservation via base-model output rehearsal anchors. "
+            "Full-FT motion preservation via base-model output replay on real dataset conditioning. "
             "Designed for image-only training to keep existing motion behavior."
         ),
     )
@@ -877,12 +872,6 @@ def ltx2_finetune_setup_parser(parser: argparse.ArgumentParser) -> argparse.Argu
         help="temporal: match frame-to-frame deltas. full: match full output tensors.",
     )
     parser.add_argument(
-        "--motion_preservation_anchor_frames",
-        type=int,
-        default=8,
-        help="Number of frames for synthetic motion rehearsal anchors (must be >=2).",
-    )
-    parser.add_argument(
         "--motion_preservation_anchor_cache_size",
         type=int,
         default=32,
@@ -895,10 +884,31 @@ def ltx2_finetune_setup_parser(parser: argparse.ArgumentParser) -> argparse.Argu
         help="Apply motion preservation every N micro-steps.",
     )
     parser.add_argument(
-        "--motion_preservation_jitter_std",
+        "--motion_preservation_probability",
         type=float,
-        default=0.01,
-        help="Std of per-frame latent jitter when expanding single-frame latents into anchor clips.",
+        default=None,
+        help=(
+            "If set, apply motion preservation stochastically each micro-step with this probability in [0,1]. "
+            "When provided, this overrides --motion_preservation_interval."
+        ),
+    )
+    parser.add_argument(
+        "--motion_preservation_separate_backward",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Reduce peak VRAM by running motion replay in a separate backward pass after task-loss backward. "
+            "For fused mode, also enable --motion_preservation_fused_defer_step."
+        ),
+    )
+    parser.add_argument(
+        "--motion_preservation_fused_defer_step",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Optional fused-mode support for --motion_preservation_separate_backward. "
+            "Defers fused per-parameter stepping on the first backward and steps on the replay backward."
+        ),
     )
     parser.add_argument(
         "--motion_attention_preservation",
@@ -1026,10 +1036,20 @@ def main() -> None:
         args.motion_preservation = False
     if args.motion_preservation and int(args.motion_preservation_interval) <= 0:
         raise ValueError("motion_preservation_interval must be >= 1")
-    if args.motion_preservation and int(args.motion_preservation_anchor_frames) <= 1:
-        raise ValueError("motion_preservation_anchor_frames must be >= 2")
+    if args.motion_preservation and args.motion_preservation_probability is not None:
+        if float(args.motion_preservation_probability) < 0.0 or float(args.motion_preservation_probability) > 1.0:
+            raise ValueError("motion_preservation_probability must be in [0, 1]")
     if args.motion_preservation and float(args.motion_preservation_multiplier) < 0.0:
         raise ValueError("motion_preservation_multiplier must be >= 0")
+    if bool(getattr(args, "motion_preservation_separate_backward", False)) and bool(getattr(args, "fused_backward_pass", False)):
+        if not bool(getattr(args, "motion_preservation_fused_defer_step", False)):
+            logger.warning(
+                "motion_preservation_separate_backward with fused_backward_pass requires "
+                "--motion_preservation_fused_defer_step; disabling separate backward."
+            )
+            args.motion_preservation_separate_backward = False
+    if bool(getattr(args, "motion_preservation_fused_defer_step", False)) and not bool(getattr(args, "fused_backward_pass", False)):
+        logger.warning("motion_preservation_fused_defer_step is set without fused_backward_pass; ignoring it.")
     if args.motion_attention_preservation and not args.motion_preservation:
         logger.warning("motion_attention_preservation requires motion_preservation anchors. Disabling it.")
         args.motion_attention_preservation = False
@@ -1279,10 +1299,12 @@ def main() -> None:
             ema_model.load_state_dict(ema_state)
             logger.info("EMA state loaded (step=%d)", ema_model.step)
 
+    fused_step_state: dict[str, bool] | None = None
     if args.fused_backward_pass:
         import musubi_tuner.modules.adafactor_fused as adafactor_fused
 
         adafactor_fused.patch_adafactor_fused(optimizer)
+        fused_step_state = {"defer_step": False}
 
         for param_group, param_name_group in zip(optimizer.param_groups, param_names):
             for parameter, param_name in zip(param_group["params"], param_name_group):
@@ -1290,6 +1312,8 @@ def main() -> None:
 
                     def create_grad_hook(p_name, p_group):
                         def grad_hook(tensor: torch.Tensor):
+                            if fused_step_state is not None and fused_step_state.get("defer_step", False):
+                                return
                             if accelerator.sync_gradients and args.max_grad_norm != 0.0:
                                 accelerator.clip_grad_norm_(tensor, args.max_grad_norm)
                             optimizer.step_param(tensor, p_group)
@@ -1343,9 +1367,11 @@ def main() -> None:
         "ss_motion_preservation": bool(getattr(args, "motion_preservation", False)),
         "ss_motion_preservation_mode": getattr(args, "motion_preservation_mode", "temporal"),
         "ss_motion_preservation_multiplier": getattr(args, "motion_preservation_multiplier", 0.0),
-        "ss_motion_preservation_anchor_frames": getattr(args, "motion_preservation_anchor_frames", 0),
         "ss_motion_preservation_anchor_cache_size": getattr(args, "motion_preservation_anchor_cache_size", 0),
         "ss_motion_preservation_interval": getattr(args, "motion_preservation_interval", 1),
+        "ss_motion_preservation_probability": getattr(args, "motion_preservation_probability", None),
+        "ss_motion_preservation_separate_backward": bool(getattr(args, "motion_preservation_separate_backward", False)),
+        "ss_motion_preservation_fused_defer_step": bool(getattr(args, "motion_preservation_fused_defer_step", False)),
         "ss_motion_attention_preservation": bool(getattr(args, "motion_attention_preservation", False)),
         "ss_motion_attention_preservation_weight": getattr(args, "motion_attention_preservation_weight", 0.0),
         "ss_motion_attention_preservation_loss": getattr(args, "motion_attention_preservation_loss", "kl"),
@@ -1814,10 +1840,31 @@ def main() -> None:
 
                 motion_pres_loss = None
                 attn_pres_loss = None
+                motion_total_loss = None
+                motion_preservation_prob = getattr(args, "motion_preservation_probability", None)
+                if motion_preservation_prob is None:
+                    should_apply_motion_replay = (motion_micro_step % int(args.motion_preservation_interval) == 0)
+                else:
+                    should_apply_motion_replay = random.random() < float(motion_preservation_prob)
+                separate_motion_backward = bool(getattr(args, "motion_preservation_separate_backward", False))
+                fused_defer_motion_step = bool(
+                    args.fused_backward_pass
+                    and bool(getattr(args, "motion_preservation_fused_defer_step", False))
+                    and separate_motion_backward
+                    and args.motion_preservation
+                    and motion_anchor_cache
+                    and should_apply_motion_replay
+                )
+                if fused_step_state is not None:
+                    fused_step_state["defer_step"] = fused_defer_motion_step
+                if separate_motion_backward:
+                    # Backprop task loss first so replay graph does not overlap it in memory.
+                    accelerator.backward(loss)
+                    total_loss_for_logging = loss.detach()
                 if (
                     args.motion_preservation
                     and motion_anchor_cache
-                    and (motion_micro_step % int(args.motion_preservation_interval) == 0)
+                    and should_apply_motion_replay
                 ):
                     anchor = random.choice(motion_anchor_cache)
                     anchor_latents = _move_to_device(
@@ -1904,7 +1951,7 @@ def main() -> None:
                                 dtype=trainer.dit_dtype,
                             )
                         motion_pres_loss = motion_pres_loss * float(args.motion_preservation_multiplier)
-                        loss = loss + motion_pres_loss
+                        motion_total_loss = motion_pres_loss
 
                         teacher_attn_maps = anchor.get("teacher_attention_maps")
                         if (
@@ -1945,9 +1992,24 @@ def main() -> None:
                                     torch.stack(per_block_losses).mean()
                                     * float(getattr(args, "motion_attention_preservation_weight", 0.0))
                                 )
-                                loss = loss + attn_pres_loss
+                                motion_total_loss = motion_total_loss + attn_pres_loss
 
-                accelerator.backward(loss)
+                if separate_motion_backward:
+                    if motion_total_loss is not None:
+                        if fused_step_state is not None:
+                            fused_step_state["defer_step"] = False
+                        accelerator.backward(motion_total_loss)
+                        total_loss_for_logging = total_loss_for_logging + motion_total_loss.detach()
+                    elif fused_defer_motion_step:
+                        if fused_step_state is not None:
+                            fused_step_state["defer_step"] = False
+                        _fused_step_pending_grads(optimizer, accelerator, args.max_grad_norm)
+                    loss_for_step = total_loss_for_logging
+                else:
+                    if motion_total_loss is not None:
+                        loss = loss + motion_total_loss
+                    accelerator.backward(loss)
+                    loss_for_step = loss.detach()
                 if not args.fused_backward_pass:
                     if accelerator.sync_gradients and args.max_grad_norm != 0.0:
                         accelerator.clip_grad_norm_(transformer.parameters(), args.max_grad_norm)
@@ -1960,7 +2022,7 @@ def main() -> None:
             if accelerator.sync_gradients:
                 progress_bar.update(1)
                 global_step += 1
-                current_loss = loss.item()
+                current_loss = loss_for_step.item()
                 loss_recorder.add(epoch=epoch, step=step, loss=current_loss)
 
                 # Update EMA weights
