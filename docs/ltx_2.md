@@ -249,6 +249,33 @@ Two-stage inference generates at half resolution, then upsamples and refines for
 
 ---
 
+## Merge LTX-2 LoRAs
+
+Use the dedicated LTX-2 LoRA merger to combine multiple LoRA files into a single LoRA checkpoint.
+
+**Script:** `ltx2_merge_lora.py`
+
+### Example Command (Windows)
+```bash
+python ltx2_merge_lora.py ^
+  --lora_weight path/to/lora_A.safetensors path/to/lora_B.safetensors ^
+  --lora_multiplier 1.0 1.0 ^
+  --save_merged_lora path/to/merged_lora.safetensors
+```
+
+### Key Arguments
+- `--lora_weight`: Input LoRA paths to merge in order (required).
+- `--lora_multiplier`: Per-LoRA multipliers aligned with `--lora_weight`. Use one value to apply the same multiplier to all inputs.
+- `--save_merged_lora`: Output merged LoRA path (required).
+- `--dtype auto|float32|float16|bfloat16`: Output tensor dtype. `auto` promotes from input dtypes.
+- `--emit_alpha`: Force writing `<module>.alpha` keys in output.
+
+### Notes
+- This merger is intended for LTX-2 LoRA formats used in this repo, including Comfy-style `lora_A/lora_B` weights.
+- It handles different ranks and partial module overlap across input LoRAs.
+
+---
+
 ## Directory Structure
 
 ### Raw Dataset Layout (Example)
