@@ -933,6 +933,11 @@ def main():
         args.fp8_llm = False
     if not hasattr(args, "disable_numpy_memmap"):
         args.disable_numpy_memmap = False
+    # ACE-Step does not support raw full-model float8 casting in the generic trainer path.
+    # Force scaled fp8 path to avoid fp8 norms/activations causing runtime failures.
+    if getattr(args, "fp8_base", False) and not getattr(args, "fp8_scaled", False):
+        logger.warning("ACE-Step: --fp8_base without --fp8_scaled is unstable; enabling --fp8_scaled automatically.")
+        args.fp8_scaled = True
 
     trainer = AceStepNetworkTrainer()
     trainer.train(args)

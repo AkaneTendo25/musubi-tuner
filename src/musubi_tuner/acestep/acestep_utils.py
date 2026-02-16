@@ -123,6 +123,36 @@ def load_acestep_model(
 
         apply_fp8_monkey_patch(model, sd, use_scaled_mm=False)
 
+        # Keep strict loading while tolerating FP8 scales for non-Linear layers.
+        # ACE-Step has conv weights like decoder.proj_in.1/proj_out.1 that can be
+        # targeted by broad patterns, but only monkey-patched Linear layers
+        # should carry scale_weight buffers.
+        expected_keys = set(model.state_dict().keys())
+        unexpected_scale_keys = [k for k in sd.keys() if k.endswith(".scale_weight") and k not in expected_keys]
+        if unexpected_scale_keys:
+            logger.warning(
+                f"Dropping {len(unexpected_scale_keys)} unexpected FP8 scale_weight key(s), "
+                f"example: {unexpected_scale_keys[:2]}"
+            )
+            for key in unexpected_scale_keys:
+                weight_key = key.replace(".scale_weight", ".weight")
+                # If this weight got quantized but the module was not monkey-patched,
+                # dequantize back to its original numeric range before loading.
+                if weight_key in sd and isinstance(sd[weight_key], torch.Tensor):
+                    weight = sd[weight_key]
+                    scale = sd[key]
+                    if weight.ndim == 2:
+                        # handled by monkey-patched Linear path; skip defensive dequant
+                        pass
+                    elif scale.ndim < 3:
+                        sd[weight_key] = (weight.to(torch.float32) * scale.to(torch.float32)).to(scale.dtype)
+                    else:
+                        out_features, num_blocks, _ = scale.shape
+                        deq = weight.to(torch.float32).contiguous().view(out_features, num_blocks, -1)
+                        deq = (deq * scale.to(torch.float32)).view(weight.shape)
+                        sd[weight_key] = deq.to(scale.dtype)
+                sd.pop(key, None)
+
     # Step 6: Load weights into model
     model.load_state_dict(sd, strict=True, assign=True)
     model.to(device)
