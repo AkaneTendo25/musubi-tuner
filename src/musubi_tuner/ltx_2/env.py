@@ -247,8 +247,10 @@ def apply_ltx2_tweaks(args) -> None:
 
     args.swap_async_prefetch = t.swap_async_prefetch
     args.swap_no_async_prefetch = not t.swap_async_prefetch
-    args.swap_pinned = t.swap_pinned
-    args.swap_no_pinned = not t.swap_pinned
+    cli_swap_pinned = bool(getattr(args, "use_pinned_memory_for_block_swap", False))
+    effective_swap_pinned = bool(t.swap_pinned or cli_swap_pinned)
+    args.swap_pinned = effective_swap_pinned
+    args.swap_no_pinned = not effective_swap_pinned
     args.swap_norms = t.swap_norms
 
     args.nan_sublayer_diag = t.nan_sublayer_diag
@@ -281,7 +283,7 @@ def apply_ltx2_tweaks(args) -> None:
     _set_env_bool("LTX2_SWAP_KEEP_CROSS_ATTN", t.swap_keep_cross_attn)
     _set_env_bool("LTX2_SWAP_SKIP_AUDIO", t.swap_keep_audio)
     _set_env_bool("LTX2_SWAP_ASYNC_PREFETCH", t.swap_async_prefetch)
-    _set_env_bool("LTX2_SWAP_PINNED", t.swap_pinned)
+    _set_env_bool("LTX2_SWAP_PINNED", effective_swap_pinned)
     _set_env_bool("LTX2_SWAP_FP8_SYNC", t.swap_fp8_sync)
     _set_env_bool("LTX2_SWAP_FP8_SYNC_STRICT", t.swap_fp8_sync_strict)
     _set_env_bool("LTX2_FP8_OFFLOAD_KEEP_FP8", t.fp8_offload_keep_fp8)

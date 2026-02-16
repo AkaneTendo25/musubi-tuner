@@ -116,7 +116,7 @@ Launch the training loop using `accelerate`.
 
 **Script:** `ltx2_train_network.py`
 
-### Example Command
+### Standard LoRA Training
 ```bash
 accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 ltx2_train_network.py ^
   --mixed_precision bf16 ^
@@ -149,6 +149,57 @@ accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 ltx2_tr
   --output_dir output ^
   --output_name ltx2_lora
 ```
+
+### Advanced: LyCORIS/LoKR Training
+
+musubi-tuner supports advanced LoRA algorithms (LoKR, LoHA, LoCoN, etc.) via:
+- `--network_args` for inline `key=value` settings
+- `--lycoris_config <path.toml>` for TOML-based settings
+
+No bundled example TOML files are shipped; provide your own config path.
+
+```bash
+# Install LyCORIS first
+pip install lycoris-lora
+
+# Example TOML (save anywhere, e.g. my_lycoris.toml)
+# [network]
+# base_algo = "lokr"
+# base_factor = 16
+#
+# [network.modules."*audio*"]
+# algo = "lora"
+# dim = 64
+# alpha = 32
+#
+# [network.init]
+# lokr_norm = 1e-3
+
+# LoKR example
+accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 ltx2_train_network.py ^
+  ... (same args as above) ^
+  --network_module lycoris.kohya ^
+  --lycoris_config my_lycoris.toml ^
+  --output_name ltx2_lokr
+
+# LoCoN example (inline args)
+accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 ltx2_train_network.py ^
+  ... (same args as above) ^
+  --network_module lycoris.kohya ^
+  --network_args "algo=locon" "conv_dim=8" "conv_alpha=4" ^
+  --output_name ltx2_locon
+```
+
+**Target format (`--network_args`)**
+- Pass args as space-separated `key=value` pairs.
+- Each pair is one argument token: `--network_args "key1=value1" "key2=value2"`.
+- Common LyCORIS keys: `algo`, `factor`, `conv_dim`, `conv_alpha`, `dropout`.
+- Use `--init_lokr_norm` only with LoKR (`algo=lokr`).
+- If both TOML and `--network_args` are used, `--network_args` can override nested TOML keys with:
+  - `modules.<name>.<param>=...`
+  - `init.<param>=...`
+
+`--lycoris_config` requires `--network_module lycoris.kohya`.
 
 ### Key Arguments
 
@@ -379,6 +430,33 @@ Two-stage inference generates at half resolution, then upsamples and refines for
 - `--spatial_upsampler_path`: Path to spatial upsampler model (e.g., `ltx-2-spatial-upscaler-x2-1.0.safetensors`). Required when `--sample_two_stage` is set.
 - `--distilled_lora_path`: Path to distilled LoRA (e.g., `ltx-2-19b-distilled-lora-384.safetensors`) for stage 2 refinement. Optional.
 - `--sample_stage2_steps`: Number of denoising steps for stage 2 refinement (default: 3).
+
+---
+
+## Merge LTX-2 LoRAs
+
+Use the dedicated LTX-2 LoRA merger to combine multiple LoRA files into a single LoRA checkpoint.
+
+**Script:** `ltx2_merge_lora.py`
+
+### Example Command (Windows)
+```bash
+python ltx2_merge_lora.py ^
+  --lora_weight path/to/lora_A.safetensors path/to/lora_B.safetensors ^
+  --lora_multiplier 1.0 1.0 ^
+  --save_merged_lora path/to/merged_lora.safetensors
+```
+
+### Key Arguments
+- `--lora_weight`: Input LoRA paths to merge in order (required).
+- `--lora_multiplier`: Per-LoRA multipliers aligned with `--lora_weight`. Use one value to apply the same multiplier to all inputs.
+- `--save_merged_lora`: Output merged LoRA path (required).
+- `--dtype auto|float32|float16|bfloat16`: Output tensor dtype. `auto` promotes from input dtypes.
+- `--emit_alpha`: Force writing `<module>.alpha` keys in output.
+
+### Notes
+- This merger is intended for LTX-2 LoRA formats used in this repo, including Comfy-style `lora_A/lora_B` weights.
+- It handles different ranks and partial module overlap across input LoRAs.
 
 ---
 

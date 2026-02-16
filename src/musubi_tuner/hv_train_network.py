@@ -574,7 +574,9 @@ class NetworkTrainer:
         optimizer_kwargs = {}
         if args.optimizer_args is not None and len(args.optimizer_args) > 0:
             for arg in args.optimizer_args:
-                key, value = arg.split("=")
+                if "=" not in arg:
+                    raise ValueError(f"Invalid --optimizer_args entry (expected key=value): {arg}")
+                key, value = arg.split("=", 1)
                 value = ast.literal_eval(value)
                 optimizer_kwargs[key] = value
 
@@ -734,7 +736,9 @@ class NetworkTrainer:
         lr_scheduler_kwargs = {}  # get custom lr_scheduler kwargs
         if args.lr_scheduler_args is not None and len(args.lr_scheduler_args) > 0:
             for arg in args.lr_scheduler_args:
-                key, value = arg.split("=")
+                if "=" not in arg:
+                    raise ValueError(f"Invalid --lr_scheduler_args entry (expected key=value): {arg}")
+                key, value = arg.split("=", 1)
                 value = ast.literal_eval(value)
                 lr_scheduler_kwargs[key] = value
 
@@ -2028,7 +2032,9 @@ class NetworkTrainer:
         net_kwargs = {}
         if args.network_args is not None:
             for net_arg in args.network_args:
-                key, value = net_arg.split("=")
+                if "=" not in net_arg:
+                    raise ValueError(f"Invalid --network_args entry (expected key=value): {net_arg}")
+                key, value = net_arg.split("=", 1)
                 net_kwargs[key] = value
 
         if args.dim_from_weights:
