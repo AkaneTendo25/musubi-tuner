@@ -1364,6 +1364,7 @@ def main() -> None:
         "ss_audio_loss_weight": getattr(args, "audio_loss_weight", 1.0),
         "ss_use_ema": args.use_ema,
         "ss_ema_decay": args.ema_decay if args.use_ema else None,
+        "ss_caption_dropout_rate": getattr(args, "caption_dropout_rate", 0.0),
         "ss_motion_preservation": bool(getattr(args, "motion_preservation", False)),
         "ss_motion_preservation_mode": getattr(args, "motion_preservation_mode", "temporal"),
         "ss_motion_preservation_multiplier": getattr(args, "motion_preservation_multiplier", 0.0),
@@ -1385,8 +1386,7 @@ def main() -> None:
         "ss_attn_geometry_lr_scale": getattr(args, "attn_geometry_lr_scale", 1.0),
         "ss_freeze_attn_geometry": bool(getattr(args, "freeze_attn_geometry", False)),
         "ss_full_ft_lr_group_scales": ft_group_stats.get("lr_scales"),
-        "ss_full_ft_frozen_blocks_applied": ft_group_stats.get("frozen_blocks"),
-    }
+        "ss_full_ft_frozen_blocks_applied": ft_group_stats.get("frozen_blocks"),    }
 
     datasets_metadata = []
     for dataset in train_dataset_group.datasets:

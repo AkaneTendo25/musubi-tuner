@@ -9,6 +9,7 @@ import logging
 import torch
 import torch.nn as nn
 
+logger = logging.getLogger(__name__)
 
 # Keep these functions here for portability, and private to avoid confusion with the ones in device_utils.py
 def _clean_memory_on_device(device: torch.device):
@@ -63,6 +64,7 @@ def swap_weight_devices_no_cuda(device: torch.device, layer_to_cpu: nn.Module, l
 # Cache for pinned buffers to avoid reallocation overhead: {param_id: pinned_tensor}
 _pinned_buffer_cache = {}
 _FIRST_SWAP_TRACED = False  # Flag for first-swap VRAM tracing
+_LOGGED_FULL_BLOCK_PINNED = False
 
 def _trace_first_swap_vram(tag: str):
     """Trace VRAM during first swap operation."""
@@ -78,6 +80,7 @@ _FP8_OFFLOAD_RESTORE_BF16 = True
 _FP8_OFFLOAD_RESTORE_STOCHASTIC = False
 _FP8_OFFLOAD_KEEP_FP8 = False
 _FP8_ORIG_DTYPE = {}
+_FP8_BUFFER_ORIG_DTYPE = {}
 _FP8_CPU_CACHE = {}
 _FP8_DTYPES = tuple(
     dt for dt in (getattr(torch, "float8_e4m3fn", None), getattr(torch, "float8_e5m2", None)) if dt is not None
@@ -632,6 +635,164 @@ class Offloader:
             move_blocks, block_idx_to_cpu, block_to_cpu, block_idx_to_cuda, block_to_cuda
         )
 
+    def _move_module_with_optional_pinning(self, module: nn.Module, target_device: torch.device) -> None:
+        """Move a full module, using pinned CPU buffers when enabled.
+
+        This is used by aggressive full-block swap mode where entire blocks are streamed
+        CPU<->GPU. If pinned memory is disabled, behavior is identical to module.to(...).
+        """
+        target_device = torch.device(target_device)
+
+        # Keep legacy behavior unless we're on CUDA and pinned memory is explicitly enabled.
+        if not (self.cuda_available and self.use_pinned_memory):
+            module.to(target_device)
+            return
+
+        # Pinned path currently targets CUDA<->CPU block streaming only.
+        if target_device.type not in {"cpu", "cuda"}:
+            module.to(target_device)
+            return
+
+        global _LOGGED_FULL_BLOCK_PINNED
+        if not _LOGGED_FULL_BLOCK_PINNED:
+            logger.info("LTX-2 swap: full-block pinned transfer path enabled")
+            _LOGGED_FULL_BLOCK_PINNED = True
+
+        non_blocking = target_device.type != "cpu"
+
+        def _to_cpu_with_cache(src: torch.Tensor, cache_key, *, force_dtype: torch.dtype = None) -> torch.Tensor:
+            cpu_dtype = force_dtype if force_dtype is not None else src.dtype
+            cached = _pinned_buffer_cache.get(cache_key)
+            if (
+                cached is None
+                or cached.shape != src.shape
+                or cached.dtype != cpu_dtype
+            ):
+                cached = torch.empty_like(src, device="cpu", dtype=cpu_dtype, pin_memory=True)
+                _pinned_buffer_cache[cache_key] = cached
+            if force_dtype is not None:
+                cached.copy_(src.to(dtype=cpu_dtype), non_blocking=True)
+            else:
+                cached.copy_(src, non_blocking=True)
+            return cached
+
+        def _restore_fp8_tensor(src: torch.Tensor, target_dtype: torch.dtype) -> torch.Tensor:
+            if (
+                _FP8_OFFLOAD_RESTORE_STOCHASTIC
+                and target_dtype in _FP8_DTYPES
+                and torch.is_floating_point(src)
+            ):
+                t = src.to(device=target_device, dtype=torch.float32, non_blocking=non_blocking)
+                noise = torch.empty_like(t).uniform_(-0.5, 0.5)
+                t = t + noise * (t.abs() + 1.0) * 1e-3
+                return t.to(dtype=target_dtype)
+            return src.to(target_device, dtype=target_dtype, non_blocking=non_blocking)
+
+        for submodule in module.modules():
+            # Parameters
+            for p in submodule.parameters(recurse=False):
+                if p is None:
+                    continue
+                if p.data.device == target_device:
+                    continue
+
+                if target_device.type == "cpu":
+                    key = ("param", id(p))
+                    src = p.data
+
+                    if _is_fp8_dtype(src.dtype):
+                        moved = False
+
+                        # Prefer true FP8 transfer (parity with non-LTX offloader behavior).
+                        try:
+                            if self.use_pinned_memory:
+                                p.data = _to_cpu_with_cache(src, key)
+                            else:
+                                p.data = src.to("cpu", non_blocking=True)
+                            _FP8_ORIG_DTYPE.pop(id(p), None)
+                            moved = True
+                        except Exception:
+                            moved = False
+
+                        # Fallback for platforms/torch builds that cannot keep FP8 on CPU pinned buffers.
+                        if not moved:
+                            _FP8_ORIG_DTYPE[id(p)] = src.dtype
+                            try:
+                                if self.use_pinned_memory:
+                                    p.data = _to_cpu_with_cache(src, key, force_dtype=torch.bfloat16)
+                                else:
+                                    p.data = src.to("cpu", dtype=torch.bfloat16, non_blocking=True)
+                            except Exception:
+                                if self.use_pinned_memory:
+                                    p.data = _to_cpu_with_cache(src, key, force_dtype=torch.float16)
+                                else:
+                                    p.data = src.to("cpu", dtype=torch.float16, non_blocking=True)
+                    else:
+                        if self.use_pinned_memory:
+                            p.data = _to_cpu_with_cache(src, key)
+                        else:
+                            p.data = src.to("cpu", non_blocking=True)
+                else:
+                    src = p.data
+                    fp8_dtype = _FP8_ORIG_DTYPE.pop(id(p), None)
+                    if fp8_dtype is None:
+                        p.data = src.to(target_device, non_blocking=non_blocking)
+                    elif _FP8_OFFLOAD_RESTORE_BF16:
+                        p.data = src.to(target_device, non_blocking=non_blocking)
+                    else:
+                        p.data = _restore_fp8_tensor(src, fp8_dtype)
+
+            # Buffers
+            for buf_name, buf in submodule.named_buffers(recurse=False):
+                if buf is None or not isinstance(buf, torch.Tensor):
+                    continue
+                if buf.device == target_device:
+                    continue
+
+                key = ("buffer", id(submodule), buf_name)
+
+                if target_device.type == "cpu":
+                    src = buf
+
+                    if _is_fp8_dtype(src.dtype):
+                        moved = False
+                        try:
+                            if self.use_pinned_memory:
+                                submodule._buffers[buf_name] = _to_cpu_with_cache(src, key)
+                            else:
+                                submodule._buffers[buf_name] = src.to("cpu", non_blocking=True)
+                            _FP8_BUFFER_ORIG_DTYPE.pop(key, None)
+                            moved = True
+                        except Exception:
+                            moved = False
+
+                        if not moved:
+                            _FP8_BUFFER_ORIG_DTYPE[key] = src.dtype
+                            try:
+                                if self.use_pinned_memory:
+                                    submodule._buffers[buf_name] = _to_cpu_with_cache(src, key, force_dtype=torch.bfloat16)
+                                else:
+                                    submodule._buffers[buf_name] = src.to("cpu", dtype=torch.bfloat16, non_blocking=True)
+                            except Exception:
+                                if self.use_pinned_memory:
+                                    submodule._buffers[buf_name] = _to_cpu_with_cache(src, key, force_dtype=torch.float16)
+                                else:
+                                    submodule._buffers[buf_name] = src.to("cpu", dtype=torch.float16, non_blocking=True)
+                    else:
+                        if self.use_pinned_memory:
+                            submodule._buffers[buf_name] = _to_cpu_with_cache(src, key)
+                        else:
+                            submodule._buffers[buf_name] = src.to("cpu", non_blocking=True)
+                else:
+                    src = buf
+                    fp8_dtype = _FP8_BUFFER_ORIG_DTYPE.pop(key, None)
+                    if fp8_dtype is None:
+                        submodule._buffers[buf_name] = src.to(target_device, non_blocking=non_blocking)
+                    elif _FP8_OFFLOAD_RESTORE_BF16:
+                        submodule._buffers[buf_name] = src.to(target_device, non_blocking=non_blocking)
+                    else:
+                        submodule._buffers[buf_name] = _restore_fp8_tensor(src, fp8_dtype)
+
     def _submit_load_block(self, blocks, block_idx):
         """Single-direction load: move ENTIRE block from CPU to GPU without swapping another out."""
         def load_block(bidx, block):
@@ -643,7 +804,7 @@ class Offloader:
             torch.cuda.set_device(dev)
 
             # Move ENTIRE block to GPU (all params and buffers, not just Linear weights)
-            block.to(self.device)
+            self._move_module_with_optional_pinning(block, self.device)
 
             if self.cuda_available:
                 torch.cuda.current_stream().synchronize()
@@ -672,7 +833,7 @@ class Offloader:
                 print(f"[{self.block_type}] Unload block {bidx} to CPU")
 
             # Move ENTIRE block to CPU
-            block.to("cpu")
+            self._move_module_with_optional_pinning(block, torch.device("cpu"))
 
             # Synchronize to ensure transfer is complete
             if self.cuda_available:

@@ -126,6 +126,7 @@ def _precache_sample_prompts(
     cache_path = args.sample_prompts_cache or _resolve_default_sample_prompts_cache(datasets)
 
     prompt_cache: list[dict] = []
+    default_guidance_scale = float(getattr(args, "guidance_scale", 3.0))
     for prompt_dict in prompts:
         param = prompt_dict.copy()
         prompt_text = param.get("prompt", "")
@@ -143,8 +144,19 @@ def _precache_sample_prompts(
             "prompt_attention_mask": prompt_mask,
         }
 
+        cfg_scale = param.get("cfg_scale", None)
+        guidance_scale = param.get("guidance_scale", default_guidance_scale)
+        effective_cfg_scale = cfg_scale if cfg_scale is not None else guidance_scale
+        try:
+            do_classifier_free_guidance = float(effective_cfg_scale) != 1.0
+        except (TypeError, ValueError):
+            do_classifier_free_guidance = False
+
         negative_prompt = param.get("negative_prompt")
-        if negative_prompt:
+        if do_classifier_free_guidance and negative_prompt is None:
+            negative_prompt = ""
+
+        if do_classifier_free_guidance or negative_prompt:
             neg_embeds, neg_mask = _encode_prompt_text_ltx2(
                 text_encoder,
                 negative_prompt,

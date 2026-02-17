@@ -819,7 +819,8 @@ def load_video(
                 detected = stream.average_rate or stream.base_rate
                 if detected and float(detected) > 0:
                     source_fps = float(detected)
-                    logger.info(f"Auto-detected source FPS: {source_fps:.2f} for {os.path.basename(video_path)}")
+                    # Keep this at debug level to avoid per-file log spam.
+                    logger.debug(f"Auto-detected source FPS: {source_fps:.2f} for {os.path.basename(video_path)}")
         except Exception:
             pass  # detection failed, fall through to no-conversion branch
 

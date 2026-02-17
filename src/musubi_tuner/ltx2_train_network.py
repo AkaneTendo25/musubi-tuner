@@ -3,6 +3,7 @@
 import argparse
 import gc
 import os
+import random
 import re
 import subprocess
 import sys
@@ -496,6 +497,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
                        transformer=None, network=None) -> None:
         self._setup_preservation(args, accelerator)
         self._setup_crepa(args, accelerator, transformer)
+        self._apply_network_initialization(args, network)
 
     def _setup_preservation(self, args: argparse.Namespace, accelerator: Accelerator) -> None:
         """Parse preservation CLI flags and prepare helper.  No-op when no flags are set."""
@@ -611,6 +613,29 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 logger.info("CREPA: resumed projector weights from %s", proj_path)
 
         self._crepa = module
+
+    def _apply_network_initialization(self, args: argparse.Namespace, network=None) -> None:
+        """Apply network initialization customizations.
+
+        Called after network creation to apply special initialization,
+        for example LoKR perturbed normal.
+        """
+        if network is None:
+            return
+
+        # Apply special initialization if configured
+        if hasattr(args, "_network_init_params"):
+            init_params = args._network_init_params
+
+            # LoKR perturbed normal initialization
+            if "lokr_norm" in init_params:
+                scale = init_params["lokr_norm"]
+                logger.info(f"Applying LoKR perturbed normal initialization (scale={scale})")
+                try:
+                    from musubi_tuner.networks.lycoris_extensions import init_lokr_network_with_perturbed_normal
+                    init_lokr_network_with_perturbed_normal(network, scale=scale)
+                except Exception as e:
+                    logger.warning(f"Failed to apply LoKR initialization: {e}")
 
     def compute_prior_divergence_addition(
         self,
@@ -1630,6 +1655,18 @@ class LTX2NetworkTrainer(NetworkTrainer):
             if args.gradient_checkpointing:
                 text_mask = text_mask.to(torch.bool)
 
+        # Caption dropout: zero out text conditioning with probability p (for CFG training)
+        caption_dropout_rate = getattr(args, "caption_dropout_rate", 0.0)
+        if caption_dropout_rate > 0.0 and self.training:
+            text_embeds = text_embeds.clone()
+            if text_mask is not None:
+                text_mask = text_mask.clone()
+            for i in range(text_embeds.shape[0]):
+                if random.random() < caption_dropout_rate:
+                    text_embeds[i] = 0
+                    if text_mask is not None:
+                        text_mask[i] = False
+
         # Move latents to device
         latents = latents.to(device=accelerator.device, dtype=network_dtype)
         noise = noise.to(device=accelerator.device, dtype=network_dtype)
@@ -2200,6 +2237,14 @@ class LTX2NetworkTrainer(NetworkTrainer):
             if not isinstance(cache_entry, dict):
                 raise ValueError(f"Invalid cache entry at {idx} ({cache_path})")
 
+            cfg_scale = param.get("cfg_scale", None)
+            guidance_scale = param.get("guidance_scale", self.default_guidance_scale)
+            effective_cfg_scale = cfg_scale if cfg_scale is not None else guidance_scale
+            try:
+                requires_negative_embed = float(effective_cfg_scale) != 1.0
+            except (TypeError, ValueError):
+                requires_negative_embed = False
+
             expected_prompt = _normalize_text(param.get("prompt", ""))
             cached_prompt = _normalize_text(cache_entry.get("prompt", ""))
             if expected_prompt != cached_prompt:
@@ -2226,11 +2271,15 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 raise ValueError(f"Missing prompt embeddings in cache entry {idx} ({cache_path})")
             param["prompt_embeds"] = cache_entry["prompt_embeds"]
             param["prompt_attention_mask"] = cache_entry["prompt_attention_mask"]
-            if param.get("negative_prompt"):
+            if requires_negative_embed or param.get("negative_prompt"):
                 if cache_entry.get("negative_prompt_embeds") is None or cache_entry.get(
                     "negative_prompt_attention_mask"
                 ) is None:
-                    raise ValueError(f"Missing negative prompt embeddings in cache entry {idx} ({cache_path})")
+                    raise ValueError(
+                        "Missing negative prompt embeddings in cache entry "
+                        f"{idx} ({cache_path}); this prompt needs CFG (guidance/cfg != 1), "
+                        "so negative embeddings must be precached."
+                    )
                 param["negative_prompt_embeds"] = cache_entry["negative_prompt_embeds"]
                 param["negative_prompt_attention_mask"] = cache_entry["negative_prompt_attention_mask"]
 
@@ -2502,25 +2551,55 @@ class LTX2NetworkTrainer(NetworkTrainer):
 
         def prepare_all_embeddings_batch(sample_params_list: List[Dict]) -> None:
             """Load text encoder once and encode ALL prompts before unloading."""
-            # Check if any prompt needs embeddings
-            needs_encoding = any(p.get("prompt_embeds") is None for p in sample_params_list)
-            if not needs_encoding:
+            def _requires_negative_embeddings(sample_parameter: Dict) -> bool:
+                cfg_scale = sample_parameter.get("cfg_scale", None)
+                guidance_scale = sample_parameter.get("guidance_scale", self.default_guidance_scale)
+                effective_cfg_scale = cfg_scale if cfg_scale is not None else guidance_scale
+                try:
+                    return float(effective_cfg_scale) != 1.0
+                except (TypeError, ValueError):
+                    return False
+
+            missing_indices = []
+            for idx, sample_parameter in enumerate(sample_params_list):
+                needs_prompt = sample_parameter.get("prompt_embeds") is None
+                needs_negative = _requires_negative_embeddings(sample_parameter) and sample_parameter.get(
+                    "negative_prompt_embeds"
+                ) is None
+                if needs_prompt or needs_negative:
+                    missing_indices.append(idx)
+
+            if not missing_indices:
                 return
+
+            strict_precached = bool(getattr(args, "use_precached_sample_prompts", False)) or bool(
+                getattr(args, "precache_sample_prompts", False)
+            )
+            if strict_precached:
+                preview = ",".join(str(i) for i in missing_indices[:10])
+                if len(missing_indices) > 10:
+                    preview += ",..."
+                raise ValueError(
+                    "Precached sample prompt embeddings are incomplete; refusing to load Gemma during training. "
+                    f"Missing prompt/negative embeddings for sample indices [{preview}]. "
+                    "Rebuild sample prompt cache with ltx2_cache_text_encoder_outputs.py."
+                )
 
             text_encoder_dtype = self._build_text_encoder(args, accelerator)
             logger.info("Sampling batch: loaded text encoder for %d prompts", len(sample_params_list))
 
             for sample_parameter in sample_params_list:
-                if sample_parameter.get("prompt_embeds") is not None:
-                    continue  # Already has embeddings
+                if sample_parameter.get("prompt_embeds") is None:
+                    prompt_text = sample_parameter.get("prompt", "")
+                    prompt_embeds, prompt_mask = self._encode_prompt_text(accelerator, prompt_text, text_encoder_dtype)
+                    sample_parameter["prompt_embeds"] = prompt_embeds
+                    sample_parameter["prompt_attention_mask"] = prompt_mask
 
-                prompt_text = sample_parameter.get("prompt", "")
-                prompt_embeds, prompt_mask = self._encode_prompt_text(accelerator, prompt_text, text_encoder_dtype)
-                sample_parameter["prompt_embeds"] = prompt_embeds
-                sample_parameter["prompt_attention_mask"] = prompt_mask
-
-                negative_prompt = sample_parameter.get("negative_prompt", None)
-                if negative_prompt:
+                if _requires_negative_embeddings(sample_parameter) and sample_parameter.get("negative_prompt_embeds") is None:
+                    negative_prompt = sample_parameter.get("negative_prompt")
+                    if negative_prompt is None:
+                        negative_prompt = ""
+                        sample_parameter["negative_prompt"] = negative_prompt
                     neg_embeds, neg_mask = self._encode_prompt_text(accelerator, negative_prompt, text_encoder_dtype)
                     sample_parameter["negative_prompt_embeds"] = neg_embeds
                     sample_parameter["negative_prompt_attention_mask"] = neg_mask
@@ -2877,6 +2956,24 @@ class LTX2NetworkTrainer(NetworkTrainer):
         frame_count = (frame_count - 1) // temporal_factor * temporal_factor + 1
 
         loaded_text_encoder = False
+        strict_precached = bool(getattr(args, "use_precached_sample_prompts", False)) or bool(
+            getattr(args, "precache_sample_prompts", False)
+        )
+        missing_prompt_embeds = sample_parameter.get("prompt_embeds") is None
+        missing_negative_embeds = do_classifier_free_guidance and sample_parameter.get("negative_prompt_embeds") is None
+        if strict_precached and (missing_prompt_embeds or missing_negative_embeds):
+            missing_parts = []
+            if missing_prompt_embeds:
+                missing_parts.append("prompt")
+            if missing_negative_embeds:
+                missing_parts.append("negative")
+            missing_desc = "/".join(missing_parts)
+            raise ValueError(
+                "Precached sample prompt embeddings are incomplete; refusing to load Gemma during training. "
+                f"Missing {missing_desc} embeddings for sample index {sample_parameter.get('enum', 0)}. "
+                "Rebuild sample prompt cache with ltx2_cache_text_encoder_outputs.py."
+            )
+
         if sample_parameter.get("prompt_embeds") is None:
             text_encoder_dtype = self._build_text_encoder(args, accelerator)
             prompt_embeds, prompt_mask = self._encode_prompt_text(accelerator, prompt, text_encoder_dtype)
@@ -3792,6 +3889,24 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
     )
 
     parser.add_argument(
+        "--lycoris_config",
+        type=str,
+        default=None,
+        help=(
+            "Path to LyCORIS TOML configuration file. "
+            "Use this for module-level algorithm settings without bundled example files."
+        ),
+    )
+    parser.add_argument(
+        "--init_lokr_norm",
+        type=float,
+        default=None,
+        help=(
+            "Initialize LoKR network with perturbed normal distribution (e.g., 1e-3). "
+            "Helps training stability. Only applies when using LoKR algorithm."
+        ),
+    )
+    parser.add_argument(
         "--ltx2_first_frame_conditioning_p",
         type=float,
         default=0.1,
@@ -4023,7 +4138,144 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
              "lambda_crepa=0.1 tau=1.0 num_neighbors=2 schedule=constant normalize=true",
     )
 
+    # -- Caption dropout --
+    parser.add_argument(
+        "--caption_dropout_rate",
+        type=float,
+        default=0.0,
+        help="Probability of dropping the caption for each sample (0.0 = disabled). "
+             "Zeros out text embeddings and mask to train unconditional generation for CFG.",
+    )
+
     return parser
+
+
+def _process_lycoris_config(args: argparse.Namespace, logger_instance: logging.Logger) -> None:
+    """Process optional LyCORIS TOML config and merge into runtime args.
+
+    Behavior:
+    - If `--lycoris_config` is set, parse TOML and apply it to LyCORIS creation.
+    - `--network_args` keeps backward compatibility and can override nested TOML keys via:
+      `modules.<name>.<param>=...` and `init.<param>=...`.
+    - `--init_lokr_norm` always overrides init values from TOML.
+    """
+    network_module_name = str(getattr(args, "network_module", "") or "")
+    uses_lycoris_module = "lycoris" in network_module_name.lower()
+
+    if args.network_args is None:
+        args.network_args = []
+
+    config = {}
+    if getattr(args, "lycoris_config", None):
+        if not uses_lycoris_module:
+            raise ValueError("--lycoris_config requires --network_module lycoris.kohya")
+
+        from musubi_tuner.networks.network_config import (
+            parse_toml_config,
+            parse_network_args_enhanced,
+            validate_network_config,
+        )
+        from musubi_tuner.networks.lycoris_extensions import (
+            build_network_kwargs_from_config,
+            log_network_config,
+            config_to_lycoris_preset,
+            get_config_init_params,
+        )
+
+        logger_instance.info("Loading LyCORIS config from: %s", args.lycoris_config)
+        config = parse_toml_config(args.lycoris_config)
+
+        # Support nested overrides through --network_args for compatibility.
+        existing_args = parse_network_args_enhanced(args.network_args)
+        for key, value in existing_args.items():
+            if "." not in key:
+                continue
+
+            parts = key.split(".")
+            if parts[0] == "modules" and len(parts) >= 3:
+                module_name = parts[1]
+                param_name = parts[2]
+                config.setdefault("modules", {}).setdefault(module_name, {})[param_name] = value
+            elif parts[0] == "init" and len(parts) >= 2:
+                param_name = parts[1]
+                config.setdefault("init", {})[param_name] = value
+
+        # Do not forward nested override keys to LyCORIS create_network kwargs.
+        filtered_network_args = []
+        stripped_count = 0
+        for arg in args.network_args:
+            if arg.startswith("modules.") or arg.startswith("init."):
+                stripped_count += 1
+                continue
+            filtered_network_args.append(arg)
+        if stripped_count > 0:
+            args.network_args = filtered_network_args
+            logger_instance.info(
+                "Consumed %d nested TOML override args from --network_args",
+                stripped_count,
+            )
+
+        validate_network_config(config)
+        log_network_config(config, logger_instance)
+
+        preset = config_to_lycoris_preset(config)
+        if preset:
+            args._network_config_preset = preset
+            logger_instance.info("LyCORIS TOML preset prepared for network creation")
+
+        config_kwargs = build_network_kwargs_from_config(
+            config,
+            base_dim=getattr(args, "network_dim", None),
+            base_alpha=getattr(args, "network_alpha", None),
+        )
+        for key, value in config_kwargs.items():
+            arg_str = f"{key}={value}"
+            if not any(arg.startswith(f"{key}=") for arg in args.network_args):
+                args.network_args.append(arg_str)
+                logger_instance.info("Added network arg from LyCORIS config: %s", arg_str)
+
+        init_params = dict(get_config_init_params(config))
+    else:
+        init_params = {}
+
+    # Explicit CLI override always wins.
+    if getattr(args, "init_lokr_norm", None) is not None:
+        init_params["lokr_norm"] = args.init_lokr_norm
+
+    if init_params:
+        args._network_init_params = init_params
+        logger_instance.info("Network initialization params: %s", args._network_init_params)
+
+
+def _apply_lycoris_preset_before_network_creation(args: argparse.Namespace, logger_instance: logging.Logger) -> None:
+    """Apply LyCORIS preset early so it affects network creation."""
+    preset = getattr(args, "_network_config_preset", None)
+    if not preset:
+        return
+
+    network_module_name = str(getattr(args, "network_module", "") or "")
+    if "lycoris" not in network_module_name.lower():
+        logger_instance.warning(
+            "Ignoring LyCORIS preset because --network_module=%s",
+            network_module_name or "<unset>",
+        )
+        return
+
+    try:
+        from lycoris.kohya import LycorisNetworkKohya
+    except Exception as e:
+        logger_instance.warning(
+            "Failed to import lycoris.kohya for preset application. "
+            "Install with: pip install lycoris-lora. Error: %s",
+            e,
+        )
+        return
+
+    try:
+        LycorisNetworkKohya.apply_preset(preset)
+        logger_instance.info("Applied LyCORIS preset before network creation")
+    except Exception as e:
+        logger_instance.warning("Failed to apply LyCORIS preset before network creation: %s", e)
 
 
 # ======== Main training entry point ========
@@ -4085,21 +4337,35 @@ def main() -> None:
     if args.vae_dtype is None:
         args.vae_dtype = "bfloat16"
 
-    # Inject lora_target_preset into network_args (LTX-2 specific)
-    if getattr(args, "ltx_mode", "video") == "audio" and not explicit_lora_preset:
+    network_module_name = str(getattr(args, "network_module", "") or "")
+    uses_lycoris_module = "lycoris" in network_module_name.lower()
+
+    # Inject lora_target_preset into network_args (LTX-2 specific, non-LyCORIS only)
+    if getattr(args, "ltx_mode", "video") == "audio" and not explicit_lora_preset and not uses_lycoris_module:
         if args.network_args is None:
             args.network_args = []
         if not any(arg.startswith("include_patterns=") for arg in args.network_args):
             args.lora_target_preset = "audio"
 
     lora_target_preset = getattr(args, "lora_target_preset", None)
-    if lora_target_preset is not None:
+    if uses_lycoris_module:
+        if args.network_args is not None:
+            filtered_args = [arg for arg in args.network_args if not arg.startswith("lora_target_preset=")]
+            if len(filtered_args) != len(args.network_args):
+                args.network_args = filtered_args
+                logger.info("Removed lora_target_preset from --network_args for LyCORIS module compatibility")
+        if lora_target_preset is not None:
+            logger.info("Skipping lora_target_preset injection for LyCORIS network module")
+    elif lora_target_preset is not None:
         if args.network_args is None:
             args.network_args = []
         # Only add if not already specified in network_args
         if not any(arg.startswith("lora_target_preset=") for arg in args.network_args):
             args.network_args.append(f"lora_target_preset={lora_target_preset}")
             logger.info(f"Using LoRA target preset: {lora_target_preset}")
+
+    _process_lycoris_config(args, logger)
+    _apply_lycoris_preset_before_network_creation(args, logger)
 
     trainer = LTX2NetworkTrainer()
     trainer.train(args)
