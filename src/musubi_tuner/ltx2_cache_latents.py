@@ -682,9 +682,9 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         "--ltx2_mode", "--ltx_mode",
         dest="ltx_mode",
         type=str,
-        default="video",
+        default="av",
         choices=["video", "av", "audio", "v", "a", "va"],
-        help="Caching modality: 'video' (default), 'av' for audio+video, 'audio' for audio-only.",
+        help="Caching modality: 'av' (default) for audio+video, 'video' for video-only, 'audio' for audio-only.",
     )
     parser.add_argument("--ltx2_checkpoint", type=str, default=None, help="Path to LTX-2 checkpoint (.safetensors)")
     parser.add_argument("--vae_chunk_size", type=int, default=None, help="chunk size for CausalConv3d in VAE")
