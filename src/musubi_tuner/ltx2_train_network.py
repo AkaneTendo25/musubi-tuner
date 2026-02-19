@@ -1028,6 +1028,38 @@ class LTX2NetworkTrainer(NetworkTrainer):
 
         args.weighting_scheme = "none"
 
+        audio_balance_mode = str(getattr(args, "audio_loss_balance_mode", "none") or "none").lower()
+        if audio_balance_mode not in {"none", "inv_freq"}:
+            raise ValueError(f"audio_loss_balance_mode must be one of ['none', 'inv_freq']. Got: {audio_balance_mode}")
+        args.audio_loss_balance_mode = audio_balance_mode
+
+        audio_balance_beta = float(getattr(args, "audio_loss_balance_beta", 0.01))
+        audio_balance_eps = float(getattr(args, "audio_loss_balance_eps", 0.05))
+        audio_balance_min = float(getattr(args, "audio_loss_balance_min", 1.0))
+        audio_balance_max = float(getattr(args, "audio_loss_balance_max", 4.0))
+        audio_balance_ema_init = float(getattr(args, "audio_loss_balance_ema_init", 1.0))
+
+        if not (0.0 < audio_balance_beta <= 1.0):
+            raise ValueError(f"audio_loss_balance_beta must be in (0, 1]. Got: {audio_balance_beta}")
+        if audio_balance_eps <= 0.0:
+            raise ValueError(f"audio_loss_balance_eps must be > 0. Got: {audio_balance_eps}")
+        if audio_balance_min < 0.0:
+            raise ValueError(f"audio_loss_balance_min must be >= 0. Got: {audio_balance_min}")
+        if audio_balance_max <= 0.0:
+            raise ValueError(f"audio_loss_balance_max must be > 0. Got: {audio_balance_max}")
+        if audio_balance_max < audio_balance_min:
+            raise ValueError(
+                f"audio_loss_balance_max must be >= audio_loss_balance_min. Got: min={audio_balance_min}, max={audio_balance_max}"
+            )
+        if not (0.0 < audio_balance_ema_init <= 1.0):
+            raise ValueError(f"audio_loss_balance_ema_init must be in (0, 1]. Got: {audio_balance_ema_init}")
+
+        args.audio_loss_balance_beta = audio_balance_beta
+        args.audio_loss_balance_eps = audio_balance_eps
+        args.audio_loss_balance_min = audio_balance_min
+        args.audio_loss_balance_max = audio_balance_max
+        args.audio_loss_balance_ema_init = audio_balance_ema_init
+
         apply_ltx2_tweaks(args)
 
     @property
@@ -3873,6 +3905,47 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         type=float,
         default=1.0,
         help="Weight applied to the audio diffusion loss.",
+    )
+    parser.add_argument(
+        "--audio_loss_balance_mode",
+        type=str,
+        default="none",
+        choices=["none", "inv_freq"],
+        help=(
+            "Optional dynamic balancing for audio loss. "
+            "'none' keeps static --audio_loss_weight; "
+            "'inv_freq' scales audio weight by inverse EMA of audio-batch frequency."
+        ),
+    )
+    parser.add_argument(
+        "--audio_loss_balance_beta",
+        type=float,
+        default=0.01,
+        help="EMA update factor for audio-batch frequency when --audio_loss_balance_mode=inv_freq.",
+    )
+    parser.add_argument(
+        "--audio_loss_balance_eps",
+        type=float,
+        default=0.05,
+        help="Minimum denominator for inverse-frequency audio weighting (prevents extreme weights).",
+    )
+    parser.add_argument(
+        "--audio_loss_balance_min",
+        type=float,
+        default=1.0,
+        help="Minimum clamp for effective audio loss weight after inverse-frequency scaling.",
+    )
+    parser.add_argument(
+        "--audio_loss_balance_max",
+        type=float,
+        default=4.0,
+        help="Maximum clamp for effective audio loss weight after inverse-frequency scaling.",
+    )
+    parser.add_argument(
+        "--audio_loss_balance_ema_init",
+        type=float,
+        default=1.0,
+        help="Initial EMA value for audio-batch frequency (1.0 means no warm-start boost).",
     )
     parser.add_argument(
         "--min_audio_batches_per_accum",
