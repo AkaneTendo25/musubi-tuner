@@ -1840,8 +1840,8 @@ class NetworkTrainer:
                 logger.info("Enabled cuDNN benchmark / cuDNNベンチマークを有効化しました")
 
         # check required arguments
-        if args.dataset_config is None:
-            raise ValueError("dataset_config is required / dataset_configが必要です")
+        if args.dataset_config is None and getattr(args, "dataset_manifest", None) is None:
+            raise ValueError("dataset_config or dataset_manifest is required / dataset_configまたはdataset_manifestが必要です")
         if args.dit is None:
             raise ValueError("path to DiT model is required / DiTモデルのパスが必要です")
         assert not args.fp8_scaled or args.fp8_base, "fp8_scaled requires fp8_base / fp8_scaledはfp8_baseが必要です"
@@ -1884,30 +1884,57 @@ class NetworkTrainer:
 
         current_epoch = Value("i", 0)  # shared between processes
 
-        blueprint_generator = BlueprintGenerator(ConfigSanitizer())
-        logger.info(f"Load dataset config from {args.dataset_config}")
-        user_config = config_utils.load_user_config(args.dataset_config)
-        blueprint = blueprint_generator.generate(user_config, args, architecture=self.architecture)
-        train_dataset_group = config_utils.generate_dataset_group_by_blueprint(
-            blueprint.dataset_group, training=True, num_timestep_buckets=self.num_timestep_buckets, shared_epoch=current_epoch
-        )
         validation_dataset_group = None
         validation_dataloader = None
-        if user_config.get("validation_datasets"):
-            logger.info("Load validation datasets from dataset config")
-            validation_user_config = {
-                "general": user_config.get("general", {}),
-                "datasets": user_config.get("validation_datasets", []),
-            }
-            validation_blueprint = blueprint_generator.generate(
-                validation_user_config, args, architecture=self.architecture
-            )
-            validation_dataset_group = config_utils.generate_dataset_group_by_blueprint(
-                validation_blueprint.dataset_group,
+        if getattr(args, "dataset_manifest", None) is not None:
+            logger.info("Load dataset manifest from %s", args.dataset_manifest)
+            dataset_manifest = config_utils.load_dataset_manifest(args.dataset_manifest)
+            manifest_architecture = dataset_manifest.get("architecture")
+            if manifest_architecture is not None and manifest_architecture != self.architecture:
+                raise ValueError(
+                    f"dataset manifest architecture mismatch: expected '{self.architecture}', got '{manifest_architecture}'"
+                )
+
+            train_dataset_group = config_utils.generate_dataset_group_by_manifest(
+                dataset_manifest,
+                split="train",
                 training=True,
                 num_timestep_buckets=self.num_timestep_buckets,
                 shared_epoch=current_epoch,
             )
+            if train_dataset_group is None:
+                raise ValueError("dataset manifest contains no training datasets")
+
+            validation_dataset_group = config_utils.generate_dataset_group_by_manifest(
+                dataset_manifest,
+                split="validation",
+                training=True,
+                num_timestep_buckets=self.num_timestep_buckets,
+                shared_epoch=current_epoch,
+            )
+        else:
+            blueprint_generator = BlueprintGenerator(ConfigSanitizer())
+            logger.info(f"Load dataset config from {args.dataset_config}")
+            user_config = config_utils.load_user_config(args.dataset_config)
+            blueprint = blueprint_generator.generate(user_config, args, architecture=self.architecture)
+            train_dataset_group = config_utils.generate_dataset_group_by_blueprint(
+                blueprint.dataset_group, training=True, num_timestep_buckets=self.num_timestep_buckets, shared_epoch=current_epoch
+            )
+            if user_config.get("validation_datasets"):
+                logger.info("Load validation datasets from dataset config")
+                validation_user_config = {
+                    "general": user_config.get("general", {}),
+                    "datasets": user_config.get("validation_datasets", []),
+                }
+                validation_blueprint = blueprint_generator.generate(
+                    validation_user_config, args, architecture=self.architecture
+                )
+                validation_dataset_group = config_utils.generate_dataset_group_by_blueprint(
+                    validation_blueprint.dataset_group,
+                    training=True,
+                    num_timestep_buckets=self.num_timestep_buckets,
+                    shared_epoch=current_epoch,
+                )
 
         if train_dataset_group.num_train_items == 0:
             raise ValueError(
@@ -3154,6 +3181,12 @@ def setup_parser_common() -> argparse.ArgumentParser:
         type=pathlib.Path,
         default=None,
         help="config file for dataset / データセットの設定ファイル",
+    )
+    parser.add_argument(
+        "--dataset_manifest",
+        type=pathlib.Path,
+        default=None,
+        help="cache-only dataset manifest JSON file (alternative to --dataset_config)",
     )
 
     # model settings

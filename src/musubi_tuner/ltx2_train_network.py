@@ -2308,41 +2308,47 @@ class LTX2NetworkTrainer(NetworkTrainer):
         except Exception as e:
             raise RuntimeError(f"Failed to load I2V latents cache: {e}")
 
-    def _resolve_default_sample_prompts_cache(self, args: argparse.Namespace) -> str:
+    def _resolve_first_dataset_cache_directory(self, args: argparse.Namespace) -> str:
         from musubi_tuner.dataset import config_utils
         from musubi_tuner.dataset.config_utils import BlueprintGenerator, ConfigSanitizer
         from musubi_tuner.dataset.image_video_dataset import ARCHITECTURE_LTX2
 
-        if not getattr(args, "dataset_config", None):
-            raise ValueError("--dataset_config is required to resolve the sample prompt cache directory")
-        user_config = config_utils.load_user_config(args.dataset_config)
-        blueprint = BlueprintGenerator(ConfigSanitizer()).generate(user_config, args, architecture=ARCHITECTURE_LTX2)
-        dataset_group = config_utils.generate_dataset_group_by_blueprint(blueprint.dataset_group)
-        datasets = dataset_group.datasets
-        if not datasets:
-            raise ValueError("No datasets available to resolve sample prompt cache directory")
-        cache_dir = getattr(datasets[0], "cache_directory", None)
-        if not cache_dir:
-            raise ValueError("First dataset has no cache_directory; set cache_directory in dataset config")
+        if getattr(args, "dataset_manifest", None):
+            dataset_manifest = config_utils.load_dataset_manifest(args.dataset_manifest)
+            manifest_architecture = dataset_manifest.get("architecture")
+            if manifest_architecture is not None and manifest_architecture != ARCHITECTURE_LTX2:
+                raise ValueError(
+                    f"dataset manifest architecture mismatch: expected '{ARCHITECTURE_LTX2}', got '{manifest_architecture}'"
+                )
+            datasets = dataset_manifest.get("datasets", [])
+            if not datasets:
+                raise ValueError("No datasets available in dataset manifest to resolve sample cache directory")
+            cache_dir = datasets[0].get("params", {}).get("cache_directory")
+            if not cache_dir:
+                raise ValueError("First manifest dataset has no cache_directory")
+            return str(cache_dir)
+
+        if getattr(args, "dataset_config", None):
+            user_config = config_utils.load_user_config(args.dataset_config)
+            blueprint = BlueprintGenerator(ConfigSanitizer()).generate(user_config, args, architecture=ARCHITECTURE_LTX2)
+            dataset_group = config_utils.generate_dataset_group_by_blueprint(blueprint.dataset_group)
+            datasets = dataset_group.datasets
+            if not datasets:
+                raise ValueError("No datasets available to resolve sample cache directory")
+            cache_dir = getattr(datasets[0], "cache_directory", None)
+            if not cache_dir:
+                raise ValueError("First dataset has no cache_directory; set cache_directory in dataset config")
+            return cache_dir
+
+        raise ValueError("--dataset_config or --dataset_manifest is required to resolve sample cache directory")
+
+    def _resolve_default_sample_prompts_cache(self, args: argparse.Namespace) -> str:
+        cache_dir = self._resolve_first_dataset_cache_directory(args)
         return os.path.join(cache_dir, DEFAULT_SAMPLE_PROMPTS_CACHE)
 
     def _resolve_default_sample_latents_cache(self, args: argparse.Namespace) -> str:
         """Resolve default path for sample latents cache (same directory as prompts cache)."""
-        from musubi_tuner.dataset import config_utils
-        from musubi_tuner.dataset.config_utils import BlueprintGenerator, ConfigSanitizer
-        from musubi_tuner.dataset.image_video_dataset import ARCHITECTURE_LTX2
-
-        if not getattr(args, "dataset_config", None):
-            raise ValueError("--dataset_config is required to resolve the sample latents cache directory")
-        user_config = config_utils.load_user_config(args.dataset_config)
-        blueprint = BlueprintGenerator(ConfigSanitizer()).generate(user_config, args, architecture=ARCHITECTURE_LTX2)
-        dataset_group = config_utils.generate_dataset_group_by_blueprint(blueprint.dataset_group)
-        datasets = dataset_group.datasets
-        if not datasets:
-            raise ValueError("No datasets available to resolve sample latents cache directory")
-        cache_dir = getattr(datasets[0], "cache_directory", None)
-        if not cache_dir:
-            raise ValueError("First dataset has no cache_directory; set cache_directory in dataset config")
+        cache_dir = self._resolve_first_dataset_cache_directory(args)
         return os.path.join(cache_dir, DEFAULT_SAMPLE_LATENTS_CACHE)
 
     def process_sample_prompts(

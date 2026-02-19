@@ -18,6 +18,20 @@ To install with GUI dashboard support:
 pip install -e ".[dashboard]"
 ```
 
+### CUDA Version
+
+The PyTorch install command must use a CUDA version compatible with your GPU. Adjust the `--index-url` accordingly:
+
+```bash
+# Default (most GPUs, including RTX 30xx/40xx):
+pip install torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0 --index-url https://download.pytorch.org/whl/cu126
+
+# RTX 5090 / 50xx series (Blackwell):
+pip install torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0 --index-url https://download.pytorch.org/whl/cu128
+```
+
+Always match the CUDA version to your GPU architecture — check [PyTorch's compatibility matrix](https://pytorch.org/get-started/locally/) for the latest supported versions.
+
 ---
 
 ## Supported Dataset Types
@@ -41,6 +55,7 @@ This step pre-processes media files into VAE latents to speed up training.
 ```bash
 python ltx2_cache_latents.py ^
   --dataset_config dataset.toml ^
+  --save_dataset_manifest dataset_manifest.json ^
   --ltx2_checkpoint /path/to/ltx-2.safetensors ^
   --device cuda ^
   --vae_dtype bf16 ^
@@ -54,6 +69,7 @@ python ltx2_cache_latents.py ^
 - `--ltx2_audio_dir`, `--ltx2_audio_ext`: Optional when using `--ltx2_audio_source audio_files` (default extension: `.wav`).
 - `--ltx2_checkpoint`: Required for `--ltx2_mode av` or `--ltx2_mode audio`.
 - `--vae_dtype`: Data type for VAE latents (default comes from the cache script).
+- `--save_dataset_manifest`: Optional. Saves a cache-only dataset manifest for source-free training.
 
 ### Output Files
 
@@ -115,6 +131,17 @@ python ltx2_cache_text_encoder_outputs.py ^
 Launch the training loop using `accelerate`.
 
 **Script:** `ltx2_train_network.py`
+
+### Optional: Source-Free Training from Cache
+If you cached with `--save_dataset_manifest`, you can train without source dataset paths:
+
+```bash
+accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 ltx2_train_network.py ^
+  --dataset_manifest dataset_manifest.json ^
+  ... (other training args)
+```
+
+Use `--dataset_manifest` instead of `--dataset_config`.
 
 ### Standard LoRA Training
 ```bash
@@ -679,6 +706,7 @@ cache_directory/
 | Too few frames from high-FPS video | FPS resampling working correctly (e.g., 60fps→24fps = 40% of frames) | This is expected behavior. Set `target_fps = 60` if you want to keep all frames |
 | Audio/video out of sync after caching | Source FPS mismatch causing wrong time-stretch | Check "Auto-detected source FPS" log line; set `source_fps` explicitly if wrong |
 | Voice/audio learning slow when mixing images with videos in AV mode | Image batches produce zero audio training signal — the entire audio branch is skipped (no audio forward pass, no audio loss, no audio gradients). This dilutes audio learning proportionally to the fraction of image steps | Use video-only datasets for AV training when voice quality matters. If you must mix images, expect audio to require proportionally more training steps to converge |
+| CUDA errors or crashes on RTX 5090 / 50xx GPUs | CUDA 12.6 (`cu126`) is not supported on Windows for Blackwell-architecture GPUs | Use CUDA 12.8 (`cu128`) when installing PyTorch: `pip install torch==2.8.0 ... --index-url https://download.pytorch.org/whl/cu128`. See the [CUDA Version](#cuda-version) section under Installation |
 
 ---
 

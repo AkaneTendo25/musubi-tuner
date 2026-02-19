@@ -529,6 +529,16 @@ def main() -> None:
         logger.info("I2V sample latent precaching complete; continuing with dataset latent caching")
 
     datasets = _load_datasets(args)
+    if args.save_dataset_manifest:
+        user_config = config_utils.load_user_config(args.dataset_config)
+        manifest = config_utils.create_cache_only_dataset_manifest(
+            user_config,
+            args,
+            architecture=ARCHITECTURE_LTX2,
+            source_dataset_config=args.dataset_config,
+        )
+        manifest_path = config_utils.save_dataset_manifest(manifest, args.save_dataset_manifest)
+        logger.info("Saved cache-only dataset manifest: %s", manifest_path)
 
     if args.debug_mode is not None:
         cache_latents.show_datasets(list(datasets), args.debug_mode, args.console_width, args.console_back, args.console_num_images)

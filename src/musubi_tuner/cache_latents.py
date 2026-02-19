@@ -346,6 +346,15 @@ def main():
     user_config = config_utils.load_user_config(args.dataset_config)
     blueprint = blueprint_generator.generate(user_config, args, architecture=ARCHITECTURE_HUNYUAN_VIDEO)
     train_dataset_group = config_utils.generate_dataset_group_by_blueprint(blueprint.dataset_group)
+    if args.save_dataset_manifest:
+        manifest = config_utils.create_cache_only_dataset_manifest(
+            user_config,
+            args,
+            architecture=ARCHITECTURE_HUNYUAN_VIDEO,
+            source_dataset_config=args.dataset_config,
+        )
+        manifest_path = config_utils.save_dataset_manifest(manifest, args.save_dataset_manifest)
+        logger.info(f"Saved cache-only dataset manifest: {manifest_path}")
 
     datasets = train_dataset_group.datasets
 
@@ -382,6 +391,12 @@ def setup_parser_common() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
 
     parser.add_argument("--dataset_config", type=str, required=True, help="path to dataset config .toml file")
+    parser.add_argument(
+        "--save_dataset_manifest",
+        type=str,
+        default=None,
+        help="optional path to write a cache-only dataset manifest JSON for source-free training",
+    )
     parser.add_argument("--vae", type=str, required=False, default=None, help="path to vae checkpoint")
     parser.add_argument("--vae_dtype", type=str, default=None, help="data type for VAE, default depends on model, e.g., float16")
     parser.add_argument("--device", type=str, default=None, help="device to use, default is cuda if available")
