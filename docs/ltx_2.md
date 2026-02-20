@@ -7,16 +7,10 @@ This guide details the process for training LTX-2 LoRA models:
 2. **Caching Text Encoder Outputs** (Prompts)
 3. **Training**
 4. **Slider LoRA Training** (Controllable direction sliders)
-5. **GUI Dashboard** (Work in Progress)
 
 ## Installation
 
 See the [Installation Guide](https://github.com/AkaneTendo25/musubi-tuner/discussions/19) for detailed setup instructions (Windows/Linux, dependencies, flash-attn, troubleshooting).
-
-To install with GUI dashboard support:
-```bash
-pip install -e ".[dashboard]"
-```
 
 ### CUDA Version
 
@@ -907,59 +901,6 @@ Note: `--gemma_root` is not needed for reference mode (text embeddings are loade
 - **Guidance strength**: For text-only mode, `1.0` is a safe default. Values of `2.0-3.0` produce stronger but potentially less stable sliders.
 - **Multiple targets**: Text-only mode supports multiple `[[targets]]` blocks. Each step randomly selects one target, so all directions get trained evenly.
 - **Inference**: Use the trained LoRA with any multiplier value. Positive multipliers enhance the positive attribute, negative multipliers enhance the negative attribute. Values beyond `[-1, +1]` extrapolate the effect.
-
----
-
-## GUI Dashboard (Work in Progress)
-
-> **Status: The GUI dashboard is under active development and is not yet fully functional.** It is included for preview purposes. Expect missing features, UI bugs, and breaking changes.
-
-A web-based GUI for managing the full LTX-2 training workflow — dataset configuration, caching, training, inference, and slider LoRA — without writing commands manually.
-
-### Quick Start
-
-```bash
-# Start backend + Vite dev server (development mode)
-python -m musubi_tuner.gui_dashboard --dev
-
-# Open http://localhost:5173 in your browser
-```
-
-The `--dev` flag starts both the FastAPI backend (port 7860) and the Vite frontend dev server (port 5173). The frontend proxies API calls to the backend automatically. Press F5 to reload after making changes (HMR is disabled).
-
-### Features (planned/partial)
-
-- **Project management**: Create/load/save project configurations as JSON files
-- **Dataset editor**: Add/remove video/image/audio datasets with resolution, frame, and bucket settings
-- **Caching**: Configure and run latent + text encoder caching with live console output
-- **Training**: Full training parameter editor with VRAM estimation, live loss monitoring, and TensorBoard integration
-- **Inference**: Generate videos with trained LoRAs directly from the UI
-- **Slider LoRA**: Text-only and reference mode slider training configuration
-- **Settings**: Model directory management and one-click model downloads (LTX-2 checkpoint, Gemma encoder)
-- **Preservation/CREPA**: UI controls for all regularization techniques
-
-### Requirements
-
-Install the dashboard extra dependencies:
-```bash
-pip install -e ".[dashboard]"
-```
-
-The GUI also requires Node.js for the frontend dev server:
-```bash
-cd src/musubi_tuner/gui_dashboard/frontend
-npm install
-```
-
-### CLI Options
-
-| Argument | Default | Description |
-|----------|---------|-------------|
-| `--port` | 7860 | Backend API server port |
-| `--host` | 0.0.0.0 | Backend server host |
-| `--project` | None | Path to `project.json` to load on startup |
-| `--dev` | false | Start Vite dev server alongside backend |
-| `--dev-port` | 5173 | Vite dev server port |
 
 ---
 
