@@ -280,8 +280,12 @@ accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 ltx2_tr
 - Use `--use_pinned_memory_for_block_swap` - faster transfers
 
 #### Audio-Video Support
-- `--ltx2_mode av`: Enables joint Video+Audio training logic.
+- `--ltx2_mode`, `--ltx_mode`: Training modality selector. Values: `video`, `av`, `audio` (aliases: `v`, `va`, `a`).
 - `--separate_audio_buckets`: Keeps audio and non-audio items in separate batches (reduces VRAM for image/video-only batches).
+- `--min_audio_batches_per_accum`: Minimum number of audio-bearing microbatches per gradient accumulation window.
+- `--audio_batch_probability`: Probability of selecting an audio-bearing batch when both audio and non-audio batches are available.
+  - `--min_audio_batches_per_accum` and `--audio_batch_probability` are mutually exclusive.
+- `--caption_dropout_rate`: Probability of dropping text conditioning for a sample during training.
 
 #### Loss Weighting
 - `--video_loss_weight`: Weight for video loss (default: 1.0).
@@ -309,6 +313,19 @@ Recommended start values:
 - `--audio_loss_balance_eps 0.05` (safe floor; increase to `0.1` if weights spike too much)
 - `--audio_loss_balance_min 1.0 --audio_loss_balance_max 3.0` (conservative clamp range)
 - `--audio_loss_balance_ema_init 1.0` (no warm-start boost; use `0.5` only if you want stronger early audio emphasis)
+
+#### Additional Audio Training Flags
+
+- `--independent_audio_timestep`: Sample a separate timestep for audio (AV/audio modes only).
+- `--audio_silence_regularizer`: When AV batches are missing audio latents, use synthetic silence latents instead of skipping the audio branch.
+- `--audio_silence_regularizer_weight`: Loss multiplier for synthetic-silence fallback batches.
+- `--audio_loss_balance_mode ema_mag`: Dynamic audio balancing by matching audio-loss EMA magnitude to a target fraction of video-loss EMA.
+- `--audio_loss_balance_target_ratio`: Target audio/video loss magnitude ratio for `ema_mag`.
+- `--audio_loss_balance_ema_decay`: EMA decay for `ema_mag`.
+- `--audio_supervision_mode off|warn|error`: AV audio-supervision monitor mode.
+- `--audio_supervision_warmup_steps`: Expected AV batches before supervision checks.
+- `--audio_supervision_check_interval`: Run supervision checks every N expected AV batches.
+- `--audio_supervision_min_ratio`: Minimum supervised/expected ratio required by the monitor.
 
 #### Preservation & Regularization
 
@@ -465,6 +482,8 @@ Custom `include_patterns` override any preset.
 - `--sample_vae_temporal_tile_size 0`: Temporal tile size (0 disables temporal tiling).
 - `--sample_vae_temporal_tile_overlap 8`: Temporal overlap (frames).
 - `--sample_merge_audio`: Merges generated audio into the `.mp4`.
+- `--sample_audio_only`: Generate audio-only preview outputs.
+- `--sample_disable_audio`: Disable audio preview generation during sampling.
 
 #### Precached Sample Prompts
 To avoid loading Gemma during training for sample generation, you can precache the prompt embeddings:

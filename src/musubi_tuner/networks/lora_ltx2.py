@@ -179,18 +179,28 @@ class LTX2Wrapper(nn.Module):
 
         bsz, vch, vframes, vheight, vwidth = video_latents.shape
 
-        if isinstance(timestep, torch.Tensor):
-            ts = timestep
-        else:
-            ts = torch.tensor(timestep, device=video_latents.device, dtype=video_latents.dtype)
-        if ts.dim() == 0:
-            ts = ts.view(1)
-        if ts.dim() == 2 and ts.shape[1] == 1:
-            sigma = ts[:, 0]
-        elif ts.dim() == 1:
-            sigma = ts
-        else:
-            raise ValueError(f"Unexpected timestep shape: {tuple(ts.shape)}")
+        def _to_sigma(ts_value, *, name: str) -> torch.Tensor:
+            if isinstance(ts_value, torch.Tensor):
+                ts = ts_value
+            else:
+                ts = torch.tensor(ts_value, device=video_latents.device, dtype=video_latents.dtype)
+            if ts.dim() == 0:
+                ts = ts.view(1)
+            if ts.dim() == 2 and ts.shape[1] == 1:
+                sigma = ts[:, 0]
+            elif ts.dim() == 1:
+                sigma = ts
+            else:
+                raise ValueError(f"Unexpected {name} shape: {tuple(ts.shape)}")
+            if sigma.numel() == 1 and bsz != 1:
+                sigma = sigma.expand(bsz)
+            if sigma.shape[0] != bsz:
+                raise ValueError(f"Expected {name} batch size {bsz}, got {sigma.shape[0]}")
+            return sigma.to(device=video_latents.device, dtype=video_latents.dtype)
+
+        sigma = _to_sigma(timestep, name="timestep")
+        audio_timestep = kwargs.get("audio_timestep")
+        audio_sigma = _to_sigma(audio_timestep, name="audio_timestep") if audio_timestep is not None else sigma
 
         video_tokens = self._video_patchifier.patchify(video_latents)
         video_seq_len = video_tokens.shape[1]
@@ -254,7 +264,7 @@ class LTX2Wrapper(nn.Module):
 
             audio_tokens = self._audio_patchifier.patchify(audio_latents)
             audio_seq_len = audio_tokens.shape[1]
-            audio_timesteps = sigma.view(bsz, 1).expand(bsz, audio_seq_len)
+            audio_timesteps = audio_sigma.view(bsz, 1).expand(bsz, audio_seq_len)
 
             audio_shape = AudioLatentShape(batch=bsz, channels=ach, frames=at, mel_bins=af)
             audio_positions = self._audio_patchifier.get_patch_grid_bounds(audio_shape, device=audio_latents.device)

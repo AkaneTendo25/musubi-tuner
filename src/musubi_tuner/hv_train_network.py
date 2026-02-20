@@ -46,7 +46,9 @@ from musubi_tuner.dataset.audio_quota_sampler import (
     sync_dataset_group_epoch_without_loading,
 )
 from musubi_tuner.audio_loss_balance import (
+    compute_ema_magnitude_audio_weight,
     compute_inverse_frequency_audio_weight,
+    update_loss_ema,
     update_audio_presence_ema,
 )
 from musubi_tuner.modules.lr_schedulers import RexLR
@@ -1887,6 +1889,10 @@ class NetworkTrainer:
         audio_loss_balance_max = float(getattr(args, "audio_loss_balance_max", 4.0))
         audio_presence_ema = float(getattr(args, "audio_loss_balance_ema_init", 1.0))
         audio_presence_ema = min(max(audio_presence_ema, 1e-6), 1.0)
+        audio_loss_balance_target_ratio = float(getattr(args, "audio_loss_balance_target_ratio", 0.33))
+        audio_loss_balance_ema_decay = float(getattr(args, "audio_loss_balance_ema_decay", 0.99))
+        audio_loss_ema = max(float(getattr(args, "audio_loss_balance_ema_init", 1.0)), 1e-6)
+        video_loss_ema = max(float(getattr(args, "audio_loss_balance_ema_init", 1.0)), 1e-6)
         if audio_loss_balance_mode == "inv_freq":
             logger.info(
                 "Audio inverse-frequency weighting enabled: beta=%.4f eps=%.4f min=%.4f max=%.4f ema_init=%.4f",
@@ -1895,6 +1901,15 @@ class NetworkTrainer:
                 audio_loss_balance_min,
                 audio_loss_balance_max,
                 audio_presence_ema,
+            )
+        elif audio_loss_balance_mode == "ema_mag":
+            logger.info(
+                "Audio EMA-magnitude balancing enabled: target_ratio=%.4f ema_decay=%.4f min=%.4f max=%.4f ema_init=%.4f",
+                audio_loss_balance_target_ratio,
+                audio_loss_balance_ema_decay,
+                audio_loss_balance_min,
+                audio_loss_balance_max,
+                audio_loss_ema,
             )
 
         # Load dataset config
@@ -2841,6 +2856,8 @@ class NetworkTrainer:
                     audio_loss_value = None  # For tracking in wandb/tensorboard
                     audio_weight_effective_value = None
                     audio_presence_ema_value = None
+                    audio_loss_ema_value = None
+                    video_loss_ema_value = None
                     if dict_output:
                         out = model_pred
 
@@ -2889,6 +2906,14 @@ class NetworkTrainer:
                         video_loss = _masked_mse(video_pred, video_target, video_loss_mask)
                         video_weight = float(out.get("video_loss_weight", 1.0))
                         loss = video_loss * video_weight
+                        if audio_loss_balance_mode == "ema_mag":
+                            video_loss_item = max(float(video_loss.detach().item()), 1e-12)
+                            video_loss_ema = update_loss_ema(
+                                loss_ema=video_loss_ema,
+                                loss_value=video_loss_item,
+                                ema_decay=audio_loss_balance_ema_decay,
+                            )
+                            video_loss_ema_value = video_loss_ema
                         # Capture video loss for logging (only if weight > 0)
                         if video_weight > 0:
                             video_loss_value = video_loss.detach().item()
@@ -2912,6 +2937,22 @@ class NetworkTrainer:
                                     base_audio_weight=audio_weight,
                                     audio_presence_ema=audio_presence_ema,
                                     balance_eps=audio_loss_balance_eps,
+                                    balance_min=audio_loss_balance_min,
+                                    balance_max=audio_loss_balance_max,
+                                )
+                            elif audio_loss_balance_mode == "ema_mag":
+                                audio_loss_item = max(float(audio_loss.detach().item()), 1e-12)
+                                audio_loss_ema = update_loss_ema(
+                                    loss_ema=audio_loss_ema,
+                                    loss_value=audio_loss_item,
+                                    ema_decay=audio_loss_balance_ema_decay,
+                                )
+                                audio_loss_ema_value = audio_loss_ema
+                                audio_weight = compute_ema_magnitude_audio_weight(
+                                    base_audio_weight=audio_weight,
+                                    audio_loss_ema=audio_loss_ema,
+                                    video_loss_ema=video_loss_ema,
+                                    target_audio_ratio=audio_loss_balance_target_ratio,
                                     balance_min=audio_loss_balance_min,
                                     balance_max=audio_loss_balance_max,
                                 )
@@ -3103,6 +3144,10 @@ class NetworkTrainer:
                         logs["loss/audio_weight_effective"] = audio_weight_effective_value
                     if audio_presence_ema_value is not None:
                         logs["loss/audio_presence_ema"] = audio_presence_ema_value
+                    if audio_loss_ema_value is not None:
+                        logs["loss/audio_loss_ema"] = audio_loss_ema_value
+                    if video_loss_ema_value is not None:
+                        logs["loss/video_loss_ema"] = video_loss_ema_value
                     if pres_losses:
                         logs.update(pres_losses)
                     accelerator.log(logs, step=global_step)
