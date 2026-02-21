@@ -433,9 +433,9 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         "--ltx2_mode", "--ltx_mode",
         dest="ltx_mode",
         type=str,
-        default="av",
+        default="v",
         choices=["video", "av", "audio", "v", "a", "va"],
-        help="Caching modality: 'av' (default) for audio+video, 'video' for video-only, 'audio' for audio-only.",
+        help="Caching modality: 'video' (default) for video-only, 'av' for audio+video, 'audio' for audio-only.",
     )
     parser.add_argument(
         "--mixed_precision",

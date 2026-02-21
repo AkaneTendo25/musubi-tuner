@@ -3974,7 +3974,7 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         "--ltx2_mode", "--ltx_mode",
         dest="ltx_mode",
         type=str,
-        default="av",
+        default="v",
         choices=["video", "av", "audio", "v", "a", "va"],
         help="Training modality.",
     )

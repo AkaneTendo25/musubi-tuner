@@ -58,7 +58,7 @@ python ltx2_cache_latents.py ^
 ```
 
 ### Key Arguments
-- `--ltx2_mode av`: Enables Audio-Video processing. Caches both `*_ltx2.safetensors` (video) and `*_ltx2_audio.safetensors` (audio) latents. `--ltx_mode` is accepted as an alias.
+- `--ltx2_mode`, `--ltx_mode`: Caching modality selector. Default is video-only (`v`/`video`). Use `av` to cache both `*_ltx2.safetensors` (video) and `*_ltx2_audio.safetensors` (audio) latents.
 - `--ltx2_audio_source video|audio_files`: Use audio from the video or from external files.
 - `--ltx2_audio_dir`, `--ltx2_audio_ext`: Optional when using `--ltx2_audio_source audio_files` (default extension: `.wav`).
 - `--ltx2_checkpoint`: Required for `--ltx2_mode av` or `--ltx2_mode audio`.
@@ -109,7 +109,7 @@ python ltx2_cache_text_encoder_outputs.py ^
 - `--gemma_load_in_8bit`: Loads Gemma in 8-bit quantization.
 - `--gemma_load_in_4bit`: Loads Gemma in 4-bit quantization.
 - `--ltx2_checkpoint`: Required. Use `--ltx2_text_encoder_checkpoint` to override for text encoder connector weights.
-- `--ltx2_mode av`: MUST match the mode used in latent caching. Concatenates video and audio prompt embeddings. `--ltx_mode` is accepted as an alias.
+- `--ltx2_mode`, `--ltx_mode`: MUST match the mode used in latent caching. Default is video-only (`v`/`video`); use `av` to concatenate video and audio prompt embeddings.
 - 8-bit/4-bit loading requires `--device cuda`.
 
 ### Output Files
@@ -274,7 +274,7 @@ accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 ltx2_tr
 - Use `--use_pinned_memory_for_block_swap` - faster transfers
 
 #### Audio-Video Support
-- `--ltx2_mode`, `--ltx_mode`: Training modality selector. Values: `video`, `av`, `audio` (aliases: `v`, `va`, `a`).
+- `--ltx2_mode`, `--ltx_mode`: Training modality selector. Default is `v` (`video`). Values: `video`, `av`, `audio` (aliases: `v`, `va`, `a`).
 - `--separate_audio_buckets`: Keeps audio and non-audio items in separate batches (reduces VRAM for image/video-only batches).
 - `--min_audio_batches_per_accum`: Minimum number of audio-bearing microbatches per gradient accumulation window.
 - `--audio_batch_probability`: Probability of selecting an audio-bearing batch when both audio and non-audio batches are available.
