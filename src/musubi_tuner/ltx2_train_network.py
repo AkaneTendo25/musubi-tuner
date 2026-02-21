@@ -85,6 +85,8 @@ KEEP_FP8_HIGH_PRECISION_TOKENS = (
     "av_ca_a2v_gate_adaln_single",
     "av_ca_audio_scale_shift_adaln_single",
     "av_ca_v2a_gate_adaln_single",
+    # --- Gated attention ---
+    "to_gate_logits",
 )
 
 
@@ -369,6 +371,16 @@ def load_ltx2_model(
     if ffn_chunk_size is not None:
         config.setdefault("transformer", {})
         config["transformer"]["ffn_chunk_size"] = int(ffn_chunk_size)
+    # Auto-detect gated attention from checkpoint keys
+    if not config.get("transformer", {}).get("apply_gated_attention", False):
+        from safetensors import safe_open
+        _check_path = model_path if isinstance(model_path, str) else model_path[0]
+        with safe_open(_check_path, framework="pt") as f:
+            if any("to_gate_logits" in k for k in f.keys()):
+                config.setdefault("transformer", {})
+                config["transformer"]["apply_gated_attention"] = True
+                logger.info("Auto-detected gated attention from checkpoint keys")
+
     configurator = LTXModelConfigurator if audio_video else LTXVideoOnlyModelConfigurator
 
     with torch.device("meta"):

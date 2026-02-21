@@ -247,6 +247,7 @@ class Attention(torch.nn.Module):
         norm_eps: float = 1e-6,
         rope_type: LTXRopeType = LTXRopeType.INTERLEAVED,
         attention_function: AttentionCallable | AttentionFunction = AttentionFunction.DEFAULT,
+        apply_gated_attention: bool = False,
     ) -> None:
         super().__init__()
         self.rope_type = rope_type
@@ -267,6 +268,13 @@ class Attention(torch.nn.Module):
         self.to_v = torch.nn.Linear(context_dim, inner_dim, bias=True)
 
         self.to_out = torch.nn.Sequential(torch.nn.Linear(inner_dim, query_dim, bias=True), torch.nn.Identity())
+
+        # Gated attention: per-head learnable gates on attention output.
+        # Zero-init gives gates = 2 * sigmoid(0) = 1.0 (identity at init).
+        if apply_gated_attention:
+            self.to_gate_logits = torch.nn.Linear(query_dim, heads, bias=True)
+        else:
+            self.to_gate_logits = None
 
         # Split attention settings (configured after model load)
         self.split_attn_mode: str | None = None  # "batch" or "query"
@@ -416,4 +424,14 @@ class Attention(torch.nn.Module):
         else:
             # attention_function can be an enum *or* a custom callable
             out = self.attention_function(q, k, v, self.heads, mask)
+
+        # Gated attention: apply per-head learnable gates
+        if self.to_gate_logits is not None:
+            gate_logits = self.to_gate_logits(x)  # (B, T, H) from original input
+            b, t, _ = out.shape
+            out = out.view(b, t, self.heads, self.dim_head)
+            gates = 2.0 * torch.sigmoid(gate_logits)
+            out = out * gates.unsqueeze(-1)
+            out = out.view(b, t, self.heads * self.dim_head)
+
         return self.to_out(out)

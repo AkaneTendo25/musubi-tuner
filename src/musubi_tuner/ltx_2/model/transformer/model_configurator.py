@@ -64,6 +64,7 @@ class LTXModelConfigurator(ModelConfigurator[LTXModel]):
             av_ca_timestep_scale_multiplier=config.get("av_ca_timestep_scale_multiplier", 1),
             rope_type=LTXRopeType(config.get("rope_type", "interleaved")),
             double_precision_rope=config.get("frequencies_precision", False) == "float64",
+            apply_gated_attention=config.get("apply_gated_attention", False),
         )
 
 
@@ -110,6 +111,7 @@ class LTXVideoOnlyModelConfigurator(ModelConfigurator[LTXModel]):
             use_middle_indices_grid=config.get("use_middle_indices_grid", True),
             rope_type=LTXRopeType(config.get("rope_type", "interleaved")),
             double_precision_rope=config.get("frequencies_precision", False) == "float64",
+            apply_gated_attention=config.get("apply_gated_attention", False),
         )
 
 

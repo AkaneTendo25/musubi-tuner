@@ -145,6 +145,7 @@ class LTXModel(torch.nn.Module):
         av_ca_timestep_scale_multiplier: int = 1,
         rope_type: LTXRopeType = LTXRopeType.INTERLEAVED,
         double_precision_rope: bool = False,
+        apply_gated_attention: bool = False,
     ):
         super().__init__()
         self._enable_gradient_checkpointing = False
@@ -202,6 +203,7 @@ class LTXModel(torch.nn.Module):
             audio_cross_attention_dim=audio_cross_attention_dim,
             norm_eps=norm_eps,
             attention_type=attention_type,
+            apply_gated_attention=apply_gated_attention,
         )
 
         self.num_blocks = len(self.transformer_blocks)
@@ -363,6 +365,7 @@ class LTXModel(torch.nn.Module):
         audio_cross_attention_dim: int,
         norm_eps: float,
         attention_type: AttentionFunction | AttentionCallable,
+        apply_gated_attention: bool = False,
     ) -> None:
         """Initialize transformer blocks for LTX."""
         video_config = (
@@ -371,6 +374,7 @@ class LTXModel(torch.nn.Module):
                 heads=self.num_attention_heads,
                 d_head=attention_head_dim,
                 context_dim=cross_attention_dim,
+                apply_gated_attention=apply_gated_attention,
             )
             if self.model_type.is_video_enabled()
             else None
@@ -381,6 +385,7 @@ class LTXModel(torch.nn.Module):
                 heads=self.audio_num_attention_heads,
                 d_head=audio_attention_head_dim,
                 context_dim=audio_cross_attention_dim,
+                apply_gated_attention=apply_gated_attention,
             )
             if self.model_type.is_audio_enabled()
             else None
