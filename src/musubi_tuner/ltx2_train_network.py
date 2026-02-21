@@ -62,16 +62,29 @@ LTX2_LATENTS_STD = [1.0]
 DEFAULT_SAMPLE_PROMPTS_CACHE = "ltx2_sample_prompts_cache.pt"
 DEFAULT_SAMPLE_LATENTS_CACHE = "ltx2_sample_latents_cache.pt"
 
-# Modules to keep in high precision for FP8 quantization
+# Modules to keep in high precision for FP8 quantization.
+# Excludes sensitive projection, conditioning, and normalization layers.
 KEEP_FP8_HIGH_PRECISION_TOKENS = (
+    # --- General layer-component exclusions ---
     "norm",
     "bias",
     "scale_shift_table",
+    "layer_norm",
+    # --- Video projection/conditioning layers ---
     "patchify_proj",
     "proj_out",
     "adaln_single",
     "caption_projection",
-    "layer_norm",
+    # --- Audio projection/conditioning layers ---
+    "audio_patchify_proj",
+    "audio_proj_out",
+    "audio_adaln_single",
+    "audio_caption_projection",
+    # --- AV cross-attention gate layers ---
+    "av_ca_video_scale_shift_adaln_single",
+    "av_ca_a2v_gate_adaln_single",
+    "av_ca_audio_scale_shift_adaln_single",
+    "av_ca_v2a_gate_adaln_single",
 )
 
 
