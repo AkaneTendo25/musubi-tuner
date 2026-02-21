@@ -3,6 +3,7 @@
 import argparse
 import gc
 import os
+import random
 import re
 import subprocess
 import sys
@@ -12,6 +13,7 @@ import wave
 from fractions import Fraction
 from typing import Any, Dict, List, Optional, Tuple, Union
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from accelerate import Accelerator, PartialState
 from tqdm import tqdm
@@ -26,6 +28,13 @@ from musubi_tuner.hv_train_network import (
     read_config_from_file,
     setup_parser_common,
     should_sample_images,
+)
+from musubi_tuner.audio_supervision import (
+    AudioSupervisionState,
+    format_audio_supervision_alert,
+    normalize_audio_supervision_mode,
+    reset_audio_supervision_state,
+    update_and_check_audio_supervision,
 )
 from musubi_tuner.hv_generate_video import save_images_grid, save_videos_grid
 from musubi_tuner.utils.device_utils import clean_memory_on_device
@@ -51,6 +60,7 @@ LTX2_LATENTS_MEAN = [0.0]
 LTX2_LATENTS_STD = [1.0]
 
 DEFAULT_SAMPLE_PROMPTS_CACHE = "ltx2_sample_prompts_cache.pt"
+DEFAULT_SAMPLE_LATENTS_CACHE = "ltx2_sample_latents_cache.pt"
 
 # Modules to keep in high precision for FP8 quantization
 KEEP_FP8_HIGH_PRECISION_TOKENS = (
@@ -464,6 +474,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
         self._dit_attn_mode: Optional[str] = None
         self._latent_norm_cache: Dict = {}
         self._warned_missing_audio = False
+        self._audio_supervision_state = AudioSupervisionState()
 
         # Initialize latent normalization
         mean = torch.tensor(LTX2_LATENTS_MEAN, dtype=torch.float32).view(1, -1, 1, 1, 1)
@@ -477,6 +488,224 @@ class LTX2NetworkTrainer(NetworkTrainer):
         self._ltx_mode: str = "video"
         self.default_guidance_scale = 3.0
         self._audio_preview_config: Optional[Dict[str, int | float]] = None
+
+        # Preservation / regularization (off by default — zero overhead)
+        self._preservation_active: bool = False
+        self._preservation_helper = None
+        self._last_dit_inputs: Optional[Dict[str, Any]] = None
+
+        # CREPA (off by default)
+        self._crepa = None
+
+    # ------------------------------------------------------------------
+    # Preservation / regularization hooks
+    # ------------------------------------------------------------------
+
+    def pre_train_hook(self, args: argparse.Namespace, accelerator: Accelerator,
+                       transformer=None, network=None) -> None:
+        self._setup_preservation(args, accelerator)
+        self._setup_crepa(args, accelerator, transformer)
+        self._apply_network_initialization(args, network)
+
+    def _setup_preservation(self, args: argparse.Namespace, accelerator: Accelerator) -> None:
+        """Parse preservation CLI flags and prepare helper.  No-op when no flags are set."""
+        blank = getattr(args, "blank_preservation", False)
+        dop = getattr(args, "dop", False)
+        prior_div = getattr(args, "prior_divergence", False)
+
+        if not (blank or dop or prior_div):
+            return
+
+        from musubi_tuner.preservation import PreservationConfig, PreservationHelper, parse_preservation_args
+
+        blank_kw = parse_preservation_args(getattr(args, "blank_preservation_args", None))
+        dop_kw = parse_preservation_args(getattr(args, "dop_args", None))
+        prior_kw = parse_preservation_args(getattr(args, "prior_divergence_args", None))
+
+        cfg = PreservationConfig(
+            blank_preservation=blank,
+            blank_multiplier=float(blank_kw.get("multiplier", 1.0)),
+            dop=dop,
+            dop_multiplier=float(dop_kw.get("multiplier", 1.0)),
+            dop_class_prompt=dop_kw.get("class", ""),
+            prior_divergence=prior_div,
+            prior_divergence_multiplier=float(prior_kw.get("multiplier", 0.1)),
+        )
+
+        # Warn about DOP without class prompt (acts identical to blank preservation)
+        if dop and not cfg.dop_class_prompt:
+            logger.warning(
+                "DOP enabled but no class prompt specified (--dop_args class=<prompt>). "
+                "This will use an empty prompt, which is identical to blank preservation."
+            )
+
+        helper = PreservationHelper(cfg)
+        helper.encode_prompts(self, args, accelerator)
+
+        self._preservation_helper = helper
+        self._preservation_active = True
+
+        # Log VRAM impact: each technique adds extra transformer forward passes per step
+        extra_fwd = 0
+        extra_bwd = 0
+        if blank:
+            extra_fwd += 2  # no-grad OFF + with-grad ON
+            extra_bwd += 1
+        if dop:
+            extra_fwd += 2
+            extra_bwd += 1
+        if prior_div:
+            extra_fwd += 1  # no-grad OFF only
+        logger.info(
+            "Preservation enabled: blank=%s (x%.2f), dop=%s (class=%r, x%.2f), prior_div=%s (x%.3f)",
+            cfg.blank_preservation, cfg.blank_multiplier,
+            cfg.dop, cfg.dop_class_prompt, cfg.dop_multiplier,
+            cfg.prior_divergence, cfg.prior_divergence_multiplier,
+        )
+        logger.warning(
+            "Preservation adds +%d forward passes and +%d backward passes per training step. "
+            "This significantly increases VRAM usage and step time.",
+            extra_fwd, extra_bwd,
+        )
+
+    def _setup_crepa(self, args: argparse.Namespace, accelerator: Accelerator,
+                     transformer=None) -> None:
+        """Parse CREPA CLI flags and install hooks.  No-op when ``--crepa`` is not set."""
+        if not getattr(args, "crepa", False):
+            return
+        if transformer is None:
+            logger.warning("CREPA enabled but transformer not available — skipping setup")
+            return
+
+        from musubi_tuner.crepa import CREPAConfig, CREPAModule, parse_crepa_args
+
+        kw = parse_crepa_args(getattr(args, "crepa_args", None))
+
+        # Build config — convert types from string values
+        cfg_kwargs: Dict[str, Any] = {}
+        _int_keys = {"student_block_idx", "teacher_block_idx", "num_neighbors", "warmup_steps", "max_steps"}
+        _float_keys = {"lambda_crepa", "tau"}
+        _bool_keys = {"normalize"}
+        for k, v in kw.items():
+            if k in _int_keys:
+                cfg_kwargs[k] = int(v)
+            elif k in _float_keys:
+                cfg_kwargs[k] = float(v)
+            elif k in _bool_keys:
+                cfg_kwargs[k] = v.lower() in ("true", "1", "yes")
+            else:
+                cfg_kwargs[k] = v
+
+        # Auto-fill max_steps for schedule
+        if "max_steps" not in cfg_kwargs and hasattr(args, "max_train_steps"):
+            cfg_kwargs["max_steps"] = args.max_train_steps
+
+        config = CREPAConfig(**cfg_kwargs)
+
+        unwrapped = accelerator.unwrap_model(transformer)
+        module = CREPAModule(config, unwrapped)
+
+        # Determine dtype from model
+        first_param = next(iter(unwrapped.parameters()), None)
+        dtype = first_param.dtype if first_param is not None else torch.float32
+
+        module.setup(accelerator.device, dtype)
+
+        # Try to load existing projector weights (for resume)
+        if args.output_dir:
+            proj_path = os.path.join(args.output_dir, "crepa_projector.safetensors")
+            if os.path.exists(proj_path):
+                from safetensors.torch import load_file
+                sd = load_file(proj_path)
+                module.load_state_dict(sd)
+                logger.info("CREPA: resumed projector weights from %s", proj_path)
+
+        self._crepa = module
+
+    def _apply_network_initialization(self, args: argparse.Namespace, network=None) -> None:
+        """Apply network initialization customizations.
+
+        Called after network creation to apply special initialization,
+        for example LoKR perturbed normal.
+        """
+        if network is None:
+            return
+
+        # Apply special initialization if configured
+        if hasattr(args, "_network_init_params"):
+            init_params = args._network_init_params
+
+            # LoKR perturbed normal initialization
+            if "lokr_norm" in init_params:
+                scale = init_params["lokr_norm"]
+                logger.info(f"Applying LoKR perturbed normal initialization (scale={scale})")
+                try:
+                    from musubi_tuner.networks.lycoris_extensions import init_lokr_network_with_perturbed_normal
+                    init_lokr_network_with_perturbed_normal(network, scale=scale)
+                except Exception as e:
+                    logger.warning(f"Failed to apply LoKR initialization: {e}")
+
+    def compute_prior_divergence_addition(
+        self,
+        args: argparse.Namespace,
+        accelerator: Accelerator,
+        transformer: torch.nn.Module,
+        network: torch.nn.Module,
+        video_pred: torch.Tensor,
+        network_dtype: torch.dtype,
+    ) -> Optional[torch.Tensor]:
+        """Return ``-MSE(video_pred, prior_pred) * mult`` or None."""
+        if not self._preservation_active or self._preservation_helper is None:
+            return None
+        cfg = self._preservation_helper.config
+        if not cfg.prior_divergence:
+            return None
+        dit_inputs = self._last_dit_inputs
+        if dit_inputs is None:
+            return None
+
+        prior_pred = self._preservation_helper.compute_prior_divergence(
+            self, transformer, network, accelerator, dit_inputs, network_dtype,
+        )
+        div_loss = -F.mse_loss(video_pred.float(), prior_pred.float()) * cfg.prior_divergence_multiplier
+        if not torch.isfinite(div_loss):
+            logger.warning("Prior divergence loss is non-finite (%.4g), skipping.", div_loss.item())
+            return None
+        return div_loss
+
+    def preservation_backward(
+        self,
+        args: argparse.Namespace,
+        accelerator: Accelerator,
+        transformer: torch.nn.Module,
+        network: torch.nn.Module,
+        network_dtype: torch.dtype,
+    ) -> Dict[str, float]:
+        """Run preservation backward passes for blank and DOP.  Returns loss dict for logging."""
+        if not self._preservation_active or self._preservation_helper is None:
+            return {}
+        dit_inputs = self._last_dit_inputs
+        self._last_dit_inputs = None  # clear for next step
+        if dit_inputs is None:
+            return {}
+
+        losses: Dict[str, float] = {}
+        helper = self._preservation_helper
+        cfg = helper.config
+
+        if cfg.blank_preservation:
+            val = helper.compute_preservation_backward(
+                "blank", self, transformer, network, accelerator, dit_inputs, network_dtype,
+            )
+            losses["loss/blank_pres"] = val
+
+        if cfg.dop:
+            val = helper.compute_preservation_backward(
+                "dop", self, transformer, network, accelerator, dit_inputs, network_dtype,
+            )
+            losses["loss/dop"] = val
+
+        return losses
 
     def _get_audio_preview_config(self, args: argparse.Namespace, transformer) -> Dict[str, int | float]:
         if self._audio_preview_config is not None:
@@ -617,6 +846,24 @@ class LTX2NetworkTrainer(NetworkTrainer):
             return timesteps
 
         return timesteps / 1000.0
+
+    def _sample_independent_audio_timesteps(
+        self,
+        args: argparse.Namespace,
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Sample audio timesteps in the same sigma range used by video timesteps."""
+        min_timestep = getattr(args, "min_timestep", None)
+        max_timestep = getattr(args, "max_timestep", None)
+        min_sigma = (float(min_timestep) / 1000.0) if min_timestep is not None else 0.0
+        max_sigma = (float(max_timestep) / 1000.0) if max_timestep is not None else 1.0
+        if max_sigma < min_sigma:
+            raise ValueError(f"Invalid timestep range: min_sigma={min_sigma} > max_sigma={max_sigma}")
+        sigmas = torch.rand((batch_size,), device=device, dtype=torch.float32)
+        sigmas = sigmas * (max_sigma - min_sigma) + min_sigma
+        return sigmas.to(device=device, dtype=dtype).view(batch_size, 1)
 
     def _ensure_fp8_buffers_on_device(self, model: torch.nn.Module) -> None:
         if not any(True for _ in model.parameters()):
@@ -807,6 +1054,86 @@ class LTX2NetworkTrainer(NetworkTrainer):
 
         args.weighting_scheme = "none"
 
+        audio_balance_mode = str(getattr(args, "audio_loss_balance_mode", "none") or "none").lower()
+        if audio_balance_mode not in {"none", "inv_freq", "ema_mag"}:
+            raise ValueError(
+                f"audio_loss_balance_mode must be one of ['none', 'inv_freq', 'ema_mag']. Got: {audio_balance_mode}"
+            )
+        args.audio_loss_balance_mode = audio_balance_mode
+
+        audio_balance_beta = float(getattr(args, "audio_loss_balance_beta", 0.01))
+        audio_balance_eps = float(getattr(args, "audio_loss_balance_eps", 0.05))
+        audio_balance_min = float(getattr(args, "audio_loss_balance_min", 1.0))
+        audio_balance_max = float(getattr(args, "audio_loss_balance_max", 4.0))
+        audio_balance_ema_init = float(getattr(args, "audio_loss_balance_ema_init", 1.0))
+        audio_balance_target_ratio = float(getattr(args, "audio_loss_balance_target_ratio", 0.33))
+        audio_balance_ema_decay = float(getattr(args, "audio_loss_balance_ema_decay", 0.99))
+
+        if not (0.0 < audio_balance_beta <= 1.0):
+            raise ValueError(f"audio_loss_balance_beta must be in (0, 1]. Got: {audio_balance_beta}")
+        if audio_balance_eps <= 0.0:
+            raise ValueError(f"audio_loss_balance_eps must be > 0. Got: {audio_balance_eps}")
+        if audio_balance_min < 0.0:
+            raise ValueError(f"audio_loss_balance_min must be >= 0. Got: {audio_balance_min}")
+        if audio_balance_max <= 0.0:
+            raise ValueError(f"audio_loss_balance_max must be > 0. Got: {audio_balance_max}")
+        if audio_balance_max < audio_balance_min:
+            raise ValueError(
+                f"audio_loss_balance_max must be >= audio_loss_balance_min. Got: min={audio_balance_min}, max={audio_balance_max}"
+            )
+        if audio_balance_mode == "inv_freq":
+            if not (0.0 < audio_balance_ema_init <= 1.0):
+                raise ValueError(f"audio_loss_balance_ema_init must be in (0, 1] for inv_freq. Got: {audio_balance_ema_init}")
+        else:
+            if audio_balance_ema_init <= 0.0:
+                raise ValueError(f"audio_loss_balance_ema_init must be > 0. Got: {audio_balance_ema_init}")
+        if audio_balance_target_ratio < 0.0:
+            raise ValueError(f"audio_loss_balance_target_ratio must be >= 0. Got: {audio_balance_target_ratio}")
+        if not (0.0 < audio_balance_ema_decay < 1.0):
+            raise ValueError(f"audio_loss_balance_ema_decay must be in (0, 1). Got: {audio_balance_ema_decay}")
+
+        args.audio_loss_balance_beta = audio_balance_beta
+        args.audio_loss_balance_eps = audio_balance_eps
+        args.audio_loss_balance_min = audio_balance_min
+        args.audio_loss_balance_max = audio_balance_max
+        args.audio_loss_balance_ema_init = audio_balance_ema_init
+        args.audio_loss_balance_target_ratio = audio_balance_target_ratio
+        args.audio_loss_balance_ema_decay = audio_balance_ema_decay
+
+        args.independent_audio_timestep = bool(getattr(args, "independent_audio_timestep", False))
+        args.audio_silence_regularizer = bool(getattr(args, "audio_silence_regularizer", False))
+        audio_silence_regularizer_weight = float(getattr(args, "audio_silence_regularizer_weight", 1.0))
+        if audio_silence_regularizer_weight < 0.0:
+            raise ValueError(
+                f"audio_silence_regularizer_weight must be >= 0. Got: {audio_silence_regularizer_weight}"
+            )
+        args.audio_silence_regularizer_weight = audio_silence_regularizer_weight
+
+        audio_supervision_mode = normalize_audio_supervision_mode(
+            getattr(args, "audio_supervision_mode", "off")
+        )
+        audio_supervision_warmup_steps = int(getattr(args, "audio_supervision_warmup_steps", 50))
+        audio_supervision_check_interval = int(getattr(args, "audio_supervision_check_interval", 50))
+        audio_supervision_min_ratio = float(getattr(args, "audio_supervision_min_ratio", 0.9))
+        if audio_supervision_warmup_steps < 0:
+            raise ValueError(
+                f"audio_supervision_warmup_steps must be >= 0. Got: {audio_supervision_warmup_steps}"
+            )
+        if audio_supervision_check_interval <= 0:
+            raise ValueError(
+                f"audio_supervision_check_interval must be > 0. Got: {audio_supervision_check_interval}"
+            )
+        if not (0.0 <= audio_supervision_min_ratio <= 1.0):
+            raise ValueError(
+                f"audio_supervision_min_ratio must be in [0, 1]. Got: {audio_supervision_min_ratio}"
+            )
+        args.audio_supervision_mode = audio_supervision_mode
+        args.audio_supervision_warmup_steps = audio_supervision_warmup_steps
+        args.audio_supervision_check_interval = audio_supervision_check_interval
+        args.audio_supervision_min_ratio = audio_supervision_min_ratio
+
+        reset_audio_supervision_state(self._audio_supervision_state)
+
         apply_ltx2_tweaks(args)
 
     @property
@@ -820,7 +1147,19 @@ class LTX2NetworkTrainer(NetworkTrainer):
         return False
 
     def post_save_checkpoint_hook(self, args, ckpt_file, ckpt_name, accelerator, force_sync_upload=False):
-        """Convert saved LoRA to ComfyUI format"""
+        """Convert saved LoRA to ComfyUI format and save CREPA projector."""
+        # Save CREPA projector weights alongside LoRA checkpoint
+        if self._crepa is not None:
+            try:
+                from safetensors.torch import save_file
+                proj_sd = self._crepa.state_dict()
+                if proj_sd:
+                    proj_file = os.path.join(args.output_dir, "crepa_projector.safetensors")
+                    save_file(proj_sd, proj_file)
+                    accelerator.print(f"Saved CREPA projector: {proj_file}")
+            except Exception as e:
+                accelerator.print(f"Warning: Failed to save CREPA projector: {e}")
+
         if not getattr(args, 'convert_to_comfy', True):
             return
 
@@ -1422,6 +1761,18 @@ class LTX2NetworkTrainer(NetworkTrainer):
             if args.gradient_checkpointing:
                 text_mask = text_mask.to(torch.bool)
 
+        # Caption dropout: zero out text conditioning with probability p (for CFG training)
+        caption_dropout_rate = getattr(args, "caption_dropout_rate", 0.0)
+        if caption_dropout_rate > 0.0 and self.training:
+            text_embeds = text_embeds.clone()
+            if text_mask is not None:
+                text_mask = text_mask.clone()
+            for i in range(text_embeds.shape[0]):
+                if random.random() < caption_dropout_rate:
+                    text_embeds[i] = 0
+                    if text_mask is not None:
+                        text_mask[i] = False
+
         # Move latents to device
         latents = latents.to(device=accelerator.device, dtype=network_dtype)
         noise = noise.to(device=accelerator.device, dtype=network_dtype)
@@ -1438,7 +1789,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
             if isinstance(latents_info, dict):
                 frame_rate = latents_info.get("fps", None)
         if frame_rate is None:
-            frame_rate = 24
+            frame_rate = 25
         if isinstance(frame_rate, torch.Tensor):
             frame_rate = frame_rate.item() if frame_rate.numel() == 1 else frame_rate[0].item()
 
@@ -1452,6 +1803,15 @@ class LTX2NetworkTrainer(NetworkTrainer):
             model_timesteps = model_timesteps.unsqueeze(1)
 
         sigma = model_timesteps[:, 0]
+        audio_model_timesteps = model_timesteps
+        if self._ltx_mode in {"av", "audio"} and bool(getattr(args, "independent_audio_timestep", False)):
+            audio_model_timesteps = self._sample_independent_audio_timesteps(
+                args,
+                batch_size=model_timesteps.shape[0],
+                device=accelerator.device,
+                dtype=network_dtype,
+            )
+        audio_sigma = audio_model_timesteps[:, 0]
 
         ref_latents = batch.get("ref_latents")
         if ref_latents is None:
@@ -1494,7 +1854,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
 
             audio_latents = audio_latents.to(device=accelerator.device, dtype=network_dtype)
             audio_noise = torch.randn_like(audio_latents)
-            sigma_audio = sigma.view(-1, 1, 1, 1)
+            sigma_audio = audio_sigma.view(-1, 1, 1, 1)
             noisy_audio = (1.0 - sigma_audio) * audio_latents + sigma_audio * audio_noise
 
             dummy_video = torch.zeros(
@@ -1509,6 +1869,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 model_pred = transformer(
                     [dummy_video, noisy_audio],
                     timestep=model_timesteps,
+                    audio_timestep=audio_model_timesteps,
                     context=text_embeds,
                     attention_mask=text_mask,
                     frame_rate=frame_rate,
@@ -1577,6 +1938,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
             if out_audio["audio_loss_weight"] < 0.0:
                 raise ValueError(f"audio_loss_weight must be >= 0. Got: {out_audio['audio_loss_weight']}")
 
+            self._last_dit_inputs = None  # audio-only path — skip preservation
             return out_audio, torch.tensor(0.0, device=accelerator.device)
 
         first_frame_p = float(getattr(args, "ltx2_first_frame_conditioning_p", 0.0))
@@ -1631,7 +1993,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
 
             frame_rate_v2v = frame_rate
             if frame_rate_v2v is None:
-                frame_rate_v2v = 24
+                frame_rate_v2v = 25
 
             ref_frames = int(ref_latents.shape[2])
             tgt_frames = int(latents.shape[2])
@@ -1702,12 +2064,15 @@ class LTX2NetworkTrainer(NetworkTrainer):
             if out_v2v["video_loss_weight"] < 0.0:
                 raise ValueError(f"video_loss_weight must be >= 0. Got: {out_v2v['video_loss_weight']}")
 
+            self._last_dit_inputs = None  # reference-latent path — skip preservation
             return out_v2v, torch.tensor(0.0, device=accelerator.device)
 
         audio_latents = None
         audio_noise = None
         noisy_audio = None
         audio_enabled_for_batch = False
+        audio_regularizer_active = False
+        audio_expected_for_batch = self._ltx_mode == "av"
         audio_loss_mask = None
         if self._ltx_mode == "av":
             audio_latents = batch.get("audio_latents")
@@ -1715,15 +2080,31 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 audio_latents = audio_latents.get("latents")
 
             if audio_latents is None:
-                if not self._warned_missing_audio:
-                    logger.warning(
-                        "LTXAV mode: missing audio latents in this batch; skipping audio branch. "
-                        "Provide cached audio latents to train audio generation."
+                if bool(getattr(args, "audio_silence_regularizer", False)):
+                    audio_latents = self._build_empty_audio_latents(
+                        args=args,
+                        transformer=transformer,
+                        latents=latents,
+                        frame_rate=float(frame_rate),
+                        device=accelerator.device,
+                        dtype=network_dtype,
                     )
-                    self._warned_missing_audio = True
-            elif not isinstance(audio_latents, torch.Tensor):
-                raise TypeError(f"Expected audio_latents to be a torch.Tensor, got: {type(audio_latents)}")
-            else:
+                    audio_regularizer_active = True
+                    if not self._warned_missing_audio:
+                        logger.warning(
+                            "LTXAV mode: missing audio latents in this batch; using silence regularizer fallback."
+                        )
+                        self._warned_missing_audio = True
+                else:
+                    if not self._warned_missing_audio:
+                        logger.warning(
+                            "LTXAV mode: missing audio latents in this batch; skipping audio branch. "
+                            "Provide cached audio latents to train audio generation."
+                        )
+                        self._warned_missing_audio = True
+            if audio_latents is not None:
+                if not isinstance(audio_latents, torch.Tensor):
+                    raise TypeError(f"Expected audio_latents to be a torch.Tensor, got: {type(audio_latents)}")
                 if audio_latents.dim() != 4:
                     raise ValueError(f"Expected audio_latents to be 4D [B, C, T, F], got shape: {tuple(audio_latents.shape)}")
                 if audio_latents.shape[0] != latents.shape[0]:
@@ -1749,7 +2130,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
 
                 audio_enabled_for_batch = True
                 audio_noise = torch.randn_like(audio_latents)
-                sigma_audio = sigma.view(-1, 1, 1, 1)
+                sigma_audio = audio_sigma.view(-1, 1, 1, 1)
                 noisy_audio = (1.0 - sigma_audio) * audio_latents + sigma_audio * audio_noise
                 _check_finite("noisy_audio", noisy_audio)
                 _log_stats("noisy_audio", noisy_audio)
@@ -1763,6 +2144,22 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 half = text_embeds.shape[-1] // 2
                 text_embeds = text_embeds[..., :half]
 
+        if bool(getattr(transformer, "training", False)) and self._ltx_mode == "av":
+            supervision_alert = update_and_check_audio_supervision(
+                self._audio_supervision_state,
+                mode=str(getattr(args, "audio_supervision_mode", "off")),
+                warmup_steps=int(getattr(args, "audio_supervision_warmup_steps", 50)),
+                check_interval=int(getattr(args, "audio_supervision_check_interval", 50)),
+                min_ratio=float(getattr(args, "audio_supervision_min_ratio", 0.9)),
+                audio_expected_for_batch=audio_expected_for_batch,
+                audio_supervised_for_batch=audio_enabled_for_batch and not audio_regularizer_active,
+            )
+            if supervision_alert is not None:
+                message = format_audio_supervision_alert(supervision_alert)
+                if str(getattr(args, "audio_supervision_mode", "off")) == "error":
+                    raise ValueError(message)
+                logger.warning("%s Running in warning mode; training will continue.", message)
+
         if skip_nonfinite and nonfinite_flag["hit"]:
             return {"_skip_step": True, "skip_reason": nonfinite_flag["tag"]}, torch.tensor(
                 0.0, device=accelerator.device
@@ -1775,6 +2172,21 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 caption_channels = getattr(getattr(base_model, "caption_projection", None), "in_features", None)
         if caption_channels is not None:
             expected_last_dim = int(caption_channels) * (2 if audio_enabled_for_batch else 1)
+            if text_embeds.shape[-1] != expected_last_dim:
+                if (
+                    self._ltx_mode == "av"
+                    and audio_enabled_for_batch
+                    and audio_regularizer_active
+                    and text_embeds.shape[-1] * 2 == expected_last_dim
+                ):
+                    text_embeds = torch.cat([text_embeds, text_embeds], dim=-1)
+                    expected_last_dim = text_embeds.shape[-1]
+                else:
+                    raise ValueError(
+                        f"Text embedding dim mismatch for {'LTXAV' if self._audio_video else 'LTXV'}: "
+                        f"got {text_embeds.shape[-1]}, expected {expected_last_dim}. "
+                        f"(caption_channels={caption_channels})"
+                    )
             if text_embeds.shape[-1] != expected_last_dim:
                 raise ValueError(
                     f"Text embedding dim mismatch for {'LTXAV' if self._audio_video else 'LTXV'}: "
@@ -1808,16 +2220,31 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 if frames > 0:
                     video_loss_mask[video_conditioning_enabled, 0] = False
 
+        resolved_transformer_options = transformer_options if video_conditioning_mask_tokens is not None else {"patches_replace": {}}
+
+        # Store inputs for preservation techniques (no-op when flag is off)
+        if self._preservation_active:
+            self._last_dit_inputs = {
+                "model_input": model_input,
+                "model_timesteps": model_timesteps,
+                "audio_model_timesteps": audio_model_timesteps if audio_enabled_for_batch else None,
+                "text_embeds": text_embeds,
+                "text_mask": text_mask,
+                "frame_rate": frame_rate,
+                "transformer_options": resolved_transformer_options,
+            }
+
         if getattr(args, "fp8_base", False) or getattr(args, "fp8_scaled", False):
             self._ensure_fp8_buffers_on_device(transformer)
         with accelerator.autocast():
             model_pred = transformer(
                 model_input,
                 timestep=model_timesteps,
+                audio_timestep=audio_model_timesteps if audio_enabled_for_batch else None,
                 context=text_embeds,
                 attention_mask=text_mask,
                 frame_rate=frame_rate,
-                transformer_options=transformer_options if video_conditioning_mask_tokens is not None else {"patches_replace": {}},
+                transformer_options=resolved_transformer_options,
             )
 
         video_pred = model_pred
@@ -1895,7 +2322,12 @@ class LTX2NetworkTrainer(NetworkTrainer):
                     "audio_pred": audio_pred,
                     "audio_target": audio_target,
                     "audio_loss_mask": audio_loss_mask,
-                    "audio_loss_weight": float(getattr(args, "audio_loss_weight", 1.0)),
+                    "audio_loss_weight": float(getattr(args, "audio_loss_weight", 1.0))
+                    * (
+                        float(getattr(args, "audio_silence_regularizer_weight", 1.0))
+                        if audio_regularizer_active
+                        else 1.0
+                    ),
                 }
             )
             if out["audio_loss_weight"] < 0.0:
@@ -1966,41 +2398,130 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 "Sample prompt count does not match precached embeddings "
                 f"(prompts={len(sample_params)} cache={len(cached_params)})."
             )
+
+        def _normalize_text(value: Optional[str]) -> str:
+            if value is None:
+                return ""
+            return " ".join(str(value).split())
+
         for idx, param in enumerate(sample_params):
             cache_entry = cached_params[idx]
             if not isinstance(cache_entry, dict):
                 raise ValueError(f"Invalid cache entry at {idx} ({cache_path})")
+
+            cfg_scale = param.get("cfg_scale", None)
+            guidance_scale = param.get("guidance_scale", self.default_guidance_scale)
+            effective_cfg_scale = cfg_scale if cfg_scale is not None else guidance_scale
+            try:
+                requires_negative_embed = float(effective_cfg_scale) != 1.0
+            except (TypeError, ValueError):
+                requires_negative_embed = False
+
+            expected_prompt = _normalize_text(param.get("prompt", ""))
+            cached_prompt = _normalize_text(cache_entry.get("prompt", ""))
+            if expected_prompt != cached_prompt:
+                raise ValueError(
+                    "Prompt text mismatch with precached embeddings at index "
+                    f"{idx} ({cache_path}). Rebuild sample prompt cache or disable "
+                    "--use_precached_sample_prompts.\n"
+                    f"Current: {param.get('prompt', '')}\n"
+                    f"Cached : {cache_entry.get('prompt', '')}"
+                )
+
+            expected_negative = _normalize_text(param.get("negative_prompt", ""))
+            cached_negative = _normalize_text(cache_entry.get("negative_prompt", ""))
+            if expected_negative != cached_negative:
+                raise ValueError(
+                    "Negative prompt mismatch with precached embeddings at index "
+                    f"{idx} ({cache_path}). Rebuild sample prompt cache or disable "
+                    "--use_precached_sample_prompts.\n"
+                    f"Current: {param.get('negative_prompt', '')}\n"
+                    f"Cached : {cache_entry.get('negative_prompt', '')}"
+                )
+
             if cache_entry.get("prompt_embeds") is None or cache_entry.get("prompt_attention_mask") is None:
                 raise ValueError(f"Missing prompt embeddings in cache entry {idx} ({cache_path})")
             param["prompt_embeds"] = cache_entry["prompt_embeds"]
             param["prompt_attention_mask"] = cache_entry["prompt_attention_mask"]
-            if param.get("negative_prompt"):
+            if requires_negative_embed or param.get("negative_prompt"):
                 if cache_entry.get("negative_prompt_embeds") is None or cache_entry.get(
                     "negative_prompt_attention_mask"
                 ) is None:
-                    raise ValueError(f"Missing negative prompt embeddings in cache entry {idx} ({cache_path})")
+                    raise ValueError(
+                        "Missing negative prompt embeddings in cache entry "
+                        f"{idx} ({cache_path}); this prompt needs CFG (guidance/cfg != 1), "
+                        "so negative embeddings must be precached."
+                    )
                 param["negative_prompt_embeds"] = cache_entry["negative_prompt_embeds"]
                 param["negative_prompt_attention_mask"] = cache_entry["negative_prompt_attention_mask"]
 
         return sample_params
 
-    def _resolve_default_sample_prompts_cache(self, args: argparse.Namespace) -> str:
+    def _load_precached_sample_latents(self, args: argparse.Namespace, sample_params: List[Dict]) -> None:
+        """Load precached I2V conditioning latents and merge into sample_params (in-place)."""
+        cache_path = getattr(args, "sample_latents_cache", None) or self._resolve_default_sample_latents_cache(args)
+        if not os.path.exists(cache_path):
+            raise FileNotFoundError(f"Precached I2V latents not found: {cache_path}")
+
+        logger.info(f"Loading precached I2V conditioning latents from {cache_path}")
+        try:
+            latent_payload = torch.load(cache_path, map_location="cpu")
+            latent_cache = latent_payload.get("latent_cache", [])
+
+            # Match latents with prompts by index
+            matched_count = 0
+            for entry in latent_cache:
+                prompt_idx = entry.get("prompt_index")
+                if prompt_idx is not None and 0 <= prompt_idx < len(sample_params):
+                    sample_params[prompt_idx]["conditioning_latent"] = entry["conditioning_latent"]
+                    matched_count += 1
+
+            logger.info(f"Loaded {matched_count}/{len(latent_cache)} I2V conditioning latents")
+        except Exception as e:
+            raise RuntimeError(f"Failed to load I2V latents cache: {e}")
+
+    def _resolve_first_dataset_cache_directory(self, args: argparse.Namespace) -> str:
         from musubi_tuner.dataset import config_utils
         from musubi_tuner.dataset.config_utils import BlueprintGenerator, ConfigSanitizer
         from musubi_tuner.dataset.image_video_dataset import ARCHITECTURE_LTX2
 
-        if not getattr(args, "dataset_config", None):
-            raise ValueError("--dataset_config is required to resolve the sample prompt cache directory")
-        user_config = config_utils.load_user_config(args.dataset_config)
-        blueprint = BlueprintGenerator(ConfigSanitizer()).generate(user_config, args, architecture=ARCHITECTURE_LTX2)
-        dataset_group = config_utils.generate_dataset_group_by_blueprint(blueprint.dataset_group)
-        datasets = dataset_group.datasets
-        if not datasets:
-            raise ValueError("No datasets available to resolve sample prompt cache directory")
-        cache_dir = getattr(datasets[0], "cache_directory", None)
-        if not cache_dir:
-            raise ValueError("First dataset has no cache_directory; set cache_directory in dataset config")
+        if getattr(args, "dataset_manifest", None):
+            dataset_manifest = config_utils.load_dataset_manifest(args.dataset_manifest)
+            manifest_architecture = dataset_manifest.get("architecture")
+            if manifest_architecture is not None and manifest_architecture != ARCHITECTURE_LTX2:
+                raise ValueError(
+                    f"dataset manifest architecture mismatch: expected '{ARCHITECTURE_LTX2}', got '{manifest_architecture}'"
+                )
+            datasets = dataset_manifest.get("datasets", [])
+            if not datasets:
+                raise ValueError("No datasets available in dataset manifest to resolve sample cache directory")
+            cache_dir = datasets[0].get("params", {}).get("cache_directory")
+            if not cache_dir:
+                raise ValueError("First manifest dataset has no cache_directory")
+            return str(cache_dir)
+
+        if getattr(args, "dataset_config", None):
+            user_config = config_utils.load_user_config(args.dataset_config)
+            blueprint = BlueprintGenerator(ConfigSanitizer()).generate(user_config, args, architecture=ARCHITECTURE_LTX2)
+            dataset_group = config_utils.generate_dataset_group_by_blueprint(blueprint.dataset_group)
+            datasets = dataset_group.datasets
+            if not datasets:
+                raise ValueError("No datasets available to resolve sample cache directory")
+            cache_dir = getattr(datasets[0], "cache_directory", None)
+            if not cache_dir:
+                raise ValueError("First dataset has no cache_directory; set cache_directory in dataset config")
+            return cache_dir
+
+        raise ValueError("--dataset_config or --dataset_manifest is required to resolve sample cache directory")
+
+    def _resolve_default_sample_prompts_cache(self, args: argparse.Namespace) -> str:
+        cache_dir = self._resolve_first_dataset_cache_directory(args)
         return os.path.join(cache_dir, DEFAULT_SAMPLE_PROMPTS_CACHE)
+
+    def _resolve_default_sample_latents_cache(self, args: argparse.Namespace) -> str:
+        """Resolve default path for sample latents cache (same directory as prompts cache)."""
+        cache_dir = self._resolve_first_dataset_cache_directory(args)
+        return os.path.join(cache_dir, DEFAULT_SAMPLE_LATENTS_CACHE)
 
     def process_sample_prompts(
         self,
@@ -2014,14 +2535,21 @@ class LTX2NetworkTrainer(NetworkTrainer):
         )
         if use_precached:
             logger.info("LTX-2 sampling: using precached Gemma embeddings for sample prompts")
-            return self._load_precached_sample_prompts(args)
+            sample_params = self._load_precached_sample_prompts(args)
+        else:
+            logger.info("LTX-2 sampling: deferring Gemma encoding until sampling")
+            prompts = load_prompts(sample_prompts)
+            if not prompts:
+                return None
+            sample_params = self._apply_sample_defaults(args, prompts)
 
-        logger.info("LTX-2 sampling: deferring Gemma encoding until sampling")
-        prompts = load_prompts(sample_prompts)
-        if not prompts:
-            return None
+        # Load precached I2V latents if requested (independent of text embedding caching)
+        use_precached_latents = bool(getattr(args, "use_precached_sample_latents", False))
+        if use_precached_latents:
+            logger.info("LTX-2 sampling: using precached I2V conditioning latents")
+            self._load_precached_sample_latents(args, sample_params)
 
-        return self._apply_sample_defaults(args, prompts)
+        return sample_params
 
     def _build_text_encoder(self, args: argparse.Namespace, accelerator: Accelerator) -> torch.dtype:
         logger.info("Loading Gemma text encoder for LTX-2 sampling")
@@ -2201,25 +2729,55 @@ class LTX2NetworkTrainer(NetworkTrainer):
 
         def prepare_all_embeddings_batch(sample_params_list: List[Dict]) -> None:
             """Load text encoder once and encode ALL prompts before unloading."""
-            # Check if any prompt needs embeddings
-            needs_encoding = any(p.get("prompt_embeds") is None for p in sample_params_list)
-            if not needs_encoding:
+            def _requires_negative_embeddings(sample_parameter: Dict) -> bool:
+                cfg_scale = sample_parameter.get("cfg_scale", None)
+                guidance_scale = sample_parameter.get("guidance_scale", self.default_guidance_scale)
+                effective_cfg_scale = cfg_scale if cfg_scale is not None else guidance_scale
+                try:
+                    return float(effective_cfg_scale) != 1.0
+                except (TypeError, ValueError):
+                    return False
+
+            missing_indices = []
+            for idx, sample_parameter in enumerate(sample_params_list):
+                needs_prompt = sample_parameter.get("prompt_embeds") is None
+                needs_negative = _requires_negative_embeddings(sample_parameter) and sample_parameter.get(
+                    "negative_prompt_embeds"
+                ) is None
+                if needs_prompt or needs_negative:
+                    missing_indices.append(idx)
+
+            if not missing_indices:
                 return
+
+            strict_precached = bool(getattr(args, "use_precached_sample_prompts", False)) or bool(
+                getattr(args, "precache_sample_prompts", False)
+            )
+            if strict_precached:
+                preview = ",".join(str(i) for i in missing_indices[:10])
+                if len(missing_indices) > 10:
+                    preview += ",..."
+                raise ValueError(
+                    "Precached sample prompt embeddings are incomplete; refusing to load Gemma during training. "
+                    f"Missing prompt/negative embeddings for sample indices [{preview}]. "
+                    "Rebuild sample prompt cache with ltx2_cache_text_encoder_outputs.py."
+                )
 
             text_encoder_dtype = self._build_text_encoder(args, accelerator)
             logger.info("Sampling batch: loaded text encoder for %d prompts", len(sample_params_list))
 
             for sample_parameter in sample_params_list:
-                if sample_parameter.get("prompt_embeds") is not None:
-                    continue  # Already has embeddings
+                if sample_parameter.get("prompt_embeds") is None:
+                    prompt_text = sample_parameter.get("prompt", "")
+                    prompt_embeds, prompt_mask = self._encode_prompt_text(accelerator, prompt_text, text_encoder_dtype)
+                    sample_parameter["prompt_embeds"] = prompt_embeds
+                    sample_parameter["prompt_attention_mask"] = prompt_mask
 
-                prompt_text = sample_parameter.get("prompt", "")
-                prompt_embeds, prompt_mask = self._encode_prompt_text(accelerator, prompt_text, text_encoder_dtype)
-                sample_parameter["prompt_embeds"] = prompt_embeds
-                sample_parameter["prompt_attention_mask"] = prompt_mask
-
-                negative_prompt = sample_parameter.get("negative_prompt", None)
-                if negative_prompt:
+                if _requires_negative_embeddings(sample_parameter) and sample_parameter.get("negative_prompt_embeds") is None:
+                    negative_prompt = sample_parameter.get("negative_prompt")
+                    if negative_prompt is None:
+                        negative_prompt = ""
+                        sample_parameter["negative_prompt"] = negative_prompt
                     neg_embeds, neg_mask = self._encode_prompt_text(accelerator, negative_prompt, text_encoder_dtype)
                     sample_parameter["negative_prompt_embeds"] = neg_embeds
                     sample_parameter["negative_prompt_attention_mask"] = neg_mask
@@ -2358,6 +2916,88 @@ class LTX2NetworkTrainer(NetworkTrainer):
             transformer.move_to_device_except_swap_blocks(accelerator.device)
         self._cleanup_cuda(accelerator.device)
 
+    def _load_and_encode_conditioning_image(
+        self,
+        image_path: str,
+        target_height: int,
+        target_width: int,
+        vae_checkpoint_path: str,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Load image from disk and encode through VAE for I2V conditioning.
+
+        Args:
+            image_path: Path to conditioning image (absolute or relative to working directory)
+            target_height: Target video height (image will be resized)
+            target_width: Target video width (image will be resized)
+            vae_checkpoint_path: Path to VAE checkpoint
+            device: Target device
+            dtype: Target dtype
+
+        Returns:
+            Encoded image latent tensor [1, C, 1, H_latent, W_latent]
+        """
+        from PIL import Image
+        import torchvision.transforms.functional as TF
+
+        if not os.path.exists(image_path):
+            raise FileNotFoundError(f"I2V conditioning image not found: {image_path}")
+
+        logger.info(f"Loading I2V conditioning image: {image_path}")
+
+        # Load and resize image with official-style "cover + center crop" behavior.
+        # This preserves aspect ratio (unlike direct resize) and matches LTX-2 validation sampler.
+        image = Image.open(image_path).convert("RGB")
+        current_width, current_height = image.size
+        if current_height != target_height or current_width != target_width:
+            aspect_ratio = current_width / current_height
+            target_aspect_ratio = target_width / target_height
+
+            if aspect_ratio > target_aspect_ratio:
+                resize_height = target_height
+                resize_width = max(target_width, int(round(target_height * aspect_ratio)))
+            else:
+                resize_width = target_width
+                resize_height = max(target_height, int(round(target_width / aspect_ratio)))
+
+            image = image.resize((resize_width, resize_height), Image.LANCZOS)
+            left = max((resize_width - target_width) // 2, 0)
+            top = max((resize_height - target_height) // 2, 0)
+            image = image.crop((left, top, left + target_width, top + target_height))
+
+        # Convert to tensor and normalize to [-1, 1]
+        image_tensor = TF.to_tensor(image).unsqueeze(0)  # [1, 3, H, W]
+        image_tensor = (image_tensor * 2.0 - 1.0).to(device=device, dtype=dtype)
+
+        # Add temporal dimension for VAE encoder: [B, C, T, H, W]
+        image_tensor = image_tensor.unsqueeze(2)  # [1, 3, 1, H, W]
+
+        # Load VAE encoder (training only loads decoder, we need encoder for I2V)
+        # Same approach as ltx2_cache_latents.py
+        from musubi_tuner.ltx_2.loader.single_gpu_model_builder import SingleGPUModelBuilder
+        from musubi_tuner.ltx_2.model.video_vae import VideoEncoderConfigurator, VAE_ENCODER_COMFY_KEYS_FILTER
+
+        logger.info("Loading VAE encoder for I2V conditioning")
+        vae_encoder = SingleGPUModelBuilder(
+            model_path=str(vae_checkpoint_path),
+            model_class_configurator=VideoEncoderConfigurator,
+            model_sd_ops=VAE_ENCODER_COMFY_KEYS_FILTER,
+        ).build(device=device, dtype=dtype)
+        vae_encoder.eval()
+
+        # Encode through VAE encoder
+        with torch.no_grad():
+            latent = vae_encoder(image_tensor)  # [1, C, 1, H_latent, W_latent]
+
+        logger.info(f"Encoded I2V conditioning image to latent shape: {latent.shape}")
+
+        # Clean up encoder to free VRAM
+        del vae_encoder
+        clean_memory_on_device(device)
+
+        return latent
+
     def sample_image_inference(
         self,
         accelerator: Accelerator,
@@ -2373,6 +3013,58 @@ class LTX2NetworkTrainer(NetworkTrainer):
         vocoder=None,
     ):
         """LTX-2-specific sampling with proper frame/size rounding."""
+
+        # ===== PHASE 1: I2V Image Encoding (if needed) =====
+        # Do this FIRST, before loading any other models, to respect --sample_with_offloading
+        # This ensures only VAE encoder is in VRAM during encoding, then it's cleaned up completely
+        conditioning_latent = None
+        image_path = sample_parameter.get("image_path", None)
+
+        # Check if we have a precached conditioning latent first
+        if "conditioning_latent" in sample_parameter:
+            conditioning_latent = sample_parameter["conditioning_latent"]
+            if conditioning_latent is not None:
+                device = accelerator.device
+                conditioning_latent = conditioning_latent.to(device=device, dtype=dit_dtype)
+                logger.info(f"I2V: Using precached conditioning latent (shape: {conditioning_latent.shape})")
+                image_path = None  # Skip encoding since we have precached latent
+
+        if image_path:
+            logger.info("=" * 60)
+            logger.info("I2V CONDITIONING: Loading and encoding image (Phase 1)")
+            logger.info("=" * 60)
+            try:
+                vae_checkpoint = getattr(args, "vae", None) or getattr(args, "ltx2_checkpoint", None)
+                if not vae_checkpoint:
+                    raise ValueError("VAE checkpoint path required for I2V conditioning (--vae or --ltx2_checkpoint)")
+
+                # Get target dimensions (need to calculate them early)
+                device = accelerator.device
+                # Use default VAE factors if vae not loaded yet
+                spatial_factor = 32
+                temporal_factor = 8
+                width = sample_parameter.get("width", 768)
+                height = sample_parameter.get("height", 512)
+                width = (width // spatial_factor) * spatial_factor
+                height = (height // spatial_factor) * spatial_factor
+
+                conditioning_latent = self._load_and_encode_conditioning_image(
+                    image_path=image_path,
+                    target_height=height,
+                    target_width=width,
+                    vae_checkpoint_path=vae_checkpoint,
+                    device=device,
+                    dtype=dit_dtype,
+                )
+                logger.info("I2V: Conditioning image loaded and encoded successfully")
+                logger.info("=" * 60)
+            except Exception as e:
+                logger.error(f"I2V: Failed to load conditioning image '{image_path}': {e}")
+                logger.warning("I2V: Continuing without image conditioning")
+                logger.info("=" * 60)
+                conditioning_latent = None
+
+        # ===== PHASE 2: Normal Sampling Setup =====
         lora_count = self._ensure_lora_enabled_for_sampling(transformer)
         if lora_count:
             logger.info("Sampling: LoRA modules active in transformer: %s", lora_count)
@@ -2428,6 +3120,12 @@ class LTX2NetworkTrainer(NetworkTrainer):
         prompt: str = sample_parameter.get("prompt", "")
         cfg_scale = sample_parameter.get("cfg_scale", None)
         negative_prompt = sample_parameter.get("negative_prompt", None)
+        effective_cfg_scale = cfg_scale if cfg_scale is not None else guidance_scale
+        do_classifier_free_guidance = float(effective_cfg_scale) != 1.0
+        if do_classifier_free_guidance and negative_prompt is None:
+            # Official CFG path still uses unconditional embedding (empty prompt).
+            negative_prompt = ""
+            sample_parameter["negative_prompt"] = negative_prompt
 
         spatial_factor = int(getattr(vae, "spatial_downsample_factor", 32))
         temporal_factor = int(getattr(vae, "temporal_downsample_factor", 8))
@@ -2436,19 +3134,37 @@ class LTX2NetworkTrainer(NetworkTrainer):
         frame_count = (frame_count - 1) // temporal_factor * temporal_factor + 1
 
         loaded_text_encoder = False
+        strict_precached = bool(getattr(args, "use_precached_sample_prompts", False)) or bool(
+            getattr(args, "precache_sample_prompts", False)
+        )
+        missing_prompt_embeds = sample_parameter.get("prompt_embeds") is None
+        missing_negative_embeds = do_classifier_free_guidance and sample_parameter.get("negative_prompt_embeds") is None
+        if strict_precached and (missing_prompt_embeds or missing_negative_embeds):
+            missing_parts = []
+            if missing_prompt_embeds:
+                missing_parts.append("prompt")
+            if missing_negative_embeds:
+                missing_parts.append("negative")
+            missing_desc = "/".join(missing_parts)
+            raise ValueError(
+                "Precached sample prompt embeddings are incomplete; refusing to load Gemma during training. "
+                f"Missing {missing_desc} embeddings for sample index {sample_parameter.get('enum', 0)}. "
+                "Rebuild sample prompt cache with ltx2_cache_text_encoder_outputs.py."
+            )
+
         if sample_parameter.get("prompt_embeds") is None:
             text_encoder_dtype = self._build_text_encoder(args, accelerator)
             prompt_embeds, prompt_mask = self._encode_prompt_text(accelerator, prompt, text_encoder_dtype)
             sample_parameter["prompt_embeds"] = prompt_embeds
             sample_parameter["prompt_attention_mask"] = prompt_mask
-            if negative_prompt:
+            if do_classifier_free_guidance and sample_parameter.get("negative_prompt_embeds") is None:
                 neg_embeds, neg_mask = self._encode_prompt_text(
                     accelerator, negative_prompt, text_encoder_dtype
                 )
                 sample_parameter["negative_prompt_embeds"] = neg_embeds
                 sample_parameter["negative_prompt_attention_mask"] = neg_mask
             loaded_text_encoder = True
-        elif negative_prompt and sample_parameter.get("negative_prompt_embeds") is None:
+        elif do_classifier_free_guidance and sample_parameter.get("negative_prompt_embeds") is None:
             text_encoder_dtype = self._build_text_encoder(args, accelerator)
             neg_embeds, neg_mask = self._encode_prompt_text(
                 accelerator, negative_prompt, text_encoder_dtype
@@ -2477,9 +3193,10 @@ class LTX2NetworkTrainer(NetworkTrainer):
         if seed is not None:
             logger.info(f"seed: {seed}")
 
-        do_classifier_free_guidance = False
-        if negative_prompt is not None:
-            do_classifier_free_guidance = True
+        # (I2V encoding now happens at the start of the method, before any model loading)
+
+        do_classifier_free_guidance = float(effective_cfg_scale) != 1.0
+        if do_classifier_free_guidance:
             logger.info(f"negative prompt: {negative_prompt}")
             logger.info(f"cfg scale: {cfg_scale}")
 
@@ -2524,6 +3241,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 seed=seed,
                 generator=generator,
                 spatial_upsampler_path=spatial_upsampler_path,
+                conditioning_latent=conditioning_latent,
                 distilled_lora_path=distilled_lora_path,
                 stage2_steps=int(getattr(args, "sample_stage2_steps", 3)),
                 audio_decoder=audio_decoder,
@@ -2559,6 +3277,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 enable_audio_preview=enable_audio_preview,
                 decode_video=not audio_only_preview,
                 audio_only=audio_only_preview,
+                conditioning_latent=conditioning_latent,
             )
 
         if not has_self_ref_orig_mod:
@@ -2646,6 +3365,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
         enable_audio_preview: bool = False,
         decode_video: bool = True,
         audio_only: bool = False,
+        conditioning_latent: Optional[torch.Tensor] = None,
     ):
         """Generate sample video during training using LTX-2 denoising loop"""
         from musubi_tuner.modules.scheduling_flow_match_discrete import FlowMatchDiscreteScheduler
@@ -2783,6 +3503,59 @@ class LTX2NetworkTrainer(NetworkTrainer):
             generator=generator,
         )
 
+        # Setup I2V conditioning mask if provided
+        denoise_mask = None
+        clean_latent = None
+        i2v_conditioning_mask_tokens = None
+        use_i2v_token_timestep_mask = bool(getattr(args, "sample_i2v_token_timestep_mask", True))
+        if conditioning_latent is not None:
+            # Validate conditioning_latent shape
+            if conditioning_latent.dim() != 5:
+                logger.warning(f"I2V: conditioning_latent has wrong dimensions {conditioning_latent.shape}, expected [B,C,T,H,W]. Skipping I2V conditioning.")
+            elif conditioning_latent.shape[2] != 1:
+                logger.warning(f"I2V: conditioning_latent has {conditioning_latent.shape[2]} frames, expected 1. Skipping I2V conditioning.")
+            elif latents.shape[2] < 1:
+                logger.warning(f"I2V: Video latents have no temporal frames. Skipping I2V conditioning.")
+            elif conditioning_latent.shape[1] != latents.shape[1]:
+                logger.warning(f"I2V: Channel dimension mismatch - conditioning {conditioning_latent.shape[1]} vs latents {latents.shape[1]}. Skipping I2V conditioning.")
+            elif conditioning_latent.shape[-2:] != latents.shape[-2:]:
+                logger.warning(f"I2V: Spatial dimension mismatch - conditioning {conditioning_latent.shape[-2:]} vs latents {latents.shape[-2:]}. Skipping I2V conditioning.")
+            else:
+                try:
+                    cond_on_device = conditioning_latent.to(device=latents.device, dtype=latents.dtype)
+
+                    # CRITICAL: Initialize first frame of latents with conditioning image
+                    # This ensures the first frame starts as the conditioning, not random noise
+                    latents[:, :, 0:1, :, :] = cond_on_device
+
+                    # Create denoise_mask: 0.0 for first frame (locked), 1.0 for others (denoised)
+                    denoise_mask = torch.ones_like(latents)
+                    denoise_mask[:, :, 0:1, :, :] = 0.0
+
+                    # Store clean conditioning latent (will be blended back at each step)
+                    clean_latent = torch.zeros_like(latents)
+                    clean_latent[:, :, 0:1, :, :] = cond_on_device
+
+                    if use_i2v_token_timestep_mask:
+                        bsz, _c, frames, h_lat, w_lat = latents.shape
+                        seq_len = frames * h_lat * w_lat
+                        first_frame_tokens = h_lat * w_lat
+                        i2v_conditioning_mask_tokens = torch.zeros(
+                            (bsz, seq_len),
+                            device=latents.device,
+                            dtype=torch.bool,
+                        )
+                        if first_frame_tokens > 0:
+                            i2v_conditioning_mask_tokens[:, :first_frame_tokens] = True
+                        logger.info("I2V: enabled token timestep mask for conditioned first-frame tokens")
+
+                    logger.info(f"I2V: Initialized first frame conditioning (shape: {conditioning_latent.shape})")
+                except Exception as e:
+                    logger.error(f"I2V: Failed to setup conditioning: {e}", exc_info=True)
+                    denoise_mask = None
+                    clean_latent = None
+                    i2v_conditioning_mask_tokens = None
+
         # Setup scheduler - official pipeline does NOT pass latent, uses default MAX_SHIFT_ANCHOR=4096
         ltx2_scheduler = LTX2Scheduler()
         sigmas = ltx2_scheduler.execute(steps=sample_steps).to(device=transformer_device, dtype=torch.float32)
@@ -2840,6 +3613,16 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 # Prepare timestep (sigma in [0, 1])
                 timestep_for_model = sigma.expand(latent_model_input.shape[0]).to(device=transformer_device, dtype=dit_dtype)
 
+                resolved_transformer_options = {"patches_replace": {}}
+                if i2v_conditioning_mask_tokens is not None:
+                    video_conditioning_mask_tokens = i2v_conditioning_mask_tokens
+                    if do_classifier_free_guidance:
+                        video_conditioning_mask_tokens = torch.cat(
+                            [video_conditioning_mask_tokens, video_conditioning_mask_tokens],
+                            dim=0,
+                        )
+                    resolved_transformer_options["video_conditioning_mask"] = video_conditioning_mask_tokens
+
                 # Model prediction
                 if self._audio_video and audio_model_input is not None:
                     model_input = [latent_model_input, audio_model_input]
@@ -2852,7 +3635,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
                     context=prompt_embeds,
                     attention_mask=prompt_mask,
                     frame_rate=sample_parameter.get("frame_rate", 25),
-                    transformer_options={},
+                    transformer_options=resolved_transformer_options,
                     audio_only=audio_only,
                 )
 
@@ -2867,20 +3650,32 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 # and CFG is applied to denoised (x0) outputs, not velocity predictions
                 video_pred = video_pred.to(dtype=latents.dtype)
 
+                sigma_for_video = denoise_mask * sigma if denoise_mask is not None else sigma
+
                 if do_classifier_free_guidance:
                     effective_cfg_scale = cfg_scale if cfg_scale is not None else guidance_scale
                     # Split velocity predictions for CFG
                     vel_uncond, vel_cond = video_pred.chunk(2)
                     # Convert each to x0
-                    x0_uncond = X0PredictionWrapper.velocity_to_x0(latents, vel_uncond, sigma.item())
-                    x0_cond = X0PredictionWrapper.velocity_to_x0(latents, vel_cond, sigma.item())
+                    x0_uncond = X0PredictionWrapper.velocity_to_x0(latents, vel_uncond, sigma_for_video)
+                    x0_cond = X0PredictionWrapper.velocity_to_x0(latents, vel_cond, sigma_for_video)
                     # Apply CFG to x0 (official formula)
                     video_x0 = x0_uncond + effective_cfg_scale * (x0_cond - x0_uncond)
                 else:
-                    video_x0 = X0PredictionWrapper.velocity_to_x0(latents, video_pred, sigma.item())
+                    video_x0 = X0PredictionWrapper.velocity_to_x0(latents, video_pred, sigma_for_video)
+
+                if denoise_mask is not None and clean_latent is not None:
+                    # Official LTX-2 ordering: blend denoised x0 before Euler step.
+                    video_x0 = video_x0 * denoise_mask + clean_latent * (1.0 - denoise_mask)
 
                 # Euler step to next latent
                 latents = stepper.step(latents, video_x0, sigmas, step_idx)
+
+                # CRITICAL: Hard-lock conditioned frames after Euler step
+                # The Euler step performs gradual correction, but I2V requires absolute locking
+                if denoise_mask is not None and clean_latent is not None:
+                    # Restore locked frames: where denoise_mask == 0.0, force latents = clean_latent
+                    latents = latents * denoise_mask + clean_latent * (1.0 - denoise_mask)
 
                 if audio_pred is not None and audio_latents is not None:
                     audio_pred = audio_pred.to(dtype=audio_latents.dtype)
@@ -2892,6 +3687,12 @@ class LTX2NetworkTrainer(NetworkTrainer):
                     else:
                         audio_x0 = X0PredictionWrapper.velocity_to_x0(audio_latents, audio_pred, sigma.item())
                     audio_latents = stepper.step(audio_latents, audio_x0, sigmas, step_idx)
+
+        # Free I2V conditioning tensors to reclaim memory before VAE decode
+        if denoise_mask is not None or clean_latent is not None:
+            del denoise_mask, clean_latent
+            if transformer_device.type == "cuda":
+                torch.cuda.empty_cache()
 
         if offload_transformer_for_decode and transformer_device != transformer_offload_device:
             if hasattr(transformer, "move_to_device_except_swap_blocks"):
@@ -3031,6 +3832,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
         enable_audio_preview: bool = False,
         decode_video: bool = True,
         audio_only: bool = False,
+        conditioning_latent: Optional[torch.Tensor] = None,
     ):
         """Generate sample video using two-stage inference (half-res + upsample + refine)."""
         device = accelerator.device
@@ -3094,6 +3896,8 @@ class LTX2NetworkTrainer(NetworkTrainer):
             prompt_attention_mask=prompt_mask,
             negative_prompt_embeds=negative_embeds,
             negative_prompt_attention_mask=negative_mask,
+            conditioning_latent=conditioning_latent,
+            use_i2v_token_timestep_mask=bool(getattr(args, "sample_i2v_token_timestep_mask", True)),
             offload_between_stages=bool(getattr(args, "sample_with_offloading", False)),
             extra={"audio_config": audio_config} if audio_config else {},
         )
@@ -3170,7 +3974,7 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         "--ltx2_mode", "--ltx_mode",
         dest="ltx_mode",
         type=str,
-        default="video",
+        default="v",
         choices=["video", "av", "audio", "v", "a", "va"],
         help="Training modality.",
     )
@@ -3242,7 +4046,143 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         default=1.0,
         help="Weight applied to the audio diffusion loss.",
     )
+    parser.add_argument(
+        "--audio_loss_balance_mode",
+        type=str,
+        default="none",
+        choices=["none", "inv_freq", "ema_mag"],
+        help=(
+            "Optional dynamic balancing for audio loss. "
+            "'none' keeps static --audio_loss_weight; "
+            "'inv_freq' scales audio weight by inverse EMA of audio-batch frequency; "
+            "'ema_mag' matches audio loss magnitude to a target fraction of video loss."
+        ),
+    )
+    parser.add_argument(
+        "--audio_loss_balance_beta",
+        type=float,
+        default=0.01,
+        help="EMA update factor for audio-batch frequency when --audio_loss_balance_mode=inv_freq.",
+    )
+    parser.add_argument(
+        "--audio_loss_balance_eps",
+        type=float,
+        default=0.05,
+        help="Minimum denominator for inverse-frequency audio weighting (prevents extreme weights).",
+    )
+    parser.add_argument(
+        "--audio_loss_balance_min",
+        type=float,
+        default=1.0,
+        help="Minimum clamp for effective audio loss weight after inverse-frequency scaling.",
+    )
+    parser.add_argument(
+        "--audio_loss_balance_max",
+        type=float,
+        default=4.0,
+        help="Maximum clamp for effective audio loss weight after inverse-frequency scaling.",
+    )
+    parser.add_argument(
+        "--audio_loss_balance_ema_init",
+        type=float,
+        default=1.0,
+        help="Initial EMA value used by audio loss balancing modes.",
+    )
+    parser.add_argument(
+        "--audio_loss_balance_target_ratio",
+        type=float,
+        default=0.33,
+        help="Target audio/video loss magnitude ratio when --audio_loss_balance_mode=ema_mag.",
+    )
+    parser.add_argument(
+        "--audio_loss_balance_ema_decay",
+        type=float,
+        default=0.99,
+        help="EMA decay for loss magnitude tracking when --audio_loss_balance_mode=ema_mag.",
+    )
+    parser.add_argument(
+        "--independent_audio_timestep",
+        action="store_true",
+        help="Sample independent timesteps for audio noising/conditioning in AV and audio modes.",
+    )
+    parser.add_argument(
+        "--audio_silence_regularizer",
+        action="store_true",
+        help="Use synthetic silence audio latents for AV batches that are missing audio latents.",
+    )
+    parser.add_argument(
+        "--audio_silence_regularizer_weight",
+        type=float,
+        default=1.0,
+        help="Multiplier applied to audio loss on synthetic-silence fallback batches.",
+    )
+    parser.add_argument(
+        "--audio_supervision_mode",
+        type=str,
+        default="off",
+        choices=["off", "warn", "error"],
+        help=(
+            "Monitor AV audio supervision quality. "
+            "'warn' logs periodic warnings when supervised-audio ratio is too low; "
+            "'error' stops training; 'off' disables checks."
+        ),
+    )
+    parser.add_argument(
+        "--audio_supervision_warmup_steps",
+        type=int,
+        default=50,
+        help="Number of expected AV batches to observe before audio supervision checks begin.",
+    )
+    parser.add_argument(
+        "--audio_supervision_check_interval",
+        type=int,
+        default=50,
+        help="Run audio supervision checks every N expected AV batches.",
+    )
+    parser.add_argument(
+        "--audio_supervision_min_ratio",
+        type=float,
+        default=0.9,
+        help="Minimum required supervised/expected audio ratio for AV training.",
+    )
+    parser.add_argument(
+        "--min_audio_batches_per_accum",
+        type=int,
+        default=0,
+        help=(
+            "Minimum number of audio-bearing microbatches per gradient accumulation window. "
+            "0 disables quota sampling and preserves existing random sampling behavior."
+        ),
+    )
+    parser.add_argument(
+        "--audio_batch_probability",
+        type=float,
+        default=None,
+        help=(
+            "Probability of selecting an audio-bearing batch when both audio/non-audio batches remain. "
+            "Mutually exclusive with --min_audio_batches_per_accum. "
+            "Unset keeps existing random sampling behavior."
+        ),
+    )
 
+    parser.add_argument(
+        "--lycoris_config",
+        type=str,
+        default=None,
+        help=(
+            "Path to LyCORIS TOML configuration file. "
+            "Use this for module-level algorithm settings without bundled example files."
+        ),
+    )
+    parser.add_argument(
+        "--init_lokr_norm",
+        type=float,
+        default=None,
+        help=(
+            "Initialize LoKR network with perturbed normal distribution (e.g., 1e-3). "
+            "Helps training stability. Only applies when using LoKR algorithm."
+        ),
+    )
     parser.add_argument(
         "--ltx2_first_frame_conditioning_p",
         type=float,
@@ -3297,6 +4237,17 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         ),
     )
     parser.add_argument(
+        "--use_precached_sample_latents",
+        action="store_true",
+        help="Use precached I2V conditioning latents for sample prompts (no VAE encoder load during training).",
+    )
+    parser.add_argument(
+        "--sample_latents_cache",
+        type=str,
+        default=None,
+        help="Path to precached I2V conditioning latents (.pt) for sample prompts.",
+    )
+    parser.add_argument(
         "--sample_disable_audio",
         action="store_true",
         help="Disable audio decoding during LTX-2 preview sampling (AV mode).",
@@ -3310,6 +4261,15 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         "--sample_disable_flash_attn",
         action="store_true",
         help="Disable FlashAttention during LTX-2 preview sampling (use SDPA).",
+    )
+    parser.add_argument(
+        "--sample_i2v_token_timestep_mask",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Use official-style I2V token timestep masking during sampling "
+            "(conditioned first-frame tokens use timestep=0 via video_conditioning_mask)."
+        ),
     )
     parser.add_argument(
         "--sample_merge_audio",
@@ -3392,7 +4352,207 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
              "By default, a *_comfy.safetensors file is created alongside the original.",
     )
 
+    # -- Preservation / regularization flags --
+    parser.add_argument(
+        "--blank_preservation",
+        action="store_true",
+        help="Regularize LoRA to not change blank-prompt output (MSE between LoRA ON/OFF with empty prompt).",
+    )
+    parser.add_argument(
+        "--blank_preservation_args",
+        type=str,
+        nargs="*",
+        help="Key=value args for blank preservation, e.g. multiplier=0.5",
+    )
+    parser.add_argument(
+        "--dop",
+        action="store_true",
+        help="Differential Output Preservation: regularize LoRA to not change class-prompt output.",
+    )
+    parser.add_argument(
+        "--dop_args",
+        type=str,
+        nargs="*",
+        help="Key=value args for DOP, e.g. class=woman multiplier=1.0",
+    )
+    parser.add_argument(
+        "--prior_divergence",
+        action="store_true",
+        help="Encourage LoRA output to diverge from base model on training prompts.",
+    )
+    parser.add_argument(
+        "--prior_divergence_args",
+        type=str,
+        nargs="*",
+        help="Key=value args for prior divergence, e.g. multiplier=0.1",
+    )
+    parser.add_argument(
+        "--use_precached_preservation",
+        action="store_true",
+        help="Load preservation embeddings from precached .pt file instead of loading Gemma. "
+             "Run ltx2_cache_text_encoder_outputs.py with --precache_preservation_prompts first.",
+    )
+    parser.add_argument(
+        "--preservation_prompts_cache",
+        type=str,
+        default=None,
+        help="Path to precached preservation prompt embeddings (.pt). "
+             "Defaults to <cache_directory>/ltx2_preservation_cache.pt. Requires --use_precached_preservation.",
+    )
+
+    # -- CREPA (Cross-frame Representation Alignment) --
+    parser.add_argument(
+        "--crepa",
+        action="store_true",
+        help="Enable CREPA temporal consistency regularization (arxiv 2506.09229). "
+             "Aligns DiT hidden states across video frames via a small projector MLP.",
+    )
+    parser.add_argument(
+        "--crepa_args",
+        type=str,
+        nargs="*",
+        help="Key=value args for CREPA, e.g. student_block_idx=16 teacher_block_idx=32 "
+             "lambda_crepa=0.1 tau=1.0 num_neighbors=2 schedule=constant normalize=true",
+    )
+
+    # -- Caption dropout --
+    parser.add_argument(
+        "--caption_dropout_rate",
+        type=float,
+        default=0.0,
+        help="Probability of dropping the caption for each sample (0.0 = disabled). "
+             "Zeros out text embeddings and mask to train unconditional generation for CFG.",
+    )
+
     return parser
+
+
+def _process_lycoris_config(args: argparse.Namespace, logger_instance: logging.Logger) -> None:
+    """Process optional LyCORIS TOML config and merge into runtime args.
+
+    Behavior:
+    - If `--lycoris_config` is set, parse TOML and apply it to LyCORIS creation.
+    - `--network_args` keeps backward compatibility and can override nested TOML keys via:
+      `modules.<name>.<param>=...` and `init.<param>=...`.
+    - `--init_lokr_norm` always overrides init values from TOML.
+    """
+    network_module_name = str(getattr(args, "network_module", "") or "")
+    uses_lycoris_module = "lycoris" in network_module_name.lower()
+
+    if args.network_args is None:
+        args.network_args = []
+
+    config = {}
+    if getattr(args, "lycoris_config", None):
+        if not uses_lycoris_module:
+            raise ValueError("--lycoris_config requires --network_module lycoris.kohya")
+
+        from musubi_tuner.networks.network_config import (
+            parse_toml_config,
+            parse_network_args_enhanced,
+            validate_network_config,
+        )
+        from musubi_tuner.networks.lycoris_extensions import (
+            build_network_kwargs_from_config,
+            log_network_config,
+            config_to_lycoris_preset,
+            get_config_init_params,
+        )
+
+        logger_instance.info("Loading LyCORIS config from: %s", args.lycoris_config)
+        config = parse_toml_config(args.lycoris_config)
+
+        # Support nested overrides through --network_args for compatibility.
+        existing_args = parse_network_args_enhanced(args.network_args)
+        for key, value in existing_args.items():
+            if "." not in key:
+                continue
+
+            parts = key.split(".")
+            if parts[0] == "modules" and len(parts) >= 3:
+                module_name = parts[1]
+                param_name = parts[2]
+                config.setdefault("modules", {}).setdefault(module_name, {})[param_name] = value
+            elif parts[0] == "init" and len(parts) >= 2:
+                param_name = parts[1]
+                config.setdefault("init", {})[param_name] = value
+
+        # Do not forward nested override keys to LyCORIS create_network kwargs.
+        filtered_network_args = []
+        stripped_count = 0
+        for arg in args.network_args:
+            if arg.startswith("modules.") or arg.startswith("init."):
+                stripped_count += 1
+                continue
+            filtered_network_args.append(arg)
+        if stripped_count > 0:
+            args.network_args = filtered_network_args
+            logger_instance.info(
+                "Consumed %d nested TOML override args from --network_args",
+                stripped_count,
+            )
+
+        validate_network_config(config)
+        log_network_config(config, logger_instance)
+
+        preset = config_to_lycoris_preset(config)
+        if preset:
+            args._network_config_preset = preset
+            logger_instance.info("LyCORIS TOML preset prepared for network creation")
+
+        config_kwargs = build_network_kwargs_from_config(
+            config,
+            base_dim=getattr(args, "network_dim", None),
+            base_alpha=getattr(args, "network_alpha", None),
+        )
+        for key, value in config_kwargs.items():
+            arg_str = f"{key}={value}"
+            if not any(arg.startswith(f"{key}=") for arg in args.network_args):
+                args.network_args.append(arg_str)
+                logger_instance.info("Added network arg from LyCORIS config: %s", arg_str)
+
+        init_params = dict(get_config_init_params(config))
+    else:
+        init_params = {}
+
+    # Explicit CLI override always wins.
+    if getattr(args, "init_lokr_norm", None) is not None:
+        init_params["lokr_norm"] = args.init_lokr_norm
+
+    if init_params:
+        args._network_init_params = init_params
+        logger_instance.info("Network initialization params: %s", args._network_init_params)
+
+
+def _apply_lycoris_preset_before_network_creation(args: argparse.Namespace, logger_instance: logging.Logger) -> None:
+    """Apply LyCORIS preset early so it affects network creation."""
+    preset = getattr(args, "_network_config_preset", None)
+    if not preset:
+        return
+
+    network_module_name = str(getattr(args, "network_module", "") or "")
+    if "lycoris" not in network_module_name.lower():
+        logger_instance.warning(
+            "Ignoring LyCORIS preset because --network_module=%s",
+            network_module_name or "<unset>",
+        )
+        return
+
+    try:
+        from lycoris.kohya import LycorisNetworkKohya
+    except Exception as e:
+        logger_instance.warning(
+            "Failed to import lycoris.kohya for preset application. "
+            "Install with: pip install lycoris-lora. Error: %s",
+            e,
+        )
+        return
+
+    try:
+        LycorisNetworkKohya.apply_preset(preset)
+        logger_instance.info("Applied LyCORIS preset before network creation")
+    except Exception as e:
+        logger_instance.warning("Failed to apply LyCORIS preset before network creation: %s", e)
 
 
 # ======== Main training entry point ========
@@ -3454,21 +4614,35 @@ def main() -> None:
     if args.vae_dtype is None:
         args.vae_dtype = "bfloat16"
 
-    # Inject lora_target_preset into network_args (LTX-2 specific)
-    if getattr(args, "ltx_mode", "video") == "audio" and not explicit_lora_preset:
+    network_module_name = str(getattr(args, "network_module", "") or "")
+    uses_lycoris_module = "lycoris" in network_module_name.lower()
+
+    # Inject lora_target_preset into network_args (LTX-2 specific, non-LyCORIS only)
+    if getattr(args, "ltx_mode", "video") == "audio" and not explicit_lora_preset and not uses_lycoris_module:
         if args.network_args is None:
             args.network_args = []
         if not any(arg.startswith("include_patterns=") for arg in args.network_args):
             args.lora_target_preset = "audio"
 
     lora_target_preset = getattr(args, "lora_target_preset", None)
-    if lora_target_preset is not None:
+    if uses_lycoris_module:
+        if args.network_args is not None:
+            filtered_args = [arg for arg in args.network_args if not arg.startswith("lora_target_preset=")]
+            if len(filtered_args) != len(args.network_args):
+                args.network_args = filtered_args
+                logger.info("Removed lora_target_preset from --network_args for LyCORIS module compatibility")
+        if lora_target_preset is not None:
+            logger.info("Skipping lora_target_preset injection for LyCORIS network module")
+    elif lora_target_preset is not None:
         if args.network_args is None:
             args.network_args = []
         # Only add if not already specified in network_args
         if not any(arg.startswith("lora_target_preset=") for arg in args.network_args):
             args.network_args.append(f"lora_target_preset={lora_target_preset}")
             logger.info(f"Using LoRA target preset: {lora_target_preset}")
+
+    _process_lycoris_config(args, logger)
+    _apply_lycoris_preset_before_network_creation(args, logger)
 
     trainer = LTX2NetworkTrainer()
     trainer.train(args)

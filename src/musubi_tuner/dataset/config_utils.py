@@ -2,11 +2,13 @@ import argparse
 from dataclasses import (
     asdict,
     dataclass,
+    fields,
 )
 import functools
 import random
 from textwrap import dedent, indent
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 
 from typing import List, Optional, Sequence, Tuple, Union, TYPE_CHECKING
@@ -40,6 +42,7 @@ class BaseDatasetParams:
     cache_directory: Optional[str] = None
     reference_cache_directory: Optional[str] = None
     separate_audio_buckets: bool = False
+    cache_only: bool = False
     debug_dataset: bool = False
     architecture: str = "no_default"  # short style like "hv" or "wan"
 
@@ -72,6 +75,7 @@ class VideoDatasetParams(BaseDatasetParams):
     frame_sample: Optional[int] = 1
     max_frames: Optional[int] = 129
     source_fps: Optional[float] = None
+    target_fps: Optional[float] = None
 
     # FramePack dependent parameters
     fp_latent_window_size: Optional[int] = 9
@@ -127,6 +131,7 @@ class ConfigSanitizer:
         "cache_directory": str,
         "reference_cache_directory": str,
         "separate_audio_buckets": bool,
+        "cache_only": bool,
     }
     IMAGE_DATASET_DISTINCT_SCHEMA = {
         "image_directory": str,
@@ -154,6 +159,7 @@ class ConfigSanitizer:
         "frame_sample": int,
         "max_frames": int,
         "source_fps": float,
+        "target_fps": float,
         "fp_latent_window_size": int,
     }
 
@@ -335,6 +341,7 @@ def generate_dataset_group_by_blueprint(
         enable_bucket: {dataset.enable_bucket}
         bucket_no_upscale: {dataset.bucket_no_upscale}
         separate_audio_buckets: {getattr(dataset, "separate_audio_buckets", False)}
+        cache_only: {getattr(dataset, "cache_only", False)}
         cache_directory: "{dataset.cache_directory}"
         debug_dataset: {dataset.debug_dataset}
     """
@@ -381,6 +388,7 @@ def generate_dataset_group_by_blueprint(
         frame_sample: {dataset.frame_sample}
         max_frames: {dataset.max_frames}
         source_fps: {dataset.source_fps}
+        target_fps: {getattr(dataset, "target_fps", None)}
         fp_latent_window_size: {dataset.fp_latent_window_size}
     \n"""
                 ),
@@ -398,6 +406,186 @@ def generate_dataset_group_by_blueprint(
             dataset.prepare_for_training(num_timestep_buckets=num_timestep_buckets)
 
     return DatasetGroup(datasets)
+
+
+def _manifest_params_with_cache_only(dataset_type: str, params: dict) -> dict:
+    params = dict(params)
+
+    if not params.get("cache_directory"):
+        if dataset_type == "audio":
+            params["cache_directory"] = params.get("audio_directory")
+        elif dataset_type == "image":
+            params["cache_directory"] = params.get("image_directory")
+        else:
+            params["cache_directory"] = params.get("video_directory")
+
+    if not params.get("cache_directory"):
+        raise ValueError(
+            f"cache_directory is required to create a cache-only manifest for {dataset_type} datasets. "
+            "Set cache_directory in dataset config."
+        )
+
+    params["cache_only"] = True
+
+    # Strip source references to guarantee source-free training from manifest.
+    if dataset_type == "audio":
+        params["audio_directory"] = None
+        params["audio_jsonl_file"] = None
+    elif dataset_type == "image":
+        params["image_directory"] = None
+        params["image_jsonl_file"] = None
+        params["control_directory"] = None
+        params["multiple_target"] = False
+    else:
+        params["video_directory"] = None
+        params["video_jsonl_file"] = None
+        params["control_directory"] = None
+
+    return params
+
+
+def _blueprint_to_manifest_entries(dataset_group_blueprint: DatasetGroupBlueprint) -> list[dict]:
+    entries: list[dict] = []
+    for dataset_blueprint in dataset_group_blueprint.datasets:
+        params = _manifest_params_with_cache_only(dataset_blueprint.dataset_type, asdict(dataset_blueprint.params))
+        entries.append(
+            {
+                "dataset_type": dataset_blueprint.dataset_type,
+                "params": params,
+            }
+        )
+    return entries
+
+
+def create_cache_only_dataset_manifest(
+    user_config: dict,
+    argparse_namespace: argparse.Namespace,
+    architecture: str,
+    source_dataset_config: Optional[Union[str, Path]] = None,
+) -> dict:
+    blueprint_generator = BlueprintGenerator(ConfigSanitizer())
+    blueprint = blueprint_generator.generate(user_config, argparse_namespace, architecture=architecture)
+
+    manifest: dict = {
+        "format": "musubi_tuner_dataset_manifest",
+        "version": 1,
+        "architecture": architecture,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "datasets": _blueprint_to_manifest_entries(blueprint.dataset_group),
+    }
+
+    if source_dataset_config is not None:
+        manifest["source_dataset_config"] = str(source_dataset_config)
+
+    if user_config.get("validation_datasets"):
+        validation_user_config = {
+            "general": user_config.get("general", {}),
+            "datasets": user_config.get("validation_datasets", []),
+        }
+        validation_blueprint = blueprint_generator.generate(
+            validation_user_config,
+            argparse_namespace,
+            architecture=architecture,
+        )
+        manifest["validation_datasets"] = _blueprint_to_manifest_entries(validation_blueprint.dataset_group)
+
+    return manifest
+
+
+def save_dataset_manifest(manifest: dict, manifest_path: Union[str, Path]) -> Path:
+    path = Path(manifest_path)
+    if path.parent and not path.parent.exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2)
+    return path
+
+
+def load_dataset_manifest(manifest_path: Union[str, Path]) -> dict:
+    path = Path(manifest_path)
+    if not path.is_file():
+        raise ValueError(f"dataset manifest not found: {path}")
+
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            manifest = json.load(f)
+    except Exception as e:
+        raise ValueError(f"failed to load dataset manifest: {path}") from e
+
+    if not isinstance(manifest, dict):
+        raise ValueError(f"invalid dataset manifest format: {path}")
+    if manifest.get("version") != 1:
+        raise ValueError(f"unsupported dataset manifest version: {manifest.get('version')}")
+    if not isinstance(manifest.get("datasets"), list):
+        raise ValueError(f"dataset manifest must contain a datasets array: {path}")
+
+    return manifest
+
+
+def _normalize_manifest_params(params: dict) -> dict:
+    normalized = dict(params)
+    if isinstance(normalized.get("resolution"), list):
+        normalized["resolution"] = tuple(normalized["resolution"])
+    if isinstance(normalized.get("control_resolution"), list):
+        normalized["control_resolution"] = tuple(normalized["control_resolution"])
+    if isinstance(normalized.get("target_frames"), list):
+        normalized["target_frames"] = tuple(normalized["target_frames"])
+    return normalized
+
+
+def _manifest_entries_to_blueprint(entries: Sequence[dict], default_architecture: Optional[str] = None) -> DatasetGroupBlueprint:
+    dataset_blueprints: list[DatasetBlueprint] = []
+    for i, entry in enumerate(entries):
+        dataset_type = entry.get("dataset_type")
+        params = entry.get("params")
+        if dataset_type not in {"audio", "image", "video"}:
+            raise ValueError(f"invalid dataset_type in manifest entry {i}: {dataset_type}")
+        if not isinstance(params, dict):
+            raise ValueError(f"manifest entry {i} has invalid params")
+
+        if dataset_type == "audio":
+            dataset_params_klass = AudioDatasetParams
+        elif dataset_type == "image":
+            dataset_params_klass = ImageDatasetParams
+        else:
+            dataset_params_klass = VideoDatasetParams
+
+        normalized_params = _normalize_manifest_params(params)
+        normalized_params["cache_only"] = True
+        if default_architecture and normalized_params.get("architecture") in {None, "no_default"}:
+            normalized_params["architecture"] = default_architecture
+
+        valid_fields = {f.name for f in fields(dataset_params_klass)}
+        filtered_params = {k: v for k, v in normalized_params.items() if k in valid_fields}
+        dataset_params = dataset_params_klass(**filtered_params)
+        dataset_blueprints.append(DatasetBlueprint(dataset_type, dataset_params))
+
+    return DatasetGroupBlueprint(dataset_blueprints)
+
+
+def generate_dataset_group_by_manifest(
+    manifest: dict,
+    split: str = "train",
+    training: bool = False,
+    num_timestep_buckets: Optional[int] = None,
+    shared_epoch: SharedEpoch = None,
+) -> Optional[DatasetGroup]:
+    if split not in {"train", "validation"}:
+        raise ValueError(f"invalid manifest split: {split}")
+
+    key = "datasets" if split == "train" else "validation_datasets"
+    entries = manifest.get(key, [])
+    if not entries:
+        return None
+
+    default_architecture = manifest.get("architecture")
+    dataset_group_blueprint = _manifest_entries_to_blueprint(entries, default_architecture=default_architecture)
+    return generate_dataset_group_by_blueprint(
+        dataset_group_blueprint,
+        training=training,
+        num_timestep_buckets=num_timestep_buckets,
+        shared_epoch=shared_epoch,
+    )
 
 
 def load_user_config(file: str) -> dict:

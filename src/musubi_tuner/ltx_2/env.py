@@ -197,6 +197,10 @@ class LTX2Env:
     # recommended=True | old SHA=True | current=False
     require_gemma_root: bool = True
 
+    # Skip no-op attention masks to enable Flash Attention on cross-attn.
+    # recommended=False | old SHA=False | current=False
+    skip_noop_attn_mask: bool = False
+
 
 DEFAULT_ENV = LTX2Env()
 
@@ -243,8 +247,10 @@ def apply_ltx2_tweaks(args) -> None:
 
     args.swap_async_prefetch = t.swap_async_prefetch
     args.swap_no_async_prefetch = not t.swap_async_prefetch
-    args.swap_pinned = t.swap_pinned
-    args.swap_no_pinned = not t.swap_pinned
+    cli_swap_pinned = bool(getattr(args, "use_pinned_memory_for_block_swap", False))
+    effective_swap_pinned = bool(t.swap_pinned or cli_swap_pinned)
+    args.swap_pinned = effective_swap_pinned
+    args.swap_no_pinned = not effective_swap_pinned
     args.swap_norms = t.swap_norms
 
     args.nan_sublayer_diag = t.nan_sublayer_diag
@@ -258,6 +264,7 @@ def apply_ltx2_tweaks(args) -> None:
     args.skip_nonfinite_steps = t.skip_nonfinite_steps
     args.auto_blocks_to_checkpoint = t.auto_blocks_to_checkpoint
     args.require_gemma_root = t.require_gemma_root
+    args.skip_noop_attn_mask = t.skip_noop_attn_mask
 
     # Apply global FP8 offload behavior.
     fp8_offload_enabled = t.fp8_offload_upcast
@@ -276,7 +283,7 @@ def apply_ltx2_tweaks(args) -> None:
     _set_env_bool("LTX2_SWAP_KEEP_CROSS_ATTN", t.swap_keep_cross_attn)
     _set_env_bool("LTX2_SWAP_SKIP_AUDIO", t.swap_keep_audio)
     _set_env_bool("LTX2_SWAP_ASYNC_PREFETCH", t.swap_async_prefetch)
-    _set_env_bool("LTX2_SWAP_PINNED", t.swap_pinned)
+    _set_env_bool("LTX2_SWAP_PINNED", effective_swap_pinned)
     _set_env_bool("LTX2_SWAP_FP8_SYNC", t.swap_fp8_sync)
     _set_env_bool("LTX2_SWAP_FP8_SYNC_STRICT", t.swap_fp8_sync_strict)
     _set_env_bool("LTX2_FP8_OFFLOAD_KEEP_FP8", t.fp8_offload_keep_fp8)
@@ -310,3 +317,4 @@ def apply_ltx2_tweaks(args) -> None:
     _set_env_bool("LTX2_V2A_DIAG", t.v2a_diag)
     _set_env_bool("LTX2_ALIGN_OUTPUT_DEVICE", t.align_output_device)
     _set_env_bool("LTX2_REQUIRE_GEMMA_ROOT", t.require_gemma_root)
+    _set_env_bool("LTX2_SKIP_NOOP_ATTN_MASK", t.skip_noop_attn_mask)

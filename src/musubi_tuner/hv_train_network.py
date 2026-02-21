@@ -40,6 +40,17 @@ from musubi_tuner.hunyuan_model.models import load_transformer, get_rotary_pos_e
 import musubi_tuner.hunyuan_model.text_encoder as text_encoder_module
 from musubi_tuner.hunyuan_model.vae import load_vae, VAE_VER
 import musubi_tuner.hunyuan_model.vae as vae_module
+from musubi_tuner.dataset.audio_quota_sampler import (
+    build_audio_sampler,
+    split_concat_indices_by_audio,
+    sync_dataset_group_epoch_without_loading,
+)
+from musubi_tuner.audio_loss_balance import (
+    compute_ema_magnitude_audio_weight,
+    compute_inverse_frequency_audio_weight,
+    update_loss_ema,
+    update_audio_presence_ema,
+)
 from musubi_tuner.modules.lr_schedulers import RexLR
 from musubi_tuner.modules.scheduling_flow_match_discrete import FlowMatchDiscreteScheduler
 import musubi_tuner.networks.lora as lora_module
@@ -524,7 +535,7 @@ class NetworkTrainer:
 
         lrs = lr_scheduler.get_last_lr()
         for i, lr in enumerate(lrs):
-            if lr_descriptions is not None:
+            if lr_descriptions is not None and i < len(lr_descriptions):
                 lr_desc = lr_descriptions[i]
             else:
                 idx = i - (0 if network_train_unet_only else 1)
@@ -550,6 +561,14 @@ class NetworkTrainer:
                 if "effective_lr" in optimizer.param_groups[i]:
                     logs[f"lr/d*eff_lr/{lr_desc}"] = optimizer.param_groups[i]["d"] * optimizer.param_groups[i]["effective_lr"]
 
+            if args.optimizer_type.lower() == "automagic" and optimizer is not None:
+                logs[f"lr/automagic_avg"] = optimizer.get_avg_learning_rate()
+                lr_tensor = optimizer.get_lr_tensor()
+                if lr_tensor is not None and len(lr_tensor) > 1:
+                    logs["lr/automagic_min"] = float(lr_tensor.min())
+                    logs["lr/automagic_max"] = float(lr_tensor.max())
+                    logs["lr/automagic_std"] = float(lr_tensor.std())
+
         return logs
 
     def get_optimizer(self, args, trainable_params: list[torch.nn.Parameter]) -> tuple[str, str, torch.optim.Optimizer]:
@@ -561,7 +580,9 @@ class NetworkTrainer:
         optimizer_kwargs = {}
         if args.optimizer_args is not None and len(args.optimizer_args) > 0:
             for arg in args.optimizer_args:
-                key, value = arg.split("=")
+                if "=" not in arg:
+                    raise ValueError(f"Invalid --optimizer_args entry (expected key=value): {arg}")
+                key, value = arg.split("=", 1)
                 value = ast.literal_eval(value)
                 optimizer_kwargs[key] = value
 
@@ -632,6 +653,12 @@ class NetworkTrainer:
             optimizer_class = torch.optim.AdamW
             optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
 
+        elif optimizer_type == "automagic":
+            from musubi_tuner.optimizers.automagic import Automagic
+            logger.info(f"use Automagic optimizer | lr={lr} | {optimizer_kwargs}")
+            optimizer_class = Automagic
+            optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
+
         if optimizer is None:
             # 任意のoptimizerを使う
             case_sensitive_optimizer_type = args.optimizer_type  # not lower
@@ -662,7 +689,17 @@ class NetworkTrainer:
         return optimizer_name, optimizer_args, optimizer, train_fn, eval_fn
 
     def is_schedulefree_optimizer(self, optimizer: torch.optim.Optimizer, args: argparse.Namespace) -> bool:
-        return args.optimizer_type.lower().endswith("schedulefree".lower())  # or args.optimizer_schedulefree_wrapper
+        return args.optimizer_type.lower().endswith("schedulefree".lower()) or args.optimizer_type.lower() == "automagic"
+
+    # -- Preservation / regularization base-class no-ops --
+    def pre_train_hook(self, args, accelerator, transformer=None, network=None):
+        pass
+
+    def compute_prior_divergence_addition(self, args, accelerator, transformer, network, video_pred, network_dtype):
+        return None
+
+    def preservation_backward(self, args, accelerator, transformer, network, network_dtype):
+        return {}
 
     def get_dummy_scheduler(self, optimizer: torch.optim.Optimizer) -> Any:
         # dummy scheduler for schedulefree optimizer. supports only empty step(), get_last_lr() and optimizers.
@@ -705,7 +742,9 @@ class NetworkTrainer:
         lr_scheduler_kwargs = {}  # get custom lr_scheduler kwargs
         if args.lr_scheduler_args is not None and len(args.lr_scheduler_args) > 0:
             for arg in args.lr_scheduler_args:
-                key, value = arg.split("=")
+                if "=" not in arg:
+                    raise ValueError(f"Invalid --lr_scheduler_args entry (expected key=value): {arg}")
+                key, value = arg.split("=", 1)
                 value = ast.literal_eval(value)
                 lr_scheduler_kwargs[key] = value
 
@@ -832,14 +871,15 @@ class NetworkTrainer:
             **lr_scheduler_kwargs,
         )
 
-    def resume_from_local_or_hf_if_specified(self, accelerator: Accelerator, args: argparse.Namespace) -> bool:
+    def resume_from_local_or_hf_if_specified(self, accelerator: Accelerator, args: argparse.Namespace) -> int:
+        """Resume training state. Returns the recovered global_step (0 if not resuming)."""
         if not args.resume:
-            return False
+            return 0
 
         if not args.resume_from_huggingface:
             logger.info(f"resume training from local state: {args.resume}")
             accelerator.load_state(args.resume)
-            return True
+            return self._recover_global_step(args.resume)
 
         logger.info(f"resume training from huggingface state: {args.resume}")
         repo_id = args.resume.split("/")[0] + "/" + args.resume.split("/")[1]
@@ -884,7 +924,20 @@ class NetworkTrainer:
         dirname = os.path.dirname(results[0])
         accelerator.load_state(dirname)
 
-        return True
+        return self._recover_global_step(dirname)
+
+    @staticmethod
+    def _recover_global_step(state_dir: str) -> int:
+        """Read global_step from the LR scheduler state saved by accelerate."""
+        scheduler_path = os.path.join(state_dir, "scheduler.bin")
+        try:
+            scheduler_state = torch.load(scheduler_path, map_location="cpu", weights_only=True)
+            global_step = int(scheduler_state["last_epoch"])
+            logger.info(f"recovered global_step={global_step} from {scheduler_path}")
+            return global_step
+        except Exception as e:
+            logger.warning(f"could not recover global_step from {scheduler_path}: {e}  (starting from step 0)")
+            return 0
 
     def get_bucketed_timestep(self) -> float:
         if self.num_timestep_buckets is None or self.num_timestep_buckets <= 1:
@@ -1793,8 +1846,8 @@ class NetworkTrainer:
                 logger.info("Enabled cuDNN benchmark / cuDNNベンチマークを有効化しました")
 
         # check required arguments
-        if args.dataset_config is None:
-            raise ValueError("dataset_config is required / dataset_configが必要です")
+        if args.dataset_config is None and getattr(args, "dataset_manifest", None) is None:
+            raise ValueError("dataset_config or dataset_manifest is required / dataset_configまたはdataset_manifestが必要です")
         if args.dit is None:
             raise ValueError("path to DiT model is required / DiTモデルのパスが必要です")
         assert not args.fp8_scaled or args.fp8_base, "fp8_scaled requires fp8_base / fp8_scaledはfp8_baseが必要です"
@@ -1829,6 +1882,35 @@ class NetworkTrainer:
 
         loss_diag_enabled = os.getenv("LTX2_LOSS_DIAG", "0") == "1"
         loss_diag_every = int(os.getenv("LTX2_LOSS_DIAG_EVERY", "10"))
+        audio_loss_balance_mode = str(getattr(args, "audio_loss_balance_mode", "none") or "none").lower()
+        audio_loss_balance_beta = float(getattr(args, "audio_loss_balance_beta", 0.01))
+        audio_loss_balance_eps = float(getattr(args, "audio_loss_balance_eps", 0.05))
+        audio_loss_balance_min = float(getattr(args, "audio_loss_balance_min", 1.0))
+        audio_loss_balance_max = float(getattr(args, "audio_loss_balance_max", 4.0))
+        audio_presence_ema = float(getattr(args, "audio_loss_balance_ema_init", 1.0))
+        audio_presence_ema = min(max(audio_presence_ema, 1e-6), 1.0)
+        audio_loss_balance_target_ratio = float(getattr(args, "audio_loss_balance_target_ratio", 0.33))
+        audio_loss_balance_ema_decay = float(getattr(args, "audio_loss_balance_ema_decay", 0.99))
+        audio_loss_ema = max(float(getattr(args, "audio_loss_balance_ema_init", 1.0)), 1e-6)
+        video_loss_ema = max(float(getattr(args, "audio_loss_balance_ema_init", 1.0)), 1e-6)
+        if audio_loss_balance_mode == "inv_freq":
+            logger.info(
+                "Audio inverse-frequency weighting enabled: beta=%.4f eps=%.4f min=%.4f max=%.4f ema_init=%.4f",
+                audio_loss_balance_beta,
+                audio_loss_balance_eps,
+                audio_loss_balance_min,
+                audio_loss_balance_max,
+                audio_presence_ema,
+            )
+        elif audio_loss_balance_mode == "ema_mag":
+            logger.info(
+                "Audio EMA-magnitude balancing enabled: target_ratio=%.4f ema_decay=%.4f min=%.4f max=%.4f ema_init=%.4f",
+                audio_loss_balance_target_ratio,
+                audio_loss_balance_ema_decay,
+                audio_loss_balance_min,
+                audio_loss_balance_max,
+                audio_loss_ema,
+            )
 
         # Load dataset config
         if args.num_timestep_buckets is not None:
@@ -1837,30 +1919,57 @@ class NetworkTrainer:
 
         current_epoch = Value("i", 0)  # shared between processes
 
-        blueprint_generator = BlueprintGenerator(ConfigSanitizer())
-        logger.info(f"Load dataset config from {args.dataset_config}")
-        user_config = config_utils.load_user_config(args.dataset_config)
-        blueprint = blueprint_generator.generate(user_config, args, architecture=self.architecture)
-        train_dataset_group = config_utils.generate_dataset_group_by_blueprint(
-            blueprint.dataset_group, training=True, num_timestep_buckets=self.num_timestep_buckets, shared_epoch=current_epoch
-        )
         validation_dataset_group = None
         validation_dataloader = None
-        if user_config.get("validation_datasets"):
-            logger.info("Load validation datasets from dataset config")
-            validation_user_config = {
-                "general": user_config.get("general", {}),
-                "datasets": user_config.get("validation_datasets", []),
-            }
-            validation_blueprint = blueprint_generator.generate(
-                validation_user_config, args, architecture=self.architecture
-            )
-            validation_dataset_group = config_utils.generate_dataset_group_by_blueprint(
-                validation_blueprint.dataset_group,
+        if getattr(args, "dataset_manifest", None) is not None:
+            logger.info("Load dataset manifest from %s", args.dataset_manifest)
+            dataset_manifest = config_utils.load_dataset_manifest(args.dataset_manifest)
+            manifest_architecture = dataset_manifest.get("architecture")
+            if manifest_architecture is not None and manifest_architecture != self.architecture:
+                raise ValueError(
+                    f"dataset manifest architecture mismatch: expected '{self.architecture}', got '{manifest_architecture}'"
+                )
+
+            train_dataset_group = config_utils.generate_dataset_group_by_manifest(
+                dataset_manifest,
+                split="train",
                 training=True,
                 num_timestep_buckets=self.num_timestep_buckets,
                 shared_epoch=current_epoch,
             )
+            if train_dataset_group is None:
+                raise ValueError("dataset manifest contains no training datasets")
+
+            validation_dataset_group = config_utils.generate_dataset_group_by_manifest(
+                dataset_manifest,
+                split="validation",
+                training=True,
+                num_timestep_buckets=self.num_timestep_buckets,
+                shared_epoch=current_epoch,
+            )
+        else:
+            blueprint_generator = BlueprintGenerator(ConfigSanitizer())
+            logger.info(f"Load dataset config from {args.dataset_config}")
+            user_config = config_utils.load_user_config(args.dataset_config)
+            blueprint = blueprint_generator.generate(user_config, args, architecture=self.architecture)
+            train_dataset_group = config_utils.generate_dataset_group_by_blueprint(
+                blueprint.dataset_group, training=True, num_timestep_buckets=self.num_timestep_buckets, shared_epoch=current_epoch
+            )
+            if user_config.get("validation_datasets"):
+                logger.info("Load validation datasets from dataset config")
+                validation_user_config = {
+                    "general": user_config.get("general", {}),
+                    "datasets": user_config.get("validation_datasets", []),
+                }
+                validation_blueprint = blueprint_generator.generate(
+                    validation_user_config, args, architecture=self.architecture
+                )
+                validation_dataset_group = config_utils.generate_dataset_group_by_blueprint(
+                    validation_blueprint.dataset_group,
+                    training=True,
+                    num_timestep_buckets=self.num_timestep_buckets,
+                    shared_epoch=current_epoch,
+                )
 
         if train_dataset_group.num_train_items == 0:
             raise ValueError(
@@ -1985,7 +2094,9 @@ class NetworkTrainer:
         net_kwargs = {}
         if args.network_args is not None:
             for net_arg in args.network_args:
-                key, value = net_arg.split("=")
+                if "=" not in net_arg:
+                    raise ValueError(f"Invalid --network_args entry (expected key=value): {net_arg}")
+                key, value = net_arg.split("=", 1)
                 net_kwargs[key] = value
 
         if args.dim_from_weights:
@@ -2076,6 +2187,7 @@ class NetworkTrainer:
         accelerator.print("prepare optimizer, data loader etc.")
 
         trainable_params, lr_descriptions = network.prepare_optimizer_params(unet_lr=args.learning_rate)
+
         optimizer_name, optimizer_args, optimizer, optimizer_train_fn, optimizer_eval_fn = self.get_optimizer(
             args, trainable_params
         )
@@ -2085,14 +2197,50 @@ class NetworkTrainer:
         # num workers for data loader: if 0, persistent_workers is not available
         n_workers = min(args.max_data_loader_n_workers, os.cpu_count())  # cpu_count or max_data_loader_n_workers
 
-        train_dataloader = torch.utils.data.DataLoader(
-            train_dataset_group,
-            batch_size=1,
-            shuffle=True,
-            collate_fn=collator,
-            num_workers=n_workers,
-            persistent_workers=args.persistent_data_loader_workers,
+        train_audio_sampler, train_audio_sampler_mode, train_audio_sampler_stats = build_audio_sampler(
+            dataset_group=train_dataset_group,
+            gradient_accumulation_steps=int(args.gradient_accumulation_steps),
+            min_audio_batches_per_accum=int(getattr(args, "min_audio_batches_per_accum", 0) or 0),
+            audio_batch_probability=getattr(args, "audio_batch_probability", None),
+            seed=int(args.seed),
         )
+
+        if train_audio_sampler_mode == "quota":
+            logger.info(
+                "Audio quota sampler enabled: min_audio_batches_per_accum=%d, accumulation_steps=%d, "
+                "audio_batches=%d, non_audio_batches=%d",
+                train_audio_sampler_stats["min_audio_batches_per_accum"],
+                train_audio_sampler_stats["accumulation_steps"],
+                train_audio_sampler_stats["audio_batches"],
+                train_audio_sampler_stats["non_audio_batches"],
+            )
+        elif train_audio_sampler_mode == "probability":
+            logger.info(
+                "Audio probability sampler enabled: audio_batch_probability=%.3f, audio_batches=%d, non_audio_batches=%d",
+                train_audio_sampler_stats["audio_batch_probability"],
+                train_audio_sampler_stats["audio_batches"],
+                train_audio_sampler_stats["non_audio_batches"],
+            )
+
+        if train_audio_sampler is None:
+            train_dataloader = torch.utils.data.DataLoader(
+                train_dataset_group,
+                batch_size=1,
+                shuffle=True,
+                collate_fn=collator,
+                num_workers=n_workers,
+                persistent_workers=args.persistent_data_loader_workers,
+            )
+        else:
+            train_dataloader = torch.utils.data.DataLoader(
+                train_dataset_group,
+                batch_size=1,
+                shuffle=False,
+                sampler=train_audio_sampler,
+                collate_fn=collator,
+                num_workers=n_workers,
+                persistent_workers=args.persistent_data_loader_workers,
+            )
         if validation_dataset_group is not None:
             validation_dataloader = torch.utils.data.DataLoader(
                 validation_dataset_group,
@@ -2121,8 +2269,8 @@ class NetworkTrainer:
         # prepare training model. accelerator does some magic here
 
         # experimental feature: train the model with gradients in fp16/bf16
+        # Stochastic rounding is now supported via copy_stochastic in optimizer_utils.py
         network_dtype = torch.float32
-        args.full_fp16 = args.full_bf16 = False  # temporary disabled because stochastic rounding is not supported yet
         if args.full_fp16:
             assert args.mixed_precision == "fp16", (
                 "full_fp16 requires mixed precision='fp16' / full_fp16を使う場合はmixed_precision='fp16'を指定してください。"
@@ -2212,12 +2360,13 @@ class NetworkTrainer:
         accelerator.register_save_state_pre_hook(save_model_hook)
         accelerator.register_load_state_pre_hook(load_model_hook)
 
-        # resume from local or huggingface. accelerator.step is set
-        self.resume_from_local_or_hf_if_specified(accelerator, args)  # accelerator.load_state(args.resume)
-
         # epoch数を計算する
         num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
         num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
+
+        # resume from local or huggingface — must be after num_update_steps_per_epoch is known
+        initial_global_step = self.resume_from_local_or_hf_if_specified(accelerator, args)
+        epoch_to_start = initial_global_step // num_update_steps_per_epoch if initial_global_step > 0 else 0
 
         # 学習する
         # total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
@@ -2232,6 +2381,8 @@ class NetworkTrainer:
         # accelerator.print(f"  total train batch size (with parallel & distributed & accumulation) / 総バッチサイズ（並列学習、勾配合計含む）: {total_batch_size}")
         accelerator.print(f"  gradient accumulation steps / 勾配を合計するステップ数 = {args.gradient_accumulation_steps}")
         accelerator.print(f"  total optimization steps / 学習ステップ数: {args.max_train_steps}")
+        if initial_global_step > 0:
+            accelerator.print(f"  resuming from step {initial_global_step}, epoch {epoch_to_start + 1}/{num_train_epochs}")
 
         # TODO refactor metadata creation and move to util
         metadata = {
@@ -2331,15 +2482,17 @@ class NetworkTrainer:
                 init_kwargs=init_kwargs,
             )
 
-        # TODO skip until initial step
-        progress_bar = tqdm(range(args.max_train_steps), smoothing=0, disable=not accelerator.is_local_main_process, desc="steps")
+        progress_bar = tqdm(
+            range(args.max_train_steps), initial=initial_global_step, smoothing=0,
+            disable=not accelerator.is_local_main_process, desc="steps",
+        )
 
-        epoch_to_start = 0
-        global_step = 0
+        global_step = initial_global_step
         noise_scheduler = FlowMatchDiscreteScheduler(shift=args.discrete_flow_shift, reverse=True, solver="euler")
 
         loss_recorder = train_utils.LossRecorder()
-        del train_dataset_group
+        if train_audio_sampler is None:
+            del train_dataset_group
 
         # function for saving/removing
         save_dtype = dit_dtype
@@ -2574,8 +2727,8 @@ class NetworkTrainer:
             network.train()
             optimizer_train_fn()
 
-        # For --sample_at_first
-        if should_sample_images(args, global_step, epoch=0):
+        # For --sample_at_first (skip on resume — samples were already generated)
+        if global_step == 0 and should_sample_images(args, global_step, epoch=0):
             optimizer_eval_fn()
             self.sample_images(accelerator, args, 0, global_step, vae, transformer, sample_parameters, dit_dtype)
             optimizer_train_fn()
@@ -2594,17 +2747,39 @@ class NetworkTrainer:
 
         clean_memory_on_device(accelerator.device)
 
+        self.pre_train_hook(args, accelerator, transformer=transformer, network=network)
+
+        # CREPA projector params → add to existing optimizer
+        if hasattr(self, '_crepa') and self._crepa is not None:
+            crepa_params = self._crepa.get_trainable_params()
+            if crepa_params:
+                optimizer.add_param_group({"params": crepa_params, "lr": args.learning_rate})
+                accelerator.print(f"CREPA: added {sum(p.numel() for p in crepa_params):,} projector params to optimizer")
+
         optimizer_train_fn()  # Set training mode
 
         for epoch in range(epoch_to_start, num_train_epochs):
             accelerator.print(f"\nepoch {epoch + 1}/{num_train_epochs}")
             current_epoch.value = epoch + 1
+            if train_audio_sampler is not None:
+                sync_dataset_group_epoch_without_loading(train_dataset_group, epoch + 1, logger=logger)
+                audio_indices, non_audio_indices = split_concat_indices_by_audio(train_dataset_group)
+                if len(audio_indices) == 0:
+                    raise ValueError(
+                        f"No audio-bearing batches available at epoch {epoch + 1} while "
+                        f"{'--min_audio_batches_per_accum' if train_audio_sampler_mode == 'quota' else '--audio_batch_probability'} is enabled."
+                    )
+                if hasattr(train_audio_sampler, "update_groups"):
+                    train_audio_sampler.update_groups(audio_indices, non_audio_indices)
+                if hasattr(train_audio_sampler, "set_epoch"):
+                    train_audio_sampler.set_epoch(epoch)
 
             metadata["ss_epoch"] = str(epoch + 1)
 
             accelerator.unwrap_model(network).on_epoch_start(transformer)
 
             for step, batch in enumerate(train_dataloader):
+                _step_start_time = time.perf_counter()
                 # VRAM spike tracing for first iteration
                 _is_first_step = (epoch == epoch_to_start and step == 0)
                 if _is_first_step:
@@ -2670,6 +2845,10 @@ class NetworkTrainer:
                     dict_output = isinstance(model_pred, dict)
                     video_loss_value = None  # For tracking in wandb/tensorboard
                     audio_loss_value = None  # For tracking in wandb/tensorboard
+                    audio_weight_effective_value = None
+                    audio_presence_ema_value = None
+                    audio_loss_ema_value = None
+                    video_loss_ema_value = None
                     if dict_output:
                         out = model_pred
 
@@ -2718,6 +2897,14 @@ class NetworkTrainer:
                         video_loss = _masked_mse(video_pred, video_target, video_loss_mask)
                         video_weight = float(out.get("video_loss_weight", 1.0))
                         loss = video_loss * video_weight
+                        if audio_loss_balance_mode == "ema_mag":
+                            video_loss_item = max(float(video_loss.detach().item()), 1e-12)
+                            video_loss_ema = update_loss_ema(
+                                loss_ema=video_loss_ema,
+                                loss_value=video_loss_item,
+                                ema_decay=audio_loss_balance_ema_decay,
+                            )
+                            video_loss_ema_value = video_loss_ema
                         # Capture video loss for logging (only if weight > 0)
                         if video_weight > 0:
                             video_loss_value = video_loss.detach().item()
@@ -2725,9 +2912,42 @@ class NetworkTrainer:
                         audio_pred = out.get("audio_pred")
                         audio_target = out.get("audio_target")
                         audio_loss_mask = out.get("audio_loss_mask")
-                        if audio_pred is not None and audio_target is not None:
+                        has_audio_loss = audio_pred is not None and audio_target is not None
+                        if audio_loss_balance_mode == "inv_freq":
+                            audio_presence_ema = update_audio_presence_ema(
+                                audio_presence_ema=audio_presence_ema,
+                                balance_beta=audio_loss_balance_beta,
+                                has_audio_loss=has_audio_loss,
+                            )
+                            audio_presence_ema_value = audio_presence_ema
+                        if has_audio_loss:
                             audio_loss = _masked_mse(audio_pred, audio_target, audio_loss_mask)
                             audio_weight = float(out.get("audio_loss_weight", 1.0))
+                            if audio_loss_balance_mode == "inv_freq":
+                                audio_weight = compute_inverse_frequency_audio_weight(
+                                    base_audio_weight=audio_weight,
+                                    audio_presence_ema=audio_presence_ema,
+                                    balance_eps=audio_loss_balance_eps,
+                                    balance_min=audio_loss_balance_min,
+                                    balance_max=audio_loss_balance_max,
+                                )
+                            elif audio_loss_balance_mode == "ema_mag":
+                                audio_loss_item = max(float(audio_loss.detach().item()), 1e-12)
+                                audio_loss_ema = update_loss_ema(
+                                    loss_ema=audio_loss_ema,
+                                    loss_value=audio_loss_item,
+                                    ema_decay=audio_loss_balance_ema_decay,
+                                )
+                                audio_loss_ema_value = audio_loss_ema
+                                audio_weight = compute_ema_magnitude_audio_weight(
+                                    base_audio_weight=audio_weight,
+                                    audio_loss_ema=audio_loss_ema,
+                                    video_loss_ema=video_loss_ema,
+                                    target_audio_ratio=audio_loss_balance_target_ratio,
+                                    balance_min=audio_loss_balance_min,
+                                    balance_max=audio_loss_balance_max,
+                                )
+                            audio_weight_effective_value = audio_weight
                             loss = loss + audio_loss * audio_weight
                             # Capture audio loss for logging (only if weight > 0)
                             if audio_weight > 0:
@@ -2748,12 +2968,38 @@ class NetworkTrainer:
                     if not dict_output:
                         loss = loss.mean()  # mean loss over all elements in batch
 
+                    _prior_div_value = None
+                    if dict_output:
+                        _prior_div = self.compute_prior_divergence_addition(
+                            args, accelerator, transformer, network, video_pred, network_dtype)
+                        if _prior_div is not None:
+                            _prior_div_value = _prior_div.detach().item()
+                            loss = loss + _prior_div
+
+                    # CREPA loss — must be added before backward (shares computation graph)
+                    _crepa_value = None
+                    if hasattr(self, '_crepa') and self._crepa is not None:
+                        self._crepa.on_step(global_step)
+                        num_latent_frames = latents_tensor.shape[2]
+                        dino_features = batch.get("conditions", {}).get("dino_features", None)
+                        crepa_loss = self._crepa.compute_loss(num_latent_frames, dino_features=dino_features)
+                        if crepa_loss is not None:
+                            _crepa_value = crepa_loss.detach().item()
+                            loss = loss + crepa_loss
+                        self._crepa.cleanup_step()
+
                     if _is_first_step:
                         _log_vram("FIRST_ITER: BEFORE backward", logger)
                     accelerator.backward(loss)
                     if _is_first_step:
                         _log_vram("FIRST_ITER: AFTER backward", logger)
-                    
+
+                    pres_losses = self.preservation_backward(args, accelerator, transformer, network, network_dtype)
+                    if _prior_div_value is not None:
+                        pres_losses["loss/prior_div"] = _prior_div_value
+                    if _crepa_value is not None:
+                        pres_losses["loss/crepa"] = _crepa_value
+
                     # DEBUG: Check if LoRA parameters have gradients (requires LTX2_DEBUG env var)
                     if os.environ.get("LTX2_DEBUG", "0") == "1":
                         unwrapped_net = accelerator.unwrap_model(network)
@@ -2801,7 +3047,9 @@ class NetworkTrainer:
                                     param.grad = accelerator.reduce(param.grad, reduction="mean")
 
                         if args.max_grad_norm != 0.0:
-                            params_to_clip = accelerator.unwrap_model(network).get_trainable_params()
+                            params_to_clip = list(accelerator.unwrap_model(network).get_trainable_params())
+                            if hasattr(self, '_crepa') and self._crepa is not None:
+                                params_to_clip.extend(self._crepa.get_trainable_params())
                             accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
 
                     if _is_first_step:
@@ -2867,6 +3115,10 @@ class NetworkTrainer:
                 if dict_output:
                     logs["loss_v"] = video_loss_value if video_loss_value is not None else "n/a"
                     logs["loss_a"] = audio_loss_value if audio_loss_value is not None else "n/a"
+                    if audio_weight_effective_value is not None:
+                        logs["audio_w"] = audio_weight_effective_value
+                    if audio_presence_ema_value is not None:
+                        logs["audio_p"] = audio_presence_ema_value
                 progress_bar.set_postfix(**logs)
 
                 if args.scale_weight_norms:
@@ -2877,7 +3129,28 @@ class NetworkTrainer:
                         args, current_loss, avr_loss, lr_scheduler, lr_descriptions, optimizer, keys_scaled, mean_norm, maximum_norm,
                         video_loss=video_loss_value, audio_loss=audio_loss_value,
                     )
+                    if audio_weight_effective_value is not None:
+                        logs["loss/audio_weight_effective"] = audio_weight_effective_value
+                    if audio_presence_ema_value is not None:
+                        logs["loss/audio_presence_ema"] = audio_presence_ema_value
+                    if audio_loss_ema_value is not None:
+                        logs["loss/audio_loss_ema"] = audio_loss_ema_value
+                    if video_loss_ema_value is not None:
+                        logs["loss/video_loss_ema"] = video_loss_ema_value
+                    if pres_losses:
+                        logs.update(pres_losses)
                     accelerator.log(logs, step=global_step)
+
+                    # Log automagic LR histogram directly to tracker
+                    if args.optimizer_type.lower() == "automagic" and optimizer is not None:
+                        lr_tensor = optimizer.get_lr_tensor()
+                        if lr_tensor is not None and lr_tensor.mean() > 0:
+                            for tracker in accelerator.trackers:
+                                if tracker.name == "tensorboard":
+                                    tracker.writer.add_histogram("lr/automagic_lrs", lr_tensor, global_step)
+                                elif tracker.name == "wandb":
+                                    import wandb
+                                    tracker.log({"lr/automagic_lrs": wandb.Histogram(lr_tensor.cpu().numpy())}, step=global_step)
 
                 if (
                     validation_dataloader is not None
@@ -2971,6 +3244,12 @@ def setup_parser_common() -> argparse.ArgumentParser:
         type=pathlib.Path,
         default=None,
         help="config file for dataset / データセットの設定ファイル",
+    )
+    parser.add_argument(
+        "--dataset_manifest",
+        type=pathlib.Path,
+        default=None,
+        help="cache-only dataset manifest JSON file (alternative to --dataset_config)",
     )
 
     # model settings
@@ -3280,8 +3559,8 @@ def setup_parser_common() -> argparse.ArgumentParser:
     )
 
     parser.add_argument("--fp8_base", action="store_true", help="use fp8 for base model / base modelにfp8を使う")
-    # parser.add_argument("--full_fp16", action="store_true", help="fp16 training including gradients / 勾配も含めてfp16で学習する")
-    # parser.add_argument("--full_bf16", action="store_true", help="bf16 training including gradients / 勾配も含めてbf16で学習する")
+    parser.add_argument("--full_fp16", action="store_true", help="fp16 training including gradients (uses stochastic rounding) / 勾配も含めてfp16で学習する")
+    parser.add_argument("--full_bf16", action="store_true", help="bf16 training including gradients (uses stochastic rounding) / 勾配も含めてbf16で学習する")
 
     parser.add_argument(
         "--dynamo_backend",

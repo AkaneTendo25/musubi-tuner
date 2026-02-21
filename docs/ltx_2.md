@@ -2,10 +2,31 @@
 
 Status: LTX-2 support is work in progress and may be incomplete or unstable.
 
-This guide details the three-step process for training LTX-2 LoRA models:
+This guide details the process for training LTX-2 LoRA models:
 1. **Caching Latents** (Video/Image + Audio)
 2. **Caching Text Encoder Outputs** (Prompts)
 3. **Training**
+4. **Slider LoRA Training** (Controllable direction sliders)
+
+## Installation
+
+See the [Installation Guide](https://github.com/AkaneTendo25/musubi-tuner/discussions/19) for detailed setup instructions (Windows/Linux, dependencies, flash-attn, troubleshooting).
+
+### CUDA Version
+
+The PyTorch install command must use a CUDA version compatible with your GPU. Adjust the `--index-url` accordingly:
+
+```bash
+# Default (most GPUs, including RTX 30xx/40xx):
+pip install torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0 --index-url https://download.pytorch.org/whl/cu126
+
+# RTX 5090 / 50xx series (Blackwell):
+pip install torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0 --index-url https://download.pytorch.org/whl/cu128
+```
+
+Always match the CUDA version to your GPU architecture — check [PyTorch's compatibility matrix](https://pytorch.org/get-started/locally/) for the latest supported versions.
+
+---
 
 ## Supported Dataset Types
 
@@ -28,6 +49,7 @@ This step pre-processes media files into VAE latents to speed up training.
 ```bash
 python ltx2_cache_latents.py ^
   --dataset_config dataset.toml ^
+  --save_dataset_manifest dataset_manifest.json ^
   --ltx2_checkpoint /path/to/ltx-2.safetensors ^
   --device cuda ^
   --vae_dtype bf16 ^
@@ -36,11 +58,12 @@ python ltx2_cache_latents.py ^
 ```
 
 ### Key Arguments
-- `--ltx2_mode av`: Enables Audio-Video processing. Caches both `*_ltx2.safetensors` (video) and `*_ltx2_audio.safetensors` (audio) latents. `--ltx_mode` is accepted as an alias.
+- `--ltx2_mode`, `--ltx_mode`: Caching modality selector. Default is video-only (`v`/`video`). Use `av` to cache both `*_ltx2.safetensors` (video) and `*_ltx2_audio.safetensors` (audio) latents.
 - `--ltx2_audio_source video|audio_files`: Use audio from the video or from external files.
 - `--ltx2_audio_dir`, `--ltx2_audio_ext`: Optional when using `--ltx2_audio_source audio_files` (default extension: `.wav`).
 - `--ltx2_checkpoint`: Required for `--ltx2_mode av` or `--ltx2_mode audio`.
 - `--vae_dtype`: Data type for VAE latents (default comes from the cache script).
+- `--save_dataset_manifest`: Optional. Saves a cache-only dataset manifest for source-free training.
 
 ### Output Files
 
@@ -86,7 +109,7 @@ python ltx2_cache_text_encoder_outputs.py ^
 - `--gemma_load_in_8bit`: Loads Gemma in 8-bit quantization.
 - `--gemma_load_in_4bit`: Loads Gemma in 4-bit quantization.
 - `--ltx2_checkpoint`: Required. Use `--ltx2_text_encoder_checkpoint` to override for text encoder connector weights.
-- `--ltx2_mode av`: MUST match the mode used in latent caching. Concatenates video and audio prompt embeddings. `--ltx_mode` is accepted as an alias.
+- `--ltx2_mode`, `--ltx_mode`: MUST match the mode used in latent caching. Default is video-only (`v`/`video`); use `av` to concatenate video and audio prompt embeddings.
 - 8-bit/4-bit loading requires `--device cuda`.
 
 ### Output Files
@@ -103,7 +126,18 @@ Launch the training loop using `accelerate`.
 
 **Script:** `ltx2_train_network.py`
 
-### Example Command
+### Optional: Source-Free Training from Cache
+If you cached with `--save_dataset_manifest`, you can train without source dataset paths:
+
+```bash
+accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 ltx2_train_network.py ^
+  --dataset_manifest dataset_manifest.json ^
+  ... (other training args)
+```
+
+Use `--dataset_manifest` instead of `--dataset_config`.
+
+### Standard LoRA Training
 ```bash
 accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 ltx2_train_network.py ^
   --mixed_precision bf16 ^
@@ -136,6 +170,57 @@ accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 ltx2_tr
   --output_dir output ^
   --output_name ltx2_lora
 ```
+
+### Advanced: LyCORIS/LoKR Training
+
+musubi-tuner supports advanced LoRA algorithms (LoKR, LoHA, LoCoN, etc.) via:
+- `--network_args` for inline `key=value` settings
+- `--lycoris_config <path.toml>` for TOML-based settings
+
+No bundled example TOML files are shipped; provide your own config path.
+
+```bash
+# Install LyCORIS first
+pip install lycoris-lora
+
+# Example TOML (save anywhere, e.g. my_lycoris.toml)
+# [network]
+# base_algo = "lokr"
+# base_factor = 16
+#
+# [network.modules."*audio*"]
+# algo = "lora"
+# dim = 64
+# alpha = 32
+#
+# [network.init]
+# lokr_norm = 1e-3
+
+# LoKR example
+accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 ltx2_train_network.py ^
+  ... (same args as above) ^
+  --network_module lycoris.kohya ^
+  --lycoris_config my_lycoris.toml ^
+  --output_name ltx2_lokr
+
+# LoCoN example (inline args)
+accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 ltx2_train_network.py ^
+  ... (same args as above) ^
+  --network_module lycoris.kohya ^
+  --network_args "algo=locon" "conv_dim=8" "conv_alpha=4" ^
+  --output_name ltx2_locon
+```
+
+**Target format (`--network_args`)**
+- Pass args as space-separated `key=value` pairs.
+- Each pair is one argument token: `--network_args "key1=value1" "key2=value2"`.
+- Common LyCORIS keys: `algo`, `factor`, `conv_dim`, `conv_alpha`, `dropout`.
+- Use `--init_lokr_norm` only with LoKR (`algo=lokr`).
+- If both TOML and `--network_args` are used, `--network_args` can override nested TOML keys with:
+  - `modules.<name>.<param>=...`
+  - `init.<param>=...`
+
+`--lycoris_config` requires `--network_module lycoris.kohya`.
 
 ### Key Arguments
 
@@ -189,12 +274,172 @@ accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 ltx2_tr
 - Use `--use_pinned_memory_for_block_swap` - faster transfers
 
 #### Audio-Video Support
-- `--ltx2_mode av`: Enables joint Video+Audio training logic.
+- `--ltx2_mode`, `--ltx_mode`: Training modality selector. Default is `v` (`video`). Values: `video`, `av`, `audio` (aliases: `v`, `va`, `a`).
 - `--separate_audio_buckets`: Keeps audio and non-audio items in separate batches (reduces VRAM for image/video-only batches).
+- `--min_audio_batches_per_accum`: Minimum number of audio-bearing microbatches per gradient accumulation window.
+- `--audio_batch_probability`: Probability of selecting an audio-bearing batch when both audio and non-audio batches are available.
+  - `--min_audio_batches_per_accum` and `--audio_batch_probability` are mutually exclusive.
+- `--caption_dropout_rate`: Probability of dropping text conditioning for a sample during training.
 
 #### Loss Weighting
 - `--video_loss_weight`: Weight for video loss (default: 1.0).
 - `--audio_loss_weight`: Weight for audio loss in AV mode (default: 1.0).
+- `--audio_loss_balance_mode inv_freq`: Optional inverse-frequency reweighting for mixed audio/non-audio training.
+- `--audio_loss_balance_beta`: EMA update rate for observed audio-batch frequency (default: 0.01).
+- `--audio_loss_balance_eps`: Denominator floor for inverse-frequency scaling (default: 0.05).
+- `--audio_loss_balance_min`, `--audio_loss_balance_max`: Clamp range for effective audio weight (defaults: 1.0, 4.0).
+- `--audio_loss_balance_ema_init`: Initial audio-frequency EMA value (default: 1.0).
+
+Example:
+```bash
+--audio_loss_weight 1.0 ^
+--audio_loss_balance_mode inv_freq ^
+--audio_loss_balance_beta 0.01 ^
+--audio_loss_balance_eps 0.05 ^
+--audio_loss_balance_min 1.0 ^
+--audio_loss_balance_max 3.0
+```
+
+Use `inv_freq` when training mixes audio and non-audio samples and audio learning is weak/delayed.
+
+Recommended start values:
+- `--audio_loss_balance_beta 0.01` (stable EMA, slower reaction; try `0.02-0.05` for faster reaction)
+- `--audio_loss_balance_eps 0.05` (safe floor; increase to `0.1` if weights spike too much)
+- `--audio_loss_balance_min 1.0 --audio_loss_balance_max 3.0` (conservative clamp range)
+- `--audio_loss_balance_ema_init 1.0` (no warm-start boost; use `0.5` only if you want stronger early audio emphasis)
+
+#### Additional Audio Training Flags
+
+- `--independent_audio_timestep`: Sample a separate timestep for audio (AV/audio modes only).
+- `--audio_silence_regularizer`: When AV batches are missing audio latents, use synthetic silence latents instead of skipping the audio branch.
+- `--audio_silence_regularizer_weight`: Loss multiplier for synthetic-silence fallback batches.
+- `--audio_loss_balance_mode ema_mag`: Dynamic audio balancing by matching audio-loss EMA magnitude to a target fraction of video-loss EMA.
+- `--audio_loss_balance_target_ratio`: Target audio/video loss magnitude ratio for `ema_mag`.
+- `--audio_loss_balance_ema_decay`: EMA decay for `ema_mag`.
+- `--audio_supervision_mode off|warn|error`: AV audio-supervision monitor mode.
+- `--audio_supervision_warmup_steps`: Expected AV batches before supervision checks.
+- `--audio_supervision_check_interval`: Run supervision checks every N expected AV batches.
+- `--audio_supervision_min_ratio`: Minimum supervised/expected ratio required by the monitor.
+
+#### Preservation & Regularization
+
+Three optional techniques to improve LoRA quality by constraining how the LoRA changes the base model. All are disabled by default with zero overhead.
+
+**Blank Prompt Preservation** — Prevents the LoRA from altering the model's blank-prompt output (used as the CFG baseline during inference):
+```bash
+--blank_preservation --blank_preservation_args multiplier=1.0
+```
+
+**Differential Output Preservation (DOP)** — Prevents the LoRA from altering class-prompt output, scoping the LoRA effect to the trigger word only:
+```bash
+--dop --dop_args class=woman multiplier=1.0
+```
+The `class` parameter should be a general description without your trigger word (e.g., `woman`, `cat`, `landscape`).
+
+**Prior Divergence** — Encourages the LoRA to produce outputs that differ from the base model on training prompts, preventing weak/timid LoRAs:
+```bash
+--prior_divergence --prior_divergence_args multiplier=0.1
+```
+
+All three can be combined:
+```bash
+--blank_preservation --blank_preservation_args multiplier=0.5 ^
+--dop --dop_args class=woman multiplier=1.0 ^
+--prior_divergence --prior_divergence_args multiplier=0.1
+```
+
+| Technique | Extra forwards/step | Extra backwards/step | Recommended multiplier |
+|-----------|-------------------|---------------------|----------------------|
+| `--blank_preservation` | +2 | +1 | 0.5 - 1.0 |
+| `--dop` | +2 | +1 | 0.5 - 1.0 |
+| `--prior_divergence` | +1 | 0 | 0.05 - 0.1 |
+
+**VRAM note:** Each technique adds transformer forward passes per step. Using all three adds +5 forwards and +2 backwards. This significantly increases VRAM usage and step time. Not recommended with `--blocks_to_swap` on low-VRAM GPUs.
+
+**CREPA (Cross-frame Representation Alignment)** — Encourages temporal consistency across video frames by aligning DiT hidden states across frames via a small projector MLP. Based on [arxiv 2506.09229](https://arxiv.org/abs/2506.09229). Only the projector is trained; all other modules stay frozen. CREPA adds negligible overhead (no extra forward passes — it uses hooks to capture intermediate features from the existing forward pass).
+
+Enable with `--crepa`. All parameters are passed via `--crepa_args` as `key=value` pairs:
+
+```bash
+accelerate launch ... ltx2_train_network.py ^
+  --crepa ^
+  --crepa_args mode=backbone student_block_idx=16 teacher_block_idx=32 lambda_crepa=0.1 tau=1.0 num_neighbors=2 schedule=constant warmup_steps=0 normalize=true
+```
+
+#### CLI Flags
+
+| Flag | Type | Description |
+|------|------|-------------|
+| `--crepa` | store_true | Enable CREPA regularization |
+| `--crepa_args` | key=value list | Configuration parameters (see table below) |
+
+#### CREPA Parameters (`--crepa_args`)
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `mode` | `backbone` | Teacher signal source: `backbone` (deeper DiT block) or `dino` (pre-cached DINOv2 features) |
+| `dino_model` | `dinov2_vitb14` | DINOv2 variant for dino mode. Must match the model used during caching. Options: `dinov2_vits14`, `dinov2_vitb14`, `dinov2_vitl14`, `dinov2_vitg14` |
+| `student_block_idx` | 16 | Transformer block whose hidden states are aligned (0-47 for LTX-2 48-block model) |
+| `teacher_block_idx` | 32 | Deeper block providing the teacher signal (backbone mode only, must be > `student_block_idx`) |
+| `lambda_crepa` | 0.1 | Loss weight for CREPA term. Recommended range: 0.05–0.5 |
+| `tau` | 1.0 | Temporal neighbor decay factor. Controls how much nearby frames contribute vs distant ones |
+| `num_neighbors` | 2 | Number of neighboring frames on each side (K). Frame f aligns with frames f-K..f+K |
+| `schedule` | `constant` | Lambda schedule over training: `constant`, `linear` (decay to 0), or `cosine` (cosine decay to 0) |
+| `warmup_steps` | 0 | Steps before CREPA loss reaches full strength (linear ramp from 0) |
+| `max_steps` | 0 | Total training steps for schedule computation. Auto-filled from `--max_train_steps` if not set |
+| `normalize` | `true` | L2-normalize features before computing cosine similarity |
+
+#### Checkpoint & Resume
+
+- The projector weights (~33M params for backbone mode) are saved as `crepa_projector.safetensors` in the output directory alongside LoRA checkpoints.
+- When resuming training with `--crepa`, projector weights are automatically loaded from `<output_dir>/crepa_projector.safetensors` if the file exists.
+- The projector is **not needed at inference** — it's only used during training.
+
+#### Monitoring
+
+CREPA adds a `loss/crepa` metric to TensorBoard/WandB logs. A healthy CREPA loss should:
+- Start negative (cosine similarity is being maximized)
+- Gradually decrease (more negative = better alignment)
+- Stabilize after warmup
+
+#### Compatibility
+
+- Works with block swap (`--blocks_to_swap`) — hooks fire when each block executes regardless of CPU offloading.
+- Works with all preservation techniques (blank preservation, DOP, prior divergence).
+- Works with gradient checkpointing.
+- Projector params are included in gradient clipping alongside LoRA params.
+
+#### Caching DINOv2 Features (Dino Mode)
+
+Dino mode requires pre-cached DINOv2 features. Run this **after latent caching** (cache paths are derived from latent cache files). DINOv2 is not loaded during training — zero VRAM overhead.
+
+```bash
+python ltx2_cache_dino_features.py ^
+  --dataset_config dataset.toml ^
+  --dino_model dinov2_vitb14 ^
+  --dino_batch_size 16 ^
+  --device cuda ^
+  --skip_existing
+```
+
+- `--dino_model`: DINOv2 variant — `dinov2_vits14` (384d), `dinov2_vitb14` (768d, default), `dinov2_vitl14` (1024d), `dinov2_vitg14` (1536d).
+- `--dino_batch_size`: Frames per forward pass. Reduce if OOM (default: 16).
+- `--skip_existing`: Skip items that already have cached features.
+
+Output: `*_ltx2_dino.safetensors` files alongside your latent caches, containing per-frame patch tokens `[T, N_patches, D]`. For `dinov2_vitb14` at 518px input: `N_patches=1369`, `D=768`, so each frame adds ~2MB (float16). Disk usage scales linearly with frame count.
+
+**Precaching preservation prompts:** Blank preservation and DOP require Gemma to encode their prompts at training startup. To avoid loading Gemma during training, precache the embeddings during the text encoder caching step:
+```bash
+python ltx2_cache_text_encoder_outputs.py --dataset_config ... --ltx2_checkpoint ... --gemma_root ... ^
+  --precache_preservation_prompts --blank_preservation --dop --dop_class_prompt "woman"
+```
+Then add the `--use_precached_preservation` flag during training:
+```bash
+python ltx2_train_network.py ... ^
+  --blank_preservation --dop --dop_args class=woman ^
+  --use_precached_preservation
+```
+The cache file is saved to `<cache_directory>/ltx2_preservation_cache.pt` by default (same directory as your dataset cache). Use `--preservation_prompts_cache <path>` to override the location in either command. Prior divergence does not need precaching (it uses the training batch's own embeddings).
 
 #### Timestep Sampling
 - `--timestep_sampling shifted_logit_normal`: Default LTX-2 method. Uses a shifted logit-normal distribution where the shift is computed based on sequence length (frames × height × width).
@@ -231,6 +476,8 @@ Custom `include_patterns` override any preset.
 - `--sample_vae_temporal_tile_size 0`: Temporal tile size (0 disables temporal tiling).
 - `--sample_vae_temporal_tile_overlap 8`: Temporal overlap (frames).
 - `--sample_merge_audio`: Merges generated audio into the `.mp4`.
+- `--sample_audio_only`: Generate audio-only preview outputs.
+- `--sample_disable_audio`: Disable audio preview generation during sampling.
 
 #### Precached Sample Prompts
 To avoid loading Gemma during training for sample generation, you can precache the prompt embeddings:
@@ -246,33 +493,6 @@ Two-stage inference generates at half resolution, then upsamples and refines for
 - `--spatial_upsampler_path`: Path to spatial upsampler model (e.g., `ltx-2-spatial-upscaler-x2-1.0.safetensors`). Required when `--sample_two_stage` is set.
 - `--distilled_lora_path`: Path to distilled LoRA (e.g., `ltx-2-19b-distilled-lora-384.safetensors`) for stage 2 refinement. Optional.
 - `--sample_stage2_steps`: Number of denoising steps for stage 2 refinement (default: 3).
-
----
-
-## Merge LTX-2 LoRAs
-
-Use the dedicated LTX-2 LoRA merger to combine multiple LoRA files into a single LoRA checkpoint.
-
-**Script:** `ltx2_merge_lora.py`
-
-### Example Command (Windows)
-```bash
-python ltx2_merge_lora.py ^
-  --lora_weight path/to/lora_A.safetensors path/to/lora_B.safetensors ^
-  --lora_multiplier 1.0 1.0 ^
-  --save_merged_lora path/to/merged_lora.safetensors
-```
-
-### Key Arguments
-- `--lora_weight`: Input LoRA paths to merge in order (required).
-- `--lora_multiplier`: Per-LoRA multipliers aligned with `--lora_weight`. Use one value to apply the same multiplier to all inputs.
-- `--save_merged_lora`: Output merged LoRA path (required).
-- `--dtype auto|float32|float16|bfloat16`: Output tensor dtype. `auto` promotes from input dtypes.
-- `--emit_alpha`: Force writing `<module>.alpha` keys in output.
-
-### Notes
-- This merger is intended for LTX-2 LoRA formats used in this repo, including Comfy-style `lora_A/lora_B` weights.
-- It handles different ranks and partial module overlap across input LoRAs.
 
 ---
 
@@ -294,6 +514,7 @@ cache_directory/
   000001_1024x0576_ltx2.safetensors       # video latents
   000001_ltx2_te.safetensors              # text encoder outputs
   000001_ltx2_audio.safetensors           # audio latents (av mode only)
+  000001_1024x0576_ltx2_dino.safetensors  # DINOv2 features (CREPA dino mode only)
 ```
 
 ---
@@ -309,4 +530,175 @@ cache_directory/
 | Audio caching fails | torchaudio missing | Install torchaudio before running `ltx2_cache_latents.py` |
 | Sampling OOM | VAE decode too large | Enable `--sample_tiled_vae` or reduce `--sample_vae_temporal_tile_size` |
 | Crash with block swap (esp. RTX 5090) | `--use_pinned_memory_for_block_swap` bug | Remove `--use_pinned_memory_for_block_swap` from training arguments |
+| `stack expects each tensor to be equal size` during AV training | Mixed audio/non-audio videos in the same batch — text embeddings are 7680-dim for AV items vs 3840-dim for video-only, and `torch.stack` fails | Add `--separate_audio_buckets` to training args. This is **required** when your dataset has a mix of videos with and without audio at `batch_size > 1`. At `batch_size=1` the flag has no effect. When all videos have audio (or all don't), the flag is also unnecessary |
+| Wrong frame count in cached latents | Auto-detected FPS incorrect (e.g., VFR video) | Set `source_fps` explicitly in TOML config to override auto-detection |
+| Too few frames from high-FPS video | FPS resampling working correctly (e.g., 60fps→24fps = 40% of frames) | This is expected behavior. Set `target_fps = 60` if you want to keep all frames |
+| Audio/video out of sync after caching | Source FPS mismatch causing wrong time-stretch | Check "Auto-detected source FPS" log line; set `source_fps` explicitly if wrong |
+| Voice/audio learning slow when mixing images with videos in AV mode | Image batches produce zero audio training signal — the entire audio branch is skipped (no audio forward pass, no audio loss, no audio gradients). This dilutes audio learning proportionally to the fraction of image steps | Use video-only datasets for AV training when voice quality matters. If you must mix images, expect audio to require proportionally more training steps to converge |
+| CUDA errors or crashes on RTX 5090 / 50xx GPUs | CUDA 12.6 (`cu126`) is not supported on Windows for Blackwell-architecture GPUs | Use CUDA 12.8 (`cu128`) when installing PyTorch: `pip install torch==2.8.0 ... --index-url https://download.pytorch.org/whl/cu128`. See the [CUDA Version](#cuda-version) section under Installation |
+
+---
+
+## 4. Slider LoRA Training
+
+Slider LoRAs learn a controllable direction in model output space (e.g., "detailed" vs "blurry"). At inference, you scale the LoRA multiplier to control the effect strength and direction: `+1.0` enhances, `-1.0` erases, `0.0` is the base model, and values like `+2.0` or `-0.5` work too.
+
+**Script:** `ltx2_train_slider.py`
+
+Two modes are available:
+
+| Mode | Input | Use Case |
+|------|-------|----------|
+| `text` | Prompt pairs only (no dataset) | Quick concept sliders from text descriptions |
+| `reference` | Pre-cached latent pairs | Precise control from paired positive/negative images |
+
+### 4a. Text-Only Mode
+
+Learns a slider direction from positive/negative prompt pairs. No images or dataset config needed.
+
+#### Slider Config (`ltx2_slider.toml`)
+
+```toml
+mode = "text"
+guidance_strength = 1.0
+sample_slider_range = [-2.0, -1.0, 0.0, 1.0, 2.0]
+
+[[targets]]
+positive = "extremely detailed, sharp, high resolution, 8k"
+negative = "blurry, out of focus, low quality, soft"
+target_class = ""      # empty = affect all content
+weight = 1.0
+```
+
+- `guidance_strength`: Scales the directional offset applied to targets. Higher values = stronger direction signal but may overshoot.
+- `target_class`: The conditioning prompt used during training passes. Empty string means the slider affects all content regardless of prompt. Set to e.g. `"a portrait"` to restrict the slider's effect to a specific subject.
+- `weight`: Per-target loss weight. Useful when training multiple directions simultaneously.
+- `sample_slider_range`: Multiplier values used for preview samples during training.
+
+Multiple `[[targets]]` blocks can be defined to train several directions at once (e.g., detail + lighting).
+
+#### Example Command (Text-Only)
+
+```bash
+accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 ltx2_train_slider.py ^
+  --mixed_precision bf16 ^
+  --ltx2_checkpoint /path/to/ltx-2.safetensors ^
+  --gemma_root /path/to/gemma ^
+  --gemma_load_in_8bit ^
+  --fp8_base --fp8_scaled ^
+  --gradient_checkpointing ^
+  --blocks_to_swap 10 ^
+  --network_module networks.lora_ltx2 ^
+  --network_dim 16 --network_alpha 16 ^
+  --lora_target_preset t2v ^
+  --learning_rate 1e-4 ^
+  --optimizer_type AdamW8bit ^
+  --lr_scheduler constant_with_warmup --lr_warmup_steps 20 ^
+  --max_train_steps 500 ^
+  --output_dir output --output_name detail_slider ^
+  --slider_config ltx2_slider.toml ^
+  --latent_frames 1 ^
+  --latent_height 512 --latent_width 768
+```
+
+#### Text-Only Arguments
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--slider_config` | (required) | Path to slider TOML config file |
+| `--latent_frames` | 1 | Number of latent frames (1=image, >1=video) |
+| `--latent_height` | 512 | Pixel height for synthetic latents |
+| `--latent_width` | 768 | Pixel width for synthetic latents |
+| `--guidance_strength` | (from TOML) | Override `guidance_strength` from config |
+| `--sample_slider_range` | (from TOML) | Override as comma-separated values, e.g. `"-2,-1,0,1,2"` |
+
+All standard training arguments (`--fp8_base`, `--blocks_to_swap`, `--gradient_checkpointing`, etc.) work the same as regular training. `--dataset_config` is not needed for text-only mode.
+
+### 4b. Reference Mode
+
+Learns a slider direction from paired positive/negative images (or videos). Requires pre-cached latents.
+
+#### Step 1: Prepare Paired Data
+
+Create two directories with matching filenames — one with positive-attribute images, one with negative:
+
+```
+positive_images/        negative_images/
+  img_001.png             img_001.png      # same subject, different attribute
+  img_002.png             img_002.png
+  img_003.png             img_003.png
+```
+
+Each positive image must have a corresponding negative image with the same filename. The images should depict the same subject but differ in the target attribute (e.g., smiling vs neutral face, detailed vs blurry).
+
+#### Step 2: Cache Latents and Text
+
+Create a dataset config for each directory and run the caching scripts. Both directories can share the same text captions (since the direction comes from the images, not the text).
+
+```bash
+# Cache positive latents
+python ltx2_cache_latents.py --dataset_config positive_dataset.toml --ltx2_checkpoint /path/to/ltx-2.safetensors
+
+# Cache negative latents
+python ltx2_cache_latents.py --dataset_config negative_dataset.toml --ltx2_checkpoint /path/to/ltx-2.safetensors
+
+# Cache text (once, for either directory — text is shared)
+python ltx2_cache_text_encoder_outputs.py --dataset_config positive_dataset.toml --ltx2_checkpoint /path/to/ltx-2.safetensors --gemma_root /path/to/gemma
+```
+
+#### Step 3: Configure and Train
+
+##### Slider Config (`ltx2_slider_reference.toml`)
+
+```toml
+mode = "reference"
+pos_cache_dir = "path/to/positive/cache"
+neg_cache_dir = "path/to/negative/cache"
+text_cache_dir = "path/to/positive/cache"   # can be same as pos (text is shared)
+sample_slider_range = [-2.0, -1.0, 0.0, 1.0, 2.0]
+```
+
+- `pos_cache_dir`: Directory containing cached positive latents (output of `ltx2_cache_latents.py`)
+- `neg_cache_dir`: Directory containing cached negative latents
+- `text_cache_dir`: Directory containing cached text encoder outputs. Defaults to `pos_cache_dir` if omitted.
+
+Pairs are matched by filename: for each `{name}_{W}x{H}_ltx2.safetensors` in the positive directory, a matching file must exist in the negative directory. Unmatched files are skipped with a warning.
+
+##### Example Command (Reference)
+
+```bash
+accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 ltx2_train_slider.py ^
+  --mixed_precision bf16 ^
+  --ltx2_checkpoint /path/to/ltx-2.safetensors ^
+  --fp8_base --fp8_scaled ^
+  --gradient_checkpointing ^
+  --blocks_to_swap 10 ^
+  --network_module networks.lora_ltx2 ^
+  --network_dim 16 --network_alpha 16 ^
+  --lora_target_preset t2v ^
+  --learning_rate 1e-4 ^
+  --optimizer_type AdamW8bit ^
+  --lr_scheduler constant_with_warmup --lr_warmup_steps 20 ^
+  --max_train_steps 500 ^
+  --output_dir output --output_name smile_slider ^
+  --slider_config ltx2_slider_reference.toml
+```
+
+Note: `--gemma_root` is not needed for reference mode (text embeddings are loaded from cache). `--dataset_config`, `--latent_frames/height/width` are also not used.
+
+### Slider Tips
+
+- **Start small**: `--network_dim 8` or `16` with `--max_train_steps 200-500` is usually sufficient.
+- **Monitor loss**: Loss should decrease steadily. If it diverges, reduce `--learning_rate`.
+- **Preview samples**: Add `--sample_prompts sampling_prompts.txt --sample_every_n_steps 50` to generate previews at each slider strength during training. Requires `--gemma_root` for text encoding.
+- **Guidance strength**: For text-only mode, `1.0` is a safe default. Values of `2.0-3.0` produce stronger but potentially less stable sliders.
+- **Multiple targets**: Text-only mode supports multiple `[[targets]]` blocks. Each step randomly selects one target, so all directions get trained evenly.
+- **Inference**: Use the trained LoRA with any multiplier value. Positive multipliers enhance the positive attribute, negative multipliers enhance the negative attribute. Values beyond `[-1, +1]` extrapolate the effect.
+
+---
+
+## Useful Links
+
+- [Installation Guide](https://github.com/AkaneTendo25/musubi-tuner/discussions/19) — Setup instructions, dependencies, flash-attn, troubleshooting
+- [Optimizers Guide](https://github.com/AkaneTendo25/musubi-tuner/discussions/21) — Optimizer comparison, recommended settings, memory usage tips
 

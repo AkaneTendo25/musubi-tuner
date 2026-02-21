@@ -18,6 +18,7 @@ import torch
 from safetensors.torch import save_file
 
 import musubi_tuner.cache_latents as cache_latents
+from musubi_tuner.audio_io_utils import coerce_decoded_audio_to_channels_first
 from musubi_tuner.dataset import config_utils
 from musubi_tuner.dataset.config_utils import BlueprintGenerator, ConfigSanitizer
 from musubi_tuner.dataset.image_video_dataset import (
@@ -197,6 +198,7 @@ def encode_and_save_audio_cache(
     *,
     audio_path: str,
     dtype: torch.dtype,
+    target_fps: float = 25.0,
 ) -> None:
     try:
         import torchaudio
@@ -223,13 +225,15 @@ def encode_and_save_audio_cache(
             sample_rate: Optional[int] = int(getattr(audio_stream, "rate", 0)) or None
 
             for frame in container.decode(audio=0):
-                # Typically returns shape [samples, channels] or [channels, samples]
-                arr = frame.to_ndarray()
-                if arr.ndim == 1:
-                    arr = arr[None, :]
-                elif arr.shape[0] > arr.shape[1]:
-                    # assume [samples, channels]
-                    arr = arr.T
+                # PyAV can return packed interleaved 1D data for stereo;
+                # normalize everything to [channels, samples].
+                frame_channels = None
+                try:
+                    frame_channels = int(len(frame.layout.channels))  # type: ignore[arg-type]
+                except Exception:
+                    frame_channels = int(getattr(audio_stream, "channels", 0)) or None
+
+                arr = coerce_decoded_audio_to_channels_first(frame.to_ndarray(), channels=frame_channels)
 
                 if sample_rate is None:
                     sample_rate = int(getattr(frame, "sample_rate", 0)) or None
@@ -303,6 +307,18 @@ def encode_and_save_audio_cache(
         if end_sample > start_sample:
             waveform = waveform[:, start_sample:end_sample]
 
+    # Pitch-preserving time stretch when source audio duration doesn't match target video duration
+    frame_count = getattr(item_info, "frame_count", None)
+    if isinstance(frame_count, int) and frame_count > 0 and waveform.shape[-1] > 0:
+        expected_duration = float(frame_count) / max(float(target_fps), 1.0)
+        actual_duration = float(waveform.shape[-1]) / float(sample_rate)
+        if actual_duration > 0 and abs(actual_duration - expected_duration) / actual_duration > 0.01:
+            from musubi_tuner.audio_utils import time_stretch_preserve_pitch
+
+            target_samples = int(expected_duration * sample_rate)
+            if target_samples > 0:
+                waveform = time_stretch_preserve_pitch(waveform, sample_rate, target_samples)
+
     waveform = waveform.unsqueeze(0)
     encoder_param = next(encoder.parameters())
     device = encoder_param.device
@@ -323,7 +339,7 @@ def encode_and_save_audio_cache(
         expected_steps = _expected_audio_latent_length_for_item(
             item_info,
             encoder,
-            fps=float(VideoDataset.TARGET_FPS_LTX2),
+            fps=target_fps,
         )
         if expected_steps is not None:
             latents = _align_audio_latents_to_video(latents, expected_steps)
@@ -361,6 +377,137 @@ def encode_and_save_audio_cache(
     save_file(sd, audio_cache_path, metadata=metadata)
 
 
+def _precache_sample_latents(args: argparse.Namespace, device: torch.device) -> None:
+    """Cache I2V conditioning image latents for sample prompts."""
+    from musubi_tuner.hv_train_network import load_prompts
+    from PIL import Image
+    import torchvision.transforms.functional as TF
+    import os
+
+    if args.sample_prompts is None:
+        raise ValueError("--sample_prompts is required when --precache_sample_latents is set")
+
+    prompts = load_prompts(args.sample_prompts)
+    if not prompts:
+        raise ValueError(f"No prompts found in {args.sample_prompts}")
+
+    # Filter prompts that have image_path
+    prompts_with_images = [(i, p) for i, p in enumerate(prompts) if p.get("image_path")]
+    if not prompts_with_images:
+        logger.info("No I2V images found in sample prompts - nothing to cache")
+        return
+
+    logger.info(f"Found {len(prompts_with_images)} prompts with I2V images")
+
+    # Load VAE encoder
+    from musubi_tuner.ltx_2.loader.single_gpu_model_builder import SingleGPUModelBuilder
+    from musubi_tuner.ltx_2.model.video_vae import VideoEncoderConfigurator, VAE_ENCODER_COMFY_KEYS_FILTER
+
+    vae_checkpoint = getattr(args, "vae", None) or getattr(args, "ltx2_checkpoint", None)
+    if not vae_checkpoint:
+        raise ValueError("VAE checkpoint required for I2V latent precaching (--vae or --ltx2_checkpoint)")
+
+    vae_dtype = torch.bfloat16  # Standard for LTX-2
+    logger.info("Loading VAE encoder for I2V image precaching")
+    vae_encoder = SingleGPUModelBuilder(
+        model_path=str(vae_checkpoint),
+        model_class_configurator=VideoEncoderConfigurator,
+        model_sd_ops=VAE_ENCODER_COMFY_KEYS_FILTER,
+    ).build(device=device, dtype=vae_dtype)
+    vae_encoder.eval()
+
+    # Cache latents
+    latent_cache: list[dict] = []
+    spatial_factor = 32  # LTX-2 VAE spatial downsample factor
+
+    for idx, prompt_dict in prompts_with_images:
+        image_path = prompt_dict["image_path"]
+        try:
+            if not os.path.exists(image_path):
+                logger.warning(f"I2V image not found, skipping prompt #{idx}: {image_path}")
+                continue
+
+            # Get dimensions from prompt or use defaults
+            width = prompt_dict.get("width", 768)
+            height = prompt_dict.get("height", 512)
+            width = (width // spatial_factor) * spatial_factor
+            height = (height // spatial_factor) * spatial_factor
+
+            # Load and encode image
+            logger.info(f"Encoding I2V image for prompt #{idx}: {os.path.basename(image_path)}")
+            image = Image.open(image_path).convert("RGB")
+
+            # Match official LTX-2 image-conditioning preprocessing:
+            # resize-to-cover while preserving aspect ratio, then center-crop.
+            current_width, current_height = image.size
+            if current_height != height or current_width != width:
+                aspect_ratio = current_width / current_height
+                target_aspect_ratio = width / height
+
+                if aspect_ratio > target_aspect_ratio:
+                    resize_height = height
+                    resize_width = max(width, int(round(height * aspect_ratio)))
+                else:
+                    resize_width = width
+                    resize_height = max(height, int(round(width / aspect_ratio)))
+
+                image = image.resize((resize_width, resize_height), Image.LANCZOS)
+                left = max((resize_width - width) // 2, 0)
+                top = max((resize_height - height) // 2, 0)
+                image = image.crop((left, top, left + width, top + height))
+
+            image_tensor = TF.to_tensor(image).unsqueeze(0)  # [1, 3, H, W]
+            image_tensor = (image_tensor * 2.0 - 1.0).to(device=device, dtype=vae_dtype)
+            image_tensor = image_tensor.unsqueeze(2)  # [1, 3, 1, H, W]
+
+            with torch.no_grad():
+                conditioning_latent = vae_encoder(image_tensor)
+
+            latent_cache.append({
+                "prompt_index": idx,
+                "image_path": image_path,
+                "conditioning_latent": conditioning_latent.cpu(),
+            })
+            logger.info(f"Encoded I2V latent for prompt #{idx}: {conditioning_latent.shape}")
+
+        except Exception as e:
+            logger.error(f"Failed to encode I2V image for prompt #{idx} '{image_path}': {e}")
+
+    # Clean up VAE encoder
+    del vae_encoder
+    from musubi_tuner.utils.device_utils import clean_memory_on_device
+    clean_memory_on_device(device)
+    logger.info("VAE encoder cleaned up")
+
+    # Determine cache path
+    if args.sample_latents_cache:
+        cache_path = args.sample_latents_cache
+    else:
+        # Default: use first dataset's cache directory
+        try:
+            datasets = _load_datasets(args)
+            if datasets:
+                cache_dir = getattr(datasets[0], "cache_directory", None)
+                if cache_dir:
+                    os.makedirs(cache_dir, exist_ok=True)
+                    cache_path = os.path.join(cache_dir, "ltx2_sample_latents_cache.pt")
+                else:
+                    cache_path = "ltx2_sample_latents_cache.pt"
+            else:
+                cache_path = "ltx2_sample_latents_cache.pt"
+        except Exception as e:
+            logger.warning(f"Could not load datasets for cache path resolution: {e}")
+            cache_path = "ltx2_sample_latents_cache.pt"
+
+    # Save cache
+    payload = {
+        "version": 1,
+        "latent_cache": latent_cache,
+    }
+    torch.save(payload, cache_path)
+    logger.info(f"Saved {len(latent_cache)} I2V conditioning latents to {cache_path}")
+
+
 def main() -> None:
     parser = cache_latents.setup_parser_common()
     parser = ltx2_setup_parser(parser)
@@ -375,7 +522,23 @@ def main() -> None:
 
     device = torch.device(args.device) if args.device else torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    # Handle I2V sample latent precaching if requested.
+    # This is additive: continue with normal dataset latent caching afterward.
+    if getattr(args, "precache_sample_latents", False):
+        _precache_sample_latents(args, device)
+        logger.info("I2V sample latent precaching complete; continuing with dataset latent caching")
+
     datasets = _load_datasets(args)
+    if args.save_dataset_manifest:
+        user_config = config_utils.load_user_config(args.dataset_config)
+        manifest = config_utils.create_cache_only_dataset_manifest(
+            user_config,
+            args,
+            architecture=ARCHITECTURE_LTX2,
+            source_dataset_config=args.dataset_config,
+        )
+        manifest_path = config_utils.save_dataset_manifest(manifest, args.save_dataset_manifest)
+        logger.info("Saved cache-only dataset manifest: %s", manifest_path)
 
     if args.debug_mode is not None:
         cache_latents.show_datasets(list(datasets), args.debug_mode, args.console_width, args.console_back, args.console_num_images)
@@ -489,6 +652,7 @@ def main() -> None:
         for ds in datasets:
             if not isinstance(ds, (VideoDataset, AudioDataset)):
                 continue
+            ds_target_fps = getattr(ds, "target_fps", VideoDataset.TARGET_FPS_LTX2)
             num_workers = args.num_workers if args.num_workers is not None else max(1, (os.cpu_count() or 2) - 1)
             for _bucket_key, batch in ds.retrieve_latent_cache_batches(num_workers):
                 for item_info in batch:
@@ -511,6 +675,7 @@ def main() -> None:
                             item_info,
                             audio_path=audio_path,
                             dtype=audio_dtype,
+                            target_fps=float(ds_target_fps),
                         )
                     except Exception as e:
                         logger.warning(
@@ -527,9 +692,9 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         "--ltx2_mode", "--ltx_mode",
         dest="ltx_mode",
         type=str,
-        default="video",
+        default="v",
         choices=["video", "av", "audio", "v", "a", "va"],
-        help="Caching modality: 'video' (default), 'av' for audio+video, 'audio' for audio-only.",
+        help="Caching modality: 'video' (default) for video-only, 'av' for audio+video, 'audio' for audio-only.",
     )
     parser.add_argument("--ltx2_checkpoint", type=str, default=None, help="Path to LTX-2 checkpoint (.safetensors)")
     parser.add_argument("--vae_chunk_size", type=int, default=None, help="chunk size for CausalConv3d in VAE")
@@ -562,6 +727,23 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         help="Override dummy video channels for audio-only caching (auto-detected by default).",
     )
     parser.add_argument("--audio_dummy_video_dtype", type=str, default=None)
+    parser.add_argument(
+        "--precache_sample_latents",
+        action="store_true",
+        help="Cache I2V conditioning image latents for sample prompts, then continue normal dataset latent caching.",
+    )
+    parser.add_argument(
+        "--sample_prompts",
+        type=str,
+        default=None,
+        help="Sample prompts file (for --precache_sample_latents).",
+    )
+    parser.add_argument(
+        "--sample_latents_cache",
+        type=str,
+        default=None,
+        help="Path to save I2V conditioning latents cache (default: cache_dir/ltx2_sample_latents_cache.pt).",
+    )
     return parser
 
 

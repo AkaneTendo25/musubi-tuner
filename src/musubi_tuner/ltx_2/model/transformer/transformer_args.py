@@ -1,5 +1,6 @@
 from dataclasses import dataclass, replace
 import logging
+import os
 
 import torch
 from musubi_tuner.ltx_2.model.transformer.adaln import AdaLayerNormSingle
@@ -122,6 +123,12 @@ class TransformerArgsPreprocessor:
         """Prepare attention mask."""
         if attention_mask is None or torch.is_floating_point(attention_mask):
             return attention_mask
+        # If all tokens are valid (no-op mask), return None so SDPA/FlashAttention
+        # can use the fast maskless kernel path (~20-25% speedup on cross-attention).
+        # Inspired by https://github.com/Nerogar/OneTrainer/pull/1109
+        if os.getenv("LTX2_SKIP_NOOP_ATTN_MASK", "0") == "1":
+            if attention_mask.dtype == torch.bool and torch.all(attention_mask):
+                return None
         if attention_mask.dtype == torch.bool:
             attention_mask = attention_mask.to(torch.int64)
 
