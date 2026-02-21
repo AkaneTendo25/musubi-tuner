@@ -44,6 +44,31 @@ def compute_trapezoidal_mask_1d(
     return mask.clamp_(0, 1)
 
 
+def compute_rectangular_mask_1d(
+    length: int,
+    left_ramp: int,
+    right_ramp: int,
+) -> torch.Tensor:
+    """
+    Generate a 1D rectangular (pulse) mask.
+    Args:
+        length: Output length of the mask.
+        left_ramp: Number of elements at the start of the mask to set to 0.
+        right_ramp: Number of elements at the end of the mask to set to 0.
+    Returns:
+        A 1D tensor of shape `(length,)` with values 0 or 1.
+    """
+    if length <= 0:
+        raise ValueError("Mask length must be positive.")
+
+    mask = torch.ones(length)
+    if left_ramp > 0:
+        mask[:left_ramp] = 0
+    if right_ramp > 0:
+        mask[-right_ramp:] = 0
+    return mask
+
+
 @dataclass(frozen=True)
 class SpatialTilingConfig:
     """Configuration for dividing each frame into spatial tiles with optional overlap.

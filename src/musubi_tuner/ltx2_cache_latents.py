@@ -577,18 +577,33 @@ def main() -> None:
             vae.set_chunk_size_for_causal_conv_3d(args.vae_chunk_size)
             logger.info("Set chunk_size to %s for CausalConv3d in VAE", args.vae_chunk_size)
 
-        from musubi_tuner.ltx_2.model.video_vae.tiling import TilingConfig, SpatialTilingConfig
+        from musubi_tuner.ltx_2.model.video_vae.tiling import TilingConfig, SpatialTilingConfig, TemporalTilingConfig
+
+        spatial_config = None
+        temporal_config = None
+
+        if args.vae_spatial_tile_size is not None:
+            logger.info("Enabling spatial tiling: size=%s, overlap=%s",
+                        args.vae_spatial_tile_size, args.vae_spatial_tile_overlap)
+            spatial_config = SpatialTilingConfig(
+                tile_size_in_pixels=args.vae_spatial_tile_size,
+                tile_overlap_in_pixels=args.vae_spatial_tile_overlap,
+            )
+
+        if args.vae_temporal_tile_size is not None:
+            logger.info("Enabling temporal tiling: size=%s frames, overlap=%s frames",
+                        args.vae_temporal_tile_size, args.vae_temporal_tile_overlap)
+            temporal_config = TemporalTilingConfig(
+                tile_size_in_frames=args.vae_temporal_tile_size,
+                tile_overlap_in_frames=args.vae_temporal_tile_overlap,
+            )
 
         tiling_config = None
-        if args.vae_spatial_tile_size is not None:
-             logger.info("Enabling spatial tiling: size=%s, overlap=%s", 
-                         args.vae_spatial_tile_size, args.vae_spatial_tile_overlap)
-             tiling_config = TilingConfig(
-                 spatial_config=SpatialTilingConfig(
-                     tile_size_in_pixels=args.vae_spatial_tile_size,
-                     tile_overlap_in_pixels=args.vae_spatial_tile_overlap
-                 )
-             )
+        if spatial_config is not None or temporal_config is not None:
+            tiling_config = TilingConfig(
+                spatial_config=spatial_config,
+                temporal_config=temporal_config,
+            )
 
         def encode_fn(batch: List[ItemInfo]) -> None:
             encode_and_save_batch(vae, batch, tiling_config)
@@ -698,8 +713,10 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
     )
     parser.add_argument("--ltx2_checkpoint", type=str, default=None, help="Path to LTX-2 checkpoint (.safetensors)")
     parser.add_argument("--vae_chunk_size", type=int, default=None, help="chunk size for CausalConv3d in VAE")
-    parser.add_argument("--vae_spatial_tile_size", type=int, default=None, help="Spatial tile size in pixels (e.g. 512)")
-    parser.add_argument("--vae_spatial_tile_overlap", type=int, default=64, help="Spatial tile overlap in pixels (default 64)")
+    parser.add_argument("--vae_spatial_tile_size", type=int, default=None, help="Spatial tile size in pixels (e.g. 512). Must be >= 64 and divisible by 32.")
+    parser.add_argument("--vae_spatial_tile_overlap", type=int, default=64, help="Spatial tile overlap in pixels (default 64). Must be divisible by 32.")
+    parser.add_argument("--vae_temporal_tile_size", type=int, default=None, help="Temporal tile size in frames (e.g. 64). Must be >= 16 and divisible by 8.")
+    parser.add_argument("--vae_temporal_tile_overlap", type=int, default=24, help="Temporal tile overlap in frames (default 24). Must be divisible by 8.")
     parser.add_argument(
         "--ltx2_audio_source",
         type=str,

@@ -73,15 +73,31 @@ python ltx2_cache_latents.py ^
 | `*_ltx2_audio.safetensors` | Audio latents: `audio_latents_{T}x{mel_bins}x{channels}_{dtype}`, `audio_lengths_int32` |
 
 ### Memory Optimization for Caching
-If you encounter Out-Of-Memory (OOM) errors during caching (especially with higher resolutions like 1080p), use VAE temporal chunking:
+If you encounter Out-Of-Memory (OOM) errors during caching (especially with higher resolutions like 1080p), you have two options:
 
+**Option 1: VAE temporal chunking** (simpler, for moderate OOM)
 ```bash
 python ltx2_cache_latents.py ^
   ...
   --vae_chunk_size 16
 ```
-
 - `--vae_chunk_size`: Processes video in temporal chunks (e.g., 16 or 32 frames at a time). Default: `None` (all frames).
+
+**Option 2: VAE tiled encoding** (larger VRAM savings, for severe OOM or high-resolution videos)
+```bash
+python ltx2_cache_latents.py ^
+  ...
+  --vae_spatial_tile_size 512 ^
+  --vae_spatial_tile_overlap 64
+```
+- `--vae_spatial_tile_size`: Splits each frame into spatial tiles of this size in pixels (e.g., 512). Must be >= 64 and divisible by 32. Default: `None` (disabled).
+- `--vae_spatial_tile_overlap`: Overlap between spatial tiles in pixels. Must be divisible by 32. Default: `64`.
+- `--vae_temporal_tile_size`: Splits the video into temporal tiles of this many frames (e.g., 64). Must be >= 16 and divisible by 8. Default: `None` (disabled).
+- `--vae_temporal_tile_overlap`: Overlap between temporal tiles in frames. Must be divisible by 8. Default: `24`.
+
+Spatial and temporal tiling can be combined. Tiled encoding produces nearly identical latents (RMSE < 1e-3) with 50-70% less VRAM at the cost of ~30% slower encoding.
+
+Both options can be combined (e.g., `--vae_chunk_size 16 --vae_spatial_tile_size 512`).
 
 ---
 
@@ -742,6 +758,7 @@ cache_directory/
 | Too few frames from high-FPS video | FPS resampling working correctly (e.g., 60fps→24fps = 40% of frames) | This is expected behavior. Set `target_fps = 60` if you want to keep all frames |
 | Audio/video out of sync after caching | Source FPS mismatch causing wrong time-stretch | Check "Auto-detected source FPS" log line; set `source_fps` explicitly if wrong |
 | Voice/audio learning slow when mixing images with videos in AV mode | Image batches produce zero audio training signal — the entire audio branch is skipped (no audio forward pass, no audio loss, no audio gradients). This dilutes audio learning proportionally to the fraction of image steps | Use video-only datasets for AV training when voice quality matters. If you must mix images, expect audio to require proportionally more training steps to converge |
+| No audio during sampling in video training mode | `ltx2_mode` is set to `v`/`video` | This is expected behavior. The sampler automatically bypasses loading the audio vocoder/decoder to save memory when the architecture is instantiated as video-only. To generate audio during sampling, you must train in AV mode (`--ltx2_mode av` or `audio`). |
 | CUDA errors or crashes on RTX 5090 / 50xx GPUs | CUDA 12.6 (`cu126`) is not supported on Windows for Blackwell-architecture GPUs | Use CUDA 12.8 (`cu128`) when installing PyTorch: `pip install torch==2.8.0 ... --index-url https://download.pytorch.org/whl/cu128`. See the [CUDA Version](#cuda-version) section under Installation |
 
 ---
