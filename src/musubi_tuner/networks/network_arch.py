@@ -35,6 +35,15 @@ def detect_arch_config(unet):
 
         return FRAMEPACK_TARGET_REPLACE_MODULES, [r".*(norm).*"]
 
+    if "LTX2Wrapper" in module_class_names or "LTXAVModel" in module_class_names or "LTXVideoOnlyModel" in module_class_names:
+        from .lora_ltx2 import LTX2_TARGET_REPLACE_MODULES
+
+        return LTX2_TARGET_REPLACE_MODULES, [
+            r".*text_embedding_projection\.aggregate_embed.*",
+            r".*embeddings_connector\..*",
+            r".*audio_embeddings_connector\..*",
+        ]
+
     # Kandinsky5 is not supported in auto-detection (uses include_patterns, requires special handling)
 
     if "DoubleStreamBlock" in module_class_names:
