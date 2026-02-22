@@ -544,7 +544,148 @@ To use custom layer patterns instead of a preset, use `--network_args`:
 ```
 Custom `include_patterns` override any preset.
 
-**Note:** IC-LoRA training is not currently supported but is being developed.
+#### IC-LoRA / Video-to-Video Training
+
+IC-LoRA (In-Context LoRA) trains the model to generate video conditioned on a reference image or video.
+
+Reference frames are encoded as clean latent tokens (timestep=0) and concatenated with noisy target tokens during training. The model attends across both sequences, using the reference as conditioning context. At inference, the same concatenation scheme is applied. Position embeddings are computed separately for reference and target, allowing different spatial resolutions via `--reference_downscale`.
+
+##### Step 1: Prepare Dataset
+
+Create a video dataset with a matching reference directory. Each reference file must share the same filename stem as its corresponding training video:
+
+```
+videos/                    references/
+  scene_001.mp4              scene_001.png     # reference for scene_001
+  scene_002.mp4              scene_002.jpg
+  scene_003.mp4              scene_003.mp4     # video references also work
+```
+
+References can be images (single frame) or videos (multiple frames).
+
+##### Step 2: Dataset Config
+
+Add `reference_directory` and `reference_cache_directory` to your TOML config:
+
+```toml
+[general]
+resolution = [768, 512]
+caption_extension = ".txt"
+batch_size = 1
+enable_bucket = true
+cache_directory = "cache"
+reference_cache_directory = "cache_ref"
+
+[[datasets]]
+video_directory = "videos"
+reference_directory = "references"
+target_frames = [1, 17, 33]
+```
+
+##### Step 3: Cache Latents
+
+Cache both video latents and reference latents in one step:
+
+```bash
+python ltx2_cache_latents.py ^
+  --dataset_config dataset.toml ^
+  --ltx2_checkpoint /path/to/ltx-2.safetensors ^
+  --device cuda ^
+  --vae_dtype bf16
+```
+
+Reference latents are automatically cached to `reference_cache_directory` when `reference_directory` is configured.
+
+**Downscaled references** (`--reference_downscale`):
+```bash
+python ltx2_cache_latents.py ^
+  --dataset_config dataset.toml ^
+  --ltx2_checkpoint /path/to/ltx-2.safetensors ^
+  --reference_downscale 2 ^
+  --device cuda
+```
+
+`--reference_downscale 2` encodes references at half spatial resolution (e.g., 384px for 768px target). Position embeddings on the reference spatial axes are scaled by the factor so they map into the target coordinate space.
+
+##### Step 4: Cache Text Encoder Outputs
+
+Same as standard training — no special flags needed:
+```bash
+python ltx2_cache_text_encoder_outputs.py ^
+  --dataset_config dataset.toml ^
+  --ltx2_checkpoint /path/to/ltx-2.safetensors ^
+  --gemma_root /path/to/gemma ^
+  --gemma_load_in_8bit ^
+  --device cuda
+```
+
+##### Step 5: Train
+
+Use `--lora_target_preset v2v` (targets attention + FFN layers):
+
+```bash
+accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 ltx2_train_network.py ^
+  --mixed_precision bf16 ^
+  --dataset_config dataset.toml ^
+  --ltx2_checkpoint /path/to/ltx-2.safetensors ^
+  --fp8_base --fp8_scaled ^
+  --blocks_to_swap 10 ^
+  --flash_attn ^
+  --gradient_checkpointing ^
+  --network_module networks.lora_ltx2 ^
+  --network_dim 32 --network_alpha 32 ^
+  --lora_target_preset v2v ^
+  --ltx2_first_frame_conditioning_p 0.2 ^
+  --timestep_sampling shifted_logit_normal ^
+  --learning_rate 1e-4 ^
+  --sample_at_first ^
+  --sample_every_n_epochs 5 ^
+  --sample_prompts sampling_prompts.txt ^
+  --sample_include_reference ^
+  --output_dir output ^
+  --output_name ltx2_ic_lora
+```
+
+If you used `--reference_downscale` during caching, also pass it during training:
+```bash
+  --reference_downscale 2
+```
+
+##### Step 6: Sample Prompts
+
+Use `--v <path>` in your sampling prompts file to specify the V2V reference for each prompt. Both images and videos are supported:
+
+```
+--v references/scene_001.png A woman walking through a forest --n blurry, low quality
+--v references/scene_002.mp4 A cat sitting on a windowsill --n distorted
+```
+
+The `--sample_include_reference` flag shows the reference side-by-side with the generated output in validation videos.
+
+##### IC-LoRA Arguments
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--reference_downscale` | 1 | Spatial downscale factor for references (1=same res, 2=half) |
+| `--reference_frames` | 1 | Number of reference frames for V2V (images always use 1) |
+| `--ltx2_first_frame_conditioning_p` | 0.0 | Probability of also conditioning on the first target frame during training |
+| `--sample_include_reference` | off | Show reference side-by-side with generated output in sample videos |
+| `--lora_target_preset v2v` | — | Targets attention + FFN layers (recommended for IC-LoRA) |
+
+##### Dataset Config Options
+
+| Option | Type | Description |
+|--------|------|-------------|
+| `reference_directory` | string | Path to reference images/videos (matched by filename stem) |
+| `reference_cache_directory` | string | Output directory for cached reference latents |
+
+##### Notes
+
+- **First-frame conditioning** (`--ltx2_first_frame_conditioning_p`): Randomly conditions on the first target frame in addition to the reference. Only applied during training; inference always denoises the full target.
+- **Multi-frame references**: Supported but increase VRAM usage proportionally to the number of reference tokens.
+- **Video-only**: IC-LoRA requires `--ltx2_mode video`. Audio-video mode is not supported for v2v training.
+- **Downscale factor metadata**: Saved in LoRA safetensors as `ss_reference_downscale_factor` when factor != 1.
+- **Two-stage inference**: Not supported with V2V; a warning is emitted and the reference is ignored.
 
 #### Sampling with Tiled VAE
 - `--sample_tiled_vae`: Enable tiled VAE decoding during sampling to reduce VRAM usage.
@@ -620,6 +761,8 @@ The dataset config is a TOML file with `[general]` defaults and `[[datasets]]` e
 | `num_repeats` | int | 1 | Dataset repetitions |
 | `enable_bucket` | bool | false | Enable resolution bucketing |
 | `cache_directory` | string | — | Latent cache output directory |
+| `reference_directory` | string | — | Reference images/videos for IC-LoRA (matched by filename) |
+| `reference_cache_directory` | string | — | Output directory for cached reference latents (IC-LoRA) |
 | `separate_audio_buckets` | bool | false | Keep audio/non-audio items in separate batches |
 
 ### Example TOML
@@ -799,6 +942,9 @@ cache_directory/
   000001_ltx2_te.safetensors              # text encoder outputs
   000001_ltx2_audio.safetensors           # audio latents (av mode only)
   000001_1024x0576_ltx2_dino.safetensors  # DINOv2 features (CREPA dino mode only)
+
+reference_cache_directory/                  # IC-LoRA only
+  000001_1024x0576_ltx2.safetensors       # reference latents
 ```
 
 ---

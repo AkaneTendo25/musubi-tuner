@@ -24,9 +24,12 @@ from musubi_tuner.dataset.config_utils import BlueprintGenerator, ConfigSanitize
 from musubi_tuner.dataset.image_video_dataset import (
     ARCHITECTURE_LTX2,
     BaseDataset,
+    IMAGE_EXTENSIONS,
     ItemInfo,
     AudioDataset,
+    VIDEO_EXTENSIONS,
     VideoDataset,
+    resize_image_to_bucket,
     save_latent_cache_ltx2,
 )
 from musubi_tuner.ltx_2.model.audio_vae.audio_vae import LATENT_DOWNSAMPLE_FACTOR
@@ -377,6 +380,171 @@ def encode_and_save_audio_cache(
     save_file(sd, audio_cache_path, metadata=metadata)
 
 
+def _find_reference_file(reference_directory: str, stem: str) -> Optional[str]:
+    """Find a reference file matching the given stem in reference_directory."""
+    all_exts = IMAGE_EXTENSIONS + VIDEO_EXTENSIONS
+    for ext in all_exts:
+        candidate = os.path.join(reference_directory, stem + ext)
+        if os.path.exists(candidate):
+            return candidate
+    # Try case-insensitive match on lowercase stem
+    lower_stem = stem.lower()
+    try:
+        for fname in os.listdir(reference_directory):
+            name_no_ext, ext = os.path.splitext(fname)
+            if name_no_ext.lower() == lower_stem and ext.lower() in [e.lower() for e in all_exts]:
+                return os.path.join(reference_directory, fname)
+    except OSError:
+        pass
+    return None
+
+
+def _load_reference_frames(
+    path: str,
+    bucket_reso: tuple[int, int],
+    num_frames: int,
+    downscale_factor: int = 1,
+) -> np.ndarray:
+    """Load reference frames as [F, H, W, 3] uint8, applying optional spatial downscale."""
+    from PIL import Image
+    import av
+
+    if downscale_factor > 1:
+        ref_w = max((bucket_reso[0] // downscale_factor // 32) * 32, 32)
+        ref_h = max((bucket_reso[1] // downscale_factor // 32) * 32, 32)
+        ref_reso = (ref_w, ref_h)
+    else:
+        ref_reso = bucket_reso
+
+    ext = os.path.splitext(path)[1].lower()
+    is_video = ext in [e.lower() for e in VIDEO_EXTENSIONS]
+
+    if is_video:
+        container = av.open(path)
+        frames = []
+        for i, frame in enumerate(container.decode(video=0)):
+            if i >= num_frames:
+                break
+            pil_frame = frame.to_image()
+            arr = resize_image_to_bucket(pil_frame, ref_reso)
+            frames.append(arr)
+        container.close()
+        if not frames:
+            raise ValueError(f"No frames decoded from reference video: {path}")
+    else:
+        image = Image.open(path).convert("RGB")
+        arr = resize_image_to_bucket(image, ref_reso)
+        frames = [arr] * num_frames
+
+    return np.stack(frames[:num_frames], axis=0)
+
+
+def encode_and_save_reference_latents(
+    vae,
+    datasets: Sequence[BaseDataset],
+    args: argparse.Namespace,
+    device: torch.device,
+    tiling_config=None,
+) -> None:
+    """Encode reference files and save as latent caches for IC-LoRA / v2v training."""
+    num_frames = getattr(args, "reference_frames", 1)
+    downscale_factor = max(1, getattr(args, "reference_downscale", 1))
+    skip_existing = getattr(args, "skip_existing", False)
+    num_workers = args.num_workers if args.num_workers is not None else max(1, (os.cpu_count() or 2) - 1)
+
+    vae_param = next(vae.parameters())
+    vae_dtype = vae_param.dtype
+
+    for ds_idx, ds in enumerate(datasets):
+        if not isinstance(ds, VideoDataset):
+            continue
+
+        ref_cache_dir = getattr(ds, "reference_cache_directory", None)
+        if ref_cache_dir is None:
+            logger.info(f"[Dataset {ds_idx}] No reference_cache_directory set, skipping reference caching")
+            continue
+
+        ref_dir = getattr(ds, "reference_directory", None)
+        if ref_dir is None:
+            logger.info(f"[Dataset {ds_idx}] No reference_directory set, skipping reference caching")
+            continue
+
+        os.makedirs(ref_cache_dir, exist_ok=True)
+        logger.info(f"[Dataset {ds_idx}] Caching reference latents to {ref_cache_dir}")
+
+        cached_count = 0
+        skipped_count = 0
+        missing_count = 0
+
+        for _bucket_key, batch in ds.retrieve_latent_cache_batches(num_workers):
+            for item_info in batch:
+                ref_cache_path = getattr(item_info, "reference_latent_cache_path", None)
+                if ref_cache_path is None:
+                    # Build it manually if not set
+                    ref_cache_path = ds.get_reference_latent_cache_path(item_info)
+
+                if skip_existing and os.path.exists(ref_cache_path):
+                    skipped_count += 1
+                    continue
+
+                # For chunked videos, item_key is "video_00000-017.mp4"; use source video name for matching
+                source_key = getattr(item_info, "source_item_key", None) or item_info.item_key
+                stem = os.path.splitext(os.path.basename(source_key))[0]
+                # bucket_size is (width, height, frame_count, ...); extract spatial dims
+                bucket_reso = (item_info.bucket_size[0], item_info.bucket_size[1])
+
+                try:
+                    ref_path = _find_reference_file(ref_dir, stem)
+                    if ref_path is None:
+                        missing_count += 1
+                        if missing_count <= 5:
+                            logger.warning(f"No reference file found for '{stem}' in {ref_dir}")
+                        elif missing_count == 6:
+                            logger.warning("(suppressing further missing-reference warnings)")
+                        continue
+                    ref_frames = _load_reference_frames(ref_path, bucket_reso, num_frames, downscale_factor)
+
+                    contents = torch.from_numpy(ref_frames).unsqueeze(0)
+                    contents = contents.permute(0, 4, 1, 2, 3).contiguous()
+                    contents = contents.to(device=device, dtype=vae_dtype)
+                    contents = contents / 127.5 - 1.0
+
+                    frames = contents.shape[2]
+                    remainder = (frames - 1) % 8
+                    if remainder != 0:
+                        pad = 8 - remainder
+                        last = contents[:, :, -1:, :, :].expand(-1, -1, pad, -1, -1)
+                        contents = torch.cat([contents, last], dim=2)
+
+                    with _amp_context(device, vae_dtype), torch.no_grad():
+                        if tiling_config is not None and hasattr(vae, "tiled_encode"):
+                            latent = vae.tiled_encode(contents, tiling_config)
+                        else:
+                            latent = vae(contents)
+                        latent = latent.to(device=device, dtype=vae_dtype)
+
+                    ref_latent = latent[0]
+                    ref_item_info = ItemInfo(
+                        item_info.item_key,
+                        item_info.caption,
+                        item_info.original_size,
+                        item_info.bucket_size,
+                    )
+                    ref_item_info.latent_cache_path = ref_cache_path
+                    ref_item_info.frame_count = num_frames
+                    save_latent_cache_ltx2(ref_item_info, ref_latent)
+                    cached_count += 1
+
+                except Exception as e:
+                    logger.warning(f"Failed to cache reference for '{stem}': {e}")
+                    continue
+
+        logger.info(
+            f"[Dataset {ds_idx}] Reference caching done: {cached_count} cached, "
+            f"{skipped_count} skipped (existing), {missing_count} missing"
+        )
+
+
 def _precache_sample_latents(args: argparse.Namespace, device: torch.device) -> None:
     """Cache I2V conditioning image latents for sample prompts."""
     from musubi_tuner.hv_train_network import load_prompts
@@ -391,13 +559,15 @@ def _precache_sample_latents(args: argparse.Namespace, device: torch.device) -> 
     if not prompts:
         raise ValueError(f"No prompts found in {args.sample_prompts}")
 
-    # Filter prompts that have image_path
-    prompts_with_images = [(i, p) for i, p in enumerate(prompts) if p.get("image_path")]
+    # Filter prompts that have image_path or v2v_ref_path
+    prompts_with_images = [(i, p) for i, p in enumerate(prompts) if p.get("image_path") or p.get("v2v_ref_path")]
     if not prompts_with_images:
-        logger.info("No I2V images found in sample prompts - nothing to cache")
+        logger.info("No I2V images or V2V references found in sample prompts - nothing to cache")
         return
 
-    logger.info(f"Found {len(prompts_with_images)} prompts with I2V images")
+    i2v_count = sum(1 for _, p in prompts_with_images if p.get("image_path"))
+    v2v_count = sum(1 for _, p in prompts_with_images if p.get("v2v_ref_path"))
+    logger.info(f"Found {i2v_count} I2V images and {v2v_count} V2V references to precache")
 
     # Load VAE encoder
     from musubi_tuner.ltx_2.loader.single_gpu_model_builder import SingleGPUModelBuilder
@@ -420,66 +590,115 @@ def _precache_sample_latents(args: argparse.Namespace, device: torch.device) -> 
     latent_cache: list[dict] = []
     spatial_factor = 32  # LTX-2 VAE spatial downsample factor
 
+    def _cover_center_crop(pil_img, tw, th):
+        cw, ch = pil_img.size
+        if ch == th and cw == tw:
+            return pil_img
+        ar = cw / ch
+        tar = tw / th
+        if ar > tar:
+            rh = th
+            rw = max(tw, int(round(th * ar)))
+        else:
+            rw = tw
+            rh = max(th, int(round(tw / ar)))
+        pil_img = pil_img.resize((rw, rh), Image.LANCZOS)
+        left = max((rw - tw) // 2, 0)
+        top = max((rh - th) // 2, 0)
+        return pil_img.crop((left, top, left + tw, top + th))
+
+    def _encode_image_to_latent(img_path, target_width, target_height):
+        """Load image, resize with cover+center-crop, VAE encode → [1, C, 1, H, W]."""
+        image = _cover_center_crop(Image.open(img_path).convert("RGB"), target_width, target_height)
+        image_tensor = TF.to_tensor(image).unsqueeze(0)  # [1, 3, H, W]
+        image_tensor = (image_tensor * 2.0 - 1.0).to(device=device, dtype=vae_dtype)
+        image_tensor = image_tensor.unsqueeze(2)  # [1, 3, 1, H, W]
+        with torch.no_grad():
+            return vae_encoder(image_tensor)
+
+    def _encode_media_to_latent(media_path, target_width, target_height, max_frames=1):
+        """Load image or video, resize, VAE encode → [1, C, F, H, W]."""
+        import av as _av
+
+        ext = os.path.splitext(media_path)[1].lower()
+
+        frames = []
+        if ext in {e.lower() for e in VIDEO_EXTENSIONS}:
+            container = _av.open(media_path)
+            for i, frame in enumerate(container.decode(video=0)):
+                if i >= max_frames:
+                    break
+                frames.append(TF.to_tensor(_cover_center_crop(frame.to_image().convert("RGB"), target_width, target_height)))
+            container.close()
+            if not frames:
+                raise ValueError(f"No frames decoded from video: {media_path}")
+        else:
+            image = _cover_center_crop(Image.open(media_path).convert("RGB"), target_width, target_height)
+            frames.append(TF.to_tensor(image))
+
+        video_tensor = torch.stack(frames, dim=0).unsqueeze(0)  # [1, F, 3, H, W]
+        video_tensor = video_tensor.permute(0, 2, 1, 3, 4).contiguous()  # [1, 3, F, H, W]
+        video_tensor = (video_tensor * 2.0 - 1.0).to(device=device, dtype=vae_dtype)
+
+        num_f = video_tensor.shape[2]
+        remainder = (num_f - 1) % 8
+        if remainder != 0:
+            pad = 8 - remainder
+            video_tensor = torch.cat([video_tensor, video_tensor[:, :, -1:].expand(-1, -1, pad, -1, -1)], dim=2)
+
+        with torch.no_grad():
+            return vae_encoder(video_tensor)
+
     for idx, prompt_dict in prompts_with_images:
-        image_path = prompt_dict["image_path"]
-        try:
-            if not os.path.exists(image_path):
-                logger.warning(f"I2V image not found, skipping prompt #{idx}: {image_path}")
-                continue
+        width = prompt_dict.get("width", 768)
+        height = prompt_dict.get("height", 512)
+        width = (width // spatial_factor) * spatial_factor
+        height = (height // spatial_factor) * spatial_factor
 
-            # Get dimensions from prompt or use defaults
-            width = prompt_dict.get("width", 768)
-            height = prompt_dict.get("height", 512)
-            width = (width // spatial_factor) * spatial_factor
-            height = (height // spatial_factor) * spatial_factor
+        cache_entry = {"prompt_index": idx}
 
-            # Load and encode image
-            logger.info(f"Encoding I2V image for prompt #{idx}: {os.path.basename(image_path)}")
-            image = Image.open(image_path).convert("RGB")
-
-            # Match official LTX-2 image-conditioning preprocessing:
-            # resize-to-cover while preserving aspect ratio, then center-crop.
-            current_width, current_height = image.size
-            if current_height != height or current_width != width:
-                aspect_ratio = current_width / current_height
-                target_aspect_ratio = width / height
-
-                if aspect_ratio > target_aspect_ratio:
-                    resize_height = height
-                    resize_width = max(width, int(round(height * aspect_ratio)))
+        # I2V conditioning image (--i)
+        image_path = prompt_dict.get("image_path")
+        if image_path:
+            try:
+                if not os.path.exists(image_path):
+                    logger.warning(f"I2V image not found, skipping prompt #{idx}: {image_path}")
                 else:
-                    resize_width = width
-                    resize_height = max(height, int(round(width / aspect_ratio)))
+                    logger.info(f"Encoding I2V image for prompt #{idx}: {os.path.basename(image_path)}")
+                    latent = _encode_image_to_latent(image_path, width, height)
+                    cache_entry["image_path"] = image_path
+                    cache_entry["conditioning_latent"] = latent.cpu()
+                    logger.info(f"Encoded I2V latent for prompt #{idx}: {latent.shape}")
+            except Exception as e:
+                logger.error(f"Failed to encode I2V image for prompt #{idx} '{image_path}': {e}")
 
-                image = image.resize((resize_width, resize_height), Image.LANCZOS)
-                left = max((resize_width - width) // 2, 0)
-                top = max((resize_height - height) // 2, 0)
-                image = image.crop((left, top, left + width, top + height))
+        v2v_ref_path = prompt_dict.get("v2v_ref_path")
+        if v2v_ref_path:
+            try:
+                if not os.path.exists(v2v_ref_path):
+                    logger.warning(f"V2V reference not found, skipping prompt #{idx}: {v2v_ref_path}")
+                else:
+                    ref_downscale = max(1, getattr(args, "reference_downscale", 1))
+                    if ref_downscale > 1:
+                        ref_w = max((width // ref_downscale // 32) * 32, 32)
+                        ref_h = max((height // ref_downscale // 32) * 32, 32)
+                    else:
+                        ref_w, ref_h = width, height
+                    ref_frames = max(1, getattr(args, "reference_frames", 1))
+                    latent = _encode_media_to_latent(v2v_ref_path, ref_w, ref_h, max_frames=ref_frames)
+                    cache_entry["v2v_ref_path"] = v2v_ref_path
+                    cache_entry["v2v_ref_latent"] = latent.cpu()
+                    logger.info(f"Encoded V2V ref for prompt #{idx}: {ref_w}x{ref_h} → {latent.shape}")
+            except Exception as e:
+                logger.error(f"Failed to encode V2V reference for prompt #{idx} '{v2v_ref_path}': {e}")
 
-            image_tensor = TF.to_tensor(image).unsqueeze(0)  # [1, 3, H, W]
-            image_tensor = (image_tensor * 2.0 - 1.0).to(device=device, dtype=vae_dtype)
-            image_tensor = image_tensor.unsqueeze(2)  # [1, 3, 1, H, W]
+        if "conditioning_latent" in cache_entry or "v2v_ref_latent" in cache_entry:
+            latent_cache.append(cache_entry)
 
-            with torch.no_grad():
-                conditioning_latent = vae_encoder(image_tensor)
-
-            latent_cache.append({
-                "prompt_index": idx,
-                "image_path": image_path,
-                "conditioning_latent": conditioning_latent.cpu(),
-            })
-            logger.info(f"Encoded I2V latent for prompt #{idx}: {conditioning_latent.shape}")
-
-        except Exception as e:
-            logger.error(f"Failed to encode I2V image for prompt #{idx} '{image_path}': {e}")
-
-    # Clean up VAE encoder
     del vae_encoder
     from musubi_tuner.utils.device_utils import clean_memory_on_device
     clean_memory_on_device(device)
-    logger.info("VAE encoder cleaned up")
 
-    # Determine cache path
     if args.sample_latents_cache:
         cache_path = args.sample_latents_cache
     else:
@@ -609,6 +828,10 @@ def main() -> None:
             encode_and_save_batch(vae, batch, tiling_config)
 
         cache_latents.encode_datasets(list(datasets), encode_fn, args)
+
+        # Cache reference latents for IC-LoRA / v2v training (auto-detected from TOML config)
+        # Runs when any dataset has both reference_directory and reference_cache_directory
+        encode_and_save_reference_latents(vae, datasets, args, device, tiling_config)
 
     if audio_only:
         if getattr(args, "ltx2_checkpoint", None) is None:
@@ -760,6 +983,18 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         type=str,
         default=None,
         help="Path to save I2V conditioning latents cache (default: cache_dir/ltx2_sample_latents_cache.pt).",
+    )
+    parser.add_argument(
+        "--reference_frames",
+        type=int,
+        default=1,
+        help="Number of frames to extract from reference videos (default 1). Images always use 1 frame.",
+    )
+    parser.add_argument(
+        "--reference_downscale",
+        type=int,
+        default=1,
+        help="Spatial downscale factor for references (1=same res, 2=half). Must be >= 1.",
     )
     return parser
 

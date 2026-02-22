@@ -358,8 +358,13 @@ def line_to_prompt_dict(line: str) -> dict:
                 continue
 
             m = re.match(r"i (.+)", parg, re.IGNORECASE)
-            if m:  # image path
+            if m:  # image path (I2V conditioning)
                 prompt_dict["image_path"] = m.group(1).strip()
+                continue
+
+            m = re.match(r"v (.+)", parg, re.IGNORECASE)
+            if m:  # v2v reference path (IC-LoRA / v2v conditioning)
+                prompt_dict["v2v_ref_path"] = m.group(1).strip()
                 continue
 
             m = re.match(r"ei (.+)", parg, re.IGNORECASE)
@@ -1480,6 +1485,10 @@ class NetworkTrainer:
 
         self.default_guidance_scale = 6.0
 
+    def get_checkpoint_metadata(self, args: argparse.Namespace) -> Dict[str, Any]:
+        """Return extra metadata to include in LoRA safetensors. Override in subclasses."""
+        return {}
+
     def post_save_checkpoint_hook(self, args, ckpt_file, ckpt_name, accelerator, force_sync_upload=False):
         """Hook called after checkpoint is saved. Override in subclasses for architecture-specific processing."""
         pass
@@ -2549,6 +2558,11 @@ class NetworkTrainer:
             )
 
             metadata_to_save.update(sai_metadata)
+
+            # Architecture-specific metadata (e.g. v2v/IC-LoRA info for LTX-2)
+            extra_md = self.get_checkpoint_metadata(args)
+            if extra_md:
+                metadata_to_save.update({k: str(v) for k, v in extra_md.items()})
 
             unwrapped_nw.save_weights(ckpt_file, save_dtype, metadata_to_save)
 

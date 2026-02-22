@@ -640,6 +640,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
         self._flow_target: str = "noise"  # LTX-2 predicts noise
         self._num_timesteps: int = 1000
         self._audio_video: bool = False
+        self._i2v_training: bool = False
         self._ltx_mode: str = "video"
         self.default_guidance_scale = 3.0
         self._audio_preview_config: Optional[Dict[str, int | float]] = None
@@ -1334,17 +1335,33 @@ class LTX2NetworkTrainer(NetworkTrainer):
 
         reset_audio_supervision_state(self._audio_supervision_state)
 
+        # IC-LoRA / v2v mode enables I2V sampling (reference conditioning)
+        self._i2v_training = getattr(args, "lora_target_preset", "t2v") == "v2v"
+
         apply_ltx2_tweaks(args)
 
     @property
     def i2v_training(self) -> bool:
-        """LTX-2 doesn't currently support I2V conditioning"""
-        return False
+        """True when training v2v / IC-LoRA (enables I2V conditioning in sampling)"""
+        return self._i2v_training
 
     @property
     def control_training(self) -> bool:
         """LTX-2 doesn't currently support control conditioning"""
         return False
+
+    def get_checkpoint_metadata(self, args: argparse.Namespace) -> Dict[str, Any]:
+        """Return LTX-2-specific metadata for LoRA safetensors (v2v mode info, etc.)."""
+        md: Dict[str, Any] = {}
+        preset = getattr(args, "lora_target_preset", None)
+        if preset:
+            md["ss_lora_target_preset"] = preset
+        if self._i2v_training:
+            md["ss_v2v_training"] = True
+        ref_downscale = max(1, getattr(args, "reference_downscale", 1))
+        if ref_downscale != 1:
+            md["ss_reference_downscale_factor"] = ref_downscale
+        return md
 
     def post_save_checkpoint_hook(self, args, ckpt_file, ckpt_name, accelerator, force_sync_upload=False):
         """Convert saved LoRA to ComfyUI format and save CREPA projector."""
@@ -2022,8 +2039,6 @@ class LTX2NetworkTrainer(NetworkTrainer):
         audio_sigma = audio_model_timesteps[:, 0]
 
         ref_latents = batch.get("ref_latents")
-        if ref_latents is None:
-            ref_latents = batch.get("reference_latents")
         if isinstance(ref_latents, dict):
             ref_latents = ref_latents.get("latents")
 
@@ -2040,10 +2055,19 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 )
             if ref_latents.shape[1] != latents.shape[1]:
                 raise ValueError(f"Channel mismatch: latents C={latents.shape[1]} vs ref_latents C={ref_latents.shape[1]}")
-            if ref_latents.shape[3] != latents.shape[3] or ref_latents.shape[4] != latents.shape[4]:
-                raise ValueError(
-                    f"Spatial mismatch: latents HxW={latents.shape[3]}x{latents.shape[4]} vs ref_latents HxW={ref_latents.shape[3]}x{ref_latents.shape[4]}"     
-                )
+            ref_h, ref_w = int(ref_latents.shape[3]), int(ref_latents.shape[4])
+            tgt_h, tgt_w = int(latents.shape[3]), int(latents.shape[4])
+            if ref_h == tgt_h and ref_w == tgt_w:
+                reference_downscale_factor = 1
+            else:
+                h_ratio = tgt_h / ref_h
+                w_ratio = tgt_w / ref_w
+                if abs(h_ratio - w_ratio) > 0.01 or abs(h_ratio - round(h_ratio)) > 0.01:
+                    raise ValueError(
+                        f"Spatial mismatch: latents HxW={tgt_h}x{tgt_w} vs ref_latents HxW={ref_h}x{ref_w}. "
+                        f"Ratios h={h_ratio:.2f} w={w_ratio:.2f} are not consistent integer downscale factors."
+                    )
+                reference_downscale_factor = round(h_ratio)
 
         if self._ltx_mode == "audio":
             audio_latents = batch.get("audio_latents")
@@ -2186,14 +2210,16 @@ class LTX2NetworkTrainer(NetworkTrainer):
             ref_seq_len = ref_tokens.shape[1]
             target_seq_len = target_tokens.shape[1]
 
-            height = int(ref_latents.shape[3])
-            width = int(ref_latents.shape[4])
+            ref_height = int(ref_latents.shape[3])
+            ref_width = int(ref_latents.shape[4])
+            tgt_height = int(latents.shape[3])
+            tgt_width = int(latents.shape[4])
 
             ref_conditioning_mask = torch.ones((bsz, ref_seq_len), device=accelerator.device, dtype=torch.bool)
 
             target_conditioning_mask = torch.zeros((bsz, target_seq_len), device=accelerator.device, dtype=torch.bool)
             if video_conditioning_enabled is not None:
-                first_frame_tokens = height * width
+                first_frame_tokens = tgt_height * tgt_width
                 if first_frame_tokens > 0:
                     target_conditioning_mask[video_conditioning_enabled, :first_frame_tokens] = True
             conditioning_mask = torch.cat([ref_conditioning_mask, target_conditioning_mask], dim=1)
@@ -2213,8 +2239,8 @@ class LTX2NetworkTrainer(NetworkTrainer):
                     batch=bsz,
                     channels=int(ref_latents.shape[1]),
                     frames=ref_frames,
-                    height=height,
-                    width=width,
+                    height=ref_height,
+                    width=ref_width,
                 ),
                 device=accelerator.device,
             )
@@ -2224,14 +2250,18 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 causal_fix=True,
             ).to(dtype=network_dtype)
             ref_positions[:, 0, ...] = ref_positions[:, 0, ...] / float(frame_rate_v2v)
+            if reference_downscale_factor != 1:
+                ref_positions = ref_positions.clone()
+                ref_positions[:, 1, ...] *= reference_downscale_factor
+                ref_positions[:, 2, ...] *= reference_downscale_factor
 
             tgt_coords = patchifier.get_patch_grid_bounds(
                 output_shape=VideoLatentShape(
                     batch=bsz,
                     channels=int(latents.shape[1]),
                     frames=tgt_frames,
-                    height=height,
-                    width=width,
+                    height=tgt_height,
+                    width=tgt_width,
                 ),
                 device=accelerator.device,
             )
@@ -2670,28 +2700,33 @@ class LTX2NetworkTrainer(NetworkTrainer):
         return sample_params
 
     def _load_precached_sample_latents(self, args: argparse.Namespace, sample_params: List[Dict]) -> None:
-        """Load precached I2V conditioning latents and merge into sample_params (in-place)."""
+        """Load precached I2V / V2V conditioning latents and merge into sample_params (in-place)."""
         cache_path = getattr(args, "sample_latents_cache", None) or self._resolve_default_sample_latents_cache(args)
         if not os.path.exists(cache_path):
-            logger.warning("Precached I2V latents not found: %s — skipping (samples will run without I2V conditioning)", cache_path)
+            logger.warning("Precached latents not found: %s — skipping (samples will run without conditioning)", cache_path)
             return
 
-        logger.info(f"Loading precached I2V conditioning latents from {cache_path}")
+        logger.info(f"Loading precached conditioning latents from {cache_path}")
         try:
             latent_payload = torch.load(cache_path, map_location="cpu")
             latent_cache = latent_payload.get("latent_cache", [])
 
             # Match latents with prompts by index
-            matched_count = 0
+            i2v_count = 0
+            v2v_count = 0
             for entry in latent_cache:
                 prompt_idx = entry.get("prompt_index")
                 if prompt_idx is not None and 0 <= prompt_idx < len(sample_params):
-                    sample_params[prompt_idx]["conditioning_latent"] = entry["conditioning_latent"]
-                    matched_count += 1
+                    if "conditioning_latent" in entry:
+                        sample_params[prompt_idx]["conditioning_latent"] = entry["conditioning_latent"]
+                        i2v_count += 1
+                    if "v2v_ref_latent" in entry:
+                        sample_params[prompt_idx]["v2v_ref_latent"] = entry["v2v_ref_latent"]
+                        v2v_count += 1
 
-            logger.info(f"Loaded {matched_count}/{len(latent_cache)} I2V conditioning latents")
+            logger.info(f"Loaded precached latents: {i2v_count} I2V, {v2v_count} V2V references")
         except Exception as e:
-            raise RuntimeError(f"Failed to load I2V latents cache: {e}")
+            raise RuntimeError(f"Failed to load latents cache: {e}")
 
     def _resolve_first_dataset_cache_directory(self, args: argparse.Namespace) -> str:
         from musubi_tuner.dataset import config_utils
@@ -3129,6 +3164,155 @@ class LTX2NetworkTrainer(NetworkTrainer):
             transformer.move_to_device_except_swap_blocks(accelerator.device)
         self._cleanup_cuda(accelerator.device)
 
+    @staticmethod
+    def _load_reference_for_output(
+        ref_path: str,
+        target_height: int,
+        target_width: int,
+        num_frames: int,
+    ) -> torch.Tensor:
+        """Load reference image/video as [1, C, T, H, W] in [0,1] for side-by-side output."""
+        from PIL import Image
+        import torchvision.transforms.functional as TF
+        from musubi_tuner.dataset.image_video_dataset import VIDEO_EXTENSIONS
+
+        ext = os.path.splitext(ref_path)[1].lower()
+        is_video = ext in [e.lower() for e in VIDEO_EXTENSIONS]
+
+        def _cover_center_crop_out(pil_img, tw, th):
+            cw, ch = pil_img.size
+            if ch == th and cw == tw:
+                return pil_img
+            ar = cw / ch
+            tar = tw / th
+            if ar > tar:
+                rh = th
+                rw = max(tw, int(round(th * ar)))
+            else:
+                rw = tw
+                rh = max(th, int(round(tw / ar)))
+            pil_img = pil_img.resize((rw, rh), Image.LANCZOS)
+            left = max((rw - tw) // 2, 0)
+            top = max((rh - th) // 2, 0)
+            return pil_img.crop((left, top, left + tw, top + th))
+
+        frames = []
+        if is_video:
+            try:
+                import av
+                container = av.open(ref_path)
+                for i, frame in enumerate(container.decode(video=0)):
+                    if i >= num_frames:
+                        break
+                    pil_frame = _cover_center_crop_out(frame.to_image().convert("RGB"), target_width, target_height)
+                    frames.append(TF.to_tensor(pil_frame))
+                container.close()
+            except Exception as e:
+                logger.warning(f"Failed to load reference video for output: {e}")
+        if not frames:
+            image = _cover_center_crop_out(Image.open(ref_path).convert("RGB"), target_width, target_height)
+            frames = [TF.to_tensor(image)]
+
+        while len(frames) < num_frames:
+            frames.append(frames[-1])
+        frames = frames[:num_frames]
+
+        video = torch.stack(frames, dim=1).unsqueeze(0)
+        return video.clamp(0, 1).to(torch.float32)
+
+    def _load_and_encode_v2v_reference(
+        self,
+        ref_path: str,
+        target_height: int,
+        target_width: int,
+        vae_checkpoint_path: str,
+        device: torch.device,
+        dtype: torch.dtype,
+        max_frames: int = 1,
+    ) -> torch.Tensor:
+        """Load image or video from disk and encode through VAE for V2V reference conditioning.
+
+        Returns:
+            Encoded latent tensor [1, C, F, H_latent, W_latent]
+        """
+        from PIL import Image
+        import torchvision.transforms.functional as TF
+
+        if not os.path.exists(ref_path):
+            raise FileNotFoundError(f"V2V reference not found: {ref_path}")
+
+        from musubi_tuner.dataset.image_video_dataset import VIDEO_EXTENSIONS
+
+        ext = os.path.splitext(ref_path)[1].lower()
+        is_video = ext in {e.lower() for e in VIDEO_EXTENSIONS}
+
+        def _cover_center_crop(pil_img, tw, th):
+            cw, ch = pil_img.size
+            if ch == th and cw == tw:
+                return pil_img
+            ar = cw / ch
+            tar = tw / th
+            if ar > tar:
+                rh = th
+                rw = max(tw, int(round(th * ar)))
+            else:
+                rw = tw
+                rh = max(th, int(round(tw / ar)))
+            pil_img = pil_img.resize((rw, rh), Image.LANCZOS)
+            left = max((rw - tw) // 2, 0)
+            top = max((rh - th) // 2, 0)
+            return pil_img.crop((left, top, left + tw, top + th))
+
+        frames = []
+        if is_video:
+            import av
+            container = av.open(ref_path)
+            for i, frame in enumerate(container.decode(video=0)):
+                if i >= max_frames:
+                    break
+                pil_frame = _cover_center_crop(frame.to_image().convert("RGB"), target_width, target_height)
+                frames.append(TF.to_tensor(pil_frame))
+            container.close()
+            if not frames:
+                raise ValueError(f"No frames decoded from V2V reference video: {ref_path}")
+        else:
+            image = _cover_center_crop(Image.open(ref_path).convert("RGB"), target_width, target_height)
+            frames.append(TF.to_tensor(image))
+
+        # [F, 3, H, W] → [1, 3, F, H, W], normalize to [-1, 1]
+        video_tensor = torch.stack(frames, dim=0).unsqueeze(0)  # [1, F, 3, H, W]
+        video_tensor = video_tensor.permute(0, 2, 1, 3, 4).contiguous()  # [1, 3, F, H, W]
+        video_tensor = (video_tensor * 2.0 - 1.0).to(device=device, dtype=dtype)
+
+        # Pad frames to VAE alignment (LTX-2 VAE needs (F-1) % 8 == 0)
+        num_frames = video_tensor.shape[2]
+        remainder = (num_frames - 1) % 8
+        if remainder != 0:
+            pad = 8 - remainder
+            last = video_tensor[:, :, -1:, :, :].expand(-1, -1, pad, -1, -1)
+            video_tensor = torch.cat([video_tensor, last], dim=2)
+
+        from musubi_tuner.ltx_2.loader.single_gpu_model_builder import SingleGPUModelBuilder
+        from musubi_tuner.ltx_2.model.video_vae import VideoEncoderConfigurator, VAE_ENCODER_COMFY_KEYS_FILTER
+
+        logger.info("Loading VAE encoder for V2V reference")
+        vae_encoder = SingleGPUModelBuilder(
+            model_path=str(vae_checkpoint_path),
+            model_class_configurator=VideoEncoderConfigurator,
+            model_sd_ops=VAE_ENCODER_COMFY_KEYS_FILTER,
+        ).build(device=device, dtype=dtype)
+        vae_encoder.eval()
+
+        with torch.no_grad():
+            latent = vae_encoder(video_tensor)  # [1, C, F_latent, H_latent, W_latent]
+
+        logger.info(f"V2V reference encoded: {ref_path} → {latent.shape}")
+
+        del vae_encoder
+        clean_memory_on_device(device)
+
+        return latent
+
     def _load_and_encode_conditioning_image(
         self,
         image_path: str,
@@ -3243,17 +3427,13 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 image_path = None  # Skip encoding since we have precached latent
 
         if image_path:
-            logger.info("=" * 60)
-            logger.info("I2V CONDITIONING: Loading and encoding image (Phase 1)")
-            logger.info("=" * 60)
+            logger.info("I2V: encoding conditioning image")
             try:
                 vae_checkpoint = getattr(args, "vae", None) or getattr(args, "ltx2_checkpoint", None)
                 if not vae_checkpoint:
                     raise ValueError("VAE checkpoint path required for I2V conditioning (--vae or --ltx2_checkpoint)")
 
-                # Get target dimensions (need to calculate them early)
                 device = accelerator.device
-                # Use default VAE factors if vae not loaded yet
                 spatial_factor = 32
                 temporal_factor = 8
                 width = sample_parameter.get("width", 768)
@@ -3269,15 +3449,57 @@ class LTX2NetworkTrainer(NetworkTrainer):
                     device=device,
                     dtype=dit_dtype,
                 )
-                logger.info("I2V: Conditioning image loaded and encoded successfully")
-                logger.info("=" * 60)
+                logger.info("I2V: conditioning image encoded")
             except Exception as e:
-                logger.error(f"I2V: Failed to load conditioning image '{image_path}': {e}")
-                logger.warning("I2V: Continuing without image conditioning")
-                logger.info("=" * 60)
+                logger.error(f"I2V: failed to load conditioning image '{image_path}': {e}")
                 conditioning_latent = None
 
-        # ===== PHASE 2: Normal Sampling Setup =====
+        v2v_ref_latent = None
+        v2v_ref_path = sample_parameter.get("v2v_ref_path", None)
+
+        if "v2v_ref_latent" in sample_parameter:
+            v2v_ref_latent = sample_parameter["v2v_ref_latent"]
+            if v2v_ref_latent is not None:
+                device = accelerator.device
+                v2v_ref_latent = v2v_ref_latent.to(device=device, dtype=dit_dtype)
+                logger.info("V2V: using precached reference latent %s", v2v_ref_latent.shape)
+                v2v_ref_path = None
+
+        if v2v_ref_path:
+            logger.info("V2V: encoding reference")
+            try:
+                vae_checkpoint = getattr(args, "vae", None) or getattr(args, "ltx2_checkpoint", None)
+                if not vae_checkpoint:
+                    raise ValueError("VAE checkpoint path required for V2V reference (--vae or --ltx2_checkpoint)")
+
+                device = accelerator.device
+                spatial_factor = 32
+                width = sample_parameter.get("width", 768)
+                height = sample_parameter.get("height", 512)
+                width = (width // spatial_factor) * spatial_factor
+                height = (height // spatial_factor) * spatial_factor
+
+                ref_downscale = max(1, getattr(args, "reference_downscale", 1))
+                if ref_downscale > 1:
+                    ref_w = max((width // ref_downscale // spatial_factor) * spatial_factor, spatial_factor)
+                    ref_h = max((height // ref_downscale // spatial_factor) * spatial_factor, spatial_factor)
+                else:
+                    ref_w, ref_h = width, height
+
+                ref_frames = max(1, getattr(args, "reference_frames", 1))
+                v2v_ref_latent = self._load_and_encode_v2v_reference(
+                    ref_path=v2v_ref_path,
+                    target_height=ref_h,
+                    target_width=ref_w,
+                    vae_checkpoint_path=vae_checkpoint,
+                    device=device,
+                    dtype=dit_dtype,
+                    max_frames=ref_frames,
+                )
+            except Exception as e:
+                logger.error(f"V2V: failed to load reference '{v2v_ref_path}': {e}")
+                v2v_ref_latent = None
+
         lora_count = self._ensure_lora_enabled_for_sampling(transformer)
         if lora_count:
             logger.info("Sampling: LoRA modules active in transformer: %s", lora_count)
@@ -3438,6 +3660,9 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 use_two_stage = False
 
         if use_two_stage:
+            if v2v_ref_latent is not None:
+                logger.warning("V2V reference conditioning is not supported with two-stage inference; ignoring V2V reference")
+                v2v_ref_latent = None
             video, audio_waveform = self.do_inference_two_stage(
                 accelerator=accelerator,
                 args=args,
@@ -3491,6 +3716,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 decode_video=not audio_only_preview,
                 audio_only=audio_only_preview,
                 conditioning_latent=conditioning_latent,
+                v2v_ref_latents=v2v_ref_latent,
             )
 
         if not has_self_ref_orig_mod:
@@ -3499,6 +3725,17 @@ class LTX2NetworkTrainer(NetworkTrainer):
         if video is None and not audio_only_preview:
             logger.error("No video generated / 生成された動画がありません")
             return
+
+        if getattr(args, "sample_include_reference", False) and video is not None:
+            ref_path = sample_parameter.get("v2v_ref_path")
+            if ref_path and os.path.exists(ref_path):
+                try:
+                    ref_video = self._load_reference_for_output(
+                        ref_path, video.shape[3], video.shape[4], video.shape[2]
+                    )
+                    video = torch.cat([ref_video.to(video.device), video], dim=4)
+                except Exception as e:
+                    logger.warning(f"Failed to prepend reference to output: {e}")
 
         wandb_tracker = None
         try:
@@ -3579,6 +3816,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
         decode_video: bool = True,
         audio_only: bool = False,
         conditioning_latent: Optional[torch.Tensor] = None,
+        v2v_ref_latents: Optional[torch.Tensor] = None,
     ):
         """Generate sample video during training using LTX-2 denoising loop"""
         from musubi_tuner.modules.scheduling_flow_match_discrete import FlowMatchDiscreteScheduler
@@ -3715,6 +3953,32 @@ class LTX2NetworkTrainer(NetworkTrainer):
             device=transformer_device,
             generator=generator,
         )
+
+        # ===== V2V / IC-LoRA sampling path =====
+        # Mirrors the training forward pass: patchify ref+target, build Modality with
+        # per-token timesteps (ref=0, target=sigma), call base_model directly.
+        if v2v_ref_latents is not None:
+            video, audio_waveform = self._do_v2v_denoising(
+                latents=latents,
+                v2v_ref_latents=v2v_ref_latents,
+                transformer=transformer,
+                dit_dtype=dit_dtype,
+                prompt_embeds=prompt_embeds,
+                prompt_mask=prompt_mask,
+                sample_parameter=sample_parameter,
+                sample_steps=sample_steps,
+                do_classifier_free_guidance=do_classifier_free_guidance,
+                guidance_scale=guidance_scale,
+                cfg_scale=cfg_scale,
+                vae=vae,
+                args=args,
+                offload_transformer_for_decode=offload_transformer_for_decode,
+                transformer_offload_device=transformer_offload_device,
+                restore_transformer_device=restore_transformer_device,
+                decode_video=decode_video,
+                attention_overrides=attention_overrides,
+            )
+            return video, audio_waveform
 
         # Setup I2V conditioning mask if provided
         denoise_mask = None
@@ -4020,6 +4284,283 @@ class LTX2NetworkTrainer(NetworkTrainer):
         vae.to_dtype(original_vae_dtype)
 
         return video, audio_waveform
+
+    def _do_v2v_denoising(
+        self,
+        latents: torch.Tensor,
+        v2v_ref_latents: torch.Tensor,
+        transformer,
+        dit_dtype: torch.dtype,
+        prompt_embeds: torch.Tensor,
+        prompt_mask: Optional[torch.Tensor],
+        sample_parameter: Dict,
+        sample_steps: int,
+        do_classifier_free_guidance: bool,
+        guidance_scale: float,
+        cfg_scale: Optional[float],
+        vae,
+        args: argparse.Namespace,
+        offload_transformer_for_decode: bool = False,
+        transformer_offload_device: Optional[torch.device] = None,
+        restore_transformer_device: bool = True,
+        decode_video: bool = True,
+        attention_overrides=None,
+    ):
+        """V2V / IC-LoRA denoising: concatenate reference + target tokens with per-token timesteps.
+
+        Mirrors the training forward pass exactly — patchify ref & target, build a ``Modality``
+        with ref timesteps=0 / target timesteps=sigma, and call the base ``LTXModel`` directly
+        (bypassing the LTX2Wrapper).
+        """
+        from musubi_tuner.ltx_2.components.patchifiers import VideoLatentPatchifier, get_pixel_coords
+        from musubi_tuner.ltx_2.components.schedulers import LTX2Scheduler
+        from musubi_tuner.ltx_2.guidance.perturbations import BatchedPerturbationConfig
+        from musubi_tuner.ltx_2.model.ltx2_scheduler import EulerDiffusionStep, X0PredictionWrapper
+        from musubi_tuner.ltx_2.model.transformer.modality import Modality
+        from musubi_tuner.ltx_2.types import SpatioTemporalScaleFactors, VideoLatentShape
+
+        transformer_device = latents.device
+        transformer_offload_device = transformer_offload_device or torch.device("cpu")
+        original_vae_device = getattr(vae, "device", torch.device("cpu"))
+        original_vae_dtype = getattr(vae, "dtype", torch.float32)
+
+        patchifier = VideoLatentPatchifier(patch_size=1)
+        stepper = EulerDiffusionStep()
+
+        # Prepare reference latents
+        v2v_ref_latents = v2v_ref_latents.to(device=transformer_device, dtype=dit_dtype)
+        bsz = latents.shape[0]
+        ref_frames = int(v2v_ref_latents.shape[2])
+        tgt_frames = int(latents.shape[2])
+        ref_height = int(v2v_ref_latents.shape[3])
+        ref_width = int(v2v_ref_latents.shape[4])
+        tgt_height = int(latents.shape[3])
+        tgt_width = int(latents.shape[4])
+
+        if ref_height == tgt_height and ref_width == tgt_width:
+            reference_downscale_factor = 1
+        else:
+            h_ratio = tgt_height / ref_height
+            w_ratio = tgt_width / ref_width
+            if abs(h_ratio - w_ratio) > 0.01 or abs(h_ratio - round(h_ratio)) > 0.01:
+                raise ValueError(
+                    f"V2V spatial mismatch: target HxW={tgt_height}x{tgt_width} vs ref HxW={ref_height}x{ref_width}. "
+                    f"Ratios h={h_ratio:.2f} w={w_ratio:.2f} are not consistent integer downscale factors."
+                )
+            reference_downscale_factor = round(h_ratio)
+
+        # Patchify reference tokens (constant across denoising steps)
+        ref_tokens = patchifier.patchify(v2v_ref_latents)  # [B, ref_seq, D]
+        ref_seq_len = ref_tokens.shape[1]
+
+        # Conditioning mask: ref=True (conditioned, t=0), target=False (denoised, t=sigma)
+        ref_conditioning_mask = torch.ones((bsz, ref_seq_len), device=transformer_device, dtype=torch.bool)
+
+        # Compute position embeddings (constant across steps)
+        ref_coords = patchifier.get_patch_grid_bounds(
+            output_shape=VideoLatentShape(
+                batch=bsz,
+                channels=int(v2v_ref_latents.shape[1]),
+                frames=ref_frames,
+                height=ref_height,
+                width=ref_width,
+            ),
+            device=transformer_device,
+        )
+        frame_rate_v2v = float(sample_parameter.get("frame_rate", 25))
+        ref_positions = get_pixel_coords(
+            latent_coords=ref_coords,
+            scale_factors=SpatioTemporalScaleFactors.default(),
+            causal_fix=True,
+        ).to(dtype=dit_dtype)
+        ref_positions[:, 0, ...] = ref_positions[:, 0, ...] / frame_rate_v2v
+        if reference_downscale_factor != 1:
+            ref_positions = ref_positions.clone()
+            ref_positions[:, 1, ...] *= reference_downscale_factor
+            ref_positions[:, 2, ...] *= reference_downscale_factor
+
+        tgt_coords = patchifier.get_patch_grid_bounds(
+            output_shape=VideoLatentShape(
+                batch=bsz,
+                channels=int(latents.shape[1]),
+                frames=tgt_frames,
+                height=tgt_height,
+                width=tgt_width,
+            ),
+            device=transformer_device,
+        )
+        tgt_positions = get_pixel_coords(
+            latent_coords=tgt_coords,
+            scale_factors=SpatioTemporalScaleFactors.default(),
+            causal_fix=True,
+        ).to(dtype=dit_dtype)
+        tgt_positions[:, 0, ...] = tgt_positions[:, 0, ...] / frame_rate_v2v
+
+        combined_positions = torch.cat([ref_positions, tgt_positions], dim=2)
+
+        # Get base model (bypass LTX2Wrapper)
+        base_model = transformer.model if hasattr(transformer, "model") else transformer
+
+        if getattr(args, "fp8_base", False) or getattr(args, "fp8_scaled", False):
+            self._ensure_fp8_buffers_on_device(base_model)
+        elif getattr(args, "nf4_base", False):
+            self._ensure_nf4_buffers_on_device(base_model)
+
+        # Scheduler
+        ltx2_scheduler = LTX2Scheduler()
+        sigmas = ltx2_scheduler.execute(steps=sample_steps).to(device=transformer_device, dtype=torch.float32)
+
+        # V2V denoising loop
+        logger.info("V2V sampling: %d steps, ref_frames=%d, target_frames=%d", sample_steps, ref_frames, tgt_frames)
+        with torch.no_grad():
+            for step_idx in tqdm(range(len(sigmas) - 1), desc="V2V preview", leave=False):
+                sigma = sigmas[step_idx]
+
+                # Patchify current noisy target
+                target_tokens = patchifier.patchify(latents.to(dtype=dit_dtype))
+                target_seq_len = target_tokens.shape[1]
+
+                # Concatenate ref + target
+                combined_tokens = torch.cat([ref_tokens, target_tokens], dim=1)
+
+                # Target conditioning mask (all False = all denoised)
+                target_conditioning_mask = torch.zeros(
+                    (bsz, target_seq_len), device=transformer_device, dtype=torch.bool
+                )
+                conditioning_mask = torch.cat([ref_conditioning_mask, target_conditioning_mask], dim=1)
+
+                # Per-token timesteps: ref=0, target=sigma
+                combined_timesteps = sigma.view(1, 1).expand(bsz, ref_seq_len + target_seq_len)
+                combined_timesteps = torch.where(
+                    conditioning_mask, torch.zeros_like(combined_timesteps), combined_timesteps
+                )
+
+                perturbations = BatchedPerturbationConfig.empty(bsz)
+
+                if do_classifier_free_guidance:
+                    # Duplicate everything for CFG (unconditional + conditional)
+                    cfg_tokens = combined_tokens.repeat(2, 1, 1)
+                    cfg_timesteps = combined_timesteps.repeat(2, 1)
+                    cfg_positions = combined_positions.repeat(2, 1, 1)
+                    cfg_perturbations = BatchedPerturbationConfig.empty(bsz * 2)
+
+                    video_modality = Modality(
+                        enabled=True,
+                        latent=cfg_tokens,
+                        timesteps=cfg_timesteps,
+                        positions=cfg_positions,
+                        context=prompt_embeds,  # already [neg+pos, seq, dim] from CFG setup
+                        context_mask=prompt_mask,
+                    )
+                    pred_tokens, _ = base_model(video_modality, None, cfg_perturbations)
+
+                    # Split and extract target predictions only
+                    pred_tokens = pred_tokens[:, ref_seq_len:, :]
+                    vel_uncond, vel_cond = pred_tokens.chunk(2)
+
+                    # Unpatchify to 5D for x0 conversion
+                    vel_uncond_5d = patchifier.unpatchify(
+                        vel_uncond,
+                        output_shape=VideoLatentShape(
+                            batch=bsz, channels=int(latents.shape[1]),
+                            frames=tgt_frames, height=tgt_height, width=tgt_width,
+                        ),
+                    ).to(dtype=latents.dtype)
+                    vel_cond_5d = patchifier.unpatchify(
+                        vel_cond,
+                        output_shape=VideoLatentShape(
+                            batch=bsz, channels=int(latents.shape[1]),
+                            frames=tgt_frames, height=tgt_height, width=tgt_width,
+                        ),
+                    ).to(dtype=latents.dtype)
+
+                    x0_uncond = X0PredictionWrapper.velocity_to_x0(latents, vel_uncond_5d, sigma)
+                    x0_cond = X0PredictionWrapper.velocity_to_x0(latents, vel_cond_5d, sigma)
+
+                    effective_cfg = cfg_scale if cfg_scale is not None else guidance_scale
+                    video_x0 = x0_uncond + effective_cfg * (x0_cond - x0_uncond)
+                else:
+                    video_modality = Modality(
+                        enabled=True,
+                        latent=combined_tokens,
+                        timesteps=combined_timesteps,
+                        positions=combined_positions,
+                        context=prompt_embeds,
+                        context_mask=prompt_mask,
+                    )
+                    pred_tokens, _ = base_model(video_modality, None, perturbations)
+
+                    # Extract target predictions only
+                    target_pred = pred_tokens[:, ref_seq_len:, :]
+                    target_pred_5d = patchifier.unpatchify(
+                        target_pred,
+                        output_shape=VideoLatentShape(
+                            batch=bsz, channels=int(latents.shape[1]),
+                            frames=tgt_frames, height=tgt_height, width=tgt_width,
+                        ),
+                    ).to(dtype=latents.dtype)
+
+                    video_x0 = X0PredictionWrapper.velocity_to_x0(latents, target_pred_5d, sigma)
+
+                # Euler step
+                latents = stepper.step(latents, video_x0, sigmas, step_idx)
+
+        # Offload transformer for VAE decode
+        if offload_transformer_for_decode and transformer_device != transformer_offload_device:
+            if hasattr(transformer, "move_to_device_except_swap_blocks"):
+                transformer.move_to_device_except_swap_blocks(transformer_offload_device)
+            else:
+                transformer.to(transformer_offload_device)
+            logger.info("V2V sampling offload: moved transformer to CPU for VAE decode")
+            self._cleanup_cuda(transformer_device)
+
+        # Decode latents
+        if not decode_video:
+            video = None
+        else:
+            if offload_transformer_for_decode:
+                vae.to_device(transformer_device)
+            with torch.no_grad():
+                use_tiled_vae = getattr(args, "sample_tiled_vae", False)
+                if use_tiled_vae:
+                    from musubi_tuner.ltx_2.model.video_vae import TilingConfig, SpatialTilingConfig, TemporalTilingConfig
+                    tile_size = getattr(args, "sample_vae_tile_size", 512)
+                    tile_overlap = getattr(args, "sample_vae_tile_overlap", 64)
+                    temporal_tile_size = getattr(args, "sample_vae_temporal_tile_size", 0)
+                    temporal_tile_overlap = getattr(args, "sample_vae_temporal_tile_overlap", 8)
+                    effective_temporal_size = temporal_tile_size if temporal_tile_size > 0 else 9999
+                    effective_temporal_overlap = temporal_tile_overlap if temporal_tile_size > 0 else 0
+                    tiling_config = TilingConfig(
+                        spatial_config=SpatialTilingConfig(tile_size_in_pixels=tile_size, tile_overlap_in_pixels=tile_overlap),
+                        temporal_config=TemporalTilingConfig(tile_size_in_frames=effective_temporal_size, tile_overlap_in_frames=effective_temporal_overlap),
+                    )
+                    video = vae.tiled_decode(latents.squeeze(0), tiling_config)
+                    if video.dim() == 4:
+                        video = video.unsqueeze(0)
+                else:
+                    video = vae.decode([latents.squeeze(0)])
+                    if isinstance(video, list) and video:
+                        video = video[0]
+                        if video.dim() == 4:
+                            video = video.unsqueeze(0)
+
+        if attention_overrides:
+            self._restore_attention_function(attention_overrides)
+        if offload_transformer_for_decode and restore_transformer_device and transformer_device != transformer_offload_device:
+            if hasattr(transformer, "move_to_device_except_swap_blocks"):
+                transformer.move_to_device_except_swap_blocks(transformer_device)
+            else:
+                transformer.to(transformer_device)
+            logger.info("V2V sampling offload: restored transformer to GPU after decode")
+            self._cleanup_cuda(transformer_device)
+
+        if video is not None:
+            video = (video / 2 + 0.5).clamp(0, 1).to(torch.float32).to("cpu")
+
+        vae.to_device(original_vae_device)
+        vae.to_dtype(original_vae_dtype)
+
+        return video, None  # no audio for v2v sampling
 
     def do_inference_two_stage(
         self,
@@ -4527,6 +5068,23 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         "--sample_merge_audio",
         action="store_true",
         help="Mux sample audio into the sample video (outputs *_av.mp4).",
+    )
+    parser.add_argument(
+        "--sample_include_reference",
+        action="store_true",
+        help="Show V2V reference side-by-side with generated output in sample videos.",
+    )
+    parser.add_argument(
+        "--reference_downscale",
+        type=int,
+        default=1,
+        help="Spatial downscale factor for V2V references (1=same res, 2=half). Must be >= 1.",
+    )
+    parser.add_argument(
+        "--reference_frames",
+        type=int,
+        default=1,
+        help="Number of reference frames to use for V2V sampling. Images always use 1 frame.",
     )
 
     # Two-stage inference arguments

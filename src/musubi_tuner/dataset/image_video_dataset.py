@@ -212,6 +212,7 @@ class ItemInfo:
         self.content = content
         self.latent_cache_path = latent_cache_path
         self.text_encoder_output_cache_path: Optional[str] = None
+        self.reference_latent_cache_path: Optional[str] = None
 
         # np.ndarray for video, list[np.ndarray] for image with multiple controls
         self.control_content: Optional[Union[np.ndarray, list[np.ndarray]]] = None
@@ -2551,6 +2552,14 @@ class ImageDataset(BaseDataset):
             dino_cache_file = self.get_dino_feature_cache_path_from_latent_cache_path(cache_file)
             item_info.dino_feature_cache_path = dino_cache_file if os.path.exists(dino_cache_file) else None
 
+            if self.reference_cache_directory is not None:
+                ref_cache_path = os.path.join(self.reference_cache_directory, os.path.basename(cache_file))
+                if os.path.exists(ref_cache_path):
+                    item_info.reference_latent_cache_path = ref_cache_path
+                else:
+                    logger.warning(f"Reference cache not found, skipping item: {ref_cache_path}")
+                    continue
+
             bucket = bucketed_item_info.get(bucket_reso, [])
             for _ in range(self.num_repeats):
                 bucket.append(item_info)
@@ -2793,6 +2802,7 @@ class VideoDataset(BaseDataset):
         video_directory: Optional[str] = None,
         video_jsonl_file: Optional[str] = None,
         control_directory: Optional[str] = None,
+        reference_directory: Optional[str] = None,
         cache_directory: Optional[str] = None,
         reference_cache_directory: Optional[str] = None,
         separate_audio_buckets: bool = False,
@@ -2817,6 +2827,7 @@ class VideoDataset(BaseDataset):
         self.video_directory = video_directory
         self.video_jsonl_file = video_jsonl_file
         self.control_directory = control_directory
+        self.reference_directory = reference_directory
         self.frame_extraction = frame_extraction
         self.frame_stride = frame_stride
         self.frame_sample = frame_sample
@@ -3106,6 +3117,14 @@ class VideoDataset(BaseDataset):
 
             dino_cache_file = self.get_dino_feature_cache_path_from_latent_cache_path(cache_file)
             item_info.dino_feature_cache_path = dino_cache_file if os.path.exists(dino_cache_file) else None
+
+            if self.reference_cache_directory is not None:
+                ref_cache_path = os.path.join(self.reference_cache_directory, os.path.basename(cache_file))
+                if os.path.exists(ref_cache_path):
+                    item_info.reference_latent_cache_path = ref_cache_path
+                else:
+                    logger.warning(f"Reference cache not found, skipping item: {ref_cache_path}")
+                    continue
 
             bucket = bucketed_item_info.get(bucket_reso, [])
             for _ in range(self.num_repeats):

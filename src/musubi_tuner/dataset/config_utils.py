@@ -69,6 +69,7 @@ class VideoDatasetParams(BaseDatasetParams):
     video_directory: Optional[str] = None
     video_jsonl_file: Optional[str] = None
     control_directory: Optional[str] = None
+    reference_directory: Optional[str] = None
     target_frames: Sequence[int] = (1,)
     frame_extraction: Optional[str] = "head"
     frame_stride: Optional[int] = 1
@@ -153,6 +154,7 @@ class ConfigSanitizer:
         "video_directory": str,
         "video_jsonl_file": str,
         "control_directory": str,
+        "reference_directory": str,
         "target_frames": [int],
         "frame_extraction": str,
         "frame_stride": int,
@@ -440,6 +442,7 @@ def _manifest_params_with_cache_only(dataset_type: str, params: dict) -> dict:
         params["video_directory"] = None
         params["video_jsonl_file"] = None
         params["control_directory"] = None
+        params["reference_directory"] = None
 
     return params
 
