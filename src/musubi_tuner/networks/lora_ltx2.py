@@ -453,6 +453,64 @@ def _get_include_patterns_for_preset(preset: Optional[str]) -> Optional[List[str
     return LTX2_LORA_TARGET_PRESETS[preset]
 
 
+def compute_loftq_from_state_dict(
+    state_dict: dict,
+    loftq_config: dict,
+    network_dim: int,
+    target_layer_keys: Optional[List[str]] = None,
+    exclude_layer_keys: Optional[List[str]] = None,
+) -> Dict[str, tuple]:
+    """Pre-compute LoftQ (lora_A, lora_B) from full-precision weights in a state dict.
+
+    Must be called BEFORE NF4 quantization, while weights are still full-precision.
+
+    Returns a dict mapping ``lora_unet_<module_path>`` → ``(lora_A, lora_B)``.
+    """
+    from tqdm import tqdm
+    from musubi_tuner.modules.loftq_init import loftq_initialize
+    from musubi_tuner.modules.nf4_optimization_utils import quantize_nf4_block, dequantize_nf4_block
+
+    num_iterations = loftq_config.get("num_iterations", 1)
+    block_size = loftq_config.get("block_size", 64)
+    device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+
+    # Find target weight keys (same filtering as NF4 quantization)
+    target_keys = []
+    for key in state_dict:
+        if not key.endswith(".weight"):
+            continue
+        is_target = target_layer_keys is None or any(p in key for p in target_layer_keys)
+        is_excluded = exclude_layer_keys is not None and any(p in key for p in exclude_layer_keys)
+        if is_target and not is_excluded:
+            w = state_dict[key]
+            if isinstance(w, torch.Tensor) and w.ndim == 2 and w.shape[1] % block_size == 0:
+                target_keys.append(key)
+
+    loftq_data: Dict[str, tuple] = {}
+    for key in tqdm(target_keys, desc="LoftQ SVD init"):
+        weight = state_dict[key]
+        # Build lora_name matching the convention in lora.py's create_modules
+        module_path = key.rsplit(".weight", 1)[0]
+        lora_name = f"lora_unet_{module_path}".replace(".", "_")
+        try:
+            lora_A, lora_B = loftq_initialize(
+                weight,
+                quantize_fn=quantize_nf4_block,
+                dequantize_fn=dequantize_nf4_block,
+                lora_rank=network_dim,
+                block_size=block_size,
+                num_iterations=num_iterations,
+                device=device,
+            )
+            loftq_data[lora_name] = (lora_A.cpu(), lora_B.cpu())
+        except Exception as e:
+            logger.warning("LoftQ init failed for %s: %s", module_path, e)
+            continue
+
+    logger.info("LoftQ initialization computed for %d modules", len(loftq_data))
+    return loftq_data
+
+
 def create_arch_network(
     multiplier: float,
     network_dim: Optional[int],
@@ -482,6 +540,15 @@ def create_arch_network(
                 f"Both lora_target_preset='{lora_target_preset}' and include_patterns are set. "
                 "Using explicit include_patterns, ignoring preset."
             )
+
+    # Handle LoftQ: loftq_data is pre-computed from full-precision weights
+    # before NF4 quantization (passed via kwargs from the training script)
+    kwargs.pop("loftq_config", None)  # consumed upstream, not needed here
+    loftq_data = kwargs.pop("loftq_data", None)
+    if loftq_data is not None:
+        module_kwargs = kwargs.get("module_kwargs", None) or {}
+        module_kwargs["loftq_data"] = loftq_data
+        kwargs["module_kwargs"] = module_kwargs
 
     net = lora.create_network(
         LTX2_TARGET_REPLACE_MODULES,

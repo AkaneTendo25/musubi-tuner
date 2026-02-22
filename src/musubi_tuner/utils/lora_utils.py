@@ -14,6 +14,7 @@ logging.basicConfig(level=logging.INFO)
 
 
 from musubi_tuner.modules.fp8_optimization_utils import load_safetensors_with_fp8_optimization
+from musubi_tuner.modules.nf4_optimization_utils import load_safetensors_with_nf4_optimization
 from musubi_tuner.utils.safetensors_utils import (
     MemoryEfficientSafeOpen,
     TensorWeightAdapter,

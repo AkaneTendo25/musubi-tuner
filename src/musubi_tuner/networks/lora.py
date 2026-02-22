@@ -36,6 +36,7 @@ class LoRAModule(torch.nn.Module):
         rank_dropout=None,
         module_dropout=None,
         split_dims: Optional[List[int]] = None,
+        **kwargs,
     ):
         """
         if alpha == 0 or None, alpha is rank (no scaling).
@@ -68,6 +69,13 @@ class LoRAModule(torch.nn.Module):
 
             torch.nn.init.kaiming_uniform_(self.lora_down.weight, a=math.sqrt(5))
             torch.nn.init.zeros_(self.lora_up.weight)
+
+            # LoftQ override: if pre-computed (lora_A, lora_B) are provided, use them
+            loftq_init_data = kwargs.get("loftq_init_data", None)
+            if loftq_init_data is not None:
+                lora_A, lora_B = loftq_init_data
+                self.lora_down.weight.data.copy_(lora_A)
+                self.lora_up.weight.data.copy_(lora_B)
         else:
             # conv2d not supported
             assert sum(split_dims) == out_dim, "sum of split_dims must be equal to out_dim"
@@ -552,6 +560,12 @@ class LoRANetwork(torch.nn.Module):
                                     skipped.append(lora_name)
                                 continue
 
+                            # Build per-module kwargs, injecting LoftQ data if available
+                            per_module_kwargs = dict(self.module_kwargs)
+                            loftq_data = per_module_kwargs.pop("loftq_data", None)
+                            if loftq_data is not None and lora_name in loftq_data:
+                                per_module_kwargs["loftq_init_data"] = loftq_data[lora_name]
+
                             lora = module_class(
                                 lora_name,
                                 child_module,
@@ -561,7 +575,7 @@ class LoRANetwork(torch.nn.Module):
                                 dropout=dropout,
                                 rank_dropout=rank_dropout,
                                 module_dropout=module_dropout,
-                                **self.module_kwargs,
+                                **per_module_kwargs,
                             )
                             loras.append(lora)
 

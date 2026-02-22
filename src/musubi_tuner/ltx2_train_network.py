@@ -41,8 +41,14 @@ from musubi_tuner.utils.device_utils import clean_memory_on_device
 from musubi_tuner.utils import model_utils
 from musubi_tuner.ltx_2.model.transformer.fp8_device_utils import ensure_fp8_modules_on_device
 from musubi_tuner.utils.safetensors_utils import MemoryEfficientSafeOpen        
-from musubi_tuner.modules.fp8_optimization_utils import apply_fp8_monkey_patch  
-from musubi_tuner.utils.lora_utils import load_safetensors_with_lora_and_fp8    
+from musubi_tuner.modules.fp8_optimization_utils import apply_fp8_monkey_patch
+from musubi_tuner.modules.nf4_optimization_utils import (
+    apply_nf4_monkey_patch,
+    is_nf4_module,
+    load_safetensors_with_nf4_optimization,
+    DEFAULT_NF4_BLOCK_SIZE,
+)
+from musubi_tuner.utils.lora_utils import load_safetensors_with_lora_and_fp8
 from musubi_tuner.ltx_2.env import apply_ltx2_tweaks
 from musubi_tuner.ltx2_inference import (
     LTX2Inferencer,
@@ -294,7 +300,15 @@ def load_ltx2_model(
     fp8_upcast: bool = False,
     fp8_upcast_stochastic: bool = False,
     fp8_upcast_seed: int = 0,
+    nf4_base: bool = False,
+    nf4_block_size: int = DEFAULT_NF4_BLOCK_SIZE,
+    loftq_init: bool = False,
+    loftq_iters: int = 1,
+    lora_rank: int = 0,
     load_weights_on_cpu: bool = False,
+    awq_calibration: bool = False,
+    awq_alpha: float = 0.25,
+    awq_num_batches: int = 8,
     **_: Any,
 ):
     """Load LTX-2 (video or audio-video) transformer
@@ -313,8 +327,8 @@ def load_ltx2_model(
     """
     def _cast_non_fp8_params(model: torch.nn.Module, target_dtype: torch.dtype) -> None:
         for module in model.modules():
-            is_fp8_linear = isinstance(module, torch.nn.Linear) and hasattr(module, "scale_weight")
-            if is_fp8_linear:
+            is_quantized_linear = isinstance(module, torch.nn.Linear) and hasattr(module, "scale_weight")
+            if is_quantized_linear:
                 continue
             for _, param in module.named_parameters(recurse=False):
                 if isinstance(param, torch.Tensor) and param.dtype == torch.float32:
@@ -386,7 +400,120 @@ def load_ltx2_model(
     with torch.device("meta"):
         base_model = configurator.from_config(config)
 
-    if fp8_scaled:
+    _awq_scales = None  # populated if AWQ calibration is used
+
+    if nf4_base:
+        nf4_calc_device = target_device if (not load_weights_on_cpu and load_device == target_device) else torch.device("cpu")
+        nf4_calc_override = os.getenv("LTX2_NF4_CALC_DEVICE", "cuda").strip().lower()
+        if nf4_calc_override in {"1", "true", "yes", "cuda", "gpu"}:
+            if target_device.type == "cuda":
+                nf4_calc_device = target_device
+                logger.info("LTX-2 nf4: quantizing on %s (LTX2_NF4_CALC_DEVICE=%s).", target_device, nf4_calc_override)
+            else:
+                logger.warning(
+                    "LTX-2 nf4: LTX2_NF4_CALC_DEVICE=%s requested GPU, but target device is %s; using CPU.",
+                    nf4_calc_override,
+                    target_device,
+                )
+        model_files = model_path if isinstance(model_path, list) else [model_path]
+        nf4_target_keys = ["transformer_blocks"]
+        nf4_exclude_keys = list(KEEP_FP8_HIGH_PRECISION_TOKENS)
+
+        # AWQ and/or LoftQ both need full-precision weights before quantization
+        _needs_full_precision = (loftq_init and lora_rank > 0) or awq_calibration
+
+        if _needs_full_precision:
+            from musubi_tuner.modules.nf4_optimization_utils import optimize_state_dict_with_nf4
+
+            sd = load_safetensors_with_lora_and_fp8(
+                model_files=model_files,
+                lora_weights_list=None,
+                lora_multipliers=None,
+                fp8_optimization=False,
+                calc_device=torch.device("cpu"),
+                move_to_device=False,
+                dit_weight_dtype=None,
+            )
+            # Rename keys (must happen before LoftQ since lora_name is built from key paths)
+            renamed_sd: dict[str, torch.Tensor] = {}
+            for k, v in sd.items():
+                nk = LTXV_MODEL_COMFY_RENAMING_MAP.apply_to_key(k)
+                renamed_sd[nk if nk is not None else k] = v
+            sd = renamed_sd
+
+            # --- AWQ calibration ---
+            if awq_calibration:
+                from musubi_tuner.modules.awq_calibration import (
+                    get_awq_cache_path,
+                    load_awq_scales,
+                    save_awq_scales,
+                    run_synthetic_calibration,
+                    apply_awq_scales_to_state_dict,
+                )
+
+                awq_cache_path = get_awq_cache_path(model_files[0])
+                if os.path.exists(awq_cache_path):
+                    logger.info("AWQ: loading cached scales from %s", awq_cache_path)
+                    _awq_scales = load_awq_scales(awq_cache_path)
+                else:
+                    logger.info("AWQ: no cached scales found, running synthetic calibration...")
+                    _awq_scales = run_synthetic_calibration(
+                        model=base_model,
+                        state_dict=sd,
+                        num_batches=awq_num_batches,
+                        alpha=awq_alpha,
+                        target_layer_keys=nf4_target_keys,
+                        exclude_layer_keys=nf4_exclude_keys,
+                        device=nf4_calc_device,
+                    )
+                    if _awq_scales:
+                        save_awq_scales(_awq_scales, awq_cache_path)
+                    else:
+                        logger.warning("AWQ: calibration produced no scales, proceeding without AWQ")
+
+                # Apply AWQ scales to weights before quantization
+                if _awq_scales:
+                    apply_awq_scales_to_state_dict(sd, _awq_scales)
+                    logger.info("AWQ: applied scales to %d weight tensors", len(_awq_scales))
+
+                # Re-create model on meta (calibration may have loaded weights into it)
+                with torch.device("meta"):
+                    base_model = configurator.from_config(config)
+
+            # --- LoftQ ---
+            if loftq_init and lora_rank > 0:
+                from musubi_tuner.networks.lora_ltx2 import compute_loftq_from_state_dict
+
+                _loftq_data = compute_loftq_from_state_dict(
+                    sd,
+                    loftq_config={"num_iterations": loftq_iters, "block_size": nf4_block_size},
+                    network_dim=lora_rank,
+                    target_layer_keys=nf4_target_keys,
+                    exclude_layer_keys=nf4_exclude_keys,
+                )
+                load_ltx2_model._loftq_data = _loftq_data
+
+            # Quantize in-place
+            sd = optimize_state_dict_with_nf4(
+                sd,
+                calc_device=nf4_calc_device,
+                target_layer_keys=nf4_target_keys,
+                exclude_layer_keys=nf4_exclude_keys,
+                block_size=nf4_block_size,
+                move_to_device=not load_weights_on_cpu and load_device == target_device,
+            )
+            _skip_rename = True
+        else:
+            sd = load_safetensors_with_nf4_optimization(
+                model_files=model_files,
+                calc_device=nf4_calc_device,
+                target_layer_keys=nf4_target_keys,
+                exclude_layer_keys=nf4_exclude_keys,
+                block_size=nf4_block_size,
+                move_to_device=not load_weights_on_cpu and load_device == target_device,
+            )
+            _skip_rename = False
+    elif fp8_scaled:
         fp8_calc_device = target_device if (not load_weights_on_cpu and load_device == target_device) else torch.device("cpu")
         fp8_calc_override = os.getenv("LTX2_FP8_CALC_DEVICE", "cuda").strip().lower()
         if fp8_calc_override in {"1", "true", "yes", "cuda", "gpu"}:
@@ -423,11 +550,12 @@ def load_ltx2_model(
             exclude_keys=None,
         )
 
-    renamed_sd: dict[str, torch.Tensor] = {}
-    for k, v in sd.items():
-        nk = LTXV_MODEL_COMFY_RENAMING_MAP.apply_to_key(k)
-        renamed_sd[nk if nk is not None else k] = v
-    sd = renamed_sd
+    if not (nf4_base and locals().get("_skip_rename", False)):
+        renamed_sd: dict[str, torch.Tensor] = {}
+        for k, v in sd.items():
+            nk = LTXV_MODEL_COMFY_RENAMING_MAP.apply_to_key(k)
+            renamed_sd[nk if nk is not None else k] = v
+        sd = renamed_sd
 
     def _trace_vram_ltx2(tag):
         if torch.cuda.is_available():
@@ -437,9 +565,11 @@ def load_ltx2_model(
             logger.info(f"[VRAM_TRACE_LTX2] {tag}: alloc={a:.2f}GB res={r:.2f}GB max={m:.2f}GB")
 
     _trace_vram_ltx2("AFTER state dict loading (sd on CPU)")
-    if fp8_scaled:
+    if nf4_base:
+        apply_nf4_monkey_patch(base_model, sd, block_size=nf4_block_size, awq_scales=_awq_scales)
+    elif fp8_scaled:
         apply_fp8_monkey_patch(base_model, sd, use_scaled_mm=False)
-    _trace_vram_ltx2("AFTER apply_fp8_monkey_patch")
+    _trace_vram_ltx2("AFTER apply monkey patch")
     base_model.load_state_dict(sd, strict=False, assign=True)
     _trace_vram_ltx2("AFTER load_state_dict (model still on meta/cpu)")
     if torch_dtype is not None:
@@ -920,6 +1050,44 @@ class LTX2NetworkTrainer(NetworkTrainer):
             # No block swap - process entire model as before
             ensure_fp8_modules_on_device(model, target_device)
 
+    def _ensure_nf4_buffers_on_device(self, model: torch.nn.Module) -> None:
+        """Move NF4 scale_weight buffers to the same device as the model weights.
+
+        NF4 uint8 packed weights move naturally between CPU/GPU, but the
+        scale_weight buffers (float) must be co-located with the weight for
+        the dequantize forward to work.  This mirrors _ensure_fp8_buffers_on_device
+        but uses the is_nf4_module check instead of FP8 dtype detection.
+        """
+        if not any(True for _ in model.parameters()):
+            return
+        target_device = next(model.parameters()).device
+
+        base_model = model.model if hasattr(model, "model") else model
+        blocks_to_swap = getattr(base_model, "blocks_to_swap", 0) or 0
+
+        def _sync_nf4_buffers(module: torch.nn.Module, device: torch.device) -> None:
+            for submodule in module.modules():
+                if is_nf4_module(submodule):
+                    sw = getattr(submodule, "scale_weight", None)
+                    if isinstance(sw, torch.Tensor) and sw.device != device:
+                        submodule.scale_weight = sw.to(device)
+                    w = getattr(submodule, "weight", None)
+                    if isinstance(w, torch.Tensor) and w.device != device:
+                        submodule.weight = w.to(device)
+
+        if blocks_to_swap > 0 and hasattr(base_model, "transformer_blocks"):
+            for name, child in base_model.named_children():
+                if name == "transformer_blocks":
+                    continue
+                _sync_nf4_buffers(child, target_device)
+            num_blocks = len(base_model.transformer_blocks)
+            swap_start = max(0, num_blocks - blocks_to_swap)
+            for idx, block in enumerate(base_model.transformer_blocks):
+                if idx < swap_start:
+                    _sync_nf4_buffers(block, target_device)
+        else:
+            _sync_nf4_buffers(model, target_device)
+
     class _DeferredVAE:
         def __init__(self) -> None:
             self._deferred = True
@@ -1054,6 +1222,13 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 compute_dtype,
             )
             self.dit_dtype = compute_dtype
+
+        if getattr(args, "nf4_base", False) and getattr(args, "fp8_base", False):
+            raise ValueError("--nf4_base and --fp8_base are mutually exclusive")
+        if getattr(args, "loftq_init", False) and not getattr(args, "nf4_base", False):
+            raise ValueError("--loftq_init requires --nf4_base")
+        if getattr(args, "awq_calibration", False) and not getattr(args, "nf4_base", False):
+            raise ValueError("--awq_calibration requires --nf4_base")
 
         if getattr(args, "fp8_scaled", False):
             assert getattr(args, "fp8_base", False), "fp8_scaled requires fp8_base / fp8_scaledはfp8_baseが必要です"
@@ -1261,7 +1436,15 @@ class LTX2NetworkTrainer(NetworkTrainer):
             fp8_upcast=bool(getattr(args, "fp8_upcast", False)),
             fp8_upcast_stochastic=bool(getattr(args, "fp8_upcast_stochastic", False)),
             fp8_upcast_seed=int(getattr(args, "fp8_upcast_seed", 0)),
+            nf4_base=bool(getattr(args, "nf4_base", False)),
+            nf4_block_size=int(getattr(args, "nf4_block_size", DEFAULT_NF4_BLOCK_SIZE)),
+            loftq_init=bool(getattr(args, "loftq_init", False)),
+            loftq_iters=int(getattr(args, "loftq_iters", 2)),
+            lora_rank=int(getattr(args, "network_dim", 0) or 0),
             load_weights_on_cpu=True,
+            awq_calibration=bool(getattr(args, "awq_calibration", False)),
+            awq_alpha=float(getattr(args, "awq_alpha", 0.25)),
+            awq_num_batches=int(getattr(args, "awq_num_batches", 8)),
         )
 
         transformer.eval()
@@ -1890,6 +2073,8 @@ class LTX2NetworkTrainer(NetworkTrainer):
 
             if getattr(args, "fp8_base", False) or getattr(args, "fp8_scaled", False):
                 self._ensure_fp8_buffers_on_device(transformer)
+            elif getattr(args, "nf4_base", False):
+                self._ensure_nf4_buffers_on_device(transformer)
             with accelerator.autocast():
                 model_pred = transformer(
                     [dummy_video, noisy_audio],
@@ -2073,6 +2258,8 @@ class LTX2NetworkTrainer(NetworkTrainer):
 
             if getattr(args, "fp8_base", False) or getattr(args, "fp8_scaled", False):
                 self._ensure_fp8_buffers_on_device(base_model)
+            elif getattr(args, "nf4_base", False):
+                self._ensure_nf4_buffers_on_device(base_model)
             with accelerator.autocast():
                 pred_tokens, _ = base_model(video_modality, None, perturbations)
 
@@ -2486,7 +2673,8 @@ class LTX2NetworkTrainer(NetworkTrainer):
         """Load precached I2V conditioning latents and merge into sample_params (in-place)."""
         cache_path = getattr(args, "sample_latents_cache", None) or self._resolve_default_sample_latents_cache(args)
         if not os.path.exists(cache_path):
-            raise FileNotFoundError(f"Precached I2V latents not found: {cache_path}")
+            logger.warning("Precached I2V latents not found: %s — skipping (samples will run without I2V conditioning)", cache_path)
+            return
 
         logger.info(f"Loading precached I2V conditioning latents from {cache_path}")
         try:
@@ -4218,6 +4406,45 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         "--fp8_scaled",
         action="store_true",
         help="use scaled fp8 for DiT / DiTにスケーリングされたfp8を使う",
+    )
+    parser.add_argument(
+        "--nf4_base",
+        action="store_true",
+        help="use NF4 4-bit quantization for base DiT model (reduces VRAM ~75%%)",
+    )
+    parser.add_argument(
+        "--nf4_block_size",
+        type=int,
+        default=32,
+        help="block size for NF4 quantization (default 32)",
+    )
+    parser.add_argument(
+        "--loftq_init",
+        action="store_true",
+        help="use LoftQ initialization for LoRA (compensates NF4 quantization error, requires --nf4_base)",
+    )
+    parser.add_argument(
+        "--loftq_iters",
+        type=int,
+        default=2,
+        help="number of LoftQ alternating iterations (default 2)",
+    )
+    parser.add_argument(
+        "--awq_calibration",
+        action="store_true",
+        help="experimental: use AWQ-style activation-aware calibration for NF4 (requires --nf4_base)",
+    )
+    parser.add_argument(
+        "--awq_alpha",
+        type=float,
+        default=0.25,
+        help="AWQ scaling strength (0=no effect, 1=full activation-aware, default 0.25)",
+    )
+    parser.add_argument(
+        "--awq_num_batches",
+        type=int,
+        default=8,
+        help="number of synthetic calibration batches for AWQ (default 8)",
     )
     parser.add_argument(
         "--height",

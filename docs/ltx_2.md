@@ -75,7 +75,7 @@ python ltx2_cache_latents.py ^
 ### Memory Optimization for Caching
 If you encounter Out-Of-Memory (OOM) errors during caching (especially with higher resolutions like 1080p), you have two options:
 
-**Option 1: VAE temporal chunking** (simpler, for moderate OOM)
+**Option 1: VAE temporal chunking** (fewer parameters, for moderate OOM)
 ```bash
 python ltx2_cache_latents.py ^
   ...
@@ -95,7 +95,7 @@ python ltx2_cache_latents.py ^
 - `--vae_temporal_tile_size`: Splits the video into temporal tiles of this many frames (e.g., 64). Must be >= 16 and divisible by 8. Default: `None` (disabled).
 - `--vae_temporal_tile_overlap`: Overlap between temporal tiles in frames. Must be divisible by 8. Default: `24`.
 
-Spatial and temporal tiling can be combined. Tiled encoding produces nearly identical latents (RMSE < 1e-3) with 50-70% less VRAM at the cost of ~30% slower encoding.
+Spatial and temporal tiling can be combined. Tiled encoding produces latents with RMSE < 1e-3 compared to non-tiled, using 50-70% less VRAM at the cost of ~30% slower encoding.
 
 Both options can be combined (e.g., `--vae_chunk_size 16 --vae_spatial_tile_size 512`).
 
@@ -241,14 +241,31 @@ accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 ltx2_tr
 ### Key Arguments
 
 #### Memory Optimization
-- `--fp8_base`, `--fp8_scaled`: Casts base model weights to FP8.
+
+##### Quantization Options
+
+| Method | VRAM (19B model) | Weight Error (MAE) | SNR | Cosine Similarity |
+|--------|------------------|--------------------|-----|-------------------|
+| BF16 (baseline) | ~38 GB | 0.0011 | 55.6 dB | 0.999999 |
+| `--fp8_base --fp8_scaled` | ~19 GB | 0.0171 (15x BF16) | 32.0 dB | 0.999686 |
+| `--nf4_base` | ~10 GB | 0.0678 (60x BF16) | 21.2 dB | 0.996188 |
+| `--nf4_base --loftq_init` | ~10 GB | 0.0654 (60x BF16) | 21.5 dB | 0.996437 |
+
+*Measured on random N(0,1) weights with shapes representative of LTX-2 transformer layers. MAE = mean absolute error between original and dequantized weights. LoftQ error is measured after adding the LoRA correction (rank 32, 2 iterations).*
+
+NF4 has ~4x higher weight error than FP8 (cosine 0.996 vs 0.9997). The base model is frozen during LoRA training, so the quantization error is constant rather than accumulating. LoftQ initializes LoRA weights from the quantization residual via SVD.
+
+- `--fp8_base`, `--fp8_scaled`: FP8 quantization (~19 GB VRAM).
+- `--nf4_base`: NF4 4-bit quantization (~10 GB VRAM). Mutually exclusive with `--fp8_base`. See [NF4 Quantization](#nf4-quantization) below.
+
+##### Other Memory Options
 - `--blocks_to_swap X`: Offloads X transformer blocks to CPU (max 47 for 48-block model). Higher values save more VRAM but increase CPU↔GPU overhead.
 - `--use_pinned_memory_for_block_swap`: Uses pinned memory for faster CPU↔GPU block transfers.
 - `--gradient_checkpointing`: Reduces VRAM by recomputing activations during backward pass.
 - `--gradient_checkpointing_cpu_offload`: Offloads activations to CPU during gradient checkpointing recomputation.
 - `--ffn_chunk_target all|video|audio`: Enable FFN chunking for selected modules. Reduces VRAM by processing FFN in chunks.
 - `--ffn_chunk_size N`: Chunk size for FFN chunking (0 disables).
-- `--split_attn_target all|self|cross|...`: Enable split attention for selected attention modules.
+- `--split_attn_target none|all|self|cross|text_cross|av_cross|video|audio`: Enable split attention for selected attention modules.
 - `--split_attn_mode batch|query`: Split attention by batch dimension or query length.
 - `--split_attn_chunk_size N`: Chunk size for query-based split attention (0 uses default 1024).
 
@@ -288,6 +305,50 @@ accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 ltx2_tr
 - Use smaller training resolutions (e.g., 512x320)
 - Reduce `--sample_vae_temporal_tile_size` to 24 or lower
 - Use `--use_pinned_memory_for_block_swap` - faster transfers
+
+#### NF4 Quantization
+
+NF4 (4-bit NormalFloat) quantization uses a 16-value codebook optimized for normally-distributed weights (QLoRA paper). Weights are stored as packed uint8 with per-block absmax scaling. VRAM usage is ~10 GB vs ~19 GB for FP8 and ~38 GB for BF16.
+
+**Basic usage:**
+```bash
+accelerate launch ... ltx2_train_network.py ^
+  --nf4_base ^
+  --network_module networks.lora_ltx2 ^
+  --network_dim 32 ^
+  ...
+```
+
+**With LoftQ initialization:**
+
+LoftQ pre-computes LoRA A/B matrices from the truncated SVD of the NF4 quantization residual (`W - dequant(Q(W))`). This runs once at startup and adds no runtime cost. Reduces static weight MAE by ~3.5% (rank 32, 2 iterations).
+
+```bash
+accelerate launch ... ltx2_train_network.py ^
+  --nf4_base ^
+  --loftq_init ^
+  --loftq_iters 2 ^
+  --network_module networks.lora_ltx2 ^
+  --network_dim 32 ^
+  ...
+```
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--nf4_base` | off | Enable NF4 4-bit quantization for the base model |
+| `--nf4_block_size` | 32 | Elements per quantization block |
+| `--loftq_init` | off | LoftQ initialization for LoRA (requires `--nf4_base`) |
+| `--loftq_iters` | 2 | Number of alternating quantize-SVD iterations |
+| `--awq_calibration` | off | Experimental: activation-aware channel scaling before quantization |
+| `--awq_alpha` | 0.25 | AWQ scaling strength (0 = no effect, 1 = full) |
+| `--awq_num_batches` | 8 | Number of synthetic calibration batches for AWQ |
+
+**Notes:**
+- `--nf4_base` and `--fp8_base` are mutually exclusive.
+- `--loftq_init` requires `--nf4_base`.
+- `--awq_calibration` is experimental. Adds a per-layer division during forward passes. In synthetic tests, reduces activation-weighted error by ~3-5%; effect on real training quality has not been validated.
+- Compatible with `--blocks_to_swap`, `--gradient_checkpointing`, and other training options. NF4 reduces block swap transfer size (4-bit vs 16-bit per weight).
+- Quantization targets transformer block weights only. Embedding layers, norms, and projection layers remain in full precision.
 
 #### Audio-Video Support
 - `--ltx2_mode`, `--ltx_mode`: Training modality selector. Default is `v` (`video`). Values: `video`, `av`, `audio` (aliases: `v`, `va`, `a`).
@@ -339,7 +400,7 @@ Recommended start values:
 
 #### Preservation & Regularization
 
-Three optional techniques to improve LoRA quality by constraining how the LoRA changes the base model. All are disabled by default with zero overhead.
+Three optional techniques that constrain how the LoRA modifies the base model. All are disabled by default with zero overhead.
 
 **Blank Prompt Preservation** — Prevents the LoRA from altering the model's blank-prompt output (used as the CFG baseline during inference):
 ```bash
@@ -370,9 +431,9 @@ All three can be combined:
 | `--dop` | +2 | +1 | 0.5 - 1.0 |
 | `--prior_divergence` | +1 | 0 | 0.05 - 0.1 |
 
-**VRAM note:** Each technique adds transformer forward passes per step. Using all three adds +5 forwards and +2 backwards. This significantly increases VRAM usage and step time. Not recommended with `--blocks_to_swap` on low-VRAM GPUs.
+**VRAM note:** Each technique adds transformer forward passes per step. Using all three adds +5 forwards and +2 backwards, increasing VRAM usage and step time proportionally.
 
-**CREPA (Cross-frame Representation Alignment)** — Encourages temporal consistency across video frames by aligning DiT hidden states across frames via a small projector MLP. Based on [arxiv 2506.09229](https://arxiv.org/abs/2506.09229). Only the projector is trained; all other modules stay frozen. CREPA adds negligible overhead (no extra forward passes — it uses hooks to capture intermediate features from the existing forward pass).
+**CREPA (Cross-frame Representation Alignment)** — Encourages temporal consistency across video frames by aligning DiT hidden states across frames via a small projector MLP. Based on [arxiv 2506.09229](https://arxiv.org/abs/2506.09229). Only the projector is trained; all other modules stay frozen. CREPA uses hooks to capture intermediate features from the existing forward pass (no extra forward passes).
 
 Enable with `--crepa`. All parameters are passed via `--crepa_args` as `key=value` pairs:
 
@@ -415,7 +476,7 @@ accelerate launch ... ltx2_train_network.py ^
 
 CREPA adds a `loss/crepa` metric to TensorBoard/WandB logs. A healthy CREPA loss should:
 - Start negative (cosine similarity is being maximized)
-- Gradually decrease (more negative = better alignment)
+- Gradually decrease (more negative = stronger cross-frame alignment)
 - Stabilize after warmup
 
 #### Compatibility
@@ -459,7 +520,7 @@ The cache file is saved to `<cache_directory>/ltx2_preservation_cache.pt` by def
 
 #### Timestep Sampling
 - `--timestep_sampling shifted_logit_normal`: Default LTX-2 method. Uses a shifted logit-normal distribution where the shift is computed based on sequence length (frames × height × width).
-- `--timestep_sampling uniform`: Simple uniform sampling from [0, 1]. Alternative if you want simpler behavior.
+- `--timestep_sampling uniform`: Uniform sampling from [0, 1].
 - `--logit_std`: Standard deviation for the logit-normal distribution (default: 1.0). Only used with `shifted_logit_normal`.
 - `--min_timestep` / `--max_timestep`: Optional timestep range constraints.
 
@@ -473,7 +534,7 @@ Use `--lora_target_preset` to control which layers LoRA targets:
 | `t2v` (default) | Attention only (`to_q`, `to_k`, `to_v`, `to_out.0`) | Text-to-video, matches official LTX-2 trainer |
 | `v2v` | Attention + FFN | Video-to-video / IC-LoRA style |
 | `audio` | Audio attention/FFN + audio-side cross-modal attention | Audio-only training (auto-selected when `--ltx2_mode audio`) |
-| `full` | All linear layers | Maximum expressiveness, larger file size |
+| `full` | All linear layers | All layers targeted, larger file size |
 
 All presets apply to all relevant attention types: self-attention, cross-attention, and cross-modal attention (in AV mode). Connector layers are always excluded.
 
@@ -503,7 +564,7 @@ To avoid loading Gemma during training for sample generation, you can precache t
 - `--sample_prompts_cache`: Path to the precached embeddings file. Defaults to `<cache_directory>/ltx2_sample_prompts_cache.pt`.
 
 #### Two-Stage Sampling (WIP)
-Two-stage inference generates at half resolution, then upsamples and refines for better quality. This feature is work in progress and may not produce optimal results yet. Disabled by default.
+Two-stage inference generates at half resolution, then upsamples and refines. This feature is work in progress. Disabled by default.
 
 - `--sample_two_stage`: Enable two-stage inference during sampling.
 - `--spatial_upsampler_path`: Path to spatial upsampler model (e.g., `ltx-2-spatial-upscaler-x2-1.0.safetensors`). Required when `--sample_two_stage` is set.
@@ -554,7 +615,7 @@ The dataset config is a TOML file with `[general]` defaults and `[[datasets]]` e
 | `frame_extraction` | string | `"head"` | Frame extraction mode |
 | `max_frames` | int | 129 | Maximum number of frames |
 | `source_fps` | float | auto-detected | Source video FPS. Auto-detected from video container metadata when not set. Use this to override auto-detection. |
-| `target_fps` | float | 24.0 | Target training FPS. Frames are resampled to this rate. When audio is present and the source video has a different FPS, the audio waveform is automatically time-stretched (pitch-preserving) to match the target video duration. |
+| `target_fps` | float | 25.0 | Target training FPS. Frames are resampled to this rate. When audio is present and the source video has a different FPS, the audio waveform is automatically time-stretched (pitch-preserving) to match the target video duration. |
 | `batch_size` | int | 1 | Batch size |
 | `num_repeats` | int | 1 | Dataset repetitions |
 | `enable_bucket` | bool | false | Enable resolution bucketing |
@@ -574,12 +635,12 @@ cache_directory = "cache"
 [[datasets]]
 video_directory = "videos"
 target_frames = [1, 17, 33, 49]
-target_fps = 24    # optional, defaults to 24
+target_fps = 25    # optional, defaults to 25
 ```
 
 ### Frame Rate (FPS) Handling
 
-LTX-2 was trained on 24fps video. During latent caching, the source FPS is **auto-detected** from each video's container metadata and frames are resampled to `target_fps` (default: 24). This ensures the model sees video at the correct temporal rate regardless of the source material.
+During latent caching, the source FPS is **auto-detected** from each video's container metadata and frames are resampled to `target_fps` (default: 25). The model receives video at the configured temporal rate regardless of the source material.
 
 #### How It Works
 
@@ -590,15 +651,15 @@ LTX-2 was trained on 24fps video. During latent caching, the source FPS is **aut
 
 #### Common Scenarios
 
-**Default — no FPS config needed (recommended for most users):**
+**Default — no FPS config needed:**
 ```toml
 [[datasets]]
 video_directory = "videos"
 target_frames = [1, 17, 33, 49]
 # source_fps: auto-detected per video
-# target_fps: defaults to 24
+# target_fps: defaults to 25
 ```
-A 60fps video produces 240 frames per 10 seconds (not 600). A 30fps video produces 240 frames per 10 seconds (not 300). A 24fps video is passed through as-is. Mixed-FPS datasets work correctly — each video is resampled independently.
+A 60fps video is resampled to 25fps. A 30fps video is resampled to 25fps. A 25fps video is passed through as-is. Mixed-FPS datasets work correctly — each video is resampled independently.
 
 **Training at a non-standard frame rate (e.g., 60fps):**
 ```toml
@@ -607,7 +668,7 @@ video_directory = "videos_60fps"
 target_frames = [1, 17, 33, 49]
 target_fps = 60
 ```
-Set `target_fps` to the desired training rate. Videos at 60fps (or 59.94fps) pass through without resampling. Videos at other frame rates are resampled to 60fps. Note: LTX-2 was trained on 24fps content, so non-24fps training is experimental.
+Set `target_fps` to the desired training rate. Videos at 60fps (or 59.94fps) pass through without resampling. Videos at other frame rates are resampled to 60fps.
 
 **Overriding auto-detection (e.g., variable frame rate videos):**
 ```toml
@@ -627,7 +688,7 @@ Image directories have no FPS metadata. No resampling is applied — all images 
 During latent caching, log messages confirm what's happening for each video:
 ```
 Auto-detected source FPS: 60.00 for my_video.mp4
-Resampling my_video.mp4: 60.00 FPS -> 24.00 FPS
+Resampling my_video.mp4: 60.00 FPS -> 25.00 FPS
 ```
 If you see **no** "Resampling" line for a video, it means source and target FPS matched (within 1%) and all frames were kept as-is. If you see unexpected frame counts in your cached latents, check these log lines first.
 
@@ -635,10 +696,10 @@ If you see **no** "Resampling" line for a video, it means source and target FPS 
 
 | Your situation | What to set | What happens |
 |---|---|---|
-| Mixed FPS dataset, want 24fps training | Nothing (defaults work) | Each video auto-detected, resampled to 24fps |
-| All videos are 24fps | Nothing | Auto-detected as 24fps, no resampling (within 1%) |
+| Mixed FPS dataset, want 25fps training | Nothing (defaults work) | Each video auto-detected, resampled to 25fps |
+| All videos are 25fps | Nothing | Auto-detected as 25fps, no resampling (within 1%) |
 | All videos are 60fps, want 60fps training | `target_fps = 60` | Auto-detected as 60fps, no resampling |
-| All videos are 60fps, want 24fps training | Nothing | Auto-detected as 60fps, resampled to 24fps |
+| All videos are 60fps, want 25fps training | Nothing | Auto-detected as 60fps, resampled to 25fps |
 | VFR videos with wrong detection | `source_fps = 30` (your actual FPS) | Overrides auto-detection |
 | Image directory | Nothing | No FPS concept, all images loaded |
 
@@ -755,7 +816,7 @@ cache_directory/
 | Crash with block swap (esp. RTX 5090) | `--use_pinned_memory_for_block_swap` bug | Remove `--use_pinned_memory_for_block_swap` from training arguments |
 | `stack expects each tensor to be equal size` during AV training | Mixed audio/non-audio videos in the same batch — text embeddings are 7680-dim for AV items vs 3840-dim for video-only, and `torch.stack` fails | Add `--separate_audio_buckets` to training args. This is **required** when your dataset has a mix of videos with and without audio at `batch_size > 1`. At `batch_size=1` the flag has no effect. When all videos have audio (or all don't), the flag is also unnecessary |
 | Wrong frame count in cached latents | Auto-detected FPS incorrect (e.g., VFR video) | Set `source_fps` explicitly in TOML config to override auto-detection |
-| Too few frames from high-FPS video | FPS resampling working correctly (e.g., 60fps→24fps = 40% of frames) | This is expected behavior. Set `target_fps = 60` if you want to keep all frames |
+| Too few frames from high-FPS video | FPS resampling working correctly (e.g., 60fps→25fps = 42% of frames) | This is expected behavior. Set `target_fps = 60` if you want to keep all frames |
 | Audio/video out of sync after caching | Source FPS mismatch causing wrong time-stretch | Check "Auto-detected source FPS" log line; set `source_fps` explicitly if wrong |
 | Voice/audio learning slow when mixing images with videos in AV mode | Image batches produce zero audio training signal — the entire audio branch is skipped (no audio forward pass, no audio loss, no audio gradients). This dilutes audio learning proportionally to the fraction of image steps | Use video-only datasets for AV training when voice quality matters. If you must mix images, expect audio to require proportionally more training steps to converge |
 | No audio during sampling in video training mode | `ltx2_mode` is set to `v`/`video` | This is expected behavior. The sampler automatically bypasses loading the audio vocoder/decoder to save memory when the architecture is instantiated as video-only. To generate audio during sampling, you must train in AV mode (`--ltx2_mode av` or `audio`). |
@@ -773,8 +834,8 @@ Two modes are available:
 
 | Mode | Input | Use Case |
 |------|-------|----------|
-| `text` | Prompt pairs only (no dataset) | Quick concept sliders from text descriptions |
-| `reference` | Pre-cached latent pairs | Precise control from paired positive/negative images |
+| `text` | Prompt pairs only (no dataset) | Sliders from text prompt pairs, no images needed |
+| `reference` | Pre-cached latent pairs | Sliders from paired positive/negative image samples |
 
 ### 4a. Text-Only Mode
 
@@ -796,7 +857,7 @@ weight = 1.0
 
 - `guidance_strength`: Scales the directional offset applied to targets. Higher values = stronger direction signal but may overshoot.
 - `target_class`: The conditioning prompt used during training passes. Empty string means the slider affects all content regardless of prompt. Set to e.g. `"a portrait"` to restrict the slider's effect to a specific subject.
-- `weight`: Per-target loss weight. Useful when training multiple directions simultaneously.
+- `weight`: Per-target loss weight. Controls relative emphasis when training multiple directions simultaneously.
 - `sample_slider_range`: Multiplier values used for preview samples during training.
 
 Multiple `[[targets]]` blocks can be defined to train several directions at once (e.g., detail + lighting).
@@ -915,13 +976,13 @@ Note: `--gemma_root` is not needed for reference mode (text embeddings are loade
 - **Start small**: `--network_dim 8` or `16` with `--max_train_steps 200-500` is usually sufficient.
 - **Monitor loss**: Loss should decrease steadily. If it diverges, reduce `--learning_rate`.
 - **Preview samples**: Add `--sample_prompts sampling_prompts.txt --sample_every_n_steps 50` to generate previews at each slider strength during training. Requires `--gemma_root` for text encoding.
-- **Guidance strength**: For text-only mode, `1.0` is a safe default. Values of `2.0-3.0` produce stronger but potentially less stable sliders.
+- **Guidance strength**: For text-only mode, the default is `1.0`. Values of `2.0-3.0` increase direction strength but may reduce convergence stability.
 - **Multiple targets**: Text-only mode supports multiple `[[targets]]` blocks. Each step randomly selects one target, so all directions get trained evenly.
 - **Inference**: Use the trained LoRA with any multiplier value. Positive multipliers enhance the positive attribute, negative multipliers enhance the negative attribute. Values beyond `[-1, +1]` extrapolate the effect.
 
 ---
 
-## Useful Links
+## References
 
 - [Installation Guide](https://github.com/AkaneTendo25/musubi-tuner/discussions/19) — Setup instructions, dependencies, flash-attn, troubleshooting
 - [Optimizers Guide](https://github.com/AkaneTendo25/musubi-tuner/discussions/21) — Optimizer comparison, recommended settings, memory usage tips

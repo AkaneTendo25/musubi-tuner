@@ -2005,7 +2005,12 @@ class NetworkTrainer:
 
         # HunyuanVideo: bfloat16 or float16, Wan2.1: bfloat16
         dit_dtype = torch.bfloat16 if args.dit_dtype is None else model_utils.str_to_dtype(args.dit_dtype)
-        dit_weight_dtype = (None if args.fp8_scaled else torch.float8_e4m3fn) if args.fp8_base else dit_dtype
+        if getattr(args, "nf4_base", False):
+            dit_weight_dtype = None  # NF4: quantized at load time, no dtype override needed
+        elif args.fp8_base:
+            dit_weight_dtype = None if args.fp8_scaled else torch.float8_e4m3fn
+        else:
+            dit_weight_dtype = dit_dtype
         logger.info(f"DiT precision: {dit_dtype}, weight precision: {dit_weight_dtype}")
 
         # get embedding for sampling images
@@ -2099,6 +2104,16 @@ class NetworkTrainer:
                 key, value = net_arg.split("=", 1)
                 net_kwargs[key] = value
 
+        # Inject pre-computed LoftQ data if available (computed during model loading).
+        # Use a separate dict so loftq_data (tensors) doesn't end up in net_kwargs
+        # which gets JSON-serialized for metadata.
+        _loftq_net_kwargs = dict(net_kwargs)
+        from musubi_tuner.ltx2_train_network import load_ltx2_model
+        _loftq_data = getattr(load_ltx2_model, "_loftq_data", None)
+        if _loftq_data is not None:
+            _loftq_net_kwargs["loftq_data"] = _loftq_data
+            load_ltx2_model._loftq_data = None  # consume it
+
         if args.dim_from_weights:
             logger.info(f"Loading network from weights: {args.dim_from_weights}")
             weights_sd = load_file(args.dim_from_weights)
@@ -2114,7 +2129,7 @@ class NetworkTrainer:
                     None,
                     transformer,
                     neuron_dropout=args.network_dropout,
-                    **net_kwargs,
+                    **_loftq_net_kwargs,
                 )
             else:
                 # LyCORIS compatibility
@@ -2125,7 +2140,7 @@ class NetworkTrainer:
                     vae,
                     None,
                     transformer,
-                    **net_kwargs,
+                    **_loftq_net_kwargs,
                 )
         if network is None:
             return
@@ -2414,6 +2429,9 @@ class NetworkTrainer:
             "ss_optimizer": optimizer_name + (f"({optimizer_args})" if len(optimizer_args) > 0 else ""),
             "ss_max_grad_norm": args.max_grad_norm,
             "ss_fp8_base": bool(args.fp8_base),
+            "ss_nf4_base": bool(getattr(args, "nf4_base", False)),
+            "ss_loftq_init": bool(getattr(args, "loftq_init", False)),
+            "ss_awq_calibration": bool(getattr(args, "awq_calibration", False)),
             # "ss_fp8_llm": bool(args.fp8_llm), # remove this because this is only for HuanyuanVideo TODO set architecure dependent metadata
             "ss_full_fp16": bool(args.full_fp16),
             "ss_full_bf16": bool(args.full_bf16),
