@@ -35,7 +35,7 @@ Always match the CUDA version to your GPU architecture — check [PyTorch's comp
 | `video` | Images | Treated as 1-frame samples (`F=1`) |
 | `video` | Videos | Standard video training |
 | `av` | Videos with audio | Audio extracted from video or external audio files |
-| `audio` | Audio only | Dataset must be audio-only; video latents are dummy placeholders |
+| `audio` | Audio only | Dataset must be audio-only; training uses audio-driven latent geometry |
 
 ---
 
@@ -62,6 +62,10 @@ python ltx2_cache_latents.py ^
 - `--ltx2_audio_source video|audio_files`: Use audio from the video or from external files.
 - `--ltx2_audio_dir`, `--ltx2_audio_ext`: Optional when using `--ltx2_audio_source audio_files` (default extension: `.wav`).
 - `--ltx2_checkpoint`: Required for `--ltx2_mode av` or `--ltx2_mode audio`.
+- `--audio_only_target_resolution`: Optional square override for audio-only latent geometry. If omitted, resolution is inferred from the audio dataset config.
+- `--audio_only_target_fps`: Target FPS used to derive audio-only frame counts from audio duration (default: `25`).
+- `--audio_video_latent_channels`: Optional override for audio-only video latent channels (auto-detected from checkpoint by default).
+- `--audio_video_latent_dtype`: Optional override for audio-only video latent dtype (defaults to `--ltx2_audio_dtype`).
 - `--vae_dtype`: Data type for VAE latents (default comes from the cache script).
 - `--save_dataset_manifest`: Optional. Saves a cache-only dataset manifest for source-free training.
 
@@ -69,7 +73,7 @@ python ltx2_cache_latents.py ^
 
 | File Pattern | Contents |
 |--------------|----------|
-| `*_ltx2.safetensors` | Video latents: `latents_{F}x{H}x{W}_{dtype}` |
+| `*_ltx2.safetensors` | Video latents: `latents_{F}x{H}x{W}_{dtype}`. In audio-only mode, this file also stores `ltx2_virtual_num_frames_int32`, `ltx2_virtual_height_int32`, and `ltx2_virtual_width_int32` used for sigma/timestep sampling. |
 | `*_ltx2_audio.safetensors` | Audio latents: `audio_latents_{T}x{mel_bins}x{channels}_{dtype}`, `audio_lengths_int32` |
 
 ### Memory Optimization for Caching
@@ -448,6 +452,7 @@ The cache file is saved to `<cache_directory>/ltx2_preservation_cache.pt` by def
 - `--min_timestep` / `--max_timestep`: Optional timestep range constraints.
 
 **Note:** The `shifted_logit_normal` shift is linearly interpolated from 0.95 (at 1024 tokens) to 2.05 (at 4096 tokens) based on sequence length.
+In `--ltx2_mode audio`, `shifted_logit_normal` uses the sequence length derived during latent caching (from audio duration + target resolution/FPS).
 
 #### LoRA Targets
 Use `--lora_target_preset` to control which layers LoRA targets:

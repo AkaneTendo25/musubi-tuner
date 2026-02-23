@@ -486,6 +486,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
         self._num_timesteps: int = 1000
         self._audio_video: bool = False
         self._ltx_mode: str = "video"
+        self._logged_audio_only_timestep_shift: bool = False
         self.default_guidance_scale = 3.0
         self._audio_preview_config: Optional[Dict[str, int | float]] = None
 
@@ -931,6 +932,71 @@ class LTX2NetworkTrainer(NetworkTrainer):
         b = min_shift - m * float(min_tokens)
         return m * float(seq_length) + b
 
+    @staticmethod
+    def _shifted_logit_normal_shift_for_sequence_lengths(
+        seq_lengths: torch.Tensor,
+        *,
+        min_tokens: int = 1024,
+        max_tokens: int = 4096,
+        min_shift: float = 0.95,
+        max_shift: float = 2.05,
+    ) -> torch.Tensor:
+        m = (max_shift - min_shift) / float(max_tokens - min_tokens)
+        b = min_shift - m * float(min_tokens)
+        return seq_lengths.to(dtype=torch.float32) * float(m) + float(b)
+
+    def _resolve_audio_only_sequence_lengths(self, batch_size: int, device: torch.device) -> Optional[torch.Tensor]:
+        latents_info = self.get_current_batch_latents_info()
+        if not isinstance(latents_info, dict):
+            return None
+
+        def _as_batch_int_tensor(value: Any) -> Optional[torch.Tensor]:
+            if isinstance(value, torch.Tensor):
+                if value.numel() == 1:
+                    return value.view(1).to(device=device, dtype=torch.int64).expand(batch_size)
+                if value.numel() == batch_size:
+                    return value.to(device=device, dtype=torch.int64).view(batch_size)
+                return None
+            if isinstance(value, (int, float)):
+                return torch.full((batch_size,), int(value), device=device, dtype=torch.int64)
+            return None
+
+        num_frames = _as_batch_int_tensor(latents_info.get("num_frames"))
+        height = _as_batch_int_tensor(latents_info.get("height"))
+        width = _as_batch_int_tensor(latents_info.get("width"))
+        if num_frames is None or height is None or width is None:
+            return None
+        seq_lens = num_frames * height * width
+        return seq_lens
+
+    def _resolve_shifted_logit_normal_shift(
+        self,
+        args: argparse.Namespace,
+        seq_len: int,
+    ) -> float:
+        """Resolve shifted-logit-normal shift for the current mode.
+
+        Audio-only mode requires duration-aware video latents so seq_len
+        reflects target token geometry.
+        """
+        if self._ltx_mode == "audio" and int(seq_len) <= 1:
+            raise ValueError(
+                "Audio-only training requires sequence-aware video latent geometry (seq_len>1). "
+                "Re-cache latents with ltx2_cache_latents.py using --ltx2_mode audio "
+                "to generate duration-aware geometry."
+            )
+
+        shift = self._shifted_logit_normal_shift_for_sequence_length(seq_len)
+        shift = max(0.95, min(2.05, float(shift)))
+        if self._ltx_mode == "audio" and not self._logged_audio_only_timestep_shift:
+            logger.info(
+                "LTX-2 audio-only mode: using shifted_logit_normal shift %.4f from seq_len=%s.",
+                shift,
+                int(seq_len),
+            )
+            self._logged_audio_only_timestep_shift = True
+        return shift
+
     def get_noisy_model_input_and_timesteps(
         self,
         args: argparse.Namespace,
@@ -953,6 +1019,14 @@ class LTX2NetworkTrainer(NetworkTrainer):
         batch_size = latents.shape[0]
         frames, height, width = latents.shape[2], latents.shape[3], latents.shape[4]
         seq_len = int(frames * height * width)
+        audio_seq_lens = None
+        if self._ltx_mode == "audio":
+            audio_seq_lens = self._resolve_audio_only_sequence_lengths(batch_size, device)
+            if audio_seq_lens is not None and torch.any(audio_seq_lens <= 1):
+                raise ValueError(
+                    "Audio-only training requires sequence-aware video latent geometry (seq_len>1). "
+                    "Re-cache latents with ltx2_cache_latents.py using --ltx2_mode audio."
+                )
 
         # Get timestep sampling mode (default to shifted_logit_normal for LTX-2)
         timestep_sampling = getattr(args, "timestep_sampling", "shifted_logit_normal")
@@ -964,9 +1038,30 @@ class LTX2NetworkTrainer(NetworkTrainer):
         if timestep_sampling == "shifted_logit_normal":
             # Official LTX-2 implementation: shifted logit-normal distribution
             # Shift is computed based on sequence length
-            shift = self._shifted_logit_normal_shift_for_sequence_length(seq_len)
+            if self._ltx_mode == "audio":
+                if audio_seq_lens is not None:
+                    shifts = self._shifted_logit_normal_shift_for_sequence_lengths(audio_seq_lens)
+                    shifts = shifts.clamp(min=0.95, max=2.05)
+                    if not self._logged_audio_only_timestep_shift:
+                        logger.info(
+                            "LTX-2 audio-only mode: shifted_logit_normal seq_len min=%s max=%s mean=%.2f, "
+                            "shift min=%.4f max=%.4f mean=%.4f.",
+                            int(audio_seq_lens.min().item()),
+                            int(audio_seq_lens.max().item()),
+                            float(audio_seq_lens.to(dtype=torch.float32).mean().item()),
+                            float(shifts.min().item()),
+                            float(shifts.max().item()),
+                            float(shifts.mean().item()),
+                        )
+                        self._logged_audio_only_timestep_shift = True
+                else:
+                    shift = self._resolve_shifted_logit_normal_shift(args, seq_len)
+                    shifts = torch.full((batch_size,), float(shift), device=device, dtype=torch.float32)
+            else:
+                shift = self._shifted_logit_normal_shift_for_sequence_length(seq_len)
+                shifts = torch.full((batch_size,), float(shift), device=device, dtype=torch.float32)
             std = getattr(args, "logit_std", 1.0)
-            normal_samples = torch.randn((batch_size,), device=device, dtype=torch.float32) * std + float(shift)
+            normal_samples = torch.randn((batch_size,), device=device, dtype=torch.float32) * std + shifts
             sigmas = torch.sigmoid(normal_samples)
         elif timestep_sampling == "uniform":
             # Uniform sampling from [0, 1]
@@ -1857,7 +1952,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
             sigma_audio = audio_sigma.view(-1, 1, 1, 1)
             noisy_audio = (1.0 - sigma_audio) * audio_latents + sigma_audio * audio_noise
 
-            dummy_video = torch.zeros(
+            video_latents = torch.zeros(
                 (latents.shape[0], latents.shape[1], 1, 1, 1),
                 device=accelerator.device,
                 dtype=network_dtype,
@@ -1867,7 +1962,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 self._ensure_fp8_buffers_on_device(transformer)
             with accelerator.autocast():
                 model_pred = transformer(
-                    [dummy_video, noisy_audio],
+                    [video_latents, noisy_audio],
                     timestep=model_timesteps,
                     audio_timestep=audio_model_timesteps,
                     context=text_embeds,

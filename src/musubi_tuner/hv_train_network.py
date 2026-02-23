@@ -503,6 +503,7 @@ class NetworkTrainer:
         self.num_timestep_buckets: Optional[int] = None  # for get_bucketed_timestep()
         self.vae_frame_stride = 4  # all architectures require frames to be divisible by 4, except Qwen-Image-Layered
         self.default_discrete_flow_shift = 14.5  # default value for discrete flow shift for all models TODO may be None is better
+        self._current_batch_latents_info: Optional[dict[str, Any]] = None
 
     # TODO 他のスクリプトと共通化する
     def generate_step_logs(
@@ -952,6 +953,12 @@ class NetworkTrainer:
         # print(f"timestep_range_pool: {self.timestep_range_pool}")
         a, b = self.timestep_range_pool.pop()
         return random.uniform(a, b)
+
+    def set_current_batch_latents_info(self, latents_info: Optional[dict[str, Any]]) -> None:
+        self._current_batch_latents_info = latents_info
+
+    def get_current_batch_latents_info(self) -> Optional[dict[str, Any]]:
+        return self._current_batch_latents_info
 
     def get_noisy_model_input_and_timesteps(
         self,
@@ -2571,8 +2578,10 @@ class NetworkTrainer:
                     if isinstance(latents, dict):
                         if "latents" not in latents:
                             raise ValueError("batch['latents'] is a dict but missing key 'latents'")
+                        self.set_current_batch_latents_info(latents)
                         latents_tensor = latents["latents"]
                     else:
+                        self.set_current_batch_latents_info(None)
                         latents_tensor = latents
 
                     latents_tensor = self.scale_shift_latents(latents_tensor)
@@ -2799,8 +2808,10 @@ class NetworkTrainer:
                 if isinstance(latents, dict):
                     if "latents" not in latents:
                         raise ValueError("batch['latents'] is a dict but missing key 'latents'")
+                    self.set_current_batch_latents_info(latents)
                     latents_tensor = latents["latents"]
                 else:
+                    self.set_current_batch_latents_info(None)
                     latents_tensor = latents
                 latents_shape = tuple(latents_tensor.shape)
 
