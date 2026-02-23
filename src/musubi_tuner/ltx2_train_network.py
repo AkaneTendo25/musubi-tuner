@@ -42,6 +42,7 @@ from musubi_tuner.utils import model_utils
 from musubi_tuner.ltx_2.model.transformer.fp8_device_utils import ensure_fp8_modules_on_device
 from musubi_tuner.utils.safetensors_utils import MemoryEfficientSafeOpen        
 from musubi_tuner.modules.fp8_optimization_utils import apply_fp8_monkey_patch
+from musubi_tuner.modules.w8a8_optimization_utils import apply_w8a8_monkey_patch
 from musubi_tuner.modules.nf4_optimization_utils import (
     apply_nf4_monkey_patch,
     is_nf4_module,
@@ -297,6 +298,8 @@ def load_ltx2_model(
     ffn_chunk_target: Optional[str] = None,
     ffn_chunk_size: int = 0,
     fp8_scaled: bool = False,
+    fp8_w8a8: bool = False,
+    w8a8_mode: str = "int8",
     fp8_upcast: bool = False,
     fp8_upcast_stochastic: bool = False,
     fp8_upcast_seed: int = 0,
@@ -574,6 +577,9 @@ def load_ltx2_model(
     _trace_vram_ltx2("AFTER load_state_dict (model still on meta/cpu)")
     if torch_dtype is not None:
         _cast_non_fp8_params(base_model, torch_dtype)
+    if fp8_w8a8:
+        apply_w8a8_monkey_patch(base_model, w8a8_mode=w8a8_mode)
+        _trace_vram_ltx2("AFTER W8A8 monkey patch")
     _trace_vram_ltx2(f"AFTER _cast_non_fp8_params, BEFORE base_model.to({load_device})")
     base_model = base_model.to(load_device)
     _trace_vram_ltx2(f"AFTER base_model.to({load_device})")
@@ -1239,6 +1245,14 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 "DiT weights is already in fp8 format, cannot scale to fp8. Please use fp16/bf16 weights / DiTの重みはすでにfp8形式です。fp8にスケーリングできません。fp16/bf16の重みを使用してください"
             )
 
+        if getattr(args, "fp8_w8a8", False):
+            if not getattr(args, "fp8_scaled", False):
+                raise ValueError("--fp8_w8a8 requires --fp8_scaled")
+            if not getattr(args, "network_module", None):
+                raise ValueError("--fp8_w8a8 requires LoRA training (--network_module)")
+            if getattr(args, "fp8_upcast", False):
+                raise ValueError("--fp8_w8a8 and --fp8_upcast are mutually exclusive")
+
         if self.dit_dtype == torch.float16:
             assert args.mixed_precision in ["fp16", "no"], "LTX-2 weights are fp16; mixed precision must be fp16 or no"
         elif self.dit_dtype == torch.bfloat16:
@@ -1450,6 +1464,8 @@ class LTX2NetworkTrainer(NetworkTrainer):
             ffn_chunk_target=getattr(args, "ffn_chunk_target", None),
             ffn_chunk_size=int(getattr(args, "ffn_chunk_size", 0) or 0),
             fp8_scaled=bool(getattr(args, "fp8_scaled", False)),
+            fp8_w8a8=bool(getattr(args, "fp8_w8a8", False)),
+            w8a8_mode=str(getattr(args, "w8a8_mode", "int8")),
             fp8_upcast=bool(getattr(args, "fp8_upcast", False)),
             fp8_upcast_stochastic=bool(getattr(args, "fp8_upcast_stochastic", False)),
             fp8_upcast_seed=int(getattr(args, "fp8_upcast_seed", 0)),
@@ -4947,6 +4963,19 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         "--fp8_scaled",
         action="store_true",
         help="use scaled fp8 for DiT / DiTにスケーリングされたfp8を使う",
+    )
+    parser.add_argument(
+        "--fp8_w8a8",
+        action="store_true",
+        help="Enable W8A8 activation quantization (saves VRAM by not storing dequantized weights "
+        "in autograd graph). Requires --fp8_scaled and LoRA training.",
+    )
+    parser.add_argument(
+        "--w8a8_mode",
+        type=str,
+        default="int8",
+        choices=["int8", "fp8"],
+        help="W8A8 quantization format: int8 (Turing+, default) or fp8 (Ada Lovelace+).",
     )
     parser.add_argument(
         "--nf4_base",
