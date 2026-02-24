@@ -1746,20 +1746,59 @@ def main() -> None:
             return True
         return False
 
+    def run_sampling_safely(sample_epoch, sample_step: int) -> None:
+        """Run sampling preview without allowing failures to interrupt training."""
+        optimizer_eval_fn()
+        cpu_rng_state = torch.get_rng_state()
+        cuda_rng_state = None
+        try:
+            if torch.cuda.is_available():
+                cuda_rng_state = torch.cuda.get_rng_state()
+        except Exception:
+            cuda_rng_state = None
+
+        try:
+            trainer.sample_images(
+                accelerator,
+                args,
+                sample_epoch,
+                sample_step,
+                vae,
+                transformer,
+                sample_parameters,
+                trainer.dit_dtype,
+            )
+        except Exception:
+            logger.exception("Sampling failed at step=%s epoch=%s; continuing training.", sample_step, sample_epoch)
+            try:
+                unwrapped_transformer = accelerator.unwrap_model(transformer)
+                if hasattr(unwrapped_transformer, "switch_block_swap_for_training"):
+                    unwrapped_transformer.switch_block_swap_for_training()
+                if hasattr(unwrapped_transformer, "move_to_device_except_swap_blocks"):
+                    unwrapped_transformer.move_to_device_except_swap_blocks(accelerator.device)
+                else:
+                    unwrapped_transformer.to(accelerator.device)
+            except Exception:
+                logger.exception("Failed to restore transformer state after sampling failure.")
+            try:
+                clean_memory_on_device(accelerator.device)
+            except Exception:
+                pass
+        finally:
+            try:
+                torch.set_rng_state(cpu_rng_state)
+            except Exception:
+                pass
+            if cuda_rng_state is not None:
+                try:
+                    torch.cuda.set_rng_state(cuda_rng_state)
+                except Exception:
+                    pass
+            optimizer_train_fn()
+
     # For --sample_at_first
     if should_sample_images(args, global_step, epoch=0):
-        optimizer_eval_fn()
-        trainer.sample_images(
-            accelerator,
-            args,
-            0,
-            global_step,
-            vae,
-            transformer,
-            sample_parameters,
-            trainer.dit_dtype,
-        )
-        optimizer_train_fn()
+        run_sampling_safely(0, global_step)
 
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
     num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
@@ -2158,18 +2197,7 @@ def main() -> None:
                     clean_memory_on_device(accelerator.device)
 
                 if should_sample_images(args, global_step, epoch=None):
-                    optimizer_eval_fn()
-                    trainer.sample_images(
-                        accelerator,
-                        args,
-                        None,
-                        global_step,
-                        vae,
-                        transformer,
-                        sample_parameters,
-                        trainer.dit_dtype,
-                    )
-                    optimizer_train_fn()
+                    run_sampling_safely(None, global_step)
 
                 if global_step >= args.max_train_steps:
                     break
@@ -2205,18 +2233,7 @@ def main() -> None:
             clean_memory_on_device(accelerator.device)
 
         if should_sample_images(args, global_step, epoch=epoch + 1):
-            optimizer_eval_fn()
-            trainer.sample_images(
-                accelerator,
-                args,
-                epoch + 1,
-                global_step,
-                vae,
-                transformer,
-                sample_parameters,
-                trainer.dit_dtype,
-            )
-            optimizer_train_fn()
+            run_sampling_safely(epoch + 1, global_step)
 
         if global_step >= args.max_train_steps:
             break
