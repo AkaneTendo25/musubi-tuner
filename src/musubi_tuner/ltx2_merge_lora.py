@@ -46,6 +46,36 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Always emit <module>.alpha keys. For lora_down/up format this is always enabled.",
     )
+    parser.add_argument(
+        "--merge_method",
+        type=str,
+        choices=["concat", "orthogonal"],
+        default="concat",
+        help=(
+            "LoRA merge method. "
+            "'concat' keeps all ranks by concatenation (default). "
+            "'orthogonal' performs a two-LoRA orthogonalized merge with SVD refactorization."
+        ),
+    )
+    parser.add_argument(
+        "--orthogonal_k_fraction",
+        type=float,
+        default=0.5,
+        help=(
+            "Orthogonal merge only: fraction of top singular directions projected out "
+            "bilaterally before combining modules. Range [0, 1]."
+        ),
+    )
+    parser.add_argument(
+        "--orthogonal_rank_mode",
+        type=str,
+        choices=["sum", "max", "min"],
+        default="sum",
+        help=(
+            "Orthogonal merge only: target rank before clipping by matrix dimensions. "
+            "'sum'=rank1+rank2, 'max'=max(rank1,rank2), 'min'=min(rank1,rank2)."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -122,14 +152,131 @@ def _read_alpha(reader, prefix: str, rank: int) -> float:
     return float(alpha_val.detach().float().item())
 
 
+def _flatten_b_rank_dim_last(b: torch.Tensor) -> Tuple[torch.Tensor, Tuple[int, ...]]:
+    # Move LoRA rank dim (dim=1) to the end so arbitrary conv/linear shapes can be flattened to [M, rank].
+    b_rank_last = b.movedim(1, -1).contiguous()
+    prefix_shape = tuple(int(x) for x in b_rank_last.shape[:-1])
+    b_flat = b_rank_last.reshape(-1, int(b.shape[1]))
+    return b_flat, prefix_shape
+
+
+def _unflatten_b_rank_dim_last(b_flat: torch.Tensor, prefix_shape: Tuple[int, ...], rank: int) -> torch.Tensor:
+    b_rank_last = b_flat.reshape(*prefix_shape, rank).contiguous()
+    return b_rank_last.movedim(-1, 1).contiguous()
+
+
+def _project_out_top_components(source: torch.Tensor, reference: torch.Tensor, k_fraction: float) -> torch.Tensor:
+    if k_fraction <= 0.0:
+        return source
+    if source.shape[1] != reference.shape[1]:
+        raise ValueError(
+            f"Projection dimension mismatch: source={tuple(source.shape)} reference={tuple(reference.shape)}"
+        )
+
+    _u, singular_values, vh = torch.linalg.svd(reference, full_matrices=False)
+    if singular_values.numel() == 0:
+        return source
+
+    k = int(round(float(singular_values.numel()) * float(k_fraction)))
+    if k <= 0:
+        return source
+    k = min(k, singular_values.numel())
+
+    basis = vh[:k, :].transpose(0, 1).contiguous()  # [N, k]
+    return source - (source @ basis @ basis.transpose(0, 1))
+
+
+def _resolve_target_rank(rank1: int, rank2: int, mode: str, max_rank: int) -> int:
+    if mode == "sum":
+        target = rank1 + rank2
+    elif mode == "max":
+        target = max(rank1, rank2)
+    elif mode == "min":
+        target = min(rank1, rank2)
+    else:
+        raise ValueError(f"Unsupported orthogonal rank mode: {mode}")
+    return max(1, min(int(target), int(max_rank)))
+
+
+def _merge_orthogonal_factors(
+    a1: torch.Tensor,
+    b1: torch.Tensor,
+    a2: torch.Tensor,
+    b2: torch.Tensor,
+    *,
+    k_fraction: float,
+    rank_mode: str,
+    output_dtype: torch.dtype,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    rank1 = int(a1.shape[0])
+    rank2 = int(a2.shape[0])
+
+    if rank1 != int(b1.shape[1]) or rank2 != int(b2.shape[1]):
+        raise ValueError(
+            f"Rank mismatch in orthogonal merge: "
+            f"(A1={rank1}, B1={int(b1.shape[1])}) (A2={rank2}, B2={int(b2.shape[1])})"
+        )
+
+    a1_flat = a1.reshape(rank1, -1).to(dtype=torch.float32)
+    a2_flat = a2.reshape(rank2, -1).to(dtype=torch.float32)
+
+    b1_flat, b1_prefix = _flatten_b_rank_dim_last(b1.to(dtype=torch.float32))
+    b2_flat, b2_prefix = _flatten_b_rank_dim_last(b2.to(dtype=torch.float32))
+
+    if a1_flat.shape[1] != a2_flat.shape[1]:
+        raise ValueError(
+            f"Orthogonal merge requires matching A flattened dimensions. Got {a1_flat.shape[1]} vs {a2_flat.shape[1]}"
+        )
+    if b1_flat.shape[0] != b2_flat.shape[0] or b1_prefix != b2_prefix:
+        raise ValueError(
+            "Orthogonal merge requires matching B flattened output dimensions. "
+            f"Got b1_flat={tuple(b1_flat.shape)} b2_flat={tuple(b2_flat.shape)}"
+        )
+
+    w1 = b1_flat @ a1_flat
+    w2 = b2_flat @ a2_flat
+
+    w1_ortho = _project_out_top_components(w1, w2, k_fraction)
+    w2_ortho = _project_out_top_components(w2, w1, k_fraction)
+    merged_w = w1_ortho + w2_ortho
+
+    u, s, vh = torch.linalg.svd(merged_w, full_matrices=False)
+    if s.numel() == 0:
+        raise ValueError("Orthogonal merge produced an empty SVD spectrum.")
+
+    target_rank = _resolve_target_rank(rank1, rank2, rank_mode, int(s.numel()))
+    s_root = torch.sqrt(s[:target_rank].clamp_min(0.0))
+
+    b_new_flat = (u[:, :target_rank] * s_root.unsqueeze(0)).contiguous()
+    a_new_flat = (s_root.unsqueeze(1) * vh[:target_rank, :]).contiguous()
+
+    a_new = a_new_flat.reshape((target_rank,) + tuple(int(x) for x in a1.shape[1:])).to(dtype=output_dtype).contiguous()
+    b_new = _unflatten_b_rank_dim_last(b_new_flat, b1_prefix, target_rank).to(dtype=output_dtype).contiguous()
+    return a_new, b_new
+
+
 def main() -> None:
     args = _parse_args()
     input_paths = [str(Path(p)) for p in args.lora_weight]
     multipliers = _resolve_multipliers(input_paths, args.lora_multiplier)
+    merge_method = str(args.merge_method)
+    orthogonal_k_fraction = float(args.orthogonal_k_fraction)
+    orthogonal_rank_mode = str(args.orthogonal_rank_mode)
 
-    logger.info("Merging %d LoRA file(s).", len(input_paths))
+    if not (0.0 <= orthogonal_k_fraction <= 1.0):
+        raise ValueError(f"--orthogonal_k_fraction must be in [0, 1]. Got: {orthogonal_k_fraction}")
+    if merge_method == "orthogonal" and len(input_paths) != 2:
+        raise ValueError("--merge_method orthogonal currently supports exactly 2 input LoRAs.")
+
+    logger.info("Merging %d LoRA file(s) with method=%s.", len(input_paths), merge_method)
     for path, mult in zip(input_paths, multipliers):
         logger.info("  %s (multiplier=%s)", path, mult)
+    if merge_method == "orthogonal":
+        logger.info(
+            "Orthogonal settings: k_fraction=%s, rank_mode=%s",
+            orthogonal_k_fraction,
+            orthogonal_rank_mode,
+        )
 
     with ExitStack() as stack:
         readers = [stack.enter_context(safe_open(path, framework="pt", device="cpu")) for path in input_paths]
@@ -166,8 +313,7 @@ def main() -> None:
         merged_sd: Dict[str, torch.Tensor] = {}
 
         for idx, module in enumerate(all_modules, start=1):
-            a_parts = []
-            b_parts = []
+            module_parts: List[Tuple[int, torch.Tensor, torch.Tensor]] = []
             expected_a_tail = None
             expected_b_head_tail = None
 
@@ -196,21 +342,56 @@ def main() -> None:
                 scale = float(multipliers[reader_idx]) * (alpha / float(rank_a))
                 b = b.mul(scale)
 
-                a_parts.append(a)
-                b_parts.append(b)
+                module_parts.append((reader_idx, a, b))
 
-            if not a_parts:
+            if not module_parts:
                 continue
 
-            merged_a = torch.cat(a_parts, dim=0).to(dtype=output_dtype).contiguous()
-            merged_b = torch.cat(b_parts, dim=1).to(dtype=output_dtype).contiguous()
+            used_orthogonal = False
+            merged_a = None
+            merged_b = None
+
+            if merge_method == "orthogonal" and len(module_parts) == 2:
+                (_, a1, b1), (_, a2, b2) = module_parts
+                try:
+                    merged_a, merged_b = _merge_orthogonal_factors(
+                        a1,
+                        b1,
+                        a2,
+                        b2,
+                        k_fraction=orthogonal_k_fraction,
+                        rank_mode=orthogonal_rank_mode,
+                        output_dtype=output_dtype,
+                    )
+                    used_orthogonal = True
+                except Exception as e:
+                    logger.warning(
+                        "Orthogonal merge fallback to concat for module '%s': %s",
+                        module,
+                        str(e),
+                    )
+
+            if merged_a is None or merged_b is None:
+                a_parts = [a for _, a, _ in module_parts]
+                b_parts = [b for _, _, b in module_parts]
+                merged_a = torch.cat(a_parts, dim=0).to(dtype=output_dtype).contiguous()
+                merged_b = torch.cat(b_parts, dim=1).to(dtype=output_dtype).contiguous()
+
             merged_sd[module + a_suffix] = merged_a
             merged_sd[module + b_suffix] = merged_b
             if emit_alpha:
                 merged_sd[f"{module}.alpha"] = torch.tensor(float(merged_a.shape[0]), dtype=torch.float32)
 
             if idx % 100 == 0 or idx == len(all_modules):
-                logger.info("Merged modules: %d / %d", idx, len(all_modules))
+                if merge_method == "orthogonal":
+                    logger.info(
+                        "Merged modules: %d / %d (last_method=%s)",
+                        idx,
+                        len(all_modules),
+                        "orthogonal" if used_orthogonal else "concat",
+                    )
+                else:
+                    logger.info("Merged modules: %d / %d", idx, len(all_modules))
 
     output_path = Path(args.save_merged_lora)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -218,9 +399,13 @@ def main() -> None:
     metadata = {
         "merged_with": "musubi_tuner.ltx2_merge_lora",
         "merge_format": fmt,
+        "merge_method": merge_method,
         "merge_sources": json.dumps(input_paths),
         "merge_multipliers": json.dumps(multipliers),
     }
+    if merge_method == "orthogonal":
+        metadata["orthogonal_k_fraction"] = str(orthogonal_k_fraction)
+        metadata["orthogonal_rank_mode"] = orthogonal_rank_mode
     mem_eff_save_file(merged_sd, str(output_path), metadata=metadata)
     logger.info("Saved merged LoRA: %s", output_path)
 
