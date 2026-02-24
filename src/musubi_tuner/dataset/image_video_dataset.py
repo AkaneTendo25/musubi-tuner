@@ -282,12 +282,15 @@ def save_latent_cache_wan(
     save_latent_cache_common(item_info, sd, ARCHITECTURE_WAN_FULL)
 
 
-def save_latent_cache_ltx2(item_info: ItemInfo, latent: torch.Tensor):
+def save_latent_cache_ltx2(item_info: ItemInfo, latent: torch.Tensor, extra_tensors: Optional[dict[str, torch.Tensor]] = None):
     assert latent.dim() == 4, "latent should be 4D tensor (channel, frame, height, width)"
 
     _, F, H, W = latent.shape
     dtype_str = dtype_to_str(latent.dtype)
     sd = {f"latents_{F}x{H}x{W}_{dtype_str}": latent.detach().cpu().contiguous()}
+    if extra_tensors:
+        for key, value in extra_tensors.items():
+            sd[key] = value.detach().cpu().contiguous()
 
     save_latent_cache_common(item_info, sd, ARCHITECTURE_LTX2_FULL)
 
@@ -1188,12 +1191,32 @@ class BucketBatchManager:
             latents = batch_tensor_data.get("latents")
             if isinstance(latents, torch.Tensor) and latents.dim() == 5:
                 bsz, _c, frames, height, width = latents.shape
-                seq_len = frames * height * width
+                virtual_num_frames = batch_tensor_data.pop("ltx2_virtual_num_frames", None)
+                virtual_height = batch_tensor_data.pop("ltx2_virtual_height", None)
+                virtual_width = batch_tensor_data.pop("ltx2_virtual_width", None)
+
+                num_frames_tensor = torch.full((bsz,), frames, dtype=torch.int32)
+                height_tensor = torch.full((bsz,), height, dtype=torch.int32)
+                width_tensor = torch.full((bsz,), width, dtype=torch.int32)
+                if (
+                    isinstance(virtual_num_frames, torch.Tensor)
+                    and isinstance(virtual_height, torch.Tensor)
+                    and isinstance(virtual_width, torch.Tensor)
+                ):
+                    if (
+                        virtual_num_frames.numel() == bsz
+                        and virtual_height.numel() == bsz
+                        and virtual_width.numel() == bsz
+                    ):
+                        num_frames_tensor = virtual_num_frames.to(dtype=torch.int32).view(-1)
+                        height_tensor = virtual_height.to(dtype=torch.int32).view(-1)
+                        width_tensor = virtual_width.to(dtype=torch.int32).view(-1)
+
                 batch_tensor_data["latents"] = {
                     "latents": latents,
-                    "num_frames": torch.full((bsz,), frames, dtype=torch.int32),
-                    "height": torch.full((bsz,), height, dtype=torch.int32),
-                    "width": torch.full((bsz,), width, dtype=torch.int32),
+                    "num_frames": num_frames_tensor,
+                    "height": height_tensor,
+                    "width": width_tensor,
                     "fps": torch.full((bsz,), self.target_fps, dtype=torch.float32),
                 }
 
@@ -2652,12 +2675,15 @@ class AudioDataset(BaseDataset):
         metadata["cache_only"] = self.cache_only
         return metadata
 
-    def _dummy_video_cache_path(self, item_key: str) -> str:
+    def _uses_ltx2_audio_video_geometry(self) -> bool:
+        return self.architecture in {ARCHITECTURE_LTX2, ARCHITECTURE_LTX2_FULL}
+
+    def _legacy_audio_latent_cache_path(self, item_key: str) -> str:
         basename = os.path.splitext(os.path.basename(item_key))[0]
         assert self.cache_directory is not None, "cache_directory is required / cache_directoryは必須です"
         return os.path.join(self.cache_directory, f"{basename}_0001x0001_{self.architecture}.safetensors")
 
-    def _strip_dummy_resolution(self, item_key: str) -> str:
+    def _legacy_strip_resolution_suffix(self, item_key: str) -> str:
         suffix = "_0001x0001"
         return item_key[: -len(suffix)] if item_key.endswith(suffix) else item_key
 
@@ -2679,9 +2705,15 @@ class AudioDataset(BaseDataset):
 
                 for future in completed_futures:
                     audio_path, caption = future.result()
-                    bucket_reso = self._append_audio_bucket_key((1, 1), True)
-                    item_info = ItemInfo(audio_path, caption, (1, 1), bucket_reso)
-                    item_info.latent_cache_path = self._dummy_video_cache_path(audio_path)
+                    if self._uses_ltx2_audio_video_geometry():
+                        width, height = int(self.resolution[0]), int(self.resolution[1])
+                        bucket_reso = self._append_audio_bucket_key((width, height), True)
+                        item_info = ItemInfo(audio_path, caption, (width, height), bucket_reso)
+                        item_info.latent_cache_path = self.get_latent_cache_path(item_info)
+                    else:
+                        bucket_reso = self._append_audio_bucket_key((1, 1), True)
+                        item_info = ItemInfo(audio_path, caption, (1, 1), bucket_reso)
+                        item_info.latent_cache_path = self._legacy_audio_latent_cache_path(audio_path)
                     item_info.audio_latent_cache_path = self.get_audio_latent_cache_path(item_info)
                     item_info.text_encoder_output_cache_path = self.get_text_encoder_output_cache_path(item_info)
                     item_info.audio_path = audio_path
@@ -2707,14 +2739,20 @@ class AudioDataset(BaseDataset):
                 batch = submit_batch()
                 if batch is None:
                     break
-                yield (1, 1), batch
+                if self._uses_ltx2_audio_video_geometry():
+                    yield (int(self.resolution[0]), int(self.resolution[1])), batch
+                else:
+                    yield (1, 1), batch
 
         aggregate_future(consume_all=True)
         while True:
             batch = submit_batch(flush=True)
             if batch is None:
                 break
-            yield (1, 1), batch
+            if self._uses_ltx2_audio_video_geometry():
+                yield (int(self.resolution[0]), int(self.resolution[1])), batch
+            else:
+                yield (1, 1), batch
         executor.shutdown()
 
     def retrieve_text_encoder_output_cache_batches(self, num_workers: int):
@@ -2732,20 +2770,52 @@ class AudioDataset(BaseDataset):
             suffix = f"_{self.architecture}_audio.safetensors"
             if not base.endswith(suffix):
                 continue
-            item_key = self._strip_dummy_resolution(base[: -len(suffix)])
-            dummy_cache_file = os.path.join(self.cache_directory, f"{item_key}_0001x0001_{self.architecture}.safetensors")
-            if not os.path.exists(dummy_cache_file):
-                logger.warning(f"Dummy video cache file not found: {dummy_cache_file}")
-                continue
-            text_encoder_output_cache_file = os.path.join(self.cache_directory, f"{item_key}_{self.architecture}_te.safetensors")
-            if not os.path.exists(text_encoder_output_cache_file):
-                logger.warning(f"Text encoder output cache file not found: {text_encoder_output_cache_file}")
-                continue
+            if self._uses_ltx2_audio_video_geometry():
+                latent_cache_file = os.path.join(
+                    self.cache_directory,
+                    base[: -len(suffix)] + f"_{self.architecture}.safetensors",
+                )
+                if not os.path.exists(latent_cache_file):
+                    logger.warning(f"Video latent cache file not found: {latent_cache_file}")
+                    continue
 
-            bucket_reso = self._append_audio_bucket_key((1, 1), True)
-            item_info = ItemInfo(item_key, "", (1, 1), bucket_reso, latent_cache_path=dummy_cache_file)
-            item_info.text_encoder_output_cache_path = text_encoder_output_cache_file
-            item_info.audio_latent_cache_path = audio_cache_file
+                latent_stem = os.path.basename(latent_cache_file)[: -len(f"_{self.architecture}.safetensors")]
+                original_size = (int(self.resolution[0]), int(self.resolution[1]))
+                item_key = latent_stem
+                if "_" in latent_stem:
+                    key_stem, resolution_token = latent_stem.rsplit("_", 1)
+                    if "x" in resolution_token:
+                        w_s, h_s = resolution_token.split("x", 1)
+                        try:
+                            original_size = (int(w_s), int(h_s))
+                            item_key = key_stem
+                        except ValueError:
+                            item_key = latent_stem
+
+                text_encoder_output_cache_file = os.path.join(self.cache_directory, f"{item_key}_{self.architecture}_te.safetensors")
+                if not os.path.exists(text_encoder_output_cache_file):
+                    logger.warning(f"Text encoder output cache file not found: {text_encoder_output_cache_file}")
+                    continue
+
+                bucket_reso = self._append_audio_bucket_key((original_size[0], original_size[1]), True)
+                item_info = ItemInfo(item_key, "", original_size, bucket_reso, latent_cache_path=latent_cache_file)
+                item_info.text_encoder_output_cache_path = text_encoder_output_cache_file
+                item_info.audio_latent_cache_path = audio_cache_file
+            else:
+                item_key = self._legacy_strip_resolution_suffix(base[: -len(suffix)])
+                latent_cache_file = os.path.join(self.cache_directory, f"{item_key}_0001x0001_{self.architecture}.safetensors")
+                if not os.path.exists(latent_cache_file):
+                    logger.warning(f"Video latent cache file not found: {latent_cache_file}")
+                    continue
+                text_encoder_output_cache_file = os.path.join(self.cache_directory, f"{item_key}_{self.architecture}_te.safetensors")
+                if not os.path.exists(text_encoder_output_cache_file):
+                    logger.warning(f"Text encoder output cache file not found: {text_encoder_output_cache_file}")
+                    continue
+
+                bucket_reso = self._append_audio_bucket_key((1, 1), True)
+                item_info = ItemInfo(item_key, "", (1, 1), bucket_reso, latent_cache_path=latent_cache_file)
+                item_info.text_encoder_output_cache_path = text_encoder_output_cache_file
+                item_info.audio_latent_cache_path = audio_cache_file
 
             bucket = bucketed_item_info.get(bucket_reso, [])
             for _ in range(self.num_repeats):

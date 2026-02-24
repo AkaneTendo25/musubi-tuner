@@ -41,6 +41,12 @@ from musubi_tuner.utils.safetensors_utils import MemoryEfficientSafeOpen
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
+LTX2_VIDEO_TEMPORAL_DOWNSAMPLE_FACTOR = 8
+LTX2_VIDEO_SPATIAL_DOWNSAMPLE_FACTOR = 32
+LTX2_AUDIO_ONLY_PROXY_LATENT_FRAMES = 1
+LTX2_AUDIO_ONLY_PROXY_LATENT_HEIGHT = 1
+LTX2_AUDIO_ONLY_PROXY_LATENT_WIDTH = 1
+
 
 def _amp_context(device: torch.device, dtype: torch.dtype):
     if device.type in {"cuda", "xpu"}:
@@ -115,9 +121,109 @@ def encode_and_save_batch(vae, batch: List[ItemInfo], tiling_config=None) -> Non
         save_latent_cache_ltx2(item, latents[idx])
 
 
-def save_dummy_latent_cache_ltx2(item: ItemInfo, *, channels: int, dtype: torch.dtype) -> None:
-    latent = torch.zeros((channels, 1, 1, 1), dtype=dtype)
-    save_latent_cache_ltx2(item, latent)
+def _adjust_ltx2_frame_count(frame_count: int) -> int:
+    frame_count = max(int(frame_count), 1)
+    if frame_count % 8 == 1:
+        return frame_count
+    return max(((frame_count - 1) // 8) * 8 + 1, 1)
+
+
+def _estimate_audio_duration_seconds(audio_path: str) -> Optional[float]:
+    normalized_audio_path = os.path.normpath(audio_path)
+    if not os.path.exists(normalized_audio_path):
+        return None
+
+    try:
+        import torchaudio
+
+        info = torchaudio.info(normalized_audio_path)
+        num_frames = int(getattr(info, "num_frames", 0))
+        sample_rate = int(getattr(info, "sample_rate", 0))
+        if num_frames > 0 and sample_rate > 0:
+            return float(num_frames) / float(sample_rate)
+    except Exception:
+        pass
+
+    try:
+        import av  # type: ignore
+    except Exception:
+        return None
+
+    try:
+        container = av.open(normalized_audio_path)
+    except Exception:
+        return None
+
+    try:
+        audio_stream = None
+        for stream in container.streams:
+            if stream.type == "audio":
+                audio_stream = stream
+                break
+        if audio_stream is None:
+            return None
+
+        duration = getattr(audio_stream, "duration", None)
+        time_base = getattr(audio_stream, "time_base", None)
+        if duration is not None and time_base is not None:
+            duration_s = float(duration * time_base)
+            if duration_s > 0:
+                return duration_s
+
+        if getattr(container, "duration", None):
+            # PyAV container duration is in microseconds.
+            duration_s = float(container.duration) / 1_000_000.0
+            if duration_s > 0:
+                return duration_s
+    except Exception:
+        return None
+    finally:
+        try:
+            container.close()
+        except Exception:
+            pass
+
+    return None
+
+
+def _estimate_video_frame_count_from_audio(audio_path: str, *, target_fps: float) -> Optional[int]:
+    duration_s = _estimate_audio_duration_seconds(audio_path)
+    if duration_s is None:
+        return None
+    frame_count = max(int(round(duration_s * max(float(target_fps), 1.0))), 1)
+    return _adjust_ltx2_frame_count(frame_count)
+
+
+def build_audio_only_video_latent(
+    *,
+    channels: int,
+    dtype: torch.dtype,
+    target_width: int,
+    target_height: int,
+    target_fps: float,
+    audio_path: str,
+    temporal_downsample_factor: int = LTX2_VIDEO_TEMPORAL_DOWNSAMPLE_FACTOR,
+    spatial_downsample_factor: int = LTX2_VIDEO_SPATIAL_DOWNSAMPLE_FACTOR,
+) -> tuple[torch.Tensor, int, tuple[int, int, int]]:
+    frame_count = _estimate_video_frame_count_from_audio(audio_path, target_fps=target_fps)
+    if frame_count is None:
+        raise ValueError(
+            f"Could not determine audio duration for {audio_path}. "
+            "Audio-only mode requires duration-aware video latent geometry."
+        )
+    virtual_latent_frames = max((frame_count - 1) // int(temporal_downsample_factor) + 1, 1)
+    virtual_latent_h = max(int(target_height) // int(spatial_downsample_factor), 1)
+    virtual_latent_w = max(int(target_width) // int(spatial_downsample_factor), 1)
+    latent = torch.zeros(
+        (
+            int(channels),
+            int(LTX2_AUDIO_ONLY_PROXY_LATENT_FRAMES),
+            int(LTX2_AUDIO_ONLY_PROXY_LATENT_HEIGHT),
+            int(LTX2_AUDIO_ONLY_PROXY_LATENT_WIDTH),
+        ),
+        dtype=dtype,
+    )
+    return latent, frame_count, (virtual_latent_frames, virtual_latent_h, virtual_latent_w)
 
 
 def infer_video_in_channels_from_checkpoint(model_path: str) -> Optional[int]:
@@ -838,16 +944,20 @@ def main() -> None:
             raise ValueError("--ltx2_checkpoint is required when --ltx2_mode audio is used")
 
         audio_dtype = torch.float16 if args.ltx2_audio_dtype is None else str_to_dtype(args.ltx2_audio_dtype)
-        dummy_dtype = audio_dtype if args.audio_dummy_video_dtype is None else str_to_dtype(args.audio_dummy_video_dtype)
-        dummy_channels = args.audio_dummy_video_channels
-        if dummy_channels is None:
-            dummy_channels = infer_video_in_channels_from_checkpoint(args.ltx2_checkpoint)
-            if dummy_channels is None:
+        latent_dtype = audio_dtype if args.audio_video_latent_dtype is None else str_to_dtype(args.audio_video_latent_dtype)
+        latent_channels = args.audio_video_latent_channels
+        target_fps = float(getattr(args, "audio_only_target_fps", VideoDataset.TARGET_FPS_LTX2))
+        target_resolution_override = getattr(args, "audio_only_target_resolution", None)
+        if latent_channels is None:
+            latent_channels = infer_video_in_channels_from_checkpoint(args.ltx2_checkpoint)
+            if latent_channels is None:
                 raise ValueError(
                     "Unable to infer video input channels from --ltx2_checkpoint; "
-                    "set --audio_dummy_video_channels explicitly."
+                    "set --audio_video_latent_channels explicitly."
                 )
-        dummy_channels = int(dummy_channels)
+        latent_channels = int(latent_channels)
+        if target_fps <= 0:
+            raise ValueError(f"audio_only_target_fps must be > 0, got {target_fps}")
 
         # Validate datasets (use variables defined during auto-detection)
         if non_audio_datasets:
@@ -855,11 +965,68 @@ def main() -> None:
         if not audio_datasets:
             raise ValueError("Audio-only caching requires at least one audio dataset")
 
-        def encode_dummy(batch: List[ItemInfo]) -> None:
-            for item in batch:
-                save_dummy_latent_cache_ltx2(item, channels=dummy_channels, dtype=dummy_dtype)
+        if target_resolution_override is not None:
+            target_width = int(target_resolution_override)
+            target_height = int(target_resolution_override)
+        else:
+            candidate_resolutions: list[tuple[int, int]] = []
+            for ds in audio_datasets:
+                res = getattr(ds, "resolution", None)
+                if isinstance(res, (tuple, list)) and len(res) >= 2:
+                    width = int(res[0])
+                    height = int(res[1])
+                    if width > 0 and height > 0:
+                        candidate_resolutions.append((width, height))
+            unique_resolutions = sorted(set(candidate_resolutions))
+            if not unique_resolutions:
+                target_width, target_height = config_utils.BaseDatasetParams.resolution
+                logger.warning(
+                    "Could not infer target resolution from audio datasets; "
+                    "falling back to default dataset resolution %sx%s.",
+                    target_width,
+                    target_height,
+                )
+            elif len(unique_resolutions) > 1:
+                target_width, target_height = max(unique_resolutions, key=lambda r: r[0] * r[1])
+                logger.warning(
+                    "Multiple audio dataset resolutions detected for audio-only caching %s; "
+                    "using largest resolution %sx%s. Set --audio_only_target_resolution to override.",
+                    unique_resolutions,
+                    target_width,
+                    target_height,
+                )
+            else:
+                target_width, target_height = unique_resolutions[0]
 
-        cache_latents.encode_datasets(list(audio_datasets), encode_dummy, args)
+        if target_width < 32 or target_height < 32:
+            raise ValueError(
+                f"Audio-only target resolution must be >= 32x32, got {target_width}x{target_height}."
+            )
+
+        def encode_audio_only_video_latents(batch: List[ItemInfo]) -> None:
+            for item in batch:
+                audio_path = getattr(item, "audio_path", None) or item.item_key
+                latent, frame_count, virtual_geometry = build_audio_only_video_latent(
+                    channels=latent_channels,
+                    dtype=latent_dtype,
+                    target_width=target_width,
+                    target_height=target_height,
+                    target_fps=target_fps,
+                    audio_path=audio_path,
+                )
+                virtual_frames, virtual_height, virtual_width = virtual_geometry
+                item.frame_count = frame_count
+                save_latent_cache_ltx2(
+                    item,
+                    latent,
+                    extra_tensors={
+                        "ltx2_virtual_num_frames_int32": torch.tensor(int(virtual_frames), dtype=torch.int32),
+                        "ltx2_virtual_height_int32": torch.tensor(int(virtual_height), dtype=torch.int32),
+                        "ltx2_virtual_width_int32": torch.tensor(int(virtual_width), dtype=torch.int32),
+                    },
+                )
+
+        cache_latents.encode_datasets(list(audio_datasets), encode_audio_only_video_latents, args)
     if audio_video or audio_only:
         if getattr(args, "ltx2_checkpoint", None) is None:
             raise ValueError("--ltx2_checkpoint is required when audio latents are cached")
@@ -891,6 +1058,9 @@ def main() -> None:
             if not isinstance(ds, (VideoDataset, AudioDataset)):
                 continue
             ds_target_fps = getattr(ds, "target_fps", VideoDataset.TARGET_FPS_LTX2)
+            if audio_only:
+                if not isinstance(ds_target_fps, (int, float)) or float(ds_target_fps) <= 0:
+                    ds_target_fps = float(VideoDataset.TARGET_FPS_LTX2)
             num_workers = args.num_workers if args.num_workers is not None else max(1, (os.cpu_count() or 2) - 1)
             for _bucket_key, batch in ds.retrieve_latent_cache_batches(num_workers):
                 for item_info in batch:
@@ -899,6 +1069,14 @@ def main() -> None:
                         continue
                     if isinstance(ds, AudioDataset):
                         audio_path = getattr(item_info, "audio_path", None) or item_info.item_key
+                        if audio_only:
+                            frame_count = _estimate_video_frame_count_from_audio(audio_path, target_fps=ds_target_fps)
+                            if frame_count is None:
+                                raise ValueError(
+                                    f"Could not determine audio duration for {audio_path}. "
+                                    "Audio-only mode requires duration-aware frame_count metadata."
+                                )
+                            item_info.frame_count = int(frame_count)
                     else:
                         audio_path = _resolve_audio_path(
                             item_info,
@@ -913,7 +1091,7 @@ def main() -> None:
                             item_info,
                             audio_path=audio_path,
                             dtype=audio_dtype,
-                            target_fps=float(ds_target_fps),
+                            target_fps=ds_target_fps,
                         )
                     except Exception as e:
                         logger.warning(
@@ -961,12 +1139,28 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
     )
     parser.add_argument("--ltx2_audio_dtype", type=str, default=None)
     parser.add_argument(
-        "--audio_dummy_video_channels",
+        "--audio_video_latent_channels",
         type=int,
         default=None,
-        help="Override dummy video channels for audio-only caching (auto-detected by default).",
+        help="Override video latent channels for audio-only caching (auto-detected by default).",
     )
-    parser.add_argument("--audio_dummy_video_dtype", type=str, default=None)
+    parser.add_argument("--audio_video_latent_dtype", type=str, default=None)
+    parser.add_argument(
+        "--audio_only_target_resolution",
+        type=int,
+        default=None,
+        help=(
+            "Optional override (square) for target video resolution used to build "
+            "duration-aware video latents in audio-only mode. By default, dataset "
+            "resolution is used."
+        ),
+    )
+    parser.add_argument(
+        "--audio_only_target_fps",
+        type=float,
+        default=VideoDataset.TARGET_FPS_LTX2,
+        help="Target FPS used to convert audio duration into video frame count in audio-only mode.",
+    )
     parser.add_argument(
         "--precache_sample_latents",
         action="store_true",
