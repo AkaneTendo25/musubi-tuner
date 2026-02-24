@@ -2,6 +2,8 @@
 
 Status: LTX-2 support is work in progress and may be incomplete or unstable.
 
+Development is tracked in [this issue](https://github.com/AkaneTendo25/musubi-tuner/issues/1).
+
 This guide details the process for training LTX-2 LoRA models:
 1. **Caching Latents** (Video/Image + Audio)
 2. **Caching Text Encoder Outputs** (Prompts)

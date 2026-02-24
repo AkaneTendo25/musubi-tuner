@@ -160,6 +160,7 @@ For detailed information on specific architectures, configurations, and advanced
 - [Z-Image](./docs/zimage.md)
 - [HunyuanVideo 1.5](./docs/hunyuan_video_1_5.md)
 - [Kandinsky 5](./docs/kandinsky5.md)
+- [LTX-2](./docs/ltx_2.md)
 - [FLUX.2](./docs/flux_2.md)
 
 **Common Configuration & Usage:**
