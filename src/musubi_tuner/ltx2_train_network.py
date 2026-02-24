@@ -3084,13 +3084,17 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 offload_transformer_if_needed()
                 prepare_all_embeddings_batch(sample_parameters)
 
+            # Load VAE once before the prompt loop to avoid repeated disk reads from the
+            # (potentially huge) safetensors checkpoint.  Keep it on CPU between prompts.
+            vae_for_sampling = None
+            if transformer_offloaded:
+                vae_dtype = torch.float16 if args.vae_dtype is None else model_utils.str_to_dtype(args.vae_dtype)
+                logger.info("Sampling offload: loading VAE for sampling (once)")
+                vae_for_sampling = self._load_vae_impl(args, vae_dtype=vae_dtype, vae_path=args.vae)
+
             with torch.no_grad(), accelerator.autocast():
                 for sample_parameter in sample_parameters:
                     if transformer_offloaded:
-                        offload_transformer_if_needed()
-                        vae_dtype = torch.float16 if args.vae_dtype is None else model_utils.str_to_dtype(args.vae_dtype)
-                        logger.info("Sampling offload: loading VAE for sampling")
-                        vae_for_sampling = self._load_vae_impl(args, vae_dtype=vae_dtype, vae_path=args.vae)
                         ensure_transformer_on_device()
                         self.sample_image_inference(
                             accelerator, args, transformer, dit_dtype, vae_for_sampling, save_dir, sample_parameter, epoch, steps,
@@ -3098,7 +3102,6 @@ class LTX2NetworkTrainer(NetworkTrainer):
                         )
                         offload_transformer_if_needed()
                         vae_for_sampling.to_device("cpu")
-                        logger.info("Sampling offload: moved VAE back to CPU after sampling")
                         self._cleanup_cuda(accelerator.device)
                     else:
                         self.sample_image_inference(
@@ -3107,6 +3110,10 @@ class LTX2NetworkTrainer(NetworkTrainer):
                         )
                     clean_memory_on_device(accelerator.device)
                     self._cleanup_cuda(accelerator.device)
+
+            if vae_for_sampling is not None:
+                del vae_for_sampling
+                self._cleanup_cuda(accelerator.device)
 
             # Cleanup embeddings after all samples are done (but NOT if precached - they're reused)
             if transformer_offloaded and not use_precached:
@@ -3120,18 +3127,21 @@ class LTX2NetworkTrainer(NetworkTrainer):
             with torch.no_grad():
                 with distributed_state.split_between_processes(per_process_params) as sample_parameter_lists:
                     my_sample_params = sample_parameter_lists[0]
-                    
+
                     # Batch encode all prompts for this process upfront
                     if transformer_offloaded:
                         offload_transformer_if_needed()
                         prepare_all_embeddings_batch(my_sample_params)
 
+                    # Load VAE once before the prompt loop
+                    vae_for_sampling = None
+                    if transformer_offloaded:
+                        vae_dtype = torch.float16 if args.vae_dtype is None else model_utils.str_to_dtype(args.vae_dtype)
+                        logger.info("Sampling offload: loading VAE for sampling (once)")
+                        vae_for_sampling = self._load_vae_impl(args, vae_dtype=vae_dtype, vae_path=args.vae)
+
                     for sample_parameter in my_sample_params:
                         if transformer_offloaded:
-                            offload_transformer_if_needed()
-                            vae_dtype = torch.float16 if args.vae_dtype is None else model_utils.str_to_dtype(args.vae_dtype)
-                            logger.info("Sampling offload: loading VAE for sampling")
-                            vae_for_sampling = self._load_vae_impl(args, vae_dtype=vae_dtype, vae_path=args.vae)
                             ensure_transformer_on_device()
                             self.sample_image_inference(
                                 accelerator,
@@ -3148,13 +3158,16 @@ class LTX2NetworkTrainer(NetworkTrainer):
                             )
                             offload_transformer_if_needed()
                             vae_for_sampling.to_device("cpu")
-                            logger.info("Sampling offload: moved VAE back to CPU after sampling")
                             self._cleanup_cuda(accelerator.device)
                         else:
                             self.sample_image_inference(
                                 accelerator, args, transformer, dit_dtype, vae, save_dir, sample_parameter, epoch, steps,
                                 audio_decoder=audio_decoder, vocoder=vocoder,
                             )
+                        self._cleanup_cuda(accelerator.device)
+
+                    if vae_for_sampling is not None:
+                        del vae_for_sampling
                         self._cleanup_cuda(accelerator.device)
 
                     # Cleanup embeddings after all samples for this process (but NOT if precached)
@@ -3725,7 +3738,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 vocoder=vocoder,
                 offload_transformer_for_decode=bool(getattr(args, "sample_with_offloading", False)),
                 transformer_offload_device=torch.device("cpu"),
-                restore_transformer_device=True,
+                restore_transformer_device=not (getattr(args, "sample_with_offloading", False) and accelerator.device.type == "cuda"),
                 audio_output_path=wav_path if enable_audio_preview else None,
                 use_audio_subprocess=use_audio_subprocess,
                 enable_audio_preview=enable_audio_preview,
