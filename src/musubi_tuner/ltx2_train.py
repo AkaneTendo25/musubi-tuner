@@ -19,6 +19,7 @@ from safetensors.torch import save_file
 
 from musubi_tuner.dataset import config_utils
 from musubi_tuner.dataset.config_utils import BlueprintGenerator, ConfigSanitizer
+from musubi_tuner.dataset.image_video_dataset import ARCHITECTURE_LTX2
 from musubi_tuner.hv_train_network import (
     SS_METADATA_KEY_BASE_MODEL_VERSION,
     SS_METADATA_MINIMUM_KEYS,
@@ -33,7 +34,7 @@ from musubi_tuner.hv_train_network import (
 )
 from musubi_tuner.modules.scheduling_flow_match_discrete import FlowMatchDiscreteScheduler
 from musubi_tuner.utils import huggingface_utils, model_utils, sai_model_spec, train_utils
-from musubi_tuner.utils.safetensors_utils import mem_eff_save_file
+from musubi_tuner.utils.safetensors_utils import MemoryEfficientSafeOpen, mem_eff_save_file
 from musubi_tuner.ltx2_train_network import LTX2NetworkTrainer, ltx2_setup_parser
 
 import copy
@@ -988,7 +989,72 @@ def ltx2_finetune_setup_parser(parser: argparse.ArgumentParser) -> argparse.Argu
         default=False,
         help="Freeze attention geometry params (to_q/to_k/q_norm/k_norm) during full fine-tuning.",
     )
+    parser.add_argument(
+        "--save_comfy_format",
+        action="store_true",
+        default=False,
+        help="Rename checkpoint keys from model.X to model.diffusion_model.X for ComfyUI compatibility.",
+    )
+    parser.add_argument(
+        "--save_merged_checkpoint",
+        action="store_true",
+        default=False,
+        help=(
+            "Save a merged checkpoint containing finetuned DIT weights plus all non-overlapping keys "
+            "(VAE, audio VAE, vocoder, text_embedding_projection, etc.) from the original --ltx2_checkpoint. "
+            "Implies --save_comfy_format."
+        ),
+    )
     return parser
+
+
+def _prepare_state_dict_for_save(state_dict: dict, args) -> tuple[dict, dict[str, str] | None]:
+    """Optionally remap keys to ComfyUI format and merge with original checkpoint.
+
+    Returns:
+        (state_dict, extra_metadata) where extra_metadata may contain the original
+        checkpoint's ``config`` entry (or None if no merging was requested).
+    """
+    if not getattr(args, "save_comfy_format", False) and not getattr(args, "save_merged_checkpoint", False):
+        return state_dict, None
+
+    # Rename keys: model.X -> model.diffusion_model.X
+    renamed: dict = {}
+    for key, value in state_dict.items():
+        if key.startswith("model."):
+            new_key = "model.diffusion_model." + key[len("model."):]
+            renamed[new_key] = value
+        else:
+            renamed[key] = value
+
+    extra_metadata: dict[str, str] | None = None
+
+    if getattr(args, "save_merged_checkpoint", False):
+        ckpt_path = args.ltx2_checkpoint
+        logger.info(f"Merging finetuned weights with original checkpoint: {ckpt_path}")
+        with MemoryEfficientSafeOpen(ckpt_path) as f:
+            all_keys = f.keys()
+            missing_keys = [k for k in all_keys if k not in renamed]
+            # Restore original dtypes for overlapping keys (e.g. scale_shift_table F32 cast to BF16 by --full_bf16)
+            _st_to_torch = {"F32": "torch.float32", "F16": "torch.float16", "BF16": "torch.bfloat16"}
+            dtype_fixed = 0
+            for key in all_keys:
+                if key in renamed:
+                    orig_dtype = f.header[key]["dtype"]
+                    if _st_to_torch.get(orig_dtype) and str(renamed[key].dtype) != _st_to_torch[orig_dtype]:
+                        renamed[key] = renamed[key].to(f.get_tensor(key).dtype)
+                        dtype_fixed += 1
+            if dtype_fixed:
+                logger.info(f"Restored original dtype for {dtype_fixed} overlapping keys")
+            # Copy non-overlapping keys (VAE, vocoder, etc.)
+            for key in tqdm(missing_keys, desc="Merging original checkpoint keys"):
+                renamed[key] = f.get_tensor(key)
+            orig_meta = f.metadata()
+            if orig_meta and "config" in orig_meta:
+                extra_metadata = {"config": orig_meta["config"]}
+        logger.info(f"Merged checkpoint has {len(renamed)} keys ({len(missing_keys)} from original)")
+
+    return renamed, extra_metadata
 
 
 def main() -> None:
@@ -1473,23 +1539,29 @@ def main() -> None:
             md_timesteps = None
 
         sai_metadata = sai_model_spec.build_metadata(
+            None,
+            ARCHITECTURE_LTX2,
+            time.time(),
+            title,
             args.metadata_reso,
-            title=title,
-            author=args.metadata_author,
-            description=args.metadata_description,
-            license=args.metadata_license,
-            tags=args.metadata_tags,
+            args.metadata_author,
+            args.metadata_description,
+            args.metadata_license,
+            args.metadata_tags,
             timesteps=md_timesteps,
+            is_lora=False,
             custom_arch=args.metadata_arch,
         )
         metadata_to_save.update(sai_metadata)
 
         save_model_ref = getattr(unwrapped_model, "_orig_mod", None) or unwrapped_model
-        state_dict = save_model_ref.state_dict()
-        if use_memory_efficient_saving or args.mem_eff_save:
-            mem_eff_save_file(state_dict, ckpt_file, metadata_to_save)
-        else:
-            save_file(state_dict, ckpt_file, metadata_to_save)
+        # Build a zero-copy dict referencing live parameters (avoids state_dict() VRAM duplication)
+        state_dict = {name: param.data for name, param in save_model_ref.named_parameters()}
+        state_dict.update({name: buf for name, buf in save_model_ref.named_buffers()})
+        state_dict, extra_meta = _prepare_state_dict_for_save(state_dict, args)
+        if extra_meta:
+            metadata_to_save.update(extra_meta)
+        mem_eff_save_file(state_dict, ckpt_file, metadata_to_save)
 
         if args.huggingface_repo_id is not None:
             huggingface_utils.upload(args, ckpt_file, "/" + ckpt_name, force_sync_upload=force_sync_upload)
@@ -1523,11 +1595,15 @@ def main() -> None:
         for name, buf in save_model_ref.named_buffers():
             ema_state_dict[name] = buf.cpu()
 
+        ema_state_dict, extra_meta = _prepare_state_dict_for_save(ema_state_dict, args)
+
         ema_metadata = metadata.copy()
         ema_metadata["ss_is_ema"] = "True"
         ema_metadata["ss_ema_decay"] = str(args.ema_decay)
         ema_metadata["ss_steps"] = str(steps)
         ema_metadata["ss_epoch"] = str(epoch_no)
+        if extra_meta:
+            ema_metadata.update(extra_meta)
 
         if args.mem_eff_save:
             mem_eff_save_file(ema_state_dict, ema_ckpt_file, ema_metadata)
@@ -1678,10 +1754,10 @@ def main() -> None:
             args,
             0,
             global_step,
-            accelerator.device,
             vae,
             transformer,
             sample_parameters,
+            trainer.dit_dtype,
         )
         optimizer_train_fn()
 
@@ -2056,20 +2132,6 @@ def main() -> None:
                     run_validation(global_step, epoch)
                     optimizer_train_fn()
 
-                if should_sample_images(args, global_step, epoch=None):
-                    optimizer_eval_fn()
-                    trainer.sample_images(
-                        accelerator,
-                        args,
-                        None,
-                        global_step,
-                        accelerator.device,
-                        vae,
-                        transformer,
-                        sample_parameters,
-                    )
-                    optimizer_train_fn()
-
                 if args.save_every_n_steps is not None and global_step % args.save_every_n_steps == 0:
                     ckpt_name = train_utils.get_step_ckpt_name(args.output_name, global_step)
                     if args.save_ema_only and ema_model is not None:
@@ -2093,6 +2155,21 @@ def main() -> None:
                     if args.save_state:
                         train_utils.save_and_remove_state_stepwise(args, accelerator, global_step)
                         save_ema_state()
+                    clean_memory_on_device(accelerator.device)
+
+                if should_sample_images(args, global_step, epoch=None):
+                    optimizer_eval_fn()
+                    trainer.sample_images(
+                        accelerator,
+                        args,
+                        None,
+                        global_step,
+                        vae,
+                        transformer,
+                        sample_parameters,
+                        trainer.dit_dtype,
+                    )
+                    optimizer_train_fn()
 
                 if global_step >= args.max_train_steps:
                     break
@@ -2125,6 +2202,7 @@ def main() -> None:
             if args.save_state:
                 train_utils.save_and_remove_state_on_epoch_end(args, accelerator, epoch + 1)
                 save_ema_state()
+            clean_memory_on_device(accelerator.device)
 
         if should_sample_images(args, global_step, epoch=epoch + 1):
             optimizer_eval_fn()
@@ -2133,10 +2211,10 @@ def main() -> None:
                 args,
                 epoch + 1,
                 global_step,
-                accelerator.device,
                 vae,
                 transformer,
                 sample_parameters,
+                trainer.dit_dtype,
             )
             optimizer_train_fn()
 
