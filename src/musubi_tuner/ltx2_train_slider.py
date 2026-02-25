@@ -791,7 +791,8 @@ class LTX2SliderTrainer:
             # ComfyUI conversion
             self._net_trainer.post_save_checkpoint_hook(args, ckpt_file, ckpt_name, accelerator, force_sync_upload)
 
-            if getattr(args, "huggingface_repo_id", None) is not None:
+            upload_original = (not getattr(args, "convert_to_comfy", False)) or getattr(args, "save_original_lora", False)
+            if getattr(args, "huggingface_repo_id", None) is not None and upload_original:
                 from musubi_tuner.utils import huggingface_utils
                 huggingface_utils.upload(args, ckpt_file, "/" + ckpt_name, force_sync_upload=force_sync_upload)
 
@@ -800,6 +801,11 @@ class LTX2SliderTrainer:
             if os.path.exists(old_ckpt_file):
                 accelerator.print(f"removing old checkpoint: {old_ckpt_file}")
                 os.remove(old_ckpt_file)
+            if getattr(args, "convert_to_comfy", False):
+                comfy_old_ckpt_file = old_ckpt_file.replace(".safetensors", "_comfy.safetensors")
+                if os.path.exists(comfy_old_ckpt_file):
+                    accelerator.print(f"removing old Comfy checkpoint: {comfy_old_ckpt_file}")
+                    os.remove(comfy_old_ckpt_file)
 
         # -- Training loop -----------------------------------------------------
         progress_bar = tqdm(

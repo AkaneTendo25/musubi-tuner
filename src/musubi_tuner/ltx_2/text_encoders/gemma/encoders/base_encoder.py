@@ -42,6 +42,23 @@ class GemmaTextEncoderModelBase(torch.nn.Module):
         self.processor = img_processor
         self.feature_extractor_linear = feature_extractor_linear.to(dtype=dtype)
 
+    def _text_model_device(self) -> torch.device:
+        model = getattr(self, "model", None)
+        if model is None:
+            return torch.device("cpu")
+
+        try:
+            embeddings = model.get_input_embeddings()
+            if embeddings is not None and hasattr(embeddings, "weight"):
+                return embeddings.weight.device
+        except Exception:
+            pass
+
+        try:
+            return next(model.parameters()).device
+        except StopIteration:
+            return torch.device("cpu")
+
     def _run_feature_extractor(
         self, hidden_states: torch.Tensor, attention_mask: torch.Tensor, padding_side: str = "right"
     ) -> torch.Tensor:
@@ -68,9 +85,10 @@ class GemmaTextEncoderModelBase(torch.nn.Module):
         Returns:
             tuple[torch.Tensor, dict[str, torch.Tensor]]: Encoded features and a dictionary with attention mask.
         """
+        text_device = self._text_model_device()
         token_pairs = self.tokenizer.tokenize_with_weights(text)["gemma"]
-        input_ids = torch.tensor([[t[0] for t in token_pairs]], device=self.model.device)
-        attention_mask = torch.tensor([[w[1] for w in token_pairs]], device=self.model.device)
+        input_ids = torch.tensor([[t[0] for t in token_pairs]], device=text_device)
+        attention_mask = torch.tensor([[w[1] for w in token_pairs]], device=text_device)
         outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True)
         projected = self._run_feature_extractor(
             hidden_states=outputs.hidden_states, attention_mask=attention_mask, padding_side=padding_side
@@ -94,15 +112,17 @@ class GemmaTextEncoderModelBase(torch.nn.Module):
             self._init_image_processor()
         text = self.processor.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 
+        text_device = self._text_model_device()
         model_inputs = self.processor(
             text=text,
             images=image,
             return_tensors="pt",
-        ).to(self.model.device)
+        ).to(text_device)
         pad_token_id = self.processor.tokenizer.pad_token_id if self.processor.tokenizer.pad_token_id is not None else 0
         model_inputs = _pad_inputs_for_attention_alignment(model_inputs, pad_token_id=pad_token_id)
 
-        with torch.inference_mode(), torch.random.fork_rng(devices=[self.model.device]):
+        rng_devices = [text_device] if text_device.type == "cuda" else []
+        with torch.inference_mode(), torch.random.fork_rng(devices=rng_devices):
             torch.manual_seed(seed)
             outputs = self.model.generate(
                 **model_inputs,
@@ -168,11 +188,15 @@ class GemmaTextEncoderModelBase(torch.nn.Module):
 
     def to(self, *args, **kwargs):
         model = getattr(self, "model", None)
-        is_quantized = False
+        protect_model = False
         if model is not None:
-            is_quantized = bool(getattr(model, "is_loaded_in_8bit", False)) or bool(getattr(model, "is_loaded_in_4bit", False))
+            protect_model = (
+                bool(getattr(model, "is_loaded_in_8bit", False))
+                or bool(getattr(model, "is_loaded_in_4bit", False))
+                or bool(getattr(self, "_has_fp8_model", False))
+            )
 
-        if not is_quantized:
+        if not protect_model:
             return super().to(*args, **kwargs)
 
         stored_model = self._modules.pop("model", None)
@@ -272,10 +296,92 @@ def _infer_safetensors_dtype(path: str) -> torch.dtype | None:
     return None
 
 
+def _has_fp8_weights(path: str) -> bool:
+    """Check if a safetensors file contains any fp8 tensors."""
+    with MemoryEfficientSafeOpen(path) as handle:
+        for key in handle.keys():
+            meta = handle.header.get(key)
+            if not isinstance(meta, dict) or "dtype" not in meta:
+                continue
+            if meta["dtype"] in ("F8_E5M2", "F8_E4M3"):
+                return True
+    return False
+
+
+def _extract_spiece_model_bytes(safetensors_path: str) -> bytes:
+    """Extract spiece_model tokenizer bytes from a safetensors file."""
+    from safetensors import safe_open
+
+    with safe_open(safetensors_path, framework="pt", device="cpu") as f:
+        if "spiece_model" not in f.keys():
+            raise ValueError(
+                f"No 'spiece_model' key found in {safetensors_path}. "
+                "Cannot extract tokenizer. Provide --gemma_root for the tokenizer."
+            )
+        tensor = f.get_tensor("spiece_model")
+        return tensor.numpy().tobytes()
+
+
+def _resolve_module_and_attr(root_module: torch.nn.Module, dotted_name: str) -> tuple[torch.nn.Module, str]:
+    parts = dotted_name.split(".")
+    submodule = root_module
+    for part in parts[:-1]:
+        submodule = getattr(submodule, part)
+    return submodule, parts[-1]
+
+
+def _materialize_meta_parameter(
+    root_module: torch.nn.Module,
+    dotted_name: str,
+    reference: torch.nn.Parameter,
+    *,
+    device: torch.device,
+) -> None:
+    submodule, attr_name = _resolve_module_and_attr(root_module, dotted_name)
+    replacement = torch.nn.Parameter(
+        torch.zeros(reference.shape, dtype=reference.dtype, device=device),
+        requires_grad=reference.requires_grad,
+    )
+    setattr(submodule, attr_name, replacement)
+
+
+def _materialize_meta_buffer(
+    root_module: torch.nn.Module,
+    dotted_name: str,
+    reference: torch.Tensor,
+    *,
+    device: torch.device,
+) -> None:
+    submodule, attr_name = _resolve_module_and_attr(root_module, dotted_name)
+
+    # Gemma3 keeps some runtime-only buffers as persistent=False; these are validly absent from checkpoints.
+    if attr_name == "inv_freq" and hasattr(submodule, "rope_init_fn") and hasattr(submodule, "config"):
+        try:
+            inv_freq, attention_scaling = submodule.rope_init_fn(submodule.config, device)
+            replacement = inv_freq.to(device=device)
+            setattr(submodule, attr_name, replacement)
+            if hasattr(submodule, "original_inv_freq"):
+                submodule.original_inv_freq = replacement
+            if hasattr(submodule, "attention_scaling"):
+                submodule.attention_scaling = attention_scaling
+            return
+        except Exception as e:
+            logger.warning("Failed to rebuild rotary buffer %s: %s", dotted_name, e)
+
+    if attr_name == "embed_scale" and hasattr(submodule, "embedding_dim"):
+        replacement = torch.tensor(float(submodule.embedding_dim**0.5), dtype=reference.dtype, device=device)
+        setattr(submodule, attr_name, replacement)
+        return
+
+    replacement = torch.zeros(reference.shape, dtype=reference.dtype, device=device)
+    setattr(submodule, attr_name, replacement)
+
+
 def module_ops_from_gemma_root(
     gemma_root: str | None,
     *,
     gemma_weights_path: str | None = None,
+    gemma_safetensors: str | None = None,
     torch_dtype: torch.dtype = torch.bfloat16,
     load_in_8bit: bool = False,
     load_in_4bit: bool = False,
@@ -284,7 +390,20 @@ def module_ops_from_gemma_root(
     bnb_4bit_compute_dtype: torch.dtype | None = None,
     device: torch.device | None = None,
 ) -> tuple[ModuleOps, ...]:
-    if os.getenv("LTX2_REQUIRE_GEMMA_ROOT", "0") == "1" and gemma_root is None:
+    # -- gemma_safetensors preprocessing --
+    keep_fp8 = False
+    if gemma_safetensors:
+        if load_in_8bit or load_in_4bit:
+            raise ValueError("--gemma_safetensors cannot be combined with --gemma_load_in_4bit/8bit")
+        sf_path = Path(gemma_safetensors)
+        if not sf_path.exists():
+            raise FileNotFoundError(f"Gemma safetensors not found: {gemma_safetensors}")
+        gemma_weights_path = gemma_safetensors
+        keep_fp8 = _has_fp8_weights(gemma_safetensors)
+        if keep_fp8:
+            logger.info("Detected fp8 weights in %s — will keep fp8 in VRAM", gemma_safetensors)
+
+    if os.getenv("LTX2_REQUIRE_GEMMA_ROOT", "0") == "1" and gemma_root is None and not gemma_safetensors:
         raise ValueError("gemma_root is required for this configuration")
     gemma_weights_dtype = None
     if gemma_weights_path:
@@ -298,14 +417,21 @@ def module_ops_from_gemma_root(
             gemma_weights_dtype = _infer_safetensors_dtype(str(weight_path))
             gemma_path = str(weight_path.parent)
 
-        if gemma_root is None:
+        if gemma_root is None and not gemma_safetensors:
             gemma_root = gemma_path
     elif gemma_root is not None:
         gemma_path = _find_matching_dir(gemma_root, "model*.safetensors")
     else:
-        raise ValueError("Either gemma_root or gemma_weights_path must be provided")
+        raise ValueError("Either gemma_root, gemma_weights_path, or gemma_safetensors must be provided")
 
-    tokenizer_path = _find_matching_dir(gemma_root, "tokenizer.model")
+    # Resolve tokenizer: from gemma_root directory or extracted from safetensors
+    if gemma_root is not None:
+        tokenizer_path: str | bytes = _find_matching_dir(gemma_root, "tokenizer.model")
+    elif gemma_safetensors:
+        logger.info("Extracting tokenizer from safetensors file...")
+        tokenizer_path = _extract_spiece_model_bytes(gemma_safetensors)
+    else:
+        raise ValueError("Cannot resolve tokenizer: provide --gemma_root or --gemma_safetensors")
 
     def load_gemma(module: GemmaTextEncoderModelBase) -> GemmaTextEncoderModelBase:
         if load_in_8bit and load_in_4bit:
@@ -340,12 +466,21 @@ def module_ops_from_gemma_root(
         else:
             if gemma_weights_path is not None:
                 from safetensors import safe_open
-                from transformers import AutoConfig
                 load_device = device or (torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
-                if gemma_weights_dtype is not None and gemma_weights_dtype.itemsize == 1 and load_device.type != "cuda":
+                if keep_fp8 and load_device.type != "cuda":
+                    raise ValueError("Float8 Gemma weights require CUDA; provide a GPU or use non-fp8 weights.")
+                elif gemma_weights_dtype is not None and gemma_weights_dtype.itemsize == 1 and load_device.type != "cuda":
                     raise ValueError("Float8 Gemma weights require CUDA; provide a GPU or use non-fp8 weights.")
 
-                config = AutoConfig.from_pretrained(gemma_root, local_files_only=True)
+                if gemma_root is not None:
+                    from transformers import AutoConfig
+                    config = AutoConfig.from_pretrained(gemma_root, local_files_only=True)
+                else:
+                    from musubi_tuner.ltx_2.text_encoders.gemma.fp8_ops import infer_gemma3_config_from_safetensors
+                    logger.info("No gemma_root — inferring config from safetensors header...")
+                    inferred = infer_gemma3_config_from_safetensors(gemma_safetensors)
+                    config_class = Gemma3ForConditionalGeneration.config_class
+                    config = config_class(**inferred)
                 
                 # Initialize on meta device to avoid immediate allocation
                 with torch.device("meta"):
@@ -397,12 +532,7 @@ def module_ops_from_gemma_root(
                         
                         try:
                             # Iterate to find the submodule and parameter
-                            sub_mod = module.model
-                            parts = new_key.split(".")
-                            param_name = parts[-1]
-                            for part in parts[:-1]:
-                                sub_mod = getattr(sub_mod, part)
-                            
+                            sub_mod, param_name = _resolve_module_and_attr(module.model, new_key)
                             param = getattr(sub_mod, param_name)
                             
                             # Skip if already loaded (unlikely in this loop but good safety)
@@ -410,10 +540,6 @@ def module_ops_from_gemma_root(
                                 pass
 
                             tensor = f.get_tensor(key)
-                            
-                            # DEBUG: Log first tensor info
-                            if i < 5:
-                                print(f"DEBUG: Tensor {key} -> {new_key} - shape={tensor.shape}, dtype={tensor.dtype}, size_mb={tensor.numel() * tensor.element_size() / 1024 / 1024:.2f}", flush=True)
 
                             with torch.no_grad():
                                 if param.shape != tensor.shape:
@@ -421,9 +547,8 @@ def module_ops_from_gemma_root(
                                     logger.warning(f"Shape mismatch for {new_key}: model {param.shape} vs ckpt {tensor.shape}")
                                     continue
                                 
-                                # FP8 weights must be cast to compute dtype (BF16) since FP8 doesn't support all ops
-                                # The memory savings from FP8 are only on disk, not in VRAM
-                                if tensor.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+                                if tensor.dtype in (torch.float8_e4m3fn, torch.float8_e5m2) and not keep_fp8:
+                                    # Cast fp8→compute dtype when not keeping fp8 in VRAM
                                     tensor = tensor.to(torch_dtype)
                                 
                                 # Materialize param on target device
@@ -446,25 +571,88 @@ def module_ops_from_gemma_root(
                     logger.info(f"First {len(unmatched_keys)} unmatched safetensors keys (original -> attempted):")
                     for orig, attempted in unmatched_keys:
                         logger.info(f"  {orig} -> {attempted}")
-                
-                # Count how many params are still on meta (not loaded from safetensors)
-                meta_count = sum(1 for p in module.model.parameters() if p.device.type == "meta")
+
+                # Some text-encoder exports omit lm_head; tie it to input embeddings before meta checks.
+                if hasattr(module.model, "tie_weights"):
+                    try:
+                        module.model.tie_weights()
+                    except Exception as e:
+                        logger.warning("Failed to tie Gemma lm_head weights: %s", e)
+
+                meta_params = [(name, p) for name, p in module.model.named_parameters() if p.device.type == "meta"]
+                meta_buffers = [(name, b) for name, b in module.model.named_buffers() if b.device.type == "meta"]
                 total_params = sum(1 for _ in module.model.parameters())
-                logger.info(f"Loaded {total_params - meta_count}/{total_params} parameters from safetensors. {meta_count} still on meta.")
-                
-                if meta_count > 0:
-                    # Log first few model keys that are still on meta
-                    meta_keys = [name for name, p in module.model.named_parameters() if p.device.type == "meta"]
-                    logger.warning(f"{meta_count} parameters were NOT found in safetensors and will be materialized as random tensors!")
-                    logger.info(f"First 10 missing model keys: {meta_keys[:10]}")
-                
-                # Materialize any remaining meta parameters (e.g. buffers or unused params) to avoid errors later
-                # NOTE: This may allocate memory for any missing weights. If your safetensors is incomplete,
-                # these will be random tensors in torch_dtype.
-                module.model.to_empty(device=load_device)
-                
+                logger.info(
+                    "Loaded %d/%d parameters from safetensors. %d parameters and %d buffers remain on meta.",
+                    total_params - len(meta_params),
+                    total_params,
+                    len(meta_params),
+                    len(meta_buffers),
+                )
+
+                required_prefixes = ("model.language_model.", "lm_head.")
+                missing_required_params = [name for name, _ in meta_params if name.startswith(required_prefixes)]
+                missing_required_buffers = [name for name, _ in meta_buffers if name.startswith(required_prefixes)]
+                derivable_required_buffer_suffixes = (".embed_scale", ".inv_freq")
+                non_derivable_required_buffers = [
+                    name for name in missing_required_buffers if not name.endswith(derivable_required_buffer_suffixes)
+                ]
+
+                if missing_required_params or non_derivable_required_buffers:
+                    raise ValueError(
+                        "Gemma safetensors is missing required language-model tensors. "
+                        f"missing_params={missing_required_params[:20]} "
+                        f"missing_buffers={non_derivable_required_buffers[:20]}"
+                    )
+
+                if meta_params or meta_buffers:
+                    # Optional multimodal branches can be absent in text-focused checkpoints.
+                    # Materialize them as zeros on CPU to avoid full-GPU allocation.
+                    optional_device = torch.device("cpu") if load_device.type == "cuda" else load_device
+                    if missing_required_buffers:
+                        logger.info(
+                            "Rebuilding %d language-model runtime buffers from config: %s",
+                            len(missing_required_buffers),
+                            missing_required_buffers[:10],
+                        )
+                    for name, param in meta_params:
+                        target_device = load_device if name.startswith(required_prefixes) else optional_device
+                        _materialize_meta_parameter(module.model, name, param, device=target_device)
+                    for name, buf in meta_buffers:
+                        target_device = load_device if name.startswith(required_prefixes) else optional_device
+                        _materialize_meta_buffer(module.model, name, buf, device=target_device)
+                    logger.info(
+                        "Materialized %d missing parameters and %d buffers (optional_device=%s, required_device=%s)",
+                        len(meta_params),
+                        len(meta_buffers),
+                        optional_device,
+                        load_device,
+                    )
+
+                if keep_fp8:
+                    from musubi_tuner.ltx_2.text_encoders.gemma.fp8_ops import replace_linear_with_fp8
+                    offload_fp8_weights = os.getenv("LTX2_GEMMA_SAFETENSORS_WEIGHT_OFFLOAD", "1").lower() in (
+                        "1",
+                        "true",
+                        "yes",
+                        "on",
+                    )
+                    n_replaced = replace_linear_with_fp8(
+                        module.model,
+                        torch_dtype,
+                        weight_offload=offload_fp8_weights,
+                    )
+                    logger.info(
+                        "Replaced %d Linear modules with FP8Linear (weight_offload=%s)",
+                        n_replaced,
+                        offload_fp8_weights,
+                    )
+                    if offload_fp8_weights and load_device.type == "cuda":
+                        torch.cuda.empty_cache()
+                    module._has_fp8_model = True
+
                 logger.info("Custom Gemma weights loaded.")
-                
+
                 # DO NOT cast to torch_dtype here - that would upcast quantized weights to full precision!
                 # module.model = module.model.to(dtype=torch_dtype)
             else:
@@ -482,7 +670,11 @@ def module_ops_from_gemma_root(
         return module
 
     def load_tokenizer(module: GemmaTextEncoderModelBase) -> GemmaTextEncoderModelBase:
-        module.tokenizer = LTXVGemmaTokenizer(tokenizer_path, 1024)
+        tokenizer_max_length = int(os.getenv("LTX2_GEMMA_MAX_LENGTH", "1024"))
+        if tokenizer_max_length <= 0:
+            raise ValueError(f"LTX2_GEMMA_MAX_LENGTH must be > 0, got {tokenizer_max_length}")
+        logger.info("Using Gemma tokenizer max_length=%d", tokenizer_max_length)
+        module.tokenizer = LTXVGemmaTokenizer(tokenizer_path, tokenizer_max_length)
         module._gemma_root = module._gemma_root or gemma_root
         return module
 

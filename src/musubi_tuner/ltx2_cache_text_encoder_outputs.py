@@ -41,7 +41,7 @@ def encode_and_save_batch_official_gemma(
     audio_video: bool,
 ) -> None:
     if autocast_dtype is not None and device.type == "cuda":
-        autocast_context = torch.cuda.amp.autocast(dtype=autocast_dtype)
+        autocast_context = torch.amp.autocast("cuda", dtype=autocast_dtype)
     else:
         autocast_context = nullcontext()
 
@@ -80,7 +80,7 @@ def _encode_prompt_text_ltx2(
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if autocast_dtype is not None and device.type == "cuda":
-        autocast_context = torch.cuda.amp.autocast(dtype=autocast_dtype)
+        autocast_context = torch.amp.autocast("cuda", dtype=autocast_dtype)
     else:
         autocast_context = nullcontext()
     with torch.no_grad(), autocast_context:
@@ -296,11 +296,11 @@ def main() -> None:
 
     autocast_dtype = torch.float16 if args.mixed_precision == "fp16" else torch.bfloat16 if args.mixed_precision == "bf16" else None
 
-    if getattr(args, "require_gemma_root", False):
-        if args.gemma_root is None:
-            raise ValueError("--gemma_root is required for LTX-2 Gemma text caching")
-    elif args.gemma_root is None:
-        raise ValueError("--gemma_root is required for LTX-2 Gemma text caching")
+    gemma_safetensors = getattr(args, "gemma_safetensors", None)
+    if args.gemma_root is None and not gemma_safetensors:
+        raise ValueError("--gemma_root or --gemma_safetensors is required for LTX-2 Gemma text caching")
+    if gemma_safetensors and (getattr(args, "gemma_load_in_8bit", False) or getattr(args, "gemma_load_in_4bit", False)):
+        raise ValueError("--gemma_safetensors cannot be combined with --gemma_load_in_4bit/8bit")
     if args.ltx2_checkpoint is None and getattr(args, "ltx2_text_encoder_checkpoint", None) is None:
         raise ValueError("--ltx2_checkpoint is required for LTX-2 Gemma text caching")
     from musubi_tuner.ltx_2.loader.single_gpu_model_builder import SingleGPUModelBuilder
@@ -340,6 +340,7 @@ def main() -> None:
         model_sd_ops=key_ops,
         module_ops=module_ops_from_gemma_root(
             args.gemma_root,
+            gemma_safetensors=gemma_safetensors,
             torch_dtype=dtype,
             load_in_8bit=bool(getattr(args, "gemma_load_in_8bit", False)),
             load_in_4bit=bool(getattr(args, "gemma_load_in_4bit", False)),
@@ -428,6 +429,12 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         type=str,
         default=None,
         help="Local directory containing Gemma weights/tokenizer (Gemma backend only)",
+    )
+    parser.add_argument(
+        "--gemma_safetensors",
+        type=str,
+        default=None,
+        help="Path to a single Gemma safetensors file (e.g. fp8 from ComfyUI). Loads weights, config, and tokenizer from one file. No --gemma_root needed.",
     )
     parser.add_argument(
         "--ltx2_mode", "--ltx_mode",

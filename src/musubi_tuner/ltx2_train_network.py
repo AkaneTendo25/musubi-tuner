@@ -1348,6 +1348,9 @@ class LTX2NetworkTrainer(NetworkTrainer):
             if getattr(args, "fp8_upcast", False):
                 raise ValueError("--fp8_w8a8 and --fp8_upcast are mutually exclusive")
 
+        if getattr(args, "save_original_lora", False) and not getattr(args, "convert_to_comfy", True):
+            logger.warning("--save_original_lora has no effect with --no_convert_to_comfy.")
+
         if self.dit_dtype == torch.float16:
             assert args.mixed_precision in ["fp16", "no"], "LTX-2 weights are fp16; mixed precision must be fp16 or no"
         elif self.dit_dtype == torch.bfloat16:
@@ -1500,6 +1503,14 @@ class LTX2NetworkTrainer(NetworkTrainer):
             if args.huggingface_repo_id is not None:
                 from musubi_tuner.utils import huggingface_utils
                 huggingface_utils.upload(args, comfy_ckpt_file, "/" + comfy_ckpt_name, force_sync_upload=force_sync_upload)
+
+            if not getattr(args, "save_original_lora", False):
+                if os.path.exists(ckpt_file):
+                    try:
+                        os.remove(ckpt_file)  # default: keep only ComfyUI LoRA
+                        accelerator.print(f"Removed original LoRA checkpoint (Comfy-only default): {ckpt_file}")
+                    except Exception as e:
+                        accelerator.print(f"Warning: Failed to remove original checkpoint '{ckpt_file}': {e}")
         except Exception as e:
             accelerator.print(f"Warning: Failed to convert LoRA to ComfyUI format: {e}")
 
@@ -2912,8 +2923,9 @@ class LTX2NetworkTrainer(NetworkTrainer):
 
     def _build_text_encoder(self, args: argparse.Namespace, accelerator: Accelerator) -> torch.dtype:
         logger.info("Loading Gemma text encoder for LTX-2 sampling")
-        if getattr(args, "gemma_root", None) is None:
-            raise ValueError("--gemma_root is required for LTX-2 sample prompts")
+        gemma_safetensors = getattr(args, "gemma_safetensors", None)
+        if getattr(args, "gemma_root", None) is None and not gemma_safetensors:
+            raise ValueError("--gemma_root or --gemma_safetensors is required for LTX-2 sample prompts")
         if getattr(args, "ltx2_checkpoint", None) is None:
             raise ValueError("--ltx2_checkpoint is required for LTX-2 sample prompts")
         from musubi_tuner.ltx_2.loader.single_gpu_model_builder import SingleGPUModelBuilder
@@ -2951,6 +2963,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
             model_sd_ops=key_ops,
             module_ops=module_ops_from_gemma_root(
                 args.gemma_root,
+                gemma_safetensors=gemma_safetensors,
                 torch_dtype=text_encoder_dtype,
                 load_in_8bit=bool(getattr(args, "gemma_load_in_8bit", False)),
                 load_in_4bit=bool(getattr(args, "gemma_load_in_4bit", False)),
@@ -2966,7 +2979,8 @@ class LTX2NetworkTrainer(NetworkTrainer):
             is_quantized = bool(getattr(text_model, "is_loaded_in_8bit", False)) or bool(
                 getattr(text_model, "is_loaded_in_4bit", False)
             )
-        if not is_quantized and accelerator.device.type != "cpu":
+        is_fp8 = bool(getattr(self._text_encoder, "_has_fp8_model", False))
+        if not is_quantized and not is_fp8 and accelerator.device.type != "cpu":
             self._text_encoder.to(accelerator.device)
         text_model = getattr(self._text_encoder, "model", None)
         if text_model is not None:
@@ -4826,6 +4840,12 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         help="Local directory containing Gemma weights/tokenizer (used for sample prompts)",
     )
     parser.add_argument(
+        "--gemma_safetensors",
+        type=str,
+        default=None,
+        help="Path to a single Gemma safetensors file (e.g. fp8 from ComfyUI). Loads weights, config, and tokenizer from one file. No --gemma_root needed.",
+    )
+    parser.add_argument(
         "--gemma_load_in_8bit",
         action="store_true",
         help="Load Gemma LLM in 8-bit (bitsandbytes). CUDA only.",
@@ -5296,7 +5316,13 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         dest="convert_to_comfy",
         default=True,
         help="Disable automatic conversion of saved LoRA to ComfyUI format. "
-             "By default, a *_comfy.safetensors file is created alongside the original.",
+             "By default, checkpoints are converted and only *_comfy.safetensors is kept.",
+    )
+    parser.add_argument(
+        "--save_original_lora",
+        action="store_true",
+        help="Also keep the original non-Comfy LoRA alongside the ComfyUI-converted checkpoint. "
+             "Default behavior is Comfy-only when conversion is enabled.",
     )
 
     # -- Preservation / regularization flags --

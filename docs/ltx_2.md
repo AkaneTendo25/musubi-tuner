@@ -12,7 +12,9 @@ This guide details the process for training LTX-2 LoRA models:
 
 ## Installation
 
-See the [Installation Guide](https://github.com/AkaneTendo25/musubi-tuner/discussions/19) for detailed setup instructions (Windows/Linux, dependencies, flash-attn, troubleshooting).
+Unless otherwise noted, command examples in this LTX-2 guide were tested on Windows 11. They should also work on Linux, but you may need small shell/path adjustments.
+
+For a Windows-focused community setup example for this fork (tested environment and install helpers), see [Discussion #19: Windows OS installation/usage helpers](https://github.com/AkaneTendo25/musubi-tuner/discussions/19).
 
 ### CUDA Version
 
@@ -127,9 +129,10 @@ python ltx2_cache_text_encoder_outputs.py ^
 ```
 
 ### Key Arguments
-- `--gemma_root`: Path to the local Gemma model folder (Hugging Face format).
-- `--gemma_load_in_8bit`: Loads Gemma in 8-bit quantization.
-- `--gemma_load_in_4bit`: Loads Gemma in 4-bit quantization.
+- `--gemma_root`: Path to the local Gemma model folder (HuggingFace format). Required unless `--gemma_safetensors` is used.
+- `--gemma_safetensors`: Path to a single Gemma `.safetensors` file (e.g. an FP8 export from ComfyUI). Loads weights, config, and tokenizer from one file — no `--gemma_root` needed. See [Loading Gemma from a Single Safetensors File](#loading-gemma-from-a-single-safetensors-file) below.
+- `--gemma_load_in_8bit`: Loads Gemma in 8-bit quantization. Cannot be combined with `--gemma_safetensors`.
+- `--gemma_load_in_4bit`: Loads Gemma in 4-bit quantization. Cannot be combined with `--gemma_safetensors`.
 - `--ltx2_checkpoint`: Required. Use `--ltx2_text_encoder_checkpoint` to override for text encoder connector weights.
 - `--ltx2_mode`, `--ltx_mode`: MUST match the mode used in latent caching. Default is video-only (`v`/`video`); use `av` to concatenate video and audio prompt embeddings.
 - 8-bit/4-bit loading requires `--device cuda`.
@@ -139,6 +142,24 @@ python ltx2_cache_text_encoder_outputs.py ^
 | File Pattern | Contents |
 |--------------|----------|
 | `*_ltx2_te.safetensors` | `video_prompt_embeds_{dtype}`, `audio_prompt_embeds_{dtype}` (av only), `prompt_attention_mask`, `text_{dtype}`, `text_mask` |
+
+### Loading Gemma from a Single Safetensors File
+
+`--gemma_safetensors` loads Gemma from a single `.safetensors` file instead of a HuggingFace model directory. Weights, tokenizer (`spiece_model` key), and config (inferred from tensor shapes) are all read from the one file. No `--gemma_root` needed.
+
+```bash
+python ltx2_cache_text_encoder_outputs.py ^
+  --dataset_config dataset.toml ^
+  --ltx2_checkpoint /path/to/ltx-2.safetensors ^
+  --gemma_safetensors /path/to/gemma3-27b-it-fp8.safetensors ^
+  --device cuda ^
+  --mixed_precision bf16
+```
+
+- FP8 weights (`F8_E4M3` / `F8_E5M2`) are detected automatically and kept in FP8 on GPU (compute in bf16). By default FP8 weights are offloaded to CPU between encoding calls; set `LTX2_GEMMA_SAFETENSORS_WEIGHT_OFFLOAD=0` to keep them on GPU.
+- `--gemma_load_in_8bit` / `--gemma_load_in_4bit` cannot be combined with `--gemma_safetensors`.
+- If the file has no `spiece_model` key, tokenizer extraction fails — use `--gemma_root` instead.
+- Works in all scripts that load Gemma: `ltx2_cache_text_encoder_outputs.py`, `ltx2_train_network.py`, `ltx2_train_slider.py`, `ltx2_generate_video.py`.
 
 ---
 
@@ -172,7 +193,7 @@ accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 ltx2_tr
   --fp8_base ^
   --fp8_scaled ^
   --blocks_to_swap 10 ^
-  --flash_attn ^
+  --sdpa ^
   --gradient_checkpointing ^
   --learning_rate 1e-4 ^
   --network_module networks.lora_ltx2 ^
@@ -293,7 +314,7 @@ accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 ltx2_tr
   --use_pinned_memory_for_block_swap ^
   --gradient_checkpointing ^
   --gradient_checkpointing_cpu_offload ^
-  --flash_attn ^
+  --sdpa ^
   --network_module networks.lora_ltx2 ^
   --network_dim 16 ^
   --network_alpha 16 ^
@@ -637,7 +658,7 @@ accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 ltx2_tr
   --ltx2_checkpoint /path/to/ltx-2.safetensors ^
   --fp8_base --fp8_scaled ^
   --blocks_to_swap 10 ^
-  --flash_attn ^
+  --sdpa ^
   --gradient_checkpointing ^
   --network_module networks.lora_ltx2 ^
   --network_dim 32 --network_alpha 32 ^
@@ -718,6 +739,18 @@ Two-stage inference generates at half resolution, then upsamples and refines. Th
 - `--spatial_upsampler_path`: Path to spatial upsampler model (e.g., `ltx-2-spatial-upscaler-x2-1.0.safetensors`). Required when `--sample_two_stage` is set.
 - `--distilled_lora_path`: Path to distilled LoRA (e.g., `ltx-2-19b-distilled-lora-384.safetensors`) for stage 2 refinement. Optional.
 - `--sample_stage2_steps`: Number of denoising steps for stage 2 refinement (default: 3).
+
+#### Checkpoint Output Format
+
+Saved LoRA checkpoints are converted to ComfyUI format by default. The original musubi-tuner format is deleted after conversion.
+
+| Flag | Behavior |
+|------|----------|
+| *(default)* | Saves `*_comfy.safetensors` only. Original is deleted after conversion. |
+| `--save_original_lora` | Keeps both `*_comfy.safetensors` and the original `*.safetensors`. |
+| `--no_convert_to_comfy` | Saves only the original `*.safetensors` (no conversion). |
+
+Checkpoint rotation (`--save_last_n_ckpts`) cleans up old ComfyUI checkpoints alongside originals. HuggingFace upload (`--huggingface_repo_id`) uploads only the ComfyUI checkpoint unless `--save_original_lora` is set.
 
 ---
 
@@ -963,7 +996,7 @@ reference_cache_directory/                  # IC-LoRA only
 | Missing cache keys during training | Caching incomplete | Run both `ltx2_cache_latents.py` and `ltx2_cache_text_encoder_outputs.py` |
 | Missing `*_ltx2_audio.safetensors` | Audio caching skipped | Re-run latent caching with `--ltx2_mode av` |
 | Gemma connector weights missing | Incorrect checkpoint | Ensure `--ltx2_checkpoint` (or `--ltx2_text_encoder_checkpoint`) contains Gemma connector weights |
-| Gemma OOM | Model too large | Use `--gemma_load_in_8bit` or `--gemma_load_in_4bit` with `--device cuda` |
+| Gemma OOM | Model too large | Use `--gemma_load_in_8bit` or `--gemma_load_in_4bit` with `--device cuda`, or use `--gemma_safetensors` with an FP8 file |
 | Audio caching fails | torchaudio missing | Install torchaudio before running `ltx2_cache_latents.py` |
 | Sampling OOM | VAE decode too large | Enable `--sample_tiled_vae` or reduce `--sample_vae_temporal_tile_size` |
 | Crash with block swap (esp. RTX 5090) | `--use_pinned_memory_for_block_swap` bug | Remove `--use_pinned_memory_for_block_swap` from training arguments |
