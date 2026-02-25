@@ -2,6 +2,7 @@ from enum import Enum
 from typing import Protocol
 
 import logging
+import math
 import torch
 from musubi_tuner.ltx_2.model.transformer.fp8_device_utils import ensure_fp8_modules_on_device
 from musubi_tuner.ltx_2.model.transformer.rope import LTXRopeType, apply_rotary_emb
@@ -280,6 +281,14 @@ class Attention(torch.nn.Module):
         self.split_attn_mode: str | None = None  # "batch" or "query"
         self.split_attn_chunk_size: int = 0  # chunk size for query mode (0 = use default 1024)
 
+        # Optional attention-map capture for training-side regularization.
+        # These fields are toggled externally by ltx2_train's recorder context.
+        self._motion_record_enabled: bool = False
+        self._motion_record_max_queries: int = 32
+        self._motion_record_max_keys: int = 64
+        self._motion_record_capture_grad: bool = False
+        self._motion_record_attn_map: torch.Tensor | None = None
+
     def _split_attention_batch(
         self,
         q: torch.Tensor,
@@ -414,6 +423,42 @@ class Attention(torch.nn.Module):
         if pe is not None:
             q = apply_rotary_emb(q, pe, self.rope_type)
             k = apply_rotary_emb(k, pe if k_pe is None else k_pe, self.rope_type)
+
+        if self._motion_record_enabled:
+            bsz = q.shape[0]
+            qh = q.view(bsz, -1, self.heads, self.dim_head).transpose(1, 2)
+            kh = k.view(bsz, -1, self.heads, self.dim_head).transpose(1, 2)
+            if qh.shape[2] > 0 and kh.shape[2] > 0:
+                q_count = max(1, min(int(self._motion_record_max_queries), int(qh.shape[2])))
+                k_count = max(1, min(int(self._motion_record_max_keys), int(kh.shape[2])))
+                if q_count >= int(qh.shape[2]):
+                    q_idx = torch.arange(int(qh.shape[2]), device=qh.device, dtype=torch.long)
+                else:
+                    q_idx = (
+                        torch.linspace(0, int(qh.shape[2]) - 1, steps=q_count, device=qh.device)
+                        .round()
+                        .to(torch.long)
+                    )
+                    q_idx = torch.unique(q_idx, sorted=True)
+                if k_count >= int(kh.shape[2]):
+                    k_idx = torch.arange(int(kh.shape[2]), device=kh.device, dtype=torch.long)
+                else:
+                    k_idx = (
+                        torch.linspace(0, int(kh.shape[2]) - 1, steps=k_count, device=kh.device)
+                        .round()
+                        .to(torch.long)
+                    )
+                    k_idx = torch.unique(k_idx, sorted=True)
+
+                q_sample = qh[:, :, q_idx, :].to(torch.float32)
+                k_sample = kh[:, :, k_idx, :].to(torch.float32)
+                logits = torch.matmul(q_sample, k_sample.transpose(-1, -2)) / math.sqrt(float(self.dim_head))
+                attn = torch.softmax(logits, dim=-1).mean(dim=1)
+                if not self._motion_record_capture_grad:
+                    attn = attn.detach()
+                self._motion_record_attn_map = attn
+            else:
+                self._motion_record_attn_map = None
 
         # Apply split attention if configured
         split_mode = getattr(self, "split_attn_mode", None)
