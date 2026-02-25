@@ -796,6 +796,26 @@ class LTX2SliderTrainer:
                 from musubi_tuner.utils import huggingface_utils
                 huggingface_utils.upload(args, ckpt_file, "/" + ckpt_name, force_sync_upload=force_sync_upload)
 
+            if getattr(args, "save_checkpoint_metadata", False):
+                from datetime import datetime
+
+                _md = {
+                    "step": steps,
+                    "epoch": epoch_no,
+                    "timestamp": datetime.now().isoformat(timespec="seconds"),
+                }
+                try:
+                    _md["loss"] = float(loss)
+                except Exception:
+                    pass
+                if loss_recorder.loss_list:
+                    _md["loss_avg"] = loss_recorder.moving_average
+                try:
+                    _md["lr"] = float(lr_scheduler.get_last_lr()[0])
+                except Exception:
+                    pass
+                train_utils.save_checkpoint_metadata(ckpt_file, _md)
+
         def remove_model(old_ckpt_name):
             old_ckpt_file = os.path.join(args.output_dir, old_ckpt_name)
             if os.path.exists(old_ckpt_file):
@@ -806,6 +826,7 @@ class LTX2SliderTrainer:
                 if os.path.exists(comfy_old_ckpt_file):
                     accelerator.print(f"removing old Comfy checkpoint: {comfy_old_ckpt_file}")
                     os.remove(comfy_old_ckpt_file)
+            train_utils.remove_checkpoint_metadata(old_ckpt_file)
 
         # -- Training loop -----------------------------------------------------
         progress_bar = tqdm(

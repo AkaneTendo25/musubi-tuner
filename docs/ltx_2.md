@@ -151,7 +151,7 @@ python ltx2_cache_text_encoder_outputs.py ^
 python ltx2_cache_text_encoder_outputs.py ^
   --dataset_config dataset.toml ^
   --ltx2_checkpoint /path/to/ltx-2.safetensors ^
-  --gemma_safetensors /path/to/gemma3-27b-it-fp8.safetensors ^
+  --gemma_safetensors /path/to/gemma3-12b-it-fp8.safetensors ^
   --device cuda ^
   --mixed_precision bf16
 ```

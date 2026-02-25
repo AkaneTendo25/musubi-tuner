@@ -2580,6 +2580,30 @@ class NetworkTrainer:
             if args.huggingface_repo_id is not None and upload_original:
                 huggingface_utils.upload(args, ckpt_file, "/" + ckpt_name, force_sync_upload=force_sync_upload)
 
+            if getattr(args, "save_checkpoint_metadata", False):
+                from datetime import datetime
+
+                _md = {
+                    "step": steps,
+                    "epoch": epoch_no,
+                    "timestamp": datetime.now().isoformat(timespec="seconds"),
+                }
+                try:
+                    _md["loss"] = loss.detach().item()
+                except Exception:
+                    pass
+                if loss_recorder.loss_list:
+                    _md["loss_avg"] = loss_recorder.moving_average
+                try:
+                    _md["lr"] = float(lr_scheduler.get_last_lr()[0])
+                except Exception:
+                    pass
+                if video_loss_value is not None:
+                    _md["loss_video"] = video_loss_value
+                if audio_loss_value is not None:
+                    _md["loss_audio"] = audio_loss_value
+                train_utils.save_checkpoint_metadata(ckpt_file, _md)
+
         def remove_model(old_ckpt_name):
             old_ckpt_file = os.path.join(args.output_dir, old_ckpt_name)
             if os.path.exists(old_ckpt_file):
@@ -2590,6 +2614,7 @@ class NetworkTrainer:
                 if os.path.exists(comfy_old_ckpt_file):
                     accelerator.print(f"removing old Comfy checkpoint: {comfy_old_ckpt_file}")
                     os.remove(comfy_old_ckpt_file)
+            train_utils.remove_checkpoint_metadata(old_ckpt_file)
 
         def run_validation(step: int, epoch_no: int | None = None) -> None:
             if validation_dataloader is None:
@@ -3880,6 +3905,11 @@ def setup_parser_common() -> argparse.ArgumentParser:
         action="store_true",
         help="save training state (including optimizer states etc.) on train end even if --save_state is not specified"
         " / --save_stateが未指定時にもoptimizerなど学習状態も含めたstateを学習終了時に保存する",
+    )
+    parser.add_argument(
+        "--save_checkpoint_metadata",
+        action="store_true",
+        help="save a JSON metadata file alongside each checkpoint with loss, lr, step, epoch",
     )
 
     # SAI Model spec

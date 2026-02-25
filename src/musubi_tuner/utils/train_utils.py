@@ -1,4 +1,5 @@
 import argparse
+import json
 import logging
 import os
 import shutil
@@ -77,6 +78,21 @@ class LossRecorder:
     @property
     def moving_average(self) -> float:
         return self.loss_total / len(self.loss_list)
+
+
+def save_checkpoint_metadata(ckpt_file: str, metadata: dict) -> None:
+    """Save a JSON sidecar file alongside a checkpoint."""
+    json_path = os.path.splitext(ckpt_file)[0] + ".json"
+    clean = {k: v for k, v in metadata.items() if v is not None}
+    with open(json_path, "w") as f:
+        json.dump(clean, f, indent=2)
+
+
+def remove_checkpoint_metadata(ckpt_file: str) -> None:
+    """Remove JSON sidecar if it exists."""
+    json_path = os.path.splitext(ckpt_file)[0] + ".json"
+    if os.path.exists(json_path):
+        os.remove(json_path)
 
 
 def get_epoch_ckpt_name(model_name, epoch_no: int):
