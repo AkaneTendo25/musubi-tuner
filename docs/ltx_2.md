@@ -446,7 +446,7 @@ accelerate launch ... ltx2_train_network.py ^
 - `--audio_loss_balance_mode inv_freq`: Optional inverse-frequency reweighting for mixed audio/non-audio training.
 - `--audio_loss_balance_beta`: EMA update rate for observed audio-batch frequency (default: 0.01).
 - `--audio_loss_balance_eps`: Denominator floor for inverse-frequency scaling (default: 0.05).
-- `--audio_loss_balance_min`, `--audio_loss_balance_max`: Clamp range for effective audio weight (defaults: 1.0, 4.0).
+- `--audio_loss_balance_min`, `--audio_loss_balance_max`: Clamp range for effective audio weight (defaults: 0.05, 4.0).
 - `--audio_loss_balance_ema_init`: Initial audio-frequency EMA value (default: 1.0).
 
 Example:
@@ -455,7 +455,7 @@ Example:
 --audio_loss_balance_mode inv_freq ^
 --audio_loss_balance_beta 0.01 ^
 --audio_loss_balance_eps 0.05 ^
---audio_loss_balance_min 1.0 ^
+--audio_loss_balance_min 0.05 ^
 --audio_loss_balance_max 3.0
 ```
 
@@ -464,7 +464,7 @@ Use `inv_freq` when training mixes audio and non-audio samples and audio learnin
 Recommended start values:
 - `--audio_loss_balance_beta 0.01` (stable EMA, slower reaction; try `0.02-0.05` for faster reaction)
 - `--audio_loss_balance_eps 0.05` (safe floor; increase to `0.1` if weights spike too much)
-- `--audio_loss_balance_min 1.0 --audio_loss_balance_max 3.0` (conservative clamp range)
+- `--audio_loss_balance_min 0.05 --audio_loss_balance_max 3.0` (conservative clamp range)
 - `--audio_loss_balance_ema_init 1.0` (no warm-start boost; use `0.5` only if you want stronger early audio emphasis)
 
 #### Additional Audio Training Flags

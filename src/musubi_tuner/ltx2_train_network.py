@@ -1376,7 +1376,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
 
         audio_balance_beta = float(getattr(args, "audio_loss_balance_beta", 0.01))
         audio_balance_eps = float(getattr(args, "audio_loss_balance_eps", 0.05))
-        audio_balance_min = float(getattr(args, "audio_loss_balance_min", 1.0))
+        audio_balance_min = float(getattr(args, "audio_loss_balance_min", 0.05))
         audio_balance_max = float(getattr(args, "audio_loss_balance_max", 4.0))
         audio_balance_ema_init = float(getattr(args, "audio_loss_balance_ema_init", 1.0))
         audio_balance_target_ratio = float(getattr(args, "audio_loss_balance_target_ratio", 0.33))
@@ -4971,7 +4971,7 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
     parser.add_argument(
         "--audio_loss_balance_min",
         type=float,
-        default=1.0,
+        default=0.05,
         help="Minimum clamp for effective audio loss weight after inverse-frequency scaling.",
     )
     parser.add_argument(

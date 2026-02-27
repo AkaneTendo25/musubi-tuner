@@ -1901,7 +1901,7 @@ class NetworkTrainer:
         audio_loss_balance_mode = str(getattr(args, "audio_loss_balance_mode", "none") or "none").lower()
         audio_loss_balance_beta = float(getattr(args, "audio_loss_balance_beta", 0.01))
         audio_loss_balance_eps = float(getattr(args, "audio_loss_balance_eps", 0.05))
-        audio_loss_balance_min = float(getattr(args, "audio_loss_balance_min", 1.0))
+        audio_loss_balance_min = float(getattr(args, "audio_loss_balance_min", 0.05))
         audio_loss_balance_max = float(getattr(args, "audio_loss_balance_max", 4.0))
         audio_presence_ema = float(getattr(args, "audio_loss_balance_ema_init", 1.0))
         audio_presence_ema = min(max(audio_presence_ema, 1e-6), 1.0)
