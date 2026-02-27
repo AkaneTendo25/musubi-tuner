@@ -1,14 +1,64 @@
 # LTX-2
 
-Status: LTX-2 support is work in progress and may be incomplete or unstable.
+> [!WARNING]
+> LTX-2 support is work in progress and may be incomplete or unstable.
+> Development is tracked in [this issue](https://github.com/AkaneTendo25/musubi-tuner/issues/1).
 
-Development is tracked in [this issue](https://github.com/AkaneTendo25/musubi-tuner/issues/1).
+---
 
-This guide details the process for training LTX-2 LoRA models:
-1. **Caching Latents** (Video/Image + Audio)
-2. **Caching Text Encoder Outputs** (Prompts)
-3. **Training**
-4. **Slider LoRA Training** (Controllable direction sliders)
+## Table of Contents
+
+- [Installation](#installation)
+  - [CUDA Version](#cuda-version)
+- [Supported Dataset Types](#supported-dataset-types)
+- [1. Caching Latents](#1-caching-latents)
+  - [Latent Caching Command](#latent-caching-command)
+  - [Latent Caching Arguments](#latent-caching-arguments)
+  - [Latent Cache Output Files](#latent-cache-output-files)
+  - [Memory Optimization for Caching](#memory-optimization-for-caching)
+- [2. Caching Text Encoder Outputs](#2-caching-text-encoder-outputs)
+  - [Text Encoder Caching Arguments](#text-encoder-caching-arguments)
+  - [Text Encoder Output Files](#text-encoder-output-files)
+  - [Loading Gemma from a Single Safetensors File](#loading-gemma-from-a-single-safetensors-file)
+- [3. Training](#3-training)
+  - [Source-Free Training from Cache](#optional-source-free-training-from-cache)
+  - [Standard LoRA Training](#standard-lora-training)
+  - [Advanced: LyCORIS/LoKR Training](#advanced-lycorislokr-training)
+  - [Training Arguments](#training-arguments)
+    - [Memory Optimization](#memory-optimization)
+      - [Quantization Options](#quantization-options)
+      - [Other Memory Options](#other-memory-options)
+    - [Aggressive VRAM Optimization (8-16GB GPUs)](#aggressive-vram-optimization-8-16gb-gpus)
+    - [NF4 Quantization](#nf4-quantization)
+    - [Audio-Video Support](#audio-video-support)
+    - [Loss Weighting](#loss-weighting)
+    - [Additional Audio Training Flags](#additional-audio-training-flags)
+    - [Preservation & Regularization](#preservation--regularization)
+    - [CREPA (Cross-frame Representation Alignment)](#crepa-cross-frame-representation-alignment)
+      - [Caching DINOv2 Features (Dino Mode)](#caching-dinov2-features-dino-mode)
+    - [Timestep Sampling](#timestep-sampling)
+    - [LoRA Targets](#lora-targets)
+    - [IC-LoRA / Video-to-Video Training](#ic-lora--video-to-video-training)
+    - [Sampling with Tiled VAE](#sampling-with-tiled-vae)
+    - [Precached Sample Prompts](#precached-sample-prompts)
+    - [Two-Stage Sampling (WIP)](#two-stage-sampling-wip)
+    - [Checkpoint Output Format](#checkpoint-output-format)
+- [Merge LTX-2 LoRAs](#merge-ltx-2-loras)
+  - [LoRA Merge Arguments](#lora-merge-arguments)
+- [Dataset Configuration](#dataset-configuration)
+  - [Video Dataset Options](#video-dataset-options)
+  - [Example TOML](#example-toml)
+  - [Frame Rate (FPS) Handling](#frame-rate-fps-handling)
+- [Validation Datasets](#validation-datasets)
+- [Directory Structure](#directory-structure)
+- [Troubleshooting](#troubleshooting)
+- [4. Slider LoRA Training](#4-slider-lora-training)
+  - [4a. Text-Only Mode](#4a-text-only-mode)
+  - [4b. Reference Mode](#4b-reference-mode)
+  - [Slider Tips](#slider-tips)
+- [References](#references)
+
+---
 
 ## Installation
 
@@ -49,7 +99,7 @@ This step pre-processes media files into VAE latents to speed up training.
 
 **Script:** `ltx2_cache_latents.py`
 
-### Example Command
+### Latent Caching Command
 ```bash
 python ltx2_cache_latents.py ^
   --dataset_config dataset.toml ^
@@ -61,7 +111,7 @@ python ltx2_cache_latents.py ^
   --ltx2_audio_source video
 ```
 
-### Key Arguments
+### Latent Caching Arguments
 - `--ltx2_mode`, `--ltx_mode`: Caching modality selector. Default is video-only (`v`/`video`). Use `av` to cache both `*_ltx2.safetensors` (video) and `*_ltx2_audio.safetensors` (audio) latents.
 - `--ltx2_audio_source video|audio_files`: Use audio from the video or from external files.
 - `--ltx2_audio_dir`, `--ltx2_audio_ext`: Optional when using `--ltx2_audio_source audio_files` (default extension: `.wav`).
@@ -73,7 +123,7 @@ python ltx2_cache_latents.py ^
 - `--vae_dtype`: Data type for VAE latents (default comes from the cache script).
 - `--save_dataset_manifest`: Optional. Saves a cache-only dataset manifest for source-free training.
 
-### Output Files
+### Latent Cache Output Files
 
 | File Pattern | Contents |
 |--------------|----------|
@@ -115,7 +165,7 @@ This step pre-computes text embeddings using the Gemma text encoder.
 
 **Script:** `ltx2_cache_text_encoder_outputs.py`
 
-### Example Command
+### Text Encoder Caching Command
 ```bash
 python ltx2_cache_text_encoder_outputs.py ^
   --dataset_config dataset.toml ^
@@ -128,16 +178,18 @@ python ltx2_cache_text_encoder_outputs.py ^
   --batch_size 1
 ```
 
-### Key Arguments
+### Text Encoder Caching Arguments
 - `--gemma_root`: Path to the local Gemma model folder (HuggingFace format). Required unless `--gemma_safetensors` is used.
 - `--gemma_safetensors`: Path to a single Gemma `.safetensors` file (e.g. an FP8 export from ComfyUI). Loads weights, config, and tokenizer from one file — no `--gemma_root` needed. See [Loading Gemma from a Single Safetensors File](#loading-gemma-from-a-single-safetensors-file) below.
 - `--gemma_load_in_8bit`: Loads Gemma in 8-bit quantization. Cannot be combined with `--gemma_safetensors`.
 - `--gemma_load_in_4bit`: Loads Gemma in 4-bit quantization. Cannot be combined with `--gemma_safetensors`.
 - `--ltx2_checkpoint`: Required. Use `--ltx2_text_encoder_checkpoint` to override for text encoder connector weights.
-- `--ltx2_mode`, `--ltx_mode`: MUST match the mode used in latent caching. Default is video-only (`v`/`video`); use `av` to concatenate video and audio prompt embeddings.
 - 8-bit/4-bit loading requires `--device cuda`.
 
-### Output Files
+> [!IMPORTANT]
+> `--ltx2_mode` / `--ltx_mode` **must match** the mode used during latent caching. Default is `video`; use `av` to concatenate video and audio prompt embeddings.
+
+### Text Encoder Output Files
 
 | File Pattern | Contents |
 |--------------|----------|
@@ -265,7 +317,7 @@ accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 ltx2_tr
 
 `--lycoris_config` requires `--network_module lycoris.kohya`.
 
-### Key Arguments
+### Training Arguments
 
 #### Memory Optimization
 
@@ -286,15 +338,18 @@ NF4 has ~4x higher weight error than FP8 (cosine 0.996 vs 0.9997). The base mode
 - `--nf4_base`: NF4 4-bit quantization (~10 GB VRAM). Mutually exclusive with `--fp8_base`. See [NF4 Quantization](#nf4-quantization) below.
 
 ##### Other Memory Options
-- `--blocks_to_swap X`: Offloads X transformer blocks to CPU (max 47 for 48-block model). Higher values save more VRAM but increase CPU↔GPU overhead.
-- `--use_pinned_memory_for_block_swap`: Uses pinned memory for faster CPU↔GPU block transfers.
-- `--gradient_checkpointing`: Reduces VRAM by recomputing activations during backward pass.
-- `--gradient_checkpointing_cpu_offload`: Offloads activations to CPU during gradient checkpointing recomputation.
-- `--ffn_chunk_target all|video|audio`: Enable FFN chunking for selected modules. Reduces VRAM by processing FFN in chunks.
-- `--ffn_chunk_size N`: Chunk size for FFN chunking (0 disables).
-- `--split_attn_target none|all|self|cross|text_cross|av_cross|video|audio`: Enable split attention for selected attention modules.
-- `--split_attn_mode batch|query`: Split attention by batch dimension or query length.
-- `--split_attn_chunk_size N`: Chunk size for query-based split attention (0 uses default 1024).
+
+| Argument | Description |
+|----------|-------------|
+| `--blocks_to_swap X` | Offload X transformer blocks to CPU (max 47 for 48-block model). Higher = more VRAM saved, more CPU↔GPU overhead |
+| `--use_pinned_memory_for_block_swap` | Use pinned memory for faster CPU↔GPU block transfers |
+| `--gradient_checkpointing` | Reduce VRAM by recomputing activations during backward pass |
+| `--gradient_checkpointing_cpu_offload` | Offload activations to CPU during gradient checkpointing |
+| `--ffn_chunk_target` | `all`, `video`, or `audio` — enable FFN chunking for selected modules |
+| `--ffn_chunk_size N` | Chunk size for FFN chunking (0 = disabled) |
+| `--split_attn_target` | `none`, `all`, `self`, `cross`, `text_cross`, `av_cross`, `video`, `audio` — split attention target modules |
+| `--split_attn_mode` | `batch` or `query` — split by batch dimension or query length |
+| `--split_attn_chunk_size N` | Chunk size for query-based split attention (0 = default 1024) |
 
 #### Aggressive VRAM Optimization (8-16GB GPUs)
 
@@ -458,7 +513,8 @@ All three can be combined:
 | `--dop` | +2 | +1 | 0.5 - 1.0 |
 | `--prior_divergence` | +1 | 0 | 0.05 - 0.1 |
 
-**VRAM note:** Each technique adds transformer forward passes per step. Using all three adds +5 forwards and +2 backwards, increasing VRAM usage and step time proportionally.
+> [!CAUTION]
+> Each preservation technique adds transformer forward passes per step. Using all three adds +5 forwards and +2 backwards, increasing VRAM usage and step time proportionally.
 
 **CREPA (Cross-frame Representation Alignment)** — Encourages temporal consistency across video frames by aligning DiT hidden states across frames via a small projector MLP. Based on [arxiv 2506.09229](https://arxiv.org/abs/2506.09229). Only the projector is trained; all other modules stay frozen. CREPA uses hooks to capture intermediate features from the existing forward pass (no extra forward passes).
 
@@ -551,8 +607,9 @@ The cache file is saved to `<cache_directory>/ltx2_preservation_cache.pt` by def
 - `--logit_std`: Standard deviation for the logit-normal distribution (default: 1.0). Only used with `shifted_logit_normal`.
 - `--min_timestep` / `--max_timestep`: Optional timestep range constraints.
 
-**Note:** The `shifted_logit_normal` shift is linearly interpolated from 0.95 (at 1024 tokens) to 2.05 (at 4096 tokens) based on sequence length.
-In `--ltx2_mode audio`, `shifted_logit_normal` uses the sequence length derived during latent caching (from audio duration + target resolution/FPS).
+> [!NOTE]
+> The `shifted_logit_normal` shift is linearly interpolated from 0.95 (at 1024 tokens) to 2.05 (at 4096 tokens) based on sequence length.
+> In `--ltx2_mode audio`, `shifted_logit_normal` uses the sequence length derived during latent caching (from audio duration + target resolution/FPS).
 
 #### LoRA Targets
 Use `--lora_target_preset` to control which layers LoRA targets:
@@ -716,14 +773,17 @@ The `--sample_include_reference` flag shows the reference side-by-side with the 
 - **Two-stage inference**: Not supported with V2V; a warning is emitted and the reference is ignored.
 
 #### Sampling with Tiled VAE
-- `--sample_tiled_vae`: Enable tiled VAE decoding during sampling to reduce VRAM usage.
-- `--sample_vae_tile_size 512`: Spatial tile size.
-- `--sample_vae_tile_overlap 64`: Spatial overlap (pixels).
-- `--sample_vae_temporal_tile_size 0`: Temporal tile size (0 disables temporal tiling).
-- `--sample_vae_temporal_tile_overlap 8`: Temporal overlap (frames).
-- `--sample_merge_audio`: Merges generated audio into the `.mp4`.
-- `--sample_audio_only`: Generate audio-only preview outputs.
-- `--sample_disable_audio`: Disable audio preview generation during sampling.
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--sample_tiled_vae` | off | Enable tiled VAE decoding during sampling to reduce VRAM |
+| `--sample_vae_tile_size` | 512 | Spatial tile size (pixels) |
+| `--sample_vae_tile_overlap` | 64 | Spatial tile overlap (pixels) |
+| `--sample_vae_temporal_tile_size` | 0 | Temporal tile size in frames (0 = disabled) |
+| `--sample_vae_temporal_tile_overlap` | 8 | Temporal tile overlap (frames) |
+| `--sample_merge_audio` | off | Merge generated audio into the output `.mp4` |
+| `--sample_audio_only` | off | Generate audio-only preview outputs |
+| `--sample_disable_audio` | off | Disable audio preview generation during sampling |
 
 #### Precached Sample Prompts
 To avoid loading Gemma during training for sample generation, you can precache the prompt embeddings:
@@ -733,22 +793,28 @@ To avoid loading Gemma during training for sample generation, you can precache t
 - `--sample_prompts_cache`: Path to the precached embeddings file. Defaults to `<cache_directory>/ltx2_sample_prompts_cache.pt`.
 
 #### Two-Stage Sampling (WIP)
-Two-stage inference generates at half resolution, then upsamples and refines. This feature is work in progress. Disabled by default.
 
-- `--sample_two_stage`: Enable two-stage inference during sampling.
-- `--spatial_upsampler_path`: Path to spatial upsampler model (e.g., `ltx-2-spatial-upscaler-x2-1.0.safetensors`). Required when `--sample_two_stage` is set.
-- `--distilled_lora_path`: Path to distilled LoRA (e.g., `ltx-2-19b-distilled-lora-384.safetensors`) for stage 2 refinement. Optional.
-- `--sample_stage2_steps`: Number of denoising steps for stage 2 refinement (default: 3).
+> [!NOTE]
+> This feature is work in progress and disabled by default. Two-stage inference generates at half resolution, then upsamples and refines.
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--sample_two_stage` | off | Enable two-stage inference during sampling |
+| `--spatial_upsampler_path` | — | Path to spatial upsampler model. Required when `--sample_two_stage` is set |
+| `--distilled_lora_path` | — | Path to distilled LoRA for stage 2 refinement. Optional |
+| `--sample_stage2_steps` | 3 | Number of denoising steps for stage 2 |
 
 #### Checkpoint Output Format
 
-Saved LoRA checkpoints are converted to ComfyUI format by default. The original musubi-tuner format is deleted after conversion.
+Saved LoRA checkpoints are converted to ComfyUI format by default. Both the original musubi-tuner format and the ComfyUI format are kept.
 
 | Flag | Behavior |
 |------|----------|
-| *(default)* | Saves `*_comfy.safetensors` only. Original is deleted after conversion. |
-| `--save_original_lora` | Keeps both `*_comfy.safetensors` and the original `*.safetensors`. |
+| *(default)* | Saves both `*.safetensors` (original) and `*_comfy.safetensors` (ComfyUI). |
+| `--no_save_original_lora` | Deletes the original after conversion, keeping only `*_comfy.safetensors`. |
 | `--no_convert_to_comfy` | Saves only the original `*.safetensors` (no conversion). |
+
+> **Important:** Training can only be resumed from the **original** (non-comfy) checkpoint format. If you plan to use `--resume`, do not use `--no_save_original_lora`.
 
 Checkpoint rotation (`--save_last_n_ckpts`) cleans up old ComfyUI checkpoints alongside originals. HuggingFace upload (`--huggingface_repo_id`) uploads only the ComfyUI checkpoint unless `--save_original_lora` is set.
 
@@ -768,7 +834,7 @@ python ltx2_merge_lora.py ^
   --save_merged_lora path/to/merged_lora.safetensors
 ```
 
-### Key Arguments
+### LoRA Merge Arguments
 - `--lora_weight`: Input LoRA paths to merge in order (required).
 - `--lora_multiplier`: Per-LoRA multipliers aligned with `--lora_weight`. Use one value to apply the same multiplier to all inputs.
 - `--save_merged_lora`: Output merged LoRA path (required).
@@ -1000,13 +1066,14 @@ reference_cache_directory/                  # IC-LoRA only
 | Audio caching fails | torchaudio missing | Install torchaudio before running `ltx2_cache_latents.py` |
 | Sampling OOM | VAE decode too large | Enable `--sample_tiled_vae` or reduce `--sample_vae_temporal_tile_size` |
 | Crash with block swap (esp. RTX 5090) | `--use_pinned_memory_for_block_swap` bug | Remove `--use_pinned_memory_for_block_swap` from training arguments |
-| `stack expects each tensor to be equal size` during AV training | Mixed audio/non-audio videos in the same batch — text embeddings are 7680-dim for AV items vs 3840-dim for video-only, and `torch.stack` fails | Add `--separate_audio_buckets` to training args. This is **required** when your dataset has a mix of videos with and without audio at `batch_size > 1`. At `batch_size=1` the flag has no effect. When all videos have audio (or all don't), the flag is also unnecessary |
+| `stack expects each tensor to be equal size` during AV training | Mixed audio/non-audio videos in the same batch — text embeddings are 7680-dim for AV items vs 3840-dim for video-only, and `torch.stack` fails | Add `--separate_audio_buckets` to training args. Required when your dataset mixes videos with and without audio at `batch_size > 1`. At `batch_size=1` it has no effect. |
 | Wrong frame count in cached latents | Auto-detected FPS incorrect (e.g., VFR video) | Set `source_fps` explicitly in TOML config to override auto-detection |
-| Too few frames from high-FPS video | FPS resampling working correctly (e.g., 60fps→25fps = 42% of frames) | This is expected behavior. Set `target_fps = 60` if you want to keep all frames |
+| Too few frames from high-FPS video | FPS resampling working correctly (e.g., 60fps→25fps = 42% of frames) | Expected behavior. Set `target_fps = 60` if you want to keep all frames |
 | Audio/video out of sync after caching | Source FPS mismatch causing wrong time-stretch | Check "Auto-detected source FPS" log line; set `source_fps` explicitly if wrong |
-| Voice/audio learning slow when mixing images with videos in AV mode | Image batches produce zero audio training signal — the entire audio branch is skipped (no audio forward pass, no audio loss, no audio gradients). This dilutes audio learning proportionally to the fraction of image steps | Use video-only datasets for AV training when voice quality matters. If you must mix images, expect audio to require proportionally more training steps to converge |
-| No audio during sampling in video training mode | `ltx2_mode` is set to `v`/`video` | This is expected behavior. The sampler automatically bypasses loading the audio vocoder/decoder to save memory when the architecture is instantiated as video-only. To generate audio during sampling, you must train in AV mode (`--ltx2_mode av` or `audio`). |
-| CUDA errors or crashes on RTX 5090 / 50xx GPUs | CUDA 12.6 (`cu126`) is not supported on Windows for Blackwell-architecture GPUs | Use CUDA 12.8 (`cu128`) when installing PyTorch: `pip install torch==2.8.0 ... --index-url https://download.pytorch.org/whl/cu128`. See the [CUDA Version](#cuda-version) section under Installation |
+| Voice/audio learning slow when mixing images with videos in AV mode | Image batches produce zero audio training signal — audio branch is skipped entirely. Dilutes audio learning proportionally to image step fraction | Use video-only datasets for AV training when voice quality matters |
+| No audio during sampling in video training mode | `ltx2_mode` is set to `v`/`video` | Expected behavior. Train in AV mode (`--ltx2_mode av` or `audio`) to generate audio during sampling |
+| Cannot resume training from checkpoint | Using a `*_comfy.safetensors` checkpoint with `--resume` | Training can only be resumed from the **original** (non-comfy) LoRA format. Use the `*.safetensors` file without the `_comfy` suffix. If you used `--no_save_original_lora`, you must retrain from scratch. |
+| CUDA errors or crashes on RTX 5090 / 50xx GPUs | CUDA 12.6 (`cu126`) not supported on Windows for Blackwell GPUs | Use CUDA 12.8: `pip install torch==2.8.0 ... --index-url https://download.pytorch.org/whl/cu128`. See [CUDA Version](#cuda-version) |
 
 ---
 

@@ -2576,7 +2576,7 @@ class NetworkTrainer:
             # Call post-save hook for architecture-specific processing
             self.post_save_checkpoint_hook(args, ckpt_file, ckpt_name, accelerator, force_sync_upload)
 
-            upload_original = (not getattr(args, "convert_to_comfy", False)) or getattr(args, "save_original_lora", False)
+            upload_original = (not getattr(args, "convert_to_comfy", True)) or getattr(args, "save_original_lora", True)
             if args.huggingface_repo_id is not None and upload_original:
                 huggingface_utils.upload(args, ckpt_file, "/" + ckpt_name, force_sync_upload=force_sync_upload)
 
@@ -2609,7 +2609,7 @@ class NetworkTrainer:
             if os.path.exists(old_ckpt_file):
                 accelerator.print(f"removing old checkpoint: {old_ckpt_file}")
                 os.remove(old_ckpt_file)
-            if getattr(args, "convert_to_comfy", False):
+            if getattr(args, "convert_to_comfy", True):
                 comfy_old_ckpt_file = old_ckpt_file.replace(".safetensors", "_comfy.safetensors")
                 if os.path.exists(comfy_old_ckpt_file):
                     accelerator.print(f"removing old Comfy checkpoint: {comfy_old_ckpt_file}")

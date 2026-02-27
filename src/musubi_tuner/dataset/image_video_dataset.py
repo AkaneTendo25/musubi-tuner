@@ -828,12 +828,23 @@ def load_video(
         except Exception:
             pass  # detection failed, fall through to no-conversion branch
 
-    # skip resampling when source and target FPS are nearly equal (within 1%)
+    # skip resampling when source and target FPS are nearly equal
+    # ceil the source FPS so that e.g. 23.976 -> 24, then compare against target (25): diff=1, skip
+    from musubi_tuner.ltx_2.env import get_ltx2_env
+
+    fps_threshold = get_ltx2_env().fps_resampling_threshold
     needs_resampling = (
         source_fps is not None
         and target_fps is not None
-        and abs(source_fps - target_fps) / max(source_fps, target_fps) > 0.01
+        and abs(math.ceil(source_fps) - target_fps) > fps_threshold
     )
+
+    if not needs_resampling and source_fps is not None and target_fps is not None and source_fps != target_fps:
+        logger.info(
+            f"Skipping FPS resampling for {os.path.basename(video_path)}: "
+            f"source {source_fps:.3f} FPS within threshold of target {target_fps:.1f} FPS "
+            f"(ceil={math.ceil(source_fps)}, diff={abs(math.ceil(source_fps) - target_fps)}, threshold={fps_threshold})"
+        )
 
     if not needs_resampling:
         if os.path.isfile(video_path):

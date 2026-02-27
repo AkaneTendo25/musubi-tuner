@@ -3677,7 +3677,21 @@ def main() -> None:
                     has_effective_reg = True
                 if has_effective_reg:
                     logs["motion/effective_regularization"] = effective_reg_value
-                progress_bar.set_postfix(**logs)
+                progress_logs: dict[str, Any] = {
+                    "loss": logs.get("loss"),
+                    "lr": logs.get("lr"),
+                }
+                if "motion/pres_weighted" in logs:
+                    progress_logs["m"] = logs["motion/pres_weighted"]
+                if "motion/attn_weighted" in logs:
+                    progress_logs["a"] = logs["motion/attn_weighted"]
+                if "ewc" in logs:
+                    progress_logs["e"] = logs["ewc"]
+                if "ewc/used_tensors" in logs:
+                    progress_logs["eu"] = logs["ewc/used_tensors"]
+                if "ewc/skipped_tensors" in logs:
+                    progress_logs["es"] = logs["ewc/skipped_tensors"]
+                progress_bar.set_postfix(**progress_logs)
                 accelerator.log(logs, step=global_step)
 
                 # Run validation at step intervals

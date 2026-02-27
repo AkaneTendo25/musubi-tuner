@@ -1348,8 +1348,8 @@ class LTX2NetworkTrainer(NetworkTrainer):
             if getattr(args, "fp8_upcast", False):
                 raise ValueError("--fp8_w8a8 and --fp8_upcast are mutually exclusive")
 
-        if getattr(args, "save_original_lora", False) and not getattr(args, "convert_to_comfy", True):
-            logger.warning("--save_original_lora has no effect with --no_convert_to_comfy.")
+        if getattr(args, "save_original_lora", True) and not getattr(args, "convert_to_comfy", True):
+            logger.info("--no_convert_to_comfy is set; original LoRA is always saved (--save_original_lora has no extra effect).")
 
         if self.dit_dtype == torch.float16:
             assert args.mixed_precision in ["fp16", "no"], "LTX-2 weights are fp16; mixed precision must be fp16 or no"
@@ -1504,11 +1504,11 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 from musubi_tuner.utils import huggingface_utils
                 huggingface_utils.upload(args, comfy_ckpt_file, "/" + comfy_ckpt_name, force_sync_upload=force_sync_upload)
 
-            if not getattr(args, "save_original_lora", False):
+            if not getattr(args, "save_original_lora", True):
                 if os.path.exists(ckpt_file):
                     try:
-                        os.remove(ckpt_file)  # default: keep only ComfyUI LoRA
-                        accelerator.print(f"Removed original LoRA checkpoint (Comfy-only default): {ckpt_file}")
+                        os.remove(ckpt_file)  # --no_save_original_lora: keep only ComfyUI LoRA
+                        accelerator.print(f"Removed original LoRA checkpoint (--no_save_original_lora): {ckpt_file}")
                     except Exception as e:
                         accelerator.print(f"Warning: Failed to remove original checkpoint '{ckpt_file}': {e}")
         except Exception as e:
@@ -5316,13 +5316,20 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         dest="convert_to_comfy",
         default=True,
         help="Disable automatic conversion of saved LoRA to ComfyUI format. "
-             "By default, checkpoints are converted and only *_comfy.safetensors is kept.",
+             "By default, both original and ComfyUI checkpoints are saved.",
     )
     parser.add_argument(
         "--save_original_lora",
         action="store_true",
-        help="Also keep the original non-Comfy LoRA alongside the ComfyUI-converted checkpoint. "
-             "Default behavior is Comfy-only when conversion is enabled.",
+        default=True,
+        help="(Default: True) Keep the original non-Comfy LoRA alongside the ComfyUI-converted checkpoint. "
+             "Use --no_save_original_lora to disable.",
+    )
+    parser.add_argument(
+        "--no_save_original_lora",
+        action="store_false",
+        dest="save_original_lora",
+        help="Delete the original LoRA after ComfyUI conversion, keeping only *_comfy.safetensors.",
     )
 
     # -- Preservation / regularization flags --

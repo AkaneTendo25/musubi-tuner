@@ -201,6 +201,11 @@ class LTX2Env:
     # recommended=False | old SHA=False | current=False
     skip_noop_attn_mask: bool = False
 
+    # Max FPS difference (after ceiling source FPS) below which resampling is skipped.
+    # e.g. threshold=1: 23.976->ceil=24 vs 25, diff=1, skip. 30 vs 25, diff=5, resample.
+    # recommended=1 | old SHA=N/A | current=1
+    fps_resampling_threshold: int = 1
+
 
 DEFAULT_ENV = LTX2Env()
 
