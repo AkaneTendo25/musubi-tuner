@@ -3273,16 +3273,17 @@ class LTX2NetworkTrainer(NetworkTrainer):
             getattr(args, "precache_sample_prompts", False)
         )
 
-        # Pre-load audio components only in NON-offloading mode (high VRAM)
-        # With offloading: audio will be loaded lazily during decode phase when transformer is on CPU
-        # Without offloading: pre-load to GPU since everything fits in VRAM
+        # Pre-load audio components only in NON-offloading mode without subprocess (high VRAM)
+        # With subprocess (default): audio decoded in separate process, no in-process loading needed
+        # With offloading: audio will be decoded via subprocess during decode phase
         audio_decoder = None
         vocoder = None
+        use_audio_subprocess = bool(getattr(args, "sample_audio_subprocess", True))
         disable_audio_preview = bool(getattr(args, "sample_disable_audio", False))
         audio_only_preview = bool(getattr(args, "sample_audio_only", False))
         enable_audio_preview = (self._audio_video or audio_only_preview) and not disable_audio_preview
-        if not transformer_offloaded and enable_audio_preview and getattr(args, "ltx_mode", "video") in {"av", "audio"}:
-            # High VRAM mode: pre-load audio to GPU
+        if not transformer_offloaded and not use_audio_subprocess and enable_audio_preview and getattr(args, "ltx_mode", "video") in {"av", "audio"}:
+            # High VRAM mode without subprocess: pre-load audio to GPU
             audio_dtype = torch.bfloat16 if args.vae_dtype is None else model_utils.str_to_dtype(args.vae_dtype)
             try:
                 audio_decoder, vocoder = self._load_audio_components(
@@ -3771,18 +3772,19 @@ class LTX2NetworkTrainer(NetworkTrainer):
         # Use pre-loaded audio components if provided, otherwise load here (fallback for non-offload mode)
         loaded_audio = False
         disable_audio_preview = bool(getattr(args, "sample_disable_audio", False))
-        use_audio_subprocess = False
+        use_audio_subprocess = bool(getattr(args, "sample_audio_subprocess", True))
         audio_only_preview = bool(getattr(args, "sample_audio_only", False))
         if audio_only_preview and getattr(args, "ltx_mode", "video") not in {"av", "audio"}:
             raise ValueError("--sample_audio_only requires --ltx2_mode av or audio")
         enable_audio_preview = (self._audio_video or audio_only_preview) and not disable_audio_preview
 
         # Only load audio components here if NOT in offloading mode and not pre-loaded
-        # In offloading mode, audio is loaded lazily during decode phase (after transformer is on CPU)
+        # In offloading mode with subprocess enabled (default), audio is decoded in a subprocess.
+        # With --no-sample_audio_subprocess, audio is loaded lazily in-process during decode phase.
         sample_with_offloading = bool(getattr(args, "sample_with_offloading", False))
         if audio_decoder is None and vocoder is None and enable_audio_preview and getattr(args, "ltx_mode", "video") in {"av", "audio"}:
-            if not sample_with_offloading:
-                # High VRAM mode: load audio to GPU now (everything fits)
+            if not sample_with_offloading and not use_audio_subprocess:
+                # High VRAM mode without subprocess: load audio to GPU now (everything fits)
                 audio_dtype = torch.bfloat16 if args.vae_dtype is None else model_utils.str_to_dtype(args.vae_dtype)
                 try:
                     audio_decoder, vocoder = self._load_audio_components(
@@ -3796,7 +3798,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
                     logger.warning("Sampling audio decoder load failed; continuing without audio preview: %s", exc)
                     audio_decoder, vocoder = None, None
                     loaded_audio = False
-            # else: offloading mode - audio will be loaded lazily during decode phase
+            # else: subprocess mode or offloading mode - audio will be decoded later
 
         sample_steps = sample_parameter.get("sample_steps", 20)
         width = sample_parameter.get("width", 768)
@@ -4481,29 +4483,25 @@ class LTX2NetworkTrainer(NetworkTrainer):
         audio_waveform = None
         loaded_audio_lazily = False
         if audio_latents is not None:
-            # Lazy-load audio components in offloading mode (they weren't pre-loaded to save RAM)
-            if audio_decoder is None and vocoder is None and offload_transformer_for_decode:
-                # Move VAE to CPU first to free GPU memory for audio decoder/vocoder
-                logger.info("Sampling offload: moving VAE to CPU before audio decoder load")
-                vae.to_device(original_vae_device)
-                clean_memory_on_device(transformer_device)
-
-                audio_dtype = torch.bfloat16 if args.vae_dtype is None else model_utils.str_to_dtype(args.vae_dtype)
-                try:
-                    logger.info("Sampling offload: lazy-loading audio decoder/vocoder to GPU")
-                    audio_decoder, vocoder = self._load_audio_components(
-                        args,
-                        audio_dtype=audio_dtype,
+            # When no audio decoder/vocoder is loaded (subprocess mode or offloading),
+            # decode audio in a separate process to avoid native crashes / OOM segfaults.
+            if audio_decoder is None and vocoder is None:
+                if audio_output_path and enable_audio_preview:
+                    logger.info("Sampling: decoding audio via subprocess (safe for low VRAM)")
+                    if offload_transformer_for_decode:
+                        vae.to_device(original_vae_device)
+                        clean_memory_on_device(transformer_device)
+                    self._decode_audio_preview_subprocess(
+                        audio_latents=audio_latents,
+                        output_path=audio_output_path,
                         checkpoint_path=args.ltx2_checkpoint,
-                        device=transformer_device,
                     )
-                    loaded_audio_lazily = True
-                except Exception as exc:
-                    logger.warning("Sampling audio decoder load failed; skipping audio decode: %s", exc)
+                    # audio_waveform stays None — the .wav was written by the subprocess
+                else:
+                    logger.info("Sampling: skipping audio decode (no output path or audio preview disabled)")
 
-            if audio_decoder is not None and vocoder is not None:
+            elif audio_decoder is not None and vocoder is not None:
                 if offload_transformer_for_decode:
-                    # Ensure VAE is on CPU (may already be if we lazy-loaded above)
                     vae.to_device(original_vae_device)
                     clean_memory_on_device(transformer_device)
 
@@ -5343,6 +5341,17 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         help=(
             "Use official-style I2V token timestep masking during sampling "
             "(conditioned first-frame tokens use timestep=0 via video_conditioning_mask)."
+        ),
+    )
+    parser.add_argument(
+        "--sample_audio_subprocess",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Decode audio previews in a separate subprocess (default: enabled). "
+            "This prevents native crashes / OOM segfaults when loading the audio "
+            "decoder on low-VRAM GPUs. Use --no-sample_audio_subprocess to decode "
+            "audio in-process (requires enough GPU memory for audio decoder + vocoder)."
         ),
     )
     parser.add_argument(
