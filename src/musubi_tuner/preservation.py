@@ -82,9 +82,12 @@ class PreservationConfig:
     prior_divergence: bool = False
     prior_divergence_multiplier: float = 0.1
 
+    audio_dop: bool = False
+    audio_dop_multiplier: float = 1.0
+
     @property
     def any_active(self) -> bool:
-        return self.blank_preservation or self.dop or self.prior_divergence
+        return self.blank_preservation or self.dop or self.prior_divergence or self.audio_dop
 
     @property
     def needs_text_encoding(self) -> bool:
@@ -336,6 +339,86 @@ class PreservationHelper:
 
         # cleanup
         del prior_pred, pres_pred, pres_loss, pres_embed, pres_mask, pres_inputs
+        clean_memory_on_device(device)
+
+        return loss_val
+
+    # -- audio DOP (preserve audio predictions on non-audio steps) ----------
+
+    def compute_audio_dop_backward(
+        self,
+        trainer: Any,
+        transformer: torch.nn.Module,
+        network: torch.nn.Module,
+        accelerator: Accelerator,
+        av_inputs: Dict[str, Any],
+        network_dtype: torch.dtype,
+    ) -> float:
+        """Two-forward audio DOP: run transformer with AV inputs, compare audio predictions
+        between LoRA OFF (prior) and LoRA ON.  MSE on audio branch only × multiplier.
+        Returns loss float."""
+        mult = self.config.audio_dop_multiplier
+        device = accelerator.device
+
+        # (a) no-grad forward, LoRA OFF -> extract audio prior
+        self._prepare_block_swap(transformer, accelerator)
+        network.set_multiplier(0.0)
+        try:
+            with torch.no_grad(), accelerator.autocast():
+                prior_pred = transformer(
+                    av_inputs["model_input"],
+                    timestep=av_inputs["model_timesteps"],
+                    audio_timestep=av_inputs["audio_timestep"],
+                    context=av_inputs["text_embeds"],
+                    attention_mask=av_inputs["text_mask"],
+                    frame_rate=av_inputs["frame_rate"],
+                    transformer_options=av_inputs["transformer_options"],
+                )
+            if not isinstance(prior_pred, (list, tuple)) or len(prior_pred) < 2:
+                logger.warning("Audio DOP: transformer did not return [video, audio] — skipping.")
+                return 0.0
+            audio_prior = prior_pred[1].detach()
+            del prior_pred
+        finally:
+            network.set_multiplier(1.0)
+
+        # (b) with-grad forward, LoRA ON -> extract audio prediction
+        self._prepare_block_swap(transformer, accelerator)
+        with accelerator.autocast():
+            lora_pred = transformer(
+                av_inputs["model_input"],
+                timestep=av_inputs["model_timesteps"],
+                audio_timestep=av_inputs["audio_timestep"],
+                context=av_inputs["text_embeds"],
+                attention_mask=av_inputs["text_mask"],
+                frame_rate=av_inputs["frame_rate"],
+                transformer_options=av_inputs["transformer_options"],
+            )
+        if not isinstance(lora_pred, (list, tuple)) or len(lora_pred) < 2:
+            logger.warning("Audio DOP: transformer did not return [video, audio] — skipping.")
+            del audio_prior
+            clean_memory_on_device(device)
+            return 0.0
+        audio_lora = lora_pred[1]
+        del lora_pred
+
+        # (c) MSE on audio predictions × multiplier
+        adop_loss = F.mse_loss(audio_lora.float(), audio_prior.float()) * mult
+
+        # (d) NaN guard
+        if not torch.isfinite(adop_loss):
+            logger.warning("Audio DOP loss is non-finite (%.4g), skipping backward.", adop_loss.item())
+            del audio_prior, audio_lora, adop_loss
+            clean_memory_on_device(device)
+            return float("nan")
+
+        # (e) separate backward
+        accelerator.backward(adop_loss)
+
+        loss_val = adop_loss.detach().item()
+
+        # cleanup
+        del audio_prior, audio_lora, adop_loss
         clean_memory_on_device(device)
 
         return loss_val

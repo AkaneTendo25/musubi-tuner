@@ -2610,7 +2610,7 @@ class NetworkTrainer:
                 accelerator.print(f"removing old checkpoint: {old_ckpt_file}")
                 os.remove(old_ckpt_file)
             if getattr(args, "convert_to_comfy", True):
-                comfy_old_ckpt_file = old_ckpt_file.replace(".safetensors", "_comfy.safetensors")
+                comfy_old_ckpt_file = old_ckpt_file.replace(".safetensors", ".comfy.safetensors")
                 if os.path.exists(comfy_old_ckpt_file):
                     accelerator.print(f"removing old Comfy checkpoint: {comfy_old_ckpt_file}")
                     os.remove(comfy_old_ckpt_file)

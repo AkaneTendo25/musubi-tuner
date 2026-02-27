@@ -675,15 +675,28 @@ class LTX2NetworkTrainer(NetworkTrainer):
         blank = getattr(args, "blank_preservation", False)
         dop = getattr(args, "dop", False)
         prior_div = getattr(args, "prior_divergence", False)
+        audio_dop = getattr(args, "audio_dop", False)
 
-        if not (blank or dop or prior_div):
+        if not (blank or dop or prior_div or audio_dop):
             return
 
         from musubi_tuner.preservation import PreservationConfig, PreservationHelper, parse_preservation_args
 
+        # Validate audio_dop requirements
+        if audio_dop:
+            if self._ltx_mode != "av":
+                raise ValueError("--audio_dop requires --ltx2_mode av (audio-video mode)")
+            if getattr(args, "audio_silence_regularizer", False):
+                logger.warning(
+                    "Both --audio_dop and --audio_silence_regularizer are active. "
+                    "The silence regularizer converts non-audio batches to audio batches, "
+                    "so audio DOP will never fire. These are mutually exclusive."
+                )
+
         blank_kw = parse_preservation_args(getattr(args, "blank_preservation_args", None))
         dop_kw = parse_preservation_args(getattr(args, "dop_args", None))
         prior_kw = parse_preservation_args(getattr(args, "prior_divergence_args", None))
+        audio_dop_kw = parse_preservation_args(getattr(args, "audio_dop_args", None))
 
         cfg = PreservationConfig(
             blank_preservation=blank,
@@ -693,6 +706,8 @@ class LTX2NetworkTrainer(NetworkTrainer):
             dop_class_prompt=dop_kw.get("class", ""),
             prior_divergence=prior_div,
             prior_divergence_multiplier=float(prior_kw.get("multiplier", 0.1)),
+            audio_dop=audio_dop,
+            audio_dop_multiplier=float(audio_dop_kw.get("multiplier", 1.0)),
         )
 
         # Warn about DOP without class prompt (acts identical to blank preservation)
@@ -719,16 +734,21 @@ class LTX2NetworkTrainer(NetworkTrainer):
             extra_bwd += 1
         if prior_div:
             extra_fwd += 1  # no-grad OFF only
+        if audio_dop:
+            extra_fwd += 2  # no-grad OFF + with-grad ON (non-audio steps only)
+            extra_bwd += 1
         logger.info(
-            "Preservation enabled: blank=%s (x%.2f), dop=%s (class=%r, x%.2f), prior_div=%s (x%.3f)",
+            "Preservation enabled: blank=%s (x%.2f), dop=%s (class=%r, x%.2f), prior_div=%s (x%.3f), audio_dop=%s (x%.2f)",
             cfg.blank_preservation, cfg.blank_multiplier,
             cfg.dop, cfg.dop_class_prompt, cfg.dop_multiplier,
             cfg.prior_divergence, cfg.prior_divergence_multiplier,
+            cfg.audio_dop, cfg.audio_dop_multiplier,
         )
         logger.warning(
             "Preservation adds +%d forward passes and +%d backward passes per training step. "
-            "This significantly increases VRAM usage and step time.",
+            "This significantly increases VRAM usage and step time.%s",
             extra_fwd, extra_bwd,
+            " Audio DOP costs apply only on non-audio steps." if audio_dop else "",
         )
 
     def _setup_crepa(self, args: argparse.Namespace, accelerator: Accelerator,
@@ -868,6 +888,16 @@ class LTX2NetworkTrainer(NetworkTrainer):
             )
             losses["loss/dop"] = val
 
+        if cfg.audio_dop and self._ltx_mode == "av":
+            is_non_audio_batch = dit_inputs.get("audio_model_timesteps") is None
+            if is_non_audio_batch:
+                av_inputs = self._build_audio_dop_inputs(args, accelerator, transformer, dit_inputs, network_dtype)
+                if av_inputs is not None:
+                    val = helper.compute_audio_dop_backward(
+                        self, transformer, network, accelerator, av_inputs, network_dtype,
+                    )
+                    losses["loss/audio_dop"] = val
+
         return losses
 
     def _get_audio_preview_config(self, args: argparse.Namespace, transformer) -> Dict[str, int | float]:
@@ -1002,6 +1032,85 @@ class LTX2NetworkTrainer(NetworkTrainer):
             device=device,
             dtype=dtype,
         )
+
+    def _build_audio_dop_inputs(
+        self,
+        args: argparse.Namespace,
+        accelerator: Accelerator,
+        transformer,
+        dit_inputs: Dict[str, Any],
+        network_dtype: torch.dtype,
+    ) -> Optional[Dict[str, Any]]:
+        """Build AV inputs for audio DOP from a non-audio batch's dit_inputs.
+
+        Takes the current step's noisy video, constructs silence audio latents,
+        noises them at the video sigma, duplicates text embeddings to 2×cc,
+        and returns a dict ready for the transformer.
+        """
+        device = accelerator.device
+
+        # Extract video tensor from model_input
+        model_input = dit_inputs["model_input"]
+        if isinstance(model_input, (list, tuple)):
+            video_input = model_input[0]
+        else:
+            video_input = model_input
+
+        # Get video sigma from timesteps
+        model_timesteps = dit_inputs["model_timesteps"]
+        sigma = model_timesteps[:, 0] if model_timesteps.dim() > 1 else model_timesteps
+
+        # Get frame rate
+        frame_rate = dit_inputs["frame_rate"]
+        if isinstance(frame_rate, torch.Tensor):
+            fr_float = frame_rate.item() if frame_rate.numel() == 1 else frame_rate[0].item()
+        else:
+            fr_float = float(frame_rate)
+
+        # Build silence audio latents (zeros) with correct shape
+        try:
+            silence_audio = self._build_empty_audio_latents(
+                args=args,
+                transformer=transformer,
+                latents=video_input,
+                frame_rate=fr_float,
+                device=device,
+                dtype=network_dtype,
+            )
+        except Exception as e:
+            logger.warning("Audio DOP: failed to build silence latents: %s", e)
+            return None
+
+        # Noise the silence audio using flow matching with video sigma
+        audio_noise = torch.randn_like(silence_audio)
+        sigma_audio = sigma.view(-1, 1, 1, 1).to(dtype=silence_audio.dtype)
+        noisy_silence = (1.0 - sigma_audio) * silence_audio + sigma_audio * audio_noise
+        del silence_audio, audio_noise
+
+        # Build AV model_input: [noisy_video, noisy_silence_audio]
+        av_model_input = [video_input, noisy_silence]
+
+        # Duplicate text embeddings to 2×cc for AV forward
+        text_embeds = dit_inputs["text_embeds"]
+        if isinstance(text_embeds, torch.Tensor):
+            # In non-audio batches, text_embeds is video-only (1×cc).
+            # Duplicate to 2×cc so the wrapper can split into video + audio connectors.
+            av_text_embeds = torch.cat([text_embeds, text_embeds], dim=-1)
+        else:
+            av_text_embeds = text_embeds
+
+        # Audio timestep = video sigma (coupled timesteps for silence)
+        audio_timestep = model_timesteps
+
+        return {
+            "model_input": av_model_input,
+            "model_timesteps": model_timesteps,
+            "audio_timestep": audio_timestep,
+            "text_embeds": av_text_embeds,
+            "text_mask": dit_inputs["text_mask"],
+            "frame_rate": frame_rate,
+            "transformer_options": dit_inputs["transformer_options"],
+        }
 
     def _normalize_timesteps_for_model(self, timesteps: torch.Tensor) -> torch.Tensor:
         """Normalize timesteps to the model's expected 0..1 sigma range."""
@@ -1494,7 +1603,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
 
         try:
             from musubi_tuner.ltx_2.convert_lora_to_comfy import convert_lora_to_comfy
-            comfy_ckpt_name = ckpt_name.replace('.safetensors', '_comfy.safetensors')
+            comfy_ckpt_name = ckpt_name.replace('.safetensors', '.comfy.safetensors')
             comfy_ckpt_file = os.path.join(args.output_dir, comfy_ckpt_name)
             convert_lora_to_comfy(ckpt_file, comfy_ckpt_file, verbose=False)
             accelerator.print(f"Saved ComfyUI-compatible LoRA: {comfy_ckpt_file}")
@@ -3203,20 +3312,23 @@ class LTX2NetworkTrainer(NetworkTrainer):
 
             with torch.no_grad(), accelerator.autocast():
                 for sample_parameter in sample_parameters:
-                    if transformer_offloaded:
-                        ensure_transformer_on_device()
-                        self.sample_image_inference(
-                            accelerator, args, transformer, dit_dtype, vae_for_sampling, save_dir, sample_parameter, epoch, steps,
-                            audio_decoder=audio_decoder, vocoder=vocoder,
-                        )
-                        offload_transformer_if_needed()
-                        vae_for_sampling.to_device("cpu")
-                        self._cleanup_cuda(accelerator.device)
-                    else:
-                        self.sample_image_inference(
-                            accelerator, args, transformer, dit_dtype, vae, save_dir, sample_parameter, epoch, steps,
-                            audio_decoder=audio_decoder, vocoder=vocoder,
-                        )
+                    try:
+                        if transformer_offloaded:
+                            ensure_transformer_on_device()
+                            self.sample_image_inference(
+                                accelerator, args, transformer, dit_dtype, vae_for_sampling, save_dir, sample_parameter, epoch, steps,
+                                audio_decoder=audio_decoder, vocoder=vocoder,
+                            )
+                            offload_transformer_if_needed()
+                            vae_for_sampling.to_device("cpu")
+                            self._cleanup_cuda(accelerator.device)
+                        else:
+                            self.sample_image_inference(
+                                accelerator, args, transformer, dit_dtype, vae, save_dir, sample_parameter, epoch, steps,
+                                audio_decoder=audio_decoder, vocoder=vocoder,
+                            )
+                    except Exception as exc:
+                        logger.error("Sampling failed for prompt, skipping: %s", exc, exc_info=True)
                     clean_memory_on_device(accelerator.device)
                     self._cleanup_cuda(accelerator.device)
 
@@ -3250,29 +3362,32 @@ class LTX2NetworkTrainer(NetworkTrainer):
                         vae_for_sampling = self._load_vae_impl(args, vae_dtype=vae_dtype, vae_path=args.vae)
 
                     for sample_parameter in my_sample_params:
-                        if transformer_offloaded:
-                            ensure_transformer_on_device()
-                            self.sample_image_inference(
-                                accelerator,
-                                args,
-                                transformer,
-                                dit_dtype,
-                                vae_for_sampling,
-                                save_dir,
-                                sample_parameter,
-                                epoch,
-                                steps,
-                                audio_decoder=audio_decoder,
-                                vocoder=vocoder,
-                            )
-                            offload_transformer_if_needed()
-                            vae_for_sampling.to_device("cpu")
-                            self._cleanup_cuda(accelerator.device)
-                        else:
-                            self.sample_image_inference(
-                                accelerator, args, transformer, dit_dtype, vae, save_dir, sample_parameter, epoch, steps,
-                                audio_decoder=audio_decoder, vocoder=vocoder,
-                            )
+                        try:
+                            if transformer_offloaded:
+                                ensure_transformer_on_device()
+                                self.sample_image_inference(
+                                    accelerator,
+                                    args,
+                                    transformer,
+                                    dit_dtype,
+                                    vae_for_sampling,
+                                    save_dir,
+                                    sample_parameter,
+                                    epoch,
+                                    steps,
+                                    audio_decoder=audio_decoder,
+                                    vocoder=vocoder,
+                                )
+                                offload_transformer_if_needed()
+                                vae_for_sampling.to_device("cpu")
+                                self._cleanup_cuda(accelerator.device)
+                            else:
+                                self.sample_image_inference(
+                                    accelerator, args, transformer, dit_dtype, vae, save_dir, sample_parameter, epoch, steps,
+                                    audio_decoder=audio_decoder, vocoder=vocoder,
+                                )
+                        except Exception as exc:
+                            logger.error("Sampling failed for prompt, skipping: %s", exc, exc_info=True)
                         self._cleanup_cuda(accelerator.device)
 
                     if vae_for_sampling is not None:
@@ -4368,7 +4483,11 @@ class LTX2NetworkTrainer(NetworkTrainer):
         if audio_latents is not None:
             # Lazy-load audio components in offloading mode (they weren't pre-loaded to save RAM)
             if audio_decoder is None and vocoder is None and offload_transformer_for_decode:
-                # Transformer is on CPU now, GPU has room for audio decoder
+                # Move VAE to CPU first to free GPU memory for audio decoder/vocoder
+                logger.info("Sampling offload: moving VAE to CPU before audio decoder load")
+                vae.to_device(original_vae_device)
+                clean_memory_on_device(transformer_device)
+
                 audio_dtype = torch.bfloat16 if args.vae_dtype is None else model_utils.str_to_dtype(args.vae_dtype)
                 try:
                     logger.info("Sampling offload: lazy-loading audio decoder/vocoder to GPU")
@@ -4384,22 +4503,27 @@ class LTX2NetworkTrainer(NetworkTrainer):
 
             if audio_decoder is not None and vocoder is not None:
                 if offload_transformer_for_decode:
-                    logger.info("Sampling offload: moving VAE back to CPU before audio decode")
+                    # Ensure VAE is on CPU (may already be if we lazy-loaded above)
                     vae.to_device(original_vae_device)
                     clean_memory_on_device(transformer_device)
 
                 decode_device = transformer_device
                 if decode_device.type == "cpu":
                     logger.info("Sampling offload: decoding audio on CPU")
-                audio_decoder.to(decode_device)
-                vocoder.to(decode_device)
-                with torch.no_grad():
-                    decode_dtype = torch.bfloat16
-                    audio_latents = audio_latents.to(device=decode_device, dtype=decode_dtype)
-                    decoded_audio = audio_decoder(audio_latents)
-                    audio_waveform = vocoder(decoded_audio).squeeze(0).float().cpu()
-                audio_decoder.to("cpu")
-                vocoder.to("cpu")
+                try:
+                    audio_decoder.to(decode_device)
+                    vocoder.to(decode_device)
+                    with torch.no_grad():
+                        decode_dtype = torch.bfloat16
+                        audio_latents = audio_latents.to(device=decode_device, dtype=decode_dtype)
+                        decoded_audio = audio_decoder(audio_latents)
+                        audio_waveform = vocoder(decoded_audio).squeeze(0).float().cpu()
+                except Exception as exc:
+                    logger.warning("Sampling: audio decode failed; skipping audio output: %s", exc)
+                    audio_waveform = None
+                finally:
+                    audio_decoder.to("cpu")
+                    vocoder.to("cpu")
             else:
                 logger.warning("Sampling: audio preview requested but no decoder/vocoder available; skipping audio decode.")
 
@@ -5329,7 +5453,7 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         "--no_save_original_lora",
         action="store_false",
         dest="save_original_lora",
-        help="Delete the original LoRA after ComfyUI conversion, keeping only *_comfy.safetensors.",
+        help="Delete the original LoRA after ComfyUI conversion, keeping only *.comfy.safetensors.",
     )
 
     # -- Preservation / regularization flags --
@@ -5378,6 +5502,18 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         default=None,
         help="Path to precached preservation prompt embeddings (.pt). "
              "Defaults to <cache_directory>/ltx2_preservation_cache.pt. Requires --use_precached_preservation.",
+    )
+    parser.add_argument(
+        "--audio_dop",
+        action="store_true",
+        help="Audio DOP: preserve base model audio predictions on non-audio batches. "
+             "Only active in AV mode (--ltx2_mode av). Adds +2 forwards and +1 backward on non-audio steps.",
+    )
+    parser.add_argument(
+        "--audio_dop_args",
+        type=str,
+        nargs="*",
+        help="Key=value args for audio DOP, e.g. multiplier=0.5",
     )
 
     # -- CREPA (Cross-frame Representation Alignment) --

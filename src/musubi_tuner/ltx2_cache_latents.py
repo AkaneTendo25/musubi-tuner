@@ -1054,6 +1054,10 @@ def main() -> None:
         ).to(device=device, dtype=torch.float32)
         processor.eval()
 
+        audio_encoded_count = 0
+        audio_failed_count = 0
+        audio_skipped_count = 0
+
         for ds in datasets:
             if not isinstance(ds, (VideoDataset, AudioDataset)):
                 continue
@@ -1066,6 +1070,7 @@ def main() -> None:
                 for item_info in batch:
                     audio_cache_path = _audio_cache_path(item_info)
                     if args.skip_existing and os.path.exists(audio_cache_path):
+                        audio_skipped_count += 1
                         continue
                     if isinstance(ds, AudioDataset):
                         audio_path = getattr(item_info, "audio_path", None) or item_info.item_key
@@ -1093,7 +1098,9 @@ def main() -> None:
                             dtype=audio_dtype,
                             target_fps=ds_target_fps,
                         )
+                        audio_encoded_count += 1
                     except Exception as e:
+                        audio_failed_count += 1
                         logger.warning(
                             "Skipping audio cache for %s (audio_path=%s): %s",
                             item_info.item_key,
@@ -1101,6 +1108,13 @@ def main() -> None:
                             e,
                         )
                         continue
+
+        logger.info(
+            "Audio latent caching complete: %d encoded, %d failed, %d skipped (existing)",
+            audio_encoded_count,
+            audio_failed_count,
+            audio_skipped_count,
+        )
 
 
 def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:

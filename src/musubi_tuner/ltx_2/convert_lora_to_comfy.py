@@ -185,7 +185,7 @@ def convert_lora_to_comfy(input_path, output_path=None, verbose=False):
     # Determine output path
     if output_path is None:
         input_file = Path(input_path)
-        output_path = input_file.parent / f"{input_file.stem}_comfy{input_file.suffix}"
+        output_path = input_file.parent / f"{input_file.stem}.comfy{input_file.suffix}"
 
     # Load metadata from the original file
     metadata = None
@@ -219,7 +219,7 @@ def main():
         "-o", "--output",
         type=str,
         default=None,
-        help="Path to save the converted LoRA (default: <input>_comfy.safetensors)"
+        help="Path to save the converted LoRA (default: <input>.comfy.safetensors)"
     )
     parser.add_argument(
         "-v", "--verbose",

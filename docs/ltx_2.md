@@ -119,6 +119,7 @@ python ltx2_cache_latents.py ^
 - `--audio_only_target_resolution`: Optional square override for audio-only latent geometry. If omitted, resolution is inferred from the audio dataset config.
 - `--audio_only_target_fps`: Target FPS used to derive audio-only frame counts from audio duration (default: `25`).
 - `--audio_video_latent_channels`: Optional override for audio-only video latent channels (auto-detected from checkpoint by default).
+- `--ltx2_audio_dtype`: Data type for audio VAE encoding (default: `float16`).
 - `--audio_video_latent_dtype`: Optional override for audio-only video latent dtype (defaults to `--ltx2_audio_dtype`).
 - `--vae_dtype`: Data type for VAE latents (default comes from the cache script).
 - `--save_dataset_manifest`: Optional. Saves a cache-only dataset manifest for source-free training.
@@ -153,7 +154,7 @@ python ltx2_cache_latents.py ^
 - `--vae_temporal_tile_size`: Splits the video into temporal tiles of this many frames (e.g., 64). Must be >= 16 and divisible by 8. Default: `None` (disabled).
 - `--vae_temporal_tile_overlap`: Overlap between temporal tiles in frames. Must be divisible by 8. Default: `24`.
 
-Spatial and temporal tiling can be combined. Tiled encoding produces latents with RMSE < 1e-3 compared to non-tiled, using 50-70% less VRAM at the cost of ~30% slower encoding.
+Spatial and temporal tiling can be combined. Tiled encoding trades speed for VRAM savings.
 
 Both options can be combined (e.g., `--vae_chunk_size 16 --vae_spatial_tile_size 512`).
 
@@ -330,7 +331,7 @@ accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 ltx2_tr
 | `--nf4_base` | ~10 GB | 0.0678 (60x BF16) | 21.2 dB | 0.996188 |
 | `--nf4_base --loftq_init` | ~10 GB | 0.0654 (60x BF16) | 21.5 dB | 0.996437 |
 
-*Measured on random N(0,1) weights with shapes representative of LTX-2 transformer layers. MAE = mean absolute error between original and dequantized weights. LoftQ error is measured after adding the LoRA correction (rank 32, 2 iterations).*
+*Approximate values measured on random N(0,1) weights with shapes representative of LTX-2 transformer layers. MAE = mean absolute error between original and dequantized weights. LoftQ error is measured after adding the LoRA correction (rank 32, 2 iterations). No benchmark script is included in this repo.*
 
 NF4 has ~4x higher weight error than FP8 (cosine 0.996 vs 0.9997). The base model is frozen during LoRA training, so the quantization error is constant rather than accumulating. LoftQ initializes LoRA weights from the quantization residual via SVD.
 
@@ -403,7 +404,7 @@ accelerate launch ... ltx2_train_network.py ^
 
 **With LoftQ initialization:**
 
-LoftQ pre-computes LoRA A/B matrices from the truncated SVD of the NF4 quantization residual (`W - dequant(Q(W))`). This runs once at startup and adds no runtime cost. Reduces static weight MAE by ~3.5% (rank 32, 2 iterations).
+LoftQ pre-computes LoRA A/B matrices from the truncated SVD of the NF4 quantization residual (`W - dequant(Q(W))`). This runs once at startup and adds no runtime cost.
 
 ```bash
 accelerate launch ... ltx2_train_network.py ^
@@ -443,10 +444,13 @@ accelerate launch ... ltx2_train_network.py ^
 #### Loss Weighting
 - `--video_loss_weight`: Weight for video loss (default: 1.0).
 - `--audio_loss_weight`: Weight for audio loss in AV mode (default: 1.0).
-- `--audio_loss_balance_mode inv_freq`: Optional inverse-frequency reweighting for mixed audio/non-audio training.
+- `--audio_loss_balance_mode`: Audio loss balancing strategy. Values: `none` (default), `inv_freq`, `ema_mag`.
+- `--audio_loss_balance_min`, `--audio_loss_balance_max`: Clamp range for effective audio weight (defaults: 0.05, 4.0).
+
+**`inv_freq` mode** — inverse-frequency reweighting for mixed audio/non-audio training. Boosts audio loss proportionally to how rare audio batches are.
+
 - `--audio_loss_balance_beta`: EMA update rate for observed audio-batch frequency (default: 0.01).
 - `--audio_loss_balance_eps`: Denominator floor for inverse-frequency scaling (default: 0.05).
-- `--audio_loss_balance_min`, `--audio_loss_balance_max`: Clamp range for effective audio weight (defaults: 0.05, 4.0).
 - `--audio_loss_balance_ema_init`: Initial audio-frequency EMA value (default: 1.0).
 
 Example:
@@ -459,22 +463,34 @@ Example:
 --audio_loss_balance_max 3.0
 ```
 
-Use `inv_freq` when training mixes audio and non-audio samples and audio learning is weak/delayed.
-
 Recommended start values:
 - `--audio_loss_balance_beta 0.01` (stable EMA, slower reaction; try `0.02-0.05` for faster reaction)
 - `--audio_loss_balance_eps 0.05` (safe floor; increase to `0.1` if weights spike too much)
 - `--audio_loss_balance_min 0.05 --audio_loss_balance_max 3.0` (conservative clamp range)
 - `--audio_loss_balance_ema_init 1.0` (no warm-start boost; use `0.5` only if you want stronger early audio emphasis)
 
+**`ema_mag` mode** — dynamic balancing by matching audio-loss EMA magnitude to a target fraction of video-loss EMA. Bidirectional: can dampen audio (weight < 1.0) when audio loss exceeds `target_ratio * video_loss`, or boost it when audio loss is below that target.
+
+- `--audio_loss_balance_target_ratio`: Target audio/video loss magnitude ratio (default: 0.33 — audio loss targets ~33% of video loss).
+- `--audio_loss_balance_ema_decay`: EMA decay for loss magnitude tracking (default: 0.99).
+
+Example:
+```bash
+--audio_loss_weight 1.0 ^
+--audio_loss_balance_mode ema_mag ^
+--audio_loss_balance_target_ratio 0.33 ^
+--audio_loss_balance_ema_decay 0.99 ^
+--audio_loss_balance_min 0.05 ^
+--audio_loss_balance_max 4.0
+```
+
+Use `ema_mag` when audio and video losses have different natural magnitudes and you want automatic scaling instead of manual `--audio_loss_weight` tuning.
+
 #### Additional Audio Training Flags
 
 - `--independent_audio_timestep`: Sample a separate timestep for audio (AV/audio modes only).
 - `--audio_silence_regularizer`: When AV batches are missing audio latents, use synthetic silence latents instead of skipping the audio branch.
 - `--audio_silence_regularizer_weight`: Loss multiplier for synthetic-silence fallback batches.
-- `--audio_loss_balance_mode ema_mag`: Dynamic audio balancing by matching audio-loss EMA magnitude to a target fraction of video-loss EMA.
-- `--audio_loss_balance_target_ratio`: Target audio/video loss magnitude ratio for `ema_mag`.
-- `--audio_loss_balance_ema_decay`: EMA decay for `ema_mag`.
 - `--audio_supervision_mode off|warn|error`: AV audio-supervision monitor mode.
 - `--audio_supervision_warmup_steps`: Expected AV batches before supervision checks.
 - `--audio_supervision_check_interval`: Run supervision checks every N expected AV batches.
@@ -482,7 +498,7 @@ Recommended start values:
 
 #### Preservation & Regularization
 
-Three optional techniques that constrain how the LoRA modifies the base model. All are disabled by default with zero overhead.
+Optional techniques that constrain how the LoRA modifies the base model. All are disabled by default with zero overhead.
 
 **Blank Prompt Preservation** — Prevents the LoRA from altering the model's blank-prompt output (used as the CFG baseline during inference):
 ```bash
@@ -500,11 +516,9 @@ The `class` parameter should be a general description without your trigger word 
 --prior_divergence --prior_divergence_args multiplier=0.1
 ```
 
-All three can be combined:
+**Audio DOP** — Preserves the base model's audio predictions on non-audio training steps. Requires `--ltx2_mode av`. On each non-audio batch, constructs silence audio latents, runs the transformer with LoRA OFF and ON, and minimizes MSE on the audio branch only. Zero cost on audio batches. Mutually exclusive with `--audio_silence_regularizer`.
 ```bash
---blank_preservation --blank_preservation_args multiplier=0.5 ^
---dop --dop_args class=woman multiplier=1.0 ^
---prior_divergence --prior_divergence_args multiplier=0.1
+--audio_dop --audio_dop_args multiplier=0.5
 ```
 
 | Technique | Extra forwards/step | Extra backwards/step | Recommended multiplier |
@@ -512,9 +526,10 @@ All three can be combined:
 | `--blank_preservation` | +2 | +1 | 0.5 - 1.0 |
 | `--dop` | +2 | +1 | 0.5 - 1.0 |
 | `--prior_divergence` | +1 | 0 | 0.05 - 0.1 |
+| `--audio_dop` | +2 (non-audio steps only) | +1 (non-audio steps only) | 0.3 - 1.0 |
 
 > [!CAUTION]
-> Each preservation technique adds transformer forward passes per step. Using all three adds +5 forwards and +2 backwards, increasing VRAM usage and step time proportionally.
+> Each preservation technique adds transformer forward passes per step. Audio DOP costs apply only on non-audio steps.
 
 **CREPA (Cross-frame Representation Alignment)** — Encourages temporal consistency across video frames by aligning DiT hidden states across frames via a small projector MLP. Based on [arxiv 2506.09229](https://arxiv.org/abs/2506.09229). Only the projector is trained; all other modules stay frozen. CREPA uses hooks to capture intermediate features from the existing forward pass (no extra forward passes).
 
@@ -810,13 +825,13 @@ Saved LoRA checkpoints are converted to ComfyUI format by default. Both the orig
 
 | Flag | Behavior |
 |------|----------|
-| *(default)* | Saves both `*.safetensors` (original) and `*_comfy.safetensors` (ComfyUI). |
-| `--no_save_original_lora` | Deletes the original after conversion, keeping only `*_comfy.safetensors`. |
+| *(default)* | Saves both `*.safetensors` (original) and `*.comfy.safetensors` (ComfyUI). |
+| `--no_save_original_lora` | Deletes the original after conversion, keeping only `*.comfy.safetensors`. |
 | `--no_convert_to_comfy` | Saves only the original `*.safetensors` (no conversion). |
 
 > **Important:** Training can only be resumed from the **original** (non-comfy) checkpoint format. If you plan to use `--resume`, do not use `--no_save_original_lora`.
 
-Checkpoint rotation (`--save_last_n_ckpts`) cleans up old ComfyUI checkpoints alongside originals. HuggingFace upload (`--huggingface_repo_id`) uploads only the ComfyUI checkpoint unless `--save_original_lora` is set.
+Checkpoint rotation (`--save_last_n_ckpts`) cleans up old ComfyUI checkpoints alongside originals. HuggingFace upload (`--huggingface_repo_id`) uploads both formats by default. Use `--no_save_original_lora` to upload only the ComfyUI checkpoint.
 
 ---
 
@@ -894,8 +909,8 @@ During latent caching, the source FPS is **auto-detected** from each video's con
 #### How It Works
 
 1. For each video file, the source FPS is read from the container metadata (`average_rate` or `base_rate`).
-2. If the source FPS differs from `target_fps` by more than 1%, frames are resampled (dropped) to match `target_fps`.
-3. If the source and target FPS are within 1% of each other (e.g., 23.976 vs 24), no resampling is done — this avoids spurious frame drops from NTSC rounding (23.976, 29.97, 59.94, etc.).
+2. If `abs(ceil(source_fps) - target_fps) > 1`, frames are resampled (dropped) to match `target_fps`.
+3. If the difference is within this threshold (e.g., 23.976 → ceil=24 vs target 25, diff=1), no resampling is done — this avoids spurious frame drops from NTSC rounding (23.976, 29.97, 59.94, etc.).
 4. If audio is present (`--ltx2_mode av`), the audio waveform is automatically time-stretched (pitch-preserving) to match the resampled video duration.
 
 #### Common Scenarios
@@ -1072,8 +1087,46 @@ reference_cache_directory/                  # IC-LoRA only
 | Audio/video out of sync after caching | Source FPS mismatch causing wrong time-stretch | Check "Auto-detected source FPS" log line; set `source_fps` explicitly if wrong |
 | Voice/audio learning slow when mixing images with videos in AV mode | Image batches produce zero audio training signal — audio branch is skipped entirely. Dilutes audio learning proportionally to image step fraction | Use video-only datasets for AV training when voice quality matters |
 | No audio during sampling in video training mode | `ltx2_mode` is set to `v`/`video` | Expected behavior. Train in AV mode (`--ltx2_mode av` or `audio`) to generate audio during sampling |
-| Cannot resume training from checkpoint | Using a `*_comfy.safetensors` checkpoint with `--resume` | Training can only be resumed from the **original** (non-comfy) LoRA format. Use the `*.safetensors` file without the `_comfy` suffix. If you used `--no_save_original_lora`, you must retrain from scratch. |
+| Cannot resume training from checkpoint | Using a `*.comfy.safetensors` checkpoint with `--resume` | Training can only be resumed from the **original** (non-comfy) LoRA format. Use the `*.safetensors` file without the `.comfy` extension. If you used `--no_save_original_lora`, you must retrain from scratch. |
 | CUDA errors or crashes on RTX 5090 / 50xx GPUs | CUDA 12.6 (`cu126`) not supported on Windows for Blackwell GPUs | Use CUDA 12.8: `pip install torch==2.8.0 ... --index-url https://download.pytorch.org/whl/cu128`. See [CUDA Version](#cuda-version) |
+
+### Audio/Voice Training with Mixed Datasets
+
+In mixed datasets, audio batches are a minority. Non-audio steps update shared transformer weights without audio supervision, causing audio drift. Mitigations:
+
+**1. Oversample audio items** — set `num_repeats` so audio batches are 30-50% of steps:
+```toml
+[[datasets]]
+video_directory = "audio_video_clips"
+num_repeats = 5
+```
+
+**2. `--audio_dop`** — preserves base model audio predictions on non-audio steps. Runs LoRA OFF/ON forwards on silence audio latents, MSE on audio branch only. +2 fwd / +1 bwd per non-audio step, zero cost on audio batches. Logged as `loss/audio_dop`. Mutually exclusive with `--audio_silence_regularizer`.
+```
+--audio_dop --audio_dop_args multiplier=0.5
+```
+
+**3. `--dop`** — preserves all base model outputs (video + audio) using a class prompt. Broader than audio DOP but applies to every step. +2 fwd / +1 bwd per step.
+```
+--dop --dop_args multiplier=0.5
+```
+
+**4. `--audio_silence_regularizer`** — converts non-audio batches to audio batches with silence target. Cheaper than DOP (+0 extra forwards) but silence is an approximation.
+```
+--audio_silence_regularizer --audio_silence_regularizer_weight 0.5
+```
+
+**5. Inverse-frequency loss balancing** — auto-boosts audio loss weight proportional to audio batch rarity:
+```
+--audio_loss_balance_mode inv_freq --audio_loss_balance_min 0.05 --audio_loss_balance_max 4.0
+```
+Alternative: `--audio_loss_balance_mode ema_mag` matches audio loss magnitude to a target fraction of video loss.
+
+**6. Diagnostics**
+
+- If `failed > 0` in latent caching summary, audio extraction is broken for those items
+- After mode switch (video→AV), re-run both latent and text encoder caching without `--skip_existing`
+- `loss_a` dropping = audio learning; absent/zero = no audio batches forming; degrades over time = forgetting
 
 ---
 
