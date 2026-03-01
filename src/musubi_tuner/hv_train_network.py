@@ -2378,6 +2378,17 @@ class NetworkTrainer:
                         weights.pop(i)
                 # print(f"save model hook: {len(weights)} weights will be saved")
 
+                # Save CREPA projector into state directory so it matches the optimizer state
+                if hasattr(self, '_crepa') and self._crepa is not None:
+                    try:
+                        from safetensors.torch import save_file
+                        proj_sd = self._crepa.state_dict()
+                        if proj_sd:
+                            proj_file = os.path.join(output_dir, "crepa_projector.safetensors")
+                            save_file(proj_sd, proj_file)
+                    except Exception as e:
+                        logger.warning(f"Failed to save CREPA projector to state dir: {e}")
+
         def load_model_hook(models, input_dir):
             # remove models except network
             remove_indices = []
@@ -2390,6 +2401,17 @@ class NetworkTrainer:
 
         accelerator.register_save_state_pre_hook(save_model_hook)
         accelerator.register_load_state_pre_hook(load_model_hook)
+
+        # Set up CREPA (and any other pre-train hooks) BEFORE resume so that the
+        # optimizer has the correct number of param groups when load_state() restores
+        # the saved optimizer state.  Without this, resume crashes with
+        # "loaded state dict has a different number of parameter groups".
+        self.pre_train_hook(args, accelerator, transformer=transformer, network=network)
+        if hasattr(self, '_crepa') and self._crepa is not None:
+            crepa_params = self._crepa.get_trainable_params()
+            if crepa_params:
+                optimizer.add_param_group({"params": crepa_params, "lr": args.learning_rate})
+                accelerator.print(f"CREPA: added {sum(p.numel() for p in crepa_params):,} projector params to optimizer")
 
         # epoch数を計算する
         num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
@@ -2819,14 +2841,7 @@ class NetworkTrainer:
 
         clean_memory_on_device(accelerator.device)
 
-        self.pre_train_hook(args, accelerator, transformer=transformer, network=network)
-
-        # CREPA projector params → add to existing optimizer
-        if hasattr(self, '_crepa') and self._crepa is not None:
-            crepa_params = self._crepa.get_trainable_params()
-            if crepa_params:
-                optimizer.add_param_group({"params": crepa_params, "lr": args.learning_rate})
-                accelerator.print(f"CREPA: added {sum(p.numel() for p in crepa_params):,} projector params to optimizer")
+        # pre_train_hook and CREPA param group already called before resume (above)
 
         optimizer_train_fn()  # Set training mode
 

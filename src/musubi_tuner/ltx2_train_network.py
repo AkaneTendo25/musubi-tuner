@@ -794,9 +794,9 @@ class LTX2NetworkTrainer(NetworkTrainer):
 
         module.setup(accelerator.device, dtype)
 
-        # Try to load existing projector weights (for resume)
-        if args.output_dir:
-            proj_path = os.path.join(args.output_dir, "crepa_projector.safetensors")
+        # Try to load existing projector weights from state directory (for resume)
+        if getattr(args, "resume", None):
+            proj_path = os.path.join(args.resume, "crepa_projector.safetensors")
             if os.path.exists(proj_path):
                 from safetensors.torch import load_file
                 sd = load_file(proj_path)
@@ -1585,19 +1585,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
         return md
 
     def post_save_checkpoint_hook(self, args, ckpt_file, ckpt_name, accelerator, force_sync_upload=False):
-        """Convert saved LoRA to ComfyUI format and save CREPA projector."""
-        # Save CREPA projector weights alongside LoRA checkpoint
-        if self._crepa is not None:
-            try:
-                from safetensors.torch import save_file
-                proj_sd = self._crepa.state_dict()
-                if proj_sd:
-                    proj_file = os.path.join(args.output_dir, "crepa_projector.safetensors")
-                    save_file(proj_sd, proj_file)
-                    accelerator.print(f"Saved CREPA projector: {proj_file}")
-            except Exception as e:
-                accelerator.print(f"Warning: Failed to save CREPA projector: {e}")
-
+        """Convert saved LoRA to ComfyUI format."""
         if not getattr(args, 'convert_to_comfy', True):
             return
 
