@@ -85,6 +85,8 @@ class VideoDatasetParams(BaseDatasetParams):
 class AudioDatasetParams(BaseDatasetParams):
     audio_directory: Optional[str] = None
     audio_jsonl_file: Optional[str] = None
+    audio_bucket_strategy: str = "pad"  # "pad" (default) or "truncate"
+    audio_bucket_interval: float = 2.0  # bucket step in seconds
 
 
 @dataclass
@@ -148,6 +150,8 @@ class ConfigSanitizer:
     AUDIO_DATASET_DISTINCT_SCHEMA = {
         "audio_directory": str,
         "audio_jsonl_file": str,
+        "audio_bucket_strategy": str,
+        "audio_bucket_interval": float,
     }
     VIDEO_DATASET_DISTINCT_SCHEMA = {
         "video_directory": str,
@@ -353,6 +357,8 @@ def generate_dataset_group_by_blueprint(
                     f"""\
         audio_directory: "{dataset.audio_directory}"
         audio_jsonl_file: "{dataset.audio_jsonl_file}"
+        audio_bucket_strategy: {getattr(dataset, "audio_bucket_strategy", "pad")}
+        audio_bucket_interval: {getattr(dataset, "audio_bucket_interval", 2.0)}
     \n"""
                 ),
                 "    ",

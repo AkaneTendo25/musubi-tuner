@@ -305,6 +305,7 @@ def encode_and_save_audio_cache(
     audio_path: str,
     dtype: torch.dtype,
     target_fps: float = 25.0,
+    audio_only: bool = False,
 ) -> None:
     try:
         import torchaudio
@@ -413,9 +414,11 @@ def encode_and_save_audio_cache(
         if end_sample > start_sample:
             waveform = waveform[:, start_sample:end_sample]
 
-    # Pitch-preserving time stretch when source audio duration doesn't match target video duration
+    # Pitch-preserving time stretch when source audio duration doesn't match target video duration.
+    # Skip for audio-only mode: frame_count is virtual (derived from the audio itself then adjusted
+    # to N%8==1), so time-stretching would circularly compress the audio by 1-8%.
     frame_count = getattr(item_info, "frame_count", None)
-    if isinstance(frame_count, int) and frame_count > 0 and waveform.shape[-1] > 0:
+    if not audio_only and isinstance(frame_count, int) and frame_count > 0 and waveform.shape[-1] > 0:
         expected_duration = float(frame_count) / max(float(target_fps), 1.0)
         actual_duration = float(waveform.shape[-1]) / float(sample_rate)
         if actual_duration > 0 and abs(actual_duration - expected_duration) / actual_duration > 0.01:
@@ -854,6 +857,7 @@ def main() -> None:
                             audio_path=audio_path,
                             dtype=audio_dtype,
                             target_fps=ds_target_fps,
+                            audio_only=audio_only,
                         )
                     except Exception as e:
                         logger.warning(

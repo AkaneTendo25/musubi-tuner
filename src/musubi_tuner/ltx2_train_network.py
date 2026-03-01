@@ -1984,7 +1984,10 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 dtype=torch.bool,
             )
 
-            if getattr(args, "use_audio_length_mask", False):
+            # Audio-only mode always masks padding to prevent loss on zero-padded
+            # positions that arise from batching variable-length audio clips.
+            _use_audio_length_mask = getattr(args, "use_audio_length_mask", False) or self._ltx_mode == "audio"
+            if _use_audio_length_mask:
                 audio_lengths = batch.get("audio_lengths")
                 if isinstance(audio_lengths, dict):
                     audio_lengths = audio_lengths.get("lengths")
@@ -2881,6 +2884,8 @@ class LTX2NetworkTrainer(NetworkTrainer):
         vocoder = None
         disable_audio_preview = bool(getattr(args, "sample_disable_audio", False))
         audio_only_preview = bool(getattr(args, "sample_audio_only", False))
+        if self._ltx_mode == "audio":
+            audio_only_preview = True
         enable_audio_preview = (self._audio_video or audio_only_preview) and not disable_audio_preview
         if not transformer_offloaded and enable_audio_preview and getattr(args, "ltx_mode", "video") in {"av", "audio"}:
             # High VRAM mode: pre-load audio to GPU
@@ -3168,6 +3173,10 @@ class LTX2NetworkTrainer(NetworkTrainer):
         disable_audio_preview = bool(getattr(args, "sample_disable_audio", False))
         use_audio_subprocess = False
         audio_only_preview = bool(getattr(args, "sample_audio_only", False))
+        # When training mode is audio-only, inference must also use audio_only=True
+        # to avoid context embedding split corruption and incorrect video modality.
+        if self._ltx_mode == "audio":
+            audio_only_preview = True
         if audio_only_preview and getattr(args, "ltx_mode", "video") not in {"av", "audio"}:
             raise ValueError("--sample_audio_only requires --ltx2_mode av or audio")
         enable_audio_preview = (self._audio_video or audio_only_preview) and not disable_audio_preview
@@ -4116,6 +4125,23 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         action="store_true",
         default=None,
         help="Split LTX-2 buckets by audio presence to avoid mixed audio/non-audio batches.",
+    )
+    parser.add_argument(
+        "--audio_bucket_strategy",
+        type=str,
+        default=None,
+        choices=["pad", "truncate"],
+        help=(
+            "Audio duration bucketing strategy. "
+            "'pad' (default): round-to-nearest bucket boundary, pad shorter clips and mask loss. "
+            "'truncate': floor to bucket boundary, truncate all clips to bucket length (no padding/masking needed)."
+        ),
+    )
+    parser.add_argument(
+        "--audio_bucket_interval",
+        type=float,
+        default=None,
+        help="Audio bucket step size in seconds (default: 2.0). Controls how finely audio clips are grouped by duration.",
     )
     parser.add_argument(
         "--video_loss_weight",
