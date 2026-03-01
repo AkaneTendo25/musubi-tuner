@@ -47,6 +47,7 @@
   - [LoRA Merge Arguments](#lora-merge-arguments)
 - [Dataset Configuration](#dataset-configuration)
   - [Video Dataset Options](#video-dataset-options)
+  - [Audio Dataset Options](#audio-dataset-options)
   - [Example TOML](#example-toml)
   - [Frame Rate (FPS) Handling](#frame-rate-fps-handling)
 - [Validation Datasets](#validation-datasets)
@@ -123,6 +124,10 @@ python ltx2_cache_latents.py ^
 - `--audio_video_latent_dtype`: Optional override for audio-only video latent dtype (defaults to `--ltx2_audio_dtype`).
 - `--vae_dtype`: Data type for VAE latents (default comes from the cache script).
 - `--save_dataset_manifest`: Optional. Saves a cache-only dataset manifest for source-free training.
+- `--precache_sample_latents`: Cache I2V conditioning image latents for sample prompts, then continue with normal latent caching. Requires `--sample_prompts`.
+- `--sample_latents_cache`: Path for the I2V conditioning latents cache file (default: `<cache_dir>/ltx2_sample_latents_cache.pt`).
+- `--reference_frames`: Number of reference frames to cache for IC-LoRA / V2V (default: `1`).
+- `--reference_downscale`: Spatial downscale factor for cached reference latents (default: `1`).
 
 ### Latent Cache Output Files
 
@@ -184,6 +189,9 @@ python ltx2_cache_text_encoder_outputs.py ^
 - `--gemma_safetensors`: Path to a single Gemma `.safetensors` file (e.g. an FP8 export from ComfyUI). Loads weights, config, and tokenizer from one file — no `--gemma_root` needed. See [Loading Gemma from a Single Safetensors File](#loading-gemma-from-a-single-safetensors-file) below.
 - `--gemma_load_in_8bit`: Loads Gemma in 8-bit quantization. Cannot be combined with `--gemma_safetensors`.
 - `--gemma_load_in_4bit`: Loads Gemma in 4-bit quantization. Cannot be combined with `--gemma_safetensors`.
+- `--gemma_bnb_4bit_quant_type nf4|fp4`: Quantization type for 4-bit loading (default: `nf4`).
+- `--gemma_bnb_4bit_disable_double_quant`: Disable bitsandbytes double quantization for 4-bit loading.
+- `--gemma_bnb_4bit_compute_dtype auto|fp16|bf16|fp32`: Compute dtype for 4-bit operations (default: `auto`, uses `--mixed_precision` dtype).
 - `--ltx2_checkpoint`: Required. Use `--ltx2_text_encoder_checkpoint` to override for text encoder connector weights.
 - 8-bit/4-bit loading requires `--device cuda`.
 
@@ -436,6 +444,8 @@ accelerate launch ... ltx2_train_network.py ^
 #### Audio-Video Support
 - `--ltx2_mode`, `--ltx_mode`: Training modality selector. Default is `v` (`video`). Values: `video`, `av`, `audio` (aliases: `v`, `va`, `a`).
 - `--separate_audio_buckets`: Keeps audio and non-audio items in separate batches (reduces VRAM for image/video-only batches).
+- `--audio_bucket_strategy pad|truncate`: Audio duration bucketing strategy. `pad` (default) rounds to nearest bucket boundary and pads shorter clips with loss masking. `truncate` floors to bucket boundary and truncates all clips to bucket length (no padding or masking needed).
+- `--audio_bucket_interval`: Audio bucket step size in seconds (default: `2.0`). Controls how finely audio clips are grouped by duration.
 - `--min_audio_batches_per_accum`: Minimum number of audio-bearing microbatches per gradient accumulation window.
 - `--audio_batch_probability`: Probability of selecting an audio-bearing batch when both audio and non-audio batches are available.
   - `--min_audio_batches_per_accum` and `--audio_batch_probability` are mutually exclusive.
@@ -768,7 +778,7 @@ The `--sample_include_reference` flag shows the reference side-by-side with the 
 |----------|---------|-------------|
 | `--reference_downscale` | 1 | Spatial downscale factor for references (1=same res, 2=half) |
 | `--reference_frames` | 1 | Number of reference frames for V2V (images always use 1) |
-| `--ltx2_first_frame_conditioning_p` | 0.0 | Probability of also conditioning on the first target frame during training |
+| `--ltx2_first_frame_conditioning_p` | 0.1 | Probability of also conditioning on the first target frame during training |
 | `--sample_include_reference` | off | Show reference side-by-side with generated output in sample videos |
 | `--lora_target_preset v2v` | — | Targets attention + FFN layers (recommended for IC-LoRA) |
 
@@ -791,6 +801,10 @@ The `--sample_include_reference` flag shows the reference side-by-side with the 
 
 | Argument | Default | Description |
 |----------|---------|-------------|
+| `--height` | 512 | Sample output height (pixels) |
+| `--width` | 768 | Sample output width (pixels) |
+| `--sample_num_frames` | 45 | Number of frames for sample video generation |
+| `--sample_with_offloading` | off | Offload DiT to CPU between sampling prompts to save VRAM |
 | `--sample_tiled_vae` | off | Enable tiled VAE decoding during sampling to reduce VRAM |
 | `--sample_vae_tile_size` | 512 | Spatial tile size (pixels) |
 | `--sample_vae_tile_overlap` | 64 | Spatial tile overlap (pixels) |
@@ -799,6 +813,9 @@ The `--sample_include_reference` flag shows the reference side-by-side with the 
 | `--sample_merge_audio` | off | Merge generated audio into the output `.mp4` |
 | `--sample_audio_only` | off | Generate audio-only preview outputs |
 | `--sample_disable_audio` | off | Disable audio preview generation during sampling |
+| `--sample_audio_subprocess` | on | Decode audio in a subprocess to avoid OOM crashes. Use `--no-sample_audio_subprocess` to decode in-process |
+| `--sample_disable_flash_attn` | off | Force SDPA instead of FlashAttention during sampling |
+| `--sample_i2v_token_timestep_mask` | on | Use I2V token timestep masking (conditioned tokens use t=0). Use `--no-sample_i2v_token_timestep_mask` to disable |
 
 #### Precached Sample Prompts
 To avoid loading Gemma during training for sample generation, you can precache the prompt embeddings:
@@ -806,6 +823,11 @@ To avoid loading Gemma during training for sample generation, you can precache t
 1. During text encoder caching, add `--precache_sample_prompts --sample_prompts sampling_prompts.txt` to also cache the sample prompt embeddings.
 2. During training, add `--use_precached_sample_prompts` (or `--precache_sample_prompts`) to load embeddings from cache instead of running Gemma.
 - `--sample_prompts_cache`: Path to the precached embeddings file. Defaults to `<cache_directory>/ltx2_sample_prompts_cache.pt`.
+
+For IC-LoRA / V2V training, you can also precache the conditioning image latents during latent caching (see [Latent Caching Arguments](#latent-caching-arguments)):
+1. During latent caching, add `--precache_sample_latents --sample_prompts sampling_prompts.txt`.
+2. During training, add `--use_precached_sample_latents` to load conditioning latents from cache instead of loading the VAE encoder.
+- `--sample_latents_cache`: Path to the precached latents file. Defaults to `<cache_directory>/ltx2_sample_latents_cache.pt`.
 
 #### Two-Stage Sampling (WIP)
 
@@ -828,10 +850,11 @@ Saved LoRA checkpoints are converted to ComfyUI format by default. Both the orig
 | *(default)* | Saves both `*.safetensors` (original) and `*.comfy.safetensors` (ComfyUI). |
 | `--no_save_original_lora` | Deletes the original after conversion, keeping only `*.comfy.safetensors`. |
 | `--no_convert_to_comfy` | Saves only the original `*.safetensors` (no conversion). |
+| `--save_checkpoint_metadata` | Saves a `.json` sidecar file alongside each checkpoint with loss, lr, step, and epoch. |
 
 > **Important:** Training can only be resumed from the **original** (non-comfy) checkpoint format. If you plan to use `--resume`, do not use `--no_save_original_lora`.
 
-Checkpoint rotation (`--save_last_n_ckpts`) cleans up old ComfyUI checkpoints alongside originals. HuggingFace upload (`--huggingface_repo_id`) uploads both formats by default. Use `--no_save_original_lora` to upload only the ComfyUI checkpoint.
+Checkpoint rotation (`--save_last_n_epochs`) cleans up old ComfyUI checkpoints alongside originals. HuggingFace upload (`--huggingface_repo_id`) uploads both formats by default. Use `--no_save_original_lora` to upload only the ComfyUI checkpoint.
 
 ---
 
@@ -853,12 +876,16 @@ python ltx2_merge_lora.py ^
 - `--lora_weight`: Input LoRA paths to merge in order (required).
 - `--lora_multiplier`: Per-LoRA multipliers aligned with `--lora_weight`. Use one value to apply the same multiplier to all inputs.
 - `--save_merged_lora`: Output merged LoRA path (required).
+- `--merge_method concat|orthogonal`: Merge method (default: `concat`). `concat` keeps all ranks by concatenation. `orthogonal` uses SVD refactorization to merge exactly 2 LoRAs with orthogonal projection.
+- `--orthogonal_k_fraction`: Fraction of top singular directions projected out bilaterally before combining (default: `0.5`, range `[0, 1]`). Only used with `--merge_method orthogonal`.
+- `--orthogonal_rank_mode sum|max|min`: Target rank mode for orthogonal merge (default: `sum`).
 - `--dtype auto|float32|float16|bfloat16`: Output tensor dtype. `auto` promotes from input dtypes.
 - `--emit_alpha`: Force writing `<module>.alpha` keys in output.
 
 ### Notes
 - This merger is intended for LTX-2 LoRA formats used in this repo, including Comfy-style `lora_A/lora_B` weights.
 - It handles different ranks and partial module overlap across input LoRAs.
+- Orthogonal merge requires exactly 2 input LoRAs.
 
 ---
 
@@ -881,10 +908,26 @@ The dataset config is a TOML file with `[general]` defaults and `[[datasets]]` e
 | `batch_size` | int | 1 | Batch size |
 | `num_repeats` | int | 1 | Dataset repetitions |
 | `enable_bucket` | bool | false | Enable resolution bucketing |
+| `bucket_no_upscale` | bool | false | Prevent upscaling when bucketing (only downscale to fit) |
 | `cache_directory` | string | — | Latent cache output directory |
 | `reference_directory` | string | — | Reference images/videos for IC-LoRA (matched by filename) |
 | `reference_cache_directory` | string | — | Output directory for cached reference latents (IC-LoRA) |
 | `separate_audio_buckets` | bool | false | Keep audio/non-audio items in separate batches |
+
+### Audio Dataset Options
+
+Audio-only datasets use `audio_directory` instead of `video_directory`.
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `audio_directory` | string | — | Path to audio file directory |
+| `audio_jsonl_file` | string | — | Path to JSONL metadata file |
+| `audio_bucket_strategy` | string | `"pad"` | `"pad"` (round-to-nearest, pad + mask) or `"truncate"` (floor, clip to bucket length) |
+| `audio_bucket_interval` | float | 2.0 | Bucket step size in seconds |
+| `resolution` | int or [int, int] | [960, 544] | Virtual resolution for audio-only latent geometry |
+| `batch_size` | int | 1 | Batch size |
+| `num_repeats` | int | 1 | Dataset repetitions |
+| `cache_directory` | string | — | Latent cache output directory |
 
 ### Example TOML
 
@@ -954,14 +997,14 @@ During latent caching, log messages confirm what's happening for each video:
 Auto-detected source FPS: 60.00 for my_video.mp4
 Resampling my_video.mp4: 60.00 FPS -> 25.00 FPS
 ```
-If you see **no** "Resampling" line for a video, it means source and target FPS matched (within 1%) and all frames were kept as-is. If you see unexpected frame counts in your cached latents, check these log lines first.
+If you see **no** "Resampling" line for a video, it means source and target FPS were close enough (within 1 FPS after rounding up the source) and all frames were kept as-is. If you see unexpected frame counts in your cached latents, check these log lines first.
 
 #### Quick Reference
 
 | Your situation | What to set | What happens |
 |---|---|---|
 | Mixed FPS dataset, want 25fps training | Nothing (defaults work) | Each video auto-detected, resampled to 25fps |
-| All videos are 25fps | Nothing | Auto-detected as 25fps, no resampling (within 1%) |
+| All videos are 25fps | Nothing | Auto-detected as 25fps, no resampling |
 | All videos are 60fps, want 60fps training | `target_fps = 60` | Auto-detected as 60fps, no resampling |
 | All videos are 60fps, want 25fps training | Nothing | Auto-detected as 60fps, resampled to 25fps |
 | VFR videos with wrong detection | `source_fps = 30` (your actual FPS) | Overrides auto-detection |
