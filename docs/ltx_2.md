@@ -117,7 +117,7 @@ python ltx2_cache_latents.py ^
 - `--ltx2_audio_source video|audio_files`: Use audio from the video or from external files.
 - `--ltx2_audio_dir`, `--ltx2_audio_ext`: Optional when using `--ltx2_audio_source audio_files` (default extension: `.wav`).
 - `--ltx2_checkpoint`: Required for `--ltx2_mode av` or `--ltx2_mode audio`.
-- `--audio_only_target_resolution`: Optional square override for audio-only latent geometry. If omitted, resolution is inferred from the audio dataset config.
+- `--audio_only_target_resolution`: Optional square override for audio-only latent geometry. Only takes effect when `--audio_only_sequence_resolution 0`; otherwise the fixed sequence resolution is used instead.
 - `--audio_only_target_fps`: Target FPS used to derive audio-only frame counts from audio duration (default: `25`).
 - `--audio_video_latent_channels`: Optional override for audio-only video latent channels (auto-detected from checkpoint by default).
 - `--ltx2_audio_dtype`: Data type for audio VAE encoding (default: `float16`).
@@ -133,7 +133,7 @@ python ltx2_cache_latents.py ^
 
 | File Pattern | Contents |
 |--------------|----------|
-| `*_ltx2.safetensors` | Video latents: `latents_{F}x{H}x{W}_{dtype}`. In audio-only mode, this file also stores `ltx2_virtual_num_frames_int32`, `ltx2_virtual_height_int32`, and `ltx2_virtual_width_int32` used for sigma/timestep sampling. |
+| `*_ltx2.safetensors` | Video latents: `latents_{F}x{H}x{W}_{dtype}`. In audio-only mode, this file also stores `ltx2_virtual_num_frames_int32` (used for timestep sampling) and `ltx2_virtual_height_int32`/`ltx2_virtual_width_int32` (only used when `--audio_only_sequence_resolution 0`). |
 | `*_ltx2_audio.safetensors` | Audio latents: `audio_latents_{T}x{mel_bins}x{channels}_{dtype}`, `audio_lengths_int32` |
 
 ### Memory Optimization for Caching
@@ -634,7 +634,7 @@ The cache file is saved to `<cache_directory>/ltx2_preservation_cache.pt` by def
 
 > [!NOTE]
 > The `shifted_logit_normal` shift is linearly interpolated from 0.95 (at 1024 tokens) to 2.05 (at 4096 tokens) based on sequence length.
-> In `--ltx2_mode audio`, `shifted_logit_normal` uses the sequence length derived during latent caching (from audio duration + target resolution/FPS).
+> In `--ltx2_mode audio`, `shifted_logit_normal` still needs a sequence length to compute the shift, but there is no real video spatial dimension. Using full video resolution would inflate the sequence length and skew the shift upward. Instead, `--audio_only_sequence_resolution` (default `64`) provides a small fixed spatial footprint (4 tokens/frame), keeping the shift dominated by the temporal dimension (audio duration/FPS) which actually matters.
 
 #### LoRA Targets
 Use `--lora_target_preset` to control which layers LoRA targets:
@@ -924,7 +924,6 @@ Audio-only datasets use `audio_directory` instead of `video_directory`.
 | `audio_jsonl_file` | string | — | Path to JSONL metadata file |
 | `audio_bucket_strategy` | string | `"pad"` | `"pad"` (round-to-nearest, pad + mask) or `"truncate"` (floor, clip to bucket length) |
 | `audio_bucket_interval` | float | 2.0 | Bucket step size in seconds |
-| `resolution` | int or [int, int] | [960, 544] | Virtual resolution for audio-only latent geometry |
 | `batch_size` | int | 1 | Batch size |
 | `num_repeats` | int | 1 | Dataset repetitions |
 | `cache_directory` | string | — | Latent cache output directory |
