@@ -21,7 +21,7 @@ from accelerate import Accelerator
 from safetensors.torch import load_file
 
 from musubi_tuner.hv_generate_video import setup_parser_compile
-from musubi_tuner.ltx2_train_network import LTX2NetworkTrainer, load_prompts
+from musubi_tuner.ltx2_train_network import LTX2NetworkTrainer
 from musubi_tuner.networks import lora_ltx2
 from musubi_tuner.utils.device_utils import clean_memory_on_device
 
@@ -112,6 +112,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--attn_mode", type=str, default="torch",
                         choices=["flash", "flash2", "flash3", "torch", "xformers", "sdpa"],
                         help="Attention backend")
+    # Training-style boolean attention flags (for config portability)
+    parser.add_argument("--flash_attn", action="store_true", help="Use FlashAttention (same as --attn_mode flash)")
+    parser.add_argument("--flash3", action="store_true", help="Use FlashAttention 3 (same as --attn_mode flash3)")
+    parser.add_argument("--sdpa", action="store_true", help="Use SDPA (same as --attn_mode sdpa)")
+    parser.add_argument("--xformers", action="store_true", help="Use xformers (same as --attn_mode xformers)")
     parser.add_argument("--fp8_base", action="store_true", help="Use FP8 cast for DiT weights")
     parser.add_argument("--fp8_scaled", action="store_true", help="Use scaled FP8 (requires fp8_base)")
     parser.add_argument("--fp8_w8a8", action="store_true", help="Use W8A8 quantization (requires fp8_scaled)")
@@ -209,19 +214,21 @@ def parse_args() -> argparse.Namespace:
 # ---------------------------------------------------------------------------
 
 def _configure_attention_flags(args: argparse.Namespace) -> None:
-    args.sdpa = False
-    args.flash_attn = False
-    args.flash3 = False
-    args.xformers = False
+    # If a training-style boolean flag was explicitly set, it takes priority
+    if args.flash_attn or args.flash3 or args.sdpa or args.xformers:
+        # Flags already set by argparse; ensure the others are False
+        args.flash_attn = bool(args.flash_attn)
+        args.flash3 = bool(args.flash3)
+        args.sdpa = bool(args.sdpa)
+        args.xformers = bool(args.xformers)
+        return
+
+    # Otherwise derive from --attn_mode
     attn_mode = (args.attn_mode or "torch").lower()
-    if attn_mode in {"sdpa", "torch"}:
-        args.sdpa = attn_mode == "sdpa"
-    elif attn_mode in {"flash", "flash2"}:
-        args.flash_attn = True
-    elif attn_mode == "flash3":
-        args.flash3 = True
-    elif attn_mode == "xformers":
-        args.xformers = True
+    args.sdpa = attn_mode == "sdpa"
+    args.flash_attn = attn_mode in {"flash", "flash2"}
+    args.flash3 = attn_mode == "flash3"
+    args.xformers = attn_mode == "xformers"
 
 
 # ---------------------------------------------------------------------------
@@ -360,39 +367,31 @@ def main() -> None:
 
     logger.info("Generating %d sample(s)...", len(prompts))
 
-    # -- Offloading: move transformer to CPU between prompts --
-    offload_between_prompts = bool(args.sample_with_offloading) and device.type == "cuda"
-    if offload_between_prompts:
-        transformer.to("cpu")
-        clean_memory_on_device(device)
+    # Set sampling gate args so should_sample_images() passes at step 0
+    args.sample_at_first = True
+    args.sample_every_n_steps = None
+    args.sample_every_n_epochs = None
 
-    for idx, sample_parameter in enumerate(prompts):
-        logger.info("--- Sample %d/%d ---", idx + 1, len(prompts))
+    # Delegate to the training script's sample_images(), which handles:
+    # - batch prompt encoding (loads Gemma once for all prompts)
+    # - staged offloading (transformer ↔ VAE on GPU)
+    # - VAE pre-loading for offloading mode
+    # - distributed inference support
+    # - per-prompt error recovery
+    # - RNG state preservation
+    # - audio component management
+    trainer.sample_images(
+        accelerator=accelerator,
+        args=args,
+        epoch=0,
+        steps=0,
+        vae=None,           # lazy-loaded by sample_image_inference()
+        transformer=transformer,
+        sample_parameters=prompts,
+        dit_dtype=trainer.dit_dtype or torch.float32,
+    )
 
-        if offload_between_prompts:
-            if hasattr(transformer, "move_to_device_except_swap_blocks"):
-                transformer.move_to_device_except_swap_blocks(device)
-            else:
-                transformer.to(device)
-            clean_memory_on_device(device)
-
-        trainer.sample_image_inference(
-            accelerator=accelerator,
-            args=args,
-            transformer=transformer,
-            dit_dtype=trainer.dit_dtype or torch.float32,
-            vae=None,  # loaded lazily inside sample_image_inference
-            save_dir=args.output_dir,
-            sample_parameter=sample_parameter,
-            epoch=None,
-            steps=idx,
-        )
-
-        if offload_between_prompts:
-            transformer.to("cpu")
-            clean_memory_on_device(device)
-
-    logger.info("Generation complete. Outputs saved to %s", args.output_dir)
+    logger.info("Generation complete. Outputs saved to %s", os.path.join(args.output_dir, "sample"))
 
 
 if __name__ == "__main__":
