@@ -202,6 +202,7 @@ def build_audio_only_video_latent(
     target_height: int,
     target_fps: float,
     audio_path: str,
+    sequence_resolution: int = 64,
     temporal_downsample_factor: int = LTX2_VIDEO_TEMPORAL_DOWNSAMPLE_FACTOR,
     spatial_downsample_factor: int = LTX2_VIDEO_SPATIAL_DOWNSAMPLE_FACTOR,
 ) -> tuple[torch.Tensor, int, tuple[int, int, int]]:
@@ -212,8 +213,15 @@ def build_audio_only_video_latent(
             "Audio-only mode requires duration-aware video latent geometry."
         )
     virtual_latent_frames = max((frame_count - 1) // int(temporal_downsample_factor) + 1, 1)
-    virtual_latent_h = max(int(target_height) // int(spatial_downsample_factor), 1)
-    virtual_latent_w = max(int(target_width) // int(spatial_downsample_factor), 1)
+    # Audio-only training does not optimize video loss, so huge virtual spatial geometry
+    # only distorts sequence-length-dependent timestep sampling. Use minimal spatial
+    # tokens by default, while keeping an override for advanced users.
+    if int(sequence_resolution) > 0:
+        virtual_latent_h = max(int(sequence_resolution) // int(spatial_downsample_factor), 1)
+        virtual_latent_w = max(int(sequence_resolution) // int(spatial_downsample_factor), 1)
+    else:
+        virtual_latent_h = max(int(target_height) // int(spatial_downsample_factor), 1)
+        virtual_latent_w = max(int(target_width) // int(spatial_downsample_factor), 1)
     latent = torch.zeros(
         (
             int(channels),
@@ -1005,6 +1013,12 @@ def main() -> None:
             raise ValueError(
                 f"Audio-only target resolution must be >= 32x32, got {target_width}x{target_height}."
             )
+        audio_only_sequence_resolution = int(getattr(args, "audio_only_sequence_resolution", 64))
+        if audio_only_sequence_resolution != 0 and audio_only_sequence_resolution < 32:
+            raise ValueError(
+                "audio_only_sequence_resolution must be 0 (use dataset/target resolution) "
+                f"or >= 32, got {audio_only_sequence_resolution}."
+            )
 
         def encode_audio_only_video_latents(batch: List[ItemInfo]) -> None:
             for item in batch:
@@ -1016,6 +1030,7 @@ def main() -> None:
                     target_height=target_height,
                     target_fps=target_fps,
                     audio_path=audio_path,
+                    sequence_resolution=audio_only_sequence_resolution,
                 )
                 virtual_frames, virtual_height, virtual_width = virtual_geometry
                 item.frame_count = frame_count
@@ -1064,8 +1079,10 @@ def main() -> None:
         for ds in datasets:
             if not isinstance(ds, (VideoDataset, AudioDataset)):
                 continue
-            ds_target_fps = getattr(ds, "target_fps", VideoDataset.TARGET_FPS_LTX2)
             if audio_only:
+                ds_target_fps = target_fps
+            else:
+                ds_target_fps = getattr(ds, "target_fps", VideoDataset.TARGET_FPS_LTX2)
                 if not isinstance(ds_target_fps, (int, float)) or float(ds_target_fps) <= 0:
                     ds_target_fps = float(VideoDataset.TARGET_FPS_LTX2)
             num_workers = args.num_workers if args.num_workers is not None else max(1, (os.cpu_count() or 2) - 1)
@@ -1178,6 +1195,15 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         type=float,
         default=VideoDataset.TARGET_FPS_LTX2,
         help="Target FPS used to convert audio duration into video frame count in audio-only mode.",
+    )
+    parser.add_argument(
+        "--audio_only_sequence_resolution",
+        type=int,
+        default=64,
+        help=(
+            "Virtual pixel resolution used to derive audio-only sequence length for timestep sampling. "
+            "Use 0 to fall back to dataset/target resolution behavior."
+        ),
     )
     parser.add_argument(
         "--precache_sample_latents",

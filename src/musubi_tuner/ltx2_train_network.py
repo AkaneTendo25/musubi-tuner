@@ -649,6 +649,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
         self._i2v_training: bool = False
         self._ltx_mode: str = "video"
         self._logged_audio_only_timestep_shift: bool = False
+        self._audio_only_sequence_resolution: int = 64
         self.default_guidance_scale = 3.0
         self._audio_preview_config: Optional[Dict[str, int | float]] = None
 
@@ -1271,12 +1272,23 @@ class LTX2NetworkTrainer(NetworkTrainer):
             return None
 
         num_frames = _as_batch_int_tensor(latents_info.get("num_frames"))
+        if num_frames is None:
+            return None
+
+        # Audio-only mode does not optimize video loss; use a minimal virtual spatial
+        # area by default to avoid over-scaling shifted_logit_normal with large
+        # (irrelevant) video resolutions.
+        seq_res = int(getattr(self, "_audio_only_sequence_resolution", 64))
+        if seq_res > 0:
+            spatial_downsample = int(getattr(getattr(self, "vae", None), "spatial_downsample_factor", 32))
+            latent_hw = max(seq_res // max(spatial_downsample, 1), 1)
+            return num_frames * latent_hw * latent_hw
+
         height = _as_batch_int_tensor(latents_info.get("height"))
         width = _as_batch_int_tensor(latents_info.get("width"))
-        if num_frames is None or height is None or width is None:
+        if height is None or width is None:
             return None
-        seq_lens = num_frames * height * width
-        return seq_lens
+        return num_frames * height * width
 
     def _resolve_shifted_logit_normal_shift(
         self,
@@ -1473,6 +1485,13 @@ class LTX2NetworkTrainer(NetworkTrainer):
         self._ltx_mode = ltx_mode
         self._audio_video = self._ltx_mode in {"av", "audio"}
         self.default_guidance_scale = 1.0
+        audio_only_sequence_resolution = int(getattr(args, "audio_only_sequence_resolution", 64))
+        if audio_only_sequence_resolution != 0 and audio_only_sequence_resolution < 32:
+            raise ValueError(
+                "audio_only_sequence_resolution must be 0 (use cached virtual geometry) "
+                f"or >= 32, got {audio_only_sequence_resolution}."
+            )
+        self._audio_only_sequence_resolution = audio_only_sequence_resolution
 
         args.weighting_scheme = "none"
 
@@ -4483,7 +4502,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
             # decode audio in a separate process to avoid native crashes / OOM segfaults.
             if audio_decoder is None and vocoder is None:
                 if audio_output_path and enable_audio_preview:
-                    logger.info("Sampling: decoding audio via subprocess (safe for low VRAM)")
+                    logger.info("Sampling: decoding audio via subprocess")
                     if offload_transformer_for_decode:
                         vae.to_device(original_vae_device)
                         clean_memory_on_device(transformer_device)
@@ -5137,6 +5156,15 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         "--independent_audio_timestep",
         action="store_true",
         help="Sample independent timesteps for audio noising/conditioning in AV and audio modes.",
+    )
+    parser.add_argument(
+        "--audio_only_sequence_resolution",
+        type=int,
+        default=64,
+        help=(
+            "Virtual pixel resolution used to derive sequence length for shifted_logit_normal "
+            "in --ltx_mode audio. Set 0 to use cached virtual geometry."
+        ),
     )
     parser.add_argument(
         "--audio_silence_regularizer",

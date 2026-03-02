@@ -32,6 +32,19 @@ DEFAULT_SAMPLE_PROMPTS_CACHE = "ltx2_sample_prompts_cache.pt"
 DEFAULT_PRESERVATION_CACHE = "ltx2_preservation_cache.pt"
 
 
+def _all_declared_datasets_are_audio(user_config: dict) -> bool:
+    declared_datasets: list[dict] = []
+    for section_name in ("datasets", "validation_datasets"):
+        section = user_config.get(section_name, [])
+        if isinstance(section, list):
+            declared_datasets.extend(ds for ds in section if isinstance(ds, dict))
+
+    if not declared_datasets:
+        return False
+
+    return all(("audio_directory" in ds or "audio_jsonl_file" in ds) for ds in declared_datasets)
+
+
 def encode_and_save_batch_official_gemma(
     text_encoder,
     batch: list[ItemInfo],
@@ -251,15 +264,20 @@ def main() -> None:
     if getattr(args, "ltx_mode", None) in short_map:
         args.ltx_mode = short_map[args.ltx_mode]
 
-    ltx_mode = getattr(args, "ltx_mode", "video")
-    # For audio-only or AV mode, we need the AV encoder to get audio encodings
-    audio_video = ltx_mode in ("av", "audio")
-
     device = torch.device(args.device if args.device is not None else ("cuda" if torch.cuda.is_available() else "cpu"))
 
     blueprint_generator = BlueprintGenerator(ConfigSanitizer())
     logger.info("Load dataset config from %s", args.dataset_config)
     user_config = config_utils.load_user_config(args.dataset_config)
+    ltx_mode = getattr(args, "ltx_mode", "video")
+    if ltx_mode == "video" and _all_declared_datasets_are_audio(user_config):
+        logger.info("All datasets are audio-only; automatically switching to --ltx2_mode audio")
+        ltx_mode = "audio"
+        args.ltx_mode = "audio"
+
+    # For audio-only or AV mode, we need the AV encoder to get audio encodings
+    audio_video = ltx_mode in ("av", "audio")
+
     blueprint = blueprint_generator.generate(user_config, args, architecture=ARCHITECTURE_LTX2)
     train_dataset_group = config_utils.generate_dataset_group_by_blueprint(blueprint.dataset_group)
 

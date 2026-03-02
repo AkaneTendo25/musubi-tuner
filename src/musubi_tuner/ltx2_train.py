@@ -45,6 +45,19 @@ logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
 
+def _all_declared_datasets_are_audio(user_config: dict) -> bool:
+    declared_datasets: list[dict] = []
+    for section_name in ("datasets", "validation_datasets"):
+        section = user_config.get(section_name, [])
+        if isinstance(section, list):
+            declared_datasets.extend(ds for ds in section if isinstance(ds, dict))
+
+    if not declared_datasets:
+        return False
+
+    return all(("audio_directory" in ds or "audio_jsonl_file" in ds) for ds in declared_datasets)
+
+
 def _is_attention_geometry_param(param_name: str) -> bool:
     # Attention geometry parameters most tied to motion priors.
     return re.search(
@@ -2221,6 +2234,11 @@ def main() -> None:
     short_map = {"v": "video", "a": "audio", "va": "av"}
     if getattr(args, "ltx_mode", None) in short_map:
         args.ltx_mode = short_map[args.ltx_mode]
+    if getattr(args, "ltx_mode", "video") == "video":
+        user_config = config_utils.load_user_config(args.dataset_config)
+        if _all_declared_datasets_are_audio(user_config):
+            logger.info("All datasets are audio-only; automatically switching to --ltx2_mode audio")
+            args.ltx_mode = "audio"
 
     trainer.handle_model_specific_args(args)
     if getattr(args, "ltx_mode", "video") == "av" and not getattr(args, "av_use_video_prompt_embeds", False):
