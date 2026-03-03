@@ -33,6 +33,7 @@
     - [Audio-Video Support](#audio-video-support)
     - [Loss Weighting](#loss-weighting)
     - [Additional Audio Training Flags](#additional-audio-training-flags)
+    - [Per-Module Learning Rates](#per-module-learning-rates)
     - [Preservation & Regularization](#preservation--regularization)
     - [CREPA (Cross-frame Representation Alignment)](#crepa-cross-frame-representation-alignment)
       - [Caching DINOv2 Features (Dino Mode)](#caching-dinov2-features-dino-mode)
@@ -505,6 +506,30 @@ Use `ema_mag` when audio and video losses have different natural magnitudes and 
 - `--audio_supervision_warmup_steps`: Expected AV batches before supervision checks.
 - `--audio_supervision_check_interval`: Run supervision checks every N expected AV batches.
 - `--audio_supervision_min_ratio`: Minimum supervised/expected ratio required by the monitor.
+
+#### Per-Module Learning Rates
+
+Set different learning rates for audio vs. video LoRA modules. Useful when audio modules need a lower LR to stabilize AV training.
+
+- `--audio_lr <float>`: Learning rate for all audio LoRA modules (names containing `audio_`). Defaults to `--learning_rate`.
+- `--lr_args <pattern=lr> ...`: Regex-based per-module LR overrides. Patterns are matched against LoRA module names via `re.search`.
+
+Priority (highest to lowest): `--lr_args` pattern match > `--audio_lr` catch-all > `--learning_rate` default.
+
+Example:
+```bash
+--learning_rate 1e-4 ^
+--audio_lr 1e-5 ^
+--lr_args audio_attn=1e-6 video_to_audio=5e-6
+```
+
+Result:
+- `audio_attn` modules → 1e-6 (matched by `--lr_args`)
+- `video_to_audio` modules → 5e-6 (matched by `--lr_args`)
+- Other `audio_*` modules (e.g. `audio_ff`) → 1e-5 (`--audio_lr`)
+- Video modules → 1e-4 (`--learning_rate`)
+
+Works with LoRA+ (`loraplus_lr_ratio`): the up/down split applies within each LR group. Both flags default to `None` and are fully backward-compatible.
 
 #### Preservation & Regularization
 

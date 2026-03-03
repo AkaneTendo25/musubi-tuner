@@ -2217,7 +2217,11 @@ class NetworkTrainer:
         # prepare optimizer, data loader etc.
         accelerator.print("prepare optimizer, data loader etc.")
 
-        trainable_params, lr_descriptions = network.prepare_optimizer_params(unet_lr=args.learning_rate)
+        trainable_params, lr_descriptions = network.prepare_optimizer_params(
+            unet_lr=args.learning_rate,
+            audio_lr=getattr(args, "audio_lr", None),
+            lr_args=getattr(args, "lr_args", None),
+        )
 
         optimizer_name, optimizer_args, optimizer, optimizer_train_fn, optimizer_eval_fn = self.get_optimizer(
             args, trainable_params
@@ -2481,6 +2485,8 @@ class NetworkTrainer:
             "ss_timestep_sampling": args.timestep_sampling,
             "ss_sigmoid_scale": args.sigmoid_scale,
             "ss_discrete_flow_shift": args.discrete_flow_shift,
+            "ss_audio_lr": getattr(args, "audio_lr", None),
+            "ss_lr_args": json.dumps(getattr(args, "lr_args", None)) if getattr(args, "lr_args", None) else None,
         }
 
         datasets_metadata = []

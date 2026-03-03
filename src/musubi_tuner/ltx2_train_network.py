@@ -5581,6 +5581,24 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
              "lambda_crepa=0.1 tau=1.0 num_neighbors=2 schedule=constant normalize=true",
     )
 
+    # -- Per-module learning rate groups --
+    parser.add_argument(
+        "--audio_lr",
+        type=float,
+        default=None,
+        help="Learning rate for audio LoRA modules (audio_attn, audio_ff, cross-modal). "
+             "Overridden by more specific --lr_args patterns. Defaults to --learning_rate.",
+    )
+    parser.add_argument(
+        "--lr_args",
+        type=str,
+        nargs="*",
+        default=None,
+        help="Per-module learning rate overrides (pattern=lr). Patterns are matched via regex "
+             "against LoRA module names. Example: --lr_args audio_attn=1e-6 audio_ff=1e-6 "
+             "video_to_audio=1e-5",
+    )
+
     # -- Caption dropout --
     parser.add_argument(
         "--caption_dropout_rate",

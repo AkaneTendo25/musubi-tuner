@@ -708,9 +708,80 @@ class LoRANetwork(torch.nn.Module):
         logger.info(f"LoRA+ UNet LR Ratio: {self.loraplus_lr_ratio}")
         # logger.info(f"LoRA+ Text Encoder LR Ratio: {self.loraplus_text_encoder_lr_ratio or self.loraplus_lr_ratio}")
 
-    def prepare_optimizer_params(self, unet_lr: float = 1e-4, **kwargs):
+    def prepare_optimizer_params(self, unet_lr: float = 1e-4, audio_lr=None, lr_args=None, **kwargs):
         self.requires_grad_(True)
 
+        # Parse lr_args from CLI format ["pattern=lr", ...] → dict
+        lr_patterns = {}
+        if lr_args:
+            for entry in lr_args:
+                if "=" not in entry:
+                    raise ValueError(f"Invalid --lr_args entry (expected pattern=lr): {entry}")
+                pattern, lr_str = entry.split("=", 1)
+                lr_patterns[pattern] = float(lr_str)
+
+        # If no custom LR config, use original fast path
+        if not lr_patterns and audio_lr is None:
+            return self._prepare_optimizer_params_simple(unet_lr)
+
+        # Group LoRA modules by resolved LR
+        lr_to_params = {}  # lr_value → {"lora": {name: param}, "plus": {name: param}}
+        lr_to_desc = {}  # lr_value → description string
+
+        for lora in self.unet_loras:
+            resolved_lr = unet_lr  # default
+            desc = "video"
+
+            # Check lr_args patterns first (highest priority)
+            matched_pattern = False
+            for pattern, pattern_lr in lr_patterns.items():
+                if re.search(pattern, lora.lora_name):
+                    resolved_lr = pattern_lr
+                    desc = pattern
+                    matched_pattern = True
+                    break
+
+            # If no pattern matched, check audio_lr
+            if not matched_pattern and audio_lr is not None:
+                if "audio_" in lora.lora_name:
+                    resolved_lr = audio_lr
+                    desc = "audio"
+
+            # Add params to the correct LR group
+            group = lr_to_params.setdefault(resolved_lr, {"lora": {}, "plus": {}})
+            lr_to_desc.setdefault(resolved_lr, desc)
+            for name, param in lora.named_parameters():
+                key = f"{lora.lora_name}.{name}"
+                if self.loraplus_lr_ratio is not None and "lora_up" in name:
+                    group["plus"][key] = param
+                else:
+                    group["lora"][key] = param
+
+        # Build final param groups
+        all_params = []
+        lr_descriptions = []
+        for lr_val in sorted(lr_to_params.keys()):
+            groups = lr_to_params[lr_val]
+            desc = lr_to_desc[lr_val]
+            for key in ("lora", "plus"):
+                if not groups[key]:
+                    continue
+                param_data = {"params": list(groups[key].values()), "lr": lr_val}
+                if key == "plus" and self.loraplus_lr_ratio:
+                    param_data["lr"] = lr_val * self.loraplus_lr_ratio
+                all_params.append(param_data)
+                suffix = " plus" if key == "plus" else ""
+                lr_descriptions.append(f"unet_{desc}{suffix}")
+
+        # Log group breakdown
+        logger.info(f"LR groups: {len(all_params)} groups created")
+        for param_data, desc in zip(all_params, lr_descriptions):
+            logger.info(f"  {desc}: lr={param_data['lr']}, {len(param_data['params'])} params")
+
+        return all_params, lr_descriptions
+
+    def _prepare_optimizer_params_simple(self, unet_lr: float = 1e-4):
+        """Original single-group optimizer param assembly (no per-module LR)."""
         all_params = []
         lr_descriptions = []
 
