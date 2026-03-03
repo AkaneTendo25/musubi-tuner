@@ -66,6 +66,96 @@ _pinned_buffer_cache = {}
 _FIRST_SWAP_TRACED = False  # Flag for first-swap VRAM tracing
 _LOGGED_FULL_BLOCK_PINNED = False
 
+
+class PinnedSlabPool:
+    """Pre-allocated pool of pinned CPU tensors for async DMA transfers.
+
+    Instead of lazily allocating pinned buffers per-parameter (the old _pinned_buffer_cache),
+    this pre-allocates a fixed number of pinned tensors at startup based on the shapes
+    needed by the model's blocks. Tensors are acquired/released explicitly.
+    """
+
+    def __init__(self):
+        self._pools: dict[tuple, list[torch.Tensor]] = {}  # (shape, dtype) -> [free tensors]
+        self._in_use: dict[int, tuple] = {}  # id(tensor) -> (shape, dtype) key
+        self._total_bytes = 0
+
+    def warmup(self, blocks: list[nn.Module], num_buffers_per_shape: int = 2):
+        """Pre-allocate pinned buffers matching the parameter shapes found in blocks.
+
+        Args:
+            blocks: transformer blocks to inspect for parameter shapes
+            num_buffers_per_shape: how many buffers to pre-allocate per unique (shape, dtype)
+        """
+        shapes_needed: set[tuple] = set()
+        if blocks:
+            for p in blocks[0].parameters():
+                shapes_needed.add((p.shape, p.dtype))
+            for buf in blocks[0].buffers():
+                shapes_needed.add((buf.shape, buf.dtype))
+
+        for shape, dtype in shapes_needed:
+            key = (shape, dtype)
+            if key not in self._pools:
+                self._pools[key] = []
+            for _ in range(num_buffers_per_shape):
+                t = torch.empty(shape, dtype=dtype, device="cpu", pin_memory=True)
+                self._pools[key].append(t)
+                self._total_bytes += t.numel() * t.element_size()
+
+        logger.info(
+            "PinnedSlabPool: allocated %.2f MB across %d unique shapes",
+            self._total_bytes / (1024**2),
+            len(self._pools),
+        )
+
+    def acquire(self, shape: tuple, dtype: torch.dtype) -> Optional[torch.Tensor]:
+        """Get a free pinned buffer matching shape/dtype, or None if pool exhausted."""
+        key = (shape, dtype)
+        pool = self._pools.get(key)
+        if pool:
+            tensor = pool.pop()
+            self._in_use[id(tensor)] = key
+            return tensor
+        return None
+
+    def release(self, tensor: torch.Tensor):
+        """Return a tensor to the pool."""
+        tid = id(tensor)
+        key = self._in_use.pop(tid, None)
+        if key is not None:
+            self._pools[key].append(tensor)
+
+    def acquire_or_alloc(self, shape: tuple, dtype: torch.dtype) -> torch.Tensor:
+        """Get from pool or allocate a new pinned tensor (fallback)."""
+        t = self.acquire(shape, dtype)
+        if t is not None:
+            return t
+        # Fallback: allocate on demand (same as old behavior)
+        return torch.empty(shape, dtype=dtype, device="cpu", pin_memory=True)
+
+    @property
+    def stats(self) -> str:
+        free = sum(len(v) for v in self._pools.values())
+        in_use = len(self._in_use)
+        return f"PinnedSlabPool: {free} free, {in_use} in-use, {self._total_bytes / (1024**2):.1f}MB total"
+
+
+# Global pinned slab pool instance (lazily initialized when LTX2_SWAP_SLAB_POOL=1)
+_pinned_slab_pool: Optional[PinnedSlabPool] = None
+
+
+def get_pinned_slab_pool() -> Optional[PinnedSlabPool]:
+    """Return the global PinnedSlabPool if slab pool mode is enabled."""
+    return _pinned_slab_pool
+
+
+def init_pinned_slab_pool() -> PinnedSlabPool:
+    """Create and set the global PinnedSlabPool instance."""
+    global _pinned_slab_pool
+    _pinned_slab_pool = PinnedSlabPool()
+    return _pinned_slab_pool
+
 def _trace_first_swap_vram(tag: str):
     """Trace VRAM during first swap operation."""
     global _FIRST_SWAP_TRACED
@@ -114,14 +204,15 @@ def set_fp8_offload_keep_fp8(enable: bool) -> None:
     global _FP8_OFFLOAD_KEEP_FP8
     _FP8_OFFLOAD_KEEP_FP8 = bool(enable)
 
-def weighs_to_device(layer: nn.Module, device: torch.device, skip_trainable: bool = True, use_pinned: bool = False):
+def weighs_to_device(layer: nn.Module, device: torch.device, skip_trainable: bool = True, use_pinned: bool = False, pinned_pool: Optional[PinnedSlabPool] = None):
     """Move layer weights to device.
-    
+
     Args:
         layer: Module to process
         device: Target device
         skip_trainable: If True AND target is CPU, skip parameters with requires_grad=True
         use_pinned: If True and target is CPU, use cached pinned memory.
+        pinned_pool: If provided, use pool.acquire_or_alloc() instead of _pinned_buffer_cache.
     """
     non_blocking = device.type != "cpu"
     # Only skip trainable parameters when moving TO CPU (offloading), not when loading TO GPU
@@ -199,22 +290,23 @@ def weighs_to_device(layer: nn.Module, device: torch.device, skip_trainable: boo
                         continue
                     
                     if use_pinned and device.type == "cpu":
-                        # Reuse or allocate pinned buffer
-                        pid = id(p)
-                        if (
-                            pid not in _pinned_buffer_cache
-                            or _pinned_buffer_cache[pid].shape != p.data.shape
-                            or _pinned_buffer_cache[pid].dtype != p.data.dtype
-                        ):
-                            # Allocate new pinned buffer
-                            _pinned_buffer_cache[pid] = torch.empty_like(p, device="cpu", pin_memory=True)
-                        
-                        target_buffer = _pinned_buffer_cache[pid]
+                        if pinned_pool is not None:
+                            target_buffer = pinned_pool.acquire_or_alloc(tuple(p.data.shape), p.data.dtype)
+                        else:
+                            # Reuse or allocate pinned buffer (legacy dict path)
+                            pid = id(p)
+                            if (
+                                pid not in _pinned_buffer_cache
+                                or _pinned_buffer_cache[pid].shape != p.data.shape
+                                or _pinned_buffer_cache[pid].dtype != p.data.dtype
+                            ):
+                                _pinned_buffer_cache[pid] = torch.empty_like(p, device="cpu", pin_memory=True)
+                            target_buffer = _pinned_buffer_cache[pid]
                         target_buffer.copy_(p.data, non_blocking=non_blocking)
                         p.data = target_buffer
                     else:
                         p.data = p.data.to(device, non_blocking=non_blocking)
-            
+
             # LoRA Handling for monkey-patched modules
             if should_skip_trainable:
                 continue
@@ -227,7 +319,7 @@ def weighs_to_device(layer: nn.Module, device: torch.device, skip_trainable: boo
 
 
 
-def params_to_device(layer: nn.Module, device: torch.device, include_norms: bool = False, use_pinned: bool = False, skip_trainable: bool = True):
+def params_to_device(layer: nn.Module, device: torch.device, include_norms: bool = False, use_pinned: bool = False, skip_trainable: bool = True, pinned_pool: Optional[PinnedSlabPool] = None):
     """Move module parameters to device, optionally including normalization layers.
 
     Args:
@@ -236,6 +328,7 @@ def params_to_device(layer: nn.Module, device: torch.device, include_norms: bool
         include_norms: If True, also move RMSNorm/LayerNorm weights (more VRAM savings, more overhead)
         use_pinned: If True and target is CPU, pin memory. If target is GPU, assumes source is pinned for async transfer.
         skip_trainable: If True AND target is CPU, skip parameters with requires_grad=True (protects LoRA params)
+        pinned_pool: If provided, use pool.acquire_or_alloc() instead of _pinned_buffer_cache.
     """
     non_blocking = device.type != "cpu"
     # Only skip trainable parameters when moving TO CPU (offloading), not when loading TO GPU
@@ -256,20 +349,23 @@ def params_to_device(layer: nn.Module, device: torch.device, include_norms: bool
                     if should_skip_trainable and hasattr(p, 'requires_grad') and p.requires_grad:
                         continue
                     if device.type == "cpu" and use_pinned:
-                        # Reuse or allocate pinned buffer
-                        pid = id(p)
-                        if (
-                            pid not in _pinned_buffer_cache
-                            or _pinned_buffer_cache[pid].shape != p.data.shape
-                            or _pinned_buffer_cache[pid].dtype != p.data.dtype
-                        ):
-                            _pinned_buffer_cache[pid] = torch.empty_like(p, device="cpu", pin_memory=True)
-                        target_buffer = _pinned_buffer_cache[pid]
+                        if pinned_pool is not None:
+                            target_buffer = pinned_pool.acquire_or_alloc(tuple(p.data.shape), p.data.dtype)
+                        else:
+                            # Reuse or allocate pinned buffer (legacy dict path)
+                            pid = id(p)
+                            if (
+                                pid not in _pinned_buffer_cache
+                                or _pinned_buffer_cache[pid].shape != p.data.shape
+                                or _pinned_buffer_cache[pid].dtype != p.data.dtype
+                            ):
+                                _pinned_buffer_cache[pid] = torch.empty_like(p, device="cpu", pin_memory=True)
+                            target_buffer = _pinned_buffer_cache[pid]
                         target_buffer.copy_(p.data, non_blocking=non_blocking)
                         p.data = target_buffer
                     else:
                         p.data = p.data.to(device, non_blocking=non_blocking)
-        
+
         # Normalization layers (if enabled)
         elif include_norms and class_name.endswith(norm_patterns):
             for attr in ["weight", "bias"]:
@@ -279,11 +375,14 @@ def params_to_device(layer: nn.Module, device: torch.device, include_norms: bool
                     if should_skip_trainable and hasattr(p, 'requires_grad') and p.requires_grad:
                         continue
                     if device.type == "cpu" and use_pinned:
-                        # Reuse or allocate pinned buffer
-                        pid = id(p)
-                        if pid not in _pinned_buffer_cache:
-                            _pinned_buffer_cache[pid] = torch.empty_like(p, device="cpu", pin_memory=True)
-                        target_buffer = _pinned_buffer_cache[pid]
+                        if pinned_pool is not None:
+                            target_buffer = pinned_pool.acquire_or_alloc(tuple(p.data.shape), p.data.dtype)
+                        else:
+                            # Reuse or allocate pinned buffer (legacy dict path)
+                            pid = id(p)
+                            if pid not in _pinned_buffer_cache:
+                                _pinned_buffer_cache[pid] = torch.empty_like(p, device="cpu", pin_memory=True)
+                            target_buffer = _pinned_buffer_cache[pid]
                         target_buffer.copy_(p.data, non_blocking=non_blocking)
                         p.data = target_buffer
                     else:
@@ -303,12 +402,17 @@ class Offloader:
         device: torch.device,
         use_pinned_memory: bool = False,
         debug: bool = False,
+        prefetch_window: int = 1,
     ):
         self.block_type = block_type
         self.num_blocks = num_blocks
         self.blocks_to_swap = min(blocks_to_swap, num_blocks)
         self.device = device
         self.use_pinned_memory = use_pinned_memory
+        self.prefetch_window = max(1, prefetch_window)
+
+        # Track which blocks are currently on GPU (for eviction scoring)
+        self.gpu_resident_blocks: set[int] = set()
 
         # check if debug is enabled from os environment variable
         if not debug:
@@ -871,6 +975,40 @@ class Offloader:
         if self.debug:
             print(f"[{self.block_type}] Waited for block {block_idx}: {time.perf_counter() - start_time:.2f}s")
 
+    def _score_for_eviction(self, block_idx: int, current_block: int, num_blocks: int) -> int:
+        """Score a GPU-resident block for eviction. Higher = better candidate to evict.
+
+        Uses distance-to-next-use: blocks furthest from being needed are evicted first.
+        """
+        if block_idx <= current_block:
+            # Already processed — won't be needed until backward (far away)
+            return num_blocks + (current_block - block_idx)
+        else:
+            # Not yet processed — distance is block_idx - current_block
+            return block_idx - current_block
+
+    def _pick_eviction_candidate(
+        self, current_block: int, num_blocks: int, protected: Optional[set] = None
+    ) -> Optional[int]:
+        """Pick the GPU-resident block with highest eviction score (furthest from next use).
+
+        Args:
+            current_block: the block currently being processed
+            num_blocks: total number of blocks
+            protected: block indices that must NOT be evicted (e.g., currently computing)
+        """
+        protected = protected or set()
+        best_idx = None
+        best_score = -1
+        for idx in self.gpu_resident_blocks:
+            if idx in protected:
+                continue
+            score = self._score_for_eviction(idx, current_block, num_blocks)
+            if score > best_score:
+                best_score = score
+                best_idx = idx
+        return best_idx
+
 
 class ModelOffloader(Offloader):
     """
@@ -887,8 +1025,9 @@ class ModelOffloader(Offloader):
         device: torch.device,
         use_pinned_memory: bool = False,
         debug: bool = False,
+        prefetch_window: int = 1,
     ):
-        super().__init__(block_type, num_blocks, blocks_to_swap, device, use_pinned_memory, debug)
+        super().__init__(block_type, num_blocks, blocks_to_swap, device, use_pinned_memory, debug, prefetch_window=prefetch_window)
 
         self.supports_backward = supports_backward
         self.forward_only = not supports_backward  # forward only offloading: can be changed to True for inference
@@ -992,18 +1131,48 @@ class ModelOffloader(Offloader):
                 # Preload the first swapped block when we're about to reach it
                 if block_idx == split_idx - 1 and split_idx < self.num_blocks:
                     self._submit_load_block(blocks, split_idx)
+                    self.gpu_resident_blocks.add(split_idx)
                 return
 
             # Swap range: after executing block N, unload it and load N+1
             # Use full block moves instead of Linear-only swaps for complete VRAM savings
             self._submit_unload_block(blocks, block_idx)
+            self.gpu_resident_blocks.discard(block_idx)
 
-            # Load next block to GPU
-            if block_idx + 1 < self.num_blocks:
-                self._submit_load_block(blocks, block_idx + 1)
+            if self.prefetch_window <= 1:
+                # Original single-block prefetch path
+                if block_idx + 1 < self.num_blocks:
+                    self._submit_load_block(blocks, block_idx + 1)
+                    self.gpu_resident_blocks.add(block_idx + 1)
+                else:
+                    # Last block - load first swapped block for backward pass
+                    self._submit_load_block(blocks, split_idx)
+                    self.gpu_resident_blocks.add(split_idx)
             else:
-                # Last block - load first swapped block for backward pass
-                self._submit_load_block(blocks, split_idx)
+                # Multi-block prefetch: load next `prefetch_window` blocks
+                max_gpu = self.num_blocks - self.blocks_to_swap + self.prefetch_window
+                for offset in range(1, self.prefetch_window + 1):
+                    next_idx = block_idx + offset
+                    if next_idx >= self.num_blocks:
+                        break
+                    if next_idx in self.gpu_resident_blocks:
+                        continue
+                    # If at GPU capacity, evict the furthest block first
+                    if len(self.gpu_resident_blocks) >= max_gpu:
+                        victim = self._pick_eviction_candidate(
+                            block_idx, self.num_blocks, protected={block_idx}
+                        )
+                        if victim is not None:
+                            self._submit_unload_block(blocks, victim)
+                            self.gpu_resident_blocks.discard(victim)
+                    self._submit_load_block(blocks, next_idx)
+                    self.gpu_resident_blocks.add(next_idx)
+
+                # If last block, load first swapped block for backward pass
+                if block_idx + 1 >= self.num_blocks:
+                    if split_idx not in self.gpu_resident_blocks:
+                        self._submit_load_block(blocks, split_idx)
+                        self.gpu_resident_blocks.add(split_idx)
             return
 
         # Forward-only (inference) mode: Use traditional swap strategies

@@ -281,8 +281,8 @@ class LTX2BlockSwapManager:
 class LTX2ModelOffloader(ModelOffloader):
     """LTX-2 local offloader that avoids GPU preloading for swap blocks."""
 
-    def __init__(self, *args, swap_norms: bool = False, **kwargs):
-        super().__init__(*args, **kwargs)
+    def __init__(self, *args, swap_norms: bool = False, prefetch_window: int = 1, **kwargs):
+        super().__init__(*args, prefetch_window=prefetch_window, **kwargs)
         self.swap_norms = swap_norms
         self._aggressive_backward_handles = []
 
@@ -417,6 +417,22 @@ class LTX2ModelOffloader(ModelOffloader):
         _clean_memory_on_device(self.device)
         _log_cuda_memory("after_prepare_blocks")
 
+        # Initialize gpu_resident_blocks tracking
+        self.gpu_resident_blocks = set(range(split_idx))
+
+        # Warmup pinned slab pool if enabled
+        slab_pool_enabled = os.getenv("LTX2_SWAP_SLAB_POOL", "0") == "1"
+        if slab_pool_enabled and use_pinned:
+            from musubi_tuner.ltx_2.model.ltx2_custom_offloading_utils import (
+                get_pinned_slab_pool,
+                init_pinned_slab_pool,
+            )
+            pool = get_pinned_slab_pool()
+            if pool is None:
+                pool = init_pinned_slab_pool()
+            pool.warmup(blocks, num_buffers_per_shape=max(2, self.prefetch_window))
+            logger.info("PinnedSlabPool warmed up: %s", pool.stats)
+
         # Preload first swapped block if training with aggressive swap
         # This ensures block split_idx is on GPU when forward pass reaches it
         aggressive_train_swap = os.getenv("LTX2_SWAP_TRAIN_FULL", "0") == "1"
@@ -436,6 +452,7 @@ class LTX2ModelOffloader(ModelOffloader):
                 logger.info(f"Preloading first swapped block {split_idx} to GPU (full block move)")
                 # Use full block move for consistency with aggressive swap mode
                 blocks[split_idx].to(self.device)
+                self.gpu_resident_blocks.add(split_idx)
                 _synchronize_device(self.device)
                 _log_cuda_memory(f"after_preload_block_{split_idx}")
 

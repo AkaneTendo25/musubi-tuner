@@ -474,6 +474,9 @@ class LTXModel(torch.nn.Module):
             f"Cannot swap more than {self.num_blocks - 1} blocks. Requested {self.blocks_to_swap} blocks to swap."
         )
 
+        prefetch_window = int(os.getenv("LTX2_SWAP_PREFETCH_WINDOW", "1"))
+        self._prefetch_window = prefetch_window
+
         self.offloader = LTX2ModelOffloader(
             "ltx2_block",
             self.transformer_blocks,
@@ -483,6 +486,7 @@ class LTXModel(torch.nn.Module):
             device,
             use_pinned_memory,
             swap_norms=swap_norms,
+            prefetch_window=prefetch_window,
         )
         swap_start = max(0, self.num_blocks - self.blocks_to_swap)
         for idx, block in enumerate(self.transformer_blocks):
@@ -686,21 +690,17 @@ class LTXModel(torch.nn.Module):
                 if fp8_swap_sync_strict:
                     torch.cuda.current_stream().synchronize()
 
-            # Phase 2: Prefetch Next Block
-            # Trigger load for N+1 on Transfer Stream while N is about to compute
-            if (
-                transfer_stream is not None
-                and getattr(block, "weight_cpu_offloading", False)
-                and block_idx + 1 < len(self.transformer_blocks)
-            ):
-                next_block = self.transformer_blocks[block_idx + 1]
-                # Only prefetch if next block also wants it
-                if getattr(next_block, "weight_cpu_offloading", False):
-                    with torch.cuda.stream(transfer_stream):
-                        # Safe to call because it checks p.device internally
-                        # If already loaded, it's a fast no-op.
-                        # If on CPU, it triggers H2D copy.
-                        next_block._load_weights(next_block, target_device)
+            # Phase 2: Prefetch Next k Blocks
+            # Trigger load for N+1..N+k on Transfer Stream while N is about to compute
+            prefetch_window = getattr(self, '_prefetch_window', 1)
+            if transfer_stream is not None and getattr(block, "weight_cpu_offloading", False):
+                for offset in range(1, prefetch_window + 1):
+                    look_idx = block_idx + offset
+                    if look_idx < len(self.transformer_blocks):
+                        look_block = self.transformer_blocks[look_idx]
+                        if getattr(look_block, "weight_cpu_offloading", False):
+                            with torch.cuda.stream(transfer_stream):
+                                look_block._load_weights(look_block, target_device)
 
             # Execute block (it now handles checkpointing i.e. load/compute/offload)
             # If offloading is on, block expects CPU inputs (for checkpoint savings) and returns CPU outputs

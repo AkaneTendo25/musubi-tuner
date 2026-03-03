@@ -206,6 +206,15 @@ class LTX2Env:
     # recommended=1 | old SHA=N/A | current=1
     fps_resampling_threshold: int = 1
 
+    # Number of blocks to prefetch ahead during block swap (1 = current behavior).
+    # Higher values overlap more transfers with compute but use more VRAM.
+    # recommended=1 | opt-in via LTX2_SWAP_PREFETCH_WINDOW env var
+    swap_prefetch_window: int = 1
+
+    # Use pre-allocated pinned slab pool instead of lazy per-parameter _pinned_buffer_cache.
+    # recommended=False | opt-in via LTX2_SWAP_SLAB_POOL=1 env var
+    swap_slab_pool: bool = False
+
 
 DEFAULT_ENV = LTX2Env()
 
@@ -323,3 +332,5 @@ def apply_ltx2_tweaks(args) -> None:
     _set_env_bool("LTX2_ALIGN_OUTPUT_DEVICE", t.align_output_device)
     _set_env_bool("LTX2_REQUIRE_GEMMA_ROOT", t.require_gemma_root)
     _set_env_bool("LTX2_SKIP_NOOP_ATTN_MASK", t.skip_noop_attn_mask)
+    os.environ["LTX2_SWAP_PREFETCH_WINDOW"] = str(int(t.swap_prefetch_window))
+    _set_env_bool("LTX2_SWAP_SLAB_POOL", t.swap_slab_pool)
