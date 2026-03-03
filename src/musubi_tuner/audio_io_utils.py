@@ -33,6 +33,10 @@ def coerce_decoded_audio_to_channels_first(audio: np.ndarray, channels: Optional
             return arr
         if arr.shape[1] == channels:
             return arr.T
+        # Packed interleaved in 2D: PyAV returns (1, samples*channels) for packed formats.
+        # arr.shape[0] is the number of planes (1), not the channel count.
+        if arr.shape[0] < arr.shape[1] and arr.shape[0] != channels:
+            return arr.reshape(-1, channels).T
 
     # Fallback heuristic when channel count is unknown:
     # if first axis is larger, treat as [samples, channels].
