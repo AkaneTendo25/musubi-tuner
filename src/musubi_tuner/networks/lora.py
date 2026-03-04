@@ -483,6 +483,7 @@ class LoRANetwork(torch.nn.Module):
                 exclude_re_patterns.append(re_pattern)
 
         include_re_patterns = []
+        has_include_filter = include_patterns is not None
         if include_patterns is not None:
             for pattern in include_patterns:
                 try:
@@ -523,7 +524,7 @@ class LoRANetwork(torch.nn.Module):
                                 if pattern.fullmatch(original_name):
                                     excluded = True
                                     break
-                            included = False
+                            included = not has_include_filter
                             for pattern in include_re_patterns:
                                 if pattern.fullmatch(original_name):
                                     included = True
@@ -531,6 +532,10 @@ class LoRANetwork(torch.nn.Module):
                             if excluded and not included:
                                 if verbose:
                                     logger.info(f"exclude: {original_name}")
+                                continue
+                            if has_include_filter and not included:
+                                if verbose:
+                                    logger.info(f"not included: {original_name}")
                                 continue
 
                             # filter by name (not used in the current implementation)
