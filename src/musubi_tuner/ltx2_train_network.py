@@ -292,6 +292,7 @@ def load_ltx2_model(
     torch_dtype: Optional[torch.dtype] = None,
     attn_mode: str = "torch",
     audio_video: bool = False,
+    audio_only_model: bool = False,
     split_attn_target: Optional[str] = None,
     split_attn_mode: Optional[str] = None,
     split_attn_chunk_size: int = 0,
@@ -314,7 +315,7 @@ def load_ltx2_model(
     awq_num_batches: int = 8,
     **_: Any,
 ):
-    """Load LTX-2 (video or audio-video) transformer
+    """Load LTX-2 (video, audio-video, or audio-only) transformer
 
     Args:
         model_path: Path to safetensors model weights
@@ -323,6 +324,7 @@ def load_ltx2_model(
         torch_dtype: Data type for model parameters
         attn_mode: Attention implementation (torch, flash, flash3, xformers)
         audio_video: If True, load LTXAV model; if False, load LTXV model
+        audio_only_model: If True, load LTX audio-only model (no video modules)
         **_: Additional arguments (ignored)
 
     Returns:
@@ -346,6 +348,7 @@ def load_ltx2_model(
 
     from musubi_tuner.ltx_2.loader.sft_loader import SafetensorsModelStateDictLoader
     from musubi_tuner.ltx_2.model.transformer.model_configurator import (
+        LTXAudioOnlyModelConfigurator,
         LTXModelConfigurator,
         LTXVideoOnlyModelConfigurator,
         LTXV_MODEL_COMFY_RENAMING_MAP,
@@ -398,7 +401,19 @@ def load_ltx2_model(
                 config["transformer"]["apply_gated_attention"] = True
                 logger.info("Auto-detected gated attention from checkpoint keys")
 
-    configurator = LTXModelConfigurator if audio_video else LTXVideoOnlyModelConfigurator
+    if audio_only_model and not audio_video:
+        raise ValueError("audio_only_model=True requires audio_video=True")
+
+    if audio_only_model:
+        configurator = LTXAudioOnlyModelConfigurator
+        model_variant = "audio-only"
+    elif audio_video:
+        configurator = LTXModelConfigurator
+        model_variant = "audio-video"
+    else:
+        configurator = LTXVideoOnlyModelConfigurator
+        model_variant = "video-only"
+    logger.info("LTX-2 model variant: %s", model_variant)
 
     with torch.device("meta"):
         base_model = configurator.from_config(config)
@@ -648,6 +663,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
         self._audio_video: bool = False
         self._i2v_training: bool = False
         self._ltx_mode: str = "video"
+        self._ltx2_audio_only_model: bool = False
         self._logged_audio_only_timestep_shift: bool = False
         self._audio_only_sequence_resolution: int = 64
         self.default_guidance_scale = 3.0
@@ -1484,6 +1500,9 @@ class LTX2NetworkTrainer(NetworkTrainer):
             raise ValueError(f"Invalid ltx_mode: {ltx_mode}")
         self._ltx_mode = ltx_mode
         self._audio_video = self._ltx_mode in {"av", "audio"}
+        self._ltx2_audio_only_model = bool(getattr(args, "ltx2_audio_only_model", False))
+        if self._ltx2_audio_only_model and self._ltx_mode != "audio":
+            raise ValueError("--ltx2_audio_only_model requires --ltx2_mode audio")
         self.default_guidance_scale = 1.0
         audio_only_sequence_resolution = int(getattr(args, "audio_only_sequence_resolution", 64))
         if audio_only_sequence_resolution != 0 and audio_only_sequence_resolution < 32:
@@ -1679,6 +1698,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
             torch_dtype=torch_dtype_to_use,
             attn_mode=attn_mode,
             audio_video=self._audio_video,
+            audio_only_model=self._ltx2_audio_only_model,
             split_attn_target=getattr(args, "split_attn_target", None),
             split_attn_mode=getattr(args, "split_attn_mode", None),
             split_attn_chunk_size=int(getattr(args, "split_attn_chunk_size", 0) or 0),
@@ -5012,6 +5032,11 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         default="v",
         choices=["video", "av", "audio", "v", "a", "va"],
         help="Training modality.",
+    )
+    parser.add_argument(
+        "--ltx2_audio_only_model",
+        action="store_true",
+        help="Load physically audio-only LTX-2 transformer (omit video modules). Requires --ltx2_mode audio.",
     )
     parser.add_argument(
         "--split_attn_target",

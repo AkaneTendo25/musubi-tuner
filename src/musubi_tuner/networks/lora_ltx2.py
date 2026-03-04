@@ -160,10 +160,14 @@ class LTX2Wrapper(nn.Module):
         else:
             video_latents, audio_latents = x, None
 
+        model_type = getattr(self.model, "model_type", None)
+        model_video_enabled = bool(model_type.is_video_enabled()) if model_type is not None else True
+        model_audio_enabled = bool(model_type.is_audio_enabled()) if model_type is not None else True
+
         if audio_only:
             if audio_latents is None:
                 raise ValueError("audio_only=True requires audio_latents")
-            if video_latents is None:
+            if video_latents is None and model_video_enabled:
                 in_channels = getattr(self.model, "in_channels", None)
                 if in_channels is None:
                     raise ValueError("audio_only=True requires model.in_channels to create dummy video latents")
@@ -174,16 +178,31 @@ class LTX2Wrapper(nn.Module):
                     dtype=audio_latents.dtype,
                 )
 
-        if not isinstance(video_latents, torch.Tensor) or video_latents.dim() != 5:
+        if not model_audio_enabled and audio_latents is not None:
+            raise ValueError("Audio latents were provided but the loaded model has no audio branch")
+        if not model_video_enabled and not audio_only:
+            raise ValueError("Loaded audio-only transformer requires audio_only=True")
+
+        if model_video_enabled:
+            if not isinstance(video_latents, torch.Tensor) or video_latents.dim() != 5:
+                raise ValueError(f"Expected video latents shape [B, C, F, H, W], got: {getattr(video_latents, 'shape', None)}")
+        elif video_latents is not None and (not isinstance(video_latents, torch.Tensor) or video_latents.dim() != 5):
             raise ValueError(f"Expected video latents shape [B, C, F, H, W], got: {getattr(video_latents, 'shape', None)}")
 
-        bsz, vch, vframes, vheight, vwidth = video_latents.shape
+        ref_latents = video_latents if isinstance(video_latents, torch.Tensor) else audio_latents
+        if not isinstance(ref_latents, torch.Tensor):
+            raise ValueError("Expected at least one latent tensor (video or audio) to be present")
+
+        bsz = int(ref_latents.shape[0])
+        vch = vframes = vheight = vwidth = None
+        if isinstance(video_latents, torch.Tensor):
+            _, vch, vframes, vheight, vwidth = video_latents.shape
 
         def _to_sigma(ts_value, *, name: str) -> torch.Tensor:
             if isinstance(ts_value, torch.Tensor):
                 ts = ts_value
             else:
-                ts = torch.tensor(ts_value, device=video_latents.device, dtype=video_latents.dtype)
+                ts = torch.tensor(ts_value, device=ref_latents.device, dtype=ref_latents.dtype)
             if ts.dim() == 0:
                 ts = ts.view(1)
             if ts.dim() == 2 and ts.shape[1] == 1:
@@ -196,61 +215,73 @@ class LTX2Wrapper(nn.Module):
                 sigma = sigma.expand(bsz)
             if sigma.shape[0] != bsz:
                 raise ValueError(f"Expected {name} batch size {bsz}, got {sigma.shape[0]}")
-            return sigma.to(device=video_latents.device, dtype=video_latents.dtype)
+            return sigma.to(device=ref_latents.device, dtype=ref_latents.dtype)
 
         sigma = _to_sigma(timestep, name="timestep")
         audio_timestep = kwargs.get("audio_timestep")
         audio_sigma = _to_sigma(audio_timestep, name="audio_timestep") if audio_timestep is not None else sigma
 
-        video_tokens = self._video_patchifier.patchify(video_latents)
-        video_seq_len = video_tokens.shape[1]
-        video_timesteps = sigma.view(bsz, 1).expand(bsz, video_seq_len)
+        video_tokens = None
+        video_timesteps = None
+        video_positions = None
+        if model_video_enabled:
+            video_tokens = self._video_patchifier.patchify(video_latents)
+            video_seq_len = video_tokens.shape[1]
+            video_timesteps = sigma.view(bsz, 1).expand(bsz, video_seq_len)
 
-        video_conditioning_mask = None
-        if isinstance(transformer_options, dict):
-            video_conditioning_mask = transformer_options.get("video_conditioning_mask")
-        if video_conditioning_mask is not None:
-            if not isinstance(video_conditioning_mask, torch.Tensor):
-                raise TypeError(f"Expected video_conditioning_mask to be a torch.Tensor, got: {type(video_conditioning_mask)}")
-            if video_conditioning_mask.shape != (bsz, video_seq_len):
-                raise ValueError(
-                    f"video_conditioning_mask shape mismatch: got {tuple(video_conditioning_mask.shape)}, expected {(bsz, video_seq_len)}"
-                )
-            video_conditioning_mask = video_conditioning_mask.to(device=video_tokens.device, dtype=torch.bool)
-            video_timesteps = torch.where(video_conditioning_mask, torch.zeros_like(video_timesteps), video_timesteps)
+            video_conditioning_mask = None
+            if isinstance(transformer_options, dict):
+                video_conditioning_mask = transformer_options.get("video_conditioning_mask")
+            if video_conditioning_mask is not None:
+                if not isinstance(video_conditioning_mask, torch.Tensor):
+                    raise TypeError(f"Expected video_conditioning_mask to be a torch.Tensor, got: {type(video_conditioning_mask)}")
+                if video_conditioning_mask.shape != (bsz, video_seq_len):
+                    raise ValueError(
+                        f"video_conditioning_mask shape mismatch: got {tuple(video_conditioning_mask.shape)}, expected {(bsz, video_seq_len)}"
+                    )
+                video_conditioning_mask = video_conditioning_mask.to(device=video_tokens.device, dtype=torch.bool)
+                video_timesteps = torch.where(video_conditioning_mask, torch.zeros_like(video_timesteps), video_timesteps)
 
-        latent_coords = self._video_patchifier.get_patch_grid_bounds(
-            output_shape=VideoLatentShape(
-                batch=bsz,
-                channels=vch,
-                frames=vframes,
-                height=vheight,
-                width=vwidth,
-            ),
-            device=video_latents.device,
-        )
-        video_positions = get_pixel_coords(
-            latent_coords=latent_coords,
-            scale_factors=SpatioTemporalScaleFactors.default(),
-            causal_fix=True,
-        ).to(dtype=video_latents.dtype)
-        video_positions[:, 0, ...] = video_positions[:, 0, ...] / float(frame_rate)
+            latent_coords = self._video_patchifier.get_patch_grid_bounds(
+                output_shape=VideoLatentShape(
+                    batch=bsz,
+                    channels=vch,
+                    frames=vframes,
+                    height=vheight,
+                    width=vwidth,
+                ),
+                device=video_latents.device,
+            )
+            video_positions = get_pixel_coords(
+                latent_coords=latent_coords,
+                scale_factors=SpatioTemporalScaleFactors.default(),
+                causal_fix=True,
+            ).to(dtype=video_latents.dtype)
+            video_positions[:, 0, ...] = video_positions[:, 0, ...] / float(frame_rate)
 
         video_context = context
         audio_context = context
-        if not audio_only and audio_latents is not None and isinstance(context, torch.Tensor) and context.shape[-1] % 2 == 0:
+        if (
+            model_video_enabled
+            and not audio_only
+            and audio_latents is not None
+            and isinstance(context, torch.Tensor)
+            and context.shape[-1] % 2 == 0
+        ):
             half = context.shape[-1] // 2
             video_context = context[..., :half]
             audio_context = context[..., half:]
 
-        video_modality = Modality(
-            enabled=(not audio_only if video_enabled is None else bool(video_enabled)),
-            latent=video_tokens,
-            timesteps=video_timesteps,
-            positions=video_positions,
-            context=video_context,
-            context_mask=attention_mask,
-        )
+        video_modality = None
+        if model_video_enabled:
+            video_modality = Modality(
+                enabled=(not audio_only if video_enabled is None else bool(video_enabled)),
+                latent=video_tokens,
+                timesteps=video_timesteps,
+                positions=video_positions,
+                context=video_context,
+                context_mask=attention_mask,
+            )
 
         audio_modality = None
         audio_shape = None
@@ -281,16 +312,26 @@ class LTX2Wrapper(nn.Module):
         perturbations = BatchedPerturbationConfig.empty(bsz)
         video_pred_tokens, audio_pred_tokens = self.model(video_modality, audio_modality, perturbations)
 
-        video_pred = self._video_patchifier.unpatchify(
-            video_pred_tokens,
-            output_shape=VideoLatentShape(
-                batch=bsz,
-                channels=vch,
-                frames=vframes,
-                height=vheight,
-                width=vwidth,
-            ),
-        )
+        if model_video_enabled:
+            video_pred = self._video_patchifier.unpatchify(
+                video_pred_tokens,
+                output_shape=VideoLatentShape(
+                    batch=bsz,
+                    channels=vch,
+                    frames=vframes,
+                    height=vheight,
+                    width=vwidth,
+                ),
+            )
+        elif isinstance(video_latents, torch.Tensor):
+            video_pred = torch.zeros_like(video_latents)
+        else:
+            channel_count = int(getattr(self.model, "in_channels", 1) or 1)
+            video_pred = torch.zeros(
+                (bsz, channel_count, 1, 1, 1),
+                device=ref_latents.device,
+                dtype=ref_latents.dtype,
+            )
 
         if audio_latents is None:
             return video_pred
