@@ -802,7 +802,7 @@ The `--sample_include_reference` flag shows the reference side-by-side with the 
 | Argument | Default | Description |
 |----------|---------|-------------|
 | `--reference_downscale` | 1 | Spatial downscale factor for references (1=same res, 2=half) |
-| `--reference_frames` | 1 | Number of reference frames for V2V (images always use 1) |
+| `--reference_frames` | 1 | Number of reference frames for V2V (images are repeated to fill this count) |
 | `--ltx2_first_frame_conditioning_p` | 0.1 | Probability of also conditioning on the first target frame during training |
 | `--sample_include_reference` | off | Show reference side-by-side with generated output in sample videos |
 | `--lora_target_preset v2v` | — | Targets attention + FFN layers (recommended for IC-LoRA) |
@@ -818,6 +818,7 @@ The `--sample_include_reference` flag shows the reference side-by-side with the 
 
 - **First-frame conditioning** (`--ltx2_first_frame_conditioning_p`): Randomly conditions on the first target frame in addition to the reference. Only applied during training; inference always denoises the full target.
 - **Multi-frame references**: Supported but increase VRAM usage proportionally to the number of reference tokens.
+- **Multi-subject references**: The VAE compresses 8 frames into 1 temporal latent via `SpaceToDepthDownsample`, which pairs consecutive frames and averages their features. Subjects sharing the same 8-frame group are blended and lose individual identity. To keep N subjects separated, structure your reference video as: frame 1 = Subject A, frames 2–9 = Subject B (repeated 8×), frames 10–17 = Subject C (repeated 8×), etc. Total frames: `1 + 8×(N−1)`. Set `--reference_frames` to match. Frame 1 gets its own latent due to causal padding in the encoder; each subsequent 8-frame block produces one additional latent.
 - **Video-only**: IC-LoRA requires `--ltx2_mode video`. Audio-video mode is not supported for v2v training.
 - **Downscale factor metadata**: Saved in LoRA safetensors as `ss_reference_downscale_factor` when factor != 1.
 - **Two-stage inference**: Not supported with V2V; a warning is emitted and the reference is ignored.
