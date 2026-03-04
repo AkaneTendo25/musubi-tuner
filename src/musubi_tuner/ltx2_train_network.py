@@ -5415,7 +5415,7 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         "--reference_frames",
         type=int,
         default=1,
-        help="Number of reference frames to use for V2V sampling. Images always use 1 frame.",
+        help="Number of reference frames to use for V2V sampling. Images are repeated to fill this count.",
     )
 
     # Two-stage inference arguments
