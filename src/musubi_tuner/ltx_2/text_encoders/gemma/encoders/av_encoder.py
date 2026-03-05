@@ -5,6 +5,7 @@ from transformers.models.gemma3 import Gemma3ForConditionalGeneration
 from musubi_tuner.ltx_2.loader.sd_ops import SDOps
 from musubi_tuner.ltx_2.model.model_protocol import ModelConfigurator
 from musubi_tuner.ltx_2.text_encoders.gemma.embeddings_connector import (
+    AudioEmbeddings1DConnectorConfigurator,
     Embeddings1DConnector,
     Embeddings1DConnectorConfigurator,
 )
@@ -45,12 +46,19 @@ class AVGemmaTextEncoderModel(GemmaTextEncoderModelBase):
         self.audio_embeddings_connector = audio_embeddings_connector.to(dtype=dtype)
 
     def _run_connectors(
-        self, encoded_input: torch.Tensor, attention_mask: torch.Tensor
+        self, encoded_input: torch.Tensor | tuple[torch.Tensor, torch.Tensor | None], attention_mask: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        connector_attention_mask = self._convert_to_additive_mask(attention_mask, encoded_input.dtype)
+        if isinstance(encoded_input, tuple):
+            video_input = encoded_input[0]
+            audio_input = encoded_input[1] if encoded_input[1] is not None else encoded_input[0]
+        else:
+            video_input = encoded_input
+            audio_input = encoded_input
+
+        connector_attention_mask = self._convert_to_additive_mask(attention_mask, video_input.dtype)
 
         encoded, encoded_connector_attention_mask = self.embeddings_connector(
-            encoded_input,
+            video_input,
             connector_attention_mask,
         )
 
@@ -59,7 +67,7 @@ class AVGemmaTextEncoderModel(GemmaTextEncoderModelBase):
         attention_mask = attention_mask.reshape([encoded.shape[0], encoded.shape[1], 1])
         encoded = encoded * attention_mask
 
-        encoded_for_audio, _ = self.audio_embeddings_connector(encoded_input, connector_attention_mask)
+        encoded_for_audio, _ = self.audio_embeddings_connector(audio_input, connector_attention_mask)
 
         return encoded, encoded_for_audio, attention_mask.squeeze(-1)
 
@@ -74,7 +82,7 @@ class AVGemmaTextEncoderModelConfigurator(ModelConfigurator[AVGemmaTextEncoderMo
     def from_config(cls: type["AVGemmaTextEncoderModel"], config: dict) -> "AVGemmaTextEncoderModel":
         feature_extractor_linear = GemmaFeaturesExtractorProjLinear.from_config(config)
         embeddings_connector = Embeddings1DConnectorConfigurator.from_config(config)
-        audio_embeddings_connector = Embeddings1DConnectorConfigurator.from_config(config)
+        audio_embeddings_connector = AudioEmbeddings1DConnectorConfigurator.from_config(config)
         return AVGemmaTextEncoderModel(
             feature_extractor_linear=feature_extractor_linear,
             embeddings_connector=embeddings_connector,

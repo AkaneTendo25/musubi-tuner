@@ -2540,6 +2540,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 timesteps=combined_timesteps,
                 positions=combined_positions,
                 context=text_embeds,
+                sigma=sigma,
                 context_mask=text_mask,
             )
 
@@ -4745,6 +4746,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
                         timesteps=cfg_timesteps,
                         positions=cfg_positions,
                         context=prompt_embeds,  # already [neg+pos, seq, dim] from CFG setup
+                        sigma=sigma,
                         context_mask=prompt_mask,
                     )
                     pred_tokens, _ = base_model(video_modality, None, cfg_perturbations)
@@ -4781,6 +4783,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
                         timesteps=combined_timesteps,
                         positions=combined_positions,
                         context=prompt_embeds,
+                        sigma=sigma,
                         context_mask=prompt_mask,
                     )
                     pred_tokens, _ = base_model(video_modality, None, perturbations)

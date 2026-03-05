@@ -3,6 +3,13 @@ from typing import Optional, Tuple
 import torch
 from musubi_tuner.ltx_2.model.transformer.timestep_embedding import PixArtAlphaCombinedTimestepSizeEmbeddings
 
+ADALN_BASE_PARAMS_COUNT = 6
+ADALN_CROSS_ATTN_PARAMS_COUNT = 3
+
+
+def adaln_embedding_coefficient(cross_attention_adaln: bool) -> int:
+    return ADALN_BASE_PARAMS_COUNT + (ADALN_CROSS_ATTN_PARAMS_COUNT if cross_attention_adaln else 0)
+
 
 class AdaLayerNormSingle(torch.nn.Module):
     r"""

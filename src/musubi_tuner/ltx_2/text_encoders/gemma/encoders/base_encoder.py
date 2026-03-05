@@ -23,13 +23,13 @@ class GemmaTextEncoderModelBase(torch.nn.Module):
     Args:
         tokenizer (LTXVGemmaTokenizer): The tokenizer used for text preprocessing.
         model (Gemma3ForConditionalGeneration): The base Gemma LLM.
-        feature_extractor_linear (GemmaFeaturesExtractorProjLinear): Linear projection for hidden state aggregation.
+        feature_extractor_linear (torch.nn.Module): Text feature extractor module.
         dtype (torch.dtype, optional): The data type for model parameters (default: torch.bfloat16).
     """
 
     def __init__(
         self,
-        feature_extractor_linear: GemmaFeaturesExtractorProjLinear,
+        feature_extractor_linear: torch.nn.Module,
         tokenizer: LTXVGemmaTokenizer | None = None,
         model: Gemma3ForConditionalGeneration | None = None,
         img_processor: Gemma3Processor | None = None,
@@ -61,23 +61,17 @@ class GemmaTextEncoderModelBase(torch.nn.Module):
 
     def _run_feature_extractor(
         self, hidden_states: torch.Tensor, attention_mask: torch.Tensor, padding_side: str = "right"
-    ) -> torch.Tensor:
-        encoded_text_features = torch.stack(hidden_states, dim=-1)
-        encoded_text_features_dtype = encoded_text_features.dtype
-
-        sequence_lengths = attention_mask.sum(dim=-1)
-        normed_concated_encoded_text_features = _norm_and_concat_padded_batch(
-            encoded_text_features, sequence_lengths, padding_side=padding_side
-        )
-
-        return self.feature_extractor_linear(normed_concated_encoded_text_features.to(encoded_text_features_dtype))
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]:
+        return self.feature_extractor_linear(hidden_states, attention_mask, padding_side=padding_side)
 
     def _convert_to_additive_mask(self, attention_mask: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
         return (attention_mask - 1).to(dtype).reshape((attention_mask.shape[0], 1, -1, attention_mask.shape[-1])) * torch.finfo(
             dtype
         ).max
 
-    def _preprocess_text(self, text: str, padding_side: str = "left") -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    def _preprocess_text(
+        self, text: str, padding_side: str = "left"
+    ) -> tuple[torch.Tensor | tuple[torch.Tensor, torch.Tensor | None], torch.Tensor]:
         """
         Encode a given string into feature tensors suitable for downstream tasks.
         Args:
