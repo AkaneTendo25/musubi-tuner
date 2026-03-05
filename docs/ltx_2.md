@@ -9,7 +9,7 @@
 | Version | Parameters | Key Differences |
 |---------|-----------|-----------------|
 | LTX-2 (19B) | 19B | Single `aggregate_embed`, caption projection inside transformer |
-| LTX-2.3 (20B) | 20B | Dual `video_aggregate_embed`/`audio_aggregate_embed`, caption projection moved to feature extractor (`caption_proj_before_connector`), cross-attention AdaLN (`prompt_adaln`), separate audio connector dimensions, BigVGAN v2 vocoder with bandwidth extension |
+| LTX-2.3 (22B) | 22B | Dual `video_aggregate_embed`/`audio_aggregate_embed`, caption projection moved to feature extractor (`caption_proj_before_connector`), cross-attention AdaLN (`prompt_adaln`), separate audio connector dimensions, BigVGAN v2 vocoder with bandwidth extension |
 
 Version is selected via `--ltx_version` (default: `2.0`). The trainer auto-detects the checkpoint version from metadata and warns on mismatch. All caching and training commands work with both versions — no separate code paths are needed.
 
@@ -343,7 +343,7 @@ accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 ltx2_tr
 
 ##### Quantization Options
 
-| Method | VRAM (19B model) | Weight Error (MAE) | SNR | Cosine Similarity |
+| Method | VRAM (19B, LTX-2) | Weight Error (MAE) | SNR | Cosine Similarity |
 |--------|------------------|--------------------|-----|-------------------|
 | BF16 (baseline) | ~38 GB | 0.0011 | 55.6 dB | 0.999999 |
 | `--fp8_base --fp8_scaled` | ~19 GB | 0.0171 (15x BF16) | 32.0 dB | 0.999686 |
