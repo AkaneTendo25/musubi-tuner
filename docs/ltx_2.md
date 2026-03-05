@@ -679,6 +679,7 @@ To use custom layer patterns instead of a preset, use `--network_args`:
 --network_args "include_patterns=['.*\.to_k$','.*\.to_q$','.*\.to_v$','.*\.to_out\.0$','.*\.ff\.net\.0\.proj$','.*\.ff\.net\.2$']"
 ```
 Custom `include_patterns` override any preset.
+When `include_patterns` is set (either explicitly or via a preset), only modules matching at least one pattern are targeted (strict whitelist behavior). Use `--lora_target_preset full` to target all linear layers.
 
 #### IC-LoRA / Video-to-Video Training
 
