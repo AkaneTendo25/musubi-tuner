@@ -61,12 +61,20 @@ class SingleGPUModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType],
 
     def _return_model(self, meta_model: ModelType, device: torch.device) -> ModelType:
         uninitialized_params = [name for name, param in meta_model.named_parameters() if str(param.device) == "meta"]
-        uninitialized_buffers = [name for name, buffer in meta_model.named_buffers() if str(buffer.device) == "meta"]
-        if uninitialized_params or uninitialized_buffers:
-            logger.warning(f"Uninitialized parameters or buffers: {uninitialized_params + uninitialized_buffers}")
+        if uninitialized_params:
+            logger.warning(f"Uninitialized parameters (still on meta device): {uninitialized_params}")
             return meta_model
-        retval = meta_model.to(device)
-        return retval
+        uninitialized_buffers = [name for name, buf in meta_model.named_buffers() if str(buf.device) == "meta"]
+        if uninitialized_buffers:
+            logger.info(f"Materializing {len(uninitialized_buffers)} unused buffer(s) as zeros: {uninitialized_buffers}")
+            for name, buf in meta_model.named_buffers():
+                if str(buf.device) == "meta":
+                    parts = name.split(".")
+                    parent = meta_model
+                    for part in parts[:-1]:
+                        parent = getattr(parent, part)
+                    parent.register_buffer(parts[-1], torch.zeros(buf.shape, dtype=buf.dtype, device=device))
+        return meta_model.to(device)
 
     def build(self, device: torch.device | None = None, dtype: torch.dtype | None = None) -> ModelType:
         device = torch.device("cuda") if device is None else device
