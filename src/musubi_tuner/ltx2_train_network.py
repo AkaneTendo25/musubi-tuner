@@ -198,6 +198,32 @@ def detect_ltx2_config(model_path: str) -> Dict[str, Any]:
     return config
 
 
+def infer_ltx_version_from_checkpoint_config(config: Dict[str, Any]) -> Tuple[str, List[str]]:
+    """Infer checkpoint generation (2.0 vs 2.3) from metadata config markers."""
+    markers: List[str] = []
+    transformer_cfg = config.get("transformer", {})
+    vocoder_cfg = config.get("vocoder", {})
+
+    if bool(transformer_cfg.get("cross_attention_adaln", False)):
+        markers.append("transformer.cross_attention_adaln=True")
+    if isinstance(vocoder_cfg.get("bwe"), dict):
+        markers.append("vocoder.bwe")
+
+    # Additional soft markers used by newer text/audio connector configs.
+    connector_keys = (
+        "audio_connector_num_attention_heads",
+        "audio_connector_attention_head_dim",
+        "audio_connector_num_layers",
+    )
+    if any(k in transformer_cfg for k in connector_keys):
+        markers.append("transformer.audio_connector_*")
+    if bool(transformer_cfg.get("caption_proj_before_connector", False)):
+        markers.append("transformer.caption_proj_before_connector=True")
+
+    detected_version = "2.3" if markers else "2.0"
+    return detected_version, markers
+
+
 def _apply_memory_optimization_settings(
     model: torch.nn.Module,
     ffn_chunk_target: Optional[str] = None,
@@ -663,9 +689,11 @@ class LTX2NetworkTrainer(NetworkTrainer):
         self._audio_video: bool = False
         self._i2v_training: bool = False
         self._ltx_mode: str = "video"
+        self._ltx_version: str = "2.0"
         self._ltx2_audio_only_model: bool = False
         self._logged_audio_only_timestep_shift: bool = False
         self._audio_only_sequence_resolution: int = 64
+        self._ltx2_checkpoint_config: Optional[Dict[str, Any]] = None
         self.default_guidance_scale = 3.0
         self._audio_preview_config: Optional[Dict[str, int | float]] = None
 
@@ -921,13 +949,12 @@ class LTX2NetworkTrainer(NetworkTrainer):
         if self._audio_preview_config is not None:
             return self._audio_preview_config
 
-        from musubi_tuner.ltx_2.loader.sft_loader import SafetensorsModelStateDictLoader
         from musubi_tuner.ltx_2.model.audio_vae.audio_vae import LATENT_DOWNSAMPLE_FACTOR
 
         if getattr(args, "ltx2_checkpoint", None) is None:
             raise ValueError("--ltx2_checkpoint is required for audio preview config")
 
-        config = SafetensorsModelStateDictLoader().metadata(str(args.ltx2_checkpoint))
+        config = self._load_ltx2_checkpoint_config(args)
         audio_vae_cfg = config.get("audio_vae", {})
         model_cfg = audio_vae_cfg.get("model", {}).get("params", {})
         ddconfig = model_cfg.get("ddconfig", {})
@@ -968,6 +995,52 @@ class LTX2NetworkTrainer(NetworkTrainer):
             "audio_latent_downsample_factor": int(LATENT_DOWNSAMPLE_FACTOR),
         }
         return self._audio_preview_config
+
+    def _load_ltx2_checkpoint_config(self, args: argparse.Namespace) -> Dict[str, Any]:
+        if self._ltx2_checkpoint_config is not None:
+            return self._ltx2_checkpoint_config
+
+        from musubi_tuner.ltx_2.loader.sft_loader import SafetensorsModelStateDictLoader
+
+        checkpoint_path = getattr(args, "ltx2_checkpoint", None)
+        if checkpoint_path is None:
+            raise ValueError("--ltx2_checkpoint is required to inspect checkpoint metadata")
+
+        self._ltx2_checkpoint_config = SafetensorsModelStateDictLoader().metadata(str(checkpoint_path))
+        return self._ltx2_checkpoint_config
+
+    def _validate_ltx_version_consistency(self, args: argparse.Namespace) -> None:
+        check_mode = str(getattr(args, "ltx_version_check_mode", "warn") or "warn").lower()
+        if check_mode == "off":
+            return
+        if check_mode not in {"warn", "error"}:
+            raise ValueError(
+                f"Invalid ltx_version_check_mode={check_mode!r}. Expected one of: off, warn, error."
+            )
+
+        try:
+            config = self._load_ltx2_checkpoint_config(args)
+            detected_version, markers = infer_ltx_version_from_checkpoint_config(config)
+        except Exception as exc:
+            message = f"Failed to inspect checkpoint metadata for --ltx_version consistency check: {exc}"
+            if check_mode == "error":
+                raise ValueError(message) from exc
+            logger.warning(message)
+            return
+
+        target_version = str(getattr(args, "ltx_version", self._ltx_version))
+        if detected_version != target_version:
+            marker_text = ", ".join(markers) if markers else "no explicit 2.3 markers"
+            message = (
+                f"--ltx_version={target_version} does not match checkpoint metadata (detected {detected_version}; "
+                f"markers: {marker_text})."
+            )
+            if check_mode == "error":
+                raise ValueError(message)
+            logger.warning(message)
+            return
+
+        logger.info("LTX version check: --ltx_version=%s matches checkpoint metadata.", target_version)
 
     def _get_video_temporal_downsample(self) -> int:
         vae = getattr(self, "vae", None)
@@ -1271,6 +1344,70 @@ class LTX2NetworkTrainer(NetworkTrainer):
         b = min_shift - m * float(min_tokens)
         return seq_lengths.to(dtype=torch.float32) * float(m) + float(b)
 
+    @staticmethod
+    def _sample_shifted_logit_normal_sigmas(
+        batch_size: int,
+        shifts: torch.Tensor,
+        *,
+        std: float = 1.0,
+        mode: str = "legacy",
+        eps: float = 1e-3,
+        uniform_prob: float = 0.1,
+    ) -> torch.Tensor:
+        """Sample sigmas for shifted_logit_normal.
+
+        Modes:
+        - legacy: historical behavior, sigma = sigmoid(N(shift, std)).
+        - stretched: upstream Mar-2026 behavior with percentile stretch and
+          optional uniform fallback.
+        """
+        if shifts.ndim != 1 or shifts.shape[0] != batch_size:
+            raise ValueError(f"shifts must be shape [batch_size], got {tuple(shifts.shape)} for batch_size={batch_size}")
+
+        shifts = shifts.to(dtype=torch.float32)
+        std = float(std)
+        mode = str(mode).lower()
+
+        normal_samples = torch.randn((batch_size,), device=shifts.device, dtype=torch.float32) * std + shifts
+        logitnormal_samples = torch.sigmoid(normal_samples)
+        if mode in {"legacy", "classic", "old"}:
+            return logitnormal_samples
+        if mode not in {"stretched", "v2", "upstream"}:
+            raise ValueError(f"Invalid shifted_logit_mode={mode!r}. Expected one of: legacy, stretched.")
+
+        # Upstream constants: 99.9th and 0.5th normal percentiles.
+        eps = min(max(float(eps), 0.0), 0.499)
+        uniform_prob = min(max(float(uniform_prob), 0.0), 1.0)
+        normal_999_percentile = 3.0902 * std
+        normal_005_percentile = -2.5758 * std
+        percentile_999 = torch.sigmoid(shifts + normal_999_percentile)
+        percentile_005 = torch.sigmoid(shifts + normal_005_percentile)
+        denom = (percentile_999 - percentile_005).clamp(min=1e-6)
+
+        stretched = (logitnormal_samples - percentile_005) / denom
+        stretched = torch.where(stretched >= eps, stretched, 2 * eps - stretched)
+        stretched = stretched.clamp(0.0, 1.0)
+
+        if uniform_prob <= 0.0:
+            return stretched
+        uniform = (1.0 - eps) * torch.rand((batch_size,), device=shifts.device, dtype=torch.float32) + eps
+        if uniform_prob >= 1.0:
+            return uniform
+        prob = torch.rand((batch_size,), device=shifts.device, dtype=torch.float32)
+        return torch.where(prob > uniform_prob, stretched, uniform)
+
+    def _resolve_shifted_logit_mode(self, args: argparse.Namespace) -> str:
+        explicit_mode = getattr(args, "shifted_logit_mode", None)
+        if explicit_mode is not None:
+            mode = str(explicit_mode).lower()
+            if mode in {"legacy", "stretched"}:
+                return mode
+            raise ValueError(f"Invalid shifted_logit_mode={explicit_mode!r}. Expected one of: legacy, stretched.")
+
+        # Route defaults by selected LTX version for backward compatibility.
+        ltx_version = str(getattr(args, "ltx_version", self._ltx_version))
+        return "stretched" if ltx_version == "2.3" else "legacy"
+
     def _resolve_audio_only_sequence_lengths(self, batch_size: int, device: torch.device) -> Optional[torch.Tensor]:
         latents_info = self.get_current_batch_latents_info()
         if not isinstance(latents_info, dict):
@@ -1398,8 +1535,17 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 shift = self._shifted_logit_normal_shift_for_sequence_length(seq_len)
                 shifts = torch.full((batch_size,), float(shift), device=device, dtype=torch.float32)
             std = getattr(args, "logit_std", 1.0)
-            normal_samples = torch.randn((batch_size,), device=device, dtype=torch.float32) * std + shifts
-            sigmas = torch.sigmoid(normal_samples)
+            shifted_logit_mode = self._resolve_shifted_logit_mode(args)
+            shifted_logit_eps = getattr(args, "shifted_logit_eps", 1e-3)
+            shifted_logit_uniform_prob = getattr(args, "shifted_logit_uniform_prob", 0.1)
+            sigmas = self._sample_shifted_logit_normal_sigmas(
+                batch_size,
+                shifts,
+                std=std,
+                mode=shifted_logit_mode,
+                eps=shifted_logit_eps,
+                uniform_prob=shifted_logit_uniform_prob,
+            )
         elif timestep_sampling == "uniform":
             # Uniform sampling from [0, 1]
             sigmas = torch.rand((batch_size,), device=device, dtype=torch.float32)
@@ -1499,6 +1645,20 @@ class LTX2NetworkTrainer(NetworkTrainer):
         if ltx_mode not in {"video", "av", "audio"}:
             raise ValueError(f"Invalid ltx_mode: {ltx_mode}")
         self._ltx_mode = ltx_mode
+
+        ltx_version = str(getattr(args, "ltx_version", "2.0"))
+        if ltx_version not in {"2.0", "2.3"}:
+            raise ValueError(f"Invalid ltx_version: {ltx_version}. Expected '2.0' or '2.3'.")
+        self._ltx_version = ltx_version
+        args.ltx_version = ltx_version
+        ltx_version_check_mode = str(getattr(args, "ltx_version_check_mode", "warn") or "warn").lower()
+        if ltx_version_check_mode not in {"off", "warn", "error"}:
+            raise ValueError(
+                f"ltx_version_check_mode must be one of ['off', 'warn', 'error']. Got: {ltx_version_check_mode}"
+            )
+        args.ltx_version_check_mode = ltx_version_check_mode
+        self._validate_ltx_version_consistency(args)
+
         self._audio_video = self._ltx_mode in {"av", "audio"}
         self._ltx2_audio_only_model = bool(getattr(args, "ltx2_audio_only_model", False))
         if self._ltx2_audio_only_model and self._ltx_mode != "audio":
@@ -1559,6 +1719,26 @@ class LTX2NetworkTrainer(NetworkTrainer):
         args.audio_loss_balance_ema_init = audio_balance_ema_init
         args.audio_loss_balance_target_ratio = audio_balance_target_ratio
         args.audio_loss_balance_ema_decay = audio_balance_ema_decay
+
+        shifted_logit_mode = getattr(args, "shifted_logit_mode", None)
+        if shifted_logit_mode is not None:
+            shifted_logit_mode = str(shifted_logit_mode).lower()
+            if shifted_logit_mode not in {"legacy", "stretched"}:
+                raise ValueError(
+                    f"shifted_logit_mode must be one of ['legacy', 'stretched']. Got: {shifted_logit_mode}"
+                )
+            args.shifted_logit_mode = shifted_logit_mode
+
+        shifted_logit_eps = float(getattr(args, "shifted_logit_eps", 1e-3))
+        shifted_logit_uniform_prob = float(getattr(args, "shifted_logit_uniform_prob", 0.1))
+        if shifted_logit_eps < 0.0:
+            raise ValueError(f"shifted_logit_eps must be >= 0. Got: {shifted_logit_eps}")
+        if not (0.0 <= shifted_logit_uniform_prob <= 1.0):
+            raise ValueError(
+                f"shifted_logit_uniform_prob must be within [0, 1]. Got: {shifted_logit_uniform_prob}"
+            )
+        args.shifted_logit_eps = shifted_logit_eps
+        args.shifted_logit_uniform_prob = shifted_logit_uniform_prob
 
         args.independent_audio_timestep = bool(getattr(args, "independent_audio_timestep", False))
         args.audio_silence_regularizer = bool(getattr(args, "audio_silence_regularizer", False))
@@ -5037,6 +5217,26 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         help="Training modality.",
     )
     parser.add_argument(
+        "--ltx_version",
+        type=str,
+        default="2.0",
+        choices=["2.0", "2.3"],
+        help=(
+            "Target LTX major trainer behavior. "
+            "2.0 keeps legacy defaults; 2.3 enables 2.3-oriented defaults when mode is not explicitly overridden."
+        ),
+    )
+    parser.add_argument(
+        "--ltx_version_check_mode",
+        type=str,
+        default="warn",
+        choices=["off", "warn", "error"],
+        help=(
+            "How strictly to enforce --ltx_version vs checkpoint metadata consistency. "
+            "'warn' logs mismatches, 'error' stops startup, 'off' disables checks."
+        ),
+    )
+    parser.add_argument(
         "--ltx2_audio_only_model",
         action="store_true",
         help="Load physically audio-only LTX-2 transformer (omit video modules). Requires --ltx2_mode audio.",
@@ -5193,6 +5393,29 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
             "Virtual pixel resolution used to derive sequence length for shifted_logit_normal "
             "in --ltx_mode audio. Set 0 to use cached virtual geometry."
         ),
+    )
+    parser.add_argument(
+        "--shifted_logit_mode",
+        type=str,
+        default=None,
+        choices=["legacy", "stretched"],
+        help=(
+            "Shifted logit-normal sigma sampler mode. "
+            "'legacy' keeps historical behavior; 'stretched' enables upstream Mar-2026 sampling. "
+            "If unset, defaults by --ltx_version (2.0->legacy, 2.3->stretched)."
+        ),
+    )
+    parser.add_argument(
+        "--shifted_logit_eps",
+        type=float,
+        default=1e-3,
+        help="Numerical epsilon used by --shifted_logit_mode stretched (reflection floor and uniform lower bound).",
+    )
+    parser.add_argument(
+        "--shifted_logit_uniform_prob",
+        type=float,
+        default=0.1,
+        help="Uniform fallback probability used by --shifted_logit_mode stretched.",
     )
     parser.add_argument(
         "--audio_silence_regularizer",

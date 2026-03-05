@@ -1,8 +1,17 @@
-# LTX-2
+# LTX-2 / LTX-2.3
 
 > [!WARNING]
 > LTX-2 support is work in progress and may be incomplete or unstable.
 > Development is tracked in [this issue](https://github.com/AkaneTendo25/musubi-tuner/issues/1).
+
+### Supported Model Versions
+
+| Version | Parameters | Key Differences |
+|---------|-----------|-----------------|
+| LTX-2 (19B) | 19B | Single `aggregate_embed`, caption projection inside transformer |
+| LTX-2.3 (20B) | 20B | Dual `video_aggregate_embed`/`audio_aggregate_embed`, caption projection moved to feature extractor (`caption_proj_before_connector`), cross-attention AdaLN (`prompt_adaln`), separate audio connector dimensions, BigVGAN v2 vocoder with bandwidth extension |
+
+Version is selected via `--ltx_version` (default: `2.0`). The trainer auto-detects the checkpoint version from metadata and warns on mismatch. All caching and training commands work with both versions — no separate code paths are needed.
 
 ---
 
@@ -30,6 +39,7 @@
       - [Other Memory Options](#other-memory-options)
     - [Aggressive VRAM Optimization (8-16GB GPUs)](#aggressive-vram-optimization-8-16gb-gpus)
     - [NF4 Quantization](#nf4-quantization)
+    - [Model Version](#model-version)
     - [Audio-Video Support](#audio-video-support)
     - [Loss Weighting](#loss-weighting)
     - [Additional Audio Training Flags](#additional-audio-training-flags)
@@ -442,6 +452,10 @@ accelerate launch ... ltx2_train_network.py ^
 - Compatible with `--blocks_to_swap`, `--gradient_checkpointing`, and other training options. NF4 reduces block swap transfer size (4-bit vs 16-bit per weight).
 - Quantization targets transformer block weights only. Embedding layers, norms, and projection layers remain in full precision.
 
+#### Model Version
+- `--ltx_version 2.0|2.3`: Select target model version (default: `2.0`). Controls default behavior for version-dependent settings (e.g., `--shifted_logit_mode` defaults to `legacy` for 2.0, `stretched` for 2.3).
+- `--ltx_version_check_mode off|warn|error`: How to handle mismatch between `--ltx_version` and checkpoint metadata (default: `warn`). The trainer reads checkpoint config keys (`cross_attention_adaln`, `caption_proj_before_connector`, `bwe` vocoder) to detect the actual version.
+
 #### Audio-Video Support
 - `--ltx2_mode`, `--ltx_mode`: Training modality selector. Default is `v` (`video`). Values: `video`, `av`, `audio` (aliases: `v`, `va`, `a`).
 - `--ltx2_audio_only_model`: Force loading a physically audio-only transformer variant (video modules omitted). Requires `--ltx2_mode audio`.
@@ -657,6 +671,11 @@ The cache file is saved to `<cache_directory>/ltx2_preservation_cache.pt` by def
 - `--timestep_sampling uniform`: Uniform sampling from [0, 1].
 - `--logit_std`: Standard deviation for the logit-normal distribution (default: 1.0). Only used with `shifted_logit_normal`.
 - `--min_timestep` / `--max_timestep`: Optional timestep range constraints.
+- `--shifted_logit_mode legacy|stretched`: Sigma sampler variant (default: auto by `--ltx_version`; 2.0→`legacy`, 2.3→`stretched`).
+  - `legacy`: `sigmoid(N(shift, std))`. Original behavior.
+  - `stretched`: Normalizes samples between the 0.5th and 99.9th percentiles of the distribution, reflects values below `eps` for numerical stability, and replaces a fraction of samples with uniform draws to prevent distribution collapse at high token counts.
+- `--shifted_logit_eps`: Reflection floor and uniform lower bound for `stretched` mode (default: `1e-3`).
+- `--shifted_logit_uniform_prob`: Fraction of samples replaced with uniform `[eps, 1]` draws (default: `0.1`).
 
 > [!NOTE]
 > The `shifted_logit_normal` shift is linearly interpolated from 0.95 (at 1024 tokens) to 2.05 (at 4096 tokens) based on sequence length.
