@@ -62,8 +62,12 @@ class TransformerArgsPreprocessor:
         self.prompt_adaln = prompt_adaln
 
     def _prepare_timestep(
-        self, timestep: torch.Tensor, batch_size: int, hidden_dtype: torch.dtype,
-        use_unique_optimization: bool = True
+        self,
+        timestep: torch.Tensor,
+        batch_size: int,
+        hidden_dtype: torch.dtype,
+        adaln: AdaLayerNormSingle | None = None,
+        use_unique_optimization: bool = True,
     ) -> tuple:
         """Prepare timestep embeddings.
         
@@ -76,6 +80,7 @@ class TransformerArgsPreprocessor:
             If not optimized: regular tensor [batch_size, num_tokens, dim]
         """
         timestep_scaled = timestep * self.timestep_scale_multiplier
+        adaln_module = self.adaln if adaln is None else adaln
         
         # Get original shape for reconstruction
         orig_shape = timestep_scaled.shape
@@ -87,7 +92,7 @@ class TransformerArgsPreprocessor:
             unique_timesteps, inverse_indices_1d = torch.unique(timestep_scaled.flatten(), return_inverse=True)
             
             # Compute embeddings for unique timesteps only
-            unique_emb, unique_embedded = self.adaln(
+            unique_emb, unique_embedded = adaln_module(
                 unique_timesteps,
                 hidden_dtype=hidden_dtype,
             )
@@ -99,7 +104,7 @@ class TransformerArgsPreprocessor:
             return timestep_out, embedded_timestep_out
         else:
             # Standard mode: compute full embeddings
-            timestep_emb, embedded_timestep = self.adaln(
+            timestep_emb, embedded_timestep = adaln_module(
                 timestep_scaled.flatten(),
                 hidden_dtype=hidden_dtype,
             )
@@ -218,6 +223,7 @@ class TransformerArgsPreprocessor:
                 modality.sigma,
                 x.shape[0],
                 modality.latent.dtype,
+                adaln=self.prompt_adaln,
                 use_unique_optimization=False,
             )
         context, attention_mask = self._prepare_context(modality.context, x, modality.context_mask)
