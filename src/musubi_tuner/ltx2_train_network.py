@@ -676,6 +676,10 @@ class LTX2NetworkTrainer(NetworkTrainer):
 
         # CREPA (off by default)
         self._crepa = None
+        # Self-Flow (off by default)
+        self._self_flow = None
+        self._self_flow_active: bool = False
+        self._self_flow_step_context: Optional[Dict[str, Any]] = None
 
     # ------------------------------------------------------------------
     # Preservation / regularization hooks
@@ -685,6 +689,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
                        transformer=None, network=None) -> None:
         self._setup_preservation(args, accelerator)
         self._setup_crepa(args, accelerator, transformer)
+        self._setup_self_flow(args, accelerator, transformer, network)
         self._apply_network_initialization(args, network)
 
     def _setup_preservation(self, args: argparse.Namespace, accelerator: Accelerator) -> None:
@@ -822,6 +827,79 @@ class LTX2NetworkTrainer(NetworkTrainer):
 
         self._crepa = module
 
+    def _setup_self_flow(
+        self,
+        args: argparse.Namespace,
+        accelerator: Accelerator,
+        transformer=None,
+        network=None,
+    ) -> None:
+        """Parse Self-Flow flags and install helper. No-op when ``--self_flow`` is not set."""
+        if not getattr(args, "self_flow", False):
+            return
+        if transformer is None or network is None:
+            logger.warning("Self-Flow enabled but transformer/network is unavailable — skipping setup")
+            return
+        if self._ltx_mode != "video":
+            raise ValueError("--self_flow currently supports only --ltx_mode video")
+
+        from musubi_tuner.self_flow import SelfFlowConfig, SelfFlowModule, parse_self_flow_args
+
+        kw = parse_self_flow_args(getattr(args, "self_flow_args", None))
+
+        cfg_kwargs: Dict[str, Any] = {}
+        int_keys = {"student_block_idx", "teacher_block_idx", "teacher_update_interval", "projector_hidden_multiplier"}
+        float_keys = {"lambda_self_flow", "mask_ratio", "teacher_momentum"}
+        bool_keys = {"dual_timestep", "tokenwise_timestep"}
+        for k, v in kw.items():
+            if k in int_keys:
+                cfg_kwargs[k] = int(v)
+            elif k in float_keys:
+                cfg_kwargs[k] = float(v)
+            elif k in bool_keys:
+                cfg_kwargs[k] = v.lower() in ("true", "1", "yes", "on")
+            else:
+                cfg_kwargs[k] = v
+
+        config = SelfFlowConfig(**cfg_kwargs)
+        if config.mask_ratio < 0.0 or config.mask_ratio > 0.5:
+            raise ValueError("Self-Flow mask_ratio must be in [0, 0.5]")
+        if config.teacher_momentum < 0.0 or config.teacher_momentum >= 1.0:
+            raise ValueError("Self-Flow teacher_momentum must be in [0, 1)")
+        if config.loss_type not in {"negative_cosine", "one_minus_cosine"}:
+            raise ValueError("Self-Flow loss_type must be one of: negative_cosine, one_minus_cosine")
+
+        unwrapped_transformer = accelerator.unwrap_model(transformer)
+        unwrapped_network = accelerator.unwrap_model(network)
+        module = SelfFlowModule(config, unwrapped_transformer)
+
+        first_param = next(iter(unwrapped_transformer.parameters()), None)
+        dtype = first_param.dtype if first_param is not None else torch.float32
+        if isinstance(dtype, torch.dtype) and dtype.itemsize == 1:
+            if args.mixed_precision == "fp16":
+                dtype = torch.float16
+            elif args.mixed_precision == "bf16":
+                dtype = torch.bfloat16
+            else:
+                dtype = torch.float32
+        module.setup(accelerator.device, dtype)
+        module.init_teacher(unwrapped_network)
+
+        if getattr(args, "resume", None):
+            proj_path = os.path.join(args.resume, "self_flow_projector.safetensors")
+            if os.path.exists(proj_path):
+                from safetensors.torch import load_file
+
+                sd = load_file(proj_path)
+                module.load_state_dict(sd)
+                logger.info("Self-Flow: resumed projector weights from %s", proj_path)
+
+        self._self_flow = module
+        self._self_flow_active = True
+        logger.warning(
+            "Self-Flow is experimental and adds one extra teacher forward pass per step; expect higher VRAM/time cost."
+        )
+
     def _apply_network_initialization(self, args: argparse.Namespace, network=None) -> None:
         """Apply network initialization customizations.
 
@@ -916,6 +994,77 @@ class LTX2NetworkTrainer(NetworkTrainer):
                     losses["loss/audio_dop"] = val
 
         return losses
+
+    def compute_self_flow_addition(
+        self,
+        args: argparse.Namespace,
+        accelerator: Accelerator,
+        transformer: torch.nn.Module,
+        network: torch.nn.Module,
+        network_dtype: torch.dtype,
+    ) -> tuple[Optional[torch.Tensor], Dict[str, float]]:
+        """Compute Self-Flow loss addition and logging values for the current step."""
+        if not self._self_flow_active or self._self_flow is None:
+            return None, {}
+        if not bool(getattr(args, "self_flow", False)):
+            return None, {}
+        if not bool(getattr(transformer, "training", False)):
+            return None, {}
+
+        dit_inputs = self._last_dit_inputs
+        sf_ctx = self._self_flow_step_context
+        if dit_inputs is None or sf_ctx is None:
+            self._self_flow.cleanup_step()
+            return None, {}
+
+        teacher_noisy = sf_ctx.get("teacher_noisy_model_input")
+        teacher_timesteps = sf_ctx.get("teacher_model_timesteps")
+        if not isinstance(teacher_noisy, torch.Tensor) or not isinstance(teacher_timesteps, torch.Tensor):
+            self._self_flow.cleanup_step()
+            return None, {}
+
+        # Current implementation supports video-only path.
+        model_input = dit_inputs.get("model_input")
+        if isinstance(model_input, (list, tuple)):
+            self._self_flow.cleanup_step()
+            return None, {}
+
+        teacher_timesteps_model = self._normalize_timesteps_for_model(
+            teacher_timesteps.to(device=accelerator.device, dtype=network_dtype)
+        )
+        if teacher_timesteps_model.dim() == 0:
+            teacher_timesteps_model = teacher_timesteps_model.unsqueeze(0)
+        if teacher_timesteps_model.dim() == 1:
+            teacher_timesteps_model = teacher_timesteps_model.unsqueeze(1)
+
+        loss = self._self_flow.compute_loss(
+            accelerator=accelerator,
+            transformer=transformer,
+            network=network,
+            teacher_model_input=teacher_noisy.to(device=accelerator.device, dtype=network_dtype),
+            teacher_timesteps=teacher_timesteps_model,
+            text_embeds=dit_inputs["text_embeds"],
+            text_mask=dit_inputs["text_mask"],
+            frame_rate=dit_inputs["frame_rate"],
+            transformer_options=dit_inputs["transformer_options"],
+        )
+
+        metrics: Dict[str, float] = {}
+        if loss is not None:
+            metrics["loss/self_flow"] = float(loss.detach().item())
+        cosine = self._self_flow.last_cosine
+        if cosine is not None:
+            metrics["self_flow/cosine"] = float(cosine)
+        if "masked_token_ratio" in sf_ctx:
+            metrics["self_flow/masked_token_ratio"] = float(sf_ctx["masked_token_ratio"])
+        if "tau_mean" in sf_ctx:
+            metrics["self_flow/tau_mean"] = float(sf_ctx["tau_mean"])
+        if "tau_min_mean" in sf_ctx:
+            metrics["self_flow/tau_min_mean"] = float(sf_ctx["tau_min_mean"])
+
+        self._self_flow.cleanup_step()
+        self._self_flow_step_context = None
+        return loss, metrics
 
     def _get_audio_preview_config(self, args: argparse.Namespace, transformer) -> Dict[str, int | float]:
         if self._audio_preview_config is not None:
@@ -1352,6 +1501,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
             latents = latents.to(device=device)
         if noise.device != device:
             noise = noise.to(device=device)
+        self._self_flow_step_context = None
 
         batch_size = latents.shape[0]
         frames, height, width = latents.shape[2], latents.shape[3], latents.shape[4]
@@ -1372,54 +1522,92 @@ class LTX2NetworkTrainer(NetworkTrainer):
         if timestep_sampling == "sigma":
             timestep_sampling = "shifted_logit_normal"
 
-        if timestep_sampling == "shifted_logit_normal":
-            # Official LTX-2 implementation: shifted logit-normal distribution
-            # Shift is computed based on sequence length
-            if self._ltx_mode == "audio":
-                if audio_seq_lens is not None:
-                    shifts = self._shifted_logit_normal_shift_for_sequence_lengths(audio_seq_lens)
-                    shifts = shifts.clamp(min=0.95, max=2.05)
-                    if not self._logged_audio_only_timestep_shift:
-                        logger.info(
-                            "LTX-2 audio-only mode: shifted_logit_normal seq_len min=%s max=%s mean=%.2f, "
-                            "shift min=%.4f max=%.4f mean=%.4f.",
-                            int(audio_seq_lens.min().item()),
-                            int(audio_seq_lens.max().item()),
-                            float(audio_seq_lens.to(dtype=torch.float32).mean().item()),
-                            float(shifts.min().item()),
-                            float(shifts.max().item()),
-                            float(shifts.mean().item()),
-                        )
-                        self._logged_audio_only_timestep_shift = True
-                else:
-                    shift = self._resolve_shifted_logit_normal_shift(args, seq_len)
-                    shifts = torch.full((batch_size,), float(shift), device=device, dtype=torch.float32)
-            else:
-                shift = self._shifted_logit_normal_shift_for_sequence_length(seq_len)
-                shifts = torch.full((batch_size,), float(shift), device=device, dtype=torch.float32)
-            std = getattr(args, "logit_std", 1.0)
-            normal_samples = torch.randn((batch_size,), device=device, dtype=torch.float32) * std + shifts
-            sigmas = torch.sigmoid(normal_samples)
-        elif timestep_sampling == "uniform":
-            # Uniform sampling from [0, 1]
-            sigmas = torch.rand((batch_size,), device=device, dtype=torch.float32)
-        else:
+        if timestep_sampling not in {"shifted_logit_normal", "uniform"}:
             # For other sampling modes, use parent implementation
             return super().get_noisy_model_input_and_timesteps(args, noise, latents, timesteps, noise_scheduler, device, dtype)
 
-        # Apply min/max timestep constraints if specified
-        min_timestep = getattr(args, "min_timestep", None)
-        max_timestep = getattr(args, "max_timestep", None)
-        if min_timestep is not None or max_timestep is not None:
-            min_sigma = (min_timestep / 1000.0) if min_timestep is not None else 0.0
-            max_sigma = (max_timestep / 1000.0) if max_timestep is not None else 1.0
-            sigmas = sigmas * (max_sigma - min_sigma) + min_sigma
+        def _sample_sigmas() -> torch.Tensor:
+            if timestep_sampling == "shifted_logit_normal":
+                if self._ltx_mode == "audio":
+                    if audio_seq_lens is not None:
+                        shifts = self._shifted_logit_normal_shift_for_sequence_lengths(audio_seq_lens)
+                        shifts = shifts.clamp(min=0.95, max=2.05)
+                        if not self._logged_audio_only_timestep_shift:
+                            logger.info(
+                                "LTX-2 audio-only mode: shifted_logit_normal seq_len min=%s max=%s mean=%.2f, "
+                                "shift min=%.4f max=%.4f mean=%.4f.",
+                                int(audio_seq_lens.min().item()),
+                                int(audio_seq_lens.max().item()),
+                                float(audio_seq_lens.to(dtype=torch.float32).mean().item()),
+                                float(shifts.min().item()),
+                                float(shifts.max().item()),
+                                float(shifts.mean().item()),
+                            )
+                            self._logged_audio_only_timestep_shift = True
+                    else:
+                        shift = self._resolve_shifted_logit_normal_shift(args, seq_len)
+                        shifts = torch.full((batch_size,), float(shift), device=device, dtype=torch.float32)
+                else:
+                    shift = self._shifted_logit_normal_shift_for_sequence_length(seq_len)
+                    shifts = torch.full((batch_size,), float(shift), device=device, dtype=torch.float32)
+                std = getattr(args, "logit_std", 1.0)
+                normal_samples = torch.randn((batch_size,), device=device, dtype=torch.float32) * std + shifts
+                sampled = torch.sigmoid(normal_samples)
+            else:
+                sampled = torch.rand((batch_size,), device=device, dtype=torch.float32)
+
+            min_timestep = getattr(args, "min_timestep", None)
+            max_timestep = getattr(args, "max_timestep", None)
+            if min_timestep is not None or max_timestep is not None:
+                min_sigma = (min_timestep / 1000.0) if min_timestep is not None else 0.0
+                max_sigma = (max_timestep / 1000.0) if max_timestep is not None else 1.0
+                sampled = sampled * (max_sigma - min_sigma) + min_sigma
+            return sampled
+
+        sigmas = _sample_sigmas()
+
+        # Optional Self-Flow dual-timestep noising for video mode.
+        if (
+            self._self_flow_active
+            and self._self_flow is not None
+            and self._ltx_mode == "video"
+            and bool(getattr(args, "self_flow", False))
+            and bool(getattr(self._self_flow.config, "dual_timestep", True))
+        ):
+            sigmas_alt = _sample_sigmas()
+            t_tokens = sigmas.view(batch_size, 1).expand(batch_size, seq_len)
+            s_tokens = sigmas_alt.view(batch_size, 1).expand(batch_size, seq_len)
+
+            mask_ratio = float(getattr(self._self_flow.config, "mask_ratio", 0.10))
+            mask_ratio = max(0.0, min(0.5, mask_ratio))
+            mask = torch.rand((batch_size, seq_len), device=device, dtype=torch.float32) < mask_ratio
+
+            tau_tokens = torch.where(mask, s_tokens, t_tokens)
+            tau_min = torch.minimum(sigmas, sigmas_alt)
+
+            tau_latent = tau_tokens.view(batch_size, frames, height, width).unsqueeze(1)
+            tau_min_latent = tau_min.view(batch_size, 1, 1, 1, 1)
+
+            noisy_model_input = (1.0 - tau_latent) * latents.to(dtype=torch.float32) + tau_latent * noise.to(dtype=torch.float32)
+            teacher_noisy = (1.0 - tau_min_latent) * latents.to(dtype=torch.float32) + tau_min_latent * noise.to(dtype=torch.float32)
+
+            if bool(getattr(self._self_flow.config, "tokenwise_timestep", True)):
+                timesteps_out = tau_tokens.to(device=device, dtype=torch.float32) * 1000.0
+            else:
+                timesteps_out = tau_tokens.mean(dim=1).to(device=device, dtype=torch.float32) * 1000.0
+            teacher_timesteps = tau_min.to(device=device, dtype=torch.float32) * 1000.0
+
+            self._self_flow_step_context = {
+                "teacher_noisy_model_input": teacher_noisy.detach(),
+                "teacher_model_timesteps": teacher_timesteps.detach(),
+                "masked_token_ratio": float(mask.float().mean().item()),
+                "tau_mean": float(tau_tokens.mean().item()),
+                "tau_min_mean": float(tau_min.mean().item()),
+            }
+            return noisy_model_input, timesteps_out
 
         sigmas_expanded = sigmas.view(-1, 1, 1, 1, 1)
-        noisy_model_input = (1.0 - sigmas_expanded) * latents.to(dtype=torch.float32) + sigmas_expanded * noise.to(
-            dtype=torch.float32
-        )
-
+        noisy_model_input = (1.0 - sigmas_expanded) * latents.to(dtype=torch.float32) + sigmas_expanded * noise.to(dtype=torch.float32)
         timesteps_out = sigmas.to(device=device, dtype=torch.float32) * 1000.0
         return noisy_model_input, timesteps_out
 
@@ -2724,8 +2912,8 @@ class LTX2NetworkTrainer(NetworkTrainer):
 
         resolved_transformer_options = transformer_options if video_conditioning_mask_tokens is not None else {"patches_replace": {}}
 
-        # Store inputs for preservation techniques (no-op when flag is off)
-        if self._preservation_active:
+        # Store inputs for preservation / Self-Flow techniques (no-op when both are off)
+        if self._preservation_active or self._self_flow_active:
             self._last_dit_inputs = {
                 "model_input": model_input,
                 "model_timesteps": model_timesteps,
@@ -2735,6 +2923,9 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 "frame_rate": frame_rate,
                 "transformer_options": resolved_transformer_options,
             }
+
+        if self._self_flow_active and self._self_flow is not None:
+            self._self_flow.mark_student_forward()
 
         if getattr(args, "fp8_base", False) or getattr(args, "fp8_scaled", False):
             self._ensure_fp8_buffers_on_device(transformer)
@@ -5604,6 +5795,19 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         nargs="*",
         help="Key=value args for CREPA, e.g. student_block_idx=16 teacher_block_idx=32 "
              "lambda_crepa=0.1 tau=1.0 num_neighbors=2 schedule=constant normalize=true",
+    )
+    parser.add_argument(
+        "--self_flow",
+        action="store_true",
+        help="Enable Self-Flow regularization (dual-timestep noising + EMA-teacher feature alignment). "
+             "Currently supported for --ltx_mode video.",
+    )
+    parser.add_argument(
+        "--self_flow_args",
+        type=str,
+        nargs="*",
+        help="Key=value args for Self-Flow, e.g. student_block_idx=16 teacher_block_idx=32 "
+             "lambda_self_flow=0.1 mask_ratio=0.1 teacher_momentum=0.999 dual_timestep=true",
     )
 
     # -- Per-module learning rate groups --

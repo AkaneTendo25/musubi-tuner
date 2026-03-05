@@ -2392,6 +2392,16 @@ class NetworkTrainer:
                             save_file(proj_sd, proj_file)
                     except Exception as e:
                         logger.warning(f"Failed to save CREPA projector to state dir: {e}")
+                if hasattr(self, "_self_flow") and self._self_flow is not None:
+                    try:
+                        from safetensors.torch import save_file
+
+                        proj_sd = self._self_flow.state_dict()
+                        if proj_sd:
+                            proj_file = os.path.join(output_dir, "self_flow_projector.safetensors")
+                            save_file(proj_sd, proj_file)
+                    except Exception as e:
+                        logger.warning(f"Failed to save Self-Flow projector to state dir: {e}")
 
         def load_model_hook(models, input_dir):
             # remove models except network
@@ -2416,6 +2426,13 @@ class NetworkTrainer:
             if crepa_params:
                 optimizer.add_param_group({"params": crepa_params, "lr": args.learning_rate})
                 accelerator.print(f"CREPA: added {sum(p.numel() for p in crepa_params):,} projector params to optimizer")
+        if hasattr(self, "_self_flow") and self._self_flow is not None:
+            self_flow_params = self._self_flow.get_trainable_params()
+            if self_flow_params:
+                optimizer.add_param_group({"params": self_flow_params, "lr": args.learning_rate})
+                accelerator.print(
+                    f"Self-Flow: added {sum(p.numel() for p in self_flow_params):,} projector params to optimizer"
+                )
 
         # epoch数を計算する
         num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
@@ -3083,6 +3100,22 @@ class NetworkTrainer:
                             loss = loss + crepa_loss
                         self._crepa.cleanup_step()
 
+                    # Self-Flow loss
+                    self_flow_metrics = {}
+                    if hasattr(self, "compute_self_flow_addition"):
+                        try:
+                            self_flow_loss, self_flow_metrics = self.compute_self_flow_addition(
+                                args,
+                                accelerator,
+                                transformer,
+                                network,
+                                network_dtype,
+                            )
+                            if self_flow_loss is not None:
+                                loss = loss + self_flow_loss
+                        except Exception as e:
+                            logger.warning("Self-Flow loss computation failed: %s", e)
+
                     if _is_first_step:
                         _log_vram("FIRST_ITER: BEFORE backward", logger)
                     accelerator.backward(loss)
@@ -3094,6 +3127,8 @@ class NetworkTrainer:
                         pres_losses["loss/prior_div"] = _prior_div_value
                     if _crepa_value is not None:
                         pres_losses["loss/crepa"] = _crepa_value
+                    if self_flow_metrics:
+                        pres_losses.update(self_flow_metrics)
 
                     # DEBUG: Check if LoRA parameters have gradients (requires LTX2_DEBUG env var)
                     if os.environ.get("LTX2_DEBUG", "0") == "1":
@@ -3140,11 +3175,21 @@ class NetworkTrainer:
                             for param in network.parameters():
                                 if param.grad is not None:
                                     param.grad = accelerator.reduce(param.grad, reduction="mean")
+                            if hasattr(self, '_crepa') and self._crepa is not None:
+                                for param in self._crepa.get_trainable_params():
+                                    if param.grad is not None:
+                                        param.grad = accelerator.reduce(param.grad, reduction="mean")
+                            if hasattr(self, "_self_flow") and self._self_flow is not None:
+                                for param in self._self_flow.get_trainable_params():
+                                    if param.grad is not None:
+                                        param.grad = accelerator.reduce(param.grad, reduction="mean")
 
                         if args.max_grad_norm != 0.0:
                             params_to_clip = list(accelerator.unwrap_model(network).get_trainable_params())
                             if hasattr(self, '_crepa') and self._crepa is not None:
                                 params_to_clip.extend(self._crepa.get_trainable_params())
+                            if hasattr(self, "_self_flow") and self._self_flow is not None:
+                                params_to_clip.extend(self._self_flow.get_trainable_params())
                             accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
 
                     if _is_first_step:
@@ -3152,6 +3197,15 @@ class NetworkTrainer:
                     optimizer.step()
                     if _is_first_step:
                         _log_vram("FIRST_ITER: AFTER optimizer.step", logger)
+                    if (
+                        accelerator.sync_gradients
+                        and hasattr(self, "_self_flow")
+                        and self._self_flow is not None
+                    ):
+                        try:
+                            self._self_flow.update_teacher(accelerator.unwrap_model(network))
+                        except Exception as e:
+                            logger.warning("Self-Flow EMA update failed: %s", e)
                     lr_scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
                     if _is_first_step:
