@@ -2485,6 +2485,10 @@ class NetworkTrainer:
             "ss_timestep_sampling": args.timestep_sampling,
             "ss_sigmoid_scale": args.sigmoid_scale,
             "ss_discrete_flow_shift": args.discrete_flow_shift,
+            "ss_ltx_version": getattr(args, "ltx_version", None),
+            "ss_shifted_logit_mode": getattr(args, "shifted_logit_mode", None),
+            "ss_shifted_logit_eps": getattr(args, "shifted_logit_eps", None),
+            "ss_shifted_logit_uniform_prob": getattr(args, "shifted_logit_uniform_prob", None),
             "ss_audio_lr": getattr(args, "audio_lr", None),
             "ss_lr_args": json.dumps(getattr(args, "lr_args", None)) if getattr(args, "lr_args", None) else None,
         }
