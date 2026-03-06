@@ -2298,9 +2298,6 @@ class NetworkTrainer:
         # send max_train_steps to train_dataset_group
         train_dataset_group.set_max_train_steps(args.max_train_steps)
 
-        # prepare lr_scheduler
-        lr_scheduler = self.get_lr_scheduler(args, optimizer, accelerator.num_processes)
-
         # prepare training model. accelerator does some magic here
 
         # experimental feature: train the model with gradients in fp16/bf16
@@ -2340,6 +2337,27 @@ class NetworkTrainer:
         if args.compile:
             transformer = self.compile_transformer(args, transformer)
             transformer.__dict__["_orig_mod"] = transformer  # for annoying accelerator checks
+
+        # Set up pre-train hooks (CREPA, Self-Flow, etc.) BEFORE creating the LR scheduler.
+        # This guarantees optimizer.param_groups is finalized before scheduler init.
+        # Otherwise torch LR schedulers can fail with:
+        #   ValueError: zip() argument 2 is shorter than argument 1
+        self.pre_train_hook(args, accelerator, transformer=transformer, network=network)
+        if hasattr(self, '_crepa') and self._crepa is not None:
+            crepa_params = self._crepa.get_trainable_params()
+            if crepa_params:
+                optimizer.add_param_group({"params": crepa_params, "lr": args.learning_rate})
+                accelerator.print(f"CREPA: added {sum(p.numel() for p in crepa_params):,} projector params to optimizer")
+        if hasattr(self, "_self_flow") and self._self_flow is not None:
+            self_flow_params = self._self_flow.get_trainable_params()
+            if self_flow_params:
+                optimizer.add_param_group({"params": self_flow_params, "lr": args.learning_rate})
+                accelerator.print(
+                    f"Self-Flow: added {sum(p.numel() for p in self_flow_params):,} projector params to optimizer"
+                )
+
+        # prepare lr_scheduler (must happen after all optimizer param groups are added)
+        lr_scheduler = self.get_lr_scheduler(args, optimizer, accelerator.num_processes)
 
         if validation_dataloader is not None:
             network, optimizer, train_dataloader, validation_dataloader, lr_scheduler = accelerator.prepare(
@@ -2415,24 +2433,6 @@ class NetworkTrainer:
 
         accelerator.register_save_state_pre_hook(save_model_hook)
         accelerator.register_load_state_pre_hook(load_model_hook)
-
-        # Set up CREPA (and any other pre-train hooks) BEFORE resume so that the
-        # optimizer has the correct number of param groups when load_state() restores
-        # the saved optimizer state.  Without this, resume crashes with
-        # "loaded state dict has a different number of parameter groups".
-        self.pre_train_hook(args, accelerator, transformer=transformer, network=network)
-        if hasattr(self, '_crepa') and self._crepa is not None:
-            crepa_params = self._crepa.get_trainable_params()
-            if crepa_params:
-                optimizer.add_param_group({"params": crepa_params, "lr": args.learning_rate})
-                accelerator.print(f"CREPA: added {sum(p.numel() for p in crepa_params):,} projector params to optimizer")
-        if hasattr(self, "_self_flow") and self._self_flow is not None:
-            self_flow_params = self._self_flow.get_trainable_params()
-            if self_flow_params:
-                optimizer.add_param_group({"params": self_flow_params, "lr": args.learning_rate})
-                accelerator.print(
-                    f"Self-Flow: added {sum(p.numel() for p in self_flow_params):,} projector params to optimizer"
-                )
 
         # epoch数を計算する
         num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)

@@ -1,8 +1,7 @@
 # LTX-2 / LTX-2.3
 
 > [!WARNING]
-> LTX-2 support is work in progress and may be incomplete or unstable.
-> Development is tracked in [this issue](https://github.com/AkaneTendo25/musubi-tuner/issues/1).
+> LTX-2.3 support is work in progress and may be incomplete or unstable.
 
 ### Supported Model Versions
 
