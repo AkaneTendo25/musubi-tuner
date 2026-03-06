@@ -2586,6 +2586,21 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 "or 'text'/'text_mask' (legacy musubi format)."
             )
 
+        # LTX-2.3 (caption_proj_before_connector=True) expects already-projected context
+        # dimensions for each modality. In audio mode this must be audio_prompt_embeds
+        # (audio_cross_attention_dim), not generic/video prompt embeds.
+        base_model = transformer.model if hasattr(transformer, "model") else transformer
+        if self._ltx_mode == "audio" and bool(getattr(base_model, "caption_proj_before_connector", False)):
+            expected_audio_dim = int(getattr(base_model, "audio_cross_attention_dim", 0) or 0)
+            if expected_audio_dim > 0 and text_embeds.shape[-1] != expected_audio_dim:
+                raise ValueError(
+                    "Audio mode received text embeddings with incompatible hidden size for this checkpoint. "
+                    f"Expected audio_prompt_embeds dim={expected_audio_dim}, got dim={text_embeds.shape[-1]}. "
+                    "This usually means text encoder cache was created without audio embeddings. "
+                    "Re-run ltx2_cache_text_encoder_outputs.py with --ltx2_mode audio (or av) using the same "
+                    "--ltx2_checkpoint, then train again."
+                )
+
         if not isinstance(text_embeds, torch.Tensor):
             raise TypeError(f"Expected text embeddings to be a torch.Tensor, got: {type(text_embeds)}")
         if text_embeds.dim() != 3:

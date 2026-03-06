@@ -221,6 +221,24 @@ class LTX2Wrapper(nn.Module):
         audio_timestep = kwargs.get("audio_timestep")
         timestep_audio = _to_timestep(audio_timestep, name="audio_timestep") if audio_timestep is not None else timestep_video
 
+        # Prompt AdaLN expects per-sample sigma. Collapse token-wise timesteps when present.
+        def _to_sigma(ts: torch.Tensor, *, name: str) -> torch.Tensor:
+            if ts.dim() == 2:
+                if ts.shape[1] == 1:
+                    sigma = ts[:, 0]
+                else:
+                    sigma = ts.to(dtype=torch.float32).mean(dim=1)
+            elif ts.dim() == 1:
+                sigma = ts
+            else:
+                raise ValueError(f"Unexpected {name} shape: {tuple(ts.shape)}")
+            if sigma.shape[0] != bsz:
+                raise ValueError(f"Expected {name} batch size {bsz}, got {sigma.shape[0]}")
+            return sigma.to(device=ref_latents.device, dtype=ref_latents.dtype)
+
+        sigma = _to_sigma(timestep_video, name="timestep")
+        audio_sigma = _to_sigma(timestep_audio, name="audio_timestep")
+
         video_tokens = None
         video_timesteps = None
         video_positions = None

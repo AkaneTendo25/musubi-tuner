@@ -11,7 +11,9 @@
 | LTX-2 (19B) | 19B | Single `aggregate_embed`, caption projection inside transformer |
 | LTX-2.3 (22B) | 22B | Dual `video_aggregate_embed`/`audio_aggregate_embed`, caption projection moved to feature extractor (`caption_proj_before_connector`), cross-attention AdaLN (`prompt_adaln`), separate audio connector dimensions, BigVGAN v2 vocoder with bandwidth extension |
 
-Version is selected via `--ltx_version` (default: `2.0`). The trainer auto-detects the checkpoint version from metadata and warns on mismatch. All caching and training commands work with both versions — no separate code paths are needed.
+Version choice for training is controlled by `--ltx_version` (default: `2.0`) in `ltx2_train_network.py`. The trainer auto-detects the checkpoint version from metadata and warns on mismatch.
+
+Caching scripts (`ltx2_cache_latents.py`, `ltx2_cache_text_encoder_outputs.py`) do not use `--ltx_version`; they work with both LTX-2 and LTX-2.3 checkpoints directly via `--ltx2_checkpoint`.
 
 ---
 
@@ -30,6 +32,7 @@ Version is selected via `--ltx_version` (default: `2.0`). The trainer auto-detec
   - [Text Encoder Output Files](#text-encoder-output-files)
   - [Loading Gemma from a Single Safetensors File](#loading-gemma-from-a-single-safetensors-file)
 - [3. Training](#3-training)
+  - [Choosing Model Version for Training (2.0 vs 2.3)](#choosing-model-version-for-training-20-vs-23)
   - [Source-Free Training from Cache](#optional-source-free-training-from-cache)
   - [Standard LoRA Training](#standard-lora-training)
   - [Advanced: LyCORIS/LoKR Training](#advanced-lycorislokr-training)
@@ -241,6 +244,36 @@ Launch the training loop using `accelerate`.
 
 **Script:** `ltx2_train_network.py`
 
+### Choosing Model Version for Training (2.0 vs 2.3)
+
+Use this rule:
+
+| Checkpoint you train on | Required training flags |
+|---|---|
+| LTX-2 (19B) checkpoint | `--ltx_version 2.0` |
+| LTX-2.3 (22B) checkpoint | `--ltx_version 2.3` |
+
+Recommended practice:
+- Always set `--ltx_version` explicitly in training commands (do not rely on the default).
+- On first run, set `--ltx_version_check_mode error` to fail fast if the selected version does not match checkpoint metadata.
+- After validation, you can switch to `--ltx_version_check_mode warn`.
+- For LTX-2.3, current upstream recommendation is to train from the BF16 checkpoint. FP8-checkpoint training recipes are currently community-contributed/experimental.
+
+When changing checkpoints (important):
+- If you change `--ltx2_checkpoint` (e.g., LTX-2 -> LTX-2.3, or different 2.3 variant), re-run **both** caches:
+  - `ltx2_cache_latents.py`
+  - `ltx2_cache_text_encoder_outputs.py`
+- Do not reuse old `*_ltx2_te.safetensors` from a different checkpoint. For LTX-2.3 audio/av training this can cause context/mask shape mismatches (for example FlashAttention varlen mask-length errors).
+- If you use `--dataset_manifest`, regenerate it from the recache step so training points to the new cache files.
+- If your selected checkpoint is already FP8-quantized (for example `*fp8*.safetensors`), still keep `--fp8_base` during training (usually with `--mixed_precision bf16`), but do not add `--fp8_scaled`.
+
+Example (LTX-2.3 training):
+```bash
+--ltx2_checkpoint /path/to/ltx-2.3.safetensors ^
+--ltx_version 2.3 ^
+--ltx_version_check_mode error
+```
+
 ### Optional: Source-Free Training from Cache
 If you cached with `--save_dataset_manifest`, you can train without source dataset paths:
 
@@ -260,7 +293,9 @@ accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 ltx2_tr
   --gemma_load_in_8bit ^
   --gemma_root /path/to/gemma ^
   --separate_audio_buckets ^
-  --ltx2_checkpoint /path/to/ltx-2.safetensors ^
+  --ltx2_checkpoint /path/to/ltx-2.3.safetensors ^
+  --ltx_version 2.3 ^
+  --ltx_version_check_mode error ^
   --ltx2_mode av ^
   --fp8_base ^
   --fp8_scaled ^
@@ -283,8 +318,14 @@ accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 ltx2_tr
   --sample_vae_temporal_tile_overlap 8 ^
   --sample_merge_audio ^
   --output_dir output ^
-  --output_name ltx2_lora
+  --output_name ltx23_lora
 ```
+
+If the selected checkpoint is already FP8 (`*fp8*.safetensors`), keep `--fp8_base` but remove `--fp8_scaled`.
+
+For LTX-2 checkpoints, replace:
+- `--ltx2_checkpoint /path/to/ltx-2.3.safetensors` -> `--ltx2_checkpoint /path/to/ltx-2.safetensors`
+- `--ltx_version 2.3` -> `--ltx_version 2.0`
 
 ### Advanced: LyCORIS/LoKR Training
 
@@ -354,7 +395,8 @@ accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 ltx2_tr
 
 NF4 has ~4x higher weight error than FP8 (cosine 0.996 vs 0.9997). The base model is frozen during LoRA training, so the quantization error is constant rather than accumulating. LoftQ initializes LoRA weights from the quantization residual via SVD.
 
-- `--fp8_base`, `--fp8_scaled`: FP8 quantization (~19 GB VRAM).
+- `--fp8_base`: keep base model weights in FP8 path (~19 GB VRAM).
+- `--fp8_scaled`: quantize non-FP8 (fp16/bf16/fp32) checkpoints to FP8. Do not use this with already-FP8 checkpoints.
 - `--nf4_base`: NF4 4-bit quantization (~10 GB VRAM). Mutually exclusive with `--fp8_base`. See [NF4 Quantization](#nf4-quantization) below.
 
 ##### Other Memory Options
@@ -401,7 +443,7 @@ accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 ltx2_tr
 ```
 
 **Tips for low-VRAM training:**
-- Use `--fp8_base --fp8_scaled`
+- Use `--fp8_base --fp8_scaled` for non-FP8 checkpoints; use `--fp8_base` only for already-FP8 checkpoints
 - Use `--blocks_to_swap 47` (keeps only 1 block on GPU)
 - Use smaller LoRA rank (`--network_dim 16` instead of 32)
 - Use smaller training resolutions (e.g., 512x320)
@@ -453,7 +495,7 @@ accelerate launch ... ltx2_train_network.py ^
 - Quantization targets transformer block weights only. Embedding layers, norms, and projection layers remain in full precision.
 
 #### Model Version
-- `--ltx_version 2.0|2.3`: Select target model version (default: `2.0`). Controls default behavior for version-dependent settings (e.g., `--shifted_logit_mode` defaults to `legacy` for 2.0, `stretched` for 2.3).
+- `--ltx_version 2.0|2.3`: Select target model version (default: `2.0`). Controls default behavior for version-dependent settings (e.g., `--shifted_logit_mode` defaults to `legacy` for 2.0, `stretched` for 2.3). For LTX-2.3 checkpoints, set `--ltx_version 2.3` explicitly.
 - `--ltx_version_check_mode off|warn|error`: How to handle mismatch between `--ltx_version` and checkpoint metadata (default: `warn`). The trainer reads checkpoint config keys (`cross_attention_adaln`, `caption_proj_before_connector`, `bwe` vocoder) to detect the actual version.
 
 #### Audio-Video Support
@@ -1164,6 +1206,11 @@ reference_cache_directory/                  # IC-LoRA only
 | Error | Cause | Solution |
 |-------|-------|----------|
 | Missing cache keys during training | Caching incomplete | Run both `ltx2_cache_latents.py` and `ltx2_cache_text_encoder_outputs.py` |
+| FlashAttention varlen mask-length mismatch (for example `expects mask length 1920, got 1024`) after checkpoint switch | Stale text cache from a different checkpoint/version/mode | Re-run `ltx2_cache_text_encoder_outputs.py` with the same `--ltx2_checkpoint` and `--ltx2_mode` as training. Remove old `*_ltx2_te.safetensors` if needed. |
+| Samples become progressively noisier/degraded when training with `--flash_attn` | FlashAttention install/runtime mismatch (CUDA/PyTorch/flash-attn build) | Switch to `--sdpa` to confirm baseline stability. If SDPA is stable, reinstall FlashAttention for your exact CUDA + PyTorch versions and retry. |
+| Training fails after changing `--ltx2_checkpoint` even though args look correct | Reused latent/text caches generated from a different checkpoint | Re-run both caches (`ltx2_cache_latents.py` and `ltx2_cache_text_encoder_outputs.py`) and regenerate `--dataset_manifest` before training. |
+| OOM appears after removing `--fp8_base` while using an FP8 checkpoint | Base model no longer uses FP8 loading path, so VRAM increases sharply | Keep `--fp8_base` enabled for FP8 checkpoints (typically with `--mixed_precision bf16`) |
+| Error when combining `--fp8_scaled` with an FP8 checkpoint | `--fp8_scaled` is for quantizing non-FP8 checkpoints | Remove `--fp8_scaled`; keep `--fp8_base` |
 | Missing `*_ltx2_audio.safetensors` | Audio caching skipped | Re-run latent caching with `--ltx2_mode av` |
 | Gemma connector weights missing | Incorrect checkpoint | Ensure `--ltx2_checkpoint` (or `--ltx2_text_encoder_checkpoint`) contains Gemma connector weights |
 | Gemma OOM | Model too large | Use `--gemma_load_in_8bit` or `--gemma_load_in_4bit` with `--device cuda`, or use `--gemma_safetensors` with an FP8 file |
@@ -1383,4 +1430,5 @@ Note: `--gemma_root` is not needed for reference mode (text embeddings are loade
 
 - [Installation Guide](https://github.com/AkaneTendo25/musubi-tuner/discussions/19) — Setup instructions, dependencies, flash-attn, troubleshooting
 - [Optimizers Guide](https://github.com/AkaneTendo25/musubi-tuner/discussions/21) — Optimizer comparison, recommended settings, memory usage tips
+- [LTX-2 Audio Dataset Builder](https://github.com/dorpxam/LTX-2-Audio-Dataset-Builder) — Specialized tool to automate high-quality audio dataset creation: transforms raw audio into clean, curated, captioned segments optimized for LTX-2 audio-only training
 
