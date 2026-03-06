@@ -41,7 +41,12 @@ class VideoGemmaTextEncoderModel(GemmaTextEncoderModelBase):
         )
         self.embeddings_connector = embeddings_connector.to(dtype=dtype)
 
-    def _run_connector(self, encoded_input: torch.Tensor, attention_mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def _run_connector(
+        self, encoded_input: torch.Tensor | tuple[torch.Tensor, torch.Tensor | None], attention_mask: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if isinstance(encoded_input, tuple):
+            encoded_input = encoded_input[0]
+
         connector_attention_mask = self._convert_to_additive_mask(attention_mask, encoded_input.dtype)
 
         encoded, encoded_connector_attention_mask = self.embeddings_connector(
@@ -66,6 +71,8 @@ class VideoGemmaTextEncoderModelConfigurator(ModelConfigurator[VideoGemmaTextEnc
     @classmethod
     def from_config(cls: type["VideoGemmaTextEncoderModel"], config: dict) -> "VideoGemmaTextEncoderModel":
         feature_extractor_linear = GemmaFeaturesExtractorProjLinear.from_config(config)
+        if isinstance(feature_extractor_linear, GemmaFeaturesExtractorProjLinear):
+            feature_extractor_linear.is_av = False
         embeddings_connector = Embeddings1DConnectorConfigurator.from_config(config)
         return VideoGemmaTextEncoderModel(
             feature_extractor_linear=feature_extractor_linear,

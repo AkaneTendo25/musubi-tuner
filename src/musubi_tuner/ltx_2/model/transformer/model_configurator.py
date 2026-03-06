@@ -65,6 +65,8 @@ class LTXModelConfigurator(ModelConfigurator[LTXModel]):
             rope_type=LTXRopeType(config.get("rope_type", "interleaved")),
             double_precision_rope=config.get("frequencies_precision", False) == "float64",
             apply_gated_attention=config.get("apply_gated_attention", False),
+            caption_proj_before_connector=config.get("caption_proj_before_connector", False),
+            cross_attention_adaln=config.get("cross_attention_adaln", False),
         )
 
 
@@ -112,6 +114,8 @@ class LTXVideoOnlyModelConfigurator(ModelConfigurator[LTXModel]):
             rope_type=LTXRopeType(config.get("rope_type", "interleaved")),
             double_precision_rope=config.get("frequencies_precision", False) == "float64",
             apply_gated_attention=config.get("apply_gated_attention", False),
+            caption_proj_before_connector=config.get("caption_proj_before_connector", False),
+            cross_attention_adaln=config.get("cross_attention_adaln", False),
         )
 
 
@@ -159,6 +163,8 @@ class LTXAudioOnlyModelConfigurator(ModelConfigurator[LTXModel]):
             rope_type=LTXRopeType(config.get("rope_type", "interleaved")),
             double_precision_rope=config.get("frequencies_precision", False) == "float64",
             apply_gated_attention=config.get("apply_gated_attention", False),
+            caption_proj_before_connector=config.get("caption_proj_before_connector", False),
+            cross_attention_adaln=config.get("cross_attention_adaln", False),
         )
 
 

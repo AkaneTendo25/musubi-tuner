@@ -10,7 +10,7 @@ from musubi_tuner.ltx_2.utils import create_cpu_offloading_wrapper
 from musubi_tuner.ltx_2.model.ltx2_custom_offloading_utils import weighs_to_device
 from musubi_tuner.ltx_2.model.transformer.block_level_checkpointing import block_checkpoint
 from musubi_tuner.ltx_2.guidance.perturbations import BatchedPerturbationConfig, PerturbationType
-from musubi_tuner.ltx_2.model.transformer.adaln import AdaLayerNormSingle
+from musubi_tuner.ltx_2.model.transformer.adaln import AdaLayerNormSingle, adaln_embedding_coefficient
 from musubi_tuner.ltx_2.model.transformer.attention import Attention, AttentionCallable, AttentionFunction
 from musubi_tuner.ltx_2.model.transformer.fp8_device_utils import ensure_fp8_modules_on_device
 from musubi_tuner.ltx_2.model.transformer.feed_forward import FeedForward
@@ -48,6 +48,7 @@ class TransformerConfig:
     d_head: int
     context_dim: int
     apply_gated_attention: bool = False
+    cross_attention_adaln: bool = False
 
 
 def _move_non_linear_params(module: torch.nn.Module, device: torch.device, skip_trainable: bool = True) -> None:
@@ -118,7 +119,7 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 apply_gated_attention=video.apply_gated_attention,
             )
             self.ff = FeedForward(video.dim, dim_out=video.dim)
-            self.scale_shift_table = torch.nn.Parameter(torch.empty(6, video.dim))
+            self.scale_shift_table = torch.nn.Parameter(torch.empty(adaln_embedding_coefficient(video.cross_attention_adaln), video.dim))
 
         if audio is not None:
             self.audio_attn1 = Attention(
@@ -142,7 +143,7 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 apply_gated_attention=audio.apply_gated_attention,
             )
             self.audio_ff = FeedForward(audio.dim, dim_out=audio.dim)
-            self.audio_scale_shift_table = torch.nn.Parameter(torch.empty(6, audio.dim))
+            self.audio_scale_shift_table = torch.nn.Parameter(torch.empty(adaln_embedding_coefficient(audio.cross_attention_adaln), audio.dim))
 
         if audio is not None and video is not None:
             # Q: Video, K,V: Audio
@@ -173,6 +174,14 @@ class BasicAVTransformerBlock(torch.nn.Module):
             self.scale_shift_table_a2v_ca_video = torch.nn.Parameter(torch.empty(5, video.dim))
 
         self.norm_eps = norm_eps
+        self.cross_attention_adaln = bool(
+            (video is not None and video.cross_attention_adaln)
+            or (audio is not None and audio.cross_attention_adaln)
+        )
+        if self.cross_attention_adaln and video is not None:
+            self.prompt_scale_shift_table = torch.nn.Parameter(torch.empty(2, video.dim))
+        if self.cross_attention_adaln and audio is not None:
+            self.audio_prompt_scale_shift_table = torch.nn.Parameter(torch.empty(2, audio.dim))
         self.gradient_checkpointing = False
         self.activation_cpu_offloading = False
         self.weight_cpu_offloading = False
@@ -255,6 +264,41 @@ class BasicAVTransformerBlock(torch.nn.Module):
         gate_ada_values = [t.squeeze(2) for t in gate_ada_values]
 
         return (*scale_shift_chunks, *gate_ada_values)
+
+    def _apply_text_cross_attention(
+        self,
+        x: torch.Tensor,
+        context: torch.Tensor,
+        attn: AttentionCallable,
+        scale_shift_table: torch.Tensor,
+        prompt_scale_shift_table: torch.Tensor | None,
+        timestep,
+        prompt_timestep,
+        context_mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if self.cross_attention_adaln:
+            shift_q, scale_q, gate = self.get_ada_values(
+                scale_shift_table, x.shape[0], timestep, slice(6, 9), num_tokens=x.shape[1]
+            )
+            if prompt_scale_shift_table is not None and prompt_timestep is not None:
+                return apply_cross_attention_adaln(
+                    x,
+                    context,
+                    attn,
+                    shift_q,
+                    scale_q,
+                    gate,
+                    prompt_scale_shift_table,
+                    prompt_timestep,
+                    context_mask,
+                    self.norm_eps,
+                )
+            attn_input = (
+                rms_norm(x, eps=self.norm_eps).to(torch.float32) * (1 + scale_q.to(torch.float32))
+                + shift_q.to(torch.float32)
+            ).to(x.dtype)
+            return attn(attn_input, context=context, mask=context_mask) * gate
+        return attn(rms_norm(x, eps=self.norm_eps), context=context, mask=context_mask)
 
     def forward(
         self,
@@ -555,17 +599,30 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 # AdaLN Structural Fix: Force modulation to happen in Float32 to prevent overflow (10^18 issue)
                 norm_vx = (rms_norm(vx, eps=self.norm_eps).to(torch.float32) * (1 + vscale_msa.to(torch.float32)) + vshift_msa.to(torch.float32)).to(vx.dtype)
                 v_mask = perturbations.mask_like(PerturbationType.SKIP_VIDEO_SELF_ATTN, self.idx, vx)
-                attn1_out = _attn_with_retry(self.attn1, norm_vx, pe=video.positional_embeddings)
+                attn1_out = _attn_with_retry(
+                    self.attn1,
+                    norm_vx,
+                    pe=video.positional_embeddings,
+                    mask=video.self_attention_mask,
+                )
                 vx = vx + attn1_out * vgate_msa * v_mask
                 _check_finite_local("video_after_attn1", vx)
 
-            attn2_out = _attn_with_retry(
-                self.attn2,
-                rms_norm(vx, eps=self.norm_eps),
-                context=video.context,
-                mask=video.context_mask,
+            vx = vx + self._apply_text_cross_attention(
+                vx,
+                video.context,
+                lambda q, context=None, mask=None: _attn_with_retry(
+                    self.attn2,
+                    q,
+                    context=context,
+                    mask=mask,
+                ),
+                self.scale_shift_table,
+                getattr(self, "prompt_scale_shift_table", None),
+                video.timesteps,
+                video.prompt_timestep,
+                video.context_mask,
             )
-            vx = vx + attn2_out
             _check_finite_local("video_after_attn2", vx)
 
             del vshift_msa, vscale_msa, vgate_msa
@@ -580,19 +637,32 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 # AdaLN Structural Fix
                 norm_ax = (rms_norm(ax, eps=self.norm_eps).to(torch.float32) * (1 + ascale_msa.to(torch.float32)) + ashift_msa.to(torch.float32)).to(ax.dtype)
                 a_mask = perturbations.mask_like(PerturbationType.SKIP_AUDIO_SELF_ATTN, self.idx, ax)
-                audio_attn1_out = _attn_with_retry(self.audio_attn1, norm_ax, pe=audio.positional_embeddings)
+                audio_attn1_out = _attn_with_retry(
+                    self.audio_attn1,
+                    norm_ax,
+                    pe=audio.positional_embeddings,
+                    mask=audio.self_attention_mask,
+                )
                 ax = ax + audio_attn1_out * agate_msa * a_mask
                 _check_finite_local("audio_after_attn1", ax)
 
-            audio_attn2_out = _attn_with_retry(
-                self.audio_attn2,
-                rms_norm(ax, eps=self.norm_eps),
-                context=audio.context,
-                mask=audio.context_mask,
-                force_fp32=force_fp32_audio_ctx,
-                force_pytorch=force_pytorch_audio_ctx,
+            ax = ax + self._apply_text_cross_attention(
+                ax,
+                audio.context,
+                lambda q, context=None, mask=None: _attn_with_retry(
+                    self.audio_attn2,
+                    q,
+                    context=context,
+                    mask=mask,
+                    force_fp32=force_fp32_audio_ctx,
+                    force_pytorch=force_pytorch_audio_ctx,
+                ),
+                self.audio_scale_shift_table,
+                getattr(self, "audio_prompt_scale_shift_table", None),
+                audio.timesteps,
+                audio.prompt_timestep,
+                audio.context_mask,
             )
-            ax = ax + audio_attn2_out
             _check_finite_local("audio_after_attn2", ax)
 
             del ashift_msa, ascale_msa, agate_msa
@@ -630,7 +700,7 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 num_tokens=vx.shape[1],
             )
 
-            if run_a2v:
+            if run_a2v and not perturbations.all_in_batch(PerturbationType.SKIP_A2V_CROSS_ATTN, self.idx):
                 # AdaLN Structural Fix
                 vx_scaled = (vx_norm3.to(torch.float32) * (1 + scale_ca_video_hidden_states_a2v.to(torch.float32)) + shift_ca_video_hidden_states_a2v.to(torch.float32)).to(vx.dtype)
                 ax_scaled = (ax_norm3.to(torch.float32) * (1 + scale_ca_audio_hidden_states_a2v.to(torch.float32)) + shift_ca_audio_hidden_states_a2v.to(torch.float32)).to(ax.dtype)
@@ -650,7 +720,7 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 )
                 _check_finite_local("video_after_a2v", vx)
 
-            if run_v2a:
+            if run_v2a and not perturbations.all_in_batch(PerturbationType.SKIP_V2A_CROSS_ATTN, self.idx):
                 # AdaLN Structural Fix
                 ax_scaled = (ax_norm3.to(torch.float32) * (1 + scale_ca_audio_hidden_states_v2a.to(torch.float32)) + shift_ca_audio_hidden_states_v2a.to(torch.float32)).to(ax.dtype)
                 vx_scaled = (vx_norm3.to(torch.float32) * (1 + scale_ca_video_hidden_states_v2a.to(torch.float32)) + shift_ca_video_hidden_states_v2a.to(torch.float32)).to(vx.dtype)
@@ -687,8 +757,9 @@ class BasicAVTransformerBlock(torch.nn.Module):
             )
 
         if run_vx:
+            mlp_slice = slice(3, 6) if self.cross_attention_adaln else slice(3, None)
             vshift_mlp, vscale_mlp, vgate_mlp = self.get_ada_values(
-                self.scale_shift_table, vx.shape[0], video.timesteps, slice(3, None), num_tokens=vx.shape[1]
+                self.scale_shift_table, vx.shape[0], video.timesteps, mlp_slice, num_tokens=vx.shape[1]
             )
             # AdaLN Structural Fix
             vx_scaled = (rms_norm(vx, eps=self.norm_eps).to(torch.float32) * (1 + vscale_mlp.to(torch.float32)) + vshift_mlp.to(torch.float32)).to(vx.dtype)
@@ -698,8 +769,9 @@ class BasicAVTransformerBlock(torch.nn.Module):
             del vshift_mlp, vscale_mlp, vgate_mlp
 
         if run_ax:
+            mlp_slice = slice(3, 6) if self.cross_attention_adaln else slice(3, None)
             ashift_mlp, ascale_mlp, agate_mlp = self.get_ada_values(
-                self.audio_scale_shift_table, ax.shape[0], audio.timesteps, slice(3, None), num_tokens=ax.shape[1]
+                self.audio_scale_shift_table, ax.shape[0], audio.timesteps, mlp_slice, num_tokens=ax.shape[1]
             )
             # AdaLN Structural Fix
             ax_scaled = (rms_norm(ax, eps=self.norm_eps).to(torch.float32) * (1 + ascale_mlp.to(torch.float32)) + ashift_mlp.to(torch.float32)).to(ax.dtype)
@@ -732,6 +804,8 @@ class BasicAVTransformerBlock(torch.nn.Module):
             "audio_scale_shift_table",
             "scale_shift_table_a2v_ca_audio",
             "scale_shift_table_a2v_ca_video",
+            "prompt_scale_shift_table",
+            "audio_prompt_scale_shift_table",
         ]:
             p = getattr(b, attr, None)
             if p is not None:
@@ -750,6 +824,8 @@ class BasicAVTransformerBlock(torch.nn.Module):
             "audio_scale_shift_table",
             "scale_shift_table_a2v_ca_audio",
             "scale_shift_table_a2v_ca_video",
+            "prompt_scale_shift_table",
+            "audio_prompt_scale_shift_table",
         ]:
             p = getattr(b, attr, None)
             if p is not None:
@@ -762,4 +838,26 @@ class BasicAVTransformerBlock(torch.nn.Module):
                         p.data = p.data.to(d, non_blocking=True)
         _move_non_linear_params(b, cpu_device)
         ensure_fp8_modules_on_device(b, cpu_device)
+
+
+def apply_cross_attention_adaln(
+    x: torch.Tensor,
+    context: torch.Tensor,
+    attn: AttentionCallable,
+    q_shift: torch.Tensor,
+    q_scale: torch.Tensor,
+    q_gate: torch.Tensor,
+    prompt_scale_shift_table: torch.Tensor,
+    prompt_timestep: torch.Tensor,
+    context_mask: torch.Tensor | None = None,
+    norm_eps: float = 1e-6,
+) -> torch.Tensor:
+    batch_size = x.shape[0]
+    shift_kv, scale_kv = (
+        prompt_scale_shift_table[None, None].to(device=x.device, dtype=x.dtype)
+        + prompt_timestep.reshape(batch_size, prompt_timestep.shape[1], 2, -1)
+    ).unbind(dim=2)
+    attn_input = rms_norm(x, eps=norm_eps) * (1 + q_scale) + q_shift
+    encoder_hidden_states = context * (1 + scale_kv) + shift_kv
+    return attn(attn_input, context=encoder_hidden_states, mask=context_mask) * q_gate
 

@@ -301,7 +301,15 @@ class LTX2SliderTrainer:
         # Sample sigma from shifted logit-normal
         seq_len = latent_frames * latent_height * latent_width
         shift = LTX2NetworkTrainer._shifted_logit_normal_shift_for_sequence_length(seq_len)
-        sigma = torch.sigmoid(torch.randn(1, device=device) + shift)
+        shifted_logit_mode = self._net_trainer._resolve_shifted_logit_mode(args)
+        sigma = LTX2NetworkTrainer._sample_shifted_logit_normal_sigmas(
+            1,
+            torch.tensor([float(shift)], device=device, dtype=torch.float32),
+            std=float(getattr(args, "logit_std", 1.0)),
+            mode=shifted_logit_mode,
+            eps=float(getattr(args, "shifted_logit_eps", 1e-3)),
+            uniform_prob=float(getattr(args, "shifted_logit_uniform_prob", 0.1)),
+        )
         sigma_exp = sigma.view(1, 1, 1, 1, 1)
         noisy = sigma_exp * noise  # pure noise scaled by sigma
 
@@ -419,7 +427,15 @@ class LTX2SliderTrainer:
         # Sample sigma
         seq_len = pos_latents.shape[2] * pos_latents.shape[3] * pos_latents.shape[4]
         shift = LTX2NetworkTrainer._shifted_logit_normal_shift_for_sequence_length(seq_len)
-        sigma = torch.sigmoid(torch.randn(1, device=device) + shift)
+        shifted_logit_mode = self._net_trainer._resolve_shifted_logit_mode(args)
+        sigma = LTX2NetworkTrainer._sample_shifted_logit_normal_sigmas(
+            1,
+            torch.tensor([float(shift)], device=device, dtype=torch.float32),
+            std=float(getattr(args, "logit_std", 1.0)),
+            mode=shifted_logit_mode,
+            eps=float(getattr(args, "shifted_logit_eps", 1e-3)),
+            uniform_prob=float(getattr(args, "shifted_logit_uniform_prob", 0.1)),
+        )
         sigma_exp = sigma.view(1, 1, 1, 1, 1)
 
         # Create noisy versions (flow matching interpolation)

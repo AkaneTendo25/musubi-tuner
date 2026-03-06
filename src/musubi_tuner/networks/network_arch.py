@@ -40,6 +40,8 @@ def detect_arch_config(unet):
 
         return LTX2_TARGET_REPLACE_MODULES, [
             r".*text_embedding_projection\.aggregate_embed.*",
+            r".*text_embedding_projection\.video_aggregate_embed.*",
+            r".*text_embedding_projection\.audio_aggregate_embed.*",
             r".*embeddings_connector\..*",
             r".*audio_embeddings_connector\..*",
         ]

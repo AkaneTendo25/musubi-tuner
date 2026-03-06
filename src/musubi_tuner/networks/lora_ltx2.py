@@ -274,21 +274,37 @@ class LTX2Wrapper(nn.Module):
             and not audio_only
             and audio_latents is not None
             and isinstance(context, torch.Tensor)
-            and context.shape[-1] % 2 == 0
         ):
-            half = context.shape[-1] // 2
-            video_context = context[..., :half]
-            audio_context = context[..., half:]
+            split_video_dim = getattr(self.model, "cross_attention_dim", None)
+            split_audio_dim = getattr(self.model, "audio_cross_attention_dim", None)
+            if (
+                isinstance(split_video_dim, int)
+                and isinstance(split_audio_dim, int)
+                and split_video_dim > 0
+                and split_audio_dim > 0
+                and (split_video_dim + split_audio_dim) == context.shape[-1]
+            ):
+                video_context = context[..., :split_video_dim]
+                audio_context = context[..., split_video_dim : split_video_dim + split_audio_dim]
+            elif context.shape[-1] % 2 == 0:
+                half = context.shape[-1] // 2
+                video_context = context[..., :half]
+                audio_context = context[..., half:]
 
         video_modality = None
         if model_video_enabled:
+            video_self_attention_mask = None
+            if isinstance(transformer_options, dict):
+                video_self_attention_mask = transformer_options.get("self_attention_mask")
             video_modality = Modality(
                 enabled=(not audio_only if video_enabled is None else bool(video_enabled)),
                 latent=video_tokens,
                 timesteps=video_timesteps,
                 positions=video_positions,
                 context=video_context,
+                sigma=sigma,
                 context_mask=attention_mask,
+                attention_mask=video_self_attention_mask,
             )
 
         audio_modality = None
@@ -322,6 +338,7 @@ class LTX2Wrapper(nn.Module):
                 timesteps=audio_timesteps,
                 positions=audio_positions.to(dtype=audio_latents.dtype),
                 context=audio_context,
+                sigma=audio_sigma,
                 context_mask=attention_mask,
             )
 
@@ -486,6 +503,8 @@ def _build_exclude_patterns(raw_patterns: Optional[str], audio_video: bool = Fal
     """Build exclude patterns list, including connector exclusions."""
     patterns: List[str] = [
         r".*text_embedding_projection\.aggregate_embed.*",
+        r".*text_embedding_projection\.video_aggregate_embed.*",
+        r".*text_embedding_projection\.audio_aggregate_embed.*",
         r".*embeddings_connector\..*",
         r".*audio_embeddings_connector\..*",
     ]

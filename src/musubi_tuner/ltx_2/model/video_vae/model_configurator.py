@@ -46,6 +46,7 @@ class VideoDecoderConfigurator(ModelConfigurator[VideoDecoder]):
         norm_layer_str = config.get("norm_layer", "pixel_norm")
         causal = config.get("causal_decoder", False)
         timestep_conditioning = config.get("timestep_conditioning", True)
+        base_channels = config.get("decoder_base_channels", 128)
 
         return VideoDecoder(
             convolution_dimensions=convolution_dimensions,
@@ -57,6 +58,7 @@ class VideoDecoderConfigurator(ModelConfigurator[VideoDecoder]):
             causal=causal,
             timestep_conditioning=timestep_conditioning,
             decoder_spatial_padding_mode=decoder_spatial_padding_mode,
+            base_channels=base_channels,
         )
 
 
