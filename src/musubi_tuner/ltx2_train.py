@@ -1166,20 +1166,30 @@ def _fused_step_pending_grads(
     optimizer: Any,
     accelerator: Accelerator,
     max_grad_norm: float,
-) -> None:
+) -> int:
     """Run one fused-style parameter step for any pending grads.
 
     Used when fused backward hooks defer stepping on the first backward pass
     and no second backward pass happens.
     """
+    params_to_step: list[tuple[torch.Tensor, Any]] = []
     for param_group in optimizer.param_groups:
         for parameter in param_group.get("params", []):
             if parameter is None or parameter.grad is None:
                 continue
-            if accelerator.sync_gradients and max_grad_norm != 0.0:
-                accelerator.clip_grad_norm_(parameter, max_grad_norm)
-            optimizer.step_param(parameter, param_group)
-            parameter.grad = None
+            params_to_step.append((parameter, param_group))
+
+    if not params_to_step:
+        return 0
+
+    if accelerator.sync_gradients and max_grad_norm != 0.0:
+        accelerator.clip_grad_norm_([p for p, _ in params_to_step], max_grad_norm)
+
+    for parameter, param_group in params_to_step:
+        optimizer.step_param(parameter, param_group)
+        parameter.grad = None
+
+    return len(params_to_step)
 
 
 def _build_synthetic_motion_latents(
@@ -2674,10 +2684,28 @@ def main() -> None:
 
     fused_step_state: dict[str, bool] | None = None
     if args.fused_backward_pass:
+        base_optimizer = getattr(optimizer, "optimizer", optimizer)
+        if base_optimizer.__class__.__name__.lower() != "adafactor":
+            raise ValueError(
+                f"--fused_backward_pass requires Adafactor optimizer; got {base_optimizer.__class__.__name__}"
+            )
+
         import musubi_tuner.modules.adafactor_fused as adafactor_fused
 
         adafactor_fused.patch_adafactor_fused(optimizer)
-        fused_step_state = {"defer_step": False, "suspend_step": False}
+        hooks_step_enabled = args.max_grad_norm == 0.0
+        if not hooks_step_enabled:
+            logger.info(
+                "Fused hooks are disabled because max_grad_norm=%.6f. "
+                "Using sync-point fused stepping to preserve global gradient clipping correctness.",
+                float(args.max_grad_norm),
+            )
+        fused_step_state = {
+            "defer_step": False,
+            "suspend_step": False,
+            "hook_stepped": False,
+            "hooks_step_enabled": hooks_step_enabled,
+        }
 
         for param_group, param_name_group in zip(optimizer.param_groups, param_names):
             for parameter, param_name in zip(param_group["params"], param_name_group):
@@ -2685,15 +2713,18 @@ def main() -> None:
 
                     def create_grad_hook(p_name, p_group):
                         def grad_hook(tensor: torch.Tensor):
+                            if fused_step_state is None or not fused_step_state.get("hooks_step_enabled", False):
+                                return
+                            if not accelerator.sync_gradients:
+                                return
                             if fused_step_state is not None and (
                                 fused_step_state.get("defer_step", False)
                                 or fused_step_state.get("suspend_step", False)
                             ):
                                 return
-                            if accelerator.sync_gradients and args.max_grad_norm != 0.0:
-                                accelerator.clip_grad_norm_(tensor, args.max_grad_norm)
                             optimizer.step_param(tensor, p_group)
                             tensor.grad = None
+                            fused_step_state["hook_stepped"] = True
 
                         return grad_hook
 
@@ -3446,6 +3477,7 @@ def main() -> None:
                 )
                 if fused_step_state is not None:
                     fused_step_state["defer_step"] = fused_defer_motion_step
+                    fused_step_state["hook_stepped"] = False
                 if separate_motion_backward:
                     # Backprop task loss first so replay graph does not overlap it in memory.
                     accelerator.backward(loss)
@@ -3618,7 +3650,6 @@ def main() -> None:
                     elif fused_defer_motion_step:
                         if fused_step_state is not None:
                             fused_step_state["defer_step"] = False
-                        _fused_step_pending_grads(optimizer, accelerator, args.max_grad_norm)
                     loss_for_step = total_loss_for_logging
                 else:
                     if motion_total_loss is not None:
@@ -3635,7 +3666,16 @@ def main() -> None:
                     lr_scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
                 else:
-                    lr_scheduler.step()
+                    did_fused_step = False
+                    if accelerator.sync_gradients:
+                        if fused_step_state is not None:
+                            fused_step_state["defer_step"] = False
+                        hook_stepped = bool(fused_step_state is not None and fused_step_state.get("hook_stepped", False))
+                        pending_steps = _fused_step_pending_grads(optimizer, accelerator, args.max_grad_norm)
+                        did_fused_step = hook_stepped or pending_steps > 0
+                        optimizer.zero_grad(set_to_none=True)
+                    if did_fused_step:
+                        lr_scheduler.step()
 
             if accelerator.sync_gradients:
                 progress_bar.update(1)
