@@ -2437,6 +2437,7 @@ class NetworkTrainer:
             transformer.eval()
 
         accelerator.unwrap_model(network).prepare_grad_etc(transformer)
+        self._current_call_network = accelerator.unwrap_model(network)
 
         if args.full_fp16:
             # patch accelerator for fp16 training
@@ -2480,6 +2481,10 @@ class NetworkTrainer:
                         if proj_sd:
                             proj_file = os.path.join(output_dir, "self_flow_projector.safetensors")
                             save_file(proj_sd, proj_file)
+                        teacher_sd = self._self_flow.teacher_state_dict()
+                        if teacher_sd:
+                            teacher_file = os.path.join(output_dir, "self_flow_teacher_ema.safetensors")
+                            save_file(teacher_sd, teacher_file)
                     except Exception as e:
                         logger.warning(f"Failed to save Self-Flow projector to state dir: {e}")
 
@@ -2492,6 +2497,22 @@ class NetworkTrainer:
             for i in reversed(remove_indices):
                 models.pop(i)
             # print(f"load model hook: {len(models)} models will be loaded")
+
+            if hasattr(self, "_self_flow") and self._self_flow is not None:
+                try:
+                    from safetensors.torch import load_file
+
+                    proj_file = os.path.join(input_dir, "self_flow_projector.safetensors")
+                    if os.path.exists(proj_file):
+                        self._self_flow.load_state_dict(load_file(proj_file))
+                        logger.info("Self-Flow: loaded projector state from %s", proj_file)
+
+                    teacher_file = os.path.join(input_dir, "self_flow_teacher_ema.safetensors")
+                    if os.path.exists(teacher_file):
+                        self._self_flow.load_teacher_state_dict(load_file(teacher_file))
+                        logger.info("Self-Flow: loaded EMA teacher state from %s", teacher_file)
+                except Exception as e:
+                    logger.warning(f"Failed to load Self-Flow state from checkpoint dir: {e}")
 
         accelerator.register_save_state_pre_hook(save_model_hook)
         accelerator.register_load_state_pre_hook(load_model_hook)

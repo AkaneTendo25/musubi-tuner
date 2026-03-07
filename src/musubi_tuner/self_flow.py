@@ -1,6 +1,6 @@
 """Self-Flow helper for LTX-2 training.
 
-Implements a lightweight training-time regularizer inspired by Self-Flow:
+Implements the Self-Flow training regularizer:
 - Dual-timestep noising is performed by the trainer.
 - This module handles feature alignment loss with an EMA teacher over LoRA params.
 """
@@ -30,6 +30,7 @@ class SelfFlowConfig:
     loss_type: str = "negative_cosine"  # "negative_cosine" | "one_minus_cosine"
     dual_timestep: bool = True
     tokenwise_timestep: bool = True
+    offload_teacher_features: bool = False
 
 
 def parse_self_flow_args(raw_args: Optional[list[str]]) -> Dict[str, str]:
@@ -77,6 +78,19 @@ class SelfFlowModule:
             raise ValueError("Self-Flow requires transformer.transformer_blocks")
         block_list = list(blocks)
         return block_list, len(block_list)
+
+    @staticmethod
+    def _resolve_shadow_name(param_name: str, shadow_params: Dict[str, torch.Tensor]) -> Optional[str]:
+        if param_name in shadow_params:
+            return param_name
+        if param_name.startswith("module."):
+            stripped = param_name[len("module."):]
+            if stripped in shadow_params:
+                return stripped
+        prefixed = f"module.{param_name}"
+        if prefixed in shadow_params:
+            return prefixed
+        return None
 
     def setup(self, device: torch.device, dtype: torch.dtype) -> None:
         blocks, depth = self._get_blocks()
@@ -162,12 +176,13 @@ class SelfFlowModule:
         momentum = float(self.config.teacher_momentum)
         with torch.no_grad():
             for name, param in network.named_parameters():
-                if name not in self._shadow_params:
+                shadow_name = self._resolve_shadow_name(name, self._shadow_params)
+                if shadow_name is None:
                     continue
-                shadow = self._shadow_params[name]
+                shadow = self._shadow_params[shadow_name]
                 if shadow.device != param.device or shadow.dtype != param.dtype:
                     shadow = shadow.to(device=param.device, dtype=param.dtype)
-                    self._shadow_params[name] = shadow
+                    self._shadow_params[shadow_name] = shadow
                 shadow.mul_(momentum).add_(param.detach(), alpha=1.0 - momentum)
 
     def _swap_in_teacher(self, network: nn.Module) -> Dict[str, torch.Tensor]:
@@ -176,9 +191,10 @@ class SelfFlowModule:
             return backups
         with torch.no_grad():
             for name, param in network.named_parameters():
-                shadow = self._shadow_params.get(name)
-                if shadow is None:
+                shadow_name = self._resolve_shadow_name(name, self._shadow_params)
+                if shadow_name is None:
                     continue
+                shadow = self._shadow_params[shadow_name]
                 backups[name] = param.detach().clone()
                 if shadow.device != param.device or shadow.dtype != param.dtype:
                     shadow = shadow.to(device=param.device, dtype=param.dtype)
@@ -210,7 +226,7 @@ class SelfFlowModule:
             return []
         return list(self.projector.parameters())
 
-    def compute_loss(
+    def prepare_teacher_features(
         self,
         *,
         accelerator,
@@ -222,16 +238,16 @@ class SelfFlowModule:
         text_mask: Optional[torch.Tensor],
         frame_rate: int | float,
         transformer_options: Dict[str, Any],
-    ) -> Optional[torch.Tensor]:
+    ) -> None:
         if self.projector is None or self.config.lambda_self_flow <= 0.0:
-            return None
-        if self._student_features is None:
-            return None
-
+            return
+        self._teacher_features = None
         backups = self._swap_in_teacher(network)
+        prev_training = bool(getattr(transformer, "training", False))
         try:
             self._capture_mode = "teacher"
-            self._teacher_features = None
+            if prev_training:
+                transformer.eval()
             with torch.no_grad(), accelerator.autocast():
                 _ = transformer(
                     teacher_model_input,
@@ -244,12 +260,26 @@ class SelfFlowModule:
         finally:
             self._capture_mode = "idle"
             self._restore_from_backups(network, backups)
+            if prev_training:
+                transformer.train()
 
-        if self._teacher_features is None:
+        if (
+            self._teacher_features is not None
+            and bool(self.config.offload_teacher_features)
+            and self._teacher_features.device.type != "cpu"
+        ):
+            self._teacher_features = self._teacher_features.to(device="cpu", non_blocking=False)
+
+    def compute_loss_from_cached_features(self) -> Optional[torch.Tensor]:
+        if self.projector is None or self.config.lambda_self_flow <= 0.0:
+            return None
+        if self._student_features is None or self._teacher_features is None:
             return None
 
         student_feat = self._student_features
         teacher_feat = self._teacher_features
+        if teacher_feat.device != student_feat.device or teacher_feat.dtype != student_feat.dtype:
+            teacher_feat = teacher_feat.to(device=student_feat.device, dtype=student_feat.dtype, non_blocking=True)
         if student_feat.shape[1] != teacher_feat.shape[1]:
             min_tokens = min(student_feat.shape[1], teacher_feat.shape[1])
             student_feat = student_feat[:, :min_tokens]
@@ -272,6 +302,10 @@ class SelfFlowModule:
             return None
         return loss
 
+    def compute_loss(self, **_kwargs) -> Optional[torch.Tensor]:
+        # Backward-compatible shim: loss is now computed from already-cached student/teacher features.
+        return self.compute_loss_from_cached_features()
+
     def remove_hooks(self) -> None:
         for hook in self._hooks:
             try:
@@ -290,3 +324,30 @@ class SelfFlowModule:
         if self.projector is not None and sd:
             self.projector.load_state_dict(sd)
             logger.info("Self-Flow: loaded projector weights (%d tensors)", len(sd))
+
+    def teacher_state_dict(self) -> Dict[str, torch.Tensor]:
+        out: Dict[str, torch.Tensor] = {
+            "__self_flow_step_counter__": torch.tensor([int(self._step_counter)], dtype=torch.int64)
+        }
+        for name, tensor in self._shadow_params.items():
+            out[f"shadow::{name}"] = tensor.detach().clone().to(device="cpu")
+        return out
+
+    def load_teacher_state_dict(self, sd: Dict[str, Any]) -> None:
+        if not sd:
+            return
+        step_tensor = sd.get("__self_flow_step_counter__")
+        if isinstance(step_tensor, torch.Tensor) and step_tensor.numel() > 0:
+            self._step_counter = int(step_tensor.flatten()[0].item())
+
+        restored: Dict[str, torch.Tensor] = {}
+        for key, value in sd.items():
+            if not isinstance(value, torch.Tensor):
+                continue
+            if not key.startswith("shadow::"):
+                continue
+            restored[key[len("shadow::") :]] = value.detach().clone()
+
+        if restored:
+            self._shadow_params = restored
+            logger.info("Self-Flow: loaded EMA teacher state (%d tensors)", len(restored))

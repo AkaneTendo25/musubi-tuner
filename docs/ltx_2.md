@@ -49,6 +49,7 @@ Caching scripts (`ltx2_cache_latents.py`, `ltx2_cache_text_encoder_outputs.py`) 
     - [Preservation & Regularization](#preservation--regularization)
     - [CREPA (Cross-frame Representation Alignment)](#crepa-cross-frame-representation-alignment)
       - [Caching DINOv2 Features (Dino Mode)](#caching-dinov2-features-dino-mode)
+    - [Self-Flow (Self-Supervised Flow Matching)](#self-flow-self-supervised-flow-matching)
     - [Timestep Sampling](#timestep-sampling)
     - [LoRA Targets](#lora-targets)
     - [IC-LoRA / Video-to-Video Training](#ic-lora--video-to-video-training)
@@ -706,6 +707,51 @@ python ltx2_train_network.py ... ^
   --use_precached_preservation
 ```
 The cache file is saved to `<cache_directory>/ltx2_preservation_cache.pt` by default (same directory as your dataset cache). Use `--preservation_prompts_cache <path>` to override the location in either command. Prior divergence does not need precaching (it uses the training batch's own embeddings).
+
+#### Self-Flow (Self-Supervised Flow Matching)
+
+**Self-Flow** — Self-supervised regularization with dual-timestep noising, EMA teacher feature alignment, and a small projector MLP.
+
+Reference: [Self-Flow research page (Black Forest Labs)](https://bfl.ai/research/self-flow)
+
+Enable with `--self_flow`. All parameters are passed via `--self_flow_args` as `key=value` pairs:
+
+```bash
+accelerate launch ... ltx2_train_network.py ^
+  --self_flow ^
+  --self_flow_args student_block_idx=16 teacher_block_idx=32 lambda_self_flow=0.1 mask_ratio=0.1 teacher_momentum=0.9999 dual_timestep=true tokenwise_timestep=true offload_teacher_features=true
+```
+
+##### CLI Flags
+
+| Flag | Type | Description |
+|------|------|-------------|
+| `--self_flow` | store_true | Enable Self-Flow regularization |
+| `--self_flow_args` | key=value list | Configuration parameters (see table below) |
+
+##### Self-Flow Parameters (`--self_flow_args`)
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `student_block_idx` | `16` | Student feature block index (0-based) |
+| `teacher_block_idx` | `32` | Teacher feature block index (must be `> student_block_idx`) |
+| `lambda_self_flow` | `0.1` | Loss weight for the Self-Flow representation term |
+| `mask_ratio` | `0.10` | Token mask ratio for dual-timestep mixing. Valid range: `[0.0, 0.5]` |
+| `teacher_momentum` | `0.999` | EMA momentum for teacher updates. Valid range: `[0.0, 1.0)` |
+| `teacher_update_interval` | `1` | Update EMA teacher every N optimizer steps |
+| `projector_hidden_multiplier` | `1` | Projector hidden width multiplier vs model inner dim |
+| `loss_type` | `negative_cosine` | `negative_cosine` or `one_minus_cosine` |
+| `dual_timestep` | `true` | Enable dual-timestep noising |
+| `tokenwise_timestep` | `true` | Use per-token timesteps (otherwise per-sample averaged timestep) |
+| `offload_teacher_features` | `false` | Offload cached teacher features to CPU to reduce VRAM |
+
+##### Notes
+
+- Supported mode: `--ltx2_mode video` only.
+- Cost: one extra teacher forward pass per train step.
+- State files (Accelerate `*-state` folder): `self_flow_projector.safetensors`, `self_flow_teacher_ema.safetensors`.
+- Resume: both state files are loaded automatically when present.
+- Logged metrics: `loss/self_flow`, `self_flow/cosine`, `self_flow/masked_token_ratio`, `self_flow/tau_mean`, `self_flow/tau_min_mean`.
 
 #### Timestep Sampling
 - `--timestep_sampling shifted_logit_normal`: Default LTX-2 method. Uses a shifted logit-normal distribution where the shift is computed based on sequence length (frames × height × width).

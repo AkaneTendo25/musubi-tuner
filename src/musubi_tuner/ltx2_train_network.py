@@ -878,7 +878,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
         cfg_kwargs: Dict[str, Any] = {}
         int_keys = {"student_block_idx", "teacher_block_idx", "teacher_update_interval", "projector_hidden_multiplier"}
         float_keys = {"lambda_self_flow", "mask_ratio", "teacher_momentum"}
-        bool_keys = {"dual_timestep", "tokenwise_timestep"}
+        bool_keys = {"dual_timestep", "tokenwise_timestep", "offload_teacher_features"}
         for k, v in kw.items():
             if k in int_keys:
                 cfg_kwargs[k] = int(v)
@@ -899,6 +899,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
 
         unwrapped_transformer = accelerator.unwrap_model(transformer)
         unwrapped_network = accelerator.unwrap_model(network)
+        self._current_call_network = unwrapped_network
         module = SelfFlowModule(config, unwrapped_transformer)
 
         first_param = next(iter(unwrapped_transformer.parameters()), None)
@@ -921,6 +922,13 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 sd = load_file(proj_path)
                 module.load_state_dict(sd)
                 logger.info("Self-Flow: resumed projector weights from %s", proj_path)
+            teacher_path = os.path.join(args.resume, "self_flow_teacher_ema.safetensors")
+            if os.path.exists(teacher_path):
+                from safetensors.torch import load_file
+
+                teacher_sd = load_file(teacher_path)
+                module.load_teacher_state_dict(teacher_sd)
+                logger.info("Self-Flow: resumed EMA teacher state from %s", teacher_path)
 
         self._self_flow = module
         self._self_flow_active = True
@@ -1036,46 +1044,13 @@ class LTX2NetworkTrainer(NetworkTrainer):
             return None, {}
         if not bool(getattr(args, "self_flow", False)):
             return None, {}
-        if not bool(getattr(transformer, "training", False)):
-            return None, {}
 
         dit_inputs = self._last_dit_inputs
         sf_ctx = self._self_flow_step_context
         if dit_inputs is None or sf_ctx is None:
             self._self_flow.cleanup_step()
             return None, {}
-
-        teacher_noisy = sf_ctx.get("teacher_noisy_model_input")
-        teacher_timesteps = sf_ctx.get("teacher_model_timesteps")
-        if not isinstance(teacher_noisy, torch.Tensor) or not isinstance(teacher_timesteps, torch.Tensor):
-            self._self_flow.cleanup_step()
-            return None, {}
-
-        # Current implementation supports video-only path.
-        model_input = dit_inputs.get("model_input")
-        if isinstance(model_input, (list, tuple)):
-            self._self_flow.cleanup_step()
-            return None, {}
-
-        teacher_timesteps_model = self._normalize_timesteps_for_model(
-            teacher_timesteps.to(device=accelerator.device, dtype=network_dtype)
-        )
-        if teacher_timesteps_model.dim() == 0:
-            teacher_timesteps_model = teacher_timesteps_model.unsqueeze(0)
-        if teacher_timesteps_model.dim() == 1:
-            teacher_timesteps_model = teacher_timesteps_model.unsqueeze(1)
-
-        loss = self._self_flow.compute_loss(
-            accelerator=accelerator,
-            transformer=transformer,
-            network=network,
-            teacher_model_input=teacher_noisy.to(device=accelerator.device, dtype=network_dtype),
-            teacher_timesteps=teacher_timesteps_model,
-            text_embeds=dit_inputs["text_embeds"],
-            text_mask=dit_inputs["text_mask"],
-            frame_rate=dit_inputs["frame_rate"],
-            transformer_options=dit_inputs["transformer_options"],
-        )
+        loss = self._self_flow.compute_loss_from_cached_features()
 
         metrics: Dict[str, float] = {}
         if loss is not None:
@@ -3131,7 +3106,45 @@ class LTX2NetworkTrainer(NetworkTrainer):
             }
 
         if self._self_flow_active and self._self_flow is not None:
-            self._self_flow.mark_student_forward()
+            self._self_flow.cleanup_step()
+            network_for_self_flow = getattr(self, "_current_call_network", None)
+            is_train_step = bool(getattr(network_for_self_flow, "training", False)) if network_for_self_flow is not None else bool(
+                getattr(transformer, "training", False)
+            )
+            if is_train_step and bool(getattr(args, "self_flow", False)):
+                sf_ctx = self._self_flow_step_context
+                if sf_ctx is not None and isinstance(model_input, torch.Tensor):
+                    teacher_noisy = sf_ctx.get("teacher_noisy_model_input")
+                    teacher_timesteps = sf_ctx.get("teacher_model_timesteps")
+                    if isinstance(teacher_noisy, torch.Tensor) and isinstance(teacher_timesteps, torch.Tensor):
+                        teacher_noisy_input = teacher_noisy
+                        if video_conditioning_enabled is not None and teacher_noisy_input.shape[2] > 0:
+                            teacher_noisy_input = teacher_noisy_input.clone()
+                            teacher_noisy_input[video_conditioning_enabled, :, 0:1, :, :] = latents[
+                                video_conditioning_enabled, :, 0:1, :, :
+                            ]
+
+                        teacher_timesteps_model = self._normalize_timesteps_for_model(
+                            teacher_timesteps.to(device=accelerator.device, dtype=network_dtype)
+                        )
+                        if teacher_timesteps_model.dim() == 0:
+                            teacher_timesteps_model = teacher_timesteps_model.unsqueeze(0)
+                        if teacher_timesteps_model.dim() == 1:
+                            teacher_timesteps_model = teacher_timesteps_model.unsqueeze(1)
+
+                        if network_for_self_flow is not None:
+                            self._self_flow.prepare_teacher_features(
+                                accelerator=accelerator,
+                                transformer=transformer,
+                                network=network_for_self_flow,
+                                teacher_model_input=teacher_noisy_input.to(device=accelerator.device, dtype=network_dtype),
+                                teacher_timesteps=teacher_timesteps_model,
+                                text_embeds=text_embeds,
+                                text_mask=text_mask,
+                                frame_rate=frame_rate,
+                                transformer_options=resolved_transformer_options,
+                            )
+                self._self_flow.mark_student_forward()
 
         if getattr(args, "fp8_base", False) or getattr(args, "fp8_scaled", False):
             self._ensure_fp8_buffers_on_device(transformer)
