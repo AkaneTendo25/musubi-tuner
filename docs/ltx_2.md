@@ -509,6 +509,28 @@ accelerate launch ... ltx2_train_network.py ^
   - `--min_audio_batches_per_accum` and `--audio_batch_probability` are mutually exclusive.
 - `--caption_dropout_rate`: Probability of dropping text conditioning for a sample during training.
 
+#### Loss Function Type
+
+`--loss_type` selects the element-wise loss function used for both video and audio branches. Default is `mse`.
+
+| `--loss_type` | PyTorch function | Per-element formula |
+|---|---|---|
+| `mse` (default) | `F.mse_loss` | `(pred - tgt)²` |
+| `mae` / `l1` | `F.l1_loss` | `\|pred - tgt\|` |
+| `huber` / `smooth_l1` | `F.smooth_l1_loss` | `0.5·(pred-tgt)²/δ` when `\|pred-tgt\| < δ`, else `\|pred-tgt\| - 0.5·δ` |
+
+- `--huber_delta` (float, default: 1.0): Transition point for Huber loss. Only used when `--loss_type` is `huber` or `smooth_l1`. Smaller values make the loss behave more like L1; larger values more like MSE.
+
+All other training mechanics (weighting scheme, masking, audio balancing) apply on top of the chosen loss unchanged.
+
+```bash
+# L1 loss
+--loss_type mae
+
+# Huber with tighter quadratic region
+--loss_type huber --huber_delta 0.1
+```
+
 #### Loss Weighting
 - `--video_loss_weight`: Weight for video loss (default: 1.0).
 - `--audio_loss_weight`: Weight for audio loss in AV mode (default: 1.0).

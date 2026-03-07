@@ -488,6 +488,16 @@ def compute_loss_weighting_for_sd3(weighting_scheme: str, noise_scheduler, times
     return weighting
 
 
+def _per_element_loss(pred: torch.Tensor, tgt: torch.Tensor, loss_type: str = "mse", huber_delta: float = 1.0) -> torch.Tensor:
+    """Compute per-element (unreduced) loss based on loss_type."""
+    if loss_type == "mae" or loss_type == "l1":
+        return torch.nn.functional.l1_loss(pred.float(), tgt.float(), reduction="none")
+    elif loss_type == "huber" or loss_type == "smooth_l1":
+        return torch.nn.functional.smooth_l1_loss(pred.float(), tgt.float(), reduction="none", beta=huber_delta)
+    else:  # "mse"
+        return torch.nn.functional.mse_loss(pred.float(), tgt.float(), reduction="none")
+
+
 def should_sample_images(args, steps, epoch=None):
     if steps == 0:
         if not args.sample_at_first:
@@ -2809,6 +2819,8 @@ class NetworkTrainer:
                     )
 
                     dict_output = isinstance(model_pred, dict)
+                    _loss_type = getattr(args, "loss_type", "mse")
+                    _huber_delta = getattr(args, "huber_delta", 1.0)
                     if dict_output:
                         out = model_pred
                         if out.get("_skip_step"):
@@ -2824,7 +2836,7 @@ class NetworkTrainer:
                         video_weight = None
                         audio_weight = None
 
-                        def _masked_mse(
+                        def _masked_loss(
                             pred: torch.Tensor,
                             tgt: torch.Tensor,
                             mask: torch.Tensor | None,
@@ -2833,7 +2845,7 @@ class NetworkTrainer:
                                 pred = pred.to(device=tgt.device, dtype=network_dtype)
                             else:
                                 pred = pred.to(dtype=network_dtype)
-                            per_elem = torch.nn.functional.mse_loss(pred, tgt, reduction="none")
+                            per_elem = _per_element_loss(pred, tgt, _loss_type, _huber_delta)
                             if weighting is not None:
                                 w = weighting
                                 if isinstance(w, torch.Tensor) and w.dim() != per_elem.dim():
@@ -2866,7 +2878,7 @@ class NetworkTrainer:
                         video_pred = out["video_pred"]
                         video_target = out["video_target"]
                         video_loss_mask = out.get("video_loss_mask")
-                        video_loss = _masked_mse(video_pred, video_target, video_loss_mask)
+                        video_loss = _masked_loss(video_pred, video_target, video_loss_mask)
                         video_weight = float(out.get("video_loss_weight", 1.0))
                         loss = video_loss * video_weight
 
@@ -2874,7 +2886,7 @@ class NetworkTrainer:
                         audio_target = out.get("audio_target")
                         audio_loss_mask = out.get("audio_loss_mask")
                         if audio_pred is not None and audio_target is not None:
-                            audio_loss = _masked_mse(audio_pred, audio_target, audio_loss_mask)
+                            audio_loss = _masked_loss(audio_pred, audio_target, audio_loss_mask)
                             audio_weight = float(out.get("audio_loss_weight", 1.0))
                             loss = loss + audio_loss * audio_weight
                     else:
@@ -2882,7 +2894,7 @@ class NetworkTrainer:
                             model_pred = model_pred.to(device=target.device, dtype=network_dtype)
                         else:
                             model_pred = model_pred.to(dtype=network_dtype)
-                        loss = torch.nn.functional.mse_loss(model_pred, target, reduction="none")
+                        loss = _per_element_loss(model_pred, target, _loss_type, _huber_delta)
                         if weighting is not None:
                             loss = loss * weighting
                         loss = loss.mean()
@@ -3048,10 +3060,13 @@ class NetworkTrainer:
                     audio_presence_ema_value = None
                     audio_loss_ema_value = None
                     video_loss_ema_value = None
+                    _loss_type = getattr(args, "loss_type", "mse")
+                    _huber_delta = getattr(args, "huber_delta", 1.0)
+
                     if dict_output:
                         out = model_pred
 
-                        def _masked_mse(
+                        def _masked_loss(
                             pred: torch.Tensor,
                             tgt: torch.Tensor,
                             mask: torch.Tensor | None,
@@ -3060,7 +3075,7 @@ class NetworkTrainer:
                                 pred = pred.to(device=tgt.device, dtype=network_dtype)
                             else:
                                 pred = pred.to(dtype=network_dtype)
-                            per_elem = torch.nn.functional.mse_loss(pred, tgt, reduction="none")
+                            per_elem = _per_element_loss(pred, tgt, _loss_type, _huber_delta)
                             if weighting is not None:
                                 w = weighting
                                 if isinstance(w, torch.Tensor) and w.dim() != per_elem.dim():
@@ -3093,7 +3108,7 @@ class NetworkTrainer:
                         video_pred = out["video_pred"]
                         video_target = out["video_target"]
                         video_loss_mask = out.get("video_loss_mask")
-                        video_loss = _masked_mse(video_pred, video_target, video_loss_mask)
+                        video_loss = _masked_loss(video_pred, video_target, video_loss_mask)
                         video_weight = float(out.get("video_loss_weight", 1.0))
                         loss = video_loss * video_weight
                         if audio_loss_balance_mode == "ema_mag":
@@ -3120,7 +3135,7 @@ class NetworkTrainer:
                             )
                             audio_presence_ema_value = audio_presence_ema
                         if has_audio_loss:
-                            audio_loss = _masked_mse(audio_pred, audio_target, audio_loss_mask)
+                            audio_loss = _masked_loss(audio_pred, audio_target, audio_loss_mask)
                             audio_weight = float(out.get("audio_loss_weight", 1.0))
                             if audio_loss_balance_mode == "inv_freq":
                                 audio_weight = compute_inverse_frequency_audio_weight(
@@ -3156,7 +3171,7 @@ class NetworkTrainer:
                             model_pred = model_pred.to(device=target.device, dtype=network_dtype)
                         else:
                             model_pred = model_pred.to(dtype=network_dtype)
-                        loss = torch.nn.functional.mse_loss(model_pred, target, reduction="none")
+                        loss = _per_element_loss(model_pred, target, _loss_type, _huber_delta)
 
                     if not dict_output and weighting is not None:
                         loss = loss * weighting
@@ -3898,6 +3913,19 @@ def setup_parser_common() -> argparse.ArgumentParser:
         type=float,
         default=1.29,
         help="Scale of mode weighting scheme. Only effective when using the `'mode'` as the `weighting_scheme` / モード重み付けスキームのスケール",
+    )
+    parser.add_argument(
+        "--loss_type",
+        type=str,
+        default="mse",
+        choices=["mse", "mae", "l1", "huber", "smooth_l1"],
+        help="Loss function type. 'mse' (default): mean squared error; 'mae'/'l1': mean absolute error; 'huber'/'smooth_l1': Huber loss (use --huber_delta to control transition point).",
+    )
+    parser.add_argument(
+        "--huber_delta",
+        type=float,
+        default=1.0,
+        help="Delta (beta) for Huber/smooth_l1 loss. Below this threshold the loss is ~MSE, above it ~MAE. Only used when --loss_type is huber or smooth_l1.",
     )
     parser.add_argument(
         "--min_timestep",
