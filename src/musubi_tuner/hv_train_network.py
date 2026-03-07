@@ -54,6 +54,7 @@ from musubi_tuner.audio_loss_balance import (
 from musubi_tuner.modules.lr_schedulers import RexLR
 from musubi_tuner.modules.scheduling_flow_match_discrete import FlowMatchDiscreteScheduler
 import musubi_tuner.networks.lora as lora_module
+from musubi_tuner.networks.optimizer_params_compat import prepare_optimizer_params_compat
 from musubi_tuner.dataset.config_utils import BlueprintGenerator, ConfigSanitizer
 from musubi_tuner.dataset.image_video_dataset import ARCHITECTURE_HUNYUAN_VIDEO, ARCHITECTURE_HUNYUAN_VIDEO_FULL
 from musubi_tuner.hv_generate_video import save_images_grid, save_videos_grid, resize_image_to_bucket, encode_to_latents
@@ -693,6 +694,58 @@ class NetworkTrainer:
             eval_fn = lambda: None
 
         return optimizer_name, optimizer_args, optimizer, train_fn, eval_fn
+
+    def _enable_lycoris_fp8_forward_compat(self, args: argparse.Namespace, network: Any) -> None:
+        network_module_name = str(getattr(args, "network_module", "") or "")
+        uses_lycoris_module = "lycoris" in network_module_name.lower()
+        uses_fp8_base = bool(getattr(args, "fp8_base", False) or getattr(args, "fp8_scaled", False))
+        if not uses_lycoris_module or not uses_fp8_base:
+            return
+        if bool(getattr(network, "_lycoris_fp8_forward_compat_applied", False)):
+            return
+
+        if args.mixed_precision == "fp16":
+            compat_dtype = torch.float16
+        elif args.mixed_precision == "bf16":
+            compat_dtype = torch.bfloat16
+        else:
+            compat_dtype = torch.float32
+
+        converted = 0
+        checked = 0
+        for lora in getattr(network, "loras", []):
+            org_modules = getattr(lora, "org_module", None)
+            if not isinstance(org_modules, (list, tuple)) or len(org_modules) == 0:
+                continue
+            module = org_modules[0]
+            if module is None or not hasattr(module, "weight"):
+                continue
+            if not isinstance(module.weight, torch.nn.Parameter):
+                continue
+
+            checked += 1
+            weight_data = module.weight.data
+            if not isinstance(weight_data, torch.Tensor) or weight_data.dtype.itemsize != 1:
+                continue
+
+            module.weight.data = weight_data.to(dtype=compat_dtype)
+            if hasattr(module, "bias") and isinstance(module.bias, torch.nn.Parameter) and module.bias is not None:
+                module.bias.data = module.bias.data.to(dtype=compat_dtype)
+            converted += 1
+
+        setattr(network, "_lycoris_fp8_forward_compat_applied", True)
+        if converted > 0:
+            logger.warning(
+                "LyCORIS FP8 forward compat enabled: upcasted %d/%d adapted base layers to %s to avoid FP8 op limitations.",
+                converted,
+                checked,
+                compat_dtype,
+            )
+        else:
+            logger.info(
+                "LyCORIS FP8 forward compat checked %d adapted layers; no FP8 base layers required upcast.",
+                checked,
+            )
 
     def is_schedulefree_optimizer(self, optimizer: torch.optim.Optimizer, args: argparse.Namespace) -> bool:
         return args.optimizer_type.lower().endswith("schedulefree".lower()) or args.optimizer_type.lower() == "automagic"
@@ -2174,6 +2227,10 @@ class NetworkTrainer:
             info = network.load_weights(args.network_weights)
             accelerator.print(f"load network weights from {args.network_weights}: {info}")
 
+        # LyCORIS + FP8 backend compatibility:
+        # keep most base model in FP8, but upcast adapted base layers that LyCORIS touches.
+        self._enable_lycoris_fp8_forward_compat(args, network)
+
         if args.gradient_checkpointing:
             blocks_to_ckpt = getattr(args, "blocks_to_checkpoint", -1)
             if getattr(args, "blockwise_checkpointing", False):
@@ -2217,11 +2274,16 @@ class NetworkTrainer:
         # prepare optimizer, data loader etc.
         accelerator.print("prepare optimizer, data loader etc.")
 
-        trainable_params, lr_descriptions = network.prepare_optimizer_params(
-            unet_lr=args.learning_rate,
-            audio_lr=getattr(args, "audio_lr", None),
-            lr_args=getattr(args, "lr_args", None),
-        )
+        network_module_name = str(getattr(args, "network_module", "") or "")
+        uses_lycoris_module = "lycoris" in network_module_name.lower()
+        if uses_lycoris_module:
+            trainable_params, lr_descriptions = prepare_optimizer_params_compat(network, args, logger)
+        else:
+            trainable_params, lr_descriptions = network.prepare_optimizer_params(
+                unet_lr=args.learning_rate,
+                audio_lr=getattr(args, "audio_lr", None),
+                lr_args=getattr(args, "lr_args", None),
+            )
 
         optimizer_name, optimizer_args, optimizer, optimizer_train_fn, optimizer_eval_fn = self.get_optimizer(
             args, trainable_params

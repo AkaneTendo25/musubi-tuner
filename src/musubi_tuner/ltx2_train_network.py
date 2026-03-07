@@ -2368,20 +2368,30 @@ class LTX2NetworkTrainer(NetworkTrainer):
 
     @staticmethod
     def _ensure_lora_enabled_for_sampling(transformer) -> int:
+        LoRAModule = None
         try:
             from musubi_tuner.networks.lora import LoRAModule
         except Exception:
-            return 0
+            pass
+        LycorisBaseModule = None
+        try:
+            from lycoris.modules.base import LycorisBaseModule
+        except Exception:
+            pass
 
         lora_count = 0
         for module in transformer.modules():
             if not isinstance(module, torch.nn.Linear):
                 continue
             bound = getattr(module.forward, "__self__", None)
-            if bound is None or not isinstance(bound, LoRAModule):
+            if bound is None:
                 continue
-            bound.enabled = True
-            lora_count += 1
+            if LoRAModule is not None and isinstance(bound, LoRAModule):
+                bound.enabled = True
+                lora_count += 1
+                continue
+            if LycorisBaseModule is not None and isinstance(bound, LycorisBaseModule):
+                lora_count += 1
         return lora_count
 
     @staticmethod
@@ -6179,10 +6189,7 @@ def _process_lycoris_config(args: argparse.Namespace, logger_instance: logging.L
 
 
 def _apply_lycoris_preset_before_network_creation(args: argparse.Namespace, logger_instance: logging.Logger) -> None:
-    """Apply LyCORIS preset early so it affects network creation."""
-    preset = getattr(args, "_network_config_preset", None)
-    if not preset:
-        return
+    """Apply/patch LyCORIS preset behavior for LTX-2 before network creation."""
 
     network_module_name = str(getattr(args, "network_module", "") or "")
     if "lycoris" not in network_module_name.lower():
@@ -6200,6 +6207,30 @@ def _apply_lycoris_preset_before_network_creation(args: argparse.Namespace, logg
             "Install with: pip install lycoris-lora. Error: %s",
             e,
         )
+        return
+
+    # LTX-2 blocks are implemented as BasicAVTransformerBlock. LyCORIS built-in presets
+    # (e.g. attn-mlp/full) don't include this class, so they would match 0 modules.
+    if not getattr(LycorisNetworkKohya, "_ltx2_apply_preset_patched", False):
+        original_apply_preset = LycorisNetworkKohya.apply_preset.__func__
+
+        def _apply_preset_with_ltx2_targets(cls, preset):
+            preset_dict = dict(preset or {})
+            unet_target_module = list(preset_dict.get("unet_target_module", []))
+            if "target_module" in preset_dict:
+                unet_target_module.extend(preset_dict.get("target_module", []))
+            if "BasicAVTransformerBlock" not in unet_target_module:
+                unet_target_module.append("BasicAVTransformerBlock")
+            preset_dict["unet_target_module"] = unet_target_module
+            preset_dict.pop("target_module", None)
+            return original_apply_preset(cls, preset_dict)
+
+        LycorisNetworkKohya.apply_preset = classmethod(_apply_preset_with_ltx2_targets)
+        LycorisNetworkKohya._ltx2_apply_preset_patched = True
+        logger_instance.info("Patched LyCORIS preset application for LTX-2 target modules")
+
+    preset = getattr(args, "_network_config_preset", None)
+    if not preset:
         return
 
     try:
