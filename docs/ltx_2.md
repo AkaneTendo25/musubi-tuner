@@ -20,6 +20,7 @@ Caching scripts (`ltx2_cache_latents.py`, `ltx2_cache_text_encoder_outputs.py`) 
 
 - [Installation](#installation)
   - [CUDA Version](#cuda-version)
+  - [Downloading Required Models](#downloading-required-models)
 - [Supported Dataset Types](#supported-dataset-types)
 - [1. Caching Latents](#1-caching-latents)
   - [Latent Caching Command](#latent-caching-command)
@@ -94,6 +95,20 @@ pip install torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0 --index-url https
 ```
 
 Always match the CUDA version to your GPU architecture — check [PyTorch's compatibility matrix](https://pytorch.org/get-started/locally/) for the latest supported versions.
+
+### Downloading Required Models
+
+The trainer does not download models automatically. You must manually download the following files before caching or training.
+
+**LTX-2 Checkpoint** — use as `--ltx2_checkpoint`:
+- LTX-2 (19B): [ltx-2-19b-dev.safetensors](https://huggingface.co/Lightricks/LTX-2/resolve/main/ltx-2-19b-dev.safetensors)
+- LTX-2.3 (22B): [ltx-2.3-22b-dev.safetensors](https://huggingface.co/Lightricks/LTX-2.3/resolve/main/ltx-2.3-22b-dev.safetensors)
+
+**Gemma Text Encoder** — pick one:
+- HF directory (`--gemma_root`): [gemma-3-12b-it-qat-q4_0-unquantized](https://huggingface.co/Lightricks/gemma-3-12b-it-qat-q4_0-unquantized)
+- Single file (`--gemma_safetensors`): [gemma_3_12B_it_fp8_e4m3fn.safetensors](https://huggingface.co/GitMylo/LTX-2-comfy_gemma_fp8_e4m3fn/resolve/main/gemma_3_12B_it_fp8_e4m3fn.safetensors)
+
+Other Gemma 3 12B variants may work but not all have been tested.
 
 ---
 
