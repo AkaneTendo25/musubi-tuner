@@ -2356,7 +2356,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
 
         lora_count = 0
         for module in transformer.modules():
-            if not isinstance(module, torch.nn.Linear):
+            if not isinstance(module, (torch.nn.Linear, torch.nn.Conv2d)):
                 continue
             bound = getattr(module.forward, "__self__", None)
             if bound is None:
@@ -2366,6 +2366,11 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 lora_count += 1
                 continue
             if LycorisBaseModule is not None and isinstance(bound, LycorisBaseModule):
+                if hasattr(bound, "enabled"):
+                    try:
+                        bound.enabled = True
+                    except Exception:
+                        pass
                 lora_count += 1
         return lora_count
 
@@ -2374,29 +2379,59 @@ class LTX2NetworkTrainer(NetworkTrainer):
         try:
             from musubi_tuner.networks.lora import LoRAModule
         except Exception:
-            return []
+            LoRAModule = None
+        try:
+            from lycoris.modules.base import LycorisBaseModule
+        except Exception:
+            LycorisBaseModule = None
 
         stats = []
+        seen = set()
         for name, module in transformer.named_modules():
-            if not isinstance(module, torch.nn.Linear):
+            if not isinstance(module, (torch.nn.Linear, torch.nn.Conv2d)):
                 continue
             bound = getattr(module.forward, "__self__", None)
-            if bound is None or not isinstance(bound, LoRAModule):
+            if bound is None:
                 continue
-            try:
-                up = bound.lora_up
-                down = bound.lora_down
-                if isinstance(up, torch.nn.ModuleList):
-                    up_norm = sum(u.weight.norm().item() for u in up)
-                else:
-                    up_norm = up.weight.norm().item()
-                if isinstance(down, torch.nn.ModuleList):
-                    down_norm = sum(d.weight.norm().item() for d in down)
-                else:
-                    down_norm = down.weight.norm().item()
-                stats.append(f"{name}: up_norm={up_norm:.6f}, down_norm={down_norm:.6f}")
-            except Exception:
+            bid = id(bound)
+            if bid in seen:
                 continue
+            seen.add(bid)
+
+            if LoRAModule is not None and isinstance(bound, LoRAModule):
+                try:
+                    up = bound.lora_up
+                    down = bound.lora_down
+                    if isinstance(up, torch.nn.ModuleList):
+                        up_norm = sum(u.weight.norm().item() for u in up)
+                    else:
+                        up_norm = up.weight.norm().item()
+                    if isinstance(down, torch.nn.ModuleList):
+                        down_norm = sum(d.weight.norm().item() for d in down)
+                    else:
+                        down_norm = down.weight.norm().item()
+                    stats.append(
+                        f"{name}: up_norm={up_norm:.6f}, down_norm={down_norm:.6f}, mult={float(getattr(bound, 'multiplier', 1.0)):.3f}"
+                    )
+                except Exception:
+                    pass
+                if len(stats) >= limit:
+                    break
+                continue
+
+            if LycorisBaseModule is not None and isinstance(bound, LycorisBaseModule):
+                try:
+                    params = [(pn, p) for pn, p in bound.named_parameters() if isinstance(p, torch.nn.Parameter)]
+                    if len(params) == 0:
+                        continue
+                    parts = []
+                    for pn, p in params[:2]:
+                        parts.append(f"{pn}_norm={p.detach().float().norm().item():.6f}")
+                    stats.append(
+                        f"{name}: {' '.join(parts)}, mult={float(getattr(bound, 'multiplier', 1.0)):.3f}"
+                    )
+                except Exception:
+                    pass
             if len(stats) >= limit:
                 break
         return stats
