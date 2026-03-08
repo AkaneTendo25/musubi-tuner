@@ -487,6 +487,44 @@ accelerate launch ... ltx2_train_network.py ^
 | `--awq_alpha` | 0.25 | AWQ scaling strength (0 = no effect, 1 = full) |
 | `--awq_num_batches` | 8 | Number of synthetic calibration batches for AWQ |
 
+**Pre-quantized models (recommended):**
+
+By default, NF4 quantization runs from scratch on every startup. `ltx2_quantize_model.py` quantizes once and saves the result (~42% of the original file size). The training/inference code auto-detects pre-quantized checkpoints via safetensors metadata and skips re-quantization.
+
+```bash
+python src/musubi_tuner/ltx2_quantize_model.py ^
+  --input_model path/to/ltx-2.3-22b-dev.safetensors ^
+  --output_model path/to/ltx-2.3-22b-dev-nf4.safetensors ^
+  --loftq_init --network_dim 32
+```
+
+Output files (kept in the same directory):
+- `*-nf4.safetensors` — quantized model (transformer in NF4, VAE and other components unchanged)
+- `*-nf4.loftq_r32.safetensors` — pre-computed LoftQ init for rank 32 (only with `--loftq_init`)
+
+Then use it exactly like the original checkpoint — just point `--ltx2_checkpoint` at the NF4 file. `--nf4_base` is still required (enables the runtime dequantization patch):
+
+```bash
+accelerate launch ... ltx2_train_network.py ^
+  --ltx2_checkpoint path/to/ltx-2.3-22b-dev-nf4.safetensors ^
+  --nf4_base --loftq_init --network_dim 32 ^
+  ...
+```
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--input_model` | required | Path to original `.safetensors` checkpoint |
+| `--output_model` | required | Path for quantized output |
+| `--nf4_block_size` | 32 | Elements per quantization block |
+| `--calc_device` | `cuda` if available | Device for quantization computation |
+| `--loftq_init` | off | Pre-compute LoftQ initialization (requires `--network_dim`) |
+| `--loftq_iters` | 2 | Number of LoftQ alternating iterations |
+| `--network_dim` | 0 | LoRA rank for LoftQ (must match training `--network_dim`) |
+
+- LoftQ is rank-specific: changing `--network_dim` requires re-running the quantize script with the new rank. The quantized model itself does not need to be regenerated.
+- `--awq_calibration` is incompatible with pre-quantized models (requires full-precision weights).
+- The quantized output is bit-for-bit identical to dynamic quantization on the same device.
+
 **Notes:**
 - `--nf4_base` and `--fp8_base` are mutually exclusive.
 - `--loftq_init` requires `--nf4_base`.

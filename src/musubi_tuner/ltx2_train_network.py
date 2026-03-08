@@ -466,7 +466,60 @@ def load_ltx2_model(
         # AWQ and/or LoftQ both need full-precision weights before quantization
         _needs_full_precision = (loftq_init and lora_rank > 0) or awq_calibration
 
-        if _needs_full_precision:
+        # Check for pre-quantized NF4 model (saved by ltx2_quantize_model.py)
+        _check_path = model_files[0]
+        _pre_quantized = False
+        try:
+            from safetensors import safe_open as _safe_open
+            with _safe_open(_check_path, framework="pt") as _f:
+                _meta = _f.metadata()
+                _pre_quantized = _meta is not None and _meta.get("nf4_quantized") == "true"
+        except Exception:
+            pass
+
+        if _pre_quantized:
+            if awq_calibration:
+                raise ValueError(
+                    "Pre-quantized NF4 models are incompatible with --awq_calibration "
+                    "(requires full-precision weights). Use the original model instead."
+                )
+            # Read block_size from pre-quantized metadata
+            _saved_bs = int(_meta.get("nf4_block_size", str(nf4_block_size)))
+            if _saved_bs != nf4_block_size:
+                logger.info(
+                    "Using block_size=%d from pre-quantized model (--nf4_block_size=%d ignored)",
+                    _saved_bs, nf4_block_size,
+                )
+                nf4_block_size = _saved_bs
+            logger.info("Detected pre-quantized NF4 model (block_size=%d), skipping quantization", nf4_block_size)
+            sd = {}
+            for model_file in model_files:
+                with MemoryEfficientSafeOpen(model_file) as f:
+                    for key in tqdm(f.keys(), desc=f"Loading {os.path.basename(model_file)}", unit="key"):
+                        sd[key] = f.get_tensor(key)
+            # Load pre-computed LoftQ data from companion file if --loftq_init
+            if loftq_init and lora_rank > 0:
+                from musubi_tuner.ltx2_quantize_model import loftq_path_for_model
+                from safetensors.torch import load_file as _load_file
+                _loftq_file = loftq_path_for_model(_check_path, lora_rank)
+                if os.path.isfile(_loftq_file):
+                    logger.info("Loading pre-computed LoftQ data from %s", _loftq_file)
+                    _loftq_sd = _load_file(_loftq_file, device="cpu")
+                    # Reconstruct {lora_name: (lora_A, lora_B)} dict
+                    _loftq_data = {}
+                    for k in _loftq_sd:
+                        if k.endswith(".lora_A"):
+                            lora_name = k[: -len(".lora_A")]
+                            _loftq_data[lora_name] = (_loftq_sd[f"{lora_name}.lora_A"], _loftq_sd[f"{lora_name}.lora_B"])
+                    load_ltx2_model._loftq_data = _loftq_data
+                    logger.info("LoftQ: loaded init data for %d modules (rank=%d)", len(_loftq_data), lora_rank)
+                else:
+                    raise FileNotFoundError(
+                        f"--loftq_init requires pre-computed LoftQ data but file not found: {_loftq_file}\n"
+                        f"Re-run ltx2_quantize_model.py with --loftq_init --network_dim {lora_rank} to generate it."
+                    )
+            _skip_rename = False
+        elif _needs_full_precision:
             from musubi_tuner.modules.nf4_optimization_utils import optimize_state_dict_with_nf4
 
             sd = load_safetensors_with_lora_and_fp8(
