@@ -59,6 +59,16 @@ from musubi_tuner.ltx2_inference import (
     cleanup_cuda,
     STAGE_2_DISTILLED_SIGMA_VALUES,
 )
+from musubi_tuner.ltx2_lycoris_runtime import (
+    apply_lycoris_preset_before_network_creation,
+    ensure_adapters_enabled_for_sampling,
+    get_adapter_norm_samples,
+    is_lycoris_requested,
+    process_lycoris_config,
+    summarize_active_adapters,
+    validate_lycoris_quantized_base_compatibility,
+    validate_lycoris_runtime,
+)
 
 # LTX-2 latent normalization defaults.
 # These are identity stats (mean=0, std=1). We keep them as a safe fallback and
@@ -772,6 +782,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
         self._setup_crepa(args, accelerator, transformer)
         self._setup_self_flow(args, accelerator, transformer, network)
         self._apply_network_initialization(args, network)
+        validate_lycoris_runtime(args, accelerator, transformer, network, logger)
 
     def _setup_preservation(self, args: argparse.Namespace, accelerator: Accelerator) -> None:
         """Parse preservation CLI flags and prepare helper.  No-op when no flags are set."""
@@ -1847,6 +1858,8 @@ class LTX2NetworkTrainer(NetworkTrainer):
             if getattr(args, "fp8_upcast", False):
                 raise ValueError("--fp8_w8a8 and --fp8_upcast are mutually exclusive")
 
+        validate_lycoris_quantized_base_compatibility(args, logger, DEFAULT_NF4_BLOCK_SIZE)
+
         if getattr(args, "save_original_lora", True) and not getattr(args, "convert_to_comfy", True):
             logger.info("--no_convert_to_comfy is set; original LoRA is always saved (--save_original_lora has no extra effect).")
 
@@ -2393,101 +2406,6 @@ class LTX2NetworkTrainer(NetworkTrainer):
 
         container_out.close()
         container_in.close()
-
-    @staticmethod
-    def _ensure_lora_enabled_for_sampling(transformer) -> int:
-        LoRAModule = None
-        try:
-            from musubi_tuner.networks.lora import LoRAModule
-        except Exception:
-            pass
-        LycorisBaseModule = None
-        try:
-            from lycoris.modules.base import LycorisBaseModule
-        except Exception:
-            pass
-
-        lora_count = 0
-        for module in transformer.modules():
-            if not isinstance(module, (torch.nn.Linear, torch.nn.Conv2d)):
-                continue
-            bound = getattr(module.forward, "__self__", None)
-            if bound is None:
-                continue
-            if LoRAModule is not None and isinstance(bound, LoRAModule):
-                bound.enabled = True
-                lora_count += 1
-                continue
-            if LycorisBaseModule is not None and isinstance(bound, LycorisBaseModule):
-                if hasattr(bound, "enabled"):
-                    try:
-                        bound.enabled = True
-                    except Exception:
-                        pass
-                lora_count += 1
-        return lora_count
-
-    @staticmethod
-    def _get_lora_norm_samples(transformer, limit: int = 5) -> list[str]:
-        try:
-            from musubi_tuner.networks.lora import LoRAModule
-        except Exception:
-            LoRAModule = None
-        try:
-            from lycoris.modules.base import LycorisBaseModule
-        except Exception:
-            LycorisBaseModule = None
-
-        stats = []
-        seen = set()
-        for name, module in transformer.named_modules():
-            if not isinstance(module, (torch.nn.Linear, torch.nn.Conv2d)):
-                continue
-            bound = getattr(module.forward, "__self__", None)
-            if bound is None:
-                continue
-            bid = id(bound)
-            if bid in seen:
-                continue
-            seen.add(bid)
-
-            if LoRAModule is not None and isinstance(bound, LoRAModule):
-                try:
-                    up = bound.lora_up
-                    down = bound.lora_down
-                    if isinstance(up, torch.nn.ModuleList):
-                        up_norm = sum(u.weight.norm().item() for u in up)
-                    else:
-                        up_norm = up.weight.norm().item()
-                    if isinstance(down, torch.nn.ModuleList):
-                        down_norm = sum(d.weight.norm().item() for d in down)
-                    else:
-                        down_norm = down.weight.norm().item()
-                    stats.append(
-                        f"{name}: up_norm={up_norm:.6f}, down_norm={down_norm:.6f}, mult={float(getattr(bound, 'multiplier', 1.0)):.3f}"
-                    )
-                except Exception:
-                    pass
-                if len(stats) >= limit:
-                    break
-                continue
-
-            if LycorisBaseModule is not None and isinstance(bound, LycorisBaseModule):
-                try:
-                    params = [(pn, p) for pn, p in bound.named_parameters() if isinstance(p, torch.nn.Parameter)]
-                    if len(params) == 0:
-                        continue
-                    parts = []
-                    for pn, p in params[:2]:
-                        parts.append(f"{pn}_norm={p.detach().float().norm().item():.6f}")
-                    stats.append(
-                        f"{name}: {' '.join(parts)}, mult={float(getattr(bound, 'multiplier', 1.0)):.3f}"
-                    )
-                except Exception:
-                    pass
-            if len(stats) >= limit:
-                break
-        return stats
 
     @staticmethod
     def _override_attention_function(transformer, attention_function):
@@ -4283,10 +4201,22 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 logger.error(f"V2V: failed to load reference '{v2v_ref_path}': {e}")
                 v2v_ref_latent = None
 
-        lora_count = self._ensure_lora_enabled_for_sampling(transformer)
+        lora_count = ensure_adapters_enabled_for_sampling(transformer)
+        adapter_summary = summarize_active_adapters(transformer)
         if lora_count:
             logger.info("Sampling: LoRA modules active in transformer: %s", lora_count)
-            lora_stats = self._get_lora_norm_samples(transformer)
+            if adapter_summary["lycoris"] > 0:
+                logger.info(
+                    "Sampling LyCORIS summary: active=%d blocks=%d attn1=%d attn2=%d ff=%d audio=%d quantized_origins=%d",
+                    adapter_summary["lycoris"],
+                    adapter_summary["block_count"],
+                    adapter_summary["attn1"],
+                    adapter_summary["attn2"],
+                    adapter_summary["ff"],
+                    adapter_summary["audio"],
+                    adapter_summary["lycoris_quantized_origin"],
+                )
+            lora_stats = get_adapter_norm_samples(transformer)
             for stat in lora_stats:
                 logger.info("Sampling LoRA norm: %s", stat)
         else:
@@ -5813,6 +5743,16 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         ),
     )
     parser.add_argument(
+        "--lycoris_quantized_base_check_mode",
+        type=str,
+        default="warn",
+        choices=["off", "warn", "error"],
+        help=(
+            "LyCORIS-only compatibility check when base-model quantization flags are enabled. "
+            "'warn' logs a warning, 'error' stops startup, 'off' disables checks."
+        ),
+    )
+    parser.add_argument(
         "--ltx2_first_frame_conditioning_p",
         type=float,
         default=0.1,
@@ -6192,155 +6132,6 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
     return parser
 
 
-def _process_lycoris_config(args: argparse.Namespace, logger_instance: logging.Logger) -> None:
-    """Process optional LyCORIS TOML config and merge into runtime args.
-
-    Behavior:
-    - If `--lycoris_config` is set, parse TOML and apply it to LyCORIS creation.
-    - `--network_args` keeps backward compatibility and can override nested TOML keys via:
-      `modules.<name>.<param>=...` and `init.<param>=...`.
-    - `--init_lokr_norm` always overrides init values from TOML.
-    """
-    network_module_name = str(getattr(args, "network_module", "") or "")
-    uses_lycoris_module = "lycoris" in network_module_name.lower()
-
-    if args.network_args is None:
-        args.network_args = []
-
-    config = {}
-    if getattr(args, "lycoris_config", None):
-        if not uses_lycoris_module:
-            raise ValueError("--lycoris_config requires --network_module lycoris.kohya")
-
-        from musubi_tuner.networks.network_config import (
-            parse_toml_config,
-            parse_network_args_enhanced,
-            validate_network_config,
-        )
-        from musubi_tuner.networks.lycoris_extensions import (
-            build_network_kwargs_from_config,
-            log_network_config,
-            config_to_lycoris_preset,
-            get_config_init_params,
-        )
-
-        logger_instance.info("Loading LyCORIS config from: %s", args.lycoris_config)
-        config = parse_toml_config(args.lycoris_config)
-
-        # Support nested overrides through --network_args for compatibility.
-        existing_args = parse_network_args_enhanced(args.network_args)
-        for key, value in existing_args.items():
-            if "." not in key:
-                continue
-
-            parts = key.split(".")
-            if parts[0] == "modules" and len(parts) >= 3:
-                module_name = parts[1]
-                param_name = parts[2]
-                config.setdefault("modules", {}).setdefault(module_name, {})[param_name] = value
-            elif parts[0] == "init" and len(parts) >= 2:
-                param_name = parts[1]
-                config.setdefault("init", {})[param_name] = value
-
-        # Do not forward nested override keys to LyCORIS create_network kwargs.
-        filtered_network_args = []
-        stripped_count = 0
-        for arg in args.network_args:
-            if arg.startswith("modules.") or arg.startswith("init."):
-                stripped_count += 1
-                continue
-            filtered_network_args.append(arg)
-        if stripped_count > 0:
-            args.network_args = filtered_network_args
-            logger_instance.info(
-                "Consumed %d nested TOML override args from --network_args",
-                stripped_count,
-            )
-
-        validate_network_config(config)
-        log_network_config(config, logger_instance)
-
-        preset = config_to_lycoris_preset(config)
-        if preset:
-            args._network_config_preset = preset
-            logger_instance.info("LyCORIS TOML preset prepared for network creation")
-
-        config_kwargs = build_network_kwargs_from_config(
-            config,
-            base_dim=getattr(args, "network_dim", None),
-            base_alpha=getattr(args, "network_alpha", None),
-        )
-        for key, value in config_kwargs.items():
-            arg_str = f"{key}={value}"
-            if not any(arg.startswith(f"{key}=") for arg in args.network_args):
-                args.network_args.append(arg_str)
-                logger_instance.info("Added network arg from LyCORIS config: %s", arg_str)
-
-        init_params = dict(get_config_init_params(config))
-    else:
-        init_params = {}
-
-    # Explicit CLI override always wins.
-    if getattr(args, "init_lokr_norm", None) is not None:
-        init_params["lokr_norm"] = args.init_lokr_norm
-
-    if init_params:
-        args._network_init_params = init_params
-        logger_instance.info("Network initialization params: %s", args._network_init_params)
-
-
-def _apply_lycoris_preset_before_network_creation(args: argparse.Namespace, logger_instance: logging.Logger) -> None:
-    """Apply/patch LyCORIS preset behavior for LTX-2 before network creation."""
-
-    network_module_name = str(getattr(args, "network_module", "") or "")
-    if "lycoris" not in network_module_name.lower():
-        logger_instance.warning(
-            "Ignoring LyCORIS preset because --network_module=%s",
-            network_module_name or "<unset>",
-        )
-        return
-
-    try:
-        from lycoris.kohya import LycorisNetworkKohya
-    except Exception as e:
-        logger_instance.warning(
-            "Failed to import lycoris.kohya for preset application. "
-            "Install with: pip install lycoris-lora. Error: %s",
-            e,
-        )
-        return
-
-    # LTX-2 blocks are implemented as BasicAVTransformerBlock. LyCORIS built-in presets
-    # (e.g. attn-mlp/full) don't include this class, so they would match 0 modules.
-    if not getattr(LycorisNetworkKohya, "_ltx2_apply_preset_patched", False):
-        original_apply_preset = LycorisNetworkKohya.apply_preset.__func__
-
-        def _apply_preset_with_ltx2_targets(cls, preset):
-            preset_dict = dict(preset or {})
-            unet_target_module = list(preset_dict.get("unet_target_module", []))
-            if "target_module" in preset_dict:
-                unet_target_module.extend(preset_dict.get("target_module", []))
-            if "BasicAVTransformerBlock" not in unet_target_module:
-                unet_target_module.append("BasicAVTransformerBlock")
-            preset_dict["unet_target_module"] = unet_target_module
-            preset_dict.pop("target_module", None)
-            return original_apply_preset(cls, preset_dict)
-
-        LycorisNetworkKohya.apply_preset = classmethod(_apply_preset_with_ltx2_targets)
-        LycorisNetworkKohya._ltx2_apply_preset_patched = True
-        logger_instance.info("Patched LyCORIS preset application for LTX-2 target modules")
-
-    preset = getattr(args, "_network_config_preset", None)
-    if not preset:
-        return
-
-    try:
-        LycorisNetworkKohya.apply_preset(preset)
-        logger_instance.info("Applied LyCORIS preset before network creation")
-    except Exception as e:
-        logger_instance.warning("Failed to apply LyCORIS preset before network creation: %s", e)
-
-
 # ======== Main training entry point ========
 
 
@@ -6400,8 +6191,7 @@ def main() -> None:
     if args.vae_dtype is None:
         args.vae_dtype = "bfloat16"
 
-    network_module_name = str(getattr(args, "network_module", "") or "")
-    uses_lycoris_module = "lycoris" in network_module_name.lower()
+    uses_lycoris_module = is_lycoris_requested(args)
 
     # Inject lora_target_preset into network_args (LTX-2 specific, non-LyCORIS only)
     if getattr(args, "ltx_mode", "video") == "audio" and not explicit_lora_preset and not uses_lycoris_module:
@@ -6427,8 +6217,8 @@ def main() -> None:
             args.network_args.append(f"lora_target_preset={lora_target_preset}")
             logger.info(f"Using LoRA target preset: {lora_target_preset}")
 
-    _process_lycoris_config(args, logger)
-    _apply_lycoris_preset_before_network_creation(args, logger)
+    process_lycoris_config(args, logger)
+    apply_lycoris_preset_before_network_creation(args, logger)
 
     trainer = LTX2NetworkTrainer()
     trainer.train(args)
