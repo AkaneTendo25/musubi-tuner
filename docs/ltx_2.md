@@ -787,7 +787,7 @@ The cache file is saved to `<cache_directory>/ltx2_preservation_cache.pt` by def
 
 **Self-Flow** — Self-supervised regularization with dual-timestep noising, EMA teacher feature alignment, and a small projector MLP.
 
-Reference: [Self-Flow research page (Black Forest Labs)](https://bfl.ai/research/self-flow)
+Reference: [Self-Flow (arXiv:2603.06507)](https://arxiv.org/abs/2603.06507)
 
 Enable with `--self_flow`. All parameters are passed via `--self_flow_args` as `key=value` pairs:
 
