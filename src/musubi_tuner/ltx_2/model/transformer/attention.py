@@ -287,6 +287,7 @@ class Attention(torch.nn.Module):
         self._motion_record_max_queries: int = 32
         self._motion_record_max_keys: int = 64
         self._motion_record_capture_grad: bool = False
+        self._motion_record_keep_heads: bool = False
         self._motion_record_attn_map: torch.Tensor | None = None
 
     def _split_attention_batch(
@@ -453,7 +454,11 @@ class Attention(torch.nn.Module):
                 q_sample = qh[:, :, q_idx, :].to(torch.float32)
                 k_sample = kh[:, :, k_idx, :].to(torch.float32)
                 logits = torch.matmul(q_sample, k_sample.transpose(-1, -2)) / math.sqrt(float(self.dim_head))
-                attn = torch.softmax(logits, dim=-1).mean(dim=1)
+                attn_probs = torch.softmax(logits, dim=-1)
+                if bool(getattr(self, "_motion_record_keep_heads", False)):
+                    attn = attn_probs
+                else:
+                    attn = attn_probs.mean(dim=1)
                 if not self._motion_record_capture_grad:
                     attn = attn.detach()
                 self._motion_record_attn_map = attn

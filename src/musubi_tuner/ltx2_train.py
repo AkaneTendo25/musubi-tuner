@@ -473,6 +473,7 @@ def _build_motion_anchor_cache_signature(
         "attention_preservation": bool(use_attn_pres),
         "attention_queries": int(max_queries),
         "attention_keys": int(max_keys),
+        "attention_per_head": bool(getattr(args, "motion_attention_preservation_per_head", False)),
         "attention_blocks": getattr(args, "motion_attention_preservation_blocks", None),
     }
 
@@ -682,6 +683,27 @@ def _build_temporal_pair_mask(video_loss_mask: Optional[torch.Tensor]) -> Option
     return None
 
 
+def _build_temporal_triplet_mask(video_loss_mask: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+    if video_loss_mask is None:
+        return None
+    if not isinstance(video_loss_mask, torch.Tensor):
+        return None
+    if video_loss_mask.dim() == 2:
+        if video_loss_mask.shape[1] < 3:
+            return None
+        triple = video_loss_mask[:, 2:] & video_loss_mask[:, 1:-1] & video_loss_mask[:, :-2]
+        return triple.unsqueeze(1).unsqueeze(-1).unsqueeze(-1)
+    if video_loss_mask.dim() == 5:
+        if video_loss_mask.shape[2] < 3:
+            return None
+        return (
+            video_loss_mask[:, :, 2:, :, :]
+            & video_loss_mask[:, :, 1:-1, :, :]
+            & video_loss_mask[:, :, :-2, :, :]
+        )
+    return None
+
+
 def _compute_motion_preservation_loss(
     args: argparse.Namespace,
     student_video_pred: torch.Tensor,
@@ -691,7 +713,14 @@ def _compute_motion_preservation_loss(
     dtype: torch.dtype,
 ) -> torch.Tensor:
     chunk_frames = int(getattr(args, "motion_preservation_teacher_chunk_frames", 0) or 0)
-    if isinstance(teacher_video_pred, torch.Tensor) and teacher_video_pred.device.type == "cpu" and chunk_frames > 0:
+    second_order_weight = float(getattr(args, "motion_preservation_second_order_weight", 0.0) or 0.0)
+    use_chunked = second_order_weight <= 0.0
+    if (
+        isinstance(teacher_video_pred, torch.Tensor)
+        and teacher_video_pred.device.type == "cpu"
+        and chunk_frames > 0
+        and use_chunked
+    ):
         return _chunked_motion_loss_with_cpu_teacher(
             args,
             student_video_pred,
@@ -700,6 +729,18 @@ def _compute_motion_preservation_loss(
             dtype=dtype,
             chunk_frames=chunk_frames,
         )
+    if (
+        isinstance(teacher_video_pred, torch.Tensor)
+        and teacher_video_pred.device.type == "cpu"
+        and chunk_frames > 0
+        and not use_chunked
+        and not bool(getattr(args, "_motion_second_order_chunk_warned", False))
+    ):
+        logger.info(
+            "motion_preservation_second_order_weight > 0 disables chunked CPU teacher loss path. "
+            "Teacher targets will be moved to GPU for replay loss."
+        )
+        setattr(args, "_motion_second_order_chunk_warned", True)
     if isinstance(teacher_video_pred, torch.Tensor) and teacher_video_pred.device != student_video_pred.device:
         teacher_video_pred = teacher_video_pred.to(device=student_video_pred.device, dtype=dtype, non_blocking=True)
     if (
@@ -711,13 +752,34 @@ def _compute_motion_preservation_loss(
         student_delta = student_video_pred[:, :, 1:, :, :] - student_video_pred[:, :, :-1, :, :]
         teacher_delta = teacher_video_pred[:, :, 1:, :, :] - teacher_video_pred[:, :, :-1, :, :]
         pair_mask = _build_temporal_pair_mask(video_loss_mask)
-        return _masked_mse(
+        first_order_loss = _masked_mse(
             student_delta,
             teacher_delta,
             pair_mask,
             weighting=None,
             dtype=dtype,
         )
+        if second_order_weight > 0.0 and student_video_pred.shape[2] > 2:
+            student_accel = (
+                student_video_pred[:, :, 2:, :, :]
+                - (2.0 * student_video_pred[:, :, 1:-1, :, :])
+                + student_video_pred[:, :, :-2, :, :]
+            )
+            teacher_accel = (
+                teacher_video_pred[:, :, 2:, :, :]
+                - (2.0 * teacher_video_pred[:, :, 1:-1, :, :])
+                + teacher_video_pred[:, :, :-2, :, :]
+            )
+            triplet_mask = _build_temporal_triplet_mask(video_loss_mask)
+            second_order_loss = _masked_mse(
+                student_accel,
+                teacher_accel,
+                triplet_mask,
+                weighting=None,
+                dtype=dtype,
+            )
+            return first_order_loss + float(second_order_weight) * second_order_loss
+        return first_order_loss
     return _masked_mse(
         student_video_pred,
         teacher_video_pred,
@@ -725,6 +787,39 @@ def _compute_motion_preservation_loss(
         weighting=None,
         dtype=dtype,
     )
+
+
+def _compute_motion_sigma_weights(sigmas: list[float], args: argparse.Namespace) -> Optional[list[float]]:
+    if len(sigmas) <= 1:
+        return None
+
+    mode = str(getattr(args, "motion_preservation_sigma_sampling", "uniform") or "uniform").lower()
+    if mode == "uniform":
+        return None
+    if mode != "logsnr":
+        return None
+
+    sigma_tensor = torch.tensor(sigmas, dtype=torch.float32)
+    sigma_tensor = sigma_tensor.clamp(1e-4, 1.0 - 1e-4)
+    logsnr = torch.log(((1.0 - sigma_tensor) ** 2) / (sigma_tensor**2))
+
+    # Favor mid-noise replay points where log-SNR is closer to zero.
+    weights = 1.0 / (1.0 + logsnr.abs())
+    power = float(getattr(args, "motion_preservation_sigma_sampling_power", 1.0) or 1.0)
+    weights = weights.clamp_min(1e-8).pow(power).to(torch.float32)
+    weights = weights / weights.sum().clamp_min(1e-8)
+    return [float(x) for x in weights.tolist()]
+
+
+def _sample_motion_sigma_index(sigmas: list[float], args: argparse.Namespace) -> int:
+    if len(sigmas) <= 1:
+        return 0
+    weights = _compute_motion_sigma_weights(sigmas, args)
+    if not weights:
+        return random.randrange(len(sigmas))
+    weight_tensor = torch.tensor(weights, dtype=torch.float32)
+    idx = int(torch.multinomial(weight_tensor, num_samples=1, replacement=True).item())
+    return idx
 
 
 def _extract_motion_anchor_batch(batch: dict) -> dict:
@@ -1395,6 +1490,7 @@ def _build_motion_anchor_cache(
                             max_queries=max_queries,
                             max_keys=max_keys,
                             capture_grad=False,
+                            keep_heads=bool(getattr(args, "motion_attention_preservation_per_head", False)),
                         ) as attn_recorder:
                             teacher_pred, _ = trainer.call_dit(
                                 args,
@@ -1559,7 +1655,65 @@ def _filter_motion_attention_modules_for_swap(
     accelerator: Accelerator,
     blocks_to_swap: int,
 ) -> list[tuple[str, torch.nn.Module]]:
-    return modules
+    if not modules:
+        return modules
+    swap_count = int(blocks_to_swap or 0)
+    if swap_count <= 0:
+        return modules
+
+    # Keep attention-map replay on non-swapped (GPU-resident) blocks when possible.
+    base_model = transformer.model if hasattr(transformer, "model") else transformer
+    transformer_blocks = getattr(base_model, "transformer_blocks", None)
+    if transformer_blocks is None:
+        logger.warning(
+            "motion_attention_preservation: block-swap filtering skipped because transformer_blocks are unavailable."
+        )
+        return modules
+
+    num_blocks = len(transformer_blocks)
+    if num_blocks <= 0:
+        return modules
+
+    swap_start = max(0, num_blocks - swap_count)
+    if swap_start <= 0:
+        logger.info(
+            "motion_attention_preservation: all blocks appear swappable (blocks=%d, blocks_to_swap=%d); "
+            "keeping all attention modules.",
+            num_blocks,
+            swap_count,
+        )
+        return modules
+
+    kept: list[tuple[str, torch.nn.Module]] = []
+    dropped = 0
+    for module_name, module in modules:
+        block_idx = _extract_attn1_block_index(module_name)
+        if block_idx is None or block_idx < swap_start:
+            kept.append((module_name, module))
+        else:
+            dropped += 1
+
+    if not kept:
+        logger.warning(
+            "motion_attention_preservation: block-swap filtering would drop all modules "
+            "(blocks=%d, blocks_to_swap=%d, requested=%d). Keeping original module list.",
+            num_blocks,
+            swap_count,
+            len(modules),
+        )
+        return modules
+
+    logger.info(
+        "motion_attention_preservation: filtered modules for block swap on %s: kept=%d dropped=%d "
+        "(non-swapped blocks: 0-%d, swapped blocks: %d-%d).",
+        str(accelerator.device),
+        len(kept),
+        dropped,
+        max(0, swap_start - 1),
+        swap_start,
+        max(0, num_blocks - 1),
+    )
+    return kept
 
 
 class _AttentionMapRecorder:
@@ -1570,11 +1724,13 @@ class _AttentionMapRecorder:
         max_queries: int,
         max_keys: int,
         capture_grad: bool,
+        keep_heads: bool,
     ) -> None:
         self.modules = modules
         self.max_queries = max(1, int(max_queries))
         self.max_keys = max(1, int(max_keys))
         self.capture_grad = capture_grad
+        self.keep_heads = bool(keep_heads)
         self.maps: dict[str, torch.Tensor] = {}
         self._active_module_names: set[str] = set()
 
@@ -1607,6 +1763,7 @@ class _AttentionMapRecorder:
             setattr(module, "_motion_record_max_queries", int(self.max_queries))
             setattr(module, "_motion_record_max_keys", int(self.max_keys))
             setattr(module, "_motion_record_capture_grad", bool(self.capture_grad))
+            setattr(module, "_motion_record_keep_heads", bool(self.keep_heads))
             setattr(module, "_motion_record_attn_map", None)
             self._active_module_names.add(name)
         return self
@@ -2000,6 +2157,29 @@ def ltx2_finetune_setup_parser(parser: argparse.ArgumentParser) -> argparse.Argu
         help="Upper bound for auto-generated multi-sigma replay schedule.",
     )
     parser.add_argument(
+        "--motion_preservation_sigma_sampling",
+        type=str,
+        default="uniform",
+        choices=["uniform", "logsnr"],
+        help=(
+            "Multi-sigma replay sampling mode. "
+            "uniform = equal probability per cached sigma; "
+            "logsnr = bias toward mid-noise points via log-SNR weighting."
+        ),
+    )
+    parser.add_argument(
+        "--motion_preservation_sigma_sampling_power",
+        type=float,
+        default=1.0,
+        help="Exponent applied to sigma-sampling weights (logsnr mode only).",
+    )
+    parser.add_argument(
+        "--motion_preservation_second_order_weight",
+        type=float,
+        default=0.0,
+        help="Additional weight for second-order temporal replay term (acceleration matching).",
+    )
+    parser.add_argument(
         "--motion_preservation_teacher_chunk_frames",
         type=int,
         default=0,
@@ -2056,6 +2236,24 @@ def ltx2_finetune_setup_parser(parser: argparse.ArgumentParser) -> argparse.Argu
         type=int,
         default=64,
         help="Number of sampled key tokens per attention map.",
+    )
+    parser.add_argument(
+        "--motion_attention_preservation_per_head",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Capture and regularize per-head attention maps (stronger, slower) instead of head-averaged maps.",
+    )
+    parser.add_argument(
+        "--motion_attention_preservation_temperature",
+        type=float,
+        default=1.0,
+        help="Temperature applied to attention distributions before KL/MSE comparison (must be > 0).",
+    )
+    parser.add_argument(
+        "--motion_attention_preservation_symmetric_kl",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="When KL loss is used, optimize symmetric KL instead of one-way KL.",
     )
     parser.add_argument(
         "--motion_attention_preservation_blocks",
@@ -2260,6 +2458,9 @@ def main() -> None:
     if args.motion_preservation and getattr(args, "ltx_mode", "video") != "video":
         logger.warning("motion_preservation is only supported for video mode in full fine-tune. Disabling it.")
         args.motion_preservation = False
+    if bool(getattr(args, "motion_prior_cache_only", False)) and getattr(args, "ltx_mode", "video") != "video":
+        logger.warning("motion_prior_cache_only is only supported for video mode. Disabling cache-only mode.")
+        args.motion_prior_cache_only = False
     if args.motion_preservation and int(args.motion_preservation_interval) <= 0:
         raise ValueError("motion_preservation_interval must be >= 1")
     if args.motion_preservation and args.motion_preservation_probability is not None:
@@ -2303,6 +2504,15 @@ def main() -> None:
             raise ValueError("motion_preservation_sigma_min/max must be in [0, 1]")
         if sigma_max < sigma_min:
             raise ValueError("motion_preservation_sigma_max must be >= motion_preservation_sigma_min")
+        sigma_sampling = str(getattr(args, "motion_preservation_sigma_sampling", "uniform") or "uniform").lower()
+        if sigma_sampling not in {"uniform", "logsnr"}:
+            raise ValueError("motion_preservation_sigma_sampling must be one of: uniform, logsnr")
+        sigma_sampling_power = float(getattr(args, "motion_preservation_sigma_sampling_power", 1.0) or 1.0)
+        if sigma_sampling_power <= 0.0:
+            raise ValueError("motion_preservation_sigma_sampling_power must be > 0")
+        second_order_weight = float(getattr(args, "motion_preservation_second_order_weight", 0.0) or 0.0)
+        if second_order_weight < 0.0:
+            raise ValueError("motion_preservation_second_order_weight must be >= 0")
     if args.motion_preservation and float(args.motion_preservation_multiplier) < 0.0:
         raise ValueError("motion_preservation_multiplier must be >= 0")
     if bool(getattr(args, "motion_preservation_separate_backward", False)) and bool(getattr(args, "fused_backward_pass", False)):
@@ -2323,6 +2533,8 @@ def main() -> None:
         raise ValueError("motion_attention_preservation_queries must be >= 1")
     if args.motion_attention_preservation and int(args.motion_attention_preservation_keys) <= 0:
         raise ValueError("motion_attention_preservation_keys must be >= 1")
+    if args.motion_attention_preservation and float(getattr(args, "motion_attention_preservation_temperature", 1.0) or 1.0) <= 0.0:
+        raise ValueError("motion_attention_preservation_temperature must be > 0")
     if args.motion_attention_preservation and bool(getattr(args, "gradient_checkpointing", False)):
         logger.info(
             "motion_attention_preservation with gradient_checkpointing enabled: "
@@ -2548,11 +2760,15 @@ def main() -> None:
                 args.motion_attention_preservation = False
             else:
                 logger.info(
-                    "Motion attention preservation enabled on %d attn1 modules (queries=%d keys=%d, loss=%s)",
+                    "Motion attention preservation enabled on %d attn1 modules "
+                    "(queries=%d keys=%d, loss=%s, per_head=%s, temp=%.3f, symmetric_kl=%s)",
                     len(motion_attention_modules),
                     int(getattr(args, "motion_attention_preservation_queries", 32) or 32),
                     int(getattr(args, "motion_attention_preservation_keys", 64) or 64),
                     getattr(args, "motion_attention_preservation_loss", "kl"),
+                    str(bool(getattr(args, "motion_attention_preservation_per_head", False))),
+                    float(getattr(args, "motion_attention_preservation_temperature", 1.0) or 1.0),
+                    str(bool(getattr(args, "motion_attention_preservation_symmetric_kl", False))),
                 )
 
         noise_scheduler = FlowMatchDiscreteScheduler(
@@ -3327,11 +3543,15 @@ def main() -> None:
             args.motion_attention_preservation = False
         else:
             logger.info(
-                "Motion attention preservation enabled on %d attn1 modules (queries=%d keys=%d, loss=%s)",
+                "Motion attention preservation enabled on %d attn1 modules "
+                "(queries=%d keys=%d, loss=%s, per_head=%s, temp=%.3f, symmetric_kl=%s)",
                 len(motion_attention_modules),
                 int(getattr(args, "motion_attention_preservation_queries", 32) or 32),
                 int(getattr(args, "motion_attention_preservation_keys", 64) or 64),
                 getattr(args, "motion_attention_preservation_loss", "kl"),
+                str(bool(getattr(args, "motion_attention_preservation_per_head", False))),
+                float(getattr(args, "motion_attention_preservation_temperature", 1.0) or 1.0),
+                str(bool(getattr(args, "motion_attention_preservation_symmetric_kl", False))),
             )
     metadata["ss_motion_attention_preservation_active"] = str(bool(args.motion_attention_preservation))
     metadata["ss_motion_attention_preservation_module_count"] = str(len(motion_attention_modules))
@@ -3592,7 +3812,7 @@ def main() -> None:
                         and len(anchor_sigmas) > 0
                         and len(anchor_sigmas) == len(teacher_video_preds)
                     ):
-                        sigma_idx = random.randrange(len(anchor_sigmas))
+                        sigma_idx = _sample_motion_sigma_index(anchor_sigmas, args)
                         sigma_value = float(anchor_sigmas[sigma_idx])
                         replay_sigma_value = float(sigma_value)
                         anchor_noisy_input, anchor_model_timesteps = _build_noisy_input_for_sigma(
@@ -3624,6 +3844,7 @@ def main() -> None:
                                 max_queries=int(getattr(args, "motion_attention_preservation_queries", 32) or 32),
                                 max_keys=int(getattr(args, "motion_attention_preservation_keys", 64) or 64),
                                 capture_grad=True,
+                                keep_heads=bool(getattr(args, "motion_attention_preservation_per_head", False)),
                             )
                             attn_recorder.__enter__()
                             pending_attn_recorder = attn_recorder
@@ -3688,6 +3909,12 @@ def main() -> None:
                             and isinstance(teacher_attn_maps, dict)
                             and student_attn_maps
                         ):
+                            attn_temperature = float(
+                                getattr(args, "motion_attention_preservation_temperature", 1.0) or 1.0
+                            )
+                            symmetric_kl = bool(
+                                getattr(args, "motion_attention_preservation_symmetric_kl", False)
+                            )
                             per_block_losses: list[torch.Tensor] = []
                             for module_name, student_map in student_attn_maps.items():
                                 teacher_map = teacher_attn_maps.get(module_name)
@@ -3700,17 +3927,30 @@ def main() -> None:
                                 teacher_dist = teacher_map.to(
                                     device=student_dist.device, dtype=torch.float32, non_blocking=True
                                 )
+                                if attn_temperature != 1.0:
+                                    inv_temp = 1.0 / max(1e-6, attn_temperature)
+                                    student_dist = student_dist.clamp_min(1e-8).pow(inv_temp)
+                                    teacher_dist = teacher_dist.clamp_min(1e-8).pow(inv_temp)
                                 student_dist = student_dist.clamp_min(1e-6)
                                 teacher_dist = teacher_dist.clamp_min(1e-6)
                                 student_dist = student_dist / student_dist.sum(dim=-1, keepdim=True).clamp_min(1e-6)
                                 teacher_dist = teacher_dist / teacher_dist.sum(dim=-1, keepdim=True).clamp_min(1e-6)
 
                                 if getattr(args, "motion_attention_preservation_loss", "kl") == "kl":
-                                    block_loss = torch.nn.functional.kl_div(
+                                    kl_t2s = torch.nn.functional.kl_div(
                                         student_dist.log(),
                                         teacher_dist,
                                         reduction="batchmean",
                                     )
+                                    if symmetric_kl:
+                                        kl_s2t = torch.nn.functional.kl_div(
+                                            teacher_dist.log(),
+                                            student_dist,
+                                            reduction="batchmean",
+                                        )
+                                        block_loss = 0.5 * (kl_t2s + kl_s2t)
+                                    else:
+                                        block_loss = kl_t2s
                                 else:
                                     block_loss = torch.nn.functional.mse_loss(student_dist, teacher_dist)
                                 per_block_losses.append(block_loss)
