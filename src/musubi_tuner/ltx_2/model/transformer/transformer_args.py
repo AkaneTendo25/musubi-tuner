@@ -133,6 +133,19 @@ class TransformerArgsPreprocessor:
             )
         context = context.reshape(batch_size, -1, expected_hidden)
 
+        # Validate common 2D token masks early to avoid downstream attention errors.
+        if attention_mask is not None and attention_mask.dim() == 2:
+            if int(attention_mask.shape[0]) != batch_size:
+                raise ValueError(
+                    "Context mask batch mismatch: "
+                    f"got {int(attention_mask.shape[0])}, expected {batch_size}."
+                )
+            if int(attention_mask.shape[-1]) != int(context.shape[1]):
+                raise ValueError(
+                    "Context mask length mismatch: "
+                    f"got {int(attention_mask.shape[-1])}, expected {int(context.shape[1])}."
+                )
+
         return context, attention_mask
 
     def _prepare_attention_mask(self, attention_mask: torch.Tensor | None, x_dtype: torch.dtype) -> torch.Tensor | None:
