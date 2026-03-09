@@ -942,7 +942,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
         cfg_kwargs: Dict[str, Any] = {}
         int_keys = {"student_block_idx", "teacher_block_idx", "teacher_update_interval", "projector_hidden_multiplier"}
         float_keys = {"lambda_self_flow", "mask_ratio", "teacher_momentum"}
-        bool_keys = {"dual_timestep", "tokenwise_timestep", "offload_teacher_features"}
+        bool_keys = {"dual_timestep", "tokenwise_timestep", "offload_teacher_features", "offload_teacher_params"}
         for k, v in kw.items():
             if k in int_keys:
                 cfg_kwargs[k] = int(v)

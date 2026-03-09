@@ -31,6 +31,7 @@ class SelfFlowConfig:
     dual_timestep: bool = True
     tokenwise_timestep: bool = True
     offload_teacher_features: bool = False
+    offload_teacher_params: bool = False
 
 
 def parse_self_flow_args(raw_args: Optional[list[str]]) -> Dict[str, str]:
@@ -120,7 +121,7 @@ class SelfFlowModule:
         self._install_hooks(blocks)
         logger.info(
             "Self-Flow ready: student_block=%d teacher_block=%d mask_ratio=%.3f lambda=%.4f "
-            "momentum=%.4f dual_timestep=%s tokenwise_timestep=%s",
+            "momentum=%.4f dual_timestep=%s tokenwise_timestep=%s offload_teacher_params=%s",
             self.config.student_block_idx,
             self.config.teacher_block_idx,
             self.config.mask_ratio,
@@ -128,6 +129,7 @@ class SelfFlowModule:
             self.config.teacher_momentum,
             str(self.config.dual_timestep).lower(),
             str(self.config.tokenwise_timestep).lower(),
+            str(self.config.offload_teacher_params).lower(),
         )
 
     def _install_hooks(self, blocks: list[nn.Module]) -> None:
@@ -164,7 +166,10 @@ class SelfFlowModule:
         for name, param in network.named_parameters():
             if not param.requires_grad:
                 continue
-            self._shadow_params[name] = param.detach().clone()
+            if bool(self.config.offload_teacher_params):
+                self._shadow_params[name] = param.detach().to(device="cpu").clone()
+            else:
+                self._shadow_params[name] = param.detach().clone()
         logger.info("Self-Flow: initialized EMA teacher with %d tensors", len(self._shadow_params))
 
     def update_teacher(self, network: nn.Module) -> None:
@@ -180,10 +185,11 @@ class SelfFlowModule:
                 if shadow_name is None:
                     continue
                 shadow = self._shadow_params[shadow_name]
-                if shadow.device != param.device or shadow.dtype != param.dtype:
-                    shadow = shadow.to(device=param.device, dtype=param.dtype)
-                    self._shadow_params[shadow_name] = shadow
-                shadow.mul_(momentum).add_(param.detach(), alpha=1.0 - momentum)
+                shadow_target_dtype = shadow.dtype
+                source = param.detach()
+                if source.device != shadow.device or source.dtype != shadow_target_dtype:
+                    source = source.to(device=shadow.device, dtype=shadow_target_dtype)
+                shadow.mul_(momentum).add_(source, alpha=1.0 - momentum)
 
     def _swap_in_teacher(self, network: nn.Module) -> Dict[str, torch.Tensor]:
         backups: Dict[str, torch.Tensor] = {}
@@ -197,8 +203,9 @@ class SelfFlowModule:
                 shadow = self._shadow_params[shadow_name]
                 backups[name] = param.detach().clone()
                 if shadow.device != param.device or shadow.dtype != param.dtype:
-                    shadow = shadow.to(device=param.device, dtype=param.dtype)
-                param.copy_(shadow)
+                    param.copy_(shadow.to(device=param.device, dtype=param.dtype))
+                else:
+                    param.copy_(shadow)
         return backups
 
     @staticmethod

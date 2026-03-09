@@ -2606,6 +2606,41 @@ def main() -> None:
         attn_geometry_lr_scale=float(getattr(args, "attn_geometry_lr_scale", 1.0) or 0.0),
         freeze_attn_geometry=bool(getattr(args, "freeze_attn_geometry", False)),
     )
+    self_flow_projector_param_count = 0
+    if bool(getattr(args, "self_flow", False)):
+        self_flow_args = list(getattr(args, "self_flow_args", None) or [])
+        if not any(str(arg).startswith("offload_teacher_params=") for arg in self_flow_args):
+            self_flow_args.append("offload_teacher_params=true")
+            args.self_flow_args = self_flow_args
+            logger.info(
+                "Self-Flow full-FT: defaulting self_flow_args offload_teacher_params=true "
+                "(override with --self_flow_args offload_teacher_params=false)."
+            )
+
+        trainer._setup_self_flow(args, accelerator, transformer=transformer, network=transformer)
+        self_flow_module = getattr(trainer, "_self_flow", None)
+        if self_flow_module is not None:
+            self_flow_params = [p for p in self_flow_module.get_trainable_params() if p.requires_grad]
+            if self_flow_params:
+                params_to_optimize.append({"params": self_flow_params, "lr": args.learning_rate})
+                param_names.append([f"self_flow_projector.{idx}" for idx in range(len(self_flow_params))])
+                self_flow_projector_param_count = int(sum(p.numel() for p in self_flow_params))
+                logger.info(
+                    "Self-Flow full-FT: added projector params to optimizer (count=%d tensors=%d)",
+                    self_flow_projector_param_count,
+                    len(self_flow_params),
+                )
+            shadow_params = getattr(self_flow_module, "_shadow_params", {})
+            shadow_bytes = int(
+                sum(int(t.numel()) * int(t.element_size()) for t in shadow_params.values() if isinstance(t, torch.Tensor))
+            )
+            if shadow_bytes > 0:
+                logger.info(
+                    "Self-Flow full-FT teacher EMA shadow size: %.2f GB across %d tensors",
+                    float(shadow_bytes) / (1024.0 ** 3),
+                    len(shadow_params),
+                )
+
     logger.info(
         "Full-FT parameter groups: trainable=%d frozen=%d groups=%d scales=%s",
         ft_group_stats["trainable_param_count"],
@@ -2646,6 +2681,9 @@ def main() -> None:
         transformer.__dict__["_orig_mod"] = transformer
 
     optimizer, train_dataloader, lr_scheduler = accelerator.prepare(optimizer, train_dataloader, lr_scheduler)
+
+    if getattr(trainer, "_self_flow", None) is not None:
+        trainer._current_call_network = accelerator.unwrap_model(transformer)
 
     # Prepare validation dataloader if exists
     if val_dataloader is not None:
@@ -2825,6 +2863,9 @@ def main() -> None:
         "ss_ewc_max_param_tensors": getattr(args, "ewc_max_param_tensors", 0),
         "ss_ewc_cache_path": getattr(args, "ewc_cache_path", None),
         "ss_ewc_cache_rebuild": bool(getattr(args, "ewc_cache_rebuild", False)),
+        "ss_self_flow": bool(getattr(args, "self_flow", False)),
+        "ss_self_flow_args": getattr(args, "self_flow_args", None),
+        "ss_self_flow_projector_params": self_flow_projector_param_count,
         "ss_freeze_early_blocks": getattr(args, "freeze_early_blocks", 0),
         "ss_freeze_block_indices": getattr(args, "freeze_block_indices", None),
         "ss_block_lr_scales": getattr(args, "block_lr_scales", None),
@@ -2895,6 +2936,7 @@ def main() -> None:
     epoch_to_start = 0
     global_step = 0
     loss_recorder = train_utils.LossRecorder()
+    self_flow_loss = None
     del train_dataset_group
 
     def save_model(
@@ -2980,6 +3022,8 @@ def main() -> None:
                 _md["loss_attn_pres"] = attn_pres_loss.detach().item()
             if ewc_loss is not None:
                 _md["loss_ewc"] = ewc_loss.detach().item()
+            if self_flow_loss is not None:
+                _md["loss_self_flow"] = self_flow_loss.detach().item()
             train_utils.save_checkpoint_metadata(ckpt_file, _md)
 
     def remove_model(old_ckpt_name: str) -> None:
@@ -3036,6 +3080,32 @@ def main() -> None:
         os.makedirs(os.path.dirname(ema_state_path), exist_ok=True)
         torch.save(ema_model.state_dict(), ema_state_path)
         logger.info("EMA state saved to: %s (step=%d)", ema_state_path, ema_model.step)
+
+    def save_self_flow_state() -> None:
+        """Save Self-Flow projector + teacher EMA state for resume."""
+        if not bool(getattr(args, "self_flow", False)):
+            return
+        module = getattr(trainer, "_self_flow", None)
+        if module is None or not accelerator.is_main_process:
+            return
+        os.makedirs(args.output_dir, exist_ok=True)
+        projector_file = os.path.join(args.output_dir, "self_flow_projector.safetensors")
+        teacher_file = os.path.join(args.output_dir, "self_flow_teacher_ema.safetensors")
+
+        try:
+            proj_sd = module.state_dict()
+            if proj_sd:
+                proj_sd_cpu = {k: v.detach().to(device="cpu") for k, v in proj_sd.items() if isinstance(v, torch.Tensor)}
+                save_file(proj_sd_cpu, projector_file)
+        except Exception as e:
+            logger.warning("Failed to save Self-Flow projector state: %s", e)
+
+        try:
+            teacher_sd = module.teacher_state_dict()
+            if teacher_sd:
+                save_file(teacher_sd, teacher_file)
+        except Exception as e:
+            logger.warning("Failed to save Self-Flow teacher EMA state: %s", e)
 
     def run_validation(step: int, epoch: int) -> dict:
         """Run validation and return metrics."""
@@ -3439,6 +3509,24 @@ def main() -> None:
                         loss = loss * w
                     loss = loss.mean()
 
+                self_flow_loss = None
+                self_flow_metrics: dict[str, float] = {}
+                if bool(getattr(args, "self_flow", False)):
+                    try:
+                        self_flow_loss, self_flow_metrics = trainer.compute_self_flow_addition(
+                            args,
+                            accelerator,
+                            transformer,
+                            transformer,
+                            trainer.dit_dtype,
+                        )
+                        if self_flow_loss is not None:
+                            loss = loss + self_flow_loss
+                    except Exception as e:
+                        if getattr(trainer, "_self_flow", None) is not None:
+                            trainer._self_flow.cleanup_step()
+                        logger.warning("Self-Flow loss computation failed at step=%s: %s", global_step, e)
+
                 motion_pres_loss = None
                 motion_pres_loss_raw = None
                 attn_pres_loss = None
@@ -3659,10 +3747,12 @@ def main() -> None:
                 if pending_attn_recorder is not None:
                     pending_attn_recorder.__exit__(None, None, None)
                     pending_attn_recorder = None
+                did_optimizer_step = False
                 if not args.fused_backward_pass:
                     if accelerator.sync_gradients and args.max_grad_norm != 0.0:
                         accelerator.clip_grad_norm_(transformer.parameters(), args.max_grad_norm)
                     optimizer.step()
+                    did_optimizer_step = bool(accelerator.sync_gradients)
                     lr_scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
                 else:
@@ -3676,6 +3766,13 @@ def main() -> None:
                         optimizer.zero_grad(set_to_none=True)
                     if did_fused_step:
                         lr_scheduler.step()
+                    did_optimizer_step = did_fused_step
+
+                if did_optimizer_step and getattr(trainer, "_self_flow", None) is not None:
+                    try:
+                        trainer._self_flow.update_teacher(accelerator.unwrap_model(transformer))
+                    except Exception as e:
+                        logger.warning("Self-Flow teacher update failed at step=%s: %s", global_step, e)
 
             if accelerator.sync_gradients:
                 progress_bar.update(1)
@@ -3707,6 +3804,10 @@ def main() -> None:
                 if motion_pres_loss is not None:
                     logs["motion_pres"] = motion_pres_loss.detach().item()
                     logs["motion/pres_weighted"] = motion_pres_loss.detach().item()
+                if self_flow_loss is not None:
+                    logs["self_flow"] = self_flow_loss.detach().item()
+                if self_flow_metrics:
+                    logs.update(self_flow_metrics)
                 if motion_pres_loss_raw is not None:
                     logs["motion/pres_raw"] = motion_pres_loss_raw.detach().item()
                 if attn_pres_loss is not None:
@@ -3736,6 +3837,9 @@ def main() -> None:
                     has_effective_reg = True
                 if ewc_loss is not None:
                     effective_reg_value += float(ewc_loss.detach().item())
+                    has_effective_reg = True
+                if self_flow_loss is not None:
+                    effective_reg_value += float(self_flow_loss.detach().item())
                     has_effective_reg = True
                 if has_effective_reg:
                     logs["motion/effective_regularization"] = effective_reg_value
@@ -3775,6 +3879,7 @@ def main() -> None:
                         )
                         if ema_model is not None:
                             save_ema_model(ckpt_name, global_step, epoch + 1)
+                    save_self_flow_state()
                     remove_step_no = train_utils.get_remove_step_no(args, global_step)
                     if remove_step_no is not None:
                         remove_model(train_utils.get_step_ckpt_name(args.output_name, remove_step_no))
@@ -3785,6 +3890,7 @@ def main() -> None:
                     if args.save_state:
                         train_utils.save_and_remove_state_stepwise(args, accelerator, global_step)
                         save_ema_state()
+                        save_self_flow_state()
                     clean_memory_on_device(accelerator.device)
 
                 if should_sample_images(args, global_step, epoch=None):
@@ -3815,12 +3921,14 @@ def main() -> None:
                 # Also save EMA if enabled
                 if ema_model is not None:
                     save_ema_model(ckpt_name, global_step, epoch + 1)
+            save_self_flow_state()
             remove_epoch_no = train_utils.get_remove_epoch_no(args, epoch + 1)
             if remove_epoch_no is not None:
                 remove_model(train_utils.get_epoch_ckpt_name(args.output_name, remove_epoch_no))
             if args.save_state:
                 train_utils.save_and_remove_state_on_epoch_end(args, accelerator, epoch + 1)
                 save_ema_state()
+                save_self_flow_state()
             clean_memory_on_device(accelerator.device)
 
         if should_sample_images(args, global_step, epoch=epoch + 1):
@@ -3840,6 +3948,7 @@ def main() -> None:
     if accelerator.is_main_process and (args.save_state or args.save_state_on_train_end):
         train_utils.save_state_on_train_end(args, accelerator)
         save_ema_state()
+        save_self_flow_state()
 
     # Save final model
     final_ckpt_name = f"{args.output_name}.safetensors"
@@ -3859,6 +3968,7 @@ def main() -> None:
         # Also save EMA if enabled
         if ema_model is not None:
             save_ema_model(final_ckpt_name, global_step, num_train_epochs)
+    save_self_flow_state()
 
     if accelerator.is_main_process:
         accelerator.end_training()
