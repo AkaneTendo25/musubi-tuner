@@ -51,6 +51,7 @@ from musubi_tuner.modules.nf4_optimization_utils import (
 )
 from musubi_tuner.utils.lora_utils import load_safetensors_with_lora_and_fp8
 from musubi_tuner.ltx_2.env import apply_ltx2_tweaks
+from musubi_tuner.ltx2_text_conditioning import select_video_text_embeds_for_av_no_audio
 from musubi_tuner.ltx2_inference import (
     LTX2Inferencer,
     InferenceConfig,
@@ -3013,13 +3014,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 _log_stats("noisy_audio", noisy_audio)
 
         if self._ltx_mode == "av" and not audio_enabled_for_batch:
-            if getattr(args, "av_use_video_prompt_embeds", False) and conditions is not None:
-                video_prompt_embeds = conditions.get("video_prompt_embeds")
-                if isinstance(video_prompt_embeds, torch.Tensor):
-                    text_embeds = video_prompt_embeds
-            elif isinstance(text_embeds, torch.Tensor) and text_embeds.shape[-1] % 2 == 0:
-                half = text_embeds.shape[-1] // 2
-                text_embeds = text_embeds[..., :half]
+            text_embeds = select_video_text_embeds_for_av_no_audio(text_embeds, conditions)
 
         if bool(getattr(transformer, "training", False)) and self._ltx_mode == "av":
             supervision_alert = update_and_check_audio_supervision(

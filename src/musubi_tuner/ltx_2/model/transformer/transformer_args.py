@@ -124,7 +124,14 @@ class TransformerArgsPreprocessor:
         batch_size = x.shape[0]
         if self.caption_projection is not None:
             context = self.caption_projection(context)
-        context = context.view(batch_size, -1, x.shape[-1])
+        expected_hidden = int(x.shape[-1])
+        actual_hidden = int(context.shape[-1])
+        if actual_hidden != expected_hidden:
+            raise ValueError(
+                f"Context hidden size mismatch: got {actual_hidden}, expected {expected_hidden}. "
+                "Check cached text embeddings and modality selection."
+            )
+        context = context.reshape(batch_size, -1, expected_hidden)
 
         return context, attention_mask
 
