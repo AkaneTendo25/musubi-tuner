@@ -51,7 +51,11 @@ from musubi_tuner.modules.nf4_optimization_utils import (
 )
 from musubi_tuner.utils.lora_utils import load_safetensors_with_lora_and_fp8
 from musubi_tuner.ltx_2.env import apply_ltx2_tweaks
-from musubi_tuner.ltx2_text_conditioning import select_video_text_embeds_for_av_no_audio
+from musubi_tuner.ltx2_text_conditioning import (
+    select_audio_text_embeds_for_audio_mode,
+    select_video_text_embeds_for_video_mode,
+    select_video_text_embeds_for_av_no_audio,
+)
 from musubi_tuner.ltx2_inference import (
     LTX2Inferencer,
     InferenceConfig,
@@ -2569,8 +2573,6 @@ class LTX2NetworkTrainer(NetworkTrainer):
         else:
             text_embeds = batch.get("text")
             text_mask = batch.get("text_mask")
-            if self._ltx_mode == "audio" and isinstance(text_embeds, torch.Tensor) and text_embeds.shape[-1] % 2 == 0:
-                text_embeds = text_embeds[..., text_embeds.shape[-1] // 2 :]
 
         if text_embeds is None:
             raise ValueError(
@@ -2578,12 +2580,34 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 "or 'text'/'text_mask' (legacy musubi format)."
             )
 
+        base_model = transformer.model if hasattr(transformer, "model") else transformer
+        expected_video_dim = int(getattr(base_model, "cross_attention_dim", 0) or 0)
+        expected_audio_dim = int(getattr(base_model, "audio_cross_attention_dim", 0) or 0)
+
+        if self._ltx_mode == "video" and isinstance(text_embeds, torch.Tensor):
+            video_source = text_embeds
+            if conditions is not None:
+                prompt_embeds = conditions.get("prompt_embeds")
+                if isinstance(prompt_embeds, torch.Tensor):
+                    video_source = prompt_embeds
+            text_embeds = select_video_text_embeds_for_video_mode(
+                video_source,
+                expected_video_dim=expected_video_dim,
+                expected_audio_dim=expected_audio_dim,
+            )
+
+        if self._ltx_mode == "audio" and isinstance(text_embeds, torch.Tensor):
+            text_embeds = select_audio_text_embeds_for_audio_mode(
+                text_embeds,
+                conditions,
+                expected_audio_dim=expected_audio_dim,
+                expected_video_dim=expected_video_dim,
+            )
+
         # LTX-2.3 (caption_proj_before_connector=True) expects already-projected context
         # dimensions for each modality. In audio mode this must be audio_prompt_embeds
         # (audio_cross_attention_dim), not generic/video prompt embeds.
-        base_model = transformer.model if hasattr(transformer, "model") else transformer
         if self._ltx_mode == "audio" and bool(getattr(base_model, "caption_proj_before_connector", False)):
-            expected_audio_dim = int(getattr(base_model, "audio_cross_attention_dim", 0) or 0)
             if expected_audio_dim > 0 and text_embeds.shape[-1] != expected_audio_dim:
                 raise ValueError(
                     "Audio mode received text embeddings with incompatible hidden size for this checkpoint. "
@@ -3014,7 +3038,12 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 _log_stats("noisy_audio", noisy_audio)
 
         if self._ltx_mode == "av" and not audio_enabled_for_batch:
-            text_embeds = select_video_text_embeds_for_av_no_audio(text_embeds, conditions)
+            text_embeds = select_video_text_embeds_for_av_no_audio(
+                text_embeds,
+                conditions,
+                expected_video_dim=expected_video_dim,
+                expected_audio_dim=expected_audio_dim,
+            )
 
         if bool(getattr(transformer, "training", False)) and self._ltx_mode == "av":
             supervision_alert = update_and_check_audio_supervision(
@@ -3064,6 +3093,16 @@ class LTX2NetworkTrainer(NetworkTrainer):
                     f"Text embedding dim mismatch for {'LTXAV' if self._audio_video else 'LTXV'}: "
                     f"got {text_embeds.shape[-1]}, expected {expected_last_dim}. "
                     f"(caption_channels={caption_channels})"
+                )
+
+        if self._ltx_mode == "av" and bool(getattr(base_model, "caption_proj_before_connector", False)):
+            expected_ctx_dim = expected_video_dim + expected_audio_dim if audio_enabled_for_batch else expected_video_dim
+            if expected_ctx_dim > 0 and int(text_embeds.shape[-1]) != expected_ctx_dim:
+                mode_name = "AV (video+audio)" if audio_enabled_for_batch else "AV-no-audio (video-only)"
+                raise ValueError(
+                    f"{mode_name} received text embeddings with incompatible hidden size for this checkpoint. "
+                    f"Expected dim={expected_ctx_dim}, got dim={text_embeds.shape[-1]}. "
+                    "Ensure caches contain modality-specific embeddings generated with the same --ltx2_checkpoint."
                 )
 
         model_input = model_noisy_video

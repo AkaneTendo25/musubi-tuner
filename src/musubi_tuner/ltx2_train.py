@@ -1403,7 +1403,12 @@ def _build_motion_anchor_cache(
         )
     anchor_start_time = time.time()
     if replay_sigmas:
-        logger.info("Motion anchor cache will store multi-sigma teacher targets: sigmas=%s", replay_sigmas)
+        logger.info(
+            "Motion anchor cache will store multi-sigma teacher targets: sigmas=%s sampling=%s power=%.3f",
+            replay_sigmas,
+            str(getattr(args, "motion_preservation_sigma_sampling", "uniform")),
+            float(getattr(args, "motion_preservation_sigma_sampling_power", 1.0) or 1.0),
+        )
     pbar_anchor = tqdm(
         total=cache_size,
         desc="prep: motion anchors",
@@ -3064,6 +3069,9 @@ def main() -> None:
         "ss_motion_preservation_sigma_values": getattr(args, "motion_preservation_sigma_values", None),
         "ss_motion_preservation_sigma_min": getattr(args, "motion_preservation_sigma_min", 0.2),
         "ss_motion_preservation_sigma_max": getattr(args, "motion_preservation_sigma_max", 0.8),
+        "ss_motion_preservation_sigma_sampling": getattr(args, "motion_preservation_sigma_sampling", "uniform"),
+        "ss_motion_preservation_sigma_sampling_power": getattr(args, "motion_preservation_sigma_sampling_power", 1.0),
+        "ss_motion_preservation_second_order_weight": getattr(args, "motion_preservation_second_order_weight", 0.0),
         "ss_motion_preservation_teacher_chunk_frames": getattr(args, "motion_preservation_teacher_chunk_frames", 0),
         "ss_motion_preservation_separate_backward": bool(getattr(args, "motion_preservation_separate_backward", False)),
         "ss_motion_preservation_fused_defer_step": bool(getattr(args, "motion_preservation_fused_defer_step", False)),
@@ -3072,6 +3080,15 @@ def main() -> None:
         "ss_motion_attention_preservation_loss": getattr(args, "motion_attention_preservation_loss", "kl"),
         "ss_motion_attention_preservation_queries": getattr(args, "motion_attention_preservation_queries", 0),
         "ss_motion_attention_preservation_keys": getattr(args, "motion_attention_preservation_keys", 0),
+        "ss_motion_attention_preservation_per_head": bool(
+            getattr(args, "motion_attention_preservation_per_head", False)
+        ),
+        "ss_motion_attention_preservation_temperature": getattr(
+            args, "motion_attention_preservation_temperature", 1.0
+        ),
+        "ss_motion_attention_preservation_symmetric_kl": bool(
+            getattr(args, "motion_attention_preservation_symmetric_kl", False)
+        ),
         "ss_motion_attention_preservation_blocks": getattr(args, "motion_attention_preservation_blocks", None),
         "ss_ewc_lambda": getattr(args, "ewc_lambda", 0.0),
         "ss_ewc_num_batches": getattr(args, "ewc_num_batches", 0),

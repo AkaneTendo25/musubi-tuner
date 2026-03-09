@@ -98,9 +98,11 @@ def _encode_prompt_text_ltx2(
         autocast_context = nullcontext()
     with torch.no_grad(), autocast_context:
         out = text_encoder(prompt_text, padding_side="left")
-        if ltx_mode == "audio":
+        if ltx_mode == "video":
+            embed = out.video_encoding
+        elif ltx_mode == "audio":
             embed = out.audio_encoding if hasattr(out, "audio_encoding") else out.video_encoding
-        elif audio_video:
+        elif ltx_mode == "av" and audio_video:
             embed = torch.cat([out.video_encoding, out.audio_encoding], dim=-1)
         else:
             embed = out.video_encoding
@@ -230,9 +232,6 @@ def _precache_preservation_prompts(
             audio_video=audio_video, ltx_mode="video",  # force video-only encoding
             autocast_dtype=autocast_dtype, device=device,
         )
-        # In AV mode the encoder still concatenates; take video half
-        if audio_video and embed.shape[-1] % 2 == 0:
-            embed = embed[..., : embed.shape[-1] // 2]
         return embed, mask
 
     if blank:

@@ -300,10 +300,17 @@ class LTX2Wrapper(nn.Module):
                 and isinstance(split_audio_dim, int)
                 and split_video_dim > 0
                 and split_audio_dim > 0
-                and (split_video_dim + split_audio_dim) == context.shape[-1]
             ):
-                video_context = context[..., :split_video_dim]
-                audio_context = context[..., split_video_dim : split_video_dim + split_audio_dim]
+                expected_total = split_video_dim + split_audio_dim
+                if expected_total == context.shape[-1]:
+                    video_context = context[..., :split_video_dim]
+                    audio_context = context[..., split_video_dim : split_video_dim + split_audio_dim]
+                else:
+                    raise ValueError(
+                        "Context hidden size mismatch for AV split: "
+                        f"got {context.shape[-1]}, expected {expected_total} "
+                        f"(video={split_video_dim}, audio={split_audio_dim})."
+                    )
             elif context.shape[-1] % 2 == 0:
                 half = context.shape[-1] // 2
                 video_context = context[..., :half]
