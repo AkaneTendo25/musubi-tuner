@@ -785,9 +785,7 @@ The cache file is saved to `<cache_directory>/ltx2_preservation_cache.pt` by def
 
 #### Self-Flow (Self-Supervised Flow Matching)
 
-**Self-Flow** — Self-supervised regularization with dual-timestep noising, EMA teacher feature alignment, and a small projector MLP.
-
-Reference: [Self-Flow (arXiv:2603.06507)](https://arxiv.org/abs/2603.06507)
+**Self-Flow** — Self-supervised regularization with dual-timestep noising, EMA teacher feature alignment, and a small projector MLP. Based on [arXiv 2603.06507](https://arxiv.org/abs/2603.06507).
 
 Enable with `--self_flow`. All parameters are passed via `--self_flow_args` as `key=value` pairs:
 
@@ -810,11 +808,14 @@ accelerate launch ... ltx2_train_network.py ^
 |-----------|---------|-------------|
 | `student_block_idx` | `16` | Student feature block index (0-based) |
 | `teacher_block_idx` | `32` | Teacher feature block index (must be `> student_block_idx`) |
+| `student_block_ratio` | `None` | Optional ratio-based student layer selection. When set, resolves to `floor(ratio * depth)` |
+| `teacher_block_ratio` | `None` | Optional ratio-based teacher layer selection. When set, resolves to `ceil(ratio * depth)` |
 | `lambda_self_flow` | `0.1` | Loss weight for the Self-Flow representation term |
 | `mask_ratio` | `0.10` | Token mask ratio for dual-timestep mixing. Valid range: `[0.0, 0.5]` |
 | `teacher_momentum` | `0.999` | EMA momentum for teacher updates. Valid range: `[0.0, 1.0)` |
 | `teacher_update_interval` | `1` | Update EMA teacher every N optimizer steps |
 | `projector_hidden_multiplier` | `1` | Projector hidden width multiplier vs model inner dim |
+| `projector_lr` | `None` | Optional projector-specific learning rate. Defaults to `--learning_rate` when unset |
 | `loss_type` | `negative_cosine` | `negative_cosine` or `one_minus_cosine` |
 | `dual_timestep` | `true` | Enable dual-timestep noising |
 | `tokenwise_timestep` | `true` | Use per-token timesteps (otherwise per-sample averaged timestep) |

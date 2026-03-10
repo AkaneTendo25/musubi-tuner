@@ -2843,13 +2843,16 @@ def main() -> None:
         if self_flow_module is not None:
             self_flow_params = [p for p in self_flow_module.get_trainable_params() if p.requires_grad]
             if self_flow_params:
-                params_to_optimize.append({"params": self_flow_params, "lr": args.learning_rate})
+                projector_lr = getattr(getattr(self_flow_module, "config", None), "projector_lr", None)
+                effective_projector_lr = float(projector_lr) if projector_lr is not None else float(args.learning_rate)
+                params_to_optimize.append({"params": self_flow_params, "lr": effective_projector_lr})
                 param_names.append([f"self_flow_projector.{idx}" for idx in range(len(self_flow_params))])
                 self_flow_projector_param_count = int(sum(p.numel() for p in self_flow_params))
                 logger.info(
-                    "Self-Flow full-FT: added projector params to optimizer (count=%d tensors=%d)",
+                    "Self-Flow full-FT: added projector params to optimizer (count=%d tensors=%d lr=%g)",
                     self_flow_projector_param_count,
                     len(self_flow_params),
+                    effective_projector_lr,
                 )
             shadow_params = getattr(self_flow_module, "_shadow_params", {})
             shadow_bytes = int(

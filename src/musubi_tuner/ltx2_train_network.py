@@ -960,14 +960,30 @@ class LTX2NetworkTrainer(NetworkTrainer):
         if self._ltx_mode != "video":
             raise ValueError("--self_flow currently supports only --ltx_mode video")
 
-        from musubi_tuner.self_flow import SelfFlowConfig, SelfFlowModule, parse_self_flow_args
+        from musubi_tuner.self_flow import (
+            SelfFlowConfig,
+            SelfFlowModule,
+            parse_self_flow_args,
+        )
 
         kw = parse_self_flow_args(getattr(args, "self_flow_args", None))
 
         cfg_kwargs: Dict[str, Any] = {}
         int_keys = {"student_block_idx", "teacher_block_idx", "teacher_update_interval", "projector_hidden_multiplier"}
-        float_keys = {"lambda_self_flow", "mask_ratio", "teacher_momentum"}
-        bool_keys = {"dual_timestep", "tokenwise_timestep", "offload_teacher_features", "offload_teacher_params"}
+        float_keys = {
+            "student_block_ratio",
+            "teacher_block_ratio",
+            "lambda_self_flow",
+            "mask_ratio",
+            "teacher_momentum",
+            "projector_lr",
+        }
+        bool_keys = {
+            "dual_timestep",
+            "tokenwise_timestep",
+            "offload_teacher_features",
+            "offload_teacher_params",
+        }
         for k, v in kw.items():
             if k in int_keys:
                 cfg_kwargs[k] = int(v)
@@ -983,6 +999,12 @@ class LTX2NetworkTrainer(NetworkTrainer):
             raise ValueError("Self-Flow mask_ratio must be in [0, 0.5]")
         if config.teacher_momentum < 0.0 or config.teacher_momentum >= 1.0:
             raise ValueError("Self-Flow teacher_momentum must be in [0, 1)")
+        if config.student_block_ratio is not None and not (0.0 < config.student_block_ratio < 1.0):
+            raise ValueError("Self-Flow student_block_ratio must be in (0, 1)")
+        if config.teacher_block_ratio is not None and not (0.0 < config.teacher_block_ratio < 1.0):
+            raise ValueError("Self-Flow teacher_block_ratio must be in (0, 1)")
+        if config.projector_lr is not None and config.projector_lr <= 0.0:
+            raise ValueError("Self-Flow projector_lr must be > 0")
         if config.loss_type not in {"negative_cosine", "one_minus_cosine"}:
             raise ValueError("Self-Flow loss_type must be one of: negative_cosine, one_minus_cosine")
 
@@ -6146,7 +6168,8 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         type=str,
         nargs="*",
         help="Key=value args for Self-Flow, e.g. student_block_idx=16 teacher_block_idx=32 "
-             "lambda_self_flow=0.1 mask_ratio=0.1 teacher_momentum=0.999 dual_timestep=true",
+             "lambda_self_flow=0.1 mask_ratio=0.1 teacher_momentum=0.999 dual_timestep=true "
+             "student_block_ratio=0.3 teacher_block_ratio=0.7 projector_lr=5e-5",
     )
 
     # -- Per-module learning rate groups --

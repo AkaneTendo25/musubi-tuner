@@ -8,6 +8,7 @@ Implements the Self-Flow training regularizer:
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
@@ -22,6 +23,8 @@ logger = logging.getLogger(__name__)
 class SelfFlowConfig:
     student_block_idx: int = 16
     teacher_block_idx: int = 32
+    student_block_ratio: Optional[float] = None
+    teacher_block_ratio: Optional[float] = None
     lambda_self_flow: float = 0.1
     mask_ratio: float = 0.10
     teacher_momentum: float = 0.999
@@ -32,6 +35,7 @@ class SelfFlowConfig:
     tokenwise_timestep: bool = True
     offload_teacher_features: bool = False
     offload_teacher_params: bool = False
+    projector_lr: Optional[float] = None
 
 
 def parse_self_flow_args(raw_args: Optional[list[str]]) -> Dict[str, str]:
@@ -68,6 +72,8 @@ class SelfFlowModule:
         self._shadow_params: Dict[str, torch.Tensor] = {}
         self._step_counter: int = 0
         self._last_cosine: Optional[float] = None
+        self._resolved_student_block_idx: Optional[int] = None
+        self._resolved_teacher_block_idx: Optional[int] = None
 
     @property
     def last_cosine(self) -> Optional[float]:
@@ -93,20 +99,45 @@ class SelfFlowModule:
             return prefixed
         return None
 
+    @staticmethod
+    def _resolve_ratio_index(ratio: float, depth: int, *, mode: str) -> int:
+        if not (0.0 < float(ratio) < 1.0):
+            raise ValueError(f"Self-Flow block ratio must be in (0, 1), got {ratio!r}")
+        position = float(ratio) * float(depth)
+        if mode == "floor":
+            resolved = int(math.floor(position))
+        elif mode == "ceil":
+            resolved = int(math.ceil(position))
+        else:
+            raise ValueError(f"Unsupported Self-Flow ratio resolution mode: {mode!r}")
+        return max(0, min(depth - 1, resolved))
+
+    def resolve_block_indices(self, depth: int) -> tuple[int, int]:
+        student_idx = int(self.config.student_block_idx)
+        teacher_idx = int(self.config.teacher_block_idx)
+        if self.config.student_block_ratio is not None:
+            student_idx = self._resolve_ratio_index(self.config.student_block_ratio, depth, mode="floor")
+        if self.config.teacher_block_ratio is not None:
+            teacher_idx = self._resolve_ratio_index(self.config.teacher_block_ratio, depth, mode="ceil")
+        return student_idx, teacher_idx
+
     def setup(self, device: torch.device, dtype: torch.dtype) -> None:
         blocks, depth = self._get_blocks()
-        if not (0 <= self.config.student_block_idx < depth):
+        student_idx, teacher_idx = self.resolve_block_indices(depth)
+        if not (0 <= student_idx < depth):
             raise ValueError(
-                f"student_block_idx={self.config.student_block_idx} out of range (model has {depth} blocks)"
+                f"student_block_idx={student_idx} out of range (model has {depth} blocks)"
             )
-        if not (0 <= self.config.teacher_block_idx < depth):
+        if not (0 <= teacher_idx < depth):
             raise ValueError(
-                f"teacher_block_idx={self.config.teacher_block_idx} out of range (model has {depth} blocks)"
+                f"teacher_block_idx={teacher_idx} out of range (model has {depth} blocks)"
             )
-        if self.config.teacher_block_idx <= self.config.student_block_idx:
+        if teacher_idx <= student_idx:
             raise ValueError(
                 "teacher_block_idx must be > student_block_idx for Self-Flow"
             )
+        self._resolved_student_block_idx = student_idx
+        self._resolved_teacher_block_idx = teacher_idx
 
         inner_dim = int(getattr(self.transformer, "inner_dim", 0))
         if inner_dim <= 0:
@@ -120,16 +151,20 @@ class SelfFlowModule:
 
         self._install_hooks(blocks)
         logger.info(
-            "Self-Flow ready: student_block=%d teacher_block=%d mask_ratio=%.3f lambda=%.4f "
-            "momentum=%.4f dual_timestep=%s tokenwise_timestep=%s offload_teacher_params=%s",
-            self.config.student_block_idx,
-            self.config.teacher_block_idx,
+            "Self-Flow ready: student_block=%d teacher_block=%d student_ratio=%s teacher_ratio=%s "
+            "mask_ratio=%.3f lambda=%.4f momentum=%.4f dual_timestep=%s tokenwise_timestep=%s "
+            "offload_teacher_params=%s projector_lr=%s",
+            student_idx,
+            teacher_idx,
+            self.config.student_block_ratio,
+            self.config.teacher_block_ratio,
             self.config.mask_ratio,
             self.config.lambda_self_flow,
             self.config.teacher_momentum,
             str(self.config.dual_timestep).lower(),
             str(self.config.tokenwise_timestep).lower(),
             str(self.config.offload_teacher_params).lower(),
+            self.config.projector_lr,
         )
 
     def _install_hooks(self, blocks: list[nn.Module]) -> None:
@@ -155,10 +190,10 @@ class SelfFlowModule:
                 self._teacher_features = tensor.detach()
 
         self._hooks.append(
-            blocks[self.config.student_block_idx].register_forward_hook(_student_hook)
+            blocks[int(self._resolved_student_block_idx)].register_forward_hook(_student_hook)
         )
         self._hooks.append(
-            blocks[self.config.teacher_block_idx].register_forward_hook(_teacher_hook)
+            blocks[int(self._resolved_teacher_block_idx)].register_forward_hook(_teacher_hook)
         )
 
     def init_teacher(self, network: nn.Module) -> None:

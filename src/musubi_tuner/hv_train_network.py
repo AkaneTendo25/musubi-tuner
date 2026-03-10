@@ -2432,9 +2432,12 @@ class NetworkTrainer:
         if hasattr(self, "_self_flow") and self._self_flow is not None:
             self_flow_params = self._self_flow.get_trainable_params()
             if self_flow_params:
-                optimizer.add_param_group({"params": self_flow_params, "lr": args.learning_rate})
+                projector_lr = getattr(getattr(self._self_flow, "config", None), "projector_lr", None)
+                effective_projector_lr = float(projector_lr) if projector_lr is not None else float(args.learning_rate)
+                optimizer.add_param_group({"params": self_flow_params, "lr": effective_projector_lr})
                 accelerator.print(
-                    f"Self-Flow: added {sum(p.numel() for p in self_flow_params):,} projector params to optimizer"
+                    f"Self-Flow: added {sum(p.numel() for p in self_flow_params):,} projector params to optimizer "
+                    f"(lr={effective_projector_lr:g})"
                 )
 
         # prepare lr_scheduler (must happen after all optimizer param groups are added)
