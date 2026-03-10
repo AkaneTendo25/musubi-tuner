@@ -520,6 +520,7 @@ class NetworkTrainer:
         self.vae_frame_stride = 4  # all architectures require frames to be divisible by 4, except Qwen-Image-Layered
         self.default_discrete_flow_shift = 14.5  # default value for discrete flow shift for all models TODO may be None is better
         self._current_batch_latents_info: Optional[dict[str, Any]] = None
+        self.training = False
 
     # TODO 他のスクリプトと共通化する
     def generate_step_logs(
@@ -2299,6 +2300,14 @@ class NetworkTrainer:
             args, trainable_params
         )
 
+        def set_trainer_train_mode() -> None:
+            optimizer_train_fn()
+            self.training = True
+
+        def set_trainer_eval_mode() -> None:
+            optimizer_eval_fn()
+            self.training = False
+
         # prepare dataloader
 
         # num workers for data loader: if 0, persistent_workers is not available
@@ -2762,7 +2771,7 @@ class NetworkTrainer:
             if validation_dataloader is None:
                 return
 
-            optimizer_eval_fn()
+            set_trainer_eval_mode()
             network.eval()
             transformer_was_training = transformer.training
             transformer.eval()
@@ -2941,13 +2950,13 @@ class NetworkTrainer:
             else:
                 transformer.eval()
             network.train()
-            optimizer_train_fn()
+            set_trainer_train_mode()
 
         # For --sample_at_first (skip on resume — samples were already generated)
         if global_step == 0 and should_sample_images(args, global_step, epoch=0):
-            optimizer_eval_fn()
+            set_trainer_eval_mode()
             self.sample_images(accelerator, args, 0, global_step, vae, transformer, sample_parameters, dit_dtype)
-            optimizer_train_fn()
+            set_trainer_train_mode()
         if len(accelerator.trackers) > 0:
             # log empty object to commit the sample images to wandb
             accelerator.log({}, step=0)
@@ -2965,7 +2974,7 @@ class NetworkTrainer:
 
         # pre_train_hook and CREPA param group already called before resume (above)
 
-        optimizer_train_fn()  # Set training mode
+        set_trainer_train_mode()  # Set training mode
 
         for epoch in range(epoch_to_start, num_train_epochs):
             accelerator.print(f"\nepoch {epoch + 1}/{num_train_epochs}")
@@ -3340,7 +3349,7 @@ class NetworkTrainer:
                     should_saving = args.save_every_n_steps is not None and global_step % args.save_every_n_steps == 0
 
                     if should_sampling or should_saving:
-                        optimizer_eval_fn()
+                        set_trainer_eval_mode()
                         if should_sampling:
                             self.sample_images(accelerator, args, None, global_step, vae, transformer, sample_parameters, dit_dtype)
 
@@ -3357,7 +3366,7 @@ class NetworkTrainer:
                                 if remove_step_no is not None:
                                     remove_ckpt_name = train_utils.get_step_ckpt_name(args.output_name, remove_step_no)
                                     remove_model(remove_ckpt_name)
-                        optimizer_train_fn()
+                        set_trainer_train_mode()
 
                 current_loss = loss.detach().item()
                 loss_recorder.add(epoch=epoch, step=step, loss=current_loss)
@@ -3427,7 +3436,7 @@ class NetworkTrainer:
             accelerator.wait_for_everyone()
 
             # save model at the end of epoch if needed
-            optimizer_eval_fn()
+            set_trainer_eval_mode()
             if args.save_every_n_epochs is not None:
                 saving = (epoch + 1) % args.save_every_n_epochs == 0 and (epoch + 1) < num_train_epochs
                 if is_main_process and saving:
@@ -3443,7 +3452,7 @@ class NetworkTrainer:
                         train_utils.save_and_remove_state_on_epoch_end(args, accelerator, epoch + 1)
 
             self.sample_images(accelerator, args, epoch + 1, global_step, vae, transformer, sample_parameters, dit_dtype)
-            optimizer_train_fn()
+            set_trainer_train_mode()
 
             # end of epoch
 
@@ -3454,7 +3463,7 @@ class NetworkTrainer:
             network = accelerator.unwrap_model(network)
 
         accelerator.end_training()
-        optimizer_eval_fn()
+        set_trainer_eval_mode()
 
         if is_main_process and (args.save_state or args.save_state_on_train_end):
             train_utils.save_state_on_train_end(args, accelerator)

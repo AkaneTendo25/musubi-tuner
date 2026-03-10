@@ -777,6 +777,26 @@ class LTX2NetworkTrainer(NetworkTrainer):
         self._self_flow_active: bool = False
         self._self_flow_step_context: Optional[Dict[str, Any]] = None
 
+    @staticmethod
+    def _apply_caption_dropout(
+        text_embeds: torch.Tensor,
+        text_mask: Optional[torch.Tensor],
+        caption_dropout_rate: float,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        text_embeds = text_embeds.clone()
+        if text_mask is not None:
+            text_mask = text_mask.clone()
+
+        for i in range(text_embeds.shape[0]):
+            if random.random() < caption_dropout_rate:
+                text_embeds[i] = 0
+                if text_mask is not None:
+                    text_mask[i] = False
+                    if text_mask.shape[-1] > 0:
+                        text_mask[i, 0] = True
+
+        return text_embeds, text_mask
+
     # ------------------------------------------------------------------
     # Preservation / regularization hooks
     # ------------------------------------------------------------------
@@ -2644,15 +2664,8 @@ class LTX2NetworkTrainer(NetworkTrainer):
 
         # Caption dropout: zero out text conditioning with probability p (for CFG training)
         caption_dropout_rate = getattr(args, "caption_dropout_rate", 0.0)
-        if caption_dropout_rate > 0.0 and self.training:
-            text_embeds = text_embeds.clone()
-            if text_mask is not None:
-                text_mask = text_mask.clone()
-            for i in range(text_embeds.shape[0]):
-                if random.random() < caption_dropout_rate:
-                    text_embeds[i] = 0
-                    if text_mask is not None:
-                        text_mask[i] = False
+        if caption_dropout_rate > 0.0 and getattr(self, "training", False):
+            text_embeds, text_mask = self._apply_caption_dropout(text_embeds, text_mask, caption_dropout_rate)
 
         # Move latents to device
         latents = latents.to(device=accelerator.device, dtype=network_dtype)
