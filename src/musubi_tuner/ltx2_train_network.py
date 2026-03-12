@@ -350,7 +350,7 @@ def load_ltx2_model(
     loftq_init: bool = False,
     loftq_iters: int = 1,
     lora_rank: int = 0,
-    load_weights_on_cpu: bool = False,
+    quantize_device: Optional[str] = None,
     awq_calibration: bool = False,
     awq_alpha: float = 0.25,
     awq_num_batches: int = 8,
@@ -385,6 +385,20 @@ def load_ltx2_model(
 
     target_device = torch.device(device)
     load_device = torch.device(load_device)
+
+    # Resolve quantization device: CLI flag > env var > default (cuda)
+    _qdev_raw = quantize_device or os.getenv("LTX2_NF4_CALC_DEVICE") or os.getenv("LTX2_FP8_CALC_DEVICE") or "cuda"
+    _qdev = _qdev_raw.strip().lower()
+    if _qdev in {"1", "true", "yes", "cuda", "gpu"}:
+        if target_device.type == "cuda":
+            _resolved_quant_device = target_device
+        else:
+            logger.warning("Quantize device '%s' requested GPU, but target device is %s; falling back to CPU.", _qdev_raw, target_device)
+            _resolved_quant_device = torch.device("cpu")
+    else:
+        _resolved_quant_device = torch.device("cpu")
+
+    load_weights_on_cpu = _resolved_quant_device.type != "cuda"
     state_device = torch.device("cpu") if load_weights_on_cpu else load_device
 
     from musubi_tuner.ltx_2.loader.sft_loader import SafetensorsModelStateDictLoader
@@ -401,7 +415,7 @@ def load_ltx2_model(
     if load_weights_on_cpu:
         logger.info("LTX-2 load path: load weights on CPU, then move to %s", target_device)
     else:
-        logger.info("LTX-2 load path: load weights on %s", load_device)
+        logger.info("LTX-2 load path: load weights on %s (quantize_device=%s)", load_device, _qdev_raw)
     loader = SafetensorsModelStateDictLoader()
     config = loader.metadata(model_path)
     attn_mode = (attn_mode or "torch").lower()
@@ -462,18 +476,8 @@ def load_ltx2_model(
     _awq_scales = None  # populated if AWQ calibration is used
 
     if nf4_base:
-        nf4_calc_device = target_device if (not load_weights_on_cpu and load_device == target_device) else torch.device("cpu")
-        nf4_calc_override = os.getenv("LTX2_NF4_CALC_DEVICE", "cuda").strip().lower()
-        if nf4_calc_override in {"1", "true", "yes", "cuda", "gpu"}:
-            if target_device.type == "cuda":
-                nf4_calc_device = target_device
-                logger.info("LTX-2 nf4: quantizing on %s (LTX2_NF4_CALC_DEVICE=%s).", target_device, nf4_calc_override)
-            else:
-                logger.warning(
-                    "LTX-2 nf4: LTX2_NF4_CALC_DEVICE=%s requested GPU, but target device is %s; using CPU.",
-                    nf4_calc_override,
-                    target_device,
-                )
+        nf4_calc_device = _resolved_quant_device
+        logger.info("LTX-2 nf4: quantization device = %s", nf4_calc_device)
         model_files = model_path if isinstance(model_path, list) else [model_path]
         nf4_target_keys = ["transformer_blocks"]
         nf4_exclude_keys = list(KEEP_FP8_HIGH_PRECISION_TOKENS)
@@ -626,18 +630,8 @@ def load_ltx2_model(
             )
             _skip_rename = False
     elif fp8_scaled:
-        fp8_calc_device = target_device if (not load_weights_on_cpu and load_device == target_device) else torch.device("cpu")
-        fp8_calc_override = os.getenv("LTX2_FP8_CALC_DEVICE", "cuda").strip().lower()
-        if fp8_calc_override in {"1", "true", "yes", "cuda", "gpu"}:
-            if target_device.type == "cuda":
-                fp8_calc_device = target_device
-                logger.info("LTX-2 fp8: forcing FP8 quantization on %s (LTX2_FP8_CALC_DEVICE=%s).", target_device, fp8_calc_override)
-            else:
-                logger.warning(
-                    "LTX-2 fp8: LTX2_FP8_CALC_DEVICE=%s requested GPU, but target device is %s; using CPU.",
-                    fp8_calc_override,
-                    target_device,
-                )
+        fp8_calc_device = _resolved_quant_device
+        logger.info("LTX-2 fp8: quantization device = %s", fp8_calc_device)
         sd = load_safetensors_with_lora_and_fp8(
             model_files=model_path,
             lora_weights_list=None,
@@ -2171,7 +2165,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
             loftq_init=bool(getattr(args, "loftq_init", False)),
             loftq_iters=int(getattr(args, "loftq_iters", 2)),
             lora_rank=int(getattr(args, "network_dim", 0) or 0),
-            load_weights_on_cpu=True,
+            quantize_device=getattr(args, "quantize_device", None),
             awq_calibration=bool(getattr(args, "awq_calibration", False)),
             awq_alpha=float(getattr(args, "awq_alpha", 0.25)),
             awq_num_batches=int(getattr(args, "awq_num_batches", 8)),
@@ -2979,14 +2973,20 @@ class LTX2NetworkTrainer(NetworkTrainer):
             )
 
             perturbations = BatchedPerturbationConfig.empty(bsz)
-            base_model = transformer.model if hasattr(transformer, "model") else transformer
+            unwrapped_transformer = accelerator.unwrap_model(transformer)
 
             if getattr(args, "fp8_base", False) or getattr(args, "fp8_scaled", False):
-                self._ensure_fp8_buffers_on_device(base_model)
+                self._ensure_fp8_buffers_on_device(unwrapped_transformer)
             elif getattr(args, "nf4_base", False):
-                self._ensure_nf4_buffers_on_device(base_model)
+                self._ensure_nf4_buffers_on_device(unwrapped_transformer)
             with accelerator.autocast():
-                pred_tokens, _ = base_model(video_modality, None, perturbations)
+                if hasattr(unwrapped_transformer, "forward_modalities"):
+                    pred_tokens, _ = unwrapped_transformer.forward_modalities(video_modality, None, perturbations)
+                else:
+                    base_model = (
+                        unwrapped_transformer.model if hasattr(unwrapped_transformer, "model") else unwrapped_transformer
+                    )
+                    pred_tokens, _ = base_model(video_modality, None, perturbations)
 
             target_pred_tokens = pred_tokens[:, ref_seq_len:, :]
             target_velocity = patchifier.patchify(noise - latents)
@@ -5855,6 +5855,13 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         type=int,
         default=32,
         help="block size for NF4 quantization (default 32)",
+    )
+    parser.add_argument(
+        "--quantize_device",
+        type=str,
+        default=None,
+        choices=["cpu", "cuda", "gpu"],
+        help="Device for NF4/FP8 quantization math (default: cuda). Overrides LTX2_NF4_CALC_DEVICE / LTX2_FP8_CALC_DEVICE env vars.",
     )
     parser.add_argument(
         "--loftq_init",

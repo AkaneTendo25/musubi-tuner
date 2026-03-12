@@ -139,6 +139,19 @@ class LTX2Wrapper(nn.Module):
         except AttributeError:
             return getattr(self.model, name)
 
+    def forward_modalities(
+        self,
+        video_modality: Optional[Modality],
+        audio_modality: Optional[Modality] = None,
+        perturbations: Optional[BatchedPerturbationConfig] = None,
+    ):
+        ref_modality = video_modality if video_modality is not None else audio_modality
+        if ref_modality is None:
+            raise ValueError("Expected at least one modality for forward_modalities")
+        if perturbations is None:
+            perturbations = BatchedPerturbationConfig.empty(int(ref_modality.latent.shape[0]))
+        return self.model(video_modality, audio_modality, perturbations)
+
     def forward(
         self,
         x,
