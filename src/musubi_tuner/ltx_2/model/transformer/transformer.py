@@ -852,12 +852,27 @@ def apply_cross_attention_adaln(
     context_mask: torch.Tensor | None = None,
     norm_eps: float = 1e-6,
 ) -> torch.Tensor:
+    prompt_adaln_fp32 = os.getenv("LTX2_PROMPT_ADALN_FP32", "1") == "1"
     batch_size = x.shape[0]
     shift_kv, scale_kv = (
-        prompt_scale_shift_table[None, None].to(device=x.device, dtype=x.dtype)
-        + prompt_timestep.reshape(batch_size, prompt_timestep.shape[1], 2, -1)
+        prompt_scale_shift_table[None, None].to(device=x.device, dtype=torch.float32 if prompt_adaln_fp32 else x.dtype)
+        + prompt_timestep.to(
+            device=x.device,
+            dtype=torch.float32 if prompt_adaln_fp32 else x.dtype,
+        ).reshape(batch_size, prompt_timestep.shape[1], 2, -1)
     ).unbind(dim=2)
-    attn_input = rms_norm(x, eps=norm_eps) * (1 + q_scale) + q_shift
-    encoder_hidden_states = context * (1 + scale_kv) + shift_kv
+    if prompt_adaln_fp32:
+        # Keep prompt AdaLN modulation in float32 to match the stability fix
+        # used in the self-attention / FF / output AdaLN paths.
+        attn_input = (
+            rms_norm(x, eps=norm_eps).to(torch.float32) * (1 + q_scale.to(torch.float32))
+            + q_shift.to(torch.float32)
+        ).to(x.dtype)
+        encoder_hidden_states = (
+            context.to(torch.float32) * (1 + scale_kv) + shift_kv
+        ).to(context.dtype)
+    else:
+        attn_input = rms_norm(x, eps=norm_eps) * (1 + q_scale.to(x.dtype)) + q_shift.to(x.dtype)
+        encoder_hidden_states = context * (1 + scale_kv.to(context.dtype)) + shift_kv.to(context.dtype)
     return attn(attn_input, context=encoder_hidden_states, mask=context_mask) * q_gate
 
