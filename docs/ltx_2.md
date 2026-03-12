@@ -346,6 +346,7 @@ NF4 has ~4x higher weight error than FP8 (cosine 0.996 vs 0.9997). The base mode
 
 - `--fp8_base`, `--fp8_scaled`: FP8 quantization (~19 GB VRAM).
 - `--nf4_base`: NF4 4-bit quantization (~10 GB VRAM). Mutually exclusive with `--fp8_base`. See [NF4 Quantization](#nf4-quantization) below.
+- `--quantize_device cpu|cuda|gpu`: Device for NF4/FP8 quantization at startup (default: `cuda`). `cpu` loads and quantizes weights on CPU, then moves to GPU. `cuda` loads and quantizes directly on GPU. Overrides `LTX2_NF4_CALC_DEVICE` / `LTX2_FP8_CALC_DEVICE` env vars.
 
 ##### Other Memory Options
 
@@ -434,6 +435,7 @@ accelerate launch ... ltx2_train_network.py ^
 | `--awq_calibration` | off | Experimental: activation-aware channel scaling before quantization |
 | `--awq_alpha` | 0.25 | AWQ scaling strength (0 = no effect, 1 = full) |
 | `--awq_num_batches` | 8 | Number of synthetic calibration batches for AWQ |
+| `--quantize_device` | `cuda` | Device for quantization math (`cpu`, `cuda`, `gpu`) |
 
 **Notes:**
 - `--nf4_base` and `--fp8_base` are mutually exclusive.
