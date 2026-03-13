@@ -4061,7 +4061,7 @@ def main() -> None:
                 if dict_output:
                     if "video_pred" in out:
                         logs["v_loss"] = video_loss.item()
-                    if audio_pred is not None:
+                    if audio_pred is not None and audio_target is not None:
                         logs["a_loss"] = audio_loss.item()
                 if motion_pres_loss is not None:
                     logs["motion_pres"] = motion_pres_loss.detach().item()
