@@ -131,7 +131,11 @@ def config_to_lycoris_preset(config: Dict[str, Any]) -> Dict[str, Any]:
         # Collect all target modules
         target_modules = [m for m in config["modules"].keys() if "*" not in m]
         if target_modules:
-            preset["target_module"] = target_modules
+            # lycoris.kohya expects this key name in apply_preset.
+            preset["unet_target_module"] = target_modules
+        if name_algo_map:
+            # Wildcard patterns should be interpreted with fnmatch, not regex.
+            preset["use_fnmatch"] = True
 
     return preset
 

@@ -9,7 +9,7 @@ from musubi_tuner.ltx_2.model.audio_vae.model_configurator import (
     VocoderConfigurator,
 )
 from musubi_tuner.ltx_2.model.audio_vae.ops import AudioProcessor
-from musubi_tuner.ltx_2.model.audio_vae.vocoder import Vocoder
+from musubi_tuner.ltx_2.model.audio_vae.vocoder import Vocoder, VocoderWithBWE
 
 __all__ = [
     "AUDIO_VAE_DECODER_COMFY_KEYS_FILTER",
@@ -21,6 +21,7 @@ __all__ = [
     "AudioEncoderConfigurator",
     "AudioProcessor",
     "Vocoder",
+    "VocoderWithBWE",
     "VocoderConfigurator",
     "decode_audio",
 ]

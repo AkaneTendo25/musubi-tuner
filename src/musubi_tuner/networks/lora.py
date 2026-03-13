@@ -524,7 +524,7 @@ class LoRANetwork(torch.nn.Module):
                                 if pattern.fullmatch(original_name):
                                     excluded = True
                                     break
-                            included = not has_include_filter
+                            included = False
                             for pattern in include_re_patterns:
                                 if pattern.fullmatch(original_name):
                                     included = True

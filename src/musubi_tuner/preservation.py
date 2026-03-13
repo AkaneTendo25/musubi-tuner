@@ -17,6 +17,7 @@ import torch
 import torch.nn.functional as F
 from accelerate import Accelerator
 
+from musubi_tuner.ltx2_text_conditioning import select_video_text_embeds_for_video_mode
 from musubi_tuner.utils.device_utils import clean_memory_on_device
 
 logger = logging.getLogger(__name__)
@@ -154,21 +155,39 @@ class PreservationHelper:
         text_encoder_dtype = trainer._build_text_encoder(args, accelerator)
 
         # In AV mode, _encode_prompt_text returns concatenated video+audio embeddings.
-        # Preservation only regularises the video branch, so keep only the video half.
+        # Preservation only regularises the video branch.
         av_mode = getattr(trainer, "_audio_video", False)
+        expected_video_dim = 0
+        expected_audio_dim = 0
+        if av_mode and hasattr(trainer, "_load_ltx2_checkpoint_config"):
+            try:
+                cfg = trainer._load_ltx2_checkpoint_config(args)
+                transformer_cfg = cfg.get("transformer", {}) if isinstance(cfg, dict) else {}
+                expected_video_dim = int(transformer_cfg.get("cross_attention_dim", 0) or 0)
+                expected_audio_dim = int(transformer_cfg.get("audio_cross_attention_dim", 0) or 0)
+            except Exception:
+                logger.warning("Preservation: failed to read checkpoint dims; falling back to legacy embed splitting.")
 
         if cfg.blank_preservation:
             embed, mask = trainer._encode_prompt_text(accelerator, "", text_encoder_dtype)
-            if av_mode and embed.shape[-1] % 2 == 0:
-                embed = embed[..., : embed.shape[-1] // 2]
+            if av_mode:
+                embed = select_video_text_embeds_for_video_mode(
+                    embed,
+                    expected_video_dim=expected_video_dim,
+                    expected_audio_dim=expected_audio_dim,
+                )
             cfg.blank_embed = embed
             cfg.blank_mask = mask
             logger.info("Preservation: encoded blank prompt  embed=%s (av_mode=%s)", tuple(embed.shape), av_mode)
 
         if cfg.dop:
             embed, mask = trainer._encode_prompt_text(accelerator, cfg.dop_class_prompt, text_encoder_dtype)
-            if av_mode and embed.shape[-1] % 2 == 0:
-                embed = embed[..., : embed.shape[-1] // 2]
+            if av_mode:
+                embed = select_video_text_embeds_for_video_mode(
+                    embed,
+                    expected_video_dim=expected_video_dim,
+                    expected_audio_dim=expected_audio_dim,
+                )
             cfg.dop_embed = embed
             cfg.dop_mask = mask
             logger.info("Preservation: encoded DOP class prompt %r  embed=%s (av_mode=%s)", cfg.dop_class_prompt, tuple(embed.shape), av_mode)

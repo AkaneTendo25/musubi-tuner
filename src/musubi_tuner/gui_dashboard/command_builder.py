@@ -1,0 +1,829 @@
+"""Convert ProjectConfig into CLI argument lists for subprocess launch."""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+from musubi_tuner.gui_dashboard.project_schema import ProjectConfig
+from musubi_tuner.gui_dashboard.toml_export import (
+    _write_slider_toml,
+    build_slider_toml_path,
+    export_dataset_toml,
+)
+
+
+def _find_script(name: str) -> str:
+    """Find a script in the musubi_tuner package."""
+    import musubi_tuner
+    pkg_dir = Path(musubi_tuner.__file__).parent
+    script = pkg_dir / name
+    if script.exists():
+        return str(script)
+    raise FileNotFoundError(f"Script not found: {name}")
+
+
+def build_cache_latents_cmd(config: ProjectConfig) -> list[str]:
+    """Build CLI args for ltx2_cache_latents.py."""
+    toml_path = export_dataset_toml(config)
+    c = config.caching
+
+    cmd = [
+        sys.executable,
+        _find_script("ltx2_cache_latents.py"),
+        "--dataset_config", str(toml_path),
+        "--ltx2_checkpoint", c.ltx2_checkpoint,
+        "--ltx2_mode", c.ltx2_mode,
+    ]
+
+    if c.vae_dtype:
+        cmd += ["--vae_dtype", c.vae_dtype]
+    if c.device:
+        cmd += ["--device", c.device]
+    if c.skip_existing:
+        cmd.append("--skip_existing")
+    if c.keep_cache:
+        cmd.append("--keep_cache")
+    if c.num_workers is not None:
+        cmd += ["--num_workers", str(c.num_workers)]
+    if c.vae_chunk_size is not None:
+        cmd += ["--vae_chunk_size", str(c.vae_chunk_size)]
+    if c.vae_spatial_tile_size is not None:
+        cmd += ["--vae_spatial_tile_size", str(c.vae_spatial_tile_size)]
+    if c.vae_spatial_tile_overlap is not None:
+        cmd += ["--vae_spatial_tile_overlap", str(c.vae_spatial_tile_overlap)]
+    if c.vae_temporal_tile_size is not None:
+        cmd += ["--vae_temporal_tile_size", str(c.vae_temporal_tile_size)]
+    if c.vae_temporal_tile_overlap is not None:
+        cmd += ["--vae_temporal_tile_overlap", str(c.vae_temporal_tile_overlap)]
+
+    # Reference (V2V)
+    if c.reference_frames != 1:
+        cmd += ["--reference_frames", str(c.reference_frames)]
+    if c.reference_downscale != 1:
+        cmd += ["--reference_downscale", str(c.reference_downscale)]
+
+    # Audio source options
+    if c.ltx2_mode in ("av", "audio"):
+        cmd += ["--ltx2_audio_source", c.ltx2_audio_source]
+        if c.ltx2_audio_source == "audio_files" and c.ltx2_audio_dir:
+            cmd += ["--ltx2_audio_dir", c.ltx2_audio_dir]
+            if c.ltx2_audio_ext:
+                cmd += ["--ltx2_audio_ext", c.ltx2_audio_ext]
+        if c.ltx2_audio_dtype:
+            cmd += ["--ltx2_audio_dtype", c.ltx2_audio_dtype]
+        if c.audio_only_sequence_resolution != 64:
+            cmd += ["--audio_only_sequence_resolution", str(c.audio_only_sequence_resolution)]
+
+    # I2V latent precaching
+    if c.precache_sample_latents and c.sample_prompts:
+        cmd.append("--precache_sample_latents")
+        cmd += ["--sample_prompts", c.sample_prompts]
+        if c.sample_latents_cache:
+            cmd += ["--sample_latents_cache", c.sample_latents_cache]
+
+    if c.quantize_device:
+        cmd += ["--quantize_device", c.quantize_device]
+    if c.save_dataset_manifest:
+        cmd += ["--save_dataset_manifest", c.save_dataset_manifest]
+
+    return cmd
+
+
+def build_cache_text_cmd(config: ProjectConfig) -> list[str]:
+    """Build CLI args for ltx2_cache_text_encoder_outputs.py."""
+    toml_path = export_dataset_toml(config)
+    c = config.caching
+
+    cmd = [
+        sys.executable,
+        _find_script("ltx2_cache_text_encoder_outputs.py"),
+        "--dataset_config", str(toml_path),
+        "--ltx2_checkpoint", c.ltx2_checkpoint,
+        "--gemma_root", c.gemma_root,
+        "--ltx2_mode", c.ltx2_mode,
+    ]
+
+    if c.gemma_safetensors:
+        cmd += ["--gemma_safetensors", c.gemma_safetensors]
+    if c.ltx2_text_encoder_checkpoint:
+        cmd += ["--ltx2_text_encoder_checkpoint", c.ltx2_text_encoder_checkpoint]
+    if c.mixed_precision != "no":
+        cmd += ["--mixed_precision", c.mixed_precision]
+    if c.skip_existing:
+        cmd.append("--skip_existing")
+    if c.keep_cache:
+        cmd.append("--keep_cache")
+    if c.num_workers is not None:
+        cmd += ["--num_workers", str(c.num_workers)]
+    if c.gemma_load_in_8bit:
+        cmd.append("--gemma_load_in_8bit")
+    if c.gemma_load_in_4bit:
+        cmd.append("--gemma_load_in_4bit")
+        cmd += ["--gemma_bnb_4bit_quant_type", c.gemma_bnb_4bit_quant_type]
+    if c.gemma_bnb_4bit_disable_double_quant:
+        cmd.append("--gemma_bnb_4bit_disable_double_quant")
+    if c.gemma_bnb_4bit_compute_dtype != "auto":
+        cmd += ["--gemma_bnb_4bit_compute_dtype", c.gemma_bnb_4bit_compute_dtype]
+
+    # Precaching
+    if c.precache_sample_prompts and c.sample_prompts:
+        cmd.append("--precache_sample_prompts")
+        cmd += ["--sample_prompts", c.sample_prompts]
+        if c.sample_prompts_cache:
+            cmd += ["--sample_prompts_cache", c.sample_prompts_cache]
+    if c.precache_preservation_prompts:
+        cmd.append("--precache_preservation_prompts")
+        if c.preservation_prompts_cache:
+            cmd += ["--preservation_prompts_cache", c.preservation_prompts_cache]
+        if c.blank_preservation:
+            cmd.append("--blank_preservation")
+        if c.dop:
+            cmd.append("--dop")
+            if c.dop_class_prompt:
+                cmd += ["--dop_class_prompt", c.dop_class_prompt]
+
+    return cmd
+
+
+def build_inference_cmd(config: ProjectConfig) -> list[str]:
+    """Build CLI args for ltx2_generate_video.py."""
+    s = config.inference
+
+    cmd = [
+        sys.executable,
+        _find_script("ltx2_generate_video.py"),
+        "--ltx2_checkpoint", s.ltx2_checkpoint,
+        "--gemma_root", s.gemma_root,
+        "--ltx2_mode", s.ltx2_mode,
+    ]
+
+    # LoRA
+    if s.lora_weight:
+        cmd += ["--lora_weight", s.lora_weight]
+        cmd += ["--lora_multiplier", str(s.lora_multiplier)]
+
+    # Prompt
+    if s.prompt:
+        cmd += ["--prompt", s.prompt]
+    if s.negative_prompt:
+        cmd += ["--negative_prompt", s.negative_prompt]
+    if s.from_file:
+        cmd += ["--from_file", s.from_file]
+
+    # Sampling params
+    cmd += ["--height", str(s.height)]
+    cmd += ["--width", str(s.width)]
+    cmd += ["--frame_count", str(s.frame_count)]
+    cmd += ["--frame_rate", str(s.frame_rate)]
+    cmd += ["--sample_steps", str(s.sample_steps)]
+    cmd += ["--guidance_scale", str(s.guidance_scale)]
+    if s.cfg_scale is not None:
+        cmd += ["--cfg_scale", str(s.cfg_scale)]
+    cmd += ["--discrete_flow_shift", str(s.discrete_flow_shift)]
+    if s.seed is not None:
+        cmd += ["--seed", str(s.seed)]
+
+    # Precision
+    if s.mixed_precision != "no":
+        cmd += ["--mixed_precision", s.mixed_precision]
+    cmd += ["--attn_mode", s.attn_mode]
+    if s.fp8_base:
+        cmd.append("--fp8_base")
+    if s.fp8_scaled:
+        cmd.append("--fp8_scaled")
+
+    # Gemma quantization
+    if s.gemma_load_in_8bit:
+        cmd.append("--gemma_load_in_8bit")
+    if s.gemma_load_in_4bit:
+        cmd.append("--gemma_load_in_4bit")
+
+    # Memory
+    if s.offloading:
+        cmd.append("--offloading")
+    if s.blocks_to_swap is not None:
+        cmd += ["--blocks_to_swap", str(s.blocks_to_swap)]
+
+    # Output
+    if s.output_dir:
+        cmd += ["--output_dir", s.output_dir]
+    if s.output_name:
+        cmd += ["--output_name", s.output_name]
+
+    return cmd
+
+
+def build_training_cmd(config: ProjectConfig) -> list[str]:
+    """Build CLI args for training via accelerate launch."""
+    toml_path = export_dataset_toml(config)
+    t = config.training
+
+    # Use accelerate launch
+    cmd = [
+        sys.executable, "-m", "accelerate.commands.launch",
+        "--mixed_precision", t.mixed_precision,
+        "--num_processes", "1",
+        "--num_machines", "1",
+        _find_script("ltx2_train_network.py"),
+    ]
+
+    # Dataset
+    if t.dataset_manifest:
+        cmd += ["--dataset_manifest", t.dataset_manifest]
+    else:
+        cmd += ["--dataset_config", str(toml_path)]
+
+    # Model
+    cmd += ["--ltx2_checkpoint", t.ltx2_checkpoint]
+    if t.gemma_root:
+        cmd += ["--gemma_root", t.gemma_root]
+    if t.gemma_safetensors:
+        cmd += ["--gemma_safetensors", t.gemma_safetensors]
+    cmd += ["--ltx2_mode", t.ltx2_mode]
+    if t.ltx_version != "2.0":
+        cmd += ["--ltx_version", t.ltx_version]
+    if t.ltx_version_check_mode != "warn":
+        cmd += ["--ltx_version_check_mode", t.ltx_version_check_mode]
+    if t.fp8_base:
+        cmd.append("--fp8_base")
+    if t.fp8_scaled:
+        cmd.append("--fp8_scaled")
+    if t.flash_attn:
+        cmd.append("--flash_attn")
+    if t.sdpa:
+        cmd.append("--sdpa")
+    if t.sage_attn:
+        cmd.append("--sage_attn")
+    if t.xformers:
+        cmd.append("--xformers")
+    if t.gemma_load_in_8bit:
+        cmd.append("--gemma_load_in_8bit")
+    if t.gemma_load_in_4bit:
+        cmd.append("--gemma_load_in_4bit")
+    if t.gemma_bnb_4bit_disable_double_quant:
+        cmd.append("--gemma_bnb_4bit_disable_double_quant")
+    if t.ltx2_audio_only_model:
+        cmd.append("--ltx2_audio_only_model")
+
+    # Quantization
+    if t.nf4_base:
+        cmd.append("--nf4_base")
+        if t.nf4_block_size != 32:
+            cmd += ["--nf4_block_size", str(t.nf4_block_size)]
+    if t.loftq_init:
+        cmd.append("--loftq_init")
+        if t.loftq_iters != 2:
+            cmd += ["--loftq_iters", str(t.loftq_iters)]
+    if t.fp8_w8a8:
+        cmd.append("--fp8_w8a8")
+        if t.w8a8_mode != "int8":
+            cmd += ["--w8a8_mode", t.w8a8_mode]
+    if t.awq_calibration:
+        cmd.append("--awq_calibration")
+        if t.awq_alpha != 0.25:
+            cmd += ["--awq_alpha", str(t.awq_alpha)]
+        if t.awq_num_batches != 8:
+            cmd += ["--awq_num_batches", str(t.awq_num_batches)]
+    if t.quantize_device:
+        cmd += ["--quantize_device", t.quantize_device]
+
+    # LoRA / Network
+    if t.network_module:
+        cmd += ["--network_module", t.network_module]
+    cmd += ["--network_dim", str(t.network_dim)]
+    cmd += ["--network_alpha", str(t.network_alpha)]
+    cmd += ["--lora_target_preset", t.lora_target_preset]
+    if t.network_args:
+        cmd += ["--network_args"] + t.network_args.split()
+    if t.network_weights:
+        cmd += ["--network_weights", t.network_weights]
+    if t.network_dropout is not None:
+        cmd += ["--network_dropout", str(t.network_dropout)]
+    if t.scale_weight_norms is not None:
+        cmd += ["--scale_weight_norms", str(t.scale_weight_norms)]
+    if t.dim_from_weights:
+        cmd.append("--dim_from_weights")
+    if t.base_weights:
+        cmd += ["--base_weights"] + t.base_weights.split()
+    if t.base_weights_multiplier:
+        cmd += ["--base_weights_multiplier"] + t.base_weights_multiplier.split()
+    if t.lycoris_config:
+        cmd += ["--lycoris_config", t.lycoris_config]
+    if t.lycoris_quantized_base_check_mode != "warn":
+        cmd += ["--lycoris_quantized_base_check_mode", t.lycoris_quantized_base_check_mode]
+    if t.init_lokr_norm is not None:
+        cmd += ["--init_lokr_norm", str(t.init_lokr_norm)]
+    if t.caption_dropout_rate > 0:
+        cmd += ["--caption_dropout_rate", str(t.caption_dropout_rate)]
+    if not t.save_original_lora:
+        cmd.append("--no-save_original_lora")
+
+    # Optimizer
+    cmd += ["--learning_rate", str(t.learning_rate)]
+    cmd += ["--optimizer_type", t.optimizer_type]
+    if t.optimizer_args:
+        cmd += ["--optimizer_args"] + t.optimizer_args.split()
+    cmd += ["--lr_scheduler", t.lr_scheduler]
+    cmd += ["--lr_warmup_steps", str(t.lr_warmup_steps)]
+    if t.lr_decay_steps is not None:
+        cmd += ["--lr_decay_steps", str(t.lr_decay_steps)]
+    if t.lr_scheduler_num_cycles is not None:
+        cmd += ["--lr_scheduler_num_cycles", str(t.lr_scheduler_num_cycles)]
+    if t.lr_scheduler_power is not None:
+        cmd += ["--lr_scheduler_power", str(t.lr_scheduler_power)]
+    if t.lr_scheduler_min_lr_ratio is not None:
+        cmd += ["--lr_scheduler_min_lr_ratio", str(t.lr_scheduler_min_lr_ratio)]
+    if t.lr_scheduler_type:
+        cmd += ["--lr_scheduler_type", t.lr_scheduler_type]
+    if t.lr_scheduler_args:
+        cmd += ["--lr_scheduler_args"] + t.lr_scheduler_args.split()
+    if t.lr_scheduler_timescale is not None:
+        cmd += ["--lr_scheduler_timescale", str(t.lr_scheduler_timescale)]
+    cmd += ["--gradient_accumulation_steps", str(t.gradient_accumulation_steps)]
+    cmd += ["--max_grad_norm", str(t.max_grad_norm)]
+    if t.audio_lr is not None:
+        cmd += ["--audio_lr", str(t.audio_lr)]
+    if t.lr_args:
+        cmd += ["--lr_args"] + t.lr_args.split()
+
+    # Schedule
+    if t.max_train_epochs is not None:
+        cmd += ["--max_train_epochs", str(t.max_train_epochs)]
+    else:
+        cmd += ["--max_train_steps", str(t.max_train_steps)]
+    cmd += ["--timestep_sampling", t.timestep_sampling]
+    cmd += ["--discrete_flow_shift", str(t.discrete_flow_shift)]
+    cmd += ["--weighting_scheme", t.weighting_scheme]
+    if t.seed is not None:
+        cmd += ["--seed", str(t.seed)]
+    if t.guidance_scale is not None:
+        cmd += ["--guidance_scale", str(t.guidance_scale)]
+    if t.sigmoid_scale is not None:
+        cmd += ["--sigmoid_scale", str(t.sigmoid_scale)]
+    if t.logit_mean is not None:
+        cmd += ["--logit_mean", str(t.logit_mean)]
+    if t.logit_std is not None:
+        cmd += ["--logit_std", str(t.logit_std)]
+    if t.mode_scale is not None:
+        cmd += ["--mode_scale", str(t.mode_scale)]
+    if t.min_timestep is not None:
+        cmd += ["--min_timestep", str(t.min_timestep)]
+    if t.max_timestep is not None:
+        cmd += ["--max_timestep", str(t.max_timestep)]
+
+    # Advanced timestep
+    if t.shifted_logit_mode:
+        cmd += ["--shifted_logit_mode", t.shifted_logit_mode]
+    if t.shifted_logit_eps != 1e-3:
+        cmd += ["--shifted_logit_eps", str(t.shifted_logit_eps)]
+    if t.shifted_logit_uniform_prob != 0.1:
+        cmd += ["--shifted_logit_uniform_prob", str(t.shifted_logit_uniform_prob)]
+    if t.preserve_distribution_shape:
+        cmd.append("--preserve_distribution_shape")
+    if t.num_timestep_buckets is not None:
+        cmd += ["--num_timestep_buckets", str(t.num_timestep_buckets)]
+
+    # Memory
+    if t.blocks_to_swap is not None:
+        cmd += ["--blocks_to_swap", str(t.blocks_to_swap)]
+    if t.gradient_checkpointing:
+        cmd.append("--gradient_checkpointing")
+    if t.gradient_checkpointing_cpu_offload:
+        cmd.append("--gradient_checkpointing_cpu_offload")
+    if t.split_attn_target:
+        cmd += ["--split_attn_target", t.split_attn_target]
+    if t.split_attn_mode:
+        cmd += ["--split_attn_mode", t.split_attn_mode]
+    if t.split_attn_chunk_size is not None:
+        cmd += ["--split_attn_chunk_size", str(t.split_attn_chunk_size)]
+    if t.blockwise_checkpointing:
+        cmd.append("--blockwise_checkpointing")
+    if t.blocks_to_checkpoint is not None:
+        cmd += ["--blocks_to_checkpoint", str(t.blocks_to_checkpoint)]
+    if t.full_fp16:
+        cmd.append("--full_fp16")
+    if t.full_bf16:
+        cmd.append("--full_bf16")
+    if t.ffn_chunk_target:
+        cmd += ["--ffn_chunk_target", t.ffn_chunk_target]
+    if t.ffn_chunk_size:
+        cmd += ["--ffn_chunk_size", str(t.ffn_chunk_size)]
+    if t.use_pinned_memory_for_block_swap:
+        cmd.append("--use_pinned_memory_for_block_swap")
+    if t.img_in_txt_in_offloading:
+        cmd.append("--img_in_txt_in_offloading")
+
+    # Compile
+    if t.compile:
+        cmd.append("--compile")
+        if t.compile_backend:
+            cmd += ["--compile_backend", t.compile_backend]
+        if t.compile_mode:
+            cmd += ["--compile_mode", t.compile_mode]
+        if t.compile_dynamic:
+            cmd.append("--compile_dynamic")
+        if t.compile_fullgraph:
+            cmd.append("--compile_fullgraph")
+        if t.compile_cache_size_limit is not None:
+            cmd += ["--compile_cache_size_limit", str(t.compile_cache_size_limit)]
+
+    # CUDA
+    if t.cuda_allow_tf32:
+        cmd.append("--cuda_allow_tf32")
+    if t.cuda_cudnn_benchmark:
+        cmd.append("--cuda_cudnn_benchmark")
+    if t.cuda_memory_fraction is not None:
+        cmd += ["--cuda_memory_fraction", str(t.cuda_memory_fraction)]
+
+    # Sampling
+    if t.sample_every_n_steps:
+        cmd += ["--sample_every_n_steps", str(t.sample_every_n_steps)]
+    if t.sample_every_n_epochs:
+        cmd += ["--sample_every_n_epochs", str(t.sample_every_n_epochs)]
+    if t.sample_prompts:
+        cmd += ["--sample_prompts", t.sample_prompts]
+    if t.use_precached_sample_prompts:
+        cmd.append("--use_precached_sample_prompts")
+    if t.sample_prompts_cache:
+        cmd += ["--sample_prompts_cache", t.sample_prompts_cache]
+    if t.use_precached_sample_latents:
+        cmd.append("--use_precached_sample_latents")
+    if t.sample_latents_cache:
+        cmd += ["--sample_latents_cache", t.sample_latents_cache]
+    cmd += ["--height", str(t.height)]
+    cmd += ["--width", str(t.width)]
+    cmd += ["--sample_num_frames", str(t.sample_num_frames)]
+    if t.sample_with_offloading:
+        cmd.append("--sample_with_offloading")
+    if t.sample_merge_audio:
+        cmd.append("--sample_merge_audio")
+    if t.sample_disable_audio:
+        cmd.append("--sample_disable_audio")
+    if t.sample_at_first:
+        cmd.append("--sample_at_first")
+    if t.sample_tiled_vae:
+        cmd.append("--sample_tiled_vae")
+    if t.sample_vae_tile_size is not None:
+        cmd += ["--sample_vae_tile_size", str(t.sample_vae_tile_size)]
+    if t.sample_vae_tile_overlap is not None:
+        cmd += ["--sample_vae_tile_overlap", str(t.sample_vae_tile_overlap)]
+    if t.sample_vae_temporal_tile_size is not None:
+        cmd += ["--sample_vae_temporal_tile_size", str(t.sample_vae_temporal_tile_size)]
+    if t.sample_vae_temporal_tile_overlap is not None:
+        cmd += ["--sample_vae_temporal_tile_overlap", str(t.sample_vae_temporal_tile_overlap)]
+    if t.sample_two_stage:
+        cmd.append("--sample_two_stage")
+        if t.spatial_upsampler_path:
+            cmd += ["--spatial_upsampler_path", t.spatial_upsampler_path]
+        if t.distilled_lora_path:
+            cmd += ["--distilled_lora_path", t.distilled_lora_path]
+        if t.sample_stage2_steps != 3:
+            cmd += ["--sample_stage2_steps", str(t.sample_stage2_steps)]
+    if t.sample_audio_only:
+        cmd.append("--sample_audio_only")
+    if t.sample_disable_flash_attn:
+        cmd.append("--sample_disable_flash_attn")
+    if not t.sample_i2v_token_timestep_mask:
+        cmd.append("--no-sample_i2v_token_timestep_mask")
+    if not t.sample_audio_subprocess:
+        cmd.append("--no-sample_audio_subprocess")
+    if t.sample_include_reference:
+        cmd.append("--sample_include_reference")
+    if t.reference_downscale != 1:
+        cmd += ["--reference_downscale", str(t.reference_downscale)]
+    if t.reference_frames != 1:
+        cmd += ["--reference_frames", str(t.reference_frames)]
+
+    # Validation
+    if t.validate_every_n_steps is not None:
+        cmd += ["--validate_every_n_steps", str(t.validate_every_n_steps)]
+    if t.validate_every_n_epochs is not None:
+        cmd += ["--validate_every_n_epochs", str(t.validate_every_n_epochs)]
+
+    # Output
+    if t.output_dir:
+        cmd += ["--output_dir", t.output_dir]
+    if t.output_name:
+        cmd += ["--output_name", t.output_name]
+    if t.save_every_n_epochs:
+        cmd += ["--save_every_n_epochs", str(t.save_every_n_epochs)]
+    if t.save_every_n_steps:
+        cmd += ["--save_every_n_steps", str(t.save_every_n_steps)]
+    if t.save_last_n_epochs is not None:
+        cmd += ["--save_last_n_epochs", str(t.save_last_n_epochs)]
+    if t.save_last_n_steps is not None:
+        cmd += ["--save_last_n_steps", str(t.save_last_n_steps)]
+    if t.save_last_n_epochs_state is not None:
+        cmd += ["--save_last_n_epochs_state", str(t.save_last_n_epochs_state)]
+    if t.save_last_n_steps_state is not None:
+        cmd += ["--save_last_n_steps_state", str(t.save_last_n_steps_state)]
+    if t.save_state:
+        cmd.append("--save_state")
+    if t.save_state_on_train_end:
+        cmd.append("--save_state_on_train_end")
+    if t.save_checkpoint_metadata:
+        cmd.append("--save_checkpoint_metadata")
+    if t.no_metadata:
+        cmd.append("--no_metadata")
+    if t.no_convert_to_comfy:
+        cmd.append("--no_convert_to_comfy")
+    if t.log_with:
+        cmd += ["--log_with", t.log_with]
+    if t.logging_dir:
+        cmd += ["--logging_dir", t.logging_dir]
+    if t.log_prefix:
+        cmd += ["--log_prefix", t.log_prefix]
+    if t.log_tracker_name:
+        cmd += ["--log_tracker_name", t.log_tracker_name]
+    if t.wandb_run_name:
+        cmd += ["--wandb_run_name", t.wandb_run_name]
+    if t.wandb_api_key:
+        cmd += ["--wandb_api_key", t.wandb_api_key]
+    if t.log_cuda_memory_every_n_steps is not None:
+        cmd += ["--log_cuda_memory_every_n_steps", str(t.log_cuda_memory_every_n_steps)]
+    if t.resume:
+        cmd += ["--resume", t.resume]
+    if t.training_comment:
+        cmd += ["--training_comment", t.training_comment]
+    if t.loss_type != "mse":
+        cmd += ["--loss_type", t.loss_type]
+    if t.loss_type in ("huber", "smooth_l1") and t.huber_delta != 1.0:
+        cmd += ["--huber_delta", str(t.huber_delta)]
+
+    # Metadata
+    if t.metadata_title:
+        cmd += ["--metadata_title", t.metadata_title]
+    if t.metadata_author:
+        cmd += ["--metadata_author", t.metadata_author]
+    if t.metadata_description:
+        cmd += ["--metadata_description", t.metadata_description]
+    if t.metadata_license:
+        cmd += ["--metadata_license", t.metadata_license]
+    if t.metadata_tags:
+        cmd += ["--metadata_tags", t.metadata_tags]
+
+    # HuggingFace upload
+    if t.huggingface_repo_id:
+        cmd += ["--huggingface_repo_id", t.huggingface_repo_id]
+    if t.huggingface_repo_type:
+        cmd += ["--huggingface_repo_type", t.huggingface_repo_type]
+    if t.huggingface_path_in_repo:
+        cmd += ["--huggingface_path_in_repo", t.huggingface_path_in_repo]
+    if t.huggingface_token:
+        cmd += ["--huggingface_token", t.huggingface_token]
+    if t.huggingface_repo_visibility:
+        cmd += ["--huggingface_repo_visibility", t.huggingface_repo_visibility]
+    if t.save_state_to_huggingface:
+        cmd.append("--save_state_to_huggingface")
+    if t.resume_from_huggingface:
+        cmd.append("--resume_from_huggingface")
+    if t.async_upload:
+        cmd.append("--async_upload")
+
+    # CREPA
+    if t.crepa:
+        cmd.append("--crepa")
+        args_parts = []
+        if t.crepa_mode != "backbone":
+            args_parts.append(f"mode={t.crepa_mode}")
+        if t.crepa_student_block_idx != 16:
+            args_parts.append(f"student_block_idx={t.crepa_student_block_idx}")
+        if t.crepa_mode == "backbone" and t.crepa_teacher_block_idx != 32:
+            args_parts.append(f"teacher_block_idx={t.crepa_teacher_block_idx}")
+        if t.crepa_mode == "dino" and t.crepa_dino_model != "dinov2_vitb14":
+            args_parts.append(f"dino_model={t.crepa_dino_model}")
+        if t.crepa_lambda != 0.1:
+            args_parts.append(f"lambda_crepa={t.crepa_lambda}")
+        if t.crepa_tau != 1.0:
+            args_parts.append(f"tau={t.crepa_tau}")
+        if t.crepa_num_neighbors != 2:
+            args_parts.append(f"num_neighbors={t.crepa_num_neighbors}")
+        if t.crepa_schedule != "constant":
+            args_parts.append(f"schedule={t.crepa_schedule}")
+        if t.crepa_warmup_steps != 0:
+            args_parts.append(f"warmup_steps={t.crepa_warmup_steps}")
+        if not t.crepa_normalize:
+            args_parts.append("normalize=false")
+        if args_parts:
+            cmd += ["--crepa_args"] + args_parts
+
+    # Self-Flow
+    if t.self_flow:
+        cmd.append("--self_flow")
+        args_parts = []
+        if t.self_flow_student_block_idx != 16:
+            args_parts.append(f"student_block_idx={t.self_flow_student_block_idx}")
+        if t.self_flow_teacher_block_idx != 32:
+            args_parts.append(f"teacher_block_idx={t.self_flow_teacher_block_idx}")
+        if t.self_flow_student_block_ratio != 0.3:
+            args_parts.append(f"student_block_ratio={t.self_flow_student_block_ratio}")
+        if t.self_flow_teacher_block_ratio != 0.7:
+            args_parts.append(f"teacher_block_ratio={t.self_flow_teacher_block_ratio}")
+        if t.self_flow_lambda != 0.1:
+            args_parts.append(f"lambda_self_flow={t.self_flow_lambda}")
+        if t.self_flow_mask_ratio != 0.1:
+            args_parts.append(f"mask_ratio={t.self_flow_mask_ratio}")
+        if t.self_flow_teacher_momentum != 0.999:
+            args_parts.append(f"teacher_momentum={t.self_flow_teacher_momentum}")
+        if not t.self_flow_dual_timestep:
+            args_parts.append("dual_timestep=false")
+        if t.self_flow_projector_lr is not None:
+            args_parts.append(f"projector_lr={t.self_flow_projector_lr}")
+        if args_parts:
+            cmd += ["--self_flow_args"] + args_parts
+
+    # Preservation
+    if t.blank_preservation:
+        cmd.append("--blank_preservation")
+        args_parts = []
+        if t.blank_preservation_multiplier != 1.0:
+            args_parts.append(f"multiplier={t.blank_preservation_multiplier}")
+        if args_parts:
+            cmd += ["--blank_preservation_args"] + args_parts
+    if t.dop:
+        cmd.append("--dop")
+        args_parts = []
+        if t.dop_class:
+            args_parts.append(f"class={t.dop_class}")
+        if t.dop_multiplier != 1.0:
+            args_parts.append(f"multiplier={t.dop_multiplier}")
+        if args_parts:
+            cmd += ["--dop_args"] + args_parts
+    if t.prior_divergence:
+        cmd.append("--prior_divergence")
+        args_parts = []
+        if t.prior_divergence_multiplier != 0.1:
+            args_parts.append(f"multiplier={t.prior_divergence_multiplier}")
+        if args_parts:
+            cmd += ["--prior_divergence_args"] + args_parts
+    if t.use_precached_preservation:
+        cmd.append("--use_precached_preservation")
+    if t.preservation_prompts_cache:
+        cmd += ["--preservation_prompts_cache", t.preservation_prompts_cache]
+
+    # Audio features
+    if t.audio_loss_balance_mode != "none":
+        cmd += ["--audio_loss_balance_mode", t.audio_loss_balance_mode]
+        if t.audio_loss_balance_mode == "inv_freq":
+            if t.audio_loss_balance_beta != 0.01:
+                cmd += ["--audio_loss_balance_beta", str(t.audio_loss_balance_beta)]
+            if t.audio_loss_balance_eps != 0.05:
+                cmd += ["--audio_loss_balance_eps", str(t.audio_loss_balance_eps)]
+            if t.audio_loss_balance_min != 0.05:
+                cmd += ["--audio_loss_balance_min", str(t.audio_loss_balance_min)]
+            if t.audio_loss_balance_max != 4.0:
+                cmd += ["--audio_loss_balance_max", str(t.audio_loss_balance_max)]
+        if t.audio_loss_balance_ema_init != 1.0:
+            cmd += ["--audio_loss_balance_ema_init", str(t.audio_loss_balance_ema_init)]
+        if t.audio_loss_balance_mode == "ema_mag":
+            if t.audio_loss_balance_target_ratio != 0.33:
+                cmd += ["--audio_loss_balance_target_ratio", str(t.audio_loss_balance_target_ratio)]
+            if t.audio_loss_balance_ema_decay != 0.99:
+                cmd += ["--audio_loss_balance_ema_decay", str(t.audio_loss_balance_ema_decay)]
+    if t.independent_audio_timestep:
+        cmd.append("--independent_audio_timestep")
+    if t.audio_silence_regularizer:
+        cmd.append("--audio_silence_regularizer")
+        if t.audio_silence_regularizer_weight != 1.0:
+            cmd += ["--audio_silence_regularizer_weight", str(t.audio_silence_regularizer_weight)]
+    if t.audio_supervision_mode != "off":
+        cmd += ["--audio_supervision_mode", t.audio_supervision_mode]
+        if t.audio_supervision_warmup_steps != 50:
+            cmd += ["--audio_supervision_warmup_steps", str(t.audio_supervision_warmup_steps)]
+        if t.audio_supervision_check_interval != 50:
+            cmd += ["--audio_supervision_check_interval", str(t.audio_supervision_check_interval)]
+        if t.audio_supervision_min_ratio != 0.9:
+            cmd += ["--audio_supervision_min_ratio", str(t.audio_supervision_min_ratio)]
+    if t.audio_dop:
+        cmd.append("--audio_dop")
+        if t.audio_dop_multiplier != 0.5:
+            cmd += ["--audio_dop_args", f"multiplier={t.audio_dop_multiplier}"]
+    if t.audio_bucket_strategy:
+        cmd += ["--audio_bucket_strategy", t.audio_bucket_strategy]
+    if t.audio_bucket_interval is not None:
+        cmd += ["--audio_bucket_interval", str(t.audio_bucket_interval)]
+    if t.audio_only_sequence_resolution != 64:
+        cmd += ["--audio_only_sequence_resolution", str(t.audio_only_sequence_resolution)]
+    if t.min_audio_batches_per_accum > 0:
+        cmd += ["--min_audio_batches_per_accum", str(t.min_audio_batches_per_accum)]
+    if t.audio_batch_probability is not None:
+        cmd += ["--audio_batch_probability", str(t.audio_batch_probability)]
+
+    # Loss weighting
+    if t.video_loss_weight != 1.0:
+        cmd += ["--video_loss_weight", str(t.video_loss_weight)]
+    if t.audio_loss_weight != 1.0:
+        cmd += ["--audio_loss_weight", str(t.audio_loss_weight)]
+
+    # Misc
+    if t.separate_audio_buckets:
+        cmd.append("--separate_audio_buckets")
+    cmd += ["--max_data_loader_n_workers", str(t.max_data_loader_n_workers)]
+    if t.persistent_data_loader_workers:
+        cmd.append("--persistent_data_loader_workers")
+    cmd += ["--ltx2_first_frame_conditioning_p", str(t.ltx2_first_frame_conditioning_p)]
+
+    # GUI dashboard
+    cmd.append("--gui")
+
+    return cmd
+
+
+def build_slider_training_cmd(config: ProjectConfig) -> list[str]:
+    """Build CLI args for slider LoRA training via accelerate launch.
+
+    Shared settings (model, LoRA, optimizer, memory, output) are inherited
+    from the training config.  Only slider-specific values (steps, output name,
+    slider config, latent dims) come from ``config.slider``.
+    """
+    s = config.slider
+    t = config.training
+    slider_toml = _write_slider_toml(config, build_slider_toml_path(config))
+
+    cmd = [
+        sys.executable, "-m", "accelerate.commands.launch",
+        "--mixed_precision", t.mixed_precision,
+        "--num_processes", "1",
+        "--num_machines", "1",
+        _find_script("ltx2_train_slider.py"),
+    ]
+
+    # Slider config
+    cmd += ["--slider_config", str(slider_toml)]
+
+    # Model — from training config
+    cmd += ["--ltx2_checkpoint", t.ltx2_checkpoint]
+    if t.gemma_root:
+        cmd += ["--gemma_root", t.gemma_root]
+    if t.fp8_base:
+        cmd.append("--fp8_base")
+    if t.fp8_scaled:
+        cmd.append("--fp8_scaled")
+    if t.flash_attn:
+        cmd.append("--flash_attn")
+    if t.gemma_load_in_8bit:
+        cmd.append("--gemma_load_in_8bit")
+    if t.gemma_load_in_4bit:
+        cmd.append("--gemma_load_in_4bit")
+
+    # Text mode latent dimensions — slider-specific
+    if s.mode == "text":
+        cmd += ["--latent_frames", str(s.latent_frames)]
+        cmd += ["--latent_height", str(s.latent_height)]
+        cmd += ["--latent_width", str(s.latent_width)]
+
+    # LoRA — from training config
+    cmd += ["--network_dim", str(t.network_dim)]
+    cmd += ["--network_alpha", str(t.network_alpha)]
+
+    # Optimizer — from training config
+    cmd += ["--learning_rate", str(t.learning_rate)]
+    cmd += ["--optimizer_type", t.optimizer_type]
+    if t.optimizer_args:
+        cmd += ["--optimizer_args"] + t.optimizer_args.split()
+    cmd += ["--gradient_accumulation_steps", str(t.gradient_accumulation_steps)]
+    cmd += ["--max_grad_norm", str(t.max_grad_norm)]
+
+    # Schedule — slider override for steps
+    cmd += ["--max_train_steps", str(s.max_train_steps)]
+    if t.seed is not None:
+        cmd += ["--seed", str(t.seed)]
+
+    # Memory — from training config
+    if t.blocks_to_swap is not None:
+        cmd += ["--blocks_to_swap", str(t.blocks_to_swap)]
+    if t.gradient_checkpointing:
+        cmd.append("--gradient_checkpointing")
+
+    # Output — dir from training, name from slider
+    if t.output_dir:
+        cmd += ["--output_dir", t.output_dir]
+    if s.output_name:
+        cmd += ["--output_name", s.output_name]
+    if t.save_every_n_steps:
+        cmd += ["--save_every_n_steps", str(t.save_every_n_steps)]
+
+    return cmd
+
+
+def build_cache_dino_cmd(config: ProjectConfig) -> list[str]:
+    """Build CLI args for ltx2_cache_dino_features.py."""
+    toml_path = export_dataset_toml(config)
+    c = config.caching
+    t = config.training
+
+    cmd = [
+        sys.executable,
+        _find_script("ltx2_cache_dino_features.py"),
+        "--dataset_config", str(toml_path),
+        "--dino_model", t.crepa_dino_model,  # Use training model setting, not caching
+        "--dino_batch_size", str(c.dino_batch_size),
+    ]
+
+    if c.device:
+        cmd += ["--device", c.device]
+    if c.skip_existing:
+        cmd.append("--skip_existing")
+
+    return cmd

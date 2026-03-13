@@ -473,6 +473,7 @@ def _build_motion_anchor_cache_signature(
         "attention_preservation": bool(use_attn_pres),
         "attention_queries": int(max_queries),
         "attention_keys": int(max_keys),
+        "attention_per_head": bool(getattr(args, "motion_attention_preservation_per_head", False)),
         "attention_blocks": getattr(args, "motion_attention_preservation_blocks", None),
     }
 
@@ -682,6 +683,27 @@ def _build_temporal_pair_mask(video_loss_mask: Optional[torch.Tensor]) -> Option
     return None
 
 
+def _build_temporal_triplet_mask(video_loss_mask: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+    if video_loss_mask is None:
+        return None
+    if not isinstance(video_loss_mask, torch.Tensor):
+        return None
+    if video_loss_mask.dim() == 2:
+        if video_loss_mask.shape[1] < 3:
+            return None
+        triple = video_loss_mask[:, 2:] & video_loss_mask[:, 1:-1] & video_loss_mask[:, :-2]
+        return triple.unsqueeze(1).unsqueeze(-1).unsqueeze(-1)
+    if video_loss_mask.dim() == 5:
+        if video_loss_mask.shape[2] < 3:
+            return None
+        return (
+            video_loss_mask[:, :, 2:, :, :]
+            & video_loss_mask[:, :, 1:-1, :, :]
+            & video_loss_mask[:, :, :-2, :, :]
+        )
+    return None
+
+
 def _compute_motion_preservation_loss(
     args: argparse.Namespace,
     student_video_pred: torch.Tensor,
@@ -691,7 +713,14 @@ def _compute_motion_preservation_loss(
     dtype: torch.dtype,
 ) -> torch.Tensor:
     chunk_frames = int(getattr(args, "motion_preservation_teacher_chunk_frames", 0) or 0)
-    if isinstance(teacher_video_pred, torch.Tensor) and teacher_video_pred.device.type == "cpu" and chunk_frames > 0:
+    second_order_weight = float(getattr(args, "motion_preservation_second_order_weight", 0.0) or 0.0)
+    use_chunked = second_order_weight <= 0.0
+    if (
+        isinstance(teacher_video_pred, torch.Tensor)
+        and teacher_video_pred.device.type == "cpu"
+        and chunk_frames > 0
+        and use_chunked
+    ):
         return _chunked_motion_loss_with_cpu_teacher(
             args,
             student_video_pred,
@@ -700,6 +729,18 @@ def _compute_motion_preservation_loss(
             dtype=dtype,
             chunk_frames=chunk_frames,
         )
+    if (
+        isinstance(teacher_video_pred, torch.Tensor)
+        and teacher_video_pred.device.type == "cpu"
+        and chunk_frames > 0
+        and not use_chunked
+        and not bool(getattr(args, "_motion_second_order_chunk_warned", False))
+    ):
+        logger.info(
+            "motion_preservation_second_order_weight > 0 disables chunked CPU teacher loss path. "
+            "Teacher targets will be moved to GPU for replay loss."
+        )
+        setattr(args, "_motion_second_order_chunk_warned", True)
     if isinstance(teacher_video_pred, torch.Tensor) and teacher_video_pred.device != student_video_pred.device:
         teacher_video_pred = teacher_video_pred.to(device=student_video_pred.device, dtype=dtype, non_blocking=True)
     if (
@@ -711,13 +752,34 @@ def _compute_motion_preservation_loss(
         student_delta = student_video_pred[:, :, 1:, :, :] - student_video_pred[:, :, :-1, :, :]
         teacher_delta = teacher_video_pred[:, :, 1:, :, :] - teacher_video_pred[:, :, :-1, :, :]
         pair_mask = _build_temporal_pair_mask(video_loss_mask)
-        return _masked_mse(
+        first_order_loss = _masked_mse(
             student_delta,
             teacher_delta,
             pair_mask,
             weighting=None,
             dtype=dtype,
         )
+        if second_order_weight > 0.0 and student_video_pred.shape[2] > 2:
+            student_accel = (
+                student_video_pred[:, :, 2:, :, :]
+                - (2.0 * student_video_pred[:, :, 1:-1, :, :])
+                + student_video_pred[:, :, :-2, :, :]
+            )
+            teacher_accel = (
+                teacher_video_pred[:, :, 2:, :, :]
+                - (2.0 * teacher_video_pred[:, :, 1:-1, :, :])
+                + teacher_video_pred[:, :, :-2, :, :]
+            )
+            triplet_mask = _build_temporal_triplet_mask(video_loss_mask)
+            second_order_loss = _masked_mse(
+                student_accel,
+                teacher_accel,
+                triplet_mask,
+                weighting=None,
+                dtype=dtype,
+            )
+            return first_order_loss + float(second_order_weight) * second_order_loss
+        return first_order_loss
     return _masked_mse(
         student_video_pred,
         teacher_video_pred,
@@ -725,6 +787,39 @@ def _compute_motion_preservation_loss(
         weighting=None,
         dtype=dtype,
     )
+
+
+def _compute_motion_sigma_weights(sigmas: list[float], args: argparse.Namespace) -> Optional[list[float]]:
+    if len(sigmas) <= 1:
+        return None
+
+    mode = str(getattr(args, "motion_preservation_sigma_sampling", "uniform") or "uniform").lower()
+    if mode == "uniform":
+        return None
+    if mode != "logsnr":
+        return None
+
+    sigma_tensor = torch.tensor(sigmas, dtype=torch.float32)
+    sigma_tensor = sigma_tensor.clamp(1e-4, 1.0 - 1e-4)
+    logsnr = torch.log(((1.0 - sigma_tensor) ** 2) / (sigma_tensor**2))
+
+    # Favor mid-noise replay points where log-SNR is closer to zero.
+    weights = 1.0 / (1.0 + logsnr.abs())
+    power = float(getattr(args, "motion_preservation_sigma_sampling_power", 1.0) or 1.0)
+    weights = weights.clamp_min(1e-8).pow(power).to(torch.float32)
+    weights = weights / weights.sum().clamp_min(1e-8)
+    return [float(x) for x in weights.tolist()]
+
+
+def _sample_motion_sigma_index(sigmas: list[float], args: argparse.Namespace) -> int:
+    if len(sigmas) <= 1:
+        return 0
+    weights = _compute_motion_sigma_weights(sigmas, args)
+    if not weights:
+        return random.randrange(len(sigmas))
+    weight_tensor = torch.tensor(weights, dtype=torch.float32)
+    idx = int(torch.multinomial(weight_tensor, num_samples=1, replacement=True).item())
+    return idx
 
 
 def _extract_motion_anchor_batch(batch: dict) -> dict:
@@ -1166,20 +1261,30 @@ def _fused_step_pending_grads(
     optimizer: Any,
     accelerator: Accelerator,
     max_grad_norm: float,
-) -> None:
+) -> int:
     """Run one fused-style parameter step for any pending grads.
 
     Used when fused backward hooks defer stepping on the first backward pass
     and no second backward pass happens.
     """
+    params_to_step: list[tuple[torch.Tensor, Any]] = []
     for param_group in optimizer.param_groups:
         for parameter in param_group.get("params", []):
             if parameter is None or parameter.grad is None:
                 continue
-            if accelerator.sync_gradients and max_grad_norm != 0.0:
-                accelerator.clip_grad_norm_(parameter, max_grad_norm)
-            optimizer.step_param(parameter, param_group)
-            parameter.grad = None
+            params_to_step.append((parameter, param_group))
+
+    if not params_to_step:
+        return 0
+
+    if accelerator.sync_gradients and max_grad_norm != 0.0:
+        accelerator.clip_grad_norm_([p for p, _ in params_to_step], max_grad_norm)
+
+    for parameter, param_group in params_to_step:
+        optimizer.step_param(parameter, param_group)
+        parameter.grad = None
+
+    return len(params_to_step)
 
 
 def _build_synthetic_motion_latents(
@@ -1298,7 +1403,12 @@ def _build_motion_anchor_cache(
         )
     anchor_start_time = time.time()
     if replay_sigmas:
-        logger.info("Motion anchor cache will store multi-sigma teacher targets: sigmas=%s", replay_sigmas)
+        logger.info(
+            "Motion anchor cache will store multi-sigma teacher targets: sigmas=%s sampling=%s power=%.3f",
+            replay_sigmas,
+            str(getattr(args, "motion_preservation_sigma_sampling", "uniform")),
+            float(getattr(args, "motion_preservation_sigma_sampling_power", 1.0) or 1.0),
+        )
     pbar_anchor = tqdm(
         total=cache_size,
         desc="prep: motion anchors",
@@ -1385,6 +1495,7 @@ def _build_motion_anchor_cache(
                             max_queries=max_queries,
                             max_keys=max_keys,
                             capture_grad=False,
+                            keep_heads=bool(getattr(args, "motion_attention_preservation_per_head", False)),
                         ) as attn_recorder:
                             teacher_pred, _ = trainer.call_dit(
                                 args,
@@ -1549,7 +1660,65 @@ def _filter_motion_attention_modules_for_swap(
     accelerator: Accelerator,
     blocks_to_swap: int,
 ) -> list[tuple[str, torch.nn.Module]]:
-    return modules
+    if not modules:
+        return modules
+    swap_count = int(blocks_to_swap or 0)
+    if swap_count <= 0:
+        return modules
+
+    # Keep attention-map replay on non-swapped (GPU-resident) blocks when possible.
+    base_model = transformer.model if hasattr(transformer, "model") else transformer
+    transformer_blocks = getattr(base_model, "transformer_blocks", None)
+    if transformer_blocks is None:
+        logger.warning(
+            "motion_attention_preservation: block-swap filtering skipped because transformer_blocks are unavailable."
+        )
+        return modules
+
+    num_blocks = len(transformer_blocks)
+    if num_blocks <= 0:
+        return modules
+
+    swap_start = max(0, num_blocks - swap_count)
+    if swap_start <= 0:
+        logger.info(
+            "motion_attention_preservation: all blocks appear swappable (blocks=%d, blocks_to_swap=%d); "
+            "keeping all attention modules.",
+            num_blocks,
+            swap_count,
+        )
+        return modules
+
+    kept: list[tuple[str, torch.nn.Module]] = []
+    dropped = 0
+    for module_name, module in modules:
+        block_idx = _extract_attn1_block_index(module_name)
+        if block_idx is None or block_idx < swap_start:
+            kept.append((module_name, module))
+        else:
+            dropped += 1
+
+    if not kept:
+        logger.warning(
+            "motion_attention_preservation: block-swap filtering would drop all modules "
+            "(blocks=%d, blocks_to_swap=%d, requested=%d). Keeping original module list.",
+            num_blocks,
+            swap_count,
+            len(modules),
+        )
+        return modules
+
+    logger.info(
+        "motion_attention_preservation: filtered modules for block swap on %s: kept=%d dropped=%d "
+        "(non-swapped blocks: 0-%d, swapped blocks: %d-%d).",
+        str(accelerator.device),
+        len(kept),
+        dropped,
+        max(0, swap_start - 1),
+        swap_start,
+        max(0, num_blocks - 1),
+    )
+    return kept
 
 
 class _AttentionMapRecorder:
@@ -1560,11 +1729,13 @@ class _AttentionMapRecorder:
         max_queries: int,
         max_keys: int,
         capture_grad: bool,
+        keep_heads: bool,
     ) -> None:
         self.modules = modules
         self.max_queries = max(1, int(max_queries))
         self.max_keys = max(1, int(max_keys))
         self.capture_grad = capture_grad
+        self.keep_heads = bool(keep_heads)
         self.maps: dict[str, torch.Tensor] = {}
         self._active_module_names: set[str] = set()
 
@@ -1597,6 +1768,7 @@ class _AttentionMapRecorder:
             setattr(module, "_motion_record_max_queries", int(self.max_queries))
             setattr(module, "_motion_record_max_keys", int(self.max_keys))
             setattr(module, "_motion_record_capture_grad", bool(self.capture_grad))
+            setattr(module, "_motion_record_keep_heads", bool(self.keep_heads))
             setattr(module, "_motion_record_attn_map", None)
             self._active_module_names.add(name)
         return self
@@ -1990,6 +2162,29 @@ def ltx2_finetune_setup_parser(parser: argparse.ArgumentParser) -> argparse.Argu
         help="Upper bound for auto-generated multi-sigma replay schedule.",
     )
     parser.add_argument(
+        "--motion_preservation_sigma_sampling",
+        type=str,
+        default="uniform",
+        choices=["uniform", "logsnr"],
+        help=(
+            "Multi-sigma replay sampling mode. "
+            "uniform = equal probability per cached sigma; "
+            "logsnr = bias toward mid-noise points via log-SNR weighting."
+        ),
+    )
+    parser.add_argument(
+        "--motion_preservation_sigma_sampling_power",
+        type=float,
+        default=1.0,
+        help="Exponent applied to sigma-sampling weights (logsnr mode only).",
+    )
+    parser.add_argument(
+        "--motion_preservation_second_order_weight",
+        type=float,
+        default=0.0,
+        help="Additional weight for second-order temporal replay term (acceleration matching).",
+    )
+    parser.add_argument(
         "--motion_preservation_teacher_chunk_frames",
         type=int,
         default=0,
@@ -2046,6 +2241,24 @@ def ltx2_finetune_setup_parser(parser: argparse.ArgumentParser) -> argparse.Argu
         type=int,
         default=64,
         help="Number of sampled key tokens per attention map.",
+    )
+    parser.add_argument(
+        "--motion_attention_preservation_per_head",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Capture and regularize per-head attention maps (stronger, slower) instead of head-averaged maps.",
+    )
+    parser.add_argument(
+        "--motion_attention_preservation_temperature",
+        type=float,
+        default=1.0,
+        help="Temperature applied to attention distributions before KL/MSE comparison (must be > 0).",
+    )
+    parser.add_argument(
+        "--motion_attention_preservation_symmetric_kl",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="When KL loss is used, optimize symmetric KL instead of one-way KL.",
     )
     parser.add_argument(
         "--motion_attention_preservation_blocks",
@@ -2250,6 +2463,9 @@ def main() -> None:
     if args.motion_preservation and getattr(args, "ltx_mode", "video") != "video":
         logger.warning("motion_preservation is only supported for video mode in full fine-tune. Disabling it.")
         args.motion_preservation = False
+    if bool(getattr(args, "motion_prior_cache_only", False)) and getattr(args, "ltx_mode", "video") != "video":
+        logger.warning("motion_prior_cache_only is only supported for video mode. Disabling cache-only mode.")
+        args.motion_prior_cache_only = False
     if args.motion_preservation and int(args.motion_preservation_interval) <= 0:
         raise ValueError("motion_preservation_interval must be >= 1")
     if args.motion_preservation and args.motion_preservation_probability is not None:
@@ -2293,6 +2509,15 @@ def main() -> None:
             raise ValueError("motion_preservation_sigma_min/max must be in [0, 1]")
         if sigma_max < sigma_min:
             raise ValueError("motion_preservation_sigma_max must be >= motion_preservation_sigma_min")
+        sigma_sampling = str(getattr(args, "motion_preservation_sigma_sampling", "uniform") or "uniform").lower()
+        if sigma_sampling not in {"uniform", "logsnr"}:
+            raise ValueError("motion_preservation_sigma_sampling must be one of: uniform, logsnr")
+        sigma_sampling_power = float(getattr(args, "motion_preservation_sigma_sampling_power", 1.0) or 1.0)
+        if sigma_sampling_power <= 0.0:
+            raise ValueError("motion_preservation_sigma_sampling_power must be > 0")
+        second_order_weight = float(getattr(args, "motion_preservation_second_order_weight", 0.0) or 0.0)
+        if second_order_weight < 0.0:
+            raise ValueError("motion_preservation_second_order_weight must be >= 0")
     if args.motion_preservation and float(args.motion_preservation_multiplier) < 0.0:
         raise ValueError("motion_preservation_multiplier must be >= 0")
     if bool(getattr(args, "motion_preservation_separate_backward", False)) and bool(getattr(args, "fused_backward_pass", False)):
@@ -2313,6 +2538,8 @@ def main() -> None:
         raise ValueError("motion_attention_preservation_queries must be >= 1")
     if args.motion_attention_preservation and int(args.motion_attention_preservation_keys) <= 0:
         raise ValueError("motion_attention_preservation_keys must be >= 1")
+    if args.motion_attention_preservation and float(getattr(args, "motion_attention_preservation_temperature", 1.0) or 1.0) <= 0.0:
+        raise ValueError("motion_attention_preservation_temperature must be > 0")
     if args.motion_attention_preservation and bool(getattr(args, "gradient_checkpointing", False)):
         logger.info(
             "motion_attention_preservation with gradient_checkpointing enabled: "
@@ -2538,11 +2765,15 @@ def main() -> None:
                 args.motion_attention_preservation = False
             else:
                 logger.info(
-                    "Motion attention preservation enabled on %d attn1 modules (queries=%d keys=%d, loss=%s)",
+                    "Motion attention preservation enabled on %d attn1 modules "
+                    "(queries=%d keys=%d, loss=%s, per_head=%s, temp=%.3f, symmetric_kl=%s)",
                     len(motion_attention_modules),
                     int(getattr(args, "motion_attention_preservation_queries", 32) or 32),
                     int(getattr(args, "motion_attention_preservation_keys", 64) or 64),
                     getattr(args, "motion_attention_preservation_loss", "kl"),
+                    str(bool(getattr(args, "motion_attention_preservation_per_head", False))),
+                    float(getattr(args, "motion_attention_preservation_temperature", 1.0) or 1.0),
+                    str(bool(getattr(args, "motion_attention_preservation_symmetric_kl", False))),
                 )
 
         noise_scheduler = FlowMatchDiscreteScheduler(
@@ -2596,6 +2827,44 @@ def main() -> None:
         attn_geometry_lr_scale=float(getattr(args, "attn_geometry_lr_scale", 1.0) or 0.0),
         freeze_attn_geometry=bool(getattr(args, "freeze_attn_geometry", False)),
     )
+    self_flow_projector_param_count = 0
+    if bool(getattr(args, "self_flow", False)):
+        self_flow_args = list(getattr(args, "self_flow_args", None) or [])
+        if not any(str(arg).startswith("offload_teacher_params=") for arg in self_flow_args):
+            self_flow_args.append("offload_teacher_params=true")
+            args.self_flow_args = self_flow_args
+            logger.info(
+                "Self-Flow full-FT: defaulting self_flow_args offload_teacher_params=true "
+                "(override with --self_flow_args offload_teacher_params=false)."
+            )
+
+        trainer._setup_self_flow(args, accelerator, transformer=transformer, network=transformer)
+        self_flow_module = getattr(trainer, "_self_flow", None)
+        if self_flow_module is not None:
+            self_flow_params = [p for p in self_flow_module.get_trainable_params() if p.requires_grad]
+            if self_flow_params:
+                projector_lr = getattr(getattr(self_flow_module, "config", None), "projector_lr", None)
+                effective_projector_lr = float(projector_lr) if projector_lr is not None else float(args.learning_rate)
+                params_to_optimize.append({"params": self_flow_params, "lr": effective_projector_lr})
+                param_names.append([f"self_flow_projector.{idx}" for idx in range(len(self_flow_params))])
+                self_flow_projector_param_count = int(sum(p.numel() for p in self_flow_params))
+                logger.info(
+                    "Self-Flow full-FT: added projector params to optimizer (count=%d tensors=%d lr=%g)",
+                    self_flow_projector_param_count,
+                    len(self_flow_params),
+                    effective_projector_lr,
+                )
+            shadow_params = getattr(self_flow_module, "_shadow_params", {})
+            shadow_bytes = int(
+                sum(int(t.numel()) * int(t.element_size()) for t in shadow_params.values() if isinstance(t, torch.Tensor))
+            )
+            if shadow_bytes > 0:
+                logger.info(
+                    "Self-Flow full-FT teacher EMA shadow size: %.2f GB across %d tensors",
+                    float(shadow_bytes) / (1024.0 ** 3),
+                    len(shadow_params),
+                )
+
     logger.info(
         "Full-FT parameter groups: trainable=%d frozen=%d groups=%d scales=%s",
         ft_group_stats["trainable_param_count"],
@@ -2637,6 +2906,9 @@ def main() -> None:
 
     optimizer, train_dataloader, lr_scheduler = accelerator.prepare(optimizer, train_dataloader, lr_scheduler)
 
+    if getattr(trainer, "_self_flow", None) is not None:
+        trainer._current_call_network = accelerator.unwrap_model(transformer)
+
     # Prepare validation dataloader if exists
     if val_dataloader is not None:
         val_dataloader = accelerator.prepare(val_dataloader)
@@ -2674,10 +2946,28 @@ def main() -> None:
 
     fused_step_state: dict[str, bool] | None = None
     if args.fused_backward_pass:
+        base_optimizer = getattr(optimizer, "optimizer", optimizer)
+        if base_optimizer.__class__.__name__.lower() != "adafactor":
+            raise ValueError(
+                f"--fused_backward_pass requires Adafactor optimizer; got {base_optimizer.__class__.__name__}"
+            )
+
         import musubi_tuner.modules.adafactor_fused as adafactor_fused
 
         adafactor_fused.patch_adafactor_fused(optimizer)
-        fused_step_state = {"defer_step": False, "suspend_step": False}
+        hooks_step_enabled = args.max_grad_norm == 0.0
+        if not hooks_step_enabled:
+            logger.info(
+                "Fused hooks are disabled because max_grad_norm=%.6f. "
+                "Using sync-point fused stepping to preserve global gradient clipping correctness.",
+                float(args.max_grad_norm),
+            )
+        fused_step_state = {
+            "defer_step": False,
+            "suspend_step": False,
+            "hook_stepped": False,
+            "hooks_step_enabled": hooks_step_enabled,
+        }
 
         for param_group, param_name_group in zip(optimizer.param_groups, param_names):
             for parameter, param_name in zip(param_group["params"], param_name_group):
@@ -2685,15 +2975,18 @@ def main() -> None:
 
                     def create_grad_hook(p_name, p_group):
                         def grad_hook(tensor: torch.Tensor):
+                            if fused_step_state is None or not fused_step_state.get("hooks_step_enabled", False):
+                                return
+                            if not accelerator.sync_gradients:
+                                return
                             if fused_step_state is not None and (
                                 fused_step_state.get("defer_step", False)
                                 or fused_step_state.get("suspend_step", False)
                             ):
                                 return
-                            if accelerator.sync_gradients and args.max_grad_norm != 0.0:
-                                accelerator.clip_grad_norm_(tensor, args.max_grad_norm)
                             optimizer.step_param(tensor, p_group)
                             tensor.grad = None
+                            fused_step_state["hook_stepped"] = True
 
                         return grad_hook
 
@@ -2734,6 +3027,10 @@ def main() -> None:
         "ss_timestep_sampling": args.timestep_sampling,
         "ss_sigmoid_scale": args.sigmoid_scale,
         "ss_discrete_flow_shift": args.discrete_flow_shift,
+        "ss_ltx_version": getattr(args, "ltx_version", "2.0"),
+        "ss_shifted_logit_mode": getattr(args, "shifted_logit_mode", None),
+        "ss_shifted_logit_eps": getattr(args, "shifted_logit_eps", 1e-3),
+        "ss_shifted_logit_uniform_prob": getattr(args, "shifted_logit_uniform_prob", 0.1),
         "ss_ltx_mode": args.ltx_mode,
         "ss_split_av_passes": bool(getattr(args, "split_av_passes", False)),
         "ss_video_loss_weight": getattr(args, "video_loss_weight", 1.0),
@@ -2775,6 +3072,9 @@ def main() -> None:
         "ss_motion_preservation_sigma_values": getattr(args, "motion_preservation_sigma_values", None),
         "ss_motion_preservation_sigma_min": getattr(args, "motion_preservation_sigma_min", 0.2),
         "ss_motion_preservation_sigma_max": getattr(args, "motion_preservation_sigma_max", 0.8),
+        "ss_motion_preservation_sigma_sampling": getattr(args, "motion_preservation_sigma_sampling", "uniform"),
+        "ss_motion_preservation_sigma_sampling_power": getattr(args, "motion_preservation_sigma_sampling_power", 1.0),
+        "ss_motion_preservation_second_order_weight": getattr(args, "motion_preservation_second_order_weight", 0.0),
         "ss_motion_preservation_teacher_chunk_frames": getattr(args, "motion_preservation_teacher_chunk_frames", 0),
         "ss_motion_preservation_separate_backward": bool(getattr(args, "motion_preservation_separate_backward", False)),
         "ss_motion_preservation_fused_defer_step": bool(getattr(args, "motion_preservation_fused_defer_step", False)),
@@ -2783,6 +3083,15 @@ def main() -> None:
         "ss_motion_attention_preservation_loss": getattr(args, "motion_attention_preservation_loss", "kl"),
         "ss_motion_attention_preservation_queries": getattr(args, "motion_attention_preservation_queries", 0),
         "ss_motion_attention_preservation_keys": getattr(args, "motion_attention_preservation_keys", 0),
+        "ss_motion_attention_preservation_per_head": bool(
+            getattr(args, "motion_attention_preservation_per_head", False)
+        ),
+        "ss_motion_attention_preservation_temperature": getattr(
+            args, "motion_attention_preservation_temperature", 1.0
+        ),
+        "ss_motion_attention_preservation_symmetric_kl": bool(
+            getattr(args, "motion_attention_preservation_symmetric_kl", False)
+        ),
         "ss_motion_attention_preservation_blocks": getattr(args, "motion_attention_preservation_blocks", None),
         "ss_ewc_lambda": getattr(args, "ewc_lambda", 0.0),
         "ss_ewc_num_batches": getattr(args, "ewc_num_batches", 0),
@@ -2790,6 +3099,9 @@ def main() -> None:
         "ss_ewc_max_param_tensors": getattr(args, "ewc_max_param_tensors", 0),
         "ss_ewc_cache_path": getattr(args, "ewc_cache_path", None),
         "ss_ewc_cache_rebuild": bool(getattr(args, "ewc_cache_rebuild", False)),
+        "ss_self_flow": bool(getattr(args, "self_flow", False)),
+        "ss_self_flow_args": getattr(args, "self_flow_args", None),
+        "ss_self_flow_projector_params": self_flow_projector_param_count,
         "ss_freeze_early_blocks": getattr(args, "freeze_early_blocks", 0),
         "ss_freeze_block_indices": getattr(args, "freeze_block_indices", None),
         "ss_block_lr_scales": getattr(args, "block_lr_scales", None),
@@ -2860,6 +3172,7 @@ def main() -> None:
     epoch_to_start = 0
     global_step = 0
     loss_recorder = train_utils.LossRecorder()
+    self_flow_loss = None
     del train_dataset_group
 
     def save_model(
@@ -2945,6 +3258,8 @@ def main() -> None:
                 _md["loss_attn_pres"] = attn_pres_loss.detach().item()
             if ewc_loss is not None:
                 _md["loss_ewc"] = ewc_loss.detach().item()
+            if self_flow_loss is not None:
+                _md["loss_self_flow"] = self_flow_loss.detach().item()
             train_utils.save_checkpoint_metadata(ckpt_file, _md)
 
     def remove_model(old_ckpt_name: str) -> None:
@@ -3001,6 +3316,32 @@ def main() -> None:
         os.makedirs(os.path.dirname(ema_state_path), exist_ok=True)
         torch.save(ema_model.state_dict(), ema_state_path)
         logger.info("EMA state saved to: %s (step=%d)", ema_state_path, ema_model.step)
+
+    def save_self_flow_state() -> None:
+        """Save Self-Flow projector + teacher EMA state for resume."""
+        if not bool(getattr(args, "self_flow", False)):
+            return
+        module = getattr(trainer, "_self_flow", None)
+        if module is None or not accelerator.is_main_process:
+            return
+        os.makedirs(args.output_dir, exist_ok=True)
+        projector_file = os.path.join(args.output_dir, "self_flow_projector.safetensors")
+        teacher_file = os.path.join(args.output_dir, "self_flow_teacher_ema.safetensors")
+
+        try:
+            proj_sd = module.state_dict()
+            if proj_sd:
+                proj_sd_cpu = {k: v.detach().to(device="cpu") for k, v in proj_sd.items() if isinstance(v, torch.Tensor)}
+                save_file(proj_sd_cpu, projector_file)
+        except Exception as e:
+            logger.warning("Failed to save Self-Flow projector state: %s", e)
+
+        try:
+            teacher_sd = module.teacher_state_dict()
+            if teacher_sd:
+                save_file(teacher_sd, teacher_file)
+        except Exception as e:
+            logger.warning("Failed to save Self-Flow teacher EMA state: %s", e)
 
     def run_validation(step: int, epoch: int) -> dict:
         """Run validation and return metrics."""
@@ -3222,11 +3563,15 @@ def main() -> None:
             args.motion_attention_preservation = False
         else:
             logger.info(
-                "Motion attention preservation enabled on %d attn1 modules (queries=%d keys=%d, loss=%s)",
+                "Motion attention preservation enabled on %d attn1 modules "
+                "(queries=%d keys=%d, loss=%s, per_head=%s, temp=%.3f, symmetric_kl=%s)",
                 len(motion_attention_modules),
                 int(getattr(args, "motion_attention_preservation_queries", 32) or 32),
                 int(getattr(args, "motion_attention_preservation_keys", 64) or 64),
                 getattr(args, "motion_attention_preservation_loss", "kl"),
+                str(bool(getattr(args, "motion_attention_preservation_per_head", False))),
+                float(getattr(args, "motion_attention_preservation_temperature", 1.0) or 1.0),
+                str(bool(getattr(args, "motion_attention_preservation_symmetric_kl", False))),
             )
     metadata["ss_motion_attention_preservation_active"] = str(bool(args.motion_attention_preservation))
     metadata["ss_motion_attention_preservation_module_count"] = str(len(motion_attention_modules))
@@ -3404,6 +3749,24 @@ def main() -> None:
                         loss = loss * w
                     loss = loss.mean()
 
+                self_flow_loss = None
+                self_flow_metrics: dict[str, float] = {}
+                if bool(getattr(args, "self_flow", False)):
+                    try:
+                        self_flow_loss, self_flow_metrics = trainer.compute_self_flow_addition(
+                            args,
+                            accelerator,
+                            transformer,
+                            transformer,
+                            trainer.dit_dtype,
+                        )
+                        if self_flow_loss is not None:
+                            loss = loss + self_flow_loss
+                    except Exception as e:
+                        if getattr(trainer, "_self_flow", None) is not None:
+                            trainer._self_flow.cleanup_step()
+                        logger.warning("Self-Flow loss computation failed at step=%s: %s", global_step, e)
+
                 motion_pres_loss = None
                 motion_pres_loss_raw = None
                 attn_pres_loss = None
@@ -3442,6 +3805,7 @@ def main() -> None:
                 )
                 if fused_step_state is not None:
                     fused_step_state["defer_step"] = fused_defer_motion_step
+                    fused_step_state["hook_stepped"] = False
                 if separate_motion_backward:
                     # Backprop task loss first so replay graph does not overlap it in memory.
                     accelerator.backward(loss)
@@ -3468,7 +3832,7 @@ def main() -> None:
                         and len(anchor_sigmas) > 0
                         and len(anchor_sigmas) == len(teacher_video_preds)
                     ):
-                        sigma_idx = random.randrange(len(anchor_sigmas))
+                        sigma_idx = _sample_motion_sigma_index(anchor_sigmas, args)
                         sigma_value = float(anchor_sigmas[sigma_idx])
                         replay_sigma_value = float(sigma_value)
                         anchor_noisy_input, anchor_model_timesteps = _build_noisy_input_for_sigma(
@@ -3500,6 +3864,7 @@ def main() -> None:
                                 max_queries=int(getattr(args, "motion_attention_preservation_queries", 32) or 32),
                                 max_keys=int(getattr(args, "motion_attention_preservation_keys", 64) or 64),
                                 capture_grad=True,
+                                keep_heads=bool(getattr(args, "motion_attention_preservation_per_head", False)),
                             )
                             attn_recorder.__enter__()
                             pending_attn_recorder = attn_recorder
@@ -3564,6 +3929,12 @@ def main() -> None:
                             and isinstance(teacher_attn_maps, dict)
                             and student_attn_maps
                         ):
+                            attn_temperature = float(
+                                getattr(args, "motion_attention_preservation_temperature", 1.0) or 1.0
+                            )
+                            symmetric_kl = bool(
+                                getattr(args, "motion_attention_preservation_symmetric_kl", False)
+                            )
                             per_block_losses: list[torch.Tensor] = []
                             for module_name, student_map in student_attn_maps.items():
                                 teacher_map = teacher_attn_maps.get(module_name)
@@ -3576,17 +3947,30 @@ def main() -> None:
                                 teacher_dist = teacher_map.to(
                                     device=student_dist.device, dtype=torch.float32, non_blocking=True
                                 )
+                                if attn_temperature != 1.0:
+                                    inv_temp = 1.0 / max(1e-6, attn_temperature)
+                                    student_dist = student_dist.clamp_min(1e-8).pow(inv_temp)
+                                    teacher_dist = teacher_dist.clamp_min(1e-8).pow(inv_temp)
                                 student_dist = student_dist.clamp_min(1e-6)
                                 teacher_dist = teacher_dist.clamp_min(1e-6)
                                 student_dist = student_dist / student_dist.sum(dim=-1, keepdim=True).clamp_min(1e-6)
                                 teacher_dist = teacher_dist / teacher_dist.sum(dim=-1, keepdim=True).clamp_min(1e-6)
 
                                 if getattr(args, "motion_attention_preservation_loss", "kl") == "kl":
-                                    block_loss = torch.nn.functional.kl_div(
+                                    kl_t2s = torch.nn.functional.kl_div(
                                         student_dist.log(),
                                         teacher_dist,
                                         reduction="batchmean",
                                     )
+                                    if symmetric_kl:
+                                        kl_s2t = torch.nn.functional.kl_div(
+                                            teacher_dist.log(),
+                                            student_dist,
+                                            reduction="batchmean",
+                                        )
+                                        block_loss = 0.5 * (kl_t2s + kl_s2t)
+                                    else:
+                                        block_loss = kl_t2s
                                 else:
                                     block_loss = torch.nn.functional.mse_loss(student_dist, teacher_dist)
                                 per_block_losses.append(block_loss)
@@ -3614,7 +3998,6 @@ def main() -> None:
                     elif fused_defer_motion_step:
                         if fused_step_state is not None:
                             fused_step_state["defer_step"] = False
-                        _fused_step_pending_grads(optimizer, accelerator, args.max_grad_norm)
                     loss_for_step = total_loss_for_logging
                 else:
                     if motion_total_loss is not None:
@@ -3624,14 +4007,32 @@ def main() -> None:
                 if pending_attn_recorder is not None:
                     pending_attn_recorder.__exit__(None, None, None)
                     pending_attn_recorder = None
+                did_optimizer_step = False
                 if not args.fused_backward_pass:
                     if accelerator.sync_gradients and args.max_grad_norm != 0.0:
                         accelerator.clip_grad_norm_(transformer.parameters(), args.max_grad_norm)
                     optimizer.step()
+                    did_optimizer_step = bool(accelerator.sync_gradients)
                     lr_scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
                 else:
-                    lr_scheduler.step()
+                    did_fused_step = False
+                    if accelerator.sync_gradients:
+                        if fused_step_state is not None:
+                            fused_step_state["defer_step"] = False
+                        hook_stepped = bool(fused_step_state is not None and fused_step_state.get("hook_stepped", False))
+                        pending_steps = _fused_step_pending_grads(optimizer, accelerator, args.max_grad_norm)
+                        did_fused_step = hook_stepped or pending_steps > 0
+                        optimizer.zero_grad(set_to_none=True)
+                    if did_fused_step:
+                        lr_scheduler.step()
+                    did_optimizer_step = did_fused_step
+
+                if did_optimizer_step and getattr(trainer, "_self_flow", None) is not None:
+                    try:
+                        trainer._self_flow.update_teacher(accelerator.unwrap_model(transformer))
+                    except Exception as e:
+                        logger.warning("Self-Flow teacher update failed at step=%s: %s", global_step, e)
 
             if accelerator.sync_gradients:
                 progress_bar.update(1)
@@ -3663,6 +4064,10 @@ def main() -> None:
                 if motion_pres_loss is not None:
                     logs["motion_pres"] = motion_pres_loss.detach().item()
                     logs["motion/pres_weighted"] = motion_pres_loss.detach().item()
+                if self_flow_loss is not None:
+                    logs["self_flow"] = self_flow_loss.detach().item()
+                if self_flow_metrics:
+                    logs.update(self_flow_metrics)
                 if motion_pres_loss_raw is not None:
                     logs["motion/pres_raw"] = motion_pres_loss_raw.detach().item()
                 if attn_pres_loss is not None:
@@ -3692,6 +4097,9 @@ def main() -> None:
                     has_effective_reg = True
                 if ewc_loss is not None:
                     effective_reg_value += float(ewc_loss.detach().item())
+                    has_effective_reg = True
+                if self_flow_loss is not None:
+                    effective_reg_value += float(self_flow_loss.detach().item())
                     has_effective_reg = True
                 if has_effective_reg:
                     logs["motion/effective_regularization"] = effective_reg_value
@@ -3731,6 +4139,7 @@ def main() -> None:
                         )
                         if ema_model is not None:
                             save_ema_model(ckpt_name, global_step, epoch + 1)
+                    save_self_flow_state()
                     remove_step_no = train_utils.get_remove_step_no(args, global_step)
                     if remove_step_no is not None:
                         remove_model(train_utils.get_step_ckpt_name(args.output_name, remove_step_no))
@@ -3741,6 +4150,7 @@ def main() -> None:
                     if args.save_state:
                         train_utils.save_and_remove_state_stepwise(args, accelerator, global_step)
                         save_ema_state()
+                        save_self_flow_state()
                     clean_memory_on_device(accelerator.device)
 
                 if should_sample_images(args, global_step, epoch=None):
@@ -3771,12 +4181,14 @@ def main() -> None:
                 # Also save EMA if enabled
                 if ema_model is not None:
                     save_ema_model(ckpt_name, global_step, epoch + 1)
+            save_self_flow_state()
             remove_epoch_no = train_utils.get_remove_epoch_no(args, epoch + 1)
             if remove_epoch_no is not None:
                 remove_model(train_utils.get_epoch_ckpt_name(args.output_name, remove_epoch_no))
             if args.save_state:
                 train_utils.save_and_remove_state_on_epoch_end(args, accelerator, epoch + 1)
                 save_ema_state()
+                save_self_flow_state()
             clean_memory_on_device(accelerator.device)
 
         if should_sample_images(args, global_step, epoch=epoch + 1):
@@ -3796,6 +4208,7 @@ def main() -> None:
     if accelerator.is_main_process and (args.save_state or args.save_state_on_train_end):
         train_utils.save_state_on_train_end(args, accelerator)
         save_ema_state()
+        save_self_flow_state()
 
     # Save final model
     final_ckpt_name = f"{args.output_name}.safetensors"
@@ -3815,6 +4228,7 @@ def main() -> None:
         # Also save EMA if enabled
         if ema_model is not None:
             save_ema_model(final_ckpt_name, global_step, num_train_epochs)
+    save_self_flow_state()
 
     if accelerator.is_main_process:
         accelerator.end_training()

@@ -1,8 +1,18 @@
-# LTX-2
+# LTX-2 / LTX-2.3
 
 > [!WARNING]
-> LTX-2 support is work in progress and may be incomplete or unstable.
-> Development is tracked in [this issue](https://github.com/AkaneTendo25/musubi-tuner/issues/1).
+> LTX-2.3 support is work in progress and may be incomplete or unstable.
+
+### Supported Model Versions
+
+| Version | Parameters | Key Differences |
+|---------|-----------|-----------------|
+| LTX-2 (19B) | 19B | Single `aggregate_embed`, caption projection inside transformer |
+| LTX-2.3 (22B) | 22B | Dual `video_aggregate_embed`/`audio_aggregate_embed`, caption projection moved to feature extractor (`caption_proj_before_connector`), cross-attention AdaLN (`prompt_adaln`), separate audio connector dimensions, BigVGAN v2 vocoder with bandwidth extension |
+
+Version choice for training is controlled by `--ltx_version` (default: `2.0`) in `ltx2_train_network.py`. The trainer auto-detects the checkpoint version from metadata and warns on mismatch.
+
+Caching scripts (`ltx2_cache_latents.py`, `ltx2_cache_text_encoder_outputs.py`) do not use `--ltx_version`; they work with both LTX-2 and LTX-2.3 checkpoints directly via `--ltx2_checkpoint`.
 
 ---
 
@@ -10,6 +20,7 @@
 
 - [Installation](#installation)
   - [CUDA Version](#cuda-version)
+  - [Downloading Required Models](#downloading-required-models)
 - [Supported Dataset Types](#supported-dataset-types)
 - [1. Caching Latents](#1-caching-latents)
   - [Latent Caching Command](#latent-caching-command)
@@ -21,6 +32,7 @@
   - [Text Encoder Output Files](#text-encoder-output-files)
   - [Loading Gemma from a Single Safetensors File](#loading-gemma-from-a-single-safetensors-file)
 - [3. Training](#3-training)
+  - [Choosing Model Version for Training (2.0 vs 2.3)](#choosing-model-version-for-training-20-vs-23)
   - [Source-Free Training from Cache](#optional-source-free-training-from-cache)
   - [Standard LoRA Training](#standard-lora-training)
   - [Advanced: LyCORIS/LoKR Training](#advanced-lycorislokr-training)
@@ -30,6 +42,7 @@
       - [Other Memory Options](#other-memory-options)
     - [Aggressive VRAM Optimization (8-16GB GPUs)](#aggressive-vram-optimization-8-16gb-gpus)
     - [NF4 Quantization](#nf4-quantization)
+    - [Model Version](#model-version)
     - [Audio-Video Support](#audio-video-support)
     - [Loss Weighting](#loss-weighting)
     - [Additional Audio Training Flags](#additional-audio-training-flags)
@@ -37,6 +50,7 @@
     - [Preservation & Regularization](#preservation--regularization)
     - [CREPA (Cross-frame Representation Alignment)](#crepa-cross-frame-representation-alignment)
       - [Caching DINOv2 Features (Dino Mode)](#caching-dinov2-features-dino-mode)
+    - [Self-Flow (Self-Supervised Flow Matching)](#self-flow-self-supervised-flow-matching)
     - [Timestep Sampling](#timestep-sampling)
     - [LoRA Targets](#lora-targets)
     - [IC-LoRA / Video-to-Video Training](#ic-lora--video-to-video-training)
@@ -81,6 +95,20 @@ pip install torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0 --index-url https
 ```
 
 Always match the CUDA version to your GPU architecture — check [PyTorch's compatibility matrix](https://pytorch.org/get-started/locally/) for the latest supported versions.
+
+### Downloading Required Models
+
+The trainer does not download models automatically. You must manually download the following files before caching or training.
+
+**LTX-2 Checkpoint** — use as `--ltx2_checkpoint`:
+- LTX-2 (19B): [ltx-2-19b-dev.safetensors](https://huggingface.co/Lightricks/LTX-2/resolve/main/ltx-2-19b-dev.safetensors)
+- LTX-2.3 (22B): [ltx-2.3-22b-dev.safetensors](https://huggingface.co/Lightricks/LTX-2.3/resolve/main/ltx-2.3-22b-dev.safetensors)
+
+**Gemma Text Encoder** — pick one:
+- HF directory (`--gemma_root`): [gemma-3-12b-it-qat-q4_0-unquantized](https://huggingface.co/Lightricks/gemma-3-12b-it-qat-q4_0-unquantized)
+- Single file (`--gemma_safetensors`): [gemma_3_12B_it_fp8_e4m3fn.safetensors](https://huggingface.co/GitMylo/LTX-2-comfy_gemma_fp8_e4m3fn/resolve/main/gemma_3_12B_it_fp8_e4m3fn.safetensors)
+
+Other Gemma 3 12B variants may work but not all have been tested.
 
 ---
 
@@ -231,6 +259,36 @@ Launch the training loop using `accelerate`.
 
 **Script:** `ltx2_train_network.py`
 
+### Choosing Model Version for Training (2.0 vs 2.3)
+
+Use this rule:
+
+| Checkpoint you train on | Required training flags |
+|---|---|
+| LTX-2 (19B) checkpoint | `--ltx_version 2.0` |
+| LTX-2.3 (22B) checkpoint | `--ltx_version 2.3` |
+
+Recommended practice:
+- Always set `--ltx_version` explicitly in training commands (do not rely on the default).
+- On first run, set `--ltx_version_check_mode error` to fail fast if the selected version does not match checkpoint metadata.
+- After validation, you can switch to `--ltx_version_check_mode warn`.
+- For LTX-2.3, current upstream recommendation is to train from the BF16 checkpoint. FP8-checkpoint training recipes are currently community-contributed/experimental.
+
+When changing checkpoints (important):
+- If you change `--ltx2_checkpoint` (e.g., LTX-2 -> LTX-2.3, or different 2.3 variant), re-run **both** caches:
+  - `ltx2_cache_latents.py`
+  - `ltx2_cache_text_encoder_outputs.py`
+- Do not reuse old `*_ltx2_te.safetensors` from a different checkpoint. For LTX-2.3 audio/av training this can cause context/mask shape mismatches (for example FlashAttention varlen mask-length errors).
+- If you use `--dataset_manifest`, regenerate it from the recache step so training points to the new cache files.
+- If your selected checkpoint is already FP8-quantized (for example `*fp8*.safetensors`), still keep `--fp8_base` during training (usually with `--mixed_precision bf16`), but do not add `--fp8_scaled`.
+
+Example (LTX-2.3 training):
+```bash
+--ltx2_checkpoint /path/to/ltx-2.3.safetensors ^
+--ltx_version 2.3 ^
+--ltx_version_check_mode error
+```
+
 ### Optional: Source-Free Training from Cache
 If you cached with `--save_dataset_manifest`, you can train without source dataset paths:
 
@@ -250,7 +308,9 @@ accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 ltx2_tr
   --gemma_load_in_8bit ^
   --gemma_root /path/to/gemma ^
   --separate_audio_buckets ^
-  --ltx2_checkpoint /path/to/ltx-2.safetensors ^
+  --ltx2_checkpoint /path/to/ltx-2.3.safetensors ^
+  --ltx_version 2.3 ^
+  --ltx_version_check_mode error ^
   --ltx2_mode av ^
   --fp8_base ^
   --fp8_scaled ^
@@ -273,8 +333,14 @@ accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 ltx2_tr
   --sample_vae_temporal_tile_overlap 8 ^
   --sample_merge_audio ^
   --output_dir output ^
-  --output_name ltx2_lora
+  --output_name ltx23_lora
 ```
+
+If the selected checkpoint is already FP8 (`*fp8*.safetensors`), keep `--fp8_base` but remove `--fp8_scaled`.
+
+For LTX-2 checkpoints, replace:
+- `--ltx2_checkpoint /path/to/ltx-2.3.safetensors` -> `--ltx2_checkpoint /path/to/ltx-2.safetensors`
+- `--ltx_version 2.3` -> `--ltx_version 2.0`
 
 ### Advanced: LyCORIS/LoKR Training
 
@@ -333,7 +399,7 @@ accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 ltx2_tr
 
 ##### Quantization Options
 
-| Method | VRAM (19B model) | Weight Error (MAE) | SNR | Cosine Similarity |
+| Method | VRAM (19B, LTX-2) | Weight Error (MAE) | SNR | Cosine Similarity |
 |--------|------------------|--------------------|-----|-------------------|
 | BF16 (baseline) | ~38 GB | 0.0011 | 55.6 dB | 0.999999 |
 | `--fp8_base --fp8_scaled` | ~19 GB | 0.0171 (15x BF16) | 32.0 dB | 0.999686 |
@@ -344,7 +410,8 @@ accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 ltx2_tr
 
 NF4 has ~4x higher weight error than FP8 (cosine 0.996 vs 0.9997). The base model is frozen during LoRA training, so the quantization error is constant rather than accumulating. LoftQ initializes LoRA weights from the quantization residual via SVD.
 
-- `--fp8_base`, `--fp8_scaled`: FP8 quantization (~19 GB VRAM).
+- `--fp8_base`: keep base model weights in FP8 path (~19 GB VRAM).
+- `--fp8_scaled`: quantize non-FP8 (fp16/bf16/fp32) checkpoints to FP8. Do not use this with already-FP8 checkpoints.
 - `--nf4_base`: NF4 4-bit quantization (~10 GB VRAM). Mutually exclusive with `--fp8_base`. See [NF4 Quantization](#nf4-quantization) below.
 - `--quantize_device cpu|cuda|gpu`: Device for NF4/FP8 quantization at startup (default: `cuda`). `cpu` loads and quantizes weights on CPU, then moves to GPU. `cuda` loads and quantizes directly on GPU. Overrides `LTX2_NF4_CALC_DEVICE` / `LTX2_FP8_CALC_DEVICE` env vars.
 
@@ -361,6 +428,9 @@ NF4 has ~4x higher weight error than FP8 (cosine 0.996 vs 0.9997). The base mode
 | `--split_attn_target` | `none`, `all`, `self`, `cross`, `text_cross`, `av_cross`, `video`, `audio` — split attention target modules |
 | `--split_attn_mode` | `batch` or `query` — split by batch dimension or query length |
 | `--split_attn_chunk_size N` | Chunk size for query-based split attention (0 = default 1024) |
+| `--sdpa` | Use PyTorch scaled dot-product attention (recommended default) |
+| `--flash_attn` | Use FlashAttention 2 (requires `flash-attn` package built for your CUDA + PyTorch) |
+| `--flash3` | Use FlashAttention 3 (requires `flash-attn` v3 with Hopper+ GPU) |
 
 #### Aggressive VRAM Optimization (8-16GB GPUs)
 
@@ -392,7 +462,7 @@ accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 ltx2_tr
 ```
 
 **Tips for low-VRAM training:**
-- Use `--fp8_base --fp8_scaled`
+- Use `--fp8_base --fp8_scaled` for non-FP8 checkpoints; use `--fp8_base` only for already-FP8 checkpoints
 - Use `--blocks_to_swap 47` (keeps only 1 block on GPU)
 - Use smaller LoRA rank (`--network_dim 16` instead of 32)
 - Use smaller training resolutions (e.g., 512x320)
@@ -437,12 +507,54 @@ accelerate launch ... ltx2_train_network.py ^
 | `--awq_num_batches` | 8 | Number of synthetic calibration batches for AWQ |
 | `--quantize_device` | `cuda` | Device for quantization math (`cpu`, `cuda`, `gpu`) |
 
+**Pre-quantized models (recommended):**
+
+By default, NF4 quantization runs from scratch on every startup. `ltx2_quantize_model.py` quantizes once and saves the result (~42% of the original file size). The training/inference code auto-detects pre-quantized checkpoints via safetensors metadata and skips re-quantization.
+
+```bash
+python src/musubi_tuner/ltx2_quantize_model.py ^
+  --input_model path/to/ltx-2.3-22b-dev.safetensors ^
+  --output_model path/to/ltx-2.3-22b-dev-nf4.safetensors ^
+  --loftq_init --network_dim 32
+```
+
+Output files (kept in the same directory):
+- `*-nf4.safetensors` — quantized model (transformer in NF4, VAE and other components unchanged)
+- `*-nf4.loftq_r32.safetensors` — pre-computed LoftQ init for rank 32 (only with `--loftq_init`)
+
+Then use it exactly like the original checkpoint — just point `--ltx2_checkpoint` at the NF4 file. `--nf4_base` is still required (enables the runtime dequantization patch):
+
+```bash
+accelerate launch ... ltx2_train_network.py ^
+  --ltx2_checkpoint path/to/ltx-2.3-22b-dev-nf4.safetensors ^
+  --nf4_base --loftq_init --network_dim 32 ^
+  ...
+```
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--input_model` | required | Path to original `.safetensors` checkpoint |
+| `--output_model` | required | Path for quantized output |
+| `--nf4_block_size` | 32 | Elements per quantization block |
+| `--calc_device` | `cuda` if available | Device for quantization computation |
+| `--loftq_init` | off | Pre-compute LoftQ initialization (requires `--network_dim`) |
+| `--loftq_iters` | 2 | Number of LoftQ alternating iterations |
+| `--network_dim` | 0 | LoRA rank for LoftQ (must match training `--network_dim`) |
+
+- LoftQ is rank-specific: changing `--network_dim` requires re-running the quantize script with the new rank. The quantized model itself does not need to be regenerated.
+- `--awq_calibration` is incompatible with pre-quantized models (requires full-precision weights).
+- The quantized output is bit-for-bit identical to dynamic quantization on the same device.
+
 **Notes:**
 - `--nf4_base` and `--fp8_base` are mutually exclusive.
 - `--loftq_init` requires `--nf4_base`.
 - `--awq_calibration` is experimental. Adds a per-layer division during forward passes. In synthetic tests, reduces activation-weighted error by ~3-5%; effect on real training quality has not been validated.
 - Compatible with `--blocks_to_swap`, `--gradient_checkpointing`, and other training options. NF4 reduces block swap transfer size (4-bit vs 16-bit per weight).
 - Quantization targets transformer block weights only. Embedding layers, norms, and projection layers remain in full precision.
+
+#### Model Version
+- `--ltx_version 2.0|2.3`: Select target model version (default: `2.0`). Controls default behavior for version-dependent settings (e.g., `--shifted_logit_mode` defaults to `legacy` for 2.0, `stretched` for 2.3). For LTX-2.3 checkpoints, set `--ltx_version 2.3` explicitly.
+- `--ltx_version_check_mode off|warn|error`: How to handle mismatch between `--ltx_version` and checkpoint metadata (default: `warn`). The trainer reads checkpoint config keys (`cross_attention_adaln`, `caption_proj_before_connector`, `bwe` vocoder) to detect the actual version.
 
 #### Audio-Video Support
 - `--ltx2_mode`, `--ltx_mode`: Training modality selector. Default is `v` (`video`). Values: `video`, `av`, `audio` (aliases: `v`, `va`, `a`).
@@ -453,7 +565,29 @@ accelerate launch ... ltx2_train_network.py ^
 - `--min_audio_batches_per_accum`: Minimum number of audio-bearing microbatches per gradient accumulation window.
 - `--audio_batch_probability`: Probability of selecting an audio-bearing batch when both audio and non-audio batches are available.
   - `--min_audio_batches_per_accum` and `--audio_batch_probability` are mutually exclusive.
-- `--caption_dropout_rate`: Probability of dropping text conditioning for a sample during training.
+- `--caption_dropout_rate`: Probability of dropping text conditioning for a sample during training (default: `0.0`, disabled). When triggered, the sample's text embeddings are zeroed out and the attention mask is cleared, training the model to generate without text guidance. This enables classifier-free guidance (CFG) at inference — without it, the model has no unconditional baseline to contrast against.
+
+#### Loss Function Type
+
+`--loss_type` selects the element-wise loss function used for both video and audio branches. Default is `mse`.
+
+| `--loss_type` | PyTorch function | Per-element formula |
+|---|---|---|
+| `mse` (default) | `F.mse_loss` | `(pred - tgt)²` |
+| `mae` / `l1` | `F.l1_loss` | `\|pred - tgt\|` |
+| `huber` / `smooth_l1` | `F.smooth_l1_loss` | `0.5·(pred-tgt)²/δ` when `\|pred-tgt\| < δ`, else `\|pred-tgt\| - 0.5·δ` |
+
+- `--huber_delta` (float, default: 1.0): Transition point for Huber loss. Only used when `--loss_type` is `huber` or `smooth_l1`. Smaller values make the loss behave more like L1; larger values more like MSE.
+
+All other training mechanics (weighting scheme, masking, audio balancing) apply on top of the chosen loss unchanged.
+
+```bash
+# L1 loss
+--loss_type mae
+
+# Huber with tighter quadratic region
+--loss_type huber --huber_delta 0.1
+```
 
 #### Loss Weighting
 - `--video_loss_weight`: Weight for video loss (default: 1.0).
@@ -654,11 +788,62 @@ python ltx2_train_network.py ... ^
 ```
 The cache file is saved to `<cache_directory>/ltx2_preservation_cache.pt` by default (same directory as your dataset cache). Use `--preservation_prompts_cache <path>` to override the location in either command. Prior divergence does not need precaching (it uses the training batch's own embeddings).
 
+#### Self-Flow (Self-Supervised Flow Matching)
+
+**Self-Flow** — Self-supervised regularization with dual-timestep noising, EMA teacher feature alignment, and a small projector MLP. Based on [arXiv 2603.06507](https://arxiv.org/abs/2603.06507).
+
+Enable with `--self_flow`. All parameters are passed via `--self_flow_args` as `key=value` pairs:
+
+```bash
+accelerate launch ... ltx2_train_network.py ^
+  --self_flow ^
+  --self_flow_args student_block_idx=16 teacher_block_idx=32 lambda_self_flow=0.1 mask_ratio=0.1 teacher_momentum=0.9999 dual_timestep=true tokenwise_timestep=true offload_teacher_features=true
+```
+
+##### CLI Flags
+
+| Flag | Type | Description |
+|------|------|-------------|
+| `--self_flow` | store_true | Enable Self-Flow regularization |
+| `--self_flow_args` | key=value list | Configuration parameters (see table below) |
+
+##### Self-Flow Parameters (`--self_flow_args`)
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `student_block_idx` | `16` | Student feature block index (0-based) |
+| `teacher_block_idx` | `32` | Teacher feature block index (must be `> student_block_idx`) |
+| `student_block_ratio` | `None` | Optional ratio-based student layer selection. When set, resolves to `floor(ratio * depth)` |
+| `teacher_block_ratio` | `None` | Optional ratio-based teacher layer selection. When set, resolves to `ceil(ratio * depth)` |
+| `lambda_self_flow` | `0.1` | Loss weight for the Self-Flow representation term |
+| `mask_ratio` | `0.10` | Token mask ratio for dual-timestep mixing. Valid range: `[0.0, 0.5]` |
+| `teacher_momentum` | `0.999` | EMA momentum for teacher updates. Valid range: `[0.0, 1.0)` |
+| `teacher_update_interval` | `1` | Update EMA teacher every N optimizer steps |
+| `projector_hidden_multiplier` | `1` | Projector hidden width multiplier vs model inner dim |
+| `projector_lr` | `None` | Optional projector-specific learning rate. Defaults to `--learning_rate` when unset |
+| `loss_type` | `negative_cosine` | `negative_cosine` or `one_minus_cosine` |
+| `dual_timestep` | `true` | Enable dual-timestep noising |
+| `tokenwise_timestep` | `true` | Use per-token timesteps (otherwise per-sample averaged timestep) |
+| `offload_teacher_features` | `false` | Offload cached teacher features to CPU to reduce VRAM |
+
+##### Notes
+
+- Supported mode: `--ltx2_mode video` only.
+- Cost: one extra teacher forward pass per train step.
+- State files (Accelerate `*-state` folder): `self_flow_projector.safetensors`, `self_flow_teacher_ema.safetensors`.
+- Resume: both state files are loaded automatically when present.
+- Logged metrics: `loss/self_flow`, `self_flow/cosine`, `self_flow/masked_token_ratio`, `self_flow/tau_mean`, `self_flow/tau_min_mean`.
+
 #### Timestep Sampling
 - `--timestep_sampling shifted_logit_normal`: Default LTX-2 method. Uses a shifted logit-normal distribution where the shift is computed based on sequence length (frames × height × width).
 - `--timestep_sampling uniform`: Uniform sampling from [0, 1].
 - `--logit_std`: Standard deviation for the logit-normal distribution (default: 1.0). Only used with `shifted_logit_normal`.
 - `--min_timestep` / `--max_timestep`: Optional timestep range constraints.
+- `--shifted_logit_mode legacy|stretched`: Sigma sampler variant (default: auto by `--ltx_version`; 2.0→`legacy`, 2.3→`stretched`).
+  - `legacy`: `sigmoid(N(shift, std))`. Original behavior.
+  - `stretched`: Normalizes samples between the 0.5th and 99.9th percentiles of the distribution, reflects values below `eps` for numerical stability, and replaces a fraction of samples with uniform draws to prevent distribution collapse at high token counts.
+- `--shifted_logit_eps`: Reflection floor and uniform lower bound for `stretched` mode (default: `1e-3`).
+- `--shifted_logit_uniform_prob`: Fraction of samples replaced with uniform `[eps, 1]` draws (default: `0.1`).
 
 > [!NOTE]
 > The `shifted_logit_normal` shift is linearly interpolated from 0.95 (at 1024 tokens) to 2.05 (at 4096 tokens) based on sequence length.
@@ -681,6 +866,7 @@ To use custom layer patterns instead of a preset, use `--network_args`:
 --network_args "include_patterns=['.*\.to_k$','.*\.to_q$','.*\.to_v$','.*\.to_out\.0$','.*\.ff\.net\.0\.proj$','.*\.ff\.net\.2$']"
 ```
 Custom `include_patterns` override any preset.
+When `include_patterns` is set (either explicitly or via a preset), only modules matching at least one pattern are targeted (strict whitelist behavior). Use `--lora_target_preset full` to target all linear layers.
 
 #### IC-LoRA / Video-to-Video Training
 
@@ -1146,13 +1332,18 @@ reference_cache_directory/                  # IC-LoRA only
 | Error | Cause | Solution |
 |-------|-------|----------|
 | Missing cache keys during training | Caching incomplete | Run both `ltx2_cache_latents.py` and `ltx2_cache_text_encoder_outputs.py` |
+| FlashAttention varlen mask-length mismatch (for example `expects mask length 1920, got 1024`) after checkpoint switch | Stale text cache from a different checkpoint/version/mode | Re-run `ltx2_cache_text_encoder_outputs.py` with the same `--ltx2_checkpoint` and `--ltx2_mode` as training. Remove old `*_ltx2_te.safetensors` if needed. |
+| Samples become progressively noisier/degraded when training with `--flash_attn` | FlashAttention install/runtime mismatch (CUDA/PyTorch/flash-attn build) | Switch to `--sdpa` to confirm baseline stability. If SDPA is stable, reinstall FlashAttention for your exact CUDA + PyTorch versions and retry. |
+| Training fails after changing `--ltx2_checkpoint` even though args look correct | Reused latent/text caches generated from a different checkpoint | Re-run both caches (`ltx2_cache_latents.py` and `ltx2_cache_text_encoder_outputs.py`) and regenerate `--dataset_manifest` before training. |
+| OOM appears after removing `--fp8_base` while using an FP8 checkpoint | Base model no longer uses FP8 loading path, so VRAM increases sharply | Keep `--fp8_base` enabled for FP8 checkpoints (typically with `--mixed_precision bf16`) |
+| Error when combining `--fp8_scaled` with an FP8 checkpoint | `--fp8_scaled` is for quantizing non-FP8 checkpoints | Remove `--fp8_scaled`; keep `--fp8_base` |
 | Missing `*_ltx2_audio.safetensors` | Audio caching skipped | Re-run latent caching with `--ltx2_mode av` |
 | Gemma connector weights missing | Incorrect checkpoint | Ensure `--ltx2_checkpoint` (or `--ltx2_text_encoder_checkpoint`) contains Gemma connector weights |
 | Gemma OOM | Model too large | Use `--gemma_load_in_8bit` or `--gemma_load_in_4bit` with `--device cuda`, or use `--gemma_safetensors` with an FP8 file |
 | Audio caching fails | torchaudio missing | Install torchaudio before running `ltx2_cache_latents.py` |
 | Sampling OOM | VAE decode too large | Enable `--sample_tiled_vae` or reduce `--sample_vae_temporal_tile_size` |
 | Crash with block swap (esp. RTX 5090) | `--use_pinned_memory_for_block_swap` bug | Remove `--use_pinned_memory_for_block_swap` from training arguments |
-| `stack expects each tensor to be equal size` during AV training | Mixed audio/non-audio videos in the same batch — text embeddings are 7680-dim for AV items vs 3840-dim for video-only, and `torch.stack` fails | Add `--separate_audio_buckets` to training args. Required when your dataset mixes videos with and without audio at `batch_size > 1`. At `batch_size=1` it has no effect. |
+| `stack expects each tensor to be equal size` during AV training | Mixed audio/non-audio videos in the same batch — text embeddings are 2×`caption_channels` for AV items vs 1×`caption_channels` for video-only (e.g., 7680 vs 3840 for LTX-2.3), and `torch.stack` fails | Add `--separate_audio_buckets` to training args. Required when your dataset mixes videos with and without audio at `batch_size > 1`. At `batch_size=1` it has no effect. |
 | Wrong frame count in cached latents | Auto-detected FPS incorrect (e.g., VFR video) | Set `source_fps` explicitly in TOML config to override auto-detection |
 | Too few frames from high-FPS video | FPS resampling working correctly (e.g., 60fps→25fps = 42% of frames) | Expected behavior. Set `target_fps = 60` if you want to keep all frames |
 | Audio/video out of sync after caching | Source FPS mismatch causing wrong time-stretch | Check "Auto-detected source FPS" log line; set `source_fps` explicitly if wrong |
@@ -1160,7 +1351,7 @@ reference_cache_directory/                  # IC-LoRA only
 | No audio during sampling in video training mode | `ltx2_mode` is set to `v`/`video` | Expected behavior. Train in AV mode (`--ltx2_mode av` or `audio`) to generate audio during sampling |
 | Cannot resume training from checkpoint | Using a `*.comfy.safetensors` checkpoint with `--resume` | Training can only be resumed from the **original** (non-comfy) LoRA format. Use the `*.safetensors` file without the `.comfy` extension. If you used `--no_save_original_lora`, you must retrain from scratch. |
 | CUDA errors or crashes on RTX 5090 / 50xx GPUs | CUDA 12.6 (`cu126`) not supported on Windows for Blackwell GPUs | Use CUDA 12.8: `pip install torch==2.8.0 ... --index-url https://download.pytorch.org/whl/cu128`. See [CUDA Version](#cuda-version) |
-| `loss_a` too low but `loss_v` still high (audio overfitting) | Audio latent space converges faster than video; audio gradients dominate shared weights | Lower `--audio_loss_weight` (e.g., 0.3), or use `--audio_loss_balance_mode ema_mag` to auto-dampen audio when it exceeds `target_ratio × video_loss`. Disable `--audio_dop` / `--audio_silence_regularizer` if active — they add more audio signal. |
+| `loss_a` too low but `loss_v` still high (audio overfitting) | Audio latent space converges faster than video; audio gradients dominate shared weights | Lower `--audio_loss_weight` (e.g., 0.3), or use `--audio_loss_balance_mode ema_mag` to auto-dampen audio when it exceeds `target_ratio × video_loss`. Reduce audio learning rate with `--audio_lr 1e-6` or fine-grained `--lr_args audio_attn=1e-6 audio_ff=1e-6`. Disable `--audio_dop` / `--audio_silence_regularizer` if active — they add more audio signal. |
 | `loss_a` absent or not dropping in mixed dataset (audio starvation) | Audio batches too rare — non-audio steps outnumber audio steps, audio branch gets insufficient supervision | Increase `num_repeats` on audio datasets (target 30-50% audio steps). Add `--audio_loss_balance_mode inv_freq` to auto-boost audio weight. Use `--audio_dop` or `--audio_silence_regularizer` to provide audio signal on non-audio steps. Check caching summary for `failed > 0`. |
 
 ### Audio/Voice Training with Mixed Datasets
@@ -1200,6 +1391,11 @@ Alternative: `--audio_loss_balance_mode ema_mag` matches audio loss magnitude to
 - If `failed > 0` in latent caching summary, audio extraction is broken for those items
 - After mode switch (video→AV), re-run both latent and text encoder caching without `--skip_existing`
 - `loss_a` dropping = audio learning; absent/zero = no audio batches forming; degrades over time = forgetting
+
+### Technical Notes
+
+- **Float32 AdaLN**: The transformer applies Adaptive Layer Norm (AdaLN) shift/scale operations in float32, then casts back to the working dtype. This prevents overflow that can occur when bf16 scale values multiply bf16 hidden states. The fix is always active and requires no flags.
+- **Float32 loss**: Per-element loss (`MSE`, `L1`, `Huber`) is computed in float32 regardless of `--mixed_precision` to avoid precision loss in gradient computation.
 
 ---
 
@@ -1365,4 +1561,5 @@ Note: `--gemma_root` is not needed for reference mode (text embeddings are loade
 
 - [Installation Guide](https://github.com/AkaneTendo25/musubi-tuner/discussions/19) — Setup instructions, dependencies, flash-attn, troubleshooting
 - [Optimizers Guide](https://github.com/AkaneTendo25/musubi-tuner/discussions/21) — Optimizer comparison, recommended settings, memory usage tips
+- [LTX-2 Audio Dataset Builder](https://github.com/dorpxam/LTX-2-Audio-Dataset-Builder) — Specialized tool to automate high-quality audio dataset creation: transforms raw audio into clean, curated, captioned segments optimized for LTX-2 audio-only training
 

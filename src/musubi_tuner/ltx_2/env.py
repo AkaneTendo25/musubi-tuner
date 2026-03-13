@@ -14,205 +14,210 @@ from musubi_tuner.ltx_2.model.ltx2_custom_offloading_utils import (
 @dataclass(frozen=True)
 class LTX2Env:
     # Apply audio_lengths mask to audio loss.
-    # recommended=True | old SHA=False | current=False
+    # recommended=True
     use_audio_length_mask: bool = True
 
     # Upcast FP8 Linear weights to compute dtype during forward for stability.
-    # recommended=True | old SHA=False | current=False
+    # recommended=True
     fp8_upcast: bool = False
 
     # Add stochastic rounding during FP8 upcast (extra stability, more noise).
-    # recommended=False | old SHA=False | current=False
+    # recommended=False
     fp8_upcast_stochastic: bool = False
 
     # Seed for stochastic FP8 upcast (only used if fp8_upcast_stochastic=True).
-    # recommended=0 | old SHA=0 | current=0
+    # recommended=0
     fp8_upcast_seed: int = 0
 
     # Allow FP8 weights to be offloaded to CPU by upcasting to bf16.
-    # recommended=True | old SHA=False | current=True
+    # recommended=True
     fp8_offload_upcast: bool = False
 
     # Keep FP8-offloaded weights in bf16 on GPU after restore (avoid FP8 round-trip).
-    # recommended=True | old SHA=False | current=True
+    # recommended=True
     fp8_offload_restore_bf16: bool = False
 
     # Keep FP8 weights in FP8 on CPU (avoid bf16 upcast and GPU re-cast cost).
-    # recommended=False | old SHA=False | current=False
+    # recommended=False
     fp8_offload_keep_fp8: bool = False
 
     # Allow FP8 CPU offload only when blockwise checkpointing is enabled.
-    # recommended=False | old SHA=False | current=False
+    # recommended=False
     blockwise_fp8_offload_upcast: bool = True
 
     # Add stochastic noise before restoring FP8 weights (experimental).
-    # recommended=False | old SHA=False | current=False
+    # recommended=False
     fp8_offload_restore_stochastic: bool = False
 
     # Keep attention weights on GPU during block swap (stability, higher VRAM).
-    # recommended=True | old SHA=False | current=False
+    # recommended=True
     swap_keep_attn: bool = False
 
     # Keep cross-attn weights on GPU during swap (stability).
-    # recommended=True | old SHA=False | current=False
+    # recommended=True
     swap_keep_cross_attn: bool = False
 
     # Keep audio-related weights on GPU during swap (stability).
-    # recommended=True | old SHA=False | current=False
+    # recommended=True
     swap_keep_audio: bool = False
 
     # Force PyTorch attention for audio ctx + cross-attn in swapped blocks.
-    # recommended=True | old SHA=False | current=False
+    # recommended=True
     attn_stability: bool = False
 
     # Force FP32 attention for audio ctx + cross-attn in swapped blocks.
-    # recommended=False | old SHA=False | current=False
+    # recommended=False
     attn_stability_fp32: bool = False
 
+    # Keep prompt-AdaLN modulation in float32 for consistency with the other
+    # AdaLN stability fixes.
+    # recommended=True
+    prompt_adaln_fp32: bool = True
+
     # Combined safe swap attention preset (keep attn + PyTorch + FP32 retry).
-    # recommended=True | old SHA=False | current=False
+    # recommended=True
     safe_swap_attn: bool = False
 
     # FP8 swap safety preset (strict sync + safe swap attn).
-    # recommended=True | old SHA=False | current=False
+    # recommended=True
     fp8_swap_safe: bool = True
 
     # Ensure FP8 weights are on device after swap-in.
-    # recommended=True | old SHA=False | current=False
+    # recommended=True
     swap_fp8_sync: bool = False
 
     # Strict CUDA sync after FP8 swap-in.
-    # recommended=False | old SHA=False | current=False
+    # recommended=False
     swap_fp8_sync_strict: bool = True
 
     # Force PyTorch attention for swapped blocks.
-    # recommended=False | old SHA=False | current=False
+    # recommended=False
     swap_force_pytorch_attn: bool = False
 
     # Retry attention in FP32 if non-finite detected.
-    # recommended=True | old SHA=False | current=False
+    # recommended=True
     attn_fp32_retry: bool = False
 
     # Force PyTorch attention for audio context.
-    # recommended=False | old SHA=False | current=False
+    # recommended=False
     force_pytorch_audio_ctx_attn: bool = False
 
     # Force FP32 for audio context attention.
-    # recommended=False | old SHA=False | current=False
+    # recommended=False
     audio_ctx_attn_fp32: bool = False
 
     # Force PyTorch for cross-attn.
-    # recommended=False | old SHA=False | current=False
+    # recommended=False
     force_pytorch_cross_attn: bool = False
 
     # Force FP32 for cross-attn.
-    # recommended=False | old SHA=False | current=False
+    # recommended=False
     cross_attn_fp32: bool = False
 
     # Apply cross-attn forcing only in swapped blocks.
-    # recommended=True | old SHA=True | current=True
+    # recommended=True
     cross_attn_swap_only: bool = True
 
     # Apply audio-ctx forcing only in swapped blocks.
-    # recommended=True | old SHA=True | current=True
+    # recommended=True
     audio_ctx_attn_swap_only: bool = True
 
     # Async prefetch stream for swap (faster but can be unstable).
-    # recommended=False | old SHA=True | current=True
+    # recommended=False
     swap_async_prefetch: bool = False
 
     # Pinned memory for swap/offload (faster, can destabilize).
-    # recommended=False | old SHA=True | current=True
+    # recommended=False
     swap_pinned: bool = False
 
     # Swap RMSNorm/LayerNorm weights to CPU during block swap (VRAM saver).
-    # recommended=False | old SHA=False | current=False
+    # recommended=False
     swap_norms: bool = False
 
     # Log sublayer-level non-finite diagnostics.
-    # recommended=False | old SHA=False | current=False
+    # recommended=False
     nan_sublayer_diag: bool = False
 
     # Log block-level non-finite diagnostics.
-    # recommended=False | old SHA=False | current=False
+    # recommended=False
     nan_block_diag: bool = False
 
     # Log NaN debug stats (latents/text/etc).
-    # recommended=False | old SHA=False | current=False
+    # recommended=False
     nan_diag: bool = False
 
     # Trainer loss diagnostics (LTX2_LOSS_DIAG / LTX2_LOSS_DIAG_EVERY).
-    # recommended=False | old SHA=False | current=False
+    # recommended=False
     loss_diag: bool = False
 
     # Frequency for loss diagnostics.
-    # recommended=10 | old SHA=10 | current=10
+    # recommended=10
     loss_diag_every: int = 10
 
     # Swap/offloader diagnostics.
-    # recommended=False | old SHA=False | current=False
+    # recommended=False
     swap_diag: bool = False
 
     # Offloader debug prints (LTX2_OFFLOADER_DEBUG).
-    # recommended=False | old SHA=False | current=False
+    # recommended=False
     offloader_debug: bool = False
 
     # Extra debug flag used by hv_train_network (LTX2_DEBUG).
-    # recommended=False | old SHA=False | current=False
+    # recommended=False
     debug: bool = False
 
     # Log V2A (video-to-audio) internal stats.
-    # recommended=False | old SHA=False | current=False
+    # recommended=False
     v2a_diag: bool = False
 
     # Align audio latents to video duration during training.
-    # recommended=False | old SHA=False | current=True
+    # recommended=False
     align_audio_latents_train: bool = False
 
     # Align audio latents to video duration during cache_latents.
-    # recommended=False | old SHA=False | current=True
+    # recommended=False
     align_audio_latents_cache: bool = False
 
     # Use video_prompt_embeds as AV fallback when audio missing.
-    # recommended=False | old SHA=False | current=True
+    # recommended=False
     av_use_video_prompt_embeds: bool = False
 
     # Use 5D video loss mask (broadcast-friendly).
-    # recommended=False | old SHA=False | current=True
+    # recommended=False
     video_loss_mask_5d: bool = False
 
     # Align transformer outputs to proj_out device.
-    # recommended=False | old SHA=False | current=True
+    # recommended=False
     align_output_device: bool = False
 
     # Skip steps on non-finite tensors instead of erroring.
-    # recommended=False | old SHA=False | current=True
+    # recommended=False
     skip_nonfinite_steps: bool = True
 
     # Auto-set blocks_to_checkpoint when blockwise+swap are both enabled.
-    # recommended=False | old SHA=False | current=True
+    # recommended=False
     auto_blocks_to_checkpoint: bool = False
 
     # Require gemma_root (no gemma_safetensors-only usage).
-    # recommended=True | old SHA=True | current=False
+    # recommended=True
     require_gemma_root: bool = True
 
     # Skip no-op attention masks to enable Flash Attention on cross-attn.
-    # recommended=False | old SHA=False | current=False
+    # recommended=False
     skip_noop_attn_mask: bool = False
 
     # Max FPS difference (after ceiling source FPS) below which resampling is skipped.
     # e.g. threshold=1: 23.976->ceil=24 vs 25, diff=1, skip. 30 vs 25, diff=5, resample.
-    # recommended=1 | old SHA=N/A | current=1
+    # recommended=1
     fps_resampling_threshold: int = 1
 
     # Number of blocks to prefetch ahead during block swap (1 = current behavior).
     # Higher values overlap more transfers with compute but use more VRAM.
-    # recommended=1 | opt-in via LTX2_SWAP_PREFETCH_WINDOW env var
+    # recommended=1
     swap_prefetch_window: int = 1
 
     # Use pre-allocated pinned slab pool instead of lazy per-parameter _pinned_buffer_cache.
-    # recommended=False | opt-in via LTX2_SWAP_SLAB_POOL=1 env var
+    # recommended=False
     swap_slab_pool: bool = False
 
 
@@ -246,6 +251,7 @@ def apply_ltx2_tweaks(args) -> None:
     args.swap_keep_audio = t.swap_keep_audio
     args.attn_stability = t.attn_stability
     args.attn_stability_fp32 = t.attn_stability_fp32
+    args.prompt_adaln_fp32 = t.prompt_adaln_fp32
     args.safe_swap_attn = t.safe_swap_attn
     args.fp8_swap_safe = t.fp8_swap_safe
     args.swap_fp8_sync = t.swap_fp8_sync
@@ -315,6 +321,7 @@ def apply_ltx2_tweaks(args) -> None:
         t.force_pytorch_cross_attn or t.attn_stability or t.safe_swap_attn,
     )
     _set_env_bool("LTX2_CROSS_ATTN_FP32", t.cross_attn_fp32 or t.attn_stability_fp32)
+    _set_env_bool("LTX2_PROMPT_ADALN_FP32", t.prompt_adaln_fp32)
     _set_env_bool("LTX2_CROSS_ATTN_SWAP_ONLY", t.cross_attn_swap_only)
     _set_env_bool("LTX2_AUDIO_CTX_ATTN_SWAP_ONLY", t.audio_ctx_attn_swap_only)
     _set_env_bool(

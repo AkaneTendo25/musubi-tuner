@@ -166,6 +166,7 @@ def _convert_fp8_to_int8_weights(module):
         scale = (abs_max / 127.0).clamp(min=1e-30).float()
         weight_int8 = (weight_float / scale).round().clamp(-127, 127).to(torch.int8)
 
+        module.weight.requires_grad_(False)
         module.weight.data = weight_int8
         module.scale_weight.data = scale  # [out, 1] float32
 

@@ -1298,12 +1298,10 @@ class BucketBatchManager:
                     if isinstance(text_mask, torch.Tensor):
                         conditions["prompt_attention_mask"] = text_mask
 
-                    if isinstance(audio_latents_tensor, torch.Tensor) and text.shape[-1] % 2 == 0:
-                        half = text.shape[-1] // 2
-                        conditions["video_prompt_embeds"] = text[..., :half]
-                        conditions["audio_prompt_embeds"] = text[..., half:]
-                    else:
-                        conditions["video_prompt_embeds"] = text
+                    # Legacy cache fallback: keep full prompt_embeds so runtime can
+                    # split by model dims (video/audio) when needed.
+                    conditions["prompt_embeds"] = text
+                    conditions["video_prompt_embeds"] = text
 
             # DINOv2 features (pre-cached, for CREPA dino mode)
             if any(d is not None for d in dino_features_per_item):

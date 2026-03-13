@@ -211,28 +211,46 @@ class LTX2Wrapper(nn.Module):
         if isinstance(video_latents, torch.Tensor):
             _, vch, vframes, vheight, vwidth = video_latents.shape
 
-        def _to_sigma(ts_value, *, name: str) -> torch.Tensor:
+        def _to_timestep(ts_value, *, name: str) -> torch.Tensor:
             if isinstance(ts_value, torch.Tensor):
                 ts = ts_value
             else:
                 ts = torch.tensor(ts_value, device=ref_latents.device, dtype=ref_latents.dtype)
             if ts.dim() == 0:
-                ts = ts.view(1)
-            if ts.dim() == 2 and ts.shape[1] == 1:
-                sigma = ts[:, 0]
+                ts = ts.view(1, 1)
+            elif ts.dim() == 1:
+                ts = ts.view(-1, 1)
+            elif ts.dim() == 2:
+                pass
+            else:
+                raise ValueError(f"Unexpected {name} shape: {tuple(ts.shape)}")
+            if ts.shape[0] == 1 and bsz != 1:
+                ts = ts.expand(bsz, ts.shape[1])
+            if ts.shape[0] != bsz:
+                raise ValueError(f"Expected {name} batch size {bsz}, got {ts.shape[0]}")
+            return ts.to(device=ref_latents.device, dtype=ref_latents.dtype)
+
+        timestep_video = _to_timestep(timestep, name="timestep")
+        audio_timestep = kwargs.get("audio_timestep")
+        timestep_audio = _to_timestep(audio_timestep, name="audio_timestep") if audio_timestep is not None else timestep_video
+
+        # Prompt AdaLN expects per-sample sigma. Collapse token-wise timesteps when present.
+        def _to_sigma(ts: torch.Tensor, *, name: str) -> torch.Tensor:
+            if ts.dim() == 2:
+                if ts.shape[1] == 1:
+                    sigma = ts[:, 0]
+                else:
+                    sigma = ts.to(dtype=torch.float32).mean(dim=1)
             elif ts.dim() == 1:
                 sigma = ts
             else:
                 raise ValueError(f"Unexpected {name} shape: {tuple(ts.shape)}")
-            if sigma.numel() == 1 and bsz != 1:
-                sigma = sigma.expand(bsz)
             if sigma.shape[0] != bsz:
                 raise ValueError(f"Expected {name} batch size {bsz}, got {sigma.shape[0]}")
             return sigma.to(device=ref_latents.device, dtype=ref_latents.dtype)
 
-        sigma = _to_sigma(timestep, name="timestep")
-        audio_timestep = kwargs.get("audio_timestep")
-        audio_sigma = _to_sigma(audio_timestep, name="audio_timestep") if audio_timestep is not None else sigma
+        sigma = _to_sigma(timestep_video, name="timestep")
+        audio_sigma = _to_sigma(timestep_audio, name="audio_timestep")
 
         video_tokens = None
         video_timesteps = None
@@ -240,7 +258,15 @@ class LTX2Wrapper(nn.Module):
         if model_video_enabled:
             video_tokens = self._video_patchifier.patchify(video_latents)
             video_seq_len = video_tokens.shape[1]
-            video_timesteps = sigma.view(bsz, 1).expand(bsz, video_seq_len)
+            if timestep_video.shape[1] == 1:
+                video_timesteps = timestep_video.expand(bsz, video_seq_len)
+            elif timestep_video.shape[1] == video_seq_len:
+                video_timesteps = timestep_video
+            else:
+                raise ValueError(
+                    f"timestep shape mismatch for video tokens: got {tuple(timestep_video.shape)}, "
+                    f"expected second dim 1 or {video_seq_len}"
+                )
 
             video_conditioning_mask = None
             if isinstance(transformer_options, dict):
@@ -279,21 +305,44 @@ class LTX2Wrapper(nn.Module):
             and not audio_only
             and audio_latents is not None
             and isinstance(context, torch.Tensor)
-            and context.shape[-1] % 2 == 0
         ):
-            half = context.shape[-1] // 2
-            video_context = context[..., :half]
-            audio_context = context[..., half:]
+            split_video_dim = getattr(self.model, "cross_attention_dim", None)
+            split_audio_dim = getattr(self.model, "audio_cross_attention_dim", None)
+            if (
+                isinstance(split_video_dim, int)
+                and isinstance(split_audio_dim, int)
+                and split_video_dim > 0
+                and split_audio_dim > 0
+            ):
+                expected_total = split_video_dim + split_audio_dim
+                if expected_total == context.shape[-1]:
+                    video_context = context[..., :split_video_dim]
+                    audio_context = context[..., split_video_dim : split_video_dim + split_audio_dim]
+                else:
+                    raise ValueError(
+                        "Context hidden size mismatch for AV split: "
+                        f"got {context.shape[-1]}, expected {expected_total} "
+                        f"(video={split_video_dim}, audio={split_audio_dim})."
+                    )
+            elif context.shape[-1] % 2 == 0:
+                half = context.shape[-1] // 2
+                video_context = context[..., :half]
+                audio_context = context[..., half:]
 
         video_modality = None
         if model_video_enabled:
+            video_self_attention_mask = None
+            if isinstance(transformer_options, dict):
+                video_self_attention_mask = transformer_options.get("self_attention_mask")
             video_modality = Modality(
                 enabled=(not audio_only if video_enabled is None else bool(video_enabled)),
                 latent=video_tokens,
                 timesteps=video_timesteps,
                 positions=video_positions,
                 context=video_context,
+                sigma=sigma,
                 context_mask=attention_mask,
+                attention_mask=video_self_attention_mask,
             )
 
         audio_modality = None
@@ -308,7 +357,15 @@ class LTX2Wrapper(nn.Module):
 
             audio_tokens = self._audio_patchifier.patchify(audio_latents)
             audio_seq_len = audio_tokens.shape[1]
-            audio_timesteps = audio_sigma.view(bsz, 1).expand(bsz, audio_seq_len)
+            if timestep_audio.shape[1] == 1:
+                audio_timesteps = timestep_audio.expand(bsz, audio_seq_len)
+            elif timestep_audio.shape[1] == audio_seq_len:
+                audio_timesteps = timestep_audio
+            else:
+                raise ValueError(
+                    f"audio_timestep shape mismatch for audio tokens: got {tuple(timestep_audio.shape)}, "
+                    f"expected second dim 1 or {audio_seq_len}"
+                )
 
             audio_shape = AudioLatentShape(batch=bsz, channels=ach, frames=at, mel_bins=af)
             audio_positions = self._audio_patchifier.get_patch_grid_bounds(audio_shape, device=audio_latents.device)
@@ -319,6 +376,7 @@ class LTX2Wrapper(nn.Module):
                 timesteps=audio_timesteps,
                 positions=audio_positions.to(dtype=audio_latents.dtype),
                 context=audio_context,
+                sigma=audio_sigma,
                 context_mask=attention_mask,
             )
 
@@ -483,6 +541,8 @@ def _build_exclude_patterns(raw_patterns: Optional[str], audio_video: bool = Fal
     """Build exclude patterns list, including connector exclusions."""
     patterns: List[str] = [
         r".*text_embedding_projection\.aggregate_embed.*",
+        r".*text_embedding_projection\.video_aggregate_embed.*",
+        r".*text_embedding_projection\.audio_aggregate_embed.*",
         r".*embeddings_connector\..*",
         r".*audio_embeddings_connector\..*",
     ]
