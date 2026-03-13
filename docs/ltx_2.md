@@ -1,7 +1,6 @@
 # LTX-2 / LTX-2.3
 
-> [!WARNING]
-> LTX-2.3 support is work in progress and may be incomplete or unstable.
+Supports LoRA training for both **LTX-2 (19B)** and **LTX-2.3 (22B)** models with the following training modes: text-to-video, joint audio-video, audio-only, and IC-LoRA / video-to-video (reference-conditioned generation).
 
 ### Supported Model Versions
 
@@ -343,6 +342,9 @@ For LTX-2 checkpoints, replace:
 - `--ltx_version 2.3` -> `--ltx_version 2.0`
 
 ### Advanced: LyCORIS/LoKR Training
+
+> [!WARNING]
+> LyCORIS training for LTX-2 has been reported as unstable by some users. This is currently being investigated. Use with caution and please report issues.
 
 musubi-tuner supports advanced LoRA algorithms (LoKR, LoHA, LoCoN, etc.) via:
 - `--network_args` for inline `key=value` settings
