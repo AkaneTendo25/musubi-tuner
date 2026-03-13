@@ -1,0 +1,394 @@
+@import "tailwindcss";
+
+/* ══════════════════════════════════════════════════
+   MUSUBI TUNER — 5 UNIQUE THEME PALETTES
+   ══════════════════════════════════════════════════ */
+
+/* ── 1. Warm Terminal (default) — Cozy retro-futurism ── */
+:root {
+	color-scheme: dark;
+	--font-label: 'JetBrains Mono', monospace;
+	--bg-base: #1a1714;
+	--bg-surface: #242018;
+	--bg-elevated: #2e2820;
+	--bg-input: #1e1a14;
+	--bg-hover: #342e24;
+	--border: #3a3228;
+	--border-subtle: #2e2820;
+	--text-primary: #e8ddd0;
+	--text-secondary: #b0a090;
+	--text-muted: #787060;
+	--accent: #f0a030;
+	--accent-hover: #fbb040;
+	--accent-muted: rgba(240,160,48,.15);
+	--accent-subtle-bg: rgba(240,160,48,.06);
+	--accent-dim: #d89028;
+	--secondary: #c47a7a;
+	--success: #70a860;
+	--success-muted: rgba(112,168,96,.15);
+	--warning: #f0b040;
+	--warning-muted: rgba(240,176,64,.15);
+	--danger: #d45050;
+	--danger-muted: rgba(212,80,80,.12);
+	--info: #6090c0;
+	--sidebar-bg: #1e1a14;
+	--sidebar-active: #2e2820;
+	--sidebar-hover: #282218;
+	--toggle-bg: #3a3228;
+	--toggle-active: #f0a030;
+	--console-bg: #141210;
+	--console-text: #b0a090;
+	--console-text-muted: #787060;
+	--shadow-sm: 0 1px 3px rgba(0,0,0,.3);
+	--shadow-md: 0 4px 12px rgba(0,0,0,.4);
+	--shadow-lg: 0 12px 32px rgba(0,0,0,.5);
+	--glow-accent: 0 0 20px rgba(240,160,48,.12);
+	--radius-sm: 8px;
+	--radius-md: 10px;
+	--radius-lg: 12px;
+	--radius-xl: 16px;
+	--radius-full: 9999px;
+	--toggle-radius: 10px;
+	--toggle-knob-radius: 50%;
+	--toggle-knob-shadow: 0 1px 3px rgba(0,0,0,.4);
+	--logo-bg: #f0a030;
+	--logo-shadow: 0 0 20px rgba(240,160,48,.2);
+	--logo-radius: 8px;
+	--logo-clip: none;
+}
+
+/* ── 2. Aurora — Northern Lights ── */
+:root.theme-aurora {
+	color-scheme: dark;
+	--font-label: 'Inter', -apple-system, sans-serif;
+	--bg-base: #080c18;
+	--bg-surface: #0e1428;
+	--bg-elevated: #141a34;
+	--bg-input: #0a1020;
+	--bg-hover: #1a2040;
+	--border: #1e2848;
+	--border-subtle: #161e38;
+	--text-primary: #e0e8f0;
+	--text-secondary: #8090b0;
+	--text-muted: #4a5878;
+	--accent: #64ffb4;
+	--accent-hover: #80ffc4;
+	--accent-muted: rgba(100,255,180,.08);
+	--accent-subtle-bg: rgba(100,255,180,.04);
+	--accent-dim: #50e0a0;
+	--secondary: #7c8aff;
+	--success: #64ffb4;
+	--success-muted: rgba(100,255,180,.1);
+	--warning: #ffd060;
+	--warning-muted: rgba(255,208,96,.1);
+	--danger: #ff7a8a;
+	--danger-muted: rgba(255,122,138,.08);
+	--info: #7c8aff;
+	--sidebar-bg: #0a0f20;
+	--sidebar-active: #141a34;
+	--sidebar-hover: #121830;
+	--toggle-bg: #1e2848;
+	--toggle-active: #64ffb4;
+	--console-bg: #060a14;
+	--console-text: #8090b0;
+	--console-text-muted: #4a5878;
+	--shadow-sm: 0 1px 4px rgba(0,0,0,.3);
+	--shadow-md: 0 4px 16px rgba(0,0,0,.4);
+	--shadow-lg: 0 12px 32px rgba(0,0,0,.5);
+	--glow-accent: 0 0 24px rgba(100,255,180,.08);
+	--radius-sm: 10px;
+	--radius-md: 14px;
+	--radius-lg: 16px;
+	--radius-xl: 20px;
+	--radius-full: 9999px;
+	--toggle-radius: 10px;
+	--toggle-knob-radius: 50%;
+	--toggle-knob-shadow: 0 1px 4px rgba(0,0,0,.3);
+	--logo-bg: linear-gradient(135deg, #64ffb4, #7c8aff);
+	--logo-shadow: 0 0 24px rgba(100,255,180,.15);
+	--logo-radius: 10px;
+	--logo-clip: none;
+}
+
+/* ── 3. Matcha Latte — Japanese Minimal ── */
+:root.theme-matcha {
+	color-scheme: light;
+	--font-label: 'Inter', -apple-system, sans-serif;
+	--bg-base: #f5f2eb;
+	--bg-surface: #ffffff;
+	--bg-elevated: #f0ede6;
+	--bg-input: #fafaf6;
+	--bg-hover: #e8e4dc;
+	--border: #e0dbd0;
+	--border-subtle: #e8e2d8;
+	--text-primary: #2c2420;
+	--text-secondary: #6b6058;
+	--text-muted: #9c9488;
+	--accent: #5b8c5a;
+	--accent-hover: #4a7a49;
+	--accent-muted: rgba(91,140,90,.08);
+	--accent-subtle-bg: rgba(91,140,90,.04);
+	--accent-dim: #4a7a49;
+	--secondary: #8c7a5b;
+	--success: #5b8c5a;
+	--success-muted: rgba(91,140,90,.1);
+	--warning: #c08820;
+	--warning-muted: rgba(192,136,32,.08);
+	--danger: #c45040;
+	--danger-muted: rgba(196,80,64,.08);
+	--info: #507898;
+	--sidebar-bg: #ffffff;
+	--sidebar-active: #f0ede6;
+	--sidebar-hover: #f5f2eb;
+	--toggle-bg: #d0ccc4;
+	--toggle-active: #5b8c5a;
+	--console-bg: #2c2420;
+	--console-text: #b0a898;
+	--console-text-muted: #787068;
+	--shadow-sm: 0 1px 2px rgba(0,0,0,.04);
+	--shadow-md: 0 2px 8px rgba(0,0,0,.06);
+	--shadow-lg: 0 8px 24px rgba(0,0,0,.08);
+	--glow-accent: none;
+	--radius-sm: 4px;
+	--radius-md: 4px;
+	--radius-lg: 6px;
+	--radius-xl: 8px;
+	--radius-full: 9999px;
+	--toggle-radius: 9px;
+	--toggle-knob-radius: 50%;
+	--toggle-knob-shadow: 0 1px 2px rgba(0,0,0,.15);
+	--logo-bg: #5b8c5a;
+	--logo-shadow: none;
+	--logo-radius: 4px;
+	--logo-clip: none;
+}
+
+/* ── 4. Neon Brutalist — Cyberpunk Raw ── */
+:root.theme-brutalist {
+	color-scheme: dark;
+	--font-label: 'JetBrains Mono', monospace;
+	--bg-base: #000000;
+	--bg-surface: #111111;
+	--bg-elevated: #1a1a1a;
+	--bg-input: #0a0a0a;
+	--bg-hover: #222222;
+	--border: #333333;
+	--border-subtle: #222222;
+	--text-primary: #e0e0e0;
+	--text-secondary: #999999;
+	--text-muted: #555555;
+	--accent: #c8ff00;
+	--accent-hover: #d8ff40;
+	--accent-muted: rgba(200,255,0,.06);
+	--accent-subtle-bg: rgba(200,255,0,.03);
+	--accent-dim: #a0cc00;
+	--secondary: #ff2d7b;
+	--success: #c8ff00;
+	--success-muted: rgba(200,255,0,.08);
+	--warning: #ff9900;
+	--warning-muted: rgba(255,153,0,.08);
+	--danger: #ff2d2d;
+	--danger-muted: rgba(255,45,45,.08);
+	--info: #00aaff;
+	--sidebar-bg: #111111;
+	--sidebar-active: #1a1a1a;
+	--sidebar-hover: #181818;
+	--toggle-bg: #333333;
+	--toggle-active: #c8ff00;
+	--console-bg: #050505;
+	--console-text: #999999;
+	--console-text-muted: #555555;
+	--shadow-sm: none;
+	--shadow-md: none;
+	--shadow-lg: none;
+	--glow-accent: 0 0 12px rgba(200,255,0,.1);
+	--radius-sm: 0px;
+	--radius-md: 0px;
+	--radius-lg: 0px;
+	--radius-xl: 0px;
+	--radius-full: 0px;
+	--toggle-radius: 0px;
+	--toggle-knob-radius: 0px;
+	--toggle-knob-shadow: none;
+	--logo-bg: #c8ff00;
+	--logo-shadow: none;
+	--logo-radius: 0px;
+	--logo-clip: polygon(0 0, calc(100% - 6px) 0, 100% 6px, 100% 100%, 6px 100%, 0 calc(100% - 6px));
+}
+
+/* ── 5. Twilight Garden — Soft & Dreamy ── */
+:root.theme-twilight {
+	color-scheme: dark;
+	--font-label: 'Inter', -apple-system, sans-serif;
+	--bg-base: #140e1a;
+	--bg-surface: #1c1424;
+	--bg-elevated: #241a30;
+	--bg-input: #120c18;
+	--bg-hover: #2a1e38;
+	--border: #2e2240;
+	--border-subtle: #241a30;
+	--text-primary: #e8e0f0;
+	--text-secondary: #a898b8;
+	--text-muted: #685878;
+	--accent: #ffb088;
+	--accent-hover: #ffc0a0;
+	--accent-muted: rgba(255,176,136,.08);
+	--accent-subtle-bg: rgba(255,176,136,.04);
+	--accent-dim: #e09870;
+	--secondary: #b8a0d4;
+	--success: #88c4a0;
+	--success-muted: rgba(136,196,160,.1);
+	--warning: #e0c080;
+	--warning-muted: rgba(224,192,128,.1);
+	--danger: #e06070;
+	--danger-muted: rgba(224,96,112,.08);
+	--info: #80a8d0;
+	--sidebar-bg: #1c1424;
+	--sidebar-active: #241a30;
+	--sidebar-hover: #201828;
+	--toggle-bg: #2e2240;
+	--toggle-active: #ffb088;
+	--console-bg: #0e0a14;
+	--console-text: #a898b8;
+	--console-text-muted: #685878;
+	--shadow-sm: 0 2px 6px rgba(100,60,140,.08);
+	--shadow-md: 0 4px 16px rgba(100,60,140,.12);
+	--shadow-lg: 0 12px 32px rgba(100,60,140,.15);
+	--glow-accent: 0 0 16px rgba(255,176,136,.1);
+	--radius-sm: 10px;
+	--radius-md: 14px;
+	--radius-lg: 18px;
+	--radius-xl: 22px;
+	--radius-full: 9999px;
+	--toggle-radius: 11px;
+	--toggle-knob-radius: 50%;
+	--toggle-knob-shadow: 0 2px 6px rgba(0,0,0,.3);
+	--logo-bg: linear-gradient(135deg, #ffb088, #e08080);
+	--logo-shadow: 0 4px 16px rgba(255,176,136,.2);
+	--logo-radius: 12px;
+	--logo-clip: none;
+}
+
+
+/* ══════════════════════════════════════════════════
+   THEME-SPECIFIC STRUCTURAL OVERRIDES
+   ══════════════════════════════════════════════════ */
+
+/* Brutalist: thick 2px borders on inputs, selects, cards */
+:root.theme-brutalist input:not([type="checkbox"]),
+:root.theme-brutalist select,
+:root.theme-brutalist textarea {
+	border-width: 2px !important;
+}
+
+/* Brutalist: monospace uppercase on nav links */
+:root.theme-brutalist nav a {
+	text-transform: uppercase;
+	letter-spacing: 1px;
+	font-family: 'JetBrains Mono', monospace;
+	font-size: 11px;
+}
+
+/* Brutalist: monospace on buttons */
+:root.theme-brutalist button {
+	font-family: 'JetBrains Mono', monospace;
+	letter-spacing: 0.3px;
+}
+
+/* Brutalist: sidebar active uses left border accent */
+:root.theme-brutalist nav a[style*="sidebar-active"] {
+	border-left: 2px solid var(--accent) !important;
+}
+
+/* Twilight: underline-style inputs */
+:root.theme-twilight input:not([type="checkbox"]),
+:root.theme-twilight select {
+	border: none !important;
+	border-bottom: 2px solid var(--border) !important;
+	border-radius: 8px 8px 0 0 !important;
+}
+:root.theme-twilight input:not([type="checkbox"]):focus,
+:root.theme-twilight select:focus {
+	border-bottom-color: var(--accent) !important;
+	box-shadow: 0 2px 8px rgba(255,176,136,.1) !important;
+}
+
+/* Twilight: buttons lift on hover */
+:root.theme-twilight button:not(:disabled):hover {
+	transform: translateY(-1px);
+}
+
+/* Aurora: subtle glow on focused inputs */
+:root.theme-aurora input:focus,
+:root.theme-aurora select:focus {
+	box-shadow: 0 0 0 2px var(--accent-muted), 0 0 16px rgba(100,255,180,.08) !important;
+}
+
+
+/* ══════════════════════════════════════════════════
+   BASE STYLES
+   ══════════════════════════════════════════════════ */
+
+body {
+	font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Segoe UI', sans-serif;
+	background: var(--bg-base);
+	color: var(--text-primary);
+	margin: 0;
+	-webkit-font-smoothing: antialiased;
+	-moz-osx-font-smoothing: grayscale;
+	font-size: 14px;
+	line-height: 1.55;
+	letter-spacing: 0.01em;
+}
+
+/* Scrollbar */
+::-webkit-scrollbar { width: 5px; height: 5px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: var(--radius-full); }
+::-webkit-scrollbar-thumb:hover { background: var(--text-muted); }
+
+/* Tooltip */
+[data-tooltip] { position: relative; }
+[data-tooltip]::after {
+	content: attr(data-tooltip);
+	position: absolute;
+	bottom: calc(100% + 8px);
+	left: 50%;
+	transform: translateX(-50%) translateY(4px);
+	padding: 5px 10px;
+	border-radius: var(--radius-sm);
+	font-size: 11px;
+	line-height: 1.4;
+	font-weight: 400;
+	white-space: normal;
+	max-width: 260px;
+	width: max-content;
+	background: var(--bg-elevated);
+	color: var(--text-secondary);
+	border: 1px solid var(--border);
+	box-shadow: var(--shadow-md);
+	opacity: 0;
+	pointer-events: none;
+	transition: opacity 0.15s ease, transform 0.15s ease;
+	z-index: 100;
+}
+[data-tooltip]:hover::after {
+	opacity: 1;
+	transform: translateX(-50%) translateY(0);
+}
+
+/* Focus */
+input:focus, select:focus, textarea:focus {
+	outline: none;
+	border-color: var(--accent) !important;
+	box-shadow: 0 0 0 2px var(--accent-muted), var(--glow-accent);
+}
+
+/* Transitions */
+button, a { transition: all 0.12s ease; }
+
+/* Selection */
+::selection {
+	background: var(--accent-muted);
+	color: var(--text-primary);
+}

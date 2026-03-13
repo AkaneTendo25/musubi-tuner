@@ -2093,6 +2093,14 @@ class NetworkTrainer:
             dit_weight_dtype = dit_dtype
         logger.info(f"DiT precision: {dit_dtype}, weight precision: {dit_weight_dtype}")
 
+        # GUI dashboard metrics writer (lazy import, no-op when --gui is not set)
+        gui_metrics = None
+        if getattr(args, "gui", False) and accelerator.is_main_process:
+            from musubi_tuner.gui_dashboard import create_metrics_writer
+
+            gui_metrics = create_metrics_writer(args.output_dir)
+            gui_metrics.update_status(step=0, max_steps=args.max_train_steps, status="starting")
+
         # get embedding for sampling images
         vae_dtype = torch.float16 if args.vae_dtype is None else model_utils.str_to_dtype(args.vae_dtype)
         sample_parameters = None
@@ -3355,12 +3363,16 @@ class NetworkTrainer:
                         set_trainer_eval_mode()
                         if should_sampling:
                             self.sample_images(accelerator, args, None, global_step, vae, transformer, sample_parameters, dit_dtype)
+                            if gui_metrics is not None:
+                                gui_metrics.log_event("sample", global_step)
 
                         if should_saving:
                             accelerator.wait_for_everyone()
                             if accelerator.is_main_process:
                                 ckpt_name = train_utils.get_step_ckpt_name(args.output_name, global_step)
                                 save_model(ckpt_name, accelerator.unwrap_model(network), global_step, epoch)
+                                if gui_metrics is not None:
+                                    gui_metrics.log_event("checkpoint", global_step)
 
                                 if args.save_state:
                                     train_utils.save_and_remove_state_stepwise(args, accelerator, global_step)
@@ -3415,6 +3427,21 @@ class NetworkTrainer:
                                     import wandb
                                     tracker.log({"lr/automagic_lrs": wandb.Histogram(lr_tensor.cpu().numpy())}, step=global_step)
 
+                # GUI dashboard per-step metrics
+                if gui_metrics is not None:
+                    step_time = time.perf_counter() - _step_start_time
+                    gui_metrics.log(
+                        step=global_step,
+                        epoch=epoch,
+                        loss=current_loss,
+                        avr_loss=avr_loss,
+                        loss_v=video_loss_value,
+                        loss_a=audio_loss_value,
+                        lr=lr_scheduler.get_last_lr()[0],
+                        step_time=step_time,
+                    )
+                    gui_metrics.update_status(step=global_step, status="training")
+
                 if (
                     validation_dataloader is not None
                     and args.validate_every_n_steps is not None
@@ -3461,6 +3488,10 @@ class NetworkTrainer:
 
         # metadata["ss_epoch"] = str(num_train_epochs)
         metadata["ss_training_finished_at"] = str(time.time())
+
+        if gui_metrics is not None:
+            gui_metrics.update_status(status="completed")
+            gui_metrics.close()
 
         if is_main_process:
             network = accelerator.unwrap_model(network)
@@ -4258,6 +4289,12 @@ def hv_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     parser.add_argument(
         "--vae_spatial_tile_sample_min_size", type=int, default=None, help="spatial tile sample min size for VAE, default 256"
     )
+
+    # GUI dashboard
+    parser.add_argument("--gui", action="store_true", help="enable live web training dashboard")
+    parser.add_argument("--gui_port", type=int, default=7860, help="port for the GUI dashboard server")
+    parser.add_argument("--gui_host", type=str, default="0.0.0.0", help="host for the GUI dashboard server")
+
     return parser
 
 

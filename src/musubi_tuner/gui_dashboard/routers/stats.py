@@ -1,0 +1,401 @@
+"""Project statistics calculation endpoints."""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+from pathlib import Path
+from typing import Optional
+
+from fastapi import APIRouter, Request
+from pydantic import BaseModel
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/api/stats", tags=["stats"])
+
+# Cache for dataset stats to avoid repeated scanning
+_dataset_cache: dict[str, tuple[float, DatasetStats]] = {}  # path -> (mtime, stats)
+
+
+class DatasetStats(BaseModel):
+    """Statistics about the dataset."""
+    total_items: int
+    video_items: int
+    audio_items: int
+    avg_resolution: tuple[int, int] | None
+    avg_frames: float | None
+    max_resolution: tuple[int, int] | None
+    max_frames: int | None
+
+
+class TrainingStats(BaseModel):
+    """Calculated training statistics."""
+    steps_per_epoch: int | None
+    total_epochs: float | None
+    effective_batch_size: int
+    estimated_time_hours: float | None
+    checkpoint_size_mb: float
+    total_checkpoints: int
+    total_storage_gb: float
+
+
+class VRAMStats(BaseModel):
+    """VRAM usage estimates."""
+    peak_training_gb: float
+    peak_sampling_gb: float
+    model_size_gb: float
+    optimizer_size_gb: float
+    activations_gb: float
+    breakdown: dict[str, float]
+
+
+class ProjectStats(BaseModel):
+    """Complete project statistics."""
+    dataset: DatasetStats | None
+    training: TrainingStats | None
+    vram: VRAMStats | None
+
+
+def _scan_dataset(dataset_path: str) -> DatasetStats | None:
+    """Scan dataset directory and extract statistics (with caching)."""
+    try:
+        path = Path(dataset_path)
+        if not path.exists():
+            return None
+
+        # Check cache first
+        try:
+            mtime = path.stat().st_mtime
+            if dataset_path in _dataset_cache:
+                cached_mtime, cached_stats = _dataset_cache[dataset_path]
+                if cached_mtime == mtime:
+                    logger.debug(f"Using cached dataset stats for {dataset_path}")
+                    return cached_stats
+        except:
+            pass
+
+        # Look for dataset config
+        toml_path = path / "dataset_config.toml"
+        if not toml_path.exists():
+            # Try to count files directly
+            video_exts = {'.mp4', '.avi', '.mov', '.mkv', '.webm'}
+            files = [f for f in path.rglob('*') if f.suffix.lower() in video_exts]
+            return DatasetStats(
+                total_items=len(files),
+                video_items=len(files),
+                audio_items=0,
+                avg_resolution=None,
+                avg_frames=None,
+                max_resolution=None,
+                max_frames=None
+            )
+
+        # Parse TOML to get subsets
+        try:
+            import tomllib  # Python 3.11+
+        except ImportError:
+            import tomli as tomllib  # Fallback for older Python
+        with open(toml_path, 'rb') as f:
+            config = tomllib.load(f)
+
+        total_items = 0
+        video_items = 0
+        audio_items = 0
+        resolutions = []
+        frames = []
+
+        for subset in config.get('subsets', []):
+            video_dir = subset.get('video_dir', '')
+            if not video_dir:
+                continue
+
+            subset_path = Path(video_dir) if os.path.isabs(video_dir) else path / video_dir
+            if not subset_path.exists():
+                continue
+
+            # Count videos in this subset
+            video_exts = {'.mp4', '.avi', '.mov', '.mkv', '.webm'}
+            subset_videos = [f for f in subset_path.rglob('*') if f.suffix.lower() in video_exts]
+
+            num_videos = len(subset_videos)
+            total_items += num_videos
+
+            # Check if audio subset
+            is_audio = subset.get('is_audio', False) or 'audio' in video_dir.lower()
+            if is_audio:
+                audio_items += num_videos
+            else:
+                video_items += num_videos
+
+            # Try to get resolution/frames from metadata if available
+            metadata_path = subset_path / '.metadata.json'
+            if metadata_path.exists():
+                try:
+                    with open(metadata_path) as mf:
+                        meta = json.load(mf)
+                        if 'resolution' in meta:
+                            resolutions.append(tuple(meta['resolution']))
+                        if 'frames' in meta:
+                            frames.append(meta['frames'])
+                except:
+                    pass
+
+        # Calculate averages
+        avg_resolution = None
+        max_resolution = None
+        if resolutions:
+            avg_w = sum(r[0] for r in resolutions) / len(resolutions)
+            avg_h = sum(r[1] for r in resolutions) / len(resolutions)
+            avg_resolution = (int(avg_w), int(avg_h))
+            max_resolution = max(resolutions, key=lambda r: r[0] * r[1])
+
+        avg_frames = sum(frames) / len(frames) if frames else None
+        max_frames = max(frames) if frames else None
+
+        stats = DatasetStats(
+            total_items=total_items,
+            video_items=video_items,
+            audio_items=audio_items,
+            avg_resolution=avg_resolution,
+            avg_frames=avg_frames,
+            max_resolution=max_resolution,
+            max_frames=max_frames
+        )
+
+        # Cache the result
+        try:
+            mtime = path.stat().st_mtime
+            _dataset_cache[dataset_path] = (mtime, stats)
+        except:
+            pass
+
+        return stats
+
+    except Exception as e:
+        logger.warning(f"Failed to scan dataset: {e}")
+        return None
+
+
+def _calculate_training_stats(config: dict, dataset_stats: DatasetStats | None) -> TrainingStats | None:
+    """Calculate training statistics from config."""
+    try:
+        training = config.get('training', {})
+
+        # Batch size
+        batch_size = training.get('train_batch_size', 1)
+        grad_accum = training.get('gradient_accumulation_steps', 1)
+        effective_batch_size = batch_size * grad_accum
+
+        # Steps per epoch
+        steps_per_epoch = None
+        if dataset_stats and dataset_stats.total_items > 0:
+            steps_per_epoch = max(1, dataset_stats.total_items // effective_batch_size)
+
+        # Total epochs
+        max_steps = training.get('max_train_steps')
+        total_epochs = None
+        if max_steps and steps_per_epoch:
+            total_epochs = max_steps / steps_per_epoch
+
+        # Estimated time (very rough estimate: 1-3 sec per step depending on config)
+        estimated_time_hours = None
+        if max_steps:
+            # Base time per step
+            time_per_step = 2.0  # seconds
+
+            # Adjust based on settings
+            if training.get('gradient_checkpointing', True):
+                time_per_step *= 1.2  # Slower with grad checkpointing
+            if training.get('sample_every_n_steps'):
+                # Add sampling overhead
+                sample_freq = training['sample_every_n_steps']
+                time_per_step += (5.0 / sample_freq)  # ~5 sec per sample
+
+            estimated_time_hours = (max_steps * time_per_step) / 3600
+
+        # Checkpoint size
+        network_dim = training.get('network_dim', 16)
+        # Rough estimate: LoRA size depends on rank and target modules
+        # LTX2 full LoRA is roughly: dim * 2 * hidden_dim * num_layers * 4 bytes
+        # For dim=16, roughly 50-100MB
+        checkpoint_size_mb = network_dim * 5  # Very rough estimate
+
+        # Total checkpoints
+        save_every_n_steps = training.get('save_every_n_steps')
+        save_every_n_epochs = training.get('save_every_n_epochs')
+        total_checkpoints = 1  # Final checkpoint
+
+        if save_every_n_steps and max_steps:
+            total_checkpoints += max_steps // save_every_n_steps
+        elif save_every_n_epochs and total_epochs:
+            total_checkpoints += int(total_epochs) // save_every_n_epochs
+
+        # Apply keep_last limits
+        keep_last_steps = training.get('save_last_n_steps')
+        keep_last_epochs = training.get('save_last_n_epochs')
+        if keep_last_steps:
+            total_checkpoints = min(total_checkpoints, keep_last_steps + 1)
+        if keep_last_epochs:
+            total_checkpoints = min(total_checkpoints, keep_last_epochs + 1)
+
+        total_storage_gb = (checkpoint_size_mb * total_checkpoints) / 1024
+
+        return TrainingStats(
+            steps_per_epoch=steps_per_epoch,
+            total_epochs=total_epochs,
+            effective_batch_size=effective_batch_size,
+            estimated_time_hours=estimated_time_hours,
+            checkpoint_size_mb=checkpoint_size_mb,
+            total_checkpoints=total_checkpoints,
+            total_storage_gb=total_storage_gb
+        )
+
+    except Exception as e:
+        logger.warning(f"Failed to calculate training stats: {e}")
+        return None
+
+
+def _calculate_vram_stats(config: dict) -> VRAMStats | None:
+    """Calculate VRAM usage estimates.
+
+    LTX-2 architecture reference:
+    - DiT: 48 transformer blocks, inner_dim=4096 (video), 2048 (audio)
+    - VAE compression: temporal 8x, spatial 32x32
+    - Latent channels: 128, patch_size: 1
+    - LTX 2.0: ~19B params → BF16 38 GB, FP8 19 GB
+    - LTX 2.3: ~21.5B params → BF16 43 GB, FP8 21.5 GB
+    """
+    try:
+        training = config.get('training', {})
+        datasets = config.get('dataset', {}).get('datasets', [])
+        ds = next((d for d in datasets if d.get('type') in ('video', 'image')), datasets[0] if datasets else {})
+
+        # ── DiT weights ──
+        ltx_version = str(training.get('ltx_version', '2.0'))
+        dit_bf16 = 43.0 if ltx_version == '2.3' else 38.0
+        is_fp8 = bool(training.get('fp8_base'))
+        is_nf4 = bool(training.get('nf4_base'))
+        dit_base = (dit_bf16 / 4) if is_nf4 else (dit_bf16 / 2) if is_fp8 else dit_bf16
+
+        total_blocks = 48
+        blocks_to_swap = min(max(int(training.get('blocks_to_swap', 0)), 0), total_blocks - 1)
+        swap_savings = blocks_to_swap * (dit_base / total_blocks) * 0.95
+        model_size_gb = max(dit_base - swap_savings, 1.0)
+
+        # ── LoRA weights ──
+        rank = max(int(training.get('network_dim', 16)), 1)
+        mode = str(training.get('ltx2_mode', 'video'))
+        is_av = mode == 'av'
+        lora_base_per_rank = (12.75 if is_av else 6.0) / 1024  # GB per rank
+        preset_mult = {'t2v': 1.0, 'v2v': 1.44, 'audio': 0.52, 'full': 2.1}.get(
+            training.get('lora_target_preset'), 1.0)
+        lora_size_gb = rank * lora_base_per_rank * preset_mult
+
+        # ── Optimizer states ──
+        lora_param_count = lora_size_gb * (1024 ** 3) / 2  # bf16 -> count
+        opt_type = str(training.get('optimizer_type', 'adamw8bit')).lower()
+        is_8bit = '8bit' in opt_type
+        is_sf = 'schedulefree' in opt_type or opt_type == 'automagic'
+        opt_bytes = 6 if is_8bit else (14 if is_sf else 12)
+        optimizer_size_gb = (lora_param_count * opt_bytes) / (1024 ** 3)
+
+        # ── Activations ──
+        res_w = max(int(ds.get('resolution_w', 768)), 64)
+        res_h = max(int(ds.get('resolution_h', 512)), 64)
+        frames = max(int(ds.get('target_frames', 33)), 1)
+        batch_size = max(int(ds.get('batch_size', 1)), 1)
+
+        # Correct VAE compression factors
+        latent_f = max(1, (frames - 1) // 8 + 1)
+        latent_h = max(1, res_h // 32)
+        latent_w = max(1, res_w // 32)
+        seq_len = latent_f * latent_h * latent_w
+
+        hidden_dim = 4096
+        bytes_per_val = 1 if is_fp8 else 2
+        grad_ckpt = training.get('gradient_checkpointing', True)
+        blockwise = bool(training.get('blockwise_checkpointing'))
+
+        activ_coeff = 10 if not grad_ckpt else (1 if blockwise else 2)
+        effective_layers = total_blocks if not blockwise else 2
+        per_layer_bytes = activ_coeff * batch_size * seq_len * hidden_dim * bytes_per_val
+        activations_gb = (per_layer_bytes * effective_layers) / (1024 ** 3)
+        if is_av:
+            activations_gb *= 1.25
+        if int(training.get('ffn_chunk_size', 0)) > 0:
+            activations_gb *= 0.90
+
+        # Fixed buffers
+        latent_bytes = batch_size * 128 * latent_f * latent_h * latent_w * 2 * 2
+        text_bytes = batch_size * 256 * (7680 if is_av else 3840) * 2
+        buffer_gb = (latent_bytes + text_bytes) / (1024 ** 3) + 0.5
+        activations_gb = max(0.3, activations_gb + buffer_gb)
+
+        # ── Gradients ──
+        grads_gb = lora_size_gb
+
+        peak_training_gb = model_size_gb + lora_size_gb + optimizer_size_gb + grads_gb + activations_gb
+
+        # Sampling VRAM (VAE loaded, lighter activations)
+        peak_sampling_gb = model_size_gb + 0.3 + (activations_gb * 0.3)
+        if training.get('sample_with_offloading'):
+            peak_sampling_gb *= 0.6
+
+        breakdown = {
+            'model': round(model_size_gb, 2),
+            'lora': round(lora_size_gb, 2),
+            'optimizer': round(optimizer_size_gb, 2),
+            'gradients': round(grads_gb, 2),
+            'activations': round(activations_gb, 2),
+        }
+
+        return VRAMStats(
+            peak_training_gb=round(peak_training_gb, 2),
+            peak_sampling_gb=round(peak_sampling_gb, 2),
+            model_size_gb=round(model_size_gb, 2),
+            optimizer_size_gb=round(optimizer_size_gb, 2),
+            activations_gb=round(activations_gb, 2),
+            breakdown=breakdown
+        )
+
+    except Exception as e:
+        logger.warning(f"Failed to calculate VRAM stats: {e}")
+        return None
+
+
+@router.get("", response_model=ProjectStats)
+async def get_project_stats(request: Request):
+    """Get comprehensive project statistics."""
+    config = request.app.state.project_config
+    if not config:
+        return ProjectStats(dataset=None, training=None, vram=None)
+
+    config_dict = config.model_dump()
+
+    # Dataset stats
+    dataset_stats = None
+    dataset_config = config_dict.get('dataset', {})
+    datasets = dataset_config.get('datasets', []) if dataset_config else []
+
+    # Scan first dataset entry
+    if datasets and len(datasets) > 0:
+        first_dataset = datasets[0]
+        dataset_dir = first_dataset.get('directory', '')
+        if dataset_dir:
+            dataset_stats = _scan_dataset(dataset_dir)
+
+    # Training stats (only if we have dataset info)
+    training_stats = None
+    if dataset_stats:
+        training_stats = _calculate_training_stats(config_dict, dataset_stats)
+
+    # VRAM stats (can calculate without dataset)
+    vram_stats = _calculate_vram_stats(config_dict)
+
+    return ProjectStats(
+        dataset=dataset_stats,
+        training=training_stats,
+        vram=vram_stats
+    )
