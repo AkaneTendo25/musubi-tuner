@@ -3176,8 +3176,9 @@ class LTX2NetworkTrainer(NetworkTrainer):
         caption_channels = getattr(transformer, "caption_channels", None)
         if caption_channels is None:
             base_model = transformer.model if hasattr(transformer, "model") else transformer
-            if hasattr(base_model, "caption_projection"):
-                caption_channels = getattr(getattr(base_model, "caption_projection", None), "in_features", None)
+            _caption_proj = getattr(base_model, "caption_projection", None)
+            if _caption_proj is not None:
+                caption_channels = getattr(getattr(_caption_proj, "linear_1", None), "in_features", None)
         if caption_channels is not None:
             expected_last_dim = int(caption_channels) * (2 if audio_enabled_for_batch else 1)
             if text_embeds.shape[-1] != expected_last_dim:
@@ -3187,7 +3188,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
                     and audio_regularizer_active
                     and text_embeds.shape[-1] * 2 == expected_last_dim
                 ):
-                    text_embeds = torch.cat([text_embeds, text_embeds], dim=-1)
+                    text_embeds = torch.cat([text_embeds, torch.zeros_like(text_embeds)], dim=-1)
                     expected_last_dim = text_embeds.shape[-1]
                 else:
                     raise ValueError(
@@ -3210,6 +3211,14 @@ class LTX2NetworkTrainer(NetworkTrainer):
                     f"{mode_name} received text embeddings with incompatible hidden size for this checkpoint. "
                     f"Expected dim={expected_ctx_dim}, got dim={text_embeds.shape[-1]}. "
                     "Ensure caches contain modality-specific embeddings generated with the same --ltx2_checkpoint."
+                )
+
+        if self._ltx_mode == "video" and bool(getattr(base_model, "caption_proj_before_connector", False)):
+            if expected_video_dim > 0 and int(text_embeds.shape[-1]) != expected_video_dim:
+                raise ValueError(
+                    f"Video mode received text embeddings with incompatible hidden size for this checkpoint. "
+                    f"Expected dim={expected_video_dim}, got dim={text_embeds.shape[-1]}. "
+                    "Ensure text encoder caches were generated with the same --ltx2_checkpoint."
                 )
 
         model_input = model_noisy_video

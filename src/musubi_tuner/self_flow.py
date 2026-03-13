@@ -114,6 +114,14 @@ class SelfFlowModule:
     def current_lambda_delta(self) -> float:
         return float(self._current_lambda_delta)
 
+    @property
+    def has_active_loss(self) -> bool:
+        return (
+            float(self.config.lambda_self_flow) > 0.0
+            or (str(self.config.temporal_mode).lower() in {"frame", "hybrid"} and self.current_lambda_temporal > 0.0)
+            or (str(self.config.temporal_mode).lower() in {"delta", "hybrid"} and self.current_lambda_delta > 0.0)
+        )
+
     def _get_blocks(self) -> tuple[list[nn.Module], int]:
         blocks = getattr(self.transformer, "transformer_blocks", None)
         if blocks is None:
@@ -367,12 +375,7 @@ class SelfFlowModule:
         frame_rate: int | float,
         transformer_options: Dict[str, Any],
     ) -> None:
-        has_active_loss = (
-            float(self.config.lambda_self_flow) > 0.0
-            or (str(self.config.temporal_mode).lower() in {"frame", "hybrid"} and self.current_lambda_temporal > 0.0)
-            or (str(self.config.temporal_mode).lower() in {"delta", "hybrid"} and self.current_lambda_delta > 0.0)
-        )
-        if self.projector is None or not has_active_loss:
+        if self.projector is None or not self.has_active_loss:
             return
         self._teacher_features = None
         backups = self._swap_in_teacher(network)
@@ -677,12 +680,7 @@ class SelfFlowModule:
         latent_height: Optional[int] = None,
         latent_width: Optional[int] = None,
     ) -> Optional[torch.Tensor]:
-        has_active_loss = (
-            float(self.config.lambda_self_flow) > 0.0
-            or (str(self.config.temporal_mode).lower() in {"frame", "hybrid"} and self.current_lambda_temporal > 0.0)
-            or (str(self.config.temporal_mode).lower() in {"delta", "hybrid"} and self.current_lambda_delta > 0.0)
-        )
-        if self.projector is None or not has_active_loss:
+        if self.projector is None or not self.has_active_loss:
             return None
         if self._student_features is None or self._teacher_features is None:
             return None
