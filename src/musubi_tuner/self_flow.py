@@ -26,6 +26,21 @@ class SelfFlowConfig:
     student_block_ratio: Optional[float] = None
     teacher_block_ratio: Optional[float] = None
     lambda_self_flow: float = 0.1
+    temporal_mode: str = "off"  # "off" | "frame" | "delta" | "hybrid"
+    lambda_temporal: float = 0.0
+    lambda_delta: float = 0.0
+    temporal_tau: float = 1.0
+    num_neighbors: int = 2
+    temporal_granularity: str = "frame"  # "frame" | "patch"
+    patch_spatial_radius: int = 0
+    patch_match_mode: str = "hard"  # "hard" | "soft"
+    patch_match_temperature: float = 0.1
+    delta_num_steps: int = 1
+    motion_weighting: str = "none"  # "none" | "teacher_delta"
+    motion_weight_strength: float = 0.0
+    temporal_schedule: str = "constant"  # "constant" | "linear" | "cosine"
+    temporal_warmup_steps: int = 0
+    temporal_max_steps: int = 0
     mask_ratio: float = 0.10
     teacher_momentum: float = 0.999
     teacher_update_interval: int = 1
@@ -72,12 +87,32 @@ class SelfFlowModule:
         self._shadow_params: Dict[str, torch.Tensor] = {}
         self._step_counter: int = 0
         self._last_cosine: Optional[float] = None
+        self._last_frame_cosine: Optional[float] = None
+        self._last_delta_cosine: Optional[float] = None
+        self._current_lambda_temporal: float = float(config.lambda_temporal)
+        self._current_lambda_delta: float = float(config.lambda_delta)
         self._resolved_student_block_idx: Optional[int] = None
         self._resolved_teacher_block_idx: Optional[int] = None
 
     @property
     def last_cosine(self) -> Optional[float]:
         return self._last_cosine
+
+    @property
+    def last_frame_cosine(self) -> Optional[float]:
+        return self._last_frame_cosine
+
+    @property
+    def last_delta_cosine(self) -> Optional[float]:
+        return self._last_delta_cosine
+
+    @property
+    def current_lambda_temporal(self) -> float:
+        return float(self._current_lambda_temporal)
+
+    @property
+    def current_lambda_delta(self) -> float:
+        return float(self._current_lambda_delta)
 
     def _get_blocks(self) -> tuple[list[nn.Module], int]:
         blocks = getattr(self.transformer, "transformer_blocks", None)
@@ -152,7 +187,12 @@ class SelfFlowModule:
         self._install_hooks(blocks)
         logger.info(
             "Self-Flow ready: student_block=%d teacher_block=%d student_ratio=%s teacher_ratio=%s "
-            "mask_ratio=%.3f lambda=%.4f momentum=%.4f dual_timestep=%s tokenwise_timestep=%s "
+            "mask_ratio=%.3f lambda=%.4f temporal_mode=%s lambda_temporal=%.4f lambda_delta=%.4f "
+            "temporal_tau=%.3f num_neighbors=%d temporal_granularity=%s patch_spatial_radius=%d "
+            "patch_match_mode=%s patch_match_temperature=%.4f delta_num_steps=%d motion_weighting=%s "
+            "motion_weight_strength=%.4f temporal_schedule=%s "
+            "temporal_warmup_steps=%d temporal_max_steps=%d "
+            "momentum=%.4f dual_timestep=%s tokenwise_timestep=%s "
             "offload_teacher_params=%s projector_lr=%s",
             student_idx,
             teacher_idx,
@@ -160,6 +200,21 @@ class SelfFlowModule:
             self.config.teacher_block_ratio,
             self.config.mask_ratio,
             self.config.lambda_self_flow,
+            self.config.temporal_mode,
+            self.config.lambda_temporal,
+            self.config.lambda_delta,
+            self.config.temporal_tau,
+            self.config.num_neighbors,
+            self.config.temporal_granularity,
+            self.config.patch_spatial_radius,
+            self.config.patch_match_mode,
+            self.config.patch_match_temperature,
+            self.config.delta_num_steps,
+            self.config.motion_weighting,
+            self.config.motion_weight_strength,
+            self.config.temporal_schedule,
+            self.config.temporal_warmup_steps,
+            self.config.temporal_max_steps,
             self.config.teacher_momentum,
             str(self.config.dual_timestep).lower(),
             str(self.config.tokenwise_timestep).lower(),
@@ -262,6 +317,37 @@ class SelfFlowModule:
         self._capture_mode = "idle"
         self._student_features = None
         self._teacher_features = None
+        self._last_cosine = None
+        self._last_frame_cosine = None
+        self._last_delta_cosine = None
+
+    def on_step(self, global_step: int) -> None:
+        scale = self._schedule_scale(global_step)
+        self._current_lambda_temporal = float(self.config.lambda_temporal) * scale
+        self._current_lambda_delta = float(self.config.lambda_delta) * scale
+
+    def _schedule_scale(self, global_step: int) -> float:
+        schedule = str(self.config.temporal_schedule).lower()
+        if schedule == "constant":
+            return 1.0
+
+        warmup_steps = max(0, int(self.config.temporal_warmup_steps))
+        if warmup_steps > 0 and global_step < warmup_steps:
+            return float(global_step) / float(warmup_steps)
+
+        max_steps = max(0, int(self.config.temporal_max_steps))
+        if max_steps <= 0:
+            return 1.0
+
+        progress = min(
+            max(float(global_step - warmup_steps), 0.0) / max(float(max_steps - warmup_steps), 1.0),
+            1.0,
+        )
+        if schedule == "linear":
+            return 1.0 - progress
+        if schedule == "cosine":
+            return 0.5 * (1.0 + math.cos(math.pi * progress))
+        return 1.0
 
     def get_trainable_params(self) -> list[torch.nn.Parameter]:
         if self.projector is None:
@@ -281,7 +367,12 @@ class SelfFlowModule:
         frame_rate: int | float,
         transformer_options: Dict[str, Any],
     ) -> None:
-        if self.projector is None or self.config.lambda_self_flow <= 0.0:
+        has_active_loss = (
+            float(self.config.lambda_self_flow) > 0.0
+            or (str(self.config.temporal_mode).lower() in {"frame", "hybrid"} and self.current_lambda_temporal > 0.0)
+            or (str(self.config.temporal_mode).lower() in {"delta", "hybrid"} and self.current_lambda_delta > 0.0)
+        )
+        if self.projector is None or not has_active_loss:
             return
         self._teacher_features = None
         backups = self._swap_in_teacher(network)
@@ -312,8 +403,286 @@ class SelfFlowModule:
         ):
             self._teacher_features = self._teacher_features.to(device="cpu", non_blocking=False)
 
-    def compute_loss_from_cached_features(self) -> Optional[torch.Tensor]:
-        if self.projector is None or self.config.lambda_self_flow <= 0.0:
+    def _loss_from_cosine(self, cosine: torch.Tensor) -> torch.Tensor:
+        if self.config.loss_type == "one_minus_cosine":
+            return 1.0 - cosine
+        return -cosine
+
+    def _reshape_temporal_features(
+        self, features: torch.Tensor, num_latent_frames: Optional[int]
+    ) -> Optional[torch.Tensor]:
+        if num_latent_frames is None:
+            return None
+        total_tokens = int(features.shape[1])
+        num_frames = int(num_latent_frames)
+        if num_frames <= 1 or total_tokens < num_frames:
+            return None
+        usable_tokens = (total_tokens // num_frames) * num_frames
+        if usable_tokens <= 0:
+            return None
+        if usable_tokens != total_tokens:
+            features = features[:, :usable_tokens]
+        spatial_tokens = usable_tokens // num_frames
+        return features.reshape(features.shape[0], num_frames, spatial_tokens, features.shape[-1])
+
+    @staticmethod
+    def _reshape_temporal_grid(
+        features: torch.Tensor,
+        *,
+        num_latent_frames: Optional[int],
+        latent_height: Optional[int],
+        latent_width: Optional[int],
+    ) -> Optional[torch.Tensor]:
+        if num_latent_frames is None or latent_height is None or latent_width is None:
+            return None
+        num_frames = int(num_latent_frames)
+        height = int(latent_height)
+        width = int(latent_width)
+        if num_frames <= 1 or height <= 0 or width <= 0:
+            return None
+        expected_tokens = num_frames * height * width
+        total_tokens = int(features.shape[1])
+        if total_tokens < expected_tokens:
+            return None
+        if total_tokens != expected_tokens:
+            features = features[:, :expected_tokens]
+        return features.reshape(features.shape[0], num_frames, height, width, features.shape[-1])
+
+    @staticmethod
+    def _neighbor_weighted_cosine(
+        student_frames: torch.Tensor,
+        teacher_frames: torch.Tensor,
+        *,
+        num_neighbors: int,
+        temporal_tau: float,
+        motion_weights: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        sim = torch.bmm(student_frames, teacher_frames.transpose(1, 2))
+        num_frames = sim.shape[1]
+        tau = max(float(temporal_tau), 1e-6)
+        total = sim.new_zeros(())
+        normalizer = sim.new_zeros(())
+
+        for delta in range(0, max(0, int(num_neighbors)) + 1):
+            weight = 1.0 if delta == 0 else math.exp(-float(delta) / tau)
+            if delta == 0:
+                diag = sim.diagonal(dim1=1, dim2=2)
+                if motion_weights is None:
+                    total = total + diag.sum()
+                    normalizer = normalizer + sim.new_tensor(diag.numel() * weight)
+                else:
+                    cast_weights = motion_weights.to(device=diag.device, dtype=diag.dtype)
+                    total = total + weight * (diag * cast_weights).sum()
+                    normalizer = normalizer + weight * cast_weights.sum()
+                continue
+
+            forward = sim.diagonal(offset=delta, dim1=1, dim2=2)
+            backward = sim.diagonal(offset=-delta, dim1=1, dim2=2)
+            if motion_weights is None:
+                total = total + weight * (forward.sum() + backward.sum())
+                normalizer = normalizer + sim.new_tensor(
+                    sim.shape[0] * (forward.shape[-1] + backward.shape[-1]) * weight
+                )
+            else:
+                forward_weights = motion_weights[:, :-delta].to(device=forward.device, dtype=forward.dtype)
+                backward_weights = motion_weights[:, delta:].to(device=backward.device, dtype=backward.dtype)
+                total = total + weight * (forward * forward_weights).sum()
+                total = total + weight * (backward * backward_weights).sum()
+                normalizer = normalizer + weight * (forward_weights.sum() + backward_weights.sum())
+
+        if normalizer.item() <= 0.0:
+            return sim.diagonal(dim1=1, dim2=2).mean()
+        return total / normalizer
+
+    @staticmethod
+    def _normalize_motion_weights(motion: torch.Tensor, strength: float) -> torch.Tensor:
+        if float(strength) <= 0.0:
+            return torch.ones_like(motion)
+        motion = motion.to(dtype=torch.float32)
+        baseline = motion.mean()
+        if not torch.isfinite(baseline) or float(baseline.item()) <= 1e-8:
+            return torch.ones_like(motion)
+        normalized = motion / baseline.clamp_min(1e-8)
+        weights = 1.0 + float(strength) * normalized
+        return weights.to(dtype=motion.dtype)
+
+    @staticmethod
+    def _teacher_delta_motion_weights(
+        teacher_frames: torch.Tensor,
+        *,
+        strength: float,
+    ) -> torch.Tensor:
+        if float(strength) <= 0.0:
+            return torch.ones(teacher_frames.shape[:-1], device=teacher_frames.device, dtype=teacher_frames.dtype)
+        if teacher_frames.shape[1] <= 1:
+            return torch.ones(teacher_frames.shape[:-1], device=teacher_frames.device, dtype=teacher_frames.dtype)
+
+        forward = (teacher_frames[:, 1:] - teacher_frames[:, :-1]).pow(2).mean(dim=-1)
+        motion = torch.zeros(teacher_frames.shape[:-1], device=teacher_frames.device, dtype=teacher_frames.dtype)
+        motion[:, :-1] = motion[:, :-1] + forward
+        motion[:, 1:] = motion[:, 1:] + forward
+        return SelfFlowModule._normalize_motion_weights(motion, strength)
+
+    @staticmethod
+    def _neighbor_weighted_local_patch_cosine(
+        student_frames: torch.Tensor,
+        teacher_frames: torch.Tensor,
+        *,
+        num_neighbors: int,
+        temporal_tau: float,
+        spatial_radius: int,
+        patch_match_mode: str,
+        patch_match_temperature: float,
+        motion_weights: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if spatial_radius <= 0:
+            flat_student = student_frames.reshape(
+                student_frames.shape[0], student_frames.shape[1], student_frames.shape[2] * student_frames.shape[3], student_frames.shape[4]
+            )
+            flat_teacher = teacher_frames.reshape(
+                teacher_frames.shape[0], teacher_frames.shape[1], teacher_frames.shape[2] * teacher_frames.shape[3], teacher_frames.shape[4]
+            )
+            sim = torch.einsum("btnd,bsnd->btsn", flat_student, flat_teacher)
+            tau = max(float(temporal_tau), 1e-6)
+            total = sim.new_zeros(())
+            normalizer = sim.new_zeros(())
+
+            def _reduce(values: torch.Tensor, weight: float, weights_slice: Optional[torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
+                local_values = values.mean(dim=-1)
+                if weights_slice is None:
+                    return weight * local_values.sum(), sim.new_tensor(local_values.numel() * weight)
+                weights_view = weights_slice.to(device=local_values.device, dtype=local_values.dtype).reshape_as(local_values)
+                return (
+                    weight * (local_values * weights_view).sum(),
+                    weight * weights_view.sum(),
+                )
+
+            for delta in range(0, max(0, int(num_neighbors)) + 1):
+                weight = 1.0 if delta == 0 else math.exp(-float(delta) / tau)
+                if delta == 0:
+                    diag = sim.diagonal(dim1=1, dim2=2).permute(0, 2, 1)
+                    part_total, part_norm = _reduce(diag, weight, motion_weights)
+                    total = total + part_total
+                    normalizer = normalizer + part_norm
+                    continue
+
+                forward = sim.diagonal(offset=delta, dim1=1, dim2=2).permute(0, 2, 1)
+                backward = sim.diagonal(offset=-delta, dim1=1, dim2=2).permute(0, 2, 1)
+                forward_weights = None if motion_weights is None else motion_weights[:, :-delta]
+                backward_weights = None if motion_weights is None else motion_weights[:, delta:]
+                part_total, part_norm = _reduce(forward, weight, forward_weights)
+                total = total + part_total
+                normalizer = normalizer + part_norm
+                part_total, part_norm = _reduce(backward, weight, backward_weights)
+                total = total + part_total
+                normalizer = normalizer + part_norm
+
+            if normalizer.item() <= 0.0:
+                return sim.diagonal(dim1=1, dim2=2).mean()
+            return total / normalizer
+
+        batch_size, num_frames, height, width, channels = teacher_frames.shape
+        kernel_size = 2 * int(spatial_radius) + 1
+        teacher_bt = teacher_frames.permute(0, 1, 4, 2, 3).reshape(batch_size * num_frames, channels, height, width)
+        teacher_neighborhoods = F.unfold(teacher_bt, kernel_size=kernel_size, padding=int(spatial_radius))
+        neighborhood_size = kernel_size * kernel_size
+        teacher_neighborhoods = teacher_neighborhoods.reshape(
+            batch_size, num_frames, channels, neighborhood_size, height, width
+        ).permute(0, 1, 4, 5, 3, 2)
+
+        tau = max(float(temporal_tau), 1e-6)
+        total = student_frames.new_zeros(())
+        normalizer = student_frames.new_zeros(())
+
+        def _accumulate(
+            student_slice: torch.Tensor,
+            teacher_slice: torch.Tensor,
+            weight: float,
+            weights_slice: Optional[torch.Tensor],
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            similarities = (student_slice.unsqueeze(-2) * teacher_slice).sum(dim=-1)
+            if patch_match_mode == "soft":
+                temperature = max(float(patch_match_temperature), 1e-6)
+                attn = torch.softmax(similarities / temperature, dim=-1)
+                matched = (attn * similarities).sum(dim=-1)
+            else:
+                matched = similarities.max(dim=-1).values
+            if weights_slice is None:
+                return weight * matched.sum(), student_frames.new_tensor(matched.numel() * weight)
+            local_weights = weights_slice.to(device=matched.device, dtype=matched.dtype)
+            return weight * (matched * local_weights).sum(), weight * local_weights.sum()
+
+        for delta in range(0, max(0, int(num_neighbors)) + 1):
+            weight = 1.0 if delta == 0 else math.exp(-float(delta) / tau)
+            if delta == 0:
+                delta_total, delta_norm = _accumulate(student_frames, teacher_neighborhoods, weight, motion_weights)
+                total = total + delta_total
+                normalizer = normalizer + delta_norm
+                continue
+
+            forward_weights = None if motion_weights is None else motion_weights[:, :-delta]
+            backward_weights = None if motion_weights is None else motion_weights[:, delta:]
+            forward_total, forward_norm = _accumulate(
+                student_frames[:, :-delta], teacher_neighborhoods[:, delta:], weight, forward_weights
+            )
+            backward_total, backward_norm = _accumulate(
+                student_frames[:, delta:], teacher_neighborhoods[:, :-delta], weight, backward_weights
+            )
+            total = total + forward_total + backward_total
+            normalizer = normalizer + forward_norm + backward_norm
+
+        if normalizer.item() <= 0.0:
+            return student_frames.new_zeros(())
+        return total / normalizer
+
+    @staticmethod
+    def _multi_step_delta_cosine(
+        student_frames: torch.Tensor,
+        teacher_frames: torch.Tensor,
+        *,
+        delta_num_steps: int,
+        temporal_tau: float,
+        motion_weights: Optional[torch.Tensor] = None,
+    ) -> Optional[torch.Tensor]:
+        max_step = min(max(1, int(delta_num_steps)), max(student_frames.shape[1] - 1, 0), max(teacher_frames.shape[1] - 1, 0))
+        if max_step <= 0:
+            return None
+
+        total = student_frames.new_zeros(())
+        normalizer = student_frames.new_zeros(())
+        tau = max(float(temporal_tau), 1e-6)
+
+        for step in range(1, max_step + 1):
+            weight = math.exp(-float(step - 1) / tau)
+            student_delta = F.normalize(student_frames[:, step:] - student_frames[:, :-step], dim=-1)
+            teacher_delta = F.normalize(teacher_frames[:, step:] - teacher_frames[:, :-step], dim=-1)
+            cosine = F.cosine_similarity(student_delta, teacher_delta, dim=-1)
+            step_weights = None if motion_weights is None else motion_weights[:, step:]
+            if step_weights is None:
+                total = total + weight * cosine.sum()
+                normalizer = normalizer + student_frames.new_tensor(cosine.numel() * weight)
+            else:
+                cast_weights = step_weights.to(device=cosine.device, dtype=cosine.dtype)
+                total = total + weight * (cosine * cast_weights).sum()
+                normalizer = normalizer + weight * cast_weights.sum()
+
+        if normalizer.item() <= 0.0:
+            return None
+        return total / normalizer
+
+    def compute_loss_from_cached_features(
+        self,
+        *,
+        num_latent_frames: Optional[int] = None,
+        latent_height: Optional[int] = None,
+        latent_width: Optional[int] = None,
+    ) -> Optional[torch.Tensor]:
+        has_active_loss = (
+            float(self.config.lambda_self_flow) > 0.0
+            or (str(self.config.temporal_mode).lower() in {"frame", "hybrid"} and self.current_lambda_temporal > 0.0)
+            or (str(self.config.temporal_mode).lower() in {"delta", "hybrid"} and self.current_lambda_delta > 0.0)
+        )
+        if self.projector is None or not has_active_loss:
             return None
         if self._student_features is None or self._teacher_features is None:
             return None
@@ -328,16 +697,138 @@ class SelfFlowModule:
             teacher_feat = teacher_feat[:, :min_tokens]
 
         student_proj = self.projector(student_feat)
-        student_proj = F.normalize(student_proj, dim=-1)
-        teacher_norm = F.normalize(teacher_feat.detach(), dim=-1)
-        cosine = F.cosine_similarity(student_proj, teacher_norm, dim=-1).mean()
-        self._last_cosine = float(cosine.detach().item())
+        teacher_feat = teacher_feat.detach()
 
-        if self.config.loss_type == "one_minus_cosine":
-            rep_loss = 1.0 - cosine
-        else:
-            rep_loss = -cosine
-        loss = rep_loss * float(self.config.lambda_self_flow)
+        student_proj_norm = F.normalize(student_proj, dim=-1)
+        teacher_norm = F.normalize(teacher_feat, dim=-1)
+        cosine = F.cosine_similarity(student_proj_norm, teacher_norm, dim=-1).mean()
+        self._last_cosine = float(cosine.detach().item())
+        loss = cosine.new_zeros(())
+        applied_terms = 0
+        if float(self.config.lambda_self_flow) > 0.0:
+            loss = loss + self._loss_from_cosine(cosine) * float(self.config.lambda_self_flow)
+            applied_terms += 1
+
+        temporal_mode = str(self.config.temporal_mode).lower()
+        temporal_granularity = str(self.config.temporal_granularity).lower()
+        motion_weighting = str(self.config.motion_weighting).lower()
+        temporal_student = self._reshape_temporal_features(student_proj, num_latent_frames)
+        temporal_teacher = self._reshape_temporal_features(teacher_feat, num_latent_frames)
+        temporal_student_grid = self._reshape_temporal_grid(
+            student_proj,
+            num_latent_frames=num_latent_frames,
+            latent_height=latent_height,
+            latent_width=latent_width,
+        )
+        temporal_teacher_grid = self._reshape_temporal_grid(
+            teacher_feat,
+            num_latent_frames=num_latent_frames,
+            latent_height=latent_height,
+            latent_width=latent_width,
+        )
+        temporal_motion_weights = None
+        temporal_motion_grid_weights = None
+        if motion_weighting == "teacher_delta":
+            if temporal_teacher is not None:
+                temporal_motion_weights = self._teacher_delta_motion_weights(
+                    temporal_teacher,
+                    strength=self.config.motion_weight_strength,
+                )
+            if temporal_teacher_grid is not None:
+                temporal_motion_grid_weights = self._teacher_delta_motion_weights(
+                    temporal_teacher_grid,
+                    strength=self.config.motion_weight_strength,
+                )
+
+        if (
+            temporal_mode in {"frame", "hybrid"}
+            and self.current_lambda_temporal > 0.0
+            and temporal_student is not None
+            and temporal_teacher is not None
+        ):
+            if temporal_granularity == "patch":
+                if temporal_student_grid is not None and temporal_teacher_grid is not None:
+                    student_frames = F.normalize(temporal_student_grid, dim=-1)
+                    teacher_frames = F.normalize(temporal_teacher_grid, dim=-1)
+                    frame_cosine = self._neighbor_weighted_local_patch_cosine(
+                        student_frames,
+                        teacher_frames,
+                        num_neighbors=self.config.num_neighbors,
+                        temporal_tau=self.config.temporal_tau,
+                        spatial_radius=self.config.patch_spatial_radius,
+                        patch_match_mode=self.config.patch_match_mode,
+                        patch_match_temperature=self.config.patch_match_temperature,
+                        motion_weights=temporal_motion_grid_weights,
+                    )
+                else:
+                    student_frames = F.normalize(temporal_student, dim=-1)
+                    teacher_frames = F.normalize(temporal_teacher, dim=-1)
+                    flat_motion_weights = None
+                    if temporal_motion_weights is not None:
+                        flat_motion_weights = temporal_motion_weights.mean(dim=-1).unsqueeze(2)
+                    frame_cosine = self._neighbor_weighted_local_patch_cosine(
+                        student_frames.reshape(student_frames.shape[0], student_frames.shape[1], 1, student_frames.shape[2], student_frames.shape[3]),
+                        teacher_frames.reshape(teacher_frames.shape[0], teacher_frames.shape[1], 1, teacher_frames.shape[2], teacher_frames.shape[3]),
+                        num_neighbors=self.config.num_neighbors,
+                        temporal_tau=self.config.temporal_tau,
+                        spatial_radius=0,
+                        patch_match_mode=self.config.patch_match_mode,
+                        patch_match_temperature=self.config.patch_match_temperature,
+                        motion_weights=flat_motion_weights,
+                    )
+            else:
+                student_frames = F.normalize(temporal_student.mean(dim=2), dim=-1)
+                teacher_frames = F.normalize(temporal_teacher.mean(dim=2), dim=-1)
+                frame_motion_weights = None
+                if temporal_motion_weights is not None:
+                    frame_motion_weights = temporal_motion_weights.mean(dim=-1)
+                frame_cosine = self._neighbor_weighted_cosine(
+                    student_frames,
+                    teacher_frames,
+                    num_neighbors=self.config.num_neighbors,
+                    temporal_tau=self.config.temporal_tau,
+                    motion_weights=frame_motion_weights,
+                )
+            self._last_frame_cosine = float(frame_cosine.detach().item())
+            loss = loss + self._loss_from_cosine(frame_cosine) * self.current_lambda_temporal
+            applied_terms += 1
+
+        if (
+            temporal_mode in {"delta", "hybrid"}
+            and self.current_lambda_delta > 0.0
+            and temporal_student is not None
+            and temporal_teacher is not None
+            and temporal_student.shape[1] > 1
+            and temporal_teacher.shape[1] > 1
+        ):
+            if temporal_granularity == "patch":
+                delta_cosine = self._multi_step_delta_cosine(
+                    temporal_student,
+                    temporal_teacher,
+                    delta_num_steps=self.config.delta_num_steps,
+                    temporal_tau=self.config.temporal_tau,
+                    motion_weights=temporal_motion_weights,
+                )
+            else:
+                student_frames = temporal_student.mean(dim=2)
+                teacher_frames = temporal_teacher.mean(dim=2)
+                frame_motion_weights = None
+                if temporal_motion_weights is not None:
+                    frame_motion_weights = temporal_motion_weights.mean(dim=-1)
+                delta_cosine = self._multi_step_delta_cosine(
+                    student_frames,
+                    teacher_frames,
+                    delta_num_steps=self.config.delta_num_steps,
+                    temporal_tau=self.config.temporal_tau,
+                    motion_weights=frame_motion_weights,
+                )
+            if delta_cosine is not None and torch.isfinite(delta_cosine):
+                self._last_delta_cosine = float(delta_cosine.detach().item())
+                loss = loss + self._loss_from_cosine(delta_cosine) * self.current_lambda_delta
+                applied_terms += 1
+
+        if applied_terms == 0:
+            return None
 
         if not torch.isfinite(loss):
             logger.warning("Self-Flow loss is non-finite (%.4g), skipping", loss.item())
@@ -346,7 +837,11 @@ class SelfFlowModule:
 
     def compute_loss(self, **_kwargs) -> Optional[torch.Tensor]:
         # Backward-compatible shim: loss is now computed from already-cached student/teacher features.
-        return self.compute_loss_from_cached_features()
+        return self.compute_loss_from_cached_features(
+            num_latent_frames=_kwargs.get("num_latent_frames"),
+            latent_height=_kwargs.get("latent_height"),
+            latent_width=_kwargs.get("latent_width"),
+        )
 
     def remove_hooks(self) -> None:
         for hook in self._hooks:

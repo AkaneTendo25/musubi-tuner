@@ -630,6 +630,36 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
             args_parts.append("dual_timestep=false")
         if t.self_flow_projector_lr is not None:
             args_parts.append(f"projector_lr={t.self_flow_projector_lr}")
+        if getattr(t, "self_flow_temporal_mode", "off") != "off":
+            args_parts.append(f"temporal_mode={t.self_flow_temporal_mode}")
+        if getattr(t, "self_flow_lambda_temporal", 0.0) != 0.0:
+            args_parts.append(f"lambda_temporal={t.self_flow_lambda_temporal}")
+        if getattr(t, "self_flow_lambda_delta", 0.0) != 0.0:
+            args_parts.append(f"lambda_delta={t.self_flow_lambda_delta}")
+        if getattr(t, "self_flow_temporal_tau", 1.0) != 1.0:
+            args_parts.append(f"temporal_tau={t.self_flow_temporal_tau}")
+        if getattr(t, "self_flow_num_neighbors", 2) != 2:
+            args_parts.append(f"num_neighbors={t.self_flow_num_neighbors}")
+        if getattr(t, "self_flow_temporal_granularity", "frame") != "frame":
+            args_parts.append(f"temporal_granularity={t.self_flow_temporal_granularity}")
+        if getattr(t, "self_flow_patch_spatial_radius", 0) != 0:
+            args_parts.append(f"patch_spatial_radius={t.self_flow_patch_spatial_radius}")
+        if getattr(t, "self_flow_patch_match_mode", "hard") != "hard":
+            args_parts.append(f"patch_match_mode={t.self_flow_patch_match_mode}")
+        if getattr(t, "self_flow_delta_num_steps", 1) != 1:
+            args_parts.append(f"delta_num_steps={t.self_flow_delta_num_steps}")
+        if getattr(t, "self_flow_motion_weighting", "none") != "none":
+            args_parts.append(f"motion_weighting={t.self_flow_motion_weighting}")
+        if getattr(t, "self_flow_motion_weight_strength", 0.0) != 0.0:
+            args_parts.append(f"motion_weight_strength={t.self_flow_motion_weight_strength}")
+        if getattr(t, "self_flow_temporal_schedule", "constant") != "constant":
+            args_parts.append(f"temporal_schedule={t.self_flow_temporal_schedule}")
+        if getattr(t, "self_flow_temporal_warmup_steps", 0) != 0:
+            args_parts.append(f"temporal_warmup_steps={t.self_flow_temporal_warmup_steps}")
+        if getattr(t, "self_flow_temporal_max_steps", 0) != 0:
+            args_parts.append(f"temporal_max_steps={t.self_flow_temporal_max_steps}")
+        if getattr(t, "self_flow_offload_teacher_features", False):
+            args_parts.append("offload_teacher_features=true")
         if args_parts:
             cmd += ["--self_flow_args"] + args_parts
 

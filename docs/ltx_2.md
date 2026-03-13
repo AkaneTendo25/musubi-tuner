@@ -793,14 +793,20 @@ The cache file is saved to `<cache_directory>/ltx2_preservation_cache.pt` by def
 
 #### Self-Flow (Self-Supervised Flow Matching)
 
-**Self-Flow** — Self-supervised regularization with dual-timestep noising, EMA teacher feature alignment, and a small projector MLP. Based on [arXiv 2603.06507](https://arxiv.org/abs/2603.06507).
+**Self-Flow** prevents the fine-tuned model from drifting away from the pretrained model's internal representations. It aligns student features against an EMA-updated teacher copy using cosine similarity, with dual-timestep noising to decorrelate the two. The optional **temporal extension** adds frame-neighbor and motion-delta losses that explicitly preserve temporal coherence — useful when fine-tuning degrades motion smoothness or introduces flickering. Based on [arXiv 2603.06507](https://arxiv.org/abs/2603.06507).
 
 Enable with `--self_flow`. All parameters are passed via `--self_flow_args` as `key=value` pairs:
 
 ```bash
+# Base Self-Flow (token-level alignment only)
 accelerate launch ... ltx2_train_network.py ^
   --self_flow ^
-  --self_flow_args student_block_idx=16 teacher_block_idx=32 lambda_self_flow=0.1 mask_ratio=0.1 teacher_momentum=0.9999 dual_timestep=true tokenwise_timestep=true offload_teacher_features=true
+  --self_flow_args student_block_ratio=0.3 teacher_block_ratio=0.7 lambda_self_flow=0.1 mask_ratio=0.1 teacher_momentum=0.999 dual_timestep=true
+
+# With temporal consistency (hybrid = frame alignment + motion delta)
+accelerate launch ... ltx2_train_network.py ^
+  --self_flow ^
+  --self_flow_args lambda_self_flow=0.1 temporal_mode=hybrid lambda_temporal=0.1 lambda_delta=0.05 num_neighbors=2 temporal_granularity=frame
 ```
 
 ##### CLI Flags
@@ -819,6 +825,21 @@ accelerate launch ... ltx2_train_network.py ^
 | `student_block_ratio` | `None` | Optional ratio-based student layer selection. When set, resolves to `floor(ratio * depth)` |
 | `teacher_block_ratio` | `None` | Optional ratio-based teacher layer selection. When set, resolves to `ceil(ratio * depth)` |
 | `lambda_self_flow` | `0.1` | Loss weight for the Self-Flow representation term |
+| `temporal_mode` | `off` | Temporal extension mode: `off`, `frame`, `delta`, or `hybrid` |
+| `lambda_temporal` | `0.0` | Loss weight for frame-level temporal neighbor alignment |
+| `lambda_delta` | `0.0` | Loss weight for frame-delta alignment (motion consistency) |
+| `temporal_tau` | `1.0` | Neighbor decay factor for `frame` / `hybrid` temporal alignment |
+| `num_neighbors` | `2` | Number of temporal neighbors on each side used by `frame` / `hybrid` mode |
+| `temporal_granularity` | `frame` | Temporal loss granularity: `frame` (mean-pooled per frame) or `patch` (preserve spatial tokens) |
+| `patch_spatial_radius` | `0` | In `temporal_granularity=patch`, local spatial neighborhood radius for teacher patch matching (`0` = strict same-patch only) |
+| `patch_match_mode` | `hard` | Patch-neighborhood matching mode: `hard` (best patch in window) or `soft` (softmax-weighted neighborhood match) |
+| `patch_match_temperature` | `0.1` | Soft neighborhood matching temperature when `patch_match_mode=soft` |
+| `delta_num_steps` | `1` | Number of temporal delta steps included in the delta loss (`1` = adjacent frames only) |
+| `motion_weighting` | `none` | Temporal weighting mode: `none` or `teacher_delta` |
+| `motion_weight_strength` | `0.0` | Strength of teacher-delta motion weighting for temporal terms |
+| `temporal_schedule` | `constant` | Temporal weight schedule: `constant`, `linear`, or `cosine` |
+| `temporal_warmup_steps` | `0` | Linear warmup steps before temporal weights reach full strength |
+| `temporal_max_steps` | `0` | Total steps for `linear` / `cosine` decay. Defaults to `--max_train_steps` when unset |
 | `mask_ratio` | `0.10` | Token mask ratio for dual-timestep mixing. Valid range: `[0.0, 0.5]` |
 | `teacher_momentum` | `0.999` | EMA momentum for teacher updates. Valid range: `[0.0, 1.0)` |
 | `teacher_update_interval` | `1` | Update EMA teacher every N optimizer steps |
@@ -828,14 +849,22 @@ accelerate launch ... ltx2_train_network.py ^
 | `dual_timestep` | `true` | Enable dual-timestep noising |
 | `tokenwise_timestep` | `true` | Use per-token timesteps (otherwise per-sample averaged timestep) |
 | `offload_teacher_features` | `false` | Offload cached teacher features to CPU to reduce VRAM |
+| `offload_teacher_params` | `false` | Offload EMA teacher parameters to CPU (saves VRAM, slower teacher forward pass) |
 
 ##### Notes
 
 - Supported mode: `--ltx2_mode video` only.
 - Cost: one extra teacher forward pass per train step.
+- Temporal extension: when `temporal_mode != off`, Self-Flow reshapes hidden states into latent frames and adds frame-neighbor and/or frame-delta consistency losses on top of the base token alignment loss.
+- Granularity: `temporal_granularity=frame` uses mean-pooled per-frame features (cheaper, coarser). `temporal_granularity=patch` keeps spatial tokens for stronger temporal matching.
+- Local patch matching: when `temporal_granularity=patch` and `patch_spatial_radius > 0`, each student patch can align to the best teacher patch inside a local spatial window, which is more tolerant to small motion and camera drift than strict same-patch matching.
+- Soft matching: `patch_match_mode=soft` replaces hard local best-match selection with softmax-weighted neighborhood matching for smoother gradients.
+- Multi-step motion: `delta_num_steps > 1` extends the delta loss beyond adjacent frames using exponentially decayed step weights.
+- Motion-aware weighting: `motion_weighting=teacher_delta` upweights temporally active teacher regions, focusing the temporal loss on moving content.
+- Scheduling: `temporal_schedule`, `temporal_warmup_steps`, and `temporal_max_steps` affect only the temporal terms; the base `lambda_self_flow` token loss stays constant.
 - State files (Accelerate `*-state` folder): `self_flow_projector.safetensors`, `self_flow_teacher_ema.safetensors`.
 - Resume: both state files are loaded automatically when present.
-- Logged metrics: `loss/self_flow`, `self_flow/cosine`, `self_flow/masked_token_ratio`, `self_flow/tau_mean`, `self_flow/tau_min_mean`.
+- Logged metrics: `loss/self_flow`, `self_flow/cosine`, `self_flow/frame_cosine`, `self_flow/delta_cosine`, `self_flow/lambda_temporal`, `self_flow/lambda_delta`, `self_flow/masked_token_ratio`, `self_flow/tau_mean`, `self_flow/tau_min_mean`.
 
 #### Timestep Sampling
 - `--timestep_sampling shifted_logit_normal`: Default LTX-2 method. Uses a shifted logit-normal distribution where the shift is computed based on sequence length (frames × height × width).

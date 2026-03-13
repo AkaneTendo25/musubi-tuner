@@ -3753,6 +3753,8 @@ def main() -> None:
                 self_flow_metrics: dict[str, float] = {}
                 if bool(getattr(args, "self_flow", False)):
                     try:
+                        if getattr(trainer, "_self_flow", None) is not None:
+                            trainer._self_flow.on_step(global_step)
                         self_flow_loss, self_flow_metrics = trainer.compute_self_flow_addition(
                             args,
                             accelerator,

@@ -3225,6 +3225,8 @@ class NetworkTrainer:
                     # Self-Flow loss
                     self_flow_metrics = {}
                     if hasattr(self, "compute_self_flow_addition"):
+                        if hasattr(self, "_self_flow") and self._self_flow is not None:
+                            self._self_flow.on_step(global_step)
                         try:
                             self_flow_loss, self_flow_metrics = self.compute_self_flow_addition(
                                 args,

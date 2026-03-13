@@ -330,6 +330,21 @@ class TrainingConfig(BaseModel):
     self_flow_teacher_momentum: float = 0.999
     self_flow_dual_timestep: bool = True
     self_flow_projector_lr: Optional[float] = None
+    self_flow_temporal_mode: Literal["off", "frame", "delta", "hybrid"] = "off"
+    self_flow_lambda_temporal: float = 0.0
+    self_flow_lambda_delta: float = 0.0
+    self_flow_temporal_tau: float = 1.0
+    self_flow_num_neighbors: int = 2
+    self_flow_temporal_granularity: Literal["frame", "patch"] = "frame"
+    self_flow_patch_spatial_radius: int = 0
+    self_flow_patch_match_mode: Literal["hard", "soft"] = "hard"
+    self_flow_delta_num_steps: int = 1
+    self_flow_motion_weighting: Literal["none", "teacher_delta"] = "none"
+    self_flow_motion_weight_strength: float = 0.0
+    self_flow_temporal_schedule: Literal["constant", "linear", "cosine"] = "constant"
+    self_flow_temporal_warmup_steps: int = 0
+    self_flow_temporal_max_steps: int = 0
+    self_flow_offload_teacher_features: bool = False
 
     # Audio features
     audio_loss_balance_mode: Literal["none", "inv_freq", "ema_mag"] = "none"

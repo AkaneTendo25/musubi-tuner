@@ -963,11 +963,26 @@ class LTX2NetworkTrainer(NetworkTrainer):
         kw = parse_self_flow_args(getattr(args, "self_flow_args", None))
 
         cfg_kwargs: Dict[str, Any] = {}
-        int_keys = {"student_block_idx", "teacher_block_idx", "teacher_update_interval", "projector_hidden_multiplier"}
+        int_keys = {
+            "student_block_idx",
+            "teacher_block_idx",
+            "teacher_update_interval",
+            "projector_hidden_multiplier",
+            "num_neighbors",
+            "patch_spatial_radius",
+            "delta_num_steps",
+            "temporal_warmup_steps",
+            "temporal_max_steps",
+        }
         float_keys = {
             "student_block_ratio",
             "teacher_block_ratio",
             "lambda_self_flow",
+            "lambda_temporal",
+            "lambda_delta",
+            "temporal_tau",
+            "patch_match_temperature",
+            "motion_weight_strength",
             "mask_ratio",
             "teacher_momentum",
             "projector_lr",
@@ -988,6 +1003,9 @@ class LTX2NetworkTrainer(NetworkTrainer):
             else:
                 cfg_kwargs[k] = v
 
+        if "temporal_max_steps" not in cfg_kwargs and hasattr(args, "max_train_steps"):
+            cfg_kwargs["temporal_max_steps"] = args.max_train_steps
+
         config = SelfFlowConfig(**cfg_kwargs)
         if config.mask_ratio < 0.0 or config.mask_ratio > 0.5:
             raise ValueError("Self-Flow mask_ratio must be in [0, 0.5]")
@@ -1001,6 +1019,36 @@ class LTX2NetworkTrainer(NetworkTrainer):
             raise ValueError("Self-Flow projector_lr must be > 0")
         if config.loss_type not in {"negative_cosine", "one_minus_cosine"}:
             raise ValueError("Self-Flow loss_type must be one of: negative_cosine, one_minus_cosine")
+        if config.temporal_mode not in {"off", "frame", "delta", "hybrid"}:
+            raise ValueError("Self-Flow temporal_mode must be one of: off, frame, delta, hybrid")
+        if config.temporal_granularity not in {"frame", "patch"}:
+            raise ValueError("Self-Flow temporal_granularity must be one of: frame, patch")
+        if config.patch_spatial_radius < 0:
+            raise ValueError("Self-Flow patch_spatial_radius must be >= 0")
+        if config.patch_match_mode not in {"hard", "soft"}:
+            raise ValueError("Self-Flow patch_match_mode must be one of: hard, soft")
+        if config.patch_match_temperature <= 0.0:
+            raise ValueError("Self-Flow patch_match_temperature must be > 0")
+        if config.delta_num_steps < 1:
+            raise ValueError("Self-Flow delta_num_steps must be >= 1")
+        if config.motion_weighting not in {"none", "teacher_delta"}:
+            raise ValueError("Self-Flow motion_weighting must be one of: none, teacher_delta")
+        if config.motion_weight_strength < 0.0:
+            raise ValueError("Self-Flow motion_weight_strength must be >= 0")
+        if config.lambda_temporal < 0.0:
+            raise ValueError("Self-Flow lambda_temporal must be >= 0")
+        if config.lambda_delta < 0.0:
+            raise ValueError("Self-Flow lambda_delta must be >= 0")
+        if config.temporal_tau <= 0.0:
+            raise ValueError("Self-Flow temporal_tau must be > 0")
+        if config.num_neighbors < 0:
+            raise ValueError("Self-Flow num_neighbors must be >= 0")
+        if config.temporal_schedule not in {"constant", "linear", "cosine"}:
+            raise ValueError("Self-Flow temporal_schedule must be one of: constant, linear, cosine")
+        if config.temporal_warmup_steps < 0:
+            raise ValueError("Self-Flow temporal_warmup_steps must be >= 0")
+        if config.temporal_max_steps < 0:
+            raise ValueError("Self-Flow temporal_max_steps must be >= 0")
 
         unwrapped_transformer = accelerator.unwrap_model(transformer)
         unwrapped_network = accelerator.unwrap_model(network)
@@ -1155,7 +1203,11 @@ class LTX2NetworkTrainer(NetworkTrainer):
         if dit_inputs is None or sf_ctx is None:
             self._self_flow.cleanup_step()
             return None, {}
-        loss = self._self_flow.compute_loss_from_cached_features()
+        loss = self._self_flow.compute_loss_from_cached_features(
+            num_latent_frames=sf_ctx.get("num_latent_frames"),
+            latent_height=sf_ctx.get("latent_height"),
+            latent_width=sf_ctx.get("latent_width"),
+        )
 
         metrics: Dict[str, float] = {}
         if loss is not None:
@@ -1163,6 +1215,14 @@ class LTX2NetworkTrainer(NetworkTrainer):
         cosine = self._self_flow.last_cosine
         if cosine is not None:
             metrics["self_flow/cosine"] = float(cosine)
+        frame_cosine = self._self_flow.last_frame_cosine
+        if frame_cosine is not None:
+            metrics["self_flow/frame_cosine"] = float(frame_cosine)
+        delta_cosine = self._self_flow.last_delta_cosine
+        if delta_cosine is not None:
+            metrics["self_flow/delta_cosine"] = float(delta_cosine)
+        metrics["self_flow/lambda_temporal"] = float(self._self_flow.current_lambda_temporal)
+        metrics["self_flow/lambda_delta"] = float(self._self_flow.current_lambda_delta)
         if "masked_token_ratio" in sf_ctx:
             metrics["self_flow/masked_token_ratio"] = float(sf_ctx["masked_token_ratio"])
         if "tau_mean" in sf_ctx:
@@ -1829,6 +1889,9 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 "masked_token_ratio": float(mask.float().mean().item()),
                 "tau_mean": float(tau_tokens.mean().item()),
                 "tau_min_mean": float(tau_min.mean().item()),
+                "num_latent_frames": int(frames),
+                "latent_height": int(height),
+                "latent_width": int(width),
             }
             return noisy_model_input, timesteps_out
 
@@ -6184,8 +6247,13 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         type=str,
         nargs="*",
         help="Key=value args for Self-Flow, e.g. student_block_idx=16 teacher_block_idx=32 "
-             "lambda_self_flow=0.1 mask_ratio=0.1 teacher_momentum=0.999 dual_timestep=true "
-             "student_block_ratio=0.3 teacher_block_ratio=0.7 projector_lr=5e-5",
+        "lambda_self_flow=0.1 temporal_mode=hybrid lambda_temporal=0.1 lambda_delta=0.05 "
+        "temporal_tau=1.0 num_neighbors=2 temporal_granularity=patch patch_spatial_radius=1 "
+        "patch_match_mode=soft patch_match_temperature=0.2 delta_num_steps=2 "
+        "motion_weighting=teacher_delta motion_weight_strength=0.5 "
+        "temporal_schedule=linear temporal_warmup_steps=200 temporal_max_steps=2000 mask_ratio=0.1 "
+        "teacher_momentum=0.999 "
+        "dual_timestep=true student_block_ratio=0.3 teacher_block_ratio=0.7 projector_lr=5e-5",
     )
 
     # -- Per-module learning rate groups --

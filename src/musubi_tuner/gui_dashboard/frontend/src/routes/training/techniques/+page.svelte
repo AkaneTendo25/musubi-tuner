@@ -192,11 +192,44 @@
 						<FormField label="Mask Ratio" type="number" value={$projectConfig?.training?.self_flow_mask_ratio ?? 0.1} oninput={(e) => updateTraining('self_flow_mask_ratio', Number(e.target.value))} step="0.05" min={0} max={1} tooltip="Feature masking ratio" />
 						<FormField label="Momentum" type="number" value={$projectConfig?.training?.self_flow_teacher_momentum ?? 0.999} oninput={(e) => updateTraining('self_flow_teacher_momentum', Number(e.target.value))} step="0.001" min={0} max={1} tooltip="EMA teacher update momentum" />
 					</div>
-					<div class="grid grid-cols-2 gap-2">
+					<div class="grid grid-cols-3 gap-2">
 						<div class="flex items-end pb-0.5">
 							<FormToggle label="Dual Timestep" checked={$projectConfig?.training?.self_flow_dual_timestep ?? true} onchange={(e) => updateTraining('self_flow_dual_timestep', e.target.checked)} tooltip="Sample independent timesteps for student/teacher" />
 						</div>
 						<FormField label="Projector LR" type="number" value={$projectConfig?.training?.self_flow_projector_lr ?? ''} oninput={(e) => updateTraining('self_flow_projector_lr', e.target.value ? Number(e.target.value) : null)} placeholder="Same as LR" step="any" tooltip="Separate LR for projector MLP" />
+						<div class="flex items-end pb-0.5">
+							<FormToggle label="Offload Teacher" checked={$projectConfig?.training?.self_flow_offload_teacher_features ?? false} onchange={(e) => updateTraining('self_flow_offload_teacher_features', e.target.checked)} tooltip="Offload teacher features to CPU to save VRAM" />
+						</div>
+					</div>
+				</div>
+
+				<!-- Temporal Consistency -->
+				<div class="p-3" style="background: var(--bg-elevated); border-radius: var(--radius-sm); border: 1px solid var(--border-subtle);">
+					<div class="text-[11px] font-semibold mb-1" style="color: var(--text-primary);">Temporal Consistency</div>
+					<div class="text-[11px] mb-2" style="color: var(--text-muted);">Frame-neighbor and motion-delta losses to preserve temporal coherence during fine-tuning</div>
+					<div class="grid grid-cols-3 gap-2 mb-2">
+						<FormField label="Mode" type="select" value={$projectConfig?.training?.self_flow_temporal_mode ?? 'off'} oninput={(e) => updateTraining('self_flow_temporal_mode', e.target.value)} options={[{value: 'off', label: 'Off'}, {value: 'frame', label: 'Frame'}, {value: 'delta', label: 'Delta'}, {value: 'hybrid', label: 'Hybrid'}]} tooltip="off: disabled, frame: neighbor alignment, delta: motion consistency, hybrid: both" />
+						<FormField label="Lambda Temporal" type="number" value={$projectConfig?.training?.self_flow_lambda_temporal ?? 0.0} oninput={(e) => updateTraining('self_flow_lambda_temporal', Number(e.target.value))} step="0.01" min={0} tooltip="Loss weight for frame-level temporal alignment (frame/hybrid modes)" />
+						<FormField label="Lambda Delta" type="number" value={$projectConfig?.training?.self_flow_lambda_delta ?? 0.0} oninput={(e) => updateTraining('self_flow_lambda_delta', Number(e.target.value))} step="0.01" min={0} tooltip="Loss weight for motion delta alignment (delta/hybrid modes)" />
+					</div>
+					<div class="grid grid-cols-3 gap-2 mb-2">
+						<FormField label="Neighbors" type="number" value={$projectConfig?.training?.self_flow_num_neighbors ?? 2} oninput={(e) => updateTraining('self_flow_num_neighbors', Number(e.target.value))} min={0} max={8} tooltip="Temporal neighbors on each side for frame alignment" />
+						<FormField label="Tau" type="number" value={$projectConfig?.training?.self_flow_temporal_tau ?? 1.0} oninput={(e) => updateTraining('self_flow_temporal_tau', Number(e.target.value))} step="0.1" min={0.1} tooltip="Neighbor weight decay factor (higher = slower decay)" />
+						<FormField label="Delta Steps" type="number" value={$projectConfig?.training?.self_flow_delta_num_steps ?? 1} oninput={(e) => updateTraining('self_flow_delta_num_steps', Number(e.target.value))} min={1} max={8} tooltip="Multi-step delta: 1 = adjacent frames only" />
+					</div>
+					<div class="grid grid-cols-3 gap-2 mb-2">
+						<FormField label="Granularity" type="select" value={$projectConfig?.training?.self_flow_temporal_granularity ?? 'frame'} oninput={(e) => updateTraining('self_flow_temporal_granularity', e.target.value)} options={[{value: 'frame', label: 'Frame'}, {value: 'patch', label: 'Patch'}]} tooltip="frame: mean-pooled per frame (fast), patch: per-token spatial (stronger)" />
+						<FormField label="Patch Radius" type="number" value={$projectConfig?.training?.self_flow_patch_spatial_radius ?? 0} oninput={(e) => updateTraining('self_flow_patch_spatial_radius', Number(e.target.value))} min={0} max={4} tooltip="Local spatial radius for patch matching (0 = strict position)" />
+						<FormField label="Patch Mode" type="select" value={$projectConfig?.training?.self_flow_patch_match_mode ?? 'hard'} oninput={(e) => updateTraining('self_flow_patch_match_mode', e.target.value)} options={[{value: 'hard', label: 'Hard'}, {value: 'soft', label: 'Soft'}]} tooltip="hard: best match in window, soft: softmax-weighted" />
+					</div>
+					<div class="grid grid-cols-2 gap-2 mb-2">
+						<FormField label="Motion Weighting" type="select" value={$projectConfig?.training?.self_flow_motion_weighting ?? 'none'} oninput={(e) => updateTraining('self_flow_motion_weighting', e.target.value)} options={[{value: 'none', label: 'None'}, {value: 'teacher_delta', label: 'Teacher Delta'}]} tooltip="Upweight regions with more motion in teacher features" />
+						<FormField label="Motion Strength" type="number" value={$projectConfig?.training?.self_flow_motion_weight_strength ?? 0.0} oninput={(e) => updateTraining('self_flow_motion_weight_strength', Number(e.target.value))} step="0.1" min={0} tooltip="How strongly motion affects per-token weighting" />
+					</div>
+					<div class="grid grid-cols-3 gap-2">
+						<FormField label="Schedule" type="select" value={$projectConfig?.training?.self_flow_temporal_schedule ?? 'constant'} oninput={(e) => updateTraining('self_flow_temporal_schedule', e.target.value)} options={[{value: 'constant', label: 'Constant'}, {value: 'linear', label: 'Linear decay'}, {value: 'cosine', label: 'Cosine decay'}]} tooltip="Temporal lambda schedule (base lambda_self_flow stays constant)" />
+						<FormField label="Warmup Steps" type="number" value={$projectConfig?.training?.self_flow_temporal_warmup_steps ?? 0} oninput={(e) => updateTraining('self_flow_temporal_warmup_steps', Number(e.target.value))} min={0} tooltip="Linear ramp-up before temporal loss reaches full weight" />
+						<FormField label="Max Steps" type="number" value={$projectConfig?.training?.self_flow_temporal_max_steps ?? 0} oninput={(e) => updateTraining('self_flow_temporal_max_steps', Number(e.target.value))} min={0} tooltip="Steps at which linear/cosine decay reaches zero (0 = no decay)" />
 					</div>
 				</div>
 			</div>
