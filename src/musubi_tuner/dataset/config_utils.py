@@ -39,6 +39,8 @@ class BaseDatasetParams:
     caption_extension: Optional[str] = None
     batch_size: int = 1
     num_repeats: int = 1
+    video_loss_weight: Optional[float] = None
+    audio_loss_weight: Optional[float] = None
     cache_directory: Optional[str] = None
     reference_cache_directory: Optional[str] = None
     separate_audio_buckets: bool = False
@@ -131,6 +133,8 @@ class ConfigSanitizer:
         "resolution": functools.partial(__validate_and_convert_scalar_or_twodim.__func__, int),
         "enable_bucket": bool,
         "bucket_no_upscale": bool,
+        "video_loss_weight": float,
+        "audio_loss_weight": float,
         "cache_directory": str,
         "reference_cache_directory": str,
         "separate_audio_buckets": bool,
@@ -343,6 +347,8 @@ def generate_dataset_group_by_blueprint(
         resolution: {dataset.resolution}
         batch_size: {dataset.batch_size}
         num_repeats: {dataset.num_repeats}
+        video_loss_weight: {getattr(dataset, "video_loss_weight", None)}
+        audio_loss_weight: {getattr(dataset, "audio_loss_weight", None)}
         caption_extension: "{dataset.caption_extension}"
         enable_bucket: {dataset.enable_bucket}
         bucket_no_upscale: {dataset.bucket_no_upscale}

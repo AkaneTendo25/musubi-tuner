@@ -968,6 +968,8 @@ class BucketBatchManager:
         architecture: Optional[str] = None,
         target_fps: float = 24.0,
         audio_bucket_strategy: str = "pad",
+        video_loss_weight: Optional[float] = None,
+        audio_loss_weight: Optional[float] = None,
     ):
         self.batch_size = batch_size
         self.buckets = bucketed_item_info
@@ -978,6 +980,8 @@ class BucketBatchManager:
         self.architecture = architecture
         self.target_fps = target_fps
         self.audio_bucket_strategy = audio_bucket_strategy
+        self.video_loss_weight = video_loss_weight
+        self.audio_loss_weight = audio_loss_weight
 
         # indices for enumerating batches. each batch is reso + batch_idx. reso is (width, height) or (width, height, frames)
         self.bucket_batch_indices: list[tuple[tuple[Any], int]] = []
@@ -1044,6 +1048,7 @@ class BucketBatchManager:
         bucket = self.buckets[bucket_reso]
         start = batch_idx * self.batch_size
         end = min(start + self.batch_size, len(bucket))
+        batch_count = max(end - start, 0)
 
         batch_tensor_data = {}
         varlen_keys = set()
@@ -1230,6 +1235,12 @@ class BucketBatchManager:
             batch_tensor_data["timesteps"] = self.timestep_pool[idx][: end - start]  # use the pre-generated timesteps
         else:
             batch_tensor_data["timesteps"] = None
+
+        if batch_count > 0:
+            if self.video_loss_weight is not None:
+                batch_tensor_data["video_loss_weight"] = float(self.video_loss_weight)
+            if self.audio_loss_weight is not None:
+                batch_tensor_data["audio_loss_weight"] = float(self.audio_loss_weight)
 
         if self.architecture in {ARCHITECTURE_LTX2, ARCHITECTURE_LTX2_FULL}:
             latents = batch_tensor_data.get("latents")
@@ -2114,6 +2125,8 @@ class BaseDataset(torch.utils.data.Dataset):
         num_repeats: int = 1,
         enable_bucket: bool = False,
         bucket_no_upscale: bool = False,
+        video_loss_weight: Optional[float] = None,
+        audio_loss_weight: Optional[float] = None,
         cache_directory: Optional[str] = None,
         reference_cache_directory: Optional[str] = None,
         separate_audio_buckets: bool = False,
@@ -2126,6 +2139,8 @@ class BaseDataset(torch.utils.data.Dataset):
         self.num_repeats = num_repeats
         self.enable_bucket = enable_bucket
         self.bucket_no_upscale = bucket_no_upscale
+        self.video_loss_weight = video_loss_weight
+        self.audio_loss_weight = audio_loss_weight
         self.cache_directory = cache_directory
         self.reference_cache_directory = reference_cache_directory
         self.separate_audio_buckets = separate_audio_buckets
@@ -2326,6 +2341,8 @@ class ImageDataset(BaseDataset):
         num_repeats: int,
         enable_bucket: bool,
         bucket_no_upscale: bool,
+        video_loss_weight: Optional[float] = None,
+        audio_loss_weight: Optional[float] = None,
         image_directory: Optional[str] = None,
         image_jsonl_file: Optional[str] = None,
         control_directory: Optional[str] = None,
@@ -2350,6 +2367,8 @@ class ImageDataset(BaseDataset):
             num_repeats,
             enable_bucket,
             bucket_no_upscale,
+            video_loss_weight,
+            audio_loss_weight,
             cache_directory,
             reference_cache_directory,
             separate_audio_buckets,
@@ -2636,6 +2655,8 @@ class ImageDataset(BaseDataset):
             self.batch_size,
             num_timestep_buckets=num_timestep_buckets,
             architecture=self.architecture,
+            video_loss_weight=self.video_loss_weight,
+            audio_loss_weight=self.audio_loss_weight,
         )
         self.batch_manager.show_bucket_info()
 
@@ -2665,6 +2686,8 @@ class AudioDataset(BaseDataset):
         num_repeats: int,
         enable_bucket: bool,
         bucket_no_upscale: bool,
+        video_loss_weight: Optional[float] = None,
+        audio_loss_weight: Optional[float] = None,
         audio_directory: Optional[str] = None,
         audio_jsonl_file: Optional[str] = None,
         cache_directory: Optional[str] = None,
@@ -2683,6 +2706,8 @@ class AudioDataset(BaseDataset):
             num_repeats,
             enable_bucket,
             bucket_no_upscale,
+            video_loss_weight,
+            audio_loss_weight,
             cache_directory,
             reference_cache_directory,
             separate_audio_buckets,
@@ -2909,6 +2934,8 @@ class AudioDataset(BaseDataset):
             architecture=self.architecture,
             target_fps=target_fps,
             audio_bucket_strategy=self.audio_bucket_strategy,
+            video_loss_weight=self.video_loss_weight,
+            audio_loss_weight=self.audio_loss_weight,
         )
         self.batch_manager.show_bucket_info()
 
@@ -2944,6 +2971,8 @@ class VideoDataset(BaseDataset):
         num_repeats: int,
         enable_bucket: bool,
         bucket_no_upscale: bool,
+        video_loss_weight: Optional[float] = None,
+        audio_loss_weight: Optional[float] = None,
         frame_extraction: Optional[str] = "head",
         frame_stride: Optional[int] = 1,
         frame_sample: Optional[int] = 1,
@@ -2970,6 +2999,8 @@ class VideoDataset(BaseDataset):
             num_repeats,
             enable_bucket,
             bucket_no_upscale,
+            video_loss_weight,
+            audio_loss_weight,
             cache_directory,
             reference_cache_directory,
             separate_audio_buckets,
@@ -3290,6 +3321,8 @@ class VideoDataset(BaseDataset):
             num_timestep_buckets=num_timestep_buckets,
             architecture=self.architecture,
             target_fps=self.target_fps,
+            video_loss_weight=self.video_loss_weight,
+            audio_loss_weight=self.audio_loss_weight,
         )
         self.batch_manager.show_bucket_info()
 

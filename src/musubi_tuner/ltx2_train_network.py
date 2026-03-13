@@ -2567,6 +2567,15 @@ class LTX2NetworkTrainer(NetworkTrainer):
         if not isinstance(batch, dict):
             raise TypeError(f"Expected batch to be a dict, got: {type(batch)}")
 
+        def _resolve_loss_weight(batch_key: str, arg_key: str, default: float = 1.0) -> float:
+            batch_value = batch.get(batch_key)
+            if batch_value is not None:
+                try:
+                    return float(batch_value)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(f"{batch_key} must be a float-compatible scalar, got {batch_value!r}") from exc
+            return float(getattr(args, arg_key, default))
+
         if latents is None or not isinstance(latents, torch.Tensor):
             raise TypeError(f"Expected latents to be a torch.Tensor, got: {type(latents)}")
         if latents.dim() != 5:
@@ -2854,7 +2863,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
                     "audio_pred": audio_pred,
                     "audio_target": audio_target,
                     "audio_loss_mask": audio_loss_mask,
-                    "audio_loss_weight": float(getattr(args, "audio_loss_weight", 1.0)),
+                    "audio_loss_weight": _resolve_loss_weight("audio_loss_weight", "audio_loss_weight"),
                 }
             )
             if out_audio["audio_loss_weight"] < 0.0:
@@ -2996,7 +3005,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 "video_pred": target_pred_tokens,
                 "video_target": target_velocity,
                 "video_loss_mask": target_loss_mask,
-                "video_loss_weight": float(getattr(args, "video_loss_weight", 1.0)),
+                "video_loss_weight": _resolve_loss_weight("video_loss_weight", "video_loss_weight"),
             }
             if out_v2v["video_loss_weight"] < 0.0:
                 raise ValueError(f"video_loss_weight must be >= 0. Got: {out_v2v['video_loss_weight']}")
@@ -3258,7 +3267,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
             "video_pred": video_pred,
             "video_target": video_target,
             "video_loss_mask": video_loss_mask,
-            "video_loss_weight": float(getattr(args, "video_loss_weight", 1.0)),
+            "video_loss_weight": _resolve_loss_weight("video_loss_weight", "video_loss_weight"),
         }
 
         if out["video_loss_weight"] < 0.0:
@@ -3309,7 +3318,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
                     "audio_pred": audio_pred,
                     "audio_target": audio_target,
                     "audio_loss_mask": audio_loss_mask,
-                    "audio_loss_weight": float(getattr(args, "audio_loss_weight", 1.0))
+                    "audio_loss_weight": _resolve_loss_weight("audio_loss_weight", "audio_loss_weight")
                     * (
                         float(getattr(args, "audio_silence_regularizer_weight", 1.0))
                         if audio_regularizer_active

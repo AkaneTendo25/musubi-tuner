@@ -594,6 +594,7 @@ All other training mechanics (weighting scheme, masking, audio balancing) apply 
 #### Loss Weighting
 - `--video_loss_weight`: Weight for video loss (default: 1.0).
 - `--audio_loss_weight`: Weight for audio loss in AV mode (default: 1.0).
+- Dataset config `video_loss_weight` / `audio_loss_weight` override the corresponding CLI weight for that dataset only.
 - `--audio_loss_balance_mode`: Audio loss balancing strategy. Values: `none` (default), `inv_freq`, `ema_mag`.
 - `--audio_loss_balance_min`, `--audio_loss_balance_max`: Clamp range for effective audio weight (defaults: 0.05, 4.0).
 
