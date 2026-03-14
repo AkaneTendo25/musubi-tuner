@@ -182,12 +182,19 @@ def _masked_mse(
     *,
     weighting: Optional[torch.Tensor],
     dtype: torch.dtype,
+    loss_type: str = "mse",
+    huber_delta: float = 1.0,
 ) -> torch.Tensor:
     if isinstance(tgt, torch.Tensor):
         pred = pred.to(device=tgt.device, dtype=dtype)
     else:
         pred = pred.to(dtype=dtype)
-    per_elem = torch.nn.functional.mse_loss(pred, tgt, reduction="none")
+    if loss_type in ("mae", "l1"):
+        per_elem = torch.nn.functional.l1_loss(pred, tgt, reduction="none")
+    elif loss_type in ("huber", "smooth_l1"):
+        per_elem = torch.nn.functional.smooth_l1_loss(pred, tgt, reduction="none", beta=huber_delta)
+    else:
+        per_elem = torch.nn.functional.mse_loss(pred, tgt, reduction="none")
     if weighting is not None:
         w = weighting
         if isinstance(w, torch.Tensor) and w.dim() != per_elem.dim():
@@ -1147,12 +1154,16 @@ def _build_fisher_ewc_stats(
                     skipped_batches += 1
                     optimizer.zero_grad(set_to_none=True)
                     continue
+                _ewc_loss_type = getattr(args, "loss_type", "mse")
+                _ewc_huber_delta = float(getattr(args, "huber_delta", 1.0))
                 loss = _masked_mse(
                     out["video_pred"],
                     out["video_target"],
                     out.get("video_loss_mask"),
                     weighting=weighting,
                     dtype=trainer.dit_dtype,
+                    loss_type=_ewc_loss_type,
+                    huber_delta=_ewc_huber_delta,
                 ) * float(out.get("video_loss_weight", 1.0))
                 audio_pred = out.get("audio_pred")
                 audio_target = out.get("audio_target")
@@ -1163,10 +1174,19 @@ def _build_fisher_ewc_stats(
                         out.get("audio_loss_mask"),
                         weighting=weighting,
                         dtype=trainer.dit_dtype,
+                        loss_type=_ewc_loss_type,
+                        huber_delta=_ewc_huber_delta,
                     ) * float(out.get("audio_loss_weight", 1.0))
             else:
+                _ewc_loss_type = getattr(args, "loss_type", "mse")
+                _ewc_huber_delta = float(getattr(args, "huber_delta", 1.0))
                 pred = model_pred.to(device=target.device, dtype=trainer.dit_dtype)
-                loss = torch.nn.functional.mse_loss(pred, target, reduction="none")
+                if _ewc_loss_type in ("mae", "l1"):
+                    loss = torch.nn.functional.l1_loss(pred, target, reduction="none")
+                elif _ewc_loss_type in ("huber", "smooth_l1"):
+                    loss = torch.nn.functional.smooth_l1_loss(pred, target, reduction="none", beta=_ewc_huber_delta)
+                else:
+                    loss = torch.nn.functional.mse_loss(pred, target, reduction="none")
                 if weighting is not None:
                     w = weighting
                     if isinstance(w, torch.Tensor) and w.dim() != loss.dim():
@@ -3412,9 +3432,12 @@ def main() -> None:
                     video_pred = out["video_pred"]
                     video_target = out["video_target"]
                     video_loss_mask = out.get("video_loss_mask")
+                    _val_loss_type = getattr(args, "loss_type", "mse")
+                    _val_huber_delta = float(getattr(args, "huber_delta", 1.0))
                     video_loss = _masked_mse(
                         video_pred, video_target, video_loss_mask,
-                        weighting=weighting, dtype=trainer.dit_dtype
+                        weighting=weighting, dtype=trainer.dit_dtype,
+                        loss_type=_val_loss_type, huber_delta=_val_huber_delta,
                     )
                     val_video_losses.append(video_loss.item())
 
@@ -3424,16 +3447,24 @@ def main() -> None:
                         audio_loss_mask = out.get("audio_loss_mask")
                         audio_loss = _masked_mse(
                             audio_pred, audio_target, audio_loss_mask,
-                            weighting=weighting, dtype=trainer.dit_dtype
+                            weighting=weighting, dtype=trainer.dit_dtype,
+                            loss_type=_val_loss_type, huber_delta=_val_huber_delta,
                         )
                         val_audio_losses.append(audio_loss.item())
                         val_losses.append(video_loss.item() * args.video_loss_weight + audio_loss.item() * args.audio_loss_weight)
                     else:
                         val_losses.append(video_loss.item())
                 else:
+                    _val_loss_type = getattr(args, "loss_type", "mse")
+                    _val_huber_delta = float(getattr(args, "huber_delta", 1.0))
                     if isinstance(target, torch.Tensor):
                         model_pred = model_pred.to(device=target.device, dtype=trainer.dit_dtype)
-                    loss = torch.nn.functional.mse_loss(model_pred, target)
+                    if _val_loss_type in ("mae", "l1"):
+                        loss = torch.nn.functional.l1_loss(model_pred, target)
+                    elif _val_loss_type in ("huber", "smooth_l1"):
+                        loss = torch.nn.functional.smooth_l1_loss(model_pred, target, beta=_val_huber_delta)
+                    else:
+                        loss = torch.nn.functional.mse_loss(model_pred, target)
                     val_losses.append(loss.item())
 
                 num_batches += 1
@@ -3709,6 +3740,8 @@ def main() -> None:
                         optimizer.zero_grad(set_to_none=True)
                         continue
 
+                    _loss_type = getattr(args, "loss_type", "mse")
+                    _huber_delta = float(getattr(args, "huber_delta", 1.0))
                     video_pred = out["video_pred"]
                     video_target = out["video_target"]
                     video_loss_mask = out.get("video_loss_mask")
@@ -3718,6 +3751,8 @@ def main() -> None:
                         video_loss_mask,
                         weighting=weighting,
                         dtype=trainer.dit_dtype,
+                        loss_type=_loss_type,
+                        huber_delta=_huber_delta,
                     )
                     video_weight = float(out.get("video_loss_weight", 1.0))
                     loss = video_loss * video_weight
@@ -3732,15 +3767,24 @@ def main() -> None:
                             audio_loss_mask,
                             weighting=weighting,
                             dtype=trainer.dit_dtype,
+                            loss_type=_loss_type,
+                            huber_delta=_huber_delta,
                         )
                         audio_weight = float(out.get("audio_loss_weight", 1.0))
                         loss = loss + audio_loss * audio_weight
                 else:
+                    _loss_type = getattr(args, "loss_type", "mse")
+                    _huber_delta = float(getattr(args, "huber_delta", 1.0))
                     if isinstance(target, torch.Tensor):
                         model_pred = model_pred.to(device=target.device, dtype=trainer.dit_dtype)
                     else:
                         model_pred = model_pred.to(dtype=trainer.dit_dtype)
-                    loss = torch.nn.functional.mse_loss(model_pred, target, reduction="none")
+                    if _loss_type in ("mae", "l1"):
+                        loss = torch.nn.functional.l1_loss(model_pred, target, reduction="none")
+                    elif _loss_type in ("huber", "smooth_l1"):
+                        loss = torch.nn.functional.smooth_l1_loss(model_pred, target, reduction="none", beta=_huber_delta)
+                    else:
+                        loss = torch.nn.functional.mse_loss(model_pred, target, reduction="none")
                     if weighting is not None:
                         w = weighting
                         if isinstance(w, torch.Tensor) and w.dim() != loss.dim():

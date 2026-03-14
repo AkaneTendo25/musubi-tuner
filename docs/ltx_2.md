@@ -351,6 +351,8 @@ musubi-tuner supports advanced LoRA algorithms (LoKR, LoHA, LoCoN, etc.) via:
 - `--network_args` for inline `key=value` settings
 - `--lycoris_config <path.toml>` for TOML-based settings
 
+See the [LyCORIS algorithm list](https://github.com/KohakuBlueleaf/LyCORIS/blob/main/docs/Algo-List.md) and [guidelines](https://github.com/KohakuBlueleaf/LyCORIS/blob/main/docs/Guidelines.md) for algorithm details and recommended settings.
+
 No bundled example TOML files are shipped; provide your own config path.
 
 ```bash
@@ -397,6 +399,8 @@ accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 ltx2_tr
 `--lycoris_config` requires `--network_module lycoris.kohya`.
 
 ### Training Arguments
+
+All training arguments can be placed in a `.toml` config file instead of on the command line via `--config_file config.toml`. See the upstream [configuration files guide](https://github.com/kohya-ss/musubi-tuner/blob/main/docs/advanced_config.md#using-configuration-files-to-specify-training-options--設定ファイルを使用した学習オプションの指定) for format details.
 
 #### Memory Optimization
 
@@ -670,7 +674,7 @@ Result:
 - Other `audio_*` modules (e.g. `audio_ff`) → 1e-5 (`--audio_lr`)
 - Video modules → 1e-4 (`--learning_rate`)
 
-Works with LoRA+ (`loraplus_lr_ratio`): the up/down split applies within each LR group. Both flags default to `None` and are fully backward-compatible.
+Works with LoRA+ (`loraplus_lr_ratio`): the up/down split applies within each LR group. Both flags default to `None` and are fully backward-compatible. See [LoRA+ in the upstream advanced configuration guide](https://github.com/kohya-ss/musubi-tuner/blob/main/docs/advanced_config.md#lora) for setup details.
 
 #### Preservation & Regularization
 
@@ -1219,6 +1223,8 @@ Reference audio latents are precached automatically when using `--precache_sampl
 
 #### Sampling with Tiled VAE
 
+The prompt file format (`--sample_prompts`) — including guidance scale, negative prompt, and per-prompt inference parameters — is documented in the upstream [Sampling During Training guide](https://github.com/kohya-ss/musubi-tuner/blob/main/docs/sampling_during_training.md). LTX-2 extends this with `--v <path>` (IC-LoRA reference) and `--ra <path>` (audio-reference IC-LoRA) prompt prefixes.
+
 | Argument | Default | Description |
 |----------|---------|-------------|
 | `--height` | 512 | Sample output height (pixels) |
@@ -1311,7 +1317,7 @@ python ltx2_merge_lora.py ^
 
 ## Dataset Configuration
 
-The dataset config is a TOML file with `[general]` defaults and `[[datasets]]` entries.
+The dataset config is a TOML file with `[general]` defaults and `[[datasets]]` entries. Common options shared across all musubi-tuner architectures — including `frame_extraction` modes, JSONL metadata format, control image support, and resolution bucketing — are documented in the upstream [Dataset Configuration guide](https://github.com/kohya-ss/musubi-tuner/blob/main/docs/dataset_config.md). The options below are LTX-2-specific or supplement upstream defaults.
 
 ### Video Dataset Options
 
@@ -1602,7 +1608,7 @@ Alternative: `--audio_loss_balance_mode ema_mag` matches audio loss magnitude to
 ### Technical Notes
 
 - **Float32 AdaLN**: The transformer applies Adaptive Layer Norm (AdaLN) shift/scale operations in float32, then casts back to the working dtype. This prevents overflow that can occur when bf16 scale values multiply bf16 hidden states. The fix is always active and requires no flags.
-- **Float32 loss**: Per-element loss (`MSE`, `L1`, `Huber`) is computed in float32 regardless of `--mixed_precision` to avoid precision loss in gradient computation.
+- **Loss dtype**: The LTX-2 training path computes the task loss (MSE, L1, Huber) in `trainer.dit_dtype` (typically bf16 with `--mixed_precision bf16`). Internal regularization losses (motion preservation, CREPA, Self-Flow) always use MSE and are unaffected by `--loss_type`.
 
 ---
 
@@ -1766,7 +1772,35 @@ Note: `--gemma_root` is not needed for reference mode (text embeddings are loade
 
 ## References
 
-- [Installation Guide](https://github.com/AkaneTendo25/musubi-tuner/discussions/19) — Setup instructions, dependencies, flash-attn, troubleshooting
-- [Optimizers Guide](https://github.com/AkaneTendo25/musubi-tuner/discussions/21) — Optimizer comparison, recommended settings, memory usage tips
-- [LTX-2 Audio Dataset Builder](https://github.com/dorpxam/LTX-2-Audio-Dataset-Builder) — Specialized tool to automate high-quality audio dataset creation: transforms raw audio into clean, curated, captioned segments optimized for LTX-2 audio-only training
+**Upstream musubi-tuner Documentation**
+- [Dataset Configuration](https://github.com/kohya-ss/musubi-tuner/blob/main/docs/dataset_config.md) — TOML format, `frame_extraction` modes, JSONL metadata, control images, resolution bucketing
+- [Sampling During Training](https://github.com/kohya-ss/musubi-tuner/blob/main/docs/sampling_during_training.md) — Prompt file format, per-prompt guidance scale, negative prompts, sampling CLI flags
+- [Advanced Configuration](https://github.com/kohya-ss/musubi-tuner/blob/main/docs/advanced_config.md) — `--config_file` TOML training configuration, `--network_args` format, LoRA+, TensorBoard/WandB logging, PyTorch Dynamo, timestep bucketing, Schedule-Free optimizer
+- [LyCORIS Algorithm List](https://github.com/KohakuBlueleaf/LyCORIS/blob/main/docs/Algo-List.md) and [Guidelines](https://github.com/KohakuBlueleaf/LyCORIS/blob/main/docs/Guidelines.md) — LoKR, LoHA, LoCoN and other algorithm details (used via `pip install lycoris-lora`)
+- [Tools](https://github.com/kohya-ss/musubi-tuner/blob/main/docs/tools.md) — Post-hoc EMA LoRA merging, image captioning with Qwen2.5-VL
+
+**Official LTX Resources**
+- [LTX-2](https://github.com/Lightricks/LTX-2) — Official Lightricks LTX-2 repository; contains the well-structured `ltx-trainer` and `ltx-pipelines` packages that served as the upstream source and reference for this implementation
+- [LTX-Video](https://github.com/Lightricks/LTX-Video) — Official Lightricks model repository (inference, ComfyUI nodes, model weights)
+- [LTX Documentation](https://docs.ltx.video/open-source-model/getting-started/overview) — Unified docs hub: open-source model, API reference, ComfyUI integration, LoRA usage, and LTX-2 trainer guide
+
+**Alternative Trainers**
+- [ai-toolkit](https://github.com/ostris/ai-toolkit) (ostris) — General diffusion fine-tuning toolkit with LTX-2 LoRA support
+- [SimpleTuner](https://github.com/bghira/SimpleTuner) — Multi-model fine-tuning framework with LTX-Video support
+- [DiffSynth-Studio](https://github.com/modelscope/DiffSynth-Studio) — ModelScope diffusion synthesis framework with LTX-Video support
+
+**Community Resources**
+- [awesome-ltx2](https://github.com/wildminder/awesome-ltx2) — Curated list of LTX-2 resources, tools, models, and guides
+- [Banodoco Discord](https://discord.gg/banodoco) — Active AI video generation community; discussions on LTX-2 training, workflows, and research
+- [Windows Installation Guide](https://github.com/AkaneTendo25/musubi-tuner/discussions/19) — Windows-specific setup (Python 3.12, CUDA, Flash Attention 2), dependencies, troubleshooting
+- [LTX-2 Training Optimizers](https://github.com/AkaneTendo25/musubi-tuner/discussions/21) — Optimizer comparison for LTX-2 training: AdamW, Prodigy, Muon, CAME, and recommended settings
+- [LTX-2 Audio Dataset Builder](https://github.com/dorpxam/LTX-2-Audio-Dataset-Builder) — Tool to automate audio dataset creation: transforms raw audio into clean, captioned segments optimized for LTX-2 audio-only training
+
+**Tutorials & Guides**
+- [LTX-2 LoRA Training Complete Guide](https://apatero.com/blog/ltx-2-lora-training-fine-tuning-complete-guide-2025) (Apatero) — Dataset preparation, training configuration, and LoRA deployment walkthrough
+- [How to Train a LTX-2 Character LoRA](https://ghost.oxen.ai/how-to-train-a-ltx-2-character-lora-with-oxen-ai/) (Oxen.ai) — Character-consistency LoRA training with dataset prep tips for audio clips
+
+**Cloud Platforms**
+- [fal.ai LTX-2 Trainer](https://fal.ai/models/fal-ai/ltx2-video-trainer) — Cloud-based LTX-2 LoRA training via API (~$0.005/step)
+- [WaveSpeedAI LTX-2](https://wavespeed.ai/landing/ltx2) — Hosted LTX-2 inference (T2V, I2V, video extend, lipsync)
 
