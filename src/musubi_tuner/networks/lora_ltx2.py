@@ -18,6 +18,56 @@ logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
 
+def _split_av_context(
+    model: nn.Module, context: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Split a concatenated AV context tensor into (video_context, audio_context).
+
+    LTX-2.0 (caption_proj_before_connector=False): context is raw text embeddings
+    [video(cc) | audio(cc)] where cc = caption_projection.linear_1.in_features.
+
+    LTX-2.3 (caption_proj_before_connector=True): the feature extractor already
+    projects to [video(cross_attention_dim) | audio(audio_cross_attention_dim)].
+
+    Falls back to an equal half-split when dims cannot be determined from the model.
+    """
+    split_video_dim: int | None = None
+    split_audio_dim: int | None = None
+    if bool(getattr(model, "caption_proj_before_connector", False)):
+        split_video_dim = getattr(model, "cross_attention_dim", None)
+        split_audio_dim = getattr(model, "audio_cross_attention_dim", None)
+    else:
+        cap_proj = getattr(model, "caption_projection", None)
+        if cap_proj is not None:
+            lin1 = getattr(cap_proj, "linear_1", None)
+            if lin1 is not None:
+                cc = getattr(lin1, "in_features", None)
+                if isinstance(cc, int) and cc > 0:
+                    split_video_dim = cc
+                    split_audio_dim = cc
+    if (
+        isinstance(split_video_dim, int)
+        and isinstance(split_audio_dim, int)
+        and split_video_dim > 0
+        and split_audio_dim > 0
+    ):
+        expected_total = split_video_dim + split_audio_dim
+        if expected_total == context.shape[-1]:
+            return (
+                context[..., :split_video_dim],
+                context[..., split_video_dim : split_video_dim + split_audio_dim],
+            )
+        raise ValueError(
+            "Context hidden size mismatch for AV split: "
+            f"got {context.shape[-1]}, expected {expected_total} "
+            f"(video={split_video_dim}, audio={split_audio_dim})."
+        )
+    if context.shape[-1] % 2 == 0:
+        half = context.shape[-1] // 2
+        return context[..., :half], context[..., half:]
+    return context, context
+
+
 def _patch_lora_load_state_dict_for_audio(network: lora.LoRANetwork) -> lora.LoRANetwork:
     original = network.load_state_dict
 
@@ -319,28 +369,7 @@ class LTX2Wrapper(nn.Module):
             and audio_latents is not None
             and isinstance(context, torch.Tensor)
         ):
-            split_video_dim = getattr(self.model, "cross_attention_dim", None)
-            split_audio_dim = getattr(self.model, "audio_cross_attention_dim", None)
-            if (
-                isinstance(split_video_dim, int)
-                and isinstance(split_audio_dim, int)
-                and split_video_dim > 0
-                and split_audio_dim > 0
-            ):
-                expected_total = split_video_dim + split_audio_dim
-                if expected_total == context.shape[-1]:
-                    video_context = context[..., :split_video_dim]
-                    audio_context = context[..., split_video_dim : split_video_dim + split_audio_dim]
-                else:
-                    raise ValueError(
-                        "Context hidden size mismatch for AV split: "
-                        f"got {context.shape[-1]}, expected {expected_total} "
-                        f"(video={split_video_dim}, audio={split_audio_dim})."
-                    )
-            elif context.shape[-1] % 2 == 0:
-                half = context.shape[-1] // 2
-                video_context = context[..., :half]
-                audio_context = context[..., half:]
+            video_context, audio_context = _split_av_context(self.model, context)
 
         video_modality = None
         if model_video_enabled:
