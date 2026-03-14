@@ -318,6 +318,16 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
         cmd += ["--caption_dropout_rate", str(t.caption_dropout_rate)]
     if not t.save_original_lora:
         cmd.append("--no-save_original_lora")
+    if t.ic_lora_strategy != "auto":
+        cmd += ["--ic_lora_strategy", t.ic_lora_strategy]
+    if t.audio_ref_use_negative_positions:
+        cmd.append("--audio_ref_use_negative_positions")
+    if t.audio_ref_mask_cross_attention_to_reference:
+        cmd.append("--audio_ref_mask_cross_attention_to_reference")
+    if t.audio_ref_mask_reference_from_text_attention:
+        cmd.append("--audio_ref_mask_reference_from_text_attention")
+    if t.audio_ref_identity_guidance_scale != 0.0:
+        cmd += ["--audio_ref_identity_guidance_scale", str(t.audio_ref_identity_guidance_scale)]
 
     # Optimizer
     cmd += ["--learning_rate", str(t.learning_rate)]

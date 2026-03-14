@@ -142,6 +142,11 @@ class TrainingConfig(BaseModel):
     init_lokr_norm: Optional[float] = None
     caption_dropout_rate: float = 0.0
     save_original_lora: bool = True
+    ic_lora_strategy: Literal["auto", "none", "v2v", "audio_ref_only_ic"] = "auto"
+    audio_ref_use_negative_positions: bool = False
+    audio_ref_mask_cross_attention_to_reference: bool = False
+    audio_ref_mask_reference_from_text_attention: bool = False
+    audio_ref_identity_guidance_scale: float = 0.0
 
     # Optimizer
     learning_rate: float = 1e-4
