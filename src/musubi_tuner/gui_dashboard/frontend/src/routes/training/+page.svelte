@@ -87,7 +87,26 @@
 								{ value: 'full', label: 'full (all)' }
 							]} onchange={(e) => update('lora_target_preset', e.target.value)} tooltip="Target layers" />
 						</div>
-						<FormField label="Network Args" value={t.network_args || ''} oninput={(e) => update('network_args', e.target.value)} placeholder="key=value ..." tooltip="Extra network args (space-separated key=value)" />
+						<div class="grid grid-cols-2 gap-2">
+						<FormSelect label="IC-LoRA Strategy" value={t.ic_lora_strategy || 'auto'} options={[
+							{ value: 'auto', label: 'auto' },
+							{ value: 'none', label: 'none' },
+							{ value: 'v2v', label: 'v2v' },
+							{ value: 'audio_ref_only_ic', label: 'audio_ref_only_ic' },
+						]} onchange={(e) => update('ic_lora_strategy', e.target.value)} tooltip="IC-LoRA conditioning strategy. 'auto' follows lora_target_preset; 'audio_ref_only_ic' = audio-reference ID-LoRA style (requires av or audio mode)" />
+					</div>
+					{#if t.ic_lora_strategy === 'audio_ref_only_ic'}
+					<div class="p-2 space-y-2" style="background: var(--bg-elevated); border-radius: var(--radius-sm); border: 1px solid var(--border-subtle);">
+						<span class="text-[11px] font-medium" style="color: var(--text-muted);">Audio-Reference IC-LoRA</span>
+						<div class="flex flex-wrap gap-x-4 gap-y-1">
+							<FormToggle label="Negative Positions" checked={t.audio_ref_use_negative_positions ?? false} onchange={(e) => update('audio_ref_use_negative_positions', e.target.checked)} tooltip="Place reference-audio token positions in negative time" />
+							<FormToggle label="Mask Cross-Attn to Ref" checked={t.audio_ref_mask_cross_attention_to_reference ?? false} onchange={(e) => update('audio_ref_mask_cross_attention_to_reference', e.target.checked)} tooltip="Video attends only to target audio, not reference-audio tokens" />
+							<FormToggle label="Mask Ref from Text" checked={t.audio_ref_mask_reference_from_text_attention ?? false} onchange={(e) => update('audio_ref_mask_reference_from_text_attention', e.target.checked)} tooltip="Block reference-audio tokens from attending to text tokens" />
+						</div>
+						<FormField label="Identity Guidance Scale" type="number" value={t.audio_ref_identity_guidance_scale ?? 0.0} oninput={(e) => update('audio_ref_identity_guidance_scale', Number(e.target.value))} step="0.1" min={0} tooltip="CFG scale override for target-audio branch (0 = use standard guidance)" />
+					</div>
+					{/if}
+					<FormField label="Network Args" value={t.network_args || ''} oninput={(e) => update('network_args', e.target.value)} placeholder="key=value ..." tooltip="Extra network args (space-separated key=value)" />
 						<div class="grid grid-cols-3 gap-2">
 							<FormField label="Dropout" type="number" value={t.network_dropout ?? ''} oninput={(e) => update('network_dropout', e.target.value ? Number(e.target.value) : null)} placeholder="None" step="0.05" min={0} max={1} tooltip="LoRA dropout rate" />
 							<FormField label="Scale W Norms" type="number" value={t.scale_weight_norms ?? ''} oninput={(e) => update('scale_weight_norms', e.target.value ? Number(e.target.value) : null)} placeholder="None" step="0.1" tooltip="Max norm for weight scaling" />
@@ -331,6 +350,9 @@
 						<div class="grid grid-cols-2 gap-2">
 							<FormField label="Workers" type="number" value={t.max_data_loader_n_workers ?? 2} oninput={(e) => update('max_data_loader_n_workers', Number(e.target.value))} min={0} tooltip="Dataloader workers" />
 							<FormField label="1st Frame P" type="number" value={t.ltx2_first_frame_conditioning_p ?? 0.1} oninput={(e) => update('ltx2_first_frame_conditioning_p', Number(e.target.value))} step="0.05" min={0} max={1} tooltip="First frame conditioning prob" />
+					{#if t.ltx2_mode === 'audio'}
+					<FormField label="Audio Seq Resolution" type="number" value={t.audio_only_sequence_resolution ?? 64} oninput={(e) => update('audio_only_sequence_resolution', Number(e.target.value))} min={0} tooltip="Virtual pixel resolution for shifted_logit_normal in audio-only mode (0 = use cached geometry)" />
+					{/if}
 						</div>
 						<FormToggle label="Persistent Workers" checked={t.persistent_data_loader_workers ?? true} onchange={(e) => update('persistent_data_loader_workers', e.target.checked)} tooltip="Keep workers between epochs" />
 					</div>
