@@ -26,7 +26,7 @@
 
 from typing import List
 import torch
-from musubi_tuner.optimizers.optimizer_utils import Auto8bitTensor, copy_stochastic, stochastic_grad_accummulation
+from musubi_tuner.optimizers.optimizer_utils import Auto8bitTensor, copy_stochastic
 import random
 
 try:

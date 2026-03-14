@@ -54,8 +54,6 @@ async def preview_toml(request: Request):
     """Return what the TOML file would look like without writing it."""
     config = _get_config(request)
 
-    from musubi_tuner.gui_dashboard.toml_export import _write_toml_fallback, build_dataset_toml_path
-    import io
 
     # Generate TOML content as string
     doc: dict = {}

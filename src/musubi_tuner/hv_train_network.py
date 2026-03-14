@@ -585,7 +585,7 @@ class NetworkTrainer:
                     logs[f"lr/d*eff_lr/{lr_desc}"] = optimizer.param_groups[i]["d"] * optimizer.param_groups[i]["effective_lr"]
 
             if args.optimizer_type.lower() == "automagic" and optimizer is not None:
-                logs[f"lr/automagic_avg"] = optimizer.get_avg_learning_rate()
+                logs["lr/automagic_avg"] = optimizer.get_avg_learning_rate()
                 lr_tensor = optimizer.get_lr_tensor()
                 if lr_tensor is not None and len(lr_tensor) > 1:
                     logs["lr/automagic_min"] = float(lr_tensor.min())
@@ -3332,7 +3332,12 @@ class NetworkTrainer:
                         and self._self_flow is not None
                     ):
                         try:
-                            self._self_flow.update_teacher(accelerator.unwrap_model(network))
+                            # Use stored network ref: may be LoRA network or transformer (full fine-tuning).
+                            _sf_net = getattr(self, "_self_flow_network", None) or (
+                                accelerator.unwrap_model(network) if network is not None else None
+                            )
+                            if _sf_net is not None:
+                                self._self_flow.update_teacher(_sf_net)
                         except Exception as e:
                             logger.warning("Self-Flow EMA update failed: %s", e)
                     lr_scheduler.step()

@@ -2858,7 +2858,7 @@ def main() -> None:
                 "(override with --self_flow_args offload_teacher_params=false)."
             )
 
-        trainer._setup_self_flow(args, accelerator, transformer=transformer, network=transformer)
+        trainer._setup_self_flow(args, accelerator, transformer=transformer, network=None)
         self_flow_module = getattr(trainer, "_self_flow", None)
         if self_flow_module is not None:
             self_flow_params = [p for p in self_flow_module.get_trainable_params() if p.requires_grad]
@@ -2927,7 +2927,7 @@ def main() -> None:
     optimizer, train_dataloader, lr_scheduler = accelerator.prepare(optimizer, train_dataloader, lr_scheduler)
 
     if getattr(trainer, "_self_flow", None) is not None:
-        trainer._current_call_network = accelerator.unwrap_model(transformer)
+        trainer._self_flow_network = accelerator.unwrap_model(transformer)
 
     # Prepare validation dataloader if exists
     if val_dataloader is not None:

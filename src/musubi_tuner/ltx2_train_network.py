@@ -13,7 +13,6 @@ import wave
 from fractions import Fraction
 from typing import Any, Dict, List, Optional, Tuple, Union
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 from accelerate import Accelerator, PartialState
 from tqdm import tqdm
@@ -59,10 +58,6 @@ from musubi_tuner.ltx2_text_conditioning import (
 from musubi_tuner.ltx2_inference import (
     LTX2Inferencer,
     InferenceConfig,
-    save_audio_wav,
-    mux_video_audio,
-    cleanup_cuda,
-    STAGE_2_DISTILLED_SIGMA_VALUES,
 )
 from musubi_tuner.ltx2_lycoris_runtime import (
     apply_lycoris_preset_before_network_creation,
@@ -269,8 +264,6 @@ def _apply_memory_optimization_settings(
         split_attn_mode: Split attention mode (batch/query)
         split_attn_chunk_size: Chunk size for query-based split attention (0 = default 1024)
     """
-    from musubi_tuner.ltx_2.model.transformer.feed_forward import FeedForward
-    from musubi_tuner.ltx_2.model.transformer.attention import Attention
 
     if not hasattr(model, "transformer_blocks"):
         logger.warning("Model does not have transformer_blocks; skipping memory optimization settings")
@@ -1072,8 +1065,8 @@ class LTX2NetworkTrainer(NetworkTrainer):
         """Parse Self-Flow flags and install helper. No-op when ``--self_flow`` is not set."""
         if not getattr(args, "self_flow", False):
             return
-        if transformer is None or network is None:
-            logger.warning("Self-Flow enabled but transformer/network is unavailable — skipping setup")
+        if transformer is None:
+            logger.warning("Self-Flow enabled but transformer is unavailable — skipping setup")
             return
         if self._ltx_mode != "video":
             raise ValueError("--self_flow currently supports only --ltx_mode video")
@@ -1097,6 +1090,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
             "delta_num_steps",
             "temporal_warmup_steps",
             "temporal_max_steps",
+            "student_block_stochastic_range",
         }
         float_keys = {
             "student_block_ratio",
@@ -1108,12 +1102,15 @@ class LTX2NetworkTrainer(NetworkTrainer):
             "patch_match_temperature",
             "motion_weight_strength",
             "mask_ratio",
+            "max_loss",
             "teacher_momentum",
             "projector_lr",
         }
         bool_keys = {
             "dual_timestep",
             "tokenwise_timestep",
+            "frame_level_mask",
+            "mask_focus_loss",
             "offload_teacher_features",
             "offload_teacher_params",
         }
@@ -1141,6 +1138,12 @@ class LTX2NetworkTrainer(NetworkTrainer):
             raise ValueError("Self-Flow teacher_block_ratio must be in (0, 1)")
         if config.projector_lr is not None and config.projector_lr <= 0.0:
             raise ValueError("Self-Flow projector_lr must be > 0")
+        if config.teacher_mode not in {"base", "ema", "partial_ema"}:
+            raise ValueError("Self-Flow teacher_mode must be one of: base, ema, partial_ema")
+        if config.student_block_stochastic_range < 0:
+            raise ValueError("Self-Flow student_block_stochastic_range must be >= 0")
+        if config.max_loss < 0.0:
+            raise ValueError("Self-Flow max_loss must be >= 0")
         if config.loss_type not in {"negative_cosine", "one_minus_cosine"}:
             raise ValueError("Self-Flow loss_type must be one of: negative_cosine, one_minus_cosine")
         if config.temporal_mode not in {"off", "frame", "delta", "hybrid"}:
@@ -1175,8 +1178,25 @@ class LTX2NetworkTrainer(NetworkTrainer):
             raise ValueError("Self-Flow temporal_max_steps must be >= 0")
 
         unwrapped_transformer = accelerator.unwrap_model(transformer)
-        unwrapped_network = accelerator.unwrap_model(network)
-        self._current_call_network = unwrapped_network
+        if network is not None:
+            unwrapped_network = accelerator.unwrap_model(network)
+            self_flow_network = unwrapped_network
+        else:
+            # Full fine-tuning mode: transformer itself is the EMA target.
+            # teacher_mode=base is incompatible (requires LoRA multipliers to create the gap).
+            if str(config.teacher_mode).lower() == "base":
+                raise ValueError(
+                    "Self-Flow teacher_mode=base requires a LoRA network — it works by zeroing LoRA multipliers "
+                    "to produce a base-model teacher pass. For full fine-tuning use teacher_mode=ema "
+                    "(EMA over all transformer weights) or teacher_mode=partial_ema (EMA over teacher block only)."
+                )
+            self_flow_network = unwrapped_transformer
+            logger.info(
+                "Self-Flow: no LoRA network detected — using transformer as EMA target (teacher_mode=%s). "
+                "teacher_mode=partial_ema is recommended to limit shadow-param memory to one block.",
+                config.teacher_mode,
+            )
+        self._self_flow_network = self_flow_network
         module = SelfFlowModule(config, unwrapped_transformer)
 
         first_param = next(iter(unwrapped_transformer.parameters()), None)
@@ -1189,7 +1209,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
             else:
                 dtype = torch.float32
         module.setup(accelerator.device, dtype)
-        module.init_teacher(unwrapped_network)
+        module.init_teacher(self_flow_network)
 
         if getattr(args, "resume", None):
             proj_path = os.path.join(args.resume, "self_flow_projector.safetensors")
@@ -1331,6 +1351,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
             num_latent_frames=sf_ctx.get("num_latent_frames"),
             latent_height=sf_ctx.get("latent_height"),
             latent_width=sf_ctx.get("latent_width"),
+            token_mask=sf_ctx.get("dual_timestep_mask"),
         )
 
         metrics: Dict[str, float] = {}
@@ -1345,6 +1366,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
         delta_cosine = self._self_flow.last_delta_cosine
         if delta_cosine is not None:
             metrics["self_flow/delta_cosine"] = float(delta_cosine)
+        metrics["self_flow/lambda_self_flow"] = float(self._self_flow.current_lambda_self_flow)
         metrics["self_flow/lambda_temporal"] = float(self._self_flow.current_lambda_temporal)
         metrics["self_flow/lambda_delta"] = float(self._self_flow.current_lambda_delta)
         if "masked_token_ratio" in sf_ctx:
@@ -1990,7 +2012,12 @@ class LTX2NetworkTrainer(NetworkTrainer):
 
             mask_ratio = float(getattr(self._self_flow.config, "mask_ratio", 0.10))
             mask_ratio = max(0.0, min(0.5, mask_ratio))
-            mask = torch.rand((batch_size, seq_len), device=device, dtype=torch.float32) < mask_ratio
+            if bool(getattr(self._self_flow.config, "frame_level_mask", False)):
+                # Mask whole frames rather than individual tokens.
+                frame_mask = torch.rand((batch_size, frames), device=device, dtype=torch.float32) < mask_ratio
+                mask = frame_mask.unsqueeze(-1).expand(batch_size, frames, height * width).reshape(batch_size, seq_len)
+            else:
+                mask = torch.rand((batch_size, seq_len), device=device, dtype=torch.float32) < mask_ratio
 
             tau_tokens = torch.where(mask, s_tokens, t_tokens)
             tau_min = torch.minimum(sigmas, sigmas_alt)
@@ -2010,6 +2037,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
             self._self_flow_step_context = {
                 "teacher_noisy_model_input": teacher_noisy.detach(),
                 "teacher_model_timesteps": teacher_timesteps.detach(),
+                "dual_timestep_mask": mask.detach(),
                 "masked_token_ratio": float(mask.float().mean().item()),
                 "tau_mean": float(tau_tokens.mean().item()),
                 "tau_min_mean": float(tau_min.mean().item()),
@@ -3691,7 +3719,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
 
         if self._self_flow_active and self._self_flow is not None:
             self._self_flow.cleanup_step()
-            network_for_self_flow = getattr(self, "_current_call_network", None)
+            network_for_self_flow = getattr(self, "_self_flow_network", None)
             is_train_step = bool(getattr(network_for_self_flow, "training", False)) if network_for_self_flow is not None else bool(
                 getattr(transformer, "training", False)
             )
@@ -5270,7 +5298,6 @@ class LTX2NetworkTrainer(NetworkTrainer):
         ref_audio_latents: Optional[torch.Tensor] = None,
     ):
         """Generate sample video during training using LTX-2 denoising loop"""
-        from musubi_tuner.modules.scheduling_flow_match_discrete import FlowMatchDiscreteScheduler
         from musubi_tuner.ltx_2.types import AudioLatentShape, VideoPixelShape
 
         transformer_device = next(transformer.parameters()).device
@@ -5476,7 +5503,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
             elif conditioning_latent.shape[2] != 1:
                 logger.warning(f"I2V: conditioning_latent has {conditioning_latent.shape[2]} frames, expected 1. Skipping I2V conditioning.")
             elif latents.shape[2] < 1:
-                logger.warning(f"I2V: Video latents have no temporal frames. Skipping I2V conditioning.")
+                logger.warning("I2V: Video latents have no temporal frames. Skipping I2V conditioning.")
             elif conditioning_latent.shape[1] != latents.shape[1]:
                 logger.warning(f"I2V: Channel dimension mismatch - conditioning {conditioning_latent.shape[1]} vs latents {latents.shape[1]}. Skipping I2V conditioning.")
             elif conditioning_latent.shape[-2:] != latents.shape[-2:]:
@@ -7005,7 +7032,8 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         "patch_match_mode=soft patch_match_temperature=0.2 delta_num_steps=2 "
         "motion_weighting=teacher_delta motion_weight_strength=0.5 "
         "temporal_schedule=linear temporal_warmup_steps=200 temporal_max_steps=2000 mask_ratio=0.1 "
-        "teacher_momentum=0.999 "
+        "frame_level_mask=false teacher_mode=base mask_focus_loss=false max_loss=0.0 "
+        "student_block_stochastic_range=2 teacher_momentum=0.999 "
         "dual_timestep=true student_block_ratio=0.3 teacher_block_ratio=0.7 projector_lr=5e-5",
     )
 

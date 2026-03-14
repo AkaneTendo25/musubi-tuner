@@ -14,7 +14,6 @@ ComfyUI format:
 """
 
 import safetensors.torch
-import torch
 import argparse
 import os
 from pathlib import Path
@@ -175,7 +174,7 @@ def convert_lora_to_comfy(input_path, output_path=None, verbose=False):
             if verbose:
                 print(f"Converted: {key} -> {new_key}")
 
-    print(f"\nConversion summary:")
+    print("\nConversion summary:")
     print(f"  Converted: {converted} keys")
     print(f"  Skipped alpha keys: {skipped_alpha}")
     print(f"  Folded alpha into lora_B: {folded_alpha}")
@@ -201,7 +200,7 @@ def convert_lora_to_comfy(input_path, output_path=None, verbose=False):
     print(f"\nSaving ComfyUI-compatible LoRA to: {output_path}")
     safetensors.torch.save_file(comfy_state_dict, output_path, metadata=metadata)
 
-    print(f"[OK] Conversion complete!")
+    print("[OK] Conversion complete!")
 
     return output_path
 

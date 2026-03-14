@@ -622,6 +622,8 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
     if t.self_flow:
         cmd.append("--self_flow")
         args_parts = []
+        if t.self_flow_teacher_mode != "base":
+            args_parts.append(f"teacher_mode={t.self_flow_teacher_mode}")
         if t.self_flow_student_block_idx != 16:
             args_parts.append(f"student_block_idx={t.self_flow_student_block_idx}")
         if t.self_flow_teacher_block_idx != 32:
@@ -630,10 +632,18 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
             args_parts.append(f"student_block_ratio={t.self_flow_student_block_ratio}")
         if t.self_flow_teacher_block_ratio != 0.7:
             args_parts.append(f"teacher_block_ratio={t.self_flow_teacher_block_ratio}")
+        if t.self_flow_student_block_stochastic_range != 0:
+            args_parts.append(f"student_block_stochastic_range={t.self_flow_student_block_stochastic_range}")
         if t.self_flow_lambda != 0.1:
             args_parts.append(f"lambda_self_flow={t.self_flow_lambda}")
         if t.self_flow_mask_ratio != 0.1:
             args_parts.append(f"mask_ratio={t.self_flow_mask_ratio}")
+        if t.self_flow_frame_level_mask:
+            args_parts.append("frame_level_mask=true")
+        if t.self_flow_mask_focus_loss:
+            args_parts.append("mask_focus_loss=true")
+        if t.self_flow_max_loss != 0.0:
+            args_parts.append(f"max_loss={t.self_flow_max_loss}")
         if t.self_flow_teacher_momentum != 0.999:
             args_parts.append(f"teacher_momentum={t.self_flow_teacher_momentum}")
         if not t.self_flow_dual_timestep:

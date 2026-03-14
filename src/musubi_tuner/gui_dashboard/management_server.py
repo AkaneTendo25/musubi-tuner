@@ -18,7 +18,6 @@ from fastapi.responses import FileResponse, HTMLResponse, Response
 from musubi_tuner.gui_dashboard.process_manager import ProcessManager
 from musubi_tuner.gui_dashboard.project_schema import ProjectConfig
 from musubi_tuner.gui_dashboard.routers import datasets, filesystem, processes, projects, stats, system
-from musubi_tuner.gui_dashboard.routers.metrics import create_metrics_router, mount_samples_dir
 
 logger = logging.getLogger(__name__)
 

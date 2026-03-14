@@ -9,7 +9,6 @@ import torch
 from einops import rearrange
 from transformers import AutoImageProcessor, Gemma3ForConditionalGeneration, Gemma3Processor
 from musubi_tuner.ltx_2.loader.module_ops import ModuleOps
-from musubi_tuner.ltx_2.text_encoders.gemma.feature_extractor import GemmaFeaturesExtractorProjLinear
 from musubi_tuner.utils.safetensors_utils import MemoryEfficientSafeOpen
 from musubi_tuner.ltx_2.text_encoders.gemma.tokenizer import LTXVGemmaTokenizer
 

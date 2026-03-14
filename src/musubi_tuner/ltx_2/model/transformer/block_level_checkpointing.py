@@ -25,7 +25,7 @@ Usage:
 """
 
 import torch
-from typing import Callable, List, Any, Optional, Tuple
+from typing import Callable, Any
 import logging
 from musubi_tuner.ltx_2.model.transformer.fp8_device_utils import ensure_fp8_modules_on_device
 

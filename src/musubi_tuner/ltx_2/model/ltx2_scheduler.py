@@ -2,8 +2,6 @@
 # Ported from ltx_core.components to work without external dependencies
 
 import torch
-from dataclasses import dataclass
-from typing import Optional
 
 
 class LTX2Scheduler:

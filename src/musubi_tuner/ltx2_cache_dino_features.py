@@ -11,7 +11,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
-from typing import List, Sequence, cast
+from typing import Sequence, cast
 
 import numpy as np
 import torch
@@ -22,7 +22,6 @@ from musubi_tuner.dataset.config_utils import BlueprintGenerator, ConfigSanitize
 from musubi_tuner.dataset.image_video_dataset import (
     ARCHITECTURE_LTX2,
     BaseDataset,
-    ItemInfo,
     VideoDataset,
 )
 

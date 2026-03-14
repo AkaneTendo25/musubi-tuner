@@ -797,15 +797,15 @@ The cache file is saved to `<cache_directory>/ltx2_preservation_cache.pt` by def
 
 #### Self-Flow (Self-Supervised Flow Matching)
 
-**Self-Flow** prevents the fine-tuned model from drifting away from the pretrained model's internal representations. It aligns student features against an EMA-updated teacher copy using cosine similarity, with dual-timestep noising to decorrelate the two. The optional **temporal extension** adds frame-neighbor and motion-delta losses that explicitly preserve temporal coherence — useful when fine-tuning degrades motion smoothness or introduces flickering. Based on [arXiv 2603.06507](https://arxiv.org/abs/2603.06507).
+**Self-Flow** prevents the fine-tuned model from drifting away from the pretrained model's internal representations. It aligns student features (shallower block) against teacher features (deeper block) using cosine similarity, with dual-timestep noising to create a meaningful student-teacher gap. The default `teacher_mode=base` uses the **frozen pretrained model** as teacher by zeroing LoRA multipliers for the teacher forward pass — no extra VRAM overhead compared to EMA. An EMA-based teacher (`teacher_mode=ema`) is also available for LoRA-aware distillation. The optional **temporal extension** adds frame-neighbor and motion-delta losses that explicitly preserve temporal coherence. Based on [arXiv 2603.06507](https://arxiv.org/abs/2603.06507).
 
 Enable with `--self_flow`. All parameters are passed via `--self_flow_args` as `key=value` pairs:
 
 ```bash
-# Base Self-Flow (token-level alignment only)
+# Recommended default: base-model teacher, token-level alignment only
 accelerate launch ... ltx2_train_network.py ^
   --self_flow ^
-  --self_flow_args student_block_ratio=0.3 teacher_block_ratio=0.7 lambda_self_flow=0.1 mask_ratio=0.1 teacher_momentum=0.999 dual_timestep=true
+  --self_flow_args teacher_mode=base student_block_ratio=0.3 teacher_block_ratio=0.7 lambda_self_flow=0.1 mask_ratio=0.1 dual_timestep=true
 
 # With temporal consistency (hybrid = frame alignment + motion delta)
 accelerate launch ... ltx2_train_network.py ^
@@ -824,11 +824,17 @@ accelerate launch ... ltx2_train_network.py ^
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `student_block_idx` | `16` | Student feature block index (0-based) |
-| `teacher_block_idx` | `32` | Teacher feature block index (must be `> student_block_idx`) |
-| `student_block_ratio` | `None` | Optional ratio-based student layer selection. When set, resolves to `floor(ratio * depth)` |
-| `teacher_block_ratio` | `None` | Optional ratio-based teacher layer selection. When set, resolves to `ceil(ratio * depth)` |
-| `lambda_self_flow` | `0.1` | Loss weight for the Self-Flow representation term |
+| `teacher_mode` | `base` | Teacher source: `base` (frozen pretrained; zero LoRA multipliers during teacher pass, no extra VRAM), `ema` (EMA over all LoRA params), `partial_ema` (EMA over teacher block's LoRA params only) |
+| `student_block_idx` | `16` | Student feature block index (0-based; overridden by `student_block_ratio` when set) |
+| `teacher_block_idx` | `32` | Teacher feature block index (must be `> student_block_idx`; overridden by `teacher_block_ratio` when set) |
+| `student_block_ratio` | `None` | Ratio-based student layer selection. Resolves to `floor(ratio * depth)`. Takes priority over `student_block_idx`. |
+| `teacher_block_ratio` | `None` | Ratio-based teacher layer selection. Resolves to `ceil(ratio * depth)`. Takes priority over `teacher_block_idx`. |
+| `student_block_stochastic_range` | `0` | Randomly vary the student capture block ±N blocks each step. `0` = fixed block. Adds regularization diversity; note a single projector is shared across all depth variants. |
+| `lambda_self_flow` | `0.1` | Loss weight for the Self-Flow token-level representation term |
+| `mask_ratio` | `0.10` | Token mask ratio for dual-timestep mixing. Valid range: `[0.0, 0.5]` |
+| `frame_level_mask` | `false` | When `true`, mask whole latent frames instead of individual tokens. More semantically coherent masking for video. |
+| `mask_focus_loss` | `false` | When `true`, compute the representation loss only on masked (higher-noise) tokens. Default: loss over all tokens. |
+| `max_loss` | `0.0` | Cap Self-Flow loss magnitude by rescaling if total loss exceeds this value. `0` = disabled. Useful to prevent Self-Flow from dominating the main task loss early in training. |
 | `temporal_mode` | `off` | Temporal extension mode: `off`, `frame`, `delta`, or `hybrid` |
 | `lambda_temporal` | `0.0` | Loss weight for frame-level temporal neighbor alignment |
 | `lambda_delta` | `0.0` | Loss weight for frame-delta alignment (motion consistency) |
@@ -841,11 +847,10 @@ accelerate launch ... ltx2_train_network.py ^
 | `delta_num_steps` | `1` | Number of temporal delta steps included in the delta loss (`1` = adjacent frames only) |
 | `motion_weighting` | `none` | Temporal weighting mode: `none` or `teacher_delta` |
 | `motion_weight_strength` | `0.0` | Strength of teacher-delta motion weighting for temporal terms |
-| `temporal_schedule` | `constant` | Temporal weight schedule: `constant`, `linear`, or `cosine` |
-| `temporal_warmup_steps` | `0` | Linear warmup steps before temporal weights reach full strength |
-| `temporal_max_steps` | `0` | Total steps for `linear` / `cosine` decay. Defaults to `--max_train_steps` when unset |
-| `mask_ratio` | `0.10` | Token mask ratio for dual-timestep mixing. Valid range: `[0.0, 0.5]` |
-| `teacher_momentum` | `0.999` | EMA momentum for teacher updates. Valid range: `[0.0, 1.0)` |
+| `temporal_schedule` | `constant` | Schedule applied to **all** Self-Flow lambdas (`lambda_self_flow`, `lambda_temporal`, `lambda_delta`): `constant`, `linear` decay, or `cosine` decay |
+| `temporal_warmup_steps` | `0` | Steps to linearly ramp all lambdas up from zero to full weight |
+| `temporal_max_steps` | `0` | Steps at which `linear` / `cosine` decay reaches zero. `0` = no decay |
+| `teacher_momentum` | `0.999` | EMA momentum for teacher updates (`ema` / `partial_ema` modes only). Valid range: `[0.0, 1.0)` |
 | `teacher_update_interval` | `1` | Update EMA teacher every N optimizer steps |
 | `projector_hidden_multiplier` | `1` | Projector hidden width multiplier vs model inner dim |
 | `projector_lr` | `None` | Optional projector-specific learning rate. Defaults to `--learning_rate` when unset |
@@ -853,22 +858,23 @@ accelerate launch ... ltx2_train_network.py ^
 | `dual_timestep` | `true` | Enable dual-timestep noising |
 | `tokenwise_timestep` | `true` | Use per-token timesteps (otherwise per-sample averaged timestep) |
 | `offload_teacher_features` | `false` | Offload cached teacher features to CPU to reduce VRAM |
-| `offload_teacher_params` | `false` | Offload EMA teacher parameters to CPU (saves VRAM, slower teacher forward pass) |
+| `offload_teacher_params` | `false` | Offload EMA teacher parameters to CPU (saves VRAM, slower teacher forward pass; `ema` / `partial_ema` only) |
 
 ##### Notes
 
 - Supported mode: `--ltx2_mode video` only.
-- Cost: one extra teacher forward pass per train step.
+- Cost: one extra teacher forward pass per train step. `teacher_mode=base` requires no extra VRAM since it reuses the existing model with LoRA multipliers zeroed.
+- Teacher modes: `base` gives the largest student-teacher gap (pretrained vs LoRA-finetuned); `ema` / `partial_ema` give a moving target that shrinks as training converges.
 - Temporal extension: when `temporal_mode != off`, Self-Flow reshapes hidden states into latent frames and adds frame-neighbor and/or frame-delta consistency losses on top of the base token alignment loss.
 - Granularity: `temporal_granularity=frame` uses mean-pooled per-frame features (cheaper, coarser). `temporal_granularity=patch` keeps spatial tokens for stronger temporal matching.
 - Local patch matching: when `temporal_granularity=patch` and `patch_spatial_radius > 0`, each student patch can align to the best teacher patch inside a local spatial window, which is more tolerant to small motion and camera drift than strict same-patch matching.
 - Soft matching: `patch_match_mode=soft` replaces hard local best-match selection with softmax-weighted neighborhood matching for smoother gradients.
 - Multi-step motion: `delta_num_steps > 1` extends the delta loss beyond adjacent frames using exponentially decayed step weights.
 - Motion-aware weighting: `motion_weighting=teacher_delta` upweights temporally active teacher regions, focusing the temporal loss on moving content.
-- Scheduling: `temporal_schedule`, `temporal_warmup_steps`, and `temporal_max_steps` affect only the temporal terms; the base `lambda_self_flow` token loss stays constant.
-- State files (Accelerate `*-state` folder): `self_flow_projector.safetensors`, `self_flow_teacher_ema.safetensors`.
-- Resume: both state files are loaded automatically when present.
-- Logged metrics: `loss/self_flow`, `self_flow/cosine`, `self_flow/frame_cosine`, `self_flow/delta_cosine`, `self_flow/lambda_temporal`, `self_flow/lambda_delta`, `self_flow/masked_token_ratio`, `self_flow/tau_mean`, `self_flow/tau_min_mean`.
+- Scheduling: `temporal_schedule`, `temporal_warmup_steps`, and `temporal_max_steps` apply to **all three** lambdas — `lambda_self_flow`, `lambda_temporal`, and `lambda_delta` — uniformly.
+- State files (Accelerate `*-state` folder): `self_flow_projector.safetensors`, `self_flow_teacher_ema.safetensors` (EMA state only saved when `teacher_mode=ema` or `partial_ema`).
+- Resume: both state files are loaded automatically when present. Loading EMA state with `teacher_mode=base` emits a warning and is ignored.
+- Logged metrics: `loss/self_flow`, `self_flow/cosine`, `self_flow/frame_cosine`, `self_flow/delta_cosine`, `self_flow/lambda_self_flow`, `self_flow/lambda_temporal`, `self_flow/lambda_delta`, `self_flow/masked_token_ratio`, `self_flow/tau_mean`, `self_flow/tau_min_mean`.
 
 #### Timestep Sampling
 - `--timestep_sampling shifted_logit_normal`: Default LTX-2 method. Uses a shifted logit-normal distribution where the shift is computed based on sequence length (frames × height × width).

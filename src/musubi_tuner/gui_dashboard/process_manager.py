@@ -6,7 +6,6 @@ import logging
 import subprocess
 import sys
 import threading
-import time
 from collections import deque
 from enum import Enum
 from typing import Literal, Optional

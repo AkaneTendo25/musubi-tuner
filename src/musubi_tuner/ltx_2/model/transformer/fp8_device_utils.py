@@ -1,4 +1,3 @@
-import os
 import torch
 
 _LOGGED_MISMATCH = False

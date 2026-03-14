@@ -175,30 +175,43 @@
 			<div class="p-5 pt-0 space-y-3">
 				<div class="p-3" style="background: var(--bg-elevated); border-radius: var(--radius-sm); border: 1px solid var(--border-subtle);">
 					<div class="text-[11px] font-semibold mb-2" style="color: var(--text-primary);">Architecture</div>
-					<div class="grid grid-cols-2 gap-2 mb-2">
-						<FormField label="Student Block" type="number" value={$projectConfig?.training?.self_flow_student_block_idx ?? 16} oninput={(e) => updateTraining('self_flow_student_block_idx', Number(e.target.value))} min={0} max={47} tooltip="Student block index" />
-						<FormField label="Teacher Block" type="number" value={$projectConfig?.training?.self_flow_teacher_block_idx ?? 32} oninput={(e) => updateTraining('self_flow_teacher_block_idx', Number(e.target.value))} min={0} max={47} tooltip="Teacher block index (must be > student)" />
+					<div class="grid grid-cols-3 gap-2 mb-2">
+						<FormField label="Teacher Mode" type="select" value={$projectConfig?.training?.self_flow_teacher_mode ?? 'base'} oninput={(e) => updateTraining('self_flow_teacher_mode', e.target.value)} options={[{value: 'base', label: 'Base model'}, {value: 'ema', label: 'EMA (all LoRA)'}, {value: 'partial_ema', label: 'Partial EMA (teacher block)'}]} tooltip="base: frozen pretrained model (no VRAM overhead, stronger gap). ema: EMA over all LoRA params. partial_ema: EMA only over teacher block's LoRA params." />
+						<FormField label="Student Block" type="number" value={$projectConfig?.training?.self_flow_student_block_idx ?? 16} oninput={(e) => updateTraining('self_flow_student_block_idx', Number(e.target.value))} min={0} max={47} tooltip="Student feature block index (overridden by ratio when set)" />
+						<FormField label="Teacher Block" type="number" value={$projectConfig?.training?.self_flow_teacher_block_idx ?? 32} oninput={(e) => updateTraining('self_flow_teacher_block_idx', Number(e.target.value))} min={0} max={47} tooltip="Teacher feature block index (must be > student; overridden by ratio when set)" />
 					</div>
-					<div class="grid grid-cols-2 gap-2">
-						<FormField label="Student Ratio" type="number" value={$projectConfig?.training?.self_flow_student_block_ratio ?? 0.3} oninput={(e) => updateTraining('self_flow_student_block_ratio', Number(e.target.value))} step="0.05" min={0} max={1} tooltip="Fraction of blocks up to student" />
-						<FormField label="Teacher Ratio" type="number" value={$projectConfig?.training?.self_flow_teacher_block_ratio ?? 0.7} oninput={(e) => updateTraining('self_flow_teacher_block_ratio', Number(e.target.value))} step="0.05" min={0} max={1} tooltip="Fraction of blocks up to teacher" />
+					<div class="grid grid-cols-3 gap-2">
+						<FormField label="Student Ratio" type="number" value={$projectConfig?.training?.self_flow_student_block_ratio ?? 0.3} oninput={(e) => updateTraining('self_flow_student_block_ratio', Number(e.target.value))} step="0.05" min={0} max={1} tooltip="Ratio-based student block: floor(ratio × depth). Takes priority over block index." />
+						<FormField label="Teacher Ratio" type="number" value={$projectConfig?.training?.self_flow_teacher_block_ratio ?? 0.7} oninput={(e) => updateTraining('self_flow_teacher_block_ratio', Number(e.target.value))} step="0.05" min={0} max={1} tooltip="Ratio-based teacher block: ceil(ratio × depth). Takes priority over block index." />
+						<FormField label="Stochastic Range" type="number" value={$projectConfig?.training?.self_flow_student_block_stochastic_range ?? 0} oninput={(e) => updateTraining('self_flow_student_block_stochastic_range', Number(e.target.value))} min={0} max={8} tooltip="Randomly vary student capture block ±N each step. 0 = fixed block. Adds regularization variety but uses a shared projector across depths." />
 					</div>
 				</div>
 
 				<div class="p-3" style="background: var(--bg-elevated); border-radius: var(--radius-sm); border: 1px solid var(--border-subtle);">
 					<div class="text-[11px] font-semibold mb-2" style="color: var(--text-primary);">Loss Parameters</div>
 					<div class="grid grid-cols-3 gap-2 mb-2">
-						<FormField label="Lambda" type="number" value={$projectConfig?.training?.self_flow_lambda ?? 0.1} oninput={(e) => updateTraining('self_flow_lambda', Number(e.target.value))} step="0.01" min={0} tooltip="Self-Flow loss weight" />
-						<FormField label="Mask Ratio" type="number" value={$projectConfig?.training?.self_flow_mask_ratio ?? 0.1} oninput={(e) => updateTraining('self_flow_mask_ratio', Number(e.target.value))} step="0.05" min={0} max={1} tooltip="Feature masking ratio" />
-						<FormField label="Momentum" type="number" value={$projectConfig?.training?.self_flow_teacher_momentum ?? 0.999} oninput={(e) => updateTraining('self_flow_teacher_momentum', Number(e.target.value))} step="0.001" min={0} max={1} tooltip="EMA teacher update momentum" />
+						<FormField label="Lambda" type="number" value={$projectConfig?.training?.self_flow_lambda ?? 0.1} oninput={(e) => updateTraining('self_flow_lambda', Number(e.target.value))} step="0.01" min={0} tooltip="Self-Flow base loss weight. Scaled by the same schedule as temporal lambdas." />
+						<FormField label="Mask Ratio" type="number" value={$projectConfig?.training?.self_flow_mask_ratio ?? 0.1} oninput={(e) => updateTraining('self_flow_mask_ratio', Number(e.target.value))} step="0.05" min={0} max={0.5} tooltip="Fraction of tokens given the alternate timestep in dual-timestep noising. Valid range [0, 0.5]." />
+						<FormField label="Max Loss Cap" type="number" value={$projectConfig?.training?.self_flow_max_loss ?? 0.0} oninput={(e) => updateTraining('self_flow_max_loss', Number(e.target.value))} step="0.01" min={0} placeholder="Disabled" tooltip="Rescale total Self-Flow loss if its magnitude exceeds this value. 0 = disabled. Prevents Self-Flow from dominating the main task loss early in training." />
+					</div>
+					<div class="grid grid-cols-3 gap-2 mb-2">
+						<FormField label="Momentum" type="number" value={$projectConfig?.training?.self_flow_teacher_momentum ?? 0.999} oninput={(e) => updateTraining('self_flow_teacher_momentum', Number(e.target.value))} step="0.001" min={0} max={1} tooltip="EMA momentum for teacher updates (only used when teacher_mode=ema or partial_ema)" />
+						<FormField label="Projector LR" type="number" value={$projectConfig?.training?.self_flow_projector_lr ?? ''} oninput={(e) => updateTraining('self_flow_projector_lr', e.target.value ? Number(e.target.value) : null)} placeholder="Same as LR" step="any" tooltip="Separate LR for projector MLP" />
 					</div>
 					<div class="grid grid-cols-3 gap-2">
 						<div class="flex items-end pb-0.5">
 							<FormToggle label="Dual Timestep" checked={$projectConfig?.training?.self_flow_dual_timestep ?? true} onchange={(e) => updateTraining('self_flow_dual_timestep', e.target.checked)} tooltip="Sample independent timesteps for student/teacher" />
 						</div>
-						<FormField label="Projector LR" type="number" value={$projectConfig?.training?.self_flow_projector_lr ?? ''} oninput={(e) => updateTraining('self_flow_projector_lr', e.target.value ? Number(e.target.value) : null)} placeholder="Same as LR" step="any" tooltip="Separate LR for projector MLP" />
 						<div class="flex items-end pb-0.5">
-							<FormToggle label="Offload Teacher" checked={$projectConfig?.training?.self_flow_offload_teacher_features ?? false} onchange={(e) => updateTraining('self_flow_offload_teacher_features', e.target.checked)} tooltip="Offload teacher features to CPU to save VRAM" />
+							<FormToggle label="Frame-Level Mask" checked={$projectConfig?.training?.self_flow_frame_level_mask ?? false} onchange={(e) => updateTraining('self_flow_frame_level_mask', e.target.checked)} tooltip="Mask whole frames instead of individual tokens. More semantically meaningful masking for video." />
+						</div>
+						<div class="flex items-end pb-0.5">
+							<FormToggle label="Mask-Focus Loss" checked={$projectConfig?.training?.self_flow_mask_focus_loss ?? false} onchange={(e) => updateTraining('self_flow_mask_focus_loss', e.target.checked)} tooltip="Focus the representation loss only on the masked (higher-noise) tokens. Standard: loss over all tokens." />
+						</div>
+					</div>
+					<div class="grid grid-cols-1 gap-2 mt-2">
+						<div class="flex items-end pb-0.5">
+							<FormToggle label="Offload Teacher Features" checked={$projectConfig?.training?.self_flow_offload_teacher_features ?? false} onchange={(e) => updateTraining('self_flow_offload_teacher_features', e.target.checked)} tooltip="Offload cached teacher features to CPU to reduce VRAM" />
 						</div>
 					</div>
 				</div>
@@ -227,7 +240,7 @@
 						<FormField label="Motion Strength" type="number" value={$projectConfig?.training?.self_flow_motion_weight_strength ?? 0.0} oninput={(e) => updateTraining('self_flow_motion_weight_strength', Number(e.target.value))} step="0.1" min={0} tooltip="How strongly motion affects per-token weighting" />
 					</div>
 					<div class="grid grid-cols-3 gap-2">
-						<FormField label="Schedule" type="select" value={$projectConfig?.training?.self_flow_temporal_schedule ?? 'constant'} oninput={(e) => updateTraining('self_flow_temporal_schedule', e.target.value)} options={[{value: 'constant', label: 'Constant'}, {value: 'linear', label: 'Linear decay'}, {value: 'cosine', label: 'Cosine decay'}]} tooltip="Temporal lambda schedule (base lambda_self_flow stays constant)" />
+						<FormField label="Schedule" type="select" value={$projectConfig?.training?.self_flow_temporal_schedule ?? 'constant'} oninput={(e) => updateTraining('self_flow_temporal_schedule', e.target.value)} options={[{value: 'constant', label: 'Constant'}, {value: 'linear', label: 'Linear decay'}, {value: 'cosine', label: 'Cosine decay'}]} tooltip="Schedule for all Self-Flow lambdas (lambda_self_flow, lambda_temporal, lambda_delta all scale together)" />
 						<FormField label="Warmup Steps" type="number" value={$projectConfig?.training?.self_flow_temporal_warmup_steps ?? 0} oninput={(e) => updateTraining('self_flow_temporal_warmup_steps', Number(e.target.value))} min={0} tooltip="Linear ramp-up before temporal loss reaches full weight" />
 						<FormField label="Max Steps" type="number" value={$projectConfig?.training?.self_flow_temporal_max_steps ?? 0} oninput={(e) => updateTraining('self_flow_temporal_max_steps', Number(e.target.value))} min={0} tooltip="Steps at which linear/cosine decay reaches zero (0 = no decay)" />
 					</div>

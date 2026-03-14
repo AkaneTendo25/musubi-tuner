@@ -17,7 +17,7 @@ from musubi_tuner.gui_dashboard.command_builder import (
     build_slider_training_cmd,
     build_training_cmd,
 )
-from musubi_tuner.gui_dashboard.process_manager import ProcessManager, ProcessState
+from musubi_tuner.gui_dashboard.process_manager import ProcessManager
 
 router = APIRouter(tags=["processes"])
 
