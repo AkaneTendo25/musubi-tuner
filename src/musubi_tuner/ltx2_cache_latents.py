@@ -1181,7 +1181,9 @@ def main() -> None:
         def encode_fn(batch: List[ItemInfo]) -> None:
             encode_and_save_batch(vae, batch, tiling_config)
 
-        cache_latents.encode_datasets(list(datasets), encode_fn, args)
+        # Only pass non-audio datasets to the video encoder; AudioDataset items have
+        # content=None (no visual frames) and are handled separately below.
+        cache_latents.encode_datasets(list(non_audio_datasets), encode_fn, args)
 
         # Cache reference latents for IC-LoRA / v2v training (auto-detected from TOML config)
         # Runs when any dataset has both reference_directory and reference_cache_directory

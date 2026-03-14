@@ -133,7 +133,6 @@ This step pre-processes media files into VAE latents to speed up training.
 ```bash
 python ltx2_cache_latents.py ^
   --dataset_config dataset.toml ^
-  --save_dataset_manifest dataset_manifest.json ^
   --ltx2_checkpoint /path/to/ltx-2.safetensors ^
   --device cuda ^
   --vae_dtype bf16 ^
