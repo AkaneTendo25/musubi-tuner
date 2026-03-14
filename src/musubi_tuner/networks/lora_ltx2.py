@@ -255,6 +255,7 @@ class LTX2Wrapper(nn.Module):
         video_tokens = None
         video_timesteps = None
         video_positions = None
+        a2v_cross_attention_mask = None
         if model_video_enabled:
             video_tokens = self._video_patchifier.patchify(video_latents)
             video_seq_len = video_tokens.shape[1]
@@ -297,9 +298,21 @@ class LTX2Wrapper(nn.Module):
                 causal_fix=True,
             ).to(dtype=video_latents.dtype)
             video_positions[:, 0, ...] = video_positions[:, 0, ...] / float(frame_rate)
+            if isinstance(transformer_options, dict):
+                video_positions_override = transformer_options.get("video_positions_override")
+                if isinstance(video_positions_override, torch.Tensor):
+                    if video_positions_override.shape != video_positions.shape:
+                        raise ValueError(
+                            "video_positions_override shape mismatch: "
+                            f"got {tuple(video_positions_override.shape)}, expected {tuple(video_positions.shape)}"
+                        )
+                    video_positions = video_positions_override.to(device=video_positions.device, dtype=video_positions.dtype)
+                a2v_cross_attention_mask = transformer_options.get("a2v_cross_attention_mask")
 
         video_context = context
         audio_context = context
+        audio_context_mask = attention_mask
+        v2a_cross_attention_mask = None
         if (
             model_video_enabled
             and not audio_only
@@ -343,6 +356,7 @@ class LTX2Wrapper(nn.Module):
                 sigma=sigma,
                 context_mask=attention_mask,
                 attention_mask=video_self_attention_mask,
+                a2v_cross_attention_mask=a2v_cross_attention_mask,
             )
 
         audio_modality = None
@@ -369,6 +383,18 @@ class LTX2Wrapper(nn.Module):
 
             audio_shape = AudioLatentShape(batch=bsz, channels=ach, frames=at, mel_bins=af)
             audio_positions = self._audio_patchifier.get_patch_grid_bounds(audio_shape, device=audio_latents.device)
+            if isinstance(transformer_options, dict):
+                audio_positions_override = transformer_options.get("audio_positions_override")
+                if isinstance(audio_positions_override, torch.Tensor):
+                    if audio_positions_override.shape != audio_positions.shape:
+                        raise ValueError(
+                            "audio_positions_override shape mismatch: "
+                            f"got {tuple(audio_positions_override.shape)}, expected {tuple(audio_positions.shape)}"
+                        )
+                    audio_positions = audio_positions_override.to(device=audio_positions.device, dtype=audio_positions.dtype)
+                if "audio_context_mask" in transformer_options:
+                    audio_context_mask = transformer_options.get("audio_context_mask")
+                v2a_cross_attention_mask = transformer_options.get("v2a_cross_attention_mask")
 
             audio_modality = Modality(
                 enabled=(True if audio_enabled is None else bool(audio_enabled)),
@@ -377,7 +403,8 @@ class LTX2Wrapper(nn.Module):
                 positions=audio_positions.to(dtype=audio_latents.dtype),
                 context=audio_context,
                 sigma=audio_sigma,
-                context_mask=attention_mask,
+                context_mask=audio_context_mask,
+                v2a_cross_attention_mask=v2a_cross_attention_mask,
             )
 
         perturbations = BatchedPerturbationConfig.empty(bsz)
@@ -521,6 +548,33 @@ LTX2_INCLUDE_PATTERNS_AUDIO = [
     r".*\.video_to_audio_attn\.to_out\.0$",
 ]
 
+# audio_ref_only_ic: ID-LoRA-style audio-reference IC preset.
+# Targets audio self/cross-attn, audio FFN, and BOTH AV cross-modal directions.
+# Mirrors ID-LoRA target_modules:
+#   - audio_attn1 / audio_attn2
+#   - audio_ff
+#   - audio_to_video_attn / video_to_audio_attn
+LTX2_INCLUDE_PATTERNS_AUDIO_REF_ONLY_IC = [
+    r".*\.audio_attn1\.to_k$",
+    r".*\.audio_attn1\.to_q$",
+    r".*\.audio_attn1\.to_v$",
+    r".*\.audio_attn1\.to_out\.0$",
+    r".*\.audio_attn2\.to_k$",
+    r".*\.audio_attn2\.to_q$",
+    r".*\.audio_attn2\.to_v$",
+    r".*\.audio_attn2\.to_out\.0$",
+    r".*\.audio_ff\.net\.0\.proj$",
+    r".*\.audio_ff\.net\.2$",
+    r".*\.audio_to_video_attn\.to_k$",
+    r".*\.audio_to_video_attn\.to_q$",
+    r".*\.audio_to_video_attn\.to_v$",
+    r".*\.audio_to_video_attn\.to_out\.0$",
+    r".*\.video_to_audio_attn\.to_k$",
+    r".*\.video_to_audio_attn\.to_q$",
+    r".*\.video_to_audio_attn\.to_v$",
+    r".*\.video_to_audio_attn\.to_out\.0$",
+]
+
 # full: All linear layers in transformer blocks
 # Maximum expressiveness, but larger LoRA file and more VRAM usage.
 LTX2_INCLUDE_PATTERNS_FULL = None  # None means no filtering, all Linear layers matched
@@ -530,6 +584,7 @@ LTX2_LORA_TARGET_PRESETS = {
     "t2v": LTX2_INCLUDE_PATTERNS_T2V,
     "v2v": LTX2_INCLUDE_PATTERNS_V2V,
     "audio": LTX2_INCLUDE_PATTERNS_AUDIO,
+    "audio_ref_only_ic": LTX2_INCLUDE_PATTERNS_AUDIO_REF_ONLY_IC,
     "full": LTX2_INCLUDE_PATTERNS_FULL,
 }
 

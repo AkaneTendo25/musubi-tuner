@@ -100,6 +100,8 @@ def _move_transformer_args(
         cross_gate_timestep=_move_tensor(args.cross_gate_timestep),
         prompt_timestep=_move_tensor(args.prompt_timestep),
         self_attention_mask=_move_tensor(args.self_attention_mask),
+        a2v_cross_attention_mask=_move_tensor(args.a2v_cross_attention_mask),
+        v2a_cross_attention_mask=_move_tensor(args.v2a_cross_attention_mask),
     )
 
 

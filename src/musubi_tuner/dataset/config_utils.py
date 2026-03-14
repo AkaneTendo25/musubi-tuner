@@ -43,6 +43,7 @@ class BaseDatasetParams:
     audio_loss_weight: Optional[float] = None
     cache_directory: Optional[str] = None
     reference_cache_directory: Optional[str] = None
+    reference_audio_cache_directory: Optional[str] = None
     separate_audio_buckets: bool = False
     cache_only: bool = False
     debug_dataset: bool = False
@@ -72,6 +73,7 @@ class VideoDatasetParams(BaseDatasetParams):
     video_jsonl_file: Optional[str] = None
     control_directory: Optional[str] = None
     reference_directory: Optional[str] = None
+    reference_audio_directory: Optional[str] = None
     target_frames: Sequence[int] = (1,)
     frame_extraction: Optional[str] = "head"
     frame_stride: Optional[int] = 1
@@ -137,6 +139,7 @@ class ConfigSanitizer:
         "audio_loss_weight": float,
         "cache_directory": str,
         "reference_cache_directory": str,
+        "reference_audio_cache_directory": str,
         "separate_audio_buckets": bool,
         "cache_only": bool,
     }
@@ -163,6 +166,7 @@ class ConfigSanitizer:
         "video_jsonl_file": str,
         "control_directory": str,
         "reference_directory": str,
+        "reference_audio_directory": str,
         "target_frames": [int],
         "frame_extraction": str,
         "frame_stride": int,
@@ -396,6 +400,9 @@ def generate_dataset_group_by_blueprint(
         video_directory: "{dataset.video_directory}"
         video_jsonl_file: "{dataset.video_jsonl_file}"
         control_directory: "{dataset.control_directory}"
+        reference_directory: "{getattr(dataset, 'reference_directory', None)}"
+        reference_audio_directory: "{getattr(dataset, 'reference_audio_directory', None)}"
+        reference_audio_cache_directory: "{getattr(dataset, 'reference_audio_cache_directory', None)}"
         target_frames: {dataset.target_frames}
         frame_extraction: {dataset.frame_extraction}
         frame_stride: {dataset.frame_stride}
@@ -455,6 +462,7 @@ def _manifest_params_with_cache_only(dataset_type: str, params: dict) -> dict:
         params["video_jsonl_file"] = None
         params["control_directory"] = None
         params["reference_directory"] = None
+        params["reference_audio_directory"] = None
 
     return params
 

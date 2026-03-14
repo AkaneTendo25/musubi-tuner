@@ -1,6 +1,6 @@
 # LTX-2 / LTX-2.3
 
-Supports LoRA training for both **LTX-2 (19B)** and **LTX-2.3 (22B)** models with the following training modes: text-to-video, joint audio-video, audio-only, and IC-LoRA / video-to-video (reference-conditioned generation).
+Supports LoRA training for both **LTX-2 (19B)** and **LTX-2.3 (22B)** models with the following training modes: text-to-video, joint audio-video, audio-only, IC-LoRA / video-to-video, and audio-reference IC-LoRA.
 
 ### Supported Model Versions
 
@@ -53,6 +53,7 @@ Caching scripts (`ltx2_cache_latents.py`, `ltx2_cache_text_encoder_outputs.py`) 
     - [Timestep Sampling](#timestep-sampling)
     - [LoRA Targets](#lora-targets)
     - [IC-LoRA / Video-to-Video Training](#ic-lora--video-to-video-training)
+    - [Audio-Reference IC-LoRA](#audio-reference-ic-lora-speaker-identity)
     - [Sampling with Tiled VAE](#sampling-with-tiled-vae)
     - [Precached Sample Prompts](#precached-sample-prompts)
     - [Two-Stage Sampling (WIP)](#two-stage-sampling-wip)
@@ -889,6 +890,7 @@ Use `--lora_target_preset` to control which layers LoRA targets:
 | `t2v` (default) | Attention only (`to_q`, `to_k`, `to_v`, `to_out.0`) | Text-to-video, matches official LTX-2 trainer |
 | `v2v` | Attention + FFN | Video-to-video / IC-LoRA style |
 | `audio` | Audio attention/FFN + audio-side cross-modal attention | Audio-only training (auto-selected when `--ltx2_mode audio`) |
+| `audio_ref_only_ic` | Audio attn/FFN + bidirectional AV cross-modal | Audio-reference IC-LoRA |
 | `full` | All linear layers | All layers targeted, larger file size |
 
 All presets apply to all relevant attention types: self-attention, cross-attention, and cross-modal attention (in AV mode). Connector layers are always excluded.
@@ -1044,6 +1046,145 @@ The `--sample_include_reference` flag shows the reference side-by-side with the 
 - **Downscale factor metadata**: Saved in LoRA safetensors as `ss_reference_downscale_factor` when factor != 1.
 - **Two-stage inference**: Not supported with V2V; a warning is emitted and the reference is ignored.
 
+#### Audio-Reference IC-LoRA
+
+Trains a LoRA using in-context audio-reference conditioning. Reference audio latents (clean, timestep=0) are concatenated with noisy target audio latents during training. Loss is computed only on the target portion. The LoRA targets audio self/cross-attention, audio FFN, and bidirectional audio-video cross-modal attention layers.
+
+Requires `--ltx2_mode av` (audio-video model).
+
+##### How it works
+
+1. Reference audio is encoded to latents and concatenated with noisy target audio along the temporal axis.
+2. Reference tokens receive timestep=0 (no noise); target tokens receive the sampled sigma.
+3. Loss is masked to exclude the reference portion — the model only learns to predict the target.
+4. Three optional attention overrides control how the reference interacts with the rest of the model:
+   - **Negative positions**: shifts reference tokens into negative RoPE time, creating clean positional separation from target tokens.
+   - **A2V cross-attention mask**: blocks video from attending to reference audio (video syncs with target audio only).
+   - **Text attention mask**: blocks reference audio from attending to text (reference provides identity, not content).
+
+##### Step 1: Prepare Data
+
+Organize training videos with matching reference audio files (same filename stem):
+
+```
+videos/                    reference_audio/
+  speaker_001.mp4            speaker_001.wav    # reference clip for speaker_001
+  speaker_002.mp4            speaker_002.flac
+```
+
+Reference audio files are matched to training videos by filename stem.
+
+##### Step 2: Dataset Config
+
+```toml
+[general]
+resolution = [768, 512]
+caption_extension = ".txt"
+batch_size = 1
+enable_bucket = true
+cache_directory = "cache"
+reference_audio_cache_directory = "cache_ref_audio"
+separate_audio_buckets = true
+
+[[datasets]]
+video_directory = "videos"
+reference_audio_directory = "reference_audio"
+target_frames = [1, 17, 33]
+```
+
+##### Step 3: Cache Latents
+
+```bash
+python ltx2_cache_latents.py ^
+  --dataset_config dataset.toml ^
+  --ltx2_checkpoint /path/to/ltxav-2.safetensors ^
+  --ltx2_mode av ^
+  --device cuda ^
+  --vae_dtype bf16
+```
+
+Reference audio latents are automatically cached to `reference_audio_cache_directory` alongside video and target audio latents.
+
+##### Step 4: Cache Text Encoder Outputs
+
+Standard AV caching — no special flags:
+
+```bash
+python ltx2_cache_text_encoder_outputs.py ^
+  --dataset_config dataset.toml ^
+  --ltx2_checkpoint /path/to/ltxav-2.safetensors ^
+  --ltx2_mode av ^
+  --gemma_root /path/to/gemma ^
+  --gemma_load_in_8bit ^
+  --device cuda
+```
+
+##### Step 5: Train
+
+```bash
+accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 ltx2_train_network.py ^
+  --mixed_precision bf16 ^
+  --dataset_config dataset.toml ^
+  --ltx2_checkpoint /path/to/ltxav-2.safetensors ^
+  --ltx2_mode av ^
+  --fp8_base --fp8_scaled ^
+  --blocks_to_swap 10 ^
+  --sdpa ^
+  --gradient_checkpointing ^
+  --network_module networks.lora_ltx2 ^
+  --network_dim 128 --network_alpha 128 ^
+  --lora_target_preset audio_ref_only_ic ^
+  --audio_ref_use_negative_positions ^
+  --audio_ref_mask_cross_attention_to_reference ^
+  --audio_ref_mask_reference_from_text_attention ^
+  --ltx2_first_frame_conditioning_p 0.9 ^
+  --timestep_sampling shifted_logit_normal ^
+  --learning_rate 2e-4 ^
+  --sample_at_first ^
+  --sample_every_n_epochs 5 ^
+  --sample_prompts sampling_prompts.txt ^
+  --output_dir output ^
+  --output_name ltx2_audio_ref_ic_lora
+```
+
+##### Step 6: Sample Prompts
+
+Use `--ra <path>` in your sampling prompts file to specify the reference audio:
+
+```
+--ra reference_audio/speaker_001.wav A person speaking about nature --n blurry, low quality
+--ra reference_audio/speaker_002.flac A woman laughing in a park
+```
+
+Reference audio latents are precached automatically when using `--precache_sample_latents` during latent caching.
+
+##### Audio-Reference IC-LoRA Arguments
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--ic_lora_strategy audio_ref_only_ic` | auto | Activates audio-reference IC-LoRA mode (auto-inferred from `--lora_target_preset audio_ref_only_ic`) |
+| `--lora_target_preset audio_ref_only_ic` | — | Targets audio attn/FFN + bidirectional AV cross-modal layers |
+| `--audio_ref_use_negative_positions` | off | Place reference audio in negative RoPE time for positional separation |
+| `--audio_ref_mask_cross_attention_to_reference` | off | Block video from attending to reference audio tokens |
+| `--audio_ref_mask_reference_from_text_attention` | off | Block reference audio from attending to text tokens |
+| `--audio_ref_identity_guidance_scale` | 0.0 | Override CFG scale for target-audio branch during `audio_ref_only_ic` sampling (0 = use standard guidance scale) |
+
+##### Dataset Config Options
+
+| Option | Type | Description |
+|--------|------|-------------|
+| `reference_audio_directory` | string | Path to reference audio files (matched by filename stem) |
+| `reference_audio_cache_directory` | string | Output directory for cached reference audio latents |
+
+##### Notes
+
+- **AV mode only**: requires `--ltx2_mode av` with an LTXAV checkpoint.
+- **Bucket separation**: `separate_audio_buckets = true` keeps audio/non-audio items in separate batches (avoids shape mismatches in collation).
+- **Attention overrides**: the three `--audio_ref_*` flags default to off. The reference ID-LoRA configuration enables all three.
+- **LoRA rank**: the reference ID-LoRA configuration uses rank 128 with alpha 128.
+- **First-frame conditioning**: the reference ID-LoRA configuration uses `first_frame_conditioning_p = 0.9`.
+- `--ic_lora_strategy auto` (default) infers the strategy from `--lora_target_preset` via `infer_ic_lora_strategy_from_preset()`.
+
 #### Sampling with Tiled VAE
 
 | Argument | Default | Description |
@@ -1159,6 +1300,8 @@ The dataset config is a TOML file with `[general]` defaults and `[[datasets]]` e
 | `cache_directory` | string | — | Latent cache output directory |
 | `reference_directory` | string | — | Reference images/videos for IC-LoRA (matched by filename) |
 | `reference_cache_directory` | string | — | Output directory for cached reference latents (IC-LoRA) |
+| `reference_audio_directory` | string | — | Reference audio files for audio-reference IC-LoRA (matched by filename stem) |
+| `reference_audio_cache_directory` | string | — | Output directory for cached reference audio latents |
 | `separate_audio_buckets` | bool | false | Keep audio/non-audio items in separate batches |
 
 ### Audio Dataset Options

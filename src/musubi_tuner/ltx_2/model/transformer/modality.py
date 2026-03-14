@@ -23,3 +23,5 @@ class Modality:
     enabled: bool = True
     context_mask: torch.Tensor | None = None
     attention_mask: torch.Tensor | None = None  # Shape: (B, T, T), values in [0, 1]
+    a2v_cross_attention_mask: torch.Tensor | None = None  # Shape: (B, Tq_video, Tk_audio)
+    v2a_cross_attention_mask: torch.Tensor | None = None  # Shape: (B, Tq_audio, Tk_video)

@@ -368,6 +368,11 @@ def line_to_prompt_dict(line: str) -> dict:
                 prompt_dict["v2v_ref_path"] = m.group(1).strip()
                 continue
 
+            m = re.match(r"ra (.+)", parg, re.IGNORECASE)
+            if m:  # reference audio path (audio_ref_only_ic sampling)
+                prompt_dict["ref_audio_path"] = m.group(1).strip()
+                continue
+
             m = re.match(r"ei (.+)", parg, re.IGNORECASE)
             if m:  # end image path
                 prompt_dict["end_image_path"] = m.group(1).strip()

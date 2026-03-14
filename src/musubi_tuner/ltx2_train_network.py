@@ -83,6 +83,17 @@ LTX2_LATENTS_STD = [1.0]
 
 DEFAULT_SAMPLE_PROMPTS_CACHE = "ltx2_sample_prompts_cache.pt"
 DEFAULT_SAMPLE_LATENTS_CACHE = "ltx2_sample_latents_cache.pt"
+IC_LORA_STRATEGIES = ("auto", "none", "v2v", "audio_ref_only_ic")
+
+
+def infer_ic_lora_strategy_from_preset(lora_target_preset: Optional[str]) -> str:
+    """Infer IC-LoRA strategy from LoRA target preset for backward-compatible auto mode."""
+    preset = str(lora_target_preset or "").lower()
+    if preset == "v2v":
+        return "v2v"
+    if preset == "audio_ref_only_ic":
+        return "audio_ref_only_ic"
+    return "none"
 
 # Modules to keep in high precision for FP8 quantization.
 # Excludes sensitive projection, conditioning, and normalization layers.
@@ -738,6 +749,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
         self._dit_attn_mode: Optional[str] = None
         self._latent_norm_cache: Dict = {}
         self._warned_missing_audio = False
+        self._warned_ignored_ref_latents = False
         self._audio_supervision_state = AudioSupervisionState()
 
         # Initialize latent normalization
@@ -750,6 +762,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
         self._num_timesteps: int = 1000
         self._audio_video: bool = False
         self._i2v_training: bool = False
+        self._ic_lora_strategy: str = "none"
         self._ltx_mode: str = "video"
         self._ltx_version: str = "2.0"
         self._ltx2_audio_only_model: bool = False
@@ -790,6 +803,117 @@ class LTX2NetworkTrainer(NetworkTrainer):
                         text_mask[i, 0] = True
 
         return text_embeds, text_mask
+
+    def _build_audio_ref_transformer_overrides(
+        self,
+        *,
+        args: argparse.Namespace,
+        transformer,
+        video_latents: torch.Tensor,
+        text_embeds: torch.Tensor,
+        text_mask: Optional[torch.Tensor],
+        audio_model_latents: torch.Tensor,
+        ref_audio_seq_len: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Dict[str, torch.Tensor]:
+        """Build optional transformer overrides for audio_ref_only_ic training/sampling."""
+        overrides: Dict[str, torch.Tensor] = {}
+
+        if ref_audio_seq_len <= 0:
+            return overrides
+
+        total_audio_seq_len = int(audio_model_latents.shape[2])
+        if total_audio_seq_len <= 0:
+            return overrides
+        ref_tokens = max(0, min(int(ref_audio_seq_len), total_audio_seq_len))
+        bsz = int(audio_model_latents.shape[0])
+
+        mask_dtype = dtype if dtype in (torch.float16, torch.float32, torch.float64, torch.bfloat16) else torch.float32
+        neg_inf = torch.finfo(mask_dtype).min
+
+        if bool(getattr(args, "audio_ref_use_negative_positions", False)):
+            from musubi_tuner.ltx_2.types import AudioLatentShape
+
+            audio_patchifier = getattr(transformer, "_audio_patchifier", None)
+            if audio_patchifier is None and hasattr(transformer, "module"):
+                audio_patchifier = getattr(transformer.module, "_audio_patchifier", None)
+            if audio_patchifier is None:
+                logger.warning("audio_ref_use_negative_positions requested but audio patchifier is unavailable; skipping override")
+            else:
+                channels = int(audio_model_latents.shape[1])
+                mel_bins = int(audio_model_latents.shape[3])
+                tgt_tokens = total_audio_seq_len - ref_tokens
+
+                # Generate SEPARATE position arrays for ref and target (matches ID-LoRA reference).
+                # Target positions start at 0 (aligned with video time); ref positions are
+                # shifted to negative time with a one-step gap for clean positional separation.
+                ref_shape = AudioLatentShape(batch=bsz, channels=channels, frames=ref_tokens, mel_bins=mel_bins)
+                ref_positions = audio_patchifier.get_patch_grid_bounds(ref_shape, device=device).to(dtype=mask_dtype)
+
+                # Compute time-per-latent for the gap (hop * downsample / sample_rate)
+                _hop = getattr(audio_patchifier, "hop_length", 160)
+                _ds = getattr(audio_patchifier, "audio_latent_downsample_factor", 4)
+                _sr = getattr(audio_patchifier, "sample_rate", 16000)
+                time_per_latent = float(_hop) * float(_ds) / float(_sr)
+
+                # Shift ref into negative time: last ref token ends at -gap
+                ref_duration = ref_positions[:, :, -1:, 1:2]
+                ref_positions = ref_positions - ref_duration - time_per_latent
+
+                tgt_shape = AudioLatentShape(batch=bsz, channels=channels, frames=max(tgt_tokens, 1), mel_bins=mel_bins)
+                tgt_positions = audio_patchifier.get_patch_grid_bounds(tgt_shape, device=device).to(dtype=mask_dtype)
+                if tgt_tokens <= 0:
+                    tgt_positions = tgt_positions[:, :, :0, :]  # empty slice
+
+                audio_positions = torch.cat([ref_positions, tgt_positions], dim=2)
+                overrides["audio_positions_override"] = audio_positions.to(
+                    device=device,
+                    dtype=audio_model_latents.dtype,
+                )
+
+        if bool(getattr(args, "audio_ref_mask_cross_attention_to_reference", False)):
+            video_seq_len = int(video_latents.shape[2]) * int(video_latents.shape[3]) * int(video_latents.shape[4])
+            if video_seq_len > 0:
+                a2v_mask = torch.zeros((bsz, video_seq_len, total_audio_seq_len), device=device, dtype=mask_dtype)
+                a2v_mask[:, :, :ref_tokens] = neg_inf
+                overrides["a2v_cross_attention_mask"] = a2v_mask
+
+        if bool(getattr(args, "audio_ref_mask_reference_from_text_attention", False)):
+            text_seq_len = int(text_embeds.shape[1])
+            audio_context_mask = torch.zeros(
+                (bsz, total_audio_seq_len, text_seq_len),
+                device=device,
+                dtype=mask_dtype,
+            )
+
+            if text_mask is not None:
+                if not isinstance(text_mask, torch.Tensor):
+                    raise TypeError(f"Expected text_mask to be a torch.Tensor, got: {type(text_mask)}")
+                tm = text_mask
+                if tm.dim() == 1:
+                    tm = tm.unsqueeze(0)
+                if tm.dim() != 2:
+                    raise ValueError(f"Expected text_mask to be 2D [B, seq_len], got shape: {tuple(tm.shape)}")
+                if tm.shape[0] == 1 and bsz != 1:
+                    tm = tm.expand(bsz, tm.shape[1])
+                if tm.shape[0] != bsz:
+                    raise ValueError(f"Batch mismatch for text_mask: got {tm.shape[0]}, expected {bsz}")
+                if tm.shape[1] != text_seq_len:
+                    if tm.shape[1] > text_seq_len:
+                        tm = tm[:, -text_seq_len:]
+                    else:
+                        tm = F.pad(tm, (text_seq_len - tm.shape[1], 0), value=1)
+                tm = tm.to(device=device)
+                valid_text = tm.to(torch.bool) if tm.dtype == torch.bool else (tm > 0)
+                key_bias = torch.zeros((bsz, text_seq_len), device=device, dtype=mask_dtype)
+                key_bias[~valid_text] = neg_inf
+                audio_context_mask = key_bias.unsqueeze(1).expand(-1, total_audio_seq_len, -1).clone()
+
+            audio_context_mask[:, :ref_tokens, :] = neg_inf
+            overrides["audio_context_mask"] = audio_context_mask
+
+        return overrides
 
     # ------------------------------------------------------------------
     # Preservation / regularization hooks
@@ -2107,8 +2231,45 @@ class LTX2NetworkTrainer(NetworkTrainer):
 
         reset_audio_supervision_state(self._audio_supervision_state)
 
-        # IC-LoRA / v2v mode enables I2V sampling (reference conditioning)
-        self._i2v_training = getattr(args, "lora_target_preset", "t2v") == "v2v"
+        ic_lora_strategy = str(getattr(args, "ic_lora_strategy", "auto") or "auto").lower()
+        if ic_lora_strategy not in IC_LORA_STRATEGIES:
+            raise ValueError(
+                f"ic_lora_strategy must be one of {list(IC_LORA_STRATEGIES)}. Got: {ic_lora_strategy}"
+            )
+        if ic_lora_strategy == "auto":
+            ic_lora_strategy = infer_ic_lora_strategy_from_preset(getattr(args, "lora_target_preset", "t2v"))
+
+        if ic_lora_strategy == "audio_ref_only_ic" and self._ltx_mode != "av":
+            raise ValueError("--ic_lora_strategy audio_ref_only_ic requires --ltx2_mode av")
+
+        self._ic_lora_strategy = ic_lora_strategy
+        args.ic_lora_strategy = ic_lora_strategy
+        args.audio_ref_use_negative_positions = bool(getattr(args, "audio_ref_use_negative_positions", False))
+        args.audio_ref_mask_cross_attention_to_reference = bool(
+            getattr(args, "audio_ref_mask_cross_attention_to_reference", False)
+        )
+        args.audio_ref_mask_reference_from_text_attention = bool(
+            getattr(args, "audio_ref_mask_reference_from_text_attention", False)
+        )
+        args.audio_ref_identity_guidance_scale = float(getattr(args, "audio_ref_identity_guidance_scale", 0.0) or 0.0)
+        if args.audio_ref_identity_guidance_scale < 0.0:
+            raise ValueError(
+                f"audio_ref_identity_guidance_scale must be >= 0. Got: {args.audio_ref_identity_guidance_scale}"
+            )
+        if ic_lora_strategy != "audio_ref_only_ic":
+            if (
+                args.audio_ref_use_negative_positions
+                or args.audio_ref_mask_cross_attention_to_reference
+                or args.audio_ref_mask_reference_from_text_attention
+                or args.audio_ref_identity_guidance_scale > 0.0
+            ):
+                logger.warning(
+                    "audio_ref_* options are set but --ic_lora_strategy is '%s'; options will be ignored.",
+                    ic_lora_strategy,
+                )
+
+        # IC-LoRA strategies enable I2V-capable sampling flow in trainer.
+        self._i2v_training = ic_lora_strategy in {"v2v", "audio_ref_only_ic"}
 
         apply_ltx2_tweaks(args)
 
@@ -2128,8 +2289,12 @@ class LTX2NetworkTrainer(NetworkTrainer):
         preset = getattr(args, "lora_target_preset", None)
         if preset:
             md["ss_lora_target_preset"] = preset
-        if self._i2v_training:
+        if self._ic_lora_strategy and self._ic_lora_strategy != "none":
+            md["ss_ic_lora_strategy"] = self._ic_lora_strategy
+        if self._ic_lora_strategy == "v2v":
             md["ss_v2v_training"] = True
+        elif self._i2v_training:
+            md["ss_i2v_training"] = True
         ref_downscale = max(1, getattr(args, "reference_downscale", 1))
         if ref_downscale != 1:
             md["ss_reference_downscale_factor"] = ref_downscale
@@ -2794,37 +2959,56 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 dtype=network_dtype,
             )
         audio_sigma = audio_model_timesteps[:, 0]
+        ic_lora_strategy = str(
+            getattr(
+                args,
+                "ic_lora_strategy",
+                self._ic_lora_strategy
+                or infer_ic_lora_strategy_from_preset(getattr(args, "lora_target_preset", "t2v")),
+            )
+            or "none"
+        ).lower()
+        audio_ref_only_ic_enabled = ic_lora_strategy == "audio_ref_only_ic"
 
         ref_latents = batch.get("ref_latents")
         if isinstance(ref_latents, dict):
             ref_latents = ref_latents.get("latents")
 
         if ref_latents is not None:
-            if self._audio_video or self._ltx_mode != "video":
-                raise ValueError("Reference latent conditioning is only supported for video-only LTX-2 training")
-            if not isinstance(ref_latents, torch.Tensor):
-                raise TypeError(f"Expected ref_latents to be a torch.Tensor, got: {type(ref_latents)}")
-            if ref_latents.dim() != 5:
-                raise ValueError(f"Expected ref_latents to be 5D [B, C, F, H, W], got shape: {tuple(ref_latents.shape)}")
-            if ref_latents.shape[0] != latents.shape[0]:
-                raise ValueError(
-                    f"Batch size mismatch: latents batch={latents.shape[0]} vs ref_latents batch={ref_latents.shape[0]}"
-                )
-            if ref_latents.shape[1] != latents.shape[1]:
-                raise ValueError(f"Channel mismatch: latents C={latents.shape[1]} vs ref_latents C={ref_latents.shape[1]}")
-            ref_h, ref_w = int(ref_latents.shape[3]), int(ref_latents.shape[4])
-            tgt_h, tgt_w = int(latents.shape[3]), int(latents.shape[4])
-            if ref_h == tgt_h and ref_w == tgt_w:
-                reference_downscale_factor = 1
-            else:
-                h_ratio = tgt_h / ref_h
-                w_ratio = tgt_w / ref_w
-                if abs(h_ratio - w_ratio) > 0.01 or abs(h_ratio - round(h_ratio)) > 0.01:
-                    raise ValueError(
-                        f"Spatial mismatch: latents HxW={tgt_h}x{tgt_w} vs ref_latents HxW={ref_h}x{ref_w}. "
-                        f"Ratios h={h_ratio:.2f} w={w_ratio:.2f} are not consistent integer downscale factors."
+            if ic_lora_strategy != "v2v":
+                if not self._warned_ignored_ref_latents:
+                    logger.warning(
+                        "ref_latents were provided but --ic_lora_strategy is '%s'; ignoring reference-video conditioning.",
+                        ic_lora_strategy,
                     )
-                reference_downscale_factor = round(h_ratio)
+                    self._warned_ignored_ref_latents = True
+                ref_latents = None
+            else:
+                if self._audio_video or self._ltx_mode != "video":
+                    raise ValueError("Reference latent conditioning is only supported for video-only LTX-2 training")
+                if not isinstance(ref_latents, torch.Tensor):
+                    raise TypeError(f"Expected ref_latents to be a torch.Tensor, got: {type(ref_latents)}")
+                if ref_latents.dim() != 5:
+                    raise ValueError(f"Expected ref_latents to be 5D [B, C, F, H, W], got shape: {tuple(ref_latents.shape)}")
+                if ref_latents.shape[0] != latents.shape[0]:
+                    raise ValueError(
+                        f"Batch size mismatch: latents batch={latents.shape[0]} vs ref_latents batch={ref_latents.shape[0]}"
+                    )
+                if ref_latents.shape[1] != latents.shape[1]:
+                    raise ValueError(f"Channel mismatch: latents C={latents.shape[1]} vs ref_latents C={ref_latents.shape[1]}")
+                ref_h, ref_w = int(ref_latents.shape[3]), int(ref_latents.shape[4])
+                tgt_h, tgt_w = int(latents.shape[3]), int(latents.shape[4])
+                if ref_h == tgt_h and ref_w == tgt_w:
+                    reference_downscale_factor = 1
+                else:
+                    h_ratio = tgt_h / ref_h
+                    w_ratio = tgt_w / ref_w
+                    if abs(h_ratio - w_ratio) > 0.01 or abs(h_ratio - round(h_ratio)) > 0.01:
+                        raise ValueError(
+                            f"Spatial mismatch: latents HxW={tgt_h}x{tgt_w} vs ref_latents HxW={ref_h}x{ref_w}. "
+                            f"Ratios h={h_ratio:.2f} w={w_ratio:.2f} are not consistent integer downscale factors."
+                        )
+                    reference_downscale_factor = round(h_ratio)
 
         if self._ltx_mode == "audio":
             audio_latents = batch.get("audio_latents")
@@ -3083,6 +3267,10 @@ class LTX2NetworkTrainer(NetworkTrainer):
         audio_regularizer_active = False
         audio_expected_for_batch = self._ltx_mode == "av"
         audio_loss_mask = None
+        audio_target = None
+        audio_timestep_for_model = None
+        ref_audio_latents = None
+        ref_audio_seq_len = 0
         if self._ltx_mode == "av":
             audio_latents = batch.get("audio_latents")
             if isinstance(audio_latents, dict):
@@ -3143,6 +3331,115 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 noisy_audio = (1.0 - sigma_audio) * audio_latents + sigma_audio * audio_noise
                 _check_finite("noisy_audio", noisy_audio)
                 _log_stats("noisy_audio", noisy_audio)
+                audio_target = audio_noise - audio_latents
+                audio_timestep_for_model = audio_model_timesteps
+
+            if audio_ref_only_ic_enabled:
+                ref_audio_latents = batch.get("ref_audio_latents")
+                if isinstance(ref_audio_latents, dict):
+                    ref_audio_latents = ref_audio_latents.get("latents")
+
+                if not audio_enabled_for_batch or audio_latents is None or noisy_audio is None:
+                    raise ValueError(
+                        "--ic_lora_strategy audio_ref_only_ic requires target audio_latents in every AV batch"
+                    )
+                if ref_audio_latents is None:
+                    raise ValueError(
+                        "--ic_lora_strategy audio_ref_only_ic requires ref_audio_latents. "
+                        "Set reference_audio_directory/reference_audio_cache_directory and cache reference audio latents."
+                    )
+                if not isinstance(ref_audio_latents, torch.Tensor):
+                    raise TypeError(f"Expected ref_audio_latents to be a torch.Tensor, got: {type(ref_audio_latents)}")
+                if ref_audio_latents.dim() != 4:
+                    raise ValueError(
+                        f"Expected ref_audio_latents to be 4D [B, C, T, F], got shape: {tuple(ref_audio_latents.shape)}"
+                    )
+                if ref_audio_latents.shape[0] != latents.shape[0]:
+                    raise ValueError(
+                        f"Batch size mismatch: latents batch={latents.shape[0]} vs ref_audio_latents batch={ref_audio_latents.shape[0]}"
+                    )
+                if ref_audio_latents.shape[1] != audio_latents.shape[1] or ref_audio_latents.shape[3] != audio_latents.shape[3]:
+                    raise ValueError(
+                        "ref_audio_latents channel/mel dimensions must match audio_latents. "
+                        f"Got ref={tuple(ref_audio_latents.shape)} target={tuple(audio_latents.shape)}"
+                    )
+
+                ref_audio_latents = ref_audio_latents.to(device=accelerator.device, dtype=network_dtype)
+                _check_finite("ref_audio_latents", ref_audio_latents)
+                _log_stats("ref_audio_latents", ref_audio_latents)
+
+                ref_audio_lengths = batch.get("ref_audio_lengths")
+                if isinstance(ref_audio_lengths, dict):
+                    ref_audio_lengths = ref_audio_lengths.get("lengths")
+                if isinstance(ref_audio_lengths, torch.Tensor):
+                    if ref_audio_lengths.dim() == 0:
+                        ref_audio_lengths = ref_audio_lengths.view(1)
+                    if ref_audio_lengths.numel() == 1 and ref_audio_latents.shape[0] != 1:
+                        ref_audio_lengths = ref_audio_lengths.expand(ref_audio_latents.shape[0])
+                    if ref_audio_lengths.shape[0] != ref_audio_latents.shape[0]:
+                        raise ValueError(
+                            "Batch size mismatch: ref_audio_lengths batch="
+                            f"{ref_audio_lengths.shape[0]} vs ref_audio_latents batch={ref_audio_latents.shape[0]}"
+                        )
+                    ref_audio_lengths = ref_audio_lengths.to(device=accelerator.device, dtype=torch.int64)
+                    if (ref_audio_lengths <= 0).any():
+                        raise ValueError(
+                            "ref_audio_lengths contains zeros; missing reference-audio caches in batch. "
+                            "Ensure every training sample has cached reference audio."
+                        )
+
+                ref_audio_seq_len = int(ref_audio_latents.shape[2])
+                tgt_seq_len = int(audio_latents.shape[2])
+                noisy_audio = torch.cat([ref_audio_latents, noisy_audio], dim=2)
+                _check_finite("noisy_audio_with_reference", noisy_audio)
+
+                target_audio_timestep = (
+                    audio_model_timesteps
+                    if audio_model_timesteps.shape[1] == tgt_seq_len
+                    else audio_model_timesteps[:, :1].expand(audio_model_timesteps.shape[0], tgt_seq_len)
+                )
+                ref_audio_timestep = torch.zeros(
+                    (audio_model_timesteps.shape[0], ref_audio_seq_len),
+                    device=accelerator.device,
+                    dtype=network_dtype,
+                )
+                audio_timestep_for_model = torch.cat([ref_audio_timestep, target_audio_timestep], dim=1)
+
+                if audio_target is None:
+                    raise ValueError("Internal error: audio_target must be initialized before audio_ref_only_ic composition")
+                zero_ref_target = torch.zeros_like(ref_audio_latents)
+                audio_target = torch.cat([zero_ref_target, audio_target], dim=2)
+
+                target_audio_loss_mask = audio_loss_mask
+                if target_audio_loss_mask is None:
+                    target_audio_loss_mask = torch.ones(
+                        (audio_latents.shape[0], tgt_seq_len),
+                        device=accelerator.device,
+                        dtype=torch.bool,
+                    )
+                if getattr(args, "use_audio_length_mask", False):
+                    audio_lengths = batch.get("audio_lengths")
+                    if isinstance(audio_lengths, dict):
+                        audio_lengths = audio_lengths.get("lengths")
+                    if isinstance(audio_lengths, torch.Tensor):
+                        if audio_lengths.dim() == 0:
+                            audio_lengths = audio_lengths.view(1)
+                        if audio_lengths.numel() == 1 and audio_latents.shape[0] != 1:
+                            audio_lengths = audio_lengths.expand(audio_latents.shape[0])
+                        if audio_lengths.shape[0] != audio_latents.shape[0]:
+                            raise ValueError(
+                                f"Batch size mismatch: audio_latents batch={audio_latents.shape[0]} vs audio_lengths batch={audio_lengths.shape[0]}"
+                            )
+                        audio_lengths = audio_lengths.to(device=accelerator.device, dtype=torch.int64)
+                        audio_lengths = audio_lengths.clamp(min=0, max=tgt_seq_len)
+                        t = torch.arange(tgt_seq_len, device=accelerator.device).view(1, -1)
+                        target_audio_loss_mask = t < audio_lengths.view(-1, 1)
+                ref_audio_loss_mask = torch.zeros(
+                    (audio_latents.shape[0], ref_audio_seq_len),
+                    device=accelerator.device,
+                    dtype=torch.bool,
+                )
+                audio_loss_mask = torch.cat([ref_audio_loss_mask, target_audio_loss_mask], dim=1)
 
         if self._ltx_mode == "av" and not audio_enabled_for_batch:
             text_embeds = select_video_text_embeds_for_av_no_audio(
@@ -3248,13 +3545,34 @@ class LTX2NetworkTrainer(NetworkTrainer):
                     video_loss_mask[video_conditioning_enabled, 0] = False
 
         resolved_transformer_options = transformer_options if video_conditioning_mask_tokens is not None else {"patches_replace": {}}
+        if (
+            self._ltx_mode == "av"
+            and audio_ref_only_ic_enabled
+            and audio_enabled_for_batch
+            and noisy_audio is not None
+            and ref_audio_seq_len > 0
+        ):
+            resolved_transformer_options = dict(resolved_transformer_options)
+            resolved_transformer_options.update(
+                self._build_audio_ref_transformer_overrides(
+                    args=args,
+                    transformer=transformer,
+                    video_latents=model_noisy_video,
+                    text_embeds=text_embeds,
+                    text_mask=text_mask,
+                    audio_model_latents=noisy_audio,
+                    ref_audio_seq_len=ref_audio_seq_len,
+                    device=accelerator.device,
+                    dtype=network_dtype,
+                )
+            )
 
         # Store inputs for preservation / Self-Flow techniques (no-op when both are off)
         if self._preservation_active or self._self_flow_active:
             self._last_dit_inputs = {
                 "model_input": model_input,
                 "model_timesteps": model_timesteps,
-                "audio_model_timesteps": audio_model_timesteps if audio_enabled_for_batch else None,
+                "audio_model_timesteps": audio_timestep_for_model if audio_enabled_for_batch else None,
                 "text_embeds": text_embeds,
                 "text_mask": text_mask,
                 "frame_rate": frame_rate,
@@ -3308,7 +3626,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
             model_pred = transformer(
                 model_input,
                 timestep=model_timesteps,
-                audio_timestep=audio_model_timesteps if audio_enabled_for_batch else None,
+                audio_timestep=audio_timestep_for_model if audio_enabled_for_batch else None,
                 context=text_embeds,
                 attention_mask=text_mask,
                 frame_rate=frame_rate,
@@ -3348,19 +3666,20 @@ class LTX2NetworkTrainer(NetworkTrainer):
         if self._ltx_mode == "av" and audio_enabled_for_batch:
             if audio_pred is None:
                 raise ValueError("AV mode expected an audio prediction but got None")
-            audio_target = audio_noise - audio_latents
+            if audio_target is None:
+                raise ValueError("Internal error: audio_target is missing in AV path")
             _check_finite("audio_target", audio_target)
             _log_stats("audio_target", audio_target)
 
-            audio_seq_len = int(audio_latents.shape[2])
+            audio_seq_len = int(audio_target.shape[2])
             if audio_loss_mask is None:
                 audio_loss_mask = torch.ones(
-                    (audio_latents.shape[0], audio_seq_len),
+                    (audio_target.shape[0], audio_seq_len),
                     device=accelerator.device,
                     dtype=torch.bool,
                 )
 
-            if getattr(args, "use_audio_length_mask", False):
+            if getattr(args, "use_audio_length_mask", False) and not audio_ref_only_ic_enabled:
                 audio_lengths = batch.get("audio_lengths")
                 if isinstance(audio_lengths, dict):
                     audio_lengths = audio_lengths.get("lengths")
@@ -3369,11 +3688,11 @@ class LTX2NetworkTrainer(NetworkTrainer):
                         audio_lengths = audio_lengths.view(1)
                     if audio_lengths.dim() != 1:
                         raise ValueError(f"Expected audio_lengths to be 1D [B] or scalar, got shape: {tuple(audio_lengths.shape)}")
-                    if audio_lengths.numel() == 1 and audio_latents.shape[0] != 1:
-                        audio_lengths = audio_lengths.expand(audio_latents.shape[0])
-                    if audio_lengths.shape[0] != audio_latents.shape[0]:
+                    if audio_lengths.numel() == 1 and audio_target.shape[0] != 1:
+                        audio_lengths = audio_lengths.expand(audio_target.shape[0])
+                    if audio_lengths.shape[0] != audio_target.shape[0]:
                         raise ValueError(
-                            f"Batch size mismatch: audio_latents batch={audio_latents.shape[0]} vs audio_lengths batch={audio_lengths.shape[0]}"
+                            f"Batch size mismatch: audio_target batch={audio_target.shape[0]} vs audio_lengths batch={audio_lengths.shape[0]}"
                         )
 
                     audio_lengths = audio_lengths.to(device=accelerator.device)
@@ -3526,7 +3845,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
         return sample_params
 
     def _load_precached_sample_latents(self, args: argparse.Namespace, sample_params: List[Dict]) -> None:
-        """Load precached I2V / V2V conditioning latents and merge into sample_params (in-place)."""
+        """Load precached I2V / V2V / reference-audio latents into sample_params (in-place)."""
         cache_path = getattr(args, "sample_latents_cache", None) or self._resolve_default_sample_latents_cache(args)
         if not os.path.exists(cache_path):
             logger.warning("Precached latents not found: %s — skipping (samples will run without conditioning)", cache_path)
@@ -3540,6 +3859,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
             # Match latents with prompts by index
             i2v_count = 0
             v2v_count = 0
+            ref_audio_count = 0
             for entry in latent_cache:
                 prompt_idx = entry.get("prompt_index")
                 if prompt_idx is not None and 0 <= prompt_idx < len(sample_params):
@@ -3549,8 +3869,25 @@ class LTX2NetworkTrainer(NetworkTrainer):
                     if "v2v_ref_latent" in entry:
                         sample_params[prompt_idx]["v2v_ref_latent"] = entry["v2v_ref_latent"]
                         v2v_count += 1
+                    ref_audio_latent_entry = entry.get("ref_audio_latent")
+                    if ref_audio_latent_entry is None and "reference_audio_latent" in entry:
+                        ref_audio_latent_entry = entry["reference_audio_latent"]
+                    if ref_audio_latent_entry is not None:
+                        sample_params[prompt_idx]["ref_audio_latent"] = ref_audio_latent_entry
+                        ref_audio_count += 1
 
-            logger.info(f"Loaded precached latents: {i2v_count} I2V, {v2v_count} V2V references")
+                    ref_audio_path_entry = entry.get("ref_audio_path")
+                    if ref_audio_path_entry is None and "reference_audio_path" in entry:
+                        ref_audio_path_entry = entry["reference_audio_path"]
+                    if ref_audio_path_entry is not None and "ref_audio_path" not in sample_params[prompt_idx]:
+                        sample_params[prompt_idx]["ref_audio_path"] = ref_audio_path_entry
+
+            logger.info(
+                "Loaded precached latents: %d I2V, %d V2V references, %d reference-audio",
+                i2v_count,
+                v2v_count,
+                ref_audio_count,
+            )
         except Exception as e:
             raise RuntimeError(f"Failed to load latents cache: {e}")
 
@@ -4246,6 +4583,72 @@ class LTX2NetworkTrainer(NetworkTrainer):
 
         return latent
 
+    def _load_and_encode_reference_audio_latent(
+        self,
+        audio_path: str,
+        checkpoint_path: str,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Load reference audio and encode it to LTX-2 audio latents [1, C, T, F]."""
+        if not os.path.exists(audio_path):
+            raise FileNotFoundError(f"Reference audio not found: {audio_path}")
+
+        try:
+            import torchaudio
+        except Exception as e:
+            raise RuntimeError("torchaudio is required for reference-audio sampling") from e
+
+        from musubi_tuner.ltx_2.loader.single_gpu_model_builder import SingleGPUModelBuilder
+        from musubi_tuner.ltx_2.model.audio_vae.model_configurator import (
+            AUDIO_VAE_ENCODER_COMFY_KEYS_FILTER,
+            AudioEncoderConfigurator,
+        )
+        from musubi_tuner.ltx_2.model.audio_vae.ops import AudioProcessor
+
+        logger.info("Loading reference audio: %s", audio_path)
+        waveform, sample_rate = torchaudio.load(audio_path)
+        if waveform.dim() != 2:
+            raise ValueError(f"Unexpected waveform shape from {audio_path}: {tuple(waveform.shape)}")
+
+        channels = int(waveform.shape[0])
+        if channels == 1:
+            waveform = waveform.repeat(2, 1)
+        elif channels == 2:
+            pass
+        elif channels > 2:
+            mono = waveform.float().mean(dim=0, keepdim=True)
+            waveform = mono.repeat(2, 1)
+
+        encoder = SingleGPUModelBuilder(
+            model_path=str(checkpoint_path),
+            model_class_configurator=AudioEncoderConfigurator,
+            model_sd_ops=AUDIO_VAE_ENCODER_COMFY_KEYS_FILTER,
+        ).build(device=device, dtype=dtype)
+        encoder.eval()
+
+        processor = AudioProcessor(
+            sample_rate=int(getattr(encoder, "sample_rate", 16000)),
+            mel_bins=int(getattr(encoder, "mel_bins", 64)),
+            mel_hop_length=int(getattr(encoder, "mel_hop_length", 160)),
+            n_fft=int(getattr(encoder, "n_fft", 1024)),
+        ).to(device=device, dtype=torch.float32)
+        processor.eval()
+
+        try:
+            waveform = waveform.unsqueeze(0).to(device=device, dtype=torch.float32)
+            encoder_dtype = next(encoder.parameters()).dtype
+            with torch.no_grad():
+                mel = processor.waveform_to_mel(waveform, int(sample_rate)).to(device=device, dtype=encoder_dtype)
+                latents = encoder(mel)
+            latents = latents[0].detach().to(device=device, dtype=torch.float32).unsqueeze(0).contiguous()
+            logger.info("Encoded reference audio latent shape: %s", tuple(latents.shape))
+            return latents
+        finally:
+            del encoder
+            del processor
+            clean_memory_on_device(device)
+
     def sample_image_inference(
         self,
         accelerator: Accelerator,
@@ -4351,6 +4754,41 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 logger.error(f"V2V: failed to load reference '{v2v_ref_path}': {e}")
                 v2v_ref_latent = None
 
+        ref_audio_latent = None
+        ref_audio_path = sample_parameter.get("ref_audio_path") or sample_parameter.get("reference_audio_path")
+        if "ref_audio_latent" in sample_parameter:
+            ref_audio_latent = sample_parameter["ref_audio_latent"]
+        elif "reference_audio_latent" in sample_parameter:
+            ref_audio_latent = sample_parameter["reference_audio_latent"]
+
+        if ref_audio_latent is not None:
+            device = accelerator.device
+            if isinstance(ref_audio_latent, torch.Tensor):
+                if ref_audio_latent.dim() == 3:
+                    ref_audio_latent = ref_audio_latent.unsqueeze(0)
+                ref_audio_latent = ref_audio_latent.to(device=device, dtype=torch.float32)
+                logger.info("Audio-ref: using precached reference audio latent %s", tuple(ref_audio_latent.shape))
+                ref_audio_path = None
+            else:
+                logger.warning("Audio-ref: ignoring non-tensor ref_audio_latent of type %s", type(ref_audio_latent))
+                ref_audio_latent = None
+
+        if ref_audio_path and ref_audio_latent is None:
+            logger.info("Audio-ref: encoding reference audio")
+            try:
+                checkpoint_path = getattr(args, "ltx2_checkpoint", None)
+                if not checkpoint_path:
+                    raise ValueError("--ltx2_checkpoint is required for reference-audio encoding")
+                ref_audio_latent = self._load_and_encode_reference_audio_latent(
+                    audio_path=ref_audio_path,
+                    checkpoint_path=checkpoint_path,
+                    device=accelerator.device,
+                    dtype=dit_dtype,
+                )
+            except Exception as e:
+                logger.error("Audio-ref: failed to load reference audio '%s': %s", ref_audio_path, e)
+                ref_audio_latent = None
+
         lora_count = ensure_adapters_enabled_for_sampling(transformer)
         adapter_summary = summarize_active_adapters(transformer)
         if lora_count:
@@ -4390,12 +4828,39 @@ class LTX2NetworkTrainer(NetworkTrainer):
         if audio_only_preview and getattr(args, "ltx_mode", "video") not in {"av", "audio"}:
             raise ValueError("--sample_audio_only requires --ltx2_mode av or audio")
         enable_audio_preview = (self._audio_video or audio_only_preview) and not disable_audio_preview
+        resolved_ic_strategy = str(
+            getattr(
+                args,
+                "ic_lora_strategy",
+                self._ic_lora_strategy
+                or infer_ic_lora_strategy_from_preset(getattr(args, "lora_target_preset", "t2v")),
+            )
+            or "none"
+        ).lower()
+        audio_ref_only_sampling = (
+            resolved_ic_strategy == "audio_ref_only_ic"
+            and self._ltx_mode == "av"
+            and isinstance(ref_audio_latent, torch.Tensor)
+        )
+        if isinstance(ref_audio_latent, torch.Tensor) and resolved_ic_strategy != "audio_ref_only_ic":
+            logger.warning(
+                "Audio-ref latent provided but --ic_lora_strategy is '%s'; sample will ignore reference audio.",
+                resolved_ic_strategy,
+            )
+            ref_audio_latent = None
+            audio_ref_only_sampling = False
+        force_audio_conditioning = audio_ref_only_sampling
 
         # Only load audio components here if NOT in offloading mode and not pre-loaded
         # In offloading mode with subprocess enabled (default), audio is decoded in a subprocess.
         # With --no-sample_audio_subprocess, audio is loaded lazily in-process during decode phase.
         sample_with_offloading = bool(getattr(args, "sample_with_offloading", False))
-        if audio_decoder is None and vocoder is None and enable_audio_preview and getattr(args, "ltx_mode", "video") in {"av", "audio"}:
+        if (
+            audio_decoder is None
+            and vocoder is None
+            and enable_audio_preview
+            and getattr(args, "ltx_mode", "video") in {"av", "audio"}
+        ):
             if not sample_with_offloading and not use_audio_subprocess:
                 # High VRAM mode without subprocess: load audio to GPU now (everything fits)
                 audio_dtype = torch.bfloat16 if args.vae_dtype is None else model_utils.str_to_dtype(args.vae_dtype)
@@ -4521,10 +4986,16 @@ class LTX2NetworkTrainer(NetworkTrainer):
         use_two_stage = bool(getattr(args, "sample_two_stage", False))
         spatial_upsampler_path = getattr(args, "spatial_upsampler_path", None)
         distilled_lora_path = getattr(args, "distilled_lora_path", None)
+        enable_audio_conditioning = bool(enable_audio_preview) or bool(force_audio_conditioning)
 
         if use_two_stage:
             if not spatial_upsampler_path:
                 logger.warning("Two-stage inference requested but --spatial_upsampler_path not set; falling back to single-stage")
+                use_two_stage = False
+            elif force_audio_conditioning:
+                logger.warning(
+                    "Reference-audio conditioning is not supported with two-stage inference; falling back to single-stage"
+                )
                 use_two_stage = False
 
         if use_two_stage:
@@ -4580,11 +5051,12 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 restore_transformer_device=not (getattr(args, "sample_with_offloading", False) and accelerator.device.type == "cuda"),
                 audio_output_path=wav_path if enable_audio_preview else None,
                 use_audio_subprocess=use_audio_subprocess,
-                enable_audio_preview=enable_audio_preview,
+                enable_audio_preview=enable_audio_conditioning,
                 decode_video=not audio_only_preview,
                 audio_only=audio_only_preview,
                 conditioning_latent=conditioning_latent,
                 v2v_ref_latents=v2v_ref_latent,
+                ref_audio_latents=ref_audio_latent,
             )
 
         if not has_self_ref_orig_mod:
@@ -4685,6 +5157,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
         audio_only: bool = False,
         conditioning_latent: Optional[torch.Tensor] = None,
         v2v_ref_latents: Optional[torch.Tensor] = None,
+        ref_audio_latents: Optional[torch.Tensor] = None,
     ):
         """Generate sample video during training using LTX-2 denoising loop"""
         from musubi_tuner.modules.scheduling_flow_match_discrete import FlowMatchDiscreteScheduler
@@ -4770,6 +5243,39 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 prompt_mask = None
         prompt_mask = prompt_mask.to(device=transformer_device, dtype=torch.int64) if prompt_mask is not None else None
 
+        resolved_ic_strategy = str(
+            getattr(
+                args,
+                "ic_lora_strategy",
+                self._ic_lora_strategy
+                or infer_ic_lora_strategy_from_preset(getattr(args, "lora_target_preset", "t2v")),
+            )
+            or "none"
+        ).lower()
+
+        if ref_audio_latents is not None:
+            if not isinstance(ref_audio_latents, torch.Tensor):
+                raise TypeError(f"Expected ref_audio_latents to be a torch.Tensor, got: {type(ref_audio_latents)}")
+            if ref_audio_latents.dim() == 3:
+                ref_audio_latents = ref_audio_latents.unsqueeze(0)
+            if ref_audio_latents.dim() != 4:
+                raise ValueError(
+                    f"Expected ref_audio_latents to be 4D [B, C, T, F], got shape: {tuple(ref_audio_latents.shape)}"
+                )
+
+        if ref_audio_latents is not None and resolved_ic_strategy != "audio_ref_only_ic":
+            logger.warning(
+                "Sampling: reference-audio latents provided but --ic_lora_strategy is '%s'; ignoring ref-audio conditioning.",
+                resolved_ic_strategy,
+            )
+            ref_audio_latents = None
+
+        audio_ref_only_ic_sampling = (
+            resolved_ic_strategy == "audio_ref_only_ic"
+            and self._ltx_mode == "av"
+            and ref_audio_latents is not None
+        )
+
         attention_overrides = []
         if getattr(args, "sample_disable_flash_attn", True):
             from musubi_tuner.ltx_2.model.transformer.attention import AttentionFunction
@@ -4783,7 +5289,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 prompt_mask = None
 
         enable_audio_preview = bool(enable_audio_preview)
-        if not enable_audio_preview:
+        if not enable_audio_preview and not audio_ref_only_ic_sampling:
             expected_embed_dim = None
             try:
                 caption_proj = getattr(transformer, "caption_projection", None)
@@ -4906,7 +5412,9 @@ class LTX2NetworkTrainer(NetworkTrainer):
         sigmas = ltx2_scheduler.execute(steps=sample_steps).to(device=transformer_device, dtype=torch.float32)
 
         audio_latents = None
-        if enable_audio_preview:
+        ref_audio_latents_device = None
+        ref_audio_seq_len = 0
+        if enable_audio_preview or audio_ref_only_ic_sampling:
             frame_rate = sample_parameter.get("frame_rate", 25)
             video_shape = VideoPixelShape(
                 batch=1,
@@ -4937,6 +5445,23 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 generator=generator,
             )
 
+            if audio_ref_only_ic_sampling:
+                if ref_audio_latents is None:
+                    raise ValueError("audio_ref_only_ic sampling requires reference-audio latents")
+                ref_audio_latents_device = ref_audio_latents.to(device=transformer_device, dtype=torch.float32)
+                if int(ref_audio_latents_device.shape[0]) != int(audio_latents.shape[0]):
+                    raise ValueError(
+                        f"Batch mismatch for reference-audio: ref={tuple(ref_audio_latents_device.shape)} target={tuple(audio_latents.shape)}"
+                    )
+                if int(ref_audio_latents_device.shape[1]) != channels or int(ref_audio_latents_device.shape[3]) != mel_bins:
+                    raise ValueError(
+                        "Reference-audio latent channel/mel mismatch. "
+                        f"Got ref={tuple(ref_audio_latents_device.shape)} target={tuple(audio_latents.shape)}"
+                    )
+                ref_audio_seq_len = int(ref_audio_latents_device.shape[2])
+                if ref_audio_seq_len <= 0:
+                    raise ValueError("Reference-audio latent sequence length must be > 0")
+
         # Denoising loop using LTX-2 scheduler with sigmas
         with torch.no_grad():
             for step_idx in tqdm(range(len(sigmas) - 1), desc="LTX-2 preview", leave=False):
@@ -4947,13 +5472,41 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 latent_model_input = latent_model_input.to(dtype=dit_dtype)
 
                 audio_model_input = None
+                audio_timestep_for_model = None
                 if audio_latents is not None:
-                    audio_model_input = (
-                        torch.cat([audio_latents, audio_latents], dim=0)
-                        if do_classifier_free_guidance
-                        else audio_latents
-                    )
-                    audio_model_input = audio_model_input.to(dtype=dit_dtype)
+                    if audio_ref_only_ic_sampling and ref_audio_latents_device is not None and ref_audio_seq_len > 0:
+                        combined_audio = torch.cat([ref_audio_latents_device, audio_latents], dim=2)
+                        audio_model_input = (
+                            torch.cat([combined_audio, combined_audio], dim=0)
+                            if do_classifier_free_guidance
+                            else combined_audio
+                        )
+                        audio_model_input = audio_model_input.to(dtype=dit_dtype)
+
+                        tgt_seq_len = int(audio_latents.shape[2])
+                        target_audio_timestep = sigma.expand(tgt_seq_len).view(1, -1).to(
+                            device=transformer_device,
+                            dtype=dit_dtype,
+                        )
+                        ref_audio_timestep = torch.zeros(
+                            (1, ref_audio_seq_len),
+                            device=transformer_device,
+                            dtype=dit_dtype,
+                        )
+                        audio_timestep_for_model = torch.cat([ref_audio_timestep, target_audio_timestep], dim=1)
+                        if do_classifier_free_guidance:
+                            audio_timestep_for_model = audio_timestep_for_model.repeat(2, 1)
+                    else:
+                        audio_model_input = (
+                            torch.cat([audio_latents, audio_latents], dim=0)
+                            if do_classifier_free_guidance
+                            else audio_latents
+                        )
+                        audio_model_input = audio_model_input.to(dtype=dit_dtype)
+                        audio_timestep_for_model = sigma.expand(audio_model_input.shape[0]).to(
+                            device=transformer_device,
+                            dtype=dit_dtype,
+                        ).unsqueeze(1)
 
                 # Prepare timestep (sigma in [0, 1])
                 timestep_for_model = sigma.expand(latent_model_input.shape[0]).to(device=transformer_device, dtype=dit_dtype)
@@ -4968,6 +5521,25 @@ class LTX2NetworkTrainer(NetworkTrainer):
                         )
                     resolved_transformer_options["video_conditioning_mask"] = video_conditioning_mask_tokens
 
+                if (
+                    audio_ref_only_ic_sampling
+                    and audio_model_input is not None
+                    and ref_audio_seq_len > 0
+                ):
+                    resolved_transformer_options.update(
+                        self._build_audio_ref_transformer_overrides(
+                            args=args,
+                            transformer=transformer,
+                            video_latents=latent_model_input,
+                            text_embeds=prompt_embeds,
+                            text_mask=prompt_mask,
+                            audio_model_latents=audio_model_input,
+                            ref_audio_seq_len=ref_audio_seq_len,
+                            device=transformer_device,
+                            dtype=dit_dtype,
+                        )
+                    )
+
                 # Model prediction
                 if self._audio_video and audio_model_input is not None:
                     model_input = [latent_model_input, audio_model_input]
@@ -4977,6 +5549,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 model_pred = transformer(
                     model_input,
                     timestep=timestep_for_model.unsqueeze(1),  # [B, 1] for per-token timesteps
+                    audio_timestep=audio_timestep_for_model,
                     context=prompt_embeds,
                     attention_mask=prompt_mask,
                     frame_rate=sample_parameter.get("frame_rate", 25),
@@ -4989,6 +5562,13 @@ class LTX2NetworkTrainer(NetworkTrainer):
                     video_pred, audio_pred = model_pred
                 else:
                     video_pred = model_pred
+
+                if audio_ref_only_ic_sampling and audio_pred is not None and ref_audio_seq_len > 0:
+                    if int(audio_pred.shape[2]) <= ref_audio_seq_len:
+                        raise ValueError(
+                            f"audio_pred length {audio_pred.shape[2]} is too short for ref_audio_seq_len={ref_audio_seq_len}"
+                        )
+                    audio_pred = audio_pred[:, :, ref_audio_seq_len:, :]
 
                 # IMPORTANT: Convert velocity to x0 FIRST, then apply CFG to x0
                 # This matches the official LTX-2 pipeline where X0Model wraps velocity model
@@ -5024,11 +5604,16 @@ class LTX2NetworkTrainer(NetworkTrainer):
 
                 if audio_pred is not None and audio_latents is not None:
                     audio_pred = audio_pred.to(dtype=audio_latents.dtype)
+                    audio_cfg_scale = cfg_scale if cfg_scale is not None else guidance_scale
+                    if audio_ref_only_ic_sampling:
+                        identity_guidance_scale = float(getattr(args, "audio_ref_identity_guidance_scale", 0.0) or 0.0)
+                        if identity_guidance_scale > 0.0:
+                            audio_cfg_scale = identity_guidance_scale
                     if do_classifier_free_guidance:
                         aud_vel_uncond, aud_vel_cond = audio_pred.chunk(2)
                         aud_x0_uncond = X0PredictionWrapper.velocity_to_x0(audio_latents, aud_vel_uncond, sigma.item())
                         aud_x0_cond = X0PredictionWrapper.velocity_to_x0(audio_latents, aud_vel_cond, sigma.item())
-                        audio_x0 = aud_x0_uncond + effective_cfg_scale * (aud_x0_cond - aud_x0_uncond)
+                        audio_x0 = aud_x0_uncond + audio_cfg_scale * (aud_x0_cond - aud_x0_uncond)
                     else:
                         audio_x0 = X0PredictionWrapper.velocity_to_x0(audio_latents, audio_pred, sigma.item())
                     audio_latents = stepper.step(audio_latents, audio_x0, sigmas, step_idx)
@@ -5678,14 +6263,63 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         "--lora_target_preset",
         type=str,
         default="t2v",
-        choices=["t2v", "v2v", "audio", "full"],
+        choices=["t2v", "v2v", "audio", "audio_ref_only_ic", "full"],
         help=(
             "LoRA target preset: "
             "'t2v' = text-to-video (attention only, official default), "
             "'v2v' = video-to-video/IC-LoRA (attention + feed-forward), "
             "'audio' = audio-only (audio attn/ffn + audio-side cross-modal), "
+            "'audio_ref_only_ic' = ID-LoRA-style AV preset "
+            "(audio attn/ffn + audio/video cross-modal both directions), "
             "'full' = all linear layers. "
             "Can be overridden by --network_args include_patterns=..."
+        ),
+    )
+    parser.add_argument(
+        "--ic_lora_strategy",
+        type=str,
+        default="auto",
+        choices=list(IC_LORA_STRATEGIES),
+        help=(
+            "IC-LoRA conditioning strategy. "
+            "'auto' keeps backward-compatible behavior "
+            "(uses 'v2v' when --lora_target_preset=v2v, "
+            "'audio_ref_only_ic' when --lora_target_preset=audio_ref_only_ic, else 'none'). "
+            "'v2v' uses reference-video conditioning. "
+            "'audio_ref_only_ic' uses reference-audio conditioning (ID-LoRA-style) in AV mode."
+        ),
+    )
+    parser.add_argument(
+        "--audio_ref_use_negative_positions",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="For --ic_lora_strategy audio_ref_only_ic: place reference-audio token positions in negative time.",
+    )
+    parser.add_argument(
+        "--audio_ref_mask_cross_attention_to_reference",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "For --ic_lora_strategy audio_ref_only_ic: mask A2V cross-attention so video attends only to target audio, "
+            "not reference-audio tokens."
+        ),
+    )
+    parser.add_argument(
+        "--audio_ref_mask_reference_from_text_attention",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "For --ic_lora_strategy audio_ref_only_ic: block reference-audio tokens from attending to text tokens "
+            "(target-audio tokens still attend to text)."
+        ),
+    )
+    parser.add_argument(
+        "--audio_ref_identity_guidance_scale",
+        type=float,
+        default=0.0,
+        help=(
+            "For --ic_lora_strategy audio_ref_only_ic sampling: optional CFG scale override for target-audio branch. "
+            "0.0 keeps standard cfg/guidance scale."
         ),
     )
     parser.add_argument(
@@ -6338,6 +6972,9 @@ def main() -> None:
     explicit_lora_preset = any(
         arg == "--lora_target_preset" or arg.startswith("--lora_target_preset=") for arg in sys.argv
     )
+    explicit_ic_strategy = any(
+        arg == "--ic_lora_strategy" or arg.startswith("--ic_lora_strategy=") for arg in sys.argv
+    )
 
     if getattr(args, "dit", None) is not None and args.dit != args.ltx2_checkpoint:
         logger.warning("Ignoring --dit for LTX-2; using --ltx2_checkpoint instead")
@@ -6355,6 +6992,7 @@ def main() -> None:
         args.vae_dtype = "bfloat16"
 
     uses_lycoris_module = is_lycoris_requested(args)
+    requested_ic_strategy = str(getattr(args, "ic_lora_strategy", "auto") or "auto").lower()
 
     # Inject lora_target_preset into network_args (LTX-2 specific, non-LyCORIS only)
     if getattr(args, "ltx_mode", "video") == "audio" and not explicit_lora_preset and not uses_lycoris_module:
@@ -6362,6 +7000,19 @@ def main() -> None:
             args.network_args = []
         if not any(arg.startswith("include_patterns=") for arg in args.network_args):
             args.lora_target_preset = "audio"
+    elif (
+        requested_ic_strategy == "audio_ref_only_ic"
+        and not explicit_lora_preset
+        and not uses_lycoris_module
+    ):
+        if args.network_args is None:
+            args.network_args = []
+        if not any(arg.startswith("include_patterns=") for arg in args.network_args):
+            args.lora_target_preset = "audio_ref_only_ic"
+            logger.info("Using lora_target_preset=audio_ref_only_ic for --ic_lora_strategy audio_ref_only_ic")
+
+    if explicit_ic_strategy and requested_ic_strategy == "audio_ref_only_ic" and getattr(args, "ltx_mode", "video") != "av":
+        logger.warning("--ic_lora_strategy audio_ref_only_ic works in --ltx2_mode av; current mode is %s", args.ltx_mode)
 
     lora_target_preset = getattr(args, "lora_target_preset", None)
     if uses_lycoris_module:

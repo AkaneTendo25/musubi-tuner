@@ -30,6 +30,8 @@ class TransformerArgs:
     enabled: bool
     prompt_timestep: torch.Tensor | None = None
     self_attention_mask: torch.Tensor | None = None
+    a2v_cross_attention_mask: torch.Tensor | None = None
+    v2a_cross_attention_mask: torch.Tensor | None = None
 
 
 class TransformerArgsPreprocessor:
@@ -270,6 +272,8 @@ class TransformerArgsPreprocessor:
             enabled=modality.enabled,
             prompt_timestep=prompt_timestep,
             self_attention_mask=self_attention_mask,
+            a2v_cross_attention_mask=modality.a2v_cross_attention_mask,
+            v2a_cross_attention_mask=modality.v2a_cross_attention_mask,
         )
 
 

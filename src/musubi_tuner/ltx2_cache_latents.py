@@ -23,6 +23,7 @@ from musubi_tuner.dataset import config_utils
 from musubi_tuner.dataset.config_utils import BlueprintGenerator, ConfigSanitizer
 from musubi_tuner.dataset.image_video_dataset import (
     ARCHITECTURE_LTX2,
+    AUDIO_EXTENSIONS,
     BaseDataset,
     IMAGE_EXTENSIONS,
     ItemInfo,
@@ -516,6 +517,40 @@ def _find_reference_file(reference_directory: str, stem: str) -> Optional[str]:
     return None
 
 
+def _find_reference_audio_file(reference_audio_directory: str, stem: str, preferred_ext: Optional[str] = None) -> Optional[str]:
+    """Find a reference audio file matching stem in reference_audio_directory."""
+    exts: list[str] = []
+    if preferred_ext:
+        exts.append(preferred_ext)
+    exts.extend(AUDIO_EXTENSIONS)
+
+    deduped_exts: list[str] = []
+    seen = set()
+    for ext in exts:
+        normalized = ext if ext.startswith(".") else f".{ext}"
+        key = normalized.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped_exts.append(normalized)
+
+    for ext in deduped_exts:
+        candidate = os.path.join(reference_audio_directory, stem + ext)
+        if os.path.exists(candidate):
+            return candidate
+
+    lower_stem = stem.lower()
+    valid_exts = {ext.lower() for ext in deduped_exts}
+    try:
+        for fname in os.listdir(reference_audio_directory):
+            name_no_ext, ext = os.path.splitext(fname)
+            if name_no_ext.lower() == lower_stem and ext.lower() in valid_exts:
+                return os.path.join(reference_audio_directory, fname)
+    except OSError:
+        pass
+    return None
+
+
 def _load_reference_frames(
     path: str,
     bucket_reso: tuple[int, int],
@@ -662,8 +697,112 @@ def encode_and_save_reference_latents(
         )
 
 
+def encode_and_save_reference_audio_latents(
+    encoder,
+    processor,
+    datasets: Sequence[BaseDataset],
+    args: argparse.Namespace,
+    *,
+    dtype: torch.dtype,
+) -> None:
+    """Encode reference-audio files and save latent caches for audio_ref_only_ic training."""
+    skip_existing = getattr(args, "skip_existing", False)
+    num_workers = args.num_workers if args.num_workers is not None else max(1, (os.cpu_count() or 2) - 1)
+    preferred_ext = getattr(args, "ltx2_audio_ext", None)
+
+    for ds_idx, ds in enumerate(datasets):
+        if not isinstance(ds, VideoDataset):
+            continue
+
+        ref_audio_cache_dir = getattr(ds, "reference_audio_cache_directory", None)
+        if ref_audio_cache_dir is None:
+            continue
+
+        ref_audio_dir = getattr(ds, "reference_audio_directory", None)
+        if ref_audio_dir is None:
+            logger.info(f"[Dataset {ds_idx}] No reference_audio_directory set, skipping reference-audio caching")
+            continue
+
+        os.makedirs(ref_audio_cache_dir, exist_ok=True)
+        logger.info(f"[Dataset {ds_idx}] Caching reference audio latents to {ref_audio_cache_dir}")
+
+        cached_count = 0
+        skipped_count = 0
+        missing_count = 0
+        failed_count = 0
+        ds_target_fps = getattr(ds, "target_fps", VideoDataset.TARGET_FPS_LTX2)
+        if not isinstance(ds_target_fps, (int, float)) or float(ds_target_fps) <= 0:
+            ds_target_fps = float(VideoDataset.TARGET_FPS_LTX2)
+
+        for _bucket_key, batch in ds.retrieve_latent_cache_batches(num_workers):
+            for item_info in batch:
+                ref_audio_cache_path = getattr(item_info, "reference_audio_latent_cache_path", None)
+                if ref_audio_cache_path is None:
+                    ref_audio_cache_path = ds.get_reference_audio_latent_cache_path(item_info)
+
+                if skip_existing and os.path.exists(ref_audio_cache_path):
+                    skipped_count += 1
+                    continue
+
+                source_key = getattr(item_info, "source_item_key", None) or item_info.item_key
+                stem = os.path.splitext(os.path.basename(source_key))[0]
+                ref_audio_path = _find_reference_audio_file(ref_audio_dir, stem, preferred_ext=preferred_ext)
+                if ref_audio_path is None:
+                    missing_count += 1
+                    if missing_count <= 5:
+                        logger.warning(f"No reference audio file found for '{stem}' in {ref_audio_dir}")
+                    elif missing_count == 6:
+                        logger.warning("(suppressing further missing-reference-audio warnings)")
+                    continue
+
+                cache_audio_suffix = f"_{ds.architecture}_audio.safetensors"
+                cache_latent_suffix = f"_{ds.architecture}.safetensors"
+                if ref_audio_cache_path.endswith(cache_audio_suffix):
+                    proxy_latent_cache_path = ref_audio_cache_path[: -len(cache_audio_suffix)] + cache_latent_suffix
+                else:
+                    proxy_latent_cache_path = ref_audio_cache_path.replace(".safetensors", cache_latent_suffix)
+
+                ref_item = ItemInfo(
+                    item_key=item_info.item_key,
+                    caption=item_info.caption,
+                    original_size=item_info.original_size,
+                    bucket_size=item_info.bucket_size,
+                    frame_count=item_info.frame_count,
+                )
+                ref_item.latent_cache_path = proxy_latent_cache_path
+                ref_item.source_total_frames = getattr(item_info, "source_total_frames", None)
+                ref_item.chunk_start_frame = getattr(item_info, "chunk_start_frame", None)
+                ref_item.chunk_num_frames = getattr(item_info, "chunk_num_frames", None)
+
+                try:
+                    encode_and_save_audio_cache(
+                        encoder,
+                        processor,
+                        ref_item,
+                        audio_path=ref_audio_path,
+                        dtype=dtype,
+                        target_fps=float(ds_target_fps),
+                        audio_only=False,
+                    )
+                    cached_count += 1
+                except Exception as e:
+                    failed_count += 1
+                    logger.warning(
+                        "Skipping reference audio cache for %s (audio_path=%s): %s",
+                        item_info.item_key,
+                        ref_audio_path,
+                        e,
+                    )
+                    continue
+
+        logger.info(
+            f"[Dataset {ds_idx}] Reference-audio caching done: {cached_count} cached, "
+            f"{failed_count} failed, {skipped_count} skipped (existing), {missing_count} missing"
+        )
+
+
 def _precache_sample_latents(args: argparse.Namespace, device: torch.device) -> None:
-    """Cache I2V conditioning image latents for sample prompts."""
+    """Cache I2V / V2V / reference-audio conditioning latents for sample prompts."""
     from musubi_tuner.hv_train_network import load_prompts
     from PIL import Image
     import torchvision.transforms.functional as TF
@@ -676,36 +815,82 @@ def _precache_sample_latents(args: argparse.Namespace, device: torch.device) -> 
     if not prompts:
         raise ValueError(f"No prompts found in {args.sample_prompts}")
 
-    # Filter prompts that have image_path or v2v_ref_path
-    prompts_with_images = [(i, p) for i, p in enumerate(prompts) if p.get("image_path") or p.get("v2v_ref_path")]
-    if not prompts_with_images:
-        logger.info("No I2V images or V2V references found in sample prompts - nothing to cache")
+    prompts_with_refs = [
+        (i, p)
+        for i, p in enumerate(prompts)
+        if p.get("image_path")
+        or p.get("v2v_ref_path")
+        or p.get("ref_audio_path")
+        or p.get("reference_audio_path")
+    ]
+    if not prompts_with_refs:
+        logger.info("No I2V/V2V/reference-audio entries found in sample prompts - nothing to cache")
         return
 
-    i2v_count = sum(1 for _, p in prompts_with_images if p.get("image_path"))
-    v2v_count = sum(1 for _, p in prompts_with_images if p.get("v2v_ref_path"))
-    logger.info(f"Found {i2v_count} I2V images and {v2v_count} V2V references to precache")
+    i2v_count = sum(1 for _, p in prompts_with_refs if p.get("image_path"))
+    v2v_count = sum(1 for _, p in prompts_with_refs if p.get("v2v_ref_path"))
+    ref_audio_count = sum(1 for _, p in prompts_with_refs if p.get("ref_audio_path") or p.get("reference_audio_path"))
+    logger.info(
+        "Found %d I2V images, %d V2V references, %d reference-audio clips to precache",
+        i2v_count,
+        v2v_count,
+        ref_audio_count,
+    )
 
-    # Load VAE encoder
-    from musubi_tuner.ltx_2.loader.single_gpu_model_builder import SingleGPUModelBuilder
-    from musubi_tuner.ltx_2.model.video_vae import VideoEncoderConfigurator, VAE_ENCODER_COMFY_KEYS_FILTER
+    need_video_encoder = i2v_count > 0 or v2v_count > 0
+    need_audio_encoder = ref_audio_count > 0
 
-    vae_checkpoint = getattr(args, "vae", None) or getattr(args, "ltx2_checkpoint", None)
-    if not vae_checkpoint:
-        raise ValueError("VAE checkpoint required for I2V latent precaching (--vae or --ltx2_checkpoint)")
+    vae_encoder = None
+    vae_dtype = torch.bfloat16
+    spatial_factor = 32
 
-    vae_dtype = torch.bfloat16  # Standard for LTX-2
-    logger.info("Loading VAE encoder for I2V image precaching")
-    vae_encoder = SingleGPUModelBuilder(
-        model_path=str(vae_checkpoint),
-        model_class_configurator=VideoEncoderConfigurator,
-        model_sd_ops=VAE_ENCODER_COMFY_KEYS_FILTER,
-    ).build(device=device, dtype=vae_dtype)
-    vae_encoder.eval()
+    if need_video_encoder:
+        from musubi_tuner.ltx_2.loader.single_gpu_model_builder import SingleGPUModelBuilder
+        from musubi_tuner.ltx_2.model.video_vae import VideoEncoderConfigurator, VAE_ENCODER_COMFY_KEYS_FILTER
 
-    # Cache latents
+        vae_checkpoint = getattr(args, "vae", None) or getattr(args, "ltx2_checkpoint", None)
+        if not vae_checkpoint:
+            raise ValueError("VAE checkpoint required for I2V/V2V latent precaching (--vae or --ltx2_checkpoint)")
+
+        logger.info("Loading VAE encoder for I2V/V2V precaching")
+        vae_encoder = SingleGPUModelBuilder(
+            model_path=str(vae_checkpoint),
+            model_class_configurator=VideoEncoderConfigurator,
+            model_sd_ops=VAE_ENCODER_COMFY_KEYS_FILTER,
+        ).build(device=device, dtype=vae_dtype)
+        vae_encoder.eval()
+
+    audio_encoder = None
+    audio_processor = None
+    if need_audio_encoder:
+        from musubi_tuner.ltx_2.loader.single_gpu_model_builder import SingleGPUModelBuilder
+        from musubi_tuner.ltx_2.model.audio_vae.model_configurator import (
+            AudioEncoderConfigurator,
+            AUDIO_VAE_ENCODER_COMFY_KEYS_FILTER,
+        )
+        from musubi_tuner.ltx_2.model.audio_vae.ops import AudioProcessor
+
+        if getattr(args, "ltx2_checkpoint", None) is None:
+            raise ValueError("--ltx2_checkpoint is required for reference-audio latent precaching")
+
+        audio_dtype = torch.float16 if args.ltx2_audio_dtype is None else str_to_dtype(args.ltx2_audio_dtype)
+        logger.info("Loading audio encoder for reference-audio precaching")
+        audio_encoder = SingleGPUModelBuilder(
+            model_path=str(args.ltx2_checkpoint),
+            model_class_configurator=AudioEncoderConfigurator,
+            model_sd_ops=AUDIO_VAE_ENCODER_COMFY_KEYS_FILTER,
+        ).build(device=device, dtype=audio_dtype)
+        audio_encoder.eval()
+
+        audio_processor = AudioProcessor(
+            sample_rate=int(getattr(audio_encoder, "sample_rate", 16000)),
+            mel_bins=int(getattr(audio_encoder, "mel_bins", 64)),
+            mel_hop_length=int(getattr(audio_encoder, "mel_hop_length", 160)),
+            n_fft=int(getattr(audio_encoder, "n_fft", 1024)),
+        ).to(device=device, dtype=torch.float32)
+        audio_processor.eval()
+
     latent_cache: list[dict] = []
-    spatial_factor = 32  # LTX-2 VAE spatial downsample factor
 
     def _cover_center_crop(pil_img, tw, th):
         cw, ch = pil_img.size
@@ -725,20 +910,21 @@ def _precache_sample_latents(args: argparse.Namespace, device: torch.device) -> 
         return pil_img.crop((left, top, left + tw, top + th))
 
     def _encode_image_to_latent(img_path, target_width, target_height):
-        """Load image, resize with cover+center-crop, VAE encode → [1, C, 1, H, W]."""
+        if vae_encoder is None:
+            raise RuntimeError("VAE encoder is not initialized")
         image = _cover_center_crop(Image.open(img_path).convert("RGB"), target_width, target_height)
-        image_tensor = TF.to_tensor(image).unsqueeze(0)  # [1, 3, H, W]
+        image_tensor = TF.to_tensor(image).unsqueeze(0)
         image_tensor = (image_tensor * 2.0 - 1.0).to(device=device, dtype=vae_dtype)
-        image_tensor = image_tensor.unsqueeze(2)  # [1, 3, 1, H, W]
+        image_tensor = image_tensor.unsqueeze(2)
         with torch.no_grad():
             return vae_encoder(image_tensor)
 
     def _encode_media_to_latent(media_path, target_width, target_height, max_frames=1):
-        """Load image or video, resize, VAE encode → [1, C, F, H, W]."""
+        if vae_encoder is None:
+            raise RuntimeError("VAE encoder is not initialized")
         import av as _av
 
         ext = os.path.splitext(media_path)[1].lower()
-
         frames = []
         if ext in {e.lower() for e in VIDEO_EXTENSIONS}:
             container = _av.open(media_path)
@@ -753,8 +939,8 @@ def _precache_sample_latents(args: argparse.Namespace, device: torch.device) -> 
             image = _cover_center_crop(Image.open(media_path).convert("RGB"), target_width, target_height)
             frames.append(TF.to_tensor(image))
 
-        video_tensor = torch.stack(frames, dim=0).unsqueeze(0)  # [1, F, 3, H, W]
-        video_tensor = video_tensor.permute(0, 2, 1, 3, 4).contiguous()  # [1, 3, F, H, W]
+        video_tensor = torch.stack(frames, dim=0).unsqueeze(0)
+        video_tensor = video_tensor.permute(0, 2, 1, 3, 4).contiguous()
         video_tensor = (video_tensor * 2.0 - 1.0).to(device=device, dtype=vae_dtype)
 
         num_f = video_tensor.shape[2]
@@ -766,7 +952,34 @@ def _precache_sample_latents(args: argparse.Namespace, device: torch.device) -> 
         with torch.no_grad():
             return vae_encoder(video_tensor)
 
-    for idx, prompt_dict in prompts_with_images:
+    def _encode_reference_audio_to_latent(audio_path: str) -> torch.Tensor:
+        if audio_encoder is None or audio_processor is None:
+            raise RuntimeError("Audio encoder is not initialized")
+        try:
+            import torchaudio
+        except Exception as e:
+            raise RuntimeError("torchaudio is required for reference-audio precaching") from e
+
+        waveform, sample_rate = torchaudio.load(audio_path)
+        if waveform.dim() != 2:
+            raise ValueError(f"Unexpected waveform shape from {audio_path}: {tuple(waveform.shape)}")
+        channels = int(waveform.shape[0])
+        if channels == 1:
+            waveform = waveform.repeat(2, 1)
+        elif channels == 2:
+            pass
+        elif channels > 2:
+            mono = waveform.float().mean(dim=0, keepdim=True)
+            waveform = mono.repeat(2, 1)
+
+        waveform = waveform.unsqueeze(0).to(device=device, dtype=torch.float32)
+        encoder_dtype = next(audio_encoder.parameters()).dtype
+        with torch.no_grad():
+            mel = audio_processor.waveform_to_mel(waveform, int(sample_rate)).to(device=device, dtype=encoder_dtype)
+            latents = audio_encoder(mel)
+        return latents[0].detach().cpu().unsqueeze(0).contiguous()
+
+    for idx, prompt_dict in prompts_with_refs:
         width = prompt_dict.get("width", 768)
         height = prompt_dict.get("height", 512)
         width = (width // spatial_factor) * spatial_factor
@@ -774,7 +987,6 @@ def _precache_sample_latents(args: argparse.Namespace, device: torch.device) -> 
 
         cache_entry = {"prompt_index": idx}
 
-        # I2V conditioning image (--i)
         image_path = prompt_dict.get("image_path")
         if image_path:
             try:
@@ -809,17 +1021,39 @@ def _precache_sample_latents(args: argparse.Namespace, device: torch.device) -> 
             except Exception as e:
                 logger.error(f"Failed to encode V2V reference for prompt #{idx} '{v2v_ref_path}': {e}")
 
-        if "conditioning_latent" in cache_entry or "v2v_ref_latent" in cache_entry:
+        ref_audio_path = prompt_dict.get("ref_audio_path") or prompt_dict.get("reference_audio_path")
+        if ref_audio_path:
+            try:
+                if not os.path.exists(ref_audio_path):
+                    logger.warning(f"Reference audio not found, skipping prompt #{idx}: {ref_audio_path}")
+                else:
+                    logger.info(f"Encoding reference audio for prompt #{idx}: {os.path.basename(ref_audio_path)}")
+                    latent = _encode_reference_audio_to_latent(ref_audio_path)
+                    cache_entry["ref_audio_path"] = ref_audio_path
+                    cache_entry["ref_audio_latent"] = latent
+                    logger.info(f"Encoded reference audio latent for prompt #{idx}: {latent.shape}")
+            except Exception as e:
+                logger.error(f"Failed to encode reference audio for prompt #{idx} '{ref_audio_path}': {e}")
+
+        if (
+            "conditioning_latent" in cache_entry
+            or "v2v_ref_latent" in cache_entry
+            or "ref_audio_latent" in cache_entry
+        ):
             latent_cache.append(cache_entry)
 
-    del vae_encoder
+    if vae_encoder is not None:
+        del vae_encoder
+    if audio_encoder is not None:
+        del audio_encoder
+    if audio_processor is not None:
+        del audio_processor
     from musubi_tuner.utils.device_utils import clean_memory_on_device
     clean_memory_on_device(device)
 
     if args.sample_latents_cache:
         cache_path = args.sample_latents_cache
     else:
-        # Default: use first dataset's cache directory
         try:
             datasets = _load_datasets(args)
             if datasets:
@@ -835,13 +1069,16 @@ def _precache_sample_latents(args: argparse.Namespace, device: torch.device) -> 
             logger.warning(f"Could not load datasets for cache path resolution: {e}")
             cache_path = "ltx2_sample_latents_cache.pt"
 
-    # Save cache
     payload = {
         "version": 1,
         "latent_cache": latent_cache,
     }
     torch.save(payload, cache_path)
-    logger.info(f"Saved {len(latent_cache)} I2V conditioning latents to {cache_path}")
+    logger.info(
+        "Saved %d sample conditioning latents (I2V/V2V/reference-audio) to %s",
+        len(latent_cache),
+        cache_path,
+    )
 
 
 def main() -> None:
@@ -862,7 +1099,7 @@ def main() -> None:
     # This is additive: continue with normal dataset latent caching afterward.
     if getattr(args, "precache_sample_latents", False):
         _precache_sample_latents(args, device)
-        logger.info("I2V sample latent precaching complete; continuing with dataset latent caching")
+        logger.info("Sample latent precaching (I2V/V2V/reference-audio) complete; continuing with dataset latent caching")
 
     datasets = _load_datasets(args)
     if args.save_dataset_manifest:
@@ -1137,6 +1374,14 @@ def main() -> None:
             audio_skipped_count,
         )
 
+        encode_and_save_reference_audio_latents(
+            encoder,
+            processor,
+            datasets,
+            args,
+            dtype=audio_dtype,
+        )
+
 
 def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     parser.add_argument(
@@ -1208,7 +1453,7 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
     parser.add_argument(
         "--precache_sample_latents",
         action="store_true",
-        help="Cache I2V conditioning image latents for sample prompts, then continue normal dataset latent caching.",
+        help="Cache I2V/V2V/reference-audio conditioning latents for sample prompts, then continue normal dataset latent caching.",
     )
     parser.add_argument(
         "--sample_prompts",
@@ -1220,7 +1465,7 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         "--sample_latents_cache",
         type=str,
         default=None,
-        help="Path to save I2V conditioning latents cache (default: cache_dir/ltx2_sample_latents_cache.pt).",
+        help="Path to save sample conditioning latents cache (default: cache_dir/ltx2_sample_latents_cache.pt).",
     )
     parser.add_argument(
         "--reference_frames",
