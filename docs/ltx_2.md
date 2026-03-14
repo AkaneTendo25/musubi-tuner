@@ -1048,9 +1048,11 @@ The `--sample_include_reference` flag shows the reference side-by-side with the 
 
 #### Audio-Reference IC-LoRA
 
-Trains a LoRA using in-context audio-reference conditioning. Reference audio latents (clean, timestep=0) are concatenated with noisy target audio latents during training. Loss is computed only on the target portion. The LoRA targets audio self/cross-attention, audio FFN, and bidirectional audio-video cross-modal attention layers.
+Trains a LoRA using in-context audio-reference conditioning. Reference audio latents (clean, timestep=0) are concatenated with noisy target audio latents during training. Loss is computed only on the target portion. In AV mode the LoRA targets audio self/cross-attention, audio FFN, and bidirectional audio-video cross-modal attention layers; in audio-only mode the `audio` preset is auto-selected, which omits cross-modal layers that connect to the (dummy) video branch.
 
-Requires `--ltx2_mode av` (audio-video model).
+Supported modes:
+- **`--ltx2_mode av`** — full audio-video model; trains both video and audio IC-LoRA layers.
+- **`--ltx2_mode audio`** — audio-only mode; trains only audio layers (video is a dummy zero tensor). `--lora_target_preset audio` is auto-selected (cross-modal layers that affect the dummy video branch are omitted).
 
 ##### How it works
 
@@ -1103,11 +1105,13 @@ python ltx2_cache_latents.py ^
   --vae_dtype bf16
 ```
 
-Reference audio latents are automatically cached to `reference_audio_cache_directory` alongside video and target audio latents.
+For audio-only mode, replace `--ltx2_mode av` with `--ltx2_mode audio` (no video latents are cached, only audio and reference audio latents).
+
+Reference audio latents are automatically cached to `reference_audio_cache_directory`.
 
 ##### Step 4: Cache Text Encoder Outputs
 
-Standard AV caching — no special flags:
+No special flags — use whichever mode you are training:
 
 ```bash
 python ltx2_cache_text_encoder_outputs.py ^
@@ -1118,6 +1122,8 @@ python ltx2_cache_text_encoder_outputs.py ^
   --gemma_load_in_8bit ^
   --device cuda
 ```
+
+For audio-only mode, replace `--ltx2_mode av` with `--ltx2_mode audio`.
 
 ##### Step 5: Train
 
@@ -1147,6 +1153,32 @@ accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 ltx2_tr
   --output_name ltx2_audio_ref_ic_lora
 ```
 
+**Audio-only mode** — replace `--ltx2_mode av` with `--ltx2_mode audio` and omit `--lora_target_preset` (auto-selected as `audio`):
+
+```bash
+accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 ltx2_train_network.py ^
+  --mixed_precision bf16 ^
+  --dataset_config dataset.toml ^
+  --ltx2_checkpoint /path/to/ltxav-2.safetensors ^
+  --ltx2_mode audio ^
+  --ic_lora_strategy audio_ref_only_ic ^
+  --fp8_base --fp8_scaled ^
+  --blocks_to_swap 10 ^
+  --sdpa ^
+  --gradient_checkpointing ^
+  --network_module networks.lora_ltx2 ^
+  --network_dim 128 --network_alpha 128 ^
+  --audio_ref_use_negative_positions ^
+  --audio_ref_mask_reference_from_text_attention ^
+  --timestep_sampling shifted_logit_normal ^
+  --learning_rate 2e-4 ^
+  --sample_at_first ^
+  --sample_every_n_epochs 5 ^
+  --sample_prompts sampling_prompts.txt ^
+  --output_dir output ^
+  --output_name ltx2_audio_ref_ic_lora_audioonly
+```
+
 ##### Step 6: Sample Prompts
 
 Use `--ra <path>` in your sampling prompts file to specify the reference audio:
@@ -1165,7 +1197,7 @@ Reference audio latents are precached automatically when using `--precache_sampl
 | `--ic_lora_strategy audio_ref_only_ic` | auto | Activates audio-reference IC-LoRA mode (auto-inferred from `--lora_target_preset audio_ref_only_ic`) |
 | `--lora_target_preset audio_ref_only_ic` | — | Targets audio attn/FFN + bidirectional AV cross-modal layers |
 | `--audio_ref_use_negative_positions` | off | Place reference audio in negative RoPE time for positional separation |
-| `--audio_ref_mask_cross_attention_to_reference` | off | Block video from attending to reference audio tokens |
+| `--audio_ref_mask_cross_attention_to_reference` | off | Block video from attending to reference audio tokens (AV mode only; no effect in audio-only mode) |
 | `--audio_ref_mask_reference_from_text_attention` | off | Block reference audio from attending to text tokens |
 | `--audio_ref_identity_guidance_scale` | 0.0 | Override CFG scale for target-audio branch during `audio_ref_only_ic` sampling (0 = use standard guidance scale) |
 
@@ -1178,7 +1210,7 @@ Reference audio latents are precached automatically when using `--precache_sampl
 
 ##### Notes
 
-- **AV mode only**: requires `--ltx2_mode av` with an LTXAV checkpoint.
+- **Checkpoint**: requires an LTXAV checkpoint for both `--ltx2_mode av` and `--ltx2_mode audio`.
 - **Bucket separation**: `separate_audio_buckets = true` keeps audio/non-audio items in separate batches (avoids shape mismatches in collation).
 - **Attention overrides**: the three `--audio_ref_*` flags default to off. The reference ID-LoRA configuration enables all three.
 - **LoRA rank**: the reference ID-LoRA configuration uses rank 128 with alpha 128.
