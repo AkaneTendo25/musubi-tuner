@@ -2836,6 +2836,24 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 video_prompt_embeds = conditions.get("video_prompt_embeds")
                 audio_prompt_embeds = conditions.get("audio_prompt_embeds")
                 if video_prompt_embeds is not None and audio_prompt_embeds is not None:
+                    if not isinstance(video_prompt_embeds, torch.Tensor) or video_prompt_embeds.dim() != 3:
+                        raise ValueError(
+                            f"conditions['video_prompt_embeds'] must be a 3D tensor [B, seq_len, dim], "
+                            f"got {type(video_prompt_embeds).__name__} "
+                            f"{tuple(video_prompt_embeds.shape) if isinstance(video_prompt_embeds, torch.Tensor) else ''}"
+                        )
+                    if not isinstance(audio_prompt_embeds, torch.Tensor) or audio_prompt_embeds.dim() != 3:
+                        raise ValueError(
+                            f"conditions['audio_prompt_embeds'] must be a 3D tensor [B, seq_len, dim], "
+                            f"got {type(audio_prompt_embeds).__name__} "
+                            f"{tuple(audio_prompt_embeds.shape) if isinstance(audio_prompt_embeds, torch.Tensor) else ''}"
+                        )
+                    if video_prompt_embeds.shape[:2] != audio_prompt_embeds.shape[:2]:
+                        raise ValueError(
+                            f"video_prompt_embeds {tuple(video_prompt_embeds.shape)} and audio_prompt_embeds "
+                            f"{tuple(audio_prompt_embeds.shape)} must have the same batch and seq_len dimensions. "
+                            "Caches may have been created with different sequence length settings or different checkpoints."
+                        )
                     text_embeds = torch.cat([video_prompt_embeds, audio_prompt_embeds], dim=-1)
                 else:
                     text_embeds = conditions.get("prompt_embeds")
@@ -2911,6 +2929,12 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 raise ValueError(f"Expected text_mask to be 2D [B, seq_len], got shape: {tuple(text_mask.shape)}")
             if text_mask.shape[0] != latents.shape[0]:
                 raise ValueError(f"Batch size mismatch: latents batch={latents.shape[0]} vs text_mask batch={text_mask.shape[0]}")
+            if text_mask.shape[1] != text_embeds.shape[1]:
+                raise ValueError(
+                    f"text_mask seq_len ({text_mask.shape[1]}) does not match text_embeds seq_len ({text_embeds.shape[1]}). "
+                    "This usually means the attention mask and text embedding caches were created with different "
+                    "sequence length settings. Re-run the text encoder caching step."
+                )
             text_mask = text_mask.to(device=accelerator.device)
             if args.gradient_checkpointing:
                 text_mask = text_mask.to(torch.bool)

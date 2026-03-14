@@ -70,6 +70,18 @@ def select_audio_text_embeds_for_audio_mode(
         _video, audio = split
         return audio
 
+    # All resolution paths failed — raise if we know the expected dim, otherwise return best guess.
+    if audio_dim > 0:
+        candidates = []
+        if isinstance(preferred_audio, torch.Tensor):
+            candidates.append(f"audio_prompt_embeds dim={preferred_audio.shape[-1]}")
+        candidates.append(f"source dim={source.shape[-1]}")
+        raise ValueError(
+            f"Could not resolve audio text embeddings with expected dim={audio_dim}. "
+            f"Tried: {', '.join(candidates)}. "
+            "This usually means the text encoder cache was created without audio embeddings or with a "
+            "different --ltx2_checkpoint. Re-run ltx2_cache_text_encoder_outputs.py with --ltx2_mode audio (or av)."
+        )
     if isinstance(preferred_audio, torch.Tensor):
         return preferred_audio
     return source
