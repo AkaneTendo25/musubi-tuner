@@ -572,7 +572,7 @@ class SelfFlowModule:
     def _loss_from_cosine(self, cosine: torch.Tensor) -> torch.Tensor:
         if self.config.loss_type == "one_minus_cosine":
             return 1.0 - cosine
-        return -cosine
+        return -cosine  # negative cosine: gradient pushes cosine toward +1 (same direction as 1-cosine but different magnitude)
 
     def _reshape_temporal_features(
         self, features: torch.Tensor, num_latent_frames: Optional[int]
@@ -895,7 +895,9 @@ class SelfFlowModule:
         temporal_mode = str(self.config.temporal_mode).lower()
         temporal_granularity = str(self.config.temporal_granularity).lower()
         motion_weighting = str(self.config.motion_weighting).lower()
-        # Temporal losses use raw (pre-projection) student features to match the space of teacher_feat.
+        # Temporal losses operate in the original feature space (not projected) so that
+        # frame-to-frame deltas reflect the transformer's actual spatiotemporal representations
+        # rather than the learned projection.
         temporal_student = self._reshape_temporal_features(student_feat, num_latent_frames)
         temporal_teacher = self._reshape_temporal_features(teacher_feat, num_latent_frames)
         temporal_student_grid = self._reshape_temporal_grid(

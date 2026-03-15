@@ -2296,7 +2296,11 @@ def ltx2_finetune_setup_parser(parser: argparse.ArgumentParser) -> argparse.Argu
         "--ewc_num_batches",
         type=int,
         default=8,
-        help="Number of batches used to estimate Fisher statistics at training start.",
+        help=(
+            "Number of batches used to estimate Fisher statistics at training start. "
+            "Fisher is computed on whatever data is in the training dataloader, so provide a "
+            "video-only dataset config if you want motion-focused Fisher statistics."
+        ),
     )
     parser.add_argument(
         "--ewc_target",
@@ -2318,7 +2322,11 @@ def ltx2_finetune_setup_parser(parser: argparse.ArgumentParser) -> argparse.Argu
         "--ewc_cache_path",
         type=str,
         default=None,
-        help="Optional on-disk cache file (.pt) for EWC Fisher/theta stats. Signature mismatch auto-rebuilds.",
+        help=(
+            "Optional on-disk cache file (.pt) for EWC Fisher/theta stats. Signature mismatch auto-rebuilds. "
+            "Note: Fisher is computed on whatever data is in the training dataloader, so if you want "
+            "motion-focused Fisher statistics, provide a video-only dataset config."
+        ),
     )
     parser.add_argument(
         "--ewc_cache_rebuild",
@@ -3896,12 +3904,22 @@ def main() -> None:
                         )
                         if isinstance(anchor_model_timesteps, torch.Tensor) and anchor_model_timesteps.numel() > 0:
                             replay_sigma_value = float(anchor_model_timesteps.view(-1)[0].detach().float().item() / 1000.0)
-                        teacher_video_pred = anchor["teacher_video_pred"]
+                        teacher_video_pred = anchor.get("teacher_video_pred")
+                        if not isinstance(teacher_video_pred, torch.Tensor):
+                            logger.warning(
+                                "Motion replay: teacher_video_pred is %s instead of Tensor, skipping replay this step",
+                                type(teacher_video_pred).__name__,
+                            )
                     anchor_batch = _move_to_device(
                         anchor["anchor_batch"], accelerator.device, dtype=trainer.dit_dtype
                     )
 
                     original_first_frame_p = float(getattr(args, "ltx2_first_frame_conditioning_p", 0.0))
+                    # Force first-frame conditioning probability to 0 during motion replay so that
+                    # the student prediction is generated under the same conditions as the cached
+                    # teacher prediction (which was recorded with p=0).  A mismatch would introduce
+                    # a systematic bias between student and teacher outputs, degrading the motion
+                    # preservation loss signal.
                     setattr(args, "ltx2_first_frame_conditioning_p", 0.0)
                     try:
                         if args.motion_attention_preservation and motion_attention_modules:
@@ -3947,7 +3965,7 @@ def main() -> None:
                     finally:
                         setattr(args, "ltx2_first_frame_conditioning_p", original_first_frame_p)
 
-                    if isinstance(motion_pred, dict) and not motion_pred.get("_skip_step"):
+                    if isinstance(motion_pred, dict) and not motion_pred.get("_skip_step") and isinstance(teacher_video_pred, torch.Tensor):
                         student_video_pred = motion_pred["video_pred"]
                         motion_pres_loss_raw = _compute_motion_preservation_loss(
                             args,
@@ -3987,6 +4005,10 @@ def main() -> None:
                                 if not isinstance(teacher_map, torch.Tensor):
                                     continue
                                 if teacher_map.shape != student_map.shape:
+                                    logger.warning(
+                                        "Motion preservation: attention map shape mismatch for module %s (student=%s teacher=%s), skipping",
+                                        module_name, student_map.shape, teacher_map.shape,
+                                    )
                                     continue
 
                                 student_dist = student_map.to(torch.float32)
