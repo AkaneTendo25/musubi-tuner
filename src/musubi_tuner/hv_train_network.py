@@ -1014,6 +1014,47 @@ class NetworkTrainer:
             logger.warning(f"could not recover global_step from {scheduler_path}: {e}  (starting from step 0)")
             return 0
 
+    @staticmethod
+    def _find_latest_state_dir(args: argparse.Namespace) -> Optional[str]:
+        """Find the latest training state directory in output_dir for --autoresume.
+
+        Scans output_dir for directories ending in '-state' that contain a valid
+        scheduler.bin, reads the global_step from each, and returns the path with
+        the highest step. Works with epoch-based, step-based, and final states.
+        """
+        if not args.output_dir or not os.path.isdir(args.output_dir):
+            return None
+
+        best_step = -1
+        best_path = None
+
+        for entry in os.listdir(args.output_dir):
+            full_path = os.path.join(args.output_dir, entry)
+            if not os.path.isdir(full_path) or not entry.endswith("-state"):
+                continue
+
+            scheduler_path = os.path.join(full_path, "scheduler.bin")
+            if not os.path.exists(scheduler_path):
+                continue
+
+            # Fast path: parse step number from step-based directory names
+            step_match = re.search(r"-step(\d+)-state$", entry)
+            if step_match:
+                step = int(step_match.group(1))
+            else:
+                # Epoch-based or final state: read scheduler.bin for actual global_step
+                try:
+                    scheduler_state = torch.load(scheduler_path, map_location="cpu", weights_only=True)
+                    step = int(scheduler_state["last_epoch"])
+                except Exception:
+                    continue
+
+            if step > best_step:
+                best_step = step
+                best_path = full_path
+
+        return best_path
+
     def get_bucketed_timestep(self) -> float:
         if self.num_timestep_buckets is None or self.num_timestep_buckets <= 1:
             return random.random()
@@ -2555,6 +2596,15 @@ class NetworkTrainer:
         # epoch数を計算する
         num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
         num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
+
+        # autoresume: find latest state in output_dir if --autoresume is set and --resume is not
+        if getattr(args, "autoresume", False) and not args.resume:
+            latest = self._find_latest_state_dir(args)
+            if latest:
+                logger.info(f"autoresume: found latest state directory: {latest}")
+                args.resume = latest
+            else:
+                logger.info("autoresume: no saved state found in output_dir, starting from scratch")
 
         # resume from local or huggingface — must be after num_update_steps_per_epoch is known
         initial_global_step = self.resume_from_local_or_hf_if_specified(accelerator, args)
@@ -4103,6 +4153,12 @@ def setup_parser_common() -> argparse.ArgumentParser:
         help="base name of trained model file / 学習後のモデルの拡張子を除くファイル名",
     )
     parser.add_argument("--resume", type=str, default=None, help="saved state to resume training / 学習再開するモデルのstate")
+    parser.add_argument(
+        "--autoresume",
+        action="store_true",
+        help="automatically resume from the latest saved state in output_dir (ignored if --resume is specified)"
+        " / output_dir内の最新のstateから自動的に学習を再開する（--resumeが指定されている場合は無視される）",
+    )
 
     parser.add_argument(
         "--save_every_n_epochs",

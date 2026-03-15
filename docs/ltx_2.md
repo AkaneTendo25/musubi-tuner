@@ -58,6 +58,7 @@ Caching scripts (`ltx2_cache_latents.py`, `ltx2_cache_text_encoder_outputs.py`) 
     - [Precached Sample Prompts](#precached-sample-prompts)
     - [Two-Stage Sampling (WIP)](#two-stage-sampling-wip)
     - [Checkpoint Output Format](#checkpoint-output-format)
+    - [Resuming Training](#resuming-training)
 - [Merge LTX-2 LoRAs](#merge-ltx-2-loras)
   - [LoRA Merge Arguments](#lora-merge-arguments)
 - [Dataset Configuration](#dataset-configuration)
@@ -1288,6 +1289,15 @@ Saved LoRA checkpoints are converted to ComfyUI format by default. Both the orig
 > **Important:** Training can only be resumed from the **original** (non-comfy) checkpoint format. If you plan to use `--resume`, do not use `--no_save_original_lora`.
 
 Checkpoint rotation (`--save_last_n_epochs`) cleans up old ComfyUI checkpoints alongside originals. HuggingFace upload (`--huggingface_repo_id`) uploads both formats by default. Use `--no_save_original_lora` to upload only the ComfyUI checkpoint.
+
+#### Resuming Training
+
+Requires `--save_state` to be enabled. State directories contain optimizer, scheduler, and RNG states.
+
+| Flag | Description |
+|------|-------------|
+| `--resume <path>` | Resume from a specific state directory |
+| `--autoresume` | Automatically resume from the latest state in `output_dir`. Ignored if `--resume` is specified. Starts from scratch if no state is found |
 
 ---
 
