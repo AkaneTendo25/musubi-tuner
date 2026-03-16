@@ -477,6 +477,7 @@ def _build_motion_anchor_cache_signature(
         "synthetic_frames": int(getattr(args, "motion_preservation_synthetic_frames", 8) or 8),
         "synthetic_temporal_corr": float(getattr(args, "motion_preservation_synthetic_temporal_corr", 0.92)),
         "synthetic_dataset_mix": float(getattr(args, "motion_preservation_synthetic_dataset_mix", 0.25)),
+        "synthetic_content_seeded": bool(getattr(args, "motion_preservation_synthetic_content_seeded", True)),
         "attention_preservation": bool(use_attn_pres),
         "attention_queries": int(max_queries),
         "attention_keys": int(max_keys),
@@ -880,7 +881,7 @@ def _resolve_motion_anchor_cache_size(args: argparse.Namespace, *, num_train_ite
 
     ratio = float(getattr(args, "motion_preservation_anchor_cache_auto_ratio", 0.2) or 0.2)
     min_size = int(getattr(args, "motion_preservation_anchor_cache_auto_min", 8) or 8)
-    max_size = int(getattr(args, "motion_preservation_anchor_cache_auto_max", 64) or 64)
+    max_size = int(getattr(args, "motion_preservation_anchor_cache_auto_max", 256) or 256)
     derived = int(math.ceil(max(1, int(num_train_items)) * ratio))
     resolved = max(min_size, min(max_size, derived))
     return resolved
@@ -1312,8 +1313,19 @@ def _build_synthetic_motion_latents(
     *,
     target_frames: int,
     temporal_corr: float,
+    content_seeded: bool = True,
 ) -> torch.Tensor:
-    """Create synthetic multi-frame latents with temporally-correlated noise."""
+    """Create synthetic multi-frame latents with temporally-correlated noise.
+
+    When *content_seeded* is True the first frame is the actual image latent from
+    the dataset and subsequent frames evolve from it via an AR(1) process.  This
+    gives the base model semantically-structured multi-frame input so its temporal
+    response encodes content-aware motion priors rather than generic noise routing.
+
+    When *content_seeded* is False the original behaviour is used: all frames are
+    pure temporally-correlated Gaussian noise rescaled to match the image latent
+    statistics.
+    """
     if base_latents.dim() != 5:
         raise ValueError(f"Expected 5D base latents, got shape={tuple(base_latents.shape)}")
 
@@ -1321,32 +1333,48 @@ def _build_synthetic_motion_latents(
     frames = max(2, int(target_frames))
     corr = max(0.0, min(0.999, float(temporal_corr)))
 
-    prev = torch.randn((batch_size, channels, height, width), device=base_latents.device, dtype=base_latents.dtype)
     synth = torch.empty(
         (batch_size, channels, frames, height, width),
         device=base_latents.device,
         dtype=base_latents.dtype,
     )
-    synth[:, :, 0, :, :] = prev
 
-    if corr >= 0.999:
-        for frame_idx in range(1, frames):
-            synth[:, :, frame_idx, :, :] = prev
+    if content_seeded:
+        # Seed from the actual image latent so the base model processes content-
+        # aware input.  The AR(1) process naturally drifts from the image toward
+        # noise, creating a smooth temporal evolution the model can reason about.
+        prev = base_latents[:, :, 0, :, :].clone()
+        synth[:, :, 0, :, :] = prev
+        if corr >= 0.999:
+            for frame_idx in range(1, frames):
+                synth[:, :, frame_idx, :, :] = prev
+        else:
+            noise_scale = math.sqrt(max(1e-6, 1.0 - corr * corr))
+            for frame_idx in range(1, frames):
+                prev = corr * prev + noise_scale * torch.randn_like(prev)
+                synth[:, :, frame_idx, :, :] = prev
+        # No mean/std rescaling needed — already in the correct latent distribution.
     else:
-        noise_scale = math.sqrt(max(1e-6, 1.0 - corr * corr))
-        for frame_idx in range(1, frames):
-            prev = corr * prev + noise_scale * torch.randn_like(prev)
-            synth[:, :, frame_idx, :, :] = prev
-
-    # Match mean/std to real cached latents so replay operates on similar magnitude.
-    base_f32 = base_latents.to(torch.float32)
-    synth_f32 = synth.to(torch.float32)
-    base_mean = base_f32.mean()
-    base_std = base_f32.std(unbiased=False).clamp_min(1e-6)
-    synth_mean = synth_f32.mean()
-    synth_std = synth_f32.std(unbiased=False).clamp_min(1e-6)
-    synth = (synth - synth_mean.to(dtype=synth.dtype)) * (base_std / synth_std).to(dtype=synth.dtype)
-    synth = synth + base_mean.to(dtype=synth.dtype)
+        # Original behaviour: pure random noise with temporal correlation.
+        prev = torch.randn((batch_size, channels, height, width), device=base_latents.device, dtype=base_latents.dtype)
+        synth[:, :, 0, :, :] = prev
+        if corr >= 0.999:
+            for frame_idx in range(1, frames):
+                synth[:, :, frame_idx, :, :] = prev
+        else:
+            noise_scale = math.sqrt(max(1e-6, 1.0 - corr * corr))
+            for frame_idx in range(1, frames):
+                prev = corr * prev + noise_scale * torch.randn_like(prev)
+                synth[:, :, frame_idx, :, :] = prev
+        # Match mean/std to real cached latents so replay operates on similar magnitude.
+        base_f32 = base_latents.to(torch.float32)
+        synth_f32 = synth.to(torch.float32)
+        base_mean = base_f32.mean()
+        base_std = base_f32.std(unbiased=False).clamp_min(1e-6)
+        synth_mean = synth_f32.mean()
+        synth_std = synth_f32.std(unbiased=False).clamp_min(1e-6)
+        synth = (synth - synth_mean.to(dtype=synth.dtype)) * (base_std / synth_std).to(dtype=synth.dtype)
+        synth = synth + base_mean.to(dtype=synth.dtype)
     return synth
 
 
@@ -1385,6 +1413,7 @@ def _build_motion_anchor_cache(
     synthetic_frames = int(getattr(args, "motion_preservation_synthetic_frames", 8) or 8)
     synthetic_temporal_corr = float(getattr(args, "motion_preservation_synthetic_temporal_corr", 0.92))
     synthetic_dataset_mix = float(getattr(args, "motion_preservation_synthetic_dataset_mix", 0.25))
+    synthetic_content_seeded = bool(getattr(args, "motion_preservation_synthetic_content_seeded", True))
 
     entries: list[dict[str, Any]] = []
     max_attempts = max(cache_size * 4, cache_size)
@@ -1416,10 +1445,11 @@ def _build_motion_anchor_cache(
     )
     if anchor_source in {"synthetic", "hybrid"}:
         logger.info(
-            "Motion prior synthetic anchors: frames=%d temporal_corr=%.3f dataset_mix=%.2f",
+            "Motion prior synthetic anchors: frames=%d temporal_corr=%.3f dataset_mix=%.2f content_seeded=%s",
             synthetic_frames,
             synthetic_temporal_corr,
             synthetic_dataset_mix,
+            synthetic_content_seeded,
         )
     anchor_start_time = time.time()
     if replay_sigmas:
@@ -1466,6 +1496,7 @@ def _build_motion_anchor_cache(
                         latents_tensor,
                         target_frames=synthetic_frames,
                         temporal_corr=synthetic_temporal_corr,
+                        content_seeded=synthetic_content_seeded,
                     )
                     synthetic_anchor_count += 1
                 else:
@@ -2092,7 +2123,7 @@ def ltx2_finetune_setup_parser(parser: argparse.ArgumentParser) -> argparse.Argu
     parser.add_argument(
         "--motion_preservation_anchor_cache_auto_max",
         type=int,
-        default=64,
+        default=256,
         help="When auto-size is enabled: maximum anchor cache size.",
     )
     parser.add_argument(
@@ -2135,6 +2166,28 @@ def ltx2_finetune_setup_parser(parser: argparse.ArgumentParser) -> argparse.Argu
         type=float,
         default=0.25,
         help="For hybrid source, probability of selecting dataset anchors vs synthetic anchors.",
+    )
+    parser.add_argument(
+        "--motion_preservation_synthetic_content_seeded",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Seed synthetic motion priors from the actual image latent instead of pure random noise. "
+            "The image becomes frame 0 and subsequent frames evolve from it via the AR(1) process, "
+            "giving the base model semantically-structured input so its temporal response encodes "
+            "content-aware motion priors. Disable with --no-motion_preservation_synthetic_content_seeded "
+            "to revert to the original pure-noise behaviour."
+        ),
+    )
+    parser.add_argument(
+        "--motion_preservation_warmup_steps",
+        type=int,
+        default=0,
+        help=(
+            "Linearly ramp the motion preservation multiplier from 0 to its full value over this many "
+            "global optimizer steps. Allows the model to learn appearance freely in early training "
+            "before motion constraints tighten. 0 disables warmup (full multiplier from step 0)."
+        ),
     )
     parser.add_argument(
         "--motion_preservation_interval",
@@ -3094,6 +3147,10 @@ def main() -> None:
         "ss_motion_preservation_synthetic_dataset_mix": getattr(
             args, "motion_preservation_synthetic_dataset_mix", 0.25
         ),
+        "ss_motion_preservation_synthetic_content_seeded": getattr(
+            args, "motion_preservation_synthetic_content_seeded", True
+        ),
+        "ss_motion_preservation_warmup_steps": getattr(args, "motion_preservation_warmup_steps", 0),
         "ss_motion_preservation_interval": getattr(args, "motion_preservation_interval", 1),
         "ss_motion_preservation_probability": getattr(args, "motion_preservation_probability", None),
         "ss_motion_preservation_num_sigmas": getattr(args, "motion_preservation_num_sigmas", 1),
@@ -3974,7 +4031,11 @@ def main() -> None:
                             motion_pred.get("video_loss_mask"),
                             dtype=trainer.dit_dtype,
                         )
-                        motion_pres_loss = motion_pres_loss_raw * float(args.motion_preservation_multiplier)
+                        motion_multiplier = float(args.motion_preservation_multiplier)
+                        motion_warmup = int(getattr(args, "motion_preservation_warmup_steps", 0) or 0)
+                        if motion_warmup > 0 and global_step < motion_warmup:
+                            motion_multiplier = motion_multiplier * (global_step / motion_warmup)
+                        motion_pres_loss = motion_pres_loss_raw * motion_multiplier
                         motion_total_loss = motion_pres_loss
 
                         teacher_attn_maps = anchor.get("teacher_attention_maps")
@@ -4138,6 +4199,12 @@ def main() -> None:
                     logs.update(self_flow_metrics)
                 if motion_pres_loss_raw is not None:
                     logs["motion/pres_raw"] = motion_pres_loss_raw.detach().item()
+                if motion_pres_loss is not None:
+                    _mw = int(getattr(args, "motion_preservation_warmup_steps", 0) or 0)
+                    _mm = float(args.motion_preservation_multiplier)
+                    if _mw > 0 and global_step < _mw:
+                        _mm = _mm * (global_step / _mw)
+                    logs["motion/effective_multiplier"] = _mm
                 if attn_pres_loss is not None:
                     logs["attn_pres"] = attn_pres_loss.detach().item()
                     logs["motion/attn_weighted"] = attn_pres_loss.detach().item()
