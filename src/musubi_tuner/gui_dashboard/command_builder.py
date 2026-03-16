@@ -389,6 +389,8 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
         cmd += ["--shifted_logit_eps", str(t.shifted_logit_eps)]
     if t.shifted_logit_uniform_prob != 0.1:
         cmd += ["--shifted_logit_uniform_prob", str(t.shifted_logit_uniform_prob)]
+    if t.shifted_logit_shift is not None:
+        cmd += ["--shifted_logit_shift", str(t.shifted_logit_shift)]
     if t.preserve_distribution_shape:
         cmd.append("--preserve_distribution_shape")
     if t.num_timestep_buckets is not None:

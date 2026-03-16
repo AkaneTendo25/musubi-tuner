@@ -300,7 +300,11 @@ class LTX2SliderTrainer:
 
         # Sample sigma from shifted logit-normal
         seq_len = latent_frames * latent_height * latent_width
-        shift = LTX2NetworkTrainer._shifted_logit_normal_shift_for_sequence_length(seq_len)
+        shifted_logit_shift_override = getattr(args, "shifted_logit_shift", None)
+        if shifted_logit_shift_override is not None:
+            shift = float(shifted_logit_shift_override)
+        else:
+            shift = LTX2NetworkTrainer._shifted_logit_normal_shift_for_sequence_length(seq_len)
         shifted_logit_mode = self._net_trainer._resolve_shifted_logit_mode(args)
         sigma = LTX2NetworkTrainer._sample_shifted_logit_normal_sigmas(
             1,
@@ -426,7 +430,11 @@ class LTX2SliderTrainer:
 
         # Sample sigma
         seq_len = pos_latents.shape[2] * pos_latents.shape[3] * pos_latents.shape[4]
-        shift = LTX2NetworkTrainer._shifted_logit_normal_shift_for_sequence_length(seq_len)
+        shifted_logit_shift_override = getattr(args, "shifted_logit_shift", None)
+        if shifted_logit_shift_override is not None:
+            shift = float(shifted_logit_shift_override)
+        else:
+            shift = LTX2NetworkTrainer._shifted_logit_normal_shift_for_sequence_length(seq_len)
         shifted_logit_mode = self._net_trainer._resolve_shifted_logit_mode(args)
         sigma = LTX2NetworkTrainer._sample_shifted_logit_normal_sigmas(
             1,

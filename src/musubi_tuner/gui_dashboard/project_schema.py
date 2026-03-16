@@ -185,6 +185,7 @@ class TrainingConfig(BaseModel):
     shifted_logit_mode: Optional[str] = None
     shifted_logit_eps: float = 1e-3
     shifted_logit_uniform_prob: float = 0.1
+    shifted_logit_shift: Optional[float] = None
     preserve_distribution_shape: bool = False
     num_timestep_buckets: Optional[int] = None
 

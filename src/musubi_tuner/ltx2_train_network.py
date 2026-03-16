@@ -1973,6 +1973,10 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 else:
                     shift = self._shifted_logit_normal_shift_for_sequence_length(seq_len)
                     shifts = torch.full((batch_size,), float(shift), device=device, dtype=torch.float32)
+                # Apply manual shift override if set
+                shifted_logit_shift_override = getattr(args, "shifted_logit_shift", None)
+                if shifted_logit_shift_override is not None:
+                    shifts = torch.full((batch_size,), float(shifted_logit_shift_override), device=device, dtype=torch.float32)
                 std = getattr(args, "logit_std", 1.0)
                 shifted_logit_mode = self._resolve_shifted_logit_mode(args)
                 shifted_logit_eps = getattr(args, "shifted_logit_eps", 1e-3)
@@ -6584,6 +6588,16 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         type=float,
         default=0.1,
         help="Uniform fallback probability used by --shifted_logit_mode stretched.",
+    )
+    parser.add_argument(
+        "--shifted_logit_shift",
+        type=float,
+        default=None,
+        help=(
+            "Override the auto-calculated logit-normal shift value. "
+            "Lower values bias toward low noise / fine details, higher values toward high noise / global structure. "
+            "If unset, shift is computed from sequence length (range [0.95, 2.05])."
+        ),
     )
     parser.add_argument(
         "--audio_silence_regularizer",

@@ -3112,6 +3112,7 @@ def main() -> None:
         "ss_shifted_logit_mode": getattr(args, "shifted_logit_mode", None),
         "ss_shifted_logit_eps": getattr(args, "shifted_logit_eps", 1e-3),
         "ss_shifted_logit_uniform_prob": getattr(args, "shifted_logit_uniform_prob", 0.1),
+        "ss_shifted_logit_shift": getattr(args, "shifted_logit_shift", None),
         "ss_ltx_mode": args.ltx_mode,
         "ss_split_av_passes": bool(getattr(args, "split_av_passes", False)),
         "ss_video_loss_weight": getattr(args, "video_loss_weight", 1.0),
