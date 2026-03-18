@@ -1806,14 +1806,14 @@ Note: `--gemma_root` is not needed for reference mode (text embeddings are loade
 - [Self-Flow (arXiv 2603.06507)](https://arxiv.org/abs/2603.06507) — Self-supervised flow matching regularization; basis for `--self_flow`
 
 **Official LTX Resources**
-- [LTX-2](https://github.com/Lightricks/LTX-2) — Official Lightricks LTX-2 repository; contains the well-structured `ltx-trainer` and `ltx-pipelines` packages that served as the upstream source and reference for this implementation
+- [LTX-2](https://github.com/Lightricks/LTX-2) — Official Lightricks LTX-2/2.3 repository; contains the well-structured `ltx-trainer` and `ltx-pipelines` packages that served as the upstream source and reference for this implementation
 - [LTX-Video](https://github.com/Lightricks/LTX-Video) — Official Lightricks model repository (inference, ComfyUI nodes, model weights)
 - [LTX Documentation](https://docs.ltx.video/open-source-model/getting-started/overview) — Unified docs hub: open-source model, API reference, ComfyUI integration, LoRA usage, and LTX-2 trainer guide
 
 **Alternative Trainers**
 - [ai-toolkit](https://github.com/ostris/ai-toolkit) (ostris) — General diffusion fine-tuning toolkit with LTX-2 LoRA support; slider LoRA training is based on its implementation
-- [SimpleTuner](https://github.com/bghira/SimpleTuner) — Multi-model fine-tuning framework with LTX-Video support; `--crepa backbone` mode is inspired by its LayerSync regularizer
-- [DiffSynth-Studio](https://github.com/modelscope/DiffSynth-Studio) — ModelScope diffusion synthesis framework with LTX-Video support
+- [SimpleTuner](https://github.com/bghira/SimpleTuner) — Multi-model fine-tuning framework with LTX-2 support; `--crepa backbone` mode is inspired by its LayerSync regularizer
+- [DiffSynth-Studio](https://github.com/modelscope/DiffSynth-Studio) — ModelScope diffusion synthesis framework with LTX-2/2.3 support
 
 **Community Resources**
 - [awesome-ltx2](https://github.com/wildminder/awesome-ltx2) — Curated list of LTX-2 resources, tools, models, and guides
