@@ -77,16 +77,28 @@
 		if (!cfg?.caching) return null;
 		const c = cfg.caching;
 		const vae = vaeSize(c);
-		// VAE chunking/tiling saves ~50-70% of activation memory
-		const tiling = (c.vae_chunk_size || c.vae_spatial_tile_size) ? -0.8 : 0;
-		// Buffer for intermediate tensors
-		const buffer = tiling ? 1.5 : 2.5;
-		const total = vae + buffer + tiling;
+		// VAE activation memory scales with input resolution and frames.
+		// Base: ~2.5 GB for 512x768x33f. Scales roughly proportional to pixel*frame count.
+		const allDatasets = cfg?.dataset?.datasets || [];
+		const ds = allDatasets.find((d) => d?.type === 'video' || d?.type === 'image') || allDatasets[0] || {};
+		const resW = Math.max(Number(ds.resolution_w || 768), 64);
+		const resH = Math.max(Number(ds.resolution_h || 512), 64);
+		const frames = Math.max(Number(ds.target_frames || 33), 1);
+		const basePixelFrames = 512 * 768 * 33;
+		const pixelFrames = resW * resH * frames;
+		const resScale = Math.max(0.5, Math.min(pixelFrames / basePixelFrames, 4.0));
+		// VAE tiling reduces activation memory significantly
+		const hasSpatialTiling = !!(c.vae_spatial_tile_size || c.vae_chunk_size);
+		const hasTemporalTiling = !!c.vae_temporal_tile_size;
+		const tilingFactor = (hasSpatialTiling && hasTemporalTiling) ? 0.2 :
+			hasSpatialTiling ? 0.3 : hasTemporalTiling ? 0.5 : 1.0;
+		const buffer = 2.5 * resScale * tilingFactor;
+		const total = vae + buffer;
 		return {
 			total: Math.max(total, 1),
 			parts: [
 				{ label: 'VAE', value: vae, color: 'var(--accent)' },
-				{ label: 'Buffer', value: buffer + tiling, color: 'var(--info)' },
+				{ label: 'Activations', value: buffer, color: 'var(--info)' },
 			]
 		};
 	}
@@ -115,10 +127,10 @@
 
 		// ── DiT weights ──
 		// LTX-2 DiT: 48 transformer blocks. VAE/Gemma NOT resident during training.
-		// LTX 2.0: ~19B params → BF16 38 GB, FP8 19 GB, FP32 76 GB
-		// LTX 2.3: ~21.5B params → BF16 43 GB, FP8 21.5 GB, FP32 86 GB
+		// LTX 2.0: ~19.6B params → BF16 39 GB, FP8 19.5 GB, FP32 78 GB
+		// LTX 2.3: ~21.0B params → BF16 42 GB, FP8 21 GB, FP32 84 GB
 		const ltxVersion = String(t.ltx_version || '2.0');
-		const ditBF16 = ltxVersion === '2.3' ? 43 : 38;
+		const ditBF16 = ltxVersion === '2.3' ? 42 : 39;
 		const isFp8 = !!t.fp8_base;
 		const isNF4 = !!t.nf4_base;
 		let ditBase = isNF4 ? (ditBF16 / 4) : isFp8 ? (ditBF16 / 2) : ditBF16;
@@ -198,6 +210,8 @@
 		// Memory-saving techniques
 		if ((t.ffn_chunk_size || 0) > 0) activations *= 0.90;
 		if (t.split_attn_mode || t.split_attn_target) activations *= 0.92;
+		// GC CPU offload: activation checkpoints stored on CPU instead of GPU
+		if (t.gradient_checkpointing_cpu_offload && t.gradient_checkpointing !== false) activations *= 0.35;
 
 		// Fixed buffers: CUDA allocator overhead, latent tensors, noise, text embeddings
 		// Latents: batch * 128 * latentF * latentH * latentW * 2 bytes (small, ~tens of MB)
@@ -217,17 +231,29 @@
 		let preservationOverhead = 0;
 		if (t.blank_preservation) preservationOverhead += activationTotal * 0.35;
 		if (t.dop) preservationOverhead += activationTotal * 0.35;
+		if (t.audio_dop) preservationOverhead += activationTotal * 0.35;
 		if (t.prior_divergence) preservationOverhead += activationTotal * 0.15;
+
+		// ── Self-Flow ──
+		// Shadow params (EMA teacher): clone of LoRA weights on GPU (or CPU if offloaded)
+		// Projector MLP: ~0.02 GB. Extra forward activations: ~10% overhead.
+		let selfFlowOverhead = 0;
+		if (t.self_flow) {
+			const teacherOnGPU = !t.self_flow_offload_teacher_params;
+			selfFlowOverhead += teacherOnGPU ? loraParamsGB : 0;  // shadow params
+			selfFlowOverhead += 0.02;  // projector MLP
+			selfFlowOverhead += activationTotal * 0.10;  // extra forward activation overhead
+		}
 
 		// ── CREPA ──
 		const crepaOverhead = t.crepa ? (String(t.crepa_mode || 'backbone') === 'dino' ? 0.08 : 0.15) : 0;
 
-		const total = dit + loraParamsGB + optimStates + loraGrads + activationTotal + gradAccumOverhead + preservationOverhead + crepaOverhead;
+		const total = dit + loraParamsGB + optimStates + loraGrads + activationTotal + gradAccumOverhead + preservationOverhead + selfFlowOverhead + crepaOverhead;
 
 		// Temporary spikes (not steady-state)
 		const samplingEnabled = !!t.sample_prompts && !!(t.sample_at_first || t.sample_every_n_steps || t.sample_every_n_epochs);
 		const samplingSpike = samplingEnabled;
-		const preservationGemmaSpike = !!(t.blank_preservation || t.dop) && !t.use_precached_preservation;
+		const preservationGemmaSpike = !!(t.blank_preservation || t.dop || t.audio_dop) && !t.use_precached_preservation;
 
 		const parts = [
 			{ label: 'DiT', value: dit, color: 'var(--accent)' },
@@ -238,6 +264,7 @@
 		parts.push({ label: 'Activ.', value: activationTotal, color: 'var(--success)' });
 		if (gradAccumOverhead > 0) parts.push({ label: 'GradAccum', value: gradAccumOverhead, color: 'var(--info)' });
 		if (preservationOverhead > 0) parts.push({ label: 'Preserv.', value: preservationOverhead, color: 'var(--danger)' });
+		if (selfFlowOverhead > 0) parts.push({ label: 'Self-Flow', value: selfFlowOverhead, color: 'var(--danger)' });
 		if (crepaOverhead > 0) parts.push({ label: 'CREPA', value: crepaOverhead, color: 'var(--secondary, var(--info))' });
 
 		return {

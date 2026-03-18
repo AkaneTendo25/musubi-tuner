@@ -263,8 +263,8 @@ def _calculate_vram_stats(config: dict) -> VRAMStats | None:
     - DiT: 48 transformer blocks, inner_dim=4096 (video), 2048 (audio)
     - VAE compression: temporal 8x, spatial 32x32
     - Latent channels: 128, patch_size: 1
-    - LTX 2.0: ~19B params → BF16 38 GB, FP8 19 GB
-    - LTX 2.3: ~21.5B params → BF16 43 GB, FP8 21.5 GB
+    - LTX 2.0: ~19.6B params → BF16 39 GB, FP8 19.5 GB
+    - LTX 2.3: ~21.0B params → BF16 42 GB, FP8 21 GB
     """
     try:
         training = config.get('training', {})
@@ -273,7 +273,7 @@ def _calculate_vram_stats(config: dict) -> VRAMStats | None:
 
         # ── DiT weights ──
         ltx_version = str(training.get('ltx_version', '2.0'))
-        dit_bf16 = 43.0 if ltx_version == '2.3' else 38.0
+        dit_bf16 = 42.0 if ltx_version == '2.3' else 39.0
         is_fp8 = bool(training.get('fp8_base'))
         is_nf4 = bool(training.get('nf4_base'))
         dit_base = (dit_bf16 / 4) if is_nf4 else (dit_bf16 / 2) if is_fp8 else dit_bf16
@@ -325,17 +325,52 @@ def _calculate_vram_stats(config: dict) -> VRAMStats | None:
             activations_gb *= 1.25
         if int(training.get('ffn_chunk_size', 0)) > 0:
             activations_gb *= 0.90
+        if training.get('split_attn_mode') or training.get('split_attn_target'):
+            activations_gb *= 0.92
+        if training.get('gradient_checkpointing_cpu_offload') and grad_ckpt:
+            activations_gb *= 0.35
 
         # Fixed buffers
         latent_bytes = batch_size * 128 * latent_f * latent_h * latent_w * 2 * 2
         text_bytes = batch_size * 256 * (7680 if is_av else 3840) * 2
         buffer_gb = (latent_bytes + text_bytes) / (1024 ** 3) + 0.5
+        if training.get('img_in_txt_in_offloading'):
+            buffer_gb = max(0.2, buffer_gb - 0.3)
         activations_gb = max(0.3, activations_gb + buffer_gb)
 
         # ── Gradients ──
         grads_gb = lora_size_gb
 
-        peak_training_gb = model_size_gb + lora_size_gb + optimizer_size_gb + grads_gb + activations_gb
+        # ── Gradient accumulation ──
+        grad_accum = max(int(training.get('gradient_accumulation_steps', 1)), 1)
+        grad_accum_gb = grads_gb * 0.4 if grad_accum > 1 else 0
+
+        # ── Preservation / DOP ──
+        preservation_gb = 0
+        if training.get('blank_preservation'):
+            preservation_gb += activations_gb * 0.35
+        if training.get('dop'):
+            preservation_gb += activations_gb * 0.35
+        if training.get('audio_dop'):
+            preservation_gb += activations_gb * 0.35
+        if training.get('prior_divergence'):
+            preservation_gb += activations_gb * 0.15
+
+        # ── Self-Flow ──
+        self_flow_gb = 0
+        if training.get('self_flow'):
+            teacher_on_gpu = not training.get('self_flow_offload_teacher_params')
+            self_flow_gb += lora_size_gb if teacher_on_gpu else 0
+            self_flow_gb += 0.02  # projector MLP
+            self_flow_gb += activations_gb * 0.10
+
+        # ── CREPA ──
+        crepa_gb = 0
+        if training.get('crepa'):
+            crepa_gb = 0.08 if str(training.get('crepa_mode', 'backbone')) == 'dino' else 0.15
+
+        peak_training_gb = (model_size_gb + lora_size_gb + optimizer_size_gb + grads_gb +
+                            activations_gb + grad_accum_gb + preservation_gb + self_flow_gb + crepa_gb)
 
         # Sampling VRAM (VAE loaded, lighter activations)
         peak_sampling_gb = model_size_gb + 0.3 + (activations_gb * 0.3)
