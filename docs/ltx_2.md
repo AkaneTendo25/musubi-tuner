@@ -1037,7 +1037,7 @@ The `--sample_include_reference` flag shows the reference side-by-side with the 
 |----------|---------|-------------|
 | `--reference_downscale` | 1 | Spatial downscale factor for references (1=same res, 2=half) |
 | `--reference_frames` | 1 | Number of reference frames for V2V (images are repeated to fill this count) |
-| `--ltx2_first_frame_conditioning_p` | 0.1 | Probability of also conditioning on the first target frame during training |
+| `--ltx2_first_frame_conditioning_p` | 0.1 | Probability of also conditioning on the first target frame during training. No effect for single-frame (image) samples |
 | `--sample_include_reference` | off | Show reference side-by-side with generated output in sample videos |
 | `--lora_target_preset v2v` | — | Targets attention + FFN layers (recommended for IC-LoRA) |
 
@@ -1050,7 +1050,7 @@ The `--sample_include_reference` flag shows the reference side-by-side with the 
 
 ##### Notes
 
-- **First-frame conditioning** (`--ltx2_first_frame_conditioning_p`): Randomly conditions on the first target frame in addition to the reference. Only applied during training; inference always denoises the full target.
+- **First-frame conditioning** (`--ltx2_first_frame_conditioning_p`): Randomly conditions on the first target frame in addition to the reference. Only applied during training; inference always denoises the full target. Has no effect for single-frame (image-only) samples — the code skips conditioning when `num_frames == 1` since there are no subsequent frames to generate.
 - **Multi-frame references**: Supported but increase VRAM usage proportionally to the number of reference tokens.
 - **Multi-subject references**: The VAE compresses 8 frames into 1 temporal latent via `SpaceToDepthDownsample`, which pairs consecutive frames and averages their features. Subjects sharing the same 8-frame group are blended and lose individual identity. To keep N subjects separated, structure your reference video as: frame 1 = Subject A, frames 2–9 = Subject B (repeated 8×), frames 10–17 = Subject C (repeated 8×), etc. Total frames: `1 + 8×(N−1)`. Set `--reference_frames` to match. Frame 1 gets its own latent due to causal padding in the encoder; each subsequent 8-frame block produces one additional latent.
 - **Video-only**: IC-LoRA requires `--ltx2_mode video`. Audio-video mode is not supported for v2v training.
