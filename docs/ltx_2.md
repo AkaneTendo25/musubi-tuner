@@ -1299,6 +1299,13 @@ Requires `--save_state` to be enabled. State directories contain optimizer, sche
 |------|-------------|
 | `--resume <path>` | Resume from a specific state directory |
 | `--autoresume` | Automatically resume from the latest state in `output_dir`. Ignored if `--resume` is specified. Starts from scratch if no state is found |
+| `--reset_optimizer` | Clear optimizer momentum/variance on resume, keep model weights only |
+| `--reset_optimizer_params` | Reset optimizer param groups (lr, weight_decay, etc.) to current CLI values on resume, keep momentum/variance |
+| `--reset_dataloader` | Skip mid-epoch batch skip, restart epoch from beginning |
+
+Mid-epoch checkpoints record `step_in_epoch` in `resume_metadata.json`. On resume, already-processed batches are skipped to keep global step consistent. `--reset_dataloader` disables this.
+
+The moving average loss is saved in state checkpoints and restored on resume.
 
 ---
 

@@ -14,6 +14,7 @@ logging.basicConfig(level=logging.INFO)
 
 
 # checkpointファイル名
+RESUME_METADATA_NAME = "resume_metadata.json"
 EPOCH_STATE_NAME = "{}-{:06d}-state"
 EPOCH_FILE_NAME = "{}-{:06d}"
 EPOCH_DIFFUSERS_DIR_NAME = "{}-{:06d}"
@@ -21,6 +22,41 @@ LAST_STATE_NAME = "{}-state"
 STEP_STATE_NAME = "{}-step{:08d}-state"
 STEP_FILE_NAME = "{}-step{:08d}"
 STEP_DIFFUSERS_DIR_NAME = "{}-step{:08d}"
+
+
+def save_resume_metadata(state_dir: str, global_step: int, step_in_epoch: int, epoch: int):
+    """Save resume metadata alongside an accelerator state checkpoint."""
+    metadata = {"global_step": global_step, "step_in_epoch": step_in_epoch, "epoch": epoch}
+    path = os.path.join(state_dir, RESUME_METADATA_NAME)
+    with open(path, "w") as f:
+        json.dump(metadata, f)
+
+
+def load_resume_metadata(state_dir: str) -> dict | None:
+    """Load resume metadata from a state directory, or None if not present (old checkpoint)."""
+    path = os.path.join(state_dir, RESUME_METADATA_NAME)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def update_resume_metadata(state_dir: str, extra: dict):
+    """Update an existing resume_metadata.json with additional fields (e.g. loss info)."""
+    path = os.path.join(state_dir, RESUME_METADATA_NAME)
+    metadata = {}
+    if os.path.exists(path):
+        try:
+            with open(path) as f:
+                metadata = json.load(f)
+        except Exception:
+            pass
+    metadata.update(extra)
+    with open(path, "w") as f:
+        json.dump(metadata, f)
 
 
 def get_sanitized_config_or_none(args: argparse.Namespace):
@@ -75,8 +111,17 @@ class LossRecorder:
             self.loss_list[step] = loss
         self.loss_total += loss
 
+    def prefill(self, avg: float, count: int) -> None:
+        """Pre-fill with a known average from a resumed checkpoint so the
+        moving average starts close to where training left off."""
+        if count > 0 and avg > 0:
+            self.loss_list = [avg] * count
+            self.loss_total = avg * count
+
     @property
     def moving_average(self) -> float:
+        if not self.loss_list:
+            return 0.0
         return self.loss_total / len(self.loss_list)
 
 
@@ -130,7 +175,13 @@ def get_remove_step_no(args: argparse.Namespace, step_no: int):
     return remove_step_no
 
 
-def save_and_remove_state_on_epoch_end(args: argparse.Namespace, accelerator: accelerate.Accelerator, epoch_no: int):
+def save_and_remove_state_on_epoch_end(
+    args: argparse.Namespace,
+    accelerator: accelerate.Accelerator,
+    epoch_no: int,
+    global_step: int = 0,
+    step_in_epoch: int = 0,
+):
     model_name = args.output_name
 
     logger.info("")
@@ -139,6 +190,7 @@ def save_and_remove_state_on_epoch_end(args: argparse.Namespace, accelerator: ac
 
     state_dir = os.path.join(args.output_dir, EPOCH_STATE_NAME.format(model_name, epoch_no))
     accelerator.save_state(state_dir)
+    save_resume_metadata(state_dir, global_step, step_in_epoch, epoch_no)
     if args.save_state_to_huggingface:
         logger.info("uploading state to huggingface.")
         huggingface_utils.upload(args, state_dir, "/" + EPOCH_STATE_NAME.format(model_name, epoch_no))
@@ -152,7 +204,13 @@ def save_and_remove_state_on_epoch_end(args: argparse.Namespace, accelerator: ac
             shutil.rmtree(state_dir_old)
 
 
-def save_and_remove_state_stepwise(args: argparse.Namespace, accelerator: accelerate.Accelerator, step_no: int):
+def save_and_remove_state_stepwise(
+    args: argparse.Namespace,
+    accelerator: accelerate.Accelerator,
+    step_no: int,
+    epoch: int = 0,
+    step_in_epoch: int = 0,
+):
     model_name = args.output_name
 
     logger.info("")
@@ -161,6 +219,7 @@ def save_and_remove_state_stepwise(args: argparse.Namespace, accelerator: accele
 
     state_dir = os.path.join(args.output_dir, STEP_STATE_NAME.format(model_name, step_no))
     accelerator.save_state(state_dir)
+    save_resume_metadata(state_dir, step_no, step_in_epoch, epoch)
     if args.save_state_to_huggingface:
         logger.info("uploading state to huggingface.")
         huggingface_utils.upload(args, state_dir, "/" + STEP_STATE_NAME.format(model_name, step_no))
@@ -178,7 +237,13 @@ def save_and_remove_state_stepwise(args: argparse.Namespace, accelerator: accele
                 shutil.rmtree(state_dir_old)
 
 
-def save_state_on_train_end(args: argparse.Namespace, accelerator: accelerate.Accelerator):
+def save_state_on_train_end(
+    args: argparse.Namespace,
+    accelerator: accelerate.Accelerator,
+    global_step: int = 0,
+    epoch: int = 0,
+    step_in_epoch: int = 0,
+):
     model_name = args.output_name
 
     logger.info("")
@@ -187,6 +252,7 @@ def save_state_on_train_end(args: argparse.Namespace, accelerator: accelerate.Ac
 
     state_dir = os.path.join(args.output_dir, LAST_STATE_NAME.format(model_name))
     accelerator.save_state(state_dir)
+    save_resume_metadata(state_dir, global_step, step_in_epoch, epoch)
 
     if args.save_state_to_huggingface:
         logger.info("uploading last state to huggingface.")

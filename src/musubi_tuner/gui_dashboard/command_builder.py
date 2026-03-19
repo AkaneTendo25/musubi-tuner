@@ -556,6 +556,14 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
         cmd += ["--log_cuda_memory_every_n_steps", str(t.log_cuda_memory_every_n_steps)]
     if t.resume:
         cmd += ["--resume", t.resume]
+    if t.autoresume:
+        cmd.append("--autoresume")
+    if t.reset_optimizer:
+        cmd.append("--reset_optimizer")
+    if t.reset_optimizer_params:
+        cmd.append("--reset_optimizer_params")
+    if t.reset_dataloader:
+        cmd.append("--reset_dataloader")
     if t.training_comment:
         cmd += ["--training_comment", t.training_comment]
     if t.loss_type != "mse":

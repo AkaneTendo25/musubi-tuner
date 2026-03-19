@@ -277,6 +277,10 @@ class TrainingConfig(BaseModel):
     wandb_api_key: str = ""
     log_cuda_memory_every_n_steps: Optional[int] = None
     resume: str = ""
+    autoresume: bool = False
+    reset_optimizer: bool = False
+    reset_optimizer_params: bool = False
+    reset_dataloader: bool = False
     training_comment: str = ""
     loss_type: Literal["mse", "mae", "l1", "huber", "smooth_l1"] = "mse"
     huber_delta: float = 1.0

@@ -273,6 +273,14 @@
 						</div>
 						<PathInput label="Resume From" value={t.resume || ''} oninput={(e) => update('resume', e.target.value)} showFiles tooltip="Resume training from saved state" />
 						<div class="grid grid-cols-2 gap-2">
+							<FormToggle label="Auto-resume" checked={t.autoresume ?? false} onchange={(e) => update('autoresume', e.target.checked)} tooltip="Auto-resume from latest state in output_dir" />
+							<FormToggle label="Reset Dataloader" checked={t.reset_dataloader ?? false} onchange={(e) => update('reset_dataloader', e.target.checked)} tooltip="Skip mid-epoch resume, restart epoch from beginning" />
+						</div>
+						<div class="grid grid-cols-2 gap-2">
+							<FormToggle label="Reset Optimizer" checked={t.reset_optimizer ?? false} onchange={(e) => update('reset_optimizer', e.target.checked)} tooltip="Clear optimizer momentum/variance on resume" />
+							<FormToggle label="Reset Optim Params" checked={t.reset_optimizer_params ?? false} onchange={(e) => update('reset_optimizer_params', e.target.checked)} tooltip="Reset lr/weight_decay to CLI values on resume" />
+						</div>
+						<div class="grid grid-cols-2 gap-2">
 							<FormSelect label="Logger" value={t.log_with || ''} options={[{value:'',label:'None'},{value:'tensorboard',label:'TensorBoard'},{value:'wandb',label:'W&B'}]} onchange={(e) => update('log_with', e.target.value || null)} tooltip="Logging integration" />
 							<PathInput label="Log Dir" value={t.logging_dir || ''} oninput={(e) => update('logging_dir', e.target.value)} disabled={!t.log_with} tooltip="Log directory" />
 						</div>

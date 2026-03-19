@@ -949,11 +949,13 @@ class NetworkTrainer:
     def resume_from_local_or_hf_if_specified(self, accelerator: Accelerator, args: argparse.Namespace) -> int:
         """Resume training state. Returns the recovered global_step (0 if not resuming)."""
         if not args.resume:
+            self._resume_state_dir = None
             return 0
 
         if not args.resume_from_huggingface:
             logger.info(f"resume training from local state: {args.resume}")
             accelerator.load_state(args.resume)
+            self._resume_state_dir = args.resume
             return self._recover_global_step(args.resume)
 
         logger.info(f"resume training from huggingface state: {args.resume}")
@@ -998,12 +1000,22 @@ class NetworkTrainer:
             )
         dirname = os.path.dirname(results[0])
         accelerator.load_state(dirname)
+        self._resume_state_dir = dirname
 
         return self._recover_global_step(dirname)
 
     @staticmethod
     def _recover_global_step(state_dir: str) -> int:
-        """Read global_step from the LR scheduler state saved by accelerate."""
+        """Read global_step from resume metadata or LR scheduler state."""
+        # prefer resume_metadata.json (new format) over scheduler.bin hack
+        # only trust metadata with global_step > 0 (callers using default params write 0)
+        metadata = train_utils.load_resume_metadata(state_dir)
+        if metadata is not None and metadata.get("global_step", 0) > 0:
+            global_step = int(metadata["global_step"])
+            logger.info(f"recovered global_step={global_step} from resume_metadata.json")
+            return global_step
+
+        # fallback to scheduler.bin for old checkpoints
         scheduler_path = os.path.join(state_dir, "scheduler.bin")
         try:
             scheduler_state = torch.load(scheduler_path, map_location="cpu", weights_only=True)
@@ -1037,17 +1049,22 @@ class NetworkTrainer:
             if not os.path.exists(scheduler_path):
                 continue
 
-            # Fast path: parse step number from step-based directory names
-            step_match = re.search(r"-step(\d+)-state$", entry)
-            if step_match:
-                step = int(step_match.group(1))
+            # Try resume_metadata.json first (new format, only trust non-zero global_step)
+            metadata = train_utils.load_resume_metadata(full_path)
+            if metadata is not None and metadata.get("global_step", 0) > 0:
+                step = int(metadata["global_step"])
             else:
-                # Epoch-based or final state: read scheduler.bin for actual global_step
-                try:
-                    scheduler_state = torch.load(scheduler_path, map_location="cpu", weights_only=True)
-                    step = int(scheduler_state["last_epoch"])
-                except Exception:
-                    continue
+                # Fast path: parse step number from step-based directory names
+                step_match = re.search(r"-step(\d+)-state$", entry)
+                if step_match:
+                    step = int(step_match.group(1))
+                else:
+                    # Epoch-based or final state: read scheduler.bin for actual global_step
+                    try:
+                        scheduler_state = torch.load(scheduler_path, map_location="cpu", weights_only=True)
+                        step = int(scheduler_state["last_epoch"])
+                    except Exception:
+                        continue
 
             if step > best_step:
                 best_step = step
@@ -2607,8 +2624,64 @@ class NetworkTrainer:
                 logger.info("autoresume: no saved state found in output_dir, starting from scratch")
 
         # resume from local or huggingface — must be after num_update_steps_per_epoch is known
+
+        # save param_groups before resume so we can restore them if --reset_optimizer_params
+        inner_optimizer = optimizer.optimizer if hasattr(optimizer, "optimizer") else optimizer
+        if getattr(args, "reset_optimizer_params", False):
+            saved_param_groups = [{k: v for k, v in pg.items() if k != "params"} for pg in inner_optimizer.param_groups]
+
+        # load resume metadata (for mid-epoch skip) before accelerator.load_state
+        resume_metadata = None
+        if args.resume:
+            resume_metadata = train_utils.load_resume_metadata(args.resume)
+
         initial_global_step = self.resume_from_local_or_hf_if_specified(accelerator, args)
-        epoch_to_start = initial_global_step // num_update_steps_per_epoch if initial_global_step > 0 else 0
+
+        # apply optimizer/scheduler resets after resume
+        if initial_global_step > 0:
+            if getattr(args, "reset_optimizer", False):
+                inner_optimizer.state.clear()
+                accelerator.print("reset optimizer state (cleared momentum/variance)")
+
+            if getattr(args, "reset_optimizer_params", False):
+                for pg, saved in zip(inner_optimizer.param_groups, saved_param_groups):
+                    for k, v in saved.items():
+                        pg[k] = v
+                accelerator.print("reset optimizer param groups to CLI values")
+
+            if getattr(args, "reset_optimizer", False) or getattr(args, "reset_optimizer_params", False):
+                # reset lr to base value so the new scheduler starts from the correct base
+                # (scheduler __init__ uses current group['lr'], not initial_lr)
+                for pg in inner_optimizer.param_groups:
+                    if "initial_lr" in pg:
+                        pg["lr"] = pg["initial_lr"]
+                        del pg["initial_lr"]
+                new_inner_scheduler = self.get_lr_scheduler(args, inner_optimizer, accelerator.num_processes)
+                # scheduler restarts from step 0 (fresh warmup/decay)
+                # resume_metadata.json tracks the real global_step for checkpoint recovery
+                # replace the inner scheduler while keeping the AcceleratedScheduler wrapper
+                # (the wrapper gates stepping on sync_gradients for gradient accumulation)
+                if hasattr(lr_scheduler, "scheduler"):
+                    lr_scheduler.scheduler = new_inner_scheduler
+                else:
+                    lr_scheduler = new_inner_scheduler
+                accelerator.print("recreated LR scheduler (restarting schedule from step 0)")
+
+        # calculate epoch and mid-epoch skip
+        steps_to_skip_in_epoch = 0
+        if initial_global_step > 0 and resume_metadata is not None and resume_metadata.get("global_step", 0) > 0:
+            saved_epoch = resume_metadata.get("epoch", 1)
+            step_in_epoch = resume_metadata.get("step_in_epoch", 0)
+            if step_in_epoch > 0:
+                # mid-epoch checkpoint: resume in the same epoch, skip processed batches
+                epoch_to_start = max(saved_epoch - 1, 0)
+                if not getattr(args, "reset_dataloader", False):
+                    steps_to_skip_in_epoch = step_in_epoch
+            else:
+                # epoch-end checkpoint: epoch is complete, start from next
+                epoch_to_start = saved_epoch
+        else:
+            epoch_to_start = initial_global_step // num_update_steps_per_epoch if initial_global_step > 0 else 0
 
         # 学習する
         # total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
@@ -2624,7 +2697,10 @@ class NetworkTrainer:
         accelerator.print(f"  gradient accumulation steps / 勾配を合計するステップ数 = {args.gradient_accumulation_steps}")
         accelerator.print(f"  total optimization steps / 学習ステップ数: {args.max_train_steps}")
         if initial_global_step > 0:
-            accelerator.print(f"  resuming from step {initial_global_step}, epoch {epoch_to_start + 1}/{num_train_epochs}")
+            msg = f"  resuming from step {initial_global_step}, epoch {epoch_to_start + 1}/{num_train_epochs}"
+            if steps_to_skip_in_epoch > 0:
+                msg += f", skipping {steps_to_skip_in_epoch} batches in epoch"
+            accelerator.print(msg)
 
         # TODO refactor metadata creation and move to util
         metadata = {
@@ -2742,6 +2818,11 @@ class NetworkTrainer:
         noise_scheduler = FlowMatchDiscreteScheduler(shift=args.discrete_flow_shift, reverse=True, solver="euler")
 
         loss_recorder = train_utils.LossRecorder()
+        if initial_global_step > 0 and getattr(self, "_resume_state_dir", None):
+            _meta = train_utils.load_resume_metadata(self._resume_state_dir)
+            if _meta and "loss_avg" in _meta:
+                loss_recorder.prefill(_meta["loss_avg"], _meta.get("loss_count", 0))
+                accelerator.print(f"  restored loss average: {_meta['loss_avg']:.4f} (from {_meta.get('loss_count', 0)} steps)")
         if train_audio_sampler is None:
             del train_dataset_group
 
@@ -3063,6 +3144,11 @@ class NetworkTrainer:
             accelerator.unwrap_model(network).on_epoch_start(transformer)
 
             for step, batch in enumerate(train_dataloader):
+                # mid-epoch resume: skip batches already processed before checkpoint
+                if steps_to_skip_in_epoch > 0:
+                    steps_to_skip_in_epoch -= 1
+                    continue
+
                 _step_start_time = time.perf_counter()
                 # VRAM spike tracing for first iteration
                 _is_first_step = (epoch == epoch_to_start and step == 0)
@@ -3437,7 +3523,17 @@ class NetworkTrainer:
                                     gui_metrics.log_event("checkpoint", global_step)
 
                                 if args.save_state:
-                                    train_utils.save_and_remove_state_stepwise(args, accelerator, global_step)
+                                    train_utils.save_and_remove_state_stepwise(
+                                        args, accelerator, global_step, epoch=epoch + 1, step_in_epoch=step + 1
+                                    )
+                                    _state_dir = os.path.join(
+                                        args.output_dir,
+                                        train_utils.STEP_STATE_NAME.format(args.output_name, global_step),
+                                    )
+                                    train_utils.update_resume_metadata(_state_dir, {
+                                        "loss_avg": loss_recorder.moving_average,
+                                        "loss_count": len(loss_recorder.loss_list),
+                                    })
 
                                 remove_step_no = train_utils.get_remove_step_no(args, global_step)
                                 if remove_step_no is not None:
@@ -3514,6 +3610,9 @@ class NetworkTrainer:
                 if global_step >= args.max_train_steps:
                     break
 
+            # ensure skip counter doesn't carry into next epoch (e.g. if dataset shrunk)
+            steps_to_skip_in_epoch = 0
+
             if len(accelerator.trackers) > 0:
                 logs = {"loss/epoch": loss_recorder.moving_average}
                 accelerator.log(logs, step=epoch + 1)
@@ -3541,7 +3640,17 @@ class NetworkTrainer:
                         remove_model(remove_ckpt_name)
 
                     if args.save_state:
-                        train_utils.save_and_remove_state_on_epoch_end(args, accelerator, epoch + 1)
+                        train_utils.save_and_remove_state_on_epoch_end(
+                            args, accelerator, epoch + 1, global_step=global_step, step_in_epoch=0
+                        )
+                        _state_dir = os.path.join(
+                            args.output_dir,
+                            train_utils.EPOCH_STATE_NAME.format(args.output_name, epoch + 1),
+                        )
+                        train_utils.update_resume_metadata(_state_dir, {
+                            "loss_avg": loss_recorder.moving_average,
+                            "loss_count": len(loss_recorder.loss_list),
+                        })
 
             self.sample_images(accelerator, args, epoch + 1, global_step, vae, transformer, sample_parameters, dit_dtype)
             set_trainer_train_mode()
@@ -3562,7 +3671,15 @@ class NetworkTrainer:
         set_trainer_eval_mode()
 
         if is_main_process and (args.save_state or args.save_state_on_train_end):
-            train_utils.save_state_on_train_end(args, accelerator)
+            train_utils.save_state_on_train_end(args, accelerator, global_step=global_step, epoch=num_train_epochs)
+            _state_dir = os.path.join(
+                args.output_dir,
+                train_utils.LAST_STATE_NAME.format(args.output_name),
+            )
+            train_utils.update_resume_metadata(_state_dir, {
+                "loss_avg": loss_recorder.moving_average,
+                "loss_count": len(loss_recorder.loss_list),
+            })
 
         if is_main_process:
             ckpt_name = train_utils.get_last_ckpt_name(args.output_name)
@@ -4158,6 +4275,21 @@ def setup_parser_common() -> argparse.ArgumentParser:
         action="store_true",
         help="automatically resume from the latest saved state in output_dir (ignored if --resume is specified)"
         " / output_dir内の最新のstateから自動的に学習を再開する（--resumeが指定されている場合は無視される）",
+    )
+    parser.add_argument(
+        "--reset_optimizer",
+        action="store_true",
+        help="clear optimizer state (momentum/variance) when resuming, keeping only model weights",
+    )
+    parser.add_argument(
+        "--reset_optimizer_params",
+        action="store_true",
+        help="reset optimizer param groups (lr, weight_decay, etc.) to CLI values when resuming, keeping momentum/variance",
+    )
+    parser.add_argument(
+        "--reset_dataloader",
+        action="store_true",
+        help="skip mid-epoch dataloader resume and restart from the beginning of the epoch",
     )
 
     parser.add_argument(
