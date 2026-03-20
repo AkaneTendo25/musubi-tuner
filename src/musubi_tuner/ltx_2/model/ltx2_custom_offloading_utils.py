@@ -625,72 +625,78 @@ class Offloader:
                 with torch.cuda.stream(self.stream):
                     # Create pinned buffer as pinned memory (as shared GPU ram). We specify device for correct pinning on multi-GPU systems
                     self.pinned_buffer = [
-                        torch.empty_like(cuda_data_view, device="cpu").pin_memory(device=device)
+                        torch.empty_like(cuda_data_view, device="cpu").pin_memory()
                         for _, _, cuda_data_view, _, _ in weight_swap_jobs
                     ]
                 self.stream.synchronize()
                 if not _FIRST_SWAP_TRACED:
                     _trace_first_swap_vram("AFTER pinned buffer creation")
                     _FIRST_SWAP_TRACED = True
-            released_pinned_buffer = []
 
-            events = [torch.cuda.Event() for _ in weight_swap_jobs]  # Waiting events for GPU to CPU non-blocking copy
+            # Nothing to swap (e.g. modules without Linear layers).
+            # Keep existing buffers untouched and return no sync event.
+            if not weight_swap_jobs:
+                sync_event = None
+            else:
+                released_pinned_buffer = []
 
-            def _copy_weights_to_cpu():
-                for event, module_pin_buf, (parent_to_cpu, parent_to_cuda, cuda_data_view, cpu_data_view, attr_name) in zip(
-                    events, self.pinned_buffer, weight_swap_jobs
+                events = [torch.cuda.Event() for _ in weight_swap_jobs]  # Waiting events for GPU to CPU non-blocking copy
+
+                def _copy_weights_to_cpu():
+                    for event, module_pin_buf, (parent_to_cpu, parent_to_cuda, cuda_data_view, cpu_data_view, attr_name) in zip(
+                        events, self.pinned_buffer, weight_swap_jobs
+                    ):
+                        # CUDA to CPU, non-blocking copy
+                        with torch.cuda.stream(self.stream):
+                            with T.section("cuda to cpu"):
+                                module_pin_buf.copy_(cuda_data_view, non_blocking=True)
+                                event.record(self.stream)
+
+                # Copy weights to CPU (retry once if pinned buffer shape mismatch slips through)
+                try:
+                    _copy_weights_to_cpu()
+                except RuntimeError as e:
+                    if "must match the size of tensor" in str(e):
+                        with torch.cuda.stream(self.stream):
+                            self.pinned_buffer = [
+                                torch.empty_like(cuda_data_view, device="cpu").pin_memory()
+                                for _, _, cuda_data_view, _, _ in weight_swap_jobs
+                            ]
+                        self.stream.synchronize()
+                        _copy_weights_to_cpu()
+                    else:
+                        raise
+
+                # CPU to CUDA
+                for event, (parent_to_cpu, parent_to_cuda, cuda_data_view, cpu_data_view, attr_name) in zip(events, weight_swap_jobs):
+                    with torch.cuda.stream(self.stream):
+                        # Wait for cuda_data_view to be ready
+                        with T.section("wait cpu"):
+                            self.stream.wait_event(event)
+
+                        # CPU to CUDA, non-blocking copy
+                        with T.section("cpu to cuda"):
+                            cuda_data_view.copy_(cpu_data_view, non_blocking=True)
+
+                # Update references
+                for module_pin_buf, (parent_to_cpu, parent_to_cuda, cuda_data_view, cpu_data_view, attr_name) in zip(
+                    self.pinned_buffer, weight_swap_jobs
                 ):
-                    # CUDA to CPU, non-blocking copy
-                    with torch.cuda.stream(self.stream):
-                        with T.section("cuda to cpu"):
-                            module_pin_buf.copy_(cuda_data_view, non_blocking=True)
-                            event.record(self.stream)
+                    getattr(parent_to_cuda, attr_name).data = cuda_data_view
+                    getattr(parent_to_cpu, attr_name).data = module_pin_buf
+                    released_pinned_buffer.append(cpu_data_view)  # CPU data view can be reused as pinned buffer
 
-            # Copy weights to CPU (retry once if pinned buffer shape mismatch slips through)
-            try:
-                _copy_weights_to_cpu()
-            except RuntimeError as e:
-                if "must match the size of tensor" in str(e):
+                # Reuse released pinned buffers
+                if not released_pinned_buffer[0].is_pinned():
+                    # In first time, we need to create pinned buffers because offloaded weights are not pinned yet
                     with torch.cuda.stream(self.stream):
-                        self.pinned_buffer = [
-                            torch.empty_like(cuda_data_view, device="cpu").pin_memory(device=device)
+                        released_pinned_buffer = [
+                            torch.empty_like(cuda_data_view, device="cpu").pin_memory()
                             for _, _, cuda_data_view, _, _ in weight_swap_jobs
                         ]
-                    self.stream.synchronize()
-                    _copy_weights_to_cpu()
-                else:
-                    raise
+                self.pinned_buffer = released_pinned_buffer
 
-            # CPU to CUDA
-            for event, (parent_to_cpu, parent_to_cuda, cuda_data_view, cpu_data_view, attr_name) in zip(events, weight_swap_jobs):
-                with torch.cuda.stream(self.stream):
-                    # Wait for cuda_data_view to be ready
-                    with T.section("wait cpu"):
-                        self.stream.wait_event(event)
-
-                    # CPU to CUDA, non-blocking copy
-                    with T.section("cpu to cuda"):
-                        cuda_data_view.copy_(cpu_data_view, non_blocking=True)
-
-            # Update references
-            for module_pin_buf, (parent_to_cpu, parent_to_cuda, cuda_data_view, cpu_data_view, attr_name) in zip(
-                self.pinned_buffer, weight_swap_jobs
-            ):
-                getattr(parent_to_cuda, attr_name).data = cuda_data_view
-                getattr(parent_to_cpu, attr_name).data = module_pin_buf
-                released_pinned_buffer.append(cpu_data_view)  # CPU data view can be reused as pinned buffer
-
-            # Reuse released pinned buffers
-            if not released_pinned_buffer[0].is_pinned():
-                # In first time, we need to create pinned buffers because offloaded weights are not pinned yet
-                with torch.cuda.stream(self.stream):
-                    released_pinned_buffer = [
-                        torch.empty_like(cuda_data_view, device="cpu").pin_memory(device=device)
-                        for _, _, cuda_data_view, _, _ in weight_swap_jobs
-                    ]
-            self.pinned_buffer = released_pinned_buffer
-
-            sync_event = self.stream.record_event()
+                sync_event = self.stream.record_event()
 
         if debug_print:
             print(f"[{self.block_type}] Weight swap timing at {self.debug_block_count - 1}:")

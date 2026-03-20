@@ -79,6 +79,8 @@ Caching scripts (`ltx2_cache_latents.py`, `ltx2_cache_text_encoder_outputs.py`) 
 
 ## Installation
 
+The base installation procedure is the same as upstream musubi-tuner — follow the [Installation guide](../README.md#installation) (`pip install -e .` in a virtual environment). The sections below cover LTX-2-specific requirements (CUDA version, model downloads) that go on top of the base install.
+
 Unless otherwise noted, command examples in this LTX-2 guide were tested on Windows 11. They should also work on Linux, but you may need small shell/path adjustments.
 
 For a Windows-focused community setup example for this fork (tested environment and install helpers), see [Discussion #19: Windows OS installation/usage helpers](https://github.com/AkaneTendo25/musubi-tuner/discussions/19).
@@ -351,7 +353,7 @@ musubi-tuner supports advanced LoRA algorithms (LoKR, LoHA, LoCoN, etc.) via:
 - `--network_args` for inline `key=value` settings
 - `--lycoris_config <path.toml>` for TOML-based settings
 
-See the [LyCORIS algorithm list](https://github.com/KohakuBlueleaf/LyCORIS/blob/main/docs/Algo-List.md) and [guidelines](https://github.com/KohakuBlueleaf/LyCORIS/blob/main/docs/Guidelines.md) for algorithm details and recommended settings.
+See the [LyCORIS algorithm list](https://github.com/KohakuBlueleaf/LyCORIS/blob/main/docs/Algo-List.md) and [guidelines](https://github.com/KohakuBlueleaf/LyCORIS/blob/main/docs/Guidelines.md) for algorithm details and recommended settings. You can also refer to the local [LoHa/LoKr documentation](./loha_lokr.md).
 
 No bundled example TOML files are shipped; provide your own config path.
 
@@ -400,9 +402,11 @@ accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 ltx2_tr
 
 ### Training Arguments
 
-All training arguments can be placed in a `.toml` config file instead of on the command line via `--config_file config.toml`. See the upstream [configuration files guide](https://github.com/kohya-ss/musubi-tuner/blob/main/docs/advanced_config.md#using-configuration-files-to-specify-training-options--設定ファイルを使用した学習オプションの指定) for format details.
+All training arguments can be placed in a `.toml` config file instead of on the command line via `--config_file config.toml`. See the [configuration files guide](./advanced_config.md#using-configuration-files-to-specify-training-options) for format details.
 
 #### Memory Optimization
+
+For additional training and inference speedups, see the [torch.compile Support](./torch_compile.md) documentation.
 
 ##### Quantization Options
 
@@ -441,7 +445,7 @@ NF4 has ~4x higher weight error than FP8 (cosine 0.996 vs 0.9997). The base mode
 
 #### Aggressive VRAM Optimization (8-16GB GPUs)
 
-For maximum VRAM savings on 8-16GB GPUs, use this combination of flags:
+For maximum VRAM savings on 8-16GB GPUs, use this combination of flags. See also the [Advanced Configuration guide](./advanced_config.md) for optimizer options (`--optimizer_type`, `--lr_scheduler`, Schedule-Free optimizer, etc.):
 
 ```bash
 accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 ltx2_train_network.py ^
@@ -674,7 +678,7 @@ Result:
 - Other `audio_*` modules (e.g. `audio_ff`) → 1e-5 (`--audio_lr`)
 - Video modules → 1e-4 (`--learning_rate`)
 
-Works with LoRA+ (`loraplus_lr_ratio`): the up/down split applies within each LR group. Both flags default to `None` and are fully backward-compatible. See [LoRA+ in the upstream advanced configuration guide](https://github.com/kohya-ss/musubi-tuner/blob/main/docs/advanced_config.md#lora) for setup details.
+Works with LoRA+ (`loraplus_lr_ratio`): the up/down split applies within each LR group. Both flags default to `None` and are fully backward-compatible. See [LoRA+ in the advanced configuration guide](./advanced_config.md#lora) for setup details.
 
 #### Preservation & Regularization
 
@@ -878,6 +882,9 @@ accelerate launch ... ltx2_train_network.py ^
 - Logged metrics: `loss/self_flow`, `self_flow/cosine`, `self_flow/frame_cosine`, `self_flow/delta_cosine`, `self_flow/lambda_self_flow`, `self_flow/lambda_temporal`, `self_flow/lambda_delta`, `self_flow/masked_token_ratio`, `self_flow/tau_mean`, `self_flow/tau_min_mean`.
 
 #### Timestep Sampling
+
+See also the [timestep bucketing documentation](./advanced_config.md#timestep-buckets) for advanced timestep bucketing options.
+
 - `--timestep_sampling shifted_logit_normal`: Default LTX-2 method. Uses a shifted logit-normal distribution where the shift is computed based on sequence length (frames × height × width).
 - `--timestep_sampling uniform`: Uniform sampling from [0, 1].
 - `--logit_std`: Standard deviation for the logit-normal distribution (default: 1.0). Only used with `shifted_logit_normal`.
@@ -894,7 +901,8 @@ accelerate launch ... ltx2_train_network.py ^
 > In `--ltx2_mode audio`, `shifted_logit_normal` still needs a sequence length to compute the shift, but there is no real video spatial dimension. Using full video resolution would inflate the sequence length and skew the shift upward. Instead, `--audio_only_sequence_resolution` (default `64`) provides a small fixed spatial footprint (4 tokens/frame), keeping the shift dominated by the temporal dimension (audio duration/FPS) which actually matters.
 
 #### LoRA Targets
-Use `--lora_target_preset` to control which layers LoRA targets:
+
+Use `--lora_target_preset` to control which layers LoRA targets. For custom layer patterns and `--network_args` format, see the [LoRA documentation](./advanced_config.md#lora):
 
 | Preset | Layers | Use Case |
 |--------|--------|----------|
@@ -1232,7 +1240,7 @@ Reference audio latents are precached automatically when using `--precache_sampl
 
 #### Sampling with Tiled VAE
 
-The prompt file format (`--sample_prompts`) — including guidance scale, negative prompt, and per-prompt inference parameters — is documented in the upstream [Sampling During Training guide](https://github.com/kohya-ss/musubi-tuner/blob/main/docs/sampling_during_training.md). LTX-2 extends this with `--v <path>` (IC-LoRA reference) and `--ra <path>` (audio-reference IC-LoRA) prompt prefixes.
+The prompt file format (`--sample_prompts`) — including guidance scale, negative prompt, and per-prompt inference parameters — is documented in the [Sampling During Training guide](./sampling_during_training.md). LTX-2 extends this with `--v <path>` (IC-LoRA reference) and `--ra <path>` (audio-reference IC-LoRA) prompt prefixes.
 
 | Argument | Default | Description |
 |----------|---------|-------------|
@@ -1278,7 +1286,7 @@ For IC-LoRA / V2V training, you can also precache the conditioning image latents
 
 #### Checkpoint Output Format
 
-Saved LoRA checkpoints are converted to ComfyUI format by default. Both the original musubi-tuner format and the ComfyUI format are kept.
+Saved LoRA checkpoints are converted to ComfyUI format by default. Both the original musubi-tuner format and the ComfyUI format are kept. For the standalone conversion utility, see [convert_lora.py](./tools.md) in the tools documentation.
 
 | Flag | Behavior |
 |------|----------|
@@ -1293,7 +1301,7 @@ Checkpoint rotation (`--save_last_n_epochs`) cleans up old ComfyUI checkpoints a
 
 #### Resuming Training
 
-Requires `--save_state` to be enabled. State directories contain optimizer, scheduler, and RNG states.
+Requires `--save_state` to be enabled. State directories contain optimizer, scheduler, and RNG states. See the [Advanced Configuration guide](./advanced_config.md) for general `--save_state` / `--resume` behavior shared across all architectures.
 
 | Flag | Description |
 |------|-------------|
@@ -1342,7 +1350,7 @@ python ltx2_merge_lora.py ^
 
 ## Dataset Configuration
 
-The dataset config is a TOML file with `[general]` defaults and `[[datasets]]` entries. Common options shared across all musubi-tuner architectures — including `frame_extraction` modes, JSONL metadata format, control image support, and resolution bucketing — are documented in the upstream [Dataset Configuration guide](https://github.com/kohya-ss/musubi-tuner/blob/main/docs/dataset_config.md). The options below are LTX-2-specific or supplement upstream defaults.
+The dataset config is a TOML file with `[general]` defaults and `[[datasets]]` entries. Common options shared across all musubi-tuner architectures — including `frame_extraction` modes, JSONL metadata format, control image support, and resolution bucketing — are documented in the [Dataset Configuration guide](./dataset_config.md). The options below are LTX-2-specific or supplement upstream defaults.
 
 ### Video Dataset Options
 
@@ -1465,6 +1473,9 @@ If you see **no** "Resampling" line for a video, it means source and target FPS 
 ---
 
 ## Validation Datasets
+
+> [!NOTE]
+> Validation datasets are a fork extension — they are not available in upstream musubi-tuner.
 
 You can configure a separate validation dataset to track validation loss (`val_loss`) during training. This helps detect overfitting and compare training runs. Validation datasets use **exactly the same schema** as training datasets — any format that works for `[[datasets]]` works for `[[validation_datasets]]`.
 
@@ -1636,6 +1647,8 @@ Alternative: `--audio_loss_balance_mode ema_mag` matches audio loss magnitude to
 - **Float32 AdaLN**: The transformer applies Adaptive Layer Norm (AdaLN) shift/scale operations in float32, then casts back to the working dtype. This prevents overflow that can occur when bf16 scale values multiply bf16 hidden states. The fix is always active and requires no flags.
 - **Loss dtype**: The LTX-2 training path computes the task loss (MSE, L1, Huber) in `trainer.dit_dtype` (typically bf16 with `--mixed_precision bf16`). Internal regularization losses (motion preservation, CREPA, Self-Flow) always use MSE and are unaffected by `--loss_type`.
 
+For additional troubleshooting resources, see the [official LTX-2 documentation hub](https://docs.ltx.video/open-source-model/getting-started/overview), the [Banodoco Discord](https://discord.gg/banodoco) community, and the [awesome-ltx2](https://github.com/wildminder/awesome-ltx2) curated resource list.
+
 ---
 
 ## 4. Slider LoRA Training
@@ -1800,12 +1813,14 @@ Note: `--gemma_root` is not needed for reference mode (text embeddings are loade
 
 ## References
 
-**Upstream musubi-tuner Documentation**
-- [Dataset Configuration](https://github.com/kohya-ss/musubi-tuner/blob/main/docs/dataset_config.md) — TOML format, `frame_extraction` modes, JSONL metadata, control images, resolution bucketing
-- [Sampling During Training](https://github.com/kohya-ss/musubi-tuner/blob/main/docs/sampling_during_training.md) — Prompt file format, per-prompt guidance scale, negative prompts, sampling CLI flags
-- [Advanced Configuration](https://github.com/kohya-ss/musubi-tuner/blob/main/docs/advanced_config.md) — `--config_file` TOML training configuration, `--network_args` format, LoRA+, TensorBoard/WandB logging, PyTorch Dynamo, timestep bucketing, Schedule-Free optimizer
+**Musubi Tuner Documentation**
+- [Dataset Configuration](./dataset_config.md) — TOML format, `frame_extraction` modes, JSONL metadata, control images, resolution bucketing
+- [Sampling During Training](./sampling_during_training.md) — Prompt file format, per-prompt guidance scale, negative prompts, sampling CLI flags
+- [Advanced Configuration](./advanced_config.md) — `--config_file` TOML training configuration, `--network_args` format, LoRA+, TensorBoard/WandB logging, PyTorch Dynamo, timestep bucketing, Schedule-Free optimizer
+- [Tools](./tools.md) — Post-hoc EMA LoRA merging, image captioning with Qwen2.5-VL
+- [LoHa/LoKr](./loha_lokr.md) — Alternative parameter-efficient fine-tuning methods
+- [torch.compile](./torch_compile.md) — PyTorch JIT compilation for faster training and inference
 - [LyCORIS Algorithm List](https://github.com/KohakuBlueleaf/LyCORIS/blob/main/docs/Algo-List.md) and [Guidelines](https://github.com/KohakuBlueleaf/LyCORIS/blob/main/docs/Guidelines.md) — LoKR, LoHA, LoCoN and other algorithm details (used via `pip install lycoris-lora`)
-- [Tools](https://github.com/kohya-ss/musubi-tuner/blob/main/docs/tools.md) — Post-hoc EMA LoRA merging, image captioning with Qwen2.5-VL
 
 **Research**
 - [ID-LoRA](https://github.com/ID-LoRA/ID-LoRA) — In-context identity LoRA; the audio-reference IC-LoRA implementation in this trainer is based on this approach
