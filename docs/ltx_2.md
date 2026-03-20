@@ -804,7 +804,7 @@ The cache file is saved to `<cache_directory>/ltx2_preservation_cache.pt` by def
 
 **Self-Flow** prevents the fine-tuned model from drifting away from the pretrained model's internal representations. It aligns student features (shallower block) against teacher features (deeper block) using cosine similarity, with dual-timestep noising to create a meaningful student-teacher gap. The default `teacher_mode=base` uses the **frozen pretrained model** as teacher by zeroing LoRA multipliers for the teacher forward pass — no extra VRAM overhead compared to EMA. An EMA-based teacher (`teacher_mode=ema`) is also available for LoRA-aware distillation. The optional **temporal extension** adds frame-neighbor and motion-delta losses that explicitly preserve temporal coherence. Based on [arXiv 2603.06507](https://arxiv.org/abs/2603.06507).
 
-Enable with `--self_flow`. All parameters are passed via `--self_flow_args` as `key=value` pairs:
+Enable with `--self_flow`. Supported in `--ltx2_mode video` and `--ltx2_mode av` (video branch only in AV mode). All parameters are passed via `--self_flow_args` as `key=value` pairs:
 
 ```bash
 # Recommended default: base-model teacher, token-level alignment only
@@ -867,7 +867,8 @@ accelerate launch ... ltx2_train_network.py ^
 
 ##### Notes
 
-- Supported mode: `--ltx2_mode video` only.
+- Supported modes: `--ltx2_mode video`, `--ltx2_mode av` (video branch only in AV mode).
+- Image-like training is supported through single-frame samples in `--ltx2_mode video` (set `temporal_mode=off` unless you intentionally want temporal terms to be inactive on image batches).
 - Cost: one extra teacher forward pass per train step. `teacher_mode=base` requires no extra VRAM since it reuses the existing model with LoRA multipliers zeroed.
 - Teacher modes: `base` gives the largest student-teacher gap (pretrained vs LoRA-finetuned); `ema` / `partial_ema` give a moving target that shrinks as training converges.
 - Temporal extension: when `temporal_mode != off`, Self-Flow reshapes hidden states into latent frames and adds frame-neighbor and/or frame-delta consistency losses on top of the base token alignment loss.

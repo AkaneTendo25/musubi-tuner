@@ -1068,8 +1068,8 @@ class LTX2NetworkTrainer(NetworkTrainer):
         if transformer is None:
             logger.warning("Self-Flow enabled but transformer is unavailable — skipping setup")
             return
-        if self._ltx_mode != "video":
-            raise ValueError("--self_flow currently supports only --ltx_mode video")
+        if self._ltx_mode not in {"video", "av"}:
+            raise ValueError("--self_flow currently supports --ltx_mode video or av (video branch only in av)")
 
         from musubi_tuner.self_flow import (
             SelfFlowConfig,
@@ -2002,11 +2002,11 @@ class LTX2NetworkTrainer(NetworkTrainer):
 
         sigmas = _sample_sigmas()
 
-        # Optional Self-Flow dual-timestep noising for video mode.
+        # Optional Self-Flow dual-timestep noising for video and AV modes.
         if (
             self._self_flow_active
             and self._self_flow is not None
-            and self._ltx_mode == "video"
+            and self._ltx_mode in {"video", "av"}
             and bool(getattr(args, "self_flow", False))
             and bool(getattr(self._self_flow.config, "dual_timestep", True))
         ):
@@ -3007,6 +3007,10 @@ class LTX2NetworkTrainer(NetworkTrainer):
 
         sigma = model_timesteps[:, 0]
         audio_model_timesteps = model_timesteps
+        if self._ltx_mode in {"av", "audio"} and model_timesteps.dim() == 2 and model_timesteps.shape[1] > 1:
+            # Self-Flow token-wise video timesteps can have a different token length than audio.
+            # Keep audio timesteps per-sample unless explicitly overridden below.
+            audio_model_timesteps = model_timesteps[:, :1]
         if self._ltx_mode in {"av", "audio"} and bool(getattr(args, "independent_audio_timestep", False)):
             audio_model_timesteps = self._sample_independent_audio_timesteps(
                 args,
@@ -3729,7 +3733,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
             )
             if is_train_step and bool(getattr(args, "self_flow", False)):
                 sf_ctx = self._self_flow_step_context
-                if sf_ctx is not None and isinstance(model_input, torch.Tensor):
+                if sf_ctx is not None:
                     teacher_noisy = sf_ctx.get("teacher_noisy_model_input")
                     teacher_timesteps = sf_ctx.get("teacher_model_timesteps")
                     if isinstance(teacher_noisy, torch.Tensor) and isinstance(teacher_timesteps, torch.Tensor):
@@ -3739,6 +3743,22 @@ class LTX2NetworkTrainer(NetworkTrainer):
                             teacher_noisy_input[video_conditioning_enabled, :, 0:1, :, :] = latents[
                                 video_conditioning_enabled, :, 0:1, :, :
                             ]
+
+                        teacher_model_input_for_self_flow: Any = teacher_noisy_input.to(
+                            device=accelerator.device, dtype=network_dtype
+                        )
+                        teacher_audio_timestep = None
+                        if (
+                            isinstance(model_input, (list, tuple))
+                            and len(model_input) >= 2
+                            and isinstance(model_input[1], torch.Tensor)
+                        ):
+                            teacher_audio_input = model_input[1].to(device=accelerator.device, dtype=network_dtype)
+                            teacher_model_input_for_self_flow = [teacher_model_input_for_self_flow, teacher_audio_input]
+                            if isinstance(audio_timestep_for_model, torch.Tensor):
+                                teacher_audio_timestep = audio_timestep_for_model.to(
+                                    device=accelerator.device, dtype=network_dtype
+                                )
 
                         teacher_timesteps_model = self._normalize_timesteps_for_model(
                             teacher_timesteps.to(device=accelerator.device, dtype=network_dtype)
@@ -3753,8 +3773,9 @@ class LTX2NetworkTrainer(NetworkTrainer):
                                 accelerator=accelerator,
                                 transformer=transformer,
                                 network=network_for_self_flow,
-                                teacher_model_input=teacher_noisy_input.to(device=accelerator.device, dtype=network_dtype),
+                                teacher_model_input=teacher_model_input_for_self_flow,
                                 teacher_timesteps=teacher_timesteps_model,
+                                audio_timestep=teacher_audio_timestep,
                                 text_embeds=text_embeds,
                                 text_mask=text_mask,
                                 frame_rate=frame_rate,
@@ -7034,7 +7055,8 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         "--self_flow",
         action="store_true",
         help="Enable Self-Flow regularization (dual-timestep noising + EMA-teacher feature alignment). "
-             "Currently supported for --ltx_mode video.",
+             "Supported for --ltx_mode video and --ltx_mode av (video branch only in av). "
+             "Single-frame image-like samples are supported via --ltx_mode video.",
     )
     parser.add_argument(
         "--self_flow_args",

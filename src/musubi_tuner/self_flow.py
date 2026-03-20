@@ -498,8 +498,9 @@ class SelfFlowModule:
         accelerator,
         transformer: nn.Module,
         network: nn.Module,
-        teacher_model_input: torch.Tensor,
+        teacher_model_input: Any,
         teacher_timesteps: torch.Tensor,
+        audio_timestep: Optional[torch.Tensor],
         text_embeds: torch.Tensor,
         text_mask: Optional[torch.Tensor],
         frame_rate: int | float,
@@ -528,6 +529,7 @@ class SelfFlowModule:
                     _ = transformer(
                         teacher_model_input,
                         timestep=teacher_timesteps,
+                        audio_timestep=audio_timestep,
                         context=text_embeds,
                         attention_mask=text_mask,
                         frame_rate=frame_rate,
@@ -551,6 +553,7 @@ class SelfFlowModule:
                     _ = transformer(
                         teacher_model_input,
                         timestep=teacher_timesteps,
+                        audio_timestep=audio_timestep,
                         context=text_embeds,
                         attention_mask=text_mask,
                         frame_rate=frame_rate,
