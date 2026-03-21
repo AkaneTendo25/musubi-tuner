@@ -202,6 +202,11 @@ class LTX2Env:
     # recommended=True
     require_gemma_root: bool = True
 
+    # Clamp FFN outputs to prevent bf16 overflow. Value is the clamp bound.
+    # 60000 leaves headroom below bf16 max (~65504). 0 = disabled.
+    # recommended=60000
+    ffn_clamp: float = 60000.0
+
     # Skip no-op attention masks to enable Flash Attention on cross-attn.
     # recommended=False
     skip_noop_attn_mask: bool = False
@@ -338,6 +343,7 @@ def apply_ltx2_tweaks(args) -> None:
     _set_env_bool("LTX2_V2A_DIAG", t.v2a_diag)
     _set_env_bool("LTX2_ALIGN_OUTPUT_DEVICE", t.align_output_device)
     _set_env_bool("LTX2_REQUIRE_GEMMA_ROOT", t.require_gemma_root)
+    os.environ["LTX2_FFN_CLAMP"] = str(t.ffn_clamp)
     _set_env_bool("LTX2_SKIP_NOOP_ATTN_MASK", t.skip_noop_attn_mask)
     os.environ["LTX2_SWAP_PREFETCH_WINDOW"] = str(int(t.swap_prefetch_window))
     _set_env_bool("LTX2_SWAP_SLAB_POOL", t.swap_slab_pool)

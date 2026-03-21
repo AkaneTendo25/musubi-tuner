@@ -472,6 +472,9 @@ class BasicAVTransformerBlock(torch.nn.Module):
         sublayer_diag = os.getenv("LTX2_NAN_SUBLAYER_DIAG", "0") == "1"
         v2a_diag = os.getenv("LTX2_V2A_DIAG", "0") == "1"
         attn_retry_fp32 = os.getenv("LTX2_ATTN_FP32_RETRY", "0") == "1"
+        # Clamp FFN outputs to prevent bf16 overflow (max ~65504).
+        # Default 60000 leaves headroom. Set LTX2_FFN_CLAMP=0 to disable.
+        ffn_clamp = float(os.getenv("LTX2_FFN_CLAMP", "60000"))
         force_pytorch_cross_attn = (
             os.getenv("LTX2_FORCE_PYTORCH_CROSS_ATTN", "0") == "1"
             or getattr(self, "_force_pytorch_cross_attn", False)
@@ -764,7 +767,10 @@ class BasicAVTransformerBlock(torch.nn.Module):
             )
             # AdaLN Structural Fix
             vx_scaled = (rms_norm(vx, eps=self.norm_eps).to(torch.float32) * (1 + vscale_mlp.to(torch.float32)) + vshift_mlp.to(torch.float32)).to(vx.dtype)
-            vx = vx + self.ff(vx_scaled) * vgate_mlp
+            ff_out = self.ff(vx_scaled) * vgate_mlp
+            if ffn_clamp > 0:
+                ff_out = ff_out.clamp(-ffn_clamp, ffn_clamp)
+            vx = vx + ff_out
             _check_finite_local("video_after_ff", vx)
 
             del vshift_mlp, vscale_mlp, vgate_mlp
@@ -776,7 +782,10 @@ class BasicAVTransformerBlock(torch.nn.Module):
             )
             # AdaLN Structural Fix
             ax_scaled = (rms_norm(ax, eps=self.norm_eps).to(torch.float32) * (1 + ascale_mlp.to(torch.float32)) + ashift_mlp.to(torch.float32)).to(ax.dtype)
-            ax = ax + self.audio_ff(ax_scaled) * agate_mlp
+            audio_ff_out = self.audio_ff(ax_scaled) * agate_mlp
+            if ffn_clamp > 0:
+                audio_ff_out = audio_ff_out.clamp(-ffn_clamp, ffn_clamp)
+            ax = ax + audio_ff_out
             _check_finite_local("audio_after_ff", ax)
 
             del ashift_mlp, ascale_mlp, agate_mlp
