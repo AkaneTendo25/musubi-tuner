@@ -2802,6 +2802,8 @@ class NetworkTrainer:
             "ss_lr_args": json.dumps(getattr(args, "lr_args", None)) if getattr(args, "lr_args", None) else None,
             "ss_audio_dim": getattr(args, "audio_dim", None),
             "ss_audio_alpha": getattr(args, "audio_alpha", None),
+            "ss_video_caption_dropout_rate": getattr(args, "video_caption_dropout_rate", 0.0),
+            "ss_audio_caption_dropout_rate": getattr(args, "audio_caption_dropout_rate", 0.0),
         }
 
         datasets_metadata = []

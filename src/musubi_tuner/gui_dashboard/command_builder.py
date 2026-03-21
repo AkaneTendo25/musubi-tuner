@@ -316,6 +316,10 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
         cmd += ["--init_lokr_norm", str(t.init_lokr_norm)]
     if t.caption_dropout_rate > 0:
         cmd += ["--caption_dropout_rate", str(t.caption_dropout_rate)]
+    if t.video_caption_dropout_rate > 0:
+        cmd += ["--video_caption_dropout_rate", str(t.video_caption_dropout_rate)]
+    if t.audio_caption_dropout_rate > 0:
+        cmd += ["--audio_caption_dropout_rate", str(t.audio_caption_dropout_rate)]
     if not t.save_original_lora:
         cmd.append("--no-save_original_lora")
     if t.ic_lora_strategy != "auto":

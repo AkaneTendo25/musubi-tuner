@@ -141,6 +141,8 @@ class TrainingConfig(BaseModel):
     lycoris_quantized_base_check_mode: Literal["off", "warn", "error"] = "warn"
     init_lokr_norm: Optional[float] = None
     caption_dropout_rate: float = 0.0
+    video_caption_dropout_rate: float = 0.0
+    audio_caption_dropout_rate: float = 0.0
     save_original_lora: bool = True
     ic_lora_strategy: Literal["auto", "none", "v2v", "audio_ref_only_ic"] = "auto"
     audio_ref_use_negative_positions: bool = False

@@ -576,7 +576,11 @@ accelerate launch ... ltx2_train_network.py ^
 - `--min_audio_batches_per_accum`: Minimum number of audio-bearing microbatches per gradient accumulation window.
 - `--audio_batch_probability`: Probability of selecting an audio-bearing batch when both audio and non-audio batches are available.
   - `--min_audio_batches_per_accum` and `--audio_batch_probability` are mutually exclusive.
-- `--caption_dropout_rate`: Probability of dropping text conditioning for a sample during training (default: `0.0`, disabled). When triggered, the sample's text embeddings are zeroed out and the attention mask is cleared, training the model to generate without text guidance. This enables classifier-free guidance (CFG) at inference — without it, the model has no unconditional baseline to contrast against.
+- `--caption_dropout_rate`: Probability of dropping ALL text conditioning (video + audio) for a sample during training (default: `0.0`, disabled). When triggered, the sample's text embeddings are zeroed out and the attention mask is cleared, training the model to generate without text guidance. This enables classifier-free guidance (CFG) at inference.
+- `--video_caption_dropout_rate`: Probability of dropping only the video text conditioning while keeping audio text conditioning (default: `0.0`). AV mode only. Applied independently per sample before `--caption_dropout_rate`.
+- `--audio_caption_dropout_rate`: Probability of dropping only the audio text conditioning while keeping video text conditioning (default: `0.0`). AV mode only. Applied independently per sample before `--caption_dropout_rate`.
+
+The three dropout rates are independent. For a given sample, the per-modality dropout is applied first (on the separate `video_prompt_embeds` / `audio_prompt_embeds`), then the joint dropout is applied on the concatenated result. A sample can end up with: both modalities present, video-only, audio-only, or fully unconditional.
 
 #### Loss Function Type
 

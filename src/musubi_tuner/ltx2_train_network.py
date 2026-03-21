@@ -2890,6 +2890,18 @@ class LTX2NetworkTrainer(NetworkTrainer):
                             f"{tuple(audio_prompt_embeds.shape)} must have the same batch and seq_len dimensions. "
                             "Caches may have been created with different sequence length settings or different checkpoints."
                         )
+                    # Per-modality caption dropout: independently zero video/audio embeddings
+                    if getattr(self, "training", False):
+                        v_drop = float(getattr(args, "video_caption_dropout_rate", 0.0))
+                        a_drop = float(getattr(args, "audio_caption_dropout_rate", 0.0))
+                        if v_drop > 0.0 or a_drop > 0.0:
+                            video_prompt_embeds = video_prompt_embeds.clone()
+                            audio_prompt_embeds = audio_prompt_embeds.clone()
+                            for i in range(video_prompt_embeds.shape[0]):
+                                if v_drop > 0.0 and random.random() < v_drop:
+                                    video_prompt_embeds[i] = 0
+                                if a_drop > 0.0 and random.random() < a_drop:
+                                    audio_prompt_embeds[i] = 0
                     text_embeds = torch.cat([video_prompt_embeds, audio_prompt_embeds], dim=-1)
                 else:
                     text_embeds = conditions.get("prompt_embeds")
@@ -7125,8 +7137,23 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         "--caption_dropout_rate",
         type=float,
         default=0.0,
-        help="Probability of dropping the caption for each sample (0.0 = disabled). "
-             "Zeros out text embeddings and mask to train unconditional generation for CFG.",
+        help="Probability of dropping ALL text conditioning for each sample (0.0 = disabled). "
+             "Zeros out both video and audio text embeddings and mask. "
+             "For per-modality dropout, use --video_caption_dropout_rate / --audio_caption_dropout_rate.",
+    )
+    parser.add_argument(
+        "--video_caption_dropout_rate",
+        type=float,
+        default=0.0,
+        help="Probability of dropping video text conditioning per sample while keeping audio (0.0 = disabled). "
+             "Applied independently before --caption_dropout_rate. AV mode only.",
+    )
+    parser.add_argument(
+        "--audio_caption_dropout_rate",
+        type=float,
+        default=0.0,
+        help="Probability of dropping audio text conditioning per sample while keeping video (0.0 = disabled). "
+             "Applied independently before --caption_dropout_rate. AV mode only.",
     )
 
     return parser
