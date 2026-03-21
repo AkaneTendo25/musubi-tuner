@@ -876,7 +876,8 @@ accelerate launch ... ltx2_train_network.py ^
 | `student_block_ratio` | `None` | Ratio-based student layer selection. Resolves to `floor(ratio * depth)`. Takes priority over `student_block_idx`. |
 | `teacher_block_ratio` | `None` | Ratio-based teacher layer selection. Resolves to `ceil(ratio * depth)`. Takes priority over `teacher_block_idx`. |
 | `student_block_stochastic_range` | `0` | Randomly vary the student capture block ±N blocks each step. `0` = fixed block. Adds regularization diversity; note a single projector is shared across all depth variants. |
-| `lambda_self_flow` | `0.1` | Loss weight for the Self-Flow token-level representation term |
+| `lambda_self_flow` | `0.1` | Loss weight for the video token-level representation alignment term |
+| `lambda_audio` | `0.0` | Loss weight for audio representation alignment. When `> 0`, captures audio hidden states from the same student/teacher blocks and aligns them via a separate audio projector MLP. Requires `--ltx2_mode av`. `0` = disabled (backward compatible). |
 | `mask_ratio` | `0.10` | Token mask ratio for dual-timestep mixing. Valid range: `[0.0, 0.5]` |
 | `frame_level_mask` | `false` | When `true`, mask whole latent frames instead of individual tokens. More semantically coherent masking for video. |
 | `mask_focus_loss` | `false` | When `true`, compute the representation loss only on masked (higher-noise) tokens. Default: loss over all tokens. |
@@ -908,7 +909,7 @@ accelerate launch ... ltx2_train_network.py ^
 
 ##### Notes
 
-- Supported modes: `--ltx2_mode video`, `--ltx2_mode av` (video branch only in AV mode).
+- Supported modes: `--ltx2_mode video`, `--ltx2_mode av`. In AV mode, video alignment is always active when `lambda_self_flow > 0`; audio alignment is active when `lambda_audio > 0`.
 - Image-like training is supported through single-frame samples in `--ltx2_mode video` (set `temporal_mode=off` unless you intentionally want temporal terms to be inactive on image batches).
 - Cost: one extra teacher forward pass per train step. `teacher_mode=base` requires no extra VRAM since it reuses the existing model with LoRA multipliers zeroed.
 - Teacher modes: `base` gives the largest student-teacher gap (pretrained vs LoRA-finetuned); `ema` / `partial_ema` give a moving target that shrinks as training converges.

@@ -62,6 +62,7 @@ class SelfFlowConfig:
     offload_teacher_features: bool = False
     offload_teacher_params: bool = False
     projector_lr: Optional[float] = None
+    lambda_audio: float = 0.0  # audio representation alignment weight (0 = disabled)
 
 
 def parse_self_flow_args(raw_args: Optional[list[str]]) -> Dict[str, str]:
@@ -89,18 +90,23 @@ class SelfFlowModule:
         self.transformer = transformer
 
         self.projector: Optional[nn.Sequential] = None
+        self.audio_projector: Optional[nn.Sequential] = None
         self._hooks: list = []
 
         self._capture_mode: str = "idle"  # "student" | "teacher" | "idle"
         self._student_features: Optional[torch.Tensor] = None
         self._teacher_features: Optional[torch.Tensor] = None
+        self._student_audio_features: Optional[torch.Tensor] = None
+        self._teacher_audio_features: Optional[torch.Tensor] = None
 
         self._shadow_params: Dict[str, torch.Tensor] = {}
         self._step_counter: int = 0
         self._last_cosine: Optional[float] = None
+        self._last_audio_cosine: Optional[float] = None
         self._last_frame_cosine: Optional[float] = None
         self._last_delta_cosine: Optional[float] = None
         self._current_lambda_self_flow: float = float(config.lambda_self_flow)
+        self._current_lambda_audio: float = float(config.lambda_audio)
         self._current_lambda_temporal: float = float(config.lambda_temporal)
         self._current_lambda_delta: float = float(config.lambda_delta)
         self._resolved_student_block_idx: Optional[int] = None
@@ -111,6 +117,10 @@ class SelfFlowModule:
     @property
     def last_cosine(self) -> Optional[float]:
         return self._last_cosine
+
+    @property
+    def last_audio_cosine(self) -> Optional[float]:
+        return self._last_audio_cosine
 
     @property
     def last_frame_cosine(self) -> Optional[float]:
@@ -136,6 +146,7 @@ class SelfFlowModule:
     def has_active_loss(self) -> bool:
         return (
             self._current_lambda_self_flow > 0.0
+            or self._current_lambda_audio > 0.0
             or (str(self.config.temporal_mode).lower() in {"frame", "hybrid"} and self.current_lambda_temporal > 0.0)
             or (str(self.config.temporal_mode).lower() in {"delta", "hybrid"} and self.current_lambda_delta > 0.0)
         )
@@ -252,6 +263,26 @@ class SelfFlowModule:
             nn.Linear(hidden_dim, inner_dim),
         ).to(device=device, dtype=dtype)
 
+        # Audio projector: created when lambda_audio > 0 and model has audio_inner_dim
+        if float(self.config.lambda_audio) > 0.0:
+            audio_inner_dim = int(getattr(self.transformer, "audio_inner_dim", 0))
+            if audio_inner_dim <= 0:
+                logger.warning(
+                    "Self-Flow lambda_audio=%.4f but transformer has no audio_inner_dim; "
+                    "audio alignment disabled.",
+                    self.config.lambda_audio,
+                )
+                self.config.lambda_audio = 0.0
+                self._current_lambda_audio = 0.0
+            else:
+                audio_hidden_dim = audio_inner_dim * max(1, int(self.config.projector_hidden_multiplier))
+                self.audio_projector = nn.Sequential(
+                    nn.Linear(audio_inner_dim, audio_hidden_dim),
+                    nn.SiLU(),
+                    nn.Linear(audio_hidden_dim, audio_inner_dim),
+                ).to(device=device, dtype=dtype)
+                logger.info("Self-Flow audio projector created: audio_inner_dim=%d", audio_inner_dim)
+
         self._install_hooks(blocks)
         logger.info(
             "Self-Flow ready: student_block=%d teacher_block=%d student_ratio=%s teacher_ratio=%s "
@@ -304,6 +335,15 @@ class SelfFlowModule:
                     return video_out.x
             return None
 
+        def _extract_audio_tensor(output: Any) -> Optional[torch.Tensor]:
+            if isinstance(output, tuple) and len(output) >= 2:
+                audio_out = output[1]
+                if audio_out is not None and hasattr(audio_out, "x") and torch.is_tensor(audio_out.x):
+                    return audio_out.x
+            return None
+
+        capture_audio = self.audio_projector is not None
+
         def _make_student_hook(block_idx: int):
             def _hook(_module, _inputs, output):
                 if self._capture_mode != "student":
@@ -313,6 +353,10 @@ class SelfFlowModule:
                 tensor = _extract_video_tensor(output)
                 if tensor is not None:
                     self._student_features = tensor
+                if capture_audio:
+                    audio_tensor = _extract_audio_tensor(output)
+                    if audio_tensor is not None:
+                        self._student_audio_features = audio_tensor
             return _hook
 
         def _teacher_hook(_module, _inputs, output):
@@ -321,6 +365,10 @@ class SelfFlowModule:
             tensor = _extract_video_tensor(output)
             if tensor is not None:
                 self._teacher_features = tensor.detach()
+            if capture_audio:
+                audio_tensor = _extract_audio_tensor(output)
+                if audio_tensor is not None:
+                    self._teacher_audio_features = audio_tensor.detach()
 
         for bidx in self._stochastic_student_indices:
             self._hooks.append(blocks[bidx].register_forward_hook(_make_student_hook(bidx)))
@@ -454,13 +502,17 @@ class SelfFlowModule:
         self._capture_mode = "idle"
         self._student_features = None
         self._teacher_features = None
+        self._student_audio_features = None
+        self._teacher_audio_features = None
         self._last_cosine = None
+        self._last_audio_cosine = None
         self._last_frame_cosine = None
         self._last_delta_cosine = None
 
     def on_step(self, global_step: int) -> None:
         scale = self._schedule_scale(global_step)
         self._current_lambda_self_flow = float(self.config.lambda_self_flow) * scale
+        self._current_lambda_audio = float(self.config.lambda_audio) * scale
         self._current_lambda_temporal = float(self.config.lambda_temporal) * scale
         self._current_lambda_delta = float(self.config.lambda_delta) * scale
 
@@ -488,9 +540,12 @@ class SelfFlowModule:
         return 1.0
 
     def get_trainable_params(self) -> list[torch.nn.Parameter]:
-        if self.projector is None:
-            return []
-        return list(self.projector.parameters())
+        params = []
+        if self.projector is not None:
+            params.extend(self.projector.parameters())
+        if self.audio_projector is not None:
+            params.extend(self.audio_projector.parameters())
+        return params
 
     def prepare_teacher_features(
         self,
@@ -565,12 +620,17 @@ class SelfFlowModule:
                 if prev_training:
                     transformer.train()
 
-        if (
-            self._teacher_features is not None
-            and bool(self.config.offload_teacher_features)
-            and self._teacher_features.device.type != "cpu"
-        ):
-            self._teacher_features = self._teacher_features.to(device="cpu", non_blocking=False)
+        if bool(self.config.offload_teacher_features):
+            if (
+                self._teacher_features is not None
+                and self._teacher_features.device.type != "cpu"
+            ):
+                self._teacher_features = self._teacher_features.to(device="cpu", non_blocking=False)
+            if (
+                self._teacher_audio_features is not None
+                and self._teacher_audio_features.device.type != "cpu"
+            ):
+                self._teacher_audio_features = self._teacher_audio_features.to(device="cpu", non_blocking=False)
 
     def _loss_from_cosine(self, cosine: torch.Tensor) -> torch.Tensor:
         if self.config.loss_type == "one_minus_cosine":
@@ -895,6 +955,30 @@ class SelfFlowModule:
             loss = loss + self._loss_from_cosine(cosine) * self._current_lambda_self_flow
             applied_terms += 1
 
+        # Audio representation alignment loss
+        if (
+            self._current_lambda_audio > 0.0
+            and self.audio_projector is not None
+            and self._student_audio_features is not None
+            and self._teacher_audio_features is not None
+        ):
+            audio_student = self._student_audio_features
+            audio_teacher = self._teacher_audio_features
+            if audio_teacher.device != audio_student.device or audio_teacher.dtype != audio_student.dtype:
+                audio_teacher = audio_teacher.to(device=audio_student.device, dtype=audio_student.dtype, non_blocking=True)
+            if audio_student.shape[1] != audio_teacher.shape[1]:
+                min_t = min(audio_student.shape[1], audio_teacher.shape[1])
+                audio_student = audio_student[:, :min_t]
+                audio_teacher = audio_teacher[:, :min_t]
+            audio_proj = self.audio_projector(audio_student)
+            audio_teacher = audio_teacher.detach()
+            audio_proj_norm = F.normalize(audio_proj, dim=-1)
+            audio_teacher_norm = F.normalize(audio_teacher, dim=-1)
+            audio_cosine = F.cosine_similarity(audio_proj_norm, audio_teacher_norm, dim=-1).mean()
+            self._last_audio_cosine = float(audio_cosine.detach().item())
+            loss = loss + self._loss_from_cosine(audio_cosine) * self._current_lambda_audio
+            applied_terms += 1
+
         temporal_mode = str(self.config.temporal_mode).lower()
         temporal_granularity = str(self.config.temporal_granularity).lower()
         motion_weighting = str(self.config.motion_weighting).lower()
@@ -1052,12 +1136,23 @@ class SelfFlowModule:
     def state_dict(self) -> Dict[str, Any]:
         if self.projector is None:
             return {}
-        return self.projector.state_dict()
+        sd = self.projector.state_dict()
+        if self.audio_projector is not None:
+            for k, v in self.audio_projector.state_dict().items():
+                sd[f"audio.{k}"] = v
+        return sd
 
     def load_state_dict(self, sd: Dict[str, Any]) -> None:
         if self.projector is not None and sd:
-            self.projector.load_state_dict(sd)
-            logger.info("Self-Flow: loaded projector weights (%d tensors)", len(sd))
+            # Split video and audio projector weights
+            video_sd = {k: v for k, v in sd.items() if not k.startswith("audio.")}
+            audio_sd = {k[len("audio."):]: v for k, v in sd.items() if k.startswith("audio.")}
+            if video_sd:
+                self.projector.load_state_dict(video_sd)
+                logger.info("Self-Flow: loaded video projector weights (%d tensors)", len(video_sd))
+            if audio_sd and self.audio_projector is not None:
+                self.audio_projector.load_state_dict(audio_sd)
+                logger.info("Self-Flow: loaded audio projector weights (%d tensors)", len(audio_sd))
 
     def teacher_state_dict(self) -> Dict[str, torch.Tensor]:
         out: Dict[str, torch.Tensor] = {

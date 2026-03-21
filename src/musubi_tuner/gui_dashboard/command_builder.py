@@ -650,6 +650,8 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
             args_parts.append(f"student_block_stochastic_range={t.self_flow_student_block_stochastic_range}")
         if t.self_flow_lambda != 0.1:
             args_parts.append(f"lambda_self_flow={t.self_flow_lambda}")
+        if t.self_flow_lambda_audio != 0.0:
+            args_parts.append(f"lambda_audio={t.self_flow_lambda_audio}")
         if t.self_flow_mask_ratio != 0.1:
             args_parts.append(f"mask_ratio={t.self_flow_mask_ratio}")
         if t.self_flow_frame_level_mask:

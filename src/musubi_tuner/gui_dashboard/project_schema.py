@@ -340,6 +340,7 @@ class TrainingConfig(BaseModel):
     self_flow_teacher_block_ratio: float = 0.7
     self_flow_student_block_stochastic_range: int = 0
     self_flow_lambda: float = 0.1
+    self_flow_lambda_audio: float = 0.0
     self_flow_mask_ratio: float = 0.1
     self_flow_frame_level_mask: bool = False
     self_flow_mask_focus_loss: bool = False

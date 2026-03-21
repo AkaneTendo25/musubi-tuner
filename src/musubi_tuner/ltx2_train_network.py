@@ -1366,7 +1366,11 @@ class LTX2NetworkTrainer(NetworkTrainer):
         delta_cosine = self._self_flow.last_delta_cosine
         if delta_cosine is not None:
             metrics["self_flow/delta_cosine"] = float(delta_cosine)
+        audio_cosine = self._self_flow.last_audio_cosine
+        if audio_cosine is not None:
+            metrics["self_flow/audio_cosine"] = float(audio_cosine)
         metrics["self_flow/lambda_self_flow"] = float(self._self_flow.current_lambda_self_flow)
+        metrics["self_flow/lambda_audio"] = float(self._self_flow._current_lambda_audio)
         metrics["self_flow/lambda_temporal"] = float(self._self_flow.current_lambda_temporal)
         metrics["self_flow/lambda_delta"] = float(self._self_flow.current_lambda_delta)
         if "masked_token_ratio" in sf_ctx:
