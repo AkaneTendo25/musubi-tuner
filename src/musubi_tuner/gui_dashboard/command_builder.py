@@ -779,6 +779,14 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
         cmd += ["--min_audio_batches_per_accum", str(t.min_audio_batches_per_accum)]
     if t.audio_batch_probability is not None:
         cmd += ["--audio_batch_probability", str(t.audio_batch_probability)]
+    if t.modality_freeze_check_interval > 0:
+        cmd += ["--modality_freeze_check_interval", str(t.modality_freeze_check_interval)]
+        if t.modality_freeze_ratio_threshold != 0.5:
+            cmd += ["--modality_freeze_ratio_threshold", str(t.modality_freeze_ratio_threshold)]
+        if t.modality_freeze_warmup_steps != 100:
+            cmd += ["--modality_freeze_warmup_steps", str(t.modality_freeze_warmup_steps)]
+        if t.modality_freeze_ema_decay != 0.99:
+            cmd += ["--modality_freeze_ema_decay", str(t.modality_freeze_ema_decay)]
 
     # Loss weighting
     if t.video_loss_weight != 1.0:

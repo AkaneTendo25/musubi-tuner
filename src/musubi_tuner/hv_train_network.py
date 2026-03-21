@@ -45,6 +45,7 @@ from musubi_tuner.dataset.audio_quota_sampler import (
     split_concat_indices_by_audio,
     sync_dataset_group_epoch_without_loading,
 )
+from musubi_tuner.modality_freezer import ModalityFreezer
 from musubi_tuner.audio_loss_balance import (
     compute_ema_magnitude_audio_weight,
     compute_inverse_frequency_audio_weight,
@@ -2064,6 +2065,24 @@ class NetworkTrainer:
             uncertainty_log_var_audio = torch.nn.Parameter(torch.zeros(1))
             logger.info("Uncertainty weighting enabled: learnable log-variance scalars initialized to 0.0")
 
+        # G2D-style modality freezing
+        modality_freezer = None
+        freeze_check_interval = int(getattr(args, "modality_freeze_check_interval", 0) or 0)
+        if freeze_check_interval > 0:
+            modality_freezer = ModalityFreezer(
+                check_interval=freeze_check_interval,
+                ratio_threshold=float(getattr(args, "modality_freeze_ratio_threshold", 0.5)),
+                warmup_steps=int(getattr(args, "modality_freeze_warmup_steps", 100)),
+                ema_decay=float(getattr(args, "modality_freeze_ema_decay", 0.99)),
+            )
+            logger.info(
+                "Modality freezer enabled: check_interval=%d ratio_threshold=%.2f warmup=%d ema_decay=%.4f",
+                modality_freezer.check_interval,
+                modality_freezer.ratio_threshold,
+                modality_freezer.warmup_steps,
+                modality_freezer.ema_decay,
+            )
+
         # Load dataset config
         if args.num_timestep_buckets is not None:
             logger.info(f"Using timestep bucketing. Number of buckets: {args.num_timestep_buckets}")
@@ -3586,6 +3605,13 @@ class NetworkTrainer:
                     ):
                         _log_cuda_memory_stats(f"step_{global_step}", latents_shape=latents_shape)
 
+                    # G2D modality freezer: update loss EMA and check freeze state
+                    if modality_freezer is not None:
+                        modality_freezer.update_losses(video_loss_value, audio_loss_value)
+                        modality_freezer.maybe_update_freeze(
+                            global_step, accelerator.unwrap_model(network),
+                        )
+
                     # to avoid calling optimizer_eval_fn() too frequently, we call it only when we need to sample images or save the model
                     should_sampling = should_sample_images(args, global_step, epoch=None)
                     should_saving = args.save_every_n_steps is not None and global_step % args.save_every_n_steps == 0
@@ -3666,6 +3692,12 @@ class NetworkTrainer:
                         logs["uncertainty/log_var_audio"] = lv_a
                         logs["uncertainty/precision_video"] = math.exp(-lv_v)
                         logs["uncertainty/precision_audio"] = math.exp(-lv_a)
+                    if modality_freezer is not None:
+                        # Encode state as numeric: 0=both active, 1=audio frozen, -1=video frozen
+                        state_map = {"both": 0, "audio_frozen": 1, "video_frozen": -1}
+                        logs["modality_freeze/state"] = state_map.get(modality_freezer.state, 0)
+                        logs["modality_freeze/video_loss_ema"] = modality_freezer.video_loss_ema
+                        logs["modality_freeze/audio_loss_ema"] = modality_freezer.audio_loss_ema
                     if pres_losses:
                         logs.update(pres_losses)
                     accelerator.log(logs, step=global_step)

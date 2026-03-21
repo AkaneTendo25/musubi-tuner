@@ -7156,6 +7156,35 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
              "Applied independently before --caption_dropout_rate. AV mode only.",
     )
 
+    # -- Modality freezing (G2D) --
+    parser.add_argument(
+        "--modality_freeze_check_interval",
+        type=int,
+        default=0,
+        help="Check modality freeze state every N steps (0 = disabled). "
+             "When audio loss EMA / video loss EMA drops below --modality_freeze_ratio_threshold, "
+             "audio LoRA params are frozen. Vice versa for video.",
+    )
+    parser.add_argument(
+        "--modality_freeze_ratio_threshold",
+        type=float,
+        default=0.5,
+        help="Audio/video loss EMA ratio below which the lower-loss modality's LoRA is frozen. "
+             "Default 0.5: freeze audio when audio_loss < 0.5 * video_loss.",
+    )
+    parser.add_argument(
+        "--modality_freeze_warmup_steps",
+        type=int,
+        default=100,
+        help="Steps before modality freezing can activate (default: 100).",
+    )
+    parser.add_argument(
+        "--modality_freeze_ema_decay",
+        type=float,
+        default=0.99,
+        help="EMA decay for per-modality loss tracking in the freezer (default: 0.99).",
+    )
+
     return parser
 
 

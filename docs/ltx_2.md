@@ -680,6 +680,24 @@ On video-only batches (no audio in the current batch), falls back to standard `v
 - `--audio_supervision_check_interval`: Run supervision checks every N expected AV batches.
 - `--audio_supervision_min_ratio`: Minimum supervised/expected ratio required by the monitor.
 
+#### Modality Freezing (G2D)
+
+Adaptive modality freezing based on per-modality loss EMA ratio (G2D Sequential Modality Prioritization, 2025). When one modality's loss is significantly lower than the other, its LoRA parameters are frozen (`requires_grad=False`) so the under-performing modality can train without gradient interference.
+
+- `--modality_freeze_check_interval <int>`: Check freeze state every N steps. `0` = disabled (default).
+- `--modality_freeze_ratio_threshold <float>`: Freeze threshold (default: `0.5`). Audio LoRA is frozen when `audio_loss_ema / video_loss_ema < threshold`. Video LoRA is frozen when the ratio exceeds `1 / threshold`.
+- `--modality_freeze_warmup_steps <int>`: Steps before freezing can activate (default: `100`).
+- `--modality_freeze_ema_decay <float>`: EMA decay for loss tracking (default: `0.99`).
+
+Example:
+```bash
+--modality_freeze_check_interval 500 ^
+--modality_freeze_ratio_threshold 0.5 ^
+--modality_freeze_warmup_steps 200
+```
+
+Logged to TensorBoard: `modality_freeze/state` (0=both active, 1=audio frozen, -1=video frozen), `modality_freeze/video_loss_ema`, `modality_freeze/audio_loss_ema`.
+
 #### Per-Module Learning Rates
 
 Set different learning rates for audio vs. video LoRA modules. Useful when audio modules need a lower LR to stabilize AV training.

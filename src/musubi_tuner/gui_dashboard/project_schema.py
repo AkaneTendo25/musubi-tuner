@@ -389,6 +389,10 @@ class TrainingConfig(BaseModel):
     audio_only_sequence_resolution: int = 64
     min_audio_batches_per_accum: int = 0
     audio_batch_probability: Optional[float] = None
+    modality_freeze_check_interval: int = 0
+    modality_freeze_ratio_threshold: float = 0.5
+    modality_freeze_warmup_steps: int = 100
+    modality_freeze_ema_decay: float = 0.99
 
     # Loss weighting
     video_loss_weight: float = 1.0
