@@ -670,6 +670,8 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
             args_parts.append("dual_timestep=false")
         if t.self_flow_projector_lr is not None:
             args_parts.append(f"projector_lr={t.self_flow_projector_lr}")
+        if t.self_flow_projector_activation != "silu":
+            args_parts.append(f"projector_activation={t.self_flow_projector_activation}")
         if getattr(t, "self_flow_temporal_mode", "off") != "off":
             args_parts.append(f"temporal_mode={t.self_flow_temporal_mode}")
         if getattr(t, "self_flow_lambda_temporal", 0.0) != 0.0:

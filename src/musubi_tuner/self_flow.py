@@ -53,6 +53,7 @@ class SelfFlowConfig:
     teacher_momentum: float = 0.999
     teacher_update_interval: int = 1
     projector_hidden_multiplier: int = 1
+    projector_activation: str = "silu"  # "silu" | "gelu"
     loss_type: str = "negative_cosine"  # "negative_cosine" | "one_minus_cosine"
     dual_timestep: bool = True
     tokenwise_timestep: bool = True
@@ -105,6 +106,7 @@ class SelfFlowModule:
         self._last_audio_cosine: Optional[float] = None
         self._last_frame_cosine: Optional[float] = None
         self._last_delta_cosine: Optional[float] = None
+        self._last_ema_drift: Optional[float] = None
         self._current_lambda_self_flow: float = float(config.lambda_self_flow)
         self._current_lambda_audio: float = float(config.lambda_audio)
         self._current_lambda_temporal: float = float(config.lambda_temporal)
@@ -117,6 +119,10 @@ class SelfFlowModule:
     @property
     def last_cosine(self) -> Optional[float]:
         return self._last_cosine
+
+    @property
+    def last_ema_drift(self) -> Optional[float]:
+        return self._last_ema_drift
 
     @property
     def last_audio_cosine(self) -> Optional[float]:
@@ -150,6 +156,12 @@ class SelfFlowModule:
             or (str(self.config.temporal_mode).lower() in {"frame", "hybrid"} and self.current_lambda_temporal > 0.0)
             or (str(self.config.temporal_mode).lower() in {"delta", "hybrid"} and self.current_lambda_delta > 0.0)
         )
+
+    def _make_activation(self) -> nn.Module:
+        act = str(self.config.projector_activation).lower()
+        if act == "gelu":
+            return nn.GELU()
+        return nn.SiLU()
 
     def _get_blocks(self) -> tuple[list[nn.Module], int]:
         blocks = getattr(self.transformer, "transformer_blocks", None)
@@ -257,9 +269,10 @@ class SelfFlowModule:
         if inner_dim <= 0:
             raise ValueError("Self-Flow could not resolve transformer.inner_dim")
         hidden_dim = inner_dim * max(1, int(self.config.projector_hidden_multiplier))
+        activation = self._make_activation()
         self.projector = nn.Sequential(
             nn.Linear(inner_dim, hidden_dim),
-            nn.SiLU(),
+            activation,
             nn.Linear(hidden_dim, inner_dim),
         ).to(device=device, dtype=dtype)
 
@@ -278,7 +291,7 @@ class SelfFlowModule:
                 audio_hidden_dim = audio_inner_dim * max(1, int(self.config.projector_hidden_multiplier))
                 self.audio_projector = nn.Sequential(
                     nn.Linear(audio_inner_dim, audio_hidden_dim),
-                    nn.SiLU(),
+                    self._make_activation(),
                     nn.Linear(audio_hidden_dim, audio_inner_dim),
                 ).to(device=device, dtype=dtype)
                 logger.info("Self-Flow audio projector created: audio_inner_dim=%d", audio_inner_dim)
@@ -450,6 +463,8 @@ class SelfFlowModule:
         if self._step_counter % max(1, int(self.config.teacher_update_interval)) != 0:
             return
         momentum = float(self.config.teacher_momentum)
+        drift_sum = 0.0
+        drift_count = 0
         with torch.no_grad():
             for name, param in network.named_parameters():
                 shadow_name = self._resolve_shadow_name(name, self._shadow_params)
@@ -460,7 +475,12 @@ class SelfFlowModule:
                 source = param.detach()
                 if source.device != shadow.device or source.dtype != shadow_target_dtype:
                     source = source.to(device=shadow.device, dtype=shadow_target_dtype)
+                # Compute drift before EMA update
+                drift_sum += (shadow - source).norm().item()
+                drift_count += 1
                 shadow.mul_(momentum).add_(source, alpha=1.0 - momentum)
+        if drift_count > 0:
+            self._last_ema_drift = drift_sum / drift_count
 
     def _swap_in_teacher(self, network: nn.Module) -> Dict[str, torch.Tensor]:
         backups: Dict[str, torch.Tensor] = {}
@@ -508,6 +528,8 @@ class SelfFlowModule:
         self._last_audio_cosine = None
         self._last_frame_cosine = None
         self._last_delta_cosine = None
+        # Note: _last_ema_drift is NOT cleared here — it's updated in update_teacher
+        # which runs after optimizer.step, not during compute_loss
 
     def on_step(self, global_step: int) -> None:
         scale = self._schedule_scale(global_step)

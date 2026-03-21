@@ -1373,6 +1373,9 @@ class LTX2NetworkTrainer(NetworkTrainer):
         metrics["self_flow/lambda_audio"] = float(self._self_flow._current_lambda_audio)
         metrics["self_flow/lambda_temporal"] = float(self._self_flow.current_lambda_temporal)
         metrics["self_flow/lambda_delta"] = float(self._self_flow.current_lambda_delta)
+        ema_drift = self._self_flow.last_ema_drift
+        if ema_drift is not None:
+            metrics["self_flow/ema_drift"] = float(ema_drift)
         if "masked_token_ratio" in sf_ctx:
             metrics["self_flow/masked_token_ratio"] = float(sf_ctx["masked_token_ratio"])
         if "tau_mean" in sf_ctx:

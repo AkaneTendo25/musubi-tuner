@@ -922,6 +922,7 @@ accelerate launch ... ltx2_train_network.py ^
 | `teacher_momentum` | `0.999` | EMA momentum for teacher updates (`ema` / `partial_ema` modes only). Valid range: `[0.0, 1.0)` |
 | `teacher_update_interval` | `1` | Update EMA teacher every N optimizer steps |
 | `projector_hidden_multiplier` | `1` | Projector hidden width multiplier vs model inner dim |
+| `projector_activation` | `silu` | Projector MLP activation function: `silu` or `gelu` |
 | `projector_lr` | `None` | Optional projector-specific learning rate. Defaults to `--learning_rate` when unset |
 | `loss_type` | `negative_cosine` | `negative_cosine` or `one_minus_cosine` |
 | `dual_timestep` | `true` | Enable dual-timestep noising |

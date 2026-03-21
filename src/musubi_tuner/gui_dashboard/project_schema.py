@@ -350,6 +350,7 @@ class TrainingConfig(BaseModel):
     self_flow_teacher_momentum: float = 0.999
     self_flow_dual_timestep: bool = True
     self_flow_projector_lr: Optional[float] = None
+    self_flow_projector_activation: Literal["silu", "gelu"] = "silu"
     self_flow_temporal_mode: Literal["off", "frame", "delta", "hybrid"] = "off"
     self_flow_lambda_temporal: float = 0.0
     self_flow_lambda_delta: float = 0.0
