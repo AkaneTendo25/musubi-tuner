@@ -7091,6 +7091,22 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
              "video_to_audio=1e-5",
     )
 
+    # -- Per-module rank (dim) overrides --
+    parser.add_argument(
+        "--audio_dim",
+        type=int,
+        default=None,
+        help="LoRA rank (dim) for audio modules (names containing 'audio_'). "
+             "Defaults to --network_dim. Allows lower rank for audio to reduce overfitting.",
+    )
+    parser.add_argument(
+        "--audio_alpha",
+        type=float,
+        default=None,
+        help="LoRA alpha for audio modules. Defaults to --network_alpha. "
+             "Typically set equal to --audio_dim for consistent scaling.",
+    )
+
     # -- Caption dropout --
     parser.add_argument(
         "--caption_dropout_rate",
@@ -7214,6 +7230,19 @@ def main() -> None:
         if not any(arg.startswith("lora_target_preset=") for arg in args.network_args):
             args.network_args.append(f"lora_target_preset={lora_target_preset}")
             logger.info(f"Using LoRA target preset: {lora_target_preset}")
+
+    # Inject audio_dim/audio_alpha into network_args (regular LoRA only, not LyCORIS)
+    if not uses_lycoris_module:
+        audio_dim = getattr(args, "audio_dim", None)
+        audio_alpha = getattr(args, "audio_alpha", None)
+        if audio_dim is not None or audio_alpha is not None:
+            if args.network_args is None:
+                args.network_args = []
+            if audio_dim is not None and not any(arg.startswith("audio_dim=") for arg in args.network_args):
+                args.network_args.append(f"audio_dim={audio_dim}")
+            if audio_alpha is not None and not any(arg.startswith("audio_alpha=") for arg in args.network_args):
+                args.network_args.append(f"audio_alpha={audio_alpha}")
+            logger.info(f"Per-modality LoRA rank: audio_dim={audio_dim}, audio_alpha={audio_alpha}")
 
     process_lycoris_config(args, logger)
     apply_lycoris_preset_before_network_creation(args, logger)

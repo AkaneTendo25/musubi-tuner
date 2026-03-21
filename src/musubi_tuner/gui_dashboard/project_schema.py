@@ -165,6 +165,8 @@ class TrainingConfig(BaseModel):
     max_grad_norm: float = 1.0
     audio_lr: Optional[float] = None
     lr_args: str = ""
+    audio_dim: Optional[int] = None
+    audio_alpha: Optional[float] = None
 
     # Schedule
     max_train_steps: int = 1600

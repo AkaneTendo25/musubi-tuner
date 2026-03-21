@@ -680,6 +680,27 @@ Result:
 
 Works with LoRA+ (`loraplus_lr_ratio`): the up/down split applies within each LR group. Both flags default to `None` and are fully backward-compatible. See [LoRA+ in the advanced configuration guide](./advanced_config.md#lora) for setup details.
 
+#### Per-Module LoRA Rank
+
+Set different LoRA rank (dim) for audio vs. video modules.
+
+- `--audio_dim <int>`: LoRA rank for audio modules (names containing `audio_`). Defaults to `--network_dim`.
+- `--audio_alpha <float>`: LoRA alpha for audio modules. Defaults to `--network_alpha`.
+
+Example:
+```bash
+--network_dim 32 ^
+--network_alpha 16 ^
+--audio_dim 8 ^
+--audio_alpha 8
+```
+
+Result:
+- Audio modules (`audio_attn`, `audio_ff`, `video_to_audio_attn`, etc.) → rank 8, alpha 8
+- Video modules → rank 32, alpha 16
+
+Both flags default to `None` (no override, all modules use `--network_dim`/`--network_alpha`). Not used with LyCORIS — use the LyCORIS per-module config instead. At inference, each module's rank is read from saved weight shapes (`lora_down.shape[0]`), so no flags are needed for loading.
+
 #### Preservation & Regularization
 
 Optional techniques that constrain how the LoRA modifies the base model. All are disabled by default with zero overhead.

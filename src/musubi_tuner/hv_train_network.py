@@ -2752,6 +2752,8 @@ class NetworkTrainer:
             "ss_shifted_logit_uniform_prob": getattr(args, "shifted_logit_uniform_prob", None),
             "ss_audio_lr": getattr(args, "audio_lr", None),
             "ss_lr_args": json.dumps(getattr(args, "lr_args", None)) if getattr(args, "lr_args", None) else None,
+            "ss_audio_dim": getattr(args, "audio_dim", None),
+            "ss_audio_alpha": getattr(args, "audio_alpha", None),
         }
 
         datasets_metadata = []

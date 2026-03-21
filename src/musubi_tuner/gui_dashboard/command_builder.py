@@ -356,6 +356,10 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
         cmd += ["--audio_lr", str(t.audio_lr)]
     if t.lr_args:
         cmd += ["--lr_args"] + t.lr_args.split()
+    if t.audio_dim is not None:
+        cmd += ["--audio_dim", str(t.audio_dim)]
+    if t.audio_alpha is not None:
+        cmd += ["--audio_alpha", str(t.audio_alpha)]
 
     # Schedule
     if t.max_train_epochs is not None:

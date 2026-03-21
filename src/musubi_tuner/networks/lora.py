@@ -355,7 +355,13 @@ def create_network(
         else:
             conv_alpha = float(conv_alpha)
 
-    # TODO generic rank/dim setting with regular expression
+    # per-modality dim/alpha overrides
+    audio_dim = kwargs.get("audio_dim", None)
+    if audio_dim is not None:
+        audio_dim = int(audio_dim)
+    audio_alpha = kwargs.get("audio_alpha", None)
+    if audio_alpha is not None:
+        audio_alpha = float(audio_alpha)
 
     # rank/module dropout
     rank_dropout = kwargs.get("rank_dropout", None)
@@ -400,6 +406,8 @@ def create_network(
         exclude_patterns=exclude_patterns,
         include_patterns=include_patterns,
         verbose=verbose,
+        audio_dim=audio_dim,
+        audio_alpha=audio_alpha,
     )
 
     loraplus_lr_ratio = kwargs.get("loraplus_lr_ratio", None)
@@ -438,6 +446,8 @@ class LoRANetwork(torch.nn.Module):
         exclude_patterns: Optional[List[str]] = None,
         include_patterns: Optional[List[str]] = None,
         verbose: Optional[bool] = False,
+        audio_dim: Optional[int] = None,
+        audio_alpha: Optional[float] = None,
     ) -> None:
         super().__init__()
         self.multiplier = multiplier
@@ -452,6 +462,8 @@ class LoRANetwork(torch.nn.Module):
         self.target_replace_modules = target_replace_modules
         self.prefix = prefix
         self.module_kwargs = module_kwargs or {}
+        self.audio_dim = audio_dim
+        self.audio_alpha = audio_alpha
 
         self.loraplus_lr_ratio = None
         # self.loraplus_unet_lr_ratio = None
@@ -461,6 +473,8 @@ class LoRANetwork(torch.nn.Module):
             logger.info("create LoRA network from weights")
         else:
             logger.info(f"create LoRA network. base dim (rank): {lora_dim}, alpha: {alpha}")
+            if self.audio_dim is not None:
+                logger.info(f"audio modules: dim (rank): {self.audio_dim}, alpha: {self.audio_alpha if self.audio_alpha is not None else alpha}")
             logger.info(
                 f"neuron dropout: p={self.dropout}, rank dropout: p={self.rank_dropout}, module dropout: p={self.module_dropout}"
             )
@@ -555,6 +569,11 @@ class LoRANetwork(torch.nn.Module):
                                 if is_linear or is_conv2d_1x1:
                                     dim = default_dim if default_dim is not None else self.lora_dim
                                     alpha = self.alpha
+                                    # per-modality override: audio modules get audio_dim/audio_alpha
+                                    if self.audio_dim is not None and "audio_" in original_name:
+                                        dim = self.audio_dim
+                                        if self.audio_alpha is not None:
+                                            alpha = self.audio_alpha
                                 elif self.conv_lora_dim is not None:
                                     dim = self.conv_lora_dim
                                     alpha = self.conv_alpha
