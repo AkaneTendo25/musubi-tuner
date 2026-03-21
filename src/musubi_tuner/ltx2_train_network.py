@@ -3899,6 +3899,25 @@ class LTX2NetworkTrainer(NetworkTrainer):
             if out["audio_loss_weight"] < 0.0:
                 raise ValueError(f"audio_loss_weight must be >= 0. Got: {out['audio_loss_weight']}")
 
+            # Store data for Cross-Task Synergy (if enabled)
+            cts_lambda_v = float(getattr(args, "cts_lambda_video_driven", 0.0))
+            cts_lambda_a = float(getattr(args, "cts_lambda_audio_driven", 0.0))
+            if cts_lambda_v > 0.0 or cts_lambda_a > 0.0:
+                out["_cts"] = {
+                    "noisy_video": model_noisy_video,
+                    "clean_video": latents,
+                    "noisy_audio": noisy_audio,
+                    "clean_audio": audio_latents,
+                    "video_timesteps": model_timesteps,
+                    "audio_timesteps": audio_timestep_for_model,
+                    "text_embeds": text_embeds,
+                    "text_mask": text_mask,
+                    "frame_rate": frame_rate,
+                    "transformer_options": resolved_transformer_options,
+                    "lambda_video_driven": cts_lambda_v,
+                    "lambda_audio_driven": cts_lambda_a,
+                }
+
         if diag_enabled:
             item_keys = batch.get("item_keys")
             if isinstance(item_keys, list) and item_keys:
@@ -7154,6 +7173,22 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         default=0.0,
         help="Probability of dropping audio text conditioning per sample while keeping video (0.0 = disabled). "
              "Applied independently before --caption_dropout_rate. AV mode only.",
+    )
+
+    # -- Cross-Task Synergy (Harmony) --
+    parser.add_argument(
+        "--cts_lambda_video_driven",
+        type=float,
+        default=0.0,
+        help="Weight for video-driven audio auxiliary loss (clean video + noisy audio). "
+             "0 = disabled. Harmony (2025) uses 0.3. Requires --ltx2_mode av with audio data.",
+    )
+    parser.add_argument(
+        "--cts_lambda_audio_driven",
+        type=float,
+        default=0.0,
+        help="Weight for audio-driven video auxiliary loss (noisy video + clean audio). "
+             "0 = disabled. Harmony (2025) uses 0.1. Requires --ltx2_mode av with audio data.",
     )
 
     # -- Modality freezing (G2D) --

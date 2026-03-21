@@ -389,6 +389,8 @@ class TrainingConfig(BaseModel):
     audio_only_sequence_resolution: int = 64
     min_audio_batches_per_accum: int = 0
     audio_batch_probability: Optional[float] = None
+    cts_lambda_video_driven: float = 0.0
+    cts_lambda_audio_driven: float = 0.0
     modality_freeze_check_interval: int = 0
     modality_freeze_ratio_threshold: float = 0.5
     modality_freeze_warmup_steps: int = 100

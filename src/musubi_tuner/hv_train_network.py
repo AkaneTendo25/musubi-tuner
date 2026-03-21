@@ -46,6 +46,7 @@ from musubi_tuner.dataset.audio_quota_sampler import (
     sync_dataset_group_epoch_without_loading,
 )
 from musubi_tuner.modality_freezer import ModalityFreezer
+from musubi_tuner.cross_task_synergy import compute_cross_task_synergy_losses
 from musubi_tuner.audio_loss_balance import (
     compute_ema_magnitude_audio_weight,
     compute_inverse_frequency_audio_weight,
@@ -3464,6 +3465,37 @@ class NetworkTrainer:
                         except Exception as e:
                             logger.warning("Self-Flow loss computation failed: %s", e)
 
+                    # Cross-Task Synergy auxiliary losses
+                    cts_metrics = {}
+                    if dict_output:
+                        cts_data = out.get("_cts")
+                        if cts_data is not None:
+                            try:
+                                cts_loss, cts_metrics = compute_cross_task_synergy_losses(
+                                    transformer=transformer,
+                                    accelerator=accelerator,
+                                    noisy_video=cts_data["noisy_video"],
+                                    clean_video=cts_data["clean_video"],
+                                    video_target=out["video_target"],
+                                    video_timesteps=cts_data["video_timesteps"],
+                                    video_loss_mask=out.get("video_loss_mask"),
+                                    noisy_audio=cts_data["noisy_audio"],
+                                    clean_audio=cts_data["clean_audio"],
+                                    audio_target=out.get("audio_target"),
+                                    audio_timesteps=cts_data["audio_timesteps"],
+                                    audio_loss_mask=out.get("audio_loss_mask"),
+                                    text_embeds=cts_data["text_embeds"],
+                                    text_mask=cts_data["text_mask"],
+                                    frame_rate=cts_data["frame_rate"],
+                                    transformer_options=cts_data["transformer_options"],
+                                    lambda_video_driven=cts_data["lambda_video_driven"],
+                                    lambda_audio_driven=cts_data["lambda_audio_driven"],
+                                )
+                                if cts_loss is not None:
+                                    loss = loss + cts_loss
+                            except Exception as e:
+                                logger.warning("Cross-Task Synergy loss failed: %s", e)
+
                     if _is_first_step:
                         _log_vram("FIRST_ITER: BEFORE backward", logger)
                     accelerator.backward(loss)
@@ -3477,6 +3509,8 @@ class NetworkTrainer:
                         pres_losses["loss/crepa"] = _crepa_value
                     if self_flow_metrics:
                         pres_losses.update(self_flow_metrics)
+                    if cts_metrics:
+                        pres_losses.update(cts_metrics)
 
                     # DEBUG: Check if LoRA parameters have gradients (requires LTX2_DEBUG env var)
                     if os.environ.get("LTX2_DEBUG", "0") == "1":

@@ -1671,7 +1671,7 @@ reference_cache_directory/                  # IC-LoRA only
 
 ### Audio/Voice Training with Mixed Datasets
 
-In mixed datasets, audio batches are a minority. Non-audio steps update shared transformer weights without audio supervision, causing audio drift. Mitigations:
+Audio overfits faster than video due to lower-dimensional latent space and simpler temporal structure. In mixed datasets, audio batches are also a minority — non-audio steps update shared weights without audio supervision, causing audio drift. The tools below address both problems.
 
 **1. Oversample audio items** — set `num_repeats` so audio batches are 30-50% of steps:
 ```toml
@@ -1680,28 +1680,61 @@ video_directory = "audio_video_clips"
 num_repeats = 5
 ```
 
-**2. `--audio_dop`** — preserves base model audio predictions on non-audio steps. Runs LoRA OFF/ON forwards on silence audio latents, MSE on audio branch only. +2 fwd / +1 bwd per non-audio step, zero cost on audio batches. Logged as `loss/audio_dop`. Mutually exclusive with `--audio_silence_regularizer`.
+**2. Lower audio learning rate** — audio converges faster, so reduce its LR relative to video. Use `--audio_lr` for a blanket reduction or `--lr_args` for per-module control. Joint AV training typically needs a lower base LR than video-only (UniAVGen uses 4x lower LR for joint vs single-modality training).
+```
+--learning_rate 1e-4 --audio_lr 3e-5
+```
+
+**3. Lower audio LoRA rank** — audio needs less adaptation capacity. Use `--audio_dim` to set a smaller rank for audio modules while keeping video rank higher:
+```
+--network_dim 32 --audio_dim 8 --audio_alpha 8
+```
+
+**4. `--audio_dop`** — preserves base model audio predictions on non-audio steps. Runs LoRA OFF/ON forwards on silence audio latents, MSE on audio branch only. +2 fwd / +1 bwd per non-audio step, zero cost on audio batches. Logged as `loss/audio_dop`. Mutually exclusive with `--audio_silence_regularizer`.
 ```
 --audio_dop --audio_dop_args multiplier=0.5
 ```
 
-**3. `--dop`** — preserves all base model outputs (video + audio) using a class prompt. Broader than audio DOP but applies to every step. +2 fwd / +1 bwd per step.
-```
---dop --dop_args multiplier=0.5
-```
-
-**4. `--audio_silence_regularizer`** — converts non-audio batches to audio batches with silence target. Cheaper than DOP (+0 extra forwards) but silence is an approximation.
+**5. `--audio_silence_regularizer`** — converts non-audio batches to audio batches with silence target. Cheaper than DOP (+0 extra forwards) but silence is an approximation.
 ```
 --audio_silence_regularizer --audio_silence_regularizer_weight 0.5
 ```
 
-**5. Inverse-frequency loss balancing** — auto-boosts audio loss weight proportional to audio batch rarity:
-```
---audio_loss_balance_mode inv_freq --audio_loss_balance_min 0.05 --audio_loss_balance_max 4.0
-```
-Alternatives: `--audio_loss_balance_mode ema_mag` matches audio loss magnitude to a target fraction of video loss. `--audio_loss_balance_mode uncertainty` uses learnable log-variance scalars (zero hyperparameters).
+**6. Loss balancing** (`--audio_loss_balance_mode`) — three modes for dynamic audio loss weight adjustment:
+- `inv_freq` — scales audio weight by inverse of audio-batch frequency EMA. Compensates when audio batches are rare:
+  ```
+  --audio_loss_balance_mode inv_freq --audio_loss_balance_min 0.05 --audio_loss_balance_max 4.0
+  ```
+- `ema_mag` — tracks audio/video loss magnitude EMAs and scales audio weight to match a target ratio (default 0.33). Bidirectional — dampens audio when too high, boosts when too low:
+  ```
+  --audio_loss_balance_mode ema_mag --audio_loss_balance_target_ratio 0.33
+  ```
+- `uncertainty` — two learnable log-variance scalars optimized jointly with LoRA weights (Kendall et al., CVPR 2018). No manual weight tuning required — scalars are learned via backpropagation:
+  ```
+  --audio_loss_balance_mode uncertainty
+  ```
 
-**6. Diagnostics**
+**7. Independent modality dropout** — drop video or audio text conditioning independently per sample. Serves as both anti-dominance regularization and CFG training:
+```
+--video_caption_dropout_rate 0.1 --audio_caption_dropout_rate 0.15
+```
+
+**8. Modality freezing** — auto-freezes the dominant modality's LoRA when loss ratio crosses a threshold (G2D, 2025). Lets the under-performing modality train without gradient interference:
+```
+--modality_freeze_check_interval 500 --modality_freeze_ratio_threshold 0.5
+```
+
+**9. Self-Flow audio alignment** — anchors audio hidden states to the base model's representations via cosine similarity loss, preventing audio feature drift during LoRA adaptation:
+```
+--self_flow --self_flow_args lambda_self_flow=0.1 lambda_audio=0.1 teacher_mode=base
+```
+
+**10. Cross-Task Synergy** — auxiliary losses with one modality clean (timestep=0) provide stable cross-modal alignment targets (Harmony, 2025). Adds two extra forward passes per AV batch:
+```
+--cts_lambda_video_driven 0.3 --cts_lambda_audio_driven 0.1
+```
+
+**11. Diagnostics** — per-modality gradient norms (`grad_norm/video`, `grad_norm/audio`, `grad_norm/audio_video_ratio`) are logged automatically in AV mode. A ratio deviating >3x from its initial value indicates modality imbalance.
 
 - If `failed > 0` in latent caching summary, audio extraction is broken for those items
 - After mode switch (video→AV), re-run both latent and text encoder caching without `--skip_existing`

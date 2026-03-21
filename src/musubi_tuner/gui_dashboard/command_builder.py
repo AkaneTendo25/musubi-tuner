@@ -779,6 +779,10 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
         cmd += ["--min_audio_batches_per_accum", str(t.min_audio_batches_per_accum)]
     if t.audio_batch_probability is not None:
         cmd += ["--audio_batch_probability", str(t.audio_batch_probability)]
+    if t.cts_lambda_video_driven > 0:
+        cmd += ["--cts_lambda_video_driven", str(t.cts_lambda_video_driven)]
+    if t.cts_lambda_audio_driven > 0:
+        cmd += ["--cts_lambda_audio_driven", str(t.cts_lambda_audio_driven)]
     if t.modality_freeze_check_interval > 0:
         cmd += ["--modality_freeze_check_interval", str(t.modality_freeze_check_interval)]
         if t.modality_freeze_ratio_threshold != 0.5:
