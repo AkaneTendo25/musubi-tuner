@@ -3223,6 +3223,8 @@ class NetworkTrainer:
                     audio_presence_ema_value = None
                     audio_loss_ema_value = None
                     video_loss_ema_value = None
+                    grad_norm_video_value = None  # Per-modality gradient norms
+                    grad_norm_audio_value = None
                     _loss_type = getattr(args, "loss_type", "mse")
                     _huber_delta = getattr(args, "huber_delta", 1.0)
 
@@ -3459,6 +3461,25 @@ class NetworkTrainer:
                                 params_to_clip.extend(self._self_flow.get_trainable_params())
                             accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
 
+                        # Per-modality gradient norm tracking
+                        if len(accelerator.trackers) > 0 and dict_output:
+                            unwrapped_net = accelerator.unwrap_model(network)
+                            lora_modules = getattr(unwrapped_net, "unet_loras", None)
+                            if lora_modules:
+                                video_grad_sq_sum = 0.0
+                                audio_grad_sq_sum = 0.0
+                                for lora in lora_modules:
+                                    is_audio = "audio_" in lora.lora_name
+                                    for param in lora.parameters():
+                                        if param.grad is not None:
+                                            g_sq = param.grad.data.norm().item() ** 2
+                                            if is_audio:
+                                                audio_grad_sq_sum += g_sq
+                                            else:
+                                                video_grad_sq_sum += g_sq
+                                grad_norm_video_value = video_grad_sq_sum ** 0.5
+                                grad_norm_audio_value = audio_grad_sq_sum ** 0.5
+
                     if _is_first_step:
                         _log_vram("FIRST_ITER: BEFORE optimizer.step", logger)
                     optimizer.step()
@@ -3572,6 +3593,12 @@ class NetworkTrainer:
                         logs["loss/audio_loss_ema"] = audio_loss_ema_value
                     if video_loss_ema_value is not None:
                         logs["loss/video_loss_ema"] = video_loss_ema_value
+                    if grad_norm_video_value is not None:
+                        logs["grad_norm/video"] = grad_norm_video_value
+                    if grad_norm_audio_value is not None:
+                        logs["grad_norm/audio"] = grad_norm_audio_value
+                        if grad_norm_video_value is not None and grad_norm_video_value > 0:
+                            logs["grad_norm/audio_video_ratio"] = grad_norm_audio_value / grad_norm_video_value
                     if pres_losses:
                         logs.update(pres_losses)
                     accelerator.log(logs, step=global_step)
