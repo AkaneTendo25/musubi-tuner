@@ -1,6 +1,7 @@
 """LTX-2 LoRA Training Implementation."""
 
 import argparse
+import copy
 import gc
 import os
 import random
@@ -825,34 +826,42 @@ class LTX2NetworkTrainer(NetworkTrainer):
         mask_dtype = dtype if dtype in (torch.float16, torch.float32, torch.float64, torch.bfloat16) else torch.float32
         neg_inf = torch.finfo(mask_dtype).min
 
-        if bool(getattr(args, "audio_ref_use_negative_positions", False)):
+        # Always generate separate ref/target position arrays for audio_ref_only_ic.
+        # ID-LoRA reference generates positions independently: both ref and target start
+        # at time=0 by default; with negative positions enabled, ref is shifted to t<0.
+        # Without this override the wrapper would compute positions for the combined
+        # sequence, placing target after ref (non-overlapping) — a layout mismatch.
+        # Position override is always applied for audio_ref_only_ic (not gated by a flag).
+        use_negative_positions = bool(getattr(args, "audio_ref_use_negative_positions", False))
+        if ref_tokens > 0:
             from musubi_tuner.ltx_2.types import AudioLatentShape
 
             audio_patchifier = getattr(transformer, "_audio_patchifier", None)
             if audio_patchifier is None and hasattr(transformer, "module"):
                 audio_patchifier = getattr(transformer.module, "_audio_patchifier", None)
             if audio_patchifier is None:
-                logger.warning("audio_ref_use_negative_positions requested but audio patchifier is unavailable; skipping override")
+                if use_negative_positions:
+                    logger.warning("audio_ref position override requested but audio patchifier is unavailable; skipping")
             else:
                 channels = int(audio_model_latents.shape[1])
                 mel_bins = int(audio_model_latents.shape[3])
                 tgt_tokens = total_audio_seq_len - ref_tokens
 
                 # Generate SEPARATE position arrays for ref and target (matches ID-LoRA reference).
-                # Target positions start at 0 (aligned with video time); ref positions are
-                # shifted to negative time with a one-step gap for clean positional separation.
+                # Target positions always start at 0 (aligned with video time).
                 ref_shape = AudioLatentShape(batch=bsz, channels=channels, frames=ref_tokens, mel_bins=mel_bins)
                 ref_positions = audio_patchifier.get_patch_grid_bounds(ref_shape, device=device).to(dtype=mask_dtype)
 
-                # Compute time-per-latent for the gap (hop * downsample / sample_rate)
-                _hop = getattr(audio_patchifier, "hop_length", 160)
-                _ds = getattr(audio_patchifier, "audio_latent_downsample_factor", 4)
-                _sr = getattr(audio_patchifier, "sample_rate", 16000)
-                time_per_latent = float(_hop) * float(_ds) / float(_sr)
+                if use_negative_positions:
+                    # Shift ref into negative time with a one-step gap for clean positional separation.
+                    _hop = getattr(audio_patchifier, "hop_length", 160)
+                    _ds = getattr(audio_patchifier, "audio_latent_downsample_factor", 4)
+                    _sr = getattr(audio_patchifier, "sample_rate", 16000)
+                    time_per_latent = float(_hop) * float(_ds) / float(_sr)
+                    ref_duration = ref_positions[:, :, -1:, 1:2]
+                    ref_positions = ref_positions - ref_duration - time_per_latent
 
-                # Shift ref into negative time: last ref token ends at -gap
-                ref_duration = ref_positions[:, :, -1:, 1:2]
-                ref_positions = ref_positions - ref_duration - time_per_latent
+                # else: ref positions start at 0 (same as target) — matches ID-LoRA default
 
                 tgt_shape = AudioLatentShape(batch=bsz, channels=channels, frames=max(tgt_tokens, 1), mel_bins=mel_bins)
                 tgt_positions = audio_patchifier.get_patch_grid_bounds(tgt_shape, device=device).to(dtype=mask_dtype)
@@ -2305,6 +2314,37 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 logger.warning(
                     "audio_ref_* options are set but --ic_lora_strategy is '%s'; options will be ignored.",
                     ic_lora_strategy,
+                )
+        else:
+            # Warn about recommended settings for audio_ref_only_ic (based on ID-LoRA reference config).
+            first_frame_p = float(getattr(args, "ltx2_first_frame_conditioning_p", 0.0))
+            if first_frame_p < 0.01 and self._ltx_mode == "av":
+                logger.warning(
+                    "audio_ref_only_ic: --ltx2_first_frame_conditioning_p is %.2f (effectively off). "
+                    "The ID-LoRA reference uses 0.9 — first-frame conditioning provides face identity "
+                    "while the LoRA provides voice identity. Set --ltx2_first_frame_conditioning_p 0.9 "
+                    "for best results.",
+                    first_frame_p,
+                )
+            if not args.audio_ref_use_negative_positions:
+                logger.warning(
+                    "audio_ref_only_ic: --audio_ref_use_negative_positions is off. "
+                    "The ID-LoRA reference enables this for clean positional separation "
+                    "between reference and target audio tokens."
+                )
+            if not args.audio_ref_mask_cross_attention_to_reference and self._ltx_mode == "av":
+                logger.warning(
+                    "audio_ref_only_ic: --audio_ref_mask_cross_attention_to_reference is off. "
+                    "The ID-LoRA reference enables this during training so video attends "
+                    "only to target audio (not reference). Masks are automatically disabled "
+                    "during sampling/inference."
+                )
+            if not args.audio_ref_mask_reference_from_text_attention:
+                logger.warning(
+                    "audio_ref_only_ic: --audio_ref_mask_reference_from_text_attention is off. "
+                    "The ID-LoRA reference enables this during training to prevent reference "
+                    "audio from attending to text (which describes target speech, not reference). "
+                    "Masks are automatically disabled during sampling/inference."
                 )
 
         # IC-LoRA strategies enable I2V-capable sampling flow in trainer.
@@ -5726,9 +5766,17 @@ class LTX2NetworkTrainer(NetworkTrainer):
                     and audio_model_input is not None
                     and ref_audio_seq_len > 0
                 ):
+                    # ID-LoRA disables attention masks during inference (validation config
+                    # sets mask_cross_attention_to_reference=false, mask_ref_audio_to_text=false).
+                    # The masks are training scaffolding: they force the model to learn proper
+                    # attention patterns, but at inference time the LoRA weights have already
+                    # internalized the separation.  Only position overrides are kept.
+                    sampling_args = copy.copy(args)
+                    sampling_args.audio_ref_mask_cross_attention_to_reference = False
+                    sampling_args.audio_ref_mask_reference_from_text_attention = False
                     resolved_transformer_options.update(
                         self._build_audio_ref_transformer_overrides(
-                            args=args,
+                            args=sampling_args,
                             transformer=transformer,
                             video_latents=latent_model_input,
                             text_embeds=prompt_embeds,

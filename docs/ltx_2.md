@@ -43,17 +43,18 @@ Caching scripts (`ltx2_cache_latents.py`, `ltx2_cache_text_encoder_outputs.py`) 
     - [NF4 Quantization](#nf4-quantization)
     - [Model Version](#model-version)
     - [Audio-Video Support](#audio-video-support)
+    - [Loss Function Type](#loss-function-type)
     - [Loss Weighting](#loss-weighting)
     - [Additional Audio Training Flags](#additional-audio-training-flags)
+    - [Modality Freezing (G2D)](#modality-freezing-g2d)
     - [Per-Module Learning Rates](#per-module-learning-rates)
+    - [Per-Module LoRA Rank](#per-module-lora-rank)
     - [Preservation & Regularization](#preservation--regularization)
-    - [CREPA (Cross-frame Representation Alignment)](#crepa-cross-frame-representation-alignment)
-      - [Caching DINOv2 Features (Dino Mode)](#caching-dinov2-features-dino-mode)
     - [Self-Flow (Self-Supervised Flow Matching)](#self-flow-self-supervised-flow-matching)
     - [Timestep Sampling](#timestep-sampling)
     - [LoRA Targets](#lora-targets)
     - [IC-LoRA / Video-to-Video Training](#ic-lora--video-to-video-training)
-    - [Audio-Reference IC-LoRA](#audio-reference-ic-lora-speaker-identity)
+    - [Audio-Reference IC-LoRA](#audio-reference-ic-lora)
     - [Sampling with Tiled VAE](#sampling-with-tiled-vae)
     - [Precached Sample Prompts](#precached-sample-prompts)
     - [Two-Stage Sampling (WIP)](#two-stage-sampling-wip)
@@ -69,6 +70,8 @@ Caching scripts (`ltx2_cache_latents.py`, `ltx2_cache_text_encoder_outputs.py`) 
 - [Validation Datasets](#validation-datasets)
 - [Directory Structure](#directory-structure)
 - [Troubleshooting](#troubleshooting)
+  - [Audio/Voice Training with Mixed Datasets](#audiovoice-training-with-mixed-datasets)
+  - [Technical Notes](#technical-notes)
 - [4. Slider LoRA Training](#4-slider-lora-training)
   - [4a. Text-Only Mode](#4a-text-only-mode)
   - [4b. Reference Mode](#4b-reference-mode)
@@ -949,7 +952,7 @@ accelerate launch ... ltx2_train_network.py ^
 
 #### Timestep Sampling
 
-See also the [timestep bucketing documentation](./advanced_config.md#timestep-buckets) for advanced timestep bucketing options.
+See also the [timestep bucketing documentation](./advanced_config.md) for advanced timestep bucketing options.
 
 - `--timestep_sampling shifted_logit_normal`: Default LTX-2 method. Uses a shifted logit-normal distribution where the shift is computed based on sequence length (frames × height × width).
 - `--timestep_sampling uniform`: Uniform sampling from [0, 1].
@@ -1141,6 +1144,21 @@ Supported modes:
 - **`--ltx2_mode av`** — full audio-video model; trains both video and audio IC-LoRA layers.
 - **`--ltx2_mode audio`** — audio-only mode; trains only audio layers (video is a dummy zero tensor). `--lora_target_preset audio` is auto-selected (cross-modal layers that affect the dummy video branch are omitted).
 
+##### Recommended settings
+
+The ID-LoRA reference configuration enables all of the following. A warning is emitted at training start if any are missing:
+
+| Setting | Recommended value | Why |
+|---------|-------------------|-----|
+| `--ltx2_first_frame_conditioning_p` | `0.9` | Face identity comes from the first frame; voice identity comes from the reference LoRA. Without this, face identity is uncontrolled. |
+| `--audio_ref_use_negative_positions` | enabled | Clean positional separation between reference and target in RoPE space. |
+| `--audio_ref_mask_cross_attention_to_reference` | enabled | Forces video to sync with target audio only (not reference). AV mode only. |
+| `--audio_ref_mask_reference_from_text_attention` | enabled | Prevents reference audio from attending to text describing the target speech. |
+| `--timestep_sampling` | `shifted_logit_normal` | Timestep distribution used by ID-LoRA. |
+| `--network_dim` / `--network_alpha` | `128` / `128` | LoRA rank used by ID-LoRA. |
+
+> **Inference note**: Attention masks (`--audio_ref_mask_cross_attention_to_reference` and `--audio_ref_mask_reference_from_text_attention`) are **training scaffolding only**. They are automatically disabled during sampling/inference, matching the ID-LoRA reference which explicitly turns masks off at validation time. The masks force the model to learn proper attention patterns during training; at inference time the LoRA weights have already internalized the separation, so masks are unnecessary.
+
 ##### How it works
 
 1. Reference audio is encoded to latents and concatenated with noisy target audio along the temporal axis.
@@ -1299,9 +1317,8 @@ Reference audio latents are precached automatically when using `--precache_sampl
 
 - **Checkpoint**: requires an LTXAV checkpoint for both `--ltx2_mode av` and `--ltx2_mode audio`.
 - **Bucket separation**: `separate_audio_buckets = true` keeps audio/non-audio items in separate batches (avoids shape mismatches in collation).
-- **Attention overrides**: the three `--audio_ref_*` flags default to off. The reference ID-LoRA configuration enables all three.
-- **LoRA rank**: the reference ID-LoRA configuration uses rank 128 with alpha 128.
-- **First-frame conditioning**: the reference ID-LoRA configuration uses `first_frame_conditioning_p = 0.9`.
+- **Attention masks are training-only**: `--audio_ref_mask_cross_attention_to_reference` and `--audio_ref_mask_reference_from_text_attention` are applied only during training. They are automatically disabled during sampling/inference to match the ID-LoRA reference (which explicitly sets both to `false` during validation). Negative position overrides are always applied.
+- **First-frame conditioning is critical**: without `--ltx2_first_frame_conditioning_p 0.9`, the model cannot learn face identity from the first frame. A warning is emitted if this is not set in AV mode.
 - `--ic_lora_strategy auto` (default) infers the strategy from `--lora_target_preset` via `infer_ic_lora_strategy_from_preset()`.
 
 #### Sampling with Tiled VAE
@@ -1352,7 +1369,7 @@ For IC-LoRA / V2V training, you can also precache the conditioning image latents
 
 #### Checkpoint Output Format
 
-Saved LoRA checkpoints are converted to ComfyUI format by default. Both the original musubi-tuner format and the ComfyUI format are kept. For the standalone conversion utility, see [convert_lora.py](./tools.md) in the tools documentation.
+Saved LoRA checkpoints are converted to ComfyUI format by default. Both the original musubi-tuner format and the ComfyUI format are kept. For the standalone conversion utility, see `convert_lora.py`.
 
 | Flag | Behavior |
 |------|----------|
