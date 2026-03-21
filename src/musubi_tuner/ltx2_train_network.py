@@ -2164,9 +2164,9 @@ class LTX2NetworkTrainer(NetworkTrainer):
         args.weighting_scheme = "none"
 
         audio_balance_mode = str(getattr(args, "audio_loss_balance_mode", "none") or "none").lower()
-        if audio_balance_mode not in {"none", "inv_freq", "ema_mag"}:
+        if audio_balance_mode not in {"none", "inv_freq", "ema_mag", "uncertainty"}:
             raise ValueError(
-                f"audio_loss_balance_mode must be one of ['none', 'inv_freq', 'ema_mag']. Got: {audio_balance_mode}"
+                f"audio_loss_balance_mode must be one of ['none', 'inv_freq', 'ema_mag', 'uncertainty']. Got: {audio_balance_mode}"
             )
         args.audio_loss_balance_mode = audio_balance_mode
 
@@ -6523,12 +6523,14 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         "--audio_loss_balance_mode",
         type=str,
         default="none",
-        choices=["none", "inv_freq", "ema_mag"],
+        choices=["none", "inv_freq", "ema_mag", "uncertainty"],
         help=(
             "Optional dynamic balancing for audio loss. "
             "'none' keeps static --audio_loss_weight; "
             "'inv_freq' scales audio weight by inverse EMA of audio-batch frequency; "
-            "'ema_mag' matches audio loss magnitude to a target fraction of video loss."
+            "'ema_mag' matches audio loss magnitude to a target fraction of video loss; "
+            "'uncertainty' uses learnable log-variance scalars per modality "
+            "(Kendall et al., CVPR 2018), no hyperparameters required."
         ),
     )
     parser.add_argument(
@@ -6572,6 +6574,13 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         type=float,
         default=0.99,
         help="EMA decay for loss magnitude tracking when --audio_loss_balance_mode=ema_mag.",
+    )
+    parser.add_argument(
+        "--uncertainty_lr",
+        type=float,
+        default=None,
+        help="Learning rate for uncertainty weighting log-variance parameters. "
+             "Defaults to --learning_rate. Only used with --audio_loss_balance_mode=uncertainty.",
     )
     parser.add_argument(
         "--independent_audio_timestep",

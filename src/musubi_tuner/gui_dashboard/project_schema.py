@@ -364,7 +364,7 @@ class TrainingConfig(BaseModel):
     self_flow_offload_teacher_features: bool = False
 
     # Audio features
-    audio_loss_balance_mode: Literal["none", "inv_freq", "ema_mag"] = "none"
+    audio_loss_balance_mode: Literal["none", "inv_freq", "ema_mag", "uncertainty"] = "none"
     audio_loss_balance_beta: float = 0.01
     audio_loss_balance_eps: float = 0.05
     audio_loss_balance_min: float = 0.05

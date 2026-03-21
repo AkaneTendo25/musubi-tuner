@@ -48,6 +48,7 @@ from musubi_tuner.dataset.audio_quota_sampler import (
 from musubi_tuner.audio_loss_balance import (
     compute_ema_magnitude_audio_weight,
     compute_inverse_frequency_audio_weight,
+    compute_uncertainty_weighted_loss,
     update_loss_ema,
     update_audio_presence_ema,
 )
@@ -2055,6 +2056,14 @@ class NetworkTrainer:
                 audio_loss_ema,
             )
 
+        # Uncertainty weighting: learnable log-variance scalars (Kendall et al., CVPR 2018)
+        uncertainty_log_var_video = None
+        uncertainty_log_var_audio = None
+        if audio_loss_balance_mode == "uncertainty":
+            uncertainty_log_var_video = torch.nn.Parameter(torch.zeros(1))
+            uncertainty_log_var_audio = torch.nn.Parameter(torch.zeros(1))
+            logger.info("Uncertainty weighting enabled: learnable log-variance scalars initialized to 0.0")
+
         # Load dataset config
         if args.num_timestep_buckets is not None:
             logger.info(f"Using timestep bucketing. Number of buckets: {args.num_timestep_buckets}")
@@ -2371,6 +2380,18 @@ class NetworkTrainer:
             args, trainable_params
         )
 
+        # Add uncertainty weighting log-variance params to optimizer
+        if uncertainty_log_var_video is not None:
+            uncertainty_lr = float(getattr(args, "uncertainty_lr", None) or args.learning_rate)
+            uncertainty_log_var_video = uncertainty_log_var_video.to(device=accelerator.device)
+            uncertainty_log_var_audio = uncertainty_log_var_audio.to(device=accelerator.device)
+            optimizer.add_param_group({
+                "params": [uncertainty_log_var_video, uncertainty_log_var_audio],
+                "lr": uncertainty_lr,
+                "weight_decay": 0.0,
+            })
+            logger.info("Added uncertainty log-variance params to optimizer (lr=%.2e)", uncertainty_lr)
+
         def set_trainer_train_mode() -> None:
             optimizer_train_fn()
             self.training = True
@@ -2581,6 +2602,17 @@ class NetworkTrainer:
                     except Exception as e:
                         logger.warning(f"Failed to save Self-Flow projector to state dir: {e}")
 
+                # Save uncertainty weighting log-variance params
+                if uncertainty_log_var_video is not None:
+                    try:
+                        from safetensors.torch import save_file
+                        save_file(
+                            {"log_var_video": uncertainty_log_var_video.data, "log_var_audio": uncertainty_log_var_audio.data},
+                            os.path.join(output_dir, "uncertainty_log_vars.safetensors"),
+                        )
+                    except Exception as e:
+                        logger.warning(f"Failed to save uncertainty log-variance params: {e}")
+
         def load_model_hook(models, input_dir):
             # remove models except network
             remove_indices = []
@@ -2606,6 +2638,22 @@ class NetworkTrainer:
                         logger.info("Self-Flow: loaded EMA teacher state from %s", teacher_file)
                 except Exception as e:
                     logger.warning(f"Failed to load Self-Flow state from checkpoint dir: {e}")
+
+            # Load uncertainty weighting log-variance params
+            if uncertainty_log_var_video is not None:
+                try:
+                    from safetensors.torch import load_file
+                    lv_file = os.path.join(input_dir, "uncertainty_log_vars.safetensors")
+                    if os.path.exists(lv_file):
+                        lv_sd = load_file(lv_file)
+                        uncertainty_log_var_video.data.copy_(lv_sd["log_var_video"])
+                        uncertainty_log_var_audio.data.copy_(lv_sd["log_var_audio"])
+                        logger.info(
+                            "Loaded uncertainty log-variance params: video=%.4f, audio=%.4f",
+                            uncertainty_log_var_video.item(), uncertainty_log_var_audio.item(),
+                        )
+                except Exception as e:
+                    logger.warning(f"Failed to load uncertainty log-variance params: {e}")
 
         accelerator.register_save_state_pre_hook(save_model_hook)
         accelerator.register_load_state_pre_hook(load_model_hook)
@@ -3274,63 +3322,73 @@ class NetworkTrainer:
                         video_target = out["video_target"]
                         video_loss_mask = out.get("video_loss_mask")
                         video_loss = _masked_loss(video_pred, video_target, video_loss_mask)
-                        video_weight = float(out.get("video_loss_weight", 1.0))
-                        loss = video_loss * video_weight
-                        if audio_loss_balance_mode == "ema_mag":
-                            video_loss_item = max(float(video_loss.detach().item()), 1e-12)
-                            video_loss_ema = update_loss_ema(
-                                loss_ema=video_loss_ema,
-                                loss_value=video_loss_item,
-                                ema_decay=audio_loss_balance_ema_decay,
-                            )
-                            video_loss_ema_value = video_loss_ema
-                        # Capture video loss for logging (only if weight > 0)
-                        if video_weight > 0:
-                            video_loss_value = video_loss.detach().item()
 
                         audio_pred = out.get("audio_pred")
                         audio_target = out.get("audio_target")
                         audio_loss_mask = out.get("audio_loss_mask")
                         has_audio_loss = audio_pred is not None and audio_target is not None
-                        if audio_loss_balance_mode == "inv_freq":
-                            audio_presence_ema = update_audio_presence_ema(
-                                audio_presence_ema=audio_presence_ema,
-                                balance_beta=audio_loss_balance_beta,
-                                has_audio_loss=has_audio_loss,
+
+                        if audio_loss_balance_mode == "uncertainty" and has_audio_loss:
+                            # Uncertainty weighting: learnable log-variance scalars replace manual weights
+                            video_loss_value = video_loss.detach().item()
+                            audio_loss_raw = _masked_loss(audio_pred, audio_target, audio_loss_mask)
+                            audio_loss_value = audio_loss_raw.detach().item()
+                            loss = compute_uncertainty_weighted_loss(
+                                video_loss, audio_loss_raw,
+                                uncertainty_log_var_video, uncertainty_log_var_audio,
                             )
-                            audio_presence_ema_value = audio_presence_ema
-                        if has_audio_loss:
-                            audio_loss = _masked_loss(audio_pred, audio_target, audio_loss_mask)
-                            audio_weight = float(out.get("audio_loss_weight", 1.0))
-                            if audio_loss_balance_mode == "inv_freq":
-                                audio_weight = compute_inverse_frequency_audio_weight(
-                                    base_audio_weight=audio_weight,
-                                    audio_presence_ema=audio_presence_ema,
-                                    balance_eps=audio_loss_balance_eps,
-                                    balance_min=audio_loss_balance_min,
-                                    balance_max=audio_loss_balance_max,
-                                )
-                            elif audio_loss_balance_mode == "ema_mag":
-                                audio_loss_item = max(float(audio_loss.detach().item()), 1e-12)
-                                audio_loss_ema = update_loss_ema(
-                                    loss_ema=audio_loss_ema,
-                                    loss_value=audio_loss_item,
+                        else:
+                            # Standard weighting path (none / inv_freq / ema_mag)
+                            video_weight = float(out.get("video_loss_weight", 1.0))
+                            loss = video_loss * video_weight
+                            if audio_loss_balance_mode == "ema_mag":
+                                video_loss_item = max(float(video_loss.detach().item()), 1e-12)
+                                video_loss_ema = update_loss_ema(
+                                    loss_ema=video_loss_ema,
+                                    loss_value=video_loss_item,
                                     ema_decay=audio_loss_balance_ema_decay,
                                 )
-                                audio_loss_ema_value = audio_loss_ema
-                                audio_weight = compute_ema_magnitude_audio_weight(
-                                    base_audio_weight=audio_weight,
-                                    audio_loss_ema=audio_loss_ema,
-                                    video_loss_ema=video_loss_ema,
-                                    target_audio_ratio=audio_loss_balance_target_ratio,
-                                    balance_min=audio_loss_balance_min,
-                                    balance_max=audio_loss_balance_max,
+                                video_loss_ema_value = video_loss_ema
+                            # Capture video loss for logging (only if weight > 0)
+                            if video_weight > 0:
+                                video_loss_value = video_loss.detach().item()
+                            if audio_loss_balance_mode == "inv_freq":
+                                audio_presence_ema = update_audio_presence_ema(
+                                    audio_presence_ema=audio_presence_ema,
+                                    balance_beta=audio_loss_balance_beta,
+                                    has_audio_loss=has_audio_loss,
                                 )
-                            audio_weight_effective_value = audio_weight
-                            loss = loss + audio_loss * audio_weight
-                            # Capture audio loss for logging (only if weight > 0)
-                            if audio_weight > 0:
-                                audio_loss_value = audio_loss.detach().item()
+                                audio_presence_ema_value = audio_presence_ema
+                            if has_audio_loss:
+                                audio_loss = _masked_loss(audio_pred, audio_target, audio_loss_mask)
+                                audio_weight = float(out.get("audio_loss_weight", 1.0))
+                                if audio_loss_balance_mode == "inv_freq":
+                                    audio_weight = compute_inverse_frequency_audio_weight(
+                                        base_audio_weight=audio_weight,
+                                        audio_presence_ema=audio_presence_ema,
+                                        balance_eps=audio_loss_balance_eps,
+                                        balance_min=audio_loss_balance_min,
+                                        balance_max=audio_loss_balance_max,
+                                    )
+                                elif audio_loss_balance_mode == "ema_mag":
+                                    audio_loss_item = max(float(audio_loss.detach().item()), 1e-12)
+                                    audio_loss_ema = update_loss_ema(
+                                        loss_ema=audio_loss_ema,
+                                        loss_value=audio_loss_item,
+                                        ema_decay=audio_loss_balance_ema_decay,
+                                    )
+                                    audio_loss_ema_value = audio_loss_ema
+                                    audio_weight = compute_ema_magnitude_audio_weight(
+                                        base_audio_weight=audio_weight,
+                                        audio_loss_ema=audio_loss_ema,
+                                        video_loss_ema=video_loss_ema,
+                                        target_audio_ratio=audio_loss_balance_target_ratio,
+                                        balance_min=audio_loss_balance_min,
+                                        balance_max=audio_loss_balance_max,
+                                    )
+                                audio_weight_effective_value = audio_weight
+                                loss = loss + audio_loss * audio_weight
+                                audio_loss_value = audio_loss.detach().item() if audio_weight > 0 else None
                     else:
                         if isinstance(target, torch.Tensor):
                             model_pred = model_pred.to(device=target.device, dtype=network_dtype)
@@ -3599,6 +3657,13 @@ class NetworkTrainer:
                         logs["grad_norm/audio"] = grad_norm_audio_value
                         if grad_norm_video_value is not None and grad_norm_video_value > 0:
                             logs["grad_norm/audio_video_ratio"] = grad_norm_audio_value / grad_norm_video_value
+                    if uncertainty_log_var_video is not None:
+                        lv_v = uncertainty_log_var_video.detach().item()
+                        lv_a = uncertainty_log_var_audio.detach().item()
+                        logs["uncertainty/log_var_video"] = lv_v
+                        logs["uncertainty/log_var_audio"] = lv_a
+                        logs["uncertainty/precision_video"] = math.exp(-lv_v)
+                        logs["uncertainty/precision_audio"] = math.exp(-lv_a)
                     if pres_losses:
                         logs.update(pres_losses)
                     accelerator.log(logs, step=global_step)

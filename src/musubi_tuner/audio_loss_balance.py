@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import torch
+
 
 def update_audio_presence_ema(audio_presence_ema: float, balance_beta: float, has_audio_loss: bool) -> float:
     """Update EMA for audio-batch frequency."""
@@ -27,6 +29,32 @@ def update_loss_ema(loss_ema: float, loss_value: float, ema_decay: float) -> flo
     value = float(loss_value)
     ema = decay * float(loss_ema) + (1.0 - decay) * value
     return max(ema, 1e-12)
+
+
+def compute_uncertainty_weighted_loss(
+    video_loss: torch.Tensor,
+    audio_loss: torch.Tensor,
+    log_var_video: torch.Tensor,
+    log_var_audio: torch.Tensor,
+) -> torch.Tensor:
+    """Compute combined loss using homoscedastic uncertainty weighting.
+
+    Kendall et al., "Multi-Task Learning Using Uncertainty to Weigh Losses
+    for Scene Geometry and Semantics", CVPR 2018.
+
+    loss = 0.5 * exp(-log_var_v) * L_v + 0.5 * log_var_v
+         + 0.5 * exp(-log_var_a) * L_a + 0.5 * log_var_a
+
+    The log_var regularization terms prevent the model from zeroing out
+    either loss by making its variance arbitrarily large.
+    """
+    precision_v = torch.exp(-log_var_video)
+    precision_a = torch.exp(-log_var_audio)
+    loss = (
+        0.5 * precision_v * video_loss + 0.5 * log_var_video
+        + 0.5 * precision_a * audio_loss + 0.5 * log_var_audio
+    )
+    return loss
 
 
 def compute_ema_magnitude_audio_weight(

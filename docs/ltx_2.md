@@ -604,8 +604,8 @@ All other training mechanics (weighting scheme, masking, audio balancing) apply 
 - `--video_loss_weight`: Weight for video loss (default: 1.0).
 - `--audio_loss_weight`: Weight for audio loss in AV mode (default: 1.0).
 - Dataset config `video_loss_weight` / `audio_loss_weight` override the corresponding CLI weight for that dataset only.
-- `--audio_loss_balance_mode`: Audio loss balancing strategy. Values: `none` (default), `inv_freq`, `ema_mag`.
-- `--audio_loss_balance_min`, `--audio_loss_balance_max`: Clamp range for effective audio weight (defaults: 0.05, 4.0).
+- `--audio_loss_balance_mode`: Audio loss balancing strategy. Values: `none` (default), `inv_freq`, `ema_mag`, `uncertainty`.
+- `--audio_loss_balance_min`, `--audio_loss_balance_max`: Clamp range for effective audio weight (defaults: 0.05, 4.0). Used by `inv_freq` and `ema_mag` only.
 
 **`inv_freq` mode** — inverse-frequency reweighting for mixed audio/non-audio training. Boosts audio loss proportionally to how rare audio batches are.
 
@@ -645,6 +645,26 @@ Example:
 ```
 
 Use `ema_mag` when audio and video losses have different natural magnitudes and you want automatic scaling instead of manual `--audio_loss_weight` tuning.
+
+**`uncertainty` mode** — learnable homoscedastic uncertainty weighting (Kendall et al., CVPR 2018). Two log-variance scalars (`log_var_video`, `log_var_audio`) are added to the optimizer and learned jointly with LoRA weights. The combined loss is:
+
+```
+loss = 0.5 * exp(-log_var_v) * L_video + 0.5 * log_var_v
+     + 0.5 * exp(-log_var_a) * L_audio + 0.5 * log_var_a
+```
+
+The regularization terms (`0.5 * log_var`) penalize large variance, preventing either loss from being scaled to zero. Both scalars are initialized to 0.0 and optimized via backpropagation. `--video_loss_weight` and `--audio_loss_weight` are ignored in this mode.
+
+- `--uncertainty_lr`: Learning rate for log-variance parameters (default: same as `--learning_rate`).
+
+Example:
+```bash
+--audio_loss_balance_mode uncertainty
+```
+
+Logged to TensorBoard: `uncertainty/log_var_video`, `uncertainty/log_var_audio`, `uncertainty/precision_video`, `uncertainty/precision_audio`. Higher precision = more weight on that modality's loss. The log-variance params are saved/loaded with checkpoints for training resume.
+
+On video-only batches (no audio in the current batch), falls back to standard `video_loss * video_weight`.
 
 #### Additional Audio Training Flags
 
@@ -1656,7 +1676,7 @@ num_repeats = 5
 ```
 --audio_loss_balance_mode inv_freq --audio_loss_balance_min 0.05 --audio_loss_balance_max 4.0
 ```
-Alternative: `--audio_loss_balance_mode ema_mag` matches audio loss magnitude to a target fraction of video loss.
+Alternatives: `--audio_loss_balance_mode ema_mag` matches audio loss magnitude to a target fraction of video loss. `--audio_loss_balance_mode uncertainty` uses learnable log-variance scalars (zero hyperparameters).
 
 **6. Diagnostics**
 
