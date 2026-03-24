@@ -205,7 +205,7 @@ class LTX2Env:
     # Clamp FFN outputs to prevent bf16 overflow. Value is the clamp bound.
     # 60000 leaves headroom below bf16 max (~65504). 0 = disabled.
     # recommended=60000
-    ffn_clamp: float = 60000.0
+    ffn_clamp: float = 0.0
 
     # Skip no-op attention masks to enable Flash Attention on cross-attn.
     # recommended=False
