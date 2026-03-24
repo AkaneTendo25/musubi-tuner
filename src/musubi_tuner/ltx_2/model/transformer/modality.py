@@ -25,3 +25,4 @@ class Modality:
     attention_mask: torch.Tensor | None = None  # Shape: (B, T, T), values in [0, 1]
     a2v_cross_attention_mask: torch.Tensor | None = None  # Shape: (B, Tq_video, Tk_audio)
     v2a_cross_attention_mask: torch.Tensor | None = None  # Shape: (B, Tq_audio, Tk_video)
+    dcr_detach_mask: torch.Tensor | None = None  # DCR: Shape (B, 1, 1), 1.0=normal 0.0=detach

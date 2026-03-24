@@ -426,6 +426,29 @@
 					</p>
 					<PathInput label="Cache Dir" value={$projectConfig?.training?.preservation_prompts_cache || ''} oninput={(e) => updateTraining('preservation_prompts_cache', e.target.value)} showFiles tooltip="Directory with cached preservation embeddings" />
 				</div>
+
+				<!-- TARP / DCR -->
+				<div class="p-3" style="background: var(--bg-elevated); border-radius: var(--radius-sm); border: 1px solid var(--border-subtle);">
+					<div class="flex items-center justify-between mb-1">
+						<span class="text-[12px] font-semibold" style="color: var(--text-primary);">TARP (Temporal Aligned RoPE Partitioning)</span>
+						<FormToggle checked={$projectConfig?.training?.tarp ?? false} onchange={(e) => updateTraining('tarp', e.target.checked)} />
+					</div>
+					<p class="text-[11px] leading-relaxed mb-2" style="color: var(--text-muted);">
+						Windowed cross-attention masks restricting each video frame to temporally nearby audio tokens. Requires AV mode. arXiv:2603.18600.
+					</p>
+					<FormField label="Window Multiplier" type="number" value={$projectConfig?.training?.tarp_window_multiplier ?? 3} oninput={(e) => updateTraining('tarp_window_multiplier', Number(e.target.value))} step="1" min={1} tooltip="Window size = multiplier * (audio_tokens_per_frame). Default 3." />
+				</div>
+
+				<div class="p-3" style="background: var(--bg-elevated); border-radius: var(--radius-sm); border: 1px solid var(--border-subtle);">
+					<div class="flex items-center justify-between mb-1">
+						<span class="text-[12px] font-semibold" style="color: var(--text-primary);">DCR (Dynamic Context Routing)</span>
+						<FormToggle checked={$projectConfig?.training?.dcr ?? false} onchange={(e) => updateTraining('dcr', e.target.checked)} />
+					</div>
+					<p class="text-[11px] leading-relaxed mb-2" style="color: var(--text-muted);">
+						Per-sample gradient detachment in cross-attention for mixed audio/video batches. Detaches absent-audio and clean-reference streams. Requires AV mode. arXiv:2603.18600.
+					</p>
+					<FormToggle label="Reference Detach" checked={$projectConfig?.training?.dcr_reference_detach ?? true} onchange={(e) => updateTraining('dcr_reference_detach', e.target.checked)} tooltip="Detach gradients when sigma=0 (clean reference conditioning)" />
+				</div>
 			</div>
 		</div>
 

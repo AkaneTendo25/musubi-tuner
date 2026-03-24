@@ -766,10 +766,16 @@ class LTX2NetworkTrainer(NetworkTrainer):
         self.default_guidance_scale = 3.0
         self._audio_preview_config: Optional[Dict[str, int | float]] = None
 
-        # Preservation / regularization (off by default — zero overhead)
+        # Preservation / regularization (off by default)
         self._preservation_active: bool = False
         self._preservation_helper = None
         self._last_dit_inputs: Optional[Dict[str, Any]] = None
+
+        # TARP / DCR (off by default)
+        self._tarp_enabled: bool = False
+        self._dcr_enabled: bool = False
+        self._tarp_window_multiplier: int = 3
+        self._dcr_reference_detach: bool = True
 
         # CREPA (off by default)
         self._crepa = None
@@ -924,10 +930,33 @@ class LTX2NetworkTrainer(NetworkTrainer):
     def pre_train_hook(self, args: argparse.Namespace, accelerator: Accelerator,
                        transformer=None, network=None) -> None:
         self._setup_preservation(args, accelerator)
+        self._setup_tarp_dcr(args)
         self._setup_crepa(args, accelerator, transformer)
         self._setup_self_flow(args, accelerator, transformer, network)
         self._apply_network_initialization(args, network)
         validate_lycoris_runtime(args, accelerator, transformer, network, logger)
+
+    def _setup_tarp_dcr(self, args: argparse.Namespace) -> None:
+        """Parse TARP / DCR CLI flags.  No-op when no flags are set."""
+        from musubi_tuner.preservation import parse_preservation_args
+
+        self._tarp_enabled = bool(getattr(args, "tarp", False))
+        self._dcr_enabled = bool(getattr(args, "dcr", False))
+
+        tarp_kw = parse_preservation_args(getattr(args, "tarp_args", None))
+        self._tarp_window_multiplier = int(tarp_kw.get("window_multiplier", 3))
+
+        dcr_kw = parse_preservation_args(getattr(args, "dcr_args", None))
+        self._dcr_reference_detach = dcr_kw.get("reference_detach", "true").lower() in ("true", "1", "yes")
+
+        if self._tarp_enabled:
+            if self._ltx_mode != "av":
+                raise ValueError("--tarp requires --ltx2_mode av")
+            logger.info("TARP enabled: window_multiplier=%d", self._tarp_window_multiplier)
+        if self._dcr_enabled:
+            if self._ltx_mode != "av":
+                raise ValueError("--dcr requires --ltx2_mode av")
+            logger.info("DCR enabled: per-sample routing, reference_detach=%s", self._dcr_reference_detach)
 
     def _setup_preservation(self, args: argparse.Namespace, accelerator: Accelerator) -> None:
         """Parse preservation CLI flags and prepare helper.  No-op when no flags are set."""
@@ -3771,6 +3800,40 @@ class LTX2NetworkTrainer(NetworkTrainer):
                     dtype=network_dtype,
                 )
             )
+
+        # TARP / DCR injection (no-op when both flags are off)
+        if (self._tarp_enabled or self._dcr_enabled) and audio_enabled_for_batch:
+            resolved_transformer_options = dict(resolved_transformer_options)
+            if self._tarp_enabled:
+                resolved_transformer_options["tarp_config"] = {
+                    "window_multiplier": self._tarp_window_multiplier,
+                }
+            if self._dcr_enabled:
+                # Per-sample audio mask: 1.0 = normal gradient, 0.0 = detach
+                # Detach when: (a) audio absent (zero-padded), or
+                #              (b) audio is clean reference (timestep=0)
+                _dcr_audio = torch.ones(latents.shape[0], device=accelerator.device)
+                _dcr_audio_lengths = batch.get("audio_lengths")
+                if isinstance(_dcr_audio_lengths, dict):
+                    _dcr_audio_lengths = _dcr_audio_lengths.get("lengths")
+                if isinstance(_dcr_audio_lengths, torch.Tensor):
+                    if _dcr_audio_lengths.dim() == 0:
+                        _dcr_audio_lengths = _dcr_audio_lengths.view(1)
+                    if _dcr_audio_lengths.numel() == 1 and latents.shape[0] != 1:
+                        _dcr_audio_lengths = _dcr_audio_lengths.expand(latents.shape[0])
+                    _dcr_audio_lengths = _dcr_audio_lengths.to(device=accelerator.device, dtype=torch.int64)
+                    _dcr_audio[_dcr_audio_lengths <= 0] = 0.0
+                # Reference-stream detachment: sigma == 0 means clean conditioning
+                if self._dcr_reference_detach:
+                    if isinstance(audio_sigma, torch.Tensor):
+                        _dcr_audio[audio_sigma == 0] = 0.0
+                resolved_transformer_options["dcr_audio_mask"] = _dcr_audio.view(-1, 1, 1)
+
+                # Per-sample video mask: detach video when it's the reference (sigma=0)
+                if self._dcr_reference_detach and isinstance(sigma, torch.Tensor) and (sigma == 0).any():
+                    _dcr_video = torch.ones(latents.shape[0], device=accelerator.device)
+                    _dcr_video[sigma == 0] = 0.0
+                    resolved_transformer_options["dcr_video_mask"] = _dcr_video.view(-1, 1, 1)
 
         # Store inputs for preservation / Self-Flow techniques (no-op when both are off)
         if self._preservation_active or self._self_flow_active:
@@ -7130,6 +7193,30 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         type=str,
         nargs="*",
         help="Key=value args for audio DOP, e.g. multiplier=0.5",
+    )
+
+    # -- TARP / DCR (arXiv:2603.18600) --
+    parser.add_argument(
+        "--tarp",
+        action="store_true",
+        help="Enable TARP windowed cross-attention for audio-video temporal locality (arXiv:2603.18600).",
+    )
+    parser.add_argument(
+        "--tarp_args",
+        type=str,
+        nargs="*",
+        help="Key=value args for TARP, e.g. window_multiplier=3",
+    )
+    parser.add_argument(
+        "--dcr",
+        action="store_true",
+        help="Enable DCR per-sample gradient routing for mixed audio/video batches (arXiv:2603.18600).",
+    )
+    parser.add_argument(
+        "--dcr_args",
+        type=str,
+        nargs="*",
+        help="Key=value args for DCR, e.g. reference_detach=true",
     )
 
     # -- CREPA (Cross-frame Representation Alignment) --

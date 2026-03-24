@@ -771,15 +771,29 @@ The `class` parameter should be a general description without your trigger word 
 --audio_dop --audio_dop_args multiplier=0.5
 ```
 
+**TARP (Temporally Aligned RoPE and Partitioning)** — Windowed cross-attention masks that restrict each video frame to temporally nearby audio tokens (A2V) and each audio token to its nearest video frame (V2A). Enforces temporal locality in the AV cross-attention without modifying model weights. Requires `--ltx2_mode av`. From [arXiv:2603.18600](https://arxiv.org/abs/2603.18600).
+```bash
+--tarp --tarp_args window_multiplier=3
+```
+`window_multiplier` controls the A2V window size: `s = multiplier * floor(audio_tokens / video_frames)`. Default 3 (each frame sees 3x its proportional share of audio). V2A always uses nearest-neighbour (s=1).
+
+**DCR (Dynamic Context Routing)** — Per-sample gradient detachment in cross-attention for mixed audio/video batches. When a sample lacks audio (zero-padded) or uses a clean reference (sigma=0), DCR detaches that stream's cross-attention context, preventing gradient flow through absent or reference-only streams. Forward values are unchanged; only the gradient path is masked. Requires `--ltx2_mode av`. From [arXiv:2603.18600](https://arxiv.org/abs/2603.18600).
+```bash
+--dcr --dcr_args reference_detach=true
+```
+`reference_detach` (default `true`) additionally detaches the reference stream when its timestep sigma is exactly 0.
+
 | Technique | Extra forwards/step | Extra backwards/step | Recommended multiplier |
 |-----------|-------------------|---------------------|----------------------|
 | `--blank_preservation` | +2 | +1 | 0.5 - 1.0 |
 | `--dop` | +2 | +1 | 0.5 - 1.0 |
 | `--prior_divergence` | +1 | 0 | 0.05 - 0.1 |
 | `--audio_dop` | +2 (non-audio steps only) | +1 (non-audio steps only) | 0.3 - 1.0 |
+| `--tarp` | 0 | 0 | N/A (mask only) |
+| `--dcr` | 0 | 0 | N/A (gradient routing) |
 
 > [!CAUTION]
-> Each preservation technique adds transformer forward passes per step. Audio DOP costs apply only on non-audio steps.
+> Each preservation technique adds transformer forward passes per step. Audio DOP costs apply only on non-audio steps. TARP and DCR add no extra passes — they modify the existing forward/backward in-place.
 
 **CREPA (Cross-frame Representation Alignment)** — Encourages temporal consistency across video frames by aligning DiT hidden states across frames via a small projector MLP. Only the projector is trained; all other modules stay frozen. CREPA uses hooks to capture intermediate features from the existing forward pass (no extra forward passes). Two modes are available: `dino` (based on [arXiv 2506.09229](https://arxiv.org/abs/2506.09229), aligns to pre-cached DINOv2 features from neighboring frames) and `backbone` (inspired by [SimpleTuner LayerSync](https://github.com/bghira/SimpleTuner), aligns to a deeper block of the same transformer).
 

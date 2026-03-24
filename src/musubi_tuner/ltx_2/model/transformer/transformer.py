@@ -473,8 +473,8 @@ class BasicAVTransformerBlock(torch.nn.Module):
         v2a_diag = os.getenv("LTX2_V2A_DIAG", "0") == "1"
         attn_retry_fp32 = os.getenv("LTX2_ATTN_FP32_RETRY", "0") == "1"
         # Clamp FFN outputs to prevent bf16 overflow (max ~65504).
-        # Default 60000 leaves headroom. Set LTX2_FFN_CLAMP=0 to disable.
-        ffn_clamp = float(os.getenv("LTX2_FFN_CLAMP", "60000"))
+        # Set LTX2_FFN_CLAMP=60000 to enable. Default: disabled (0).
+        ffn_clamp = float(os.getenv("LTX2_FFN_CLAMP", "0"))
         force_pytorch_cross_attn = (
             os.getenv("LTX2_FORCE_PYTORCH_CROSS_ATTN", "0") == "1"
             or getattr(self, "_force_pytorch_cross_attn", False)
@@ -674,6 +674,10 @@ class BasicAVTransformerBlock(torch.nn.Module):
             vx_norm3 = rms_norm(vx, eps=self.norm_eps)
             ax_norm3 = rms_norm(ax, eps=self.norm_eps)
 
+            # DCR: per-sample gradient detachment (applied after AdaLN, see below)
+            dcr_audio_mask = audio.dcr_detach_mask if audio is not None else None
+            dcr_video_mask = video.dcr_detach_mask if video is not None else None
+
             (
                 scale_ca_audio_hidden_states_a2v,
                 shift_ca_audio_hidden_states_a2v,
@@ -706,6 +710,9 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 # AdaLN Structural Fix
                 vx_scaled = (vx_norm3.to(torch.float32) * (1 + scale_ca_video_hidden_states_a2v.to(torch.float32)) + shift_ca_video_hidden_states_a2v.to(torch.float32)).to(vx.dtype)
                 ax_scaled = (ax_norm3.to(torch.float32) * (1 + scale_ca_audio_hidden_states_a2v.to(torch.float32)) + shift_ca_audio_hidden_states_a2v.to(torch.float32)).to(ax.dtype)
+                # DCR: detach audio context AFTER AdaLN so scale/shift params also don't get noisy gradients
+                if dcr_audio_mask is not None:
+                    ax_scaled = ax_scaled * dcr_audio_mask + ax_scaled.detach() * (1 - dcr_audio_mask)
                 a2v_mask = perturbations.mask_like(PerturbationType.SKIP_A2V_CROSS_ATTN, self.idx, vx)
                 vx = vx + (
                     _attn_with_retry(
@@ -727,6 +734,9 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 # AdaLN Structural Fix
                 ax_scaled = (ax_norm3.to(torch.float32) * (1 + scale_ca_audio_hidden_states_v2a.to(torch.float32)) + shift_ca_audio_hidden_states_v2a.to(torch.float32)).to(ax.dtype)
                 vx_scaled = (vx_norm3.to(torch.float32) * (1 + scale_ca_video_hidden_states_v2a.to(torch.float32)) + shift_ca_video_hidden_states_v2a.to(torch.float32)).to(vx.dtype)
+                # DCR: detach video context AFTER AdaLN
+                if dcr_video_mask is not None:
+                    vx_scaled = vx_scaled * dcr_video_mask + vx_scaled.detach() * (1 - dcr_video_mask)
                 v2a_mask = perturbations.mask_like(PerturbationType.SKIP_V2A_CROSS_ATTN, self.idx, ax)
                 _log_stats("v2a_ax_scaled", ax_scaled)
                 _log_stats("v2a_vx_scaled", vx_scaled)

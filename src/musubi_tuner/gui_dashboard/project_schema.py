@@ -320,6 +320,12 @@ class TrainingConfig(BaseModel):
     use_precached_preservation: bool = False
     preservation_prompts_cache: str = ""
 
+    # TARP / DCR (arXiv:2603.18600)
+    tarp: bool = False
+    tarp_window_multiplier: int = 3
+    dcr: bool = False
+    dcr_reference_detach: bool = True
+
     # CREPA
     crepa: bool = False
     crepa_mode: Literal["backbone", "dino"] = "backbone"

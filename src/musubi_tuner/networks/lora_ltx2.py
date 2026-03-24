@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import logging
 import types
+from dataclasses import replace
 from typing import Dict, List, Optional
 
 import torch
@@ -435,6 +436,56 @@ class LTX2Wrapper(nn.Module):
                 context_mask=audio_context_mask,
                 v2a_cross_attention_mask=v2a_cross_attention_mask,
             )
+
+        # TARP: windowed A2V cross-attention mask
+        tarp_config = transformer_options.get("tarp_config") if isinstance(transformer_options, dict) else None
+        if (
+            tarp_config is not None
+            and video_modality is not None
+            and audio_modality is not None
+            and audio_seq_len > 0
+        ):
+            from musubi_tuner.tarp_dcr import compute_tarp_a2v_mask, compute_tarp_v2a_mask
+
+            spatial_per_frame = video_seq_len // vframes
+
+            # A2V: video queries attend to windowed audio (s = 3c)
+            tarp_a2v = compute_tarp_a2v_mask(
+                video_frames=vframes,
+                video_spatial_tokens=spatial_per_frame,
+                audio_seq_len=audio_seq_len,
+                window_multiplier=tarp_config["window_multiplier"],
+                device=video_tokens.device,
+                dtype=video_latents.dtype,
+            )
+            if tarp_a2v is not None:
+                existing_mask = video_modality.a2v_cross_attention_mask
+                if existing_mask is not None:
+                    tarp_a2v = torch.minimum(existing_mask, tarp_a2v)
+                video_modality = replace(video_modality, a2v_cross_attention_mask=tarp_a2v)
+
+            # V2A: each audio token attends to nearest video frame only (s = 1)
+            tarp_v2a = compute_tarp_v2a_mask(
+                video_frames=vframes,
+                video_spatial_tokens=spatial_per_frame,
+                audio_seq_len=audio_seq_len,
+                device=video_tokens.device,
+                dtype=video_latents.dtype,
+            )
+            if tarp_v2a is not None:
+                existing_v2a = audio_modality.v2a_cross_attention_mask
+                if existing_v2a is not None:
+                    tarp_v2a = torch.minimum(existing_v2a, tarp_v2a)
+                audio_modality = replace(audio_modality, v2a_cross_attention_mask=tarp_v2a)
+
+        # DCR: per-sample gradient detachment masks
+        if isinstance(transformer_options, dict):
+            dcr_audio_mask = transformer_options.get("dcr_audio_mask")
+            if dcr_audio_mask is not None and audio_modality is not None:
+                audio_modality = replace(audio_modality, dcr_detach_mask=dcr_audio_mask)
+            dcr_video_mask = transformer_options.get("dcr_video_mask")
+            if dcr_video_mask is not None and video_modality is not None:
+                video_modality = replace(video_modality, dcr_detach_mask=dcr_video_mask)
 
         perturbations = BatchedPerturbationConfig.empty(bsz)
         video_pred_tokens, audio_pred_tokens = self.model(video_modality, audio_modality, perturbations)

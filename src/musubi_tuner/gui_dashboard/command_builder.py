@@ -734,6 +734,16 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
     if t.preservation_prompts_cache:
         cmd += ["--preservation_prompts_cache", t.preservation_prompts_cache]
 
+    # TARP / DCR
+    if t.tarp:
+        cmd.append("--tarp")
+        if t.tarp_window_multiplier != 3:
+            cmd += ["--tarp_args", f"window_multiplier={t.tarp_window_multiplier}"]
+    if t.dcr:
+        cmd.append("--dcr")
+        if not t.dcr_reference_detach:
+            cmd += ["--dcr_args", "reference_detach=false"]
+
     # Audio features
     if t.audio_loss_balance_mode != "none":
         cmd += ["--audio_loss_balance_mode", t.audio_loss_balance_mode]
