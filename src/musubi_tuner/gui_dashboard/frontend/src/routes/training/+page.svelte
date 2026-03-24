@@ -103,7 +103,13 @@
 							<FormToggle label="Mask Cross-Attn to Ref" checked={t.audio_ref_mask_cross_attention_to_reference ?? false} onchange={(e) => update('audio_ref_mask_cross_attention_to_reference', e.target.checked)} tooltip="Video attends only to target audio, not reference-audio tokens" />
 							<FormToggle label="Mask Ref from Text" checked={t.audio_ref_mask_reference_from_text_attention ?? false} onchange={(e) => update('audio_ref_mask_reference_from_text_attention', e.target.checked)} tooltip="Block reference-audio tokens from attending to text tokens" />
 						</div>
-						<FormField label="Identity Guidance Scale" type="number" value={t.audio_ref_identity_guidance_scale ?? 0.0} oninput={(e) => update('audio_ref_identity_guidance_scale', Number(e.target.value))} step="0.1" min={0} tooltip="CFG scale override for target-audio branch (0 = use standard guidance)" />
+						<FormField label="Identity Guidance Scale" type="number" value={t.audio_ref_identity_guidance_scale ?? 0.0} oninput={(e) => update('audio_ref_identity_guidance_scale', Number(e.target.value))} step="0.1" min={0} tooltip="Extra forward pass without reference to isolate and amplify speaker identity (0 = disabled, recommended: 3.0)" />
+						<div class="flex flex-wrap gap-x-4 gap-y-1 items-end">
+							<FormToggle label="AV Bimodal CFG" checked={t.av_bimodal_cfg ?? false} onchange={(e) => update('av_bimodal_cfg', e.target.checked)} tooltip="Extra forward pass with cross-modal attention disabled to strengthen independent audio/video generation" />
+							{#if t.av_bimodal_cfg}
+							<FormField label="Bimodal Scale" type="number" value={t.av_bimodal_scale ?? 3.0} oninput={(e) => update('av_bimodal_scale', Number(e.target.value))} step="0.1" min={1} tooltip="Bimodal guidance strength. Applied as (scale-1) × delta. Default: 3.0" />
+							{/if}
+						</div>
 					</div>
 					{/if}
 					<FormField label="Network Args" value={t.network_args || ''} oninput={(e) => update('network_args', e.target.value)} placeholder="key=value ..." tooltip="Extra network args (space-separated key=value)" />

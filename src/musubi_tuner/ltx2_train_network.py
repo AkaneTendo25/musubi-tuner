@@ -5765,6 +5765,37 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 if ref_audio_seq_len <= 0:
                     raise ValueError("Reference-audio latent sequence length must be > 0")
 
+        # Identity guidance setup
+        _identity_guidance_scale = 0.0
+        if audio_ref_only_ic_sampling and ref_audio_seq_len > 0:
+            _identity_guidance_scale = float(getattr(args, "audio_ref_identity_guidance_scale", 0.0) or 0.0)
+            if _identity_guidance_scale > 0.0:
+                logger.info(
+                    "Sampling: identity guidance scale=%.2f (extra forward pass per step without reference)",
+                    _identity_guidance_scale,
+                )
+
+        # AV bimodal CFG setup
+        _av_bimodal_cfg = bool(getattr(args, "av_bimodal_cfg", False))
+        _av_bimodal_scale = float(getattr(args, "av_bimodal_scale", 3.0) or 3.0)
+        if _av_bimodal_cfg and audio_latents is not None:
+            from musubi_tuner.ltx_2.guidance.perturbations import (
+                BatchedPerturbationConfig as _BPC,
+                Perturbation as _Pert,
+                PerturbationConfig as _PertCfg,
+                PerturbationType as _PertType,
+            )
+            _bimodal_pert_single = _PertCfg(perturbations=[
+                _Pert(type=_PertType.SKIP_A2V_CROSS_ATTN, blocks=None),
+                _Pert(type=_PertType.SKIP_V2A_CROSS_ATTN, blocks=None),
+            ])
+            logger.info(
+                "Sampling: AV bimodal CFG scale=%.2f (extra forward pass per step without cross-modal attention)",
+                _av_bimodal_scale,
+            )
+        else:
+            _av_bimodal_cfg = False
+
         # Denoising loop using LTX-2 scheduler with sigmas
         with torch.no_grad():
             for step_idx in tqdm(range(len(sigmas) - 1), desc="LTX-2 preview", leave=False):
@@ -5888,38 +5919,23 @@ class LTX2NetworkTrainer(NetworkTrainer):
 
                 sigma_for_video = denoise_mask * sigma if denoise_mask is not None else sigma
 
+                # --- Video CFG ---
+                x0_cond = None
                 if do_classifier_free_guidance:
                     effective_cfg_scale = cfg_scale if cfg_scale is not None else guidance_scale
-                    # Split velocity predictions for CFG
                     vel_uncond, vel_cond = video_pred.chunk(2)
-                    # Convert each to x0
                     x0_uncond = X0PredictionWrapper.velocity_to_x0(latents, vel_uncond, sigma_for_video)
                     x0_cond = X0PredictionWrapper.velocity_to_x0(latents, vel_cond, sigma_for_video)
-                    # Apply CFG to x0 (official formula)
                     video_x0 = x0_uncond + effective_cfg_scale * (x0_cond - x0_uncond)
                 else:
                     video_x0 = X0PredictionWrapper.velocity_to_x0(latents, video_pred, sigma_for_video)
 
-                if denoise_mask is not None and clean_latent is not None:
-                    # Official LTX-2 ordering: blend denoised x0 before Euler step.
-                    video_x0 = video_x0 * denoise_mask + clean_latent * (1.0 - denoise_mask)
-
-                # Euler step to next latent
-                latents = stepper.step(latents, video_x0, sigmas, step_idx)
-
-                # CRITICAL: Hard-lock conditioned frames after Euler step
-                # The Euler step performs gradual correction, but I2V requires absolute locking
-                if denoise_mask is not None and clean_latent is not None:
-                    # Restore locked frames: where denoise_mask == 0.0, force latents = clean_latent
-                    latents = latents * denoise_mask + clean_latent * (1.0 - denoise_mask)
-
+                # --- Audio CFG ---
+                audio_x0 = None
+                aud_x0_cond = None
                 if audio_pred is not None and audio_latents is not None:
                     audio_pred = audio_pred.to(dtype=audio_latents.dtype)
                     audio_cfg_scale = cfg_scale if cfg_scale is not None else guidance_scale
-                    if audio_ref_only_ic_sampling:
-                        identity_guidance_scale = float(getattr(args, "audio_ref_identity_guidance_scale", 0.0) or 0.0)
-                        if identity_guidance_scale > 0.0:
-                            audio_cfg_scale = identity_guidance_scale
                     if do_classifier_free_guidance:
                         aud_vel_uncond, aud_vel_cond = audio_pred.chunk(2)
                         aud_x0_uncond = X0PredictionWrapper.velocity_to_x0(audio_latents, aud_vel_uncond, sigma.item())
@@ -5927,6 +5943,144 @@ class LTX2NetworkTrainer(NetworkTrainer):
                         audio_x0 = aud_x0_uncond + audio_cfg_scale * (aud_x0_cond - aud_x0_uncond)
                     else:
                         audio_x0 = X0PredictionWrapper.velocity_to_x0(audio_latents, audio_pred, sigma.item())
+
+                    # --- Identity guidance: extra forward pass without reference audio ---
+                    # Isolates the reference audio's contribution and amplifies it (post-CFG).
+                    # Formula: audio_x0 += scale * (cond_with_ref - cond_without_ref)
+                    if _identity_guidance_scale > 0.0 and aud_x0_cond is not None:
+                        noref_audio = audio_latents.to(dtype=dit_dtype)
+                        tgt_seq_len = int(audio_latents.shape[2])
+                        noref_audio_ts = sigma.expand(tgt_seq_len).view(1, -1).to(
+                            device=transformer_device, dtype=dit_dtype,
+                        )
+                        noref_video = latents.to(dtype=dit_dtype)
+                        noref_video_ts = sigma.expand(1).to(device=transformer_device, dtype=dit_dtype)
+
+                        cond_prompt = prompt_embeds[1:2]  # conditional half only
+                        cond_mask = prompt_mask[1:2] if prompt_mask is not None else None
+
+                        noref_options = {"patches_replace": {}}
+                        if i2v_conditioning_mask_tokens is not None:
+                            noref_options["video_conditioning_mask"] = i2v_conditioning_mask_tokens
+
+                        noref_input = [noref_video, noref_audio] if self._audio_video else noref_video
+                        noref_pred = transformer(
+                            noref_input,
+                            timestep=noref_video_ts.unsqueeze(1),
+                            audio_timestep=noref_audio_ts,
+                            context=cond_prompt,
+                            attention_mask=cond_mask,
+                            frame_rate=sample_parameter.get("frame_rate", 25),
+                            transformer_options=noref_options,
+                            audio_only=audio_only,
+                        )
+
+                        noref_audio_vel = noref_pred[1] if isinstance(noref_pred, (list, tuple)) else None
+                        if noref_audio_vel is not None:
+                            noref_audio_vel = noref_audio_vel.to(dtype=audio_latents.dtype)
+                            aud_x0_noref = X0PredictionWrapper.velocity_to_x0(
+                                audio_latents, noref_audio_vel, sigma.item()
+                            )
+                            audio_x0 = audio_x0 + _identity_guidance_scale * (aud_x0_cond - aud_x0_noref)
+
+                # --- AV Bimodal CFG: extra forward pass with cross-modal attention disabled ---
+                # Strengthens independent modality generation by contrasting full cross-attention
+                # prediction with one where A2V and V2A attention are skipped.
+                # Formula: x0 += (scale - 1) * (cond_full - cond_bimodal)
+                if _av_bimodal_cfg and do_classifier_free_guidance and audio_pred is not None:
+                    # Single-batch (conditional only) — we only need the cond prediction.
+                    bimodal_perturbations = _BPC(perturbations=[_bimodal_pert_single])
+
+                    bimodal_options = {"patches_replace": {}, "perturbations": bimodal_perturbations}
+                    if i2v_conditioning_mask_tokens is not None:
+                        bimodal_options["video_conditioning_mask"] = i2v_conditioning_mask_tokens
+                    if (
+                        audio_ref_only_ic_sampling
+                        and audio_model_input is not None
+                        and ref_audio_seq_len > 0
+                    ):
+                        bm_sampling_args = copy.copy(args)
+                        bm_sampling_args.audio_ref_mask_cross_attention_to_reference = False
+                        bm_sampling_args.audio_ref_mask_reference_from_text_attention = False
+                        bimodal_options.update(
+                            self._build_audio_ref_transformer_overrides(
+                                args=bm_sampling_args,
+                                transformer=transformer,
+                                video_latents=latents.to(dtype=dit_dtype).unsqueeze(0) if latents.dim() == 4 else latents.to(dtype=dit_dtype),
+                                text_embeds=prompt_embeds[1:2],
+                                text_mask=prompt_mask[1:2] if prompt_mask is not None else None,
+                                audio_model_latents=audio_model_input[:1] if audio_model_input is not None else None,
+                                ref_audio_seq_len=ref_audio_seq_len,
+                                device=transformer_device,
+                                dtype=dit_dtype,
+                            )
+                        )
+
+                    # Conditional-only video and audio inputs (single batch)
+                    bm_video = latents.to(dtype=dit_dtype)
+                    bm_video_ts = sigma.expand(1).to(device=transformer_device, dtype=dit_dtype)
+
+                    if audio_ref_only_ic_sampling and ref_audio_latents_device is not None and ref_audio_seq_len > 0:
+                        bm_audio_input = torch.cat([ref_audio_latents_device, audio_latents], dim=2).to(dtype=dit_dtype)
+                        tgt_seq = int(audio_latents.shape[2])
+                        bm_tgt_ts = sigma.expand(tgt_seq).view(1, -1).to(device=transformer_device, dtype=dit_dtype)
+                        bm_ref_ts = torch.zeros((1, ref_audio_seq_len), device=transformer_device, dtype=dit_dtype)
+                        bm_audio_ts = torch.cat([bm_ref_ts, bm_tgt_ts], dim=1)
+                    elif audio_latents is not None:
+                        bm_audio_input = audio_latents.to(dtype=dit_dtype)
+                        bm_audio_ts = sigma.expand(int(audio_latents.shape[2])).view(1, -1).to(
+                            device=transformer_device, dtype=dit_dtype,
+                        )
+                    else:
+                        bm_audio_input = None
+                        bm_audio_ts = None
+
+                    cond_prompt = prompt_embeds[1:2]
+                    cond_mask = prompt_mask[1:2] if prompt_mask is not None else None
+
+                    bm_input = [bm_video, bm_audio_input] if self._audio_video and bm_audio_input is not None else bm_video
+
+                    bimodal_pred = transformer(
+                        bm_input,
+                        timestep=bm_video_ts.unsqueeze(1),
+                        audio_timestep=bm_audio_ts,
+                        context=cond_prompt,
+                        attention_mask=cond_mask,
+                        frame_rate=sample_parameter.get("frame_rate", 25),
+                        transformer_options=bimodal_options,
+                        audio_only=audio_only,
+                    )
+
+                    if isinstance(bimodal_pred, (list, tuple)):
+                        bm_video_pred, bm_audio_pred = bimodal_pred
+                    else:
+                        bm_video_pred, bm_audio_pred = bimodal_pred, None
+
+                    # Bimodal delta for video
+                    if bm_video_pred is not None and x0_cond is not None:
+                        bm_video_pred = bm_video_pred.to(dtype=latents.dtype)
+                        bm_x0_cond = X0PredictionWrapper.velocity_to_x0(latents, bm_video_pred, sigma_for_video)
+                        video_x0 = video_x0 + (_av_bimodal_scale - 1) * (x0_cond - bm_x0_cond)
+
+                    # Bimodal delta for audio
+                    if bm_audio_pred is not None and aud_x0_cond is not None:
+                        if audio_ref_only_ic_sampling and ref_audio_seq_len > 0:
+                            bm_audio_pred = bm_audio_pred[:, :, ref_audio_seq_len:, :]
+                        bm_audio_pred = bm_audio_pred.to(dtype=audio_latents.dtype)
+                        bm_aud_x0_cond = X0PredictionWrapper.velocity_to_x0(
+                            audio_latents, bm_audio_pred, sigma.item()
+                        )
+                        audio_x0 = audio_x0 + (_av_bimodal_scale - 1) * (aud_x0_cond - bm_aud_x0_cond)
+
+                # --- Video: denoise mask blend + Euler step + hard-lock ---
+                if denoise_mask is not None and clean_latent is not None:
+                    video_x0 = video_x0 * denoise_mask + clean_latent * (1.0 - denoise_mask)
+                latents = stepper.step(latents, video_x0, sigmas, step_idx)
+                if denoise_mask is not None and clean_latent is not None:
+                    latents = latents * denoise_mask + clean_latent * (1.0 - denoise_mask)
+
+                # --- Audio: Euler step ---
+                if audio_x0 is not None and audio_latents is not None:
                     audio_latents = stepper.step(audio_latents, audio_x0, sigmas, step_idx)
 
         # Free I2V conditioning tensors to reclaim memory before VAE decode
@@ -6629,9 +6783,26 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         type=float,
         default=0.0,
         help=(
-            "For --ic_lora_strategy audio_ref_only_ic sampling: optional CFG scale override for target-audio branch. "
-            "0.0 keeps standard cfg/guidance scale."
+            "For --ic_lora_strategy audio_ref_only_ic sampling: identity guidance scale. "
+            "Runs an extra forward pass without reference audio to isolate and amplify "
+            "the speaker identity contribution. 0.0 disables. Recommended: 3.0."
         ),
+    )
+    parser.add_argument(
+        "--av_bimodal_cfg",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Enable audio-video bimodal CFG during sampling. Runs an extra forward pass "
+            "with cross-modal attention (A2V, V2A) disabled to strengthen independent "
+            "modality generation. Used by official ID-LoRA inference."
+        ),
+    )
+    parser.add_argument(
+        "--av_bimodal_scale",
+        type=float,
+        default=3.0,
+        help="Scale for AV bimodal CFG. Applied as (scale-1) * (cond - bimodal). Default: 3.0.",
     )
     parser.add_argument(
         "--separate_audio_buckets",

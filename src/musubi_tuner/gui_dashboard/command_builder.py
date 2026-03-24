@@ -332,6 +332,10 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
         cmd.append("--audio_ref_mask_reference_from_text_attention")
     if t.audio_ref_identity_guidance_scale != 0.0:
         cmd += ["--audio_ref_identity_guidance_scale", str(t.audio_ref_identity_guidance_scale)]
+    if t.av_bimodal_cfg:
+        cmd.append("--av_bimodal_cfg")
+    if t.av_bimodal_scale != 3.0:
+        cmd += ["--av_bimodal_scale", str(t.av_bimodal_scale)]
 
     # Optimizer
     cmd += ["--learning_rate", str(t.learning_rate)]

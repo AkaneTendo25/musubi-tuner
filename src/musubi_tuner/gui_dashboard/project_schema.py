@@ -149,6 +149,8 @@ class TrainingConfig(BaseModel):
     audio_ref_mask_cross_attention_to_reference: bool = False
     audio_ref_mask_reference_from_text_attention: bool = False
     audio_ref_identity_guidance_scale: float = 0.0
+    av_bimodal_cfg: bool = False
+    av_bimodal_scale: float = 3.0
 
     # Optimizer
     learning_rate: float = 1e-4

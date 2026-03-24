@@ -487,7 +487,11 @@ class LTX2Wrapper(nn.Module):
             if dcr_video_mask is not None and video_modality is not None:
                 video_modality = replace(video_modality, dcr_detach_mask=dcr_video_mask)
 
-        perturbations = BatchedPerturbationConfig.empty(bsz)
+        perturbations = (
+            transformer_options.get("perturbations")
+            if isinstance(transformer_options, dict) and "perturbations" in transformer_options
+            else BatchedPerturbationConfig.empty(bsz)
+        )
         video_pred_tokens, audio_pred_tokens = self.model(video_modality, audio_modality, perturbations)
 
         if model_video_enabled:
