@@ -3295,6 +3295,7 @@ class NetworkTrainer:
                     video_loss_ema_value = None
                     grad_norm_video_value = None  # Per-modality gradient norms
                     grad_norm_audio_value = None
+                    audio_diagnostics = {}  # Per-batch audio quality diagnostics (negligible cost)
                     _loss_type = getattr(args, "loss_type", "mse")
                     _huber_delta = getattr(args, "huber_delta", 1.0)
 
@@ -3411,6 +3412,48 @@ class NetworkTrainer:
                                 audio_weight_effective_value = audio_weight
                                 loss = loss + audio_loss * audio_weight
                                 audio_loss_value = audio_loss.detach().item() if audio_weight > 0 else None
+
+                        # --- Audio diagnostics (per-batch, negligible cost) ---
+                        if has_audio_loss and audio_pred is not None and audio_target is not None:
+                            with torch.no_grad():
+                                ap = audio_pred.detach().float()
+                                at = audio_target.detach().float()
+
+                                # Task 2: Audio latent statistics — detect collapse/explosion
+                                audio_diagnostics["audio_latent/pred_mean"] = ap.mean().item()
+                                audio_diagnostics["audio_latent/pred_std"] = ap.std().item()
+                                audio_diagnostics["audio_latent/pred_absmax"] = ap.abs().max().item()
+
+                                # Task 3: Latent-space SNR (dB)
+                                target_power = (at ** 2).mean()
+                                error_power = ((at - ap) ** 2).mean()
+                                if error_power > 0:
+                                    audio_diagnostics["audio_latent/snr_db"] = (
+                                        10.0 * torch.log10(target_power / error_power)
+                                    ).item()
+
+                                # Task 1: Timestep-stratified audio loss
+                                audio_sigma = out.get("audio_sigma")
+                                if audio_sigma is not None:
+                                    sigma = audio_sigma.detach().float()
+                                    # Per-sample MSE (reduce over C, T, F)
+                                    per_sample = ((ap - at) ** 2).mean(
+                                        dim=list(range(1, ap.dim()))
+                                    )
+                                    high_mask = sigma > 0.5
+                                    mid_mask = (sigma >= 0.1) & (sigma <= 0.5)
+                                    low_mask = sigma < 0.1
+                                    if high_mask.any():
+                                        audio_diagnostics["loss_a/sigma_high"] = per_sample[high_mask].mean().item()
+                                    if mid_mask.any():
+                                        audio_diagnostics["loss_a/sigma_mid"] = per_sample[mid_mask].mean().item()
+                                    if low_mask.any():
+                                        audio_diagnostics["loss_a/sigma_low"] = per_sample[low_mask].mean().item()
+
+                        # Task 4: Audio/video loss ratio
+                        if video_loss_value is not None and audio_loss_value is not None and video_loss_value > 0:
+                            audio_diagnostics["loss/audio_video_ratio"] = audio_loss_value / video_loss_value
+
                     else:
                         if isinstance(target, torch.Tensor):
                             model_pred = model_pred.to(device=target.device, dtype=network_dtype)
@@ -3734,6 +3777,8 @@ class NetworkTrainer:
                         logs["modality_freeze/audio_loss_ema"] = modality_freezer.audio_loss_ema
                     if pres_losses:
                         logs.update(pres_losses)
+                    if audio_diagnostics:
+                        logs.update(audio_diagnostics)
                     accelerator.log(logs, step=global_step)
 
                     # Log automagic LR histogram directly to tracker

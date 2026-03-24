@@ -3345,6 +3345,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
                     "audio_target": audio_target,
                     "audio_loss_mask": audio_loss_mask,
                     "audio_loss_weight": _resolve_loss_weight("audio_loss_weight", "audio_loss_weight"),
+                    "audio_sigma": audio_sigma,
                 }
             )
             if out_audio["audio_loss_weight"] < 0.0:
@@ -4000,6 +4001,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
                         if audio_regularizer_active
                         else 1.0
                     ),
+                    "audio_sigma": audio_sigma,
                 }
             )
             if out["audio_loss_weight"] < 0.0:
