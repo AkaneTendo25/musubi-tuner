@@ -339,6 +339,13 @@ class SelfFlowModule:
             str(self.config.offload_teacher_params).lower(),
             self.config.projector_lr,
         )
+        if not bool(self.config.dual_timestep):
+            logger.warning(
+                "Self-Flow: dual_timestep=False — the teacher forward pass will be skipped "
+                "and Self-Flow will produce no loss. Projector parameters and hooks are still "
+                "active but consuming resources with no benefit. Set dual_timestep=True "
+                "(the default) or disable --self_flow entirely."
+            )
 
     def _install_hooks(self, blocks: list[nn.Module]) -> None:
         def _extract_video_tensor(output: Any) -> Optional[torch.Tensor]:
@@ -390,12 +397,25 @@ class SelfFlowModule:
         )
 
     @staticmethod
+    def _is_adapter_module(m: nn.Module) -> bool:
+        """Return True if *m* is a LoRA, LoHa, or LoKr adapter module with a multiplier."""
+        if not hasattr(m, "multiplier"):
+            return False
+        # Standard LoRA (lora_down + lora_up)
+        if hasattr(m, "lora_down") and hasattr(m, "lora_up"):
+            return True
+        # LoHa (Hadamard product decomposition)
+        if hasattr(m, "hada_w1_a") and hasattr(m, "hada_w2_a"):
+            return True
+        # LoKr (Kronecker product decomposition)
+        if hasattr(m, "lokr_w1") or hasattr(m, "lokr_w1_a"):
+            return True
+        return False
+
+    @staticmethod
     def _collect_lora_modules(network: nn.Module) -> list:
-        """Return all LoRA modules (identified by lora_down + lora_up + multiplier attrs)."""
-        return [
-            m for m in network.modules()
-            if hasattr(m, "lora_down") and hasattr(m, "lora_up") and hasattr(m, "multiplier")
-        ]
+        """Return all adapter modules (LoRA, LoHa, LoKr) that have a multiplier attribute."""
+        return [m for m in network.modules() if SelfFlowModule._is_adapter_module(m)]
 
     @staticmethod
     def _zero_lora_multipliers(modules: list) -> list:
@@ -513,6 +533,7 @@ class SelfFlowModule:
     def mark_student_forward(self) -> None:
         self._capture_mode = "student"
         self._student_features = None
+        self._student_audio_features = None
         if len(self._stochastic_student_indices) > 1:
             self._active_student_block_idx = random.choice(self._stochastic_student_indices)
         else:
@@ -533,8 +554,11 @@ class SelfFlowModule:
 
     def on_step(self, global_step: int) -> None:
         scale = self._schedule_scale(global_step)
-        self._current_lambda_self_flow = float(self.config.lambda_self_flow) * scale
-        self._current_lambda_audio = float(self.config.lambda_audio) * scale
+        # Schedule only applies to temporal/delta lambdas (they are the ones named
+        # temporal_schedule / temporal_warmup_steps / temporal_max_steps).
+        # Base self-flow and audio lambdas remain constant throughout training.
+        self._current_lambda_self_flow = float(self.config.lambda_self_flow)
+        self._current_lambda_audio = float(self.config.lambda_audio)
         self._current_lambda_temporal = float(self.config.lambda_temporal) * scale
         self._current_lambda_delta = float(self.config.lambda_delta) * scale
 
