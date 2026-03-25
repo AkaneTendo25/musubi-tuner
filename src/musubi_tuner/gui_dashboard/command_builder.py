@@ -748,6 +748,21 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
         if not t.dcr_reference_detach:
             cmd += ["--dcr_args", "reference_detach=false"]
 
+    # Audio Metrics
+    if t.audio_metrics:
+        cmd.append("--audio_metrics")
+        args_parts = []
+        if t.audio_metrics_mel_metrics:
+            args_parts.append("mel_metrics=true")
+            if t.audio_metrics_mel_compute_every != 100:
+                args_parts.append(f"mel_compute_every={t.audio_metrics_mel_compute_every}")
+        if t.audio_metrics_clap_similarity:
+            args_parts.append("clap_similarity=true")
+        if t.audio_metrics_av_onset_alignment:
+            args_parts.append("av_onset_alignment=true")
+        if args_parts:
+            cmd += ["--audio_metrics_args"] + args_parts
+
     # Audio features
     if t.audio_loss_balance_mode != "none":
         cmd += ["--audio_loss_balance_mode", t.audio_loss_balance_mode]

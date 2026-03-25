@@ -783,6 +783,8 @@ class LTX2NetworkTrainer(NetworkTrainer):
         self._self_flow = None
         self._self_flow_active: bool = False
         self._self_flow_step_context: Optional[Dict[str, Any]] = None
+        # Audio metrics (off by default)
+        self._audio_metrics = None
 
     @staticmethod
     def _apply_caption_dropout(
@@ -933,8 +935,50 @@ class LTX2NetworkTrainer(NetworkTrainer):
         self._setup_tarp_dcr(args)
         self._setup_crepa(args, accelerator, transformer)
         self._setup_self_flow(args, accelerator, transformer, network)
+        self._setup_audio_metrics(args)
         self._apply_network_initialization(args, network)
         validate_lycoris_runtime(args, accelerator, transformer, network, logger)
+
+    def _setup_audio_metrics(self, args: argparse.Namespace) -> None:
+        """Parse audio metrics CLI flags.  No-op when --audio_metrics is not set."""
+        if not getattr(args, "audio_metrics", False):
+            return
+        from musubi_tuner.audio_metrics import AudioMetricsConfig, AudioMetricsModule, parse_audio_metrics_args, _config_from_kwargs
+        kw = parse_audio_metrics_args(getattr(args, "audio_metrics_args", None))
+        config = _config_from_kwargs(kw) if kw else AudioMetricsConfig()
+        self._audio_metrics = AudioMetricsModule(config)
+        self._audio_metrics_checkpoint = getattr(args, "ltx2_checkpoint", None)
+        self._audio_metrics_decoder = None  # lazy-loaded
+        logger.info("Audio metrics enabled: latent_fd=%s temporal_coherence=%s av_latent_sync=%s mel=%s clap=%s",
+                     config.latent_fd, config.temporal_coherence, config.av_latent_sync,
+                     config.mel_metrics, config.clap_similarity)
+
+    def _get_audio_decoder_for_metrics(self) -> torch.nn.Module | None:
+        """Lazy-load AudioDecoder for mel-space metrics.  Cached on CPU."""
+        if self._audio_metrics_decoder is not None:
+            return self._audio_metrics_decoder
+        ckpt = getattr(self, "_audio_metrics_checkpoint", None)
+        if ckpt is None:
+            return None
+        try:
+            from musubi_tuner.ltx_2.loader.single_gpu_model_builder import SingleGPUModelBuilder
+            from musubi_tuner.ltx_2.model.audio_vae.model_configurator import (
+                AudioDecoderConfigurator,
+                AUDIO_VAE_DECODER_COMFY_KEYS_FILTER,
+            )
+            decoder = SingleGPUModelBuilder(
+                model_path=str(ckpt),
+                model_class_configurator=AudioDecoderConfigurator,
+                model_sd_ops=AUDIO_VAE_DECODER_COMFY_KEYS_FILTER,
+            ).build(device=torch.device("cpu"), dtype=torch.bfloat16)
+            decoder.eval()
+            decoder.requires_grad_(False)
+            self._audio_metrics_decoder = decoder
+            logger.info("Audio metrics: loaded AudioDecoder for mel-space metrics")
+            return decoder
+        except Exception as e:
+            logger.warning("Audio metrics: failed to load AudioDecoder: %s", e)
+            return None
 
     def _setup_tarp_dcr(self, args: argparse.Namespace) -> None:
         """Parse TARP / DCR CLI flags.  No-op when no flags are set."""
@@ -1143,6 +1187,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
             "max_loss",
             "teacher_momentum",
             "projector_lr",
+            "lambda_audio",
         }
         bool_keys = {
             "dual_timestep",
@@ -5409,6 +5454,15 @@ class LTX2NetworkTrainer(NetworkTrainer):
             wav_path = os.path.join(save_dir, save_path) + ".wav"
             sample_rate = int(getattr(vocoder, "output_sample_rate", 24000)) if vocoder is not None else 24000
             self._save_audio_wav(wav_path, audio_waveform, sample_rate)
+            if self._audio_metrics is not None:
+                sample_metrics = self._audio_metrics.on_sample(
+                    waveform=audio_waveform,
+                    text_prompt=sample_parameter.get("prompt", ""),
+                    device=device,
+                    sample_rate=sample_rate,
+                )
+                if sample_metrics and len(accelerator.trackers) > 0:
+                    accelerator.log(sample_metrics, step=steps)
             if getattr(args, "sample_merge_audio", False) and video_path is not None:
                 merged_path = os.path.join(save_dir, save_path) + "_av.mp4"
                 self._mux_video_audio(video_path, wav_path, merged_path)
@@ -7390,6 +7444,21 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         type=str,
         nargs="*",
         help="Key=value args for DCR, e.g. reference_detach=true",
+    )
+
+    # -- Audio Metrics --
+    parser.add_argument(
+        "--audio_metrics",
+        action="store_true",
+        help="Enable audio quality metrics logging. Tier 1 (latent-space) runs every step at ~0 cost. "
+             "Tier 2 (mel-space) and Tier 3 (embedding-space) are opt-in via --audio_metrics_args.",
+    )
+    parser.add_argument(
+        "--audio_metrics_args",
+        type=str,
+        nargs="*",
+        help="Key=value args for audio metrics, e.g. mel_metrics=true fad=true clap_similarity=true "
+             "latent_fd_compute_every=50 mel_compute_every=100",
     )
 
     # -- CREPA (Cross-frame Representation Alignment) --

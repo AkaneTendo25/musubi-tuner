@@ -449,6 +449,23 @@
 					</p>
 					<FormToggle label="Reference Detach" checked={$projectConfig?.training?.dcr_reference_detach ?? true} onchange={(e) => updateTraining('dcr_reference_detach', e.target.checked)} tooltip="Detach gradients when sigma=0 (clean reference conditioning)" />
 				</div>
+
+				<!-- Audio Quality Metrics -->
+				<div class="p-3" style="background: var(--bg-elevated); border-radius: var(--radius-sm); border: 1px solid var(--border-subtle);">
+					<div class="flex items-center justify-between mb-1">
+						<span class="text-[12px] font-semibold" style="color: var(--text-primary);">Audio Quality Metrics</span>
+						<FormToggle checked={$projectConfig?.training?.audio_metrics ?? false} onchange={(e) => updateTraining('audio_metrics', e.target.checked)} />
+					</div>
+					<p class="text-[11px] leading-relaxed mb-2" style="color: var(--text-muted);">
+						Latent-space metrics (FD, temporal coherence, AV sync) run every step at ~0 cost. Mel-space and embedding-space metrics are opt-in.
+					</p>
+					<div class="flex flex-wrap gap-x-4 gap-y-1 mb-2">
+						<FormToggle label="Mel Metrics" checked={$projectConfig?.training?.audio_metrics_mel_metrics ?? false} onchange={(e) => updateTraining('audio_metrics_mel_metrics', e.target.checked)} disabled={!$projectConfig?.training?.audio_metrics} tooltip="Spectral convergence, MCD, log-spectral distance (periodic, requires VAE decode)" />
+						<FormToggle label="CLAP Similarity" checked={$projectConfig?.training?.audio_metrics_clap_similarity ?? false} onchange={(e) => updateTraining('audio_metrics_clap_similarity', e.target.checked)} disabled={!$projectConfig?.training?.audio_metrics} tooltip="CLAP audio-text cosine similarity at sampling time" />
+						<FormToggle label="AV Onset Alignment" checked={$projectConfig?.training?.audio_metrics_av_onset_alignment ?? false} onchange={(e) => updateTraining('audio_metrics_av_onset_alignment', e.target.checked)} disabled={!$projectConfig?.training?.audio_metrics} tooltip="Correlation between audio onsets and video motion at sampling time" />
+					</div>
+					<FormField label="Mel Interval" type="number" value={$projectConfig?.training?.audio_metrics_mel_compute_every ?? 100} oninput={(e) => updateTraining('audio_metrics_mel_compute_every', Number(e.target.value))} step="10" min={1} disabled={!$projectConfig?.training?.audio_metrics_mel_metrics} tooltip="Compute mel metrics every N steps" />
+				</div>
 			</div>
 		</div>
 

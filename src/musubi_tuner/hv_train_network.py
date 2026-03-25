@@ -3454,6 +3454,21 @@ class NetworkTrainer:
                         if video_loss_value is not None and audio_loss_value is not None and video_loss_value > 0:
                             audio_diagnostics["loss/audio_video_ratio"] = audio_loss_value / video_loss_value
 
+                        # Extended audio metrics (standalone module, no-op when off)
+                        if getattr(self, '_audio_metrics', None) is not None:
+                            self._audio_metrics.on_step(global_step)
+                            audio_diagnostics.update(self._audio_metrics.compute_latent_metrics(
+                                ap, at,
+                                video_pred=out.get("video_pred"),
+                                video_target=out.get("video_target"),
+                            ))
+                            if self._audio_metrics.should_compute_mel(global_step):
+                                _mel_decoder = getattr(self, '_get_audio_decoder_for_metrics', lambda: None)()
+                                if _mel_decoder is not None:
+                                    audio_diagnostics.update(self._audio_metrics.compute_mel_metrics(
+                                        out.get("audio_pred"), out.get("audio_target"), _mel_decoder,
+                                    ))
+
                     else:
                         if isinstance(target, torch.Tensor):
                             model_pred = model_pred.to(device=target.device, dtype=network_dtype)

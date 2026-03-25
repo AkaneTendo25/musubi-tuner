@@ -964,6 +964,41 @@ accelerate launch ... ltx2_train_network.py ^
 - Resume: both state files are loaded automatically when present. Loading EMA state with `teacher_mode=base` emits a warning and is ignored.
 - Logged metrics: `loss/self_flow`, `self_flow/cosine`, `self_flow/frame_cosine`, `self_flow/delta_cosine`, `self_flow/lambda_self_flow`, `self_flow/lambda_temporal`, `self_flow/lambda_delta`, `self_flow/masked_token_ratio`, `self_flow/tau_mean`, `self_flow/tau_min_mean`.
 
+#### Audio Quality Metrics
+
+Enable with `--audio_metrics`. All logic in `audio_metrics.py`. Disabled by default with zero overhead.
+
+**Per-step** (latent-space, enabled by default with `--audio_metrics`):
+
+| Key | Description |
+|-----|-------------|
+| `audio_metrics/latent_fd` | Running Frechet distance between pred/target latent distributions (every 50 steps) |
+| `audio_metrics/temporal_coherence` | Cosine similarity between adjacent audio latent frames |
+| `audio_metrics/av_latent_sync` | Pearson correlation between audio and video per-frame energy |
+
+**Periodic** (mel-space, opt-in — decodes 1 sample per batch through AudioDecoder):
+```bash
+--audio_metrics --audio_metrics_args mel_metrics=true mel_compute_every=100
+```
+
+| Key | Description |
+|-----|-------------|
+| `audio_metrics/spectral_convergence` | `\|\|S_pred - S_target\|\|_F / \|\|S_target\|\|_F` |
+| `audio_metrics/mcd_db` | Mel Cepstral Distortion (13 DCT coefficients, dB) |
+| `audio_metrics/log_spectral_distance_db` | Per-frame log-spectral distance (dB) |
+
+**Sampling-time** (embedding-space, opt-in — runs on generated waveforms during `sample_images`):
+```bash
+--audio_metrics --audio_metrics_args clap_similarity=true av_onset_alignment=true
+```
+
+| Key | Description | Requires |
+|-----|-------------|----------|
+| `sample_audio/clap_similarity` | CLAP audio-text cosine similarity | transformers (already a dep) |
+| `sample_audio/av_onset_alignment` | Correlation between audio energy onsets and video motion | None |
+
+CLAP model is lazy-loaded on first sample, offloaded to CPU between uses.
+
 #### Timestep Sampling
 
 See also the [timestep bucketing documentation](./advanced_config.md) for advanced timestep bucketing options.
@@ -1761,7 +1796,7 @@ num_repeats = 5
 --self_flow --self_flow_args lambda_self_flow=0.1 lambda_audio=0.1 teacher_mode=base
 ```
 
-**10. Cross-Task Synergy** — auxiliary losses with one modality clean (timestep=0) provide stable cross-modal alignment targets (Harmony, 2025). Adds two extra forward passes per AV batch:
+**10. Cross-Task Synergy** — auxiliary losses with one modality clean (timestep=0) provide stable cross-modal alignment targets ([Harmony, 2025](https://arxiv.org/abs/2511.21579)). Adds two extra forward passes per AV batch:
 ```
 --cts_lambda_video_driven 0.3 --cts_lambda_audio_driven 0.1
 ```
@@ -1956,6 +1991,7 @@ Note: `--gemma_root` is not needed for reference mode (text embeddings are loade
 - [ID-LoRA](https://github.com/ID-LoRA/ID-LoRA) — In-context identity LoRA; the audio-reference IC-LoRA implementation in this trainer is based on this approach
 - [CREPA (arXiv 2506.09229)](https://arxiv.org/abs/2506.09229) — Cross-frame Representation Alignment; basis for `--crepa dino` mode (DINOv2 teacher from neighboring frames)
 - [Self-Flow (arXiv 2603.06507)](https://arxiv.org/abs/2603.06507) — Self-supervised flow matching regularization; basis for `--self_flow`
+- [Harmony (arXiv 2511.21579)](https://arxiv.org/abs/2511.21579) — Cross-Task Synergy; basis for `--cts_lambda_video_driven` and `--cts_lambda_audio_driven`
 
 **Official LTX Resources**
 - [LTX-2](https://github.com/Lightricks/LTX-2) — Official Lightricks LTX-2/2.3 repository; contains the well-structured `ltx-trainer` and `ltx-pipelines` packages that served as the upstream source and reference for this implementation

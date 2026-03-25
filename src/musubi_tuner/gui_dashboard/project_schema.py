@@ -328,6 +328,13 @@ class TrainingConfig(BaseModel):
     dcr: bool = False
     dcr_reference_detach: bool = True
 
+    # Audio Metrics
+    audio_metrics: bool = False
+    audio_metrics_mel_metrics: bool = False
+    audio_metrics_mel_compute_every: int = 100
+    audio_metrics_clap_similarity: bool = False
+    audio_metrics_av_onset_alignment: bool = False
+
     # CREPA
     crepa: bool = False
     crepa_mode: Literal["backbone", "dino"] = "backbone"
