@@ -385,6 +385,12 @@ class TrainingConfig(BaseModel):
     self_flow_temporal_max_steps: int = 0
     self_flow_offload_teacher_features: bool = False
 
+    # HFATO (ViBe - High-Frequency Awareness Training Objective)
+    hfato: bool = False
+    hfato_scale_factor: float = 0.5
+    hfato_interpolation: Literal["bilinear", "nearest", "bicubic"] = "bilinear"
+    hfato_probability: float = 1.0
+
     # Audio features
     audio_loss_balance_mode: Literal["none", "inv_freq", "ema_mag", "uncertainty"] = "none"
     audio_loss_balance_beta: float = 0.01

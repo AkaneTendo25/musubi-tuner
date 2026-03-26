@@ -714,6 +714,19 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
         if args_parts:
             cmd += ["--self_flow_args"] + args_parts
 
+    # HFATO (ViBe)
+    if t.hfato:
+        cmd.append("--hfato")
+        args_parts = []
+        if t.hfato_scale_factor != 0.5:
+            args_parts.append(f"scale_factor={t.hfato_scale_factor}")
+        if t.hfato_interpolation != "bilinear":
+            args_parts.append(f"interpolation={t.hfato_interpolation}")
+        if t.hfato_probability != 1.0:
+            args_parts.append(f"probability={t.hfato_probability}")
+        if args_parts:
+            cmd += ["--hfato_args"] + args_parts
+
     # Preservation
     if t.blank_preservation:
         cmd.append("--blank_preservation")

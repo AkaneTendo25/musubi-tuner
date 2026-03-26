@@ -248,6 +248,40 @@
 			</div>
 		</div>
 
+		<!-- HFATO (ViBe) -->
+		<div style="background: var(--bg-surface); border: 1px solid var(--border-subtle); border-radius: var(--radius-md); position: relative; overflow: hidden;">
+			<div style="position: absolute; top: 0; left: 0; right: 0; height: 2px; background: linear-gradient(90deg, transparent, var(--accent), var(--secondary, var(--accent)), transparent); opacity: 0.5;"></div>
+
+			<div class="p-5 pb-0">
+				<div class="flex items-center gap-3 mb-2">
+					<div class="w-8 h-8 flex items-center justify-center flex-shrink-0" style="background: var(--accent-muted); border-radius: var(--radius-sm);">
+						<svg class="w-4 h-4" style="color: var(--accent);" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.5"><path d="M2.25 15.75l5.159-5.159a2.25 2.25 0 013.182 0l5.159 5.159m-1.5-1.5l1.409-1.409a2.25 2.25 0 013.182 0l2.909 2.909M3.75 21h16.5A2.25 2.25 0 0022.5 18.75V5.25A2.25 2.25 0 0020.25 3H3.75A2.25 2.25 0 001.5 5.25v13.5A2.25 2.25 0 003.75 21z"/></svg>
+					</div>
+					<div>
+						<div class="text-[13px] font-semibold" style="color: var(--text-primary);">HFATO</div>
+						<div class="text-[11px]" style="color: var(--text-muted);">High-Frequency Awareness Training Objective (ViBe, arxiv 2603.23326)</div>
+					</div>
+					<div class="ml-auto">
+						<FormToggle checked={$projectConfig?.training?.hfato ?? false} onchange={(e) => updateTraining('hfato', e.target.checked)} />
+					</div>
+				</div>
+				<p class="text-[12px] leading-relaxed mb-3" style="color: var(--text-secondary);">
+					Degrades clean latents via downsample-upsample before noise addition, then trains the model to reconstruct the original clean latents. Enables image-only training without losing video temporal coherence. Use with Relay LoRA workflow for best results.
+				</p>
+			</div>
+
+			<div class="p-5 pt-0 space-y-3">
+				<div class="p-3" style="background: var(--bg-elevated); border-radius: var(--radius-sm); border: 1px solid var(--border-subtle);">
+					<div class="text-[11px] font-semibold mb-2" style="color: var(--text-primary);">Parameters</div>
+					<div class="grid grid-cols-3 gap-2">
+						<FormField label="Scale Factor" type="number" value={$projectConfig?.training?.hfato_scale_factor ?? 0.5} oninput={(e) => updateTraining('hfato_scale_factor', Number(e.target.value))} step="0.05" min={0.05} max={1.0} tooltip="Downsample ratio for spatial degradation. 0.5 = halve each spatial dimension. Lower = more aggressive degradation (default 0.5)" />
+						<FormSelect label="Interpolation" value={$projectConfig?.training?.hfato_interpolation || 'bilinear'} onchange={(e) => updateTraining('hfato_interpolation', e.target.value)} options={[{value: 'bilinear', label: 'Bilinear'}, {value: 'nearest', label: 'Nearest'}, {value: 'bicubic', label: 'Bicubic'}]} tooltip="Interpolation mode for downsample-upsample (default bilinear)" />
+						<FormField label="Probability" type="number" value={$projectConfig?.training?.hfato_probability ?? 1.0} oninput={(e) => updateTraining('hfato_probability', Number(e.target.value))} step="0.05" min={0.05} max={1.0} tooltip="Probability of applying HFATO per training step. 1.0 = always apply (default 1.0)" />
+					</div>
+				</div>
+			</div>
+		</div>
+
 		<!-- Audio Features (shown when mode is av/audio) -->
 		{#if ($projectConfig?.training?.ltx2_mode || 'video') !== 'video'}
 		<div style="background: var(--bg-surface); border: 1px solid var(--border-subtle); border-radius: var(--radius-md); position: relative; overflow: hidden;">

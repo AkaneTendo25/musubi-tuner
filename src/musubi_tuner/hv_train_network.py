@@ -3106,7 +3106,18 @@ class NetworkTrainer:
                         video_pred = out["video_pred"]
                         video_target = out["video_target"]
                         video_loss_mask = out.get("video_loss_mask")
-                        video_loss = _masked_loss(video_pred, video_target, video_loss_mask)
+                        _hfato_data = out.get("_hfato")
+                        if _hfato_data is not None:
+                            from musubi_tuner.hfato import hfato_x0_loss
+                            video_loss = hfato_x0_loss(
+                                video_pred.to(dtype=network_dtype),
+                                _hfato_data["noisy"].to(device=video_pred.device, dtype=network_dtype),
+                                _hfato_data["clean"].to(device=video_pred.device, dtype=network_dtype),
+                                _hfato_data["sigma"].to(device=video_pred.device),
+                                video_loss_mask,
+                            )
+                        else:
+                            video_loss = _masked_loss(video_pred, video_target, video_loss_mask)
                         video_weight = float(out.get("video_loss_weight", 1.0))
                         loss = video_loss * video_weight
 
@@ -3344,7 +3355,18 @@ class NetworkTrainer:
                         video_pred = out["video_pred"]
                         video_target = out["video_target"]
                         video_loss_mask = out.get("video_loss_mask")
-                        video_loss = _masked_loss(video_pred, video_target, video_loss_mask)
+                        _hfato_data = out.get("_hfato")
+                        if _hfato_data is not None:
+                            from musubi_tuner.hfato import hfato_x0_loss
+                            video_loss = hfato_x0_loss(
+                                video_pred.to(dtype=network_dtype),
+                                _hfato_data["noisy"].to(device=video_pred.device, dtype=network_dtype),
+                                _hfato_data["clean"].to(device=video_pred.device, dtype=network_dtype),
+                                _hfato_data["sigma"].to(device=video_pred.device),
+                                video_loss_mask,
+                            )
+                        else:
+                            video_loss = _masked_loss(video_pred, video_target, video_loss_mask)
 
                         audio_pred = out.get("audio_pred")
                         audio_target = out.get("audio_target")

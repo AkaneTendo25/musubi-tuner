@@ -785,6 +785,8 @@ class LTX2NetworkTrainer(NetworkTrainer):
         self._self_flow_step_context: Optional[Dict[str, Any]] = None
         # Audio metrics (off by default)
         self._audio_metrics = None
+        # HFATO (off by default)
+        self._hfato_config = None  # Optional[HFATOConfig]
 
     @staticmethod
     def _apply_caption_dropout(
@@ -936,6 +938,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
         self._setup_crepa(args, accelerator, transformer)
         self._setup_self_flow(args, accelerator, transformer, network)
         self._setup_audio_metrics(args)
+        self._setup_hfato(args)
         self._apply_network_initialization(args, network)
         validate_lycoris_runtime(args, accelerator, transformer, network, logger)
 
@@ -979,6 +982,43 @@ class LTX2NetworkTrainer(NetworkTrainer):
         except Exception as e:
             logger.warning("Audio metrics: failed to load AudioDecoder: %s", e)
             return None
+
+    def _setup_hfato(self, args: argparse.Namespace) -> None:
+        """Parse HFATO CLI flags.  No-op when --hfato is not set."""
+        if not getattr(args, "hfato", False):
+            return
+        if getattr(args, "self_flow", False):
+            raise ValueError("--hfato and --self_flow cannot be used simultaneously")
+        ic_strategy = getattr(args, "ic_lora_strategy", "none")
+        if ic_strategy not in ("none", "auto"):
+            raise ValueError(f"--hfato is incompatible with --ic_lora_strategy {ic_strategy} (v2v/ref_latents path uses standard loss)")
+
+        from musubi_tuner.hfato import HFATOConfig, parse_hfato_args
+
+        kw = parse_hfato_args(getattr(args, "hfato_args", None))
+        cfg_kwargs = {}
+        float_keys = {"scale_factor", "probability"}
+        for k, v in kw.items():
+            if k in float_keys:
+                cfg_kwargs[k] = float(v)
+            elif k == "interpolation":
+                if v not in ("bilinear", "nearest", "bicubic"):
+                    raise ValueError(f"HFATO interpolation must be bilinear|nearest|bicubic, got: {v}")
+                cfg_kwargs[k] = v
+            else:
+                raise ValueError(f"Unknown HFATO arg: {k}")
+
+        config = HFATOConfig(**cfg_kwargs)
+        if not (0.0 < config.scale_factor <= 1.0):
+            raise ValueError(f"HFATO scale_factor must be in (0, 1], got: {config.scale_factor}")
+        if not (0.0 < config.probability <= 1.0):
+            raise ValueError(f"HFATO probability must be in (0, 1], got: {config.probability}")
+
+        self._hfato_config = config
+        logger.info(
+            "HFATO enabled: scale_factor=%.2f interpolation=%s probability=%.2f",
+            config.scale_factor, config.interpolation, config.probability,
+        )
 
     def _setup_tarp_dcr(self, args: argparse.Namespace) -> None:
         """Parse TARP / DCR CLI flags.  No-op when no flags are set."""
@@ -3434,6 +3474,19 @@ class LTX2NetworkTrainer(NetworkTrainer):
             if enable_conditioning:
                 video_conditioning_enabled = torch.ones((latents.shape[0],), device=accelerator.device, dtype=torch.bool)
 
+        # -- HFATO: replace noisy input with degraded version --
+        _hfato_active = False
+        _hfato_noisy = None
+        if self._hfato_config is not None and latents.dim() == 5:
+            import random as _hfato_rand
+            if _hfato_rand.random() < self._hfato_config.probability:
+                from musubi_tuner.hfato import compute_hfato_noisy_input
+                _hfato_noisy, _ = compute_hfato_noisy_input(
+                    latents, noise, sigma, self._hfato_config,
+                )
+                noisy_model_input = _hfato_noisy.to(dtype=noisy_model_input.dtype)
+                _hfato_active = True
+
         model_noisy_video = noisy_model_input
         if video_conditioning_enabled is not None and model_noisy_video.shape[2] > 0:
             model_noisy_video = model_noisy_video.clone()
@@ -4035,6 +4088,14 @@ class LTX2NetworkTrainer(NetworkTrainer):
             "video_loss_mask": video_loss_mask,
             "video_loss_weight": _resolve_loss_weight("video_loss_weight", "video_loss_weight"),
         }
+
+        # HFATO: pass metadata for x0-prediction loss in the training loop
+        if _hfato_active:
+            out["_hfato"] = {
+                "noisy": _hfato_noisy,
+                "clean": latents,
+                "sigma": sigma,
+            }
 
         if out["video_loss_weight"] < 0.0:
             raise ValueError(f"video_loss_weight must be >= 0. Got: {out['video_loss_weight']}")
@@ -7559,6 +7620,22 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         "frame_level_mask=false teacher_mode=base mask_focus_loss=false max_loss=0.0 "
         "student_block_stochastic_range=2 teacher_momentum=0.999 "
         "dual_timestep=true student_block_ratio=0.3 teacher_block_ratio=0.7 projector_lr=5e-5",
+    )
+
+    # -- HFATO (High-Frequency Awareness Training Objective, ViBe) --
+    parser.add_argument(
+        "--hfato",
+        action="store_true",
+        help="Enable HFATO: degrades clean latents via downsample-upsample before "
+             "noise addition, then supervises model to reconstruct original clean "
+             "latents.  Forces high-frequency detail recovery (ViBe, arxiv 2603.23326).",
+    )
+    parser.add_argument(
+        "--hfato_args",
+        type=str,
+        nargs="*",
+        help="Key=value args for HFATO, e.g. scale_factor=0.5 interpolation=bilinear "
+             "probability=1.0",
     )
 
     # -- Per-module learning rate groups --

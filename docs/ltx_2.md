@@ -51,6 +51,7 @@ Caching scripts (`ltx2_cache_latents.py`, `ltx2_cache_text_encoder_outputs.py`) 
     - [Per-Module LoRA Rank](#per-module-lora-rank)
     - [Preservation & Regularization](#preservation--regularization)
     - [Self-Flow (Self-Supervised Flow Matching)](#self-flow-self-supervised-flow-matching)
+    - [HFATO (High-Frequency Awareness Training Objective)](#hfato-high-frequency-awareness-training-objective)
     - [Timestep Sampling](#timestep-sampling)
     - [LoRA Targets](#lora-targets)
       - [Connector LoRA](#connector-lora---train_connectors)
@@ -966,6 +967,72 @@ accelerate launch ... ltx2_train_network.py ^
 - State files (Accelerate `*-state` folder): `self_flow_projector.safetensors`, `self_flow_teacher_ema.safetensors` (EMA state only saved when `teacher_mode=ema` or `partial_ema`).
 - Resume: both state files are loaded automatically when present. Loading EMA state with `teacher_mode=base` emits a warning and is ignored.
 - Logged metrics: `loss/self_flow`, `self_flow/cosine`, `self_flow/frame_cosine`, `self_flow/delta_cosine`, `self_flow/lambda_self_flow`, `self_flow/lambda_temporal`, `self_flow/lambda_delta`, `self_flow/masked_token_ratio`, `self_flow/tau_mean`, `self_flow/tau_min_mean`.
+
+#### HFATO (High-Frequency Awareness Training Objective)
+
+Adapted from [ViBe (arXiv 2603.23326)](https://arxiv.org/abs/2603.23326). Experimental — not yet validated on LTX-2.
+
+**HFATO** is a training objective designed for image-only fine-tuning of video models. Before adding noise, clean latents are spatially degraded via downsample-upsample, destroying high-frequency details. The model is then supervised to reconstruct the original clean latents (x₀-prediction loss instead of standard velocity loss). Can be combined with the Relay LoRA workflow below for two-stage image-only training.
+
+Enable with `--hfato`. Parameters are passed via `--hfato_args` as `key=value` pairs. Incompatible with `--self_flow` and `--ic_lora_strategy v2v`.
+
+```bash
+accelerate launch ... ltx2_train_network.py ^
+  --hfato ^
+  --hfato_args scale_factor=0.5
+```
+
+##### CLI Flags
+
+| Flag | Type | Description |
+|------|------|-------------|
+| `--hfato` | store_true | Enable HFATO loss |
+| `--hfato_args` | key=value list | Configuration parameters (see table below) |
+
+##### HFATO Parameters (`--hfato_args`)
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `scale_factor` | `0.5` | Spatial downsample ratio. `0.5` = halve each spatial dimension. Lower values destroy more high-frequency info and force stronger reconstruction. `0.25` is more aggressive. |
+| `interpolation` | `bilinear` | Interpolation mode for downsample-upsample: `bilinear`, `nearest`, or `bicubic` |
+| `probability` | `1.0` | Per-step probability of applying HFATO. `1.0` = always. Values `< 1.0` mix HFATO and standard flow matching steps. |
+
+##### Relay LoRA Workflow (Image-Only Training)
+
+Two-stage training strategy for adapting a video model using only images:
+
+1. **Stage 1 (Modality Bridge)**: Train a LoRA on low-resolution images using standard flow matching. Bridges the image-video modality gap.
+2. **Merge**: Merge the Stage 1 LoRA into the base model checkpoint.
+3. **Stage 2 (Detail Enhancement)**: Train a new LoRA on high-resolution images with `--hfato`, using the merged checkpoint.
+4. **Inference**: Load the original base model with only the Stage 2 LoRA. Stage 1 is discarded.
+
+```bash
+# Stage 1: standard LoRA on low-res images
+accelerate launch ... ltx2_train_network.py ^
+  --ltx2_checkpoint base_model.safetensors ^
+  --network_dim 32 --output_dir stage1_output/
+
+# Merge Stage 1 into base
+python ltx2_merge_lora.py ^
+  --dit base_model.safetensors ^
+  --lora_weight stage1_output/last.safetensors ^
+  --save_merged_model merged_model.safetensors
+
+# Stage 2: HFATO on high-res images using merged base
+accelerate launch ... ltx2_train_network.py ^
+  --ltx2_checkpoint merged_model.safetensors ^
+  --hfato --hfato_args scale_factor=0.5 ^
+  --network_dim 32 --output_dir stage2_output/
+
+# Inference: original base + Stage 2 LoRA only
+python ltx2_generate_video.py ^
+  --ltx2_checkpoint base_model.safetensors ^
+  --lora_weight stage2_output/last.safetensors
+```
+
+The resulting LoRA is standard — no inference pipeline changes. Discarding the Stage 1 bridge at inference acts as an implicit regularizer that limits how far the model drifts from its pretrained video priors.
+
+HFATO can also be used standalone (without relay) as a spatial detail objective for image or video training.
 
 #### Audio Quality Metrics
 
