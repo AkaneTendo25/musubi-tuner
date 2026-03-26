@@ -1907,7 +1907,7 @@ Two modes are available:
 | Mode | Input | Use Case |
 |------|-------|----------|
 | `text` | Prompt pairs only (no dataset) | Sliders from text prompt pairs, no images needed |
-| `reference` | Pre-cached latent pairs | Sliders from paired positive/negative image or video samples |
+| `reference` | Pre-cached latent pairs | Sliders from paired positive/negative video or audio samples |
 
 ### 4a. Text-Only Mode
 
@@ -1973,7 +1973,7 @@ All standard training arguments (`--fp8_base`, `--blocks_to_swap`, `--gradient_c
 
 ### 4b. Reference Mode
 
-Learns a slider direction from paired positive/negative images (or videos). Requires pre-cached latents.
+Learns a slider direction from paired positive/negative video or audio examples. Requires pre-cached latents.
 
 #### Step 1: Prepare Paired Data
 
@@ -2009,17 +2009,21 @@ python ltx2_cache_text_encoder_outputs.py --dataset_config positive_dataset.toml
 
 ```toml
 mode = "reference"
+reference_modality = "video"            # "video" or "audio"
 pos_cache_dir = "path/to/positive/cache"
 neg_cache_dir = "path/to/negative/cache"
 text_cache_dir = "path/to/positive/cache"   # can be same as pos (text is shared)
 sample_slider_range = [-2.0, -1.0, 0.0, 1.0, 2.0]
 ```
 
+- `reference_modality`: `video` for image/video latent pairs, `audio` for paired audio latents
 - `pos_cache_dir`: Directory containing cached positive latents (output of `ltx2_cache_latents.py`)
 - `neg_cache_dir`: Directory containing cached negative latents
 - `text_cache_dir`: Directory containing cached text encoder outputs. Defaults to `pos_cache_dir` if omitted.
 
-Pairs are matched by filename: for each `{name}_{W}x{H}_ltx2.safetensors` in the positive directory, a matching file must exist in the negative directory. Unmatched files are skipped with a warning.
+Video pairs are matched by filename: for each `{name}_{W}x{H}_ltx2.safetensors` in the positive directory, a matching file must exist in the negative directory.
+
+Audio pairs are matched by filename: for each `{name}_ltx2_audio.safetensors` in the positive directory, a matching audio file must exist in the negative directory, and both directories must also contain the companion audio-only virtual geometry cache `{name}_{W}x{H}_ltx2.safetensors`. Unmatched files are skipped with a warning.
 
 ##### Example Command (Reference)
 
@@ -2045,11 +2049,50 @@ Note: `--gemma_root` is not needed for reference mode (text embeddings are loade
 
 For video reference sliders, `--ltx2_first_frame_conditioning_p` also works here. When enabled on multi-frame samples, the trainer anchors frame 0 as conditioning-only and excludes it from the loss, which is useful when positive/negative pairs share the same start frame and differ mainly in motion. It has no effect for text-only sliders or single-frame reference samples.
 
+##### Audio Reference Sliders
+
+For paired audio sliders, set `reference_modality = "audio"` and train in audio-only mode:
+
+```toml
+mode = "reference"
+reference_modality = "audio"
+pos_cache_dir = "path/to/positive/audio_cache"
+neg_cache_dir = "path/to/negative/audio_cache"
+text_cache_dir = "path/to/positive/audio_cache"
+sample_slider_range = [-2.0, -1.0, 0.0, 1.0, 2.0]
+```
+
+```bash
+accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 ltx2_train_slider.py ^
+  --mixed_precision bf16 ^
+  --ltx2_checkpoint /path/to/ltxav-2.safetensors ^
+  --ltx2_mode audio ^
+  --fp8_base --fp8_scaled ^
+  --gradient_checkpointing ^
+  --blocks_to_swap 10 ^
+  --network_module networks.lora_ltx2 ^
+  --network_dim 16 --network_alpha 16 ^
+  --lora_target_preset audio ^
+  --learning_rate 1e-4 ^
+  --optimizer_type AdamW8bit ^
+  --lr_scheduler constant_with_warmup --lr_warmup_steps 20 ^
+  --max_train_steps 500 ^
+  --sample_audio_only ^
+  --output_dir output --output_name audio_energy_slider ^
+  --slider_config ltx2_slider_audio_reference.toml
+```
+
+Notes:
+- Audio reference sliders are an MVP path built for `--ltx2_mode audio`.
+- The trainer uses the same paired positive/negative audio latents plus shared text cache, and masks loss with cached `audio_lengths`.
+- `--lora_target_preset audio` is recommended; if omitted, the slider trainer selects it automatically for audio reference sliders.
+- `--ltx2_first_frame_conditioning_p` has no effect for audio sliders.
+
 ### Slider Tips
 
 - **Start small**: `--network_dim 8` or `16` with `--max_train_steps 200-500` is usually sufficient.
 - **Monitor loss**: Loss should decrease steadily. If it diverges, reduce `--learning_rate`.
-- **Preview samples**: Add `--sample_prompts sampling_prompts.txt --sample_every_n_steps 50` to generate previews at each slider strength during training. Requires `--gemma_root` for text encoding.
+- **Preview samples**: Add `--sample_prompts sampling_prompts.txt --sample_every_n_steps 50` to generate previews at each slider strength during training. Requires `--gemma_root` for text encoding. For audio sliders, also use `--sample_audio_only`.
 - **Guidance strength**: For text-only mode, the default is `1.0`. Values of `2.0-3.0` increase direction strength but may reduce convergence stability.
 - **Multiple targets**: Text-only mode supports multiple `[[targets]]` blocks. Each step randomly selects one target, so all directions get trained evenly.
 - **Inference**: Use the trained LoRA with any multiplier value. Positive multipliers enhance the positive attribute, negative multipliers enhance the negative attribute. Values beyond `[-1, +1]` extrapolate the effect.

@@ -5,7 +5,7 @@ Trains a LoRA that shifts model output in a controllable direction
 
 Supports two modes:
   - text-only: learns direction from positive/negative prompt pairs (no dataset needed)
-  - reference: learns direction from paired positive/negative latent examples
+  - reference: learns direction from paired positive/negative video or audio latent examples
 """
 
 import argparse
@@ -64,6 +64,7 @@ class SliderTargetConfig:
 @dataclass
 class SliderConfig:
     mode: str  # "text" or "reference"
+    reference_modality: str = "video"  # "video" or "audio" for reference mode
     targets: List[SliderTargetConfig] = field(default_factory=list)
     guidance_strength: float = 1.0
     frame_rate: int = 25
@@ -79,6 +80,7 @@ def load_slider_config(path: str) -> SliderConfig:
         raw = toml.load(f)
 
     mode = raw.get("mode", "text")
+    reference_modality = str(raw.get("reference_modality", "video")).lower()
     guidance_strength = float(raw.get("guidance_strength", 1.0))
     frame_rate = int(raw.get("frame_rate", 25))
     sample_slider_range = raw.get("sample_slider_range", [-2.0, -1.0, 0.0, 1.0, 2.0])
@@ -100,6 +102,7 @@ def load_slider_config(path: str) -> SliderConfig:
 
     return SliderConfig(
         mode=mode,
+        reference_modality=reference_modality,
         targets=targets,
         guidance_strength=guidance_strength,
         frame_rate=frame_rate,
@@ -168,6 +171,14 @@ def _find_latent_tensor(sd: dict) -> torch.Tensor:
     raise KeyError(f"No latents key found in {list(sd.keys())}")
 
 
+def _find_audio_latent_tensor(sd: dict) -> torch.Tensor:
+    """Extract the audio latent tensor from a safetensors state dict with dynamic keys."""
+    for key, val in sd.items():
+        if key.startswith("audio_latents_"):
+            return val
+    raise KeyError(f"No audio latents key found in {list(sd.keys())}")
+
+
 def _find_text_tensor(sd: dict) -> torch.Tensor:
     """Extract the text embedding tensor from a safetensors state dict with dynamic keys."""
     for key, val in sd.items():
@@ -177,18 +188,47 @@ def _find_text_tensor(sd: dict) -> torch.Tensor:
 
 
 _LATENT_BASENAME_RE = re.compile(r"^(.+)_\d{4}x\d{4}_ltx2\.safetensors$")
+_AUDIO_BASENAME_RE = re.compile(r"^(.+)_ltx2_audio\.safetensors$")
+
+
+def _find_length_tensor(sd: dict, prefix: str) -> Optional[torch.Tensor]:
+    for key, val in sd.items():
+        if key.startswith(prefix):
+            return val
+    return None
+
+
+def _find_virtual_latent_cache_path(cache_dir: str, stem: str) -> Optional[str]:
+    pattern = os.path.join(cache_dir, f"{stem}_*_ltx2.safetensors")
+    matches = sorted(
+        path for path in glob.glob(pattern) if not path.endswith("_te.safetensors") and not path.endswith("_audio.safetensors")
+    )
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        logger.warning("Multiple virtual latent caches found for %s in %s, using %s", stem, cache_dir, os.path.basename(matches[0]))
+        return matches[0]
+    return None
 
 
 class PairedSliderDataset(torch.utils.data.Dataset):
     """Loads matched positive/negative latent pairs from cache directories."""
 
-    def __init__(self, pos_cache_dir: str, neg_cache_dir: str, text_cache_dir: Optional[str] = None):
+    def __init__(
+        self,
+        pos_cache_dir: str,
+        neg_cache_dir: str,
+        text_cache_dir: Optional[str] = None,
+        reference_modality: str = "video",
+    ):
         self.text_cache_dir = text_cache_dir or pos_cache_dir
+        self.reference_modality = reference_modality
 
-        # Find latent cache files in pos_cache_dir
-        pos_files = sorted(glob.glob(os.path.join(pos_cache_dir, "*_ltx2.safetensors")))
-        # Exclude text encoder caches (*_te.safetensors) and audio (*_audio.safetensors)
-        pos_files = [f for f in pos_files if not f.endswith("_te.safetensors") and not f.endswith("_audio.safetensors")]
+        if self.reference_modality == "audio":
+            pos_files = sorted(glob.glob(os.path.join(pos_cache_dir, "*_ltx2_audio.safetensors")))
+        else:
+            pos_files = sorted(glob.glob(os.path.join(pos_cache_dir, "*_ltx2.safetensors")))
+            pos_files = [f for f in pos_files if not f.endswith("_te.safetensors") and not f.endswith("_audio.safetensors")]
 
         self.pairs = []
         for pos_path in pos_files:
@@ -198,34 +238,88 @@ class PairedSliderDataset(torch.utils.data.Dataset):
                 logger.warning("No negative match for %s, skipping", basename)
                 continue
 
+            if self.reference_modality == "audio":
+                m = _AUDIO_BASENAME_RE.match(basename)
+                if not m:
+                    logger.warning("Cannot parse audio latent filename %s, skipping", basename)
+                    continue
+                stem = m.group(1)
+                pos_virtual_path = _find_virtual_latent_cache_path(pos_cache_dir, stem)
+                neg_virtual_path = _find_virtual_latent_cache_path(neg_cache_dir, stem)
+                if pos_virtual_path is None or neg_virtual_path is None:
+                    logger.warning("Missing virtual latent cache for %s, skipping", stem)
+                    continue
+            else:
+                m = _LATENT_BASENAME_RE.match(basename)
+                if not m:
+                    logger.warning("Cannot parse latent filename %s, skipping", basename)
+                    continue
+                stem = m.group(1)
+                pos_virtual_path = None
+                neg_virtual_path = None
+
             # Text cache uses stem without WxH dimensions:
             #   latent: {stem}_{W:04d}x{H:04d}_ltx2.safetensors
             #   text:   {stem}_ltx2_te.safetensors
-            m = _LATENT_BASENAME_RE.match(basename)
-            if not m:
-                logger.warning("Cannot parse latent filename %s, skipping", basename)
-                continue
-            te_basename = f"{m.group(1)}_ltx2_te.safetensors"
+            te_basename = f"{stem}_ltx2_te.safetensors"
             te_path = os.path.join(self.text_cache_dir, te_basename)
             if not os.path.exists(te_path):
                 logger.warning("No text cache for %s, skipping", basename)
                 continue
 
-            self.pairs.append((pos_path, neg_path, te_path))
+            self.pairs.append((pos_path, neg_path, te_path, pos_virtual_path, neg_virtual_path))
 
         if len(self.pairs) == 0:
             raise ValueError(f"No matched pairs found in {pos_cache_dir} and {neg_cache_dir}")
-        logger.info("PairedSliderDataset: found %d matched pairs", len(self.pairs))
+        logger.info("PairedSliderDataset (%s): found %d matched pairs", self.reference_modality, len(self.pairs))
 
     def __len__(self):
         return len(self.pairs)
 
     def __getitem__(self, idx):
-        pos_path, neg_path, te_path = self.pairs[idx]
+        pos_path, neg_path, te_path, pos_virtual_path, neg_virtual_path = self.pairs[idx]
 
         pos_sd = load_file(pos_path)
         neg_sd = load_file(neg_path)
         te_sd = load_file(te_path)
+
+        text_embeds = _find_text_tensor(te_sd)        # [seq_len, dim]
+        text_mask = te_sd.get("text_mask", torch.ones(text_embeds.shape[0]))  # [seq_len]
+
+        if self.reference_modality == "audio":
+            pos_audio_latents = _find_audio_latent_tensor(pos_sd)
+            neg_audio_latents = _find_audio_latent_tensor(neg_sd)
+            if pos_audio_latents.shape != neg_audio_latents.shape:
+                raise ValueError(
+                    f"Audio shape mismatch for {os.path.basename(pos_path)}: "
+                    f"pos {pos_audio_latents.shape} vs neg {neg_audio_latents.shape}"
+                )
+
+            pos_lengths = _find_length_tensor(pos_sd, "audio_lengths_")
+            neg_lengths = _find_length_tensor(neg_sd, "audio_lengths_")
+            if pos_lengths is None or neg_lengths is None:
+                raise ValueError(f"Missing audio lengths for {os.path.basename(pos_path)}")
+
+            pos_virtual_sd = load_file(pos_virtual_path)
+            neg_virtual_sd = load_file(neg_virtual_path)
+            pos_virtual_latents = _find_latent_tensor(pos_virtual_sd)
+            neg_virtual_latents = _find_latent_tensor(neg_virtual_sd)
+            if pos_virtual_latents.shape != neg_virtual_latents.shape:
+                raise ValueError(
+                    f"Virtual geometry mismatch for {os.path.basename(pos_virtual_path)}: "
+                    f"pos {pos_virtual_latents.shape} vs neg {neg_virtual_latents.shape}"
+                )
+
+            return {
+                "pos_audio_latents": pos_audio_latents,
+                "neg_audio_latents": neg_audio_latents,
+                "audio_lengths": pos_lengths,
+                "neg_audio_lengths": neg_lengths,
+                "pos_virtual_latents": pos_virtual_latents,
+                "neg_virtual_latents": neg_virtual_latents,
+                "text_embeds": text_embeds,
+                "text_mask": text_mask,
+            }
 
         pos_latents = _find_latent_tensor(pos_sd)    # [C, F, H, W]
         neg_latents = _find_latent_tensor(neg_sd)     # [C, F, H, W]
@@ -234,8 +328,6 @@ class PairedSliderDataset(torch.utils.data.Dataset):
                 f"Shape mismatch for {os.path.basename(pos_path)}: "
                 f"pos {pos_latents.shape} vs neg {neg_latents.shape}"
             )
-        text_embeds = _find_text_tensor(te_sd)        # [seq_len, dim]
-        text_mask = te_sd.get("text_mask", torch.ones(text_embeds.shape[0]))  # [seq_len]
 
         return {
             "pos_latents": pos_latents,
@@ -312,11 +404,48 @@ class LTX2SliderTrainer:
         mask = loss_mask.to(device=prediction.device)
         if mask.dtype != torch.bool:
             mask = mask != 0
+        if mask.dim() == 2 and squared_error.dim() >= 4:
+            mask = mask.unsqueeze(1)
+        while mask.dim() < squared_error.dim():
+            mask = mask.unsqueeze(-1)
         mask = mask.expand_as(squared_error)
         masked_error = squared_error[mask]
         if masked_error.numel() == 0:
             return squared_error.new_zeros(())
         return masked_error.mean()
+
+    @staticmethod
+    def _resolve_transformer_in_channels(transformer) -> int:
+        in_channels = getattr(transformer, "in_channels", None)
+        if in_channels is None and hasattr(transformer, "patchify_proj"):
+            in_channels = getattr(getattr(transformer, "patchify_proj", None), "in_features", None)
+        if in_channels is None:
+            raise ValueError("Could not determine transformer input channels for dummy video latents")
+        return int(in_channels)
+
+    @staticmethod
+    def _build_audio_loss_mask(
+        audio_latents: torch.Tensor,
+        audio_lengths: Optional[torch.Tensor],
+        device: torch.device,
+    ) -> torch.Tensor:
+        audio_seq_len = int(audio_latents.shape[2])
+        audio_loss_mask = torch.ones((audio_latents.shape[0], audio_seq_len), device=device, dtype=torch.bool)
+        if audio_lengths is None:
+            return audio_loss_mask
+
+        if audio_lengths.dim() == 0:
+            audio_lengths = audio_lengths.view(1)
+        if audio_lengths.numel() == 1 and audio_latents.shape[0] != 1:
+            audio_lengths = audio_lengths.expand(audio_latents.shape[0])
+        if audio_lengths.dim() != 1 or audio_lengths.shape[0] != audio_latents.shape[0]:
+            raise ValueError(
+                f"Expected audio_lengths to be [B] matching audio latents batch size, got shape {tuple(audio_lengths.shape)}"
+            )
+
+        audio_lengths = audio_lengths.to(device=device, dtype=torch.int64).clamp(min=0, max=audio_seq_len)
+        t = torch.arange(audio_seq_len, device=device).view(1, -1)
+        return t < audio_lengths.view(-1, 1)
 
     # -- Prompt pre-caching --------------------------------------------------
 
@@ -563,6 +692,146 @@ class LTX2SliderTrainer:
         network.set_multiplier(1.0)
         return (loss_pos.item() + loss_neg.item()) / 2.0
 
+    def _audio_reference_slider_step(
+        self,
+        transformer,
+        network,
+        batch: Dict[str, torch.Tensor],
+        accelerator: Accelerator,
+        args: argparse.Namespace,
+        dit_dtype: torch.dtype,
+    ) -> float:
+        """One training step for audio-only reference slider mode."""
+        if getattr(args, "ltx_mode", "video") != "audio":
+            raise ValueError("Audio reference sliders require --ltx2_mode audio")
+
+        device = accelerator.device
+
+        pos_audio_latents = batch["pos_audio_latents"].to(device=device, dtype=torch.float32)
+        neg_audio_latents = batch["neg_audio_latents"].to(device=device, dtype=torch.float32)
+        pos_virtual_latents = batch["pos_virtual_latents"].to(device=device, dtype=torch.float32)
+        neg_virtual_latents = batch["neg_virtual_latents"].to(device=device, dtype=torch.float32)
+        text_embeds = batch["text_embeds"].to(device=device, dtype=dit_dtype)
+        text_mask = batch["text_mask"].to(device=device, dtype=torch.int64)
+
+        if text_embeds.dim() == 2:
+            text_embeds = text_embeds.unsqueeze(0)
+        if text_mask.dim() == 1:
+            text_mask = text_mask.unsqueeze(0)
+
+        if pos_audio_latents.shape != neg_audio_latents.shape:
+            raise ValueError(
+                f"Audio slider pair shape mismatch: pos {tuple(pos_audio_latents.shape)} vs neg {tuple(neg_audio_latents.shape)}"
+            )
+        if pos_virtual_latents.shape != neg_virtual_latents.shape:
+            raise ValueError(
+                "Audio slider virtual geometry mismatch: "
+                f"pos {tuple(pos_virtual_latents.shape)} vs neg {tuple(neg_virtual_latents.shape)}"
+            )
+
+        noise = torch.randn_like(pos_audio_latents)
+
+        seq_len = pos_virtual_latents.shape[2] * pos_virtual_latents.shape[3] * pos_virtual_latents.shape[4]
+        shifted_logit_shift_override = getattr(args, "shifted_logit_shift", None)
+        if shifted_logit_shift_override is not None:
+            shift = float(shifted_logit_shift_override)
+        else:
+            shift = self._net_trainer._resolve_shifted_logit_normal_shift(args, int(seq_len))
+        shifted_logit_mode = self._net_trainer._resolve_shifted_logit_mode(args)
+        sigma = LTX2NetworkTrainer._sample_shifted_logit_normal_sigmas(
+            pos_audio_latents.shape[0],
+            torch.full((pos_audio_latents.shape[0],), float(shift), device=device, dtype=torch.float32),
+            std=float(getattr(args, "logit_std", 1.0)),
+            mode=shifted_logit_mode,
+            eps=float(getattr(args, "shifted_logit_eps", 1e-3)),
+            uniform_prob=float(getattr(args, "shifted_logit_uniform_prob", 0.1)),
+        )
+        model_ts = sigma.unsqueeze(1).to(dtype=dit_dtype)
+        audio_model_ts = model_ts
+        if bool(getattr(args, "independent_audio_timestep", False)):
+            audio_model_ts = self._net_trainer._sample_independent_audio_timesteps(
+                args,
+                batch_size=pos_audio_latents.shape[0],
+                device=device,
+                dtype=dit_dtype,
+            )
+        sigma_audio = audio_model_ts[:, 0].to(dtype=torch.float32).view(-1, 1, 1, 1)
+
+        noisy_pos = ((1.0 - sigma_audio) * pos_audio_latents + sigma_audio * noise).to(dtype=dit_dtype)
+        noisy_neg = ((1.0 - sigma_audio) * neg_audio_latents + sigma_audio * noise).to(dtype=dit_dtype)
+
+        target_pos = (noise - pos_audio_latents).to(dtype=dit_dtype)
+        target_neg = (noise - neg_audio_latents).to(dtype=dit_dtype)
+
+        audio_lengths = batch.get("audio_lengths")
+        neg_audio_lengths = batch.get("neg_audio_lengths")
+        if isinstance(audio_lengths, torch.Tensor):
+            audio_lengths = audio_lengths.to(device=device)
+        if isinstance(neg_audio_lengths, torch.Tensor):
+            neg_audio_lengths = neg_audio_lengths.to(device=device)
+        loss_mask_pos = self._build_audio_loss_mask(pos_audio_latents, audio_lengths, device)
+        loss_mask_neg = self._build_audio_loss_mask(neg_audio_latents, neg_audio_lengths, device)
+
+        dummy_video = torch.zeros(
+            (pos_audio_latents.shape[0], self._resolve_transformer_in_channels(transformer), 1, 1, 1),
+            device=device,
+            dtype=dit_dtype,
+        )
+        transformer_options = {"patches_replace": {}}
+
+        self._net_trainer._ensure_fp8_buffers_on_device(accelerator.unwrap_model(transformer))
+
+        network.set_multiplier(1.0)
+        with accelerator.autocast():
+            pred_pos = transformer(
+                [dummy_video, noisy_pos],
+                timestep=model_ts,
+                audio_timestep=audio_model_ts,
+                context=text_embeds,
+                attention_mask=text_mask,
+                frame_rate=self.slider_config.frame_rate,
+                transformer_options=transformer_options,
+                audio_only=True,
+            )
+        if isinstance(pred_pos, (list, tuple)):
+            _video_pred_pos, pred_pos_audio = pred_pos
+        else:
+            pred_pos_audio = None
+        if pred_pos_audio is None:
+            raise ValueError("Audio slider expected an audio prediction but got None")
+        loss_pos = self._compute_masked_mse_loss(pred_pos_audio, target_pos, loss_mask_pos)
+        accelerator.backward(loss_pos)
+
+        del pred_pos, pred_pos_audio
+        clean_memory_on_device(device)
+
+        network.set_multiplier(-1.0)
+        with accelerator.autocast():
+            pred_neg = transformer(
+                [dummy_video, noisy_neg],
+                timestep=model_ts,
+                audio_timestep=audio_model_ts,
+                context=text_embeds,
+                attention_mask=text_mask,
+                frame_rate=self.slider_config.frame_rate,
+                transformer_options=transformer_options,
+                audio_only=True,
+            )
+        if isinstance(pred_neg, (list, tuple)):
+            _video_pred_neg, pred_neg_audio = pred_neg
+        else:
+            pred_neg_audio = None
+        if pred_neg_audio is None:
+            raise ValueError("Audio slider expected an audio prediction but got None")
+        loss_neg = self._compute_masked_mse_loss(pred_neg_audio, target_neg, loss_mask_neg)
+        accelerator.backward(loss_neg)
+
+        del pred_neg, pred_neg_audio
+        clean_memory_on_device(device)
+
+        network.set_multiplier(1.0)
+        return (loss_pos.item() + loss_neg.item()) / 2.0
+
     # -- Sampling at multiple slider strengths --------------------------------
 
     def _sample_slider(
@@ -607,7 +876,12 @@ class LTX2SliderTrainer:
         Loads matched positive/negative latent pairs from pre-cached directories.
         """
         cfg = self.slider_config
-        dataset = PairedSliderDataset(cfg.pos_cache_dir, cfg.neg_cache_dir, cfg.text_cache_dir)
+        dataset = PairedSliderDataset(
+            cfg.pos_cache_dir,
+            cfg.neg_cache_dir,
+            cfg.text_cache_dir,
+            reference_modality=cfg.reference_modality,
+        )
         num_workers = min(getattr(args, "max_data_loader_n_workers", 2), os.cpu_count() or 1)
         dataloader = torch.utils.data.DataLoader(
             dataset,
@@ -635,7 +909,12 @@ class LTX2SliderTrainer:
 
         # Load slider config
         self.slider_config = load_slider_config(args.slider_config)
-        logger.info("Slider mode: %s, targets: %d", self.slider_config.mode, len(self.slider_config.targets))
+        logger.info(
+            "Slider mode: %s, reference_modality: %s, targets: %d",
+            self.slider_config.mode,
+            self.slider_config.reference_modality,
+            len(self.slider_config.targets),
+        )
 
         # Override from CLI if given
         if getattr(args, "guidance_strength", None) is not None:
@@ -646,11 +925,29 @@ class LTX2SliderTrainer:
         # Validate
         if self.slider_config.mode not in {"text", "reference"}:
             raise ValueError(f"Invalid slider mode '{self.slider_config.mode}'. Must be 'text' or 'reference'.")
+        if self.slider_config.reference_modality not in {"video", "audio"}:
+            raise ValueError(
+                f"Invalid reference_modality '{self.slider_config.reference_modality}'. Must be 'video' or 'audio'."
+            )
         if self.slider_config.mode == "text" and len(self.slider_config.targets) == 0:
             raise ValueError("Text-only slider mode requires at least one target in slider config")
         if self.slider_config.mode == "reference":
             if not self.slider_config.pos_cache_dir or not self.slider_config.neg_cache_dir:
                 raise ValueError("Reference slider mode requires pos_cache_dir and neg_cache_dir in slider config")
+            if self.slider_config.reference_modality == "audio":
+                if getattr(args, "ltx_mode", "video") != "audio":
+                    raise ValueError("Audio reference sliders require --ltx2_mode audio")
+                if getattr(args, "sample_prompts", None) and not bool(getattr(args, "sample_audio_only", False)):
+                    logger.info("Enabling --sample_audio_only automatically for audio reference sliders.")
+                    args.sample_audio_only = True
+                if getattr(args, "lora_target_preset", None) is None:
+                    logger.info("Using lora_target_preset=audio for audio reference slider training")
+                    args.lora_target_preset = "audio"
+                elif getattr(args, "lora_target_preset", None) != "audio":
+                    logger.warning(
+                        "Audio reference sliders work best with --lora_target_preset audio; got %s",
+                        args.lora_target_preset,
+                    )
 
         # Seed
         if args.seed is None:
@@ -967,7 +1264,10 @@ class LTX2SliderTrainer:
                     except StopIteration:
                         ref_iter = iter(ref_dataloader)
                         batch = next(ref_iter)
-                    loss = self._reference_slider_step(transformer, network, batch, accelerator, args, dit_dtype)
+                    if self.slider_config.reference_modality == "audio":
+                        loss = self._audio_reference_slider_step(transformer, network, batch, accelerator, args, dit_dtype)
+                    else:
+                        loss = self._reference_slider_step(transformer, network, batch, accelerator, args, dit_dtype)
 
                 # Gradient clipping
                 if accelerator.sync_gradients and getattr(args, "max_grad_norm", 0.0) != 0.0:
