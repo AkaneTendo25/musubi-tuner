@@ -1907,7 +1907,7 @@ Two modes are available:
 | Mode | Input | Use Case |
 |------|-------|----------|
 | `text` | Prompt pairs only (no dataset) | Sliders from text prompt pairs, no images needed |
-| `reference` | Pre-cached latent pairs | Sliders from paired positive/negative video or audio samples |
+| `reference` | Pre-cached latent pairs | Sliders from paired positive/negative image, video, or audio samples |
 
 ### 4a. Text-Only Mode
 
@@ -1973,7 +1973,7 @@ All standard training arguments (`--fp8_base`, `--blocks_to_swap`, `--gradient_c
 
 ### 4b. Reference Mode
 
-Learns a slider direction from paired positive/negative video or audio examples. Requires pre-cached latents.
+Learns a slider direction from paired positive/negative image, video, or audio examples. Requires pre-cached latents.
 
 #### Step 1: Prepare Paired Data
 
@@ -1987,6 +1987,8 @@ positive_images/        negative_images/
 ```
 
 Each positive image must have a corresponding negative image with the same filename. The images should depict the same subject but differ in the target attribute (e.g., smiling vs neutral face, detailed vs blurry).
+
+For image-based sliders, cache these paired images normally and keep `reference_modality = "video"` (the visual latent path covers both single-frame images and multi-frame videos).
 
 #### Step 2: Cache Latents and Text
 
