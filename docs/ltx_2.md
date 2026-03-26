@@ -1907,7 +1907,7 @@ Two modes are available:
 | Mode | Input | Use Case |
 |------|-------|----------|
 | `text` | Prompt pairs only (no dataset) | Sliders from text prompt pairs, no images needed |
-| `reference` | Pre-cached latent pairs | Sliders from paired positive/negative image samples |
+| `reference` | Pre-cached latent pairs | Sliders from paired positive/negative image or video samples |
 
 ### 4a. Text-Only Mode
 
@@ -2042,6 +2042,8 @@ accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 ltx2_tr
 ```
 
 Note: `--gemma_root` is not needed for reference mode (text embeddings are loaded from cache). `--dataset_config`, `--latent_frames/height/width` are also not used.
+
+For video reference sliders, `--ltx2_first_frame_conditioning_p` also works here. When enabled on multi-frame samples, the trainer anchors frame 0 as conditioning-only and excludes it from the loss, which is useful when positive/negative pairs share the same start frame and differ mainly in motion. It has no effect for text-only sliders or single-frame reference samples.
 
 ### Slider Tips
 

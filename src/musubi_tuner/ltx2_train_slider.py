@@ -256,6 +256,68 @@ class LTX2SliderTrainer:
         self.slider_config: Optional[SliderConfig] = None
         self.cached_embeds: Dict[str, Tuple[torch.Tensor, torch.Tensor]] = {}
 
+    def _prepare_first_frame_conditioning(
+        self,
+        latents: torch.Tensor,
+        noisy_latents: torch.Tensor,
+        accelerator: Accelerator,
+        args: argparse.Namespace,
+        conditioning_enabled: Optional[bool] = None,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor], Optional[torch.Tensor], bool]:
+        first_frame_p = float(getattr(args, "ltx2_first_frame_conditioning_p", 0.0))
+        if not (0.0 <= first_frame_p <= 1.0):
+            raise ValueError(f"ltx2_first_frame_conditioning_p must be in [0,1]. Got: {first_frame_p}")
+
+        if latents.dim() != 5 or latents.shape[2] <= 1 or first_frame_p <= 0.0:
+            return noisy_latents, {"patches_replace": {}}, None, False
+
+        if conditioning_enabled is None:
+            conditioning_enabled = bool(torch.rand((), device=accelerator.device) < first_frame_p)
+        if not conditioning_enabled:
+            return noisy_latents, {"patches_replace": {}}, None, False
+
+        conditioned_noisy = noisy_latents.clone()
+        conditioned_noisy[:, :, 0:1, :, :] = latents[:, :, 0:1, :, :].to(dtype=noisy_latents.dtype)
+
+        batch_size, _channels, frames, height, width = latents.shape
+        seq_len = frames * height * width
+        first_frame_tokens = height * width
+        video_conditioning_mask = torch.zeros(
+            (batch_size, seq_len), device=accelerator.device, dtype=torch.bool
+        )
+        if first_frame_tokens > 0:
+            video_conditioning_mask[:, :first_frame_tokens] = True
+
+        video_loss_mask = torch.ones(
+            (batch_size, 1, frames, 1, 1), device=accelerator.device, dtype=torch.bool
+        )
+        video_loss_mask[:, :, 0:1, :, :] = False
+
+        transformer_options = {
+            "patches_replace": {},
+            "video_conditioning_mask": video_conditioning_mask,
+        }
+        return conditioned_noisy, transformer_options, video_loss_mask, True
+
+    @staticmethod
+    def _compute_masked_mse_loss(
+        prediction: torch.Tensor,
+        target: torch.Tensor,
+        loss_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        squared_error = (prediction.float() - target.float()) ** 2
+        if loss_mask is None:
+            return squared_error.mean()
+
+        mask = loss_mask.to(device=prediction.device)
+        if mask.dtype != torch.bool:
+            mask = mask != 0
+        mask = mask.expand_as(squared_error)
+        masked_error = squared_error[mask]
+        if masked_error.numel() == 0:
+            return squared_error.new_zeros(())
+        return masked_error.mean()
+
     # -- Prompt pre-caching --------------------------------------------------
 
     def _precache_slider_prompts(self, args: argparse.Namespace, accelerator: Accelerator) -> None:
@@ -455,6 +517,13 @@ class LTX2SliderTrainer:
         target_pos = (noise - pos_latents).to(dtype=dit_dtype)
         target_neg = (noise - neg_latents).to(dtype=dit_dtype)
 
+        noisy_pos, transformer_options, video_loss_mask, conditioning_enabled = self._prepare_first_frame_conditioning(
+            pos_latents, noisy_pos, accelerator, args
+        )
+        noisy_neg, _, _, _ = self._prepare_first_frame_conditioning(
+            neg_latents, noisy_neg, accelerator, args, conditioning_enabled=conditioning_enabled
+        )
+
         self._net_trainer._ensure_fp8_buffers_on_device(accelerator.unwrap_model(transformer))
 
         # Training pass: positive (multiplier=+1)
@@ -466,9 +535,9 @@ class LTX2SliderTrainer:
                 context=text_embeds,
                 attention_mask=text_mask,
                 frame_rate=self.slider_config.frame_rate,
-                transformer_options={},
+                transformer_options=transformer_options,
             )
-        loss_pos = F_torch.mse_loss(pred_pos.float(), target_pos.float())
+        loss_pos = self._compute_masked_mse_loss(pred_pos, target_pos, video_loss_mask)
         accelerator.backward(loss_pos)
 
         del pred_pos
@@ -483,9 +552,9 @@ class LTX2SliderTrainer:
                 context=text_embeds,
                 attention_mask=text_mask,
                 frame_rate=self.slider_config.frame_rate,
-                transformer_options={},
+                transformer_options=transformer_options,
             )
-        loss_neg = F_torch.mse_loss(pred_neg.float(), target_neg.float())
+        loss_neg = self._compute_masked_mse_loss(pred_neg, target_neg, video_loss_mask)
         accelerator.backward(loss_neg)
 
         del pred_neg
