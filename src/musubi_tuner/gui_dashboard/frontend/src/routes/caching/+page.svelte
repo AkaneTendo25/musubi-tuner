@@ -154,6 +154,12 @@
 					</div>
 				</FormGroup>
 
+				<FormGroup title="Connector LoRA">
+					<div class="space-y-2 pt-2">
+						<FormToggle label="Cache Pre-Connector Features" checked={caching.cache_before_connector ?? false} onchange={(e) => updateCaching('cache_before_connector', e.target.checked)} tooltip="Save pre-connector text features alongside standard embeddings. Required for --train_connectors during training." />
+					</div>
+				</FormGroup>
+
 				<ProcessControls processType="cache_text" status={textStatus} onStart={() => startProcess('cache_text')} onStop={() => stopProcess('cache_text')} />
 				<ProcessConsole lines={textLogs} />
 				<CommandPanel processType="cache_text" defaultFilename="cache_text.bat" />

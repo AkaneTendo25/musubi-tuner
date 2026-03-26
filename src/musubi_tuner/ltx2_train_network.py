@@ -2239,6 +2239,7 @@ class LTX2NetworkTrainer(NetworkTrainer):
         self._validate_ltx_version_consistency(args)
 
         self._audio_video = self._ltx_mode in {"av", "audio"}
+        self._train_connectors = bool(getattr(args, "train_connectors", False))
         self._ltx2_audio_only_model = bool(getattr(args, "ltx2_audio_only_model", False))
         if self._ltx2_audio_only_model and self._ltx_mode != "audio":
             raise ValueError("--ltx2_audio_only_model requires --ltx2_mode audio")
@@ -2554,6 +2555,27 @@ class LTX2NetworkTrainer(NetworkTrainer):
 
         transformer.eval()
         transformer.requires_grad_(False)
+
+        # Connector LoRA: load connectors from checkpoint and attach to wrapper
+        if self._train_connectors:
+            from musubi_tuner.networks.lora_ltx2 import load_connectors_from_checkpoint
+            from musubi_tuner.ltx_2.loader.sft_loader import SafetensorsModelStateDictLoader
+
+            connector_config = SafetensorsModelStateDictLoader().metadata(str(dit_path))
+            video_connector, audio_connector = load_connectors_from_checkpoint(
+                str(dit_path),
+                connector_config,
+                audio_video=self._audio_video,
+                device=accelerator.device,
+                dtype=torch_dtype_to_use or torch.bfloat16,
+            )
+            video_connector.eval()
+            video_connector.requires_grad_(False)
+            if audio_connector is not None:
+                audio_connector.eval()
+                audio_connector.requires_grad_(False)
+            transformer.load_connectors(video_connector, audio_connector)
+            logger.info("Connector LoRA: attached connectors to transformer wrapper")
 
         return transformer
 
@@ -3951,6 +3973,29 @@ class LTX2NetworkTrainer(NetworkTrainer):
                             )
                 self._self_flow.mark_student_forward()
 
+        # Connector LoRA: pass pre-connector features for on-the-fly connector processing
+        if self._train_connectors and conditions is not None:
+            video_features = conditions.get("video_features")
+            if not isinstance(video_features, torch.Tensor):
+                if not getattr(self, "_warned_missing_connector_features", False):
+                    logger.error(
+                        "--train_connectors is set but cache lacks 'video_features' keys. "
+                        "Re-run caching with --cache_before_connector. "
+                        "Connector LoRA will have NO effect on training."
+                    )
+                    self._warned_missing_connector_features = True
+            if isinstance(video_features, torch.Tensor):
+                resolved_transformer_options = dict(resolved_transformer_options)
+                resolved_transformer_options["video_features"] = video_features.to(
+                    device=accelerator.device, dtype=network_dtype
+                )
+                audio_features = conditions.get("audio_features")
+                if isinstance(audio_features, torch.Tensor):
+                    resolved_transformer_options["audio_features"] = audio_features.to(
+                        device=accelerator.device, dtype=network_dtype
+                    )
+                resolved_transformer_options["features_attention_mask"] = text_mask
+
         if getattr(args, "fp8_base", False) or getattr(args, "fp8_scaled", False):
             self._ensure_fp8_buffers_on_device(transformer)
         with accelerator.autocast():
@@ -4386,6 +4431,19 @@ class LTX2NetworkTrainer(NetworkTrainer):
             except StopIteration:
                 pass
         self._text_encoder.eval()
+
+        # Connector LoRA: replace text encoder's connectors with the wrapper's
+        # (which have LoRA hooks or merged weights), so samples reflect connector LoRA.
+        # This covers both training (--train_connectors) and inference (merged connector LoRA).
+        transformer = getattr(self, "unet", None)
+        if transformer is not None and getattr(transformer, "has_connectors", lambda: False)():
+            if hasattr(self._text_encoder, "embeddings_connector"):
+                self._text_encoder.embeddings_connector = transformer.embeddings_connector
+                logger.info("Sampling: using LoRA'd video connector from wrapper")
+            if hasattr(self._text_encoder, "audio_embeddings_connector") and hasattr(transformer, "audio_embeddings_connector"):
+                self._text_encoder.audio_embeddings_connector = transformer.audio_embeddings_connector
+                logger.info("Sampling: using LoRA'd audio connector from wrapper")
+
         return text_encoder_dtype
 
     def _encode_prompt_text(
@@ -6797,6 +6855,12 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         ),
     )
     parser.add_argument(
+        "--train_connectors",
+        action="store_true",
+        help="Also apply LoRA to text connector modules (Embeddings1DConnector) in addition to "
+        "transformer blocks. Requires caching with --cache_before_connector.",
+    )
+    parser.add_argument(
         "--ic_lora_strategy",
         type=str,
         default="auto",
@@ -7714,6 +7778,21 @@ def main() -> None:
         if not any(arg.startswith("lora_target_preset=") for arg in args.network_args):
             args.network_args.append(f"lora_target_preset={lora_target_preset}")
             logger.info(f"Using LoRA target preset: {lora_target_preset}")
+
+    # Inject connector_lora into network_args
+    if getattr(args, "train_connectors", False):
+        if uses_lycoris_module:
+            logger.warning(
+                "--train_connectors has no effect with LyCORIS networks. "
+                "Connector LoRA is only supported with standard LoRA. Ignoring."
+            )
+            args.train_connectors = False
+        else:
+            if args.network_args is None:
+                args.network_args = []
+            if not any(arg.startswith("connector_lora=") for arg in args.network_args):
+                args.network_args.append("connector_lora=True")
+                logger.info("Connector LoRA enabled: connectors will be targeted by LoRA")
 
     # Inject audio_dim/audio_alpha into network_args (regular LoRA only, not LyCORIS)
     if not uses_lycoris_module:

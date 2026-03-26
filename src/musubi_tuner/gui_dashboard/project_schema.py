@@ -90,6 +90,8 @@ class CachingConfig(BaseModel):
     dino_batch_size: int = 16
     # Quantization device
     quantize_device: Optional[str] = None
+    # Connector LoRA
+    cache_before_connector: bool = False
     # Dataset manifest
     save_dataset_manifest: str = ""
 
@@ -143,6 +145,7 @@ class TrainingConfig(BaseModel):
     caption_dropout_rate: float = 0.0
     video_caption_dropout_rate: float = 0.0
     audio_caption_dropout_rate: float = 0.0
+    train_connectors: bool = False
     save_original_lora: bool = True
     ic_lora_strategy: Literal["auto", "none", "v2v", "audio_ref_only_ic"] = "auto"
     audio_ref_use_negative_positions: bool = False

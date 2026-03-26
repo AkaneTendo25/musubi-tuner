@@ -83,6 +83,59 @@ def encode_and_save_batch_official_gemma(
             )
 
 
+def encode_and_save_batch_pre_connector(
+    text_encoder,
+    batch: list[ItemInfo],
+    *,
+    device: torch.device,
+    autocast_dtype: torch.dtype | None,
+    audio_video: bool,
+) -> None:
+    """Encode and save with both pre-connector features and post-connector embeddings.
+
+    Calls _preprocess_text() to get pre-connector features, then _run_connectors()
+    to get standard embeddings. Both are saved in the same cache file.
+    """
+    if autocast_dtype is not None and device.type == "cuda":
+        autocast_context = torch.amp.autocast("cuda", dtype=autocast_dtype)
+    else:
+        autocast_context = nullcontext()
+
+    with torch.no_grad(), autocast_context:
+        for item in batch:
+            # Phase 1: Gemma + feature extractor (pre-connector)
+            projected, attention_mask = text_encoder._preprocess_text(item.caption, padding_side="left")
+
+            if isinstance(projected, tuple):
+                video_feat, audio_feat = projected
+            else:
+                video_feat, audio_feat = projected, None
+
+            # Phase 2: run connectors for standard embeddings
+            if audio_video:
+                video_embed, audio_embed, mask = text_encoder._run_connectors(projected, attention_mask)
+            else:
+                video_embed, mask = text_encoder._run_connector(projected, attention_mask)
+                audio_embed = None
+
+            # Squeeze batch dim and detach
+            video_embed = video_embed.squeeze(0).detach().cpu()
+            mask = mask.squeeze(0).detach().cpu()
+            audio_embed_out = audio_embed.squeeze(0).detach().cpu() if audio_embed is not None else None
+
+            video_feat_out = video_feat.squeeze(0).detach().cpu()
+            audio_feat_out = audio_feat.squeeze(0).detach().cpu() if audio_feat is not None else None
+
+            save_text_encoder_output_cache_ltx2_official(
+                item,
+                video_prompt_embeds=video_embed,
+                audio_prompt_embeds=audio_embed_out,
+                prompt_attention_mask=mask,
+                video_features=video_feat_out,
+                audio_features=audio_feat_out,
+            )
+
+
 def _encode_prompt_text_ltx2(
     text_encoder,
     prompt_text: str,
@@ -379,14 +432,25 @@ def main() -> None:
             f"meta_params={meta_params[:10]} meta_bufs={meta_bufs[:10]}"
         )
 
+    cache_before_connector = bool(getattr(args, "cache_before_connector", False))
+
     def encode_fn(batch: list[ItemInfo]) -> None:
-        encode_and_save_batch_official_gemma(
-            text_encoder,
-            batch,
-            device=device,
-            autocast_dtype=autocast_dtype,
-            audio_video=audio_video,
-        )
+        if cache_before_connector:
+            encode_and_save_batch_pre_connector(
+                text_encoder,
+                batch,
+                device=device,
+                autocast_dtype=autocast_dtype,
+                audio_video=audio_video,
+            )
+        else:
+            encode_and_save_batch_official_gemma(
+                text_encoder,
+                batch,
+                device=device,
+                autocast_dtype=autocast_dtype,
+                audio_video=audio_video,
+            )
 
     # Text caching is CPU-heavy (tokenization, python-side preprocessing). On Windows, high num_workers
     # often hurts throughput or appears to hang due to thread contention. Default to 1 unless specified.
@@ -549,6 +613,12 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         default="auto",
         choices=["auto", "fp16", "bf16", "fp32"],
         help="Compute dtype for 4-bit (auto uses --mixed_precision dtype)",
+    )
+    parser.add_argument(
+        "--cache_before_connector",
+        action="store_true",
+        help="Also cache pre-connector features (for --train_connectors training). "
+        "Saves both pre-connector features and standard post-connector embeddings.",
     )
     return parser
 

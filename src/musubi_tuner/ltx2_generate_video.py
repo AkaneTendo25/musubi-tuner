@@ -241,11 +241,36 @@ def _merge_lora_weights(
     multipliers: Optional[list[float]],
     include_patterns: Optional[list[str]],
     exclude_patterns: Optional[list[str]],
+    ltx2_checkpoint: Optional[str] = None,
+    text_encoder: Optional[torch.nn.Module] = None,
 ) -> None:
     for idx, path in enumerate(weights):
         multiplier = multipliers[idx] if multipliers and len(multipliers) > idx else 1.0
         logger.info("Merging LoRA: %s (multiplier=%.3f)", path, multiplier)
         lora_sd = load_file(path)
+
+        # Auto-detect connector LoRA and attach connectors to wrapper for merge
+        has_connector_lora = any("embeddings_connector" in k for k in lora_sd.keys())
+        if has_connector_lora and not getattr(transformer, "has_connectors", lambda: False)():
+            if ltx2_checkpoint is None:
+                logger.warning(
+                    "LoRA contains connector weights but --ltx2_checkpoint not provided; "
+                    "connector LoRA will be skipped."
+                )
+            else:
+                from musubi_tuner.ltx_2.loader.sft_loader import SafetensorsModelStateDictLoader
+
+                config = SafetensorsModelStateDictLoader().metadata(str(ltx2_checkpoint))
+                video_conn, audio_conn = lora_ltx2.load_connectors_from_checkpoint(
+                    str(ltx2_checkpoint),
+                    config,
+                    audio_video=True,
+                    device=next(transformer.parameters()).device,
+                    dtype=next(transformer.parameters()).dtype,
+                )
+                transformer.load_connectors(video_conn, audio_conn)
+                logger.info("Attached connectors to wrapper for connector LoRA merge")
+
         net = lora_ltx2.create_arch_network_from_weights(
             multiplier,
             lora_sd,
@@ -255,6 +280,19 @@ def _merge_lora_weights(
             exclude_patterns=exclude_patterns,
         )
         net.merge_to(None, transformer, lora_sd, device=next(transformer.parameters()).device, non_blocking=True)
+
+        # Copy merged connector weights back to text encoder if available
+        if has_connector_lora and text_encoder is not None and getattr(transformer, "has_connectors", lambda: False)():
+            if hasattr(text_encoder, "embeddings_connector"):
+                text_encoder.embeddings_connector.load_state_dict(
+                    transformer.embeddings_connector.state_dict(), strict=False
+                )
+                logger.info("Copied merged connector LoRA weights to text encoder (video)")
+            if hasattr(text_encoder, "audio_embeddings_connector") and hasattr(transformer, "audio_embeddings_connector"):
+                text_encoder.audio_embeddings_connector.load_state_dict(
+                    transformer.audio_embeddings_connector.state_dict(), strict=False
+                )
+                logger.info("Copied merged connector LoRA weights to text encoder (audio)")
 
 
 # ---------------------------------------------------------------------------
@@ -338,6 +376,7 @@ def main() -> None:
             args.lora_multiplier,
             args.include_patterns,
             args.exclude_patterns,
+            ltx2_checkpoint=str(args.ltx2_checkpoint),
         )
         clean_memory_on_device(device)
 

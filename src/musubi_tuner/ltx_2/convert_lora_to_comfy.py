@@ -40,13 +40,24 @@ def convert_key_to_comfy(key):
     main_part = parts[0]  # e.g., lora_unet_model_transformer_blocks_0_attn1_to_k
     weight_part = '.'.join(parts[1:])  # e.g., lora_down.weight
 
-    # Remove the 'lora_unet_model_' prefix and replace with 'diffusion_model.'
-    if not main_part.startswith('lora_unet_model_'):
-        print(f"Warning: Key doesn't start with 'lora_unet_model_': {key}")
+    # Remove the lora_unet_ prefix and handle the wrapper's module structure.
+    # Transformer keys: lora_unet_model_transformer_blocks_... (wrapper.model.transformer_blocks)
+    # Connector keys:   lora_unet_embeddings_connector_... (wrapper.embeddings_connector)
+    if main_part.startswith('lora_unet_model_'):
+        # Standard transformer path: strip wrapper.model prefix
+        main_part = main_part[len('lora_unet_model_'):]
+    elif main_part.startswith('lora_unet_'):
+        # Connector or other wrapper-level module
+        main_part = main_part[len('lora_unet_'):]
+    else:
+        print(f"Warning: Key doesn't start with 'lora_unet_': {key}")
         return None
 
-    # Remove prefix
-    main_part = main_part[len('lora_unet_model_'):]
+    # Map connector attribute names to ComfyUI model names
+    # Training wrapper: self.embeddings_connector -> ComfyUI: video_embeddings_connector
+    if main_part.startswith('embeddings_connector_'):
+        main_part = 'video_' + main_part
+    # audio_embeddings_connector is already correct
 
     # Convert underscores to dots for the hierarchy
     # We need to be careful with numeric parts
@@ -62,7 +73,14 @@ def convert_key_to_comfy(key):
     # This prevents _attn1_ from matching inside audio_attn1_
     import re
 
-    # Step 1: Basic block structure
+    # Step 0: Handle connector module paths
+    # video_embeddings_connector_transformer_1d_blocks_0_... -> video_embeddings_connector.transformer_1d_blocks.0....
+    # audio_embeddings_connector_transformer_1d_blocks_0_... -> audio_embeddings_connector.transformer_1d_blocks.0....
+    converted = converted.replace('video_embeddings_connector_', 'video_embeddings_connector.')
+    converted = converted.replace('audio_embeddings_connector_', 'audio_embeddings_connector.')
+    converted = converted.replace('transformer_1d_blocks_', 'transformer_1d_blocks.')
+
+    # Step 1: Basic block structure (main transformer)
     converted = converted.replace('transformer_blocks_', 'transformer_blocks.')
 
     # Step 2: Handle audio/video attention patterns FIRST (keep underscores in these)

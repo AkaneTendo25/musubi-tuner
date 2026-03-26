@@ -533,6 +533,8 @@ def save_text_encoder_output_cache_ltx2_official(
     video_prompt_embeds: torch.Tensor,
     prompt_attention_mask: torch.Tensor,
     audio_prompt_embeds: Optional[torch.Tensor] = None,
+    video_features: Optional[torch.Tensor] = None,
+    audio_features: Optional[torch.Tensor] = None,
 ):
     assert video_prompt_embeds.dim() == 1 or video_prompt_embeds.dim() == 2, (
         f"video_prompt_embeds should be 2D tensor (feature, hidden_size) or (hidden_size,), got {video_prompt_embeds.shape}"
@@ -553,6 +555,12 @@ def save_text_encoder_output_cache_ltx2_official(
         sd[f"audio_prompt_embeds_{dtype_str}"] = audio_prompt_embeds.detach().cpu()
     if prompt_attention_mask is not None:
         sd["prompt_attention_mask"] = prompt_attention_mask.detach().cpu()
+
+    # Pre-connector features for --train_connectors training
+    if video_features is not None:
+        sd[f"video_features_{dtype_str}"] = video_features.detach().cpu()
+    if audio_features is not None:
+        sd[f"audio_features_{dtype_str}"] = audio_features.detach().cpu()
 
     text = video_prompt_embeds
     if audio_prompt_embeds is not None:
@@ -1427,6 +1435,14 @@ class BucketBatchManager:
                     conditions["audio_prompt_embeds"] = audio_prompt_embeds
                 if isinstance(prompt_attention_mask, torch.Tensor):
                     conditions["prompt_attention_mask"] = prompt_attention_mask
+
+            # Pre-connector features for --train_connectors training
+            video_features = batch_tensor_data.get("video_features")
+            if isinstance(video_features, torch.Tensor):
+                conditions["video_features"] = video_features
+            audio_features = batch_tensor_data.get("audio_features")
+            if isinstance(audio_features, torch.Tensor):
+                conditions["audio_features"] = audio_features
 
             if not conditions:
                 text = batch_tensor_data.get("text")

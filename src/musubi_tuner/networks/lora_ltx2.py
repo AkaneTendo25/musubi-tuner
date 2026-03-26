@@ -184,6 +184,43 @@ class LTX2Wrapper(nn.Module):
             return self.model.switch_block_swap_for_training()
         return None
 
+    def load_connectors(
+        self,
+        embeddings_connector: nn.Module,
+        audio_embeddings_connector: Optional[nn.Module] = None,
+    ) -> None:
+        """Attach connector modules to the wrapper for LoRA discovery and forward pass."""
+        self.embeddings_connector = embeddings_connector
+        if audio_embeddings_connector is not None:
+            self.audio_embeddings_connector = audio_embeddings_connector
+
+    def has_connectors(self) -> bool:
+        return isinstance(getattr(self, "embeddings_connector", None), nn.Module)
+
+    def _run_connectors(
+        self,
+        video_features: torch.Tensor,
+        audio_features: Optional[torch.Tensor],
+        attention_mask: torch.Tensor,
+    ) -> tuple:
+        """Run attached connectors on pre-connector features. Returns (video_ctx, audio_ctx, mask)."""
+        dtype = video_features.dtype
+        additive_mask = (attention_mask - 1).to(dtype).reshape(
+            (attention_mask.shape[0], 1, -1, attention_mask.shape[-1])
+        ) * torch.finfo(dtype).max
+
+        encoded, encoded_mask = self.embeddings_connector(video_features, additive_mask)
+        mask_int = (encoded_mask < 0.000001).to(torch.int64)
+        mask_int = mask_int.reshape([encoded.shape[0], encoded.shape[1], 1])
+        video_ctx = encoded * mask_int
+        out_mask = mask_int.squeeze(-1)
+
+        audio_ctx = None
+        if audio_features is not None and hasattr(self, "audio_embeddings_connector"):
+            audio_ctx, _ = self.audio_embeddings_connector(audio_features, additive_mask)
+
+        return video_ctx, audio_ctx, out_mask
+
     def __getattr__(self, name: str):
         try:
             return super().__getattr__(name)
@@ -359,6 +396,24 @@ class LTX2Wrapper(nn.Module):
                         )
                     video_positions = video_positions_override.to(device=video_positions.device, dtype=video_positions.dtype)
                 a2v_cross_attention_mask = transformer_options.get("a2v_cross_attention_mask")
+
+        # Connector LoRA: run connectors on pre-connector features if available
+        if (
+            self.has_connectors()
+            and isinstance(transformer_options, dict)
+            and isinstance(transformer_options.get("video_features"), torch.Tensor)
+        ):
+            raw_video_features = transformer_options["video_features"]
+            raw_audio_features = transformer_options.get("audio_features")
+            features_mask = transformer_options.get("features_attention_mask", attention_mask)
+            video_ctx, audio_ctx, connector_mask = self._run_connectors(
+                raw_video_features, raw_audio_features, features_mask
+            )
+            if audio_ctx is not None:
+                context = torch.cat([video_ctx, audio_ctx], dim=-1)
+            else:
+                context = video_ctx
+            attention_mask = connector_mask
 
         video_context = context
         audio_context = context
@@ -566,6 +621,12 @@ LTX2_TARGET_REPLACE_MODULES = [
     "BasicAVTransformerBlock",
 ]
 
+# Extended target modules when connector LoRA is enabled
+LTX2_TARGET_REPLACE_MODULES_WITH_CONNECTOR = [
+    "BasicAVTransformerBlock",
+    "_BasicTransformerBlock1D",
+]
+
 # LoRA target presets for different training modes
 # These patterns match layers inside BasicAVTransformerBlock.
 #
@@ -676,15 +737,20 @@ LTX2_LORA_TARGET_PRESETS = {
 LTX2_DEFAULT_INCLUDE_PATTERNS = LTX2_INCLUDE_PATTERNS_T2V
 
 
-def _build_exclude_patterns(raw_patterns: Optional[str], audio_video: bool = False) -> List[str]:  # noqa: ARG001
+def _build_exclude_patterns(
+    raw_patterns: Optional[str], audio_video: bool = False, connector_lora: bool = False,  # noqa: ARG001
+) -> List[str]:
     """Build exclude patterns list, including connector exclusions."""
     patterns: List[str] = [
         r".*text_embedding_projection\.aggregate_embed.*",
         r".*text_embedding_projection\.video_aggregate_embed.*",
         r".*text_embedding_projection\.audio_aggregate_embed.*",
-        r".*embeddings_connector\..*",
-        r".*audio_embeddings_connector\..*",
     ]
+    if not connector_lora:
+        patterns.extend([
+            r".*embeddings_connector\..*",
+            r".*audio_embeddings_connector\..*",
+        ])
     if raw_patterns is None:
         return patterns
     user_patterns = ast.literal_eval(raw_patterns)
@@ -778,7 +844,12 @@ def create_arch_network(
     if not audio_video and unet is not None:
         audio_video = unet.__class__.__name__ == "LTXAVModel" or hasattr(unet, "audio_patchify_proj")
 
-    kwargs["exclude_patterns"] = _build_exclude_patterns(kwargs.get("exclude_patterns"), audio_video=audio_video)
+    connector_lora = kwargs.pop("connector_lora", False)
+    kwargs["exclude_patterns"] = _build_exclude_patterns(
+        kwargs.get("exclude_patterns"), audio_video=audio_video, connector_lora=connector_lora,
+    )
+
+    target_modules = LTX2_TARGET_REPLACE_MODULES_WITH_CONNECTOR if connector_lora else LTX2_TARGET_REPLACE_MODULES
 
     # Handle lora_target_preset: use preset patterns unless include_patterns is explicitly set
     lora_target_preset = kwargs.pop("lora_target_preset", None)
@@ -803,8 +874,11 @@ def create_arch_network(
         module_kwargs["loftq_data"] = loftq_data
         kwargs["module_kwargs"] = module_kwargs
 
+    if connector_lora:
+        logger.info("Connector LoRA enabled: targeting %s", target_modules)
+
     net = lora.create_network(
-        LTX2_TARGET_REPLACE_MODULES,
+        target_modules,
         "lora_unet",
         multiplier,
         network_dim,
@@ -832,10 +906,19 @@ def create_arch_network_from_weights(
         if not audio_video and unet is not None:
             audio_video = unet.__class__.__name__ == "LTXAVModel" or hasattr(unet, "audio_patchify_proj")
 
-    kwargs["exclude_patterns"] = _build_exclude_patterns(kwargs.get("exclude_patterns"), audio_video=audio_video)
+    # Auto-detect connector LoRA from weight keys
+    connector_lora = kwargs.pop("connector_lora", False)
+    if not connector_lora:
+        connector_lora = any("embeddings_connector" in k for k in weights_sd.keys())
+
+    kwargs["exclude_patterns"] = _build_exclude_patterns(
+        kwargs.get("exclude_patterns"), audio_video=audio_video, connector_lora=connector_lora,
+    )
+
+    target_modules = LTX2_TARGET_REPLACE_MODULES_WITH_CONNECTOR if connector_lora else LTX2_TARGET_REPLACE_MODULES
 
     net = lora.create_network_from_weights(
-        LTX2_TARGET_REPLACE_MODULES,
+        target_modules,
         multiplier,
         weights_sd,
         text_encoders,
@@ -844,3 +927,61 @@ def create_arch_network_from_weights(
         **kwargs,
     )
     return _patch_lora_load_state_dict_for_audio(net)
+
+
+def load_connectors_from_checkpoint(
+    checkpoint_path: str,
+    config: dict,
+    *,
+    audio_video: bool = True,
+    device: torch.device = torch.device("cpu"),
+    dtype: torch.dtype = torch.bfloat16,
+) -> tuple:
+    """Load connector modules from an LTX-2 checkpoint.
+
+    Returns (video_connector, audio_connector_or_None).
+    """
+    from musubi_tuner.ltx_2.text_encoders.gemma.embeddings_connector import (
+        AudioEmbeddings1DConnectorConfigurator,
+        Embeddings1DConnector,
+        Embeddings1DConnectorConfigurator,
+    )
+
+    video_connector = Embeddings1DConnectorConfigurator.from_config(config)
+    audio_connector = AudioEmbeddings1DConnectorConfigurator.from_config(config) if audio_video else None
+
+    # Load weights from checkpoint using key mapping from AV_GEMMA_TEXT_ENCODER_KEY_OPS
+    from safetensors import safe_open
+
+    video_prefix = "model.diffusion_model.video_embeddings_connector."
+    audio_prefix = "model.diffusion_model.audio_embeddings_connector."
+
+    paths = checkpoint_path if isinstance(checkpoint_path, (list, tuple)) else [checkpoint_path]
+
+    video_sd = {}
+    audio_sd = {}
+    for path in paths:
+        with safe_open(path, framework="pt", device=str(device)) as f:
+            for key in f.keys():
+                if key.startswith(video_prefix):
+                    local_key = key[len(video_prefix):]
+                    video_sd[local_key] = f.get_tensor(key).to(dtype=dtype)
+                elif key.startswith(audio_prefix) and audio_connector is not None:
+                    local_key = key[len(audio_prefix):]
+                    audio_sd[local_key] = f.get_tensor(key).to(dtype=dtype)
+
+    if video_sd:
+        video_connector.load_state_dict(video_sd, strict=False, assign=True)
+        video_connector = video_connector.to(device=device, dtype=dtype)
+        logger.info("Loaded video connector: %d params", sum(p.numel() for p in video_connector.parameters()))
+    else:
+        logger.warning("No video connector weights found in checkpoint (prefix: %s)", video_prefix)
+
+    if audio_connector is not None and audio_sd:
+        audio_connector.load_state_dict(audio_sd, strict=False, assign=True)
+        audio_connector = audio_connector.to(device=device, dtype=dtype)
+        logger.info("Loaded audio connector: %d params", sum(p.numel() for p in audio_connector.parameters()))
+    elif audio_connector is not None:
+        logger.warning("No audio connector weights found in checkpoint (prefix: %s)", audio_prefix)
+
+    return video_connector, audio_connector

@@ -53,6 +53,7 @@ Caching scripts (`ltx2_cache_latents.py`, `ltx2_cache_text_encoder_outputs.py`) 
     - [Self-Flow (Self-Supervised Flow Matching)](#self-flow-self-supervised-flow-matching)
     - [Timestep Sampling](#timestep-sampling)
     - [LoRA Targets](#lora-targets)
+      - [Connector LoRA](#connector-lora---train_connectors)
     - [IC-LoRA / Video-to-Video Training](#ic-lora--video-to-video-training)
     - [Audio-Reference IC-LoRA](#audio-reference-ic-lora)
     - [Sampling with Tiled VAE](#sampling-with-tiled-vae)
@@ -227,6 +228,7 @@ python ltx2_cache_text_encoder_outputs.py ^
 - `--gemma_bnb_4bit_disable_double_quant`: Disable bitsandbytes double quantization for 4-bit loading.
 - `--gemma_bnb_4bit_compute_dtype auto|fp16|bf16|fp32`: Compute dtype for 4-bit operations (default: `auto`, uses `--mixed_precision` dtype).
 - `--ltx2_checkpoint`: Required. Use `--ltx2_text_encoder_checkpoint` to override for text encoder connector weights.
+- `--cache_before_connector`: Also save pre-connector text features (`video_features_{dtype}`, `audio_features_{dtype}`) alongside standard post-connector embeddings. Required for `--train_connectors` during training. Does not change standard cache keys; only adds extra tensors.
 - 8-bit/4-bit loading requires `--device cuda`.
 
 > [!IMPORTANT]
@@ -237,6 +239,7 @@ python ltx2_cache_text_encoder_outputs.py ^
 | File Pattern | Contents |
 |--------------|----------|
 | `*_ltx2_te.safetensors` | `video_prompt_embeds_{dtype}`, `audio_prompt_embeds_{dtype}` (av only), `prompt_attention_mask`, `text_{dtype}`, `text_mask` |
+| (with `--cache_before_connector`) | Above keys plus `video_features_{dtype}`, `audio_features_{dtype}` (av only) |
 
 ### Loading Gemma from a Single Safetensors File
 
@@ -1030,7 +1033,7 @@ Use `--lora_target_preset` to control which layers LoRA targets. For custom laye
 | `audio_ref_only_ic` | Audio attn/FFN + bidirectional AV cross-modal | Audio-reference IC-LoRA |
 | `full` | All linear layers | All layers targeted, larger file size |
 
-All presets apply to all relevant attention types: self-attention, cross-attention, and cross-modal attention (in AV mode). Connector layers are always excluded.
+All presets apply to all relevant attention types: self-attention, cross-attention, and cross-modal attention (in AV mode). Connector layers (`Embeddings1DConnector`) are excluded by default; use `--train_connectors` to include them (see below).
 
 To use custom layer patterns instead of a preset, use `--network_args`:
 ```bash
@@ -1038,6 +1041,14 @@ To use custom layer patterns instead of a preset, use `--network_args`:
 ```
 Custom `include_patterns` override any preset.
 When `include_patterns` is set (either explicitly or via a preset), only modules matching at least one pattern are targeted (strict whitelist behavior). Use `--lora_target_preset full` to target all linear layers.
+
+#### Connector LoRA (`--train_connectors`)
+
+Text connectors are 8-layer transformer blocks (in LTX-2.3) between Gemma and the denoising transformer. They transform text embeddings before they reach the denoising model. `--train_connectors` includes these modules in LoRA training alongside the main transformer.
+
+**Usage:** Cache with `--cache_before_connector`, train with `--train_connectors`. The same `--lora_target_preset` patterns apply to both transformer and connector layers. Connector and transformer LoRA weights are saved in one file. At inference and in ComfyUI (after `convert_lora_to_comfy.py`), connector weights are auto-detected and applied.
+
+**Notes:** Adds ~3.8 GB VRAM (bf16) for the frozen connector weights. Not compatible with LyCORIS. Connectors have `attn1` and `ff` only (no `attn2`).
 
 #### IC-LoRA / Video-to-Video Training
 

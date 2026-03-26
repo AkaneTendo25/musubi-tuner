@@ -143,6 +143,9 @@ def build_cache_text_cmd(config: ProjectConfig) -> list[str]:
             if c.dop_class_prompt:
                 cmd += ["--dop_class_prompt", c.dop_class_prompt]
 
+    if c.cache_before_connector:
+        cmd.append("--cache_before_connector")
+
     return cmd
 
 
@@ -294,6 +297,8 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
     cmd += ["--network_dim", str(t.network_dim)]
     cmd += ["--network_alpha", str(t.network_alpha)]
     cmd += ["--lora_target_preset", t.lora_target_preset]
+    if t.train_connectors:
+        cmd.append("--train_connectors")
     if t.network_args:
         cmd += ["--network_args"] + t.network_args.split()
     if t.network_weights:

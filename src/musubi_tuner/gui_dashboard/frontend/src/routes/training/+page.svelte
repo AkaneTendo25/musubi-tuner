@@ -124,6 +124,7 @@
 						<div class="flex flex-wrap gap-x-4 gap-y-1">
 							<FormToggle label="Dim from Weights" checked={t.dim_from_weights ?? false} onchange={(e) => update('dim_from_weights', e.target.checked)} tooltip="Auto-detect dim/alpha from weights" />
 							<FormToggle label="Save Orig LoRA" checked={t.save_original_lora ?? true} onchange={(e) => update('save_original_lora', e.target.checked)} tooltip="Save original LoRA format" />
+							<FormToggle label="Train Connectors" checked={t.train_connectors ?? false} onchange={(e) => update('train_connectors', e.target.checked)} tooltip="Also apply LoRA to text connector modules. Requires caching with 'Cache Pre-Connector Features' enabled. Not compatible with LyCORIS." />
 						</div>
 					</div>
 				</FormGroup>
