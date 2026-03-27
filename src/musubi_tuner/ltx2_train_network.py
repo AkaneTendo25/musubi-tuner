@@ -987,8 +987,6 @@ class LTX2NetworkTrainer(NetworkTrainer):
         """Parse HFATO CLI flags.  No-op when --hfato is not set."""
         if not getattr(args, "hfato", False):
             return
-        if getattr(args, "self_flow", False):
-            raise ValueError("--hfato and --self_flow cannot be used simultaneously")
         ic_strategy = getattr(args, "ic_lora_strategy", "none")
         if ic_strategy not in ("none", "auto"):
             raise ValueError(f"--hfato is incompatible with --ic_lora_strategy {ic_strategy} (v2v/ref_latents path uses standard loss)")
@@ -2295,9 +2293,9 @@ class LTX2NetworkTrainer(NetworkTrainer):
         args.weighting_scheme = "none"
 
         audio_balance_mode = str(getattr(args, "audio_loss_balance_mode", "none") or "none").lower()
-        if audio_balance_mode not in {"none", "inv_freq", "ema_mag", "uncertainty"}:
+        if audio_balance_mode not in {"none", "inv_freq", "ema_mag", "uncertainty", "ogm_ge"}:
             raise ValueError(
-                f"audio_loss_balance_mode must be one of ['none', 'inv_freq', 'ema_mag', 'uncertainty']. Got: {audio_balance_mode}"
+                f"audio_loss_balance_mode must be one of ['none', 'inv_freq', 'ema_mag', 'uncertainty', 'ogm_ge']. Got: {audio_balance_mode}"
             )
         args.audio_loss_balance_mode = audio_balance_mode
 
@@ -2308,6 +2306,8 @@ class LTX2NetworkTrainer(NetworkTrainer):
         audio_balance_ema_init = float(getattr(args, "audio_loss_balance_ema_init", 1.0))
         audio_balance_target_ratio = float(getattr(args, "audio_loss_balance_target_ratio", 0.33))
         audio_balance_ema_decay = float(getattr(args, "audio_loss_balance_ema_decay", 0.99))
+        ogm_ge_alpha = float(getattr(args, "ogm_ge_alpha", 0.3))
+        ogm_ge_noise_std = float(getattr(args, "ogm_ge_noise_std", 0.0))
 
         if not (0.0 < audio_balance_beta <= 1.0):
             raise ValueError(f"audio_loss_balance_beta must be in (0, 1]. Got: {audio_balance_beta}")
@@ -2331,6 +2331,10 @@ class LTX2NetworkTrainer(NetworkTrainer):
             raise ValueError(f"audio_loss_balance_target_ratio must be >= 0. Got: {audio_balance_target_ratio}")
         if not (0.0 < audio_balance_ema_decay < 1.0):
             raise ValueError(f"audio_loss_balance_ema_decay must be in (0, 1). Got: {audio_balance_ema_decay}")
+        if ogm_ge_alpha < 0.0:
+            raise ValueError(f"ogm_ge_alpha must be >= 0. Got: {ogm_ge_alpha}")
+        if ogm_ge_noise_std < 0.0:
+            raise ValueError(f"ogm_ge_noise_std must be >= 0. Got: {ogm_ge_noise_std}")
 
         args.audio_loss_balance_beta = audio_balance_beta
         args.audio_loss_balance_eps = audio_balance_eps
@@ -2339,6 +2343,8 @@ class LTX2NetworkTrainer(NetworkTrainer):
         args.audio_loss_balance_ema_init = audio_balance_ema_init
         args.audio_loss_balance_target_ratio = audio_balance_target_ratio
         args.audio_loss_balance_ema_decay = audio_balance_ema_decay
+        args.ogm_ge_alpha = ogm_ge_alpha
+        args.ogm_ge_noise_std = ogm_ge_noise_std
 
         shifted_logit_mode = getattr(args, "shifted_logit_mode", None)
         if shifted_logit_mode is not None:
@@ -3474,19 +3480,6 @@ class LTX2NetworkTrainer(NetworkTrainer):
             if enable_conditioning:
                 video_conditioning_enabled = torch.ones((latents.shape[0],), device=accelerator.device, dtype=torch.bool)
 
-        # -- HFATO: replace noisy input with degraded version --
-        _hfato_active = False
-        _hfato_noisy = None
-        if self._hfato_config is not None and latents.dim() == 5:
-            import random as _hfato_rand
-            if _hfato_rand.random() < self._hfato_config.probability:
-                from musubi_tuner.hfato import compute_hfato_noisy_input
-                _hfato_noisy, _ = compute_hfato_noisy_input(
-                    latents, noise, sigma, self._hfato_config,
-                )
-                noisy_model_input = _hfato_noisy.to(dtype=noisy_model_input.dtype)
-                _hfato_active = True
-
         model_noisy_video = noisy_model_input
         if video_conditioning_enabled is not None and model_noisy_video.shape[2] > 0:
             model_noisy_video = model_noisy_video.clone()
@@ -4090,10 +4083,11 @@ class LTX2NetworkTrainer(NetworkTrainer):
         }
 
         # HFATO: pass metadata for x0-prediction loss in the training loop
-        if _hfato_active:
+        _hfato_data = batch.get("_hfato")
+        if _hfato_data is not None:
             out["_hfato"] = {
-                "noisy": _hfato_noisy,
-                "clean": latents,
+                "noisy": noisy_model_input,
+                "clean": _hfato_data["clean_latents"],
                 "sigma": sigma,
             }
 
@@ -7024,14 +7018,16 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         "--audio_loss_balance_mode",
         type=str,
         default="none",
-        choices=["none", "inv_freq", "ema_mag", "uncertainty"],
+        choices=["none", "inv_freq", "ema_mag", "uncertainty", "ogm_ge"],
         help=(
             "Optional dynamic balancing for audio loss. "
             "'none' keeps static --audio_loss_weight; "
             "'inv_freq' scales audio weight by inverse EMA of audio-batch frequency; "
             "'ema_mag' matches audio loss magnitude to a target fraction of video loss; "
             "'uncertainty' uses learnable log-variance scalars per modality "
-            "(Kendall et al., CVPR 2018), no hyperparameters required."
+            "(Kendall et al., CVPR 2018), no hyperparameters required; "
+            "'ogm_ge' attenuates the lower-loss / faster-learning modality on each step "
+            "and can optionally inject GE noise into its gradients."
         ),
     )
     parser.add_argument(
@@ -7082,6 +7078,20 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         default=None,
         help="Learning rate for uncertainty weighting log-variance parameters. "
              "Defaults to --learning_rate. Only used with --audio_loss_balance_mode=uncertainty.",
+    )
+    parser.add_argument(
+        "--ogm_ge_alpha",
+        type=float,
+        default=0.3,
+        help="OGM-GE modulation strength. Higher values attenuate the dominant modality more strongly. "
+             "Only used with --audio_loss_balance_mode=ogm_ge.",
+    )
+    parser.add_argument(
+        "--ogm_ge_noise_std",
+        type=float,
+        default=0.0,
+        help="Optional GE gradient-noise scale for OGM-GE. 0 disables noise injection. "
+             "Only used with --audio_loss_balance_mode=ogm_ge.",
     )
     parser.add_argument(
         "--independent_audio_timestep",
@@ -7654,6 +7664,15 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         help="Per-module learning rate overrides (pattern=lr). Patterns are matched via regex "
              "against LoRA module names. Example: --lr_args audio_attn=1e-6 audio_ff=1e-6 "
              "video_to_audio=1e-5",
+    )
+    parser.add_argument(
+        "--lr_group_warmup_args",
+        type=str,
+        nargs="*",
+        default=None,
+        help="Optional per-group warmup overrides (pattern=steps) applied on top of the selected "
+             "scheduler family. Patterns match optimizer group names such as unet_audio, "
+             "unet_video, or unet_audio_attn. Example: --lr_group_warmup_args audio=500 video=1500",
     )
 
     # -- Per-module rank (dim) overrides --

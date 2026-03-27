@@ -615,7 +615,7 @@ All other training mechanics (weighting scheme, masking, audio balancing) apply 
 - `--video_loss_weight`: Weight for video loss (default: 1.0).
 - `--audio_loss_weight`: Weight for audio loss in AV mode (default: 1.0).
 - Dataset config `video_loss_weight` / `audio_loss_weight` override the corresponding CLI weight for that dataset only.
-- `--audio_loss_balance_mode`: Audio loss balancing strategy. Values: `none` (default), `inv_freq`, `ema_mag`, `uncertainty`.
+- `--audio_loss_balance_mode`: Audio loss balancing strategy. Values: `none` (default), `inv_freq`, `ema_mag`, `uncertainty`, `ogm_ge`.
 - `--audio_loss_balance_min`, `--audio_loss_balance_max`: Clamp range for effective audio weight (defaults: 0.05, 4.0). Used by `inv_freq` and `ema_mag` only.
 
 **`inv_freq` mode** — inverse-frequency reweighting for mixed audio/non-audio training. Boosts audio loss proportionally to how rare audio batches are.
@@ -675,6 +675,26 @@ Example:
 
 Logged to TensorBoard: `uncertainty/log_var_video`, `uncertainty/log_var_audio`, `uncertainty/precision_video`, `uncertainty/precision_audio`. Higher precision = more weight on that modality's loss. The log-variance params are saved/loaded with checkpoints for training resume.
 
+**`ogm_ge` mode** — Online Gradient Modulation with optional Generalization Enhancement noise. The lower-loss / faster-learning modality is attenuated on each AV step using a discrepancy-dependent coefficient:
+
+```
+k = 1 - tanh(alpha * discrepancy)
+```
+
+The weaker modality keeps coefficient `1.0`. This is an opt-in conservative implementation for joint AV LoRA training:
+
+- `--ogm_ge_alpha`: Modulation strength (default: `0.3`)
+- `--ogm_ge_noise_std`: Optional GE noise scale added to the attenuated modality gradients after backward (default: `0.0`, disabled)
+
+Example:
+```bash
+--audio_loss_balance_mode ogm_ge ^
+--ogm_ge_alpha 0.3 ^
+--ogm_ge_noise_std 0.0
+```
+
+Logged to TensorBoard: `ogm_ge/video_coeff`, `ogm_ge/audio_coeff`, `ogm_ge/discrepancy`.
+
 On video-only batches (no audio in the current batch), falls back to standard `video_loss * video_weight`.
 
 #### Additional Audio Training Flags
@@ -728,6 +748,21 @@ Result:
 - Video modules → 1e-4 (`--learning_rate`)
 
 Works with LoRA+ (`loraplus_lr_ratio`): the up/down split applies within each LR group. Both flags default to `None` and are fully backward-compatible. See [LoRA+ in the advanced configuration guide](./advanced_config.md#lora) for setup details.
+
+Optional per-group warmup overrides:
+
+- `--lr_group_warmup_args <pattern=steps> ...`: Override warmup length for matching optimizer groups while keeping the selected scheduler family and default path unchanged. Patterns match group names such as `unet_audio`, `unet_video`, or regex-derived names from `--lr_args`.
+
+Example:
+```bash
+--learning_rate 1e-4 ^
+--audio_lr 3e-5 ^
+--lr_scheduler cosine ^
+--lr_warmup_steps 500 ^
+--lr_group_warmup_args audio=500 video=1500
+```
+
+This keeps audio groups on a shorter warmup and video groups on a longer warmup without changing existing behavior unless `--lr_group_warmup_args` is provided.
 
 #### Per-Module LoRA Rank
 
@@ -974,7 +1009,7 @@ Adapted from [ViBe (arXiv 2603.23326)](https://arxiv.org/abs/2603.23326). Experi
 
 **HFATO** is a training objective designed for image-only fine-tuning of video models. Before adding noise, clean latents are spatially degraded via downsample-upsample, destroying high-frequency details. The model is then supervised to reconstruct the original clean latents (x₀-prediction loss instead of standard velocity loss). Can be combined with the Relay LoRA workflow below for two-stage image-only training.
 
-Enable with `--hfato`. Parameters are passed via `--hfato_args` as `key=value` pairs. Incompatible with `--self_flow` and `--ic_lora_strategy v2v`.
+Enable with `--hfato`. Parameters are passed via `--hfato_args` as `key=value` pairs. Incompatible with `--ic_lora_strategy v2v`.
 
 ```bash
 accelerate launch ... ltx2_train_network.py ^
@@ -1845,7 +1880,7 @@ num_repeats = 5
 --audio_silence_regularizer --audio_silence_regularizer_weight 0.5
 ```
 
-**6. Loss balancing** (`--audio_loss_balance_mode`) — three modes for dynamic audio loss weight adjustment:
+**6. Loss balancing** (`--audio_loss_balance_mode`) — four modes for dynamic audio loss weight adjustment:
 - `inv_freq` — scales audio weight by inverse of audio-batch frequency EMA. Compensates when audio batches are rare:
   ```
   --audio_loss_balance_mode inv_freq --audio_loss_balance_min 0.05 --audio_loss_balance_max 4.0
@@ -1857,6 +1892,10 @@ num_repeats = 5
 - `uncertainty` — two learnable log-variance scalars optimized jointly with LoRA weights (Kendall et al., CVPR 2018). No manual weight tuning required — scalars are learned via backpropagation:
   ```
   --audio_loss_balance_mode uncertainty
+  ```
+- `ogm_ge` — attenuates the lower-loss / faster-learning modality on each AV step. Optional gradient noise is available but disabled by default:
+  ```
+  --audio_loss_balance_mode ogm_ge --ogm_ge_alpha 0.3
   ```
 
 **7. Independent modality dropout** — drop video or audio text conditioning independently per sample. Serves as both anti-dominance regularization and CFG training:
@@ -1880,6 +1919,11 @@ num_repeats = 5
 ```
 
 **11. Diagnostics** — per-modality gradient norms (`grad_norm/video`, `grad_norm/audio`, `grad_norm/audio_video_ratio`) are logged automatically in AV mode. A ratio deviating >3x from its initial value indicates modality imbalance.
+
+**12. Per-group warmup overrides** — keep the same scheduler family but stretch warmup differently for audio and video LR groups:
+```
+--lr_group_warmup_args audio=500 video=1500
+```
 
 - If `failed > 0` in latent caching summary, audio extraction is broken for those items
 - After mode switch (video→AV), re-run both latent and text encoder caching without `--skip_existing`

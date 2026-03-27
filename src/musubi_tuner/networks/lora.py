@@ -793,6 +793,7 @@ class LoRANetwork(torch.nn.Module):
                 param_data = {"params": list(groups[key].values()), "lr": lr_val}
                 if key == "plus" and self.loraplus_lr_ratio:
                     param_data["lr"] = lr_val * self.loraplus_lr_ratio
+                param_data["group_name"] = f"unet_{desc}{suffix}".replace(" ", "_")
                 all_params.append(param_data)
                 suffix = " plus" if key == "plus" else ""
                 lr_descriptions.append(f"unet_{desc}{suffix}")
@@ -839,6 +840,7 @@ class LoRANetwork(torch.nn.Module):
                     logger.info("NO LR skipping!")
                     continue
 
+                param_data["group_name"] = "unet_plus" if key == "plus" else "unet"
                 params.append(param_data)
                 descriptions.append("plus" if key == "plus" else "")
 

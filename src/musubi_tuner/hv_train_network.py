@@ -54,6 +54,8 @@ from musubi_tuner.audio_loss_balance import (
     update_loss_ema,
     update_audio_presence_ema,
 )
+from musubi_tuner.ogm_ge import compute_ogm_ge_coefficients, maybe_add_ogm_ge_gradient_noise
+from musubi_tuner.modules.group_lr_scheduler import GroupWarmupScheduler, parse_group_lr_warmup_args
 from musubi_tuner.modules.lr_schedulers import RexLR
 from musubi_tuner.modules.scheduling_flow_match_discrete import FlowMatchDiscreteScheduler
 import musubi_tuner.networks.lora as lora_module
@@ -816,6 +818,7 @@ class NetworkTrainer:
         power = args.lr_scheduler_power
         timescale = args.lr_scheduler_timescale
         min_lr_ratio = args.lr_scheduler_min_lr_ratio
+        group_lr_warmup_overrides = parse_group_lr_warmup_args(getattr(args, "lr_group_warmup_args", None))
 
         lr_scheduler_kwargs = {}  # get custom lr_scheduler kwargs
         if args.lr_scheduler_args is not None and len(args.lr_scheduler_args) > 0:
@@ -843,7 +846,9 @@ class NetworkTrainer:
                 lr_scheduler_type = values[-1]
             lr_scheduler_class = getattr(lr_scheduler_module, lr_scheduler_type)
             lr_scheduler = lr_scheduler_class(optimizer, **lr_scheduler_kwargs)
-            return lr_scheduler
+            return self._maybe_wrap_group_warmup_scheduler(
+                lr_scheduler, optimizer, num_warmup_steps, group_lr_warmup_overrides
+            )
 
         if name.startswith("adafactor"):
             assert type(optimizer) == transformers.optimization.Adafactor, (
@@ -851,102 +856,179 @@ class NetworkTrainer:
             )
             initial_lr = float(name.split(":")[1])
             # logger.info(f"adafactor scheduler init lr {initial_lr}")
-            return wrap_check_needless_num_warmup_steps(transformers.optimization.AdafactorSchedule(optimizer, initial_lr))
+            return self._maybe_wrap_group_warmup_scheduler(
+                wrap_check_needless_num_warmup_steps(transformers.optimization.AdafactorSchedule(optimizer, initial_lr)),
+                optimizer,
+                num_warmup_steps,
+                group_lr_warmup_overrides,
+            )
 
         if name.lower() == "rex":
-            return RexLR(
-                optimizer,
-                max_lr=args.learning_rate,
-                min_lr=(  # Will start and end with min_lr, use non-zero min_lr by default
-                    args.learning_rate * min_lr_ratio if min_lr_ratio is not None else args.learning_rate * 0.01
+            return self._maybe_wrap_group_warmup_scheduler(
+                RexLR(
+                    optimizer,
+                    max_lr=args.learning_rate,
+                    min_lr=(  # Will start and end with min_lr, use non-zero min_lr by default
+                        args.learning_rate * min_lr_ratio if min_lr_ratio is not None else args.learning_rate * 0.01
+                    ),
+                    num_steps=num_training_steps,
+                    num_warmup_steps=num_warmup_steps,
+                    **lr_scheduler_kwargs,
                 ),
-                num_steps=num_training_steps,
+                optimizer,
                 num_warmup_steps=num_warmup_steps,
-                **lr_scheduler_kwargs,
+                warmup_overrides=group_lr_warmup_overrides,
             )
 
         if name == DiffusersSchedulerType.PIECEWISE_CONSTANT.value:
             name = DiffusersSchedulerType(name)
             schedule_func = DIFFUSERS_TYPE_TO_SCHEDULER_FUNCTION[name]
-            return schedule_func(optimizer, **lr_scheduler_kwargs)  # step_rules and last_epoch are given as kwargs
+            return self._maybe_wrap_group_warmup_scheduler(
+                schedule_func(optimizer, **lr_scheduler_kwargs),  # step_rules and last_epoch are given as kwargs
+                optimizer,
+                num_warmup_steps,
+                group_lr_warmup_overrides,
+            )
 
         name = SchedulerType(name)
         schedule_func = TYPE_TO_SCHEDULER_FUNCTION[name]
 
         if name == SchedulerType.CONSTANT:
-            return wrap_check_needless_num_warmup_steps(schedule_func(optimizer, **lr_scheduler_kwargs))
+            return self._maybe_wrap_group_warmup_scheduler(
+                wrap_check_needless_num_warmup_steps(schedule_func(optimizer, **lr_scheduler_kwargs)),
+                optimizer,
+                num_warmup_steps,
+                group_lr_warmup_overrides,
+            )
 
         # All other schedulers require `num_warmup_steps`
         if num_warmup_steps is None:
             raise ValueError(f"{name} requires `num_warmup_steps`, please provide that argument.")
 
         if name == SchedulerType.CONSTANT_WITH_WARMUP:
-            return schedule_func(optimizer, num_warmup_steps=num_warmup_steps, **lr_scheduler_kwargs)
+            return self._maybe_wrap_group_warmup_scheduler(
+                schedule_func(optimizer, num_warmup_steps=num_warmup_steps, **lr_scheduler_kwargs),
+                optimizer,
+                num_warmup_steps,
+                group_lr_warmup_overrides,
+            )
 
         if name == SchedulerType.INVERSE_SQRT:
-            return schedule_func(optimizer, num_warmup_steps=num_warmup_steps, timescale=timescale, **lr_scheduler_kwargs)
+            return self._maybe_wrap_group_warmup_scheduler(
+                schedule_func(optimizer, num_warmup_steps=num_warmup_steps, timescale=timescale, **lr_scheduler_kwargs),
+                optimizer,
+                num_warmup_steps,
+                group_lr_warmup_overrides,
+            )
 
         # All other schedulers require `num_training_steps`
         if num_training_steps is None:
             raise ValueError(f"{name} requires `num_training_steps`, please provide that argument.")
 
         if name == SchedulerType.COSINE_WITH_RESTARTS:
-            return schedule_func(
+            return self._maybe_wrap_group_warmup_scheduler(
+                schedule_func(
+                    optimizer,
+                    num_warmup_steps=num_warmup_steps,
+                    num_training_steps=num_training_steps,
+                    num_cycles=num_cycles,
+                    **lr_scheduler_kwargs,
+                ),
                 optimizer,
-                num_warmup_steps=num_warmup_steps,
-                num_training_steps=num_training_steps,
-                num_cycles=num_cycles,
-                **lr_scheduler_kwargs,
+                num_warmup_steps,
+                group_lr_warmup_overrides,
             )
 
         if name == SchedulerType.POLYNOMIAL:
-            return schedule_func(
+            return self._maybe_wrap_group_warmup_scheduler(
+                schedule_func(
+                    optimizer,
+                    num_warmup_steps=num_warmup_steps,
+                    num_training_steps=num_training_steps,
+                    power=power,
+                    **lr_scheduler_kwargs,
+                ),
                 optimizer,
-                num_warmup_steps=num_warmup_steps,
-                num_training_steps=num_training_steps,
-                power=power,
-                **lr_scheduler_kwargs,
+                num_warmup_steps,
+                group_lr_warmup_overrides,
             )
 
         if name == SchedulerType.COSINE_WITH_MIN_LR:
-            return schedule_func(
+            return self._maybe_wrap_group_warmup_scheduler(
+                schedule_func(
+                    optimizer,
+                    num_warmup_steps=num_warmup_steps,
+                    num_training_steps=num_training_steps,
+                    num_cycles=num_cycles / 2,
+                    min_lr_rate=min_lr_ratio,
+                    **lr_scheduler_kwargs,
+                ),
                 optimizer,
-                num_warmup_steps=num_warmup_steps,
-                num_training_steps=num_training_steps,
-                num_cycles=num_cycles / 2,
-                min_lr_rate=min_lr_ratio,
-                **lr_scheduler_kwargs,
+                num_warmup_steps,
+                group_lr_warmup_overrides,
             )
 
         # these schedulers do not require `num_decay_steps`
         if name == SchedulerType.LINEAR or name == SchedulerType.COSINE:
-            return schedule_func(
+            return self._maybe_wrap_group_warmup_scheduler(
+                schedule_func(
+                    optimizer,
+                    num_warmup_steps=num_warmup_steps,
+                    num_training_steps=num_training_steps,
+                    **lr_scheduler_kwargs,
+                ),
                 optimizer,
-                num_warmup_steps=num_warmup_steps,
-                num_training_steps=num_training_steps,
-                **lr_scheduler_kwargs,
+                num_warmup_steps,
+                group_lr_warmup_overrides,
             )
 
         # All other schedulers require `num_decay_steps`
         if num_decay_steps is None:
             raise ValueError(f"{name} requires `num_decay_steps`, please provide that argument.")
         if name == SchedulerType.WARMUP_STABLE_DECAY:
-            return schedule_func(
+            return self._maybe_wrap_group_warmup_scheduler(
+                schedule_func(
+                    optimizer,
+                    num_warmup_steps=num_warmup_steps,
+                    num_stable_steps=num_stable_steps,
+                    num_decay_steps=num_decay_steps,
+                    num_cycles=num_cycles / 2,
+                    min_lr_ratio=min_lr_ratio if min_lr_ratio is not None else 0.0,
+                    **lr_scheduler_kwargs,
+                ),
                 optimizer,
-                num_warmup_steps=num_warmup_steps,
-                num_stable_steps=num_stable_steps,
-                num_decay_steps=num_decay_steps,
-                num_cycles=num_cycles / 2,
-                min_lr_ratio=min_lr_ratio if min_lr_ratio is not None else 0.0,
-                **lr_scheduler_kwargs,
+                num_warmup_steps,
+                group_lr_warmup_overrides,
             )
 
-        return schedule_func(
+        return self._maybe_wrap_group_warmup_scheduler(
+            schedule_func(
+                optimizer,
+                num_warmup_steps=num_warmup_steps,
+                num_training_steps=num_training_steps,
+                num_decay_steps=num_decay_steps,
+                **lr_scheduler_kwargs,
+            ),
             optimizer,
-            num_warmup_steps=num_warmup_steps,
-            num_training_steps=num_training_steps,
-            num_decay_steps=num_decay_steps,
-            **lr_scheduler_kwargs,
+            num_warmup_steps,
+            group_lr_warmup_overrides,
+        )
+
+    def _maybe_wrap_group_warmup_scheduler(
+        self,
+        lr_scheduler,
+        optimizer: torch.optim.Optimizer,
+        num_warmup_steps: Optional[int],
+        warmup_overrides: dict[str, int],
+    ):
+        if not warmup_overrides:
+            return lr_scheduler
+        logger.info("Per-group LR warmup overrides enabled: %s", warmup_overrides)
+        return GroupWarmupScheduler(
+            lr_scheduler,
+            optimizer,
+            default_warmup_steps=int(num_warmup_steps or 0),
+            warmup_overrides=warmup_overrides,
         )
 
     def resume_from_local_or_hf_if_specified(self, accelerator: Accelerator, args: argparse.Namespace) -> int:
@@ -2057,6 +2139,12 @@ class NetworkTrainer:
                 audio_loss_balance_max,
                 audio_loss_ema,
             )
+        elif audio_loss_balance_mode == "ogm_ge":
+            logger.info(
+                "OGM-GE balancing enabled: alpha=%.4f noise_std=%.4f",
+                float(getattr(args, "ogm_ge_alpha", 0.3)),
+                float(getattr(args, "ogm_ge_noise_std", 0.0)),
+            )
 
         # Uncertainty weighting: learnable log-variance scalars (Kendall et al., CVPR 2018)
         uncertainty_log_var_video = None
@@ -2409,6 +2497,7 @@ class NetworkTrainer:
                 "params": [uncertainty_log_var_video, uncertainty_log_var_audio],
                 "lr": uncertainty_lr,
                 "weight_decay": 0.0,
+                "group_name": "uncertainty",
             })
             logger.info("Added uncertainty log-variance params to optimizer (lr=%.2e)", uncertainty_lr)
 
@@ -3020,6 +3109,17 @@ class NetworkTrainer:
                     latents_tensor = self.scale_shift_latents(latents_tensor)
                     noise = torch.randn_like(latents_tensor)
 
+                    # HFATO: degrade latents before noise addition, keep clean for loss
+                    _hfato_config = getattr(self, "_hfato_config", None)
+                    if _hfato_config is not None and latents_tensor.dim() == 5:
+                        import random as _hfato_rand
+                        if _hfato_rand.random() < _hfato_config.probability:
+                            from musubi_tuner.hfato import degrade_latents
+                            batch["_hfato"] = {"clean_latents": latents_tensor}
+                            latents_tensor = degrade_latents(
+                                latents_tensor, _hfato_config.scale_factor, _hfato_config.interpolation,
+                            )
+
                     noisy_model_input, timesteps = self.get_noisy_model_input_and_timesteps(
                         args,
                         noise,
@@ -3267,6 +3367,17 @@ class NetworkTrainer:
                     # Sample noise that we'll add to the latents
                     noise = torch.randn_like(latents_tensor)
 
+                    # HFATO: degrade latents before noise addition, keep clean for loss
+                    _hfato_config = getattr(self, "_hfato_config", None)
+                    if _hfato_config is not None and latents_tensor.dim() == 5:
+                        import random as _hfato_rand
+                        if _hfato_rand.random() < _hfato_config.probability:
+                            from musubi_tuner.hfato import degrade_latents
+                            batch["_hfato"] = {"clean_latents": latents_tensor}
+                            latents_tensor = degrade_latents(
+                                latents_tensor, _hfato_config.scale_factor, _hfato_config.interpolation,
+                            )
+
                     # calculate model input and timesteps
                     noisy_model_input, timesteps = self.get_noisy_model_input_and_timesteps(
                         args,
@@ -3304,6 +3415,7 @@ class NetworkTrainer:
                     audio_presence_ema_value = None
                     audio_loss_ema_value = None
                     video_loss_ema_value = None
+                    ogm_ge_state = None
                     grad_norm_video_value = None  # Per-modality gradient norms
                     grad_norm_audio_value = None
                     audio_diagnostics = {}  # Per-batch audio quality diagnostics (negligible cost)
@@ -3382,6 +3494,17 @@ class NetworkTrainer:
                                 video_loss, audio_loss_raw,
                                 uncertainty_log_var_video, uncertainty_log_var_audio,
                             )
+                        elif audio_loss_balance_mode == "ogm_ge" and has_audio_loss:
+                            audio_loss = _masked_loss(audio_pred, audio_target, audio_loss_mask)
+                            video_loss_value = video_loss.detach().item()
+                            audio_loss_value = audio_loss.detach().item()
+                            ogm_ge_state = compute_ogm_ge_coefficients(
+                                video_loss_value,
+                                audio_loss_value,
+                                alpha=float(getattr(args, "ogm_ge_alpha", 0.3)),
+                            )
+                            loss = video_loss * ogm_ge_state.video_coeff + audio_loss * ogm_ge_state.audio_coeff
+                            audio_weight_effective_value = ogm_ge_state.audio_coeff
                         else:
                             # Standard weighting path (none / inv_freq / ema_mag)
                             video_weight = float(out.get("video_loss_weight", 1.0))
@@ -3581,6 +3704,14 @@ class NetworkTrainer:
                     accelerator.backward(loss)
                     if _is_first_step:
                         _log_vram("FIRST_ITER: AFTER backward", logger)
+
+                    if dict_output and ogm_ge_state is not None:
+                        maybe_add_ogm_ge_gradient_noise(
+                            accelerator.unwrap_model(network),
+                            video_coeff=ogm_ge_state.video_coeff,
+                            audio_coeff=ogm_ge_state.audio_coeff,
+                            noise_std_scale=float(getattr(args, "ogm_ge_noise_std", 0.0)),
+                        )
 
                     pres_losses = self.preservation_backward(args, accelerator, transformer, network, network_dtype)
                     if _prior_div_value is not None:
@@ -3787,6 +3918,10 @@ class NetworkTrainer:
                     )
                     if audio_weight_effective_value is not None:
                         logs["loss/audio_weight_effective"] = audio_weight_effective_value
+                    if ogm_ge_state is not None:
+                        logs["ogm_ge/video_coeff"] = ogm_ge_state.video_coeff
+                        logs["ogm_ge/audio_coeff"] = ogm_ge_state.audio_coeff
+                        logs["ogm_ge/discrepancy"] = ogm_ge_state.discrepancy
                     if audio_presence_ema_value is not None:
                         logs["loss/audio_presence_ema"] = audio_presence_ema_value
                     if audio_loss_ema_value is not None:
