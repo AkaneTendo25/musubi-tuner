@@ -362,6 +362,23 @@ def create_network(
     audio_alpha = kwargs.get("audio_alpha", None)
     if audio_alpha is not None:
         audio_alpha = float(audio_alpha)
+    cross_modal_dim = kwargs.get("cross_modal_dim", None)
+    if cross_modal_dim is not None:
+        cross_modal_dim = int(cross_modal_dim)
+    cross_modal_alpha = kwargs.get("cross_modal_alpha", None)
+    if cross_modal_alpha is not None:
+        cross_modal_alpha = float(cross_modal_alpha)
+
+    # per-modality dropout overrides
+    audio_dropout = kwargs.get("audio_dropout", None)
+    if audio_dropout is not None:
+        audio_dropout = float(audio_dropout)
+    video_dropout = kwargs.get("video_dropout", None)
+    if video_dropout is not None:
+        video_dropout = float(video_dropout)
+    cross_modal_dropout = kwargs.get("cross_modal_dropout", None)
+    if cross_modal_dropout is not None:
+        cross_modal_dropout = float(cross_modal_dropout)
 
     # rank/module dropout
     rank_dropout = kwargs.get("rank_dropout", None)
@@ -408,6 +425,11 @@ def create_network(
         verbose=verbose,
         audio_dim=audio_dim,
         audio_alpha=audio_alpha,
+        audio_dropout=audio_dropout,
+        video_dropout=video_dropout,
+        cross_modal_dim=cross_modal_dim,
+        cross_modal_alpha=cross_modal_alpha,
+        cross_modal_dropout=cross_modal_dropout,
     )
 
     loraplus_lr_ratio = kwargs.get("loraplus_lr_ratio", None)
@@ -448,6 +470,11 @@ class LoRANetwork(torch.nn.Module):
         verbose: Optional[bool] = False,
         audio_dim: Optional[int] = None,
         audio_alpha: Optional[float] = None,
+        audio_dropout: Optional[float] = None,
+        video_dropout: Optional[float] = None,
+        cross_modal_dim: Optional[int] = None,
+        cross_modal_alpha: Optional[float] = None,
+        cross_modal_dropout: Optional[float] = None,
     ) -> None:
         super().__init__()
         self.multiplier = multiplier
@@ -464,6 +491,11 @@ class LoRANetwork(torch.nn.Module):
         self.module_kwargs = module_kwargs or {}
         self.audio_dim = audio_dim
         self.audio_alpha = audio_alpha
+        self.audio_dropout = audio_dropout
+        self.video_dropout = video_dropout
+        self.cross_modal_dim = cross_modal_dim
+        self.cross_modal_alpha = cross_modal_alpha
+        self.cross_modal_dropout = cross_modal_dropout
 
         self.loraplus_lr_ratio = None
         # self.loraplus_unet_lr_ratio = None
@@ -475,9 +507,17 @@ class LoRANetwork(torch.nn.Module):
             logger.info(f"create LoRA network. base dim (rank): {lora_dim}, alpha: {alpha}")
             if self.audio_dim is not None:
                 logger.info(f"audio modules: dim (rank): {self.audio_dim}, alpha: {self.audio_alpha if self.audio_alpha is not None else alpha}")
+            if self.cross_modal_dim is not None:
+                logger.info(
+                    f"cross-modal modules: dim (rank): {self.cross_modal_dim}, alpha: {self.cross_modal_alpha if self.cross_modal_alpha is not None else alpha}"
+                )
             logger.info(
                 f"neuron dropout: p={self.dropout}, rank dropout: p={self.rank_dropout}, module dropout: p={self.module_dropout}"
             )
+            if self.audio_dropout is not None or self.video_dropout is not None or self.cross_modal_dropout is not None:
+                logger.info(
+                    f"per-modality dropout overrides: video={self.video_dropout}, audio={self.audio_dropout}, cross-modal={self.cross_modal_dropout}"
+                )
             # if self.conv_lora_dim is not None:
             #     logger.info(
             #         f"apply LoRA to Conv2d with kernel size (3,3). dim (rank): {self.conv_lora_dim}, alpha: {self.conv_alpha}"
@@ -518,6 +558,23 @@ class LoRANetwork(torch.nn.Module):
         ) -> List[LoRAModule]:
             loras = []
             skipped = []
+
+            def is_audio_module(module_name: str) -> bool:
+                return "audio_" in module_name
+
+            def is_cross_modal_module(module_name: str) -> bool:
+                return "audio_to_video" in module_name or "video_to_audio" in module_name or "av_ca_" in module_name
+
+            def resolve_module_dropout(module_name: str) -> Optional[float]:
+                if is_cross_modal_module(module_name) and self.cross_modal_dropout is not None:
+                    return self.cross_modal_dropout
+                if is_audio_module(module_name):
+                    if self.audio_dropout is not None:
+                        return self.audio_dropout
+                elif self.video_dropout is not None:
+                    return self.video_dropout
+                return self.dropout
+
             for name, module in root_module.named_modules():
                 if target_replace_mods is None or module.__class__.__name__ in target_replace_mods:
                     if target_replace_mods is None:  # dirty hack for all modules
@@ -558,6 +615,7 @@ class LoRANetwork(torch.nn.Module):
 
                             dim = None
                             alpha = None
+                            module_dropout_value = resolve_module_dropout(original_name)
 
                             if modules_dim is not None:
                                 # モジュール指定あり
@@ -570,10 +628,15 @@ class LoRANetwork(torch.nn.Module):
                                     dim = default_dim if default_dim is not None else self.lora_dim
                                     alpha = self.alpha
                                     # per-modality override: audio modules get audio_dim/audio_alpha
-                                    if self.audio_dim is not None and "audio_" in original_name:
+                                    if self.audio_dim is not None and is_audio_module(original_name):
                                         dim = self.audio_dim
                                         if self.audio_alpha is not None:
                                             alpha = self.audio_alpha
+                                    if is_cross_modal_module(original_name):
+                                        if self.cross_modal_dim is not None:
+                                            dim = self.cross_modal_dim
+                                        if self.cross_modal_alpha is not None:
+                                            alpha = self.cross_modal_alpha
                                 elif self.conv_lora_dim is not None:
                                     dim = self.conv_lora_dim
                                     alpha = self.conv_alpha
@@ -596,7 +659,7 @@ class LoRANetwork(torch.nn.Module):
                                 self.multiplier,
                                 dim,
                                 alpha,
-                                dropout=dropout,
+                                dropout=module_dropout_value,
                                 rank_dropout=rank_dropout,
                                 module_dropout=module_dropout,
                                 **per_module_kwargs,

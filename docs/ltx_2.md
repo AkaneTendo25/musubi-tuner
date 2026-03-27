@@ -770,20 +770,49 @@ Set different LoRA rank (dim) for audio vs. video modules.
 
 - `--audio_dim <int>`: LoRA rank for audio modules (names containing `audio_`). Defaults to `--network_dim`.
 - `--audio_alpha <float>`: LoRA alpha for audio modules. Defaults to `--network_alpha`.
+- `--network_args "cross_modal_dim=<int>"`: Optional LoRA rank override for cross-modal modules (`audio_to_video`, `video_to_audio`, `av_ca_*`).
+- `--network_args "cross_modal_alpha=<float>"`: Optional LoRA alpha override for cross-modal modules.
 
 Example:
 ```bash
 --network_dim 32 ^
 --network_alpha 16 ^
 --audio_dim 8 ^
---audio_alpha 8
+--audio_alpha 8 ^
+--network_args "cross_modal_dim=12" "cross_modal_alpha=12"
 ```
 
 Result:
-- Audio modules (`audio_attn`, `audio_ff`, `video_to_audio_attn`, etc.) → rank 8, alpha 8
+- Audio-only modules (`audio_attn`, `audio_ff`, etc.) → rank 8, alpha 8
+- Cross-modal modules (`audio_to_video_attn`, `video_to_audio_attn`, `av_ca_*`) → rank 12, alpha 12
 - Video modules → rank 32, alpha 16
 
-Both flags default to `None` (no override, all modules use `--network_dim`/`--network_alpha`). Not used with LyCORIS — use the LyCORIS per-module config instead. At inference, each module's rank is read from saved weight shapes (`lora_down.shape[0]`), so no flags are needed for loading.
+Precedence is: `cross_modal_*` override > `audio_*` override > base `--network_dim` / `--network_alpha`.
+
+All override flags default to `None` (no override, all modules use `--network_dim`/`--network_alpha`). Not used with LyCORIS — use the LyCORIS per-module config instead. At inference, each module's rank is read from saved weight shapes (`lora_down.shape[0]`), so no flags are needed for loading.
+
+#### Per-Module LoRA Dropout
+
+Keep the existing global LoRA dropout as the default, but optionally override it per modality through `--network_args`.
+
+- `--network_dropout <float>`: Base dropout for all LoRA modules.
+- `--network_args "audio_dropout=<float>"`: Optional dropout override for audio-only modules.
+- `--network_args "video_dropout=<float>"`: Optional dropout override for non-audio video modules.
+- `--network_args "cross_modal_dropout=<float>"`: Optional dropout override for cross-modal modules (`audio_to_video`, `video_to_audio`, `av_ca_*`).
+
+Example:
+```bash
+--network_dropout 0.10 ^
+--network_args "audio_dropout=0.15" "video_dropout=0.05" "cross_modal_dropout=0.20"
+```
+
+Result:
+- Audio-only modules → dropout `0.15`
+- Video-only modules → dropout `0.05`
+- Cross-modal modules → dropout `0.20`
+- If no per-modality override is provided, modules keep the global `--network_dropout`
+
+Precedence is: `cross_modal_dropout` override > `audio_dropout` override for audio-only modules > `video_dropout` override for video-only modules > global `--network_dropout`.
 
 #### Preservation & Regularization
 
