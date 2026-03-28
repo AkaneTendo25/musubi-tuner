@@ -2292,7 +2292,8 @@ class LTX2NetworkTrainer(NetworkTrainer):
             )
         self._audio_only_sequence_resolution = audio_only_sequence_resolution
 
-        args.weighting_scheme = "none"
+        if not getattr(args, "allow_custom_weighting_scheme", False):
+            args.weighting_scheme = "none"
 
         audio_balance_mode = str(getattr(args, "audio_loss_balance_mode", "none") or "none").lower()
         if audio_balance_mode not in {"none", "inv_freq", "ema_mag", "uncertainty"}:
@@ -2949,6 +2950,24 @@ class LTX2NetworkTrainer(NetworkTrainer):
         self._latent_norm_cache.clear()
 
     # ======== Training loop methods ========
+
+    def _pre_transformer_call_hook(
+        self,
+        transformer_options: Dict[str, Any],
+        batch: Dict[str, torch.Tensor],
+        model_input,
+        model_timesteps: torch.Tensor,
+        text_embeds: torch.Tensor,
+        text_mask,
+        accelerator: Accelerator,
+        network_dtype: torch.dtype,
+    ) -> Dict[str, Any]:
+        """Hook for subclasses to modify transformer_options before the forward call.
+
+        Override this in subclasses (e.g., VACE trainer) to inject additional
+        conditioning into the transformer. Default implementation is a no-op.
+        """
+        return transformer_options
 
     def call_dit(
         self,
@@ -4051,6 +4070,13 @@ class LTX2NetworkTrainer(NetworkTrainer):
 
         if getattr(args, "fp8_base", False) or getattr(args, "fp8_scaled", False):
             self._ensure_fp8_buffers_on_device(transformer)
+
+        # Hook for subclasses (e.g., VACE) to modify transformer_options before forward
+        resolved_transformer_options = self._pre_transformer_call_hook(
+            resolved_transformer_options, batch, model_input, model_timesteps,
+            text_embeds, text_mask, accelerator, network_dtype,
+        )
+
         with accelerator.autocast():
             model_pred = transformer(
                 model_input,
@@ -7799,9 +7825,10 @@ def main() -> None:
         logger.warning("Ignoring --vae for LTX-2; using --ltx2_checkpoint instead")
     args.vae = args.ltx2_checkpoint
 
-    if getattr(args, "weighting_scheme", None) not in {None, "none"}:
-        logger.warning("Ignoring --weighting_scheme for LTX-2; forcing weighting_scheme=none")
-    args.weighting_scheme = "none"
+    if not getattr(args, "allow_custom_weighting_scheme", False):
+        if getattr(args, "weighting_scheme", None) not in {None, "none"}:
+            logger.warning("Ignoring --weighting_scheme for LTX-2; forcing weighting_scheme=none")
+        args.weighting_scheme = "none"
 
     if args.vae_dtype is None:
         args.vae_dtype = "bfloat16"

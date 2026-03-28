@@ -1189,6 +1189,53 @@ def main() -> None:
         # Runs when any dataset has both reference_directory and reference_cache_directory
         encode_and_save_reference_latents(vae, datasets, args, device, tiling_config)
 
+        # Cache VACE control latents (auto-detected from TOML config)
+        # Runs when any dataset has both vace_directory and vace_cache_directory
+        from musubi_tuner.ltx_vace.vace_cache_latents import encode_and_save_vace_latents
+        encode_and_save_vace_latents(vae, datasets, args, device, tiling_config)
+
+        # Cache audio VACE control latents (auto-detected from TOML config)
+        # Runs when any dataset has both audio_vace_directory and audio_vace_cache_directory
+        has_audio_vace = any(
+            getattr(ds, "audio_vace_cache_directory", None) is not None
+            and getattr(ds, "audio_vace_directory", None) is not None
+            for ds in datasets
+        )
+        if has_audio_vace:
+            if getattr(args, "ltx2_checkpoint", None) is None:
+                raise ValueError("--ltx2_checkpoint is required for audio VACE latent caching")
+
+            from musubi_tuner.ltx_2.loader.single_gpu_model_builder import SingleGPUModelBuilder
+            from musubi_tuner.ltx_2.model.audio_vae.model_configurator import (
+                AudioEncoderConfigurator,
+                AUDIO_VAE_ENCODER_COMFY_KEYS_FILTER,
+            )
+            from musubi_tuner.ltx_2.model.audio_vae.ops import AudioProcessor
+
+            audio_dtype = torch.bfloat16 if getattr(args, "ltx2_audio_dtype", None) is None else str_to_dtype(args.ltx2_audio_dtype)
+            logger.info("Loading audio encoder for audio VACE latent caching")
+            _audio_enc = SingleGPUModelBuilder(
+                model_path=str(args.ltx2_checkpoint),
+                model_class_configurator=AudioEncoderConfigurator,
+                model_sd_ops=AUDIO_VAE_ENCODER_COMFY_KEYS_FILTER,
+            ).build(device=device, dtype=audio_dtype)
+            _audio_enc.eval()
+
+            _audio_proc = AudioProcessor(
+                sample_rate=int(getattr(_audio_enc, "sample_rate", 16000)),
+                mel_bins=int(getattr(_audio_enc, "mel_bins", 64)),
+                mel_hop_length=int(getattr(_audio_enc, "mel_hop_length", 160)),
+                n_fft=int(getattr(_audio_enc, "n_fft", 1024)),
+            ).to(device=device, dtype=torch.float32)
+            _audio_proc.eval()
+
+            from musubi_tuner.ltx_vace.vace_cache_latents import encode_and_save_audio_vace_latents
+            encode_and_save_audio_vace_latents(_audio_enc, _audio_proc, datasets, args, device)
+
+            del _audio_enc, _audio_proc
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
     if audio_only:
         if getattr(args, "ltx2_checkpoint", None) is None:
             raise ValueError("--ltx2_checkpoint is required when --ltx2_mode audio is used")

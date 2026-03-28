@@ -491,6 +491,23 @@ def compute_loss_weighting_for_sd3(weighting_scheme: str, noise_scheduler, times
         else:
             bot = 1 - 2 * sigmas + 2 * sigmas**2
             weighting = 2 / (math.pi * bot)
+    elif weighting_scheme == "vace_gaussian":
+        # Gaussian weighting centered at mid-timestep, from VACE paper (arXiv:2503.07598).
+        # Higher weight for mid-range timesteps, lower for extremes.
+        num_train_timesteps = getattr(noise_scheduler, "num_train_timesteps", 1000)
+        if hasattr(noise_scheduler, "config") and hasattr(noise_scheduler.config, "num_train_timesteps"):
+            num_train_timesteps = noise_scheduler.config.num_train_timesteps
+        t = timesteps.float().to(device)
+        if torch.max(t).item() <= 1.0 + 1e-6:
+            t = t * num_train_timesteps
+        center = num_train_timesteps / 2.0
+        weighting = torch.exp(-2.0 * ((t - center) / num_train_timesteps) ** 2)
+        # Normalize so mean weight ≈ 1
+        weighting = weighting / weighting.mean().clamp(min=1e-6)
+        # Reshape for broadcasting with 5D loss tensors
+        while weighting.dim() < 5:
+            weighting = weighting.unsqueeze(-1)
+        weighting = weighting.float()
     else:
         weighting = None  # torch.ones_like(sigmas)
     return weighting
@@ -2550,6 +2567,15 @@ class NetworkTrainer:
                 accelerator.print(
                     f"Self-Flow: added {sum(p.numel() for p in self_flow_params):,} projector params to optimizer "
                     f"(lr={effective_projector_lr:g})"
+                )
+        # VACE model parameters (added by LTX2VaceTrainer subclass)
+        if hasattr(self, "get_vace_trainable_params"):
+            vace_params = self.get_vace_trainable_params()
+            if vace_params:
+                vace_lr = float(getattr(args, "vace_lr", None) or args.learning_rate)
+                optimizer.add_param_group({"params": vace_params, "lr": vace_lr})
+                accelerator.print(
+                    f"VACE: added {sum(p.numel() for p in vace_params):,} params to optimizer (lr={vace_lr:g})"
                 )
 
         # prepare lr_scheduler (must happen after all optimizer param groups are added)

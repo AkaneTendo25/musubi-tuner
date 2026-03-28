@@ -613,6 +613,12 @@ class LTXModel(torch.nn.Module):
         video: TransformerArgs | None,
         audio: TransformerArgs | None,
         perturbations: BatchedPerturbationConfig,
+        vace_hints: list[torch.Tensor] | None = None,
+        vace_scale: float = 1.0,
+        vace_layers_mapping: dict[int, int] | None = None,
+        audio_vace_hints: list[torch.Tensor] | None = None,
+        audio_vace_scale: float = 1.0,
+        audio_vace_layers_mapping: dict[int, int] | None = None,
     ) -> tuple[TransformerArgs, TransformerArgs]:
         """Process transformer blocks with optional offloading and block swapping."""
 
@@ -735,6 +741,27 @@ class LTXModel(torch.nn.Module):
             # Execute block (it now handles checkpointing i.e. load/compute/offload)
             # If offloading is on, block expects CPU inputs (for checkpoint savings) and returns CPU outputs
             video, audio = block(video, audio, perturbations)
+
+            # VACE hint injection: residually add control hints at mapped layers
+            if vace_hints is not None and vace_layers_mapping is not None and block_idx in vace_layers_mapping and video is not None:
+                hint_idx = vace_layers_mapping[block_idx]
+                hint = vace_hints[hint_idx]
+                if hint.device != video.x.device:
+                    hint = hint.to(device=video.x.device)
+                video = replace(video, x=video.x + hint.to(dtype=video.x.dtype) * vace_scale)
+
+            # Audio VACE hint injection: residually add audio control hints
+            if (
+                audio_vace_hints is not None
+                and audio_vace_layers_mapping is not None
+                and block_idx in audio_vace_layers_mapping
+                and audio is not None
+            ):
+                audio_hint_idx = audio_vace_layers_mapping[block_idx]
+                audio_hint = audio_vace_hints[audio_hint_idx]
+                if audio_hint.device != audio.x.device:
+                    audio_hint = audio_hint.to(device=audio.x.device)
+                audio = replace(audio, x=audio.x + audio_hint.to(dtype=audio.x.dtype) * audio_vace_scale)
 
             if nan_block_diag:
                 vx = video.x if video is not None and isinstance(video.x, torch.Tensor) else None
@@ -874,10 +901,25 @@ class LTXModel(torch.nn.Module):
                 block.enable_gradient_checkpointing(activation_cpu_offloading, weight_cpu_offloading)
 
     def forward(
-        self, video: Modality | None, audio: Modality | None, perturbations: BatchedPerturbationConfig
+        self,
+        video: Modality | None,
+        audio: Modality | None,
+        perturbations: BatchedPerturbationConfig,
+        vace_context: torch.Tensor | None = None,
+        vace_scale: float = 1.0,
+        audio_vace_context: torch.Tensor | None = None,
+        audio_vace_scale: float = 1.0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Forward pass for LTX models.
+
+        Args:
+            vace_context: Optional VACE control tokens (B, seq_len, vace_in_dim).
+                          Pre-patchified but not yet projected to model dim.
+                          Requires self._vace_model to be set.
+            audio_vace_context: Optional audio VACE control tokens (B, audio_seq_len, audio_vace_in_dim).
+                                Requires self._audio_vace_model to be set.
+            audio_vace_scale: Audio VACE hint injection scale.
         Returns:
             Processed output tensors
         """
@@ -888,11 +930,52 @@ class LTXModel(torch.nn.Module):
 
         video_args = self.video_args_preprocessor.prepare(video, audio) if video is not None else None
         audio_args = self.audio_args_preprocessor.prepare(audio, video) if audio is not None else None
+
+        # Compute video VACE hints using preprocessed video_args (correct dims, AdaLN, RoPE)
+        vace_hints = None
+        vace_layers_mapping = None
+        vace_model = getattr(self, "_vace_model", None)
+        if vace_context is not None and vace_model is not None and video_args is not None:
+            # Pass audio hidden states as cross-attention context (if audio x-attn enabled)
+            audio_ctx = audio_args.x if audio_args is not None else None
+            vace_hints = vace_model(
+                x=video_args.x,
+                vace_context=vace_context,
+                text_context=video_args.context,
+                text_context_mask=video_args.context_mask,
+                timesteps=video_args.timesteps,
+                pe=video_args.positional_embeddings,
+                audio_context=audio_ctx,
+                audio_context_mask=None,  # audio hidden states are not masked
+            )
+            vace_layers_mapping = vace_model.vace_layers_mapping
+
+        # Compute audio VACE hints using preprocessed audio_args
+        audio_vace_hints = None
+        audio_vace_layers_mapping = None
+        audio_vace_model = getattr(self, "_audio_vace_model", None)
+        if audio_vace_context is not None and audio_vace_model is not None and audio_args is not None:
+            audio_vace_hints = audio_vace_model(
+                x=audio_args.x,
+                vace_context=audio_vace_context,
+                text_context=audio_args.context,
+                text_context_mask=audio_args.context_mask,
+                timesteps=audio_args.timesteps,
+                pe=audio_args.positional_embeddings,
+            )
+            audio_vace_layers_mapping = audio_vace_model.vace_layers_mapping
+
         # Process transformer blocks
         video_out, audio_out = self._process_transformer_blocks(
             video=video_args,
             audio=audio_args,
             perturbations=perturbations,
+            vace_hints=vace_hints,
+            vace_scale=vace_scale,
+            vace_layers_mapping=vace_layers_mapping,
+            audio_vace_hints=audio_vace_hints,
+            audio_vace_scale=audio_vace_scale,
+            audio_vace_layers_mapping=audio_vace_layers_mapping,
         )
 
         if self.activation_cpu_offloading and self.training:

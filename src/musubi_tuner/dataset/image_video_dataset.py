@@ -214,6 +214,8 @@ class ItemInfo:
         self.text_encoder_output_cache_path: Optional[str] = None
         self.reference_latent_cache_path: Optional[str] = None
         self.reference_audio_latent_cache_path: Optional[str] = None
+        self.vace_latent_cache_path: Optional[str] = None
+        self.audio_vace_latent_cache_path: Optional[str] = None
 
         # np.ndarray for video, list[np.ndarray] for image with multiple controls
         self.control_content: Optional[Union[np.ndarray, list[np.ndarray]]] = None
@@ -1066,6 +1068,8 @@ class BucketBatchManager:
         audio_lengths_per_item = []
         ref_audio_latents_per_item = []
         ref_audio_lengths_per_item = []
+        audio_vace_latents_per_item = []
+        audio_vace_mask_per_item = []
         dino_features_per_item = []
         diag_collect_keys = os.getenv("LTX2_NAN_DIAG", "0") == "1"
         item_keys = []
@@ -1118,6 +1122,34 @@ class BucketBatchManager:
                     )
                 sd_latent = {**sd_latent, **sd_ref_audio}
 
+            vace_latent_cache_path = getattr(item_info, "vace_latent_cache_path", None)
+            if vace_latent_cache_path is not None:
+                if not os.path.exists(vace_latent_cache_path):
+                    raise FileNotFoundError(f"VACE latent cache file not found: {vace_latent_cache_path}")
+                sd_vace_raw = load_file(vace_latent_cache_path)
+                sd_vace = {}
+                for key, value in sd_vace_raw.items():
+                    if key.startswith("latents_"):
+                        sd_vace["vace_" + key] = value
+                if not sd_vace:
+                    raise ValueError(f"No latent tensors found in VACE cache: {vace_latent_cache_path}")
+                sd_latent = {**sd_latent, **sd_vace}
+
+            audio_vace_latent_cache_path = getattr(item_info, "audio_vace_latent_cache_path", None)
+            if audio_vace_latent_cache_path is not None:
+                if not os.path.exists(audio_vace_latent_cache_path):
+                    raise FileNotFoundError(f"Audio VACE latent cache file not found: {audio_vace_latent_cache_path}")
+                sd_audio_vace_raw = load_file(audio_vace_latent_cache_path)
+                sd_audio_vace = {}
+                for key, value in sd_audio_vace_raw.items():
+                    if key.startswith("latents_"):
+                        sd_audio_vace["audio_vace_" + key] = value
+                    elif key == "audio_vace_mask":
+                        sd_audio_vace["audio_vace_mask"] = value
+                if not any(k.startswith("audio_vace_latents") for k in sd_audio_vace):
+                    raise ValueError(f"No latent tensors found in audio VACE cache: {audio_vace_latent_cache_path}")
+                sd_latent = {**sd_latent, **sd_audio_vace}
+
             sd_te = load_file(item_info.text_encoder_output_cache_path)
             sd = {**sd_latent, **sd_te}
 
@@ -1125,6 +1157,8 @@ class BucketBatchManager:
             item_audio_lengths = None
             item_ref_audio_latents = None
             item_ref_audio_lengths = None
+            item_audio_vace_latents = None
+            item_audio_vace_mask = None
             for key, value in sd.items():
                 if key.startswith("audio_latents_"):
                     item_audio_latents = value
@@ -1134,10 +1168,16 @@ class BucketBatchManager:
                     item_ref_audio_latents = value
                 elif key.startswith("ref_audio_lengths_"):
                     item_ref_audio_lengths = value
+                elif key.startswith("audio_vace_latents_"):
+                    item_audio_vace_latents = value
+                elif key == "audio_vace_mask":
+                    item_audio_vace_mask = value
             audio_latents_per_item.append(item_audio_latents)
             audio_lengths_per_item.append(item_audio_lengths)
             ref_audio_latents_per_item.append(item_ref_audio_latents)
             ref_audio_lengths_per_item.append(item_ref_audio_lengths)
+            audio_vace_latents_per_item.append(item_audio_vace_latents)
+            audio_vace_mask_per_item.append(item_audio_vace_mask)
 
             if diag_collect_keys:
                 item_keys.append(item_info.item_key)
@@ -1152,6 +1192,8 @@ class BucketBatchManager:
                     or key.startswith("audio_lengths_")
                     or key.startswith("ref_audio_latents_")
                     or key.startswith("ref_audio_lengths_")
+                    or key.startswith("audio_vace_latents_")
+                    or key == "audio_vace_mask"
                 ):
                     continue
                 is_varlen_key = key.startswith("varlen_")  # varlen keys are not stacked
@@ -1168,6 +1210,8 @@ class BucketBatchManager:
                         content_key.startswith("latents_")
                         or content_key.startswith("audio_latents_")
                         or content_key.startswith("ref_latents_")
+                        or content_key.startswith("vace_latents_")
+                        or content_key.startswith("audio_vace_latents_")
                     ):
                         content_key = content_key.rsplit("_", 1)[0]  # remove FxHxW
 
@@ -1360,6 +1404,39 @@ class BucketBatchManager:
 
                     batch_tensor_data["ref_audio_latents"] = torch.stack(padded_ref)
                     batch_tensor_data["ref_audio_lengths"] = torch.tensor(ref_lengths, device=ref_device, dtype=torch.int32)
+
+        # Pad audio VACE latents to the same temporal length within batch
+        present_audio_vace = [x for x in audio_vace_latents_per_item if isinstance(x, torch.Tensor) and x.dim() == 3]
+        if present_audio_vace:
+            channels = present_audio_vace[0].shape[0]
+            freq_bins = present_audio_vace[0].shape[2]
+            max_t = max(x.shape[1] for x in present_audio_vace)
+            if max_t <= 0:
+                max_t = 1
+            padded = []
+            for lat in audio_vace_latents_per_item:
+                if isinstance(lat, torch.Tensor) and lat.dim() == 3:
+                    t = lat.shape[1]
+                    out = torch.zeros((channels, max_t, freq_bins), device=lat.device, dtype=lat.dtype)
+                    use_t = min(t, max_t)
+                    if use_t > 0:
+                        out[:, :use_t, :] = lat[:, :use_t, :]
+                    padded.append(out)
+                else:
+                    padded.append(torch.zeros((channels, max_t, freq_bins), device=present_audio_vace[0].device, dtype=present_audio_vace[0].dtype))
+            batch_tensor_data["audio_vace_latents"] = torch.stack(padded)
+
+            # Pad audio VACE masks to the same temporal length
+            padded_masks = []
+            for m in audio_vace_mask_per_item:
+                if isinstance(m, torch.Tensor):
+                    out = torch.ones(max_t, device=m.device, dtype=m.dtype)  # default: generate
+                    use_t = min(m.shape[0], max_t)
+                    out[:use_t] = m[:use_t]
+                    padded_masks.append(out)
+                else:
+                    padded_masks.append(torch.ones(max_t, device=present_audio_vace[0].device, dtype=present_audio_vace[0].dtype))
+            batch_tensor_data["audio_vace_mask"] = torch.stack(padded_masks)
 
         if self.timestep_pool is not None:
             batch_tensor_data["timesteps"] = self.timestep_pool[idx][: end - start]  # use the pre-generated timesteps
@@ -2272,6 +2349,8 @@ class BaseDataset(torch.utils.data.Dataset):
         cache_directory: Optional[str] = None,
         reference_cache_directory: Optional[str] = None,
         reference_audio_cache_directory: Optional[str] = None,
+        vace_cache_directory: Optional[str] = None,
+        audio_vace_cache_directory: Optional[str] = None,
         separate_audio_buckets: bool = False,
         debug_dataset: bool = False,
         architecture: str = "no_default",
@@ -2287,6 +2366,8 @@ class BaseDataset(torch.utils.data.Dataset):
         self.cache_directory = cache_directory
         self.reference_cache_directory = reference_cache_directory
         self.reference_audio_cache_directory = reference_audio_cache_directory
+        self.vace_cache_directory = vace_cache_directory
+        self.audio_vace_cache_directory = audio_vace_cache_directory
         self.separate_audio_buckets = separate_audio_buckets
         self.debug_dataset = debug_dataset
         self.architecture = architecture
@@ -2385,6 +2466,28 @@ class BaseDataset(torch.utils.data.Dataset):
         return os.path.join(
             self.reference_audio_cache_directory,
             f"{basename}_{w:04d}x{h:04d}_{self.architecture}_audio.safetensors",
+        )
+
+    def get_vace_latent_cache_path(self, item_info: ItemInfo) -> str:
+        w, h = item_info.original_size
+        basename = os.path.splitext(os.path.basename(item_info.item_key))[0]
+        assert self.vace_cache_directory is not None, (
+            "vace_cache_directory is required for VACE training"
+        )
+        return os.path.join(
+            self.vace_cache_directory,
+            f"{basename}_{w:04d}x{h:04d}_{self.architecture}_vace.safetensors",
+        )
+
+    def get_audio_vace_latent_cache_path(self, item_info: ItemInfo) -> str:
+        w, h = item_info.original_size
+        basename = os.path.splitext(os.path.basename(item_info.item_key))[0]
+        assert self.audio_vace_cache_directory is not None, (
+            "audio_vace_cache_directory is required for audio VACE training"
+        )
+        return os.path.join(
+            self.audio_vace_cache_directory,
+            f"{basename}_{w:04d}x{h:04d}_{self.architecture}_audio_vace.safetensors",
         )
 
     def get_text_encoder_output_cache_path(self, item_info: ItemInfo) -> str:
@@ -2631,6 +2734,10 @@ class ImageDataset(BaseDataset):
 
                     if self.reference_cache_directory is not None:
                         item_info.reference_latent_cache_path = self.get_reference_latent_cache_path(item_info)
+                    if self.vace_cache_directory is not None:
+                        item_info.vace_latent_cache_path = self.get_vace_latent_cache_path(item_info)
+                    if self.audio_vace_cache_directory is not None:
+                        item_info.audio_vace_latent_cache_path = self.get_audio_vace_latent_cache_path(item_info)
 
                     # for VLM, which require image in addition to text, like Qwen-Image-Edit
                     item_info.text_encoder_output_cache_path = self.get_text_encoder_output_cache_path(item_info)
@@ -2799,6 +2906,28 @@ class ImageDataset(BaseDataset):
                     item_info.reference_latent_cache_path = ref_cache_path
                 else:
                     logger.warning(f"Reference cache not found, skipping item: {ref_cache_path}")
+                    continue
+
+            if self.vace_cache_directory is not None:
+                vace_cache_path = os.path.join(self.vace_cache_directory, os.path.basename(cache_file))
+                if os.path.exists(vace_cache_path):
+                    item_info.vace_latent_cache_path = vace_cache_path
+                else:
+                    logger.warning(f"VACE cache not found, skipping item: {vace_cache_path}")
+                    continue
+
+            if self.audio_vace_cache_directory is not None:
+                audio_vace_cache_path = os.path.join(
+                    self.audio_vace_cache_directory,
+                    os.path.basename(cache_file).replace(
+                        f"_{self.architecture}.safetensors",
+                        f"_{self.architecture}_audio_vace.safetensors",
+                    ),
+                )
+                if os.path.exists(audio_vace_cache_path):
+                    item_info.audio_vace_latent_cache_path = audio_vace_cache_path
+                else:
+                    logger.warning(f"Audio VACE cache not found, skipping item: {audio_vace_cache_path}")
                     continue
 
             bucket = bucketed_item_info.get(bucket_reso, [])
@@ -3144,9 +3273,13 @@ class VideoDataset(BaseDataset):
         control_directory: Optional[str] = None,
         reference_directory: Optional[str] = None,
         reference_audio_directory: Optional[str] = None,
+        vace_directory: Optional[str] = None,
+        audio_vace_directory: Optional[str] = None,
         cache_directory: Optional[str] = None,
         reference_cache_directory: Optional[str] = None,
         reference_audio_cache_directory: Optional[str] = None,
+        vace_cache_directory: Optional[str] = None,
+        audio_vace_cache_directory: Optional[str] = None,
         separate_audio_buckets: bool = False,
         fp_latent_window_size: Optional[int] = 9,
         cache_only: bool = False,
@@ -3165,15 +3298,19 @@ class VideoDataset(BaseDataset):
             cache_directory,
             reference_cache_directory,
             reference_audio_cache_directory,
-            separate_audio_buckets,
-            debug_dataset,
-            architecture,
+            vace_cache_directory=vace_cache_directory,
+            audio_vace_cache_directory=audio_vace_cache_directory,
+            separate_audio_buckets=separate_audio_buckets,
+            debug_dataset=debug_dataset,
+            architecture=architecture,
         )
         self.video_directory = video_directory
         self.video_jsonl_file = video_jsonl_file
         self.control_directory = control_directory
         self.reference_directory = reference_directory
         self.reference_audio_directory = reference_audio_directory
+        self.vace_directory = vace_directory
+        self.audio_vace_directory = audio_vace_directory
         self.frame_extraction = frame_extraction
         self.frame_stride = frame_stride
         self.frame_sample = frame_sample
@@ -3485,6 +3622,34 @@ class VideoDataset(BaseDataset):
                     item_info.reference_audio_latent_cache_path = ref_audio_cache_path
                 else:
                     logger.warning(f"Reference audio cache not found, skipping item: {ref_audio_cache_path}")
+                    continue
+
+            if self.vace_cache_directory is not None:
+                vace_cache_path = os.path.join(
+                    self.vace_cache_directory,
+                    os.path.basename(cache_file).replace(
+                        f"_{self.architecture}.safetensors",
+                        f"_{self.architecture}_vace.safetensors",
+                    ),
+                )
+                if os.path.exists(vace_cache_path):
+                    item_info.vace_latent_cache_path = vace_cache_path
+                else:
+                    logger.warning(f"VACE cache not found, skipping item: {vace_cache_path}")
+                    continue
+
+            if self.audio_vace_cache_directory is not None:
+                audio_vace_cache_path = os.path.join(
+                    self.audio_vace_cache_directory,
+                    os.path.basename(cache_file).replace(
+                        f"_{self.architecture}.safetensors",
+                        f"_{self.architecture}_audio_vace.safetensors",
+                    ),
+                )
+                if os.path.exists(audio_vace_cache_path):
+                    item_info.audio_vace_latent_cache_path = audio_vace_cache_path
+                else:
+                    logger.warning(f"Audio VACE cache not found, skipping item: {audio_vace_cache_path}")
                     continue
 
             bucket = bucketed_item_info.get(bucket_reso, [])

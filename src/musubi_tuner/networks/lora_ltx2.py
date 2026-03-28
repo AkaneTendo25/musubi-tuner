@@ -547,7 +547,20 @@ class LTX2Wrapper(nn.Module):
             if isinstance(transformer_options, dict) and "perturbations" in transformer_options
             else BatchedPerturbationConfig.empty(bsz)
         )
-        video_pred_tokens, audio_pred_tokens = self.model(video_modality, audio_modality, perturbations)
+
+        # VACE: extract context from transformer_options and pass to model
+        vace_kwargs = {}
+        if isinstance(transformer_options, dict):
+            if "vace_context" in transformer_options:
+                vace_kwargs["vace_context"] = transformer_options["vace_context"]
+                vace_kwargs["vace_scale"] = transformer_options.get("vace_scale", 1.0)
+            if "audio_vace_context" in transformer_options:
+                vace_kwargs["audio_vace_context"] = transformer_options["audio_vace_context"]
+                vace_kwargs["audio_vace_scale"] = transformer_options.get("audio_vace_scale", 1.0)
+
+        video_pred_tokens, audio_pred_tokens = self.model(
+            video_modality, audio_modality, perturbations, **vace_kwargs
+        )
 
         if model_video_enabled:
             video_pred = self._video_patchifier.unpatchify(
@@ -619,6 +632,7 @@ def load_ltx2_wrapper(
 #   - ff, audio_ff (feed-forward, if included via patterns)
 LTX2_TARGET_REPLACE_MODULES = [
     "BasicAVTransformerBlock",
+    "VaceLTXBlock",
 ]
 
 # Extended target modules when connector LoRA is enabled
@@ -724,6 +738,21 @@ LTX2_INCLUDE_PATTERNS_AUDIO_REF_ONLY_IC = [
 # Maximum expressiveness, but larger LoRA file and more VRAM usage.
 LTX2_INCLUDE_PATTERNS_FULL = None  # None means no filtering, all Linear layers matched
 
+# vace: VACE context encoder blocks only (attention + FFN)
+# For VACE training where the base DiT is frozen and only the VACE encoder trains.
+LTX2_INCLUDE_PATTERNS_VACE = [
+    r".*vace_blocks\.\d+\.attn1\.to_k$",
+    r".*vace_blocks\.\d+\.attn1\.to_q$",
+    r".*vace_blocks\.\d+\.attn1\.to_v$",
+    r".*vace_blocks\.\d+\.attn1\.to_out\.0$",
+    r".*vace_blocks\.\d+\.attn2\.to_k$",
+    r".*vace_blocks\.\d+\.attn2\.to_q$",
+    r".*vace_blocks\.\d+\.attn2\.to_v$",
+    r".*vace_blocks\.\d+\.attn2\.to_out\.0$",
+    r".*vace_blocks\.\d+\.ff\.net\.0\.proj$",
+    r".*vace_blocks\.\d+\.ff\.net\.2$",
+]
+
 # Mapping from preset name to include patterns
 LTX2_LORA_TARGET_PRESETS = {
     "t2v": LTX2_INCLUDE_PATTERNS_T2V,
@@ -731,6 +760,7 @@ LTX2_LORA_TARGET_PRESETS = {
     "audio": LTX2_INCLUDE_PATTERNS_AUDIO,
     "audio_ref_only_ic": LTX2_INCLUDE_PATTERNS_AUDIO_REF_ONLY_IC,
     "full": LTX2_INCLUDE_PATTERNS_FULL,
+    "vace": LTX2_INCLUDE_PATTERNS_VACE,
 }
 
 # Default preset (for backwards compatibility)
