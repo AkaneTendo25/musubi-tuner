@@ -20,6 +20,17 @@ def detect_arch_config(unet):
 
         return WAN_TARGET_REPLACE_MODULES, [r".*(patch_embedding|text_embedding|time_embedding|time_projection|norm|head).*"]
 
+    # Cosmos Predict 2.5
+    if "CosmosBlock" in module_class_names:
+        from .lora_cosmos import COSMOS_TARGET_REPLACE_MODULES
+
+        return COSMOS_TARGET_REPLACE_MODULES, [
+            r".*(x_embedder|pos_embedder|extra_pos_embedder|t_embedder|t_embedding_norm|final_layer|crossattn_proj).*",
+            r".*adaln_modulation.*",
+            r".*layer_norm.*",
+            r".*(q_norm|k_norm|v_norm).*",
+        ]
+
     if "QwenImageTransformerBlock" in module_class_names:
         from .lora_qwen_image import QWEN_IMAGE_TARGET_REPLACE_MODULES
 

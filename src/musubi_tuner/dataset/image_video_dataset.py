@@ -93,6 +93,8 @@ ARCHITECTURE_HUNYUAN_VIDEO_1_5 = "hv15"
 ARCHITECTURE_HUNYUAN_VIDEO_1_5_FULL = "hunyuan_video_1_5"
 ARCHITECTURE_Z_IMAGE = "zi"
 ARCHITECTURE_Z_IMAGE_FULL = "z_image"
+ARCHITECTURE_COSMOS = "cosmos"
+ARCHITECTURE_COSMOS_FULL = "cosmos_predict_2_5"
 
 
 def glob_images(directory, base="*", caption_extension=None):
@@ -621,6 +623,7 @@ class BucketSelector:
         ARCHITECTURE_KANDINSKY5: RESOLUTION_STEPS_KANDINSKY5,
         ARCHITECTURE_HUNYUAN_VIDEO_1_5: RESOLUTION_STEPS_HUNYUAN_VIDEO_1_5,
         ARCHITECTURE_Z_IMAGE: RESOLUTION_STEPS_Z_IMAGE,
+        ARCHITECTURE_COSMOS: RESOLUTION_STEPS_WAN,  # Cosmos uses WAN VAE (8x spatial) + patch_spatial=2
     }
 
     def __init__(
@@ -1814,7 +1817,7 @@ class ImageDataset(BaseDataset):
         self.control_resolution = control_resolution
 
         control_count_per_image: Optional[int] = 1
-        if self.architecture == ARCHITECTURE_FRAMEPACK or self.architecture == ARCHITECTURE_WAN:
+        if self.architecture == ARCHITECTURE_FRAMEPACK or self.architecture == ARCHITECTURE_WAN or self.architecture == ARCHITECTURE_COSMOS:
             if fp_1f_clean_indices is not None:
                 control_count_per_image = len(fp_1f_clean_indices)
             else:
@@ -1897,7 +1900,7 @@ class ImageDataset(BaseDataset):
                     item_info.fp_1f_target_index = self.fp_1f_target_index
                     item_info.fp_1f_no_post = self.fp_1f_no_post
 
-                    if self.architecture == ARCHITECTURE_FRAMEPACK or self.architecture == ARCHITECTURE_WAN:
+                    if self.architecture == ARCHITECTURE_FRAMEPACK or self.architecture == ARCHITECTURE_WAN or self.architecture == ARCHITECTURE_COSMOS:
                         # we need to split the bucket with latent window size and optional 1f clean indices, zero post
                         bucket_reso = list(bucket_reso) + [self.fp_latent_window_size]
                         if self.fp_1f_clean_indices is not None:
@@ -2023,7 +2026,7 @@ class ImageDataset(BaseDataset):
 
             bucket_reso = bucket_selector.get_bucket_resolution(image_size)
 
-            if self.architecture == ARCHITECTURE_FRAMEPACK or self.architecture == ARCHITECTURE_WAN:
+            if self.architecture == ARCHITECTURE_FRAMEPACK or self.architecture == ARCHITECTURE_WAN or self.architecture == ARCHITECTURE_COSMOS:
                 # we need to split the bucket with latent window size and optional 1f clean indices, zero post
                 bucket_reso = list(bucket_reso) + [self.fp_latent_window_size]
                 if self.fp_1f_clean_indices is not None:
@@ -2129,6 +2132,8 @@ class VideoDataset(BaseDataset):
             self.target_fps = VideoDataset.TARGET_FPS_HUNYUAN
         elif self.architecture == ARCHITECTURE_HUNYUAN_VIDEO_1_5:
             self.target_fps = VideoDataset.TARGET_FPS_HUNYUAN_VIDEO_1_5
+        elif self.architecture == ARCHITECTURE_COSMOS:
+            self.target_fps = VideoDataset.TARGET_FPS_WAN  # Cosmos uses 16 fps by default
         else:
             raise ValueError(f"Unsupported architecture: {self.architecture}")
 
