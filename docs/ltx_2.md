@@ -2200,13 +2200,13 @@ Notes:
 - [LTX Documentation](https://docs.ltx.video/open-source-model/getting-started/overview) — Unified docs hub: open-source model, API reference, ComfyUI integration, LoRA usage, and LTX-2 trainer guide
 
 **Alternative Trainers**
-- [ai-toolkit](https://github.com/ostris/ai-toolkit) (ostris) — General diffusion fine-tuning toolkit with LTX-2 LoRA support; slider LoRA training is based on its implementation
-- [SimpleTuner](https://github.com/bghira/SimpleTuner) — Multi-model fine-tuning framework with LTX-2 support; `--crepa backbone` mode is inspired by its LayerSync regularizer
+- [ai-toolkit](https://github.com/ostris/ai-toolkit) (ostris) — General diffusion fine-tuning toolkit with LTX-2/2.3 LoRA support; slider LoRA training is based on its implementation
 - [DiffSynth-Studio](https://github.com/modelscope/DiffSynth-Studio) — ModelScope diffusion synthesis framework with LTX-2/2.3 support
+- [SimpleTuner](https://github.com/bghira/SimpleTuner) — Multi-model fine-tuning framework with LTX-2/2.3 support; `--crepa backbone` mode is inspired by its LayerSync regularizer
 
 **Community Resources**
 - [awesome-ltx2](https://github.com/wildminder/awesome-ltx2) — Curated list of LTX-2 resources, tools, models, and guides
-- [Banodoco Discord](https://discord.gg/banodoco) — Active AI video generation community; discussions on LTX-2 training, workflows, and research
+- [Banodoco Discord](https://discord.gg/SrkBPTzw) — Active AI video generation community; discussions on LTX-2 training, workflows, and research
 - [Windows Installation Guide](https://github.com/AkaneTendo25/musubi-tuner/discussions/19) — Windows-specific setup (Python 3.12, CUDA, Flash Attention 2), dependencies, troubleshooting
 - [LTX-2 Training Optimizers](https://github.com/AkaneTendo25/musubi-tuner/discussions/21) — Optimizer comparison for LTX-2 training: AdamW, Prodigy, Muon, CAME, and recommended settings
 - [LTX-2 Audio Dataset Builder](https://github.com/dorpxam/LTX-2-Audio-Dataset-Builder) — Tool to automate audio dataset creation: transforms raw audio into clean, captioned segments optimized for LTX-2 audio-only training
