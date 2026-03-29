@@ -1158,13 +1158,16 @@ Use `--lora_target_preset` to control which layers LoRA targets. For custom laye
 
 | Preset | Layers | Use Case |
 |--------|--------|----------|
-| `t2v` (default) | Attention only (`to_q`, `to_k`, `to_v`, `to_out.0`) | Text-to-video, matches official LTX-2 trainer |
-| `v2v` | Attention + FFN | Video-to-video / IC-LoRA style |
+| `t2v` (default) | All attention (`to_q`, `to_k`, `to_v`, `to_out.0`) | Text-to-video, matches official LTX-2 trainer |
+| `v2v` | All attention + FFN | Video-to-video / IC-LoRA style |
+| `video_sa` | Video self-attention only | Spatially-aligned controls (depth, pose, canny, inpaint) |
+| `video_sa_ff` | Video self-attention + video FFN | Controls needing more capacity (local edit, cut-on-action) |
+| `video_sa_ca_ff` | Video self-attention + cross-attention + video FFN | Text-guided controls (video detailing, camera-from-image, sparse tracks) |
 | `audio` | Audio attention/FFN + audio-side cross-modal attention | Audio-only training (auto-selected when `--ltx2_mode audio`) |
 | `audio_ref_only_ic` | Audio attn/FFN + bidirectional AV cross-modal | Audio-reference IC-LoRA |
 | `full` | All linear layers | All layers targeted, larger file size |
 
-All presets apply to all relevant attention types: self-attention, cross-attention, and cross-modal attention (in AV mode). Connector layers (`Embeddings1DConnector`) are excluded by default; use `--train_connectors` to include them (see below).
+The `t2v`, `v2v`, and `full` presets target modules across all modalities (video, audio, cross-modal). The `video_*` presets target only video-branch modules — use with `--ltx2_mode video` for smaller LoRA files with no dead audio parameters. Connector layers (`Embeddings1DConnector`) are excluded by default; use `--train_connectors` to include them (see below).
 
 To use custom layer patterns instead of a preset, use `--network_args`:
 ```bash

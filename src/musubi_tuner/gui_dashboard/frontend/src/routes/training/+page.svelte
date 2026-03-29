@@ -81,9 +81,13 @@
 							<FormField label="Dim" type="number" value={t.network_dim ?? 16} oninput={(e) => update('network_dim', Number(e.target.value))} min={1} tooltip="LoRA rank" />
 							<FormField label="Alpha" type="number" value={t.network_alpha ?? 16} oninput={(e) => update('network_alpha', Number(e.target.value))} min={1} tooltip="LoRA alpha" />
 							<FormSelect label="Target" value={t.lora_target_preset || 't2v'} options={[
-								{ value: 't2v', label: 't2v (attn)' },
-								{ value: 'v2v', label: 'v2v (attn+FFN)' },
+								{ value: 't2v', label: 't2v (all attn)' },
+								{ value: 'v2v', label: 'v2v (all attn+FFN)' },
+								{ value: 'video_sa', label: 'V:SA' },
+								{ value: 'video_sa_ff', label: 'V:SA+FF' },
+								{ value: 'video_sa_ca_ff', label: 'V:SA+CA+FF' },
 								{ value: 'audio', label: 'audio' },
+								{ value: 'audio_ref_only_ic', label: 'audio ref IC' },
 								{ value: 'full', label: 'full (all)' }
 							]} onchange={(e) => update('lora_target_preset', e.target.value)} tooltip="Target layers" />
 						</div>

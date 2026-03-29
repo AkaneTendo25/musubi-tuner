@@ -288,8 +288,10 @@ def _calculate_vram_stats(config: dict) -> VRAMStats | None:
         mode = str(training.get('ltx2_mode', 'video'))
         is_av = mode == 'av'
         lora_base_per_rank = (12.75 if is_av else 6.0) / 1024  # GB per rank
-        preset_mult = {'t2v': 1.0, 'v2v': 1.44, 'audio': 0.52, 'full': 2.1}.get(
-            training.get('lora_target_preset'), 1.0)
+        preset_mult = {
+            't2v': 1.0, 'v2v': 1.44, 'video_sa': 0.37, 'video_sa_ff': 0.56,
+            'video_sa_ca_ff': 0.74, 'audio': 0.52, 'audio_ref_only_ic': 0.63, 'full': 2.1,
+        }.get(training.get('lora_target_preset'), 1.0)
         lora_size_gb = rank * lora_base_per_rank * preset_mult
 
         # ── Optimizer states ──

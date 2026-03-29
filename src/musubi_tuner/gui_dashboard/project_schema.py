@@ -131,7 +131,7 @@ class TrainingConfig(BaseModel):
     network_module: Optional[str] = None
     network_dim: int = 16
     network_alpha: int = 16
-    lora_target_preset: Literal["t2v", "v2v", "audio", "full"] = "t2v"
+    lora_target_preset: Literal["t2v", "v2v", "video_sa", "video_sa_ff", "video_sa_ca_ff", "audio", "audio_ref_only_ic", "full"] = "t2v"
     network_args: str = ""
     network_weights: str = ""
     network_dropout: Optional[float] = None

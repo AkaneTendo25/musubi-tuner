@@ -6897,11 +6897,15 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         "--lora_target_preset",
         type=str,
         default="t2v",
-        choices=["t2v", "v2v", "audio", "audio_ref_only_ic", "full"],
+        choices=["t2v", "v2v", "video_sa", "video_sa_ff", "video_sa_ca_ff",
+                 "audio", "audio_ref_only_ic", "full"],
         help=(
             "LoRA target preset: "
-            "'t2v' = text-to-video (attention only, official default), "
-            "'v2v' = video-to-video/IC-LoRA (attention + feed-forward), "
+            "'t2v' = text-to-video (all attention, official default), "
+            "'v2v' = video-to-video/IC-LoRA (all attention + feed-forward), "
+            "'video_sa' = video self-attention only, "
+            "'video_sa_ff' = video self-attention + video feed-forward, "
+            "'video_sa_ca_ff' = video self-attention + cross-attention + feed-forward, "
             "'audio' = audio-only (audio attn/ffn + audio-side cross-modal), "
             "'audio_ref_only_ic' = ID-LoRA-style AV preset "
             "(audio attn/ffn + audio/video cross-modal both directions), "

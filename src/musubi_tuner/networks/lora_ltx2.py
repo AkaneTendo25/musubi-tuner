@@ -720,6 +720,40 @@ LTX2_INCLUDE_PATTERNS_AUDIO_REF_ONLY_IC = [
     r".*\.video_to_audio_attn\.to_out\.0$",
 ]
 
+# video_sa: Video self-attention only
+# Targets only video self-attention projections. Audio modules are excluded entirely,
+# producing a smaller LoRA when used with --ltx2_mode video.
+LTX2_INCLUDE_PATTERNS_VIDEO_SA = [
+    r".*\.attn1\.to_k$",
+    r".*\.attn1\.to_q$",
+    r".*\.attn1\.to_v$",
+    r".*\.attn1\.to_out\.0$",
+]
+
+# video_sa_ff: Video self-attention + video feed-forward
+LTX2_INCLUDE_PATTERNS_VIDEO_SA_FF = [
+    r".*\.attn1\.to_k$",
+    r".*\.attn1\.to_q$",
+    r".*\.attn1\.to_v$",
+    r".*\.attn1\.to_out\.0$",
+    r".*\.ff\.net\.0\.proj$",
+    r".*\.ff\.net\.2$",
+]
+
+# video_sa_ca_ff: Video self-attention + cross-attention + feed-forward
+LTX2_INCLUDE_PATTERNS_VIDEO_SA_CA_FF = [
+    r".*\.attn1\.to_k$",
+    r".*\.attn1\.to_q$",
+    r".*\.attn1\.to_v$",
+    r".*\.attn1\.to_out\.0$",
+    r".*\.attn2\.to_k$",
+    r".*\.attn2\.to_q$",
+    r".*\.attn2\.to_v$",
+    r".*\.attn2\.to_out\.0$",
+    r".*\.ff\.net\.0\.proj$",
+    r".*\.ff\.net\.2$",
+]
+
 # full: All linear layers in transformer blocks
 # Maximum expressiveness, but larger LoRA file and more VRAM usage.
 LTX2_INCLUDE_PATTERNS_FULL = None  # None means no filtering, all Linear layers matched
@@ -728,6 +762,9 @@ LTX2_INCLUDE_PATTERNS_FULL = None  # None means no filtering, all Linear layers 
 LTX2_LORA_TARGET_PRESETS = {
     "t2v": LTX2_INCLUDE_PATTERNS_T2V,
     "v2v": LTX2_INCLUDE_PATTERNS_V2V,
+    "video_sa": LTX2_INCLUDE_PATTERNS_VIDEO_SA,
+    "video_sa_ff": LTX2_INCLUDE_PATTERNS_VIDEO_SA_FF,
+    "video_sa_ca_ff": LTX2_INCLUDE_PATTERNS_VIDEO_SA_CA_FF,
     "audio": LTX2_INCLUDE_PATTERNS_AUDIO,
     "audio_ref_only_ic": LTX2_INCLUDE_PATTERNS_AUDIO_REF_ONLY_IC,
     "full": LTX2_INCLUDE_PATTERNS_FULL,
