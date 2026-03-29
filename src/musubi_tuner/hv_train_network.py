@@ -3785,24 +3785,24 @@ class NetworkTrainer:
                                 params_to_clip.extend(self._self_flow.get_trainable_params())
                             accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
 
-                        # Per-modality gradient norm tracking
+                        # Per-modality gradient norm tracking (accumulate on GPU, sync once)
                         if len(accelerator.trackers) > 0 and dict_output:
                             unwrapped_net = accelerator.unwrap_model(network)
                             lora_modules = getattr(unwrapped_net, "unet_loras", None)
                             if lora_modules:
-                                video_grad_sq_sum = 0.0
-                                audio_grad_sq_sum = 0.0
+                                video_grad_sq = torch.zeros(1, device=accelerator.device)
+                                audio_grad_sq = torch.zeros(1, device=accelerator.device)
                                 for lora in lora_modules:
                                     is_audio = "audio_" in lora.lora_name
                                     for param in lora.parameters():
                                         if param.grad is not None:
-                                            g_sq = param.grad.data.norm().item() ** 2
+                                            g_sq = param.grad.data.norm() ** 2
                                             if is_audio:
-                                                audio_grad_sq_sum += g_sq
+                                                audio_grad_sq += g_sq
                                             else:
-                                                video_grad_sq_sum += g_sq
-                                grad_norm_video_value = video_grad_sq_sum ** 0.5
-                                grad_norm_audio_value = audio_grad_sq_sum ** 0.5
+                                                video_grad_sq += g_sq
+                                grad_norm_video_value = video_grad_sq.sqrt().item()
+                                grad_norm_audio_value = audio_grad_sq.sqrt().item()
 
                     if _is_first_step:
                         _log_vram("FIRST_ITER: BEFORE optimizer.step", logger)
