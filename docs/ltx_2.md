@@ -281,7 +281,7 @@ Recommended practice:
 - Always set `--ltx_version` explicitly in training commands (do not rely on the default).
 - On first run, set `--ltx_version_check_mode error` to fail fast if the selected version does not match checkpoint metadata.
 - After validation, you can switch to `--ltx_version_check_mode warn`.
-- For LTX-2.3, current upstream recommendation is to train from the BF16 checkpoint. FP8-checkpoint training recipes are currently community-contributed/experimental.
+- Pre-quantized FP8 checkpoints (e.g. `ltx-2.3-22b-dev-fp8.safetensors`) are supported. The loader auto-detects `weight_scale`/`input_scale` keys and dequantizes to bf16 before applying LoRA merges and any further quantization.
 
 When changing checkpoints (important):
 - If you change `--ltx2_checkpoint` (e.g., LTX-2 -> LTX-2.3, or different 2.3 variant), re-run **both** caches:
@@ -289,7 +289,7 @@ When changing checkpoints (important):
   - `ltx2_cache_text_encoder_outputs.py`
 - Do not reuse old `*_ltx2_te.safetensors` from a different checkpoint. For LTX-2.3 audio/av training this can cause context/mask shape mismatches (for example FlashAttention varlen mask-length errors).
 - If you use `--dataset_manifest`, regenerate it from the recache step so training points to the new cache files.
-- If your selected checkpoint is already FP8-quantized (for example `*fp8*.safetensors`), still keep `--fp8_base` during training (usually with `--mixed_precision bf16`), but do not add `--fp8_scaled`.
+- Pre-quantized FP8 checkpoints (`*fp8*.safetensors`) work with both `--fp8_base` and `--fp8_base --fp8_scaled`. The loader dequantizes to bf16 using the checkpoint's scale tensors before any further processing.
 
 Example (LTX-2.3 training):
 ```bash
@@ -345,7 +345,7 @@ accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 ltx2_tr
   --output_name ltx23_lora
 ```
 
-If the selected checkpoint is already FP8 (`*fp8*.safetensors`), keep `--fp8_base` but remove `--fp8_scaled`.
+Pre-quantized FP8 checkpoints (`*fp8*.safetensors`) are supported — `--fp8_base --fp8_scaled` works the same as with standard checkpoints (weights are dequantized to bf16 first, then re-quantized).
 
 For LTX-2 checkpoints, replace:
 - `--ltx2_checkpoint /path/to/ltx-2.3.safetensors` -> `--ltx2_checkpoint /path/to/ltx-2.safetensors`
@@ -429,7 +429,7 @@ For additional training and inference speedups, see the [torch.compile Support](
 NF4 has ~4x higher weight error than FP8 (cosine 0.996 vs 0.9997). The base model is frozen during LoRA training, so the quantization error is constant rather than accumulating. LoftQ initializes LoRA weights from the quantization residual via SVD.
 
 - `--fp8_base`: keep base model weights in FP8 path (~19 GB VRAM).
-- `--fp8_scaled`: quantize non-FP8 (fp16/bf16/fp32) checkpoints to FP8. Do not use this with already-FP8 checkpoints.
+- `--fp8_scaled`: quantize checkpoint weights to FP8 at load time. Works with both standard (bf16/fp16/fp32) and pre-quantized FP8 checkpoints (the latter are dequantized to bf16 first, then re-quantized).
 - `--nf4_base`: NF4 4-bit quantization (~10 GB VRAM). Mutually exclusive with `--fp8_base`. See [NF4 Quantization](#nf4-quantization) below.
 - `--quantize_device cpu|cuda|gpu`: Device for NF4/FP8 quantization at startup (default: `cuda`). `cpu` loads and quantizes weights on CPU, then moves to GPU. `cuda` loads and quantizes directly on GPU. Overrides `LTX2_NF4_CALC_DEVICE` / `LTX2_FP8_CALC_DEVICE` env vars.
 
@@ -480,7 +480,7 @@ accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 ltx2_tr
 ```
 
 **Tips for low-VRAM training:**
-- Use `--fp8_base --fp8_scaled` for non-FP8 checkpoints; use `--fp8_base` only for already-FP8 checkpoints
+- Use `--fp8_base --fp8_scaled` (works with both standard and pre-quantized FP8 checkpoints)
 - Use `--blocks_to_swap 47` (keeps only 1 block on GPU)
 - Use smaller LoRA rank (`--network_dim 16` instead of 32)
 - Use smaller training resolutions (e.g., 512x320)
@@ -1862,7 +1862,7 @@ reference_cache_directory/                  # IC-LoRA only
 | Samples become progressively noisier/degraded when training with `--flash_attn` | FlashAttention install/runtime mismatch (CUDA/PyTorch/flash-attn build) | Switch to `--sdpa` to confirm baseline stability. If SDPA is stable, reinstall FlashAttention for your exact CUDA + PyTorch versions and retry. |
 | Training fails after changing `--ltx2_checkpoint` even though args look correct | Reused latent/text caches generated from a different checkpoint | Re-run both caches (`ltx2_cache_latents.py` and `ltx2_cache_text_encoder_outputs.py`) and regenerate `--dataset_manifest` before training. |
 | OOM appears after removing `--fp8_base` while using an FP8 checkpoint | Base model no longer uses FP8 loading path, so VRAM increases sharply | Keep `--fp8_base` enabled for FP8 checkpoints (typically with `--mixed_precision bf16`) |
-| Error when combining `--fp8_scaled` with an FP8 checkpoint | `--fp8_scaled` is for quantizing non-FP8 checkpoints | Remove `--fp8_scaled`; keep `--fp8_base` |
+| Error when combining `--fp8_scaled` with an FP8 checkpoint (old behavior) | Checkpoint has FP8 weights without `weight_scale` keys (non-standard format) | Use a standard bf16 checkpoint, or a properly exported FP8 checkpoint that includes scale tensors |
 | Missing `*_ltx2_audio.safetensors` | Audio caching skipped | Re-run latent caching with `--ltx2_mode av` |
 | Gemma connector weights missing | Incorrect checkpoint | Ensure `--ltx2_checkpoint` (or `--ltx2_text_encoder_checkpoint`) contains Gemma connector weights |
 | Gemma OOM | Model too large | Use `--gemma_load_in_8bit` or `--gemma_load_in_4bit` with `--device cuda`, or use `--gemma_safetensors` with an FP8 file |

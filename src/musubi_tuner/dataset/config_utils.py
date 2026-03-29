@@ -5,6 +5,7 @@ from dataclasses import (
     fields,
 )
 import functools
+import os
 import random
 from textwrap import dedent, indent
 import json
@@ -329,6 +330,15 @@ def generate_dataset_group_by_blueprint(
 
         dataset = dataset_klass(**asdict(dataset_blueprint.params))
         datasets.append(dataset)
+
+    # warn about missing data directories
+    for i, dataset in enumerate(datasets):
+        data_dir = getattr(dataset, "image_directory", None) or getattr(dataset, "video_directory", None) or getattr(dataset, "audio_directory", None)
+        if data_dir is not None and not os.path.isdir(data_dir):
+            logger.warning(
+                "Dataset [%d]: data directory does not exist: %s — this dataset will produce zero items",
+                i, data_dir,
+            )
 
     # assertion
     cache_directories = [dataset.cache_directory for dataset in datasets]
