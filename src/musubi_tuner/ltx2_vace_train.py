@@ -42,8 +42,9 @@ from musubi_tuner.ltx2_train_network import (
     ltx2_setup_parser,
     apply_ltx2_tweaks,
 )
-from musubi_tuner.hv_train_network import setup_parser as setup_parser_common, read_config_from_file
+from musubi_tuner.hv_train_network import setup_parser_common, read_config_from_file
 from musubi_tuner.ltx_vace.vace_model import VaceLTXModel, AudioVaceLTXModel, DEFAULT_VACE_LAYERS
+from musubi_tuner.ltx_2.model.transformer.attention import AttentionFunction
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +63,7 @@ class LTX2VaceTrainer(LTX2NetworkTrainer):
         self._audio_vace_layers: Tuple[int, ...] = DEFAULT_VACE_LAYERS
         self._enable_audio_xattn_in_vace: bool = False
         self._video_patchifier = None  # Set during load_transformer for correct VACE patchification
+        self._train_vace_full_model: bool = True
 
     def handle_model_specific_args(self, args: argparse.Namespace) -> None:
         """Add VACE-specific argument handling on top of LTX-2's."""
@@ -86,6 +88,7 @@ class LTX2VaceTrainer(LTX2NetworkTrainer):
 
         self._audio_vace_scale = float(getattr(args, "audio_vace_scale", 1.0))
         self._enable_audio_xattn_in_vace = bool(getattr(args, "enable_audio_xattn_in_vace", False))
+        self._train_vace_full_model = not bool(getattr(args, "network_module", None))
 
         # Default to vace_gaussian weighting if not explicitly set
         if not getattr(args, "weighting_scheme", None):
@@ -126,8 +129,31 @@ class LTX2VaceTrainer(LTX2NetworkTrainer):
 
         # Get model dimensions from the loaded transformer
         model = transformer.model if hasattr(transformer, "model") else transformer
-        dim = getattr(model, "inner_dim", 4096)
-        context_dim = getattr(model, "cross_attention_dim", dim)
+        video_patchify = getattr(model, "patchify_proj", None)
+        if video_patchify is None:
+            raise ValueError("Loaded LTX-2 transformer has no patchify_proj; cannot initialize VACE model")
+
+        dim = int(getattr(video_patchify, "out_features", None) or getattr(model, "inner_dim", 4096))
+        context_dim = dim  # video_args.context is already projected to the video hidden size
+        cross_attention_adaln = bool(getattr(model, "cross_attention_adaln", False))
+        rope_type = getattr(model, "rope_type", None)
+
+        video_blocks = getattr(model, "transformer_blocks", None) or []
+        first_video_block = next((block for block in video_blocks if hasattr(block, "attn1")), None)
+        if first_video_block is not None and hasattr(first_video_block.attn1, "heads"):
+            num_heads = int(first_video_block.attn1.heads)
+            d_head = int(first_video_block.attn1.dim_head)
+            attention_function = getattr(first_video_block.attn1, "attention_function", AttentionFunction.DEFAULT)
+            if rope_type is None:
+                rope_type = getattr(first_video_block.attn1, "rope_type", None)
+        else:
+            num_heads = int(getattr(model, "num_attention_heads", 32))
+            d_head = dim // max(num_heads, 1)
+            attention_function = AttentionFunction.DEFAULT
+
+        if rope_type is None:
+            from musubi_tuner.ltx_2.model.transformer.rope import LTXRopeType
+            rope_type = LTXRopeType.INTERLEAVED
 
         # Determine VAE latent channels for vace_in_dim calculation
         # LTX-2 VAE compresses spatially by 32x, so mask channels = 32*32 = 1024
@@ -144,8 +170,8 @@ class LTX2VaceTrainer(LTX2NetworkTrainer):
                 patch_size_product *= ps
         vace_in_dim = base_vace_channels * patch_size_product
         logger.info(
-            "VACE model init: dim=%d context_dim=%d vace_in_dim=%d (base=%d * patch=%d) num_blocks=%d",
-            dim, context_dim, vace_in_dim, base_vace_channels, patch_size_product, len(self._vace_layers),
+            "VACE model init: dim=%d context_dim=%d heads=%d d_head=%d vace_in_dim=%d (base=%d * patch=%d) num_blocks=%d",
+            dim, context_dim, num_heads, d_head, vace_in_dim, base_vace_channels, patch_size_product, len(self._vace_layers),
         )
 
         # Determine audio_context_dim for video VACE (if audio x-attn enabled)
@@ -168,10 +194,15 @@ class LTX2VaceTrainer(LTX2NetworkTrainer):
             vace_in_dim=vace_in_dim,
             latent_channels=in_channels,
             dim=dim,
+            num_heads=num_heads,
+            d_head=d_head,
             context_dim=context_dim,
             audio_context_dim=audio_context_dim_for_vace,
+            cross_attention_adaln=cross_attention_adaln,
+            rope_type=rope_type,
+            attention_function=attention_function,
         )
-        self._vace_model.initialize_input_proj_from_patchify_proj(model.patchify_proj)
+        self._vace_model.initialize_input_proj_from_patchify_proj(video_patchify)
 
         # Load VACE weights if provided
         vace_path = getattr(args, "vace_model_path", None)
@@ -206,17 +237,25 @@ class LTX2VaceTrainer(LTX2NetworkTrainer):
         enable_audio_vace = audio_vace_path is not None or self._enable_audio_xattn_in_vace
         if audio_patchify is not None and enable_audio_vace:
             audio_in_channels = audio_patchify.weight.shape[1]
-            audio_inner_dim = audio_patchify.weight.shape[0]
-            # Determine audio cross-attention dim from model
-            audio_cross_attn_dim = getattr(model, "audio_cross_attention_dim", audio_inner_dim)
-            # Determine number of heads and d_head for audio
-            audio_num_heads = getattr(model, "audio_num_attention_heads", 32)
-            audio_d_head = audio_inner_dim // audio_num_heads
+            audio_inner_dim = int(audio_patchify.weight.shape[0])
+            audio_context_dim = audio_inner_dim  # audio_args.context is already projected to audio hidden size
+
+            first_audio_block = next((block for block in video_blocks if hasattr(block, "audio_attn1")), None)
+            if first_audio_block is not None and hasattr(first_audio_block.audio_attn1, "heads"):
+                audio_num_heads = int(first_audio_block.audio_attn1.heads)
+                audio_d_head = int(first_audio_block.audio_attn1.dim_head)
+                audio_attention_function = getattr(
+                    first_audio_block.audio_attn1, "attention_function", attention_function
+                )
+            else:
+                audio_num_heads = int(getattr(model, "audio_num_attention_heads", 32))
+                audio_d_head = audio_inner_dim // max(audio_num_heads, 1)
+                audio_attention_function = attention_function
 
             audio_vace_in_dim = 2 * audio_in_channels + 1  # 257 for default 128-ch audio
             logger.info(
-                "Audio VACE model init: dim=%d context_dim=%d vace_in_dim=%d num_blocks=%d",
-                audio_inner_dim, audio_cross_attn_dim, audio_vace_in_dim, len(self._audio_vace_layers),
+                "Audio VACE model init: dim=%d context_dim=%d heads=%d d_head=%d vace_in_dim=%d num_blocks=%d",
+                audio_inner_dim, audio_context_dim, audio_num_heads, audio_d_head, audio_vace_in_dim, len(self._audio_vace_layers),
             )
 
             self._audio_vace_model = AudioVaceLTXModel(
@@ -226,7 +265,10 @@ class LTX2VaceTrainer(LTX2NetworkTrainer):
                 dim=audio_inner_dim,
                 num_heads=audio_num_heads,
                 d_head=audio_d_head,
-                context_dim=audio_cross_attn_dim,
+                context_dim=audio_context_dim,
+                cross_attention_adaln=cross_attention_adaln,
+                rope_type=rope_type,
+                attention_function=audio_attention_function,
             )
             self._audio_vace_model.initialize_input_proj_from_audio_patchify_proj(audio_patchify)
 
@@ -276,12 +318,16 @@ class LTX2VaceTrainer(LTX2NetworkTrainer):
             self._vace_model = self._vace_model.to(accelerator.device)
             self._vace_model.train()
 
-            # Make VACE parameters trainable
+            # In adapter mode (LoRA/LyCORIS), the external network module owns the trainable
+            # parameters. Keep the base VACE backbone frozen so we do not optimize both.
             for param in self._vace_model.parameters():
-                param.requires_grad = True
+                param.requires_grad = self._train_vace_full_model
 
             vace_params = sum(p.numel() for p in self._vace_model.parameters() if p.requires_grad)
-            logger.info("VACE trainable parameters: %d (%.2f MB)", vace_params, vace_params * 2 / 1024 / 1024)
+            if self._train_vace_full_model:
+                logger.info("VACE trainable parameters: %d (%.2f MB)", vace_params, vace_params * 2 / 1024 / 1024)
+            else:
+                logger.info("VACE adapter mode: base VACE parameters remain frozen; optimizer params come from network module")
 
         if self._audio_vace_model is not None:
             if getattr(args, "gradient_checkpointing", False):
@@ -291,13 +337,20 @@ class LTX2VaceTrainer(LTX2NetworkTrainer):
             self._audio_vace_model.train()
 
             for param in self._audio_vace_model.parameters():
-                param.requires_grad = True
+                param.requires_grad = self._train_vace_full_model
 
             audio_vace_params = sum(p.numel() for p in self._audio_vace_model.parameters() if p.requires_grad)
-            logger.info("Audio VACE trainable parameters: %d (%.2f MB)", audio_vace_params, audio_vace_params * 2 / 1024 / 1024)
+            if self._train_vace_full_model:
+                logger.info("Audio VACE trainable parameters: %d (%.2f MB)", audio_vace_params, audio_vace_params * 2 / 1024 / 1024)
+            else:
+                logger.info(
+                    "Audio VACE adapter mode: base audio VACE parameters remain frozen; optimizer params come from network module"
+                )
 
     def get_vace_trainable_params(self) -> list[torch.nn.Parameter]:
         """Return VACE trainable parameters for optimizer registration."""
+        if not self._train_vace_full_model:
+            return []
         params = []
         if self._vace_model is not None:
             params.extend(p for p in self._vace_model.parameters() if p.requires_grad)
@@ -308,6 +361,8 @@ class LTX2VaceTrainer(LTX2NetworkTrainer):
     def post_save_checkpoint_hook(self, args, ckpt_file, ckpt_name, accelerator, force_sync_upload=False):
         """Save VACE model weights alongside each LoRA checkpoint."""
         super().post_save_checkpoint_hook(args, ckpt_file, ckpt_name, accelerator, force_sync_upload)
+        if not self._train_vace_full_model:
+            return
         if self._vace_model is not None:
             from safetensors.torch import save_file
             vace_path = ckpt_file.replace(".safetensors", "_vace.safetensors")
@@ -363,6 +418,15 @@ class LTX2VaceTrainer(LTX2NetworkTrainer):
 
         audio_vace_mask = batch.get("audio_vace_mask")
 
+        if audio_vace_latents is not None and self._audio_vace_model is None:
+            if not getattr(self, "_warned_missing_audio_vace_model", False):
+                logger.warning(
+                    "Batch contains audio_vace_latents but audio VACE model was not initialized. "
+                    "Audio VACE conditioning will be ignored. "
+                    "Provide --audio_vace_model_path or enable --enable_audio_xattn_in_vace."
+                )
+                self._warned_missing_audio_vace_model = True
+
         if audio_vace_latents is not None and self._audio_vace_model is not None:
             audio_vace_latents = audio_vace_latents.to(device=accelerator.device, dtype=network_dtype)
 
@@ -395,6 +459,10 @@ class LTX2VaceTrainer(LTX2NetworkTrainer):
 
 def vace_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     """Add VACE-specific arguments."""
+    # Override the shared LTX-2 parser default. VACE training should target VACE
+    # modules unless the user explicitly selects a different preset.
+    parser.set_defaults(lora_target_preset=None)
+
     vace_group = parser.add_argument_group("VACE Training")
     vace_group.add_argument(
         "--vace_model_path",
@@ -484,10 +552,31 @@ def main() -> None:
     args.allow_custom_weighting_scheme = True
     apply_ltx2_tweaks(args)
 
+    # Map ltx2_checkpoint → dit/vae (base trainer expects args.dit)
+    if getattr(args, "dit", None) is not None and args.dit != args.ltx2_checkpoint:
+        logger.warning("Ignoring --dit for LTX-2; using --ltx2_checkpoint instead")
+    args.dit = args.ltx2_checkpoint
+
+    if getattr(args, "vae", None) is not None and args.vae != args.ltx2_checkpoint:
+        logger.warning("Ignoring --vae for LTX-2; using --ltx2_checkpoint instead")
+    args.vae = args.ltx2_checkpoint
+
+    if args.vae_dtype is None:
+        args.vae_dtype = "bfloat16"
+
     # Default to vace LoRA preset if not specified
     if not getattr(args, "lora_target_preset", None):
         args.lora_target_preset = "vace"
         logger.info("Defaulting to 'vace' LoRA target preset")
+
+    # Inject lora_target_preset into network_args
+    lora_target_preset = getattr(args, "lora_target_preset", None)
+    if lora_target_preset is not None:
+        if args.network_args is None:
+            args.network_args = []
+        if not any(arg.startswith("lora_target_preset=") for arg in args.network_args):
+            args.network_args.append(f"lora_target_preset={lora_target_preset}")
+            logger.info(f"Using LoRA target preset: {lora_target_preset}")
 
     trainer = LTX2VaceTrainer()
     trainer.train(args)

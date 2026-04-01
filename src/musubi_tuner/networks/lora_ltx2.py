@@ -740,7 +740,11 @@ LTX2_INCLUDE_PATTERNS_FULL = None  # None means no filtering, all Linear layers 
 
 # vace: VACE context encoder blocks only (attention + FFN)
 # For VACE training where the base DiT is frozen and only the VACE encoder trains.
+# Include the skip/output projections because they are zero-initialized; if they are
+# omitted in adapter mode, VACE hints stay zero and training has no effect.
 LTX2_INCLUDE_PATTERNS_VACE = [
+    r".*vace_blocks\.\d+\.before_proj$",
+    r".*vace_blocks\.\d+\.after_proj$",
     r".*vace_blocks\.\d+\.attn1\.to_k$",
     r".*vace_blocks\.\d+\.attn1\.to_q$",
     r".*vace_blocks\.\d+\.attn1\.to_v$",
@@ -749,6 +753,10 @@ LTX2_INCLUDE_PATTERNS_VACE = [
     r".*vace_blocks\.\d+\.attn2\.to_q$",
     r".*vace_blocks\.\d+\.attn2\.to_v$",
     r".*vace_blocks\.\d+\.attn2\.to_out\.0$",
+    r".*vace_blocks\.\d+\.audio_attn\.to_k$",
+    r".*vace_blocks\.\d+\.audio_attn\.to_q$",
+    r".*vace_blocks\.\d+\.audio_attn\.to_v$",
+    r".*vace_blocks\.\d+\.audio_attn\.to_out\.0$",
     r".*vace_blocks\.\d+\.ff\.net\.0\.proj$",
     r".*vace_blocks\.\d+\.ff\.net\.2$",
 ]

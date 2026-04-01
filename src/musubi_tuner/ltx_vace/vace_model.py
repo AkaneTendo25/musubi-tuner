@@ -18,6 +18,7 @@ import torch.nn as nn
 import torch.utils.checkpoint as checkpoint
 
 from musubi_tuner.ltx_2.model.transformer.attention import Attention, AttentionFunction
+from musubi_tuner.ltx_2.model.transformer.adaln import adaln_embedding_coefficient
 from musubi_tuner.ltx_2.model.transformer.feed_forward import FeedForward
 from musubi_tuner.ltx_2.model.transformer.rope import LTXRopeType
 from musubi_tuner.ltx_2.utils import rms_norm
@@ -53,11 +54,13 @@ class VaceLTXBlock(nn.Module):
         rope_type: LTXRopeType = LTXRopeType.INTERLEAVED,
         attention_function: AttentionFunction = AttentionFunction.DEFAULT,
         audio_context_dim: int | None = None,
+        timestep_ada_embed_count: int = 6,
     ):
         super().__init__()
         self.block_id = block_id
         self.dim = dim
         self.norm_eps = norm_eps
+        self.timestep_ada_embed_count = timestep_ada_embed_count
 
         # Self-attention
         self.attn1 = Attention(
@@ -192,7 +195,7 @@ class VaceLTXBlock(nn.Module):
         Supports both standard tensor and optimized tuple formats (matching
         BasicAVTransformerBlock.get_ada_values).
         """
-        num_ada_params = scale_shift_table.shape[0]
+        num_ada_params = self.timestep_ada_embed_count
 
         if isinstance(timestep, tuple) and len(timestep) == 4:
             unique_emb, inverse_indices_1d, orig_batch_size, orig_num_tokens = timestep
@@ -263,6 +266,7 @@ class VaceLTXModel(nn.Module):
         rope_type: LTXRopeType = LTXRopeType.INTERLEAVED,
         attention_function: AttentionFunction = AttentionFunction.DEFAULT,
         audio_context_dim: int | None = None,
+        cross_attention_adaln: bool = False,
     ):
         super().__init__()
         self.vace_layers = tuple(vace_layers)
@@ -271,6 +275,7 @@ class VaceLTXModel(nn.Module):
         self.dim = dim
         self.audio_context_dim = audio_context_dim
         self.vace_layers_mapping = {layer_id: idx for idx, layer_id in enumerate(self.vace_layers)}
+        self.timestep_ada_embed_count = adaln_embedding_coefficient(cross_attention_adaln)
 
         # Project VACE control channels to model dim.
         # Spatial patchification is handled externally by the DiT's patchify_proj or
@@ -291,6 +296,7 @@ class VaceLTXModel(nn.Module):
                 rope_type=rope_type,
                 attention_function=attention_function,
                 audio_context_dim=audio_context_dim,
+                timestep_ada_embed_count=self.timestep_ada_embed_count,
             )
             for i in range(len(self.vace_layers))
         ])
@@ -450,6 +456,7 @@ class AudioVaceLTXModel(nn.Module):
         norm_eps: float = 1e-6,
         rope_type: LTXRopeType = LTXRopeType.INTERLEAVED,
         attention_function: AttentionFunction = AttentionFunction.DEFAULT,
+        cross_attention_adaln: bool = False,
     ):
         super().__init__()
         self.vace_layers = tuple(vace_layers)
@@ -457,6 +464,7 @@ class AudioVaceLTXModel(nn.Module):
         self.latent_channels = latent_channels
         self.dim = dim
         self.vace_layers_mapping = {layer_id: idx for idx, layer_id in enumerate(self.vace_layers)}
+        self.timestep_ada_embed_count = adaln_embedding_coefficient(cross_attention_adaln)
 
         # Project audio VACE control channels to audio model dim.
         # vace_in_dim (257 = 2*128 + 1) -> dim (2048).
@@ -474,6 +482,7 @@ class AudioVaceLTXModel(nn.Module):
                 norm_eps=norm_eps,
                 rope_type=rope_type,
                 attention_function=attention_function,
+                timestep_ada_embed_count=self.timestep_ada_embed_count,
             )
             for i in range(len(self.vace_layers))
         ])

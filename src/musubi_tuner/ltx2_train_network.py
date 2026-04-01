@@ -6929,7 +6929,7 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         "--lora_target_preset",
         type=str,
         default="t2v",
-        choices=["t2v", "v2v", "audio", "audio_ref_only_ic", "full"],
+        choices=["t2v", "v2v", "audio", "audio_ref_only_ic", "full", "vace"],
         help=(
             "LoRA target preset: "
             "'t2v' = text-to-video (attention only, official default), "
@@ -6937,6 +6937,7 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
             "'audio' = audio-only (audio attn/ffn + audio-side cross-modal), "
             "'audio_ref_only_ic' = ID-LoRA-style AV preset "
             "(audio attn/ffn + audio/video cross-modal both directions), "
+            "'vace' = VACE blocks only, "
             "'full' = all linear layers. "
             "Can be overridden by --network_args include_patterns=..."
         ),
