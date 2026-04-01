@@ -122,7 +122,7 @@
 							<FormField label="Scale W Norms" type="number" value={t.scale_weight_norms ?? ''} oninput={(e) => update('scale_weight_norms', e.target.value ? Number(e.target.value) : null)} placeholder="None" step="0.1" tooltip="Max norm for weight scaling" />
 							<FormField label="Caption Drop" type="number" value={t.caption_dropout_rate ?? 0} oninput={(e) => update('caption_dropout_rate', Number(e.target.value))} step="0.05" min={0} max={1} tooltip="Caption dropout rate for CFG training" />
 						</div>
-						<PathInput label="Network Weights" value={t.network_weights || ''} oninput={(e) => update('network_weights', e.target.value)} showFiles tooltip="Resume from existing LoRA weights" />
+						<PathInput label="Network Weights" value={t.network_weights || ''} oninput={(e) => update('network_weights', e.target.value)} showFiles tooltip="Warm-start from existing LoRA weights" />
 						<PathInput label="LyCORIS Config" value={t.lycoris_config || ''} oninput={(e) => update('lycoris_config', e.target.value)} showFiles tooltip="Path to LyCORIS TOML config (enables LyCORIS mode)" />
 						<FormSelect label="LyCORIS Quant Check" value={t.lycoris_quantized_base_check_mode || 'warn'} options={['off', 'warn', 'error']} onchange={(e) => update('lycoris_quantized_base_check_mode', e.target.value)} tooltip="Check for quantized base with LyCORIS" />
 						<div class="flex flex-wrap gap-x-4 gap-y-1">

@@ -1720,7 +1720,22 @@ class NetworkTrainer:
     def control_training(self) -> bool:
         return self._control_training
 
+    def _resolve_network_module(self, network_module):
+        if isinstance(network_module, str):
+            return importlib.import_module(network_module)
+        return network_module
+
     def convert_weight_keys(self, weights_sd: dict[str, torch.Tensor], network_module: lora_module):
+        if not weights_sd:
+            return weights_sd
+
+        network_module_obj = self._resolve_network_module(network_module)
+        module_converter = getattr(network_module_obj, "convert_weight_keys", None)
+        if callable(module_converter):
+            converted = module_converter(weights_sd)
+            if converted is not None:
+                return converted
+
         keys = list(weights_sd.keys())
         if keys[0].startswith("lora_"):
             return weights_sd  # default format
@@ -1729,6 +1744,13 @@ class NetworkTrainer:
             logger.info("converting LoRA weights from diffusers format to default format")
             return convert_lora.convert_from_diffusers("lora_unet_", weights_sd)
         return weights_sd  # unknown format, return as is
+
+    def load_network_weights(self, file: str, network_module: lora_module) -> dict[str, torch.Tensor]:
+        if os.path.splitext(file)[1] == ".safetensors":
+            weights_sd = load_file(file)
+        else:
+            weights_sd = torch.load(file, map_location="cpu")
+        return self.convert_weight_keys(weights_sd, network_module)
 
     def process_sample_prompts(
         self,
@@ -2354,8 +2376,7 @@ class NetworkTrainer:
 
                 accelerator.print(f"merging module: {weight_path} with multiplier {multiplier}")
 
-                weights_sd = load_file(weight_path)
-                weights_sd = self.convert_weight_keys(weights_sd, args.network_module)
+                weights_sd = self.load_network_weights(weight_path, network_module)
                 module = network_module.create_arch_network_from_weights(
                     multiplier, weights_sd, unet=transformer, for_inference=True
                 )
@@ -2384,7 +2405,7 @@ class NetworkTrainer:
 
         if args.dim_from_weights:
             logger.info(f"Loading network from weights: {args.dim_from_weights}")
-            weights_sd = load_file(args.dim_from_weights)
+            weights_sd = self.load_network_weights(args.dim_from_weights, network_module)
             network, _ = network_module.create_arch_network_from_weights(1, weights_sd, unet=transformer)
         else:
             # We use the name create_arch_network for compatibility with LyCORIS
@@ -2423,7 +2444,8 @@ class NetworkTrainer:
 
         if args.network_weights is not None:
             # FIXME consider alpha of weights: this assumes that the alpha is not changed
-            info = network.load_weights(args.network_weights)
+            weights_sd = self.load_network_weights(args.network_weights, network_module)
+            info = network.load_state_dict(weights_sd, False)
             accelerator.print(f"load network weights from {args.network_weights}: {info}")
 
         # LyCORIS + FP8 backend compatibility:

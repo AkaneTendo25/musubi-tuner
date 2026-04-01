@@ -10,6 +10,7 @@ import torch
 import torch.nn as nn
 
 import musubi_tuner.networks.lora as lora
+from musubi_tuner.ltx_2.convert_lora_to_comfy import convert_lora_from_comfy_state_dict, is_comfy_lora_state_dict
 from musubi_tuner.ltx_2.components.patchifiers import get_pixel_coords
 from musubi_tuner.ltx_2.guidance.perturbations import BatchedPerturbationConfig
 from musubi_tuner.ltx_2.model.transformer.modality import Modality
@@ -17,6 +18,14 @@ from musubi_tuner.ltx_2.types import AudioLatentShape, SpatioTemporalScaleFactor
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
+
+
+def convert_weight_keys(weights_sd: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    """Normalize external LTX-2 LoRA weights into native training keys."""
+    if is_comfy_lora_state_dict(weights_sd):
+        logger.info("converting LTX-2 LoRA weights from ComfyUI format to native training format")
+        return convert_lora_from_comfy_state_dict(weights_sd)
+    return weights_sd
 
 
 def _split_av_context(
