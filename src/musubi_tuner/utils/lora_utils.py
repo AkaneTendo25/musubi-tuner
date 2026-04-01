@@ -281,10 +281,12 @@ def load_safetensors_with_fp8_optimization_and_hook(
 
                 # Detect pre-quantized FP8 checkpoint scale keys
                 checkpoint_scale_keys = set(k for k in all_keys if k.endswith(".weight_scale") or k.endswith(".input_scale"))
+                # Always dequantize to a compute-capable dtype (not FP8 — CPU doesn't support FP8 arithmetic)
+                deq_dtype = dit_weight_dtype if dit_weight_dtype is not None and dit_weight_dtype.itemsize > 1 else torch.bfloat16
                 if checkpoint_scale_keys:
                     logger.info(
                         f"Detected pre-quantized FP8 checkpoint with {len(checkpoint_scale_keys)} scale keys. "
-                        f"Will dequantize to {dit_weight_dtype or 'bfloat16'} during loading."
+                        f"Will dequantize to {deq_dtype} during loading."
                     )
 
                 for key in tqdm(all_keys, desc=f"Loading {os.path.basename(model_file)}", leave=False):
@@ -302,12 +304,11 @@ def load_safetensors_with_fp8_optimization_and_hook(
                             ckpt_scale_key = key.replace(".weight", ".weight_scale")
                             if ckpt_scale_key in checkpoint_scale_keys:
                                 ckpt_scale = original_f.get_tensor(ckpt_scale_key).to(value.device)
-                                target_dt = dit_weight_dtype or torch.bfloat16
-                                value = value.to(target_dt) * ckpt_scale
+                                value = value.to(deq_dtype) * ckpt_scale
                             else:
                                 logger.warning(
                                     f"Layer {key} is in {value.dtype} format without a weight_scale. "
-                                    f"Casting to {dit_weight_dtype or torch.bfloat16} without dequantization — values may be incorrect."
+                                    f"Casting to {deq_dtype} without dequantization — values may be incorrect."
                                 )
 
                         if weight_hook is not None:
