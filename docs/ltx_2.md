@@ -78,6 +78,7 @@ Caching scripts (`ltx2_cache_latents.py`, `ltx2_cache_text_encoder_outputs.py`) 
   - [4a. Text-Only Mode](#4a-text-only-mode)
   - [4b. Reference Mode](#4b-reference-mode)
   - [Slider Tips](#slider-tips)
+- [Auto-Installer Script (WIP)](#auto-installer-script-wip)
 - [References](#references)
 
 ---
@@ -1137,7 +1138,7 @@ CLAP model is lazy-loaded on first sample, offloaded to CPU between uses.
 
 See also the [timestep bucketing documentation](./advanced_config.md) for advanced timestep bucketing options.
 
-- `--timestep_sampling shifted_logit_normal`: Default LTX-2 method. Uses a shifted logit-normal distribution where the shift is computed based on sequence length (frames × height × width).
+- `--timestep_sampling shifted_logit_normal`: Default LTX-2 method. Uses a shifted logit-normal distribution where the shift is computed from latent sequence length. In normal video/AV training this means `latent_frames × latent_height × latent_width`; only `--ltx2_mode audio` uses the audio-only sequence-length path described below.
 - `--timestep_sampling uniform`: Uniform sampling from [0, 1].
 - `--logit_std`: Standard deviation for the logit-normal distribution (default: 1.0). Only used with `shifted_logit_normal`.
 - `--min_timestep` / `--max_timestep`: Optional timestep range constraints.
@@ -1146,11 +1147,12 @@ See also the [timestep bucketing documentation](./advanced_config.md) for advanc
   - `stretched`: Normalizes samples between the 0.5th and 99.9th percentiles of the distribution, reflects values below `eps` for numerical stability, and replaces a fraction of samples with uniform draws to prevent distribution collapse at high token counts.
 - `--shifted_logit_eps`: Reflection floor and uniform lower bound for `stretched` mode (default: `1e-3`).
 - `--shifted_logit_uniform_prob`: Fraction of samples replaced with uniform `[eps, 1]` draws (default: `0.1`).
-- `--shifted_logit_shift`: Override the auto-calculated shift value. Lower values (e.g., `0.0`) produce a symmetric distribution centered on medium noise (σ≈0.5) for learning fine details. Higher values (e.g., `2.0`) heavily right-skew the distribution toward high noise (σ≈0.9+) for learning global structure. If unset, it is auto-calculated from sequence length.
+- `--shifted_logit_shift`: Override the auto-calculated shift value. Lower values (e.g., `0.0`) produce a symmetric distribution centered on medium noise (σ≈0.5) for learning fine details. Higher values (e.g., `2.0`) heavily right-skew the distribution toward high noise (σ≈0.9+) for learning global structure. If unset, it is computed dynamically from sequence length. In the current trainer implementation, non-audio training uses the raw linear formula below (so short or long sequences can fall outside the anchor values), while `--ltx2_mode audio` clamps the auto-computed shift to `[0.95, 2.05]`.
 
 > [!NOTE]
-> The `shifted_logit_normal` shift is linearly interpolated from 0.95 (at 1024 tokens) to 2.05 (at 4096 tokens) based on sequence length.
+> The `shifted_logit_normal` auto-shift uses a linear formula anchored at 0.95 for 1024 tokens and 2.05 for 4096 tokens, based on sequence length. The current non-audio trainer extrapolates this formula outside those anchor points for shorter/longer sequences; for example, a single 768x768 image has latent sequence length `1 x (768/32) x (768/32) = 576`, which gives shift `0.7896`. In `--ltx2_mode audio`, the auto-computed shift is clamped to `[0.95, 2.05]`.
 > In `--ltx2_mode audio`, `shifted_logit_normal` still needs a sequence length to compute the shift, but there is no real video spatial dimension. Using full video resolution would inflate the sequence length and skew the shift upward. Instead, `--audio_only_sequence_resolution` (default `64`) provides a small fixed spatial footprint (4 tokens/frame), keeping the shift dominated by the temporal dimension (audio duration/FPS) which actually matters.
+> In joint AV training (`--ltx2_mode av`), the auto shift still comes from the video latent geometry; the presence of audio latents does not change the shift calculation.
 
 #### LoRA Targets
 
@@ -1588,6 +1590,8 @@ Requires `--save_state` to be enabled. State directories contain optimizer, sche
 | `--reset_optimizer` | Clear optimizer momentum/variance on resume, keep model weights only |
 | `--reset_optimizer_params` | Reset optimizer param groups (lr, weight_decay, etc.) to current CLI values on resume, keep momentum/variance |
 | `--reset_dataloader` | Skip mid-epoch batch skip, restart epoch from beginning |
+
+**Changing learning rate on resume:** When you resume from a saved state, the optimizer's learning rate is restored from the checkpoint — any new `--learning_rate` value on the command line is silently ignored. To apply a new learning rate, add `--reset_optimizer_params`. This resets lr, weight_decay, and other optimizer param-group settings to your current CLI values while keeping the accumulated momentum/variance intact.
 
 Mid-epoch checkpoints record `step_in_epoch` in `resume_metadata.json`. On resume, already-processed batches are skipped to keep global step consistent. `--reset_dataloader` disables this.
 
@@ -2219,4 +2223,32 @@ Notes:
 **Cloud Platforms**
 - [fal.ai LTX-2 Trainer](https://fal.ai/models/fal-ai/ltx2-video-trainer) — Cloud-based LTX-2 LoRA training via API (~$0.005/step)
 - [WaveSpeedAI LTX-2](https://wavespeed.ai/landing/ltx2) — Hosted LTX-2 inference (T2V, I2V, video extend, lipsync)
+
+---
+
+## Auto-Installer Script (WIP)
+
+> [!WARNING]
+> This script is a **work in progress**. It has been tested on Windows 11 but may not cover every edge case. Please report issues.
+
+An all-in-one PowerShell installer is available at [`scripts/install.ps1`](https://github.com/AkaneTendo25/musubi-tuner/blob/ltx-2-dev/scripts/install.ps1). It automates the full setup: detecting/installing prerequisites (Git, Python, Node.js via winget/choco/scoop), cloning the repository, creating a virtual environment, installing PyTorch + all Python dependencies, optionally building the dashboard frontend, and creating a desktop shortcut to launch the dashboard.
+
+**Quick start (one-liner):**
+
+```powershell
+irm https://raw.githubusercontent.com/AkaneTendo25/musubi-tuner/ltx-2-dev/scripts/install.ps1 | iex
+```
+
+This downloads and runs the installer with default settings (CUDA 12.8, Python 3.12, `ltx-2-dev` branch). An interactive menu lets you toggle which steps to run (install Git, clone repo, create venv, etc.).
+
+**With custom parameters** — save the script locally first:
+
+```powershell
+irm https://raw.githubusercontent.com/AkaneTendo25/musubi-tuner/ltx-2-dev/scripts/install.ps1 -OutFile install.ps1
+.\install.ps1 -Cuda cu124 -PythonVersion 3.11 -NonInteractive
+```
+
+Available parameters: `-InstallRoot`, `-Branch`, `-Cuda` (`cu124`/`cu128`/`cu130`/`cpu`), `-PythonVersion` (`3.10`-`3.13`), `-Port`, `-DashboardHost`, `-NonInteractive`, `-PreflightOnly`.
+
+The script writes a timestamped log to `%TEMP%` and prints a support bundle on failure for easier debugging.
 
