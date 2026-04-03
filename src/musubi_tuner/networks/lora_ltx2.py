@@ -214,6 +214,8 @@ class LTX2Wrapper(nn.Module):
     ) -> tuple:
         """Run attached connectors on pre-connector features. Returns (video_ctx, audio_ctx, mask)."""
         dtype = video_features.dtype
+        if attention_mask.dtype == torch.bool:
+            attention_mask = attention_mask.to(torch.int64)
         additive_mask = (attention_mask - 1).to(dtype).reshape(
             (attention_mask.shape[0], 1, -1, attention_mask.shape[-1])
         ) * torch.finfo(dtype).max

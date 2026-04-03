@@ -103,7 +103,9 @@ def main() -> None:
     audio_decoder.eval()
     vocoder.eval()
 
-    audio_latents = audio_latents.to(device=device, dtype=dtype)
+    first_param = next(audio_decoder.parameters(), None)
+    decode_dtype = first_param.dtype if first_param is not None else audio_latents.dtype
+    audio_latents = audio_latents.to(device=device, dtype=decode_dtype)
     with torch.no_grad():
         decoded_audio = audio_decoder(audio_latents)
         audio_waveform = vocoder(decoded_audio).squeeze(0)

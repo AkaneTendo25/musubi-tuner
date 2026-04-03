@@ -64,6 +64,8 @@ class GemmaTextEncoderModelBase(torch.nn.Module):
         return self.feature_extractor_linear(hidden_states, attention_mask, padding_side=padding_side)
 
     def _convert_to_additive_mask(self, attention_mask: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+        if attention_mask.dtype == torch.bool:
+            attention_mask = attention_mask.to(torch.int64)
         return (attention_mask - 1).to(dtype).reshape((attention_mask.shape[0], 1, -1, attention_mask.shape[-1])) * torch.finfo(
             dtype
         ).max

@@ -201,35 +201,39 @@ def _upcast_and_round(
         return weight.to(dtype)
 
 
+class Fp8CastLinear(torch.nn.Linear):
+    """Linear layer that upcasts fp8 weights to the input dtype during forward."""
+
+    _with_stochastic_rounding: bool
+    _seed: int
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:  # noqa: A002, type: ignore[override]
+        w_up = _upcast_and_round(self.weight, input.dtype, self._with_stochastic_rounding, self._seed)
+        b_up = (
+            _upcast_and_round(self.bias, input.dtype, self._with_stochastic_rounding, self._seed)
+            if self.bias is not None
+            else None
+        )
+        return torch.nn.functional.linear(input, w_up, b_up)
+
+
 def replace_fwd_with_upcast(layer: torch.nn.Linear, with_stochastic_rounding: bool = False, seed: int = 0) -> None:
     """
-    Replace linear.forward and rms_norm.forward with a version that:
-      - upcasts weight and bias to input's dtype
-      - returns F.linear or F.rms_norm calculated in that dtype
+    Reassign the layer class so forward stays defined at the class level.
+    This avoids per-instance closure monkey-patching, which causes graph breaks
+    under torch.compile.
     """
-
-    layer.original_forward = layer.forward
-
-    def new_linear_forward(*args, **_kwargs) -> torch.Tensor:
-        # assume first arg is the input tensor
-        x = args[0]
-        w_up = _upcast_and_round(layer.weight, x.dtype, with_stochastic_rounding, seed)
-        b_up = None
-
-        if layer.bias is not None:
-            b_up = _upcast_and_round(layer.bias, x.dtype, with_stochastic_rounding, seed)
-
-        return torch.nn.functional.linear(x, w_up, b_up)
-
-    layer.forward = new_linear_forward
+    layer.__class__ = Fp8CastLinear
+    layer._with_stochastic_rounding = with_stochastic_rounding
+    layer._seed = seed
 
 
 def amend_forward_with_upcast(
     model: torch.nn.Module, with_stochastic_rounding: bool = False, seed: int = 0
 ) -> torch.nn.Module:
     """
-    Replace the forward method of the model's Linear and RMSNorm layers to forward
-    with upcast and optional stochastic rounding.
+    Replace the forward method of the model's Linear layers to forward with
+    upcast and optional stochastic rounding.
     """
     for m in model.modules():
         if isinstance(m, (torch.nn.Linear)):

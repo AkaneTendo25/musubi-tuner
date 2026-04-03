@@ -218,24 +218,19 @@ class AttentionFunction(Enum):
     FLASH_ATTENTION_3 = "flash_attention_3"
     DEFAULT = "default"
 
-    def __call__(
-        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, heads: int, mask: torch.Tensor | None = None
-    ) -> torch.Tensor:
+    def to_callable(self) -> AttentionCallable:
+        """Resolve enums at init time so torch.compile can trace the attention call cleanly."""
         if self is AttentionFunction.PYTORCH:
-            return PytorchAttention()(q, k, v, heads, mask)
+            return PytorchAttention()
         elif self is AttentionFunction.XFORMERS:
-            return XFormersAttention()(q, k, v, heads, mask)
+            return XFormersAttention()
         elif self is AttentionFunction.FLASH_ATTENTION_2:
-            return FlashAttention2()(q, k, v, heads, mask)
+            return FlashAttention2()
         elif self is AttentionFunction.FLASH_ATTENTION_3:
-            return FlashAttention3()(q, k, v, heads, mask)
+            return FlashAttention3()
         else:
             # Default behavior: XFormers if installed else - PyTorch
-            return (
-                XFormersAttention()(q, k, v, heads, mask)
-                if memory_efficient_attention is not None
-                else PytorchAttention()(q, k, v, heads, mask)
-            )
+            return XFormersAttention() if memory_efficient_attention is not None else PytorchAttention()
 
 
 class Attention(torch.nn.Module):
@@ -252,7 +247,11 @@ class Attention(torch.nn.Module):
     ) -> None:
         super().__init__()
         self.rope_type = rope_type
-        self.attention_function = attention_function
+        self.attention_function = (
+            attention_function.to_callable()
+            if isinstance(attention_function, AttentionFunction)
+            else attention_function
+        )
 
         inner_dim = dim_head * heads
         context_dim = query_dim if context_dim is None else context_dim
