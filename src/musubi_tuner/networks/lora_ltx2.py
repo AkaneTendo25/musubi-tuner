@@ -20,12 +20,16 @@ logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
 
-def convert_weight_keys(weights_sd: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-    """Normalize external LTX-2 LoRA weights into native training keys."""
+def convert_weight_keys(weights_sd: Dict[str, torch.Tensor]) -> Optional[Dict[str, torch.Tensor]]:
+    """Normalize external LTX-2 LoRA weights into native training keys.
+
+    Returns converted state dict for recognized formats, or None to let the
+    generic fallback in hv_train_network handle it.
+    """
     if is_comfy_lora_state_dict(weights_sd):
         logger.info("converting LTX-2 LoRA weights from ComfyUI format to native training format")
         return convert_lora_from_comfy_state_dict(weights_sd)
-    return weights_sd
+    return None
 
 
 def _split_av_context(

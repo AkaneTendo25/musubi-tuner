@@ -681,7 +681,7 @@ class LTXModel(torch.nn.Module):
 
                 for mod in block.modules():
                     if isinstance(mod, Attention):
-                        mod.attention_function = AttentionFunction.PYTORCH
+                        mod.attention_function = AttentionFunction.PYTORCH.to_callable()
                 block._forced_pytorch_attn = True
                 logger.info("Forced PyTorch attention for swapped block %s", block_idx)
 

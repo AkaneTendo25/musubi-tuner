@@ -278,8 +278,10 @@ class LTX2SamplingMixin:
 
     @staticmethod
     def _override_attention_function(transformer, attention_function):
-        from musubi_tuner.ltx_2.model.transformer.attention import Attention
+        from musubi_tuner.ltx_2.model.transformer.attention import Attention, AttentionFunction
 
+        if isinstance(attention_function, AttentionFunction):
+            attention_function = attention_function.to_callable()
         overrides = []
         for module in transformer.modules():
             if isinstance(module, Attention):

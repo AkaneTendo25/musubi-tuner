@@ -539,7 +539,7 @@ class BasicAVTransformerBlock(torch.nn.Module):
             original_fn = None
             if force_pytorch:
                 original_fn = getattr(attn_module, "attention_function", None)
-                attn_module.attention_function = AttentionFunction.PYTORCH
+                attn_module.attention_function = AttentionFunction.PYTORCH.to_callable()
             try:
                 if force_fp32:
                     x_fp32 = x_in.to(torch.float32)
