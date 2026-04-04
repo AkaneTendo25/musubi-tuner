@@ -249,8 +249,18 @@ class TransformerArgsPreprocessor:
                 adaln=self.prompt_adaln,
                 use_unique_optimization=False,
             )
-        context, attention_mask = self._prepare_context(modality.context, x, modality.context_mask)
-        attention_mask = self._prepare_attention_mask(attention_mask, modality.latent.dtype)
+        if modality.enabled:
+            context, attention_mask = self._prepare_context(modality.context, x, modality.context_mask)
+            attention_mask = self._prepare_attention_mask(attention_mask, modality.latent.dtype)
+        else:
+            # Disabled modality: context is never used in transformer blocks (they check
+            # TransformerArgs.enabled), so create a placeholder with the correct inner_dim
+            # to avoid dimension validation failures — e.g. audio-only mode on LTX 2.3
+            # where the video preprocessor has no caption_projection but receives
+            # audio-dimension context.
+            batch_size = x.shape[0]
+            context = torch.zeros(batch_size, 1, x.shape[-1], device=x.device, dtype=x.dtype)
+            attention_mask = None
         self_attention_mask = self._prepare_self_attention_mask(modality.attention_mask, modality.latent.dtype)
         pe = self._prepare_positional_embeddings(
             positions=modality.positions,
