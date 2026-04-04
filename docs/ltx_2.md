@@ -62,6 +62,7 @@ Caching scripts (`ltx2_cache_latents.py`, `ltx2_cache_text_encoder_outputs.py`) 
     - [Two-Stage Sampling (WIP)](#two-stage-sampling-wip)
     - [Checkpoint Output Format](#checkpoint-output-format)
     - [Resuming Training](#resuming-training)
+- [Merge LoRA into Base Model](#merge-lora-into-base-model)
 - [Merge LTX-2 LoRAs](#merge-ltx-2-loras)
   - [LoRA Merge Arguments](#lora-merge-arguments)
 - [Dataset Configuration](#dataset-configuration)
@@ -1078,7 +1079,7 @@ accelerate launch ... ltx2_train_network.py ^
   --network_dim 32 --output_dir stage1_output/
 
 # Merge Stage 1 into base
-python ltx2_merge_lora.py ^
+python ltx2_merge_lora_to_model.py ^
   --dit base_model.safetensors ^
   --lora_weight stage1_output/last.safetensors ^
   --save_merged_model merged_model.safetensors
@@ -1596,6 +1597,32 @@ Requires `--save_state` to be enabled. State directories contain optimizer, sche
 Mid-epoch checkpoints record `step_in_epoch` in `resume_metadata.json`. On resume, already-processed batches are skipped to keep global step consistent. `--reset_dataloader` disables this.
 
 The moving average loss is saved in state checkpoints and restored on resume.
+
+---
+
+## Merge LoRA into Base Model
+
+**Script:** `ltx2_merge_lora_to_model.py`
+
+```bash
+python ltx2_merge_lora_to_model.py ^
+  --dit base_model.safetensors ^
+  --lora_weight lora.safetensors ^
+  --save_merged_model merged_model.safetensors
+```
+
+### Arguments
+- `--dit`: LTX-2 base model checkpoint (required).
+- `--lora_weight`: One or more LoRA paths to merge sequentially (required).
+- `--lora_multiplier`: Per-LoRA multipliers (default: all 1.0).
+- `--save_merged_model`: Output merged model path (required).
+- `--device cpu|cuda`: Device for merge computation (default: cuda). Pass `--device cpu` to run on system RAM if you don't have enough VRAM.
+- `--audio_video`: Load as audio-video model (for LTXAV checkpoints).
+
+### Notes
+- The output contains only transformer weights (VAE, vocoder, and text encoder are loaded separately by training/inference scripts).
+- Original checkpoint metadata is preserved, so the merged file is directly usable with `--ltx2_checkpoint`.
+- FP8 base models cannot be merged directly — merge into the bf16 base, then use `--fp8_base` at training time for on-the-fly quantization.
 
 ---
 
