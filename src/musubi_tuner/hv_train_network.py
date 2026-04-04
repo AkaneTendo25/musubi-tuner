@@ -1,5 +1,6 @@
 import ast
 import asyncio
+from collections import deque
 from datetime import timedelta
 import gc
 import importlib
@@ -1483,6 +1484,93 @@ class NetworkTrainer:
                 line = f"{i * N_TIMESTEPS_PER_LINE:4d}-{(i + 1) * N_TIMESTEPS_PER_LINE - 1:4d}: {w:8.2f} "
                 line += "#" * int(w / max_weighting * CONSOLE_WIDTH)
                 print(line)
+
+    def _get_tensorboard_writer(self, accelerator: Accelerator):
+        for tracker in getattr(accelerator, "trackers", []):
+            if getattr(tracker, "name", None) == "tensorboard" and hasattr(tracker, "writer"):
+                return tracker.writer
+        return None
+
+    def _should_log_timestep_distribution_to_tensorboard(self, args: argparse.Namespace, accelerator: Accelerator) -> bool:
+        if not accelerator.is_main_process:
+            return False
+        if not bool(getattr(args, "log_timestep_distribution_tensorboard", False)):
+            return False
+        return self._get_tensorboard_writer(accelerator) is not None
+
+    def _get_timestep_distribution_logging_payload(
+        self,
+        args: argparse.Namespace,
+        timesteps: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        del args
+        return {"main": timesteps}
+
+    def _prepare_timestep_distribution_values(
+        self,
+        timesteps: torch.Tensor,
+        accelerator: Accelerator,
+    ) -> Optional[torch.Tensor]:
+        try:
+            flat = timesteps.detach().reshape(-1).to(dtype=torch.float32)
+            if accelerator.num_processes > 1:
+                try:
+                    flat = accelerator.gather(flat)
+                except Exception:
+                    flat = flat.cpu()
+            else:
+                flat = flat.cpu()
+
+            if flat.numel() == 0:
+                return None
+            flat = flat[torch.isfinite(flat)]
+            if flat.numel() == 0:
+                return None
+            return flat.contiguous()
+        except Exception as e:
+            logger.warning(f"Failed to accumulate timestep distribution for TensorBoard logging: {e}")
+            return None
+
+    def _accumulate_timestep_distribution(
+        self,
+        timestep_buffers: Dict[str, deque],
+        name: str,
+        timesteps: torch.Tensor,
+        accelerator: Accelerator,
+    ) -> None:
+        try:
+            values = self._prepare_timestep_distribution_values(timesteps, accelerator)
+            if values is None or values.numel() == 0:
+                return
+            if name not in timestep_buffers:
+                timestep_buffers[name] = deque()
+            timestep_buffers[name].append(values)
+        except Exception as e:
+            logger.warning(f"Failed to accumulate timestep distribution for TensorBoard logging: {e}")
+
+    def _log_timestep_distribution_histogram(
+        self,
+        accelerator: Accelerator,
+        global_step: int,
+        tag: str,
+        values: torch.Tensor,
+    ) -> None:
+        try:
+            writer = self._get_tensorboard_writer(accelerator)
+            if writer is None or values.numel() == 0:
+                return
+            try:
+                writer.add_histogram(tag, values, global_step=global_step, bins=100)
+            except TypeError:
+                writer.add_histogram(tag, values, global_step=global_step)
+
+            writer.add_scalar(f"{tag}_mean", float(values.mean().item()), global_step)
+            writer.add_scalar(f"{tag}_std", float(values.std(unbiased=False).item()), global_step)
+            writer.add_scalar(f"{tag}_min", float(values.min().item()), global_step)
+            writer.add_scalar(f"{tag}_max", float(values.max().item()), global_step)
+            writer.add_scalar(f"{tag}_count", int(values.numel()), global_step)
+        except Exception as e:
+            logger.warning(f"Failed to log timestep distribution histogram to TensorBoard: {e}")
 
     def sample_images(self, accelerator: Accelerator, args, epoch, steps, vae, transformer, sample_parameters, dit_dtype):
         """architecture independent sample images"""
@@ -2999,6 +3087,14 @@ class NetworkTrainer:
 
         global_step = initial_global_step
         noise_scheduler = FlowMatchDiscreteScheduler(shift=args.discrete_flow_shift, reverse=True, solver="euler")
+        timestep_tb_buffers = None
+        timestep_tb_interval = max(1, int(getattr(args, "log_timestep_distribution_interval", 100) or 100))
+        try:
+            if self._should_log_timestep_distribution_to_tensorboard(args, accelerator):
+                timestep_tb_buffers = {}
+        except Exception as e:
+            logger.warning(f"Disabling TensorBoard timestep distribution logging due to initialization failure: {e}")
+            timestep_tb_buffers = None
 
         loss_recorder = train_utils.LossRecorder()
         if initial_global_step > 0 and getattr(self, "_resume_state_dir", None):
@@ -3428,6 +3524,12 @@ class NetworkTrainer:
                         timesteps,
                         network_dtype,
                     )
+                    if timestep_tb_buffers is not None:
+                        payload = self._get_timestep_distribution_logging_payload(args, timesteps)
+                        for name, ts_values in payload.items():
+                            if ts_values is None:
+                                continue
+                            self._accumulate_timestep_distribution(timestep_tb_buffers, name, ts_values, accelerator)
                     if _is_first_step:
                         _log_vram("FIRST_ITER: AFTER call_dit (forward pass)", logger)
                     dict_output = isinstance(model_pred, dict)
@@ -3864,6 +3966,21 @@ class NetworkTrainer:
                         progress_bar.reset()  # exclude first step from progress bar, because it may take long due to initializations
                     progress_bar.update(1)
                     global_step += 1
+                    if timestep_tb_buffers is not None and (
+                        global_step == 1 or global_step % timestep_tb_interval == 0
+                    ):
+                        for name, chunks in timestep_tb_buffers.items():
+                            if not chunks:
+                                continue
+                            values = torch.cat(list(chunks), dim=0)
+                            tag = "timestep/used_values" if name == "main" else f"timestep/used_values_{name}"
+                            self._log_timestep_distribution_histogram(
+                                accelerator,
+                                global_step,
+                                tag,
+                                values,
+                            )
+                            chunks.clear()
                     if (
                         args.log_cuda_memory_every_n_steps is not None
                         and args.log_cuda_memory_every_n_steps > 0
@@ -4591,6 +4708,37 @@ def setup_parser_common() -> argparse.ArgumentParser:
         default=None,
         choices=["image", "console"],
         help="show timesteps in image or console, and return to console / タイムステップを画像またはコンソールに表示し、コンソールに戻る",
+    )
+    parser.set_defaults(log_timestep_distribution_tensorboard=True)
+    parser.add_argument(
+        "--log_timestep_distribution_tensorboard",
+        dest="log_timestep_distribution_tensorboard",
+        action="store_true",
+        help=(
+            "Enable native TensorBoard histogram logging of the observed training timestep distribution "
+            "(enabled by default when TensorBoard logging is active)."
+            " / TensorBoard有効時、実際に使用されたタイムステップ分布をネイティブヒストグラムとして記録します"
+            "（デフォルトで有効）。"
+        ),
+    )
+    parser.add_argument(
+        "--disable_timestep_distribution_tensorboard",
+        dest="log_timestep_distribution_tensorboard",
+        action="store_false",
+        help=(
+            "Disable TensorBoard histogram logging of timestep distribution."
+            " / タイムステップ分布のTensorBoardヒストグラム記録を無効にします。"
+        ),
+    )
+    parser.add_argument(
+        "--log_timestep_distribution_interval",
+        type=int,
+        default=100,
+        help=(
+            "Interval in optimizer steps for TensorBoard timestep distribution logging when "
+            "timestep distribution logging is enabled (default: 100)."
+            " / タイムステップ分布のTensorBoard記録間隔（最適化ステップ単位、デフォルト: 100）。"
+        ),
     )
 
     # network settings

@@ -121,6 +121,7 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
         self._ltx2_checkpoint_config: Optional[Dict[str, Any]] = None
         self.default_guidance_scale = 3.0
         self._audio_preview_config: Optional[Dict[str, int | float]] = None
+        self._timestep_logging_context: Optional[Dict[str, torch.Tensor]] = None
 
         # Preservation / regularization (off by default)
         self._preservation_active: bool = False
@@ -1095,6 +1096,26 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
         sigmas = torch.rand((batch_size,), device=device, dtype=torch.float32)
         sigmas = sigmas * (max_sigma - min_sigma) + min_sigma
         return sigmas.to(device=device, dtype=dtype).view(batch_size, 1)
+
+    def _get_timestep_distribution_logging_payload(
+        self,
+        args: argparse.Namespace,
+        timesteps: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        payload = super()._get_timestep_distribution_logging_payload(args, timesteps)
+        ctx = self._timestep_logging_context
+        self._timestep_logging_context = None
+        if not isinstance(ctx, dict):
+            return payload
+
+        audio_model_timesteps = ctx.get("audio_model_timesteps")
+        if (
+            bool(getattr(args, "independent_audio_timestep", False))
+            and isinstance(audio_model_timesteps, torch.Tensor)
+            and audio_model_timesteps.numel() > 0
+        ):
+            payload["audio"] = audio_model_timesteps.detach().to(dtype=torch.float32) * 1000.0
+        return payload
 
     def _ensure_fp8_buffers_on_device(self, model: torch.nn.Module) -> None:
         if not any(True for _ in model.parameters()):
@@ -2351,6 +2372,9 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                 device=accelerator.device,
                 dtype=network_dtype,
             )
+        self._timestep_logging_context = {
+            "audio_model_timesteps": audio_model_timesteps.detach(),
+        }
         audio_sigma = audio_model_timesteps[:, 0]
         ic_lora_strategy = str(
             getattr(
