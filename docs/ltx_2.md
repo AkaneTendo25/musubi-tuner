@@ -1159,18 +1159,19 @@ See also the [timestep bucketing documentation](./advanced_config.md) for advanc
 
 Use `--lora_target_preset` to control which layers LoRA targets. For custom layer patterns and `--network_args` format, see the [LoRA documentation](./advanced_config.md#lora):
 
-| Preset | Layers | Use Case |
-|--------|--------|----------|
-| `t2v` (default) | All attention (`to_q`, `to_k`, `to_v`, `to_out.0`) | Text-to-video, matches official LTX-2 trainer |
-| `v2v` | All attention + FFN | Video-to-video / IC-LoRA style |
-| `video_sa` | Video self-attention only | Spatially-aligned controls (depth, pose, canny, inpaint) |
-| `video_sa_ff` | Video self-attention + video FFN | Controls needing more capacity (local edit, cut-on-action) |
-| `video_sa_ca_ff` | Video self-attention + cross-attention + video FFN | Text-guided controls (video detailing, camera-from-image, sparse tracks) |
-| `audio` | Audio attention/FFN + audio-side cross-modal attention | Audio-only training (auto-selected when `--ltx2_mode audio`) |
-| `audio_ref_only_ic` | Audio attn/FFN + bidirectional AV cross-modal | Audio-reference IC-LoRA |
-| `full` | All linear layers | All layers targeted, larger file size |
+| Preset | Layers | Modality scope | Use Case |
+|--------|--------|----------------|----------|
+| `t2v` (default) | All attention (`to_q`, `to_k`, `to_v`, `to_out.0`) | Video + audio + cross-modal | Text-to-video, matches official LTX-2 trainer |
+| `v2v` | All attention + video FFN + audio FFN | Video + audio + cross-modal | Video-to-video / IC-LoRA style |
+| `video_sa` | Video self-attention (`attn1`) | Video only | Spatially-aligned controls (depth, pose, canny, inpaint) |
+| `video_sa_ff` | Video self-attention + video FFN (`attn1`, `ff`) | Video only | Controls needing more capacity (local edit, cut-on-action) |
+| `video_sa_ca_ff` | Video self-attention + cross-attention + video FFN (`attn1`, `attn2`, `ff`) | Video only | Text-guided controls (video detailing, camera-from-image, sparse tracks) |
+| `audio` | Audio attn/FFN + `video_to_audio_attn` | Audio only | Audio-only training (auto-selected when `--ltx2_mode audio`) |
+| `audio_ref_only_ic` | Audio attn/FFN + bidirectional AV cross-modal | Audio + cross-modal | Audio-reference IC-LoRA |
+| `av_ic` | All attention + video FFN + audio FFN (same as `v2v`) | Video + audio + cross-modal | Joint AV IC-LoRA |
+| `full` | All linear layers | Video + audio + cross-modal | Maximum expressiveness, larger file size |
 
-The `t2v`, `v2v`, and `full` presets target modules across all modalities (video, audio, cross-modal). The `video_*` presets target only video-branch modules — use with `--ltx2_mode video` for smaller LoRA files with no dead audio parameters. Connector layers (`Embeddings1DConnector`) are excluded by default; use `--train_connectors` to include them (see below).
+**Modality scope matters when training on an AV checkpoint.** The `t2v`, `v2v`, `av_ic`, and `full` presets create LoRA weights for audio and cross-modal layers. If those layers receive no audio training signal (e.g., image/video-only dataset), the LoRA weights for audio modules are initialized but never meaningfully updated — applying such a LoRA can degrade the base model's audio capabilities. Use a `video_*` preset to restrict LoRA to video-branch modules only, leaving audio layers completely untouched. Connector layers (`Embeddings1DConnector`) are excluded by default; use `--train_connectors` to include them (see below).
 
 To use custom layer patterns instead of a preset, use `--network_args`:
 ```bash
@@ -1910,6 +1911,7 @@ reference_cache_directory/                  # IC-LoRA only
 | Cannot resume training from checkpoint | Using a `*.comfy.safetensors` checkpoint with `--resume` | Training can only be resumed from the **original** (non-comfy) LoRA format. Use the `*.safetensors` file without the `.comfy` extension. If you used `--no_save_original_lora`, you must retrain from scratch. |
 | CUDA errors or crashes on RTX 5090 / 50xx GPUs | CUDA 12.6 (`cu126`) not supported on Windows for Blackwell GPUs | Use CUDA 12.8: `pip install torch==2.8.0 ... --index-url https://download.pytorch.org/whl/cu128`. See [CUDA Version](#cuda-version) |
 | `ValueError: Gemma safetensors is missing required language-model tensors` with `missing_buffers` mentioning `full_attention_inv_freq` or `sliding_attention_inv_freq` | `transformers>=5.0` renamed Gemma3 rotary embedding buffers (`rotary_emb.inv_freq` → `rotary_emb.full_attention_inv_freq` / `sliding_attention_inv_freq`). The derivable-buffer suffix check expects `.inv_freq` and does not match the new `_inv_freq` suffix. The safetensors file is correct — rotary buffers are non-persistent and computed from config at init time. | `pip install transformers==4.56.1` (pinned in `pyproject.toml`), or reinstall all deps with `pip install -e .` |
+| Audio quality degrades after training video/image LoRA on an AV checkpoint | Default `t2v` preset creates LoRA weights for audio and cross-modal attention layers. With no audio training data, those weights are initialized but receive no meaningful gradient signal — applying the LoRA overwrites audio layers with near-zero deltas that disrupt the base model's audio representations. | Use a `video_*` preset (`--lora_target_preset video_sa`, `video_sa_ff`, or `video_sa_ca_ff`) to restrict LoRA to video-branch modules only. Audio layers remain frozen and unmodified. See [LoRA Targets](#lora-targets). |
 | `loss_a` too low but `loss_v` still high (audio overfitting) | Audio latent space converges faster than video; audio gradients dominate shared weights | Lower `--audio_loss_weight` (e.g., 0.3), or use `--audio_loss_balance_mode ema_mag` to auto-dampen audio when it exceeds `target_ratio × video_loss`. Reduce audio learning rate with `--audio_lr 1e-6` or fine-grained `--lr_args audio_attn=1e-6 audio_ff=1e-6`. Disable `--audio_dop` / `--audio_silence_regularizer` if active — they add more audio signal. |
 | `loss_a` absent or not dropping in mixed dataset (audio starvation) | Audio batches too rare — non-audio steps outnumber audio steps, audio branch gets insufficient supervision | Increase `num_repeats` on audio datasets (target 30-50% audio steps). Add `--audio_loss_balance_mode inv_freq` to auto-boost audio weight. Use `--audio_dop` or `--audio_silence_regularizer` to provide audio signal on non-audio steps. Check caching summary for `failed > 0`. |
 
