@@ -131,7 +131,7 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         type=str,
         default="t2v",
         choices=["t2v", "v2v", "video_sa", "video_sa_ff", "video_sa_ca_ff",
-                 "audio", "audio_ref_only_ic", "av_ic", "full"],
+                 "audio", "audio_ref_only_ic", "av_ic", "full", "lycoris"],
         help=(
             "LoRA target preset: "
             "'t2v' = text-to-video (all attention, official default), "
@@ -142,6 +142,7 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
             "'audio' = audio-only (audio attn/ffn + audio-side cross-modal), "
             "'audio_ref_only_ic' = ID-LoRA-style AV preset "
             "(audio attn/ffn + audio/video cross-modal both directions), "
+            "'lycoris' = LyCORIS attention-only target preset for LTX-2, "
             "'full' = all linear layers. "
             "Can be overridden by --network_args include_patterns=..."
         ),
@@ -1115,8 +1116,14 @@ def main() -> None:
             if len(filtered_args) != len(args.network_args):
                 args.network_args = filtered_args
                 logger.info("Removed lora_target_preset from --network_args for LyCORIS module compatibility")
-        if lora_target_preset is not None:
-            logger.info("Skipping lora_target_preset injection for LyCORIS network module")
+        if explicit_lora_preset and lora_target_preset == "lycoris":
+            logger.info("Using LyCORIS target preset: lycoris (Attention modules only)")
+        elif explicit_lora_preset and lora_target_preset is not None:
+            logger.warning(
+                "--lora_target_preset %s does not affect LyCORIS networks. "
+                "Use --lora_target_preset lycoris for the attention-only LTX-2 LyCORIS preset.",
+                lora_target_preset,
+            )
     elif lora_target_preset is not None:
         if args.network_args is None:
             args.network_args = []

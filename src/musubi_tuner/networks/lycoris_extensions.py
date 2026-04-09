@@ -6,11 +6,61 @@ Provides enhancements to LyCORIS:
 """
 
 import logging
+import math
+from typing import Any, Dict, Optional
+
 import torch
 import torch.nn as nn
-from typing import Dict, Any, Optional
 
 logger = logging.getLogger(__name__)
+
+
+def _to_dense_tensor(tensor: torch.Tensor) -> torch.Tensor:
+    if hasattr(tensor, "dequantize"):
+        dequantized = tensor.dequantize()
+        if isinstance(dequantized, torch.Tensor):
+            return dequantized
+    return tensor
+
+
+def _matched_normal_tensor(inp: torch.Tensor, shape: torch.Size, scale: float = 1e-3) -> torch.Tensor:
+    dense_inp = _to_dense_tensor(inp).detach().float()
+    device = dense_inp.device
+    target = torch.randn(shape, device=device, dtype=torch.float32)
+
+    desired_norm = dense_inp.norm()
+    desired_mean = dense_inp.mean()
+    desired_std = dense_inp.std()
+
+    current_norm = target.norm().clamp_min(1e-12)
+    target = target * (desired_norm / current_norm)
+    current_std = target.std().clamp_min(1e-12)
+    target = target * (desired_std / current_std)
+    target = target - target.mean() + desired_mean
+    target.mul_(scale)
+    return target
+
+
+def _factorize_matrix(matrix: torch.Tensor, rank: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return A, B such that A @ B approximates matrix."""
+    out_dim, in_dim = matrix.shape
+    rank = max(1, min(rank, out_dim, in_dim))
+    u, s, vh = torch.linalg.svd(matrix, full_matrices=False)
+    u = u[:, :rank]
+    s = s[:rank]
+    vh = vh[:rank, :]
+    root_s = torch.sqrt(s.clamp_min(0))
+    a = u * root_s.unsqueeze(0)
+    b = root_s.unsqueeze(1) * vh
+    return a, b
+
+
+def _init_factorized_ones(left: torch.Tensor, right: torch.Tensor) -> None:
+    """Initialize A, B so that A @ B ~= 1 everywhere instead of ~= rank."""
+    rank = max(1, right.shape[0])
+    fill = 1.0 / math.sqrt(rank)
+    left.fill_(fill)
+    right.fill_(fill)
 
 
 def init_lokr_network_with_perturbed_normal(network, scale: float = 1e-3) -> None:
@@ -33,24 +83,39 @@ def init_lokr_network_with_perturbed_normal(network, scale: float = 1e-3) -> Non
     with torch.no_grad():
         for lora_module in network.loras:
             # LoKR modules have lokr_w1 and lokr_w2
-            if hasattr(lora_module, 'lokr_w1'):
+            if hasattr(lora_module, "lokr_w1"):
                 # Initialize w1 to identity (ones)
                 if isinstance(lora_module.lokr_w1, nn.Parameter):
                     lora_module.lokr_w1.fill_(1.0)
                     initialized_count += 1
-                elif hasattr(lora_module, 'lokr_w1_a') and hasattr(lora_module, 'lokr_w1_b'):
-                    # Factorized form
-                    lora_module.lokr_w1_a.fill_(1.0)
-                    lora_module.lokr_w1_b.fill_(1.0)
-                    initialized_count += 1
+            elif hasattr(lora_module, "lokr_w1_a") and hasattr(lora_module, "lokr_w1_b"):
+                _init_factorized_ones(lora_module.lokr_w1_a, lora_module.lokr_w1_b)
+                initialized_count += 1
 
-            if hasattr(lora_module, 'lokr_w2'):
-                # Initialize w2 with small normal perturbation
+            org_weight = getattr(lora_module, "org_weight", None)
+            if not isinstance(org_weight, torch.Tensor):
+                logger.warning("LoKR module %s has no org_weight; falling back to plain normal init", getattr(lora_module, "lora_name", "<unknown>"))
+
+            if hasattr(lora_module, "lokr_w2"):
+                # Match dense-weight statistics for the full-matrix branch.
                 if isinstance(lora_module.lokr_w2, nn.Parameter):
-                    nn.init.normal_(lora_module.lokr_w2, mean=0.0, std=scale)
+                    if isinstance(org_weight, torch.Tensor):
+                        target = _matched_normal_tensor(org_weight, lora_module.lokr_w2.shape, scale=scale)
+                        lora_module.lokr_w2.copy_(target.to(dtype=lora_module.lokr_w2.dtype))
+                    else:
+                        nn.init.normal_(lora_module.lokr_w2, mean=0.0, std=scale)
                     initialized_count += 1
-                elif hasattr(lora_module, 'lokr_w2_a') and hasattr(lora_module, 'lokr_w2_b'):
-                    # Factorized form
+            elif hasattr(lora_module, "lokr_w2_a") and hasattr(lora_module, "lokr_w2_b"):
+                if isinstance(org_weight, torch.Tensor) and lora_module.lokr_w2_a.ndim == 2 and lora_module.lokr_w2_b.ndim == 2:
+                    dense_target = _matched_normal_tensor(
+                        org_weight,
+                        torch.Size((lora_module.lokr_w2_a.shape[0], lora_module.lokr_w2_b.shape[1])),
+                        scale=scale,
+                    )
+                    a, b = _factorize_matrix(dense_target, lora_module.lokr_w2_a.shape[1])
+                    lora_module.lokr_w2_a.copy_(a.to(dtype=lora_module.lokr_w2_a.dtype))
+                    lora_module.lokr_w2_b.copy_(b.to(dtype=lora_module.lokr_w2_b.dtype))
+                else:
                     nn.init.normal_(lora_module.lokr_w2_a, mean=0.0, std=scale)
                     nn.init.normal_(lora_module.lokr_w2_b, mean=0.0, std=scale)
                     initialized_count += 1
@@ -127,6 +192,7 @@ def config_to_lycoris_preset(config: Dict[str, Any]) -> Dict[str, Any]:
             preset["module_algo_map"] = module_algo_map
         if name_algo_map:
             preset["name_algo_map"] = name_algo_map
+            preset["unet_target_name"] = list(name_algo_map.keys())
 
         # Collect all target modules
         target_modules = [m for m in config["modules"].keys() if "*" not in m]

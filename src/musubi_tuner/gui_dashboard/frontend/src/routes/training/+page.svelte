@@ -83,6 +83,7 @@
 							<FormSelect label="Target" value={t.lora_target_preset || 't2v'} options={[
 								{ value: 't2v', label: 't2v (all attn)' },
 								{ value: 'v2v', label: 'v2v (all attn+FFN)' },
+								{ value: 'lycoris', label: 'lycoris (attn)' },
 								{ value: 'video_sa', label: 'V:SA' },
 								{ value: 'video_sa_ff', label: 'V:SA+FF' },
 								{ value: 'video_sa_ca_ff', label: 'V:SA+CA+FF' },

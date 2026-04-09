@@ -355,9 +355,6 @@ For LTX-2 checkpoints, replace:
 
 ### Advanced: LyCORIS/LoKR Training
 
-> [!WARNING]
-> LyCORIS training for LTX-2 has been reported as unstable by some users. This is currently being investigated. Use with caution and please report issues.
-
 musubi-tuner supports advanced LoRA algorithms (LoKR, LoHA, LoCoN, etc.) via:
 - `--network_args` for inline `key=value` settings
 - `--lycoris_config <path.toml>` for TOML-based settings
@@ -386,6 +383,7 @@ pip install lycoris-lora
 # LoKR example
 accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 ltx2_train_network.py ^
   ... (same args as above) ^
+  --lora_target_preset lycoris ^
   --network_module lycoris.kohya ^
   --lycoris_config my_lycoris.toml ^
   --output_name ltx2_lokr

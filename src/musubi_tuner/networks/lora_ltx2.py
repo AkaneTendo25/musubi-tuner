@@ -777,6 +777,7 @@ LTX2_INCLUDE_PATTERNS_FULL = None  # None means no filtering, all Linear layers 
 LTX2_LORA_TARGET_PRESETS = {
     "t2v": LTX2_INCLUDE_PATTERNS_T2V,
     "v2v": LTX2_INCLUDE_PATTERNS_V2V,
+    "lycoris": LTX2_INCLUDE_PATTERNS_T2V,
     "video_sa": LTX2_INCLUDE_PATTERNS_VIDEO_SA,
     "video_sa_ff": LTX2_INCLUDE_PATTERNS_VIDEO_SA_FF,
     "video_sa_ca_ff": LTX2_INCLUDE_PATTERNS_VIDEO_SA_CA_FF,

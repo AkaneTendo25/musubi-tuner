@@ -8,7 +8,7 @@ from __future__ import annotations
 import argparse
 import logging
 import re
-from typing import Dict, Iterator, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import torch
 
@@ -373,6 +373,27 @@ def process_lycoris_config(args: argparse.Namespace, logger_instance: logging.Lo
         logger_instance.info("Network initialization params: %s", args._network_init_params)
 
 
+def _build_attention_only_lycoris_preset(base_preset: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    preset: Dict[str, Any] = dict(base_preset or {})
+    module_algo_map = dict(preset.get("module_algo_map") or {})
+
+    attention_config = module_algo_map.get("Attention")
+    if attention_config is None:
+        attention_config = module_algo_map.get("BasicAVTransformerBlock")
+
+    preset["unet_target_module"] = ["Attention"]
+    preset.pop("target_module", None)
+    preset.pop("name_algo_map", None)
+    preset["use_fnmatch"] = False
+
+    if attention_config is not None:
+        preset["module_algo_map"] = {"Attention": dict(attention_config)}
+    else:
+        preset.pop("module_algo_map", None)
+
+    return preset
+
+
 def apply_lycoris_preset_before_network_creation(
     args: argparse.Namespace,
     logger_instance: logging.Logger,
@@ -398,15 +419,21 @@ def apply_lycoris_preset_before_network_creation(
 
     if not getattr(LycorisNetworkKohya, "_ltx2_apply_preset_patched", False):
         original_apply_preset = LycorisNetworkKohya.apply_preset.__func__
+        LycorisNetworkKohya._ltx2_original_preset_state = {
+            "ENABLE_CONV": LycorisNetworkKohya.ENABLE_CONV,
+            "UNET_TARGET_REPLACE_MODULE": list(getattr(LycorisNetworkKohya, "UNET_TARGET_REPLACE_MODULE", [])),
+            "UNET_TARGET_REPLACE_NAME": list(getattr(LycorisNetworkKohya, "UNET_TARGET_REPLACE_NAME", [])),
+            "TEXT_ENCODER_TARGET_REPLACE_MODULE": list(getattr(LycorisNetworkKohya, "TEXT_ENCODER_TARGET_REPLACE_MODULE", [])),
+            "TEXT_ENCODER_TARGET_REPLACE_NAME": list(getattr(LycorisNetworkKohya, "TEXT_ENCODER_TARGET_REPLACE_NAME", [])),
+            "MODULE_ALGO_MAP": dict(getattr(LycorisNetworkKohya, "MODULE_ALGO_MAP", {})),
+            "NAME_ALGO_MAP": dict(getattr(LycorisNetworkKohya, "NAME_ALGO_MAP", {})),
+            "USE_FNMATCH": bool(getattr(LycorisNetworkKohya, "USE_FNMATCH", False)),
+        }
 
         def _apply_preset_with_ltx2_targets(cls, preset):
             preset_dict = dict(preset or {})
-            unet_target_module = list(preset_dict.get("unet_target_module", []))
-            if "target_module" in preset_dict:
-                unet_target_module.extend(preset_dict.get("target_module", []))
-            if "BasicAVTransformerBlock" not in unet_target_module:
-                unet_target_module.append("BasicAVTransformerBlock")
-            preset_dict["unet_target_module"] = unet_target_module
+            if "target_module" in preset_dict and "unet_target_module" not in preset_dict:
+                preset_dict["unet_target_module"] = list(preset_dict.get("target_module", []))
             preset_dict.pop("target_module", None)
             return original_apply_preset(cls, preset_dict)
 
@@ -414,7 +441,21 @@ def apply_lycoris_preset_before_network_creation(
         LycorisNetworkKohya._ltx2_apply_preset_patched = True
         logger_instance.info("Patched LyCORIS preset application for LTX-2 target modules")
 
+    original_state = getattr(LycorisNetworkKohya, "_ltx2_original_preset_state", None)
+    if isinstance(original_state, dict):
+        LycorisNetworkKohya.ENABLE_CONV = original_state["ENABLE_CONV"]
+        LycorisNetworkKohya.UNET_TARGET_REPLACE_MODULE = list(original_state["UNET_TARGET_REPLACE_MODULE"])
+        LycorisNetworkKohya.UNET_TARGET_REPLACE_NAME = list(original_state["UNET_TARGET_REPLACE_NAME"])
+        LycorisNetworkKohya.TEXT_ENCODER_TARGET_REPLACE_MODULE = list(original_state["TEXT_ENCODER_TARGET_REPLACE_MODULE"])
+        LycorisNetworkKohya.TEXT_ENCODER_TARGET_REPLACE_NAME = list(original_state["TEXT_ENCODER_TARGET_REPLACE_NAME"])
+        LycorisNetworkKohya.MODULE_ALGO_MAP = dict(original_state["MODULE_ALGO_MAP"])
+        LycorisNetworkKohya.NAME_ALGO_MAP = dict(original_state["NAME_ALGO_MAP"])
+        LycorisNetworkKohya.USE_FNMATCH = original_state["USE_FNMATCH"]
+
     preset = getattr(args, "_network_config_preset", None)
+    if str(getattr(args, "lora_target_preset", "") or "").lower() == "lycoris":
+        preset = _build_attention_only_lycoris_preset(preset)
+        logger_instance.info("Using LyCORIS target preset: lycoris (Attention modules only)")
     if not preset:
         return
 
