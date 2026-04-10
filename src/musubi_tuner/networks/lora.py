@@ -20,6 +20,18 @@ logging.basicConfig(level=logging.INFO)
 HUNYUAN_TARGET_REPLACE_MODULES = ["MMDoubleStreamBlock", "MMSingleStreamBlock"]
 
 
+def is_linear_like_module(module: torch.nn.Module) -> bool:
+    return (
+        module.__class__.__name__ == "Linear"
+        or (
+            hasattr(module, "in_features")
+            and hasattr(module, "out_features")
+            and hasattr(module, "weight")
+            and getattr(module.weight, "ndim", 0) == 2
+        )
+    )
+
+
 class LoRAModule(torch.nn.Module):
     """
     replaces forward method of the original Linear, instead of replacing the original Linear module.
@@ -71,7 +83,7 @@ class LoRAModule(torch.nn.Module):
         else:
             # conv2d not supported
             assert sum(split_dims) == out_dim, "sum of split_dims must be equal to out_dim"
-            assert org_module.__class__.__name__ == "Linear", "split_dims is only supported for Linear"
+            assert is_linear_like_module(org_module), "split_dims is only supported for linear-like modules"
             # print(f"split_dims: {split_dims}")
             self.lora_down = torch.nn.ModuleList(
                 [torch.nn.Linear(in_dim, self.lora_dim, bias=False) for _ in range(len(split_dims))]
@@ -100,8 +112,8 @@ class LoRAModule(torch.nn.Module):
         self.org_module.forward = self.forward
         del self.org_module
 
-    def forward(self, x):
-        org_forwarded = self.org_forward(x)
+    def forward(self, x, *args, **kwargs):
+        org_forwarded = self.org_forward(x, *args, **kwargs)
 
         # module dropout
         if self.module_dropout is not None and self.training:
@@ -109,7 +121,12 @@ class LoRAModule(torch.nn.Module):
                 return org_forwarded
 
         if self.split_dims is None:
-            lx = self.lora_down(x)
+            lora_input = x
+            lora_device = self.lora_down.weight.device
+            if lora_input.device != lora_device:
+                lora_input = lora_input.to(lora_device)
+
+            lx = self.lora_down(lora_input)
 
             # normal dropout
             if self.dropout is not None and self.training:
@@ -130,10 +147,18 @@ class LoRAModule(torch.nn.Module):
                 scale = self.scale
 
             lx = self.lora_up(lx)
+            if lx.device != org_forwarded.device:
+                lx = lx.to(org_forwarded.device)
 
             return org_forwarded + lx * self.multiplier * scale
         else:
-            lxs = [lora_down(x) for lora_down in self.lora_down]
+            lxs = []
+            for lora_down in self.lora_down:
+                lora_input = x
+                lora_device = lora_down.weight.device
+                if lora_input.device != lora_device:
+                    lora_input = lora_input.to(lora_device)
+                lxs.append(lora_down(lora_input))
 
             # normal dropout
             if self.dropout is not None and self.training:
@@ -155,6 +180,7 @@ class LoRAModule(torch.nn.Module):
                 scale = self.scale
 
             lxs = [lora_up(lx) for lora_up, lx in zip(self.lora_up, lxs)]
+            lxs = [lx.to(org_forwarded.device) if lx.device != org_forwarded.device else lx for lx in lxs]
 
             return org_forwarded + torch.cat(lxs, dim=-1) * self.multiplier * scale
 
@@ -264,21 +290,21 @@ class LoRAInfModule(LoRAModule):
 
         return weight
 
-    def default_forward(self, x):
+    def default_forward(self, x, *args, **kwargs):
         # logger.info(f"default_forward {self.lora_name} {x.size()}")
         if self.split_dims is None:
             lx = self.lora_down(x)
             lx = self.lora_up(lx)
-            return self.org_forward(x) + lx * self.multiplier * self.scale
+            return self.org_forward(x, *args, **kwargs) + lx * self.multiplier * self.scale
         else:
             lxs = [lora_down(x) for lora_down in self.lora_down]
             lxs = [lora_up(lx) for lora_up, lx in zip(self.lora_up, lxs)]
-            return self.org_forward(x) + torch.cat(lxs, dim=-1) * self.multiplier * self.scale
+            return self.org_forward(x, *args, **kwargs) + torch.cat(lxs, dim=-1) * self.multiplier * self.scale
 
-    def forward(self, x):
+    def forward(self, x, *args, **kwargs):
         if not self.enabled:
-            return self.org_forward(x)
-        return self.default_forward(x)
+            return self.org_forward(x, *args, **kwargs)
+        return self.default_forward(x, *args, **kwargs)
 
 
 def create_arch_network(
@@ -501,7 +527,7 @@ class LoRANetwork(torch.nn.Module):
                         module = root_module  # search all modules
 
                     for child_name, child_module in module.named_modules():
-                        is_linear = child_module.__class__.__name__ == "Linear"
+                        is_linear = is_linear_like_module(child_module)
                         is_conv2d = child_module.__class__.__name__ == "Conv2d"
                         is_conv2d_1x1 = is_conv2d and child_module.kernel_size == (1, 1)
 

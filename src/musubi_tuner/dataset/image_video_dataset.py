@@ -93,6 +93,8 @@ ARCHITECTURE_HUNYUAN_VIDEO_1_5 = "hv15"
 ARCHITECTURE_HUNYUAN_VIDEO_1_5_FULL = "hunyuan_video_1_5"
 ARCHITECTURE_Z_IMAGE = "zi"
 ARCHITECTURE_Z_IMAGE_FULL = "z_image"
+ARCHITECTURE_MAGIHUMAN = "mh"
+ARCHITECTURE_MAGIHUMAN_FULL = "magihuman"
 
 
 def glob_images(directory, base="*", caption_extension=None):
@@ -187,6 +189,9 @@ class ItemInfo:
         frame_count: Optional[int] = None,
         content: Optional[Union[np.ndarray, list[np.ndarray]]] = None,
         latent_cache_path: Optional[str] = None,
+        source_path: Optional[str] = None,
+        source_start_frame: Optional[int] = None,
+        source_fps: Optional[float] = None,
     ) -> None:
         self.item_key = item_key
         self.caption = caption
@@ -195,6 +200,9 @@ class ItemInfo:
         self.frame_count = frame_count
         self.content = content
         self.latent_cache_path = latent_cache_path
+        self.source_path = source_path
+        self.source_start_frame = source_start_frame
+        self.source_fps = source_fps
         self.text_encoder_output_cache_path: Optional[str] = None
 
         # np.ndarray for video, list[np.ndarray] for image with multiple controls
@@ -431,6 +439,38 @@ def save_latent_cache_z_image(item_info: ItemInfo, latent: torch.Tensor):
     save_latent_cache_common(item_info, sd, ARCHITECTURE_Z_IMAGE_FULL)
 
 
+def save_latent_cache_magihuman(
+    item_info: ItemInfo,
+    video_latent: torch.Tensor,
+    audio_latent: torch.Tensor,
+    image_latent: Optional[torch.Tensor] = None,
+):
+    """MagiHuman architecture."""
+    assert video_latent.dim() == 4, "video_latent should be 4D tensor (channel, frame, height, width)"
+    assert audio_latent.dim() == 2, "audio_latent should be 2D tensor (frame, channel)"
+
+    _, F, H, W = video_latent.shape
+    dtype_str = dtype_to_str(video_latent.dtype)
+    sd = {f"latents_{F}x{H}x{W}_{dtype_str}": video_latent.detach().cpu().contiguous()}
+
+    dtype_str = dtype_to_str(audio_latent.dtype)
+    audio_tokens, audio_channels = audio_latent.shape
+    sd[f"latents_audio_{audio_tokens}x{audio_channels}_{dtype_str}"] = audio_latent.detach().cpu().contiguous()
+
+    if image_latent is not None:
+        dtype_str = dtype_to_str(image_latent.dtype)
+        if image_latent.dim() == 4:
+            _, F_img, H_img, W_img = image_latent.shape
+            sd[f"latents_image_{F_img}x{H_img}x{W_img}_{dtype_str}"] = image_latent.detach().cpu().contiguous()
+        elif image_latent.dim() == 3:
+            _, H_img, W_img = image_latent.shape
+            sd[f"latents_image_1x{H_img}x{W_img}_{dtype_str}"] = image_latent.detach().cpu().contiguous()
+        else:
+            raise ValueError(f"Unsupported image_latent shape for MagiHuman: {image_latent.shape}")
+
+    save_latent_cache_common(item_info, sd, ARCHITECTURE_MAGIHUMAN_FULL)
+
+
 def save_latent_cache_common(item_info: ItemInfo, sd: dict[str, torch.Tensor], arch_fullname: str):
     metadata = {
         "architecture": arch_fullname,
@@ -559,6 +599,15 @@ def save_text_encoder_output_cache_z_image(item_info: ItemInfo, embed: torch.Ten
     save_text_encoder_output_cache_common(item_info, sd, ARCHITECTURE_Z_IMAGE_FULL)
 
 
+def save_text_encoder_output_cache_magihuman(item_info: ItemInfo, embed: torch.Tensor):
+    """MagiHuman architecture."""
+    sd = {}
+    dtype_str = dtype_to_str(embed.dtype)
+    sd[f"varlen_t5gemma_embed_{dtype_str}"] = embed.detach().cpu()
+
+    save_text_encoder_output_cache_common(item_info, sd, ARCHITECTURE_MAGIHUMAN_FULL)
+
+
 def save_text_encoder_output_cache_common(item_info: ItemInfo, sd: dict[str, torch.Tensor], arch_fullname: str):
     for key, value in sd.items():
         # NaN check and show warning, replace NaN with 0
@@ -606,6 +655,7 @@ class BucketSelector:
     RESOLUTION_STEPS_KANDINSKY5 = 16
     RESOLUTION_STEPS_HUNYUAN_VIDEO_1_5 = 16
     RESOLUTION_STEPS_Z_IMAGE = 16
+    RESOLUTION_STEPS_MAGIHUMAN = 16
 
     ARCHITECTURE_STEPS_MAP = {
         ARCHITECTURE_HUNYUAN_VIDEO: RESOLUTION_STEPS_HUNYUAN,
@@ -621,6 +671,7 @@ class BucketSelector:
         ARCHITECTURE_KANDINSKY5: RESOLUTION_STEPS_KANDINSKY5,
         ARCHITECTURE_HUNYUAN_VIDEO_1_5: RESOLUTION_STEPS_HUNYUAN_VIDEO_1_5,
         ARCHITECTURE_Z_IMAGE: RESOLUTION_STEPS_Z_IMAGE,
+        ARCHITECTURE_MAGIHUMAN: RESOLUTION_STEPS_MAGIHUMAN,
     }
 
     def __init__(
@@ -1885,7 +1936,12 @@ class ImageDataset(BaseDataset):
                     bucket_reso = (bucket_width, bucket_height)
 
                     item_info = ItemInfo(
-                        item_key, caption, original_size, bucket_reso, content=image if len(images) == 1 else images
+                        item_key,
+                        caption,
+                        original_size,
+                        bucket_reso,
+                        content=image if len(images) == 1 else images,
+                        source_path=item_key,
                     )
                     item_info.latent_cache_path = self.get_latent_cache_path(item_info)
 
@@ -2072,6 +2128,7 @@ class VideoDataset(BaseDataset):
     TARGET_FPS_FRAMEPACK = 30.0
     TARGET_FPS_FLUX_KONTEXT = 1.0  # VideoDataset is not used for Flux Kontext, but this is a placeholder
     TARGET_FPS_HUNYUAN_VIDEO_1_5 = 24.0
+    TARGET_FPS_MAGIHUMAN = 25.0
 
     def __init__(
         self,
@@ -2129,6 +2186,8 @@ class VideoDataset(BaseDataset):
             self.target_fps = VideoDataset.TARGET_FPS_HUNYUAN
         elif self.architecture == ARCHITECTURE_HUNYUAN_VIDEO_1_5:
             self.target_fps = VideoDataset.TARGET_FPS_HUNYUAN_VIDEO_1_5
+        elif self.architecture == ARCHITECTURE_MAGIHUMAN:
+            self.target_fps = VideoDataset.TARGET_FPS_MAGIHUMAN
         else:
             raise ValueError(f"Unsupported architecture: {self.architecture}")
 
@@ -2277,7 +2336,15 @@ class VideoDataset(BaseDataset):
                             cropped_control = control_video[crop_pos : crop_pos + target_frame]
 
                         item_info = ItemInfo(
-                            item_key, caption, original_frame_size, batch_key, frame_count=target_frame, content=cropped_video
+                            item_key,
+                            caption,
+                            original_frame_size,
+                            batch_key,
+                            frame_count=target_frame,
+                            content=cropped_video,
+                            source_path=video_key,
+                            source_start_frame=crop_pos,
+                            source_fps=self.target_fps,
                         )
                         item_info.latent_cache_path = self.get_latent_cache_path(item_info)
                         item_info.control_content = cropped_control  # None is allowed
