@@ -54,6 +54,7 @@ Caching scripts (`ltx2_cache_latents.py`, `ltx2_cache_text_encoder_outputs.py`) 
     - [HFATO (High-Frequency Awareness Training Objective)](#hfato-high-frequency-awareness-training-objective)
     - [Timestep Sampling](#timestep-sampling)
     - [LoRA Targets](#lora-targets)
+      - [LoRA Target Estimation](#lora-target-estimation-ltx2_estimatepy)
       - [Connector LoRA](#connector-lora---train_connectors)
     - [IC-LoRA / Video-to-Video Training](#ic-lora--video-to-video-training)
     - [Audio-Reference IC-LoRA](#audio-reference-ic-lora)
@@ -1177,6 +1178,47 @@ To use custom layer patterns instead of a preset, use `--network_args`:
 ```
 Custom `include_patterns` override any preset.
 When `include_patterns` is set (either explicitly or via a preset), only modules matching at least one pattern are targeted (strict whitelist behavior). Use `--lora_target_preset full` to target all linear layers.
+
+#### LoRA Target Estimation (`ltx2_estimate.py`)
+
+`ltx2_estimate.py` runs the LTX forward/loss path on cached training batches and accumulates squared gradients ("Fisher-style importance") for LoRA-targetable weights.
+
+- It uses `setup_parser_common()` plus `ltx2_setup_parser()`, so the normal LTX argument surface is available. In the estimator path, attention backend selection (`--sdpa`, `--flash_attn`, `--flash3`, `--xformers`), `--blocks_to_swap`, `--gradient_checkpointing`, `--blockwise_checkpointing`, `--compile`, `--fp8_base` / `--fp8_scaled`, `--nf4_base`, and `--split_attn` are applied.
+- It requires `--dataset_config` and cached dataset items. If the dataset group has no training items, it exits with `No training items found in the dataset. Create latent/text caches first.`
+- It keeps up to `--estimation_batches` batches. Batches without 5D `latents` are skipped.
+- If `--network_weights` is set, the estimator attaches that LoRA to the transformer and scores the LoRA weights from the attached network (`candidate_source = "network"`).
+- If `--network_weights` is not set, it scores LoRA-targetable linear weights from the transformer itself (`candidate_source = "base_model"`).
+- If `--base_weights` is set, those weights are merged into the transformer before estimation.
+- Unless `--estimation_keep_caption_dropout` is set, the estimator temporarily forces `caption_dropout_rate = 0`.
+- `--estimation_block_window` only affects the base-model path: it groups candidate weights by transformer block and enables one window of blocks per backward pass. When `--network_weights` is used, all network candidates are scored in one pass.
+
+Example:
+
+```bash
+python ltx2_estimate.py ^
+  --dataset_config dataset.toml ^
+  --ltx2_checkpoint /path/to/ltx-2.3.safetensors ^
+  --ltx_version 2.3 ^
+  --ltx2_mode av ^
+  --network_module networks.lora_ltx2 ^
+  --network_weights output/your_lora.safetensors ^
+  --estimation_batches 8 ^
+  --estimation_output output/ltx2_estimate.json ^
+  --flash_attn --fp8_base --fp8_scaled --blocks_to_swap 10 --gradient_checkpointing
+```
+
+The output is a JSON report written to `--estimation_output` or, if omitted, `<output_dir>/ltx2_estimate.json`.
+
+- `meta`: run configuration, timing, applied / merged weights, and `candidate_source`
+- `summary`: `candidate_modules`, `candidate_params`, `total_fisher_sum`, and `recommended_preset`
+- `family_scores`: aggregate scores by module family such as `video_self_attn` and `video_cross_attn`
+- `preset_scores`: aggregate scores for the preset candidates available in the current `ltx_mode`
+- `top_modules`: highest-ranked individual weights
+
+`recommended_preset` is selected as follows:
+
+- Pick the smallest preset whose `fisher_share` reaches `--estimation_target_coverage`
+- If no preset reaches that threshold, pick the preset with the highest `efficiency`
 
 #### Connector LoRA (`--train_connectors`)
 
