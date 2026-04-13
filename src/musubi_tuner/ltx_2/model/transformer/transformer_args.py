@@ -125,6 +125,10 @@ class TransformerArgsPreprocessor:
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Prepare context for transformer blocks."""
         batch_size = x.shape[0]
+        if context.device != x.device:
+            context = context.to(x.device)
+        if isinstance(attention_mask, torch.Tensor) and attention_mask.device != x.device:
+            attention_mask = attention_mask.to(x.device)
         if self.caption_projection is not None:
             context = self.caption_projection(context)
         expected_hidden = int(x.shape[-1])
