@@ -1,4 +1,5 @@
 import argparse
+import copy
 from dataclasses import (
     asdict,
     dataclass,
@@ -24,7 +25,14 @@ import toml
 import voluptuous
 from voluptuous import Any, ExactSequence, MultipleInvalid, Object, Optional as VOptional, Schema
 
-from musubi_tuner.dataset.image_video_dataset import DatasetGroup, ImageDataset, VideoDataset, AudioDataset
+from musubi_tuner.dataset.image_video_dataset import (
+    ARCHITECTURE_LTX2,
+    ARCHITECTURE_LTX2_FULL,
+    AudioDataset,
+    DatasetGroup,
+    ImageDataset,
+    VideoDataset,
+)
 
 import logging
 
@@ -261,7 +269,8 @@ class BlueprintGenerator:
 
     # runtime_params is for parameters which is only configurable on runtime, such as tokenizer
     def generate(self, user_config: dict, argparse_namespace: argparse.Namespace, **runtime_params) -> Blueprint:
-        sanitized_user_config = self.sanitizer.sanitize_user_config(user_config)
+        normalized_user_config = self._normalize_runtime_specific_user_config(user_config, runtime_params)
+        sanitized_user_config = self.sanitizer.sanitize_user_config(normalized_user_config)
         sanitized_argparse_namespace = self.sanitizer.sanitize_argparse_namespace(argparse_namespace)
 
         argparse_config = {k: v for k, v in vars(sanitized_argparse_namespace).items() if v is not None}
@@ -289,6 +298,65 @@ class BlueprintGenerator:
         dataset_group_blueprint = DatasetGroupBlueprint(dataset_blueprints)
 
         return Blueprint(dataset_group_blueprint)
+
+    @staticmethod
+    def _normalize_runtime_specific_user_config(user_config: dict, runtime_params: dict) -> dict:
+        architecture = runtime_params.get("architecture")
+        if architecture not in {ARCHITECTURE_LTX2, ARCHITECTURE_LTX2_FULL}:
+            return user_config
+
+        normalized_user_config = copy.deepcopy(user_config)
+
+        for section_name in ("datasets", "validation_datasets"):
+            dataset_entries = normalized_user_config.get(section_name)
+            if not isinstance(dataset_entries, list):
+                continue
+
+            for i, dataset_config in enumerate(dataset_entries):
+                if not isinstance(dataset_config, dict):
+                    continue
+
+                is_image_dataset = "image_directory" in dataset_config or "image_jsonl_file" in dataset_config
+                if not is_image_dataset:
+                    continue
+
+                reference_directory = dataset_config.get("reference_directory")
+                control_directory = dataset_config.get("control_directory")
+                has_reference_directory = reference_directory is not None
+                has_control_directory = control_directory is not None
+                has_reference_cache = dataset_config.get("reference_cache_directory") is not None
+
+                if has_reference_directory and not has_reference_cache:
+                    raise ValueError(
+                        f"{section_name}[{i}] uses reference_directory on an image dataset without "
+                        "reference_cache_directory. For LTX image IC-LoRA datasets, set both "
+                        "reference_directory and reference_cache_directory."
+                    )
+
+                if not has_reference_cache:
+                    continue
+
+                if has_reference_directory and has_control_directory:
+                    raise ValueError(
+                        f"{section_name}[{i}] sets both reference_directory and control_directory. "
+                        "For LTX image IC-LoRA datasets, use reference_directory only."
+                    )
+
+                if has_control_directory:
+                    raise ValueError(
+                        f"{section_name}[{i}] uses control_directory, but LTX image IC-LoRA datasets must use "
+                        "reference_directory when reference_cache_directory is set."
+                    )
+
+                if not has_reference_directory:
+                    raise ValueError(
+                        f"{section_name}[{i}] sets reference_cache_directory, but LTX image IC-LoRA datasets "
+                        "also require reference_directory."
+                    )
+
+                dataset_config["control_directory"] = dataset_config.pop("reference_directory")
+
+        return normalized_user_config
 
     @staticmethod
     def generate_params_by_fallbacks(param_klass, fallbacks: Sequence[dict]):

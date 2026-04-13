@@ -1194,7 +1194,7 @@ Reference frames are encoded as clean latent tokens (timestep=0) and concatenate
 
 ##### Step 1: Prepare Dataset
 
-Create a video dataset with a matching reference directory. Each reference file must share the same filename stem as its corresponding training video:
+Create a dataset with a matching reference/source directory. For both video and image IC-LoRA datasets, use `reference_directory`. Each reference file must share the same filename stem as its corresponding training sample:
 
 ```
 videos/                    references/
@@ -1207,7 +1207,7 @@ References can be images (single frame) or videos (multiple frames).
 
 ##### Step 2: Dataset Config
 
-Add `reference_directory` and `reference_cache_directory` to your TOML config:
+Add `reference_cache_directory` plus the matching source directory key to your TOML config:
 
 ```toml
 [general]
@@ -1222,6 +1222,15 @@ reference_cache_directory = "cache_ref"
 video_directory = "videos"
 reference_directory = "references"
 target_frames = [1, 17, 33]
+```
+
+For image datasets, use `reference_directory` as well:
+
+```toml
+[[datasets]]
+image_directory = "targets"
+reference_directory = "references"
+reference_cache_directory = "cache_ref"
 ```
 
 ##### Step 3: Cache Latents
@@ -1318,7 +1327,7 @@ The `--sample_include_reference` flag shows the reference side-by-side with the 
 
 | Option | Type | Description |
 |--------|------|-------------|
-| `reference_directory` | string | Path to reference images/videos (matched by filename stem) |
+| `reference_directory` | string | Path to reference images/videos for IC-LoRA datasets (matched by filename stem) |
 | `reference_cache_directory` | string | Output directory for cached reference latents |
 
 ##### Notes
@@ -1660,11 +1669,18 @@ python ltx2_merge_lora.py ^
 
 The dataset config is a TOML file with `[general]` defaults and `[[datasets]]` entries. Common options shared across all musubi-tuner architectures — including `frame_extraction` modes, JSONL metadata format, control image support, and resolution bucketing — are documented in the [Dataset Configuration guide](./dataset_config.md). The options below are LTX-2-specific or supplement upstream defaults.
 
+### Image Dataset Notes
+
+Image datasets use the common image schema from [Dataset Configuration](./dataset_config.md), including
+`image_directory` or `image_jsonl_file`. For LTX-2 IC-LoRA with image datasets, use `reference_directory`
+and `reference_cache_directory`. Internally this is normalized onto the shared image control path, so
+other non-IC image workflows can continue using `control_directory`.
+
 ### Video Dataset Options
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `video_directory` | string | — | Path to video/image directory |
+| `video_directory` | string | — | Path to video directory |
 | `video_jsonl_file` | string | — | Path to JSONL metadata file |
 | `resolution` | int or [int, int] | [960, 544] | Target resolution |
 | `target_frames` | [int] | [1] | List of target frame counts |

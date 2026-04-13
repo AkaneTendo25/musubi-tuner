@@ -76,7 +76,10 @@ def _dataset_entry_to_dict(entry) -> dict:
     if entry.reference_cache_directory:
         d["reference_cache_directory"] = entry.reference_cache_directory
     if entry.control_directory:
-        d["control_directory"] = entry.control_directory
+        if entry.reference_cache_directory:
+            d["reference_directory"] = entry.control_directory
+        else:
+            d["control_directory"] = entry.control_directory
     if entry.type != "audio":
         d["resolution"] = [entry.resolution_w, entry.resolution_h]
     d["batch_size"] = entry.batch_size

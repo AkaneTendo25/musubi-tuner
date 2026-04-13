@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException, Request
 
-from musubi_tuner.gui_dashboard.toml_export import export_dataset_toml
+from musubi_tuner.gui_dashboard.toml_export import _dataset_entry_to_dict, _toml_value, export_dataset_toml
 from musubi_tuner.gui_dashboard.project_schema import DatasetConfig, ProjectConfig
 
 router = APIRouter(prefix="/api/dataset", tags=["dataset"])
@@ -54,60 +54,18 @@ async def preview_toml(request: Request):
     """Return what the TOML file would look like without writing it."""
     config = _get_config(request)
 
-
-    # Generate TOML content as string
-    doc: dict = {}
-    doc["general"] = {
-        "enable_bucket": config.dataset.general.enable_bucket,
-        "bucket_no_upscale": config.dataset.general.bucket_no_upscale,
+    doc: dict = {
+        "general": {
+            "enable_bucket": config.dataset.general.enable_bucket,
+            "bucket_no_upscale": config.dataset.general.bucket_no_upscale,
+        },
+        "datasets": [_dataset_entry_to_dict(entry) for entry in config.dataset.datasets],
     }
 
-    from musubi_tuner.gui_dashboard.toml_export import _toml_value
-
-    datasets = []
-    for entry in config.dataset.datasets:
-        d: dict = {}
-        if entry.type == "video":
-            d["video_directory"] = entry.directory
-        elif entry.type == "image":
-            d["image_directory"] = entry.directory
-        elif entry.type == "audio":
-            d["audio_directory"] = entry.directory
-        d["cache_directory"] = entry.cache_directory
-        if entry.type != "audio":
-            d["resolution"] = [entry.resolution_w, entry.resolution_h]
-        d["batch_size"] = entry.batch_size
-        d["num_repeats"] = entry.num_repeats
-        d["caption_extension"] = entry.caption_extension
-        if entry.type == "video":
-            d["target_frames"] = [entry.target_frames]
-            d["frame_extraction"] = entry.frame_extraction
-            if entry.frame_sample is not None:
-                d["frame_sample"] = entry.frame_sample
-        datasets.append(d)
-    doc["datasets"] = datasets
-
     if config.dataset.validation_datasets:
-        val = []
-        for entry in config.dataset.validation_datasets:
-            d = {}
-            if entry.type == "video":
-                d["video_directory"] = entry.directory
-            elif entry.type == "image":
-                d["image_directory"] = entry.directory
-            elif entry.type == "audio":
-                d["audio_directory"] = entry.directory
-            d["cache_directory"] = entry.cache_directory
-            if entry.type != "audio":
-                d["resolution"] = [entry.resolution_w, entry.resolution_h]
-            d["batch_size"] = entry.batch_size
-            d["num_repeats"] = entry.num_repeats
-            d["caption_extension"] = entry.caption_extension
-            if entry.type == "video":
-                d["target_frames"] = [entry.target_frames]
-                d["frame_extraction"] = entry.frame_extraction
-            val.append(d)
-        doc["validation_datasets"] = val
+        doc["validation_datasets"] = [
+            _dataset_entry_to_dict(entry) for entry in config.dataset.validation_datasets
+        ]
 
     # Build TOML string
     lines = []

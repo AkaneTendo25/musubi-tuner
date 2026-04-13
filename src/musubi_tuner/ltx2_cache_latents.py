@@ -28,6 +28,7 @@ from musubi_tuner.dataset.image_video_dataset import (
     IMAGE_EXTENSIONS,
     ItemInfo,
     AudioDataset,
+    ImageDataset,
     VIDEO_EXTENSIONS,
     VideoDataset,
     resize_image_to_bucket,
@@ -608,7 +609,7 @@ def encode_and_save_reference_latents(
     vae_dtype = vae_param.dtype
 
     for ds_idx, ds in enumerate(datasets):
-        if not isinstance(ds, VideoDataset):
+        if not isinstance(ds, (ImageDataset, VideoDataset)):
             continue
 
         ref_cache_dir = getattr(ds, "reference_cache_directory", None)
@@ -617,12 +618,16 @@ def encode_and_save_reference_latents(
             continue
 
         ref_dir = getattr(ds, "reference_directory", None)
+        ref_dir_source = "reference_directory"
         if ref_dir is None:
-            logger.info(f"[Dataset {ds_idx}] No reference_directory set, skipping reference caching")
+            ref_dir = getattr(ds, "control_directory", None)
+            ref_dir_source = "control_directory"
+        if ref_dir is None:
+            logger.info(f"[Dataset {ds_idx}] No reference/control directory set, skipping reference caching")
             continue
 
         os.makedirs(ref_cache_dir, exist_ok=True)
-        logger.info(f"[Dataset {ds_idx}] Caching reference latents to {ref_cache_dir}")
+        logger.info(f"[Dataset {ds_idx}] Caching reference latents from {ref_dir_source} to {ref_cache_dir}")
 
         cached_count = 0
         skipped_count = 0
@@ -1186,7 +1191,7 @@ def main() -> None:
         cache_latents.encode_datasets(list(non_audio_datasets), encode_fn, args)
 
         # Cache reference latents for IC-LoRA / v2v training (auto-detected from TOML config)
-        # Runs when any dataset has both reference_directory and reference_cache_directory
+        # Runs when any dataset has reference_cache_directory and a matching reference source directory.
         encode_and_save_reference_latents(vae, datasets, args, device, tiling_config)
 
     if audio_only:

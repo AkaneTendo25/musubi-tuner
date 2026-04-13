@@ -28,6 +28,13 @@
 	const isVideo = $derived(entry.type === 'video');
 	const isImage = $derived(entry.type === 'image');
 	const isAudio = $derived(entry.type === 'audio');
+	const usesReferenceDirectory = $derived(Boolean(entry.reference_cache_directory));
+	const sourceDirectoryLabel = $derived(usesReferenceDirectory ? 'Reference Directory' : 'Control Directory');
+	const sourceDirectoryTooltip = $derived(
+		usesReferenceDirectory
+			? 'Directory with reference images/videos. When Reference Cache Dir is set, this is exported as reference_directory for IC-LoRA datasets.'
+			: 'Directory with control images/videos (e.g. depth maps, edges).'
+	);
 </script>
 
 <div class="overflow-hidden" style="background: var(--bg-surface); border: 1px solid var(--border-subtle); border-radius: var(--radius-md); box-shadow: var(--shadow-sm);">
@@ -54,7 +61,7 @@
 		<PathInput label="Cache Directory" bind:value={entry.cache_directory} onselect={(p) => setField('cache_directory', p)} tooltip="Directory to store cached latents/embeddings" />
 		<PathInput label="Reference Cache Dir" bind:value={entry.reference_cache_directory} onselect={(p) => setField('reference_cache_directory', p)} placeholder="Optional" tooltip="Reference cache directory for I2V / control workflows" />
 		{#if !isAudio}
-			<PathInput label="Control Directory" bind:value={entry.control_directory} onselect={(p) => setField('control_directory', p)} placeholder="Optional" tooltip="Directory with control images/videos (e.g. depth maps, edges)" />
+			<PathInput label={sourceDirectoryLabel} bind:value={entry.control_directory} onselect={(p) => setField('control_directory', p)} placeholder="Optional" tooltip={sourceDirectoryTooltip} />
 		{/if}
 
 		{#if !isAudio}
