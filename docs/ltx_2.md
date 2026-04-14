@@ -1198,6 +1198,7 @@ Example:
 python ltx2_estimate.py ^
   --dataset_config dataset.toml ^
   --ltx2_checkpoint /path/to/ltx-2.3.safetensors ^
+  --mixed_precision bf16 ^
   --ltx_version 2.3 ^
   --ltx2_mode av ^
   --network_module networks.lora_ltx2 ^
