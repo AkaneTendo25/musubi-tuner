@@ -52,6 +52,32 @@ class ConfigManager:
                     ">32": {"batch_size": 2, "block_swap": 0, "fp8_scaled": False, "fp8_llm": False},
                 },
             },
+            "OpenMOSS-MOVA": {
+                "resolution": (960, 544),
+                "required_subdirs": ["video_dit", "audio_dit", "dual_tower_bridge", "video_vae", "text_encoder"],
+                "cache_pattern": "*_mova.safetensors",
+                "vae_subpath": [],
+                "te1_subpath": [],
+                "te2_subpath": None,
+                "dit_subpath": [],
+                "training_base": {
+                    "learning_rate": 1e-4,
+                    "default_num_steps": 1000,
+                    "save_every_n_epochs": 1,
+                    "discrete_flow_shift": 14.5,
+                    "mixed_precision": "bf16",
+                    "gradient_checkpointing": True,
+                    "fp8_scaled": True,
+                    "fp8_llm": False,
+                },
+                "vram_settings": {
+                    "12": {"batch_size": 1, "block_swap": 12, "fp8_scaled": True, "fp8_llm": False},
+                    "16": {"batch_size": 1, "block_swap": 10, "fp8_scaled": True, "fp8_llm": False},
+                    "24": {"batch_size": 1, "block_swap": 8, "fp8_scaled": True, "fp8_llm": False},
+                    "32": {"batch_size": 1, "block_swap": 4, "fp8_scaled": False, "fp8_llm": False},
+                    ">32": {"batch_size": 1, "block_swap": 0, "fp8_scaled": False, "fp8_llm": False},
+                },
+            },
         }
 
     def get_resolution(self, model_name):
@@ -103,3 +129,11 @@ class ConfigManager:
             base["dit_path"] = ""
 
         return base
+
+    def get_required_subdirs(self, model_name):
+        conf = self.models.get(model_name, {})
+        return conf.get("required_subdirs", ["diffusion_models", "vae", "text_encoders"])
+
+    def get_cache_pattern(self, model_name):
+        conf = self.models.get(model_name, {})
+        return conf.get("cache_pattern", "*" + ("_qi" if model_name == "Qwen-Image" else "_zi") + ".safetensors")

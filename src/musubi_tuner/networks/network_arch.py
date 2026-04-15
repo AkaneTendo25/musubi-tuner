@@ -20,6 +20,11 @@ def detect_arch_config(unet):
 
         return WAN_TARGET_REPLACE_MODULES, [r".*(patch_embedding|text_embedding|time_embedding|time_projection|norm|head).*"]
 
+    if "DiTBlock" in module_class_names:
+        from .lora_mova import MOVA_TARGET_REPLACE_MODULES
+
+        return MOVA_TARGET_REPLACE_MODULES, [r".*(norm).*"]
+
     if "QwenImageTransformerBlock" in module_class_names:
         from .lora_qwen_image import QWEN_IMAGE_TARGET_REPLACE_MODULES
 

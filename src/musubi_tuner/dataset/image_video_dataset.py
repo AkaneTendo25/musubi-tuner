@@ -66,6 +66,23 @@ VIDEO_EXTENSIONS = [
     ".MPEG",
 ]  # some of them are not tested
 
+AUDIO_EXTENSIONS = [
+    ".wav",
+    ".flac",
+    ".mp3",
+    ".m4a",
+    ".aac",
+    ".ogg",
+    ".opus",
+    ".WAV",
+    ".FLAC",
+    ".MP3",
+    ".M4A",
+    ".AAC",
+    ".OGG",
+    ".OPUS",
+]
+
 # Architecture short names cannot contain underscore
 ARCHITECTURE_HUNYUAN_VIDEO = "hv"
 ARCHITECTURE_HUNYUAN_VIDEO_FULL = "hunyuan_video"
@@ -93,6 +110,8 @@ ARCHITECTURE_HUNYUAN_VIDEO_1_5 = "hv15"
 ARCHITECTURE_HUNYUAN_VIDEO_1_5_FULL = "hunyuan_video_1_5"
 ARCHITECTURE_Z_IMAGE = "zi"
 ARCHITECTURE_Z_IMAGE_FULL = "z_image"
+ARCHITECTURE_MOVA = "mova"
+ARCHITECTURE_MOVA_FULL = "mova"
 
 
 def glob_images(directory, base="*", caption_extension=None):
@@ -132,6 +151,18 @@ def glob_videos(directory, base="*"):
     video_paths = list(set(video_paths))  # remove duplicates
     video_paths.sort()
     return video_paths
+
+
+def glob_audios(directory, base="*"):
+    audio_paths = []
+    for ext in AUDIO_EXTENSIONS:
+        if base == "*":
+            audio_paths.extend(glob.glob(os.path.join(glob.escape(directory), base + ext)))
+        else:
+            audio_paths.extend(glob.glob(glob.escape(os.path.join(directory, base + ext))))
+    audio_paths = list(set(audio_paths))
+    audio_paths.sort()
+    return audio_paths
 
 
 def divisible_by(num: int, divisor: int) -> int:
@@ -205,6 +236,13 @@ class ItemInfo:
         self.fp_1f_clean_indices: Optional[list[int]] = None  # indices of clean latents for 1f
         self.fp_1f_target_index: Optional[int] = None  # target index for 1f clean latents
         self.fp_1f_no_post: Optional[bool] = None  # whether to add zero values as clean latent post
+
+        # Video/audio dataset specific
+        self.source_path: Optional[str] = None
+        self.audio_path: Optional[str] = None
+        self.frame_start: Optional[int] = None
+        self.target_fps: Optional[float] = None
+        self.video_fps: Optional[float] = None
 
     def __str__(self) -> str:
         return (
@@ -431,6 +469,37 @@ def save_latent_cache_z_image(item_info: ItemInfo, latent: torch.Tensor):
     save_latent_cache_common(item_info, sd, ARCHITECTURE_Z_IMAGE_FULL)
 
 
+def save_latent_cache_mova(
+    item_info: ItemInfo,
+    latent: torch.Tensor,
+    audio_latent: torch.Tensor,
+    conditioning_latent: torch.Tensor,
+    video_fps: Optional[float] = None,
+):
+    """MOVA architecture."""
+    assert latent.dim() == 4, "latent should be 4D tensor (channel, frame, height, width)"
+    assert audio_latent.dim() == 2, "audio_latent should be 2D tensor (channel, length)"
+    assert conditioning_latent.dim() == 4, "conditioning_latent should be 4D tensor (channel, frame, height, width)"
+
+    _, F, H, W = latent.shape
+    dtype_str = dtype_to_str(latent.dtype)
+    sd = {f"latents_{F}x{H}x{W}_{dtype_str}": latent.detach().cpu()}
+
+    audio_dtype_str = dtype_to_str(audio_latent.dtype)
+    sd[f"latents_audio_{audio_latent.shape[1]}_{audio_dtype_str}"] = audio_latent.detach().cpu()
+
+    cond_dtype_str = dtype_to_str(conditioning_latent.dtype)
+    _, F_cond, H_cond, W_cond = conditioning_latent.shape
+    sd[f"latents_image_{F_cond}x{H_cond}x{W_cond}_{cond_dtype_str}"] = conditioning_latent.detach().cpu()
+
+    if video_fps is None:
+        video_fps = item_info.video_fps
+    if video_fps is not None:
+        sd["video_fps_float32"] = torch.tensor(float(video_fps), dtype=torch.float32)
+
+    save_latent_cache_common(item_info, sd, ARCHITECTURE_MOVA_FULL)
+
+
 def save_latent_cache_common(item_info: ItemInfo, sd: dict[str, torch.Tensor], arch_fullname: str):
     metadata = {
         "architecture": arch_fullname,
@@ -559,6 +628,15 @@ def save_text_encoder_output_cache_z_image(item_info: ItemInfo, embed: torch.Ten
     save_text_encoder_output_cache_common(item_info, sd, ARCHITECTURE_Z_IMAGE_FULL)
 
 
+def save_text_encoder_output_cache_mova(item_info: ItemInfo, embed: torch.Tensor):
+    """MOVA architecture."""
+    sd = {}
+    dtype_str = dtype_to_str(embed.dtype)
+    sd[f"varlen_t5_{dtype_str}"] = embed.detach().cpu()
+
+    save_text_encoder_output_cache_common(item_info, sd, ARCHITECTURE_MOVA_FULL)
+
+
 def save_text_encoder_output_cache_common(item_info: ItemInfo, sd: dict[str, torch.Tensor], arch_fullname: str):
     for key, value in sd.items():
         # NaN check and show warning, replace NaN with 0
@@ -606,6 +684,7 @@ class BucketSelector:
     RESOLUTION_STEPS_KANDINSKY5 = 16
     RESOLUTION_STEPS_HUNYUAN_VIDEO_1_5 = 16
     RESOLUTION_STEPS_Z_IMAGE = 16
+    RESOLUTION_STEPS_MOVA = 16
 
     ARCHITECTURE_STEPS_MAP = {
         ARCHITECTURE_HUNYUAN_VIDEO: RESOLUTION_STEPS_HUNYUAN,
@@ -621,6 +700,7 @@ class BucketSelector:
         ARCHITECTURE_KANDINSKY5: RESOLUTION_STEPS_KANDINSKY5,
         ARCHITECTURE_HUNYUAN_VIDEO_1_5: RESOLUTION_STEPS_HUNYUAN_VIDEO_1_5,
         ARCHITECTURE_Z_IMAGE: RESOLUTION_STEPS_Z_IMAGE,
+        ARCHITECTURE_MOVA: RESOLUTION_STEPS_MOVA,
     }
 
     def __init__(
@@ -1413,11 +1493,18 @@ class VideoDatasource(ContentDatasource):
 
 
 class VideoDirectoryDatasource(VideoDatasource):
-    def __init__(self, video_directory: str, caption_extension: Optional[str] = None, control_directory: Optional[str] = None):
+    def __init__(
+        self,
+        video_directory: str,
+        caption_extension: Optional[str] = None,
+        control_directory: Optional[str] = None,
+        audio_directory: Optional[str] = None,
+    ):
         super().__init__()
         self.video_directory = video_directory
         self.caption_extension = caption_extension
         self.control_directory = control_directory  # 新しく追加: コントロール画像ディレクトリ
+        self.audio_directory = audio_directory
         self.current_idx = 0
 
         # glob videos
@@ -1465,6 +1552,27 @@ class VideoDirectoryDatasource(VideoDatasource):
                 )
                 raise ValueError(f"Could not find matching control videos/images for {missing_controls} videos")
 
+        self.audio_paths = {}
+        if self.audio_directory is not None:
+            logger.info(f"glob audios in {self.audio_directory}")
+            all_audio_paths = glob_audios(self.audio_directory)
+            audio_by_base = {}
+            for audio_path in all_audio_paths:
+                audio_by_base.setdefault(os.path.splitext(os.path.basename(audio_path))[0], []).append(audio_path)
+
+            for video_path in self.video_paths:
+                video_base = os.path.splitext(os.path.basename(video_path))[0]
+                matches = audio_by_base.get(video_base, [])
+                if matches:
+                    self.audio_paths[video_path] = matches[0]
+
+            missing_audios = len(self.video_paths) - len(self.audio_paths)
+            if missing_audios > 0:
+                missing_audio_videos = [video_path for video_path in self.video_paths if video_path not in self.audio_paths]
+                logger.error(f"Could not find matching audios for {missing_audios} videos: {missing_audio_videos}")
+                raise ValueError(f"Could not find matching audios for {missing_audios} videos")
+            logger.info(f"found {len(self.audio_paths)} matching audios")
+
     def is_indexable(self):
         return True
 
@@ -1477,7 +1585,7 @@ class VideoDirectoryDatasource(VideoDatasource):
         start_frame: Optional[int] = None,
         end_frame: Optional[int] = None,
         bucket_selector: Optional[BucketSelector] = None,
-    ) -> tuple[str, list[Image.Image], str, Optional[list[Image.Image]]]:
+    ) -> tuple[str, list[Image.Image], str, Optional[list[Image.Image]], Optional[str]]:
         video_path = self.video_paths[idx]
         video = self.get_video_data_from_path(video_path, start_frame, end_frame, bucket_selector)
 
@@ -1488,7 +1596,9 @@ class VideoDirectoryDatasource(VideoDatasource):
             control_path = self.control_paths[video_path]
             control = self.get_control_data_from_path(control_path, start_frame, end_frame, bucket_selector)
 
-        return video_path, video, caption, control
+        audio_path = self.audio_paths.get(video_path) if self.audio_directory is not None else None
+
+        return video_path, video, caption, control, audio_path
 
     def get_caption(self, idx: int) -> tuple[str, str]:
         video_path = self.video_paths[idx]
@@ -1548,6 +1658,15 @@ class VideoJsonlDatasource(VideoDatasource):
                 raise ValueError(f"Some videos do not have control paths in JSONL data: {missing_control_videos}")
             logger.info(f"found {control_count} control videos/images in JSONL data")
 
+        self.has_audio = any("audio_path" in item for item in self.data)
+        if self.has_audio:
+            audio_count = sum(1 for item in self.data if "audio_path" in item and item["audio_path"])
+            if audio_count < len(self.data):
+                missing_audio_videos = [item["video_path"] for item in self.data if "audio_path" not in item or not item["audio_path"]]
+                logger.error(f"Some videos do not have audio paths in JSONL data: {missing_audio_videos}")
+                raise ValueError(f"Some videos do not have audio paths in JSONL data: {missing_audio_videos}")
+            logger.info(f"found {audio_count} audio paths in JSONL data")
+
     def is_indexable(self):
         return True
 
@@ -1560,7 +1679,7 @@ class VideoJsonlDatasource(VideoDatasource):
         start_frame: Optional[int] = None,
         end_frame: Optional[int] = None,
         bucket_selector: Optional[BucketSelector] = None,
-    ) -> tuple[str, list[Image.Image], str, Optional[list[Image.Image]]]:
+    ) -> tuple[str, list[Image.Image], str, Optional[list[Image.Image]], Optional[str]]:
         data = self.data[idx]
         video_path = data["video_path"]
         video = self.get_video_data_from_path(video_path, start_frame, end_frame, bucket_selector)
@@ -1572,7 +1691,7 @@ class VideoJsonlDatasource(VideoDatasource):
             control_path = data["control_path"]
             control = self.get_control_data_from_path(control_path, start_frame, end_frame, bucket_selector)
 
-        return video_path, video, caption, control
+        return video_path, video, caption, control, data.get("audio_path")
 
     def get_caption(self, idx: int) -> tuple[str, str]:
         data = self.data[idx]
@@ -2072,6 +2191,7 @@ class VideoDataset(BaseDataset):
     TARGET_FPS_FRAMEPACK = 30.0
     TARGET_FPS_FLUX_KONTEXT = 1.0  # VideoDataset is not used for Flux Kontext, but this is a placeholder
     TARGET_FPS_HUNYUAN_VIDEO_1_5 = 24.0
+    TARGET_FPS_MOVA = 16.0
 
     def __init__(
         self,
@@ -2090,6 +2210,7 @@ class VideoDataset(BaseDataset):
         video_directory: Optional[str] = None,
         video_jsonl_file: Optional[str] = None,
         control_directory: Optional[str] = None,
+        audio_directory: Optional[str] = None,
         cache_directory: Optional[str] = None,
         fp_latent_window_size: Optional[int] = 9,
         debug_dataset: bool = False,
@@ -2109,6 +2230,7 @@ class VideoDataset(BaseDataset):
         self.video_directory = video_directory
         self.video_jsonl_file = video_jsonl_file
         self.control_directory = control_directory
+        self.audio_directory = audio_directory
         self.frame_extraction = frame_extraction
         self.frame_stride = frame_stride
         self.frame_sample = frame_sample
@@ -2129,6 +2251,8 @@ class VideoDataset(BaseDataset):
             self.target_fps = VideoDataset.TARGET_FPS_HUNYUAN
         elif self.architecture == ARCHITECTURE_HUNYUAN_VIDEO_1_5:
             self.target_fps = VideoDataset.TARGET_FPS_HUNYUAN_VIDEO_1_5
+        elif self.architecture == ARCHITECTURE_MOVA:
+            self.target_fps = VideoDataset.TARGET_FPS_MOVA
         else:
             raise ValueError(f"Unsupported architecture: {self.architecture}")
 
@@ -2150,7 +2274,7 @@ class VideoDataset(BaseDataset):
         self.target_frames = target_frames
 
         if video_directory is not None:
-            self.datasource = VideoDirectoryDatasource(video_directory, caption_extension, control_directory)
+            self.datasource = VideoDirectoryDatasource(video_directory, caption_extension, control_directory, audio_directory)
         elif video_jsonl_file is not None:
             self.datasource = VideoJsonlDatasource(video_jsonl_file)
 
@@ -2176,6 +2300,8 @@ class VideoDataset(BaseDataset):
             metadata["video_jsonl_file"] = os.path.basename(self.video_jsonl_file)
         if self.control_directory is not None:
             metadata["control_directory"] = os.path.basename(self.control_directory)
+        if self.audio_directory is not None:
+            metadata["audio_directory"] = os.path.basename(self.audio_directory)
         metadata["frame_extraction"] = self.frame_extraction
         metadata["frame_stride"] = self.frame_stride
         metadata["frame_sample"] = self.frame_sample
@@ -2210,7 +2336,12 @@ class VideoDataset(BaseDataset):
                         break  # submit batch if possible
 
                 for future in completed_futures:
-                    original_frame_size, video_key, video, caption, control = future.result()
+                    result = future.result()
+                    if len(result) == 5:
+                        original_frame_size, video_key, video, caption, control = result
+                        audio_path = None
+                    else:
+                        original_frame_size, video_key, video, caption, control, audio_path = result
 
                     frame_count = len(video)
                     video = np.stack(video, axis=0)
@@ -2282,6 +2413,11 @@ class VideoDataset(BaseDataset):
                         item_info.latent_cache_path = self.get_latent_cache_path(item_info)
                         item_info.control_content = cropped_control  # None is allowed
                         item_info.fp_latent_window_size = self.fp_latent_window_size
+                        item_info.source_path = video_key
+                        item_info.audio_path = audio_path
+                        item_info.frame_start = crop_pos
+                        item_info.target_fps = self.target_fps
+                        item_info.video_fps = self.target_fps
 
                         batch = batches.get(batch_key, [])
                         batch.append(item_info)
@@ -2302,14 +2438,20 @@ class VideoDataset(BaseDataset):
 
         for operator in self.datasource:
 
-            def fetch_and_resize(op: callable) -> tuple[tuple[int, int], str, list[np.ndarray], str, Optional[list[np.ndarray]]]:
+            def fetch_and_resize(
+                op: callable,
+            ) -> tuple[tuple[int, int], str, list[np.ndarray], str, Optional[list[np.ndarray]], Optional[str]]:
                 result = op()
 
                 if len(result) == 3:  # for backward compatibility TODO remove this in the future
                     video_key, video, caption = result
                     control = None
-                else:
+                    audio_path = None
+                elif len(result) == 4:
                     video_key, video, caption, control = result
+                    audio_path = None
+                else:
+                    video_key, video, caption, control, audio_path = result
 
                 video: list[np.ndarray]
                 frame_size = (video[0].shape[1], video[0].shape[0])
@@ -2322,7 +2464,7 @@ class VideoDataset(BaseDataset):
                 if control is not None:
                     control = [resize_image_to_bucket(frame, bucket_reso) for frame in control]
 
-                return frame_size, video_key, video, caption, control
+                return frame_size, video_key, video, caption, control, audio_path
 
             future = executor.submit(fetch_and_resize, operator)
             futures.append(future)

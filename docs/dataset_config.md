@@ -154,6 +154,7 @@ bucket_no_upscale = false
 
 [[datasets]]
 video_directory = "/path/to/video_dir"
+audio_directory = "/path/to/audio_dir" # optional, matched by basename; useful for MOVA
 cache_directory = "/path/to/cache_directory" # recommended to set cache directory
 target_frames = [1, 25, 45]
 frame_extraction = "head"
@@ -170,6 +171,8 @@ max_frames = 45
 
 `video_directory` is the directory containing videos. The captions are stored in text files with the same filename as the video, but with the extension specified by `caption_extension` (for example, `video1.mp4` and `video1.txt`).
 
+`audio_directory` is optional. If specified, audio files are matched to videos by basename (for example, `video1.mp4` with `video1.wav`). This is required for architectures that need paired audio files such as MOVA when audio is not embedded in the source video.
+
 __In HunyuanVideo and Wan2.1, the number of `target_frames` must be "N\*4+1" (N=0,1,2,...).__ Otherwise, it will be truncated to the nearest "N*4+1".
 
 In FramePack, it is recommended to set `frame_extraction` to `full` and `max_frames` to a sufficiently large value, as it can handle longer videos. However, if the video is too long, an Out of Memory error may occur during VAE encoding. The videos in FramePack are trimmed to "N * latent_window_size * 4 + 1" frames (for example, 37, 73, 109... if `latent_window_size` is 9).
@@ -185,6 +188,8 @@ If `source_fps` is not specified (default), all frames of the video will be used
 動画固有のパラメータ（target_frames, frame_extraction, frame_stride, frame_sample, max_frames, source_fps）は、各datasetsセクションに設定する必要があります。
 
 `video_directory`は動画を含むディレクトリのパスです。キャプションは、動画と同じファイル名で、`caption_extension`で指定した拡張子のテキストファイルに格納してください（例：`video1.mp4`と`video1.txt`）。
+
+`audio_directory`は任意です。指定した場合、音声ファイルはベース名で動画に対応付けられます（例：`video1.mp4`と`video1.wav`）。MOVAのように音声ペアが必要で、元動画に音声が埋め込まれていないアーキテクチャではこの指定が必要です。
 
 __HunyuanVideoおよびWan2.1では、target_framesの数値は「N\*4+1」である必要があります。__ これ以外の値の場合は、最も近いN\*4+1の値に切り捨てられます。
 
@@ -236,15 +241,20 @@ JSONL file format for metadata:
 ```json
 {"video_path": "/path/to/video1.mp4", "caption": "A caption for video1"}
 {"video_path": "/path/to/video2.mp4", "caption": "A caption for video2"}
+{"video_path": "/path/to/video3.mp4", "audio_path": "/path/to/video3.wav", "caption": "A caption for video3"}
 ```
 
 `video_path` can be a directory containing multiple images.
+
+`audio_path` is optional and is used by architectures that require paired audio, such as MOVA.
 
 <details>
 <summary>日本語</summary>
 metadata jsonl ファイルを使用する場合、caption_extension は必要ありません。また、cache_directory は必須です。
 
 `video_path`は、複数の画像を含むディレクトリのパスでも構いません。
+
+`audio_path`は任意で、MOVAのように音声ペアが必要なアーキテクチャで使用されます。
 
 他の注意事項は今までのデータセットと同様です。
 </details>
