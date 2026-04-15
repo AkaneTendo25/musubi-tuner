@@ -1,7 +1,7 @@
 """
-Cache text encoder outputs for ACE-Step 1.5 architecture.
+Cache text encoder outputs for ACE-Step architecture.
 
-This script encodes text prompts using ACE-Step's Qwen3-Embedding text encoder
+This script encodes text prompts using an ACE-Step-compatible text encoder
 and caches the embeddings for faster training.
 """
 
@@ -23,6 +23,7 @@ import musubi_tuner.cache_text_encoder_outputs as cache_text_encoder_outputs
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
+_warned_missing_embed_tokens = False
 
 
 def _get_embed_tokens_layer(text_encoder):
@@ -42,12 +43,13 @@ def encode_and_save_batch(
     device: torch.device,
     max_length: int,
     condition_encoder=None,
+    cache_metadata: dict[str, str] | None = None,
 ):
     """Encode a batch of prompts and save their text encoder outputs.
 
     Args:
-        tokenizer: Qwen3 tokenizer
-        text_encoder: Qwen3 text encoder model
+        tokenizer: ACE-Step-compatible tokenizer
+        text_encoder: ACE-Step-compatible text encoder model
         batch: List of ItemInfo containing captions to encode
         device: Device to use for encoding
         max_length: Maximum token length
@@ -138,15 +140,65 @@ def encode_and_save_batch(
                     refer_audio_order_mask=refer_audio_order_mask,
                 )
         else:
-            # Fallback mode: cache raw text encoder outputs.
-            hidden_states, attention_mask = acestep_utils.encode_text_for_acestep(
-                tokenizer,
-                text_encoder,
+            # Fallback mode: cache prompt branch + lyric branch separately so the
+            # trainer can still run the ACE-Step condition encoder correctly.
+            formatted_prompt = acestep_utils.format_text_for_acestep(
                 caption,
-                lyrics,
-                max_length=max_length,
-                device=str(device),
+                "",
+                bpm=item_bpm,
+                key=item_key,
+                time_signature=item_timesig,
+                duration=item_duration,
             )
+            if "\n\n# Lyrics\n" in formatted_prompt:
+                formatted_prompt = formatted_prompt.split("\n\n# Lyrics\n", 1)[0]
+
+            text_inputs = tokenizer(
+                formatted_prompt,
+                max_length=max_length,
+                padding="max_length",
+                truncation=True,
+                return_tensors="pt",
+            )
+            text_input_ids = text_inputs["input_ids"].to(device)
+            attention_mask = text_inputs["attention_mask"].to(device)
+
+            with torch.no_grad():
+                text_outputs = text_encoder(text_input_ids)
+                if hasattr(text_outputs, "last_hidden_state"):
+                    hidden_states = text_outputs.last_hidden_state
+                elif isinstance(text_outputs, tuple):
+                    hidden_states = text_outputs[0]
+                else:
+                    hidden_states = text_outputs
+
+            lyrics_text = acestep_utils.format_lyrics_for_acestep(lyrics, language="unknown")
+            lyric_inputs = tokenizer(
+                lyrics_text,
+                max_length=2048,
+                padding="max_length",
+                truncation=True,
+                return_tensors="pt",
+            )
+            lyric_input_ids = lyric_inputs["input_ids"].to(device)
+            lyric_attention_mask = lyric_inputs["attention_mask"].to(device)
+
+            embed_tokens = _get_embed_tokens_layer(text_encoder)
+            if embed_tokens is not None:
+                with torch.no_grad():
+                    lyric_hidden_states = embed_tokens(lyric_input_ids)
+            else:
+                global _warned_missing_embed_tokens
+                if not _warned_missing_embed_tokens:
+                    logger.warning("text_encoder has no embedding layer accessor; using zero lyric embeddings")
+                    _warned_missing_embed_tokens = True
+                lyric_hidden_states = torch.zeros(
+                    lyric_input_ids.shape[0],
+                    lyric_input_ids.shape[1],
+                    hidden_states.shape[-1],
+                    device=device,
+                    dtype=hidden_states.dtype,
+                )
 
         # Remove batch dimension and move to CPU
         hidden_states = hidden_states.squeeze(0).cpu()  # [L, D]
@@ -157,9 +209,25 @@ def encode_and_save_batch(
         hidden_states_trimmed = hidden_states[:actual_length]  # [actual_length, D]
         attention_mask_trimmed = attention_mask[:actual_length]  # [actual_length]
 
+        lyric_hidden_states_trimmed = None
+        lyric_attention_mask_trimmed = None
+        if condition_encoder is None:
+            lyric_hidden_states = lyric_hidden_states.squeeze(0).cpu()
+            lyric_attention_mask = lyric_attention_mask.squeeze(0).cpu()
+            lyric_length = int(lyric_attention_mask.sum().item())
+            lyric_hidden_states_trimmed = lyric_hidden_states[:lyric_length]
+            lyric_attention_mask_trimmed = lyric_attention_mask[:lyric_length]
+
         logger.debug(f"Saving text cache for {item.item_key}: {hidden_states_trimmed.shape}")
 
-        save_text_encoder_output_cache_acestep(item, hidden_states_trimmed, attention_mask_trimmed)
+        save_text_encoder_output_cache_acestep(
+            item,
+            hidden_states_trimmed,
+            attention_mask_trimmed,
+            lyric_hidden_states=lyric_hidden_states_trimmed,
+            lyric_attention_mask=lyric_attention_mask_trimmed,
+            cache_metadata=cache_metadata,
+        )
 
 
 def main():
@@ -185,8 +253,8 @@ def main():
         datasets
     )
 
-    # Load Qwen3 tokenizer and text encoder
-    logger.info(f"Loading Qwen3 text encoder from {args.text_encoder}")
+    # Load ACE-Step-compatible tokenizer and text encoder
+    logger.info(f"Loading text encoder from {args.text_encoder}")
     tokenizer, text_encoder = acestep_utils.load_text_encoder(
         args.text_encoder,
         device=str(device),
@@ -196,6 +264,10 @@ def main():
 
     condition_encoder = None
     model = None
+    cache_metadata = acestep_utils.build_acestep_text_cache_metadata(
+        cache_kind="raw",
+        text_encoder_path=args.text_encoder,
+    )
     if args.dit is not None:
         logger.info(f"Loading ACE-Step DiT condition encoder from {args.dit}")
         model, _ = acestep_utils.load_acestep_model(
@@ -206,12 +278,18 @@ def main():
         )
         condition_encoder = model.encoder
         condition_encoder.eval()
+        cache_metadata = acestep_utils.build_acestep_text_cache_metadata(
+            cache_kind="conditioned",
+            text_encoder_path=args.text_encoder,
+            model_config=model.config,
+            model_path=args.dit,
+        )
 
     # Get max length from args
     max_length = args.max_length
 
-    # Encode with Qwen3 text encoder
-    logger.info("Encoding prompts with Qwen3 text encoder")
+    # Encode with the ACE-Step-compatible text encoder
+    logger.info("Encoding prompts with text encoder")
 
     def encode_for_text_encoder(batch: list[ItemInfo]):
         nonlocal tokenizer, text_encoder, condition_encoder
@@ -222,6 +300,7 @@ def main():
             device,
             max_length,
             condition_encoder=condition_encoder,
+            cache_metadata=cache_metadata,
         )
 
     cache_text_encoder_outputs.process_text_encoder_batches(
@@ -253,7 +332,7 @@ def acestep_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentPa
         "--text_encoder",
         type=str,
         required=True,
-        help="Qwen3-Embedding text encoder checkpoint path or directory",
+        help="ACE-Step-compatible text encoder checkpoint path or directory",
     )
     parser.add_argument(
         "--max_length",

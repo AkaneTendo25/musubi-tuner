@@ -1,7 +1,7 @@
 """
-ACE-Step 1.5 LoRA training with musubi-tuner infrastructure.
+ACE-Step LoRA training with musubi-tuner infrastructure.
 
-This module provides LoRA fine-tuning for ACE-Step 1.5 audio generation model,
+This module provides LoRA fine-tuning for ACE-Step audio generation models,
 following the NetworkTrainer pattern from musubi-tuner.
 """
 
@@ -11,6 +11,7 @@ from typing import Optional
 
 import torch
 from accelerate import Accelerator
+from transformers.cache_utils import DynamicCache, EncoderDecoderCache
 
 from musubi_tuner.dataset.image_video_dataset import ARCHITECTURE_ACESTEP, ARCHITECTURE_ACESTEP_FULL
 from musubi_tuner.acestep import acestep_utils
@@ -29,6 +30,7 @@ from musubi_tuner.hv_train_network import (
     read_config_from_file,
 )
 from musubi_tuner.utils import model_utils
+from musubi_tuner.utils.safetensors_utils import MemoryEfficientSafeOpen
 
 import logging
 
@@ -61,7 +63,11 @@ class AceStepNetworkTrainer(NetworkTrainer):
         self._discrete_timesteps: list = compute_shifted_timesteps(8, 3.0)
         self._timestep_mu: float = -0.4
         self._timestep_sigma: float = 1.0
+        self._encoder_hidden_size: Optional[int] = None
+        self._model_arch_signature: Optional[str] = None
         self._silence_latent: Optional[torch.Tensor] = None  # Loaded from silence_latent.pt
+        self._warned_missing_lyric_cache: bool = False
+        self._allow_missing_silence_latent: bool = False
 
     # region model specific
 
@@ -101,6 +107,7 @@ class AceStepNetworkTrainer(NetworkTrainer):
             self._is_turbo = is_turbo_str in ("true", "1", "yes")
 
         self._acestep_shift = getattr(args, "acestep_shift", None)  # None = auto
+        self._allow_missing_silence_latent = getattr(args, "acestep_allow_missing_silence_latent", False)
 
         # Provisional defaults (finalized in load_transformer when we have model config)
         self.default_discrete_flow_shift = 3.0
@@ -283,7 +290,7 @@ class AceStepNetworkTrainer(NetworkTrainer):
         """Generate audio sample during training.
 
         For ACE-Step turbo model: 8-step discrete timesteps, no CFG.
-        For ACE-Step base/sft model: configurable steps (default 60), CFG enabled.
+        For ACE-Step base/sft model: configurable steps (default 50), CFG enabled.
         Returns audio as [B, C, F, H, W] format for compatibility (F=1, audio as 2D).
 
         This implementation follows the official ACE-Step generate_audio method.
@@ -302,6 +309,8 @@ class AceStepNetworkTrainer(NetworkTrainer):
         if text_hidden_states is None:
             text_hidden_states = sample_parameter.get("encoder_hidden_states")
             text_attention_mask = sample_parameter.get("encoder_attention_mask")
+        negative_text_hidden_states = sample_parameter.get("negative_text_hidden_states")
+        negative_text_attention_mask = sample_parameter.get("negative_text_attention_mask")
         lyric_hidden_states = sample_parameter.get("lyric_hidden_states")
         lyric_attention_mask = sample_parameter.get("lyric_attention_mask")
 
@@ -313,9 +322,14 @@ class AceStepNetworkTrainer(NetworkTrainer):
 
         text_hidden_states = text_hidden_states.to(device=device, dtype=dtype)
         text_attention_mask = text_attention_mask.to(device=device)
+        if negative_text_hidden_states is not None and negative_text_attention_mask is not None:
+            negative_text_hidden_states = negative_text_hidden_states.to(device=device, dtype=dtype)
+            negative_text_attention_mask = negative_text_attention_mask.to(device=device)
+        else:
+            negative_text_hidden_states = None
+            negative_text_attention_mask = None
 
-        # Log input shape for debugging
-        logger.info(f"text_hidden_states shape: {text_hidden_states.shape}, unique values: {text_hidden_states.unique().numel()}")
+        logger.info(f"text_hidden_states shape: {text_hidden_states.shape}")
 
         # Determine audio duration from sample parameter or use default
         duration = sample_parameter.get("audio_duration", 30.0)  # Default 30 seconds
@@ -353,21 +367,31 @@ class AceStepNetworkTrainer(NetworkTrainer):
         # Use model.generate_audio to match original ACE-Step inference path exactly.
         # This avoids subtle drift from hand-rolled denoising loops.
         seed = generator.initial_seed() if generator is not None else None
+        effective_guidance_scale = guidance_scale if do_classifier_free_guidance and guidance_scale is not None else 1.0
+        if negative_text_hidden_states is not None and effective_guidance_scale <= 1.0:
+            logger.warning("negative_prompt specified with guidance_scale<=1.0; using guidance_scale=7.0")
+            effective_guidance_scale = BASE_MODEL_DEFAULTS["guidance_scale"]
 
         # Compute timestep schedule for the requested steps and shift
         t_schedule = torch.tensor(
             compute_shifted_timesteps(sample_steps, discrete_flow_shift),
             device=device, dtype=dtype,
         )
-        logger.info(f"Running model.generate_audio: {len(t_schedule)} steps, "
-                    f"shift={discrete_flow_shift}, is_turbo={self._is_turbo}, seed={seed}")
-        with torch.no_grad():
-            gen_outputs = model.generate_audio(
+        negative_prompt_enabled = negative_text_hidden_states is not None and negative_text_attention_mask is not None
+        if negative_prompt_enabled:
+            logger.info(
+                f"Running custom negative-prompt ACE-Step sampling: {len(t_schedule)} schedule points, "
+                f"shift={discrete_flow_shift}, guidance_scale={effective_guidance_scale}, seed={seed}"
+            )
+            latents = self._generate_audio_with_negative_prompt_guidance(
+                model=model,
                 text_hidden_states=text_hidden_states,
                 text_attention_mask=text_attention_mask,
+                negative_text_hidden_states=negative_text_hidden_states,
+                negative_text_attention_mask=negative_text_attention_mask,
                 lyric_hidden_states=lyric_hidden_states,
                 lyric_attention_mask=lyric_attention_mask,
-                refer_audio_acoustic_hidden_states_packed=refer_audio_hidden,
+                refer_audio_hidden=refer_audio_hidden,
                 refer_audio_order_mask=refer_audio_order_mask,
                 src_latents=src_latents,
                 chunk_masks=chunk_masks,
@@ -375,12 +399,34 @@ class AceStepNetworkTrainer(NetworkTrainer):
                 silence_latent=silence_latent,
                 attention_mask=attention_mask,
                 seed=seed,
-                fix_nfe=len(t_schedule),
-                infer_method="ode",
-                shift=discrete_flow_shift,
                 timesteps=t_schedule,
+                guidance_scale=effective_guidance_scale,
             )
-        latents = gen_outputs["target_latents"]
+        else:
+            logger.info(f"Running model.generate_audio: {len(t_schedule)} steps, "
+                        f"shift={discrete_flow_shift}, is_turbo={self._is_turbo}, "
+                        f"guidance_scale={effective_guidance_scale}, seed={seed}")
+            with torch.no_grad():
+                gen_outputs = model.generate_audio(
+                    text_hidden_states=text_hidden_states,
+                    text_attention_mask=text_attention_mask,
+                    lyric_hidden_states=lyric_hidden_states,
+                    lyric_attention_mask=lyric_attention_mask,
+                    refer_audio_acoustic_hidden_states_packed=refer_audio_hidden,
+                    refer_audio_order_mask=refer_audio_order_mask,
+                    src_latents=src_latents,
+                    chunk_masks=chunk_masks,
+                    is_covers=is_covers,
+                    silence_latent=silence_latent,
+                    attention_mask=attention_mask,
+                    seed=seed,
+                    fix_nfe=len(t_schedule),
+                    infer_method="ode",
+                    diffusion_guidance_scale=effective_guidance_scale,
+                    shift=discrete_flow_shift,
+                    timesteps=t_schedule,
+                )
+            latents = gen_outputs["target_latents"]
 
         # Restore model training state
         if was_training:
@@ -485,11 +531,12 @@ class AceStepNetworkTrainer(NetworkTrainer):
         if self._is_turbo:
             default_steps = TURBO_MODEL_DEFAULTS["inference_steps"]  # 8
         else:
-            default_steps = BASE_MODEL_DEFAULTS["inference_steps"]  # 60
+            default_steps = BASE_MODEL_DEFAULTS["inference_steps"]  # 50
 
         sample_steps = sample_parameter.get("sample_steps", default_steps)
         seed = sample_parameter.get("seed")
         prompt = sample_parameter.get("prompt", "")
+        negative_prompt = sample_parameter.get("negative_prompt", "")
 
         device = accelerator.device
         if seed is not None:
@@ -526,7 +573,7 @@ class AceStepNetworkTrainer(NetworkTrainer):
             height=0,  # Not used for audio
             frame_count=0,  # Not used for audio
             generator=generator,
-            do_classifier_free_guidance=not self._is_turbo,  # CFG for base only
+            do_classifier_free_guidance=(not self._is_turbo) or bool(negative_prompt),
             guidance_scale=sample_parameter.get("guidance_scale", self.default_guidance_scale),
             cfg_scale=None,
         )
@@ -612,10 +659,17 @@ class AceStepNetworkTrainer(NetworkTrainer):
             self._is_turbo = config.get("is_turbo", True)
         # Store silence_latent from checkpoint (loaded from silence_latent.pt)
         self._silence_latent = config.get("silence_latent", None)
+        self._model_arch_signature = config.get("arch_signature")
 
         # Store timestep distribution parameters from model config (for non-turbo training)
         self._timestep_mu = config.get("timestep_mu", -0.4)
         self._timestep_sigma = config.get("timestep_sigma", 1.0)
+        self._encoder_hidden_size = config.get("encoder_hidden_size", config.get("hidden_size", None))
+        if self._silence_latent is None and not self._allow_missing_silence_latent:
+            raise ValueError(
+                f"ACE-Step checkpoint at {dit_path} is missing silence_latent.pt. "
+                "Use a complete checkpoint or pass --acestep_allow_missing_silence_latent to override."
+            )
 
         # Determine shift value
         if self._acestep_shift is not None:
@@ -638,6 +692,7 @@ class AceStepNetworkTrainer(NetworkTrainer):
             self.default_guidance_scale = BASE_MODEL_DEFAULTS["guidance_scale"]  # 7.0
 
         logger.info(f"ACE-Step: is_turbo={self._is_turbo}, shift={self._shift}, "
+                    f"encoder_hidden_size={self._encoder_hidden_size}, "
                     f"guidance_scale={self.default_guidance_scale}, "
                     f"timestep_mu={self._timestep_mu}, timestep_sigma={self._timestep_sigma}")
 
@@ -662,6 +717,205 @@ class AceStepNetworkTrainer(NetworkTrainer):
         model.switch_block_swap_for_training = _switch_block_swap_for_training
 
         return model
+
+    def validate_training_setup(self, args: argparse.Namespace, train_dataset_group, transformer) -> None:
+        """Validate ACE-Step caches against the loaded model architecture."""
+        expected_arch_signature = None
+        transformer_config = getattr(transformer, "config", None)
+        if transformer_config is not None:
+            expected_arch_signature = acestep_utils.build_acestep_model_arch_signature(transformer_config)
+
+        checked_files = 0
+        errors = []
+        allow_legacy = getattr(args, "acestep_allow_legacy_text_cache", False)
+        normalized_cache_text_encoder_sources = set()
+        normalized_runtime_text_encoder = self._normalize_metadata_source(getattr(args, "text_encoder", None))
+
+        for dataset in getattr(train_dataset_group, "datasets", []):
+            if getattr(dataset, "architecture", None) != ARCHITECTURE_ACESTEP:
+                continue
+
+            for cache_file in dataset.get_all_text_encoder_output_cache_files():
+                checked_files += 1
+                with MemoryEfficientSafeOpen(cache_file) as f:
+                    metadata = f.metadata()
+                    tensor_keys = list(f.keys())
+                cache_text_encoder_source = self._normalize_metadata_source((metadata or {}).get("acestep_text_encoder_source"))
+                if cache_text_encoder_source:
+                    normalized_cache_text_encoder_sources.add(cache_text_encoder_source)
+
+                try:
+                    acestep_utils.validate_acestep_text_cache(
+                        metadata,
+                        tensor_keys,
+                        expected_dit_arch_signature=expected_arch_signature,
+                        allow_legacy=allow_legacy,
+                    )
+                except ValueError as e:
+                    errors.append(f"{cache_file}: {e}")
+                    if len(errors) >= 20:
+                        break
+            if len(errors) >= 20:
+                break
+
+        if len(normalized_cache_text_encoder_sources) > 1:
+            errors.append(
+                "ACE-Step text caches were built with multiple text encoder sources: "
+                + ", ".join(sorted(normalized_cache_text_encoder_sources))
+            )
+        if normalized_runtime_text_encoder and normalized_cache_text_encoder_sources:
+            if normalized_runtime_text_encoder not in normalized_cache_text_encoder_sources:
+                errors.append(
+                    "sample-generation text_encoder does not match the cached ACE-Step text encoder source: "
+                    f"{normalized_runtime_text_encoder} not in {sorted(normalized_cache_text_encoder_sources)}"
+                )
+
+        if errors:
+            error_body = "\n".join(errors)
+            remaining = max(0, checked_files - min(checked_files, len(errors)))
+            if remaining > 0:
+                error_body += f"\n... and {remaining} more cache file(s) were inspected."
+            raise ValueError(f"ACE-Step cache compatibility validation failed:\n{error_body}")
+
+        logger.info(f"Validated {checked_files} ACE-Step text cache file(s) against the loaded model architecture")
+
+    @staticmethod
+    def _normalize_metadata_source(value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        value = str(value).strip()
+        if not value:
+            return None
+        expanded = os.path.expanduser(value)
+        if os.path.exists(expanded):
+            return os.path.normcase(os.path.abspath(expanded))
+        return os.path.normcase(value)
+
+    @staticmethod
+    def _fallback_cfg_forward(pred_cond: torch.Tensor, pred_uncond: torch.Tensor, guidance_scale: float) -> torch.Tensor:
+        return pred_uncond + guidance_scale * (pred_cond - pred_uncond)
+
+    @staticmethod
+    def _get_upstream_guidance_helpers(model) -> tuple[object, object, object]:
+        generate_audio = getattr(model, "generate_audio", None)
+        if generate_audio is None:
+            return None, None, None
+        fn = getattr(generate_audio, "__func__", generate_audio)
+        fn_globals = getattr(fn, "__globals__", {})
+        return fn_globals.get("apg_forward"), fn_globals.get("cfg_forward"), fn_globals.get("MomentumBuffer")
+
+    def _generate_audio_with_negative_prompt_guidance(
+        self,
+        model,
+        text_hidden_states: torch.Tensor,
+        text_attention_mask: torch.Tensor,
+        negative_text_hidden_states: torch.Tensor,
+        negative_text_attention_mask: torch.Tensor,
+        lyric_hidden_states: torch.Tensor,
+        lyric_attention_mask: torch.Tensor,
+        refer_audio_hidden: torch.Tensor,
+        refer_audio_order_mask: torch.Tensor,
+        src_latents: torch.Tensor,
+        chunk_masks: torch.Tensor,
+        is_covers: torch.Tensor,
+        silence_latent: torch.Tensor,
+        attention_mask: torch.Tensor,
+        seed: Optional[int],
+        timesteps: torch.Tensor,
+        guidance_scale: float,
+    ) -> torch.Tensor:
+        required_attrs = ("prepare_condition", "prepare_noise", "decoder")
+        missing_attrs = [attr for attr in required_attrs if not hasattr(model, attr)]
+        if missing_attrs:
+            raise ValueError(
+                f"AceStep model is missing required sampling helpers for negative prompt guidance: {missing_attrs}"
+            )
+
+        encoder_hidden_states, encoder_attention_mask, context_latents = model.prepare_condition(
+            text_hidden_states=text_hidden_states,
+            text_attention_mask=text_attention_mask,
+            lyric_hidden_states=lyric_hidden_states,
+            lyric_attention_mask=lyric_attention_mask,
+            refer_audio_acoustic_hidden_states_packed=refer_audio_hidden,
+            refer_audio_order_mask=refer_audio_order_mask,
+            hidden_states=src_latents,
+            attention_mask=attention_mask,
+            silence_latent=silence_latent,
+            src_latents=src_latents,
+            chunk_masks=chunk_masks,
+            is_covers=is_covers,
+            precomputed_lm_hints_25Hz=None,
+            audio_codes=None,
+        )
+        negative_encoder_hidden_states, negative_encoder_attention_mask, negative_context_latents = model.prepare_condition(
+            text_hidden_states=negative_text_hidden_states,
+            text_attention_mask=negative_text_attention_mask,
+            lyric_hidden_states=lyric_hidden_states,
+            lyric_attention_mask=lyric_attention_mask,
+            refer_audio_acoustic_hidden_states_packed=refer_audio_hidden,
+            refer_audio_order_mask=refer_audio_order_mask,
+            hidden_states=src_latents,
+            attention_mask=attention_mask,
+            silence_latent=silence_latent,
+            src_latents=src_latents,
+            chunk_masks=chunk_masks,
+            is_covers=is_covers,
+            precomputed_lm_hints_25Hz=None,
+            audio_codes=None,
+        )
+
+        noise = model.prepare_noise(context_latents, seed)
+        xt = noise
+
+        apg_forward, cfg_forward, momentum_buffer_cls = self._get_upstream_guidance_helpers(model)
+        if cfg_forward is None:
+            cfg_forward = self._fallback_cfg_forward
+        momentum_buffer = momentum_buffer_cls() if apg_forward is not None and momentum_buffer_cls is not None else None
+        past_key_values = EncoderDecoderCache(DynamicCache(), DynamicCache())
+
+        decoder_attention_mask = torch.cat([attention_mask, attention_mask], dim=0)
+        encoder_attention_mask_cat = torch.cat([encoder_attention_mask, negative_encoder_attention_mask], dim=0)
+        context_latents_cat = torch.cat([context_latents, negative_context_latents], dim=0)
+        encoder_hidden_states_cat = torch.cat([encoder_hidden_states, negative_encoder_hidden_states], dim=0)
+
+        with torch.no_grad():
+            for t_curr, t_prev in zip(timesteps[:-1], timesteps[1:]):
+                x = torch.cat([xt, xt], dim=0)
+                t_curr_tensor = t_curr * torch.ones((x.shape[0],), device=x.device, dtype=x.dtype)
+
+                decoder_outputs = model.decoder(
+                    hidden_states=x,
+                    timestep=t_curr_tensor,
+                    timestep_r=t_curr_tensor,
+                    attention_mask=decoder_attention_mask,
+                    encoder_hidden_states=encoder_hidden_states_cat,
+                    encoder_attention_mask=encoder_attention_mask_cat,
+                    context_latents=context_latents_cat,
+                    use_cache=True,
+                    past_key_values=past_key_values,
+                )
+
+                vt = decoder_outputs[0]
+                if len(decoder_outputs) > 1:
+                    past_key_values = decoder_outputs[1]
+
+                pred_cond, pred_negative = vt.chunk(2)
+                if apg_forward is not None and momentum_buffer is not None:
+                    vt = apg_forward(
+                        pred_cond=pred_cond,
+                        pred_uncond=pred_negative,
+                        guidance_scale=guidance_scale,
+                        momentum_buffer=momentum_buffer,
+                        dims=[1],
+                    )
+                else:
+                    vt = cfg_forward(pred_cond, pred_negative, guidance_scale)
+
+                dt = t_curr - t_prev
+                dt_tensor = dt * torch.ones((xt.shape[0],), device=xt.device, dtype=xt.dtype).unsqueeze(-1).unsqueeze(-1)
+                xt = xt - vt * dt_tensor
+
+        return xt
 
     def compile_transformer(self, args, transformer):
         """Compile transformer blocks for optimization."""
@@ -713,6 +967,8 @@ class AceStepNetworkTrainer(NetworkTrainer):
         # These are loaded from the cached text encoder outputs
         encoder_hidden_states = batch.get("encoder_hidden_states")
         encoder_attention_mask = batch.get("encoder_attention_mask")
+        lyric_hidden_states = batch.get("lyric_hidden_states")
+        lyric_attention_mask = batch.get("lyric_attention_mask")
         attention_mask = batch.get("attention_mask")
         context_latents = batch.get("latents_context")
 
@@ -733,6 +989,10 @@ class AceStepNetworkTrainer(NetworkTrainer):
                 device=accelerator.device,
                 dtype=torch.long,
             )
+        if lyric_hidden_states is not None:
+            lyric_hidden_states = lyric_hidden_states.to(accelerator.device, dtype=network_dtype)
+        if lyric_attention_mask is not None:
+            lyric_attention_mask = lyric_attention_mask.to(accelerator.device)
         if attention_mask is not None:
             attention_mask = attention_mask.to(accelerator.device)
         if context_latents is not None:
@@ -742,7 +1002,12 @@ class AceStepNetworkTrainer(NetworkTrainer):
         if hasattr(transformer, "encoder") and encoder_hidden_states is not None:
             # If cache was built with --dit, encoder_hidden_states are already conditioned.
             # If cache was built from raw text encoder outputs, we need to run condition encoder here.
-            expected_hidden_size = getattr(getattr(transformer, "config", None), "hidden_size", None)
+            expected_hidden_size = self._encoder_hidden_size
+            if expected_hidden_size is None:
+                transformer_config = getattr(transformer, "config", None)
+                expected_hidden_size = getattr(transformer_config, "encoder_hidden_size", None)
+                if expected_hidden_size is None:
+                    expected_hidden_size = getattr(transformer_config, "hidden_size", None)
             if expected_hidden_size is None:
                 needs_condition_encode = True
             else:
@@ -753,14 +1018,21 @@ class AceStepNetworkTrainer(NetworkTrainer):
             # Get encoder dtype (may be different from network_dtype)
             encoder_dtype = next(transformer.encoder.parameters()).dtype
 
-            # Create dummy lyric embeddings (use embed_tokens if available, else zeros)
-            # Original trainer uses: lyric_hidden_states = text_encoder.embed_tokens(lyric_input_ids)
-            # For simplicity, use zeros with proper shape
-            lyric_hidden_states = torch.zeros(
-                bsz, 1, encoder_hidden_states.shape[-1],  # [B, 1, 1024]
-                device=accelerator.device, dtype=encoder_dtype
-            )
-            lyric_attention_mask = torch.zeros(bsz, 1, device=accelerator.device, dtype=encoder_attention_mask.dtype)
+            if lyric_hidden_states is None or lyric_attention_mask is None:
+                if not self._warned_missing_lyric_cache:
+                    logger.warning(
+                        "ACE-Step raw text cache is missing lyric_hidden_states; "
+                        "falling back to zero lyric branch. Rebuild text caches for best results."
+                    )
+                    self._warned_missing_lyric_cache = True
+                lyric_hidden_states = torch.zeros(
+                    bsz, 1, encoder_hidden_states.shape[-1],
+                    device=accelerator.device, dtype=encoder_dtype
+                )
+                lyric_attention_mask = torch.zeros(bsz, 1, device=accelerator.device, dtype=encoder_attention_mask.dtype)
+            else:
+                lyric_hidden_states = lyric_hidden_states.to(accelerator.device, dtype=encoder_dtype)
+                lyric_attention_mask = lyric_attention_mask.to(accelerator.device)
 
             # Create dummy refer_audio (zeros for text2music, like original trainer)
             refer_audio_hidden = torch.zeros(bsz, 1, 64, device=accelerator.device, dtype=encoder_dtype)
@@ -888,7 +1160,7 @@ def acestep_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentPa
         "--text_encoder",
         type=str,
         default=None,
-        help="Path to Qwen3 text encoder (for sample generation)",
+        help="Path to an ACE-Step-compatible text encoder (for sample generation)",
     )
     parser.add_argument(
         "--is_turbo",
@@ -912,6 +1184,16 @@ def acestep_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentPa
         type=float,
         default=240.0,
         help="Maximum audio duration in seconds (default: 240)",
+    )
+    parser.add_argument(
+        "--acestep_allow_legacy_text_cache",
+        action="store_true",
+        help="Allow legacy ACE-Step text caches without schema metadata or lyric-branch validation",
+    )
+    parser.add_argument(
+        "--acestep_allow_missing_silence_latent",
+        action="store_true",
+        help="Allow training with an ACE-Step checkpoint missing silence_latent.pt",
     )
     return parser
 

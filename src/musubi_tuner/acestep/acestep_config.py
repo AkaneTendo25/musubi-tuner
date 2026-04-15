@@ -1,5 +1,5 @@
 """
-ACE-Step 1.5 configuration constants.
+ACE-Step configuration constants.
 
 Audio processing and training configuration for ACE-Step model integration.
 """
@@ -32,7 +32,7 @@ TURBO_SHIFT3_TIMESTEPS = [
 BASE_MODEL_DEFAULTS = {
     "shift": 1.0,
     "guidance_scale": 7.0,
-    "inference_steps": 60,
+    "inference_steps": 50,
 }
 
 TURBO_MODEL_DEFAULTS = {
@@ -77,6 +77,7 @@ DEFAULT_LORA_DROPOUT = 0.1
 
 # Text encoder configuration
 TEXT_ENCODER_MAX_LENGTH = 256
+ACESTEP_TEXT_CACHE_SCHEMA_VERSION = "2"
 
 # Default instruction - must match original ACE-Step trainer
 DEFAULT_DIT_INSTRUCTION = "Fill the audio semantic mask based on the given conditions:"

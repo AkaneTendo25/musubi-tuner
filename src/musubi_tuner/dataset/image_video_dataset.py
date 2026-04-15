@@ -630,7 +630,12 @@ def save_text_encoder_output_cache_z_image(item_info: ItemInfo, embed: torch.Ten
 
 
 def save_text_encoder_output_cache_acestep(
-    item_info: ItemInfo, hidden_states: torch.Tensor, attention_mask: torch.Tensor
+    item_info: ItemInfo,
+    hidden_states: torch.Tensor,
+    attention_mask: torch.Tensor,
+    lyric_hidden_states: Optional[torch.Tensor] = None,
+    lyric_attention_mask: Optional[torch.Tensor] = None,
+    cache_metadata: Optional[dict[str, str]] = None,
 ):
     """ACE-Step architecture - text encoder output for conditioning."""
     assert hidden_states.dim() == 2, f"hidden_states should be 2D tensor (seq_len, hidden_size), got {hidden_states.shape}"
@@ -641,10 +646,34 @@ def save_text_encoder_output_cache_acestep(
     sd[f"encoder_hidden_states_{dtype_str}"] = hidden_states.detach().cpu()
     sd["encoder_attention_mask"] = attention_mask.detach().cpu()
 
-    save_text_encoder_output_cache_common(item_info, sd, ARCHITECTURE_ACESTEP_FULL)
+    if lyric_hidden_states is not None:
+        assert lyric_hidden_states.dim() == 2, (
+            f"lyric_hidden_states should be 2D tensor (seq_len, hidden_size), got {lyric_hidden_states.shape}"
+        )
+        dtype_str = dtype_to_str(lyric_hidden_states.dtype)
+        sd[f"lyric_hidden_states_{dtype_str}"] = lyric_hidden_states.detach().cpu()
+
+    if lyric_attention_mask is not None:
+        assert lyric_attention_mask.dim() == 1, (
+            f"lyric_attention_mask should be 1D tensor (seq_len), got {lyric_attention_mask.shape}"
+        )
+        sd["lyric_attention_mask"] = lyric_attention_mask.detach().cpu()
+
+    if cache_metadata is None:
+        cache_metadata = {}
+    cache_metadata = cache_metadata.copy()
+    cache_metadata.setdefault("acestep_text_hidden_size", str(hidden_states.shape[-1]))
+    cache_metadata.setdefault("acestep_cache_kind", "raw" if lyric_hidden_states is not None else "conditioned")
+
+    save_text_encoder_output_cache_common(item_info, sd, ARCHITECTURE_ACESTEP_FULL, extra_metadata=cache_metadata)
 
 
-def save_text_encoder_output_cache_common(item_info: ItemInfo, sd: dict[str, torch.Tensor], arch_fullname: str):
+def save_text_encoder_output_cache_common(
+    item_info: ItemInfo,
+    sd: dict[str, torch.Tensor],
+    arch_fullname: str,
+    extra_metadata: Optional[dict[str, str]] = None,
+):
     for key, value in sd.items():
         # NaN check and show warning, replace NaN with 0
         if torch.isnan(value).any():
@@ -656,6 +685,8 @@ def save_text_encoder_output_cache_common(item_info: ItemInfo, sd: dict[str, tor
         "caption1": item_info.caption,
         "format_version": "1.0.1",
     }
+    if extra_metadata is not None:
+        metadata.update({k: str(v) for k, v in extra_metadata.items()})
 
     if os.path.exists(item_info.text_encoder_output_cache_path):
         # load existing cache and update metadata
@@ -672,7 +703,8 @@ def save_text_encoder_output_cache_common(item_info: ItemInfo, sd: dict[str, tor
 
         existing_metadata.pop("caption1", None)
         existing_metadata.pop("format_version", None)
-        metadata.update(existing_metadata)  # copy existing metadata except caption and format_version
+        for key, value in existing_metadata.items():
+            metadata.setdefault(key, value)
     else:
         text_encoder_output_dir = os.path.dirname(item_info.text_encoder_output_cache_path)
         os.makedirs(text_encoder_output_dir, exist_ok=True)

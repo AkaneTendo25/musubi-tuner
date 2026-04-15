@@ -1,11 +1,12 @@
 """
-ACE-Step 1.5 model loading utilities.
+ACE-Step model loading utilities.
 
 Functions for loading ACE-Step models, VAE, and text encoder.
 """
 
+import json
 import os
-from typing import Optional, Tuple, Dict, Any, List
+from typing import Optional, Tuple, Dict, Any, List, Mapping, Sequence
 
 import glob
 
@@ -22,11 +23,110 @@ from .acestep_config import (
     DEFAULT_DIT_INSTRUCTION,
     ACESTEP_FP8_TARGET_KEYS,
     ACESTEP_FP8_EXCLUDE_KEYS,
+    ACESTEP_TEXT_CACHE_SCHEMA_VERSION,
 )
 
 import logging
 
 logger = logging.getLogger(__name__)
+
+ACESTEP_MODEL_SIGNATURE_KEYS = (
+    "model_type",
+    "hidden_size",
+    "num_hidden_layers",
+    "num_attention_heads",
+    "intermediate_size",
+    "encoder_hidden_size",
+    "encoder_num_hidden_layers",
+    "encoder_num_attention_heads",
+    "encoder_intermediate_size",
+    "text_hidden_dim",
+)
+
+
+def _get_config_value(config: Any, key: str, default: Any = None) -> Any:
+    if isinstance(config, dict):
+        return config.get(key, default)
+    return getattr(config, key, default)
+
+
+def build_acestep_model_arch_signature(config: Any) -> str:
+    """Build a stable architecture signature for ACE-Step family checkpoints."""
+    signature = {}
+    for key in ACESTEP_MODEL_SIGNATURE_KEYS:
+        value = _get_config_value(config, key, None)
+        if value is not None:
+            signature[key] = value
+    if "model_type" not in signature:
+        signature["model_type"] = type(config).__name__
+    return json.dumps(signature, sort_keys=True, separators=(",", ":"))
+
+
+def build_acestep_text_cache_metadata(
+    cache_kind: str,
+    text_encoder_path: Optional[str] = None,
+    model_config: Optional[Any] = None,
+    model_path: Optional[str] = None,
+) -> Dict[str, str]:
+    """Build metadata stored in ACE-Step text caches."""
+    metadata = {
+        "acestep_text_cache_schema": ACESTEP_TEXT_CACHE_SCHEMA_VERSION,
+        "acestep_cache_kind": cache_kind,
+        "acestep_text_encoder_source": text_encoder_path or "",
+    }
+    if model_config is not None:
+        metadata["acestep_dit_arch_signature"] = build_acestep_model_arch_signature(model_config)
+    if model_path is not None:
+        metadata["acestep_dit_source"] = model_path
+    return metadata
+
+
+def validate_acestep_text_cache(
+    metadata: Optional[Mapping[str, str]],
+    tensor_keys: Sequence[str],
+    expected_dit_arch_signature: Optional[str],
+    allow_legacy: bool = False,
+) -> None:
+    """Validate ACE-Step text cache metadata against the current training setup."""
+    metadata = dict(metadata or {})
+    key_set = set(tensor_keys)
+
+    schema = metadata.get("acestep_text_cache_schema")
+    if schema is None:
+        if allow_legacy:
+            return
+        raise ValueError(
+            "legacy ACE-Step text cache detected (missing acestep_text_cache_schema). "
+            "Rebuild text caches with the updated acestep_cache_text_encoder_outputs.py "
+            "or pass --acestep_allow_legacy_text_cache."
+        )
+    if schema != ACESTEP_TEXT_CACHE_SCHEMA_VERSION:
+        raise ValueError(
+            f"unsupported ACE-Step text cache schema '{schema}' "
+            f"(expected {ACESTEP_TEXT_CACHE_SCHEMA_VERSION})"
+        )
+
+    cache_kind = metadata.get("acestep_cache_kind")
+    if cache_kind not in ("raw", "conditioned"):
+        raise ValueError(f"unknown ACE-Step cache kind '{cache_kind}'")
+
+    if cache_kind == "raw":
+        has_lyric_branch = any(key.startswith("lyric_hidden_states_") for key in key_set) and "lyric_attention_mask" in key_set
+        if not has_lyric_branch:
+            raise ValueError(
+                "raw ACE-Step text cache is missing lyric branch tensors. "
+                "Rebuild text caches with the updated acestep_cache_text_encoder_outputs.py."
+            )
+        return
+
+    cache_signature = metadata.get("acestep_dit_arch_signature")
+    if cache_signature is None:
+        raise ValueError("conditioned ACE-Step text cache is missing acestep_dit_arch_signature")
+    if expected_dit_arch_signature is not None and cache_signature != expected_dit_arch_signature:
+        raise ValueError(
+            "conditioned ACE-Step text cache was created for a different model architecture. "
+            "Rebuild text caches with the same --dit checkpoint family used for training."
+        )
 
 
 def _find_safetensors_file(model_path: str) -> str:
@@ -162,8 +262,10 @@ def load_acestep_model(
     config_dict = {
         "is_turbo": getattr(config, "is_turbo", True),
         "hidden_size": getattr(config, "hidden_size", 1024),
+        "encoder_hidden_size": getattr(config, "encoder_hidden_size", getattr(config, "hidden_size", 1024)),
         "timestep_mu": getattr(config, "timestep_mu", -0.4),
         "timestep_sigma": getattr(config, "timestep_sigma", 1.0),
+        "arch_signature": build_acestep_model_arch_signature(config),
     }
 
     # Load silence_latent from separate .pt file (following official ACE-Step handler)
@@ -181,7 +283,12 @@ def load_acestep_model(
         logger.warning(f"silence_latent.pt not found at {silence_latent_path}, will use zeros as fallback")
         config_dict["silence_latent"] = None
 
-    logger.info(f"ACE-Step model loaded: is_turbo={config_dict['is_turbo']}")
+    logger.info(
+        "ACE-Step model loaded: "
+        f"is_turbo={config_dict['is_turbo']}, "
+        f"encoder_hidden_size={config_dict['encoder_hidden_size']}, "
+        f"hidden_size={config_dict['hidden_size']}"
+    )
 
     return model, config_dict
 
@@ -216,10 +323,10 @@ def load_text_encoder(
     device: str = "cpu",
     dtype: torch.dtype = torch.bfloat16,
 ) -> Tuple[Any, nn.Module]:
-    """Load Qwen3-Embedding text encoder.
+    """Load an ACE-Step-compatible text encoder.
 
     Args:
-        text_encoder_path: Path to Qwen3 checkpoint
+        text_encoder_path: Path to text encoder checkpoint
         device: Device
         dtype: Model dtype
 
@@ -325,8 +432,8 @@ def encode_text_for_acestep(
     """Encode text using ACE-Step's format.
 
     Args:
-        tokenizer: Qwen3 tokenizer
-        text_encoder: Qwen3 text encoder
+        tokenizer: ACE-Step-compatible tokenizer
+        text_encoder: ACE-Step-compatible text encoder
         caption: Music description/prompt
         lyrics: Song lyrics (optional)
         max_length: Maximum token length

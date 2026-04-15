@@ -1575,6 +1575,10 @@ class NetworkTrainer:
             args, transformer, [transformer.double_blocks, transformer.single_blocks], disable_linear=self.blocks_to_swap > 0
         )
 
+    def validate_training_setup(self, args: argparse.Namespace, train_dataset_group, transformer) -> None:
+        """Architecture-specific validation hook called after dataset/model loading."""
+        pass
+
     def scale_shift_latents(self, latents):
         latents = latents * vae_module.SCALING_FACTOR
         return latents
@@ -1766,6 +1770,8 @@ class NetworkTrainer:
         )
         transformer.eval()
         transformer.requires_grad_(False)
+
+        self.validate_training_setup(args, train_dataset_group, transformer)
 
         if blocks_to_swap > 0:
             logger.info(

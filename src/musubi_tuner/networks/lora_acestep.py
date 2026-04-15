@@ -20,18 +20,34 @@ import musubi_tuner.networks.lora as lora
 
 # Pass None to search all modules, filtering by include/exclude patterns
 ACESTEP_TARGET_REPLACE_MODULES = None
+ACESTEP_TARGET_SUFFIXES = ("q_proj", "k_proj", "v_proj", "o_proj")
+ACESTEP_EXCLUDED_SUBSTRINGS = ("encoder", "embedding", "norm", "layernorm", ".ln", "_ln")
 
 
 def _prepare_include_patterns(include_patterns: Optional[str]) -> List[str]:
     if include_patterns is None:
-        # Default to attention projection layers as in the reference ACE-Step trainer
-        return [
-            r".*q_proj.*",
-            r".*k_proj.*",
-            r".*v_proj.*",
-            r".*o_proj.*",
-        ]
+        return []
     return ast.literal_eval(include_patterns)
+
+
+def _discover_target_module_names(target_model: nn.Module) -> List[str]:
+    """Discover the exact projection modules to target for ACE-Step LoRA."""
+    target_names: List[str] = []
+
+    for name, module in target_model.named_modules():
+        if module.__class__.__name__ != "Linear":
+            continue
+        lower_name = name.lower()
+        if any(token in lower_name for token in ACESTEP_EXCLUDED_SUBSTRINGS):
+            continue
+        if lower_name.endswith(ACESTEP_TARGET_SUFFIXES):
+            target_names.append(name)
+
+    target_names = sorted(set(target_names))
+    if not target_names:
+        raise ValueError("No ACE-Step LoRA target modules were discovered in the decoder")
+
+    return target_names
 
 
 def create_arch_network(
@@ -60,7 +76,7 @@ def create_arch_network(
         LoRANetwork instance
     """
     include_patterns = _prepare_include_patterns(kwargs.get("include_patterns", None))
-    kwargs["include_patterns"] = include_patterns
+    verbose = kwargs.get("verbose", False)
 
     # Exclude encoder, embeddings, and normalization layers
     exclude_patterns = kwargs.get("exclude_patterns", None)
@@ -86,14 +102,24 @@ def create_arch_network(
         target_model = unet
         logger.info("Targeting entire model for LoRA injection")
 
-    # Log model structure for debugging
-    logger.info(f"Model type: {type(target_model)}")
-    for name, module in target_model.named_modules():
-        if "proj" in name.lower():
-            logger.info(f"  Found proj module: {name} -> {type(module).__name__}")
+    discovered_target_names = _discover_target_module_names(target_model)
+    if include_patterns:
+        unmatched_patterns = []
+        for pattern in include_patterns:
+            regex = re.compile(pattern)
+            if not any(regex.match(name) for name in discovered_target_names):
+                unmatched_patterns.append(pattern)
+        if unmatched_patterns:
+            raise ValueError(f"ACE-Step include_patterns matched no discovered decoder targets: {unmatched_patterns}")
+        kwargs["include_patterns"] = include_patterns
+    else:
+        kwargs["include_patterns"] = [rf"^{re.escape(name)}$" for name in discovered_target_names]
 
-    # Enable verbose to see what modules are being targeted
-    kwargs["verbose"] = True
+    kwargs["verbose"] = verbose
+    logger.info(
+        f"Discovered {len(discovered_target_names)} ACE-Step LoRA target modules; "
+        f"example targets: {discovered_target_names[:4]}"
+    )
 
     # Use "lora_unet_decoder" prefix for ComfyUI compatibility
     # This produces keys like: lora_unet_decoder_layers_0_self_attn_q_proj.lora_down.weight
