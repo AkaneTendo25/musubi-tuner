@@ -38,6 +38,7 @@ from musubi_tuner.ltx2_train import (
     _normalize_ltx2_batch_for_call_dit,
 )
 from musubi_tuner.ltx2_train_network import LTX2NetworkTrainer, ltx2_setup_parser
+from musubi_tuner.modules.nf4_optimization_utils import dequantize_nf4_block, is_nf4_module
 from musubi_tuner.modules.scheduling_flow_match_discrete import FlowMatchDiscreteScheduler
 from musubi_tuner.networks.lora_ltx2 import LTX2_LORA_TARGET_PRESETS
 
@@ -68,8 +69,19 @@ class CandidateParam:
     module_path: str
     family: str
     block_index: Optional[int]
-    param: torch.nn.Parameter
+    param: torch.Tensor
     numel: int
+    module: Optional[torch.nn.Module] = None
+
+
+@dataclass
+class ShadowWeightBinding:
+    candidate_name: str
+    module: torch.nn.Module
+    shadow_param: torch.nn.Parameter
+    original_weight: torch.Tensor
+    original_weight_kind: str
+    original_forward: Any
 
 
 def setup_parser() -> argparse.ArgumentParser:
@@ -124,23 +136,28 @@ def _module_family(module_path: str) -> Optional[str]:
 
 def _candidate_params(transformer: torch.nn.Module) -> list[CandidateParam]:
     selected: list[CandidateParam] = []
-    for name, param in transformer.named_parameters():
-        if not name.endswith(".weight"):
-            continue
-        if not isinstance(param, torch.nn.Parameter) or param.ndim != 2:
-            continue
-        module_path = name[: -len(".weight")]
+    for module_path, module in transformer.named_modules():
         family = _module_family(module_path)
         if family is None:
             continue
+        param = getattr(module, "weight", None)
+        if not isinstance(param, torch.Tensor) or param.ndim != 2:
+            continue
+        numel = int(param.numel())
+        if is_nf4_module(module):
+            out_features = int(getattr(module, "nf4_out_features", 0) or 0)
+            in_features = int(getattr(module, "nf4_in_features", 0) or 0)
+            if out_features > 0 and in_features > 0:
+                numel = out_features * in_features
         selected.append(
             CandidateParam(
-                name=name,
+                name=f"{module_path}.weight",
                 module_path=module_path,
                 family=family,
-                block_index=_extract_transformer_block_index(name),
+                block_index=_extract_transformer_block_index(module_path),
                 param=param,
-                numel=int(param.numel()),
+                numel=numel,
+                module=module,
             )
         )
     return selected
@@ -196,6 +213,7 @@ def _candidate_params_from_network(network: torch.nn.Module) -> list[CandidatePa
                     block_index=block_index,
                     param=param,
                     numel=int(param.numel()),
+                    module=None,
                 )
             )
     return selected
@@ -392,6 +410,143 @@ def _build_estimation_passes(candidates: list[CandidateParam], block_window: int
         return [[]]
     window = max(1, int(block_window or 1))
     return [block_ids[i : i + window] for i in range(0, len(block_ids), window)]
+
+
+def _candidate_needs_shadow_weight(cand: CandidateParam) -> bool:
+    module = cand.module
+    if module is None:
+        return False
+    if is_nf4_module(module):
+        return True
+    weight = cand.param
+    return (not weight.is_floating_point()) or weight.dtype.itemsize < 2
+
+
+def _shadow_weight_dtype(cand: CandidateParam, fallback_dtype: torch.dtype) -> torch.dtype:
+    module = cand.module
+    if module is not None:
+        scale_weight = getattr(module, "scale_weight", None)
+        if (
+            isinstance(scale_weight, torch.Tensor)
+            and scale_weight.is_floating_point()
+            and scale_weight.dtype.itemsize >= 2
+        ):
+            return scale_weight.dtype
+    if fallback_dtype.is_floating_point and fallback_dtype.itemsize >= 2:
+        return fallback_dtype
+    return torch.float32
+
+
+def _dequantize_candidate_weight(cand: CandidateParam, target_dtype: torch.dtype) -> torch.Tensor:
+    module = cand.module
+    if module is None:
+        raise ValueError(f"Estimator: candidate {cand.name} has no module for shadow dequantization.")
+
+    weight = getattr(module, "weight", None)
+    if not isinstance(weight, torch.Tensor):
+        raise ValueError(f"Estimator: module {cand.module_path} has no tensor weight.")
+
+    if is_nf4_module(module):
+        scale_weight = getattr(module, "scale_weight", None)
+        if not isinstance(scale_weight, torch.Tensor):
+            raise ValueError(f"Estimator: NF4 module {cand.module_path} is missing scale_weight.")
+        dense = dequantize_nf4_block(
+            weight,
+            scale_weight,
+            int(getattr(module, "nf4_out_features")),
+            int(getattr(module, "nf4_in_features")),
+            int(getattr(module, "nf4_block_size")),
+            scale_weight.dtype,
+        )
+        if hasattr(module, "awq_scales"):
+            dense = dense / module.awq_scales.unsqueeze(0)
+        return dense.to(dtype=target_dtype)
+
+    scale_weight = getattr(module, "scale_weight", None)
+    if not isinstance(scale_weight, torch.Tensor):
+        return weight.to(dtype=target_dtype)
+
+    scale = scale_weight.to(dtype=target_dtype)
+    dense_weight = weight.to(dtype=target_dtype)
+    if scale.ndim < 3:
+        return dense_weight * scale
+
+    out_features, num_blocks, _ = scale.shape
+    dense_weight = dense_weight.contiguous().view(out_features, num_blocks, -1)
+    dense_weight = dense_weight * scale
+    return dense_weight.view(weight.shape)
+
+
+def _shadow_linear_forward(self: torch.nn.Module, x: torch.Tensor) -> torch.Tensor:
+    return torch.nn.functional.linear(x, self.weight, self.bias)
+
+
+def _install_shadow_weight(cand: CandidateParam, fallback_dtype: torch.dtype) -> ShadowWeightBinding:
+    module = cand.module
+    if module is None:
+        raise ValueError(f"Estimator: candidate {cand.name} has no module for shadow-weight estimation.")
+
+    if "weight" in module._parameters:
+        original_weight_kind = "parameter"
+    elif "weight" in module._buffers:
+        original_weight_kind = "buffer"
+    else:
+        original_weight_kind = "attr"
+
+    original_weight = getattr(module, "weight")
+    shadow_dtype = _shadow_weight_dtype(cand, fallback_dtype)
+    shadow_param = torch.nn.Parameter(_dequantize_candidate_weight(cand, shadow_dtype).detach(), requires_grad=True)
+    original_forward = module.forward
+
+    module._parameters.pop("weight", None)
+    module._buffers.pop("weight", None)
+    module.register_parameter("weight", shadow_param)
+    module.forward = _shadow_linear_forward.__get__(module, type(module))
+
+    return ShadowWeightBinding(
+        candidate_name=cand.name,
+        module=module,
+        shadow_param=shadow_param,
+        original_weight=original_weight,
+        original_weight_kind=original_weight_kind,
+        original_forward=original_forward,
+    )
+
+
+def _restore_shadow_weight(binding: ShadowWeightBinding) -> None:
+    module = binding.module
+    module.forward = binding.original_forward
+    module._parameters.pop("weight", None)
+    module._buffers.pop("weight", None)
+    if binding.original_weight_kind == "parameter":
+        module.register_parameter("weight", binding.original_weight)
+    elif binding.original_weight_kind == "buffer":
+        module.register_buffer("weight", binding.original_weight)
+    else:
+        setattr(module, "weight", binding.original_weight)
+
+
+def _validate_base_model_candidates(candidates: list[CandidateParam]) -> None:
+    unsupported = sorted(
+        {
+            str(cand.param.dtype)
+            for cand in candidates
+            if _candidate_needs_shadow_weight(cand) and cand.module is None
+        }
+    )
+    if unsupported:
+        raise ValueError(
+            "Base-model estimation encountered quantized candidates without module references "
+            f"({', '.join(unsupported)}), so shadow dequantization could not be installed."
+        )
+
+
+def _direct_grad_param(cand: CandidateParam) -> Optional[torch.Tensor]:
+    if _candidate_needs_shadow_weight(cand):
+        return None
+    if not isinstance(cand.param, torch.Tensor) or not cand.param.is_floating_point():
+        return None
+    return cand.param
 
 
 def _loss_from_prediction(
@@ -651,10 +806,13 @@ def run_estimation(args: argparse.Namespace) -> dict[str, Any]:
     else:
         candidates = _candidate_params(unwrapped_transformer)
         candidate_source = "base_model"
+        _validate_base_model_candidates(candidates)
     if not candidates:
         raise ValueError("No LoRA-targetable LTX-2 linear weights were found for estimation.")
     for cand in candidates:
-        cand.param.requires_grad_(False)
+        direct_param = _direct_grad_param(cand)
+        if direct_param is not None:
+            direct_param.requires_grad_(False)
 
     clean_memory_on_device(accelerator.device)
     noise_scheduler = FlowMatchDiscreteScheduler(
@@ -688,6 +846,7 @@ def run_estimation(args: argparse.Namespace) -> dict[str, Any]:
         block_passes: list[Optional[list[int]]] = [None]
     else:
         block_passes = _build_estimation_passes(candidates, int(getattr(args, "estimation_block_window", 1) or 1))
+    used_shadow_dequant = candidate_source == "base_model" and any(_candidate_needs_shadow_weight(cand) for cand in candidates)
     total_steps = len(block_passes) * valid_batches
 
     progress = tqdm(
@@ -715,81 +874,97 @@ def run_estimation(args: argparse.Namespace) -> dict[str, Any]:
 
             active_param_names = {cand.name for cand in active_candidates}
             for cand in candidates:
-                cand.param.requires_grad_(cand.name in active_param_names)
+                direct_param = _direct_grad_param(cand)
+                if direct_param is not None:
+                    direct_param.requires_grad_(cand.name in active_param_names)
+
+            shadow_bindings: dict[str, ShadowWeightBinding] = {}
+            for cand in active_candidates:
+                if _candidate_needs_shadow_weight(cand):
+                    shadow_bindings[cand.name] = _install_shadow_weight(cand, trainer.dit_dtype)
 
             if blocks_to_swap > 0 and hasattr(unwrapped_transformer, "switch_block_swap_for_training"):
                 unwrapped_transformer.switch_block_swap_for_training()
             elif blocks_to_swap > 0 and hasattr(unwrapped_transformer, "prepare_block_swap_before_forward"):
                 unwrapped_transformer.prepare_block_swap_before_forward()
 
-            optimizer = torch.optim.SGD([cand.param for cand in active_candidates], lr=0.0)
+            active_grad_params = [
+                shadow_bindings[cand.name].shadow_param if cand.name in shadow_bindings else cand.param
+                for cand in active_candidates
+            ]
+            optimizer = torch.optim.SGD(active_grad_params, lr=0.0)
+            try:
+                for batch in cached_batches:
+                    batch = copy.deepcopy(batch)
+                    latents = batch.get("latents")
+                    if isinstance(latents, dict):
+                        latents = latents.get("latents")
+                    latents_tensor = trainer.scale_shift_latents(latents)
+                    noise = torch.randn_like(latents_tensor)
+                    noisy_model_input, timesteps = trainer.get_noisy_model_input_and_timesteps(
+                        args,
+                        noise,
+                        latents_tensor,
+                        batch.get("timesteps"),
+                        noise_scheduler,
+                        accelerator.device,
+                        trainer.dit_dtype,
+                    )
+                    weighting = compute_loss_weighting_for_sd3(
+                        args.weighting_scheme,
+                        noise_scheduler,
+                        timesteps,
+                        accelerator.device,
+                        trainer.dit_dtype,
+                    )
+                    if getattr(args, "fp8_base", False) or getattr(args, "fp8_scaled", False):
+                        trainer._ensure_fp8_buffers_on_device(transformer)
+                    elif getattr(args, "nf4_base", False):
+                        trainer._ensure_nf4_buffers_on_device(transformer)
+                    model_pred, target = trainer.call_dit(
+                        args,
+                        accelerator,
+                        transformer,
+                        latents_tensor,
+                        batch,
+                        noise,
+                        noisy_model_input,
+                        timesteps,
+                        trainer.dit_dtype,
+                    )
+                    loss = _loss_from_prediction(args, trainer, model_pred, target, weighting)
+                    if loss is None:
+                        optimizer.zero_grad(set_to_none=True)
+                        progress.update(1)
+                        continue
 
-            for batch in cached_batches:
-                batch = copy.deepcopy(batch)
-                latents = batch.get("latents")
-                if isinstance(latents, dict):
-                    latents = latents.get("latents")
-                latents_tensor = trainer.scale_shift_latents(latents)
-                noise = torch.randn_like(latents_tensor)
-                noisy_model_input, timesteps = trainer.get_noisy_model_input_and_timesteps(
-                    args,
-                    noise,
-                    latents_tensor,
-                    batch.get("timesteps"),
-                    noise_scheduler,
-                    accelerator.device,
-                    trainer.dit_dtype,
-                )
-                weighting = compute_loss_weighting_for_sd3(
-                    args.weighting_scheme,
-                    noise_scheduler,
-                    timesteps,
-                    accelerator.device,
-                    trainer.dit_dtype,
-                )
-                if getattr(args, "fp8_base", False) or getattr(args, "fp8_scaled", False):
-                    trainer._ensure_fp8_buffers_on_device(transformer)
-                elif getattr(args, "nf4_base", False):
-                    trainer._ensure_nf4_buffers_on_device(transformer)
-                model_pred, target = trainer.call_dit(
-                    args,
-                    accelerator,
-                    transformer,
-                    latents_tensor,
-                    batch,
-                    noise,
-                    noisy_model_input,
-                    timesteps,
-                    trainer.dit_dtype,
-                )
-                loss = _loss_from_prediction(args, trainer, model_pred, target, weighting)
-                if loss is None:
+                    accelerator.backward(loss)
+                    for cand in active_candidates:
+                        grad_param = shadow_bindings[cand.name].shadow_param if cand.name in shadow_bindings else cand.param
+                        grad = grad_param.grad
+                        if grad is None:
+                            continue
+                        grad_f = grad.detach().float()
+                        fisher_sums[cand.name] += float(grad_f.square().sum().item())
+                        grad_norm_sums[cand.name] += float(grad_f.norm().item())
                     optimizer.zero_grad(set_to_none=True)
                     progress.update(1)
-                    continue
-
-                accelerator.backward(loss)
-                for cand in active_candidates:
-                    grad = cand.param.grad
-                    if grad is None:
-                        continue
-                    grad_f = grad.detach().float()
-                    fisher_sums[cand.name] += float(grad_f.square().sum().item())
-                    grad_norm_sums[cand.name] += float(grad_f.norm().item())
+                    if accelerator.is_local_main_process:
+                        if pass_block_ids is None:
+                            progress.set_postfix(valid=valid_batches, skipped=skipped_batches, blocks="all")
+                        else:
+                            progress.set_postfix(valid=valid_batches, skipped=skipped_batches, blocks=",".join(map(str, pass_block_ids)))
+            finally:
                 optimizer.zero_grad(set_to_none=True)
-                progress.update(1)
-                if accelerator.is_local_main_process:
-                    if pass_block_ids is None:
-                        progress.set_postfix(valid=valid_batches, skipped=skipped_batches, blocks="all")
-                    else:
-                        progress.set_postfix(valid=valid_batches, skipped=skipped_batches, blocks=",".join(map(str, pass_block_ids)))
-
-            optimizer.zero_grad(set_to_none=True)
-            for cand in active_candidates:
-                cand.param.requires_grad_(False)
-            if blocks_to_swap > 0 and hasattr(unwrapped_transformer, "prepare_block_swap_before_forward"):
-                unwrapped_transformer.prepare_block_swap_before_forward()
-            clean_memory_on_device(accelerator.device)
+                for cand in active_candidates:
+                    direct_param = _direct_grad_param(cand)
+                    if direct_param is not None:
+                        direct_param.requires_grad_(False)
+                for binding in shadow_bindings.values():
+                    _restore_shadow_weight(binding)
+                if blocks_to_swap > 0 and hasattr(unwrapped_transformer, "prepare_block_swap_before_forward"):
+                    unwrapped_transformer.prepare_block_swap_before_forward()
+                clean_memory_on_device(accelerator.device)
     finally:
         progress.close()
         args.caption_dropout_rate = original_caption_dropout
@@ -811,6 +986,7 @@ def run_estimation(args: argparse.Namespace) -> dict[str, Any]:
     report["meta"]["merged_weights"] = merged_weights
     report["meta"]["applied_network"] = applied_network_info
     report["meta"]["candidate_source"] = candidate_source
+    report["meta"]["shadow_dequantized_candidates"] = used_shadow_dequant
     return report
 
 
