@@ -782,6 +782,18 @@ class NetworkTrainer:
     def preservation_backward(self, args, accelerator, transformer, network, network_dtype):
         return {}
 
+    def compute_validation_extra_loss(
+        self,
+        args,
+        accelerator,
+        transformer,
+        network,
+        batch,
+        global_step: int,
+        network_dtype,
+    ):
+        return None, {}
+
     def get_dummy_scheduler(self, optimizer: torch.optim.Optimizer) -> Any:
         # dummy scheduler for schedulefree optimizer. supports only empty step(), get_last_lr() and optimizers.
         # this scheduler is used for logging only.
@@ -3326,179 +3338,341 @@ class NetworkTrainer:
 
             total_loss = 0.0
             total_count = 0
-            with torch.no_grad():
-                val_iter = validation_dataloader
-                if accelerator.is_local_main_process:
-                    val_iter = tqdm(
-                        validation_dataloader,
-                        desc="validation",
-                        smoothing=0,
-                        leave=False,
-                    )
-                for val_step, batch in enumerate(val_iter):
-                    latents = batch["latents"]
-                    if isinstance(latents, dict):
-                        if "latents" not in latents:
-                            raise ValueError("batch['latents'] is a dict but missing key 'latents'")
-                        self.set_current_batch_latents_info(latents)
-                        latents_tensor = latents["latents"]
-                    else:
-                        self.set_current_batch_latents_info(None)
-                        latents_tensor = latents
+            val_audio_presence_ema = float(audio_presence_ema)
+            val_audio_loss_ema = float(audio_loss_ema)
+            val_video_loss_ema = float(video_loss_ema)
+            validation_self_flow_network = None
+            validation_self_flow_prev_training = None
+            if bool(getattr(args, "self_flow", False)):
+                validation_self_flow_network = getattr(self, "_self_flow_network", None)
+                if validation_self_flow_network is not None:
+                    validation_self_flow_prev_training = bool(getattr(validation_self_flow_network, "training", False))
+                    validation_self_flow_network.training = True
 
-                    latents_tensor = self.scale_shift_latents(latents_tensor)
-                    noise = torch.randn_like(latents_tensor)
+            try:
+                with torch.no_grad():
+                    val_iter = validation_dataloader
+                    if accelerator.is_local_main_process:
+                        val_iter = tqdm(
+                            validation_dataloader,
+                            desc="validation",
+                            smoothing=0,
+                            leave=False,
+                        )
+                    for val_step, batch in enumerate(val_iter):
+                        latents = batch["latents"]
+                        if isinstance(latents, dict):
+                            if "latents" not in latents:
+                                raise ValueError("batch['latents'] is a dict but missing key 'latents'")
+                            self.set_current_batch_latents_info(latents)
+                            latents_tensor = latents["latents"]
+                        else:
+                            self.set_current_batch_latents_info(None)
+                            latents_tensor = latents
 
-                    # HFATO: degrade latents before noise addition, keep clean for loss
-                    _hfato_config = getattr(self, "_hfato_config", None)
-                    if _hfato_config is not None and latents_tensor.dim() == 5:
-                        import random as _hfato_rand
-                        if _hfato_rand.random() < _hfato_config.probability:
-                            from musubi_tuner.hfato import degrade_latents
-                            batch["_hfato"] = {"clean_latents": latents_tensor}
-                            latents_tensor = degrade_latents(
-                                latents_tensor, _hfato_config.scale_factor, _hfato_config.interpolation,
-                            )
+                        latents_tensor = self.scale_shift_latents(latents_tensor)
+                        noise = torch.randn_like(latents_tensor)
 
-                    noisy_model_input, timesteps = self.get_noisy_model_input_and_timesteps(
-                        args,
-                        noise,
-                        latents_tensor,
-                        batch["timesteps"],
-                        noise_scheduler,
-                        accelerator.device,
-                        dit_dtype,
-                    )
+                        # HFATO: degrade latents before noise addition, keep clean for loss
+                        _hfato_config = getattr(self, "_hfato_config", None)
+                        if _hfato_config is not None and latents_tensor.dim() == 5:
+                            import random as _hfato_rand
+                            if _hfato_rand.random() < _hfato_config.probability:
+                                from musubi_tuner.hfato import degrade_latents
+                                batch["_hfato"] = {"clean_latents": latents_tensor}
+                                latents_tensor = degrade_latents(
+                                    latents_tensor, _hfato_config.scale_factor, _hfato_config.interpolation,
+                                )
 
-                    weighting = compute_loss_weighting_for_sd3(
-                        args.weighting_scheme, noise_scheduler, timesteps, accelerator.device, dit_dtype
-                    )
+                        noisy_model_input, timesteps = self.get_noisy_model_input_and_timesteps(
+                            args,
+                            noise,
+                            latents_tensor,
+                            batch["timesteps"],
+                            noise_scheduler,
+                            accelerator.device,
+                            dit_dtype,
+                        )
 
-                    model_pred, target = self.call_dit(
-                        args,
-                        accelerator,
-                        transformer,
-                        latents_tensor,
-                        batch,
-                        noise,
-                        noisy_model_input,
-                        timesteps,
-                        network_dtype,
-                    )
+                        weighting = compute_loss_weighting_for_sd3(
+                            args.weighting_scheme, noise_scheduler, timesteps, accelerator.device, dit_dtype
+                        )
 
-                    dict_output = isinstance(model_pred, dict)
-                    _loss_type = getattr(args, "loss_type", "mse")
-                    _huber_delta = getattr(args, "huber_delta", 1.0)
-                    if dict_output:
-                        out = model_pred
-                        if out.get("_skip_step"):
-                            logger.warning(
-                                "Skipping step due to non-finite tensor (%s).",
-                                out.get("skip_reason", "unknown"),
-                            )
-                            optimizer.zero_grad(set_to_none=True)
-                            continue
+                        model_pred, target = self.call_dit(
+                            args,
+                            accelerator,
+                            transformer,
+                            latents_tensor,
+                            batch,
+                            noise,
+                            noisy_model_input,
+                            timesteps,
+                            network_dtype,
+                        )
 
+                        dict_output = isinstance(model_pred, dict)
+                        out = model_pred if dict_output else None
+                        _loss_type = getattr(args, "loss_type", "mse")
+                        _huber_delta = getattr(args, "huber_delta", 1.0)
+                        video_pred = None
                         video_loss = None
                         audio_loss = None
                         video_weight = None
                         audio_weight = None
 
-                        def _masked_loss(
-                            pred: torch.Tensor,
-                            tgt: torch.Tensor,
-                            mask: torch.Tensor | None,
-                        ) -> torch.Tensor:
-                            if isinstance(tgt, torch.Tensor):
-                                pred = pred.to(device=tgt.device, dtype=network_dtype)
+                        if dict_output:
+                            if out.get("_skip_step"):
+                                logger.warning(
+                                    "Skipping step due to non-finite tensor (%s).",
+                                    out.get("skip_reason", "unknown"),
+                                )
+                                optimizer.zero_grad(set_to_none=True)
+                                continue
+
+                            def _masked_loss(
+                                pred: torch.Tensor,
+                                tgt: torch.Tensor,
+                                mask: torch.Tensor | None,
+                            ) -> torch.Tensor:
+                                if isinstance(tgt, torch.Tensor):
+                                    pred = pred.to(device=tgt.device, dtype=network_dtype)
+                                else:
+                                    pred = pred.to(dtype=network_dtype)
+                                per_elem = _per_element_loss(pred, tgt, _loss_type, _huber_delta)
+                                if weighting is not None:
+                                    w = weighting
+                                    if isinstance(w, torch.Tensor) and w.dim() != per_elem.dim():
+                                        while w.dim() > per_elem.dim() and w.shape[-1] == 1:
+                                            w = w.squeeze(-1)
+                                    per_elem = per_elem * w
+                                if mask is None:
+                                    return per_elem.mean()
+
+                                mask = mask.to(device=per_elem.device)
+                                if per_elem.dim() == 5 and mask.dim() == 2:
+                                    mask = mask.view(mask.shape[0], 1, mask.shape[1], 1, 1)
+                                elif per_elem.dim() == 5 and mask.dim() == 1:
+                                    mask = mask.view(mask.shape[0], 1, 1, 1, 1)
+                                elif per_elem.dim() == 4 and mask.dim() == 2:
+                                    mask = mask.view(mask.shape[0], 1, mask.shape[1], 1)
+                                elif per_elem.dim() == 4 and mask.dim() == 1:
+                                    mask = mask.view(mask.shape[0], 1, 1, 1)
+                                elif per_elem.dim() == 3 and mask.dim() == 2:
+                                    mask = mask.unsqueeze(-1)
+                                elif per_elem.dim() == 3 and mask.dim() == 1:
+                                    mask = mask.view(mask.shape[0], 1, 1)
+
+                                mask_f = mask.to(dtype=per_elem.dtype)
+                                denom = mask_f.mean()
+                                if denom.item() == 0:
+                                    return per_elem.mean()
+                                return (per_elem * mask_f).div(denom).mean()
+
+                            video_pred = out["video_pred"]
+                            video_target = out["video_target"]
+                            video_loss_mask = out.get("video_loss_mask")
+                            _hfato_data = out.get("_hfato")
+                            if _hfato_data is not None:
+                                from musubi_tuner.hfato import hfato_x0_loss
+                                video_loss = hfato_x0_loss(
+                                    video_pred.to(dtype=network_dtype),
+                                    _hfato_data["noisy"].to(device=video_pred.device, dtype=network_dtype),
+                                    _hfato_data["clean"].to(device=video_pred.device, dtype=network_dtype),
+                                    _hfato_data["sigma"].to(device=video_pred.device),
+                                    video_loss_mask,
+                                )
                             else:
-                                pred = pred.to(dtype=network_dtype)
-                            per_elem = _per_element_loss(pred, tgt, _loss_type, _huber_delta)
+                                video_loss = _masked_loss(video_pred, video_target, video_loss_mask)
+
+                            audio_pred = out.get("audio_pred")
+                            audio_target = out.get("audio_target")
+                            audio_loss_mask = out.get("audio_loss_mask")
+                            has_audio_loss = audio_pred is not None and audio_target is not None
+
+                            if (
+                                audio_loss_balance_mode == "uncertainty"
+                                and has_audio_loss
+                                and uncertainty_log_var_video is not None
+                                and uncertainty_log_var_audio is not None
+                            ):
+                                audio_loss = _masked_loss(audio_pred, audio_target, audio_loss_mask)
+                                loss = compute_uncertainty_weighted_loss(
+                                    video_loss, audio_loss,
+                                    uncertainty_log_var_video, uncertainty_log_var_audio,
+                                )
+                            elif audio_loss_balance_mode == "ogm_ge" and has_audio_loss:
+                                audio_loss = _masked_loss(audio_pred, audio_target, audio_loss_mask)
+                                ogm_ge_state = compute_ogm_ge_coefficients(
+                                    float(video_loss.detach().item()),
+                                    float(audio_loss.detach().item()),
+                                    alpha=float(getattr(args, "ogm_ge_alpha", 0.3)),
+                                )
+                                video_weight = float(ogm_ge_state.video_coeff)
+                                audio_weight = float(ogm_ge_state.audio_coeff)
+                                loss = video_loss * ogm_ge_state.video_coeff + audio_loss * ogm_ge_state.audio_coeff
+                            else:
+                                video_weight = float(out.get("video_loss_weight", 1.0))
+                                loss = video_loss * video_weight
+                                if audio_loss_balance_mode == "ema_mag":
+                                    video_loss_item = max(float(video_loss.detach().item()), 1e-12)
+                                    val_video_loss_ema = update_loss_ema(
+                                        loss_ema=val_video_loss_ema,
+                                        loss_value=video_loss_item,
+                                        ema_decay=audio_loss_balance_ema_decay,
+                                    )
+                                if audio_loss_balance_mode == "inv_freq":
+                                    val_audio_presence_ema = update_audio_presence_ema(
+                                        audio_presence_ema=val_audio_presence_ema,
+                                        balance_beta=audio_loss_balance_beta,
+                                        has_audio_loss=has_audio_loss,
+                                    )
+                                if has_audio_loss:
+                                    audio_loss = _masked_loss(audio_pred, audio_target, audio_loss_mask)
+                                    audio_weight = float(out.get("audio_loss_weight", 1.0))
+                                    if audio_loss_balance_mode == "inv_freq":
+                                        audio_weight = compute_inverse_frequency_audio_weight(
+                                            base_audio_weight=audio_weight,
+                                            audio_presence_ema=val_audio_presence_ema,
+                                            balance_eps=audio_loss_balance_eps,
+                                            balance_min=audio_loss_balance_min,
+                                            balance_max=audio_loss_balance_max,
+                                        )
+                                    elif audio_loss_balance_mode == "ema_mag":
+                                        audio_loss_item = max(float(audio_loss.detach().item()), 1e-12)
+                                        val_audio_loss_ema = update_loss_ema(
+                                            loss_ema=val_audio_loss_ema,
+                                            loss_value=audio_loss_item,
+                                            ema_decay=audio_loss_balance_ema_decay,
+                                        )
+                                        audio_weight = compute_ema_magnitude_audio_weight(
+                                            base_audio_weight=audio_weight,
+                                            audio_loss_ema=val_audio_loss_ema,
+                                            video_loss_ema=val_video_loss_ema,
+                                            target_audio_ratio=audio_loss_balance_target_ratio,
+                                            balance_min=audio_loss_balance_min,
+                                            balance_max=audio_loss_balance_max,
+                                        )
+                                    loss = loss + audio_loss * audio_weight
+                        else:
+                            if isinstance(target, torch.Tensor):
+                                model_pred = model_pred.to(device=target.device, dtype=network_dtype)
+                            else:
+                                model_pred = model_pred.to(dtype=network_dtype)
+                            loss = _per_element_loss(model_pred, target, _loss_type, _huber_delta)
                             if weighting is not None:
-                                w = weighting
-                                if isinstance(w, torch.Tensor) and w.dim() != per_elem.dim():
-                                    while w.dim() > per_elem.dim() and w.shape[-1] == 1:
-                                        w = w.squeeze(-1)
-                                per_elem = per_elem * w
-                            if mask is None:
-                                return per_elem.mean()
+                                loss = loss * weighting
+                            loss = loss.mean()
 
-                            mask = mask.to(device=per_elem.device)
-                            if per_elem.dim() == 5 and mask.dim() == 2:
-                                mask = mask.view(mask.shape[0], 1, mask.shape[1], 1, 1)
-                            elif per_elem.dim() == 5 and mask.dim() == 1:
-                                mask = mask.view(mask.shape[0], 1, 1, 1, 1)
-                            elif per_elem.dim() == 4 and mask.dim() == 2:
-                                mask = mask.view(mask.shape[0], 1, mask.shape[1], 1)
-                            elif per_elem.dim() == 4 and mask.dim() == 1:
-                                mask = mask.view(mask.shape[0], 1, 1, 1)
-                            elif per_elem.dim() == 3 and mask.dim() == 2:
-                                mask = mask.unsqueeze(-1)
-                            elif per_elem.dim() == 3 and mask.dim() == 1:
-                                mask = mask.view(mask.shape[0], 1, 1)
-
-                            mask_f = mask.to(dtype=per_elem.dtype)
-                            denom = mask_f.mean()
-                            if denom.item() == 0:
-                                return per_elem.mean()
-                            return (per_elem * mask_f).div(denom).mean()
-
-                        video_pred = out["video_pred"]
-                        video_target = out["video_target"]
-                        video_loss_mask = out.get("video_loss_mask")
-                        _hfato_data = out.get("_hfato")
-                        if _hfato_data is not None:
-                            from musubi_tuner.hfato import hfato_x0_loss
-                            video_loss = hfato_x0_loss(
-                                video_pred.to(dtype=network_dtype),
-                                _hfato_data["noisy"].to(device=video_pred.device, dtype=network_dtype),
-                                _hfato_data["clean"].to(device=video_pred.device, dtype=network_dtype),
-                                _hfato_data["sigma"].to(device=video_pred.device),
-                                video_loss_mask,
+                        if dict_output and video_pred is not None:
+                            _prior_div = self.compute_prior_divergence_addition(
+                                args, accelerator, transformer, network, video_pred, network_dtype
                             )
-                        else:
-                            video_loss = _masked_loss(video_pred, video_target, video_loss_mask)
-                        video_weight = float(out.get("video_loss_weight", 1.0))
-                        loss = video_loss * video_weight
+                            if _prior_div is not None:
+                                loss = loss + _prior_div
 
-                        audio_pred = out.get("audio_pred")
-                        audio_target = out.get("audio_target")
-                        audio_loss_mask = out.get("audio_loss_mask")
-                        if audio_pred is not None and audio_target is not None:
-                            audio_loss = _masked_loss(audio_pred, audio_target, audio_loss_mask)
-                            audio_weight = float(out.get("audio_loss_weight", 1.0))
-                            loss = loss + audio_loss * audio_weight
-                    else:
-                        if isinstance(target, torch.Tensor):
-                            model_pred = model_pred.to(device=target.device, dtype=network_dtype)
-                        else:
-                            model_pred = model_pred.to(dtype=network_dtype)
-                        loss = _per_element_loss(model_pred, target, _loss_type, _huber_delta)
-                        if weighting is not None:
-                            loss = loss * weighting
-                        loss = loss.mean()
+                        if hasattr(self, "_crepa") and self._crepa is not None:
+                            self._crepa.on_step(step)
+                            try:
+                                num_latent_frames = int(latents_tensor.shape[2]) if latents_tensor.dim() >= 3 else 0
+                                conditions = batch.get("conditions", {})
+                                dino_features = conditions.get("dino_features") if isinstance(conditions, dict) else None
+                                crepa_loss = self._crepa.compute_loss(num_latent_frames, dino_features=dino_features)
+                                if crepa_loss is not None:
+                                    loss = loss + crepa_loss
+                            finally:
+                                self._crepa.cleanup_step()
 
-                    if loss_diag_enabled and global_step % max(loss_diag_every, 1) == 0:
-                        weight_stats = ""
-                        if isinstance(weighting, torch.Tensor):
-                            weight_stats = (
-                                f" weighting(mean={weighting.float().mean().item():.6f}"
-                                f" min={weighting.float().min().item():.6f}"
-                                f" max={weighting.float().max().item():.6f})"
+                        if hasattr(self, "compute_self_flow_addition"):
+                            if hasattr(self, "_self_flow") and self._self_flow is not None:
+                                self._self_flow.on_step(step)
+                            try:
+                                self_flow_loss, _ = self.compute_self_flow_addition(
+                                    args,
+                                    accelerator,
+                                    transformer,
+                                    network,
+                                    network_dtype,
+                                )
+                                if self_flow_loss is not None:
+                                    loss = loss + self_flow_loss
+                            except Exception as e:
+                                logger.warning("Self-Flow loss computation failed during validation: %s", e)
+
+                        if dict_output and out is not None:
+                            cts_data = out.get("_cts")
+                            if cts_data is not None:
+                                try:
+                                    cts_loss, _ = compute_cross_task_synergy_losses(
+                                        transformer=transformer,
+                                        accelerator=accelerator,
+                                        noisy_video=cts_data["noisy_video"],
+                                        clean_video=cts_data["clean_video"],
+                                        video_target=out["video_target"],
+                                        video_timesteps=cts_data["video_timesteps"],
+                                        video_loss_mask=out.get("video_loss_mask"),
+                                        noisy_audio=cts_data["noisy_audio"],
+                                        clean_audio=cts_data["clean_audio"],
+                                        audio_target=out.get("audio_target"),
+                                        audio_timesteps=cts_data["audio_timesteps"],
+                                        audio_loss_mask=out.get("audio_loss_mask"),
+                                        text_embeds=cts_data["text_embeds"],
+                                        text_mask=cts_data["text_mask"],
+                                        frame_rate=cts_data["frame_rate"],
+                                        transformer_options=cts_data["transformer_options"],
+                                        lambda_video_driven=cts_data["lambda_video_driven"],
+                                        lambda_audio_driven=cts_data["lambda_audio_driven"],
+                                    )
+                                    if cts_loss is not None:
+                                        loss = loss + cts_loss
+                                except Exception as e:
+                                    logger.warning("Cross-Task Synergy loss failed during validation: %s", e)
+
+                        unwrapped_network = accelerator.unwrap_model(network)
+                        if hasattr(unwrapped_network, "compute_adaptive_rank_loss"):
+                            adaptive_rank_loss = unwrapped_network.compute_adaptive_rank_loss()
+                            if adaptive_rank_loss is not None:
+                                loss = loss + adaptive_rank_loss
+
+                        try:
+                            validation_extra_loss, _ = self.compute_validation_extra_loss(
+                                args,
+                                accelerator,
+                                transformer,
+                                network,
+                                batch,
+                                step,
+                                network_dtype,
                             )
-                        logger.info(
-                            "LOSS_DIAG step=%s video_loss=%s video_weight=%s audio_loss=%s audio_weight=%s total=%s%s",
-                            global_step,
-                            f"{video_loss.item():.6f}" if isinstance(video_loss, torch.Tensor) else "n/a",
-                            f"{video_weight:.3f}" if isinstance(video_weight, float) else "n/a",
-                            f"{audio_loss.item():.6f}" if isinstance(audio_loss, torch.Tensor) else "n/a",
-                            f"{audio_weight:.3f}" if isinstance(audio_weight, float) else "n/a",
-                            f"{loss.item():.6f}" if isinstance(loss, torch.Tensor) else str(loss),
-                            weight_stats,
-                        )
+                            if validation_extra_loss is not None:
+                                loss = loss + validation_extra_loss
+                        finally:
+                            if hasattr(self, "_last_dit_inputs"):
+                                self._last_dit_inputs = None
 
-                    total_loss += loss.detach().item()
-                    total_count += 1
+                        if loss_diag_enabled and global_step % max(loss_diag_every, 1) == 0:
+                            weight_stats = ""
+                            if isinstance(weighting, torch.Tensor):
+                                weight_stats = (
+                                    f" weighting(mean={weighting.float().mean().item():.6f}"
+                                    f" min={weighting.float().min().item():.6f}"
+                                    f" max={weighting.float().max().item():.6f})"
+                                )
+                            logger.info(
+                                "LOSS_DIAG step=%s video_loss=%s video_weight=%s audio_loss=%s audio_weight=%s total=%s%s",
+                                global_step,
+                                f"{video_loss.item():.6f}" if isinstance(video_loss, torch.Tensor) else "n/a",
+                                f"{video_weight:.3f}" if isinstance(video_weight, float) else "n/a",
+                                f"{audio_loss.item():.6f}" if isinstance(audio_loss, torch.Tensor) else "n/a",
+                                f"{audio_weight:.3f}" if isinstance(audio_weight, float) else "n/a",
+                                f"{loss.item():.6f}" if isinstance(loss, torch.Tensor) else str(loss),
+                                weight_stats,
+                            )
+
+                        total_loss += loss.detach().item()
+                        total_count += 1
+            finally:
+                if validation_self_flow_network is not None and validation_self_flow_prev_training is not None:
+                    validation_self_flow_network.training = validation_self_flow_prev_training
 
             loss_stats = torch.tensor([total_loss, total_count], device=accelerator.device)
             if accelerator.num_processes > 1:

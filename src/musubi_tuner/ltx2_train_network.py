@@ -806,6 +806,197 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
 
         return losses
 
+    def _compute_validation_preservation_loss(
+        self,
+        technique: str,
+        accelerator: Accelerator,
+        transformer: torch.nn.Module,
+        network: torch.nn.Module,
+        dit_inputs: Dict[str, Any],
+        network_dtype: torch.dtype,
+    ) -> Optional[torch.Tensor]:
+        helper = self._preservation_helper
+        if helper is None:
+            return None
+
+        cfg = helper.config
+        if technique == "blank":
+            embed, mask, mult = cfg.blank_embed, cfg.blank_mask, cfg.blank_multiplier
+        elif technique == "dop":
+            embed, mask, mult = cfg.dop_embed, cfg.dop_mask, cfg.dop_multiplier
+        else:
+            raise ValueError(f"Unknown preservation technique: {technique}")
+
+        if embed is None or mask is None:
+            return None
+
+        device = accelerator.device
+        bsz = dit_inputs["model_timesteps"].shape[0]
+        pres_embed = embed.unsqueeze(0).expand(bsz, -1, -1).to(device=device, dtype=network_dtype)
+        pres_mask = mask.unsqueeze(0).expand(bsz, -1).to(device=device)
+
+        model_input = dit_inputs["model_input"]
+        if isinstance(model_input, (list, tuple)):
+            model_input = model_input[0]
+
+        pres_inputs = {
+            "model_input": model_input,
+            "model_timesteps": dit_inputs["model_timesteps"],
+            "text_embeds": pres_embed,
+            "text_mask": pres_mask,
+            "frame_rate": dit_inputs["frame_rate"],
+            "transformer_options": dit_inputs["transformer_options"],
+        }
+
+        helper._prepare_block_swap(transformer, accelerator)
+        network.set_multiplier(0.0)
+        try:
+            with torch.no_grad(), accelerator.autocast():
+                prior_pred = transformer(
+                    pres_inputs["model_input"],
+                    timestep=pres_inputs["model_timesteps"],
+                    context=pres_inputs["text_embeds"],
+                    attention_mask=pres_inputs["text_mask"],
+                    frame_rate=pres_inputs["frame_rate"],
+                    transformer_options=pres_inputs["transformer_options"],
+                )
+            if isinstance(prior_pred, (list, tuple)):
+                prior_pred = prior_pred[0]
+            prior_pred = prior_pred.detach()
+        finally:
+            network.set_multiplier(1.0)
+
+        helper._prepare_block_swap(transformer, accelerator)
+        with torch.no_grad(), accelerator.autocast():
+            pres_pred = transformer(
+                pres_inputs["model_input"],
+                timestep=pres_inputs["model_timesteps"],
+                context=pres_inputs["text_embeds"],
+                attention_mask=pres_inputs["text_mask"],
+                frame_rate=pres_inputs["frame_rate"],
+                transformer_options=pres_inputs["transformer_options"],
+            )
+        if isinstance(pres_pred, (list, tuple)):
+            pres_pred = pres_pred[0]
+
+        pres_loss = F.mse_loss(pres_pred.float(), prior_pred.float()) * mult
+        if not torch.isfinite(pres_loss):
+            logger.warning("Validation preservation %s loss is non-finite (%.4g), skipping.", technique, pres_loss.item())
+            return None
+        return pres_loss
+
+    def _compute_validation_audio_dop_loss(
+        self,
+        accelerator: Accelerator,
+        transformer: torch.nn.Module,
+        network: torch.nn.Module,
+        av_inputs: Dict[str, Any],
+    ) -> Optional[torch.Tensor]:
+        helper = self._preservation_helper
+        if helper is None:
+            return None
+
+        mult = float(helper.config.audio_dop_multiplier)
+        helper._prepare_block_swap(transformer, accelerator)
+        network.set_multiplier(0.0)
+        try:
+            with torch.no_grad(), accelerator.autocast():
+                prior_pred = transformer(
+                    av_inputs["model_input"],
+                    timestep=av_inputs["model_timesteps"],
+                    audio_timestep=av_inputs["audio_timestep"],
+                    context=av_inputs["text_embeds"],
+                    attention_mask=av_inputs["text_mask"],
+                    frame_rate=av_inputs["frame_rate"],
+                    transformer_options=av_inputs["transformer_options"],
+                )
+            if not isinstance(prior_pred, (list, tuple)) or len(prior_pred) < 2:
+                logger.warning("Validation audio DOP: transformer did not return [video, audio] — skipping.")
+                return None
+            audio_prior = prior_pred[1].detach()
+        finally:
+            network.set_multiplier(1.0)
+
+        helper._prepare_block_swap(transformer, accelerator)
+        with torch.no_grad(), accelerator.autocast():
+            lora_pred = transformer(
+                av_inputs["model_input"],
+                timestep=av_inputs["model_timesteps"],
+                audio_timestep=av_inputs["audio_timestep"],
+                context=av_inputs["text_embeds"],
+                attention_mask=av_inputs["text_mask"],
+                frame_rate=av_inputs["frame_rate"],
+                transformer_options=av_inputs["transformer_options"],
+            )
+        if not isinstance(lora_pred, (list, tuple)) or len(lora_pred) < 2:
+            logger.warning("Validation audio DOP: transformer did not return [video, audio] — skipping.")
+            return None
+
+        adop_loss = F.mse_loss(lora_pred[1].float(), audio_prior.float()) * mult
+        if not torch.isfinite(adop_loss):
+            logger.warning("Validation audio DOP loss is non-finite (%.4g), skipping.", adop_loss.item())
+            return None
+        return adop_loss
+
+    def compute_validation_extra_loss(
+        self,
+        args,
+        accelerator,
+        transformer,
+        network,
+        batch,
+        global_step: int,
+        network_dtype,
+    ):
+        if not self._preservation_active or self._preservation_helper is None:
+            return None, {}
+
+        dit_inputs = self._last_dit_inputs
+        if dit_inputs is None:
+            return None, {}
+
+        helper = self._preservation_helper
+        cfg = helper.config
+        total_loss = None
+        metrics: Dict[str, float] = {}
+
+        def _accumulate(name: str, value: Optional[torch.Tensor]) -> None:
+            nonlocal total_loss
+            if value is None:
+                return
+            total_loss = value if total_loss is None else total_loss + value
+            metrics[name] = float(value.detach().item())
+
+        if cfg.blank_preservation:
+            _accumulate(
+                "loss/blank_pres",
+                self._compute_validation_preservation_loss(
+                    "blank", accelerator, transformer, network, dit_inputs, network_dtype
+                ),
+            )
+
+        if cfg.dop:
+            _accumulate(
+                "loss/dop",
+                self._compute_validation_preservation_loss(
+                    "dop", accelerator, transformer, network, dit_inputs, network_dtype
+                ),
+            )
+
+        if cfg.audio_dop and self._ltx_mode == "av":
+            is_non_audio_batch = dit_inputs.get("audio_model_timesteps") is None
+            if is_non_audio_batch:
+                av_inputs = self._build_audio_dop_inputs(args, accelerator, transformer, dit_inputs, network_dtype)
+                if av_inputs is not None:
+                    _accumulate(
+                        "loss/audio_dop",
+                        self._compute_validation_audio_dop_loss(
+                            accelerator, transformer, network, av_inputs
+                        ),
+                    )
+
+        return total_loss, metrics
+
     def compute_self_flow_addition(
         self,
         args: argparse.Namespace,

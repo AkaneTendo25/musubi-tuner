@@ -3442,9 +3442,32 @@ def main() -> None:
         if ema_model is not None:
             original_params = ema_model.apply_to(accelerator.unwrap_model(transformer))
 
+        self_flow_network = getattr(trainer, "_self_flow_network", None)
+        self_flow_network_was_training = (
+            bool(getattr(self_flow_network, "training", False))
+            if self_flow_network is not None
+            else None
+        )
+        force_self_flow_capture = bool(
+            getattr(args, "self_flow", False)
+            and getattr(trainer, "_self_flow", None) is not None
+            and self_flow_network is not None
+            and not bool(getattr(self_flow_network, "training", False))
+        )
+        if force_self_flow_capture:
+            # Self-Flow capture is gated on the top-level module's `.training` flag.
+            # Flip only that flag so validation can populate cached teacher/student
+            # features without globally switching submodules back to train mode.
+            self_flow_network.training = True
+
         val_losses = []
         val_video_losses = []
         val_audio_losses = []
+        val_self_flow_losses = []
+        val_ewc_losses = []
+        val_motion_pres_losses = []
+        val_motion_attn_pres_losses = []
+        val_motion_total_losses = []
         num_batches = 0
         max_batches = args.num_validation_batches
 
@@ -3517,27 +3540,305 @@ def main() -> None:
                             loss_type=_val_loss_type, huber_delta=_val_huber_delta,
                         )
                         val_audio_losses.append(audio_loss.item())
-                        val_losses.append(video_loss.item() * args.video_loss_weight + audio_loss.item() * args.audio_loss_weight)
+                        video_weight = float(out.get("video_loss_weight", 1.0))
+                        audio_weight = float(out.get("audio_loss_weight", 1.0))
+                        loss = video_loss * video_weight + audio_loss * audio_weight
                     else:
-                        val_losses.append(video_loss.item())
+                        video_weight = float(out.get("video_loss_weight", 1.0))
+                        loss = video_loss * video_weight
                 else:
                     _val_loss_type = getattr(args, "loss_type", "mse")
                     _val_huber_delta = float(getattr(args, "huber_delta", 1.0))
                     if isinstance(target, torch.Tensor):
                         model_pred = model_pred.to(device=target.device, dtype=trainer.dit_dtype)
-                    if _val_loss_type in ("mae", "l1"):
-                        loss = torch.nn.functional.l1_loss(model_pred, target)
-                    elif _val_loss_type in ("huber", "smooth_l1"):
-                        loss = torch.nn.functional.smooth_l1_loss(model_pred, target, beta=_val_huber_delta)
                     else:
-                        loss = torch.nn.functional.mse_loss(model_pred, target)
-                    val_losses.append(loss.item())
+                        model_pred = model_pred.to(dtype=trainer.dit_dtype)
+                    if _val_loss_type in ("mae", "l1"):
+                        loss = torch.nn.functional.l1_loss(model_pred, target, reduction="none")
+                    elif _val_loss_type in ("huber", "smooth_l1"):
+                        loss = torch.nn.functional.smooth_l1_loss(
+                            model_pred, target, reduction="none", beta=_val_huber_delta
+                        )
+                    else:
+                        loss = torch.nn.functional.mse_loss(model_pred, target, reduction="none")
+                    if weighting is not None:
+                        w = weighting
+                        if isinstance(w, torch.Tensor) and w.dim() != loss.dim():
+                            while w.dim() > loss.dim() and w.shape[-1] == 1:
+                                w = w.squeeze(-1)
+                        loss = loss * w
+                    loss = loss.mean()
+
+                self_flow_loss = None
+                if bool(getattr(args, "self_flow", False)):
+                    try:
+                        if getattr(trainer, "_self_flow", None) is not None:
+                            trainer._self_flow.on_step(step)
+                        self_flow_loss, _self_flow_metrics = trainer.compute_self_flow_addition(
+                            args,
+                            accelerator,
+                            transformer,
+                            transformer,
+                            trainer.dit_dtype,
+                        )
+                        if self_flow_loss is not None:
+                            loss = loss + self_flow_loss
+                            val_self_flow_losses.append(float(self_flow_loss.detach().item()))
+                    except Exception as e:
+                        if getattr(trainer, "_self_flow", None) is not None:
+                            trainer._self_flow.cleanup_step()
+                        logger.warning(
+                            "Self-Flow validation loss computation failed at step=%s batch=%s: %s",
+                            step,
+                            num_batches,
+                            e,
+                        )
+
+                ewc_loss = None
+                if ewc_state is not None and float(getattr(args, "ewc_lambda", 0.0) or 0.0) > 0.0:
+                    ewc_penalty_raw, _ewc_used_tensors, _ewc_skipped_tensors = _compute_ewc_penalty(
+                        ewc_state,
+                        dtype=trainer.dit_dtype,
+                        target_device=loss.device if isinstance(loss, torch.Tensor) else None,
+                    )
+                    if ewc_penalty_raw is not None:
+                        ewc_loss = ewc_penalty_raw * float(getattr(args, "ewc_lambda", 0.0))
+                        loss = loss + ewc_loss
+                        val_ewc_losses.append(float(ewc_loss.detach().item()))
+
+                motion_pres_loss = None
+                attn_pres_loss = None
+                motion_total_loss = None
+                motion_preservation_prob = getattr(args, "motion_preservation_probability", None)
+                if motion_preservation_prob is None:
+                    should_apply_motion_replay = (
+                        (step + num_batches + 1) % int(args.motion_preservation_interval) == 0
+                    )
+                else:
+                    should_apply_motion_replay = random.random() < float(motion_preservation_prob)
+
+                if (
+                    args.motion_preservation
+                    and motion_anchor_cache
+                    and should_apply_motion_replay
+                ):
+                    anchor = random.choice(motion_anchor_cache)
+                    anchor_latents = _move_to_device(
+                        anchor["anchor_latents"], accelerator.device, dtype=trainer.dit_dtype
+                    )
+                    anchor_noise = _move_to_device(
+                        anchor["anchor_noise"], accelerator.device, dtype=trainer.dit_dtype
+                    )
+
+                    sigma_idx: Optional[int] = None
+                    anchor_sigmas = anchor.get("anchor_sigmas") or []
+                    teacher_video_preds = anchor.get("teacher_video_preds")
+                    if (
+                        isinstance(anchor_sigmas, list)
+                        and isinstance(teacher_video_preds, list)
+                        and len(anchor_sigmas) > 0
+                        and len(anchor_sigmas) == len(teacher_video_preds)
+                    ):
+                        sigma_idx = _sample_motion_sigma_index(anchor_sigmas, args)
+                        sigma_value = float(anchor_sigmas[sigma_idx])
+                        anchor_noisy_input, anchor_model_timesteps = _build_noisy_input_for_sigma(
+                            anchor_latents,
+                            anchor_noise,
+                            sigma_value,
+                        )
+                        teacher_video_pred = teacher_video_preds[sigma_idx]
+                    else:
+                        anchor_noisy_input = _move_to_device(
+                            anchor["anchor_noisy_input"], accelerator.device, dtype=trainer.dit_dtype
+                        )
+                        anchor_model_timesteps = _move_to_device(
+                            anchor["anchor_model_timesteps"], accelerator.device
+                        )
+                        teacher_video_pred = anchor.get("teacher_video_pred")
+
+                    anchor_batch = _move_to_device(
+                        anchor["anchor_batch"], accelerator.device, dtype=trainer.dit_dtype
+                    )
+                    if isinstance(teacher_video_pred, torch.Tensor):
+                        original_first_frame_p = float(
+                            getattr(args, "ltx2_first_frame_conditioning_p", 0.0)
+                        )
+                        try:
+                            setattr(args, "ltx2_first_frame_conditioning_p", 0.0)
+                            if args.motion_attention_preservation and motion_attention_modules:
+                                attn_recorder = _AttentionMapRecorder(
+                                    motion_attention_modules,
+                                    max_queries=int(
+                                        getattr(args, "motion_attention_preservation_queries", 32)
+                                        or 32
+                                    ),
+                                    max_keys=int(
+                                        getattr(args, "motion_attention_preservation_keys", 64)
+                                        or 64
+                                    ),
+                                    capture_grad=False,
+                                    keep_heads=bool(
+                                        getattr(args, "motion_attention_preservation_per_head", False)
+                                    ),
+                                )
+                                attn_recorder.__enter__()
+                                try:
+                                    motion_pred, _ = trainer.call_dit(
+                                        args,
+                                        accelerator,
+                                        transformer,
+                                        anchor_latents,
+                                        anchor_batch,
+                                        anchor_noise,
+                                        anchor_noisy_input,
+                                        anchor_model_timesteps,
+                                        trainer.dit_dtype,
+                                    )
+                                    student_attn_maps = attn_recorder.collect_maps()
+                                finally:
+                                    attn_recorder.__exit__(None, None, None)
+                            else:
+                                student_attn_maps = {}
+                                motion_pred, _ = trainer.call_dit(
+                                    args,
+                                    accelerator,
+                                    transformer,
+                                    anchor_latents,
+                                    anchor_batch,
+                                    anchor_noise,
+                                    anchor_noisy_input,
+                                    anchor_model_timesteps,
+                                    trainer.dit_dtype,
+                                )
+                        finally:
+                            setattr(args, "ltx2_first_frame_conditioning_p", original_first_frame_p)
+
+                        if (
+                            isinstance(motion_pred, dict)
+                            and not motion_pred.get("_skip_step")
+                        ):
+                            student_video_pred = motion_pred["video_pred"]
+                            motion_pres_loss_raw = _compute_motion_preservation_loss(
+                                args,
+                                student_video_pred,
+                                teacher_video_pred,
+                                motion_pred.get("video_loss_mask"),
+                                dtype=trainer.dit_dtype,
+                            )
+                            motion_multiplier = float(args.motion_preservation_multiplier)
+                            motion_warmup = int(
+                                getattr(args, "motion_preservation_warmup_steps", 0) or 0
+                            )
+                            if motion_warmup > 0 and step < motion_warmup:
+                                motion_multiplier = motion_multiplier * (step / motion_warmup)
+                            motion_pres_loss = motion_pres_loss_raw * motion_multiplier
+                            motion_total_loss = motion_pres_loss
+
+                            teacher_attn_maps = anchor.get("teacher_attention_maps")
+                            teacher_attn_maps_multi = anchor.get("teacher_attention_maps_multi")
+                            if isinstance(teacher_attn_maps_multi, list) and teacher_attn_maps_multi:
+                                if sigma_idx is not None and 0 <= sigma_idx < len(teacher_attn_maps_multi):
+                                    mapped = teacher_attn_maps_multi[sigma_idx]
+                                    if isinstance(mapped, dict):
+                                        teacher_attn_maps = mapped
+                                elif sigma_idx is None and len(teacher_attn_maps_multi) == 1:
+                                    mapped = teacher_attn_maps_multi[0]
+                                    if isinstance(mapped, dict):
+                                        teacher_attn_maps = mapped
+
+                            if (
+                                args.motion_attention_preservation
+                                and isinstance(teacher_attn_maps, dict)
+                                and student_attn_maps
+                            ):
+                                attn_temperature = float(
+                                    getattr(args, "motion_attention_preservation_temperature", 1.0)
+                                    or 1.0
+                                )
+                                symmetric_kl = bool(
+                                    getattr(args, "motion_attention_preservation_symmetric_kl", False)
+                                )
+                                per_block_losses: list[torch.Tensor] = []
+                                for module_name, student_map in student_attn_maps.items():
+                                    teacher_map = teacher_attn_maps.get(module_name)
+                                    if not isinstance(teacher_map, torch.Tensor):
+                                        continue
+                                    if teacher_map.shape != student_map.shape:
+                                        logger.warning(
+                                            "Motion preservation validation: attention map shape mismatch for module %s (student=%s teacher=%s), skipping",
+                                            module_name,
+                                            student_map.shape,
+                                            teacher_map.shape,
+                                        )
+                                        continue
+
+                                    student_dist = student_map.to(torch.float32)
+                                    teacher_dist = teacher_map.to(
+                                        device=student_dist.device,
+                                        dtype=torch.float32,
+                                        non_blocking=True,
+                                    )
+                                    if attn_temperature != 1.0:
+                                        inv_temp = 1.0 / max(1e-6, attn_temperature)
+                                        student_dist = student_dist.clamp_min(1e-8).pow(inv_temp)
+                                        teacher_dist = teacher_dist.clamp_min(1e-8).pow(inv_temp)
+                                    student_dist = student_dist.clamp_min(1e-6)
+                                    teacher_dist = teacher_dist.clamp_min(1e-6)
+                                    student_dist = student_dist / student_dist.sum(
+                                        dim=-1, keepdim=True
+                                    ).clamp_min(1e-6)
+                                    teacher_dist = teacher_dist / teacher_dist.sum(
+                                        dim=-1, keepdim=True
+                                    ).clamp_min(1e-6)
+
+                                    if getattr(args, "motion_attention_preservation_loss", "kl") == "kl":
+                                        kl_t2s = torch.nn.functional.kl_div(
+                                            student_dist.log(),
+                                            teacher_dist,
+                                            reduction="batchmean",
+                                        )
+                                        if symmetric_kl:
+                                            kl_s2t = torch.nn.functional.kl_div(
+                                                teacher_dist.log(),
+                                                student_dist,
+                                                reduction="batchmean",
+                                            )
+                                            block_loss = 0.5 * (kl_t2s + kl_s2t)
+                                        else:
+                                            block_loss = kl_t2s
+                                    else:
+                                        block_loss = torch.nn.functional.mse_loss(
+                                            student_dist, teacher_dist
+                                        )
+                                    per_block_losses.append(block_loss)
+
+                                if per_block_losses:
+                                    attn_pres_loss_raw = torch.stack(per_block_losses).mean()
+                                    attn_pres_loss = (
+                                        attn_pres_loss_raw
+                                        * float(
+                                            getattr(args, "motion_attention_preservation_weight", 0.0)
+                                        )
+                                    )
+                                    motion_total_loss = motion_total_loss + attn_pres_loss
+
+                if motion_pres_loss is not None:
+                    val_motion_pres_losses.append(float(motion_pres_loss.detach().item()))
+                if attn_pres_loss is not None:
+                    val_motion_attn_pres_losses.append(float(attn_pres_loss.detach().item()))
+                if motion_total_loss is not None:
+                    loss = loss + motion_total_loss
+                    val_motion_total_losses.append(float(motion_total_loss.detach().item()))
+
+                val_losses.append(float(loss.detach().item()))
 
                 num_batches += 1
 
         # Restore original weights if EMA was applied
         if original_params is not None:
             ema_model.restore(accelerator.unwrap_model(transformer), original_params)
+        if force_self_flow_capture and self_flow_network is not None:
+            self_flow_network.training = bool(self_flow_network_was_training)
 
         transformer.train()
 
@@ -3549,6 +3850,16 @@ def main() -> None:
             val_metrics["val_video_loss"] = sum(val_video_losses) / len(val_video_losses)
         if val_audio_losses:
             val_metrics["val_audio_loss"] = sum(val_audio_losses) / len(val_audio_losses)
+        if val_self_flow_losses:
+            val_metrics["val_self_flow_loss"] = sum(val_self_flow_losses) / len(val_self_flow_losses)
+        if val_ewc_losses:
+            val_metrics["val_ewc_loss"] = sum(val_ewc_losses) / len(val_ewc_losses)
+        if val_motion_pres_losses:
+            val_metrics["val_motion_pres_loss"] = sum(val_motion_pres_losses) / len(val_motion_pres_losses)
+        if val_motion_attn_pres_losses:
+            val_metrics["val_motion_attn_pres_loss"] = sum(val_motion_attn_pres_losses) / len(val_motion_attn_pres_losses)
+        if val_motion_total_losses:
+            val_metrics["val_motion_total_loss"] = sum(val_motion_total_losses) / len(val_motion_total_losses)
 
         if val_metrics:
             accelerator.print(f"Validation metrics: {val_metrics}")
