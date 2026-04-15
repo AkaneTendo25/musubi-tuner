@@ -712,6 +712,7 @@ def _score_report(
         },
         "family_scores": family_scores,
         "preset_scores": preset_scores,
+        "module_scores": param_rows,
         "top_modules": top_modules,
     }
 
@@ -1029,14 +1030,10 @@ def _print_summary(report: dict[str, Any]) -> None:
             )
 
 
-def main() -> None:
-    parser = setup_parser()
-    args = parser.parse_args()
-    args = read_config_from_file(args, parser)
-
-    if args.dataset_config is None:
+def _normalize_estimation_args(args: argparse.Namespace) -> argparse.Namespace:
+    if getattr(args, "dataset_config", None) is None:
         raise ValueError("dataset_config is required")
-    if args.ltx2_checkpoint is None:
+    if getattr(args, "ltx2_checkpoint", None) is None:
         raise ValueError("ltx2_checkpoint is required")
 
     short_map = {"v": "video", "a": "audio", "va": "av"}
@@ -1053,13 +1050,64 @@ def main() -> None:
     if float(args.estimation_target_coverage) <= 0.0 or float(args.estimation_target_coverage) > 1.0:
         raise ValueError("estimation_target_coverage must be in (0, 1]")
     args.max_train_steps = max(1, int(args.estimation_batches))
+    return args
 
+
+def build_estimation_args_from_training_args(
+    source_args: Any,
+    *,
+    estimation_output: Optional[str | Path] = None,
+) -> argparse.Namespace:
+    if not hasattr(source_args, "__dict__"):
+        raise TypeError("source_args must provide attributes via __dict__")
+
+    estimate_args = argparse.Namespace(**vars(source_args).copy())
+    defaults = {
+        "estimation_batches": 16,
+        "estimation_output": None,
+        "estimation_top_k": 24,
+        "estimation_target_coverage": 0.85,
+        "estimation_keep_caption_dropout": False,
+        "estimation_block_window": 1,
+    }
+    for key, default_value in defaults.items():
+        if getattr(estimate_args, key, None) is None:
+            setattr(estimate_args, key, default_value)
+
+    if estimation_output is not None:
+        estimate_args.estimation_output = str(estimation_output)
+
+    return _normalize_estimation_args(estimate_args)
+
+
+def write_estimation_report(report: dict[str, Any], output_path: str | Path) -> Path:
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = output_path.with_name(f"{output_path.name}.tmp")
+    temp_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    os.replace(temp_path, output_path)
+    return output_path
+
+
+def generate_estimation_report(
+    source_args: Any,
+    *,
+    estimation_output: Optional[str | Path] = None,
+) -> Path:
+    args = build_estimation_args_from_training_args(source_args, estimation_output=estimation_output)
     report = run_estimation(args)
     output_path = Path(args.estimation_output) if args.estimation_output else _default_output_path(args)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    output_path = write_estimation_report(report, output_path)
     _print_summary(report)
     logger.info("Saved estimate report to %s", output_path)
+    return output_path
+
+
+def main() -> None:
+    parser = setup_parser()
+    args = parser.parse_args()
+    args = read_config_from_file(args, parser)
+    generate_estimation_report(args)
 
 
 if __name__ == "__main__":

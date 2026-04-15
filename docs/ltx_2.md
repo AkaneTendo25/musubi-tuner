@@ -49,6 +49,7 @@ Caching scripts (`ltx2_cache_latents.py`, `ltx2_cache_text_encoder_outputs.py`) 
     - [Modality Freezing (G2D)](#modality-freezing-g2d)
     - [Per-Module Learning Rates](#per-module-learning-rates)
     - [Per-Module LoRA Rank](#per-module-lora-rank)
+    - [Adaptive LoRA Rank](#adaptive-lora-rank)
     - [Preservation & Regularization](#preservation--regularization)
     - [Self-Flow (Self-Supervised Flow Matching)](#self-flow-self-supervised-flow-matching)
     - [HFATO (High-Frequency Awareness Training Objective)](#hfato-high-frequency-awareness-training-objective)
@@ -792,6 +793,45 @@ Precedence is: `cross_modal_*` override > `audio_*` override > base `--network_d
 
 All override flags default to `None` (no override, all modules use `--network_dim`/`--network_alpha`). Not used with LyCORIS — use the LyCORIS per-module config instead. At inference, each module's rank is read from saved weight shapes (`lora_down.shape[0]`), so no flags are needed for loading.
 
+#### Adaptive LoRA Rank
+
+Implemented only for standard LoRA (`networks.lora_ltx2` / `networks.lora`).
+Related paper: [Not All Layers Are Created Equal: Adaptive Rank Allocation in Personalized Diffusion Models](https://arxiv.org/abs/2603.21884).
+
+- `--network_args "adaptive_rank=True"`: Enable adaptive rank.
+- `--network_args "adaptive_rank_target=<int>"`: Target effective rank. Default: each module's base rank.
+- `--network_args "adaptive_rank_weight=<float>"`: Rank regularization weight. Default: `1e-4` when enabled.
+- `--network_args "adaptive_rank_budget=<float>"`: Shared target for the sum of expected ranks.
+- `--network_args "adaptive_rank_budget_ratio=<float>"`: Use `total_max_rank * ratio` when `adaptive_rank_budget` is unset.
+- `--network_args "adaptive_rank_estimate=True"`: Use `<output_dir>/ltx2_estimate.json`. If the file is missing, it is generated from the current training args before rank allocation is applied.
+- `--network_args "adaptive_rank_estimate_report=<path>"`: Override the estimate report path.
+- `--network_args "adaptive_rank_hard_prune=True"`: Rebuild modules as static LoRA during training when the prune trigger fires.
+- `--network_args "adaptive_rank_finalize_start=<float>"`: Convert remaining adaptive modules to static LoRA once training progress reaches this value.
+
+Behavior:
+- Without `adaptive_rank_hard_prune`, modules keep their configured base rank during training.
+- Export writes standard LoRA weights. Inference reads per-module rank from weight shapes; no adaptive-rank runtime logic is required.
+- `--save_state` also writes `adaptive_rank_runtime.json`. `--resume` restores adaptive/static module structure from it before loading model weights.
+- Shared-budget loss uses the sum of expected ranks, not the final exported integer ranks.
+- `adaptive_rank_budget` overrides `adaptive_rank_budget_ratio`.
+- With `audio_dim` / `cross_modal_dim`, each module keeps its own local maximum rank.
+- Estimate score lookup reads `module_scores`, or `top_modules` as fallback, keyed by `module_path`.
+
+CLI example:
+```bash
+--network_dim 64 ^
+--network_args "adaptive_rank=True" "adaptive_rank_target=16" "adaptive_rank_weight=1e-4"
+```
+
+Estimate-driven example:
+```bash
+--network_dim 64 ^
+--network_args "adaptive_rank=True" "adaptive_rank_budget_ratio=0.35" "adaptive_rank_estimate=True" "adaptive_rank_hard_prune=True"
+```
+
+Notes:
+- Logged metrics include `loss/adaptive_rank`, `adaptive_rank/mean_effective_rank`, `adaptive_rank/mean_expected_rank`, `adaptive_rank/mean_target_rank`, and, when a shared budget is enabled, `adaptive_rank/expected_rank_sum` and `adaptive_rank/target_budget`.
+
 #### Per-Module LoRA Dropout
 
 Keep the existing global LoRA dropout as the default, but optionally override it per modality through `--network_args`.
@@ -1213,6 +1253,7 @@ The output is a JSON report written to `--estimation_output` or, if omitted, `<o
 - `summary`: `candidate_modules`, `candidate_params`, `total_fisher_sum`, and `recommended_preset`
 - `family_scores`: aggregate scores by module family such as `video_self_attn` and `video_cross_attn`
 - `preset_scores`: aggregate scores for the preset candidates available in the current `ltx_mode`
+- `module_scores`: per-module score rows keyed by `module_path`
 - `top_modules`: highest-ranked individual weights
 
 `recommended_preset` is selected as follows:

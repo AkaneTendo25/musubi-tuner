@@ -1,10 +1,10 @@
 import ast
 import asyncio
-from collections import deque
+import argparse
+from collections import defaultdict, deque
 from datetime import timedelta
 import gc
 import importlib
-import argparse
 import math
 import os
 import pathlib
@@ -1031,6 +1031,102 @@ class NetworkTrainer:
             default_warmup_steps=int(num_warmup_steps or 0),
             warmup_overrides=warmup_overrides,
         )
+
+    def _prepare_network_optimizer_params(self, args: argparse.Namespace, network: Any):
+        network_module_name = str(getattr(args, "network_module", "") or "")
+        uses_lycoris_module = "lycoris" in network_module_name.lower()
+        if uses_lycoris_module:
+            return prepare_optimizer_params_compat(network, args, logger)
+        return network.prepare_optimizer_params(
+            unet_lr=args.learning_rate,
+            audio_lr=getattr(args, "audio_lr", None),
+            lr_args=getattr(args, "lr_args", None),
+        )
+
+    @staticmethod
+    def _copy_optimizer_state_subset(state: dict, keep_param_ids: set[int]) -> dict:
+        if isinstance(state, defaultdict):
+            copied = defaultdict(dict)
+        else:
+            copied = type(state)()
+        for param, value in state.items():
+            if id(param) in keep_param_ids:
+                copied[param] = value
+        return copied
+
+    def _refresh_optimizer_after_adaptive_rank_prune(
+        self,
+        args: argparse.Namespace,
+        accelerator: Accelerator,
+        network: Any,
+        optimizer: torch.optim.Optimizer,
+        lr_scheduler: Any,
+        *,
+        old_network_param_ids: set[int],
+        global_step: int,
+        recovery_config: Optional[dict[str, Any]] = None,
+    ):
+        unwrapped_network = accelerator.unwrap_model(network)
+        new_network_param_groups, lr_descriptions = self._prepare_network_optimizer_params(args, unwrapped_network)
+
+        inner_optimizer = optimizer.optimizer if hasattr(optimizer, "optimizer") else optimizer
+
+        preserved_extra_groups = []
+        preserved_extra_param_ids: set[int] = set()
+        for group in inner_optimizer.param_groups:
+            extra_params = [param for param in group["params"] if id(param) not in old_network_param_ids]
+            if not extra_params:
+                continue
+            group_copy = {k: v for k, v in group.items() if k != "params"}
+            group_copy["params"] = extra_params
+            preserved_extra_groups.append(group_copy)
+            preserved_extra_param_ids.update(id(param) for param in extra_params)
+
+        new_network_param_ids: set[int] = set()
+        normalized_network_groups = []
+        for group in new_network_param_groups:
+            group_copy = {k: v for k, v in group.items() if k != "params"}
+            params = list(group["params"])
+            if recovery_config is not None and "lr" in group_copy:
+                group_copy["lr"] = float(group_copy["lr"]) * float(recovery_config.get("lr_scale", 1.0))
+            group_copy["params"] = params
+            normalized_network_groups.append(group_copy)
+            new_network_param_ids.update(id(param) for param in params)
+
+        keep_param_ids = new_network_param_ids | preserved_extra_param_ids
+        inner_optimizer.state = self._copy_optimizer_state_subset(inner_optimizer.state, keep_param_ids)
+        inner_optimizer.param_groups = []
+
+        for group in normalized_network_groups:
+            inner_optimizer.add_param_group(group)
+        for group in preserved_extra_groups:
+            inner_optimizer.add_param_group(group)
+
+        for group in inner_optimizer.param_groups:
+            if "initial_lr" in group:
+                group["lr"] = group["initial_lr"]
+
+        scheduler_args = args
+        if recovery_config is not None:
+            scheduler_args = argparse.Namespace(**vars(args))
+            scheduler_args.max_train_steps = max(1, int(recovery_config["steps"]))
+            scheduler_args.lr_warmup_steps = int(recovery_config.get("warmup_steps", 0))
+            recover_scheduler = recovery_config.get("scheduler")
+            if recover_scheduler is None:
+                recover_scheduler = "constant_with_warmup" if scheduler_args.lr_warmup_steps > 0 else "constant"
+            scheduler_args.lr_scheduler = recover_scheduler
+        new_inner_scheduler = self.get_lr_scheduler(scheduler_args, inner_optimizer, accelerator.num_processes)
+        if recovery_config is None and global_step > 0 and not self.is_schedulefree_optimizer(inner_optimizer, args):
+            for _ in range(global_step):
+                new_inner_scheduler.step()
+
+        if hasattr(lr_scheduler, "scheduler"):
+            lr_scheduler.scheduler = new_inner_scheduler
+            refreshed_scheduler = lr_scheduler
+        else:
+            refreshed_scheduler = new_inner_scheduler
+
+        return refreshed_scheduler, lr_descriptions
 
     def resume_from_local_or_hf_if_specified(self, accelerator: Accelerator, args: argparse.Namespace) -> int:
         """Resume training state. Returns the recovered global_step (0 if not resuming)."""
@@ -2583,16 +2679,7 @@ class NetworkTrainer:
         # prepare optimizer, data loader etc.
         accelerator.print("prepare optimizer, data loader etc.")
 
-        network_module_name = str(getattr(args, "network_module", "") or "")
-        uses_lycoris_module = "lycoris" in network_module_name.lower()
-        if uses_lycoris_module:
-            trainable_params, lr_descriptions = prepare_optimizer_params_compat(network, args, logger)
-        else:
-            trainable_params, lr_descriptions = network.prepare_optimizer_params(
-                unet_lr=args.learning_rate,
-                audio_lr=getattr(args, "audio_lr", None),
-                lr_args=getattr(args, "lr_args", None),
-            )
+        trainable_params, lr_descriptions = self._prepare_network_optimizer_params(args, network)
 
         optimizer_name, optimizer_args, optimizer, optimizer_train_fn, optimizer_eval_fn = self.get_optimizer(
             args, trainable_params
@@ -2796,6 +2883,17 @@ class NetworkTrainer:
                         weights.pop(i)
                 # print(f"save model hook: {len(weights)} weights will be saved")
 
+                unwrapped_network = accelerator.unwrap_model(network)
+                if hasattr(unwrapped_network, "build_adaptive_rank_runtime_state"):
+                    try:
+                        adaptive_rank_runtime_state = unwrapped_network.build_adaptive_rank_runtime_state()
+                        if adaptive_rank_runtime_state is not None:
+                            runtime_state_path = unwrapped_network._adaptive_rank_runtime_state_path(output_dir)
+                            with open(runtime_state_path, "w", encoding="utf-8") as f:
+                                json.dump(adaptive_rank_runtime_state, f, indent=2, sort_keys=True)
+                    except Exception as e:
+                        logger.warning(f"Failed to save adaptive rank runtime state: {e}")
+
                 # Save CREPA projector into state directory so it matches the optimizer state
                 if hasattr(self, '_crepa') and self._crepa is not None:
                     try:
@@ -2841,6 +2939,30 @@ class NetworkTrainer:
             for i in reversed(remove_indices):
                 models.pop(i)
             # print(f"load model hook: {len(models)} models will be loaded")
+
+            if models:
+                try:
+                    runtime_state_path = None
+                    adaptive_rank_runtime_state = None
+                    for model in models:
+                        unwrapped_model = accelerator.unwrap_model(model)
+                        if not hasattr(unwrapped_model, "load_adaptive_rank_runtime_state"):
+                            continue
+                        runtime_state_path = unwrapped_model._adaptive_rank_runtime_state_path(input_dir)
+                        if not os.path.exists(runtime_state_path):
+                            continue
+                        with open(runtime_state_path, "r", encoding="utf-8") as f:
+                            adaptive_rank_runtime_state = json.load(f)
+                        break
+
+                    if adaptive_rank_runtime_state is not None:
+                        for model in models:
+                            unwrapped_model = accelerator.unwrap_model(model)
+                            if hasattr(unwrapped_model, "load_adaptive_rank_runtime_state"):
+                                unwrapped_model.load_adaptive_rank_runtime_state(adaptive_rank_runtime_state)
+                        logger.info("Loaded adaptive rank runtime state from %s", runtime_state_path)
+                except Exception as e:
+                    logger.warning(f"Failed to load adaptive rank runtime state: {e}")
 
             if hasattr(self, "_self_flow") and self._self_flow is not None:
                 try:
@@ -3478,7 +3600,10 @@ class NetworkTrainer:
                 latents_shape = tuple(latents_tensor.shape)
 
                 with accelerator.accumulate(training_model):
-                    accelerator.unwrap_model(network).on_step_start()
+                    accelerator.unwrap_model(network).on_step_start(
+                        global_step=global_step,
+                        max_train_steps=args.max_train_steps,
+                    )
 
                     latents_tensor = self.scale_shift_latents(latents_tensor)
 
@@ -3823,6 +3948,15 @@ class NetworkTrainer:
                             except Exception as e:
                                 logger.warning("Cross-Task Synergy loss failed: %s", e)
 
+                    adaptive_rank_metrics = {}
+                    unwrapped_network = accelerator.unwrap_model(network)
+                    if hasattr(unwrapped_network, "compute_adaptive_rank_loss"):
+                        adaptive_rank_loss = unwrapped_network.compute_adaptive_rank_loss()
+                        if adaptive_rank_loss is not None:
+                            loss = loss + adaptive_rank_loss
+                            adaptive_rank_metrics = unwrapped_network.get_adaptive_rank_metrics()
+                            adaptive_rank_metrics["loss/adaptive_rank"] = adaptive_rank_loss.detach().item()
+
                     if _is_first_step:
                         _log_vram("FIRST_ITER: BEFORE backward", logger)
                     accelerator.backward(loss)
@@ -3846,6 +3980,8 @@ class NetworkTrainer:
                         pres_losses.update(self_flow_metrics)
                     if cts_metrics:
                         pres_losses.update(cts_metrics)
+                    if adaptive_rank_metrics:
+                        pres_losses.update(adaptive_rank_metrics)
 
                     # DEBUG: Check if LoRA parameters have gradients (requires LTX2_DEBUG env var)
                     if os.environ.get("LTX2_DEBUG", "0") == "1":
@@ -3966,6 +4102,70 @@ class NetworkTrainer:
                         progress_bar.reset()  # exclude first step from progress bar, because it may take long due to initializations
                     progress_bar.update(1)
                     global_step += 1
+                    unwrapped_network = accelerator.unwrap_model(network)
+                    finalized_this_step = False
+                    if hasattr(unwrapped_network, "maybe_finalize_adaptive_rank"):
+                        old_network_param_ids = {id(param) for param in unwrapped_network.get_trainable_params()}
+                        finalize_report = unwrapped_network.maybe_finalize_adaptive_rank(
+                            global_step=global_step,
+                            max_train_steps=args.max_train_steps,
+                        )
+                        if finalize_report is not None:
+                            lr_scheduler, lr_descriptions = self._refresh_optimizer_after_adaptive_rank_prune(
+                                args,
+                                accelerator,
+                                network,
+                                optimizer,
+                                lr_scheduler,
+                                old_network_param_ids=old_network_param_ids,
+                                global_step=global_step,
+                                recovery_config=finalize_report.get("recovery_config"),
+                            )
+                            finalized_this_step = True
+                            logger.info(
+                                "adaptive rank finalize at step %s: modules=%s rank_sum=%s->%s recovery=%s",
+                                finalize_report["step"],
+                                finalize_report["finalized_module_count"],
+                                finalize_report["rank_sum_before"],
+                                finalize_report["rank_sum_after"],
+                                "on" if finalize_report.get("recovery_config") is not None else "off",
+                            )
+                    if not finalized_this_step and hasattr(unwrapped_network, "maybe_hard_prune_adaptive_rank"):
+                        old_network_param_ids = {id(param) for param in unwrapped_network.get_trainable_params()}
+                        hard_prune_report = unwrapped_network.maybe_hard_prune_adaptive_rank(
+                            global_step=global_step,
+                            max_train_steps=args.max_train_steps,
+                        )
+                        if hard_prune_report is not None:
+                            lr_scheduler, lr_descriptions = self._refresh_optimizer_after_adaptive_rank_prune(
+                                args,
+                                accelerator,
+                                network,
+                                optimizer,
+                                lr_scheduler,
+                                old_network_param_ids=old_network_param_ids,
+                                global_step=global_step,
+                            )
+                            logger.info(
+                                "adaptive rank hard prune at step %s: modules=%s rank_sum=%s->%s",
+                                hard_prune_report["step"],
+                                hard_prune_report["pruned_module_count"],
+                                hard_prune_report["rank_sum_before"],
+                                hard_prune_report["rank_sum_after"],
+                            )
+                    if not finalized_this_step and hasattr(unwrapped_network, "maybe_reallocate_adaptive_rank_estimate"):
+                        reallocate_report = unwrapped_network.maybe_reallocate_adaptive_rank_estimate(
+                            global_step=global_step,
+                            max_train_steps=args.max_train_steps,
+                        )
+                        if reallocate_report is not None:
+                            logger.info(
+                                "adaptive rank estimate reallocation at step %s: changed=%s fixed_budget=%.3f remaining_budget=%.3f",
+                                reallocate_report["step"],
+                                reallocate_report["changed_module_count"],
+                                reallocate_report["fixed_budget"],
+                                reallocate_report["remaining_budget"],
+                            )
                     if timestep_tb_buffers is not None and (
                         global_step == 1 or global_step % timestep_tb_interval == 0
                     ):
