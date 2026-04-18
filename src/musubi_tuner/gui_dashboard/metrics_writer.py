@@ -17,8 +17,12 @@ SCHEMA = pa.schema(
         ("avr_loss", pa.float32()),
         ("loss_v", pa.float32()),
         ("loss_a", pa.float32()),
+        ("grad_norm", pa.float32()),
+        ("grad_norm_v", pa.float32()),
+        ("grad_norm_a", pa.float32()),
         ("lr", pa.float64()),
         ("step_time", pa.float32()),
+        ("data_wait_time", pa.float32()),
     ]
 )
 
@@ -74,8 +78,12 @@ class MetricsWriter:
         avr_loss: float = 0.0,
         loss_v: Optional[float] = None,
         loss_a: Optional[float] = None,
+        grad_norm: Optional[float] = None,
+        grad_norm_v: Optional[float] = None,
+        grad_norm_a: Optional[float] = None,
         lr: float = 0.0,
         step_time: float = 0.0,
+        data_wait_time: float = 0.0,
     ):
         row = {
             "step": step,
@@ -84,8 +92,12 @@ class MetricsWriter:
             "avr_loss": avr_loss,
             "loss_v": loss_v if loss_v is not None else float("nan"),
             "loss_a": loss_a if loss_a is not None else float("nan"),
+            "grad_norm": grad_norm if grad_norm is not None else float("nan"),
+            "grad_norm_v": grad_norm_v if grad_norm_v is not None else float("nan"),
+            "grad_norm_a": grad_norm_a if grad_norm_a is not None else float("nan"),
             "lr": lr,
             "step_time": step_time,
+            "data_wait_time": data_wait_time,
         }
         with self._lock:
             self._buffer.append(row)

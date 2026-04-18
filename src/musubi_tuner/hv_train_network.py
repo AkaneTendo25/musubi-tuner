@@ -3693,6 +3693,8 @@ class NetworkTrainer:
                 avg_loss = total_loss / max(total_count, 1)
                 if len(accelerator.trackers) > 0:
                     accelerator.log({"val_loss": avg_loss}, step=step)
+                if gui_metrics is not None:
+                    gui_metrics.log_event("validation", step, val_loss=avg_loss, epoch=epoch_no)
                 log_msg = f"validation loss: {avg_loss:.6f}"
                 if epoch_no is not None:
                     log_msg += f" (epoch {epoch_no})"
@@ -3748,6 +3750,7 @@ class NetworkTrainer:
             metadata["ss_epoch"] = str(epoch + 1)
 
             accelerator.unwrap_model(network).on_epoch_start(transformer)
+            _prev_step_end_time = time.perf_counter()
 
             for step, batch in enumerate(train_dataloader):
                 # mid-epoch resume: skip batches already processed before checkpoint
@@ -3756,6 +3759,7 @@ class NetworkTrainer:
                     continue
 
                 _step_start_time = time.perf_counter()
+                _data_wait_time = max(0.0, _step_start_time - _prev_step_end_time)
                 # VRAM spike tracing for first iteration
                 _is_first_step = (epoch == epoch_to_start and step == 0)
                 if _is_first_step:
@@ -3848,6 +3852,7 @@ class NetworkTrainer:
                     audio_loss_ema_value = None
                     video_loss_ema_value = None
                     ogm_ge_state = None
+                    grad_norm_total_value = None
                     grad_norm_video_value = None  # Per-modality gradient norms
                     grad_norm_audio_value = None
                     audio_diagnostics = {}  # Per-batch audio quality diagnostics (negligible cost)
@@ -4202,9 +4207,6 @@ class NetworkTrainer:
                                 )
 
                     if accelerator.sync_gradients:
-
-
-
                         # self.all_reduce_network(accelerator, network)  # sync DDP grad manually
                         state = accelerate.PartialState()
                         if state.distributed_type != accelerate.DistributedType.NO:
@@ -4220,16 +4222,21 @@ class NetworkTrainer:
                                     if param.grad is not None:
                                         param.grad = accelerator.reduce(param.grad, reduction="mean")
 
-                        if args.max_grad_norm != 0.0:
-                            params_to_clip = list(accelerator.unwrap_model(network).get_trainable_params())
-                            if hasattr(self, '_crepa') and self._crepa is not None:
-                                params_to_clip.extend(self._crepa.get_trainable_params())
-                            if hasattr(self, "_self_flow") and self._self_flow is not None:
-                                params_to_clip.extend(self._self_flow.get_trainable_params())
-                            accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
+                        params_to_clip = list(accelerator.unwrap_model(network).get_trainable_params())
+                        if hasattr(self, '_crepa') and self._crepa is not None:
+                            params_to_clip.extend(self._crepa.get_trainable_params())
+                        if hasattr(self, "_self_flow") and self._self_flow is not None:
+                            params_to_clip.extend(self._self_flow.get_trainable_params())
+
+                        if len(accelerator.trackers) > 0 or gui_metrics is not None:
+                            total_grad_sq = torch.zeros(1, device=accelerator.device)
+                            for param in params_to_clip:
+                                if param.grad is not None:
+                                    total_grad_sq += param.grad.detach().float().pow(2).sum()
+                            grad_norm_total_value = total_grad_sq.sqrt().item()
 
                         # Per-modality gradient norm tracking (accumulate on GPU, sync once)
-                        if len(accelerator.trackers) > 0 and dict_output:
+                        if (len(accelerator.trackers) > 0 or gui_metrics is not None) and dict_output:
                             unwrapped_net = accelerator.unwrap_model(network)
                             lora_modules = getattr(unwrapped_net, "unet_loras", None)
                             if lora_modules:
@@ -4239,13 +4246,16 @@ class NetworkTrainer:
                                     is_audio = "audio_" in lora.lora_name
                                     for param in lora.parameters():
                                         if param.grad is not None:
-                                            g_sq = param.grad.data.norm() ** 2
+                                            g_sq = param.grad.detach().float().pow(2).sum()
                                             if is_audio:
                                                 audio_grad_sq += g_sq
                                             else:
                                                 video_grad_sq += g_sq
                                 grad_norm_video_value = video_grad_sq.sqrt().item()
                                 grad_norm_audio_value = audio_grad_sq.sqrt().item()
+
+                        if args.max_grad_norm != 0.0:
+                            accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
 
                     if _is_first_step:
                         _log_vram("FIRST_ITER: BEFORE optimizer.step", logger)
@@ -4268,6 +4278,7 @@ class NetworkTrainer:
                             logger.warning("Self-Flow EMA update failed: %s", e)
                     lr_scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
+                    _prev_step_end_time = time.perf_counter()
                     if _is_first_step:
                         _log_vram("FIRST_ITER: AFTER zero_grad (end of first step)", logger)
 
@@ -4456,6 +4467,8 @@ class NetworkTrainer:
                         logs["grad_norm/audio"] = grad_norm_audio_value
                         if grad_norm_video_value is not None and grad_norm_video_value > 0:
                             logs["grad_norm/audio_video_ratio"] = grad_norm_audio_value / grad_norm_video_value
+                    if grad_norm_total_value is not None:
+                        logs["grad_norm/total"] = grad_norm_total_value
                     if uncertainty_log_var_video is not None:
                         lv_v = uncertainty_log_var_video.detach().item()
                         lv_a = uncertainty_log_var_audio.detach().item()
@@ -4496,8 +4509,12 @@ class NetworkTrainer:
                         avr_loss=avr_loss,
                         loss_v=video_loss_value,
                         loss_a=audio_loss_value,
+                        grad_norm=grad_norm_total_value,
+                        grad_norm_v=grad_norm_video_value,
+                        grad_norm_a=grad_norm_audio_value,
                         lr=lr_scheduler.get_last_lr()[0],
                         step_time=step_time,
+                        data_wait_time=_data_wait_time,
                     )
                     gui_metrics.update_status(
                         step=global_step,
@@ -4514,6 +4531,7 @@ class NetworkTrainer:
                 ):
                     run_validation(global_step)
 
+                _prev_step_end_time = time.perf_counter()
                 if global_step >= args.max_train_steps:
                     break
 

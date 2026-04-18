@@ -3,12 +3,15 @@
 	import LossChart from '$lib/components/LossChart.svelte';
 	import LRChart from '$lib/components/LRChart.svelte';
 	import StepTimeChart from '$lib/components/StepTimeChart.svelte';
+	import GradNormChart from '$lib/components/GradNormChart.svelte';
+	import DataWaitChart from '$lib/components/DataWaitChart.svelte';
+	import ComputeTimeChart from '$lib/components/ComputeTimeChart.svelte';
 	import SampleGallery from '$lib/components/SampleGallery.svelte';
 	import ProcessConsole from '$lib/components/ProcessConsole.svelte';
 	import ProcessControls from '$lib/components/ProcessControls.svelte';
 	import { projectConfig } from '$lib/stores/project.js';
 	import { processStatuses, processLogs, startProcess, stopProcess, preloadLogsIfActive, clearProcessLogs, refreshStatuses, fetchLogs, startLogPolling } from '$lib/stores/processes.js';
-	import { clearMetrics } from '$lib/stores/metrics.js';
+	import { clearMetrics, lossData, gradNormData, lrData, stepTimeData, dataWaitData } from '$lib/stores/metrics.js';
 	import { status, clearStatus } from '$lib/stores/status.js';
 	import { onMount } from 'svelte';
 
@@ -196,6 +199,19 @@
 	let nextCheckpoint = $derived(nextStepEventLabel(Number(t.save_every_n_steps || 0), $status?.step, $status?.speed_steps_per_sec, 'Final only'));
 	let nextSample = $derived(nextSampleLabel(t, $status, runStats));
 	let resumeMode = $derived(resumeModeLabel(t));
+	let hasLossChartData = $derived(($lossData?.length ?? 0) > 0);
+	let hasGradNormChartData = $derived(
+		($gradNormData?.some((r) =>
+			(r.grad_norm !== null && !isNaN(r.grad_norm)) ||
+			(r.grad_norm_v !== null && !isNaN(r.grad_norm_v)) ||
+			(r.grad_norm_a !== null && !isNaN(r.grad_norm_a))
+		) ?? false)
+	);
+	let hasBottomCharts = $derived(
+		($lrData?.length ?? 0) > 0 ||
+		($stepTimeData?.length ?? 0) > 0 ||
+		($dataWaitData?.length ?? 0) > 0
+	);
 </script>
 
 <div class="space-y-4">
@@ -373,12 +389,35 @@
 	</div>
 
 	{#if showDashboardData}
-		<LossChart />
+		{#if hasLossChartData || hasGradNormChartData}
+			<div class="grid grid-cols-1 xl:grid-cols-2 gap-4">
+				{#if hasLossChartData}
+					<LossChart />
+				{/if}
+				{#if hasGradNormChartData}
+					<GradNormChart />
+				{/if}
+			</div>
+		{:else}
+			<div class="bg-gray-900 border border-gray-800 rounded-lg p-4">
+				<h3 class="text-sm font-medium text-gray-400 mb-3">Charts</h3>
+				<p class="text-sm text-gray-600">No training metrics yet</p>
+			</div>
+		{/if}
 
-		<div class="grid grid-cols-1 md:grid-cols-2 gap-4">
-			<LRChart />
-			<StepTimeChart />
-		</div>
+		{#if hasBottomCharts}
+			<div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-4">
+				<LRChart />
+				<StepTimeChart />
+				<DataWaitChart />
+				<ComputeTimeChart />
+			</div>
+		{:else}
+			<div class="bg-gray-900 border border-gray-800 rounded-lg p-4">
+				<h3 class="text-sm font-medium text-gray-400 mb-3">Detailed Charts</h3>
+				<p class="text-sm text-gray-600">No detailed metrics yet</p>
+			</div>
+		{/if}
 
 		<SampleGallery />
 	{/if}
