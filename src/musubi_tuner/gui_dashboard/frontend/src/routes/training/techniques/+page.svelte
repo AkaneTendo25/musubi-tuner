@@ -9,6 +9,7 @@
 	import CommandPanel from '$lib/components/CommandPanel.svelte';
 	import { projectConfig, projectLoaded, saveProjectDebounced } from '$lib/stores/project.js';
 	import { processStatuses, processLogs, startProcess, stopProcess } from '$lib/stores/processes.js';
+	import { advancedMode } from '$lib/stores/uiMode.js';
 
 	function update(key, value) {
 		projectConfig.update((c) => {
@@ -72,6 +73,17 @@
 {#if !$projectLoaded}
 	<div class="text-center py-16" style="color: var(--text-muted);">
 		<p>No project loaded. Go to <a href="/" style="color: var(--accent);">Project</a> to create or load one.</p>
+	</div>
+{:else if !$advancedMode}
+	<div class="space-y-4">
+		<div>
+			<h2 class="text-base font-semibold" style="color: var(--text-primary);">Training Techniques</h2>
+			<p class="text-[12px]" style="color: var(--text-muted);">This page is only shown in Advanced mode.</p>
+		</div>
+		<div class="p-5" style="background: var(--bg-surface); border: 1px solid var(--border-subtle); border-radius: var(--radius-md);">
+			<div class="text-[13px] font-semibold mb-1" style="color: var(--text-primary);">Advanced mode required</div>
+			<div class="text-[12px]" style="color: var(--text-secondary);">Switch the left sidebar to `Advanced` to access CREPA, Self-Flow, HFATO, slider targets, and the rest of the specialized training controls.</div>
+		</div>
 	</div>
 {:else}
 	<div class="space-y-5">
@@ -176,7 +188,7 @@
 				<div class="p-3" style="background: var(--bg-elevated); border-radius: var(--radius-sm); border: 1px solid var(--border-subtle);">
 					<div class="text-[11px] font-semibold mb-2" style="color: var(--text-primary);">Architecture</div>
 					<div class="grid grid-cols-3 gap-2 mb-2">
-						<FormField label="Teacher Mode" type="select" value={$projectConfig?.training?.self_flow_teacher_mode ?? 'base'} oninput={(e) => updateTraining('self_flow_teacher_mode', e.target.value)} options={[{value: 'base', label: 'Base model'}, {value: 'ema', label: 'EMA (all LoRA)'}, {value: 'partial_ema', label: 'Partial EMA (teacher block)'}]} tooltip="base: frozen pretrained model (no VRAM overhead, stronger gap). ema: EMA over all LoRA params. partial_ema: EMA only over teacher block's LoRA params." />
+						<FormSelect label="Teacher Mode" value={$projectConfig?.training?.self_flow_teacher_mode ?? 'base'} onchange={(e) => updateTraining('self_flow_teacher_mode', e.target.value)} options={[{value: 'base', label: 'Base model'}, {value: 'ema', label: 'EMA (all LoRA)'}, {value: 'partial_ema', label: 'Partial EMA (teacher block)'}]} tooltip="base: frozen pretrained model (no VRAM overhead, stronger gap). ema: EMA over all LoRA params. partial_ema: EMA only over teacher block's LoRA params." />
 						<FormField label="Student Block" type="number" value={$projectConfig?.training?.self_flow_student_block_idx ?? 16} oninput={(e) => updateTraining('self_flow_student_block_idx', Number(e.target.value))} min={0} max={47} tooltip="Student feature block index (overridden by ratio when set)" />
 						<FormField label="Teacher Block" type="number" value={$projectConfig?.training?.self_flow_teacher_block_idx ?? 32} oninput={(e) => updateTraining('self_flow_teacher_block_idx', Number(e.target.value))} min={0} max={47} tooltip="Teacher feature block index (must be > student; overridden by ratio when set)" />
 					</div>
@@ -194,9 +206,11 @@
 						<FormField label="Mask Ratio" type="number" value={$projectConfig?.training?.self_flow_mask_ratio ?? 0.1} oninput={(e) => updateTraining('self_flow_mask_ratio', Number(e.target.value))} step="0.05" min={0} max={0.5} tooltip="Fraction of tokens given the alternate timestep in dual-timestep noising. Valid range [0, 0.5]." />
 						<FormField label="Max Loss Cap" type="number" value={$projectConfig?.training?.self_flow_max_loss ?? 0.0} oninput={(e) => updateTraining('self_flow_max_loss', Number(e.target.value))} step="0.01" min={0} placeholder="Disabled" tooltip="Rescale total Self-Flow loss if its magnitude exceeds this value. 0 = disabled. Prevents Self-Flow from dominating the main task loss early in training." />
 					</div>
-					<div class="grid grid-cols-3 gap-2 mb-2">
+					<div class="grid grid-cols-4 gap-2 mb-2">
 						<FormField label="Momentum" type="number" value={$projectConfig?.training?.self_flow_teacher_momentum ?? 0.999} oninput={(e) => updateTraining('self_flow_teacher_momentum', Number(e.target.value))} step="0.001" min={0} max={1} tooltip="EMA momentum for teacher updates (only used when teacher_mode=ema or partial_ema)" />
 						<FormField label="Projector LR" type="number" value={$projectConfig?.training?.self_flow_projector_lr ?? ''} oninput={(e) => updateTraining('self_flow_projector_lr', e.target.value ? Number(e.target.value) : null)} placeholder="Same as LR" step="any" tooltip="Separate LR for projector MLP" />
+						<FormSelect label="Projector Act" value={$projectConfig?.training?.self_flow_projector_activation ?? 'silu'} onchange={(e) => updateTraining('self_flow_projector_activation', e.target.value)} options={['silu', 'gelu']} tooltip="Projector activation for Self-Flow." />
+						<FormField label="Audio Lambda" type="number" value={$projectConfig?.training?.self_flow_lambda_audio ?? 0.0} oninput={(e) => updateTraining('self_flow_lambda_audio', Number(e.target.value))} step="0.01" min={0} tooltip="Optional Self-Flow audio loss weight." />
 					</div>
 					<div class="grid grid-cols-3 gap-2">
 						<div class="flex items-end pb-0.5">
@@ -221,7 +235,7 @@
 					<div class="text-[11px] font-semibold mb-1" style="color: var(--text-primary);">Temporal Consistency</div>
 					<div class="text-[11px] mb-2" style="color: var(--text-muted);">Frame-neighbor and motion-delta losses to preserve temporal coherence during fine-tuning</div>
 					<div class="grid grid-cols-3 gap-2 mb-2">
-						<FormField label="Mode" type="select" value={$projectConfig?.training?.self_flow_temporal_mode ?? 'off'} oninput={(e) => updateTraining('self_flow_temporal_mode', e.target.value)} options={[{value: 'off', label: 'Off'}, {value: 'frame', label: 'Frame'}, {value: 'delta', label: 'Delta'}, {value: 'hybrid', label: 'Hybrid'}]} tooltip="off: disabled, frame: neighbor alignment, delta: motion consistency, hybrid: both" />
+						<FormSelect label="Mode" value={$projectConfig?.training?.self_flow_temporal_mode ?? 'off'} onchange={(e) => updateTraining('self_flow_temporal_mode', e.target.value)} options={[{value: 'off', label: 'Off'}, {value: 'frame', label: 'Frame'}, {value: 'delta', label: 'Delta'}, {value: 'hybrid', label: 'Hybrid'}]} tooltip="off: disabled, frame: neighbor alignment, delta: motion consistency, hybrid: both" />
 						<FormField label="Lambda Temporal" type="number" value={$projectConfig?.training?.self_flow_lambda_temporal ?? 0.0} oninput={(e) => updateTraining('self_flow_lambda_temporal', Number(e.target.value))} step="0.01" min={0} tooltip="Loss weight for frame-level temporal alignment (frame/hybrid modes)" />
 						<FormField label="Lambda Delta" type="number" value={$projectConfig?.training?.self_flow_lambda_delta ?? 0.0} oninput={(e) => updateTraining('self_flow_lambda_delta', Number(e.target.value))} step="0.01" min={0} tooltip="Loss weight for motion delta alignment (delta/hybrid modes)" />
 					</div>
@@ -231,16 +245,16 @@
 						<FormField label="Delta Steps" type="number" value={$projectConfig?.training?.self_flow_delta_num_steps ?? 1} oninput={(e) => updateTraining('self_flow_delta_num_steps', Number(e.target.value))} min={1} max={8} tooltip="Multi-step delta: 1 = adjacent frames only" />
 					</div>
 					<div class="grid grid-cols-3 gap-2 mb-2">
-						<FormField label="Granularity" type="select" value={$projectConfig?.training?.self_flow_temporal_granularity ?? 'frame'} oninput={(e) => updateTraining('self_flow_temporal_granularity', e.target.value)} options={[{value: 'frame', label: 'Frame'}, {value: 'patch', label: 'Patch'}]} tooltip="frame: mean-pooled per frame (fast), patch: per-token spatial (stronger)" />
+						<FormSelect label="Granularity" value={$projectConfig?.training?.self_flow_temporal_granularity ?? 'frame'} onchange={(e) => updateTraining('self_flow_temporal_granularity', e.target.value)} options={[{value: 'frame', label: 'Frame'}, {value: 'patch', label: 'Patch'}]} tooltip="frame: mean-pooled per frame (fast), patch: per-token spatial (stronger)" />
 						<FormField label="Patch Radius" type="number" value={$projectConfig?.training?.self_flow_patch_spatial_radius ?? 0} oninput={(e) => updateTraining('self_flow_patch_spatial_radius', Number(e.target.value))} min={0} max={4} tooltip="Local spatial radius for patch matching (0 = strict position)" />
-						<FormField label="Patch Mode" type="select" value={$projectConfig?.training?.self_flow_patch_match_mode ?? 'hard'} oninput={(e) => updateTraining('self_flow_patch_match_mode', e.target.value)} options={[{value: 'hard', label: 'Hard'}, {value: 'soft', label: 'Soft'}]} tooltip="hard: best match in window, soft: softmax-weighted" />
+						<FormSelect label="Patch Mode" value={$projectConfig?.training?.self_flow_patch_match_mode ?? 'hard'} onchange={(e) => updateTraining('self_flow_patch_match_mode', e.target.value)} options={[{value: 'hard', label: 'Hard'}, {value: 'soft', label: 'Soft'}]} tooltip="hard: best match in window, soft: softmax-weighted" />
 					</div>
 					<div class="grid grid-cols-2 gap-2 mb-2">
-						<FormField label="Motion Weighting" type="select" value={$projectConfig?.training?.self_flow_motion_weighting ?? 'none'} oninput={(e) => updateTraining('self_flow_motion_weighting', e.target.value)} options={[{value: 'none', label: 'None'}, {value: 'teacher_delta', label: 'Teacher Delta'}]} tooltip="Upweight regions with more motion in teacher features" />
+						<FormSelect label="Motion Weighting" value={$projectConfig?.training?.self_flow_motion_weighting ?? 'none'} onchange={(e) => updateTraining('self_flow_motion_weighting', e.target.value)} options={[{value: 'none', label: 'None'}, {value: 'teacher_delta', label: 'Teacher Delta'}]} tooltip="Upweight regions with more motion in teacher features" />
 						<FormField label="Motion Strength" type="number" value={$projectConfig?.training?.self_flow_motion_weight_strength ?? 0.0} oninput={(e) => updateTraining('self_flow_motion_weight_strength', Number(e.target.value))} step="0.1" min={0} tooltip="How strongly motion affects per-token weighting" />
 					</div>
 					<div class="grid grid-cols-3 gap-2">
-						<FormField label="Schedule" type="select" value={$projectConfig?.training?.self_flow_temporal_schedule ?? 'constant'} oninput={(e) => updateTraining('self_flow_temporal_schedule', e.target.value)} options={[{value: 'constant', label: 'Constant'}, {value: 'linear', label: 'Linear decay'}, {value: 'cosine', label: 'Cosine decay'}]} tooltip="Schedule for all Self-Flow lambdas (lambda_self_flow, lambda_temporal, lambda_delta all scale together)" />
+						<FormSelect label="Schedule" value={$projectConfig?.training?.self_flow_temporal_schedule ?? 'constant'} onchange={(e) => updateTraining('self_flow_temporal_schedule', e.target.value)} options={[{value: 'constant', label: 'Constant'}, {value: 'linear', label: 'Linear decay'}, {value: 'cosine', label: 'Cosine decay'}]} tooltip="Schedule for all Self-Flow lambdas (lambda_self_flow, lambda_temporal, lambda_delta all scale together)" />
 						<FormField label="Warmup Steps" type="number" value={$projectConfig?.training?.self_flow_temporal_warmup_steps ?? 0} oninput={(e) => updateTraining('self_flow_temporal_warmup_steps', Number(e.target.value))} min={0} tooltip="Linear ramp-up before temporal loss reaches full weight" />
 						<FormField label="Max Steps" type="number" value={$projectConfig?.training?.self_flow_temporal_max_steps ?? 0} oninput={(e) => updateTraining('self_flow_temporal_max_steps', Number(e.target.value))} min={0} tooltip="Steps at which linear/cosine decay reaches zero (0 = no decay)" />
 					</div>
@@ -302,7 +316,15 @@
 			<div class="p-5 space-y-3">
 				<div class="p-3" style="background: var(--bg-elevated); border-radius: var(--radius-sm); border: 1px solid var(--border-subtle);">
 					<div class="text-[11px] font-semibold mb-2" style="color: var(--text-primary);">Loss Balance</div>
-					<FormSelect label="Mode" value={$projectConfig?.training?.audio_loss_balance_mode || 'none'} onchange={(e) => updateTraining('audio_loss_balance_mode', e.target.value)} options={[{value: 'none', label: 'None (static weights)'}, {value: 'inv_freq', label: 'Inverse Frequency'}, {value: 'ema_mag', label: 'EMA Magnitude'}]} tooltip="Dynamic audio loss balancing mode" />
+					<FormSelect label="Mode" value={$projectConfig?.training?.audio_loss_balance_mode || 'none'} onchange={(e) => updateTraining('audio_loss_balance_mode', e.target.value)} options={[{value: 'none', label: 'None (static weights)'}, {value: 'inv_freq', label: 'Inverse Frequency'}, {value: 'ema_mag', label: 'EMA Magnitude'}, {value: 'uncertainty', label: 'Uncertainty'}, {value: 'ogm_ge', label: 'OGM-GE'}]} tooltip="Dynamic audio loss balancing mode" />
+					<div class="grid grid-cols-2 gap-2 mt-2">
+						<FormField label="EMA Init" type="number" value={$projectConfig?.training?.audio_loss_balance_ema_init ?? 1.0} oninput={(e) => updateTraining('audio_loss_balance_ema_init', Number(e.target.value))} step="0.1" min={0} tooltip="Initial EMA value for audio-loss balancing." />
+						{#if ($projectConfig?.training?.audio_loss_balance_mode || 'none') === 'uncertainty'}
+							<FormField label="Uncertainty LR" type="number" value={$projectConfig?.training?.uncertainty_lr ?? ''} oninput={(e) => updateTraining('uncertainty_lr', e.target.value ? Number(e.target.value) : null)} placeholder="Optional" step="any" tooltip="Learning rate for uncertainty-based balancing." />
+						{:else if ($projectConfig?.training?.audio_loss_balance_mode || 'none') === 'ogm_ge'}
+							<FormField label="OGM-GE Alpha" type="number" value={$projectConfig?.training?.ogm_ge_alpha ?? 0.3} oninput={(e) => updateTraining('ogm_ge_alpha', Number(e.target.value))} step="0.05" min={0} tooltip="Alpha parameter for OGM-GE balancing." />
+						{/if}
+					</div>
 					{#if ($projectConfig?.training?.audio_loss_balance_mode || 'none') === 'inv_freq'}
 					<div class="grid grid-cols-2 gap-2 mt-2">
 						<FormField label="Beta" type="number" value={$projectConfig?.training?.audio_loss_balance_beta ?? 0.01} oninput={(e) => updateTraining('audio_loss_balance_beta', Number(e.target.value))} step="0.005" tooltip="EMA update factor" />
@@ -317,6 +339,12 @@
 					<div class="grid grid-cols-2 gap-2 mt-2">
 						<FormField label="Target Ratio" type="number" value={$projectConfig?.training?.audio_loss_balance_target_ratio ?? 0.33} oninput={(e) => updateTraining('audio_loss_balance_target_ratio', Number(e.target.value))} step="0.05" tooltip="Target audio/video loss ratio" />
 						<FormField label="EMA Decay" type="number" value={$projectConfig?.training?.audio_loss_balance_ema_decay ?? 0.99} oninput={(e) => updateTraining('audio_loss_balance_ema_decay', Number(e.target.value))} step="0.005" tooltip="EMA decay for loss magnitude tracking" />
+					</div>
+					{/if}
+					{#if ($projectConfig?.training?.audio_loss_balance_mode || 'none') === 'ogm_ge'}
+					<div class="grid grid-cols-2 gap-2 mt-2">
+						<FormField label="OGM-GE Noise" type="number" value={$projectConfig?.training?.ogm_ge_noise_std ?? 0.0} oninput={(e) => updateTraining('ogm_ge_noise_std', Number(e.target.value))} step="0.01" min={0} tooltip="Gaussian noise standard deviation for OGM-GE." />
+						<div></div>
 					</div>
 					{/if}
 				</div>
@@ -356,6 +384,20 @@
 					<div class="grid grid-cols-2 gap-2">
 						<FormField label="Min Audio Batches" type="number" value={$projectConfig?.training?.min_audio_batches_per_accum ?? 0} oninput={(e) => updateTraining('min_audio_batches_per_accum', Number(e.target.value))} min={0} tooltip="Min audio batches per accumulation (0=disabled)" />
 						<FormField label="Audio Batch Prob" type="number" value={$projectConfig?.training?.audio_batch_probability ?? ''} oninput={(e) => updateTraining('audio_batch_probability', e.target.value ? Number(e.target.value) : null)} placeholder="Random" step="0.1" min={0} max={1} tooltip="Audio batch selection probability" />
+					</div>
+				</div>
+
+				<div class="p-3" style="background: var(--bg-elevated); border-radius: var(--radius-sm); border: 1px solid var(--border-subtle);">
+					<div class="text-[11px] font-semibold mb-2" style="color: var(--text-primary);">Cross-Token Sync & Modality Freeze</div>
+					<div class="grid grid-cols-2 gap-2 mb-2">
+						<FormField label="CTS Video" type="number" value={$projectConfig?.training?.cts_lambda_video_driven ?? 0.0} oninput={(e) => updateTraining('cts_lambda_video_driven', Number(e.target.value))} step="0.01" min={0} tooltip="Cross-token sync weight driven by video tokens." />
+						<FormField label="CTS Audio" type="number" value={$projectConfig?.training?.cts_lambda_audio_driven ?? 0.0} oninput={(e) => updateTraining('cts_lambda_audio_driven', Number(e.target.value))} step="0.01" min={0} tooltip="Cross-token sync weight driven by audio tokens." />
+					</div>
+					<div class="grid grid-cols-4 gap-2">
+						<FormField label="Freeze Interval" type="number" value={$projectConfig?.training?.modality_freeze_check_interval ?? 0} oninput={(e) => updateTraining('modality_freeze_check_interval', Number(e.target.value))} min={0} tooltip="0 disables automatic modality freezing." />
+						<FormField label="Ratio Threshold" type="number" value={$projectConfig?.training?.modality_freeze_ratio_threshold ?? 0.5} oninput={(e) => updateTraining('modality_freeze_ratio_threshold', Number(e.target.value))} step="0.05" min={0} tooltip="Video/audio loss ratio threshold for freezing." />
+						<FormField label="Warmup" type="number" value={$projectConfig?.training?.modality_freeze_warmup_steps ?? 100} oninput={(e) => updateTraining('modality_freeze_warmup_steps', Number(e.target.value))} min={0} tooltip="Warmup steps before freeze decisions are allowed." />
+						<FormField label="EMA Decay" type="number" value={$projectConfig?.training?.modality_freeze_ema_decay ?? 0.99} oninput={(e) => updateTraining('modality_freeze_ema_decay', Number(e.target.value))} step="0.005" min={0} max={1} tooltip="EMA decay for modality-freeze loss tracking." />
 					</div>
 				</div>
 			</div>

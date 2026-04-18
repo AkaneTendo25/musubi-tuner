@@ -85,7 +85,7 @@ def create_management_app(project_path: Optional[str] = None) -> FastAPI:
             return Response(status_code=204)
         return FileResponse(path, media_type="application/json")
 
-    @app.get("/data/samples/{file_path:path}")
+    @app.api_route("/data/samples/{file_path:path}", methods=["GET", "HEAD"])
     async def get_sample(file_path: str):
         run_dir = _get_run_dir(app)
         if not run_dir:

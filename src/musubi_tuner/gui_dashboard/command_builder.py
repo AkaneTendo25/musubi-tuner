@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shlex
 import sys
 from pathlib import Path
 
@@ -11,6 +12,10 @@ from musubi_tuner.gui_dashboard.toml_export import (
     build_slider_toml_path,
     export_dataset_toml,
 )
+
+DEFAULT_MODEL_DIR_NAME = "models"
+DEFAULT_LTX2_CHECKPOINT_NAME = "ltx-2-19b-dev.safetensors"
+DEFAULT_GEMMA_ROOT_NAME = "gemma-3-12b-it"
 
 
 def _find_script(name: str) -> str:
@@ -23,16 +28,54 @@ def _find_script(name: str) -> str:
     raise FileNotFoundError(f"Script not found: {name}")
 
 
+def _default_model_dir(config: ProjectConfig) -> Path:
+    return Path(config.model_dir) if config.model_dir else Path.cwd() / DEFAULT_MODEL_DIR_NAME
+
+
+def _effective_ltx2_checkpoint(config: ProjectConfig, explicit: str) -> str:
+    return explicit or config.default_ltx2_checkpoint or str(_default_model_dir(config) / DEFAULT_LTX2_CHECKPOINT_NAME)
+
+
+def _effective_gemma_root(config: ProjectConfig, explicit: str, gemma_safetensors: str) -> str:
+    if gemma_safetensors:
+        return ""
+    return explicit or config.default_gemma_root or str(_default_model_dir(config) / DEFAULT_GEMMA_ROOT_NAME)
+
+
+def _effective_gemma_safetensors(config: ProjectConfig, explicit: str) -> str:
+    return explicit or config.default_gemma_safetensors or ""
+
+
+def _split_cli_args(raw: str) -> list[str]:
+    if not raw:
+        return []
+    return shlex.split(raw, posix=False)
+
+
+def _append_network_arg(args_parts: list[str], key: str, value) -> None:
+    prefix = f"{key}="
+    if any(part.startswith(prefix) for part in args_parts):
+        return
+    if isinstance(value, bool):
+        if value:
+            args_parts.append(f"{key}=true")
+        return
+    if value is None:
+        return
+    args_parts.append(f"{key}={value}")
+
+
 def build_cache_latents_cmd(config: ProjectConfig) -> list[str]:
     """Build CLI args for ltx2_cache_latents.py."""
     toml_path = export_dataset_toml(config)
     c = config.caching
+    ltx2_checkpoint = _effective_ltx2_checkpoint(config, c.ltx2_checkpoint)
 
     cmd = [
         sys.executable,
         _find_script("ltx2_cache_latents.py"),
         "--dataset_config", str(toml_path),
-        "--ltx2_checkpoint", c.ltx2_checkpoint,
+        "--ltx2_checkpoint", ltx2_checkpoint,
         "--ltx2_mode", c.ltx2_mode,
     ]
 
@@ -94,18 +137,22 @@ def build_cache_text_cmd(config: ProjectConfig) -> list[str]:
     """Build CLI args for ltx2_cache_text_encoder_outputs.py."""
     toml_path = export_dataset_toml(config)
     c = config.caching
+    ltx2_checkpoint = _effective_ltx2_checkpoint(config, c.ltx2_checkpoint)
+    gemma_safetensors = _effective_gemma_safetensors(config, c.gemma_safetensors)
+    gemma_root = _effective_gemma_root(config, c.gemma_root, gemma_safetensors)
 
     cmd = [
         sys.executable,
         _find_script("ltx2_cache_text_encoder_outputs.py"),
         "--dataset_config", str(toml_path),
-        "--ltx2_checkpoint", c.ltx2_checkpoint,
-        "--gemma_root", c.gemma_root,
+        "--ltx2_checkpoint", ltx2_checkpoint,
         "--ltx2_mode", c.ltx2_mode,
     ]
 
-    if c.gemma_safetensors:
-        cmd += ["--gemma_safetensors", c.gemma_safetensors]
+    if gemma_root:
+        cmd += ["--gemma_root", gemma_root]
+    if gemma_safetensors:
+        cmd += ["--gemma_safetensors", gemma_safetensors]
     if c.ltx2_text_encoder_checkpoint:
         cmd += ["--ltx2_text_encoder_checkpoint", c.ltx2_text_encoder_checkpoint]
     if c.mixed_precision != "no":
@@ -221,6 +268,19 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
     """Build CLI args for training via accelerate launch."""
     toml_path = export_dataset_toml(config)
     t = config.training
+    ltx2_checkpoint = _effective_ltx2_checkpoint(config, t.ltx2_checkpoint)
+    gemma_safetensors = _effective_gemma_safetensors(config, t.gemma_safetensors)
+    gemma_root = _effective_gemma_root(config, t.gemma_root, gemma_safetensors)
+    network_args_parts = _split_cli_args(t.network_args)
+
+    _append_network_arg(network_args_parts, "rank_dropout", t.rank_dropout)
+    _append_network_arg(network_args_parts, "module_dropout", t.module_dropout)
+    _append_network_arg(network_args_parts, "adaptive_rank", t.adaptive_rank)
+    _append_network_arg(network_args_parts, "adaptive_rank_target", t.adaptive_rank_target)
+    _append_network_arg(network_args_parts, "adaptive_rank_min_rank", t.adaptive_rank_min_rank)
+    _append_network_arg(network_args_parts, "adaptive_rank_init_rank", t.adaptive_rank_init_rank)
+    _append_network_arg(network_args_parts, "adaptive_rank_quantile", t.adaptive_rank_quantile)
+    _append_network_arg(network_args_parts, "adaptive_rank_weight", t.adaptive_rank_weight)
 
     # Use accelerate launch
     cmd = [
@@ -238,11 +298,11 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
         cmd += ["--dataset_config", str(toml_path)]
 
     # Model
-    cmd += ["--ltx2_checkpoint", t.ltx2_checkpoint]
-    if t.gemma_root:
-        cmd += ["--gemma_root", t.gemma_root]
-    if t.gemma_safetensors:
-        cmd += ["--gemma_safetensors", t.gemma_safetensors]
+    cmd += ["--ltx2_checkpoint", ltx2_checkpoint]
+    if gemma_root:
+        cmd += ["--gemma_root", gemma_root]
+    if gemma_safetensors:
+        cmd += ["--gemma_safetensors", gemma_safetensors]
     cmd += ["--ltx2_mode", t.ltx2_mode]
     if t.ltx_version != "2.0":
         cmd += ["--ltx_version", t.ltx_version]
@@ -294,13 +354,15 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
     # LoRA / Network
     if t.network_module:
         cmd += ["--network_module", t.network_module]
-    cmd += ["--network_dim", str(t.network_dim)]
-    cmd += ["--network_alpha", str(t.network_alpha)]
+    if t.network_dim is not None:
+        cmd += ["--network_dim", str(t.network_dim)]
+    if t.network_alpha != 1:
+        cmd += ["--network_alpha", str(t.network_alpha)]
     cmd += ["--lora_target_preset", t.lora_target_preset]
     if t.train_connectors:
         cmd.append("--train_connectors")
-    if t.network_args:
-        cmd += ["--network_args"] + t.network_args.split()
+    if network_args_parts:
+        cmd += ["--network_args"] + network_args_parts
     if t.network_weights:
         cmd += ["--network_weights", t.network_weights]
     if t.network_dropout is not None:
@@ -310,9 +372,9 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
     if t.dim_from_weights:
         cmd.append("--dim_from_weights")
     if t.base_weights:
-        cmd += ["--base_weights"] + t.base_weights.split()
+        cmd += ["--base_weights"] + _split_cli_args(t.base_weights)
     if t.base_weights_multiplier:
-        cmd += ["--base_weights_multiplier"] + t.base_weights_multiplier.split()
+        cmd += ["--base_weights_multiplier"] + _split_cli_args(t.base_weights_multiplier)
     if t.lycoris_config:
         cmd += ["--lycoris_config", t.lycoris_config]
     if t.lycoris_quantized_base_check_mode != "warn":
@@ -344,9 +406,10 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
 
     # Optimizer
     cmd += ["--learning_rate", str(t.learning_rate)]
-    cmd += ["--optimizer_type", t.optimizer_type]
+    if t.optimizer_type:
+        cmd += ["--optimizer_type", t.optimizer_type]
     if t.optimizer_args:
-        cmd += ["--optimizer_args"] + t.optimizer_args.split()
+        cmd += ["--optimizer_args"] + _split_cli_args(t.optimizer_args)
     cmd += ["--lr_scheduler", t.lr_scheduler]
     cmd += ["--lr_warmup_steps", str(t.lr_warmup_steps)]
     if t.lr_decay_steps is not None:
@@ -360,7 +423,7 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
     if t.lr_scheduler_type:
         cmd += ["--lr_scheduler_type", t.lr_scheduler_type]
     if t.lr_scheduler_args:
-        cmd += ["--lr_scheduler_args"] + t.lr_scheduler_args.split()
+        cmd += ["--lr_scheduler_args"] + _split_cli_args(t.lr_scheduler_args)
     if t.lr_scheduler_timescale is not None:
         cmd += ["--lr_scheduler_timescale", str(t.lr_scheduler_timescale)]
     cmd += ["--gradient_accumulation_steps", str(t.gradient_accumulation_steps)]
@@ -368,7 +431,7 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
     if t.audio_lr is not None:
         cmd += ["--audio_lr", str(t.audio_lr)]
     if t.lr_args:
-        cmd += ["--lr_args"] + t.lr_args.split()
+        cmd += ["--lr_args"] + _split_cli_args(t.lr_args)
     if t.audio_dim is not None:
         cmd += ["--audio_dim", str(t.audio_dim)]
     if t.audio_alpha is not None:
@@ -800,6 +863,13 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
                 cmd += ["--audio_loss_balance_target_ratio", str(t.audio_loss_balance_target_ratio)]
             if t.audio_loss_balance_ema_decay != 0.99:
                 cmd += ["--audio_loss_balance_ema_decay", str(t.audio_loss_balance_ema_decay)]
+        if t.audio_loss_balance_mode == "uncertainty" and t.uncertainty_lr is not None:
+            cmd += ["--uncertainty_lr", str(t.uncertainty_lr)]
+        if t.audio_loss_balance_mode == "ogm_ge":
+            if t.ogm_ge_alpha != 0.3:
+                cmd += ["--ogm_ge_alpha", str(t.ogm_ge_alpha)]
+            if t.ogm_ge_noise_std != 0.0:
+                cmd += ["--ogm_ge_noise_std", str(t.ogm_ge_noise_std)]
     if t.independent_audio_timestep:
         cmd.append("--independent_audio_timestep")
     if t.audio_silence_regularizer:
@@ -871,6 +941,9 @@ def build_slider_training_cmd(config: ProjectConfig) -> list[str]:
     s = config.slider
     t = config.training
     slider_toml = _write_slider_toml(config, build_slider_toml_path(config))
+    ltx2_checkpoint = _effective_ltx2_checkpoint(config, t.ltx2_checkpoint)
+    gemma_safetensors = _effective_gemma_safetensors(config, t.gemma_safetensors)
+    gemma_root = _effective_gemma_root(config, t.gemma_root, gemma_safetensors)
 
     cmd = [
         sys.executable, "-m", "accelerate.commands.launch",
@@ -884,9 +957,11 @@ def build_slider_training_cmd(config: ProjectConfig) -> list[str]:
     cmd += ["--slider_config", str(slider_toml)]
 
     # Model — from training config
-    cmd += ["--ltx2_checkpoint", t.ltx2_checkpoint]
-    if t.gemma_root:
-        cmd += ["--gemma_root", t.gemma_root]
+    cmd += ["--ltx2_checkpoint", ltx2_checkpoint]
+    if gemma_root:
+        cmd += ["--gemma_root", gemma_root]
+    if gemma_safetensors:
+        cmd += ["--gemma_safetensors", gemma_safetensors]
     if t.fp8_base:
         cmd.append("--fp8_base")
     if t.fp8_scaled:
@@ -905,14 +980,17 @@ def build_slider_training_cmd(config: ProjectConfig) -> list[str]:
         cmd += ["--latent_width", str(s.latent_width)]
 
     # LoRA — from training config
-    cmd += ["--network_dim", str(t.network_dim)]
-    cmd += ["--network_alpha", str(t.network_alpha)]
+    if t.network_dim is not None:
+        cmd += ["--network_dim", str(t.network_dim)]
+    if t.network_alpha != 1:
+        cmd += ["--network_alpha", str(t.network_alpha)]
 
     # Optimizer — from training config
     cmd += ["--learning_rate", str(t.learning_rate)]
-    cmd += ["--optimizer_type", t.optimizer_type]
+    if t.optimizer_type:
+        cmd += ["--optimizer_type", t.optimizer_type]
     if t.optimizer_args:
-        cmd += ["--optimizer_args"] + t.optimizer_args.split()
+        cmd += ["--optimizer_args"] + _split_cli_args(t.optimizer_args)
     cmd += ["--gradient_accumulation_steps", str(t.gradient_accumulation_steps)]
     cmd += ["--max_grad_norm", str(t.max_grad_norm)]
 

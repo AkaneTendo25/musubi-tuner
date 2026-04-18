@@ -1,11 +1,19 @@
 <script>
-	let { label, value = $bindable(''), options = [], tooltip = '', disabled = false, ...rest } = $props();
+	let { label, value = $bindable(''), options = [], tooltip = '', disabled = false, onchange, ...rest } = $props();
+
+	function handleChange(e) {
+		value = e.target.value;
+		if (onchange) {
+			onchange(e);
+		}
+	}
 </script>
 
 <label class="block" data-tooltip={tooltip || undefined}>
 	<span class="text-xs font-medium uppercase tracking-wider" style="color: var(--text-muted); font-family: var(--font-label);">{label}</span>
 	<select
-		bind:value
+		{value}
+		onchange={handleChange}
 		{disabled}
 		{...rest}
 		class="mt-1 block w-full px-3 py-2 text-sm transition-colors disabled:opacity-40"

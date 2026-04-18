@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 try:
@@ -28,15 +29,15 @@ def _toml_value(v) -> str:
     if isinstance(v, float):
         return str(v)
     if isinstance(v, str):
-        return f'"{v}"'
+        return json.dumps(v, ensure_ascii=False)
     if isinstance(v, list):
         items = ", ".join(_toml_value(i) for i in v)
         return f"[{items}]"
     return str(v)
 
 
-def _write_toml_fallback(doc: dict, path: Path):
-    """Simple TOML writer for when tomli_w is not available."""
+def _render_toml_fallback(doc: dict) -> str:
+    """Simple TOML renderer for when tomli_w is not available."""
     lines = []
 
     if "general" in doc:
@@ -54,7 +55,23 @@ def _write_toml_fallback(doc: dict, path: Path):
                 lines.append(f"{k} = {_toml_value(v)}")
             lines.append("")
 
-    path.write_text("\n".join(lines), encoding="utf-8")
+    return "\n".join(lines)
+
+
+def render_toml(doc: dict) -> str:
+    if tomli_w is not None:
+        return tomli_w.dumps(doc)
+    return _render_toml_fallback(doc)
+
+
+def _default_cache_directory(entry) -> str:
+    if entry.cache_directory:
+        return entry.cache_directory
+    if entry.directory:
+        return str(Path(entry.directory) / "cache")
+    if entry.jsonl_file:
+        return str(Path(entry.jsonl_file).parent / "cache")
+    return ""
 
 
 def _dataset_entry_to_dict(entry) -> dict:
@@ -72,7 +89,7 @@ def _dataset_entry_to_dict(entry) -> dict:
         elif entry.type == "audio":
             d["audio_directory"] = entry.directory
 
-    d["cache_directory"] = entry.cache_directory
+    d["cache_directory"] = _default_cache_directory(entry)
     if entry.reference_cache_directory:
         d["reference_cache_directory"] = entry.reference_cache_directory
     if entry.control_directory:
@@ -103,31 +120,29 @@ def _dataset_entry_to_dict(entry) -> dict:
     return d
 
 
-def _write_dataset_toml(config: ProjectConfig, output_path: Path) -> Path:
-    """Generate dataset_config.toml from project config and return path."""
-    doc: dict = {}
-
-    # General section
-    doc["general"] = {
-        "enable_bucket": config.dataset.general.enable_bucket,
-        "bucket_no_upscale": config.dataset.general.bucket_no_upscale,
+def build_dataset_toml_document(config: ProjectConfig) -> dict:
+    doc: dict = {
+        "general": {
+            "enable_bucket": config.dataset.general.enable_bucket,
+            "bucket_no_upscale": config.dataset.general.bucket_no_upscale,
+        },
+        "datasets": [_dataset_entry_to_dict(e) for e in config.dataset.datasets],
     }
 
-    # Datasets
-    doc["datasets"] = [_dataset_entry_to_dict(e) for e in config.dataset.datasets]
-
-    # Validation datasets
     if config.dataset.validation_datasets:
         doc["validation_datasets"] = [
             _dataset_entry_to_dict(e) for e in config.dataset.validation_datasets
         ]
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+    return doc
 
-    if tomli_w is not None:
-        output_path.write_bytes(tomli_w.dumps(doc).encode("utf-8"))
-    else:
-        _write_toml_fallback(doc, output_path)
+
+def _write_dataset_toml(config: ProjectConfig, output_path: Path) -> Path:
+    """Generate dataset_config.toml from project config and return path."""
+    doc = build_dataset_toml_document(config)
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(render_toml(doc), encoding="utf-8")
 
     return output_path
 

@@ -2,6 +2,7 @@
 	import FormToggle from '$lib/components/FormToggle.svelte';
 	import DatasetEntry from '$lib/components/DatasetEntry.svelte';
 	import { projectConfig, projectLoaded, saveProjectDebounced, saveProjectNow } from '$lib/stores/project.js';
+	import { advancedMode } from '$lib/stores/uiMode.js';
 
 	let tomlPreview = $state('');
 	let showToml = $state(false);
@@ -50,6 +51,19 @@
 			} else {
 				ds.datasets = (ds.datasets || []).filter((_, i) => i !== index);
 			}
+			return { ...c, dataset: ds };
+		});
+		saveProjectDebounced();
+	}
+
+	function updateDataset(index, nextEntry, isValidation = false) {
+		projectConfig.update((c) => {
+			if (!c) return c;
+			const ds = { ...(c.dataset || {}) };
+			const key = isValidation ? 'validation_datasets' : 'datasets';
+			const items = [...(ds[key] || [])];
+			items[index] = nextEntry;
+			ds[key] = items;
 			return { ...c, dataset: ds };
 		});
 		saveProjectDebounced();
@@ -113,10 +127,12 @@
 				<h2 class="text-base font-semibold" style="color: var(--text-primary);">Dataset</h2>
 				<p class="text-[12px]" style="color: var(--text-muted);">Configure training and validation datasets.</p>
 			</div>
-			<div class="flex items-center gap-5">
-				<FormToggle label="Enable Bucket" checked={general.enable_bucket ?? true} onchange={(e) => updateGeneral('enable_bucket', e.target.checked)} tooltip="Enable resolution bucketing for varied aspect ratios" />
-				<FormToggle label="No Upscale" checked={general.bucket_no_upscale ?? true} onchange={(e) => updateGeneral('bucket_no_upscale', e.target.checked)} tooltip="Prevent upscaling images smaller than bucket resolution" />
-			</div>
+			{#if $advancedMode}
+				<div class="flex items-center gap-5">
+					<FormToggle label="Enable Bucket" checked={general.enable_bucket ?? true} onchange={(e) => updateGeneral('enable_bucket', e.target.checked)} tooltip="Enable resolution bucketing for varied aspect ratios" />
+					<FormToggle label="No Upscale" checked={general.bucket_no_upscale ?? true} onchange={(e) => updateGeneral('bucket_no_upscale', e.target.checked)} tooltip="Prevent upscaling images smaller than bucket resolution" />
+				</div>
+			{/if}
 		</div>
 
 		<!-- Training Datasets -->
@@ -132,10 +148,11 @@
 			<div class="grid grid-cols-1 xl:grid-cols-2 gap-3">
 				{#each datasets as entry, i}
 					<DatasetEntry
-						bind:entry={$projectConfig.dataset.datasets[i]}
+						{entry}
 						index={i}
+						advanced={$advancedMode}
 						onRemove={() => removeDataset(i, false)}
-						onchange={() => { $projectConfig = $projectConfig; saveProjectDebounced(); }}
+						onchange={(nextEntry) => updateDataset(i, nextEntry, false)}
 					/>
 				{/each}
 			</div>
@@ -159,10 +176,11 @@
 			<div class="grid grid-cols-1 xl:grid-cols-2 gap-3">
 				{#each validationDatasets as entry, i}
 					<DatasetEntry
-						bind:entry={$projectConfig.dataset.validation_datasets[i]}
+						{entry}
 						index={i}
+						advanced={$advancedMode}
 						onRemove={() => removeDataset(i, true)}
-						onchange={() => { $projectConfig = $projectConfig; saveProjectDebounced(); }}
+						onchange={(nextEntry) => updateDataset(i, nextEntry, true)}
 					/>
 				{/each}
 			</div>

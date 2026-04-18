@@ -40,7 +40,11 @@
 		error = '';
 		creating = true;
 		try {
-			await createProject({ name: newProjectName, project_dir: newProjectDir });
+			await createProject({
+				name: newProjectName,
+				project_dir: newProjectDir,
+				model_dir: cwd ? `${cwd}/models` : 'models'
+			});
 		} catch (e) { error = e.message; }
 		creating = false;
 	}
@@ -310,6 +314,8 @@
 	let diagnostics = $derived.by(() => {
 		const errors = [];
 		const warnings = [];
+		const hasLtxPath = !!(c.ltx2_checkpoint || t.ltx2_checkpoint || cfg?.default_ltx2_checkpoint || cfg?.model_dir || cwd);
+		const hasGemmaPath = !!(c.gemma_root || t.gemma_root || cfg?.default_gemma_root || cfg?.default_gemma_safetensors || cfg?.model_dir || cwd);
 
 		// Dataset
 		if (datasets.length === 0) {
@@ -322,18 +328,18 @@
 		}
 
 		// Caching
-		if (!c.ltx2_checkpoint && !t.ltx2_checkpoint) {
+		if (!hasLtxPath) {
 			errors.push({ stage: 'Caching', msg: 'LTX-2 checkpoint path not set', href: '/caching' });
 		}
-		if (!c.gemma_root && !t.gemma_root) {
+		if (!hasGemmaPath) {
 			errors.push({ stage: 'Caching', msg: 'Gemma text encoder path not set', href: '/caching' });
 		}
 
 		// Training
-		if (!t.ltx2_checkpoint) {
+		if (!hasLtxPath) {
 			warnings.push({ stage: 'Training', msg: 'Training checkpoint not set', href: '/training' });
 		}
-		if (!t.gemma_root) {
+		if (!hasGemmaPath) {
 			warnings.push({ stage: 'Training', msg: 'Training Gemma root not set', href: '/training' });
 		}
 		if (!t.output_dir) {
@@ -363,7 +369,7 @@
 				<div class="text-[11px] font-semibold uppercase tracking-wider" style="color: var(--text-muted); font-family: var(--font-label);">New Project</div>
 				<div class="space-y-3">
 					<FormField label="Project Name" bind:value={newProjectName} placeholder="My LTX-2 LoRA" tooltip="Display name for your project" />
-					<PathInput label="Project Directory" bind:value={newProjectDir} placeholder="{cwd ? cwd + '/projects/Project_Name' : 'Path to store project files'}" tooltip="Directory where project.json and configs will be saved" />
+					<PathInput label="Project Directory" bind:value={newProjectDir} placeholder={cwd ? `${cwd}/projects/Project_Name` : 'Path to store project files'} tooltip="Directory where project.json and configs will be saved" />
 					<button
 						onclick={handleCreate}
 						disabled={!newProjectDir || creating}

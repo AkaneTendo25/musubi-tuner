@@ -1,4 +1,5 @@
-import { writable, get } from 'svelte/store';
+import { writable } from 'svelte/store';
+import { saveProjectNow } from '$lib/stores/project.js';
 
 export const processStatuses = writable({
 	cache_latents: { state: 'idle', exit_code: null },
@@ -77,6 +78,8 @@ export function disconnectProcessSSE() {
 }
 
 export async function startProcess(type) {
+	await saveProjectNow();
+
 	const res = await fetch(`/api/processes/${type}/start`, { method: 'POST' });
 	if (!res.ok) {
 		const err = await res.json();

@@ -47,9 +47,9 @@ class CachingConfig(BaseModel):
     gemma_safetensors: str = ""
     ltx2_text_encoder_checkpoint: str = ""
     ltx2_mode: Literal["video", "av", "audio"] = "video"
-    vae_dtype: Literal["float16", "bfloat16", "float32"] = "bfloat16"
-    device: str = "cuda"
-    skip_existing: bool = True
+    vae_dtype: Optional[Literal["float16", "bfloat16", "float32"]] = None
+    device: Optional[str] = None
+    skip_existing: bool = False
     keep_cache: bool = False
     num_workers: Optional[int] = None
     # VAE tiling
@@ -59,7 +59,7 @@ class CachingConfig(BaseModel):
     vae_temporal_tile_size: Optional[int] = None
     vae_temporal_tile_overlap: Optional[int] = None
     # Gemma quantization
-    mixed_precision: Literal["no", "fp16", "bf16"] = "bf16"
+    mixed_precision: Literal["no", "fp16", "bf16"] = "no"
     gemma_load_in_8bit: bool = False
     gemma_load_in_4bit: bool = False
     gemma_bnb_4bit_quant_type: Literal["nf4", "fp4"] = "nf4"
@@ -84,7 +84,7 @@ class CachingConfig(BaseModel):
     ltx2_audio_source: Literal["video", "audio_files"] = "video"
     ltx2_audio_dir: str = ""
     ltx2_audio_ext: str = ".wav"
-    ltx2_audio_dtype: str = ""
+    ltx2_audio_dtype: Optional[str] = None
     audio_only_sequence_resolution: int = 64
     # DINOv2 feature caching (for CREPA dino mode - model selection in training.crepa_dino_model)
     dino_batch_size: int = 16
@@ -106,7 +106,7 @@ class TrainingConfig(BaseModel):
     ltx_version_check_mode: Literal["off", "warn", "error"] = "warn"
     fp8_base: bool = False
     fp8_scaled: bool = False
-    flash_attn: bool = True
+    flash_attn: bool = False
     sdpa: bool = False
     sage_attn: bool = False
     xformers: bool = False
@@ -129,8 +129,8 @@ class TrainingConfig(BaseModel):
 
     # LoRA / Network
     network_module: Optional[str] = None
-    network_dim: int = 16
-    network_alpha: int = 16
+    network_dim: Optional[int] = None
+    network_alpha: float = 1.0
     lora_target_preset: Literal[
         "t2v", "v2v", "video_sa", "video_sa_ff", "video_sa_ca_ff", "audio", "audio_ref_only_ic", "av_ic", "full", "lycoris"
     ] = "t2v"
@@ -144,6 +144,14 @@ class TrainingConfig(BaseModel):
     lycoris_config: str = ""
     lycoris_quantized_base_check_mode: Literal["off", "warn", "error"] = "warn"
     init_lokr_norm: Optional[float] = None
+    rank_dropout: Optional[float] = None
+    module_dropout: Optional[float] = None
+    adaptive_rank: bool = False
+    adaptive_rank_target: Optional[int] = None
+    adaptive_rank_min_rank: Optional[int] = None
+    adaptive_rank_init_rank: Optional[int] = None
+    adaptive_rank_quantile: Optional[float] = None
+    adaptive_rank_weight: Optional[float] = None
     caption_dropout_rate: float = 0.0
     video_caption_dropout_rate: float = 0.0
     audio_caption_dropout_rate: float = 0.0
@@ -158,14 +166,14 @@ class TrainingConfig(BaseModel):
     av_bimodal_scale: float = 3.0
 
     # Optimizer
-    learning_rate: float = 1e-4
-    optimizer_type: str = "adamw8bit"
+    learning_rate: float = 2e-6
+    optimizer_type: str = ""
     optimizer_args: str = ""
-    lr_scheduler: str = "constant_with_warmup"
-    lr_warmup_steps: int = 100
-    lr_decay_steps: Optional[int] = None
-    lr_scheduler_num_cycles: Optional[int] = None
-    lr_scheduler_power: Optional[float] = None
+    lr_scheduler: str = "constant"
+    lr_warmup_steps: int = 0
+    lr_decay_steps: Optional[int] = 0
+    lr_scheduler_num_cycles: Optional[int] = 1
+    lr_scheduler_power: Optional[float] = 1.0
     lr_scheduler_min_lr_ratio: Optional[float] = None
     lr_scheduler_type: str = ""
     lr_scheduler_args: str = ""
@@ -180,15 +188,15 @@ class TrainingConfig(BaseModel):
     # Schedule
     max_train_steps: int = 1600
     max_train_epochs: Optional[int] = None
-    timestep_sampling: str = "shifted_logit_normal"
+    timestep_sampling: str = "sigma"
     discrete_flow_shift: float = 1.0
     weighting_scheme: str = "none"
     seed: Optional[int] = None
-    guidance_scale: Optional[float] = None
-    sigmoid_scale: Optional[float] = None
-    logit_mean: Optional[float] = None
-    logit_std: Optional[float] = None
-    mode_scale: Optional[float] = None
+    guidance_scale: Optional[float] = 1.0
+    sigmoid_scale: Optional[float] = 1.0
+    logit_mean: Optional[float] = 0.0
+    logit_std: Optional[float] = 1.0
+    mode_scale: Optional[float] = 1.29
     min_timestep: Optional[float] = None
     max_timestep: Optional[float] = None
 
@@ -202,14 +210,14 @@ class TrainingConfig(BaseModel):
 
     # Memory
     blocks_to_swap: Optional[int] = None
-    gradient_checkpointing: bool = True
+    gradient_checkpointing: bool = False
     gradient_checkpointing_cpu_offload: bool = False
     split_attn_target: Optional[str] = None
     split_attn_mode: Optional[str] = None
     split_attn_chunk_size: Optional[int] = None
     blockwise_checkpointing: bool = False
     blocks_to_checkpoint: Optional[int] = None
-    mixed_precision: str = "bf16"
+    mixed_precision: str = "no"
     full_fp16: bool = False
     full_bf16: bool = False
     ffn_chunk_target: Optional[str] = None
@@ -220,7 +228,7 @@ class TrainingConfig(BaseModel):
     # Compile
     compile: bool = False
     compile_backend: str = "inductor"
-    compile_mode: str = ""
+    compile_mode: str = "default"
     compile_dynamic: bool = False
     compile_fullgraph: bool = False
     compile_cache_size_limit: Optional[int] = None
@@ -246,10 +254,10 @@ class TrainingConfig(BaseModel):
     sample_disable_audio: bool = False
     sample_at_first: bool = False
     sample_tiled_vae: bool = False
-    sample_vae_tile_size: Optional[int] = None
-    sample_vae_tile_overlap: Optional[int] = None
-    sample_vae_temporal_tile_size: Optional[int] = None
-    sample_vae_temporal_tile_overlap: Optional[int] = None
+    sample_vae_tile_size: Optional[int] = 512
+    sample_vae_tile_overlap: Optional[int] = 64
+    sample_vae_temporal_tile_size: Optional[int] = 0
+    sample_vae_temporal_tile_overlap: Optional[int] = 8
     sample_two_stage: bool = False
     spatial_upsampler_path: str = ""
     distilled_lora_path: str = ""
@@ -394,7 +402,7 @@ class TrainingConfig(BaseModel):
     hfato_probability: float = 1.0
 
     # Audio features
-    audio_loss_balance_mode: Literal["none", "inv_freq", "ema_mag", "uncertainty"] = "none"
+    audio_loss_balance_mode: Literal["none", "inv_freq", "ema_mag", "uncertainty", "ogm_ge"] = "none"
     audio_loss_balance_beta: float = 0.01
     audio_loss_balance_eps: float = 0.05
     audio_loss_balance_min: float = 0.05
@@ -402,6 +410,9 @@ class TrainingConfig(BaseModel):
     audio_loss_balance_ema_init: float = 1.0
     audio_loss_balance_target_ratio: float = 0.33
     audio_loss_balance_ema_decay: float = 0.99
+    uncertainty_lr: Optional[float] = None
+    ogm_ge_alpha: float = 0.3
+    ogm_ge_noise_std: float = 0.0
     independent_audio_timestep: bool = False
     audio_silence_regularizer: bool = False
     audio_silence_regularizer_weight: float = 1.0
@@ -428,9 +439,9 @@ class TrainingConfig(BaseModel):
     audio_loss_weight: float = 1.0
 
     # Misc
-    separate_audio_buckets: bool = True
-    max_data_loader_n_workers: int = 2
-    persistent_data_loader_workers: bool = True
+    separate_audio_buckets: bool = False
+    max_data_loader_n_workers: int = 8
+    persistent_data_loader_workers: bool = False
     ltx2_first_frame_conditioning_p: float = 0.1
 
 
@@ -499,6 +510,9 @@ class ProjectConfig(BaseModel):
     name: str = "New Project"
     project_dir: str = ""
     model_dir: str = ""  # directory where downloaded models are stored
+    default_ltx2_checkpoint: str = ""
+    default_gemma_root: str = ""
+    default_gemma_safetensors: str = ""
     dataset: DatasetConfig = Field(default_factory=DatasetConfig)
     caching: CachingConfig = Field(default_factory=CachingConfig)
     training: TrainingConfig = Field(default_factory=TrainingConfig)
