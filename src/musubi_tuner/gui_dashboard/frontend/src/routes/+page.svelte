@@ -255,7 +255,8 @@
 		const total = dit + loraParamsGB + optimStates + loraGrads + activationTotal + gradAccumOverhead + preservationOverhead + selfFlowOverhead + crepaOverhead;
 
 		// Temporary spikes (not steady-state)
-		const samplingEnabled = !!t.sample_prompts && !!(t.sample_at_first || t.sample_every_n_steps || t.sample_every_n_epochs);
+		const hasSamplePrompts = !!(t.sample_prompts || t.sample_prompts_text);
+		const samplingEnabled = hasSamplePrompts && !!(t.sample_at_first || t.sample_every_n_steps || t.sample_every_n_epochs);
 		const samplingSpike = samplingEnabled;
 		const preservationGemmaSpike = !!(t.blank_preservation || t.dop || t.audio_dop) && !t.use_precached_preservation;
 
@@ -373,8 +374,10 @@
 					<button
 						onclick={handleCreate}
 						disabled={!newProjectDir || creating}
-						class="w-full py-2.5 text-[13px] font-semibold disabled:opacity-40"
-						style="background: var(--accent); color: var(--bg-base); border-radius: var(--radius-sm); box-shadow: var(--shadow-sm), var(--glow-accent);"
+						class="w-full py-2.5 text-[13px] font-semibold disabled:opacity-40 transition-colors"
+						style="background: color-mix(in srgb, var(--accent) 78%, var(--bg-elevated)); color: var(--text-primary); border: 1px solid color-mix(in srgb, var(--accent) 42%, var(--border)); border-radius: var(--radius-sm); box-shadow: var(--shadow-sm);"
+						onmouseenter={(e) => { e.currentTarget.style.background = 'color-mix(in srgb, var(--accent) 88%, var(--bg-elevated))'; e.currentTarget.style.borderColor = 'color-mix(in srgb, var(--accent) 62%, var(--border))'; }}
+						onmouseleave={(e) => { e.currentTarget.style.background = 'color-mix(in srgb, var(--accent) 78%, var(--bg-elevated))'; e.currentTarget.style.borderColor = 'color-mix(in srgb, var(--accent) 42%, var(--border))'; }}
 					>{creating ? 'Creating...' : 'Create Project'}</button>
 				</div>
 			</div>
@@ -385,26 +388,31 @@
 				<div class="text-[11px] font-semibold uppercase tracking-wider" style="color: var(--text-muted); font-family: var(--font-label);">Open Project</div>
 
 				{#if $recentProjects.length > 0}
-					<div class="space-y-1.5">
-						<p class="text-[11px] font-medium" style="color: var(--text-muted);">Recent</p>
+					<div class="space-y-2.5">
+						<div class="flex items-center justify-between">
+							<p class="text-[11px] font-medium uppercase tracking-[0.18em]" style="color: var(--text-secondary); font-family: var(--font-label);">Recent</p>
+							<span class="text-[10px] px-2 py-0.5 rounded-full" style="background: var(--bg-elevated); color: var(--text-muted); border: 1px solid var(--border);">{$recentProjects.length}</span>
+						</div>
+						<div class="p-2 space-y-2" style="background: color-mix(in srgb, var(--bg-elevated) 68%, transparent); border: 1px solid var(--border); border-radius: var(--radius-sm);">
 						{#each $recentProjects as proj}
 							<div class="flex items-center gap-2 group">
 								<button
 									onclick={() => { loadPath = proj.path; handleLoad(); }}
-									class="flex-1 flex items-center gap-3 px-3 py-2 text-left min-w-0"
-									style="background: var(--bg-elevated); border: 1px solid var(--border-subtle); border-radius: var(--radius-sm);"
-									onmouseenter={(e) => { e.currentTarget.style.borderColor = 'var(--accent)'; }}
-									onmouseleave={(e) => { e.currentTarget.style.borderColor = 'var(--border-subtle)'; }}
+									class="flex-1 flex items-center gap-3 px-3 py-2.5 text-left min-w-0 transition-colors"
+									style="background: color-mix(in srgb, var(--bg-surface) 70%, var(--bg-elevated)); border: 1px solid color-mix(in srgb, var(--accent) 20%, var(--border-subtle)); border-radius: var(--radius-sm); box-shadow: inset 0 1px 0 rgba(255,255,255,0.02);"
+									onmouseenter={(e) => { e.currentTarget.style.borderColor = 'color-mix(in srgb, var(--accent) 55%, var(--border-subtle))'; e.currentTarget.style.background = 'color-mix(in srgb, var(--bg-surface) 82%, var(--accent-muted))'; }}
+									onmouseleave={(e) => { e.currentTarget.style.borderColor = 'color-mix(in srgb, var(--accent) 20%, var(--border-subtle))'; e.currentTarget.style.background = 'color-mix(in srgb, var(--bg-surface) 70%, var(--bg-elevated))'; }}
 								>
+									<div class="w-7 h-7 flex items-center justify-center flex-shrink-0 rounded-sm" style="background: color-mix(in srgb, var(--accent) 16%, var(--bg-base)); color: var(--accent); border: 1px solid color-mix(in srgb, var(--accent) 22%, var(--border));">P</div>
 									<div class="min-w-0 flex-1">
 										<div class="text-[12px] font-semibold truncate" style="color: var(--text-primary);">{proj.name}</div>
-										<div class="text-[10px] font-mono truncate" style="color: var(--text-muted);">{proj.path}</div>
+										<div class="text-[10px] font-mono truncate mt-0.5" style="color: var(--text-secondary);">{proj.path}</div>
 									</div>
 								</button>
 								<button
 									onclick={() => removeRecentProject(proj.path)}
-									class="flex-shrink-0 px-2 py-0.5 text-[10px] font-medium opacity-0 group-hover:opacity-100 transition-opacity"
-									style="color: var(--text-muted); background: var(--bg-elevated); border: 1px solid var(--border); border-radius: var(--radius-sm);"
+									class="flex-shrink-0 px-2 py-1 text-[10px] font-medium opacity-0 group-hover:opacity-100 transition-opacity"
+									style="color: var(--text-muted); background: color-mix(in srgb, var(--bg-elevated) 88%, var(--bg-base)); border: 1px solid var(--border); border-radius: var(--radius-sm);"
 									onmouseenter={(e) => { e.currentTarget.style.color = 'var(--danger)'; e.currentTarget.style.borderColor = 'var(--danger)'; }}
 									onmouseleave={(e) => { e.currentTarget.style.color = 'var(--text-muted)'; e.currentTarget.style.borderColor = 'var(--border)'; }}
 								>
@@ -412,6 +420,7 @@
 								</button>
 							</div>
 						{/each}
+						</div>
 					</div>
 				{/if}
 

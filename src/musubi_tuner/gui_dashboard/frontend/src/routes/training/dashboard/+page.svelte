@@ -7,20 +7,33 @@
 	import ProcessConsole from '$lib/components/ProcessConsole.svelte';
 	import ProcessControls from '$lib/components/ProcessControls.svelte';
 	import { projectConfig } from '$lib/stores/project.js';
-	import { processStatuses, processLogs, startProcess, stopProcess, fetchLogs } from '$lib/stores/processes.js';
-	import { dataLoading } from '$lib/stores/metrics.js';
+	import { processStatuses, processLogs, startProcess, stopProcess, preloadLogsIfActive, clearProcessLogs, refreshStatuses, fetchLogs, startLogPolling } from '$lib/stores/processes.js';
+import { clearMetrics } from '$lib/stores/metrics.js';
+	import { clearStatus } from '$lib/stores/status.js';
 	import { onMount } from 'svelte';
 
 	let t = $derived($projectConfig?.training || {});
 
-	let trainingStatus = $derived($processStatuses.training || { state: 'idle', exit_code: null });
+	let rawTrainingStatus = $derived($processStatuses.training || { state: 'idle', exit_code: null });
+	let trainingLive = $derived(rawTrainingStatus.state === 'running' || rawTrainingStatus.state === 'stopping');
+	let trainingStatus = $derived(rawTrainingStatus);
 	let trainingLogs = $derived($processLogs.training || []);
-	let trainingActive = $derived(trainingStatus.state === 'running' || trainingStatus.state === 'stopping' || trainingStatus.state === 'finished');
+	let trainingActive = $derived(trainingLive);
+	let showDashboardData = $derived(trainingLive);
 
 	let systemInfo = $state(null);
 
 	onMount(async () => {
-		fetchLogs('training');
+		const statuses = await refreshStatuses();
+		const state = statuses?.training?.state;
+		if (state === 'running' || state === 'stopping') {
+			await preloadLogsIfActive('training');
+		} else {
+			clearMetrics();
+			clearStatus();
+			clearProcessLogs('training');
+		}
+
 		try {
 			const res = await fetch('/api/system/info');
 			if (res.ok) systemInfo = await res.json();
@@ -31,10 +44,23 @@
 				if (res.ok) systemInfo = await res.json();
 			} catch {}
 		}, 2000);
-		return () => clearInterval(interval);
+		const logInterval = startLogPolling('training', 1000);
+		return () => {
+			clearInterval(interval);
+			clearInterval(logInterval);
+		};
 	});
 
 	let gpu = $derived(systemInfo?.gpus?.[0]);
+
+	async function handleStart() {
+		await startProcess('training');
+		await fetchLogs('training');
+	}
+
+	async function handleStop() {
+		await stopProcess('training');
+	}
 </script>
 
 <div class="space-y-4">
@@ -44,9 +70,7 @@
 	</div>
 
 	<!-- Status + Hardware row -->
-	{#if trainingActive}
-		<StatusBar />
-	{/if}
+	<StatusBar active={trainingActive} />
 
 	<div class="grid grid-cols-2 xl:grid-cols-4 gap-3" style="min-height: 80px;">
 		{#if systemInfo}
@@ -96,15 +120,11 @@
 
 	<!-- Process Controls + Console — always visible -->
 	<div class="space-y-3">
-		<ProcessControls processType="training" status={trainingStatus} onStart={() => startProcess('training')} onStop={() => stopProcess('training')} />
+		<ProcessControls processType="training" status={trainingStatus} onStart={handleStart} onStop={handleStop} />
 		<ProcessConsole lines={trainingLogs} />
 	</div>
 
-	{#if trainingActive}
-		{#if $dataLoading}
-			<div class="text-center text-[12px] py-8" style="color: var(--text-muted);">Loading metrics...</div>
-		{/if}
-
+	{#if showDashboardData}
 		<LossChart />
 
 		<div class="grid grid-cols-1 md:grid-cols-2 gap-4">

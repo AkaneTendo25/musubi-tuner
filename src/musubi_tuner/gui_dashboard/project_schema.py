@@ -7,6 +7,11 @@ from typing import Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from musubi_tuner.gui_dashboard.cli_defaults import (
+    get_ltx2_training_network_module_default,
+    get_ltx2_training_output_dir_default,
+)
+
 
 class GeneralConfig(BaseModel):
     enable_bucket: bool = True
@@ -242,6 +247,7 @@ class TrainingConfig(BaseModel):
     sample_every_n_steps: Optional[int] = None
     sample_every_n_epochs: Optional[int] = None
     sample_prompts: str = ""
+    sample_prompts_text: str = ""
     use_precached_sample_prompts: bool = False
     sample_prompts_cache: str = ""
     use_precached_sample_latents: bool = False
@@ -445,6 +451,7 @@ class TrainingConfig(BaseModel):
     ltx2_first_frame_conditioning_p: float = 0.1
 
 
+
 class InferenceConfig(BaseModel):
     ltx2_checkpoint: str = ""
     gemma_root: str = ""
@@ -525,6 +532,20 @@ class ProjectConfig(BaseModel):
         """Backward compat: rename old 'sampling' key to 'inference'."""
         if isinstance(data, dict) and 'sampling' in data and 'inference' not in data:
             data['inference'] = data.pop('sampling')
+        if isinstance(data, dict):
+            training = data.get('training')
+            if training is None:
+                data['training'] = {
+                    'output_dir': get_ltx2_training_output_dir_default(),
+                    'network_module': get_ltx2_training_network_module_default(),
+                }
+            elif isinstance(training, dict):
+                training = dict(training)
+                if not training.get('output_dir'):
+                    training['output_dir'] = get_ltx2_training_output_dir_default()
+                if not training.get('network_module'):
+                    training['network_module'] = get_ltx2_training_network_module_default()
+                data['training'] = training
         return data
 
     def save(self, path: Optional[Path] = None):

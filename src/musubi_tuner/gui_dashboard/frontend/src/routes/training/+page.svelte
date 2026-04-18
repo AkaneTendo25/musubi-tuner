@@ -10,7 +10,7 @@
 	import CommandPanel from '$lib/components/CommandPanel.svelte';
 	import ModelDownloadPanel from '$lib/components/ModelDownloadPanel.svelte';
 	import { projectConfig, projectLoaded, updateSection } from '$lib/stores/project.js';
-	import { processStatuses, startProcess, stopProcess } from '$lib/stores/processes.js';
+	import { processStatuses, processValidation, startProcess, stopProcess, validateProcess } from '$lib/stores/processes.js';
 	import { advancedMode } from '$lib/stores/uiMode.js';
 	import { goto } from '$app/navigation';
 
@@ -39,6 +39,30 @@
 
 	let t = $derived($projectConfig?.training || {});
 	let trainingStatus = $derived($processStatuses.training || { state: 'idle', exit_code: null });
+	let trainingValidation = $derived($processValidation.training || { ok: true, summary: '', errors: [], warnings: [], field_errors: {}, field_warnings: {} });
+	let hasValidationIssues = $derived((trainingValidation.errors?.length || 0) > 0 || (trainingValidation.warnings?.length || 0) > 0);
+	let hasDatasetValidationErrors = $derived((trainingValidation.errors || []).some((issue) => issue.page === 'dataset'));
+	let validationTimer = null;
+
+	function fieldError(field) {
+		return trainingValidation.field_errors?.[field]?.[0] || '';
+	}
+
+	function fieldInvalid(field) {
+		return Boolean(fieldError(field));
+	}
+
+	$effect(() => {
+		if (!$projectLoaded || !$projectConfig) return;
+
+		clearTimeout(validationTimer);
+		const configSnapshot = $projectConfig;
+		validationTimer = setTimeout(() => {
+			validateProcess('training', configSnapshot).catch(() => {});
+		}, 250);
+
+		return () => clearTimeout(validationTimer);
+	});
 </script>
 
 {#if !$projectLoaded}
@@ -64,30 +88,32 @@
 			<div class="space-y-3">
 				<FormGroup title="Model">
 					<div class="space-y-2 pt-2">
-						<CheckpointInput label="LTX-2 Checkpoint" value={t.ltx2_checkpoint || ''} onchange={(v) => update('ltx2_checkpoint', v)} showFiles tooltip="Path to LTX-2 checkpoint" />
-						<CheckpointInput label="Gemma Root" value={t.gemma_root || ''} onchange={(v) => update('gemma_root', v)} tooltip="Gemma text encoder directory" />
-						<PathInput label="Gemma Safetensors" value={t.gemma_safetensors || ''} oninput={(e) => update('gemma_safetensors', e.target.value)} showFiles tooltip="Single safetensors file (alternative to Gemma Root)" />
+						<CheckpointInput label="LTX-2 Checkpoint" value={t.ltx2_checkpoint || ''} onchange={(v) => update('ltx2_checkpoint', v)} showFiles tooltip="Path to LTX-2 checkpoint" invalid={fieldInvalid('training.ltx2_checkpoint')} error={fieldError('training.ltx2_checkpoint')} />
+						<CheckpointInput label="Gemma Root" value={t.gemma_root || ''} onchange={(v) => update('gemma_root', v)} tooltip="Gemma text encoder directory" invalid={fieldInvalid('training.gemma_root')} error={fieldError('training.gemma_root')} />
+						<PathInput label="Gemma Safetensors" value={t.gemma_safetensors || ''} oninput={(e) => update('gemma_safetensors', e.target.value)} showFiles tooltip="Single safetensors file (alternative to Gemma Root)" invalid={fieldInvalid('training.gemma_safetensors')} error={fieldError('training.gemma_safetensors')} />
 						{#if $advancedMode}
-							<PathInput label="Dataset Manifest" value={t.dataset_manifest || ''} oninput={(e) => update('dataset_manifest', e.target.value)} showFiles tooltip="Optional manifest file. If set, training uses this instead of regenerating dataset_config.toml." />
+							<PathInput label="Dataset Manifest" value={t.dataset_manifest || ''} oninput={(e) => update('dataset_manifest', e.target.value)} showFiles tooltip="Optional manifest file. If set, training uses this instead of regenerating dataset_config.toml." invalid={fieldInvalid('training.dataset_manifest')} error={fieldError('training.dataset_manifest')} />
 						{/if}
 						<div class="grid grid-cols-2 gap-2">
 							<FormSelect label="Mode" value={t.ltx2_mode || 'video'} options={['video', 'av', 'audio']} onchange={(e) => update('ltx2_mode', e.target.value)} tooltip="Video/AV/Audio" />
 							<FormSelect label="Precision" value={t.mixed_precision || 'no'} options={['no', 'fp16', 'bf16']} onchange={(e) => update('mixed_precision', e.target.value)} tooltip="Mixed precision mode" />
 						</div>
+						<div class="grid grid-cols-2 gap-2">
+							<FormSelect label="LTX Version" value={t.ltx_version || '2.0'} options={['2.0', '2.3']} onchange={(e) => update('ltx_version', e.target.value)} tooltip="Target LTX version behavior" />
+							<FormSelect label="Version Check" value={t.ltx_version_check_mode || 'warn'} options={['off', 'warn', 'error']} onchange={(e) => update('ltx_version_check_mode', e.target.value)} tooltip="Behavior when the checkpoint and selected LTX version do not match." />
+						</div>
+						<div class="flex flex-wrap gap-x-4 gap-y-1">
+							<FormToggle label="FP8 Base" checked={t.fp8_base ?? false} onchange={(e) => update('fp8_base', e.target.checked)} tooltip="FP8 precision (VRAM savings)" />
+							<FormToggle label="FP8 Scaled" checked={t.fp8_scaled ?? false} onchange={(e) => update('fp8_scaled', e.target.checked)} tooltip="Scaled FP8 for stability" />
+							<FormToggle label="Flash Attn" checked={t.flash_attn ?? false} onchange={(e) => update('flash_attn', e.target.checked)} tooltip="Flash Attention 2" />
+							<FormToggle label="SDPA" checked={t.sdpa ?? false} onchange={(e) => update('sdpa', e.target.checked)} tooltip="PyTorch SDPA attention" />
+							<FormToggle label="Gemma 8b" checked={t.gemma_load_in_8bit ?? false} onchange={(e) => update('gemma_load_in_8bit', e.target.checked)} tooltip="8-bit quantization" />
+							<FormToggle label="Gemma 4b" checked={t.gemma_load_in_4bit ?? false} onchange={(e) => update('gemma_load_in_4bit', e.target.checked)} tooltip="4-bit quantization" />
+						</div>
 						{#if $advancedMode}
-							<div class="grid grid-cols-2 gap-2">
-								<FormSelect label="LTX Version" value={t.ltx_version || '2.0'} options={['2.0', '2.3']} onchange={(e) => update('ltx_version', e.target.value)} tooltip="Target LTX version behavior" />
-								<FormSelect label="Version Check" value={t.ltx_version_check_mode || 'warn'} options={['off', 'warn', 'error']} onchange={(e) => update('ltx_version_check_mode', e.target.value)} tooltip="Behavior when the checkpoint and selected LTX version do not match." />
-							</div>
 							<div class="flex flex-wrap gap-x-4 gap-y-1">
-								<FormToggle label="FP8 Base" checked={t.fp8_base ?? false} onchange={(e) => update('fp8_base', e.target.checked)} tooltip="FP8 precision (VRAM savings)" />
-								<FormToggle label="FP8 Scaled" checked={t.fp8_scaled ?? false} onchange={(e) => update('fp8_scaled', e.target.checked)} tooltip="Scaled FP8 for stability" />
-								<FormToggle label="Flash Attn" checked={t.flash_attn ?? false} onchange={(e) => update('flash_attn', e.target.checked)} tooltip="Flash Attention 2" />
-								<FormToggle label="SDPA" checked={t.sdpa ?? false} onchange={(e) => update('sdpa', e.target.checked)} tooltip="PyTorch SDPA attention" />
 								<FormToggle label="Sage Attn" checked={t.sage_attn ?? false} onchange={(e) => update('sage_attn', e.target.checked)} tooltip="Sage Attention backend" />
 								<FormToggle label="xFormers" checked={t.xformers ?? false} onchange={(e) => update('xformers', e.target.checked)} tooltip="xFormers attention" />
-								<FormToggle label="Gemma 8b" checked={t.gemma_load_in_8bit ?? false} onchange={(e) => update('gemma_load_in_8bit', e.target.checked)} tooltip="8-bit quantization" />
-								<FormToggle label="Gemma 4b" checked={t.gemma_load_in_4bit ?? false} onchange={(e) => update('gemma_load_in_4bit', e.target.checked)} tooltip="4-bit quantization" />
 								<FormToggle label="No Dbl Quant" checked={t.gemma_bnb_4bit_disable_double_quant ?? false} onchange={(e) => update('gemma_bnb_4bit_disable_double_quant', e.target.checked)} tooltip="Disable double quantization (4-bit)" />
 								<FormToggle label="Audio Only Model" checked={t.ltx2_audio_only_model ?? false} onchange={(e) => update('ltx2_audio_only_model', e.target.checked)} tooltip="Audio-only model architecture" />
 							</div>
@@ -98,7 +124,7 @@
 				<FormGroup title="LoRA">
 					<div class="space-y-2 pt-2">
 						{#if $advancedMode}
-							<FormField label="Network Module" value={t.network_module || ''} oninput={(e) => update('network_module', e.target.value || null)} placeholder="CLI default" tooltip="Optional custom network module. Leave blank for the trainer default." />
+							<FormField label="Network Module" value={t.network_module || ''} oninput={(e) => update('network_module', e.target.value || 'networks.lora_ltx2')} placeholder="networks.lora_ltx2" tooltip="LTX-2 LoRA network module. Clearing this resets it to the LTX-2 default." />
 						{/if}
 						<div class="grid grid-cols-3 gap-2">
 							<FormField label="Dim" type="number" value={t.network_dim ?? ''} oninput={(e) => update('network_dim', e.target.value ? Number(e.target.value) : null)} min={1} placeholder="CLI default" tooltip="LoRA rank. Leave blank to follow the trainer default." />
@@ -252,11 +278,15 @@
 							<FormField label="Max Steps" type="number" value={t.max_train_steps ?? 1600} oninput={(e) => update('max_train_steps', Number(e.target.value))} min={1} tooltip="Total training steps" />
 							<FormField label="Max Epochs" type="number" value={t.max_train_epochs ?? ''} oninput={(e) => update('max_train_epochs', e.target.value ? Number(e.target.value) : null)} placeholder="Optional" tooltip="Epochs (overrides steps)" />
 						</div>
+						<div class="grid grid-cols-2 gap-2">
+							<FormSelect label="Timestep" value={t.timestep_sampling || 'sigma'} options={['sigma', 'uniform', 'sigmoid', 'shift', 'shifted_logit_normal', 'logsnr']} onchange={(e) => update('timestep_sampling', e.target.value)} tooltip="Timestep sampling" />
+							<FormField label="Validate / Steps" type="number" value={t.validate_every_n_steps ?? ''} oninput={(e) => update('validate_every_n_steps', e.target.value ? Number(e.target.value) : null)} placeholder="Off" tooltip="Run validation every N steps" />
+						</div>
 						{#if $advancedMode}
 							<div class="grid grid-cols-3 gap-2">
-								<FormSelect label="Timestep" value={t.timestep_sampling || 'sigma'} options={['sigma', 'uniform', 'sigmoid', 'shift', 'shifted_logit_normal', 'logsnr']} onchange={(e) => update('timestep_sampling', e.target.value)} tooltip="Timestep sampling" />
 								<FormField label="Flow Shift" type="number" value={t.discrete_flow_shift ?? 1.0} oninput={(e) => update('discrete_flow_shift', Number(e.target.value))} step="0.1" tooltip="Flow matching shift" />
 								<FormSelect label="Weighting" value={t.weighting_scheme || 'none'} options={['none', 'logit_normal', 'mode', 'cosmap', 'sigma_sqrt']} onchange={(e) => update('weighting_scheme', e.target.value)} tooltip="Loss weighting" />
+								<FormField label="Validate / Epochs" type="number" value={t.validate_every_n_epochs ?? ''} oninput={(e) => update('validate_every_n_epochs', e.target.value ? Number(e.target.value) : null)} placeholder="Off" tooltip="Run validation every N epochs" />
 							</div>
 							<div class="grid grid-cols-2 gap-2">
 								<FormField label="Seed" type="number" value={t.seed ?? ''} oninput={(e) => update('seed', e.target.value ? Number(e.target.value) : null)} placeholder="Optional" tooltip="Random seed" />
@@ -279,30 +309,45 @@
 					</div>
 				</FormGroup>
 
-				{#if $advancedMode}
 				<FormGroup title="Memory">
 					<div class="space-y-2 pt-2">
 						<div class="grid grid-cols-2 gap-2">
 							<FormField label="Blocks to Swap" type="number" value={t.blocks_to_swap ?? ''} oninput={(e) => update('blocks_to_swap', e.target.value ? Number(e.target.value) : null)} placeholder="0-40" min={0} max={40} tooltip="CPU offload blocks" />
-							<FormSelect label="Split Attn" value={t.split_attn_target || ''} options={[{value:'',label:'None'},{value:'all',label:'All'},{value:'self',label:'Self'},{value:'cross',label:'Cross'}]} onchange={(e) => update('split_attn_target', e.target.value || null)} tooltip="Split attention target" />
-						</div>
-						<FormSelect label="Split Mode" value={t.split_attn_mode || ''} options={[{value:'',label:'None'},{value:'batch',label:'Batch'},{value:'query',label:'Query'}]} onchange={(e) => update('split_attn_mode', e.target.value || null)} disabled={!t.split_attn_target} tooltip="Split mode" />
-						<div class="grid grid-cols-2 gap-2">
-							<FormSelect label="FFN Chunk" value={t.ffn_chunk_target || ''} options={[{value:'',label:'None'},{value:'all',label:'All'},{value:'video',label:'Video'},{value:'audio',label:'Audio'}]} onchange={(e) => update('ffn_chunk_target', e.target.value || null)} tooltip="FFN chunking" />
-							<FormField label="Chunk Size" type="number" value={t.ffn_chunk_size ?? 0} oninput={(e) => update('ffn_chunk_size', Number(e.target.value))} disabled={!t.ffn_chunk_target} tooltip="Tokens per chunk" />
+							<FormField label="Workers" type="number" value={t.max_data_loader_n_workers ?? 8} oninput={(e) => update('max_data_loader_n_workers', Number(e.target.value))} min={0} tooltip="Dataloader workers" />
 						</div>
 						<div class="flex flex-wrap gap-x-4 gap-y-1">
 							<FormToggle label="Grad Checkpoint" checked={t.gradient_checkpointing ?? false} onchange={(e) => update('gradient_checkpointing', e.target.checked)} tooltip="Gradient checkpointing" />
-							<FormToggle label="GC CPU Offload" checked={t.gradient_checkpointing_cpu_offload ?? false} onchange={(e) => update('gradient_checkpointing_cpu_offload', e.target.checked)} tooltip="Offload checkpointed activations to CPU" />
-							<FormToggle label="Blockwise" checked={t.blockwise_checkpointing ?? false} onchange={(e) => update('blockwise_checkpointing', e.target.checked)} tooltip="Per-block checkpointing" />
-							<FormToggle label="Pinned Memory" checked={t.use_pinned_memory_for_block_swap ?? false} onchange={(e) => update('use_pinned_memory_for_block_swap', e.target.checked)} tooltip="Pinned memory for block swap" />
-							<FormToggle label="Offload img/txt" checked={t.img_in_txt_in_offloading ?? false} onchange={(e) => update('img_in_txt_in_offloading', e.target.checked)} tooltip="Offload img_in/txt_in to CPU" />
+							<FormToggle label="Separate Audio Buckets" checked={t.separate_audio_buckets ?? false} onchange={(e) => update('separate_audio_buckets', e.target.checked)} tooltip="Separate audio/video buckets" />
+							<FormToggle label="Persistent Workers" checked={t.persistent_data_loader_workers ?? false} onchange={(e) => update('persistent_data_loader_workers', e.target.checked)} tooltip="Keep workers between epochs" />
 						</div>
-						<FormField label="Blocks to Checkpoint" type="number" value={t.blocks_to_checkpoint ?? ''} oninput={(e) => update('blocks_to_checkpoint', e.target.value ? Number(e.target.value) : null)} placeholder="All" disabled={!t.blockwise_checkpointing} tooltip="Number of blocks to checkpoint (default: all)" />
-						<FormField label="Attn Chunk Size" type="number" value={t.split_attn_chunk_size ?? ''} oninput={(e) => update('split_attn_chunk_size', e.target.value ? Number(e.target.value) : null)} placeholder="Auto" disabled={!t.split_attn_target} tooltip="Split attention chunk size" />
+						<div class="grid grid-cols-2 gap-2">
+							<FormField label="1st Frame P" type="number" value={t.ltx2_first_frame_conditioning_p ?? 0.1} oninput={(e) => update('ltx2_first_frame_conditioning_p', Number(e.target.value))} step="0.05" min={0} max={1} tooltip="First frame conditioning prob" />
+							{#if t.ltx2_mode === 'audio'}
+								<FormField label="Audio Seq Resolution" type="number" value={t.audio_only_sequence_resolution ?? 64} oninput={(e) => update('audio_only_sequence_resolution', Number(e.target.value))} min={0} tooltip="Virtual pixel resolution for shifted_logit_normal in audio-only mode (0 = use cached geometry)" />
+							{/if}
+						</div>
+						{#if $advancedMode}
+							<div class="grid grid-cols-2 gap-2">
+								<FormSelect label="Split Attn" value={t.split_attn_target || ''} options={[{value:'',label:'None'},{value:'all',label:'All'},{value:'self',label:'Self'},{value:'cross',label:'Cross'}]} onchange={(e) => update('split_attn_target', e.target.value || null)} tooltip="Split attention target" />
+								<FormSelect label="Split Mode" value={t.split_attn_mode || ''} options={[{value:'',label:'None'},{value:'batch',label:'Batch'},{value:'query',label:'Query'}]} onchange={(e) => update('split_attn_mode', e.target.value || null)} disabled={!t.split_attn_target} tooltip="Split mode" />
+							</div>
+							<div class="grid grid-cols-2 gap-2">
+								<FormSelect label="FFN Chunk" value={t.ffn_chunk_target || ''} options={[{value:'',label:'None'},{value:'all',label:'All'},{value:'video',label:'Video'},{value:'audio',label:'Audio'}]} onchange={(e) => update('ffn_chunk_target', e.target.value || null)} tooltip="FFN chunking" />
+								<FormField label="Chunk Size" type="number" value={t.ffn_chunk_size ?? 0} oninput={(e) => update('ffn_chunk_size', Number(e.target.value))} disabled={!t.ffn_chunk_target} tooltip="Tokens per chunk" />
+							</div>
+							<div class="flex flex-wrap gap-x-4 gap-y-1">
+								<FormToggle label="GC CPU Offload" checked={t.gradient_checkpointing_cpu_offload ?? false} onchange={(e) => update('gradient_checkpointing_cpu_offload', e.target.checked)} tooltip="Offload checkpointed activations to CPU" />
+								<FormToggle label="Blockwise" checked={t.blockwise_checkpointing ?? false} onchange={(e) => update('blockwise_checkpointing', e.target.checked)} tooltip="Per-block checkpointing" />
+								<FormToggle label="Pinned Memory" checked={t.use_pinned_memory_for_block_swap ?? false} onchange={(e) => update('use_pinned_memory_for_block_swap', e.target.checked)} tooltip="Pinned memory for block swap" />
+								<FormToggle label="Offload img/txt" checked={t.img_in_txt_in_offloading ?? false} onchange={(e) => update('img_in_txt_in_offloading', e.target.checked)} tooltip="Offload img_in/txt_in to CPU" />
+							</div>
+							<FormField label="Blocks to Checkpoint" type="number" value={t.blocks_to_checkpoint ?? ''} oninput={(e) => update('blocks_to_checkpoint', e.target.value ? Number(e.target.value) : null)} placeholder="All" disabled={!t.blockwise_checkpointing} tooltip="Number of blocks to checkpoint (default: all)" />
+							<FormField label="Attn Chunk Size" type="number" value={t.split_attn_chunk_size ?? ''} oninput={(e) => update('split_attn_chunk_size', e.target.value ? Number(e.target.value) : null)} placeholder="Auto" disabled={!t.split_attn_target} tooltip="Split attention chunk size" />
+						{/if}
 					</div>
 				</FormGroup>
 
+				{#if $advancedMode}
 				<FormGroup title="Compile & CUDA">
 					<div class="space-y-2 pt-2">
 						<div class="flex flex-wrap gap-x-4 gap-y-1">
@@ -329,11 +374,18 @@
 			<div class="space-y-3">
 				<FormGroup title="Output">
 					<div class="space-y-2 pt-2">
-						<PathInput label="Output Dir" value={t.output_dir || ''} oninput={(e) => update('output_dir', e.target.value)} tooltip="Checkpoint save directory" />
+						<PathInput label="Output Dir" value={t.output_dir || ''} oninput={(e) => update('output_dir', e.target.value)} tooltip="Checkpoint save directory" invalid={fieldInvalid('training.output_dir')} error={fieldError('training.output_dir')} />
 						<FormField label="Name" value={t.output_name || 'ltx2_lora'} oninput={(e) => update('output_name', e.target.value)} tooltip="Checkpoint filename" />
 						<div class="grid grid-cols-2 gap-2">
 							<FormField label="Save / Epochs" type="number" value={t.save_every_n_epochs ?? ''} oninput={(e) => update('save_every_n_epochs', e.target.value ? Number(e.target.value) : null)} placeholder="Optional" tooltip="Save every N epochs" />
 							<FormField label="Save / Steps" type="number" value={t.save_every_n_steps ?? ''} oninput={(e) => update('save_every_n_steps', e.target.value ? Number(e.target.value) : null)} placeholder="Optional" tooltip="Save every N steps" />
+						</div>
+						<div class="flex flex-wrap gap-x-4 gap-y-1">
+							<FormToggle label="Save State" checked={t.save_state ?? false} onchange={(e) => update('save_state', e.target.checked)} tooltip="Save optimizer state" />
+						</div>
+						<div class="grid grid-cols-2 gap-2">
+							<FormSelect label="Logger" value={t.log_with || ''} options={[{value:'',label:'None'},{value:'tensorboard',label:'TensorBoard'},{value:'wandb',label:'W&B'}]} onchange={(e) => update('log_with', e.target.value || null)} tooltip="Logging integration" />
+							<PathInput label="Log Dir" value={t.logging_dir || ''} oninput={(e) => update('logging_dir', e.target.value)} disabled={!t.log_with} tooltip="Log directory" invalid={fieldInvalid('training.logging_dir')} error={fieldError('training.logging_dir')} />
 						</div>
 						{#if $advancedMode}
 						<div class="grid grid-cols-2 gap-2">
@@ -345,7 +397,6 @@
 							<FormField label="Keep Last N Steps (State)" type="number" value={t.save_last_n_steps_state ?? ''} oninput={(e) => update('save_last_n_steps_state', e.target.value ? Number(e.target.value) : null)} placeholder="All" tooltip="Only keep last N step optimizer states" />
 						</div>
 						<div class="flex flex-wrap gap-x-4 gap-y-1">
-							<FormToggle label="Save State" checked={t.save_state ?? false} onchange={(e) => update('save_state', e.target.checked)} tooltip="Save optimizer state" />
 							<FormToggle label="State on End" checked={t.save_state_on_train_end ?? false} onchange={(e) => update('save_state_on_train_end', e.target.checked)} tooltip="Save state at training end" />
 							<FormToggle label="Ckpt Metadata" checked={t.save_checkpoint_metadata ?? false} onchange={(e) => update('save_checkpoint_metadata', e.target.checked)} tooltip="Save JSON metadata alongside each checkpoint" />
 							<FormToggle label="No Metadata" checked={t.no_metadata ?? false} onchange={(e) => update('no_metadata', e.target.checked)} tooltip="Skip metadata in checkpoint" />
@@ -366,10 +417,6 @@
 							<FormToggle label="Reset Optimizer" checked={t.reset_optimizer ?? false} onchange={(e) => update('reset_optimizer', e.target.checked)} tooltip="Clear optimizer momentum/variance on resume" />
 							<FormToggle label="Reset Optim Params" checked={t.reset_optimizer_params ?? false} onchange={(e) => update('reset_optimizer_params', e.target.checked)} tooltip="Reset lr/weight_decay to CLI values on resume" />
 						</div>
-						<div class="grid grid-cols-2 gap-2">
-							<FormSelect label="Logger" value={t.log_with || ''} options={[{value:'',label:'None'},{value:'tensorboard',label:'TensorBoard'},{value:'wandb',label:'W&B'}]} onchange={(e) => update('log_with', e.target.value || null)} tooltip="Logging integration" />
-							<PathInput label="Log Dir" value={t.logging_dir || ''} oninput={(e) => update('logging_dir', e.target.value)} disabled={!t.log_with} tooltip="Log directory" />
-						</div>
 						<FormField label="W&B Run Name" value={t.wandb_run_name || ''} oninput={(e) => update('wandb_run_name', e.target.value)} disabled={t.log_with !== 'wandb'} placeholder="Auto" tooltip="Weights & Biases run name" />
 						<FormField label="W&B API Key" value={t.wandb_api_key || ''} oninput={(e) => update('wandb_api_key', e.target.value)} disabled={t.log_with !== 'wandb'} placeholder="Optional" tooltip="W&B API key (or set WANDB_API_KEY env)" />
 						<div class="grid grid-cols-2 gap-2">
@@ -388,22 +435,14 @@
 							<FormField label="Every N Steps" type="number" value={t.sample_every_n_steps ?? ''} oninput={(e) => update('sample_every_n_steps', e.target.value ? Number(e.target.value) : null)} placeholder="Optional" tooltip="Sample every N steps" />
 							<FormField label="Every N Epochs" type="number" value={t.sample_every_n_epochs ?? ''} oninput={(e) => update('sample_every_n_epochs', e.target.value ? Number(e.target.value) : null)} placeholder="Optional" tooltip="Sample every N epochs" />
 						</div>
-						<PathInput label="Sample Prompts" value={t.sample_prompts || ''} oninput={(e) => update('sample_prompts', e.target.value)} showFiles tooltip="Prompts file" />
-						{#if $advancedMode}
+						<PathInput label="Sample Prompts File" value={t.sample_prompts || ''} oninput={(e) => update('sample_prompts', e.target.value)} showFiles tooltip="Optional external prompts file. Leave blank to use prompts defined on the Samples page." invalid={fieldInvalid('training.sample_prompts')} error={fieldError('training.sample_prompts')} />
 						<div class="flex flex-wrap gap-x-4 gap-y-1">
 							<FormToggle label="Precached" checked={t.use_precached_sample_prompts ?? false} onchange={(e) => update('use_precached_sample_prompts', e.target.checked)} tooltip="Use cached text embeddings" />
 							<FormToggle label="Precached I2V" checked={t.use_precached_sample_latents ?? false} onchange={(e) => update('use_precached_sample_latents', e.target.checked)} tooltip="Use cached I2V latents" />
 							<FormToggle label="Offload" checked={t.sample_with_offloading ?? false} onchange={(e) => update('sample_with_offloading', e.target.checked)} tooltip="Offload during sampling" />
 							<FormToggle label="Merge Audio" checked={t.sample_merge_audio ?? false} onchange={(e) => update('sample_merge_audio', e.target.checked)} tooltip="Merge audio in samples" />
-							<FormToggle label="No Audio" checked={t.sample_disable_audio ?? false} onchange={(e) => update('sample_disable_audio', e.target.checked)} tooltip="Disable audio sampling" />
 							<FormToggle label="At First" checked={t.sample_at_first ?? false} onchange={(e) => update('sample_at_first', e.target.checked)} tooltip="Generate samples before training" />
 							<FormToggle label="Tiled VAE" checked={t.sample_tiled_vae ?? false} onchange={(e) => update('sample_tiled_vae', e.target.checked)} tooltip="Tiled VAE for sampling (saves VRAM)" />
-							<FormToggle label="Two-Stage" checked={t.sample_two_stage ?? false} onchange={(e) => update('sample_two_stage', e.target.checked)} tooltip="Two-stage spatial upsampling" />
-							<FormToggle label="Audio Only" checked={t.sample_audio_only ?? false} onchange={(e) => update('sample_audio_only', e.target.checked)} tooltip="Audio-only samples" />
-							<FormToggle label="No Flash Attn" checked={t.sample_disable_flash_attn ?? false} onchange={(e) => update('sample_disable_flash_attn', e.target.checked)} tooltip="Disable flash attention during sampling" />
-							<FormToggle label="I2V Mask" checked={t.sample_i2v_token_timestep_mask ?? true} onchange={(e) => update('sample_i2v_token_timestep_mask', e.target.checked)} tooltip="Token timestep mask for I2V sampling" />
-							<FormToggle label="Audio Subprocess" checked={t.sample_audio_subprocess ?? true} onchange={(e) => update('sample_audio_subprocess', e.target.checked)} tooltip="Run audio sampling in subprocess" />
-							<FormToggle label="V2V Reference" checked={t.sample_include_reference ?? false} onchange={(e) => update('sample_include_reference', e.target.checked)} tooltip="Show V2V reference side-by-side" />
 						</div>
 						<PathInput label="Cache Dir" value={t.sample_prompts_cache || ''} oninput={(e) => update('sample_prompts_cache', e.target.value)} showFiles disabled={!t.use_precached_sample_prompts} tooltip="Cached text embeddings dir" />
 						<PathInput label="I2V Latents Cache" value={t.sample_latents_cache || ''} oninput={(e) => update('sample_latents_cache', e.target.value)} showFiles disabled={!t.use_precached_sample_latents} tooltip="Cached I2V conditioning latents (.pt)" />
@@ -415,12 +454,22 @@
 							<FormField label="Temporal Tile" type="number" value={t.sample_vae_temporal_tile_size ?? ''} oninput={(e) => update('sample_vae_temporal_tile_size', e.target.value ? Number(e.target.value) : null)} placeholder="Off" disabled={!t.sample_tiled_vae} tooltip="Temporal tile size (0=disabled)" />
 							<FormField label="Temporal Overlap" type="number" value={t.sample_vae_temporal_tile_overlap ?? ''} oninput={(e) => update('sample_vae_temporal_tile_overlap', e.target.value ? Number(e.target.value) : null)} placeholder="8" disabled={!t.sample_tiled_vae} tooltip="Temporal tile overlap" />
 						</div>
+						{#if $advancedMode}
+						<div class="flex flex-wrap gap-x-4 gap-y-1">
+							<FormToggle label="No Audio" checked={t.sample_disable_audio ?? false} onchange={(e) => update('sample_disable_audio', e.target.checked)} tooltip="Disable audio sampling" />
+							<FormToggle label="Two-Stage" checked={t.sample_two_stage ?? false} onchange={(e) => update('sample_two_stage', e.target.checked)} tooltip="Two-stage spatial upsampling" />
+							<FormToggle label="Audio Only" checked={t.sample_audio_only ?? false} onchange={(e) => update('sample_audio_only', e.target.checked)} tooltip="Audio-only samples" />
+							<FormToggle label="No Flash Attn" checked={t.sample_disable_flash_attn ?? false} onchange={(e) => update('sample_disable_flash_attn', e.target.checked)} tooltip="Disable flash attention during sampling" />
+							<FormToggle label="I2V Mask" checked={t.sample_i2v_token_timestep_mask ?? true} onchange={(e) => update('sample_i2v_token_timestep_mask', e.target.checked)} tooltip="Token timestep mask for I2V sampling" />
+							<FormToggle label="Audio Subprocess" checked={t.sample_audio_subprocess ?? true} onchange={(e) => update('sample_audio_subprocess', e.target.checked)} tooltip="Run audio sampling in subprocess" />
+							<FormToggle label="V2V Reference" checked={t.sample_include_reference ?? false} onchange={(e) => update('sample_include_reference', e.target.checked)} tooltip="Show V2V reference side-by-side" />
+						</div>
 						<div class="grid grid-cols-2 gap-2">
 							<FormField label="Ref Downscale" type="number" value={t.reference_downscale ?? 1} oninput={(e) => update('reference_downscale', Number(e.target.value))} min={1} disabled={!t.sample_include_reference} tooltip="V2V reference downscale factor" />
 							<FormField label="Ref Frames" type="number" value={t.reference_frames ?? 1} oninput={(e) => update('reference_frames', Number(e.target.value))} min={1} disabled={!t.sample_include_reference} tooltip="Number of reference frames" />
 						</div>
 						{#if t.sample_two_stage}
-						<PathInput label="Upsampler Path" value={t.spatial_upsampler_path || ''} oninput={(e) => update('spatial_upsampler_path', e.target.value)} showFiles tooltip="Spatial upsampler model path" />
+						<PathInput label="Upsampler Path" value={t.spatial_upsampler_path || ''} oninput={(e) => update('spatial_upsampler_path', e.target.value)} showFiles tooltip="Spatial upsampler model path" invalid={fieldInvalid('training.spatial_upsampler_path')} error={fieldError('training.spatial_upsampler_path')} />
 						<PathInput label="Distilled LoRA" value={t.distilled_lora_path || ''} oninput={(e) => update('distilled_lora_path', e.target.value)} showFiles tooltip="Distilled LoRA for stage 2" />
 						<FormField label="Stage 2 Steps" type="number" value={t.sample_stage2_steps ?? 3} oninput={(e) => update('sample_stage2_steps', Number(e.target.value))} min={1} tooltip="Number of denoising steps for stage 2" />
 						{/if}
@@ -430,12 +479,6 @@
 							<FormField label="H" type="number" value={t.height ?? 512} oninput={(e) => update('height', Number(e.target.value))} min={64} step={64} tooltip="Sample height" />
 							<FormField label="Frames" type="number" value={t.sample_num_frames ?? 45} oninput={(e) => update('sample_num_frames', Number(e.target.value))} min={1} tooltip="Sample frames" />
 						</div>
-						{#if $advancedMode}
-						<div class="grid grid-cols-2 gap-2">
-							<FormField label="Validate / Steps" type="number" value={t.validate_every_n_steps ?? ''} oninput={(e) => update('validate_every_n_steps', e.target.value ? Number(e.target.value) : null)} placeholder="Off" tooltip="Run validation every N steps" />
-							<FormField label="Validate / Epochs" type="number" value={t.validate_every_n_epochs ?? ''} oninput={(e) => update('validate_every_n_epochs', e.target.value ? Number(e.target.value) : null)} placeholder="Off" tooltip="Run validation every N epochs" />
-						</div>
-						{/if}
 					</div>
 				</FormGroup>
 
@@ -446,18 +489,9 @@
 							<FormField label="Video Weight" type="number" value={t.video_loss_weight ?? 1.0} oninput={(e) => update('video_loss_weight', Number(e.target.value))} step="0.1" tooltip="Video loss multiplier" />
 							<FormField label="Audio Weight" type="number" value={t.audio_loss_weight ?? 1.0} oninput={(e) => update('audio_loss_weight', Number(e.target.value))} step="0.1" tooltip="Audio loss multiplier" />
 						</div>
-						<FormToggle label="Separate Audio Buckets" checked={t.separate_audio_buckets ?? false} onchange={(e) => update('separate_audio_buckets', e.target.checked)} tooltip="Separate audio/video buckets" />
-						<div class="grid grid-cols-2 gap-2">
-							<FormField label="Workers" type="number" value={t.max_data_loader_n_workers ?? 8} oninput={(e) => update('max_data_loader_n_workers', Number(e.target.value))} min={0} tooltip="Dataloader workers" />
-							<FormField label="1st Frame P" type="number" value={t.ltx2_first_frame_conditioning_p ?? 0.1} oninput={(e) => update('ltx2_first_frame_conditioning_p', Number(e.target.value))} step="0.05" min={0} max={1} tooltip="First frame conditioning prob" />
-					{#if t.ltx2_mode === 'audio'}
-					<FormField label="Audio Seq Resolution" type="number" value={t.audio_only_sequence_resolution ?? 64} oninput={(e) => update('audio_only_sequence_resolution', Number(e.target.value))} min={0} tooltip="Virtual pixel resolution for shifted_logit_normal in audio-only mode (0 = use cached geometry)" />
-					{/if}
-						</div>
-						<FormToggle label="Persistent Workers" checked={t.persistent_data_loader_workers ?? false} onchange={(e) => update('persistent_data_loader_workers', e.target.checked)} tooltip="Keep workers between epochs" />
 					</div>
 				</FormGroup>
-
+				
 				<FormGroup title="Metadata">
 					<div class="space-y-2 pt-2">
 						<FormField label="Title" value={t.metadata_title || ''} oninput={(e) => update('metadata_title', e.target.value)} placeholder="LoRA name" tooltip="Model card title" />
@@ -491,6 +525,36 @@
 		</div>
 
 		<!-- Controls -->
+		{#if hasValidationIssues}
+			<div class="p-3 space-y-2" style="background: {trainingValidation.errors?.length ? 'var(--danger-muted)' : 'var(--bg-elevated)'}; border: 1px solid {trainingValidation.errors?.length ? 'var(--danger)' : 'var(--border)'}; border-radius: var(--radius-sm);">
+				<div class="flex items-center justify-between gap-3">
+					<div class="text-[12px] font-medium" style="color: {trainingValidation.errors?.length ? 'var(--danger)' : 'var(--text-primary)'};">
+						{trainingValidation.summary}
+					</div>
+					{#if hasDatasetValidationErrors}
+						<a href="/dataset" class="text-[12px] font-medium" style="color: var(--accent);">Open Dataset</a>
+					{/if}
+				</div>
+				{#if trainingValidation.errors?.length}
+					<div class="space-y-1">
+						{#each trainingValidation.errors as issue}
+							<div class="text-[12px]" style="color: var(--text-primary);">
+								{issue.message}
+							</div>
+						{/each}
+					</div>
+				{/if}
+				{#if trainingValidation.warnings?.length}
+					<div class="space-y-1">
+						{#each trainingValidation.warnings as issue}
+							<div class="text-[12px]" style="color: var(--text-secondary);">
+								{issue.message}
+							</div>
+						{/each}
+					</div>
+				{/if}
+			</div>
+		{/if}
 		<div class="py-4 flex items-center gap-4">
 			<ProcessControls processType="training" status={trainingStatus} onStart={startTraining} onStop={() => stopProcess('training')} />
 			<div class="flex-1"></div>

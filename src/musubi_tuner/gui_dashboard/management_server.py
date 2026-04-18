@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import mimetypes
 import os
 from pathlib import Path
@@ -13,7 +14,8 @@ mimetypes.add_type("application/javascript", ".js")
 mimetypes.add_type("text/css", ".css")
 
 from fastapi import FastAPI
-from fastapi.responses import FileResponse, HTMLResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
+import pyarrow.parquet as pq
 
 from musubi_tuner.gui_dashboard.process_manager import ProcessManager
 from musubi_tuner.gui_dashboard.project_schema import ProjectConfig
@@ -22,6 +24,11 @@ from musubi_tuner.gui_dashboard.routers import datasets, filesystem, processes, 
 logger = logging.getLogger(__name__)
 
 FRONTEND_DIST = os.path.join(os.path.dirname(__file__), "frontend", "dist")
+NO_CACHE_HEADERS = {
+    "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+    "Pragma": "no-cache",
+    "Expires": "0",
+}
 
 
 def create_management_app(project_path: Optional[str] = None) -> FastAPI:
@@ -57,36 +64,69 @@ def create_management_app(project_path: Optional[str] = None) -> FastAPI:
     # Metrics router — dynamically bound to training output_dir
     @app.get("/data/metrics.parquet")
     async def get_metrics():
+        if not _training_dashboard_active(app):
+            return Response(status_code=204)
         run_dir = _get_run_dir(app)
         if not run_dir:
             return Response(status_code=204)
         path = os.path.join(run_dir, "dashboard", "metrics.parquet")
         if not os.path.exists(path):
             return Response(status_code=204)
-        return FileResponse(path, media_type="application/octet-stream")
+        return Response(Path(path).read_bytes(), media_type="application/octet-stream", headers=NO_CACHE_HEADERS)
 
     @app.get("/data/status.json")
     async def get_status():
+        if not _training_dashboard_active(app):
+            return Response(status_code=204)
         run_dir = _get_run_dir(app)
         if not run_dir:
             return Response(status_code=204)
         path = os.path.join(run_dir, "dashboard", "status.json")
         if not os.path.exists(path):
             return Response(status_code=204)
-        return FileResponse(path, media_type="application/json")
+        return Response(Path(path).read_bytes(), media_type="application/json", headers=NO_CACHE_HEADERS)
 
     @app.get("/data/events.json")
     async def get_events():
+        if not _training_dashboard_active(app):
+            return Response(status_code=204)
         run_dir = _get_run_dir(app)
         if not run_dir:
             return Response(status_code=204)
         path = os.path.join(run_dir, "dashboard", "events.json")
         if not os.path.exists(path):
             return Response(status_code=204)
-        return FileResponse(path, media_type="application/json")
+        return Response(Path(path).read_bytes(), media_type="application/json", headers=NO_CACHE_HEADERS)
+
+    @app.get("/api/dashboard/metrics")
+    async def get_metrics_json():
+        if not _training_dashboard_active(app):
+            return Response(status_code=204)
+        run_dir = _get_run_dir(app)
+        if not run_dir:
+            return Response(status_code=204)
+        path = os.path.join(run_dir, "dashboard", "metrics.parquet")
+        if not os.path.exists(path):
+            return Response(status_code=204)
+        try:
+            table = pq.read_table(path)
+            rows = []
+            for row in table.to_pylist():
+                clean_row = {}
+                for key, value in row.items():
+                    if isinstance(value, float) and math.isnan(value):
+                        clean_row[key] = None
+                    else:
+                        clean_row[key] = value
+                rows.append(clean_row)
+            return JSONResponse({"rows": rows}, headers=NO_CACHE_HEADERS)
+        except Exception:
+            return Response(status_code=204)
 
     @app.api_route("/data/samples/{file_path:path}", methods=["GET", "HEAD"])
     async def get_sample(file_path: str):
+        if not _training_dashboard_active(app):
+            return HTMLResponse("no active training run", status_code=404)
         run_dir = _get_run_dir(app)
         if not run_dir:
             return HTMLResponse("no training output configured", status_code=404)
@@ -105,12 +145,20 @@ def create_management_app(project_path: Optional[str] = None) -> FastAPI:
             last_mtime = 0.0
             while True:
                 await asyncio.sleep(2)
+                if not _training_dashboard_active(app):
+                    continue
                 run_dir = _get_run_dir(app)
                 if not run_dir:
                     continue
                 metrics_path = os.path.join(run_dir, "dashboard", "metrics.parquet")
+                status_path = os.path.join(run_dir, "dashboard", "status.json")
+                events_path = os.path.join(run_dir, "dashboard", "events.json")
                 try:
-                    mtime = os.path.getmtime(metrics_path) if os.path.exists(metrics_path) else 0.0
+                    mtime = max(
+                        os.path.getmtime(metrics_path) if os.path.exists(metrics_path) else 0.0,
+                        os.path.getmtime(status_path) if os.path.exists(status_path) else 0.0,
+                        os.path.getmtime(events_path) if os.path.exists(events_path) else 0.0,
+                    )
                 except OSError:
                     mtime = 0.0
                 if mtime > last_mtime:
@@ -142,5 +190,14 @@ def _get_run_dir(app: FastAPI) -> Optional[str]:
     """Get the current training output directory from project config."""
     config: ProjectConfig | None = app.state.project_config
     if config and config.training.output_dir:
-        return config.training.output_dir
+        run_dir = Path(config.training.output_dir)
+        if not run_dir.is_absolute() and config.project_dir:
+            run_dir = Path(config.project_dir) / run_dir
+        return str(run_dir)
     return None
+
+
+def _training_dashboard_active(app: FastAPI) -> bool:
+    pm: ProcessManager = app.state.process_manager
+    state = pm.get_status("training").get("state")
+    return state in {"running", "stopping"}

@@ -16,6 +16,8 @@ logger = logging.getLogger(__name__)
 def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     """Add LTX-2-specific arguments to parser"""
 
+    parser.set_defaults(network_module="networks.lora_ltx2")
+
     parser.add_argument(
         "--ltx2_checkpoint",
         type=str,

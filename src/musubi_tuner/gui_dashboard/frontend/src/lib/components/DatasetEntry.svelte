@@ -3,7 +3,7 @@
 	import FormSelect from './FormSelect.svelte';
 	import PathInput from './PathInput.svelte';
 
-	let { entry = {}, index = 0, onRemove, onchange, advanced = false } = $props();
+	let { entry = {}, index = 0, onRemove, onchange, advanced = false, sourceError = '' } = $props();
 
 	function emit(nextEntry) {
 		if (onchange) {
@@ -89,6 +89,8 @@
 			value={entry.directory}
 			oninput={(e) => updateField('directory', e.target.value)}
 			tooltip="Directory containing media files"
+			invalid={Boolean(sourceError)}
+			error={sourceError}
 		/>
 		<PathInput
 			label="JSONL File"
@@ -97,6 +99,8 @@
 			showFiles
 			placeholder="Optional (alternative to directory)"
 			tooltip="JSONL file listing individual media paths instead of a directory"
+			invalid={Boolean(sourceError)}
+			error={sourceError}
 		/>
 		{#if advanced}
 			<PathInput

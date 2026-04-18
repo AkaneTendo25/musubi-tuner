@@ -53,6 +53,8 @@
 		if (hours < 24) return `${hours.toFixed(1)} hrs`;
 		return `${(hours / 24).toFixed(1)} days`;
 	}
+
+	const statRowClass = 'flex items-baseline gap-2 flex-wrap';
 </script>
 
 <div style="background: var(--bg-surface); border: 1px solid var(--border-subtle); border-radius: var(--radius-md); box-shadow: var(--shadow-sm); position: relative; overflow: hidden;">
@@ -83,11 +85,11 @@
 				<div class="p-2.5" style="background: var(--bg-elevated); border-radius: var(--radius-sm);">
 					<div class="text-[10px] font-semibold mb-1.5 uppercase tracking-wider" style="color: var(--accent);">VRAM Estimates</div>
 					<div class="space-y-1.5">
-						<div class="flex justify-between items-center">
+						<div class={statRowClass}>
 							<span class="text-[11px]" style="color: var(--text-muted);">Peak Training:</span>
 							<span class="text-[13px] font-bold" style="color: var(--success);">{formatNumber(stats.vram.peak_training_gb)} GB</span>
 						</div>
-						<div class="flex justify-between items-center">
+						<div class={statRowClass}>
 							<span class="text-[11px]" style="color: var(--text-muted);">Peak Sampling:</span>
 							<span class="text-[11px] font-medium" style="color: var(--text-primary);">{formatNumber(stats.vram.peak_sampling_gb)} GB</span>
 						</div>
@@ -114,26 +116,36 @@
 			{#if stats.dataset}
 				<div class="p-2.5" style="background: var(--bg-elevated); border-radius: var(--radius-sm);">
 					<div class="text-[10px] font-semibold mb-1.5 uppercase tracking-wider" style="color: var(--accent);">Dataset</div>
-					<div class="grid grid-cols-2 gap-x-3 gap-y-1">
-						<div class="text-[11px]" style="color: var(--text-muted);">Total Items:</div>
-						<div class="text-[11px] font-medium text-right" style="color: var(--text-primary);">{formatNumber(stats.dataset.total_items)}</div>
+					<div class="space-y-1.5">
+						<div class={statRowClass}>
+							<div class="text-[11px]" style="color: var(--text-muted);">Total Items:</div>
+							<div class="text-[11px] font-medium" style="color: var(--text-primary);">{formatNumber(stats.dataset.total_items)}</div>
+						</div>
 
-						<div class="text-[11px]" style="color: var(--text-muted);">Video:</div>
-						<div class="text-[11px] font-medium text-right" style="color: var(--text-primary);">{formatNumber(stats.dataset.video_items)}</div>
+						<div class={statRowClass}>
+							<div class="text-[11px]" style="color: var(--text-muted);">Video:</div>
+							<div class="text-[11px] font-medium" style="color: var(--text-primary);">{formatNumber(stats.dataset.video_items)}</div>
+						</div>
 
 						{#if stats.dataset.audio_items > 0}
-							<div class="text-[11px]" style="color: var(--text-muted);">Audio:</div>
-							<div class="text-[11px] font-medium text-right" style="color: var(--text-primary);">{formatNumber(stats.dataset.audio_items)}</div>
+							<div class={statRowClass}>
+								<div class="text-[11px]" style="color: var(--text-muted);">Audio:</div>
+								<div class="text-[11px] font-medium" style="color: var(--text-primary);">{formatNumber(stats.dataset.audio_items)}</div>
+							</div>
 						{/if}
 
 						{#if stats.dataset.max_resolution}
-							<div class="text-[11px]" style="color: var(--text-muted);">Max Resolution:</div>
-							<div class="text-[11px] font-medium text-right font-mono" style="color: var(--text-primary);">{stats.dataset.max_resolution[0]}×{stats.dataset.max_resolution[1]}</div>
+							<div class={statRowClass}>
+								<div class="text-[11px]" style="color: var(--text-muted);">Max Resolution:</div>
+								<div class="text-[11px] font-medium font-mono" style="color: var(--text-primary);">{stats.dataset.max_resolution[0]}×{stats.dataset.max_resolution[1]}</div>
+							</div>
 						{/if}
 
 						{#if stats.dataset.max_frames}
-							<div class="text-[11px]" style="color: var(--text-muted);">Max Frames:</div>
-							<div class="text-[11px] font-medium text-right" style="color: var(--text-primary);">{formatNumber(stats.dataset.max_frames)}</div>
+							<div class={statRowClass}>
+								<div class="text-[11px]" style="color: var(--text-muted);">Max Frames:</div>
+								<div class="text-[11px] font-medium" style="color: var(--text-primary);">{formatNumber(stats.dataset.max_frames)}</div>
+							</div>
 						{/if}
 					</div>
 				</div>
@@ -143,30 +155,42 @@
 			{#if stats.training}
 				<div class="p-2.5" style="background: var(--bg-elevated); border-radius: var(--radius-sm);">
 					<div class="text-[10px] font-semibold mb-1.5 uppercase tracking-wider" style="color: var(--accent);">Training</div>
-					<div class="grid grid-cols-2 gap-x-3 gap-y-1">
-						<div class="text-[11px]" style="color: var(--text-muted);">Effective Batch Size:</div>
-						<div class="text-[11px] font-medium text-right" style="color: var(--text-primary);">{stats.training.effective_batch_size}</div>
+					<div class="space-y-1.5">
+						<div class={statRowClass}>
+							<div class="text-[11px]" style="color: var(--text-muted);">Effective Batch Size:</div>
+							<div class="text-[11px] font-medium" style="color: var(--text-primary);">{stats.training.effective_batch_size}</div>
+						</div>
 
 						{#if stats.training.steps_per_epoch}
-							<div class="text-[11px]" style="color: var(--text-muted);">Steps per Epoch:</div>
-							<div class="text-[11px] font-medium text-right" style="color: var(--text-primary);">{formatNumber(stats.training.steps_per_epoch)}</div>
+							<div class={statRowClass}>
+								<div class="text-[11px]" style="color: var(--text-muted);">Steps per Epoch:</div>
+								<div class="text-[11px] font-medium" style="color: var(--text-primary);">{formatNumber(stats.training.steps_per_epoch)}</div>
+							</div>
 						{/if}
 
 						{#if stats.training.total_epochs}
-							<div class="text-[11px]" style="color: var(--text-muted);">Total Epochs:</div>
-							<div class="text-[11px] font-medium text-right" style="color: var(--text-primary);">{formatNumber(stats.training.total_epochs)}</div>
+							<div class={statRowClass}>
+								<div class="text-[11px]" style="color: var(--text-muted);">Total Epochs:</div>
+								<div class="text-[11px] font-medium" style="color: var(--text-primary);">{formatNumber(stats.training.total_epochs)}</div>
+							</div>
 						{/if}
 
 						{#if stats.training.estimated_time_hours}
-							<div class="text-[11px]" style="color: var(--text-muted);">Est. Duration:</div>
-							<div class="text-[11px] font-medium text-right" style="color: var(--text-primary);">{formatTime(stats.training.estimated_time_hours)}</div>
+							<div class={statRowClass}>
+								<div class="text-[11px]" style="color: var(--text-muted);">Est. Duration:</div>
+								<div class="text-[11px] font-medium" style="color: var(--text-primary);">{formatTime(stats.training.estimated_time_hours)}</div>
+							</div>
 						{/if}
 
-						<div class="text-[11px]" style="color: var(--text-muted);">Checkpoints:</div>
-						<div class="text-[11px] font-medium text-right" style="color: var(--text-primary);">{stats.training.total_checkpoints}</div>
+						<div class={statRowClass}>
+							<div class="text-[11px]" style="color: var(--text-muted);">Checkpoints:</div>
+							<div class="text-[11px] font-medium" style="color: var(--text-primary);">{stats.training.total_checkpoints}</div>
+						</div>
 
-						<div class="text-[11px]" style="color: var(--text-muted);">Storage (LoRA):</div>
-						<div class="text-[11px] font-medium text-right" style="color: var(--text-primary);">{formatNumber(stats.training.total_storage_gb)} GB</div>
+						<div class={statRowClass}>
+							<div class="text-[11px]" style="color: var(--text-muted);">Storage (LoRA):</div>
+							<div class="text-[11px] font-medium" style="color: var(--text-primary);">{formatNumber(stats.training.total_storage_gb)} GB</div>
+						</div>
 					</div>
 				</div>
 			{/if}
@@ -176,11 +200,11 @@
 				<div class="p-2.5" style="background: var(--bg-elevated); border-radius: var(--radius-sm);">
 					<div class="text-[10px] font-semibold mb-1.5 uppercase tracking-wider" style="color: var(--accent);">VRAM Estimates</div>
 					<div class="space-y-1.5">
-						<div class="flex justify-between items-center">
+						<div class={statRowClass}>
 							<span class="text-[11px]" style="color: var(--text-muted);">Peak Training:</span>
 							<span class="text-[13px] font-bold" style="color: var(--success);">{formatNumber(stats.vram.peak_training_gb)} GB</span>
 						</div>
-						<div class="flex justify-between items-center">
+						<div class={statRowClass}>
 							<span class="text-[11px]" style="color: var(--text-muted);">Peak Sampling:</span>
 							<span class="text-[11px] font-medium" style="color: var(--text-primary);">{formatNumber(stats.vram.peak_sampling_gb)} GB</span>
 						</div>
@@ -189,19 +213,19 @@
 						<details class="mt-1">
 							<summary class="text-[10px] cursor-pointer" style="color: var(--text-muted);">Show breakdown</summary>
 							<div class="mt-1.5 pl-2 space-y-0.5 border-l-2" style="border-color: var(--border);">
-								<div class="flex justify-between text-[10px]">
+								<div class={statRowClass + ' text-[10px]'}>
 									<span style="color: var(--text-muted);">Model:</span>
 									<span style="color: var(--text-secondary);">{stats.vram.breakdown.model} GB</span>
 								</div>
-								<div class="flex justify-between text-[10px]">
+								<div class={statRowClass + ' text-[10px]'}>
 									<span style="color: var(--text-muted);">Optimizer:</span>
 									<span style="color: var(--text-secondary);">{stats.vram.breakdown.optimizer} GB</span>
 								</div>
-								<div class="flex justify-between text-[10px]">
+								<div class={statRowClass + ' text-[10px]'}>
 									<span style="color: var(--text-muted);">Activations:</span>
 									<span style="color: var(--text-secondary);">{stats.vram.breakdown.activations} GB</span>
 								</div>
-								<div class="flex justify-between text-[10px]">
+								<div class={statRowClass + ' text-[10px]'}>
 									<span style="color: var(--text-muted);">Overhead:</span>
 									<span style="color: var(--text-secondary);">{stats.vram.breakdown.overhead} GB</span>
 								</div>

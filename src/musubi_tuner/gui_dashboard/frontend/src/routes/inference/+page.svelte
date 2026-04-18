@@ -9,10 +9,14 @@
 	import ProcessControls from '$lib/components/ProcessControls.svelte';
 	import CommandPanel from '$lib/components/CommandPanel.svelte';
 	import { projectConfig, projectLoaded, updateSection } from '$lib/stores/project.js';
-	import { processStatuses, processLogs, startProcess, stopProcess, fetchLogs } from '$lib/stores/processes.js';
+	import { processStatuses, processLogs, startProcess, stopProcess, preloadLogsIfActive, startLogPolling } from '$lib/stores/processes.js';
 	import { onMount } from 'svelte';
 
-	onMount(() => { fetchLogs('inference'); });
+	onMount(() => {
+		preloadLogsIfActive('inference');
+		const logInterval = startLogPolling('inference', 1000);
+		return () => clearInterval(logInterval);
+	});
 
 	function update(key, value) { updateSection('inference', key, value); }
 

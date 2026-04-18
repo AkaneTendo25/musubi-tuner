@@ -8,8 +8,15 @@
 	import ProcessConsole from '$lib/components/ProcessConsole.svelte';
 	import CommandPanel from '$lib/components/CommandPanel.svelte';
 	import { projectConfig, projectLoaded, saveProjectDebounced } from '$lib/stores/project.js';
-	import { processStatuses, processLogs, startProcess, stopProcess } from '$lib/stores/processes.js';
+	import { processStatuses, processLogs, startProcess, stopProcess, preloadLogsIfActive, startLogPolling } from '$lib/stores/processes.js';
 	import { advancedMode } from '$lib/stores/uiMode.js';
+	import { onMount } from 'svelte';
+
+	onMount(() => {
+		preloadLogsIfActive(['cache_dino', 'slider_training']);
+		const logInterval = startLogPolling(['cache_dino', 'slider_training'], 1000);
+		return () => clearInterval(logInterval);
+	});
 
 	function update(key, value) {
 		projectConfig.update((c) => {

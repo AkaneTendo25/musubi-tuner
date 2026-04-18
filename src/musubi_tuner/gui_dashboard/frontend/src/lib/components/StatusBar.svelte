@@ -2,6 +2,7 @@
 	import { status, eta } from '../stores/status.js';
 	import { connected } from '../stores/sse.js';
 	import MetricCard from './MetricCard.svelte';
+	let { active = false } = $props();
 
 	function formatTime(seconds) {
 		if (seconds == null || seconds <= 0) return '--';
@@ -19,38 +20,50 @@
 		return (1 / s).toFixed(1) + ' s/step';
 	}
 
-	let statusText = $derived($status?.status || 'waiting');
+	let statusText = $derived(active ? ($status?.status || 'waiting') : 'waiting');
 	let progress = $derived(
-		$status?.max_steps > 0 ? (($status.step / $status.max_steps) * 100).toFixed(1) : 0
+		active && $status?.max_steps > 0 ? (($status.step / $status.max_steps) * 100).toFixed(1) : 0
 	);
+let epochValue = $derived(active ? `${$status?.epoch ?? 0}/${$status?.max_epochs ?? 0}` : '0/0');
+let statusLabel = $derived(active ? 'Live Status' : 'Inactive');
 </script>
 
-<div class="flex flex-wrap items-center gap-3">
-	<div class="flex items-center gap-2 mr-2">
-		<div
-			class="w-2 h-2 rounded-full"
-			style="background: {$connected ? 'var(--success)' : 'var(--danger)'}; box-shadow: 0 0 6px {$connected ? 'var(--success)' : 'var(--danger)'};"
-		></div>
-		<span class="text-[12px] capitalize" style="color: var(--text-muted);">{statusText}</span>
-	</div>
-
-	{#if $status?.max_steps > 0}
-		<div class="flex-1 min-w-[200px]">
-			<div class="flex justify-between text-[11px] mb-1" style="color: var(--text-muted);">
-				<span>Step {$status?.step?.toLocaleString() ?? 0} / {$status?.max_steps?.toLocaleString()}</span>
-				<span>{progress}%</span>
+<div class="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-12 gap-2.5">
+	<div class="xl:col-span-4 px-3.5 py-2.5 min-h-[72px]" style="background: {active ? 'var(--bg-surface)' : 'color-mix(in srgb, var(--bg-surface) 78%, transparent)'}; border: 1px solid {active ? 'var(--border-subtle)' : 'var(--border)'}; border-radius: var(--radius-md); opacity: {active ? '1' : '0.76'}; box-shadow: {active ? 'var(--shadow-sm)' : 'none'}; transition: opacity 0.2s ease, border-color 0.2s ease;">
+		<div class="flex items-center justify-between gap-3">
+			<div class="flex items-center gap-2">
+			<div
+				class="w-1.5 h-1.5 rounded-full flex-shrink-0"
+				style="background: {active ? ($connected ? 'var(--success)' : 'var(--danger)') : 'var(--text-muted)'}; box-shadow: 0 0 6px {active ? ($connected ? 'var(--success)' : 'var(--danger)') : 'transparent'};"
+			></div>
+				<span class="text-[9px] font-medium uppercase tracking-[0.22em]" style="color: var(--text-muted); font-family: var(--font-label);">{statusLabel}</span>
 			</div>
-			<div class="h-1.5 overflow-hidden" style="background: var(--border); border-radius: var(--radius-full);">
-				<div
-					class="h-full transition-all duration-500"
-					style="width: {progress}%; background: var(--accent); border-radius: var(--radius-full);"
-				></div>
+			<span class="text-[10px] font-medium tabular-nums" style="color: var(--text-muted);">{active ? progress : 0}%</span>
+		</div>
+		<div class="flex items-end justify-between gap-3 mt-1.5">
+			<div class="text-[17px] leading-none font-semibold capitalize" style="color: {active ? 'var(--text-primary)' : 'var(--text-secondary)'};">{statusText}</div>
+			<div class="text-[10px] tabular-nums whitespace-nowrap" style="color: var(--text-muted);">
+				Step {active ? ($status?.step?.toLocaleString() ?? 0) : 0} / {active ? ($status?.max_steps?.toLocaleString() ?? 0) : 0}
 			</div>
 		</div>
-	{/if}
+		<div class="h-1 mt-2 overflow-hidden" style="background: var(--border); border-radius: var(--radius-full);">
+			<div
+				class="h-full transition-all duration-500"
+				style="width: {active ? progress : 0}%; background: {active ? 'var(--accent)' : 'var(--text-muted)'}; border-radius: var(--radius-full);"
+			></div>
+		</div>
+	</div>
 
-	<MetricCard label="Epoch" value="{$status?.epoch ?? 0}/{$status?.max_epochs ?? 0}" />
-	<MetricCard label="Speed" value={formatSpeed($status?.speed_steps_per_sec)} />
-	<MetricCard label="Elapsed" value={formatTime($status?.elapsed_sec)} />
-	<MetricCard label="ETA" value={formatTime($eta)} />
+	<div class="xl:col-span-2">
+		<MetricCard label="Epoch" value={epochValue} inactive={!active} />
+	</div>
+	<div class="xl:col-span-2">
+		<MetricCard label="Speed" value={active ? formatSpeed($status?.speed_steps_per_sec) : '--'} inactive={!active} />
+	</div>
+	<div class="xl:col-span-2">
+		<MetricCard label="Elapsed" value={active ? formatTime($status?.elapsed_sec) : '--'} inactive={!active} />
+	</div>
+	<div class="xl:col-span-2">
+		<MetricCard label="ETA" value={active ? formatTime($eta) : '--'} inactive={!active} />
+	</div>
 </div>

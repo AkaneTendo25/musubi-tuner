@@ -11,6 +11,7 @@
 	let initialized = $state(false);
 	let hydratedFromProject = $state(false);
 	let lastSavedSignature = $state('');
+	let inlineSaveSignature = $state('');
 
 	let entries = $state([createEntry()]);
 
@@ -102,27 +103,55 @@
 	let promptCount = $derived(entries.filter((entry) => entry.prompt).length);
 	let autosaveSignature = $derived(filePath && filePath.endsWith('.txt') ? `${filePath}\n${fileContent}` : '');
 
+	function syncTrainingSamplePrompts(path) {
+		projectConfig.update((config) => {
+			if (!config) return config;
+			if ((config.training?.sample_prompts || '') === path) return config;
+			return {
+				...config,
+				training: { ...(config.training || {}), sample_prompts: path }
+			};
+		});
+		saveProjectDebounced();
+	}
+
+	function syncTrainingSamplePromptsText(text) {
+		projectConfig.update((config) => {
+			if (!config) return config;
+			if ((config.training?.sample_prompts_text || '') === text) return config;
+			return {
+				...config,
+				training: { ...(config.training || {}), sample_prompts_text: text }
+			};
+		});
+		saveProjectDebounced();
+	}
+
 	$effect(() => {
 		if (hydratedFromProject || !$projectLoaded || !$projectConfig) return;
 		hydratedFromProject = true;
 		const config = $projectConfig;
 		const samplePrompts = config.training?.sample_prompts;
-		filePath = samplePrompts || (config.project_dir ? config.project_dir.replace(/[\\/]$/, '') + '/sample_prompts.txt' : 'sample_prompts.txt');
-		void loadFile().then(() => {
+		const samplePromptsText = config.training?.sample_prompts_text || '';
+		filePath = samplePrompts || '';
+		if (filePath) {
+			void loadFile().then(() => {
+				initialized = true;
+			});
+		} else if (samplePromptsText.trim()) {
+			const parsed = samplePromptsText
+				.split('\n')
+				.map((line) => lineToEntry(line))
+				.filter(Boolean);
+			if (parsed.length > 0) {
+				entries = parsed;
+			}
+			lastSavedSignature = `\n${samplePromptsText}`;
+			inlineSaveSignature = samplePromptsText;
 			initialized = true;
-		});
-	});
-
-	$effect(() => {
-		if (!initialized || !$projectLoaded || !filePath) return;
-		projectConfig.update((config) => {
-			if (!config) return config;
-			return {
-				...config,
-				training: { ...(config.training || {}), sample_prompts: filePath }
-			};
-		});
-		saveProjectDebounced();
+		} else {
+			initialized = true;
+		}
 	});
 
 	$effect(() => {
@@ -132,6 +161,18 @@
 			void persistFile({ showMessage: false, silent: true });
 		}, 900);
 		return () => clearTimeout(timer);
+	});
+
+	$effect(() => {
+		if (!initialized) return;
+		syncTrainingSamplePrompts(filePath);
+	});
+
+	$effect(() => {
+		if (!initialized) return;
+		if (fileContent === inlineSaveSignature) return;
+		inlineSaveSignature = fileContent;
+		syncTrainingSamplePromptsText(fileContent);
 	});
 
 	async function loadFile() {
@@ -153,7 +194,10 @@
 						entries = parsed;
 					}
 				}
+				syncTrainingSamplePrompts(filePath);
+				syncTrainingSamplePromptsText(content);
 				lastSavedSignature = `${filePath}\n${content.trim() ? content : fileContent}`;
+				inlineSaveSignature = content;
 			}
 		} catch {
 			// file may not exist yet
@@ -183,7 +227,10 @@
 				const err = await res.json();
 				throw new Error(err.detail || 'Failed to save');
 			}
+			syncTrainingSamplePrompts(filePath);
+			syncTrainingSamplePromptsText(fileContent);
 			lastSavedSignature = `${filePath}\n${fileContent}`;
+			inlineSaveSignature = fileContent;
 			success = showMessage ? 'Saved' : 'Autosaved';
 			setTimeout(() => {
 				if (success === 'Saved' || success === 'Autosaved') success = '';
@@ -203,12 +250,12 @@
 	<div class="space-y-4">
 		<div>
 			<h2 class="text-base font-semibold" style="color: var(--text-primary);">Sample Prompts</h2>
-			<p class="text-[12px] mt-0.5" style="color: var(--text-muted);">Prompts for periodic sample generation during training.</p>
+			<p class="text-[12px] mt-0.5" style="color: var(--text-muted);">Prompts for periodic sample generation during training. They are stored in the project automatically; a `.txt` file is optional.</p>
 		</div>
 
 		<div class="flex items-end gap-2">
 			<div class="flex-1">
-				<PathInput label="Prompts File" bind:value={filePath} showFiles tooltip="Path to sample prompts text file (.txt)" />
+				<PathInput label="Prompts File" bind:value={filePath} showFiles tooltip="Optional path to import from or export to a sample prompts text file (.txt)." />
 			</div>
 			<button
 				onclick={loadFile}
@@ -325,8 +372,11 @@
 				style="background: var(--accent-muted); border: 1px solid var(--accent); color: var(--accent); border-radius: var(--radius-sm);"
 				onmouseenter={(e) => { if (!e.currentTarget.disabled) e.currentTarget.style.filter = 'brightness(1.15)'; }}
 				onmouseleave={(e) => { e.currentTarget.style.filter = ''; }}
-			>{saving ? 'Saving...' : 'Save Now'}</button>
+			>{saving ? 'Saving...' : 'Save File'}</button>
 			<span class="text-[11px] tabular-nums" style="color: var(--text-muted);">{promptCount} prompt{promptCount !== 1 ? 's' : ''}</span>
+			{#if !filePath}
+				<span class="text-[11px]" style="color: var(--text-muted);">Stored in project config</span>
+			{/if}
 			{#if success}
 				<span class="text-[11px] font-medium" style="color: var(--success);">{success}</span>
 			{/if}

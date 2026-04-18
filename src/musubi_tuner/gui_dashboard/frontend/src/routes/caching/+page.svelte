@@ -10,14 +10,14 @@
 	import CommandPanel from '$lib/components/CommandPanel.svelte';
 	import ModelDownloadPanel from '$lib/components/ModelDownloadPanel.svelte';
 	import { projectConfig, projectLoaded, updateSection } from '$lib/stores/project.js';
-	import { processStatuses, processLogs, startProcess, stopProcess, fetchLogs } from '$lib/stores/processes.js';
+	import { processStatuses, processLogs, startProcess, stopProcess, preloadLogsIfActive, startLogPolling } from '$lib/stores/processes.js';
 	import { advancedMode } from '$lib/stores/uiMode.js';
 	import { onMount } from 'svelte';
 
 	onMount(() => {
-		fetchLogs('cache_latents');
-		fetchLogs('cache_text');
-		fetchLogs('cache_dino');
+		preloadLogsIfActive(['cache_latents', 'cache_text', 'cache_dino']);
+		const logInterval = startLogPolling(['cache_latents', 'cache_text', 'cache_dino'], 1000);
+		return () => clearInterval(logInterval);
 	});
 
 	function updateCaching(key, value) { updateSection('caching', key, value); }
@@ -104,9 +104,9 @@
 
 					<FormGroup title="Precache I2V Latents">
 						<div class="space-y-2 pt-2">
-							<FormToggle label="Precache Sample Latents" checked={caching.precache_sample_latents ?? false} onchange={(e) => updateCaching('precache_sample_latents', e.target.checked)} tooltip="Pre-encode I2V conditioning latents from the sample prompts file." />
+							<FormToggle label="Precache Sample Latents" checked={caching.precache_sample_latents ?? false} onchange={(e) => updateCaching('precache_sample_latents', e.target.checked)} tooltip="Pre-encode I2V conditioning latents from prompts defined on the Samples page." />
 							{#if caching.precache_sample_latents}
-								<PathInput label="Prompts File" value={caching.sample_prompts || ''} oninput={(e) => updateCaching('sample_prompts', e.target.value)} showFiles tooltip="Prompt file used for sample-latent precaching." />
+								<PathInput label="External Prompts File" value={caching.sample_prompts || ''} oninput={(e) => updateCaching('sample_prompts', e.target.value)} showFiles tooltip="Optional override. Leave blank to use prompts defined on the Samples page." />
 								<PathInput label="Latents Cache Dir" value={caching.sample_latents_cache || ''} oninput={(e) => updateCaching('sample_latents_cache', e.target.value)} tooltip="Directory for cached sample conditioning latents." />
 							{/if}
 						</div>
@@ -169,7 +169,7 @@
 						<div class="space-y-2 pt-2">
 							<FormToggle label="Precache Sample Prompts" checked={caching.precache_sample_prompts ?? false} onchange={(e) => updateCaching('precache_sample_prompts', e.target.checked)} tooltip="Cache text embeddings for sample prompts" />
 							{#if caching.precache_sample_prompts}
-								<PathInput label="Prompts File" value={caching.sample_prompts || ''} oninput={(e) => updateCaching('sample_prompts', e.target.value)} showFiles tooltip="Text file with prompts (one per line)" />
+								<PathInput label="External Prompts File" value={caching.sample_prompts || ''} oninput={(e) => updateCaching('sample_prompts', e.target.value)} showFiles tooltip="Optional override. Leave blank to use prompts defined on the Samples page." />
 								<PathInput label="Cache Dir" value={caching.sample_prompts_cache || ''} oninput={(e) => updateCaching('sample_prompts_cache', e.target.value)} tooltip="Output directory for cached embeddings" />
 							{/if}
 						</div>

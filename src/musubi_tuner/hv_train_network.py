@@ -2491,13 +2491,10 @@ class NetworkTrainer:
             dit_weight_dtype = dit_dtype
         logger.info(f"DiT precision: {dit_dtype}, weight precision: {dit_weight_dtype}")
 
-        # GUI dashboard metrics writer (lazy import, no-op when --gui is not set)
+        # GUI dashboard metrics writer. Enable either via legacy --gui or the
+        # GUI process manager's environment flag.
         gui_metrics = None
-        if getattr(args, "gui", False) and accelerator.is_main_process:
-            from musubi_tuner.gui_dashboard import create_metrics_writer
-
-            gui_metrics = create_metrics_writer(args.output_dir)
-            gui_metrics.update_status(step=0, max_steps=args.max_train_steps, status="starting")
+        dashboard_metrics_enabled = getattr(args, "gui", False) or os.getenv("MUSUBI_DASHBOARD_METRICS") == "1"
 
         # get embedding for sampling images
         vae_dtype = torch.float16 if args.vae_dtype is None else model_utils.str_to_dtype(args.vae_dtype)
@@ -3037,6 +3034,10 @@ class NetworkTrainer:
             resume_metadata = train_utils.load_resume_metadata(args.resume)
 
         initial_global_step = self.resume_from_local_or_hf_if_specified(accelerator, args)
+        if dashboard_metrics_enabled and accelerator.is_main_process:
+            from musubi_tuner.gui_dashboard import create_metrics_writer
+
+            gui_metrics = create_metrics_writer(args.output_dir, reset=initial_global_step == 0)
 
         # apply optimizer/scheduler resets after resume
         if initial_global_step > 0:
@@ -3083,6 +3084,14 @@ class NetworkTrainer:
                 epoch_to_start = saved_epoch
         else:
             epoch_to_start = initial_global_step // num_update_steps_per_epoch if initial_global_step > 0 else 0
+        if gui_metrics is not None:
+            gui_metrics.update_status(
+                step=initial_global_step,
+                max_steps=args.max_train_steps,
+                epoch=epoch_to_start,
+                max_epochs=num_train_epochs,
+                status="starting",
+            )
 
         # 学習する
         # total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
@@ -4490,7 +4499,13 @@ class NetworkTrainer:
                         lr=lr_scheduler.get_last_lr()[0],
                         step_time=step_time,
                     )
-                    gui_metrics.update_status(step=global_step, status="training")
+                    gui_metrics.update_status(
+                        step=global_step,
+                        max_steps=args.max_train_steps,
+                        epoch=epoch + 1,
+                        max_epochs=num_train_epochs,
+                        status="training",
+                    )
 
                 if (
                     validation_dataloader is not None
@@ -4553,7 +4568,13 @@ class NetworkTrainer:
         metadata["ss_training_finished_at"] = str(time.time())
 
         if gui_metrics is not None:
-            gui_metrics.update_status(status="completed")
+            gui_metrics.update_status(
+                step=global_step,
+                max_steps=args.max_train_steps,
+                epoch=num_train_epochs,
+                max_epochs=num_train_epochs,
+                status="completed",
+            )
             gui_metrics.close()
 
         if is_main_process:
@@ -5184,7 +5205,7 @@ def setup_parser_common() -> argparse.ArgumentParser:
 
     # save and load settings
     parser.add_argument(
-        "--output_dir", type=str, default=None, help="directory to output trained model / 学習後のモデル出力先ディレクトリ"
+        "--output_dir", type=str, default="output", help="directory to output trained model / 学習後のモデル出力先ディレクトリ"
     )
     parser.add_argument(
         "--output_name",

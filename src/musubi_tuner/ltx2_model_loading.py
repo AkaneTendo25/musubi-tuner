@@ -601,7 +601,9 @@ def load_ltx2_model(
             m = torch.cuda.max_memory_allocated() / (1024**3)
             logger.info(f"[VRAM_TRACE_LTX2] {tag}: alloc={a:.2f}GB res={r:.2f}GB max={m:.2f}GB")
 
-    _trace_vram_ltx2("AFTER state dict loading (sd on CPU)")
+    _trace_vram_ltx2(
+        f"AFTER state dict loading (state_device={state_device}, quantize_device={_resolved_quant_device})"
+    )
     if nf4_base:
         apply_nf4_monkey_patch(base_model, sd, block_size=nf4_block_size, awq_scales=_awq_scales)
     elif fp8_scaled:

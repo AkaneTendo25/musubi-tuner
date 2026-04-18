@@ -6,8 +6,30 @@
 
 	let container;
 	let chart;
-	let smoothing = $state(0.95);
+	let pendingFrame = 0;
+	let pendingData = [];
+	let smoothing = $state(0);
 	let logScale = $state(false);
+
+	function getScrollTarget(node) {
+		let current = node?.parentElement;
+		while (current) {
+			const style = getComputedStyle(current);
+			if (/(auto|scroll)/.test(style.overflowY) && current.scrollHeight > current.clientHeight) {
+				return current;
+			}
+			current = current.parentElement;
+		}
+		return document.scrollingElement || document.documentElement;
+	}
+
+	function handleWheel(event) {
+		if (event.ctrlKey) return;
+		event.preventDefault();
+		event.stopPropagation();
+		const target = getScrollTarget(container);
+		target?.scrollBy?.({ top: event.deltaY, left: event.deltaX, behavior: 'auto' });
+	}
 
 	function ema(data, alpha) {
 		if (!data.length) return [];
@@ -49,8 +71,62 @@
 		return sampled;
 	}
 
-	function updateChart(data) {
-		if (!chart || !data.length) return;
+	function baseOption() {
+		return {
+			animation: false,
+			animationDuration: 0,
+			animationDurationUpdate: 0,
+			backgroundColor: 'transparent',
+			grid: { left: 60, right: 20, top: 40, bottom: 60 },
+			tooltip: {
+				trigger: 'axis',
+				backgroundColor: '#1f2937',
+				borderColor: '#374151',
+				textStyle: { color: '#e5e7eb', fontSize: 12 },
+				axisPointer: { type: 'cross', lineStyle: { color: '#4b5563' } }
+			},
+			legend: {
+				top: 8,
+				textStyle: { color: '#9ca3af', fontSize: 11 },
+				icon: 'roundRect',
+				itemWidth: 14,
+				itemHeight: 3
+			},
+			xAxis: {
+				type: 'value',
+				name: 'Step',
+				nameTextStyle: { color: '#6b7280' },
+				axisLine: { lineStyle: { color: '#374151' } },
+				axisLabel: { color: '#6b7280' },
+				splitLine: { lineStyle: { color: '#1f2937' } }
+			},
+			yAxis: {
+				type: 'value',
+				name: 'Loss',
+				nameTextStyle: { color: '#6b7280' },
+				axisLine: { lineStyle: { color: '#374151' } },
+				axisLabel: { color: '#6b7280' },
+				splitLine: { lineStyle: { color: '#1f2937' } }
+			},
+			dataZoom: [
+				{ type: 'inside', xAxisIndex: 0, zoomOnMouseWheel: 'ctrl', moveOnMouseWheel: false },
+				{
+					type: 'slider', xAxisIndex: 0, height: 20, bottom: 8,
+					borderColor: '#374151', fillerColor: 'rgba(59,130,246,0.1)',
+					handleStyle: { color: '#3b82f6' },
+					textStyle: { color: '#6b7280' }
+				}
+			],
+			series: []
+		};
+	}
+
+	function renderChart(data) {
+		if (!chart) return;
+		if (!data.length) {
+			chart.setOption({ series: [] }, { notMerge: false, lazyUpdate: true, replaceMerge: ['series'] });
+			return;
+		}
 
 		const steps = data.map((r) => r.step);
 		const rawLoss = data.map((r) => r.loss);
@@ -113,61 +189,40 @@
 		}
 
 		chart.setOption({
-			animation: false,
-			backgroundColor: 'transparent',
-			grid: { left: 60, right: 20, top: 40, bottom: 60 },
-			tooltip: {
-				trigger: 'axis',
-				backgroundColor: '#1f2937',
-				borderColor: '#374151',
-				textStyle: { color: '#e5e7eb', fontSize: 12 },
-				axisPointer: { type: 'cross', lineStyle: { color: '#4b5563' } }
-			},
-			legend: {
-				top: 8,
-				textStyle: { color: '#9ca3af', fontSize: 11 },
-				icon: 'roundRect',
-				itemWidth: 14,
-				itemHeight: 3
-			},
-			xAxis: {
-				type: 'value',
-				name: 'Step',
-				nameTextStyle: { color: '#6b7280' },
-				axisLine: { lineStyle: { color: '#374151' } },
-				axisLabel: { color: '#6b7280' },
-				splitLine: { lineStyle: { color: '#1f2937' } }
-			},
-			yAxis: {
-				type: logScale ? 'log' : 'value',
-				name: 'Loss',
-				nameTextStyle: { color: '#6b7280' },
-				axisLine: { lineStyle: { color: '#374151' } },
-				axisLabel: { color: '#6b7280' },
-				splitLine: { lineStyle: { color: '#1f2937' } }
-			},
-			dataZoom: [
-				{ type: 'inside', xAxisIndex: 0 },
-				{
-					type: 'slider', xAxisIndex: 0, height: 20, bottom: 8,
-					borderColor: '#374151', fillerColor: 'rgba(59,130,246,0.1)',
-					handleStyle: { color: '#3b82f6' },
-					textStyle: { color: '#6b7280' }
-				}
-			],
+			yAxis: { type: logScale ? 'log' : 'value' },
 			series
-		}, true);
+		}, { notMerge: false, lazyUpdate: true, replaceMerge: ['series'] });
+	}
+
+	function queueUpdate(data) {
+		pendingData = data;
+		if (!chart || pendingFrame) return;
+		pendingFrame = requestAnimationFrame(() => {
+			pendingFrame = 0;
+			renderChart(pendingData);
+		});
 	}
 
 	onMount(() => {
 		chart = echarts.init(container, null, { renderer: 'canvas' });
+		chart.setOption(baseOption(), { notMerge: true });
+		container?.addEventListener('wheel', handleWheel, { passive: false, capture: true });
 		const ro = new ResizeObserver(() => chart?.resize());
 		ro.observe(container);
-		return () => { ro.disconnect(); chart?.dispose(); };
+		return () => {
+			if (pendingFrame) cancelAnimationFrame(pendingFrame);
+			container?.removeEventListener('wheel', handleWheel, { capture: true });
+			ro.disconnect();
+			chart?.dispose();
+		};
 	});
 
-	$effect(() => { updateChart($lossData); });
-	$effect(() => { smoothing; logScale; updateChart($lossData); });
+	$effect(() => {
+		smoothing;
+		logScale;
+		$hasAudioLoss;
+		queueUpdate($lossData);
+	});
 </script>
 
 <div class="bg-gray-900 border border-gray-800 rounded-lg p-4">

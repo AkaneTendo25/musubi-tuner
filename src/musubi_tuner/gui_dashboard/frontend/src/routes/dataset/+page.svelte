@@ -2,11 +2,13 @@
 	import FormToggle from '$lib/components/FormToggle.svelte';
 	import DatasetEntry from '$lib/components/DatasetEntry.svelte';
 	import { projectConfig, projectLoaded, saveProjectDebounced, saveProjectNow } from '$lib/stores/project.js';
+	import { processValidation, validateProcess } from '$lib/stores/processes.js';
 	import { advancedMode } from '$lib/stores/uiMode.js';
 
 	let tomlPreview = $state('');
 	let showToml = $state(false);
 	let saving = $state(false);
+	let validationTimer = null;
 
 	function addDataset(isValidation = false) {
 		projectConfig.update((c) => {
@@ -114,6 +116,26 @@
 	let datasets = $derived($projectConfig?.dataset?.datasets || []);
 	let validationDatasets = $derived($projectConfig?.dataset?.validation_datasets || []);
 	let general = $derived($projectConfig?.dataset?.general || {});
+	let trainingValidation = $derived($processValidation.training || { errors: [], warnings: [], field_errors: {} });
+	let datasetValidationIssues = $derived(
+		[...(trainingValidation.errors || []), ...(trainingValidation.warnings || [])].filter((issue) => issue.page === 'dataset')
+	);
+
+	function datasetSourceError(index) {
+		return trainingValidation.field_errors?.[`dataset.datasets[${index}].source`]?.[0] || '';
+	}
+
+	$effect(() => {
+		if (!$projectLoaded || !$projectConfig) return;
+
+		clearTimeout(validationTimer);
+		const configSnapshot = $projectConfig;
+		validationTimer = setTimeout(() => {
+			validateProcess('training', configSnapshot).catch(() => {});
+		}, 250);
+
+		return () => clearTimeout(validationTimer);
+	});
 </script>
 
 {#if !$projectLoaded}
@@ -135,6 +157,16 @@
 			{/if}
 		</div>
 
+		{#if datasetValidationIssues.length}
+			<div class="p-3 space-y-1" style="background: {(trainingValidation.errors || []).some((issue) => issue.page === 'dataset') ? 'var(--danger-muted)' : 'var(--bg-elevated)'}; border: 1px solid {(trainingValidation.errors || []).some((issue) => issue.page === 'dataset') ? 'var(--danger)' : 'var(--border)'}; border-radius: var(--radius-sm);">
+				{#each datasetValidationIssues as issue}
+					<div class="text-[12px]" style="color: {issue.severity === 'error' ? 'var(--danger)' : 'var(--text-secondary)'};">
+						{issue.message}
+					</div>
+				{/each}
+			</div>
+		{/if}
+
 		<!-- Training Datasets -->
 		<div>
 			<div class="flex items-center justify-between mb-2">
@@ -151,6 +183,7 @@
 						{entry}
 						index={i}
 						advanced={$advancedMode}
+						sourceError={datasetSourceError(i)}
 						onRemove={() => removeDataset(i, false)}
 						onchange={(nextEntry) => updateDataset(i, nextEntry, false)}
 					/>

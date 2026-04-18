@@ -6,6 +6,10 @@ import shlex
 import sys
 from pathlib import Path
 
+from musubi_tuner.gui_dashboard.cli_defaults import (
+    get_ltx2_training_network_module_default,
+    get_ltx2_training_output_dir_default,
+)
 from musubi_tuner.gui_dashboard.project_schema import ProjectConfig
 from musubi_tuner.gui_dashboard.toml_export import (
     _write_slider_toml,
@@ -46,6 +50,37 @@ def _effective_gemma_safetensors(config: ProjectConfig, explicit: str) -> str:
     return explicit or config.default_gemma_safetensors or ""
 
 
+def _effective_output_dir(explicit: str) -> str:
+    return explicit or get_ltx2_training_output_dir_default()
+
+
+def _effective_network_module(explicit: str) -> str:
+    return explicit or get_ltx2_training_network_module_default()
+
+
+def _generated_sample_prompts_path(config: ProjectConfig) -> Path:
+    return Path(config.project_dir) / "sample_prompts.generated.txt"
+
+
+def _effective_training_sample_prompts(config: ProjectConfig) -> str:
+    training = config.training
+    if training.sample_prompts:
+        return training.sample_prompts
+    if training.sample_prompts_text.strip():
+        output_path = _generated_sample_prompts_path(config)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(training.sample_prompts_text, encoding="utf-8")
+        return str(output_path)
+    return ""
+
+
+def _effective_caching_sample_prompts(config: ProjectConfig) -> str:
+    caching = config.caching
+    if caching.sample_prompts:
+        return caching.sample_prompts
+    return _effective_training_sample_prompts(config)
+
+
 def _split_cli_args(raw: str) -> list[str]:
     if not raw:
         return []
@@ -70,9 +105,11 @@ def build_cache_latents_cmd(config: ProjectConfig) -> list[str]:
     toml_path = export_dataset_toml(config)
     c = config.caching
     ltx2_checkpoint = _effective_ltx2_checkpoint(config, c.ltx2_checkpoint)
+    sample_prompts = _effective_caching_sample_prompts(config)
 
     cmd = [
         sys.executable,
+        "-u",
         _find_script("ltx2_cache_latents.py"),
         "--dataset_config", str(toml_path),
         "--ltx2_checkpoint", ltx2_checkpoint,
@@ -119,9 +156,9 @@ def build_cache_latents_cmd(config: ProjectConfig) -> list[str]:
             cmd += ["--audio_only_sequence_resolution", str(c.audio_only_sequence_resolution)]
 
     # I2V latent precaching
-    if c.precache_sample_latents and c.sample_prompts:
+    if c.precache_sample_latents and sample_prompts:
         cmd.append("--precache_sample_latents")
-        cmd += ["--sample_prompts", c.sample_prompts]
+        cmd += ["--sample_prompts", sample_prompts]
         if c.sample_latents_cache:
             cmd += ["--sample_latents_cache", c.sample_latents_cache]
 
@@ -140,9 +177,11 @@ def build_cache_text_cmd(config: ProjectConfig) -> list[str]:
     ltx2_checkpoint = _effective_ltx2_checkpoint(config, c.ltx2_checkpoint)
     gemma_safetensors = _effective_gemma_safetensors(config, c.gemma_safetensors)
     gemma_root = _effective_gemma_root(config, c.gemma_root, gemma_safetensors)
+    sample_prompts = _effective_caching_sample_prompts(config)
 
     cmd = [
         sys.executable,
+        "-u",
         _find_script("ltx2_cache_text_encoder_outputs.py"),
         "--dataset_config", str(toml_path),
         "--ltx2_checkpoint", ltx2_checkpoint,
@@ -174,9 +213,9 @@ def build_cache_text_cmd(config: ProjectConfig) -> list[str]:
         cmd += ["--gemma_bnb_4bit_compute_dtype", c.gemma_bnb_4bit_compute_dtype]
 
     # Precaching
-    if c.precache_sample_prompts and c.sample_prompts:
+    if c.precache_sample_prompts and sample_prompts:
         cmd.append("--precache_sample_prompts")
-        cmd += ["--sample_prompts", c.sample_prompts]
+        cmd += ["--sample_prompts", sample_prompts]
         if c.sample_prompts_cache:
             cmd += ["--sample_prompts_cache", c.sample_prompts_cache]
     if c.precache_preservation_prompts:
@@ -202,6 +241,7 @@ def build_inference_cmd(config: ProjectConfig) -> list[str]:
 
     cmd = [
         sys.executable,
+        "-u",
         _find_script("ltx2_generate_video.py"),
         "--ltx2_checkpoint", s.ltx2_checkpoint,
         "--gemma_root", s.gemma_root,
@@ -271,6 +311,8 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
     ltx2_checkpoint = _effective_ltx2_checkpoint(config, t.ltx2_checkpoint)
     gemma_safetensors = _effective_gemma_safetensors(config, t.gemma_safetensors)
     gemma_root = _effective_gemma_root(config, t.gemma_root, gemma_safetensors)
+    network_module = _effective_network_module(t.network_module or "")
+    sample_prompts = _effective_training_sample_prompts(config)
     network_args_parts = _split_cli_args(t.network_args)
 
     _append_network_arg(network_args_parts, "rank_dropout", t.rank_dropout)
@@ -284,7 +326,7 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
 
     # Use accelerate launch
     cmd = [
-        sys.executable, "-m", "accelerate.commands.launch",
+        sys.executable, "-u", "-m", "accelerate.commands.launch",
         "--mixed_precision", t.mixed_precision,
         "--num_processes", "1",
         "--num_machines", "1",
@@ -352,8 +394,7 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
         cmd += ["--quantize_device", t.quantize_device]
 
     # LoRA / Network
-    if t.network_module:
-        cmd += ["--network_module", t.network_module]
+    cmd += ["--network_module", network_module]
     if t.network_dim is not None:
         cmd += ["--network_dim", str(t.network_dim)]
     if t.network_alpha != 1:
@@ -533,8 +574,8 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
         cmd += ["--sample_every_n_steps", str(t.sample_every_n_steps)]
     if t.sample_every_n_epochs:
         cmd += ["--sample_every_n_epochs", str(t.sample_every_n_epochs)]
-    if t.sample_prompts:
-        cmd += ["--sample_prompts", t.sample_prompts]
+    if sample_prompts:
+        cmd += ["--sample_prompts", sample_prompts]
     if t.use_precached_sample_prompts:
         cmd.append("--use_precached_sample_prompts")
     if t.sample_prompts_cache:
@@ -594,8 +635,7 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
         cmd += ["--validate_every_n_epochs", str(t.validate_every_n_epochs)]
 
     # Output
-    if t.output_dir:
-        cmd += ["--output_dir", t.output_dir]
+    cmd += ["--output_dir", _effective_output_dir(t.output_dir)]
     if t.output_name:
         cmd += ["--output_name", t.output_name]
     if t.save_every_n_epochs:
@@ -925,9 +965,6 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
         cmd.append("--persistent_data_loader_workers")
     cmd += ["--ltx2_first_frame_conditioning_p", str(t.ltx2_first_frame_conditioning_p)]
 
-    # GUI dashboard
-    cmd.append("--gui")
-
     return cmd
 
 
@@ -946,7 +983,7 @@ def build_slider_training_cmd(config: ProjectConfig) -> list[str]:
     gemma_root = _effective_gemma_root(config, t.gemma_root, gemma_safetensors)
 
     cmd = [
-        sys.executable, "-m", "accelerate.commands.launch",
+        sys.executable, "-u", "-m", "accelerate.commands.launch",
         "--mixed_precision", t.mixed_precision,
         "--num_processes", "1",
         "--num_machines", "1",
@@ -1006,8 +1043,7 @@ def build_slider_training_cmd(config: ProjectConfig) -> list[str]:
         cmd.append("--gradient_checkpointing")
 
     # Output — dir from training, name from slider
-    if t.output_dir:
-        cmd += ["--output_dir", t.output_dir]
+    cmd += ["--output_dir", _effective_output_dir(t.output_dir)]
     if s.output_name:
         cmd += ["--output_name", s.output_name]
     if t.save_every_n_steps:
@@ -1024,6 +1060,7 @@ def build_cache_dino_cmd(config: ProjectConfig) -> list[str]:
 
     cmd = [
         sys.executable,
+        "-u",
         _find_script("ltx2_cache_dino_features.py"),
         "--dataset_config", str(toml_path),
         "--dino_model", t.crepa_dino_model,  # Use training model setting, not caching

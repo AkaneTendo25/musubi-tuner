@@ -4,6 +4,7 @@ import argparse
 import copy
 import gc
 import logging
+import locale
 import os
 import subprocess
 import sys
@@ -34,6 +35,19 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_SAMPLE_PROMPTS_CACHE = "ltx2_sample_prompts_cache.pt"
 DEFAULT_SAMPLE_LATENTS_CACHE = "ltx2_sample_latents_cache.pt"
+
+
+def _decode_subprocess_output(data: bytes | None) -> str:
+    if not data:
+        return ""
+    for encoding in ("utf-8", locale.getpreferredencoding(False), "cp1251", "cp866"):
+        if not encoding:
+            continue
+        try:
+            return data.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return data.decode("utf-8", errors="replace")
 
 
 def infer_ic_lora_strategy_from_preset(lora_target_preset: Optional[str]) -> str:
@@ -177,12 +191,15 @@ class LTX2SamplingMixin:
                 "--dtype",
                 "fp32",
             ]
-            result = subprocess.run(cmd, capture_output=True, text=True)
+            env = os.environ.copy()
+            env.setdefault("PYTHONIOENCODING", "utf-8")
+            env.setdefault("PYTHONUTF8", "1")
+            result = subprocess.run(cmd, capture_output=True, env=env)
             if result.returncode != 0:
                 logger.warning(
                     "Audio preview subprocess failed (code=%s): %s",
                     result.returncode,
-                    (result.stderr or result.stdout).strip(),
+                    (_decode_subprocess_output(result.stderr) or _decode_subprocess_output(result.stdout)).strip(),
                 )
         finally:
             try:

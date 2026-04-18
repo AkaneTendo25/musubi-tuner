@@ -7,10 +7,22 @@ import platform
 import shutil
 import subprocess
 import sys
+import locale
 
 from fastapi import APIRouter
 
 router = APIRouter(prefix="/api/system", tags=["system"])
+
+
+def _decode_subprocess_output(data: bytes) -> str:
+    for encoding in ("utf-8", locale.getpreferredencoding(False), "cp1251", "cp866"):
+        if not encoding:
+            continue
+        try:
+            return data.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return data.decode("utf-8", errors="replace")
 
 
 @router.get("/info")
@@ -80,12 +92,12 @@ def _get_gpu_info() -> list[dict]:
                 "--format=csv,noheader,nounits",
             ],
             capture_output=True,
-            text=True,
             timeout=5,
         )
         if result.returncode == 0:
+            stdout = _decode_subprocess_output(result.stdout or b"")
             gpus = []
-            for line in result.stdout.strip().split("\n"):
+            for line in stdout.strip().splitlines():
                 parts = [p.strip() for p in line.split(",")]
                 if len(parts) >= 6:
                     gpus.append(

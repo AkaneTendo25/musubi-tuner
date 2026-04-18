@@ -5,12 +5,34 @@
 
 	let container;
 	let chart;
+	let pendingFrame = 0;
+	let pendingData = [];
 
-	function updateChart(data) {
-		if (!chart || !data.length) return;
+	function getScrollTarget(node) {
+		let current = node?.parentElement;
+		while (current) {
+			const style = getComputedStyle(current);
+			if (/(auto|scroll)/.test(style.overflowY) && current.scrollHeight > current.clientHeight) {
+				return current;
+			}
+			current = current.parentElement;
+		}
+		return document.scrollingElement || document.documentElement;
+	}
 
-		chart.setOption({
+	function handleWheel(event) {
+		if (event.ctrlKey) return;
+		event.preventDefault();
+		event.stopPropagation();
+		const target = getScrollTarget(container);
+		target?.scrollBy?.({ top: event.deltaY, left: event.deltaX, behavior: 'auto' });
+	}
+
+	function baseOption() {
+		return {
 			animation: false,
+			animationDuration: 0,
+			animationDurationUpdate: 0,
 			backgroundColor: 'transparent',
 			grid: { left: 70, right: 20, top: 30, bottom: 50 },
 			tooltip: {
@@ -42,7 +64,19 @@
 				},
 				splitLine: { lineStyle: { color: '#1f2937' } }
 			},
-			dataZoom: [{ type: 'inside', xAxisIndex: 0 }],
+			dataZoom: [{ type: 'inside', xAxisIndex: 0, zoomOnMouseWheel: 'ctrl', moveOnMouseWheel: false }],
+			series: []
+		};
+	}
+
+	function renderChart(data) {
+		if (!chart) return;
+		if (!data.length) {
+			chart.setOption({ series: [] }, { notMerge: false, lazyUpdate: true, replaceMerge: ['series'] });
+			return;
+		}
+
+		chart.setOption({
 			series: [
 				{
 					type: 'line',
@@ -52,17 +86,33 @@
 					color: '#14b8a6'
 				}
 			]
-		}, true);
+		}, { notMerge: false, lazyUpdate: true, replaceMerge: ['series'] });
+	}
+
+	function queueUpdate(data) {
+		pendingData = data;
+		if (!chart || pendingFrame) return;
+		pendingFrame = requestAnimationFrame(() => {
+			pendingFrame = 0;
+			renderChart(pendingData);
+		});
 	}
 
 	onMount(() => {
 		chart = echarts.init(container, null, { renderer: 'canvas' });
+		chart.setOption(baseOption(), { notMerge: true });
+		container?.addEventListener('wheel', handleWheel, { passive: false, capture: true });
 		const ro = new ResizeObserver(() => chart?.resize());
 		ro.observe(container);
-		return () => { ro.disconnect(); chart?.dispose(); };
+		return () => {
+			if (pendingFrame) cancelAnimationFrame(pendingFrame);
+			container?.removeEventListener('wheel', handleWheel, { capture: true });
+			ro.disconnect();
+			chart?.dispose();
+		};
 	});
 
-	$effect(() => { updateChart($lrData); });
+	$effect(() => { queueUpdate($lrData); });
 </script>
 
 <div class="bg-gray-900 border border-gray-800 rounded-lg p-4">
