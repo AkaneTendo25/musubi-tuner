@@ -1,1 +1,0 @@
-import{j as s,w as d}from"./BnUfL1-W.js";const t=["basic","advanced"],o=typeof localStorage<"u"?localStorage.getItem("uiMode"):null,i=o&&t.includes(o)?o:"basic",a=d(i),n=s(a,e=>e==="advanced");a.subscribe(e=>{typeof localStorage<"u"&&localStorage.setItem("uiMode",e)});function l(e){t.includes(e)&&a.set(e)}export{n as a,l as s,a as u};

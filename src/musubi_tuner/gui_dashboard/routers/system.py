@@ -88,7 +88,7 @@ def _get_gpu_info() -> list[dict]:
         result = subprocess.run(
             [
                 "nvidia-smi",
-                "--query-gpu=name,memory.total,memory.used,memory.free,temperature.gpu,utilization.gpu",
+                "--query-gpu=name,memory.total,memory.used,memory.free,temperature.gpu,fan.speed,utilization.gpu,power.draw,clocks.current.graphics",
                 "--format=csv,noheader,nounits",
             ],
             capture_output=True,
@@ -99,7 +99,7 @@ def _get_gpu_info() -> list[dict]:
             gpus = []
             for line in stdout.strip().splitlines():
                 parts = [p.strip() for p in line.split(",")]
-                if len(parts) >= 6:
+                if len(parts) >= 9:
                     gpus.append(
                         {
                             "name": parts[0],
@@ -107,7 +107,10 @@ def _get_gpu_info() -> list[dict]:
                             "vram_used_mb": int(parts[2]),
                             "vram_free_mb": int(parts[3]),
                             "temperature": int(parts[4]) if parts[4] not in ("N/A", "[N/A]") else None,
-                            "utilization": int(parts[5]) if parts[5] not in ("N/A", "[N/A]") else None,
+                            "fan_speed_percent": int(parts[5]) if parts[5] not in ("N/A", "[N/A]") else None,
+                            "utilization": int(parts[6]) if parts[6] not in ("N/A", "[N/A]") else None,
+                            "power_draw_w": float(parts[7]) if parts[7] not in ("N/A", "[N/A]") else None,
+                            "graphics_clock_mhz": int(float(parts[8])) if parts[8] not in ("N/A", "[N/A]") else None,
                         }
                     )
             return gpus
