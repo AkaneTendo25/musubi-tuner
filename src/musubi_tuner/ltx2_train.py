@@ -381,6 +381,154 @@ def _normalize_ltx2_batch_for_call_dit(batch: dict) -> dict:
     return normalized
 
 
+def _get_ltx2_batch_tensor(
+    batch: dict,
+    key: str,
+    *,
+    nested_key: str = "latents",
+) -> Optional[torch.Tensor]:
+    value = batch.get(key)
+    if isinstance(value, dict):
+        value = value.get(nested_key)
+    return value if isinstance(value, torch.Tensor) else None
+
+
+def _validate_full_ft_ic_batch(
+    args: argparse.Namespace,
+    batch: dict,
+    *,
+    split_name: str,
+    batch_index: int,
+) -> None:
+    ic_lora_strategy = str(getattr(args, "ic_lora_strategy", "none") or "none").lower()
+    if ic_lora_strategy in {"none", "auto"}:
+        return
+
+    batch = _normalize_ltx2_batch_for_call_dit(batch)
+    latents = _get_ltx2_batch_tensor(batch, "latents")
+    if latents is None:
+        raise ValueError(f"{split_name} batch {batch_index} is missing latents")
+
+    ltx_mode = str(getattr(args, "ltx_mode", "video") or "video").lower()
+    ref_latents = _get_ltx2_batch_tensor(batch, "ref_latents")
+    audio_latents = _get_ltx2_batch_tensor(batch, "audio_latents")
+    ref_audio_latents = _get_ltx2_batch_tensor(batch, "ref_audio_latents")
+
+    if ic_lora_strategy == "v2v":
+        if ltx_mode != "video":
+            raise ValueError("--ic_lora_strategy v2v requires --ltx_mode=video")
+        if ref_latents is None:
+            raise ValueError(
+                f"{split_name} batch {batch_index} is missing ref_latents required for --ic_lora_strategy v2v. "
+                "Set reference_directory/reference_cache_directory and cache reference latents."
+            )
+        if ref_latents.dim() != 5:
+            raise ValueError(
+                f"{split_name} batch {batch_index} ref_latents must be 5D [B, C, F, H, W], got {tuple(ref_latents.shape)}"
+            )
+        if ref_latents.shape[0] != latents.shape[0]:
+            raise ValueError(
+                f"{split_name} batch {batch_index} latents/ref_latents batch mismatch: "
+                f"{latents.shape[0]} vs {ref_latents.shape[0]}"
+            )
+        if ref_latents.shape[1] != latents.shape[1]:
+            raise ValueError(
+                f"{split_name} batch {batch_index} latents/ref_latents channel mismatch: "
+                f"{latents.shape[1]} vs {ref_latents.shape[1]}"
+            )
+        ref_h, ref_w = int(ref_latents.shape[3]), int(ref_latents.shape[4])
+        tgt_h, tgt_w = int(latents.shape[3]), int(latents.shape[4])
+        if ref_h != tgt_h or ref_w != tgt_w:
+            h_ratio = tgt_h / ref_h
+            w_ratio = tgt_w / ref_w
+            if abs(h_ratio - w_ratio) > 0.01 or abs(h_ratio - round(h_ratio)) > 0.01:
+                raise ValueError(
+                    f"{split_name} batch {batch_index} has invalid V2V spatial mismatch: "
+                    f"latents={tgt_h}x{tgt_w}, ref_latents={ref_h}x{ref_w}, "
+                    f"h_ratio={h_ratio:.2f}, w_ratio={w_ratio:.2f}"
+                )
+        return
+
+    if ic_lora_strategy == "audio_ref_only_ic":
+        if ltx_mode not in {"av", "audio"}:
+            raise ValueError("--ic_lora_strategy audio_ref_only_ic requires --ltx_mode=av or audio")
+        if audio_latents is None:
+            raise ValueError(
+                f"{split_name} batch {batch_index} is missing audio_latents required for --ic_lora_strategy audio_ref_only_ic."
+            )
+        if ref_audio_latents is None:
+            raise ValueError(
+                f"{split_name} batch {batch_index} is missing ref_audio_latents required for --ic_lora_strategy audio_ref_only_ic. "
+                "Set reference_audio_directory/reference_audio_cache_directory and cache reference audio latents."
+            )
+        return
+
+    if ic_lora_strategy == "av_ic":
+        if ltx_mode != "av":
+            raise ValueError("--ic_lora_strategy av_ic requires --ltx_mode=av")
+        if ref_latents is None:
+            raise ValueError(
+                f"{split_name} batch {batch_index} is missing ref_latents required for --ic_lora_strategy av_ic."
+            )
+        if ref_latents.dim() != 5:
+            raise ValueError(
+                f"{split_name} batch {batch_index} ref_latents must be 5D [B, C, F, H, W], got {tuple(ref_latents.shape)}"
+            )
+        if ref_latents.shape[0] != latents.shape[0]:
+            raise ValueError(
+                f"{split_name} batch {batch_index} latents/ref_latents batch mismatch: "
+                f"{latents.shape[0]} vs {ref_latents.shape[0]}"
+            )
+        if ref_latents.shape[1] != latents.shape[1]:
+            raise ValueError(
+                f"{split_name} batch {batch_index} latents/ref_latents channel mismatch: "
+                f"{latents.shape[1]} vs {ref_latents.shape[1]}"
+            )
+        ref_h, ref_w = int(ref_latents.shape[3]), int(ref_latents.shape[4])
+        tgt_h, tgt_w = int(latents.shape[3]), int(latents.shape[4])
+        if ref_h != tgt_h or ref_w != tgt_w:
+            raise ValueError(
+                f"{split_name} batch {batch_index} av_ic requires same spatial resolution for ref and target video. "
+                f"Got ref={ref_h}x{ref_w}, target={tgt_h}x{tgt_w}."
+            )
+        if audio_latents is None:
+            raise ValueError(
+                f"{split_name} batch {batch_index} is missing audio_latents required for --ic_lora_strategy av_ic."
+            )
+        if ref_audio_latents is None:
+            raise ValueError(
+                f"{split_name} batch {batch_index} is missing ref_audio_latents required for --ic_lora_strategy av_ic."
+            )
+
+
+def _run_full_ft_ic_preflight(
+    args: argparse.Namespace,
+    dataset_group,
+    *,
+    split_name: str,
+    max_batches: int = 8,
+) -> None:
+    ic_lora_strategy = str(getattr(args, "ic_lora_strategy", "none") or "none").lower()
+    if ic_lora_strategy in {"none", "auto"} or dataset_group is None:
+        return
+
+    num_batches = min(len(dataset_group), max_batches)
+    for batch_index in range(num_batches):
+        try:
+            batch = dataset_group[batch_index]
+        except Exception as exc:
+            raise ValueError(
+                f"{split_name} IC preflight failed while loading batch {batch_index} for "
+                f"--ic_lora_strategy {ic_lora_strategy}: {exc}"
+            ) from exc
+        _validate_full_ft_ic_batch(
+            args,
+            batch,
+            split_name=split_name,
+            batch_index=batch_index,
+        )
+
+
 def _clone_to_cpu(value: Any) -> Any:
     if isinstance(value, torch.Tensor):
         return value.detach().cpu().clone()
@@ -2732,6 +2880,7 @@ def main() -> None:
 
     # Validation dataset (optional)
     val_dataloader = None
+    val_dataset_group = None
     if args.validation_dataset_config is not None:
         logger.info("Loading validation dataset from: %s", args.validation_dataset_config)
         val_user_config = config_utils.load_user_config(args.validation_dataset_config)
@@ -2755,6 +2904,10 @@ def main() -> None:
             logger.info("Validation dataset loaded with %d items", val_dataset_group.num_train_items)
         else:
             logger.warning("Validation dataset has no items, validation disabled")
+
+    _run_full_ft_ic_preflight(args, train_dataset_group, split_name="train")
+    if val_dataset_group is not None:
+        _run_full_ft_ic_preflight(args, val_dataset_group, split_name="validation")
 
     if args.max_train_epochs is not None:
         args.max_train_steps = args.max_train_epochs * math.ceil(
@@ -3197,6 +3350,10 @@ def main() -> None:
         "ss_full_ft_lr_group_scales": ft_group_stats.get("lr_scales"),
         "ss_full_ft_frozen_blocks_applied": ft_group_stats.get("frozen_blocks"),    }
 
+    checkpoint_extra_metadata = {k: str(v) for k, v in trainer.get_checkpoint_metadata(args).items()}
+    if checkpoint_extra_metadata:
+        metadata.update(checkpoint_extra_metadata)
+
     datasets_metadata = []
     for dataset in train_dataset_group.datasets:
         datasets_metadata.append(dataset.get_metadata())
@@ -3297,6 +3454,9 @@ def main() -> None:
             custom_arch=args.metadata_arch,
         )
         metadata_to_save.update(sai_metadata)
+
+        if checkpoint_extra_metadata:
+            metadata_to_save.update(checkpoint_extra_metadata)
 
         save_model_ref = getattr(unwrapped_model, "_orig_mod", None) or unwrapped_model
         # Build a zero-copy dict referencing live parameters (avoids state_dict() VRAM duplication)
