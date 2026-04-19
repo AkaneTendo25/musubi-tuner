@@ -639,8 +639,14 @@ def encode_and_save_reference_latents(
             getattr(ds, "reference_directory", None) or getattr(ds, "control_directory", None),
             getattr(ds, "reference_directories", None),
         )
-        ref_dir_source = "reference_directory"
-        if not ref_dirs and getattr(ds, "control_directory", None) is not None:
+        has_reference_dirs = getattr(ds, "reference_directory", None) is not None
+        has_reference_dir_list = getattr(ds, "reference_directories", None) is not None
+        has_control_dir = getattr(ds, "control_directory", None) is not None
+        if has_reference_dirs or has_reference_dir_list:
+            ref_dir_source = "reference_directory"
+        elif has_control_dir:
+            ref_dir_source = "control_directory"
+        else:
             ref_dir_source = "control_directory"
         if not ref_dirs:
             logger.info(f"[Dataset {ds_idx}] No reference/control directory set, skipping reference caching")

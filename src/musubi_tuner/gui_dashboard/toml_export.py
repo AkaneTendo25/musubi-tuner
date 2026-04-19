@@ -146,7 +146,11 @@ def _dataset_entry_to_dict(entry) -> dict:
             else:
                 d["reference_directories"] = reference_directories
         else:
-            d["control_directory"] = reference_directories[0]
+            if len(reference_directories) == 1:
+                d["control_directory"] = reference_directories[0]
+            else:
+                d["control_directory"] = reference_directories[0]
+                d["extra_control_directories"] = ", ".join(reference_directories[1:])
 
     reference_audio_directories = _merge_path_values(
         [entry.reference_audio_directory] if getattr(entry, "reference_audio_directory", "") else [],
@@ -221,6 +225,16 @@ def _write_slider_toml(config: ProjectConfig, output_path: Path) -> Path:
         "mode": s.mode,
         "guidance_strength": s.guidance_strength,
     }
+    if s.reference_modality:
+        doc["reference_modality"] = s.reference_modality
+    if s.pos_cache_dir:
+        doc["pos_cache_dir"] = s.pos_cache_dir
+    if s.neg_cache_dir:
+        doc["neg_cache_dir"] = s.neg_cache_dir
+    if s.text_cache_dir:
+        doc["text_cache_dir"] = s.text_cache_dir
+    if s.reference_cache_dir:
+        doc["reference_cache_dir"] = s.reference_cache_dir
 
     # Parse sample_slider_range
     try:
@@ -236,14 +250,15 @@ def _write_slider_toml(config: ProjectConfig, output_path: Path) -> Path:
         lines.append(f"{k} = {_toml_value(v)}")
     lines.append("")
 
-    for target in s.targets:
-        lines.append("[[targets]]")
-        lines.append(f'positive = "{target.positive}"')
-        lines.append(f'negative = "{target.negative}"')
-        if target.target_class:
-            lines.append(f'target_class = "{target.target_class}"')
-        lines.append(f"weight = {target.weight}")
-        lines.append("")
+    if s.mode == "text":
+        for target in s.targets:
+            lines.append("[[targets]]")
+            lines.append(f'positive = "{target.positive}"')
+            lines.append(f'negative = "{target.negative}"')
+            if target.target_class:
+                lines.append(f'target_class = "{target.target_class}"')
+            lines.append(f"weight = {target.weight}")
+            lines.append("")
 
     output_path.write_text("\n".join(lines), encoding="utf-8")
     return output_path

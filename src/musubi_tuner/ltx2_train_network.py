@@ -2013,7 +2013,7 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                 ic_lora_strategy,
             )
             args.audio_ref_mask_reference_from_text_attention = False
-        if ic_lora_strategy != "av_ic":
+        if ic_lora_strategy not in {"av_ic", "video_ref_only_av"}:
             if args.av_cross_attention_mode != "both":
                 logger.warning(
                     "av_cross_attention_mode=%s is set but --ic_lora_strategy is '%s'; the option will be ignored.",
@@ -3669,6 +3669,33 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             target_audio_pos = audio_patchifier.get_patch_grid_bounds(tgt_audio_shape, device=accelerator.device).to(dtype=network_dtype)
 
             video_ctx, audio_ctx = _split_av_context(base_model, text_embeds)
+            av_cross_attention_mode = _normalize_av_cross_attention_mode(
+                getattr(args, "av_cross_attention_mode", "both")
+            )
+            av_audio_to_video_enabled = av_cross_attention_mode in {"both", "a2v_only"}
+            av_video_to_audio_enabled = av_cross_attention_mode in {"both", "v2a_only"}
+            total_video_seq = ref_video_seq_len + tgt_video_seq_len
+            total_audio_seq = tgt_audio_seq_len
+            mask_dtype = network_dtype if network_dtype in (torch.float16, torch.float32, torch.float64, torch.bfloat16) else torch.float32
+            neg_inf = torch.finfo(mask_dtype).min
+
+            a2v_cross_attention_mask = None
+            if not av_audio_to_video_enabled:
+                a2v_cross_attention_mask = torch.full(
+                    (bsz, total_video_seq, total_audio_seq),
+                    neg_inf,
+                    device=accelerator.device,
+                    dtype=mask_dtype,
+                )
+
+            v2a_cross_attention_mask = None
+            if not av_video_to_audio_enabled:
+                v2a_cross_attention_mask = torch.full(
+                    (bsz, total_audio_seq, total_video_seq),
+                    neg_inf,
+                    device=accelerator.device,
+                    dtype=mask_dtype,
+                )
 
             video_modality = Modality(
                 enabled=True,
@@ -3678,6 +3705,7 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                 context=video_ctx,
                 sigma=sigma,
                 context_mask=text_mask,
+                a2v_cross_attention_mask=a2v_cross_attention_mask,
             )
             audio_modality = Modality(
                 enabled=True,
@@ -3687,7 +3715,7 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                 context=audio_ctx,
                 sigma=audio_sigma,
                 context_mask=text_mask,
-                v2a_cross_attention_mask=v2a_mask,
+                v2a_cross_attention_mask=v2a_cross_attention_mask,
             )
 
             perturbations = BatchedPerturbationConfig.empty(bsz)
