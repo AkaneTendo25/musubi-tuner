@@ -1003,6 +1003,13 @@ def build_slider_training_cmd(config: ProjectConfig) -> list[str]:
         cmd += ["--gemma_root", gemma_root]
     if gemma_safetensors:
         cmd += ["--gemma_safetensors", gemma_safetensors]
+    if t.ltx2_mode:
+        cmd += ["--ltx2_mode", t.ltx2_mode]
+    if s.mode == "ic_reference":
+        cmd += ["--lora_target_preset", "v2v"]
+        cmd += ["--ic_lora_strategy", "v2v"]
+    elif t.lora_target_preset:
+        cmd += ["--lora_target_preset", t.lora_target_preset]
     if t.fp8_base:
         cmd.append("--fp8_base")
     if t.fp8_scaled:

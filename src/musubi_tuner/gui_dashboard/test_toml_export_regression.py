@@ -6,7 +6,7 @@ import toml
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from musubi_tuner.gui_dashboard import toml_export
-from musubi_tuner.gui_dashboard.command_builder import build_training_cmd
+from musubi_tuner.gui_dashboard.command_builder import build_slider_training_cmd, build_training_cmd
 from musubi_tuner.gui_dashboard.project_schema import ProjectConfig
 
 
@@ -151,6 +151,29 @@ def test_dataset_toml_export_splits_extra_reference_dirs(tmp_path):
     assert doc["datasets"][0]["reference_directories"] == [WINDOWS_REF_DIR, WINDOWS_REF_DIR_2]
 
 
+def test_dataset_toml_export_splits_extra_control_dirs_without_reference_cache(tmp_path):
+    config = ProjectConfig(
+        name="Extra Control Dirs",
+        project_dir=str(tmp_path),
+        dataset={
+            "datasets": [
+                {
+                    "type": "video",
+                    "directory": WINDOWS_VIDEO_DIR,
+                    "cache_directory": WINDOWS_CACHE_DIR,
+                    "control_directory": WINDOWS_REF_DIR,
+                    "extra_control_directories": f"{WINDOWS_REF_DIR_2}; {WINDOWS_REF_CACHE_DIR_2}",
+                }
+            ]
+        },
+    )
+
+    doc = toml_export.build_dataset_toml_document(config)
+
+    assert doc["datasets"][0]["control_directory"] == WINDOWS_REF_DIR
+    assert doc["datasets"][0]["extra_control_directories"] == f"{WINDOWS_REF_DIR_2}, {WINDOWS_REF_CACHE_DIR_2}"
+
+
 def test_training_command_builder_includes_av_ic_modifier_args(tmp_path):
     config = ProjectConfig(
         name="AV IC Training Cmd",
@@ -210,3 +233,59 @@ def test_training_command_builder_omits_default_av_ic_modifier_args(tmp_path):
 
     assert "--av_cross_attention_mode" not in cmd
     assert "--av_multi_ref" not in cmd
+
+
+def test_slider_toml_export_writes_reference_slider_fields(tmp_path):
+    config = ProjectConfig(
+        name="Slider IC Export",
+        project_dir=str(tmp_path),
+        slider={
+            "mode": "ic_reference",
+            "reference_modality": "video",
+            "pos_cache_dir": r"E:\slider\pos",
+            "neg_cache_dir": r"E:\slider\neg",
+            "text_cache_dir": r"E:\slider\text",
+            "reference_cache_dir": r"E:\slider\ref",
+            "sample_slider_range": "-3,-1,0,1,3",
+        },
+    )
+
+    output_path = toml_export._write_slider_toml(config, toml_export.build_slider_toml_path(config))
+    parsed = toml.load(output_path)
+
+    assert parsed["mode"] == "ic_reference"
+    assert parsed["reference_modality"] == "video"
+    assert parsed["pos_cache_dir"] == r"E:\slider\pos"
+    assert parsed["neg_cache_dir"] == r"E:\slider\neg"
+    assert parsed["text_cache_dir"] == r"E:\slider\text"
+    assert parsed["reference_cache_dir"] == r"E:\slider\ref"
+    assert parsed["sample_slider_range"] == [-3.0, -1.0, 0.0, 1.0, 3.0]
+    assert "targets" not in parsed
+
+
+def test_slider_command_builder_includes_mode_relevant_training_args(tmp_path):
+    config = ProjectConfig(
+        name="Slider Cmd",
+        project_dir=str(tmp_path),
+        training={
+            "ltx2_checkpoint": str(tmp_path / "ltx2.safetensors"),
+            "gemma_root": str(tmp_path / "gemma"),
+            "mixed_precision": "bf16",
+            "ltx2_mode": "video",
+            "lora_target_preset": "v2v",
+        },
+        slider={
+            "mode": "ic_reference",
+            "pos_cache_dir": str(tmp_path / "pos"),
+            "neg_cache_dir": str(tmp_path / "neg"),
+            "text_cache_dir": str(tmp_path / "text"),
+            "reference_cache_dir": str(tmp_path / "ref"),
+        },
+    )
+
+    cmd = build_slider_training_cmd(config)
+
+    assert "--ltx2_mode" in cmd
+    assert cmd[cmd.index("--ltx2_mode") + 1] == "video"
+    assert "--lora_target_preset" in cmd
+    assert cmd[cmd.index("--lora_target_preset") + 1] == "v2v"

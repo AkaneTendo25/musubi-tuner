@@ -564,7 +564,7 @@
 					</div>
 					<div>
 						<div class="text-[13px] font-semibold" style="color: var(--text-primary);">Slider LoRA</div>
-						<div class="text-[11px]" style="color: var(--text-muted);">Train controllable attribute sliders with prompt pairs</div>
+						<div class="text-[11px]" style="color: var(--text-muted);">Train controllable sliders from prompt pairs, paired caches, or IC-aware v2v pairs</div>
 					</div>
 				</div>
 			</div>
@@ -572,7 +572,7 @@
 			<!-- Config -->
 			<div class="p-5 space-y-4">
 				<p class="text-[11px] leading-relaxed" style="color: var(--text-muted);">
-					Model, LoRA, optimizer, memory, and output settings are inherited from the Training tab. Only slider-specific settings are shown here.
+					Model, LoRA, optimizer, memory, and output settings are inherited from the Training tab. Slider-specific cache paths and mode selection live here.
 				</p>
 
 				<div class="grid grid-cols-1 xl:grid-cols-2 gap-4">
@@ -580,16 +580,49 @@
 					<div class="space-y-3">
 						<FormGroup title="Slider Settings">
 							<div class="space-y-2 pt-2">
+								<FormSelect
+									label="Mode"
+									value={$projectConfig?.slider?.mode || 'text'}
+									options={[
+										{ value: 'text', label: 'text' },
+										{ value: 'reference', label: 'reference' },
+										{ value: 'ic_reference', label: 'ic_reference (v2v)' }
+									]}
+									onchange={(e) => update('mode', e.target.value)}
+									tooltip="Slider training mode. ic_reference currently reuses the v2v IC-LoRA path."
+								/>
 								<div class="grid grid-cols-2 gap-2">
 									<FormField label="Steps" type="number" value={$projectConfig?.slider?.max_train_steps ?? 500} oninput={(e) => update('max_train_steps', Number(e.target.value))} min={1} tooltip="Slider training steps (typically less than full training)" />
 									<FormField label="Output Name" value={$projectConfig?.slider?.output_name || 'ltx2_slider'} oninput={(e) => update('output_name', e.target.value)} tooltip="Output filename prefix for slider LoRA" />
 								</div>
-								<FormField label="Guidance Strength" type="number" value={$projectConfig?.slider?.guidance_strength ?? 1.0} oninput={(e) => update('guidance_strength', Number(e.target.value))} step="0.1" min={0} tooltip="Guidance strength for text-mode training" />
-								<div class="grid grid-cols-3 gap-2">
-									<FormField label="Frames" type="number" value={$projectConfig?.slider?.latent_frames ?? 1} oninput={(e) => update('latent_frames', Number(e.target.value))} min={1} tooltip="Latent frames (1=image, >1=video)" />
-									<FormField label="Height" type="number" value={$projectConfig?.slider?.latent_height ?? 512} oninput={(e) => update('latent_height', Number(e.target.value))} min={64} step={64} tooltip="Synthetic latent height" />
-									<FormField label="Width" type="number" value={$projectConfig?.slider?.latent_width ?? 768} oninput={(e) => update('latent_width', Number(e.target.value))} min={64} step={64} tooltip="Synthetic latent width" />
-								</div>
+								{#if ($projectConfig?.slider?.mode || 'text') === 'text'}
+									<FormField label="Guidance Strength" type="number" value={$projectConfig?.slider?.guidance_strength ?? 1.0} oninput={(e) => update('guidance_strength', Number(e.target.value))} step="0.1" min={0} tooltip="Guidance strength for text-mode training" />
+									<div class="grid grid-cols-3 gap-2">
+										<FormField label="Frames" type="number" value={$projectConfig?.slider?.latent_frames ?? 1} oninput={(e) => update('latent_frames', Number(e.target.value))} min={1} tooltip="Latent frames (1=image, >1=video)" />
+										<FormField label="Height" type="number" value={$projectConfig?.slider?.latent_height ?? 512} oninput={(e) => update('latent_height', Number(e.target.value))} min={64} step={64} tooltip="Synthetic latent height" />
+										<FormField label="Width" type="number" value={$projectConfig?.slider?.latent_width ?? 768} oninput={(e) => update('latent_width', Number(e.target.value))} min={64} step={64} tooltip="Synthetic latent width" />
+									</div>
+								{:else}
+									<div class="grid grid-cols-2 gap-2">
+										<PathInput label="Positive Cache Dir" value={$projectConfig?.slider?.pos_cache_dir || ''} oninput={(e) => update('pos_cache_dir', e.target.value)} showFiles tooltip="Directory with positive latent caches" />
+										<PathInput label="Negative Cache Dir" value={$projectConfig?.slider?.neg_cache_dir || ''} oninput={(e) => update('neg_cache_dir', e.target.value)} showFiles tooltip="Directory with negative latent caches" />
+									</div>
+									<div class="grid grid-cols-2 gap-2">
+										<PathInput label="Text Cache Dir" value={$projectConfig?.slider?.text_cache_dir || ''} oninput={(e) => update('text_cache_dir', e.target.value)} showFiles tooltip="Directory with matching text embedding caches" />
+										{#if ($projectConfig?.slider?.mode || 'text') === 'reference'}
+											<FormSelect label="Reference Modality" value={$projectConfig?.slider?.reference_modality || 'video'} options={['video', 'audio']} onchange={(e) => update('reference_modality', e.target.value)} tooltip="Paired slider target modality" />
+										{:else}
+											<PathInput label="IC Ref Cache Dir" value={$projectConfig?.slider?.reference_cache_dir || ''} oninput={(e) => update('reference_cache_dir', e.target.value)} showFiles tooltip="Reference latent cache directory used for the shared v2v IC context" />
+										{/if}
+									</div>
+									<p class="text-[11px] leading-relaxed" style="color: var(--text-muted);">
+										{#if ($projectConfig?.slider?.mode || 'text') === 'ic_reference'}
+											`ic_reference` currently implements a shared-reference `v2v` slider: the positive and negative targets use the same cached visual reference clip.
+										{:else}
+											Reference sliders train from paired cached examples instead of prompt targets. Use audio modality only with `--ltx2_mode audio`.
+										{/if}
+									</p>
+								{/if}
 								<FormField label="Sample Slider Range" value={$projectConfig?.slider?.sample_slider_range || '-2,-1,0,1,2'} oninput={(e) => update('sample_slider_range', e.target.value)} tooltip="Comma-separated multiplier values for preview sampling" />
 							</div>
 						</FormGroup>
@@ -599,69 +632,75 @@
 					<div class="space-y-3">
 						<FormGroup title="Slider Targets">
 							<div class="space-y-3 pt-2">
-								<p class="text-[11px] leading-relaxed" style="color: var(--text-muted);">
-									Define positive/negative prompt pairs that define the slider direction. The LoRA will learn to move between these attributes.
-								</p>
-								{#each targets as target, i}
-									<div class="p-3 space-y-2 relative" style="background: var(--bg-elevated); border-radius: var(--radius-sm); border: 1px solid var(--border-subtle);">
-										<div class="flex items-center justify-between">
-											<span class="text-[10px] font-semibold uppercase tracking-wider" style="color: var(--accent);">Target #{i + 1}</span>
-											{#if targets.length > 1}
-												<button
-													onclick={() => removeTarget(i)}
-													class="px-2 py-0.5 text-[10px] font-medium"
-													style="color: var(--text-muted); background: var(--bg-elevated); border: 1px solid var(--border); border-radius: var(--radius-sm);"
-													onmouseenter={(e) => { e.currentTarget.style.color = 'var(--danger)'; e.currentTarget.style.borderColor = 'var(--danger)'; }}
-													onmouseleave={(e) => { e.currentTarget.style.color = 'var(--text-muted)'; e.currentTarget.style.borderColor = 'var(--border)'; }}
-												>
-													Remove
-												</button>
-											{/if}
+								{#if ($projectConfig?.slider?.mode || 'text') === 'text'}
+									<p class="text-[11px] leading-relaxed" style="color: var(--text-muted);">
+										Define positive/negative prompt pairs that define the slider direction. The LoRA will learn to move between these attributes.
+									</p>
+									{#each targets as target, i}
+										<div class="p-3 space-y-2 relative" style="background: var(--bg-elevated); border-radius: var(--radius-sm); border: 1px solid var(--border-subtle);">
+											<div class="flex items-center justify-between">
+												<span class="text-[10px] font-semibold uppercase tracking-wider" style="color: var(--accent);">Target #{i + 1}</span>
+												{#if targets.length > 1}
+													<button
+														onclick={() => removeTarget(i)}
+														class="px-2 py-0.5 text-[10px] font-medium"
+														style="color: var(--text-muted); background: var(--bg-elevated); border: 1px solid var(--border); border-radius: var(--radius-sm);"
+														onmouseenter={(e) => { e.currentTarget.style.color = 'var(--danger)'; e.currentTarget.style.borderColor = 'var(--danger)'; }}
+														onmouseleave={(e) => { e.currentTarget.style.color = 'var(--text-muted)'; e.currentTarget.style.borderColor = 'var(--border)'; }}
+													>
+														Remove
+													</button>
+												{/if}
+											</div>
+											<!-- svelte-ignore a11y_label_has_associated_control -->
+											<label class="block">
+												<span class="block text-[10px] font-medium mb-0.5" style="color: var(--success);">Positive (+)</span>
+												<textarea
+													class="w-full text-[11px] px-2 py-1.5 resize-y"
+													rows="2"
+													value={target.positive || ''}
+													oninput={(e) => updateTarget(i, 'positive', e.target.value)}
+													placeholder="high quality, sharp, detailed..."
+													style="background: var(--bg-surface); border: 1px solid var(--border); border-radius: var(--radius-sm); color: var(--text-primary); outline: none;"
+													onfocus={(e) => e.currentTarget.style.borderColor = 'var(--accent)'}
+													onblur={(e) => e.currentTarget.style.borderColor = 'var(--border)'}
+												></textarea>
+											</label>
+											<!-- svelte-ignore a11y_label_has_associated_control -->
+											<label class="block">
+												<span class="block text-[10px] font-medium mb-0.5" style="color: var(--danger);">Negative (-)</span>
+												<textarea
+													class="w-full text-[11px] px-2 py-1.5 resize-y"
+													rows="2"
+													value={target.negative || ''}
+													oninput={(e) => updateTarget(i, 'negative', e.target.value)}
+													placeholder="blurry, low quality, soft..."
+													style="background: var(--bg-surface); border: 1px solid var(--border); border-radius: var(--radius-sm); color: var(--text-primary); outline: none;"
+													onfocus={(e) => e.currentTarget.style.borderColor = 'var(--accent)'}
+													onblur={(e) => e.currentTarget.style.borderColor = 'var(--border)'}
+												></textarea>
+											</label>
+											<div class="grid grid-cols-2 gap-2">
+												<FormField label="Target Class" value={target.target_class || ''} oninput={(e) => updateTarget(i, 'target_class', e.target.value)} placeholder="(all content)" tooltip="Optional: restrict to class" />
+												<FormField label="Weight" type="number" value={target.weight ?? 1.0} oninput={(e) => updateTarget(i, 'weight', Number(e.target.value))} step="0.1" min={0} tooltip="Loss weight for this target" />
+											</div>
 										</div>
-										<!-- svelte-ignore a11y_label_has_associated_control -->
-										<label class="block">
-											<span class="block text-[10px] font-medium mb-0.5" style="color: var(--success);">Positive (+)</span>
-											<textarea
-												class="w-full text-[11px] px-2 py-1.5 resize-y"
-												rows="2"
-												value={target.positive || ''}
-												oninput={(e) => updateTarget(i, 'positive', e.target.value)}
-												placeholder="high quality, sharp, detailed..."
-												style="background: var(--bg-surface); border: 1px solid var(--border); border-radius: var(--radius-sm); color: var(--text-primary); outline: none;"
-												onfocus={(e) => e.currentTarget.style.borderColor = 'var(--accent)'}
-												onblur={(e) => e.currentTarget.style.borderColor = 'var(--border)'}
-											></textarea>
-										</label>
-										<!-- svelte-ignore a11y_label_has_associated_control -->
-										<label class="block">
-											<span class="block text-[10px] font-medium mb-0.5" style="color: var(--danger);">Negative (-)</span>
-											<textarea
-												class="w-full text-[11px] px-2 py-1.5 resize-y"
-												rows="2"
-												value={target.negative || ''}
-												oninput={(e) => updateTarget(i, 'negative', e.target.value)}
-												placeholder="blurry, low quality, soft..."
-												style="background: var(--bg-surface); border: 1px solid var(--border); border-radius: var(--radius-sm); color: var(--text-primary); outline: none;"
-												onfocus={(e) => e.currentTarget.style.borderColor = 'var(--accent)'}
-												onblur={(e) => e.currentTarget.style.borderColor = 'var(--border)'}
-											></textarea>
-										</label>
-										<div class="grid grid-cols-2 gap-2">
-											<FormField label="Target Class" value={target.target_class || ''} oninput={(e) => updateTarget(i, 'target_class', e.target.value)} placeholder="(all content)" tooltip="Optional: restrict to class" />
-											<FormField label="Weight" type="number" value={target.weight ?? 1.0} oninput={(e) => updateTarget(i, 'weight', Number(e.target.value))} step="0.1" min={0} tooltip="Loss weight for this target" />
-										</div>
-									</div>
-								{/each}
-								<button
-									onclick={addTarget}
-									class="w-full py-1.5 text-[11px] font-medium flex items-center justify-center gap-1"
-									style="background: var(--bg-elevated); border: 1px dashed var(--border); color: var(--text-muted); border-radius: var(--radius-sm);"
-									onmouseenter={(e) => { e.currentTarget.style.borderColor = 'var(--accent)'; e.currentTarget.style.color = 'var(--accent)'; }}
-									onmouseleave={(e) => { e.currentTarget.style.borderColor = 'var(--border)'; e.currentTarget.style.color = 'var(--text-muted)'; }}
-								>
-									<svg class="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path d="M12 6v12m6-6H6"/></svg>
-									Add Target
-								</button>
+									{/each}
+									<button
+										onclick={addTarget}
+										class="w-full py-1.5 text-[11px] font-medium flex items-center justify-center gap-1"
+										style="background: var(--bg-elevated); border: 1px dashed var(--border); color: var(--text-muted); border-radius: var(--radius-sm);"
+										onmouseenter={(e) => { e.currentTarget.style.borderColor = 'var(--accent)'; e.currentTarget.style.color = 'var(--accent)'; }}
+										onmouseleave={(e) => { e.currentTarget.style.borderColor = 'var(--border)'; e.currentTarget.style.color = 'var(--text-muted)'; }}
+									>
+										<svg class="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path d="M12 6v12m6-6H6"/></svg>
+										Add Target
+									</button>
+								{:else}
+									<p class="text-[11px] leading-relaxed" style="color: var(--text-muted);">
+										Reference-based slider modes use paired cached examples instead of prompt targets. The positive and negative samples must share basename-aligned cache files.
+									</p>
+								{/if}
 							</div>
 						</FormGroup>
 					</div>

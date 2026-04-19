@@ -501,7 +501,12 @@ class SliderConfig(BaseModel):
     model_config = ConfigDict(extra="ignore")  # old projects may have fields that moved to TrainingConfig
 
     # Mode
-    mode: Literal["text", "reference"] = "text"
+    mode: Literal["text", "reference", "ic_reference"] = "text"
+    reference_modality: Literal["video", "audio"] = "video"
+    pos_cache_dir: str = ""
+    neg_cache_dir: str = ""
+    text_cache_dir: str = ""
+    reference_cache_dir: str = ""
 
     # Targets (text-only mode)
     targets: list[SliderTargetConfig] = Field(default_factory=lambda: [SliderTargetConfig()])

@@ -2142,12 +2142,13 @@ Slider LoRAs learn a controllable direction in model output space (e.g., "detail
 
 **Script:** `ltx2_train_slider.py`
 
-Two modes are available:
+Three modes are available:
 
 | Mode | Input | Use Case |
 |------|-------|----------|
 | `text` | Prompt pairs only (no dataset) | Sliders from text prompt pairs, no images needed |
 | `reference` | Pre-cached latent pairs | Sliders from paired positive/negative image, video, or audio samples |
+| IC-slider (`mode = "ic_reference"`) | Paired target caches + shared reference caches | Slider training under shared `v2v` reference conditioning |
 
 ### 4a. Text-Only Mode
 
@@ -2329,6 +2330,62 @@ Notes:
 - The trainer uses the same paired positive/negative audio latents plus shared text cache, and masks loss with cached `audio_lengths`.
 - `--lora_target_preset audio` is recommended; if omitted, the slider trainer selects it automatically for audio reference sliders.
 - `--ltx2_first_frame_conditioning_p` has no effect for audio sliders.
+
+### 4c. IC-slider
+Trains a slider from paired positive/negative target latents under a shared cached visual reference. Internally this mode reuses the existing `v2v` IC path.
+
+#### Slider Config (`ltx2_slider_ic_reference.toml`)
+
+```toml
+mode = "ic_reference"
+reference_modality = "video"
+pos_cache_dir = "path/to/positive/cache"
+neg_cache_dir = "path/to/negative/cache"
+text_cache_dir = "path/to/text/cache"
+reference_cache_dir = "path/to/reference/cache"
+sample_slider_range = [-2.0, -1.0, 0.0, 1.0, 2.0]
+```
+
+- `pos_cache_dir`: Directory containing cached positive target latents.
+- `neg_cache_dir`: Directory containing cached negative target latents.
+- `text_cache_dir`: Directory containing cached text encoder outputs matched by basename.
+- `reference_cache_dir`: Directory containing cached reference-video latents matched by basename.
+
+Current restrictions:
+- `reference_modality = "video"` only
+- `--ltx2_mode video` only
+- `--ic_lora_strategy` resolves to `v2v`
+- if `--lora_target_preset` is omitted, the trainer selects `v2v`
+
+Files are matched by basename. For each `{name}_{W}x{H}_ltx2.safetensors` in `pos_cache_dir`, the trainer expects:
+- a matching negative latent file in `neg_cache_dir`
+- a matching text cache `{name}_ltx2_te.safetensors` in `text_cache_dir`
+- a matching reference latent file in `reference_cache_dir`
+
+##### Example Command (IC-Aware Reference)
+
+```bash
+accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 ltx2_train_slider.py ^
+  --mixed_precision bf16 ^
+  --ltx2_checkpoint /path/to/ltx-2.safetensors ^
+  --ltx2_mode video ^
+  --fp8_base --fp8_scaled ^
+  --gradient_checkpointing ^
+  --blocks_to_swap 10 ^
+  --network_module networks.lora_ltx2 ^
+  --network_dim 16 --network_alpha 16 ^
+  --lora_target_preset v2v ^
+  --learning_rate 1e-4 ^
+  --optimizer_type AdamW8bit ^
+  --lr_scheduler constant_with_warmup --lr_warmup_steps 20 ^
+  --max_train_steps 500 ^
+  --output_dir output --output_name identity_smile_slider ^
+  --slider_config ltx2_slider_ic_reference.toml
+```
+
+Additional notes:
+- `--ltx2_first_frame_conditioning_p` still applies on the target side
+- AV and audio IC-slider variants are not implemented
 
 ### Slider Tips
 
