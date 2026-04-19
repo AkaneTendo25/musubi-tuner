@@ -432,6 +432,10 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
         cmd.append("--no-save_original_lora")
     if t.ic_lora_strategy != "auto":
         cmd += ["--ic_lora_strategy", t.ic_lora_strategy]
+    if t.av_cross_attention_mode != "both":
+        cmd += ["--av_cross_attention_mode", t.av_cross_attention_mode]
+    if t.av_multi_ref:
+        cmd.append("--av_multi_ref")
     if t.audio_ref_use_negative_positions:
         cmd.append("--audio_ref_use_negative_positions")
     if t.audio_ref_mask_cross_attention_to_reference:

@@ -23,7 +23,13 @@ class DatasetEntry(BaseModel):
     directory: str = ""
     cache_directory: str = ""
     reference_cache_directory: str = ""
+    extra_reference_cache_directories: str = ""
+    reference_audio_cache_directory: str = ""
+    extra_reference_audio_cache_directories: str = ""
     control_directory: str = ""
+    extra_control_directories: str = ""
+    reference_audio_directory: str = ""
+    extra_reference_audio_directories: str = ""
     jsonl_file: str = ""
     resolution_w: int = 768
     resolution_h: int = 512
@@ -137,7 +143,7 @@ class TrainingConfig(BaseModel):
     network_dim: Optional[int] = None
     network_alpha: float = 1.0
     lora_target_preset: Literal[
-        "t2v", "v2v", "video_sa", "video_sa_ff", "video_sa_ca_ff", "audio", "audio_ref_only_ic", "av_ic", "full", "lycoris"
+        "t2v", "v2v", "video_sa", "video_sa_ff", "video_sa_ca_ff", "audio", "audio_ref_only_ic", "av_ic", "video_ref_only_av", "full", "lycoris"
     ] = "t2v"
     network_args: str = ""
     network_weights: str = ""
@@ -162,7 +168,9 @@ class TrainingConfig(BaseModel):
     audio_caption_dropout_rate: float = 0.0
     train_connectors: bool = False
     save_original_lora: bool = True
-    ic_lora_strategy: Literal["auto", "none", "v2v", "audio_ref_only_ic"] = "auto"
+    ic_lora_strategy: Literal["auto", "none", "v2v", "audio_ref_only_ic", "av_ic", "video_ref_only_av"] = "auto"
+    av_cross_attention_mode: Literal["both", "a2v_only", "v2a_only", "none"] = "both"
+    av_multi_ref: bool = False
     audio_ref_use_negative_positions: bool = False
     audio_ref_mask_cross_attention_to_reference: bool = False
     audio_ref_mask_reference_from_text_attention: bool = False

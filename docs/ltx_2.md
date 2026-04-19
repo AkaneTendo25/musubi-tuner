@@ -1207,8 +1207,9 @@ Use `--lora_target_preset` to control which layers LoRA targets. For custom laye
 | `video_sa_ca_ff` | Video self-attention + cross-attention + video FFN (`attn1`, `attn2`, `ff`) | Video only | Text-guided controls (video detailing, camera-from-image, sparse tracks) |
 | `audio` | Audio attn/FFN + `video_to_audio_attn` | Audio only | Audio-only training (auto-selected when `--ltx2_mode audio`) |
 | `audio_ref_only_ic` | Audio attn/FFN + bidirectional AV cross-modal | Audio + cross-modal | Audio-reference IC-LoRA |
-| `av_ic` | All attention + video FFN + audio FFN (same as `v2v`) | Video + audio + cross-modal | Joint AV IC-LoRA |
-| `full` | All linear layers | Video + audio + cross-modal | Maximum expressiveness, larger file size |
+| `av_ic` | All attention + video FFN + audio FFN (same as `v2v`) | Video + audio + cross-modal | Joint AV IC-LoRA. Use `--av_cross_attention_mode` for directional variants and `--av_multi_ref` when configuring a multi-reference AV IC run |
+| `video_ref_only_av` | All attention + video FFN + audio FFN (same as `v2v`) | Video + audio + cross-modal | AV training with reference video only; target audio is still generated |
+| `full` | All linear layers for LoRA targeting | Video + audio + cross-modal | Maximum expressiveness, larger file size |
 
 **Modality scope matters when training on an AV checkpoint.** The `t2v`, `v2v`, `av_ic`, and `full` presets create LoRA weights for audio and cross-modal layers. If those layers receive no audio training signal (e.g., image/video-only dataset), the LoRA weights for audio modules are initialized but never meaningfully updated — applying such a LoRA can degrade the base model's audio capabilities. Use a `video_*` preset to restrict LoRA to video-branch modules only, leaving audio layers completely untouched. Connector layers (`Embeddings1DConnector`) are excluded by default; use `--train_connectors` to include them (see below).
 
@@ -1316,6 +1317,29 @@ reference_directory = "references"
 reference_cache_directory = "cache_ref"
 ```
 
+For multi-reference `av_ic`, use the plural dataset keys instead:
+
+```toml
+[[datasets]]
+video_directory = "videos"
+reference_directories = ["references_a", "references_b"]
+reference_cache_directories = ["cache_ref_a", "cache_ref_b"]
+reference_audio_directories = ["reference_audio_a", "reference_audio_b"]
+reference_audio_cache_directories = ["cache_ref_audio_a", "cache_ref_audio_b"]
+target_frames = [33]
+```
+
+In the dashboard, these map to the Advanced dataset fields:
+- `Reference Cache Dir` + `Extra Ref Cache Dirs`
+- `Reference Directory` + `Extra Reference Dirs`
+- `Ref Audio Cache Dir` + `Extra Ref Audio Cache Dirs`
+- `Ref Audio Directory` + `Extra Ref Audio Dirs`
+
+In the training dashboard, AV IC behavior is configured from the Advanced LoRA section:
+- `IC-LoRA Strategy = av_ic`
+- `AV Cross-Attn` for `both` / `a2v_only` / `v2a_only` / `none`
+- `Multi-Ref AV` when the dataset uses the plural reference directory fields above
+
 ##### Step 3: Cache Latents
 
 Cache both video latents and reference latents in one step:
@@ -1411,12 +1435,15 @@ The `--sample_include_reference` flag shows the reference side-by-side with the 
 | Option | Type | Description |
 |--------|------|-------------|
 | `reference_directory` | string | Path to reference images/videos for IC-LoRA datasets (matched by filename stem) |
+| `reference_directories` | array[string] | Optional multi-reference variant of `reference_directory`; use one entry per reference stream |
 | `reference_cache_directory` | string | Output directory for cached reference latents |
+| `reference_cache_directories` | array[string] | Optional multi-reference variant of `reference_cache_directory`; count must match `reference_directories` |
 
 ##### Notes
 
 - **First-frame conditioning** (`--ltx2_first_frame_conditioning_p`): Randomly conditions on the first target frame in addition to the reference. Only applied during training; inference always denoises the full target. Has no effect for single-frame (image-only) samples — the code skips conditioning when `num_frames == 1` since there are no subsequent frames to generate.
 - **Multi-frame references**: Supported but increase VRAM usage proportionally to the number of reference tokens.
+- **Multi-reference datasets**: `av_ic` can consume multiple references directly from dataset TOML via `reference_directories` + `reference_cache_directories` (and the audio equivalents below). The list lengths must match. `--av_multi_ref` exposes that intent in training metadata/UI.
 - **Multi-subject references**: The VAE compresses 8 frames into 1 temporal latent via `SpaceToDepthDownsample`, which pairs consecutive frames and averages their features. Subjects sharing the same 8-frame group are blended and lose individual identity. To keep N subjects separated, structure your reference video as: frame 1 = Subject A, frames 2–9 = Subject B (repeated 8×), frames 10–17 = Subject C (repeated 8×), etc. Total frames: `1 + 8×(N−1)`. Set `--reference_frames` to match. Frame 1 gets its own latent due to causal padding in the encoder; each subsequent 8-frame block produces one additional latent.
 - **Video-only**: IC-LoRA requires `--ltx2_mode video`. Audio-video mode is not supported for v2v training.
 - **Downscale factor metadata**: Saved in LoRA safetensors as `ss_reference_downscale_factor` when factor != 1.
@@ -1591,7 +1618,7 @@ Reference audio latents are precached automatically when using `--precache_sampl
 | `--lora_target_preset audio_ref_only_ic` | — | Targets audio attn/FFN + bidirectional AV cross-modal layers |
 | `--audio_ref_use_negative_positions` | off | Place reference audio in negative RoPE time for positional separation |
 | `--audio_ref_mask_cross_attention_to_reference` | off | Block video from attending to reference audio tokens (AV mode only; no effect in audio-only mode) |
-| `--audio_ref_mask_reference_from_text_attention` | off | Block reference audio from attending to text tokens |
+| `--audio_ref_mask_reference_from_text_attention` | off | Block reference audio from attending to text tokens (`av_ic`: currently unsupported and ignored) |
 | `--audio_ref_identity_guidance_scale` | 0.0 | Override CFG scale for target-audio branch during `audio_ref_only_ic` sampling (0 = use standard guidance scale) |
 
 ##### Dataset Config Options
@@ -1599,13 +1626,19 @@ Reference audio latents are precached automatically when using `--precache_sampl
 | Option | Type | Description |
 |--------|------|-------------|
 | `reference_audio_directory` | string | Path to reference audio files (matched by filename stem) |
+| `reference_audio_directories` | array[string] | Optional multi-reference variant of `reference_audio_directory`; use one entry per reference stream |
 | `reference_audio_cache_directory` | string | Output directory for cached reference audio latents |
+| `reference_audio_cache_directories` | array[string] | Optional multi-reference variant of `reference_audio_cache_directory`; count must match `reference_audio_directories` |
 
 ##### Notes
 
 - **Checkpoint**: requires an LTXAV checkpoint for both `--ltx2_mode av` and `--ltx2_mode audio`.
 - **Bucket separation**: `separate_audio_buckets = true` keeps audio/non-audio items in separate batches (avoids shape mismatches in collation).
 - **Attention masks are training-only**: `--audio_ref_mask_cross_attention_to_reference` and `--audio_ref_mask_reference_from_text_attention` are applied only during training. They are automatically disabled during sampling/inference to match the ID-LoRA reference (which explicitly sets both to `false` during validation). Negative position overrides are always applied.
+- **`av_ic` limitation**: `--audio_ref_mask_reference_from_text_attention` is not currently supported in `av_ic` because the Modality API uses a 2D `context_mask`; the trainer warns and ignores this flag.
+- **AV cross-attention modes**: `--av_cross_attention_mode both` is the default `av_ic` behavior. Use `a2v_only` for audio-to-video only, `v2a_only` for video-to-audio only, or `none` to disable AV cross-modal attention while keeping the rest of `av_ic` intact. All require `--ltx2_mode av`.
+- **Multi-reference `av_ic`**: accepts multiple reference latents when they are provided as stacked tensors or extra `ref_*` entries, and concatenates them before conditioning. This keeps the implementation compatible with the existing single-reference path while allowing richer identity/style aggregation. `--av_multi_ref` is the explicit training-side toggle for this setup.
+- **`video_ref_only_av`**: requires `--ltx2_mode av`, uses reference video only, and keeps the audio branch target-only. This is useful when you want identity/motion conditioning from video without requiring reference audio for every sample.
 - **First-frame conditioning is critical**: without `--ltx2_first_frame_conditioning_p 0.9`, the model cannot learn face identity from the first frame. A warning is emitted if this is not set in AV mode.
 - `--ic_lora_strategy auto` (default) infers the strategy from `--lora_target_preset` via `infer_ic_lora_strategy_from_preset()`.
 

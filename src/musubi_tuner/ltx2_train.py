@@ -414,6 +414,18 @@ def _validate_full_ft_ic_batch(
     audio_latents = _get_ltx2_batch_tensor(batch, "audio_latents")
     ref_audio_latents = _get_ltx2_batch_tensor(batch, "ref_audio_latents")
 
+    def _normalize_stacked_refs(ref_value: Optional[torch.Tensor], *, single_ndim: int) -> Optional[torch.Tensor]:
+        if ref_value is None:
+            return None
+        if ref_value.dim() == single_ndim + 1:
+            if int(ref_value.shape[1]) <= 0:
+                raise ValueError(f"{split_name} batch {batch_index} has an empty stacked reference tensor.")
+            return ref_value[:, 0, ...]
+        return ref_value
+
+    ref_latents = _normalize_stacked_refs(ref_latents, single_ndim=5)
+    ref_audio_latents = _normalize_stacked_refs(ref_audio_latents, single_ndim=4)
+
     if ic_lora_strategy == "v2v":
         if ltx_mode != "video":
             raise ValueError("--ic_lora_strategy v2v requires --ltx_mode=video")
@@ -465,10 +477,10 @@ def _validate_full_ft_ic_batch(
 
     if ic_lora_strategy == "av_ic":
         if ltx_mode != "av":
-            raise ValueError("--ic_lora_strategy av_ic requires --ltx_mode=av")
+            raise ValueError(f"--ic_lora_strategy {ic_lora_strategy} requires --ltx_mode=av")
         if ref_latents is None:
             raise ValueError(
-                f"{split_name} batch {batch_index} is missing ref_latents required for --ic_lora_strategy av_ic."
+                f"{split_name} batch {batch_index} is missing ref_latents required for --ic_lora_strategy {ic_lora_strategy}."
             )
         if ref_latents.dim() != 5:
             raise ValueError(
@@ -487,17 +499,59 @@ def _validate_full_ft_ic_batch(
         ref_h, ref_w = int(ref_latents.shape[3]), int(ref_latents.shape[4])
         tgt_h, tgt_w = int(latents.shape[3]), int(latents.shape[4])
         if ref_h != tgt_h or ref_w != tgt_w:
-            raise ValueError(
-                f"{split_name} batch {batch_index} av_ic requires same spatial resolution for ref and target video. "
-                f"Got ref={ref_h}x{ref_w}, target={tgt_h}x{tgt_w}."
-            )
+            h_ratio = tgt_h / ref_h
+            w_ratio = tgt_w / ref_w
+            if abs(h_ratio - w_ratio) > 0.01 or abs(h_ratio - round(h_ratio)) > 0.01:
+                raise ValueError(
+                    f"{split_name} batch {batch_index} {ic_lora_strategy} has invalid spatial mismatch: "
+                    f"latents={tgt_h}x{tgt_w}, ref_latents={ref_h}x{ref_w}, "
+                    f"h_ratio={h_ratio:.2f}, w_ratio={w_ratio:.2f}"
+                )
         if audio_latents is None:
             raise ValueError(
-                f"{split_name} batch {batch_index} is missing audio_latents required for --ic_lora_strategy av_ic."
+                f"{split_name} batch {batch_index} is missing audio_latents required for --ic_lora_strategy {ic_lora_strategy}."
             )
         if ref_audio_latents is None:
             raise ValueError(
-                f"{split_name} batch {batch_index} is missing ref_audio_latents required for --ic_lora_strategy av_ic."
+                f"{split_name} batch {batch_index} is missing ref_audio_latents required for --ic_lora_strategy {ic_lora_strategy}."
+            )
+        return
+
+    if ic_lora_strategy == "video_ref_only_av":
+        if ltx_mode != "av":
+            raise ValueError("--ic_lora_strategy video_ref_only_av requires --ltx_mode=av")
+        if ref_latents is None:
+            raise ValueError(
+                f"{split_name} batch {batch_index} is missing ref_latents required for --ic_lora_strategy video_ref_only_av."
+            )
+        if ref_latents.dim() != 5:
+            raise ValueError(
+                f"{split_name} batch {batch_index} ref_latents must be 5D [B, C, F, H, W], got {tuple(ref_latents.shape)}"
+            )
+        if ref_latents.shape[0] != latents.shape[0]:
+            raise ValueError(
+                f"{split_name} batch {batch_index} latents/ref_latents batch mismatch: "
+                f"{latents.shape[0]} vs {ref_latents.shape[0]}"
+            )
+        if ref_latents.shape[1] != latents.shape[1]:
+            raise ValueError(
+                f"{split_name} batch {batch_index} latents/ref_latents channel mismatch: "
+                f"{latents.shape[1]} vs {ref_latents.shape[1]}"
+            )
+        ref_h, ref_w = int(ref_latents.shape[3]), int(ref_latents.shape[4])
+        tgt_h, tgt_w = int(latents.shape[3]), int(latents.shape[4])
+        if ref_h != tgt_h or ref_w != tgt_w:
+            h_ratio = tgt_h / ref_h
+            w_ratio = tgt_w / ref_w
+            if abs(h_ratio - w_ratio) > 0.01 or abs(h_ratio - round(h_ratio)) > 0.01:
+                raise ValueError(
+                    f"{split_name} batch {batch_index} video_ref_only_av has invalid spatial mismatch: "
+                    f"latents={tgt_h}x{tgt_w}, ref_latents={ref_h}x{ref_w}, "
+                    f"h_ratio={h_ratio:.2f}, w_ratio={w_ratio:.2f}"
+                )
+        if audio_latents is None:
+            raise ValueError(
+                f"{split_name} batch {batch_index} is missing audio_latents required for --ic_lora_strategy video_ref_only_av."
             )
 
 

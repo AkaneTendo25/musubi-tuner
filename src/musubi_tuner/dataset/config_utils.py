@@ -52,7 +52,9 @@ class BaseDatasetParams:
     audio_loss_weight: Optional[float] = None
     cache_directory: Optional[str] = None
     reference_cache_directory: Optional[str] = None
+    reference_cache_directories: Optional[Sequence[str]] = None
     reference_audio_cache_directory: Optional[str] = None
+    reference_audio_cache_directories: Optional[Sequence[str]] = None
     separate_audio_buckets: bool = False
     cache_only: bool = False
     debug_dataset: bool = False
@@ -82,7 +84,9 @@ class VideoDatasetParams(BaseDatasetParams):
     video_jsonl_file: Optional[str] = None
     control_directory: Optional[str] = None
     reference_directory: Optional[str] = None
+    reference_directories: Optional[Sequence[str]] = None
     reference_audio_directory: Optional[str] = None
+    reference_audio_directories: Optional[Sequence[str]] = None
     target_frames: Sequence[int] = (1,)
     frame_extraction: Optional[str] = "head"
     frame_stride: Optional[int] = 1
@@ -148,7 +152,9 @@ class ConfigSanitizer:
         "audio_loss_weight": float,
         "cache_directory": str,
         "reference_cache_directory": str,
+        "reference_cache_directories": [str],
         "reference_audio_cache_directory": str,
+        "reference_audio_cache_directories": [str],
         "separate_audio_buckets": bool,
         "cache_only": bool,
     }
@@ -175,7 +181,9 @@ class ConfigSanitizer:
         "video_jsonl_file": str,
         "control_directory": str,
         "reference_directory": str,
+        "reference_directories": [str],
         "reference_audio_directory": str,
+        "reference_audio_directories": [str],
         "target_frames": [int],
         "frame_extraction": str,
         "frame_stride": int,
@@ -320,10 +328,30 @@ class BlueprintGenerator:
                 if not is_image_dataset:
                     continue
 
+                reference_directories = dataset_config.get("reference_directories")
+                if reference_directories is not None and not isinstance(reference_directories, list):
+                    raise ValueError(f"{section_name}[{i}] reference_directories must be a list of strings.")
+                if reference_directories:
+                    if len(reference_directories) != 1:
+                        raise ValueError(
+                            f"{section_name}[{i}] uses reference_directories on an image dataset, but image IC-LoRA "
+                            "currently supports only one reference directory. Use a single entry."
+                        )
+                    dataset_config["reference_directory"] = reference_directories[0]
                 reference_directory = dataset_config.get("reference_directory")
                 control_directory = dataset_config.get("control_directory")
                 has_reference_directory = reference_directory is not None
                 has_control_directory = control_directory is not None
+                reference_cache_directories = dataset_config.get("reference_cache_directories")
+                if reference_cache_directories is not None and not isinstance(reference_cache_directories, list):
+                    raise ValueError(f"{section_name}[{i}] reference_cache_directories must be a list of strings.")
+                if reference_cache_directories:
+                    if len(reference_cache_directories) != 1:
+                        raise ValueError(
+                            f"{section_name}[{i}] uses reference_cache_directories on an image dataset, but image IC-LoRA "
+                            "currently supports only one reference cache directory. Use a single entry."
+                        )
+                    dataset_config["reference_cache_directory"] = reference_cache_directories[0]
                 has_reference_cache = dataset_config.get("reference_cache_directory") is not None
 
                 if has_reference_directory and not has_reference_cache:
@@ -437,6 +465,8 @@ def generate_dataset_group_by_blueprint(
         separate_audio_buckets: {getattr(dataset, "separate_audio_buckets", False)}
         cache_only: {getattr(dataset, "cache_only", False)}
         cache_directory: "{dataset.cache_directory}"
+        reference_cache_directory: "{getattr(dataset, 'reference_cache_directory', None)}"
+        reference_cache_directories: {getattr(dataset, "reference_cache_directories", None)}
         debug_dataset: {dataset.debug_dataset}
     """
         )
@@ -479,8 +509,11 @@ def generate_dataset_group_by_blueprint(
         video_jsonl_file: "{dataset.video_jsonl_file}"
         control_directory: "{dataset.control_directory}"
         reference_directory: "{getattr(dataset, 'reference_directory', None)}"
+        reference_directories: {getattr(dataset, "reference_directories", None)}
         reference_audio_directory: "{getattr(dataset, 'reference_audio_directory', None)}"
+        reference_audio_directories: {getattr(dataset, "reference_audio_directories", None)}
         reference_audio_cache_directory: "{getattr(dataset, 'reference_audio_cache_directory', None)}"
+        reference_audio_cache_directories: {getattr(dataset, "reference_audio_cache_directories", None)}
         target_frames: {dataset.target_frames}
         frame_extraction: {dataset.frame_extraction}
         frame_stride: {dataset.frame_stride}
@@ -540,7 +573,9 @@ def _manifest_params_with_cache_only(dataset_type: str, params: dict) -> dict:
         params["video_jsonl_file"] = None
         params["control_directory"] = None
         params["reference_directory"] = None
+        params["reference_directories"] = None
         params["reference_audio_directory"] = None
+        params["reference_audio_directories"] = None
 
     return params
 

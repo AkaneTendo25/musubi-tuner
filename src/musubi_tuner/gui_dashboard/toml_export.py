@@ -74,6 +74,33 @@ def _default_cache_directory(entry) -> str:
     return ""
 
 
+def _split_path_list(raw: str) -> list[str]:
+    if not raw:
+        return []
+    values: list[str] = []
+    seen: set[str] = set()
+    normalized = raw.replace(";", "\n").replace(",", "\n")
+    for part in normalized.splitlines():
+        candidate = part.strip()
+        if not candidate or candidate in seen:
+            continue
+        seen.add(candidate)
+        values.append(candidate)
+    return values
+
+
+def _merge_path_values(*groups: list[str]) -> list[str]:
+    values: list[str] = []
+    seen: set[str] = set()
+    for group in groups:
+        for value in group:
+            if value in seen:
+                continue
+            seen.add(value)
+            values.append(value)
+    return values
+
+
 def _dataset_entry_to_dict(entry) -> dict:
     """Convert a DatasetEntry to a TOML-ready dict."""
     d: dict = {}
@@ -90,13 +117,45 @@ def _dataset_entry_to_dict(entry) -> dict:
             d["audio_directory"] = entry.directory
 
     d["cache_directory"] = _default_cache_directory(entry)
-    if entry.reference_cache_directory:
-        d["reference_cache_directory"] = entry.reference_cache_directory
-    if entry.control_directory:
-        if entry.reference_cache_directory:
-            d["reference_directory"] = entry.control_directory
+    reference_cache_directories = _merge_path_values(
+        [entry.reference_cache_directory] if entry.reference_cache_directory else [],
+        _split_path_list(getattr(entry, "extra_reference_cache_directories", "")),
+    )
+    if len(reference_cache_directories) == 1:
+        d["reference_cache_directory"] = reference_cache_directories[0]
+    elif len(reference_cache_directories) > 1:
+        d["reference_cache_directories"] = reference_cache_directories
+
+    reference_audio_cache_directories = _merge_path_values(
+        [entry.reference_audio_cache_directory] if getattr(entry, "reference_audio_cache_directory", "") else [],
+        _split_path_list(getattr(entry, "extra_reference_audio_cache_directories", "")),
+    )
+    if len(reference_audio_cache_directories) == 1:
+        d["reference_audio_cache_directory"] = reference_audio_cache_directories[0]
+    elif len(reference_audio_cache_directories) > 1:
+        d["reference_audio_cache_directories"] = reference_audio_cache_directories
+
+    reference_directories = _merge_path_values(
+        [entry.control_directory] if entry.control_directory else [],
+        _split_path_list(getattr(entry, "extra_control_directories", "")),
+    )
+    if reference_directories:
+        if reference_cache_directories:
+            if len(reference_directories) == 1:
+                d["reference_directory"] = reference_directories[0]
+            else:
+                d["reference_directories"] = reference_directories
         else:
-            d["control_directory"] = entry.control_directory
+            d["control_directory"] = reference_directories[0]
+
+    reference_audio_directories = _merge_path_values(
+        [entry.reference_audio_directory] if getattr(entry, "reference_audio_directory", "") else [],
+        _split_path_list(getattr(entry, "extra_reference_audio_directories", "")),
+    )
+    if len(reference_audio_directories) == 1:
+        d["reference_audio_directory"] = reference_audio_directories[0]
+    elif len(reference_audio_directories) > 1:
+        d["reference_audio_directories"] = reference_audio_directories
     if entry.type != "audio":
         d["resolution"] = [entry.resolution_w, entry.resolution_h]
     d["batch_size"] = entry.batch_size

@@ -784,6 +784,7 @@ LTX2_LORA_TARGET_PRESETS = {
     "audio": LTX2_INCLUDE_PATTERNS_AUDIO,
     "audio_ref_only_ic": LTX2_INCLUDE_PATTERNS_AUDIO_REF_ONLY_IC,
     "av_ic": LTX2_INCLUDE_PATTERNS_V2V,  # superset: all attn (video+audio+cross-modal) + video FFN + audio FFN
+    "video_ref_only_av": LTX2_INCLUDE_PATTERNS_V2V,  # AV target generation with video-reference conditioning only
     "full": LTX2_INCLUDE_PATTERNS_FULL,
 }
 

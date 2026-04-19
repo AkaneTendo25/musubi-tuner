@@ -45,12 +45,22 @@
 	const isVideo = $derived(entry.type === 'video');
 	const isAudio = $derived(entry.type === 'audio');
 	const mediaLabel = $derived(isAudio ? 'Audio' : isVideo ? 'Video' : 'Image');
-	const usesReferenceDirectory = $derived(Boolean(entry.reference_cache_directory));
+	const usesReferenceDirectory = $derived(
+		Boolean(entry.reference_cache_directory || entry.extra_reference_cache_directories)
+	);
 	const sourceDirectoryLabel = $derived(usesReferenceDirectory ? 'Reference Directory' : 'Control Directory');
+	const extraSourceDirectoryLabel = $derived(
+		usesReferenceDirectory ? 'Extra Reference Dirs' : 'Extra Control Dirs'
+	);
 	const sourceDirectoryTooltip = $derived(
 		usesReferenceDirectory
 			? 'Directory with reference images/videos. When Reference Cache Dir is set, this is exported as reference_directory for IC-LoRA datasets.'
 			: 'Directory with control images/videos (e.g. depth maps, edges).'
+	);
+	const extraSourceDirectoryTooltip = $derived(
+		usesReferenceDirectory
+			? 'Optional extra reference image/video directories, separated by commas or semicolons.'
+			: 'Optional extra control directories, separated by commas or semicolons.'
 	);
 </script>
 
@@ -116,6 +126,27 @@
 				placeholder="Optional"
 				tooltip="Reference cache directory for I2V / control workflows"
 			/>
+			<PathInput
+				label="Extra Ref Cache Dirs"
+				value={entry.extra_reference_cache_directories}
+				oninput={(e) => updateField('extra_reference_cache_directories', e.target.value)}
+				placeholder="Optional"
+				tooltip="Optional extra reference cache directories, separated by commas or semicolons."
+			/>
+			<PathInput
+				label="Ref Audio Cache Dir"
+				value={entry.reference_audio_cache_directory}
+				oninput={(e) => updateField('reference_audio_cache_directory', e.target.value)}
+				placeholder="Optional"
+				tooltip="Reference audio latent cache directory for audio-ref / AV IC modes."
+			/>
+			<PathInput
+				label="Extra Ref Audio Cache Dirs"
+				value={entry.extra_reference_audio_cache_directories}
+				oninput={(e) => updateField('extra_reference_audio_cache_directories', e.target.value)}
+				placeholder="Optional"
+				tooltip="Optional extra reference audio cache directories, separated by commas or semicolons."
+			/>
 		{/if}
 		{#if advanced && !isAudio}
 			<PathInput
@@ -124,6 +155,27 @@
 				oninput={(e) => updateField('control_directory', e.target.value)}
 				placeholder="Optional"
 				tooltip={sourceDirectoryTooltip}
+			/>
+			<PathInput
+				label={extraSourceDirectoryLabel}
+				value={entry.extra_control_directories}
+				oninput={(e) => updateField('extra_control_directories', e.target.value)}
+				placeholder="Optional"
+				tooltip={extraSourceDirectoryTooltip}
+			/>
+			<PathInput
+				label="Ref Audio Directory"
+				value={entry.reference_audio_directory}
+				oninput={(e) => updateField('reference_audio_directory', e.target.value)}
+				placeholder="Optional"
+				tooltip="Directory with reference audio files for audio-ref / AV IC modes."
+			/>
+			<PathInput
+				label="Extra Ref Audio Dirs"
+				value={entry.extra_reference_audio_directories}
+				oninput={(e) => updateField('extra_reference_audio_directories', e.target.value)}
+				placeholder="Optional"
+				tooltip="Optional extra reference audio directories, separated by commas or semicolons."
 			/>
 		{/if}
 

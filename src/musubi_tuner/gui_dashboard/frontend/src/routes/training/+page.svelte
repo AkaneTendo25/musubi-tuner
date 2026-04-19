@@ -138,6 +138,8 @@
 								{ value: 'video_sa_ca_ff', label: 'V:SA+CA+FF' },
 								{ value: 'audio', label: 'audio' },
 								{ value: 'audio_ref_only_ic', label: 'audio ref IC' },
+								{ value: 'av_ic', label: 'AV IC' },
+								{ value: 'video_ref_only_av', label: 'AV video-ref' },
 								{ value: 'full', label: 'full (all)' }
 							]} onchange={(e) => update('lora_target_preset', e.target.value)} tooltip="Target layers" />
 						</div>
@@ -148,15 +150,28 @@
 									{ value: 'none', label: 'none' },
 									{ value: 'v2v', label: 'v2v' },
 									{ value: 'audio_ref_only_ic', label: 'audio_ref_only_ic' },
-								]} onchange={(e) => update('ic_lora_strategy', e.target.value)} tooltip="IC-LoRA conditioning strategy. 'auto' follows lora_target_preset; 'audio_ref_only_ic' = audio-reference ID-LoRA style (requires av or audio mode)" />
+									{ value: 'av_ic', label: 'av_ic' },
+									{ value: 'video_ref_only_av', label: 'video_ref_only_av' },
+								]} onchange={(e) => update('ic_lora_strategy', e.target.value)} tooltip="IC-LoRA conditioning strategy. 'auto' follows lora_target_preset; 'audio_ref_only_ic' = audio-reference ID-LoRA style (requires av or audio mode); 'av_ic' = joint video+audio reference conditioning (requires av mode, with extra AV modifiers below); 'video_ref_only_av' = video reference with target AV generation (requires av mode)" />
 							</div>
-							{#if t.ic_lora_strategy === 'audio_ref_only_ic'}
+							{#if t.ic_lora_strategy === 'audio_ref_only_ic' || t.ic_lora_strategy === 'av_ic' || (t.ic_lora_strategy === 'auto' && (t.lora_target_preset === 'audio_ref_only_ic' || t.lora_target_preset === 'av_ic'))}
 								<div class="p-2 space-y-2" style="background: var(--bg-elevated); border-radius: var(--radius-sm); border: 1px solid var(--border-subtle);">
 									<span class="text-[11px] font-medium" style="color: var(--text-muted);">Audio-Reference IC-LoRA</span>
+									{#if t.ic_lora_strategy === 'av_ic' || (t.ic_lora_strategy === 'auto' && t.lora_target_preset === 'av_ic')}
+										<div class="grid grid-cols-2 gap-2">
+											<FormSelect label="AV Cross-Attn" value={t.av_cross_attention_mode || 'both'} options={[
+												{ value: 'both', label: 'both' },
+												{ value: 'a2v_only', label: 'a2v_only' },
+												{ value: 'v2a_only', label: 'v2a_only' },
+												{ value: 'none', label: 'none' },
+											]} onchange={(e) => update('av_cross_attention_mode', e.target.value)} tooltip="AV IC cross-modal direction control. 'both' = default AV IC, 'a2v_only' = audio-to-video only, 'v2a_only' = video-to-audio only, 'none' = disable both cross-modal directions." />
+											<FormToggle label="Multi-Ref AV" checked={t.av_multi_ref ?? false} onchange={(e) => update('av_multi_ref', e.target.checked)} tooltip="Mark this AV IC run as multi-reference. Backend multi-reference support uses the plural dataset reference fields." />
+										</div>
+									{/if}
 									<div class="flex flex-wrap gap-x-4 gap-y-1">
 										<FormToggle label="Negative Positions" checked={t.audio_ref_use_negative_positions ?? false} onchange={(e) => update('audio_ref_use_negative_positions', e.target.checked)} tooltip="Place reference-audio token positions in negative time" />
 										<FormToggle label="Mask Cross-Attn to Ref" checked={t.audio_ref_mask_cross_attention_to_reference ?? false} onchange={(e) => update('audio_ref_mask_cross_attention_to_reference', e.target.checked)} tooltip="Video attends only to target audio, not reference-audio tokens" />
-										<FormToggle label="Mask Ref from Text" checked={t.audio_ref_mask_reference_from_text_attention ?? false} onchange={(e) => update('audio_ref_mask_reference_from_text_attention', e.target.checked)} tooltip="Block reference-audio tokens from attending to text tokens" />
+										<FormToggle label="Mask Ref from Text" checked={t.audio_ref_mask_reference_from_text_attention ?? false} onchange={(e) => update('audio_ref_mask_reference_from_text_attention', e.target.checked)} tooltip={t.ic_lora_strategy === 'av_ic' || (t.ic_lora_strategy === 'auto' && t.lora_target_preset === 'av_ic') ? 'Not supported in AV IC Modality-path mode; the trainer warns and ignores this flag.' : 'Block reference-audio tokens from attending to text tokens'} />
 									</div>
 									<FormField label="Identity Guidance Scale" type="number" value={t.audio_ref_identity_guidance_scale ?? 0.0} oninput={(e) => update('audio_ref_identity_guidance_scale', Number(e.target.value))} step="0.1" min={0} tooltip="Extra forward pass without reference to isolate and amplify speaker identity (0 = disabled, recommended: 3.0)" />
 									<div class="flex flex-wrap gap-x-4 gap-y-1 items-end">
