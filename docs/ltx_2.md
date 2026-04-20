@@ -9,7 +9,7 @@ Supports LoRA training for both **LTX-2 (19B)** and **LTX-2.3 (22B)** models wit
 | LTX-2 (19B) | 19B | Single `aggregate_embed`, caption projection inside transformer |
 | LTX-2.3 (22B) | 22B | Dual `video_aggregate_embed`/`audio_aggregate_embed`, caption projection moved to feature extractor (`caption_proj_before_connector`), cross-attention AdaLN (`prompt_adaln`), separate audio connector dimensions, BigVGAN v2 vocoder with bandwidth extension |
 
-Version choice for training is controlled by `--ltx_version` (default: `2.0`) in `ltx2_train_network.py`. The trainer auto-detects the checkpoint version from metadata and warns on mismatch.
+Version choice for training is controlled by `--ltx_version` (default: `2.3`) in `ltx2_train_network.py`. The trainer auto-detects the checkpoint version from metadata and warns on mismatch.
 
 Caching scripts (`ltx2_cache_latents.py`, `ltx2_cache_text_encoder_outputs.py`) do not use `--ltx_version`; they work with both LTX-2 and LTX-2.3 checkpoints directly via `--ltx2_checkpoint`.
 
@@ -573,7 +573,7 @@ accelerate launch ... ltx2_train_network.py ^
 - Quantization targets transformer block weights only. Embedding layers, norms, and projection layers remain in full precision.
 
 #### Model Version
-- `--ltx_version 2.0|2.3`: Select target model version (default: `2.0`). Controls default behavior for version-dependent settings (e.g., `--shifted_logit_mode` defaults to `legacy` for 2.0, `stretched` for 2.3). For LTX-2.3 checkpoints, set `--ltx_version 2.3` explicitly.
+- `--ltx_version 2.0|2.3`: Select target model version (default: `2.3`). Controls default behavior for version-dependent settings (e.g., `--shifted_logit_mode` defaults to `legacy` for 2.0, `stretched` for 2.3).
 - `--ltx_version_check_mode off|warn|error`: How to handle mismatch between `--ltx_version` and checkpoint metadata (default: `warn`). The trainer reads checkpoint config keys (`cross_attention_adaln`, `caption_proj_before_connector`, `bwe` vocoder) to detect the actual version.
 
 #### Audio-Video Support

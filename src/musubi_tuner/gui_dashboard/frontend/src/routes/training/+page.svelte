@@ -99,7 +99,7 @@
 							<FormSelect label="Precision" value={t.mixed_precision || 'no'} options={['no', 'fp16', 'bf16']} onchange={(e) => update('mixed_precision', e.target.value)} tooltip="Mixed precision mode" />
 						</div>
 						<div class="grid grid-cols-2 gap-2">
-							<FormSelect label="LTX Version" value={t.ltx_version || '2.0'} options={['2.0', '2.3']} onchange={(e) => update('ltx_version', e.target.value)} tooltip="Target LTX version behavior" />
+							<FormSelect label="LTX Version" value={t.ltx_version || '2.3'} options={['2.0', '2.3']} onchange={(e) => update('ltx_version', e.target.value)} tooltip="Target LTX version behavior" />
 							<FormSelect label="Version Check" value={t.ltx_version_check_mode || 'warn'} options={['off', 'warn', 'error']} onchange={(e) => update('ltx_version_check_mode', e.target.value)} tooltip="Behavior when the checkpoint and selected LTX version do not match." />
 						</div>
 						<div class="flex flex-wrap gap-x-4 gap-y-1">

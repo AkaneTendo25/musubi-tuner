@@ -70,7 +70,7 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
     parser.add_argument(
         "--ltx_version",
         type=str,
-        default="2.0",
+        default="2.3",
         choices=["2.0", "2.3"],
         help=(
             "Target LTX major trainer behavior. "

@@ -697,7 +697,7 @@ def _score_report(
     return {
         "meta": {
             "ltx_mode": getattr(args, "ltx_mode", "video"),
-            "ltx_version": getattr(args, "ltx_version", "2.0"),
+            "ltx_version": getattr(args, "ltx_version", "2.3"),
             "estimation_batches": valid_batches,
             "dataset_config": str(args.dataset_config),
             "checkpoint": str(args.ltx2_checkpoint),

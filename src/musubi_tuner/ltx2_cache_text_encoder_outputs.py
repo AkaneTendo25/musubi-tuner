@@ -378,7 +378,10 @@ def main() -> None:
         AVGemmaTextEncoderModelConfigurator,
         AV_GEMMA_TEXT_ENCODER_KEY_OPS,
     )
-    from musubi_tuner.ltx_2.text_encoders.gemma.encoders.base_encoder import module_ops_from_gemma_root
+    from musubi_tuner.ltx_2.text_encoders.gemma.encoders.base_encoder import (
+        apply_text_encoder_checkpoint_overrides,
+        module_ops_from_gemma_root,
+    )
     from musubi_tuner.ltx_2.text_encoders.gemma.encoders.video_only_encoder import (
         VIDEO_ONLY_GEMMA_TEXT_ENCODER_KEY_OPS,
         VideoGemmaTextEncoderModelConfigurator,
@@ -419,6 +422,7 @@ def main() -> None:
             bnb_4bit_compute_dtype=bnb_compute_dtype,
         ),
     ).build(device=device, dtype=dtype)
+    apply_text_encoder_checkpoint_overrides(text_encoder, str(text_encoder_checkpoint))
     text_encoder.eval()
 
     # If connector weights are missing, SingleGPUModelBuilder returns a meta-device model.

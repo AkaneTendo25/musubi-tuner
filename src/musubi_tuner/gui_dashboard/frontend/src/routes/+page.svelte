@@ -133,7 +133,7 @@
 		// LTX-2 DiT: 48 transformer blocks. VAE/Gemma NOT resident during training.
 		// LTX 2.0: ~19.6B params → BF16 39 GB, FP8 19.5 GB, FP32 78 GB
 		// LTX 2.3: ~21.0B params → BF16 42 GB, FP8 21 GB, FP32 84 GB
-		const ltxVersion = String(t.ltx_version || '2.0');
+		const ltxVersion = String(t.ltx_version || '2.3');
 		const ditBF16 = ltxVersion === '2.3' ? 42 : 39;
 		const isFp8 = !!t.fp8_base;
 		const isNF4 = !!t.nf4_base;

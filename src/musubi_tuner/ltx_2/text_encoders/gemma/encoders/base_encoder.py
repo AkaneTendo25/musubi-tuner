@@ -372,6 +372,86 @@ def _materialize_meta_buffer(
     setattr(submodule, attr_name, replacement)
 
 
+def apply_text_encoder_checkpoint_overrides(
+    text_encoder: torch.nn.Module,
+    checkpoint_path: str | None,
+    *,
+    prefix: str = "text_encoder.",
+) -> int:
+    """Overlay text-encoder weights stored inside a training checkpoint.
+
+    Full-FT checkpoints save Gemma weights under the ``text_encoder.`` prefix.
+    The runtime Gemma loader still rebuilds the module from ``gemma_root`` /
+    ``gemma_safetensors`` plus the checkpoint connectors, so we need to copy any
+    prefixed overrides on top of the rebuilt module to restore the finetuned
+    Gemma state.
+    """
+    if not checkpoint_path or not os.path.isfile(checkpoint_path):
+        return 0
+
+    override_keys: list[str] = []
+    with MemoryEfficientSafeOpen(checkpoint_path) as handle:
+        for key in handle.keys():
+            if key.startswith(prefix):
+                override_keys.append(key)
+
+        if not override_keys:
+            return 0
+
+        text_model = getattr(text_encoder, "model", None)
+        is_quantized = bool(getattr(text_model, "is_loaded_in_8bit", False)) or bool(
+            getattr(text_model, "is_loaded_in_4bit", False)
+        )
+        is_fp8 = bool(getattr(text_encoder, "_has_fp8_model", False))
+        if is_quantized or is_fp8:
+            raise ValueError(
+                "Checkpoint contains finetuned text_encoder weights, but the runtime Gemma load is quantized/fp8. "
+                "Load Gemma in full precision to restore finetuned text-encoder weights."
+            )
+
+        loaded = 0
+        for key in override_keys:
+            module_key = key[len(prefix):]
+            try:
+                submodule, attr_name = _resolve_module_and_attr(text_encoder, module_key)
+            except AttributeError:
+                logger.warning("Ignoring unknown text-encoder override key from checkpoint: %s", key)
+                continue
+
+            current_value = getattr(submodule, attr_name)
+            tensor = handle.get_tensor(key)
+
+            if isinstance(current_value, torch.nn.Parameter):
+                if tuple(current_value.shape) != tuple(tensor.shape):
+                    raise ValueError(
+                        f"Text-encoder override shape mismatch for {module_key}: "
+                        f"checkpoint={tuple(tensor.shape)} runtime={tuple(current_value.shape)}"
+                    )
+                replacement = torch.nn.Parameter(
+                    tensor.to(device=current_value.device, dtype=current_value.dtype),
+                    requires_grad=current_value.requires_grad,
+                )
+                setattr(submodule, attr_name, replacement)
+                loaded += 1
+                continue
+
+            if isinstance(current_value, torch.Tensor):
+                if tuple(current_value.shape) != tuple(tensor.shape):
+                    raise ValueError(
+                        f"Text-encoder override shape mismatch for {module_key}: "
+                        f"checkpoint={tuple(tensor.shape)} runtime={tuple(current_value.shape)}"
+                    )
+                setattr(submodule, attr_name, tensor.to(device=current_value.device, dtype=current_value.dtype))
+                loaded += 1
+                continue
+
+            logger.warning("Ignoring non-tensor text-encoder override target %s (%s)", module_key, type(current_value).__name__)
+
+    if loaded > 0:
+        logger.info("Applied %d finetuned text-encoder tensors from checkpoint: %s", loaded, checkpoint_path)
+    return loaded
+
+
 def module_ops_from_gemma_root(
     gemma_root: str | None,
     *,

@@ -346,7 +346,7 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
     if gemma_safetensors:
         cmd += ["--gemma_safetensors", gemma_safetensors]
     cmd += ["--ltx2_mode", t.ltx2_mode]
-    if t.ltx_version != "2.0":
+    if t.ltx_version != "2.3":
         cmd += ["--ltx_version", t.ltx_version]
     if t.ltx_version_check_mode != "warn":
         cmd += ["--ltx_version_check_mode", t.ltx_version_check_mode]

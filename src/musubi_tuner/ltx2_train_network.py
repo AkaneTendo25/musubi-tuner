@@ -121,6 +121,22 @@ def _merge_reference_tensors(refs: List[torch.Tensor], concat_dim: int) -> Optio
         return refs[0]
     return torch.cat(refs, dim=concat_dim)
 
+
+def _resolve_batch_captions(batch: Dict[str, Any]) -> Optional[list[str]]:
+    captions = batch.get("captions")
+    if captions is None:
+        return None
+    if isinstance(captions, str):
+        return [captions]
+    if isinstance(captions, (list, tuple)):
+        if not captions:
+            return []
+        for caption in captions:
+            if not isinstance(caption, str):
+                return None
+        return list(captions)
+    return None
+
 # Model loading functions moved to ltx2_model_loading.py
 # Parser functions moved to ltx2_args.py
 # Sampling/inference methods moved to ltx2_sampling.py (LTX2SamplingMixin)
@@ -160,6 +176,7 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
         self._latent_norm_cache: Dict = {}
         self._warned_missing_audio = False
         self._warned_ignored_ref_latents = False
+        self._warned_text_encoder_fallback = False
         self._audio_supervision_state = AudioSupervisionState()
 
         # Initialize latent normalization
@@ -174,7 +191,7 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
         self._i2v_training: bool = False
         self._ic_lora_strategy: str = "none"
         self._ltx_mode: str = "video"
-        self._ltx_version: str = "2.0"
+        self._ltx_version: str = "2.3"
         self._ltx2_audio_only_model: bool = False
         self._logged_audio_only_timestep_shift: bool = False
         self._audio_only_sequence_resolution: int = 64
@@ -1841,7 +1858,7 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             raise ValueError(f"Invalid ltx_mode: {ltx_mode}")
         self._ltx_mode = ltx_mode
 
-        ltx_version = str(getattr(args, "ltx_version", "2.0"))
+        ltx_version = str(getattr(args, "ltx_version", "2.3"))
         if ltx_version not in {"2.0", "2.3"}:
             raise ValueError(f"Invalid ltx_version: {ltx_version}. Expected '2.0' or '2.3'.")
         self._ltx_version = ltx_version
@@ -2544,10 +2561,95 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             text_mask = batch.get("text_mask")
 
         if text_embeds is None:
-            raise ValueError(
-                "Cached text embeddings missing from batch. Expected either batch['conditions'] (official format) "
-                "or 'text'/'text_mask' (legacy musubi format)."
+            use_full_ft_fallback = bool(getattr(args, "full_ft_train_text_encoder", False)) and bool(
+                getattr(args, "full_ft_text_encoder_fallback", False)
             )
+            enable_prompt_grad = bool(getattr(args, "full_ft_train_text_encoder", False))
+            if not use_full_ft_fallback:
+                raise ValueError(
+                    "Cached text embeddings missing from batch. Expected either batch['conditions'] (official format) "
+                    "or 'text'/'text_mask' (legacy musubi format)."
+                )
+
+            captions = _resolve_batch_captions(batch)
+            if captions is None:
+                raise ValueError(
+                    "Cached text embeddings missing from batch and fallback is enabled, but no captions were found. "
+                    "Set --full_ft_train_text_encoder with --full_ft_text_encoder_fallback and ensure batches include "
+                    "per-sample captions."
+                )
+            if len(captions) != latents.shape[0]:
+                raise ValueError(
+                    "Captions count mismatch for runtime text encoding. Expected one caption per sample in the batch. "
+                    f"captions={len(captions)} latents_batch={latents.shape[0]}"
+                )
+            if not self._warned_text_encoder_fallback:
+                logger.warning(
+                    "Runtime-fallbacking Gemma text encoder for %d captions because cached embeddings are missing.",
+                    len(captions),
+                )
+                self._warned_text_encoder_fallback = True
+
+            if not isinstance(conditions, dict):
+                conditions = {}
+            if self._text_encoder is None:
+                text_encoder_dtype = self._build_text_encoder(args, accelerator)
+            else:
+                text_encoder_dtype = torch.float32
+                first_param = next(self._text_encoder.parameters(), None)
+                if first_param is not None:
+                    text_encoder_dtype = first_param.dtype
+
+            encoded_pairs = []
+            for caption in captions:
+                embed, mask = self._encode_prompt_text(
+                    accelerator,
+                    caption,
+                    text_encoder_dtype,
+                    allow_grad=enable_prompt_grad,
+                )
+                if not isinstance(embed, torch.Tensor) or not isinstance(mask, torch.Tensor):
+                    raise TypeError("Gemma runtime text encoding must return tensors for both embedding and attention mask.")
+                if embed.dim() != 2:
+                    raise ValueError(
+                        f"Runtime text embedding must be [seq_len, hidden], got {tuple(embed.shape)} for caption={caption!r}"
+                    )
+                if mask.dim() != 1:
+                    raise ValueError(
+                        f"Runtime text mask must be 1D, got {tuple(mask.shape)} for caption={caption!r}"
+                    )
+                if embed.shape[0] != mask.shape[0]:
+                    raise ValueError(
+                        f"Runtime text embedding length and mask length mismatch for caption={caption!r}: "
+                        f"embed={tuple(embed.shape)} mask={tuple(mask.shape)}"
+                    )
+                encoded_pairs.append((embed, mask))
+
+            embed_dim = int(encoded_pairs[0][0].shape[1])
+            max_seq_len = max(int(embed.shape[0]) for embed, _ in encoded_pairs)
+            fallback_device = accelerator.device if enable_prompt_grad else torch.device("cpu")
+            fallback_text_embeds = torch.zeros(
+                (latents.shape[0], max_seq_len, embed_dim),
+                device=fallback_device,
+                dtype=encoded_pairs[0][0].dtype,
+            )
+            fallback_text_mask = torch.zeros(
+                (latents.shape[0], max_seq_len),
+                device=fallback_device,
+                dtype=encoded_pairs[0][1].dtype,
+            )
+            for sample_idx, (embed, mask) in enumerate(encoded_pairs):
+                if int(embed.shape[1]) != embed_dim:
+                    raise ValueError(
+                        "Runtime text embedding hidden size must match across all captions in a batch. "
+                        f"caption={captions[sample_idx]!r} has hidden={int(embed.shape[1])}, expected={embed_dim}"
+                    )
+                seq_len = int(embed.shape[0])
+                fallback_text_embeds[sample_idx, :seq_len, :] = embed
+                fallback_text_mask[sample_idx, :seq_len] = mask
+            text_embeds = fallback_text_embeds
+            text_mask = fallback_text_mask
+            conditions["prompt_embeds"] = text_embeds
 
         base_model = transformer.model if hasattr(transformer, "model") else transformer
         expected_video_dim = int(getattr(base_model, "cross_attention_dim", 0) or 0)

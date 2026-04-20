@@ -113,7 +113,7 @@ class TrainingConfig(BaseModel):
     gemma_root: str = ""
     gemma_safetensors: str = ""
     ltx2_mode: Literal["video", "av", "audio"] = "video"
-    ltx_version: Literal["2.0", "2.3"] = "2.0"
+    ltx_version: Literal["2.0", "2.3"] = "2.3"
     ltx_version_check_mode: Literal["off", "warn", "error"] = "warn"
     fp8_base: bool = False
     fp8_scaled: bool = False

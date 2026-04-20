@@ -586,7 +586,10 @@ class LTX2SamplingMixin:
             AVGemmaTextEncoderModelConfigurator,
             AV_GEMMA_TEXT_ENCODER_KEY_OPS,
         )
-        from musubi_tuner.ltx_2.text_encoders.gemma.encoders.base_encoder import module_ops_from_gemma_root
+        from musubi_tuner.ltx_2.text_encoders.gemma.encoders.base_encoder import (
+            apply_text_encoder_checkpoint_overrides,
+            module_ops_from_gemma_root,
+        )
         from musubi_tuner.ltx_2.text_encoders.gemma.encoders.video_only_encoder import (
             VIDEO_ONLY_GEMMA_TEXT_ENCODER_KEY_OPS,
             VideoGemmaTextEncoderModelConfigurator,
@@ -646,6 +649,7 @@ class LTX2SamplingMixin:
                 )
             except StopIteration:
                 pass
+        apply_text_encoder_checkpoint_overrides(self._text_encoder, str(args.ltx2_checkpoint))
         self._text_encoder.eval()
 
         # Connector LoRA: replace text encoder's connectors with the wrapper's
@@ -667,7 +671,22 @@ class LTX2SamplingMixin:
         accelerator: Accelerator,
         prompt_text: str,
         text_encoder_dtype: torch.dtype,
+        *,
+        allow_grad: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # Keep gradients for full-FT text-encoder training when explicitly requested.
+        if allow_grad:
+            with accelerator.autocast():
+                out = self._text_encoder(prompt_text, padding_side="left")
+                if self._ltx_mode == "audio":
+                    embed = out.audio_encoding if hasattr(out, "audio_encoding") else out.video_encoding
+                elif self._audio_video:
+                    embed = torch.cat([out.video_encoding, out.audio_encoding], dim=-1)
+                else:
+                    embed = out.video_encoding
+                mask = out.attention_mask
+            return embed.squeeze(0).to(dtype=text_encoder_dtype), mask.squeeze(0).to(dtype=out.attention_mask.dtype)
+
         with accelerator.autocast(), torch.no_grad():
             out = self._text_encoder(prompt_text, padding_side="left")
             if self._ltx_mode == "audio":

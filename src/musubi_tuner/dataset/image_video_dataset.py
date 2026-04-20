@@ -1091,6 +1091,7 @@ class BucketBatchManager:
         latent_cache_paths = []
         audio_cache_paths = []
         text_cache_paths = []
+        captions: list[str] = []
         for item_info in bucket[start:end]:
             sd_latent = load_file(item_info.latent_cache_path)
             audio_latent_cache_path = getattr(item_info, "audio_latent_cache_path", None)
@@ -1201,6 +1202,7 @@ class BucketBatchManager:
                 latent_cache_paths.append(item_info.latent_cache_path)
                 audio_cache_paths.append(audio_latent_cache_path)
                 text_cache_paths.append(item_info.text_encoder_output_cache_path)
+            captions.append(item_info.caption)
 
             # TODO refactor this
             for key in sd.keys():
@@ -1560,6 +1562,7 @@ class BucketBatchManager:
             batch_tensor_data["latent_cache_paths"] = latent_cache_paths
             batch_tensor_data["audio_cache_paths"] = audio_cache_paths
             batch_tensor_data["text_cache_paths"] = text_cache_paths
+        batch_tensor_data["captions"] = captions
 
         return batch_tensor_data
 

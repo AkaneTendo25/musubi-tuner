@@ -381,6 +381,56 @@ def _normalize_ltx2_batch_for_call_dit(batch: dict) -> dict:
     return normalized
 
 
+def _resolve_text_captions(batch: dict) -> list[str] | None:
+    """Return normalized caption list from a LTX-2 batch, if available."""
+    captions = batch.get("captions")
+    if captions is None:
+        return None
+    if isinstance(captions, str):
+        return [captions]
+    if isinstance(captions, (list, tuple)):
+        if len(captions) == 0:
+            return []
+        result: list[str] = []
+        for caption in captions:
+            if not isinstance(caption, str):
+                return None
+            result.append(caption)
+        return result
+    return None
+
+
+def _add_full_ft_text_encoder_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
+    parser.add_argument(
+        "--full_ft_train_text_encoder",
+        action="store_true",
+        default=False,
+        help=(
+            "Enable full-FT training for the Gemma text encoder in addition to the denoising transformer. "
+            "The text encoder is not trained by default in full-FT mode."
+        ),
+    )
+    parser.add_argument(
+        "--full_ft_text_encoder_lr",
+        type=float,
+        default=None,
+        help=(
+            "Learning rate for text-encoder parameters when --full_ft_train_text_encoder is enabled. "
+            "Defaults to --learning_rate."
+        ),
+    )
+    parser.add_argument(
+        "--full_ft_text_encoder_fallback",
+        action="store_true",
+        default=False,
+        help=(
+            "When --full_ft_train_text_encoder is enabled and a batch has no cached text embeddings, "
+            "encode captions through Gemma at runtime."
+        ),
+    )
+    return parser
+
+
 def _get_ltx2_batch_tensor(
     batch: dict,
     key: str,
@@ -2113,6 +2163,7 @@ def _build_full_ft_param_groups(
     non_block_lr_scale: float,
     attn_geometry_lr_scale: float,
     freeze_attn_geometry: bool,
+    exclude_param_prefixes: Optional[list[str]] = None,
 ) -> tuple[list[dict[str, Any]], list[list[str]], dict[str, Any]]:
     if base_lr <= 0:
         raise ValueError(f"learning_rate must be > 0 for full fine-tune, got {base_lr}")
@@ -2134,8 +2185,11 @@ def _build_full_ft_param_groups(
     frozen_attn_geometry_count = 0
     trainable_attn_geometry_count = 0
     trainable_by_block: dict[str, int] = {}
+    excluded_prefixes = tuple(exclude_param_prefixes or [])
 
     for name, param in transformer.named_parameters():
+        if any(name.startswith(prefix) for prefix in excluded_prefixes):
+            continue
         if not param.requires_grad:
             continue
 
@@ -2630,6 +2684,7 @@ def ltx2_finetune_setup_parser(parser: argparse.ArgumentParser) -> argparse.Argu
         default=False,
         help="Freeze attention geometry params (to_q/to_k/q_norm/k_norm) during full fine-tuning.",
     )
+    _add_full_ft_text_encoder_args(parser)
     parser.add_argument(
         "--save_comfy_format",
         action="store_true",
@@ -3105,6 +3160,23 @@ def main() -> None:
         return
 
     # optimizer
+    text_encoder = None
+    if bool(getattr(args, "full_ft_train_text_encoder", False)):
+        logger.info("Preparing Gemma text encoder for full fine-tuning.")
+        trainer._build_text_encoder(args, accelerator)
+        if trainer._text_encoder is None:
+            raise RuntimeError("Failed to initialize text encoder despite --full_ft_train_text_encoder.")
+        text_encoder = trainer._text_encoder
+        text_encoder_model = getattr(text_encoder, "model", None)
+        if bool(getattr(text_encoder, "_has_fp8_model", False)) or bool(getattr(text_encoder_model, "is_loaded_in_8bit", False)) or bool(
+            getattr(text_encoder_model, "is_loaded_in_4bit", False)
+        ):
+            raise ValueError(
+                "--full_ft_train_text_encoder requires full-precision Gemma weights. "
+                "Do not use gemma fp8/8bit/4bit loading for text-encoder full fine-tuning."
+            )
+        text_encoder.train()
+
     params_to_optimize, param_names, ft_group_stats = _build_full_ft_param_groups(
         transformer,
         args.learning_rate,
@@ -3115,6 +3187,29 @@ def main() -> None:
         attn_geometry_lr_scale=float(getattr(args, "attn_geometry_lr_scale", 1.0) or 0.0),
         freeze_attn_geometry=bool(getattr(args, "freeze_attn_geometry", False)),
     )
+    if text_encoder is not None:
+        text_encoder_lr = getattr(args, "full_ft_text_encoder_lr", None)
+        if text_encoder_lr is None:
+            text_encoder_lr = float(args.learning_rate)
+        text_encoder_lr = float(text_encoder_lr)
+        if text_encoder_lr <= 0:
+            raise ValueError(f"full_ft_text_encoder_lr must be > 0 when provided, got {text_encoder_lr}")
+        text_encoder_params: list[torch.nn.Parameter] = []
+        text_encoder_param_names: list[str] = []
+        for name, param in text_encoder.named_parameters():
+            if not param.requires_grad:
+                continue
+            text_encoder_params.append(param)
+            text_encoder_param_names.append(f"text_encoder.{name}")
+        if not text_encoder_params:
+            raise ValueError("No trainable text-encoder parameters found; check --full_ft_train_text_encoder inputs.")
+        params_to_optimize.append({"params": text_encoder_params, "lr": text_encoder_lr})
+        param_names.append(text_encoder_param_names)
+        ft_group_stats = dict(ft_group_stats)
+        ft_group_stats["text_encoder_param_count"] = int(sum(int(p.numel()) for p in text_encoder_params))
+        ft_group_stats["text_encoder_trainable_tensor_count"] = int(len(text_encoder_param_names))
+        ft_group_stats["text_encoder_lr"] = text_encoder_lr
+
     self_flow_projector_param_count = 0
     if bool(getattr(args, "self_flow", False)):
         self_flow_args = list(getattr(args, "self_flow_args", None) or [])
@@ -3172,6 +3267,13 @@ def main() -> None:
             int(ft_group_stats.get("trainable_attn_geometry_count", 0)),
             int(ft_group_stats.get("frozen_attn_geometry_count", 0)),
         )
+    if text_encoder is not None:
+        logger.info(
+            "Full-FT text encoder params: trainable_tensors=%d trainable_params=%d lr=%.6g",
+            int(ft_group_stats.get("text_encoder_trainable_tensor_count", 0)),
+            int(ft_group_stats.get("text_encoder_param_count", 0)),
+            float(ft_group_stats.get("text_encoder_lr", 0.0)),
+        )
 
     optimizer_name, optimizer_args, optimizer, optimizer_train_fn, optimizer_eval_fn = trainer.get_optimizer(
         args, params_to_optimize
@@ -3185,8 +3287,13 @@ def main() -> None:
         transformer = accelerator.prepare(transformer, device_placement=[not blocks_to_swap > 0])
         accelerator.unwrap_model(transformer).move_to_device_except_swap_blocks(accelerator.device)
         accelerator.unwrap_model(transformer).prepare_block_swap_before_forward()
+        if text_encoder is not None:
+            text_encoder = accelerator.prepare(text_encoder)
     else:
-        transformer = accelerator.prepare(transformer)
+        if text_encoder is not None:
+            transformer, text_encoder = accelerator.prepare(transformer, text_encoder)
+        else:
+            transformer = accelerator.prepare(transformer)
 
     if args.compile:
         transformer = trainer.compile_transformer(args, transformer)
@@ -3207,6 +3314,11 @@ def main() -> None:
     ema_model = None
     ema_state_path = os.path.join(args.output_dir, "ema_state.pt") if args.output_dir else None
     if args.use_ema:
+        if text_encoder is not None:
+            logger.warning(
+                "EMA is currently tracking transformer parameters only; text-encoder parameters will not be EMA-averaged "
+                "even when --full_ft_train_text_encoder is enabled."
+            )
         ema_device = torch.device("cpu") if args.ema_cpu_offload else None
         logger.info(
             "Initializing EMA with decay=%.6f, update_after_step=%d, update_every=%d, device=%s",
@@ -3315,7 +3427,7 @@ def main() -> None:
         "ss_timestep_sampling": args.timestep_sampling,
         "ss_sigmoid_scale": args.sigmoid_scale,
         "ss_discrete_flow_shift": args.discrete_flow_shift,
-        "ss_ltx_version": getattr(args, "ltx_version", "2.0"),
+        "ss_ltx_version": getattr(args, "ltx_version", "2.3"),
         "ss_shifted_logit_mode": getattr(args, "shifted_logit_mode", None),
         "ss_shifted_logit_eps": getattr(args, "shifted_logit_eps", 1e-3),
         "ss_shifted_logit_uniform_prob": getattr(args, "shifted_logit_uniform_prob", 0.1),
@@ -3401,8 +3513,14 @@ def main() -> None:
         "ss_non_block_lr_scale": getattr(args, "non_block_lr_scale", 1.0),
         "ss_attn_geometry_lr_scale": getattr(args, "attn_geometry_lr_scale", 1.0),
         "ss_freeze_attn_geometry": bool(getattr(args, "freeze_attn_geometry", False)),
+        "ss_full_ft_train_text_encoder": bool(getattr(args, "full_ft_train_text_encoder", False)),
+        "ss_full_ft_text_encoder_lr": getattr(args, "full_ft_text_encoder_lr", None),
+        "ss_full_ft_text_encoder_fallback": bool(getattr(args, "full_ft_text_encoder_fallback", False)),
+        "ss_full_ft_text_encoder_param_count": ft_group_stats.get("text_encoder_param_count", 0),
         "ss_full_ft_lr_group_scales": ft_group_stats.get("lr_scales"),
-        "ss_full_ft_frozen_blocks_applied": ft_group_stats.get("frozen_blocks"),    }
+        "ss_full_ft_frozen_blocks_applied": ft_group_stats.get("frozen_blocks"),
+        "ss_full_ft_text_encoder_lr_group": ft_group_stats.get("text_encoder_lr", None),
+    }
 
     checkpoint_extra_metadata = {k: str(v) for k, v in trainer.get_checkpoint_metadata(args).items()}
     if checkpoint_extra_metadata:
@@ -3516,6 +3634,13 @@ def main() -> None:
         # Build a zero-copy dict referencing live parameters (avoids state_dict() VRAM duplication)
         state_dict = {name: param.data for name, param in save_model_ref.named_parameters()}
         state_dict.update({name: buf for name, buf in save_model_ref.named_buffers()})
+        if text_encoder is not None:
+            unwrapped_text_encoder = accelerator.unwrap_model(text_encoder)
+            text_encoder_ref = getattr(unwrapped_text_encoder, "_orig_mod", None) or unwrapped_text_encoder
+            for name, param in text_encoder_ref.named_parameters():
+                state_dict[f"text_encoder.{name}"] = param.data
+            for name, buf in text_encoder_ref.named_buffers():
+                state_dict[f"text_encoder.{name}"] = buf
         state_dict, extra_meta = _prepare_state_dict_for_save(state_dict, args)
         if extra_meta:
             metadata_to_save.update(extra_meta)
@@ -4890,6 +5015,8 @@ def main() -> None:
         if ema_model is not None:
             save_ema_model(final_ckpt_name, global_step, num_train_epochs)
     save_self_flow_state()
+    if text_encoder is not None:
+        trainer._cleanup_text_encoder(accelerator)
 
     if accelerator.is_main_process:
         accelerator.end_training()
