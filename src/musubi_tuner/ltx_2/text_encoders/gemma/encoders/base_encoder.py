@@ -372,6 +372,18 @@ def _materialize_meta_buffer(
     setattr(submodule, attr_name, replacement)
 
 
+_QUANTIZED_LINEAR_CLASS_NAMES = frozenset({"Linear4bit", "Linear8bitLt", "FP8Linear"})
+
+
+def _override_target_is_quantized(submodule: torch.nn.Module, attr_name: str) -> bool:
+    if type(submodule).__name__ in _QUANTIZED_LINEAR_CLASS_NAMES:
+        return True
+    current = getattr(submodule, attr_name, None)
+    if isinstance(current, torch.Tensor) and current.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+        return True
+    return False
+
+
 def apply_text_encoder_checkpoint_overrides(
     text_encoder: torch.nn.Module,
     checkpoint_path: str | None,
@@ -385,6 +397,11 @@ def apply_text_encoder_checkpoint_overrides(
     ``gemma_safetensors`` plus the checkpoint connectors, so we need to copy any
     prefixed overrides on top of the rebuilt module to restore the finetuned
     Gemma state.
+
+    Overrides whose target module is quantized (bnb 4/8-bit) or fp8-wrapped
+    cannot be assigned as plain tensors, so they are skipped with an aggregated
+    warning; unquantized overrides (embeddings, layernorms, etc.) are still
+    applied.
     """
     if not checkpoint_path or not os.path.isfile(checkpoint_path):
         return 0
@@ -398,24 +415,18 @@ def apply_text_encoder_checkpoint_overrides(
         if not override_keys:
             return 0
 
-        text_model = getattr(text_encoder, "model", None)
-        is_quantized = bool(getattr(text_model, "is_loaded_in_8bit", False)) or bool(
-            getattr(text_model, "is_loaded_in_4bit", False)
-        )
-        is_fp8 = bool(getattr(text_encoder, "_has_fp8_model", False))
-        if is_quantized or is_fp8:
-            raise ValueError(
-                "Checkpoint contains finetuned text_encoder weights, but the runtime Gemma load is quantized/fp8. "
-                "Load Gemma in full precision to restore finetuned text-encoder weights."
-            )
-
         loaded = 0
+        skipped_quantized: list[str] = []
         for key in override_keys:
             module_key = key[len(prefix):]
             try:
                 submodule, attr_name = _resolve_module_and_attr(text_encoder, module_key)
             except AttributeError:
                 logger.warning("Ignoring unknown text-encoder override key from checkpoint: %s", key)
+                continue
+
+            if _override_target_is_quantized(submodule, attr_name):
+                skipped_quantized.append(module_key)
                 continue
 
             current_value = getattr(submodule, attr_name)
@@ -446,6 +457,16 @@ def apply_text_encoder_checkpoint_overrides(
                 continue
 
             logger.warning("Ignoring non-tensor text-encoder override target %s (%s)", module_key, type(current_value).__name__)
+
+    if skipped_quantized:
+        logger.warning(
+            "Checkpoint contains %d finetuned text_encoder override(s) whose target modules are "
+            "quantized/fp8 at runtime; they were NOT applied and those layers will use the base "
+            "Gemma weights. Load Gemma in full precision (no --gemma_load_in_4bit/8bit, non-fp8 "
+            "weights) to restore them. Affected keys (first 10): %s",
+            len(skipped_quantized),
+            skipped_quantized[:10],
+        )
 
     if loaded > 0:
         logger.info("Applied %d finetuned text-encoder tensors from checkpoint: %s", loaded, checkpoint_path)
