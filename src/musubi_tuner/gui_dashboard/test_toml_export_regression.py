@@ -6,8 +6,10 @@ import toml
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from musubi_tuner.gui_dashboard import toml_export
-from musubi_tuner.gui_dashboard.command_builder import build_slider_training_cmd, build_training_cmd
+from musubi_tuner.gui_dashboard.command_builder import build_cache_latents_cmd, build_cache_text_cmd, build_inference_cmd, build_slider_training_cmd, build_training_cmd
 from musubi_tuner.gui_dashboard.project_schema import ProjectConfig
+from musubi_tuner.gui_dashboard.validation import validate_process_config
+from musubi_tuner.ltx2_generate_video import _apply_reference_conditioning_overrides
 
 
 WINDOWS_VIDEO_DIR = r"E:\DaVinciResolve_Files_cache.gallery\LORA_STUFF\musubi-tuner-ltx2\projects\Kom\videos"
@@ -235,6 +237,212 @@ def test_training_command_builder_omits_default_av_ic_modifier_args(tmp_path):
     assert "--av_multi_ref" not in cmd
 
 
+def test_cache_text_command_builder_includes_explicit_fp8_weight_offload_flag(tmp_path):
+    config = ProjectConfig(
+        name="Cache Text Cmd",
+        project_dir=str(tmp_path),
+        dataset={
+            "datasets": [
+                {
+                    "type": "video",
+                    "directory": WINDOWS_VIDEO_DIR,
+                    "cache_directory": WINDOWS_CACHE_DIR,
+                }
+            ]
+        },
+        caching={
+            "ltx2_checkpoint": str(tmp_path / "ltx2.safetensors"),
+            "gemma_safetensors": str(tmp_path / "gemma_fp8.safetensors"),
+            "gemma_fp8_weight_offload": False,
+        },
+    )
+
+    cmd = build_cache_text_cmd(config)
+
+    assert "--no-gemma_fp8_weight_offload" in cmd
+    assert "--gemma_fp8_weight_offload" not in cmd
+
+
+def test_cache_latents_builder_includes_audio_only_overrides(tmp_path):
+    config = _build_config(tmp_path)
+    config.caching.ltx2_mode = "audio"
+    config.caching.audio_video_latent_channels = 128
+    config.caching.audio_video_latent_dtype = "float32"
+    config.caching.audio_only_target_resolution = 768
+    config.caching.audio_only_target_fps = 30.0
+
+    cmd = build_cache_latents_cmd(config)
+
+    assert "--audio_video_latent_channels" in cmd
+    assert cmd[cmd.index("--audio_video_latent_channels") + 1] == "128"
+    assert "--audio_video_latent_dtype" in cmd
+    assert cmd[cmd.index("--audio_video_latent_dtype") + 1] == "float32"
+    assert "--audio_only_target_resolution" in cmd
+    assert cmd[cmd.index("--audio_only_target_resolution") + 1] == "768"
+    assert "--audio_only_target_fps" in cmd
+    assert cmd[cmd.index("--audio_only_target_fps") + 1] == "30.0"
+
+
+def test_training_command_builder_includes_explicit_fp8_weight_offload_flag(tmp_path):
+    config = ProjectConfig(
+        name="Training Cmd",
+        project_dir=str(tmp_path),
+        dataset={
+            "datasets": [
+                {
+                    "type": "video",
+                    "directory": WINDOWS_VIDEO_DIR,
+                    "cache_directory": WINDOWS_CACHE_DIR,
+                }
+            ]
+        },
+        training={
+            "ltx2_checkpoint": str(tmp_path / "ltx2.safetensors"),
+            "gemma_safetensors": str(tmp_path / "gemma_fp8.safetensors"),
+            "gemma_fp8_weight_offload": False,
+        },
+    )
+
+    cmd = build_training_cmd(config)
+
+    assert "--no-gemma_fp8_weight_offload" in cmd
+    assert "--gemma_fp8_weight_offload" not in cmd
+
+
+def test_inference_command_builder_uses_gemma_safetensors_and_offload_flag(tmp_path):
+    config = ProjectConfig(
+        name="Inference Cmd",
+        project_dir=str(tmp_path),
+        default_gemma_safetensors=str(tmp_path / "default_gemma_fp8.safetensors"),
+        inference={
+            "ltx2_checkpoint": str(tmp_path / "ltx2.safetensors"),
+            "ltx2_mode": "video",
+            "gemma_root": "",
+            "gemma_safetensors": "",
+            "gemma_fp8_weight_offload": False,
+        },
+    )
+
+    cmd = build_inference_cmd(config)
+
+    assert "--gemma_safetensors" in cmd
+    assert cmd[cmd.index("--gemma_safetensors") + 1] == str(tmp_path / "default_gemma_fp8.safetensors")
+    assert "--no-gemma_fp8_weight_offload" in cmd
+
+
+def test_cache_text_validation_rejects_default_gemma_safetensors_with_bnb_quantization(tmp_path):
+    config = ProjectConfig(
+        name="Cache Text Validation",
+        project_dir=str(tmp_path),
+        default_gemma_safetensors=str(tmp_path / "default_gemma_fp8.safetensors"),
+        caching={
+            "ltx2_checkpoint": str(tmp_path / "ltx2.safetensors"),
+            "gemma_root": "",
+            "gemma_safetensors": "",
+            "gemma_load_in_8bit": True,
+        },
+    )
+
+    report = validate_process_config("cache_text", config)
+
+    assert report["ok"] is False
+    assert "caching.gemma_safetensors" in report["field_errors"]
+
+
+def test_training_validation_rejects_default_gemma_safetensors_with_bnb_quantization(tmp_path):
+    config = ProjectConfig(
+        name="Training Validation",
+        project_dir=str(tmp_path),
+        default_gemma_safetensors=str(tmp_path / "default_gemma_fp8.safetensors"),
+        dataset={
+            "datasets": [
+                {
+                    "type": "video",
+                    "directory": WINDOWS_VIDEO_DIR,
+                    "cache_directory": WINDOWS_CACHE_DIR,
+                }
+            ]
+        },
+        training={
+            "ltx2_checkpoint": str(tmp_path / "ltx2.safetensors"),
+            "gemma_root": "",
+            "gemma_safetensors": "",
+            "gemma_load_in_4bit": True,
+        },
+    )
+
+    report = validate_process_config("training", config)
+
+    assert report["ok"] is False
+    assert "training.gemma_safetensors" in report["field_errors"]
+
+
+def test_inference_validation_rejects_default_gemma_safetensors_with_bnb_quantization(tmp_path):
+    prompts_path = tmp_path / "prompts.txt"
+    prompts_path.write_text("a prompt", encoding="utf-8")
+    config = ProjectConfig(
+        name="Inference Validation",
+        project_dir=str(tmp_path),
+        default_gemma_safetensors=str(tmp_path / "default_gemma_fp8.safetensors"),
+        inference={
+            "ltx2_checkpoint": str(tmp_path / "ltx2.safetensors"),
+            "from_file": str(prompts_path),
+            "gemma_root": "",
+            "gemma_safetensors": "",
+            "gemma_load_in_8bit": True,
+        },
+    )
+
+    report = validate_process_config("inference", config)
+
+    assert report["ok"] is False
+    assert "inference.gemma_safetensors" in report["field_errors"]
+
+
+def test_reference_conditioning_override_replaces_prompt_reference_fields(tmp_path):
+    image_path = tmp_path / "ref.png"
+    image_path.write_bytes(b"fake")
+    prompts = [
+        {
+            "image_path": "old.png",
+            "conditioning_latent": object(),
+            "v2v_ref_path": "old.mp4",
+            "v2v_ref_latent": object(),
+        }
+    ]
+
+    ref_path, use_v2v = _apply_reference_conditioning_overrides(prompts, reference_image=str(image_path))
+
+    assert ref_path == str(image_path)
+    assert use_v2v is False
+    assert prompts[0]["image_path"] == str(image_path)
+    assert "conditioning_latent" not in prompts[0]
+    assert "v2v_ref_path" not in prompts[0]
+    assert "v2v_ref_latent" not in prompts[0]
+
+
+def test_reference_video_override_replaces_prompt_reference_fields(tmp_path):
+    video_path = tmp_path / "ref.mp4"
+    video_path.write_bytes(b"fake")
+    prompts = [
+        {
+            "image_path": "old.png",
+            "conditioning_latent": object(),
+            "v2v_ref_path": "old.mp4",
+            "v2v_ref_latent": object(),
+        }
+    ]
+
+    ref_path, use_v2v = _apply_reference_conditioning_overrides(prompts, reference_video=str(video_path))
+
+    assert ref_path == str(video_path)
+    assert use_v2v is True
+    assert prompts[0]["v2v_ref_path"] == str(video_path)
+    assert "image_path" not in prompts[0]
+    assert "conditioning_latent" not in prompts[0]
+    assert "v2v_ref_latent" not in prompts[0]
+
+
 def test_slider_toml_export_writes_reference_slider_fields(tmp_path):
     config = ProjectConfig(
         name="Slider IC Export",
@@ -289,3 +497,130 @@ def test_slider_command_builder_includes_mode_relevant_training_args(tmp_path):
     assert cmd[cmd.index("--ltx2_mode") + 1] == "video"
     assert "--lora_target_preset" in cmd
     assert cmd[cmd.index("--lora_target_preset") + 1] == "v2v"
+
+
+def test_slider_command_builder_includes_slider_cli_overrides(tmp_path):
+    config = ProjectConfig(
+        name="Slider Overrides",
+        project_dir=str(tmp_path),
+        training={
+            "ltx2_checkpoint": str(tmp_path / "ltx2.safetensors"),
+            "gemma_root": str(tmp_path / "gemma"),
+        },
+        slider={
+            "guidance_strength": 1.7,
+            "sample_slider_range": "-4,-2,0,2,4",
+        },
+    )
+
+    cmd = build_slider_training_cmd(config)
+
+    assert "--guidance_strength" in cmd
+    assert cmd[cmd.index("--guidance_strength") + 1] == "1.7"
+    assert "--sample_slider_range" in cmd
+    assert cmd[cmd.index("--sample_slider_range") + 1] == "-4,-2,0,2,4"
+
+
+def test_inference_command_builder_includes_advanced_cli_flags(tmp_path):
+    config = ProjectConfig(
+        name="Inference Cmd",
+        project_dir=str(tmp_path),
+        inference={
+            "ltx2_checkpoint": str(tmp_path / "ltx2.safetensors"),
+            "vae": str(tmp_path / "vae.safetensors"),
+            "vae_dtype": "float16",
+            "gemma_root": str(tmp_path / "gemma"),
+            "lora_weight": '"a.safetensors" "b.safetensors"',
+            "include_patterns": "double_blocks to_q",
+            "exclude_patterns": "skip_me",
+            "device": "cuda",
+            "stg_scale": 1.0,
+            "stg_blocks": "3 7 9",
+            "stg_mode": "both",
+            "rescale_scale": 0.7,
+            "flash_attn": True,
+            "fp8_w8a8": True,
+            "w8a8_mode": "fp8",
+            "fp8_upcast": True,
+            "fp8_upcast_stochastic": True,
+            "fp8_upcast_seed": 13,
+            "nf4_base": True,
+            "nf4_block_size": 128,
+            "loftq_init": True,
+            "loftq_iters": 4,
+            "awq_calibration": True,
+            "awq_alpha": 0.5,
+            "awq_num_batches": 16,
+            "network_dim": 32,
+            "split_attn_target": "video audio",
+            "split_attn_mode": "chunk",
+            "split_attn_chunk_size": 256,
+            "ffn_chunk_target": "video",
+            "ffn_chunk_size": 128,
+            "offloading": True,
+            "blocks_to_swap": 4,
+            "use_pinned_memory_for_block_swap": True,
+            "gemma_load_in_4bit": True,
+            "gemma_bnb_4bit_quant_type": "fp4",
+            "gemma_bnb_4bit_disable_double_quant": True,
+            "sample_i2v_token_timestep_mask": False,
+            "reference_downscale": 2,
+            "reference_frames": 5,
+            "sample_include_reference": True,
+            "reference_image": str(tmp_path / "ref.png"),
+            "reference_video": str(tmp_path / "ref.mp4"),
+            "sample_disable_audio": True,
+            "sample_audio_only": True,
+            "sample_merge_audio": True,
+            "sample_two_stage": True,
+            "spatial_upsampler_path": str(tmp_path / "upsampler.safetensors"),
+            "distilled_lora_path": str(tmp_path / "distilled.safetensors"),
+            "sample_stage2_steps": 5,
+            "sample_tiled_vae": True,
+            "sample_vae_tile_size": 768,
+            "sample_vae_tile_overlap": 96,
+            "sample_vae_temporal_tile_size": 16,
+            "sample_vae_temporal_tile_overlap": 12,
+            "sample_disable_flash_attn": True,
+            "use_precached_sample_prompts": True,
+            "sample_prompts_cache": str(tmp_path / "prompt_cache.pt"),
+            "use_precached_sample_latents": True,
+            "sample_latents_cache": str(tmp_path / "latents_cache.pt"),
+        },
+    )
+
+    cmd = build_inference_cmd(config)
+
+    assert "--device" in cmd
+    assert "--vae" in cmd
+    assert "--vae_dtype" in cmd
+    assert "--lora_weight" in cmd and cmd[cmd.index("--lora_weight") + 1:cmd.index("--lora_multiplier")] == ["a.safetensors", "b.safetensors"]
+    assert "--include_patterns" in cmd
+    assert "--exclude_patterns" in cmd
+    assert "--stg_scale" in cmd
+    assert "--stg_blocks" in cmd
+    assert "--rescale_scale" in cmd
+    assert "--flash_attn" in cmd
+    assert "--fp8_w8a8" in cmd
+    assert "--w8a8_mode" in cmd
+    assert "--nf4_base" in cmd
+    assert "--loftq_init" in cmd
+    assert "--awq_calibration" in cmd
+    assert "--split_attn_target" in cmd
+    assert "--ffn_chunk_target" in cmd
+    assert "--sample_with_offloading" in cmd
+    assert "--use_pinned_memory_for_block_swap" in cmd
+    assert "--gemma_bnb_4bit_quant_type" in cmd
+    assert "--gemma_bnb_4bit_disable_double_quant" in cmd
+    assert "--no-sample_i2v_token_timestep_mask" in cmd
+    assert "--reference_image" in cmd
+    assert "--reference_video" in cmd
+    assert "--sample_two_stage" in cmd
+    assert "--spatial_upsampler_path" in cmd
+    assert "--distilled_lora_path" in cmd
+    assert "--sample_tiled_vae" in cmd
+    assert "--sample_disable_flash_attn" in cmd
+    assert "--use_precached_sample_prompts" in cmd
+    assert "--sample_prompts_cache" in cmd
+    assert "--use_precached_sample_latents" in cmd
+    assert "--sample_latents_cache" in cmd

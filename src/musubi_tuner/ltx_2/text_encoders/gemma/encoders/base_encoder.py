@@ -484,6 +484,7 @@ def module_ops_from_gemma_root(
     bnb_4bit_quant_type: str = "nf4",
     bnb_4bit_use_double_quant: bool = True,
     bnb_4bit_compute_dtype: torch.dtype | None = None,
+    fp8_weight_offload: bool | None = None,
     device: torch.device | None = None,
 ) -> tuple[ModuleOps, ...]:
     # -- gemma_safetensors preprocessing --
@@ -727,12 +728,15 @@ def module_ops_from_gemma_root(
 
                 if keep_fp8:
                     from musubi_tuner.ltx_2.text_encoders.gemma.fp8_ops import replace_linear_with_fp8
-                    offload_fp8_weights = os.getenv("LTX2_GEMMA_SAFETENSORS_WEIGHT_OFFLOAD", "1").lower() in (
-                        "1",
-                        "true",
-                        "yes",
-                        "on",
-                    )
+                    if fp8_weight_offload is None:
+                        offload_fp8_weights = os.getenv("LTX2_GEMMA_SAFETENSORS_WEIGHT_OFFLOAD", "1").lower() in (
+                            "1",
+                            "true",
+                            "yes",
+                            "on",
+                        )
+                    else:
+                        offload_fp8_weights = bool(fp8_weight_offload)
                     n_replaced = replace_linear_with_fp8(
                         module.model,
                         torch_dtype,

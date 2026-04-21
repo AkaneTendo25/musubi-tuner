@@ -173,8 +173,8 @@ def create_management_app(project_path: Optional[str] = None) -> FastAPI:
         async def serve_frontend(full_path: str):
             file_path = os.path.join(FRONTEND_DIST, full_path)
             if full_path and os.path.isfile(file_path):
-                return FileResponse(file_path)
-            return FileResponse(os.path.join(FRONTEND_DIST, "index.html"))
+                return FileResponse(file_path, headers=NO_CACHE_HEADERS)
+            return FileResponse(os.path.join(FRONTEND_DIST, "index.html"), headers=NO_CACHE_HEADERS)
     else:
         @app.get("/")
         async def no_frontend():

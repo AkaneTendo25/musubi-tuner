@@ -11,7 +11,12 @@
 		invalid = false,
 		error = '',
 		onselect,
-		oninput
+		oninput,
+		actionLabel = '',
+		actionBusyLabel = '',
+		actionDisabled = false,
+		actionTooltip = '',
+		onaction
 	} = $props();
 
 	let showBrowser = $state(false);
@@ -19,6 +24,7 @@
 	let browserPath = $state('');
 	let browserParent = $state(null);
 	let serverCwd = $state('');
+	let compactAction = $derived(actionLabel && actionLabel.length <= 1);
 
 	async function openBrowser() {
 		showBrowser = true;
@@ -92,6 +98,23 @@
 			class="flex-1 px-3 py-2 text-sm transition-colors disabled:opacity-40"
 			style="background: var(--bg-input); border: 1px solid {invalid ? 'var(--danger)' : 'var(--border)'}; color: var(--text-primary); border-radius: var(--radius-sm);"
 		/>
+		{#if actionLabel}
+			<button
+				type="button"
+				onclick={onaction}
+				disabled={disabled || actionDisabled}
+				data-tooltip={actionTooltip || undefined}
+				class="text-sm font-medium disabled:opacity-40 flex-shrink-0"
+				class:px-2={compactAction}
+				class:py-1.5={compactAction}
+				class:min-w-9={compactAction}
+				class:px-3={!compactAction}
+				class:py-2={!compactAction}
+				style="background: var(--bg-elevated); border: 1px solid var(--border); color: var(--text-secondary); border-radius: var(--radius-sm);"
+				onmouseenter={(e) => e.currentTarget.style.background = 'var(--border)'}
+				onmouseleave={(e) => e.currentTarget.style.background = 'var(--bg-elevated)'}
+			>{actionDisabled && actionBusyLabel ? actionBusyLabel : actionLabel}</button>
+		{/if}
 		<!-- svelte-ignore a11y_no_static_element_interactions a11y_click_events_have_key_events -->
 		<button
 			type="button"

@@ -8,11 +8,13 @@
 	import CheckpointInput from '$lib/components/CheckpointInput.svelte';
 	import ProcessControls from '$lib/components/ProcessControls.svelte';
 	import CommandPanel from '$lib/components/CommandPanel.svelte';
-	import ModelDownloadPanel from '$lib/components/ModelDownloadPanel.svelte';
-	import { projectConfig, projectLoaded, updateSection } from '$lib/stores/project.js';
+	import { defaultModelDir, effectiveGemmaRoot, effectiveLtx2Checkpoint } from '$lib/utils/modelPaths.js';
+	import { startModelDownload, getModelDownloadStatus, cancelModelDownload, formatModelDownloadStatus, getModelDownloadTone, isActiveModelDownload } from '$lib/utils/modelDownloads.js';
+	import { projectConfig, projectLoaded, updateSection, saveProjectNow } from '$lib/stores/project.js';
 	import { processStatuses, processValidation, startProcess, stopProcess, validateProcess } from '$lib/stores/processes.js';
 	import { advancedMode } from '$lib/stores/uiMode.js';
 	import { goto } from '$app/navigation';
+	import { onMount } from 'svelte';
 
 	function update(key, value) { updateSection('training', key, value); }
 	async function startTraining() {
@@ -43,6 +45,92 @@
 	let hasValidationIssues = $derived((trainingValidation.errors?.length || 0) > 0 || (trainingValidation.warnings?.length || 0) > 0);
 	let hasDatasetValidationErrors = $derived((trainingValidation.errors || []).some((issue) => issue.page === 'dataset'));
 	let validationTimer = null;
+	let cwd = $state('');
+	let downloading = $state('');
+	let downloadJobId = $state('');
+	let downloadState = $state('');
+	let modelStatus = $state('');
+	let modelStatusTone = $state('muted');
+	let downloadPollTimer = null;
+
+	onMount(async () => {
+		try {
+			const res = await fetch('/api/fs/cwd');
+			if (res.ok) cwd = (await res.json()).cwd || '';
+		} catch {}
+		return () => {
+			clearTimeout(downloadPollTimer);
+		};
+	});
+
+	let modelDir = $derived(defaultModelDir(cwd, $projectConfig));
+	let resolvedLtx = $derived(effectiveLtx2Checkpoint(cwd, $projectConfig, t.ltx2_checkpoint || ''));
+	let resolvedGemma = $derived(effectiveGemmaRoot(cwd, $projectConfig, t.gemma_root || '', t.gemma_safetensors || ''));
+	let hasActiveDownload = $derived(Boolean(downloadJobId) && ['queued', 'running', 'cancelling'].includes(downloadState));
+
+	function setModelStatus(status) {
+		modelStatus = formatModelDownloadStatus(status);
+		modelStatusTone = getModelDownloadTone(status);
+		downloadState = status?.state || '';
+	}
+
+	async function finalizeDownload(status) {
+		if (status.state === 'completed' && status.path) {
+			update('ltx2_checkpoint', downloading === 'ltxav' ? status.path : t.ltx2_checkpoint || '');
+			if (downloading === 'gemma-unsloth') {
+				update('gemma_root', status.path);
+				update('gemma_safetensors', '');
+			}
+			projectConfig.update((config) => config ? { ...config, model_dir: modelDir } : config);
+			await saveProjectNow();
+		}
+		downloadJobId = '';
+		downloading = '';
+	}
+
+	async function pollDownload(jobId) {
+		clearTimeout(downloadPollTimer);
+		try {
+			const status = await getModelDownloadStatus(jobId);
+			setModelStatus(status);
+			if (!isActiveModelDownload(status)) {
+				await finalizeDownload(status);
+				return;
+			}
+			downloadPollTimer = setTimeout(() => pollDownload(jobId), 1000);
+		} catch (e) {
+			setModelStatus({ state: 'failed', error: e.message || 'Download status failed' });
+			downloadJobId = '';
+			downloading = '';
+		}
+	}
+
+	async function downloadModel(preset) {
+		if (downloadJobId) return;
+		const targetPath = preset === 'ltxav' ? resolvedLtx : resolvedGemma;
+		if (!targetPath) return;
+		try {
+			const job = await startModelDownload(preset, targetPath);
+			downloading = preset;
+			downloadJobId = job.job_id || '';
+			setModelStatus(job);
+			if (downloadJobId) {
+				await pollDownload(downloadJobId);
+			}
+		} catch (e) {
+			setModelStatus({ state: 'failed', error: e.message || 'Download failed' });
+		}
+	}
+
+	async function stopDownload() {
+		if (!downloadJobId) return;
+		try {
+			const status = await cancelModelDownload(downloadJobId);
+			setModelStatus(status);
+		} catch (e) {
+			setModelStatus({ state: 'failed', error: e.message || 'Cancel failed' });
+		}
+	}
 
 	function fieldError(field) {
 		return trainingValidation.field_errors?.[field]?.[0] || '';
@@ -75,22 +163,29 @@
 			<h2 class="text-base font-semibold" style="color: var(--text-primary);">Training</h2>
 			<p class="text-[12px]" style="color: var(--text-muted);">Configure and run LoRA training.</p>
 		</div>
-
-		<ModelDownloadPanel
-			section="training"
-			title="Download Required Models"
-			description="Download the DiT checkpoint or Gemma encoder without leaving training setup."
-		/>
-
 		<!-- Two-column layout -->
 		<div class="grid grid-cols-1 xl:grid-cols-2 gap-4">
 			<!-- Left column -->
 			<div class="space-y-3">
 				<FormGroup title="Model">
 					<div class="space-y-2 pt-2">
-						<CheckpointInput label="LTX-2 Checkpoint" value={t.ltx2_checkpoint || ''} onchange={(v) => update('ltx2_checkpoint', v)} showFiles tooltip="Path to LTX-2 checkpoint" invalid={fieldInvalid('training.ltx2_checkpoint')} error={fieldError('training.ltx2_checkpoint')} />
-						<CheckpointInput label="Gemma Root" value={t.gemma_root || ''} onchange={(v) => update('gemma_root', v)} tooltip="Gemma text encoder directory" invalid={fieldInvalid('training.gemma_root')} error={fieldError('training.gemma_root')} />
+						<CheckpointInput label="LTX-2 Checkpoint" value={t.ltx2_checkpoint || ''} onchange={(v) => update('ltx2_checkpoint', v)} showFiles tooltip="Path to LTX-2 checkpoint" invalid={fieldInvalid('training.ltx2_checkpoint')} error={fieldError('training.ltx2_checkpoint')} actionLabel="D" actionBusyLabel="..." actionDisabled={downloading === 'ltxav' && hasActiveDownload} actionTooltip={`Download to ${resolvedLtx}`} onaction={() => downloadModel('ltxav')} />
+						<CheckpointInput label="Gemma Root" value={t.gemma_root || ''} onchange={(v) => update('gemma_root', v)} tooltip="Gemma text encoder directory" invalid={fieldInvalid('training.gemma_root')} error={fieldError('training.gemma_root')} actionLabel="D" actionBusyLabel="..." actionDisabled={downloading === 'gemma-unsloth' && hasActiveDownload} actionTooltip={`Download to ${resolvedGemma}`} onaction={() => downloadModel('gemma-unsloth')} />
 						<PathInput label="Gemma Safetensors" value={t.gemma_safetensors || ''} oninput={(e) => update('gemma_safetensors', e.target.value)} showFiles tooltip="Single safetensors file (alternative to Gemma Root)" invalid={fieldInvalid('training.gemma_safetensors')} error={fieldError('training.gemma_safetensors')} />
+						{#if modelStatus}
+							<div class="flex items-center justify-between gap-3 text-[11px] px-3 py-2" style="color: {modelStatusTone === 'success' ? 'var(--success)' : modelStatusTone === 'accent' ? 'var(--accent)' : modelStatusTone === 'danger' ? 'var(--danger)' : 'var(--text-secondary)'}; background: {modelStatusTone === 'success' ? 'var(--success-muted, rgba(34,197,94,0.1))' : modelStatusTone === 'accent' ? 'var(--accent-muted)' : modelStatusTone === 'danger' ? 'var(--danger-muted)' : 'var(--bg-elevated)'}; border-radius: var(--radius-sm);">
+								<span>{modelStatus}</span>
+								{#if hasActiveDownload}
+									<button
+										type="button"
+										onclick={stopDownload}
+										disabled={downloadState === 'cancelling'}
+										class="px-2 py-1 text-[11px] font-medium disabled:opacity-40"
+										style="background: var(--bg-elevated); border: 1px solid var(--border); color: var(--text-secondary); border-radius: var(--radius-sm);"
+									>Stop</button>
+								{/if}
+							</div>
+						{/if}
 						{#if $advancedMode}
 							<PathInput label="Dataset Manifest" value={t.dataset_manifest || ''} oninput={(e) => update('dataset_manifest', e.target.value)} showFiles tooltip="Optional manifest file. If set, training uses this instead of regenerating dataset_config.toml." invalid={fieldInvalid('training.dataset_manifest')} error={fieldError('training.dataset_manifest')} />
 						{/if}
@@ -115,6 +210,7 @@
 								<FormToggle label="Sage Attn" checked={t.sage_attn ?? false} onchange={(e) => update('sage_attn', e.target.checked)} tooltip="Sage Attention backend" />
 								<FormToggle label="xFormers" checked={t.xformers ?? false} onchange={(e) => update('xformers', e.target.checked)} tooltip="xFormers attention" />
 								<FormToggle label="No Dbl Quant" checked={t.gemma_bnb_4bit_disable_double_quant ?? false} onchange={(e) => update('gemma_bnb_4bit_disable_double_quant', e.target.checked)} tooltip="Disable double quantization (4-bit)" />
+								<FormToggle label="FP8 Weight Offload" checked={t.gemma_fp8_weight_offload ?? true} onchange={(e) => update('gemma_fp8_weight_offload', e.target.checked)} tooltip="For FP8 Gemma safetensors, offload FP8 linear weights to CPU RAM. Disable this to keep more weights on VRAM and reduce RAM/pagefile pressure." />
 								<FormToggle label="Audio Only Model" checked={t.ltx2_audio_only_model ?? false} onchange={(e) => update('ltx2_audio_only_model', e.target.checked)} tooltip="Audio-only model architecture" />
 							</div>
 						{/if}
@@ -127,7 +223,7 @@
 							<FormField label="Network Module" value={t.network_module || ''} oninput={(e) => update('network_module', e.target.value || 'networks.lora_ltx2')} placeholder="networks.lora_ltx2" tooltip="LTX-2 LoRA network module. Clearing this resets it to the LTX-2 default." />
 						{/if}
 						<div class="grid grid-cols-3 gap-2">
-							<FormField label="Dim" type="number" value={t.network_dim ?? ''} oninput={(e) => update('network_dim', e.target.value ? Number(e.target.value) : null)} min={1} placeholder="CLI default" tooltip="LoRA rank. Leave blank to follow the trainer default." />
+							<FormField label="Dim" type="number" value={t.network_dim ?? ''} oninput={(e) => update('network_dim', e.target.value ? Number(e.target.value) : null)} min={1} placeholder="4 for default LoRA" tooltip="LoRA rank. Blank uses the network module default; for the standard LoRA module that is `4`." />
 							<FormField label="Alpha" type="number" value={t.network_alpha ?? 1.0} oninput={(e) => update('network_alpha', Number(e.target.value))} min={0} step="0.1" tooltip="LoRA alpha" />
 							<FormSelect label="Target" value={t.lora_target_preset || 't2v'} options={[
 								{ value: 't2v', label: 't2v (all attn)' },
@@ -256,7 +352,7 @@
 					<div class="space-y-2 pt-2">
 						<div class="grid grid-cols-2 gap-2">
 							<FormField label="LR" value={t.learning_rate ?? 2e-6} oninput={(e) => update('learning_rate', Number(e.target.value))} step="any" tooltip="Learning rate" />
-							<FormCombobox label="Optimizer" value={t.optimizer_type || ''} oninput={(e) => update('optimizer_type', e.target.value)} options={optimizerOptions} placeholder="CLI default" tooltip="Optimizer type (select preset or type custom)" />
+							<FormCombobox label="Optimizer" value={t.optimizer_type || ''} oninput={(e) => update('optimizer_type', e.target.value)} options={optimizerOptions} placeholder="AdamW" tooltip="Optimizer type. Blank uses the default `AdamW`." />
 						</div>
 						<div class="grid grid-cols-3 gap-2">
 							<FormSelect label="Scheduler" value={t.lr_scheduler || 'constant'} options={['constant', 'constant_with_warmup', 'cosine', 'cosine_with_restarts', 'linear', 'polynomial', 'rex']} onchange={(e) => update('lr_scheduler', e.target.value)} tooltip="LR schedule" />
@@ -278,7 +374,7 @@
 							</div>
 							<div class="grid grid-cols-3 gap-2">
 								<FormField label="Scheduler Power" type="number" value={t.lr_scheduler_power ?? 1.0} oninput={(e) => update('lr_scheduler_power', e.target.value ? Number(e.target.value) : null)} step="0.1" tooltip="Polynomial scheduler power." />
-								<FormField label="Scheduler Type" value={t.lr_scheduler_type || ''} oninput={(e) => update('lr_scheduler_type', e.target.value)} placeholder="CLI default" tooltip="Optional scheduler type override." />
+								<FormField label="Scheduler Type" value={t.lr_scheduler_type || ''} oninput={(e) => update('lr_scheduler_type', e.target.value)} placeholder="None" tooltip="Optional custom scheduler module override. Blank means no custom scheduler type." />
 								<FormField label="Scheduler Args" value={t.lr_scheduler_args || ''} oninput={(e) => update('lr_scheduler_args', e.target.value)} placeholder="key=value ..." tooltip="Extra scheduler arguments passed through to the trainer." />
 							</div>
 							<FormField label="Audio LR" type="number" value={t.audio_lr ?? ''} oninput={(e) => update('audio_lr', e.target.value ? Number(e.target.value) : null)} placeholder="Same as LR" step="any" tooltip="Separate LR for audio LoRA modules" />

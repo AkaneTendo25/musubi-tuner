@@ -385,7 +385,7 @@
 	<!-- Process Controls + Console — always visible -->
 	<div class="space-y-3">
 		<ProcessControls processType="training" status={trainingStatus} onStart={handleStart} onStop={handleStop} />
-		<ProcessConsole lines={trainingLogs} />
+		<ProcessConsole lines={trainingLogs} processType="training" initiallyCollapsed={false} />
 	</div>
 
 	{#if showDashboardData}

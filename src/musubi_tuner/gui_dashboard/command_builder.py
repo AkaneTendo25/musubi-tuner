@@ -10,16 +10,17 @@ from musubi_tuner.gui_dashboard.cli_defaults import (
     get_ltx2_training_network_module_default,
     get_ltx2_training_output_dir_default,
 )
+from musubi_tuner.model_defaults import (
+    DEFAULT_GEMMA_ROOT_NAME,
+    DEFAULT_LTX2_CHECKPOINT_NAME,
+    DEFAULT_MODEL_DIR_NAME,
+)
 from musubi_tuner.gui_dashboard.project_schema import ProjectConfig
 from musubi_tuner.gui_dashboard.toml_export import (
     _write_slider_toml,
     build_slider_toml_path,
     export_dataset_toml,
 )
-
-DEFAULT_MODEL_DIR_NAME = "models"
-DEFAULT_LTX2_CHECKPOINT_NAME = "ltx-2-19b-dev.safetensors"
-DEFAULT_GEMMA_ROOT_NAME = "gemma-3-12b-it"
 
 
 def _find_script(name: str) -> str:
@@ -84,7 +85,14 @@ def _effective_caching_sample_prompts(config: ProjectConfig) -> str:
 def _split_cli_args(raw: str) -> list[str]:
     if not raw:
         return []
-    return shlex.split(raw, posix=False)
+    parts = shlex.split(raw, posix=False)
+    normalized: list[str] = []
+    for part in parts:
+        if len(part) >= 2 and part[0] == part[-1] and part[0] in {"'", '"'}:
+            normalized.append(part[1:-1])
+        else:
+            normalized.append(part)
+    return normalized
 
 
 def _append_network_arg(args_parts: list[str], key: str, value) -> None:
@@ -152,6 +160,14 @@ def build_cache_latents_cmd(config: ProjectConfig) -> list[str]:
                 cmd += ["--ltx2_audio_ext", c.ltx2_audio_ext]
         if c.ltx2_audio_dtype:
             cmd += ["--ltx2_audio_dtype", c.ltx2_audio_dtype]
+        if c.audio_video_latent_channels is not None:
+            cmd += ["--audio_video_latent_channels", str(c.audio_video_latent_channels)]
+        if c.audio_video_latent_dtype:
+            cmd += ["--audio_video_latent_dtype", c.audio_video_latent_dtype]
+        if c.audio_only_target_resolution is not None:
+            cmd += ["--audio_only_target_resolution", str(c.audio_only_target_resolution)]
+        if c.audio_only_target_fps is not None:
+            cmd += ["--audio_only_target_fps", str(c.audio_only_target_fps)]
         if c.audio_only_sequence_resolution != 64:
             cmd += ["--audio_only_sequence_resolution", str(c.audio_only_sequence_resolution)]
 
@@ -211,6 +227,10 @@ def build_cache_text_cmd(config: ProjectConfig) -> list[str]:
         cmd.append("--gemma_bnb_4bit_disable_double_quant")
     if c.gemma_bnb_4bit_compute_dtype != "auto":
         cmd += ["--gemma_bnb_4bit_compute_dtype", c.gemma_bnb_4bit_compute_dtype]
+    if c.gemma_fp8_weight_offload:
+        cmd.append("--gemma_fp8_weight_offload")
+    else:
+        cmd.append("--no-gemma_fp8_weight_offload")
 
     # Precaching
     if c.precache_sample_prompts and sample_prompts:
@@ -238,20 +258,36 @@ def build_cache_text_cmd(config: ProjectConfig) -> list[str]:
 def build_inference_cmd(config: ProjectConfig) -> list[str]:
     """Build CLI args for ltx2_generate_video.py."""
     s = config.inference
+    gemma_safetensors = _effective_gemma_safetensors(config, s.gemma_safetensors)
+    gemma_root = _effective_gemma_root(config, s.gemma_root, gemma_safetensors)
 
     cmd = [
         sys.executable,
         "-u",
         _find_script("ltx2_generate_video.py"),
         "--ltx2_checkpoint", s.ltx2_checkpoint,
-        "--gemma_root", s.gemma_root,
         "--ltx2_mode", s.ltx2_mode,
     ]
 
+    if s.vae:
+        cmd += ["--vae", s.vae]
+    if s.vae_dtype:
+        cmd += ["--vae_dtype", s.vae_dtype]
+    if s.device:
+        cmd += ["--device", s.device]
+    if gemma_root:
+        cmd += ["--gemma_root", gemma_root]
+    if gemma_safetensors:
+        cmd += ["--gemma_safetensors", gemma_safetensors]
+
     # LoRA
     if s.lora_weight:
-        cmd += ["--lora_weight", s.lora_weight]
+        cmd += ["--lora_weight"] + _split_cli_args(s.lora_weight)
         cmd += ["--lora_multiplier", str(s.lora_multiplier)]
+    if s.include_patterns:
+        cmd += ["--include_patterns"] + _split_cli_args(s.include_patterns)
+    if s.exclude_patterns:
+        cmd += ["--exclude_patterns"] + _split_cli_args(s.exclude_patterns)
 
     # Prompt
     if s.prompt:
@@ -273,27 +309,141 @@ def build_inference_cmd(config: ProjectConfig) -> list[str]:
     cmd += ["--discrete_flow_shift", str(s.discrete_flow_shift)]
     if s.seed is not None:
         cmd += ["--seed", str(s.seed)]
+    if s.stg_scale != 0.0:
+        cmd += ["--stg_scale", str(s.stg_scale)]
+    if s.stg_blocks:
+        cmd += ["--stg_blocks"] + _split_cli_args(s.stg_blocks)
+    if s.stg_mode != "video":
+        cmd += ["--stg_mode", s.stg_mode]
+    if s.rescale_scale != 0.0:
+        cmd += ["--rescale_scale", str(s.rescale_scale)]
 
     # Precision
     if s.mixed_precision != "no":
         cmd += ["--mixed_precision", s.mixed_precision]
     cmd += ["--attn_mode", s.attn_mode]
+    if s.flash_attn:
+        cmd.append("--flash_attn")
+    if s.flash3:
+        cmd.append("--flash3")
+    if s.sdpa:
+        cmd.append("--sdpa")
+    if s.xformers:
+        cmd.append("--xformers")
     if s.fp8_base:
         cmd.append("--fp8_base")
     if s.fp8_scaled:
         cmd.append("--fp8_scaled")
+    if s.fp8_w8a8:
+        cmd.append("--fp8_w8a8")
+    if s.w8a8_mode != "int8":
+        cmd += ["--w8a8_mode", s.w8a8_mode]
+    if s.fp8_upcast:
+        cmd.append("--fp8_upcast")
+    if s.fp8_upcast_stochastic:
+        cmd.append("--fp8_upcast_stochastic")
+    if s.fp8_upcast_seed != 0:
+        cmd += ["--fp8_upcast_seed", str(s.fp8_upcast_seed)]
+    if s.nf4_base:
+        cmd.append("--nf4_base")
+    if s.nf4_block_size != 64:
+        cmd += ["--nf4_block_size", str(s.nf4_block_size)]
+    if s.loftq_init:
+        cmd.append("--loftq_init")
+    if s.loftq_iters != 2:
+        cmd += ["--loftq_iters", str(s.loftq_iters)]
+    if s.awq_calibration:
+        cmd.append("--awq_calibration")
+    if s.awq_alpha != 0.25:
+        cmd += ["--awq_alpha", str(s.awq_alpha)]
+    if s.awq_num_batches != 8:
+        cmd += ["--awq_num_batches", str(s.awq_num_batches)]
+    if s.network_dim:
+        cmd += ["--network_dim", str(s.network_dim)]
+    if s.split_attn_target:
+        cmd += ["--split_attn_target"] + _split_cli_args(s.split_attn_target)
+    if s.split_attn_mode:
+        cmd += ["--split_attn_mode", s.split_attn_mode]
+    if s.split_attn_chunk_size:
+        cmd += ["--split_attn_chunk_size", str(s.split_attn_chunk_size)]
+    if s.ffn_chunk_target:
+        cmd += ["--ffn_chunk_target"] + _split_cli_args(s.ffn_chunk_target)
+    if s.ffn_chunk_size:
+        cmd += ["--ffn_chunk_size", str(s.ffn_chunk_size)]
 
     # Gemma quantization
     if s.gemma_load_in_8bit:
         cmd.append("--gemma_load_in_8bit")
     if s.gemma_load_in_4bit:
         cmd.append("--gemma_load_in_4bit")
+        if s.gemma_bnb_4bit_quant_type != "nf4":
+            cmd += ["--gemma_bnb_4bit_quant_type", s.gemma_bnb_4bit_quant_type]
+    if s.gemma_bnb_4bit_disable_double_quant:
+        cmd.append("--gemma_bnb_4bit_disable_double_quant")
+    if s.gemma_fp8_weight_offload:
+        cmd.append("--gemma_fp8_weight_offload")
+    else:
+        cmd.append("--no-gemma_fp8_weight_offload")
 
     # Memory
     if s.offloading:
-        cmd.append("--offloading")
+        cmd.append("--sample_with_offloading")
     if s.blocks_to_swap is not None:
         cmd += ["--blocks_to_swap", str(s.blocks_to_swap)]
+    if s.use_pinned_memory_for_block_swap:
+        cmd.append("--use_pinned_memory_for_block_swap")
+
+    # Conditioning
+    if not s.sample_i2v_token_timestep_mask:
+        cmd.append("--no-sample_i2v_token_timestep_mask")
+    if s.reference_downscale != 1:
+        cmd += ["--reference_downscale", str(s.reference_downscale)]
+    if s.reference_frames != 1:
+        cmd += ["--reference_frames", str(s.reference_frames)]
+    if s.sample_include_reference:
+        cmd.append("--sample_include_reference")
+    if s.reference_image:
+        cmd += ["--reference_image", s.reference_image]
+    if s.reference_video:
+        cmd += ["--reference_video", s.reference_video]
+
+    # Audio / decode
+    if s.sample_disable_audio:
+        cmd.append("--sample_disable_audio")
+    if s.sample_audio_only:
+        cmd.append("--sample_audio_only")
+    if s.sample_merge_audio:
+        cmd.append("--sample_merge_audio")
+    if s.sample_two_stage:
+        cmd.append("--sample_two_stage")
+        if s.spatial_upsampler_path:
+            cmd += ["--spatial_upsampler_path", s.spatial_upsampler_path]
+        if s.distilled_lora_path:
+            cmd += ["--distilled_lora_path", s.distilled_lora_path]
+        if s.sample_stage2_steps != 3:
+            cmd += ["--sample_stage2_steps", str(s.sample_stage2_steps)]
+    if s.sample_tiled_vae:
+        cmd.append("--sample_tiled_vae")
+    if s.sample_vae_tile_size != 512:
+        cmd += ["--sample_vae_tile_size", str(s.sample_vae_tile_size)]
+    if s.sample_vae_tile_overlap != 64:
+        cmd += ["--sample_vae_tile_overlap", str(s.sample_vae_tile_overlap)]
+    if s.sample_vae_temporal_tile_size != 0:
+        cmd += ["--sample_vae_temporal_tile_size", str(s.sample_vae_temporal_tile_size)]
+    if s.sample_vae_temporal_tile_overlap != 8:
+        cmd += ["--sample_vae_temporal_tile_overlap", str(s.sample_vae_temporal_tile_overlap)]
+    if s.sample_disable_flash_attn:
+        cmd.append("--sample_disable_flash_attn")
+
+    # Precached inputs
+    if s.use_precached_sample_prompts:
+        cmd.append("--use_precached_sample_prompts")
+    if s.sample_prompts_cache:
+        cmd += ["--sample_prompts_cache", s.sample_prompts_cache]
+    if s.use_precached_sample_latents:
+        cmd.append("--use_precached_sample_latents")
+    if s.sample_latents_cache:
+        cmd += ["--sample_latents_cache", s.sample_latents_cache]
 
     # Output
     if s.output_dir:
@@ -368,6 +518,10 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
         cmd.append("--gemma_load_in_4bit")
     if t.gemma_bnb_4bit_disable_double_quant:
         cmd.append("--gemma_bnb_4bit_disable_double_quant")
+    if t.gemma_fp8_weight_offload:
+        cmd.append("--gemma_fp8_weight_offload")
+    else:
+        cmd.append("--no-gemma_fp8_weight_offload")
     if t.ltx2_audio_only_model:
         cmd.append("--ltx2_audio_only_model")
 
@@ -1020,12 +1174,20 @@ def build_slider_training_cmd(config: ProjectConfig) -> list[str]:
         cmd.append("--gemma_load_in_8bit")
     if t.gemma_load_in_4bit:
         cmd.append("--gemma_load_in_4bit")
+    if t.gemma_fp8_weight_offload:
+        cmd.append("--gemma_fp8_weight_offload")
+    else:
+        cmd.append("--no-gemma_fp8_weight_offload")
 
     # Text mode latent dimensions — slider-specific
     if s.mode == "text":
         cmd += ["--latent_frames", str(s.latent_frames)]
         cmd += ["--latent_height", str(s.latent_height)]
         cmd += ["--latent_width", str(s.latent_width)]
+    if s.guidance_strength != 1.0:
+        cmd += ["--guidance_strength", str(s.guidance_strength)]
+    if s.sample_slider_range != "-2,-1,0,1,2":
+        cmd += ["--sample_slider_range", s.sample_slider_range]
 
     # LoRA — from training config
     if t.network_dim is not None:

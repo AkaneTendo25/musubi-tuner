@@ -16,6 +16,11 @@ from sse_starlette.sse import EventSourceResponse
 logger = logging.getLogger(__name__)
 
 FRONTEND_DIST = os.path.join(os.path.dirname(__file__), "frontend", "dist")
+NO_CACHE_HEADERS = {
+    "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+    "Pragma": "no-cache",
+    "Expires": "0",
+}
 
 
 def create_app(run_dir: str) -> FastAPI:
@@ -83,8 +88,8 @@ def create_app(run_dir: str) -> FastAPI:
         async def serve_frontend(full_path: str):
             file_path = os.path.join(FRONTEND_DIST, full_path)
             if full_path and os.path.isfile(file_path):
-                return FileResponse(file_path)
-            return FileResponse(os.path.join(FRONTEND_DIST, "index.html"))
+                return FileResponse(file_path, headers=NO_CACHE_HEADERS)
+            return FileResponse(os.path.join(FRONTEND_DIST, "index.html"), headers=NO_CACHE_HEADERS)
     else:
         @app.get("/")
         async def no_frontend():

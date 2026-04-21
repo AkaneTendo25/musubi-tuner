@@ -38,7 +38,7 @@ def _group_by_field(issues: list[dict[str, Any]]) -> dict[str, list[str]]:
 
 def _build_report(errors: list[dict[str, Any]], warnings: list[dict[str, Any]]) -> dict[str, Any]:
     if errors:
-        summary = f"Fix {len(errors)} validation error{'s' if len(errors) != 1 else ''} before training."
+        summary = f"Fix {len(errors)} validation error{'s' if len(errors) != 1 else ''} before launch."
     elif warnings:
         summary = f"Validation passed with {len(warnings)} warning{'s' if len(warnings) != 1 else ''}."
     else:
@@ -101,8 +101,76 @@ def _has_training_gemma_source(config: ProjectConfig) -> bool:
     )
 
 
+def _has_inference_gemma_source(config: ProjectConfig) -> bool:
+    i = config.inference
+    return any(
+        _has_text(value)
+        for value in (
+            i.gemma_root,
+            i.gemma_safetensors,
+            config.default_gemma_root,
+            config.default_gemma_safetensors,
+        )
+    )
+
+
+def _has_cache_text_gemma_source(config: ProjectConfig) -> bool:
+    c = config.caching
+    return any(
+        _has_text(value)
+        for value in (
+            c.gemma_root,
+            c.gemma_safetensors,
+            config.default_gemma_root,
+            config.default_gemma_safetensors,
+        )
+    )
+
+
 def _has_training_checkpoint(config: ProjectConfig) -> bool:
     return _has_text(config.training.ltx2_checkpoint) or _has_text(config.default_ltx2_checkpoint)
+
+
+def _has_inference_checkpoint(config: ProjectConfig) -> bool:
+    return _has_text(config.inference.ltx2_checkpoint) or _has_text(config.default_ltx2_checkpoint)
+
+
+def _has_cache_text_checkpoint(config: ProjectConfig) -> bool:
+    return _has_text(config.caching.ltx2_checkpoint) or _has_text(config.default_ltx2_checkpoint)
+
+
+def _effective_gemma_safetensors(raw_path: str | None, default_path: str | None) -> str:
+    if _has_text(raw_path):
+        return str(raw_path).strip()
+    if _has_text(default_path):
+        return str(default_path).strip()
+    return ""
+
+
+def _validate_gemma_quantization_combo(
+    *,
+    errors: list[dict[str, Any]],
+    gemma_load_in_8bit: bool,
+    gemma_load_in_4bit: bool,
+    gemma_safetensors: str,
+    field_prefix: str,
+    page: str,
+) -> None:
+    if gemma_load_in_8bit and gemma_load_in_4bit:
+        message = "Gemma 8-bit and Gemma 4-bit cannot be enabled together."
+        errors.append(_make_issue("error", f"{field_prefix}.gemma_load_in_8bit", message, label="Gemma 8b", page=page))
+        errors.append(_make_issue("error", f"{field_prefix}.gemma_load_in_4bit", message, label="Gemma 4b", page=page))
+
+    if gemma_safetensors and (gemma_load_in_8bit or gemma_load_in_4bit):
+        errors.append(
+            _make_issue(
+                "error",
+                f"{field_prefix}.gemma_safetensors",
+                "Gemma Safetensors cannot be combined with Gemma 8-bit or 4-bit loading.",
+                label="Gemma Safetensors",
+                page=page,
+            )
+        )
 
 
 def _has_inline_training_sample_prompts(config: ProjectConfig) -> bool:
@@ -133,6 +201,7 @@ def validate_training_config(config: ProjectConfig) -> dict[str, Any]:
     t = config.training
     errors: list[dict[str, Any]] = []
     warnings: list[dict[str, Any]] = []
+    effective_gemma_safetensors = _effective_gemma_safetensors(t.gemma_safetensors, config.default_gemma_safetensors)
 
     if not _has_training_checkpoint(config):
         errors.append(
@@ -156,21 +225,14 @@ def validate_training_config(config: ProjectConfig) -> dict[str, Any]:
             )
         )
 
-    if t.gemma_load_in_8bit and t.gemma_load_in_4bit:
-        message = "Gemma 8-bit and Gemma 4-bit cannot be enabled together."
-        errors.append(_make_issue("error", "training.gemma_load_in_8bit", message, label="Gemma 8b", page="training"))
-        errors.append(_make_issue("error", "training.gemma_load_in_4bit", message, label="Gemma 4b", page="training"))
-
-    if _has_text(t.gemma_safetensors) and (t.gemma_load_in_8bit or t.gemma_load_in_4bit):
-        errors.append(
-            _make_issue(
-                "error",
-                "training.gemma_safetensors",
-                "Gemma Safetensors cannot be combined with Gemma 8-bit or 4-bit loading.",
-                label="Gemma Safetensors",
-                page="training",
-            )
-        )
+    _validate_gemma_quantization_combo(
+        errors=errors,
+        gemma_load_in_8bit=t.gemma_load_in_8bit,
+        gemma_load_in_4bit=t.gemma_load_in_4bit,
+        gemma_safetensors=effective_gemma_safetensors,
+        field_prefix="training",
+        page="training",
+    )
 
     if t.full_fp16 and t.full_bf16:
         message = "Full FP16 and Full BF16 cannot be enabled together."
@@ -351,6 +413,31 @@ def validate_cache_text_config(config: ProjectConfig) -> dict[str, Any]:
     c = config.caching
     errors: list[dict[str, Any]] = []
     warnings: list[dict[str, Any]] = []
+    effective_gemma_safetensors = _effective_gemma_safetensors(c.gemma_safetensors, config.default_gemma_safetensors)
+
+    if not _has_cache_text_checkpoint(config):
+        errors.append(
+            _make_issue(
+                "error",
+                "caching.ltx2_checkpoint",
+                "LTX-2 Checkpoint is required.",
+                label="LTX-2 Checkpoint",
+                page="caching",
+            )
+        )
+    if not _has_cache_text_gemma_source(config):
+        message = "Gemma Root or Gemma Safetensors is required for text encoder caching."
+        errors.append(_make_issue("error", "caching.gemma_root", message, label="Gemma Root", page="caching"))
+        errors.append(_make_issue("error", "caching.gemma_safetensors", message, label="Gemma Safetensors", page="caching"))
+
+    _validate_gemma_quantization_combo(
+        errors=errors,
+        gemma_load_in_8bit=c.gemma_load_in_8bit,
+        gemma_load_in_4bit=c.gemma_load_in_4bit,
+        gemma_safetensors=effective_gemma_safetensors,
+        field_prefix="caching",
+        page="caching",
+    )
 
     if c.precache_sample_prompts and not _has_any_sample_prompts(config):
         errors.append(
@@ -383,6 +470,54 @@ def validate_cache_text_config(config: ProjectConfig) -> dict[str, Any]:
     return _build_report(errors, warnings)
 
 
+def validate_inference_config(config: ProjectConfig) -> dict[str, Any]:
+    i = config.inference
+    errors: list[dict[str, Any]] = []
+    warnings: list[dict[str, Any]] = []
+    effective_gemma_safetensors = _effective_gemma_safetensors(i.gemma_safetensors, config.default_gemma_safetensors)
+
+    if not _has_inference_checkpoint(config):
+        errors.append(
+            _make_issue(
+                "error",
+                "inference.ltx2_checkpoint",
+                "LTX-2 Checkpoint is required.",
+                label="LTX-2 Checkpoint",
+                page="inference",
+            )
+        )
+
+    if not _has_text(i.prompt) and not _has_text(i.from_file):
+        message = "Prompt or Sample Prompts File is required."
+        errors.append(_make_issue("error", "inference.prompt", message, label="Prompt", page="inference"))
+        errors.append(_make_issue("error", "inference.from_file", message, label="Sample Prompts File", page="inference"))
+
+    if not _has_inference_gemma_source(config):
+        message = "Gemma Root or Gemma Safetensors is required for inference."
+        errors.append(_make_issue("error", "inference.gemma_root", message, label="Gemma Root", page="inference"))
+        errors.append(_make_issue("error", "inference.gemma_safetensors", message, label="Gemma Safetensors", page="inference"))
+
+    _validate_gemma_quantization_combo(
+        errors=errors,
+        gemma_load_in_8bit=i.gemma_load_in_8bit,
+        gemma_load_in_4bit=i.gemma_load_in_4bit,
+        gemma_safetensors=effective_gemma_safetensors,
+        field_prefix="inference",
+        page="inference",
+    )
+
+    _validate_sample_prompt_path(
+        config,
+        i.from_file,
+        errors=errors,
+        field="inference.from_file",
+        label="Sample Prompts File",
+        page="inference",
+    )
+
+    return _build_report(errors, warnings)
+
+
 def validate_process_config(proc_type: str, config: ProjectConfig) -> dict[str, Any]:
     if proc_type == "training":
         return validate_training_config(config)
@@ -390,4 +525,6 @@ def validate_process_config(proc_type: str, config: ProjectConfig) -> dict[str, 
         return validate_cache_latents_config(config)
     if proc_type == "cache_text":
         return validate_cache_text_config(config)
+    if proc_type == "inference":
+        return validate_inference_config(config)
     return _build_report([], [])

@@ -22,6 +22,15 @@ export const processLogs = writable({
 	slider_training: []
 });
 
+export const processConsoleUi = writable({
+	cache_latents: { collapsed: null },
+	cache_text: { collapsed: null },
+	cache_dino: { collapsed: null },
+	training: { collapsed: null },
+	inference: { collapsed: null },
+	slider_training: { collapsed: null }
+});
+
 function emptyValidation() {
 	return {
 		ok: true,
@@ -120,6 +129,16 @@ export function clearProcessLogs(type = null) {
 		}
 		return { ...current, [type]: [] };
 	});
+}
+
+export function setProcessConsoleCollapsed(type, collapsed) {
+	processConsoleUi.update((current) => ({
+		...current,
+		[type]: {
+			...(current[type] || {}),
+			collapsed
+		}
+	}));
 }
 
 function setProcessStatus(type, status) {

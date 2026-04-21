@@ -2,6 +2,7 @@
 	import FormField from '$lib/components/FormField.svelte';
 	import PathInput from '$lib/components/PathInput.svelte';
 	import StatsPanel from '$lib/components/StatsPanel.svelte';
+	import { defaultModelDir, effectiveGemmaRoot, effectiveLtx2Checkpoint } from '$lib/utils/modelPaths.js';
 	import { projectConfig, projectLoaded, createProject, loadProjectFromPath, saveProjectDebounced, recentProjects, removeRecentProject, closeProject } from '$lib/stores/project.js';
 	import { processStatuses } from '$lib/stores/processes.js';
 	import { status } from '$lib/stores/status.js';
@@ -40,10 +41,28 @@
 		error = '';
 		creating = true;
 		try {
+			const modelDir = defaultModelDir(cwd, null);
+			const seedConfig = { model_dir: modelDir };
+			const defaultLtx = effectiveLtx2Checkpoint(cwd, seedConfig, '');
+			const defaultGemma = effectiveGemmaRoot(cwd, seedConfig, '', '');
 			await createProject({
 				name: newProjectName,
 				project_dir: newProjectDir,
-				model_dir: cwd ? `${cwd}/models` : 'models'
+				model_dir: modelDir,
+				default_ltx2_checkpoint: defaultLtx,
+				default_gemma_root: defaultGemma,
+				caching: {
+					ltx2_checkpoint: defaultLtx,
+					gemma_root: defaultGemma,
+				},
+				training: {
+					ltx2_checkpoint: defaultLtx,
+					gemma_root: defaultGemma,
+				},
+				inference: {
+					ltx2_checkpoint: defaultLtx,
+					gemma_root: defaultGemma,
+				}
 			});
 		} catch (e) { error = e.message; }
 		creating = false;

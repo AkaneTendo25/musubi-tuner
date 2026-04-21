@@ -8,16 +8,29 @@
 	import ProcessConsole from '$lib/components/ProcessConsole.svelte';
 	import ProcessControls from '$lib/components/ProcessControls.svelte';
 	import CommandPanel from '$lib/components/CommandPanel.svelte';
-	import ModelDownloadPanel from '$lib/components/ModelDownloadPanel.svelte';
-	import { projectConfig, projectLoaded, updateSection } from '$lib/stores/project.js';
+	import { defaultModelDir, effectiveGemmaRoot, effectiveLtx2Checkpoint } from '$lib/utils/modelPaths.js';
+	import { startModelDownload, getModelDownloadStatus, cancelModelDownload, formatModelDownloadStatus, getModelDownloadTone, isActiveModelDownload } from '$lib/utils/modelDownloads.js';
+	import { projectConfig, projectLoaded, updateSection, saveProjectNow } from '$lib/stores/project.js';
 	import { processStatuses, processLogs, startProcess, stopProcess, preloadLogsIfActive, startLogPolling } from '$lib/stores/processes.js';
 	import { advancedMode } from '$lib/stores/uiMode.js';
 	import { onMount } from 'svelte';
 
+	let cwd = $state('');
+	let downloading = $state('');
+	let downloadJobId = $state('');
+	let downloadState = $state('');
+	let modelStatus = $state('');
+	let modelStatusTone = $state('muted');
+	let downloadPollTimer = null;
+
 	onMount(() => {
+		fetch('/api/fs/cwd').then((res) => res.ok ? res.json() : null).then((data) => { cwd = data?.cwd || ''; }).catch(() => {});
 		preloadLogsIfActive(['cache_latents', 'cache_text', 'cache_dino']);
 		const logInterval = startLogPolling(['cache_latents', 'cache_text', 'cache_dino'], 1000);
-		return () => clearInterval(logInterval);
+		return () => {
+			clearInterval(logInterval);
+			if (downloadPollTimer) clearTimeout(downloadPollTimer);
+		};
 	});
 
 	function updateCaching(key, value) { updateSection('caching', key, value); }
@@ -29,6 +42,74 @@
 	let latentLogs = $derived($processLogs.cache_latents || []);
 	let textLogs = $derived($processLogs.cache_text || []);
 	let dinoLogs = $derived($processLogs.cache_dino || []);
+	let modelDir = $derived(defaultModelDir(cwd, $projectConfig));
+	let resolvedLtx = $derived(effectiveLtx2Checkpoint(cwd, $projectConfig, caching.ltx2_checkpoint || ''));
+	let resolvedGemma = $derived(effectiveGemmaRoot(cwd, $projectConfig, caching.gemma_root || '', caching.gemma_safetensors || ''));
+	let hasActiveDownload = $derived(Boolean(downloadJobId) && ['queued', 'running', 'cancelling'].includes(downloadState));
+
+	function setModelStatus(status) {
+		modelStatus = formatModelDownloadStatus(status);
+		modelStatusTone = getModelDownloadTone(status);
+		downloadState = status?.state || '';
+	}
+
+	async function finalizeDownload(status) {
+		if (status.state === 'completed' && status.path) {
+			updateCaching('ltx2_checkpoint', downloading === 'ltxav' ? status.path : caching.ltx2_checkpoint || '');
+			if (downloading === 'gemma-unsloth') {
+				updateCaching('gemma_root', status.path);
+				updateCaching('gemma_safetensors', '');
+			}
+			projectConfig.update((config) => config ? { ...config, model_dir: modelDir } : config);
+			await saveProjectNow();
+		}
+		downloadJobId = '';
+		downloading = '';
+	}
+
+	async function pollDownload(jobId) {
+		if (downloadPollTimer) clearTimeout(downloadPollTimer);
+		try {
+			const status = await getModelDownloadStatus(jobId);
+			setModelStatus(status);
+			if (!isActiveModelDownload(status)) {
+				await finalizeDownload(status);
+				return;
+			}
+			downloadPollTimer = setTimeout(() => pollDownload(jobId), 1000);
+		} catch (e) {
+			setModelStatus({ state: 'failed', error: e.message || 'Download status failed' });
+			downloadJobId = '';
+			downloading = '';
+		}
+	}
+
+	async function downloadModel(preset) {
+		if (downloadJobId) return;
+		const targetPath = preset === 'ltxav' ? resolvedLtx : resolvedGemma;
+		if (!targetPath) return;
+		try {
+			const job = await startModelDownload(preset, targetPath);
+			downloading = preset;
+			downloadJobId = job.job_id || '';
+			setModelStatus(job);
+			if (downloadJobId) {
+				await pollDownload(downloadJobId);
+			}
+		} catch (e) {
+			setModelStatus({ state: 'failed', error: e.message || 'Download failed' });
+		}
+	}
+
+	async function stopDownload() {
+		if (!downloadJobId) return;
+		try {
+			const status = await cancelModelDownload(downloadJobId);
+			setModelStatus(status);
+		} catch (e) {
+			setModelStatus({ state: 'failed', error: e.message || 'Cancel failed' });
+		}
+	}
 </script>
 
 {#if !$projectLoaded}
@@ -41,30 +122,37 @@
 			<h2 class="text-base font-semibold" style="color: var(--text-primary);">Caching</h2>
 			<p class="text-[12px]" style="color: var(--text-muted);">Cache latents and text encoder outputs before training.</p>
 		</div>
-
-		<ModelDownloadPanel
-			section="caching"
-			title="Download Required Models"
-			description="Download the DiT checkpoint or Gemma encoder without leaving the caching page."
-		/>
-
 		<!-- Shared Settings -->
 		<div class="p-4 space-y-3" style="background: var(--bg-surface); border: 1px solid var(--border-subtle); border-radius: var(--radius-md);">
 			<div class="grid grid-cols-2 xl:grid-cols-3 gap-3">
-				<CheckpointInput label="LTX-2 Checkpoint" value={caching.ltx2_checkpoint || ''} onchange={(v) => updateCaching('ltx2_checkpoint', v)} showFiles tooltip="Path to the LTX-2 model checkpoint file" />
-				<CheckpointInput label="Gemma Root" value={caching.gemma_root || ''} onchange={(v) => updateCaching('gemma_root', v)} tooltip="Root directory containing Gemma text encoder weights" />
+				<CheckpointInput label="LTX-2 Checkpoint" value={caching.ltx2_checkpoint || ''} onchange={(v) => updateCaching('ltx2_checkpoint', v)} showFiles tooltip="Path to the LTX-2 model checkpoint file" actionLabel="D" actionBusyLabel="..." actionDisabled={downloading === 'ltxav' && hasActiveDownload} actionTooltip={`Download to ${resolvedLtx}`} onaction={() => downloadModel('ltxav')} />
+				<CheckpointInput label="Gemma Root" value={caching.gemma_root || ''} onchange={(v) => updateCaching('gemma_root', v)} tooltip="Root directory containing Gemma text encoder weights" actionLabel="D" actionBusyLabel="..." actionDisabled={downloading === 'gemma-unsloth' && hasActiveDownload} actionTooltip={`Download to ${resolvedGemma}`} onaction={() => downloadModel('gemma-unsloth')} />
 				<FormSelect label="LTX-2 Mode" value={caching.ltx2_mode || 'video'} options={['video', 'av', 'audio']} onchange={(e) => updateCaching('ltx2_mode', e.target.value)} tooltip="Video: visual only, AV: audio+video, Audio: audio only" />
 			</div>
+			{#if modelStatus}
+				<div class="flex items-center justify-between gap-3 text-[11px] px-3 py-2" style="color: {modelStatusTone === 'success' ? 'var(--success)' : modelStatusTone === 'accent' ? 'var(--accent)' : modelStatusTone === 'danger' ? 'var(--danger)' : 'var(--text-secondary)'}; background: {modelStatusTone === 'success' ? 'var(--success-muted, rgba(34,197,94,0.1))' : modelStatusTone === 'accent' ? 'var(--accent-muted)' : modelStatusTone === 'danger' ? 'var(--danger-muted)' : 'var(--bg-elevated)'}; border-radius: var(--radius-sm);">
+					<span>{modelStatus}</span>
+					{#if hasActiveDownload}
+						<button
+							type="button"
+							onclick={stopDownload}
+							disabled={downloadState === 'cancelling'}
+							class="px-2 py-1 text-[11px] font-medium disabled:opacity-40"
+							style="background: var(--bg-elevated); border: 1px solid var(--border); color: var(--text-secondary); border-radius: var(--radius-sm);"
+						>Stop</button>
+					{/if}
+				</div>
+			{/if}
 			<div class="grid grid-cols-2 gap-3">
 				<PathInput label="Gemma Safetensors" value={caching.gemma_safetensors || ''} oninput={(e) => updateCaching('gemma_safetensors', e.target.value)} showFiles tooltip="Single safetensors file (alternative to Gemma Root)" />
 				<PathInput label="Text Encoder Ckpt" value={caching.ltx2_text_encoder_checkpoint || ''} oninput={(e) => updateCaching('ltx2_text_encoder_checkpoint', e.target.value)} showFiles tooltip="Separate text encoder checkpoint (if different from main)" />
 			</div>
 			{#if $advancedMode}
 				<div class="grid grid-cols-2 xl:grid-cols-5 gap-3">
-					<FormSelect label="VAE Dtype" value={caching.vae_dtype || ''} options={[{ value: '', label: 'CLI default' }, 'float16', 'bfloat16', 'float32']} onchange={(e) => updateCaching('vae_dtype', e.target.value || null)} tooltip="Leave blank to follow the CLI default." />
-					<FormField label="Device" value={caching.device || ''} oninput={(e) => updateCaching('device', e.target.value || null)} placeholder="CLI default" tooltip="Torch device. Leave blank to follow the CLI default." />
+					<FormSelect label="VAE Dtype" value={caching.vae_dtype || ''} options={[{ value: '', label: 'bfloat16 (default)' }, 'float16', 'bfloat16', 'float32']} onchange={(e) => updateCaching('vae_dtype', e.target.value || null)} tooltip="VAE dtype for latent caching. Blank uses the default `bfloat16`." />
+					<FormField label="Device" value={caching.device || ''} oninput={(e) => updateCaching('device', e.target.value || null)} placeholder="Auto" tooltip="Torch device. Leave blank to auto-select the runtime device." />
 					<FormField label="Workers" type="number" value={caching.num_workers ?? ''} oninput={(e) => updateCaching('num_workers', e.target.value ? Number(e.target.value) : null)} placeholder="Auto" tooltip="Number of data loader workers" />
-					<FormSelect label="Quantize Device" value={caching.quantize_device || ''} options={[{ value: '', label: 'CLI default' }, { value: 'cuda', label: 'CUDA' }, { value: 'cpu', label: 'CPU' }]} onchange={(e) => updateCaching('quantize_device', e.target.value || null)} tooltip="Device for quantization-related work." />
+					<FormSelect label="Quantize Device" value={caching.quantize_device || ''} options={[{ value: '', label: 'Auto' }, { value: 'cuda', label: 'CUDA' }, { value: 'cpu', label: 'CPU' }]} onchange={(e) => updateCaching('quantize_device', e.target.value || null)} tooltip="Device for quantization-related work. Blank auto-selects." />
 					<FormToggle label="Keep Cache" checked={caching.keep_cache ?? false} onchange={(e) => updateCaching('keep_cache', e.target.checked)} tooltip="Keep old cache files when re-caching" />
 				</div>
 				<div class="flex flex-wrap gap-x-4 gap-y-1">
@@ -128,13 +216,21 @@
 									<FormField label="Audio Dtype" value={caching.ltx2_audio_dtype || ''} oninput={(e) => updateCaching('ltx2_audio_dtype', e.target.value)} placeholder="Auto" tooltip="Audio latent dtype" />
 									<FormField label="Audio Seq Res" type="number" value={caching.audio_only_sequence_resolution ?? 64} oninput={(e) => updateCaching('audio_only_sequence_resolution', Number(e.target.value))} min={1} tooltip="Audio-only sequence resolution" />
 								</div>
+								<div class="grid grid-cols-2 gap-2">
+									<FormField label="Video Latent Channels" type="number" value={caching.audio_video_latent_channels ?? ''} oninput={(e) => updateCaching('audio_video_latent_channels', e.target.value ? Number(e.target.value) : null)} placeholder="Auto" min={1} tooltip="Override video latent channels when caching audio-only latents" />
+									<FormField label="Video Latent Dtype" value={caching.audio_video_latent_dtype || ''} oninput={(e) => updateCaching('audio_video_latent_dtype', e.target.value)} placeholder="Auto" tooltip="Override video latent dtype for audio-only caching" />
+								</div>
+								<div class="grid grid-cols-2 gap-2">
+									<FormField label="Target Resolution" type="number" value={caching.audio_only_target_resolution ?? ''} oninput={(e) => updateCaching('audio_only_target_resolution', e.target.value ? Number(e.target.value) : null)} placeholder="Dataset default" min={1} tooltip="Square target resolution used to derive audio-only video latent shapes" />
+									<FormField label="Target FPS" type="number" value={caching.audio_only_target_fps ?? ''} oninput={(e) => updateCaching('audio_only_target_fps', e.target.value ? Number(e.target.value) : null)} placeholder="Default" min={0} step="0.1" tooltip="Target FPS used to derive frame count for audio-only caching" />
+								</div>
 							{/if}
 						</div>
 					</FormGroup>
 				{/if}
 
 				<ProcessControls processType="cache_latents" status={latentStatus} onStart={() => startProcess('cache_latents')} onStop={() => stopProcess('cache_latents')} />
-				<ProcessConsole lines={latentLogs} />
+				<ProcessConsole lines={latentLogs} processType="cache_latents" initiallyCollapsed={false} />
 				{#if $advancedMode}
 					<CommandPanel processType="cache_latents" defaultFilename="cache_latents.bat" />
 				{/if}
@@ -145,7 +241,11 @@
 				<span class="text-[11px] font-medium uppercase tracking-wider" style="color: var(--text-muted);">Cache Text Encoder</span>
 
 				{#if $advancedMode}
-					<FormSelect label="Mixed Precision" value={caching.mixed_precision || 'no'} options={['no', 'fp16', 'bf16']} onchange={(e) => updateCaching('mixed_precision', e.target.value)} tooltip="Mixed precision mode. Leave on `no` to match the CLI default." />
+					<FormGroup title="Text Encoder Runtime">
+						<div class="pt-2">
+							<FormSelect label="Mixed Precision" value={caching.mixed_precision || 'no'} options={['no', 'fp16', 'bf16']} onchange={(e) => updateCaching('mixed_precision', e.target.value)} tooltip="Mixed precision mode for text encoder caching." />
+						</div>
+					</FormGroup>
 				{/if}
 
 				{#if $advancedMode}
@@ -155,6 +255,7 @@
 								<FormToggle label="8-bit" checked={caching.gemma_load_in_8bit ?? false} onchange={(e) => updateCaching('gemma_load_in_8bit', e.target.checked)} tooltip="Load Gemma with 8-bit quantization" />
 								<FormToggle label="4-bit" checked={caching.gemma_load_in_4bit ?? false} onchange={(e) => updateCaching('gemma_load_in_4bit', e.target.checked)} tooltip="Load Gemma with 4-bit quantization" />
 								<FormToggle label="No Dbl Quant" checked={caching.gemma_bnb_4bit_disable_double_quant ?? false} onchange={(e) => updateCaching('gemma_bnb_4bit_disable_double_quant', e.target.checked)} tooltip="Disable double quantization" />
+								<FormToggle label="FP8 Weight Offload" checked={caching.gemma_fp8_weight_offload ?? true} onchange={(e) => updateCaching('gemma_fp8_weight_offload', e.target.checked)} tooltip="For FP8 Gemma safetensors, offload FP8 linear weights to CPU RAM. Disable this to keep more weights on VRAM and reduce RAM/pagefile pressure." />
 							</div>
 							{#if caching.gemma_load_in_4bit}
 								<div class="grid grid-cols-2 gap-2">
@@ -197,7 +298,7 @@
 				{/if}
 
 				<ProcessControls processType="cache_text" status={textStatus} onStart={() => startProcess('cache_text')} onStop={() => stopProcess('cache_text')} />
-				<ProcessConsole lines={textLogs} />
+				<ProcessConsole lines={textLogs} processType="cache_text" initiallyCollapsed={false} />
 				{#if $advancedMode}
 					<CommandPanel processType="cache_text" defaultFilename="cache_text.bat" />
 				{/if}

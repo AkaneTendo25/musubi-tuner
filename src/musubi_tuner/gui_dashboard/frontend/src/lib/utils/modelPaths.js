@@ -1,6 +1,6 @@
 export const DEFAULT_MODEL_DIR_NAME = 'models';
-export const DEFAULT_LTX2_CHECKPOINT_NAME = 'ltx-2-19b-dev.safetensors';
-export const DEFAULT_GEMMA_ROOT_NAME = 'gemma-3-12b-it';
+export const DEFAULT_LTX2_CHECKPOINT_NAME = 'ltx-2.3-22b-dev.safetensors';
+export const DEFAULT_GEMMA_ROOT_NAME = 'gemma-3-12b-it-qat-q4_0-unquantized';
 
 function normalizeBase(path) {
 	return (path || '').replace(/[\\/]+$/, '');

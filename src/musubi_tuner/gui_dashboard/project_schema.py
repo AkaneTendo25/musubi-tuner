@@ -11,6 +11,7 @@ from musubi_tuner.gui_dashboard.cli_defaults import (
     get_ltx2_training_network_module_default,
     get_ltx2_training_output_dir_default,
 )
+from musubi_tuner.model_defaults import default_gemma_root_path, default_ltx2_checkpoint_path
 
 
 class GeneralConfig(BaseModel):
@@ -76,6 +77,7 @@ class CachingConfig(BaseModel):
     gemma_bnb_4bit_quant_type: Literal["nf4", "fp4"] = "nf4"
     gemma_bnb_4bit_disable_double_quant: bool = False
     gemma_bnb_4bit_compute_dtype: Literal["auto", "fp16", "bf16", "fp32"] = "auto"
+    gemma_fp8_weight_offload: bool = True
     # Text encoder precaching
     precache_sample_prompts: bool = False
     sample_prompts: str = ""
@@ -96,6 +98,10 @@ class CachingConfig(BaseModel):
     ltx2_audio_dir: str = ""
     ltx2_audio_ext: str = ".wav"
     ltx2_audio_dtype: Optional[str] = None
+    audio_video_latent_channels: Optional[int] = None
+    audio_video_latent_dtype: Optional[str] = None
+    audio_only_target_resolution: Optional[int] = None
+    audio_only_target_fps: Optional[float] = None
     audio_only_sequence_resolution: int = 64
     # DINOv2 feature caching (for CREPA dino mode - model selection in training.crepa_dino_model)
     dino_batch_size: int = 16
@@ -124,6 +130,7 @@ class TrainingConfig(BaseModel):
     gemma_load_in_8bit: bool = False
     gemma_load_in_4bit: bool = False
     gemma_bnb_4bit_disable_double_quant: bool = False
+    gemma_fp8_weight_offload: bool = True
     ltx2_audio_only_model: bool = False
 
     # Quantization
@@ -462,9 +469,15 @@ class TrainingConfig(BaseModel):
 
 class InferenceConfig(BaseModel):
     ltx2_checkpoint: str = ""
+    vae: str = ""
+    vae_dtype: Optional[Literal["bfloat16", "float16", "float32"]] = None
+    device: Optional[str] = None
     gemma_root: str = ""
+    gemma_safetensors: str = ""
     lora_weight: str = ""
     lora_multiplier: float = 1.0
+    include_patterns: str = ""
+    exclude_patterns: str = ""
     prompt: str = ""
     negative_prompt: str = ""
     from_file: str = ""
@@ -479,15 +492,68 @@ class InferenceConfig(BaseModel):
     cfg_scale: Optional[float] = None
     discrete_flow_shift: float = 5.0
     seed: Optional[int] = None
+    stg_scale: float = 0.0
+    stg_blocks: str = ""
+    stg_mode: Literal["video", "audio", "both"] = "video"
+    rescale_scale: float = 0.0
     mixed_precision: Literal["no", "fp16", "bf16"] = "bf16"
     ltx2_mode: Literal["video", "av", "audio"] = "video"
     attn_mode: str = "torch"
+    flash_attn: bool = False
+    flash3: bool = False
+    sdpa: bool = False
+    xformers: bool = False
     fp8_base: bool = False
     fp8_scaled: bool = False
+    fp8_w8a8: bool = False
+    w8a8_mode: Literal["int8", "fp8"] = "int8"
+    fp8_upcast: bool = False
+    fp8_upcast_stochastic: bool = False
+    fp8_upcast_seed: int = 0
+    nf4_base: bool = False
+    nf4_block_size: int = 64
+    loftq_init: bool = False
+    loftq_iters: int = 2
+    awq_calibration: bool = False
+    awq_alpha: float = 0.25
+    awq_num_batches: int = 8
+    network_dim: int = 0
+    split_attn_target: str = ""
+    split_attn_mode: str = ""
+    split_attn_chunk_size: int = 0
+    ffn_chunk_target: str = ""
+    ffn_chunk_size: int = 0
     offloading: bool = False
     blocks_to_swap: Optional[int] = None
+    use_pinned_memory_for_block_swap: bool = False
     gemma_load_in_8bit: bool = False
     gemma_load_in_4bit: bool = False
+    gemma_bnb_4bit_quant_type: Literal["nf4", "fp4"] = "nf4"
+    gemma_bnb_4bit_disable_double_quant: bool = False
+    gemma_fp8_weight_offload: bool = True
+    sample_i2v_token_timestep_mask: bool = True
+    reference_downscale: int = 1
+    reference_frames: int = 1
+    sample_include_reference: bool = False
+    reference_image: str = ""
+    reference_video: str = ""
+    sample_disable_audio: bool = False
+    sample_audio_only: bool = False
+    sample_merge_audio: bool = False
+    sample_two_stage: bool = False
+    spatial_upsampler_path: str = ""
+    distilled_lora_path: str = ""
+    sample_stage2_steps: int = 3
+    sample_tiled_vae: bool = False
+    sample_vae_tile_size: int = 512
+    sample_vae_tile_overlap: int = 64
+    sample_vae_temporal_tile_size: int = 0
+    sample_vae_temporal_tile_overlap: int = 8
+    sample_disable_flash_attn: bool = False
+    use_precached_sample_prompts: bool = False
+    sample_prompts_cache: str = ""
+    use_precached_sample_latents: bool = False
+    sample_latents_cache: str = ""
 
 
 class SliderTargetConfig(BaseModel):
@@ -559,6 +625,27 @@ class ProjectConfig(BaseModel):
                 if not training.get('network_module'):
                     training['network_module'] = get_ltx2_training_network_module_default()
                 data['training'] = training
+
+            model_dir = data.get('model_dir') or None
+            default_ltx = data.get('default_ltx2_checkpoint') or default_ltx2_checkpoint_path(model_dir)
+            default_gemma = data.get('default_gemma_root') or default_gemma_root_path(model_dir)
+            data['default_ltx2_checkpoint'] = default_ltx
+            data['default_gemma_root'] = default_gemma
+
+            for section_name in ('caching', 'training', 'inference'):
+                section = data.get(section_name)
+                if section is None:
+                    section = {}
+                elif not isinstance(section, dict):
+                    continue
+                else:
+                    section = dict(section)
+
+                if not section.get('ltx2_checkpoint'):
+                    section['ltx2_checkpoint'] = default_ltx
+                if not section.get('gemma_root') and not section.get('gemma_safetensors'):
+                    section['gemma_root'] = default_gemma
+                data[section_name] = section
         return data
 
     def save(self, path: Optional[Path] = None):

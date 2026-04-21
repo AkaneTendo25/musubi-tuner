@@ -626,6 +626,7 @@ class LTX2SamplingMixin:
                 bnb_4bit_quant_type=str(getattr(args, "gemma_bnb_4bit_quant_type", "nf4")),
                 bnb_4bit_use_double_quant=not bool(getattr(args, "gemma_bnb_4bit_disable_double_quant", False)),
                 bnb_4bit_compute_dtype=text_encoder_dtype,
+                fp8_weight_offload=getattr(args, "gemma_fp8_weight_offload", None),
                 device=build_device,
             ),
         ).build(device=build_device, dtype=text_encoder_dtype)

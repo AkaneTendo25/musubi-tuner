@@ -1,0 +1,1 @@
+import{d,w as s}from"./DKBz8ZjG.js";const t=["basic","advanced"],o=typeof localStorage<"u"?localStorage.getItem("uiMode"):null,i=o&&t.includes(o)?o:"basic",a=s(i),n=d(a,e=>e==="advanced");a.subscribe(e=>{typeof localStorage<"u"&&localStorage.setItem("uiMode",e)});function l(e){t.includes(e)&&a.set(e)}export{n as a,l as s,a as u};

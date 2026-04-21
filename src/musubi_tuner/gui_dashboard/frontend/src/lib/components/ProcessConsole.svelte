@@ -1,11 +1,25 @@
 <script>
 	import { tick } from 'svelte';
+	import { processConsoleUi, setProcessConsoleCollapsed } from '$lib/stores/processes.js';
 
-	let { lines = [], maxLines = 1000 } = $props();
+	let { lines = [], maxLines = 1000, initiallyCollapsed = false, processType = null } = $props();
 
 	let container = $state(null);
 	let autoScroll = $state(true);
-	let collapsed = $state(true);
+	let localCollapsed = $state(false);
+	let collapsed = $derived.by(() => {
+		if (processType) {
+			const storedCollapsed = $processConsoleUi?.[processType]?.collapsed;
+			return storedCollapsed == null ? initiallyCollapsed : storedCollapsed;
+		}
+		return localCollapsed;
+	});
+
+	$effect(() => {
+		if (!processType) {
+			localCollapsed = initiallyCollapsed;
+		}
+	});
 
 	function stripAnsi(str) {
 		return str.replace(/\x1b\[[0-9;]*m/g, '').replace(/\r/g, '');
@@ -38,6 +52,17 @@
 	let displayLines = $derived(
 		collapsed ? (lines.length ? [lines[lines.length - 1]] : []) : lines.slice(-maxLines)
 	);
+
+	function toggleCollapsed() {
+		const next = !collapsed;
+		if (processType) {
+			setProcessConsoleCollapsed(processType, next);
+		} else {
+			localCollapsed = next;
+		}
+		autoScroll = true;
+		if (container) container.scrollTop = container.scrollHeight;
+	}
 </script>
 
 <div class="relative">
@@ -46,11 +71,7 @@
 			Console
 		</div>
 		<button
-			onclick={() => {
-				collapsed = !collapsed;
-				autoScroll = true;
-				if (container) container.scrollTop = container.scrollHeight;
-			}}
+			onclick={toggleCollapsed}
 			class="text-[10px] font-medium px-2 py-0.5"
 			style="background: var(--bg-elevated); border: 1px solid var(--border); color: var(--text-secondary); border-radius: var(--radius-sm);"
 		>{collapsed ? 'Expand log' : 'Collapse log'}</button>

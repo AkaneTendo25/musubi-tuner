@@ -163,7 +163,7 @@
 					<div class="mb-2">
 						<ProcessControls processType="cache_dino" status={dinoStatus} onStart={() => startProcess('cache_dino')} onStop={() => stopProcess('cache_dino')} />
 					</div>
-					<ProcessConsole lines={dinoLogs} />
+					<ProcessConsole lines={dinoLogs} processType="cache_dino" />
 					<CommandPanel processType="cache_dino" defaultFilename="cache_dino.bat" />
 				</div>
 			</div>

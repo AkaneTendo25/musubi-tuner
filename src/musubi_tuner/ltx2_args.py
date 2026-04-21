@@ -9,6 +9,7 @@ from musubi_tuner.hv_train_network import read_config_from_file, setup_parser_co
 from musubi_tuner.ltx_2.env import apply_ltx2_tweaks
 from musubi_tuner.ltx2_lycoris_runtime import apply_lycoris_preset_before_network_creation, is_lycoris_requested, process_lycoris_config
 from musubi_tuner.ltx2_train_network import IC_LORA_STRATEGIES
+from musubi_tuner.model_defaults import default_gemma_root_path, default_ltx2_checkpoint_path
 
 logger = logging.getLogger(__name__)
 
@@ -21,13 +22,13 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
     parser.add_argument(
         "--ltx2_checkpoint",
         type=str,
-        required=True,
+        default=default_ltx2_checkpoint_path(),
         help="Path to LTX-2 checkpoint (.safetensors)",
     )
     parser.add_argument(
         "--gemma_root",
         type=str,
-        default=None,
+        default=default_gemma_root_path(),
         help="Local directory containing Gemma weights/tokenizer (used for sample prompts)",
     )
     parser.add_argument(
@@ -57,6 +58,15 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         "--gemma_bnb_4bit_disable_double_quant",
         action="store_true",
         help="Disable bitsandbytes double quant for 4-bit loading.",
+    )
+    parser.add_argument(
+        "--gemma_fp8_weight_offload",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "When using FP8 Gemma safetensors, offload FP8 linear weights to CPU RAM. "
+            "Defaults to the LTX2_GEMMA_SAFETENSORS_WEIGHT_OFFLOAD environment variable when omitted."
+        ),
     )
 
     parser.add_argument(
