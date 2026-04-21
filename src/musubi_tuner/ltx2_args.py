@@ -250,6 +250,46 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         help="Scale for AV bimodal CFG. Applied as (scale-1) * (cond - bimodal). Default: 3.0.",
     )
     parser.add_argument(
+        "--stg_scale",
+        type=float,
+        default=0.0,
+        help=(
+            "Spatio-Temporal Guidance (STG) scale. 0.0 disables STG (default, no extra cost). "
+            "When > 0, runs a perturbed forward with self-attention skipped at --stg_blocks "
+            "and steers x0 by stg_scale * (cond - perturbed). Official pipeline uses ~1.0."
+        ),
+    )
+    parser.add_argument(
+        "--stg_blocks",
+        type=int,
+        nargs="*",
+        default=None,
+        help=(
+            "Transformer block indices to perturb for STG. None = all blocks. "
+            "Official default targets a single late block, e.g. --stg_blocks 29."
+        ),
+    )
+    parser.add_argument(
+        "--stg_mode",
+        type=str,
+        default="video",
+        choices=["video", "audio", "both"],
+        help=(
+            "Which modality to perturb for STG. 'video' skips video self-attn "
+            "(default), 'audio' skips audio self-attn, 'both' skips both (AV mode)."
+        ),
+    )
+    parser.add_argument(
+        "--rescale_scale",
+        type=float,
+        default=0.0,
+        help=(
+            "CFG★ rescaling strength after CFG+STG. 0.0 disables (default). "
+            "Official LTX-2.3 pipeline uses 0.7 — prevents oversaturation from "
+            "amplified guidance by rescaling prediction toward cond.std()."
+        ),
+    )
+    parser.add_argument(
         "--separate_audio_buckets",
         action="store_true",
         default=None,

@@ -107,6 +107,33 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cfg_scale", type=float, default=None, help="CFG scale (overrides guidance_scale when set)")
     parser.add_argument("--discrete_flow_shift", type=float, default=5.0, help="Flow matching shift parameter")
     parser.add_argument("--seed", type=int, default=None, help="Random seed (None = random)")
+    parser.add_argument(
+        "--stg_scale",
+        type=float,
+        default=0.0,
+        help="Spatio-Temporal Guidance scale (0.0 = disabled). Official recommended ~1.0. "
+             "Costs one extra transformer forward per denoising step.",
+    )
+    parser.add_argument(
+        "--stg_blocks",
+        type=int,
+        nargs="*",
+        default=None,
+        help="Transformer block indices to perturb for STG (None = all blocks).",
+    )
+    parser.add_argument(
+        "--stg_mode",
+        type=str,
+        default="video",
+        choices=["video", "audio", "both"],
+        help="Which self-attention modality to perturb for STG.",
+    )
+    parser.add_argument(
+        "--rescale_scale",
+        type=float,
+        default=0.0,
+        help="CFG\u2605 rescaling after CFG+STG. Official LTX-2.3 uses 0.7; 0 disables.",
+    )
 
     # -- Attention / DiT quantization --
     parser.add_argument("--attn_mode", type=str, default="torch",

@@ -2496,6 +2496,113 @@ class LTX2SamplingMixin:
                         )
                         audio_x0 = audio_x0 + (_av_bimodal_scale - 1) * (aud_x0_cond - bm_aud_x0_cond)
 
+                # --- STG (Spatio-Temporal Guidance): perturbed forward + steer x0 ---
+                # One extra forward with self-attention skipped at --stg_blocks; video_x0
+                # is pushed by stg_scale * (x0_cond - x0_perturbed). Opt-in; inert at 0.
+                _stg_scale = float(getattr(args, "stg_scale", 0.0) or 0.0)
+                if _stg_scale > 0.0 and video_pred is not None:
+                    from musubi_tuner.ltx_2.guidance.perturbations import (
+                        BatchedPerturbationConfig as _BPC_STG,
+                        Perturbation as _Pert_STG,
+                        PerturbationConfig as _PertCfg_STG,
+                        PerturbationType as _PertType_STG,
+                    )
+                    _stg_blocks_arg = getattr(args, "stg_blocks", None)
+                    _stg_mode_arg = str(getattr(args, "stg_mode", "video"))
+                    _stg_audio_allowed = (
+                        _stg_mode_arg in ("audio", "both")
+                        and audio_pred is not None
+                        and audio_latents is not None
+                        and not audio_ref_only_ic_sampling
+                    )
+
+                    _stg_pert_list = []
+                    if _stg_mode_arg in ("video", "both"):
+                        _stg_pert_list.append(
+                            _Pert_STG(type=_PertType_STG.SKIP_VIDEO_SELF_ATTN, blocks=_stg_blocks_arg)
+                        )
+                    if _stg_audio_allowed:
+                        _stg_pert_list.append(
+                            _Pert_STG(type=_PertType_STG.SKIP_AUDIO_SELF_ATTN, blocks=_stg_blocks_arg)
+                        )
+
+                    if _stg_pert_list:
+                        _stg_perturbations = _BPC_STG(
+                            perturbations=[_PertCfg_STG(perturbations=_stg_pert_list)]
+                        )
+                        _stg_options = {"patches_replace": {}, "perturbations": _stg_perturbations}
+                        if i2v_conditioning_mask_tokens is not None:
+                            _stg_options["video_conditioning_mask"] = i2v_conditioning_mask_tokens
+
+                        if do_classifier_free_guidance:
+                            _half = prompt_embeds.shape[0] // 2
+                            _stg_ctx = prompt_embeds[_half:]
+                            _stg_mask = prompt_mask[_half:] if prompt_mask is not None else None
+                        else:
+                            _stg_ctx = prompt_embeds
+                            _stg_mask = prompt_mask
+
+                        _stg_video = latents.to(dtype=dit_dtype)
+                        _stg_video_ts = sigma.expand(1).to(device=transformer_device, dtype=dit_dtype)
+
+                        _stg_audio = None
+                        _stg_audio_ts = None
+                        if _stg_audio_allowed:
+                            _stg_audio = audio_latents.to(dtype=dit_dtype)
+                            _stg_audio_ts = sigma.expand(int(audio_latents.shape[2])).view(1, -1).to(
+                                device=transformer_device, dtype=dit_dtype,
+                            )
+
+                        _stg_input = (
+                            [_stg_video, _stg_audio]
+                            if self._audio_video and _stg_audio is not None
+                            else _stg_video
+                        )
+
+                        _stg_pred = transformer(
+                            _stg_input,
+                            timestep=_stg_video_ts.unsqueeze(1),
+                            audio_timestep=_stg_audio_ts,
+                            context=_stg_ctx,
+                            attention_mask=_stg_mask,
+                            frame_rate=sample_parameter.get("frame_rate", 25),
+                            transformer_options=_stg_options,
+                            audio_only=audio_only,
+                        )
+
+                        if isinstance(_stg_pred, (list, tuple)):
+                            _stg_vpred, _stg_apred = _stg_pred
+                        else:
+                            _stg_vpred, _stg_apred = _stg_pred, None
+
+                        _v_base = x0_cond if x0_cond is not None else video_x0
+                        if _stg_mode_arg in ("video", "both") and _stg_vpred is not None:
+                            _stg_vpred = _stg_vpred.to(dtype=latents.dtype)
+                            _v_ptb = X0PredictionWrapper.velocity_to_x0(latents, _stg_vpred, sigma_for_video)
+                            video_x0 = video_x0 + _stg_scale * (_v_base - _v_ptb)
+
+                        if _stg_audio_allowed and _stg_apred is not None and audio_x0 is not None:
+                            _a_base = aud_x0_cond if aud_x0_cond is not None else audio_x0
+                            _stg_apred = _stg_apred.to(dtype=audio_latents.dtype)
+                            _a_ptb = X0PredictionWrapper.velocity_to_x0(audio_latents, _stg_apred, sigma.item())
+                            audio_x0 = audio_x0 + _stg_scale * (_a_base - _a_ptb)
+
+                # --- CFG\u2605 rescaling (official pipeline). 0.0 disables. ---
+                _rescale = float(getattr(args, "rescale_scale", 0.0) or 0.0)
+                if _rescale > 0.0:
+                    if x0_cond is not None and video_x0 is not None:
+                        _ps = video_x0.std()
+                        if _ps > 1e-6:
+                            _f = x0_cond.std() / _ps
+                            _f = _rescale * _f + (1.0 - _rescale)
+                            video_x0 = video_x0 * _f
+                    if aud_x0_cond is not None and audio_x0 is not None:
+                        _ps = audio_x0.std()
+                        if _ps > 1e-6:
+                            _f = aud_x0_cond.std() / _ps
+                            _f = _rescale * _f + (1.0 - _rescale)
+                            audio_x0 = audio_x0 * _f
+
                 # --- Video: denoise mask blend + Euler step + hard-lock ---
                 if denoise_mask is not None and clean_latent is not None:
                     video_x0 = video_x0 * denoise_mask + clean_latent * (1.0 - denoise_mask)
@@ -3464,6 +3571,10 @@ class LTX2SamplingMixin:
             conditioning_latent=conditioning_latent,
             use_i2v_token_timestep_mask=bool(getattr(args, "sample_i2v_token_timestep_mask", True)),
             offload_between_stages=bool(getattr(args, "sample_with_offloading", False)),
+            stg_scale=float(getattr(args, "stg_scale", 0.0) or 0.0),
+            stg_blocks=getattr(args, "stg_blocks", None),
+            stg_mode=str(getattr(args, "stg_mode", "video")),
+            rescale_scale=float(getattr(args, "rescale_scale", 0.0) or 0.0),
             extra={"audio_config": audio_config} if audio_config else {},
         )
 

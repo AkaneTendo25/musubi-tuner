@@ -12,7 +12,7 @@ import os
 import wave
 from dataclasses import dataclass, field
 from fractions import Fraction
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -52,6 +52,14 @@ class InferenceConfig:
 
     # Offloading
     offload_between_stages: bool = False
+
+    # STG (Spatio-Temporal Guidance) — opt-in, inert when stg_scale == 0.0
+    stg_scale: float = 0.0
+    stg_blocks: Optional[List[int]] = None  # None = all blocks
+    stg_mode: str = "video"  # "video" | "audio" | "both"
+
+    # CFG★ rescaling (official pipeline uses 0.7 for LTX-2.3). 0.0 disables.
+    rescale_scale: float = 0.0
 
     # Audio settings
     enable_audio: bool = False
@@ -330,6 +338,10 @@ class LTX2Inferencer:
         progress_desc: str = "LTX-2 inference",
         conditioning_latent: Optional[torch.Tensor] = None,
         use_i2v_token_timestep_mask: bool = True,
+        stg_scale: float = 0.0,
+        stg_blocks: Optional[List[int]] = None,
+        stg_mode: str = "video",
+        rescale_scale: float = 0.0,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Run the denoising loop with optional I2V conditioning.
 
@@ -487,7 +499,100 @@ class LTX2Inferencer:
                 # Apply CFG to x0 (official formula)
                 video_x0 = x0_uncond + cfg_scale * (x0_cond - x0_uncond)
             else:
-                video_x0 = X0PredictionWrapper.velocity_to_x0(latents, video_pred, sigma_for_video)
+                x0_cond = X0PredictionWrapper.velocity_to_x0(latents, video_pred, sigma_for_video)
+                video_x0 = x0_cond
+
+            # STG refinement: perturbed forward (self-attention skipped at chosen blocks),
+            # then steer x0 toward (x0_cond - x0_perturbed). Opt-in via stg_scale > 0.
+            x0_audio_ptb: Optional[torch.Tensor] = None
+            aud_x0_cond_for_stg: Optional[torch.Tensor] = None
+            stg_video_active = stg_scale > 0.0 and stg_mode in ("video", "both")
+            stg_audio_active = (
+                stg_scale > 0.0 and stg_mode in ("audio", "both") and audio_pred is not None
+            )
+            if stg_video_active or stg_audio_active:
+                from musubi_tuner.ltx_2.guidance.perturbations import (
+                    BatchedPerturbationConfig,
+                    Perturbation,
+                    PerturbationConfig,
+                    PerturbationType,
+                )
+
+                pert_list: List[Perturbation] = []
+                if stg_video_active:
+                    pert_list.append(
+                        Perturbation(type=PerturbationType.SKIP_VIDEO_SELF_ATTN, blocks=stg_blocks)
+                    )
+                if stg_audio_active:
+                    pert_list.append(
+                        Perturbation(type=PerturbationType.SKIP_AUDIO_SELF_ATTN, blocks=stg_blocks)
+                    )
+
+                if do_cfg:
+                    _halves = prompt_embeds.shape[0] // 2
+                    stg_context = prompt_embeds[_halves:]
+                    stg_ctx_mask = prompt_mask[_halves:] if prompt_mask is not None else None
+                else:
+                    stg_context = prompt_embeds
+                    stg_ctx_mask = prompt_mask
+
+                stg_latent = latents.to(dtype=self.dit_dtype)
+                stg_audio_lat = (
+                    audio_latents.to(dtype=self.dit_dtype) if audio_latents is not None else None
+                )
+                stg_timestep = sigma.expand(stg_latent.shape[0]).to(
+                    device=self.device, dtype=self.dit_dtype
+                )
+
+                stg_opts: Dict[str, Any] = {"patches_replace": {}}
+                if i2v_conditioning_mask_tokens is not None:
+                    stg_opts["video_conditioning_mask"] = i2v_conditioning_mask_tokens
+                stg_opts["perturbations"] = BatchedPerturbationConfig(
+                    [PerturbationConfig(perturbations=pert_list)] * stg_latent.shape[0]
+                )
+
+                if self._audio_video and stg_audio_lat is not None:
+                    stg_input = [stg_latent, stg_audio_lat]
+                else:
+                    stg_input = stg_latent
+
+                stg_pred = self.transformer(
+                    stg_input,
+                    timestep=stg_timestep.unsqueeze(1),
+                    context=stg_context,
+                    attention_mask=stg_ctx_mask,
+                    frame_rate=frame_rate,
+                    transformer_options=stg_opts,
+                    audio_only=audio_only,
+                )
+
+                stg_audio_vel = None
+                if isinstance(stg_pred, (list, tuple)):
+                    stg_video_vel, stg_audio_vel = stg_pred
+                else:
+                    stg_video_vel = stg_pred
+
+                if stg_video_active:
+                    stg_video_vel = stg_video_vel.to(dtype=latents.dtype)
+                    x0_video_ptb = X0PredictionWrapper.velocity_to_x0(
+                        latents, stg_video_vel, sigma_for_video
+                    )
+                    video_x0 = video_x0 + stg_scale * (x0_cond - x0_video_ptb)
+
+                if stg_audio_active and stg_audio_vel is not None and audio_latents is not None:
+                    stg_audio_vel = stg_audio_vel.to(dtype=audio_latents.dtype)
+                    x0_audio_ptb = X0PredictionWrapper.velocity_to_x0(
+                        audio_latents, stg_audio_vel, sigma.item()
+                    )
+
+            # CFG★ rescaling: after CFG + STG, rescale prediction toward cond.std() to
+            # prevent oversaturation from amplified guidance. Matches official MultiModalGuider.
+            if rescale_scale > 0.0 and x0_cond is not None:
+                pred_std = video_x0.std()
+                if pred_std > 1e-6:
+                    factor = x0_cond.std() / pred_std
+                    factor = rescale_scale * factor + (1.0 - rescale_scale)
+                    video_x0 = video_x0 * factor
 
             if denoise_mask is not None and clean_latent is not None:
                 # Official LTX-2 ordering: blend denoised x0 before Euler step.
@@ -509,7 +614,16 @@ class LTX2Inferencer:
                     aud_x0_cond = X0PredictionWrapper.velocity_to_x0(audio_latents, aud_vel_cond, sigma.item())
                     audio_x0 = aud_x0_uncond + cfg_scale * (aud_x0_cond - aud_x0_uncond)
                 else:
-                    audio_x0 = X0PredictionWrapper.velocity_to_x0(audio_latents, audio_pred, sigma.item())
+                    aud_x0_cond = X0PredictionWrapper.velocity_to_x0(audio_latents, audio_pred, sigma.item())
+                    audio_x0 = aud_x0_cond
+                if x0_audio_ptb is not None:
+                    audio_x0 = audio_x0 + stg_scale * (aud_x0_cond - x0_audio_ptb)
+                if rescale_scale > 0.0:
+                    pred_std = audio_x0.std()
+                    if pred_std > 1e-6:
+                        factor = aud_x0_cond.std() / pred_std
+                        factor = rescale_scale * factor + (1.0 - rescale_scale)
+                        audio_x0 = audio_x0 * factor
                 audio_latents = stepper.step(audio_latents, audio_x0, sigmas, step_idx)
 
         # Free I2V conditioning tensors to reclaim memory
@@ -666,6 +780,10 @@ class LTX2Inferencer:
                 progress_desc="Stage 1" if config.two_stage else "LTX-2 inference",
                 conditioning_latent=config.conditioning_latent,
                 use_i2v_token_timestep_mask=bool(config.use_i2v_token_timestep_mask),
+                stg_scale=config.stg_scale,
+                stg_blocks=config.stg_blocks,
+                stg_mode=config.stg_mode,
+                rescale_scale=config.rescale_scale,
             )
 
         # Stage 2: Upsample and refine (if two-stage)
@@ -773,6 +891,9 @@ class LTX2Inferencer:
                     progress_desc="Stage 2 refine",
                     conditioning_latent=config.conditioning_latent,
                     use_i2v_token_timestep_mask=bool(config.use_i2v_token_timestep_mask),
+                    stg_scale=config.stg_scale,
+                    stg_blocks=config.stg_blocks,
+                    stg_mode=config.stg_mode,
                 )
 
             # Remove distilled LoRA
