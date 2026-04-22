@@ -8,8 +8,11 @@ import shutil
 import subprocess
 import sys
 import locale
+from typing import Literal
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException, Query, Request
+
+from musubi_tuner.gui_dashboard.management_tools import get_management_status, launch_setup_tool, open_repo_in_file_browser
 
 router = APIRouter(prefix="/api/system", tags=["system"])
 
@@ -35,6 +38,43 @@ async def get_system_info():
         "os": platform.platform(),
         "python": sys.version.split()[0],
     }
+
+
+@router.get("/management-status")
+async def get_management_status_route(request: Request):
+    try:
+        return get_management_status(project_config=getattr(request.app.state, "project_config", None))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to load management status: {exc}") from exc
+
+
+@router.post("/management/open-setup")
+async def open_setup_tool(
+    request: Request,
+    branch: Literal["ltx-2", "ltx-2-dev"] | None = Query(default=None),
+):
+    process_manager = getattr(request.app.state, "process_manager", None)
+    if process_manager:
+        statuses = process_manager.get_all_statuses()
+        active = [name for name, status in statuses.items() if status.get("state") in {"running", "stopping"}]
+        if active:
+            raise HTTPException(status_code=409, detail=f"Cannot open Setup / Update while processes are active: {', '.join(active)}")
+    try:
+        return launch_setup_tool(branch_override=branch)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to open Setup / Update: {exc}") from exc
+
+
+@router.post("/management/open-repo")
+async def open_repo_folder():
+    try:
+        return open_repo_in_file_browser()
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to open repository folder: {exc}") from exc
 
 
 def _get_cpu_info() -> dict:

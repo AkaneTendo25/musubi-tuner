@@ -204,13 +204,13 @@
 							<FormToggle label="SDPA" checked={t.sdpa ?? false} onchange={(e) => update('sdpa', e.target.checked)} tooltip="PyTorch SDPA attention" />
 							<FormToggle label="Gemma 8b" checked={t.gemma_load_in_8bit ?? false} onchange={(e) => update('gemma_load_in_8bit', e.target.checked)} tooltip="8-bit quantization" />
 							<FormToggle label="Gemma 4b" checked={t.gemma_load_in_4bit ?? false} onchange={(e) => update('gemma_load_in_4bit', e.target.checked)} tooltip="4-bit quantization" />
+							<FormToggle label="FP8 Weight Offload" checked={t.gemma_fp8_weight_offload ?? true} onchange={(e) => update('gemma_fp8_weight_offload', e.target.checked)} tooltip="For FP8 Gemma safetensors, offload FP8 linear weights to CPU RAM. Disable this to keep more weights on VRAM and reduce RAM/pagefile pressure." />
 						</div>
 						{#if $advancedMode}
 							<div class="flex flex-wrap gap-x-4 gap-y-1">
 								<FormToggle label="Sage Attn" checked={t.sage_attn ?? false} onchange={(e) => update('sage_attn', e.target.checked)} tooltip="Sage Attention backend" />
 								<FormToggle label="xFormers" checked={t.xformers ?? false} onchange={(e) => update('xformers', e.target.checked)} tooltip="xFormers attention" />
 								<FormToggle label="No Dbl Quant" checked={t.gemma_bnb_4bit_disable_double_quant ?? false} onchange={(e) => update('gemma_bnb_4bit_disable_double_quant', e.target.checked)} tooltip="Disable double quantization (4-bit)" />
-								<FormToggle label="FP8 Weight Offload" checked={t.gemma_fp8_weight_offload ?? true} onchange={(e) => update('gemma_fp8_weight_offload', e.target.checked)} tooltip="For FP8 Gemma safetensors, offload FP8 linear weights to CPU RAM. Disable this to keep more weights on VRAM and reduce RAM/pagefile pressure." />
 								<FormToggle label="Audio Only Model" checked={t.ltx2_audio_only_model ?? false} onchange={(e) => update('ltx2_audio_only_model', e.target.checked)} tooltip="Audio-only model architecture" />
 							</div>
 						{/if}

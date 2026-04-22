@@ -171,6 +171,14 @@ def create_management_app(project_path: Optional[str] = None) -> FastAPI:
     if os.path.isdir(FRONTEND_DIST):
         @app.get("/{full_path:path}")
         async def serve_frontend(full_path: str):
+            normalized = (full_path or "").lstrip("/")
+            if normalized.startswith("api/"):
+                return JSONResponse({"detail": f"API route not found: /{normalized}"}, status_code=404, headers=NO_CACHE_HEADERS)
+            if normalized.startswith("data/"):
+                return Response(status_code=404, headers=NO_CACHE_HEADERS)
+            if normalized == "sse" or normalized.startswith("sse/"):
+                return Response(status_code=404, headers=NO_CACHE_HEADERS)
+
             file_path = os.path.join(FRONTEND_DIST, full_path)
             if full_path and os.path.isfile(file_path):
                 return FileResponse(file_path, headers=NO_CACHE_HEADERS)

@@ -81,7 +81,7 @@ Caching scripts (`ltx2_cache_latents.py`, `ltx2_cache_text_encoder_outputs.py`) 
   - [4a. Text-Only Mode](#4a-text-only-mode)
   - [4b. Reference Mode](#4b-reference-mode)
   - [Slider Tips](#slider-tips)
-- [Auto-Installer Script (WIP)](#auto-installer-script-wip)
+- [Setup / Update Script](#setup--update-script)
 - [References](#references)
 
 ---
@@ -110,7 +110,16 @@ Always match the CUDA version to your GPU architecture — check [PyTorch's comp
 
 ### Downloading Required Models
 
-The trainer does not download models automatically. You must manually download the following files before caching or training.
+> [!WARNING]
+> The dashboard UI and the Windows Setup / Update script are still early prototypes and work in progress. Their stable behavior is not guaranteed yet, and some flows may still break or change.
+
+You can now handle the common model downloads directly from the dashboard:
+
+- Use the project page to choose a template that matches your use case.
+- Open `Caching`, `Training`, or `Inference` and use the download actions beside the LTX-2 and Gemma model fields.
+- Use `Setup & Updates` in the dashboard to verify the install, repo state, shortcuts, and project readiness before you start caching or training.
+
+Manual download is still fully supported, and it remains useful if you want to manage checkpoints outside the default model directory.
 
 **LTX-2 Checkpoint** — use as `--ltx2_checkpoint`:
 - LTX-2 (19B): [ltx-2-19b-dev.safetensors](https://huggingface.co/Lightricks/LTX-2/resolve/main/ltx-2-19b-dev.safetensors)
@@ -259,7 +268,9 @@ python ltx2_cache_text_encoder_outputs.py ^
   --mixed_precision bf16
 ```
 
-- FP8 weights (`F8_E4M3` / `F8_E5M2`) are detected automatically and kept in FP8 on GPU (compute in bf16). By default FP8 weights are offloaded to CPU between encoding calls; set `LTX2_GEMMA_SAFETENSORS_WEIGHT_OFFLOAD=0` to keep them on GPU.
+- FP8 weights (`F8_E4M3` / `F8_E5M2`) are detected automatically and kept in FP8 on GPU (compute in bf16).
+- `--gemma_fp8_weight_offload` / `--no-gemma_fp8_weight_offload`: Explicitly enable or disable CPU offload for FP8 Gemma linear weights when using `--gemma_safetensors`.
+- If `--gemma_fp8_weight_offload` is omitted, the code falls back to `LTX2_GEMMA_SAFETENSORS_WEIGHT_OFFLOAD` (default environment fallback: enabled / `1`).
 - `--gemma_load_in_8bit` / `--gemma_load_in_4bit` cannot be combined with `--gemma_safetensors`.
 - If the file has no `spiece_model` key, tokenizer extraction fails — use `--gemma_root` instead.
 - Works in all scripts that load Gemma: `ltx2_cache_text_encoder_outputs.py`, `ltx2_train_network.py`, `ltx2_train_slider.py`, `ltx2_generate_video.py`.
@@ -1138,6 +1149,18 @@ python ltx2_generate_video.py ^
 The resulting LoRA is standard — no inference pipeline changes. Discarding the Stage 1 bridge at inference acts as an implicit regularizer that limits how far the model drifts from its pretrained video priors.
 
 HFATO can also be used standalone (without relay) as a spatial detail objective for image or video training.
+
+#### Standalone Inference Overrides
+
+`ltx2_generate_video.py` accepts a few standalone-inference-only overrides that are not part of the training sample table:
+
+- `--vae`: Use a separate VAE checkpoint for inference. If omitted, `--ltx2_checkpoint` is used for both DiT and VAE loading.
+- `--vae_dtype`: Override the VAE runtime dtype for inference. If omitted, the script uses its default VAE dtype (`bfloat16`).
+- `--reference_image`: Apply one global I2V reference image to all prompts in the current inference run.
+- `--reference_video`: Apply one global V2V reference video to all prompts in the current inference run.
+- If both `--reference_image` and `--reference_video` are supplied, `--reference_video` takes priority.
+- Global `--reference_image` / `--reference_video` overrides replace conflicting per-prompt `image_path` / `v2v_ref_path` entries loaded from prompt files, and also clear any cached reference latents tied to those prompt entries before sampling.
+- If the path passed to `--reference_image` has a video filename extension, the script treats it as a V2V reference and routes it through the video-reference path.
 
 #### Audio Quality Metrics
 
@@ -2442,12 +2465,23 @@ Additional notes:
 
 ---
 
-## Auto-Installer Script (WIP)
+## Setup / Update Script
+
+[`scripts/install.ps1`](https://github.com/AkaneTendo25/musubi-tuner/blob/ltx-2-dev/scripts/install.ps1) is the Windows setup and maintenance entry point.
 
 > [!WARNING]
-> This script is a **work in progress**. It has been tested on Windows 11 but may not cover every edge case. Please report issues.
+> The dashboard and `scripts/install.ps1` are still early prototypes and work in progress. Their stable behavior is not guaranteed.
 
-An all-in-one PowerShell installer is available at [`scripts/install.ps1`](https://github.com/AkaneTendo25/musubi-tuner/blob/ltx-2-dev/scripts/install.ps1). It automates the full setup: detecting/installing prerequisites (Git, Python, Node.js via winget/choco/scoop), cloning the repository, creating a virtual environment, installing PyTorch + all Python dependencies, optionally building the dashboard frontend, and creating a desktop shortcut to launch the dashboard.
+It can:
+
+- install or locate prerequisites (`git`, Python, Node.js)
+- clone the repository or update an existing checkout
+- create or repair the virtual environment
+- install or refresh Python dependencies
+- build or rebuild the dashboard frontend
+- create or recreate dashboard/setup launchers and desktop shortcuts
+- launch the dashboard
+- switch the target branch with `-Branch`
 
 **Quick start (one-liner):**
 
@@ -2455,7 +2489,7 @@ An all-in-one PowerShell installer is available at [`scripts/install.ps1`](https
 irm https://raw.githubusercontent.com/AkaneTendo25/musubi-tuner/ltx-2-dev/scripts/install.ps1 | iex
 ```
 
-This downloads and runs the installer with default settings (CUDA 12.8, Python 3.12, `ltx-2-dev` branch). An interactive menu lets you toggle which steps to run (install Git, clone repo, create venv, etc.).
+This downloads and runs the script with default settings (CUDA 12.8, Python 3.12, `ltx-2-dev` branch). Interactive mode shows the available actions and lets you choose which ones to run.
 
 **With custom parameters** — save the script locally first:
 
@@ -2466,5 +2500,7 @@ irm https://raw.githubusercontent.com/AkaneTendo25/musubi-tuner/ltx-2-dev/script
 
 Available parameters: `-InstallRoot`, `-Branch`, `-Cuda` (`cu124`/`cu128`/`cu130`/`cpu`), `-PythonVersion` (`3.10`-`3.13`), `-Port`, `-DashboardHost`, `-NonInteractive`, `-PreflightOnly`.
 
-The script writes a timestamped log to `%TEMP%` and prints a support bundle on failure for easier debugging.
+On success the script writes launchers and desktop shortcuts for the dashboard and the setup tool, and records install state used by later runs.
+
+The script writes a timestamped log to `%TEMP%`. On failure it prints support details at the end of the run.
 

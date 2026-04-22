@@ -143,20 +143,21 @@
 					{/if}
 				</div>
 			{/if}
-			<div class="grid grid-cols-2 gap-3">
+			<div class="grid grid-cols-2 xl:grid-cols-4 gap-3">
 				<PathInput label="Gemma Safetensors" value={caching.gemma_safetensors || ''} oninput={(e) => updateCaching('gemma_safetensors', e.target.value)} showFiles tooltip="Single safetensors file (alternative to Gemma Root)" />
 				<PathInput label="Text Encoder Ckpt" value={caching.ltx2_text_encoder_checkpoint || ''} oninput={(e) => updateCaching('ltx2_text_encoder_checkpoint', e.target.value)} showFiles tooltip="Separate text encoder checkpoint (if different from main)" />
+				<FormSelect label="Text Precision" value={caching.mixed_precision || 'no'} options={['no', 'fp16', 'bf16']} onchange={(e) => updateCaching('mixed_precision', e.target.value)} tooltip="Mixed precision mode for text encoder caching." />
+				<FormField label="Workers" type="number" value={caching.num_workers ?? ''} oninput={(e) => updateCaching('num_workers', e.target.value ? Number(e.target.value) : null)} placeholder="Auto" tooltip="Number of data loader workers" />
+			</div>
+			<div class="flex flex-wrap gap-x-4 gap-y-1">
+				<FormToggle label="Skip Existing" checked={caching.skip_existing ?? false} onchange={(e) => updateCaching('skip_existing', e.target.checked)} tooltip="Skip files that already have cached outputs" />
 			</div>
 			{#if $advancedMode}
-				<div class="grid grid-cols-2 xl:grid-cols-5 gap-3">
+				<div class="grid grid-cols-2 xl:grid-cols-4 gap-3">
 					<FormSelect label="VAE Dtype" value={caching.vae_dtype || ''} options={[{ value: '', label: 'bfloat16 (default)' }, 'float16', 'bfloat16', 'float32']} onchange={(e) => updateCaching('vae_dtype', e.target.value || null)} tooltip="VAE dtype for latent caching. Blank uses the default `bfloat16`." />
 					<FormField label="Device" value={caching.device || ''} oninput={(e) => updateCaching('device', e.target.value || null)} placeholder="Auto" tooltip="Torch device. Leave blank to auto-select the runtime device." />
-					<FormField label="Workers" type="number" value={caching.num_workers ?? ''} oninput={(e) => updateCaching('num_workers', e.target.value ? Number(e.target.value) : null)} placeholder="Auto" tooltip="Number of data loader workers" />
 					<FormSelect label="Quantize Device" value={caching.quantize_device || ''} options={[{ value: '', label: 'Auto' }, { value: 'cuda', label: 'CUDA' }, { value: 'cpu', label: 'CPU' }]} onchange={(e) => updateCaching('quantize_device', e.target.value || null)} tooltip="Device for quantization-related work. Blank auto-selects." />
 					<FormToggle label="Keep Cache" checked={caching.keep_cache ?? false} onchange={(e) => updateCaching('keep_cache', e.target.checked)} tooltip="Keep old cache files when re-caching" />
-				</div>
-				<div class="flex flex-wrap gap-x-4 gap-y-1">
-					<FormToggle label="Skip Existing" checked={caching.skip_existing ?? false} onchange={(e) => updateCaching('skip_existing', e.target.checked)} tooltip="Skip files that already have cached outputs" />
 				</div>
 				<PathInput label="Dataset Manifest Output" value={caching.save_dataset_manifest || ''} oninput={(e) => updateCaching('save_dataset_manifest', e.target.value)} showFiles tooltip="Optional path to write a dataset manifest during latent caching." />
 			{/if}
@@ -240,41 +241,34 @@
 			<div class="space-y-3">
 				<span class="text-[11px] font-medium uppercase tracking-wider" style="color: var(--text-muted);">Cache Text Encoder</span>
 
-				{#if $advancedMode}
-					<FormGroup title="Text Encoder Runtime">
-						<div class="pt-2">
-							<FormSelect label="Mixed Precision" value={caching.mixed_precision || 'no'} options={['no', 'fp16', 'bf16']} onchange={(e) => updateCaching('mixed_precision', e.target.value)} tooltip="Mixed precision mode for text encoder caching." />
+				<FormGroup title="Gemma Quantization">
+					<div class="space-y-2 pt-2">
+						<div class="flex flex-wrap gap-x-4 gap-y-1">
+							<FormToggle label="8-bit" checked={caching.gemma_load_in_8bit ?? false} onchange={(e) => updateCaching('gemma_load_in_8bit', e.target.checked)} tooltip="Load Gemma with 8-bit quantization" />
+							<FormToggle label="4-bit" checked={caching.gemma_load_in_4bit ?? false} onchange={(e) => updateCaching('gemma_load_in_4bit', e.target.checked)} tooltip="Load Gemma with 4-bit quantization" />
+							<FormToggle label="No Dbl Quant" checked={caching.gemma_bnb_4bit_disable_double_quant ?? false} onchange={(e) => updateCaching('gemma_bnb_4bit_disable_double_quant', e.target.checked)} tooltip="Disable double quantization" />
+							<FormToggle label="FP8 Weight Offload" checked={caching.gemma_fp8_weight_offload ?? true} onchange={(e) => updateCaching('gemma_fp8_weight_offload', e.target.checked)} tooltip="For FP8 Gemma safetensors, offload FP8 linear weights to CPU RAM. Disable this to keep more weights on VRAM and reduce RAM/pagefile pressure." />
 						</div>
-					</FormGroup>
-				{/if}
-
-				{#if $advancedMode}
-					<FormGroup title="Gemma Quantization">
-						<div class="space-y-2 pt-2">
-							<div class="flex flex-wrap gap-x-4 gap-y-1">
-								<FormToggle label="8-bit" checked={caching.gemma_load_in_8bit ?? false} onchange={(e) => updateCaching('gemma_load_in_8bit', e.target.checked)} tooltip="Load Gemma with 8-bit quantization" />
-								<FormToggle label="4-bit" checked={caching.gemma_load_in_4bit ?? false} onchange={(e) => updateCaching('gemma_load_in_4bit', e.target.checked)} tooltip="Load Gemma with 4-bit quantization" />
-								<FormToggle label="No Dbl Quant" checked={caching.gemma_bnb_4bit_disable_double_quant ?? false} onchange={(e) => updateCaching('gemma_bnb_4bit_disable_double_quant', e.target.checked)} tooltip="Disable double quantization" />
-								<FormToggle label="FP8 Weight Offload" checked={caching.gemma_fp8_weight_offload ?? true} onchange={(e) => updateCaching('gemma_fp8_weight_offload', e.target.checked)} tooltip="For FP8 Gemma safetensors, offload FP8 linear weights to CPU RAM. Disable this to keep more weights on VRAM and reduce RAM/pagefile pressure." />
+						{#if caching.gemma_load_in_4bit}
+							<div class="grid grid-cols-2 gap-2">
+								<FormSelect label="Quant Type" value={caching.gemma_bnb_4bit_quant_type || 'nf4'} options={['nf4', 'fp4']} onchange={(e) => updateCaching('gemma_bnb_4bit_quant_type', e.target.value)} tooltip="NF4 recommended" />
+								<FormSelect label="Compute Dtype" value={caching.gemma_bnb_4bit_compute_dtype || 'auto'} options={['auto', 'fp16', 'bf16', 'fp32']} onchange={(e) => updateCaching('gemma_bnb_4bit_compute_dtype', e.target.value)} tooltip="Compute dtype for 4-bit" />
 							</div>
-							{#if caching.gemma_load_in_4bit}
-								<div class="grid grid-cols-2 gap-2">
-									<FormSelect label="Quant Type" value={caching.gemma_bnb_4bit_quant_type || 'nf4'} options={['nf4', 'fp4']} onchange={(e) => updateCaching('gemma_bnb_4bit_quant_type', e.target.value)} tooltip="NF4 recommended" />
-									<FormSelect label="Compute Dtype" value={caching.gemma_bnb_4bit_compute_dtype || 'auto'} options={['auto', 'fp16', 'bf16', 'fp32']} onchange={(e) => updateCaching('gemma_bnb_4bit_compute_dtype', e.target.value)} tooltip="Compute dtype for 4-bit" />
-								</div>
-							{/if}
-						</div>
-					</FormGroup>
+						{/if}
+					</div>
+				</FormGroup>
 
-					<FormGroup title="Precache Samples">
-						<div class="space-y-2 pt-2">
-							<FormToggle label="Precache Sample Prompts" checked={caching.precache_sample_prompts ?? false} onchange={(e) => updateCaching('precache_sample_prompts', e.target.checked)} tooltip="Cache text embeddings for sample prompts" />
-							{#if caching.precache_sample_prompts}
-								<PathInput label="External Prompts File" value={caching.sample_prompts || ''} oninput={(e) => updateCaching('sample_prompts', e.target.value)} showFiles tooltip="Optional override. Leave blank to use prompts defined on the Samples page." />
-								<PathInput label="Cache Dir" value={caching.sample_prompts_cache || ''} oninput={(e) => updateCaching('sample_prompts_cache', e.target.value)} tooltip="Output directory for cached embeddings" />
-							{/if}
-						</div>
-					</FormGroup>
+				<FormGroup title="Precache Samples">
+					<div class="space-y-2 pt-2">
+						<FormToggle label="Precache Sample Prompts" checked={caching.precache_sample_prompts ?? false} onchange={(e) => updateCaching('precache_sample_prompts', e.target.checked)} tooltip="Cache text embeddings for sample prompts" />
+						{#if caching.precache_sample_prompts}
+							<PathInput label="External Prompts File" value={caching.sample_prompts || ''} oninput={(e) => updateCaching('sample_prompts', e.target.value)} showFiles tooltip="Optional override. Leave blank to use prompts defined on the Samples page." />
+							<PathInput label="Cache Dir" value={caching.sample_prompts_cache || ''} oninput={(e) => updateCaching('sample_prompts_cache', e.target.value)} tooltip="Output directory for cached embeddings" />
+						{/if}
+					</div>
+				</FormGroup>
+
+				{#if $advancedMode}
 
 					<FormGroup title="Precache Preservation">
 						<div class="space-y-2 pt-2">

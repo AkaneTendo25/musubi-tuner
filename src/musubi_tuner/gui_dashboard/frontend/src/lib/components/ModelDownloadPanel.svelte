@@ -1,23 +1,39 @@
 <script>
-	import { onMount } from 'svelte';
+	import { onDestroy, onMount } from 'svelte';
 	import { projectConfig, saveProjectNow } from '$lib/stores/project.js';
 	import {
 		defaultModelDir,
 		effectiveGemmaRoot,
 		effectiveLtx2Checkpoint
 	} from '$lib/utils/modelPaths.js';
+	import {
+		cancelModelDownload,
+		formatModelDownloadStatus,
+		getModelDownloadStatus,
+		getModelDownloadTone,
+		isActiveModelDownload,
+		startModelDownload
+	} from '$lib/utils/modelDownloads.js';
 
 	let { section = 'caching', title = 'Model Downloads', description = '' } = $props();
 
 	let cwd = $state('');
 	let downloading = $state('');
 	let status = $state('');
+	let statusTone = $state('muted');
+	let downloadJobId = $state('');
+	let downloadState = $state('');
+	let downloadPollTimer = null;
 
 	onMount(async () => {
 		try {
 			const res = await fetch('/api/fs/cwd');
 			if (res.ok) cwd = (await res.json()).cwd || '';
 		} catch {}
+	});
+
+	onDestroy(() => {
+		if (downloadPollTimer) clearTimeout(downloadPollTimer);
 	});
 
 	let sectionConfig = $derived($projectConfig?.[section] || {});
@@ -31,53 +47,88 @@
 			sectionConfig.gemma_safetensors || ''
 		)
 	);
+	let hasActiveDownload = $derived(Boolean(downloadJobId) && ['queued', 'running', 'cancelling'].includes(downloadState));
 
-	async function handleDownload(preset) {
-		const dest = modelDir.trim();
-		if (!dest) return;
-		downloading = preset;
-		status = 'Downloading...';
+	function setStatus(downloadStatus) {
+		status = formatModelDownloadStatus(downloadStatus);
+		statusTone = getModelDownloadTone(downloadStatus);
+		downloadState = downloadStatus?.state || '';
+	}
 
-		projectConfig.update((config) => {
-			if (!config) return config;
-			return { ...config, model_dir: dest };
-		});
-		await saveProjectNow();
-
-		try {
-			const res = await fetch('/api/fs/download-model', {
-				method: 'POST',
-				headers: { 'Content-Type': 'application/json' },
-				body: JSON.stringify({ preset, dest_dir: dest })
-			});
-			const data = await res.json();
-			if (!res.ok) {
-				throw new Error(data.detail || 'Download failed');
-			}
-
+	async function finalizeDownload(downloadStatus) {
+		if (downloadStatus.state === 'completed' && downloadStatus.path) {
 			projectConfig.update((config) => {
 				if (!config) return config;
-				const next = { ...config, model_dir: dest };
+				const next = { ...config, model_dir: modelDir };
 				const currentSection = { ...(config[section] || {}) };
-				if (preset === 'ltxav') {
-					next.default_ltx2_checkpoint = data.path || resolvedLtx;
-					currentSection.ltx2_checkpoint = data.path || resolvedLtx;
-				} else if (preset === 'gemma-unsloth') {
-					next.default_gemma_root = data.path || resolvedGemma;
+				if (downloading === 'ltxav') {
+					next.default_ltx2_checkpoint = downloadStatus.path;
+					currentSection.ltx2_checkpoint = downloadStatus.path;
+				} else if (downloading === 'gemma-unsloth') {
+					next.default_gemma_root = downloadStatus.path;
 					next.default_gemma_safetensors = '';
-					currentSection.gemma_root = data.path || resolvedGemma;
+					currentSection.gemma_root = downloadStatus.path;
 					currentSection.gemma_safetensors = '';
 				}
 				next[section] = currentSection;
 				return next;
 			});
 			await saveProjectNow();
-			status = `Done. Saved to ${data.path || dest}`;
-		} catch (e) {
-			status = e.message || 'Download failed';
 		}
 
+		downloadJobId = '';
 		downloading = '';
+	}
+
+	async function pollDownload(jobId) {
+		if (downloadPollTimer) clearTimeout(downloadPollTimer);
+		try {
+			const downloadStatus = await getModelDownloadStatus(jobId);
+			setStatus(downloadStatus);
+			if (!isActiveModelDownload(downloadStatus)) {
+				await finalizeDownload(downloadStatus);
+				return;
+			}
+			downloadPollTimer = setTimeout(() => pollDownload(jobId), 1000);
+		} catch (e) {
+			setStatus({ state: 'failed', error: e.message || 'Download status failed' });
+			downloadJobId = '';
+			downloading = '';
+		}
+	}
+
+	async function handleDownload(preset) {
+		if (downloadJobId) return;
+		const targetPath = preset === 'ltxav' ? resolvedLtx : resolvedGemma;
+		if (!targetPath) return;
+
+		projectConfig.update((config) => {
+			if (!config) return config;
+			return { ...config, model_dir: modelDir.trim() };
+		});
+		await saveProjectNow();
+
+		try {
+			const job = await startModelDownload(preset, targetPath);
+			downloading = preset;
+			downloadJobId = job.job_id || '';
+			setStatus(job);
+			if (downloadJobId) {
+				await pollDownload(downloadJobId);
+			}
+		} catch (e) {
+			setStatus({ state: 'failed', error: e.message || 'Download failed' });
+		}
+	}
+
+	async function handleCancel() {
+		if (!downloadJobId) return;
+		try {
+			const downloadStatus = await cancelModelDownload(downloadJobId);
+			setStatus(downloadStatus);
+		} catch (e) {
+			setStatus({ state: 'failed', error: e.message || 'Cancel failed' });
+		}
 	}
 </script>
 
@@ -101,11 +152,11 @@
 				</div>
 				<button
 					onclick={() => handleDownload('ltxav')}
-					disabled={!!downloading}
+					disabled={hasActiveDownload}
 					class="px-3 py-1 text-[11px] font-medium disabled:opacity-40"
 					style="background: var(--accent-muted); color: var(--accent); border: 1px solid var(--accent); border-radius: var(--radius-sm);"
 				>
-					{downloading === 'ltxav' ? 'Downloading...' : 'Download'}
+					{downloading === 'ltxav' && hasActiveDownload ? 'Downloading...' : 'Download'}
 				</button>
 			</div>
 			<div class="text-[10px] font-mono break-all" style="color: var(--text-muted);">{resolvedLtx}</div>
@@ -119,11 +170,11 @@
 				</div>
 				<button
 					onclick={() => handleDownload('gemma-unsloth')}
-					disabled={!!downloading}
+					disabled={hasActiveDownload}
 					class="px-3 py-1 text-[11px] font-medium disabled:opacity-40"
 					style="background: var(--accent-muted); color: var(--accent); border: 1px solid var(--accent); border-radius: var(--radius-sm);"
 				>
-					{downloading === 'gemma-unsloth' ? 'Downloading...' : 'Download'}
+					{downloading === 'gemma-unsloth' && hasActiveDownload ? 'Downloading...' : 'Download'}
 				</button>
 			</div>
 			<div class="text-[10px] font-mono break-all" style="color: var(--text-muted);">{resolvedGemma}</div>
@@ -132,10 +183,20 @@
 
 	{#if status}
 		<div
-			class="text-[11px] px-3 py-2"
-			style="color: {status.startsWith('Done') ? 'var(--success)' : status === 'Downloading...' ? 'var(--accent)' : 'var(--danger)'}; background: {status.startsWith('Done') ? 'var(--success-muted, rgba(34,197,94,0.1))' : status === 'Downloading...' ? 'var(--accent-muted)' : 'var(--danger-muted)'}; border-radius: var(--radius-sm);"
+			class="flex items-center justify-between gap-3 text-[11px] px-3 py-2"
+			style="color: {statusTone === 'success' ? 'var(--success)' : statusTone === 'accent' ? 'var(--accent)' : statusTone === 'danger' ? 'var(--danger)' : 'var(--text-secondary)'}; background: {statusTone === 'success' ? 'var(--success-muted, rgba(34,197,94,0.1))' : statusTone === 'accent' ? 'var(--accent-muted)' : statusTone === 'danger' ? 'var(--danger-muted)' : 'var(--bg-elevated)'}; border-radius: var(--radius-sm);"
 		>
-			{status}
+			<span>{status}</span>
+			{#if hasActiveDownload}
+				<button
+					type="button"
+					onclick={handleCancel}
+					class="px-2 py-1 text-[10px] font-medium"
+					style="background: var(--bg-surface); color: var(--text-secondary); border: 1px solid var(--border); border-radius: var(--radius-sm);"
+				>
+					Cancel
+				</button>
+			{/if}
 		</div>
 	{/if}
 </div>
