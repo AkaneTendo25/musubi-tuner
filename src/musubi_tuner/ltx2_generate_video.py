@@ -86,6 +86,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--include_patterns", type=str, nargs="*", default=None, help="LoRA module include patterns")
     parser.add_argument("--exclude_patterns", type=str, nargs="*", default=None, help="LoRA module exclude patterns")
 
+    # -- MMControl control bypass --
+    parser.add_argument("--mmcontrol_layers", type=str, default=None,
+                        help="Comma-separated DiT block indices for MMControl hint injection")
+    parser.add_argument("--mmcontrol_visual_model_path", "--visual_control_model_path",
+                        dest="visual_control_model_path", type=str, default=None,
+                        help="MMControl visual branch weights (.safetensors)")
+    parser.add_argument("--mmcontrol_audio_model_path", "--audio_control_model_path",
+                        dest="audio_control_model_path", type=str, default=None,
+                        help="MMControl audio branch weights (.safetensors)")
+    parser.add_argument("--mmcontrol_visual_latents_path", "--visual_control_latents_path",
+                        dest="mmcontrol_visual_latents_path", type=str, default=None,
+                        help="Cached visual MMControl control latents (.safetensors)")
+    parser.add_argument("--mmcontrol_audio_latents_path", "--audio_control_latents_path",
+                        dest="mmcontrol_audio_latents_path", type=str, default=None,
+                        help="Cached audio MMControl control latents (.safetensors)")
+    parser.add_argument("--mmcontrol_audio_mask_path", type=str, default=None,
+                        help="Optional audio MMControl mask (.npy or safetensors key audio_vace_mask)")
+    parser.add_argument("--mmcontrol_visual_scale", "--visual_guidance_scale",
+                        dest="mmcontrol_visual_scale", type=float, default=1.0,
+                        help="Visual MMControl residual strength")
+    parser.add_argument("--mmcontrol_audio_scale", "--audio_guidance_scale",
+                        dest="mmcontrol_audio_scale", type=float, default=1.0,
+                        help="Audio MMControl residual strength")
+
     # -- Prompt input --
     parser.add_argument("--prompt", type=str, default=None, help="Text prompt for generation")
     parser.add_argument("--negative_prompt", type=str, default=None, help="Negative prompt (enables CFG)")
@@ -200,6 +224,11 @@ def parse_args() -> argparse.Namespace:
     short_map = {"v": "video", "a": "audio", "va": "av"}
     if getattr(args, "ltx_mode", None) in short_map:
         args.ltx_mode = short_map[args.ltx_mode]
+
+    # MMControl trainer reuses the VACE implementation internally.
+    args.visual_guidance_scale = args.mmcontrol_visual_scale
+    args.audio_guidance_scale = args.mmcontrol_audio_scale
+    args.enable_audio_mmcontrol = bool(args.audio_control_model_path)
 
     if args.prompt is None and args.sample_prompts is None:
         raise ValueError("Either --prompt or --sample_prompts (--from_file) must be specified")
@@ -327,6 +356,16 @@ def _build_prompt_list(
         "cfg_scale": args.cfg_scale,
         "enum": 0,
     }
+    for key in (
+        "mmcontrol_visual_latents_path",
+        "mmcontrol_audio_latents_path",
+        "mmcontrol_audio_mask_path",
+        "mmcontrol_visual_scale",
+        "mmcontrol_audio_scale",
+    ):
+        value = getattr(args, key, None)
+        if value is not None:
+            sample[key] = value
     return [sample]
 
 
@@ -351,8 +390,13 @@ def main() -> None:
     accelerator = Accelerator(mixed_precision=mixed_precision, cpu=use_cpu)
     device = accelerator.device
 
-    # Initialize trainer (only using its model loading + sampling methods, not training)
-    trainer = LTX2NetworkTrainer()
+    # Initialize trainer (only using its model loading + sampling methods, not training).
+    use_mmcontrol = bool(args.visual_control_model_path or args.audio_control_model_path)
+    if use_mmcontrol:
+        from musubi_tuner.ltx2_mmcontrol_train import LTX2MMControlTrainer
+        trainer = LTX2MMControlTrainer()
+    else:
+        trainer = LTX2NetworkTrainer()
     trainer.blocks_to_swap = int(args.blocks_to_swap or 0)
     trainer.handle_model_specific_args(args)
 

@@ -31,6 +31,14 @@ logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
 
+MMCONTROL_CONFIG_ALIASES = {
+    "mmcontrol_visual_directory": "vace_directory",
+    "mmcontrol_audio_directory": "audio_vace_directory",
+    "mmcontrol_visual_cache_directory": "vace_cache_directory",
+    "mmcontrol_audio_cache_directory": "audio_vace_cache_directory",
+}
+
+
 @dataclass
 class BaseDatasetParams:
     resolution: Tuple[int, int] = (960, 544)
@@ -146,6 +154,12 @@ class ConfigSanitizer:
         "reference_audio_cache_directory": str,
         "vace_cache_directory": str,
         "audio_vace_cache_directory": str,
+        "vace_directory": str,
+        "audio_vace_directory": str,
+        "mmcontrol_visual_cache_directory": str,
+        "mmcontrol_audio_cache_directory": str,
+        "mmcontrol_visual_directory": str,
+        "mmcontrol_audio_directory": str,
         "separate_audio_buckets": bool,
         "cache_only": bool,
     }
@@ -175,6 +189,8 @@ class ConfigSanitizer:
         "reference_audio_directory": str,
         "vace_directory": str,
         "audio_vace_directory": str,
+        "mmcontrol_visual_directory": str,
+        "mmcontrol_audio_directory": str,
         "target_frames": [int],
         "frame_extraction": str,
         "frame_stride": int,
@@ -230,12 +246,37 @@ class ConfigSanitizer:
         self.argparse_config_validator = Schema(Object(self.argparse_schema), extra=voluptuous.ALLOW_EXTRA)
 
     def sanitize_user_config(self, user_config: dict) -> dict:
+        user_config = self._apply_mmcontrol_aliases(user_config)
         try:
             return self.user_config_validator(user_config)
         except MultipleInvalid:
             # TODO: clarify the error message
             logger.error("Invalid user config / ユーザ設定の形式が正しくないようです")
             raise
+
+    @staticmethod
+    def _apply_mmcontrol_aliases(user_config: dict) -> dict:
+        """Map MMControl dataset names onto the existing VACE cache fields."""
+        if not isinstance(user_config, dict):
+            return user_config
+
+        def apply_aliases(section: dict, inherited: dict | None = None) -> None:
+            if not isinstance(section, dict):
+                return
+            inherited = inherited or {}
+            for alias, canonical in MMCONTROL_CONFIG_ALIASES.items():
+                if section.get(canonical) is None:
+                    if section.get(alias) is not None:
+                        section[canonical] = section[alias]
+                    elif inherited.get(alias) is not None and inherited.get(canonical) is None:
+                        section[canonical] = inherited[alias]
+
+        general = user_config.get("general", {})
+        apply_aliases(general)
+        for key in ("datasets", "validation_datasets"):
+            for dataset_config in user_config.get(key, []) or []:
+                apply_aliases(dataset_config, general)
+        return user_config
 
     # NOTE: In nature, argument parser result is not needed to be sanitize
     #   However this will help us to detect program bug

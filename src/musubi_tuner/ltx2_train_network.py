@@ -5145,6 +5145,190 @@ class LTX2NetworkTrainer(NetworkTrainer):
             del processor
             clean_memory_on_device(device)
 
+    @staticmethod
+    def _first_latent_tensor_from_safetensors(path: str, prefix: str = "latents_") -> torch.Tensor:
+        from safetensors.torch import load_file
+
+        sd = load_file(path)
+        for key, value in sd.items():
+            if key.startswith(prefix):
+                return value
+        raise ValueError(f"No tensor with prefix '{prefix}' found in {path}")
+
+    @staticmethod
+    def _first_existing_sample_value(sample_parameter: Dict, args: argparse.Namespace, names: tuple[str, ...]):
+        for name in names:
+            value = sample_parameter.get(name)
+            if value is not None:
+                return value
+        for name in names:
+            value = getattr(args, name, None)
+            if value is not None:
+                return value
+        return None
+
+    @staticmethod
+    def _fit_audio_vace_control_to_target(
+        latents: torch.Tensor,
+        mask: Optional[torch.Tensor],
+        target_t: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if latents.dim() == 3:
+            latents = latents.unsqueeze(0)
+        if latents.dim() != 4:
+            raise ValueError(f"Expected audio MMControl latents [B,C,T,F], got {tuple(latents.shape)}")
+
+        current_t = int(latents.shape[2])
+        if mask is None:
+            mask = torch.ones((latents.shape[0], current_t), device=latents.device, dtype=latents.dtype)
+        elif mask.dim() == 1:
+            mask = mask.unsqueeze(0)
+        elif mask.dim() > 2:
+            mask = mask.view(mask.shape[0], -1)
+        mask = mask.to(device=latents.device, dtype=latents.dtype)
+
+        if current_t == target_t:
+            return latents, mask[:, :target_t]
+        if current_t > target_t:
+            return latents[:, :, :target_t, :], mask[:, :target_t]
+
+        pad_t = target_t - current_t
+        latent_pad = torch.zeros(
+            (latents.shape[0], latents.shape[1], pad_t, latents.shape[3]),
+            device=latents.device,
+            dtype=latents.dtype,
+        )
+        mask_pad = torch.ones((mask.shape[0], pad_t), device=mask.device, dtype=mask.dtype)
+        return torch.cat([latents, latent_pad], dim=2), torch.cat([mask, mask_pad], dim=1)
+
+    def _prepare_mmcontrol_sample_options(
+        self,
+        *,
+        args: argparse.Namespace,
+        sample_parameter: Dict,
+        transformer,
+        latents: torch.Tensor,
+        audio_latents: Optional[torch.Tensor],
+        device: torch.device,
+        dtype: torch.dtype,
+        duplicate_for_cfg: bool,
+    ) -> dict:
+        """Build MMControl transformer options for one sampling pass."""
+        ltx_model = transformer.model if hasattr(transformer, "model") else transformer
+        options: dict = {}
+
+        visual_control = self._first_existing_sample_value(
+            sample_parameter,
+            args,
+            (
+                "mmcontrol_visual_latents",
+                "visual_control_latents",
+                "vace_latents",
+                "mmcontrol_visual_latents_path",
+                "visual_control_latents_path",
+                "vace_latents_path",
+            ),
+        )
+        if visual_control is not None:
+            if getattr(ltx_model, "_vace_model", None) is None:
+                logger.warning("MMControl visual latents provided but no visual control model is attached; ignoring")
+            else:
+                if isinstance(visual_control, str):
+                    visual_control = self._first_latent_tensor_from_safetensors(visual_control)
+                if visual_control.dim() == 4:
+                    visual_control = visual_control.unsqueeze(0)
+                if visual_control.dim() != 5:
+                    raise ValueError(
+                        f"Expected visual MMControl latents [B,C,F,H,W], got {tuple(visual_control.shape)}"
+                    )
+                visual_control = visual_control.to(device=device, dtype=dtype)
+                expected_shape = tuple(latents.shape[2:])
+                if tuple(visual_control.shape[2:]) != expected_shape:
+                    raise ValueError(
+                        "Visual MMControl latent shape mismatch: "
+                        f"control={tuple(visual_control.shape[2:])}, target={expected_shape}"
+                    )
+                from musubi_tuner.ltx_vace.vace_control_encoder import patchify_vace_context
+
+                patchifier = getattr(self, "_video_patchifier", None) or getattr(transformer, "_video_patchifier", None)
+                visual_tokens = patchify_vace_context(visual_control, patchifier=patchifier)
+                if duplicate_for_cfg:
+                    visual_tokens = torch.cat([visual_tokens, visual_tokens], dim=0)
+                options["vace_context"] = visual_tokens
+                options["vace_scale"] = float(
+                    sample_parameter.get(
+                        "mmcontrol_visual_scale",
+                        getattr(args, "mmcontrol_visual_scale", getattr(args, "vace_scale", 1.0)),
+                    )
+                )
+
+        audio_control = self._first_existing_sample_value(
+            sample_parameter,
+            args,
+            (
+                "mmcontrol_audio_latents",
+                "audio_control_latents",
+                "audio_vace_latents",
+                "mmcontrol_audio_latents_path",
+                "audio_control_latents_path",
+                "audio_vace_latents_path",
+            ),
+        )
+        if audio_control is not None:
+            if getattr(ltx_model, "_audio_vace_model", None) is None:
+                logger.warning("MMControl audio latents provided but no audio control model is attached; ignoring")
+            elif audio_latents is None:
+                logger.warning("MMControl audio latents provided but this sample has no audio latents; ignoring")
+            else:
+                audio_mask = sample_parameter.get("mmcontrol_audio_mask")
+                audio_mask_path = sample_parameter.get("mmcontrol_audio_mask_path")
+                if isinstance(audio_control, str):
+                    from safetensors.torch import load_file
+
+                    sd = load_file(audio_control)
+                    loaded = None
+                    for key, value in sd.items():
+                        if key.startswith("latents_"):
+                            loaded = value
+                            break
+                    if loaded is None:
+                        raise ValueError(f"No audio MMControl latent tensor found in {audio_control}")
+                    audio_control = loaded
+                    if audio_mask is None and "audio_vace_mask" in sd:
+                        audio_mask = sd["audio_vace_mask"]
+                if audio_mask is None and isinstance(audio_mask_path, str):
+                    if audio_mask_path.endswith(".npy"):
+                        import numpy as np
+
+                        audio_mask = torch.from_numpy(np.load(audio_mask_path).astype(np.float32))
+                    else:
+                        audio_mask = self._first_latent_tensor_from_safetensors(audio_mask_path, prefix="audio_vace_mask")
+
+                audio_control = audio_control.to(device=device, dtype=dtype)
+                if isinstance(audio_mask, torch.Tensor):
+                    audio_mask = audio_mask.to(device=device, dtype=dtype)
+                target_t = int(audio_latents.shape[2])
+                audio_control, audio_mask = self._fit_audio_vace_control_to_target(audio_control, audio_mask, target_t)
+
+                from musubi_tuner.ltx_vace.vace_control_encoder import (
+                    patchify_audio_latents_for_vace,
+                    prepare_audio_vace_context,
+                )
+
+                audio_tokens = patchify_audio_latents_for_vace(audio_control)
+                audio_context = prepare_audio_vace_context(audio_tokens, audio_mask.unsqueeze(-1))
+                if duplicate_for_cfg:
+                    audio_context = torch.cat([audio_context, audio_context], dim=0)
+                options["audio_vace_context"] = audio_context
+                options["audio_vace_scale"] = float(
+                    sample_parameter.get(
+                        "mmcontrol_audio_scale",
+                        getattr(args, "mmcontrol_audio_scale", getattr(args, "audio_vace_scale", 1.0)),
+                    )
+                )
+
+        return options
+
     def sample_image_inference(
         self,
         accelerator: Accelerator,
@@ -5966,6 +6150,32 @@ class LTX2NetworkTrainer(NetworkTrainer):
                 if ref_audio_seq_len <= 0:
                     raise ValueError("Reference-audio latent sequence length must be > 0")
 
+        mmcontrol_options = self._prepare_mmcontrol_sample_options(
+            args=args,
+            sample_parameter=sample_parameter,
+            transformer=transformer,
+            latents=latents,
+            audio_latents=audio_latents,
+            device=transformer_device,
+            dtype=dit_dtype,
+            duplicate_for_cfg=do_classifier_free_guidance,
+        )
+        mmcontrol_cond_options = self._prepare_mmcontrol_sample_options(
+            args=args,
+            sample_parameter=sample_parameter,
+            transformer=transformer,
+            latents=latents,
+            audio_latents=audio_latents,
+            device=transformer_device,
+            dtype=dit_dtype,
+            duplicate_for_cfg=False,
+        )
+        if mmcontrol_options:
+            logger.info(
+                "Sampling: enabled MMControl options: %s",
+                ", ".join(sorted(k for k in mmcontrol_options.keys() if not k.endswith("_scale"))),
+            )
+
         # Identity guidance setup
         _identity_guidance_scale = 0.0
         if audio_ref_only_ic_sampling and ref_audio_seq_len > 0:
@@ -6055,6 +6265,8 @@ class LTX2NetworkTrainer(NetworkTrainer):
                             dim=0,
                         )
                     resolved_transformer_options["video_conditioning_mask"] = video_conditioning_mask_tokens
+                if mmcontrol_options:
+                    resolved_transformer_options.update(mmcontrol_options)
 
                 if (
                     audio_ref_only_ic_sampling
@@ -6163,6 +6375,8 @@ class LTX2NetworkTrainer(NetworkTrainer):
                         noref_options = {"patches_replace": {}}
                         if i2v_conditioning_mask_tokens is not None:
                             noref_options["video_conditioning_mask"] = i2v_conditioning_mask_tokens
+                        if mmcontrol_cond_options:
+                            noref_options.update(mmcontrol_cond_options)
 
                         noref_input = [noref_video, noref_audio] if self._audio_video else noref_video
                         noref_pred = transformer(
@@ -6195,6 +6409,8 @@ class LTX2NetworkTrainer(NetworkTrainer):
                     bimodal_options = {"patches_replace": {}, "perturbations": bimodal_perturbations}
                     if i2v_conditioning_mask_tokens is not None:
                         bimodal_options["video_conditioning_mask"] = i2v_conditioning_mask_tokens
+                    if mmcontrol_cond_options:
+                        bimodal_options.update(mmcontrol_cond_options)
                     if (
                         audio_ref_only_ic_sampling
                         and audio_model_input is not None

@@ -61,6 +61,7 @@ class LTX2VaceTrainer(LTX2NetworkTrainer):
         self._audio_vace_model: Optional[AudioVaceLTXModel] = None
         self._audio_vace_scale: float = 1.0
         self._audio_vace_layers: Tuple[int, ...] = DEFAULT_VACE_LAYERS
+        self._enable_audio_vace: bool = False
         self._enable_audio_xattn_in_vace: bool = False
         self._video_patchifier = None  # Set during load_transformer for correct VACE patchification
         self._train_vace_full_model: bool = True
@@ -87,6 +88,7 @@ class LTX2VaceTrainer(LTX2NetworkTrainer):
             self._audio_vace_layers = DEFAULT_VACE_LAYERS
 
         self._audio_vace_scale = float(getattr(args, "audio_vace_scale", 1.0))
+        self._enable_audio_vace = bool(getattr(args, "enable_audio_vace", False))
         self._enable_audio_xattn_in_vace = bool(getattr(args, "enable_audio_xattn_in_vace", False))
         self._train_vace_full_model = not bool(getattr(args, "network_module", None))
 
@@ -214,9 +216,14 @@ class LTX2VaceTrainer(LTX2NetworkTrainer):
         else:
             logger.info("Initializing VACE model from scratch")
 
-        # Move VACE model to the same device/dtype as transformer
+        # Move VACE model to the same device/dtype as transformer. Training moves it
+        # again in pre_train_hook; inference relies on this load-time placement.
+        transformer_param = next(model.parameters())
+        transformer_device = transformer_param.device
+        transformer_dtype = dit_weight_dtype or transformer_param.dtype
         if dit_weight_dtype is not None:
             self._vace_model = self._vace_model.to(dtype=dit_weight_dtype)
+        self._vace_model = self._vace_model.to(device=transformer_device, dtype=transformer_dtype)
 
         # Attach VACE model to LTXModel so forward() can access it
         ltx_model = transformer.model if hasattr(transformer, "model") else transformer
@@ -234,7 +241,11 @@ class LTX2VaceTrainer(LTX2NetworkTrainer):
         # Enable audio VACE if model has audio branch AND audio VACE is requested
         # (either via weights path or by the presence of audio_vace configs which
         # will be checked later during dataset setup)
-        enable_audio_vace = audio_vace_path is not None or self._enable_audio_xattn_in_vace
+        enable_audio_vace = (
+            self._enable_audio_vace
+            or audio_vace_path is not None
+            or self._enable_audio_xattn_in_vace
+        )
         if audio_patchify is not None and enable_audio_vace:
             audio_in_channels = audio_patchify.weight.shape[1]
             audio_inner_dim = int(audio_patchify.weight.shape[0])
@@ -283,6 +294,7 @@ class LTX2VaceTrainer(LTX2NetworkTrainer):
 
             if dit_weight_dtype is not None:
                 self._audio_vace_model = self._audio_vace_model.to(dtype=dit_weight_dtype)
+            self._audio_vace_model = self._audio_vace_model.to(device=transformer_device, dtype=transformer_dtype)
 
             ltx_model._audio_vace_model = self._audio_vace_model
             logger.info("Attached audio VACE model to LTXModel")
@@ -502,6 +514,12 @@ def vace_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         action="store_true",
         default=False,
         help="Add cross-attention from video VACE blocks to audio DiT hidden states.",
+    )
+    vace_group.add_argument(
+        "--enable_audio_vace",
+        action="store_true",
+        default=False,
+        help="Initialize/train the audio VACE branch even when --audio_vace_model_path is not provided.",
     )
     vace_group.add_argument(
         "--audio_vace_model_path",
