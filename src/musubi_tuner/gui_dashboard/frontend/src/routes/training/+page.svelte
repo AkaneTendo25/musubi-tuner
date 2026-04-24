@@ -8,7 +8,7 @@
 	import CheckpointInput from '$lib/components/CheckpointInput.svelte';
 	import ProcessControls from '$lib/components/ProcessControls.svelte';
 	import CommandPanel from '$lib/components/CommandPanel.svelte';
-	import { defaultModelDir, effectiveGemmaRoot, effectiveLtx2Checkpoint } from '$lib/utils/modelPaths.js';
+	import { defaultModelDir, effectiveGemmaRoot, effectiveGemmaSafetensors, effectiveLtx2Checkpoint } from '$lib/utils/modelPaths.js';
 	import { startModelDownload, getModelDownloadStatus, cancelModelDownload, formatModelDownloadStatus, getModelDownloadTone, isActiveModelDownload } from '$lib/utils/modelDownloads.js';
 	import { projectConfig, projectLoaded, updateSection, saveProjectNow } from '$lib/stores/project.js';
 	import { processStatuses, processValidation, startProcess, stopProcess, validateProcess } from '$lib/stores/processes.js';
@@ -65,7 +65,9 @@
 
 	let modelDir = $derived(defaultModelDir(cwd, $projectConfig));
 	let resolvedLtx = $derived(effectiveLtx2Checkpoint(cwd, $projectConfig, t.ltx2_checkpoint || ''));
-	let resolvedGemma = $derived(effectiveGemmaRoot(cwd, $projectConfig, t.gemma_root || '', t.gemma_safetensors || ''));
+	let activeGemmaSafetensors = $derived(effectiveGemmaSafetensors($projectConfig, t.gemma_safetensors || ''));
+	let gemmaRootDisabled = $derived(Boolean(activeGemmaSafetensors));
+	let resolvedGemma = $derived(effectiveGemmaRoot(cwd, $projectConfig, t.gemma_root || '', activeGemmaSafetensors));
 	let hasActiveDownload = $derived(Boolean(downloadJobId) && ['queued', 'running', 'cancelling'].includes(downloadState));
 
 	function setModelStatus(status) {
@@ -170,7 +172,7 @@
 				<FormGroup title="Model">
 					<div class="space-y-2 pt-2">
 						<CheckpointInput label="LTX-2 Checkpoint" value={t.ltx2_checkpoint || ''} onchange={(v) => update('ltx2_checkpoint', v)} showFiles tooltip="Path to LTX-2 checkpoint" invalid={fieldInvalid('training.ltx2_checkpoint')} error={fieldError('training.ltx2_checkpoint')} actionLabel="D" actionBusyLabel="..." actionDisabled={downloading === 'ltxav' && hasActiveDownload} actionTooltip={`Download to ${resolvedLtx}`} onaction={() => downloadModel('ltxav')} />
-						<CheckpointInput label="Gemma Root" value={t.gemma_root || ''} onchange={(v) => update('gemma_root', v)} tooltip="Gemma text encoder directory" invalid={fieldInvalid('training.gemma_root')} error={fieldError('training.gemma_root')} actionLabel="D" actionBusyLabel="..." actionDisabled={downloading === 'gemma-unsloth' && hasActiveDownload} actionTooltip={`Download to ${resolvedGemma}`} onaction={() => downloadModel('gemma-unsloth')} />
+						<CheckpointInput label="Gemma Root" value={t.gemma_root || ''} onchange={(v) => update('gemma_root', v)} disabled={gemmaRootDisabled} tooltip={gemmaRootDisabled ? 'Ignored while Gemma Safetensors is set' : 'Gemma text encoder directory'} invalid={fieldInvalid('training.gemma_root')} error={fieldError('training.gemma_root')} actionLabel="D" actionBusyLabel="..." actionDisabled={gemmaRootDisabled || (downloading === 'gemma-unsloth' && hasActiveDownload)} actionTooltip={gemmaRootDisabled ? 'Gemma Safetensors is active' : `Download to ${resolvedGemma}`} onaction={() => downloadModel('gemma-unsloth')} />
 						<PathInput label="Gemma Safetensors" value={t.gemma_safetensors || ''} oninput={(e) => update('gemma_safetensors', e.target.value)} showFiles tooltip="Single safetensors file (alternative to Gemma Root)" invalid={fieldInvalid('training.gemma_safetensors')} error={fieldError('training.gemma_safetensors')} />
 						{#if modelStatus}
 							<div class="flex items-center justify-between gap-3 text-[11px] px-3 py-2" style="color: {modelStatusTone === 'success' ? 'var(--success)' : modelStatusTone === 'accent' ? 'var(--accent)' : modelStatusTone === 'danger' ? 'var(--danger)' : 'var(--text-secondary)'}; background: {modelStatusTone === 'success' ? 'var(--success-muted, rgba(34,197,94,0.1))' : modelStatusTone === 'accent' ? 'var(--accent-muted)' : modelStatusTone === 'danger' ? 'var(--danger-muted)' : 'var(--bg-elevated)'}; border-radius: var(--radius-sm);">

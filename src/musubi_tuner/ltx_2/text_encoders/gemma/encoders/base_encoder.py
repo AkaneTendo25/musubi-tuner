@@ -496,6 +496,7 @@ def module_ops_from_gemma_root(
         if not sf_path.exists():
             raise FileNotFoundError(f"Gemma safetensors not found: {gemma_safetensors}")
         gemma_weights_path = gemma_safetensors
+        gemma_root = None
         keep_fp8 = _has_fp8_weights(gemma_safetensors)
         if keep_fp8:
             logger.info("Detected fp8 weights in %s — will keep fp8 in VRAM", gemma_safetensors)
