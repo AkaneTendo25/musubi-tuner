@@ -9,7 +9,7 @@ Supports LoRA training for both **LTX-2 (19B)** and **LTX-2.3 (22B)** models wit
 | LTX-2 (19B) | 19B | Single `aggregate_embed`, caption projection inside transformer |
 | LTX-2.3 (22B) | 22B | Dual `video_aggregate_embed`/`audio_aggregate_embed`, caption projection moved to feature extractor (`caption_proj_before_connector`), cross-attention AdaLN (`prompt_adaln`), separate audio connector dimensions, BigVGAN v2 vocoder with bandwidth extension |
 
-Version choice for training is controlled by `--ltx_version` (default: `2.0`) in `ltx2_train_network.py`. The trainer auto-detects the checkpoint version from metadata and warns on mismatch.
+Version choice for training is controlled by `--ltx_version` (default: `2.3`) in `ltx2_train_network.py`. The trainer auto-detects the checkpoint version from metadata and warns on mismatch.
 
 Caching scripts (`ltx2_cache_latents.py`, `ltx2_cache_text_encoder_outputs.py`) do not use `--ltx_version`; they work with both LTX-2 and LTX-2.3 checkpoints directly via `--ltx2_checkpoint`.
 
@@ -49,6 +49,7 @@ Caching scripts (`ltx2_cache_latents.py`, `ltx2_cache_text_encoder_outputs.py`) 
     - [Modality Freezing (G2D)](#modality-freezing-g2d)
     - [Per-Module Learning Rates](#per-module-learning-rates)
     - [Per-Module LoRA Rank](#per-module-lora-rank)
+    - [Adaptive LoRA Rank](#adaptive-lora-rank)
     - [Preservation & Regularization](#preservation--regularization)
     - [Self-Flow (Self-Supervised Flow Matching)](#self-flow-self-supervised-flow-matching)
     - [HFATO (High-Frequency Awareness Training Objective)](#hfato-high-frequency-awareness-training-objective)
@@ -80,7 +81,7 @@ Caching scripts (`ltx2_cache_latents.py`, `ltx2_cache_text_encoder_outputs.py`) 
   - [4a. Text-Only Mode](#4a-text-only-mode)
   - [4b. Reference Mode](#4b-reference-mode)
   - [Slider Tips](#slider-tips)
-- [Auto-Installer Script (WIP)](#auto-installer-script-wip)
+- [Setup / Update Script](#setup--update-script)
 - [References](#references)
 
 ---
@@ -109,7 +110,16 @@ Always match the CUDA version to your GPU architecture — check [PyTorch's comp
 
 ### Downloading Required Models
 
-The trainer does not download models automatically. You must manually download the following files before caching or training.
+> [!WARNING]
+> The dashboard UI and the Windows Setup / Update script are still early prototypes and work in progress. Their stable behavior is not guaranteed yet, and some flows may still break or change.
+
+You can now handle the common model downloads directly from the dashboard:
+
+- Use the project page to choose a template that matches your use case.
+- Open `Caching`, `Training`, or `Inference` and use the download actions beside the LTX-2 and Gemma model fields.
+- Use `Setup & Updates` in the dashboard to verify the install, repo state, shortcuts, and project readiness before you start caching or training.
+
+Manual download is still fully supported, and it remains useful if you want to manage checkpoints outside the default model directory.
 
 **LTX-2 Checkpoint** — use as `--ltx2_checkpoint`:
 - LTX-2 (19B): [ltx-2-19b-dev.safetensors](https://huggingface.co/Lightricks/LTX-2/resolve/main/ltx-2-19b-dev.safetensors)
@@ -258,7 +268,9 @@ python ltx2_cache_text_encoder_outputs.py ^
   --mixed_precision bf16
 ```
 
-- FP8 weights (`F8_E4M3` / `F8_E5M2`) are detected automatically and kept in FP8 on GPU (compute in bf16). By default FP8 weights are offloaded to CPU between encoding calls; set `LTX2_GEMMA_SAFETENSORS_WEIGHT_OFFLOAD=0` to keep them on GPU.
+- FP8 weights (`F8_E4M3` / `F8_E5M2`) are detected automatically and kept in FP8 on GPU (compute in bf16).
+- `--gemma_fp8_weight_offload` / `--no-gemma_fp8_weight_offload`: Explicitly enable or disable CPU offload for FP8 Gemma linear weights when using `--gemma_safetensors`.
+- If `--gemma_fp8_weight_offload` is omitted, the code falls back to `LTX2_GEMMA_SAFETENSORS_WEIGHT_OFFLOAD` (default environment fallback: enabled / `1`).
 - `--gemma_load_in_8bit` / `--gemma_load_in_4bit` cannot be combined with `--gemma_safetensors`.
 - If the file has no `spiece_model` key, tokenizer extraction fails — use `--gemma_root` instead.
 - Works in all scripts that load Gemma: `ltx2_cache_text_encoder_outputs.py`, `ltx2_train_network.py`, `ltx2_train_slider.py`, `ltx2_generate_video.py`.
@@ -572,7 +584,7 @@ accelerate launch ... ltx2_train_network.py ^
 - Quantization targets transformer block weights only. Embedding layers, norms, and projection layers remain in full precision.
 
 #### Model Version
-- `--ltx_version 2.0|2.3`: Select target model version (default: `2.0`). Controls default behavior for version-dependent settings (e.g., `--shifted_logit_mode` defaults to `legacy` for 2.0, `stretched` for 2.3). For LTX-2.3 checkpoints, set `--ltx_version 2.3` explicitly.
+- `--ltx_version 2.0|2.3`: Select target model version (default: `2.3`). Controls default behavior for version-dependent settings (e.g., `--shifted_logit_mode` defaults to `legacy` for 2.0, `stretched` for 2.3).
 - `--ltx_version_check_mode off|warn|error`: How to handle mismatch between `--ltx_version` and checkpoint metadata (default: `warn`). The trainer reads checkpoint config keys (`cross_attention_adaln`, `caption_proj_before_connector`, `bwe` vocoder) to detect the actual version.
 
 #### Audio-Video Support
@@ -791,6 +803,45 @@ Result:
 Precedence is: `cross_modal_*` override > `audio_*` override > base `--network_dim` / `--network_alpha`.
 
 All override flags default to `None` (no override, all modules use `--network_dim`/`--network_alpha`). Not used with LyCORIS — use the LyCORIS per-module config instead. At inference, each module's rank is read from saved weight shapes (`lora_down.shape[0]`), so no flags are needed for loading.
+
+#### Adaptive LoRA Rank
+
+Implemented only for standard LoRA (`networks.lora_ltx2` / `networks.lora`).
+Related paper: [Not All Layers Are Created Equal: Adaptive Rank Allocation in Personalized Diffusion Models](https://arxiv.org/abs/2603.21884).
+
+- `--network_args "adaptive_rank=True"`: Enable adaptive rank.
+- `--network_args "adaptive_rank_target=<int>"`: Target effective rank. Default: each module's base rank.
+- `--network_args "adaptive_rank_weight=<float>"`: Rank regularization weight. Default: `1e-4` when enabled.
+- `--network_args "adaptive_rank_budget=<float>"`: Shared target for the sum of expected ranks.
+- `--network_args "adaptive_rank_budget_ratio=<float>"`: Use `total_max_rank * ratio` when `adaptive_rank_budget` is unset.
+- `--network_args "adaptive_rank_estimate=True"`: Use `<output_dir>/ltx2_estimate.json`. If the file is missing, it is generated from the current training args before rank allocation is applied.
+- `--network_args "adaptive_rank_estimate_report=<path>"`: Override the estimate report path.
+- `--network_args "adaptive_rank_hard_prune=True"`: Rebuild modules as static LoRA during training when the prune trigger fires.
+- `--network_args "adaptive_rank_finalize_start=<float>"`: Convert remaining adaptive modules to static LoRA once training progress reaches this value.
+
+Behavior:
+- Without `adaptive_rank_hard_prune`, modules keep their configured base rank during training.
+- Export writes standard LoRA weights. Inference reads per-module rank from weight shapes; no adaptive-rank runtime logic is required.
+- `--save_state` also writes `adaptive_rank_runtime.json`. `--resume` restores adaptive/static module structure from it before loading model weights.
+- Shared-budget loss uses the sum of expected ranks, not the final exported integer ranks.
+- `adaptive_rank_budget` overrides `adaptive_rank_budget_ratio`.
+- With `audio_dim` / `cross_modal_dim`, each module keeps its own local maximum rank.
+- Estimate score lookup reads `module_scores`, or `top_modules` as fallback, keyed by `module_path`.
+
+CLI example:
+```bash
+--network_dim 64 ^
+--network_args "adaptive_rank=True" "adaptive_rank_target=16" "adaptive_rank_weight=1e-4"
+```
+
+Estimate-driven example:
+```bash
+--network_dim 64 ^
+--network_args "adaptive_rank=True" "adaptive_rank_budget_ratio=0.35" "adaptive_rank_estimate=True" "adaptive_rank_hard_prune=True"
+```
+
+Notes:
+- Logged metrics include `loss/adaptive_rank`, `adaptive_rank/mean_effective_rank`, `adaptive_rank/mean_expected_rank`, `adaptive_rank/mean_target_rank`, and, when a shared budget is enabled, `adaptive_rank/expected_rank_sum` and `adaptive_rank/target_budget`.
 
 #### Per-Module LoRA Dropout
 
@@ -1099,6 +1150,18 @@ The resulting LoRA is standard — no inference pipeline changes. Discarding the
 
 HFATO can also be used standalone (without relay) as a spatial detail objective for image or video training.
 
+#### Standalone Inference Overrides
+
+`ltx2_generate_video.py` accepts a few standalone-inference-only overrides that are not part of the training sample table:
+
+- `--vae`: Use a separate VAE checkpoint for inference. If omitted, `--ltx2_checkpoint` is used for both DiT and VAE loading.
+- `--vae_dtype`: Override the VAE runtime dtype for inference. If omitted, the script uses its default VAE dtype (`bfloat16`).
+- `--reference_image`: Apply one global I2V reference image to all prompts in the current inference run.
+- `--reference_video`: Apply one global V2V reference video to all prompts in the current inference run.
+- If both `--reference_image` and `--reference_video` are supplied, `--reference_video` takes priority.
+- Global `--reference_image` / `--reference_video` overrides replace conflicting per-prompt `image_path` / `v2v_ref_path` entries loaded from prompt files, and also clear any cached reference latents tied to those prompt entries before sampling.
+- If the path passed to `--reference_image` has a video filename extension, the script treats it as a V2V reference and routes it through the video-reference path.
+
 #### Audio Quality Metrics
 
 Enable with `--audio_metrics`. All logic in `audio_metrics.py`. Disabled by default with zero overhead.
@@ -1167,8 +1230,9 @@ Use `--lora_target_preset` to control which layers LoRA targets. For custom laye
 | `video_sa_ca_ff` | Video self-attention + cross-attention + video FFN (`attn1`, `attn2`, `ff`) | Video only | Text-guided controls (video detailing, camera-from-image, sparse tracks) |
 | `audio` | Audio attn/FFN + `video_to_audio_attn` | Audio only | Audio-only training (auto-selected when `--ltx2_mode audio`) |
 | `audio_ref_only_ic` | Audio attn/FFN + bidirectional AV cross-modal | Audio + cross-modal | Audio-reference IC-LoRA |
-| `av_ic` | All attention + video FFN + audio FFN (same as `v2v`) | Video + audio + cross-modal | Joint AV IC-LoRA |
-| `full` | All linear layers | Video + audio + cross-modal | Maximum expressiveness, larger file size |
+| `av_ic` | All attention + video FFN + audio FFN (same as `v2v`) | Video + audio + cross-modal | Joint AV IC-LoRA. Use `--av_cross_attention_mode` for directional variants and `--av_multi_ref` when configuring a multi-reference AV IC run |
+| `video_ref_only_av` | All attention + video FFN + audio FFN (same as `v2v`) | Video + audio + cross-modal | AV training with reference video only; target audio is still generated |
+| `full` | All linear layers for LoRA targeting | Video + audio + cross-modal | Maximum expressiveness, larger file size |
 
 **Modality scope matters when training on an AV checkpoint.** The `t2v`, `v2v`, `av_ic`, and `full` presets create LoRA weights for audio and cross-modal layers. If those layers receive no audio training signal (e.g., image/video-only dataset), the LoRA weights for audio modules are initialized but never meaningfully updated — applying such a LoRA can degrade the base model's audio capabilities. Use a `video_*` preset to restrict LoRA to video-branch modules only, leaving audio layers completely untouched. Connector layers (`Embeddings1DConnector`) are excluded by default; use `--train_connectors` to include them (see below).
 
@@ -1214,6 +1278,7 @@ The output is a JSON report written to `--estimation_output` or, if omitted, `<o
 - `summary`: `candidate_modules`, `candidate_params`, `total_fisher_sum`, and `recommended_preset`
 - `family_scores`: aggregate scores by module family such as `video_self_attn` and `video_cross_attn`
 - `preset_scores`: aggregate scores for the preset candidates available in the current `ltx_mode`
+- `module_scores`: per-module score rows keyed by `module_path`
 - `top_modules`: highest-ranked individual weights
 
 `recommended_preset` is selected as follows:
@@ -1275,6 +1340,29 @@ image_directory = "targets"
 reference_directory = "references"
 reference_cache_directory = "cache_ref"
 ```
+
+For multi-reference `av_ic`, use the plural dataset keys instead:
+
+```toml
+[[datasets]]
+video_directory = "videos"
+reference_directories = ["references_a", "references_b"]
+reference_cache_directories = ["cache_ref_a", "cache_ref_b"]
+reference_audio_directories = ["reference_audio_a", "reference_audio_b"]
+reference_audio_cache_directories = ["cache_ref_audio_a", "cache_ref_audio_b"]
+target_frames = [33]
+```
+
+In the dashboard, these map to the Advanced dataset fields:
+- `Reference Cache Dir` + `Extra Ref Cache Dirs`
+- `Reference Directory` + `Extra Reference Dirs`
+- `Ref Audio Cache Dir` + `Extra Ref Audio Cache Dirs`
+- `Ref Audio Directory` + `Extra Ref Audio Dirs`
+
+In the training dashboard, AV IC behavior is configured from the Advanced LoRA section:
+- `IC-LoRA Strategy = av_ic`
+- `AV Cross-Attn` for `both` / `a2v_only` / `v2a_only` / `none`
+- `Multi-Ref AV` when the dataset uses the plural reference directory fields above
 
 ##### Step 3: Cache Latents
 
@@ -1371,12 +1459,15 @@ The `--sample_include_reference` flag shows the reference side-by-side with the 
 | Option | Type | Description |
 |--------|------|-------------|
 | `reference_directory` | string | Path to reference images/videos for IC-LoRA datasets (matched by filename stem) |
+| `reference_directories` | array[string] | Optional multi-reference variant of `reference_directory`; use one entry per reference stream |
 | `reference_cache_directory` | string | Output directory for cached reference latents |
+| `reference_cache_directories` | array[string] | Optional multi-reference variant of `reference_cache_directory`; count must match `reference_directories` |
 
 ##### Notes
 
 - **First-frame conditioning** (`--ltx2_first_frame_conditioning_p`): Randomly conditions on the first target frame in addition to the reference. Only applied during training; inference always denoises the full target. Has no effect for single-frame (image-only) samples — the code skips conditioning when `num_frames == 1` since there are no subsequent frames to generate.
 - **Multi-frame references**: Supported but increase VRAM usage proportionally to the number of reference tokens.
+- **Multi-reference datasets**: `av_ic` can consume multiple references directly from dataset TOML via `reference_directories` + `reference_cache_directories` (and the audio equivalents below). The list lengths must match. `--av_multi_ref` exposes that intent in training metadata/UI.
 - **Multi-subject references**: The VAE compresses 8 frames into 1 temporal latent via `SpaceToDepthDownsample`, which pairs consecutive frames and averages their features. Subjects sharing the same 8-frame group are blended and lose individual identity. To keep N subjects separated, structure your reference video as: frame 1 = Subject A, frames 2–9 = Subject B (repeated 8×), frames 10–17 = Subject C (repeated 8×), etc. Total frames: `1 + 8×(N−1)`. Set `--reference_frames` to match. Frame 1 gets its own latent due to causal padding in the encoder; each subsequent 8-frame block produces one additional latent.
 - **Video-only**: IC-LoRA requires `--ltx2_mode video`. Audio-video mode is not supported for v2v training.
 - **Downscale factor metadata**: Saved in LoRA safetensors as `ss_reference_downscale_factor` when factor != 1.
@@ -1551,7 +1642,7 @@ Reference audio latents are precached automatically when using `--precache_sampl
 | `--lora_target_preset audio_ref_only_ic` | — | Targets audio attn/FFN + bidirectional AV cross-modal layers |
 | `--audio_ref_use_negative_positions` | off | Place reference audio in negative RoPE time for positional separation |
 | `--audio_ref_mask_cross_attention_to_reference` | off | Block video from attending to reference audio tokens (AV mode only; no effect in audio-only mode) |
-| `--audio_ref_mask_reference_from_text_attention` | off | Block reference audio from attending to text tokens |
+| `--audio_ref_mask_reference_from_text_attention` | off | Block reference audio from attending to text tokens (`av_ic`: currently unsupported and ignored) |
 | `--audio_ref_identity_guidance_scale` | 0.0 | Override CFG scale for target-audio branch during `audio_ref_only_ic` sampling (0 = use standard guidance scale) |
 
 ##### Dataset Config Options
@@ -1559,13 +1650,19 @@ Reference audio latents are precached automatically when using `--precache_sampl
 | Option | Type | Description |
 |--------|------|-------------|
 | `reference_audio_directory` | string | Path to reference audio files (matched by filename stem) |
+| `reference_audio_directories` | array[string] | Optional multi-reference variant of `reference_audio_directory`; use one entry per reference stream |
 | `reference_audio_cache_directory` | string | Output directory for cached reference audio latents |
+| `reference_audio_cache_directories` | array[string] | Optional multi-reference variant of `reference_audio_cache_directory`; count must match `reference_audio_directories` |
 
 ##### Notes
 
 - **Checkpoint**: requires an LTXAV checkpoint for both `--ltx2_mode av` and `--ltx2_mode audio`.
 - **Bucket separation**: `separate_audio_buckets = true` keeps audio/non-audio items in separate batches (avoids shape mismatches in collation).
 - **Attention masks are training-only**: `--audio_ref_mask_cross_attention_to_reference` and `--audio_ref_mask_reference_from_text_attention` are applied only during training. They are automatically disabled during sampling/inference to match the ID-LoRA reference (which explicitly sets both to `false` during validation). Negative position overrides are always applied.
+- **`av_ic` limitation**: `--audio_ref_mask_reference_from_text_attention` is not currently supported in `av_ic` because the Modality API uses a 2D `context_mask`; the trainer warns and ignores this flag.
+- **AV cross-attention modes**: `--av_cross_attention_mode both` is the default `av_ic` behavior. Use `a2v_only` for audio-to-video only, `v2a_only` for video-to-audio only, or `none` to disable AV cross-modal attention while keeping the rest of `av_ic` intact. All require `--ltx2_mode av`.
+- **Multi-reference `av_ic`**: accepts multiple reference latents when they are provided as stacked tensors or extra `ref_*` entries, and concatenates them before conditioning. This keeps the implementation compatible with the existing single-reference path while allowing richer identity/style aggregation. `--av_multi_ref` is the explicit training-side toggle for this setup.
+- **`video_ref_only_av`**: requires `--ltx2_mode av`, uses reference video only, and keeps the audio branch target-only. This is useful when you want identity/motion conditioning from video without requiring reference audio for every sample.
 - **First-frame conditioning is critical**: without `--ltx2_first_frame_conditioning_p 0.9`, the model cannot learn face identity from the first frame. A warning is emitted if this is not set in AV mode.
 - `--ic_lora_strategy auto` (default) infers the strategy from `--lora_target_preset` via `infer_ic_lora_strategy_from_preset()`.
 
@@ -2069,12 +2166,13 @@ Slider LoRAs learn a controllable direction in model output space (e.g., "detail
 
 **Script:** `ltx2_train_slider.py`
 
-Two modes are available:
+Three modes are available:
 
 | Mode | Input | Use Case |
 |------|-------|----------|
 | `text` | Prompt pairs only (no dataset) | Sliders from text prompt pairs, no images needed |
 | `reference` | Pre-cached latent pairs | Sliders from paired positive/negative image, video, or audio samples |
+| IC-slider (`mode = "ic_reference"`) | Paired target caches + shared reference caches | Slider training under shared `v2v` reference conditioning |
 
 ### 4a. Text-Only Mode
 
@@ -2257,6 +2355,62 @@ Notes:
 - `--lora_target_preset audio` is recommended; if omitted, the slider trainer selects it automatically for audio reference sliders.
 - `--ltx2_first_frame_conditioning_p` has no effect for audio sliders.
 
+### 4c. IC-slider
+Trains a slider from paired positive/negative target latents under a shared cached visual reference. Internally this mode reuses the existing `v2v` IC path.
+
+#### Slider Config (`ltx2_slider_ic_reference.toml`)
+
+```toml
+mode = "ic_reference"
+reference_modality = "video"
+pos_cache_dir = "path/to/positive/cache"
+neg_cache_dir = "path/to/negative/cache"
+text_cache_dir = "path/to/text/cache"
+reference_cache_dir = "path/to/reference/cache"
+sample_slider_range = [-2.0, -1.0, 0.0, 1.0, 2.0]
+```
+
+- `pos_cache_dir`: Directory containing cached positive target latents.
+- `neg_cache_dir`: Directory containing cached negative target latents.
+- `text_cache_dir`: Directory containing cached text encoder outputs matched by basename.
+- `reference_cache_dir`: Directory containing cached reference-video latents matched by basename.
+
+Current restrictions:
+- `reference_modality = "video"` only
+- `--ltx2_mode video` only
+- `--ic_lora_strategy` resolves to `v2v`
+- if `--lora_target_preset` is omitted, the trainer selects `v2v`
+
+Files are matched by basename. For each `{name}_{W}x{H}_ltx2.safetensors` in `pos_cache_dir`, the trainer expects:
+- a matching negative latent file in `neg_cache_dir`
+- a matching text cache `{name}_ltx2_te.safetensors` in `text_cache_dir`
+- a matching reference latent file in `reference_cache_dir`
+
+##### Example Command (IC-Aware Reference)
+
+```bash
+accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 ltx2_train_slider.py ^
+  --mixed_precision bf16 ^
+  --ltx2_checkpoint /path/to/ltx-2.safetensors ^
+  --ltx2_mode video ^
+  --fp8_base --fp8_scaled ^
+  --gradient_checkpointing ^
+  --blocks_to_swap 10 ^
+  --network_module networks.lora_ltx2 ^
+  --network_dim 16 --network_alpha 16 ^
+  --lora_target_preset v2v ^
+  --learning_rate 1e-4 ^
+  --optimizer_type AdamW8bit ^
+  --lr_scheduler constant_with_warmup --lr_warmup_steps 20 ^
+  --max_train_steps 500 ^
+  --output_dir output --output_name identity_smile_slider ^
+  --slider_config ltx2_slider_ic_reference.toml
+```
+
+Additional notes:
+- `--ltx2_first_frame_conditioning_p` still applies on the target side
+- AV and audio IC-slider variants are not implemented
+
 ### Slider Tips
 
 - **Start small**: `--network_dim 8` or `16` with `--max_train_steps 200-500` is usually sufficient.
@@ -2312,12 +2466,23 @@ Notes:
 
 ---
 
-## Auto-Installer Script (WIP)
+## Setup / Update Script
+
+[`scripts/install.ps1`](https://github.com/AkaneTendo25/musubi-tuner/blob/ltx-2-dev/scripts/install.ps1) is the Windows setup and maintenance entry point.
 
 > [!WARNING]
-> This script is a **work in progress**. It has been tested on Windows 11 but may not cover every edge case. Please report issues.
+> The dashboard and `scripts/install.ps1` are still early prototypes and work in progress. Their stable behavior is not guaranteed.
 
-An all-in-one PowerShell installer is available at [`scripts/install.ps1`](https://github.com/AkaneTendo25/musubi-tuner/blob/ltx-2-dev/scripts/install.ps1). It automates the full setup: detecting/installing prerequisites (Git, Python, Node.js via winget/choco/scoop), cloning the repository, creating a virtual environment, installing PyTorch + all Python dependencies, optionally building the dashboard frontend, and creating a desktop shortcut to launch the dashboard.
+It can:
+
+- install or locate prerequisites (`git`, Python, Node.js)
+- clone the repository or update an existing checkout
+- create or repair the virtual environment
+- install or refresh Python dependencies
+- build or rebuild the dashboard frontend
+- create or recreate dashboard/setup launchers and desktop shortcuts
+- launch the dashboard
+- switch the target branch with `-Branch`
 
 **Quick start (one-liner):**
 
@@ -2325,7 +2490,7 @@ An all-in-one PowerShell installer is available at [`scripts/install.ps1`](https
 irm https://raw.githubusercontent.com/AkaneTendo25/musubi-tuner/ltx-2-dev/scripts/install.ps1 | iex
 ```
 
-This downloads and runs the installer with default settings (CUDA 12.8, Python 3.12, `ltx-2-dev` branch). An interactive menu lets you toggle which steps to run (install Git, clone repo, create venv, etc.).
+This downloads and runs the script with default settings (CUDA 12.8, Python 3.12, `ltx-2-dev` branch). Interactive mode shows the available actions and lets you choose which ones to run.
 
 **With custom parameters** — save the script locally first:
 
@@ -2336,5 +2501,7 @@ irm https://raw.githubusercontent.com/AkaneTendo25/musubi-tuner/ltx-2-dev/script
 
 Available parameters: `-InstallRoot`, `-Branch`, `-Cuda` (`cu124`/`cu128`/`cu130`/`cpu`), `-PythonVersion` (`3.10`-`3.13`), `-Port`, `-DashboardHost`, `-NonInteractive`, `-PreflightOnly`.
 
-The script writes a timestamped log to `%TEMP%` and prints a support bundle on failure for easier debugging.
+On success the script writes launchers and desktop shortcuts for the dashboard and the setup tool, and records install state used by later runs.
+
+The script writes a timestamped log to `%TEMP%`. On failure it prints support details at the end of the run.
 

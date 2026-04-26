@@ -26,6 +26,21 @@ export function removeRecentProject(path) {
 	recentProjects.update((list) => list.filter((p) => p.path !== path));
 }
 
+export function restoreRecentProject(project, index = 0) {
+	if (!project?.path) return;
+	recentProjects.update((list) => {
+		const filtered = list.filter((p) => p.path !== project.path);
+		const safeIndex = Math.max(0, Math.min(index, filtered.length));
+		const next = [...filtered];
+		next.splice(safeIndex, 0, {
+			name: project.name || project.path,
+			path: project.path,
+			lastOpened: project.lastOpened || Date.now(),
+		});
+		return next.slice(0, 10);
+	});
+}
+
 export async function closeProject() {
 	projectConfig.set(null);
 	projectLoaded.set(false);

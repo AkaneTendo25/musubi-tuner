@@ -21,12 +21,57 @@ from accelerate import Accelerator
 from safetensors.torch import load_file
 
 from musubi_tuner.hv_generate_video import setup_parser_compile
+from musubi_tuner.model_defaults import default_gemma_root_path, default_ltx2_checkpoint_path
 from musubi_tuner.ltx2_train_network import LTX2NetworkTrainer
 from musubi_tuner.networks import lora_ltx2
 from musubi_tuner.utils.device_utils import clean_memory_on_device
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
+
+
+def _apply_reference_conditioning_overrides(
+    prompts: list[dict],
+    *,
+    reference_image: str | None = None,
+    reference_video: str | None = None,
+) -> tuple[str, bool] | None:
+    if not reference_image and not reference_video:
+        return None
+
+    if reference_image and reference_video:
+        logger.warning(
+            "Both --reference_image and --reference_video given; "
+            "--reference_video takes priority (V2V), --reference_image ignored."
+        )
+
+    ref_path = reference_video or reference_image
+
+    # Auto-detect: if an --reference_image path is actually a video by ext, use V2V slot.
+    try:
+        from musubi_tuner.dataset.image_video_dataset import VIDEO_EXTENSIONS
+        video_exts = {e.lower() for e in VIDEO_EXTENSIONS}
+    except Exception:
+        video_exts = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
+
+    ext = os.path.splitext(ref_path)[1].lower()
+    use_v2v = bool(reference_video) or (ext in video_exts)
+
+    if not os.path.isfile(ref_path):
+        raise FileNotFoundError(f"Reference path does not exist: {ref_path}")
+
+    for prompt_dict in prompts:
+        # Explicit CLI references should override prompt-file paths and cached reference latents.
+        prompt_dict.pop("image_path", None)
+        prompt_dict.pop("conditioning_latent", None)
+        prompt_dict.pop("v2v_ref_path", None)
+        prompt_dict.pop("v2v_ref_latent", None)
+        if use_v2v:
+            prompt_dict["v2v_ref_path"] = ref_path
+        else:
+            prompt_dict["image_path"] = ref_path
+
+    return ref_path, use_v2v
 
 
 # ---------------------------------------------------------------------------
@@ -43,7 +88,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--ltx2_checkpoint",
         type=str,
-        required=True,
+        default=default_ltx2_checkpoint_path(),
         help="Path to LTX-2 checkpoint (.safetensors). Also used for VAE unless --vae is set.",
     )
     parser.add_argument(
@@ -70,7 +115,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", type=str, default=None, help="Force device to cpu or cuda")
 
     # -- Gemma text encoder --
-    parser.add_argument("--gemma_root", type=str, default=None,
+    parser.add_argument("--gemma_root", type=str, default=default_gemma_root_path(),
                         help="Local directory containing Gemma weights/tokenizer")
     parser.add_argument("--gemma_safetensors", type=str, default=None,
                         help="Single Gemma safetensors file (e.g. fp8 from ComfyUI). No --gemma_root needed.")
@@ -78,6 +123,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gemma_load_in_4bit", action="store_true", help="Load Gemma in 4-bit (bitsandbytes). CUDA only.")
     parser.add_argument("--gemma_bnb_4bit_quant_type", type=str, default="nf4", choices=["nf4", "fp4"])
     parser.add_argument("--gemma_bnb_4bit_disable_double_quant", action="store_true")
+    parser.add_argument(
+        "--gemma_fp8_weight_offload",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "When using FP8 Gemma safetensors, offload FP8 linear weights to CPU RAM. "
+            "Defaults to the LTX2_GEMMA_SAFETENSORS_WEIGHT_OFFLOAD environment variable when omitted."
+        ),
+    )
 
     # -- LoRA (merged into transformer for inference) --
     parser.add_argument("--lora_weight", type=str, nargs="*", default=None, help="LoRA weight path(s) to merge")
@@ -107,6 +161,33 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cfg_scale", type=float, default=None, help="CFG scale (overrides guidance_scale when set)")
     parser.add_argument("--discrete_flow_shift", type=float, default=5.0, help="Flow matching shift parameter")
     parser.add_argument("--seed", type=int, default=None, help="Random seed (None = random)")
+    parser.add_argument(
+        "--stg_scale",
+        type=float,
+        default=0.0,
+        help="Spatio-Temporal Guidance scale (0.0 = disabled). Official recommended ~1.0. "
+             "Costs one extra transformer forward per denoising step.",
+    )
+    parser.add_argument(
+        "--stg_blocks",
+        type=int,
+        nargs="*",
+        default=None,
+        help="Transformer block indices to perturb for STG (None = all blocks).",
+    )
+    parser.add_argument(
+        "--stg_mode",
+        type=str,
+        default="video",
+        choices=["video", "audio", "both"],
+        help="Which self-attention modality to perturb for STG.",
+    )
+    parser.add_argument(
+        "--rescale_scale",
+        type=float,
+        default=0.0,
+        help="CFG\u2605 rescaling after CFG+STG. Official LTX-2.3 uses 0.7; 0 disables.",
+    )
 
     # -- Attention / DiT quantization --
     parser.add_argument("--attn_mode", type=str, default="torch",
@@ -152,6 +233,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reference_frames", type=int, default=1, help="Number of V2V reference frames")
     parser.add_argument("--sample_include_reference", action="store_true",
                         help="Show V2V reference side-by-side in output")
+    parser.add_argument("--reference_image", type=str, default=None,
+                        help="Path to reference image for I2V conditioning (single frame). "
+                             "If path points to a video file by extension, treated as V2V.")
+    parser.add_argument("--reference_video", type=str, default=None,
+                        help="Path to reference video file for V2V conditioning (multi-frame).")
 
     # -- Audio (AV mode) --
     parser.add_argument("--sample_disable_audio", action="store_true", help="Disable audio decoding in AV mode")
@@ -205,6 +291,10 @@ def parse_args() -> argparse.Namespace:
         raise ValueError("Either --prompt or --sample_prompts (--from_file) must be specified")
     if args.gemma_root is None and not args.gemma_safetensors and not args.use_precached_sample_prompts:
         raise ValueError("--gemma_root or --gemma_safetensors is required (unless using --use_precached_sample_prompts)")
+    if args.gemma_load_in_8bit and args.gemma_load_in_4bit:
+        raise ValueError("--gemma_load_in_8bit and --gemma_load_in_4bit cannot be enabled together")
+    if args.gemma_safetensors and (args.gemma_load_in_8bit or args.gemma_load_in_4bit):
+        raise ValueError("--gemma_safetensors cannot be combined with --gemma_load_in_4bit/8bit")
 
     return args
 
@@ -403,6 +493,21 @@ def main() -> None:
     if not prompts:
         logger.error("No prompts to generate. Exiting.")
         return
+
+    if args.reference_image or args.reference_video:
+        try:
+            ref_path, use_v2v = _apply_reference_conditioning_overrides(
+                prompts,
+                reference_image=args.reference_image,
+                reference_video=args.reference_video,
+            )
+        except FileNotFoundError as exc:
+            logger.error(str(exc))
+            return
+        logger.info(
+            "Reference conditioning: %s via %s slot",
+            ref_path, "V2V (v2v_ref_path)" if use_v2v else "I2V (image_path)"
+        )
 
     logger.info("Generating %d sample(s)...", len(prompts))
 

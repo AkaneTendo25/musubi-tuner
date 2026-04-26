@@ -1,10 +1,10 @@
 import ast
 import asyncio
-from collections import deque
+import argparse
+from collections import defaultdict, deque
 from datetime import timedelta
 import gc
 import importlib
-import argparse
 import math
 import os
 import pathlib
@@ -782,6 +782,18 @@ class NetworkTrainer:
     def preservation_backward(self, args, accelerator, transformer, network, network_dtype):
         return {}
 
+    def compute_validation_extra_loss(
+        self,
+        args,
+        accelerator,
+        transformer,
+        network,
+        batch,
+        global_step: int,
+        network_dtype,
+    ):
+        return None, {}
+
     def get_dummy_scheduler(self, optimizer: torch.optim.Optimizer) -> Any:
         # dummy scheduler for schedulefree optimizer. supports only empty step(), get_last_lr() and optimizers.
         # this scheduler is used for logging only.
@@ -1031,6 +1043,102 @@ class NetworkTrainer:
             default_warmup_steps=int(num_warmup_steps or 0),
             warmup_overrides=warmup_overrides,
         )
+
+    def _prepare_network_optimizer_params(self, args: argparse.Namespace, network: Any):
+        network_module_name = str(getattr(args, "network_module", "") or "")
+        uses_lycoris_module = "lycoris" in network_module_name.lower()
+        if uses_lycoris_module:
+            return prepare_optimizer_params_compat(network, args, logger)
+        return network.prepare_optimizer_params(
+            unet_lr=args.learning_rate,
+            audio_lr=getattr(args, "audio_lr", None),
+            lr_args=getattr(args, "lr_args", None),
+        )
+
+    @staticmethod
+    def _copy_optimizer_state_subset(state: dict, keep_param_ids: set[int]) -> dict:
+        if isinstance(state, defaultdict):
+            copied = defaultdict(dict)
+        else:
+            copied = type(state)()
+        for param, value in state.items():
+            if id(param) in keep_param_ids:
+                copied[param] = value
+        return copied
+
+    def _refresh_optimizer_after_adaptive_rank_prune(
+        self,
+        args: argparse.Namespace,
+        accelerator: Accelerator,
+        network: Any,
+        optimizer: torch.optim.Optimizer,
+        lr_scheduler: Any,
+        *,
+        old_network_param_ids: set[int],
+        global_step: int,
+        recovery_config: Optional[dict[str, Any]] = None,
+    ):
+        unwrapped_network = accelerator.unwrap_model(network)
+        new_network_param_groups, lr_descriptions = self._prepare_network_optimizer_params(args, unwrapped_network)
+
+        inner_optimizer = optimizer.optimizer if hasattr(optimizer, "optimizer") else optimizer
+
+        preserved_extra_groups = []
+        preserved_extra_param_ids: set[int] = set()
+        for group in inner_optimizer.param_groups:
+            extra_params = [param for param in group["params"] if id(param) not in old_network_param_ids]
+            if not extra_params:
+                continue
+            group_copy = {k: v for k, v in group.items() if k != "params"}
+            group_copy["params"] = extra_params
+            preserved_extra_groups.append(group_copy)
+            preserved_extra_param_ids.update(id(param) for param in extra_params)
+
+        new_network_param_ids: set[int] = set()
+        normalized_network_groups = []
+        for group in new_network_param_groups:
+            group_copy = {k: v for k, v in group.items() if k != "params"}
+            params = list(group["params"])
+            if recovery_config is not None and "lr" in group_copy:
+                group_copy["lr"] = float(group_copy["lr"]) * float(recovery_config.get("lr_scale", 1.0))
+            group_copy["params"] = params
+            normalized_network_groups.append(group_copy)
+            new_network_param_ids.update(id(param) for param in params)
+
+        keep_param_ids = new_network_param_ids | preserved_extra_param_ids
+        inner_optimizer.state = self._copy_optimizer_state_subset(inner_optimizer.state, keep_param_ids)
+        inner_optimizer.param_groups = []
+
+        for group in normalized_network_groups:
+            inner_optimizer.add_param_group(group)
+        for group in preserved_extra_groups:
+            inner_optimizer.add_param_group(group)
+
+        for group in inner_optimizer.param_groups:
+            if "initial_lr" in group:
+                group["lr"] = group["initial_lr"]
+
+        scheduler_args = args
+        if recovery_config is not None:
+            scheduler_args = argparse.Namespace(**vars(args))
+            scheduler_args.max_train_steps = max(1, int(recovery_config["steps"]))
+            scheduler_args.lr_warmup_steps = int(recovery_config.get("warmup_steps", 0))
+            recover_scheduler = recovery_config.get("scheduler")
+            if recover_scheduler is None:
+                recover_scheduler = "constant_with_warmup" if scheduler_args.lr_warmup_steps > 0 else "constant"
+            scheduler_args.lr_scheduler = recover_scheduler
+        new_inner_scheduler = self.get_lr_scheduler(scheduler_args, inner_optimizer, accelerator.num_processes)
+        if recovery_config is None and global_step > 0 and not self.is_schedulefree_optimizer(inner_optimizer, args):
+            for _ in range(global_step):
+                new_inner_scheduler.step()
+
+        if hasattr(lr_scheduler, "scheduler"):
+            lr_scheduler.scheduler = new_inner_scheduler
+            refreshed_scheduler = lr_scheduler
+        else:
+            refreshed_scheduler = new_inner_scheduler
+
+        return refreshed_scheduler, lr_descriptions
 
     def resume_from_local_or_hf_if_specified(self, accelerator: Accelerator, args: argparse.Namespace) -> int:
         """Resume training state. Returns the recovered global_step (0 if not resuming)."""
@@ -2383,13 +2491,10 @@ class NetworkTrainer:
             dit_weight_dtype = dit_dtype
         logger.info(f"DiT precision: {dit_dtype}, weight precision: {dit_weight_dtype}")
 
-        # GUI dashboard metrics writer (lazy import, no-op when --gui is not set)
+        # GUI dashboard metrics writer. Enable either via legacy --gui or the
+        # GUI process manager's environment flag.
         gui_metrics = None
-        if getattr(args, "gui", False) and accelerator.is_main_process:
-            from musubi_tuner.gui_dashboard import create_metrics_writer
-
-            gui_metrics = create_metrics_writer(args.output_dir)
-            gui_metrics.update_status(step=0, max_steps=args.max_train_steps, status="starting")
+        dashboard_metrics_enabled = getattr(args, "gui", False) or os.getenv("MUSUBI_DASHBOARD_METRICS") == "1"
 
         # get embedding for sampling images
         vae_dtype = torch.float16 if args.vae_dtype is None else model_utils.str_to_dtype(args.vae_dtype)
@@ -2583,16 +2688,7 @@ class NetworkTrainer:
         # prepare optimizer, data loader etc.
         accelerator.print("prepare optimizer, data loader etc.")
 
-        network_module_name = str(getattr(args, "network_module", "") or "")
-        uses_lycoris_module = "lycoris" in network_module_name.lower()
-        if uses_lycoris_module:
-            trainable_params, lr_descriptions = prepare_optimizer_params_compat(network, args, logger)
-        else:
-            trainable_params, lr_descriptions = network.prepare_optimizer_params(
-                unet_lr=args.learning_rate,
-                audio_lr=getattr(args, "audio_lr", None),
-                lr_args=getattr(args, "lr_args", None),
-            )
+        trainable_params, lr_descriptions = self._prepare_network_optimizer_params(args, network)
 
         optimizer_name, optimizer_args, optimizer, optimizer_train_fn, optimizer_eval_fn = self.get_optimizer(
             args, trainable_params
@@ -2796,6 +2892,17 @@ class NetworkTrainer:
                         weights.pop(i)
                 # print(f"save model hook: {len(weights)} weights will be saved")
 
+                unwrapped_network = accelerator.unwrap_model(network)
+                if hasattr(unwrapped_network, "build_adaptive_rank_runtime_state"):
+                    try:
+                        adaptive_rank_runtime_state = unwrapped_network.build_adaptive_rank_runtime_state()
+                        if adaptive_rank_runtime_state is not None:
+                            runtime_state_path = unwrapped_network._adaptive_rank_runtime_state_path(output_dir)
+                            with open(runtime_state_path, "w", encoding="utf-8") as f:
+                                json.dump(adaptive_rank_runtime_state, f, indent=2, sort_keys=True)
+                    except Exception as e:
+                        logger.warning(f"Failed to save adaptive rank runtime state: {e}")
+
                 # Save CREPA projector into state directory so it matches the optimizer state
                 if hasattr(self, '_crepa') and self._crepa is not None:
                     try:
@@ -2841,6 +2948,30 @@ class NetworkTrainer:
             for i in reversed(remove_indices):
                 models.pop(i)
             # print(f"load model hook: {len(models)} models will be loaded")
+
+            if models:
+                try:
+                    runtime_state_path = None
+                    adaptive_rank_runtime_state = None
+                    for model in models:
+                        unwrapped_model = accelerator.unwrap_model(model)
+                        if not hasattr(unwrapped_model, "load_adaptive_rank_runtime_state"):
+                            continue
+                        runtime_state_path = unwrapped_model._adaptive_rank_runtime_state_path(input_dir)
+                        if not os.path.exists(runtime_state_path):
+                            continue
+                        with open(runtime_state_path, "r", encoding="utf-8") as f:
+                            adaptive_rank_runtime_state = json.load(f)
+                        break
+
+                    if adaptive_rank_runtime_state is not None:
+                        for model in models:
+                            unwrapped_model = accelerator.unwrap_model(model)
+                            if hasattr(unwrapped_model, "load_adaptive_rank_runtime_state"):
+                                unwrapped_model.load_adaptive_rank_runtime_state(adaptive_rank_runtime_state)
+                        logger.info("Loaded adaptive rank runtime state from %s", runtime_state_path)
+                except Exception as e:
+                    logger.warning(f"Failed to load adaptive rank runtime state: {e}")
 
             if hasattr(self, "_self_flow") and self._self_flow is not None:
                 try:
@@ -2903,6 +3034,10 @@ class NetworkTrainer:
             resume_metadata = train_utils.load_resume_metadata(args.resume)
 
         initial_global_step = self.resume_from_local_or_hf_if_specified(accelerator, args)
+        if dashboard_metrics_enabled and accelerator.is_main_process:
+            from musubi_tuner.gui_dashboard import create_metrics_writer
+
+            gui_metrics = create_metrics_writer(args.output_dir, reset=initial_global_step == 0)
 
         # apply optimizer/scheduler resets after resume
         if initial_global_step > 0:
@@ -2949,6 +3084,14 @@ class NetworkTrainer:
                 epoch_to_start = saved_epoch
         else:
             epoch_to_start = initial_global_step // num_update_steps_per_epoch if initial_global_step > 0 else 0
+        if gui_metrics is not None:
+            gui_metrics.update_status(
+                step=initial_global_step,
+                max_steps=args.max_train_steps,
+                epoch=epoch_to_start,
+                max_epochs=num_train_epochs,
+                status="starting",
+            )
 
         # 学習する
         # total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
@@ -3204,179 +3347,341 @@ class NetworkTrainer:
 
             total_loss = 0.0
             total_count = 0
-            with torch.no_grad():
-                val_iter = validation_dataloader
-                if accelerator.is_local_main_process:
-                    val_iter = tqdm(
-                        validation_dataloader,
-                        desc="validation",
-                        smoothing=0,
-                        leave=False,
-                    )
-                for val_step, batch in enumerate(val_iter):
-                    latents = batch["latents"]
-                    if isinstance(latents, dict):
-                        if "latents" not in latents:
-                            raise ValueError("batch['latents'] is a dict but missing key 'latents'")
-                        self.set_current_batch_latents_info(latents)
-                        latents_tensor = latents["latents"]
-                    else:
-                        self.set_current_batch_latents_info(None)
-                        latents_tensor = latents
+            val_audio_presence_ema = float(audio_presence_ema)
+            val_audio_loss_ema = float(audio_loss_ema)
+            val_video_loss_ema = float(video_loss_ema)
+            validation_self_flow_network = None
+            validation_self_flow_prev_training = None
+            if bool(getattr(args, "self_flow", False)):
+                validation_self_flow_network = getattr(self, "_self_flow_network", None)
+                if validation_self_flow_network is not None:
+                    validation_self_flow_prev_training = bool(getattr(validation_self_flow_network, "training", False))
+                    validation_self_flow_network.training = True
 
-                    latents_tensor = self.scale_shift_latents(latents_tensor)
-                    noise = torch.randn_like(latents_tensor)
+            try:
+                with torch.no_grad():
+                    val_iter = validation_dataloader
+                    if accelerator.is_local_main_process:
+                        val_iter = tqdm(
+                            validation_dataloader,
+                            desc="validation",
+                            smoothing=0,
+                            leave=False,
+                        )
+                    for val_step, batch in enumerate(val_iter):
+                        latents = batch["latents"]
+                        if isinstance(latents, dict):
+                            if "latents" not in latents:
+                                raise ValueError("batch['latents'] is a dict but missing key 'latents'")
+                            self.set_current_batch_latents_info(latents)
+                            latents_tensor = latents["latents"]
+                        else:
+                            self.set_current_batch_latents_info(None)
+                            latents_tensor = latents
 
-                    # HFATO: degrade latents before noise addition, keep clean for loss
-                    _hfato_config = getattr(self, "_hfato_config", None)
-                    if _hfato_config is not None and latents_tensor.dim() == 5:
-                        import random as _hfato_rand
-                        if _hfato_rand.random() < _hfato_config.probability:
-                            from musubi_tuner.hfato import degrade_latents
-                            batch["_hfato"] = {"clean_latents": latents_tensor}
-                            latents_tensor = degrade_latents(
-                                latents_tensor, _hfato_config.scale_factor, _hfato_config.interpolation,
-                            )
+                        latents_tensor = self.scale_shift_latents(latents_tensor)
+                        noise = torch.randn_like(latents_tensor)
 
-                    noisy_model_input, timesteps = self.get_noisy_model_input_and_timesteps(
-                        args,
-                        noise,
-                        latents_tensor,
-                        batch["timesteps"],
-                        noise_scheduler,
-                        accelerator.device,
-                        dit_dtype,
-                    )
+                        # HFATO: degrade latents before noise addition, keep clean for loss
+                        _hfato_config = getattr(self, "_hfato_config", None)
+                        if _hfato_config is not None and latents_tensor.dim() == 5:
+                            import random as _hfato_rand
+                            if _hfato_rand.random() < _hfato_config.probability:
+                                from musubi_tuner.hfato import degrade_latents
+                                batch["_hfato"] = {"clean_latents": latents_tensor}
+                                latents_tensor = degrade_latents(
+                                    latents_tensor, _hfato_config.scale_factor, _hfato_config.interpolation,
+                                )
 
-                    weighting = compute_loss_weighting_for_sd3(
-                        args.weighting_scheme, noise_scheduler, timesteps, accelerator.device, dit_dtype
-                    )
+                        noisy_model_input, timesteps = self.get_noisy_model_input_and_timesteps(
+                            args,
+                            noise,
+                            latents_tensor,
+                            batch["timesteps"],
+                            noise_scheduler,
+                            accelerator.device,
+                            dit_dtype,
+                        )
 
-                    model_pred, target = self.call_dit(
-                        args,
-                        accelerator,
-                        transformer,
-                        latents_tensor,
-                        batch,
-                        noise,
-                        noisy_model_input,
-                        timesteps,
-                        network_dtype,
-                    )
+                        weighting = compute_loss_weighting_for_sd3(
+                            args.weighting_scheme, noise_scheduler, timesteps, accelerator.device, dit_dtype
+                        )
 
-                    dict_output = isinstance(model_pred, dict)
-                    _loss_type = getattr(args, "loss_type", "mse")
-                    _huber_delta = getattr(args, "huber_delta", 1.0)
-                    if dict_output:
-                        out = model_pred
-                        if out.get("_skip_step"):
-                            logger.warning(
-                                "Skipping step due to non-finite tensor (%s).",
-                                out.get("skip_reason", "unknown"),
-                            )
-                            optimizer.zero_grad(set_to_none=True)
-                            continue
+                        model_pred, target = self.call_dit(
+                            args,
+                            accelerator,
+                            transformer,
+                            latents_tensor,
+                            batch,
+                            noise,
+                            noisy_model_input,
+                            timesteps,
+                            network_dtype,
+                        )
 
+                        dict_output = isinstance(model_pred, dict)
+                        out = model_pred if dict_output else None
+                        _loss_type = getattr(args, "loss_type", "mse")
+                        _huber_delta = getattr(args, "huber_delta", 1.0)
+                        video_pred = None
                         video_loss = None
                         audio_loss = None
                         video_weight = None
                         audio_weight = None
 
-                        def _masked_loss(
-                            pred: torch.Tensor,
-                            tgt: torch.Tensor,
-                            mask: torch.Tensor | None,
-                        ) -> torch.Tensor:
-                            if isinstance(tgt, torch.Tensor):
-                                pred = pred.to(device=tgt.device, dtype=network_dtype)
+                        if dict_output:
+                            if out.get("_skip_step"):
+                                logger.warning(
+                                    "Skipping step due to non-finite tensor (%s).",
+                                    out.get("skip_reason", "unknown"),
+                                )
+                                optimizer.zero_grad(set_to_none=True)
+                                continue
+
+                            def _masked_loss(
+                                pred: torch.Tensor,
+                                tgt: torch.Tensor,
+                                mask: torch.Tensor | None,
+                            ) -> torch.Tensor:
+                                if isinstance(tgt, torch.Tensor):
+                                    pred = pred.to(device=tgt.device, dtype=network_dtype)
+                                else:
+                                    pred = pred.to(dtype=network_dtype)
+                                per_elem = _per_element_loss(pred, tgt, _loss_type, _huber_delta)
+                                if weighting is not None:
+                                    w = weighting
+                                    if isinstance(w, torch.Tensor) and w.dim() != per_elem.dim():
+                                        while w.dim() > per_elem.dim() and w.shape[-1] == 1:
+                                            w = w.squeeze(-1)
+                                    per_elem = per_elem * w
+                                if mask is None:
+                                    return per_elem.mean()
+
+                                mask = mask.to(device=per_elem.device)
+                                if per_elem.dim() == 5 and mask.dim() == 2:
+                                    mask = mask.view(mask.shape[0], 1, mask.shape[1], 1, 1)
+                                elif per_elem.dim() == 5 and mask.dim() == 1:
+                                    mask = mask.view(mask.shape[0], 1, 1, 1, 1)
+                                elif per_elem.dim() == 4 and mask.dim() == 2:
+                                    mask = mask.view(mask.shape[0], 1, mask.shape[1], 1)
+                                elif per_elem.dim() == 4 and mask.dim() == 1:
+                                    mask = mask.view(mask.shape[0], 1, 1, 1)
+                                elif per_elem.dim() == 3 and mask.dim() == 2:
+                                    mask = mask.unsqueeze(-1)
+                                elif per_elem.dim() == 3 and mask.dim() == 1:
+                                    mask = mask.view(mask.shape[0], 1, 1)
+
+                                mask_f = mask.to(dtype=per_elem.dtype)
+                                denom = mask_f.mean()
+                                if denom.item() == 0:
+                                    return per_elem.mean()
+                                return (per_elem * mask_f).div(denom).mean()
+
+                            video_pred = out["video_pred"]
+                            video_target = out["video_target"]
+                            video_loss_mask = out.get("video_loss_mask")
+                            _hfato_data = out.get("_hfato")
+                            if _hfato_data is not None:
+                                from musubi_tuner.hfato import hfato_x0_loss
+                                video_loss = hfato_x0_loss(
+                                    video_pred.to(dtype=network_dtype),
+                                    _hfato_data["noisy"].to(device=video_pred.device, dtype=network_dtype),
+                                    _hfato_data["clean"].to(device=video_pred.device, dtype=network_dtype),
+                                    _hfato_data["sigma"].to(device=video_pred.device),
+                                    video_loss_mask,
+                                )
                             else:
-                                pred = pred.to(dtype=network_dtype)
-                            per_elem = _per_element_loss(pred, tgt, _loss_type, _huber_delta)
+                                video_loss = _masked_loss(video_pred, video_target, video_loss_mask)
+
+                            audio_pred = out.get("audio_pred")
+                            audio_target = out.get("audio_target")
+                            audio_loss_mask = out.get("audio_loss_mask")
+                            has_audio_loss = audio_pred is not None and audio_target is not None
+
+                            if (
+                                audio_loss_balance_mode == "uncertainty"
+                                and has_audio_loss
+                                and uncertainty_log_var_video is not None
+                                and uncertainty_log_var_audio is not None
+                            ):
+                                audio_loss = _masked_loss(audio_pred, audio_target, audio_loss_mask)
+                                loss = compute_uncertainty_weighted_loss(
+                                    video_loss, audio_loss,
+                                    uncertainty_log_var_video, uncertainty_log_var_audio,
+                                )
+                            elif audio_loss_balance_mode == "ogm_ge" and has_audio_loss:
+                                audio_loss = _masked_loss(audio_pred, audio_target, audio_loss_mask)
+                                ogm_ge_state = compute_ogm_ge_coefficients(
+                                    float(video_loss.detach().item()),
+                                    float(audio_loss.detach().item()),
+                                    alpha=float(getattr(args, "ogm_ge_alpha", 0.3)),
+                                )
+                                video_weight = float(ogm_ge_state.video_coeff)
+                                audio_weight = float(ogm_ge_state.audio_coeff)
+                                loss = video_loss * ogm_ge_state.video_coeff + audio_loss * ogm_ge_state.audio_coeff
+                            else:
+                                video_weight = float(out.get("video_loss_weight", 1.0))
+                                loss = video_loss * video_weight
+                                if audio_loss_balance_mode == "ema_mag":
+                                    video_loss_item = max(float(video_loss.detach().item()), 1e-12)
+                                    val_video_loss_ema = update_loss_ema(
+                                        loss_ema=val_video_loss_ema,
+                                        loss_value=video_loss_item,
+                                        ema_decay=audio_loss_balance_ema_decay,
+                                    )
+                                if audio_loss_balance_mode == "inv_freq":
+                                    val_audio_presence_ema = update_audio_presence_ema(
+                                        audio_presence_ema=val_audio_presence_ema,
+                                        balance_beta=audio_loss_balance_beta,
+                                        has_audio_loss=has_audio_loss,
+                                    )
+                                if has_audio_loss:
+                                    audio_loss = _masked_loss(audio_pred, audio_target, audio_loss_mask)
+                                    audio_weight = float(out.get("audio_loss_weight", 1.0))
+                                    if audio_loss_balance_mode == "inv_freq":
+                                        audio_weight = compute_inverse_frequency_audio_weight(
+                                            base_audio_weight=audio_weight,
+                                            audio_presence_ema=val_audio_presence_ema,
+                                            balance_eps=audio_loss_balance_eps,
+                                            balance_min=audio_loss_balance_min,
+                                            balance_max=audio_loss_balance_max,
+                                        )
+                                    elif audio_loss_balance_mode == "ema_mag":
+                                        audio_loss_item = max(float(audio_loss.detach().item()), 1e-12)
+                                        val_audio_loss_ema = update_loss_ema(
+                                            loss_ema=val_audio_loss_ema,
+                                            loss_value=audio_loss_item,
+                                            ema_decay=audio_loss_balance_ema_decay,
+                                        )
+                                        audio_weight = compute_ema_magnitude_audio_weight(
+                                            base_audio_weight=audio_weight,
+                                            audio_loss_ema=val_audio_loss_ema,
+                                            video_loss_ema=val_video_loss_ema,
+                                            target_audio_ratio=audio_loss_balance_target_ratio,
+                                            balance_min=audio_loss_balance_min,
+                                            balance_max=audio_loss_balance_max,
+                                        )
+                                    loss = loss + audio_loss * audio_weight
+                        else:
+                            if isinstance(target, torch.Tensor):
+                                model_pred = model_pred.to(device=target.device, dtype=network_dtype)
+                            else:
+                                model_pred = model_pred.to(dtype=network_dtype)
+                            loss = _per_element_loss(model_pred, target, _loss_type, _huber_delta)
                             if weighting is not None:
-                                w = weighting
-                                if isinstance(w, torch.Tensor) and w.dim() != per_elem.dim():
-                                    while w.dim() > per_elem.dim() and w.shape[-1] == 1:
-                                        w = w.squeeze(-1)
-                                per_elem = per_elem * w
-                            if mask is None:
-                                return per_elem.mean()
+                                loss = loss * weighting
+                            loss = loss.mean()
 
-                            mask = mask.to(device=per_elem.device)
-                            if per_elem.dim() == 5 and mask.dim() == 2:
-                                mask = mask.view(mask.shape[0], 1, mask.shape[1], 1, 1)
-                            elif per_elem.dim() == 5 and mask.dim() == 1:
-                                mask = mask.view(mask.shape[0], 1, 1, 1, 1)
-                            elif per_elem.dim() == 4 and mask.dim() == 2:
-                                mask = mask.view(mask.shape[0], 1, mask.shape[1], 1)
-                            elif per_elem.dim() == 4 and mask.dim() == 1:
-                                mask = mask.view(mask.shape[0], 1, 1, 1)
-                            elif per_elem.dim() == 3 and mask.dim() == 2:
-                                mask = mask.unsqueeze(-1)
-                            elif per_elem.dim() == 3 and mask.dim() == 1:
-                                mask = mask.view(mask.shape[0], 1, 1)
-
-                            mask_f = mask.to(dtype=per_elem.dtype)
-                            denom = mask_f.mean()
-                            if denom.item() == 0:
-                                return per_elem.mean()
-                            return (per_elem * mask_f).div(denom).mean()
-
-                        video_pred = out["video_pred"]
-                        video_target = out["video_target"]
-                        video_loss_mask = out.get("video_loss_mask")
-                        _hfato_data = out.get("_hfato")
-                        if _hfato_data is not None:
-                            from musubi_tuner.hfato import hfato_x0_loss
-                            video_loss = hfato_x0_loss(
-                                video_pred.to(dtype=network_dtype),
-                                _hfato_data["noisy"].to(device=video_pred.device, dtype=network_dtype),
-                                _hfato_data["clean"].to(device=video_pred.device, dtype=network_dtype),
-                                _hfato_data["sigma"].to(device=video_pred.device),
-                                video_loss_mask,
+                        if dict_output and video_pred is not None:
+                            _prior_div = self.compute_prior_divergence_addition(
+                                args, accelerator, transformer, network, video_pred, network_dtype
                             )
-                        else:
-                            video_loss = _masked_loss(video_pred, video_target, video_loss_mask)
-                        video_weight = float(out.get("video_loss_weight", 1.0))
-                        loss = video_loss * video_weight
+                            if _prior_div is not None:
+                                loss = loss + _prior_div
 
-                        audio_pred = out.get("audio_pred")
-                        audio_target = out.get("audio_target")
-                        audio_loss_mask = out.get("audio_loss_mask")
-                        if audio_pred is not None and audio_target is not None:
-                            audio_loss = _masked_loss(audio_pred, audio_target, audio_loss_mask)
-                            audio_weight = float(out.get("audio_loss_weight", 1.0))
-                            loss = loss + audio_loss * audio_weight
-                    else:
-                        if isinstance(target, torch.Tensor):
-                            model_pred = model_pred.to(device=target.device, dtype=network_dtype)
-                        else:
-                            model_pred = model_pred.to(dtype=network_dtype)
-                        loss = _per_element_loss(model_pred, target, _loss_type, _huber_delta)
-                        if weighting is not None:
-                            loss = loss * weighting
-                        loss = loss.mean()
+                        if hasattr(self, "_crepa") and self._crepa is not None:
+                            self._crepa.on_step(step)
+                            try:
+                                num_latent_frames = int(latents_tensor.shape[2]) if latents_tensor.dim() >= 3 else 0
+                                conditions = batch.get("conditions", {})
+                                dino_features = conditions.get("dino_features") if isinstance(conditions, dict) else None
+                                crepa_loss = self._crepa.compute_loss(num_latent_frames, dino_features=dino_features)
+                                if crepa_loss is not None:
+                                    loss = loss + crepa_loss
+                            finally:
+                                self._crepa.cleanup_step()
 
-                    if loss_diag_enabled and global_step % max(loss_diag_every, 1) == 0:
-                        weight_stats = ""
-                        if isinstance(weighting, torch.Tensor):
-                            weight_stats = (
-                                f" weighting(mean={weighting.float().mean().item():.6f}"
-                                f" min={weighting.float().min().item():.6f}"
-                                f" max={weighting.float().max().item():.6f})"
+                        if hasattr(self, "compute_self_flow_addition"):
+                            if hasattr(self, "_self_flow") and self._self_flow is not None:
+                                self._self_flow.on_step(step)
+                            try:
+                                self_flow_loss, _ = self.compute_self_flow_addition(
+                                    args,
+                                    accelerator,
+                                    transformer,
+                                    network,
+                                    network_dtype,
+                                )
+                                if self_flow_loss is not None:
+                                    loss = loss + self_flow_loss
+                            except Exception as e:
+                                logger.warning("Self-Flow loss computation failed during validation: %s", e)
+
+                        if dict_output and out is not None:
+                            cts_data = out.get("_cts")
+                            if cts_data is not None:
+                                try:
+                                    cts_loss, _ = compute_cross_task_synergy_losses(
+                                        transformer=transformer,
+                                        accelerator=accelerator,
+                                        noisy_video=cts_data["noisy_video"],
+                                        clean_video=cts_data["clean_video"],
+                                        video_target=out["video_target"],
+                                        video_timesteps=cts_data["video_timesteps"],
+                                        video_loss_mask=out.get("video_loss_mask"),
+                                        noisy_audio=cts_data["noisy_audio"],
+                                        clean_audio=cts_data["clean_audio"],
+                                        audio_target=out.get("audio_target"),
+                                        audio_timesteps=cts_data["audio_timesteps"],
+                                        audio_loss_mask=out.get("audio_loss_mask"),
+                                        text_embeds=cts_data["text_embeds"],
+                                        text_mask=cts_data["text_mask"],
+                                        frame_rate=cts_data["frame_rate"],
+                                        transformer_options=cts_data["transformer_options"],
+                                        lambda_video_driven=cts_data["lambda_video_driven"],
+                                        lambda_audio_driven=cts_data["lambda_audio_driven"],
+                                    )
+                                    if cts_loss is not None:
+                                        loss = loss + cts_loss
+                                except Exception as e:
+                                    logger.warning("Cross-Task Synergy loss failed during validation: %s", e)
+
+                        unwrapped_network = accelerator.unwrap_model(network)
+                        if hasattr(unwrapped_network, "compute_adaptive_rank_loss"):
+                            adaptive_rank_loss = unwrapped_network.compute_adaptive_rank_loss()
+                            if adaptive_rank_loss is not None:
+                                loss = loss + adaptive_rank_loss
+
+                        try:
+                            validation_extra_loss, _ = self.compute_validation_extra_loss(
+                                args,
+                                accelerator,
+                                transformer,
+                                network,
+                                batch,
+                                step,
+                                network_dtype,
                             )
-                        logger.info(
-                            "LOSS_DIAG step=%s video_loss=%s video_weight=%s audio_loss=%s audio_weight=%s total=%s%s",
-                            global_step,
-                            f"{video_loss.item():.6f}" if isinstance(video_loss, torch.Tensor) else "n/a",
-                            f"{video_weight:.3f}" if isinstance(video_weight, float) else "n/a",
-                            f"{audio_loss.item():.6f}" if isinstance(audio_loss, torch.Tensor) else "n/a",
-                            f"{audio_weight:.3f}" if isinstance(audio_weight, float) else "n/a",
-                            f"{loss.item():.6f}" if isinstance(loss, torch.Tensor) else str(loss),
-                            weight_stats,
-                        )
+                            if validation_extra_loss is not None:
+                                loss = loss + validation_extra_loss
+                        finally:
+                            if hasattr(self, "_last_dit_inputs"):
+                                self._last_dit_inputs = None
 
-                    total_loss += loss.detach().item()
-                    total_count += 1
+                        if loss_diag_enabled and global_step % max(loss_diag_every, 1) == 0:
+                            weight_stats = ""
+                            if isinstance(weighting, torch.Tensor):
+                                weight_stats = (
+                                    f" weighting(mean={weighting.float().mean().item():.6f}"
+                                    f" min={weighting.float().min().item():.6f}"
+                                    f" max={weighting.float().max().item():.6f})"
+                                )
+                            logger.info(
+                                "LOSS_DIAG step=%s video_loss=%s video_weight=%s audio_loss=%s audio_weight=%s total=%s%s",
+                                global_step,
+                                f"{video_loss.item():.6f}" if isinstance(video_loss, torch.Tensor) else "n/a",
+                                f"{video_weight:.3f}" if isinstance(video_weight, float) else "n/a",
+                                f"{audio_loss.item():.6f}" if isinstance(audio_loss, torch.Tensor) else "n/a",
+                                f"{audio_weight:.3f}" if isinstance(audio_weight, float) else "n/a",
+                                f"{loss.item():.6f}" if isinstance(loss, torch.Tensor) else str(loss),
+                                weight_stats,
+                            )
+
+                        total_loss += loss.detach().item()
+                        total_count += 1
+            finally:
+                if validation_self_flow_network is not None and validation_self_flow_prev_training is not None:
+                    validation_self_flow_network.training = validation_self_flow_prev_training
 
             loss_stats = torch.tensor([total_loss, total_count], device=accelerator.device)
             if accelerator.num_processes > 1:
@@ -3388,6 +3693,8 @@ class NetworkTrainer:
                 avg_loss = total_loss / max(total_count, 1)
                 if len(accelerator.trackers) > 0:
                     accelerator.log({"val_loss": avg_loss}, step=step)
+                if gui_metrics is not None:
+                    gui_metrics.log_event("validation", step, val_loss=avg_loss, epoch=epoch_no)
                 log_msg = f"validation loss: {avg_loss:.6f}"
                 if epoch_no is not None:
                     log_msg += f" (epoch {epoch_no})"
@@ -3443,6 +3750,7 @@ class NetworkTrainer:
             metadata["ss_epoch"] = str(epoch + 1)
 
             accelerator.unwrap_model(network).on_epoch_start(transformer)
+            _prev_step_end_time = time.perf_counter()
 
             for step, batch in enumerate(train_dataloader):
                 # mid-epoch resume: skip batches already processed before checkpoint
@@ -3451,6 +3759,7 @@ class NetworkTrainer:
                     continue
 
                 _step_start_time = time.perf_counter()
+                _data_wait_time = max(0.0, _step_start_time - _prev_step_end_time)
                 # VRAM spike tracing for first iteration
                 _is_first_step = (epoch == epoch_to_start and step == 0)
                 if _is_first_step:
@@ -3478,7 +3787,10 @@ class NetworkTrainer:
                 latents_shape = tuple(latents_tensor.shape)
 
                 with accelerator.accumulate(training_model):
-                    accelerator.unwrap_model(network).on_step_start()
+                    accelerator.unwrap_model(network).on_step_start(
+                        global_step=global_step,
+                        max_train_steps=args.max_train_steps,
+                    )
 
                     latents_tensor = self.scale_shift_latents(latents_tensor)
 
@@ -3540,6 +3852,7 @@ class NetworkTrainer:
                     audio_loss_ema_value = None
                     video_loss_ema_value = None
                     ogm_ge_state = None
+                    grad_norm_total_value = None
                     grad_norm_video_value = None  # Per-modality gradient norms
                     grad_norm_audio_value = None
                     audio_diagnostics = {}  # Per-batch audio quality diagnostics (negligible cost)
@@ -3823,6 +4136,15 @@ class NetworkTrainer:
                             except Exception as e:
                                 logger.warning("Cross-Task Synergy loss failed: %s", e)
 
+                    adaptive_rank_metrics = {}
+                    unwrapped_network = accelerator.unwrap_model(network)
+                    if hasattr(unwrapped_network, "compute_adaptive_rank_loss"):
+                        adaptive_rank_loss = unwrapped_network.compute_adaptive_rank_loss()
+                        if adaptive_rank_loss is not None:
+                            loss = loss + adaptive_rank_loss
+                            adaptive_rank_metrics = unwrapped_network.get_adaptive_rank_metrics()
+                            adaptive_rank_metrics["loss/adaptive_rank"] = adaptive_rank_loss.detach().item()
+
                     if _is_first_step:
                         _log_vram("FIRST_ITER: BEFORE backward", logger)
                     accelerator.backward(loss)
@@ -3846,6 +4168,8 @@ class NetworkTrainer:
                         pres_losses.update(self_flow_metrics)
                     if cts_metrics:
                         pres_losses.update(cts_metrics)
+                    if adaptive_rank_metrics:
+                        pres_losses.update(adaptive_rank_metrics)
 
                     # DEBUG: Check if LoRA parameters have gradients (requires LTX2_DEBUG env var)
                     if os.environ.get("LTX2_DEBUG", "0") == "1":
@@ -3883,9 +4207,6 @@ class NetworkTrainer:
                                 )
 
                     if accelerator.sync_gradients:
-
-
-
                         # self.all_reduce_network(accelerator, network)  # sync DDP grad manually
                         state = accelerate.PartialState()
                         if state.distributed_type != accelerate.DistributedType.NO:
@@ -3901,16 +4222,21 @@ class NetworkTrainer:
                                     if param.grad is not None:
                                         param.grad = accelerator.reduce(param.grad, reduction="mean")
 
-                        if args.max_grad_norm != 0.0:
-                            params_to_clip = list(accelerator.unwrap_model(network).get_trainable_params())
-                            if hasattr(self, '_crepa') and self._crepa is not None:
-                                params_to_clip.extend(self._crepa.get_trainable_params())
-                            if hasattr(self, "_self_flow") and self._self_flow is not None:
-                                params_to_clip.extend(self._self_flow.get_trainable_params())
-                            accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
+                        params_to_clip = list(accelerator.unwrap_model(network).get_trainable_params())
+                        if hasattr(self, '_crepa') and self._crepa is not None:
+                            params_to_clip.extend(self._crepa.get_trainable_params())
+                        if hasattr(self, "_self_flow") and self._self_flow is not None:
+                            params_to_clip.extend(self._self_flow.get_trainable_params())
+
+                        if len(accelerator.trackers) > 0 or gui_metrics is not None:
+                            total_grad_sq = torch.zeros(1, device=accelerator.device)
+                            for param in params_to_clip:
+                                if param.grad is not None:
+                                    total_grad_sq += param.grad.detach().float().pow(2).sum()
+                            grad_norm_total_value = total_grad_sq.sqrt().item()
 
                         # Per-modality gradient norm tracking (accumulate on GPU, sync once)
-                        if len(accelerator.trackers) > 0 and dict_output:
+                        if (len(accelerator.trackers) > 0 or gui_metrics is not None) and dict_output:
                             unwrapped_net = accelerator.unwrap_model(network)
                             lora_modules = getattr(unwrapped_net, "unet_loras", None)
                             if lora_modules:
@@ -3920,13 +4246,16 @@ class NetworkTrainer:
                                     is_audio = "audio_" in lora.lora_name
                                     for param in lora.parameters():
                                         if param.grad is not None:
-                                            g_sq = param.grad.data.norm() ** 2
+                                            g_sq = param.grad.detach().float().pow(2).sum()
                                             if is_audio:
                                                 audio_grad_sq += g_sq
                                             else:
                                                 video_grad_sq += g_sq
                                 grad_norm_video_value = video_grad_sq.sqrt().item()
                                 grad_norm_audio_value = audio_grad_sq.sqrt().item()
+
+                        if args.max_grad_norm != 0.0:
+                            accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
 
                     if _is_first_step:
                         _log_vram("FIRST_ITER: BEFORE optimizer.step", logger)
@@ -3949,6 +4278,7 @@ class NetworkTrainer:
                             logger.warning("Self-Flow EMA update failed: %s", e)
                     lr_scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
+                    _prev_step_end_time = time.perf_counter()
                     if _is_first_step:
                         _log_vram("FIRST_ITER: AFTER zero_grad (end of first step)", logger)
 
@@ -3966,6 +4296,70 @@ class NetworkTrainer:
                         progress_bar.reset()  # exclude first step from progress bar, because it may take long due to initializations
                     progress_bar.update(1)
                     global_step += 1
+                    unwrapped_network = accelerator.unwrap_model(network)
+                    finalized_this_step = False
+                    if hasattr(unwrapped_network, "maybe_finalize_adaptive_rank"):
+                        old_network_param_ids = {id(param) for param in unwrapped_network.get_trainable_params()}
+                        finalize_report = unwrapped_network.maybe_finalize_adaptive_rank(
+                            global_step=global_step,
+                            max_train_steps=args.max_train_steps,
+                        )
+                        if finalize_report is not None:
+                            lr_scheduler, lr_descriptions = self._refresh_optimizer_after_adaptive_rank_prune(
+                                args,
+                                accelerator,
+                                network,
+                                optimizer,
+                                lr_scheduler,
+                                old_network_param_ids=old_network_param_ids,
+                                global_step=global_step,
+                                recovery_config=finalize_report.get("recovery_config"),
+                            )
+                            finalized_this_step = True
+                            logger.info(
+                                "adaptive rank finalize at step %s: modules=%s rank_sum=%s->%s recovery=%s",
+                                finalize_report["step"],
+                                finalize_report["finalized_module_count"],
+                                finalize_report["rank_sum_before"],
+                                finalize_report["rank_sum_after"],
+                                "on" if finalize_report.get("recovery_config") is not None else "off",
+                            )
+                    if not finalized_this_step and hasattr(unwrapped_network, "maybe_hard_prune_adaptive_rank"):
+                        old_network_param_ids = {id(param) for param in unwrapped_network.get_trainable_params()}
+                        hard_prune_report = unwrapped_network.maybe_hard_prune_adaptive_rank(
+                            global_step=global_step,
+                            max_train_steps=args.max_train_steps,
+                        )
+                        if hard_prune_report is not None:
+                            lr_scheduler, lr_descriptions = self._refresh_optimizer_after_adaptive_rank_prune(
+                                args,
+                                accelerator,
+                                network,
+                                optimizer,
+                                lr_scheduler,
+                                old_network_param_ids=old_network_param_ids,
+                                global_step=global_step,
+                            )
+                            logger.info(
+                                "adaptive rank hard prune at step %s: modules=%s rank_sum=%s->%s",
+                                hard_prune_report["step"],
+                                hard_prune_report["pruned_module_count"],
+                                hard_prune_report["rank_sum_before"],
+                                hard_prune_report["rank_sum_after"],
+                            )
+                    if not finalized_this_step and hasattr(unwrapped_network, "maybe_reallocate_adaptive_rank_estimate"):
+                        reallocate_report = unwrapped_network.maybe_reallocate_adaptive_rank_estimate(
+                            global_step=global_step,
+                            max_train_steps=args.max_train_steps,
+                        )
+                        if reallocate_report is not None:
+                            logger.info(
+                                "adaptive rank estimate reallocation at step %s: changed=%s fixed_budget=%.3f remaining_budget=%.3f",
+                                reallocate_report["step"],
+                                reallocate_report["changed_module_count"],
+                                reallocate_report["fixed_budget"],
+                                reallocate_report["remaining_budget"],
+                            )
                     if timestep_tb_buffers is not None and (
                         global_step == 1 or global_step % timestep_tb_interval == 0
                     ):
@@ -4073,6 +4467,8 @@ class NetworkTrainer:
                         logs["grad_norm/audio"] = grad_norm_audio_value
                         if grad_norm_video_value is not None and grad_norm_video_value > 0:
                             logs["grad_norm/audio_video_ratio"] = grad_norm_audio_value / grad_norm_video_value
+                    if grad_norm_total_value is not None:
+                        logs["grad_norm/total"] = grad_norm_total_value
                     if uncertainty_log_var_video is not None:
                         lv_v = uncertainty_log_var_video.detach().item()
                         lv_a = uncertainty_log_var_audio.detach().item()
@@ -4113,10 +4509,20 @@ class NetworkTrainer:
                         avr_loss=avr_loss,
                         loss_v=video_loss_value,
                         loss_a=audio_loss_value,
+                        grad_norm=grad_norm_total_value,
+                        grad_norm_v=grad_norm_video_value,
+                        grad_norm_a=grad_norm_audio_value,
                         lr=lr_scheduler.get_last_lr()[0],
                         step_time=step_time,
+                        data_wait_time=_data_wait_time,
                     )
-                    gui_metrics.update_status(step=global_step, status="training")
+                    gui_metrics.update_status(
+                        step=global_step,
+                        max_steps=args.max_train_steps,
+                        epoch=epoch + 1,
+                        max_epochs=num_train_epochs,
+                        status="training",
+                    )
 
                 if (
                     validation_dataloader is not None
@@ -4125,6 +4531,7 @@ class NetworkTrainer:
                 ):
                     run_validation(global_step)
 
+                _prev_step_end_time = time.perf_counter()
                 if global_step >= args.max_train_steps:
                     break
 
@@ -4179,7 +4586,13 @@ class NetworkTrainer:
         metadata["ss_training_finished_at"] = str(time.time())
 
         if gui_metrics is not None:
-            gui_metrics.update_status(status="completed")
+            gui_metrics.update_status(
+                step=global_step,
+                max_steps=args.max_train_steps,
+                epoch=num_train_epochs,
+                max_epochs=num_train_epochs,
+                status="completed",
+            )
             gui_metrics.close()
 
         if is_main_process:
@@ -4810,7 +5223,7 @@ def setup_parser_common() -> argparse.ArgumentParser:
 
     # save and load settings
     parser.add_argument(
-        "--output_dir", type=str, default=None, help="directory to output trained model / 学習後のモデル出力先ディレクトリ"
+        "--output_dir", type=str, default="output", help="directory to output trained model / 学習後のモデル出力先ディレクトリ"
     )
     parser.add_argument(
         "--output_name",

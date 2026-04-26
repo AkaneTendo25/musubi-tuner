@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 import logging
+import os
+import locale
+import re
+import signal
 import subprocess
 import sys
 import threading
@@ -20,6 +24,40 @@ if sys.platform == "win32":
     _CREATION_FLAGS = subprocess.CREATE_NEW_PROCESS_GROUP
 
 
+def _decode_output(data: bytes) -> str:
+    for encoding in ("utf-8", locale.getpreferredencoding(False), "cp1251", "cp866"):
+        if not encoding:
+            continue
+        try:
+            return data.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return data.decode("utf-8", errors="replace")
+
+
+_LINE_BREAK_RE = re.compile(br"[\r\n]+")
+
+
+_TQDM_PROGRESS_RE = re.compile(
+    r"^(?P<label>.*?)(?::)?\s*(?P<pct>\d+)%\|.*?\|\s*(?P<current>\d+)/(?P<total>\d+)",
+    re.IGNORECASE,
+)
+
+
+def _progress_signature(line: str) -> tuple[str, str, int] | None:
+    match = _TQDM_PROGRESS_RE.match(line.strip())
+    if not match:
+        return None
+
+    label = (match.group("label") or "").strip().lower()
+    pct = int(match.group("pct"))
+    current = int(match.group("current"))
+
+    if label == "steps":
+        return ("steps", match.group("total"), current)
+    return ("progress", label, pct)
+
+
 class ProcessState(str, Enum):
     IDLE = "idle"
     RUNNING = "running"
@@ -31,15 +69,17 @@ class ProcessState(str, Enum):
 class ManagedProcess:
     """Wraps a subprocess with state tracking and log buffering."""
 
-    def __init__(self, cmd: list[str], cwd: Optional[str] = None):
+    def __init__(self, cmd: list[str], cwd: Optional[str] = None, env: Optional[dict[str, str]] = None):
         self.cmd = cmd
         self.cwd = cwd
+        self.env = env
         self.state = ProcessState.IDLE
         self.exit_code: Optional[int] = None
         self.logs: deque[str] = deque(maxlen=5000)
         self._proc: Optional[subprocess.Popen] = None
         self._reader_thread: Optional[threading.Thread] = None
         self._lock = threading.Lock()
+        self._last_progress_signature: tuple[str, str, int] | None = None
 
     def start(self):
         with self._lock:
@@ -50,17 +90,16 @@ class ManagedProcess:
             self.exit_code = None
             self.logs.clear()
             self.logs.append(f"$ {' '.join(self.cmd)}\n")
+            self._last_progress_signature = None
 
             self._proc = subprocess.Popen(
                 self.cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 cwd=self.cwd,
+                env=self.env,
                 creationflags=_CREATION_FLAGS,
-                bufsize=1,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
+                bufsize=0,
             )
 
             self._reader_thread = threading.Thread(
@@ -71,8 +110,25 @@ class ManagedProcess:
     def _read_output(self):
         try:
             assert self._proc and self._proc.stdout
-            for line in self._proc.stdout:
-                self.logs.append(line)
+            pending = b""
+            while True:
+                chunk = self._proc.stdout.read(4096)
+                if not chunk:
+                    break
+
+                pending += chunk
+                ended_with_break = pending.endswith((b"\r", b"\n"))
+                parts = _LINE_BREAK_RE.split(pending)
+                complete_parts = parts if ended_with_break else parts[:-1]
+                pending = b"" if ended_with_break else parts[-1]
+
+                for part in complete_parts:
+                    if not part:
+                        continue
+                    self._append_log_line(_decode_output(part))
+
+            if pending:
+                self._append_log_line(_decode_output(pending))
             self._proc.wait()
         except Exception as e:
             self.logs.append(f"\n[Process reader error: {e}]\n")
@@ -87,6 +143,22 @@ class ManagedProcess:
                 self.state = ProcessState.ERROR
             self.logs.append(f"\n[Process exited with code {self.exit_code}]\n")
 
+    def _append_log_line(self, line: str) -> bool:
+        signature = _progress_signature(line)
+        if signature is not None:
+            if signature == self._last_progress_signature:
+                return False
+            self._last_progress_signature = signature
+        else:
+            self._last_progress_signature = None
+
+        clean = line.rstrip("\r\n")
+        if not clean.strip():
+            return False
+
+        self.logs.append(f"{clean}\n")
+        return True
+
     def terminate(self):
         with self._lock:
             if self.state != ProcessState.RUNNING:
@@ -95,7 +167,13 @@ class ManagedProcess:
             self.logs.append("\n[Stopping process...]\n")
 
         if self._proc:
-            self._proc.terminate()
+            if sys.platform == "win32":
+                try:
+                    self._proc.send_signal(signal.CTRL_BREAK_EVENT)
+                except Exception:
+                    self._proc.terminate()
+            else:
+                self._proc.terminate()
             # Wait up to 10s then force kill
             t = threading.Thread(target=self._force_kill, daemon=True)
             t.start()
@@ -106,7 +184,18 @@ class ManagedProcess:
                 self._proc.wait(timeout=10)
             except subprocess.TimeoutExpired:
                 self.logs.append("\n[Force killing process...]\n")
-                self._proc.kill()
+                if sys.platform == "win32":
+                    try:
+                        subprocess.run(
+                            ["taskkill", "/PID", str(self._proc.pid), "/T", "/F"],
+                            check=False,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                        )
+                    except Exception:
+                        self._proc.kill()
+                else:
+                    self._proc.kill()
 
     def get_status(self) -> dict:
         return {
@@ -133,7 +222,16 @@ class ProcessManager:
             if existing and existing.state == ProcessState.RUNNING:
                 raise RuntimeError(f"{proc_type} is already running")
 
-            mp = ManagedProcess(cmd, cwd=cwd)
+            env = os.environ.copy()
+            # Force UTF-8 stdio for dashboard-launched Python subprocesses so
+            # trainer logs with Japanese text do not crash on localized Windows.
+            env["PYTHONIOENCODING"] = "utf-8"
+            env["PYTHONUTF8"] = "1"
+            env["PYTHONUNBUFFERED"] = "1"
+            if proc_type in ("training", "slider_training"):
+                env["MUSUBI_DASHBOARD_METRICS"] = "1"
+
+            mp = ManagedProcess(cmd, cwd=cwd, env=env)
             self._processes[proc_type] = mp
 
         mp.start()

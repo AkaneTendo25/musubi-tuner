@@ -36,6 +36,7 @@ from musubi_tuner.dataset.image_video_dataset import (
 )
 from musubi_tuner.ltx_2.model.audio_vae.audio_vae import LATENT_DOWNSAMPLE_FACTOR
 from musubi_tuner.ltx_2.env import get_ltx2_env
+from musubi_tuner.model_defaults import default_ltx2_checkpoint_path
 from musubi_tuner.utils.model_utils import str_to_dtype
 from musubi_tuner.utils.safetensors_utils import MemoryEfficientSafeOpen
 
@@ -552,6 +553,21 @@ def _find_reference_audio_file(reference_audio_directory: str, stem: str, prefer
     return None
 
 
+def _normalize_dataset_path_list(
+    primary: Optional[str],
+    extras: Optional[Sequence[str]],
+) -> list[str]:
+    values: list[str] = []
+    seen: set[str] = set()
+    for value in ([primary] if primary is not None else []) + list(extras or []):
+        normalized = str(value).strip()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        values.append(normalized)
+    return values
+
+
 def _load_reference_frames(
     path: str,
     bucket_reso: tuple[int, int],
@@ -612,22 +628,45 @@ def encode_and_save_reference_latents(
         if not isinstance(ds, (ImageDataset, VideoDataset)):
             continue
 
-        ref_cache_dir = getattr(ds, "reference_cache_directory", None)
-        if ref_cache_dir is None:
+        ref_cache_dirs = _normalize_dataset_path_list(
+            getattr(ds, "reference_cache_directory", None),
+            getattr(ds, "reference_cache_directories", None),
+        )
+        if not ref_cache_dirs:
             logger.info(f"[Dataset {ds_idx}] No reference_cache_directory set, skipping reference caching")
             continue
 
-        ref_dir = getattr(ds, "reference_directory", None)
-        ref_dir_source = "reference_directory"
-        if ref_dir is None:
-            ref_dir = getattr(ds, "control_directory", None)
+        ref_dirs = _normalize_dataset_path_list(
+            getattr(ds, "reference_directory", None) or getattr(ds, "control_directory", None),
+            getattr(ds, "reference_directories", None),
+        )
+        has_reference_dirs = getattr(ds, "reference_directory", None) is not None
+        has_reference_dir_list = getattr(ds, "reference_directories", None) is not None
+        has_control_dir = getattr(ds, "control_directory", None) is not None
+        if has_reference_dirs or has_reference_dir_list:
+            ref_dir_source = "reference_directory"
+        elif has_control_dir:
             ref_dir_source = "control_directory"
-        if ref_dir is None:
+        else:
+            ref_dir_source = "control_directory"
+        if not ref_dirs:
             logger.info(f"[Dataset {ds_idx}] No reference/control directory set, skipping reference caching")
             continue
+        if len(ref_dirs) != len(ref_cache_dirs):
+            raise ValueError(
+                f"[Dataset {ds_idx}] reference directory count ({len(ref_dirs)}) must match "
+                f"reference cache directory count ({len(ref_cache_dirs)})."
+            )
 
-        os.makedirs(ref_cache_dir, exist_ok=True)
-        logger.info(f"[Dataset {ds_idx}] Caching reference latents from {ref_dir_source} to {ref_cache_dir}")
+        for ref_cache_dir in ref_cache_dirs:
+            os.makedirs(ref_cache_dir, exist_ok=True)
+        logger.info(
+            "[Dataset %s] Caching %s reference latent stream(s) from %s to %s",
+            ds_idx,
+            len(ref_dirs),
+            ref_dir_source,
+            ref_cache_dirs,
+        )
 
         cached_count = 0
         skipped_count = 0
@@ -635,15 +674,6 @@ def encode_and_save_reference_latents(
 
         for _bucket_key, batch in ds.retrieve_latent_cache_batches(num_workers):
             for item_info in batch:
-                ref_cache_path = getattr(item_info, "reference_latent_cache_path", None)
-                if ref_cache_path is None:
-                    # Build it manually if not set
-                    ref_cache_path = ds.get_reference_latent_cache_path(item_info)
-
-                if skip_existing and os.path.exists(ref_cache_path):
-                    skipped_count += 1
-                    continue
-
                 # For chunked videos, item_key is "video_00000-017.mp4"; use source video name for matching
                 source_key = getattr(item_info, "source_item_key", None) or item_info.item_key
                 stem = os.path.splitext(os.path.basename(source_key))[0]
@@ -651,46 +681,52 @@ def encode_and_save_reference_latents(
                 bucket_reso = (item_info.bucket_size[0], item_info.bucket_size[1])
 
                 try:
-                    ref_path = _find_reference_file(ref_dir, stem)
-                    if ref_path is None:
-                        missing_count += 1
-                        if missing_count <= 5:
-                            logger.warning(f"No reference file found for '{stem}' in {ref_dir}")
-                        elif missing_count == 6:
-                            logger.warning("(suppressing further missing-reference warnings)")
-                        continue
-                    ref_frames = _load_reference_frames(ref_path, bucket_reso, num_frames, downscale_factor)
+                    ref_cache_paths = getattr(item_info, "reference_latent_cache_paths", None) or ds.get_reference_latent_cache_paths(item_info)
+                    for ref_idx, (ref_dir, ref_cache_path) in enumerate(zip(ref_dirs, ref_cache_paths)):
+                        if skip_existing and os.path.exists(ref_cache_path):
+                            skipped_count += 1
+                            continue
 
-                    contents = torch.from_numpy(ref_frames).unsqueeze(0)
-                    contents = contents.permute(0, 4, 1, 2, 3).contiguous()
-                    contents = contents.to(device=device, dtype=vae_dtype)
-                    contents = contents / 127.5 - 1.0
+                        ref_path = _find_reference_file(ref_dir, stem)
+                        if ref_path is None:
+                            missing_count += 1
+                            if missing_count <= 5:
+                                logger.warning(f"No reference file found for '{stem}' in {ref_dir}")
+                            elif missing_count == 6:
+                                logger.warning("(suppressing further missing-reference warnings)")
+                            continue
+                        ref_frames = _load_reference_frames(ref_path, bucket_reso, num_frames, downscale_factor)
 
-                    frames = contents.shape[2]
-                    remainder = (frames - 1) % 8
-                    if remainder != 0:
-                        pad = 8 - remainder
-                        last = contents[:, :, -1:, :, :].expand(-1, -1, pad, -1, -1)
-                        contents = torch.cat([contents, last], dim=2)
+                        contents = torch.from_numpy(ref_frames).unsqueeze(0)
+                        contents = contents.permute(0, 4, 1, 2, 3).contiguous()
+                        contents = contents.to(device=device, dtype=vae_dtype)
+                        contents = contents / 127.5 - 1.0
 
-                    with _amp_context(device, vae_dtype), torch.no_grad():
-                        if tiling_config is not None and hasattr(vae, "tiled_encode"):
-                            latent = vae.tiled_encode(contents, tiling_config)
-                        else:
-                            latent = vae(contents)
-                        latent = latent.to(device=device, dtype=vae_dtype)
+                        frames = contents.shape[2]
+                        remainder = (frames - 1) % 8
+                        if remainder != 0:
+                            pad = 8 - remainder
+                            last = contents[:, :, -1:, :, :].expand(-1, -1, pad, -1, -1)
+                            contents = torch.cat([contents, last], dim=2)
 
-                    ref_latent = latent[0]
-                    ref_item_info = ItemInfo(
-                        item_info.item_key,
-                        item_info.caption,
-                        item_info.original_size,
-                        item_info.bucket_size,
-                    )
-                    ref_item_info.latent_cache_path = ref_cache_path
-                    ref_item_info.frame_count = num_frames
-                    save_latent_cache_ltx2(ref_item_info, ref_latent)
-                    cached_count += 1
+                        with _amp_context(device, vae_dtype), torch.no_grad():
+                            if tiling_config is not None and hasattr(vae, "tiled_encode"):
+                                latent = vae.tiled_encode(contents, tiling_config)
+                            else:
+                                latent = vae(contents)
+                            latent = latent.to(device=device, dtype=vae_dtype)
+
+                        ref_latent = latent[0]
+                        ref_item_info = ItemInfo(
+                            item_info.item_key,
+                            item_info.caption,
+                            item_info.original_size,
+                            item_info.bucket_size,
+                        )
+                        ref_item_info.latent_cache_path = ref_cache_path
+                        ref_item_info.frame_count = num_frames
+                        save_latent_cache_ltx2(ref_item_info, ref_latent)
+                        cached_count += 1
 
                 except Exception as e:
                     logger.warning(f"Failed to cache reference for '{stem}': {e}")
@@ -719,17 +755,34 @@ def encode_and_save_reference_audio_latents(
         if not isinstance(ds, VideoDataset):
             continue
 
-        ref_audio_cache_dir = getattr(ds, "reference_audio_cache_directory", None)
-        if ref_audio_cache_dir is None:
+        ref_audio_cache_dirs = _normalize_dataset_path_list(
+            getattr(ds, "reference_audio_cache_directory", None),
+            getattr(ds, "reference_audio_cache_directories", None),
+        )
+        if not ref_audio_cache_dirs:
             continue
 
-        ref_audio_dir = getattr(ds, "reference_audio_directory", None)
-        if ref_audio_dir is None:
+        ref_audio_dirs = _normalize_dataset_path_list(
+            getattr(ds, "reference_audio_directory", None),
+            getattr(ds, "reference_audio_directories", None),
+        )
+        if not ref_audio_dirs:
             logger.info(f"[Dataset {ds_idx}] No reference_audio_directory set, skipping reference-audio caching")
             continue
+        if len(ref_audio_dirs) != len(ref_audio_cache_dirs):
+            raise ValueError(
+                f"[Dataset {ds_idx}] reference audio directory count ({len(ref_audio_dirs)}) must match "
+                f"reference audio cache directory count ({len(ref_audio_cache_dirs)})."
+            )
 
-        os.makedirs(ref_audio_cache_dir, exist_ok=True)
-        logger.info(f"[Dataset {ds_idx}] Caching reference audio latents to {ref_audio_cache_dir}")
+        for ref_audio_cache_dir in ref_audio_cache_dirs:
+            os.makedirs(ref_audio_cache_dir, exist_ok=True)
+        logger.info(
+            "[Dataset %s] Caching %s reference audio stream(s) to %s",
+            ds_idx,
+            len(ref_audio_dirs),
+            ref_audio_cache_dirs,
+        )
 
         cached_count = 0
         skipped_count = 0
@@ -741,55 +794,54 @@ def encode_and_save_reference_audio_latents(
 
         for _bucket_key, batch in ds.retrieve_latent_cache_batches(num_workers):
             for item_info in batch:
-                ref_audio_cache_path = getattr(item_info, "reference_audio_latent_cache_path", None)
-                if ref_audio_cache_path is None:
-                    ref_audio_cache_path = ds.get_reference_audio_latent_cache_path(item_info)
-
-                if skip_existing and os.path.exists(ref_audio_cache_path):
-                    skipped_count += 1
-                    continue
-
                 source_key = getattr(item_info, "source_item_key", None) or item_info.item_key
                 stem = os.path.splitext(os.path.basename(source_key))[0]
-                ref_audio_path = _find_reference_audio_file(ref_audio_dir, stem, preferred_ext=preferred_ext)
-                if ref_audio_path is None:
-                    missing_count += 1
-                    if missing_count <= 5:
-                        logger.warning(f"No reference audio file found for '{stem}' in {ref_audio_dir}")
-                    elif missing_count == 6:
-                        logger.warning("(suppressing further missing-reference-audio warnings)")
-                    continue
-
-                cache_audio_suffix = f"_{ds.architecture}_audio.safetensors"
-                cache_latent_suffix = f"_{ds.architecture}.safetensors"
-                if ref_audio_cache_path.endswith(cache_audio_suffix):
-                    proxy_latent_cache_path = ref_audio_cache_path[: -len(cache_audio_suffix)] + cache_latent_suffix
-                else:
-                    proxy_latent_cache_path = ref_audio_cache_path.replace(".safetensors", cache_latent_suffix)
-
-                ref_item = ItemInfo(
-                    item_key=item_info.item_key,
-                    caption=item_info.caption,
-                    original_size=item_info.original_size,
-                    bucket_size=item_info.bucket_size,
-                    frame_count=item_info.frame_count,
-                )
-                ref_item.latent_cache_path = proxy_latent_cache_path
-                ref_item.source_total_frames = getattr(item_info, "source_total_frames", None)
-                ref_item.chunk_start_frame = getattr(item_info, "chunk_start_frame", None)
-                ref_item.chunk_num_frames = getattr(item_info, "chunk_num_frames", None)
-
+                ref_audio_path = None
                 try:
-                    encode_and_save_audio_cache(
-                        encoder,
-                        processor,
-                        ref_item,
-                        audio_path=ref_audio_path,
-                        dtype=dtype,
-                        target_fps=float(ds_target_fps),
-                        audio_only=False,
-                    )
-                    cached_count += 1
+                    ref_audio_cache_paths = getattr(item_info, "reference_audio_latent_cache_paths", None) or ds.get_reference_audio_latent_cache_paths(item_info)
+                    for ref_audio_dir, ref_audio_cache_path in zip(ref_audio_dirs, ref_audio_cache_paths):
+                        if skip_existing and os.path.exists(ref_audio_cache_path):
+                            skipped_count += 1
+                            continue
+
+                        ref_audio_path = _find_reference_audio_file(ref_audio_dir, stem, preferred_ext=preferred_ext)
+                        if ref_audio_path is None:
+                            missing_count += 1
+                            if missing_count <= 5:
+                                logger.warning(f"No reference audio file found for '{stem}' in {ref_audio_dir}")
+                            elif missing_count == 6:
+                                logger.warning("(suppressing further missing-reference-audio warnings)")
+                            continue
+
+                        cache_audio_suffix = f"_{ds.architecture}_audio.safetensors"
+                        cache_latent_suffix = f"_{ds.architecture}.safetensors"
+                        if ref_audio_cache_path.endswith(cache_audio_suffix):
+                            proxy_latent_cache_path = ref_audio_cache_path[: -len(cache_audio_suffix)] + cache_latent_suffix
+                        else:
+                            proxy_latent_cache_path = ref_audio_cache_path.replace(".safetensors", cache_latent_suffix)
+
+                        ref_item = ItemInfo(
+                            item_key=item_info.item_key,
+                            caption=item_info.caption,
+                            original_size=item_info.original_size,
+                            bucket_size=item_info.bucket_size,
+                            frame_count=item_info.frame_count,
+                        )
+                        ref_item.latent_cache_path = proxy_latent_cache_path
+                        ref_item.source_total_frames = getattr(item_info, "source_total_frames", None)
+                        ref_item.chunk_start_frame = getattr(item_info, "chunk_start_frame", None)
+                        ref_item.chunk_num_frames = getattr(item_info, "chunk_num_frames", None)
+
+                        encode_and_save_audio_cache(
+                            encoder,
+                            processor,
+                            ref_item,
+                            audio_path=ref_audio_path,
+                            dtype=dtype,
+                            target_fps=float(ds_target_fps),
+                            audio_only=False,
+                        )
+                        cached_count += 1
                 except Exception as e:
                     failed_count += 1
                     logger.warning(
@@ -1399,7 +1451,12 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         choices=["video", "av", "audio", "v", "a", "va"],
         help="Caching modality: 'video' (default) for video-only, 'av' for audio+video, 'audio' for audio-only.",
     )
-    parser.add_argument("--ltx2_checkpoint", type=str, default=None, help="Path to LTX-2 checkpoint (.safetensors)")
+    parser.add_argument(
+        "--ltx2_checkpoint",
+        type=str,
+        default=default_ltx2_checkpoint_path(),
+        help="Path to LTX-2 checkpoint (.safetensors)",
+    )
     parser.add_argument("--vae_chunk_size", type=int, default=None, help="chunk size for CausalConv3d in VAE")
     parser.add_argument("--vae_spatial_tile_size", type=int, default=None, help="Spatial tile size in pixels (e.g. 512). Must be >= 64 and divisible by 32.")
     parser.add_argument("--vae_spatial_tile_overlap", type=int, default=64, help="Spatial tile overlap in pixels (default 64). Must be divisible by 32.")

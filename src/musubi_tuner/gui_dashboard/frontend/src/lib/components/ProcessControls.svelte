@@ -47,6 +47,22 @@
 	}
 </script>
 
+<style>
+	.running-blink {
+		animation: runningBlink 1.8s ease-in-out infinite;
+	}
+
+	@keyframes runningBlink {
+		0%, 100% {
+			opacity: 1;
+		}
+
+		50% {
+			opacity: 0.45;
+		}
+	}
+</style>
+
 <div class="flex items-center gap-3 flex-wrap">
 	{#if canStart}
 		<button
@@ -73,8 +89,8 @@
 	{/if}
 
 	<div class="flex items-center gap-2">
-		<span class="w-2 h-2 rounded-full flex-shrink-0" style="background: {stateColor(status.state)}; {status.state === 'running' ? `box-shadow: 0 0 6px ${stateColor(status.state)};` : ''}"></span>
-		<span class="text-[12px] font-medium" style="color: {stateColor(status.state)}; font-family: var(--font-label);">
+		<span class="w-2 h-2 rounded-full flex-shrink-0 {status.state === 'running' ? 'running-blink' : ''}" style="background: {stateColor(status.state)}; {status.state === 'running' ? `box-shadow: 0 0 6px ${stateColor(status.state)};` : ''}"></span>
+		<span class="text-[12px] font-medium {status.state === 'running' ? 'running-blink' : ''}" style="color: {stateColor(status.state)}; font-family: var(--font-label);">
 			{stateLabel(status.state)}
 		</span>
 		{#if status.exit_code !== null && status.state !== 'running'}

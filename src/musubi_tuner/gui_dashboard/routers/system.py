@@ -7,10 +7,25 @@ import platform
 import shutil
 import subprocess
 import sys
+import locale
+from typing import Literal
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException, Query, Request
+
+from musubi_tuner.gui_dashboard.management_tools import get_management_status, launch_setup_tool, open_repo_in_file_browser
 
 router = APIRouter(prefix="/api/system", tags=["system"])
+
+
+def _decode_subprocess_output(data: bytes) -> str:
+    for encoding in ("utf-8", locale.getpreferredencoding(False), "cp1251", "cp866"):
+        if not encoding:
+            continue
+        try:
+            return data.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return data.decode("utf-8", errors="replace")
 
 
 @router.get("/info")
@@ -23,6 +38,43 @@ async def get_system_info():
         "os": platform.platform(),
         "python": sys.version.split()[0],
     }
+
+
+@router.get("/management-status")
+async def get_management_status_route(request: Request):
+    try:
+        return get_management_status(project_config=getattr(request.app.state, "project_config", None))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to load management status: {exc}") from exc
+
+
+@router.post("/management/open-setup")
+async def open_setup_tool(
+    request: Request,
+    branch: Literal["ltx-2", "ltx-2-dev"] | None = Query(default=None),
+):
+    process_manager = getattr(request.app.state, "process_manager", None)
+    if process_manager:
+        statuses = process_manager.get_all_statuses()
+        active = [name for name, status in statuses.items() if status.get("state") in {"running", "stopping"}]
+        if active:
+            raise HTTPException(status_code=409, detail=f"Cannot open Setup / Update while processes are active: {', '.join(active)}")
+    try:
+        return launch_setup_tool(branch_override=branch)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to open Setup / Update: {exc}") from exc
+
+
+@router.post("/management/open-repo")
+async def open_repo_folder():
+    try:
+        return open_repo_in_file_browser()
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to open repository folder: {exc}") from exc
 
 
 def _get_cpu_info() -> dict:
@@ -76,18 +128,18 @@ def _get_gpu_info() -> list[dict]:
         result = subprocess.run(
             [
                 "nvidia-smi",
-                "--query-gpu=name,memory.total,memory.used,memory.free,temperature.gpu,utilization.gpu",
+                "--query-gpu=name,memory.total,memory.used,memory.free,temperature.gpu,fan.speed,utilization.gpu,power.draw,clocks.current.graphics",
                 "--format=csv,noheader,nounits",
             ],
             capture_output=True,
-            text=True,
             timeout=5,
         )
         if result.returncode == 0:
+            stdout = _decode_subprocess_output(result.stdout or b"")
             gpus = []
-            for line in result.stdout.strip().split("\n"):
+            for line in stdout.strip().splitlines():
                 parts = [p.strip() for p in line.split(",")]
-                if len(parts) >= 6:
+                if len(parts) >= 9:
                     gpus.append(
                         {
                             "name": parts[0],
@@ -95,7 +147,10 @@ def _get_gpu_info() -> list[dict]:
                             "vram_used_mb": int(parts[2]),
                             "vram_free_mb": int(parts[3]),
                             "temperature": int(parts[4]) if parts[4] not in ("N/A", "[N/A]") else None,
-                            "utilization": int(parts[5]) if parts[5] not in ("N/A", "[N/A]") else None,
+                            "fan_speed_percent": int(parts[5]) if parts[5] not in ("N/A", "[N/A]") else None,
+                            "utilization": int(parts[6]) if parts[6] not in ("N/A", "[N/A]") else None,
+                            "power_draw_w": float(parts[7]) if parts[7] not in ("N/A", "[N/A]") else None,
+                            "graphics_clock_mhz": int(float(parts[8])) if parts[8] not in ("N/A", "[N/A]") else None,
                         }
                     )
             return gpus

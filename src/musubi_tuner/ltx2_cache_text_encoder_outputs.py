@@ -23,6 +23,7 @@ from musubi_tuner.dataset.image_video_dataset import (
     save_text_encoder_output_cache_ltx2_official,
 )
 from musubi_tuner.ltx_2.env import apply_ltx2_tweaks
+from musubi_tuner.model_defaults import default_gemma_root_path, default_ltx2_checkpoint_path
 
 
 logger = logging.getLogger(__name__)
@@ -378,7 +379,10 @@ def main() -> None:
         AVGemmaTextEncoderModelConfigurator,
         AV_GEMMA_TEXT_ENCODER_KEY_OPS,
     )
-    from musubi_tuner.ltx_2.text_encoders.gemma.encoders.base_encoder import module_ops_from_gemma_root
+    from musubi_tuner.ltx_2.text_encoders.gemma.encoders.base_encoder import (
+        apply_text_encoder_checkpoint_overrides,
+        module_ops_from_gemma_root,
+    )
     from musubi_tuner.ltx_2.text_encoders.gemma.encoders.video_only_encoder import (
         VIDEO_ONLY_GEMMA_TEXT_ENCODER_KEY_OPS,
         VideoGemmaTextEncoderModelConfigurator,
@@ -417,8 +421,10 @@ def main() -> None:
             bnb_4bit_quant_type=str(getattr(args, "gemma_bnb_4bit_quant_type", "nf4")),
             bnb_4bit_use_double_quant=not bool(getattr(args, "gemma_bnb_4bit_disable_double_quant", False)),
             bnb_4bit_compute_dtype=bnb_compute_dtype,
+            fp8_weight_offload=getattr(args, "gemma_fp8_weight_offload", None),
         ),
     ).build(device=device, dtype=dtype)
+    apply_text_encoder_checkpoint_overrides(text_encoder, str(text_encoder_checkpoint))
     text_encoder.eval()
 
     # If connector weights are missing, SingleGPUModelBuilder returns a meta-device model.
@@ -496,7 +502,7 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
     parser.add_argument(
         "--ltx2_checkpoint",
         type=str,
-        default=None,
+        default=default_ltx2_checkpoint_path(),
         help="Path to LTX-2 checkpoint (.safetensors)",
     )
     parser.add_argument(
@@ -508,7 +514,7 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
     parser.add_argument(
         "--gemma_root",
         type=str,
-        default=None,
+        default=default_gemma_root_path(),
         help="Local directory containing Gemma weights/tokenizer (Gemma backend only)",
     )
     parser.add_argument(
@@ -613,6 +619,15 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         default="auto",
         choices=["auto", "fp16", "bf16", "fp32"],
         help="Compute dtype for 4-bit (auto uses --mixed_precision dtype)",
+    )
+    parser.add_argument(
+        "--gemma_fp8_weight_offload",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "When using FP8 Gemma safetensors, offload FP8 linear weights to CPU RAM. "
+            "Defaults to the LTX2_GEMMA_SAFETENSORS_WEIGHT_OFFLOAD environment variable when omitted."
+        ),
     )
     parser.add_argument(
         "--cache_before_connector",

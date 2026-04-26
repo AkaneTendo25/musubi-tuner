@@ -40,6 +40,56 @@ def _reconstruct_transformer_args(values: list[Any], is_none: bool) -> Transform
     return TransformerArgs(**kwargs)
 
 
+def _run_attn_with_optional_fp32_retry(
+    attn_module: torch.nn.Module,
+    x_in: torch.Tensor,
+    *,
+    context: torch.Tensor | None = None,
+    mask: torch.Tensor | None = None,
+    pe: torch.Tensor | None = None,
+    k_pe: torch.Tensor | None = None,
+    force_fp32: bool = False,
+    force_pytorch: bool = False,
+    attn_retry_fp32: bool = False,
+    block_idx: int | None = None,
+) -> torch.Tensor:
+    """Run attention and fall back to PyTorch SDPA in fp32 if the output is non-finite.
+
+    The fallback intentionally switches away from the current backend. Retrying the
+    same FlashAttention kernel in fp32 can still leave the graph in a bad state for
+    backward when swap/fp8/checkpointing are active.
+    """
+
+    original_fn = getattr(attn_module, "attention_function", None)
+
+    def _call(*, use_fp32: bool) -> torch.Tensor:
+        if use_fp32:
+            x = x_in.to(torch.float32)
+            ctx = context.to(torch.float32) if isinstance(context, torch.Tensor) else None
+            pe_local = pe.to(torch.float32) if isinstance(pe, torch.Tensor) else None
+            k_pe_local = k_pe.to(torch.float32) if isinstance(k_pe, torch.Tensor) else None
+            out_local = attn_module(x, context=ctx, mask=mask, pe=pe_local, k_pe=k_pe_local)
+            return out_local.to(dtype=x_in.dtype)
+
+        return attn_module(x_in, context=context, mask=mask, pe=pe, k_pe=k_pe)
+
+    try:
+        if force_pytorch and original_fn is not None:
+            attn_module.attention_function = AttentionFunction.PYTORCH.to_callable()
+
+        out = _call(use_fp32=force_fp32)
+        if not attn_retry_fp32 or torch.isfinite(out).all():
+            return out
+
+        logger.warning("LTX-2 attn retry in fp32 for block %s", block_idx)
+        if original_fn is not None:
+            attn_module.attention_function = AttentionFunction.PYTORCH.to_callable()
+        return _call(use_fp32=True)
+    finally:
+        if original_fn is not None:
+            attn_module.attention_function = original_fn
+
+
 @dataclass
 class TransformerConfig:
     dim: int
@@ -536,34 +586,18 @@ class BasicAVTransformerBlock(torch.nn.Module):
             force_fp32: bool = False,
             force_pytorch: bool = False,
         ) -> torch.Tensor:
-            original_fn = None
-            if force_pytorch:
-                original_fn = getattr(attn_module, "attention_function", None)
-                attn_module.attention_function = AttentionFunction.PYTORCH.to_callable()
-            try:
-                if force_fp32:
-                    x_fp32 = x_in.to(torch.float32)
-                    ctx_fp32 = context.to(torch.float32) if isinstance(context, torch.Tensor) else None
-                    pe_fp32 = pe.to(torch.float32) if isinstance(pe, torch.Tensor) else None
-                    k_pe_fp32 = k_pe.to(torch.float32) if isinstance(k_pe, torch.Tensor) else None
-                    out = attn_module(x_fp32, context=ctx_fp32, mask=mask, pe=pe_fp32, k_pe=k_pe_fp32)
-                    out = out.to(dtype=x_in.dtype)
-                else:
-                    out = attn_module(x_in, context=context, mask=mask, pe=pe, k_pe=k_pe)
-                if not attn_retry_fp32:
-                    return out
-                if torch.isfinite(out).all():
-                    return out
-                logger.warning("LTX-2 attn retry in fp32 for block %s", self.idx)
-                x_fp32 = x_in.to(torch.float32)
-                ctx_fp32 = context.to(torch.float32) if isinstance(context, torch.Tensor) else None
-                pe_fp32 = pe.to(torch.float32) if isinstance(pe, torch.Tensor) else None
-                k_pe_fp32 = k_pe.to(torch.float32) if isinstance(k_pe, torch.Tensor) else None
-                out = attn_module(x_fp32, context=ctx_fp32, mask=mask, pe=pe_fp32, k_pe=k_pe_fp32)
-                return out.to(dtype=x_in.dtype)
-            finally:
-                if force_pytorch and original_fn is not None:
-                    attn_module.attention_function = original_fn
+            return _run_attn_with_optional_fp32_retry(
+                attn_module,
+                x_in,
+                context=context,
+                mask=mask,
+                pe=pe,
+                k_pe=k_pe,
+                force_fp32=force_fp32,
+                force_pytorch=force_pytorch,
+                attn_retry_fp32=attn_retry_fp32,
+                block_idx=self.idx,
+            )
 
         target_device = None
         if video is not None and isinstance(video.x, torch.Tensor):

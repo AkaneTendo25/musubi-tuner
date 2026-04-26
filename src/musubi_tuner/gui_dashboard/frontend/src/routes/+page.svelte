@@ -2,7 +2,8 @@
 	import FormField from '$lib/components/FormField.svelte';
 	import PathInput from '$lib/components/PathInput.svelte';
 	import StatsPanel from '$lib/components/StatsPanel.svelte';
-	import { projectConfig, projectLoaded, createProject, loadProjectFromPath, saveProjectDebounced, recentProjects, removeRecentProject, closeProject } from '$lib/stores/project.js';
+	import { defaultModelDir, effectiveGemmaRoot, effectiveLtx2Checkpoint } from '$lib/utils/modelPaths.js';
+	import { projectConfig, projectLoaded, createProject, loadProjectFromPath, saveProjectDebounced, recentProjects, removeRecentProject, restoreRecentProject, closeProject } from '$lib/stores/project.js';
 	import { processStatuses } from '$lib/stores/processes.js';
 	import { status } from '$lib/stores/status.js';
 	import { onMount } from 'svelte';
@@ -14,6 +15,58 @@
 	let creating = $state(false);
 	let systemInfo = $state(null);
 	let cwd = $state('');
+	let selectedLoraFamily = $state('video');
+	let selectedMemoryProfile = $state('regular');
+	let removedRecentProjects = $state([]);
+
+	const LORA_FAMILIES = [
+		{
+			id: 'video',
+			label: 'Video',
+			blurb: 'Standard visual LoRA setup for image and video datasets.'
+		},
+		{
+			id: 'av',
+			label: 'Audio-Video',
+			blurb: 'Joint audio and video training defaults for synchronized clips.'
+		},
+		{
+			id: 'audio',
+			label: 'Audio-Only',
+			blurb: 'Audio-only mode with audio-target defaults already selected.'
+		},
+		{
+			id: 'ic',
+			label: 'IC-LoRA',
+			blurb: 'Reference-conditioned setup for identity or shared-reference work.'
+		},
+		{
+			id: 'slider',
+			label: 'Slider',
+			blurb: 'Base project for prompt or reference sliders from the Techniques page.'
+		}
+	];
+
+	const MEMORY_PROFILES = [
+		{
+			id: 'high',
+			label: 'High VRAM',
+			blurb: 'Full-weight defaults with minimal memory-saving tradeoffs.'
+		},
+		{
+			id: 'regular',
+			label: 'Regular',
+			blurb: 'Moderate memory savings with 8-bit Gemma and checkpointing enabled.'
+		},
+		{
+			id: 'low',
+			label: 'Low VRAM',
+			blurb: 'FP8 / 4-bit oriented defaults for tighter cards.'
+		}
+	];
+
+	let activeLoraFamily = $derived(LORA_FAMILIES.find((item) => item.id === selectedLoraFamily) || LORA_FAMILIES[0]);
+	let activeMemoryProfile = $derived(MEMORY_PROFILES.find((item) => item.id === selectedMemoryProfile) || MEMORY_PROFILES[1]);
 
 	// Update project directory when name changes
 	$effect(() => {
@@ -36,11 +89,162 @@
 		} catch {}
 	});
 
+	function buildTemplateConfig(loraFamily, memoryProfile, defaultLtx, defaultGemma) {
+		const shared = {
+			default_ltx2_checkpoint: defaultLtx,
+			default_gemma_root: defaultGemma,
+			default_gemma_safetensors: '',
+			caching: {
+				ltx2_checkpoint: defaultLtx,
+				gemma_root: defaultGemma,
+				ltx2_mode: 'video',
+			},
+			training: {
+				ltx2_checkpoint: defaultLtx,
+				gemma_root: defaultGemma,
+				ltx2_mode: 'video',
+				ltx_version: '2.3',
+				lora_target_preset: 't2v',
+				ic_lora_strategy: 'auto',
+			},
+			inference: {
+				ltx2_checkpoint: defaultLtx,
+				gemma_root: defaultGemma,
+				ltx2_mode: 'video',
+			},
+			slider: {
+				mode: 'text',
+				output_name: 'ltx2_slider',
+			},
+		};
+
+		let familyConfig = shared;
+		if (loraFamily === 'av') {
+			familyConfig = {
+				...shared,
+				caching: { ...shared.caching, ltx2_mode: 'av' },
+				training: { ...shared.training, ltx2_mode: 'av' },
+				inference: { ...shared.inference, ltx2_mode: 'av' },
+			};
+		} else if (loraFamily === 'audio') {
+			familyConfig = {
+				...shared,
+				caching: { ...shared.caching, ltx2_mode: 'audio' },
+				training: { ...shared.training, ltx2_mode: 'audio', lora_target_preset: 'audio' },
+				inference: { ...shared.inference, ltx2_mode: 'audio' },
+			};
+		} else if (loraFamily === 'ic') {
+			familyConfig = {
+				...shared,
+				caching: { ...shared.caching, reference_frames: 1, reference_downscale: 1 },
+				training: {
+					...shared.training,
+					lora_target_preset: 'v2v',
+					ic_lora_strategy: 'v2v',
+				},
+				inference: { ...shared.inference, sample_include_reference: true },
+			};
+		} else if (loraFamily === 'slider') {
+			familyConfig = {
+				...shared,
+				slider: {
+					...shared.slider,
+					mode: 'text',
+					output_name: 'ltx2_slider',
+					max_train_steps: 500,
+				},
+			};
+		}
+
+		if (memoryProfile === 'high') {
+			return {
+				...familyConfig,
+				caching: {
+					...familyConfig.caching,
+					gemma_load_in_8bit: false,
+					gemma_load_in_4bit: false,
+				},
+				training: {
+					...familyConfig.training,
+					gradient_checkpointing: false,
+					fp8_base: false,
+					gemma_load_in_8bit: false,
+					gemma_load_in_4bit: false,
+				},
+				inference: {
+					...familyConfig.inference,
+					fp8_base: false,
+					gemma_load_in_8bit: false,
+					gemma_load_in_4bit: false,
+					offloading: false,
+				},
+			};
+		}
+
+		if (memoryProfile === 'low') {
+			return {
+				...familyConfig,
+				caching: {
+					...familyConfig.caching,
+					gemma_load_in_8bit: false,
+					gemma_load_in_4bit: true,
+				},
+				training: {
+					...familyConfig.training,
+					gradient_checkpointing: true,
+					fp8_base: true,
+					gemma_load_in_8bit: false,
+					gemma_load_in_4bit: true,
+				},
+				inference: {
+					...familyConfig.inference,
+					fp8_base: true,
+					gemma_load_in_8bit: false,
+					gemma_load_in_4bit: true,
+					offloading: true,
+				},
+			};
+		}
+
+		return {
+			...familyConfig,
+			caching: {
+				...familyConfig.caching,
+				gemma_load_in_8bit: true,
+				gemma_load_in_4bit: false,
+			},
+			training: {
+				...familyConfig.training,
+				gradient_checkpointing: true,
+				fp8_base: false,
+				gemma_load_in_8bit: true,
+				gemma_load_in_4bit: false,
+			},
+			inference: {
+				...familyConfig.inference,
+				fp8_base: false,
+				gemma_load_in_8bit: true,
+				gemma_load_in_4bit: false,
+				offloading: false,
+			},
+		};
+	}
+
 	async function handleCreate() {
 		error = '';
 		creating = true;
 		try {
-			await createProject({ name: newProjectName, project_dir: newProjectDir });
+			const modelDir = defaultModelDir(cwd, null);
+			const seedConfig = { model_dir: modelDir };
+			const defaultLtx = effectiveLtx2Checkpoint(cwd, seedConfig, '');
+			const defaultGemma = effectiveGemmaRoot(cwd, seedConfig, '', '');
+			const templateConfig = buildTemplateConfig(selectedLoraFamily, selectedMemoryProfile, defaultLtx, defaultGemma);
+			await createProject({
+				name: newProjectName,
+				project_dir: newProjectDir,
+				model_dir: modelDir,
+				...templateConfig
+			});
 		} catch (e) { error = e.message; }
 		creating = false;
 	}
@@ -48,6 +252,19 @@
 	async function handleLoad() {
 		error = '';
 		try { await loadProjectFromPath(loadPath); } catch (e) { error = e.message; }
+	}
+
+	function handleRemoveRecentProject(project, index) {
+		removeRecentProject(project.path);
+		removedRecentProjects = [
+			{ ...project, removedIndex: index, removedAt: Date.now() },
+			...removedRecentProjects.filter((item) => item.path !== project.path)
+		].slice(0, 5);
+	}
+
+	function handleRestoreRecentProject(project) {
+		restoreRecentProject(project, project.removedIndex ?? 0);
+		removedRecentProjects = removedRecentProjects.filter((item) => item.path !== project.path);
 	}
 
 	function updateConfig(key, value) {
@@ -129,7 +346,7 @@
 		// LTX-2 DiT: 48 transformer blocks. VAE/Gemma NOT resident during training.
 		// LTX 2.0: ~19.6B params → BF16 39 GB, FP8 19.5 GB, FP32 78 GB
 		// LTX 2.3: ~21.0B params → BF16 42 GB, FP8 21 GB, FP32 84 GB
-		const ltxVersion = String(t.ltx_version || '2.0');
+		const ltxVersion = String(t.ltx_version || '2.3');
 		const ditBF16 = ltxVersion === '2.3' ? 42 : 39;
 		const isFp8 = !!t.fp8_base;
 		const isNF4 = !!t.nf4_base;
@@ -152,7 +369,7 @@
 		const isAV = mode === 'av';
 		// Base LoRA size in GB per unit rank (t2v preset, video-only)
 		const loraBasePerRank = isAV ? 12.75 / 1024 : 6.0 / 1024;  // GB per rank
-		const presetMultiplier = { t2v: 1.0, v2v: 1.44, video_sa: 0.37, video_sa_ff: 0.56, video_sa_ca_ff: 0.74, audio: 0.52, audio_ref_only_ic: 0.63, full: 2.1 }[t.lora_target_preset] || 1.0;
+		const presetMultiplier = { t2v: 1.0, v2v: 1.44, video_sa: 0.37, video_sa_ff: 0.56, video_sa_ca_ff: 0.74, audio: 0.52, audio_ref_only_ic: 0.63, av_ic: 1.44, video_ref_only_av: 1.44, full: 2.1 }[t.lora_target_preset] || 1.0;
 		const loraParamsGB = rank * loraBasePerRank * presetMultiplier;
 
 		// ── Optimizer states ──
@@ -251,7 +468,8 @@
 		const total = dit + loraParamsGB + optimStates + loraGrads + activationTotal + gradAccumOverhead + preservationOverhead + selfFlowOverhead + crepaOverhead;
 
 		// Temporary spikes (not steady-state)
-		const samplingEnabled = !!t.sample_prompts && !!(t.sample_at_first || t.sample_every_n_steps || t.sample_every_n_epochs);
+		const hasSamplePrompts = !!(t.sample_prompts || t.sample_prompts_text);
+		const samplingEnabled = hasSamplePrompts && !!(t.sample_at_first || t.sample_every_n_steps || t.sample_every_n_epochs);
 		const samplingSpike = samplingEnabled;
 		const preservationGemmaSpike = !!(t.blank_preservation || t.dop || t.audio_dop) && !t.use_precached_preservation;
 
@@ -310,6 +528,8 @@
 	let diagnostics = $derived.by(() => {
 		const errors = [];
 		const warnings = [];
+		const hasLtxPath = !!(c.ltx2_checkpoint || t.ltx2_checkpoint || cfg?.default_ltx2_checkpoint || cfg?.model_dir || cwd);
+		const hasGemmaPath = !!(c.gemma_root || t.gemma_root || cfg?.default_gemma_root || cfg?.default_gemma_safetensors || cfg?.model_dir || cwd);
 
 		// Dataset
 		if (datasets.length === 0) {
@@ -322,18 +542,18 @@
 		}
 
 		// Caching
-		if (!c.ltx2_checkpoint && !t.ltx2_checkpoint) {
+		if (!hasLtxPath) {
 			errors.push({ stage: 'Caching', msg: 'LTX-2 checkpoint path not set', href: '/caching' });
 		}
-		if (!c.gemma_root && !t.gemma_root) {
+		if (!hasGemmaPath) {
 			errors.push({ stage: 'Caching', msg: 'Gemma text encoder path not set', href: '/caching' });
 		}
 
 		// Training
-		if (!t.ltx2_checkpoint) {
+		if (!hasLtxPath) {
 			warnings.push({ stage: 'Training', msg: 'Training checkpoint not set', href: '/training' });
 		}
-		if (!t.gemma_root) {
+		if (!hasGemmaPath) {
 			warnings.push({ stage: 'Training', msg: 'Training Gemma root not set', href: '/training' });
 		}
 		if (!t.output_dir) {
@@ -345,7 +565,7 @@
 </script>
 
 {#if !$projectLoaded}
-	<div class="max-w-3xl mx-auto mt-10 space-y-6">
+	<div class="max-w-6xl mx-auto mt-10 space-y-6">
 		<!-- Header -->
 		<div class="text-center">
 			<div class="w-12 h-12 mx-auto mb-3 flex items-center justify-center" style="background: var(--logo-bg); box-shadow: var(--logo-shadow); border-radius: var(--logo-radius); clip-path: var(--logo-clip);">
@@ -356,56 +576,137 @@
 		</div>
 
 		<!-- Two-panel layout -->
-		<div class="grid grid-cols-1 md:grid-cols-2 gap-5">
+		<div class="grid grid-cols-1 xl:grid-cols-3 gap-5">
 			<!-- Left: Create New Project -->
-			<div class="p-5 space-y-4" style="background: var(--bg-surface); border: 1px solid var(--border-subtle); border-radius: var(--radius-md); position: relative; overflow: hidden;">
+			<div class="xl:col-span-2 p-5 space-y-4" style="background: var(--bg-surface); border: 1px solid var(--border-subtle); border-radius: var(--radius-md); position: relative; overflow: hidden;">
 				<div style="position: absolute; top: 0; left: 0; right: 0; height: 1px; background: linear-gradient(90deg, transparent, var(--accent), var(--secondary, var(--accent)), transparent); opacity: 0.4;"></div>
-				<div class="text-[11px] font-semibold uppercase tracking-wider" style="color: var(--text-muted); font-family: var(--font-label);">New Project</div>
+				<div class="flex items-center justify-between gap-4">
+					<div>
+						<div class="text-[11px] font-semibold uppercase tracking-wider" style="color: var(--text-muted); font-family: var(--font-label);">New Project</div>
+					</div>
+					<div class="text-[11px]" style="color: var(--text-muted);">{activeLoraFamily.label} • {activeMemoryProfile.label}</div>
+				</div>
 				<div class="space-y-3">
 					<FormField label="Project Name" bind:value={newProjectName} placeholder="My LTX-2 LoRA" tooltip="Display name for your project" />
-					<PathInput label="Project Directory" bind:value={newProjectDir} placeholder="{cwd ? cwd + '/projects/Project_Name' : 'Path to store project files'}" tooltip="Directory where project.json and configs will be saved" />
+					<PathInput label="Project Directory" bind:value={newProjectDir} placeholder={cwd ? `${cwd}/projects/Project_Name` : 'Path to store project files'} tooltip="Directory where project.json and configs will be saved" />
+
+					<div class="space-y-2">
+						<div class="flex items-center justify-between gap-3">
+							<div class="text-[11px] font-medium uppercase tracking-[0.18em]" style="color: var(--text-secondary); font-family: var(--font-label);">LoRA Type</div>
+							<div class="text-[10px]" style="color: var(--text-muted);">{activeLoraFamily.label}</div>
+						</div>
+						<div class="flex flex-wrap gap-2">
+							{#each LORA_FAMILIES as family}
+								<button
+									type="button"
+									onclick={() => selectedLoraFamily = family.id}
+									class="choice-pill"
+									style="background: {selectedLoraFamily === family.id ? 'color-mix(in srgb, var(--accent) 10%, var(--bg-elevated))' : 'var(--bg-elevated)'}; border: 1px solid {selectedLoraFamily === family.id ? 'color-mix(in srgb, var(--accent) 28%, var(--border))' : 'var(--border)'}; color: {selectedLoraFamily === family.id ? 'var(--text-primary)' : 'var(--text-secondary)'};"
+								>
+									{family.label}
+								</button>
+							{/each}
+						</div>
+						<div class="text-[11px]" style="color: var(--text-muted);">{activeLoraFamily.blurb}</div>
+					</div>
+
+					<div class="space-y-2">
+						<div class="flex items-center justify-between gap-3">
+							<div class="text-[11px] font-medium uppercase tracking-[0.18em]" style="color: var(--text-secondary); font-family: var(--font-label);">Memory Profile</div>
+							<div class="text-[10px]" style="color: var(--text-muted);">{activeMemoryProfile.label}</div>
+						</div>
+						<div class="flex flex-wrap gap-2">
+							{#each MEMORY_PROFILES as profile}
+								<button
+									type="button"
+									onclick={() => selectedMemoryProfile = profile.id}
+									class="choice-pill"
+									style="background: {selectedMemoryProfile === profile.id ? 'color-mix(in srgb, var(--accent) 10%, var(--bg-elevated))' : 'var(--bg-elevated)'}; border: 1px solid {selectedMemoryProfile === profile.id ? 'color-mix(in srgb, var(--accent) 28%, var(--border))' : 'var(--border)'}; color: {selectedMemoryProfile === profile.id ? 'var(--text-primary)' : 'var(--text-secondary)'};"
+								>
+									{profile.label}
+								</button>
+							{/each}
+						</div>
+						<div class="text-[11px]" style="color: var(--text-muted);">{activeMemoryProfile.blurb}</div>
+					</div>
+
 					<button
 						onclick={handleCreate}
 						disabled={!newProjectDir || creating}
 						class="w-full py-2.5 text-[13px] font-semibold disabled:opacity-40"
-						style="background: var(--accent); color: var(--bg-base); border-radius: var(--radius-sm); box-shadow: var(--shadow-sm), var(--glow-accent);"
+						style="background: color-mix(in srgb, var(--accent) 74%, var(--bg-elevated)); color: var(--text-primary); border: 1px solid color-mix(in srgb, var(--accent) 32%, var(--border)); border-radius: var(--radius-sm);"
 					>{creating ? 'Creating...' : 'Create Project'}</button>
 				</div>
 			</div>
 
 			<!-- Right: Recent Projects + Load Existing -->
-			<div class="p-5 space-y-4" style="background: var(--bg-surface); border: 1px solid var(--border-subtle); border-radius: var(--radius-md); position: relative; overflow: hidden;">
+			<div class="xl:col-span-1 p-5 space-y-4" style="background: var(--bg-surface); border: 1px solid var(--border-subtle); border-radius: var(--radius-md); position: relative; overflow: hidden;">
 				<div style="position: absolute; top: 0; left: 0; right: 0; height: 1px; background: linear-gradient(90deg, transparent, var(--accent), var(--secondary, var(--accent)), transparent); opacity: 0.4;"></div>
 				<div class="text-[11px] font-semibold uppercase tracking-wider" style="color: var(--text-muted); font-family: var(--font-label);">Open Project</div>
 
 				{#if $recentProjects.length > 0}
-					<div class="space-y-1.5">
-						<p class="text-[11px] font-medium" style="color: var(--text-muted);">Recent</p>
-						{#each $recentProjects as proj}
-							<div class="flex items-center gap-2 group">
-								<button
-									onclick={() => { loadPath = proj.path; handleLoad(); }}
-									class="flex-1 flex items-center gap-3 px-3 py-2 text-left min-w-0"
-									style="background: var(--bg-elevated); border: 1px solid var(--border-subtle); border-radius: var(--radius-sm);"
-									onmouseenter={(e) => { e.currentTarget.style.borderColor = 'var(--accent)'; }}
-									onmouseleave={(e) => { e.currentTarget.style.borderColor = 'var(--border-subtle)'; }}
-								>
+					<div class="space-y-3">
+						<div class="flex items-center justify-between">
+							<p class="text-[11px] font-medium uppercase tracking-[0.18em]" style="color: var(--text-secondary); font-family: var(--font-label);">Recent</p>
+							<span class="text-[10px] px-2 py-0.5 rounded-full" style="background: var(--bg-elevated); color: var(--text-muted); border: 1px solid var(--border);">{$recentProjects.length}</span>
+						</div>
+						<div class="space-y-2.5">
+						{#each $recentProjects as proj, index}
+							<div class="recent-project-card p-3 space-y-3">
+								<div class="flex items-start gap-3">
+									<div class="w-9 h-9 flex items-center justify-center flex-shrink-0 rounded-sm" style="background: color-mix(in srgb, var(--accent) 14%, var(--bg-base)); color: var(--accent); border: 1px solid color-mix(in srgb, var(--accent) 24%, var(--border));">
+										{(proj.name || 'P').trim().charAt(0).toUpperCase() || 'P'}
+									</div>
 									<div class="min-w-0 flex-1">
 										<div class="text-[12px] font-semibold truncate" style="color: var(--text-primary);">{proj.name}</div>
-										<div class="text-[10px] font-mono truncate" style="color: var(--text-muted);">{proj.path}</div>
+										<div class="text-[10px] mt-1 break-all" style="color: var(--text-secondary);">{proj.path}</div>
 									</div>
-								</button>
-								<button
-									onclick={() => removeRecentProject(proj.path)}
-									class="flex-shrink-0 px-2 py-0.5 text-[10px] font-medium opacity-0 group-hover:opacity-100 transition-opacity"
-									style="color: var(--text-muted); background: var(--bg-elevated); border: 1px solid var(--border); border-radius: var(--radius-sm);"
-									onmouseenter={(e) => { e.currentTarget.style.color = 'var(--danger)'; e.currentTarget.style.borderColor = 'var(--danger)'; }}
-									onmouseleave={(e) => { e.currentTarget.style.color = 'var(--text-muted)'; e.currentTarget.style.borderColor = 'var(--border)'; }}
-								>
-									Remove
-								</button>
+							</div>
+								<div class="flex gap-2">
+									<button
+										type="button"
+										onclick={() => { loadPath = proj.path; handleLoad(); }}
+										class="recent-project-action recent-project-action-primary flex-1 py-2 text-[11px] font-medium"
+									>
+										Open
+									</button>
+									<button
+										type="button"
+										onclick={() => handleRemoveRecentProject(proj, index)}
+										class="recent-project-action recent-project-action-muted px-3 py-2 text-[11px] font-medium"
+									>
+										Remove
+									</button>
+								</div>
 							</div>
 						{/each}
+						</div>
+					</div>
+				{/if}
+
+				{#if removedRecentProjects.length > 0}
+					<div class="space-y-2.5" style="padding-top: 0.5rem; border-top: 1px solid var(--border-subtle);">
+						<div class="flex items-center justify-between">
+							<p class="text-[11px] font-medium uppercase tracking-[0.18em]" style="color: var(--text-secondary); font-family: var(--font-label);">Removed</p>
+							<span class="text-[10px] px-2 py-0.5 rounded-full" style="background: var(--bg-elevated); color: var(--text-muted); border: 1px solid var(--border);">{removedRecentProjects.length}</span>
+						</div>
+						<div class="space-y-2">
+							{#each removedRecentProjects as proj}
+								<div class="removed-project-row flex items-center justify-between gap-3 px-3 py-2">
+									<div class="min-w-0 flex-1">
+										<div class="text-[11px] font-medium truncate" style="color: var(--text-primary);">{proj.name}</div>
+										<div class="text-[10px] truncate" style="color: var(--text-muted);">{proj.path}</div>
+									</div>
+									<button
+										type="button"
+										onclick={() => handleRestoreRecentProject(proj)}
+										class="recent-project-action recent-project-action-primary px-3 py-2 text-[11px] font-medium"
+									>
+										Restore
+									</button>
+								</div>
+							{/each}
+						</div>
 					</div>
 				{/if}
 
@@ -721,3 +1022,59 @@
 		{/if}
 	</div>
 {/if}
+
+<style>
+	.choice-pill {
+		padding: 0.45rem 0.7rem;
+		font-size: 11px;
+		font-weight: 500;
+		border-radius: var(--radius-sm);
+		transition: background-color 140ms ease, border-color 140ms ease, color 140ms ease;
+	}
+
+	.choice-pill:hover {
+		border-color: color-mix(in srgb, var(--accent) 22%, var(--border));
+		color: var(--text-primary);
+	}
+
+	.recent-project-card {
+		background: color-mix(in srgb, var(--bg-elevated) 80%, var(--bg-base));
+		border: 1px solid color-mix(in srgb, var(--accent) 14%, var(--border));
+		border-radius: var(--radius-sm);
+		box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.02);
+	}
+
+	.removed-project-row {
+		background: color-mix(in srgb, var(--bg-elevated) 72%, var(--bg-base));
+		border: 1px solid var(--border);
+		border-radius: var(--radius-sm);
+	}
+
+	.recent-project-action {
+		border-radius: var(--radius-sm);
+		transition: background-color 140ms ease, border-color 140ms ease, color 140ms ease;
+	}
+
+	.recent-project-action-primary {
+		background: color-mix(in srgb, var(--accent) 10%, var(--bg-elevated));
+		color: var(--text-primary);
+		border: 1px solid color-mix(in srgb, var(--accent) 24%, var(--border));
+	}
+
+	.recent-project-action-primary:hover {
+		background: color-mix(in srgb, var(--accent) 18%, var(--bg-elevated));
+		border-color: color-mix(in srgb, var(--accent) 38%, var(--border));
+	}
+
+	.recent-project-action-muted {
+		background: var(--bg-surface);
+		color: var(--text-muted);
+		border: 1px solid var(--border);
+	}
+
+	.recent-project-action-muted:hover {
+		color: var(--text-primary);
+		border-color: color-mix(in srgb, var(--accent) 24%, var(--border));
+		background: color-mix(in srgb, var(--bg-elevated) 88%, var(--bg-base));
+	}
+</style>

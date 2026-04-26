@@ -1,13 +1,30 @@
 <script>
 	import { projectConfig } from '$lib/stores/project.js';
 
-	let { label, value = $bindable(''), placeholder = '', tooltip = '', disabled = false, showFiles = false, onselect, oninput } = $props();
+	let {
+		label,
+		value = $bindable(''),
+		placeholder = '',
+		tooltip = '',
+		disabled = false,
+		showFiles = false,
+		invalid = false,
+		error = '',
+		onselect,
+		oninput,
+		actionLabel = '',
+		actionBusyLabel = '',
+		actionDisabled = false,
+		actionTooltip = '',
+		onaction
+	} = $props();
 
 	let showBrowser = $state(false);
 	let browserEntries = $state([]);
 	let browserPath = $state('');
 	let browserParent = $state(null);
 	let serverCwd = $state('');
+	let compactAction = $derived(actionLabel && actionLabel.length <= 1);
 
 	async function openBrowser() {
 		showBrowser = true;
@@ -70,7 +87,7 @@
 </script>
 
 <label class="block" data-tooltip={tooltip || undefined}>
-	<span class="text-xs font-medium uppercase tracking-wider" style="color: var(--text-muted); font-family: var(--font-label);">{label}</span>
+	<span class="text-xs font-medium uppercase tracking-wider" style="color: {invalid ? 'var(--danger)' : 'var(--text-muted)'}; font-family: var(--font-label);">{label}</span>
 	<div class="mt-1 flex gap-1.5">
 		<input
 			type="text"
@@ -79,8 +96,25 @@
 			{disabled}
 			oninput={oninput}
 			class="flex-1 px-3 py-2 text-sm transition-colors disabled:opacity-40"
-			style="background: var(--bg-input); border: 1px solid var(--border); color: var(--text-primary); border-radius: var(--radius-sm);"
+			style="background: var(--bg-input); border: 1px solid {invalid ? 'var(--danger)' : 'var(--border)'}; color: var(--text-primary); border-radius: var(--radius-sm);"
 		/>
+		{#if actionLabel}
+			<button
+				type="button"
+				onclick={onaction}
+				disabled={disabled || actionDisabled}
+				data-tooltip={actionTooltip || undefined}
+				class="text-sm font-medium disabled:opacity-40 flex-shrink-0"
+				class:px-2={compactAction}
+				class:py-1.5={compactAction}
+				class:min-w-9={compactAction}
+				class:px-3={!compactAction}
+				class:py-2={!compactAction}
+				style="background: var(--bg-elevated); border: 1px solid var(--border); color: var(--text-secondary); border-radius: var(--radius-sm);"
+				onmouseenter={(e) => e.currentTarget.style.background = 'var(--border)'}
+				onmouseleave={(e) => e.currentTarget.style.background = 'var(--bg-elevated)'}
+			>{actionDisabled && actionBusyLabel ? actionBusyLabel : actionLabel}</button>
+		{/if}
 		<!-- svelte-ignore a11y_no_static_element_interactions a11y_click_events_have_key_events -->
 		<button
 			type="button"
@@ -92,6 +126,9 @@
 			onmouseleave={(e) => e.currentTarget.style.background = 'var(--bg-elevated)'}
 		>...</button>
 	</div>
+	{#if error}
+		<div class="mt-1 text-[11px]" style="color: var(--danger);">{error}</div>
+	{/if}
 </label>
 
 {#if showBrowser}

@@ -225,6 +225,95 @@ def _masked_mse(
     return (per_elem * mask_f).div(denom).mean()
 
 
+def _masked_cosine_loss(
+    pred: torch.Tensor,
+    tgt: torch.Tensor,
+    mask: Optional[torch.Tensor],
+    *,
+    dtype: torch.dtype,
+    channel_dim: int = 1,
+) -> torch.Tensor:
+    """1 - cosine similarity along channel dim, averaged over spatio-temporal positions.
+
+    Semantically meaningful for latent features where direction matters more than magnitude.
+    """
+    pred_f = pred.to(device=tgt.device, dtype=torch.float32) if isinstance(tgt, torch.Tensor) else pred.to(torch.float32)
+    tgt_f = tgt.to(dtype=torch.float32) if isinstance(tgt, torch.Tensor) else tgt
+    cos = torch.nn.functional.cosine_similarity(pred_f, tgt_f, dim=channel_dim, eps=1e-8)
+    per_elem = (1.0 - cos).to(dtype=dtype)
+    if mask is None:
+        return per_elem.mean()
+    mask = mask.to(device=per_elem.device)
+    if per_elem.dim() == 4 and mask.dim() == 2:
+        mask = mask.view(mask.shape[0], mask.shape[1], 1, 1)
+    elif per_elem.dim() == 4 and mask.dim() == 1:
+        mask = mask.view(mask.shape[0], 1, 1, 1)
+    elif per_elem.dim() == 3 and mask.dim() == 1:
+        mask = mask.view(mask.shape[0], 1, 1)
+    mask_f = mask.to(dtype=per_elem.dtype)
+    denom = mask_f.mean()
+    if denom.item() == 0:
+        return per_elem.mean()
+    return (per_elem * mask_f).div(denom).mean()
+
+
+def _masked_kl_softmax_loss(
+    pred: torch.Tensor,
+    tgt: torch.Tensor,
+    mask: Optional[torch.Tensor],
+    *,
+    dtype: torch.dtype,
+    channel_dim: int = 1,
+    temperature: float = 1.0,
+) -> torch.Tensor:
+    """KL(softmax(student/T) || softmax(teacher/T)) along channel dim, averaged over positions.
+
+    Interprets per-position channel vector as logits. Semantic when channels carry
+    comparable roles (e.g. latent head dims). Less grounded for arbitrary latent
+    channels; prefer cosine or l2 if unclear.
+    """
+    inv_t = 1.0 / max(1e-6, temperature)
+    pred_f = pred.to(device=tgt.device, dtype=torch.float32) if isinstance(tgt, torch.Tensor) else pred.to(torch.float32)
+    tgt_f = tgt.to(dtype=torch.float32) if isinstance(tgt, torch.Tensor) else tgt
+    log_p_s = torch.nn.functional.log_softmax(pred_f * inv_t, dim=channel_dim)
+    log_p_t = torch.nn.functional.log_softmax(tgt_f * inv_t, dim=channel_dim)
+    p_s = log_p_s.exp()
+    per_elem = (p_s * (log_p_s - log_p_t)).sum(dim=channel_dim).to(dtype=dtype)
+    if mask is None:
+        return per_elem.mean()
+    mask = mask.to(device=per_elem.device)
+    if per_elem.dim() == 4 and mask.dim() == 2:
+        mask = mask.view(mask.shape[0], mask.shape[1], 1, 1)
+    elif per_elem.dim() == 4 and mask.dim() == 1:
+        mask = mask.view(mask.shape[0], 1, 1, 1)
+    elif per_elem.dim() == 3 and mask.dim() == 1:
+        mask = mask.view(mask.shape[0], 1, 1)
+    mask_f = mask.to(dtype=per_elem.dtype)
+    denom = mask_f.mean()
+    if denom.item() == 0:
+        return per_elem.mean()
+    return (per_elem * mask_f).div(denom).mean()
+
+
+def _motion_loss_dispatch(
+    pred: torch.Tensor,
+    tgt: torch.Tensor,
+    mask: Optional[torch.Tensor],
+    *,
+    dtype: torch.dtype,
+    loss_type: str,
+    kl_temperature: float = 1.0,
+) -> torch.Tensor:
+    lt = (loss_type or "mse").lower()
+    if lt in ("mse", "l2", "mae", "l1", "huber", "smooth_l1"):
+        return _masked_mse(pred, tgt, mask, weighting=None, dtype=dtype, loss_type=lt)
+    if lt == "cosine":
+        return _masked_cosine_loss(pred, tgt, mask, dtype=dtype)
+    if lt == "kl_softmax":
+        return _masked_kl_softmax_loss(pred, tgt, mask, dtype=dtype, temperature=kl_temperature)
+    raise ValueError(f"Unknown motion preservation loss_type: {loss_type}")
+
+
 def _expand_mask_like_per_elem(mask: Optional[torch.Tensor], per_elem: torch.Tensor) -> Optional[torch.Tensor]:
     if mask is None:
         return None
@@ -379,6 +468,258 @@ def _normalize_ltx2_batch_for_call_dit(batch: dict) -> dict:
 
     normalized["conditions"] = conditions_dict
     return normalized
+
+
+def _resolve_text_captions(batch: dict) -> list[str] | None:
+    """Return normalized caption list from a LTX-2 batch, if available."""
+    captions = batch.get("captions")
+    if captions is None:
+        return None
+    if isinstance(captions, str):
+        return [captions]
+    if isinstance(captions, (list, tuple)):
+        if len(captions) == 0:
+            return []
+        result: list[str] = []
+        for caption in captions:
+            if not isinstance(caption, str):
+                return None
+            result.append(caption)
+        return result
+    return None
+
+
+def _add_full_ft_text_encoder_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
+    parser.add_argument(
+        "--full_ft_train_text_encoder",
+        action="store_true",
+        default=False,
+        help=(
+            "Enable full-FT training for the Gemma text encoder in addition to the denoising transformer. "
+            "The text encoder is not trained by default in full-FT mode."
+        ),
+    )
+    parser.add_argument(
+        "--full_ft_text_encoder_lr",
+        type=float,
+        default=None,
+        help=(
+            "Learning rate for text-encoder parameters when --full_ft_train_text_encoder is enabled. "
+            "Defaults to --learning_rate."
+        ),
+    )
+    parser.add_argument(
+        "--full_ft_text_encoder_fallback",
+        action="store_true",
+        default=False,
+        help=(
+            "When --full_ft_train_text_encoder is enabled and a batch has no cached text embeddings, "
+            "encode captions through Gemma at runtime."
+        ),
+    )
+    return parser
+
+
+def _get_ltx2_batch_tensor(
+    batch: dict,
+    key: str,
+    *,
+    nested_key: str = "latents",
+) -> Optional[torch.Tensor]:
+    value = batch.get(key)
+    if isinstance(value, dict):
+        value = value.get(nested_key)
+    return value if isinstance(value, torch.Tensor) else None
+
+
+def _validate_full_ft_ic_batch(
+    args: argparse.Namespace,
+    batch: dict,
+    *,
+    split_name: str,
+    batch_index: int,
+) -> None:
+    ic_lora_strategy = str(getattr(args, "ic_lora_strategy", "none") or "none").lower()
+    if ic_lora_strategy in {"none", "auto"}:
+        return
+
+    batch = _normalize_ltx2_batch_for_call_dit(batch)
+    latents = _get_ltx2_batch_tensor(batch, "latents")
+    if latents is None:
+        raise ValueError(f"{split_name} batch {batch_index} is missing latents")
+
+    ltx_mode = str(getattr(args, "ltx_mode", "video") or "video").lower()
+    ref_latents = _get_ltx2_batch_tensor(batch, "ref_latents")
+    audio_latents = _get_ltx2_batch_tensor(batch, "audio_latents")
+    ref_audio_latents = _get_ltx2_batch_tensor(batch, "ref_audio_latents")
+
+    def _normalize_stacked_refs(ref_value: Optional[torch.Tensor], *, single_ndim: int) -> Optional[torch.Tensor]:
+        if ref_value is None:
+            return None
+        if ref_value.dim() == single_ndim + 1:
+            if int(ref_value.shape[1]) <= 0:
+                raise ValueError(f"{split_name} batch {batch_index} has an empty stacked reference tensor.")
+            return ref_value[:, 0, ...]
+        return ref_value
+
+    ref_latents = _normalize_stacked_refs(ref_latents, single_ndim=5)
+    ref_audio_latents = _normalize_stacked_refs(ref_audio_latents, single_ndim=4)
+
+    if ic_lora_strategy == "v2v":
+        if ltx_mode != "video":
+            raise ValueError("--ic_lora_strategy v2v requires --ltx_mode=video")
+        if ref_latents is None:
+            raise ValueError(
+                f"{split_name} batch {batch_index} is missing ref_latents required for --ic_lora_strategy v2v. "
+                "Set reference_directory/reference_cache_directory and cache reference latents."
+            )
+        if ref_latents.dim() != 5:
+            raise ValueError(
+                f"{split_name} batch {batch_index} ref_latents must be 5D [B, C, F, H, W], got {tuple(ref_latents.shape)}"
+            )
+        if ref_latents.shape[0] != latents.shape[0]:
+            raise ValueError(
+                f"{split_name} batch {batch_index} latents/ref_latents batch mismatch: "
+                f"{latents.shape[0]} vs {ref_latents.shape[0]}"
+            )
+        if ref_latents.shape[1] != latents.shape[1]:
+            raise ValueError(
+                f"{split_name} batch {batch_index} latents/ref_latents channel mismatch: "
+                f"{latents.shape[1]} vs {ref_latents.shape[1]}"
+            )
+        ref_h, ref_w = int(ref_latents.shape[3]), int(ref_latents.shape[4])
+        tgt_h, tgt_w = int(latents.shape[3]), int(latents.shape[4])
+        if ref_h != tgt_h or ref_w != tgt_w:
+            h_ratio = tgt_h / ref_h
+            w_ratio = tgt_w / ref_w
+            if abs(h_ratio - w_ratio) > 0.01 or abs(h_ratio - round(h_ratio)) > 0.01:
+                raise ValueError(
+                    f"{split_name} batch {batch_index} has invalid V2V spatial mismatch: "
+                    f"latents={tgt_h}x{tgt_w}, ref_latents={ref_h}x{ref_w}, "
+                    f"h_ratio={h_ratio:.2f}, w_ratio={w_ratio:.2f}"
+                )
+        return
+
+    if ic_lora_strategy == "audio_ref_only_ic":
+        if ltx_mode not in {"av", "audio"}:
+            raise ValueError("--ic_lora_strategy audio_ref_only_ic requires --ltx_mode=av or audio")
+        if audio_latents is None:
+            raise ValueError(
+                f"{split_name} batch {batch_index} is missing audio_latents required for --ic_lora_strategy audio_ref_only_ic."
+            )
+        if ref_audio_latents is None:
+            raise ValueError(
+                f"{split_name} batch {batch_index} is missing ref_audio_latents required for --ic_lora_strategy audio_ref_only_ic. "
+                "Set reference_audio_directory/reference_audio_cache_directory and cache reference audio latents."
+            )
+        return
+
+    if ic_lora_strategy == "av_ic":
+        if ltx_mode != "av":
+            raise ValueError(f"--ic_lora_strategy {ic_lora_strategy} requires --ltx_mode=av")
+        if ref_latents is None:
+            raise ValueError(
+                f"{split_name} batch {batch_index} is missing ref_latents required for --ic_lora_strategy {ic_lora_strategy}."
+            )
+        if ref_latents.dim() != 5:
+            raise ValueError(
+                f"{split_name} batch {batch_index} ref_latents must be 5D [B, C, F, H, W], got {tuple(ref_latents.shape)}"
+            )
+        if ref_latents.shape[0] != latents.shape[0]:
+            raise ValueError(
+                f"{split_name} batch {batch_index} latents/ref_latents batch mismatch: "
+                f"{latents.shape[0]} vs {ref_latents.shape[0]}"
+            )
+        if ref_latents.shape[1] != latents.shape[1]:
+            raise ValueError(
+                f"{split_name} batch {batch_index} latents/ref_latents channel mismatch: "
+                f"{latents.shape[1]} vs {ref_latents.shape[1]}"
+            )
+        ref_h, ref_w = int(ref_latents.shape[3]), int(ref_latents.shape[4])
+        tgt_h, tgt_w = int(latents.shape[3]), int(latents.shape[4])
+        if ref_h != tgt_h or ref_w != tgt_w:
+            h_ratio = tgt_h / ref_h
+            w_ratio = tgt_w / ref_w
+            if abs(h_ratio - w_ratio) > 0.01 or abs(h_ratio - round(h_ratio)) > 0.01:
+                raise ValueError(
+                    f"{split_name} batch {batch_index} {ic_lora_strategy} has invalid spatial mismatch: "
+                    f"latents={tgt_h}x{tgt_w}, ref_latents={ref_h}x{ref_w}, "
+                    f"h_ratio={h_ratio:.2f}, w_ratio={w_ratio:.2f}"
+                )
+        if audio_latents is None:
+            raise ValueError(
+                f"{split_name} batch {batch_index} is missing audio_latents required for --ic_lora_strategy {ic_lora_strategy}."
+            )
+        if ref_audio_latents is None:
+            raise ValueError(
+                f"{split_name} batch {batch_index} is missing ref_audio_latents required for --ic_lora_strategy {ic_lora_strategy}."
+            )
+        return
+
+    if ic_lora_strategy == "video_ref_only_av":
+        if ltx_mode != "av":
+            raise ValueError("--ic_lora_strategy video_ref_only_av requires --ltx_mode=av")
+        if ref_latents is None:
+            raise ValueError(
+                f"{split_name} batch {batch_index} is missing ref_latents required for --ic_lora_strategy video_ref_only_av."
+            )
+        if ref_latents.dim() != 5:
+            raise ValueError(
+                f"{split_name} batch {batch_index} ref_latents must be 5D [B, C, F, H, W], got {tuple(ref_latents.shape)}"
+            )
+        if ref_latents.shape[0] != latents.shape[0]:
+            raise ValueError(
+                f"{split_name} batch {batch_index} latents/ref_latents batch mismatch: "
+                f"{latents.shape[0]} vs {ref_latents.shape[0]}"
+            )
+        if ref_latents.shape[1] != latents.shape[1]:
+            raise ValueError(
+                f"{split_name} batch {batch_index} latents/ref_latents channel mismatch: "
+                f"{latents.shape[1]} vs {ref_latents.shape[1]}"
+            )
+        ref_h, ref_w = int(ref_latents.shape[3]), int(ref_latents.shape[4])
+        tgt_h, tgt_w = int(latents.shape[3]), int(latents.shape[4])
+        if ref_h != tgt_h or ref_w != tgt_w:
+            h_ratio = tgt_h / ref_h
+            w_ratio = tgt_w / ref_w
+            if abs(h_ratio - w_ratio) > 0.01 or abs(h_ratio - round(h_ratio)) > 0.01:
+                raise ValueError(
+                    f"{split_name} batch {batch_index} video_ref_only_av has invalid spatial mismatch: "
+                    f"latents={tgt_h}x{tgt_w}, ref_latents={ref_h}x{ref_w}, "
+                    f"h_ratio={h_ratio:.2f}, w_ratio={w_ratio:.2f}"
+                )
+        if audio_latents is None:
+            raise ValueError(
+                f"{split_name} batch {batch_index} is missing audio_latents required for --ic_lora_strategy video_ref_only_av."
+            )
+
+
+def _run_full_ft_ic_preflight(
+    args: argparse.Namespace,
+    dataset_group,
+    *,
+    split_name: str,
+    max_batches: int = 8,
+) -> None:
+    ic_lora_strategy = str(getattr(args, "ic_lora_strategy", "none") or "none").lower()
+    if ic_lora_strategy in {"none", "auto"} or dataset_group is None:
+        return
+
+    num_batches = min(len(dataset_group), max_batches)
+    for batch_index in range(num_batches):
+        try:
+            batch = dataset_group[batch_index]
+        except Exception as exc:
+            raise ValueError(
+                f"{split_name} IC preflight failed while loading batch {batch_index} for "
+                f"--ic_lora_strategy {ic_lora_strategy}: {exc}"
+            ) from exc
+        _validate_full_ft_ic_batch(
+            args,
+            batch,
+            split_name=split_name,
+            batch_index=batch_index,
+        )
 
 
 def _clone_to_cpu(value: Any) -> Any:
@@ -722,7 +1063,9 @@ def _compute_motion_preservation_loss(
 ) -> torch.Tensor:
     chunk_frames = int(getattr(args, "motion_preservation_teacher_chunk_frames", 0) or 0)
     second_order_weight = float(getattr(args, "motion_preservation_second_order_weight", 0.0) or 0.0)
-    use_chunked = second_order_weight <= 0.0
+    _lt = str(getattr(args, "motion_preservation_loss_type", "mse") or "mse").lower()
+    # Chunked CPU-teacher path implements L2 inline; non-L2 losses fall through to standard path.
+    use_chunked = second_order_weight <= 0.0 and _lt in ("mse", "l2")
     if (
         isinstance(teacher_video_pred, torch.Tensor)
         and teacher_video_pred.device.type == "cpu"
@@ -751,6 +1094,8 @@ def _compute_motion_preservation_loss(
         setattr(args, "_motion_second_order_chunk_warned", True)
     if isinstance(teacher_video_pred, torch.Tensor) and teacher_video_pred.device != student_video_pred.device:
         teacher_video_pred = teacher_video_pred.to(device=student_video_pred.device, dtype=dtype, non_blocking=True)
+    loss_type = str(getattr(args, "motion_preservation_loss_type", "mse") or "mse").lower()
+    kl_t = float(getattr(args, "motion_preservation_kl_temperature", 1.0) or 1.0)
     if (
         getattr(args, "motion_preservation_mode", "temporal") == "temporal"
         and student_video_pred.dim() == 5
@@ -760,12 +1105,9 @@ def _compute_motion_preservation_loss(
         student_delta = student_video_pred[:, :, 1:, :, :] - student_video_pred[:, :, :-1, :, :]
         teacher_delta = teacher_video_pred[:, :, 1:, :, :] - teacher_video_pred[:, :, :-1, :, :]
         pair_mask = _build_temporal_pair_mask(video_loss_mask)
-        first_order_loss = _masked_mse(
-            student_delta,
-            teacher_delta,
-            pair_mask,
-            weighting=None,
-            dtype=dtype,
+        first_order_loss = _motion_loss_dispatch(
+            student_delta, teacher_delta, pair_mask,
+            dtype=dtype, loss_type=loss_type, kl_temperature=kl_t,
         )
         if second_order_weight > 0.0 and student_video_pred.shape[2] > 2:
             student_accel = (
@@ -779,21 +1121,15 @@ def _compute_motion_preservation_loss(
                 + teacher_video_pred[:, :, :-2, :, :]
             )
             triplet_mask = _build_temporal_triplet_mask(video_loss_mask)
-            second_order_loss = _masked_mse(
-                student_accel,
-                teacher_accel,
-                triplet_mask,
-                weighting=None,
-                dtype=dtype,
+            second_order_loss = _motion_loss_dispatch(
+                student_accel, teacher_accel, triplet_mask,
+                dtype=dtype, loss_type=loss_type, kl_temperature=kl_t,
             )
             return first_order_loss + float(second_order_weight) * second_order_loss
         return first_order_loss
-    return _masked_mse(
-        student_video_pred,
-        teacher_video_pred,
-        video_loss_mask,
-        weighting=None,
-        dtype=dtype,
+    return _motion_loss_dispatch(
+        student_video_pred, teacher_video_pred, video_loss_mask,
+        dtype=dtype, loss_type=loss_type, kl_temperature=kl_t,
     )
 
 
@@ -1276,6 +1612,341 @@ def _compute_ewc_penalty(
     if target_device is not None:
         return penalty.to(device=target_device, dtype=torch.float32), used_params, skipped_mismatched_device
     return penalty.to(dtype=torch.float32), used_params, skipped_mismatched_device
+
+
+def _short_drift_label(name: str) -> str:
+    s = re.sub(r"^transformer_blocks\.", "b", name)
+    s = s.replace(".weight", "").replace(".bias", "_bias")
+    return s
+
+
+def _build_weight_drift_state(
+    args: argparse.Namespace,
+    transformer: torch.nn.Module,
+) -> Optional[dict[str, Any]]:
+    interval = int(getattr(args, "log_weight_drift_every", 0) or 0)
+    if interval <= 0:
+        return None
+    target = str(getattr(args, "weight_drift_target", "attn_geometry") or "attn_geometry")
+    if target not in {"attn_norm_bias", "attn_geometry", "all_trainable"}:
+        raise ValueError(f"Invalid weight_drift_target: {target}")
+
+    selected: list[tuple[str, torch.nn.Parameter]] = []
+    for name, param in transformer.named_parameters():
+        if not param.requires_grad:
+            continue
+        if _is_ewc_target_param(name, target):
+            selected.append((name, param))
+
+    if not selected:
+        logger.warning("weight_drift: no matching parameters (target=%s); disabled.", target)
+        return None
+
+    theta_ref = {name: p.detach().cpu().float().clone() for name, p in selected}
+    logger.info(
+        "weight_drift: tracking %d tensors (target=%s, every=%d steps, top_k=%d).",
+        len(selected),
+        target,
+        interval,
+        int(getattr(args, "weight_drift_top_k", 20) or 20),
+    )
+    return {
+        "theta_ref": theta_ref,
+        "params": selected,
+        "target": target,
+        "interval": interval,
+        "top_k": int(getattr(args, "weight_drift_top_k", 20) or 20),
+    }
+
+
+def _register_grad_norm_hooks(
+    args: argparse.Namespace,
+    transformer: torch.nn.Module,
+) -> Optional[dict[str, Any]]:
+    interval = int(getattr(args, "log_grad_norm_every", 0) or 0)
+    if interval <= 0:
+        return None
+    target = str(getattr(args, "grad_norm_target", "attn_geometry") or "attn_geometry")
+    if target not in {"attn_norm_bias", "attn_geometry", "all_trainable"}:
+        raise ValueError(f"Invalid grad_norm_target: {target}")
+    top_k = int(getattr(args, "grad_norm_top_k", 20) or 20)
+
+    state: dict[str, Any] = {
+        "interval": interval,
+        "target": target,
+        "top_k": top_k,
+        "norms": {},
+        "hooks": [],
+    }
+
+    n = 0
+    for name, param in transformer.named_parameters():
+        if not param.requires_grad:
+            continue
+        if not _is_ewc_target_param(name, target):
+            continue
+
+        def _make_hook(pname: str):
+            def _hook(p: torch.nn.Parameter) -> None:
+                if p.grad is None:
+                    return
+                try:
+                    state["norms"][pname] = float(p.grad.detach().norm(2).item())
+                except Exception:
+                    pass
+            return _hook
+
+        try:
+            handle = param.register_post_accumulate_grad_hook(_make_hook(name))
+            state["hooks"].append(handle)
+            n += 1
+        except Exception as exc:
+            logger.warning("grad_norm: failed to hook %s: %s", name, exc)
+
+    if n == 0:
+        logger.warning("grad_norm: no matching parameters (target=%s); disabled.", target)
+        return None
+
+    logger.info(
+        "grad_norm: hooked %d tensors (target=%s, every=%d steps, top_k=%d).",
+        n, target, interval, top_k,
+    )
+    return state
+
+
+def _compute_grad_norm_logs(state: Optional[dict[str, Any]]) -> dict[str, float]:
+    if not state:
+        return {}
+    norms = state.get("norms") or {}
+    if not norms:
+        return {}
+    top_k = int(state.get("top_k", 20))
+    items = [(k, v) for k, v in norms.items() if v == v]
+    if not items:
+        return {}
+    values = [v for _, v in items]
+    logs: dict[str, float] = {
+        "grad_norm/mean": float(sum(values) / len(values)),
+        "grad_norm/max": float(max(values)),
+        "grad_norm/n_tensors": float(len(values)),
+    }
+    top_items = sorted(items, key=lambda x: x[1], reverse=True)[:top_k]
+    for name, v in top_items:
+        logs[f"grad_norm/layer/{_short_drift_label(name)}"] = float(v)
+    return logs
+
+
+def _move_batch_to_device(batch: Any, device: torch.device) -> Any:
+    if isinstance(batch, torch.Tensor):
+        return batch.to(device=device, non_blocking=True)
+    if isinstance(batch, dict):
+        return {k: _move_batch_to_device(v, device) for k, v in batch.items()}
+    if isinstance(batch, (list, tuple)):
+        seq = [_move_batch_to_device(v, device) for v in batch]
+        return type(batch)(seq) if isinstance(batch, tuple) else seq
+    return batch
+
+
+def _move_batch_to_cpu(batch: Any) -> Any:
+    if isinstance(batch, torch.Tensor):
+        return batch.detach().cpu().clone()
+    if isinstance(batch, dict):
+        return {k: _move_batch_to_cpu(v) for k, v in batch.items()}
+    if isinstance(batch, (list, tuple)):
+        seq = [_move_batch_to_cpu(v) for v in batch]
+        return type(batch)(seq) if isinstance(batch, tuple) else seq
+    return batch
+
+
+def _build_output_drift_state(
+    args: argparse.Namespace,
+    trainer: Any,
+    transformer: torch.nn.Module,
+    val_dataloader: Any,
+    noise_scheduler: Any,
+    accelerator: Any,
+) -> Optional[dict[str, Any]]:
+    interval = int(getattr(args, "log_output_drift_every", 0) or 0)
+    if interval <= 0:
+        return None
+    if val_dataloader is None:
+        logger.warning("output_drift: requires --validation_dataset_config; disabled.")
+        return None
+    k_batches = int(getattr(args, "output_drift_batches", 1) or 1)
+    fixed_t_value = float(getattr(args, "output_drift_timestep", 500.0) or 500.0)
+
+    probes: list[dict[str, Any]] = []
+    was_training = transformer.training
+    transformer.eval()
+    try:
+        with torch.no_grad():
+            for batch in val_dataloader:
+                if len(probes) >= k_batches:
+                    break
+                batch = _normalize_ltx2_batch_for_call_dit(batch)
+                latents = batch.get("latents")
+                latents_tensor = latents["latents"] if isinstance(latents, dict) else latents
+                if not isinstance(latents_tensor, torch.Tensor):
+                    continue
+                latents_tensor = trainer.scale_shift_latents(latents_tensor)
+                noise = torch.randn_like(latents_tensor)
+                bsz = int(noise.shape[0])
+                fixed_t = [fixed_t_value] * bsz
+                try:
+                    noisy_model_input, timesteps = trainer.get_noisy_model_input_and_timesteps(
+                        args, noise, latents_tensor, fixed_t,
+                        noise_scheduler, accelerator.device, trainer.dit_dtype,
+                    )
+                    model_pred, _ = trainer.call_dit(
+                        args, accelerator, transformer, latents_tensor, batch, noise,
+                        noisy_model_input, timesteps, trainer.dit_dtype,
+                    )
+                except Exception as exc:
+                    logger.warning("output_drift: probe build failed for a batch: %s", exc)
+                    continue
+
+                ref_pred_cpu: Optional[torch.Tensor] = None
+                if isinstance(model_pred, dict):
+                    v_pred = model_pred.get("video_pred")
+                    if isinstance(v_pred, torch.Tensor):
+                        ref_pred_cpu = v_pred.detach().cpu().float().clone()
+                elif isinstance(model_pred, torch.Tensor):
+                    ref_pred_cpu = model_pred.detach().cpu().float().clone()
+                if ref_pred_cpu is None:
+                    continue
+
+                probes.append({
+                    "batch_cpu": _move_batch_to_cpu(batch),
+                    "latents_cpu": latents_tensor.detach().cpu().clone(),
+                    "noise_cpu": noise.detach().cpu().clone(),
+                    "timesteps_override": list(fixed_t),
+                    "ref_pred_cpu": ref_pred_cpu,
+                })
+    finally:
+        if was_training:
+            transformer.train()
+
+    if not probes:
+        logger.warning("output_drift: failed to capture any probe batches; disabled.")
+        return None
+    logger.info(
+        "output_drift: captured %d probe batches at t=%.1f, every=%d steps.",
+        len(probes), fixed_t_value, interval,
+    )
+    return {"probes": probes, "interval": interval, "fixed_t": fixed_t_value}
+
+
+def _compute_output_drift_logs(
+    state: Optional[dict[str, Any]],
+    trainer: Any,
+    transformer: torch.nn.Module,
+    args: argparse.Namespace,
+    noise_scheduler: Any,
+    accelerator: Any,
+) -> dict[str, float]:
+    if not state:
+        return {}
+    probes = state.get("probes") or []
+    if not probes:
+        return {}
+    device = accelerator.device
+
+    was_training = transformer.training
+    transformer.eval()
+    mse_vals: list[float] = []
+    cos_vals: list[float] = []
+    try:
+        with torch.no_grad():
+            for probe in probes:
+                batch = _move_batch_to_device(probe["batch_cpu"], device)
+                latents_tensor = probe["latents_cpu"].to(device=device)
+                noise = probe["noise_cpu"].to(device=device)
+                try:
+                    noisy_model_input, timesteps = trainer.get_noisy_model_input_and_timesteps(
+                        args, noise, latents_tensor, probe["timesteps_override"],
+                        noise_scheduler, device, trainer.dit_dtype,
+                    )
+                    model_pred, _ = trainer.call_dit(
+                        args, accelerator, transformer, latents_tensor, batch, noise,
+                        noisy_model_input, timesteps, trainer.dit_dtype,
+                    )
+                except Exception as exc:
+                    logger.warning("output_drift: forward failed: %s", exc)
+                    continue
+
+                cur_pred: Optional[torch.Tensor] = None
+                if isinstance(model_pred, dict):
+                    v_pred = model_pred.get("video_pred")
+                    if isinstance(v_pred, torch.Tensor):
+                        cur_pred = v_pred.detach()
+                elif isinstance(model_pred, torch.Tensor):
+                    cur_pred = model_pred.detach()
+                if cur_pred is None:
+                    continue
+                cur_f = cur_pred.to(torch.float32)
+                ref = probe["ref_pred_cpu"].to(device=cur_f.device, dtype=torch.float32)
+                if cur_f.shape != ref.shape:
+                    continue
+                mse_vals.append(float((cur_f - ref).square().mean().item()))
+                cos = torch.nn.functional.cosine_similarity(
+                    cur_f.flatten().unsqueeze(0), ref.flatten().unsqueeze(0), dim=1, eps=1e-8,
+                ).item()
+                cos_vals.append(float(cos))
+    finally:
+        if was_training:
+            transformer.train()
+
+    if not mse_vals:
+        return {}
+    return {
+        "output_drift/mse": float(sum(mse_vals) / len(mse_vals)),
+        "output_drift/cosine": float(sum(cos_vals) / len(cos_vals)),
+        "output_drift/n_probes": float(len(mse_vals)),
+    }
+
+
+def _compute_weight_drift_logs(state: Optional[dict[str, Any]]) -> dict[str, float]:
+    if not state:
+        return {}
+    theta_ref = state["theta_ref"]
+    top_k = int(state.get("top_k", 20))
+    eps = 1e-9
+
+    per_layer: list[tuple[str, float, float]] = []
+    for name, param in state["params"]:
+        ref = theta_ref.get(name)
+        if ref is None:
+            continue
+        cur = param.detach().cpu().float()
+        if cur.shape != ref.shape:
+            continue
+        ref_norm = ref.norm(2).item()
+        cur_norm = cur.norm(2).item()
+        delta_norm = (cur - ref).norm(2).item()
+        frob_rel = delta_norm / max(ref_norm, eps)
+        dot = (cur.flatten() * ref.flatten()).sum().item()
+        cos_sim = dot / max(cur_norm * ref_norm, eps)
+        per_layer.append((name, frob_rel, cos_sim))
+
+    if not per_layer:
+        return {}
+
+    frob_values = [x[1] for x in per_layer]
+    cos_values = [x[2] for x in per_layer]
+    logs: dict[str, float] = {
+        "drift/frob_mean": float(sum(frob_values) / len(frob_values)),
+        "drift/frob_max": float(max(frob_values)),
+        "drift/cosine_mean": float(sum(cos_values) / len(cos_values)),
+        "drift/cosine_min": float(min(cos_values)),
+        "drift/n_tensors": float(len(per_layer)),
+    }
+    top_frob = sorted(per_layer, key=lambda x: x[1], reverse=True)[:top_k]
+    top_cos = sorted(per_layer, key=lambda x: x[2])[:top_k]
+    for name, frob_rel, _ in top_frob:
+        logs[f"drift/frob/{_short_drift_label(name)}"] = float(frob_rel)
+    for name, _, cos_sim in top_cos:
+        logs[f"drift/cosine/{_short_drift_label(name)}"] = float(cos_sim)
+    return logs
 
 
 def _fused_step_pending_grads(
@@ -1911,6 +2582,7 @@ def _build_full_ft_param_groups(
     non_block_lr_scale: float,
     attn_geometry_lr_scale: float,
     freeze_attn_geometry: bool,
+    exclude_param_prefixes: Optional[list[str]] = None,
 ) -> tuple[list[dict[str, Any]], list[list[str]], dict[str, Any]]:
     if base_lr <= 0:
         raise ValueError(f"learning_rate must be > 0 for full fine-tune, got {base_lr}")
@@ -1932,8 +2604,11 @@ def _build_full_ft_param_groups(
     frozen_attn_geometry_count = 0
     trainable_attn_geometry_count = 0
     trainable_by_block: dict[str, int] = {}
+    excluded_prefixes = tuple(exclude_param_prefixes or [])
 
     for name, param in transformer.named_parameters():
+        if any(name.startswith(prefix) for prefix in excluded_prefixes):
+            continue
         if not param.requires_grad:
             continue
 
@@ -2053,6 +2728,17 @@ def ltx2_finetune_setup_parser(parser: argparse.ArgumentParser) -> argparse.Argu
         help="Path to validation dataset config (TOML). If not set, validation is disabled.",
     )
     parser.add_argument(
+        "--validation_extra_configs",
+        type=str,
+        nargs="*",
+        default=None,
+        help=(
+            "Extra validation datasets for per-category / OOD tracking. Format: "
+            "category:path.toml (e.g. motion:val_motion.toml night:val_night.toml). "
+            "Each runs after the main validation pass and logs val/<category>/loss."
+        ),
+    )
+    parser.add_argument(
         "--motion_prior_cache_only",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -2075,6 +2761,16 @@ def ltx2_finetune_setup_parser(parser: argparse.ArgumentParser) -> argparse.Argu
         help="Number of validation batches to use (None = all)",
     )
     parser.add_argument(
+        "--validation_timesteps",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated list of fixed timesteps for multi-timestep validation "
+            "(e.g. '100,300,500,700,900'). When set, runs additional validation passes with "
+            "each timestep forced, logging val/t<T>/loss per t. Empty = disabled."
+        ),
+    )
+    parser.add_argument(
         "--motion_preservation",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -2095,6 +2791,24 @@ def ltx2_finetune_setup_parser(parser: argparse.ArgumentParser) -> argparse.Argu
         default="temporal",
         choices=["temporal", "full"],
         help="temporal: match frame-to-frame deltas. full: match full output tensors.",
+    )
+    parser.add_argument(
+        "--motion_preservation_loss_type",
+        type=str,
+        default="mse",
+        choices=["mse", "l2", "l1", "mae", "huber", "smooth_l1", "cosine", "kl_softmax"],
+        help=(
+            "Distance between student and teacher motion outputs. mse (default) = L2 on values; "
+            "cosine = 1 - cos on channel dim (directional, amplitude-invariant); "
+            "kl_softmax = KL over softmax(channel logits) with temperature. "
+            "Chunked CPU-teacher path supports mse only; other types fall through to standard path."
+        ),
+    )
+    parser.add_argument(
+        "--motion_preservation_kl_temperature",
+        type=float,
+        default=1.0,
+        help="Temperature for kl_softmax motion loss (lower = sharper distributions).",
     )
     parser.add_argument(
         "--motion_preservation_anchor_cache_size",
@@ -2388,6 +3102,81 @@ def ltx2_finetune_setup_parser(parser: argparse.ArgumentParser) -> argparse.Argu
         help="Force rebuild EWC cache even if cache file exists.",
     )
     parser.add_argument(
+        "--log_weight_drift_every",
+        type=int,
+        default=0,
+        help=(
+            "Log per-layer weight drift every N steps (0=disabled). Snapshots initial trainable "
+            "params on CPU at training start, then computes ||W - W_0||_F / ||W_0||_F and cosine "
+            "similarity per tensor."
+        ),
+    )
+    parser.add_argument(
+        "--weight_drift_target",
+        type=str,
+        default="all_trainable",
+        choices=["attn_norm_bias", "attn_geometry", "all_trainable"],
+        help=(
+            "Parameter subset for drift logging. Default 'all_trainable' tracks ALL trainable "
+            "tensors (general catastrophic forgetting detection). 'attn_geometry'/'attn_norm_bias' "
+            "narrow to motion-relevant subsets (cheaper, reuses EWC classification)."
+        ),
+    )
+    parser.add_argument(
+        "--weight_drift_top_k",
+        type=int,
+        default=20,
+        help="Log top-K highest-drifting tensors per metric (Frobenius/cosine) to avoid TB spam.",
+    )
+    parser.add_argument(
+        "--log_grad_norm_every",
+        type=int,
+        default=0,
+        help=(
+            "Log per-layer gradient L2 norm every N steps (0=disabled). Uses post-accumulate-grad "
+            "hooks so it works with both fused and non-fused backward paths."
+        ),
+    )
+    parser.add_argument(
+        "--grad_norm_target",
+        type=str,
+        default="all_trainable",
+        choices=["attn_norm_bias", "attn_geometry", "all_trainable"],
+        help=(
+            "Parameter subset for grad-norm logging. Default 'all_trainable' tracks ALL trainable "
+            "tensors (general catastrophic forgetting detection). Narrow targets reuse EWC classification."
+        ),
+    )
+    parser.add_argument(
+        "--grad_norm_top_k",
+        type=int,
+        default=20,
+        help="Log top-K highest grad-norm tensors to avoid TB spam.",
+    )
+    parser.add_argument(
+        "--log_output_drift_every",
+        type=int,
+        default=0,
+        help=(
+            "Log output drift vs initial snapshot every N steps (0=disabled). Captures first K "
+            "validation batches + their initial predictions at training start; re-runs forward "
+            "with identical noise/timestep every N steps and logs MSE + cosine similarity. "
+            "Direct behavioural indicator of catastrophic forgetting; requires --validation_dataset_config."
+        ),
+    )
+    parser.add_argument(
+        "--output_drift_batches",
+        type=int,
+        default=1,
+        help="Number of validation batches to use as output-drift probes (keep small; each costs CPU memory).",
+    )
+    parser.add_argument(
+        "--output_drift_timestep",
+        type=float,
+        default=500.0,
+        help="Fixed timestep used for probe batches (middle of schedule by default).",
+    )
+    parser.add_argument(
         "--freeze_early_blocks",
         type=int,
         default=0,
@@ -2429,6 +3218,31 @@ def ltx2_finetune_setup_parser(parser: argparse.ArgumentParser) -> argparse.Argu
         help="Freeze attention geometry params (to_q/to_k/q_norm/k_norm) during full fine-tuning.",
     )
     parser.add_argument(
+        "--ltx2_finetune_block_swap_mode",
+        type=str,
+        default="default",
+        choices=["default", "linear", "full"],
+        help=(
+            "Full fine-tuning only: override LTX-2 block swap mode. "
+            "'default' preserves the shared LTX2_SWAP_FULL_BLOCK environment/default behaviour, "
+            "'linear' keeps only Linear weights swapped to CPU, and 'full' moves full swapped blocks to CPU. "
+            "LoRA training does not use this flag."
+        ),
+    )
+    parser.add_argument(
+        "--ltx2_finetune_block_swap_mask",
+        type=str,
+        default="all",
+        help=(
+            "Full fine-tuning only: comma-separated block-swap mask. In full mode, only matching module groups "
+            "inside swapped blocks are offloaded. In linear mode, only matching Linear weights are offloaded. "
+            "Valid tokens: all, ff, attn, self_attn, cross_attn, av_cross_attn. "
+            "Example: 'ff' offloads only feed-forward modules/Linear weights inside swapped blocks. "
+            "LoRA training does not use this flag."
+        ),
+    )
+    _add_full_ft_text_encoder_args(parser)
+    parser.add_argument(
         "--save_comfy_format",
         action="store_true",
         default=False,
@@ -2445,6 +3259,34 @@ def ltx2_finetune_setup_parser(parser: argparse.ArgumentParser) -> argparse.Argu
         ),
     )
     return parser
+
+
+_LTX2_FT_SWAP_MASK_TOKENS = {"all", "ff", "attn", "self_attn", "cross_attn", "av_cross_attn"}
+_LTX2_FT_SWAP_MASK_ALIASES = {
+    "mlp": "ff",
+    "feedforward": "ff",
+    "feed_forward": "ff",
+    "self": "self_attn",
+    "cross": "cross_attn",
+    "av": "av_cross_attn",
+}
+
+
+def _normalize_ltx2_finetune_swap_mask(value: str | None) -> str:
+    raw_tokens = [token.strip().lower() for token in (value or "all").replace("+", ",").split(",")]
+    tokens = [_LTX2_FT_SWAP_MASK_ALIASES.get(token, token) for token in raw_tokens if token]
+    if not tokens:
+        return "all"
+
+    invalid = sorted(set(tokens) - _LTX2_FT_SWAP_MASK_TOKENS)
+    if invalid:
+        raise ValueError(
+            "--ltx2_finetune_block_swap_mask contains invalid token(s): "
+            f"{', '.join(invalid)}. Valid tokens: {', '.join(sorted(_LTX2_FT_SWAP_MASK_TOKENS))}"
+        )
+    if "all" in tokens:
+        return "all"
+    return ",".join(dict.fromkeys(tokens))
 
 
 def _prepare_state_dict_for_save(state_dict: dict, args) -> tuple[dict, dict[str, str] | None]:
@@ -2521,6 +3363,23 @@ def main() -> None:
     if getattr(args, "weighting_scheme", None) not in {None, "none"}:
         logger.warning("Ignoring --weighting_scheme for LTX-2; forcing weighting_scheme=none")
     args.weighting_scheme = "none"
+
+    os.environ["LTX2_FULL_FT_OFFLOAD_TRAINABLE_SWAP"] = "1"
+    ft_swap_mode = str(getattr(args, "ltx2_finetune_block_swap_mode", "default") or "default").lower()
+    raw_swap_mask = getattr(args, "ltx2_finetune_block_swap_mask", "all")
+    ft_swap_mask = _normalize_ltx2_finetune_swap_mask(raw_swap_mask)
+    os.environ["LTX2_FULL_FT_SWAP_MASK"] = ft_swap_mask
+    if ft_swap_mode == "linear":
+        os.environ["LTX2_SWAP_FULL_BLOCK"] = "0"
+        logger.info("Full fine-tune block swap override: Linear-weight swap mode (mask=%s)", ft_swap_mask)
+    elif ft_swap_mode == "full":
+        os.environ["LTX2_SWAP_FULL_BLOCK"] = "1"
+        logger.info("Full fine-tune block swap override: full-block swap mode (mask=%s)", ft_swap_mask)
+    elif ft_swap_mask != "all":
+        logger.info(
+            "Full fine-tune block swap mask set to %s; it applies when LTX2_SWAP_FULL_BLOCK resolves to either mode",
+            ft_swap_mask,
+        )
 
     if args.vae_dtype is None:
         args.vae_dtype = "bfloat16"
@@ -2732,6 +3591,7 @@ def main() -> None:
 
     # Validation dataset (optional)
     val_dataloader = None
+    val_dataset_group = None
     if args.validation_dataset_config is not None:
         logger.info("Loading validation dataset from: %s", args.validation_dataset_config)
         val_user_config = config_utils.load_user_config(args.validation_dataset_config)
@@ -2755,6 +3615,10 @@ def main() -> None:
             logger.info("Validation dataset loaded with %d items", val_dataset_group.num_train_items)
         else:
             logger.warning("Validation dataset has no items, validation disabled")
+
+    _run_full_ft_ic_preflight(args, train_dataset_group, split_name="train")
+    if val_dataset_group is not None:
+        _run_full_ft_ic_preflight(args, val_dataset_group, split_name="validation")
 
     if args.max_train_epochs is not None:
         args.max_train_steps = args.max_train_epochs * math.ceil(
@@ -2898,6 +3762,23 @@ def main() -> None:
         return
 
     # optimizer
+    text_encoder = None
+    if bool(getattr(args, "full_ft_train_text_encoder", False)):
+        logger.info("Preparing Gemma text encoder for full fine-tuning.")
+        trainer._build_text_encoder(args, accelerator)
+        if trainer._text_encoder is None:
+            raise RuntimeError("Failed to initialize text encoder despite --full_ft_train_text_encoder.")
+        text_encoder = trainer._text_encoder
+        text_encoder_model = getattr(text_encoder, "model", None)
+        if bool(getattr(text_encoder, "_has_fp8_model", False)) or bool(getattr(text_encoder_model, "is_loaded_in_8bit", False)) or bool(
+            getattr(text_encoder_model, "is_loaded_in_4bit", False)
+        ):
+            raise ValueError(
+                "--full_ft_train_text_encoder requires full-precision Gemma weights. "
+                "Do not use gemma fp8/8bit/4bit loading for text-encoder full fine-tuning."
+            )
+        text_encoder.train()
+
     params_to_optimize, param_names, ft_group_stats = _build_full_ft_param_groups(
         transformer,
         args.learning_rate,
@@ -2908,6 +3789,29 @@ def main() -> None:
         attn_geometry_lr_scale=float(getattr(args, "attn_geometry_lr_scale", 1.0) or 0.0),
         freeze_attn_geometry=bool(getattr(args, "freeze_attn_geometry", False)),
     )
+    if text_encoder is not None:
+        text_encoder_lr = getattr(args, "full_ft_text_encoder_lr", None)
+        if text_encoder_lr is None:
+            text_encoder_lr = float(args.learning_rate)
+        text_encoder_lr = float(text_encoder_lr)
+        if text_encoder_lr <= 0:
+            raise ValueError(f"full_ft_text_encoder_lr must be > 0 when provided, got {text_encoder_lr}")
+        text_encoder_params: list[torch.nn.Parameter] = []
+        text_encoder_param_names: list[str] = []
+        for name, param in text_encoder.named_parameters():
+            if not param.requires_grad:
+                continue
+            text_encoder_params.append(param)
+            text_encoder_param_names.append(f"text_encoder.{name}")
+        if not text_encoder_params:
+            raise ValueError("No trainable text-encoder parameters found; check --full_ft_train_text_encoder inputs.")
+        params_to_optimize.append({"params": text_encoder_params, "lr": text_encoder_lr})
+        param_names.append(text_encoder_param_names)
+        ft_group_stats = dict(ft_group_stats)
+        ft_group_stats["text_encoder_param_count"] = int(sum(int(p.numel()) for p in text_encoder_params))
+        ft_group_stats["text_encoder_trainable_tensor_count"] = int(len(text_encoder_param_names))
+        ft_group_stats["text_encoder_lr"] = text_encoder_lr
+
     self_flow_projector_param_count = 0
     if bool(getattr(args, "self_flow", False)):
         self_flow_args = list(getattr(args, "self_flow_args", None) or [])
@@ -2965,6 +3869,13 @@ def main() -> None:
             int(ft_group_stats.get("trainable_attn_geometry_count", 0)),
             int(ft_group_stats.get("frozen_attn_geometry_count", 0)),
         )
+    if text_encoder is not None:
+        logger.info(
+            "Full-FT text encoder params: trainable_tensors=%d trainable_params=%d lr=%.6g",
+            int(ft_group_stats.get("text_encoder_trainable_tensor_count", 0)),
+            int(ft_group_stats.get("text_encoder_param_count", 0)),
+            float(ft_group_stats.get("text_encoder_lr", 0.0)),
+        )
 
     optimizer_name, optimizer_args, optimizer, optimizer_train_fn, optimizer_eval_fn = trainer.get_optimizer(
         args, params_to_optimize
@@ -2978,8 +3889,13 @@ def main() -> None:
         transformer = accelerator.prepare(transformer, device_placement=[not blocks_to_swap > 0])
         accelerator.unwrap_model(transformer).move_to_device_except_swap_blocks(accelerator.device)
         accelerator.unwrap_model(transformer).prepare_block_swap_before_forward()
+        if text_encoder is not None:
+            text_encoder = accelerator.prepare(text_encoder)
     else:
-        transformer = accelerator.prepare(transformer)
+        if text_encoder is not None:
+            transformer, text_encoder = accelerator.prepare(transformer, text_encoder)
+        else:
+            transformer = accelerator.prepare(transformer)
 
     if args.compile:
         transformer = trainer.compile_transformer(args, transformer)
@@ -2994,12 +3910,52 @@ def main() -> None:
     if val_dataloader is not None:
         val_dataloader = accelerator.prepare(val_dataloader)
 
+    # Extra per-category validation dataloaders
+    extra_val_dataloaders: dict[str, Any] = {}
+    _extra_cfgs = getattr(args, "validation_extra_configs", None) or []
+    for entry in _extra_cfgs:
+        s = str(entry).strip()
+        if not s or ":" not in s:
+            logger.warning("validation_extra_configs: skipping malformed entry %r (expected category:path)", entry)
+            continue
+        _cat, _path = s.split(":", 1)
+        _cat = _cat.strip()
+        _path = _path.strip()
+        if not _cat or not _path:
+            continue
+        try:
+            _uc = config_utils.load_user_config(_path)
+            _bp = blueprint_generator.generate(_uc, args, architecture=trainer.architecture)
+            _dg = config_utils.generate_dataset_group_by_blueprint(
+                _bp.dataset_group, training=False,
+                num_timestep_buckets=args.num_timestep_buckets,
+                shared_epoch=current_epoch,
+            )
+            if _dg.num_train_items <= 0:
+                logger.warning("validation_extra_configs[%s]: no items, skipping.", _cat)
+                continue
+            _col = collator_class(current_epoch, _dg if args.max_data_loader_n_workers == 0 else None)
+            _dl = torch.utils.data.DataLoader(
+                _dg, batch_size=1, shuffle=False, collate_fn=_col,
+                num_workers=n_workers, persistent_workers=False,
+            )
+            _dl = accelerator.prepare(_dl)
+            extra_val_dataloaders[_cat] = _dl
+            logger.info("validation_extra[%s]: %d items from %s", _cat, _dg.num_train_items, _path)
+        except Exception as exc:
+            logger.warning("validation_extra_configs[%s]: failed to load %s: %s", _cat, _path, exc)
+
     trainer.resume_from_local_or_hf_if_specified(accelerator, args)
 
     # Initialize EMA after model is prepared
     ema_model = None
     ema_state_path = os.path.join(args.output_dir, "ema_state.pt") if args.output_dir else None
     if args.use_ema:
+        if text_encoder is not None:
+            logger.warning(
+                "EMA is currently tracking transformer parameters only; text-encoder parameters will not be EMA-averaged "
+                "even when --full_ft_train_text_encoder is enabled."
+            )
         ema_device = torch.device("cpu") if args.ema_cpu_offload else None
         logger.info(
             "Initializing EMA with decay=%.6f, update_after_step=%d, update_every=%d, device=%s",
@@ -3108,7 +4064,7 @@ def main() -> None:
         "ss_timestep_sampling": args.timestep_sampling,
         "ss_sigmoid_scale": args.sigmoid_scale,
         "ss_discrete_flow_shift": args.discrete_flow_shift,
-        "ss_ltx_version": getattr(args, "ltx_version", "2.0"),
+        "ss_ltx_version": getattr(args, "ltx_version", "2.3"),
         "ss_shifted_logit_mode": getattr(args, "shifted_logit_mode", None),
         "ss_shifted_logit_eps": getattr(args, "shifted_logit_eps", 1e-3),
         "ss_shifted_logit_uniform_prob": getattr(args, "shifted_logit_uniform_prob", 0.1),
@@ -3194,8 +4150,18 @@ def main() -> None:
         "ss_non_block_lr_scale": getattr(args, "non_block_lr_scale", 1.0),
         "ss_attn_geometry_lr_scale": getattr(args, "attn_geometry_lr_scale", 1.0),
         "ss_freeze_attn_geometry": bool(getattr(args, "freeze_attn_geometry", False)),
+        "ss_full_ft_train_text_encoder": bool(getattr(args, "full_ft_train_text_encoder", False)),
+        "ss_full_ft_text_encoder_lr": getattr(args, "full_ft_text_encoder_lr", None),
+        "ss_full_ft_text_encoder_fallback": bool(getattr(args, "full_ft_text_encoder_fallback", False)),
+        "ss_full_ft_text_encoder_param_count": ft_group_stats.get("text_encoder_param_count", 0),
         "ss_full_ft_lr_group_scales": ft_group_stats.get("lr_scales"),
-        "ss_full_ft_frozen_blocks_applied": ft_group_stats.get("frozen_blocks"),    }
+        "ss_full_ft_frozen_blocks_applied": ft_group_stats.get("frozen_blocks"),
+        "ss_full_ft_text_encoder_lr_group": ft_group_stats.get("text_encoder_lr", None),
+    }
+
+    checkpoint_extra_metadata = {k: str(v) for k, v in trainer.get_checkpoint_metadata(args).items()}
+    if checkpoint_extra_metadata:
+        metadata.update(checkpoint_extra_metadata)
 
     datasets_metadata = []
     for dataset in train_dataset_group.datasets:
@@ -3298,10 +4264,20 @@ def main() -> None:
         )
         metadata_to_save.update(sai_metadata)
 
+        if checkpoint_extra_metadata:
+            metadata_to_save.update(checkpoint_extra_metadata)
+
         save_model_ref = getattr(unwrapped_model, "_orig_mod", None) or unwrapped_model
         # Build a zero-copy dict referencing live parameters (avoids state_dict() VRAM duplication)
         state_dict = {name: param.data for name, param in save_model_ref.named_parameters()}
         state_dict.update({name: buf for name, buf in save_model_ref.named_buffers()})
+        if text_encoder is not None:
+            unwrapped_text_encoder = accelerator.unwrap_model(text_encoder)
+            text_encoder_ref = getattr(unwrapped_text_encoder, "_orig_mod", None) or unwrapped_text_encoder
+            for name, param in text_encoder_ref.named_parameters():
+                state_dict[f"text_encoder.{name}"] = param.data
+            for name, buf in text_encoder_ref.named_buffers():
+                state_dict[f"text_encoder.{name}"] = buf
         state_dict, extra_meta = _prepare_state_dict_for_save(state_dict, args)
         if extra_meta:
             metadata_to_save.update(extra_meta)
@@ -3442,9 +4418,32 @@ def main() -> None:
         if ema_model is not None:
             original_params = ema_model.apply_to(accelerator.unwrap_model(transformer))
 
+        self_flow_network = getattr(trainer, "_self_flow_network", None)
+        self_flow_network_was_training = (
+            bool(getattr(self_flow_network, "training", False))
+            if self_flow_network is not None
+            else None
+        )
+        force_self_flow_capture = bool(
+            getattr(args, "self_flow", False)
+            and getattr(trainer, "_self_flow", None) is not None
+            and self_flow_network is not None
+            and not bool(getattr(self_flow_network, "training", False))
+        )
+        if force_self_flow_capture:
+            # Self-Flow capture is gated on the top-level module's `.training` flag.
+            # Flip only that flag so validation can populate cached teacher/student
+            # features without globally switching submodules back to train mode.
+            self_flow_network.training = True
+
         val_losses = []
         val_video_losses = []
         val_audio_losses = []
+        val_self_flow_losses = []
+        val_ewc_losses = []
+        val_motion_pres_losses = []
+        val_motion_attn_pres_losses = []
+        val_motion_total_losses = []
         num_batches = 0
         max_batches = args.num_validation_batches
 
@@ -3517,27 +4516,305 @@ def main() -> None:
                             loss_type=_val_loss_type, huber_delta=_val_huber_delta,
                         )
                         val_audio_losses.append(audio_loss.item())
-                        val_losses.append(video_loss.item() * args.video_loss_weight + audio_loss.item() * args.audio_loss_weight)
+                        video_weight = float(out.get("video_loss_weight", 1.0))
+                        audio_weight = float(out.get("audio_loss_weight", 1.0))
+                        loss = video_loss * video_weight + audio_loss * audio_weight
                     else:
-                        val_losses.append(video_loss.item())
+                        video_weight = float(out.get("video_loss_weight", 1.0))
+                        loss = video_loss * video_weight
                 else:
                     _val_loss_type = getattr(args, "loss_type", "mse")
                     _val_huber_delta = float(getattr(args, "huber_delta", 1.0))
                     if isinstance(target, torch.Tensor):
                         model_pred = model_pred.to(device=target.device, dtype=trainer.dit_dtype)
-                    if _val_loss_type in ("mae", "l1"):
-                        loss = torch.nn.functional.l1_loss(model_pred, target)
-                    elif _val_loss_type in ("huber", "smooth_l1"):
-                        loss = torch.nn.functional.smooth_l1_loss(model_pred, target, beta=_val_huber_delta)
                     else:
-                        loss = torch.nn.functional.mse_loss(model_pred, target)
-                    val_losses.append(loss.item())
+                        model_pred = model_pred.to(dtype=trainer.dit_dtype)
+                    if _val_loss_type in ("mae", "l1"):
+                        loss = torch.nn.functional.l1_loss(model_pred, target, reduction="none")
+                    elif _val_loss_type in ("huber", "smooth_l1"):
+                        loss = torch.nn.functional.smooth_l1_loss(
+                            model_pred, target, reduction="none", beta=_val_huber_delta
+                        )
+                    else:
+                        loss = torch.nn.functional.mse_loss(model_pred, target, reduction="none")
+                    if weighting is not None:
+                        w = weighting
+                        if isinstance(w, torch.Tensor) and w.dim() != loss.dim():
+                            while w.dim() > loss.dim() and w.shape[-1] == 1:
+                                w = w.squeeze(-1)
+                        loss = loss * w
+                    loss = loss.mean()
+
+                self_flow_loss = None
+                if bool(getattr(args, "self_flow", False)):
+                    try:
+                        if getattr(trainer, "_self_flow", None) is not None:
+                            trainer._self_flow.on_step(step)
+                        self_flow_loss, _self_flow_metrics = trainer.compute_self_flow_addition(
+                            args,
+                            accelerator,
+                            transformer,
+                            transformer,
+                            trainer.dit_dtype,
+                        )
+                        if self_flow_loss is not None:
+                            loss = loss + self_flow_loss
+                            val_self_flow_losses.append(float(self_flow_loss.detach().item()))
+                    except Exception as e:
+                        if getattr(trainer, "_self_flow", None) is not None:
+                            trainer._self_flow.cleanup_step()
+                        logger.warning(
+                            "Self-Flow validation loss computation failed at step=%s batch=%s: %s",
+                            step,
+                            num_batches,
+                            e,
+                        )
+
+                ewc_loss = None
+                if ewc_state is not None and float(getattr(args, "ewc_lambda", 0.0) or 0.0) > 0.0:
+                    ewc_penalty_raw, _ewc_used_tensors, _ewc_skipped_tensors = _compute_ewc_penalty(
+                        ewc_state,
+                        dtype=trainer.dit_dtype,
+                        target_device=loss.device if isinstance(loss, torch.Tensor) else None,
+                    )
+                    if ewc_penalty_raw is not None:
+                        ewc_loss = ewc_penalty_raw * float(getattr(args, "ewc_lambda", 0.0))
+                        loss = loss + ewc_loss
+                        val_ewc_losses.append(float(ewc_loss.detach().item()))
+
+                motion_pres_loss = None
+                attn_pres_loss = None
+                motion_total_loss = None
+                motion_preservation_prob = getattr(args, "motion_preservation_probability", None)
+                if motion_preservation_prob is None:
+                    should_apply_motion_replay = (
+                        (step + num_batches + 1) % int(args.motion_preservation_interval) == 0
+                    )
+                else:
+                    should_apply_motion_replay = random.random() < float(motion_preservation_prob)
+
+                if (
+                    args.motion_preservation
+                    and motion_anchor_cache
+                    and should_apply_motion_replay
+                ):
+                    anchor = random.choice(motion_anchor_cache)
+                    anchor_latents = _move_to_device(
+                        anchor["anchor_latents"], accelerator.device, dtype=trainer.dit_dtype
+                    )
+                    anchor_noise = _move_to_device(
+                        anchor["anchor_noise"], accelerator.device, dtype=trainer.dit_dtype
+                    )
+
+                    sigma_idx: Optional[int] = None
+                    anchor_sigmas = anchor.get("anchor_sigmas") or []
+                    teacher_video_preds = anchor.get("teacher_video_preds")
+                    if (
+                        isinstance(anchor_sigmas, list)
+                        and isinstance(teacher_video_preds, list)
+                        and len(anchor_sigmas) > 0
+                        and len(anchor_sigmas) == len(teacher_video_preds)
+                    ):
+                        sigma_idx = _sample_motion_sigma_index(anchor_sigmas, args)
+                        sigma_value = float(anchor_sigmas[sigma_idx])
+                        anchor_noisy_input, anchor_model_timesteps = _build_noisy_input_for_sigma(
+                            anchor_latents,
+                            anchor_noise,
+                            sigma_value,
+                        )
+                        teacher_video_pred = teacher_video_preds[sigma_idx]
+                    else:
+                        anchor_noisy_input = _move_to_device(
+                            anchor["anchor_noisy_input"], accelerator.device, dtype=trainer.dit_dtype
+                        )
+                        anchor_model_timesteps = _move_to_device(
+                            anchor["anchor_model_timesteps"], accelerator.device
+                        )
+                        teacher_video_pred = anchor.get("teacher_video_pred")
+
+                    anchor_batch = _move_to_device(
+                        anchor["anchor_batch"], accelerator.device, dtype=trainer.dit_dtype
+                    )
+                    if isinstance(teacher_video_pred, torch.Tensor):
+                        original_first_frame_p = float(
+                            getattr(args, "ltx2_first_frame_conditioning_p", 0.0)
+                        )
+                        try:
+                            setattr(args, "ltx2_first_frame_conditioning_p", 0.0)
+                            if args.motion_attention_preservation and motion_attention_modules:
+                                attn_recorder = _AttentionMapRecorder(
+                                    motion_attention_modules,
+                                    max_queries=int(
+                                        getattr(args, "motion_attention_preservation_queries", 32)
+                                        or 32
+                                    ),
+                                    max_keys=int(
+                                        getattr(args, "motion_attention_preservation_keys", 64)
+                                        or 64
+                                    ),
+                                    capture_grad=False,
+                                    keep_heads=bool(
+                                        getattr(args, "motion_attention_preservation_per_head", False)
+                                    ),
+                                )
+                                attn_recorder.__enter__()
+                                try:
+                                    motion_pred, _ = trainer.call_dit(
+                                        args,
+                                        accelerator,
+                                        transformer,
+                                        anchor_latents,
+                                        anchor_batch,
+                                        anchor_noise,
+                                        anchor_noisy_input,
+                                        anchor_model_timesteps,
+                                        trainer.dit_dtype,
+                                    )
+                                    student_attn_maps = attn_recorder.collect_maps()
+                                finally:
+                                    attn_recorder.__exit__(None, None, None)
+                            else:
+                                student_attn_maps = {}
+                                motion_pred, _ = trainer.call_dit(
+                                    args,
+                                    accelerator,
+                                    transformer,
+                                    anchor_latents,
+                                    anchor_batch,
+                                    anchor_noise,
+                                    anchor_noisy_input,
+                                    anchor_model_timesteps,
+                                    trainer.dit_dtype,
+                                )
+                        finally:
+                            setattr(args, "ltx2_first_frame_conditioning_p", original_first_frame_p)
+
+                        if (
+                            isinstance(motion_pred, dict)
+                            and not motion_pred.get("_skip_step")
+                        ):
+                            student_video_pred = motion_pred["video_pred"]
+                            motion_pres_loss_raw = _compute_motion_preservation_loss(
+                                args,
+                                student_video_pred,
+                                teacher_video_pred,
+                                motion_pred.get("video_loss_mask"),
+                                dtype=trainer.dit_dtype,
+                            )
+                            motion_multiplier = float(args.motion_preservation_multiplier)
+                            motion_warmup = int(
+                                getattr(args, "motion_preservation_warmup_steps", 0) or 0
+                            )
+                            if motion_warmup > 0 and step < motion_warmup:
+                                motion_multiplier = motion_multiplier * (step / motion_warmup)
+                            motion_pres_loss = motion_pres_loss_raw * motion_multiplier
+                            motion_total_loss = motion_pres_loss
+
+                            teacher_attn_maps = anchor.get("teacher_attention_maps")
+                            teacher_attn_maps_multi = anchor.get("teacher_attention_maps_multi")
+                            if isinstance(teacher_attn_maps_multi, list) and teacher_attn_maps_multi:
+                                if sigma_idx is not None and 0 <= sigma_idx < len(teacher_attn_maps_multi):
+                                    mapped = teacher_attn_maps_multi[sigma_idx]
+                                    if isinstance(mapped, dict):
+                                        teacher_attn_maps = mapped
+                                elif sigma_idx is None and len(teacher_attn_maps_multi) == 1:
+                                    mapped = teacher_attn_maps_multi[0]
+                                    if isinstance(mapped, dict):
+                                        teacher_attn_maps = mapped
+
+                            if (
+                                args.motion_attention_preservation
+                                and isinstance(teacher_attn_maps, dict)
+                                and student_attn_maps
+                            ):
+                                attn_temperature = float(
+                                    getattr(args, "motion_attention_preservation_temperature", 1.0)
+                                    or 1.0
+                                )
+                                symmetric_kl = bool(
+                                    getattr(args, "motion_attention_preservation_symmetric_kl", False)
+                                )
+                                per_block_losses: list[torch.Tensor] = []
+                                for module_name, student_map in student_attn_maps.items():
+                                    teacher_map = teacher_attn_maps.get(module_name)
+                                    if not isinstance(teacher_map, torch.Tensor):
+                                        continue
+                                    if teacher_map.shape != student_map.shape:
+                                        logger.warning(
+                                            "Motion preservation validation: attention map shape mismatch for module %s (student=%s teacher=%s), skipping",
+                                            module_name,
+                                            student_map.shape,
+                                            teacher_map.shape,
+                                        )
+                                        continue
+
+                                    student_dist = student_map.to(torch.float32)
+                                    teacher_dist = teacher_map.to(
+                                        device=student_dist.device,
+                                        dtype=torch.float32,
+                                        non_blocking=True,
+                                    )
+                                    if attn_temperature != 1.0:
+                                        inv_temp = 1.0 / max(1e-6, attn_temperature)
+                                        student_dist = student_dist.clamp_min(1e-8).pow(inv_temp)
+                                        teacher_dist = teacher_dist.clamp_min(1e-8).pow(inv_temp)
+                                    student_dist = student_dist.clamp_min(1e-6)
+                                    teacher_dist = teacher_dist.clamp_min(1e-6)
+                                    student_dist = student_dist / student_dist.sum(
+                                        dim=-1, keepdim=True
+                                    ).clamp_min(1e-6)
+                                    teacher_dist = teacher_dist / teacher_dist.sum(
+                                        dim=-1, keepdim=True
+                                    ).clamp_min(1e-6)
+
+                                    if getattr(args, "motion_attention_preservation_loss", "kl") == "kl":
+                                        kl_t2s = torch.nn.functional.kl_div(
+                                            student_dist.log(),
+                                            teacher_dist,
+                                            reduction="batchmean",
+                                        )
+                                        if symmetric_kl:
+                                            kl_s2t = torch.nn.functional.kl_div(
+                                                teacher_dist.log(),
+                                                student_dist,
+                                                reduction="batchmean",
+                                            )
+                                            block_loss = 0.5 * (kl_t2s + kl_s2t)
+                                        else:
+                                            block_loss = kl_t2s
+                                    else:
+                                        block_loss = torch.nn.functional.mse_loss(
+                                            student_dist, teacher_dist
+                                        )
+                                    per_block_losses.append(block_loss)
+
+                                if per_block_losses:
+                                    attn_pres_loss_raw = torch.stack(per_block_losses).mean()
+                                    attn_pres_loss = (
+                                        attn_pres_loss_raw
+                                        * float(
+                                            getattr(args, "motion_attention_preservation_weight", 0.0)
+                                        )
+                                    )
+                                    motion_total_loss = motion_total_loss + attn_pres_loss
+
+                if motion_pres_loss is not None:
+                    val_motion_pres_losses.append(float(motion_pres_loss.detach().item()))
+                if attn_pres_loss is not None:
+                    val_motion_attn_pres_losses.append(float(attn_pres_loss.detach().item()))
+                if motion_total_loss is not None:
+                    loss = loss + motion_total_loss
+                    val_motion_total_losses.append(float(motion_total_loss.detach().item()))
+
+                val_losses.append(float(loss.detach().item()))
 
                 num_batches += 1
 
         # Restore original weights if EMA was applied
         if original_params is not None:
             ema_model.restore(accelerator.unwrap_model(transformer), original_params)
+        if force_self_flow_capture and self_flow_network is not None:
+            self_flow_network.training = bool(self_flow_network_was_training)
 
         transformer.train()
 
@@ -3549,6 +4826,227 @@ def main() -> None:
             val_metrics["val_video_loss"] = sum(val_video_losses) / len(val_video_losses)
         if val_audio_losses:
             val_metrics["val_audio_loss"] = sum(val_audio_losses) / len(val_audio_losses)
+        if val_self_flow_losses:
+            val_metrics["val_self_flow_loss"] = sum(val_self_flow_losses) / len(val_self_flow_losses)
+        if val_ewc_losses:
+            val_metrics["val_ewc_loss"] = sum(val_ewc_losses) / len(val_ewc_losses)
+        if val_motion_pres_losses:
+            val_metrics["val_motion_pres_loss"] = sum(val_motion_pres_losses) / len(val_motion_pres_losses)
+        if val_motion_attn_pres_losses:
+            val_metrics["val_motion_attn_pres_loss"] = sum(val_motion_attn_pres_losses) / len(val_motion_attn_pres_losses)
+        if val_motion_total_losses:
+            val_metrics["val_motion_total_loss"] = sum(val_motion_total_losses) / len(val_motion_total_losses)
+
+        # Multi-timestep validation passes: run additional dataloader sweeps with fixed t.
+        mt_raw = getattr(args, "validation_timesteps", None)
+        mt_list: list[float] = []
+        if mt_raw:
+            for tok in str(mt_raw).split(","):
+                tok = tok.strip()
+                if not tok:
+                    continue
+                try:
+                    mt_list.append(float(tok))
+                except ValueError:
+                    logger.warning("validation_timesteps: skipping non-numeric token %r", tok)
+
+        if mt_list:
+            transformer.eval()
+            if ema_model is not None and original_params is None:
+                original_params = ema_model.apply_to(accelerator.unwrap_model(transformer))
+            with torch.no_grad():
+                for fixed_t in mt_list:
+                    mt_losses: list[float] = []
+                    mt_video_losses: list[float] = []
+                    mt_audio_losses: list[float] = []
+                    mt_batches = 0
+                    for batch in val_dataloader:
+                        if max_batches is not None and mt_batches >= max_batches:
+                            break
+                        batch = _normalize_ltx2_batch_for_call_dit(batch)
+                        latents = batch["latents"]
+                        latents_tensor = latents["latents"] if isinstance(latents, dict) else latents
+                        latents_tensor = trainer.scale_shift_latents(latents_tensor)
+                        noise = torch.randn_like(latents_tensor)
+                        bsz = int(noise.shape[0])
+                        override_t = [float(fixed_t)] * bsz
+                        try:
+                            noisy_model_input, timesteps = trainer.get_noisy_model_input_and_timesteps(
+                                args, noise, latents_tensor, override_t,
+                                noise_scheduler, accelerator.device, trainer.dit_dtype,
+                            )
+                        except Exception as exc:
+                            logger.warning("val/t%s: get_noisy failed: %s", fixed_t, exc)
+                            break
+                        weighting = compute_loss_weighting_for_sd3(
+                            args.weighting_scheme, noise_scheduler, timesteps,
+                            accelerator.device, trainer.dit_dtype,
+                        )
+                        model_pred, target = trainer.call_dit(
+                            args, accelerator, transformer, latents_tensor, batch, noise,
+                            noisy_model_input, timesteps, trainer.dit_dtype,
+                        )
+                        _val_lt = getattr(args, "loss_type", "mse")
+                        _val_hd = float(getattr(args, "huber_delta", 1.0))
+                        if isinstance(model_pred, dict):
+                            if model_pred.get("_skip_step"):
+                                continue
+                            v_pred = model_pred["video_pred"]
+                            v_tgt = model_pred["video_target"]
+                            v_mask = model_pred.get("video_loss_mask")
+                            v_loss = _masked_mse(
+                                v_pred, v_tgt, v_mask,
+                                weighting=weighting, dtype=trainer.dit_dtype,
+                                loss_type=_val_lt, huber_delta=_val_hd,
+                            )
+                            mt_video_losses.append(v_loss.item())
+                            a_pred = model_pred.get("audio_pred")
+                            a_tgt = model_pred.get("audio_target")
+                            if a_pred is not None and a_tgt is not None:
+                                a_mask = model_pred.get("audio_loss_mask")
+                                a_loss = _masked_mse(
+                                    a_pred, a_tgt, a_mask,
+                                    weighting=weighting, dtype=trainer.dit_dtype,
+                                    loss_type=_val_lt, huber_delta=_val_hd,
+                                )
+                                mt_audio_losses.append(a_loss.item())
+                                v_w = float(model_pred.get("video_loss_weight", 1.0))
+                                a_w = float(model_pred.get("audio_loss_weight", 1.0))
+                                loss_mt = v_loss * v_w + a_loss * a_w
+                            else:
+                                v_w = float(model_pred.get("video_loss_weight", 1.0))
+                                loss_mt = v_loss * v_w
+                        else:
+                            if isinstance(target, torch.Tensor):
+                                model_pred = model_pred.to(device=target.device, dtype=trainer.dit_dtype)
+                            else:
+                                model_pred = model_pred.to(dtype=trainer.dit_dtype)
+                            if _val_lt in ("mae", "l1"):
+                                per_el = torch.nn.functional.l1_loss(model_pred, target, reduction="none")
+                            elif _val_lt in ("huber", "smooth_l1"):
+                                per_el = torch.nn.functional.smooth_l1_loss(
+                                    model_pred, target, reduction="none", beta=_val_hd,
+                                )
+                            else:
+                                per_el = torch.nn.functional.mse_loss(model_pred, target, reduction="none")
+                            if weighting is not None:
+                                w = weighting
+                                if isinstance(w, torch.Tensor) and w.dim() != per_el.dim():
+                                    while w.dim() > per_el.dim() and w.shape[-1] == 1:
+                                        w = w.squeeze(-1)
+                                per_el = per_el * w
+                            loss_mt = per_el.mean()
+                        mt_losses.append(loss_mt.item())
+                        mt_batches += 1
+                    t_key = f"t{int(round(fixed_t))}"
+                    if mt_losses:
+                        val_metrics[f"val/{t_key}/loss"] = sum(mt_losses) / len(mt_losses)
+                    if mt_video_losses:
+                        val_metrics[f"val/{t_key}/video_loss"] = sum(mt_video_losses) / len(mt_video_losses)
+                    if mt_audio_losses:
+                        val_metrics[f"val/{t_key}/audio_loss"] = sum(mt_audio_losses) / len(mt_audio_losses)
+            if original_params is not None:
+                ema_model.restore(accelerator.unwrap_model(transformer), original_params)
+                original_params = None
+            transformer.train()
+
+        # Per-category OOD validation: basic loss only, no EWC/motion/self_flow.
+        if extra_val_dataloaders:
+            transformer.eval()
+            if ema_model is not None and original_params is None:
+                original_params = ema_model.apply_to(accelerator.unwrap_model(transformer))
+            with torch.no_grad():
+                for cat_name, cat_loader in extra_val_dataloaders.items():
+                    c_losses: list[float] = []
+                    c_video: list[float] = []
+                    c_audio: list[float] = []
+                    c_batches = 0
+                    for batch in cat_loader:
+                        if max_batches is not None and c_batches >= max_batches:
+                            break
+                        batch = _normalize_ltx2_batch_for_call_dit(batch)
+                        latents = batch["latents"]
+                        latents_tensor = latents["latents"] if isinstance(latents, dict) else latents
+                        latents_tensor = trainer.scale_shift_latents(latents_tensor)
+                        noise = torch.randn_like(latents_tensor)
+                        try:
+                            noisy_model_input, timesteps = trainer.get_noisy_model_input_and_timesteps(
+                                args, noise, latents_tensor, batch.get("timesteps"),
+                                noise_scheduler, accelerator.device, trainer.dit_dtype,
+                            )
+                        except Exception as exc:
+                            logger.warning("val/%s: get_noisy failed: %s", cat_name, exc)
+                            break
+                        weighting = compute_loss_weighting_for_sd3(
+                            args.weighting_scheme, noise_scheduler, timesteps,
+                            accelerator.device, trainer.dit_dtype,
+                        )
+                        model_pred, target = trainer.call_dit(
+                            args, accelerator, transformer, latents_tensor, batch, noise,
+                            noisy_model_input, timesteps, trainer.dit_dtype,
+                        )
+                        _val_lt = getattr(args, "loss_type", "mse")
+                        _val_hd = float(getattr(args, "huber_delta", 1.0))
+                        if isinstance(model_pred, dict):
+                            if model_pred.get("_skip_step"):
+                                continue
+                            v_pred = model_pred["video_pred"]
+                            v_tgt = model_pred["video_target"]
+                            v_mask = model_pred.get("video_loss_mask")
+                            v_loss = _masked_mse(
+                                v_pred, v_tgt, v_mask,
+                                weighting=weighting, dtype=trainer.dit_dtype,
+                                loss_type=_val_lt, huber_delta=_val_hd,
+                            )
+                            c_video.append(v_loss.item())
+                            a_pred = model_pred.get("audio_pred")
+                            a_tgt = model_pred.get("audio_target")
+                            if a_pred is not None and a_tgt is not None:
+                                a_mask = model_pred.get("audio_loss_mask")
+                                a_loss = _masked_mse(
+                                    a_pred, a_tgt, a_mask,
+                                    weighting=weighting, dtype=trainer.dit_dtype,
+                                    loss_type=_val_lt, huber_delta=_val_hd,
+                                )
+                                c_audio.append(a_loss.item())
+                                v_w = float(model_pred.get("video_loss_weight", 1.0))
+                                a_w = float(model_pred.get("audio_loss_weight", 1.0))
+                                loss_c = v_loss * v_w + a_loss * a_w
+                            else:
+                                v_w = float(model_pred.get("video_loss_weight", 1.0))
+                                loss_c = v_loss * v_w
+                        else:
+                            if isinstance(target, torch.Tensor):
+                                model_pred = model_pred.to(device=target.device, dtype=trainer.dit_dtype)
+                            else:
+                                model_pred = model_pred.to(dtype=trainer.dit_dtype)
+                            if _val_lt in ("mae", "l1"):
+                                per_el = torch.nn.functional.l1_loss(model_pred, target, reduction="none")
+                            elif _val_lt in ("huber", "smooth_l1"):
+                                per_el = torch.nn.functional.smooth_l1_loss(
+                                    model_pred, target, reduction="none", beta=_val_hd,
+                                )
+                            else:
+                                per_el = torch.nn.functional.mse_loss(model_pred, target, reduction="none")
+                            if weighting is not None:
+                                w = weighting
+                                if isinstance(w, torch.Tensor) and w.dim() != per_el.dim():
+                                    while w.dim() > per_el.dim() and w.shape[-1] == 1:
+                                        w = w.squeeze(-1)
+                                per_el = per_el * w
+                            loss_c = per_el.mean()
+                        c_losses.append(loss_c.item())
+                        c_batches += 1
+                    if c_losses:
+                        val_metrics[f"val/{cat_name}/loss"] = sum(c_losses) / len(c_losses)
+                    if c_video:
+                        val_metrics[f"val/{cat_name}/video_loss"] = sum(c_video) / len(c_video)
+                    if c_audio:
+                        val_metrics[f"val/{cat_name}/audio_loss"] = sum(c_audio) / len(c_audio)
+            if original_params is not None:
+                ema_model.restore(accelerator.unwrap_model(transformer), original_params)
+                original_params = None
+            transformer.train()
 
         if val_metrics:
             accelerator.print(f"Validation metrics: {val_metrics}")
@@ -3749,6 +5247,14 @@ def main() -> None:
                 _save_ewc_cache(ewc_cache_path, ewc_signature, ewc_state)
         if ewc_state is None:
             logger.warning("EWC requested but statistics were not built; disabling EWC loss.")
+
+    weight_drift_state: Optional[dict[str, Any]] = _build_weight_drift_state(args, transformer)
+    grad_norm_state: Optional[dict[str, Any]] = _register_grad_norm_hooks(
+        args, accelerator.unwrap_model(transformer)
+    )
+    output_drift_state: Optional[dict[str, Any]] = _build_output_drift_state(
+        args, trainer, transformer, val_dataloader, noise_scheduler, accelerator,
+    )
 
     for epoch in range(epoch_to_start, num_train_epochs):
         current_epoch.value = epoch + 1
@@ -4239,6 +5745,20 @@ def main() -> None:
                     has_effective_reg = True
                 if has_effective_reg:
                     logs["motion/effective_regularization"] = effective_reg_value
+                if weight_drift_state is not None:
+                    _interval = int(weight_drift_state.get("interval", 0) or 0)
+                    if _interval > 0 and global_step > 0 and global_step % _interval == 0:
+                        logs.update(_compute_weight_drift_logs(weight_drift_state))
+                if grad_norm_state is not None:
+                    _interval = int(grad_norm_state.get("interval", 0) or 0)
+                    if _interval > 0 and global_step > 0 and global_step % _interval == 0:
+                        logs.update(_compute_grad_norm_logs(grad_norm_state))
+                if output_drift_state is not None:
+                    _interval = int(output_drift_state.get("interval", 0) or 0)
+                    if _interval > 0 and global_step > 0 and global_step % _interval == 0:
+                        logs.update(_compute_output_drift_logs(
+                            output_drift_state, trainer, transformer, args, noise_scheduler, accelerator,
+                        ))
                 progress_logs: dict[str, Any] = {
                     "loss": logs.get("loss"),
                     "lr": logs.get("lr"),
@@ -4365,6 +5885,8 @@ def main() -> None:
         if ema_model is not None:
             save_ema_model(final_ckpt_name, global_step, num_train_epochs)
     save_self_flow_state()
+    if text_encoder is not None:
+        trainer._cleanup_text_encoder(accelerator)
 
     if accelerator.is_main_process:
         accelerator.end_training()
