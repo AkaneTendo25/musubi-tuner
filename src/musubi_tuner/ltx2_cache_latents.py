@@ -8,6 +8,7 @@ Uses the standard musubi-tuner dataset config so cached files match the trainer.
 from __future__ import annotations
 
 import argparse
+import math
 import os
 from contextlib import nullcontext
 from typing import List, Optional, Sequence, cast
@@ -94,6 +95,23 @@ def encode_and_save_batch(vae, batch: List[ItemInfo], tiling_config=None) -> Non
     if contents.ndim == 4:
         contents = contents.unsqueeze(1)
 
+    loss_masks = []
+    has_loss_masks = any(getattr(item, "loss_mask_content", None) is not None for item in batch)
+    if has_loss_masks:
+        for item in batch:
+            mask = getattr(item, "loss_mask_content", None)
+            if mask is None:
+                mask = np.ones((contents.shape[1], contents.shape[2], contents.shape[3]), dtype=np.float32)
+            mask_tensor = torch.from_numpy(np.asarray(mask, dtype=np.float32))
+            if mask_tensor.ndim == 2:
+                mask_tensor = mask_tensor.unsqueeze(0)
+            if mask_tensor.shape[0] < contents.shape[1]:
+                pad = contents.shape[1] - mask_tensor.shape[0]
+                mask_tensor = torch.cat([mask_tensor, mask_tensor[-1:].expand(pad, -1, -1)], dim=0)
+            elif mask_tensor.shape[0] > contents.shape[1]:
+                mask_tensor = mask_tensor[: contents.shape[1]]
+            loss_masks.append(mask_tensor.clamp(0.0, 1.0))
+
     contents = contents.permute(0, 4, 1, 2, 3).contiguous()
     vae_param = next(vae.parameters())
     device = vae_param.device
@@ -107,6 +125,12 @@ def encode_and_save_batch(vae, batch: List[ItemInfo], tiling_config=None) -> Non
         pad = 8 - remainder
         last = contents[:, :, -1:, :, :].expand(-1, -1, pad, -1, -1)
         contents = torch.cat([contents, last], dim=2)
+        if has_loss_masks:
+            padded_masks = []
+            for mask_tensor in loss_masks:
+                mask_pad = mask_tensor[-1:].expand(pad, -1, -1)
+                padded_masks.append(torch.cat([mask_tensor, mask_pad], dim=0))
+            loss_masks = padded_masks
 
     height, width = contents.shape[-2:]
     if height < 8 or width < 8:
@@ -121,7 +145,19 @@ def encode_and_save_batch(vae, batch: List[ItemInfo], tiling_config=None) -> Non
         latents = latents.to(device=device, dtype=vae_dtype)
 
     for idx, item in enumerate(batch):
-        save_latent_cache_ltx2(item, latents[idx])
+        extra_tensors = None
+        if has_loss_masks:
+            latent_mask = torch.nn.functional.interpolate(
+                loss_masks[idx].view(1, 1, loss_masks[idx].shape[0], loss_masks[idx].shape[1], loss_masks[idx].shape[2]).to(
+                    device=latents.device,
+                    dtype=torch.float32,
+                ),
+                size=tuple(latents[idx].shape[1:]),
+                mode="trilinear",
+                align_corners=False,
+            )[0].clamp(0.0, 1.0)
+            extra_tensors = {"video_loss_mask": latent_mask.to(dtype=torch.float32)}
+        save_latent_cache_ltx2(item, latents[idx], extra_tensors=extra_tensors)
 
 
 def _adjust_ltx2_frame_count(frame_count: int) -> int:
@@ -475,6 +511,18 @@ def encode_and_save_audio_cache(
     time_steps = int(latents.shape[1])
     mel_bins = int(latents.shape[2])
     channels = int(latents.shape[0])
+    audio_loss_mask = None
+    loss_mask_intervals = getattr(item_info, "audio_loss_mask_intervals", None)
+    if loss_mask_intervals is not None:
+        audio_loss_mask = torch.zeros((time_steps,), dtype=torch.float32)
+        latents_per_second = float(sample_rate) / float(getattr(encoder, "mel_hop_length", 160)) / float(LATENT_DOWNSAMPLE_FACTOR)
+        for start_s, end_s in loss_mask_intervals:
+            start_idx = max(0, min(time_steps, int(math.floor(float(start_s) * latents_per_second))))
+            end_idx = max(start_idx, min(time_steps, int(math.ceil(float(end_s) * latents_per_second))))
+            if end_idx > start_idx:
+                audio_loss_mask[start_idx:end_idx] = 1.0
+        if effective_steps < time_steps:
+            audio_loss_mask[int(effective_steps) :] = 0.0
 
     dtype_str = (
         cache_latents.dtype_to_str(dtype)
@@ -491,6 +539,8 @@ def encode_and_save_audio_cache(
         f"audio_latents_{time_steps}x{mel_bins}x{channels}_{dtype_str}": latents,
         f"audio_lengths_{int_dtype_str}": audio_lengths,
     }
+    if audio_loss_mask is not None:
+        sd["audio_loss_mask"] = audio_loss_mask
 
     metadata = {
         "architecture": "ltx2_v1",

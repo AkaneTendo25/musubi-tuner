@@ -70,6 +70,7 @@ Caching scripts (`ltx2_cache_latents.py`, `ltx2_cache_text_encoder_outputs.py`) 
 - [Dataset Configuration](#dataset-configuration)
   - [Video Dataset Options](#video-dataset-options)
   - [Audio Dataset Options](#audio-dataset-options)
+  - [Masked Loss Datasets](#masked-loss-datasets)
   - [Example TOML](#example-toml)
   - [Frame Rate (FPS) Handling](#frame-rate-fps-handling)
 - [Validation Datasets](#validation-datasets)
@@ -184,8 +185,8 @@ python ltx2_cache_latents.py ^
 
 | File Pattern | Contents |
 |--------------|----------|
-| `*_ltx2.safetensors` | Video latents: `latents_{F}x{H}x{W}_{dtype}`. In audio-only mode, this file also stores `ltx2_virtual_num_frames_int32` (used for timestep sampling) and `ltx2_virtual_height_int32`/`ltx2_virtual_width_int32` (only used when `--audio_only_sequence_resolution 0`). |
-| `*_ltx2_audio.safetensors` | Audio latents: `audio_latents_{T}x{mel_bins}x{channels}_{dtype}`, `audio_lengths_int32` |
+| `*_ltx2.safetensors` | Video latents: `latents_{F}x{H}x{W}_{dtype}`. If masked loss is configured, also stores `video_loss_mask`. In audio-only mode, this file also stores `ltx2_virtual_num_frames_int32` (used for timestep sampling) and `ltx2_virtual_height_int32`/`ltx2_virtual_width_int32` (only used when `--audio_only_sequence_resolution 0`). |
+| `*_ltx2_audio.safetensors` | Audio latents: `audio_latents_{T}x{mel_bins}x{channels}_{dtype}`, `audio_lengths_int32`. If audio masked loss is configured, also stores `audio_loss_mask`. |
 
 ### Memory Optimization for Caching
 If you encounter Out-Of-Memory (OOM) errors during caching (especially with higher resolutions like 1080p), you have two options:
@@ -1845,6 +1846,10 @@ other non-IC image workflows can continue using `control_directory`.
 | `reference_audio_directory` | string | — | Reference audio files for audio-reference IC-LoRA (matched by filename stem) |
 | `reference_audio_cache_directory` | string | — | Output directory for cached reference audio latents |
 | `separate_audio_buckets` | bool | false | Keep audio/non-audio items in separate batches |
+| `loss_mask_directory` | string | — | Optional stem-matched image/video masks for masked loss |
+| `default_loss_mask_path` | string | — | Optional fallback image/video mask |
+| `loss_mask_use_alpha` | bool | false | Image datasets only: use target image alpha as the mask when no mask directory is set |
+| `loss_mask_invert` | bool | false | Invert image/video masks before caching |
 
 ### Audio Dataset Options
 
@@ -1859,6 +1864,40 @@ Audio-only datasets use `audio_directory` instead of `video_directory`.
 | `batch_size` | int | 1 | Batch size |
 | `num_repeats` | int | 1 | Dataset repetitions |
 | `cache_directory` | string | — | Latent cache output directory |
+| `loss_mask_directory` | string | — | Optional stem-matched JSON/TXT/CSV interval masks |
+| `default_loss_mask_path` | string | — | Optional fallback interval mask file |
+
+### Masked Loss Datasets
+
+Masked loss is configured in the dataset TOML and applied automatically during latent/audio caching. Training then reads `video_loss_mask` and `audio_loss_mask` from the cache and multiplies them with any masks already required by the selected training mode. This means masked loss works with standard video/image training, first-frame conditioning, v2v / IC-LoRA variants, audio-only training, and AV training. In IC-LoRA modes, masks are applied to target loss only; reference and conditioning tokens remain excluded from loss where the IC mode already excludes them.
+
+If no mask options are set, the cache output and training behavior are unchanged.
+
+Image/video masks:
+- White means full loss, black means no loss, and grayscale values are soft weights.
+- `loss_mask_directory` matches masks by source filename stem.
+- JSONL datasets may use per-item `loss_mask_path` / `image_loss_mask_path` / `video_loss_mask_path`.
+- A single image mask can be used for all frames, or a video/image-sequence mask can be used for frame-varying masks.
+
+Audio masks:
+- Use intervals in seconds via JSONL `loss_mask_intervals` / `audio_loss_mask_intervals`.
+- Or set `loss_mask_path` / `audio_loss_mask_path` to a JSON/TXT/CSV interval file.
+- Directory datasets can use `loss_mask_directory` with stem-matched interval files.
+
+Examples:
+
+```toml
+[[datasets]]
+video_directory = "videos"
+cache_directory = "cache"
+caption_extension = ".txt"
+target_frames = [33]
+loss_mask_directory = "video_masks"
+```
+
+```json
+{"audio_path":"audio/line.wav","caption":"voice","loss_mask_intervals":[[0.25, 1.8], [2.4, 3.1]]}
+```
 
 ### Example TOML
 

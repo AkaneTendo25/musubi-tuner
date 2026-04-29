@@ -1024,12 +1024,17 @@ def _build_temporal_pair_mask(video_loss_mask: Optional[torch.Tensor]) -> Option
     if video_loss_mask.dim() == 2:
         if video_loss_mask.shape[1] < 2:
             return None
-        pair = video_loss_mask[:, 1:] & video_loss_mask[:, :-1]
+        if video_loss_mask.dtype == torch.bool:
+            pair = video_loss_mask[:, 1:] & video_loss_mask[:, :-1]
+        else:
+            pair = video_loss_mask[:, 1:] * video_loss_mask[:, :-1]
         return pair.unsqueeze(1).unsqueeze(-1).unsqueeze(-1)
     if video_loss_mask.dim() == 5:
         if video_loss_mask.shape[2] < 2:
             return None
-        return video_loss_mask[:, :, 1:, :, :] & video_loss_mask[:, :, :-1, :, :]
+        if video_loss_mask.dtype == torch.bool:
+            return video_loss_mask[:, :, 1:, :, :] & video_loss_mask[:, :, :-1, :, :]
+        return video_loss_mask[:, :, 1:, :, :] * video_loss_mask[:, :, :-1, :, :]
     return None
 
 
@@ -1041,11 +1046,20 @@ def _build_temporal_triplet_mask(video_loss_mask: Optional[torch.Tensor]) -> Opt
     if video_loss_mask.dim() == 2:
         if video_loss_mask.shape[1] < 3:
             return None
-        triple = video_loss_mask[:, 2:] & video_loss_mask[:, 1:-1] & video_loss_mask[:, :-2]
+        if video_loss_mask.dtype == torch.bool:
+            triple = video_loss_mask[:, 2:] & video_loss_mask[:, 1:-1] & video_loss_mask[:, :-2]
+        else:
+            triple = video_loss_mask[:, 2:] * video_loss_mask[:, 1:-1] * video_loss_mask[:, :-2]
         return triple.unsqueeze(1).unsqueeze(-1).unsqueeze(-1)
     if video_loss_mask.dim() == 5:
         if video_loss_mask.shape[2] < 3:
             return None
+        if video_loss_mask.dtype != torch.bool:
+            return (
+                video_loss_mask[:, :, 2:, :, :]
+                * video_loss_mask[:, :, 1:-1, :, :]
+                * video_loss_mask[:, :, :-2, :, :]
+            )
         return (
             video_loss_mask[:, :, 2:, :, :]
             & video_loss_mask[:, :, 1:-1, :, :]

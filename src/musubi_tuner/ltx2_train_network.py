@@ -123,6 +123,140 @@ def _merge_reference_tensors(refs: List[torch.Tensor], concat_dim: int) -> Optio
     return torch.cat(refs, dim=concat_dim)
 
 
+def _coerce_video_loss_mask(
+    mask: Any,
+    *,
+    latents: torch.Tensor,
+    device: torch.device,
+    dtype: torch.dtype,
+    as_tokens: bool,
+) -> Optional[torch.Tensor]:
+    payload = _extract_tensor_payload(mask)
+    mask_tensor = payload if payload is not None else (mask if isinstance(mask, torch.Tensor) else None)
+    if mask_tensor is None:
+        return None
+
+    bsz, _channels, frames, height, width = latents.shape
+    mask = mask_tensor.to(device=device, dtype=torch.float32)
+    if mask.dim() == 2:
+        if mask.shape[0] != bsz:
+            raise ValueError(f"video_loss_mask batch mismatch: mask={tuple(mask.shape)} latents={tuple(latents.shape)}")
+        if as_tokens:
+            if mask.shape[1] != frames:
+                mask = F.interpolate(mask.unsqueeze(1), size=frames, mode="linear", align_corners=False).squeeze(1)
+            return mask.view(bsz, frames, 1, 1).expand(bsz, frames, height, width).reshape(bsz, -1).to(dtype=dtype)
+        if mask.shape[1] != frames:
+            mask = F.interpolate(mask.unsqueeze(1), size=frames, mode="linear", align_corners=False).squeeze(1)
+        return mask.view(bsz, 1, frames, 1, 1).to(dtype=dtype)
+
+    if mask.dim() == 4:
+        mask = mask.unsqueeze(1)
+    if mask.dim() != 5:
+        raise ValueError(f"video_loss_mask must be [B,F], [B,F,H,W], or [B,1,F,H,W], got {tuple(mask.shape)}")
+    if mask.shape[0] != bsz:
+        raise ValueError(f"video_loss_mask batch mismatch: mask={tuple(mask.shape)} latents={tuple(latents.shape)}")
+    if mask.shape[1] != 1:
+        mask = mask.mean(dim=1, keepdim=True)
+    if tuple(mask.shape[2:]) != (frames, height, width):
+        mask = F.interpolate(mask, size=(frames, height, width), mode="trilinear", align_corners=False)
+    mask = mask.clamp(0.0, 1.0)
+    if as_tokens:
+        return mask.flatten(2).squeeze(1).to(dtype=dtype)
+    return mask.to(dtype=dtype)
+
+
+def _coerce_audio_loss_mask(
+    mask: Any,
+    *,
+    batch_size: int,
+    seq_len: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> Optional[torch.Tensor]:
+    payload = _extract_tensor_payload(mask)
+    mask_tensor = payload if payload is not None else (mask if isinstance(mask, torch.Tensor) else None)
+    if mask_tensor is None:
+        return None
+    mask = mask_tensor.to(device=device, dtype=torch.float32)
+    if mask.dim() == 1:
+        mask = mask.view(1, -1)
+    if mask.dim() != 2:
+        raise ValueError(f"audio_loss_mask must be [B,T] or [T], got {tuple(mask.shape)}")
+    if mask.shape[0] == 1 and batch_size != 1:
+        mask = mask.expand(batch_size, -1)
+    if mask.shape[0] != batch_size:
+        raise ValueError(f"audio_loss_mask batch mismatch: mask={tuple(mask.shape)} batch={batch_size}")
+    if mask.shape[1] < seq_len:
+        pad = torch.ones((batch_size, seq_len - int(mask.shape[1])), device=device, dtype=mask.dtype)
+        mask = torch.cat([mask, pad], dim=1)
+    elif mask.shape[1] > seq_len:
+        mask = mask[:, :seq_len]
+    return mask.clamp(0.0, 1.0).to(dtype=dtype)
+
+
+def _combine_loss_masks(existing: Optional[torch.Tensor], extra: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+    if extra is None:
+        return existing
+    if existing is None:
+        return extra
+    extra = extra.to(device=existing.device)
+    if existing.dim() == 2 and extra.dim() == 5:
+        existing = existing.view(existing.shape[0], 1, existing.shape[1], 1, 1)
+    elif existing.dim() == 5 and extra.dim() == 2:
+        extra = extra.view(extra.shape[0], 1, extra.shape[1], 1, 1)
+    elif existing.dim() == 2 and extra.dim() == 3 and extra.shape[-1] == 1:
+        extra = extra.squeeze(-1)
+    return existing.to(dtype=extra.dtype) * extra
+
+
+def _compose_target_audio_loss_mask(
+    target_audio_loss_mask: Optional[torch.Tensor],
+    cached_audio_loss_mask: Optional[torch.Tensor],
+    *,
+    batch_size: int,
+    target_seq_len: int,
+    device: torch.device,
+) -> torch.Tensor:
+    if target_audio_loss_mask is None or int(target_audio_loss_mask.shape[1]) != target_seq_len:
+        target_audio_loss_mask = torch.ones((batch_size, target_seq_len), device=device, dtype=torch.bool)
+    return _combine_loss_masks(target_audio_loss_mask, cached_audio_loss_mask)
+
+
+def _compose_audio_ref_only_ic_loss_mask(
+    target_audio_loss_mask: Optional[torch.Tensor],
+    cached_audio_loss_mask: Optional[torch.Tensor],
+    *,
+    batch_size: int,
+    target_seq_len: int,
+    ref_seq_len: int,
+    device: torch.device,
+    audio_lengths: Any = None,
+) -> torch.Tensor:
+    if target_audio_loss_mask is None:
+        target_audio_loss_mask = torch.ones((batch_size, target_seq_len), device=device, dtype=torch.bool)
+    if isinstance(audio_lengths, dict):
+        audio_lengths = audio_lengths.get("lengths")
+    if isinstance(audio_lengths, torch.Tensor):
+        if audio_lengths.dim() == 0:
+            audio_lengths = audio_lengths.view(1)
+        if audio_lengths.numel() == 1 and batch_size != 1:
+            audio_lengths = audio_lengths.expand(batch_size)
+        if audio_lengths.shape[0] != batch_size:
+            raise ValueError(
+                f"Batch size mismatch: audio_latents batch={batch_size} vs audio_lengths batch={audio_lengths.shape[0]}"
+            )
+        audio_lengths = audio_lengths.to(device=device, dtype=torch.int64).clamp(min=0, max=target_seq_len)
+        t = torch.arange(target_seq_len, device=device).view(1, -1)
+        target_audio_loss_mask = t < audio_lengths.view(-1, 1)
+    target_audio_loss_mask = _combine_loss_masks(target_audio_loss_mask, cached_audio_loss_mask)
+    ref_audio_loss_mask = torch.zeros(
+        (batch_size, ref_seq_len),
+        device=device,
+        dtype=target_audio_loss_mask.dtype,
+    )
+    return torch.cat([ref_audio_loss_mask, target_audio_loss_mask], dim=1)
+
+
 def _resolve_batch_captions(batch: Dict[str, Any]) -> Optional[list[str]]:
     captions = batch.get("captions")
     if captions is None:
@@ -2139,6 +2273,8 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             md["ss_ic_lora_strategy"] = self._ic_lora_strategy
         if self._ic_lora_strategy == "v2v":
             md["ss_v2v_training"] = True
+        elif self._ic_lora_strategy == "self_ref_v2v":
+            md["ss_self_ref_v2v_training"] = True
         elif self._ic_lora_strategy == "audio_ref_only_ic":
             md["ss_audio_ref_only_ic_training"] = True
         elif self._ic_lora_strategy == "av_ic":
@@ -2736,6 +2872,24 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
         noise = noise.to(device=accelerator.device, dtype=network_dtype)
         noisy_model_input = noisy_model_input.to(device=accelerator.device, dtype=network_dtype)
 
+        def _cached_video_loss_mask(*, as_tokens: bool) -> Optional[torch.Tensor]:
+            return _coerce_video_loss_mask(
+                batch.get("video_loss_mask"),
+                latents=latents,
+                device=accelerator.device,
+                dtype=network_dtype,
+                as_tokens=as_tokens,
+            )
+
+        def _cached_audio_loss_mask(seq_len: int, batch_size: int) -> Optional[torch.Tensor]:
+            return _coerce_audio_loss_mask(
+                batch.get("audio_loss_mask"),
+                batch_size=batch_size,
+                seq_len=seq_len,
+                device=accelerator.device,
+                dtype=network_dtype,
+            )
+
         # Check for NaN in latents
         if torch.isnan(latents).any():
             raise ValueError("NaN detected in latents!")
@@ -2904,6 +3058,10 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                 audio_lengths = audio_lengths.clamp(min=0, max=audio_seq_len)
                 t = torch.arange(audio_seq_len, device=accelerator.device).view(1, -1)
                 audio_loss_mask = t < audio_lengths.view(-1, 1)
+            audio_loss_mask = _combine_loss_masks(
+                audio_loss_mask,
+                _cached_audio_loss_mask(audio_seq_len, int(audio_latents.shape[0])),
+            )
 
             video_latents = torch.zeros(
                 (latents.shape[0], latents.shape[1], 1, 1, 1),
@@ -3179,6 +3337,7 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             target_pred_tokens = pred_tokens[:, ref_seq_len:, :]
             target_velocity = patchifier.patchify(noise - latents)
             target_loss_mask = ~target_conditioning_mask
+            target_loss_mask = _combine_loss_masks(target_loss_mask, _cached_video_loss_mask(as_tokens=True))
 
             out_v2v: Dict[str, Any] = {
                 "video_pred": target_pred_tokens,
@@ -3416,8 +3575,17 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             video_velocity = video_patchifier.patchify(noise - latents)
             audio_velocity = audio_patchifier.patchify(av_ic_audio_target_raw)
 
-            video_loss_mask = ~tgt_video_cond_mask  # True where loss should apply
-            audio_loss_mask = torch.ones((bsz, tgt_audio_seq_len), device=accelerator.device, dtype=torch.bool)
+            video_loss_mask = _combine_loss_masks(
+                ~tgt_video_cond_mask,
+                _cached_video_loss_mask(as_tokens=True),
+            )
+            audio_loss_mask = _compose_target_audio_loss_mask(
+                None,
+                _cached_audio_loss_mask(tgt_audio_seq_len, bsz),
+                batch_size=bsz,
+                target_seq_len=tgt_audio_seq_len,
+                device=accelerator.device,
+            )
 
             out_av_ic: Dict[str, Any] = {
                 "video_pred": target_video_pred,
@@ -3640,36 +3808,15 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                 zero_ref_target = torch.zeros_like(ref_audio_latents)
                 audio_target = torch.cat([zero_ref_target, audio_target], dim=2)
 
-                target_audio_loss_mask = audio_loss_mask
-                if target_audio_loss_mask is None:
-                    target_audio_loss_mask = torch.ones(
-                        (audio_latents.shape[0], tgt_seq_len),
-                        device=accelerator.device,
-                        dtype=torch.bool,
-                    )
-                if getattr(args, "use_audio_length_mask", False):
-                    audio_lengths = batch.get("audio_lengths")
-                    if isinstance(audio_lengths, dict):
-                        audio_lengths = audio_lengths.get("lengths")
-                    if isinstance(audio_lengths, torch.Tensor):
-                        if audio_lengths.dim() == 0:
-                            audio_lengths = audio_lengths.view(1)
-                        if audio_lengths.numel() == 1 and audio_latents.shape[0] != 1:
-                            audio_lengths = audio_lengths.expand(audio_latents.shape[0])
-                        if audio_lengths.shape[0] != audio_latents.shape[0]:
-                            raise ValueError(
-                                f"Batch size mismatch: audio_latents batch={audio_latents.shape[0]} vs audio_lengths batch={audio_lengths.shape[0]}"
-                            )
-                        audio_lengths = audio_lengths.to(device=accelerator.device, dtype=torch.int64)
-                        audio_lengths = audio_lengths.clamp(min=0, max=tgt_seq_len)
-                        t = torch.arange(tgt_seq_len, device=accelerator.device).view(1, -1)
-                        target_audio_loss_mask = t < audio_lengths.view(-1, 1)
-                ref_audio_loss_mask = torch.zeros(
-                    (audio_latents.shape[0], ref_audio_seq_len),
+                audio_loss_mask = _compose_audio_ref_only_ic_loss_mask(
+                    audio_loss_mask,
+                    _cached_audio_loss_mask(tgt_seq_len, int(audio_latents.shape[0])),
+                    batch_size=int(audio_latents.shape[0]),
+                    target_seq_len=tgt_seq_len,
+                    ref_seq_len=ref_audio_seq_len,
                     device=accelerator.device,
-                    dtype=torch.bool,
+                    audio_lengths=batch.get("audio_lengths") if getattr(args, "use_audio_length_mask", False) else None,
                 )
-                audio_loss_mask = torch.cat([ref_audio_loss_mask, target_audio_loss_mask], dim=1)
 
         if self._ltx_mode == "av" and not audio_enabled_for_batch:
             text_embeds = select_video_text_embeds_for_av_no_audio(
@@ -3904,14 +4051,18 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             video_velocity = video_patchifier.patchify(noise - latents)
             audio_velocity = audio_patchifier.patchify(audio_target)
 
-            target_audio_loss_mask = audio_loss_mask
-            if target_audio_loss_mask is None or int(target_audio_loss_mask.shape[1]) != tgt_audio_seq_len:
-                target_audio_loss_mask = torch.ones((bsz, tgt_audio_seq_len), device=accelerator.device, dtype=torch.bool)
+            target_audio_loss_mask = _compose_target_audio_loss_mask(
+                audio_loss_mask,
+                _cached_audio_loss_mask(tgt_audio_seq_len, bsz),
+                batch_size=bsz,
+                target_seq_len=tgt_audio_seq_len,
+                device=accelerator.device,
+            )
 
             out_video_ref_av: Dict[str, Any] = {
                 "video_pred": target_video_pred,
                 "video_target": video_velocity,
-                "video_loss_mask": ~tgt_video_cond_mask,
+                "video_loss_mask": _combine_loss_masks(~tgt_video_cond_mask, _cached_video_loss_mask(as_tokens=True)),
                 "video_loss_weight": _resolve_loss_weight("video_loss_weight", "video_loss_weight"),
                 "audio_pred": target_audio_pred,
                 "audio_target": audio_velocity,
@@ -3947,6 +4098,7 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                 video_loss_mask = torch.ones((bsz, frames), device=accelerator.device, dtype=torch.bool)
                 if frames > 0:
                     video_loss_mask[video_conditioning_enabled, 0] = False
+        video_loss_mask = _combine_loss_masks(video_loss_mask, _cached_video_loss_mask(as_tokens=False))
 
         resolved_transformer_options = transformer_options if video_conditioning_mask_tokens is not None else {"patches_replace": {}}
         if (
@@ -4201,6 +4353,10 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                     audio_lengths = audio_lengths.clamp(min=0, max=audio_seq_len)
                     t = torch.arange(audio_seq_len, device=accelerator.device).view(1, -1)
                     audio_loss_mask = t < audio_lengths.view(-1, 1)
+            audio_loss_mask = _combine_loss_masks(
+                audio_loss_mask,
+                _cached_audio_loss_mask(audio_seq_len, int(audio_target.shape[0])),
+            )
             out.update(
                 {
                     "audio_pred": audio_pred,

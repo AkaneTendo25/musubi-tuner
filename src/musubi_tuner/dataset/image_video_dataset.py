@@ -67,6 +67,8 @@ VIDEO_EXTENSIONS = [
     ".MPG",
     ".MPEG",
 ]  # some of them are not tested
+MASK_EXTENSIONS = IMAGE_EXTENSIONS + VIDEO_EXTENSIONS
+MASK_METADATA_EXTENSIONS = [".json", ".JSON", ".txt", ".TXT", ".csv", ".CSV"]
 
 # Architecture short names cannot contain underscore
 ARCHITECTURE_HUNYUAN_VIDEO = "hv"
@@ -152,6 +154,144 @@ def glob_videos(directory, base="*"):
     video_paths = list(set(video_paths))  # remove duplicates
     video_paths.sort()
     return video_paths
+
+
+def find_stem_matched_file(directory: Optional[str], stem: str, extensions: Optional[Sequence[str]] = None) -> Optional[str]:
+    if directory is None:
+        return None
+    extensions = extensions or MASK_EXTENSIONS
+    for ext in extensions:
+        candidate = os.path.join(directory, stem + ext)
+        if os.path.exists(candidate):
+            return candidate
+    candidate_dir = os.path.join(directory, stem)
+    if os.path.isdir(candidate_dir):
+        return candidate_dir
+    return None
+
+
+def load_loss_mask_image(mask_path: str, *, invert: bool = False) -> Image.Image:
+    mask = Image.open(mask_path)
+    if "A" in mask.getbands():
+        mask = mask.getchannel("A")
+    else:
+        mask = mask.convert("L")
+    if invert:
+        from PIL import ImageOps
+
+        mask = ImageOps.invert(mask)
+    return mask
+
+
+def alpha_channel_to_loss_mask(image: Image.Image, *, invert: bool = False) -> Optional[Image.Image]:
+    if "A" not in image.getbands():
+        return None
+    mask = image.getchannel("A")
+    if invert:
+        from PIL import ImageOps
+
+        mask = ImageOps.invert(mask)
+    return mask
+
+
+def loss_mask_to_float_array(mask: Union[Image.Image, np.ndarray], bucket_reso: tuple[int, int]) -> np.ndarray:
+    if isinstance(mask, Image.Image) and mask.mode != "L":
+        mask = mask.convert("L")
+    arr = resize_image_to_bucket(mask, bucket_reso)
+    if arr.ndim == 3:
+        arr = arr[..., 0]
+    return arr.astype(np.float32) / 255.0
+
+
+def load_loss_mask_frames(
+    mask_path: str,
+    *,
+    bucket_reso: tuple[int, int],
+    frame_count: int,
+    start_frame: Optional[int] = None,
+    end_frame: Optional[int] = None,
+    source_fps: Optional[float] = None,
+    target_fps: Optional[float] = None,
+    invert: bool = False,
+) -> np.ndarray:
+    if frame_count <= 0:
+        raise ValueError(f"frame_count must be positive for loss mask loading, got {frame_count}")
+
+    if os.path.isfile(mask_path) and os.path.splitext(mask_path)[1] in IMAGE_EXTENSIONS:
+        mask = load_loss_mask_image(mask_path, invert=invert)
+        mask_frames = [loss_mask_to_float_array(mask, bucket_reso)] * frame_count
+    else:
+        frames = load_video(
+            mask_path,
+            start_frame=start_frame,
+            end_frame=end_frame,
+            bucket_reso=bucket_reso,
+            source_fps=source_fps,
+            target_fps=target_fps,
+        )
+        if not frames:
+            raise ValueError(f"No frames decoded from loss mask path: {mask_path}")
+
+        mask_frames = []
+        for frame in frames:
+            if isinstance(frame, np.ndarray):
+                image = Image.fromarray(frame)
+            else:
+                image = frame
+            if image.mode != "L":
+                image = image.convert("L")
+            if invert:
+                from PIL import ImageOps
+
+                image = ImageOps.invert(image)
+            mask_frames.append(loss_mask_to_float_array(image, bucket_reso))
+
+        if len(mask_frames) < frame_count:
+            mask_frames.extend([mask_frames[-1]] * (frame_count - len(mask_frames)))
+        elif len(mask_frames) > frame_count:
+            mask_frames = mask_frames[:frame_count]
+
+    return np.stack(mask_frames, axis=0).astype(np.float32)
+
+
+def load_audio_loss_mask_intervals(mask_path: str) -> Optional[list[tuple[float, float]]]:
+    ext = os.path.splitext(mask_path)[1].lower()
+    if ext == ".json":
+        with open(mask_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            data = data.get("loss_mask_intervals", data.get("audio_loss_mask_intervals", data.get("intervals")))
+        return normalize_loss_mask_intervals(data)
+
+    intervals: list[tuple[float, float]] = []
+    with open(mask_path, "r", encoding="utf-8") as f:
+        for line in f:
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            parts = [p for p in stripped.replace(",", " ").split() if p]
+            if len(parts) < 2:
+                raise ValueError(f"Audio loss mask interval line must contain start and end seconds: {line!r}")
+            intervals.append((float(parts[0]), float(parts[1])))
+    return intervals
+
+
+def normalize_loss_mask_intervals(value: Any) -> Optional[list[tuple[float, float]]]:
+    if value is None:
+        return None
+    intervals: list[tuple[float, float]] = []
+    for item in value:
+        if isinstance(item, dict):
+            start = item.get("start", item.get("start_time", item.get("from")))
+            end = item.get("end", item.get("end_time", item.get("to")))
+        else:
+            start, end = item[0], item[1]
+        start_f = float(start)
+        end_f = float(end)
+        if end_f <= start_f:
+            raise ValueError(f"Invalid loss mask interval with end <= start: {(start_f, end_f)}")
+        intervals.append((start_f, end_f))
+    return intervals
 
 
 def divisible_by(num: int, divisor: int) -> int:
@@ -240,6 +380,9 @@ class ItemInfo:
 
         # np.ndarray for video, list[np.ndarray] for image with multiple controls
         self.control_content: Optional[Union[np.ndarray, list[np.ndarray]]] = None
+        self.loss_mask_content: Optional[np.ndarray] = None
+        self.loss_mask_path: Optional[str] = None
+        self.audio_loss_mask_intervals: Optional[list[tuple[float, float]]] = None
 
         # FramePack architecture specific
         self.fp_latent_window_size: Optional[int] = None
@@ -1102,6 +1245,7 @@ class BucketBatchManager:
 
         audio_latents_per_item = []
         audio_lengths_per_item = []
+        audio_loss_masks_per_item = []
         ref_audio_latents_per_item = []
         ref_audio_lengths_per_item = []
         dino_features_per_item = []
@@ -1184,6 +1328,7 @@ class BucketBatchManager:
 
             item_audio_latents = None
             item_audio_lengths = None
+            item_audio_loss_mask = None
             item_ref_audio_latents: dict[int, torch.Tensor] = {}
             item_ref_audio_lengths: dict[int, torch.Tensor] = {}
             for key, value in sorted(sd.items()):
@@ -1191,6 +1336,8 @@ class BucketBatchManager:
                     item_audio_latents = value
                 elif key.startswith("audio_lengths_"):
                     item_audio_lengths = value
+                elif key == "audio_loss_mask":
+                    item_audio_loss_mask = value
                 elif key.startswith("ref_audio_latents_"):
                     ref_suffix = key[len("ref_audio_latents_") :]
                     ref_index = 0
@@ -1209,6 +1356,7 @@ class BucketBatchManager:
                     item_ref_audio_lengths[ref_index] = value
             audio_latents_per_item.append(item_audio_latents)
             audio_lengths_per_item.append(item_audio_lengths)
+            audio_loss_masks_per_item.append(item_audio_loss_mask)
             ref_audio_latents_per_item.append(
                 [item_ref_audio_latents[idx] for idx in sorted(item_ref_audio_latents.keys())] if item_ref_audio_latents else None
             )
@@ -1228,6 +1376,7 @@ class BucketBatchManager:
                 if (
                     key.startswith("audio_latents_")
                     or key.startswith("audio_lengths_")
+                    or key == "audio_loss_mask"
                     or key.startswith("ref_audio_latents_")
                     or key.startswith("ref_audio_lengths_")
                 ):
@@ -1286,7 +1435,10 @@ class BucketBatchManager:
                         quantized_t = int(ref.shape[1])
 
                     truncated = []
+                    truncated_masks = []
+                    has_audio_loss_masks = any(isinstance(mask, torch.Tensor) for mask in audio_loss_masks_per_item)
                     for lat in audio_latents_per_item:
+                        item_index = len(truncated)
                         if isinstance(lat, torch.Tensor):
                             if lat.dim() != 3:
                                 raise ValueError(f"Expected audio latents to be 3D [C, T, F], got {tuple(lat.shape)}")
@@ -1296,13 +1448,27 @@ class BucketBatchManager:
                                     f"expected [C={channels}, *, F={mel_bins}], got {tuple(lat.shape)}"
                                 )
                             truncated.append(lat[:, :quantized_t, :].to(device=device, dtype=dtype))
+                            if has_audio_loss_masks:
+                                mask = audio_loss_masks_per_item[item_index]
+                                if isinstance(mask, torch.Tensor):
+                                    mask_out = torch.zeros((quantized_t,), device=device, dtype=torch.float32)
+                                    use_mask_t = min(int(mask.shape[0]), quantized_t)
+                                    if use_mask_t > 0:
+                                        mask_out[:use_mask_t] = mask[:use_mask_t].to(device=device, dtype=torch.float32)
+                                    truncated_masks.append(mask_out)
+                                else:
+                                    truncated_masks.append(torch.ones((quantized_t,), device=device, dtype=torch.float32))
                         else:
                             truncated.append(torch.zeros((channels, quantized_t, mel_bins), device=device, dtype=dtype))
+                            if has_audio_loss_masks:
+                                truncated_masks.append(torch.zeros((quantized_t,), device=device, dtype=torch.float32))
 
                     batch_tensor_data["audio_latents"] = torch.stack(truncated)
                     batch_tensor_data["audio_lengths"] = torch.full(
                         (len(truncated),), quantized_t, device=device, dtype=torch.int32
                     )
+                    if has_audio_loss_masks:
+                        batch_tensor_data["audio_loss_mask"] = torch.stack(truncated_masks)
                 else:
                     # Pad mode (default): pad shorter clips to max_t and store actual lengths.
                     lengths = []
@@ -1325,6 +1491,8 @@ class BucketBatchManager:
                         max_t = 1
 
                     padded = []
+                    padded_masks = []
+                    has_audio_loss_masks = any(isinstance(mask, torch.Tensor) for mask in audio_loss_masks_per_item)
                     for i, lat in enumerate(audio_latents_per_item):
                         if isinstance(lat, torch.Tensor):
                             if lat.dim() != 3:
@@ -1342,11 +1510,27 @@ class BucketBatchManager:
                                 out[:, :use_t, :] = lat[:, :use_t, :].to(device=device, dtype=dtype)
                             padded.append(out)
                             lengths[i] = int(min(max(0, lengths[i]), max_t))
+                            if has_audio_loss_masks:
+                                mask_out = torch.zeros((max_t,), device=device, dtype=torch.float32)
+                                mask = audio_loss_masks_per_item[i]
+                                if isinstance(mask, torch.Tensor):
+                                    use_mask_t = min(int(mask.shape[0]), max_t)
+                                    if use_mask_t > 0:
+                                        mask_out[:use_mask_t] = mask[:use_mask_t].to(device=device, dtype=torch.float32)
+                                else:
+                                    valid_t = int(min(max(0, lengths[i]), max_t))
+                                    if valid_t > 0:
+                                        mask_out[:valid_t] = 1.0
+                                padded_masks.append(mask_out)
                         else:
                             padded.append(torch.zeros((channels, max_t, mel_bins), device=device, dtype=dtype))
+                            if has_audio_loss_masks:
+                                padded_masks.append(torch.zeros((max_t,), device=device, dtype=torch.float32))
 
                     batch_tensor_data["audio_latents"] = torch.stack(padded)
                     batch_tensor_data["audio_lengths"] = torch.tensor(lengths, device=device, dtype=torch.int32)
+                    if has_audio_loss_masks:
+                        batch_tensor_data["audio_loss_mask"] = torch.stack(padded_masks)
 
             else:
                 # Skip allocating placeholder audio tensors when the batch has no audio.
@@ -1647,6 +1831,9 @@ class ImageDirectoryDatasource(ImageDatasource):
         control_directory: Optional[str] = None,
         control_count_per_image: Optional[int] = None,
         multiple_target: bool = False,
+        loss_mask_directory: Optional[str] = None,
+        loss_mask_use_alpha: bool = False,
+        loss_mask_invert: bool = False,
     ):
         super().__init__()
         self.image_directory = image_directory
@@ -1654,6 +1841,9 @@ class ImageDirectoryDatasource(ImageDatasource):
         self.control_directory = control_directory
         self.control_count_per_image = control_count_per_image
         self.multiple_target = multiple_target
+        self.loss_mask_directory = loss_mask_directory
+        self.loss_mask_use_alpha = loss_mask_use_alpha
+        self.loss_mask_invert = loss_mask_invert
         self.current_idx = 0
 
         # glob images
@@ -1794,7 +1984,7 @@ class ImageDirectoryDatasource(ImageDatasource):
     def __len__(self):
         return len(self.image_paths)
 
-    def get_image_data(self, idx: int) -> tuple[str, list[Image.Image], str, Optional[list[Image.Image]]]:
+    def get_image_data(self, idx: int) -> tuple[str, list[Image.Image], str, Optional[list[Image.Image]], Optional[Image.Image]]:
         image_path = self.image_paths[idx]
         image_paths = [image_path]
         if self.multiple_target:
@@ -1810,6 +2000,15 @@ class ImageDirectoryDatasource(ImageDatasource):
 
         _, caption = self.get_caption(idx)
 
+        loss_mask = None
+        if self.loss_mask_directory is not None:
+            stem = os.path.splitext(os.path.basename(image_path))[0]
+            loss_mask_path = find_stem_matched_file(self.loss_mask_directory, stem, IMAGE_EXTENSIONS)
+            if loss_mask_path is not None:
+                loss_mask = load_loss_mask_image(loss_mask_path, invert=self.loss_mask_invert)
+        elif self.loss_mask_use_alpha:
+            loss_mask = alpha_channel_to_loss_mask(images[0], invert=self.loss_mask_invert)
+
         controls = None
         if self.has_control:
             controls = []
@@ -1819,7 +2018,7 @@ class ImageDirectoryDatasource(ImageDatasource):
                     control = control.convert("RGB")
                 controls.append(control)
 
-        return image_path, images, caption, controls
+        return image_path, images, caption, controls, loss_mask
 
     def get_caption(self, idx: int) -> tuple[str, str]:
         image_path = self.image_paths[idx]
@@ -1863,12 +2062,18 @@ class ImageJsonlDatasource(ImageDatasource):
         control_count_per_image: Optional[int] = None,
         multiple_target: bool = False,
         caption_field: Optional[str] = None,
+        loss_mask_directory: Optional[str] = None,
+        loss_mask_use_alpha: bool = False,
+        loss_mask_invert: bool = False,
     ):
         super().__init__()
         self.image_jsonl_file = image_jsonl_file
         self.control_count_per_image = control_count_per_image
         self.multiple_target = multiple_target
         self.caption_field = caption_field
+        self.loss_mask_directory = loss_mask_directory
+        self.loss_mask_use_alpha = loss_mask_use_alpha
+        self.loss_mask_invert = loss_mask_invert
         self.current_idx = 0
 
         # load jsonl
@@ -1920,7 +2125,7 @@ class ImageJsonlDatasource(ImageDatasource):
     def __len__(self):
         return len(self.data)
 
-    def get_image_data(self, idx: int) -> tuple[str, list[Image.Image], str, Optional[list[Image.Image]]]:
+    def get_image_data(self, idx: int) -> tuple[str, list[Image.Image], str, Optional[list[Image.Image]], Optional[Image.Image]]:
         data = self.data[idx]
         image_path = data.get("image_path", data.get("image_path_0"))
         image_paths = [image_path]
@@ -1945,6 +2150,18 @@ class ImageJsonlDatasource(ImageDatasource):
 
         caption = select_caption_from_metadata(data, self.caption_field)
 
+        loss_mask = None
+        mask_path = data.get("loss_mask_path") or data.get("image_loss_mask_path")
+        if mask_path:
+            loss_mask = load_loss_mask_image(mask_path, invert=self.loss_mask_invert)
+        elif self.loss_mask_directory is not None:
+            stem = os.path.splitext(os.path.basename(image_path))[0]
+            loss_mask_path = find_stem_matched_file(self.loss_mask_directory, stem, IMAGE_EXTENSIONS)
+            if loss_mask_path is not None:
+                loss_mask = load_loss_mask_image(loss_mask_path, invert=self.loss_mask_invert)
+        elif self.loss_mask_use_alpha:
+            loss_mask = alpha_channel_to_loss_mask(images[0], invert=self.loss_mask_invert)
+
         controls = None
         if self.has_control:
             controls = []
@@ -1957,7 +2174,7 @@ class ImageJsonlDatasource(ImageDatasource):
                     control = control.convert("RGB")
                 controls.append(control)
 
-        return image_path, images, caption, controls
+        return image_path, images, caption, controls, loss_mask
 
     def get_caption(self, idx: int) -> tuple[str, str]:
         data = self.data[idx]
@@ -1996,10 +2213,12 @@ class AudioDirectoryDatasource(AudioDatasource):
         self,
         audio_directory: str,
         caption_extension: Optional[str] = None,
+        loss_mask_directory: Optional[str] = None,
     ):
         super().__init__()
         self.audio_directory = audio_directory
         self.caption_extension = caption_extension
+        self.loss_mask_directory = loss_mask_directory
         self.current_idx = 0
 
         logger.info(f"glob audio in {self.audio_directory}")
@@ -2012,15 +2231,22 @@ class AudioDirectoryDatasource(AudioDatasource):
     def __len__(self):
         return len(self.audio_paths)
 
-    def get_audio_data(self, idx: int) -> tuple[str, str]:
+    def get_audio_data(self, idx: int) -> tuple[str, str, Optional[list[tuple[float, float]]]]:
         audio_path = self.audio_paths[idx]
         caption_path = os.path.splitext(audio_path)[0] + (self.caption_extension or "")
         with open(caption_path, "r", encoding="utf-8") as f:
             caption = f.read().strip()
-        return audio_path, caption
+        intervals = None
+        if self.loss_mask_directory is not None:
+            stem = os.path.splitext(os.path.basename(audio_path))[0]
+            mask_path = find_stem_matched_file(self.loss_mask_directory, stem, MASK_METADATA_EXTENSIONS)
+            if mask_path is not None and os.path.isfile(mask_path):
+                intervals = load_audio_loss_mask_intervals(mask_path)
+        return audio_path, caption, intervals
 
     def get_caption(self, idx: int) -> tuple[str, str]:
-        return self.get_audio_data(idx)
+        audio_path, caption, _intervals = self.get_audio_data(idx)
+        return audio_path, caption
 
     def __iter__(self):
         self.current_idx = 0
@@ -2048,10 +2274,16 @@ class AudioDirectoryDatasource(AudioDatasource):
 
 
 class AudioJsonlDatasource(AudioDatasource):
-    def __init__(self, audio_jsonl_file: str, caption_field: Optional[str] = None):
+    def __init__(
+        self,
+        audio_jsonl_file: str,
+        caption_field: Optional[str] = None,
+        loss_mask_directory: Optional[str] = None,
+    ):
         super().__init__()
         self.audio_jsonl_file = audio_jsonl_file
         self.caption_field = caption_field
+        self.loss_mask_directory = loss_mask_directory
         self.current_idx = 0
 
         logger.info(f"load audio jsonl from {self.audio_jsonl_file}")
@@ -2072,14 +2304,24 @@ class AudioJsonlDatasource(AudioDatasource):
     def __len__(self):
         return len(self.data)
 
-    def get_audio_data(self, idx: int) -> tuple[str, str]:
+    def get_audio_data(self, idx: int) -> tuple[str, str, Optional[list[tuple[float, float]]]]:
         data = self.data[idx]
         audio_path = data["audio_path"]
         caption = select_caption_from_metadata(data, self.caption_field)
-        return audio_path, caption
+        intervals = normalize_loss_mask_intervals(data.get("loss_mask_intervals") or data.get("audio_loss_mask_intervals"))
+        mask_path = data.get("loss_mask_path") or data.get("audio_loss_mask_path")
+        if mask_path:
+            intervals = load_audio_loss_mask_intervals(mask_path)
+        elif intervals is None and self.loss_mask_directory is not None:
+            stem = os.path.splitext(os.path.basename(audio_path))[0]
+            mask_path = find_stem_matched_file(self.loss_mask_directory, stem, MASK_METADATA_EXTENSIONS)
+            if mask_path is not None and os.path.isfile(mask_path):
+                intervals = load_audio_loss_mask_intervals(mask_path)
+        return audio_path, caption, intervals
 
     def get_caption(self, idx: int) -> tuple[str, str]:
-        return self.get_audio_data(idx)
+        audio_path, caption, _intervals = self.get_audio_data(idx)
+        return audio_path, caption
 
     def __iter__(self):
         self.current_idx = 0
@@ -2175,11 +2417,20 @@ class VideoDatasource(ContentDatasource):
 
 
 class VideoDirectoryDatasource(VideoDatasource):
-    def __init__(self, video_directory: str, caption_extension: Optional[str] = None, control_directory: Optional[str] = None):
+    def __init__(
+        self,
+        video_directory: str,
+        caption_extension: Optional[str] = None,
+        control_directory: Optional[str] = None,
+        loss_mask_directory: Optional[str] = None,
+        loss_mask_invert: bool = False,
+    ):
         super().__init__()
         self.video_directory = video_directory
         self.caption_extension = caption_extension
         self.control_directory = control_directory  # 新しく追加: コントロール画像ディレクトリ
+        self.loss_mask_directory = loss_mask_directory
+        self.loss_mask_invert = loss_mask_invert
         self.current_idx = 0
 
         # glob videos
@@ -2239,7 +2490,7 @@ class VideoDirectoryDatasource(VideoDatasource):
         start_frame: Optional[int] = None,
         end_frame: Optional[int] = None,
         bucket_selector: Optional[BucketSelector] = None,
-    ) -> tuple[str, list[Image.Image], str, Optional[list[Image.Image]]]:
+    ) -> tuple[str, list[Image.Image], str, Optional[list[Image.Image]], Optional[list[np.ndarray]]]:
         video_path = self.video_paths[idx]
         video = self.get_video_data_from_path(video_path, start_frame, end_frame, bucket_selector)
 
@@ -2250,7 +2501,24 @@ class VideoDirectoryDatasource(VideoDatasource):
             control_path = self.control_paths[video_path]
             control = self.get_control_data_from_path(control_path, start_frame, end_frame, bucket_selector)
 
-        return video_path, video, caption, control
+        loss_mask = None
+        if self.loss_mask_directory is not None and video:
+            stem = os.path.splitext(os.path.basename(video_path))[0]
+            mask_path = find_stem_matched_file(self.loss_mask_directory, stem)
+            if mask_path is not None:
+                bucket_reso = (video[0].shape[1], video[0].shape[0])
+                loss_mask = load_loss_mask_frames(
+                    mask_path,
+                    bucket_reso=bucket_reso,
+                    frame_count=len(video),
+                    start_frame=start_frame,
+                    end_frame=end_frame,
+                    source_fps=self.source_fps,
+                    target_fps=self.target_fps,
+                    invert=self.loss_mask_invert,
+                )
+
+        return video_path, video, caption, control, loss_mask
 
     def get_caption(self, idx: int) -> tuple[str, str]:
         video_path = self.video_paths[idx]
@@ -2286,10 +2554,18 @@ class VideoDirectoryDatasource(VideoDatasource):
 
 
 class VideoJsonlDatasource(VideoDatasource):
-    def __init__(self, video_jsonl_file: str, caption_field: Optional[str] = None):
+    def __init__(
+        self,
+        video_jsonl_file: str,
+        caption_field: Optional[str] = None,
+        loss_mask_directory: Optional[str] = None,
+        loss_mask_invert: bool = False,
+    ):
         super().__init__()
         self.video_jsonl_file = video_jsonl_file
         self.caption_field = caption_field
+        self.loss_mask_directory = loss_mask_directory
+        self.loss_mask_invert = loss_mask_invert
         self.current_idx = 0
 
         # load jsonl
@@ -2323,7 +2599,7 @@ class VideoJsonlDatasource(VideoDatasource):
         start_frame: Optional[int] = None,
         end_frame: Optional[int] = None,
         bucket_selector: Optional[BucketSelector] = None,
-    ) -> tuple[str, list[Image.Image], str, Optional[list[Image.Image]]]:
+    ) -> tuple[str, list[Image.Image], str, Optional[list[Image.Image]], Optional[list[np.ndarray]]]:
         data = self.data[idx]
         video_path = data["video_path"]
         video = self.get_video_data_from_path(video_path, start_frame, end_frame, bucket_selector)
@@ -2335,7 +2611,25 @@ class VideoJsonlDatasource(VideoDatasource):
             control_path = data["control_path"]
             control = self.get_control_data_from_path(control_path, start_frame, end_frame, bucket_selector)
 
-        return video_path, video, caption, control
+        loss_mask = None
+        mask_path = data.get("loss_mask_path") or data.get("video_loss_mask_path")
+        if not mask_path and self.loss_mask_directory is not None:
+            stem = os.path.splitext(os.path.basename(video_path))[0]
+            mask_path = find_stem_matched_file(self.loss_mask_directory, stem)
+        if mask_path and video:
+            bucket_reso = (video[0].shape[1], video[0].shape[0])
+            loss_mask = load_loss_mask_frames(
+                mask_path,
+                bucket_reso=bucket_reso,
+                frame_count=len(video),
+                start_frame=start_frame,
+                end_frame=end_frame,
+                source_fps=self.source_fps,
+                target_fps=self.target_fps,
+                invert=self.loss_mask_invert,
+            )
+
+        return video_path, video, caption, control, loss_mask
 
     def get_caption(self, idx: int) -> tuple[str, str]:
         data = self.data[idx]
@@ -2387,6 +2681,10 @@ class BaseDataset(torch.utils.data.Dataset):
         reference_audio_cache_directory: Optional[str] = None,
         reference_audio_cache_directories: Optional[Sequence[str]] = None,
         separate_audio_buckets: bool = False,
+        loss_mask_directory: Optional[str] = None,
+        default_loss_mask_path: Optional[str] = None,
+        loss_mask_use_alpha: bool = False,
+        loss_mask_invert: bool = False,
         debug_dataset: bool = False,
         architecture: str = "no_default",
     ):
@@ -2413,6 +2711,10 @@ class BaseDataset(torch.utils.data.Dataset):
             self.reference_audio_cache_directories[0] if self.reference_audio_cache_directories else None
         )
         self.separate_audio_buckets = separate_audio_buckets
+        self.loss_mask_directory = loss_mask_directory
+        self.default_loss_mask_path = default_loss_mask_path
+        self.loss_mask_use_alpha = loss_mask_use_alpha
+        self.loss_mask_invert = loss_mask_invert
         self.debug_dataset = debug_dataset
         self.architecture = architecture
         self.seed = None
@@ -2657,6 +2959,10 @@ class ImageDataset(BaseDataset):
         reference_audio_cache_directory: Optional[str] = None,
         reference_audio_cache_directories: Optional[Sequence[str]] = None,
         separate_audio_buckets: bool = False,
+        loss_mask_directory: Optional[str] = None,
+        default_loss_mask_path: Optional[str] = None,
+        loss_mask_use_alpha: bool = False,
+        loss_mask_invert: bool = False,
         fp_latent_window_size: Optional[int] = 9,
         fp_1f_clean_indices: Optional[list[int]] = None,
         fp_1f_target_index: Optional[int] = None,
@@ -2683,6 +2989,10 @@ class ImageDataset(BaseDataset):
             reference_audio_cache_directory,
             reference_audio_cache_directories,
             separate_audio_buckets,
+            loss_mask_directory,
+            default_loss_mask_path,
+            loss_mask_use_alpha,
+            loss_mask_invert,
             debug_dataset,
             architecture,
         )
@@ -2719,7 +3029,14 @@ class ImageDataset(BaseDataset):
             self.datasource = None
         elif image_directory is not None:
             self.datasource = ImageDirectoryDatasource(
-                image_directory, caption_extension, control_directory, control_count_per_image, multiple_target
+                image_directory,
+                caption_extension,
+                control_directory,
+                control_count_per_image,
+                multiple_target,
+                loss_mask_directory=loss_mask_directory,
+                loss_mask_use_alpha=loss_mask_use_alpha,
+                loss_mask_invert=loss_mask_invert,
             )
         elif image_jsonl_file is not None:
             self.datasource = ImageJsonlDatasource(
@@ -2727,6 +3044,9 @@ class ImageDataset(BaseDataset):
                 control_count_per_image,
                 multiple_target,
                 caption_field=caption_field,
+                loss_mask_directory=loss_mask_directory,
+                loss_mask_use_alpha=loss_mask_use_alpha,
+                loss_mask_invert=loss_mask_invert,
             )
         else:
             raise ValueError("image_directory or image_jsonl_file must be specified")
@@ -2778,7 +3098,7 @@ class ImageDataset(BaseDataset):
                         break  # submit batch if possible
 
                 for future in completed_futures:
-                    original_size, item_key, images, caption, controls = future.result()
+                    original_size, item_key, images, caption, controls, loss_mask = future.result()
                     image = images[0]  # use the first image as the main content
                     bucket_height, bucket_width = image.shape[:2]
                     bucket_reso = (bucket_width, bucket_height)
@@ -2817,6 +3137,9 @@ class ImageDataset(BaseDataset):
                                 bucket_reso = bucket_reso + list(control.shape[0:2])
                             bucket_reso = tuple(bucket_reso)
 
+                    if loss_mask is not None:
+                        item_info.loss_mask_content = loss_mask
+
                     if bucket_reso not in batches:
                         batches[bucket_reso] = []
                     batches[bucket_reso].append(item_info)
@@ -2837,14 +3160,28 @@ class ImageDataset(BaseDataset):
 
         for fetch_op in self.datasource:
             # fetch and resize image in a separate thread
-            def fetch_and_resize(op: callable) -> tuple[tuple[int, int], str, Image.Image, str, Optional[Image.Image]]:
-                image_key, images, caption, controls = op()
+            def fetch_and_resize(op: callable) -> tuple[tuple[int, int], str, list[np.ndarray], str, Optional[list[np.ndarray]], Optional[np.ndarray]]:
+                result = op()
+                if len(result) == 4:
+                    image_key, images, caption, controls = result
+                    loss_mask = None
+                else:
+                    image_key, images, caption, controls, loss_mask = result
                 images: list[Image.Image]
                 image: Image.Image = images[0]  # use the first image as the main content
                 image_size = image.size
 
                 bucket_reso = bucket_selector.get_bucket_resolution(image_size)
                 images = [resize_image_to_bucket(img, bucket_reso) for img in images]  # list of np.ndarray
+
+                resized_loss_mask = None
+                if loss_mask is not None:
+                    resized_loss_mask = loss_mask_to_float_array(loss_mask, bucket_reso)
+                elif self.default_loss_mask_path:
+                    resized_loss_mask = loss_mask_to_float_array(
+                        load_loss_mask_image(self.default_loss_mask_path, invert=self.loss_mask_invert),
+                        bucket_reso,
+                    )
 
                 resized_controls = None
                 if controls is not None:
@@ -2879,7 +3216,7 @@ class ImageDataset(BaseDataset):
                             resized_control = resize_image_to_bucket(control, bucket_reso)
                             resized_controls.append(resized_control)
 
-                return image_size, image_key, images, caption, resized_controls
+                return image_size, image_key, images, caption, resized_controls, resized_loss_mask
 
             future = executor.submit(fetch_and_resize, fetch_op)
             futures.append(future)
@@ -3023,6 +3360,10 @@ class AudioDataset(BaseDataset):
         reference_audio_cache_directory: Optional[str] = None,
         reference_audio_cache_directories: Optional[Sequence[str]] = None,
         separate_audio_buckets: bool = False,
+        loss_mask_directory: Optional[str] = None,
+        default_loss_mask_path: Optional[str] = None,
+        loss_mask_use_alpha: bool = False,
+        loss_mask_invert: bool = False,
         cache_only: bool = False,
         debug_dataset: bool = False,
         architecture: str = "no_default",
@@ -3045,6 +3386,10 @@ class AudioDataset(BaseDataset):
             reference_audio_cache_directory,
             reference_audio_cache_directories,
             separate_audio_buckets,
+            loss_mask_directory,
+            default_loss_mask_path,
+            loss_mask_use_alpha,
+            loss_mask_invert,
             debug_dataset,
             architecture,
         )
@@ -3060,9 +3405,13 @@ class AudioDataset(BaseDataset):
         if self.cache_only:
             self.datasource = None
         elif audio_directory is not None:
-            self.datasource = AudioDirectoryDatasource(audio_directory, caption_extension)
+            self.datasource = AudioDirectoryDatasource(audio_directory, caption_extension, loss_mask_directory=loss_mask_directory)
         elif audio_jsonl_file is not None:
-            self.datasource = AudioJsonlDatasource(audio_jsonl_file, caption_field=caption_field)
+            self.datasource = AudioJsonlDatasource(
+                audio_jsonl_file,
+                caption_field=caption_field,
+                loss_mask_directory=loss_mask_directory,
+            )
         else:
             raise ValueError("audio_directory or audio_jsonl_file must be specified")
 
@@ -3112,7 +3461,12 @@ class AudioDataset(BaseDataset):
                     break
 
                 for future in completed_futures:
-                    audio_path, caption = future.result()
+                    result = future.result()
+                    if len(result) == 2:
+                        audio_path, caption = result
+                        loss_mask_intervals = None
+                    else:
+                        audio_path, caption, loss_mask_intervals = result
                     if self._uses_ltx2_audio_video_geometry():
                         width, height = int(self.resolution[0]), int(self.resolution[1])
                         bucket_reso = self._append_audio_bucket_key((width, height), True)
@@ -3125,6 +3479,9 @@ class AudioDataset(BaseDataset):
                     item_info.audio_latent_cache_path = self.get_audio_latent_cache_path(item_info)
                     item_info.text_encoder_output_cache_path = self.get_text_encoder_output_cache_path(item_info)
                     item_info.audio_path = audio_path
+                    if loss_mask_intervals is None and self.default_loss_mask_path:
+                        loss_mask_intervals = load_audio_loss_mask_intervals(self.default_loss_mask_path)
+                    item_info.audio_loss_mask_intervals = loss_mask_intervals
                     data.append(item_info)
                     futures.remove(future)
 
@@ -3328,6 +3685,10 @@ class VideoDataset(BaseDataset):
         reference_audio_cache_directory: Optional[str] = None,
         reference_audio_cache_directories: Optional[Sequence[str]] = None,
         separate_audio_buckets: bool = False,
+        loss_mask_directory: Optional[str] = None,
+        default_loss_mask_path: Optional[str] = None,
+        loss_mask_use_alpha: bool = False,
+        loss_mask_invert: bool = False,
         fp_latent_window_size: Optional[int] = 9,
         cache_only: bool = False,
         debug_dataset: bool = False,
@@ -3349,6 +3710,10 @@ class VideoDataset(BaseDataset):
             reference_audio_cache_directory,
             reference_audio_cache_directories,
             separate_audio_buckets,
+            loss_mask_directory,
+            default_loss_mask_path,
+            loss_mask_use_alpha,
+            loss_mask_invert,
             debug_dataset,
             architecture,
         )
@@ -3410,9 +3775,20 @@ class VideoDataset(BaseDataset):
         if self.cache_only:
             self.datasource = None
         elif video_directory is not None:
-            self.datasource = VideoDirectoryDatasource(video_directory, caption_extension, control_directory)
+            self.datasource = VideoDirectoryDatasource(
+                video_directory,
+                caption_extension,
+                control_directory,
+                loss_mask_directory=loss_mask_directory,
+                loss_mask_invert=loss_mask_invert,
+            )
         elif video_jsonl_file is not None:
-            self.datasource = VideoJsonlDatasource(video_jsonl_file, caption_field=caption_field)
+            self.datasource = VideoJsonlDatasource(
+                video_jsonl_file,
+                caption_field=caption_field,
+                loss_mask_directory=loss_mask_directory,
+                loss_mask_invert=loss_mask_invert,
+            )
         else:
             raise ValueError("video_directory or video_jsonl_file must be specified")
 
@@ -3474,7 +3850,7 @@ class VideoDataset(BaseDataset):
                         break  # submit batch if possible
 
                 for future in completed_futures:
-                    original_frame_size, video_key, video, caption, control = future.result()
+                    original_frame_size, video_key, video, caption, control, loss_mask = future.result()
 
                     frame_count = len(video)
                     video = np.stack(video, axis=0)
@@ -3492,6 +3868,10 @@ class VideoDataset(BaseDataset):
                             last_frame = control[-1]
                             control.extend([last_frame] * (frame_count - len(control)))
                         control_video = np.stack(control, axis=0)
+
+                    loss_mask_video = None
+                    if loss_mask is not None:
+                        loss_mask_video = np.asarray(loss_mask, dtype=np.float32)
 
                     crop_pos_and_frames = []
                     if self.frame_extraction == "head":
@@ -3540,6 +3920,10 @@ class VideoDataset(BaseDataset):
                         if control_video is not None:
                             cropped_control = control_video[crop_pos : crop_pos + target_frame]
 
+                        cropped_loss_mask = None
+                        if loss_mask_video is not None:
+                            cropped_loss_mask = loss_mask_video[crop_pos : crop_pos + target_frame]
+
                         item_info = ItemInfo(
                             item_key, caption, original_frame_size, batch_key, frame_count=target_frame, content=cropped_video
                         )
@@ -3556,6 +3940,7 @@ class VideoDataset(BaseDataset):
                             item_info.reference_audio_latent_cache_paths = self.get_reference_audio_latent_cache_paths(item_info)
                             item_info.reference_audio_latent_cache_path = item_info.reference_audio_latent_cache_paths[0]
                         item_info.control_content = cropped_control  # None is allowed
+                        item_info.loss_mask_content = cropped_loss_mask
                         item_info.fp_latent_window_size = self.fp_latent_window_size
 
                         batch = batches.get(batch_key, [])
@@ -3577,14 +3962,18 @@ class VideoDataset(BaseDataset):
 
         for operator in self.datasource:
 
-            def fetch_and_resize(op: callable) -> tuple[tuple[int, int], str, list[np.ndarray], str, Optional[list[np.ndarray]]]:
+            def fetch_and_resize(op: callable) -> tuple[tuple[int, int], str, list[np.ndarray], str, Optional[list[np.ndarray]], Optional[np.ndarray]]:
                 result = op()
 
                 if len(result) == 3:  # for backward compatibility TODO remove this in the future
                     video_key, video, caption = result
                     control = None
-                else:
+                    loss_mask = None
+                elif len(result) == 4:
                     video_key, video, caption, control = result
+                    loss_mask = None
+                else:
+                    video_key, video, caption, control, loss_mask = result
 
                 video: list[np.ndarray]
                 frame_size = (video[0].shape[1], video[0].shape[0])
@@ -3597,7 +3986,23 @@ class VideoDataset(BaseDataset):
                 if control is not None:
                     control = [resize_image_to_bucket(frame, bucket_reso) for frame in control]
 
-                return frame_size, video_key, video, caption, control
+                resized_loss_mask = None
+                if loss_mask is not None:
+                    resized_loss_mask = np.stack(
+                        [loss_mask_to_float_array(frame, bucket_reso) for frame in loss_mask],
+                        axis=0,
+                    )
+                elif self.default_loss_mask_path:
+                    resized_loss_mask = load_loss_mask_frames(
+                        self.default_loss_mask_path,
+                        bucket_reso=bucket_reso,
+                        frame_count=len(video),
+                        source_fps=self.source_fps,
+                        target_fps=self.target_fps,
+                        invert=self.loss_mask_invert,
+                    )
+
+                return frame_size, video_key, video, caption, control, resized_loss_mask
 
             future = executor.submit(fetch_and_resize, operator)
             futures.append(future)

@@ -1,6 +1,7 @@
 <script>
 	import FormField from './FormField.svelte';
 	import FormSelect from './FormSelect.svelte';
+	import FormToggle from './FormToggle.svelte';
 	import PathInput from './PathInput.svelte';
 
 	let { entry = {}, index = 0, onRemove, onchange, advanced = false, sourceError = '' } = $props();
@@ -156,6 +157,40 @@
 				placeholder="Optional"
 				tooltip="Optional extra reference audio cache directories, separated by commas or semicolons."
 			/>
+			<div class="pt-3 space-y-3" style="border-top: 1px solid var(--border-subtle);">
+				<span class="text-[11px] font-medium uppercase tracking-wider" style="color: var(--text-muted);">Masked Loss</span>
+				<PathInput
+					label="Mask Directory"
+					value={entry.loss_mask_directory || ''}
+					oninput={(e) => updateField('loss_mask_directory', e.target.value)}
+					placeholder="Optional"
+					tooltip="Stem-matched loss masks. Image/video datasets use image/video masks; audio datasets use JSON/TXT/CSV interval files."
+				/>
+				<PathInput
+					label="Default Mask"
+					value={entry.default_loss_mask_path || ''}
+					oninput={(e) => updateField('default_loss_mask_path', e.target.value)}
+					showFiles
+					placeholder="Optional"
+					tooltip="Fallback mask used when no per-item mask is found. For audio, use an interval file."
+				/>
+				<div class="grid grid-cols-2 gap-3">
+					<FormToggle
+						label="Use Alpha"
+						checked={entry.loss_mask_use_alpha ?? false}
+						onchange={(e) => updateField('loss_mask_use_alpha', e.target.checked)}
+						disabled={isAudio}
+						tooltip="Use the target image alpha channel as the mask when no mask directory is set."
+					/>
+					<FormToggle
+						label="Invert"
+						checked={entry.loss_mask_invert ?? false}
+						onchange={(e) => updateField('loss_mask_invert', e.target.checked)}
+						disabled={isAudio}
+						tooltip="Invert image/video mask values before caching."
+					/>
+				</div>
+			</div>
 		{/if}
 		{#if advanced && !isAudio}
 			<PathInput

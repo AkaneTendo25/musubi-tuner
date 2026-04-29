@@ -57,6 +57,10 @@ class BaseDatasetParams:
     reference_audio_cache_directory: Optional[str] = None
     reference_audio_cache_directories: Optional[Sequence[str]] = None
     separate_audio_buckets: bool = False
+    loss_mask_directory: Optional[str] = None
+    default_loss_mask_path: Optional[str] = None
+    loss_mask_use_alpha: bool = False
+    loss_mask_invert: bool = False
     cache_only: bool = False
     debug_dataset: bool = False
     architecture: str = "no_default"  # short style like "hv" or "wan"
@@ -158,6 +162,10 @@ class ConfigSanitizer:
         "reference_audio_cache_directory": str,
         "reference_audio_cache_directories": [str],
         "separate_audio_buckets": bool,
+        "loss_mask_directory": str,
+        "default_loss_mask_path": str,
+        "loss_mask_use_alpha": bool,
+        "loss_mask_invert": bool,
         "cache_only": bool,
     }
     IMAGE_DATASET_DISTINCT_SCHEMA = {
@@ -467,6 +475,10 @@ def generate_dataset_group_by_blueprint(
         bucket_no_upscale: {dataset.bucket_no_upscale}
         separate_audio_buckets: {getattr(dataset, "separate_audio_buckets", False)}
         cache_only: {getattr(dataset, "cache_only", False)}
+        loss_mask_directory: "{getattr(dataset, "loss_mask_directory", None)}"
+        default_loss_mask_path: "{getattr(dataset, "default_loss_mask_path", None)}"
+        loss_mask_use_alpha: {getattr(dataset, "loss_mask_use_alpha", False)}
+        loss_mask_invert: {getattr(dataset, "loss_mask_invert", False)}
         cache_directory: "{dataset.cache_directory}"
         reference_cache_directory: "{getattr(dataset, 'reference_cache_directory', None)}"
         reference_cache_directories: {getattr(dataset, "reference_cache_directories", None)}

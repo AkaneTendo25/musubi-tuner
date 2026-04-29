@@ -34,6 +34,10 @@ class DatasetEntry(BaseModel):
     extra_control_directories: str = ""
     reference_audio_directory: str = ""
     extra_reference_audio_directories: str = ""
+    loss_mask_directory: str = ""
+    default_loss_mask_path: str = ""
+    loss_mask_use_alpha: bool = False
+    loss_mask_invert: bool = False
     jsonl_file: str = ""
     resolution_w: int = 768
     resolution_h: int = 512

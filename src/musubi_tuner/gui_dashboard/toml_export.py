@@ -168,6 +168,15 @@ def _dataset_entry_to_dict(entry) -> dict:
     if getattr(entry, "caption_field", ""):
         d["caption_field"] = entry.caption_field
 
+    if getattr(entry, "loss_mask_directory", ""):
+        d["loss_mask_directory"] = entry.loss_mask_directory
+    if getattr(entry, "default_loss_mask_path", ""):
+        d["default_loss_mask_path"] = entry.default_loss_mask_path
+    if getattr(entry, "loss_mask_use_alpha", False):
+        d["loss_mask_use_alpha"] = True
+    if getattr(entry, "loss_mask_invert", False):
+        d["loss_mask_invert"] = True
+
     if entry.type == "video":
         d["target_frames"] = [entry.target_frames]
         d["frame_extraction"] = entry.frame_extraction
