@@ -645,7 +645,7 @@ LTX2_TARGET_REPLACE_MODULES_WITH_CONNECTOR = [
 # LoRA target presets for different training modes
 # These patterns match layers inside BasicAVTransformerBlock.
 #
-# Available modules (from official LTX-2 docs):
+# Available modules (from LTX-2 docs):
 #
 # VIDEO MODULES:
 #   - attn1.to_k, attn1.to_q, attn1.to_v, attn1.to_out.0  (video self-attention)
@@ -665,7 +665,7 @@ LTX2_TARGET_REPLACE_MODULES_WITH_CONNECTOR = [
 # and cross-modal branches. This is the recommended approach for audio-video training.
 
 # t2v: Text-to-video (attention only)
-# Official LTX-2 trainer default. Trains all attention projections (Q, K, V, Out)
+# LTX-2 trainer default. Trains all attention projections (Q, K, V, Out)
 # across video, audio, and cross-modal attention blocks.
 LTX2_INCLUDE_PATTERNS_T2V = [
     r".*\.to_k$",
@@ -922,7 +922,7 @@ def create_arch_network(
 
     # Handle LoftQ: loftq_data is pre-computed from full-precision weights
     # before NF4 quantization (passed via kwargs from the training script)
-    kwargs.pop("loftq_config", None)  # consumed upstream, not needed here
+    kwargs.pop("loftq_config", None)  # consumed before module construction
     loftq_data = kwargs.pop("loftq_data", None)
     if loftq_data is not None:
         module_kwargs = kwargs.get("module_kwargs", None) or {}

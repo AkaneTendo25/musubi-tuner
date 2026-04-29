@@ -25,6 +25,7 @@ from musubi_tuner.utils import model_utils
 from musubi_tuner.hv_train_network import load_prompts, should_sample_images
 from musubi_tuner.hv_generate_video import save_images_grid, save_videos_grid
 from musubi_tuner.ltx2_inference import LTX2Inferencer, InferenceConfig
+from musubi_tuner.ltx2_defaults import get_ltx2_sampling_preset
 from musubi_tuner.ltx2_lycoris_runtime import (
     ensure_adapters_enabled_for_sampling,
     get_adapter_norm_samples,
@@ -348,10 +349,51 @@ class LTX2SamplingMixin:
             module.attention_function = attention_function
 
     def _apply_sample_defaults(self, args: argparse.Namespace, prompts: List[Dict]) -> List[Dict]:
+        preset = get_ltx2_sampling_preset(
+            getattr(args, "sample_sampling_preset", "legacy"),
+            ltx_version=str(getattr(args, "ltx_version", "2.3")),
+        )
         default_height = int(getattr(args, "height", 512))
         default_width = int(getattr(args, "width", 768))
         default_frame_count = int(getattr(args, "sample_num_frames", 45))
+        default_sample_steps = 20
         default_guidance_scale = float(getattr(args, "guidance_scale", self.default_guidance_scale))
+        default_negative_prompt = ""
+        if preset is not None:
+            default_height = preset.height
+            default_width = preset.width
+            default_frame_count = preset.frame_count
+            default_sample_steps = preset.sample_steps
+            default_guidance_scale = preset.video_cfg_scale
+            if getattr(args, "video_cfg_scale", None) is None:
+                args.video_cfg_scale = preset.video_cfg_scale
+            if getattr(args, "audio_cfg_scale", None) is None:
+                args.audio_cfg_scale = preset.audio_cfg_scale
+            if getattr(args, "stg_scale", None) is None:
+                args.stg_scale = preset.stg_scale
+            if getattr(args, "stg_blocks", None) is None:
+                args.stg_blocks = preset.stg_blocks
+            if getattr(args, "stg_mode", None) is None:
+                args.stg_mode = preset.stg_mode
+            if getattr(args, "video_rescale_scale", None) is None:
+                args.video_rescale_scale = preset.video_rescale_scale
+            if getattr(args, "audio_rescale_scale", None) is None:
+                args.audio_rescale_scale = preset.audio_rescale_scale
+            if getattr(args, "video_modality_scale", None) is None:
+                args.video_modality_scale = preset.video_modality_scale
+            if getattr(args, "audio_modality_scale", None) is None:
+                args.audio_modality_scale = preset.audio_modality_scale
+            if getattr(args, "av_bimodal_cfg", False) is False:
+                args.av_bimodal_cfg = preset.video_modality_scale != 1.0 or preset.audio_modality_scale != 1.0
+            if getattr(args, "av_bimodal_scale", 3.0) == 3.0:
+                args.av_bimodal_scale = preset.video_modality_scale
+            use_default_negative = getattr(args, "sample_use_default_negative_prompt", None)
+            if use_default_negative is None or bool(use_default_negative):
+                default_negative_prompt = preset.negative_prompt
+        if getattr(args, "stg_scale", None) is None:
+            args.stg_scale = 0.0
+        if getattr(args, "stg_mode", None) is None:
+            args.stg_mode = "video"
         default_discrete_flow_shift = getattr(args, "discrete_flow_shift", None)
 
         sample_parameters = []
@@ -359,13 +401,13 @@ class LTX2SamplingMixin:
             prompt_text = prompt_data.get("prompt", "")
             param = prompt_data.copy()
             param.setdefault("prompt", prompt_text)
-            param.setdefault("negative_prompt", prompt_data.get("negative_prompt", ""))
+            param.setdefault("negative_prompt", prompt_data.get("negative_prompt", default_negative_prompt))
             if "frame_count" not in param and "num_frames" in param:
                 param["frame_count"] = param["num_frames"]
             param.setdefault("height", prompt_data.get("height", default_height))
             param.setdefault("width", prompt_data.get("width", default_width))
             param.setdefault("frame_count", prompt_data.get("frame_count", default_frame_count))
-            param.setdefault("sample_steps", prompt_data.get("sample_steps", 20))
+            param.setdefault("sample_steps", prompt_data.get("sample_steps", default_sample_steps))
             param.setdefault("guidance_scale", prompt_data.get("guidance_scale", default_guidance_scale))
             if default_discrete_flow_shift is not None:
                 param.setdefault("discrete_flow_shift", prompt_data.get("discrete_flow_shift", default_discrete_flow_shift))
@@ -411,8 +453,14 @@ class LTX2SamplingMixin:
             cfg_scale = param.get("cfg_scale", None)
             guidance_scale = param.get("guidance_scale", self.default_guidance_scale)
             effective_cfg_scale = cfg_scale if cfg_scale is not None else guidance_scale
+            video_cfg_scale = getattr(args, "video_cfg_scale", None)
+            audio_cfg_scale = getattr(args, "audio_cfg_scale", None)
             try:
-                requires_negative_embed = float(effective_cfg_scale) != 1.0
+                requires_negative_embed = (
+                    float(effective_cfg_scale) != 1.0
+                    or (video_cfg_scale is not None and float(video_cfg_scale) != 1.0)
+                    or (audio_cfg_scale is not None and float(audio_cfg_scale) != 1.0)
+                )
             except (TypeError, ValueError):
                 requires_negative_embed = False
 
@@ -792,8 +840,14 @@ class LTX2SamplingMixin:
                 cfg_scale = sample_parameter.get("cfg_scale", None)
                 guidance_scale = sample_parameter.get("guidance_scale", self.default_guidance_scale)
                 effective_cfg_scale = cfg_scale if cfg_scale is not None else guidance_scale
+                video_cfg_scale = getattr(args, "video_cfg_scale", None)
+                audio_cfg_scale = getattr(args, "audio_cfg_scale", None)
                 try:
-                    return float(effective_cfg_scale) != 1.0
+                    return (
+                        float(effective_cfg_scale) != 1.0
+                        or (video_cfg_scale is not None and float(video_cfg_scale) != 1.0)
+                        or (audio_cfg_scale is not None and float(audio_cfg_scale) != 1.0)
+                    )
                 except (TypeError, ValueError):
                     return False
 
@@ -1176,7 +1230,7 @@ class LTX2SamplingMixin:
 
         logger.info(f"Loading I2V conditioning image: {image_path}")
 
-        # Load and resize image with official-style "cover + center crop" behavior.
+        # Load and resize image with LTX "cover + center crop" behavior.
         # This preserves aspect ratio (unlike direct resize) and matches LTX-2 validation sampler.
         image = Image.open(image_path).convert("RGB")
         current_width, current_height = image.size
@@ -1545,9 +1599,15 @@ class LTX2SamplingMixin:
         cfg_scale = sample_parameter.get("cfg_scale", None)
         negative_prompt = sample_parameter.get("negative_prompt", None)
         effective_cfg_scale = cfg_scale if cfg_scale is not None else guidance_scale
-        do_classifier_free_guidance = float(effective_cfg_scale) != 1.0
+        video_cfg_scale_arg = getattr(args, "video_cfg_scale", None)
+        audio_cfg_scale_arg = getattr(args, "audio_cfg_scale", None)
+        do_classifier_free_guidance = (
+            float(effective_cfg_scale) != 1.0
+            or (video_cfg_scale_arg is not None and float(video_cfg_scale_arg) != 1.0)
+            or (audio_cfg_scale_arg is not None and float(audio_cfg_scale_arg) != 1.0)
+        )
         if do_classifier_free_guidance and negative_prompt is None:
-            # Official CFG path still uses unconditional embedding (empty prompt).
+            # CFG path still uses unconditional embedding (empty prompt).
             negative_prompt = ""
             sample_parameter["negative_prompt"] = negative_prompt
 
@@ -1619,7 +1679,11 @@ class LTX2SamplingMixin:
 
         # (I2V encoding now happens at the start of the method, before any model loading)
 
-        do_classifier_free_guidance = float(effective_cfg_scale) != 1.0
+        do_classifier_free_guidance = (
+            float(effective_cfg_scale) != 1.0
+            or (video_cfg_scale_arg is not None and float(video_cfg_scale_arg) != 1.0)
+            or (audio_cfg_scale_arg is not None and float(audio_cfg_scale_arg) != 1.0)
+        )
         if do_classifier_free_guidance:
             logger.info(f"negative prompt: {negative_prompt}")
             logger.info(f"cfg scale: {cfg_scale}")
@@ -2135,7 +2199,7 @@ class LTX2SamplingMixin:
                     clean_latent = None
                     i2v_conditioning_mask_tokens = None
 
-        # Setup scheduler - official pipeline does NOT pass latent, uses default MAX_SHIFT_ANCHOR=4096
+        # Setup scheduler without passing latent; this uses default MAX_SHIFT_ANCHOR=4096.
         ltx2_scheduler = LTX2Scheduler()
         sigmas = ltx2_scheduler.execute(steps=sample_steps).to(device=transformer_device, dtype=torch.float32)
 
@@ -2201,8 +2265,39 @@ class LTX2SamplingMixin:
                 )
 
         # AV bimodal CFG setup
-        _av_bimodal_cfg = bool(getattr(args, "av_bimodal_cfg", False))
-        _av_bimodal_scale = float(getattr(args, "av_bimodal_scale", 3.0) or 3.0)
+        _video_cfg_scale = float(
+            getattr(args, "video_cfg_scale", None)
+            if getattr(args, "video_cfg_scale", None) is not None
+            else (cfg_scale if cfg_scale is not None else guidance_scale)
+        )
+        _audio_cfg_scale = float(
+            getattr(args, "audio_cfg_scale", None)
+            if getattr(args, "audio_cfg_scale", None) is not None
+            else (cfg_scale if cfg_scale is not None else guidance_scale)
+        )
+        _video_modality_scale = float(
+            getattr(args, "video_modality_scale", None)
+            if getattr(args, "video_modality_scale", None) is not None
+            else getattr(args, "av_bimodal_scale", 1.0)
+        )
+        _audio_modality_scale = float(
+            getattr(args, "audio_modality_scale", None)
+            if getattr(args, "audio_modality_scale", None) is not None
+            else getattr(args, "av_bimodal_scale", 1.0)
+        )
+        _video_rescale_scale = float(
+            getattr(args, "video_rescale_scale", None)
+            if getattr(args, "video_rescale_scale", None) is not None
+            else getattr(args, "rescale_scale", 0.0)
+        )
+        _audio_rescale_scale = float(
+            getattr(args, "audio_rescale_scale", None)
+            if getattr(args, "audio_rescale_scale", None) is not None
+            else getattr(args, "rescale_scale", 0.0)
+        )
+        _av_bimodal_cfg = bool(getattr(args, "av_bimodal_cfg", False)) or (
+            audio_latents is not None and (_video_modality_scale != 1.0 or _audio_modality_scale != 1.0)
+        )
         if _av_bimodal_cfg and audio_latents is not None:
             from musubi_tuner.ltx_2.guidance.perturbations import (
                 BatchedPerturbationConfig as _BPC,
@@ -2215,8 +2310,9 @@ class LTX2SamplingMixin:
                 _Pert(type=_PertType.SKIP_V2A_CROSS_ATTN, blocks=None),
             ])
             logger.info(
-                "Sampling: AV bimodal CFG scale=%.2f (extra forward pass per step without cross-modal attention)",
-                _av_bimodal_scale,
+                "Sampling: modality guidance video=%.2f audio=%.2f (extra forward pass without cross-modal attention)",
+                _video_modality_scale,
+                _audio_modality_scale,
             )
         else:
             _av_bimodal_cfg = False
@@ -2338,7 +2434,7 @@ class LTX2SamplingMixin:
                     audio_pred = audio_pred[:, :, ref_audio_seq_len:, :]
 
                 # IMPORTANT: Convert velocity to x0 FIRST, then apply CFG to x0
-                # This matches the official LTX-2 pipeline where X0Model wraps velocity model
+                # X0Model wraps the velocity model before guidance is applied.
                 # and CFG is applied to denoised (x0) outputs, not velocity predictions
                 video_pred = video_pred.to(dtype=latents.dtype)
 
@@ -2347,11 +2443,10 @@ class LTX2SamplingMixin:
                 # --- Video CFG ---
                 x0_cond = None
                 if do_classifier_free_guidance:
-                    effective_cfg_scale = cfg_scale if cfg_scale is not None else guidance_scale
                     vel_uncond, vel_cond = video_pred.chunk(2)
                     x0_uncond = X0PredictionWrapper.velocity_to_x0(latents, vel_uncond, sigma_for_video)
                     x0_cond = X0PredictionWrapper.velocity_to_x0(latents, vel_cond, sigma_for_video)
-                    video_x0 = x0_uncond + effective_cfg_scale * (x0_cond - x0_uncond)
+                    video_x0 = x0_uncond + _video_cfg_scale * (x0_cond - x0_uncond)
                 else:
                     video_x0 = X0PredictionWrapper.velocity_to_x0(latents, video_pred, sigma_for_video)
 
@@ -2360,12 +2455,11 @@ class LTX2SamplingMixin:
                 aud_x0_cond = None
                 if audio_pred is not None and audio_latents is not None:
                     audio_pred = audio_pred.to(dtype=audio_latents.dtype)
-                    audio_cfg_scale = cfg_scale if cfg_scale is not None else guidance_scale
                     if do_classifier_free_guidance:
                         aud_vel_uncond, aud_vel_cond = audio_pred.chunk(2)
                         aud_x0_uncond = X0PredictionWrapper.velocity_to_x0(audio_latents, aud_vel_uncond, sigma.item())
                         aud_x0_cond = X0PredictionWrapper.velocity_to_x0(audio_latents, aud_vel_cond, sigma.item())
-                        audio_x0 = aud_x0_uncond + audio_cfg_scale * (aud_x0_cond - aud_x0_uncond)
+                        audio_x0 = aud_x0_uncond + _audio_cfg_scale * (aud_x0_cond - aud_x0_uncond)
                     else:
                         audio_x0 = X0PredictionWrapper.velocity_to_x0(audio_latents, audio_pred, sigma.item())
 
@@ -2485,7 +2579,7 @@ class LTX2SamplingMixin:
                     if bm_video_pred is not None and x0_cond is not None:
                         bm_video_pred = bm_video_pred.to(dtype=latents.dtype)
                         bm_x0_cond = X0PredictionWrapper.velocity_to_x0(latents, bm_video_pred, sigma_for_video)
-                        video_x0 = video_x0 + (_av_bimodal_scale - 1) * (x0_cond - bm_x0_cond)
+                        video_x0 = video_x0 + (_video_modality_scale - 1) * (x0_cond - bm_x0_cond)
 
                     # Bimodal delta for audio
                     if bm_audio_pred is not None and aud_x0_cond is not None:
@@ -2495,7 +2589,7 @@ class LTX2SamplingMixin:
                         bm_aud_x0_cond = X0PredictionWrapper.velocity_to_x0(
                             audio_latents, bm_audio_pred, sigma.item()
                         )
-                        audio_x0 = audio_x0 + (_av_bimodal_scale - 1) * (aud_x0_cond - bm_aud_x0_cond)
+                        audio_x0 = audio_x0 + (_audio_modality_scale - 1) * (aud_x0_cond - bm_aud_x0_cond)
 
                 # --- STG (Spatio-Temporal Guidance): perturbed forward + steer x0 ---
                 # One extra forward with self-attention skipped at --stg_blocks; video_x0
@@ -2588,20 +2682,20 @@ class LTX2SamplingMixin:
                             _a_ptb = X0PredictionWrapper.velocity_to_x0(audio_latents, _stg_apred, sigma.item())
                             audio_x0 = audio_x0 + _stg_scale * (_a_base - _a_ptb)
 
-                # --- CFG\u2605 rescaling (official pipeline). 0.0 disables. ---
-                _rescale = float(getattr(args, "rescale_scale", 0.0) or 0.0)
-                if _rescale > 0.0:
+                # --- CFG\u2605 rescaling. 0.0 disables. ---
+                if _video_rescale_scale > 0.0:
                     if x0_cond is not None and video_x0 is not None:
                         _ps = video_x0.std()
                         if _ps > 1e-6:
                             _f = x0_cond.std() / _ps
-                            _f = _rescale * _f + (1.0 - _rescale)
+                            _f = _video_rescale_scale * _f + (1.0 - _video_rescale_scale)
                             video_x0 = video_x0 * _f
+                if _audio_rescale_scale > 0.0:
                     if aud_x0_cond is not None and audio_x0 is not None:
                         _ps = audio_x0.std()
                         if _ps > 1e-6:
                             _f = aud_x0_cond.std() / _ps
-                            _f = _rescale * _f + (1.0 - _rescale)
+                            _f = _audio_rescale_scale * _f + (1.0 - _audio_rescale_scale)
                             audio_x0 = audio_x0 * _f
 
                 # --- Video: denoise mask blend + Euler step + hard-lock ---
@@ -2645,8 +2739,8 @@ class LTX2SamplingMixin:
                     temporal_tile_size = getattr(args, "sample_vae_temporal_tile_size", 0)
                     temporal_tile_overlap = getattr(args, "sample_vae_temporal_tile_overlap", 8)
 
-                    # Use configured temporal tiling, or 9999 frames (all at once) if disabled
-                    effective_temporal_size = temporal_tile_size if temporal_tile_size > 0 else 9999
+                    # Use configured temporal tiling, or a large valid tile size if temporal splitting is disabled.
+                    effective_temporal_size = temporal_tile_size if temporal_tile_size > 0 else 8192
                     effective_temporal_overlap = temporal_tile_overlap if temporal_tile_size > 0 else 0
 
                     tiling_config = TilingConfig(
@@ -2934,8 +3028,23 @@ class LTX2SamplingMixin:
                     x0_uncond = X0PredictionWrapper.velocity_to_x0(latents, vel_uncond_5d, sigma)
                     x0_cond = X0PredictionWrapper.velocity_to_x0(latents, vel_cond_5d, sigma)
 
-                    effective_cfg = cfg_scale if cfg_scale is not None else guidance_scale
+                    effective_cfg = float(
+                        getattr(args, "video_cfg_scale", None)
+                        if getattr(args, "video_cfg_scale", None) is not None
+                        else (cfg_scale if cfg_scale is not None else guidance_scale)
+                    )
                     video_x0 = x0_uncond + effective_cfg * (x0_cond - x0_uncond)
+                    video_rescale = float(
+                        getattr(args, "video_rescale_scale", None)
+                        if getattr(args, "video_rescale_scale", None) is not None
+                        else getattr(args, "rescale_scale", 0.0)
+                    )
+                    if video_rescale > 0.0:
+                        pred_std = video_x0.std()
+                        if pred_std > 1e-6:
+                            factor = x0_cond.std() / pred_std
+                            factor = video_rescale * factor + (1.0 - video_rescale)
+                            video_x0 = video_x0 * factor
                 else:
                     video_modality = Modality(
                         enabled=True,
@@ -2986,7 +3095,7 @@ class LTX2SamplingMixin:
                     tile_overlap = getattr(args, "sample_vae_tile_overlap", 64)
                     temporal_tile_size = getattr(args, "sample_vae_temporal_tile_size", 0)
                     temporal_tile_overlap = getattr(args, "sample_vae_temporal_tile_overlap", 8)
-                    effective_temporal_size = temporal_tile_size if temporal_tile_size > 0 else 9999
+                    effective_temporal_size = temporal_tile_size if temporal_tile_size > 0 else 8192
                     effective_temporal_overlap = temporal_tile_overlap if temporal_tile_size > 0 else 0
                     tiling_config = TilingConfig(
                         spatial_config=SpatialTilingConfig(tile_size_in_pixels=tile_size, tile_overlap_in_pixels=tile_overlap),
@@ -3332,15 +3441,47 @@ class LTX2SamplingMixin:
                             ),
                         ).to(dtype=audio_latents.dtype)
 
-                    effective_cfg = cfg_scale if cfg_scale is not None else guidance_scale
+                    effective_video_cfg = float(
+                        getattr(args, "video_cfg_scale", None)
+                        if getattr(args, "video_cfg_scale", None) is not None
+                        else (cfg_scale if cfg_scale is not None else guidance_scale)
+                    )
+                    effective_audio_cfg = float(
+                        getattr(args, "audio_cfg_scale", None)
+                        if getattr(args, "audio_cfg_scale", None) is not None
+                        else (cfg_scale if cfg_scale is not None else guidance_scale)
+                    )
 
                     v_x0_uncond = X0PredictionWrapper.velocity_to_x0(latents, _unpatchify_video(video_vel_uncond), sigma)
                     v_x0_cond = X0PredictionWrapper.velocity_to_x0(latents, _unpatchify_video(video_vel_cond), sigma)
-                    video_x0 = v_x0_uncond + effective_cfg * (v_x0_cond - v_x0_uncond)
+                    video_x0 = v_x0_uncond + effective_video_cfg * (v_x0_cond - v_x0_uncond)
 
                     a_x0_uncond = X0PredictionWrapper.velocity_to_x0(audio_latents, _unpatchify_audio(audio_vel_uncond), sigma)
                     a_x0_cond = X0PredictionWrapper.velocity_to_x0(audio_latents, _unpatchify_audio(audio_vel_cond), sigma)
-                    audio_x0 = a_x0_uncond + effective_cfg * (a_x0_cond - a_x0_uncond)
+                    audio_x0 = a_x0_uncond + effective_audio_cfg * (a_x0_cond - a_x0_uncond)
+
+                    video_rescale = float(
+                        getattr(args, "video_rescale_scale", None)
+                        if getattr(args, "video_rescale_scale", None) is not None
+                        else getattr(args, "rescale_scale", 0.0)
+                    )
+                    audio_rescale = float(
+                        getattr(args, "audio_rescale_scale", None)
+                        if getattr(args, "audio_rescale_scale", None) is not None
+                        else getattr(args, "rescale_scale", 0.0)
+                    )
+                    if video_rescale > 0.0:
+                        pred_std = video_x0.std()
+                        if pred_std > 1e-6:
+                            factor = v_x0_cond.std() / pred_std
+                            factor = video_rescale * factor + (1.0 - video_rescale)
+                            video_x0 = video_x0 * factor
+                    if audio_rescale > 0.0:
+                        pred_std = audio_x0.std()
+                        if pred_std > 1e-6:
+                            factor = a_x0_cond.std() / pred_std
+                            factor = audio_rescale * factor + (1.0 - audio_rescale)
+                            audio_x0 = audio_x0 * factor
                 else:
                     perturbations = BatchedPerturbationConfig.empty(bsz)
 
@@ -3413,7 +3554,7 @@ class LTX2SamplingMixin:
                     tile_overlap = getattr(args, "sample_vae_tile_overlap", 64)
                     temporal_tile_size = getattr(args, "sample_vae_temporal_tile_size", 0)
                     temporal_tile_overlap = getattr(args, "sample_vae_temporal_tile_overlap", 8)
-                    effective_temporal_size = temporal_tile_size if temporal_tile_size > 0 else 9999
+                    effective_temporal_size = temporal_tile_size if temporal_tile_size > 0 else 8192
                     effective_temporal_overlap = temporal_tile_overlap if temporal_tile_size > 0 else 0
                     tiling_config = TilingConfig(
                         spatial_config=SpatialTilingConfig(tile_size_in_pixels=tile_size, tile_overlap_in_pixels=tile_overlap),
@@ -3543,7 +3684,7 @@ class LTX2SamplingMixin:
             tiled_vae_config = {
                 "tile_size": getattr(args, "sample_vae_tile_size", 512),
                 "tile_overlap": getattr(args, "sample_vae_tile_overlap", 64),
-                "temporal_tile_size": getattr(args, "sample_vae_temporal_tile_size", 0) or 9999,
+                "temporal_tile_size": getattr(args, "sample_vae_temporal_tile_size", 0) or 8192,
                 "temporal_tile_overlap": getattr(args, "sample_vae_temporal_tile_overlap", 8),
             }
 
@@ -3558,6 +3699,8 @@ class LTX2SamplingMixin:
             sample_steps=sample_steps,
             guidance_scale=guidance_scale,
             cfg_scale=cfg_scale,
+            video_cfg_scale=getattr(args, "video_cfg_scale", None),
+            audio_cfg_scale=getattr(args, "audio_cfg_scale", None),
             seed=seed,
             two_stage=True,
             spatial_upsampler_path=spatial_upsampler_path,
@@ -3576,6 +3719,10 @@ class LTX2SamplingMixin:
             stg_blocks=getattr(args, "stg_blocks", None),
             stg_mode=str(getattr(args, "stg_mode", "video")),
             rescale_scale=float(getattr(args, "rescale_scale", 0.0) or 0.0),
+            video_rescale_scale=getattr(args, "video_rescale_scale", None),
+            audio_rescale_scale=getattr(args, "audio_rescale_scale", None),
+            video_modality_scale=float(getattr(args, "video_modality_scale", 1.0) or 1.0),
+            audio_modality_scale=float(getattr(args, "audio_modality_scale", 1.0) or 1.0),
             extra={"audio_config": audio_config} if audio_config else {},
         )
 

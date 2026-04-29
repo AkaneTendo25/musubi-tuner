@@ -1482,7 +1482,7 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
     ) -> float:
         """Calculate shift value for shifted logit-normal timestep sampling.
 
-        This matches the official LTX-2 trainer implementation where the shift
+        This matches the LTX-2 trainer implementation where the shift
         is linearly interpolated based on sequence length.
         """
         m = (max_shift - min_shift) / float(max_tokens - min_tokens)
@@ -1516,8 +1516,7 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
 
         Modes:
         - legacy: historical behavior, sigma = sigmoid(N(shift, std)).
-        - stretched: upstream Mar-2026 behavior with percentile stretch and
-          optional uniform fallback.
+        - stretched: percentile stretch behavior with optional uniform fallback.
         """
         if shifts.ndim != 1 or shifts.shape[0] != batch_size:
             raise ValueError(f"shifts must be shape [batch_size], got {tuple(shifts.shape)} for batch_size={batch_size}")
@@ -1530,10 +1529,10 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
         logitnormal_samples = torch.sigmoid(normal_samples)
         if mode in {"legacy", "classic", "old"}:
             return logitnormal_samples
-        if mode not in {"stretched", "v2", "upstream"}:
+        if mode not in {"stretched", "v2", "normalized"}:
             raise ValueError(f"Invalid shifted_logit_mode={mode!r}. Expected one of: legacy, stretched.")
 
-        # Upstream constants: 99.9th and 0.5th normal percentiles.
+        # Constants for 99.9th and 0.5th normal percentiles.
         eps = min(max(float(eps), 0.0), 0.499)
         uniform_prob = min(max(float(uniform_prob), 0.0), 1.0)
         normal_999_percentile = 3.0902 * std
@@ -2567,7 +2566,7 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             enable_prompt_grad = bool(getattr(args, "full_ft_train_text_encoder", False))
             if not use_full_ft_fallback:
                 raise ValueError(
-                    "Cached text embeddings missing from batch. Expected either batch['conditions'] (official format) "
+                    "Cached text embeddings missing from batch. Expected either batch['conditions'] (Gemma cache format) "
                     "or 'text'/'text_mask' (legacy musubi format)."
                 )
 

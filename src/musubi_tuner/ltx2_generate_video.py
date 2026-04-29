@@ -21,6 +21,7 @@ from accelerate import Accelerator
 from safetensors.torch import load_file
 
 from musubi_tuner.hv_generate_video import setup_parser_compile
+from musubi_tuner.ltx2_defaults import get_ltx2_sampling_preset
 from musubi_tuner.model_defaults import default_gemma_root_path, default_ltx2_checkpoint_path
 from musubi_tuner.ltx2_train_network import LTX2NetworkTrainer
 from musubi_tuner.networks import lora_ltx2
@@ -151,21 +152,42 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output_name", type=str, default="ltx2_gen", help="Base output filename prefix")
 
     # -- Generation controls (become sample_parameter defaults) --
-    parser.add_argument("--height", type=int, default=512, help="Output height in pixels (rounded to multiple of 32)")
-    parser.add_argument("--width", type=int, default=768, help="Output width in pixels (rounded to multiple of 32)")
-    parser.add_argument("--frame_count", "--sample_num_frames", type=int, default=45, dest="frame_count",
+    parser.add_argument(
+        "--sampling_preset",
+        "--sample_sampling_preset",
+        type=str,
+        default="defaults",
+        choices=["legacy", "defaults", "ltx20", "ltx23", "ltx23_hq", "distilled_two_stage"],
+        help="Generation defaults. Use 'legacy' for the old 512x768/20-step/no-guidance defaults.",
+    )
+    parser.add_argument(
+        "--use_default_negative_prompt",
+        "--sample_use_default_negative_prompt",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Use the default LTX negative prompt when CFG is enabled and --negative_prompt is omitted.",
+    )
+    parser.add_argument("--height", type=int, default=None, help="Output height in pixels (rounded to multiple of 32)")
+    parser.add_argument("--width", type=int, default=None, help="Output width in pixels (rounded to multiple of 32)")
+    parser.add_argument("--frame_count", "--sample_num_frames", type=int, default=None, dest="frame_count",
                         help="Number of frames (rounded to 8k+1)")
-    parser.add_argument("--frame_rate", type=float, default=25.0, help="Output FPS")
-    parser.add_argument("--sample_steps", type=int, default=20, help="Number of denoising steps")
-    parser.add_argument("--guidance_scale", type=float, default=1.0, help="Guidance scale (1.0 = no guidance)")
+    parser.add_argument("--frame_rate", type=float, default=None, help="Output FPS")
+    parser.add_argument("--sample_steps", type=int, default=None, help="Number of denoising steps")
+    parser.add_argument("--guidance_scale", type=float, default=None, help="Guidance scale (1.0 = no guidance)")
     parser.add_argument("--cfg_scale", type=float, default=None, help="CFG scale (overrides guidance_scale when set)")
     parser.add_argument("--discrete_flow_shift", type=float, default=5.0, help="Flow matching shift parameter")
     parser.add_argument("--seed", type=int, default=None, help="Random seed (None = random)")
+    parser.add_argument("--video_cfg_scale", type=float, default=None, help="Video CFG scale")
+    parser.add_argument("--audio_cfg_scale", type=float, default=None, help="Audio CFG scale")
+    parser.add_argument("--video_modality_scale", type=float, default=None, help="Video A2V modality guidance scale")
+    parser.add_argument("--audio_modality_scale", type=float, default=None, help="Audio V2A modality guidance scale")
+    parser.add_argument("--video_rescale_scale", type=float, default=None, help="Video CFG rescale scale")
+    parser.add_argument("--audio_rescale_scale", type=float, default=None, help="Audio CFG rescale scale")
     parser.add_argument(
         "--stg_scale",
         type=float,
-        default=0.0,
-        help="Spatio-Temporal Guidance scale (0.0 = disabled). Official recommended ~1.0. "
+        default=None,
+        help="Spatio-Temporal Guidance scale (0.0 = disabled). Recommended default is 1.0. "
              "Costs one extra transformer forward per denoising step.",
     )
     parser.add_argument(
@@ -178,16 +200,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--stg_mode",
         type=str,
-        default="video",
+        default=None,
         choices=["video", "audio", "both"],
         help="Which self-attention modality to perturb for STG.",
     )
     parser.add_argument(
         "--rescale_scale",
         type=float,
-        default=0.0,
-        help="CFG\u2605 rescaling after CFG+STG. Official LTX-2.3 uses 0.7; 0 disables.",
+        default=None,
+        help="CFG\u2605 rescaling after CFG+STG. LTX-2.3 default is 0.7; 0 disables.",
     )
+    parser.add_argument("--av_bimodal_cfg", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--av_bimodal_scale", type=float, default=None)
 
     # -- Attention / DiT quantization --
     parser.add_argument("--attn_mode", type=str, default="torch",
@@ -227,7 +251,7 @@ def parse_args() -> argparse.Namespace:
 
     # -- I2V / V2V conditioning --
     parser.add_argument("--sample_i2v_token_timestep_mask", action=argparse.BooleanOptionalAction, default=True,
-                        help="Use official-style I2V token timestep masking during sampling")
+                        help="Use LTX I2V token timestep masking during sampling")
     parser.add_argument("--reference_downscale", type=int, default=1,
                         help="Spatial downscale factor for V2V references (1=same res)")
     parser.add_argument("--reference_frames", type=int, default=1, help="Number of V2V reference frames")
@@ -295,6 +319,58 @@ def parse_args() -> argparse.Namespace:
         raise ValueError("--gemma_load_in_8bit and --gemma_load_in_4bit cannot be enabled together")
     if args.gemma_safetensors and (args.gemma_load_in_8bit or args.gemma_load_in_4bit):
         raise ValueError("--gemma_safetensors cannot be combined with --gemma_load_in_4bit/8bit")
+
+    preset = get_ltx2_sampling_preset(args.sampling_preset, ltx_version="2.3")
+    if preset is None:
+        args.height = 512 if args.height is None else args.height
+        args.width = 768 if args.width is None else args.width
+        args.frame_count = 45 if args.frame_count is None else args.frame_count
+        args.frame_rate = 25.0 if args.frame_rate is None else args.frame_rate
+        args.sample_steps = 20 if args.sample_steps is None else args.sample_steps
+        args.guidance_scale = 1.0 if args.guidance_scale is None else args.guidance_scale
+        args.stg_scale = 0.0 if args.stg_scale is None else args.stg_scale
+        args.stg_mode = "video" if args.stg_mode is None else args.stg_mode
+        args.rescale_scale = 0.0 if args.rescale_scale is None else args.rescale_scale
+        if args.use_default_negative_prompt is None:
+            args.use_default_negative_prompt = False
+    else:
+        args.height = preset.height if args.height is None else args.height
+        args.width = preset.width if args.width is None else args.width
+        args.frame_count = preset.frame_count if args.frame_count is None else args.frame_count
+        args.frame_rate = preset.frame_rate if args.frame_rate is None else args.frame_rate
+        args.sample_steps = preset.sample_steps if args.sample_steps is None else args.sample_steps
+        args.guidance_scale = preset.video_cfg_scale if args.guidance_scale is None else args.guidance_scale
+        args.video_cfg_scale = preset.video_cfg_scale if args.video_cfg_scale is None else args.video_cfg_scale
+        args.audio_cfg_scale = preset.audio_cfg_scale if args.audio_cfg_scale is None else args.audio_cfg_scale
+        args.stg_scale = preset.stg_scale if args.stg_scale is None else args.stg_scale
+        args.stg_blocks = preset.stg_blocks if args.stg_blocks is None else args.stg_blocks
+        args.stg_mode = preset.stg_mode if args.stg_mode is None else args.stg_mode
+        args.rescale_scale = preset.video_rescale_scale if args.rescale_scale is None else args.rescale_scale
+        args.video_rescale_scale = preset.video_rescale_scale if args.video_rescale_scale is None else args.video_rescale_scale
+        args.audio_rescale_scale = preset.audio_rescale_scale if args.audio_rescale_scale is None else args.audio_rescale_scale
+        args.video_modality_scale = preset.video_modality_scale if args.video_modality_scale is None else args.video_modality_scale
+        args.audio_modality_scale = preset.audio_modality_scale if args.audio_modality_scale is None else args.audio_modality_scale
+        if args.av_bimodal_cfg is None:
+            args.av_bimodal_cfg = preset.video_modality_scale != 1.0 or preset.audio_modality_scale != 1.0
+        if args.av_bimodal_scale is None:
+            args.av_bimodal_scale = preset.video_modality_scale
+        if args.use_default_negative_prompt is None:
+            args.use_default_negative_prompt = bool(preset.negative_prompt)
+        if args.negative_prompt is None and args.use_default_negative_prompt:
+            args.negative_prompt = preset.negative_prompt
+        if args.sampling_preset == "distilled_two_stage":
+            args.sample_two_stage = True
+
+    args.video_cfg_scale = args.guidance_scale if args.video_cfg_scale is None else args.video_cfg_scale
+    args.audio_cfg_scale = args.guidance_scale if args.audio_cfg_scale is None else args.audio_cfg_scale
+    args.video_rescale_scale = args.rescale_scale if args.video_rescale_scale is None else args.video_rescale_scale
+    args.audio_rescale_scale = args.rescale_scale if args.audio_rescale_scale is None else args.audio_rescale_scale
+    args.video_modality_scale = 1.0 if args.video_modality_scale is None else args.video_modality_scale
+    args.audio_modality_scale = 1.0 if args.audio_modality_scale is None else args.audio_modality_scale
+    args.av_bimodal_cfg = False if args.av_bimodal_cfg is None else args.av_bimodal_cfg
+    args.av_bimodal_scale = args.video_modality_scale if args.av_bimodal_scale is None else args.av_bimodal_scale
+    if args.cfg_scale is None and args.video_cfg_scale != args.guidance_scale:
+        args.cfg_scale = args.video_cfg_scale
 
     return args
 
@@ -429,6 +505,8 @@ def main() -> None:
 
     # Wire up aliases that the training code expects
     args.dit = args.ltx2_checkpoint
+    args.sample_sampling_preset = args.sampling_preset
+    args.sample_use_default_negative_prompt = args.use_default_negative_prompt
     if args.vae is None:
         args.vae = args.ltx2_checkpoint
     if args.vae_dtype is None:

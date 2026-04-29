@@ -20,7 +20,7 @@ from musubi_tuner.dataset.config_utils import BlueprintGenerator, ConfigSanitize
 from musubi_tuner.dataset.image_video_dataset import (
     ARCHITECTURE_LTX2,
     ItemInfo,
-    save_text_encoder_output_cache_ltx2_official,
+    save_text_encoder_output_cache_ltx2_gemma,
 )
 from musubi_tuner.ltx_2.env import apply_ltx2_tweaks
 from musubi_tuner.model_defaults import default_gemma_root_path, default_ltx2_checkpoint_path
@@ -46,7 +46,7 @@ def _all_declared_datasets_are_audio(user_config: dict) -> bool:
     return all(("audio_directory" in ds or "audio_jsonl_file" in ds) for ds in declared_datasets)
 
 
-def encode_and_save_batch_official_gemma(
+def encode_and_save_batch_gemma(
     text_encoder,
     batch: list[ItemInfo],
     *,
@@ -76,7 +76,7 @@ def encode_and_save_batch_official_gemma(
             mask = mask.squeeze(0).detach().cpu()
             audio_embed_out = audio_embed.squeeze(0).detach().cpu() if audio_embed is not None else None
 
-            save_text_encoder_output_cache_ltx2_official(
+            save_text_encoder_output_cache_ltx2_gemma(
                 item,
                 video_prompt_embeds=video_embed,
                 audio_prompt_embeds=audio_embed_out,
@@ -127,7 +127,7 @@ def encode_and_save_batch_pre_connector(
             video_feat_out = video_feat.squeeze(0).detach().cpu()
             audio_feat_out = audio_feat.squeeze(0).detach().cpu() if audio_feat is not None else None
 
-            save_text_encoder_output_cache_ltx2_official(
+            save_text_encoder_output_cache_ltx2_gemma(
                 item,
                 video_prompt_embeds=video_embed,
                 audio_prompt_embeds=audio_embed_out,
@@ -450,7 +450,7 @@ def main() -> None:
                 audio_video=audio_video,
             )
         else:
-            encode_and_save_batch_official_gemma(
+            encode_and_save_batch_gemma(
                 text_encoder,
                 batch,
                 device=device,

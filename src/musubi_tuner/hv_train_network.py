@@ -5027,7 +5027,7 @@ def setup_parser_common() -> argparse.ArgumentParser:
         choices=["sigma", "uniform", "sigmoid", "shift", "flux_shift", "flux2_shift", "qwen_shift", "logsnr", "qinglong_flux", "qinglong_qwen", "shifted_logit_normal"],
         default="sigma",
         help="Method to sample timesteps: sigma-based, uniform random, sigmoid of random normal, shift of sigmoid, flux shift, "
-        "or shifted_logit_normal (sequence-length-adaptive, official LTX-2 method)."
+        "or shifted_logit_normal (sequence-length-adaptive LTX-2 method)."
         " / torch.compileの動的形状モード（デフォルト: None、autoと同じ動作）",
     )
     parser.add_argument(

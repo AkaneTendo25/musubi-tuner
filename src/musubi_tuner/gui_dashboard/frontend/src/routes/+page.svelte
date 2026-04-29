@@ -91,6 +91,7 @@
 
 	function buildTemplateConfig(loraFamily, memoryProfile, defaultLtx, defaultGemma) {
 		const shared = {
+			version: 2,
 			default_ltx2_checkpoint: defaultLtx,
 			default_gemma_root: defaultGemma,
 			default_gemma_safetensors: '',
@@ -104,6 +105,7 @@
 				gemma_root: defaultGemma,
 				ltx2_mode: 'video',
 				ltx_version: '2.3',
+				sample_sampling_preset: 'defaults',
 				lora_target_preset: 't2v',
 				ic_lora_strategy: 'auto',
 			},
@@ -111,6 +113,7 @@
 				ltx2_checkpoint: defaultLtx,
 				gemma_root: defaultGemma,
 				ltx2_mode: 'video',
+				sampling_preset: 'defaults',
 			},
 			slider: {
 				mode: 'text',

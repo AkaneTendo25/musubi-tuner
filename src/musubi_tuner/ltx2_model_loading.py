@@ -621,7 +621,7 @@ def load_ltx2_model(
     _trace_vram_ltx2(f"AFTER base_model.to({load_device})")
     if fp8_upcast or fp8_upcast_stochastic:
         # Upcast FP8 linear weights during forward for stability.
-        # This is optional and not enabled by default in upstream configs.
+        # This is optional and not enabled by default.
         base_model = amend_forward_with_upcast(
             base_model,
             with_stochastic_rounding=bool(fp8_upcast_stochastic),

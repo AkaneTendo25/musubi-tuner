@@ -88,7 +88,7 @@ Caching scripts (`ltx2_cache_latents.py`, `ltx2_cache_text_encoder_outputs.py`) 
 
 ## Installation
 
-The base installation procedure is the same as upstream musubi-tuner — follow the [Installation guide](../README.md#installation) (`pip install -e .` in a virtual environment). The sections below cover LTX-2-specific requirements (CUDA version, model downloads) that go on top of the base install.
+The base installation procedure is the same as musubi-tuner — follow the [Installation guide](../README.md#installation) (`pip install -e .` in a virtual environment). The sections below cover LTX-2-specific requirements (CUDA version, model downloads) that go on top of the base install.
 
 Unless otherwise noted, command examples in this LTX-2 guide were tested on Windows 11. They should also work on Linux, but you may need small shell/path adjustments.
 
@@ -1223,7 +1223,7 @@ Use `--lora_target_preset` to control which layers LoRA targets. For custom laye
 
 | Preset | Layers | Modality scope | Use Case |
 |--------|--------|----------------|----------|
-| `t2v` (default) | All attention (`to_q`, `to_k`, `to_v`, `to_out.0`) | Video + audio + cross-modal | Text-to-video, matches official LTX-2 trainer |
+| `t2v` (default) | All attention (`to_q`, `to_k`, `to_v`, `to_out.0`) | Video + audio + cross-modal | Text-to-video default |
 | `v2v` | All attention + video FFN + audio FFN | Video + audio + cross-modal | Video-to-video / IC-LoRA style |
 | `video_sa` | Video self-attention (`attn1`) | Video only | Spatially-aligned controls (depth, pose, canny, inpaint) |
 | `video_sa_ff` | Video self-attention + video FFN (`attn1`, `ff`) | Video only | Controls needing more capacity (local edit, cut-on-action) |
@@ -1806,7 +1806,7 @@ python ltx2_merge_lora.py ^
 
 ## Dataset Configuration
 
-The dataset config is a TOML file with `[general]` defaults and `[[datasets]]` entries. Common options shared across all musubi-tuner architectures — including `frame_extraction` modes, JSONL metadata format, control image support, and resolution bucketing — are documented in the [Dataset Configuration guide](./dataset_config.md). The options below are LTX-2-specific or supplement upstream defaults.
+The dataset config is a TOML file with `[general]` defaults and `[[datasets]]` entries. Common options shared across all musubi-tuner architectures — including `frame_extraction` modes, JSONL metadata format, control image support, and resolution bucketing — are documented in the [Dataset Configuration guide](./dataset_config.md). The options below are LTX-2-specific or supplement base defaults.
 
 ### Image Dataset Notes
 
@@ -1938,7 +1938,7 @@ If you see **no** "Resampling" line for a video, it means source and target FPS 
 ## Validation Datasets
 
 > [!NOTE]
-> Validation datasets are a fork extension — they are not available in upstream musubi-tuner.
+> Validation datasets are an extension specific to this LTX-2 trainer.
 
 You can configure a separate validation dataset to track validation loss (`val_loss`) during training. This helps detect overfitting and compare training runs. Validation datasets use **exactly the same schema** as training datasets — any format that works for `[[datasets]]` works for `[[validation_datasets]]`.
 
@@ -2153,7 +2153,7 @@ num_repeats = 5
 - **Float32 AdaLN**: The transformer applies Adaptive Layer Norm (AdaLN) shift/scale operations in float32, then casts back to the working dtype. This prevents overflow that can occur when bf16 scale values multiply bf16 hidden states. The fix is always active and requires no flags.
 - **Loss dtype**: The LTX-2 training path computes the task loss (MSE, L1, Huber) in `trainer.dit_dtype` (typically bf16 with `--mixed_precision bf16`). Internal regularization losses (motion preservation, CREPA, Self-Flow) always use MSE and are unaffected by `--loss_type`.
 
-For additional troubleshooting resources, see the [official LTX-2 documentation hub](https://docs.ltx.video/open-source-model/getting-started/overview), the [Banodoco Discord](https://discord.gg/banodoco) community, and the [awesome-ltx2](https://github.com/wildminder/awesome-ltx2) curated resource list.
+For additional troubleshooting resources, see the [LTX-2 documentation hub](https://docs.ltx.video/open-source-model/getting-started/overview), the [Banodoco Discord](https://discord.gg/banodoco) community, and the [awesome-ltx2](https://github.com/wildminder/awesome-ltx2) curated resource list.
 
 ---
 
@@ -2438,9 +2438,9 @@ Additional notes:
 - [Self-Flow (arXiv 2603.06507)](https://arxiv.org/abs/2603.06507) — Self-supervised flow matching regularization; basis for `--self_flow`
 - [Harmony (arXiv 2511.21579)](https://arxiv.org/abs/2511.21579) — Cross-Task Synergy; basis for `--cts_lambda_video_driven` and `--cts_lambda_audio_driven`
 
-**Official LTX Resources**
-- [LTX-2](https://github.com/Lightricks/LTX-2) — Official Lightricks LTX-2/2.3 repository; contains the well-structured `ltx-trainer` and `ltx-pipelines` packages that served as the upstream source and reference for this implementation
-- [LTX-Video](https://github.com/Lightricks/LTX-Video) — Official Lightricks model repository (inference, ComfyUI nodes, model weights)
+**LTX Resources**
+- [LTX-2](https://github.com/Lightricks/LTX-2) — LTX-2/2.3 model and pipeline resources
+- [LTX-Video](https://github.com/Lightricks/LTX-Video) — LTX model resources, inference tooling, ComfyUI nodes, and model weights
 - [LTX Documentation](https://docs.ltx.video/open-source-model/getting-started/overview) — Unified docs hub: open-source model, API reference, ComfyUI integration, LoRA usage, and LTX-2 trainer guide
 
 **Alternative Trainers**

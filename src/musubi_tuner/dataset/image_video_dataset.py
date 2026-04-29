@@ -546,7 +546,7 @@ def save_text_encoder_output_cache_ltx2(item_info: ItemInfo, embed: torch.Tensor
     save_text_encoder_output_cache_common(item_info, sd, ARCHITECTURE_LTX2_FULL)
 
 
-def save_text_encoder_output_cache_ltx2_official(
+def save_text_encoder_output_cache_ltx2_gemma(
     item_info: ItemInfo,
     *,
     video_prompt_embeds: torch.Tensor,

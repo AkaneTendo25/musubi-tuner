@@ -22,7 +22,7 @@ from musubi_tuner.utils.device_utils import clean_memory_on_device
 
 logger = logging.getLogger(__name__)
 
-# Stage 2 distilled sigma values (from LTX-2 official pipeline)
+# Stage 2 distilled sigma values for the LTX-2 two-stage path.
 # These are a subset of the full distilled schedule, optimized for refinement
 STAGE_2_DISTILLED_SIGMA_VALUES = [0.909375, 0.725, 0.421875, 0.0]
 
@@ -38,9 +38,11 @@ class InferenceConfig:
     height: int = 512
     frame_count: int = 45
     frame_rate: float = 25.0
-    sample_steps: int = 40  # Official default: 40 steps
+    sample_steps: int = 40  # Default: 40 steps
     guidance_scale: float = 1.0
-    cfg_scale: Optional[float] = 4.0  # Official default: 4.0 CFG
+    cfg_scale: Optional[float] = 4.0  # Default: 4.0 CFG
+    video_cfg_scale: Optional[float] = None
+    audio_cfg_scale: Optional[float] = None
     discrete_flow_shift: float = 5.0
     seed: Optional[int] = None
 
@@ -58,8 +60,12 @@ class InferenceConfig:
     stg_blocks: Optional[List[int]] = None  # None = all blocks
     stg_mode: str = "video"  # "video" | "audio" | "both"
 
-    # CFG★ rescaling (official pipeline uses 0.7 for LTX-2.3). 0.0 disables.
+    # CFG★ rescaling (LTX-2.3 default is 0.7). 0.0 disables.
     rescale_scale: float = 0.0
+    video_rescale_scale: Optional[float] = None
+    audio_rescale_scale: Optional[float] = None
+    video_modality_scale: float = 1.0
+    audio_modality_scale: float = 1.0
 
     # Audio settings
     enable_audio: bool = False
@@ -299,7 +305,7 @@ class LTX2Inferencer:
             else:
                 logger.warning(
                     "CFG is enabled but negative_prompt_embeds are missing; "
-                    "falling back to duplicated positive embeddings (deviates from official behavior)."
+                    "falling back to duplicated positive embeddings."
                 )
                 prompt_embeds = torch.cat([prompt_embeds, prompt_embeds], dim=0)
                 prompt_mask = _normalize_mask(prompt_mask)
@@ -342,6 +348,12 @@ class LTX2Inferencer:
         stg_blocks: Optional[List[int]] = None,
         stg_mode: str = "video",
         rescale_scale: float = 0.0,
+        video_cfg_scale: Optional[float] = None,
+        audio_cfg_scale: Optional[float] = None,
+        video_rescale_scale: Optional[float] = None,
+        audio_rescale_scale: Optional[float] = None,
+        video_modality_scale: float = 1.0,
+        audio_modality_scale: float = 1.0,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Run the denoising loop with optional I2V conditioning.
 
@@ -352,6 +364,10 @@ class LTX2Inferencer:
         from musubi_tuner.ltx_2.model.ltx2_scheduler import EulerDiffusionStep, X0PredictionWrapper
 
         stepper = EulerDiffusionStep()
+        effective_video_cfg = float(video_cfg_scale if video_cfg_scale is not None else cfg_scale)
+        effective_audio_cfg = float(audio_cfg_scale if audio_cfg_scale is not None else cfg_scale)
+        effective_video_rescale = float(video_rescale_scale if video_rescale_scale is not None else rescale_scale)
+        effective_audio_rescale = float(audio_rescale_scale if audio_rescale_scale is not None else rescale_scale)
 
         # Setup I2V conditioning mask if provided
         denoise_mask = None
@@ -484,7 +500,7 @@ class LTX2Inferencer:
                 video_pred = model_pred
 
             # IMPORTANT: Convert velocity to x0 FIRST, then apply CFG to x0
-            # This matches the official LTX-2 pipeline where X0Model wraps velocity model
+            # X0Model wraps the velocity model before guidance is applied.
             # and CFG is applied to denoised (x0) outputs, not velocity predictions
             video_pred = video_pred.to(dtype=latents.dtype)
 
@@ -496,11 +512,61 @@ class LTX2Inferencer:
                 # Convert each to x0
                 x0_uncond = X0PredictionWrapper.velocity_to_x0(latents, vel_uncond, sigma_for_video)
                 x0_cond = X0PredictionWrapper.velocity_to_x0(latents, vel_cond, sigma_for_video)
-                # Apply CFG to x0 (official formula)
-                video_x0 = x0_uncond + cfg_scale * (x0_cond - x0_uncond)
+                # Apply CFG to x0 using the LTX-2 formula
+                video_x0 = x0_uncond + effective_video_cfg * (x0_cond - x0_uncond)
             else:
                 x0_cond = X0PredictionWrapper.velocity_to_x0(latents, video_pred, sigma_for_video)
                 video_x0 = x0_cond
+
+            # Modality guidance: extra conditional forward with A2V/V2A attention skipped.
+            if (
+                audio_latents is not None
+                and (video_modality_scale != 1.0 or audio_modality_scale != 1.0)
+                and x0_cond is not None
+            ):
+                from musubi_tuner.ltx_2.guidance.perturbations import (
+                    BatchedPerturbationConfig,
+                    Perturbation,
+                    PerturbationConfig,
+                    PerturbationType,
+                )
+
+                mod_context = prompt_embeds[prompt_embeds.shape[0] // 2 :] if do_cfg else prompt_embeds
+                mod_mask = prompt_mask[prompt_mask.shape[0] // 2 :] if do_cfg and prompt_mask is not None else prompt_mask
+                mod_opts: Dict[str, Any] = {
+                    "patches_replace": {},
+                    "perturbations": BatchedPerturbationConfig(
+                        [
+                            PerturbationConfig(
+                                perturbations=[
+                                    Perturbation(type=PerturbationType.SKIP_A2V_CROSS_ATTN, blocks=None),
+                                    Perturbation(type=PerturbationType.SKIP_V2A_CROSS_ATTN, blocks=None),
+                                ]
+                            )
+                        ]
+                    ),
+                }
+                if i2v_conditioning_mask_tokens is not None:
+                    mod_opts["video_conditioning_mask"] = i2v_conditioning_mask_tokens
+                mod_pred = self.transformer(
+                    [latents.to(dtype=self.dit_dtype), audio_latents.to(dtype=self.dit_dtype)],
+                    timestep=sigma.expand(1).to(device=self.device, dtype=self.dit_dtype).unsqueeze(1),
+                    context=mod_context,
+                    attention_mask=mod_mask,
+                    frame_rate=frame_rate,
+                    transformer_options=mod_opts,
+                    audio_only=audio_only,
+                )
+                if isinstance(mod_pred, (list, tuple)):
+                    mod_video_vel, mod_audio_vel = mod_pred
+                else:
+                    mod_video_vel, mod_audio_vel = mod_pred, None
+                mod_video_x0 = X0PredictionWrapper.velocity_to_x0(
+                    latents, mod_video_vel.to(dtype=latents.dtype), sigma_for_video
+                )
+                video_x0 = video_x0 + (video_modality_scale - 1.0) * (x0_cond - mod_video_x0)
+            else:
+                mod_audio_vel = None
 
             # STG refinement: perturbed forward (self-attention skipped at chosen blocks),
             # then steer x0 toward (x0_cond - x0_perturbed). Opt-in via stg_scale > 0.
@@ -586,16 +652,16 @@ class LTX2Inferencer:
                     )
 
             # CFG★ rescaling: after CFG + STG, rescale prediction toward cond.std() to
-            # prevent oversaturation from amplified guidance. Matches official MultiModalGuider.
-            if rescale_scale > 0.0 and x0_cond is not None:
+            # prevent oversaturation from amplified guidance. Matches the MultiModalGuider behavior.
+            if effective_video_rescale > 0.0 and x0_cond is not None:
                 pred_std = video_x0.std()
                 if pred_std > 1e-6:
                     factor = x0_cond.std() / pred_std
-                    factor = rescale_scale * factor + (1.0 - rescale_scale)
+                    factor = effective_video_rescale * factor + (1.0 - effective_video_rescale)
                     video_x0 = video_x0 * factor
 
             if denoise_mask is not None and clean_latent is not None:
-                # Official LTX-2 ordering: blend denoised x0 before Euler step.
+                # LTX-2 ordering: blend denoised x0 before Euler step.
                 video_x0 = video_x0 * denoise_mask + clean_latent * (1.0 - denoise_mask)
 
             latents = stepper.step(latents, video_x0, sigmas, step_idx)
@@ -612,17 +678,22 @@ class LTX2Inferencer:
                     aud_vel_uncond, aud_vel_cond = audio_pred.chunk(2)
                     aud_x0_uncond = X0PredictionWrapper.velocity_to_x0(audio_latents, aud_vel_uncond, sigma.item())
                     aud_x0_cond = X0PredictionWrapper.velocity_to_x0(audio_latents, aud_vel_cond, sigma.item())
-                    audio_x0 = aud_x0_uncond + cfg_scale * (aud_x0_cond - aud_x0_uncond)
+                    audio_x0 = aud_x0_uncond + effective_audio_cfg * (aud_x0_cond - aud_x0_uncond)
                 else:
                     aud_x0_cond = X0PredictionWrapper.velocity_to_x0(audio_latents, audio_pred, sigma.item())
                     audio_x0 = aud_x0_cond
+                if mod_audio_vel is not None:
+                    mod_audio_x0 = X0PredictionWrapper.velocity_to_x0(
+                        audio_latents, mod_audio_vel.to(dtype=audio_latents.dtype), sigma.item()
+                    )
+                    audio_x0 = audio_x0 + (audio_modality_scale - 1.0) * (aud_x0_cond - mod_audio_x0)
                 if x0_audio_ptb is not None:
                     audio_x0 = audio_x0 + stg_scale * (aud_x0_cond - x0_audio_ptb)
-                if rescale_scale > 0.0:
+                if effective_audio_rescale > 0.0:
                     pred_std = audio_x0.std()
                     if pred_std > 1e-6:
                         factor = aud_x0_cond.std() / pred_std
-                        factor = rescale_scale * factor + (1.0 - rescale_scale)
+                        factor = effective_audio_rescale * factor + (1.0 - effective_audio_rescale)
                         audio_x0 = audio_x0 * factor
                 audio_latents = stepper.step(audio_latents, audio_x0, sigmas, step_idx)
 
@@ -695,9 +766,11 @@ class LTX2Inferencer:
         """
         from musubi_tuner.ltx_2.types import AudioLatentShape, VideoPixelShape
 
-        # Setup (official-style CFG activation: enabled only when effective scale != 1.0)
+        # Setup CFG activation: enabled only when effective scale != 1.0.
         cfg_scale = config.cfg_scale if config.cfg_scale is not None else config.guidance_scale
-        do_cfg = float(cfg_scale) != 1.0
+        video_cfg_scale = config.video_cfg_scale if config.video_cfg_scale is not None else cfg_scale
+        audio_cfg_scale = config.audio_cfg_scale if config.audio_cfg_scale is not None else cfg_scale
+        do_cfg = float(video_cfg_scale) != 1.0 or float(audio_cfg_scale) != 1.0
 
         # Seed
         if config.seed is not None:
@@ -763,7 +836,7 @@ class LTX2Inferencer:
                 )
 
         # Stage 1: Main generation
-        # Official pipeline does NOT pass latent to scheduler - uses default MAX_SHIFT_ANCHOR=4096
+        # Use the default scheduler shift anchor.
         from musubi_tuner.ltx_2.components.schedulers import LTX2Scheduler
         scheduler = LTX2Scheduler()
         sigmas = scheduler.execute(steps=config.sample_steps).to(device=self.device, dtype=torch.float32)
@@ -784,6 +857,12 @@ class LTX2Inferencer:
                 stg_blocks=config.stg_blocks,
                 stg_mode=config.stg_mode,
                 rescale_scale=config.rescale_scale,
+                video_cfg_scale=video_cfg_scale,
+                audio_cfg_scale=audio_cfg_scale,
+                video_rescale_scale=config.video_rescale_scale,
+                audio_rescale_scale=config.audio_rescale_scale,
+                video_modality_scale=config.video_modality_scale,
+                audio_modality_scale=config.audio_modality_scale,
             )
 
         # Stage 2: Upsample and refine (if two-stage)
@@ -875,7 +954,7 @@ class LTX2Inferencer:
             )
             latents = (1.0 - sigma) * latents + sigma * video_noise
 
-            # Also add noise to audio latents if present (official pipeline does this)
+            # Also add noise to audio latents if present.
             if audio_latents is not None:
                 audio_noise = torch.randn(
                     audio_latents.shape, dtype=audio_latents.dtype, device=audio_latents.device, generator=generator
@@ -894,6 +973,12 @@ class LTX2Inferencer:
                     stg_scale=config.stg_scale,
                     stg_blocks=config.stg_blocks,
                     stg_mode=config.stg_mode,
+                    video_cfg_scale=1.0,
+                    audio_cfg_scale=1.0,
+                    video_rescale_scale=0.0,
+                    audio_rescale_scale=0.0,
+                    video_modality_scale=1.0,
+                    audio_modality_scale=1.0,
                 )
 
             # Remove distilled LoRA

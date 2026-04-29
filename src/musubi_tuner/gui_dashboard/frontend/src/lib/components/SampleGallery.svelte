@@ -119,7 +119,9 @@
 		onkeydown={(e) => e.key === 'Escape' && closeViewer()}
 	>
 		{#if viewerType === 'video'}
-			<video src={viewerSrc} class="max-w-[90vw] max-h-[90vh]" controls autoplay></video>
+			<video src={viewerSrc} class="max-w-[90vw] max-h-[90vh]" controls autoplay>
+				<track kind="captions" />
+			</video>
 		{:else if viewerType === 'audio'}
 			<audio src={viewerSrc} controls autoplay></audio>
 		{:else}

@@ -254,10 +254,123 @@ _DOWNLOAD_PRESETS: dict[str, dict] = {
 }
 
 
+def _download_preset_url(preset: dict) -> str:
+    repo = preset["repo"]
+    filename = preset.get("filename")
+    if filename:
+        return f"https://huggingface.co/{repo}/resolve/main/{filename}"
+    return f"https://huggingface.co/{repo}"
+
+
+def _nearest_existing_parent(path: Path) -> Path:
+    current = path if path.is_dir() else path.parent
+    while not current.exists() and current != current.parent:
+        current = current.parent
+    return current
+
+
+def _format_bytes_for_message(value: int | None) -> str:
+    if value is None:
+        return "unknown"
+    units = ["B", "KB", "MB", "GB", "TB"]
+    amount = float(value)
+    index = 0
+    while amount >= 1024 and index < len(units) - 1:
+        amount /= 1024
+        index += 1
+    return f"{amount:.1f} {units[index]}" if index else f"{int(amount)} B"
+
+
+def _estimate_download_size(preset: dict) -> tuple[int | None, str | None]:
+    try:
+        from huggingface_hub import HfApi, hf_hub_url
+        from huggingface_hub.file_download import get_hf_file_metadata
+        from huggingface_hub.hf_api import RepoFile
+    except ImportError:
+        return None, "huggingface_hub is not installed; download size cannot be estimated."
+
+    repo = preset["repo"]
+    filename = preset.get("filename")
+    try:
+        if filename:
+            metadata = get_hf_file_metadata(hf_hub_url(repo_id=repo, filename=filename), token=None)
+            return metadata.size or None, None
+
+        api = HfApi()
+        total = 0
+        found_size = False
+        for entry in api.list_repo_tree(repo_id=repo, recursive=True, expand=True, repo_type="model"):
+            if isinstance(entry, RepoFile) and entry.size is not None:
+                total += int(entry.size)
+                found_size = True
+        return (total if found_size else None), None
+    except Exception as exc:
+        logger.debug("Could not estimate download size for %s: %s", repo, exc)
+        return None, f"Download size could not be estimated: {exc}"
+
+
+def _build_download_preflight(preset_key: str, dest_path: str) -> dict:
+    preset = _DOWNLOAD_PRESETS[preset_key]
+    target_path = Path(dest_path)
+    partial_path = target_path.with_name(f"{target_path.name}.partial")
+    target_exists = target_path.exists()
+    partial_exists = partial_path.exists()
+    size_bytes, size_warning = _estimate_download_size(preset)
+
+    disk_root = _nearest_existing_parent(target_path)
+    free_bytes = None
+    disk_warning = None
+    try:
+        free_bytes = shutil.disk_usage(str(disk_root)).free
+    except Exception as exc:
+        disk_warning = f"Free disk space could not be checked: {exc}"
+
+    enough_space = None
+    if size_bytes is not None and free_bytes is not None:
+        enough_space = free_bytes >= int(size_bytes * 1.05)
+
+    warnings = [w for w in (size_warning, disk_warning) if w]
+    errors: list[str] = []
+    if target_exists:
+        errors.append(f"Target already exists: {target_path}")
+    if partial_exists:
+        errors.append(f"Partial download already exists: {partial_path}")
+    if enough_space is False:
+        errors.append(
+            f"Not enough free disk space: need about {_format_bytes_for_message(size_bytes)}, "
+            f"available {_format_bytes_for_message(free_bytes)}."
+        )
+
+    return {
+        "ok": not errors,
+        "preset": preset_key,
+        "url": _download_preset_url(preset),
+        "target_path": str(target_path),
+        "target_exists": target_exists,
+        "partial_path": str(partial_path),
+        "partial_exists": partial_exists,
+        "total_bytes": size_bytes,
+        "free_bytes": free_bytes,
+        "enough_space": enough_space,
+        "warnings": warnings,
+        "errors": errors,
+    }
+
+
 @router.get("/download-presets")
 async def get_download_presets():
     """Return available model download presets."""
-    return {"presets": {k: {"label": v["label"]} for k, v in _DOWNLOAD_PRESETS.items()}}
+    return {
+        "presets": {
+            k: {
+                "label": v["label"],
+                "repo": v["repo"],
+                "filename": v.get("filename"),
+                "url": _download_preset_url(v),
+            }
+            for k, v in _DOWNLOAD_PRESETS.items()
+        }
+    }
 
 
 class DownloadRequest(BaseModel):
@@ -339,13 +452,10 @@ def _snapshot_download_job(job: DownloadJob) -> dict:
         }
 
 
-def _ensure_clean_target(path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+def _ensure_target_available(path: Path) -> None:
     if path.exists():
-        if path.is_dir():
-            shutil.rmtree(path)
-        else:
-            path.unlink()
+        raise FileExistsError(f"Target already exists: {path}")
+    path.parent.mkdir(parents=True, exist_ok=True)
 
 
 def _download_file(
@@ -355,10 +465,10 @@ def _download_file(
     destination: Path,
     job: DownloadJob,
 ) -> None:
-    destination.parent.mkdir(parents=True, exist_ok=True)
+    _ensure_target_available(destination)
     temp_path = destination.with_name(f"{destination.name}.partial")
     if temp_path.exists():
-        temp_path.unlink()
+        raise FileExistsError(f"Partial download already exists: {temp_path}")
 
     try:
         with session.get(url, stream=True, timeout=30) as response:
@@ -372,7 +482,6 @@ def _download_file(
                     handle.write(chunk)
                     _add_job_progress(job, len(chunk))
 
-        _ensure_clean_target(destination)
         temp_path.replace(destination)
     except Exception:
         if temp_path.exists():
@@ -463,10 +572,16 @@ async def download_model(req: DownloadRequest, request: Request):
     if req.preset not in _DOWNLOAD_PRESETS:
         raise HTTPException(status_code=400, detail=f"Unknown preset: {req.preset}")
 
+    preflight = _build_download_preflight(req.preset, req.dest_path)
+    if not preflight["ok"]:
+        raise HTTPException(status_code=409, detail="; ".join(preflight["errors"]))
+
+    target_path = Path(preflight["target_path"])
+
     job = DownloadJob(
         job_id=uuid.uuid4().hex,
         preset=req.preset,
-        target_path=req.dest_path,
+        target_path=str(target_path),
     )
     jobs = _get_download_jobs(request)
     _prune_finished_downloads(jobs)
@@ -474,6 +589,14 @@ async def download_model(req: DownloadRequest, request: Request):
     job.thread = threading.Thread(target=_run_download_job, args=(job,), daemon=True)
     job.thread.start()
     return _snapshot_download_job(job)
+
+
+@router.post("/download-preflight")
+async def download_preflight(req: DownloadRequest):
+    """Check target conflicts and disk space before starting a model download."""
+    if req.preset not in _DOWNLOAD_PRESETS:
+        raise HTTPException(status_code=400, detail=f"Unknown preset: {req.preset}")
+    return _build_download_preflight(req.preset, req.dest_path)
 
 
 @router.get("/download-model/{job_id}")

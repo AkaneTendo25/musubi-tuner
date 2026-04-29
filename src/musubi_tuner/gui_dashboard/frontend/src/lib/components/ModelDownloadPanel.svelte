@@ -8,12 +8,19 @@
 	} from '$lib/utils/modelPaths.js';
 	import {
 		cancelModelDownload,
+		checkPathExists,
 		formatModelDownloadStatus,
+		formatModelPreflightStatus,
+		getModelDownloadPresets,
+		getModelDownloadPreflight,
 		getModelDownloadStatus,
 		getModelDownloadTone,
 		isActiveModelDownload,
+		modelDownloadTooltip,
+		scanCheckpoints,
 		startModelDownload
 	} from '$lib/utils/modelDownloads.js';
+	import ModelPathStatus from './ModelPathStatus.svelte';
 
 	let { section = 'caching', title = 'Model Downloads', description = '' } = $props();
 
@@ -21,6 +28,11 @@
 	let downloading = $state('');
 	let status = $state('');
 	let statusTone = $state('muted');
+	let downloadPresets = $state({});
+	let ltxDownloadExists = $state(false);
+	let gemmaDownloadExists = $state(false);
+	let foundLtxPath = $state('');
+	let foundGemmaPath = $state('');
 	let downloadJobId = $state('');
 	let downloadState = $state('');
 	let downloadPollTimer = null;
@@ -29,6 +41,9 @@
 		try {
 			const res = await fetch('/api/fs/cwd');
 			if (res.ok) cwd = (await res.json()).cwd || '';
+		} catch {}
+		try {
+			downloadPresets = await getModelDownloadPresets();
 		} catch {}
 	});
 
@@ -48,6 +63,38 @@
 		)
 	);
 	let hasActiveDownload = $derived(Boolean(downloadJobId) && ['queued', 'running', 'cancelling'].includes(downloadState));
+
+	$effect(() => {
+		const path = resolvedLtx;
+		let cancelled = false;
+		checkPathExists(path).then((exists) => { if (!cancelled) ltxDownloadExists = exists; }).catch(() => { if (!cancelled) ltxDownloadExists = false; });
+		return () => { cancelled = true; };
+	});
+
+	$effect(() => {
+		const path = resolvedGemma;
+		let cancelled = false;
+		checkPathExists(path).then((exists) => { if (!cancelled) gemmaDownloadExists = exists; }).catch(() => { if (!cancelled) gemmaDownloadExists = false; });
+		return () => { cancelled = true; };
+	});
+
+	$effect(() => {
+		if (!cwd) return;
+		let cancelled = false;
+		scanCheckpoints('ltx2', modelDir).then((results) => {
+			if (!cancelled) foundLtxPath = results.find((p) => p === resolvedLtx) || results[0] || '';
+		}).catch(() => { if (!cancelled) foundLtxPath = ''; });
+		return () => { cancelled = true; };
+	});
+
+	$effect(() => {
+		if (!cwd) return;
+		let cancelled = false;
+		scanCheckpoints('gemma', modelDir).then((results) => {
+			if (!cancelled) foundGemmaPath = results.find((p) => p === resolvedGemma) || results[0] || '';
+		}).catch(() => { if (!cancelled) foundGemmaPath = ''; });
+		return () => { cancelled = true; };
+	});
 
 	function setStatus(downloadStatus) {
 		status = formatModelDownloadStatus(downloadStatus);
@@ -109,6 +156,13 @@
 		await saveProjectNow();
 
 		try {
+			const preflight = await getModelDownloadPreflight(preset, targetPath);
+			setStatus({
+				state: preflight.ok ? 'queued' : 'failed',
+				message: formatModelPreflightStatus(preflight),
+				error: preflight.errors?.join('; ')
+			});
+			if (!preflight.ok) return;
 			const job = await startModelDownload(preset, targetPath);
 			downloading = preset;
 			downloadJobId = job.job_id || '';
@@ -148,11 +202,12 @@
 			<div class="flex items-center justify-between gap-2">
 				<div>
 					<div class="text-[12px] font-semibold" style="color: var(--text-primary);">LTX-2 Checkpoint</div>
-					<div class="text-[10px]" style="color: var(--text-muted);">Downloads `Lightricks/LTX-2` checkpoint</div>
+					<div class="text-[10px]" style="color: var(--text-muted);">Downloads the checkpoint file</div>
 				</div>
 				<button
 					onclick={() => handleDownload('ltxav')}
-					disabled={hasActiveDownload}
+					disabled={hasActiveDownload || ltxDownloadExists}
+					data-tooltip={modelDownloadTooltip(downloadPresets, 'ltxav', resolvedLtx, ltxDownloadExists)}
 					class="px-3 py-1 text-[11px] font-medium disabled:opacity-40"
 					style="background: var(--accent-muted); color: var(--accent); border: 1px solid var(--accent); border-radius: var(--radius-sm);"
 				>
@@ -160,17 +215,22 @@
 				</button>
 			</div>
 			<div class="text-[10px] font-mono break-all" style="color: var(--text-muted);">{resolvedLtx}</div>
+			<ModelPathStatus exists={ltxDownloadExists} foundPath={foundLtxPath} disabled={hasActiveDownload} onusefound={(path) => {
+				projectConfig.update((config) => config ? { ...config, default_ltx2_checkpoint: path, [section]: { ...(config[section] || {}), ltx2_checkpoint: path } } : config);
+				saveProjectNow();
+			}} />
 		</div>
 
 		<div class="p-3 space-y-2" style="background: var(--bg-elevated); border: 1px solid var(--border-subtle); border-radius: var(--radius-sm);">
 			<div class="flex items-center justify-between gap-2">
 				<div>
 					<div class="text-[12px] font-semibold" style="color: var(--text-primary);">Gemma Text Encoder</div>
-					<div class="text-[10px]" style="color: var(--text-muted);">Downloads `unsloth/gemma-3-12b-it`</div>
+					<div class="text-[10px]" style="color: var(--text-muted);">Downloads the text encoder files</div>
 				</div>
 				<button
 					onclick={() => handleDownload('gemma-unsloth')}
-					disabled={hasActiveDownload}
+					disabled={hasActiveDownload || gemmaDownloadExists}
+					data-tooltip={modelDownloadTooltip(downloadPresets, 'gemma-unsloth', resolvedGemma, gemmaDownloadExists)}
 					class="px-3 py-1 text-[11px] font-medium disabled:opacity-40"
 					style="background: var(--accent-muted); color: var(--accent); border: 1px solid var(--accent); border-radius: var(--radius-sm);"
 				>
@@ -178,6 +238,10 @@
 				</button>
 			</div>
 			<div class="text-[10px] font-mono break-all" style="color: var(--text-muted);">{resolvedGemma}</div>
+			<ModelPathStatus exists={gemmaDownloadExists} foundPath={foundGemmaPath} disabled={hasActiveDownload} onusefound={(path) => {
+				projectConfig.update((config) => config ? { ...config, default_gemma_root: path, default_gemma_safetensors: '', [section]: { ...(config[section] || {}), gemma_root: path, gemma_safetensors: '' } } : config);
+				saveProjectNow();
+			}} />
 		</div>
 	</div>
 

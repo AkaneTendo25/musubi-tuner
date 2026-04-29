@@ -429,7 +429,7 @@
 
 			<div class="p-5 pt-2 space-y-2">
 				<div class="grid grid-cols-3 gap-2">
-					<FormSelect label="Logit Mode" value={$projectConfig?.training?.shifted_logit_mode || ''} options={[{value:'',label:'Auto'},{value:'legacy',label:'Legacy'},{value:'stretched',label:'Stretched'}]} onchange={(e) => updateTraining('shifted_logit_mode', e.target.value || null)} tooltip="legacy: historical behavior, stretched: upstream Mar-2026" />
+					<FormSelect label="Logit Mode" value={$projectConfig?.training?.shifted_logit_mode || ''} options={[{value:'',label:'Auto'},{value:'legacy',label:'Legacy'},{value:'stretched',label:'Stretched'}]} onchange={(e) => updateTraining('shifted_logit_mode', e.target.value || null)} tooltip="legacy: historical behavior, stretched: percentile stretch behavior" />
 					<FormField label="Eps" type="number" value={$projectConfig?.training?.shifted_logit_eps ?? 0.001} oninput={(e) => updateTraining('shifted_logit_eps', Number(e.target.value))} step="0.001" tooltip="Numerical epsilon for stretched mode" />
 					<FormField label="Uniform Prob" type="number" value={$projectConfig?.training?.shifted_logit_uniform_prob ?? 0.1} oninput={(e) => updateTraining('shifted_logit_uniform_prob', Number(e.target.value))} step="0.05" min={0} max={1} tooltip="Uniform fallback probability" />
 				</div>

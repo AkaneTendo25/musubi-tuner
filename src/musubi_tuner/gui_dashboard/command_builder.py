@@ -108,6 +108,11 @@ def _append_network_arg(args_parts: list[str], key: str, value) -> None:
     args_parts.append(f"{key}={value}")
 
 
+def _append_optional(cmd: list[str], flag: str, value) -> None:
+    if value is not None:
+        cmd += [flag, str(value)]
+
+
 def build_cache_latents_cmd(config: ProjectConfig) -> list[str]:
     """Build CLI args for ltx2_cache_latents.py."""
     toml_path = export_dataset_toml(config)
@@ -298,25 +303,41 @@ def build_inference_cmd(config: ProjectConfig) -> list[str]:
         cmd += ["--from_file", s.from_file]
 
     # Sampling params
-    cmd += ["--height", str(s.height)]
-    cmd += ["--width", str(s.width)]
-    cmd += ["--frame_count", str(s.frame_count)]
-    cmd += ["--frame_rate", str(s.frame_rate)]
-    cmd += ["--sample_steps", str(s.sample_steps)]
-    cmd += ["--guidance_scale", str(s.guidance_scale)]
+    cmd += ["--sampling_preset", s.sampling_preset]
+    if s.use_default_negative_prompt is True:
+        cmd.append("--use_default_negative_prompt")
+    elif s.use_default_negative_prompt is False:
+        cmd.append("--no-use_default_negative_prompt")
+    _append_optional(cmd, "--height", s.height)
+    _append_optional(cmd, "--width", s.width)
+    _append_optional(cmd, "--frame_count", s.frame_count)
+    _append_optional(cmd, "--frame_rate", s.frame_rate)
+    _append_optional(cmd, "--sample_steps", s.sample_steps)
+    _append_optional(cmd, "--guidance_scale", s.guidance_scale)
     if s.cfg_scale is not None:
         cmd += ["--cfg_scale", str(s.cfg_scale)]
     cmd += ["--discrete_flow_shift", str(s.discrete_flow_shift)]
     if s.seed is not None:
         cmd += ["--seed", str(s.seed)]
-    if s.stg_scale != 0.0:
+    _append_optional(cmd, "--video_cfg_scale", s.video_cfg_scale)
+    _append_optional(cmd, "--audio_cfg_scale", s.audio_cfg_scale)
+    _append_optional(cmd, "--video_modality_scale", s.video_modality_scale)
+    _append_optional(cmd, "--audio_modality_scale", s.audio_modality_scale)
+    _append_optional(cmd, "--video_rescale_scale", s.video_rescale_scale)
+    _append_optional(cmd, "--audio_rescale_scale", s.audio_rescale_scale)
+    if s.stg_scale is not None:
         cmd += ["--stg_scale", str(s.stg_scale)]
     if s.stg_blocks:
         cmd += ["--stg_blocks"] + _split_cli_args(s.stg_blocks)
-    if s.stg_mode != "video":
+    if s.stg_mode:
         cmd += ["--stg_mode", s.stg_mode]
-    if s.rescale_scale != 0.0:
+    if s.rescale_scale is not None:
         cmd += ["--rescale_scale", str(s.rescale_scale)]
+    if s.av_bimodal_cfg is True:
+        cmd.append("--av_bimodal_cfg")
+    elif s.av_bimodal_cfg is False:
+        cmd.append("--no-av_bimodal_cfg")
+    _append_optional(cmd, "--av_bimodal_scale", s.av_bimodal_scale)
 
     # Precision
     if s.mixed_precision != "no":
@@ -742,9 +763,20 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
         cmd.append("--use_precached_sample_latents")
     if t.sample_latents_cache:
         cmd += ["--sample_latents_cache", t.sample_latents_cache]
-    cmd += ["--height", str(t.height)]
-    cmd += ["--width", str(t.width)]
-    cmd += ["--sample_num_frames", str(t.sample_num_frames)]
+    cmd += ["--sample_sampling_preset", t.sample_sampling_preset]
+    if t.sample_use_default_negative_prompt is True:
+        cmd.append("--sample_use_default_negative_prompt")
+    elif t.sample_use_default_negative_prompt is False:
+        cmd.append("--no-sample_use_default_negative_prompt")
+    _append_optional(cmd, "--height", t.height)
+    _append_optional(cmd, "--width", t.width)
+    _append_optional(cmd, "--sample_num_frames", t.sample_num_frames)
+    _append_optional(cmd, "--video_cfg_scale", t.video_cfg_scale)
+    _append_optional(cmd, "--audio_cfg_scale", t.audio_cfg_scale)
+    _append_optional(cmd, "--video_modality_scale", t.video_modality_scale)
+    _append_optional(cmd, "--audio_modality_scale", t.audio_modality_scale)
+    _append_optional(cmd, "--video_rescale_scale", t.video_rescale_scale)
+    _append_optional(cmd, "--audio_rescale_scale", t.audio_rescale_scale)
     if t.sample_with_offloading:
         cmd.append("--sample_with_offloading")
     if t.sample_merge_audio:

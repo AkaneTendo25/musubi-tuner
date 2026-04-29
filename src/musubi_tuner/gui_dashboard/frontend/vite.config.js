@@ -7,6 +7,17 @@ export default defineConfig({
 	optimizeDeps: {
 		exclude: ['@duckdb/duckdb-wasm']
 	},
+	build: {
+		chunkSizeWarningLimit: 1200,
+		rollupOptions: {
+			output: {
+				manualChunks(id) {
+					if (id.includes('node_modules/echarts')) return 'vendor-echarts';
+					if (id.includes('node_modules/@duckdb')) return 'vendor-duckdb';
+				}
+			}
+		}
+	},
 	server: {
 		hmr: true,
 		proxy: {

@@ -146,7 +146,7 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
                  "audio", "audio_ref_only_ic", "av_ic", "video_ref_only_av", "full", "lycoris"],
         help=(
             "LoRA target preset: "
-            "'t2v' = text-to-video (all attention, official default), "
+            "'t2v' = text-to-video (all attention, default), "
             "'v2v' = video-to-video/IC-LoRA (all attention + feed-forward), "
             "'video_sa' = video self-attention only, "
             "'video_sa_ff' = video self-attention + video feed-forward, "
@@ -250,7 +250,7 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         help=(
             "Enable audio-video bimodal CFG during sampling. Runs an extra forward pass "
             "with cross-modal attention (A2V, V2A) disabled to strengthen independent "
-            "modality generation. Used by official ID-LoRA inference."
+            "modality generation. Used by the ID-LoRA inference path."
         ),
     )
     parser.add_argument(
@@ -260,13 +260,66 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         help="Scale for AV bimodal CFG. Applied as (scale-1) * (cond - bimodal). Default: 3.0.",
     )
     parser.add_argument(
+        "--sample_sampling_preset",
+        "--sampling_preset",
+        type=str,
+        default="defaults",
+        choices=["legacy", "defaults", "ltx20", "ltx23", "ltx23_hq", "distilled_two_stage"],
+        help=(
+            "Sampling defaults for validation previews. 'legacy' preserves current behavior; "
+            "'defaults' selects the preset for --ltx_version."
+        ),
+    )
+    parser.add_argument(
+        "--sample_use_default_negative_prompt",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Use the default LTX negative prompt when a CFG sample has no --n/negative_prompt.",
+    )
+    parser.add_argument(
+        "--video_cfg_scale",
+        type=float,
+        default=None,
+        help="Video CFG scale for LTX-2 sampling. Defaults to cfg_scale/guidance_scale unless a preset sets it.",
+    )
+    parser.add_argument(
+        "--audio_cfg_scale",
+        type=float,
+        default=None,
+        help="Audio CFG scale for LTX-2 sampling. Defaults to cfg_scale/guidance_scale unless a preset sets it.",
+    )
+    parser.add_argument(
+        "--video_modality_scale",
+        type=float,
+        default=None,
+        help="Video A2V modality guidance scale. Default preset uses 3.0.",
+    )
+    parser.add_argument(
+        "--audio_modality_scale",
+        type=float,
+        default=None,
+        help="Audio V2A modality guidance scale. Default preset uses 3.0.",
+    )
+    parser.add_argument(
+        "--video_rescale_scale",
+        type=float,
+        default=None,
+        help="Video CFG rescale scale. Defaults to --rescale_scale unless a preset sets it.",
+    )
+    parser.add_argument(
+        "--audio_rescale_scale",
+        type=float,
+        default=None,
+        help="Audio CFG rescale scale. Defaults to --rescale_scale unless a preset sets it.",
+    )
+    parser.add_argument(
         "--stg_scale",
         type=float,
-        default=0.0,
+        default=None,
         help=(
-            "Spatio-Temporal Guidance (STG) scale. 0.0 disables STG (default, no extra cost). "
+            "Spatio-Temporal Guidance (STG) scale. None inherits from --sample_sampling_preset; 0.0 disables STG. "
             "When > 0, runs a perturbed forward with self-attention skipped at --stg_blocks "
-            "and steers x0 by stg_scale * (cond - perturbed). Official pipeline uses ~1.0."
+            "and steers x0 by stg_scale * (cond - perturbed). Default preset uses 1.0."
         ),
     )
     parser.add_argument(
@@ -276,17 +329,17 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         default=None,
         help=(
             "Transformer block indices to perturb for STG. None = all blocks. "
-            "Official default targets a single late block, e.g. --stg_blocks 29."
+            "Default preset targets a single late block, e.g. --stg_blocks 29."
         ),
     )
     parser.add_argument(
         "--stg_mode",
         type=str,
-        default="video",
+        default=None,
         choices=["video", "audio", "both"],
         help=(
-            "Which modality to perturb for STG. 'video' skips video self-attn "
-            "(default), 'audio' skips audio self-attn, 'both' skips both (AV mode)."
+            "Which modality to perturb for STG. None inherits from --sample_sampling_preset; "
+            "'video' skips video self-attn, 'audio' skips audio self-attn, 'both' skips both (AV mode)."
         ),
     )
     parser.add_argument(
@@ -295,7 +348,7 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         default=0.0,
         help=(
             "CFG★ rescaling strength after CFG+STG. 0.0 disables (default). "
-            "Official LTX-2.3 pipeline uses 0.7 — prevents oversaturation from "
+            "LTX-2.3 default is 0.7; prevents oversaturation from "
             "amplified guidance by rescaling prediction toward cond.std()."
         ),
     )
@@ -434,7 +487,7 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         choices=["legacy", "stretched"],
         help=(
             "Shifted logit-normal sigma sampler mode. "
-            "'legacy' keeps historical behavior; 'stretched' enables upstream Mar-2026 sampling. "
+            "'legacy' keeps historical behavior; 'stretched' enables the current Mar-2026 sampling path. "
             "If unset, defaults by --ltx_version (2.0->legacy, 2.3->stretched)."
         ),
     )
@@ -694,7 +747,7 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         action=argparse.BooleanOptionalAction,
         default=True,
         help=(
-            "Use official-style I2V token timestep masking during sampling "
+            "Use LTX I2V token timestep masking during sampling "
             "(conditioned first-frame tokens use timestep=0 via video_conditioning_mask)."
         ),
     )
@@ -754,7 +807,7 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         "--sample_stage2_steps",
         type=int,
         default=3,
-        help="Number of denoising steps for stage 2 refinement (default: 3, official uses 3 steps with 4 sigma values).",
+        help="Number of denoising steps for stage 2 refinement (default: 3 steps with 4 sigma values).",
     )
 
     parser.add_argument(

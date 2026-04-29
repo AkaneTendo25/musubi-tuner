@@ -5,11 +5,12 @@
 	import FormGroup from '$lib/components/FormGroup.svelte';
 	import PathInput from '$lib/components/PathInput.svelte';
 	import CheckpointInput from '$lib/components/CheckpointInput.svelte';
+	import ModelPathStatus from '$lib/components/ModelPathStatus.svelte';
 	import ProcessConsole from '$lib/components/ProcessConsole.svelte';
 	import ProcessControls from '$lib/components/ProcessControls.svelte';
 	import CommandPanel from '$lib/components/CommandPanel.svelte';
 	import { defaultModelDir, effectiveGemmaRoot, effectiveGemmaSafetensors, effectiveLtx2Checkpoint } from '$lib/utils/modelPaths.js';
-	import { startModelDownload, getModelDownloadStatus, cancelModelDownload, formatModelDownloadStatus, getModelDownloadTone, isActiveModelDownload } from '$lib/utils/modelDownloads.js';
+	import { startModelDownload, getModelDownloadStatus, cancelModelDownload, formatModelDownloadStatus, getModelDownloadTone, isActiveModelDownload, getModelDownloadPresets, getModelDownloadPreflight, checkPathExists, scanCheckpoints, modelDownloadTooltip, formatModelPreflightStatus } from '$lib/utils/modelDownloads.js';
 	import { projectConfig, projectLoaded, updateSection, saveProjectNow } from '$lib/stores/project.js';
 	import { processStatuses, processLogs, startProcess, stopProcess, preloadLogsIfActive, startLogPolling } from '$lib/stores/processes.js';
 	import { advancedMode } from '$lib/stores/uiMode.js';
@@ -21,10 +22,16 @@
 	let downloadState = $state('');
 	let modelStatus = $state('');
 	let modelStatusTone = $state('muted');
+	let downloadPresets = $state({});
+	let ltxDownloadExists = $state(false);
+	let gemmaDownloadExists = $state(false);
+	let foundLtxPath = $state('');
+	let foundGemmaPath = $state('');
 	let downloadPollTimer = null;
 
 	onMount(() => {
 		fetch('/api/fs/cwd').then((res) => res.ok ? res.json() : null).then((data) => { cwd = data?.cwd || ''; }).catch(() => {});
+		getModelDownloadPresets().then((presets) => { downloadPresets = presets; }).catch(() => {});
 		preloadLogsIfActive(['cache_latents', 'cache_text', 'cache_dino']);
 		const logInterval = startLogPolling(['cache_latents', 'cache_text', 'cache_dino'], 1000);
 		return () => {
@@ -48,6 +55,38 @@
 	let gemmaRootDisabled = $derived(Boolean(activeGemmaSafetensors));
 	let resolvedGemma = $derived(effectiveGemmaRoot(cwd, $projectConfig, caching.gemma_root || '', activeGemmaSafetensors));
 	let hasActiveDownload = $derived(Boolean(downloadJobId) && ['queued', 'running', 'cancelling'].includes(downloadState));
+
+	$effect(() => {
+		const path = resolvedLtx;
+		let cancelled = false;
+		checkPathExists(path).then((exists) => { if (!cancelled) ltxDownloadExists = exists; }).catch(() => { if (!cancelled) ltxDownloadExists = false; });
+		return () => { cancelled = true; };
+	});
+
+	$effect(() => {
+		const path = resolvedGemma;
+		let cancelled = false;
+		checkPathExists(path).then((exists) => { if (!cancelled) gemmaDownloadExists = exists; }).catch(() => { if (!cancelled) gemmaDownloadExists = false; });
+		return () => { cancelled = true; };
+	});
+
+	$effect(() => {
+		if (!cwd) return;
+		let cancelled = false;
+		scanCheckpoints('ltx2', modelDir).then((results) => {
+			if (!cancelled) foundLtxPath = results.find((p) => p === resolvedLtx) || results[0] || '';
+		}).catch(() => { if (!cancelled) foundLtxPath = ''; });
+		return () => { cancelled = true; };
+	});
+
+	$effect(() => {
+		if (!cwd) return;
+		let cancelled = false;
+		scanCheckpoints('gemma', modelDir).then((results) => {
+			if (!cancelled) foundGemmaPath = results.find((p) => p === resolvedGemma) || results[0] || '';
+		}).catch(() => { if (!cancelled) foundGemmaPath = ''; });
+		return () => { cancelled = true; };
+	});
 
 	function setModelStatus(status) {
 		modelStatus = formatModelDownloadStatus(status);
@@ -91,6 +130,13 @@
 		const targetPath = preset === 'ltxav' ? resolvedLtx : resolvedGemma;
 		if (!targetPath) return;
 		try {
+			const preflight = await getModelDownloadPreflight(preset, targetPath);
+			setModelStatus({
+				state: preflight.ok ? 'queued' : 'failed',
+				message: formatModelPreflightStatus(preflight),
+				error: preflight.errors?.join('; ')
+			});
+			if (!preflight.ok) return;
 			const job = await startModelDownload(preset, targetPath);
 			downloading = preset;
 			downloadJobId = job.job_id || '';
@@ -127,8 +173,14 @@
 		<!-- Shared Settings -->
 		<div class="p-4 space-y-3" style="background: var(--bg-surface); border: 1px solid var(--border-subtle); border-radius: var(--radius-md);">
 			<div class="grid grid-cols-2 xl:grid-cols-3 gap-3">
-				<CheckpointInput label="LTX-2 Checkpoint" value={caching.ltx2_checkpoint || ''} onchange={(v) => updateCaching('ltx2_checkpoint', v)} showFiles tooltip="Path to the LTX-2 model checkpoint file" actionLabel="D" actionBusyLabel="..." actionDisabled={downloading === 'ltxav' && hasActiveDownload} actionTooltip={`Download to ${resolvedLtx}`} onaction={() => downloadModel('ltxav')} />
-				<CheckpointInput label="Gemma Root" value={caching.gemma_root || ''} onchange={(v) => updateCaching('gemma_root', v)} disabled={gemmaRootDisabled} tooltip={gemmaRootDisabled ? 'Ignored while Gemma Safetensors is set' : 'Root directory containing Gemma text encoder weights'} actionLabel="D" actionBusyLabel="..." actionDisabled={gemmaRootDisabled || (downloading === 'gemma-unsloth' && hasActiveDownload)} actionTooltip={gemmaRootDisabled ? 'Gemma Safetensors is active' : `Download to ${resolvedGemma}`} onaction={() => downloadModel('gemma-unsloth')} />
+				<div class="space-y-1">
+					<CheckpointInput label="LTX-2 Checkpoint" value={caching.ltx2_checkpoint || ''} onchange={(v) => updateCaching('ltx2_checkpoint', v)} showFiles tooltip="Path to the LTX-2 model checkpoint file" actionLabel="D" actionBusyLabel="..." actionDisabled={hasActiveDownload || ltxDownloadExists} actionTooltip={modelDownloadTooltip(downloadPresets, 'ltxav', resolvedLtx, ltxDownloadExists)} onaction={() => downloadModel('ltxav')} />
+					<ModelPathStatus exists={ltxDownloadExists} foundPath={foundLtxPath} disabled={hasActiveDownload} onusefound={(path) => updateCaching('ltx2_checkpoint', path)} />
+				</div>
+				<div class="space-y-1">
+					<CheckpointInput label="Gemma Root" value={caching.gemma_root || ''} onchange={(v) => updateCaching('gemma_root', v)} disabled={gemmaRootDisabled} tooltip={gemmaRootDisabled ? 'Ignored while Gemma Safetensors is set' : 'Root directory containing Gemma text encoder weights'} actionLabel="D" actionBusyLabel="..." actionDisabled={gemmaRootDisabled || hasActiveDownload || gemmaDownloadExists} actionTooltip={gemmaRootDisabled ? 'Gemma Safetensors is active' : modelDownloadTooltip(downloadPresets, 'gemma-unsloth', resolvedGemma, gemmaDownloadExists)} onaction={() => downloadModel('gemma-unsloth')} />
+					<ModelPathStatus exists={gemmaRootDisabled || gemmaDownloadExists} foundPath={foundGemmaPath} disabled={gemmaRootDisabled || hasActiveDownload} onusefound={(path) => { updateCaching('gemma_root', path); updateCaching('gemma_safetensors', ''); }} />
+				</div>
 				<FormSelect label="LTX-2 Mode" value={caching.ltx2_mode || 'video'} options={['video', 'av', 'audio']} onchange={(e) => updateCaching('ltx2_mode', e.target.value)} tooltip="Video: visual only, AV: audio+video, Audio: audio only" />
 			</div>
 			{#if modelStatus}

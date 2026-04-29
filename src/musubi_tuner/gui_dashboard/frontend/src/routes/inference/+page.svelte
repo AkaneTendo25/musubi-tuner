@@ -5,11 +5,12 @@
 	import FormGroup from '$lib/components/FormGroup.svelte';
 	import PathInput from '$lib/components/PathInput.svelte';
 	import CheckpointInput from '$lib/components/CheckpointInput.svelte';
+	import ModelPathStatus from '$lib/components/ModelPathStatus.svelte';
 	import ProcessConsole from '$lib/components/ProcessConsole.svelte';
 	import ProcessControls from '$lib/components/ProcessControls.svelte';
 	import CommandPanel from '$lib/components/CommandPanel.svelte';
 	import { defaultModelDir, effectiveGemmaRoot, effectiveGemmaSafetensors, effectiveLtx2Checkpoint } from '$lib/utils/modelPaths.js';
-	import { startModelDownload, getModelDownloadStatus, cancelModelDownload, formatModelDownloadStatus, getModelDownloadTone, isActiveModelDownload } from '$lib/utils/modelDownloads.js';
+	import { startModelDownload, getModelDownloadStatus, cancelModelDownload, formatModelDownloadStatus, getModelDownloadTone, isActiveModelDownload, getModelDownloadPresets, getModelDownloadPreflight, checkPathExists, scanCheckpoints, modelDownloadTooltip, formatModelPreflightStatus } from '$lib/utils/modelDownloads.js';
 	import { projectConfig, projectLoaded, updateSection, saveProjectNow } from '$lib/stores/project.js';
 	import { processStatuses, processLogs, startProcess, stopProcess, preloadLogsIfActive, startLogPolling } from '$lib/stores/processes.js';
 	import { advancedMode } from '$lib/stores/uiMode.js';
@@ -21,10 +22,16 @@
 	let downloadState = $state('');
 	let modelStatus = $state('');
 	let modelStatusTone = $state('muted');
+	let downloadPresets = $state({});
+	let ltxDownloadExists = $state(false);
+	let gemmaDownloadExists = $state(false);
+	let foundLtxPath = $state('');
+	let foundGemmaPath = $state('');
 	let downloadPollTimer = null;
 
 	onMount(() => {
 		fetch('/api/fs/cwd').then((res) => res.ok ? res.json() : null).then((data) => { cwd = data?.cwd || ''; }).catch(() => {});
+		getModelDownloadPresets().then((presets) => { downloadPresets = presets; }).catch(() => {});
 		preloadLogsIfActive('inference');
 		const logInterval = startLogPolling('inference', 1000);
 		return () => {
@@ -44,6 +51,38 @@
 	let gemmaRootDisabled = $derived(Boolean(activeGemmaSafetensors));
 	let resolvedGemma = $derived(effectiveGemmaRoot(cwd, $projectConfig, s.gemma_root || '', activeGemmaSafetensors));
 	let hasActiveDownload = $derived(Boolean(downloadJobId) && ['queued', 'running', 'cancelling'].includes(downloadState));
+
+	$effect(() => {
+		const path = resolvedLtx;
+		let cancelled = false;
+		checkPathExists(path).then((exists) => { if (!cancelled) ltxDownloadExists = exists; }).catch(() => { if (!cancelled) ltxDownloadExists = false; });
+		return () => { cancelled = true; };
+	});
+
+	$effect(() => {
+		const path = resolvedGemma;
+		let cancelled = false;
+		checkPathExists(path).then((exists) => { if (!cancelled) gemmaDownloadExists = exists; }).catch(() => { if (!cancelled) gemmaDownloadExists = false; });
+		return () => { cancelled = true; };
+	});
+
+	$effect(() => {
+		if (!cwd) return;
+		let cancelled = false;
+		scanCheckpoints('ltx2', modelDir).then((results) => {
+			if (!cancelled) foundLtxPath = results.find((p) => p === resolvedLtx) || results[0] || '';
+		}).catch(() => { if (!cancelled) foundLtxPath = ''; });
+		return () => { cancelled = true; };
+	});
+
+	$effect(() => {
+		if (!cwd) return;
+		let cancelled = false;
+		scanCheckpoints('gemma', modelDir).then((results) => {
+			if (!cancelled) foundGemmaPath = results.find((p) => p === resolvedGemma) || results[0] || '';
+		}).catch(() => { if (!cancelled) foundGemmaPath = ''; });
+		return () => { cancelled = true; };
+	});
 
 	function setModelStatus(status) {
 		modelStatus = formatModelDownloadStatus(status);
@@ -87,6 +126,13 @@
 		const targetPath = preset === 'ltxav' ? resolvedLtx : resolvedGemma;
 		if (!targetPath) return;
 		try {
+			const preflight = await getModelDownloadPreflight(preset, targetPath);
+			setModelStatus({
+				state: preflight.ok ? 'queued' : 'failed',
+				message: formatModelPreflightStatus(preflight),
+				error: preflight.errors?.join('; ')
+			});
+			if (!preflight.ok) return;
 			const job = await startModelDownload(preset, targetPath);
 			downloading = preset;
 			downloadJobId = job.job_id || '';
@@ -127,9 +173,11 @@
 			<div class="space-y-3">
 				<FormGroup title="Model">
 					<div class="space-y-2 pt-2">
-						<CheckpointInput label="LTX-2 Checkpoint" value={s.ltx2_checkpoint || ''} onchange={(v) => update('ltx2_checkpoint', v)} showFiles tooltip="Path to LTX-2 checkpoint" actionLabel="D" actionBusyLabel="..." actionDisabled={downloading === 'ltxav' && hasActiveDownload} actionTooltip={`Download to ${resolvedLtx}`} onaction={() => downloadModel('ltxav')} />
+						<CheckpointInput label="LTX-2 Checkpoint" value={s.ltx2_checkpoint || ''} onchange={(v) => update('ltx2_checkpoint', v)} showFiles tooltip="Path to LTX-2 checkpoint" actionLabel="D" actionBusyLabel="..." actionDisabled={hasActiveDownload || ltxDownloadExists} actionTooltip={modelDownloadTooltip(downloadPresets, 'ltxav', resolvedLtx, ltxDownloadExists)} onaction={() => downloadModel('ltxav')} />
+						<ModelPathStatus exists={ltxDownloadExists} foundPath={foundLtxPath} disabled={hasActiveDownload} onusefound={(path) => update('ltx2_checkpoint', path)} />
 						<PathInput label="VAE Checkpoint" value={s.vae || ''} oninput={(e) => update('vae', e.target.value)} showFiles tooltip="Optional separate VAE checkpoint. Leave blank to reuse the LTX-2 checkpoint." />
-						<CheckpointInput label="Gemma Root" value={s.gemma_root || ''} onchange={(v) => update('gemma_root', v)} disabled={gemmaRootDisabled} tooltip={gemmaRootDisabled ? 'Ignored while Gemma Safetensors is set' : 'Gemma text encoder directory'} actionLabel="D" actionBusyLabel="..." actionDisabled={gemmaRootDisabled || (downloading === 'gemma-unsloth' && hasActiveDownload)} actionTooltip={gemmaRootDisabled ? 'Gemma Safetensors is active' : `Download to ${resolvedGemma}`} onaction={() => downloadModel('gemma-unsloth')} />
+						<CheckpointInput label="Gemma Root" value={s.gemma_root || ''} onchange={(v) => update('gemma_root', v)} disabled={gemmaRootDisabled} tooltip={gemmaRootDisabled ? 'Ignored while Gemma Safetensors is set' : 'Gemma text encoder directory'} actionLabel="D" actionBusyLabel="..." actionDisabled={gemmaRootDisabled || hasActiveDownload || gemmaDownloadExists} actionTooltip={gemmaRootDisabled ? 'Gemma Safetensors is active' : modelDownloadTooltip(downloadPresets, 'gemma-unsloth', resolvedGemma, gemmaDownloadExists)} onaction={() => downloadModel('gemma-unsloth')} />
+						<ModelPathStatus exists={gemmaRootDisabled || gemmaDownloadExists} foundPath={foundGemmaPath} disabled={gemmaRootDisabled || hasActiveDownload} onusefound={(path) => { update('gemma_root', path); update('gemma_safetensors', ''); }} />
 						<PathInput label="Gemma Safetensors" value={s.gemma_safetensors || ''} oninput={(e) => update('gemma_safetensors', e.target.value)} showFiles tooltip="Single safetensors file (alternative to Gemma Root)" />
 						{#if modelStatus}
 							<div class="flex items-center justify-between gap-3 text-[11px] px-3 py-2" style="color: {modelStatusTone === 'success' ? 'var(--success)' : modelStatusTone === 'accent' ? 'var(--accent)' : modelStatusTone === 'danger' ? 'var(--danger)' : 'var(--text-secondary)'}; background: {modelStatusTone === 'success' ? 'var(--success-muted, rgba(34,197,94,0.1))' : modelStatusTone === 'accent' ? 'var(--accent-muted)' : modelStatusTone === 'danger' ? 'var(--danger-muted)' : 'var(--bg-elevated)'}; border-radius: var(--radius-sm);">
@@ -255,31 +303,60 @@
 			<div class="space-y-3">
 				<FormGroup title="Generation">
 					<div class="space-y-2 pt-2">
-						<div class="grid grid-cols-3 gap-2">
-							<FormField label="Width" type="number" value={s.width ?? 768} oninput={(e) => update('width', Number(e.target.value))} min={64} step={64} tooltip="Output width" />
-							<FormField label="Height" type="number" value={s.height ?? 512} oninput={(e) => update('height', Number(e.target.value))} min={64} step={64} tooltip="Output height" />
-							<FormField label="Frames" type="number" value={s.frame_count ?? 45} oninput={(e) => update('frame_count', Number(e.target.value))} min={1} tooltip="Number of frames" />
+						<div class="grid grid-cols-2 gap-2">
+							<FormSelect label="Preset" value={s.sampling_preset || 'defaults'} options={[
+								{ value: 'legacy', label: 'Legacy' },
+								{ value: 'defaults', label: 'Defaults' },
+								{ value: 'ltx20', label: 'LTX 2.0' },
+								{ value: 'ltx23', label: 'LTX 2.3' },
+								{ value: 'ltx23_hq', label: 'LTX 2.3 HQ' },
+								{ value: 'distilled_two_stage', label: 'Distilled Two-Stage' }
+							]} onchange={(e) => update('sampling_preset', e.target.value)} tooltip="Generation preset. Blank numeric fields below inherit from this preset." />
+							<FormSelect label="Default Negative" value={s.use_default_negative_prompt === true ? 'true' : s.use_default_negative_prompt === false ? 'false' : ''} options={[
+								{ value: '', label: 'Auto' },
+								{ value: 'true', label: 'On' },
+								{ value: 'false', label: 'Off' }
+							]} onchange={(e) => update('use_default_negative_prompt', e.target.value === '' ? null : e.target.value === 'true')} tooltip="Use the built-in negative prompt when the preset enables CFG and no negative prompt is typed." />
 						</div>
 						<div class="grid grid-cols-3 gap-2">
-							<FormField label="Frame Rate" type="number" value={s.frame_rate ?? 25} oninput={(e) => update('frame_rate', Number(e.target.value))} min={1} step={1} tooltip="Frames per second" />
-							<FormField label="Steps" type="number" value={s.sample_steps ?? 20} oninput={(e) => update('sample_steps', Number(e.target.value))} min={1} tooltip="Sampling steps" />
+							<FormField label="Width" type="number" value={s.width ?? ''} oninput={(e) => update('width', e.target.value ? Number(e.target.value) : null)} min={64} step={64} placeholder="Preset" tooltip="Output width override" />
+							<FormField label="Height" type="number" value={s.height ?? ''} oninput={(e) => update('height', e.target.value ? Number(e.target.value) : null)} min={64} step={64} placeholder="Preset" tooltip="Output height override" />
+							<FormField label="Frames" type="number" value={s.frame_count ?? ''} oninput={(e) => update('frame_count', e.target.value ? Number(e.target.value) : null)} min={1} placeholder="Preset" tooltip="Frame count override" />
+						</div>
+						<div class="grid grid-cols-3 gap-2">
+							<FormField label="Frame Rate" type="number" value={s.frame_rate ?? ''} oninput={(e) => update('frame_rate', e.target.value ? Number(e.target.value) : null)} min={1} step={1} placeholder="Preset" tooltip="Frame rate override" />
+							<FormField label="Steps" type="number" value={s.sample_steps ?? ''} oninput={(e) => update('sample_steps', e.target.value ? Number(e.target.value) : null)} min={1} placeholder="Preset" tooltip="Sampling steps override" />
 							<FormField label="Seed" type="number" value={s.seed ?? ''} oninput={(e) => update('seed', e.target.value ? Number(e.target.value) : null)} placeholder="Random" tooltip="Random seed" />
 						</div>
 						<div class="grid grid-cols-3 gap-2">
-							<FormField label="Guidance" type="number" value={s.guidance_scale ?? 1.0} oninput={(e) => update('guidance_scale', Number(e.target.value))} step="0.1" min={0} tooltip="Guidance scale" />
+							<FormField label="Guidance" type="number" value={s.guidance_scale ?? ''} oninput={(e) => update('guidance_scale', e.target.value ? Number(e.target.value) : null)} step="0.1" min={0} placeholder="Preset" tooltip="Guidance scale override" />
 							<FormField label="CFG Scale" type="number" value={s.cfg_scale ?? ''} oninput={(e) => update('cfg_scale', e.target.value ? Number(e.target.value) : null)} placeholder="Optional" step="0.1" tooltip="Classifier-free guidance (optional)" />
 							<FormField label="Flow Shift" type="number" value={s.discrete_flow_shift ?? 5.0} oninput={(e) => update('discrete_flow_shift', Number(e.target.value))} step="0.1" tooltip="Discrete flow shift" />
 						</div>
-						{#if $advancedMode}
-							<div class="grid grid-cols-2 gap-2">
-								<FormField label="STG Scale" type="number" value={s.stg_scale ?? 0.0} oninput={(e) => update('stg_scale', Number(e.target.value || 0))} step="0.1" tooltip="Spatiotemporal guidance scale" />
-								<FormSelect label="STG Mode" value={s.stg_mode || 'video'} options={['video', 'attention_values']} onchange={(e) => update('stg_mode', e.target.value)} tooltip="STG application mode" />
-							</div>
-							<div class="grid grid-cols-2 gap-2">
-								<FormField label="STG Blocks" value={s.stg_blocks || ''} oninput={(e) => update('stg_blocks', e.target.value)} placeholder="Comma or space separated" tooltip="Blocks targeted by STG" />
-								<FormField label="Rescale Scale" type="number" value={s.rescale_scale ?? 0.0} oninput={(e) => update('rescale_scale', Number(e.target.value || 0))} step="0.1" tooltip="Guidance rescale factor" />
-							</div>
-						{/if}
+						<div class="grid grid-cols-2 gap-2">
+							<FormField label="Video CFG" type="number" value={s.video_cfg_scale ?? ''} oninput={(e) => update('video_cfg_scale', e.target.value ? Number(e.target.value) : null)} placeholder="Preset" step="0.1" tooltip="Video CFG scale override" />
+							<FormField label="Audio CFG" type="number" value={s.audio_cfg_scale ?? ''} oninput={(e) => update('audio_cfg_scale', e.target.value ? Number(e.target.value) : null)} placeholder="Preset" step="0.1" tooltip="Audio CFG scale override" />
+						</div>
+						<div class="grid grid-cols-2 gap-2">
+							<FormField label="STG Scale" type="number" value={s.stg_scale ?? ''} oninput={(e) => update('stg_scale', e.target.value ? Number(e.target.value) : null)} placeholder="Preset" step="0.1" tooltip="Spatiotemporal guidance scale override" />
+							<FormSelect label="STG Mode" value={s.stg_mode || ''} options={[{ value: '', label: 'Preset' }, 'video', 'audio', 'both']} onchange={(e) => update('stg_mode', e.target.value || null)} tooltip="STG application mode override" />
+						</div>
+						<div class="grid grid-cols-2 gap-2">
+							<FormField label="STG Blocks" value={s.stg_blocks || ''} oninput={(e) => update('stg_blocks', e.target.value)} placeholder="Comma or space separated" tooltip="Blocks targeted by STG" />
+							<FormField label="Rescale Scale" type="number" value={s.rescale_scale ?? ''} oninput={(e) => update('rescale_scale', e.target.value ? Number(e.target.value) : null)} placeholder="Preset" step="0.1" tooltip="Guidance rescale override" />
+						</div>
+						<div class="grid grid-cols-2 gap-2">
+							<FormField label="Video Rescale" type="number" value={s.video_rescale_scale ?? ''} oninput={(e) => update('video_rescale_scale', e.target.value ? Number(e.target.value) : null)} placeholder="Preset" step="0.1" tooltip="Video CFG rescale override" />
+							<FormField label="Audio Rescale" type="number" value={s.audio_rescale_scale ?? ''} oninput={(e) => update('audio_rescale_scale', e.target.value ? Number(e.target.value) : null)} placeholder="Preset" step="0.1" tooltip="Audio CFG rescale override" />
+						</div>
+						<div class="grid grid-cols-2 gap-2">
+							<FormField label="Video Modality" type="number" value={s.video_modality_scale ?? ''} oninput={(e) => update('video_modality_scale', e.target.value ? Number(e.target.value) : null)} placeholder="Preset" step="0.1" tooltip="Video A2V modality guidance override" />
+							<FormField label="Audio Modality" type="number" value={s.audio_modality_scale ?? ''} oninput={(e) => update('audio_modality_scale', e.target.value ? Number(e.target.value) : null)} placeholder="Preset" step="0.1" tooltip="Audio V2A modality guidance override" />
+						</div>
+						<div class="grid grid-cols-2 gap-2">
+							<FormSelect label="AV Bimodal CFG" value={s.av_bimodal_cfg === true ? 'true' : s.av_bimodal_cfg === false ? 'false' : ''} options={[{ value: '', label: 'Preset' }, { value: 'true', label: 'On' }, { value: 'false', label: 'Off' }]} onchange={(e) => update('av_bimodal_cfg', e.target.value === '' ? null : e.target.value === 'true')} tooltip="Cross-modal CFG mode override" />
+							<FormField label="AV Bimodal Scale" type="number" value={s.av_bimodal_scale ?? ''} oninput={(e) => update('av_bimodal_scale', e.target.value ? Number(e.target.value) : null)} placeholder="Preset" step="0.1" tooltip="AV bimodal CFG scale override" />
+						</div>
 					</div>
 				</FormGroup>
 

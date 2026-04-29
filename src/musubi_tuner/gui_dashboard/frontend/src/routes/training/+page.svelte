@@ -6,10 +6,11 @@
 	import FormGroup from '$lib/components/FormGroup.svelte';
 	import PathInput from '$lib/components/PathInput.svelte';
 	import CheckpointInput from '$lib/components/CheckpointInput.svelte';
+	import ModelPathStatus from '$lib/components/ModelPathStatus.svelte';
 	import ProcessControls from '$lib/components/ProcessControls.svelte';
 	import CommandPanel from '$lib/components/CommandPanel.svelte';
 	import { defaultModelDir, effectiveGemmaRoot, effectiveGemmaSafetensors, effectiveLtx2Checkpoint } from '$lib/utils/modelPaths.js';
-	import { startModelDownload, getModelDownloadStatus, cancelModelDownload, formatModelDownloadStatus, getModelDownloadTone, isActiveModelDownload } from '$lib/utils/modelDownloads.js';
+	import { startModelDownload, getModelDownloadStatus, cancelModelDownload, formatModelDownloadStatus, getModelDownloadTone, isActiveModelDownload, getModelDownloadPresets, getModelDownloadPreflight, checkPathExists, scanCheckpoints, modelDownloadTooltip, formatModelPreflightStatus } from '$lib/utils/modelDownloads.js';
 	import { projectConfig, projectLoaded, updateSection, saveProjectNow } from '$lib/stores/project.js';
 	import { processStatuses, processValidation, startProcess, stopProcess, validateProcess } from '$lib/stores/processes.js';
 	import { advancedMode } from '$lib/stores/uiMode.js';
@@ -51,12 +52,20 @@
 	let downloadState = $state('');
 	let modelStatus = $state('');
 	let modelStatusTone = $state('muted');
+	let downloadPresets = $state({});
+	let ltxDownloadExists = $state(false);
+	let gemmaDownloadExists = $state(false);
+	let foundLtxPath = $state('');
+	let foundGemmaPath = $state('');
 	let downloadPollTimer = null;
 
 	onMount(async () => {
 		try {
 			const res = await fetch('/api/fs/cwd');
 			if (res.ok) cwd = (await res.json()).cwd || '';
+		} catch {}
+		try {
+			downloadPresets = await getModelDownloadPresets();
 		} catch {}
 		return () => {
 			clearTimeout(downloadPollTimer);
@@ -69,6 +78,38 @@
 	let gemmaRootDisabled = $derived(Boolean(activeGemmaSafetensors));
 	let resolvedGemma = $derived(effectiveGemmaRoot(cwd, $projectConfig, t.gemma_root || '', activeGemmaSafetensors));
 	let hasActiveDownload = $derived(Boolean(downloadJobId) && ['queued', 'running', 'cancelling'].includes(downloadState));
+
+	$effect(() => {
+		const path = resolvedLtx;
+		let cancelled = false;
+		checkPathExists(path).then((exists) => { if (!cancelled) ltxDownloadExists = exists; }).catch(() => { if (!cancelled) ltxDownloadExists = false; });
+		return () => { cancelled = true; };
+	});
+
+	$effect(() => {
+		const path = resolvedGemma;
+		let cancelled = false;
+		checkPathExists(path).then((exists) => { if (!cancelled) gemmaDownloadExists = exists; }).catch(() => { if (!cancelled) gemmaDownloadExists = false; });
+		return () => { cancelled = true; };
+	});
+
+	$effect(() => {
+		if (!cwd) return;
+		let cancelled = false;
+		scanCheckpoints('ltx2', modelDir).then((results) => {
+			if (!cancelled) foundLtxPath = results.find((p) => p === resolvedLtx) || results[0] || '';
+		}).catch(() => { if (!cancelled) foundLtxPath = ''; });
+		return () => { cancelled = true; };
+	});
+
+	$effect(() => {
+		if (!cwd) return;
+		let cancelled = false;
+		scanCheckpoints('gemma', modelDir).then((results) => {
+			if (!cancelled) foundGemmaPath = results.find((p) => p === resolvedGemma) || results[0] || '';
+		}).catch(() => { if (!cancelled) foundGemmaPath = ''; });
+		return () => { cancelled = true; };
+	});
 
 	function setModelStatus(status) {
 		modelStatus = formatModelDownloadStatus(status);
@@ -112,6 +153,13 @@
 		const targetPath = preset === 'ltxav' ? resolvedLtx : resolvedGemma;
 		if (!targetPath) return;
 		try {
+			const preflight = await getModelDownloadPreflight(preset, targetPath);
+			setModelStatus({
+				state: preflight.ok ? 'queued' : 'failed',
+				message: formatModelPreflightStatus(preflight),
+				error: preflight.errors?.join('; ')
+			});
+			if (!preflight.ok) return;
 			const job = await startModelDownload(preset, targetPath);
 			downloading = preset;
 			downloadJobId = job.job_id || '';
@@ -171,8 +219,10 @@
 			<div class="space-y-3">
 				<FormGroup title="Model">
 					<div class="space-y-2 pt-2">
-						<CheckpointInput label="LTX-2 Checkpoint" value={t.ltx2_checkpoint || ''} onchange={(v) => update('ltx2_checkpoint', v)} showFiles tooltip="Path to LTX-2 checkpoint" invalid={fieldInvalid('training.ltx2_checkpoint')} error={fieldError('training.ltx2_checkpoint')} actionLabel="D" actionBusyLabel="..." actionDisabled={downloading === 'ltxav' && hasActiveDownload} actionTooltip={`Download to ${resolvedLtx}`} onaction={() => downloadModel('ltxav')} />
-						<CheckpointInput label="Gemma Root" value={t.gemma_root || ''} onchange={(v) => update('gemma_root', v)} disabled={gemmaRootDisabled} tooltip={gemmaRootDisabled ? 'Ignored while Gemma Safetensors is set' : 'Gemma text encoder directory'} invalid={fieldInvalid('training.gemma_root')} error={fieldError('training.gemma_root')} actionLabel="D" actionBusyLabel="..." actionDisabled={gemmaRootDisabled || (downloading === 'gemma-unsloth' && hasActiveDownload)} actionTooltip={gemmaRootDisabled ? 'Gemma Safetensors is active' : `Download to ${resolvedGemma}`} onaction={() => downloadModel('gemma-unsloth')} />
+						<CheckpointInput label="LTX-2 Checkpoint" value={t.ltx2_checkpoint || ''} onchange={(v) => update('ltx2_checkpoint', v)} showFiles tooltip="Path to LTX-2 checkpoint" invalid={fieldInvalid('training.ltx2_checkpoint')} error={fieldError('training.ltx2_checkpoint')} actionLabel="D" actionBusyLabel="..." actionDisabled={hasActiveDownload || ltxDownloadExists} actionTooltip={modelDownloadTooltip(downloadPresets, 'ltxav', resolvedLtx, ltxDownloadExists)} onaction={() => downloadModel('ltxav')} />
+						<ModelPathStatus exists={ltxDownloadExists} foundPath={foundLtxPath} disabled={hasActiveDownload} onusefound={(path) => update('ltx2_checkpoint', path)} />
+						<CheckpointInput label="Gemma Root" value={t.gemma_root || ''} onchange={(v) => update('gemma_root', v)} disabled={gemmaRootDisabled} tooltip={gemmaRootDisabled ? 'Ignored while Gemma Safetensors is set' : 'Gemma text encoder directory'} invalid={fieldInvalid('training.gemma_root')} error={fieldError('training.gemma_root')} actionLabel="D" actionBusyLabel="..." actionDisabled={gemmaRootDisabled || hasActiveDownload || gemmaDownloadExists} actionTooltip={gemmaRootDisabled ? 'Gemma Safetensors is active' : modelDownloadTooltip(downloadPresets, 'gemma-unsloth', resolvedGemma, gemmaDownloadExists)} onaction={() => downloadModel('gemma-unsloth')} />
+						<ModelPathStatus exists={gemmaRootDisabled || gemmaDownloadExists} foundPath={foundGemmaPath} disabled={gemmaRootDisabled || hasActiveDownload} onusefound={(path) => { update('gemma_root', path); update('gemma_safetensors', ''); }} />
 						<PathInput label="Gemma Safetensors" value={t.gemma_safetensors || ''} oninput={(e) => update('gemma_safetensors', e.target.value)} showFiles tooltip="Single safetensors file (alternative to Gemma Root)" invalid={fieldInvalid('training.gemma_safetensors')} error={fieldError('training.gemma_safetensors')} />
 						{#if modelStatus}
 							<div class="flex items-center justify-between gap-3 text-[11px] px-3 py-2" style="color: {modelStatusTone === 'success' ? 'var(--success)' : modelStatusTone === 'accent' ? 'var(--accent)' : modelStatusTone === 'danger' ? 'var(--danger)' : 'var(--text-secondary)'}; background: {modelStatusTone === 'success' ? 'var(--success-muted, rgba(34,197,94,0.1))' : modelStatusTone === 'accent' ? 'var(--accent-muted)' : modelStatusTone === 'danger' ? 'var(--danger-muted)' : 'var(--bg-elevated)'}; border-radius: var(--radius-sm);">
@@ -545,6 +595,21 @@
 				<FormGroup title="Sampling">
 					<div class="space-y-2 pt-2">
 						<div class="grid grid-cols-2 gap-2">
+							<FormSelect label="Preset" value={t.sample_sampling_preset || 'defaults'} options={[
+								{ value: 'legacy', label: 'Legacy' },
+								{ value: 'defaults', label: 'Defaults' },
+								{ value: 'ltx20', label: 'LTX 2.0' },
+								{ value: 'ltx23', label: 'LTX 2.3' },
+								{ value: 'ltx23_hq', label: 'LTX 2.3 HQ' },
+								{ value: 'distilled_two_stage', label: 'Distilled Two-Stage' }
+							]} onchange={(e) => update('sample_sampling_preset', e.target.value)} tooltip="Validation sample preset. Blank numeric fields below inherit from this preset." />
+							<FormSelect label="Default Negative" value={t.sample_use_default_negative_prompt === true ? 'true' : t.sample_use_default_negative_prompt === false ? 'false' : ''} options={[
+								{ value: '', label: 'Auto' },
+								{ value: 'true', label: 'On' },
+								{ value: 'false', label: 'Off' }
+							]} onchange={(e) => update('sample_use_default_negative_prompt', e.target.value === '' ? null : e.target.value === 'true')} tooltip="Use the built-in negative prompt for validation samples when the preset enables CFG." />
+						</div>
+						<div class="grid grid-cols-2 gap-2">
 							<FormField label="Every N Steps" type="number" value={t.sample_every_n_steps ?? ''} oninput={(e) => update('sample_every_n_steps', e.target.value ? Number(e.target.value) : null)} placeholder="Optional" tooltip="Sample every N steps" />
 							<FormField label="Every N Epochs" type="number" value={t.sample_every_n_epochs ?? ''} oninput={(e) => update('sample_every_n_epochs', e.target.value ? Number(e.target.value) : null)} placeholder="Optional" tooltip="Sample every N epochs" />
 						</div>
@@ -567,6 +632,18 @@
 							<FormField label="Temporal Tile" type="number" value={t.sample_vae_temporal_tile_size ?? ''} oninput={(e) => update('sample_vae_temporal_tile_size', e.target.value ? Number(e.target.value) : null)} placeholder="Off" disabled={!t.sample_tiled_vae} tooltip="Temporal tile size (0=disabled)" />
 							<FormField label="Temporal Overlap" type="number" value={t.sample_vae_temporal_tile_overlap ?? ''} oninput={(e) => update('sample_vae_temporal_tile_overlap', e.target.value ? Number(e.target.value) : null)} placeholder="8" disabled={!t.sample_tiled_vae} tooltip="Temporal tile overlap" />
 						</div>
+						<div class="grid grid-cols-2 gap-2">
+							<FormField label="Video CFG" type="number" value={t.video_cfg_scale ?? ''} oninput={(e) => update('video_cfg_scale', e.target.value ? Number(e.target.value) : null)} placeholder="Preset" step="0.1" tooltip="Video CFG scale override for validation samples" />
+							<FormField label="Audio CFG" type="number" value={t.audio_cfg_scale ?? ''} oninput={(e) => update('audio_cfg_scale', e.target.value ? Number(e.target.value) : null)} placeholder="Preset" step="0.1" tooltip="Audio CFG scale override for validation samples" />
+						</div>
+						<div class="grid grid-cols-2 gap-2">
+							<FormField label="Video Rescale" type="number" value={t.video_rescale_scale ?? ''} oninput={(e) => update('video_rescale_scale', e.target.value ? Number(e.target.value) : null)} placeholder="Preset" step="0.1" tooltip="Video CFG rescale override for validation samples" />
+							<FormField label="Audio Rescale" type="number" value={t.audio_rescale_scale ?? ''} oninput={(e) => update('audio_rescale_scale', e.target.value ? Number(e.target.value) : null)} placeholder="Preset" step="0.1" tooltip="Audio CFG rescale override for validation samples" />
+						</div>
+						<div class="grid grid-cols-2 gap-2">
+							<FormField label="Video Modality" type="number" value={t.video_modality_scale ?? ''} oninput={(e) => update('video_modality_scale', e.target.value ? Number(e.target.value) : null)} placeholder="Preset" step="0.1" tooltip="Video A2V modality guidance override" />
+							<FormField label="Audio Modality" type="number" value={t.audio_modality_scale ?? ''} oninput={(e) => update('audio_modality_scale', e.target.value ? Number(e.target.value) : null)} placeholder="Preset" step="0.1" tooltip="Audio V2A modality guidance override" />
+						</div>
 						{#if $advancedMode}
 						<div class="flex flex-wrap gap-x-4 gap-y-1">
 							<FormToggle label="No Audio" checked={t.sample_disable_audio ?? false} onchange={(e) => update('sample_disable_audio', e.target.checked)} tooltip="Disable audio sampling" />
@@ -588,9 +665,9 @@
 						{/if}
 						{/if}
 						<div class="grid grid-cols-3 gap-2">
-							<FormField label="W" type="number" value={t.width ?? 768} oninput={(e) => update('width', Number(e.target.value))} min={64} step={64} tooltip="Sample width" />
-							<FormField label="H" type="number" value={t.height ?? 512} oninput={(e) => update('height', Number(e.target.value))} min={64} step={64} tooltip="Sample height" />
-							<FormField label="Frames" type="number" value={t.sample_num_frames ?? 45} oninput={(e) => update('sample_num_frames', Number(e.target.value))} min={1} tooltip="Sample frames" />
+							<FormField label="W" type="number" value={t.width ?? ''} oninput={(e) => update('width', e.target.value ? Number(e.target.value) : null)} min={64} step={64} placeholder="Preset" tooltip="Sample width override" />
+							<FormField label="H" type="number" value={t.height ?? ''} oninput={(e) => update('height', e.target.value ? Number(e.target.value) : null)} min={64} step={64} placeholder="Preset" tooltip="Sample height override" />
+							<FormField label="Frames" type="number" value={t.sample_num_frames ?? ''} oninput={(e) => update('sample_num_frames', e.target.value ? Number(e.target.value) : null)} min={1} placeholder="Preset" tooltip="Sample frame count override" />
 						</div>
 					</div>
 				</FormGroup>

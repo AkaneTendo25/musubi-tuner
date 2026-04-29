@@ -14,6 +14,9 @@ from musubi_tuner.gui_dashboard.cli_defaults import (
 from musubi_tuner.model_defaults import default_gemma_root_path, default_ltx2_checkpoint_path
 
 
+SamplingPreset = Literal["legacy", "defaults", "ltx20", "ltx23", "ltx23_hq", "distilled_two_stage"]
+
+
 class GeneralConfig(BaseModel):
     enable_bucket: bool = True
     bucket_no_upscale: bool = True
@@ -267,9 +270,17 @@ class TrainingConfig(BaseModel):
     sample_prompts_cache: str = ""
     use_precached_sample_latents: bool = False
     sample_latents_cache: str = ""
-    height: int = 512
-    width: int = 768
-    sample_num_frames: int = 45
+    sample_sampling_preset: SamplingPreset = "defaults"
+    sample_use_default_negative_prompt: Optional[bool] = None
+    height: Optional[int] = None
+    width: Optional[int] = None
+    sample_num_frames: Optional[int] = None
+    video_cfg_scale: Optional[float] = None
+    audio_cfg_scale: Optional[float] = None
+    video_modality_scale: Optional[float] = None
+    audio_modality_scale: Optional[float] = None
+    video_rescale_scale: Optional[float] = None
+    audio_rescale_scale: Optional[float] = None
     sample_with_offloading: bool = False
     sample_merge_audio: bool = False
     sample_disable_audio: bool = False
@@ -483,19 +494,29 @@ class InferenceConfig(BaseModel):
     from_file: str = ""
     output_dir: str = "output"
     output_name: str = "ltx2_sample"
-    height: int = 512
-    width: int = 768
-    frame_count: int = 45
-    frame_rate: float = 25.0
-    sample_steps: int = 20
-    guidance_scale: float = 1.0
+    sampling_preset: SamplingPreset = "defaults"
+    use_default_negative_prompt: Optional[bool] = None
+    height: Optional[int] = None
+    width: Optional[int] = None
+    frame_count: Optional[int] = None
+    frame_rate: Optional[float] = None
+    sample_steps: Optional[int] = None
+    guidance_scale: Optional[float] = None
     cfg_scale: Optional[float] = None
     discrete_flow_shift: float = 5.0
     seed: Optional[int] = None
-    stg_scale: float = 0.0
+    video_cfg_scale: Optional[float] = None
+    audio_cfg_scale: Optional[float] = None
+    video_modality_scale: Optional[float] = None
+    audio_modality_scale: Optional[float] = None
+    video_rescale_scale: Optional[float] = None
+    audio_rescale_scale: Optional[float] = None
+    stg_scale: Optional[float] = None
     stg_blocks: str = ""
-    stg_mode: Literal["video", "audio", "both"] = "video"
-    rescale_scale: float = 0.0
+    stg_mode: Optional[Literal["video", "audio", "both"]] = None
+    rescale_scale: Optional[float] = None
+    av_bimodal_cfg: Optional[bool] = None
+    av_bimodal_scale: Optional[float] = None
     mixed_precision: Literal["no", "fp16", "bf16"] = "bf16"
     ltx2_mode: Literal["video", "av", "audio"] = "video"
     attn_mode: str = "torch"
@@ -592,7 +613,7 @@ class SliderConfig(BaseModel):
 
 
 class ProjectConfig(BaseModel):
-    version: int = 1
+    version: int = 2
     name: str = "New Project"
     project_dir: str = ""
     model_dir: str = ""  # directory where downloaded models are stored
@@ -645,7 +666,22 @@ class ProjectConfig(BaseModel):
                     section['ltx2_checkpoint'] = default_ltx
                 if not section.get('gemma_root') and not section.get('gemma_safetensors'):
                     section['gemma_root'] = default_gemma
+                if section_name == 'training':
+                    has_old_sampling_values = any(
+                        key in section and section.get(key) is not None
+                        for key in ('height', 'width', 'sample_num_frames')
+                    )
+                    if has_old_sampling_values and 'sample_sampling_preset' not in section:
+                        section['sample_sampling_preset'] = 'legacy'
+                elif section_name == 'inference':
+                    has_old_generation_values = any(
+                        key in section and section.get(key) is not None
+                        for key in ('height', 'width', 'frame_count', 'frame_rate', 'sample_steps', 'guidance_scale')
+                    )
+                    if has_old_generation_values and 'sampling_preset' not in section:
+                        section['sampling_preset'] = 'legacy'
                 data[section_name] = section
+            data['version'] = max(int(data.get('version') or 1), 2)
         return data
 
     def save(self, path: Optional[Path] = None):

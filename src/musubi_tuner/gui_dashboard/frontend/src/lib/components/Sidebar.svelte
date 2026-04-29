@@ -228,8 +228,13 @@
 		</button>
 
 		{#if showThemePicker}
-			<!-- svelte-ignore a11y_no_static_element_interactions a11y_click_events_have_key_events -->
-			<div class="fixed inset-0 z-40" onclick={() => showThemePicker = false}></div>
+			<button
+				type="button"
+				aria-label="Close theme picker"
+				class="fixed inset-0 z-40"
+				style="background: transparent;"
+				onclick={() => showThemePicker = false}
+			></button>
 			<div class="absolute bottom-full left-2 right-2 mb-1 p-1.5 z-50" style="background: var(--bg-elevated); border: 1px solid var(--border); border-radius: var(--radius-md); box-shadow: var(--shadow-lg);">
 				{#each THEMES as t}
 					<button

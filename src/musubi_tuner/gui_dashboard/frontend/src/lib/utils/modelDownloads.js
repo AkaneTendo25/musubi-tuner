@@ -39,6 +39,70 @@ export async function startModelDownload(preset, targetPath) {
 	return data;
 }
 
+export async function getModelDownloadPreflight(preset, targetPath) {
+	const res = await fetch('/api/fs/download-preflight', {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify({ preset, dest_path: targetPath })
+	});
+	const data = await parseJsonOrEmpty(res);
+	if (!res.ok) {
+		throw new Error(formatDownloadError(data.detail || data));
+	}
+	return data;
+}
+
+export async function getModelDownloadPresets() {
+	const res = await fetch('/api/fs/download-presets');
+	const data = await parseJsonOrEmpty(res);
+	if (!res.ok) {
+		throw new Error(formatDownloadError(data.detail || data));
+	}
+	return data.presets || {};
+}
+
+export async function scanCheckpoints(type, extraPaths = '') {
+	const params = new URLSearchParams({ type, extra_paths: extraPaths || '' });
+	const res = await fetch(`/api/fs/scan-checkpoints?${params}`);
+	const data = await parseJsonOrEmpty(res);
+	if (!res.ok) {
+		throw new Error(formatDownloadError(data.detail || data));
+	}
+	return data.results || [];
+}
+
+export async function checkPathExists(path) {
+	if (!path) return false;
+	const params = new URLSearchParams({ path });
+	const res = await fetch(`/api/fs/exists?${params}`);
+	const data = await parseJsonOrEmpty(res);
+	if (!res.ok) {
+		throw new Error(formatDownloadError(data.detail || data));
+	}
+	return Boolean(data.exists);
+}
+
+export function modelDownloadUrl(downloadPresets, preset) {
+	return downloadPresets?.[preset]?.url || '';
+}
+
+export function modelDownloadTooltip(downloadPresets, preset, targetPath, targetExists = false) {
+	const url = modelDownloadUrl(downloadPresets, preset);
+	if (targetExists) {
+		return `Already exists: ${targetPath}`;
+	}
+	return url ? `Download ${url} to ${targetPath}` : `Download to ${targetPath}`;
+}
+
+export function formatModelPreflightStatus(preflight) {
+	if (!preflight) return '';
+	if (preflight.errors?.length) return preflight.errors.join('; ');
+	const total = formatBytes(preflight.total_bytes) || 'unknown size';
+	const free = formatBytes(preflight.free_bytes) || 'unknown free space';
+	const warning = preflight.warnings?.length ? ` (${preflight.warnings.join('; ')})` : '';
+	return `Preflight OK: ${total}, ${free} available${warning}`;
+}
+
 export async function getModelDownloadStatus(jobId) {
 	const res = await fetch(`/api/fs/download-model/${jobId}`);
 	const data = await parseJsonOrEmpty(res);
