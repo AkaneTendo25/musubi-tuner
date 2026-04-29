@@ -35,6 +35,7 @@ from musubi_tuner.ltx2_text_conditioning import (
     select_video_text_embeds_for_video_mode,
     select_video_text_embeds_for_av_no_audio,
 )
+from musubi_tuner.self_flow import build_self_flow_video_context, prepare_self_flow_audio_view
 from musubi_tuner.ltx2_lycoris_runtime import (
     validate_lycoris_quantized_base_compatibility,
     validate_lycoris_runtime,
@@ -1128,6 +1129,12 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             metrics["self_flow/tau_mean"] = float(sf_ctx["tau_mean"])
         if "tau_min_mean" in sf_ctx:
             metrics["self_flow/tau_min_mean"] = float(sf_ctx["tau_min_mean"])
+        if "audio_masked_token_ratio" in sf_ctx:
+            metrics["self_flow/audio_masked_token_ratio"] = float(sf_ctx["audio_masked_token_ratio"])
+        if "audio_tau_mean" in sf_ctx:
+            metrics["self_flow/audio_tau_mean"] = float(sf_ctx["audio_tau_mean"])
+        if "audio_tau_min_mean" in sf_ctx:
+            metrics["self_flow/audio_tau_min_mean"] = float(sf_ctx["audio_tau_min_mean"])
 
         self._self_flow.cleanup_step()
         self._self_flow_step_context = None
@@ -1760,17 +1767,18 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                 timesteps_out = tau_tokens.mean(dim=1).to(device=device, dtype=torch.float32) * 1000.0
             teacher_timesteps = tau_min.to(device=device, dtype=torch.float32) * 1000.0
 
-            self._self_flow_step_context = {
-                "teacher_noisy_model_input": teacher_noisy.detach(),
-                "teacher_model_timesteps": teacher_timesteps.detach(),
-                "dual_timestep_mask": mask.detach(),
-                "masked_token_ratio": float(mask.float().mean().item()),
-                "tau_mean": float(tau_tokens.mean().item()),
-                "tau_min_mean": float(tau_min.mean().item()),
-                "num_latent_frames": int(frames),
-                "latent_height": int(height),
-                "latent_width": int(width),
-            }
+            self._self_flow_step_context = build_self_flow_video_context(
+                base_sigmas=sigmas,
+                alt_sigmas=sigmas_alt,
+                teacher_noisy_model_input=teacher_noisy,
+                teacher_model_timesteps=teacher_timesteps,
+                dual_timestep_mask=mask,
+                tau_tokens=tau_tokens,
+                tau_min=tau_min,
+                num_latent_frames=int(frames),
+                latent_height=int(height),
+                latent_width=int(width),
+            )
             return noisy_model_input, timesteps_out
 
         sigmas_expanded = sigmas.view(-1, 1, 1, 1, 1)
@@ -2958,10 +2966,11 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                 tgt_seq_len = int(audio_latents.shape[2])
                 noisy_audio = torch.cat([ref_audio_latents, noisy_audio], dim=2)
 
+                audio_timestep_source = audio_timestep_local
                 target_audio_timestep = (
-                    audio_model_timesteps
-                    if audio_model_timesteps.shape[1] == tgt_seq_len
-                    else audio_model_timesteps[:, :1].expand(audio_model_timesteps.shape[0], tgt_seq_len)
+                    audio_timestep_source
+                    if audio_timestep_source.shape[1] == tgt_seq_len
+                    else audio_timestep_source[:, :1].expand(audio_timestep_source.shape[0], tgt_seq_len)
                 )
                 ref_audio_timestep = torch.zeros(
                     (audio_model_timesteps.shape[0], ref_audio_seq_len),
@@ -3433,6 +3442,8 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
         audio_loss_mask = None
         audio_target = None
         audio_timestep_for_model = None
+        teacher_noisy_audio_for_self_flow = None
+        teacher_audio_timestep_for_self_flow = None
         ref_audio_latents = None
         ref_audio_seq_len = 0
         if self._ltx_mode == "av":
@@ -3493,10 +3504,45 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                 audio_noise = torch.randn_like(audio_latents)
                 sigma_audio = audio_sigma.view(-1, 1, 1, 1)
                 noisy_audio = (1.0 - sigma_audio) * audio_latents + sigma_audio * audio_noise
+                sf_ctx = self._self_flow_step_context if self._self_flow_active else None
+                if (
+                    isinstance(sf_ctx, dict)
+                    and bool(getattr(args, "self_flow", False))
+                    and bool(getattr(getattr(self._self_flow, "config", None), "dual_timestep", True))
+                ):
+                    base_audio_sigmas = sf_ctx.get("base_sigmas")
+                    alt_audio_sigmas = sf_ctx.get("alt_sigmas")
+                    if bool(getattr(args, "independent_audio_timestep", False)):
+                        base_audio_sigmas = audio_model_timesteps[:, :1].to(device=accelerator.device, dtype=network_dtype)
+                        alt_audio_sigmas = self._sample_independent_audio_timesteps(
+                            args,
+                            batch_size=audio_model_timesteps.shape[0],
+                            device=accelerator.device,
+                            dtype=network_dtype,
+                        )
+                    if isinstance(base_audio_sigmas, torch.Tensor) and isinstance(alt_audio_sigmas, torch.Tensor):
+                        audio_sf = prepare_self_flow_audio_view(
+                            audio_latents=audio_latents,
+                            audio_noise=audio_noise,
+                            base_audio_sigmas=base_audio_sigmas,
+                            alt_audio_sigmas=alt_audio_sigmas,
+                            mask_ratio=float(getattr(self._self_flow.config, "mask_ratio", 0.10)),
+                            device=accelerator.device,
+                            dtype=network_dtype,
+                        )
+                        noisy_audio = audio_sf["student_noisy_audio"]
+                        audio_timestep_for_model = audio_sf["student_audio_timesteps"]
+                        teacher_noisy_audio_for_self_flow = audio_sf["teacher_noisy_audio"].detach()
+                        teacher_audio_timestep_for_self_flow = audio_sf["teacher_audio_timesteps"].detach()
+                        sf_ctx["audio_self_flow_mask"] = audio_sf["audio_mask"].detach()
+                        sf_ctx["audio_masked_token_ratio"] = float(audio_sf["audio_masked_token_ratio"].detach().item())
+                        sf_ctx["audio_tau_mean"] = float(audio_sf["audio_tau_mean"].detach().item())
+                        sf_ctx["audio_tau_min_mean"] = float(audio_sf["audio_tau_min_mean"].detach().item())
                 _check_finite("noisy_audio", noisy_audio)
                 _log_stats("noisy_audio", noisy_audio)
                 audio_target = audio_noise - audio_latents
-                audio_timestep_for_model = audio_model_timesteps
+                if audio_timestep_for_model is None:
+                    audio_timestep_for_model = audio_model_timesteps
 
             if audio_ref_only_ic_enabled:
                 ref_audio_latents = batch.get("ref_audio_latents")
@@ -3557,10 +3603,11 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                 noisy_audio = torch.cat([ref_audio_latents, noisy_audio], dim=2)
                 _check_finite("noisy_audio_with_reference", noisy_audio)
 
+                audio_timestep_source = audio_timestep_for_model if isinstance(audio_timestep_for_model, torch.Tensor) else audio_model_timesteps
                 target_audio_timestep = (
-                    audio_model_timesteps
-                    if audio_model_timesteps.shape[1] == tgt_seq_len
-                    else audio_model_timesteps[:, :1].expand(audio_model_timesteps.shape[0], tgt_seq_len)
+                    audio_timestep_source
+                    if audio_timestep_source.shape[1] == tgt_seq_len
+                    else audio_timestep_source[:, :1].expand(audio_timestep_source.shape[0], tgt_seq_len)
                 )
                 ref_audio_timestep = torch.zeros(
                     (audio_model_timesteps.shape[0], ref_audio_seq_len),
@@ -3568,6 +3615,25 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                     dtype=network_dtype,
                 )
                 audio_timestep_for_model = torch.cat([ref_audio_timestep, target_audio_timestep], dim=1)
+                if (
+                    isinstance(teacher_noisy_audio_for_self_flow, torch.Tensor)
+                    and isinstance(teacher_audio_timestep_for_self_flow, torch.Tensor)
+                ):
+                    teacher_noisy_audio_for_self_flow = torch.cat(
+                        [ref_audio_latents, teacher_noisy_audio_for_self_flow],
+                        dim=2,
+                    )
+                    teacher_target_audio_timestep = (
+                        teacher_audio_timestep_for_self_flow
+                        if teacher_audio_timestep_for_self_flow.shape[1] == tgt_seq_len
+                        else teacher_audio_timestep_for_self_flow[:, :1].expand(
+                            teacher_audio_timestep_for_self_flow.shape[0], tgt_seq_len
+                        )
+                    )
+                    teacher_audio_timestep_for_self_flow = torch.cat(
+                        [ref_audio_timestep, teacher_target_audio_timestep],
+                        dim=1,
+                    )
 
                 if audio_target is None:
                     raise ValueError("Internal error: audio_target must be initialized before audio_ref_only_ic composition")
@@ -3979,10 +4045,20 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                             and len(model_input) >= 2
                             and isinstance(model_input[1], torch.Tensor)
                         ):
-                            teacher_audio_input = model_input[1].to(device=accelerator.device, dtype=network_dtype)
+                            teacher_audio_source = (
+                                teacher_noisy_audio_for_self_flow
+                                if isinstance(teacher_noisy_audio_for_self_flow, torch.Tensor)
+                                else model_input[1]
+                            )
+                            teacher_audio_input = teacher_audio_source.to(device=accelerator.device, dtype=network_dtype)
                             teacher_model_input_for_self_flow = [teacher_model_input_for_self_flow, teacher_audio_input]
-                            if isinstance(audio_timestep_for_model, torch.Tensor):
-                                teacher_audio_timestep = audio_timestep_for_model.to(
+                            teacher_audio_timestep_source = (
+                                teacher_audio_timestep_for_self_flow
+                                if isinstance(teacher_audio_timestep_for_self_flow, torch.Tensor)
+                                else audio_timestep_for_model
+                            )
+                            if isinstance(teacher_audio_timestep_source, torch.Tensor):
+                                teacher_audio_timestep = teacher_audio_timestep_source.to(
                                     device=accelerator.device, dtype=network_dtype
                                 )
 

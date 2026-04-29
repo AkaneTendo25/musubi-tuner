@@ -1057,7 +1057,7 @@ accelerate launch ... ltx2_train_network.py ^
 | `delta_num_steps` | `1` | Number of temporal delta steps included in the delta loss (`1` = adjacent frames only) |
 | `motion_weighting` | `none` | Temporal weighting mode: `none` or `teacher_delta` |
 | `motion_weight_strength` | `0.0` | Strength of teacher-delta motion weighting for temporal terms |
-| `temporal_schedule` | `constant` | Schedule applied to **all** Self-Flow lambdas (`lambda_self_flow`, `lambda_temporal`, `lambda_delta`): `constant`, `linear` decay, or `cosine` decay |
+| `temporal_schedule` | `constant` | Schedule applied to **all** Self-Flow lambdas (`lambda_self_flow`, `lambda_audio`, `lambda_temporal`, `lambda_delta`): `constant`, `linear` decay, or `cosine` decay |
 | `temporal_warmup_steps` | `0` | Steps to linearly ramp all lambdas up from zero to full weight |
 | `temporal_max_steps` | `0` | Steps at which `linear` / `cosine` decay reaches zero. `0` = no decay |
 | `teacher_momentum` | `0.999` | EMA momentum for teacher updates (`ema` / `partial_ema` modes only). Valid range: `[0.0, 1.0)` |
@@ -1083,10 +1083,12 @@ accelerate launch ... ltx2_train_network.py ^
 - Soft matching: `patch_match_mode=soft` replaces hard local best-match selection with softmax-weighted neighborhood matching for smoother gradients.
 - Multi-step motion: `delta_num_steps > 1` extends the delta loss beyond adjacent frames using exponentially decayed step weights.
 - Motion-aware weighting: `motion_weighting=teacher_delta` upweights temporally active teacher regions, focusing the temporal loss on moving content.
-- Scheduling: `temporal_schedule`, `temporal_warmup_steps`, and `temporal_max_steps` apply to **all three** lambdas — `lambda_self_flow`, `lambda_temporal`, and `lambda_delta` — uniformly.
+- Scheduling: `temporal_schedule`, `temporal_warmup_steps`, and `temporal_max_steps` apply to all Self-Flow lambdas — `lambda_self_flow`, `lambda_audio`, `lambda_temporal`, and `lambda_delta` — uniformly.
+- AV audio: when `lambda_audio > 0`, AV mode builds a separate dual-timestep student audio view and a cleaner teacher audio view, matching the video Self-Flow teacher/student asymmetry.
+- Validation: the primary validation loss uses the normal homogeneous noising path. `val_self_flow_loss`, when logged, is a separate diagnostic and is not added to `val_loss`.
 - State files (Accelerate `*-state` folder): `self_flow_projector.safetensors`, `self_flow_teacher_ema.safetensors` (EMA state only saved when `teacher_mode=ema` or `partial_ema`).
 - Resume: both state files are loaded automatically when present. Loading EMA state with `teacher_mode=base` emits a warning and is ignored.
-- Logged metrics: `loss/self_flow`, `self_flow/cosine`, `self_flow/frame_cosine`, `self_flow/delta_cosine`, `self_flow/lambda_self_flow`, `self_flow/lambda_temporal`, `self_flow/lambda_delta`, `self_flow/masked_token_ratio`, `self_flow/tau_mean`, `self_flow/tau_min_mean`.
+- Logged metrics: `loss/self_flow`, `self_flow/cosine`, `self_flow/audio_cosine`, `self_flow/frame_cosine`, `self_flow/delta_cosine`, `self_flow/lambda_self_flow`, `self_flow/lambda_audio`, `self_flow/lambda_temporal`, `self_flow/lambda_delta`, `self_flow/masked_token_ratio`, `self_flow/audio_masked_token_ratio`, `self_flow/tau_mean`, `self_flow/tau_min_mean`, `self_flow/audio_tau_mean`, `self_flow/audio_tau_min_mean`.
 
 #### HFATO (High-Frequency Awareness Training Objective)
 

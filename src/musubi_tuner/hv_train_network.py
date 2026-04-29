@@ -3602,8 +3602,6 @@ class NetworkTrainer:
                                     network,
                                     network_dtype,
                                 )
-                                if self_flow_loss is not None:
-                                    loss = loss + self_flow_loss
                             except Exception as e:
                                 logger.warning("Self-Flow loss computation failed during validation: %s", e)
 

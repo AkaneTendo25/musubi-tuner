@@ -4491,6 +4491,7 @@ def main() -> None:
         val_motion_total_losses = []
         num_batches = 0
         max_batches = args.num_validation_batches
+        validation_self_flow_enabled = bool(getattr(args, "self_flow", False))
 
         with torch.no_grad():
             for batch in val_dataloader:
@@ -4507,31 +4508,49 @@ def main() -> None:
                 latents_tensor = trainer.scale_shift_latents(latents_tensor)
                 noise = torch.randn_like(latents_tensor)
 
-                noisy_model_input, timesteps = trainer.get_noisy_model_input_and_timesteps(
-                    args,
-                    noise,
-                    latents_tensor,
-                    batch["timesteps"],
-                    noise_scheduler,
-                    accelerator.device,
-                    trainer.dit_dtype,
-                )
+                if validation_self_flow_enabled:
+                    args.self_flow = False
+                    if getattr(trainer, "_self_flow", None) is not None:
+                        trainer._self_flow.cleanup_step()
+                    trainer._self_flow_step_context = None
+                try:
+                    noisy_model_input, timesteps = trainer.get_noisy_model_input_and_timesteps(
+                        args,
+                        noise,
+                        latents_tensor,
+                        batch["timesteps"],
+                        noise_scheduler,
+                        accelerator.device,
+                        trainer.dit_dtype,
+                    )
+                finally:
+                    if validation_self_flow_enabled:
+                        args.self_flow = True
 
                 weighting = compute_loss_weighting_for_sd3(
                     args.weighting_scheme, noise_scheduler, timesteps, accelerator.device, trainer.dit_dtype
                 )
 
-                model_pred, target = trainer.call_dit(
-                    args,
-                    accelerator,
-                    transformer,
-                    latents_tensor,
-                    batch,
-                    noise,
-                    noisy_model_input,
-                    timesteps,
-                    trainer.dit_dtype,
-                )
+                if validation_self_flow_enabled:
+                    args.self_flow = False
+                    if getattr(trainer, "_self_flow", None) is not None:
+                        trainer._self_flow.cleanup_step()
+                    trainer._self_flow_step_context = None
+                try:
+                    model_pred, target = trainer.call_dit(
+                        args,
+                        accelerator,
+                        transformer,
+                        latents_tensor,
+                        batch,
+                        noise,
+                        noisy_model_input,
+                        timesteps,
+                        trainer.dit_dtype,
+                    )
+                finally:
+                    if validation_self_flow_enabled:
+                        args.self_flow = True
 
                 dict_output = isinstance(model_pred, dict)
                 if dict_output:
@@ -4591,8 +4610,28 @@ def main() -> None:
                     loss = loss.mean()
 
                 self_flow_loss = None
-                if bool(getattr(args, "self_flow", False)):
+                if validation_self_flow_enabled:
                     try:
+                        sf_noisy_model_input, sf_timesteps = trainer.get_noisy_model_input_and_timesteps(
+                            args,
+                            noise,
+                            latents_tensor,
+                            batch["timesteps"],
+                            noise_scheduler,
+                            accelerator.device,
+                            trainer.dit_dtype,
+                        )
+                        _sf_model_pred, _sf_target = trainer.call_dit(
+                            args,
+                            accelerator,
+                            transformer,
+                            latents_tensor,
+                            batch,
+                            noise,
+                            sf_noisy_model_input,
+                            sf_timesteps,
+                            trainer.dit_dtype,
+                        )
                         if getattr(trainer, "_self_flow", None) is not None:
                             trainer._self_flow.on_step(step)
                         self_flow_loss, _self_flow_metrics = trainer.compute_self_flow_addition(
@@ -4603,7 +4642,6 @@ def main() -> None:
                             trainer.dit_dtype,
                         )
                         if self_flow_loss is not None:
-                            loss = loss + self_flow_loss
                             val_self_flow_losses.append(float(self_flow_loss.detach().item()))
                     except Exception as e:
                         if getattr(trainer, "_self_flow", None) is not None:
@@ -4899,6 +4937,11 @@ def main() -> None:
             transformer.eval()
             if ema_model is not None and original_params is None:
                 original_params = ema_model.apply_to(accelerator.unwrap_model(transformer))
+            if validation_self_flow_enabled:
+                args.self_flow = False
+                if getattr(trainer, "_self_flow", None) is not None:
+                    trainer._self_flow.cleanup_step()
+                trainer._self_flow_step_context = None
             with torch.no_grad():
                 for fixed_t in mt_list:
                     mt_losses: list[float] = []
@@ -4993,6 +5036,8 @@ def main() -> None:
             if original_params is not None:
                 ema_model.restore(accelerator.unwrap_model(transformer), original_params)
                 original_params = None
+            if validation_self_flow_enabled:
+                args.self_flow = True
             transformer.train()
 
         # Per-category OOD validation: basic loss only, no EWC/motion/self_flow.
@@ -5000,6 +5045,11 @@ def main() -> None:
             transformer.eval()
             if ema_model is not None and original_params is None:
                 original_params = ema_model.apply_to(accelerator.unwrap_model(transformer))
+            if validation_self_flow_enabled:
+                args.self_flow = False
+                if getattr(trainer, "_self_flow", None) is not None:
+                    trainer._self_flow.cleanup_step()
+                trainer._self_flow_step_context = None
             with torch.no_grad():
                 for cat_name, cat_loader in extra_val_dataloaders.items():
                     c_losses: list[float] = []
@@ -5091,6 +5141,8 @@ def main() -> None:
             if original_params is not None:
                 ema_model.restore(accelerator.unwrap_model(transformer), original_params)
                 original_params = None
+            if validation_self_flow_enabled:
+                args.self_flow = True
             transformer.train()
 
         if val_metrics:
