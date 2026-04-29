@@ -81,7 +81,7 @@ Caching scripts (`ltx2_cache_latents.py`, `ltx2_cache_text_encoder_outputs.py`) 
   - [4a. Text-Only Mode](#4a-text-only-mode)
   - [4b. Reference Mode](#4b-reference-mode)
   - [Slider Tips](#slider-tips)
-- [Setup / Update Script](#setup--update-script)
+- [Windows Setup / Update Script](#windows-setup--update-script)
 - [References](#references)
 
 ---
@@ -89,6 +89,8 @@ Caching scripts (`ltx2_cache_latents.py`, `ltx2_cache_text_encoder_outputs.py`) 
 ## Installation
 
 The base installation procedure is the same as musubi-tuner — follow the [Installation guide](../README.md#installation) (`pip install -e .` in a virtual environment). The sections below cover LTX-2-specific requirements (CUDA version, model downloads) that go on top of the base install.
+
+Windows users can also use [`scripts/install.ps1`](#windows-setup--update-script) as a setup/update helper. It can create or refresh the local virtual environment, install the dashboard extras, build the dashboard frontend, and write launchers for the dashboard and setup tool.
 
 Unless otherwise noted, command examples in this LTX-2 guide were tested on Windows 11. They should also work on Linux, but you may need small shell/path adjustments.
 
@@ -111,7 +113,7 @@ Always match the CUDA version to your GPU architecture — check [PyTorch's comp
 ### Downloading Required Models
 
 > [!WARNING]
-> The dashboard UI and the Windows Setup / Update script are still early prototypes and work in progress. Their stable behavior is not guaranteed yet, and some flows may still break or change.
+> The dashboard UI and the Windows Setup / Update script are under active testing. Their behavior may change, and some local environments may still require manual fixes.
 
 You can now handle the common model downloads directly from the dashboard:
 
@@ -2427,6 +2429,70 @@ Additional notes:
 
 ---
 
+## Windows Setup / Update Script
+
+[`scripts/install.ps1`](https://github.com/AkaneTendo25/musubi-tuner/blob/ltx-2-dev/scripts/install.ps1) is the Windows setup and maintenance entry point.
+
+> [!WARNING]
+> The script and dashboard setup flow are under active testing. Their behavior and generated files may change, and unsupported local environments may still need manual installation steps.
+
+The script can run these actions, depending on the selected options and current machine state:
+
+- install or locate `git`, Python, and Node.js/npm
+- clone the repository, update an existing checkout, or switch the target branch with `-Branch`
+- create the repo-local `venv` or reuse an existing `venv\Scripts\python.exe`
+- install PyTorch for `cu124`, `cu128`, `cu130`, or `cpu`, then install the project with dashboard extras
+- build the dashboard frontend with `npm install` and `npm run build`
+- write `launch_musubi_dashboard.cmd` and `launch_musubi_setup.cmd`
+- optionally create desktop shortcuts for the dashboard and setup/update launcher
+- write `.musubi_install_state.json` for later setup/status checks
+- optionally start the dashboard launcher at the end of the run
+
+**Interactive one-liner:**
+
+```powershell
+irm https://raw.githubusercontent.com/AkaneTendo25/musubi-tuner/ltx-2-dev/scripts/install.ps1 | iex
+```
+
+With no parameters, the script defaults to branch `ltx-2-dev`, CUDA `cu128`, Python `3.12`, dashboard host `127.0.0.1`, and port `7860`. Interactive mode prints the detected environment and lets you choose which actions to run.
+
+**Saved script with explicit parameters:**
+
+```powershell
+irm https://raw.githubusercontent.com/AkaneTendo25/musubi-tuner/ltx-2-dev/scripts/install.ps1 -OutFile install.ps1
+.\install.ps1 -Cuda cu124 -PythonVersion 3.11 -NonInteractive
+```
+
+Available parameters: `-InstallRoot`, `-RepoUrl`, `-Branch`, `-RepoDir`, `-Cuda` (`cu124`/`cu128`/`cu130`/`cpu`), `-PythonVersion` (`3.10`/`3.11`/`3.12`/`3.13`), `-Port`, `-DashboardHost`, `-NonInteractive`, `-StrictPreflight`, and `-PreflightOnly`.
+
+Use `-PreflightOnly` to run the environment checks without making install changes. The script writes a timestamped log to `%TEMP%\musubi_ltx2_install_*.log`; on failure it prints a support bundle with the current step, exception details, and log path.
+
+### Dashboard Usage
+
+After the installer finishes, start the dashboard from the generated `Musubi Tuner Dashboard` desktop shortcut or from `launch_musubi_dashboard.cmd` in the repository directory.
+
+You can also start it manually from the repo-local virtual environment:
+
+```powershell
+venv\Scripts\python.exe -m musubi_tuner.gui_dashboard --host 127.0.0.1 --port 7860
+```
+
+Open the printed browser URL, usually `http://127.0.0.1:7860/`.
+
+Basic flow:
+
+- Use `Projects` to create or load a `project.json`.
+- Use `Dataset` to define training and validation datasets.
+- Use `Caching` to run latent, text encoder, and DINO cache jobs when needed.
+- Use `Training` to configure LoRA training and start/stop the training process.
+- Use `Samples` for training sample prompts.
+- Use `Inference` to run inference from the selected project settings.
+- Use `Settings` > `Setup & Updates` to view install status, launcher/shortcut status, repository status, and open the setup/update tool.
+
+When a cache, training, slider training, or inference job is started from the dashboard, the dashboard shows process status and logs. For training jobs started from the dashboard, the dashboard also reads the training metrics written by the trainer.
+
+---
+
 ## References
 
 **Musubi Tuner Documentation**
@@ -2468,45 +2534,4 @@ Additional notes:
 **Cloud Platforms**
 - [fal.ai LTX-2 Trainer](https://fal.ai/models/fal-ai/ltx2-video-trainer) — Cloud-based LTX-2 LoRA training via API (~$0.005/step)
 - [WaveSpeedAI LTX-2](https://wavespeed.ai/landing/ltx2) — Hosted LTX-2 inference (T2V, I2V, video extend, lipsync)
-
----
-
-## Setup / Update Script
-
-[`scripts/install.ps1`](https://github.com/AkaneTendo25/musubi-tuner/blob/ltx-2-dev/scripts/install.ps1) is the Windows setup and maintenance entry point.
-
-> [!WARNING]
-> The dashboard and `scripts/install.ps1` are still early prototypes and work in progress. Their stable behavior is not guaranteed.
-
-It can:
-
-- install or locate prerequisites (`git`, Python, Node.js)
-- clone the repository or update an existing checkout
-- create or repair the virtual environment
-- install or refresh Python dependencies
-- build or rebuild the dashboard frontend
-- create or recreate dashboard/setup launchers and desktop shortcuts
-- launch the dashboard
-- switch the target branch with `-Branch`
-
-**Quick start (one-liner):**
-
-```powershell
-irm https://raw.githubusercontent.com/AkaneTendo25/musubi-tuner/ltx-2-dev/scripts/install.ps1 | iex
-```
-
-This downloads and runs the script with default settings (CUDA 12.8, Python 3.12, `ltx-2-dev` branch). Interactive mode shows the available actions and lets you choose which ones to run.
-
-**With custom parameters** — save the script locally first:
-
-```powershell
-irm https://raw.githubusercontent.com/AkaneTendo25/musubi-tuner/ltx-2-dev/scripts/install.ps1 -OutFile install.ps1
-.\install.ps1 -Cuda cu124 -PythonVersion 3.11 -NonInteractive
-```
-
-Available parameters: `-InstallRoot`, `-Branch`, `-Cuda` (`cu124`/`cu128`/`cu130`/`cpu`), `-PythonVersion` (`3.10`-`3.13`), `-Port`, `-DashboardHost`, `-NonInteractive`, `-PreflightOnly`.
-
-On success the script writes launchers and desktop shortcuts for the dashboard and the setup tool, and records install state used by later runs.
-
-The script writes a timestamped log to `%TEMP%`. On failure it prints support details at the end of the run.
 
