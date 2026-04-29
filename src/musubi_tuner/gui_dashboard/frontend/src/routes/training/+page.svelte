@@ -413,6 +413,10 @@
 						</div>
 						{#if $advancedMode}
 							<div class="grid grid-cols-2 gap-2">
+								<FormSelect label="Accum Group" value={t.accumulation_group_by || 'none'} options={[{value:'none',label:'None'},{value:'frames',label:'Frames'},{value:'bucket',label:'Bucket'},{value:'dataset',label:'Dataset'}]} onchange={(e) => update('accumulation_group_by', e.target.value)} tooltip="Keep gradient accumulation windows grouped by frame count, full bucket, or dataset. Bucket is safest for mixed frame lengths." />
+								<FormSelect label="Remainder" value={t.accumulation_group_remainder || 'drop'} options={[{value:'drop',label:'Drop'},{value:'pad',label:'Pad'},{value:'allow_mixed',label:'Allow Mixed'}]} onchange={(e) => update('accumulation_group_remainder', e.target.value)} disabled={(t.accumulation_group_by || 'none') === 'none'} tooltip="How to handle incomplete accumulation groups." />
+							</div>
+							<div class="grid grid-cols-2 gap-2">
 								<FormField label="Max Grad Norm" type="number" value={t.max_grad_norm ?? 1.0} oninput={(e) => update('max_grad_norm', Number(e.target.value))} step="0.1" tooltip="Gradient clipping" />
 								<FormField label="Optimizer Args" value={t.optimizer_args || ''} oninput={(e) => update('optimizer_args', e.target.value)} placeholder="key=value ..." tooltip="Extra optimizer args" />
 							</div>

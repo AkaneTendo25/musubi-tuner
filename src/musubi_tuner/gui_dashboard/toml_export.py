@@ -165,6 +165,8 @@ def _dataset_entry_to_dict(entry) -> dict:
     d["batch_size"] = entry.batch_size
     d["num_repeats"] = entry.num_repeats
     d["caption_extension"] = entry.caption_extension
+    if getattr(entry, "caption_field", ""):
+        d["caption_field"] = entry.caption_field
 
     if entry.type == "video":
         d["target_frames"] = [entry.target_frames]

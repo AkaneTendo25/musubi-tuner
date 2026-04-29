@@ -18,6 +18,7 @@ from accelerate import Accelerator
 from tqdm import tqdm
 from safetensors.torch import save_file
 
+from musubi_tuner.dataset.accumulation_group_sampler import build_accumulation_group_sampler
 from musubi_tuner.dataset import config_utils
 from musubi_tuner.dataset.config_utils import BlueprintGenerator, ConfigSanitizer
 from musubi_tuner.dataset.image_video_dataset import ARCHITECTURE_LTX2
@@ -3580,14 +3581,56 @@ def main() -> None:
     collator = collator_class(current_epoch, ds_for_collator)
     n_workers = min(args.max_data_loader_n_workers, os.cpu_count())
 
-    train_dataloader = torch.utils.data.DataLoader(
-        train_dataset_group,
-        batch_size=1,
-        shuffle=True,
-        collate_fn=collator,
-        num_workers=n_workers,
-        persistent_workers=args.persistent_data_loader_workers,
+    accumulation_sampler, accumulation_sampler_stats = build_accumulation_group_sampler(
+        dataset_group=train_dataset_group,
+        group_by=getattr(args, "accumulation_group_by", "none"),
+        gradient_accumulation_steps=int(args.gradient_accumulation_steps),
+        num_processes=int(accelerator.num_processes),
+        remainder=getattr(args, "accumulation_group_remainder", "drop"),
+        seed=int(args.seed),
+        shared_epoch=current_epoch,
+        logger=logger,
     )
+    if accumulation_sampler is None:
+        if (
+            int(args.gradient_accumulation_steps) > 1
+            and int(accumulation_sampler_stats.get("bucket_groups", 0)) > 1
+        ):
+            logger.warning(
+                "gradient_accumulation_steps=%d with %d dataset bucket groups: accumulation windows may mix "
+                "frame counts/resolutions. Use --accumulation_group_by bucket for opt-in grouped windows.",
+                int(args.gradient_accumulation_steps),
+                int(accumulation_sampler_stats["bucket_groups"]),
+            )
+        train_dataloader = torch.utils.data.DataLoader(
+            train_dataset_group,
+            batch_size=1,
+            shuffle=True,
+            collate_fn=collator,
+            num_workers=n_workers,
+            persistent_workers=args.persistent_data_loader_workers,
+        )
+    else:
+        logger.info(
+            "Accumulation group sampler enabled: group_by=%s remainder=%s groups=%d "
+            "window_size=%d original_batches=%d planned_batches=%d delta=%+d",
+            accumulation_sampler_stats["group_by"],
+            accumulation_sampler_stats["remainder"],
+            int(accumulation_sampler_stats["groups"]),
+            int(accumulation_sampler_stats["window_size"]),
+            int(accumulation_sampler_stats["original_batches"]),
+            int(accumulation_sampler_stats["planned_batches"]),
+            int(accumulation_sampler_stats["dropped_or_added_batches"]),
+        )
+        train_dataloader = torch.utils.data.DataLoader(
+            train_dataset_group,
+            batch_size=1,
+            shuffle=False,
+            sampler=accumulation_sampler,
+            collate_fn=collator,
+            num_workers=n_workers,
+            persistent_workers=args.persistent_data_loader_workers,
+        )
 
     # Validation dataset (optional)
     val_dataloader = None
@@ -4044,6 +4087,8 @@ def main() -> None:
         "ss_gradient_checkpointing": args.gradient_checkpointing,
         "ss_gradient_checkpointing_cpu_offload": args.gradient_checkpointing_cpu_offload,
         "ss_gradient_accumulation_steps": args.gradient_accumulation_steps,
+        "ss_accumulation_group_by": getattr(args, "accumulation_group_by", "none"),
+        "ss_accumulation_group_remainder": getattr(args, "accumulation_group_remainder", "drop"),
         "ss_max_train_steps": args.max_train_steps,
         "ss_lr_warmup_steps": args.lr_warmup_steps,
         "ss_lr_scheduler": args.lr_scheduler,

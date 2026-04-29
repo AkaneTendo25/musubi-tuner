@@ -359,6 +359,39 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         help="Split LTX-2 buckets by audio presence to avoid mixed audio/non-audio batches.",
     )
     parser.add_argument(
+        "--accumulation_group_by",
+        type=str,
+        default="none",
+        choices=["none", "frames", "bucket", "dataset"],
+        help=(
+            "Opt-in dataloader ordering for gradient accumulation windows. "
+            "'frames' keeps each accumulation window on one frame count, "
+            "'bucket' keeps it on one full bucket key (resolution/frame/audio), "
+            "'dataset' keeps it within one dataset section, and 'none' uses normal shuffling."
+        ),
+    )
+    parser.add_argument(
+        "--accumulation_group_remainder",
+        type=str,
+        default="drop",
+        choices=["drop", "pad", "allow_mixed"],
+        help=(
+            "How --accumulation_group_by handles buckets that do not divide evenly by the accumulation window. "
+            "'drop' skips incomplete windows, 'pad' repeats same-group batches to fill them, "
+            "and 'allow_mixed' keeps all batches but may mix groups in the final windows."
+        ),
+    )
+    parser.add_argument(
+        "--caption_field",
+        type=str,
+        default=None,
+        help=(
+            "For JSONL datasets, use this metadata field as the training caption instead of 'caption'. "
+            "Useful for I2V/reference datasets that store separate fields such as target_caption "
+            "and reference_caption. Directory datasets still use caption_extension files."
+        ),
+    )
+    parser.add_argument(
         "--audio_bucket_strategy",
         type=str,
         default=None,

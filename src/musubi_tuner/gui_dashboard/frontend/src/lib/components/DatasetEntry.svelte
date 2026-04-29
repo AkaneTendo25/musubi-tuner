@@ -90,9 +90,18 @@
 				value={entry.caption_extension}
 				oninput={(e) => updateField('caption_extension', e.target.value)}
 				placeholder=".txt"
-				tooltip="File extension for caption files"
+				tooltip="Caption file suffix for directory datasets. Use .target.txt for alternate caption files."
 			/>
 		</div>
+		{#if advanced}
+			<FormField
+				label="Caption Field"
+				value={entry.caption_field || ''}
+				oninput={(e) => updateField('caption_field', e.target.value)}
+				placeholder="caption"
+				tooltip="JSONL caption key. Leave blank to use caption; set target_caption for alternate target captions."
+			/>
+		{/if}
 
 		<PathInput
 			label={`${mediaLabel} Directory`}

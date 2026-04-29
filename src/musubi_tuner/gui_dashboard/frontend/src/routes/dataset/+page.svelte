@@ -31,6 +31,7 @@
 				batch_size: 1,
 				num_repeats: 1,
 				caption_extension: '.txt',
+				caption_field: '',
 				target_frames: 33,
 				frame_extraction: 'head',
 				frame_sample: null,

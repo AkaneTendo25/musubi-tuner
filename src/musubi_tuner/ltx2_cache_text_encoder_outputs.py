@@ -558,6 +558,15 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
             "the first dataset's cache_directory/ltx2_sample_prompts_cache.pt"
         ),
     )
+    parser.add_argument(
+        "--caption_field",
+        type=str,
+        default=None,
+        help=(
+            "For JSONL datasets, cache text embeddings from this metadata field instead of 'caption'. "
+            "Use fields such as target_caption for I2V/reference datasets with separate captions."
+        ),
+    )
 
     # -- Preservation prompt precaching --
     parser.add_argument(

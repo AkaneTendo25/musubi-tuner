@@ -40,6 +40,7 @@ class DatasetEntry(BaseModel):
     batch_size: int = 1
     num_repeats: int = 1
     caption_extension: str = ".txt"
+    caption_field: str = ""
     # video-specific
     target_frames: int = 33
     frame_extraction: Literal["head", "chunk", "slide", "uniform", "full"] = "head"
@@ -202,6 +203,8 @@ class TrainingConfig(BaseModel):
     lr_scheduler_args: str = ""
     lr_scheduler_timescale: Optional[int] = None
     gradient_accumulation_steps: int = 1
+    accumulation_group_by: Literal["none", "frames", "bucket", "dataset"] = "none"
+    accumulation_group_remainder: Literal["drop", "pad", "allow_mixed"] = "drop"
     max_grad_norm: float = 1.0
     audio_lr: Optional[float] = None
     lr_args: str = ""

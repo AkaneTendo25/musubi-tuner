@@ -647,6 +647,9 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
     if t.lr_scheduler_timescale is not None:
         cmd += ["--lr_scheduler_timescale", str(t.lr_scheduler_timescale)]
     cmd += ["--gradient_accumulation_steps", str(t.gradient_accumulation_steps)]
+    if t.accumulation_group_by != "none":
+        cmd += ["--accumulation_group_by", t.accumulation_group_by]
+        cmd += ["--accumulation_group_remainder", t.accumulation_group_remainder]
     cmd += ["--max_grad_norm", str(t.max_grad_norm)]
     if t.audio_lr is not None:
         cmd += ["--audio_lr", str(t.audio_lr)]
