@@ -355,6 +355,8 @@ def build_inference_cmd(config: ProjectConfig) -> list[str]:
         cmd.append("--fp8_base")
     if s.fp8_scaled:
         cmd.append("--fp8_scaled")
+    if getattr(s, "fp8_keep_blocks", ""):
+        cmd += ["--fp8_keep_blocks", s.fp8_keep_blocks]
     if s.fp8_w8a8:
         cmd.append("--fp8_w8a8")
     if s.w8a8_mode != "int8":
@@ -525,6 +527,8 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
         cmd.append("--fp8_base")
     if t.fp8_scaled:
         cmd.append("--fp8_scaled")
+    if getattr(t, "fp8_keep_blocks", ""):
+        cmd += ["--fp8_keep_blocks", t.fp8_keep_blocks]
     if t.flash_attn:
         cmd.append("--flash_attn")
     if t.sdpa:
@@ -1203,6 +1207,8 @@ def build_slider_training_cmd(config: ProjectConfig) -> list[str]:
         cmd.append("--fp8_base")
     if t.fp8_scaled:
         cmd.append("--fp8_scaled")
+    if getattr(t, "fp8_keep_blocks", ""):
+        cmd += ["--fp8_keep_blocks", t.fp8_keep_blocks]
     if t.flash_attn:
         cmd.append("--flash_attn")
     if t.gemma_load_in_8bit:

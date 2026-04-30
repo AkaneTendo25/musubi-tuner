@@ -45,6 +45,53 @@ KEEP_FP8_HIGH_PRECISION_TOKENS = (
 )
 
 
+def parse_fp8_keep_blocks(value: Any) -> List[int]:
+    """Parse a comma-separated transformer-block list for FP8 exclusion."""
+    if value is None:
+        return []
+    if isinstance(value, int):
+        return [value]
+    if isinstance(value, (list, tuple, set)):
+        parsed: List[int] = []
+        for item in value:
+            parsed.extend(parse_fp8_keep_blocks(item))
+        return sorted(set(parsed))
+    text = str(value).strip()
+    if not text:
+        return []
+
+    parsed: List[int] = []
+    for raw_part in text.replace(";", ",").split(","):
+        part = raw_part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            start_s, end_s = [p.strip() for p in part.split("-", 1)]
+            if not start_s or not end_s:
+                raise ValueError(f"Invalid --fp8_keep_blocks range: {part!r}")
+            start, end = int(start_s), int(end_s)
+            if end < start:
+                raise ValueError(f"Invalid --fp8_keep_blocks range: {part!r}")
+            parsed.extend(range(start, end + 1))
+        else:
+            parsed.append(int(part))
+    return sorted(set(parsed))
+
+
+def build_fp8_keep_block_exclude_keys(value: Any, num_blocks: Optional[int]) -> List[str]:
+    block_indices = parse_fp8_keep_blocks(value)
+    if not block_indices:
+        return []
+    if num_blocks is None or num_blocks <= 0:
+        raise ValueError("--fp8_keep_blocks requires a model with transformer_blocks")
+    invalid = [idx for idx in block_indices if idx < 0 or idx >= num_blocks]
+    if invalid:
+        raise ValueError(
+            f"--fp8_keep_blocks contains invalid block indices {invalid}; valid range is 0..{num_blocks - 1}"
+        )
+    return [f"transformer_blocks.{idx}." for idx in block_indices]
+
+
 def detect_ltx2_dtype(model_path: str) -> torch.dtype:
     """Detect the data type of LTX-2 model weights"""
     if not os.path.isfile(model_path):
@@ -276,6 +323,7 @@ def load_ltx2_model(
     fp8_upcast: bool = False,
     fp8_upcast_stochastic: bool = False,
     fp8_upcast_seed: int = 0,
+    fp8_keep_blocks: Optional[str] = None,
     nf4_base: bool = False,
     nf4_block_size: int = DEFAULT_NF4_BLOCK_SIZE,
     loftq_init: bool = False,
@@ -403,6 +451,17 @@ def load_ltx2_model(
 
     with torch.device("meta"):
         base_model = configurator.from_config(config)
+    num_transformer_blocks = len(getattr(base_model, "transformer_blocks", []) or [])
+    fp8_block_exclude_keys = (
+        build_fp8_keep_block_exclude_keys(fp8_keep_blocks, num_transformer_blocks) if fp8_scaled else []
+    )
+    if fp8_block_exclude_keys:
+        logger.info(
+            "LTX-2 fp8: keeping transformer blocks in high precision: %s",
+            ", ".join(str(idx) for idx in parse_fp8_keep_blocks(fp8_keep_blocks)),
+        )
+    elif fp8_keep_blocks:
+        logger.warning("--fp8_keep_blocks is set but --fp8_scaled is disabled; ignoring block FP8 exclusions.")
 
     _awq_scales = None  # populated if AWQ calibration is used
 
@@ -563,6 +622,7 @@ def load_ltx2_model(
     elif fp8_scaled:
         fp8_calc_device = _resolved_quant_device
         logger.info("LTX-2 fp8: quantization device = %s", fp8_calc_device)
+        fp8_exclude_keys = list(KEEP_FP8_HIGH_PRECISION_TOKENS) + fp8_block_exclude_keys
         sd = load_safetensors_with_lora_and_fp8(
             model_files=model_path,
             lora_weights_list=None,
@@ -572,7 +632,7 @@ def load_ltx2_model(
             move_to_device=not load_weights_on_cpu and load_device == target_device,
             dit_weight_dtype=None,
             target_keys=["transformer_blocks"],
-            exclude_keys=list(KEEP_FP8_HIGH_PRECISION_TOKENS),
+            exclude_keys=fp8_exclude_keys,
         )
     else:
         sd = load_safetensors_with_lora_and_fp8(

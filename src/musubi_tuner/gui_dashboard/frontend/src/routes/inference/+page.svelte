@@ -212,6 +212,7 @@
 							<FormToggle label="FP8 Weight Offload" checked={s.gemma_fp8_weight_offload ?? true} onchange={(e) => update('gemma_fp8_weight_offload', e.target.checked)} tooltip="For FP8 Gemma safetensors, offload FP8 linear weights to CPU RAM. Disable this to keep more weights on VRAM and reduce RAM/pagefile pressure." />
 						</div>
 						{#if $advancedMode}
+							<FormField label="FP8 Keep Blocks" value={s.fp8_keep_blocks || ''} oninput={(e) => update('fp8_keep_blocks', e.target.value)} placeholder="0,1,2,45" tooltip="Transformer block indices to keep in high precision when FP8 Scaled is enabled. Ranges like 0-2,45 are accepted." />
 							<div class="grid grid-cols-2 gap-2">
 								<FormSelect label="Gemma 4b Type" value={s.gemma_bnb_4bit_quant_type || 'nf4'} options={['nf4', 'fp4']} onchange={(e) => update('gemma_bnb_4bit_quant_type', e.target.value)} tooltip="bitsandbytes 4-bit quant type" />
 								<div class="flex items-end">

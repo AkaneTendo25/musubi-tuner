@@ -131,6 +131,7 @@ class TrainingConfig(BaseModel):
     ltx_version_check_mode: Literal["off", "warn", "error"] = "warn"
     fp8_base: bool = False
     fp8_scaled: bool = False
+    fp8_keep_blocks: str = ""
     flash_attn: bool = False
     sdpa: bool = False
     sage_attn: bool = False
@@ -533,6 +534,7 @@ class InferenceConfig(BaseModel):
     xformers: bool = False
     fp8_base: bool = False
     fp8_scaled: bool = False
+    fp8_keep_blocks: str = ""
     fp8_w8a8: bool = False
     w8a8_mode: Literal["int8", "fp8"] = "int8"
     fp8_upcast: bool = False

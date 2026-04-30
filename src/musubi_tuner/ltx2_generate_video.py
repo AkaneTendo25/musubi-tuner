@@ -224,6 +224,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--xformers", action="store_true", help="Use xformers (same as --attn_mode xformers)")
     parser.add_argument("--fp8_base", action="store_true", help="Use FP8 cast for DiT weights")
     parser.add_argument("--fp8_scaled", action="store_true", help="Use scaled FP8 (requires fp8_base)")
+    parser.add_argument(
+        "--fp8_keep_blocks",
+        type=str,
+        default=None,
+        help="Comma-separated transformer block indices to keep in high precision with --fp8_scaled, e.g. 0,1,2,45.",
+    )
     parser.add_argument("--fp8_w8a8", action="store_true", help="Use W8A8 quantization (requires fp8_scaled)")
     parser.add_argument("--w8a8_mode", type=str, default="int8", choices=["int8", "fp8"])
     parser.add_argument("--fp8_upcast", action="store_true")

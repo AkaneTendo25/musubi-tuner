@@ -649,6 +649,15 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         help="use scaled fp8 for DiT / DiTにスケーリングされたfp8を使う",
     )
     parser.add_argument(
+        "--fp8_keep_blocks",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated transformer block indices to keep in high precision when --fp8_scaled is enabled. "
+            "Example: --fp8_keep_blocks 0,1,2,45. Ranges like 0-2,45 are also accepted."
+        ),
+    )
+    parser.add_argument(
         "--fp8_w8a8",
         action="store_true",
         help="Enable W8A8 activation quantization (saves VRAM by not storing dequantized weights "
