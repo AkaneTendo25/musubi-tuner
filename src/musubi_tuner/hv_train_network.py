@@ -605,21 +605,33 @@ class NetworkTrainer:
 
         optimizer_type = args.optimizer_type.lower()
 
-        # split optimizer_type and optimizer_args
+        # split optimizer_type and optimizer_args. Values fall back to raw string when
+        # they are not Python literals (so identifiers like base_optimizer_type=CAME8Bit
+        # don't need quoting).
         optimizer_kwargs = {}
         if args.optimizer_args is not None and len(args.optimizer_args) > 0:
             for arg in args.optimizer_args:
                 if "=" not in arg:
                     raise ValueError(f"Invalid --optimizer_args entry (expected key=value): {arg}")
                 key, value = arg.split("=", 1)
-                value = ast.literal_eval(value)
+                try:
+                    value = ast.literal_eval(value)
+                except (ValueError, SyntaxError):
+                    pass  # keep as string
                 optimizer_kwargs[key] = value
 
         lr = args.learning_rate
         optimizer = None
         optimizer_class = None
 
-        if optimizer_type.endswith("8bit".lower()):
+        # CAME8bit dispatched before the bitsandbytes "8bit" branch since CAME ends in "8bit".
+        if optimizer_type == "CAME8bit".lower():
+            from musubi_tuner.optimizers.came_8bit import CAME8bit
+            logger.info(f"use CAME8bit optimizer (stochastic_rounding, cautious, step_parameter) | {optimizer_kwargs}")
+            optimizer_class = CAME8bit
+            optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
+
+        elif optimizer_type.endswith("8bit".lower()):
             try:
                 import bitsandbytes as bnb
             except ImportError:
@@ -687,6 +699,25 @@ class NetworkTrainer:
             logger.info(f"use Automagic optimizer | lr={lr} | {optimizer_kwargs}")
             optimizer_class = Automagic
             optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
+
+        elif optimizer_type in ("badam", "blockadam", "block_optimizer", "blockoptimizer"):
+            # BAdam wraps a base optimizer (built via recursive dispatch) and is wired
+            # in the trainer after accelerator.prepare() to enable gradient_release hooks.
+            # Wrapper kwargs go through --optimizer_args (this branch sees them via
+            # optimizer_kwargs); the inner optimizer's kwargs come from --base_optimizer_args.
+            base_type = str(optimizer_kwargs.get("base_optimizer_type") or "AdamW")
+            if base_type.lower() in ("badam", "blockadam", "block_optimizer", "blockoptimizer"):
+                raise ValueError("base_optimizer_type must name the wrapped optimizer, not BAdam")
+            logger.info(f"BAdam: building base optimizer '{base_type}' (wrap deferred to trainer) | wrapper_kwargs={optimizer_kwargs}")
+            saved_optimizer_type = args.optimizer_type
+            saved_optimizer_args = args.optimizer_args
+            args.optimizer_type = base_type
+            args.optimizer_args = list(getattr(args, "base_optimizer_args", None) or [])
+            try:
+                return self.get_optimizer(args, trainable_params)
+            finally:
+                args.optimizer_type = saved_optimizer_type
+                args.optimizer_args = saved_optimizer_args
 
         if optimizer is None:
             # 任意のoptimizerを使う

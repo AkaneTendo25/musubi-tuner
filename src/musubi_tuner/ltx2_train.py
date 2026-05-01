@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import hashlib
 import json
 import math
@@ -2691,8 +2692,14 @@ def ltx2_finetune_setup_parser(parser: argparse.ArgumentParser) -> argparse.Argu
     parser.add_argument(
         "--fused_backward_pass",
         action="store_true",
-        help="Use fused backward pass for Adafactor optimizer",
+        help="Use fused backward pass for Adafactor or BAdam (with use_gradient_release=True)",
     )
+    # BAdam (block-coordinate Adam wrapper).
+    # All wrapper kwargs flow through --optimizer_args as key=value entries
+    # (e.g. base_optimizer_type=CAME8Bit switch_block_every=25 use_gradient_release=True).
+    # The inner optimizer's kwargs are passed via --base_optimizer_args.
+    parser.add_argument("--base_optimizer_args", type=str, default=None, nargs="*",
+                        help="Inner optimizer kwargs when --optimizer_type=BAdam (e.g. stochastic_rounding=True use_cautious=False).")
     parser.add_argument(
         "--mem_eff_save",
         action="store_true",
@@ -3940,6 +3947,65 @@ def main() -> None:
         args, params_to_optimize
     )
 
+    # BAdam: wrap the freshly-built base optimizer with the block-coordinate wrapper.
+    badam_aliases = {"badam", "blockadam", "block_optimizer", "blockoptimizer"}
+    is_badam_run = str(getattr(args, "optimizer_type", "")).lower() in badam_aliases
+    if is_badam_run:
+        from musubi_tuner.optimizers.badam import create_badam_optimizer
+
+        # Parse wrapper kwargs from --optimizer_args. base_optimizer_type is consumed by
+        # the factory and must be excluded here. Values fall back to raw string when
+        # they are not Python literals.
+        wrapper_kwargs: dict[str, Any] = {}
+        for entry in (args.optimizer_args or []):
+            if "=" not in entry:
+                raise ValueError(f"Invalid --optimizer_args entry (expected key=value): {entry}")
+            k, v = entry.split("=", 1)
+            try:
+                wrapper_kwargs[k] = ast.literal_eval(v)
+            except (ValueError, SyntaxError):
+                wrapper_kwargs[k] = v
+        wrapper_kwargs.pop("base_optimizer_type", None)
+        if wrapper_kwargs.get("use_gradient_release", False) and not wrapper_kwargs.get("use_fp32_active_copy", True):
+            raise ValueError(
+                "use_gradient_release=True requires use_fp32_active_copy=True; "
+                "the per-param step path operates on HP fp32 copies."
+            )
+
+        # create_badam_optimizer reads its config via getattr(args, 'badam_*', default).
+        # Build a synthetic namespace populated from wrapper_kwargs to keep that contract
+        # without re-introducing 14 individual CLI flags.
+        badam_args_ns = argparse.Namespace()
+        for short, default in [
+            ("switch_block_every", 100),
+            ("switch_mode", "random"),
+            ("start_block", None),
+            ("block_prefix_mode", "transformer_blocks"),
+            ("block_prefixes", []),
+            ("always_active_prefixes", []),
+            ("active_modules", []),
+            ("include_non_block", True),
+            ("include_embedding", False),
+            ("include_lm_head", False),
+            ("use_fp32_active_copy", True),
+            ("purge_inactive_state", True),
+            ("reset_state_on_switch", True),
+            ("use_gradient_release", False),
+            ("allow_distributed", False),
+            ("allow_unmatched_params", False),
+            ("verbose", 1),
+        ]:
+            setattr(badam_args_ns, f"badam_{short}", wrapper_kwargs.get(short, default))
+
+        optimizer = create_badam_optimizer(
+            badam_args_ns,
+            transformer,
+            params_to_optimize,
+            optimizer,
+            logger=logger,
+        )
+        optimizer_name = type(optimizer).__module__ + "." + type(optimizer).__name__
+
     # lr scheduler
     lr_scheduler = trainer.get_lr_scheduler(args, optimizer, accelerator.num_processes)
 
@@ -4042,52 +4108,78 @@ def main() -> None:
             logger.info("EMA state loaded (step=%d)", ema_model.step)
 
     fused_step_state: dict[str, bool] | None = None
+    badam_gr_active = False
     if args.fused_backward_pass:
         base_optimizer = getattr(optimizer, "optimizer", optimizer)
-        if base_optimizer.__class__.__name__.lower() != "adafactor":
-            raise ValueError(
-                f"--fused_backward_pass requires Adafactor optimizer; got {base_optimizer.__class__.__name__}"
+        # BAdam-with-gradient_release: hooks attach to LP params via the wrapper itself.
+        from musubi_tuner.optimizers.badam import BlockOptimizer
+
+        if isinstance(base_optimizer, BlockOptimizer) and bool(getattr(args, "badam_use_gradient_release", False)):
+            hooks_step_enabled = args.max_grad_norm == 0.0
+            if not hooks_step_enabled:
+                logger.info(
+                    "BAdam gradient-release: per-param clipping at max_grad_norm=%.6f.",
+                    float(args.max_grad_norm),
+                )
+            fused_step_state = {
+                "defer_step": False,
+                "suspend_step": False,
+                "hook_stepped": False,
+                "hooks_step_enabled": hooks_step_enabled,
+            }
+            base_optimizer.enable_gradient_release(
+                accelerator=accelerator,
+                max_grad_norm=float(args.max_grad_norm or 0.0),
+                fused_step_state=fused_step_state,
             )
+            badam_gr_active = True
+            logger.info("BAdam gradient-release enabled (post-prepare).")
+        else:
+            if base_optimizer.__class__.__name__.lower() != "adafactor":
+                raise ValueError(
+                    f"--fused_backward_pass requires Adafactor optimizer or BAdam with "
+                    f"badam_use_gradient_release=True; got {base_optimizer.__class__.__name__}"
+                )
 
-        import musubi_tuner.modules.adafactor_fused as adafactor_fused
+            import musubi_tuner.modules.adafactor_fused as adafactor_fused
 
-        adafactor_fused.patch_adafactor_fused(optimizer)
-        hooks_step_enabled = args.max_grad_norm == 0.0
-        if not hooks_step_enabled:
-            logger.info(
-                "Fused hooks are disabled because max_grad_norm=%.6f. "
-                "Using sync-point fused stepping to preserve global gradient clipping correctness.",
-                float(args.max_grad_norm),
-            )
-        fused_step_state = {
-            "defer_step": False,
-            "suspend_step": False,
-            "hook_stepped": False,
-            "hooks_step_enabled": hooks_step_enabled,
-        }
+            adafactor_fused.patch_adafactor_fused(optimizer)
+            hooks_step_enabled = args.max_grad_norm == 0.0
+            if not hooks_step_enabled:
+                logger.info(
+                    "Fused hooks are disabled because max_grad_norm=%.6f. "
+                    "Using sync-point fused stepping to preserve global gradient clipping correctness.",
+                    float(args.max_grad_norm),
+                )
+            fused_step_state = {
+                "defer_step": False,
+                "suspend_step": False,
+                "hook_stepped": False,
+                "hooks_step_enabled": hooks_step_enabled,
+            }
 
-        for param_group, param_name_group in zip(optimizer.param_groups, param_names):
-            for parameter, param_name in zip(param_group["params"], param_name_group):
-                if parameter.requires_grad:
+            for param_group, param_name_group in zip(optimizer.param_groups, param_names):
+                for parameter, param_name in zip(param_group["params"], param_name_group):
+                    if parameter.requires_grad:
 
-                    def create_grad_hook(p_name, p_group):
-                        def grad_hook(tensor: torch.Tensor):
-                            if fused_step_state is None or not fused_step_state.get("hooks_step_enabled", False):
-                                return
-                            if not accelerator.sync_gradients:
-                                return
-                            if fused_step_state is not None and (
-                                fused_step_state.get("defer_step", False)
-                                or fused_step_state.get("suspend_step", False)
-                            ):
-                                return
-                            optimizer.step_param(tensor, p_group)
-                            tensor.grad = None
-                            fused_step_state["hook_stepped"] = True
+                        def create_grad_hook(p_name, p_group):
+                            def grad_hook(tensor: torch.Tensor):
+                                if fused_step_state is None or not fused_step_state.get("hooks_step_enabled", False):
+                                    return
+                                if not accelerator.sync_gradients:
+                                    return
+                                if fused_step_state is not None and (
+                                    fused_step_state.get("defer_step", False)
+                                    or fused_step_state.get("suspend_step", False)
+                                ):
+                                    return
+                                optimizer.step_param(tensor, p_group)
+                                tensor.grad = None
+                                fused_step_state["hook_stepped"] = True
 
-                        return grad_hook
+                            return grad_hook
 
-                    parameter.register_post_accumulate_grad_hook(create_grad_hook(param_name, param_group))
+                        parameter.register_post_accumulate_grad_hook(create_grad_hook(param_name, param_group))
 
     # scheduler
     noise_scheduler = FlowMatchDiscreteScheduler(shift=args.discrete_flow_shift, reverse=True, solver="euler")
@@ -5771,8 +5863,14 @@ def main() -> None:
                         if fused_step_state is not None:
                             fused_step_state["defer_step"] = False
                         hook_stepped = bool(fused_step_state is not None and fused_step_state.get("hook_stepped", False))
-                        pending_steps = _fused_step_pending_grads(optimizer, accelerator, args.max_grad_norm)
-                        did_fused_step = hook_stepped or pending_steps > 0
+                        if badam_gr_active:
+                            # Hooks already applied per-param updates; wrapper.step() advances
+                            # the block-switch counter and runs end-of-iteration housekeeping.
+                            optimizer.step()
+                            did_fused_step = True
+                        else:
+                            pending_steps = _fused_step_pending_grads(optimizer, accelerator, args.max_grad_norm)
+                            did_fused_step = hook_stepped or pending_steps > 0
                         optimizer.zero_grad(set_to_none=True)
                     if did_fused_step:
                         lr_scheduler.step()
