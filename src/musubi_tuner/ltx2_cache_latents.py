@@ -519,7 +519,16 @@ def encode_and_save_audio_cache(
     loss_mask_intervals = getattr(item_info, "audio_loss_mask_intervals", None)
     if loss_mask_intervals is not None:
         audio_loss_mask = torch.zeros((time_steps,), dtype=torch.float32)
-        latents_per_second = float(sample_rate) / float(getattr(encoder, "mel_hop_length", 160)) / float(LATENT_DOWNSAMPLE_FACTOR)
+        # Derive latents/sec from the encoder's actual output rather than from
+        # sample_rate / mel_hop_length / LATENT_DOWNSAMPLE_FACTOR, which assumes
+        # the encoder's internal rate matches the input file's sample_rate. With
+        # input audio at any non-default SR, that formula misaligns interval
+        # boundaries and silently drops intervals past time_steps.
+        waveform_seconds = float(waveform.shape[-1]) / max(float(sample_rate), 1.0)
+        if original_steps > 0 and waveform_seconds > 0:
+            latents_per_second = float(original_steps) / waveform_seconds
+        else:
+            latents_per_second = float(sample_rate) / float(getattr(encoder, "mel_hop_length", 160)) / float(LATENT_DOWNSAMPLE_FACTOR)
         for start_s, end_s in loss_mask_intervals:
             start_idx = max(0, min(time_steps, int(math.floor(float(start_s) * latents_per_second))))
             end_idx = max(start_idx, min(time_steps, int(math.ceil(float(end_s) * latents_per_second))))

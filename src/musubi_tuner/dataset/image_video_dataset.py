@@ -4024,10 +4024,9 @@ class VideoDataset(BaseDataset):
 
                 resized_loss_mask = None
                 if loss_mask is not None:
-                    resized_loss_mask = np.stack(
-                        [loss_mask_to_float_array(frame, bucket_reso) for frame in loss_mask],
-                        axis=0,
-                    )
+                    # Datasource already returns a float32 [0,1] ndarray pre-resized
+                    # to bucket_reso via load_loss_mask_frames; do not re-normalize.
+                    resized_loss_mask = np.asarray(loss_mask, dtype=np.float32)
                 elif self.default_loss_mask_path:
                     resized_loss_mask = load_loss_mask_frames(
                         self.default_loss_mask_path,
