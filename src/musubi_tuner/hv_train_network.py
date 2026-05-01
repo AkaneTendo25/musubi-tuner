@@ -509,6 +509,53 @@ def _per_element_loss(pred: torch.Tensor, tgt: torch.Tensor, loss_type: str = "m
         return torch.nn.functional.mse_loss(pred.float(), tgt.float(), reduction="none")
 
 
+def apply_loss_mask(
+    per_elem: torch.Tensor,
+    mask: Optional[torch.Tensor],
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Reduce a per-element loss to a scalar with optional mask weighting.
+
+    Returns (loss, metrics). When `mask is None`, loss = per_elem.mean() and
+    metrics is empty. When mask is given:
+      - mask is broadcast/reshaped to per_elem's rank;
+      - loss = (per_elem * mask).div(mask.mean()).mean(), which equals the
+        unweighted mean of per_elem over the mask-active region for binary
+        masks, and a soft-weighted mean for non-binary masks;
+      - if mask.mean() == 0, loss falls back to per_elem.mean();
+      - metrics carries `mask_active`, `loss_unmasked`, `loss_masked` for
+        downstream logging.
+    """
+    if mask is None:
+        return per_elem.mean(), {}
+
+    mask = mask.to(device=per_elem.device)
+    if per_elem.dim() == 5 and mask.dim() == 2:
+        mask = mask.view(mask.shape[0], 1, mask.shape[1], 1, 1)
+    elif per_elem.dim() == 5 and mask.dim() == 1:
+        mask = mask.view(mask.shape[0], 1, 1, 1, 1)
+    elif per_elem.dim() == 4 and mask.dim() == 2:
+        mask = mask.view(mask.shape[0], 1, mask.shape[1], 1)
+    elif per_elem.dim() == 4 and mask.dim() == 1:
+        mask = mask.view(mask.shape[0], 1, 1, 1)
+    elif per_elem.dim() == 3 and mask.dim() == 2:
+        mask = mask.unsqueeze(-1)
+    elif per_elem.dim() == 3 and mask.dim() == 1:
+        mask = mask.view(mask.shape[0], 1, 1)
+
+    mask_f = mask.to(dtype=per_elem.dtype)
+    denom = mask_f.mean()
+    metrics: dict[str, float] = {
+        "mask_active": float(denom.detach().float().item()),
+        "loss_unmasked": float(per_elem.detach().float().mean().item()),
+    }
+    if denom.item() == 0:
+        loss = per_elem.mean()
+    else:
+        loss = (per_elem * mask_f).div(denom).mean()
+    metrics["loss_masked"] = float(loss.detach().float().item())
+    return loss, metrics
+
+
 def should_sample_images(args, steps, epoch=None):
     if steps == 0:
         if not args.sample_at_first:
@@ -547,6 +594,7 @@ class NetworkTrainer:
         maximum_norm=None,
         video_loss=None,
         audio_loss=None,
+        mask_metrics=None,
     ):
         network_train_unet_only = True
         logs = {"loss/current": current_loss, "loss/average": avr_loss}
@@ -556,6 +604,13 @@ class NetworkTrainer:
             logs["loss/video"] = video_loss
         if audio_loss is not None:
             logs["loss/audio"] = audio_loss
+
+        # Mask-loss visibility: when a loss mask was present, surface the active
+        # fraction and the pre-/post-mask loss values so it's obvious whether the
+        # mask is meaningfully shifting the gradient.
+        if mask_metrics:
+            for k, v in mask_metrics.items():
+                logs[f"loss/{k}"] = v
 
         if keys_scaled is not None:
             logs["max_norm/keys_scaled"] = keys_scaled
@@ -3492,28 +3547,8 @@ class NetworkTrainer:
                                         while w.dim() > per_elem.dim() and w.shape[-1] == 1:
                                             w = w.squeeze(-1)
                                     per_elem = per_elem * w
-                                if mask is None:
-                                    return per_elem.mean()
-
-                                mask = mask.to(device=per_elem.device)
-                                if per_elem.dim() == 5 and mask.dim() == 2:
-                                    mask = mask.view(mask.shape[0], 1, mask.shape[1], 1, 1)
-                                elif per_elem.dim() == 5 and mask.dim() == 1:
-                                    mask = mask.view(mask.shape[0], 1, 1, 1, 1)
-                                elif per_elem.dim() == 4 and mask.dim() == 2:
-                                    mask = mask.view(mask.shape[0], 1, mask.shape[1], 1)
-                                elif per_elem.dim() == 4 and mask.dim() == 1:
-                                    mask = mask.view(mask.shape[0], 1, 1, 1)
-                                elif per_elem.dim() == 3 and mask.dim() == 2:
-                                    mask = mask.unsqueeze(-1)
-                                elif per_elem.dim() == 3 and mask.dim() == 1:
-                                    mask = mask.view(mask.shape[0], 1, 1)
-
-                                mask_f = mask.to(dtype=per_elem.dtype)
-                                denom = mask_f.mean()
-                                if denom.item() == 0:
-                                    return per_elem.mean()
-                                return (per_elem * mask_f).div(denom).mean()
+                                loss, _ = apply_loss_mask(per_elem, mask)
+                                return loss
 
                             video_pred = out["video_pred"]
                             video_target = out["video_target"]
@@ -3892,6 +3927,7 @@ class NetworkTrainer:
                     grad_norm_video_value = None  # Per-modality gradient norms
                     grad_norm_audio_value = None
                     audio_diagnostics = {}  # Per-batch audio quality diagnostics (negligible cost)
+                    mask_metrics: dict[str, float] = {}
                     _loss_type = getattr(args, "loss_type", "mse")
                     _huber_delta = getattr(args, "huber_delta", 1.0)
 
@@ -3902,6 +3938,8 @@ class NetworkTrainer:
                             pred: torch.Tensor,
                             tgt: torch.Tensor,
                             mask: torch.Tensor | None,
+                            *,
+                            tag: str | None = None,
                         ) -> torch.Tensor:
                             if isinstance(tgt, torch.Tensor):
                                 pred = pred.to(device=tgt.device, dtype=network_dtype)
@@ -3914,28 +3952,11 @@ class NetworkTrainer:
                                     while w.dim() > per_elem.dim() and w.shape[-1] == 1:
                                         w = w.squeeze(-1)
                                 per_elem = per_elem * w
-                            if mask is None:
-                                return per_elem.mean()
-
-                            mask = mask.to(device=per_elem.device)
-                            if per_elem.dim() == 5 and mask.dim() == 2:
-                                mask = mask.view(mask.shape[0], 1, mask.shape[1], 1, 1)
-                            elif per_elem.dim() == 5 and mask.dim() == 1:
-                                mask = mask.view(mask.shape[0], 1, 1, 1, 1)
-                            elif per_elem.dim() == 4 and mask.dim() == 2:
-                                mask = mask.view(mask.shape[0], 1, mask.shape[1], 1)
-                            elif per_elem.dim() == 4 and mask.dim() == 1:
-                                mask = mask.view(mask.shape[0], 1, 1, 1)
-                            elif per_elem.dim() == 3 and mask.dim() == 2:
-                                mask = mask.unsqueeze(-1)
-                            elif per_elem.dim() == 3 and mask.dim() == 1:
-                                mask = mask.view(mask.shape[0], 1, 1)
-
-                            mask_f = mask.to(dtype=per_elem.dtype)
-                            denom = mask_f.mean()
-                            if denom.item() == 0:
-                                return per_elem.mean()
-                            return (per_elem * mask_f).div(denom).mean()
+                            loss, metrics = apply_loss_mask(per_elem, mask)
+                            if tag is not None and metrics:
+                                for k, v in metrics.items():
+                                    mask_metrics[f"{tag}_{k}"] = v
+                            return loss
 
                         video_pred = out["video_pred"]
                         video_target = out["video_target"]
@@ -3951,7 +3972,7 @@ class NetworkTrainer:
                                 video_loss_mask,
                             )
                         else:
-                            video_loss = _masked_loss(video_pred, video_target, video_loss_mask)
+                            video_loss = _masked_loss(video_pred, video_target, video_loss_mask, tag="video")
 
                         audio_pred = out.get("audio_pred")
                         audio_target = out.get("audio_target")
@@ -3961,14 +3982,14 @@ class NetworkTrainer:
                         if audio_loss_balance_mode == "uncertainty" and has_audio_loss:
                             # Uncertainty weighting: learnable log-variance scalars replace manual weights
                             video_loss_value = video_loss.detach().item()
-                            audio_loss_raw = _masked_loss(audio_pred, audio_target, audio_loss_mask)
+                            audio_loss_raw = _masked_loss(audio_pred, audio_target, audio_loss_mask, tag="audio")
                             audio_loss_value = audio_loss_raw.detach().item()
                             loss = compute_uncertainty_weighted_loss(
                                 video_loss, audio_loss_raw,
                                 uncertainty_log_var_video, uncertainty_log_var_audio,
                             )
                         elif audio_loss_balance_mode == "ogm_ge" and has_audio_loss:
-                            audio_loss = _masked_loss(audio_pred, audio_target, audio_loss_mask)
+                            audio_loss = _masked_loss(audio_pred, audio_target, audio_loss_mask, tag="audio")
                             video_loss_value = video_loss.detach().item()
                             audio_loss_value = audio_loss.detach().item()
                             ogm_ge_state = compute_ogm_ge_coefficients(
@@ -4001,7 +4022,7 @@ class NetworkTrainer:
                                 )
                                 audio_presence_ema_value = audio_presence_ema
                             if has_audio_loss:
-                                audio_loss = _masked_loss(audio_pred, audio_target, audio_loss_mask)
+                                audio_loss = _masked_loss(audio_pred, audio_target, audio_loss_mask, tag="audio")
                                 audio_weight = float(out.get("audio_loss_weight", 1.0))
                                 if audio_loss_balance_mode == "inv_freq":
                                     audio_weight = compute_inverse_frequency_audio_weight(
@@ -4475,6 +4496,10 @@ class NetworkTrainer:
                         logs["audio_w"] = audio_weight_effective_value
                     if audio_presence_ema_value is not None:
                         logs["audio_p"] = audio_presence_ema_value
+                    if "video_mask_active" in mask_metrics:
+                        logs["mv_act"] = round(mask_metrics["video_mask_active"], 3)
+                    if "audio_mask_active" in mask_metrics:
+                        logs["ma_act"] = round(mask_metrics["audio_mask_active"], 3)
                 progress_bar.set_postfix(**logs)
 
                 if args.scale_weight_norms:
@@ -4484,6 +4509,7 @@ class NetworkTrainer:
                     logs = self.generate_step_logs(
                         args, current_loss, avr_loss, lr_scheduler, lr_descriptions, optimizer, keys_scaled, mean_norm, maximum_norm,
                         video_loss=video_loss_value, audio_loss=audio_loss_value,
+                        mask_metrics=mask_metrics if mask_metrics else None,
                     )
                     if audio_weight_effective_value is not None:
                         logs["loss/audio_weight_effective"] = audio_weight_effective_value

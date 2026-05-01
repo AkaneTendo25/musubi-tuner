@@ -1900,6 +1900,8 @@ loss_mask_directory = "video_masks"
 {"audio_path":"audio/line.wav","caption":"voice","loss_mask_intervals":[[0.25, 1.8], [2.4, 3.1]]}
 ```
 
+When a loss mask is configured, the training loop logs the mask-active fraction in the progress bar (`mv_act` / `ma_act`) and emits `loss/video_mask_active`, `loss/video_loss_unmasked`, `loss/video_loss_masked` (and audio equivalents) to TensorBoard / WandB. The pre- vs post-mask loss values make it visible whether the mask is actually shifting the gradient.
+
 ### Example TOML
 
 ```toml
