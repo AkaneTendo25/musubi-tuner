@@ -372,6 +372,7 @@ def _build_dataloader(args: argparse.Namespace, trainer: LTX2NetworkTrainer) -> 
         training=True,
         num_timestep_buckets=args.num_timestep_buckets,
         shared_epoch=current_epoch,
+        reference_downscale=getattr(args, "reference_downscale", 1),
     )
     if train_dataset_group.num_train_items == 0:
         raise ValueError("No training items found in the dataset. Create latent/text caches first.")

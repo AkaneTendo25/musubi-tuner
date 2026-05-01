@@ -2414,6 +2414,7 @@ class NetworkTrainer:
                 training=True,
                 num_timestep_buckets=self.num_timestep_buckets,
                 shared_epoch=current_epoch,
+                reference_downscale=getattr(args, "reference_downscale", 1),
             )
             if train_dataset_group is None:
                 raise ValueError("dataset manifest contains no training datasets")
@@ -2424,6 +2425,7 @@ class NetworkTrainer:
                 training=True,
                 num_timestep_buckets=self.num_timestep_buckets,
                 shared_epoch=current_epoch,
+                reference_downscale=getattr(args, "reference_downscale", 1),
             )
         else:
             blueprint_generator = BlueprintGenerator(ConfigSanitizer())
@@ -2431,7 +2433,11 @@ class NetworkTrainer:
             user_config = config_utils.load_user_config(args.dataset_config)
             blueprint = blueprint_generator.generate(user_config, args, architecture=self.architecture)
             train_dataset_group = config_utils.generate_dataset_group_by_blueprint(
-                blueprint.dataset_group, training=True, num_timestep_buckets=self.num_timestep_buckets, shared_epoch=current_epoch
+                blueprint.dataset_group,
+                training=True,
+                num_timestep_buckets=self.num_timestep_buckets,
+                shared_epoch=current_epoch,
+                reference_downscale=getattr(args, "reference_downscale", 1),
             )
             if user_config.get("validation_datasets"):
                 logger.info("Load validation datasets from dataset config")
@@ -2447,6 +2453,7 @@ class NetworkTrainer:
                     training=True,
                     num_timestep_buckets=self.num_timestep_buckets,
                     shared_epoch=current_epoch,
+                    reference_downscale=getattr(args, "reference_downscale", 1),
                 )
 
         if train_dataset_group.num_train_items == 0:

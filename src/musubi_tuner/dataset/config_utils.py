@@ -423,6 +423,7 @@ def generate_dataset_group_by_blueprint(
     training: bool = False,
     num_timestep_buckets: Optional[int] = None,
     shared_epoch: SharedEpoch = None,
+    reference_downscale: int = 1,
 ) -> DatasetGroup:
     datasets: List[Union[ImageDataset, VideoDataset, AudioDataset]] = []
 
@@ -436,6 +437,14 @@ def generate_dataset_group_by_blueprint(
 
         dataset = dataset_klass(**asdict(dataset_blueprint.params))
         datasets.append(dataset)
+
+    try:
+        reference_downscale = max(1, int(reference_downscale or 1))
+    except (TypeError, ValueError):
+        reference_downscale = 1
+    for dataset in datasets:
+        if getattr(dataset, "architecture", None) in {ARCHITECTURE_LTX2, ARCHITECTURE_LTX2_FULL}:
+            dataset.reference_downscale = reference_downscale
 
     # warn about missing data directories
     for i, dataset in enumerate(datasets):
@@ -479,6 +488,7 @@ def generate_dataset_group_by_blueprint(
         default_loss_mask_path: "{getattr(dataset, "default_loss_mask_path", None)}"
         loss_mask_use_alpha: {getattr(dataset, "loss_mask_use_alpha", False)}
         loss_mask_invert: {getattr(dataset, "loss_mask_invert", False)}
+        reference_downscale: {getattr(dataset, "reference_downscale", 1)}
         cache_directory: "{dataset.cache_directory}"
         reference_cache_directory: "{getattr(dataset, 'reference_cache_directory', None)}"
         reference_cache_directories: {getattr(dataset, "reference_cache_directories", None)}
@@ -720,6 +730,7 @@ def generate_dataset_group_by_manifest(
     training: bool = False,
     num_timestep_buckets: Optional[int] = None,
     shared_epoch: SharedEpoch = None,
+    reference_downscale: int = 1,
 ) -> Optional[DatasetGroup]:
     if split not in {"train", "validation"}:
         raise ValueError(f"invalid manifest split: {split}")
@@ -736,6 +747,7 @@ def generate_dataset_group_by_manifest(
         training=training,
         num_timestep_buckets=num_timestep_buckets,
         shared_epoch=shared_epoch,
+        reference_downscale=reference_downscale,
     )
 
 

@@ -3561,6 +3561,7 @@ def main() -> None:
         training=True,
         num_timestep_buckets=args.num_timestep_buckets,
         shared_epoch=current_epoch,
+        reference_downscale=getattr(args, "reference_downscale", 1),
     )
 
     if train_dataset_group.num_train_items == 0:
@@ -3658,6 +3659,7 @@ def main() -> None:
             training=False,  # validation mode
             num_timestep_buckets=args.num_timestep_buckets,
             shared_epoch=current_epoch,
+            reference_downscale=getattr(args, "reference_downscale", 1),
         )
         if val_dataset_group.num_train_items > 0:
             val_collator = collator_class(current_epoch, val_dataset_group if args.max_data_loader_n_workers == 0 else None)
@@ -3987,6 +3989,7 @@ def main() -> None:
                 _bp.dataset_group, training=False,
                 num_timestep_buckets=args.num_timestep_buckets,
                 shared_epoch=current_epoch,
+                reference_downscale=getattr(args, "reference_downscale", 1),
             )
             if _dg.num_train_items <= 0:
                 logger.warning("validation_extra_configs[%s]: no items, skipping.", _cat)

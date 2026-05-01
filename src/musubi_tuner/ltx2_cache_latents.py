@@ -70,7 +70,10 @@ def _load_datasets(args: argparse.Namespace) -> Sequence[BaseDataset]:
     logger.info("Load dataset config from %s", args.dataset_config)
     user_config = config_utils.load_user_config(args.dataset_config)
     blueprint = blueprint_generator.generate(user_config, args, architecture=ARCHITECTURE_LTX2)
-    dataset_group = config_utils.generate_dataset_group_by_blueprint(blueprint.dataset_group)
+    dataset_group = config_utils.generate_dataset_group_by_blueprint(
+        blueprint.dataset_group,
+        reference_downscale=getattr(args, "reference_downscale", 1),
+    )
     datasets = list(dataset_group.datasets)
 
     if user_config.get("validation_datasets"):
@@ -83,7 +86,8 @@ def _load_datasets(args: argparse.Namespace) -> Sequence[BaseDataset]:
             validation_user_config, args, architecture=ARCHITECTURE_LTX2
         )
         validation_dataset_group = config_utils.generate_dataset_group_by_blueprint(
-            validation_blueprint.dataset_group
+            validation_blueprint.dataset_group,
+            reference_downscale=getattr(args, "reference_downscale", 1),
         )
         datasets.extend(validation_dataset_group.datasets)
 

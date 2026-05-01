@@ -897,17 +897,32 @@ class BucketSelector:
         ARCHITECTURE_Z_IMAGE: RESOLUTION_STEPS_Z_IMAGE,
     }
 
+    @classmethod
+    def resolve_resolution_steps(cls, architecture: str, reference_downscale: int = 1) -> int:
+        if architecture not in BucketSelector.ARCHITECTURE_STEPS_MAP:
+            raise ValueError(f"Invalid architecture: {architecture}")
+
+        reso_steps = BucketSelector.ARCHITECTURE_STEPS_MAP[architecture]
+        reference_downscale = max(1, int(reference_downscale or 1))
+        if architecture == ARCHITECTURE_LTX2 and reference_downscale > 1:
+            # LTX2 reference latents are quantized to /32 after spatial downscale.
+            # Make target buckets divisible by 32 * downscale to avoid lossy flooring.
+            reso_steps *= reference_downscale
+        return reso_steps
+
     def __init__(
-        self, resolution: Tuple[int, int], enable_bucket: bool = True, no_upscale: bool = False, architecture: str = "no_default"
+        self,
+        resolution: Tuple[int, int],
+        enable_bucket: bool = True,
+        no_upscale: bool = False,
+        architecture: str = "no_default",
+        reference_downscale: int = 1,
     ):
         self.resolution = resolution
         self.bucket_area = resolution[0] * resolution[1]
         self.architecture = architecture
 
-        if architecture in BucketSelector.ARCHITECTURE_STEPS_MAP:
-            self.reso_steps = BucketSelector.ARCHITECTURE_STEPS_MAP[architecture]
-        else:
-            raise ValueError(f"Invalid architecture: {architecture}")
+        self.reso_steps = BucketSelector.resolve_resolution_steps(architecture, reference_downscale)
 
         if not enable_bucket:
             # only define one bucket
@@ -955,6 +970,7 @@ class BucketSelector:
         resolution: tuple[int, int],
         reso_steps: Optional[int] = None,
         architecture: Optional[str] = None,
+        reference_downscale: int = 1,
     ) -> tuple[int, int]:
         """
         Get the bucket resolution for the given image size, resolution and resolution steps.
@@ -963,10 +979,7 @@ class BucketSelector:
         if reso_steps is None and architecture is None:
             raise ValueError("resolution steps or architecture must be provided")
         if reso_steps is None and architecture is not None:
-            if architecture in BucketSelector.ARCHITECTURE_STEPS_MAP:
-                reso_steps = BucketSelector.ARCHITECTURE_STEPS_MAP[architecture]
-            else:
-                raise ValueError(f"Invalid architecture: {architecture}")
+            reso_steps = BucketSelector.resolve_resolution_steps(architecture, reference_downscale)
 
         max_area = resolution[0] * resolution[1]
         width, height = image_size
@@ -2717,6 +2730,7 @@ class BaseDataset(torch.utils.data.Dataset):
         self.loss_mask_invert = loss_mask_invert
         self.debug_dataset = debug_dataset
         self.architecture = architecture
+        self.reference_downscale = 1
         self.seed = None
         self.current_epoch = 0
         self.shared_epoch = None
@@ -3080,7 +3094,13 @@ class ImageDataset(BaseDataset):
     def retrieve_latent_cache_batches(self, num_workers: int):
         if self.datasource is None:
             raise ValueError("retrieve_latent_cache_batches is not available when cache_only=True")
-        bucket_selector = BucketSelector(self.resolution, self.enable_bucket, self.bucket_no_upscale, self.architecture)
+        bucket_selector = BucketSelector(
+            self.resolution,
+            self.enable_bucket,
+            self.bucket_no_upscale,
+            self.architecture,
+            reference_downscale=getattr(self, "reference_downscale", 1),
+        )
         executor = ThreadPoolExecutor(max_workers=num_workers)
 
         batches: dict[tuple[int, int], list[ItemInfo]] = {}  # (width, height) -> [ItemInfo]
@@ -3196,7 +3216,10 @@ class ImageDataset(BaseDataset):
                                 max_width, max_height = self.control_resolution
                                 if width * height > max_width * max_height:
                                     width, height = BucketSelector.calculate_bucket_resolution(
-                                        control.size, self.control_resolution, architecture=self.architecture
+                                        control.size,
+                                        self.control_resolution,
+                                        architecture=self.architecture,
+                                        reference_downscale=getattr(self, "reference_downscale", 1),
                                     )
                             else:
                                 width = width - (width % bucket_selector.reso_steps)
@@ -3207,7 +3230,10 @@ class ImageDataset(BaseDataset):
                     elif self.control_resolution is not None:
                         for control in controls:
                             control_bucket_reso = BucketSelector.calculate_bucket_resolution(
-                                control.size, self.control_resolution, architecture=self.architecture
+                                control.size,
+                                self.control_resolution,
+                                architecture=self.architecture,
+                                reference_downscale=getattr(self, "reference_downscale", 1),
                             )
                             resized_control = resize_image_to_bucket(control, control_bucket_reso)
                             resized_controls.append(resized_control)
@@ -3242,7 +3268,13 @@ class ImageDataset(BaseDataset):
         return self._default_retrieve_text_encoder_output_cache_batches(self.datasource, self.batch_size, num_workers)
 
     def prepare_for_training(self, num_timestep_buckets: Optional[int] = None):
-        bucket_selector = BucketSelector(self.resolution, self.enable_bucket, self.bucket_no_upscale, self.architecture)
+        bucket_selector = BucketSelector(
+            self.resolution,
+            self.enable_bucket,
+            self.bucket_no_upscale,
+            self.architecture,
+            reference_downscale=getattr(self, "reference_downscale", 1),
+        )
 
         # glob cache files
         latent_cache_files = glob.glob(os.path.join(self.cache_directory, f"*_{self.architecture}.safetensors"))
@@ -3829,7 +3861,11 @@ class VideoDataset(BaseDataset):
     def retrieve_latent_cache_batches(self, num_workers: int):
         if self.datasource is None:
             raise ValueError("retrieve_latent_cache_batches is not available when cache_only=True")
-        buckset_selector = BucketSelector(self.resolution, architecture=self.architecture)
+        buckset_selector = BucketSelector(
+            self.resolution,
+            architecture=self.architecture,
+            reference_downscale=getattr(self, "reference_downscale", 1),
+        )
         self.datasource.set_bucket_selector(buckset_selector)
         self.datasource.set_source_and_target_fps(self.source_fps, self.target_fps)
 
@@ -4028,7 +4064,13 @@ class VideoDataset(BaseDataset):
         return self._default_retrieve_text_encoder_output_cache_batches(self.datasource, self.batch_size, num_workers)
 
     def prepare_for_training(self, num_timestep_buckets: Optional[int] = None):
-        bucket_selector = BucketSelector(self.resolution, self.enable_bucket, self.bucket_no_upscale, self.architecture)
+        bucket_selector = BucketSelector(
+            self.resolution,
+            self.enable_bucket,
+            self.bucket_no_upscale,
+            self.architecture,
+            reference_downscale=getattr(self, "reference_downscale", 1),
+        )
 
         # glob cache files
         latent_cache_files = glob.glob(os.path.join(self.cache_directory, f"*_{self.architecture}.safetensors"))
