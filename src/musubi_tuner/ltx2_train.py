@@ -3991,11 +3991,18 @@ def main() -> None:
             ("purge_inactive_state", True),
             ("reset_state_on_switch", True),
             ("use_gradient_release", False),
+            ("bread_sgd", False),
+            ("bread_sgd_lr_scale", 1.0),
+            ("bread_sgd_use_sign", False),
             ("allow_distributed", False),
             ("allow_unmatched_params", False),
             ("verbose", 1),
         ]:
-            setattr(badam_args_ns, f"badam_{short}", wrapper_kwargs.get(short, default))
+            value = wrapper_kwargs.get(short, default)
+            setattr(badam_args_ns, f"badam_{short}", value)
+            # Mirror onto args so trainer-side hooks (gradient release, fused-step
+            # wiring) can inspect them via the standard args namespace.
+            setattr(args, f"badam_{short}", value)
 
         optimizer = create_badam_optimizer(
             badam_args_ns,

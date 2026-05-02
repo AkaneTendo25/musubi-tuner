@@ -171,6 +171,9 @@ class BlockOptimizer(torch.optim.Optimizer):
         use_fp32_active_copy: bool = True,
         purge_inactive_state: bool = True,
         reset_state_on_switch: bool = True,
+        bread_sgd_enabled: bool = False,
+        bread_sgd_lr_scale: float = 1.0,
+        bread_sgd_use_sign: bool = False,
         verbose: int = 1,
         logger: Any | None = None,
     ) -> None:
@@ -205,6 +208,10 @@ class BlockOptimizer(torch.optim.Optimizer):
         self._gr_max_grad_norm: float = 0.0
         self._gr_fused_step_state: dict[str, Any] | None = None
         self._gr_hook_handles: list[Any] = []
+        self.bread_sgd_enabled = bool(bread_sgd_enabled)
+        self.bread_sgd_lr_scale = float(bread_sgd_lr_scale)
+        self.bread_sgd_use_sign = bool(bread_sgd_use_sign)
+        self._bread_sgd_hook_handles: list[Any] = []
 
         fp32_params = [name for name, param in self.named_parameters_list if param.dtype == torch.float32]
         if fp32_params and self.use_fp32_active_copy:
@@ -295,7 +302,9 @@ class BlockOptimizer(torch.optim.Optimizer):
                 name,
                 active_prefixes,
             )
-            param.requires_grad_(is_active)
+            # BREAD-SGD keeps requires_grad on inactive params so backward computes
+            # their grads, then a post-accumulate hook applies a cheap SGD update.
+            param.requires_grad_(is_active or self.bread_sgd_enabled)
             if is_active:
                 active_ids.add(id(param))
                 if self.verbose >= 2:
@@ -317,6 +326,8 @@ class BlockOptimizer(torch.optim.Optimizer):
 
         if self._gradient_release_enabled:
             self._refresh_gradient_release_hooks()
+        if self.bread_sgd_enabled:
+            self._refresh_bread_sgd_hooks()
 
         if self.verbose >= 1:
             self._log(
@@ -449,6 +460,50 @@ class BlockOptimizer(torch.optim.Optimizer):
                 self._make_grad_release_hook(lp_param, hp_param)
             )
             self._gr_hook_handles.append(handle)
+
+    def _unregister_bread_sgd_hooks(self) -> None:
+        for handle in self._bread_sgd_hook_handles:
+            try:
+                handle.remove()
+            except Exception:
+                pass
+        self._bread_sgd_hook_handles = []
+
+    def _refresh_bread_sgd_hooks(self) -> None:
+        """Register cheap SGD hook on every inactive param.
+
+        Implements BREAD's "landscape correction" idea (Luo et al. 2025): when a
+        block is frozen, applying a small on-the-fly SGD update during the same
+        backward keeps frozen weights from drifting away from the active block's
+        current optimum. Updates use the wrapper's current LR scaled by
+        bread_sgd_lr_scale; grads are released immediately after the update.
+        """
+        if not self.bread_sgd_enabled:
+            return
+        self._unregister_bread_sgd_hooks()
+        for name, param in self.named_parameters_list:
+            if id(param) in self._active_param_ids:
+                continue
+            handle = param.register_post_accumulate_grad_hook(
+                self._make_bread_sgd_hook()
+            )
+            self._bread_sgd_hook_handles.append(handle)
+
+    def _make_bread_sgd_hook(self):
+        def hook(p: torch.Tensor) -> None:
+            if p.grad is None:
+                return
+            lr = float(self.param_groups[0].get("lr", 0.0)) * self.bread_sgd_lr_scale
+            if lr == 0.0:
+                p.grad = None
+                return
+            if self.bread_sgd_use_sign:
+                p.data.add_(p.grad.data.sign(), alpha=-lr)
+            else:
+                p.data.add_(p.grad.data, alpha=-lr)
+            p.grad = None
+
+        return hook
 
     def _make_grad_release_hook(
         self,
@@ -687,15 +742,19 @@ def create_badam_optimizer(
         use_fp32_active_copy=bool(getattr(args, "badam_use_fp32_active_copy", True)),
         purge_inactive_state=bool(getattr(args, "badam_purge_inactive_state", True)),
         reset_state_on_switch=bool(getattr(args, "badam_reset_state_on_switch", True)),
+        bread_sgd_enabled=bool(getattr(args, "badam_bread_sgd", False)),
+        bread_sgd_lr_scale=float(getattr(args, "badam_bread_sgd_lr_scale", 1.0)),
+        bread_sgd_use_sign=bool(getattr(args, "badam_bread_sgd_use_sign", False)),
         verbose=int(getattr(args, "badam_verbose", 1)),
         logger=logger,
     )
     if logger is not None:
         logger.info(
-            "BAdam wrapped %s with %d block(s), switch_every=%d, mode=%s.",
+            "BAdam wrapped %s with %d block(s), switch_every=%d, mode=%s, bread_sgd=%s.",
             base_optimizer.__class__.__name__,
             len(block_prefixes),
             wrapper.switch_block_every,
             wrapper.switch_mode,
+            "on" if wrapper.bread_sgd_enabled else "off",
         )
     return wrapper
