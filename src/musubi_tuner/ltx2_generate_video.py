@@ -114,12 +114,19 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--mixed_precision", type=str, default="bf16", choices=["no", "fp16", "bf16"])
     parser.add_argument("--device", type=str, default=None, help="Force device to cpu or cuda")
+    parser.add_argument(
+        "--ltx_version",
+        type=str,
+        default="2.3",
+        choices=["2.0", "2.3"],
+        help="Target LTX version for default sampling presets.",
+    )
 
     # -- Gemma text encoder --
     parser.add_argument("--gemma_root", type=str, default=default_gemma_root_path(),
                         help="Local directory containing Gemma weights/tokenizer")
     parser.add_argument("--gemma_safetensors", type=str, default=None,
-                        help="Single Gemma safetensors file (e.g. fp8 from ComfyUI). No --gemma_root needed.")
+                        help="Single Gemma safetensors file (for example, an fp8 export). No --gemma_root needed.")
     parser.add_argument("--gemma_load_in_8bit", action="store_true", help="Load Gemma in 8-bit (bitsandbytes). CUDA only.")
     parser.add_argument("--gemma_load_in_4bit", action="store_true", help="Load Gemma in 4-bit (bitsandbytes). CUDA only.")
     parser.add_argument("--gemma_bnb_4bit_quant_type", type=str, default="nf4", choices=["nf4", "fp4"])
@@ -173,6 +180,23 @@ def parse_args() -> argparse.Namespace:
                         help="Number of frames (rounded to 8k+1)")
     parser.add_argument("--frame_rate", type=float, default=None, help="Output FPS")
     parser.add_argument("--sample_steps", type=int, default=None, help="Number of denoising steps")
+    parser.add_argument(
+        "--sample_sigma_schedule",
+        type=str,
+        default="auto",
+        choices=["auto", "ltx", "ltx23_distilled"],
+        help=(
+            "Sigma schedule. 'auto' uses LTX token-shifted sigmas, and the exact "
+            "LTX-2.3 distilled sigmas for the distilled_two_stage preset."
+        ),
+    )
+    parser.add_argument(
+        "--sample_sampler",
+        type=str,
+        default="auto",
+        choices=["auto", "euler", "res_2s"],
+        help="Sampler. 'auto' uses res_2s for full presets and Euler for distilled_two_stage.",
+    )
     parser.add_argument("--guidance_scale", type=float, default=None, help="Guidance scale (1.0 = no guidance)")
     parser.add_argument("--cfg_scale", type=float, default=None, help="CFG scale (overrides guidance_scale when set)")
     parser.add_argument("--discrete_flow_shift", type=float, default=5.0, help="Flow matching shift parameter")
@@ -208,7 +232,7 @@ def parse_args() -> argparse.Namespace:
         "--rescale_scale",
         type=float,
         default=None,
-        help="CFG\u2605 rescaling after CFG+STG. LTX-2.3 default is 0.7; 0 disables.",
+        help="CFG\u2605 rescaling after CFG+STG. LTX-2.3 default is 0.9; 0 disables.",
     )
     parser.add_argument("--av_bimodal_cfg", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--av_bimodal_scale", type=float, default=None)
@@ -283,6 +307,12 @@ def parse_args() -> argparse.Namespace:
                         help="Path to distilled LoRA for two-stage refinement.")
     parser.add_argument("--sample_stage2_steps", type=int, default=3,
                         help="Number of stage-2 refinement steps (default: 3)")
+    parser.add_argument("--sample_stage1_distilled_lora_multiplier", type=float, default=None,
+                        help="Stage-1 distilled LoRA multiplier for two-stage. "
+                             "Default: 0.25 with res_2s, 0.0 with Euler.")
+    parser.add_argument("--sample_stage2_distilled_lora_multiplier", type=float, default=None,
+                        help="Stage-2 distilled LoRA multiplier for two-stage. "
+                             "Default: 0.5 with res_2s, 1.0 with Euler.")
 
     # -- Tiled VAE decode --
     parser.add_argument("--sample_tiled_vae", action="store_true", help="Enable tiled VAE decoding")
@@ -326,7 +356,7 @@ def parse_args() -> argparse.Namespace:
     if args.gemma_safetensors and (args.gemma_load_in_8bit or args.gemma_load_in_4bit):
         raise ValueError("--gemma_safetensors cannot be combined with --gemma_load_in_4bit/8bit")
 
-    preset = get_ltx2_sampling_preset(args.sampling_preset, ltx_version="2.3")
+    preset = get_ltx2_sampling_preset(args.sampling_preset, ltx_version=args.ltx_version)
     if preset is None:
         args.height = 512 if args.height is None else args.height
         args.width = 768 if args.width is None else args.width
@@ -493,6 +523,9 @@ def _build_prompt_list(
         "frame_count": args.frame_count,
         "frame_rate": args.frame_rate,
         "sample_steps": args.sample_steps,
+        "sigma_schedule": args.sample_sigma_schedule,
+        "sample_sampler": args.sample_sampler,
+        "sampling_preset": args.sampling_preset,
         "guidance_scale": args.guidance_scale,
         "discrete_flow_shift": args.discrete_flow_shift,
         "seed": args.seed,

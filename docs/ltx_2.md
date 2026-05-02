@@ -1696,6 +1696,9 @@ The prompt file format (`--sample_prompts`) — including guidance scale, negati
 | `--sample_audio_subprocess` | on | Decode audio in a subprocess to avoid OOM crashes. Use `--no-sample_audio_subprocess` to decode in-process |
 | `--sample_disable_flash_attn` | off | Force SDPA instead of FlashAttention during sampling |
 | `--sample_i2v_token_timestep_mask` | on | Use I2V token timestep masking (conditioned tokens use t=0). Use `--no-sample_i2v_token_timestep_mask` to disable |
+| `--sample_sampling_preset` | `defaults` | Validation sampling preset. Use `ltx23` for the corrected LTX-2.3 defaults (`15` steps, CFG/STG defaults, CFG rescale `0.9`) |
+| `--sample_sampler` | `auto` | Denoising sampler. `auto` uses `res_2s` for full LTX presets and Euler for `distilled_two_stage` |
+| `--sample_sigma_schedule` | `auto` | Sigma schedule. `auto` uses latent-aware LTX shifted sigmas and the exact LTX-2.3 distilled schedule for the distilled preset |
 
 #### Precached Sample Prompts
 To avoid loading Gemma during training for sample generation, you can precache the prompt embeddings:
@@ -1709,17 +1712,27 @@ For IC-LoRA / V2V training, you can also precache the conditioning image latents
 2. During training, add `--use_precached_sample_latents` to load conditioning latents from cache instead of loading the VAE encoder.
 - `--sample_latents_cache`: Path to the precached latents file. Defaults to `<cache_directory>/ltx2_sample_latents_cache.pt`.
 
-#### Two-Stage Sampling (WIP)
+#### Two-Stage Sampling
 
 > [!NOTE]
-> This feature is work in progress and disabled by default. Two-stage inference generates at half resolution, then upsamples and refines.
+> This feature is disabled by default. Two-stage inference generates at half resolution, then upsamples and refines. It is intended for larger final outputs; at `512x512`, stage 1 is only `256x256`, so single-stage may look better.
 
 | Argument | Default | Description |
 |----------|---------|-------------|
 | `--sample_two_stage` | off | Enable two-stage inference during sampling |
 | `--spatial_upsampler_path` | — | Path to spatial upsampler model. Required when `--sample_two_stage` is set |
-| `--distilled_lora_path` | — | Path to distilled LoRA for stage 2 refinement. Optional |
+| `--distilled_lora_path` | — | Path to distilled LoRA for stage refinement. External-format LTX-2 LoRAs are converted automatically |
 | `--sample_stage2_steps` | 3 | Number of denoising steps for stage 2 |
+| `--sample_stage1_distilled_lora_multiplier` | auto | Optional stage-1 distilled LoRA strength. With `res_2s`, auto uses `0.25`; with Euler, auto uses `0.0` |
+| `--sample_stage2_distilled_lora_multiplier` | auto | Optional stage-2 distilled LoRA strength. With `res_2s`, auto uses `0.5`; with Euler, auto uses `1.0` |
+
+For LTX-2.3 quality previews, prefer:
+
+```bash
+--sample_sampling_preset ltx23 ^
+--sample_sampler auto ^
+--sample_sigma_schedule auto
+```
 
 #### Checkpoint Output Format
 

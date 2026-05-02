@@ -304,6 +304,10 @@ def build_inference_cmd(config: ProjectConfig) -> list[str]:
 
     # Sampling params
     cmd += ["--sampling_preset", s.sampling_preset]
+    if s.sample_sigma_schedule != "auto":
+        cmd += ["--sample_sigma_schedule", s.sample_sigma_schedule]
+    if s.sample_sampler != "auto":
+        cmd += ["--sample_sampler", s.sample_sampler]
     if s.use_default_negative_prompt is True:
         cmd.append("--use_default_negative_prompt")
     elif s.use_default_negative_prompt is False:
@@ -445,6 +449,16 @@ def build_inference_cmd(config: ProjectConfig) -> list[str]:
             cmd += ["--distilled_lora_path", s.distilled_lora_path]
         if s.sample_stage2_steps != 3:
             cmd += ["--sample_stage2_steps", str(s.sample_stage2_steps)]
+        if s.sample_stage1_distilled_lora_multiplier is not None:
+            cmd += [
+                "--sample_stage1_distilled_lora_multiplier",
+                str(s.sample_stage1_distilled_lora_multiplier),
+            ]
+        if s.sample_stage2_distilled_lora_multiplier is not None:
+            cmd += [
+                "--sample_stage2_distilled_lora_multiplier",
+                str(s.sample_stage2_distilled_lora_multiplier),
+            ]
     if s.sample_tiled_vae:
         cmd.append("--sample_tiled_vae")
     if s.sample_vae_tile_size != 512:
@@ -771,6 +785,10 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
     if t.sample_latents_cache:
         cmd += ["--sample_latents_cache", t.sample_latents_cache]
     cmd += ["--sample_sampling_preset", t.sample_sampling_preset]
+    if t.sample_sigma_schedule != "auto":
+        cmd += ["--sample_sigma_schedule", t.sample_sigma_schedule]
+    if t.sample_sampler != "auto":
+        cmd += ["--sample_sampler", t.sample_sampler]
     if t.sample_use_default_negative_prompt is True:
         cmd.append("--sample_use_default_negative_prompt")
     elif t.sample_use_default_negative_prompt is False:
@@ -810,6 +828,16 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
             cmd += ["--distilled_lora_path", t.distilled_lora_path]
         if t.sample_stage2_steps != 3:
             cmd += ["--sample_stage2_steps", str(t.sample_stage2_steps)]
+        if t.sample_stage1_distilled_lora_multiplier is not None:
+            cmd += [
+                "--sample_stage1_distilled_lora_multiplier",
+                str(t.sample_stage1_distilled_lora_multiplier),
+            ]
+        if t.sample_stage2_distilled_lora_multiplier is not None:
+            cmd += [
+                "--sample_stage2_distilled_lora_multiplier",
+                str(t.sample_stage2_distilled_lora_multiplier),
+            ]
     if t.sample_audio_only:
         cmd.append("--sample_audio_only")
     if t.sample_disable_flash_attn:

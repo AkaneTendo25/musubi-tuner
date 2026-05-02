@@ -15,6 +15,8 @@ from musubi_tuner.model_defaults import default_gemma_root_path, default_ltx2_ch
 
 
 SamplingPreset = Literal["legacy", "defaults", "ltx20", "ltx23", "ltx23_hq", "distilled_two_stage"]
+SampleSigmaSchedule = Literal["auto", "ltx", "ltx23_distilled"]
+SampleSampler = Literal["auto", "euler", "res_2s"]
 
 
 class GeneralConfig(BaseModel):
@@ -279,6 +281,8 @@ class TrainingConfig(BaseModel):
     use_precached_sample_latents: bool = False
     sample_latents_cache: str = ""
     sample_sampling_preset: SamplingPreset = "defaults"
+    sample_sigma_schedule: SampleSigmaSchedule = "auto"
+    sample_sampler: SampleSampler = "auto"
     sample_use_default_negative_prompt: Optional[bool] = None
     height: Optional[int] = None
     width: Optional[int] = None
@@ -302,6 +306,8 @@ class TrainingConfig(BaseModel):
     spatial_upsampler_path: str = ""
     distilled_lora_path: str = ""
     sample_stage2_steps: int = 3
+    sample_stage1_distilled_lora_multiplier: Optional[float] = None
+    sample_stage2_distilled_lora_multiplier: Optional[float] = None
     sample_audio_only: bool = False
     sample_disable_flash_attn: bool = False
     sample_i2v_token_timestep_mask: bool = True
@@ -503,6 +509,8 @@ class InferenceConfig(BaseModel):
     output_dir: str = "output"
     output_name: str = "ltx2_sample"
     sampling_preset: SamplingPreset = "defaults"
+    sample_sigma_schedule: SampleSigmaSchedule = "auto"
+    sample_sampler: SampleSampler = "auto"
     use_default_negative_prompt: Optional[bool] = None
     height: Optional[int] = None
     width: Optional[int] = None
@@ -574,6 +582,8 @@ class InferenceConfig(BaseModel):
     spatial_upsampler_path: str = ""
     distilled_lora_path: str = ""
     sample_stage2_steps: int = 3
+    sample_stage1_distilled_lora_multiplier: Optional[float] = None
+    sample_stage2_distilled_lora_multiplier: Optional[float] = None
     sample_tiled_vae: bool = False
     sample_vae_tile_size: int = 512
     sample_vae_tile_overlap: int = 64

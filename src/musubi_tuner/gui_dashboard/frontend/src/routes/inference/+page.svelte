@@ -319,6 +319,18 @@
 								{ value: 'false', label: 'Off' }
 							]} onchange={(e) => update('use_default_negative_prompt', e.target.value === '' ? null : e.target.value === 'true')} tooltip="Use the built-in negative prompt when the preset enables CFG and no negative prompt is typed." />
 						</div>
+						<div class="grid grid-cols-2 gap-2">
+							<FormSelect label="Sampler" value={s.sample_sampler || 'auto'} options={[
+								{ value: 'auto', label: 'Auto' },
+								{ value: 'res_2s', label: 'RES 2S' },
+								{ value: 'euler', label: 'Euler' }
+							]} onchange={(e) => update('sample_sampler', e.target.value)} tooltip="Denoising sampler. Auto uses RES 2S for full LTX presets and Euler for distilled two-stage." />
+							<FormSelect label="Sigma Schedule" value={s.sample_sigma_schedule || 'auto'} options={[
+								{ value: 'auto', label: 'Auto' },
+								{ value: 'ltx', label: 'LTX Shifted' },
+								{ value: 'ltx23_distilled', label: 'LTX 2.3 Distilled' }
+							]} onchange={(e) => update('sample_sigma_schedule', e.target.value)} tooltip="Sigma schedule. Auto uses latent-aware LTX sigmas, with the distilled schedule for distilled presets." />
+						</div>
 						<div class="grid grid-cols-3 gap-2">
 							<FormField label="Width" type="number" value={s.width ?? ''} oninput={(e) => update('width', e.target.value ? Number(e.target.value) : null)} min={64} step={64} placeholder="Preset" tooltip="Output width override" />
 							<FormField label="Height" type="number" value={s.height ?? ''} oninput={(e) => update('height', e.target.value ? Number(e.target.value) : null)} min={64} step={64} placeholder="Preset" tooltip="Output height override" />
@@ -418,6 +430,10 @@
 							</div>
 							<div class="grid grid-cols-3 gap-2">
 								<FormField label="Stage2 Steps" type="number" value={s.sample_stage2_steps ?? 3} oninput={(e) => update('sample_stage2_steps', Number(e.target.value || 3))} min={1} tooltip="Second-stage denoising steps" />
+								<FormField label="Stage1 LoRA" type="number" value={s.sample_stage1_distilled_lora_multiplier ?? ''} oninput={(e) => update('sample_stage1_distilled_lora_multiplier', e.target.value ? Number(e.target.value) : null)} min={0} step="0.05" placeholder="Auto" tooltip="Distilled LoRA multiplier for stage 1. Auto uses 0.25 with RES 2S." />
+								<FormField label="Stage2 LoRA" type="number" value={s.sample_stage2_distilled_lora_multiplier ?? ''} oninput={(e) => update('sample_stage2_distilled_lora_multiplier', e.target.value ? Number(e.target.value) : null)} min={0} step="0.05" placeholder="Auto" tooltip="Distilled LoRA multiplier for stage 2. Auto uses 0.5 with RES 2S." />
+							</div>
+							<div class="grid grid-cols-2 gap-2">
 								<FormField label="Tile Size" type="number" value={s.sample_vae_tile_size ?? 512} oninput={(e) => update('sample_vae_tile_size', Number(e.target.value || 512))} min={1} tooltip="Spatial tile size" />
 								<FormField label="Tile Overlap" type="number" value={s.sample_vae_tile_overlap ?? 64} oninput={(e) => update('sample_vae_tile_overlap', Number(e.target.value || 64))} min={0} tooltip="Spatial tile overlap" />
 							</div>

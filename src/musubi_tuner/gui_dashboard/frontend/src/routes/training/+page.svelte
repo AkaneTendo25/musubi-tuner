@@ -615,6 +615,18 @@
 							]} onchange={(e) => update('sample_use_default_negative_prompt', e.target.value === '' ? null : e.target.value === 'true')} tooltip="Use the built-in negative prompt for validation samples when the preset enables CFG." />
 						</div>
 						<div class="grid grid-cols-2 gap-2">
+							<FormSelect label="Sampler" value={t.sample_sampler || 'auto'} options={[
+								{ value: 'auto', label: 'Auto' },
+								{ value: 'res_2s', label: 'RES 2S' },
+								{ value: 'euler', label: 'Euler' }
+							]} onchange={(e) => update('sample_sampler', e.target.value)} tooltip="Validation sampler. Auto uses RES 2S for full LTX presets and Euler for distilled two-stage." />
+							<FormSelect label="Sigma Schedule" value={t.sample_sigma_schedule || 'auto'} options={[
+								{ value: 'auto', label: 'Auto' },
+								{ value: 'ltx', label: 'LTX Shifted' },
+								{ value: 'ltx23_distilled', label: 'LTX 2.3 Distilled' }
+							]} onchange={(e) => update('sample_sigma_schedule', e.target.value)} tooltip="Validation sigma schedule. Auto uses latent-aware LTX sigmas." />
+						</div>
+						<div class="grid grid-cols-2 gap-2">
 							<FormField label="Every N Steps" type="number" value={t.sample_every_n_steps ?? ''} oninput={(e) => update('sample_every_n_steps', e.target.value ? Number(e.target.value) : null)} placeholder="Optional" tooltip="Sample every N steps" />
 							<FormField label="Every N Epochs" type="number" value={t.sample_every_n_epochs ?? ''} oninput={(e) => update('sample_every_n_epochs', e.target.value ? Number(e.target.value) : null)} placeholder="Optional" tooltip="Sample every N epochs" />
 						</div>
@@ -666,7 +678,11 @@
 						{#if t.sample_two_stage}
 						<PathInput label="Upsampler Path" value={t.spatial_upsampler_path || ''} oninput={(e) => update('spatial_upsampler_path', e.target.value)} showFiles tooltip="Spatial upsampler model path" invalid={fieldInvalid('training.spatial_upsampler_path')} error={fieldError('training.spatial_upsampler_path')} />
 						<PathInput label="Distilled LoRA" value={t.distilled_lora_path || ''} oninput={(e) => update('distilled_lora_path', e.target.value)} showFiles tooltip="Distilled LoRA for stage 2" />
-						<FormField label="Stage 2 Steps" type="number" value={t.sample_stage2_steps ?? 3} oninput={(e) => update('sample_stage2_steps', Number(e.target.value))} min={1} tooltip="Number of denoising steps for stage 2" />
+						<div class="grid grid-cols-3 gap-2">
+							<FormField label="Stage 2 Steps" type="number" value={t.sample_stage2_steps ?? 3} oninput={(e) => update('sample_stage2_steps', Number(e.target.value))} min={1} tooltip="Number of denoising steps for stage 2" />
+							<FormField label="Stage1 LoRA" type="number" value={t.sample_stage1_distilled_lora_multiplier ?? ''} oninput={(e) => update('sample_stage1_distilled_lora_multiplier', e.target.value ? Number(e.target.value) : null)} min={0} step="0.05" placeholder="Auto" tooltip="Distilled LoRA multiplier for stage 1. Auto uses 0.25 with RES 2S." />
+							<FormField label="Stage2 LoRA" type="number" value={t.sample_stage2_distilled_lora_multiplier ?? ''} oninput={(e) => update('sample_stage2_distilled_lora_multiplier', e.target.value ? Number(e.target.value) : null)} min={0} step="0.05" placeholder="Auto" tooltip="Distilled LoRA multiplier for stage 2. Auto uses 0.5 with RES 2S." />
+						</div>
 						{/if}
 						{/if}
 						<div class="grid grid-cols-3 gap-2">

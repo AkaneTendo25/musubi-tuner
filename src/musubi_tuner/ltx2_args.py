@@ -35,7 +35,7 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         "--gemma_safetensors",
         type=str,
         default=None,
-        help="Path to a single Gemma safetensors file (e.g. fp8 from ComfyUI). Loads weights, config, and tokenizer from one file. No --gemma_root needed.",
+        help="Path to a single Gemma safetensors file (for example, an fp8 export). Loads weights, config, and tokenizer from one file. No --gemma_root needed.",
     )
     parser.add_argument(
         "--gemma_load_in_8bit",
@@ -277,6 +277,23 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         help="Use the default LTX negative prompt when a CFG sample has no --n/negative_prompt.",
     )
     parser.add_argument(
+        "--sample_sigma_schedule",
+        type=str,
+        default="auto",
+        choices=["auto", "ltx", "ltx23_distilled"],
+        help=(
+            "Sigma schedule for LTX-2 previews. 'auto' uses LTX token-shifted sigmas, "
+            "and uses the exact LTX-2.3 distilled sigmas for the distilled_two_stage preset."
+        ),
+    )
+    parser.add_argument(
+        "--sample_sampler",
+        type=str,
+        default="auto",
+        choices=["auto", "euler", "res_2s"],
+        help="Sampler for LTX-2 previews. 'auto' uses res_2s for full presets and Euler for distilled_two_stage.",
+    )
+    parser.add_argument(
         "--video_cfg_scale",
         type=float,
         default=None,
@@ -348,7 +365,7 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         default=0.0,
         help=(
             "CFG★ rescaling strength after CFG+STG. 0.0 disables (default). "
-            "LTX-2.3 default is 0.7; prevents oversaturation from "
+            "LTX-2.3 default is 0.9; prevents oversaturation from "
             "amplified guidance by rescaling prediction toward cond.std()."
         ),
     )
@@ -850,6 +867,24 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         type=int,
         default=3,
         help="Number of denoising steps for stage 2 refinement (default: 3 steps with 4 sigma values).",
+    )
+    parser.add_argument(
+        "--sample_stage1_distilled_lora_multiplier",
+        type=float,
+        default=None,
+        help=(
+            "Optional distilled LoRA multiplier for two-stage stage 1. "
+            "If omitted, res_2s two-stage uses 0.25; Euler uses 0.0."
+        ),
+    )
+    parser.add_argument(
+        "--sample_stage2_distilled_lora_multiplier",
+        type=float,
+        default=None,
+        help=(
+            "Optional distilled LoRA multiplier for two-stage stage 2. "
+            "If omitted, res_2s two-stage uses 0.5; Euler uses 1.0."
+        ),
     )
 
     parser.add_argument(

@@ -26,6 +26,7 @@ from musubi_tuner.hv_train_network import load_prompts, should_sample_images
 from musubi_tuner.hv_generate_video import save_images_grid, save_videos_grid
 from musubi_tuner.ltx2_inference import LTX2Inferencer, InferenceConfig
 from musubi_tuner.ltx2_defaults import get_ltx2_sampling_preset
+from musubi_tuner.ltx2_samplers import resolve_ltx2_sampler, res2s_midpoint, res2s_step
 from musubi_tuner.ltx2_lycoris_runtime import (
     ensure_adapters_enabled_for_sampling,
     get_adapter_norm_samples,
@@ -408,6 +409,7 @@ class LTX2SamplingMixin:
             param.setdefault("width", prompt_data.get("width", default_width))
             param.setdefault("frame_count", prompt_data.get("frame_count", default_frame_count))
             param.setdefault("sample_steps", prompt_data.get("sample_steps", default_sample_steps))
+            param.setdefault("sample_sampler", prompt_data.get("sample_sampler", getattr(args, "sample_sampler", "auto")))
             param.setdefault("guidance_scale", prompt_data.get("guidance_scale", default_guidance_scale))
             if default_discrete_flow_shift is not None:
                 param.setdefault("discrete_flow_shift", prompt_data.get("discrete_flow_shift", default_discrete_flow_shift))
@@ -2047,13 +2049,13 @@ class LTX2SamplingMixin:
 
         # Setup LTX-2 specific stepper
         from musubi_tuner.ltx_2.model.ltx2_scheduler import EulerDiffusionStep, X0PredictionWrapper
-        from musubi_tuner.ltx_2.components.schedulers import LTX2Scheduler
+        from musubi_tuner.ltx_2.components.schedulers import build_ltx2_sigmas
 
         stepper = EulerDiffusionStep()
 
         # Calculate latent dimensions
-        vae_scale_factor_temporal = getattr(vae, "temporal_downsample_factor", 4)
-        vae_scale_factor_spatial = getattr(vae, "spatial_downsample_factor", 8)
+        vae_scale_factor_temporal = getattr(vae, "temporal_downsample_factor", 8)
+        vae_scale_factor_spatial = getattr(vae, "spatial_downsample_factor", 32)
         latent_frames = (frame_count - 1) // vae_scale_factor_temporal + 1
         latent_height = height // vae_scale_factor_spatial
         latent_width = width // vae_scale_factor_spatial
@@ -2199,9 +2201,14 @@ class LTX2SamplingMixin:
                     clean_latent = None
                     i2v_conditioning_mask_tokens = None
 
-        # Setup scheduler without passing latent; this uses default MAX_SHIFT_ANCHOR=4096.
-        ltx2_scheduler = LTX2Scheduler()
-        sigmas = ltx2_scheduler.execute(steps=sample_steps).to(device=transformer_device, dtype=torch.float32)
+        sigma_schedule = sample_parameter.get("sigma_schedule") or getattr(args, "sample_sigma_schedule", "auto")
+        sampling_preset = sample_parameter.get("sampling_preset") or getattr(args, "sample_sampling_preset", None)
+        sigmas = build_ltx2_sigmas(
+            sample_steps,
+            latent=latents,
+            sigma_schedule=sigma_schedule,
+            sampling_preset=sampling_preset,
+        ).to(device=transformer_device, dtype=torch.float32)
 
         audio_latents = None
         ref_audio_latents_device = None
@@ -2316,6 +2323,114 @@ class LTX2SamplingMixin:
             )
         else:
             _av_bimodal_cfg = False
+
+        sampler_name = resolve_ltx2_sampler(
+            sample_parameter.get("sample_sampler") or getattr(args, "sample_sampler", "auto"),
+            sample_parameter.get("sampling_preset") or getattr(args, "sample_sampling_preset", None),
+        )
+        if sampler_name == "res_2s" and (
+            audio_latents is not None
+            or audio_ref_only_ic_sampling
+            or av_ic_sampling
+            or video_ref_only_av_sampling
+        ):
+            logger.warning("Sampling: res_2s is not wired for audio/reference-conditioned path yet; using Euler.")
+            sampler_name = "euler"
+        logger.info("Sampling sampler: %s", sampler_name)
+
+        def _predict_video_x0_res2s(video_state: torch.Tensor, sigma_value: torch.Tensor) -> torch.Tensor:
+            latent_input = torch.cat([video_state, video_state], dim=0) if do_classifier_free_guidance else video_state
+            latent_input = latent_input.to(dtype=dit_dtype)
+            timestep = sigma_value.expand(latent_input.shape[0]).to(device=transformer_device, dtype=dit_dtype)
+
+            options = {"patches_replace": {}}
+            if i2v_conditioning_mask_tokens is not None:
+                mask_tokens = i2v_conditioning_mask_tokens
+                if do_classifier_free_guidance:
+                    mask_tokens = torch.cat([mask_tokens, mask_tokens], dim=0)
+                options["video_conditioning_mask"] = mask_tokens
+
+            pred = transformer(
+                latent_input,
+                timestep=timestep.unsqueeze(1),
+                context=prompt_embeds,
+                attention_mask=prompt_mask,
+                frame_rate=sample_parameter.get("frame_rate", 25),
+                transformer_options=options,
+                audio_only=audio_only,
+            )
+            video_pred_mid = pred[0] if isinstance(pred, (list, tuple)) else pred
+            video_pred_mid = video_pred_mid.to(dtype=video_state.dtype)
+
+            sigma_for_video_mid = denoise_mask * sigma_value if denoise_mask is not None else sigma_value
+            x0_cond_mid = None
+            if do_classifier_free_guidance:
+                vel_uncond_mid, vel_cond_mid = video_pred_mid.chunk(2)
+                x0_uncond_mid = X0PredictionWrapper.velocity_to_x0(video_state, vel_uncond_mid, sigma_for_video_mid)
+                x0_cond_mid = X0PredictionWrapper.velocity_to_x0(video_state, vel_cond_mid, sigma_for_video_mid)
+                video_x0_mid = x0_uncond_mid + _video_cfg_scale * (x0_cond_mid - x0_uncond_mid)
+            else:
+                x0_cond_mid = X0PredictionWrapper.velocity_to_x0(video_state, video_pred_mid, sigma_for_video_mid)
+                video_x0_mid = x0_cond_mid
+
+            _stg_scale_mid = float(getattr(args, "stg_scale", 0.0) or 0.0)
+            _stg_mode_mid = str(getattr(args, "stg_mode", "video"))
+            if _stg_scale_mid > 0.0 and _stg_mode_mid in ("video", "both"):
+                from musubi_tuner.ltx_2.guidance.perturbations import (
+                    BatchedPerturbationConfig as _BPC_STG_MID,
+                    Perturbation as _Pert_STG_MID,
+                    PerturbationConfig as _PertCfg_STG_MID,
+                    PerturbationType as _PertType_STG_MID,
+                )
+
+                stg_options = {
+                    "patches_replace": {},
+                    "perturbations": _BPC_STG_MID(
+                        perturbations=[
+                            _PertCfg_STG_MID(
+                                perturbations=[
+                                    _Pert_STG_MID(
+                                        type=_PertType_STG_MID.SKIP_VIDEO_SELF_ATTN,
+                                        blocks=getattr(args, "stg_blocks", None),
+                                    )
+                                ]
+                            )
+                        ]
+                    ),
+                }
+                if i2v_conditioning_mask_tokens is not None:
+                    stg_options["video_conditioning_mask"] = i2v_conditioning_mask_tokens
+
+                if do_classifier_free_guidance:
+                    half = prompt_embeds.shape[0] // 2
+                    stg_context = prompt_embeds[half:]
+                    stg_mask = prompt_mask[half:] if prompt_mask is not None else None
+                else:
+                    stg_context = prompt_embeds
+                    stg_mask = prompt_mask
+
+                stg_pred = transformer(
+                    video_state.to(dtype=dit_dtype),
+                    timestep=sigma_value.expand(1).to(device=transformer_device, dtype=dit_dtype).unsqueeze(1),
+                    context=stg_context,
+                    attention_mask=stg_mask,
+                    frame_rate=sample_parameter.get("frame_rate", 25),
+                    transformer_options=stg_options,
+                    audio_only=audio_only,
+                )
+                stg_video_pred = stg_pred[0] if isinstance(stg_pred, (list, tuple)) else stg_pred
+                stg_video_pred = stg_video_pred.to(dtype=video_state.dtype)
+                x0_ptb_mid = X0PredictionWrapper.velocity_to_x0(video_state, stg_video_pred, sigma_for_video_mid)
+                video_x0_mid = video_x0_mid + _stg_scale_mid * (x0_cond_mid - x0_ptb_mid)
+
+            if _video_rescale_scale > 0.0 and x0_cond_mid is not None:
+                pred_std_mid = video_x0_mid.std()
+                if pred_std_mid > 1e-6:
+                    factor_mid = x0_cond_mid.std() / pred_std_mid
+                    factor_mid = _video_rescale_scale * factor_mid + (1.0 - _video_rescale_scale)
+                    video_x0_mid = video_x0_mid * factor_mid
+
+            return video_x0_mid
 
         # Denoising loop using LTX-2 scheduler with sigmas
         with torch.no_grad():
@@ -2701,7 +2816,18 @@ class LTX2SamplingMixin:
                 # --- Video: denoise mask blend + Euler step + hard-lock ---
                 if denoise_mask is not None and clean_latent is not None:
                     video_x0 = video_x0 * denoise_mask + clean_latent * (1.0 - denoise_mask)
-                latents = stepper.step(latents, video_x0, sigmas, step_idx)
+                if sampler_name == "res_2s":
+                    midpoint = res2s_midpoint(latents, video_x0, sigmas[step_idx], sigmas[step_idx + 1])
+                    if midpoint is None:
+                        latents = video_x0
+                    else:
+                        midpoint_latents, midpoint_sigma = midpoint
+                        midpoint_video_x0 = _predict_video_x0_res2s(midpoint_latents, midpoint_sigma)
+                        if denoise_mask is not None and clean_latent is not None:
+                            midpoint_video_x0 = midpoint_video_x0 * denoise_mask + clean_latent * (1.0 - denoise_mask)
+                        latents = res2s_step(latents, video_x0, midpoint_video_x0, sigmas[step_idx], sigmas[step_idx + 1])
+                else:
+                    latents = stepper.step(latents, video_x0, sigmas, step_idx)
                 if denoise_mask is not None and clean_latent is not None:
                     latents = latents * denoise_mask + clean_latent * (1.0 - denoise_mask)
 
@@ -2863,7 +2989,7 @@ class LTX2SamplingMixin:
         (bypassing the LTX2Wrapper).
         """
         from musubi_tuner.ltx_2.components.patchifiers import VideoLatentPatchifier, get_pixel_coords
-        from musubi_tuner.ltx_2.components.schedulers import LTX2Scheduler
+        from musubi_tuner.ltx_2.components.schedulers import build_ltx2_sigmas
         from musubi_tuner.ltx_2.guidance.perturbations import BatchedPerturbationConfig
         from musubi_tuner.ltx_2.model.ltx2_scheduler import EulerDiffusionStep, X0PredictionWrapper
         from musubi_tuner.ltx_2.model.transformer.modality import Modality
@@ -2956,9 +3082,14 @@ class LTX2SamplingMixin:
         elif getattr(args, "nf4_base", False):
             self._ensure_nf4_buffers_on_device(base_model)
 
-        # Scheduler
-        ltx2_scheduler = LTX2Scheduler()
-        sigmas = ltx2_scheduler.execute(steps=sample_steps).to(device=transformer_device, dtype=torch.float32)
+        sigma_schedule = sample_parameter.get("sigma_schedule") or getattr(args, "sample_sigma_schedule", "auto")
+        sampling_preset = sample_parameter.get("sampling_preset") or getattr(args, "sample_sampling_preset", None)
+        sigmas = build_ltx2_sigmas(
+            sample_steps,
+            latent=latents,
+            sigma_schedule=sigma_schedule,
+            sampling_preset=sampling_preset,
+        ).to(device=transformer_device, dtype=torch.float32)
 
         # V2V denoising loop
         logger.info("V2V sampling: %d steps, ref_frames=%d, target_frames=%d", sample_steps, ref_frames, tgt_frames)
@@ -3159,7 +3290,7 @@ class LTX2SamplingMixin:
         for `av_ic`, or target-only audio for `video_ref_only_av`.
         """
         from musubi_tuner.ltx_2.components.patchifiers import VideoLatentPatchifier, get_pixel_coords
-        from musubi_tuner.ltx_2.components.schedulers import LTX2Scheduler
+        from musubi_tuner.ltx_2.components.schedulers import build_ltx2_sigmas
         from musubi_tuner.ltx_2.guidance.perturbations import BatchedPerturbationConfig
         from musubi_tuner.ltx_2.model.ltx2_scheduler import EulerDiffusionStep, X0PredictionWrapper
         from musubi_tuner.ltx_2.model.transformer.modality import Modality
@@ -3334,9 +3465,14 @@ class LTX2SamplingMixin:
         elif getattr(args, "nf4_base", False):
             self._ensure_nf4_buffers_on_device(base_model)
 
-        # Scheduler
-        ltx2_scheduler = LTX2Scheduler()
-        sigmas = ltx2_scheduler.execute(steps=sample_steps).to(device=transformer_device, dtype=torch.float32)
+        sigma_schedule = sample_parameter.get("sigma_schedule") or getattr(args, "sample_sigma_schedule", "auto")
+        sampling_preset = sample_parameter.get("sampling_preset") or getattr(args, "sample_sampling_preset", None)
+        sigmas = build_ltx2_sigmas(
+            sample_steps,
+            latent=latents,
+            sigma_schedule=sigma_schedule,
+            sampling_preset=sampling_preset,
+        ).to(device=transformer_device, dtype=torch.float32)
 
         logger.info(
             "AV_IC sampling: %d steps, ref_video_frames=%d, tgt_video_frames=%d, ref_audio_T=%d, tgt_audio_T=%d",
@@ -3701,11 +3837,16 @@ class LTX2SamplingMixin:
             cfg_scale=cfg_scale,
             video_cfg_scale=getattr(args, "video_cfg_scale", None),
             audio_cfg_scale=getattr(args, "audio_cfg_scale", None),
+            sigma_schedule=sample_parameter.get("sigma_schedule") or getattr(args, "sample_sigma_schedule", "auto"),
+            sample_sampler=sample_parameter.get("sample_sampler") or getattr(args, "sample_sampler", "auto"),
+            sampling_preset=sample_parameter.get("sampling_preset") or getattr(args, "sample_sampling_preset", None),
             seed=seed,
             two_stage=True,
             spatial_upsampler_path=spatial_upsampler_path,
             distilled_lora_path=distilled_lora_path,
             stage2_steps=stage2_steps,
+            stage1_distilled_lora_multiplier=getattr(args, "sample_stage1_distilled_lora_multiplier", None),
+            stage2_distilled_lora_multiplier=getattr(args, "sample_stage2_distilled_lora_multiplier", None),
             enable_audio=enable_audio_preview,
             audio_only=audio_only,
             prompt_embeds=prompt_embeds,

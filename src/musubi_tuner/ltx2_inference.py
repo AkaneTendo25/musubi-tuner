@@ -18,6 +18,7 @@ import torch
 import torch.nn.functional as F
 from tqdm import tqdm
 
+from musubi_tuner.ltx2_samplers import resolve_ltx2_sampler, res2s_midpoint, res2s_step
 from musubi_tuner.utils.device_utils import clean_memory_on_device
 
 logger = logging.getLogger(__name__)
@@ -45,12 +46,17 @@ class InferenceConfig:
     audio_cfg_scale: Optional[float] = None
     discrete_flow_shift: float = 5.0
     seed: Optional[int] = None
+    sigma_schedule: str = "auto"
+    sample_sampler: str = "auto"
+    sampling_preset: Optional[str] = None
 
     # Two-stage inference
     two_stage: bool = False
     spatial_upsampler_path: Optional[str] = None
     distilled_lora_path: Optional[str] = None
     stage2_steps: int = 3  # Stage 2 uses 3 steps (4 sigma values including 0.0)
+    stage1_distilled_lora_multiplier: Optional[float] = None
+    stage2_distilled_lora_multiplier: Optional[float] = None
 
     # Offloading
     offload_between_stages: bool = False
@@ -60,7 +66,7 @@ class InferenceConfig:
     stg_blocks: Optional[List[int]] = None  # None = all blocks
     stg_mode: str = "video"  # "video" | "audio" | "both"
 
-    # CFG★ rescaling (LTX-2.3 default is 0.7). 0.0 disables.
+    # CFG★ rescaling (LTX-2.3 default is 0.9). 0.0 disables.
     rescale_scale: float = 0.0
     video_rescale_scale: Optional[float] = None
     audio_rescale_scale: Optional[float] = None
@@ -146,7 +152,21 @@ class LTX2Inferencer:
         logger.info("Loading distilled LoRA from %s", lora_path)
 
         from safetensors.torch import load_file
-        self._distilled_lora_state = load_file(lora_path)
+        state = load_file(lora_path)
+        try:
+            from musubi_tuner.ltx_2.convert_lora_to_comfy import (
+                convert_lora_from_comfy_state_dict,
+                is_comfy_lora_state_dict,
+            )
+
+            if is_comfy_lora_state_dict(state):
+                logger.info("Converting distilled LoRA from external format")
+                state = convert_lora_from_comfy_state_dict(state)
+        except Exception:
+            logger.exception("Failed to convert distilled LoRA weights from external format")
+            raise
+
+        self._distilled_lora_state = state
         return self._distilled_lora_state
 
     def _apply_distilled_lora(self, multiplier: float = 1.0) -> None:
@@ -220,12 +240,20 @@ class LTX2Inferencer:
             generator=generator,
         )
 
-    def _get_expected_embed_dim(self) -> int:
+    def _get_expected_embed_dim(self) -> Optional[int]:
         """Get expected embedding dimension based on mode."""
-        # Known dimensions for LTX-2
-        VIDEO_ONLY_DIM = 1920
-        AV_DIM = 3840
-        return AV_DIM if self._audio_video else VIDEO_ONLY_DIM
+        transformer = getattr(self.transformer, "model", self.transformer)
+        caption_proj = getattr(transformer, "caption_projection", None)
+        linear_1 = getattr(caption_proj, "linear_1", None) if caption_proj is not None else None
+        in_features = getattr(linear_1, "in_features", None)
+        if isinstance(in_features, int) and in_features > 0:
+            return in_features * 2 if self._audio_video else in_features
+
+        # Some LTX-2.3 checkpoints use connector/preprocessor paths where the
+        # transformer does not expose caption_projection. In that case the
+        # single-stage sampler passes Gemma embeddings through unchanged, so the
+        # two-stage path should do the same instead of guessing and warning.
+        return None
 
     def _prepare_prompt_embeds(
         self,
@@ -244,7 +272,7 @@ class LTX2Inferencer:
         expected_dim = self._get_expected_embed_dim()
         current_dim = prompt_embeds.shape[-1]
 
-        if current_dim != expected_dim:
+        if expected_dim is not None and current_dim != expected_dim:
             if current_dim * 2 == expected_dim:
                 # Video-only embeddings (1920) but AV model expects (3840)
                 # Pad with zeros for audio portion
@@ -354,6 +382,7 @@ class LTX2Inferencer:
         audio_rescale_scale: Optional[float] = None,
         video_modality_scale: float = 1.0,
         audio_modality_scale: float = 1.0,
+        sample_sampler: str = "euler",
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Run the denoising loop with optional I2V conditioning.
 
@@ -453,6 +482,88 @@ class LTX2Inferencer:
                 denoise_mask = None
                 clean_latent = None
                 i2v_conditioning_mask_tokens = None
+
+        sampler_name = resolve_ltx2_sampler(sample_sampler, None)
+        if sampler_name == "res_2s" and audio_latents is not None:
+            logger.warning("LTX-2 inference: res_2s is not wired for audio two-stage refinement yet; using Euler.")
+            sampler_name = "euler"
+        logger.info("LTX-2 inference sampler: %s", sampler_name)
+
+        def _predict_video_x0_res2s(video_state: torch.Tensor, sigma_value: torch.Tensor) -> torch.Tensor:
+            latent_input = torch.cat([video_state, video_state], dim=0) if do_cfg else video_state
+            latent_input = latent_input.to(dtype=self.dit_dtype)
+            timestep = sigma_value.expand(latent_input.shape[0]).to(device=self.device, dtype=self.dit_dtype)
+            options: Dict[str, Any] = {"patches_replace": {}}
+            if i2v_conditioning_mask_tokens is not None:
+                mask_tokens = i2v_conditioning_mask_tokens
+                if do_cfg:
+                    mask_tokens = torch.cat([mask_tokens, mask_tokens], dim=0)
+                options["video_conditioning_mask"] = mask_tokens
+
+            pred = self.transformer(
+                latent_input,
+                timestep=timestep.unsqueeze(1),
+                context=prompt_embeds,
+                attention_mask=prompt_mask,
+                frame_rate=frame_rate,
+                transformer_options=options,
+                audio_only=audio_only,
+            )
+            video_pred_mid = pred[0] if isinstance(pred, (list, tuple)) else pred
+            video_pred_mid = video_pred_mid.to(dtype=video_state.dtype)
+            sigma_for_video_mid = denoise_mask * sigma_value if denoise_mask is not None else sigma_value
+
+            if do_cfg:
+                vel_uncond_mid, vel_cond_mid = video_pred_mid.chunk(2)
+                x0_uncond_mid = X0PredictionWrapper.velocity_to_x0(video_state, vel_uncond_mid, sigma_for_video_mid)
+                x0_cond_mid = X0PredictionWrapper.velocity_to_x0(video_state, vel_cond_mid, sigma_for_video_mid)
+                video_x0_mid = x0_uncond_mid + effective_video_cfg * (x0_cond_mid - x0_uncond_mid)
+            else:
+                x0_cond_mid = X0PredictionWrapper.velocity_to_x0(video_state, video_pred_mid, sigma_for_video_mid)
+                video_x0_mid = x0_cond_mid
+
+            stg_video_active_mid = stg_scale > 0.0 and stg_mode in ("video", "both")
+            if stg_video_active_mid:
+                from musubi_tuner.ltx_2.guidance.perturbations import (
+                    BatchedPerturbationConfig,
+                    Perturbation,
+                    PerturbationConfig,
+                    PerturbationType,
+                )
+
+                stg_context = prompt_embeds[prompt_embeds.shape[0] // 2 :] if do_cfg else prompt_embeds
+                stg_ctx_mask = prompt_mask[prompt_mask.shape[0] // 2 :] if do_cfg and prompt_mask is not None else prompt_mask
+                stg_opts: Dict[str, Any] = {
+                    "patches_replace": {},
+                    "perturbations": BatchedPerturbationConfig(
+                        [PerturbationConfig(perturbations=[
+                            Perturbation(type=PerturbationType.SKIP_VIDEO_SELF_ATTN, blocks=stg_blocks)
+                        ])]
+                    ),
+                }
+                if i2v_conditioning_mask_tokens is not None:
+                    stg_opts["video_conditioning_mask"] = i2v_conditioning_mask_tokens
+                stg_pred = self.transformer(
+                    video_state.to(dtype=self.dit_dtype),
+                    timestep=sigma_value.expand(1).to(device=self.device, dtype=self.dit_dtype).unsqueeze(1),
+                    context=stg_context,
+                    attention_mask=stg_ctx_mask,
+                    frame_rate=frame_rate,
+                    transformer_options=stg_opts,
+                    audio_only=audio_only,
+                )
+                stg_video_vel = stg_pred[0] if isinstance(stg_pred, (list, tuple)) else stg_pred
+                stg_video_vel = stg_video_vel.to(dtype=video_state.dtype)
+                x0_video_ptb_mid = X0PredictionWrapper.velocity_to_x0(video_state, stg_video_vel, sigma_for_video_mid)
+                video_x0_mid = video_x0_mid + stg_scale * (x0_cond_mid - x0_video_ptb_mid)
+
+            if effective_video_rescale > 0.0 and x0_cond_mid is not None:
+                pred_std_mid = video_x0_mid.std()
+                if pred_std_mid > 1e-6:
+                    factor_mid = x0_cond_mid.std() / pred_std_mid
+                    factor_mid = effective_video_rescale * factor_mid + (1.0 - effective_video_rescale)
+                    video_x0_mid = video_x0_mid * factor_mid
+            return video_x0_mid
 
         for step_idx in tqdm(range(len(sigmas) - 1), desc=progress_desc, leave=False):
             sigma = sigmas[step_idx]
@@ -664,7 +775,18 @@ class LTX2Inferencer:
                 # LTX-2 ordering: blend denoised x0 before Euler step.
                 video_x0 = video_x0 * denoise_mask + clean_latent * (1.0 - denoise_mask)
 
-            latents = stepper.step(latents, video_x0, sigmas, step_idx)
+            if sampler_name == "res_2s":
+                midpoint = res2s_midpoint(latents, video_x0, sigmas[step_idx], sigmas[step_idx + 1])
+                if midpoint is None:
+                    latents = video_x0
+                else:
+                    midpoint_latents, midpoint_sigma = midpoint
+                    midpoint_video_x0 = _predict_video_x0_res2s(midpoint_latents, midpoint_sigma)
+                    if denoise_mask is not None and clean_latent is not None:
+                        midpoint_video_x0 = midpoint_video_x0 * denoise_mask + clean_latent * (1.0 - denoise_mask)
+                    latents = res2s_step(latents, video_x0, midpoint_video_x0, sigmas[step_idx], sigmas[step_idx + 1])
+            else:
+                latents = stepper.step(latents, video_x0, sigmas, step_idx)
 
             # CRITICAL: Hard-lock conditioned frames after Euler step
             # The Euler step performs gradual correction, but I2V requires absolute locking
@@ -836,13 +958,43 @@ class LTX2Inferencer:
                 )
 
         # Stage 1: Main generation
-        # Use the default scheduler shift anchor.
-        from musubi_tuner.ltx_2.components.schedulers import LTX2Scheduler
-        scheduler = LTX2Scheduler()
-        sigmas = scheduler.execute(steps=config.sample_steps).to(device=self.device, dtype=torch.float32)
+        from musubi_tuner.ltx_2.components.schedulers import build_ltx2_sigmas
+        sigmas = build_ltx2_sigmas(
+            config.sample_steps,
+            latent=latents,
+            sigma_schedule=config.sigma_schedule,
+            sampling_preset=config.sampling_preset,
+        ).to(device=self.device, dtype=torch.float32)
 
         logger.info("Stage 1: Generating at %dx%d (%d frames, %d steps)",
                    gen_width, gen_height, frame_count, config.sample_steps)
+
+        resolved_sampler = resolve_ltx2_sampler(config.sample_sampler, config.sampling_preset)
+        if resolved_sampler == "res_2s":
+            default_stage1_lora_multiplier = 0.25
+            default_stage2_lora_multiplier = 0.5
+        else:
+            default_stage1_lora_multiplier = 0.0
+            default_stage2_lora_multiplier = 1.0
+
+        stage1_lora_multiplier = (
+            default_stage1_lora_multiplier
+            if config.stage1_distilled_lora_multiplier is None
+            else float(config.stage1_distilled_lora_multiplier)
+        )
+        stage2_lora_multiplier = (
+            default_stage2_lora_multiplier
+            if config.stage2_distilled_lora_multiplier is None
+            else float(config.stage2_distilled_lora_multiplier)
+        )
+
+        stage1_lora_applied = False
+        if config.two_stage and config.distilled_lora_path and stage1_lora_multiplier != 0.0:
+            if self._distilled_lora_state is None:
+                self.load_distilled_lora(config.distilled_lora_path)
+            logger.info("Applying stage-1 distilled LoRA multiplier %.2f", stage1_lora_multiplier)
+            self._apply_distilled_lora(stage1_lora_multiplier)
+            stage1_lora_applied = True
 
         with torch.no_grad():
             latents, audio_latents = self._denoise_loop(
@@ -863,10 +1015,14 @@ class LTX2Inferencer:
                 audio_rescale_scale=config.audio_rescale_scale,
                 video_modality_scale=config.video_modality_scale,
                 audio_modality_scale=config.audio_modality_scale,
+                sample_sampler=config.sample_sampler,
             )
 
         # Stage 2: Upsample and refine (if two-stage)
         if config.two_stage:
+            if stage1_lora_applied:
+                self._remove_distilled_lora(stage1_lora_multiplier)
+
             logger.info("Stage 2: Upsampling and refining to %dx%d", config.width, config.height)
 
             # Load upsampler if needed
@@ -909,7 +1065,9 @@ class LTX2Inferencer:
             if config.distilled_lora_path:
                 if self._distilled_lora_state is None:
                     self.load_distilled_lora(config.distilled_lora_path)
-                self._apply_distilled_lora()
+                if stage2_lora_multiplier != 0.0:
+                    logger.info("Applying stage-2 distilled LoRA multiplier %.2f", stage2_lora_multiplier)
+                    self._apply_distilled_lora(stage2_lora_multiplier)
 
             # Stage 2 denoising with distilled sigmas
             stage2_sigmas = torch.tensor(
@@ -979,11 +1137,16 @@ class LTX2Inferencer:
                     audio_rescale_scale=0.0,
                     video_modality_scale=1.0,
                     audio_modality_scale=1.0,
+                    sample_sampler=config.sample_sampler,
                 )
 
             # Remove distilled LoRA
-            if config.distilled_lora_path and self._distilled_lora_state is not None:
-                self._remove_distilled_lora()
+            if (
+                config.distilled_lora_path
+                and self._distilled_lora_state is not None
+                and stage2_lora_multiplier != 0.0
+            ):
+                self._remove_distilled_lora(stage2_lora_multiplier)
 
         # Decode video
         video = None
