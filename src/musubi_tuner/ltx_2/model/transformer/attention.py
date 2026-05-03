@@ -10,6 +10,10 @@ from musubi_tuner.ltx_2.model.transformer.rope import LTXRopeType, apply_rotary_
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
+_warned_flash2_mask_fallback = False
+_warned_flash2_query_mask_fallback = False
+_warned_flash3_mask_fallback = False
+
 memory_efficient_attention = None
 flash_attn_interface = None
 flash_attention_2 = None
@@ -120,10 +124,14 @@ class FlashAttention3(AttentionCallable):
         b, _, dim_head = q.shape
         dim_head //= heads
 
-        q, k, v = (t.view(b, -1, heads, dim_head) for t in (q, k, v))
-
         if mask is not None:
-            raise NotImplementedError("Mask is not supported for FlashAttention3")
+            global _warned_flash3_mask_fallback
+            if not _warned_flash3_mask_fallback:
+                logger.warning("FlashAttention3 does not support attention masks; falling back to PyTorch SDPA.")
+                _warned_flash3_mask_fallback = True
+            return PytorchAttention()(q, k, v, heads, mask)
+
+        q, k, v = (t.view(b, -1, heads, dim_head) for t in (q, k, v))
 
         out = flash_attn_interface.flash_attn_func(q.to(v.dtype), k.to(v.dtype), v)
         out = out.reshape(b, -1, heads * dim_head)
@@ -194,8 +202,22 @@ class FlashAttention2(AttentionCallable):
         if flash_attention_2 is None:
             raise RuntimeError("FlashAttention2 was selected but `flash_attn` is not installed.")
         if mask is not None and flash_attn_varlen_func is None:
-            logger.warning("FlashAttention2 does not support attention masks; falling back to PyTorch SDPA.")
+            global _warned_flash2_mask_fallback
+            if not _warned_flash2_mask_fallback:
+                logger.warning("FlashAttention2 does not support attention masks; falling back to PyTorch SDPA.")
+                _warned_flash2_mask_fallback = True
             return PytorchAttention()(q, k, v, heads, mask)
+        if mask is not None and mask.ndim > 2:
+            reduced_mask = mask
+            while reduced_mask.ndim > 2 and reduced_mask.shape[-2] == 1:
+                reduced_mask = reduced_mask.squeeze(-2)
+            if reduced_mask.ndim > 2:
+                global _warned_flash2_query_mask_fallback
+                if not _warned_flash2_query_mask_fallback:
+                    logger.warning("FlashAttention2 does not support query-specific attention masks; falling back to PyTorch SDPA.")
+                    _warned_flash2_query_mask_fallback = True
+                return PytorchAttention()(q, k, v, heads, mask)
+            mask = reduced_mask
 
         b, _, dim_head = q.shape
         dim_head //= heads
