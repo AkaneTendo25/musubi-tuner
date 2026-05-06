@@ -499,6 +499,8 @@ def build_inference_cmd(config: ProjectConfig) -> list[str]:
         cmd.append("--sample_audio_only")
     if s.sample_merge_audio:
         cmd.append("--sample_merge_audio")
+    if not s.sample_audio_subprocess:
+        cmd.append("--no-sample_audio_subprocess")
     if s.sample_two_stage:
         cmd.append("--sample_two_stage")
         if s.spatial_upsampler_path:

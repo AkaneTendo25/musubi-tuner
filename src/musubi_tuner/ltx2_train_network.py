@@ -3681,6 +3681,7 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                 context=audio_ctx,
                 sigma=audio_sigma,
                 context_mask=text_mask,
+                v2a_cross_attention_mask=v2a_mask,
             )
 
             perturbations = BatchedPerturbationConfig.empty(bsz)

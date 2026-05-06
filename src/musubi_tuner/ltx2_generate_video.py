@@ -297,6 +297,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sample_disable_audio", action="store_true", help="Disable audio decoding in AV mode")
     parser.add_argument("--sample_audio_only", action="store_true", help="Audio-only output (skip video decode)")
     parser.add_argument("--sample_merge_audio", action="store_true", help="Mux audio into video (_av.mp4)")
+    parser.add_argument(
+        "--sample_audio_subprocess",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Decode audio in a subprocess. Use --no-sample_audio_subprocess to decode in-process.",
+    )
 
     # -- Two-stage inference --
     parser.add_argument("--sample_two_stage", action="store_true",

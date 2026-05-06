@@ -503,7 +503,41 @@ def validate_inference_config(config: ProjectConfig) -> dict[str, Any]:
         errors.append(_make_issue("error", "inference.prompt", message, label="Prompt", page="inference"))
         errors.append(_make_issue("error", "inference.from_file", message, label="Sample Prompts File", page="inference"))
 
-    if not _has_inference_gemma_source(config):
+    if (i.sample_two_stage or i.sampling_preset == "distilled_two_stage") and not _has_text(i.spatial_upsampler_path):
+        errors.append(
+            _make_issue(
+                "error",
+                "inference.spatial_upsampler_path",
+                "Upsampler Path is required when Two-Stage sampling is enabled.",
+                label="Upsampler Path",
+                page="inference",
+            )
+        )
+
+    if i.use_precached_sample_prompts and not _has_text(i.from_file):
+        errors.append(
+            _make_issue(
+                "error",
+                "inference.from_file",
+                "Sample Prompts File is required when Precached sample prompts is enabled.",
+                label="Sample Prompts File",
+                page="inference",
+            )
+        )
+
+    sample_prompts_cache_path = _resolve_project_path(config, i.sample_prompts_cache)
+    if i.use_precached_sample_prompts and sample_prompts_cache_path is not None and not sample_prompts_cache_path.exists():
+        errors.append(
+            _make_issue(
+                "error",
+                "inference.sample_prompts_cache",
+                f"Sample Prompts Cache file not found: {sample_prompts_cache_path}",
+                label="Sample Prompts Cache",
+                page="inference",
+            )
+        )
+
+    if not i.use_precached_sample_prompts and not _has_inference_gemma_source(config):
         message = "Gemma Root or Gemma Safetensors is required for inference."
         errors.append(_make_issue("error", "inference.gemma_root", message, label="Gemma Root", page="inference"))
         errors.append(_make_issue("error", "inference.gemma_safetensors", message, label="Gemma Safetensors", page="inference"))

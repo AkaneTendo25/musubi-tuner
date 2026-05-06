@@ -578,6 +578,7 @@
 								<FormToggle fieldPath="inference.sample_disable_audio" checked={s.sample_disable_audio ?? false} onchange={(e) => update('sample_disable_audio', e.target.checked)} tooltip="Skip audio decode in AV mode" />
 								<FormToggle fieldPath="inference.sample_audio_only" checked={s.sample_audio_only ?? false} onchange={(e) => update('sample_audio_only', e.target.checked)} tooltip="Output audio only" />
 								<FormToggle fieldPath="inference.sample_merge_audio" checked={s.sample_merge_audio ?? false} onchange={(e) => update('sample_merge_audio', e.target.checked)} tooltip="Mux generated audio into video output" />
+								<FormToggle fieldPath="inference.sample_audio_subprocess" checked={s.sample_audio_subprocess ?? true} onchange={(e) => update('sample_audio_subprocess', e.target.checked)} tooltip="Decode audio in a subprocess" />
 								<FormToggle fieldPath="inference.sample_two_stage" checked={s.sample_two_stage ?? false} onchange={(e) => update('sample_two_stage', e.target.checked)} tooltip="Enable spatial upsampler second stage" />
 								<FormToggle fieldPath="inference.sample_tiled_vae" checked={s.sample_tiled_vae ?? false} onchange={(e) => update('sample_tiled_vae', e.target.checked)} tooltip="Enable tiled VAE decode" />
 							</div>

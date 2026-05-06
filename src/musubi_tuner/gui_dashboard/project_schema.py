@@ -625,6 +625,7 @@ class InferenceConfig(BaseModel):
     sample_disable_audio: bool = False
     sample_audio_only: bool = False
     sample_merge_audio: bool = False
+    sample_audio_subprocess: bool = True
     sample_two_stage: bool = False
     spatial_upsampler_path: str = ""
     distilled_lora_path: str = ""

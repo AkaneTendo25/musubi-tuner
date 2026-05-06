@@ -1789,8 +1789,7 @@ class LTX2SamplingMixin:
 
         if use_two_stage:
             if not spatial_upsampler_path:
-                logger.warning("Two-stage inference requested but --spatial_upsampler_path not set; falling back to single-stage")
-                use_two_stage = False
+                raise ValueError("Two-stage inference requires --spatial_upsampler_path")
             elif force_audio_conditioning:
                 logger.warning(
                     "Reference-audio conditioning is not supported with two-stage inference; falling back to single-stage"
