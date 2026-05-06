@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shlex
+import subprocess
 from pathlib import Path
 from typing import Optional
 
@@ -61,6 +63,21 @@ def _build_cmd(proc_type: str, config):
         return build_slider_training_cmd(config)
     else:
         raise HTTPException(status_code=400, detail=f"Unknown type: {proc_type}")
+
+
+def _render_command_script(cmd: list[str], cwd: str | None = None) -> str:
+    if os.name == "nt":
+        lines = ["@echo off"]
+        if cwd:
+            lines.append(f"cd /d {subprocess.list2cmdline([str(cwd)])}")
+        lines.append(subprocess.list2cmdline([str(part) for part in cmd]))
+        return "\r\n".join(lines) + "\r\n"
+
+    lines = ["#!/usr/bin/env sh", "set -e"]
+    if cwd:
+        lines.append(f"cd {shlex.quote(str(cwd))}")
+    lines.append(shlex.join([str(part) for part in cmd]))
+    return "\n".join(lines) + "\n"
 
 
 def _validate_process_or_raise(proc_type: str, config) -> dict:
@@ -185,7 +202,7 @@ async def get_command_preview(proc_type: str, request: Request):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to build command: {e}")
 
-    return {"command": " ".join(cmd)}
+    return {"command": _render_command_script(cmd, cwd=config.project_dir or None)}
 
 
 @router.get("/api/processes/status")

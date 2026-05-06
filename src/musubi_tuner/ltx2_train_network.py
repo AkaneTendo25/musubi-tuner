@@ -75,6 +75,22 @@ def infer_ic_lora_strategy_from_preset(lora_target_preset: Optional[str]) -> str
     return "none"
 
 
+def validate_connector_lora_cache_features(conditions: Optional[Dict[str, Any]], *, ltx_mode: str) -> None:
+    """Fail fast when connector LoRA training would run without connector inputs."""
+    missing: list[str] = []
+    if not isinstance(conditions, dict) or not isinstance(conditions.get("video_features"), torch.Tensor):
+        missing.append("video_features")
+    if str(ltx_mode or "video").lower() in {"av", "audio"}:
+        if not isinstance(conditions, dict) or not isinstance(conditions.get("audio_features"), torch.Tensor):
+            missing.append("audio_features")
+    if missing:
+        raise ValueError(
+            "--train_connectors requires text encoder caches created with --cache_before_connector. "
+            f"Missing pre-connector cache tensor(s): {', '.join(missing)}. "
+            "Re-run ltx2_cache_text_encoder_outputs.py with --cache_before_connector and the same --ltx2_mode."
+        )
+
+
 def _normalize_av_cross_attention_mode(value: Optional[str]) -> str:
     mode = str(value or "both").lower()
     if mode not in AV_CROSS_ATTENTION_MODES:
@@ -4367,28 +4383,21 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                             )
                 self._self_flow.mark_student_forward()
 
-        # Connector LoRA: pass pre-connector features for on-the-fly connector processing
-        if self._train_connectors and conditions is not None:
-            video_features = conditions.get("video_features")
-            if not isinstance(video_features, torch.Tensor):
-                if not getattr(self, "_warned_missing_connector_features", False):
-                    logger.error(
-                        "--train_connectors is set but cache lacks 'video_features' keys. "
-                        "Re-run caching with --cache_before_connector. "
-                        "Connector LoRA will have NO effect on training."
-                    )
-                    self._warned_missing_connector_features = True
-            if isinstance(video_features, torch.Tensor):
-                resolved_transformer_options = dict(resolved_transformer_options)
-                resolved_transformer_options["video_features"] = video_features.to(
+        # Connector LoRA: pass pre-connector features for on-the-fly connector processing.
+        if self._train_connectors:
+            validate_connector_lora_cache_features(conditions, ltx_mode=self._ltx_mode)
+            assert conditions is not None
+            video_features = conditions["video_features"]
+            resolved_transformer_options = dict(resolved_transformer_options)
+            resolved_transformer_options["video_features"] = video_features.to(
+                device=accelerator.device, dtype=network_dtype
+            )
+            audio_features = conditions.get("audio_features")
+            if isinstance(audio_features, torch.Tensor):
+                resolved_transformer_options["audio_features"] = audio_features.to(
                     device=accelerator.device, dtype=network_dtype
                 )
-                audio_features = conditions.get("audio_features")
-                if isinstance(audio_features, torch.Tensor):
-                    resolved_transformer_options["audio_features"] = audio_features.to(
-                        device=accelerator.device, dtype=network_dtype
-                    )
-                resolved_transformer_options["features_attention_mask"] = text_mask
+            resolved_transformer_options["features_attention_mask"] = text_mask
 
         if getattr(args, "fp8_base", False) or getattr(args, "fp8_scaled", False):
             self._ensure_fp8_buffers_on_device(transformer)

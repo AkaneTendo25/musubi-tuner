@@ -149,8 +149,10 @@ def _dataset_entry_to_dict(entry) -> dict:
             if len(reference_directories) == 1:
                 d["control_directory"] = reference_directories[0]
             else:
-                d["control_directory"] = reference_directories[0]
-                d["extra_control_directories"] = ", ".join(reference_directories[1:])
+                raise ValueError(
+                    "Multiple control/reference directories require matching reference cache directories. "
+                    "Dataset TOML supports one control_directory without reference caches."
+                )
 
     reference_audio_directories = _merge_path_values(
         [entry.reference_audio_directory] if getattr(entry, "reference_audio_directory", "") else [],
@@ -264,10 +266,10 @@ def _write_slider_toml(config: ProjectConfig, output_path: Path) -> Path:
     if s.mode == "text":
         for target in s.targets:
             lines.append("[[targets]]")
-            lines.append(f'positive = "{target.positive}"')
-            lines.append(f'negative = "{target.negative}"')
+            lines.append(f"positive = {_toml_value(target.positive)}")
+            lines.append(f"negative = {_toml_value(target.negative)}")
             if target.target_class:
-                lines.append(f'target_class = "{target.target_class}"')
+                lines.append(f"target_class = {_toml_value(target.target_class)}")
             lines.append(f"weight = {target.weight}")
             lines.append("")
 
