@@ -135,6 +135,14 @@ class RunningStats:
 # Pure-PyTorch Fréchet Distance
 # ---------------------------------------------------------------------------
 
+def _matrix_sqrt_spd(m: torch.Tensor) -> torch.Tensor:
+    """Symmetric matrix square root of a symmetric PSD matrix via eigh."""
+    m = 0.5 * (m + m.T)
+    eigvals, eigvecs = torch.linalg.eigh(m)
+    eigvals = eigvals.clamp(min=0)
+    return eigvecs @ torch.diag(eigvals.sqrt()) @ eigvecs.T
+
+
 def _frechet_distance(
     mu1: torch.Tensor, sigma1: torch.Tensor,
     mu2: torch.Tensor, sigma2: torch.Tensor,
@@ -142,23 +150,19 @@ def _frechet_distance(
 ) -> float:
     """Compute Fréchet distance between two multivariate Gaussians.
 
-    Uses eigendecomposition instead of scipy sqrtm for portability.
+    Uses the symmetric form tr(s1 + s2 - 2*sqrt(sqrt(s1) * s2 * sqrt(s1))) so the
+    inner matrix is SPD and eigh is valid (sigma1 @ sigma2 is generally non-symmetric).
     """
     diff = mu1 - mu2
 
-    # Regularize covariance matrices
     sigma1 = sigma1 + eps * torch.eye(sigma1.shape[0], dtype=sigma1.dtype)
     sigma2 = sigma2 + eps * torch.eye(sigma2.shape[0], dtype=sigma2.dtype)
 
-    # Product of covariance matrices
-    product = sigma1 @ sigma2
+    sqrt_sigma1 = _matrix_sqrt_spd(sigma1)
+    inner = sqrt_sigma1 @ sigma2 @ sqrt_sigma1
+    sqrt_inner = _matrix_sqrt_spd(inner)
 
-    # Matrix square root via eigendecomposition
-    eigvals, eigvecs = torch.linalg.eigh(product)
-    eigvals = eigvals.clamp(min=0)  # numerical safety
-    sqrt_product = eigvecs @ torch.diag(eigvals.sqrt()) @ eigvecs.T
-
-    trace_term = sigma1.trace() + sigma2.trace() - 2 * sqrt_product.trace()
+    trace_term = sigma1.trace() + sigma2.trace() - 2 * sqrt_inner.trace()
     fd = float((diff @ diff) + trace_term)
     return max(fd, 0.0)
 
@@ -244,6 +248,13 @@ def _spectral_convergence(mel_pred: torch.Tensor, mel_target: torch.Tensor) -> f
     return float(diff_norm / target_norm)
 
 
+def _dct_ii_basis(N: int, n_coeff: int, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+    """DCT-II basis matrix of shape [n_coeff, N]: B[k, n] = cos(pi*(2n+1)*k/(2N))."""
+    n = torch.arange(N, dtype=dtype, device=device)
+    k = torch.arange(n_coeff, dtype=dtype, device=device).unsqueeze(-1)
+    return torch.cos(math.pi * (2 * n + 1) * k / (2 * N))
+
+
 def _mel_cepstral_distortion(
     mel_pred: torch.Tensor, mel_target: torch.Tensor,
     n_coefficients: int = 13,
@@ -256,23 +267,18 @@ def _mel_cepstral_distortion(
     if mel_pred.dim() != 2 or mel_pred.shape[0] < 1:
         return None
 
-    # Ensure log-mel (if not already)
-    # The AudioDecoder output may already be in log scale — caller must verify.
-    # We apply a safety clamp.
     pred_log = mel_pred.float()
     target_log = mel_target.float()
 
-    # Type-II DCT via torch.fft (real-to-real cosine transform)
-    # DCT-II: X[k] = 2 * sum_n x[n] * cos(pi*(2n+1)*k / (2N))
     N = pred_log.shape[-1]
     n_coeff = min(n_coefficients, N)
+    basis = _dct_ii_basis(N, n_coeff, pred_log.dtype, pred_log.device)  # [n_coeff, N]
 
-    pred_dct = torch.fft.rfft(pred_log, dim=-1).real[:, :n_coeff]
-    target_dct = torch.fft.rfft(target_log, dim=-1).real[:, :n_coeff]
+    # x @ basis.T -> [T, n_coeff]
+    pred_dct = pred_log @ basis.T
+    target_dct = target_log @ basis.T
 
-    # Euclidean distance per frame, then average
     frame_dist = (pred_dct - target_dct).norm(dim=-1)  # [T]
-    # Scale factor: (10 * sqrt(2) / ln(10)) ≈ 6.1416 for dB conversion
     mcd = float(frame_dist.mean()) * (10.0 * math.sqrt(2) / math.log(10))
     return mcd
 
@@ -285,12 +291,12 @@ def _log_spectral_distance(mel_pred: torch.Tensor, mel_target: torch.Tensor) -> 
     if mel_pred.dim() != 2 or mel_pred.shape[0] < 1:
         return None
 
-    pred = mel_pred.float().clamp(min=1e-8)
-    target = mel_target.float().clamp(min=1e-8)
+    # Inputs are log-mel (typically negative), so do NOT clamp; clamping would
+    # snap negative values up to a positive floor and zero out the difference.
+    pred = mel_pred.float()
+    target = mel_target.float()
 
-    # Convert to power if in log domain — assume inputs are log-mel
-    # LSD = sqrt(mean((10*log10(S_pred) - 10*log10(S_target))^2))
-    # If already in log domain: LSD = sqrt(mean((pred - target)^2)) * 10/ln(10)
+    # LSD on log-mel: sqrt(mean((pred - target)^2)) * 10/ln(10) for dB
     diff_sq = (pred - target) ** 2
     lsd_per_frame = diff_sq.mean(dim=-1).sqrt()  # [T]
     # Scale: the inputs are in natural log, convert difference to dB
@@ -622,6 +628,11 @@ class AudioMetricsModule:
 
         if waveform is not None and self._clap is not None and text_prompt:
             try:
+                # Reset before accumulating so compute() returns the cosine for
+                # this prompt only — without the reset it returns a running mean
+                # over every prompt+pass+epoch ever seen, which drifts to a stale
+                # historical average.
+                self._clap.reset()
                 self._clap.accumulate(waveform, text_prompt, device, sample_rate)
                 clap_score = self._clap.compute()
                 if clap_score is not None:

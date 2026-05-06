@@ -6,6 +6,7 @@ import dataclasses
 import logging
 import os
 import shutil
+import string
 import threading
 import time
 import uuid
@@ -13,7 +14,7 @@ from pathlib import Path
 
 import requests
 from fastapi import APIRouter, HTTPException, Query, Request
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
 
@@ -119,44 +120,343 @@ async def write_file(req: WriteFileRequest):
 # Checkpoint scanning
 # ---------------------------------------------------------------------------
 
-_LTX_PATTERNS = ["*ltx*", "*LTX*"]
-_LTX_SUFFIXES = {".safetensors"}
+_SAFETENSORS_SUFFIXES = {".safetensors"}
+_LTX_SUFFIXES = _SAFETENSORS_SUFFIXES
+_SCAN_TYPES = {"ltx2", "gemma", "gemma_safetensors"}
 _GEMMA_MARKERS = ["tokenizer.model", "config.json"]  # files inside gemma dirs
 _GEMMA_NAME_HINTS = ["gemma"]
+_SCAN_MAX_DEPTH = 5
+_SCAN_SKIP_DIRS = {
+    "$recycle.bin",
+    "__pycache__",
+    "node_modules",
+    "program files",
+    "program files (x86)",
+    "programdata",
+    "system volume information",
+    "venv",
+    "windows",
+}
 
 
-def _scan_ltx_checkpoints(roots: list[Path], max_depth: int = 3) -> list[str]:
-    """Recursively search *roots* for safetensors files with 'ltx' in the name."""
-    results: list[str] = []
+@dataclasses.dataclass
+class ScanJob:
+    job_id: str
+    scan_type: str
+    target_name: str = ""
+    related_specs: dict[tuple[str, str], tuple[str, str]] = dataclasses.field(default_factory=dict)
+    state: str = "queued"
+    current_path: str = ""
+    results: list[str] = dataclasses.field(default_factory=list)
+    error: str = ""
+    cancel_requested: bool = False
+    started_at: float = dataclasses.field(default_factory=time.time)
+    finished_at: float | None = None
+    last_progress_at: float = 0.0
+    lock: threading.Lock = dataclasses.field(default_factory=threading.Lock)
+
+
+class ScanCheckpointRequest(BaseModel):
+    type: str
+    extra_paths: str = ""
+    target_path: str = ""
+    related_targets: dict[str, str] = Field(default_factory=dict)
+
+
+_SCAN_JOBS: dict[str, ScanJob] = {}
+_SCAN_JOBS_LOCK = threading.Lock()
+_SCAN_RESULT_CACHE: dict[tuple[str, str], list[str]] = {}
+_SCAN_RESULT_CACHE_LOCK = threading.Lock()
+
+
+def _scan_job_payload(job: ScanJob) -> dict:
+    with job.lock:
+        state = "cancelling" if job.state == "running" and job.cancel_requested else job.state
+        return {
+            "job_id": job.job_id,
+            "type": job.scan_type,
+            "target_name": job.target_name,
+            "state": state,
+            "current_path": job.current_path,
+            "results": list(job.results),
+            "error": job.error,
+            "started_at": job.started_at,
+            "finished_at": job.finished_at,
+        }
+
+
+def _set_scan_progress(job: ScanJob, path: Path, force: bool = False):
+    now = time.monotonic()
+    with job.lock:
+        if force or now - job.last_progress_at >= 1.0:
+            job.current_path = str(path)
+            job.last_progress_at = now
+
+
+def _scan_roots(extra_paths: str = "") -> list[Path]:
+    roots = _gather_scan_roots()
+    if extra_paths:
+        for p in extra_paths.split(","):
+            p = p.strip()
+            if p:
+                pp = Path(p)
+                if pp.is_dir():
+                    roots.append(pp)
+
+    unique_roots: list[Path] = []
     seen: set[str] = set()
+    for root in roots:
+        key = str(root).lower()
+        if key not in seen:
+            seen.add(key)
+            unique_roots.append(root)
+    return unique_roots
+
+
+def _target_leaf_name(path_or_name: str = "") -> str:
+    normalized = str(path_or_name or "").replace("\\", "/").rstrip("/")
+    return normalized.rsplit("/", 1)[-1].strip()
+
+
+def _same_leaf_name(candidate_name: str, target_name: str) -> bool:
+    return bool(target_name) and candidate_name.casefold() == target_name.casefold()
+
+
+def _add_scan_result(results: list[str], seen: set[str], path: Path):
+    s = str(path)
+    key = s.casefold()
+    if key not in seen:
+        seen.add(key)
+        results.append(s)
+
+
+def _scan_cache_key(scan_type: str, target_name: str) -> tuple[str, str]:
+    return (scan_type, target_name.casefold())
+
+
+def _scan_result_still_valid(scan_type: str, path: Path, target_name: str) -> bool:
+    if not _same_leaf_name(path.name, target_name):
+        return False
+    if scan_type == "gemma":
+        return path.is_dir()
+    if scan_type in {"ltx2", "gemma_safetensors"}:
+        return path.is_file() and path.suffix.casefold() in _SAFETENSORS_SUFFIXES
+    return False
+
+
+def _get_cached_scan_results(scan_type: str, target_name: str) -> list[str]:
+    if not target_name:
+        return []
+    key = _scan_cache_key(scan_type, target_name)
+    with _SCAN_RESULT_CACHE_LOCK:
+        cached = list(_SCAN_RESULT_CACHE.get(key, []))
+    if not cached:
+        return []
+    valid = [path for path in cached if _scan_result_still_valid(scan_type, Path(path), target_name)]
+    with _SCAN_RESULT_CACHE_LOCK:
+        if valid:
+            _SCAN_RESULT_CACHE[key] = valid
+        else:
+            _SCAN_RESULT_CACHE.pop(key, None)
+    return valid
+
+
+def _store_scan_results(scan_type: str, target_name: str, results: list[str]):
+    if not target_name or not results:
+        return
+    valid = [path for path in results if _scan_result_still_valid(scan_type, Path(path), target_name)]
+    if not valid:
+        return
+    with _SCAN_RESULT_CACHE_LOCK:
+        _SCAN_RESULT_CACHE[_scan_cache_key(scan_type, target_name)] = valid
+
+
+def _completed_scan_payload(scan_type: str, target_name: str, results: list[str]) -> dict:
+    job = ScanJob(
+        job_id="",
+        scan_type=scan_type,
+        target_name=target_name,
+        state="completed",
+        results=results,
+        started_at=time.time(),
+        finished_at=time.time(),
+    )
+    return _scan_job_payload(job)
+
+
+def _scan_target_specs(scan_type: str, target_path: str, related_targets: dict[str, str] | None = None) -> dict[tuple[str, str], tuple[str, str]]:
+    specs: dict[tuple[str, str], tuple[str, str]] = {}
+
+    def add(target_type: str, path_or_name: str):
+        if target_type not in _SCAN_TYPES:
+            return
+        target_name = _target_leaf_name(path_or_name)
+        if not target_name:
+            return
+        specs[_scan_cache_key(target_type, target_name)] = (target_type, target_name)
+
+    add(scan_type, target_path)
+    for target_type, path_or_name in (related_targets or {}).items():
+        add(target_type, path_or_name)
+    return specs
+
+
+def _scan_exact_targets(
+    roots: list[Path],
+    specs: dict[tuple[str, str], tuple[str, str]],
+    max_depth: int = _SCAN_MAX_DEPTH,
+    should_cancel=None,
+    on_progress=None,
+) -> dict[tuple[str, str], list[str]]:
+    """Recursively search *roots* once for multiple exact file/folder targets."""
+    results = {key: [] for key in specs}
+    seen = {key: set() for key in specs}
+
+    if not specs:
+        return results
+
+    def _matches_file(scan_type: str, item: Path, target_name: str) -> bool:
+        return scan_type in {"ltx2", "gemma_safetensors"} and _same_leaf_name(item.name, target_name) and item.suffix.casefold() in _SAFETENSORS_SUFFIXES
+
+    def _matches_dir(scan_type: str, item: Path, target_name: str) -> bool:
+        return scan_type == "gemma" and _same_leaf_name(item.name, target_name)
 
     def _walk(p: Path, depth: int):
+        if should_cancel and should_cancel():
+            return
         if depth > max_depth:
             return
+        if on_progress:
+            on_progress(p)
         try:
             for item in p.iterdir():
+                if should_cancel and should_cancel():
+                    return
                 if item.name.startswith("."):
                     continue
-                if item.is_file() and item.suffix in _LTX_SUFFIXES:
-                    low = item.name.lower()
-                    if "ltx" in low:
-                        s = str(item)
-                        if s not in seen:
-                            seen.add(s)
-                            results.append(s)
+                if item.is_file():
+                    for key, (scan_type, target_name) in specs.items():
+                        if _matches_file(scan_type, item, target_name):
+                            _add_scan_result(results[key], seen[key], item)
                 elif item.is_dir():
+                    for key, (scan_type, target_name) in specs.items():
+                        if _matches_dir(scan_type, item, target_name):
+                            _add_scan_result(results[key], seen[key], item)
+                    if item.name.lower() in _SCAN_SKIP_DIRS:
+                        continue
                     _walk(item, depth + 1)
         except (PermissionError, OSError):
             pass
 
     for root in roots:
+        if should_cancel and should_cancel():
+            break
         if root.is_dir():
             _walk(root, 0)
     return results
 
 
-def _scan_gemma_roots(roots: list[Path], max_depth: int = 3) -> list[str]:
-    """Recursively search for directories that look like Gemma model dirs."""
+def _scan_exact_files(
+    roots: list[Path],
+    target_name: str,
+    suffixes: set[str] | None = None,
+    max_depth: int = _SCAN_MAX_DEPTH,
+    should_cancel=None,
+    on_progress=None,
+) -> list[str]:
+    """Recursively search *roots* for files whose basename exactly matches *target_name*."""
+    results: list[str] = []
+    seen: set[str] = set()
+    target_suffix = Path(target_name).suffix.casefold()
+    suffixes = {suffix.casefold() for suffix in suffixes or set()}
+    if not target_name or (suffixes and target_suffix not in suffixes):
+        return results
+
+    def _walk(p: Path, depth: int):
+        if should_cancel and should_cancel():
+            return
+        if depth > max_depth:
+            return
+        if on_progress:
+            on_progress(p)
+        try:
+            for item in p.iterdir():
+                if should_cancel and should_cancel():
+                    return
+                if item.name.startswith("."):
+                    continue
+                if item.is_file():
+                    if _same_leaf_name(item.name, target_name) and (not suffixes or item.suffix.casefold() in suffixes):
+                        _add_scan_result(results, seen, item)
+                elif item.is_dir():
+                    if item.name.lower() in _SCAN_SKIP_DIRS:
+                        continue
+                    _walk(item, depth + 1)
+        except (PermissionError, OSError):
+            pass
+
+    for root in roots:
+        if should_cancel and should_cancel():
+            break
+        if root.is_dir():
+            _walk(root, 0)
+    return results
+
+
+def _scan_ltx_checkpoints(
+    roots: list[Path],
+    target_name: str = "",
+    max_depth: int = _SCAN_MAX_DEPTH,
+    should_cancel=None,
+    on_progress=None,
+) -> list[str]:
+    """Recursively search *roots* for LTX checkpoint files."""
+    if target_name:
+        return _scan_exact_files(roots, target_name, _LTX_SUFFIXES, max_depth, should_cancel, on_progress)
+
+    results: list[str] = []
+    seen: set[str] = set()
+
+    def _walk(p: Path, depth: int):
+        if should_cancel and should_cancel():
+            return
+        if depth > max_depth:
+            return
+        if on_progress:
+            on_progress(p)
+        try:
+            for item in p.iterdir():
+                if should_cancel and should_cancel():
+                    return
+                if item.name.startswith("."):
+                    continue
+                if item.is_file() and item.suffix in _LTX_SUFFIXES:
+                    low = item.name.lower()
+                    if "ltx" in low:
+                        _add_scan_result(results, seen, item)
+                elif item.is_dir():
+                    if item.name.lower() in _SCAN_SKIP_DIRS:
+                        continue
+                    _walk(item, depth + 1)
+        except (PermissionError, OSError):
+            pass
+
+    for root in roots:
+        if should_cancel and should_cancel():
+            break
+        if root.is_dir():
+            _walk(root, 0)
+    return results
+
+
+def _scan_gemma_roots(
+    roots: list[Path],
+    target_name: str = "",
+    max_depth: int = _SCAN_MAX_DEPTH,
+    should_cancel=None,
+    on_progress=None,
+) -> list[str]:
+    """Recursively search for Gemma model directories."""
     results: list[str] = []
     seen: set[str] = set()
 
@@ -168,32 +468,41 @@ def _scan_gemma_roots(roots: list[Path], max_depth: int = 3) -> list[str]:
         return False
 
     def _walk(p: Path, depth: int):
+        if should_cancel and should_cancel():
+            return
         if depth > max_depth:
             return
+        if on_progress:
+            on_progress(p)
         try:
             for item in p.iterdir():
+                if should_cancel and should_cancel():
+                    return
                 if item.name.startswith("."):
                     continue
                 if item.is_dir():
+                    if item.name.lower() in _SCAN_SKIP_DIRS:
+                        continue
+                    if target_name and _same_leaf_name(item.name, target_name):
+                        _add_scan_result(results, seen, item)
                     low = item.name.lower()
-                    if any(h in low for h in _GEMMA_NAME_HINTS) and _is_gemma(item):
-                        s = str(item)
-                        if s not in seen:
-                            seen.add(s)
-                            results.append(s)
+                    if not target_name and any(h in low for h in _GEMMA_NAME_HINTS) and _is_gemma(item):
+                        _add_scan_result(results, seen, item)
                     else:
                         _walk(item, depth + 1)
         except (PermissionError, OSError):
             pass
 
     for root in roots:
+        if should_cancel and should_cancel():
+            break
         if root.is_dir():
             _walk(root, 0)
     return results
 
 
 def _gather_scan_roots() -> list[Path]:
-    """Collect common directories to scan for model files."""
+    """Collect common directories and mounted drives to scan for model files."""
     roots: list[Path] = []
     cwd = Path.cwd()
     roots.append(cwd)
@@ -211,29 +520,137 @@ def _gather_scan_roots() -> list[Path]:
         if d.is_dir():
             roots.append(d)
 
-    return roots
+    if os.name == "nt":
+        for letter in string.ascii_uppercase:
+            drive = Path(f"{letter}:\\")
+            if drive.is_dir():
+                roots.append(drive)
+    else:
+        roots.append(Path("/"))
+
+    unique_roots: list[Path] = []
+    seen: set[str] = set()
+    for root in roots:
+        key = str(root).lower()
+        if key not in seen:
+            seen.add(key)
+            unique_roots.append(root)
+    return unique_roots
 
 
 @router.get("/scan-checkpoints")
 async def scan_checkpoints(
-    type: str = Query(..., description="Type: 'ltx2' or 'gemma'"),
+    type: str = Query(..., description="Type: 'ltx2', 'gemma', or 'gemma_safetensors'"),
     extra_paths: str = Query("", description="Comma-separated extra directories to scan"),
+    target_path: str = Query("", description="Target path/name to match exactly by basename"),
 ):
     """Scan common locations for model checkpoints."""
-    roots = _gather_scan_roots()
-    if extra_paths:
-        for p in extra_paths.split(","):
-            p = p.strip()
-            if p:
-                pp = Path(p)
-                if pp.is_dir():
-                    roots.append(pp)
+    roots = _scan_roots(extra_paths)
+    target_name = _target_leaf_name(target_path)
+    cached = _get_cached_scan_results(type, target_name)
+    if cached:
+        return {"results": cached}
     if type == "ltx2":
-        return {"results": _scan_ltx_checkpoints(roots)}
+        results = _scan_ltx_checkpoints(roots, target_name=target_name)
     elif type == "gemma":
-        return {"results": _scan_gemma_roots(roots)}
+        results = _scan_gemma_roots(roots, target_name=target_name)
+    elif type == "gemma_safetensors":
+        results = _scan_exact_files(roots, target_name, _SAFETENSORS_SUFFIXES)
     else:
         raise HTTPException(status_code=400, detail=f"Unknown type: {type}")
+    _store_scan_results(type, target_name, results)
+    return {"results": results}
+
+
+def _run_scan_job(job: ScanJob, extra_paths: str):
+    with job.lock:
+        job.state = "running"
+    try:
+        roots = _scan_roots(extra_paths)
+        _set_scan_progress(job, roots[0] if roots else Path.cwd(), force=True)
+
+        def should_cancel() -> bool:
+            with job.lock:
+                return job.cancel_requested
+
+        def on_progress(path: Path):
+            _set_scan_progress(job, path)
+
+        related_specs = getattr(job, "related_specs", None)
+        if related_specs:
+            grouped_results = _scan_exact_targets(roots, related_specs, should_cancel=should_cancel, on_progress=on_progress)
+            results = grouped_results.get(_scan_cache_key(job.scan_type, job.target_name), [])
+            if not should_cancel():
+                for key, paths in grouped_results.items():
+                    scan_type, target_name = related_specs[key]
+                    _store_scan_results(scan_type, target_name, paths)
+        elif job.scan_type == "ltx2":
+            results = _scan_ltx_checkpoints(roots, target_name=job.target_name, should_cancel=should_cancel, on_progress=on_progress)
+            if not should_cancel():
+                _store_scan_results(job.scan_type, job.target_name, results)
+        elif job.scan_type == "gemma":
+            results = _scan_gemma_roots(roots, target_name=job.target_name, should_cancel=should_cancel, on_progress=on_progress)
+            if not should_cancel():
+                _store_scan_results(job.scan_type, job.target_name, results)
+        elif job.scan_type == "gemma_safetensors":
+            results = _scan_exact_files(roots, job.target_name, _SAFETENSORS_SUFFIXES, should_cancel=should_cancel, on_progress=on_progress)
+            if not should_cancel():
+                _store_scan_results(job.scan_type, job.target_name, results)
+        else:
+            raise ValueError(f"Unknown type: {job.scan_type}")
+
+        with job.lock:
+            job.results = results
+            job.finished_at = time.time()
+            job.state = "cancelled" if job.cancel_requested else "completed"
+    except Exception as e:
+        logger.warning("Checkpoint scan failed: %s", e)
+        with job.lock:
+            job.error = str(e)
+            job.finished_at = time.time()
+            job.state = "failed"
+
+
+@router.post("/scan-checkpoints/start")
+async def start_scan_checkpoints(req: ScanCheckpointRequest):
+    """Start a cancellable checkpoint scan job."""
+    if req.type not in _SCAN_TYPES:
+        raise HTTPException(status_code=400, detail=f"Unknown type: {req.type}")
+
+    target_name = _target_leaf_name(req.target_path)
+    cached = _get_cached_scan_results(req.type, target_name)
+    if cached:
+        return _completed_scan_payload(req.type, target_name, cached)
+
+    job = ScanJob(job_id=str(uuid.uuid4()), scan_type=req.type, target_name=target_name)
+    job.related_specs = _scan_target_specs(req.type, req.target_path, req.related_targets)
+    with _SCAN_JOBS_LOCK:
+        _SCAN_JOBS[job.job_id] = job
+
+    thread = threading.Thread(target=_run_scan_job, args=(job, req.extra_paths), daemon=True)
+    thread.start()
+    return _scan_job_payload(job)
+
+
+@router.get("/scan-checkpoints/{job_id}")
+async def get_scan_checkpoint_status(job_id: str):
+    with _SCAN_JOBS_LOCK:
+        job = _SCAN_JOBS.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Scan job not found")
+    return _scan_job_payload(job)
+
+
+@router.post("/scan-checkpoints/{job_id}/cancel")
+async def cancel_scan_checkpoint(job_id: str):
+    with _SCAN_JOBS_LOCK:
+        job = _SCAN_JOBS.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Scan job not found")
+    with job.lock:
+        if job.state in {"queued", "running"}:
+            job.cancel_requested = True
+    return _scan_job_payload(job)
 
 
 # ---------------------------------------------------------------------------

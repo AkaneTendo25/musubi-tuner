@@ -1,5 +1,9 @@
 <script>
-	let { label, value = $bindable(''), options = [], tooltip = '', disabled = false, onchange, ...rest } = $props();
+	import FieldResetButton from './FieldResetButton.svelte';
+	import { labelFromFieldPath } from '$lib/utils/fieldLabels.js';
+
+	let { label = '', value = $bindable(''), options = [], tooltip = '', disabled = false, fieldPath = '', onchange, ...rest } = $props();
+	let displayLabel = $derived(label || labelFromFieldPath(fieldPath));
 
 	function handleChange(e) {
 		value = e.target.value;
@@ -9,8 +13,11 @@
 	}
 </script>
 
-<label class="block" data-tooltip={tooltip || undefined}>
-	<span class="text-xs font-medium uppercase tracking-wider" style="color: var(--text-muted); font-family: var(--font-label);">{label}</span>
+<label class="block">
+	<span class="flex items-center gap-1 text-xs font-medium uppercase tracking-wider" style="color: var(--text-muted); font-family: var(--font-label);">
+		<span data-tooltip={tooltip || undefined}>{displayLabel}</span>
+		<FieldResetButton {fieldPath} {disabled} />
+	</span>
 	<select
 		{value}
 		onchange={handleChange}

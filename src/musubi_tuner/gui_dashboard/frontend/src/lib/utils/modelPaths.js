@@ -29,3 +29,27 @@ export function effectiveGemmaRoot(cwd, config, explicit = '', gemmaSafetensors 
 export function effectiveGemmaSafetensors(config, explicit = '') {
 	return explicit || config?.default_gemma_safetensors || '';
 }
+
+export function pathBaseName(path) {
+	return normalizeBase(path).split(/[\\/]/).filter(Boolean).pop() || '';
+}
+
+export function findExactModelNameMatch(paths, targetPath) {
+	const targetName = pathBaseName(targetPath).toLowerCase();
+	if (!targetName) return '';
+	return (paths || []).find((path) => pathBaseName(path).toLowerCase() === targetName) || '';
+}
+
+export function describeExactModelScan(paths, targetPath) {
+	const candidates = paths || [];
+	const match = findExactModelNameMatch(candidates, targetPath);
+	if (match) {
+		return { match, message: 'Exact match found', tone: 'success' };
+	}
+	const targetName = pathBaseName(targetPath) || 'target name';
+	return {
+		match: '',
+		message: `No exact match for ${targetName} (${candidates.length} candidates scanned)`,
+		tone: 'muted'
+	};
+}

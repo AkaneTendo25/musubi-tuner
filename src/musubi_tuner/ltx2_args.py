@@ -256,7 +256,7 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
     parser.add_argument(
         "--av_bimodal_scale",
         type=float,
-        default=3.0,
+        default=None,
         help="Scale for AV bimodal CFG. Applied as (scale-1) * (cond - bimodal). Default: 3.0.",
     )
     parser.add_argument(
@@ -266,8 +266,8 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         default="defaults",
         choices=["legacy", "defaults", "ltx20", "ltx23", "ltx23_hq", "distilled_two_stage"],
         help=(
-            "Sampling defaults for validation previews. 'legacy' preserves current behavior; "
-            "'defaults' selects the preset for --ltx_version."
+            "Sampling defaults for validation previews. 'defaults' selects the preset for --ltx_version; "
+            "use 'legacy' to bypass version preset defaults."
         ),
     )
     parser.add_argument(
@@ -562,9 +562,30 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
             "Lower values bias toward low noise / fine details, higher values toward high noise / global structure. "
             "If unset, shift is computed dynamically from sequence length using the LTX-2 linear formula "
             "(anchored at 0.95 for 1024 tokens and 2.05 for 4096 tokens). "
-            "Current non-audio training extrapolates outside those anchor values for shorter/longer sequences; "
-            "--ltx2_mode audio clamps auto-computed shifts to [0.95, 2.05]."
+            "By default non-audio training extrapolates outside those anchor values for shorter/longer sequences; "
+            "--ltx2_mode audio clamps auto-computed shifts to the configured min/max shift bounds."
         ),
+    )
+    parser.add_argument(
+        "--shifted_logit_clamp_auto_shift",
+        action="store_true",
+        help=(
+            "Clamp auto-computed shifted_logit_normal shifts to "
+            "[--shifted_logit_min_shift, --shifted_logit_max_shift]. "
+            "Does not affect explicit --shifted_logit_shift overrides."
+        ),
+    )
+    parser.add_argument(
+        "--shifted_logit_min_shift",
+        type=float,
+        default=0.95,
+        help="Lower clamp bound for auto-computed shifted_logit_normal shifts.",
+    )
+    parser.add_argument(
+        "--shifted_logit_max_shift",
+        type=float,
+        default=2.05,
+        help="Upper clamp bound for auto-computed shifted_logit_normal shifts.",
     )
     parser.add_argument(
         "--audio_silence_regularizer",

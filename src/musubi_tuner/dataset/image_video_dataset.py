@@ -3625,13 +3625,15 @@ class AudioDataset(BaseDataset):
                     dims_part = audio_key.split("_")[2]  # "{T}x{F}x{C}"
                     audio_t = int(dims_part.split("x")[0])
                     if self.audio_bucket_strategy == "truncate":
-                        # Floor division: all items in bucket have T >= quantized_t
-                        quantized_t = max(
-                            (audio_t // _AUDIO_DURATION_BUCKET_STEP) * _AUDIO_DURATION_BUCKET_STEP,
-                            _AUDIO_DURATION_BUCKET_STEP,
-                        )
+                        # Floor division: all items in bucket have T >= quantized_t.
+                        # Items shorter than one bucket step would violate that invariant
+                        # (and break torch.stack in the truncate batch path), so key them
+                        # on their actual length — same-length clips co-bucket cleanly.
+                        floored = (audio_t // _AUDIO_DURATION_BUCKET_STEP) * _AUDIO_DURATION_BUCKET_STEP
+                        quantized_t = floored if floored >= _AUDIO_DURATION_BUCKET_STEP else audio_t
                     else:
-                        # Round-to-nearest (pad mode)
+                        # Round-to-nearest (pad mode). Pad batch path computes max_t from
+                        # actual shapes, so the bucket key only affects grouping efficiency.
                         quantized_t = max(
                             ((audio_t + _AUDIO_DURATION_BUCKET_STEP // 2) // _AUDIO_DURATION_BUCKET_STEP)
                             * _AUDIO_DURATION_BUCKET_STEP,

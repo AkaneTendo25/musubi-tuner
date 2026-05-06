@@ -960,6 +960,19 @@ def _precache_sample_latents(args: argparse.Namespace, device: torch.device) -> 
     need_video_encoder = i2v_count > 0 or v2v_count > 0
     need_audio_encoder = ref_audio_count > 0
 
+    from musubi_tuner.ltx2_defaults import get_ltx2_sampling_preset
+    _preset = get_ltx2_sampling_preset(
+        getattr(args, "sample_sampling_preset", "defaults"),
+        ltx_version=str(getattr(args, "ltx_version", "2.3")),
+    )
+    _default_w = int(getattr(args, "width", 768) or 768)
+    _default_h = int(getattr(args, "height", 512) or 512)
+    _default_f = int(getattr(args, "sample_num_frames", 45) or 45)
+    if _preset is not None:
+        _default_w = _preset.width
+        _default_h = _preset.height
+        _default_f = _preset.frame_count
+
     vae_encoder = None
     vae_dtype = torch.bfloat16
     spatial_factor = 32
@@ -1100,12 +1113,17 @@ def _precache_sample_latents(args: argparse.Namespace, device: torch.device) -> 
         return latents[0].detach().cpu().unsqueeze(0).contiguous()
 
     for idx, prompt_dict in prompts_with_refs:
-        width = prompt_dict.get("width", 768)
-        height = prompt_dict.get("height", 512)
+        width = prompt_dict.get("width", _default_w)
+        height = prompt_dict.get("height", _default_h)
         width = (width // spatial_factor) * spatial_factor
         height = (height // spatial_factor) * spatial_factor
 
-        cache_entry = {"prompt_index": idx}
+        cache_entry = {
+            "prompt_index": idx,
+            "width": width,
+            "height": height,
+            "spatial_factor": spatial_factor,
+        }
 
         image_path = prompt_dict.get("image_path")
         if image_path:
@@ -1605,6 +1623,39 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         type=int,
         default=1,
         help="Spatial downscale factor for references (1=same res, 2=half). Must be >= 1.",
+    )
+    parser.add_argument(
+        "--ltx_version",
+        type=str,
+        default="2.3",
+        choices=["2.0", "2.3"],
+        help="LTX model version (used to resolve sampling-preset geometry for --precache_sample_latents).",
+    )
+    parser.add_argument(
+        "--sample_sampling_preset",
+        "--sampling_preset",
+        type=str,
+        default="defaults",
+        choices=["legacy", "defaults", "ltx20", "ltx23", "ltx23_hq", "distilled_two_stage"],
+        help="Sampling preset used to resolve fallback geometry when sample prompts omit --w/--h.",
+    )
+    parser.add_argument(
+        "--height",
+        type=int,
+        default=512,
+        help="Legacy fallback sample height when sample prompts omit --h and no sample preset is selected.",
+    )
+    parser.add_argument(
+        "--width",
+        type=int,
+        default=768,
+        help="Legacy fallback sample width when sample prompts omit --w and no sample preset is selected.",
+    )
+    parser.add_argument(
+        "--sample_num_frames",
+        type=int,
+        default=45,
+        help="Legacy fallback sample frame count when sample prompts omit --f and no sample preset is selected.",
     )
     return parser
 

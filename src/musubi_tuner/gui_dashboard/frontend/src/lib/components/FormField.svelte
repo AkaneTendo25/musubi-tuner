@@ -1,6 +1,9 @@
 <script>
+	import FieldResetButton from './FieldResetButton.svelte';
+	import { labelFromFieldPath } from '$lib/utils/fieldLabels.js';
+
 	let {
-		label,
+		label = '',
 		value = $bindable(''),
 		type = 'text',
 		placeholder = '',
@@ -11,9 +14,12 @@
 		min = undefined,
 		max = undefined,
 		step = undefined,
+		fieldPath = '',
 		oninput,
 		...rest
 	} = $props();
+
+	let displayLabel = $derived(label || labelFromFieldPath(fieldPath));
 
 	// Handle input to ensure immediate propagation
 	function handleInput(e) {
@@ -24,8 +30,11 @@
 	}
 </script>
 
-<label class="block" data-tooltip={tooltip || undefined}>
-	<span class="text-xs font-medium uppercase tracking-wider" style="color: {invalid ? 'var(--danger)' : 'var(--text-muted)'}; font-family: var(--font-label);">{label}</span>
+<label class="block">
+	<span class="flex items-center gap-1 text-xs font-medium uppercase tracking-wider" style="color: {invalid ? 'var(--danger)' : 'var(--text-muted)'}; font-family: var(--font-label);">
+		<span data-tooltip={tooltip || undefined}>{displayLabel}</span>
+		<FieldResetButton {fieldPath} {disabled} />
+	</span>
 	<input
 		{type}
 		{value}

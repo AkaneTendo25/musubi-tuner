@@ -350,11 +350,10 @@ body {
 /* Tooltip */
 [data-tooltip] { position: relative; }
 [data-tooltip]::after {
-	content: attr(data-tooltip);
-	position: absolute;
-	bottom: calc(100% + 8px);
-	left: 50%;
-	transform: translateX(-50%) translateY(4px);
+	display: none;
+}
+.global-tooltip {
+	position: fixed;
 	padding: 5px 10px;
 	border-radius: var(--radius-sm);
 	font-size: 11px;
@@ -367,14 +366,8 @@ body {
 	color: var(--text-secondary);
 	border: 1px solid var(--border);
 	box-shadow: var(--shadow-md);
-	opacity: 0;
 	pointer-events: none;
-	transition: opacity 0.15s ease, transform 0.15s ease;
-	z-index: 100;
-}
-[data-tooltip]:hover::after {
-	opacity: 1;
-	transform: translateX(-50%) translateY(0);
+	z-index: 10000;
 }
 
 /* Focus */

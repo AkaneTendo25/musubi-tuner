@@ -18,11 +18,11 @@
 	function createEntry() {
 		return {
 			prompt: '',
-			w: 768,
-			h: 512,
-			f: 45,
+			w: 960,
+			h: 544,
+			f: 121,
 			d: 42,
-			s: 20,
+			s: 15,
 			g: 1.0,
 			l: '',
 			fs: 5.0,
@@ -54,11 +54,11 @@
 	function entryToLine(entry) {
 		if (!entry.prompt) return '';
 		let line = entry.prompt;
-		if (entry.w && entry.w !== 768) line += ` --w ${entry.w}`;
-		if (entry.h && entry.h !== 512) line += ` --h ${entry.h}`;
-		if (entry.f && entry.f !== 45) line += ` --f ${entry.f}`;
+		if (entry.w && entry.w !== 960) line += ` --w ${entry.w}`;
+		if (entry.h && entry.h !== 544) line += ` --h ${entry.h}`;
+		if (entry.f && entry.f !== 121) line += ` --f ${entry.f}`;
 		if (entry.d != null && entry.d !== '') line += ` --d ${entry.d}`;
-		if (entry.s && entry.s !== 20) line += ` --s ${entry.s}`;
+		if (entry.s && entry.s !== 15) line += ` --s ${entry.s}`;
 		if (entry.g != null && entry.g !== 1.0) line += ` --g ${entry.g}`;
 		if (entry.l != null && entry.l !== '' && entry.l !== 0) line += ` --l ${entry.l}`;
 		if (entry.fs != null && entry.fs !== 5.0) line += ` --fs ${entry.fs}`;
@@ -79,11 +79,11 @@
 			if (!match) continue;
 			const key = match[1];
 			const value = match[2].replace(/^"(.*)"$/, '$1');
-			if (key === 'w') entry.w = parseInt(value) || 768;
-			else if (key === 'h') entry.h = parseInt(value) || 512;
-			else if (key === 'f') entry.f = parseInt(value) || 45;
+			if (key === 'w') entry.w = parseInt(value) || 960;
+			else if (key === 'h') entry.h = parseInt(value) || 544;
+			else if (key === 'f') entry.f = parseInt(value) || 121;
 			else if (key === 'd') entry.d = parseInt(value);
-			else if (key === 's') entry.s = parseInt(value) || 20;
+			else if (key === 's') entry.s = parseInt(value) || 15;
 			else if (key === 'g') entry.g = parseFloat(value) || 1.0;
 			else if (key === 'l') entry.l = parseFloat(value) || '';
 			else if (key === 'fs') entry.fs = parseFloat(value) || 5.0;

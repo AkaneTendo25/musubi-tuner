@@ -14,7 +14,7 @@ mimetypes.add_type("application/javascript", ".js")
 mimetypes.add_type("text/css", ".css")
 
 from fastapi import FastAPI
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
 import pyarrow.parquet as pq
 
 from musubi_tuner.gui_dashboard.process_manager import ProcessManager
@@ -31,7 +31,7 @@ NO_CACHE_HEADERS = {
 }
 
 
-def create_management_app(project_path: Optional[str] = None) -> FastAPI:
+def create_management_app(project_path: Optional[str] = None, dev_frontend_url: Optional[str] = None) -> FastAPI:
     """Create the management FastAPI application."""
     app = FastAPI(title="LTX-2 Training Manager")
 
@@ -178,6 +178,9 @@ def create_management_app(project_path: Optional[str] = None) -> FastAPI:
                 return Response(status_code=404, headers=NO_CACHE_HEADERS)
             if normalized == "sse" or normalized.startswith("sse/"):
                 return Response(status_code=404, headers=NO_CACHE_HEADERS)
+            if dev_frontend_url:
+                target = f"{dev_frontend_url.rstrip('/')}/{normalized}" if normalized else dev_frontend_url.rstrip("/")
+                return RedirectResponse(target, status_code=307, headers=NO_CACHE_HEADERS)
 
             file_path = os.path.join(FRONTEND_DIST, full_path)
             if full_path and os.path.isfile(file_path):

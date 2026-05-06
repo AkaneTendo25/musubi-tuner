@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import locale
+from pathlib import Path
 from typing import Literal
 
 from fastapi import APIRouter, HTTPException, Query, Request
@@ -15,6 +16,10 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from musubi_tuner.gui_dashboard.management_tools import get_management_status, launch_setup_tool, open_repo_in_file_browser
 
 router = APIRouter(prefix="/api/system", tags=["system"])
+
+_LTX_DOC_BRANCHES = {"ltx-2", "ltx-2-dev"}
+_LTX_DOCS_REPO = "https://github.com/AkaneTendo25/musubi-tuner"
+_LTX_DOCS_FALLBACK_BRANCH = "ltx-2-dev"
 
 
 def _decode_subprocess_output(data: bytes) -> str:
@@ -30,6 +35,9 @@ def _decode_subprocess_output(data: bytes) -> str:
 
 @router.get("/info")
 async def get_system_info():
+    repo_root = _find_repo_root()
+    branch = _get_git_branch(repo_root)
+    docs_branch = branch if branch in _LTX_DOC_BRANCHES else _LTX_DOCS_FALLBACK_BRANCH
     return {
         "cpu": _get_cpu_info(),
         "ram": _get_ram_info(),
@@ -37,6 +45,12 @@ async def get_system_info():
         "disk": _get_disk_info(),
         "os": platform.platform(),
         "python": sys.version.split()[0],
+        "repo": {
+            "root": str(repo_root),
+            "branch": branch,
+            "docs_branch": docs_branch,
+            "docs_url": f"{_LTX_DOCS_REPO}/blob/{docs_branch}/docs/ltx_2.md",
+        },
     }
 
 
@@ -78,10 +92,40 @@ async def open_repo_folder():
 
 
 def _get_cpu_info() -> dict:
-    return {
+    info = {
         "model": platform.processor() or platform.machine() or "Unknown",
         "cores": os.cpu_count() or 0,
     }
+    try:
+        import psutil
+
+        info["utilization"] = psutil.cpu_percent(interval=None)
+    except Exception:
+        pass
+    return info
+
+
+def _find_repo_root() -> Path:
+    start = Path(__file__).resolve()
+    for path in (start.parent, *start.parents):
+        if (path / ".git").exists():
+            return path
+    return Path.cwd()
+
+
+def _get_git_branch(repo_root: Path) -> str:
+    try:
+        result = subprocess.run(
+            ["git", "branch", "--show-current"],
+            cwd=repo_root,
+            capture_output=True,
+            timeout=2,
+        )
+        if result.returncode == 0:
+            return _decode_subprocess_output(result.stdout or b"").strip()
+    except Exception:
+        pass
+    return ""
 
 
 def _get_ram_info() -> dict | None:
@@ -166,6 +210,7 @@ def _get_disk_info() -> dict | None:
             "total_gb": round(usage.total / (1024**3), 1),
             "used_gb": round(usage.used / (1024**3), 1),
             "free_gb": round(usage.free / (1024**3), 1),
+            "percent": round((usage.used / usage.total) * 100, 1) if usage.total > 0 else 0,
         }
     except Exception:
         return None

@@ -17,11 +17,119 @@ from typing import Literal, Optional
 logger = logging.getLogger(__name__)
 
 ProcessType = Literal["cache_latents", "cache_text", "cache_dino", "training", "inference", "slider_training"]
+ProcessRef = tuple[int, float | None]
 
 # Windows-specific flags for clean subprocess shutdown
 _CREATION_FLAGS = 0
 if sys.platform == "win32":
     _CREATION_FLAGS = subprocess.CREATE_NEW_PROCESS_GROUP
+
+_STOP_GRACE_SECONDS = 5
+_TASKKILL_TIMEOUT_SECONDS = 10
+
+
+def _collect_windows_process_tree_refs(pid: int) -> list[ProcessRef]:
+    if sys.platform != "win32":
+        return []
+
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class PROCESSENTRY32W(ctypes.Structure):
+            _fields_ = [
+                ("dwSize", wintypes.DWORD),
+                ("cntUsage", wintypes.DWORD),
+                ("th32ProcessID", wintypes.DWORD),
+                ("th32DefaultHeapID", ctypes.c_size_t),
+                ("th32ModuleID", wintypes.DWORD),
+                ("cntThreads", wintypes.DWORD),
+                ("th32ParentProcessID", wintypes.DWORD),
+                ("pcPriClassBase", ctypes.c_long),
+                ("dwFlags", wintypes.DWORD),
+                ("szExeFile", ctypes.c_wchar * 260),
+            ]
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        create_snapshot = kernel32.CreateToolhelp32Snapshot
+        create_snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+        create_snapshot.restype = wintypes.HANDLE
+        process_first = kernel32.Process32FirstW
+        process_first.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+        process_first.restype = wintypes.BOOL
+        process_next = kernel32.Process32NextW
+        process_next.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+        process_next.restype = wintypes.BOOL
+        close_handle = kernel32.CloseHandle
+        close_handle.argtypes = [wintypes.HANDLE]
+        close_handle.restype = wintypes.BOOL
+
+        snapshot = create_snapshot(0x00000002, 0)
+        if snapshot == wintypes.HANDLE(-1).value:
+            return [(pid, None)]
+
+        children_by_parent: dict[int, list[int]] = {}
+        try:
+            entry = PROCESSENTRY32W()
+            entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+            if not process_first(snapshot, ctypes.byref(entry)):
+                return [(pid, None)]
+
+            while True:
+                child_pid = int(entry.th32ProcessID)
+                parent_pid = int(entry.th32ParentProcessID)
+                children_by_parent.setdefault(parent_pid, []).append(child_pid)
+                if not process_next(snapshot, ctypes.byref(entry)):
+                    break
+        finally:
+            close_handle(snapshot)
+
+        refs: list[ProcessRef] = []
+        seen: set[int] = set()
+        stack = [pid]
+        while stack:
+            current_pid = stack.pop()
+            if current_pid in seen:
+                continue
+            seen.add(current_pid)
+            refs.append((current_pid, None))
+            stack.extend(children_by_parent.get(current_pid, []))
+        return refs
+    except Exception as exc:
+        logger.debug("Could not collect Windows process tree for PID %s: %s", pid, exc)
+        return [(pid, None)]
+
+
+def _windows_pid_exists(pid: int) -> bool:
+    if sys.platform != "win32":
+        return True
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        open_process = kernel32.OpenProcess
+        open_process.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        open_process.restype = wintypes.HANDLE
+        get_exit_code_process = kernel32.GetExitCodeProcess
+        get_exit_code_process.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+        get_exit_code_process.restype = wintypes.BOOL
+        close_handle = kernel32.CloseHandle
+        close_handle.argtypes = [wintypes.HANDLE]
+        close_handle.restype = wintypes.BOOL
+
+        handle = open_process(0x1000, False, int(pid))
+        if not handle:
+            return False
+        try:
+            exit_code = wintypes.DWORD()
+            if not get_exit_code_process(handle, ctypes.byref(exit_code)):
+                return True
+            return int(exit_code.value) == 259
+        finally:
+            close_handle(handle)
+    except Exception:
+        return True
 
 
 def _decode_output(data: bytes) -> str:
@@ -58,6 +166,97 @@ def _progress_signature(line: str) -> tuple[str, str, int] | None:
     return ("progress", label, pct)
 
 
+def _dedupe_process_refs(refs: list[ProcessRef]) -> list[ProcessRef]:
+    result: list[ProcessRef] = []
+    seen: set[int] = set()
+    for pid, create_time in refs:
+        if pid <= 0 or pid in seen or pid == os.getpid():
+            continue
+        seen.add(pid)
+        result.append((pid, create_time))
+    return result
+
+
+def _collect_process_tree_refs(pid: int) -> list[ProcessRef]:
+    """Capture child PIDs before termination can orphan them."""
+    if sys.platform == "win32":
+        return _dedupe_process_refs(_collect_windows_process_tree_refs(pid))
+
+    refs: list[ProcessRef] = []
+    try:
+        import psutil
+
+        parent = psutil.Process(pid)
+        processes = parent.children(recursive=True)
+        processes.append(parent)
+        for process in processes:
+            try:
+                refs.append((int(process.pid), float(process.create_time())))
+            except psutil.NoSuchProcess:
+                continue
+            except psutil.AccessDenied:
+                refs.append((int(process.pid), None))
+    except Exception as exc:
+        logger.debug("Could not collect process tree for PID %s: %s", pid, exc)
+        refs.append((pid, None))
+    return _dedupe_process_refs(refs)
+
+
+def _process_ref_still_matches(ref: ProcessRef) -> bool:
+    pid, create_time = ref
+    if pid <= 0 or pid == os.getpid():
+        return False
+    if create_time is None:
+        if sys.platform == "win32":
+            return _windows_pid_exists(pid)
+        try:
+            import psutil
+
+            return bool(psutil.pid_exists(pid))
+        except ImportError:
+            return True
+        except Exception:
+            return True
+    try:
+        import psutil
+
+        return abs(float(psutil.Process(pid).create_time()) - create_time) < 0.1
+    except ImportError:
+        return True
+    except Exception as exc:
+        if exc.__class__.__name__ == "AccessDenied":
+            return True
+        return False
+
+
+def _kill_process_refs(refs: list[ProcessRef]):
+    for ref in _dedupe_process_refs(refs):
+        if not _process_ref_still_matches(ref):
+            continue
+
+        pid = ref[0]
+        if sys.platform == "win32":
+            try:
+                subprocess.run(
+                    ["taskkill", "/PID", str(pid), "/T", "/F"],
+                    check=False,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=_TASKKILL_TIMEOUT_SECONDS,
+                )
+            except Exception as exc:
+                logger.debug("Could not taskkill PID %s: %s", pid, exc)
+            continue
+
+        try:
+            os.killpg(os.getpgid(pid), signal.SIGKILL)
+        except Exception:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except Exception as exc:
+                logger.debug("Could not kill PID %s: %s", pid, exc)
+
+
 class ProcessState(str, Enum):
     IDLE = "idle"
     RUNNING = "running"
@@ -80,6 +279,7 @@ class ManagedProcess:
         self._reader_thread: Optional[threading.Thread] = None
         self._lock = threading.Lock()
         self._last_progress_signature: tuple[str, str, int] | None = None
+        self._stop_process_refs: list[ProcessRef] = []
 
     def start(self):
         with self._lock:
@@ -91,6 +291,7 @@ class ManagedProcess:
             self.logs.clear()
             self.logs.append(f"$ {' '.join(self.cmd)}\n")
             self._last_progress_signature = None
+            self._stop_process_refs = []
 
             self._proc = subprocess.Popen(
                 self.cmd,
@@ -99,6 +300,7 @@ class ManagedProcess:
                 cwd=self.cwd,
                 env=self.env,
                 creationflags=_CREATION_FLAGS,
+                start_new_session=sys.platform != "win32",
                 bufsize=0,
             )
 
@@ -106,6 +308,20 @@ class ManagedProcess:
                 target=self._read_output, daemon=True
             )
             self._reader_thread.start()
+
+    def _finalize_process_state(self):
+        with self._lock:
+            exit_code = self._proc.returncode if self._proc else -1
+            already_reported = self.state in (ProcessState.FINISHED, ProcessState.ERROR) and self.exit_code == exit_code
+            self.exit_code = exit_code
+            if self.state in (ProcessState.STOPPING, ProcessState.FINISHED):
+                self.state = ProcessState.FINISHED
+            elif self.exit_code == 0:
+                self.state = ProcessState.FINISHED
+            else:
+                self.state = ProcessState.ERROR
+            if not already_reported:
+                self.logs.append(f"\n[Process exited with code {self.exit_code}]\n")
 
     def _read_output(self):
         try:
@@ -133,15 +349,7 @@ class ManagedProcess:
         except Exception as e:
             self.logs.append(f"\n[Process reader error: {e}]\n")
 
-        with self._lock:
-            self.exit_code = self._proc.returncode if self._proc else -1
-            if self.state == ProcessState.STOPPING:
-                self.state = ProcessState.FINISHED
-            elif self.exit_code == 0:
-                self.state = ProcessState.FINISHED
-            else:
-                self.state = ProcessState.ERROR
-            self.logs.append(f"\n[Process exited with code {self.exit_code}]\n")
+        self._finalize_process_state()
 
     def _append_log_line(self, line: str) -> bool:
         signature = _progress_signature(line)
@@ -161,41 +369,57 @@ class ManagedProcess:
 
     def terminate(self):
         with self._lock:
-            if self.state != ProcessState.RUNNING:
+            if self.state == ProcessState.STOPPING:
+                process_refs = list(self._stop_process_refs)
+                self.logs.append("\n[Force stop requested...]\n")
+            elif self.state == ProcessState.RUNNING:
+                self.state = ProcessState.STOPPING
+                self.logs.append("\n[Stopping process...]\n")
+                process_refs = []
+            else:
                 return
-            self.state = ProcessState.STOPPING
-            self.logs.append("\n[Stopping process...]\n")
 
-        if self._proc:
+        if not self._proc:
+            return
+
+        if not process_refs:
+            process_refs = _collect_process_tree_refs(self._proc.pid)
+            with self._lock:
+                self._stop_process_refs = list(process_refs)
+
             if sys.platform == "win32":
                 try:
                     self._proc.send_signal(signal.CTRL_BREAK_EVENT)
                 except Exception:
                     self._proc.terminate()
             else:
-                self._proc.terminate()
-            # Wait up to 10s then force kill
-            t = threading.Thread(target=self._force_kill, daemon=True)
-            t.start()
+                try:
+                    os.killpg(os.getpgid(self._proc.pid), signal.SIGTERM)
+                except Exception:
+                    self._proc.terminate()
 
-    def _force_kill(self):
+        t = threading.Thread(target=self._force_kill, args=(process_refs,), daemon=True)
+        t.start()
+
+    def _force_kill(self, process_refs: list[ProcessRef]):
         if self._proc:
             try:
-                self._proc.wait(timeout=10)
+                self._proc.wait(timeout=_STOP_GRACE_SECONDS)
             except subprocess.TimeoutExpired:
-                self.logs.append("\n[Force killing process...]\n")
-                if sys.platform == "win32":
-                    try:
-                        subprocess.run(
-                            ["taskkill", "/PID", str(self._proc.pid), "/T", "/F"],
-                            check=False,
-                            stdout=subprocess.DEVNULL,
-                            stderr=subprocess.DEVNULL,
-                        )
-                    except Exception:
-                        self._proc.kill()
-                else:
-                    self._proc.kill()
+                self.logs.append("\n[Force killing process tree...]\n")
+                _kill_process_refs(_dedupe_process_refs(process_refs + _collect_process_tree_refs(self._proc.pid)))
+                try:
+                    self._proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    return
+                self._finalize_process_state()
+                return
+
+            orphan_refs = [ref for ref in process_refs if ref[0] != self._proc.pid and _process_ref_still_matches(ref)]
+            if orphan_refs:
+                self.logs.append("\n[Force killing remaining child processes...]\n")
+                _kill_process_refs(orphan_refs)
+                self._finalize_process_state()
 
     def get_status(self) -> dict:
         return {
@@ -223,6 +447,9 @@ class ProcessManager:
                 raise RuntimeError(f"{proc_type} is already running")
 
             env = os.environ.copy()
+            python_bin_dir = os.path.dirname(sys.executable)
+            path_key = "Path" if "Path" in env else "PATH"
+            env[path_key] = python_bin_dir + os.pathsep + env.get(path_key, "")
             # Force UTF-8 stdio for dashboard-launched Python subprocesses so
             # trainer logs with Japanese text do not crash on localized Windows.
             env["PYTHONIOENCODING"] = "utf-8"

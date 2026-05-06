@@ -1,8 +1,10 @@
 <script>
 	import { projectConfig } from '$lib/stores/project.js';
+	import FieldResetButton from './FieldResetButton.svelte';
+	import { labelFromFieldPath } from '$lib/utils/fieldLabels.js';
 
 	let {
-		label,
+		label = '',
 		value = $bindable(''),
 		placeholder = '',
 		tooltip = '',
@@ -16,8 +18,11 @@
 		actionBusyLabel = '',
 		actionDisabled = false,
 		actionTooltip = '',
+		fieldPath = '',
 		onaction
 	} = $props();
+
+	let displayLabel = $derived(label || labelFromFieldPath(fieldPath));
 
 	let showBrowser = $state(false);
 	let browserEntries = $state([]);
@@ -86,8 +91,11 @@
 	}
 </script>
 
-<label class="block" data-tooltip={tooltip || undefined}>
-	<span class="text-xs font-medium uppercase tracking-wider" style="color: {invalid ? 'var(--danger)' : 'var(--text-muted)'}; font-family: var(--font-label);">{label}</span>
+<label class="block">
+	<span class="flex items-center gap-1 text-xs font-medium uppercase tracking-wider" style="color: {invalid ? 'var(--danger)' : 'var(--text-muted)'}; font-family: var(--font-label);">
+		<span data-tooltip={tooltip || undefined}>{displayLabel}</span>
+		<FieldResetButton {fieldPath} {disabled} />
+	</span>
 	<div class="mt-1 flex gap-1.5">
 		<input
 			type="text"

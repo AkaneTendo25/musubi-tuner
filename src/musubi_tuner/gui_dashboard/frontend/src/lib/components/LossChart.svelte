@@ -186,9 +186,9 @@
 	});
 </script>
 
-<div class="bg-gray-900 border border-gray-800 rounded-lg p-4">
+<div class="p-4">
 	<div class="flex items-center justify-between mb-2">
-		<h3 class="text-sm font-medium text-gray-400">Loss</h3>
+		<h3 class="text-sm font-medium" style="color: var(--text-secondary);">Loss</h3>
 	</div>
 	<div bind:this={container} class="w-full h-[350px]"></div>
 </div>

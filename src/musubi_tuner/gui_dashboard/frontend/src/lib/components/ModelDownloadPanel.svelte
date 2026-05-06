@@ -3,6 +3,7 @@
 	import { projectConfig, saveProjectNow } from '$lib/stores/project.js';
 	import {
 		defaultModelDir,
+		describeExactModelScan,
 		effectiveGemmaRoot,
 		effectiveLtx2Checkpoint
 	} from '$lib/utils/modelPaths.js';
@@ -17,7 +18,9 @@
 		getModelDownloadTone,
 		isActiveModelDownload,
 		modelDownloadTooltip,
-		scanCheckpoints,
+		scanCheckpointsWithProgress,
+		cancelCheckpointScan,
+		formatCheckpointScanStatus,
 		startModelDownload
 	} from '$lib/utils/modelDownloads.js';
 	import ModelPathStatus from './ModelPathStatus.svelte';
@@ -33,6 +36,14 @@
 	let gemmaDownloadExists = $state(false);
 	let foundLtxPath = $state('');
 	let foundGemmaPath = $state('');
+	let scanningLtx = $state(false);
+	let scanningGemma = $state(false);
+	let ltxScanMessage = $state('');
+	let ltxScanTone = $state('muted');
+	let gemmaScanMessage = $state('');
+	let gemmaScanTone = $state('muted');
+	let ltxScanJobId = $state('');
+	let gemmaScanJobId = $state('');
 	let downloadJobId = $state('');
 	let downloadState = $state('');
 	let downloadPollTimer = null;
@@ -49,11 +60,15 @@
 
 	onDestroy(() => {
 		if (downloadPollTimer) clearTimeout(downloadPollTimer);
+		if (ltxScanJobId) cancelCheckpointScan(ltxScanJobId).catch(() => {});
+		if (gemmaScanJobId) cancelCheckpointScan(gemmaScanJobId).catch(() => {});
 	});
 
 	let sectionConfig = $derived($projectConfig?.[section] || {});
 	let modelDir = $derived(defaultModelDir(cwd, $projectConfig));
 	let resolvedLtx = $derived(effectiveLtx2Checkpoint(cwd, $projectConfig, sectionConfig.ltx2_checkpoint || ''));
+	let activeGemmaSafetensors = $derived(sectionConfig.gemma_safetensors || $projectConfig?.default_gemma_safetensors || '');
+	let scanTargetGemmaRoot = $derived(effectiveGemmaRoot(cwd, $projectConfig, sectionConfig.gemma_root || '', ''));
 	let resolvedGemma = $derived(
 		effectiveGemmaRoot(
 			cwd,
@@ -64,8 +79,18 @@
 	);
 	let hasActiveDownload = $derived(Boolean(downloadJobId) && ['queued', 'running', 'cancelling'].includes(downloadState));
 
+	function relatedScanTargets() {
+		return {
+			ltx2: resolvedLtx,
+			gemma: scanTargetGemmaRoot,
+			gemma_safetensors: activeGemmaSafetensors
+		};
+	}
+
 	$effect(() => {
 		const path = resolvedLtx;
+		foundLtxPath = '';
+		ltxScanMessage = '';
 		let cancelled = false;
 		checkPathExists(path).then((exists) => { if (!cancelled) ltxDownloadExists = exists; }).catch(() => { if (!cancelled) ltxDownloadExists = false; });
 		return () => { cancelled = true; };
@@ -73,28 +98,98 @@
 
 	$effect(() => {
 		const path = resolvedGemma;
+		foundGemmaPath = '';
+		gemmaScanMessage = '';
 		let cancelled = false;
 		checkPathExists(path).then((exists) => { if (!cancelled) gemmaDownloadExists = exists; }).catch(() => { if (!cancelled) gemmaDownloadExists = false; });
 		return () => { cancelled = true; };
 	});
 
-	$effect(() => {
-		if (!cwd) return;
-		let cancelled = false;
-		scanCheckpoints('ltx2', modelDir).then((results) => {
-			if (!cancelled) foundLtxPath = results.find((p) => p === resolvedLtx) || results[0] || '';
-		}).catch(() => { if (!cancelled) foundLtxPath = ''; });
-		return () => { cancelled = true; };
-	});
+	async function scanLtx() {
+		if (scanningLtx) return;
+		if (!cwd) {
+			ltxScanMessage = 'Working directory not loaded yet';
+			ltxScanTone = 'danger';
+			return;
+		}
+		scanningLtx = true;
+		foundLtxPath = '';
+		ltxScanMessage = '';
+		try {
+			const status = await scanCheckpointsWithProgress('ltx2', modelDir, resolvedLtx, (scanStatus) => {
+				ltxScanJobId = scanStatus.job_id || ltxScanJobId;
+				ltxScanMessage = formatCheckpointScanStatus(scanStatus);
+				ltxScanTone = scanStatus.state === 'failed' ? 'danger' : 'muted';
+			}, relatedScanTargets());
+			if (status.state === 'completed') {
+				const result = describeExactModelScan(status.results || [], resolvedLtx);
+				foundLtxPath = result.match;
+				ltxScanMessage = result.message;
+				ltxScanTone = result.tone;
+			}
+		} catch (e) {
+			foundLtxPath = '';
+			ltxScanMessage = e?.message || 'Scan failed';
+			ltxScanTone = 'danger';
+		} finally {
+			scanningLtx = false;
+			ltxScanJobId = '';
+		}
+	}
 
-	$effect(() => {
-		if (!cwd) return;
-		let cancelled = false;
-		scanCheckpoints('gemma', modelDir).then((results) => {
-			if (!cancelled) foundGemmaPath = results.find((p) => p === resolvedGemma) || results[0] || '';
-		}).catch(() => { if (!cancelled) foundGemmaPath = ''; });
-		return () => { cancelled = true; };
-	});
+	async function scanGemma() {
+		if (scanningGemma) return;
+		if (!cwd) {
+			gemmaScanMessage = 'Working directory not loaded yet';
+			gemmaScanTone = 'danger';
+			return;
+		}
+		scanningGemma = true;
+		foundGemmaPath = '';
+		gemmaScanMessage = '';
+		try {
+			const status = await scanCheckpointsWithProgress('gemma', modelDir, scanTargetGemmaRoot, (scanStatus) => {
+				gemmaScanJobId = scanStatus.job_id || gemmaScanJobId;
+				gemmaScanMessage = formatCheckpointScanStatus(scanStatus);
+				gemmaScanTone = scanStatus.state === 'failed' ? 'danger' : 'muted';
+			}, relatedScanTargets());
+			if (status.state === 'completed') {
+				const result = describeExactModelScan(status.results || [], scanTargetGemmaRoot);
+				foundGemmaPath = result.match;
+				gemmaScanMessage = result.message;
+				gemmaScanTone = result.tone;
+			}
+		} catch (e) {
+			foundGemmaPath = '';
+			gemmaScanMessage = e?.message || 'Scan failed';
+			gemmaScanTone = 'danger';
+		} finally {
+			scanningGemma = false;
+			gemmaScanJobId = '';
+		}
+	}
+
+	async function stopLtxScan() {
+		if (!ltxScanJobId) return;
+		try {
+			const status = await cancelCheckpointScan(ltxScanJobId);
+			ltxScanMessage = formatCheckpointScanStatus(status);
+		} catch (e) {
+			ltxScanMessage = e?.message || 'Cancel failed';
+			ltxScanTone = 'danger';
+		}
+	}
+
+	async function stopGemmaScan() {
+		if (!gemmaScanJobId) return;
+		try {
+			const status = await cancelCheckpointScan(gemmaScanJobId);
+			gemmaScanMessage = formatCheckpointScanStatus(status);
+		} catch (e) {
+			gemmaScanMessage = e?.message || 'Cancel failed';
+			gemmaScanTone = 'danger';
+		}
+	}
 
 	function setStatus(downloadStatus) {
 		status = formatModelDownloadStatus(downloadStatus);
@@ -215,7 +310,7 @@
 				</button>
 			</div>
 			<div class="text-[10px] font-mono break-all" style="color: var(--text-muted);">{resolvedLtx}</div>
-			<ModelPathStatus exists={ltxDownloadExists} foundPath={foundLtxPath} disabled={hasActiveDownload} onusefound={(path) => {
+			<ModelPathStatus exists={ltxDownloadExists} foundPath={foundLtxPath} disabled={hasActiveDownload} scanning={scanningLtx} scanMessage={ltxScanMessage} scanTone={ltxScanTone} onscan={scanLtx} oncancel={stopLtxScan} onusefound={(path) => {
 				projectConfig.update((config) => config ? { ...config, default_ltx2_checkpoint: path, [section]: { ...(config[section] || {}), ltx2_checkpoint: path } } : config);
 				saveProjectNow();
 			}} />
@@ -238,7 +333,7 @@
 				</button>
 			</div>
 			<div class="text-[10px] font-mono break-all" style="color: var(--text-muted);">{resolvedGemma}</div>
-			<ModelPathStatus exists={gemmaDownloadExists} foundPath={foundGemmaPath} disabled={hasActiveDownload} onusefound={(path) => {
+			<ModelPathStatus exists={gemmaDownloadExists} foundPath={foundGemmaPath} disabled={hasActiveDownload} scanning={scanningGemma} scanMessage={gemmaScanMessage} scanTone={gemmaScanTone} onscan={scanGemma} oncancel={stopGemmaScan} onusefound={(path) => {
 				projectConfig.update((config) => config ? { ...config, default_gemma_root: path, default_gemma_safetensors: '', [section]: { ...(config[section] || {}), gemma_root: path, gemma_safetensors: '' } } : config);
 				saveProjectNow();
 			}} />

@@ -196,6 +196,26 @@ def _precache_sample_prompts(
 
     prompt_cache: list[dict] = []
     default_guidance_scale = float(getattr(args, "guidance_scale", 3.0))
+    default_negative_prompt = ""
+    video_cfg_scale = getattr(args, "video_cfg_scale", None)
+    audio_cfg_scale = getattr(args, "audio_cfg_scale", None)
+
+    from musubi_tuner.ltx2_defaults import get_ltx2_sampling_preset
+
+    preset = get_ltx2_sampling_preset(
+        getattr(args, "sample_sampling_preset", "defaults"),
+        ltx_version=str(getattr(args, "ltx_version", "2.3")),
+    )
+    if preset is not None:
+        default_guidance_scale = preset.video_cfg_scale
+        if video_cfg_scale is None:
+            video_cfg_scale = preset.video_cfg_scale
+        if audio_cfg_scale is None:
+            audio_cfg_scale = preset.audio_cfg_scale
+        use_default_negative = getattr(args, "sample_use_default_negative_prompt", None)
+        if use_default_negative is None or bool(use_default_negative):
+            default_negative_prompt = preset.negative_prompt
+
     for prompt_dict in prompts:
         param = prompt_dict.copy()
         prompt_text = param.get("prompt", "")
@@ -217,13 +237,15 @@ def _precache_sample_prompts(
         guidance_scale = param.get("guidance_scale", default_guidance_scale)
         effective_cfg_scale = cfg_scale if cfg_scale is not None else guidance_scale
         try:
-            do_classifier_free_guidance = float(effective_cfg_scale) != 1.0
+            do_classifier_free_guidance = (
+                float(effective_cfg_scale) != 1.0
+                or (video_cfg_scale is not None and float(video_cfg_scale) != 1.0)
+                or (audio_cfg_scale is not None and float(audio_cfg_scale) != 1.0)
+            )
         except (TypeError, ValueError):
             do_classifier_free_guidance = False
 
-        negative_prompt = param.get("negative_prompt")
-        if do_classifier_free_guidance and negative_prompt is None:
-            negative_prompt = ""
+        negative_prompt = param.get("negative_prompt", default_negative_prompt)
 
         if do_classifier_free_guidance or negative_prompt:
             neg_embeds, neg_mask = _encode_prompt_text_ltx2(
@@ -532,6 +554,13 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         help="Caching modality: 'video' (default) for video-only, 'av' for audio+video, 'audio' for audio-only.",
     )
     parser.add_argument(
+        "--ltx_version",
+        type=str,
+        default="2.3",
+        choices=["2.0", "2.3"],
+        help="LTX model version used to resolve sample-prompt preset defaults.",
+    )
+    parser.add_argument(
         "--mixed_precision",
         type=str,
         default="no",
@@ -566,6 +595,38 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
             "For JSONL datasets, cache text embeddings from this metadata field instead of 'caption'. "
             "Use fields such as target_caption for I2V/reference datasets with separate captions."
         ),
+    )
+    parser.add_argument(
+        "--sample_sampling_preset",
+        "--sampling_preset",
+        type=str,
+        default="defaults",
+        choices=["legacy", "defaults", "ltx20", "ltx23", "ltx23_hq", "distilled_two_stage"],
+        help="Sampling preset used to resolve default negative prompts for sample prompt caching.",
+    )
+    parser.add_argument(
+        "--sample_use_default_negative_prompt",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Use the preset default negative prompt when caching sample prompt embeddings.",
+    )
+    parser.add_argument(
+        "--guidance_scale",
+        type=float,
+        default=3.0,
+        help="Fallback guidance scale for deciding whether sample prompt negative embeddings are needed.",
+    )
+    parser.add_argument(
+        "--video_cfg_scale",
+        type=float,
+        default=None,
+        help="Video CFG scale for deciding whether sample prompt negative embeddings are needed.",
+    )
+    parser.add_argument(
+        "--audio_cfg_scale",
+        type=float,
+        default=None,
+        help="Audio CFG scale for deciding whether sample prompt negative embeddings are needed.",
     )
 
     # -- Preservation prompt precaching --

@@ -1,15 +1,20 @@
 <script>
+	import FieldResetButton from './FieldResetButton.svelte';
+	import { labelFromFieldPath } from '$lib/utils/fieldLabels.js';
+
 	let {
-		label,
+		label = '',
 		value = $bindable(''),
 		options = [],
 		placeholder = '',
 		tooltip = '',
 		disabled = false,
+		fieldPath = '',
 		oninput,
 		...rest
 	} = $props();
 
+	let displayLabel = $derived(label || labelFromFieldPath(fieldPath));
 	let isOpen = $state(false);
 	let inputRef = $state(null);
 	let dropdownRef = $state(null);
@@ -63,8 +68,11 @@
 	}
 </script>
 
-<label class="block relative" data-tooltip={tooltip || undefined}>
-	<span class="text-[11px] font-medium uppercase tracking-wider" style="color: var(--text-muted); font-family: var(--font-label);">{label}</span>
+<label class="block relative">
+	<span class="flex items-center gap-1 text-[11px] font-medium uppercase tracking-wider" style="color: var(--text-muted); font-family: var(--font-label);">
+		<span data-tooltip={tooltip || undefined}>{displayLabel}</span>
+		<FieldResetButton {fieldPath} {disabled} />
+	</span>
 
 	<div class="relative">
 		<input

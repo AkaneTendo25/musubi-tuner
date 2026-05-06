@@ -19,11 +19,12 @@ export default defineConfig({
 		}
 	},
 	server: {
+		host: '127.0.0.1',
 		hmr: true,
 		proxy: {
-			'/api': 'http://localhost:7860',
-			'/data': 'http://localhost:7860',
-			'/sse': 'http://localhost:7860'
+			'/api': 'http://127.0.0.1:7860',
+			'/data': 'http://127.0.0.1:7860',
+			'/sse': 'http://127.0.0.1:7860'
 		}
 	}
 });

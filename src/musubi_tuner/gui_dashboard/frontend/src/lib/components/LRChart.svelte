@@ -115,7 +115,7 @@
 	$effect(() => { queueUpdate($lrData); });
 </script>
 
-<div class="bg-gray-900 border border-gray-800 rounded-lg p-4">
-	<h3 class="text-sm font-medium text-gray-400 mb-2">Learning Rate</h3>
+<div class="p-4">
+	<h3 class="text-sm font-medium mb-2" style="color: var(--text-secondary);">Learning Rate</h3>
 	<div bind:this={container} class="w-full h-[200px]"></div>
 </div>

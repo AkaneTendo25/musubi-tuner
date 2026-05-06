@@ -61,14 +61,74 @@ export async function getModelDownloadPresets() {
 	return data.presets || {};
 }
 
-export async function scanCheckpoints(type, extraPaths = '') {
-	const params = new URLSearchParams({ type, extra_paths: extraPaths || '' });
+export async function scanCheckpoints(type, extraPaths = '', targetPath = '') {
+	const params = new URLSearchParams({ type, extra_paths: extraPaths || '', target_path: targetPath || '' });
 	const res = await fetch(`/api/fs/scan-checkpoints?${params}`);
 	const data = await parseJsonOrEmpty(res);
 	if (!res.ok) {
 		throw new Error(formatDownloadError(data.detail || data));
 	}
 	return data.results || [];
+}
+
+export async function startCheckpointScan(type, extraPaths = '', targetPath = '', relatedTargets = {}) {
+	const res = await fetch('/api/fs/scan-checkpoints/start', {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify({ type, extra_paths: extraPaths || '', target_path: targetPath || '', related_targets: relatedTargets || {} })
+	});
+	const data = await parseJsonOrEmpty(res);
+	if (!res.ok) {
+		throw new Error(formatDownloadError(data.detail || data));
+	}
+	return data;
+}
+
+export async function getCheckpointScanStatus(jobId) {
+	const res = await fetch(`/api/fs/scan-checkpoints/${jobId}`);
+	const data = await parseJsonOrEmpty(res);
+	if (!res.ok) {
+		throw new Error(formatDownloadError(data.detail || data));
+	}
+	return data;
+}
+
+export async function cancelCheckpointScan(jobId) {
+	const res = await fetch(`/api/fs/scan-checkpoints/${jobId}/cancel`, { method: 'POST' });
+	const data = await parseJsonOrEmpty(res);
+	if (!res.ok) {
+		throw new Error(formatDownloadError(data.detail || data));
+	}
+	return data;
+}
+
+function sleep(ms) {
+	return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+export async function scanCheckpointsWithProgress(type, extraPaths = '', targetPath = '', onStatus = () => {}, relatedTargets = {}) {
+	if (typeof targetPath === 'function') {
+		onStatus = targetPath;
+		targetPath = '';
+	}
+	let status = await startCheckpointScan(type, extraPaths, targetPath, relatedTargets);
+	onStatus(status);
+	while (['queued', 'running', 'cancelling'].includes(status.state || '')) {
+		await sleep(1000);
+		status = await getCheckpointScanStatus(status.job_id);
+		onStatus(status);
+	}
+	return status;
+}
+
+export function formatCheckpointScanStatus(status) {
+	if (!status) return '';
+	if (status.state === 'queued') return 'Search queued';
+	if (status.state === 'running') return status.current_path ? `Searching: ${status.current_path}` : 'Searching...';
+	if (status.state === 'cancelling') return status.current_path ? `Stopping: ${status.current_path}` : 'Stopping search...';
+	if (status.state === 'cancelled') return 'Search stopped';
+	if (status.state === 'failed') return status.error || 'Search failed';
+	return '';
 }
 
 export async function checkPathExists(path) {

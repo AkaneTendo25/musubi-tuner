@@ -70,11 +70,6 @@ def _validate_process_or_raise(proc_type: str, config) -> dict:
     return report
 
 
-def _training_is_resume(config: ProjectConfig) -> bool:
-    t = config.training
-    return bool(t.resume or t.autoresume or t.resume_from_huggingface)
-
-
 def _get_training_run_dir(config: ProjectConfig) -> Optional[Path]:
     if not config.project_dir:
         return None
@@ -84,6 +79,24 @@ def _get_training_run_dir(config: ProjectConfig) -> Optional[Path]:
     if not run_dir.is_absolute():
         run_dir = Path(config.project_dir) / run_dir
     return run_dir
+
+
+def _has_local_autoresume_state(config: ProjectConfig) -> bool:
+    run_dir = _get_training_run_dir(config)
+    if run_dir is None or not run_dir.is_dir():
+        return False
+
+    for path in run_dir.iterdir():
+        if path.is_dir() and path.name.endswith("-state") and (path / "scheduler.bin").exists():
+            return True
+    return False
+
+
+def _training_is_resume(config: ProjectConfig) -> bool:
+    t = config.training
+    if t.resume or t.resume_from_huggingface:
+        return True
+    return bool(t.autoresume and _has_local_autoresume_state(config))
 
 
 def _clear_training_dashboard_files(config: ProjectConfig) -> None:

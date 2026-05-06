@@ -121,6 +121,10 @@ class CachingConfig(BaseModel):
     cache_before_connector: bool = False
     # Dataset manifest
     save_dataset_manifest: str = ""
+    # Raw CLI passthroughs, scoped to the individual cache commands.
+    cache_latents_extra_args: str = ""
+    cache_text_extra_args: str = ""
+    cache_dino_extra_args: str = ""
 
 
 class TrainingConfig(BaseModel):
@@ -128,6 +132,8 @@ class TrainingConfig(BaseModel):
     ltx2_checkpoint: str = ""
     gemma_root: str = ""
     gemma_safetensors: str = ""
+    config_file: str = ""
+    dataset_config: str = ""
     ltx2_mode: Literal["video", "av", "audio"] = "video"
     ltx_version: Literal["2.0", "2.3"] = "2.3"
     ltx_version_check_mode: Literal["off", "warn", "error"] = "warn"
@@ -135,14 +141,17 @@ class TrainingConfig(BaseModel):
     fp8_scaled: bool = False
     fp8_keep_blocks: str = ""
     flash_attn: bool = False
+    flash3: bool = False
     sdpa: bool = False
     sage_attn: bool = False
     xformers: bool = False
     gemma_load_in_8bit: bool = False
     gemma_load_in_4bit: bool = False
+    gemma_bnb_4bit_quant_type: Literal["nf4", "fp4"] = "nf4"
     gemma_bnb_4bit_disable_double_quant: bool = False
     gemma_fp8_weight_offload: bool = True
     ltx2_audio_only_model: bool = False
+    vae_dtype: Optional[str] = None
 
     # Quantization
     nf4_base: bool = False
@@ -215,6 +224,7 @@ class TrainingConfig(BaseModel):
     max_grad_norm: float = 1.0
     audio_lr: Optional[float] = None
     lr_args: str = ""
+    lr_group_warmup_args: str = ""
     audio_dim: Optional[int] = None
     audio_alpha: Optional[float] = None
 
@@ -238,13 +248,20 @@ class TrainingConfig(BaseModel):
     shifted_logit_eps: float = 1e-3
     shifted_logit_uniform_prob: float = 0.1
     shifted_logit_shift: Optional[float] = None
+    shifted_logit_clamp_auto_shift: bool = False
+    shifted_logit_min_shift: float = 0.95
+    shifted_logit_max_shift: float = 2.05
     preserve_distribution_shape: bool = False
     num_timestep_buckets: Optional[int] = None
+    show_timesteps: Optional[Literal["image", "console"]] = None
+    log_timestep_distribution_tensorboard: bool = True
+    log_timestep_distribution_interval: int = 100
 
     # Memory
     blocks_to_swap: Optional[int] = None
     gradient_checkpointing: bool = False
     gradient_checkpointing_cpu_offload: bool = False
+    split_attn: bool = False
     split_attn_target: Optional[str] = None
     split_attn_mode: Optional[str] = None
     split_attn_chunk_size: Optional[int] = None
@@ -262,24 +279,34 @@ class TrainingConfig(BaseModel):
     compile: bool = False
     compile_backend: str = "inductor"
     compile_mode: str = "default"
-    compile_dynamic: bool = False
+    compile_dynamic: bool | str | None = False
     compile_fullgraph: bool = False
     compile_cache_size_limit: Optional[int] = None
+    dynamo_backend: str = "NO"
+    dynamo_mode: Optional[Literal["default", "reduce-overhead", "max-autotune"]] = None
+    dynamo_fullgraph: bool = False
+    dynamo_dynamic: bool = False
 
     # CUDA
     cuda_allow_tf32: bool = False
     cuda_cudnn_benchmark: bool = False
     cuda_memory_fraction: Optional[float] = None
+    disable_numpy_memmap: bool = False
+    ddp_timeout: Optional[int] = None
+    ddp_gradient_as_bucket_view: bool = False
+    ddp_static_graph: bool = False
 
     # Sampling
     sample_every_n_steps: Optional[int] = None
     sample_every_n_epochs: Optional[int] = None
     sample_prompts: str = ""
     sample_prompts_text: str = ""
+    precache_sample_prompts: bool = False
     use_precached_sample_prompts: bool = False
     sample_prompts_cache: str = ""
     use_precached_sample_latents: bool = False
     sample_latents_cache: str = ""
+    caption_field: str = ""
     sample_sampling_preset: SamplingPreset = "defaults"
     sample_sigma_schedule: SampleSigmaSchedule = "auto"
     sample_sampler: SampleSampler = "auto"
@@ -291,6 +318,10 @@ class TrainingConfig(BaseModel):
     audio_cfg_scale: Optional[float] = None
     video_modality_scale: Optional[float] = None
     audio_modality_scale: Optional[float] = None
+    stg_scale: Optional[float] = None
+    stg_blocks: str = ""
+    stg_mode: Optional[Literal["video", "audio", "both"]] = None
+    rescale_scale: Optional[float] = None
     video_rescale_scale: Optional[float] = None
     audio_rescale_scale: Optional[float] = None
     sample_with_offloading: bool = False
@@ -338,6 +369,8 @@ class TrainingConfig(BaseModel):
     logging_dir: str = ""
     log_prefix: str = ""
     log_tracker_name: str = ""
+    log_tracker_config: str = ""
+    log_config: bool = False
     wandb_run_name: str = ""
     wandb_api_key: str = ""
     log_cuda_memory_every_n_steps: Optional[int] = None
@@ -356,6 +389,8 @@ class TrainingConfig(BaseModel):
     metadata_description: str = ""
     metadata_license: str = ""
     metadata_tags: str = ""
+    metadata_reso: str = ""
+    metadata_arch: str = ""
 
     # HuggingFace upload
     huggingface_repo_id: str = ""
@@ -372,23 +407,29 @@ class TrainingConfig(BaseModel):
 
     # Preservation
     blank_preservation: bool = False
+    blank_preservation_args: str = ""
     blank_preservation_multiplier: float = 1.0
     dop: bool = False
+    dop_args: str = ""
     dop_class: str = ""
     dop_multiplier: float = 1.0
     prior_divergence: bool = False
+    prior_divergence_args: str = ""
     prior_divergence_multiplier: float = 0.1
     use_precached_preservation: bool = False
     preservation_prompts_cache: str = ""
 
     # TARP / DCR (arXiv:2603.18600)
     tarp: bool = False
+    tarp_args: str = ""
     tarp_window_multiplier: int = 3
     dcr: bool = False
+    dcr_args: str = ""
     dcr_reference_detach: bool = True
 
     # Audio Metrics
     audio_metrics: bool = False
+    audio_metrics_args: str = ""
     audio_metrics_mel_metrics: bool = False
     audio_metrics_mel_compute_every: int = 100
     audio_metrics_clap_similarity: bool = False
@@ -396,6 +437,7 @@ class TrainingConfig(BaseModel):
 
     # CREPA
     crepa: bool = False
+    crepa_args: str = ""
     crepa_mode: Literal["backbone", "dino"] = "backbone"
     crepa_student_block_idx: int = 16
     crepa_teacher_block_idx: int = 32
@@ -409,6 +451,7 @@ class TrainingConfig(BaseModel):
 
     # Self-Flow
     self_flow: bool = False
+    self_flow_args: str = ""
     self_flow_teacher_mode: Literal["base", "ema", "partial_ema"] = "base"
     self_flow_student_block_idx: int = 16
     self_flow_teacher_block_idx: int = 32
@@ -443,6 +486,7 @@ class TrainingConfig(BaseModel):
 
     # HFATO (ViBe - High-Frequency Awareness Training Objective)
     hfato: bool = False
+    hfato_args: str = ""
     hfato_scale_factor: float = 0.5
     hfato_interpolation: Literal["bilinear", "nearest", "bicubic"] = "bilinear"
     hfato_probability: float = 1.0
@@ -467,6 +511,7 @@ class TrainingConfig(BaseModel):
     audio_supervision_check_interval: int = 50
     audio_supervision_min_ratio: float = 0.9
     audio_dop: bool = False
+    audio_dop_args: str = ""
     audio_dop_multiplier: float = 0.5
     audio_bucket_strategy: Optional[str] = None
     audio_bucket_interval: Optional[float] = None
@@ -486,9 +531,11 @@ class TrainingConfig(BaseModel):
 
     # Misc
     separate_audio_buckets: bool = False
-    max_data_loader_n_workers: int = 8
+    max_data_loader_n_workers: Optional[int] = None
     persistent_data_loader_workers: bool = False
     ltx2_first_frame_conditioning_p: float = 0.1
+    accelerate_extra_args: str = ""
+    extra_args: str = ""
 
 
 
@@ -594,6 +641,7 @@ class InferenceConfig(BaseModel):
     sample_prompts_cache: str = ""
     use_precached_sample_latents: bool = False
     sample_latents_cache: str = ""
+    extra_args: str = ""
 
 
 class SliderTargetConfig(BaseModel):
@@ -629,6 +677,8 @@ class SliderConfig(BaseModel):
     # Slider-specific overrides (empty = inherit from training config)
     max_train_steps: int = 500
     output_name: str = "ltx2_slider"
+    accelerate_extra_args: str = ""
+    extra_args: str = ""
 
 
 class ProjectConfig(BaseModel):

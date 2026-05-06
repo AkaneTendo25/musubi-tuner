@@ -113,10 +113,51 @@ def _append_optional(cmd: list[str], flag: str, value) -> None:
         cmd += [flag, str(value)]
 
 
+def _accelerate_executable() -> str:
+    executable_name = "accelerate.exe" if sys.platform == "win32" else "accelerate"
+    executable = Path(sys.executable).parent / executable_name
+    if executable.exists():
+        return str(executable)
+    repo_venv_executable = Path(__file__).resolve().parents[3] / "venv" / ("Scripts" if sys.platform == "win32" else "bin") / executable_name
+    if repo_venv_executable.exists():
+        return str(repo_venv_executable)
+    return "accelerate"
+
+
+def _accelerate_launch_prefix(mixed_precision: str, extra_args: str) -> list[str]:
+    extra = _split_cli_args(extra_args)
+    cmd = [
+        _accelerate_executable(), "launch",
+        *extra,
+        "--mixed_precision", mixed_precision,
+    ]
+    return cmd
+
+
+def _ltx2_timestep_sampling(value: str) -> str:
+    return "shifted_logit_normal" if value in ("", "sigma") else value
+
+
+def _append_key_value_args(args_parts: list[str], raw: str) -> None:
+    args_parts.extend(_split_cli_args(raw))
+
+
+def _compile_dynamic_value(value) -> str | None:
+    if value in (None, False, ""):
+        return None
+    if value is True:
+        return "true"
+    normalized = str(value).lower()
+    if normalized in {"true", "false", "auto"}:
+        return normalized
+    return None
+
+
 def build_cache_latents_cmd(config: ProjectConfig) -> list[str]:
     """Build CLI args for ltx2_cache_latents.py."""
     toml_path = export_dataset_toml(config)
     c = config.caching
+    t = config.training
     ltx2_checkpoint = _effective_ltx2_checkpoint(config, c.ltx2_checkpoint)
     sample_prompts = _effective_caching_sample_prompts(config)
 
@@ -180,6 +221,11 @@ def build_cache_latents_cmd(config: ProjectConfig) -> list[str]:
     if c.precache_sample_latents and sample_prompts:
         cmd.append("--precache_sample_latents")
         cmd += ["--sample_prompts", sample_prompts]
+        cmd += ["--ltx_version", t.ltx_version]
+        cmd += ["--sample_sampling_preset", t.sample_sampling_preset]
+        _append_optional(cmd, "--height", t.height)
+        _append_optional(cmd, "--width", t.width)
+        _append_optional(cmd, "--sample_num_frames", t.sample_num_frames)
         if c.sample_latents_cache:
             cmd += ["--sample_latents_cache", c.sample_latents_cache]
 
@@ -188,6 +234,7 @@ def build_cache_latents_cmd(config: ProjectConfig) -> list[str]:
     if c.save_dataset_manifest:
         cmd += ["--save_dataset_manifest", c.save_dataset_manifest]
 
+    cmd += _split_cli_args(c.cache_latents_extra_args)
     return cmd
 
 
@@ -195,6 +242,7 @@ def build_cache_text_cmd(config: ProjectConfig) -> list[str]:
     """Build CLI args for ltx2_cache_text_encoder_outputs.py."""
     toml_path = export_dataset_toml(config)
     c = config.caching
+    t = config.training
     ltx2_checkpoint = _effective_ltx2_checkpoint(config, c.ltx2_checkpoint)
     gemma_safetensors = _effective_gemma_safetensors(config, c.gemma_safetensors)
     gemma_root = _effective_gemma_root(config, c.gemma_root, gemma_safetensors)
@@ -241,6 +289,15 @@ def build_cache_text_cmd(config: ProjectConfig) -> list[str]:
     if c.precache_sample_prompts and sample_prompts:
         cmd.append("--precache_sample_prompts")
         cmd += ["--sample_prompts", sample_prompts]
+        cmd += ["--ltx_version", t.ltx_version]
+        cmd += ["--sample_sampling_preset", t.sample_sampling_preset]
+        if t.sample_use_default_negative_prompt is True:
+            cmd.append("--sample_use_default_negative_prompt")
+        elif t.sample_use_default_negative_prompt is False:
+            cmd.append("--no-sample_use_default_negative_prompt")
+        _append_optional(cmd, "--guidance_scale", t.guidance_scale)
+        _append_optional(cmd, "--video_cfg_scale", t.video_cfg_scale)
+        _append_optional(cmd, "--audio_cfg_scale", t.audio_cfg_scale)
         if c.sample_prompts_cache:
             cmd += ["--sample_prompts_cache", c.sample_prompts_cache]
     if c.precache_preservation_prompts:
@@ -257,6 +314,7 @@ def build_cache_text_cmd(config: ProjectConfig) -> list[str]:
     if c.cache_before_connector:
         cmd.append("--cache_before_connector")
 
+    cmd += _split_cli_args(c.cache_text_extra_args)
     return cmd
 
 
@@ -488,6 +546,7 @@ def build_inference_cmd(config: ProjectConfig) -> list[str]:
     if s.output_name:
         cmd += ["--output_name", s.output_name]
 
+    cmd += _split_cli_args(s.extra_args)
     return cmd
 
 
@@ -511,18 +570,18 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
     _append_network_arg(network_args_parts, "adaptive_rank_quantile", t.adaptive_rank_quantile)
     _append_network_arg(network_args_parts, "adaptive_rank_weight", t.adaptive_rank_weight)
 
-    # Use accelerate launch
-    cmd = [
-        sys.executable, "-u", "-m", "accelerate.commands.launch",
-        "--mixed_precision", t.mixed_precision,
-        "--num_processes", "1",
-        "--num_machines", "1",
-        _find_script("ltx2_train_network.py"),
-    ]
+    # Use accelerate launch. The Python module form is equivalent to the
+    # console script and avoids PATH issues with Windows virtualenvs.
+    cmd = _accelerate_launch_prefix(t.mixed_precision, t.accelerate_extra_args)
+    cmd.append(_find_script("ltx2_train_network.py"))
 
     # Dataset
+    if t.config_file:
+        cmd += ["--config_file", t.config_file]
     if t.dataset_manifest:
         cmd += ["--dataset_manifest", t.dataset_manifest]
+    elif t.dataset_config:
+        cmd += ["--dataset_config", t.dataset_config]
     else:
         cmd += ["--dataset_config", str(toml_path)]
 
@@ -537,6 +596,8 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
         cmd += ["--ltx_version", t.ltx_version]
     if t.ltx_version_check_mode != "warn":
         cmd += ["--ltx_version_check_mode", t.ltx_version_check_mode]
+    if t.vae_dtype:
+        cmd += ["--vae_dtype", t.vae_dtype]
     if t.fp8_base:
         cmd.append("--fp8_base")
     if t.fp8_scaled:
@@ -545,6 +606,8 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
         cmd += ["--fp8_keep_blocks", t.fp8_keep_blocks]
     if t.flash_attn:
         cmd.append("--flash_attn")
+    if t.flash3:
+        cmd.append("--flash3")
     if t.sdpa:
         cmd.append("--sdpa")
     if t.sage_attn:
@@ -555,6 +618,8 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
         cmd.append("--gemma_load_in_8bit")
     if t.gemma_load_in_4bit:
         cmd.append("--gemma_load_in_4bit")
+        if t.gemma_bnb_4bit_quant_type != "nf4":
+            cmd += ["--gemma_bnb_4bit_quant_type", t.gemma_bnb_4bit_quant_type]
     if t.gemma_bnb_4bit_disable_double_quant:
         cmd.append("--gemma_bnb_4bit_disable_double_quant")
     if t.gemma_fp8_weight_offload:
@@ -622,7 +687,7 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
     if t.audio_caption_dropout_rate > 0:
         cmd += ["--audio_caption_dropout_rate", str(t.audio_caption_dropout_rate)]
     if not t.save_original_lora:
-        cmd.append("--no-save_original_lora")
+        cmd.append("--no_save_original_lora")
     if t.ic_lora_strategy != "auto":
         cmd += ["--ic_lora_strategy", t.ic_lora_strategy]
     if t.av_cross_attention_mode != "both":
@@ -673,6 +738,8 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
         cmd += ["--audio_lr", str(t.audio_lr)]
     if t.lr_args:
         cmd += ["--lr_args"] + _split_cli_args(t.lr_args)
+    if t.lr_group_warmup_args:
+        cmd += ["--lr_group_warmup_args"] + _split_cli_args(t.lr_group_warmup_args)
     if t.audio_dim is not None:
         cmd += ["--audio_dim", str(t.audio_dim)]
     if t.audio_alpha is not None:
@@ -683,7 +750,7 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
         cmd += ["--max_train_epochs", str(t.max_train_epochs)]
     else:
         cmd += ["--max_train_steps", str(t.max_train_steps)]
-    cmd += ["--timestep_sampling", t.timestep_sampling]
+    cmd += ["--timestep_sampling", _ltx2_timestep_sampling(t.timestep_sampling)]
     cmd += ["--discrete_flow_shift", str(t.discrete_flow_shift)]
     cmd += ["--weighting_scheme", t.weighting_scheme]
     if t.seed is not None:
@@ -712,10 +779,24 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
         cmd += ["--shifted_logit_uniform_prob", str(t.shifted_logit_uniform_prob)]
     if t.shifted_logit_shift is not None:
         cmd += ["--shifted_logit_shift", str(t.shifted_logit_shift)]
+    if t.shifted_logit_clamp_auto_shift:
+        cmd.append("--shifted_logit_clamp_auto_shift")
+    if t.shifted_logit_min_shift != 0.95:
+        cmd += ["--shifted_logit_min_shift", str(t.shifted_logit_min_shift)]
+    if t.shifted_logit_max_shift != 2.05:
+        cmd += ["--shifted_logit_max_shift", str(t.shifted_logit_max_shift)]
     if t.preserve_distribution_shape:
         cmd.append("--preserve_distribution_shape")
     if t.num_timestep_buckets is not None:
         cmd += ["--num_timestep_buckets", str(t.num_timestep_buckets)]
+    if t.show_timesteps:
+        cmd += ["--show_timesteps", t.show_timesteps]
+    if not t.log_timestep_distribution_tensorboard:
+        cmd.append("--disable_timestep_distribution_tensorboard")
+    elif t.log_timestep_distribution_tensorboard:
+        cmd.append("--log_timestep_distribution_tensorboard")
+    if t.log_timestep_distribution_interval != 100:
+        cmd += ["--log_timestep_distribution_interval", str(t.log_timestep_distribution_interval)]
 
     # Memory
     if t.blocks_to_swap is not None:
@@ -724,6 +805,8 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
         cmd.append("--gradient_checkpointing")
     if t.gradient_checkpointing_cpu_offload:
         cmd.append("--gradient_checkpointing_cpu_offload")
+    if t.split_attn:
+        cmd.append("--split_attn")
     if t.split_attn_target:
         cmd += ["--split_attn_target", t.split_attn_target]
     if t.split_attn_mode:
@@ -754,12 +837,21 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
             cmd += ["--compile_backend", t.compile_backend]
         if t.compile_mode:
             cmd += ["--compile_mode", t.compile_mode]
-        if t.compile_dynamic:
-            cmd.append("--compile_dynamic")
+        compile_dynamic = _compile_dynamic_value(t.compile_dynamic)
+        if compile_dynamic:
+            cmd += ["--compile_dynamic", compile_dynamic]
         if t.compile_fullgraph:
             cmd.append("--compile_fullgraph")
         if t.compile_cache_size_limit is not None:
             cmd += ["--compile_cache_size_limit", str(t.compile_cache_size_limit)]
+    if t.dynamo_backend != "NO":
+        cmd += ["--dynamo_backend", t.dynamo_backend]
+        if t.dynamo_mode:
+            cmd += ["--dynamo_mode", t.dynamo_mode]
+        if t.dynamo_fullgraph:
+            cmd.append("--dynamo_fullgraph")
+        if t.dynamo_dynamic:
+            cmd.append("--dynamo_dynamic")
 
     # CUDA
     if t.cuda_allow_tf32:
@@ -768,6 +860,14 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
         cmd.append("--cuda_cudnn_benchmark")
     if t.cuda_memory_fraction is not None:
         cmd += ["--cuda_memory_fraction", str(t.cuda_memory_fraction)]
+    if t.disable_numpy_memmap:
+        cmd.append("--disable_numpy_memmap")
+    if t.ddp_timeout is not None:
+        cmd += ["--ddp_timeout", str(t.ddp_timeout)]
+    if t.ddp_gradient_as_bucket_view:
+        cmd.append("--ddp_gradient_as_bucket_view")
+    if t.ddp_static_graph:
+        cmd.append("--ddp_static_graph")
 
     # Sampling
     if t.sample_every_n_steps:
@@ -776,10 +876,14 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
         cmd += ["--sample_every_n_epochs", str(t.sample_every_n_epochs)]
     if sample_prompts:
         cmd += ["--sample_prompts", sample_prompts]
+    if t.precache_sample_prompts:
+        cmd.append("--precache_sample_prompts")
     if t.use_precached_sample_prompts:
         cmd.append("--use_precached_sample_prompts")
     if t.sample_prompts_cache:
         cmd += ["--sample_prompts_cache", t.sample_prompts_cache]
+    if t.caption_field:
+        cmd += ["--caption_field", t.caption_field]
     if t.use_precached_sample_latents:
         cmd.append("--use_precached_sample_latents")
     if t.sample_latents_cache:
@@ -800,6 +904,12 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
     _append_optional(cmd, "--audio_cfg_scale", t.audio_cfg_scale)
     _append_optional(cmd, "--video_modality_scale", t.video_modality_scale)
     _append_optional(cmd, "--audio_modality_scale", t.audio_modality_scale)
+    _append_optional(cmd, "--stg_scale", t.stg_scale)
+    if t.stg_blocks:
+        cmd += ["--stg_blocks"] + _split_cli_args(t.stg_blocks)
+    if t.stg_mode:
+        cmd += ["--stg_mode", t.stg_mode]
+    _append_optional(cmd, "--rescale_scale", t.rescale_scale)
     _append_optional(cmd, "--video_rescale_scale", t.video_rescale_scale)
     _append_optional(cmd, "--audio_rescale_scale", t.audio_rescale_scale)
     if t.sample_with_offloading:
@@ -887,12 +997,16 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
         cmd.append("--no_convert_to_comfy")
     if t.log_with:
         cmd += ["--log_with", t.log_with]
-    if t.logging_dir:
+    if t.log_with and t.logging_dir:
         cmd += ["--logging_dir", t.logging_dir]
     if t.log_prefix:
         cmd += ["--log_prefix", t.log_prefix]
     if t.log_tracker_name:
         cmd += ["--log_tracker_name", t.log_tracker_name]
+    if t.log_tracker_config:
+        cmd += ["--log_tracker_config", t.log_tracker_config]
+    if t.log_config:
+        cmd.append("--log_config")
     if t.wandb_run_name:
         cmd += ["--wandb_run_name", t.wandb_run_name]
     if t.wandb_api_key:
@@ -927,6 +1041,10 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
         cmd += ["--metadata_license", t.metadata_license]
     if t.metadata_tags:
         cmd += ["--metadata_tags", t.metadata_tags]
+    if t.metadata_reso:
+        cmd += ["--metadata_reso", t.metadata_reso]
+    if t.metadata_arch:
+        cmd += ["--metadata_arch", t.metadata_arch]
 
     # HuggingFace upload
     if t.huggingface_repo_id:
@@ -950,6 +1068,7 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
     if t.crepa:
         cmd.append("--crepa")
         args_parts = []
+        _append_key_value_args(args_parts, t.crepa_args)
         if t.crepa_mode != "backbone":
             args_parts.append(f"mode={t.crepa_mode}")
         if t.crepa_student_block_idx != 16:
@@ -977,6 +1096,7 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
     if t.self_flow:
         cmd.append("--self_flow")
         args_parts = []
+        _append_key_value_args(args_parts, t.self_flow_args)
         if t.self_flow_teacher_mode != "base":
             args_parts.append(f"teacher_mode={t.self_flow_teacher_mode}")
         if t.self_flow_student_block_idx != 16:
@@ -1046,6 +1166,7 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
     if t.hfato:
         cmd.append("--hfato")
         args_parts = []
+        _append_key_value_args(args_parts, t.hfato_args)
         if t.hfato_scale_factor != 0.5:
             args_parts.append(f"scale_factor={t.hfato_scale_factor}")
         if t.hfato_interpolation != "bilinear":
@@ -1059,6 +1180,7 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
     if t.blank_preservation:
         cmd.append("--blank_preservation")
         args_parts = []
+        _append_key_value_args(args_parts, t.blank_preservation_args)
         if t.blank_preservation_multiplier != 1.0:
             args_parts.append(f"multiplier={t.blank_preservation_multiplier}")
         if args_parts:
@@ -1066,6 +1188,7 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
     if t.dop:
         cmd.append("--dop")
         args_parts = []
+        _append_key_value_args(args_parts, t.dop_args)
         if t.dop_class:
             args_parts.append(f"class={t.dop_class}")
         if t.dop_multiplier != 1.0:
@@ -1075,6 +1198,7 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
     if t.prior_divergence:
         cmd.append("--prior_divergence")
         args_parts = []
+        _append_key_value_args(args_parts, t.prior_divergence_args)
         if t.prior_divergence_multiplier != 0.1:
             args_parts.append(f"multiplier={t.prior_divergence_multiplier}")
         if args_parts:
@@ -1087,17 +1211,26 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
     # TARP / DCR
     if t.tarp:
         cmd.append("--tarp")
+        args_parts = []
+        _append_key_value_args(args_parts, t.tarp_args)
         if t.tarp_window_multiplier != 3:
-            cmd += ["--tarp_args", f"window_multiplier={t.tarp_window_multiplier}"]
+            args_parts.append(f"window_multiplier={t.tarp_window_multiplier}")
+        if args_parts:
+            cmd += ["--tarp_args"] + args_parts
     if t.dcr:
         cmd.append("--dcr")
+        args_parts = []
+        _append_key_value_args(args_parts, t.dcr_args)
         if not t.dcr_reference_detach:
-            cmd += ["--dcr_args", "reference_detach=false"]
+            args_parts.append("reference_detach=false")
+        if args_parts:
+            cmd += ["--dcr_args"] + args_parts
 
     # Audio Metrics
     if t.audio_metrics:
         cmd.append("--audio_metrics")
         args_parts = []
+        _append_key_value_args(args_parts, t.audio_metrics_args)
         if t.audio_metrics_mel_metrics:
             args_parts.append("mel_metrics=true")
             if t.audio_metrics_mel_compute_every != 100:
@@ -1151,8 +1284,12 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
             cmd += ["--audio_supervision_min_ratio", str(t.audio_supervision_min_ratio)]
     if t.audio_dop:
         cmd.append("--audio_dop")
+        args_parts = []
+        _append_key_value_args(args_parts, t.audio_dop_args)
         if t.audio_dop_multiplier != 0.5:
-            cmd += ["--audio_dop_args", f"multiplier={t.audio_dop_multiplier}"]
+            args_parts.append(f"multiplier={t.audio_dop_multiplier}")
+        if args_parts:
+            cmd += ["--audio_dop_args"] + args_parts
     if t.audio_bucket_strategy:
         cmd += ["--audio_bucket_strategy", t.audio_bucket_strategy]
     if t.audio_bucket_interval is not None:
@@ -1185,11 +1322,13 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
     # Misc
     if t.separate_audio_buckets:
         cmd.append("--separate_audio_buckets")
-    cmd += ["--max_data_loader_n_workers", str(t.max_data_loader_n_workers)]
+    if t.max_data_loader_n_workers is not None:
+        cmd += ["--max_data_loader_n_workers", str(t.max_data_loader_n_workers)]
     if t.persistent_data_loader_workers:
         cmd.append("--persistent_data_loader_workers")
     cmd += ["--ltx2_first_frame_conditioning_p", str(t.ltx2_first_frame_conditioning_p)]
 
+    cmd += _split_cli_args(t.extra_args)
     return cmd
 
 
@@ -1207,13 +1346,8 @@ def build_slider_training_cmd(config: ProjectConfig) -> list[str]:
     gemma_safetensors = _effective_gemma_safetensors(config, t.gemma_safetensors)
     gemma_root = _effective_gemma_root(config, t.gemma_root, gemma_safetensors)
 
-    cmd = [
-        sys.executable, "-u", "-m", "accelerate.commands.launch",
-        "--mixed_precision", t.mixed_precision,
-        "--num_processes", "1",
-        "--num_machines", "1",
-        _find_script("ltx2_train_slider.py"),
-    ]
+    cmd = _accelerate_launch_prefix(t.mixed_precision, s.accelerate_extra_args)
+    cmd.append(_find_script("ltx2_train_slider.py"))
 
     # Slider config
     cmd += ["--slider_config", str(slider_toml)]
@@ -1291,6 +1425,7 @@ def build_slider_training_cmd(config: ProjectConfig) -> list[str]:
     if t.save_every_n_steps:
         cmd += ["--save_every_n_steps", str(t.save_every_n_steps)]
 
+    cmd += _split_cli_args(s.extra_args)
     return cmd
 
 
@@ -1314,4 +1449,5 @@ def build_cache_dino_cmd(config: ProjectConfig) -> list[str]:
     if c.skip_existing:
         cmd.append("--skip_existing")
 
+    cmd += _split_cli_args(c.cache_dino_extra_args)
     return cmd

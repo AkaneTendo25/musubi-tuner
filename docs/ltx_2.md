@@ -1214,16 +1214,19 @@ See also the [timestep bucketing documentation](./advanced_config.md) for advanc
 - `--timestep_sampling shifted_logit_normal`: Default LTX-2 method. Uses a shifted logit-normal distribution where the shift is computed from latent sequence length. In normal video/AV training this means `latent_frames × latent_height × latent_width`; only `--ltx2_mode audio` uses the audio-only sequence-length path described below.
 - `--timestep_sampling uniform`: Uniform sampling from [0, 1].
 - `--logit_std`: Standard deviation for the logit-normal distribution (default: 1.0). Only used with `shifted_logit_normal`.
-- `--min_timestep` / `--max_timestep`: Optional timestep range constraints.
+- `--min_timestep` / `--max_timestep`: Optional timestep range constraints. By default LTX-2 scales the sampled sigma into this range; with `--preserve_distribution_shape`, it rejection-samples from the original distribution and keeps only values inside the range.
+- `--num_timestep_buckets`: Stratified timestep buckets are honored by LTX-2 `shifted_logit_normal` and `uniform` sampling.
 - `--shifted_logit_mode legacy|stretched`: Sigma sampler variant (default: auto by `--ltx_version`; 2.0→`legacy`, 2.3→`stretched`).
   - `legacy`: `sigmoid(N(shift, std))`. Original behavior.
   - `stretched`: Normalizes samples between the 0.5th and 99.9th percentiles of the distribution, reflects values below `eps` for numerical stability, and replaces a fraction of samples with uniform draws to prevent distribution collapse at high token counts.
 - `--shifted_logit_eps`: Reflection floor and uniform lower bound for `stretched` mode (default: `1e-3`).
 - `--shifted_logit_uniform_prob`: Fraction of samples replaced with uniform `[eps, 1]` draws (default: `0.1`).
-- `--shifted_logit_shift`: Override the auto-calculated shift value. Lower values (e.g., `0.0`) produce a symmetric distribution centered on medium noise (σ≈0.5) for learning fine details. Higher values (e.g., `2.0`) heavily right-skew the distribution toward high noise (σ≈0.9+) for learning global structure. If unset, it is computed dynamically from sequence length. In the current trainer implementation, non-audio training uses the raw linear formula below (so short or long sequences can fall outside the anchor values), while `--ltx2_mode audio` clamps the auto-computed shift to `[0.95, 2.05]`.
+- `--shifted_logit_shift`: Override the auto-calculated shift value. Lower values (e.g., `0.0`) produce a symmetric distribution centered on medium noise (σ≈0.5) for learning fine details. Higher values (e.g., `2.0`) heavily right-skew the distribution toward high noise (σ≈0.9+) for learning global structure. If unset, it is computed dynamically from sequence length. By default, non-audio training uses the raw linear formula below (so short or long sequences can fall outside the anchor values), while `--ltx2_mode audio` clamps the auto-computed shift to the configured min/max shift bounds.
+- `--shifted_logit_clamp_auto_shift`: Clamp non-audio auto-computed shifts instead of extrapolating outside the anchor range. This does not affect explicit `--shifted_logit_shift`.
+- `--shifted_logit_min_shift` / `--shifted_logit_max_shift`: Clamp bounds for auto-computed shifts (defaults: `0.95` / `2.05`). Audio mode always applies these bounds to auto shifts; non-audio mode applies them only with `--shifted_logit_clamp_auto_shift`.
 
 > [!NOTE]
-> The `shifted_logit_normal` auto-shift uses a linear formula anchored at 0.95 for 1024 tokens and 2.05 for 4096 tokens, based on sequence length. The current non-audio trainer extrapolates this formula outside those anchor points for shorter/longer sequences; for example, a single 768x768 image has latent sequence length `1 x (768/32) x (768/32) = 576`, which gives shift `0.7896`. In `--ltx2_mode audio`, the auto-computed shift is clamped to `[0.95, 2.05]`.
+> The `shifted_logit_normal` auto-shift uses a linear formula anchored at 0.95 for 1024 tokens and 2.05 for 4096 tokens, based on sequence length. By default, non-audio training extrapolates this formula outside those anchor points for shorter/longer sequences; for example, a single 768x768 image has latent sequence length `1 x (768/32) x (768/32) = 576`, which gives shift `0.7896`. In `--ltx2_mode audio`, the auto-computed shift is clamped to the configured min/max shift bounds, defaulting to `[0.95, 2.05]`.
 > In `--ltx2_mode audio`, `shifted_logit_normal` still needs a sequence length to compute the shift, but there is no real video spatial dimension. Using full video resolution would inflate the sequence length and skew the shift upward. Instead, `--audio_only_sequence_resolution` (default `64`) provides a small fixed spatial footprint (4 tokens/frame), keeping the shift dominated by the temporal dimension (audio duration/FPS) which actually matters.
 > In joint AV training (`--ltx2_mode av`), the auto shift still comes from the video latent geometry; the presence of audio latents does not change the shift calculation.
 
@@ -1681,9 +1684,9 @@ The prompt file format (`--sample_prompts`) — including guidance scale, negati
 
 | Argument | Default | Description |
 |----------|---------|-------------|
-| `--height` | 512 | Sample output height (pixels) |
-| `--width` | 768 | Sample output width (pixels) |
-| `--sample_num_frames` | 45 | Number of frames for sample video generation |
+| `--height` | 512 | Base sample output height. With the default sampling preset, LTX-2.3 uses `544` unless the prompt line sets `--h` |
+| `--width` | 768 | Base sample output width. With the default sampling preset, LTX-2.3 uses `960` unless the prompt line sets `--w` |
+| `--sample_num_frames` | 45 | Base sample frame count. With the default sampling preset, LTX-2.3 uses `121` unless the prompt line sets `--f` |
 | `--sample_with_offloading` | off | Offload DiT to CPU between sampling prompts to save VRAM |
 | `--sample_tiled_vae` | off | Enable tiled VAE decoding during sampling to reduce VRAM |
 | `--sample_vae_tile_size` | 512 | Spatial tile size (pixels) |
@@ -1696,7 +1699,7 @@ The prompt file format (`--sample_prompts`) — including guidance scale, negati
 | `--sample_audio_subprocess` | on | Decode audio in a subprocess to avoid OOM crashes. Use `--no-sample_audio_subprocess` to decode in-process |
 | `--sample_disable_flash_attn` | off | Force SDPA instead of FlashAttention during sampling |
 | `--sample_i2v_token_timestep_mask` | on | Use I2V token timestep masking (conditioned tokens use t=0). Use `--no-sample_i2v_token_timestep_mask` to disable |
-| `--sample_sampling_preset` | `defaults` | Validation sampling preset. Use `ltx23` for the corrected LTX-2.3 defaults (`15` steps, CFG/STG defaults, CFG rescale `0.9`) |
+| `--sample_sampling_preset` | `defaults` | Validation sampling preset. For `--ltx_version 2.3`, this resolves to the LTX-2.3 defaults (`15` steps, `960x544`, `121` frames, CFG/STG defaults, CFG rescale `0.9`). Use `legacy` only to bypass preset defaults |
 | `--sample_sampler` | `auto` | Denoising sampler. `auto` uses `res_2s` for full LTX presets and Euler for `distilled_two_stage` |
 | `--sample_sigma_schedule` | `auto` | Sigma schedule. `auto` uses latent-aware LTX shifted sigmas and the exact LTX-2.3 distilled schedule for the distilled preset |
 
@@ -1711,6 +1714,7 @@ For IC-LoRA / V2V training, you can also precache the conditioning image latents
 1. During latent caching, add `--precache_sample_latents --sample_prompts sampling_prompts.txt`.
 2. During training, add `--use_precached_sample_latents` to load conditioning latents from cache instead of loading the VAE encoder.
 - `--sample_latents_cache`: Path to the precached latents file. Defaults to `<cache_directory>/ltx2_sample_latents_cache.pt`.
+- Rebuild this cache after changing sample prompt `--w`, `--h`, or `--reference_downscale`; cached video conditioning latent shapes are validated and stale spatial shapes are rejected. Rebuild manually after changing `--i` or `--v`, because cache entries are matched by prompt index rather than by source path.
 
 #### Two-Stage Sampling
 
@@ -1733,6 +1737,8 @@ For LTX-2.3 quality previews, prefer:
 --sample_sampler auto ^
 --sample_sigma_schedule auto
 ```
+
+Prompt-level `--w`, `--h`, `--f`, and `--s` values override preset defaults. For LTX-2.3 presets, explicit `--w`/`--h` values with a short side below `544` or an aspect ratio outside the near-16:9/9:16 warning range, and explicit `--s` values different from the preset step count, are logged as warnings.
 
 #### Checkpoint Output Format
 

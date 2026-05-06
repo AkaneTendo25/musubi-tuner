@@ -350,9 +350,11 @@ class LTX2SamplingMixin:
             module.attention_function = attention_function
 
     def _apply_sample_defaults(self, args: argparse.Namespace, prompts: List[Dict]) -> List[Dict]:
+        preset_name = getattr(args, "sample_sampling_preset", "defaults")
+        ltx_version = str(getattr(args, "ltx_version", "2.3"))
         preset = get_ltx2_sampling_preset(
-            getattr(args, "sample_sampling_preset", "legacy"),
-            ltx_version=str(getattr(args, "ltx_version", "2.3")),
+            preset_name,
+            ltx_version=ltx_version,
         )
         default_height = int(getattr(args, "height", 512))
         default_width = int(getattr(args, "width", 768))
@@ -386,7 +388,7 @@ class LTX2SamplingMixin:
                 args.audio_modality_scale = preset.audio_modality_scale
             if getattr(args, "av_bimodal_cfg", False) is False:
                 args.av_bimodal_cfg = preset.video_modality_scale != 1.0 or preset.audio_modality_scale != 1.0
-            if getattr(args, "av_bimodal_scale", 3.0) == 3.0:
+            if getattr(args, "av_bimodal_scale", None) is None:
                 args.av_bimodal_scale = preset.video_modality_scale
             use_default_negative = getattr(args, "sample_use_default_negative_prompt", None)
             if use_default_negative is None or bool(use_default_negative):
@@ -395,10 +397,19 @@ class LTX2SamplingMixin:
             args.stg_scale = 0.0
         if getattr(args, "stg_mode", None) is None:
             args.stg_mode = "video"
+        if getattr(args, "av_bimodal_scale", None) is None:
+            args.av_bimodal_scale = 3.0
         default_discrete_flow_shift = getattr(args, "discrete_flow_shift", None)
 
         sample_parameters = []
-        for prompt_data in prompts:
+        preset_key = str(preset_name or "").lower()
+        resolved_preset_key = "ltx23" if preset_key == "defaults" and ltx_version == "2.3" else preset_key
+        warn_ltx23_prompt_overrides = (
+            preset is not None
+            and ltx_version == "2.3"
+            and resolved_preset_key in {"ltx23", "ltx23_hq", "distilled_two_stage"}
+        )
+        for prompt_index, prompt_data in enumerate(prompts):
             prompt_text = prompt_data.get("prompt", "")
             param = prompt_data.copy()
             param.setdefault("prompt", prompt_text)
@@ -414,6 +425,31 @@ class LTX2SamplingMixin:
             if default_discrete_flow_shift is not None:
                 param.setdefault("discrete_flow_shift", prompt_data.get("discrete_flow_shift", default_discrete_flow_shift))
             param.setdefault("seed", prompt_data.get("seed", 0))
+            if warn_ltx23_prompt_overrides:
+                explicit_width = "width" in prompt_data
+                explicit_height = "height" in prompt_data
+                if explicit_width or explicit_height:
+                    width = int(param["width"])
+                    height = int(param["height"])
+                    aspect = max(width, height) / max(min(width, height), 1)
+                    common_video_aspect = 16.0 / 9.0
+                    near_common_aspect = abs(aspect - common_video_aspect) <= 0.08
+                    if min(width, height) < 544 or not near_common_aspect:
+                        logger.warning(
+                            "Sample prompt %d overrides the LTX-2.3 preset geometry to %dx%d. "
+                            "Small square or 4:3 previews can look severely degraded; "
+                            "prefer 960x544 or 544x960, or leave --w/--h unset to inherit the preset.",
+                            prompt_index,
+                            width,
+                            height,
+                        )
+                if "sample_steps" in prompt_data and int(param["sample_steps"]) != int(default_sample_steps):
+                    logger.warning(
+                        "Sample prompt %d overrides preset steps to %d. "
+                        "For LTX-2.3 quality checks, leave --s unset unless you are intentionally testing another schedule.",
+                        prompt_index,
+                        int(param["sample_steps"]),
+                    )
             sample_parameters.append(param)
 
         return sample_parameters
@@ -513,6 +549,33 @@ class LTX2SamplingMixin:
             logger.warning("Precached latents not found: %s — skipping (samples will run without conditioning)", cache_path)
             return
 
+        def _target_latent_hw(sample_param: Dict, *, downscale: int = 1, fallback_spatial_factor: int = 32) -> tuple[int, int]:
+            spatial_factor = int(sample_param.get("spatial_factor") or fallback_spatial_factor)
+            width = int(sample_param.get("width", 768))
+            height = int(sample_param.get("height", 512))
+            width = max((width // downscale // spatial_factor) * spatial_factor, spatial_factor)
+            height = max((height // downscale // spatial_factor) * spatial_factor, spatial_factor)
+            return height // spatial_factor, width // spatial_factor
+
+        def _check_video_latent_shape(
+            *,
+            tensor: torch.Tensor,
+            sample_param: Dict,
+            prompt_idx: int,
+            field_name: str,
+            downscale: int = 1,
+        ) -> None:
+            if not isinstance(tensor, torch.Tensor) or tensor.dim() != 5:
+                return
+            expected_h, expected_w = _target_latent_hw(sample_param, downscale=downscale)
+            actual_h, actual_w = int(tensor.shape[-2]), int(tensor.shape[-1])
+            if (actual_h, actual_w) != (expected_h, expected_w):
+                raise ValueError(
+                    f"Precached sample latent shape mismatch for prompt {prompt_idx} ({field_name}) in {cache_path}: "
+                    f"cached latent is {actual_w}x{actual_h}, expected {expected_w}x{expected_h}. "
+                    "Rebuild the sample latent cache after changing sample prompt width/height or reference_downscale."
+                )
+
         logger.info(f"Loading precached conditioning latents from {cache_path}")
         try:
             latent_payload = torch.load(cache_path, map_location="cpu")
@@ -525,24 +588,38 @@ class LTX2SamplingMixin:
             for entry in latent_cache:
                 prompt_idx = entry.get("prompt_index")
                 if prompt_idx is not None and 0 <= prompt_idx < len(sample_params):
+                    sample_param = sample_params[prompt_idx]
                     if "conditioning_latent" in entry:
-                        sample_params[prompt_idx]["conditioning_latent"] = entry["conditioning_latent"]
+                        _check_video_latent_shape(
+                            tensor=entry["conditioning_latent"],
+                            sample_param=sample_param,
+                            prompt_idx=prompt_idx,
+                            field_name="conditioning_latent",
+                        )
+                        sample_param["conditioning_latent"] = entry["conditioning_latent"]
                         i2v_count += 1
                     if "v2v_ref_latent" in entry:
-                        sample_params[prompt_idx]["v2v_ref_latent"] = entry["v2v_ref_latent"]
+                        _check_video_latent_shape(
+                            tensor=entry["v2v_ref_latent"],
+                            sample_param=sample_param,
+                            prompt_idx=prompt_idx,
+                            field_name="v2v_ref_latent",
+                            downscale=max(1, int(getattr(args, "reference_downscale", 1))),
+                        )
+                        sample_param["v2v_ref_latent"] = entry["v2v_ref_latent"]
                         v2v_count += 1
                     ref_audio_latent_entry = entry.get("ref_audio_latent")
                     if ref_audio_latent_entry is None and "reference_audio_latent" in entry:
                         ref_audio_latent_entry = entry["reference_audio_latent"]
                     if ref_audio_latent_entry is not None:
-                        sample_params[prompt_idx]["ref_audio_latent"] = ref_audio_latent_entry
+                        sample_param["ref_audio_latent"] = ref_audio_latent_entry
                         ref_audio_count += 1
 
                     ref_audio_path_entry = entry.get("ref_audio_path")
                     if ref_audio_path_entry is None and "reference_audio_path" in entry:
                         ref_audio_path_entry = entry["reference_audio_path"]
-                    if ref_audio_path_entry is not None and "ref_audio_path" not in sample_params[prompt_idx]:
-                        sample_params[prompt_idx]["ref_audio_path"] = ref_audio_path_entry
+                    if ref_audio_path_entry is not None and "ref_audio_path" not in sample_param:
+                        sample_param["ref_audio_path"] = ref_audio_path_entry
 
             logger.info(
                 "Loaded precached latents: %d I2V, %d V2V references, %d reference-audio",

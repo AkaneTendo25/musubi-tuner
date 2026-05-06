@@ -15,6 +15,7 @@
 		actionBusyLabel = '',
 		actionDisabled = false,
 		actionTooltip = '',
+		fieldPath = '',
 		onaction
 	} = $props();
 
@@ -29,5 +30,5 @@
 
 <!-- svelte-ignore a11y_no_static_element_interactions -->
 <div oninput={(e) => { if (e.target?.tagName === 'INPUT') fireChange(e.target.value); }}>
-	<PathInput {label} {value} {placeholder} {tooltip} {disabled} {showFiles} {invalid} {error} {actionLabel} {actionBusyLabel} {actionDisabled} {actionTooltip} {onaction} onselect={handleBrowseSelect} />
+	<PathInput {label} {value} {placeholder} {tooltip} {disabled} {showFiles} {invalid} {error} {actionLabel} {actionBusyLabel} {actionDisabled} {actionTooltip} {fieldPath} {onaction} onselect={handleBrowseSelect} />
 </div>

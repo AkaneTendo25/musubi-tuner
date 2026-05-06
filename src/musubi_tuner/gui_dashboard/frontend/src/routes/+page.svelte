@@ -9,15 +9,21 @@
 	import { onMount } from 'svelte';
 
 	let newProjectName = $state('New Project');
-	let newProjectDir = $state('');
 	let loadPath = $state('');
 	let error = $state('');
 	let creating = $state(false);
+	let projectDirExists = $state(false);
+	let projectDirCheckPending = $state(false);
 	let systemInfo = $state(null);
 	let cwd = $state('');
 	let selectedLoraFamily = $state('video');
 	let selectedMemoryProfile = $state('regular');
 	let removedRecentProjects = $state([]);
+	let recentProjectSummaries = $state({});
+	let recentProjectSummaryLoading = $state({});
+
+	const LTX_DOCS_FALLBACK_URL = 'https://github.com/AkaneTendo25/musubi-tuner/blob/ltx-2-dev/docs/ltx_2.md';
+	const TEMPLATE_VARIANTS_DISABLED = true;
 
 	const LORA_FAMILIES = [
 		{
@@ -67,14 +73,13 @@
 
 	let activeLoraFamily = $derived(LORA_FAMILIES.find((item) => item.id === selectedLoraFamily) || LORA_FAMILIES[0]);
 	let activeMemoryProfile = $derived(MEMORY_PROFILES.find((item) => item.id === selectedMemoryProfile) || MEMORY_PROFILES[1]);
+	let ltxDocsUrl = $derived(systemInfo?.repo?.docs_url || LTX_DOCS_FALLBACK_URL);
+	let ltxDocsBranch = $derived(systemInfo?.repo?.docs_branch || systemInfo?.repo?.branch || 'ltx-2-dev');
+	let repoRoot = $derived(systemInfo?.repo?.root || cwd);
+	let newProjectSlug = $derived(slugProjectName(newProjectName));
+	let newProjectDir = $derived(repoRoot && newProjectSlug ? `${repoRoot}/projects/${newProjectSlug}` : '');
 
-	// Update project directory when name changes
-	$effect(() => {
-		if (cwd && newProjectName) {
-			const sanitized = newProjectName.replace(/[<>:"/\\|?*]/g, '_').replace(/\s+/g, '_');
-			newProjectDir = `${cwd}/projects/${sanitized}`;
-		}
-	});
+	let projectDirCheckSeq = 0;
 
 	onMount(async () => {
 		try {
@@ -89,7 +94,49 @@
 		} catch {}
 	});
 
+	$effect(() => {
+		if ($projectLoaded) return;
+		for (const project of $recentProjects) {
+			const path = project?.path;
+			if (!path || recentProjectSummaries[path] || recentProjectSummaryLoading[path]) continue;
+			void loadRecentProjectSummary(path);
+		}
+	});
+
+	$effect(() => {
+		const path = newProjectDir;
+		if (!path) {
+			projectDirExists = false;
+			projectDirCheckPending = false;
+			return;
+		}
+		const seq = ++projectDirCheckSeq;
+		projectDirCheckPending = true;
+		fetch(`/api/fs/exists?path=${encodeURIComponent(path)}`)
+			.then((res) => res.ok ? res.json() : { exists: false })
+			.then((data) => {
+				if (seq === projectDirCheckSeq) projectDirExists = !!data.exists;
+			})
+			.catch(() => {
+				if (seq === projectDirCheckSeq) projectDirExists = false;
+			})
+			.finally(() => {
+				if (seq === projectDirCheckSeq) projectDirCheckPending = false;
+			});
+	});
+
+	function slugProjectName(name) {
+		const slug = (name || '')
+			.trim()
+			.toLowerCase()
+			.replace(/[^\w\s-]/g, '')
+			.replace(/[\s-]+/g, '_');
+		return slug || 'project';
+	}
+
 	function buildTemplateConfig(loraFamily, memoryProfile, defaultLtx, defaultGemma) {
+		const repoOutputDir = repoRoot ? `${repoRoot}/output/${newProjectSlug}` : `output/${newProjectSlug}`;
+		const repoLoggingDir = repoRoot ? `${repoRoot}/logs/${newProjectSlug}` : `logs/${newProjectSlug}`;
 		const shared = {
 			version: 2,
 			default_ltx2_checkpoint: defaultLtx,
@@ -99,15 +146,33 @@
 				ltx2_checkpoint: defaultLtx,
 				gemma_root: defaultGemma,
 				ltx2_mode: 'video',
+				mixed_precision: 'bf16',
 			},
 			training: {
 				ltx2_checkpoint: defaultLtx,
 				gemma_root: defaultGemma,
 				ltx2_mode: 'video',
 				ltx_version: '2.3',
+				mixed_precision: 'bf16',
+				fp8_base: true,
+				fp8_scaled: true,
+				sdpa: true,
 				sample_sampling_preset: 'defaults',
 				lora_target_preset: 't2v',
 				ic_lora_strategy: 'auto',
+				network_dim: 32,
+				network_alpha: 32,
+				optimizer_type: 'adamw8bit',
+				learning_rate: 1e-4,
+				gradient_checkpointing: true,
+				timestep_sampling: 'shifted_logit_normal',
+				output_dir: repoOutputDir,
+				autoresume: true,
+				save_every_n_steps: 400,
+				save_state: true,
+				logging_dir: repoLoggingDir,
+				accelerate_extra_args: '--num_processes 1 --num_machines 1 --num_cpu_threads_per_process 1',
+				max_data_loader_n_workers: 1,
 			},
 			inference: {
 				ltx2_checkpoint: defaultLtx,
@@ -118,6 +183,7 @@
 			slider: {
 				mode: 'text',
 				output_name: 'ltx2_slider',
+				accelerate_extra_args: '--num_processes 1 --num_machines 1 --num_cpu_threads_per_process 1',
 			},
 		};
 
@@ -169,8 +235,9 @@
 				},
 				training: {
 					...familyConfig.training,
-					gradient_checkpointing: false,
-					fp8_base: false,
+					gradient_checkpointing: true,
+					fp8_base: true,
+					fp8_scaled: true,
 					gemma_load_in_8bit: false,
 					gemma_load_in_4bit: false,
 				},
@@ -196,6 +263,7 @@
 					...familyConfig.training,
 					gradient_checkpointing: true,
 					fp8_base: true,
+					fp8_scaled: true,
 					gemma_load_in_8bit: false,
 					gemma_load_in_4bit: true,
 				},
@@ -219,7 +287,8 @@
 			training: {
 				...familyConfig.training,
 				gradient_checkpointing: true,
-				fp8_base: false,
+				fp8_base: true,
+				fp8_scaled: true,
 				gemma_load_in_8bit: true,
 				gemma_load_in_4bit: false,
 			},
@@ -235,6 +304,14 @@
 
 	async function handleCreate() {
 		error = '';
+		if (!newProjectName.trim()) {
+			error = 'Project name is required';
+			return;
+		}
+		if (projectDirExists) {
+			error = `Project already exists: ${newProjectDir}`;
+			return;
+		}
 		creating = true;
 		try {
 			const modelDir = defaultModelDir(cwd, null);
@@ -268,6 +345,46 @@
 	function handleRestoreRecentProject(project) {
 		restoreRecentProject(project, project.removedIndex ?? 0);
 		removedRecentProjects = removedRecentProjects.filter((item) => item.path !== project.path);
+	}
+
+	async function loadRecentProjectSummary(path) {
+		recentProjectSummaryLoading = { ...recentProjectSummaryLoading, [path]: true };
+		try {
+			const res = await fetch('/api/project/summary', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ path })
+			});
+			const data = await res.json();
+			if (!res.ok) throw new Error(data.detail || 'Failed to read summary');
+			recentProjectSummaries = { ...recentProjectSummaries, [path]: data.summary };
+		} catch (e) {
+			recentProjectSummaries = { ...recentProjectSummaries, [path]: { error: e.message || 'Summary unavailable' } };
+		} finally {
+			recentProjectSummaryLoading = { ...recentProjectSummaryLoading, [path]: false };
+		}
+	}
+
+	function compactDatasetSummary(summary) {
+		if (!summary) return '';
+		const total = summary.datasets ?? 0;
+		const val = summary.validation_datasets ?? 0;
+		return `${total} ds${val ? ` +${val} val` : ''}`;
+	}
+
+	function trainingLengthSummary(summary) {
+		if (!summary) return '';
+		if (summary.max_train_epochs) return `${summary.max_train_epochs} epochs`;
+		return `${summary.max_train_steps || 0} steps`;
+	}
+
+	function rankSummary(summary) {
+		if (!summary) return '';
+		return summary.network_dim ? `rank ${summary.network_dim}` : 'rank auto';
+	}
+
+	function projectFolderPath(path) {
+		return (path || '').replace(/[\\/][^\\/]*\.json$/i, '');
 	}
 
 	function updateConfig(key, value) {
@@ -568,20 +685,36 @@
 </script>
 
 {#if !$projectLoaded}
-	<div class="max-w-6xl mx-auto mt-10 space-y-6">
+	<div class="h-full max-w-7xl mx-auto px-4 sm:px-6 flex flex-col gap-3 min-h-0">
 		<!-- Header -->
-		<div class="text-center">
-			<div class="w-12 h-12 mx-auto mb-3 flex items-center justify-center" style="background: var(--logo-bg); box-shadow: var(--logo-shadow); border-radius: var(--logo-radius); clip-path: var(--logo-clip);">
-				<span class="text-base font-bold" style="color: var(--bg-base);">M</span>
+		<div class="flex flex-wrap items-center justify-between gap-3">
+			<div class="flex items-center gap-2.5 min-w-0">
+				<div class="w-7 h-7 flex items-center justify-center flex-shrink-0" style="background: var(--logo-bg); box-shadow: var(--logo-shadow); border-radius: var(--logo-radius); clip-path: var(--logo-clip);">
+					<span class="text-[11px] font-bold" style="color: var(--bg-base);">M</span>
+				</div>
+				<div class="flex flex-wrap items-baseline gap-x-2 min-w-0">
+					<h2 class="text-base font-semibold" style="color: var(--text-primary);">Musubi Tuner</h2>
+					<span class="text-[12px]" style="color: var(--text-muted);">LTX-2 LoRA training management</span>
+				</div>
 			</div>
-			<h2 class="text-lg font-semibold" style="color: var(--text-primary);">Musubi Tuner</h2>
-			<p class="text-[12px] mt-1" style="color: var(--text-muted);">LTX-2 LoRA training management</p>
+			<div class="flex flex-wrap items-center gap-2 text-[11px]">
+				<a
+					href={ltxDocsUrl}
+					target="_blank"
+					rel="noreferrer"
+					class="title-docs-link px-2 py-1 font-medium"
+					style="background: var(--bg-elevated); color: var(--accent); border: 1px solid color-mix(in srgb, var(--accent) 26%, var(--border)); border-radius: var(--radius-sm);"
+				>
+					LTX-2 docs
+				</a>
+				<span class="font-mono text-[10px] px-1.5 py-0.5" style="color: var(--text-muted); background: var(--bg-elevated); border: 1px solid var(--border); border-radius: var(--radius-sm);">{ltxDocsBranch}</span>
+			</div>
 		</div>
 
 		<!-- Two-panel layout -->
-		<div class="grid grid-cols-1 xl:grid-cols-3 gap-5">
+		<div class="grid grid-cols-1 xl:grid-cols-2 gap-5 min-h-0 flex-1">
 			<!-- Left: Create New Project -->
-			<div class="xl:col-span-2 p-5 space-y-4" style="background: var(--bg-surface); border: 1px solid var(--border-subtle); border-radius: var(--radius-md); position: relative; overflow: hidden;">
+			<div class="p-5 space-y-4 min-h-0" style="background: var(--bg-surface); border: 1px solid var(--border-subtle); border-radius: var(--radius-md); position: relative; overflow: hidden;">
 				<div style="position: absolute; top: 0; left: 0; right: 0; height: 1px; background: linear-gradient(90deg, transparent, var(--accent), var(--secondary, var(--accent)), transparent); opacity: 0.4;"></div>
 				<div class="flex items-center justify-between gap-4">
 					<div>
@@ -590,8 +723,20 @@
 					<div class="text-[11px]" style="color: var(--text-muted);">{activeLoraFamily.label} • {activeMemoryProfile.label}</div>
 				</div>
 				<div class="space-y-3">
-					<FormField label="Project Name" bind:value={newProjectName} placeholder="My LTX-2 LoRA" tooltip="Display name for your project" />
-					<PathInput label="Project Directory" bind:value={newProjectDir} placeholder={cwd ? `${cwd}/projects/Project_Name` : 'Path to store project files'} tooltip="Directory where project.json and configs will be saved" />
+					<div class="project-name-field">
+						<FormField label="Project Name" bind:value={newProjectName} placeholder="My LTX-2 LoRA" tooltip="Display name for your project" invalid={projectDirExists} />
+						<div class="project-name-status">
+							{#if projectDirExists}
+								<span style="color: var(--danger);">Name exists</span>
+							{:else if projectDirCheckPending}
+								<span style="color: var(--text-muted);">Checking...</span>
+							{/if}
+						</div>
+					</div>
+					<div class="project-path-preview" data-tooltip={newProjectDir || undefined}>
+						<span>Folder</span>
+						<strong>{newProjectDir || 'Waiting for repository path...'}</strong>
+					</div>
 
 					<div class="space-y-2">
 						<div class="flex items-center justify-between gap-3">
@@ -602,7 +747,10 @@
 							{#each LORA_FAMILIES as family}
 								<button
 									type="button"
-									onclick={() => selectedLoraFamily = family.id}
+									disabled={TEMPLATE_VARIANTS_DISABLED}
+									onclick={() => {
+										if (!TEMPLATE_VARIANTS_DISABLED) selectedLoraFamily = family.id;
+									}}
 									class="choice-pill"
 									style="background: {selectedLoraFamily === family.id ? 'color-mix(in srgb, var(--accent) 10%, var(--bg-elevated))' : 'var(--bg-elevated)'}; border: 1px solid {selectedLoraFamily === family.id ? 'color-mix(in srgb, var(--accent) 28%, var(--border))' : 'var(--border)'}; color: {selectedLoraFamily === family.id ? 'var(--text-primary)' : 'var(--text-secondary)'};"
 								>
@@ -622,7 +770,10 @@
 							{#each MEMORY_PROFILES as profile}
 								<button
 									type="button"
-									onclick={() => selectedMemoryProfile = profile.id}
+									disabled={TEMPLATE_VARIANTS_DISABLED}
+									onclick={() => {
+										if (!TEMPLATE_VARIANTS_DISABLED) selectedMemoryProfile = profile.id;
+									}}
 									class="choice-pill"
 									style="background: {selectedMemoryProfile === profile.id ? 'color-mix(in srgb, var(--accent) 10%, var(--bg-elevated))' : 'var(--bg-elevated)'}; border: 1px solid {selectedMemoryProfile === profile.id ? 'color-mix(in srgb, var(--accent) 28%, var(--border))' : 'var(--border)'}; color: {selectedMemoryProfile === profile.id ? 'var(--text-primary)' : 'var(--text-secondary)'};"
 								>
@@ -635,7 +786,7 @@
 
 					<button
 						onclick={handleCreate}
-						disabled={!newProjectDir || creating}
+						disabled={!newProjectDir || projectDirExists || projectDirCheckPending || creating}
 						class="w-full py-2.5 text-[13px] font-semibold disabled:opacity-40"
 						style="background: color-mix(in srgb, var(--accent) 74%, var(--bg-elevated)); color: var(--text-primary); border: 1px solid color-mix(in srgb, var(--accent) 32%, var(--border)); border-radius: var(--radius-sm);"
 					>{creating ? 'Creating...' : 'Create Project'}</button>
@@ -643,40 +794,60 @@
 			</div>
 
 			<!-- Right: Recent Projects + Load Existing -->
-			<div class="xl:col-span-1 p-5 space-y-4" style="background: var(--bg-surface); border: 1px solid var(--border-subtle); border-radius: var(--radius-md); position: relative; overflow: hidden;">
+			<div class="p-5 min-h-0 flex flex-col gap-4" style="background: var(--bg-surface); border: 1px solid var(--border-subtle); border-radius: var(--radius-md); position: relative; overflow: hidden;">
 				<div style="position: absolute; top: 0; left: 0; right: 0; height: 1px; background: linear-gradient(90deg, transparent, var(--accent), var(--secondary, var(--accent)), transparent); opacity: 0.4;"></div>
 				<div class="text-[11px] font-semibold uppercase tracking-wider" style="color: var(--text-muted); font-family: var(--font-label);">Open Project</div>
 
 				{#if $recentProjects.length > 0}
-					<div class="space-y-3">
+					<div class="space-y-3 min-h-0 flex-1 flex flex-col">
 						<div class="flex items-center justify-between">
 							<p class="text-[11px] font-medium uppercase tracking-[0.18em]" style="color: var(--text-secondary); font-family: var(--font-label);">Recent</p>
 							<span class="text-[10px] px-2 py-0.5 rounded-full" style="background: var(--bg-elevated); color: var(--text-muted); border: 1px solid var(--border);">{$recentProjects.length}</span>
 						</div>
-						<div class="space-y-2.5">
+						<div class="recent-project-list flex-1 min-h-0 space-y-1.5">
 						{#each $recentProjects as proj, index}
-							<div class="recent-project-card p-3 space-y-3">
-								<div class="flex items-start gap-3">
-									<div class="w-9 h-9 flex items-center justify-center flex-shrink-0 rounded-sm" style="background: color-mix(in srgb, var(--accent) 14%, var(--bg-base)); color: var(--accent); border: 1px solid color-mix(in srgb, var(--accent) 24%, var(--border));">
-										{(proj.name || 'P').trim().charAt(0).toUpperCase() || 'P'}
+							{@const summary = recentProjectSummaries[proj.path]}
+							{@const summaryLoading = recentProjectSummaryLoading[proj.path]}
+							<div class="recent-project-row">
+								<div class="min-w-0 flex-1">
+									<div class="flex items-center min-w-0">
+										<div class="min-w-0 flex-1">
+											<div class="text-[13px] font-semibold truncate" style="color: var(--text-primary);" data-tooltip={projectFolderPath(proj.path)}>{proj.name}</div>
+										</div>
 									</div>
-									<div class="min-w-0 flex-1">
-										<div class="text-[12px] font-semibold truncate" style="color: var(--text-primary);">{proj.name}</div>
-										<div class="text-[10px] mt-1 break-all" style="color: var(--text-secondary);">{proj.path}</div>
+									<div class="mt-1.5 min-w-0">
+										{#if summary?.error}
+											<div class="text-[11px] truncate" style="color: var(--danger);">{summary.error}</div>
+										{:else if summary}
+											<div class="recent-project-meta">
+												<span class="summary-dataset">{compactDatasetSummary(summary)}</span>
+												<span class="summary-version">LTX {summary.ltx_version}</span>
+												<span class="summary-mode">{summary.mode}</span>
+												<span class="summary-target">{summary.lora_target_preset}</span>
+												{#if summary.lora_kind !== 'LoRA'}
+													<span class="summary-kind">{summary.lora_kind}</span>
+												{/if}
+												<span class="summary-output">{summary.output_name || 'ltx2_lora'}</span>
+												<span class="summary-steps">{trainingLengthSummary(summary)}</span>
+												<span class="summary-rank">{rankSummary(summary)}</span>
+											</div>
+										{:else if summaryLoading}
+											<div class="text-[11px] truncate" style="color: var(--text-muted);">Reading summary...</div>
+										{/if}
 									</div>
-							</div>
-								<div class="flex gap-2">
+								</div>
+								<div class="recent-project-actions">
 									<button
 										type="button"
 										onclick={() => { loadPath = proj.path; handleLoad(); }}
-										class="recent-project-action recent-project-action-primary flex-1 py-2 text-[11px] font-medium"
+										class="recent-project-action recent-project-action-primary px-3 py-1.5 text-[11px] font-medium"
 									>
 										Open
 									</button>
 									<button
 										type="button"
 										onclick={() => handleRemoveRecentProject(proj, index)}
-										class="recent-project-action recent-project-action-muted px-3 py-2 text-[11px] font-medium"
+										class="recent-project-action recent-project-action-muted px-2.5 py-1.5 text-[11px] font-medium"
 									>
 										Remove
 									</button>
@@ -1040,11 +1211,150 @@
 		color: var(--text-primary);
 	}
 
-	.recent-project-card {
-		background: color-mix(in srgb, var(--bg-elevated) 80%, var(--bg-base));
-		border: 1px solid color-mix(in srgb, var(--accent) 14%, var(--border));
+	.choice-pill:disabled {
+		cursor: not-allowed;
+		opacity: 0.55;
+	}
+
+	.choice-pill:disabled:hover {
+		color: var(--text-secondary);
+	}
+
+	.project-name-field {
+		position: relative;
+	}
+
+	.project-name-status {
+		position: absolute;
+		top: 1px;
+		right: 0;
+		max-width: 48%;
+		overflow: hidden;
+		font-size: 10px;
+		font-weight: 600;
+		line-height: 1.2;
+		pointer-events: none;
+		text-align: right;
+		white-space: nowrap;
+	}
+
+	.project-name-status span {
+		display: block;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+
+	.project-path-preview {
+		display: grid;
+		grid-template-columns: auto minmax(0, 1fr);
+		gap: 0.55rem;
+		align-items: baseline;
+		font-size: 11px;
+		line-height: 1.35;
+	}
+
+	.project-path-preview span {
+		color: var(--text-muted);
+		font-family: var(--font-label);
+		font-size: 10px;
+		font-weight: 600;
+		text-transform: uppercase;
+	}
+
+	.project-path-preview strong {
+		min-width: 0;
+		overflow: hidden;
+		color: var(--text-secondary);
+		font-family: var(--font-mono, monospace);
+		font-weight: 500;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+
+	.recent-project-list {
+		overflow-y: auto;
+		padding-right: 0.2rem;
+	}
+
+	.recent-project-row {
+		display: flex;
+		align-items: center;
+		gap: 0.85rem;
+		min-height: 78px;
+		padding: 0.7rem 0.75rem;
 		border-radius: var(--radius-sm);
-		box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.02);
+	}
+
+	.recent-project-row:hover {
+		background: color-mix(in srgb, var(--bg-elevated) 72%, var(--bg-base));
+	}
+
+	.recent-project-meta {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 0.2rem 0.7rem;
+		font-size: 11px;
+		line-height: 1.45;
+	}
+
+	.summary-dataset {
+		color: var(--text-muted);
+		font-variant-numeric: tabular-nums;
+	}
+
+	.summary-mode {
+		color: var(--accent);
+		font-weight: 650;
+		text-transform: uppercase;
+	}
+
+	.summary-target {
+		color: var(--text-secondary);
+		font-weight: 600;
+	}
+
+	.summary-kind {
+		color: var(--warning);
+		font-weight: 650;
+	}
+
+	.summary-output {
+		color: var(--text-primary);
+		font-weight: 650;
+	}
+
+	.summary-steps {
+		color: var(--success);
+		font-weight: 600;
+		font-variant-numeric: tabular-nums;
+	}
+
+	.summary-version {
+		color: var(--info);
+		font-weight: 600;
+	}
+
+	.summary-rank {
+		color: var(--text-secondary);
+		font-family: var(--font-mono, monospace);
+	}
+
+	.recent-project-actions {
+		display: flex;
+		flex-shrink: 0;
+		gap: 0.4rem;
+	}
+
+	@media (max-width: 640px) {
+		.recent-project-row {
+			align-items: stretch;
+			flex-direction: column;
+		}
+
+		.recent-project-actions {
+			justify-content: flex-end;
+		}
 	}
 
 	.removed-project-row {
@@ -1079,5 +1389,10 @@
 		color: var(--text-primary);
 		border-color: color-mix(in srgb, var(--accent) 24%, var(--border));
 		background: color-mix(in srgb, var(--bg-elevated) 88%, var(--bg-base));
+	}
+
+	.title-docs-link:hover {
+		background: color-mix(in srgb, var(--accent) 12%, var(--bg-elevated)) !important;
+		border-color: color-mix(in srgb, var(--accent) 44%, var(--border)) !important;
 	}
 </style>

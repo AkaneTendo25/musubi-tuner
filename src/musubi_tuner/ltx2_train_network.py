@@ -1,6 +1,7 @@
 """LTX-2 LoRA Training Implementation."""
 
 import argparse
+import math
 import os
 import random
 import re
@@ -1524,6 +1525,9 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             and audio_model_timesteps.numel() > 0
         ):
             payload["audio"] = audio_model_timesteps.detach().to(dtype=torch.float32) * 1000.0
+        shifted_logit_shifts = ctx.get("shifted_logit_shift")
+        if isinstance(shifted_logit_shifts, torch.Tensor) and shifted_logit_shifts.numel() > 0:
+            payload["shifted_logit_shift"] = shifted_logit_shifts.detach().to(dtype=torch.float32)
         return payload
 
     def _ensure_fp8_buffers_on_device(self, model: torch.nn.Module) -> None:
@@ -1652,6 +1656,7 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
         mode: str = "legacy",
         eps: float = 1e-3,
         uniform_prob: float = 0.1,
+        uniform_samples: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Sample sigmas for shifted_logit_normal.
 
@@ -1666,7 +1671,20 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
         std = float(std)
         mode = str(mode).lower()
 
-        normal_samples = torch.randn((batch_size,), device=shifts.device, dtype=torch.float32) * std + shifts
+        if uniform_samples is None:
+            normal_samples = torch.randn((batch_size,), device=shifts.device, dtype=torch.float32) * std + shifts
+        else:
+            uniform_samples = uniform_samples.to(device=shifts.device, dtype=torch.float32).view(-1)
+            if uniform_samples.numel() == 1 and batch_size > 1:
+                uniform_samples = uniform_samples.expand(batch_size)
+            if uniform_samples.numel() != batch_size:
+                raise ValueError(
+                    f"uniform_samples must be shape [batch_size], got {tuple(uniform_samples.shape)} "
+                    f"for batch_size={batch_size}"
+                )
+            uniform_samples = uniform_samples.clamp(1e-7, 1.0 - 1e-7)
+            standard_normal = math.sqrt(2.0) * torch.erfinv(2.0 * uniform_samples - 1.0)
+            normal_samples = standard_normal * std + shifts
         logitnormal_samples = torch.sigmoid(normal_samples)
         if mode in {"legacy", "classic", "old"}:
             return logitnormal_samples
@@ -1693,6 +1711,27 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             return uniform
         prob = torch.rand((batch_size,), device=shifts.device, dtype=torch.float32)
         return torch.where(prob > uniform_prob, stretched, uniform)
+
+    def _apply_shifted_logit_auto_shift_bounds(
+        self,
+        args: argparse.Namespace,
+        shifts: torch.Tensor,
+        *,
+        force_clamp: bool = False,
+    ) -> torch.Tensor:
+        if getattr(args, "shifted_logit_shift", None) is not None:
+            return shifts
+        if not force_clamp and not bool(getattr(args, "shifted_logit_clamp_auto_shift", False)):
+            return shifts
+
+        min_shift = float(getattr(args, "shifted_logit_min_shift", 0.95))
+        max_shift = float(getattr(args, "shifted_logit_max_shift", 2.05))
+        return shifts.clamp(min=min_shift, max=max_shift)
+
+    def _record_timestep_logging_tensor(self, name: str, value: torch.Tensor) -> None:
+        ctx = self._timestep_logging_context if isinstance(self._timestep_logging_context, dict) else {}
+        ctx[name] = value.detach()
+        self._timestep_logging_context = ctx
 
     def _resolve_shifted_logit_mode(self, args: argparse.Namespace) -> str:
         explicit_mode = getattr(args, "shifted_logit_mode", None)
@@ -1759,7 +1798,13 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             )
 
         shift = self._shifted_logit_normal_shift_for_sequence_length(seq_len)
-        shift = max(0.95, min(2.05, float(shift)))
+        shift_tensor = torch.tensor([float(shift)], dtype=torch.float32)
+        shift_tensor = self._apply_shifted_logit_auto_shift_bounds(
+            args,
+            shift_tensor,
+            force_clamp=self._ltx_mode == "audio",
+        )
+        shift = float(shift_tensor[0].item())
         if self._ltx_mode == "audio" and not self._logged_audio_only_timestep_shift:
             logger.info(
                 "LTX-2 audio-only mode: using shifted_logit_normal shift %.4f from seq_len=%s.",
@@ -1788,10 +1833,22 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
         if noise.device != device:
             noise = noise.to(device=device)
         self._self_flow_step_context = None
+        self._timestep_logging_context = None
 
         batch_size = latents.shape[0]
         frames, height, width = latents.shape[2], latents.shape[3], latents.shape[4]
         seq_len = int(frames * height * width)
+        timestep_uniforms: Optional[torch.Tensor] = None
+        if timesteps is not None:
+            timestep_uniforms = torch.as_tensor(timesteps, device=device, dtype=torch.float32).view(-1)
+            if timestep_uniforms.numel() == 1 and batch_size > 1:
+                timestep_uniforms = timestep_uniforms.expand(batch_size)
+            if timestep_uniforms.numel() != batch_size:
+                raise ValueError(
+                    f"timesteps must contain {batch_size} values for LTX-2 sampling, "
+                    f"got {timestep_uniforms.numel()}"
+                )
+            timestep_uniforms = timestep_uniforms.clamp(0.0, 1.0)
         audio_seq_lens = None
         if self._ltx_mode == "audio":
             audio_seq_lens = self._resolve_audio_only_sequence_lengths(batch_size, device)
@@ -1812,12 +1869,30 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             # For other sampling modes, use parent implementation
             return super().get_noisy_model_input_and_timesteps(args, noise, latents, timesteps, noise_scheduler, device, dtype)
 
-        def _sample_sigmas() -> torch.Tensor:
+        min_timestep = getattr(args, "min_timestep", None)
+        max_timestep = getattr(args, "max_timestep", None)
+        min_sigma = (float(min_timestep) / 1000.0) if min_timestep is not None else 0.0
+        max_sigma = (float(max_timestep) / 1000.0) if max_timestep is not None else 1.0
+        if max_sigma < min_sigma:
+            raise ValueError(f"Invalid timestep range: min_sigma={min_sigma} > max_sigma={max_sigma}")
+
+        def _sample_base_uniform(*, use_provided: bool = True) -> Optional[torch.Tensor]:
+            if use_provided and timestep_uniforms is not None:
+                return timestep_uniforms
+            if self.num_timestep_buckets is not None and self.num_timestep_buckets > 1:
+                return torch.tensor(
+                    [self.get_bucketed_timestep() for _ in range(batch_size)],
+                    device=device,
+                    dtype=torch.float32,
+                )
+            return None
+
+        def _sample_raw_sigmas(base_uniform: Optional[torch.Tensor] = None) -> torch.Tensor:
             if timestep_sampling == "shifted_logit_normal":
                 if self._ltx_mode == "audio":
                     if audio_seq_lens is not None:
                         shifts = self._shifted_logit_normal_shift_for_sequence_lengths(audio_seq_lens)
-                        shifts = shifts.clamp(min=0.95, max=2.05)
+                        shifts = self._apply_shifted_logit_auto_shift_bounds(args, shifts, force_clamp=True)
                         if not self._logged_audio_only_timestep_shift:
                             logger.info(
                                 "LTX-2 audio-only mode: shifted_logit_normal seq_len min=%s max=%s mean=%.2f, "
@@ -1836,10 +1911,12 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                 else:
                     shift = self._shifted_logit_normal_shift_for_sequence_length(seq_len)
                     shifts = torch.full((batch_size,), float(shift), device=device, dtype=torch.float32)
+                    shifts = self._apply_shifted_logit_auto_shift_bounds(args, shifts)
                 # Apply manual shift override if set
                 shifted_logit_shift_override = getattr(args, "shifted_logit_shift", None)
                 if shifted_logit_shift_override is not None:
                     shifts = torch.full((batch_size,), float(shifted_logit_shift_override), device=device, dtype=torch.float32)
+                self._record_timestep_logging_tensor("shifted_logit_shift", shifts)
                 std = getattr(args, "logit_std", 1.0)
                 shifted_logit_mode = self._resolve_shifted_logit_mode(args)
                 shifted_logit_eps = getattr(args, "shifted_logit_eps", 1e-3)
@@ -1851,15 +1928,50 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                     mode=shifted_logit_mode,
                     eps=shifted_logit_eps,
                     uniform_prob=shifted_logit_uniform_prob,
+                    uniform_samples=base_uniform,
                 )
             else:
-                sampled = torch.rand((batch_size,), device=device, dtype=torch.float32)
+                if base_uniform is None:
+                    sampled = torch.rand((batch_size,), device=device, dtype=torch.float32)
+                else:
+                    sampled = base_uniform.to(device=device, dtype=torch.float32).view(-1)
+                    if sampled.numel() == 1 and batch_size > 1:
+                        sampled = sampled.expand(batch_size)
+                    if sampled.numel() != batch_size:
+                        raise ValueError(
+                            f"base_uniform must contain {batch_size} values for LTX-2 uniform sampling, "
+                            f"got {sampled.numel()}"
+                        )
+                    sampled = sampled.clamp(0.0, 1.0)
+            return sampled
 
-            min_timestep = getattr(args, "min_timestep", None)
-            max_timestep = getattr(args, "max_timestep", None)
+        def _sample_sigmas(*, use_provided: bool = True) -> torch.Tensor:
+            if bool(getattr(args, "preserve_distribution_shape", False)) and (
+                min_timestep is not None or max_timestep is not None
+            ):
+                max_loops = 1000
+                available_sigmas: List[torch.Tensor] = []
+                for _ in range(max_loops):
+                    sampled = _sample_raw_sigmas(_sample_base_uniform(use_provided=False))
+                    for sigma in sampled:
+                        sigma_value = float(sigma.item())
+                        if min_sigma <= sigma_value <= max_sigma:
+                            available_sigmas.append(sigma)
+                        if len(available_sigmas) == batch_size:
+                            break
+                    if len(available_sigmas) == batch_size:
+                        break
+                if len(available_sigmas) < batch_size:
+                    logger.warning(
+                        f"Could not sample {batch_size} valid LTX-2 timesteps in {max_loops} loops; "
+                        "falling back to clamped samples."
+                    )
+                    sampled = _sample_raw_sigmas(_sample_base_uniform(use_provided=use_provided))
+                    return sampled.clamp(min=min_sigma, max=max_sigma)
+                return torch.stack(available_sigmas, dim=0).to(device=device, dtype=torch.float32)
+
+            sampled = _sample_raw_sigmas(_sample_base_uniform(use_provided=use_provided))
             if min_timestep is not None or max_timestep is not None:
-                min_sigma = (min_timestep / 1000.0) if min_timestep is not None else 0.0
-                max_sigma = (max_timestep / 1000.0) if max_timestep is not None else 1.0
                 sampled = sampled * (max_sigma - min_sigma) + min_sigma
             return sampled
 
@@ -1873,7 +1985,7 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             and bool(getattr(args, "self_flow", False))
             and bool(getattr(self._self_flow.config, "dual_timestep", True))
         ):
-            sigmas_alt = _sample_sigmas()
+            sigmas_alt = _sample_sigmas(use_provided=False)
             t_tokens = sigmas.view(batch_size, 1).expand(batch_size, seq_len)
             s_tokens = sigmas_alt.view(batch_size, 1).expand(batch_size, seq_len)
 
@@ -2099,8 +2211,22 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             raise ValueError(
                 f"shifted_logit_uniform_prob must be within [0, 1]. Got: {shifted_logit_uniform_prob}"
             )
+        shifted_logit_min_shift = float(getattr(args, "shifted_logit_min_shift", 0.95))
+        shifted_logit_max_shift = float(getattr(args, "shifted_logit_max_shift", 2.05))
+        if not math.isfinite(shifted_logit_min_shift):
+            raise ValueError(f"shifted_logit_min_shift must be finite. Got: {shifted_logit_min_shift}")
+        if not math.isfinite(shifted_logit_max_shift):
+            raise ValueError(f"shifted_logit_max_shift must be finite. Got: {shifted_logit_max_shift}")
+        if shifted_logit_max_shift < shifted_logit_min_shift:
+            raise ValueError(
+                "shifted_logit_max_shift must be >= shifted_logit_min_shift. "
+                f"Got: min={shifted_logit_min_shift}, max={shifted_logit_max_shift}"
+            )
         args.shifted_logit_eps = shifted_logit_eps
         args.shifted_logit_uniform_prob = shifted_logit_uniform_prob
+        args.shifted_logit_clamp_auto_shift = bool(getattr(args, "shifted_logit_clamp_auto_shift", False))
+        args.shifted_logit_min_shift = shifted_logit_min_shift
+        args.shifted_logit_max_shift = shifted_logit_max_shift
 
         args.independent_audio_timestep = bool(getattr(args, "independent_audio_timestep", False))
         args.audio_silence_regularizer = bool(getattr(args, "audio_silence_regularizer", False))
@@ -2928,9 +3054,11 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                 device=accelerator.device,
                 dtype=network_dtype,
             )
-        self._timestep_logging_context = {
-            "audio_model_timesteps": audio_model_timesteps.detach(),
-        }
+        timestep_logging_context = (
+            self._timestep_logging_context if isinstance(self._timestep_logging_context, dict) else {}
+        )
+        timestep_logging_context["audio_model_timesteps"] = audio_model_timesteps.detach()
+        self._timestep_logging_context = timestep_logging_context
         audio_sigma = audio_model_timesteps[:, 0]
         ic_lora_strategy = str(
             getattr(

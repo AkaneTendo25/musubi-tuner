@@ -30,41 +30,61 @@
 	let peakVramMb = $state(0);
 	let lastRunActive = $state(false);
 	let statsTimer = null;
+	let systemInfoLoading = false;
+	let statsLoading = false;
 
-	onMount(async () => {
-		const statuses = await refreshStatuses();
-		const state = statuses?.training?.state;
-		if (state === 'running' || state === 'stopping') {
-			await preloadLogsIfActive('training');
-		} else {
-			clearMetrics();
-			clearStatus();
-			clearProcessLogs('training');
-		}
-
+	async function fetchSystemInfo() {
+		if (systemInfoLoading) return;
+		systemInfoLoading = true;
 		try {
-			const res = await fetch('/api/system/info');
+			const res = await fetch('/api/system/info', { cache: 'no-store' });
 			if (res.ok) systemInfo = await res.json();
-		} catch {}
+		} catch {
+		} finally {
+			systemInfoLoading = false;
+		}
+	}
+
+	async function fetchStats() {
+		if (statsLoading) return;
+		statsLoading = true;
 		try {
 			const res = await fetch('/api/stats', { cache: 'no-store' });
 			if (res.ok) stats = await res.json();
-		} catch {}
-		const interval = setInterval(async () => {
-			try {
-				const res = await fetch('/api/system/info');
-				if (res.ok) systemInfo = await res.json();
-			} catch {}
-		}, 2000);
+		} catch {
+		} finally {
+			statsLoading = false;
+		}
+	}
+
+	onMount(() => {
+		let disposed = false;
+		const init = async () => {
+			const statuses = await refreshStatuses();
+			if (disposed) return;
+			const state = statuses?.training?.state;
+			if (state === 'running' || state === 'stopping') {
+				await preloadLogsIfActive('training');
+			} else {
+				clearMetrics();
+				clearStatus();
+				clearProcessLogs('training');
+			}
+
+			await Promise.all([fetchSystemInfo(), fetchStats()]);
+		};
+		void init();
+
+		const systemInterval = setInterval(fetchSystemInfo, 1000);
+		const statsInterval = setInterval(fetchStats, 3000);
 		const logInterval = startLogPolling('training', 1000);
 		return () => {
-			clearInterval(interval);
+			disposed = true;
+			clearInterval(systemInterval);
+			clearInterval(statsInterval);
 			clearInterval(logInterval);
 		};
 	});
-
-	let gpu = $derived(systemInfo?.gpus?.[0]);
-	let runStats = $derived(stats?.training || null);
 
 	$effect(() => {
 		const cfg = $projectConfig;
@@ -90,17 +110,15 @@
 		});
 
 		if (statsTimer) clearTimeout(statsTimer);
-		statsTimer = setTimeout(async () => {
-			try {
-				const res = await fetch('/api/stats', { cache: 'no-store' });
-				if (res.ok) stats = await res.json();
-			} catch {}
-		}, 700);
+		statsTimer = setTimeout(fetchStats, 700);
 
 		return () => {
 			if (statsTimer) clearTimeout(statsTimer);
 		};
 	});
+
+	let gpu = $derived(systemInfo?.gpus?.[0]);
+	let runStats = $derived(stats?.training || null);
 
 	$effect(() => {
 		if (trainingLive && !lastRunActive) {
@@ -138,6 +156,19 @@
 		if (value >= 100) return `${Math.round(value)} GB`;
 		if (value >= 10) return `${value.toFixed(1)} GB`;
 		return `${value.toFixed(2)} GB`;
+	}
+
+	function clampPercent(value) {
+		const n = Number(value);
+		if (!Number.isFinite(n)) return 0;
+		return Math.max(0, Math.min(100, n));
+	}
+
+	function ratioPercent(used, total) {
+		const u = Number(used);
+		const t = Number(total);
+		if (!Number.isFinite(u) || !Number.isFinite(t) || t <= 0) return 0;
+		return clampPercent((u / t) * 100);
 	}
 
 	function truncateMiddle(value, max = 34) {
@@ -199,6 +230,11 @@
 	let nextCheckpoint = $derived(nextStepEventLabel(Number(t.save_every_n_steps || 0), $status?.step, $status?.speed_steps_per_sec, 'Final only'));
 	let nextSample = $derived(nextSampleLabel(t, $status, runStats));
 	let resumeMode = $derived(resumeModeLabel(t));
+	let gpuVramPercent = $derived(ratioPercent(gpu?.vram_used_mb, gpu?.vram_total_mb));
+	let gpuUtilization = $derived(clampPercent(gpu?.utilization));
+	let ramPercent = $derived(clampPercent(systemInfo?.ram?.percent));
+	let diskPercent = $derived(clampPercent(systemInfo?.disk?.percent ?? ratioPercent(systemInfo?.disk?.used_gb, systemInfo?.disk?.total_gb)));
+	let cpuUtilization = $derived(systemInfo?.cpu?.utilization == null ? null : clampPercent(systemInfo.cpu.utilization));
 	let hasLossChartData = $derived(($lossData?.length ?? 0) > 0);
 	let hasGradNormChartData = $derived(
 		($gradNormData?.some((r) =>
@@ -246,17 +282,17 @@
 							<span class="font-semibold tabular-nums" style="color: var(--accent);">{(gpu.vram_used_mb / 1024).toFixed(1)} / {(gpu.vram_total_mb / 1024).toFixed(0)} GB</span>
 						</div>
 						<div class="h-1.5 overflow-hidden" style="background: var(--border); border-radius: var(--radius-full);">
-							<div class="h-full" style="width: {(gpu.vram_used_mb / gpu.vram_total_mb * 100).toFixed(0)}%; background: var(--accent); border-radius: var(--radius-full); transition: width 0.6s ease;"></div>
+							<div class="h-full" style="width: {gpuVramPercent.toFixed(0)}%; background: var(--accent); border-radius: var(--radius-full); transition: width 0.6s ease;"></div>
 						</div>
 					</div>
 
 					<div class="space-y-1">
 						<div class="flex items-center justify-between gap-3 text-[11px]">
 							<span style="color: var(--text-muted);">GPU Load</span>
-							<span class="font-semibold tabular-nums" style="color: var(--text-primary);">{gpu.utilization ?? 0}%</span>
+							<span class="font-semibold tabular-nums" style="color: var(--text-primary);">{gpu.utilization == null ? '--' : `${gpuUtilization.toFixed(0)}%`}</span>
 						</div>
 						<div class="h-1.5 overflow-hidden" style="background: var(--border); border-radius: var(--radius-full);">
-							<div class="h-full" style="width: {gpu.utilization ?? 0}%; background: var(--info); border-radius: var(--radius-full); transition: width 0.6s ease;"></div>
+							<div class="h-full" style="width: {gpuUtilization.toFixed(0)}%; background: var(--info); border-radius: var(--radius-full); transition: width 0.6s ease;"></div>
 						</div>
 					</div>
 				</div>
@@ -344,7 +380,7 @@
 						<span class="font-semibold tabular-nums" style="color: var(--text-primary);">{systemInfo.ram.used_gb} / {systemInfo.ram.total_gb} GB</span>
 					</div>
 					<div class="h-1.5 overflow-hidden" style="background: var(--border); border-radius: var(--radius-full);">
-						<div class="h-full" style="width: {systemInfo.ram.percent}%; background: {systemInfo.ram.percent > 90 ? 'var(--danger)' : 'var(--info)'}; border-radius: var(--radius-full); transition: width 0.6s ease;"></div>
+						<div class="h-full" style="width: {ramPercent.toFixed(0)}%; background: {ramPercent > 90 ? 'var(--danger)' : 'var(--info)'}; border-radius: var(--radius-full); transition: width 0.6s ease;"></div>
 					</div>
 				</div>
 			{/if}
@@ -356,7 +392,7 @@
 						<span class="font-semibold tabular-nums" style="color: var(--text-primary);">{systemInfo.disk.free_gb} GB</span>
 					</div>
 					<div class="h-1.5 overflow-hidden" style="background: var(--border); border-radius: var(--radius-full);">
-						<div class="h-full" style="width: {(systemInfo.disk.used_gb / systemInfo.disk.total_gb * 100).toFixed(0)}%; background: var(--info); border-radius: var(--radius-full); transition: width 0.6s ease;"></div>
+						<div class="h-full" style="width: {diskPercent.toFixed(0)}%; background: var(--info); border-radius: var(--radius-full); transition: width 0.6s ease;"></div>
 					</div>
 				</div>
 			{/if}
@@ -371,8 +407,8 @@
 					<span class="font-medium tabular-nums" style="color: var(--text-primary);">{runStats?.estimated_time_hours ? formatDuration(runStats.estimated_time_hours * 3600) : '--'}</span>
 				</div>
 				<div class="flex items-center justify-between gap-3">
-					<span style="color: var(--text-muted);">CPU</span>
-					<span class="font-medium text-right" style="color: var(--text-primary);">{systemInfo?.cpu?.model ? truncateMiddle(systemInfo.cpu.model, 18) : '--'}</span>
+					<span style="color: var(--text-muted);">CPU Load</span>
+					<span class="font-medium tabular-nums" style="color: var(--text-primary);">{cpuUtilization == null ? '--' : `${cpuUtilization.toFixed(0)}%`}</span>
 				</div>
 				<div class="flex items-center justify-between gap-3">
 					<span style="color: var(--text-muted);">Cores</span>
@@ -399,9 +435,9 @@
 				{/if}
 			</div>
 		{:else}
-			<div class="bg-gray-900 border border-gray-800 rounded-lg p-4">
-				<h3 class="text-sm font-medium text-gray-400 mb-3">Charts</h3>
-				<p class="text-sm text-gray-600">No training metrics yet</p>
+			<div class="p-4">
+				<h3 class="text-sm font-medium mb-3" style="color: var(--text-secondary);">Charts</h3>
+				<p class="text-sm" style="color: var(--text-muted);">No training metrics yet</p>
 			</div>
 		{/if}
 
@@ -413,9 +449,9 @@
 				<ComputeTimeChart />
 			</div>
 		{:else}
-			<div class="bg-gray-900 border border-gray-800 rounded-lg p-4">
-				<h3 class="text-sm font-medium text-gray-400 mb-3">Detailed Charts</h3>
-				<p class="text-sm text-gray-600">No detailed metrics yet</p>
+			<div class="p-4">
+				<h3 class="text-sm font-medium mb-3" style="color: var(--text-secondary);">Detailed Charts</h3>
+				<p class="text-sm" style="color: var(--text-muted);">No detailed metrics yet</p>
 			</div>
 		{/if}
 

@@ -30,9 +30,10 @@ def main():
     if args.dev:
         vite_proc = _start_vite(args.dev_port)
 
-    app = create_management_app(project_path=args.project)
+    dev_frontend_url = f"http://127.0.0.1:{args.dev_port}" if args.dev else None
+    app = create_management_app(project_path=args.project, dev_frontend_url=dev_frontend_url)
 
-    url = f"http://localhost:{args.dev_port}" if args.dev else f"http://{args.host}:{args.port}"
+    url = f"http://127.0.0.1:{args.dev_port}" if args.dev else f"http://{args.host}:{args.port}"
     logger.info(f"Starting LTX-2 Training Manager — open {url}")
 
     try:
@@ -47,7 +48,7 @@ def _start_vite(port: int) -> subprocess.Popen:
     npm_cmd = "npm.cmd" if sys.platform == "win32" else "npm"
     logger.info(f"Starting Vite dev server on port {port} ...")
     proc = subprocess.Popen(
-        [npm_cmd, "run", "dev", "--", "--port", str(port)],
+        [npm_cmd, "run", "dev", "--", "--host", "127.0.0.1", "--port", str(port)],
         cwd=FRONTEND_DIR,
         # Let Vite output go to the same console
         stdout=sys.stdout,

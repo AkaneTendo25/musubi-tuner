@@ -254,6 +254,17 @@ def validate_training_config(config: ProjectConfig) -> dict[str, Any]:
         errors.append(_make_issue("error", "training.awq_calibration", message, label="AWQ Calibration", page="training"))
         errors.append(_make_issue("error", "training.nf4_base", message, label="NF4 Base", page="training"))
 
+    if not t.save_every_n_steps and not t.save_every_n_epochs:
+        warnings.append(
+            _make_issue(
+                "warning",
+                "training.save_every_n_epochs",
+                "No checkpoint save frequency is set. Set Save Every N Epochs or Save Every N Steps to make checkpoint output explicit.",
+                label="Checkpoint Save Frequency",
+                page="training",
+            )
+        )
+
     if t.sample_two_stage and not _has_text(t.spatial_upsampler_path):
         errors.append(
             _make_issue(
