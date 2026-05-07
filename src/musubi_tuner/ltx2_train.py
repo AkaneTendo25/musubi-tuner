@@ -60,6 +60,19 @@ def _all_declared_datasets_are_audio(user_config: dict) -> bool:
     return all(("audio_directory" in ds or "audio_jsonl_file" in ds) for ds in declared_datasets)
 
 
+def _all_manifest_datasets_are_audio(manifest: dict) -> bool:
+    declared_datasets: list[dict] = []
+    for section_name in ("datasets", "validation_datasets"):
+        section = manifest.get(section_name, [])
+        if isinstance(section, list):
+            declared_datasets.extend(entry for entry in section if isinstance(entry, dict))
+
+    if not declared_datasets:
+        return False
+
+    return all(entry.get("dataset_type") == "audio" for entry in declared_datasets)
+
+
 def _is_attention_geometry_param(param_name: str) -> bool:
     # Attention geometry parameters most tied to motion priors.
     return re.search(
@@ -3369,8 +3382,10 @@ def main() -> None:
 
     trainer = LTX2NetworkTrainer()
 
-    if args.dataset_config is None:
-        raise ValueError("dataset_config is required / dataset_configが必要です")
+    if args.dataset_config is None and getattr(args, "dataset_manifest", None) is None:
+        raise ValueError("dataset_config or dataset_manifest is required / dataset_configまたはdataset_manifestが必要です")
+    if args.dataset_config is not None and getattr(args, "dataset_manifest", None) is not None:
+        logger.info("Both --dataset_config and --dataset_manifest were provided; full fine-tune will use --dataset_manifest.")
     if args.ltx2_checkpoint is None:
         raise ValueError("path to LTX-2 checkpoint is required / LTX-2チェックポイントのパスが必要です")
 
@@ -3410,8 +3425,14 @@ def main() -> None:
     if getattr(args, "ltx_mode", None) in short_map:
         args.ltx_mode = short_map[args.ltx_mode]
     if getattr(args, "ltx_mode", "video") == "video":
-        user_config = config_utils.load_user_config(args.dataset_config)
-        if _all_declared_datasets_are_audio(user_config):
+        all_declared_audio = False
+        if getattr(args, "dataset_manifest", None) is not None:
+            dataset_manifest_for_mode = config_utils.load_dataset_manifest(args.dataset_manifest)
+            all_declared_audio = _all_manifest_datasets_are_audio(dataset_manifest_for_mode)
+        elif args.dataset_config is not None:
+            user_config = config_utils.load_user_config(args.dataset_config)
+            all_declared_audio = _all_declared_datasets_are_audio(user_config)
+        if all_declared_audio:
             logger.info("All datasets are audio-only; automatically switching to --ltx2_mode audio")
             args.ltx_mode = "audio"
 
@@ -3561,15 +3582,43 @@ def main() -> None:
     # datasets
     current_epoch = Value("i", 0)
     blueprint_generator = BlueprintGenerator(ConfigSanitizer())
-    user_config = config_utils.load_user_config(args.dataset_config)
-    blueprint = blueprint_generator.generate(user_config, args, architecture=trainer.architecture)
-    train_dataset_group = config_utils.generate_dataset_group_by_blueprint(
-        blueprint.dataset_group,
-        training=True,
-        num_timestep_buckets=args.num_timestep_buckets,
-        shared_epoch=current_epoch,
-        reference_downscale=getattr(args, "reference_downscale", 1),
-    )
+    manifest_validation_dataset_group = None
+    if getattr(args, "dataset_manifest", None) is not None:
+        logger.info("Load dataset manifest from %s", args.dataset_manifest)
+        dataset_manifest = config_utils.load_dataset_manifest(args.dataset_manifest)
+        manifest_architecture = dataset_manifest.get("architecture")
+        if manifest_architecture is not None and manifest_architecture != trainer.architecture:
+            raise ValueError(
+                f"dataset manifest architecture mismatch: expected '{trainer.architecture}', got '{manifest_architecture}'"
+            )
+        train_dataset_group = config_utils.generate_dataset_group_by_manifest(
+            dataset_manifest,
+            split="train",
+            training=True,
+            num_timestep_buckets=args.num_timestep_buckets,
+            shared_epoch=current_epoch,
+            reference_downscale=getattr(args, "reference_downscale", 1),
+        )
+        if train_dataset_group is None:
+            raise ValueError("dataset manifest contains no training datasets")
+        manifest_validation_dataset_group = config_utils.generate_dataset_group_by_manifest(
+            dataset_manifest,
+            split="validation",
+            training=False,
+            num_timestep_buckets=args.num_timestep_buckets,
+            shared_epoch=current_epoch,
+            reference_downscale=getattr(args, "reference_downscale", 1),
+        )
+    else:
+        user_config = config_utils.load_user_config(args.dataset_config)
+        blueprint = blueprint_generator.generate(user_config, args, architecture=trainer.architecture)
+        train_dataset_group = config_utils.generate_dataset_group_by_blueprint(
+            blueprint.dataset_group,
+            training=True,
+            num_timestep_buckets=args.num_timestep_buckets,
+            shared_epoch=current_epoch,
+            reference_downscale=getattr(args, "reference_downscale", 1),
+        )
 
     if train_dataset_group.num_train_items == 0:
         raise ValueError(
@@ -3681,6 +3730,21 @@ def main() -> None:
             logger.info("Validation dataset loaded with %d items", val_dataset_group.num_train_items)
         else:
             logger.warning("Validation dataset has no items, validation disabled")
+    elif manifest_validation_dataset_group is not None:
+        val_dataset_group = manifest_validation_dataset_group
+        if val_dataset_group.num_train_items > 0:
+            val_collator = collator_class(current_epoch, val_dataset_group if args.max_data_loader_n_workers == 0 else None)
+            val_dataloader = torch.utils.data.DataLoader(
+                val_dataset_group,
+                batch_size=1,
+                shuffle=False,
+                collate_fn=val_collator,
+                num_workers=n_workers,
+                persistent_workers=False,
+            )
+            logger.info("Validation dataset loaded from manifest with %d items", val_dataset_group.num_train_items)
+        else:
+            logger.warning("Manifest validation dataset has no items, validation disabled")
 
     _run_full_ft_ic_preflight(args, train_dataset_group, split_name="train")
     if val_dataset_group is not None:

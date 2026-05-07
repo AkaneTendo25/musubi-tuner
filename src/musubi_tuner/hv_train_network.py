@@ -72,6 +72,20 @@ from musubi_tuner.utils import huggingface_utils, model_utils, train_utils, sai_
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
+
+def configure_console_output_for_help() -> None:
+    """Avoid argparse --help crashes on Windows consoles with narrow encodings."""
+
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if not callable(reconfigure):
+            continue
+        try:
+            reconfigure(errors="replace")
+        except Exception:
+            pass
+
+
 # Global tracker for all-time peak VRAM since app launch
 _global_peak_alloc_mb: float = 0.0
 _global_peak_reserved_mb: float = 0.0
@@ -4682,6 +4696,8 @@ class NetworkTrainer:
 
 
 def setup_parser_common() -> argparse.ArgumentParser:
+    configure_console_output_for_help()
+
     def int_or_float(value):
         if value.endswith("%"):
             try:
