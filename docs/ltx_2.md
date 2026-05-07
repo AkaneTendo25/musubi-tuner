@@ -1474,6 +1474,7 @@ The `--sample_include_reference` flag shows the reference side-by-side with the 
 | `reference_directories` | array[string] | Optional multi-reference variant of `reference_directory`; use one entry per reference stream |
 | `reference_cache_directory` | string | Output directory for cached reference latents |
 | `reference_cache_directories` | array[string] | Optional multi-reference variant of `reference_cache_directory`; count must match `reference_directories` |
+| `reference_frames` | int | Optional per-dataset override for `--reference_frames` during reference latent caching |
 
 ##### Notes
 

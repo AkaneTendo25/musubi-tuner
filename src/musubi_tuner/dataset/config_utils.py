@@ -54,6 +54,7 @@ class BaseDatasetParams:
     cache_directory: Optional[str] = None
     reference_cache_directory: Optional[str] = None
     reference_cache_directories: Optional[Sequence[str]] = None
+    reference_frames: Optional[int] = None
     reference_audio_cache_directory: Optional[str] = None
     reference_audio_cache_directories: Optional[Sequence[str]] = None
     separate_audio_buckets: bool = False
@@ -159,6 +160,7 @@ class ConfigSanitizer:
         "cache_directory": str,
         "reference_cache_directory": str,
         "reference_cache_directories": [str],
+        "reference_frames": int,
         "reference_audio_cache_directory": str,
         "reference_audio_cache_directories": [str],
         "separate_audio_buckets": bool,
@@ -291,7 +293,13 @@ class BlueprintGenerator:
         sanitized_user_config = self.sanitizer.sanitize_user_config(normalized_user_config)
         sanitized_argparse_namespace = self.sanitizer.sanitize_argparse_namespace(argparse_namespace)
 
-        argparse_config = {k: v for k, v in vars(sanitized_argparse_namespace).items() if v is not None}
+        # Keep CLI reference_frames as a cache-time fallback; only TOML/general should populate dataset overrides.
+        dataset_local_arg_exclusions = {"reference_frames"}
+        argparse_config = {
+            k: v
+            for k, v in vars(sanitized_argparse_namespace).items()
+            if v is not None and k not in dataset_local_arg_exclusions
+        }
         general_config = sanitized_user_config.get("general", {})
 
         dataset_blueprints = []
@@ -489,6 +497,7 @@ def generate_dataset_group_by_blueprint(
         loss_mask_use_alpha: {getattr(dataset, "loss_mask_use_alpha", False)}
         loss_mask_invert: {getattr(dataset, "loss_mask_invert", False)}
         reference_downscale: {getattr(dataset, "reference_downscale", 1)}
+        reference_frames: {getattr(dataset, "reference_frames", None)}
         cache_directory: "{dataset.cache_directory}"
         reference_cache_directory: "{getattr(dataset, 'reference_cache_directory', None)}"
         reference_cache_directories: {getattr(dataset, "reference_cache_directories", None)}

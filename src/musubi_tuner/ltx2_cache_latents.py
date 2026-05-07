@@ -679,7 +679,7 @@ def encode_and_save_reference_latents(
     tiling_config=None,
 ) -> None:
     """Encode reference files and save as latent caches for IC-LoRA / v2v training."""
-    num_frames = getattr(args, "reference_frames", 1)
+    default_num_frames = max(1, int(getattr(args, "reference_frames", 1) or 1))
     downscale_factor = max(1, getattr(args, "reference_downscale", 1))
     skip_existing = getattr(args, "skip_existing", False)
     num_workers = args.num_workers if args.num_workers is not None else max(1, (os.cpu_count() or 2) - 1)
@@ -729,6 +729,17 @@ def encode_and_save_reference_latents(
             len(ref_dirs),
             ref_dir_source,
             ref_cache_dirs,
+        )
+        dataset_reference_frames = getattr(ds, "reference_frames", None)
+        if dataset_reference_frames is None:
+            num_frames = default_num_frames
+        else:
+            num_frames = max(1, int(dataset_reference_frames or 1))
+        logger.info(
+            "[Dataset %s] Reference frames: %s%s",
+            ds_idx,
+            num_frames,
+            " (dataset override)" if dataset_reference_frames is not None else " (CLI/default)",
         )
 
         cached_count = 0

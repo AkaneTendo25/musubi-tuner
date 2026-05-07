@@ -2691,6 +2691,7 @@ class BaseDataset(torch.utils.data.Dataset):
         cache_directory: Optional[str] = None,
         reference_cache_directory: Optional[str] = None,
         reference_cache_directories: Optional[Sequence[str]] = None,
+        reference_frames: Optional[int] = None,
         reference_audio_cache_directory: Optional[str] = None,
         reference_audio_cache_directories: Optional[Sequence[str]] = None,
         separate_audio_buckets: bool = False,
@@ -2716,6 +2717,7 @@ class BaseDataset(torch.utils.data.Dataset):
             reference_cache_directories,
         )
         self.reference_cache_directory = self.reference_cache_directories[0] if self.reference_cache_directories else None
+        self.reference_frames = reference_frames
         self.reference_audio_cache_directories = _normalize_optional_path_list(
             reference_audio_cache_directory,
             reference_audio_cache_directories,
@@ -2748,6 +2750,7 @@ class BaseDataset(torch.utils.data.Dataset):
             "enable_bucket": bool(self.enable_bucket),
             "bucket_no_upscale": bool(self.bucket_no_upscale),
             "separate_audio_buckets": bool(self.separate_audio_buckets),
+            "reference_frames": self.reference_frames,
         }
         return metadata
 
@@ -2970,6 +2973,7 @@ class ImageDataset(BaseDataset):
         multiple_target: bool = False,
         reference_cache_directory: Optional[str] = None,
         reference_cache_directories: Optional[Sequence[str]] = None,
+        reference_frames: Optional[int] = None,
         reference_audio_cache_directory: Optional[str] = None,
         reference_audio_cache_directories: Optional[Sequence[str]] = None,
         separate_audio_buckets: bool = False,
@@ -3000,6 +3004,7 @@ class ImageDataset(BaseDataset):
             cache_directory,
             reference_cache_directory,
             reference_cache_directories,
+            reference_frames,
             reference_audio_cache_directory,
             reference_audio_cache_directories,
             separate_audio_buckets,
@@ -3389,6 +3394,7 @@ class AudioDataset(BaseDataset):
         cache_directory: Optional[str] = None,
         reference_cache_directory: Optional[str] = None,
         reference_cache_directories: Optional[Sequence[str]] = None,
+        reference_frames: Optional[int] = None,
         reference_audio_cache_directory: Optional[str] = None,
         reference_audio_cache_directories: Optional[Sequence[str]] = None,
         separate_audio_buckets: bool = False,
@@ -3415,6 +3421,7 @@ class AudioDataset(BaseDataset):
             cache_directory,
             reference_cache_directory,
             reference_cache_directories,
+            reference_frames,
             reference_audio_cache_directory,
             reference_audio_cache_directories,
             separate_audio_buckets,
@@ -3716,6 +3723,7 @@ class VideoDataset(BaseDataset):
         cache_directory: Optional[str] = None,
         reference_cache_directory: Optional[str] = None,
         reference_cache_directories: Optional[Sequence[str]] = None,
+        reference_frames: Optional[int] = None,
         reference_audio_cache_directory: Optional[str] = None,
         reference_audio_cache_directories: Optional[Sequence[str]] = None,
         separate_audio_buckets: bool = False,
@@ -3741,6 +3749,7 @@ class VideoDataset(BaseDataset):
             cache_directory,
             reference_cache_directory,
             reference_cache_directories,
+            reference_frames,
             reference_audio_cache_directory,
             reference_audio_cache_directories,
             separate_audio_buckets,
