@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+from pathlib import Path
 from typing import Sequence, cast
 
 import numpy as np
@@ -42,6 +43,28 @@ DINO_INPUT_SIZE = 518
 # ImageNet normalization
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD = [0.229, 0.224, 0.225]
+
+
+def load_dino_model(model_name: str, *, dino_repo_path: str | None = None, torch_hub_dir: str | None = None) -> torch.nn.Module:
+    """Load DINOv2 from a local torch.hub repo clone, or from torch hub."""
+
+    if torch_hub_dir:
+        hub_dir = Path(torch_hub_dir).expanduser()
+        hub_dir.mkdir(parents=True, exist_ok=True)
+        torch.hub.set_dir(str(hub_dir))
+        logger.info("Using torch hub directory: %s", hub_dir)
+
+    if dino_repo_path:
+        repo_path = Path(dino_repo_path).expanduser()
+        if not repo_path.is_dir():
+            raise ValueError(f"DINOv2 repo path is not a directory: {repo_path}")
+        if not (repo_path / "hubconf.py").is_file():
+            raise ValueError(f"DINOv2 repo path must contain hubconf.py: {repo_path}")
+        logger.info("Loading DINOv2 from local repo: %s", repo_path)
+        return torch.hub.load(str(repo_path), model_name, source="local")
+
+    logger.info("Loading DINOv2 from torch hub: facebookresearch/dinov2")
+    return torch.hub.load("facebookresearch/dinov2", model_name)
 
 
 def _load_datasets(args: argparse.Namespace) -> Sequence[BaseDataset]:
@@ -147,6 +170,18 @@ def main() -> None:
         help="DINOv2 model variant (default: dinov2_vitb14)",
     )
     parser.add_argument("--dino_batch_size", type=int, default=16, help="Frames per DINOv2 forward pass (default: 16)")
+    parser.add_argument(
+        "--dino_repo_path",
+        type=str,
+        default=None,
+        help="Local facebookresearch/dinov2 repo clone containing hubconf.py. Uses torch.hub source='local'.",
+    )
+    parser.add_argument(
+        "--torch_hub_dir",
+        type=str,
+        default=None,
+        help="Torch hub cache directory. Useful for offline/pre-populated DINOv2 cache environments.",
+    )
     parser.add_argument("--device", type=str, default=None, help="Torch device (default: cuda if available)")
     parser.add_argument("--skip_existing", action="store_true", help="Skip items that already have dino caches")
     parser.add_argument("--num_workers", type=int, default=None, help="Number of workers for dataset loading")
@@ -168,7 +203,11 @@ def main() -> None:
     dino_dim = DINO_DIMS[args.dino_model]
 
     logger.info("Loading DINOv2 model: %s (dim=%d)", args.dino_model, dino_dim)
-    dino = torch.hub.load("facebookresearch/dinov2", args.dino_model)
+    dino = load_dino_model(
+        args.dino_model,
+        dino_repo_path=args.dino_repo_path,
+        torch_hub_dir=args.torch_hub_dir,
+    )
     dino = dino.to(device=device, dtype=torch.float32)
     dino.eval()
     for p in dino.parameters():

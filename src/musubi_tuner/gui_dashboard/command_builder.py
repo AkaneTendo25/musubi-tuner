@@ -1448,6 +1448,10 @@ def build_cache_dino_cmd(config: ProjectConfig) -> list[str]:
 
     if c.device:
         cmd += ["--device", c.device]
+    if c.dino_repo_path:
+        cmd += ["--dino_repo_path", c.dino_repo_path]
+    if c.torch_hub_dir:
+        cmd += ["--torch_hub_dir", c.torch_hub_dir]
     if c.skip_existing:
         cmd.append("--skip_existing")
 

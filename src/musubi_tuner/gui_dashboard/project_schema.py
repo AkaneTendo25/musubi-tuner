@@ -116,6 +116,8 @@ class CachingConfig(BaseModel):
     audio_only_sequence_resolution: int = 64
     # DINOv2 feature caching (for CREPA dino mode - model selection in training.crepa_dino_model)
     dino_batch_size: int = 16
+    dino_repo_path: str = ""
+    torch_hub_dir: str = ""
     # Quantization device
     quantize_device: Optional[str] = None
     # Connector LoRA

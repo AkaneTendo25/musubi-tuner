@@ -991,6 +991,8 @@ python ltx2_cache_dino_features.py ^
 
 - `--dino_model`: DINOv2 variant — `dinov2_vits14` (384d), `dinov2_vitb14` (768d, default), `dinov2_vitl14` (1024d), `dinov2_vitg14` (1536d).
 - `--dino_batch_size`: Frames per forward pass. Reduce if OOM (default: 16).
+- `--dino_repo_path`: Local `facebookresearch/dinov2` clone containing `hubconf.py`. Uses `torch.hub` with `source="local"` and avoids a GitHub fetch.
+- `--torch_hub_dir`: Torch hub cache directory. Use this when the DINOv2 repo/weights are already pre-populated in a local cache.
 - `--skip_existing`: Skip items that already have cached features.
 
 Output: `*_ltx2_dino.safetensors` files alongside your latent caches, containing per-frame patch tokens `[T, N_patches, D]`. For `dinov2_vitb14` at 518px input: `N_patches=1369`, `D=768`, so each frame adds ~2MB (float16). Disk usage scales linearly with frame count.
