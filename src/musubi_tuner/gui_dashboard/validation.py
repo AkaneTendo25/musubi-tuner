@@ -87,6 +87,17 @@ def _validate_dataset_entry(entry: DatasetEntry, index: int, *, errors: list[dic
             )
         )
 
+    if entry.type != "audio" and entry.reference_frames is not None and entry.reference_frames < 1:
+        errors.append(
+            _make_issue(
+                "error",
+                f"{field_base}.reference_frames",
+                f"{label}: reference frames must be at least 1.",
+                label=label,
+                page="dataset",
+            )
+        )
+
 
 def _has_training_gemma_source(config: ProjectConfig) -> bool:
     t = config.training

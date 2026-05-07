@@ -30,6 +30,7 @@ class DatasetEntry(BaseModel):
     cache_directory: str = ""
     reference_cache_directory: str = ""
     extra_reference_cache_directories: str = ""
+    reference_frames: Optional[int] = None
     reference_audio_cache_directory: str = ""
     extra_reference_audio_cache_directories: str = ""
     control_directory: str = ""

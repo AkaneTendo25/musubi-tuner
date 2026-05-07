@@ -125,6 +125,9 @@ def _dataset_entry_to_dict(entry) -> dict:
         d["reference_cache_directory"] = reference_cache_directories[0]
     elif len(reference_cache_directories) > 1:
         d["reference_cache_directories"] = reference_cache_directories
+    reference_frames = getattr(entry, "reference_frames", None)
+    if entry.type != "audio" and reference_frames is not None:
+        d["reference_frames"] = int(reference_frames)
 
     reference_audio_cache_directories = _merge_path_values(
         [entry.reference_audio_cache_directory] if getattr(entry, "reference_audio_cache_directory", "") else [],

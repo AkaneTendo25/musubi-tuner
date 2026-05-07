@@ -19,6 +19,7 @@
 				cache_directory: '',
 				reference_cache_directory: '',
 				extra_reference_cache_directories: '',
+				reference_frames: null,
 				reference_audio_cache_directory: '',
 				extra_reference_audio_cache_directories: '',
 				control_directory: '',

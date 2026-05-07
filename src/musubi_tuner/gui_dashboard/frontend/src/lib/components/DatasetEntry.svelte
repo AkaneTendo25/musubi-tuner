@@ -143,6 +143,17 @@
 				placeholder="Optional"
 				tooltip="Optional extra reference cache directories, separated by commas or semicolons."
 			/>
+			{#if !isAudio}
+				<FormField
+					label="Reference Frames"
+					type="number"
+					value={entry.reference_frames ?? ''}
+					oninput={(e) => updateNumberField('reference_frames', e.target.value, true)}
+					min={1}
+					placeholder="Global"
+					tooltip="Optional reference video frame count for this dataset. Leave blank to use the global caching Reference Frames setting."
+				/>
+			{/if}
 			<PathInput
 				label="Ref Audio Cache Dir"
 				value={entry.reference_audio_cache_directory}

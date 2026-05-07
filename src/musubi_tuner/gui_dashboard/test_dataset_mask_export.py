@@ -81,6 +81,39 @@ def test_dataset_toml_export_uses_reference_directories_with_reference_caches():
     assert "extra_control_directories" not in dataset
 
 
+def test_dataset_toml_export_includes_reference_frames_override():
+    config = ProjectConfig()
+    config.dataset.datasets = [
+        DatasetEntry(
+            type="video",
+            directory="G:/data/videos",
+            cache_directory="G:/data/cache",
+            reference_cache_directory="G:/data/ref_cache",
+            reference_frames=97,
+        )
+    ]
+
+    dataset = build_dataset_toml_document(config)["datasets"][0]
+
+    assert dataset["reference_frames"] == 97
+
+
+def test_dataset_toml_export_omits_unset_reference_frames():
+    config = ProjectConfig()
+    config.dataset.datasets = [
+        DatasetEntry(
+            type="video",
+            directory="G:/data/videos",
+            cache_directory="G:/data/cache",
+            reference_cache_directory="G:/data/ref_cache",
+        )
+    ]
+
+    dataset = build_dataset_toml_document(config)["datasets"][0]
+
+    assert "reference_frames" not in dataset
+
+
 def test_slider_toml_export_escapes_target_strings(tmp_path):
     if tomllib is None:
         pytest.skip("tomllib/tomli is not available")
