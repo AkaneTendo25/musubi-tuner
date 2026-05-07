@@ -894,6 +894,12 @@ class NetworkTrainer:
     ):
         return None, {}
 
+    def modify_video_loss_per_element(self, args, per_elem, out, network_dtype):
+        return per_elem, {}
+
+    def compute_video_extra_loss(self, args, out, network_dtype):
+        return None, {}
+
     def get_dummy_scheduler(self, optimizer: torch.optim.Optimizer) -> Any:
         # dummy scheduler for schedulefree optimizer. supports only empty step(), get_last_lr() and optimizers.
         # this scheduler is used for logging only.
@@ -3549,6 +3555,8 @@ class NetworkTrainer:
                                 pred: torch.Tensor,
                                 tgt: torch.Tensor,
                                 mask: torch.Tensor | None,
+                                *,
+                                tag: str | None = None,
                             ) -> torch.Tensor:
                                 if isinstance(tgt, torch.Tensor):
                                     pred = pred.to(device=tgt.device, dtype=network_dtype)
@@ -3561,6 +3569,8 @@ class NetworkTrainer:
                                         while w.dim() > per_elem.dim() and w.shape[-1] == 1:
                                             w = w.squeeze(-1)
                                     per_elem = per_elem * w
+                                if tag == "video":
+                                    per_elem, _ = self.modify_video_loss_per_element(args, per_elem, out, network_dtype)
                                 loss, _ = apply_loss_mask(per_elem, mask)
                                 return loss
 
@@ -3578,7 +3588,7 @@ class NetworkTrainer:
                                     video_loss_mask,
                                 )
                             else:
-                                video_loss = _masked_loss(video_pred, video_target, video_loss_mask)
+                                video_loss = _masked_loss(video_pred, video_target, video_loss_mask, tag="video")
 
                             audio_pred = out.get("audio_pred")
                             audio_target = out.get("audio_target")
@@ -3649,6 +3659,10 @@ class NetworkTrainer:
                                             balance_max=audio_loss_balance_max,
                                         )
                                     loss = loss + audio_loss * audio_weight
+
+                            video_extra_loss, _ = self.compute_video_extra_loss(args, out, network_dtype)
+                            if video_extra_loss is not None:
+                                loss = loss + video_extra_loss
                         else:
                             if isinstance(target, torch.Tensor):
                                 model_pred = model_pred.to(device=target.device, dtype=network_dtype)
@@ -3942,6 +3956,7 @@ class NetworkTrainer:
                     grad_norm_audio_value = None
                     audio_diagnostics = {}  # Per-batch audio quality diagnostics (negligible cost)
                     mask_metrics: dict[str, float] = {}
+                    latent_temporal_metrics: dict[str, float] = {}
                     _loss_type = getattr(args, "loss_type", "mse")
                     _huber_delta = getattr(args, "huber_delta", 1.0)
 
@@ -3966,6 +3981,10 @@ class NetworkTrainer:
                                     while w.dim() > per_elem.dim() and w.shape[-1] == 1:
                                         w = w.squeeze(-1)
                                 per_elem = per_elem * w
+                            if tag == "video":
+                                per_elem, modifier_metrics = self.modify_video_loss_per_element(args, per_elem, out, network_dtype)
+                                for k, v in modifier_metrics.items():
+                                    mask_metrics[k] = v
                             loss, metrics = apply_loss_mask(per_elem, mask)
                             if tag is not None and metrics:
                                 for k, v in metrics.items():
@@ -4065,6 +4084,12 @@ class NetworkTrainer:
                                 audio_weight_effective_value = audio_weight
                                 loss = loss + audio_loss * audio_weight
                                 audio_loss_value = audio_loss.detach().item() if audio_weight > 0 else None
+
+                        latent_temporal_extra_loss, latent_temporal_metrics = self.compute_video_extra_loss(
+                            args, out, network_dtype
+                        )
+                        if latent_temporal_extra_loss is not None:
+                            loss = loss + latent_temporal_extra_loss
 
                         # --- Audio diagnostics (per-batch, negligible cost) ---
                         if has_audio_loss and audio_pred is not None and audio_target is not None:
@@ -4235,6 +4260,8 @@ class NetworkTrainer:
                         pres_losses["loss/prior_div"] = _prior_div_value
                     if _crepa_value is not None:
                         pres_losses["loss/crepa"] = _crepa_value
+                    if latent_temporal_metrics:
+                        pres_losses.update(latent_temporal_metrics)
                     if self_flow_metrics:
                         pres_losses.update(self_flow_metrics)
                     if cts_metrics:

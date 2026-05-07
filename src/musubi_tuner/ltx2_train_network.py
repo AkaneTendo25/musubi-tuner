@@ -373,6 +373,9 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
         self._audio_metrics = None
         # HFATO (off by default)
         self._hfato_config = None  # Optional[HFATOConfig]
+        # Latent temporal objectives (off by default)
+        self._latent_temporal_weighting_config = None
+        self._latent_delta_loss_config = None
 
     @staticmethod
     def _apply_caption_dropout(
@@ -525,8 +528,84 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
         self._setup_self_flow(args, accelerator, transformer, network)
         self._setup_audio_metrics(args)
         self._setup_hfato(args)
+        self._setup_latent_temporal(args)
         self._apply_network_initialization(args, network)
         validate_lycoris_runtime(args, accelerator, transformer, network, logger)
+
+    def _setup_latent_temporal(self, args: argparse.Namespace) -> None:
+        """Parse latent temporal objective flags. No-op when both flags are off."""
+        self._latent_temporal_weighting_config = None
+        self._latent_delta_loss_config = None
+        weighting_enabled = bool(getattr(args, "latent_temporal_weighting", False))
+        delta_enabled = bool(getattr(args, "latent_delta_loss", False))
+        if not weighting_enabled and not delta_enabled:
+            return
+
+        from musubi_tuner.ltx2_latent_temporal import build_delta_loss_config, build_weighting_config
+
+        if self._ltx_mode == "audio":
+            logger.warning(
+                "Latent temporal video objectives are enabled in --ltx2_mode audio; "
+                "they will be skipped for audio-only batches."
+            )
+        if self._ic_lora_strategy != "none":
+            logger.warning(
+                "Latent temporal video objectives are designed for normal video/AV training. "
+                "Current --ic_lora_strategy=%s uses token/reference paths where these objectives may be skipped.",
+                self._ic_lora_strategy,
+            )
+        if weighting_enabled and bool(getattr(args, "hfato", False)):
+            logger.warning(
+                "--latent_temporal_weighting is currently applied to the regular denoising loss path; "
+                "HFATO x0 loss bypasses that per-element loss reducer."
+            )
+
+        if weighting_enabled:
+            self._latent_temporal_weighting_config = build_weighting_config(
+                getattr(args, "latent_temporal_weighting_args", None)
+            )
+            logger.info("Latent temporal weighting enabled: %s", self._latent_temporal_weighting_config)
+        if delta_enabled:
+            self._latent_delta_loss_config = build_delta_loss_config(getattr(args, "latent_delta_loss_args", None))
+            logger.info("Latent delta loss enabled: %s", self._latent_delta_loss_config)
+
+    def modify_video_loss_per_element(self, args, per_elem: torch.Tensor, out: Dict[str, Any], network_dtype):
+        if self._latent_temporal_weighting_config is None:
+            return per_elem, {}
+        if float(out.get("video_loss_weight", 1.0)) <= 0.0:
+            return per_elem, {}
+        from musubi_tuner.ltx2_latent_temporal import apply_latent_temporal_weighting
+
+        return apply_latent_temporal_weighting(
+            per_elem,
+            out.get("_latent_temporal"),
+            self._latent_temporal_weighting_config,
+        )
+
+    def compute_video_extra_loss(self, args, out: Dict[str, Any], network_dtype):
+        if self._latent_delta_loss_config is None:
+            return None, {}
+        video_loss_weight = float(out.get("video_loss_weight", 1.0))
+        if video_loss_weight <= 0.0:
+            return None, {}
+        from musubi_tuner.ltx2_latent_temporal import compute_latent_delta_loss
+
+        extra_loss, metrics = compute_latent_delta_loss(
+            out.get("video_pred"),
+            out.get("video_target"),
+            out.get("video_loss_mask"),
+            out.get("_latent_temporal"),
+            self._latent_delta_loss_config,
+        )
+        if extra_loss is None:
+            return None, metrics
+        if video_loss_weight != 1.0:
+            extra_loss = extra_loss * video_loss_weight
+            metrics = {
+                key: value * video_loss_weight if key.startswith("loss/") else value
+                for key, value in metrics.items()
+            }
+        return extra_loss, metrics
 
     def _setup_audio_metrics(self, args: argparse.Namespace) -> None:
         """Parse audio metrics CLI flags.  No-op when --audio_metrics is not set."""
@@ -2413,6 +2492,14 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             md["ss_lora_target_preset"] = preset
         if self._ic_lora_strategy and self._ic_lora_strategy != "none":
             md["ss_ic_lora_strategy"] = self._ic_lora_strategy
+        if bool(getattr(args, "latent_temporal_weighting", False)):
+            md["ss_latent_temporal_weighting"] = True
+            if getattr(args, "latent_temporal_weighting_args", None):
+                md["ss_latent_temporal_weighting_args"] = " ".join(args.latent_temporal_weighting_args)
+        if bool(getattr(args, "latent_delta_loss", False)):
+            md["ss_latent_delta_loss"] = True
+            if getattr(args, "latent_delta_loss_args", None):
+                md["ss_latent_delta_loss_args"] = " ".join(args.latent_delta_loss_args)
         if self._ic_lora_strategy == "v2v":
             md["ss_v2v_training"] = True
         elif self._ic_lora_strategy == "self_ref_v2v":
@@ -4441,11 +4528,31 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
 
         # HFATO: pass metadata for x0-prediction loss in the training loop
         _hfato_data = batch.get("_hfato")
+        latent_temporal_clean = latents
         if _hfato_data is not None:
+            if isinstance(_hfato_data.get("clean_latents"), torch.Tensor):
+                latent_temporal_clean = _hfato_data["clean_latents"]
             out["_hfato"] = {
                 "noisy": noisy_model_input,
                 "clean": _hfato_data["clean_latents"],
                 "sigma": sigma,
+            }
+
+        latent_temporal_enabled = (
+            self._latent_temporal_weighting_config is not None
+            or self._latent_delta_loss_config is not None
+        )
+        if latent_temporal_enabled and isinstance(video_pred, torch.Tensor) and video_pred.dim() == 5:
+            sigma_for_latents = sigma
+            if model_timesteps.dim() == 2:
+                bsz, _channels, frames, height, width = model_noisy_video.shape
+                seq_len = int(frames * height * width)
+                if int(model_timesteps.shape[1]) == seq_len:
+                    sigma_for_latents = model_timesteps.view(bsz, frames, height, width).unsqueeze(1)
+            out["_latent_temporal"] = {
+                "clean_latents": latent_temporal_clean,
+                "noisy_latents": model_noisy_video,
+                "sigma": sigma_for_latents,
             }
 
         if out["video_loss_weight"] < 0.0:

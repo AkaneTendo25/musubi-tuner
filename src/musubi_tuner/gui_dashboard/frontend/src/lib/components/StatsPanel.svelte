@@ -84,6 +84,7 @@
 			{#if stats.vram}
 				<div class="p-2.5" style="background: var(--bg-elevated); border-radius: var(--radius-sm);">
 					<div class="text-[10px] font-semibold mb-1.5 uppercase tracking-wider" style="color: var(--accent);">VRAM Estimates</div>
+					<div class="text-[10px] mb-1.5" style="color: var(--text-muted);">Approximate, not a strict limit.</div>
 					<div class="space-y-1.5">
 						<div class={statRowClass}>
 							<span class="text-[11px]" style="color: var(--text-muted);">Peak Training:</span>
@@ -199,6 +200,7 @@
 			{#if stats.vram}
 				<div class="p-2.5" style="background: var(--bg-elevated); border-radius: var(--radius-sm);">
 					<div class="text-[10px] font-semibold mb-1.5 uppercase tracking-wider" style="color: var(--accent);">VRAM Estimates</div>
+					<div class="text-[10px] mb-1.5" style="color: var(--text-muted);">Approximate, not a strict limit.</div>
 					<div class="space-y-1.5">
 						<div class={statRowClass}>
 							<span class="text-[11px]" style="color: var(--text-muted);">Peak Training:</span>

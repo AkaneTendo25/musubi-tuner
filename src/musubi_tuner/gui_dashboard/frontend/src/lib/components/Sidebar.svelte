@@ -246,7 +246,6 @@
 					>
 						<span class="w-2.5 h-2.5 rounded-full flex-shrink-0" style="background: {t.swatch}; box-shadow: 0 0 4px {t.swatch}30;"></span>
 						<span class="flex-1 text-left">{t.name}</span>
-						<span class="text-[10px]" style="color: var(--text-muted);">{t.desc}</span>
 						{#if $theme === t.id}
 							<svg class="w-3 h-3 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5"><path d="M5 13l4 4L19 7"/></svg>
 						{/if}

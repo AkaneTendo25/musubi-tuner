@@ -67,6 +67,16 @@ def _coerce_int(value, default: int) -> int:
         return default
 
 
+def _coerce_float(value, default: float) -> float:
+    """Coerce nullable or string-like values to float with a safe fallback."""
+    if value in (None, ""):
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def _first_training_dataset(config: dict) -> dict:
     """Return the primary dataset used for training/stat estimates."""
     datasets = config.get('dataset', {}).get('datasets', [])
@@ -290,9 +300,10 @@ def _calculate_vram_stats(config: dict) -> VRAMStats | None:
         ds = _first_training_dataset(config)
 
         # ── DiT weights ──
-        ltx_version = str(training.get('ltx_version', '2.0'))
+        ltx_version = str(training.get('ltx_version', '2.3'))
         dit_bf16 = 42.0 if ltx_version == '2.3' else 39.0
         is_fp8 = bool(training.get('fp8_base'))
+        is_w8a8 = bool(training.get('fp8_w8a8'))
         is_nf4 = bool(training.get('nf4_base'))
         dit_base = (dit_bf16 / 4) if is_nf4 else (dit_bf16 / 2) if is_fp8 else dit_bf16
 
@@ -303,12 +314,13 @@ def _calculate_vram_stats(config: dict) -> VRAMStats | None:
 
         # ── LoRA weights ──
         rank = max(_coerce_int(training.get('network_dim', 16), 16), 1)
-        mode = str(training.get('ltx2_mode', 'video'))
+        mode = str(training.get('ltx2_mode', 'video')).lower()
         is_av = mode == 'av'
         lora_base_per_rank = (12.75 if is_av else 6.0) / 1024  # GB per rank
         preset_mult = {
             't2v': 1.0, 'v2v': 1.44, 'video_sa': 0.37, 'video_sa_ff': 0.56,
-            'video_sa_ca_ff': 0.74, 'audio': 0.52, 'audio_ref_only_ic': 0.63, 'full': 2.1,
+            'video_sa_ca_ff': 0.74, 'audio': 0.52, 'audio_ref_only_ic': 0.63,
+            'av_ic': 1.44, 'video_ref_only_av': 1.44, 'full': 2.1,
         }.get(training.get('lora_target_preset'), 1.0)
         lora_size_gb = rank * lora_base_per_rank * preset_mult
 
@@ -332,8 +344,8 @@ def _calculate_vram_stats(config: dict) -> VRAMStats | None:
         latent_w = max(1, res_w // 32)
         seq_len = latent_f * latent_h * latent_w
 
-        hidden_dim = 4096
-        bytes_per_val = 1 if is_fp8 else 2
+        hidden_dim = 2048 if mode == 'audio' else 4096
+        bytes_per_val = 1 if is_w8a8 else 2
         grad_ckpt = training.get('gradient_checkpointing', True)
         blockwise = bool(training.get('blockwise_checkpointing'))
 
@@ -379,10 +391,20 @@ def _calculate_vram_stats(config: dict) -> VRAMStats | None:
         # ── Self-Flow ──
         self_flow_gb = 0
         if training.get('self_flow'):
-            teacher_on_gpu = not training.get('self_flow_offload_teacher_params')
-            self_flow_gb += lora_size_gb if teacher_on_gpu else 0
-            self_flow_gb += 0.02  # projector MLP
-            self_flow_gb += activations_gb * 0.10
+            teacher_mode = str(training.get('self_flow_teacher_mode', 'base')).lower()
+            if teacher_mode == 'ema':
+                self_flow_gb += lora_size_gb
+            elif teacher_mode == 'partial_ema':
+                self_flow_gb += max(lora_size_gb / total_blocks, 0.01)
+
+            has_audio_projector = (
+                mode in {'av', 'audio'}
+                and _coerce_float(training.get('self_flow_lambda_audio', 0.0), 0.0) > 0.0
+            )
+            self_flow_gb += 0.03 if has_audio_projector else 0.02
+
+            feature_factor = 0.03 if training.get('self_flow_offload_teacher_features') else 0.10
+            self_flow_gb += activations_gb * feature_factor
 
         # ── CREPA ──
         crepa_gb = 0

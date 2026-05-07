@@ -494,6 +494,25 @@ class TrainingConfig(BaseModel):
     hfato_interpolation: Literal["bilinear", "nearest", "bicubic"] = "bilinear"
     hfato_probability: float = 1.0
 
+    # Latent temporal objectives
+    latent_temporal_weighting: bool = False
+    latent_temporal_weighting_args: str = ""
+    latent_temporal_weighting_alpha: float = 0.5
+    latent_temporal_weighting_mode: Literal["log", "linear"] = "log"
+    latent_temporal_weighting_normalize: Literal["mean", "max", "none"] = "mean"
+    latent_temporal_weighting_clip_min: float = 0.5
+    latent_temporal_weighting_clip_max: float = 2.0
+    latent_delta_loss: bool = False
+    latent_delta_loss_args: str = ""
+    latent_delta_loss_weight: float = 0.03
+    latent_delta_loss_order: Literal["1", "2", "1+2", "both"] = "1"
+    latent_delta_loss_target: Literal["x0", "velocity"] = "x0"
+    latent_delta_loss_sigma_min: float = 0.05
+    latent_delta_loss_sigma_max: float = 0.85
+    latent_delta_loss_second_order_weight: float = 0.5
+    latent_delta_loss_type: Literal["mse", "l1", "huber", "smooth_l1"] = "mse"
+    latent_delta_loss_huber_delta: float = 1.0
+
     # Audio features
     audio_loss_balance_mode: Literal["none", "inv_freq", "ema_mag", "uncertainty", "ogm_ge"] = "none"
     audio_loss_balance_beta: float = 0.01

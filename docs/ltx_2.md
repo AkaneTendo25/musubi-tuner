@@ -578,7 +578,7 @@ accelerate launch ... ltx2_train_network.py ^
 
 - LoftQ is rank-specific: changing `--network_dim` requires re-running the quantize script with the new rank. The quantized model itself does not need to be regenerated.
 - `--awq_calibration` is incompatible with pre-quantized models (requires full-precision weights).
-- The quantized output is bit-for-bit identical to dynamic quantization on the same device.
+- Pre-quantized checkpoints use the same NF4 packing/dequantization path as runtime dynamic quantization for the same block size. Exact byte equality can still depend on device, PyTorch, and CUDA behavior.
 
 **Notes:**
 - `--nf4_base` and `--fp8_base` are mutually exclusive.
@@ -678,7 +678,7 @@ Example:
 
 Use `ema_mag` when audio and video losses have different natural magnitudes and you want automatic scaling instead of manual `--audio_loss_weight` tuning.
 
-**`uncertainty` mode** — learnable homoscedastic uncertainty weighting (Kendall et al., CVPR 2018). Two log-variance scalars (`log_var_video`, `log_var_audio`) are added to the optimizer and learned jointly with LoRA weights. The combined loss is:
+**`uncertainty` mode** — learnable homoscedastic uncertainty weighting ([Kendall et al., CVPR 2018](https://arxiv.org/abs/1705.07115)). Two log-variance scalars (`log_var_video`, `log_var_audio`) are added to the optimizer and learned jointly with LoRA weights. The combined loss is:
 
 ```
 loss = 0.5 * exp(-log_var_v) * L_video + 0.5 * log_var_v
@@ -730,7 +730,7 @@ On video-only batches (no audio in the current batch), falls back to standard `v
 
 #### Modality Freezing (G2D)
 
-Adaptive modality freezing based on per-modality loss EMA ratio (G2D Sequential Modality Prioritization, 2025). When one modality's loss is significantly lower than the other, its LoRA parameters are frozen (`requires_grad=False`) so the under-performing modality can train without gradient interference.
+Adaptive modality freezing based on per-modality loss EMA ratio, inspired by G2D Sequential Modality Prioritization ([arXiv 2506.21514](https://arxiv.org/abs/2506.21514)). When one modality's loss is significantly lower than the other, its LoRA parameters are frozen (`requires_grad=False`) so the under-performing modality can train without gradient interference.
 
 - `--modality_freeze_check_interval <int>`: Check freeze state every N steps. `0` = disabled (default).
 - `--modality_freeze_ratio_threshold <float>`: Freeze threshold (default: `0.5`). Audio LoRA is frozen when `audio_loss_ema / video_loss_ema < threshold`. Video LoRA is frozen when the ratio exceeds `1 / threshold`.
@@ -889,7 +889,7 @@ Optional techniques that constrain how the LoRA modifies the base model. All are
 ```
 The `class` parameter should be a general description without your trigger word (e.g., `woman`, `cat`, `landscape`).
 
-**Prior Divergence** — Encourages the LoRA to produce outputs that differ from the base model on training prompts, preventing weak/timid LoRAs:
+**Prior Divergence** — Encourages the LoRA to produce outputs that differ from the base model on training prompts, discouraging overly weak LoRA effects:
 ```bash
 --prior_divergence --prior_divergence_args multiplier=0.1
 ```
@@ -978,7 +978,7 @@ CREPA adds a `loss/crepa` metric to TensorBoard/WandB logs. A healthy CREPA loss
 
 #### Caching DINOv2 Features (Dino Mode)
 
-Dino mode requires pre-cached DINOv2 features. Run this **after latent caching** (cache paths are derived from latent cache files). DINOv2 is not loaded during training — zero VRAM overhead.
+Dino mode requires pre-cached DINOv2 features. Run this **after latent caching** (cache paths are derived from latent cache files). DINOv2 is not loaded during training; only cached tensors are read, so the DINO model itself adds no training VRAM.
 
 ```bash
 python ltx2_cache_dino_features.py ^
@@ -1012,7 +1012,7 @@ The cache file is saved to `<cache_directory>/ltx2_preservation_cache.pt` by def
 
 #### Self-Flow (Self-Supervised Flow Matching)
 
-**Self-Flow** prevents the fine-tuned model from drifting away from the pretrained model's internal representations. It aligns student features (shallower block) against teacher features (deeper block) using cosine similarity, with dual-timestep noising to create a meaningful student-teacher gap. The default `teacher_mode=base` uses the **frozen pretrained model** as teacher by zeroing LoRA multipliers for the teacher forward pass — no extra VRAM overhead compared to EMA. An EMA-based teacher (`teacher_mode=ema`) is also available for LoRA-aware distillation. The optional **temporal extension** adds frame-neighbor and motion-delta losses that explicitly preserve temporal coherence. Based on [arXiv 2603.06507](https://arxiv.org/abs/2603.06507).
+**Self-Flow** is intended to reduce drift from the pretrained model's internal representations. It aligns student features (shallower block) against teacher features (deeper block) using cosine similarity, with dual-timestep noising to create a student-teacher gap. The default `teacher_mode=base` uses the **frozen pretrained model** as teacher by zeroing LoRA multipliers for the teacher forward pass, avoiding a separate teacher-weight copy. An EMA-based teacher (`teacher_mode=ema`) is also available for LoRA-aware distillation. The optional **temporal extension** adds frame-neighbor and motion-delta consistency terms. Based on [arXiv 2603.06507](https://arxiv.org/abs/2603.06507).
 
 Enable with `--self_flow`. Supported in `--ltx2_mode video` and `--ltx2_mode av` (video branch only in AV mode). All parameters are passed via `--self_flow_args` as `key=value` pairs:
 
@@ -1039,7 +1039,7 @@ accelerate launch ... ltx2_train_network.py ^
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `teacher_mode` | `base` | Teacher source: `base` (frozen pretrained; zero LoRA multipliers during teacher pass, no extra VRAM), `ema` (EMA over all LoRA params), `partial_ema` (EMA over teacher block's LoRA params only) |
+| `teacher_mode` | `base` | Teacher source: `base` (frozen pretrained; zero LoRA multipliers during teacher pass, no separate teacher-weight copy), `ema` (EMA over all LoRA params), `partial_ema` (EMA over teacher block's LoRA params only) |
 | `student_block_idx` | `16` | Student feature block index (0-based; overridden by `student_block_ratio` when set) |
 | `teacher_block_idx` | `32` | Teacher feature block index (must be `> student_block_idx`; overridden by `teacher_block_ratio` when set) |
 | `student_block_ratio` | `None` | Ratio-based student layer selection. Resolves to `floor(ratio * depth)`. Takes priority over `student_block_idx`. |
@@ -1081,7 +1081,7 @@ accelerate launch ... ltx2_train_network.py ^
 
 - Supported modes: `--ltx2_mode video`, `--ltx2_mode av`. In AV mode, video alignment is always active when `lambda_self_flow > 0`; audio alignment is active when `lambda_audio > 0`.
 - Image-like training is supported through single-frame samples in `--ltx2_mode video` (set `temporal_mode=off` unless you intentionally want temporal terms to be inactive on image batches).
-- Cost: one extra teacher forward pass per train step. `teacher_mode=base` requires no extra VRAM since it reuses the existing model with LoRA multipliers zeroed.
+- Cost: one extra teacher forward pass per train step. `teacher_mode=base` reuses the existing model with LoRA multipliers zeroed instead of keeping a separate teacher-weight copy.
 - Teacher modes: `base` gives the largest student-teacher gap (pretrained vs LoRA-finetuned); `ema` / `partial_ema` give a moving target that shrinks as training converges.
 - Temporal extension: when `temporal_mode != off`, Self-Flow reshapes hidden states into latent frames and adds frame-neighbor and/or frame-delta consistency losses on top of the base token alignment loss.
 - Granularity: `temporal_granularity=frame` uses mean-pooled per-frame features (cheaper, coarser). `temporal_granularity=patch` keeps spatial tokens for stronger temporal matching.
@@ -1158,9 +1158,70 @@ python ltx2_generate_video.py ^
   --lora_weight stage2_output/last.safetensors
 ```
 
-The resulting LoRA is standard — no inference pipeline changes. Discarding the Stage 1 bridge at inference acts as an implicit regularizer that limits how far the model drifts from its pretrained video priors.
+The resulting LoRA is standard — no inference pipeline changes. In the ViBe Relay LoRA design, Stage 1 is used only to train the Stage 2 base; inference loads the original base model plus the Stage 2 LoRA, so the low-resolution bridge is not part of the deployed model.
 
 HFATO can also be used standalone (without relay) as a spatial detail objective for image or video training.
+
+#### Latent Temporal Objectives
+
+Adds two optional training-only terms to the LTX-2 video loss. The saved LoRA/checkpoint is loaded normally at inference.
+
+- `--latent_temporal_weighting`: computes clean-latent frame deltas `||z[t+1] - z[t]||` and maps them to per-frame multipliers for the denoising loss.
+- `--latent_delta_loss`: computes `x0_pred = noisy - sigma * video_pred` or uses predicted velocity, then matches temporal derivatives to the clean latent target: `Delta pred ~= Delta target`.
+
+Paper basis: `--latent_temporal_weighting` follows Latent Temporal Discrepancy ([arXiv 2601.20504](https://arxiv.org/abs/2601.20504)). `--latent_delta_loss` is an LTX-2-specific auxiliary objective in this trainer, not a direct reproduction of a paper method.
+
+Usage:
+
+```bash
+# LoRA defaults
+accelerate launch ... ltx2_train_network.py ^
+  --latent_temporal_weighting ^
+  --latent_temporal_weighting_args alpha=0.5 mode=log normalize=mean clip_min=0.5 clip_max=2.0 ^
+  --latent_delta_loss ^
+  --latent_delta_loss_args weight=0.03 order=1 target=x0 sigma_min=0.05 sigma_max=0.85
+
+# Lower-weight full fine-tune
+accelerate launch ... ltx2_train_network.py ^
+  --latent_temporal_weighting ^
+  --latent_temporal_weighting_args alpha=0.25 clip_max=1.5 ^
+  --latent_delta_loss ^
+  --latent_delta_loss_args weight=0.01 order=1 target=x0 sigma_min=0.05 sigma_max=0.85
+```
+
+When both flags are off, the trainer does not attach latent-temporal context and the training loss path is unchanged.
+
+Behavior:
+
+- `order=1` matches first-order frame deltas; `order=2` matches second-order deltas; `order=1+2` uses both.
+- `sigma_min` / `sigma_max` gate only the extra delta loss.
+- Delta loss matches target deltas; it does not minimize motion magnitude.
+- HFATO uses its own x0 reducer, so latent temporal weighting is not applied to HFATO's primary loss.
+- Token/reference IC paths are skipped unless they expose 5D video predictions.
+- Logged metrics: `latent_temporal_weight_mean`, `latent_temporal_weight_min`, `latent_temporal_weight_max`, `loss/latent_delta`, `loss/latent_accel`, `loss/latent_temporal_extra`.
+
+##### Weighting Args
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `alpha` | `0.5` | Motion-weight strength |
+| `mode` | `log` | Motion score transform: `log` or `linear` |
+| `normalize` | `mean` | Score normalization |
+| `clip_min` | `0.5` | Lower clamp before final mean rescale |
+| `clip_max` | `2.0` | Upper clamp before final mean rescale |
+
+##### Delta Loss Args
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `weight` | `0.03` | Extra loss multiplier |
+| `order` | `1` | `1`, `2`, `1+2`, or `both` |
+| `target` | `x0` | Match derivatives of `x0` or raw `velocity` |
+| `sigma_min` | `0.0` | Minimum sigma where the extra loss is active |
+| `sigma_max` | `1.0` | Maximum sigma where the extra loss is active |
+| `second_order_weight` | `0.5` | Multiplier for `order=2` term |
+| `loss_type` | `mse` | `mse`, `l1`, `huber`, or `smooth_l1` |
+| `huber_delta` | `1.0` | Huber beta for `huber` / `smooth_l1` |
 
 #### Standalone Inference Overrides
 
@@ -1176,7 +1237,7 @@ HFATO can also be used standalone (without relay) as a spatial detail objective 
 
 #### Audio Quality Metrics
 
-Enable with `--audio_metrics`. All logic in `audio_metrics.py`. Disabled by default with zero overhead.
+Enable with `--audio_metrics`. All logic is in `audio_metrics.py`. When disabled, the trainer does not run the audio-metrics code path.
 
 **Per-step** (latent-space, enabled by default with `--audio_metrics`):
 
@@ -1678,7 +1739,7 @@ Reference audio latents are precached automatically when using `--precache_sampl
 - **AV cross-attention modes**: `--av_cross_attention_mode both` is the default `av_ic` behavior. Use `a2v_only` for audio-to-video only, `v2a_only` for video-to-audio only, or `none` to disable AV cross-modal attention while keeping the rest of `av_ic` intact. All require `--ltx2_mode av`.
 - **Multi-reference `av_ic`**: accepts multiple reference latents when they are provided as stacked tensors or extra `ref_*` entries, and concatenates them before conditioning. This keeps the implementation compatible with the existing single-reference path while allowing richer identity/style aggregation. `--av_multi_ref` is the explicit training-side toggle for this setup.
 - **`video_ref_only_av`**: requires `--ltx2_mode av`, uses reference video only, and keeps the audio branch target-only. This is useful when you want identity/motion conditioning from video without requiring reference audio for every sample.
-- **First-frame conditioning is critical**: without `--ltx2_first_frame_conditioning_p 0.9`, the model cannot learn face identity from the first frame. A warning is emitted if this is not set in AV mode.
+- **First-frame conditioning**: for identity-sensitive AV IC-LoRA, `--ltx2_first_frame_conditioning_p 0.9` is the documented starting point. Without it, identity transfer from the target first frame is often weak. A warning is emitted if this is not set in AV mode.
 - `--ic_lora_strategy auto` (default) infers the strategy from `--lora_target_preset` via `infer_ic_lora_strategy_from_preset()`.
 
 #### Sampling with Tiled VAE
@@ -1722,7 +1783,7 @@ For IC-LoRA / V2V training, you can also precache the conditioning image latents
 #### Two-Stage Sampling
 
 > [!NOTE]
-> This feature is disabled by default. Two-stage inference generates at half resolution, then upsamples and refines. It is intended for larger final outputs; at `512x512`, stage 1 is only `256x256`, so single-stage may look better.
+> This feature is disabled by default. Two-stage inference generates at half resolution, then upsamples and refines. It is intended for larger final outputs; at `512x512`, stage 1 is only `256x256`, so compare against the single-stage baseline before using it.
 
 | Argument | Default | Description |
 |----------|---------|-------------|
@@ -1733,7 +1794,7 @@ For IC-LoRA / V2V training, you can also precache the conditioning image latents
 | `--sample_stage1_distilled_lora_multiplier` | auto | Optional stage-1 distilled LoRA strength. With `res_2s`, auto uses `0.25`; with Euler, auto uses `0.0` |
 | `--sample_stage2_distilled_lora_multiplier` | auto | Optional stage-2 distilled LoRA strength. With `res_2s`, auto uses `0.5`; with Euler, auto uses `1.0` |
 
-For LTX-2.3 quality previews, prefer:
+Code-backed LTX-2.3 preview starting point:
 
 ```bash
 --sample_sampling_preset ltx23 ^
@@ -2180,7 +2241,7 @@ num_repeats = 5
   ```
   --audio_loss_balance_mode ema_mag --audio_loss_balance_target_ratio 0.33
   ```
-- `uncertainty` — two learnable log-variance scalars optimized jointly with LoRA weights (Kendall et al., CVPR 2018). No manual weight tuning required — scalars are learned via backpropagation:
+- `uncertainty` — two learnable log-variance scalars optimized jointly with LoRA weights ([Kendall et al., CVPR 2018](https://arxiv.org/abs/1705.07115)). Reduces manual loss-weight tuning because the scalars are learned via backpropagation:
   ```
   --audio_loss_balance_mode uncertainty
   ```
@@ -2194,12 +2255,12 @@ num_repeats = 5
 --video_caption_dropout_rate 0.1 --audio_caption_dropout_rate 0.15
 ```
 
-**8. Modality freezing** — auto-freezes the dominant modality's LoRA when loss ratio crosses a threshold (G2D, 2025). Lets the under-performing modality train without gradient interference:
+**8. Modality freezing** — auto-freezes the dominant modality's LoRA when loss ratio crosses a threshold, inspired by G2D Sequential Modality Prioritization ([arXiv 2506.21514](https://arxiv.org/abs/2506.21514)). Lets the under-performing modality train without gradient interference:
 ```
 --modality_freeze_check_interval 500 --modality_freeze_ratio_threshold 0.5
 ```
 
-**9. Self-Flow audio alignment** — anchors audio hidden states to the base model's representations via cosine similarity loss, preventing audio feature drift during LoRA adaptation:
+**9. Self-Flow audio alignment** — anchors audio hidden states to the base model's representations via cosine similarity loss, intended to reduce audio feature drift during LoRA adaptation:
 ```
 --self_flow --self_flow_args lambda_self_flow=0.1 lambda_audio=0.1 teacher_mode=base
 ```
@@ -2223,7 +2284,7 @@ num_repeats = 5
 ### Technical Notes
 
 - **Float32 AdaLN**: The transformer applies Adaptive Layer Norm (AdaLN) shift/scale operations in float32, then casts back to the working dtype. This prevents overflow that can occur when bf16 scale values multiply bf16 hidden states. The fix is always active and requires no flags.
-- **Loss dtype**: The LTX-2 training path computes the task loss (MSE, L1, Huber) in `trainer.dit_dtype` (typically bf16 with `--mixed_precision bf16`). Internal regularization losses (motion preservation, CREPA, Self-Flow) always use MSE and are unaffected by `--loss_type`.
+- **Loss dtype**: The LTX-2 training path computes the task loss (MSE, L1, Huber) in `trainer.dit_dtype` (typically bf16 with `--mixed_precision bf16`). Internal regularization losses (motion preservation, CREPA, Self-Flow, latent temporal objectives) always use their own configured loss and are unaffected by global `--loss_type`.
 
 For additional troubleshooting resources, see the [LTX-2 documentation hub](https://docs.ltx.video/open-source-model/getting-started/overview), the [Banodoco Discord](https://discord.gg/banodoco) community, and the [awesome-ltx2](https://github.com/wildminder/awesome-ltx2) curated resource list.
 
@@ -2485,7 +2546,7 @@ Additional notes:
 ### Slider Tips
 
 - **Start small**: `--network_dim 8` or `16` with `--max_train_steps 200-500` is usually sufficient.
-- **Monitor loss**: Loss should decrease steadily. If it diverges, reduce `--learning_rate`.
+- **Monitor loss**: Loss usually trends downward once training is stable. If it diverges, reduce `--learning_rate`.
 - **Preview samples**: Add `--sample_prompts sampling_prompts.txt --sample_every_n_steps 50` to generate previews at each slider strength during training. Requires `--gemma_root` for text encoding. For audio sliders, also use `--sample_audio_only`.
 - **Guidance strength**: For text-only mode, the default is `1.0`. Values of `2.0-3.0` increase direction strength but may reduce convergence stability.
 - **Multiple targets**: Text-only mode supports multiple `[[targets]]` blocks. Each step randomly selects one target, so all directions get trained evenly.
@@ -2570,8 +2631,17 @@ When a cache, training, slider training, or inference job is started from the da
 
 **Research**
 - [ID-LoRA](https://github.com/ID-LoRA/ID-LoRA) — In-context identity LoRA; the audio-reference IC-LoRA implementation in this trainer is based on this approach
+- [QLoRA (arXiv 2305.14314)](https://arxiv.org/abs/2305.14314) — Introduces NF4 quantization used by the `--nf4_base` implementation
+- [LoftQ (arXiv 2310.08659)](https://arxiv.org/abs/2310.08659) — Quantization-aware LoRA initialization used by `--loftq_init`
+- [AWQ (arXiv 2306.00978)](https://arxiv.org/abs/2306.00978) — Activation-aware quantization background for `--awq_calibration`
+- [DINOv2 (arXiv 2304.07193)](https://arxiv.org/abs/2304.07193) — External visual features used by CREPA dino mode
 - [CREPA (arXiv 2506.09229)](https://arxiv.org/abs/2506.09229) — Cross-frame Representation Alignment; basis for `--crepa dino` mode (DINOv2 teacher from neighboring frames)
+- [Latent Temporal Discrepancy (arXiv 2601.20504)](https://arxiv.org/abs/2601.20504) — Motion-prior loss weighting basis for `--latent_temporal_weighting`
+- [CCL / TARP / DCR (arXiv 2603.18600)](https://arxiv.org/abs/2603.18600) — Cross-modal context learning; basis for `--tarp` and `--dcr`
 - [Self-Flow (arXiv 2603.06507)](https://arxiv.org/abs/2603.06507) — Self-supervised flow matching regularization; basis for `--self_flow`
+- [ViBe / HFATO / Relay LoRA (arXiv 2603.23326)](https://arxiv.org/abs/2603.23326) — Basis for `--hfato` and the Relay LoRA workflow
+- [G2D (arXiv 2506.21514)](https://arxiv.org/abs/2506.21514) — Sequential Modality Prioritization inspiration for modality freezing
+- [UniAVGen (arXiv 2511.03334)](https://arxiv.org/abs/2511.03334) — Joint audio-video generation reference for lower-LR AV training guidance
 - [Harmony (arXiv 2511.21579)](https://arxiv.org/abs/2511.21579) — Cross-Task Synergy; basis for `--cts_lambda_video_driven` and `--cts_lambda_audio_driven`
 
 **LTX Resources**

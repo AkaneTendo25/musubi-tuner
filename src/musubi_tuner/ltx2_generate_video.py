@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import sys
 from types import SimpleNamespace
 from typing import List, Optional
 
@@ -29,6 +30,18 @@ from musubi_tuner.utils.device_utils import clean_memory_on_device
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
+
+
+def _configure_windows_cli_encoding() -> None:
+    """Keep Unicode help text printable when Windows stdout is not UTF-8."""
+    if os.name != "nt":
+        return
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
 
 
 def _apply_reference_conditioning_overrides(
@@ -546,6 +559,7 @@ def _build_prompt_list(
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    _configure_windows_cli_encoding()
     args = parse_args()
 
     # Wire up aliases that the training code expects

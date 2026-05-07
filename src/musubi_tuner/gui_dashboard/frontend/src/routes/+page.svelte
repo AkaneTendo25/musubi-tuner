@@ -469,6 +469,7 @@
 		const ltxVersion = String(t.ltx_version || '2.3');
 		const ditBF16 = ltxVersion === '2.3' ? 42 : 39;
 		const isFp8 = !!t.fp8_base;
+		const isW8A8 = !!t.fp8_w8a8;
 		const isNF4 = !!t.nf4_base;
 		let ditBase = isNF4 ? (ditBF16 / 4) : isFp8 ? (ditBF16 / 2) : ditBF16;
 
@@ -526,8 +527,8 @@
 		const audioTokens = isAV ? Math.round(sourceFrames) : 0;
 		if (mode === 'audio') seqTokens = Math.round(sourceFrames);  // audio-only
 
-		const hiddenDim = 4096;  // video inner_dim = 32 heads * 128 dim_head
-		const bytesPerValue = isFp8 ? 1 : 2;
+		const hiddenDim = mode === 'audio' ? 2048 : 4096;
+		const bytesPerValue = isW8A8 ? 1 : 2;
 
 		// Per-block activation: ~10 tensors of (batch, seq_len, hidden_dim) without checkpointing,
 		// ~2 with gradient checkpointing (only block boundaries stored, recomputed in backward).
@@ -572,14 +573,17 @@
 		if (t.prior_divergence) preservationOverhead += activationTotal * 0.15;
 
 		// ── Self-Flow ──
-		// Shadow params (EMA teacher): clone of LoRA weights on GPU (or CPU if offloaded)
-		// Projector MLP: ~0.02 GB. Extra forward activations: ~10% overhead.
+		// teacher_mode=base reuses the frozen base via zeroed LoRA multipliers.
+		// EMA modes keep shadow trainable params; offload_teacher_features only moves cached features.
 		let selfFlowOverhead = 0;
 		if (t.self_flow) {
-			const teacherOnGPU = !t.self_flow_offload_teacher_params;
-			selfFlowOverhead += teacherOnGPU ? loraParamsGB : 0;  // shadow params
-			selfFlowOverhead += 0.02;  // projector MLP
-			selfFlowOverhead += activationTotal * 0.10;  // extra forward activation overhead
+			const teacherMode = String(t.self_flow_teacher_mode || 'base').toLowerCase();
+			if (teacherMode === 'ema') selfFlowOverhead += loraParamsGB;
+			else if (teacherMode === 'partial_ema') selfFlowOverhead += Math.max(loraParamsGB / totalBlocks, 0.01);
+
+			const hasAudioProjector = (mode === 'av' || mode === 'audio') && Number(t.self_flow_lambda_audio || 0) > 0;
+			selfFlowOverhead += hasAudioProjector ? 0.03 : 0.02;
+			selfFlowOverhead += activationTotal * (t.self_flow_offload_teacher_features ? 0.03 : 0.10);
 		}
 
 		// ── CREPA ──
@@ -924,6 +928,9 @@
 					VRAM Estimation{#if gpu} — {gpu.name.replace('NVIDIA ','').replace('GeForce ','')}{/if}
 				</span>
 				<span class="text-[10px] tabular-nums" style="color: var(--text-muted);">{vramTotal} GB total</span>
+			</div>
+			<div class="text-[10px] -mt-2 mb-3" style="color: var(--text-muted);">
+				Approximate planning estimate, not a strict guarantee. Actual VRAM depends on runtime kernels, driver/CUDA allocator behavior, data shape, and temporary spikes.
 			</div>
 			<div class="grid grid-cols-3 gap-3">
 				<!-- Latent Caching gauge -->

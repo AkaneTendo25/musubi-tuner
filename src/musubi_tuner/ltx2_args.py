@@ -1106,6 +1106,43 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         "dual_timestep=true student_block_ratio=0.3 teacher_block_ratio=0.7 projector_lr=5e-5",
     )
 
+    # -- Latent temporal objectives --
+    parser.add_argument(
+        "--latent_temporal_weighting",
+        action="store_true",
+        help=(
+            "Enable latent motion weighting for the video denoising loss. "
+            "Clean latent frame deltas are converted into per-frame loss weights."
+        ),
+    )
+    parser.add_argument(
+        "--latent_temporal_weighting_args",
+        type=str,
+        nargs="*",
+        help=(
+            "Key=value args for latent temporal weighting, e.g. "
+            "alpha=0.5 mode=log normalize=mean clip_min=0.5 clip_max=2.0"
+        ),
+    )
+    parser.add_argument(
+        "--latent_delta_loss",
+        action="store_true",
+        help=(
+            "Enable latent temporal derivative matching for video training. "
+            "By default this matches predicted x0 frame deltas to clean latent frame deltas."
+        ),
+    )
+    parser.add_argument(
+        "--latent_delta_loss_args",
+        type=str,
+        nargs="*",
+        help=(
+            "Key=value args for latent delta loss, e.g. "
+            "weight=0.03 order=1 target=x0 sigma_min=0.05 sigma_max=0.85 "
+            "second_order_weight=0.5 loss_type=mse"
+        ),
+    )
+
     # -- HFATO (High-Frequency Awareness Training Objective, ViBe) --
     parser.add_argument(
         "--hfato",

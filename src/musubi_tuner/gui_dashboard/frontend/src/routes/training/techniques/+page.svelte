@@ -198,7 +198,7 @@
 				<div class="p-3" style="background: var(--bg-elevated); border-radius: var(--radius-sm); border: 1px solid var(--border-subtle);">
 					<div class="text-[11px] font-semibold mb-2" style="color: var(--text-primary);">Architecture</div>
 					<div class="grid grid-cols-3 gap-2 mb-2">
-						<FormSelect fieldPath="training.self_flow_teacher_mode" value={$projectConfig?.training?.self_flow_teacher_mode ?? 'base'} onchange={(e) => updateTraining('self_flow_teacher_mode', e.target.value)} options={[{value: 'base', label: 'Base model'}, {value: 'ema', label: 'EMA (all LoRA)'}, {value: 'partial_ema', label: 'Partial EMA (teacher block)'}]} tooltip="base: frozen pretrained model (no VRAM overhead, stronger gap). ema: EMA over all LoRA params. partial_ema: EMA only over teacher block's LoRA params." />
+						<FormSelect fieldPath="training.self_flow_teacher_mode" value={$projectConfig?.training?.self_flow_teacher_mode ?? 'base'} onchange={(e) => updateTraining('self_flow_teacher_mode', e.target.value)} options={[{value: 'base', label: 'Base model'}, {value: 'ema', label: 'EMA (all LoRA)'}, {value: 'partial_ema', label: 'Partial EMA (teacher block)'}]} tooltip="base: frozen pretrained model via zeroed LoRA multipliers, with no EMA shadow params. ema: EMA over all LoRA params. partial_ema: EMA only over teacher block's LoRA params." />
 						<FormField type="number" fieldPath="training.self_flow_student_block_idx" value={$projectConfig?.training?.self_flow_student_block_idx ?? 16} oninput={(e) => updateTraining('self_flow_student_block_idx', Number(e.target.value))} min={0} max={47} tooltip="Student feature block index (overridden by ratio when set)" />
 						<FormField fieldPath="training.self_flow_teacher_block_idx" label="Teacher Block" type="number" value={$projectConfig?.training?.self_flow_teacher_block_idx ?? 32} oninput={(e) => updateTraining('self_flow_teacher_block_idx', Number(e.target.value))} min={0} max={47} tooltip="Teacher feature block index (must be > student; overridden by ratio when set)" />
 					</div>
@@ -305,6 +305,69 @@
 					</div>
 					<div class="mt-2">
 						<FormField fieldPath="training.hfato_args" value={$projectConfig?.training?.hfato_args || ''} oninput={(e) => updateTraining('hfato_args', e.target.value)} placeholder="key=value ..." tooltip="Additional values passed after --hfato_args." />
+					</div>
+				</div>
+			</div>
+		</div>
+
+		<!-- Latent Temporal Objectives -->
+		<div style="background: var(--bg-surface); border: 1px solid var(--border-subtle); border-radius: var(--radius-md); position: relative; overflow: hidden;">
+			<div style="position: absolute; top: 0; left: 0; right: 0; height: 2px; background: linear-gradient(90deg, transparent, var(--accent), var(--secondary, var(--accent)), transparent); opacity: 0.5;"></div>
+
+			<div class="p-5 pb-0">
+				<div class="flex items-center gap-3 mb-2">
+					<div class="w-8 h-8 flex items-center justify-center flex-shrink-0" style="background: var(--accent-muted); border-radius: var(--radius-sm);">
+						<svg class="w-4 h-4" style="color: var(--accent);" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.5"><path d="M4.5 12.75l6-6 4.5 4.5 4.5-4.5M4.5 17.25l6-6 4.5 4.5 4.5-4.5"/></svg>
+					</div>
+					<div>
+						<div class="text-[13px] font-semibold" style="color: var(--text-primary);">Latent Temporal Objectives</div>
+						<div class="text-[11px]" style="color: var(--text-muted);">Clean-latent motion weighting and predicted-latent derivative loss</div>
+					</div>
+				</div>
+				<p class="text-[12px] leading-relaxed mb-3" style="color: var(--text-secondary);">
+					Training-only terms: per-frame denoising weights from clean latent deltas, plus optional derivative matching on predicted x0 or velocity.
+				</p>
+			</div>
+
+			<div class="p-5 pt-0 space-y-3">
+				<div class="p-3" style="background: var(--bg-elevated); border-radius: var(--radius-sm); border: 1px solid var(--border-subtle);">
+					<div class="flex items-center justify-between mb-2">
+						<span class="text-[12px] font-semibold" style="color: var(--text-primary);">Latent Motion Weighting</span>
+						<FormToggle fieldPath="training.latent_temporal_weighting" checked={$projectConfig?.training?.latent_temporal_weighting ?? false} onchange={(e) => updateTraining('latent_temporal_weighting', e.target.checked)} />
+					</div>
+					<div class="grid grid-cols-3 gap-2 mb-2">
+						<FormField type="number" fieldPath="training.latent_temporal_weighting_alpha" value={$projectConfig?.training?.latent_temporal_weighting_alpha ?? 0.5} oninput={(e) => updateTraining('latent_temporal_weighting_alpha', Number(e.target.value))} step="0.05" min={0} disabled={!$projectConfig?.training?.latent_temporal_weighting} tooltip="Strength of clean-latent motion weighting. Start lower for full fine-tuning." />
+						<FormSelect fieldPath="training.latent_temporal_weighting_mode" value={$projectConfig?.training?.latent_temporal_weighting_mode || 'log'} onchange={(e) => updateTraining('latent_temporal_weighting_mode', e.target.value)} options={[{value: 'log', label: 'Log'}, {value: 'linear', label: 'Linear'}]} disabled={!$projectConfig?.training?.latent_temporal_weighting} tooltip="How frame-to-frame latent discrepancy is converted to motion scores." />
+						<FormSelect fieldPath="training.latent_temporal_weighting_normalize" value={$projectConfig?.training?.latent_temporal_weighting_normalize || 'mean'} onchange={(e) => updateTraining('latent_temporal_weighting_normalize', e.target.value)} options={[{value: 'mean', label: 'Mean'}, {value: 'max', label: 'Max'}, {value: 'none', label: 'None'}]} disabled={!$projectConfig?.training?.latent_temporal_weighting} tooltip="Normalization applied before turning motion scores into loss weights." />
+					</div>
+					<div class="grid grid-cols-2 gap-2">
+						<FormField type="number" fieldPath="training.latent_temporal_weighting_clip_min" value={$projectConfig?.training?.latent_temporal_weighting_clip_min ?? 0.5} oninput={(e) => updateTraining('latent_temporal_weighting_clip_min', Number(e.target.value))} step="0.05" min={0.01} disabled={!$projectConfig?.training?.latent_temporal_weighting} tooltip="Lower clamp before final mean rescale." />
+						<FormField type="number" fieldPath="training.latent_temporal_weighting_clip_max" value={$projectConfig?.training?.latent_temporal_weighting_clip_max ?? 2.0} oninput={(e) => updateTraining('latent_temporal_weighting_clip_max', Number(e.target.value))} step="0.05" min={0.01} disabled={!$projectConfig?.training?.latent_temporal_weighting} tooltip="Upper clamp before final mean rescale." />
+					</div>
+					<div class="mt-2">
+						<FormField fieldPath="training.latent_temporal_weighting_args" value={$projectConfig?.training?.latent_temporal_weighting_args || ''} oninput={(e) => updateTraining('latent_temporal_weighting_args', e.target.value)} placeholder="alpha=0.5 clip_max=2.0" disabled={!$projectConfig?.training?.latent_temporal_weighting} tooltip="Additional values passed after --latent_temporal_weighting_args." />
+					</div>
+				</div>
+
+				<div class="p-3" style="background: var(--bg-elevated); border-radius: var(--radius-sm); border: 1px solid var(--border-subtle);">
+					<div class="flex items-center justify-between mb-2">
+						<span class="text-[12px] font-semibold" style="color: var(--text-primary);">Predicted Latent Delta Loss</span>
+						<FormToggle fieldPath="training.latent_delta_loss" checked={$projectConfig?.training?.latent_delta_loss ?? false} onchange={(e) => updateTraining('latent_delta_loss', e.target.checked)} />
+					</div>
+					<div class="grid grid-cols-4 gap-2 mb-2">
+						<FormField type="number" fieldPath="training.latent_delta_loss_weight" value={$projectConfig?.training?.latent_delta_loss_weight ?? 0.03} oninput={(e) => updateTraining('latent_delta_loss_weight', Number(e.target.value))} step="0.005" min={0} disabled={!$projectConfig?.training?.latent_delta_loss} tooltip="Extra latent temporal loss weight. Use 0.01-0.05 as a first range." />
+						<FormSelect fieldPath="training.latent_delta_loss_order" value={$projectConfig?.training?.latent_delta_loss_order || '1'} onchange={(e) => updateTraining('latent_delta_loss_order', e.target.value)} options={[{value: '1', label: 'Delta'}, {value: '2', label: 'Accel'}, {value: '1+2', label: 'Delta + Accel'}]} disabled={!$projectConfig?.training?.latent_delta_loss} tooltip="First-order delta, second-order acceleration, or both." />
+						<FormSelect fieldPath="training.latent_delta_loss_target" value={$projectConfig?.training?.latent_delta_loss_target || 'x0'} onchange={(e) => updateTraining('latent_delta_loss_target', e.target.value)} options={[{value: 'x0', label: 'x0'}, {value: 'velocity', label: 'Velocity'}]} disabled={!$projectConfig?.training?.latent_delta_loss} tooltip="Latent quantity whose temporal derivatives are matched." />
+						<FormSelect fieldPath="training.latent_delta_loss_type" value={$projectConfig?.training?.latent_delta_loss_type || 'mse'} onchange={(e) => updateTraining('latent_delta_loss_type', e.target.value)} options={[{value: 'mse', label: 'MSE'}, {value: 'l1', label: 'L1'}, {value: 'huber', label: 'Huber'}, {value: 'smooth_l1', label: 'Smooth L1'}]} disabled={!$projectConfig?.training?.latent_delta_loss} tooltip="Loss function for temporal derivative matching." />
+					</div>
+					<div class="grid grid-cols-4 gap-2">
+						<FormField type="number" fieldPath="training.latent_delta_loss_sigma_min" value={$projectConfig?.training?.latent_delta_loss_sigma_min ?? 0.05} oninput={(e) => updateTraining('latent_delta_loss_sigma_min', Number(e.target.value))} step="0.01" min={0} max={1} disabled={!$projectConfig?.training?.latent_delta_loss} tooltip="Minimum sigma where the extra loss is active." />
+						<FormField type="number" fieldPath="training.latent_delta_loss_sigma_max" value={$projectConfig?.training?.latent_delta_loss_sigma_max ?? 0.85} oninput={(e) => updateTraining('latent_delta_loss_sigma_max', Number(e.target.value))} step="0.01" min={0} max={1} disabled={!$projectConfig?.training?.latent_delta_loss} tooltip="Maximum sigma where the extra loss is active." />
+						<FormField type="number" fieldPath="training.latent_delta_loss_second_order_weight" value={$projectConfig?.training?.latent_delta_loss_second_order_weight ?? 0.5} oninput={(e) => updateTraining('latent_delta_loss_second_order_weight', Number(e.target.value))} step="0.05" min={0} disabled={!$projectConfig?.training?.latent_delta_loss} tooltip="Relative weight for second-order acceleration when enabled." />
+						<FormField type="number" fieldPath="training.latent_delta_loss_huber_delta" value={$projectConfig?.training?.latent_delta_loss_huber_delta ?? 1.0} oninput={(e) => updateTraining('latent_delta_loss_huber_delta', Number(e.target.value))} step="0.1" min={0.01} disabled={!$projectConfig?.training?.latent_delta_loss} tooltip="Huber beta when using huber or smooth_l1." />
+					</div>
+					<div class="mt-2">
+						<FormField fieldPath="training.latent_delta_loss_args" value={$projectConfig?.training?.latent_delta_loss_args || ''} oninput={(e) => updateTraining('latent_delta_loss_args', e.target.value)} placeholder="weight=0.03 order=1 target=x0" disabled={!$projectConfig?.training?.latent_delta_loss} tooltip="Additional values passed after --latent_delta_loss_args." />
 					</div>
 				</div>
 			</div>

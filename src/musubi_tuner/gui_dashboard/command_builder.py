@@ -1178,6 +1178,47 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
         if args_parts:
             cmd += ["--hfato_args"] + args_parts
 
+    # Latent temporal objectives
+    if t.latent_temporal_weighting:
+        cmd.append("--latent_temporal_weighting")
+        args_parts = []
+        _append_key_value_args(args_parts, t.latent_temporal_weighting_args)
+        if t.latent_temporal_weighting_alpha != 0.5:
+            args_parts.append(f"alpha={t.latent_temporal_weighting_alpha}")
+        if t.latent_temporal_weighting_mode != "log":
+            args_parts.append(f"mode={t.latent_temporal_weighting_mode}")
+        if t.latent_temporal_weighting_normalize != "mean":
+            args_parts.append(f"normalize={t.latent_temporal_weighting_normalize}")
+        if t.latent_temporal_weighting_clip_min != 0.5:
+            args_parts.append(f"clip_min={t.latent_temporal_weighting_clip_min}")
+        if t.latent_temporal_weighting_clip_max != 2.0:
+            args_parts.append(f"clip_max={t.latent_temporal_weighting_clip_max}")
+        if args_parts:
+            cmd += ["--latent_temporal_weighting_args"] + args_parts
+
+    if t.latent_delta_loss:
+        cmd.append("--latent_delta_loss")
+        args_parts = []
+        _append_key_value_args(args_parts, t.latent_delta_loss_args)
+        if t.latent_delta_loss_weight != 0.03:
+            args_parts.append(f"weight={t.latent_delta_loss_weight}")
+        if t.latent_delta_loss_order != "1":
+            args_parts.append(f"order={t.latent_delta_loss_order}")
+        if t.latent_delta_loss_target != "x0":
+            args_parts.append(f"target={t.latent_delta_loss_target}")
+        if t.latent_delta_loss_sigma_min != 0.0:
+            args_parts.append(f"sigma_min={t.latent_delta_loss_sigma_min}")
+        if t.latent_delta_loss_sigma_max != 1.0:
+            args_parts.append(f"sigma_max={t.latent_delta_loss_sigma_max}")
+        if t.latent_delta_loss_second_order_weight != 0.5:
+            args_parts.append(f"second_order_weight={t.latent_delta_loss_second_order_weight}")
+        if t.latent_delta_loss_type != "mse":
+            args_parts.append(f"loss_type={t.latent_delta_loss_type}")
+        if t.latent_delta_loss_huber_delta != 1.0:
+            args_parts.append(f"huber_delta={t.latent_delta_loss_huber_delta}")
+        if args_parts:
+            cmd += ["--latent_delta_loss_args"] + args_parts
+
     # Preservation
     if t.blank_preservation:
         cmd.append("--blank_preservation")
