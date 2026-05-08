@@ -19,7 +19,7 @@ router = APIRouter(prefix="/api/system", tags=["system"])
 
 _LTX_DOC_BRANCHES = {"ltx-2", "ltx-2-dev"}
 _LTX_DOCS_REPO = "https://github.com/AkaneTendo25/musubi-tuner"
-_LTX_DOCS_FALLBACK_BRANCH = "ltx-2-dev"
+_LTX_DOCS_FALLBACK_BRANCH = "ltx-2"
 
 
 def _decode_subprocess_output(data: bytes) -> str:

@@ -9,7 +9,7 @@
 	let actionTone = $state('muted');
 	let openingSetup = $state(false);
 	let openingRepo = $state(false);
-	let selectedBranch = $state('ltx-2-dev');
+	let selectedBranch = $state('ltx-2');
 
 	let processesBusy = $derived.by(() => {
 		const statuses = $processStatuses || {};
@@ -286,19 +286,19 @@
 					<div class="flex flex-wrap gap-2">
 						<button
 							type="button"
-							onclick={() => selectedBranch = 'ltx-2-dev'}
-							class="px-3 py-2 text-[12px] font-medium"
-							style="background: {selectedBranch === 'ltx-2-dev' ? 'var(--sidebar-active)' : 'var(--bg-elevated)'}; color: {selectedBranch === 'ltx-2-dev' ? 'var(--accent)' : 'var(--text-secondary)'}; border: 1px solid {selectedBranch === 'ltx-2-dev' ? 'color-mix(in srgb, var(--accent) 36%, var(--border))' : 'var(--border)'}; border-radius: var(--radius-sm);"
-						>
-							ltx-2-dev
-						</button>
-						<button
-							type="button"
 							onclick={() => selectedBranch = 'ltx-2'}
 							class="px-3 py-2 text-[12px] font-medium"
 							style="background: {selectedBranch === 'ltx-2' ? 'var(--sidebar-active)' : 'var(--bg-elevated)'}; color: {selectedBranch === 'ltx-2' ? 'var(--accent)' : 'var(--text-secondary)'}; border: 1px solid {selectedBranch === 'ltx-2' ? 'color-mix(in srgb, var(--accent) 36%, var(--border))' : 'var(--border)'}; border-radius: var(--radius-sm);"
 						>
 							ltx-2
+						</button>
+						<button
+							type="button"
+							onclick={() => selectedBranch = 'ltx-2-dev'}
+							class="px-3 py-2 text-[12px] font-medium"
+							style="background: {selectedBranch === 'ltx-2-dev' ? 'var(--sidebar-active)' : 'var(--bg-elevated)'}; color: {selectedBranch === 'ltx-2-dev' ? 'var(--accent)' : 'var(--text-secondary)'}; border: 1px solid {selectedBranch === 'ltx-2-dev' ? 'color-mix(in srgb, var(--accent) 36%, var(--border))' : 'var(--border)'}; border-radius: var(--radius-sm);"
+						>
+							ltx-2-dev
 						</button>
 					</div>
 					<div class="grid grid-cols-1 gap-2 text-[11px]" style="color: var(--text-muted);">

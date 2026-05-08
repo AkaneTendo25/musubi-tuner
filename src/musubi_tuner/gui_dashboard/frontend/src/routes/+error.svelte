@@ -1,12 +1,29 @@
 <script>
 	import { page } from '$app/state';
+	import { onMount } from 'svelte';
 
 	const DEV_DASHBOARD_URL = 'http://127.0.0.1:5173';
 	const BACKEND_URL = 'http://127.0.0.1:7860';
-	const DOCS_URL = 'https://github.com/AkaneTendo25/musubi-tuner/blob/ltx-2-dev/docs/ltx_2.md';
+	// Last-resort fallback when the API is unreachable (which is the typical
+	// reason this error page renders). When the API is reachable we replace
+	// this with the branch-aware URL the backend reports.
+	const DOCS_URL_FALLBACK = 'https://github.com/AkaneTendo25/musubi-tuner/blob/ltx-2/docs/ltx_2.md';
 
+	let docsUrl = $state(DOCS_URL_FALLBACK);
 	let status = $derived(page.status || 500);
 	let message = $derived(page.error?.message || 'The dashboard page could not be loaded.');
+
+	onMount(async () => {
+		try {
+			const res = await fetch('/api/system/info', { cache: 'no-store' });
+			if (res.ok) {
+				const info = await res.json();
+				if (info?.repo?.docs_url) docsUrl = info.repo.docs_url;
+			}
+		} catch {
+			// Backend unreachable — keep fallback URL.
+		}
+	});
 </script>
 
 <svelte:head>
@@ -49,7 +66,7 @@
 
 		<div class="flex flex-wrap gap-2">
 			<a
-				href={DOCS_URL}
+				href={docsUrl}
 				target="_blank"
 				rel="noreferrer"
 				class="px-3 py-1.5 text-[11px] font-medium"

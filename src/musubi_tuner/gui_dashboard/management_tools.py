@@ -18,8 +18,8 @@ SETUP_LAUNCHER_NAME = "launch_musubi_setup.cmd"
 DASHBOARD_SHORTCUT_NAME = "Musubi Tuner Dashboard.lnk"
 SETUP_SHORTCUT_NAME = "Musubi Tuner Setup and Update.lnk"
 CHECK_CACHE_WINDOW = timedelta(minutes=15)
-DEFAULT_BRANCH = "ltx-2-dev"
-SUPPORTED_BRANCHES = ("ltx-2-dev", "ltx-2")
+DEFAULT_BRANCH = "ltx-2"
+SUPPORTED_BRANCHES = ("ltx-2", "ltx-2-dev")
 PROCESS_LABELS: dict[str, tuple[str, str]] = {
     "cache_latents": ("Cache Latents", "/caching"),
     "cache_text": ("Cache Text", "/caching"),

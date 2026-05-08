@@ -23,7 +23,7 @@
 	let recentProjectSummaries = $state({});
 	let recentProjectSummaryLoading = $state({});
 
-	const LTX_DOCS_FALLBACK_URL = 'https://github.com/AkaneTendo25/musubi-tuner/blob/ltx-2-dev/docs/ltx_2.md';
+	const LTX_DOCS_FALLBACK_URL = 'https://github.com/AkaneTendo25/musubi-tuner/blob/ltx-2/docs/ltx_2.md';
 	const TEMPLATE_VARIANTS_DISABLED = true;
 
 	const LORA_FAMILIES = [
@@ -75,7 +75,7 @@
 	let activeLoraFamily = $derived(LORA_FAMILIES.find((item) => item.id === selectedLoraFamily) || LORA_FAMILIES[0]);
 	let activeMemoryProfile = $derived(MEMORY_PROFILES.find((item) => item.id === selectedMemoryProfile) || MEMORY_PROFILES[1]);
 	let ltxDocsUrl = $derived(systemInfo?.repo?.docs_url || LTX_DOCS_FALLBACK_URL);
-	let ltxDocsBranch = $derived(systemInfo?.repo?.docs_branch || systemInfo?.repo?.branch || 'ltx-2-dev');
+	let ltxDocsBranch = $derived(systemInfo?.repo?.docs_branch || systemInfo?.repo?.branch || 'ltx-2');
 	let repoRoot = $derived(systemInfo?.repo?.root || cwd);
 	let newProjectSlug = $derived(slugProjectName(newProjectName));
 	let newProjectDir = $derived(repoRoot && newProjectSlug ? `${repoRoot}/projects/${newProjectSlug}` : '');

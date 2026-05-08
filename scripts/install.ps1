@@ -1322,8 +1322,8 @@ function Select-Branch {
             Write-Host (" Checked-out repo branch: {0}" -f $actualBranch) -ForegroundColor DarkGray
         }
         Write-Host ""
-        Write-Host " 1. ltx-2-dev"
-        Write-Host " 2. ltx-2"
+        Write-Host " 1. ltx-2"
+        Write-Host " 2. ltx-2-dev"
         Write-Host ""
         Write-Host "Press [Enter]/[C] to continue with the current selection." -ForegroundColor DarkGray
         $choice = (Read-SelectionInput).Trim()
@@ -1340,11 +1340,11 @@ function Select-Branch {
             throw "Installation cancelled by user."
         }
         if ($choice -eq "1") {
-            $CurrentBranch = "ltx-2-dev"
+            $CurrentBranch = "ltx-2"
             continue
         }
         if ($choice -eq "2") {
-            $CurrentBranch = "ltx-2"
+            $CurrentBranch = "ltx-2-dev"
             continue
         }
 

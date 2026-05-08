@@ -2707,10 +2707,10 @@ Additional notes:
 
 ## Windows Setup / Update Script
 
-[`scripts/install.ps1`](https://github.com/AkaneTendo25/musubi-tuner/blob/ltx-2-dev/scripts/install.ps1) is the Windows setup and maintenance entry point.
+[`scripts/install.ps1`](https://github.com/AkaneTendo25/musubi-tuner/blob/ltx-2/scripts/install.ps1) is the Windows setup and maintenance entry point.
 
 > [!WARNING]
-> The script and dashboard setup flow are under active testing. Their behavior and generated files may change, and unsupported local environments may still need manual installation steps.
+> The setup script, dashboard, and GUI are **experimental**. Their behavior, layout, and generated files may change between versions. Unsupported local environments may still need manual installation steps. Not all training and inference paths are wired through the dashboard — some advanced flags are CLI-only.
 
 The script can run these actions, depending on the selected options and current machine state:
 
@@ -2727,15 +2727,15 @@ The script can run these actions, depending on the selected options and current 
 **Interactive one-liner:**
 
 ```powershell
-irm https://raw.githubusercontent.com/AkaneTendo25/musubi-tuner/ltx-2-dev/scripts/install.ps1 | iex
+irm https://raw.githubusercontent.com/AkaneTendo25/musubi-tuner/ltx-2/scripts/install.ps1 | iex
 ```
 
-With no parameters, the script defaults to branch `ltx-2-dev`, CUDA `cu128`, Python `3.12`, dashboard host `127.0.0.1`, and port `7860`. Interactive mode prints the detected environment and lets you choose which actions to run.
+With no parameters, the script defaults to branch `ltx-2`, CUDA `cu128`, Python `3.12`, dashboard host `127.0.0.1`, and port `7860`. Interactive mode prints the detected environment and lets you choose which actions to run.
 
 **Saved script with explicit parameters:**
 
 ```powershell
-irm https://raw.githubusercontent.com/AkaneTendo25/musubi-tuner/ltx-2-dev/scripts/install.ps1 -OutFile install.ps1
+irm https://raw.githubusercontent.com/AkaneTendo25/musubi-tuner/ltx-2/scripts/install.ps1 -OutFile install.ps1
 .\install.ps1 -Cuda cu124 -PythonVersion 3.11 -NonInteractive
 ```
 
@@ -2744,6 +2744,9 @@ Available parameters: `-InstallRoot`, `-RepoUrl`, `-Branch`, `-RepoDir`, `-Cuda`
 Use `-PreflightOnly` to run the environment checks without making install changes. The script writes a timestamped log to `%TEMP%\musubi_ltx2_install_*.log`; on failure it prints a support bundle with the current step, exception details, and log path.
 
 ### Dashboard Usage
+
+> [!NOTE]
+> The dashboard GUI is experimental. Common training, caching, and inference flows are wired up; some advanced flags remain CLI-only. UI layout, validation messages, and dashboard metrics may change between versions.
 
 After the installer finishes, start the dashboard from the generated `Musubi Tuner Dashboard` desktop shortcut or from `launch_musubi_dashboard.cmd` in the repository directory.
 
