@@ -115,6 +115,44 @@ export function disconnectProcessSSE() {
 	}
 }
 
+let _validationAutoTimer = null;
+let _validationAutoUnsub = null;
+
+// Re-run validation for any process type that currently has errors whenever
+// the project config changes. Lets sidebar badges clear on their own once the
+// underlying setting is fixed, instead of only on the next launch attempt.
+export function connectProcessValidationAutoRefresh() {
+	if (_validationAutoUnsub) return;
+	_validationAutoUnsub = projectConfig.subscribe((config) => {
+		if (!config) return;
+		if (_validationAutoTimer) clearTimeout(_validationAutoTimer);
+		_validationAutoTimer = setTimeout(async () => {
+			const reports = get(processValidation);
+			const typesWithErrors = Object.keys(reports).filter(
+				(t) => Array.isArray(reports[t]?.errors) && reports[t].errors.length > 0
+			);
+			for (const t of typesWithErrors) {
+				try {
+					await validateProcess(t, config);
+				} catch {
+					// keep prior report on failure
+				}
+			}
+		}, 1500);
+	});
+}
+
+export function disconnectProcessValidationAutoRefresh() {
+	if (_validationAutoUnsub) {
+		_validationAutoUnsub();
+		_validationAutoUnsub = null;
+	}
+	if (_validationAutoTimer) {
+		clearTimeout(_validationAutoTimer);
+		_validationAutoTimer = null;
+	}
+}
+
 export function clearProcessLogs(type = null) {
 	processLogs.update((current) => {
 		if (!type) {

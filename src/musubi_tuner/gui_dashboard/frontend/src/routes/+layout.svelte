@@ -5,7 +5,7 @@
 	import { startStatusPolling, stopStatusPolling } from '$lib/stores/status.js';
 	import { startMetricsPolling, stopMetricsPolling } from '$lib/stores/metrics.js';
 	import { loadProject, loadProjectDefaults } from '$lib/stores/project.js';
-	import { connectProcessSSE, disconnectProcessSSE } from '$lib/stores/processes.js';
+	import { connectProcessSSE, disconnectProcessSSE, connectProcessValidationAutoRefresh, disconnectProcessValidationAutoRefresh } from '$lib/stores/processes.js';
 	import Sidebar from '$lib/components/Sidebar.svelte';
 
 	let { children } = $props();
@@ -71,6 +71,7 @@
 		await loadProjectDefaults();
 		await loadProject();
 		connectProcessSSE();
+		connectProcessValidationAutoRefresh();
 	});
 
 	onDestroy(() => {
@@ -86,6 +87,7 @@
 		stopStatusPolling();
 		stopMetricsPolling();
 		disconnectProcessSSE();
+		disconnectProcessValidationAutoRefresh();
 	});
 </script>
 

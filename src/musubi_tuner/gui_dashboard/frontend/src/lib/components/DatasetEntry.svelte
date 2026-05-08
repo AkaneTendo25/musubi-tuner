@@ -122,6 +122,127 @@
 			invalid={Boolean(sourceError)}
 			error={sourceError}
 		/>
+
+		{#if !isAudio}
+			<div class="grid grid-cols-3 gap-3">
+				<FormField
+					label="Width"
+					type="number"
+					value={entry.resolution_w}
+					oninput={(e) => updateNumberField('resolution_w', e.target.value)}
+					min={64}
+					step={64}
+					tooltip="Target width in pixels (multiples of 64)"
+				/>
+				<FormField
+					label="Height"
+					type="number"
+					value={entry.resolution_h}
+					oninput={(e) => updateNumberField('resolution_h', e.target.value)}
+					min={64}
+					step={64}
+					tooltip="Target height in pixels (multiples of 64)"
+				/>
+				<FormField
+					label="Batch Size"
+					type="number"
+					value={entry.batch_size}
+					oninput={(e) => updateNumberField('batch_size', e.target.value)}
+					min={1}
+					tooltip="Training batch size for this dataset"
+				/>
+			</div>
+		{:else}
+			<FormField
+				label="Batch Size"
+				type="number"
+				value={entry.batch_size}
+				oninput={(e) => updateNumberField('batch_size', e.target.value)}
+				min={1}
+				tooltip="Training batch size for this dataset"
+			/>
+		{/if}
+
+		<FormField
+			label="Num Repeats"
+			type="number"
+			value={entry.num_repeats}
+			oninput={(e) => updateNumberField('num_repeats', e.target.value)}
+			min={1}
+			tooltip="Number of times to repeat this dataset per epoch"
+		/>
+
+		{#if isVideo}
+			<div class="pt-3 space-y-3" style="border-top: 1px solid var(--border-subtle);">
+				<span class="text-[11px] font-medium uppercase tracking-wider" style="color: var(--text-muted);">Video Options</span>
+				<div class="grid grid-cols-2 gap-3">
+					<FormField
+						label="Target Frames"
+						type="number"
+						value={entry.target_frames}
+						oninput={(e) => updateNumberField('target_frames', e.target.value)}
+						min={1}
+						tooltip="Number of frames to extract per video"
+					/>
+					<FormSelect
+						label="Frame Extraction"
+						value={entry.frame_extraction}
+						onchange={(e) => updateField('frame_extraction', e.target.value)}
+						options={extractionOptions}
+						tooltip="Method used to select frames from video"
+					/>
+				</div>
+				{#if advanced}
+					<div class="grid grid-cols-3 gap-3">
+						<FormField
+							label="Frame Sample"
+							type="number"
+							value={entry.frame_sample ?? ''}
+							oninput={(e) => updateNumberField('frame_sample', e.target.value, true)}
+							placeholder="Optional"
+							tooltip="Sample interval for frame extraction (varies by method)"
+						/>
+						<FormField
+							label="Max Frames"
+							type="number"
+							value={entry.max_frames ?? ''}
+							oninput={(e) => updateNumberField('max_frames', e.target.value, true)}
+							placeholder="Optional"
+							tooltip="Maximum frames limit per video clip"
+						/>
+						<FormField
+							label="Frame Stride"
+							type="number"
+							value={entry.frame_stride ?? ''}
+							oninput={(e) => updateNumberField('frame_stride', e.target.value, true)}
+							placeholder="Optional"
+							tooltip="Stride between extracted frames"
+						/>
+					</div>
+					<div class="grid grid-cols-2 gap-3">
+						<FormField
+							label="Source FPS"
+							type="number"
+							value={entry.source_fps ?? ''}
+							oninput={(e) => updateNumberField('source_fps', e.target.value, true)}
+							placeholder="Optional"
+							step="0.1"
+							tooltip="Source video frame rate (for FPS-aware extraction)"
+						/>
+						<FormField
+							label="Target FPS"
+							type="number"
+							value={entry.target_fps ?? ''}
+							oninput={(e) => updateNumberField('target_fps', e.target.value, true)}
+							placeholder="Optional"
+							step="0.1"
+							tooltip="Target frame rate for resampling"
+						/>
+					</div>
+				{/if}
+			</div>
+		{/if}
+
 		{#if advanced}
 			<PathInput
 				label="Cache Directory"
@@ -343,124 +464,5 @@
 			</div>
 		{/if}
 
-		{#if !isAudio}
-			<div class="grid grid-cols-3 gap-3">
-				<FormField
-					label="Width"
-					type="number"
-					value={entry.resolution_w}
-					oninput={(e) => updateNumberField('resolution_w', e.target.value)}
-					min={64}
-					step={64}
-					tooltip="Target width in pixels (multiples of 64)"
-				/>
-				<FormField
-					label="Height"
-					type="number"
-					value={entry.resolution_h}
-					oninput={(e) => updateNumberField('resolution_h', e.target.value)}
-					min={64}
-					step={64}
-					tooltip="Target height in pixels (multiples of 64)"
-				/>
-				<FormField
-					label="Batch Size"
-					type="number"
-					value={entry.batch_size}
-					oninput={(e) => updateNumberField('batch_size', e.target.value)}
-					min={1}
-					tooltip="Training batch size for this dataset"
-				/>
-			</div>
-		{:else}
-			<FormField
-				label="Batch Size"
-				type="number"
-				value={entry.batch_size}
-				oninput={(e) => updateNumberField('batch_size', e.target.value)}
-				min={1}
-				tooltip="Training batch size for this dataset"
-			/>
-		{/if}
-
-		<FormField
-			label="Num Repeats"
-			type="number"
-			value={entry.num_repeats}
-			oninput={(e) => updateNumberField('num_repeats', e.target.value)}
-			min={1}
-			tooltip="Number of times to repeat this dataset per epoch"
-		/>
-
-		{#if isVideo}
-			<div class="pt-3 space-y-3" style="border-top: 1px solid var(--border-subtle);">
-				<span class="text-[11px] font-medium uppercase tracking-wider" style="color: var(--text-muted);">Video Options</span>
-				<div class="grid grid-cols-2 gap-3">
-					<FormField
-						label="Target Frames"
-						type="number"
-						value={entry.target_frames}
-						oninput={(e) => updateNumberField('target_frames', e.target.value)}
-						min={1}
-						tooltip="Number of frames to extract per video"
-					/>
-					<FormSelect
-						label="Frame Extraction"
-						value={entry.frame_extraction}
-						onchange={(e) => updateField('frame_extraction', e.target.value)}
-						options={extractionOptions}
-						tooltip="Method used to select frames from video"
-					/>
-				</div>
-				{#if advanced}
-					<div class="grid grid-cols-3 gap-3">
-						<FormField
-							label="Frame Sample"
-							type="number"
-							value={entry.frame_sample ?? ''}
-							oninput={(e) => updateNumberField('frame_sample', e.target.value, true)}
-							placeholder="Optional"
-							tooltip="Sample interval for frame extraction (varies by method)"
-						/>
-						<FormField
-							label="Max Frames"
-							type="number"
-							value={entry.max_frames ?? ''}
-							oninput={(e) => updateNumberField('max_frames', e.target.value, true)}
-							placeholder="Optional"
-							tooltip="Maximum frames limit per video clip"
-						/>
-						<FormField
-							label="Frame Stride"
-							type="number"
-							value={entry.frame_stride ?? ''}
-							oninput={(e) => updateNumberField('frame_stride', e.target.value, true)}
-							placeholder="Optional"
-							tooltip="Stride between extracted frames"
-						/>
-					</div>
-					<div class="grid grid-cols-2 gap-3">
-						<FormField
-							label="Source FPS"
-							type="number"
-							value={entry.source_fps ?? ''}
-							oninput={(e) => updateNumberField('source_fps', e.target.value, true)}
-							placeholder="Optional"
-							step="0.1"
-							tooltip="Source video frame rate (for FPS-aware extraction)"
-						/>
-						<FormField
-							label="Target FPS"
-							type="number"
-							value={entry.target_fps ?? ''}
-							oninput={(e) => updateNumberField('target_fps', e.target.value, true)}
-							placeholder="Optional"
-							step="0.1"
-							tooltip="Target frame rate for resampling"
-						/>
-					</div>
-				{/if}
-			</div>
-		{/if}
 	</div>
 </div>

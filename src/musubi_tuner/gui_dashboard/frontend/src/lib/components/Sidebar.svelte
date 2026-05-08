@@ -1,7 +1,7 @@
 <script>
 	import { page } from '$app/state';
 	import { projectConfig, projectLoaded, closeProject } from '$lib/stores/project.js';
-	import { processStatuses } from '$lib/stores/processes.js';
+	import { processStatuses, processValidation } from '$lib/stores/processes.js';
 	import { theme, setTheme, THEMES } from '$lib/stores/theme.js';
 	import { uiMode, setUiMode } from '$lib/stores/uiMode.js';
 	import { onMount, onDestroy } from 'svelte';
@@ -48,6 +48,27 @@
 			if (s && s.state === 'finished') return 'finished';
 		}
 		return null;
+	}
+
+	function validationInfo(processTypes) {
+		if (!processTypes) return { count: 0, title: '' };
+		const reports = $processValidation;
+		const seen = new Set();
+		const lines = [];
+		let count = 0;
+		for (const t of processTypes) {
+			const r = reports[t];
+			if (!r || !Array.isArray(r.errors)) continue;
+			count += r.errors.length;
+			for (const err of r.errors) {
+				const key = (err.label || err.field || '') + '|' + (err.message || '');
+				if (seen.has(key)) continue;
+				seen.add(key);
+				const prefix = err.label ? `${err.label}: ` : '';
+				lines.push(`${prefix}${err.message || ''}`);
+			}
+		}
+		return { count, title: lines.join('\n') };
 	}
 
 	function dotStyle(status) {
@@ -129,9 +150,11 @@
 					{#each visibleItems as item}
 						{@const isActive = page.url.pathname === item.href}
 						{@const dot = statusDot(item.processTypes)}
+						{@const validation = validationInfo(item.processTypes)}
 						{@const isDimmed = item.dimWhenIdle && !trainingActive && !isActive}
 						<a
 							href={item.href}
+							title={validation.count > 0 ? validation.title : undefined}
 							class="flex items-center gap-2 px-3 py-[7px] text-[12px] font-medium"
 							style="
 								border-radius: var(--radius-sm);
@@ -148,6 +171,12 @@
 								<path d="{item.icon}"/>
 							</svg>
 							<span class="flex-1">{navLabel(item)}</span>
+							{#if validation.count > 0}
+								<span
+									class="text-[10px] font-bold tabular-nums flex-shrink-0 inline-flex items-center justify-center"
+									style="background: var(--danger); color: var(--bg-base); border-radius: 4px; height: 16px; min-width: 16px; padding: 0 4px;"
+								>{validation.count}</span>
+							{/if}
 							{#if dot}
 								<span class="w-[6px] h-[6px] rounded-full flex-shrink-0" style="{dotStyle(dot)}"></span>
 							{/if}
