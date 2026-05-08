@@ -232,6 +232,115 @@
 				placeholder="Optional"
 				tooltip="Optional extra reference audio directories, separated by commas or semicolons."
 			/>
+
+			<div class="pt-3 space-y-3" style="border-top: 1px solid var(--border-subtle);">
+				<span class="text-[11px] font-medium uppercase tracking-wider" style="color: var(--text-muted);">Latent Guides</span>
+				<p class="text-[11px]" style="color: var(--text-muted);">
+					Reference latents stem-matched to each item. <strong>Latent-idx (hard lock)</strong> replaces tokens at a frame slot — exact pixel match;
+					<strong>keyframe (soft guide)</strong> appends a token the model is guided toward but not constrained to. Both compose with any
+					<code>--ic_lora_strategy</code>.
+				</p>
+				<PathInput
+					label="Latent-Idx Guide Dir"
+					value={entry.latent_idx_guide_directory || ''}
+					oninput={(e) => updateField('latent_idx_guide_directory', e.target.value)}
+					placeholder="Optional"
+					tooltip="Directory of guide images to inject at a specific latent-frame slot inside the temporal grid (e.g. last-frame anchor)."
+				/>
+				<PathInput
+					label="Latent-Idx Guide Cache Dir"
+					value={entry.latent_idx_guide_cache_directory || ''}
+					oninput={(e) => updateField('latent_idx_guide_cache_directory', e.target.value)}
+					placeholder="Optional"
+					tooltip="Cache directory for encoded latent-idx guide latents. Required when Latent-Idx Guide Dir is set."
+				/>
+				<div class="grid grid-cols-2 gap-3">
+					<FormField
+						label="Frame Idx (latent_idx)"
+						type="number"
+						value={entry.latent_idx_guide_frame_idx ?? 0}
+						oninput={(e) => updateNumberField('latent_idx_guide_frame_idx', e.target.value)}
+						tooltip="Latent-frame slot replaced with the guide. 0 = first slot (I2V-style), or any in-grid index."
+					/>
+					<FormField
+						label="Strength (latent_idx)"
+						type="number"
+						value={entry.latent_idx_guide_strength ?? 1.0}
+						oninput={(e) => updateNumberField('latent_idx_guide_strength', e.target.value)}
+						min={0}
+						max={1}
+						step={0.05}
+						tooltip="Training requires 1.0 (raises if other). Inference accepts any value via the 5D denoise_mask = 1 − strength. Out-of-range values are clamped with a warning."
+					/>
+				</div>
+				<PathInput
+					label="Keyframe Guide Dir"
+					value={entry.keyframe_guide_directory || ''}
+					oninput={(e) => updateField('keyframe_guide_directory', e.target.value)}
+					placeholder="Optional"
+					tooltip="Directory of global-reference / keyframe images. Tokens are appended outside the temporal grid (frame_idx=-1 = global subject reference)."
+				/>
+				<PathInput
+					label="Keyframe Guide Cache Dir"
+					value={entry.keyframe_guide_cache_directory || ''}
+					oninput={(e) => updateField('keyframe_guide_cache_directory', e.target.value)}
+					placeholder="Optional"
+					tooltip="Cache directory for encoded keyframe guide latents. Required when Keyframe Guide Dir is set."
+				/>
+				<div class="grid grid-cols-2 gap-3">
+					<FormField
+						label="Frame Idx (keyframe)"
+						type="number"
+						value={entry.keyframe_guide_frame_idx ?? -1}
+						oninput={(e) => updateNumberField('keyframe_guide_frame_idx', e.target.value)}
+						tooltip="Pixel-frame index (NOT latent-frame). -1 = global reference. For non-negative values multiply the latent-frame by VIDEO_SCALE_FACTORS.time first (×8 for LTX-2): e.g. last latent frame of a 9-frame video → 64."
+					/>
+					<FormField
+						label="Strength (keyframe)"
+						type="number"
+						value={entry.keyframe_guide_strength ?? 1.0}
+						oninput={(e) => updateNumberField('keyframe_guide_strength', e.target.value)}
+						min={0}
+						max={1}
+						step={0.05}
+						tooltip="Per-token denoise_mask = 1 − strength → effective appended timestep = (1−strength)×sigma. 1.0 = clean conditioning (default); 0.0 = full noise (no contribution). Range [0, 1]; clamped if outside."
+					/>
+				</div>
+
+				<p class="text-[11px]" style="color: var(--text-muted);">
+					Optional: stack extra keyframes beyond the primary above. Use <code>;</code> to separate values; all four lists must have the same length.
+				</p>
+				<FormField
+					label="Extra Keyframe Dirs"
+					value={entry.keyframe_guide_extra_directories || ''}
+					oninput={(e) => updateField('keyframe_guide_extra_directories', e.target.value)}
+					placeholder="/path/k2;/path/k3"
+					tooltip="Semicolon-separated list of additional keyframe directories. Each one stem-matches per item like the primary."
+				/>
+				<FormField
+					label="Extra Keyframe Cache Dirs"
+					value={entry.keyframe_guide_extra_cache_directories || ''}
+					oninput={(e) => updateField('keyframe_guide_extra_cache_directories', e.target.value)}
+					placeholder="/cache/k2;/cache/k3"
+					tooltip="Semicolon-separated list of cache directories matching the extra keyframe directories above."
+				/>
+				<div class="grid grid-cols-2 gap-3">
+					<FormField
+						label="Extra Frame Idxs"
+						value={entry.keyframe_guide_extra_frame_idxs || ''}
+						oninput={(e) => updateField('keyframe_guide_extra_frame_idxs', e.target.value)}
+						placeholder="-1;5"
+						tooltip="Semicolon-separated frame_idx values (PIXEL-frame units, not latent-frame). -1 = global reference. Multiply latent-frame by VIDEO_SCALE_FACTORS.time (×8 for LTX-2) for non-negative anchors."
+					/>
+					<FormField
+						label="Extra Strengths"
+						value={entry.keyframe_guide_extra_strengths || ''}
+						oninput={(e) => updateField('keyframe_guide_extra_strengths', e.target.value)}
+						placeholder="1.0;0.7"
+						tooltip="Semicolon-separated strength values per extra keyframe. Range [0, 1]."
+					/>
+				</div>
+			</div>
 		{/if}
 
 		{#if !isAudio}

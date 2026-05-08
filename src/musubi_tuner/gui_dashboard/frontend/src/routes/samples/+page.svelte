@@ -27,8 +27,14 @@
 			l: '',
 			fs: 5.0,
 			n: '',
-			i: ''
+			i: '',
+			guides: []
 		};
+	}
+
+	function createGuide(type) {
+		// Latent-idx default frame_idx is 0 (slot 0); keyframe default is -1 (global ref).
+		return { type, frame_idx: type === 'gk' ? -1 : 0, path: '', strength: 1.0 };
 	}
 
 	function addEntry() {
@@ -41,7 +47,7 @@
 	}
 
 	function duplicateEntry(index) {
-		const clone = { ...entries[index] };
+		const clone = { ...entries[index], guides: (entries[index].guides || []).map((g) => ({ ...g })) };
 		entries = [...entries.slice(0, index + 1), clone, ...entries.slice(index + 1)];
 	}
 
@@ -49,6 +55,50 @@
 		const next = [...entries];
 		next[index] = { ...next[index], [key]: value };
 		entries = next;
+	}
+
+	function addGuide(entryIdx, type) {
+		const next = [...entries];
+		const guides = [...(next[entryIdx].guides || []), createGuide(type)];
+		next[entryIdx] = { ...next[entryIdx], guides };
+		entries = next;
+	}
+
+	function removeGuide(entryIdx, guideIdx) {
+		const next = [...entries];
+		const guides = (next[entryIdx].guides || []).filter((_, i) => i !== guideIdx);
+		next[entryIdx] = { ...next[entryIdx], guides };
+		entries = next;
+	}
+
+	function updateGuide(entryIdx, guideIdx, key, value) {
+		const next = [...entries];
+		const guides = [...(next[entryIdx].guides || [])];
+		guides[guideIdx] = { ...guides[guideIdx], [key]: value };
+		next[entryIdx] = { ...next[entryIdx], guides };
+		entries = next;
+	}
+
+	// Mirrors `_parse_ltx2_guide_spec` in ltx2_sampling.py: split on first ':'
+	// for frame_idx, then check if the LAST ':' is followed by a strict float
+	// (so Windows drive letters in the path are preserved).
+	function parseGuideSpec(s) {
+		const firstColon = s.indexOf(':');
+		if (firstColon === -1) return null;
+		const frameIdxNum = Number(s.slice(0, firstColon));
+		if (!Number.isInteger(frameIdxNum)) return null;
+		const tail = s.slice(firstColon + 1);
+		let strength = 1.0;
+		let path = tail;
+		const lastColon = tail.lastIndexOf(':');
+		if (lastColon !== -1) {
+			const cand = tail.slice(lastColon + 1).trim();
+			if (cand && /^-?\d+(\.\d+)?$/.test(cand)) {
+				strength = parseFloat(cand);
+				path = tail.slice(0, lastColon);
+			}
+		}
+		return { frame_idx: frameIdxNum, path: path.trim(), strength };
 	}
 
 	function entryToLine(entry) {
@@ -64,6 +114,15 @@
 		if (entry.fs != null && entry.fs !== 5.0) line += ` --fs ${entry.fs}`;
 		if (entry.n) line += ` --n "${entry.n}"`;
 		if (entry.i) line += ` --i ${entry.i}`;
+		for (const g of entry.guides || []) {
+			if (!g || !g.path) continue;
+			const flag = g.type === 'gk' ? '--gk' : '--gl';
+			const frame = Number.isFinite(Number(g.frame_idx)) ? Number(g.frame_idx) : (g.type === 'gk' ? -1 : 0);
+			const strength = Number.isFinite(Number(g.strength)) ? Number(g.strength) : 1.0;
+			line += strength === 1.0
+				? ` ${flag} ${frame}:${g.path}`
+				: ` ${flag} ${frame}:${g.path}:${strength}`;
+		}
 		return line;
 	}
 
@@ -89,6 +148,10 @@
 			else if (key === 'fs') entry.fs = parseFloat(value) || 5.0;
 			else if (key === 'n') entry.n = value;
 			else if (key === 'i') entry.i = value;
+			else if (key === 'gl' || key === 'gk') {
+				const spec = parseGuideSpec(value);
+				if (spec) entry.guides.push({ type: key, ...spec });
+			}
 		}
 		return entry;
 	}
@@ -347,6 +410,66 @@
 
 						<div>
 							<FormField label="I2V Image (optional)" value={entry.i} oninput={(e) => updateEntry(i, 'i', e.target.value)} placeholder="path/to/first_frame.jpg" tooltip="Image-to-Video: path to conditioning image for first frame" />
+						</div>
+
+						{#if (entry.guides || []).length > 0}
+							<div class="mt-3 space-y-1.5">
+								<span class="block text-[10px] font-semibold uppercase tracking-wider" style="color: var(--text-muted);">Latent Guides</span>
+								{#each entry.guides as guide, gi}
+									<div class="grid grid-cols-12 gap-2 items-end">
+										<div class="col-span-2">
+											<label class="block text-[10px] font-medium mb-1" style="color: var(--text-muted);">Type</label>
+											<select
+												value={guide.type}
+												onchange={(e) => updateGuide(i, gi, 'type', e.target.value)}
+												class="w-full text-[12px] px-2 py-[7px]"
+												style="background: var(--console-bg); border: 1px solid var(--border); border-radius: var(--radius-sm); color: var(--text-primary); outline: none;"
+												onfocus={(e) => e.currentTarget.style.borderColor = 'var(--accent)'}
+												onblur={(e) => e.currentTarget.style.borderColor = 'var(--border)'}
+											>
+												<option value="gl">--gl (replace)</option>
+												<option value="gk">--gk (append)</option>
+											</select>
+										</div>
+										<div class="col-span-2">
+											<FormField label="Frame idx" type="number" value={guide.frame_idx} oninput={(e) => updateGuide(i, gi, 'frame_idx', Number(e.target.value))} tooltip={guide.type === 'gk' ? 'Pixel-frame index. -1 = global reference (visible to all output frames). For non-negative values, multiply latent index by 8 (e.g. last latent of a 9-frame video = 64).' : 'Latent-frame slot to replace. 0 reproduces standard I2V conditioning.'} />
+										</div>
+										<div class="col-span-5">
+											<FormField label="Image path" value={guide.path} oninput={(e) => updateGuide(i, gi, 'path', e.target.value)} placeholder="path/to/guide.png" tooltip="Path to a still image. VAE-encoded at sample time and resized to the current denoising-stage resolution if needed." />
+										</div>
+										<div class="col-span-2">
+											<FormField label="Strength" type="number" value={guide.strength} step="0.05" min={0} max={1} oninput={(e) => updateGuide(i, gi, 'strength', Number(e.target.value))} tooltip="0..1. denoise_mask = 1 - strength. 1.0 = clean conditioning; 0.0 skips the guide entirely." />
+										</div>
+										<button
+											onclick={() => removeGuide(i, gi)}
+											class="col-span-1 px-2 py-[7px] text-[12px] font-medium"
+											style="color: var(--text-muted); background: var(--bg-elevated); border: 1px solid var(--border); border-radius: var(--radius-sm);"
+											onmouseenter={(e) => { e.currentTarget.style.color = 'var(--danger)'; e.currentTarget.style.borderColor = 'var(--danger)'; }}
+											onmouseleave={(e) => { e.currentTarget.style.color = 'var(--text-muted)'; e.currentTarget.style.borderColor = 'var(--border)'; }}
+											title="Remove guide"
+										>×</button>
+									</div>
+								{/each}
+							</div>
+						{/if}
+
+						<div class="flex gap-2 mt-2">
+							<button
+								onclick={() => addGuide(i, 'gl')}
+								class="text-[11px] px-2.5 py-1 font-medium"
+								style="color: var(--text-muted); background: var(--bg-elevated); border: 1px dashed var(--border); border-radius: var(--radius-sm);"
+								onmouseenter={(e) => { e.currentTarget.style.borderColor = 'var(--accent)'; e.currentTarget.style.color = 'var(--accent)'; }}
+								onmouseleave={(e) => { e.currentTarget.style.borderColor = 'var(--border)'; e.currentTarget.style.color = 'var(--text-muted)'; }}
+								title="Add a latent_idx guide (--gl): replaces tokens at a specific frame slot"
+							>+ Latent-idx guide</button>
+							<button
+								onclick={() => addGuide(i, 'gk')}
+								class="text-[11px] px-2.5 py-1 font-medium"
+								style="color: var(--text-muted); background: var(--bg-elevated); border: 1px dashed var(--border); border-radius: var(--radius-sm);"
+								onmouseenter={(e) => { e.currentTarget.style.borderColor = 'var(--accent)'; e.currentTarget.style.color = 'var(--accent)'; }}
+								onmouseleave={(e) => { e.currentTarget.style.borderColor = 'var(--border)'; e.currentTarget.style.color = 'var(--text-muted)'; }}
+								title="Add a keyframe guide (--gk): appends a token block with custom positional encoding"
+							>+ Keyframe guide</button>
 						</div>
 					</div>
 				{/each}

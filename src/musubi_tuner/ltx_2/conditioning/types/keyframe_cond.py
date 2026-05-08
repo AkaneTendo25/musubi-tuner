@@ -10,12 +10,29 @@ class VideoConditionByKeyframeIndex(ConditioningItem):
     Conditions video generation on keyframe latents at a specific frame index.
     Appends keyframe tokens to the latent state with positions offset by frame_idx,
     and sets denoise strength according to the strength parameter.
+
+    Args:
+        keyframes: Keyframe latents [B, C, F, H, W].
+        frame_idx: Frame index offset for positional encoding.
+        strength: Conditioning strength (1.0 = clean, 0.0 = fully denoised).
+        num_pixel_frames: Number of pixel frames the keyframe latent originally
+            encodes. When set to 1, the temporal end position of each token is
+            narrowed to start+1 (single-pixel-frame extent) instead of the
+            VAE-scaled range. Default 1 matches upstream's typical use where
+            keyframes represent single-pixel-frame anchors.
     """
 
-    def __init__(self, keyframes: torch.Tensor, frame_idx: int, strength: float):
+    def __init__(
+        self,
+        keyframes: torch.Tensor,
+        frame_idx: int,
+        strength: float,
+        num_pixel_frames: int = 1,
+    ):
         self.keyframes = keyframes
         self.frame_idx = frame_idx
         self.strength = strength
+        self.num_pixel_frames = num_pixel_frames
 
     def apply_to(
         self,
@@ -34,6 +51,8 @@ class VideoConditionByKeyframeIndex(ConditioningItem):
         )
 
         positions[:, 0, ...] += self.frame_idx
+        if self.num_pixel_frames == 1:
+            positions[:, 0, ..., 1:] = positions[:, 0, ..., :1] + 1
         positions = positions.to(dtype=torch.float32)
         positions[:, 0, ...] /= latent_tools.fps
 

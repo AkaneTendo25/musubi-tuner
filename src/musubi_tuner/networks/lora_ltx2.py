@@ -32,6 +32,157 @@ def convert_weight_keys(weights_sd: Dict[str, torch.Tensor]) -> Optional[Dict[st
     return None
 
 
+def build_keyframe_extension(
+    keyframe_guides: List[Dict[str, object]],
+    *,
+    bsz: int,
+    video_channels: int,
+    frame_rate: float,
+    patchifier,
+    device: torch.device,
+    dtype: torch.dtype,
+    reference_downscale_factor: int = 1,
+    collapse_to_single_pixel_frame: bool = False,
+) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor], int]:
+    """Patchify keyframe guide latents and compute positions for token-append conditioning.
+
+    Each guide latent is patchified, positions are computed with
+    `causal_fix=(frame_idx == 0)`, offset by `frame_idx` (pixel-frame units;
+    `-1` is a global reference yielding slightly-negative temporal positions),
+    then divided by `frame_rate`.
+
+    Strength maps to a per-token `denoise_mask = 1.0 - strength`. The caller
+    multiplies this mask by the global sigma to produce the appended tokens'
+    effective timesteps. `strength=1.0` → mask 0 (clean conditioning at t=0);
+    `strength=0.0` → mask 1 (treated as fully noisy). Out-of-range values are
+    clamped to `[0, 1]`.
+
+    Returns `(appended_tokens, appended_positions, denoise_mask, appended_count)`:
+    - `appended_tokens`: `[B, sum(T_g), C]`
+    - `appended_positions`: `[B, 3, sum(T_g), 2]`
+    - `denoise_mask`: `[B, sum(T_g)]` with values in `[0, 1]`
+    - `appended_count`: total appended token count
+
+    Returns `(None, None, None, 0)` when no guides are provided.
+
+    The caller is responsible for: appending tokens/positions/timesteps to the
+    video stream, marking the appended block in any per-token conditioning mask,
+    and slicing off keyframe predictions before computing loss.
+    """
+    if not keyframe_guides:
+        return None, None, None, 0
+
+    chunks_t: List[torch.Tensor] = []
+    chunks_p: List[torch.Tensor] = []
+    chunks_m: List[torch.Tensor] = []
+    for gi, guide in enumerate(keyframe_guides):
+        if not isinstance(guide, dict):
+            raise TypeError(f"keyframe_guides[{gi}] must be a dict (latent, frame_idx[, strength])")
+        g_latent = guide.get("latent")
+        if not isinstance(g_latent, torch.Tensor) or g_latent.dim() != 5:
+            raise ValueError(f"keyframe_guides[{gi}] latent must be 5D [B,C,T,H,W]")
+        g_frame_idx = int(guide.get("frame_idx", -1))
+        g_strength_raw = guide.get("strength", 1.0)
+        g_collapse = bool(guide.get("collapse_to_single_pixel_frame", collapse_to_single_pixel_frame))
+        # `strength` may be a scalar (uniform across batch) or a 1-D tensor
+        # of shape [B] for per-sample dropout. Per-sample form lets samples
+        # within a single batch independently opt in/out of conditioning.
+        if isinstance(g_strength_raw, torch.Tensor):
+            if g_strength_raw.dim() != 1 or g_strength_raw.shape[0] != bsz:
+                raise ValueError(
+                    f"keyframe_guides[{gi}] per-sample strength must have shape [B={bsz}], got {tuple(g_strength_raw.shape)}"
+                )
+            g_strength = g_strength_raw.to(device=device, dtype=torch.float32)
+            if torch.any((g_strength < 0.0) | (g_strength > 1.0)):
+                logger.warning(
+                    "keyframe_guides[%d]: per-sample strength has values outside [0,1]; clamping.", gi,
+                )
+                g_strength = g_strength.clamp(0.0, 1.0)
+            g_strength_is_per_sample = True
+            g_strength_skip = bool(torch.all(g_strength <= 0.0).item())
+        else:
+            g_strength = float(g_strength_raw)
+            if g_strength < 0.0 or g_strength > 1.0:
+                logger.warning(
+                    "keyframe_guides[%d]: strength=%.3f outside [0,1]; clamping.",
+                    gi, g_strength,
+                )
+                g_strength = max(0.0, min(1.0, g_strength))
+            g_strength_is_per_sample = False
+            g_strength_skip = g_strength <= 0.0
+        # All-zero strength → guide has no useful signal; skip appending entirely
+        # so the appended tokens do not perturb attention via their content/length.
+        if g_strength_skip:
+            continue
+
+        g_latent = g_latent.to(device=device, dtype=dtype)
+        g_b, g_c, g_t, g_h, g_w = g_latent.shape
+        if g_b != bsz or g_c != video_channels:
+            raise ValueError(
+                f"keyframe_guides[{gi}] shape {(g_b, g_c)} does not match video (B,C)=({bsz},{video_channels})"
+            )
+
+        # Per-sample dropout: for samples where strength=0 (losers in a
+        # per-sample Bernoulli), replace clean target-derived content with
+        # noise. Without this the model would see clean, semantically-aligned
+        # content tagged as fully noisy (denoise_mask=1) — a leak that biases
+        # the off-regime away from "no signal".
+        if g_strength_is_per_sample:
+            losers = (g_strength <= 0.0)
+            if bool(losers.any().item()):
+                g_latent = g_latent.clone()
+                noise = torch.randn_like(g_latent)
+                # Broadcast losers [B] over [B, C, T, H, W]
+                loser_mask = losers.view(bsz, 1, 1, 1, 1).to(dtype=g_latent.dtype)
+                g_latent = g_latent * (1.0 - loser_mask) + noise * loser_mask
+
+        g_tokens = patchifier.patchify(g_latent)
+        g_coords = patchifier.get_patch_grid_bounds(
+            output_shape=VideoLatentShape(
+                batch=bsz, channels=g_c, frames=g_t, height=g_h, width=g_w,
+            ),
+            device=device,
+        )
+        # Float32 to avoid bf16/fp16 precision loss in `+= frame_idx` and `/= frame_rate`.
+        g_positions = get_pixel_coords(
+            latent_coords=g_coords,
+            scale_factors=SpatioTemporalScaleFactors.default(),
+            causal_fix=(g_frame_idx == 0),
+        ).to(dtype=torch.float32)
+        g_positions[:, 0, ...] = g_positions[:, 0, ...] + float(g_frame_idx)
+        # Collapse temporal extent so each token covers exactly 1 pixel-frame
+        # (end = start + 1) instead of the natural latent-slot span.
+        if g_collapse:
+            g_positions[:, 0, ..., 1:] = g_positions[:, 0, ..., :1] + 1
+        g_positions[:, 0, ...] = g_positions[:, 0, ...] / float(frame_rate)
+        if reference_downscale_factor != 1:
+            g_positions[:, 1, ...] *= reference_downscale_factor
+            g_positions[:, 2, ...] *= reference_downscale_factor
+        g_positions = g_positions.to(dtype=dtype)
+
+        g_count = int(g_tokens.shape[1])
+        if g_strength_is_per_sample:
+            # Broadcast [B] → [B, g_count]: each sample's denoise_mask = 1 - its strength.
+            g_mask = (1.0 - g_strength).unsqueeze(-1).expand(bsz, g_count).to(dtype=dtype)
+        else:
+            g_mask = torch.full(
+                (bsz, g_count), 1.0 - g_strength, device=device, dtype=dtype,
+            )
+
+        chunks_t.append(g_tokens)
+        chunks_p.append(g_positions)
+        chunks_m.append(g_mask)
+
+    if not chunks_t:
+        return None, None, None, 0
+
+    appended_tokens = torch.cat(chunks_t, dim=1)
+    appended_positions = torch.cat(chunks_p, dim=2)
+    appended_mask = torch.cat(chunks_m, dim=1)
+    appended_count = int(appended_tokens.shape[1])
+    return appended_tokens, appended_positions, appended_mask, appended_count
+
+
 def _split_av_context(
     model: nn.Module, context: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -412,6 +563,31 @@ class LTX2Wrapper(nn.Module):
                     video_positions = video_positions_override.to(device=video_positions.device, dtype=video_positions.dtype)
                 a2v_cross_attention_mask = transformer_options.get("a2v_cross_attention_mask")
 
+        # Keyframe guide tokens appended to the video stream. Per-token
+        # denoise_mask = 1 - strength → effective timestep = mask * sigma:
+        # strength=1 → t=0 (clean conditioning); strength=0 → t=sigma (no effect).
+        appended_video_token_count = 0
+        if model_video_enabled and isinstance(transformer_options, dict):
+            kf_guides = transformer_options.get("keyframe_guides")
+            if kf_guides:
+                appended_tokens, appended_positions, appended_mask, appended_video_token_count = build_keyframe_extension(
+                    kf_guides,
+                    bsz=bsz,
+                    video_channels=vch,
+                    frame_rate=float(frame_rate),
+                    patchifier=self._video_patchifier,
+                    device=video_latents.device,
+                    dtype=video_latents.dtype,
+                )
+                if appended_video_token_count > 0:
+                    video_tokens = torch.cat([video_tokens, appended_tokens], dim=1)
+                    video_positions = torch.cat([video_positions, appended_positions], dim=2)
+                    # sigma: [B]; broadcast to per-token effective timestep.
+                    extra_ts = (appended_mask * sigma.view(bsz, 1)).to(
+                        device=video_timesteps.device, dtype=video_timesteps.dtype
+                    )
+                    video_timesteps = torch.cat([video_timesteps, extra_ts], dim=1)
+
         # Connector LoRA: run connectors on pre-connector features if available
         if (
             self.has_connectors()
@@ -564,6 +740,11 @@ class LTX2Wrapper(nn.Module):
         )
         video_pred_tokens, audio_pred_tokens = self.model(video_modality, audio_modality, perturbations)
 
+        # Strip appended keyframe-guide tokens before unpatchify — they were
+        # context-only; the patchifier expects the original token count.
+        if model_video_enabled and appended_video_token_count > 0:
+            video_pred_tokens = video_pred_tokens[:, : video_pred_tokens.shape[1] - appended_video_token_count]
+
         if model_video_enabled:
             video_pred = self._video_patchifier.unpatchify(
                 video_pred_tokens,
@@ -688,9 +869,10 @@ LTX2_INCLUDE_PATTERNS_V2V = [
     r".*\.audio_ff\.net\.2$",
 ]
 
-# audio: Audio-only LoRA (audio attention/FFN + audio-side cross-modal)
-# Targets audio self/cross-attn, audio FFN, and video_to_audio_attn (audio queries video).
-# Excludes audio_to_video_attn to avoid altering the video branch.
+# audio: Audio-only LoRA (audio attention/FFN only)
+# Targets audio self/cross-attn and audio FFN. Excludes cross-modal attention
+# (audio_to_video_attn / video_to_audio_attn) — those layers stay at
+# base-model values.
 LTX2_INCLUDE_PATTERNS_AUDIO = [
     r".*\.audio_attn1\.to_k$",
     r".*\.audio_attn1\.to_q$",
@@ -702,6 +884,14 @@ LTX2_INCLUDE_PATTERNS_AUDIO = [
     r".*\.audio_attn2\.to_out\.0$",
     r".*\.audio_ff\.net\.0\.proj$",
     r".*\.audio_ff\.net\.2$",
+]
+
+# audio_v2a: Audio preset plus video_to_audio_attn cross-modal attention.
+# Targets the same modules as "audio" plus video_to_audio_attn.{to_q,to_k,to_v,to_out.0}
+# (audio queries over video tokens). Use when the audio-side LoRA should also
+# adapt this cross-modal direction.
+LTX2_INCLUDE_PATTERNS_AUDIO_V2A = [
+    *LTX2_INCLUDE_PATTERNS_AUDIO,
     r".*\.video_to_audio_attn\.to_k$",
     r".*\.video_to_audio_attn\.to_q$",
     r".*\.video_to_audio_attn\.to_v$",
@@ -782,6 +972,7 @@ LTX2_LORA_TARGET_PRESETS = {
     "video_sa_ff": LTX2_INCLUDE_PATTERNS_VIDEO_SA_FF,
     "video_sa_ca_ff": LTX2_INCLUDE_PATTERNS_VIDEO_SA_CA_FF,
     "audio": LTX2_INCLUDE_PATTERNS_AUDIO,
+    "audio_v2a": LTX2_INCLUDE_PATTERNS_AUDIO_V2A,
     "audio_ref_only_ic": LTX2_INCLUDE_PATTERNS_AUDIO_REF_ONLY_IC,
     "av_ic": LTX2_INCLUDE_PATTERNS_V2V,  # superset: all attn (video+audio+cross-modal) + video FFN + audio FFN
     "video_ref_only_av": LTX2_INCLUDE_PATTERNS_V2V,  # AV target generation with video-reference conditioning only

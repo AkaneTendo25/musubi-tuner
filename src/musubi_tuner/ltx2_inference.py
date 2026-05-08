@@ -87,8 +87,45 @@ class InferenceConfig:
     conditioning_latent: Optional[torch.Tensor] = None
     use_i2v_token_timestep_mask: bool = True
 
+    # Latent-guide conditioning.
+    # latent_idx_guides: list of LatentIndexGuide — replaces tokens at the given
+    # latent frame slot with guide latents (generalizes I2V to arbitrary frames).
+    # keyframe_guides: list of KeyframeGuide — appends extra tokens with custom
+    # frame-index positional encoding (use frame_idx=-1 for global reference).
+    latent_idx_guides: Optional[List["LatentIndexGuide"]] = None
+    keyframe_guides: Optional[List["KeyframeGuide"]] = None
+
     # Extra options
     extra: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class LatentIndexGuide:
+    """Replace tokens at a specific latent-frame slot with guide latents.
+
+    Generalizes I2V: I2V is the special case latent_idx=0, strength=1.0.
+    Mirrors VideoConditionByLatentIndex semantics on 5D latents (no patchify needed).
+    """
+    latent: torch.Tensor       # [B, C, T_g, H_lat, W_lat] — guide latents (already VAE-encoded)
+    latent_idx: int            # Target latent-frame slot (must satisfy latent_idx + T_g <= total latent frames)
+    strength: float = 1.0      # 1.0 = fully clean (no denoising), 0.0 = no conditioning
+
+
+@dataclass
+class KeyframeGuide:
+    """Append extra tokens to the sequence with custom frame-index positional encoding.
+
+    frame_idx=-1 is the canonical global-reference case (tokens visible to all frames
+    via positional encoding, but not part of the temporal grid).
+    Mirrors VideoConditionByKeyframeIndex semantics.
+    """
+    latent: torch.Tensor       # [B, C, T_g, H_lat, W_lat] — guide latents
+    frame_idx: int             # Frame index used to offset positional encoding (-1 = global)
+    strength: float = 1.0
+    # When True, the appended token's temporal extent is collapsed to a single
+    # pixel-frame (end = start + 1). Appropriate for still-image keyframes;
+    # leave None to defer to the caller default in build_keyframe_extension.
+    collapse_to_single_pixel_frame: Optional[bool] = None
 
 
 class LTX2Inferencer:
@@ -372,6 +409,8 @@ class LTX2Inferencer:
         progress_desc: str = "LTX-2 inference",
         conditioning_latent: Optional[torch.Tensor] = None,
         use_i2v_token_timestep_mask: bool = True,
+        latent_idx_guides: Optional[List[LatentIndexGuide]] = None,
+        keyframe_guides: Optional[List["KeyframeGuide"]] = None,
         stg_scale: float = 0.0,
         stg_blocks: Optional[List[int]] = None,
         stg_mode: str = "video",
@@ -398,90 +437,233 @@ class LTX2Inferencer:
         effective_video_rescale = float(video_rescale_scale if video_rescale_scale is not None else rescale_scale)
         effective_audio_rescale = float(audio_rescale_scale if audio_rescale_scale is not None else rescale_scale)
 
-        # Setup I2V conditioning mask if provided
+        # Build a unified guide list:
+        #   - legacy conditioning_latent → single LatentIndexGuide(latent_idx=0, strength=1.0)
+        #   - explicit latent_idx_guides → as-is
+        # Both go through the same setup path: build 5D denoise_mask + clean_latent
+        # plus per-token video_conditioning_mask covering all guide tokens.
         denoise_mask = None
         clean_latent = None
         i2v_conditioning_mask_tokens = None
+
+        # Determine whether the I2V lock will actually be established. The raw
+        # `conditioning_latent is not None` check is insufficient — a malformed
+        # conditioning_latent may fail downstream validation, leaving no lock.
+        # Use a pre-validated flag so the user-guide overlap guard doesn't
+        # spuriously block valid guides when no lock exists.
+        i2v_lock_active = False
         if conditioning_latent is not None:
             try:
-                # Validate conditioning_latent shape
-                if conditioning_latent.dim() != 5:
+                cl_shape = conditioning_latent.shape
+                # Match do_inference and legacy semantics: conditioning_latent
+                # is a single-frame I2V anchor. For multi-frame replacement,
+                # callers must use explicit latent_idx_guides.
+                if (
+                    conditioning_latent.dim() == 5
+                    and cl_shape[2] == 1
+                    and latents.shape[2] >= 1
+                    and cl_shape[1] == latents.shape[1]
+                ):
+                    i2v_lock_active = True
+                elif conditioning_latent.dim() == 5 and cl_shape[2] != 1:
                     logger.warning(
-                        "I2V: conditioning_latent has wrong dimensions %s, expected [B,C,T,H,W]. Skipping I2V conditioning.",
-                        tuple(conditioning_latent.shape),
+                        "conditioning_latent has %d frames; expected 1. Use "
+                        "latent_idx_guides for multi-frame replacement. Treating "
+                        "as no I2V lock.",
+                        cl_shape[2],
                     )
-                elif latents.shape[2] < 1:
-                    logger.warning("I2V: Video latents have no temporal frames. Skipping I2V conditioning.")
-                else:
-                    cond_on_device = conditioning_latent.to(device=latents.device, dtype=latents.dtype)
+            except Exception:
+                i2v_lock_active = False
 
-                    if cond_on_device.shape[2] != 1:
-                        logger.warning(
-                            "I2V: conditioning_latent has %s frames, expected 1. Skipping I2V conditioning.",
-                            cond_on_device.shape[2],
-                        )
-                        cond_on_device = None
-                    elif cond_on_device.shape[1] != latents.shape[1]:
-                        logger.warning(
-                            "I2V: Channel dimension mismatch - conditioning %s vs latents %s. Skipping I2V conditioning.",
-                            cond_on_device.shape[1],
-                            latents.shape[1],
-                        )
-                        cond_on_device = None
+        guides: List[LatentIndexGuide] = []
+        # Only append conditioning_latent if pre-validation passed; otherwise
+        # the warning above already informed the user and we skip silently here.
+        if conditioning_latent is not None and i2v_lock_active:
+            guides.append(LatentIndexGuide(latent=conditioning_latent, latent_idx=0, strength=1.0))
+        if latent_idx_guides:
+            for g in latent_idx_guides:
+                # Skip user guides at latent_idx=0 only when a real lock will exist.
+                if i2v_lock_active and int(getattr(g, "latent_idx", 0)) == 0:
+                    logger.warning(
+                        "latent_idx_guide at latent_idx=0 overlaps active I2V lock; "
+                        "skipping to preserve the lock. Remove conditioning_latent if "
+                        "you want this guide to take effect."
+                    )
+                    continue
+                # Clamp strength to [0, 1]; out-of-range produces broken
+                # denoise_mask = 1 - strength arithmetic and corrupts the
+                # latent / clean_latent / mask blend.
+                raw_strength = float(getattr(g, "strength", 1.0))
+                if raw_strength < 0.0 or raw_strength > 1.0:
+                    logger.warning(
+                        "latent_idx_guide: strength=%.3f outside [0,1]; clamping.",
+                        raw_strength,
+                    )
+                clamped_strength = max(0.0, min(1.0, raw_strength))
+                # strength<=0 means no conditioning; skip entirely so the apply
+                # step doesn't overwrite the latent slice with clean guide
+                # content tagged as fully noisy (denoise_mask=1).
+                if clamped_strength <= 0.0:
+                    logger.warning(
+                        "latent_idx_guide: strength=0 skipped (no conditioning effect)."
+                    )
+                    continue
+                # Substitute the clamped strength so downstream resolve uses it.
+                guides.append(LatentIndexGuide(
+                    latent=g.latent,
+                    latent_idx=int(getattr(g, "latent_idx", 0)),
+                    strength=clamped_strength,
+                ))
 
-                    # Two-stage stage-1 uses half-res latents. Resize conditioning latent if needed.
-                    if cond_on_device is not None and cond_on_device.shape[-2:] != latents.shape[-2:]:
-                        resized = F.interpolate(
-                            cond_on_device.squeeze(2),
-                            size=latents.shape[-2:],
-                            mode="bilinear",
-                            align_corners=False,
-                        ).unsqueeze(2)
+        if guides:
+            try:
+                bsz, ch, total_frames, h_lat, w_lat = latents.shape
+                if total_frames < 1:
+                    logger.warning("Latent guides: video latents have no temporal frames. Skipping.")
+                    guides = []
+
+                # Validate every guide and resize spatially if needed (two-stage stage-1).
+                resolved: List[Tuple[torch.Tensor, int, float]] = []
+                for gi, g in enumerate(guides):
+                    cond = g.latent
+                    if cond is None or cond.dim() != 5:
+                        logger.warning("Guide %d: invalid shape %s, skipping.", gi, tuple(getattr(cond, "shape", ())))
+                        continue
+                    cond = cond.to(device=latents.device, dtype=latents.dtype)
+                    if cond.shape[1] != ch:
+                        logger.warning("Guide %d: channel mismatch (%d vs %d), skipping.", gi, cond.shape[1], ch)
+                        continue
+                    if cond.shape[-2:] != latents.shape[-2:]:
+                        # Squeeze T into batch for resize, then restore.
+                        b_g, c_g, t_g, _, _ = cond.shape
+                        flat = cond.reshape(b_g * t_g, c_g, cond.shape[3], cond.shape[4])
+                        flat = F.interpolate(flat, size=latents.shape[-2:], mode="bilinear", align_corners=False)
+                        cond = flat.reshape(b_g, c_g, t_g, latents.shape[3], latents.shape[4])
                         logger.info(
-                            "I2V: resized conditioning latent from %s to %s for current denoising stage",
-                            tuple(cond_on_device.shape),
-                            tuple(resized.shape),
+                            "Guide %d: resized to %s for current denoising stage.",
+                            gi, tuple(cond.shape),
                         )
-                        cond_on_device = resized
-
-                    if cond_on_device is not None and cond_on_device.shape[-2:] != latents.shape[-2:]:
+                    t_g = int(cond.shape[2])
+                    if t_g < 1:
+                        logger.warning("Guide %d: zero temporal length, skipping.", gi)
+                        continue
+                    if g.latent_idx < 0 or g.latent_idx + t_g > total_frames:
                         logger.warning(
-                            "I2V: Spatial dimension mismatch after resize attempt - conditioning %s vs latents %s. Skipping I2V conditioning.",
-                            tuple(cond_on_device.shape[-2:]),
-                            tuple(latents.shape[-2:]),
+                            "Guide %d: latent_idx %d + T %d out of range (total frames %d), skipping.",
+                            gi, g.latent_idx, t_g, total_frames,
                         )
-                        cond_on_device = None
+                        continue
+                    resolved.append((cond, int(g.latent_idx), float(g.strength)))
 
-                    if cond_on_device is not None:
-                        # Initialize first frame with conditioning latent.
-                        latents[:, :, 0:1, :, :] = cond_on_device
+                if resolved:
+                    denoise_mask = torch.ones_like(latents)
+                    clean_latent = torch.zeros_like(latents)
+                    for cond, idx, strength in resolved:
+                        t_g = int(cond.shape[2])
+                        latents[:, :, idx : idx + t_g, :, :] = cond
+                        # denoise_mask: 1 - strength (1.0 = fully clean → mask=0, no denoising).
+                        denoise_mask[:, :, idx : idx + t_g, :, :] = 1.0 - strength
+                        clean_latent[:, :, idx : idx + t_g, :, :] = cond
 
-                        # Keep first frame locked across denoising.
-                        denoise_mask = torch.ones_like(latents)
-                        denoise_mask[:, :, 0:1, :, :] = 0.0
-
-                        clean_latent = torch.zeros_like(latents)
-                        clean_latent[:, :, 0:1, :, :] = cond_on_device
-
-                        if use_i2v_token_timestep_mask:
-                            bsz, _c, frames, h_lat, w_lat = latents.shape
-                            seq_len = frames * h_lat * w_lat
-                            first_frame_tokens = h_lat * w_lat
-                            i2v_conditioning_mask_tokens = torch.zeros(
-                                (bsz, seq_len),
-                                device=latents.device,
-                                dtype=torch.bool,
-                            )
-                            if first_frame_tokens > 0:
-                                i2v_conditioning_mask_tokens[:, :first_frame_tokens] = True
-                            logger.info("I2V: enabled token timestep mask for conditioned first-frame tokens")
-
-                        logger.info(f"I2V: Initialized first frame conditioning (shape: {cond_on_device.shape})")
+                    if use_i2v_token_timestep_mask:
+                        seq_len = total_frames * h_lat * w_lat
+                        i2v_conditioning_mask_tokens = torch.zeros(
+                            (bsz, seq_len), device=latents.device, dtype=torch.bool,
+                        )
+                        for _cond, idx, strength in resolved:
+                            if strength < 1.0:
+                                continue  # Only fully-clean guides get token-timestep zeroing.
+                            tg_eff = int(_cond.shape[2])
+                            tokens_per_frame = h_lat * w_lat
+                            start_tok = idx * tokens_per_frame
+                            stop_tok = (idx + tg_eff) * tokens_per_frame
+                            i2v_conditioning_mask_tokens[:, start_tok:stop_tok] = True
+                        logger.info(
+                            "Latent guides: %d guide(s) applied at frame indices %s.",
+                            len(resolved), [r[1] for r in resolved],
+                        )
             except Exception as e:
-                logger.error(f"I2V: Failed to setup conditioning: {e}", exc_info=True)
+                logger.error("Latent guides: failed to setup: %s", e, exc_info=True)
                 denoise_mask = None
                 clean_latent = None
                 i2v_conditioning_mask_tokens = None
+                i2v_lock_active = False
+
+        # Preprocess keyframe guides into the dict format expected by LTX2Wrapper.
+        # We resize spatially to match the current denoising stage if needed (two-stage).
+        kf_guide_dicts: Optional[List[Dict[str, Any]]] = None
+        if keyframe_guides:
+            kf_guide_dicts = []
+            for gi, kg in enumerate(keyframe_guides):
+                gl = kg.latent
+                if gl is None or gl.dim() != 5:
+                    logger.warning("KeyframeGuide %d: invalid shape %s, skipping.",
+                                   gi, tuple(getattr(gl, "shape", ())))
+                    continue
+                gl = gl.to(device=latents.device, dtype=latents.dtype)
+                if gl.shape[1] != latents.shape[1]:
+                    logger.warning("KeyframeGuide %d: channel mismatch (%d vs %d), skipping.",
+                                   gi, gl.shape[1], latents.shape[1])
+                    continue
+                if gl.shape[-2:] != latents.shape[-2:]:
+                    b_g, c_g, t_g, _, _ = gl.shape
+                    flat = gl.reshape(b_g * t_g, c_g, gl.shape[3], gl.shape[4])
+                    flat = F.interpolate(flat, size=latents.shape[-2:], mode="bilinear", align_corners=False)
+                    gl = flat.reshape(b_g, c_g, t_g, latents.shape[3], latents.shape[4])
+                kf_frame_idx = int(kg.frame_idx)
+                kf_strength = float(kg.strength)
+                # Use i2v_lock_active (not raw conditioning_latent) so a
+                # malformed I2V setup doesn't spuriously block valid keyframes.
+                if i2v_lock_active and kf_frame_idx == 0 and kf_strength >= 1.0:
+                    logger.warning(
+                        "KeyframeGuide %d at frame_idx=0 with strength=%.2f competes with the "
+                        "conditioning_latent first-frame lock; skipping. Use strength<1.0 for an "
+                        "auxiliary cue, or remove conditioning_latent if this guide should win.",
+                        gi, kf_strength,
+                    )
+                    continue
+                if i2v_lock_active and kf_frame_idx == 0 and 0.9 <= kf_strength < 1.0:
+                    logger.warning(
+                        "KeyframeGuide %d at frame_idx=0 with strength=%.2f is very close to the "
+                        "locking threshold (1.0). It will pass through as an auxiliary cue but "
+                        "its effect may be visually indistinguishable from a competing lock.",
+                        gi, kf_strength,
+                    )
+                kf_dict: Dict[str, Any] = {
+                    "latent": gl,
+                    "frame_idx": kf_frame_idx,
+                    "strength": kf_strength,
+                }
+                # Propagate collapse_to_single_pixel_frame if the source carries
+                # it (still-image keyframe inference relies on this). Without
+                # propagation the guide silently uses the wider latent-slot span.
+                kf_collapse = getattr(kg, "collapse_to_single_pixel_frame", None)
+                if kf_collapse is not None:
+                    kf_dict["collapse_to_single_pixel_frame"] = bool(kf_collapse)
+                kf_guide_dicts.append(kf_dict)
+            if kf_guide_dicts:
+                logger.info(
+                    "Keyframe guides: %d guide(s) at frame indices %s.",
+                    len(kf_guide_dicts), [g["frame_idx"] for g in kf_guide_dicts],
+                )
+            else:
+                kf_guide_dicts = None
+
+        def _kf_for_cfg(do_cfg_local: bool) -> Optional[List[Dict[str, Any]]]:
+            """Duplicate each guide along the batch dim to match CFG-expanded inputs."""
+            if kf_guide_dicts is None:
+                return None
+            if not do_cfg_local:
+                return kf_guide_dicts
+            out = []
+            for g in kf_guide_dicts:
+                lat = g["latent"]
+                doubled = {**g, "latent": torch.cat([lat, lat], dim=0)}
+                s = g.get("strength")
+                if isinstance(s, torch.Tensor):
+                    doubled["strength"] = torch.cat([s, s], dim=0)
+                out.append(doubled)
+            return out
 
         sampler_name = resolve_ltx2_sampler(sample_sampler, None)
         if sampler_name == "res_2s" and audio_latents is not None:
@@ -499,6 +681,9 @@ class LTX2Inferencer:
                 if do_cfg:
                     mask_tokens = torch.cat([mask_tokens, mask_tokens], dim=0)
                 options["video_conditioning_mask"] = mask_tokens
+            kf_for_main_res2s = _kf_for_cfg(do_cfg)
+            if kf_for_main_res2s is not None:
+                options["keyframe_guides"] = kf_for_main_res2s
 
             pred = self.transformer(
                 latent_input,
@@ -543,6 +728,9 @@ class LTX2Inferencer:
                 }
                 if i2v_conditioning_mask_tokens is not None:
                     stg_opts["video_conditioning_mask"] = i2v_conditioning_mask_tokens
+                kf_for_stg_res2s = _kf_for_cfg(False)
+                if kf_for_stg_res2s is not None:
+                    stg_opts["keyframe_guides"] = kf_for_stg_res2s
                 stg_pred = self.transformer(
                     video_state.to(dtype=self.dit_dtype),
                     timestep=sigma_value.expand(1).to(device=self.device, dtype=self.dit_dtype).unsqueeze(1),
@@ -587,6 +775,9 @@ class LTX2Inferencer:
                         dim=0,
                     )
                 resolved_transformer_options["video_conditioning_mask"] = video_conditioning_mask_tokens
+            kf_for_main = _kf_for_cfg(do_cfg)
+            if kf_for_main is not None:
+                resolved_transformer_options["keyframe_guides"] = kf_for_main
 
             # Model input
             if self._audio_video and audio_input is not None:
@@ -659,6 +850,9 @@ class LTX2Inferencer:
                 }
                 if i2v_conditioning_mask_tokens is not None:
                     mod_opts["video_conditioning_mask"] = i2v_conditioning_mask_tokens
+                kf_for_mod = _kf_for_cfg(False)
+                if kf_for_mod is not None:
+                    mod_opts["keyframe_guides"] = kf_for_mod
                 mod_pred = self.transformer(
                     [latents.to(dtype=self.dit_dtype), audio_latents.to(dtype=self.dit_dtype)],
                     timestep=sigma.expand(1).to(device=self.device, dtype=self.dit_dtype).unsqueeze(1),
@@ -724,6 +918,9 @@ class LTX2Inferencer:
                 stg_opts: Dict[str, Any] = {"patches_replace": {}}
                 if i2v_conditioning_mask_tokens is not None:
                     stg_opts["video_conditioning_mask"] = i2v_conditioning_mask_tokens
+                kf_for_stg = _kf_for_cfg(False)
+                if kf_for_stg is not None:
+                    stg_opts["keyframe_guides"] = kf_for_stg
                 stg_opts["perturbations"] = BatchedPerturbationConfig(
                     [PerturbationConfig(perturbations=pert_list)] * stg_latent.shape[0]
                 )
@@ -1005,6 +1202,8 @@ class LTX2Inferencer:
                 progress_desc="Stage 1" if config.two_stage else "LTX-2 inference",
                 conditioning_latent=config.conditioning_latent,
                 use_i2v_token_timestep_mask=bool(config.use_i2v_token_timestep_mask),
+                latent_idx_guides=config.latent_idx_guides,
+                keyframe_guides=config.keyframe_guides,
                 stg_scale=config.stg_scale,
                 stg_blocks=config.stg_blocks,
                 stg_mode=config.stg_mode,
@@ -1128,6 +1327,8 @@ class LTX2Inferencer:
                     progress_desc="Stage 2 refine",
                     conditioning_latent=config.conditioning_latent,
                     use_i2v_token_timestep_mask=bool(config.use_i2v_token_timestep_mask),
+                    latent_idx_guides=config.latent_idx_guides,
+                    keyframe_guides=config.keyframe_guides,
                     stg_scale=config.stg_scale,
                     stg_blocks=config.stg_blocks,
                     stg_mode=config.stg_mode,

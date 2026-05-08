@@ -2,6 +2,7 @@
 	import FormField from '$lib/components/FormField.svelte';
 	import PathInput from '$lib/components/PathInput.svelte';
 	import StatsPanel from '$lib/components/StatsPanel.svelte';
+	import VramEstimateCard from '$lib/components/VramEstimateCard.svelte';
 	import { defaultModelDir, effectiveGemmaRoot, effectiveLtx2Checkpoint } from '$lib/utils/modelPaths.js';
 	import { projectConfig, projectLoaded, createProject, loadProjectFromPath, saveProjectDebounced, recentProjects, removeRecentProject, restoreRecentProject, closeProject } from '$lib/stores/project.js';
 	import { processStatuses } from '$lib/stores/processes.js';
@@ -490,7 +491,7 @@
 		const isAV = mode === 'av';
 		// Base LoRA size in GB per unit rank (t2v preset, video-only)
 		const loraBasePerRank = isAV ? 12.75 / 1024 : 6.0 / 1024;  // GB per rank
-		const presetMultiplier = { t2v: 1.0, v2v: 1.44, video_sa: 0.37, video_sa_ff: 0.56, video_sa_ca_ff: 0.74, audio: 0.52, audio_ref_only_ic: 0.63, av_ic: 1.44, video_ref_only_av: 1.44, full: 2.1 }[t.lora_target_preset] || 1.0;
+		const presetMultiplier = { t2v: 1.0, v2v: 1.44, video_sa: 0.37, video_sa_ff: 0.56, video_sa_ca_ff: 0.74, audio: 0.37, audio_v2a: 0.52, audio_ref_only_ic: 0.63, av_ic: 1.44, video_ref_only_av: 1.44, full: 2.1 }[t.lora_target_preset] || 1.0;
 		const loraParamsGB = rank * loraBasePerRank * presetMultiplier;
 
 		// ── Optimizer states ──
@@ -921,127 +922,23 @@
 		</div>
 		<div class="text-[11px] font-mono truncate -mt-3" style="color: var(--text-muted);">{cfg?.project_dir || ''}</div>
 
-		<!-- VRAM Estimation — Three Gauges -->
-		<div class="p-3" style="background: var(--bg-surface); border: 1px solid var(--border-subtle); border-radius: var(--radius-md);">
-			<div class="flex items-center justify-between mb-3">
-				<span class="text-[10px] font-medium uppercase tracking-wider" style="color: var(--text-muted);">
+		<!-- VRAM Estimation -->
+		<div class="p-4" style="background: var(--bg-surface); border: 1px solid var(--border-subtle); border-radius: var(--radius-md);">
+			<div class="flex items-center justify-between gap-3 mb-3">
+				<span class="text-[11px] font-semibold uppercase tracking-wider" style="color: var(--text-muted); font-family: var(--font-label);">
 					VRAM Estimation{#if gpu} — {gpu.name.replace('NVIDIA ','').replace('GeForce ','')}{/if}
 				</span>
-				<span class="text-[10px] tabular-nums" style="color: var(--text-muted);">{vramTotal} GB total</span>
+				<span class="text-[12px] tabular-nums" style="color: var(--text-muted);">{vramTotal} GB total</span>
 			</div>
-			<div class="text-[10px] -mt-2 mb-3" style="color: var(--text-muted);">
-				Approximate planning estimate, not a strict guarantee. Actual VRAM depends on runtime kernels, driver/CUDA allocator behavior, data shape, and temporary spikes.
-			</div>
-			<div class="grid grid-cols-3 gap-3">
-				<!-- Latent Caching gauge -->
+			<div class="grid grid-cols-1 xl:grid-cols-3 gap-3 items-stretch">
 				{#if vramLatent}
-					{@const pct = Math.min(vramLatent.total / vramTotal, 1.2)}
-					{@const over = vramLatent.total > vramTotal}
-					{@const col = over ? 'var(--danger)' : 'var(--accent)'}
-					{@const r = 52}
-					{@const circ = 2 * Math.PI * r}
-					{@const off = circ * (1 - Math.min(pct, 1))}
-					<div class="flex flex-col items-center">
-						<div class="relative" style="width: 140px; height: 140px;">
-							<svg viewBox="0 0 120 120" class="w-full h-full" style="transform: rotate(-90deg);">
-								<circle cx="60" cy="60" r={r} fill="none" stroke="var(--border)" stroke-width="6" />
-								<circle cx="60" cy="60" r={r} fill="none" stroke={col} stroke-width="6"
-									stroke-dasharray={circ} stroke-dashoffset={off}
-									stroke-linecap="round" style="transition: stroke-dashoffset 0.5s ease;" />
-							</svg>
-							<div class="absolute inset-0 flex flex-col items-center justify-center">
-								<span class="text-[18px] font-bold tabular-nums leading-none" style="color: {col};">~{vramLatent.total.toFixed(1)}</span>
-								<span class="text-[10px] mt-0.5" style="color: var(--text-muted);">/ {vramTotal} GB</span>
-							</div>
-						</div>
-						<span class="text-[11px] font-medium mt-1.5" style="color: var(--text-secondary);">Latent Cache</span>
-						<div class="flex flex-wrap justify-center gap-x-3 gap-y-0 mt-1">
-							{#each vramLatent.parts as p}
-								<span class="flex items-center gap-1 text-[10px]">
-									<span class="w-1.5 h-1.5 rounded-full" style="background: {p.color};"></span>
-									<span style="color: var(--text-muted);">{p.label} {p.value.toFixed(1)}G</span>
-								</span>
-							{/each}
-						</div>
-					</div>
+					<VramEstimateCard title="Latent Cache" subtitle="VAE encode pass" estimate={vramLatent} total={vramTotal} color="var(--accent)" />
 				{/if}
-
-				<!-- Text Caching gauge -->
 				{#if vramText}
-					{@const pct = Math.min(vramText.total / vramTotal, 1.2)}
-					{@const over = vramText.total > vramTotal}
-					{@const col = over ? 'var(--danger)' : 'var(--info)'}
-					{@const r = 52}
-					{@const circ = 2 * Math.PI * r}
-					{@const off = circ * (1 - Math.min(pct, 1))}
-					<div class="flex flex-col items-center">
-						<div class="relative" style="width: 140px; height: 140px;">
-							<svg viewBox="0 0 120 120" class="w-full h-full" style="transform: rotate(-90deg);">
-								<circle cx="60" cy="60" r={r} fill="none" stroke="var(--border)" stroke-width="6" />
-								<circle cx="60" cy="60" r={r} fill="none" stroke={col} stroke-width="6"
-									stroke-dasharray={circ} stroke-dashoffset={off}
-									stroke-linecap="round" style="transition: stroke-dashoffset 0.5s ease;" />
-							</svg>
-							<div class="absolute inset-0 flex flex-col items-center justify-center">
-								<span class="text-[18px] font-bold tabular-nums leading-none" style="color: {col};">~{vramText.total.toFixed(1)}</span>
-								<span class="text-[10px] mt-0.5" style="color: var(--text-muted);">/ {vramTotal} GB</span>
-							</div>
-						</div>
-						<span class="text-[11px] font-medium mt-1.5" style="color: var(--text-secondary);">Text Cache</span>
-						<div class="flex flex-wrap justify-center gap-x-3 gap-y-0 mt-1">
-							{#each vramText.parts as p}
-								<span class="flex items-center gap-1 text-[10px]">
-									<span class="w-1.5 h-1.5 rounded-full" style="background: {p.color};"></span>
-									<span style="color: var(--text-muted);">{p.label} {p.value.toFixed(1)}G</span>
-								</span>
-							{/each}
-						</div>
-					</div>
+					<VramEstimateCard title="Text Cache" subtitle="Gemma encode pass" estimate={vramText} total={vramTotal} color="var(--info)" />
 				{/if}
-
-				<!-- Training gauge -->
 				{#if vramTrain}
-					{@const pct = Math.min(vramTrain.total / vramTotal, 1.2)}
-					{@const over = vramTrain.total > vramTotal}
-					{@const col = over ? 'var(--danger)' : 'var(--warning)'}
-					{@const r = 52}
-					{@const circ = 2 * Math.PI * r}
-					{@const off = circ * (1 - Math.min(pct, 1))}
-					<div class="flex flex-col items-center">
-						<div class="relative" style="width: 140px; height: 140px;">
-							<svg viewBox="0 0 120 120" class="w-full h-full" style="transform: rotate(-90deg);">
-								<circle cx="60" cy="60" r={r} fill="none" stroke="var(--border)" stroke-width="6" />
-								<circle cx="60" cy="60" r={r} fill="none" stroke={col} stroke-width="6"
-									stroke-dasharray={circ} stroke-dashoffset={off}
-									stroke-linecap="round" style="transition: stroke-dashoffset 0.5s ease;" />
-							</svg>
-							<div class="absolute inset-0 flex flex-col items-center justify-center">
-								<span class="text-[18px] font-bold tabular-nums leading-none" style="color: {col};">~{vramTrain.total.toFixed(1)}</span>
-								<span class="text-[10px] mt-0.5" style="color: var(--text-muted);">/ {vramTotal} GB</span>
-							</div>
-						</div>
-						<span class="text-[11px] font-medium mt-1.5" style="color: var(--text-secondary);">Training</span>
-						<div class="flex flex-wrap justify-center gap-x-3 gap-y-0 mt-1">
-							{#each vramTrain.parts as p}
-								<span class="flex items-center gap-1 text-[10px]">
-									<span class="w-1.5 h-1.5 rounded-full" style="background: {p.color};"></span>
-									<span style="color: var(--text-muted);">{p.label} {p.value.toFixed(1)}G</span>
-								</span>
-							{/each}
-						</div>
-						{#if vramTrain.swap > 0}
-							<span class="text-[9px] mt-0.5" style="color: var(--success);">-{vramTrain.swap.toFixed(1)}G swap</span>
-						{/if}
-						{#if vramTrain.noGemma}
-							<span class="text-[9px] mt-0.5" style="color: var(--info);">steady-state: cached latents/text (no VAE/Gemma)</span>
-						{/if}
-						{#if vramTrain.samplingSpike}
-							<span class="text-[9px] mt-0.5" style="color: var(--text-muted);">sampling can spike VRAM (temporary VAE/Gemma load)</span>
-						{/if}
-						{#if vramTrain.preservationGemmaSpike}
-							<span class="text-[9px] mt-0.5" style="color: var(--text-muted);">preservation prompt encoding loads Gemma once (if not precached)</span>
-						{/if}
-					</div>
+					<VramEstimateCard title="Training" subtitle="DiT + LoRA step" estimate={vramTrain} total={vramTotal} color="var(--warning)" />
 				{/if}
 			</div>
 			{#if vramTrain && vramTrain.total > vramTotal}

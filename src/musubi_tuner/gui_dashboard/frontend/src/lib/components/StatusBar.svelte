@@ -16,8 +16,7 @@
 
 	function formatSpeed(s) {
 		if (!s || s <= 0) return '--';
-		if (s >= 1) return s.toFixed(1);
-		return (1 / s).toFixed(1) + ' s/step';
+		return `${s >= 1 ? s.toFixed(1) : s.toFixed(2)} it/s`;
 	}
 
 	let statusText = $derived(active ? ($status?.status || 'waiting') : 'waiting');

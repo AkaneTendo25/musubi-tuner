@@ -450,6 +450,7 @@
 								{ value: 'video_sa_ff', label: 'V:SA+FF' },
 								{ value: 'video_sa_ca_ff', label: 'V:SA+CA+FF' },
 								{ value: 'audio', label: 'audio' },
+								{ value: 'audio_v2a', label: 'audio+V2A' },
 								{ value: 'audio_ref_only_ic', label: 'audio ref IC' },
 								{ value: 'av_ic', label: 'AV IC' },
 								{ value: 'video_ref_only_av', label: 'AV video-ref' },
@@ -673,6 +674,26 @@
 							<FormField type="number" fieldPath="training.ltx2_first_frame_conditioning_p" value={t.ltx2_first_frame_conditioning_p ?? 0.1} oninput={(e) => update('ltx2_first_frame_conditioning_p', Number(e.target.value))} step="0.05" min={0} max={1} tooltip="First frame conditioning prob" />
 							{#if t.ltx2_mode === 'audio'}
 								<FormField type="number" fieldPath="training.audio_only_sequence_resolution" value={t.audio_only_sequence_resolution ?? 64} oninput={(e) => update('audio_only_sequence_resolution', Number(e.target.value))} min={0} tooltip="Virtual pixel resolution for shifted_logit_normal in audio-only mode (0 = use cached geometry)" />
+							{/if}
+						</div>
+
+						<!-- Endpoint-keyframe training (orthogonal to IC-LoRA strategy) -->
+						<div class="pt-3 space-y-2" style="border-top: 1px solid var(--border-subtle);">
+							<div class="flex items-center justify-between">
+								<span class="text-[11px] font-medium uppercase tracking-wider" style="color: var(--text-muted);">Endpoint Keyframe Training</span>
+							</div>
+							<p class="text-[11px]" style="color: var(--text-muted);">
+								Extract first / last / random-interior latent frames of the target as clean keyframe tokens at training time.
+								Composes with any <code>--ic_lora_strategy</code>. All sub-fields are no-ops while the master toggle is off.
+							</p>
+							<FormToggle fieldPath="training.keyframe_endpoint_training" checked={t.keyframe_endpoint_training ?? false} onchange={(e) => update('keyframe_endpoint_training', e.target.checked)} tooltip="Master enable for endpoint-keyframe training. When off, the four probabilities below are not emitted to the CLI." />
+							{#if t.keyframe_endpoint_training}
+								<div class="grid grid-cols-2 gap-2">
+									<FormField type="number" fieldPath="training.keyframe_first_frame_p" value={t.keyframe_first_frame_p ?? 1.0} oninput={(e) => update('keyframe_first_frame_p', Number(e.target.value))} step="0.05" min={0} max={1} tooltip="Per-sample probability of appending the first latent frame as a clean keyframe at frame_idx=0 (independent Bernoulli per item in the batch)." />
+									<FormField type="number" fieldPath="training.keyframe_last_frame_p" value={t.keyframe_last_frame_p ?? 1.0} oninput={(e) => update('keyframe_last_frame_p', Number(e.target.value))} step="0.05" min={0} max={1} tooltip="Per-sample probability of appending the last latent frame at frame_idx=(T-1)*VIDEO_SCALE_FACTORS.time (pixel-frame units)." />
+									<FormField type="number" fieldPath="training.keyframe_random_interior_p" value={t.keyframe_random_interior_p ?? 0.0} oninput={(e) => update('keyframe_random_interior_p', Number(e.target.value))} step="0.05" min={0} max={1} tooltip="Per-sample probability of appending random interior latent frames as keyframes (interior indices are shared across the batch; only the dropout decision is per-sample)." />
+									<FormField type="number" fieldPath="training.keyframe_max_random_interior" value={t.keyframe_max_random_interior ?? 0} oninput={(e) => update('keyframe_max_random_interior', Number(e.target.value))} step="1" min={0} tooltip="Cap on number of random interior keyframes per batch when keyframe_random_interior_p triggers." />
+								</div>
 							{/if}
 						</div>
 						{#if $advancedMode}

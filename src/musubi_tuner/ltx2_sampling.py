@@ -6,13 +6,14 @@ import gc
 import logging
 import locale
 import os
+import re
 import subprocess
 import sys
 import tempfile
 import time
 import wave
 from fractions import Fraction
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -37,6 +38,101 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_SAMPLE_PROMPTS_CACHE = "ltx2_sample_prompts_cache.pt"
 DEFAULT_SAMPLE_LATENTS_CACHE = "ltx2_sample_latents_cache.pt"
+
+
+# --- Latent-guide prompt-line extension (--gl / --gk) -----------------------
+# We don't add these to hv_train_network.line_to_prompt_dict to keep that file
+# model-agnostic. Instead, we re-parse the prompt lines after load_prompts.
+
+def _parse_ltx2_guide_spec(s: str) -> Optional[Dict[str, Any]]:
+    """Parse 'frame_idx:path[:strength]' into a dict; returns None on failure.
+
+    Handles Windows drive-letter paths like 'G:\\path\\image.png' by splitting
+    only on the FIRST colon (frame_idx separator) and treating the rest as
+    'path[:strength]', where strength is an optional trailing float.
+    """
+    head, sep, tail = s.partition(":")
+    if not sep:
+        logger.warning("LTX-2 guide spec %r missing path; expected 'frame_idx:path[:strength]'", s)
+        return None
+    try:
+        frame_idx = int(head)
+    except ValueError:
+        logger.warning("LTX-2 guide spec %r: frame_idx %r is not an integer", s, head)
+        return None
+
+    # Detect optional trailing strength: look for the LAST ':' followed by a
+    # well-formed float. This preserves Windows drive letters and Unix paths.
+    path = tail
+    strength = 1.0
+    last_colon = tail.rfind(":")
+    if last_colon != -1:
+        candidate = tail[last_colon + 1 :].strip()
+        try:
+            strength = float(candidate)
+            path = tail[:last_colon]
+        except ValueError:
+            # Trailing fragment isn't a number — treat the whole tail as path.
+            pass
+    return {"frame_idx": frame_idx, "path": path.strip(), "strength": strength}
+
+
+def _extract_ltx2_guide_specs_from_line(line: str) -> Dict[str, List[Dict[str, Any]]]:
+    """Parse --gl / --gk flags from a raw prompt line.
+
+    Format: '--gl frame_idx:path[:strength]' (replace tokens at slot N).
+    Format: '--gk frame_idx:path[:strength]' (append global/anchored keyframe;
+    frame_idx=-1 is the canonical global-reference case).
+    """
+    out: Dict[str, List[Dict[str, Any]]] = {}
+    for parg in line.split(" --"):
+        m = re.match(r"gl (.+)", parg, re.IGNORECASE)
+        if m:
+            spec = _parse_ltx2_guide_spec(m.group(1).strip())
+            if spec is not None:
+                out.setdefault("latent_idx_guide_specs", []).append(spec)
+            continue
+        m = re.match(r"gk (.+)", parg, re.IGNORECASE)
+        if m:
+            spec = _parse_ltx2_guide_spec(m.group(1).strip())
+            if spec is not None:
+                out.setdefault("keyframe_guide_specs", []).append(spec)
+            continue
+    return out
+
+
+def _augment_prompts_with_ltx2_guide_specs(prompts: List[Dict], prompt_file: str) -> None:
+    """Mutate `prompts` in place to add LTX-2 guide specs.
+
+    For .txt prompt files we re-read the raw lines so '--gl' / '--gk' can be
+    parsed. For .toml / .json files, the prompt dict is expected to already
+    contain 'latent_idx_guide_specs' / 'keyframe_guide_specs' as structured
+    fields if guides are wanted, so no augmentation is needed there.
+    """
+    if not prompt_file.endswith(".txt"):
+        return
+    try:
+        with open(prompt_file, "r", encoding="utf-8") as f:
+            raw_lines = [
+                line.strip() for line in f.readlines()
+                if line.strip() and not line.lstrip().startswith("#")
+            ]
+    except OSError as e:
+        logger.warning("Could not re-read %s for LTX-2 guide specs: %s", prompt_file, e)
+        return
+    if len(raw_lines) != len(prompts):
+        # Sanity check — load_prompts uses the same filtering rules.
+        logger.warning(
+            "LTX-2 guide spec parsing skipped: re-read line count (%d) != prompt count (%d)",
+            len(raw_lines), len(prompts),
+        )
+        return
+    for prompt, raw_line in zip(prompts, raw_lines):
+        if not isinstance(prompt, dict):
+            continue
+        extracted = _extract_ltx2_guide_specs_from_line(raw_line)
+        for k, v in extracted.items():
+            prompt.setdefault(k, []).extend(v)
 
 
 def _decode_subprocess_output(data: bytes | None) -> str:
@@ -691,6 +787,7 @@ class LTX2SamplingMixin:
             prompts = load_prompts(sample_prompts)
             if not prompts:
                 return None
+            _augment_prompts_with_ltx2_guide_specs(prompts, sample_prompts)
             sample_params = self._apply_sample_defaults(args, prompts)
 
         # Load precached I2V latents if requested (independent of text embedding caching)
@@ -1532,6 +1629,79 @@ class LTX2SamplingMixin:
                 logger.error(f"V2V: failed to load reference '{v2v_ref_path}': {e}")
                 v2v_ref_latent = None
 
+        # ---- LTX-2 latent-guide specs (--gl / --gk in prompt lines) ----
+        # Encode each spec into a 5D latent and convert into LatentIndexGuide /
+        # KeyframeGuide for the inferencer. For now we re-use the same pixel
+        # resolution as the target video (no per-guide resolution override).
+        latent_idx_guides_resolved = None
+        keyframe_guides_resolved = None
+        latent_idx_specs = sample_parameter.get("latent_idx_guide_specs") or []
+        keyframe_specs = sample_parameter.get("keyframe_guide_specs") or []
+        if latent_idx_specs or keyframe_specs:
+            from musubi_tuner.ltx2_inference import LatentIndexGuide, KeyframeGuide
+            try:
+                vae_checkpoint = getattr(args, "vae", None) or getattr(args, "ltx2_checkpoint", None)
+                if not vae_checkpoint:
+                    raise ValueError("VAE checkpoint required for latent guides (--vae or --ltx2_checkpoint)")
+                device = accelerator.device
+                spatial_factor = 32
+                width = sample_parameter.get("width", 768)
+                height = sample_parameter.get("height", 512)
+                width = (width // spatial_factor) * spatial_factor
+                height = (height // spatial_factor) * spatial_factor
+
+                def _enc(path: str) -> torch.Tensor:
+                    return self._load_and_encode_conditioning_image(
+                        image_path=path,
+                        target_height=height,
+                        target_width=width,
+                        vae_checkpoint_path=vae_checkpoint,
+                        device=device,
+                        dtype=dit_dtype,
+                    )
+
+                if latent_idx_specs:
+                    latent_idx_guides_resolved = []
+                    for spec in latent_idx_specs:
+                        try:
+                            lat = _enc(spec["path"])
+                            latent_idx_guides_resolved.append(
+                                LatentIndexGuide(
+                                    latent=lat,
+                                    latent_idx=int(spec["frame_idx"]),
+                                    strength=float(spec.get("strength", 1.0)),
+                                )
+                            )
+                        except Exception as e:
+                            logger.error("Failed to encode --gl guide %r: %s", spec.get("path"), e)
+                if keyframe_specs:
+                    keyframe_guides_resolved = []
+                    for spec in keyframe_specs:
+                        try:
+                            lat = _enc(spec["path"])
+                            kf_idx = int(spec["frame_idx"])
+                            # Match training-time first-frame behavior: a still-image
+                            # keyframe at the causal-anchor slot (frame_idx=0) covers
+                            # one pixel-frame, not the full ~8 pixel-frames a latent
+                            # slice represents. Endpoint training sets this in
+                            # _extract_endpoint_keyframes; mirror it here so --gk
+                            # samples don't drift to a wider span.
+                            kf_collapse = (kf_idx == 0)
+                            keyframe_guides_resolved.append(
+                                KeyframeGuide(
+                                    latent=lat,
+                                    frame_idx=kf_idx,
+                                    strength=float(spec.get("strength", 1.0)),
+                                    collapse_to_single_pixel_frame=kf_collapse,
+                                )
+                            )
+                        except Exception as e:
+                            logger.error("Failed to encode --gk guide %r: %s", spec.get("path"), e)
+            except Exception as e:
+                logger.error("LTX-2 latent guides: setup failed: %s", e)
+                latent_idx_guides_resolved = None
+                keyframe_guides_resolved = None
+
         ref_audio_latent = None
         ref_audio_path = sample_parameter.get("ref_audio_path") or sample_parameter.get("reference_audio_path")
         if "ref_audio_latent" in sample_parameter:
@@ -1824,6 +1994,8 @@ class LTX2SamplingMixin:
                 enable_audio_preview=enable_audio_preview,
                 decode_video=not audio_only_preview,
                 audio_only=audio_only_preview,
+                latent_idx_guides=latent_idx_guides_resolved,
+                keyframe_guides=keyframe_guides_resolved,
             )
         else:
             video, audio_waveform = self.do_inference(
@@ -1855,6 +2027,8 @@ class LTX2SamplingMixin:
                 conditioning_latent=conditioning_latent,
                 v2v_ref_latents=v2v_ref_latent,
                 ref_audio_latents=ref_audio_latent,
+                latent_idx_guides=latent_idx_guides_resolved,
+                keyframe_guides=keyframe_guides_resolved,
             )
 
         if not has_self_ref_orig_mod:
@@ -1965,6 +2139,8 @@ class LTX2SamplingMixin:
         conditioning_latent: Optional[torch.Tensor] = None,
         v2v_ref_latents: Optional[torch.Tensor] = None,
         ref_audio_latents: Optional[torch.Tensor] = None,
+        latent_idx_guides: Optional[List[Any]] = None,
+        keyframe_guides: Optional[List[Any]] = None,
     ):
         """Generate sample video during training using LTX-2 denoising loop"""
         from musubi_tuner.ltx_2.types import AudioLatentShape, VideoPixelShape
@@ -2228,6 +2404,7 @@ class LTX2SamplingMixin:
         denoise_mask = None
         clean_latent = None
         i2v_conditioning_mask_tokens = None
+        i2v_lock_active = False  # Set True only after a valid lock is established
         use_i2v_token_timestep_mask = bool(getattr(args, "sample_i2v_token_timestep_mask", True))
         if conditioning_latent is not None:
             # Validate conditioning_latent shape
@@ -2271,11 +2448,222 @@ class LTX2SamplingMixin:
                         logger.info("I2V: enabled token timestep mask for conditioned first-frame tokens")
 
                     logger.info(f"I2V: Initialized first frame conditioning (shape: {conditioning_latent.shape})")
+                    i2v_lock_active = True
                 except Exception as e:
                     logger.error(f"I2V: Failed to setup conditioning: {e}", exc_info=True)
                     denoise_mask = None
                     clean_latent = None
                     i2v_conditioning_mask_tokens = None
+                    i2v_lock_active = False
+
+        if latent_idx_guides:
+            try:
+                bsz, ch, total_frames, h_lat, w_lat = latents.shape
+                if total_frames < 1:
+                    logger.warning("Latent guides: video latents have no temporal frames. Skipping.")
+                else:
+                    resolved_li_guides: List[Tuple[torch.Tensor, int, float]] = []
+                    for gi, g in enumerate(latent_idx_guides):
+                        cond = getattr(g, "latent", None)
+                        if cond is None or cond.dim() != 5:
+                            logger.warning("Latent guide %d: invalid shape %s, skipping.",
+                                           gi, tuple(getattr(cond, "shape", ())))
+                            continue
+                        cond = cond.to(device=latents.device, dtype=latents.dtype)
+                        if cond.shape[1] != ch:
+                            logger.warning("Latent guide %d: channel mismatch (%d vs %d), skipping.",
+                                           gi, cond.shape[1], ch)
+                            continue
+                        if cond.shape[-2:] != latents.shape[-2:]:
+                            b_g, c_g, t_g, _, _ = cond.shape
+                            flat = cond.reshape(b_g * t_g, c_g, cond.shape[3], cond.shape[4])
+                            flat = F.interpolate(flat, size=latents.shape[-2:], mode="bilinear", align_corners=False)
+                            cond = flat.reshape(b_g, c_g, t_g, latents.shape[3], latents.shape[4])
+                        t_g = int(cond.shape[2])
+                        if t_g < 1:
+                            continue
+                        idx = int(getattr(g, "latent_idx", 0))
+                        if idx < 0 or idx + t_g > total_frames:
+                            logger.warning(
+                                "Latent guide %d: latent_idx %d + T %d out of range (total %d), skipping.",
+                                gi, idx, t_g, total_frames,
+                            )
+                            continue
+                        # Conflict with already-locked first-frame I2V slot: a
+                        # latent_idx guide overlapping idx=0 would silently relax
+                        # the lock by overwriting denoise_mask with 1-strength.
+                        # Use i2v_lock_active (not raw conditioning_latent) so a
+                        # failed/invalid I2V setup doesn't spuriously block guides.
+                        if i2v_lock_active and idx == 0:
+                            logger.warning(
+                                "Latent guide %d: latent_idx=0 overlaps the active first-frame "
+                                "I2V lock; skipping to preserve the lock. Remove conditioning_latent "
+                                "if you want this guide to take effect.",
+                                gi,
+                            )
+                            continue
+                        # Clamp strength to [0, 1]; out-of-range produces broken
+                        # denoise_mask = 1 - strength arithmetic downstream.
+                        raw_strength = float(getattr(g, "strength", 1.0))
+                        if raw_strength < 0.0 or raw_strength > 1.0:
+                            logger.warning(
+                                "Latent guide %d: strength=%.3f outside [0,1]; clamping.",
+                                gi, raw_strength,
+                            )
+                        clamped_strength = max(0.0, min(1.0, raw_strength))
+                        # strength=0 means no conditioning. Without skipping, the
+                        # write at the apply step would still place clean guide
+                        # content in the denoised stream while denoise_mask=1
+                        # claims it's fully noisy — a leak. Skip entirely.
+                        if clamped_strength <= 0.0:
+                            logger.warning(
+                                "Latent guide %d: strength=0 skipped (no conditioning effect).",
+                                gi,
+                            )
+                            continue
+                        resolved_li_guides.append((cond, idx, clamped_strength))
+
+                    if resolved_li_guides:
+                        if denoise_mask is None:
+                            denoise_mask = torch.ones_like(latents)
+                        if clean_latent is None:
+                            clean_latent = torch.zeros_like(latents)
+                        for cond, idx, strength in resolved_li_guides:
+                            t_g = int(cond.shape[2])
+                            latents[:, :, idx : idx + t_g, :, :] = cond
+                            denoise_mask[:, :, idx : idx + t_g, :, :] = 1.0 - strength
+                            clean_latent[:, :, idx : idx + t_g, :, :] = cond
+
+                        if use_i2v_token_timestep_mask:
+                            seq_len = total_frames * h_lat * w_lat
+                            if i2v_conditioning_mask_tokens is None:
+                                i2v_conditioning_mask_tokens = torch.zeros(
+                                    (bsz, seq_len), device=latents.device, dtype=torch.bool,
+                                )
+                            tokens_per_frame = h_lat * w_lat
+                            for cond, idx, strength in resolved_li_guides:
+                                if strength < 1.0:
+                                    continue
+                                t_g = int(cond.shape[2])
+                                i2v_conditioning_mask_tokens[:, idx * tokens_per_frame : (idx + t_g) * tokens_per_frame] = True
+                        logger.info(
+                            "Latent guides: %d guide(s) applied at frame indices %s.",
+                            len(resolved_li_guides), [r[1] for r in resolved_li_guides],
+                        )
+            except Exception as e:
+                logger.error("Latent guides: failed to setup: %s", e, exc_info=True)
+
+        kf_guide_dicts: Optional[List[Dict[str, Any]]] = None
+        if keyframe_guides:
+            kf_guide_dicts = []
+            for gi, kg in enumerate(keyframe_guides):
+                gl = getattr(kg, "latent", None)
+                if gl is None or gl.dim() != 5:
+                    logger.warning("Keyframe guide %d: invalid shape %s, skipping.",
+                                   gi, tuple(getattr(gl, "shape", ())))
+                    continue
+                gl = gl.to(device=latents.device, dtype=latents.dtype)
+                if gl.shape[1] != latents.shape[1]:
+                    logger.warning("Keyframe guide %d: channel mismatch (%d vs %d), skipping.",
+                                   gi, gl.shape[1], latents.shape[1])
+                    continue
+                if gl.shape[-2:] != latents.shape[-2:]:
+                    b_g, c_g, t_g, _, _ = gl.shape
+                    flat = gl.reshape(b_g * t_g, c_g, gl.shape[3], gl.shape[4])
+                    flat = F.interpolate(flat, size=latents.shape[-2:], mode="bilinear", align_corners=False)
+                    gl = flat.reshape(b_g, c_g, t_g, latents.shape[3], latents.shape[4])
+                kf_frame_idx = int(getattr(kg, "frame_idx", -1))
+                kf_strength = float(getattr(kg, "strength", 1.0))
+                # Use i2v_lock_active (not raw conditioning_latent) so a failed
+                # I2V setup doesn't spuriously block valid keyframe guides.
+                if i2v_lock_active and kf_frame_idx == 0 and kf_strength >= 1.0:
+                    logger.warning(
+                        "Keyframe guide %d at frame_idx=0 with strength=%.2f competes with the "
+                        "active first-frame I2V lock; skipping. Use strength<1.0 for an "
+                        "auxiliary cue, or remove conditioning_latent if this guide should win.",
+                        gi, kf_strength,
+                    )
+                    continue
+                if i2v_lock_active and kf_frame_idx == 0 and 0.9 <= kf_strength < 1.0:
+                    logger.warning(
+                        "Keyframe guide %d at frame_idx=0 with strength=%.2f is very close to "
+                        "the locking threshold (1.0). It will pass through as an auxiliary cue, "
+                        "but its effect at this strength may be visually indistinguishable from "
+                        "a competing lock. Lower strength or set strength=1.0 explicitly to "
+                        "indicate intent.",
+                        gi, kf_strength,
+                    )
+                kf_dict: Dict[str, Any] = {
+                    "latent": gl,
+                    "frame_idx": kf_frame_idx,
+                    "strength": kf_strength,
+                }
+                # Propagate collapse_to_single_pixel_frame if the source guide
+                # carries it; otherwise build_keyframe_extension will use the
+                # caller's default.
+                kf_collapse = getattr(kg, "collapse_to_single_pixel_frame", None)
+                if kf_collapse is not None:
+                    kf_dict["collapse_to_single_pixel_frame"] = bool(kf_collapse)
+                kf_guide_dicts.append(kf_dict)
+            if kf_guide_dicts:
+                logger.info(
+                    "Keyframe guides: %d guide(s) at frame indices %s.",
+                    len(kf_guide_dicts), [g["frame_idx"] for g in kf_guide_dicts],
+                )
+            else:
+                kf_guide_dicts = None
+
+        def _kf_for_cfg(do_cfg_local: bool) -> Optional[List[Dict[str, Any]]]:
+            # Keyframes are structural conditioning (geometric anchors) that must
+            # appear in every guidance branch. Per-branch verification:
+            #
+            #   * CFG (main vs uncond): contrast isolates the text-conditioning
+            #     factor. Keyframes are appended VIDEO tokens; they appear in
+            #     both branches identically. The CFG contrast (cond - uncond)
+            #     evaluates the response to text presence/absence, not to
+            #     keyframe presence — keyframes contribute equally to both
+            #     sides of the contrast and don't pollute the text-direction
+            #     amplification.
+            #
+            #   * STG (main vs perturbed-self-attn): perturbation only skips
+            #     SKIP_VIDEO_SELF_ATTN at specified blocks (see perturbations.py).
+            #     Cross-attention to text and per-token positional encoding
+            #     are unchanged. Appended keyframe tokens DO participate in
+            #     self-attention; therefore their contribution differs between
+            #     main and perturbed branches by the same factor as regular
+            #     video tokens. The contrast amplifies "what self-attention
+            #     adds, including via keyframe-token interactions" — which is
+            #     the LoRA's learned use of keyframes. Removing keyframes here
+            #     would change the contrast meaning rather than clean it.
+            #
+            #   * No-ref identity guidance (AV): perturbation zeros the audio
+            #     reference; the contrast isolates the audio-reference factor.
+            #     Keyframes are video-side and unaffected by audio-reference
+            #     zeroing — they appear identically in both branches and don't
+            #     leak into the audio-reference amplification.
+            #
+            #   * AV bimodal CFG: perturbation disables a2v/v2a cross-modal
+            #     attention; the contrast isolates cross-modal attention.
+            #     Keyframes participate in video self-attention but don't
+            #     mediate cross-modal coupling, so their contribution is
+            #     symmetric across the contrast.
+            #
+            # Verified via test_stg_options_carry_keyframes_alongside_perturbations.
+            if kf_guide_dicts is None:
+                return None
+            if not do_cfg_local:
+                return kf_guide_dicts
+            out = []
+            for g in kf_guide_dicts:
+                lat = g["latent"]
+                doubled = {**g, "latent": torch.cat([lat, lat], dim=0)}
+                # If strength is per-sample [B], it must double along batch too
+                # so its length matches the CFG-expanded video latents.
+                s = g.get("strength")
+                if isinstance(s, torch.Tensor):
+                    doubled["strength"] = torch.cat([s, s], dim=0)
+                out.append(doubled)
+            return out
 
         sigma_schedule = sample_parameter.get("sigma_schedule") or getattr(args, "sample_sigma_schedule", "auto")
         sampling_preset = sample_parameter.get("sampling_preset") or getattr(args, "sample_sampling_preset", None)
@@ -2425,6 +2813,9 @@ class LTX2SamplingMixin:
                 if do_classifier_free_guidance:
                     mask_tokens = torch.cat([mask_tokens, mask_tokens], dim=0)
                 options["video_conditioning_mask"] = mask_tokens
+            kf_for_main_res2s = _kf_for_cfg(do_classifier_free_guidance)
+            if kf_for_main_res2s is not None:
+                options["keyframe_guides"] = kf_for_main_res2s
 
             pred = transformer(
                 latent_input,
@@ -2476,6 +2867,9 @@ class LTX2SamplingMixin:
                 }
                 if i2v_conditioning_mask_tokens is not None:
                     stg_options["video_conditioning_mask"] = i2v_conditioning_mask_tokens
+                kf_for_stg_res2s = _kf_for_cfg(False)
+                if kf_for_stg_res2s is not None:
+                    stg_options["keyframe_guides"] = kf_for_stg_res2s
 
                 if do_classifier_free_guidance:
                     half = prompt_embeds.shape[0] // 2
@@ -2566,6 +2960,9 @@ class LTX2SamplingMixin:
                             dim=0,
                         )
                     resolved_transformer_options["video_conditioning_mask"] = video_conditioning_mask_tokens
+                kf_for_main = _kf_for_cfg(do_classifier_free_guidance)
+                if kf_for_main is not None:
+                    resolved_transformer_options["keyframe_guides"] = kf_for_main
 
                 if (
                     audio_ref_only_ic_sampling
@@ -2672,6 +3069,9 @@ class LTX2SamplingMixin:
                         noref_options = {"patches_replace": {}}
                         if i2v_conditioning_mask_tokens is not None:
                             noref_options["video_conditioning_mask"] = i2v_conditioning_mask_tokens
+                        kf_for_noref = _kf_for_cfg(False)
+                        if kf_for_noref is not None:
+                            noref_options["keyframe_guides"] = kf_for_noref
 
                         noref_input = [noref_video, noref_audio] if self._audio_video else noref_video
                         noref_pred = transformer(
@@ -2704,6 +3104,9 @@ class LTX2SamplingMixin:
                     bimodal_options = {"patches_replace": {}, "perturbations": bimodal_perturbations}
                     if i2v_conditioning_mask_tokens is not None:
                         bimodal_options["video_conditioning_mask"] = i2v_conditioning_mask_tokens
+                    kf_for_bimodal = _kf_for_cfg(False)
+                    if kf_for_bimodal is not None:
+                        bimodal_options["keyframe_guides"] = kf_for_bimodal
                     if (
                         audio_ref_only_ic_sampling
                         and audio_model_input is not None
@@ -2819,6 +3222,9 @@ class LTX2SamplingMixin:
                         _stg_options = {"patches_replace": {}, "perturbations": _stg_perturbations}
                         if i2v_conditioning_mask_tokens is not None:
                             _stg_options["video_conditioning_mask"] = i2v_conditioning_mask_tokens
+                        kf_for_stg = _kf_for_cfg(False)
+                        if kf_for_stg is not None:
+                            _stg_options["keyframe_guides"] = kf_for_stg
 
                         if do_classifier_free_guidance:
                             _half = prompt_embeds.shape[0] // 2
@@ -3859,6 +4265,8 @@ class LTX2SamplingMixin:
         decode_video: bool = True,
         audio_only: bool = False,
         conditioning_latent: Optional[torch.Tensor] = None,
+        latent_idx_guides: Optional[List[Any]] = None,
+        keyframe_guides: Optional[List[Any]] = None,
     ):
         """Generate sample video using two-stage inference (half-res + upsample + refine)."""
         device = accelerator.device
@@ -3931,6 +4339,8 @@ class LTX2SamplingMixin:
             negative_prompt_attention_mask=negative_mask,
             conditioning_latent=conditioning_latent,
             use_i2v_token_timestep_mask=bool(getattr(args, "sample_i2v_token_timestep_mask", True)),
+            latent_idx_guides=latent_idx_guides,
+            keyframe_guides=keyframe_guides,
             offload_between_stages=bool(getattr(args, "sample_with_offloading", False)),
             stg_scale=float(getattr(args, "stg_scale", 0.0) or 0.0),
             stg_blocks=getattr(args, "stg_blocks", None),

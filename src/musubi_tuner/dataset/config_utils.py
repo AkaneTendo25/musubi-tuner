@@ -57,6 +57,23 @@ class BaseDatasetParams:
     reference_frames: Optional[int] = None
     reference_audio_cache_directory: Optional[str] = None
     reference_audio_cache_directories: Optional[Sequence[str]] = None
+    # Latent guides (directory-based, one guide of each type per item).
+    latent_idx_guide_directory: Optional[str] = None
+    latent_idx_guide_cache_directory: Optional[str] = None
+    latent_idx_guide_frame_idx: int = 0
+    latent_idx_guide_strength: float = 1.0
+    keyframe_guide_directory: Optional[str] = None
+    keyframe_guide_cache_directory: Optional[str] = None
+    keyframe_guide_frame_idx: int = -1
+    keyframe_guide_strength: float = 1.0
+    # Multi-keyframe: extra keyframe guides beyond the single primary above.
+    # If set, each list must have the same length and is appended after the
+    # primary keyframe (which stays in keyframe_guide_directory). Empty/None
+    # falls back to single-keyframe behavior.
+    keyframe_guide_extra_directories: Optional[Sequence[str]] = None
+    keyframe_guide_extra_cache_directories: Optional[Sequence[str]] = None
+    keyframe_guide_extra_frame_idxs: Optional[Sequence[int]] = None
+    keyframe_guide_extra_strengths: Optional[Sequence[float]] = None
     separate_audio_buckets: bool = False
     loss_mask_directory: Optional[str] = None
     default_loss_mask_path: Optional[str] = None
@@ -163,6 +180,19 @@ class ConfigSanitizer:
         "reference_frames": int,
         "reference_audio_cache_directory": str,
         "reference_audio_cache_directories": [str],
+        # LTX-2 latent guides
+        "latent_idx_guide_directory": str,
+        "latent_idx_guide_cache_directory": str,
+        "latent_idx_guide_frame_idx": int,
+        "latent_idx_guide_strength": float,
+        "keyframe_guide_directory": str,
+        "keyframe_guide_cache_directory": str,
+        "keyframe_guide_frame_idx": int,
+        "keyframe_guide_strength": float,
+        "keyframe_guide_extra_directories": [str],
+        "keyframe_guide_extra_cache_directories": [str],
+        "keyframe_guide_extra_frame_idxs": [int],
+        "keyframe_guide_extra_strengths": [float],
         "separate_audio_buckets": bool,
         "loss_mask_directory": str,
         "default_loss_mask_path": str,

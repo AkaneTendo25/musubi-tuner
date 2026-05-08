@@ -142,8 +142,8 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         "--lora_target_preset",
         type=str,
         default="t2v",
-        choices=["t2v", "v2v", "video_sa", "video_sa_ff", "video_sa_ca_ff",
-                 "audio", "audio_ref_only_ic", "av_ic", "video_ref_only_av", "full", "lycoris"],
+            choices=["t2v", "v2v", "video_sa", "video_sa_ff", "video_sa_ca_ff",
+                 "audio", "audio_v2a", "audio_ref_only_ic", "av_ic", "video_ref_only_av", "full", "lycoris"],
         help=(
             "LoRA target preset: "
             "'t2v' = text-to-video (all attention, default), "
@@ -151,7 +151,8 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
             "'video_sa' = video self-attention only, "
             "'video_sa_ff' = video self-attention + video feed-forward, "
             "'video_sa_ca_ff' = video self-attention + cross-attention + feed-forward, "
-            "'audio' = audio-only (audio attn/ffn + audio-side cross-modal), "
+            "'audio' = audio-only (audio attn/ffn, no AV cross-modal), "
+            "'audio_v2a' = audio preset plus video_to_audio_attn (audio attn/ffn + video_to_audio_attn), "
             "'audio_ref_only_ic' = ID-LoRA-style AV preset "
             "(audio attn/ffn + audio/video cross-modal both directions), "
             "'av_ic' = AV IC preset (use --av_cross_attention_mode / --av_multi_ref for AV variants), "
@@ -680,6 +681,57 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         type=float,
         default=0.1,
         help="Probability of first-frame conditioning during training (keep frame 0 clean and set its timestep to 0).",
+    )
+    # ---- Endpoint-keyframe training (orthogonal to --ic_lora_strategy) -----
+    parser.add_argument(
+        "--keyframe_endpoint_training",
+        action="store_true",
+        help=(
+            "Enable endpoint-keyframe training: extract first/last/random-interior latent "
+            "frames of the target and append them as APPEND-GUIDE keyframe tokens (soft "
+            "guidance — model is steered toward but not constrained to match them). For "
+            "exact frame replacement (hard lock) use the dataset-level latent_idx workflow "
+            "instead. Composes with any --ic_lora_strategy. Off by default."
+        ),
+    )
+    parser.add_argument(
+        "--keyframe_first_frame_p",
+        type=float,
+        default=1.0,
+        help=(
+            "Per-sample probability of appending the first latent frame as a keyframe when "
+            "--keyframe_endpoint_training is set (independent Bernoulli per item in the "
+            "batch). Default 1.0 (always)."
+        ),
+    )
+    parser.add_argument(
+        "--keyframe_last_frame_p",
+        type=float,
+        default=1.0,
+        help=(
+            "Per-sample probability of appending the last latent frame as a keyframe when "
+            "--keyframe_endpoint_training is set (independent Bernoulli per item in the "
+            "batch). Default 1.0 (always)."
+        ),
+    )
+    parser.add_argument(
+        "--keyframe_random_interior_p",
+        type=float,
+        default=0.0,
+        help=(
+            "Per-sample probability of appending random interior latent frames as keyframes "
+            "when --keyframe_endpoint_training is set. Interior indices are shared across the "
+            "batch; only the dropout decision is per-sample. Default 0.0 (off)."
+        ),
+    )
+    parser.add_argument(
+        "--keyframe_max_random_interior",
+        type=int,
+        default=0,
+        help=(
+            "Maximum number of random interior latent frames to append per batch when "
+            "--keyframe_random_interior_p triggers. Default 0 (none)."
+        ),
     )
     parser.add_argument(
         "--fp8_scaled",
@@ -1388,6 +1440,17 @@ def main() -> None:
         logger.warning(
             "--lora_target_preset audio_ref_only_ic in --ltx2_mode audio trains cross-modal layers that only "
             "affect the (dummy) video branch; consider --lora_target_preset audio instead."
+        )
+    if (
+        explicit_lora_preset
+        and getattr(args, "lora_target_preset", None) == "audio_v2a"
+        and getattr(args, "ltx_mode", "video") == "audio"
+    ):
+        logger.warning(
+            "--lora_target_preset audio_v2a in --ltx2_mode audio trains video_to_audio_attn against "
+            "dummy/unsupervised video context (audio mode has no real video tokens). Prefer "
+            "--lora_target_preset audio when --ltx2_mode is audio, or use --ltx2_mode av if you intend "
+            "to train video_to_audio_attn."
         )
 
     lora_target_preset = getattr(args, "lora_target_preset", None)

@@ -6,6 +6,7 @@
 	import GradNormChart from '$lib/components/GradNormChart.svelte';
 	import DataWaitChart from '$lib/components/DataWaitChart.svelte';
 	import ComputeTimeChart from '$lib/components/ComputeTimeChart.svelte';
+	import CircularMetricGauge from '$lib/components/CircularMetricGauge.svelte';
 	import SampleGallery from '$lib/components/SampleGallery.svelte';
 	import ProcessConsole from '$lib/components/ProcessConsole.svelte';
 	import ProcessControls from '$lib/components/ProcessControls.svelte';
@@ -232,8 +233,9 @@
 	let resumeMode = $derived(resumeModeLabel(t));
 	let gpuVramPercent = $derived(ratioPercent(gpu?.vram_used_mb, gpu?.vram_total_mb));
 	let gpuUtilization = $derived(clampPercent(gpu?.utilization));
+	let fanPercent = $derived(gpu?.fan_speed_percent == null ? null : clampPercent(gpu.fan_speed_percent));
 	let ramPercent = $derived(clampPercent(systemInfo?.ram?.percent));
-	let diskPercent = $derived(clampPercent(systemInfo?.disk?.percent ?? ratioPercent(systemInfo?.disk?.used_gb, systemInfo?.disk?.total_gb)));
+	let diskFreePercent = $derived(ratioPercent(systemInfo?.disk?.free_gb, systemInfo?.disk?.total_gb));
 	let cpuUtilization = $derived(systemInfo?.cpu?.utilization == null ? null : clampPercent(systemInfo.cpu.utilization));
 	let hasLossChartData = $derived(($lossData?.length ?? 0) > 0);
 	let hasGradNormChartData = $derived(
@@ -275,26 +277,32 @@
 			</div>
 
 			{#if gpu}
-				<div class="space-y-2">
-					<div class="space-y-1">
-						<div class="flex items-center justify-between gap-3 text-[11px]">
-							<span style="color: var(--text-muted);">VRAM</span>
-							<span class="font-semibold tabular-nums" style="color: var(--accent);">{(gpu.vram_used_mb / 1024).toFixed(1)} / {(gpu.vram_total_mb / 1024).toFixed(0)} GB</span>
-						</div>
-						<div class="h-1.5 overflow-hidden" style="background: var(--border); border-radius: var(--radius-full);">
-							<div class="h-full" style="width: {gpuVramPercent.toFixed(0)}%; background: var(--accent); border-radius: var(--radius-full); transition: width 0.6s ease;"></div>
-						</div>
-					</div>
-
-					<div class="space-y-1">
-						<div class="flex items-center justify-between gap-3 text-[11px]">
-							<span style="color: var(--text-muted);">GPU Load</span>
-							<span class="font-semibold tabular-nums" style="color: var(--text-primary);">{gpu.utilization == null ? '--' : `${gpuUtilization.toFixed(0)}%`}</span>
-						</div>
-						<div class="h-1.5 overflow-hidden" style="background: var(--border); border-radius: var(--radius-full);">
-							<div class="h-full" style="width: {gpuUtilization.toFixed(0)}%; background: var(--info); border-radius: var(--radius-full); transition: width 0.6s ease;"></div>
-						</div>
-					</div>
+				<div class="grid grid-cols-2 2xl:grid-cols-3 gap-3">
+					<CircularMetricGauge
+						label="VRAM"
+						value={gpuVramPercent}
+						display={`${(gpu.vram_used_mb / 1024).toFixed(1)}G`}
+						sublabel={`/ ${(gpu.vram_total_mb / 1024).toFixed(0)}G`}
+						color="var(--accent)"
+						size={116}
+					/>
+					<CircularMetricGauge
+						label="GPU Load"
+						value={gpuUtilization}
+						display={gpu.utilization == null ? '--' : `${gpuUtilization.toFixed(0)}%`}
+						color="var(--info)"
+						size={116}
+						inactive={gpu.utilization == null}
+					/>
+					{#if fanPercent != null}
+						<CircularMetricGauge
+							label="Fan"
+							value={fanPercent}
+							display={`${fanPercent.toFixed(0)}%`}
+							color="var(--warning)"
+							size={116}
+						/>
+					{/if}
 				</div>
 
 				<div class="grid grid-cols-2 gap-x-4 gap-y-2 text-[11px]">
@@ -302,13 +310,9 @@
 						<span style="color: var(--text-muted);">Peak VRAM</span>
 						<span class="font-medium tabular-nums" style="color: var(--text-primary);">{peakVramMb > 0 ? `${(peakVramMb / 1024).toFixed(1)} GB` : '--'}</span>
 					</div>
-					<div class="flex items-center justify-between gap-3">
+					<div class="flex items-baseline justify-between gap-3">
 						<span style="color: var(--text-muted);">Temp</span>
-						<span class="font-medium tabular-nums" style="color: {gpu.temperature > 80 ? 'var(--danger)' : gpu.temperature > 72 ? 'var(--warning)' : 'var(--text-primary)'};">{gpu.temperature != null ? `${gpu.temperature}°C` : '--'}</span>
-					</div>
-					<div class="flex items-center justify-between gap-3">
-						<span style="color: var(--text-muted);">Fan</span>
-						<span class="font-medium tabular-nums" style="color: var(--text-primary);">{gpu.fan_speed_percent != null ? `${gpu.fan_speed_percent}%` : '--'}</span>
+						<span class="text-[16px] leading-none font-bold tabular-nums" style="color: {gpu.temperature > 80 ? 'var(--danger)' : gpu.temperature > 72 ? 'var(--warning)' : 'var(--text-primary)'};">{gpu.temperature != null ? `${gpu.temperature}°C` : '--'}</span>
 					</div>
 					<div class="flex items-center justify-between gap-3">
 						<span style="color: var(--text-muted);">Clock</span>
@@ -373,27 +377,37 @@
 				<div class="text-[13px] font-semibold mt-1" style="color: var(--text-primary);">Host health</div>
 			</div>
 
-			{#if systemInfo?.ram}
-				<div class="space-y-1">
-					<div class="flex items-center justify-between gap-3 text-[11px]">
-						<span style="color: var(--text-muted);">RAM</span>
-						<span class="font-semibold tabular-nums" style="color: var(--text-primary);">{systemInfo.ram.used_gb} / {systemInfo.ram.total_gb} GB</span>
-					</div>
-					<div class="h-1.5 overflow-hidden" style="background: var(--border); border-radius: var(--radius-full);">
-						<div class="h-full" style="width: {ramPercent.toFixed(0)}%; background: {ramPercent > 90 ? 'var(--danger)' : 'var(--info)'}; border-radius: var(--radius-full); transition: width 0.6s ease;"></div>
-					</div>
-				</div>
-			{/if}
-
-			{#if systemInfo?.disk}
-				<div class="space-y-1">
-					<div class="flex items-center justify-between gap-3 text-[11px]">
-						<span style="color: var(--text-muted);">Disk Free</span>
-						<span class="font-semibold tabular-nums" style="color: var(--text-primary);">{systemInfo.disk.free_gb} GB</span>
-					</div>
-					<div class="h-1.5 overflow-hidden" style="background: var(--border); border-radius: var(--radius-full);">
-						<div class="h-full" style="width: {diskPercent.toFixed(0)}%; background: var(--info); border-radius: var(--radius-full); transition: width 0.6s ease;"></div>
-					</div>
+			{#if systemInfo?.ram || systemInfo?.disk || cpuUtilization != null}
+				<div class="grid grid-cols-2 2xl:grid-cols-3 gap-3">
+					{#if systemInfo?.ram}
+						<CircularMetricGauge
+							label="RAM"
+							value={ramPercent}
+							display={`${systemInfo.ram.used_gb}G`}
+							sublabel={`/ ${systemInfo.ram.total_gb}G`}
+							color={ramPercent > 90 ? 'var(--danger)' : ramPercent > 75 ? 'var(--warning)' : 'var(--info)'}
+							size={116}
+						/>
+					{/if}
+					{#if systemInfo?.disk}
+						<CircularMetricGauge
+							label="Disk Free"
+							value={diskFreePercent}
+							display={`${systemInfo.disk.free_gb}G`}
+							sublabel={`/ ${systemInfo.disk.total_gb}G`}
+							color={diskFreePercent < 10 ? 'var(--danger)' : diskFreePercent < 20 ? 'var(--warning)' : 'var(--success)'}
+							size={116}
+						/>
+					{/if}
+					{#if cpuUtilization != null}
+						<CircularMetricGauge
+							label="CPU Load"
+							value={cpuUtilization}
+							display={`${cpuUtilization.toFixed(0)}%`}
+							color={cpuUtilization > 90 ? 'var(--danger)' : cpuUtilization > 75 ? 'var(--warning)' : 'var(--info)'}
+							size={116}
+						/>
+					{/if}
 				</div>
 			{/if}
 
@@ -405,10 +419,6 @@
 				<div class="flex items-center justify-between gap-3">
 					<span style="color: var(--text-muted);">Est. duration</span>
 					<span class="font-medium tabular-nums" style="color: var(--text-primary);">{runStats?.estimated_time_hours ? formatDuration(runStats.estimated_time_hours * 3600) : '--'}</span>
-				</div>
-				<div class="flex items-center justify-between gap-3">
-					<span style="color: var(--text-muted);">CPU Load</span>
-					<span class="font-medium tabular-nums" style="color: var(--text-primary);">{cpuUtilization == null ? '--' : `${cpuUtilization.toFixed(0)}%`}</span>
 				</div>
 				<div class="flex items-center justify-between gap-3">
 					<span style="color: var(--text-muted);">Cores</span>

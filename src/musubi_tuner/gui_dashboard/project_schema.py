@@ -41,6 +41,22 @@ class DatasetEntry(BaseModel):
     default_loss_mask_path: str = ""
     loss_mask_use_alpha: bool = False
     loss_mask_invert: bool = False
+    # Latent guides (directory-based, one guide of each type per item)
+    latent_idx_guide_directory: str = ""
+    latent_idx_guide_cache_directory: str = ""
+    latent_idx_guide_frame_idx: int = 0
+    latent_idx_guide_strength: float = 1.0
+    keyframe_guide_directory: str = ""
+    keyframe_guide_cache_directory: str = ""
+    keyframe_guide_frame_idx: int = -1
+    keyframe_guide_strength: float = 1.0
+    # Multi-keyframe extras (semicolon-separated to keep the project JSON flat).
+    # Each list must have the same number of entries; first entry corresponds to
+    # the first extra keyframe. Empty falls back to single-keyframe behavior.
+    keyframe_guide_extra_directories: str = ""
+    keyframe_guide_extra_cache_directories: str = ""
+    keyframe_guide_extra_frame_idxs: str = ""
+    keyframe_guide_extra_strengths: str = ""
     jsonl_file: str = ""
     resolution_w: int = 768
     resolution_h: int = 512
@@ -173,7 +189,7 @@ class TrainingConfig(BaseModel):
     network_dim: Optional[int] = None
     network_alpha: float = 1.0
     lora_target_preset: Literal[
-        "t2v", "v2v", "video_sa", "video_sa_ff", "video_sa_ca_ff", "audio", "audio_ref_only_ic", "av_ic", "video_ref_only_av", "full", "lycoris"
+        "t2v", "v2v", "video_sa", "video_sa_ff", "video_sa_ca_ff", "audio", "audio_v2a", "audio_ref_only_ic", "av_ic", "video_ref_only_av", "full", "lycoris"
     ] = "t2v"
     network_args: str = ""
     network_weights: str = ""
@@ -556,6 +572,12 @@ class TrainingConfig(BaseModel):
     max_data_loader_n_workers: Optional[int] = None
     persistent_data_loader_workers: bool = False
     ltx2_first_frame_conditioning_p: float = 0.1
+    # Endpoint-keyframe training (orthogonal to --ic_lora_strategy)
+    keyframe_endpoint_training: bool = False
+    keyframe_first_frame_p: float = 1.0
+    keyframe_last_frame_p: float = 1.0
+    keyframe_random_interior_p: float = 0.0
+    keyframe_max_random_interior: int = 0
     accelerate_extra_args: str = ""
     extra_args: str = ""
 

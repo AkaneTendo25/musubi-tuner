@@ -35,6 +35,9 @@ class TrainingStats(BaseModel):
     total_epochs: float | None
     effective_batch_size: int
     estimated_time_hours: float | None
+    estimated_step_time_sec: float | None = None
+    estimated_steps_per_sec: float | None = None
+    estimated_time_source: str | None = None
     checkpoint_size_mb: float
     total_checkpoints: int
     total_storage_gb: float
@@ -83,6 +86,62 @@ def _first_training_dataset(config: dict) -> dict:
     if not datasets:
         return {}
     return next((d for d in datasets if d.get('type') in ('video', 'image')), datasets[0])
+
+
+def _estimate_training_step_time_sec(config: dict) -> float | None:
+    """Estimate wall-clock seconds per optimizer step from the current config."""
+    try:
+        training = config.get('training', {})
+        dataset = _first_training_dataset(config)
+
+        mode = str(training.get('ltx2_mode', 'video')).lower()
+        res_w = max(_coerce_int(dataset.get('resolution_w', 768), 768), 64)
+        res_h = max(_coerce_int(dataset.get('resolution_h', 512), 512), 64)
+        frames = max(_coerce_int(dataset.get('target_frames', 33), 33), 1)
+        batch_size = max(_coerce_int(dataset.get('batch_size', training.get('train_batch_size', 1)), 1), 1)
+        grad_accum = max(_coerce_int(training.get('gradient_accumulation_steps', 1), 1), 1)
+
+        pixel_frame_scale = (res_w * res_h * frames) / (768 * 512 * 33)
+        step_time = 2.35 * max(pixel_frame_scale, 0.25) * batch_size * grad_accum
+
+        if mode == 'av':
+            step_time *= 1.35
+        elif mode == 'audio':
+            step_time *= 0.55
+
+        if training.get('gradient_checkpointing', True):
+            step_time *= 1.20
+        if training.get('blockwise_checkpointing'):
+            step_time *= 1.08
+        if training.get('gradient_checkpointing_cpu_offload'):
+            step_time *= 1.15
+        if training.get('fp8_w8a8'):
+            step_time *= 0.88
+        elif training.get('fp8_base'):
+            step_time *= 0.95
+        if training.get('nf4_base'):
+            step_time *= 1.08
+        if training.get('self_flow'):
+            step_time *= 1.22
+        if training.get('blank_preservation'):
+            step_time *= 1.12
+        if training.get('dop'):
+            step_time *= 1.10
+        if training.get('audio_dop'):
+            step_time *= 1.10
+        if training.get('prior_divergence'):
+            step_time *= 1.05
+        if training.get('crepa'):
+            step_time *= 1.08
+
+        sample_every_n_steps = _coerce_int(training.get('sample_every_n_steps', 0), 0)
+        if sample_every_n_steps:
+            step_time += 5.0 / sample_every_n_steps
+
+        return max(step_time, 0.05)
+    except Exception as e:
+        logger.debug(f"Failed to estimate training step time: {e}")
+        return None
 
 
 def _scan_dataset(dataset_path: str) -> DatasetStats | None:
@@ -227,21 +286,12 @@ def _calculate_training_stats(config: dict, dataset_stats: DatasetStats | None) 
         if max_steps and steps_per_epoch:
             total_epochs = max_steps / steps_per_epoch
 
-        # Estimated time (very rough estimate: 1-3 sec per step depending on config)
+        # Estimated time from the same shape/config heuristic used for iteration time.
         estimated_time_hours = None
+        estimated_step_time_sec = _estimate_training_step_time_sec(config)
+        estimated_steps_per_sec = (1.0 / estimated_step_time_sec) if estimated_step_time_sec else None
         if max_steps:
-            # Base time per step
-            time_per_step = 2.0  # seconds
-
-            # Adjust based on settings
-            if training.get('gradient_checkpointing', True):
-                time_per_step *= 1.2  # Slower with grad checkpointing
-            sample_every_n_steps = _coerce_int(training.get('sample_every_n_steps', 0), 0)
-            if sample_every_n_steps:
-                # Add sampling overhead
-                time_per_step += (5.0 / sample_every_n_steps)  # ~5 sec per sample
-
-            estimated_time_hours = (max_steps * time_per_step) / 3600
+            estimated_time_hours = (max_steps * (estimated_step_time_sec or 0)) / 3600
 
         # Checkpoint size
         network_dim = max(_coerce_int(training.get('network_dim', 16), 16), 1)
@@ -275,6 +325,9 @@ def _calculate_training_stats(config: dict, dataset_stats: DatasetStats | None) 
             total_epochs=total_epochs,
             effective_batch_size=effective_batch_size,
             estimated_time_hours=estimated_time_hours,
+            estimated_step_time_sec=round(estimated_step_time_sec, 3) if estimated_step_time_sec else None,
+            estimated_steps_per_sec=round(estimated_steps_per_sec, 4) if estimated_steps_per_sec else None,
+            estimated_time_source='heuristic' if estimated_step_time_sec else None,
             checkpoint_size_mb=checkpoint_size_mb,
             total_checkpoints=total_checkpoints,
             total_storage_gb=total_storage_gb
@@ -319,7 +372,7 @@ def _calculate_vram_stats(config: dict) -> VRAMStats | None:
         lora_base_per_rank = (12.75 if is_av else 6.0) / 1024  # GB per rank
         preset_mult = {
             't2v': 1.0, 'v2v': 1.44, 'video_sa': 0.37, 'video_sa_ff': 0.56,
-            'video_sa_ca_ff': 0.74, 'audio': 0.52, 'audio_ref_only_ic': 0.63,
+            'video_sa_ca_ff': 0.74, 'audio': 0.37, 'audio_v2a': 0.52, 'audio_ref_only_ic': 0.63,
             'av_ic': 1.44, 'video_ref_only_av': 1.44, 'full': 2.1,
         }.get(training.get('lora_target_preset'), 1.0)
         lora_size_gb = rank * lora_base_per_rank * preset_mult

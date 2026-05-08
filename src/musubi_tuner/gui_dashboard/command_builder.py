@@ -1371,6 +1371,13 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
         cmd.append("--persistent_data_loader_workers")
     cmd += ["--ltx2_first_frame_conditioning_p", str(t.ltx2_first_frame_conditioning_p)]
 
+    if getattr(t, "keyframe_endpoint_training", False):
+        cmd += ["--keyframe_endpoint_training"]
+        cmd += ["--keyframe_first_frame_p", str(getattr(t, "keyframe_first_frame_p", 1.0))]
+        cmd += ["--keyframe_last_frame_p", str(getattr(t, "keyframe_last_frame_p", 1.0))]
+        cmd += ["--keyframe_random_interior_p", str(getattr(t, "keyframe_random_interior_p", 0.0))]
+        cmd += ["--keyframe_max_random_interior", str(int(getattr(t, "keyframe_max_random_interior", 0)))]
+
     cmd += _split_cli_args(t.extra_args)
     return cmd
 

@@ -27,6 +27,7 @@ Caching scripts (`ltx2_cache_latents.py`, `ltx2_cache_text_encoder_outputs.py`) 
   - [Latent Cache Output Files](#latent-cache-output-files)
   - [Memory Optimization for Caching](#memory-optimization-for-caching)
 - [2. Caching Text Encoder Outputs](#2-caching-text-encoder-outputs)
+  - [Text Encoder Caching Command](#text-encoder-caching-command)
   - [Text Encoder Caching Arguments](#text-encoder-caching-arguments)
   - [Text Encoder Output Files](#text-encoder-output-files)
   - [Loading Gemma from a Single Safetensors File](#loading-gemma-from-a-single-safetensors-file)
@@ -50,39 +51,60 @@ Caching scripts (`ltx2_cache_latents.py`, `ltx2_cache_text_encoder_outputs.py`) 
     - [Per-Module Learning Rates](#per-module-learning-rates)
     - [Per-Module LoRA Rank](#per-module-lora-rank)
     - [Adaptive LoRA Rank](#adaptive-lora-rank)
+    - [Per-Module LoRA Dropout](#per-module-lora-dropout)
     - [Preservation & Regularization](#preservation--regularization)
+    - [CREPA (Cross-frame Representation Alignment)](#crepa-cross-frame-representation-alignment)
     - [Self-Flow (Self-Supervised Flow Matching)](#self-flow-self-supervised-flow-matching)
     - [HFATO (High-Frequency Awareness Training Objective)](#hfato-high-frequency-awareness-training-objective)
+    - [Latent Temporal Objectives](#latent-temporal-objectives)
+    - [Standalone Inference Overrides](#standalone-inference-overrides)
+    - [Audio Quality Metrics](#audio-quality-metrics)
     - [Timestep Sampling](#timestep-sampling)
     - [LoRA Targets](#lora-targets)
       - [LoRA Target Estimation](#lora-target-estimation-ltx2_estimatepy)
       - [Connector LoRA](#connector-lora---train_connectors)
     - [IC-LoRA / Video-to-Video Training](#ic-lora--video-to-video-training)
     - [Audio-Reference IC-LoRA](#audio-reference-ic-lora)
+    - [Latent Guides](#latent-guides)
     - [Sampling with Tiled VAE](#sampling-with-tiled-vae)
     - [Precached Sample Prompts](#precached-sample-prompts)
-    - [Two-Stage Sampling (WIP)](#two-stage-sampling-wip)
+    - [Two-Stage Sampling](#two-stage-sampling)
     - [Checkpoint Output Format](#checkpoint-output-format)
     - [Resuming Training](#resuming-training)
 - [Merge LoRA into Base Model](#merge-lora-into-base-model)
+  - [Merge-to-Base Arguments](#merge-to-base-arguments)
+  - [Merge-to-Base Notes](#merge-to-base-notes)
 - [Merge LTX-2 LoRAs](#merge-ltx-2-loras)
+  - [Example Command (Windows)](#example-command-windows)
   - [LoRA Merge Arguments](#lora-merge-arguments)
+  - [LoRA Merge Notes](#lora-merge-notes)
 - [Dataset Configuration](#dataset-configuration)
+  - [Image Dataset Notes](#image-dataset-notes)
   - [Video Dataset Options](#video-dataset-options)
   - [Audio Dataset Options](#audio-dataset-options)
   - [Masked Loss Datasets](#masked-loss-datasets)
   - [Example TOML](#example-toml)
   - [Frame Rate (FPS) Handling](#frame-rate-fps-handling)
 - [Validation Datasets](#validation-datasets)
+  - [Configuration](#configuration)
+  - [Caching](#caching)
+  - [Training Arguments](#training-arguments-1)
+  - [Example](#example)
+  - [How It Works](#how-it-works-1)
+  - [Tips](#tips)
 - [Directory Structure](#directory-structure)
+  - [Raw Dataset Layout (Example)](#raw-dataset-layout-example)
+  - [Cache Directory Layout (After Caching)](#cache-directory-layout-after-caching)
 - [Troubleshooting](#troubleshooting)
   - [Audio/Voice Training with Mixed Datasets](#audiovoice-training-with-mixed-datasets)
   - [Technical Notes](#technical-notes)
 - [4. Slider LoRA Training](#4-slider-lora-training)
   - [4a. Text-Only Mode](#4a-text-only-mode)
   - [4b. Reference Mode](#4b-reference-mode)
+  - [4c. IC-slider](#4c-ic-slider)
   - [Slider Tips](#slider-tips)
 - [Windows Setup / Update Script](#windows-setup--update-script)
+  - [Dashboard Usage](#dashboard-usage)
 - [References](#references)
 
 ---
@@ -923,7 +945,9 @@ The `class` parameter should be a general description without your trigger word 
 > [!CAUTION]
 > Each preservation technique adds transformer forward passes per step. Audio DOP costs apply only on non-audio steps. TARP and DCR add no extra passes — they modify the existing forward/backward in-place.
 
-**CREPA (Cross-frame Representation Alignment)** — Encourages temporal consistency across video frames by aligning DiT hidden states across frames via a small projector MLP. Only the projector is trained; all other modules stay frozen. CREPA uses hooks to capture intermediate features from the existing forward pass (no extra forward passes). Two modes are available: `dino` (based on [arXiv 2506.09229](https://arxiv.org/abs/2506.09229), aligns to pre-cached DINOv2 features from neighboring frames) and `backbone` (inspired by [SimpleTuner LayerSync](https://github.com/bghira/SimpleTuner), aligns to a deeper block of the same transformer).
+#### CREPA (Cross-frame Representation Alignment)
+
+Encourages temporal consistency across video frames by aligning DiT hidden states across frames via a small projector MLP. Only the projector is trained; all other modules stay frozen. CREPA uses hooks to capture intermediate features from the existing forward pass (no extra forward passes). Two modes are available: `dino` (based on [arXiv 2506.09229](https://arxiv.org/abs/2506.09229), aligns to pre-cached DINOv2 features from neighboring frames) and `backbone` (inspired by [SimpleTuner LayerSync](https://github.com/bghira/SimpleTuner), aligns to a deeper block of the same transformer).
 
 Enable with `--crepa`. All parameters are passed via `--crepa_args` as `key=value` pairs:
 
@@ -933,14 +957,14 @@ accelerate launch ... ltx2_train_network.py ^
   --crepa_args mode=backbone student_block_idx=16 teacher_block_idx=32 lambda_crepa=0.1 tau=1.0 num_neighbors=2 schedule=constant warmup_steps=0 normalize=true
 ```
 
-#### CLI Flags
+##### CREPA CLI Flags
 
 | Flag | Type | Description |
 |------|------|-------------|
 | `--crepa` | store_true | Enable CREPA regularization |
 | `--crepa_args` | key=value list | Configuration parameters (see table below) |
 
-#### CREPA Parameters (`--crepa_args`)
+##### CREPA Parameters (`--crepa_args`)
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
@@ -956,27 +980,27 @@ accelerate launch ... ltx2_train_network.py ^
 | `max_steps` | 0 | Total training steps for schedule computation. Auto-filled from `--max_train_steps` if not set |
 | `normalize` | `true` | L2-normalize features before computing cosine similarity |
 
-#### Checkpoint & Resume
+##### CREPA Checkpoint & Resume
 
 - The projector weights (~33M params for backbone mode) are saved as `crepa_projector.safetensors` in the output directory alongside LoRA checkpoints.
 - When resuming training with `--crepa`, projector weights are automatically loaded from `<output_dir>/crepa_projector.safetensors` if the file exists.
 - The projector is **not needed at inference** — it's only used during training.
 
-#### Monitoring
+##### CREPA Monitoring
 
 CREPA adds a `loss/crepa` metric to TensorBoard/WandB logs. A healthy CREPA loss should:
 - Start negative (cosine similarity is being maximized)
 - Gradually decrease (more negative = stronger cross-frame alignment)
 - Stabilize after warmup
 
-#### Compatibility
+##### CREPA Compatibility
 
 - Works with block swap (`--blocks_to_swap`) — hooks fire when each block executes regardless of CPU offloading.
 - Works with all preservation techniques (blank preservation, DOP, prior divergence).
 - Works with gradient checkpointing.
 - Projector params are included in gradient clipping alongside LoRA params.
 
-#### Caching DINOv2 Features (Dino Mode)
+##### Caching DINOv2 Features (Dino Mode)
 
 Dino mode requires pre-cached DINOv2 features. Run this **after latent caching** (cache paths are derived from latent cache files). DINOv2 is not loaded during training; only cached tensors are read, so the DINO model itself adds no training VRAM.
 
@@ -1304,13 +1328,16 @@ Use `--lora_target_preset` to control which layers LoRA targets. For custom laye
 | `video_sa` | Video self-attention (`attn1`) | Video only | Spatially-aligned controls (depth, pose, canny, inpaint) |
 | `video_sa_ff` | Video self-attention + video FFN (`attn1`, `ff`) | Video only | Controls needing more capacity (local edit, cut-on-action) |
 | `video_sa_ca_ff` | Video self-attention + cross-attention + video FFN (`attn1`, `attn2`, `ff`) | Video only | Text-guided controls (video detailing, camera-from-image, sparse tracks) |
-| `audio` | Audio attn/FFN + `video_to_audio_attn` | Audio only | Audio-only training (auto-selected when `--ltx2_mode audio`) |
+| `audio` | Audio attn/FFN only | Audio only | Audio-only training (auto-selected when `--ltx2_mode audio`) |
+| `audio_v2a` | Audio attn/FFN + `video_to_audio_attn` | Audio + V2A cross-modal | Audio preset plus `video_to_audio_attn` (audio queries over video tokens) |
 | `audio_ref_only_ic` | Audio attn/FFN + bidirectional AV cross-modal | Audio + cross-modal | Audio-reference IC-LoRA |
 | `av_ic` | All attention + video FFN + audio FFN (same as `v2v`) | Video + audio + cross-modal | Joint AV IC-LoRA. Use `--av_cross_attention_mode` for directional variants and `--av_multi_ref` when configuring a multi-reference AV IC run |
 | `video_ref_only_av` | All attention + video FFN + audio FFN (same as `v2v`) | Video + audio + cross-modal | AV training with reference video only; target audio is still generated |
 | `full` | All linear layers for LoRA targeting | Video + audio + cross-modal | Maximum expressiveness, larger file size |
 
 **Modality scope matters when training on an AV checkpoint.** The `t2v`, `v2v`, `av_ic`, and `full` presets create LoRA weights for audio and cross-modal layers. If those layers receive no audio training signal (e.g., image/video-only dataset), the LoRA weights for audio modules are initialized but never meaningfully updated — applying such a LoRA can degrade the base model's audio capabilities. Use a `video_*` preset to restrict LoRA to video-branch modules only, leaving audio layers completely untouched. Connector layers (`Embeddings1DConnector`) are excluded by default; use `--train_connectors` to include them (see below).
+
+The `audio` preset excludes `video_to_audio_attn`; `audio_v2a` includes it. Choose `audio_v2a` when the audio-side LoRA should also adapt how audio queries over video tokens. Choose `audio` when the run should leave `video_to_audio_attn` weights at base-model values — for example when later merging this LoRA with another LoRA that owns those layers.
 
 To use custom layer patterns instead of a preset, use `--network_args`:
 ```bash
@@ -1742,6 +1769,121 @@ Reference audio latents are precached automatically when using `--precache_sampl
 - **First-frame conditioning**: for identity-sensitive AV IC-LoRA, `--ltx2_first_frame_conditioning_p 0.9` is the documented starting point. Without it, identity transfer from the target first frame is often weak. A warning is emitted if this is not set in AV mode.
 - `--ic_lora_strategy auto` (default) infers the strategy from `--lora_target_preset` via `infer_ic_lora_strategy_from_preset()`.
 
+#### Latent Guides
+
+Latent guides inject a per-sample reference latent directly into the video token stream — orthogonal to the IC-LoRA reference-video pathway. They are loaded from dataset directories (one stem-matched image per video sample), VAE-encoded once during latent caching, and applied automatically at training and inference time.
+
+Two kinds, mirroring upstream Lightricks `VideoConditionByLatentIndex` / `VideoConditionByKeyframeIndex`:
+
+- **`latent_idx`** — *token replacement* at a fixed frame slot. The guide latent overwrites tokens at `frame_idx` (and the loss is masked there, so the model only learns to denoise the remaining frames). `frame_idx=0` reproduces standard I2V conditioning; non-zero indices anchor a frame mid-video. Loss/timestep parity is preserved by re-masking the affected tokens as clean (`t=0`) per-token.
+- **`keyframe`** — *token append* with custom positional encoding. A patchified keyframe latent is concatenated to the video token sequence. Positions are offset by `frame_idx` then divided by `frame_rate`. `frame_idx=-1` yields slightly-negative timestamps (the global-reference convention from upstream), making the keyframe visible to every output frame without claiming a specific slot. Predictions for the appended tokens are sliced off before loss.
+
+  Strength is plumbed via per-token `denoise_mask = 1 - strength`, matching upstream `VideoConditionByKeyframeIndex`. The appended tokens get effective timestep `denoise_mask × sigma`: at `strength=1.0` this is `t=0` (clean conditioning); at `strength=0.0` this is `t=sigma` (the model sees the keyframe as pure noise, so it contributes no information). For scalar (per-batch) strength the latent itself is never modified — strength only modulates how "clean" the model perceives the keyframe to be. Per-sample strength tensors (used by Endpoint Keyframe Training) are an exception: when some samples in the batch have `strength<=0`, those samples' guide latent is replaced with `randn` noise before patchifying, to prevent leaking clean target-derived content into a fully-noisy mask slot.
+
+Both can be set independently and per-dataset.
+
+##### Dataset Config Options
+
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `latent_idx_guide_directory` | string | — | Stem-matched guide images. Activates `latent_idx` for this dataset. |
+| `latent_idx_guide_cache_directory` | string | — | Required when the source directory is set. |
+| `latent_idx_guide_frame_idx` | int | `0` | Slot to replace. Training raises `ValueError` if `frame_idx < 0` or `frame_idx + T_guide > num_frames`. |
+| `latent_idx_guide_strength` | float | `1.0` | Training requires exactly `1.0` and raises `ValueError` otherwise (out-of-range values are clamped to `[0, 1]` with a warning before the check fires). Inference accepts any value via the 5D `denoise_mask = 1 - strength`. |
+| `keyframe_guide_directory` | string | — | Stem-matched global-reference images. Activates `keyframe`. |
+| `keyframe_guide_cache_directory` | string | — | Required when the source directory is set. |
+| `keyframe_guide_frame_idx` | int | `-1` | **Pixel-frame** index (NOT latent-frame). `-1` = global reference (slightly-negative timestamps, visible to all frames). For non-negative values, multiply the desired latent-frame by `VIDEO_SCALE_FACTORS.time` first — for LTX-2 (8× temporal VAE), latent frame `L` corresponds to `frame_idx = L × 8`. Example: anchor at the last latent frame of a 9-latent-frame video → `frame_idx = 64`. |
+| `keyframe_guide_strength` | float | `1.0` | Per-token `denoise_mask = 1 - strength` → effective appended timestep = `(1-strength) × sigma`. `1.0` = clean conditioning; `0.0` = full noise / no contribution. Clamped to `[0, 1]`. |
+| `keyframe_guide_extra_directories` | array[string] | — | Optional. Stack additional keyframes beyond the primary. |
+| `keyframe_guide_extra_cache_directories` | array[string] | — | Cache directories for the extras (parallel to the directories list). |
+| `keyframe_guide_extra_frame_idxs` | array[int] | — | Per-extra `frame_idx` values. |
+| `keyframe_guide_extra_strengths` | array[float] | — | Per-extra `strength` values. |
+
+The four `keyframe_guide_extra_*` arrays must all have the same length. The primary keyframe (above) must also be set.
+
+`strength` semantics differ between guide types and are NOT interchangeable:
+
+- **`latent_idx_guide_strength`** is a **replacement-lock strength**. The guide latent overwrites tokens at the slot in-place; `strength` controls the per-token `denoise_mask` for those tokens. Training requires exactly `1.0` (hard lock); only inference supports continuous `<1.0`.
+- **`keyframe_guide_strength`** is an **append-guide strength**. The guide latent is appended as a new token block at the configured `frame_idx`; the original target tokens are still denoised normally. `strength` controls the appended block's `denoise_mask` (`1.0` = clean conditioning, `0.0` = effectively absent and the guide is dropped). Continuous values are accepted at both training and inference.
+
+If you want frame N pixels to *exactly* match a reference image, use `latent_idx`. If you want the model to be *guided toward* a reference, use `keyframe`.
+
+Example multi-keyframe TOML:
+```toml
+keyframe_guide_directory = "/data/identity"
+keyframe_guide_cache_directory = "/cache/identity"
+keyframe_guide_frame_idx = -1
+keyframe_guide_extra_directories      = ["/data/style"]
+keyframe_guide_extra_cache_directories = ["/cache/style"]
+keyframe_guide_extra_frame_idxs        = [5]
+keyframe_guide_extra_strengths         = [0.7]
+```
+
+`ltx2_cache_latents.py` auto-encodes any guide directory it finds in the dataset config — no new CLI flags. Items differing in any guide-config detail (presence, count, `frame_idx`, `strength`) land in separate buckets, so each batch is shape-uniform.
+
+##### IC-LoRA Compatibility Matrix
+
+| `--ic_lora_strategy` | `--ltx2_mode` | `latent_idx` | `keyframe` |
+|---|---|---|---|
+| `none` | `video` / `av` | ✓ | ✓ |
+| `v2v` | `video` | ✓ | ✓ |
+| `av_ic` | `av` | ✓ | ✓ |
+| `video_ref_only_av` | `av` | ✓ | ✓ |
+| `audio_ref_only_ic` | `av` | ✓ | ✓ |
+| `audio_ref_only_ic` | `audio` | n/a (no video target) | n/a |
+
+`latent_idx` overwrites the noisy-target tensor before patchify, so it works on every branch that produces video tokens. `keyframe` token-append is wired through the `LTX2Wrapper.forward` path for the simple/audio-ref-only paths and via `build_keyframe_extension` for the v2v / av_ic / video_ref_only_av IC-LoRA branches; in all cases the appended timesteps are `(1 − strength) × sigma` and the predictions are sliced off before loss.
+
+Notes on edge cases:
+- **`reference_downscale_factor`** (set on the dataset for v2v / av_ic / video_ref_only_av when ref-video resolution is lower than the target) is propagated into keyframe positions inside `build_keyframe_extension` so a downscaled keyframe carries spatial positions consistent with the ref-video. The simple path runs at full resolution and ignores this factor.
+- **Inference image-resize on shape mismatch**: in `ltx2_inference.py:_denoise_loop`, both latent_idx and keyframe guide latents are bilinearly resized to the current denoising stage's spatial resolution if they don't already match (relevant for `--sample_two_stage` where stage 1 runs at half-resolution).
+- **`--sample_i2v_token_timestep_mask`**: when set (default), inference only zeroes the token timestep at locked slots when `strength == 1.0`. With `strength < 1.0`, the per-token timestep follows `(1 − strength) × sigma` and the boolean mask is not applied.
+- **Single-stage and two-stage sampling** both consume guides during sample-prompt previews.
+
+##### Endpoint Keyframe Training
+
+Optional training-time CLI flags that extract first / last / random-interior latent frames of the target video and append them as clean keyframe tokens, without requiring per-item keyframe images on disk. Composes with any `--ic_lora_strategy` (the endpoint guides are appended to the same `keyframe_guides_for_options` list that external keyframes use).
+
+| Flag | Default | Description |
+|---|---|---|
+| `--keyframe_endpoint_training` | off | Master enable. All flags below are no-ops when this is unset. |
+| `--keyframe_first_frame_p` | `1.0` | Per-sample probability of appending the first latent frame as a clean keyframe at `frame_idx=0` (independent Bernoulli per item in the batch). |
+| `--keyframe_last_frame_p` | `1.0` | Per-sample probability of appending the last latent frame at `frame_idx=(T−1) × VIDEO_SCALE_FACTORS.time` (pixel-frame units; for LTX-2's 8× temporal VAE this is `(T−1) × 8`). |
+| `--keyframe_random_interior_p` | `0.0` | Per-sample probability of appending random interior latent frames as keyframes. Interior indices are shared across the batch; only the dropout decision is per-sample. |
+| `--keyframe_max_random_interior` | `0` | Maximum number of random interior latent frames to append per batch when any sample triggers. Sampled without replacement from `[1, T−2]`, sorted ascending. |
+
+When the master flag is on, each per-frame probability is sampled independently **per sample** within the batch (Bernoulli; `1.0` always fires, `0.0` never fires). Within one batch, some samples may receive a given endpoint guide while others do not — the guide is appended uniformly (required for tensor packing) but the per-sample denoise_mask is `0` (clean) for samples that won the flip and `1` (no effect) for those that didn't. For losers (samples that did not win the flip), the appended guide latent is replaced with random noise *before* patchifying, so the model sees noise tokens with `denoise_mask=1` rather than clean target-derived content tagged as fully noisy — this prevents a leak of the supervision target through the appended-token stream. Endpoint guides stack with any external keyframes from `keyframe_guide_directory` (external first, endpoints appended after).
+
+Example: train an interpolation LoRA from raw videos, both endpoints always present, no interior augmentation:
+```
+--keyframe_endpoint_training \
+--keyframe_first_frame_p 1.0 \
+--keyframe_last_frame_p 1.0
+```
+
+Example: same but with up to 2 random interior keyframes 30% of the time, for a model that learns to use keyframes at arbitrary positions:
+```
+--keyframe_endpoint_training \
+--keyframe_random_interior_p 0.3 \
+--keyframe_max_random_interior 2
+```
+
+Caveats and tradeoffs:
+
+- **Distribution match**: endpoint keyframes are sliced directly from the encoded video latent, not from a separately VAE-encoded still image. The first latent frame of LTX-2's 8× causal VAE encodes essentially pixel-frame 0 (causal_fix anchors it), so first-frame extraction is close to a still-image encode. The last and interior latent slices represent ~8 pixel-frames each of motion context, so they carry temporal information a single still image would not. To match the inference distribution exactly when keyframes will come from images at sample time, prefer the dataset-driven `keyframe_guide_directory` workflow with images that are encoded individually via the same VAE, OR train on still-image-derived latents and use endpoint extraction only as augmentation.
+- **Soft conditioning, not hard locks**: keyframes are appended tokens with `denoise_mask = 1 - strength`. The original target latent at the corresponding frame is still denoised normally. The model learns to be guided by the keyframe; it does not have a hard constraint to reproduce it pixel-exact. For exact endpoint preservation (image-to-video with frame 0 fixed), use a `latent_idx` guide (token replacement at that slot) instead of (or in addition to) keyframe append.
+- **Distribution under defaults**: defaults `first_p=1.0, last_p=1.0, interior_p=0.0` train two-ended interpolation. Single-anchor i2v (set `last_p=0`) and last-anchor extension (set `first_p=0`) are out-of-distribution unless you train with those probabilities directly.
+- **`strength=0` keyframes are skipped entirely** (they would otherwise add tokens to attention with no useful signal). At inference, this means a `--gk` guide with `:0.0` is equivalent to omitting it.
+
+##### Sample Prompt Flags
+
+| Flag | Meaning |
+|---|---|
+| `--gl frame_idx:path[:strength]` | `latent_idx` guide for this prompt. Multiple allowed. |
+| `--gk frame_idx:path[:strength]` | `keyframe` guide for this prompt. Multiple allowed. |
+
+Guides take effect on both single-stage and two-stage sampling paths.
+
 #### Sampling with Tiled VAE
 
 The prompt file format (`--sample_prompts`) — including guidance scale, negative prompt, and per-prompt inference parameters — is documented in the [Sampling During Training guide](./sampling_during_training.md). LTX-2 extends this with `--v <path>` (IC-LoRA reference) and `--ra <path>` (audio-reference IC-LoRA) prompt prefixes.
@@ -1851,7 +1993,7 @@ python ltx2_merge_lora_to_model.py ^
   --save_merged_model merged_model.safetensors
 ```
 
-### Arguments
+### Merge-to-Base Arguments
 - `--dit`: LTX-2 base model checkpoint (required).
 - `--lora_weight`: One or more LoRA paths to merge sequentially (required).
 - `--lora_multiplier`: Per-LoRA multipliers (default: all 1.0).
@@ -1859,7 +2001,7 @@ python ltx2_merge_lora_to_model.py ^
 - `--device cpu|cuda`: Device for merge computation (default: cuda). Pass `--device cpu` to run on system RAM if you don't have enough VRAM.
 - `--audio_video`: Load as audio-video model (for LTXAV checkpoints).
 
-### Notes
+### Merge-to-Base Notes
 - The output contains only transformer weights (VAE, vocoder, and text encoder are loaded separately by training/inference scripts).
 - Original checkpoint metadata is preserved, so the merged file is directly usable with `--ltx2_checkpoint`.
 - FP8 base models cannot be merged directly — merge into the bf16 base, then use `--fp8_base` at training time for on-the-fly quantization.
@@ -1880,6 +2022,14 @@ python ltx2_merge_lora.py ^
   --save_merged_lora path/to/merged_lora.safetensors
 ```
 
+When merging multiple LoRAs that overlap on certain modules and only the first input's weights should win for the matched modules, pass a regex to `--preserve_first_match_pattern`:
+```bash
+python ltx2_merge_lora.py ^
+  --lora_weight path/to/first.safetensors path/to/second.safetensors ^
+  --preserve_first_match_pattern video_to_audio_attn ^
+  --save_merged_lora path/to/merged_lora.safetensors
+```
+
 ### LoRA Merge Arguments
 - `--lora_weight`: Input LoRA paths to merge in order (required).
 - `--lora_multiplier`: Per-LoRA multipliers aligned with `--lora_weight`. Use one value to apply the same multiplier to all inputs.
@@ -1887,10 +2037,11 @@ python ltx2_merge_lora.py ^
 - `--merge_method concat|orthogonal`: Merge method (default: `concat`). `concat` keeps all ranks by concatenation. `orthogonal` uses SVD refactorization to merge exactly 2 LoRAs with orthogonal projection.
 - `--orthogonal_k_fraction`: Fraction of top singular directions projected out bilaterally before combining (default: `0.5`, range `[0, 1]`). Only used with `--merge_method orthogonal`.
 - `--orthogonal_rank_mode sum|max|min`: Target rank mode for orthogonal merge (default: `sum`).
+- `--preserve_first_match_pattern`: Regex matched against LoRA module prefixes. Matching modules keep only the first input LoRA that contains that module; later LoRAs are ignored for those modules.
 - `--dtype auto|float32|float16|bfloat16`: Output tensor dtype. `auto` promotes from input dtypes.
 - `--emit_alpha`: Force writing `<module>.alpha` keys in output.
 
-### Notes
+### LoRA Merge Notes
 - This merger is intended for LTX-2 LoRA formats used in this repo, including Comfy-style `lora_A/lora_B` weights.
 - It handles different ranks and partial module overlap across input LoRAs.
 - Orthogonal merge requires exactly 2 input LoRAs.

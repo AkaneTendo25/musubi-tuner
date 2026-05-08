@@ -165,6 +165,59 @@ def _dataset_entry_to_dict(entry) -> dict:
         d["reference_audio_directory"] = reference_audio_directories[0]
     elif len(reference_audio_directories) > 1:
         d["reference_audio_directories"] = reference_audio_directories
+
+    # Latent guides — only emitted when the source directory is set so existing
+    # TOMLs without these fields stay byte-identical.
+    if getattr(entry, "latent_idx_guide_directory", ""):
+        d["latent_idx_guide_directory"] = entry.latent_idx_guide_directory
+        if getattr(entry, "latent_idx_guide_cache_directory", ""):
+            d["latent_idx_guide_cache_directory"] = entry.latent_idx_guide_cache_directory
+        latidx_fi = getattr(entry, "latent_idx_guide_frame_idx", None)
+        if latidx_fi is not None:
+            d["latent_idx_guide_frame_idx"] = int(latidx_fi)
+        latidx_st = getattr(entry, "latent_idx_guide_strength", None)
+        if latidx_st is not None and float(latidx_st) != 1.0:
+            d["latent_idx_guide_strength"] = float(latidx_st)
+    if getattr(entry, "keyframe_guide_directory", ""):
+        d["keyframe_guide_directory"] = entry.keyframe_guide_directory
+        if getattr(entry, "keyframe_guide_cache_directory", ""):
+            d["keyframe_guide_cache_directory"] = entry.keyframe_guide_cache_directory
+        kf_fi = getattr(entry, "keyframe_guide_frame_idx", None)
+        if kf_fi is not None:
+            d["keyframe_guide_frame_idx"] = int(kf_fi)
+        kf_st = getattr(entry, "keyframe_guide_strength", None)
+        if kf_st is not None and float(kf_st) != 1.0:
+            d["keyframe_guide_strength"] = float(kf_st)
+
+        # Multi-keyframe extras: parallel semicolon-separated lists in the GUI
+        # (flat JSON friendly) become parallel TOML arrays. All four lists must
+        # have the same length and parse cleanly; mismatches raise so the user
+        # gets a clear error instead of a silently-dropped extras config.
+        def _split_csv(s: str) -> list[str]:
+            return [p.strip() for p in (s or "").replace(",", ";").split(";") if p.strip()]
+
+        extra_dirs = _split_csv(getattr(entry, "keyframe_guide_extra_directories", ""))
+        extra_caches = _split_csv(getattr(entry, "keyframe_guide_extra_cache_directories", ""))
+        extra_fis = _split_csv(getattr(entry, "keyframe_guide_extra_frame_idxs", ""))
+        extra_sts = _split_csv(getattr(entry, "keyframe_guide_extra_strengths", ""))
+        any_set = any((extra_dirs, extra_caches, extra_fis, extra_sts))
+        if any_set:
+            if not (len(extra_dirs) == len(extra_caches) == len(extra_fis) == len(extra_sts)):
+                raise ValueError(
+                    "keyframe_guide_extra_* fields must all have the same number of entries (use ';' to separate). "
+                    f"Got directories={len(extra_dirs)}, cache_directories={len(extra_caches)}, "
+                    f"frame_idxs={len(extra_fis)}, strengths={len(extra_sts)}."
+                )
+            try:
+                d["keyframe_guide_extra_directories"] = extra_dirs
+                d["keyframe_guide_extra_cache_directories"] = extra_caches
+                d["keyframe_guide_extra_frame_idxs"] = [int(x) for x in extra_fis]
+                d["keyframe_guide_extra_strengths"] = [float(x) for x in extra_sts]
+            except ValueError as exc:
+                raise ValueError(
+                    f"keyframe_guide_extra_frame_idxs / keyframe_guide_extra_strengths must parse as int / float: {exc}"
+                ) from exc
+
     if entry.type != "audio":
         d["resolution"] = [entry.resolution_w, entry.resolution_h]
     d["batch_size"] = entry.batch_size

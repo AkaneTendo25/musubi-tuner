@@ -671,6 +671,146 @@ def _load_reference_frames(
     return np.stack(frames[:num_frames], axis=0)
 
 
+def encode_and_save_latent_guides(
+    vae,
+    datasets: Sequence[BaseDataset],
+    args: argparse.Namespace,
+    device: torch.device,
+    tiling_config=None,
+) -> None:
+    """Encode latent-guide images (latent_idx + keyframe) per item.
+
+    Each declared `*_guide_directory` is keyed by item stem (matching the
+    reference_directory pattern). For each item we encode the matching image
+    through the VAE, saving a single-frame latent at the cache path pointed to
+    by `item_info.latent_idx_guide_cache_path` / `keyframe_guide_cache_path`.
+    `frame_idx` and `strength` are subset-level config; they're read from the
+    dataset object at training time, not stored in the cache.
+    """
+    skip_existing = getattr(args, "skip_existing", False)
+    num_workers = args.num_workers if args.num_workers is not None else max(1, (os.cpu_count() or 2) - 1)
+
+    vae_param = next(vae.parameters())
+    vae_dtype = vae_param.dtype
+
+    for ds_idx, ds in enumerate(datasets):
+        if not isinstance(ds, (ImageDataset, VideoDataset)):
+            continue
+
+        # Build plan list. Warn (don't silently skip) when a directory is set
+        # without its matching cache directory — that's a config mistake.
+        plans: list[tuple[str, str, str, str]] = []
+        latidx_src = getattr(ds, "latent_idx_guide_directory", None)
+        latidx_cache = getattr(ds, "latent_idx_guide_cache_directory", None)
+        if latidx_src and latidx_cache:
+            plans.append(("latent_idx", latidx_src, latidx_cache, "latent_idx_guide"))
+        elif bool(latidx_src) ^ bool(latidx_cache):
+            logger.warning(
+                "[Dataset %s] latent_idx_guide_directory=%r but latent_idx_guide_cache_directory=%r — "
+                "both must be set together; skipping latent_idx-guide caching for this dataset",
+                ds_idx, latidx_src, latidx_cache,
+            )
+
+        kf_src = getattr(ds, "keyframe_guide_directory", None)
+        kf_cache = getattr(ds, "keyframe_guide_cache_directory", None)
+        if kf_src and kf_cache:
+            plans.append(("keyframe", kf_src, kf_cache, "keyframe_guide"))
+        elif bool(kf_src) ^ bool(kf_cache):
+            logger.warning(
+                "[Dataset %s] keyframe_guide_directory=%r but keyframe_guide_cache_directory=%r — "
+                "both must be set together; skipping keyframe-guide caching for this dataset",
+                ds_idx, kf_src, kf_cache,
+            )
+
+        # Multi-keyframe extras: each extra is its own (directory, cache_directory)
+        # pair encoded with the same `_kf_guide.safetensors` suffix.
+        for _ix, _spec in enumerate(getattr(ds, "keyframe_guide_extras", []) or [], start=1):
+            _ex_src = _spec.get("directory")
+            _ex_cache = _spec.get("cache_directory")
+            if _ex_src and _ex_cache:
+                plans.append((f"keyframe_extra_{_ix}", _ex_src, _ex_cache, f"keyframe_guide_extra_{_ix}"))
+
+        if not plans:
+            continue
+
+        for _kind, _src, cache_dir, _label in plans:
+            os.makedirs(cache_dir, exist_ok=True)
+            logger.info("[Dataset %s] Caching %s images to %s", ds_idx, _kind, cache_dir)
+
+        # Single pass over the dataset; encode every applicable guide kind per item.
+        per_kind_stats = {kind: {"cached": 0, "skipped": 0, "missing": 0} for kind, *_ in plans}
+        for _bucket_key, batch in ds.retrieve_latent_cache_batches(num_workers):
+            for item_info in batch:
+                source_key = getattr(item_info, "source_item_key", None) or item_info.item_key
+                stem = os.path.splitext(os.path.basename(source_key))[0]
+                bucket_reso = (item_info.bucket_size[0], item_info.bucket_size[1])
+
+                for kind, src_dir, _cache_dir, label in plans:
+                    if kind == "latent_idx":
+                        cache_path = getattr(item_info, "latent_idx_guide_cache_path", None) \
+                            or ds.get_latent_idx_guide_cache_path(item_info)
+                    elif kind == "keyframe":
+                        cache_path = getattr(item_info, "keyframe_guide_cache_path", None) \
+                            or ds.get_keyframe_guide_cache_path(item_info)
+                    else:  # keyframe_extra_<i>
+                        # Build cache path directly from the per-extra cache_dir.
+                        w_b, h_b = item_info.original_size
+                        cache_path = os.path.join(
+                            _cache_dir,
+                            f"{stem}_{w_b:04d}x{h_b:04d}_{ds.architecture}_kf_guide.safetensors",
+                        )
+
+                    if skip_existing and os.path.exists(cache_path):
+                        per_kind_stats[kind]["skipped"] += 1
+                        continue
+
+                    src_path = _find_reference_file(src_dir, stem)
+                    if src_path is None:
+                        per_kind_stats[kind]["missing"] += 1
+                        if per_kind_stats[kind]["missing"] <= 5:
+                            logger.warning("No %s file found for %r in %s", label, stem, src_dir)
+                        elif per_kind_stats[kind]["missing"] == 6:
+                            logger.warning("(suppressing further missing-%s warnings)", label)
+                        continue
+
+                    try:
+                        # Load image at bucket resolution (single frame).
+                        ref_frames = _load_reference_frames(src_path, bucket_reso, num_frames=1, downscale_factor=1)
+                        contents = torch.from_numpy(ref_frames).unsqueeze(0)  # [1, T=1, H, W, 3]
+                        contents = contents.permute(0, 4, 1, 2, 3).contiguous()  # [1, 3, 1, H, W]
+                        contents = contents.to(device=device, dtype=vae_dtype)
+                        contents = contents / 127.5 - 1.0
+
+                        with _amp_context(device, vae_dtype), torch.no_grad():
+                            if tiling_config is not None and hasattr(vae, "tiled_encode"):
+                                latent = vae.tiled_encode(contents, tiling_config)
+                            else:
+                                latent = vae(contents)
+                            latent = latent.to(device=device, dtype=vae_dtype)
+
+                        guide_latent = latent[0]  # [C, T_lat, H_lat, W_lat]
+                        guide_item_info = ItemInfo(
+                            item_info.item_key,
+                            item_info.caption,
+                            item_info.original_size,
+                            item_info.bucket_size,
+                        )
+                        guide_item_info.latent_cache_path = cache_path
+                        guide_item_info.frame_count = 1
+                        save_latent_cache_ltx2(guide_item_info, guide_latent)
+                        per_kind_stats[kind]["cached"] += 1
+                    except Exception as e:
+                        logger.warning("Failed to cache %s for %r: %s", label, stem, e)
+                        continue
+
+        for kind, *_ in plans:
+            stats = per_kind_stats[kind]
+            logger.info(
+                "[Dataset %s] %s caching done: %s cached, %s skipped, %s missing",
+                ds_idx, kind, stats["cached"], stats["skipped"], stats["missing"],
+            )
+
+
 def encode_and_save_reference_latents(
     vae,
     datasets: Sequence[BaseDataset],
@@ -1337,6 +1477,10 @@ def main() -> None:
         # Cache reference latents for IC-LoRA / v2v training (auto-detected from TOML config)
         # Runs when any dataset has reference_cache_directory and a matching reference source directory.
         encode_and_save_reference_latents(vae, datasets, args, device, tiling_config)
+
+        # Cache latent guides (latent_idx + keyframe). Auto-detected from TOML:
+        # runs when any dataset has *_guide_directory + *_guide_cache_directory set.
+        encode_and_save_latent_guides(vae, datasets, args, device, tiling_config)
 
     if audio_only:
         if getattr(args, "ltx2_checkpoint", None) is None:

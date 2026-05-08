@@ -58,6 +58,9 @@ IC_LORA_STRATEGIES = (
     "av_ic",
     "video_ref_only_av",
 )
+# Latent guides (latent_idx + keyframe) are orthogonal signals that stack with
+# any IC-LoRA strategy. latent_idx is applied via 5D paste pre-patchify;
+# keyframe is appended via `build_keyframe_extension`.
 AV_CROSS_ATTENTION_MODES = ("both", "a2v_only", "v2a_only", "none")
 
 
@@ -89,6 +92,200 @@ def validate_connector_lora_cache_features(conditions: Optional[Dict[str, Any]],
             f"Missing pre-connector cache tensor(s): {', '.join(missing)}. "
             "Re-run ltx2_cache_text_encoder_outputs.py with --cache_before_connector and the same --ltx2_mode."
         )
+
+
+_SHORT_VIDEO_WARN_KEYS: set = set()
+_SHORT_VIDEO_WARN_SUPPRESSED: dict = {}
+_VSF_VALIDATION_DONE: dict = {}
+_SUMMARY_ATEXIT_REGISTERED: bool = False
+
+
+def _is_rank_zero() -> bool:
+    """Cheap rank check: log only on rank-zero in DDP runs to avoid N copies."""
+    try:
+        import torch.distributed as _dist
+        if _dist.is_available() and _dist.is_initialized():
+            return _dist.get_rank() == 0
+    except Exception:
+        pass
+    return True
+
+
+def _warn_short_video_once(key: tuple, msg: str) -> None:
+    if key in _SHORT_VIDEO_WARN_KEYS:
+        _SHORT_VIDEO_WARN_SUPPRESSED[key] = _SHORT_VIDEO_WARN_SUPPRESSED.get(key, 0) + 1
+        return
+    _SHORT_VIDEO_WARN_KEYS.add(key)
+    _ensure_summary_atexit_registered()
+    if _is_rank_zero():
+        logger.warning(msg)
+
+
+def emit_endpoint_warning_summary() -> None:
+    """End-of-training summary of suppressed dedup'd warnings, so users learn
+    if a recurring data-quality issue was hidden by hot-loop dedup. Emitted
+    automatically at process exit via atexit (registered lazily on the first
+    deduped warning) AND callable from explicit teardown paths."""
+    if not _SHORT_VIDEO_WARN_SUPPRESSED:
+        return
+    if not _is_rank_zero():
+        return
+    parts = [f"{k}: {v} additional occurrence(s)" for k, v in
+             sorted(_SHORT_VIDEO_WARN_SUPPRESSED.items(), key=lambda x: -x[1])]
+    logger.warning(
+        "endpoint keyframe: suppressed warning summary (only first occurrence per key was logged): %s",
+        "; ".join(parts),
+    )
+
+
+def _ensure_summary_atexit_registered() -> None:
+    global _SUMMARY_ATEXIT_REGISTERED
+    if _SUMMARY_ATEXIT_REGISTERED:
+        return
+    _SUMMARY_ATEXIT_REGISTERED = True
+    import atexit as _atexit
+    _atexit.register(emit_endpoint_warning_summary)
+
+
+def _validate_vae_temporal_convention_once(vsf_t: int, observed_pixel_frames: Optional[int],
+                                           T_lat: int) -> None:
+    """Endpoint frame_idx math assumes pixel_frames = vsf_t * (T_lat - 1) + 1
+    (canonical LTX-2 causal VAE). If observed pixel-frame count from the
+    dataset disagrees, last/interior endpoint guides will land at wrong
+    temporal positions. Warn once per (vsf_t, T_lat, observed) tuple.
+
+    When observed_pixel_frames is None (dataset doesn't carry the key), emit
+    a one-shot 'validation unavailable' notice so users aren't given false
+    confidence by a silent skip."""
+    if observed_pixel_frames is None:
+        key = (vsf_t, T_lat, "unavailable")
+        if key in _VSF_VALIDATION_DONE:
+            return
+        _VSF_VALIDATION_DONE[key] = True
+        if _is_rank_zero():
+            logger.info(
+                "endpoint keyframe: VAE temporal convention validation unavailable "
+                "(batch missing 'num_pixel_frames'). Endpoint frame_idx math assumes "
+                "the canonical pixel = %d * (T_lat - 1) + 1 convention. Verify your "
+                "VAE config and pad/crop preprocessing match this if last/interior "
+                "endpoints appear to land at unexpected positions.",
+                vsf_t,
+            )
+        return
+    key = (vsf_t, T_lat, observed_pixel_frames)
+    if key in _VSF_VALIDATION_DONE:
+        return
+    _VSF_VALIDATION_DONE[key] = True
+    expected = vsf_t * (T_lat - 1) + 1
+    if observed_pixel_frames != expected and _is_rank_zero():
+        logger.warning(
+            "endpoint keyframe: VAE temporal convention mismatch — observed %d pixel frames "
+            "but expected %d (= vsf_t %d * (T_lat %d - 1) + 1). Endpoint frame_idx values "
+            "may not align with actual video frame positions. Verify VAE config or pad/crop "
+            "preprocessing.",
+            observed_pixel_frames, expected, vsf_t, T_lat,
+        )
+
+
+def _extract_endpoint_keyframes(
+    *,
+    latents: torch.Tensor,
+    first_frame_p: float,
+    last_frame_p: float,
+    random_interior_p: float,
+    max_random_interior: int,
+    target_dtype: torch.dtype,
+    device: torch.device,
+    observed_pixel_frames: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    """Sample endpoint keyframes from the target latent for keyframe-append training.
+
+    Returns a list of guide dicts (`{latent, frame_idx, strength, ...}`).
+    `frame_idx` is in pixel-frame units: latent index L → `L * VIDEO_SCALE_FACTORS.time`.
+    Probabilities are Bernoulli per sample (one independent draw per item in the
+    batch). `p>=1.0` always fires, `p<=0.0` never. The per-sample decision is
+    encoded as a `[B]` strength tensor on each emitted guide: 1.0 for samples
+    that won the flip, 0.0 for samples that did not. Random-interior indices
+    are shared across the batch (required for tensor packing); the per-sample
+    flip controls only the dropout decision.
+    """
+    from musubi_tuner.ltx_2.types import VIDEO_SCALE_FACTORS
+
+    if latents.dim() != 5:
+        raise ValueError(f"_extract_endpoint_keyframes expects 5D latents, got shape {tuple(latents.shape)}")
+
+    bsz = int(latents.shape[0])
+    T_lat = int(latents.shape[2])
+    vsf_t = int(VIDEO_SCALE_FACTORS.time)
+    _validate_vae_temporal_convention_once(vsf_t, observed_pixel_frames, T_lat)
+
+    def _bernoulli_per_sample(p: float) -> torch.Tensor:
+        p = float(p)
+        if p <= 0.0:
+            return torch.zeros(bsz, dtype=torch.bool, device=device)
+        if p >= 1.0:
+            return torch.ones(bsz, dtype=torch.bool, device=device)
+        return torch.rand(bsz, device=device) < p
+
+    if last_frame_p > 0.0 and T_lat < 2:
+        _warn_short_video_once(("last", T_lat),
+            "endpoint keyframe: last_frame_p=%.2f requested but T_lat=%d (<2); skipping last-frame guide."
+            % (last_frame_p, T_lat))
+    if max_random_interior > 0 and random_interior_p > 0.0 and T_lat < 3:
+        _warn_short_video_once(("interior", T_lat),
+            "endpoint keyframe: interior keyframes requested (max=%d, p=%.2f) but T_lat=%d (<3); skipping interior guides."
+            % (max_random_interior, random_interior_p, T_lat))
+    # One-time distribution-match advisory when last/interior endpoints are used.
+    # Last/interior latent slices encode ~vsf_t pixel-frames of motion context,
+    # not single still images — so a LoRA trained on these and inferred with
+    # still-image keyframes has a real train/test gap.
+    if (last_frame_p > 0.0 or (max_random_interior > 0 and random_interior_p > 0.0)) and T_lat >= 2:
+        _warn_short_video_once(("distribution_advisory", "any"),
+            "endpoint keyframe: last/interior guides are encoded video latent slices (each "
+            "spans ~%d pixel-frames of motion context), not still-image encodings. "
+            "If you intend to infer with still-image keyframes at these positions, prefer "
+            "the dataset-driven `keyframe_guide_directory` workflow with image-encoded "
+            "latents. First-frame extraction is closer to a still due to causal_fix." % vsf_t)
+
+    # Collapse-to-single-pixel-frame is only correct for the first latent slice:
+    # the LTX-2 causal VAE anchors that slice to pixel-frame 0 (causal_fix),
+    # so it represents a single pixel-frame moment. Last and interior latent
+    # slices span the full 8-pixel-frame VAE temporal chunk; collapsing them
+    # would lie about temporal support and distort positional encoding.
+    out: List[Dict[str, Any]] = []
+    if T_lat >= 1 and first_frame_p > 0.0:
+        first_decisions = _bernoulli_per_sample(first_frame_p)
+        if bool(first_decisions.any().item()):
+            out.append({
+                "latent": latents[:, :, :1, :, :].to(dtype=target_dtype),
+                "frame_idx": 0,
+                "strength": first_decisions.to(dtype=torch.float32),
+                "collapse_to_single_pixel_frame": True,
+            })
+    if T_lat >= 2 and last_frame_p > 0.0:
+        last_decisions = _bernoulli_per_sample(last_frame_p)
+        if bool(last_decisions.any().item()):
+            out.append({
+                "latent": latents[:, :, -1:, :, :].to(dtype=target_dtype),
+                "frame_idx": (T_lat - 1) * vsf_t,
+                "strength": last_decisions.to(dtype=torch.float32),
+                "collapse_to_single_pixel_frame": False,
+            })
+    if max_random_interior > 0 and T_lat >= 3 and random_interior_p > 0.0:
+        interior_decisions = _bernoulli_per_sample(random_interior_p)
+        if bool(interior_decisions.any().item()):
+            interior_count = T_lat - 2
+            n = min(interior_count, max_random_interior)
+            perm = torch.randperm(interior_count, device=device)[:n]
+            interior_strength = interior_decisions.to(dtype=torch.float32)
+            for lat_idx in sorted(int(i.item()) + 1 for i in perm):
+                out.append({
+                    "latent": latents[:, :, lat_idx : lat_idx + 1, :, :].to(dtype=target_dtype),
+                    "frame_idx": lat_idx * vsf_t,
+                    "strength": interior_strength,
+                    "collapse_to_single_pixel_frame": False,
+                })
+    return out
 
 
 def _normalize_av_cross_attention_mode(value: Optional[str]) -> str:
@@ -3459,11 +3656,100 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             model_noisy_video = model_noisy_video.clone()
             model_noisy_video[video_conditioning_enabled, :, 0:1, :, :] = latents[video_conditioning_enabled, :, 0:1, :, :]
 
-        if ref_latents is not None:
+        # Apply latent_idx guides to model_noisy_video before the IC-LoRA branches
+        latent_idx_guide_entry = batch.get("latent_idx_guide_latents") if isinstance(batch, dict) else None
+        keyframe_guide_entry = batch.get("keyframe_guide_latents") if isinstance(batch, dict) else None
+        latent_idx_guide_slot: Optional[Tuple[int, int]] = None  # (frame_idx, T_g) for downstream masks
+        keyframe_guides_for_options: Optional[List[Dict[str, Any]]] = None
+        if isinstance(latent_idx_guide_entry, dict):
+            _gl = latent_idx_guide_entry.get("latents")
+            _gfi = int(latent_idx_guide_entry.get("frame_idx", 0))
+            _gst_raw = float(latent_idx_guide_entry.get("strength", 1.0))
+            if _gst_raw < 0.0 or _gst_raw > 1.0:
+                logger.warning(
+                    "latent_idx_guide_strength=%.3f outside [0, 1]; clamping.", _gst_raw,
+                )
+            _gst = max(0.0, min(1.0, _gst_raw))
+            if isinstance(_gl, torch.Tensor) and _gl.dim() == 5:
+                _gl = _gl.to(device=accelerator.device, dtype=model_noisy_video.dtype)
+                _, _c, frames_g, _h_g, _w_g = latents.shape
+                gT = int(_gl.shape[2])
+                if not (0 <= _gfi and _gfi + gT <= frames_g):
+                    raise ValueError(
+                        f"latent_idx guide out of range: frame_idx={_gfi}, T_guide={gT}, total_frames={frames_g}. "
+                        f"Required: 0 <= frame_idx and frame_idx + T_guide <= total_frames."
+                    )
+                if _gst < 1.0:
+                    # Training boolean conditioning masks cannot represent fractional
+                    # strength. Inference supports it via the 5D denoise_mask path.
+                    raise ValueError(
+                        f"latent_idx_guide_strength={_gst} is not supported in training (only 1.0 is). "
+                        "Partial-strength latent_idx guides are an inference-only feature; for training, "
+                        "either set strength=1.0 or remove the latent_idx guide from this dataset."
+                    )
+                model_noisy_video = model_noisy_video.clone()
+                model_noisy_video[:, :, _gfi : _gfi + gT, :, :] = _gl
+                latent_idx_guide_slot = (_gfi, gT)
+        if isinstance(keyframe_guide_entry, dict):
+            _kgl = keyframe_guide_entry.get("latents")
+            _kgfi = int(keyframe_guide_entry.get("frame_idx", -1))
+            _kgst = float(keyframe_guide_entry.get("strength", 1.0))
+            if isinstance(_kgl, torch.Tensor) and _kgl.dim() == 5:
+                _kgl = _kgl.to(device=accelerator.device, dtype=model_noisy_video.dtype)
+                keyframe_guides_for_options = [{
+                    "latent": _kgl,
+                    "frame_idx": _kgfi,
+                    "strength": _kgst,
+                }]
+        # Bucket invariant guarantees uniform multi-keyframe spec across batch.
+        _kf_extras = batch.get("keyframe_guide_extras") if isinstance(batch, dict) else None
+        if isinstance(_kf_extras, list) and _kf_extras:
+            if keyframe_guides_for_options is None:
+                keyframe_guides_for_options = []
+            for _entry in _kf_extras:
+                if not isinstance(_entry, dict):
+                    continue
+                _et = _entry.get("latents")
+                if not isinstance(_et, torch.Tensor) or _et.dim() != 5:
+                    continue
+                _et = _et.to(device=accelerator.device, dtype=model_noisy_video.dtype)
+                keyframe_guides_for_options.append({
+                    "latent": _et,
+                    "frame_idx": int(_entry.get("frame_idx", -1)),
+                    "strength": float(_entry.get("strength", 1.0)),
+                })
+
+        if bool(getattr(args, "keyframe_endpoint_training", False)):
+            # Pass observed pixel-frame count if the batch carries it, so the
+            # validator can warn on VAE-convention drift (cropped/padded clips).
+            _observed_pf = batch.get("num_pixel_frames") if isinstance(batch, dict) else None
+            if isinstance(_observed_pf, (list, tuple)) and _observed_pf:
+                _observed_pf = int(_observed_pf[0])
+            elif isinstance(_observed_pf, torch.Tensor) and _observed_pf.numel() > 0:
+                _observed_pf = int(_observed_pf.flatten()[0].item())
+            elif not isinstance(_observed_pf, int):
+                _observed_pf = None
+            _endpoint_guides = _extract_endpoint_keyframes(
+                latents=latents,
+                first_frame_p=float(getattr(args, "keyframe_first_frame_p", 1.0)),
+                last_frame_p=float(getattr(args, "keyframe_last_frame_p", 1.0)),
+                random_interior_p=float(getattr(args, "keyframe_random_interior_p", 0.0)),
+                max_random_interior=int(getattr(args, "keyframe_max_random_interior", 0)),
+                target_dtype=model_noisy_video.dtype,
+                device=accelerator.device,
+                observed_pixel_frames=_observed_pf,
+            )
+            if _endpoint_guides:
+                if keyframe_guides_for_options is None:
+                    keyframe_guides_for_options = []
+                keyframe_guides_for_options.extend(_endpoint_guides)
+
+        if ref_latents is not None and ic_lora_strategy == "v2v":
             from musubi_tuner.ltx_2.components.patchifiers import VideoLatentPatchifier, get_pixel_coords
             from musubi_tuner.ltx_2.guidance.perturbations import BatchedPerturbationConfig
             from musubi_tuner.ltx_2.model.transformer.modality import Modality
             from musubi_tuner.ltx_2.types import SpatioTemporalScaleFactors, VideoLatentShape
+            from musubi_tuner.networks.lora_ltx2 import build_keyframe_extension
 
             patchifier = VideoLatentPatchifier(patch_size=1)
 
@@ -3488,6 +3774,13 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                 first_frame_tokens = tgt_height * tgt_width
                 if first_frame_tokens > 0:
                     target_conditioning_mask[video_conditioning_enabled, :first_frame_tokens] = True
+            # latent_idx guide → mark its target-slot tokens as clean conditioning.
+            if latent_idx_guide_slot is not None:
+                _slot_idx, _slot_T = latent_idx_guide_slot
+                _tokens_per_frame = tgt_height * tgt_width
+                _slot_start = _slot_idx * _tokens_per_frame
+                _slot_stop = (_slot_idx + _slot_T) * _tokens_per_frame
+                target_conditioning_mask[:, _slot_start:_slot_stop] = True
             conditioning_mask = torch.cat([ref_conditioning_mask, target_conditioning_mask], dim=1)
 
             combined_timesteps = sigma.view(bsz, 1).expand(bsz, ref_seq_len + target_seq_len)
@@ -3540,6 +3833,25 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
 
             combined_positions = torch.cat([ref_positions, tgt_positions], dim=2)
 
+            kf_tokens, kf_positions, kf_mask, kf_count = build_keyframe_extension(
+                keyframe_guides_for_options or [],
+                bsz=bsz,
+                video_channels=int(latents.shape[1]),
+                frame_rate=float(frame_rate_v2v),
+                patchifier=patchifier,
+                device=accelerator.device,
+                dtype=network_dtype,
+                reference_downscale_factor=reference_downscale_factor,
+            )
+            if kf_count > 0:
+                combined_tokens = torch.cat([combined_tokens, kf_tokens], dim=1)
+                combined_positions = torch.cat([combined_positions, kf_positions], dim=2)
+                # Per-token effective timestep = denoise_mask * sigma.
+                kf_ts = (kf_mask * sigma.view(bsz, 1)).to(combined_timesteps.dtype)
+                combined_timesteps = torch.cat([combined_timesteps, kf_ts], dim=1)
+                kf_cond_mask = (kf_mask == 0.0).to(torch.bool)
+                conditioning_mask = torch.cat([conditioning_mask, kf_cond_mask], dim=1)
+
             video_modality = Modality(
                 enabled=True,
                 latent=combined_tokens,
@@ -3566,7 +3878,7 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                     )
                     pred_tokens, _ = base_model(video_modality, None, perturbations)
 
-            target_pred_tokens = pred_tokens[:, ref_seq_len:, :]
+            target_pred_tokens = pred_tokens[:, ref_seq_len : ref_seq_len + target_seq_len, :]
             target_velocity = patchifier.patchify(noise - latents)
             target_loss_mask = ~target_conditioning_mask
             target_loss_mask = _combine_loss_masks(target_loss_mask, _cached_video_loss_mask(as_tokens=True))
@@ -3589,7 +3901,7 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             from musubi_tuner.ltx_2.guidance.perturbations import BatchedPerturbationConfig
             from musubi_tuner.ltx_2.model.transformer.modality import Modality
             from musubi_tuner.ltx_2.types import AudioLatentShape, SpatioTemporalScaleFactors, VideoLatentShape
-            from musubi_tuner.networks.lora_ltx2 import _split_av_context
+            from musubi_tuner.networks.lora_ltx2 import _split_av_context, build_keyframe_extension
 
             unwrapped_transformer = accelerator.unwrap_model(transformer)
             base_model = unwrapped_transformer.model if hasattr(unwrapped_transformer, "model") else unwrapped_transformer
@@ -3656,6 +3968,13 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                 first_frame_tokens = int(latents.shape[3]) * int(latents.shape[4])
                 if first_frame_tokens > 0:
                     tgt_video_cond_mask[video_conditioning_enabled, :first_frame_tokens] = True
+            # latent_idx guide: mark target-side guide-slot tokens as clean conditioning
+            if latent_idx_guide_slot is not None:
+                _slot_idx, _slot_T = latent_idx_guide_slot
+                _tokens_per_frame = int(latents.shape[3]) * int(latents.shape[4])
+                tgt_video_cond_mask[
+                    :, _slot_idx * _tokens_per_frame : (_slot_idx + _slot_T) * _tokens_per_frame
+                ] = True
             video_cond_mask = torch.cat([ref_video_cond_mask, tgt_video_cond_mask], dim=1)
 
             video_combined_ts = sigma.view(bsz, 1).expand(bsz, ref_video_seq_len + tgt_video_seq_len)
@@ -3695,6 +4014,24 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             ).to(dtype=network_dtype)
             tgt_video_pos[:, 0, ...] = tgt_video_pos[:, 0, ...] / float(av_ic_frame_rate)
             video_combined_pos = torch.cat([ref_video_pos, tgt_video_pos], dim=2)
+
+            kf_tokens, kf_positions, kf_mask, kf_count = build_keyframe_extension(
+                keyframe_guides_for_options or [],
+                bsz=bsz,
+                video_channels=int(latents.shape[1]),
+                frame_rate=float(av_ic_frame_rate),
+                patchifier=video_patchifier,
+                device=accelerator.device,
+                dtype=network_dtype,
+                reference_downscale_factor=reference_downscale_factor,
+            )
+            if kf_count > 0:
+                video_combined_tokens = torch.cat([video_combined_tokens, kf_tokens], dim=1)
+                video_combined_pos = torch.cat([video_combined_pos, kf_positions], dim=2)
+                kf_ts = (kf_mask * sigma.view(bsz, 1)).to(video_combined_ts.dtype)
+                video_combined_ts = torch.cat([video_combined_ts, kf_ts], dim=1)
+                kf_cond = (kf_mask == 0.0).to(torch.bool)
+                video_cond_mask = torch.cat([video_cond_mask, kf_cond], dim=1)
 
             # ---- AUDIO SIDE: patchify ref + target, build positions & timesteps ----
             audio_patchifier = getattr(unwrapped_transformer, "_audio_patchifier", None)
@@ -3750,7 +4087,7 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             )
             av_ic_a2v_enabled = av_cross_attention_mode in {"both", "a2v_only"}
             av_ic_v2a_enabled = av_cross_attention_mode in {"both", "v2a_only"}
-            total_video_seq = ref_video_seq_len + tgt_video_seq_len
+            total_video_seq = ref_video_seq_len + tgt_video_seq_len + kf_count
             total_audio_seq = ref_audio_seq_len + tgt_audio_seq_len
 
             a2v_mask = None
@@ -3802,7 +4139,7 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                     video_pred_all, audio_pred_all = base_model(video_modality, audio_modality, perturbations)
 
             # ---- EXTRACT TARGET PREDICTIONS & COMPUTE LOSS TARGETS ----
-            target_video_pred = video_pred_all[:, ref_video_seq_len:, :]
+            target_video_pred = video_pred_all[:, ref_video_seq_len : ref_video_seq_len + tgt_video_seq_len, :]
             target_audio_pred = audio_pred_all[:, ref_audio_seq_len:, :]
 
             video_velocity = video_patchifier.patchify(noise - latents)
@@ -4133,7 +4470,7 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             from musubi_tuner.ltx_2.guidance.perturbations import BatchedPerturbationConfig
             from musubi_tuner.ltx_2.model.transformer.modality import Modality
             from musubi_tuner.ltx_2.types import AudioLatentShape, SpatioTemporalScaleFactors, VideoLatentShape
-            from musubi_tuner.networks.lora_ltx2 import _split_av_context
+            from musubi_tuner.networks.lora_ltx2 import _split_av_context, build_keyframe_extension
 
             if not audio_enabled_for_batch or audio_latents is None or noisy_audio is None or audio_target is None:
                 raise ValueError("--ic_lora_strategy video_ref_only_av requires target audio_latents in every AV batch")
@@ -4157,6 +4494,12 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                 first_frame_tokens = int(latents.shape[3]) * int(latents.shape[4])
                 if first_frame_tokens > 0:
                     tgt_video_cond_mask[video_conditioning_enabled, :first_frame_tokens] = True
+            if latent_idx_guide_slot is not None:
+                _slot_idx, _slot_T = latent_idx_guide_slot
+                _tokens_per_frame = int(latents.shape[3]) * int(latents.shape[4])
+                tgt_video_cond_mask[
+                    :, _slot_idx * _tokens_per_frame : (_slot_idx + _slot_T) * _tokens_per_frame
+                ] = True
             video_cond_mask = torch.cat([ref_video_cond_mask, tgt_video_cond_mask], dim=1)
 
             video_combined_ts = sigma.view(bsz, 1).expand(bsz, ref_video_seq_len + tgt_video_seq_len)
@@ -4197,6 +4540,24 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             tgt_video_pos[:, 0, ...] = tgt_video_pos[:, 0, ...] / float(frame_rate_vref)
             video_combined_pos = torch.cat([ref_video_pos, tgt_video_pos], dim=2)
 
+            kf_tokens, kf_positions, kf_mask, kf_count = build_keyframe_extension(
+                keyframe_guides_for_options or [],
+                bsz=bsz,
+                video_channels=int(latents.shape[1]),
+                frame_rate=float(frame_rate_vref),
+                patchifier=video_patchifier,
+                device=accelerator.device,
+                dtype=network_dtype,
+                reference_downscale_factor=reference_downscale_factor,
+            )
+            if kf_count > 0:
+                video_combined_tokens = torch.cat([video_combined_tokens, kf_tokens], dim=1)
+                video_combined_pos = torch.cat([video_combined_pos, kf_positions], dim=2)
+                kf_ts = (kf_mask * sigma.view(bsz, 1)).to(video_combined_ts.dtype)
+                video_combined_ts = torch.cat([video_combined_ts, kf_ts], dim=1)
+                kf_cond = (kf_mask == 0.0).to(torch.bool)
+                video_cond_mask = torch.cat([video_cond_mask, kf_cond], dim=1)
+
             audio_patchifier = getattr(unwrapped_transformer, "_audio_patchifier", None)
             if audio_patchifier is None and hasattr(unwrapped_transformer, "module"):
                 audio_patchifier = getattr(unwrapped_transformer.module, "_audio_patchifier", None)
@@ -4221,7 +4582,7 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             )
             av_audio_to_video_enabled = av_cross_attention_mode in {"both", "a2v_only"}
             av_video_to_audio_enabled = av_cross_attention_mode in {"both", "v2a_only"}
-            total_video_seq = ref_video_seq_len + tgt_video_seq_len
+            total_video_seq = ref_video_seq_len + tgt_video_seq_len + kf_count
             total_audio_seq = tgt_audio_seq_len
             mask_dtype = network_dtype if network_dtype in (torch.float16, torch.float32, torch.float64, torch.bfloat16) else torch.float32
             neg_inf = torch.finfo(mask_dtype).min
@@ -4279,7 +4640,7 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                 else:
                     video_pred_all, audio_pred_all = base_model(video_modality, audio_modality, perturbations)
 
-            target_video_pred = video_pred_all[:, ref_video_seq_len:, :]
+            target_video_pred = video_pred_all[:, ref_video_seq_len : ref_video_seq_len + tgt_video_seq_len, :]
             target_audio_pred = audio_pred_all
             video_velocity = video_patchifier.patchify(noise - latents)
             audio_velocity = audio_patchifier.patchify(audio_target)
@@ -4306,6 +4667,25 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             self._last_dit_inputs = None
             return out_video_ref_av, torch.tensor(0.0, device=accelerator.device)
 
+        # Per-token conditioning mask + frame-level loss mask for the latent_idx
+        # guide slot. The guide latent itself was already pasted into
+        # model_noisy_video before the IC-LoRA branches.
+        latent_idx_guide_token_mask: Optional[torch.Tensor] = None
+        latent_idx_guide_loss_mask: Optional[torch.Tensor] = None
+        if latent_idx_guide_slot is not None:
+            _slot_idx, _slot_T = latent_idx_guide_slot
+            bsz_g, _c, frames_g, h_g, w_g = latents.shape
+            seq_len_g = frames_g * h_g * w_g
+            tokens_per_frame = h_g * w_g
+            latent_idx_guide_token_mask = torch.zeros(
+                (bsz_g, seq_len_g), device=accelerator.device, dtype=torch.bool,
+            )
+            latent_idx_guide_token_mask[
+                :, _slot_idx * tokens_per_frame : (_slot_idx + _slot_T) * tokens_per_frame
+            ] = True
+            latent_idx_guide_loss_mask = torch.ones((bsz_g, frames_g), device=accelerator.device, dtype=torch.bool)
+            latent_idx_guide_loss_mask[:, _slot_idx : _slot_idx + _slot_T] = False
+
         model_input = model_noisy_video
         if self._ltx_mode == "av" and audio_enabled_for_batch:
             model_input = [model_noisy_video, noisy_audio]
@@ -4314,6 +4694,7 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
 
         video_conditioning_mask_tokens = None
         video_loss_mask = None
+        transformer_options = {"patches_replace": {}}
         if video_conditioning_enabled is not None:
             bsz, _c, frames, height, width = latents.shape
             seq_len = frames * height * width
@@ -4321,7 +4702,6 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             video_conditioning_mask_tokens = torch.zeros((bsz, seq_len), device=accelerator.device, dtype=torch.bool)
             if first_frame_tokens > 0:
                 video_conditioning_mask_tokens[video_conditioning_enabled, :first_frame_tokens] = True
-            transformer_options = {"patches_replace": {}, "video_conditioning_mask": video_conditioning_mask_tokens}
 
             if getattr(args, "video_loss_mask_5d", False):
                 video_loss_mask = torch.ones((bsz, 1, frames, 1, 1), device=accelerator.device, dtype=torch.bool)
@@ -4331,9 +4711,30 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                 video_loss_mask = torch.ones((bsz, frames), device=accelerator.device, dtype=torch.bool)
                 if frames > 0:
                     video_loss_mask[video_conditioning_enabled, 0] = False
+
+        # OR the latent_idx guide mask with the first-frame mask when both are active.
+        if latent_idx_guide_token_mask is not None:
+            if video_conditioning_mask_tokens is None:
+                video_conditioning_mask_tokens = latent_idx_guide_token_mask
+            else:
+                video_conditioning_mask_tokens = video_conditioning_mask_tokens | latent_idx_guide_token_mask
+        if latent_idx_guide_loss_mask is not None:
+            if video_loss_mask is None:
+                video_loss_mask = latent_idx_guide_loss_mask
+            elif video_loss_mask.dim() == 2:
+                video_loss_mask = video_loss_mask & latent_idx_guide_loss_mask
+            elif video_loss_mask.dim() == 5:
+                _expand = latent_idx_guide_loss_mask.view(
+                    latent_idx_guide_loss_mask.shape[0], 1, latent_idx_guide_loss_mask.shape[1], 1, 1
+                )
+                video_loss_mask = video_loss_mask & _expand
         video_loss_mask = _combine_loss_masks(video_loss_mask, _cached_video_loss_mask(as_tokens=False))
 
-        resolved_transformer_options = transformer_options if video_conditioning_mask_tokens is not None else {"patches_replace": {}}
+        resolved_transformer_options = dict(transformer_options)
+        if video_conditioning_mask_tokens is not None:
+            resolved_transformer_options["video_conditioning_mask"] = video_conditioning_mask_tokens
+        if keyframe_guides_for_options is not None:
+            resolved_transformer_options["keyframe_guides"] = keyframe_guides_for_options
         if (
             self._ltx_mode == "av"
             and audio_ref_only_ic_enabled
