@@ -46,14 +46,39 @@ class BaseDatasetParams:
     enable_bucket: bool = False
     bucket_no_upscale: bool = False
     caption_extension: Optional[str] = None
+    caption_field: Optional[str] = None
     batch_size: int = 1
     num_repeats: int = 1
     video_loss_weight: Optional[float] = None
     audio_loss_weight: Optional[float] = None
     cache_directory: Optional[str] = None
     reference_cache_directory: Optional[str] = None
+    reference_cache_directories: Optional[Sequence[str]] = None
+    reference_frames: Optional[int] = None
     reference_audio_cache_directory: Optional[str] = None
+    reference_audio_cache_directories: Optional[Sequence[str]] = None
+    # Latent guides (directory-based, one guide of each type per item).
+    latent_idx_guide_directory: Optional[str] = None
+    latent_idx_guide_cache_directory: Optional[str] = None
+    latent_idx_guide_frame_idx: int = 0
+    latent_idx_guide_strength: float = 1.0
+    keyframe_guide_directory: Optional[str] = None
+    keyframe_guide_cache_directory: Optional[str] = None
+    keyframe_guide_frame_idx: int = -1
+    keyframe_guide_strength: float = 1.0
+    # Multi-keyframe: extra keyframe guides beyond the single primary above.
+    # If set, each list must have the same length and is appended after the
+    # primary keyframe (which stays in keyframe_guide_directory). Empty/None
+    # falls back to single-keyframe behavior.
+    keyframe_guide_extra_directories: Optional[Sequence[str]] = None
+    keyframe_guide_extra_cache_directories: Optional[Sequence[str]] = None
+    keyframe_guide_extra_frame_idxs: Optional[Sequence[int]] = None
+    keyframe_guide_extra_strengths: Optional[Sequence[float]] = None
     separate_audio_buckets: bool = False
+    loss_mask_directory: Optional[str] = None
+    default_loss_mask_path: Optional[str] = None
+    loss_mask_use_alpha: bool = False
+    loss_mask_invert: bool = False
     cache_only: bool = False
     debug_dataset: bool = False
     architecture: str = "no_default"  # short style like "hv" or "wan"
@@ -82,7 +107,9 @@ class VideoDatasetParams(BaseDatasetParams):
     video_jsonl_file: Optional[str] = None
     control_directory: Optional[str] = None
     reference_directory: Optional[str] = None
+    reference_directories: Optional[Sequence[str]] = None
     reference_audio_directory: Optional[str] = None
+    reference_audio_directories: Optional[Sequence[str]] = None
     target_frames: Sequence[int] = (1,)
     frame_extraction: Optional[str] = "head"
     frame_stride: Optional[int] = 1
@@ -139,6 +166,7 @@ class ConfigSanitizer:
     # datasets schema
     DATASET_ASCENDABLE_SCHEMA = {
         "caption_extension": str,
+        "caption_field": str,
         "batch_size": int,
         "num_repeats": int,
         "resolution": functools.partial(__validate_and_convert_scalar_or_twodim.__func__, int),
@@ -148,8 +176,28 @@ class ConfigSanitizer:
         "audio_loss_weight": float,
         "cache_directory": str,
         "reference_cache_directory": str,
+        "reference_cache_directories": [str],
+        "reference_frames": int,
         "reference_audio_cache_directory": str,
+        "reference_audio_cache_directories": [str],
+        # LTX-2 latent guides
+        "latent_idx_guide_directory": str,
+        "latent_idx_guide_cache_directory": str,
+        "latent_idx_guide_frame_idx": int,
+        "latent_idx_guide_strength": float,
+        "keyframe_guide_directory": str,
+        "keyframe_guide_cache_directory": str,
+        "keyframe_guide_frame_idx": int,
+        "keyframe_guide_strength": float,
+        "keyframe_guide_extra_directories": [str],
+        "keyframe_guide_extra_cache_directories": [str],
+        "keyframe_guide_extra_frame_idxs": [int],
+        "keyframe_guide_extra_strengths": [float],
         "separate_audio_buckets": bool,
+        "loss_mask_directory": str,
+        "default_loss_mask_path": str,
+        "loss_mask_use_alpha": bool,
+        "loss_mask_invert": bool,
         "cache_only": bool,
     }
     IMAGE_DATASET_DISTINCT_SCHEMA = {
@@ -175,7 +223,9 @@ class ConfigSanitizer:
         "video_jsonl_file": str,
         "control_directory": str,
         "reference_directory": str,
+        "reference_directories": [str],
         "reference_audio_directory": str,
+        "reference_audio_directories": [str],
         "target_frames": [int],
         "frame_extraction": str,
         "frame_stride": int,
@@ -273,7 +323,13 @@ class BlueprintGenerator:
         sanitized_user_config = self.sanitizer.sanitize_user_config(normalized_user_config)
         sanitized_argparse_namespace = self.sanitizer.sanitize_argparse_namespace(argparse_namespace)
 
-        argparse_config = {k: v for k, v in vars(sanitized_argparse_namespace).items() if v is not None}
+        # Keep CLI reference_frames as a cache-time fallback; only TOML/general should populate dataset overrides.
+        dataset_local_arg_exclusions = {"reference_frames"}
+        argparse_config = {
+            k: v
+            for k, v in vars(sanitized_argparse_namespace).items()
+            if v is not None and k not in dataset_local_arg_exclusions
+        }
         general_config = sanitized_user_config.get("general", {})
 
         dataset_blueprints = []
@@ -320,10 +376,30 @@ class BlueprintGenerator:
                 if not is_image_dataset:
                     continue
 
+                reference_directories = dataset_config.get("reference_directories")
+                if reference_directories is not None and not isinstance(reference_directories, list):
+                    raise ValueError(f"{section_name}[{i}] reference_directories must be a list of strings.")
+                if reference_directories:
+                    if len(reference_directories) != 1:
+                        raise ValueError(
+                            f"{section_name}[{i}] uses reference_directories on an image dataset, but image IC-LoRA "
+                            "currently supports only one reference directory. Use a single entry."
+                        )
+                    dataset_config["reference_directory"] = reference_directories[0]
                 reference_directory = dataset_config.get("reference_directory")
                 control_directory = dataset_config.get("control_directory")
                 has_reference_directory = reference_directory is not None
                 has_control_directory = control_directory is not None
+                reference_cache_directories = dataset_config.get("reference_cache_directories")
+                if reference_cache_directories is not None and not isinstance(reference_cache_directories, list):
+                    raise ValueError(f"{section_name}[{i}] reference_cache_directories must be a list of strings.")
+                if reference_cache_directories:
+                    if len(reference_cache_directories) != 1:
+                        raise ValueError(
+                            f"{section_name}[{i}] uses reference_cache_directories on an image dataset, but image IC-LoRA "
+                            "currently supports only one reference cache directory. Use a single entry."
+                        )
+                    dataset_config["reference_cache_directory"] = reference_cache_directories[0]
                 has_reference_cache = dataset_config.get("reference_cache_directory") is not None
 
                 if has_reference_directory and not has_reference_cache:
@@ -385,6 +461,7 @@ def generate_dataset_group_by_blueprint(
     training: bool = False,
     num_timestep_buckets: Optional[int] = None,
     shared_epoch: SharedEpoch = None,
+    reference_downscale: int = 1,
 ) -> DatasetGroup:
     datasets: List[Union[ImageDataset, VideoDataset, AudioDataset]] = []
 
@@ -398,6 +475,14 @@ def generate_dataset_group_by_blueprint(
 
         dataset = dataset_klass(**asdict(dataset_blueprint.params))
         datasets.append(dataset)
+
+    try:
+        reference_downscale = max(1, int(reference_downscale or 1))
+    except (TypeError, ValueError):
+        reference_downscale = 1
+    for dataset in datasets:
+        if getattr(dataset, "architecture", None) in {ARCHITECTURE_LTX2, ARCHITECTURE_LTX2_FULL}:
+            dataset.reference_downscale = reference_downscale
 
     # warn about missing data directories
     for i, dataset in enumerate(datasets):
@@ -432,11 +517,20 @@ def generate_dataset_group_by_blueprint(
         video_loss_weight: {getattr(dataset, "video_loss_weight", None)}
         audio_loss_weight: {getattr(dataset, "audio_loss_weight", None)}
         caption_extension: "{dataset.caption_extension}"
+        caption_field: "{getattr(dataset, 'caption_field', None)}"
         enable_bucket: {dataset.enable_bucket}
         bucket_no_upscale: {dataset.bucket_no_upscale}
         separate_audio_buckets: {getattr(dataset, "separate_audio_buckets", False)}
         cache_only: {getattr(dataset, "cache_only", False)}
+        loss_mask_directory: "{getattr(dataset, "loss_mask_directory", None)}"
+        default_loss_mask_path: "{getattr(dataset, "default_loss_mask_path", None)}"
+        loss_mask_use_alpha: {getattr(dataset, "loss_mask_use_alpha", False)}
+        loss_mask_invert: {getattr(dataset, "loss_mask_invert", False)}
+        reference_downscale: {getattr(dataset, "reference_downscale", 1)}
+        reference_frames: {getattr(dataset, "reference_frames", None)}
         cache_directory: "{dataset.cache_directory}"
+        reference_cache_directory: "{getattr(dataset, 'reference_cache_directory', None)}"
+        reference_cache_directories: {getattr(dataset, "reference_cache_directories", None)}
         debug_dataset: {dataset.debug_dataset}
     """
         )
@@ -479,8 +573,11 @@ def generate_dataset_group_by_blueprint(
         video_jsonl_file: "{dataset.video_jsonl_file}"
         control_directory: "{dataset.control_directory}"
         reference_directory: "{getattr(dataset, 'reference_directory', None)}"
+        reference_directories: {getattr(dataset, "reference_directories", None)}
         reference_audio_directory: "{getattr(dataset, 'reference_audio_directory', None)}"
+        reference_audio_directories: {getattr(dataset, "reference_audio_directories", None)}
         reference_audio_cache_directory: "{getattr(dataset, 'reference_audio_cache_directory', None)}"
+        reference_audio_cache_directories: {getattr(dataset, "reference_audio_cache_directories", None)}
         target_frames: {dataset.target_frames}
         frame_extraction: {dataset.frame_extraction}
         frame_stride: {dataset.frame_stride}
@@ -540,7 +637,9 @@ def _manifest_params_with_cache_only(dataset_type: str, params: dict) -> dict:
         params["video_jsonl_file"] = None
         params["control_directory"] = None
         params["reference_directory"] = None
+        params["reference_directories"] = None
         params["reference_audio_directory"] = None
+        params["reference_audio_directories"] = None
 
     return params
 
@@ -670,6 +769,7 @@ def generate_dataset_group_by_manifest(
     training: bool = False,
     num_timestep_buckets: Optional[int] = None,
     shared_epoch: SharedEpoch = None,
+    reference_downscale: int = 1,
 ) -> Optional[DatasetGroup]:
     if split not in {"train", "validation"}:
         raise ValueError(f"invalid manifest split: {split}")
@@ -686,6 +786,7 @@ def generate_dataset_group_by_manifest(
         training=training,
         num_timestep_buckets=num_timestep_buckets,
         shared_epoch=shared_epoch,
+        reference_downscale=reference_downscale,
     )
 
 

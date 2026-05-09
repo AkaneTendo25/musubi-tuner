@@ -20,9 +20,10 @@ from musubi_tuner.dataset.config_utils import BlueprintGenerator, ConfigSanitize
 from musubi_tuner.dataset.image_video_dataset import (
     ARCHITECTURE_LTX2,
     ItemInfo,
-    save_text_encoder_output_cache_ltx2_official,
+    save_text_encoder_output_cache_ltx2_gemma,
 )
 from musubi_tuner.ltx_2.env import apply_ltx2_tweaks
+from musubi_tuner.model_defaults import default_gemma_root_path, default_ltx2_checkpoint_path
 
 
 logger = logging.getLogger(__name__)
@@ -45,7 +46,7 @@ def _all_declared_datasets_are_audio(user_config: dict) -> bool:
     return all(("audio_directory" in ds or "audio_jsonl_file" in ds) for ds in declared_datasets)
 
 
-def encode_and_save_batch_official_gemma(
+def encode_and_save_batch_gemma(
     text_encoder,
     batch: list[ItemInfo],
     *,
@@ -75,7 +76,7 @@ def encode_and_save_batch_official_gemma(
             mask = mask.squeeze(0).detach().cpu()
             audio_embed_out = audio_embed.squeeze(0).detach().cpu() if audio_embed is not None else None
 
-            save_text_encoder_output_cache_ltx2_official(
+            save_text_encoder_output_cache_ltx2_gemma(
                 item,
                 video_prompt_embeds=video_embed,
                 audio_prompt_embeds=audio_embed_out,
@@ -126,7 +127,7 @@ def encode_and_save_batch_pre_connector(
             video_feat_out = video_feat.squeeze(0).detach().cpu()
             audio_feat_out = audio_feat.squeeze(0).detach().cpu() if audio_feat is not None else None
 
-            save_text_encoder_output_cache_ltx2_official(
+            save_text_encoder_output_cache_ltx2_gemma(
                 item,
                 video_prompt_embeds=video_embed,
                 audio_prompt_embeds=audio_embed_out,
@@ -195,6 +196,26 @@ def _precache_sample_prompts(
 
     prompt_cache: list[dict] = []
     default_guidance_scale = float(getattr(args, "guidance_scale", 3.0))
+    default_negative_prompt = ""
+    video_cfg_scale = getattr(args, "video_cfg_scale", None)
+    audio_cfg_scale = getattr(args, "audio_cfg_scale", None)
+
+    from musubi_tuner.ltx2_defaults import get_ltx2_sampling_preset
+
+    preset = get_ltx2_sampling_preset(
+        getattr(args, "sample_sampling_preset", "defaults"),
+        ltx_version=str(getattr(args, "ltx_version", "2.3")),
+    )
+    if preset is not None:
+        default_guidance_scale = preset.video_cfg_scale
+        if video_cfg_scale is None:
+            video_cfg_scale = preset.video_cfg_scale
+        if audio_cfg_scale is None:
+            audio_cfg_scale = preset.audio_cfg_scale
+        use_default_negative = getattr(args, "sample_use_default_negative_prompt", None)
+        if use_default_negative is None or bool(use_default_negative):
+            default_negative_prompt = preset.negative_prompt
+
     for prompt_dict in prompts:
         param = prompt_dict.copy()
         prompt_text = param.get("prompt", "")
@@ -216,13 +237,15 @@ def _precache_sample_prompts(
         guidance_scale = param.get("guidance_scale", default_guidance_scale)
         effective_cfg_scale = cfg_scale if cfg_scale is not None else guidance_scale
         try:
-            do_classifier_free_guidance = float(effective_cfg_scale) != 1.0
+            do_classifier_free_guidance = (
+                float(effective_cfg_scale) != 1.0
+                or (video_cfg_scale is not None and float(video_cfg_scale) != 1.0)
+                or (audio_cfg_scale is not None and float(audio_cfg_scale) != 1.0)
+            )
         except (TypeError, ValueError):
             do_classifier_free_guidance = False
 
-        negative_prompt = param.get("negative_prompt")
-        if do_classifier_free_guidance and negative_prompt is None:
-            negative_prompt = ""
+        negative_prompt = param.get("negative_prompt", default_negative_prompt)
 
         if do_classifier_free_guidance or negative_prompt:
             neg_embeds, neg_mask = _encode_prompt_text_ltx2(
@@ -378,7 +401,10 @@ def main() -> None:
         AVGemmaTextEncoderModelConfigurator,
         AV_GEMMA_TEXT_ENCODER_KEY_OPS,
     )
-    from musubi_tuner.ltx_2.text_encoders.gemma.encoders.base_encoder import module_ops_from_gemma_root
+    from musubi_tuner.ltx_2.text_encoders.gemma.encoders.base_encoder import (
+        apply_text_encoder_checkpoint_overrides,
+        module_ops_from_gemma_root,
+    )
     from musubi_tuner.ltx_2.text_encoders.gemma.encoders.video_only_encoder import (
         VIDEO_ONLY_GEMMA_TEXT_ENCODER_KEY_OPS,
         VideoGemmaTextEncoderModelConfigurator,
@@ -417,8 +443,10 @@ def main() -> None:
             bnb_4bit_quant_type=str(getattr(args, "gemma_bnb_4bit_quant_type", "nf4")),
             bnb_4bit_use_double_quant=not bool(getattr(args, "gemma_bnb_4bit_disable_double_quant", False)),
             bnb_4bit_compute_dtype=bnb_compute_dtype,
+            fp8_weight_offload=getattr(args, "gemma_fp8_weight_offload", None),
         ),
     ).build(device=device, dtype=dtype)
+    apply_text_encoder_checkpoint_overrides(text_encoder, str(text_encoder_checkpoint))
     text_encoder.eval()
 
     # If connector weights are missing, SingleGPUModelBuilder returns a meta-device model.
@@ -444,7 +472,7 @@ def main() -> None:
                 audio_video=audio_video,
             )
         else:
-            encode_and_save_batch_official_gemma(
+            encode_and_save_batch_gemma(
                 text_encoder,
                 batch,
                 device=device,
@@ -496,7 +524,7 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
     parser.add_argument(
         "--ltx2_checkpoint",
         type=str,
-        default=None,
+        default=default_ltx2_checkpoint_path(),
         help="Path to LTX-2 checkpoint (.safetensors)",
     )
     parser.add_argument(
@@ -508,7 +536,7 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
     parser.add_argument(
         "--gemma_root",
         type=str,
-        default=None,
+        default=default_gemma_root_path(),
         help="Local directory containing Gemma weights/tokenizer (Gemma backend only)",
     )
     parser.add_argument(
@@ -524,6 +552,13 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         default="v",
         choices=["video", "av", "audio", "v", "a", "va"],
         help="Caching modality: 'video' (default) for video-only, 'av' for audio+video, 'audio' for audio-only.",
+    )
+    parser.add_argument(
+        "--ltx_version",
+        type=str,
+        default="2.3",
+        choices=["2.0", "2.3"],
+        help="LTX model version used to resolve sample-prompt preset defaults.",
     )
     parser.add_argument(
         "--mixed_precision",
@@ -551,6 +586,47 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
             "Path to write precached sample prompt embeddings (.pt). Defaults to "
             "the first dataset's cache_directory/ltx2_sample_prompts_cache.pt"
         ),
+    )
+    parser.add_argument(
+        "--caption_field",
+        type=str,
+        default=None,
+        help=(
+            "For JSONL datasets, cache text embeddings from this metadata field instead of 'caption'. "
+            "Use fields such as target_caption for I2V/reference datasets with separate captions."
+        ),
+    )
+    parser.add_argument(
+        "--sample_sampling_preset",
+        "--sampling_preset",
+        type=str,
+        default="defaults",
+        choices=["legacy", "defaults", "ltx20", "ltx23", "ltx23_hq", "distilled_two_stage"],
+        help="Sampling preset used to resolve default negative prompts for sample prompt caching.",
+    )
+    parser.add_argument(
+        "--sample_use_default_negative_prompt",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Use the preset default negative prompt when caching sample prompt embeddings.",
+    )
+    parser.add_argument(
+        "--guidance_scale",
+        type=float,
+        default=3.0,
+        help="Fallback guidance scale for deciding whether sample prompt negative embeddings are needed.",
+    )
+    parser.add_argument(
+        "--video_cfg_scale",
+        type=float,
+        default=None,
+        help="Video CFG scale for deciding whether sample prompt negative embeddings are needed.",
+    )
+    parser.add_argument(
+        "--audio_cfg_scale",
+        type=float,
+        default=None,
+        help="Audio CFG scale for deciding whether sample prompt negative embeddings are needed.",
     )
 
     # -- Preservation prompt precaching --
@@ -613,6 +689,15 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         default="auto",
         choices=["auto", "fp16", "bf16", "fp32"],
         help="Compute dtype for 4-bit (auto uses --mixed_precision dtype)",
+    )
+    parser.add_argument(
+        "--gemma_fp8_weight_offload",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "When using FP8 Gemma safetensors, offload FP8 linear weights to CPU RAM. "
+            "Defaults to the LTX2_GEMMA_SAFETENSORS_WEIGHT_OFFLOAD environment variable when omitted."
+        ),
     )
     parser.add_argument(
         "--cache_before_connector",

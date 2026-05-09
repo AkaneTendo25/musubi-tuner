@@ -8,6 +8,46 @@ from musubi_tuner.ltx_2.components.protocols import SchedulerProtocol
 BASE_SHIFT_ANCHOR = 1024
 MAX_SHIFT_ANCHOR = 4096
 
+# LTX-2.3 distilled single-stage workflow schedule.
+# This is intentionally exact: the distilled model/LoRA was tuned for these
+# sigmas rather than for the default token-shifted linear schedule.
+LTX23_DISTILLED_SIGMAS = (1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0)
+
+
+def build_ltx2_sigmas(
+    steps: int,
+    latent: torch.Tensor | None = None,
+    *,
+    sigma_schedule: str = "auto",
+    sampling_preset: str | None = None,
+) -> torch.FloatTensor:
+    """Build LTX-2 sigmas from the configured sampling schedule.
+
+    ``auto`` uses the exact LTX-2.3 distilled schedule for the distilled
+    two-stage preset at 8 steps. Otherwise it uses ``LTX2Scheduler`` with the
+    latent tensor for token-count-dependent shifting.
+    """
+
+    schedule = str(sigma_schedule or "auto").lower()
+    preset = str(sampling_preset or "").lower()
+
+    use_distilled = schedule == "ltx23_distilled" or (
+        schedule == "auto" and preset == "distilled_two_stage" and int(steps) == len(LTX23_DISTILLED_SIGMAS) - 1
+    )
+    if use_distilled:
+        expected_steps = len(LTX23_DISTILLED_SIGMAS) - 1
+        if int(steps) != expected_steps:
+            raise ValueError(
+                f"LTX-2.3 distilled sigma schedule requires {expected_steps} steps, got {steps}. "
+                "Use --sample_sigma_schedule ltx or --sample_steps 8."
+            )
+        return torch.tensor(LTX23_DISTILLED_SIGMAS, dtype=torch.float32)
+
+    if schedule not in {"auto", "ltx"}:
+        raise ValueError("sigma_schedule must be one of: auto, ltx, ltx23_distilled")
+
+    return LTX2Scheduler().execute(steps=int(steps), latent=latent)
+
 
 class LTX2Scheduler(SchedulerProtocol):
     """

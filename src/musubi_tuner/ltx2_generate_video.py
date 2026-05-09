@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import sys
 from types import SimpleNamespace
 from typing import List, Optional
 
@@ -21,12 +22,70 @@ from accelerate import Accelerator
 from safetensors.torch import load_file
 
 from musubi_tuner.hv_generate_video import setup_parser_compile
+from musubi_tuner.ltx2_defaults import get_ltx2_sampling_preset
+from musubi_tuner.model_defaults import default_gemma_root_path, default_ltx2_checkpoint_path
 from musubi_tuner.ltx2_train_network import LTX2NetworkTrainer
 from musubi_tuner.networks import lora_ltx2
 from musubi_tuner.utils.device_utils import clean_memory_on_device
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
+
+
+def _configure_windows_cli_encoding() -> None:
+    """Keep Unicode help text printable when Windows stdout is not UTF-8."""
+    if os.name != "nt":
+        return
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+
+
+def _apply_reference_conditioning_overrides(
+    prompts: list[dict],
+    *,
+    reference_image: str | None = None,
+    reference_video: str | None = None,
+) -> tuple[str, bool] | None:
+    if not reference_image and not reference_video:
+        return None
+
+    if reference_image and reference_video:
+        logger.warning(
+            "Both --reference_image and --reference_video given; "
+            "--reference_video takes priority (V2V), --reference_image ignored."
+        )
+
+    ref_path = reference_video or reference_image
+
+    # Auto-detect: if an --reference_image path is actually a video by ext, use V2V slot.
+    try:
+        from musubi_tuner.dataset.image_video_dataset import VIDEO_EXTENSIONS
+        video_exts = {e.lower() for e in VIDEO_EXTENSIONS}
+    except Exception:
+        video_exts = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
+
+    ext = os.path.splitext(ref_path)[1].lower()
+    use_v2v = bool(reference_video) or (ext in video_exts)
+
+    if not os.path.isfile(ref_path):
+        raise FileNotFoundError(f"Reference path does not exist: {ref_path}")
+
+    for prompt_dict in prompts:
+        # Explicit CLI references should override prompt-file paths and cached reference latents.
+        prompt_dict.pop("image_path", None)
+        prompt_dict.pop("conditioning_latent", None)
+        prompt_dict.pop("v2v_ref_path", None)
+        prompt_dict.pop("v2v_ref_latent", None)
+        if use_v2v:
+            prompt_dict["v2v_ref_path"] = ref_path
+        else:
+            prompt_dict["image_path"] = ref_path
+
+    return ref_path, use_v2v
 
 
 # ---------------------------------------------------------------------------
@@ -43,7 +102,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--ltx2_checkpoint",
         type=str,
-        required=True,
+        default=default_ltx2_checkpoint_path(),
         help="Path to LTX-2 checkpoint (.safetensors). Also used for VAE unless --vae is set.",
     )
     parser.add_argument(
@@ -68,16 +127,32 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--mixed_precision", type=str, default="bf16", choices=["no", "fp16", "bf16"])
     parser.add_argument("--device", type=str, default=None, help="Force device to cpu or cuda")
+    parser.add_argument(
+        "--ltx_version",
+        type=str,
+        default="2.3",
+        choices=["2.0", "2.3"],
+        help="Target LTX version for default sampling presets.",
+    )
 
     # -- Gemma text encoder --
-    parser.add_argument("--gemma_root", type=str, default=None,
+    parser.add_argument("--gemma_root", type=str, default=default_gemma_root_path(),
                         help="Local directory containing Gemma weights/tokenizer")
     parser.add_argument("--gemma_safetensors", type=str, default=None,
-                        help="Single Gemma safetensors file (e.g. fp8 from ComfyUI). No --gemma_root needed.")
+                        help="Single Gemma safetensors file (for example, an fp8 export). No --gemma_root needed.")
     parser.add_argument("--gemma_load_in_8bit", action="store_true", help="Load Gemma in 8-bit (bitsandbytes). CUDA only.")
     parser.add_argument("--gemma_load_in_4bit", action="store_true", help="Load Gemma in 4-bit (bitsandbytes). CUDA only.")
     parser.add_argument("--gemma_bnb_4bit_quant_type", type=str, default="nf4", choices=["nf4", "fp4"])
     parser.add_argument("--gemma_bnb_4bit_disable_double_quant", action="store_true")
+    parser.add_argument(
+        "--gemma_fp8_weight_offload",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "When using FP8 Gemma safetensors, offload FP8 linear weights to CPU RAM. "
+            "Defaults to the LTX2_GEMMA_SAFETENSORS_WEIGHT_OFFLOAD environment variable when omitted."
+        ),
+    )
 
     # -- LoRA (merged into transformer for inference) --
     parser.add_argument("--lora_weight", type=str, nargs="*", default=None, help="LoRA weight path(s) to merge")
@@ -97,16 +172,83 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output_name", type=str, default="ltx2_gen", help="Base output filename prefix")
 
     # -- Generation controls (become sample_parameter defaults) --
-    parser.add_argument("--height", type=int, default=512, help="Output height in pixels (rounded to multiple of 32)")
-    parser.add_argument("--width", type=int, default=768, help="Output width in pixels (rounded to multiple of 32)")
-    parser.add_argument("--frame_count", "--sample_num_frames", type=int, default=45, dest="frame_count",
+    parser.add_argument(
+        "--sampling_preset",
+        "--sample_sampling_preset",
+        type=str,
+        default="defaults",
+        choices=["legacy", "defaults", "ltx20", "ltx23", "ltx23_hq", "distilled_two_stage"],
+        help="Generation defaults. Use 'legacy' for the old 512x768/20-step/no-guidance defaults.",
+    )
+    parser.add_argument(
+        "--use_default_negative_prompt",
+        "--sample_use_default_negative_prompt",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Use the default LTX negative prompt when CFG is enabled and --negative_prompt is omitted.",
+    )
+    parser.add_argument("--height", type=int, default=None, help="Output height in pixels (rounded to multiple of 32)")
+    parser.add_argument("--width", type=int, default=None, help="Output width in pixels (rounded to multiple of 32)")
+    parser.add_argument("--frame_count", "--sample_num_frames", type=int, default=None, dest="frame_count",
                         help="Number of frames (rounded to 8k+1)")
-    parser.add_argument("--frame_rate", type=float, default=25.0, help="Output FPS")
-    parser.add_argument("--sample_steps", type=int, default=20, help="Number of denoising steps")
-    parser.add_argument("--guidance_scale", type=float, default=1.0, help="Guidance scale (1.0 = no guidance)")
+    parser.add_argument("--frame_rate", type=float, default=None, help="Output FPS")
+    parser.add_argument("--sample_steps", type=int, default=None, help="Number of denoising steps")
+    parser.add_argument(
+        "--sample_sigma_schedule",
+        type=str,
+        default="auto",
+        choices=["auto", "ltx", "ltx23_distilled"],
+        help=(
+            "Sigma schedule. 'auto' uses LTX token-shifted sigmas, and the exact "
+            "LTX-2.3 distilled sigmas for the distilled_two_stage preset."
+        ),
+    )
+    parser.add_argument(
+        "--sample_sampler",
+        type=str,
+        default="auto",
+        choices=["auto", "euler", "res_2s"],
+        help="Sampler. 'auto' uses res_2s for full presets and Euler for distilled_two_stage.",
+    )
+    parser.add_argument("--guidance_scale", type=float, default=None, help="Guidance scale (1.0 = no guidance)")
     parser.add_argument("--cfg_scale", type=float, default=None, help="CFG scale (overrides guidance_scale when set)")
     parser.add_argument("--discrete_flow_shift", type=float, default=5.0, help="Flow matching shift parameter")
     parser.add_argument("--seed", type=int, default=None, help="Random seed (None = random)")
+    parser.add_argument("--video_cfg_scale", type=float, default=None, help="Video CFG scale")
+    parser.add_argument("--audio_cfg_scale", type=float, default=None, help="Audio CFG scale")
+    parser.add_argument("--video_modality_scale", type=float, default=None, help="Video A2V modality guidance scale")
+    parser.add_argument("--audio_modality_scale", type=float, default=None, help="Audio V2A modality guidance scale")
+    parser.add_argument("--video_rescale_scale", type=float, default=None, help="Video CFG rescale scale")
+    parser.add_argument("--audio_rescale_scale", type=float, default=None, help="Audio CFG rescale scale")
+    parser.add_argument(
+        "--stg_scale",
+        type=float,
+        default=None,
+        help="Spatio-Temporal Guidance scale (0.0 = disabled). Recommended default is 1.0. "
+             "Costs one extra transformer forward per denoising step.",
+    )
+    parser.add_argument(
+        "--stg_blocks",
+        type=int,
+        nargs="*",
+        default=None,
+        help="Transformer block indices to perturb for STG (None = all blocks).",
+    )
+    parser.add_argument(
+        "--stg_mode",
+        type=str,
+        default=None,
+        choices=["video", "audio", "both"],
+        help="Which self-attention modality to perturb for STG.",
+    )
+    parser.add_argument(
+        "--rescale_scale",
+        type=float,
+        default=None,
+        help="CFG\u2605 rescaling after CFG+STG. LTX-2.3 default is 0.9; 0 disables.",
+    )
+    parser.add_argument("--av_bimodal_cfg", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--av_bimodal_scale", type=float, default=None)
 
     # -- Attention / DiT quantization --
     parser.add_argument("--attn_mode", type=str, default="torch",
@@ -119,6 +261,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--xformers", action="store_true", help="Use xformers (same as --attn_mode xformers)")
     parser.add_argument("--fp8_base", action="store_true", help="Use FP8 cast for DiT weights")
     parser.add_argument("--fp8_scaled", action="store_true", help="Use scaled FP8 (requires fp8_base)")
+    parser.add_argument(
+        "--fp8_keep_blocks",
+        type=str,
+        default=None,
+        help="Comma-separated transformer block indices to keep in high precision with --fp8_scaled, e.g. 0,1,2,45.",
+    )
     parser.add_argument("--fp8_w8a8", action="store_true", help="Use W8A8 quantization (requires fp8_scaled)")
     parser.add_argument("--w8a8_mode", type=str, default="int8", choices=["int8", "fp8"])
     parser.add_argument("--fp8_upcast", action="store_true")
@@ -146,17 +294,28 @@ def parse_args() -> argparse.Namespace:
 
     # -- I2V / V2V conditioning --
     parser.add_argument("--sample_i2v_token_timestep_mask", action=argparse.BooleanOptionalAction, default=True,
-                        help="Use official-style I2V token timestep masking during sampling")
+                        help="Use LTX I2V token timestep masking during sampling")
     parser.add_argument("--reference_downscale", type=int, default=1,
                         help="Spatial downscale factor for V2V references (1=same res)")
     parser.add_argument("--reference_frames", type=int, default=1, help="Number of V2V reference frames")
     parser.add_argument("--sample_include_reference", action="store_true",
                         help="Show V2V reference side-by-side in output")
+    parser.add_argument("--reference_image", type=str, default=None,
+                        help="Path to reference image for I2V conditioning (single frame). "
+                             "If path points to a video file by extension, treated as V2V.")
+    parser.add_argument("--reference_video", type=str, default=None,
+                        help="Path to reference video file for V2V conditioning (multi-frame).")
 
     # -- Audio (AV mode) --
     parser.add_argument("--sample_disable_audio", action="store_true", help="Disable audio decoding in AV mode")
     parser.add_argument("--sample_audio_only", action="store_true", help="Audio-only output (skip video decode)")
     parser.add_argument("--sample_merge_audio", action="store_true", help="Mux audio into video (_av.mp4)")
+    parser.add_argument(
+        "--sample_audio_subprocess",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Decode audio in a subprocess. Use --no-sample_audio_subprocess to decode in-process.",
+    )
 
     # -- Two-stage inference --
     parser.add_argument("--sample_two_stage", action="store_true",
@@ -167,6 +326,12 @@ def parse_args() -> argparse.Namespace:
                         help="Path to distilled LoRA for two-stage refinement.")
     parser.add_argument("--sample_stage2_steps", type=int, default=3,
                         help="Number of stage-2 refinement steps (default: 3)")
+    parser.add_argument("--sample_stage1_distilled_lora_multiplier", type=float, default=None,
+                        help="Stage-1 distilled LoRA multiplier for two-stage. "
+                             "Default: 0.25 with res_2s, 0.0 with Euler.")
+    parser.add_argument("--sample_stage2_distilled_lora_multiplier", type=float, default=None,
+                        help="Stage-2 distilled LoRA multiplier for two-stage. "
+                             "Default: 0.5 with res_2s, 1.0 with Euler.")
 
     # -- Tiled VAE decode --
     parser.add_argument("--sample_tiled_vae", action="store_true", help="Enable tiled VAE decoding")
@@ -205,6 +370,62 @@ def parse_args() -> argparse.Namespace:
         raise ValueError("Either --prompt or --sample_prompts (--from_file) must be specified")
     if args.gemma_root is None and not args.gemma_safetensors and not args.use_precached_sample_prompts:
         raise ValueError("--gemma_root or --gemma_safetensors is required (unless using --use_precached_sample_prompts)")
+    if args.gemma_load_in_8bit and args.gemma_load_in_4bit:
+        raise ValueError("--gemma_load_in_8bit and --gemma_load_in_4bit cannot be enabled together")
+    if args.gemma_safetensors and (args.gemma_load_in_8bit or args.gemma_load_in_4bit):
+        raise ValueError("--gemma_safetensors cannot be combined with --gemma_load_in_4bit/8bit")
+
+    preset = get_ltx2_sampling_preset(args.sampling_preset, ltx_version=args.ltx_version)
+    if preset is None:
+        args.height = 512 if args.height is None else args.height
+        args.width = 768 if args.width is None else args.width
+        args.frame_count = 45 if args.frame_count is None else args.frame_count
+        args.frame_rate = 25.0 if args.frame_rate is None else args.frame_rate
+        args.sample_steps = 20 if args.sample_steps is None else args.sample_steps
+        args.guidance_scale = 1.0 if args.guidance_scale is None else args.guidance_scale
+        args.stg_scale = 0.0 if args.stg_scale is None else args.stg_scale
+        args.stg_mode = "video" if args.stg_mode is None else args.stg_mode
+        args.rescale_scale = 0.0 if args.rescale_scale is None else args.rescale_scale
+        if args.use_default_negative_prompt is None:
+            args.use_default_negative_prompt = False
+    else:
+        args.height = preset.height if args.height is None else args.height
+        args.width = preset.width if args.width is None else args.width
+        args.frame_count = preset.frame_count if args.frame_count is None else args.frame_count
+        args.frame_rate = preset.frame_rate if args.frame_rate is None else args.frame_rate
+        args.sample_steps = preset.sample_steps if args.sample_steps is None else args.sample_steps
+        args.guidance_scale = preset.video_cfg_scale if args.guidance_scale is None else args.guidance_scale
+        args.video_cfg_scale = preset.video_cfg_scale if args.video_cfg_scale is None else args.video_cfg_scale
+        args.audio_cfg_scale = preset.audio_cfg_scale if args.audio_cfg_scale is None else args.audio_cfg_scale
+        args.stg_scale = preset.stg_scale if args.stg_scale is None else args.stg_scale
+        args.stg_blocks = preset.stg_blocks if args.stg_blocks is None else args.stg_blocks
+        args.stg_mode = preset.stg_mode if args.stg_mode is None else args.stg_mode
+        args.rescale_scale = preset.video_rescale_scale if args.rescale_scale is None else args.rescale_scale
+        args.video_rescale_scale = preset.video_rescale_scale if args.video_rescale_scale is None else args.video_rescale_scale
+        args.audio_rescale_scale = preset.audio_rescale_scale if args.audio_rescale_scale is None else args.audio_rescale_scale
+        args.video_modality_scale = preset.video_modality_scale if args.video_modality_scale is None else args.video_modality_scale
+        args.audio_modality_scale = preset.audio_modality_scale if args.audio_modality_scale is None else args.audio_modality_scale
+        if args.av_bimodal_cfg is None:
+            args.av_bimodal_cfg = preset.video_modality_scale != 1.0 or preset.audio_modality_scale != 1.0
+        if args.av_bimodal_scale is None:
+            args.av_bimodal_scale = preset.video_modality_scale
+        if args.use_default_negative_prompt is None:
+            args.use_default_negative_prompt = bool(preset.negative_prompt)
+        if args.negative_prompt is None and args.use_default_negative_prompt:
+            args.negative_prompt = preset.negative_prompt
+        if args.sampling_preset == "distilled_two_stage":
+            args.sample_two_stage = True
+
+    args.video_cfg_scale = args.guidance_scale if args.video_cfg_scale is None else args.video_cfg_scale
+    args.audio_cfg_scale = args.guidance_scale if args.audio_cfg_scale is None else args.audio_cfg_scale
+    args.video_rescale_scale = args.rescale_scale if args.video_rescale_scale is None else args.video_rescale_scale
+    args.audio_rescale_scale = args.rescale_scale if args.audio_rescale_scale is None else args.audio_rescale_scale
+    args.video_modality_scale = 1.0 if args.video_modality_scale is None else args.video_modality_scale
+    args.audio_modality_scale = 1.0 if args.audio_modality_scale is None else args.audio_modality_scale
+    args.av_bimodal_cfg = False if args.av_bimodal_cfg is None else args.av_bimodal_cfg
+    args.av_bimodal_scale = args.video_modality_scale if args.av_bimodal_scale is None else args.av_bimodal_scale
+    if args.cfg_scale is None and args.video_cfg_scale != args.guidance_scale:
+        args.cfg_scale = args.video_cfg_scale
 
     return args
 
@@ -321,6 +542,9 @@ def _build_prompt_list(
         "frame_count": args.frame_count,
         "frame_rate": args.frame_rate,
         "sample_steps": args.sample_steps,
+        "sigma_schedule": args.sample_sigma_schedule,
+        "sample_sampler": args.sample_sampler,
+        "sampling_preset": args.sampling_preset,
         "guidance_scale": args.guidance_scale,
         "discrete_flow_shift": args.discrete_flow_shift,
         "seed": args.seed,
@@ -335,10 +559,13 @@ def _build_prompt_list(
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    _configure_windows_cli_encoding()
     args = parse_args()
 
     # Wire up aliases that the training code expects
     args.dit = args.ltx2_checkpoint
+    args.sample_sampling_preset = args.sampling_preset
+    args.sample_use_default_negative_prompt = args.use_default_negative_prompt
     if args.vae is None:
         args.vae = args.ltx2_checkpoint
     if args.vae_dtype is None:
@@ -403,6 +630,21 @@ def main() -> None:
     if not prompts:
         logger.error("No prompts to generate. Exiting.")
         return
+
+    if args.reference_image or args.reference_video:
+        try:
+            ref_path, use_v2v = _apply_reference_conditioning_overrides(
+                prompts,
+                reference_image=args.reference_image,
+                reference_video=args.reference_video,
+            )
+        except FileNotFoundError as exc:
+            logger.error(str(exc))
+            return
+        logger.info(
+            "Reference conditioning: %s via %s slot",
+            ref_path, "V2V (v2v_ref_path)" if use_v2v else "I2V (image_path)"
+        )
 
     logger.info("Generating %d sample(s)...", len(prompts))
 

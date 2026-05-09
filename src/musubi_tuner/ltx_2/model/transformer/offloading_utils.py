@@ -20,6 +20,8 @@ _LOGGED_FIRST_PARAM = False
 _SKIP_AUDIO_SWAP = os.getenv("LTX2_SWAP_SKIP_AUDIO", "1") == "1"
 _SKIP_CROSS_ATTN_SWAP = os.getenv("LTX2_SWAP_KEEP_CROSS_ATTN", "0") == "1"
 _SKIP_ATTN_SWAP = os.getenv("LTX2_SWAP_KEEP_ATTN", "0") == "1"
+_SWAP_MASK_TOKENS = {"all", "ff", "attn", "self_attn", "cross_attn", "av_cross_attn"}
+_LOGGED_SWAP_MASK = False
 
 
 def _swap_full_block_enabled() -> bool:
@@ -41,21 +43,116 @@ def _should_skip_swap(name: str) -> bool:
     return False
 
 
+def _swap_mask_tokens() -> set[str]:
+    raw = os.getenv("LTX2_FULL_FT_SWAP_MASK", "all")
+    tokens = {token.strip().lower() for token in raw.replace("+", ",").split(",") if token.strip()}
+    if not tokens or "all" in tokens:
+        return {"all"}
+
+    aliases = {
+        "mlp": "ff",
+        "feedforward": "ff",
+        "feed_forward": "ff",
+        "self": "self_attn",
+        "cross": "cross_attn",
+        "av": "av_cross_attn",
+    }
+    tokens = {aliases.get(token, token) for token in tokens}
+    invalid = sorted(tokens - _SWAP_MASK_TOKENS)
+    if invalid:
+        logger.warning(
+            "Ignoring invalid LTX-2 linear swap mask token(s): %s; falling back to all",
+            ", ".join(invalid),
+        )
+        return {"all"}
+    return tokens
+
+
+def _module_matches_swap_mask(name: str, mask_tokens: set[str]) -> bool:
+    if "all" in mask_tokens:
+        return True
+
+    top = name.split(".", 1)[0]
+    if "ff" in mask_tokens and (top in {"ff", "audio_ff"} or ".ff." in f".{name}."):
+        return True
+    if "attn" in mask_tokens and "attn" in name:
+        return True
+    if "self_attn" in mask_tokens and top in {"attn1", "audio_attn1"}:
+        return True
+    if "cross_attn" in mask_tokens and top in {
+        "attn2",
+        "audio_attn2",
+        "audio_to_video_attn",
+        "video_to_audio_attn",
+    }:
+        return True
+    if "av_cross_attn" in mask_tokens and top in {"audio_to_video_attn", "video_to_audio_attn"}:
+        return True
+    return False
+
+
+def _move_masked_linear_params(
+    block: nn.Module,
+    offload_device: torch.device,
+    keep_device: torch.device,
+    *,
+    mask_tokens: set[str],
+    use_pinned: bool,
+    skip_trainable: bool = True,
+) -> None:
+    for name, module in block.named_modules():
+        if not module.__class__.__name__.endswith("Linear"):
+            continue
+        target_device = offload_device
+        if _should_skip_swap(name) or not _module_matches_swap_mask(name, mask_tokens):
+            target_device = keep_device
+        weighs_to_device(module, target_device, use_pinned=use_pinned, skip_trainable=skip_trainable)
+
+
+def _move_masked_module_groups(
+    block: nn.Module,
+    offload_device: torch.device,
+    keep_device: torch.device,
+    *,
+    mask_tokens: set[str],
+    skip_trainable: bool = True,
+) -> None:
+    """Move selected top-level module groups to CPU and keep the rest on GPU."""
+    should_skip_trainable = skip_trainable and offload_device.type == "cpu"
+    non_blocking_keep = keep_device.type != "cpu"
+
+    for param in block.parameters(recurse=False):
+        if param.device != keep_device:
+            param.data = param.data.to(keep_device, non_blocking=non_blocking_keep)
+    for buf in block.buffers(recurse=False):
+        if buf.device != keep_device:
+            buf.data = buf.data.to(keep_device, non_blocking=non_blocking_keep)
+
+    for name, module in block.named_children():
+        if _should_skip_swap(name) or not _module_matches_swap_mask(name, mask_tokens):
+            module.to(keep_device)
+        elif should_skip_trainable:
+            params_to_device(module, offload_device, include_norms=True, use_pinned=False, skip_trainable=skip_trainable)
+        else:
+            module.to(offload_device)
+
+
 def _move_block_params_excluding_audio(
     block: nn.Module,
     device: torch.device,
     *,
     include_norms: bool,
     use_pinned: bool,
+    skip_trainable: bool = True,
 ) -> None:
     for name, module in block.named_modules():
         if _should_skip_swap(name):
             continue
         if include_norms:
-            params_to_device(module, device, include_norms=True, use_pinned=use_pinned)
+            params_to_device(module, device, include_norms=True, use_pinned=use_pinned, skip_trainable=skip_trainable)
         else:
             if module.__class__.__name__.endswith("Linear"):
-                weighs_to_device(module, device, use_pinned=use_pinned)
+                weighs_to_device(module, device, use_pinned=use_pinned, skip_trainable=skip_trainable)
 
 
 def _is_norm_module(module: nn.Module) -> bool:
@@ -333,7 +430,7 @@ class LTX2ModelOffloader(ModelOffloader):
         logger.info(f"Registered backward unload hooks for {len(blocks) - split_idx} swapped blocks")
 
     def prepare_block_devices_before_forward(self, blocks: list[nn.Module]) -> None:
-        global _LOGGED_SWAP_BYTES, _LOGGED_FIRST_PARAM
+        global _LOGGED_SWAP_BYTES, _LOGGED_FIRST_PARAM, _LOGGED_SWAP_MASK
         if self.blocks_to_swap is None or self.blocks_to_swap == 0:
             return
 
@@ -350,6 +447,8 @@ class LTX2ModelOffloader(ModelOffloader):
         _log_cuda_memory("before_prepare_blocks")
 
         use_pinned = self.use_pinned_memory and os.getenv("LTX2_SWAP_PINNED", "1") == "1"
+        skip_trainable = os.getenv("LTX2_FULL_FT_OFFLOAD_TRAINABLE_SWAP", "0") != "1"
+        swap_mask = _swap_mask_tokens()
         split_idx = max(0, self.num_blocks - self.blocks_to_swap)
         cpu_device = torch.device("cpu")
 
@@ -366,13 +465,40 @@ class LTX2ModelOffloader(ModelOffloader):
             for idx, block in enumerate(blocks[0 : split_idx]):
                 _mark_swap_weight_offload(block, False)
                 block.to(self.device)
-                params_to_device(block, self.device, include_norms=True, use_pinned=use_pinned)
+                params_to_device(
+                    block,
+                    self.device,
+                    include_norms=True,
+                    use_pinned=use_pinned,
+                    skip_trainable=skip_trainable,
+                )
             _log_cuda_memory(f"full_block_swap_AFTER_GPU_blocks_0_to_{split_idx-1}")
 
             for idx, block in enumerate(blocks[split_idx :], start=split_idx):
                 _mark_swap_weight_offload(block, True)
-                block.to(cpu_device)
-                params_to_device(block, cpu_device, include_norms=True, use_pinned=use_pinned)
+                if swap_mask == {"all"}:
+                    block.to(cpu_device)
+                    params_to_device(
+                        block,
+                        cpu_device,
+                        include_norms=True,
+                        use_pinned=use_pinned,
+                        skip_trainable=skip_trainable,
+                    )
+                else:
+                    if not _LOGGED_SWAP_MASK:
+                        logger.info(
+                            "LTX-2 swap: FULL MASK MODE - offloading mask=%s for swapped blocks",
+                            ",".join(sorted(swap_mask)),
+                        )
+                        _LOGGED_SWAP_MASK = True
+                    _move_masked_module_groups(
+                        block,
+                        cpu_device,
+                        self.device,
+                        mask_tokens=swap_mask,
+                        skip_trainable=skip_trainable,
+                    )
             _log_cuda_memory(f"full_block_swap_AFTER_CPU_blocks_{split_idx}_to_{len(blocks)-1}")
 
             # Debug: count params on each device after
@@ -384,11 +510,27 @@ class LTX2ModelOffloader(ModelOffloader):
             for block in blocks[0 : split_idx]:
                 _mark_swap_weight_offload(block, False)
                 block.to(self.device)
-                weighs_to_device(block, self.device, use_pinned=use_pinned)
+                weighs_to_device(block, self.device, use_pinned=use_pinned, skip_trainable=skip_trainable)
 
             for block in blocks[split_idx :]:
                 _mark_swap_weight_offload(block, True)
-                if self.swap_norms:
+                if swap_mask != {"all"}:
+                    if not _LOGGED_SWAP_MASK:
+                        logger.info(
+                            "LTX-2 swap: LINEAR MASK MODE - offloading mask=%s for swapped blocks",
+                            ",".join(sorted(swap_mask)),
+                        )
+                        _LOGGED_SWAP_MASK = True
+                    _move_masked_linear_params(
+                        block,
+                        cpu_device,
+                        self.device,
+                        mask_tokens=swap_mask,
+                        use_pinned=use_pinned,
+                        skip_trainable=skip_trainable,
+                    )
+                    _move_non_linear_params(block, self.device, include_norms=True)
+                elif self.swap_norms:
                     # Keep Linear+norm weights on CPU; move remaining non-linear params to GPU.
                     if _SKIP_AUDIO_SWAP or _SKIP_CROSS_ATTN_SWAP:
                         _move_block_params_excluding_audio(
@@ -396,9 +538,16 @@ class LTX2ModelOffloader(ModelOffloader):
                             cpu_device,
                             include_norms=True,
                             use_pinned=use_pinned,
+                            skip_trainable=skip_trainable,
                         )
                     else:
-                        params_to_device(block, cpu_device, include_norms=True, use_pinned=use_pinned)
+                        params_to_device(
+                            block,
+                            cpu_device,
+                            include_norms=True,
+                            use_pinned=use_pinned,
+                            skip_trainable=skip_trainable,
+                        )
                     _move_non_linear_params(block, self.device, include_norms=False)
                 else:
                     # Keep Linear weights on CPU; move non-linear params/buffers to GPU.
@@ -408,9 +557,10 @@ class LTX2ModelOffloader(ModelOffloader):
                             cpu_device,
                             include_norms=False,
                             use_pinned=use_pinned,
+                            skip_trainable=skip_trainable,
                         )
                     else:
-                        weighs_to_device(block, cpu_device, use_pinned=use_pinned)
+                        weighs_to_device(block, cpu_device, use_pinned=use_pinned, skip_trainable=skip_trainable)
                     _move_non_linear_params(block, self.device, include_norms=True)
 
         _synchronize_device(self.device)

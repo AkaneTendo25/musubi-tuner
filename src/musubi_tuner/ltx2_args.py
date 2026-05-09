@@ -9,6 +9,7 @@ from musubi_tuner.hv_train_network import read_config_from_file, setup_parser_co
 from musubi_tuner.ltx_2.env import apply_ltx2_tweaks
 from musubi_tuner.ltx2_lycoris_runtime import apply_lycoris_preset_before_network_creation, is_lycoris_requested, process_lycoris_config
 from musubi_tuner.ltx2_train_network import IC_LORA_STRATEGIES
+from musubi_tuner.model_defaults import default_gemma_root_path, default_ltx2_checkpoint_path
 
 logger = logging.getLogger(__name__)
 
@@ -16,23 +17,25 @@ logger = logging.getLogger(__name__)
 def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     """Add LTX-2-specific arguments to parser"""
 
+    parser.set_defaults(network_module="networks.lora_ltx2")
+
     parser.add_argument(
         "--ltx2_checkpoint",
         type=str,
-        required=True,
+        default=default_ltx2_checkpoint_path(),
         help="Path to LTX-2 checkpoint (.safetensors)",
     )
     parser.add_argument(
         "--gemma_root",
         type=str,
-        default=None,
+        default=default_gemma_root_path(),
         help="Local directory containing Gemma weights/tokenizer (used for sample prompts)",
     )
     parser.add_argument(
         "--gemma_safetensors",
         type=str,
         default=None,
-        help="Path to a single Gemma safetensors file (e.g. fp8 from ComfyUI). Loads weights, config, and tokenizer from one file. No --gemma_root needed.",
+        help="Path to a single Gemma safetensors file (for example, an fp8 export). Loads weights, config, and tokenizer from one file. No --gemma_root needed.",
     )
     parser.add_argument(
         "--gemma_load_in_8bit",
@@ -56,6 +59,15 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         action="store_true",
         help="Disable bitsandbytes double quant for 4-bit loading.",
     )
+    parser.add_argument(
+        "--gemma_fp8_weight_offload",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "When using FP8 Gemma safetensors, offload FP8 linear weights to CPU RAM. "
+            "Defaults to the LTX2_GEMMA_SAFETENSORS_WEIGHT_OFFLOAD environment variable when omitted."
+        ),
+    )
 
     parser.add_argument(
         "--ltx2_mode", "--ltx_mode",
@@ -68,7 +80,7 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
     parser.add_argument(
         "--ltx_version",
         type=str,
-        default="2.0",
+        default="2.3",
         choices=["2.0", "2.3"],
         help=(
             "Target LTX major trainer behavior. "
@@ -130,20 +142,23 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         "--lora_target_preset",
         type=str,
         default="t2v",
-        choices=["t2v", "v2v", "video_sa", "video_sa_ff", "video_sa_ca_ff",
-                 "audio", "audio_ref_only_ic", "av_ic", "full", "lycoris"],
+            choices=["t2v", "v2v", "video_sa", "video_sa_ff", "video_sa_ca_ff",
+                 "audio", "audio_v2a", "audio_ref_only_ic", "av_ic", "video_ref_only_av", "full", "lycoris"],
         help=(
             "LoRA target preset: "
-            "'t2v' = text-to-video (all attention, official default), "
+            "'t2v' = text-to-video (all attention, default), "
             "'v2v' = video-to-video/IC-LoRA (all attention + feed-forward), "
             "'video_sa' = video self-attention only, "
             "'video_sa_ff' = video self-attention + video feed-forward, "
             "'video_sa_ca_ff' = video self-attention + cross-attention + feed-forward, "
-            "'audio' = audio-only (audio attn/ffn + audio-side cross-modal), "
+            "'audio' = audio-only (audio attn/ffn, no AV cross-modal), "
+            "'audio_v2a' = audio preset plus video_to_audio_attn (audio attn/ffn + video_to_audio_attn), "
             "'audio_ref_only_ic' = ID-LoRA-style AV preset "
             "(audio attn/ffn + audio/video cross-modal both directions), "
+            "'av_ic' = AV IC preset (use --av_cross_attention_mode / --av_multi_ref for AV variants), "
+            "'video_ref_only_av' = AV preset for video-reference conditioning without reference audio, "
             "'lycoris' = LyCORIS attention-only target preset for LTX-2, "
-            "'full' = all linear layers. "
+            "'full' = all linear layers for LoRA targeting. "
             "Can be overridden by --network_args include_patterns=..."
         ),
     )
@@ -162,10 +177,37 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
             "IC-LoRA conditioning strategy. "
             "'auto' keeps backward-compatible behavior "
             "(uses 'v2v' when --lora_target_preset=v2v, "
-            "'audio_ref_only_ic' when --lora_target_preset=audio_ref_only_ic, else 'none'). "
+            "'audio_ref_only_ic' when --lora_target_preset=audio_ref_only_ic, "
+            "'av_ic' when --lora_target_preset=av_ic, "
+            "'video_ref_only_av' when --lora_target_preset=video_ref_only_av, else 'none'). "
             "'v2v' uses reference-video conditioning. "
             "'audio_ref_only_ic' uses reference-audio conditioning (ID-LoRA-style) in AV or audio-only mode. "
-            "'av_ic' uses combined video+audio reference conditioning (requires --ltx2_mode av)."
+            "'av_ic' uses combined video+audio reference conditioning (requires --ltx2_mode av; "
+            "use --av_cross_attention_mode / --av_multi_ref for AV variants). "
+            "'video_ref_only_av' uses reference-video conditioning while still training target AV generation "
+            "(requires --ltx2_mode av)."
+        ),
+    )
+    parser.add_argument(
+        "--av_cross_attention_mode",
+        type=str,
+        default="both",
+        choices=["both", "a2v_only", "v2a_only", "none"],
+        help=(
+            "For --ic_lora_strategy av_ic: which AV cross-modal directions remain enabled. "
+            "'both' keeps default bidirectional AV IC, "
+            "'a2v_only' keeps audio-to-video only, "
+            "'v2a_only' keeps video-to-audio only, "
+            "'none' disables both AV cross-modal directions."
+        ),
+    )
+    parser.add_argument(
+        "--av_multi_ref",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "For --ic_lora_strategy av_ic: mark the run as using multi-reference AV IC. "
+            "The backend already accepts multiple provided reference tensors; this flag exposes the intent in UI/metadata."
         ),
     )
     parser.add_argument(
@@ -189,7 +231,7 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         default=False,
         help=(
             "For --ic_lora_strategy audio_ref_only_ic: block reference-audio tokens from attending to text tokens "
-            "(target-audio tokens still attend to text)."
+            "(target-audio tokens still attend to text; currently ignored in av_ic)."
         ),
     )
     parser.add_argument(
@@ -209,20 +251,163 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         help=(
             "Enable audio-video bimodal CFG during sampling. Runs an extra forward pass "
             "with cross-modal attention (A2V, V2A) disabled to strengthen independent "
-            "modality generation. Used by official ID-LoRA inference."
+            "modality generation. Used by the ID-LoRA inference path."
         ),
     )
     parser.add_argument(
         "--av_bimodal_scale",
         type=float,
-        default=3.0,
+        default=None,
         help="Scale for AV bimodal CFG. Applied as (scale-1) * (cond - bimodal). Default: 3.0.",
+    )
+    parser.add_argument(
+        "--sample_sampling_preset",
+        "--sampling_preset",
+        type=str,
+        default="defaults",
+        choices=["legacy", "defaults", "ltx20", "ltx23", "ltx23_hq", "distilled_two_stage"],
+        help=(
+            "Sampling defaults for validation previews. 'defaults' selects the preset for --ltx_version; "
+            "use 'legacy' to bypass version preset defaults."
+        ),
+    )
+    parser.add_argument(
+        "--sample_use_default_negative_prompt",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Use the default LTX negative prompt when a CFG sample has no --n/negative_prompt.",
+    )
+    parser.add_argument(
+        "--sample_sigma_schedule",
+        type=str,
+        default="auto",
+        choices=["auto", "ltx", "ltx23_distilled"],
+        help=(
+            "Sigma schedule for LTX-2 previews. 'auto' uses LTX token-shifted sigmas, "
+            "and uses the exact LTX-2.3 distilled sigmas for the distilled_two_stage preset."
+        ),
+    )
+    parser.add_argument(
+        "--sample_sampler",
+        type=str,
+        default="auto",
+        choices=["auto", "euler", "res_2s"],
+        help="Sampler for LTX-2 previews. 'auto' uses res_2s for full presets and Euler for distilled_two_stage.",
+    )
+    parser.add_argument(
+        "--video_cfg_scale",
+        type=float,
+        default=None,
+        help="Video CFG scale for LTX-2 sampling. Defaults to cfg_scale/guidance_scale unless a preset sets it.",
+    )
+    parser.add_argument(
+        "--audio_cfg_scale",
+        type=float,
+        default=None,
+        help="Audio CFG scale for LTX-2 sampling. Defaults to cfg_scale/guidance_scale unless a preset sets it.",
+    )
+    parser.add_argument(
+        "--video_modality_scale",
+        type=float,
+        default=None,
+        help="Video A2V modality guidance scale. Default preset uses 3.0.",
+    )
+    parser.add_argument(
+        "--audio_modality_scale",
+        type=float,
+        default=None,
+        help="Audio V2A modality guidance scale. Default preset uses 3.0.",
+    )
+    parser.add_argument(
+        "--video_rescale_scale",
+        type=float,
+        default=None,
+        help="Video CFG rescale scale. Defaults to --rescale_scale unless a preset sets it.",
+    )
+    parser.add_argument(
+        "--audio_rescale_scale",
+        type=float,
+        default=None,
+        help="Audio CFG rescale scale. Defaults to --rescale_scale unless a preset sets it.",
+    )
+    parser.add_argument(
+        "--stg_scale",
+        type=float,
+        default=None,
+        help=(
+            "Spatio-Temporal Guidance (STG) scale. None inherits from --sample_sampling_preset; 0.0 disables STG. "
+            "When > 0, runs a perturbed forward with self-attention skipped at --stg_blocks "
+            "and steers x0 by stg_scale * (cond - perturbed). Default preset uses 1.0."
+        ),
+    )
+    parser.add_argument(
+        "--stg_blocks",
+        type=int,
+        nargs="*",
+        default=None,
+        help=(
+            "Transformer block indices to perturb for STG. None = all blocks. "
+            "Default preset targets a single late block, e.g. --stg_blocks 29."
+        ),
+    )
+    parser.add_argument(
+        "--stg_mode",
+        type=str,
+        default=None,
+        choices=["video", "audio", "both"],
+        help=(
+            "Which modality to perturb for STG. None inherits from --sample_sampling_preset; "
+            "'video' skips video self-attn, 'audio' skips audio self-attn, 'both' skips both (AV mode)."
+        ),
+    )
+    parser.add_argument(
+        "--rescale_scale",
+        type=float,
+        default=0.0,
+        help=(
+            "CFG★ rescaling strength after CFG+STG. 0.0 disables (default). "
+            "LTX-2.3 default is 0.9; prevents oversaturation from "
+            "amplified guidance by rescaling prediction toward cond.std()."
+        ),
     )
     parser.add_argument(
         "--separate_audio_buckets",
         action="store_true",
         default=None,
         help="Split LTX-2 buckets by audio presence to avoid mixed audio/non-audio batches.",
+    )
+    parser.add_argument(
+        "--accumulation_group_by",
+        type=str,
+        default="none",
+        choices=["none", "frames", "bucket", "dataset"],
+        help=(
+            "Opt-in dataloader ordering for gradient accumulation windows. "
+            "'frames' keeps each accumulation window on one frame count, "
+            "'bucket' keeps it on one full bucket key (resolution/frame/audio), "
+            "'dataset' keeps it within one dataset section, and 'none' uses normal shuffling."
+        ),
+    )
+    parser.add_argument(
+        "--accumulation_group_remainder",
+        type=str,
+        default="drop",
+        choices=["drop", "pad", "allow_mixed"],
+        help=(
+            "How --accumulation_group_by handles buckets that do not divide evenly by the accumulation window. "
+            "'drop' skips incomplete windows, 'pad' repeats same-group batches to fill them, "
+            "and 'allow_mixed' keeps all batches but may mix groups in the final windows."
+        ),
+    )
+    parser.add_argument(
+        "--caption_field",
+        type=str,
+        default=None,
+        help=(
+            "For JSONL datasets, use this metadata field as the training caption instead of 'caption'. "
+            "Useful for I2V/reference datasets that store separate fields such as target_caption "
+            "and reference_caption. Directory datasets still use caption_extension files."
+        ),
     )
     parser.add_argument(
         "--audio_bucket_strategy",
@@ -353,7 +538,7 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         choices=["legacy", "stretched"],
         help=(
             "Shifted logit-normal sigma sampler mode. "
-            "'legacy' keeps historical behavior; 'stretched' enables upstream Mar-2026 sampling. "
+            "'legacy' keeps historical behavior; 'stretched' enables the current Mar-2026 sampling path. "
             "If unset, defaults by --ltx_version (2.0->legacy, 2.3->stretched)."
         ),
     )
@@ -378,9 +563,30 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
             "Lower values bias toward low noise / fine details, higher values toward high noise / global structure. "
             "If unset, shift is computed dynamically from sequence length using the LTX-2 linear formula "
             "(anchored at 0.95 for 1024 tokens and 2.05 for 4096 tokens). "
-            "Current non-audio training extrapolates outside those anchor values for shorter/longer sequences; "
-            "--ltx2_mode audio clamps auto-computed shifts to [0.95, 2.05]."
+            "By default non-audio training extrapolates outside those anchor values for shorter/longer sequences; "
+            "--ltx2_mode audio clamps auto-computed shifts to the configured min/max shift bounds."
         ),
+    )
+    parser.add_argument(
+        "--shifted_logit_clamp_auto_shift",
+        action="store_true",
+        help=(
+            "Clamp auto-computed shifted_logit_normal shifts to "
+            "[--shifted_logit_min_shift, --shifted_logit_max_shift]. "
+            "Does not affect explicit --shifted_logit_shift overrides."
+        ),
+    )
+    parser.add_argument(
+        "--shifted_logit_min_shift",
+        type=float,
+        default=0.95,
+        help="Lower clamp bound for auto-computed shifted_logit_normal shifts.",
+    )
+    parser.add_argument(
+        "--shifted_logit_max_shift",
+        type=float,
+        default=2.05,
+        help="Upper clamp bound for auto-computed shifted_logit_normal shifts.",
     )
     parser.add_argument(
         "--audio_silence_regularizer",
@@ -476,10 +682,70 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         default=0.1,
         help="Probability of first-frame conditioning during training (keep frame 0 clean and set its timestep to 0).",
     )
+    # ---- Endpoint-keyframe training (orthogonal to --ic_lora_strategy) -----
+    parser.add_argument(
+        "--keyframe_endpoint_training",
+        action="store_true",
+        help=(
+            "Enable endpoint-keyframe training: extract first/last/random-interior latent "
+            "frames of the target and append them as APPEND-GUIDE keyframe tokens (soft "
+            "guidance — model is steered toward but not constrained to match them). For "
+            "exact frame replacement (hard lock) use the dataset-level latent_idx workflow "
+            "instead. Composes with any --ic_lora_strategy. Off by default."
+        ),
+    )
+    parser.add_argument(
+        "--keyframe_first_frame_p",
+        type=float,
+        default=1.0,
+        help=(
+            "Per-sample probability of appending the first latent frame as a keyframe when "
+            "--keyframe_endpoint_training is set (independent Bernoulli per item in the "
+            "batch). Default 1.0 (always)."
+        ),
+    )
+    parser.add_argument(
+        "--keyframe_last_frame_p",
+        type=float,
+        default=1.0,
+        help=(
+            "Per-sample probability of appending the last latent frame as a keyframe when "
+            "--keyframe_endpoint_training is set (independent Bernoulli per item in the "
+            "batch). Default 1.0 (always)."
+        ),
+    )
+    parser.add_argument(
+        "--keyframe_random_interior_p",
+        type=float,
+        default=0.0,
+        help=(
+            "Per-sample probability of appending random interior latent frames as keyframes "
+            "when --keyframe_endpoint_training is set. Interior indices are shared across the "
+            "batch; only the dropout decision is per-sample. Default 0.0 (off)."
+        ),
+    )
+    parser.add_argument(
+        "--keyframe_max_random_interior",
+        type=int,
+        default=0,
+        help=(
+            "Maximum number of random interior latent frames to append per batch when "
+            "--keyframe_random_interior_p triggers. Default 0 (none)."
+        ),
+    )
     parser.add_argument(
         "--fp8_scaled",
         action="store_true",
         help="use scaled fp8 for DiT / DiTにスケーリングされたfp8を使う",
+    )
+    parser.add_argument(
+        "--fp8_keep_blocks",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated transformer block indices to keep in high precision when --fp8_scaled is enabled. "
+            "Example: --fp8_keep_blocks 0,1,2,45. Ranges like 0-2,45 are also accepted."
+        ),
     )
     parser.add_argument(
         "--fp8_w8a8",
@@ -613,7 +879,7 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         action=argparse.BooleanOptionalAction,
         default=True,
         help=(
-            "Use official-style I2V token timestep masking during sampling "
+            "Use LTX I2V token timestep masking during sampling "
             "(conditioned first-frame tokens use timestep=0 via video_conditioning_mask)."
         ),
     )
@@ -673,7 +939,25 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         "--sample_stage2_steps",
         type=int,
         default=3,
-        help="Number of denoising steps for stage 2 refinement (default: 3, official uses 3 steps with 4 sigma values).",
+        help="Number of denoising steps for stage 2 refinement (default: 3 steps with 4 sigma values).",
+    )
+    parser.add_argument(
+        "--sample_stage1_distilled_lora_multiplier",
+        type=float,
+        default=None,
+        help=(
+            "Optional distilled LoRA multiplier for two-stage stage 1. "
+            "If omitted, res_2s two-stage uses 0.25; Euler uses 0.0."
+        ),
+    )
+    parser.add_argument(
+        "--sample_stage2_distilled_lora_multiplier",
+        type=float,
+        default=None,
+        help=(
+            "Optional distilled LoRA multiplier for two-stage stage 2. "
+            "If omitted, res_2s two-stage uses 0.5; Euler uses 1.0."
+        ),
     )
 
     parser.add_argument(
@@ -872,6 +1156,43 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         "frame_level_mask=false teacher_mode=base mask_focus_loss=false max_loss=0.0 "
         "student_block_stochastic_range=2 teacher_momentum=0.999 "
         "dual_timestep=true student_block_ratio=0.3 teacher_block_ratio=0.7 projector_lr=5e-5",
+    )
+
+    # -- Latent temporal objectives --
+    parser.add_argument(
+        "--latent_temporal_weighting",
+        action="store_true",
+        help=(
+            "Enable latent motion weighting for the video denoising loss. "
+            "Clean latent frame deltas are converted into per-frame loss weights."
+        ),
+    )
+    parser.add_argument(
+        "--latent_temporal_weighting_args",
+        type=str,
+        nargs="*",
+        help=(
+            "Key=value args for latent temporal weighting, e.g. "
+            "alpha=0.5 mode=log normalize=mean clip_min=0.5 clip_max=2.0"
+        ),
+    )
+    parser.add_argument(
+        "--latent_delta_loss",
+        action="store_true",
+        help=(
+            "Enable latent temporal derivative matching for video training. "
+            "By default this matches predicted x0 frame deltas to clean latent frame deltas."
+        ),
+    )
+    parser.add_argument(
+        "--latent_delta_loss_args",
+        type=str,
+        nargs="*",
+        help=(
+            "Key=value args for latent delta loss, e.g. "
+            "weight=0.03 order=1 target=x0 sigma_min=0.05 sigma_max=0.85 "
+            "second_order_weight=0.5 loss_type=mse"
+        ),
     )
 
     # -- HFATO (High-Frequency Awareness Training Objective, ViBe) --
@@ -1093,11 +1414,23 @@ def main() -> None:
         if not any(arg.startswith("include_patterns=") for arg in args.network_args):
             args.lora_target_preset = "av_ic"
             logger.info("Using lora_target_preset=av_ic for --ic_lora_strategy av_ic")
+    elif (
+        requested_ic_strategy == "video_ref_only_av"
+        and not explicit_lora_preset
+        and not uses_lycoris_module
+    ):
+        if args.network_args is None:
+            args.network_args = []
+        if not any(arg.startswith("include_patterns=") for arg in args.network_args):
+            args.lora_target_preset = "video_ref_only_av"
+            logger.info("Using lora_target_preset=video_ref_only_av for --ic_lora_strategy video_ref_only_av")
 
     if explicit_ic_strategy and requested_ic_strategy == "audio_ref_only_ic" and getattr(args, "ltx_mode", "video") not in {"av", "audio"}:
         logger.warning("--ic_lora_strategy audio_ref_only_ic works in --ltx2_mode av or audio; current mode is %s", args.ltx_mode)
     if explicit_ic_strategy and requested_ic_strategy == "av_ic" and getattr(args, "ltx_mode", "video") != "av":
-        logger.warning("--ic_lora_strategy av_ic requires --ltx2_mode av; current mode is %s", args.ltx_mode)
+        logger.warning("--ic_lora_strategy %s requires --ltx2_mode av; current mode is %s", requested_ic_strategy, args.ltx_mode)
+    if explicit_ic_strategy and requested_ic_strategy == "video_ref_only_av" and getattr(args, "ltx_mode", "video") != "av":
+        logger.warning("--ic_lora_strategy video_ref_only_av requires --ltx2_mode av; current mode is %s", args.ltx_mode)
 
     if (
         explicit_lora_preset
@@ -1107,6 +1440,17 @@ def main() -> None:
         logger.warning(
             "--lora_target_preset audio_ref_only_ic in --ltx2_mode audio trains cross-modal layers that only "
             "affect the (dummy) video branch; consider --lora_target_preset audio instead."
+        )
+    if (
+        explicit_lora_preset
+        and getattr(args, "lora_target_preset", None) == "audio_v2a"
+        and getattr(args, "ltx_mode", "video") == "audio"
+    ):
+        logger.warning(
+            "--lora_target_preset audio_v2a in --ltx2_mode audio trains video_to_audio_attn against "
+            "dummy/unsupervised video context (audio mode has no real video tokens). Prefer "
+            "--lora_target_preset audio when --ltx2_mode is audio, or use --ltx2_mode av if you intend "
+            "to train video_to_audio_attn."
         )
 
     lora_target_preset = getattr(args, "lora_target_preset", None)

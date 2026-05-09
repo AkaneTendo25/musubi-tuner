@@ -54,7 +54,7 @@ def validate_lycoris_quantized_base_compatibility(
         return
 
     msg = (
-        "LyCORIS with quantized base model is enabled (%s). This path relies on lycoris-lora upstream "
+        "LyCORIS with quantized base model is enabled (%s). This path relies on lycoris-lora "
         "modules and can be slower/less stable than custom quantization-aware LoKr wrappers. "
         "For a quality baseline, try disabling quantized-base flags first."
     ) % ", ".join(flags)

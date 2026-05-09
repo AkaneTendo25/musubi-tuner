@@ -4,6 +4,7 @@
 # https://github.com/cloneofsimo/lora/blob/master/lora_diffusion/lora.py
 
 import ast
+import json
 import math
 import os
 import re
@@ -14,13 +15,19 @@ import torch.nn as nn
 
 import logging
 
+from musubi_tuner.networks.lora_adaptive_rank import (
+    AdaptiveRankLoRAModuleMixin,
+    AdaptiveRankLoRANetworkMixin,
+    parse_adaptive_rank_network_kwargs,
+)
+
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
 HUNYUAN_TARGET_REPLACE_MODULES = ["MMDoubleStreamBlock", "MMSingleStreamBlock"]
 
 
-class LoRAModule(torch.nn.Module):
+class LoRAModule(AdaptiveRankLoRAModuleMixin, torch.nn.Module):
     """
     replaces forward method of the original Linear, instead of replacing the original Linear module.
     """
@@ -54,6 +61,7 @@ class LoRAModule(torch.nn.Module):
             out_dim = org_module.out_features
 
         self.lora_dim = lora_dim
+        self._init_adaptive_rank_module_state(kwargs)
         self.split_dims = split_dims
 
         if split_dims is None:
@@ -95,7 +103,6 @@ class LoRAModule(torch.nn.Module):
         alpha = self.lora_dim if alpha is None or alpha == 0 else alpha
         self.scale = alpha / self.lora_dim
         self.register_buffer("alpha", torch.tensor(alpha))  # for save/load
-
         # same as microsoft's
         self.multiplier = multiplier
         self.org_module = org_module  # remove in applying
@@ -137,6 +144,10 @@ class LoRAModule(torch.nn.Module):
             else:
                 scale = self.scale
 
+            if self.adaptive_rank:
+                rank_weights = self._adaptive_rank_weights(self.lora_dim, dtype=lx.dtype, device=lx.device)
+                lx = lx * self._reshape_rank_weights(rank_weights, lx)
+
             lx = self.lora_up(lx)
 
             return org_forwarded + lx * self.multiplier * scale
@@ -161,6 +172,10 @@ class LoRAModule(torch.nn.Module):
                 scale = self.scale * (1.0 / (1.0 - self.rank_dropout))  # redundant for readability
             else:
                 scale = self.scale
+
+            if self.adaptive_rank:
+                rank_weights = self._adaptive_rank_weights(self.lora_dim, dtype=lxs[0].dtype, device=lxs[0].device)
+                lxs = [lx * self._reshape_rank_weights(rank_weights, lx) for lx in lxs]
 
             lxs = [lora_up(lx) for lora_up, lx in zip(self.lora_up, lxs)]
 
@@ -368,6 +383,7 @@ def create_network(
     cross_modal_alpha = kwargs.get("cross_modal_alpha", None)
     if cross_modal_alpha is not None:
         cross_modal_alpha = float(cross_modal_alpha)
+    adaptive_rank_kwargs = parse_adaptive_rank_network_kwargs(kwargs)
 
     # per-modality dropout overrides
     audio_dropout = kwargs.get("audio_dropout", None)
@@ -430,6 +446,7 @@ def create_network(
         cross_modal_dim=cross_modal_dim,
         cross_modal_alpha=cross_modal_alpha,
         cross_modal_dropout=cross_modal_dropout,
+        adaptive_rank_config=adaptive_rank_kwargs,
     )
 
     loraplus_lr_ratio = kwargs.get("loraplus_lr_ratio", None)
@@ -444,7 +461,7 @@ def create_network(
     return network
 
 
-class LoRANetwork(torch.nn.Module):
+class LoRANetwork(AdaptiveRankLoRANetworkMixin, torch.nn.Module):
     # only supports U-Net (DiT), Text Encoders are not supported
 
     def __init__(
@@ -475,6 +492,7 @@ class LoRANetwork(torch.nn.Module):
         cross_modal_dim: Optional[int] = None,
         cross_modal_alpha: Optional[float] = None,
         cross_modal_dropout: Optional[float] = None,
+        adaptive_rank_config: Optional[Dict[str, Any]] = None,
     ) -> None:
         super().__init__()
         self.multiplier = multiplier
@@ -496,6 +514,8 @@ class LoRANetwork(torch.nn.Module):
         self.cross_modal_dim = cross_modal_dim
         self.cross_modal_alpha = cross_modal_alpha
         self.cross_modal_dropout = cross_modal_dropout
+        normalized_adaptive_rank_config = parse_adaptive_rank_network_kwargs(adaptive_rank_config or {})
+        self._init_adaptive_rank_network_state(**normalized_adaptive_rank_config)
 
         self.loraplus_lr_ratio = None
         # self.loraplus_unet_lr_ratio = None
@@ -518,6 +538,7 @@ class LoRANetwork(torch.nn.Module):
                 logger.info(
                     f"per-modality dropout overrides: video={self.video_dropout}, audio={self.audio_dropout}, cross-modal={self.cross_modal_dropout}"
                 )
+            self._log_adaptive_rank_configuration(modules_dim)
             # if self.conv_lora_dim is not None:
             #     logger.info(
             #         f"apply LoRA to Conv2d with kernel size (3,3). dim (rank): {self.conv_lora_dim}, alpha: {self.conv_alpha}"
@@ -560,10 +581,10 @@ class LoRANetwork(torch.nn.Module):
             skipped = []
 
             def is_audio_module(module_name: str) -> bool:
-                return "audio_" in module_name
+                return self._is_audio_module(module_name)
 
             def is_cross_modal_module(module_name: str) -> bool:
-                return "audio_to_video" in module_name or "video_to_audio" in module_name or "av_ca_" in module_name
+                return self._is_cross_modal_module(module_name)
 
             def resolve_module_dropout(module_name: str) -> Optional[float]:
                 if is_cross_modal_module(module_name) and self.cross_modal_dropout is not None:
@@ -574,6 +595,12 @@ class LoRANetwork(torch.nn.Module):
                 elif self.video_dropout is not None:
                     return self.video_dropout
                 return self.dropout
+
+            def resolve_adaptive_rank_target(module_name: str) -> Optional[int]:
+                return self.resolve_module_adaptive_rank_target(module_name)
+
+            def resolve_adaptive_rank_weight(module_name: str) -> Optional[float]:
+                return self.resolve_module_adaptive_rank_weight(module_name)
 
             for name, module in root_module.named_modules():
                 if target_replace_mods is None or module.__class__.__name__ in target_replace_mods:
@@ -652,6 +679,8 @@ class LoRANetwork(torch.nn.Module):
                             loftq_data = per_module_kwargs.pop("loftq_data", None)
                             if loftq_data is not None and lora_name in loftq_data:
                                 per_module_kwargs["loftq_init_data"] = loftq_data[lora_name]
+                            adaptive_rank_target_value = resolve_adaptive_rank_target(original_name)
+                            adaptive_rank_weight_value = resolve_adaptive_rank_weight(original_name)
 
                             lora = module_class(
                                 lora_name,
@@ -662,6 +691,13 @@ class LoRANetwork(torch.nn.Module):
                                 dropout=module_dropout_value,
                                 rank_dropout=rank_dropout,
                                 module_dropout=module_dropout,
+                                module_path=original_name,
+                                adaptive_rank=self.adaptive_rank,
+                                adaptive_rank_target=adaptive_rank_target_value,
+                                adaptive_rank_quantile=self.adaptive_rank_quantile,
+                                adaptive_rank_weight=adaptive_rank_weight_value,
+                                adaptive_rank_min_rank=self.adaptive_rank_min_rank,
+                                adaptive_rank_init_rank=self.adaptive_rank_init_rank,
                                 **per_module_kwargs,
                             )
                             loras.append(lora)
@@ -708,11 +744,14 @@ class LoRANetwork(torch.nn.Module):
             assert lora.lora_name not in names, f"duplicated lora name: {lora.lora_name}"
             names.add(lora.lora_name)
 
+        if self.adaptive_rank_estimate_report is not None:
+            self._apply_adaptive_rank_estimate_overrides()
+
     def prepare_network(self, args):
         """
         called after the network is created
         """
-        pass
+        self.prepare_adaptive_rank(args)
 
     def set_multiplier(self, multiplier):
         self.multiplier = multiplier
@@ -926,9 +965,6 @@ class LoRANetwork(torch.nn.Module):
     def on_epoch_start(self, unet):
         self.train()
 
-    def on_step_start(self):
-        pass
-
     def get_trainable_params(self):
         return self.parameters()
 
@@ -936,7 +972,8 @@ class LoRANetwork(torch.nn.Module):
         if metadata is not None and len(metadata) == 0:
             metadata = None
 
-        state_dict = self.state_dict()
+        state_dict = self.build_export_state_dict()
+        adaptive_rank_report = self.build_adaptive_rank_report()
 
         if dtype is not None:
             for key in list(state_dict.keys()):
@@ -958,6 +995,10 @@ class LoRANetwork(torch.nn.Module):
             save_file(state_dict, file, metadata)
         else:
             torch.save(state_dict, file)
+
+        if adaptive_rank_report is not None:
+            with open(self._adaptive_rank_report_path(file), "w", encoding="utf-8") as f:
+                json.dump(adaptive_rank_report, f, indent=2, sort_keys=True)
 
     def backup_weights(self):
         # 重みのバックアップを行う

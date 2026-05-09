@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import re
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Request
@@ -16,12 +15,49 @@ def _get_state(request: Request):
     return request.app.state
 
 
-def _slugify(name: str) -> str:
-    """Convert a project name to a safe filename (without extension)."""
-    s = name.strip().lower()
-    s = re.sub(r'[^\w\s-]', '', s)
-    s = re.sub(r'[\s-]+', '_', s)
-    return s or "project"
+def _resolve_project_json(path_str: str) -> Path:
+    path = Path(path_str)
+    if path.is_dir():
+        path = path / "project.json"
+    return path
+
+
+def _project_summary(config: ProjectConfig, path: Path) -> dict:
+    training = config.training
+    datasets = config.dataset.datasets
+    validation_datasets = config.dataset.validation_datasets
+    dataset_types: dict[str, int] = {}
+    for entry in datasets:
+        dataset_types[entry.type] = dataset_types.get(entry.type, 0) + 1
+
+    ic_targets = {"v2v", "audio_ref_only_ic", "av_ic", "video_ref_only_av"}
+    uses_ic_lora = training.ic_lora_strategy not in ("auto", "none") or training.lora_target_preset in ic_targets
+    uses_lycoris = bool(training.lycoris_config) or training.lora_target_preset == "lycoris"
+    if uses_lycoris:
+        lora_kind = "LyCORIS"
+    elif uses_ic_lora:
+        lora_kind = "IC-LoRA"
+    else:
+        lora_kind = "LoRA"
+
+    return {
+        "name": config.name,
+        "path": str(path),
+        "project_dir": config.project_dir,
+        "datasets": len(datasets),
+        "validation_datasets": len(validation_datasets),
+        "dataset_types": dataset_types,
+        "mode": training.ltx2_mode,
+        "ltx_version": training.ltx_version,
+        "lora_kind": lora_kind,
+        "lora_target_preset": training.lora_target_preset,
+        "ic_lora_strategy": training.ic_lora_strategy,
+        "network_dim": training.network_dim,
+        "network_alpha": training.network_alpha,
+        "max_train_epochs": training.max_train_epochs,
+        "max_train_steps": training.max_train_steps,
+        "output_name": training.output_name,
+    }
 
 
 @router.get("")
@@ -38,6 +74,28 @@ async def get_project(request: Request):
     }
 
 
+@router.get("/defaults")
+async def get_project_defaults():
+    return {"config": ProjectConfig().model_dump()}
+
+
+@router.post("/summary")
+async def summarize_project(body: dict):
+    path_str = body.get("path", "")
+    if not path_str:
+        raise HTTPException(status_code=400, detail="path is required")
+
+    path = _resolve_project_json(path_str)
+    if not path.exists():
+        raise HTTPException(status_code=404, detail=f"File not found: {path}")
+
+    try:
+        config = ProjectConfig.load(path)
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=f"Failed to load: {e}")
+    return {"ok": True, "summary": _project_summary(config, path)}
+
+
 @router.post("")
 async def create_project(body: dict, request: Request):
     state = _get_state(request)
@@ -49,23 +107,16 @@ async def create_project(body: dict, request: Request):
     if not config.project_dir:
         raise HTTPException(status_code=400, detail="project_dir is required")
 
-    # Keep canonical filename for compatibility with directory-based loading.
-    project_json = Path(config.project_dir) / "project.json"
+    project_dir = Path(config.project_dir)
+    project_json = project_dir / "project.json"
 
-    # If canonical file exists, add a numeric suffix based on project name.
-    if project_json.exists():
-        for i in range(2, 100):
-            candidate = Path(config.project_dir) / f"{_slugify(config.name)}_{i}.json"
-            if not candidate.exists():
-                project_json = candidate
-                break
-        else:
-            raise HTTPException(
-                status_code=409,
-                detail=f"Too many project files with name '{config.name}' in {config.project_dir}.",
-            )
+    if project_dir.exists():
+        raise HTTPException(
+            status_code=409,
+            detail=f"Project folder already exists: {project_dir}",
+        )
 
-    Path(config.project_dir).mkdir(parents=True, exist_ok=True)
+    project_dir.mkdir(parents=True, exist_ok=True)
     config.save(project_json)
     state.project_config = config
     state.project_path = project_json
@@ -109,11 +160,7 @@ async def load_project(body: dict, request: Request):
     if not path_str:
         raise HTTPException(status_code=400, detail="path is required")
 
-    path = Path(path_str)
-
-    # If user passes a directory, look for project.json inside it
-    if path.is_dir():
-        path = path / "project.json"
+    path = _resolve_project_json(path_str)
 
     if not path.exists():
         raise HTTPException(status_code=404, detail=f"File not found: {path}")

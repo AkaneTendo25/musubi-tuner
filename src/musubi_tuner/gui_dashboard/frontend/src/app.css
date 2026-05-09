@@ -270,6 +270,219 @@
 }
 
 
+/* ── 6. Synthwave — 80s Retrowave Neon ── */
+:root.theme-synthwave {
+	color-scheme: dark;
+	--font-label: 'JetBrains Mono', monospace;
+	--bg-base: #0a0418;
+	--bg-surface: #150828;
+	--bg-elevated: #1c0e34;
+	--bg-input: #0f0620;
+	--bg-hover: #240e44;
+	--border: #3c1a5c;
+	--border-subtle: #261040;
+	--text-primary: #f0e0ff;
+	--text-secondary: #b890d8;
+	--text-muted: #7060a0;
+	--accent: #ff2dca;
+	--accent-hover: #ff5ad8;
+	--accent-muted: rgba(255,45,202,.12);
+	--accent-subtle-bg: rgba(255,45,202,.05);
+	--accent-dim: #d428a8;
+	--secondary: #00f0ff;
+	--success: #00ffaa;
+	--success-muted: rgba(0,255,170,.1);
+	--warning: #ffd000;
+	--warning-muted: rgba(255,208,0,.1);
+	--danger: #ff4060;
+	--danger-muted: rgba(255,64,96,.1);
+	--info: #00f0ff;
+	--sidebar-bg: #0e0620;
+	--sidebar-active: #1c0e34;
+	--sidebar-hover: #180a2c;
+	--toggle-bg: #3c1a5c;
+	--toggle-active: #ff2dca;
+	--console-bg: #050210;
+	--console-text: #b890d8;
+	--console-text-muted: #7060a0;
+	--shadow-sm: 0 1px 4px rgba(0,0,0,.4);
+	--shadow-md: 0 4px 16px rgba(80,0,80,.3);
+	--shadow-lg: 0 12px 36px rgba(80,0,80,.4);
+	--glow-accent: 0 0 24px rgba(255,45,202,.18);
+	--radius-sm: 6px;
+	--radius-md: 8px;
+	--radius-lg: 10px;
+	--radius-xl: 14px;
+	--radius-full: 9999px;
+	--toggle-radius: 8px;
+	--toggle-knob-radius: 50%;
+	--toggle-knob-shadow: 0 1px 4px rgba(0,0,0,.4);
+	--logo-bg: linear-gradient(135deg, #ff2dca, #00f0ff);
+	--logo-shadow: 0 0 24px rgba(255,45,202,.25);
+	--logo-radius: 8px;
+	--logo-clip: none;
+}
+
+/* ── 7. Sakura — Cherry Blossom Light ── */
+:root.theme-sakura {
+	color-scheme: light;
+	--font-label: 'Inter', -apple-system, sans-serif;
+	--bg-base: #fdf5f7;
+	--bg-surface: #ffffff;
+	--bg-elevated: #fae8ed;
+	--bg-input: #fffafc;
+	--bg-hover: #f5dde4;
+	--border: #f0d0d8;
+	--border-subtle: #f8e0e8;
+	--text-primary: #3a1f28;
+	--text-secondary: #6e4858;
+	--text-muted: #a87888;
+	--accent: #d4546e;
+	--accent-hover: #c44058;
+	--accent-muted: rgba(212,84,110,.08);
+	--accent-subtle-bg: rgba(212,84,110,.04);
+	--accent-dim: #b84058;
+	--secondary: #8c5870;
+	--success: #6ba868;
+	--success-muted: rgba(107,168,104,.1);
+	--warning: #d09030;
+	--warning-muted: rgba(208,144,48,.1);
+	--danger: #c43048;
+	--danger-muted: rgba(196,48,72,.08);
+	--info: #6890b0;
+	--sidebar-bg: #ffffff;
+	--sidebar-active: #fae8ed;
+	--sidebar-hover: #fdf0f3;
+	--toggle-bg: #e8c8d0;
+	--toggle-active: #d4546e;
+	--console-bg: #2a1820;
+	--console-text: #c8a8b4;
+	--console-text-muted: #806068;
+	--shadow-sm: 0 1px 2px rgba(180,80,110,.06);
+	--shadow-md: 0 4px 12px rgba(180,80,110,.08);
+	--shadow-lg: 0 12px 28px rgba(180,80,110,.12);
+	--glow-accent: none;
+	--radius-sm: 8px;
+	--radius-md: 12px;
+	--radius-lg: 16px;
+	--radius-xl: 20px;
+	--radius-full: 9999px;
+	--toggle-radius: 10px;
+	--toggle-knob-radius: 50%;
+	--toggle-knob-shadow: 0 1px 3px rgba(180,80,110,.15);
+	--logo-bg: linear-gradient(135deg, #ffb0c4, #d4546e);
+	--logo-shadow: 0 4px 14px rgba(212,84,110,.18);
+	--logo-radius: 10px;
+	--logo-clip: none;
+}
+
+/* ── 8. Deep Sea — Bioluminescent Abyss ── */
+:root.theme-deep-sea {
+	color-scheme: dark;
+	--font-label: 'Inter', -apple-system, sans-serif;
+	--bg-base: #04101a;
+	--bg-surface: #08182a;
+	--bg-elevated: #0e2238;
+	--bg-input: #06121e;
+	--bg-hover: #122c44;
+	--border: #1c3a52;
+	--border-subtle: #142c40;
+	--text-primary: #d8eef8;
+	--text-secondary: #80a0b8;
+	--text-muted: #486878;
+	--accent: #00d4d4;
+	--accent-hover: #20e8e8;
+	--accent-muted: rgba(0,212,212,.1);
+	--accent-subtle-bg: rgba(0,212,212,.04);
+	--accent-dim: #00b0b0;
+	--secondary: #80a8e0;
+	--success: #40e0a0;
+	--success-muted: rgba(64,224,160,.1);
+	--warning: #f0c060;
+	--warning-muted: rgba(240,192,96,.1);
+	--danger: #ff7888;
+	--danger-muted: rgba(255,120,136,.08);
+	--info: #80a8e0;
+	--sidebar-bg: #06121e;
+	--sidebar-active: #0e2238;
+	--sidebar-hover: #0a1c30;
+	--toggle-bg: #1c3a52;
+	--toggle-active: #00d4d4;
+	--console-bg: #020a14;
+	--console-text: #80a0b8;
+	--console-text-muted: #486878;
+	--shadow-sm: 0 1px 4px rgba(0,0,0,.4);
+	--shadow-md: 0 4px 16px rgba(0,40,60,.4);
+	--shadow-lg: 0 12px 36px rgba(0,40,60,.5);
+	--glow-accent: 0 0 28px rgba(0,212,212,.15);
+	--radius-sm: 8px;
+	--radius-md: 12px;
+	--radius-lg: 14px;
+	--radius-xl: 18px;
+	--radius-full: 9999px;
+	--toggle-radius: 10px;
+	--toggle-knob-radius: 50%;
+	--toggle-knob-shadow: 0 1px 4px rgba(0,0,0,.4);
+	--logo-bg: linear-gradient(135deg, #00d4d4, #80a8e0);
+	--logo-shadow: 0 0 22px rgba(0,212,212,.22);
+	--logo-radius: 10px;
+	--logo-clip: none;
+}
+
+/* ── 9. Mono Slate — Minimal Monochrome ── */
+:root.theme-mono {
+	color-scheme: dark;
+	--font-label: 'Inter', -apple-system, sans-serif;
+	--bg-base: #0e0e10;
+	--bg-surface: #18181a;
+	--bg-elevated: #222226;
+	--bg-input: #131315;
+	--bg-hover: #2a2a2e;
+	--border: #2e2e32;
+	--border-subtle: #1f1f22;
+	--text-primary: #f0f0f2;
+	--text-secondary: #a0a0a4;
+	--text-muted: #606064;
+	--accent: #4a90ff;
+	--accent-hover: #68a4ff;
+	--accent-muted: rgba(74,144,255,.1);
+	--accent-subtle-bg: rgba(74,144,255,.04);
+	--accent-dim: #3878dd;
+	--secondary: #a0a0a4;
+	--success: #50d090;
+	--success-muted: rgba(80,208,144,.1);
+	--warning: #f0c060;
+	--warning-muted: rgba(240,192,96,.1);
+	--danger: #ff6068;
+	--danger-muted: rgba(255,96,104,.08);
+	--info: #4a90ff;
+	--sidebar-bg: #131315;
+	--sidebar-active: #222226;
+	--sidebar-hover: #1c1c1e;
+	--toggle-bg: #2e2e32;
+	--toggle-active: #4a90ff;
+	--console-bg: #08080a;
+	--console-text: #a0a0a4;
+	--console-text-muted: #606064;
+	--shadow-sm: 0 1px 2px rgba(0,0,0,.4);
+	--shadow-md: 0 4px 12px rgba(0,0,0,.5);
+	--shadow-lg: 0 12px 32px rgba(0,0,0,.6);
+	--glow-accent: none;
+	--radius-sm: 6px;
+	--radius-md: 8px;
+	--radius-lg: 10px;
+	--radius-xl: 12px;
+	--radius-full: 9999px;
+	--toggle-radius: 8px;
+	--toggle-knob-radius: 50%;
+	--toggle-knob-shadow: 0 1px 3px rgba(0,0,0,.5);
+	--logo-bg: #4a90ff;
+	--logo-shadow: none;
+	--logo-radius: 6px;
+	--logo-clip: none;
+}
+
+
 /* ══════════════════════════════════════════════════
    THEME-SPECIFIC STRUCTURAL OVERRIDES
    ══════════════════════════════════════════════════ */
@@ -350,11 +563,10 @@ body {
 /* Tooltip */
 [data-tooltip] { position: relative; }
 [data-tooltip]::after {
-	content: attr(data-tooltip);
-	position: absolute;
-	bottom: calc(100% + 8px);
-	left: 50%;
-	transform: translateX(-50%) translateY(4px);
+	display: none;
+}
+.global-tooltip {
+	position: fixed;
 	padding: 5px 10px;
 	border-radius: var(--radius-sm);
 	font-size: 11px;
@@ -367,14 +579,8 @@ body {
 	color: var(--text-secondary);
 	border: 1px solid var(--border);
 	box-shadow: var(--shadow-md);
-	opacity: 0;
 	pointer-events: none;
-	transition: opacity 0.15s ease, transform 0.15s ease;
-	z-index: 100;
-}
-[data-tooltip]:hover::after {
-	opacity: 1;
-	transform: translateX(-50%) translateY(0);
+	z-index: 10000;
 }
 
 /* Focus */

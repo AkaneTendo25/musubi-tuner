@@ -16,13 +16,98 @@ import logging
 import math
 import random
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, TypedDict
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 logger = logging.getLogger(__name__)
+
+
+class SelfFlowAudioView(TypedDict):
+    student_noisy_audio: torch.Tensor
+    student_audio_timesteps: torch.Tensor
+    teacher_noisy_audio: torch.Tensor
+    teacher_audio_timesteps: torch.Tensor
+    audio_mask: torch.Tensor
+    audio_masked_token_ratio: torch.Tensor
+    audio_tau_mean: torch.Tensor
+    audio_tau_min_mean: torch.Tensor
+
+
+def build_self_flow_video_context(
+    *,
+    base_sigmas: torch.Tensor,
+    alt_sigmas: torch.Tensor,
+    teacher_noisy_model_input: torch.Tensor,
+    teacher_model_timesteps: torch.Tensor,
+    dual_timestep_mask: torch.Tensor,
+    tau_tokens: torch.Tensor,
+    tau_min: torch.Tensor,
+    num_latent_frames: int,
+    latent_height: int,
+    latent_width: int,
+) -> Dict[str, Any]:
+    """Build the per-step video Self-Flow context captured by the trainer."""
+    return {
+        "base_sigmas": base_sigmas.detach(),
+        "alt_sigmas": alt_sigmas.detach(),
+        "teacher_noisy_model_input": teacher_noisy_model_input.detach(),
+        "teacher_model_timesteps": teacher_model_timesteps.detach(),
+        "dual_timestep_mask": dual_timestep_mask.detach(),
+        "masked_token_ratio": float(dual_timestep_mask.float().mean().item()),
+        "tau_mean": float(tau_tokens.mean().item()),
+        "tau_min_mean": float(tau_min.mean().item()),
+        "num_latent_frames": int(num_latent_frames),
+        "latent_height": int(latent_height),
+        "latent_width": int(latent_width),
+    }
+
+
+def prepare_self_flow_audio_view(
+    *,
+    audio_latents: torch.Tensor,
+    audio_noise: torch.Tensor,
+    base_audio_sigmas: torch.Tensor,
+    alt_audio_sigmas: torch.Tensor,
+    mask_ratio: float,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> SelfFlowAudioView:
+    """Build tokenwise student audio and cleaner teacher audio views for Self-Flow."""
+    if audio_latents.dim() != 4:
+        raise ValueError(f"Expected audio_latents to be 4D [B, C, T, F], got {tuple(audio_latents.shape)}")
+    batch_size = int(audio_latents.shape[0])
+    audio_tokens = int(audio_latents.shape[2])
+    if audio_tokens <= 0:
+        raise ValueError("Self-Flow audio view requires at least one audio token")
+
+    base = base_audio_sigmas.to(device=device, dtype=torch.float32).view(batch_size, -1)[:, :1]
+    alt = alt_audio_sigmas.to(device=device, dtype=torch.float32).view(batch_size, -1)[:, :1]
+    mask_ratio = max(0.0, min(0.5, float(mask_ratio)))
+    token_mask = torch.rand((batch_size, audio_tokens), device=device, dtype=torch.float32) < mask_ratio
+
+    student_token_sigmas = torch.where(token_mask, alt.expand(-1, audio_tokens), base.expand(-1, audio_tokens))
+    teacher_sigmas = torch.minimum(base, alt)
+    student_sigma_grid = student_token_sigmas[:, None, :, None].to(device=device, dtype=dtype)
+    teacher_sigma_grid = teacher_sigmas[:, :, None, None].to(device=device, dtype=dtype)
+
+    audio_latents_f = audio_latents.to(device=device, dtype=dtype)
+    audio_noise_f = audio_noise.to(device=device, dtype=dtype)
+    student_noisy_audio = (1.0 - student_sigma_grid) * audio_latents_f + student_sigma_grid * audio_noise_f
+    teacher_noisy_audio = (1.0 - teacher_sigma_grid) * audio_latents_f + teacher_sigma_grid * audio_noise_f
+
+    return {
+        "student_noisy_audio": student_noisy_audio,
+        "student_audio_timesteps": student_token_sigmas.to(device=device, dtype=dtype),
+        "teacher_noisy_audio": teacher_noisy_audio,
+        "teacher_audio_timesteps": teacher_sigmas.to(device=device, dtype=dtype),
+        "audio_mask": token_mask,
+        "audio_masked_token_ratio": token_mask.to(dtype=torch.float32).mean(),
+        "audio_tau_mean": student_token_sigmas.mean(),
+        "audio_tau_min_mean": teacher_sigmas.mean(),
+    }
 
 
 @dataclass
@@ -554,11 +639,10 @@ class SelfFlowModule:
 
     def on_step(self, global_step: int) -> None:
         scale = self._schedule_scale(global_step)
-        # Schedule only applies to temporal/delta lambdas (they are the ones named
-        # temporal_schedule / temporal_warmup_steps / temporal_max_steps).
-        # Base self-flow and audio lambdas remain constant throughout training.
-        self._current_lambda_self_flow = float(self.config.lambda_self_flow)
-        self._current_lambda_audio = float(self.config.lambda_audio)
+        # Apply the schedule to every Self-Flow regularization term so the
+        # logged lambdas match the documented effective weights.
+        self._current_lambda_self_flow = float(self.config.lambda_self_flow) * scale
+        self._current_lambda_audio = float(self.config.lambda_audio) * scale
         self._current_lambda_temporal = float(self.config.lambda_temporal) * scale
         self._current_lambda_delta = float(self.config.lambda_delta) * scale
 

@@ -186,14 +186,17 @@ def line_to_prompt_dict(line: str) -> dict:
                 prompt_dict["sample_steps"] = max(1, min(1000, int(m.group(1))))
                 continue
 
-            # m = re.match(r"l ([\d\.]+)", parg, re.IGNORECASE)
-            # if m:  # scale
-            #     prompt_dict["scale"] = float(m.group(1))
-            #     continue
-            # m = re.match(r"n (.+)", parg, re.IGNORECASE)
-            # if m:  # negative prompt
-            #     prompt_dict["negative_prompt"] = m.group(1)
-            #     continue
+            m = re.match(r"l ([\d\.]+)", parg, re.IGNORECASE)
+            if m:  # guidance scale
+                prompt_dict["guidance_scale"] = float(m.group(1))
+                continue
+            m = re.match(r"n (.+)", parg, re.IGNORECASE)
+            if m:  # negative prompt
+                negative_prompt = m.group(1).strip()
+                if len(negative_prompt) >= 2 and negative_prompt[0] == negative_prompt[-1] and negative_prompt[0] in "'\"":
+                    negative_prompt = negative_prompt[1:-1]
+                prompt_dict["negative_prompt"] = negative_prompt
+                continue
 
         except ValueError as ex:
             logger.error(f"Exception in parsing / 解析エラー: {parg}")

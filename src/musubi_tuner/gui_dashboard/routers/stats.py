@@ -35,6 +35,9 @@ class TrainingStats(BaseModel):
     total_epochs: float | None
     effective_batch_size: int
     estimated_time_hours: float | None
+    estimated_step_time_sec: float | None = None
+    estimated_steps_per_sec: float | None = None
+    estimated_time_source: str | None = None
     checkpoint_size_mb: float
     total_checkpoints: int
     total_storage_gb: float
@@ -55,6 +58,90 @@ class ProjectStats(BaseModel):
     dataset: DatasetStats | None
     training: TrainingStats | None
     vram: VRAMStats | None
+
+
+def _coerce_int(value, default: int) -> int:
+    """Coerce nullable or string-like values to int with a safe fallback."""
+    if value in (None, ""):
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _coerce_float(value, default: float) -> float:
+    """Coerce nullable or string-like values to float with a safe fallback."""
+    if value in (None, ""):
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _first_training_dataset(config: dict) -> dict:
+    """Return the primary dataset used for training/stat estimates."""
+    datasets = config.get('dataset', {}).get('datasets', [])
+    if not datasets:
+        return {}
+    return next((d for d in datasets if d.get('type') in ('video', 'image')), datasets[0])
+
+
+def _estimate_training_step_time_sec(config: dict) -> float | None:
+    """Estimate wall-clock seconds per optimizer step from the current config."""
+    try:
+        training = config.get('training', {})
+        dataset = _first_training_dataset(config)
+
+        mode = str(training.get('ltx2_mode', 'video')).lower()
+        res_w = max(_coerce_int(dataset.get('resolution_w', 768), 768), 64)
+        res_h = max(_coerce_int(dataset.get('resolution_h', 512), 512), 64)
+        frames = max(_coerce_int(dataset.get('target_frames', 33), 33), 1)
+        batch_size = max(_coerce_int(dataset.get('batch_size', training.get('train_batch_size', 1)), 1), 1)
+        grad_accum = max(_coerce_int(training.get('gradient_accumulation_steps', 1), 1), 1)
+
+        pixel_frame_scale = (res_w * res_h * frames) / (768 * 512 * 33)
+        step_time = 2.35 * max(pixel_frame_scale, 0.25) * batch_size * grad_accum
+
+        if mode == 'av':
+            step_time *= 1.35
+        elif mode == 'audio':
+            step_time *= 0.55
+
+        if training.get('gradient_checkpointing', True):
+            step_time *= 1.20
+        if training.get('blockwise_checkpointing'):
+            step_time *= 1.08
+        if training.get('gradient_checkpointing_cpu_offload'):
+            step_time *= 1.15
+        if training.get('fp8_w8a8'):
+            step_time *= 0.88
+        elif training.get('fp8_base'):
+            step_time *= 0.95
+        if training.get('nf4_base'):
+            step_time *= 1.08
+        if training.get('self_flow'):
+            step_time *= 1.22
+        if training.get('blank_preservation'):
+            step_time *= 1.12
+        if training.get('dop'):
+            step_time *= 1.10
+        if training.get('audio_dop'):
+            step_time *= 1.10
+        if training.get('prior_divergence'):
+            step_time *= 1.05
+        if training.get('crepa'):
+            step_time *= 1.08
+
+        sample_every_n_steps = _coerce_int(training.get('sample_every_n_steps', 0), 0)
+        if sample_every_n_steps:
+            step_time += 5.0 / sample_every_n_steps
+
+        return max(step_time, 0.05)
+    except Exception as e:
+        logger.debug(f"Failed to estimate training step time: {e}")
+        return None
 
 
 def _scan_dataset(dataset_path: str) -> DatasetStats | None:
@@ -181,10 +268,11 @@ def _calculate_training_stats(config: dict, dataset_stats: DatasetStats | None) 
     """Calculate training statistics from config."""
     try:
         training = config.get('training', {})
+        dataset = _first_training_dataset(config)
 
         # Batch size
-        batch_size = training.get('train_batch_size', 1)
-        grad_accum = training.get('gradient_accumulation_steps', 1)
+        batch_size = max(_coerce_int(dataset.get('batch_size', training.get('train_batch_size', 1)), 1), 1)
+        grad_accum = max(_coerce_int(training.get('gradient_accumulation_steps', 1), 1), 1)
         effective_batch_size = batch_size * grad_accum
 
         # Steps per epoch
@@ -193,37 +281,28 @@ def _calculate_training_stats(config: dict, dataset_stats: DatasetStats | None) 
             steps_per_epoch = max(1, dataset_stats.total_items // effective_batch_size)
 
         # Total epochs
-        max_steps = training.get('max_train_steps')
+        max_steps = _coerce_int(training.get('max_train_steps', 0), 0)
         total_epochs = None
         if max_steps and steps_per_epoch:
             total_epochs = max_steps / steps_per_epoch
 
-        # Estimated time (very rough estimate: 1-3 sec per step depending on config)
+        # Estimated time from the same shape/config heuristic used for iteration time.
         estimated_time_hours = None
+        estimated_step_time_sec = _estimate_training_step_time_sec(config)
+        estimated_steps_per_sec = (1.0 / estimated_step_time_sec) if estimated_step_time_sec else None
         if max_steps:
-            # Base time per step
-            time_per_step = 2.0  # seconds
-
-            # Adjust based on settings
-            if training.get('gradient_checkpointing', True):
-                time_per_step *= 1.2  # Slower with grad checkpointing
-            if training.get('sample_every_n_steps'):
-                # Add sampling overhead
-                sample_freq = training['sample_every_n_steps']
-                time_per_step += (5.0 / sample_freq)  # ~5 sec per sample
-
-            estimated_time_hours = (max_steps * time_per_step) / 3600
+            estimated_time_hours = (max_steps * (estimated_step_time_sec or 0)) / 3600
 
         # Checkpoint size
-        network_dim = training.get('network_dim', 16)
+        network_dim = max(_coerce_int(training.get('network_dim', 16), 16), 1)
         # Rough estimate: LoRA size depends on rank and target modules
         # LTX2 full LoRA is roughly: dim * 2 * hidden_dim * num_layers * 4 bytes
         # For dim=16, roughly 50-100MB
         checkpoint_size_mb = network_dim * 5  # Very rough estimate
 
         # Total checkpoints
-        save_every_n_steps = training.get('save_every_n_steps')
-        save_every_n_epochs = training.get('save_every_n_epochs')
+        save_every_n_steps = _coerce_int(training.get('save_every_n_steps', 0), 0)
+        save_every_n_epochs = _coerce_int(training.get('save_every_n_epochs', 0), 0)
         total_checkpoints = 1  # Final checkpoint
 
         if save_every_n_steps and max_steps:
@@ -232,8 +311,8 @@ def _calculate_training_stats(config: dict, dataset_stats: DatasetStats | None) 
             total_checkpoints += int(total_epochs) // save_every_n_epochs
 
         # Apply keep_last limits
-        keep_last_steps = training.get('save_last_n_steps')
-        keep_last_epochs = training.get('save_last_n_epochs')
+        keep_last_steps = _coerce_int(training.get('save_last_n_steps', 0), 0)
+        keep_last_epochs = _coerce_int(training.get('save_last_n_epochs', 0), 0)
         if keep_last_steps:
             total_checkpoints = min(total_checkpoints, keep_last_steps + 1)
         if keep_last_epochs:
@@ -246,6 +325,9 @@ def _calculate_training_stats(config: dict, dataset_stats: DatasetStats | None) 
             total_epochs=total_epochs,
             effective_batch_size=effective_batch_size,
             estimated_time_hours=estimated_time_hours,
+            estimated_step_time_sec=round(estimated_step_time_sec, 3) if estimated_step_time_sec else None,
+            estimated_steps_per_sec=round(estimated_steps_per_sec, 4) if estimated_steps_per_sec else None,
+            estimated_time_source='heuristic' if estimated_step_time_sec else None,
             checkpoint_size_mb=checkpoint_size_mb,
             total_checkpoints=total_checkpoints,
             total_storage_gb=total_storage_gb
@@ -268,29 +350,30 @@ def _calculate_vram_stats(config: dict) -> VRAMStats | None:
     """
     try:
         training = config.get('training', {})
-        datasets = config.get('dataset', {}).get('datasets', [])
-        ds = next((d for d in datasets if d.get('type') in ('video', 'image')), datasets[0] if datasets else {})
+        ds = _first_training_dataset(config)
 
         # ── DiT weights ──
-        ltx_version = str(training.get('ltx_version', '2.0'))
+        ltx_version = str(training.get('ltx_version', '2.3'))
         dit_bf16 = 42.0 if ltx_version == '2.3' else 39.0
         is_fp8 = bool(training.get('fp8_base'))
+        is_w8a8 = bool(training.get('fp8_w8a8'))
         is_nf4 = bool(training.get('nf4_base'))
         dit_base = (dit_bf16 / 4) if is_nf4 else (dit_bf16 / 2) if is_fp8 else dit_bf16
 
         total_blocks = 48
-        blocks_to_swap = min(max(int(training.get('blocks_to_swap', 0)), 0), total_blocks - 1)
+        blocks_to_swap = min(max(_coerce_int(training.get('blocks_to_swap', 0), 0), 0), total_blocks - 1)
         swap_savings = blocks_to_swap * (dit_base / total_blocks) * 0.95
         model_size_gb = max(dit_base - swap_savings, 1.0)
 
         # ── LoRA weights ──
-        rank = max(int(training.get('network_dim', 16)), 1)
-        mode = str(training.get('ltx2_mode', 'video'))
+        rank = max(_coerce_int(training.get('network_dim', 16), 16), 1)
+        mode = str(training.get('ltx2_mode', 'video')).lower()
         is_av = mode == 'av'
         lora_base_per_rank = (12.75 if is_av else 6.0) / 1024  # GB per rank
         preset_mult = {
             't2v': 1.0, 'v2v': 1.44, 'video_sa': 0.37, 'video_sa_ff': 0.56,
-            'video_sa_ca_ff': 0.74, 'audio': 0.52, 'audio_ref_only_ic': 0.63, 'full': 2.1,
+            'video_sa_ca_ff': 0.74, 'audio': 0.37, 'audio_v2a': 0.52, 'audio_ref_only_ic': 0.63,
+            'av_ic': 1.44, 'video_ref_only_av': 1.44, 'full': 2.1,
         }.get(training.get('lora_target_preset'), 1.0)
         lora_size_gb = rank * lora_base_per_rank * preset_mult
 
@@ -303,10 +386,10 @@ def _calculate_vram_stats(config: dict) -> VRAMStats | None:
         optimizer_size_gb = (lora_param_count * opt_bytes) / (1024 ** 3)
 
         # ── Activations ──
-        res_w = max(int(ds.get('resolution_w', 768)), 64)
-        res_h = max(int(ds.get('resolution_h', 512)), 64)
-        frames = max(int(ds.get('target_frames', 33)), 1)
-        batch_size = max(int(ds.get('batch_size', 1)), 1)
+        res_w = max(_coerce_int(ds.get('resolution_w', 768), 768), 64)
+        res_h = max(_coerce_int(ds.get('resolution_h', 512), 512), 64)
+        frames = max(_coerce_int(ds.get('target_frames', 33), 33), 1)
+        batch_size = max(_coerce_int(ds.get('batch_size', 1), 1), 1)
 
         # Correct VAE compression factors
         latent_f = max(1, (frames - 1) // 8 + 1)
@@ -314,8 +397,8 @@ def _calculate_vram_stats(config: dict) -> VRAMStats | None:
         latent_w = max(1, res_w // 32)
         seq_len = latent_f * latent_h * latent_w
 
-        hidden_dim = 4096
-        bytes_per_val = 1 if is_fp8 else 2
+        hidden_dim = 2048 if mode == 'audio' else 4096
+        bytes_per_val = 1 if is_w8a8 else 2
         grad_ckpt = training.get('gradient_checkpointing', True)
         blockwise = bool(training.get('blockwise_checkpointing'))
 
@@ -325,7 +408,7 @@ def _calculate_vram_stats(config: dict) -> VRAMStats | None:
         activations_gb = (per_layer_bytes * effective_layers) / (1024 ** 3)
         if is_av:
             activations_gb *= 1.25
-        if int(training.get('ffn_chunk_size', 0)) > 0:
+        if _coerce_int(training.get('ffn_chunk_size', 0), 0) > 0:
             activations_gb *= 0.90
         if training.get('split_attn_mode') or training.get('split_attn_target'):
             activations_gb *= 0.92
@@ -344,7 +427,7 @@ def _calculate_vram_stats(config: dict) -> VRAMStats | None:
         grads_gb = lora_size_gb
 
         # ── Gradient accumulation ──
-        grad_accum = max(int(training.get('gradient_accumulation_steps', 1)), 1)
+        grad_accum = max(_coerce_int(training.get('gradient_accumulation_steps', 1), 1), 1)
         grad_accum_gb = grads_gb * 0.4 if grad_accum > 1 else 0
 
         # ── Preservation / DOP ──
@@ -361,10 +444,20 @@ def _calculate_vram_stats(config: dict) -> VRAMStats | None:
         # ── Self-Flow ──
         self_flow_gb = 0
         if training.get('self_flow'):
-            teacher_on_gpu = not training.get('self_flow_offload_teacher_params')
-            self_flow_gb += lora_size_gb if teacher_on_gpu else 0
-            self_flow_gb += 0.02  # projector MLP
-            self_flow_gb += activations_gb * 0.10
+            teacher_mode = str(training.get('self_flow_teacher_mode', 'base')).lower()
+            if teacher_mode == 'ema':
+                self_flow_gb += lora_size_gb
+            elif teacher_mode == 'partial_ema':
+                self_flow_gb += max(lora_size_gb / total_blocks, 0.01)
+
+            has_audio_projector = (
+                mode in {'av', 'audio'}
+                and _coerce_float(training.get('self_flow_lambda_audio', 0.0), 0.0) > 0.0
+            )
+            self_flow_gb += 0.03 if has_audio_projector else 0.02
+
+            feature_factor = 0.03 if training.get('self_flow_offload_teacher_features') else 0.10
+            self_flow_gb += activations_gb * feature_factor
 
         # ── CREPA ──
         crepa_gb = 0
@@ -379,12 +472,14 @@ def _calculate_vram_stats(config: dict) -> VRAMStats | None:
         if training.get('sample_with_offloading'):
             peak_sampling_gb *= 0.6
 
+        overhead_gb = grad_accum_gb + preservation_gb + self_flow_gb + crepa_gb
         breakdown = {
             'model': round(model_size_gb, 2),
             'lora': round(lora_size_gb, 2),
             'optimizer': round(optimizer_size_gb, 2),
             'gradients': round(grads_gb, 2),
             'activations': round(activations_gb, 2),
+            'overhead': round(overhead_gb, 2),
         }
 
         return VRAMStats(

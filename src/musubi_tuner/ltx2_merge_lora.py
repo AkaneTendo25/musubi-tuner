@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import re
 from contextlib import ExitStack
 from pathlib import Path
 from typing import Dict, Iterable, List, Literal, Tuple
@@ -74,6 +75,16 @@ def _parse_args() -> argparse.Namespace:
         help=(
             "Orthogonal merge only: target rank before clipping by matrix dimensions. "
             "'sum'=rank1+rank2, 'max'=max(rank1,rank2), 'min'=min(rank1,rank2)."
+        ),
+    )
+    parser.add_argument(
+        "--preserve_first_match_pattern",
+        type=str,
+        default=None,
+        help=(
+            "Regex matched against LoRA module prefixes. For matching modules, keep only the first input "
+            "LoRA that contains the module and ignore later LoRAs. Useful when merging multiple LoRAs "
+            "that overlap on certain modules and only the first input's weights should win for those modules."
         ),
     )
     return parser.parse_args()
@@ -262,6 +273,8 @@ def main() -> None:
     merge_method = str(args.merge_method)
     orthogonal_k_fraction = float(args.orthogonal_k_fraction)
     orthogonal_rank_mode = str(args.orthogonal_rank_mode)
+    preserve_first_match_pattern = str(args.preserve_first_match_pattern or "")
+    preserve_first_match_regex = re.compile(preserve_first_match_pattern) if preserve_first_match_pattern else None
 
     if not (0.0 <= orthogonal_k_fraction <= 1.0):
         raise ValueError(f"--orthogonal_k_fraction must be in [0, 1]. Got: {orthogonal_k_fraction}")
@@ -277,6 +290,8 @@ def main() -> None:
             orthogonal_k_fraction,
             orthogonal_rank_mode,
         )
+    if preserve_first_match_regex is not None:
+        logger.info("Preserving first input for modules matching: %s", preserve_first_match_pattern)
 
     with ExitStack() as stack:
         readers = [stack.enter_context(safe_open(path, framework="pt", device="cpu")) for path in input_paths]
@@ -346,6 +361,16 @@ def main() -> None:
 
             if not module_parts:
                 continue
+            if preserve_first_match_regex is not None and preserve_first_match_regex.search(module):
+                first_reader_idx = min(reader_idx for reader_idx, _, _ in module_parts)
+                if len(module_parts) > 1:
+                    logger.debug(
+                        "Preserving first matching module '%s' from input %d; ignoring %d later part(s).",
+                        module,
+                        first_reader_idx,
+                        len(module_parts) - 1,
+                    )
+                module_parts = [part for part in module_parts if part[0] == first_reader_idx]
 
             used_orthogonal = False
             merged_a = None
@@ -406,6 +431,8 @@ def main() -> None:
     if merge_method == "orthogonal":
         metadata["orthogonal_k_fraction"] = str(orthogonal_k_fraction)
         metadata["orthogonal_rank_mode"] = orthogonal_rank_mode
+    if preserve_first_match_pattern:
+        metadata["preserve_first_match_pattern"] = preserve_first_match_pattern
     mem_eff_save_file(merged_sd, str(output_path), metadata=metadata)
     logger.info("Saved merged LoRA: %s", output_path)
 

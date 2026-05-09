@@ -4,11 +4,16 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import shlex
+import subprocess
+from pathlib import Path
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, Body, HTTPException, Query, Request
 from sse_starlette.sse import EventSourceResponse
 
+from musubi_tuner.gui_dashboard.cli_defaults import get_ltx2_training_output_dir_default
 from musubi_tuner.gui_dashboard.command_builder import (
     build_cache_dino_cmd,
     build_cache_latents_cmd,
@@ -18,6 +23,8 @@ from musubi_tuner.gui_dashboard.command_builder import (
     build_training_cmd,
 )
 from musubi_tuner.gui_dashboard.process_manager import ProcessManager
+from musubi_tuner.gui_dashboard.project_schema import ProjectConfig
+from musubi_tuner.gui_dashboard.validation import validate_process_config
 
 router = APIRouter(tags=["processes"])
 
@@ -58,11 +65,88 @@ def _build_cmd(proc_type: str, config):
         raise HTTPException(status_code=400, detail=f"Unknown type: {proc_type}")
 
 
+def _render_command_script(cmd: list[str], cwd: str | None = None) -> str:
+    if os.name == "nt":
+        lines = ["@echo off"]
+        if cwd:
+            lines.append(f"cd /d {subprocess.list2cmdline([str(cwd)])}")
+        lines.append(subprocess.list2cmdline([str(part) for part in cmd]))
+        return "\r\n".join(lines) + "\r\n"
+
+    lines = ["#!/usr/bin/env sh", "set -e"]
+    if cwd:
+        lines.append(f"cd {shlex.quote(str(cwd))}")
+    lines.append(shlex.join([str(part) for part in cmd]))
+    return "\n".join(lines) + "\n"
+
+
+def _validate_process_or_raise(proc_type: str, config) -> dict:
+    report = validate_process_config(proc_type, config)
+    if not report["ok"]:
+        raise HTTPException(status_code=422, detail=report)
+    return report
+
+
+def _get_training_run_dir(config: ProjectConfig) -> Optional[Path]:
+    if not config.project_dir:
+        return None
+
+    output_dir = config.training.output_dir or get_ltx2_training_output_dir_default()
+    run_dir = Path(output_dir)
+    if not run_dir.is_absolute():
+        run_dir = Path(config.project_dir) / run_dir
+    return run_dir
+
+
+def _has_local_autoresume_state(config: ProjectConfig) -> bool:
+    run_dir = _get_training_run_dir(config)
+    if run_dir is None or not run_dir.is_dir():
+        return False
+
+    for path in run_dir.iterdir():
+        if path.is_dir() and path.name.endswith("-state") and (path / "scheduler.bin").exists():
+            return True
+    return False
+
+
+def _training_is_resume(config: ProjectConfig) -> bool:
+    t = config.training
+    if t.resume or t.resume_from_huggingface:
+        return True
+    return bool(t.autoresume and _has_local_autoresume_state(config))
+
+
+def _clear_training_dashboard_files(config: ProjectConfig) -> None:
+    run_dir = _get_training_run_dir(config)
+    if run_dir is None:
+        return
+
+    dashboard_dir = run_dir / "dashboard"
+    for filename in ("metrics.parquet", "status.json", "events.json"):
+        path = dashboard_dir / filename
+        try:
+            if path.exists():
+                os.remove(path)
+        except OSError:
+            pass
+
+
+@router.post("/api/processes/{proc_type}/validate")
+async def validate_process(proc_type: str, request: Request, project_config: ProjectConfig | None = Body(default=None)):
+    _validate_type(proc_type)
+    config = project_config or _get_config(request)
+    return validate_process_config(proc_type, config)
+
+
 @router.post("/api/processes/{proc_type}/start")
 async def start_process(proc_type: str, request: Request):
     _validate_type(proc_type)
     pm = _get_pm(request)
     config = _get_config(request)
+    _validate_process_or_raise(proc_type, config)
+
+    if proc_type == "training" and not _training_is_resume(config):
+        _clear_training_dashboard_files(config)
 
     try:
         cmd = _build_cmd(proc_type, config)
@@ -118,7 +202,7 @@ async def get_command_preview(proc_type: str, request: Request):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to build command: {e}")
 
-    return {"command": " ".join(cmd)}
+    return {"command": _render_command_script(cmd, cwd=config.project_dir or None)}
 
 
 @router.get("/api/processes/status")
@@ -129,12 +213,11 @@ async def get_all_process_statuses(request: Request):
 
 @router.get("/sse/processes")
 async def sse_process_stream(request: Request):
-    """SSE stream that emits process status changes and new log lines."""
+    """SSE stream that emits process status changes."""
     pm = _get_pm(request)
 
     async def event_generator():
         last_statuses = {}
-        last_log_counts = {t: 0 for t in VALID_TYPES}
 
         while True:
             await asyncio.sleep(1)
@@ -144,20 +227,5 @@ async def sse_process_stream(request: Request):
             if current != last_statuses:
                 last_statuses = current
                 yield {"event": "status", "data": json.dumps(current)}
-
-            # Check for new log lines
-            for proc_type in VALID_TYPES:
-                logs = pm.get_logs(proc_type)
-                count = len(logs)
-                if count > last_log_counts[proc_type]:
-                    new_lines = logs[last_log_counts[proc_type]:]
-                    last_log_counts[proc_type] = count
-                    yield {
-                        "event": "logs",
-                        "data": json.dumps({
-                            "type": proc_type,
-                            "lines": new_lines,
-                        }),
-                    }
 
     return EventSourceResponse(event_generator())

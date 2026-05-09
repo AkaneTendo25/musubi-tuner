@@ -8,6 +8,17 @@
 		<link rel="preconnect" href="https://fonts.googleapis.com" />
 		<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
 		<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+		<script>
+			(() => {
+				const themes = ['warm-terminal', 'aurora', 'matcha', 'brutalist', 'twilight', 'synthwave', 'sakura', 'deep-sea', 'mono'];
+				try {
+					const theme = localStorage.getItem('theme');
+					if (theme && themes.includes(theme) && theme !== 'warm-terminal') {
+						document.documentElement.classList.add(`theme-${theme}`);
+					}
+				} catch {}
+			})();
+		</script>
 		%sveltekit.head%
 	</head>
 	<body data-sveltekit-prerender="false">

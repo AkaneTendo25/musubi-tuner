@@ -63,7 +63,7 @@ class SliderTargetConfig:
 
 @dataclass
 class SliderConfig:
-    mode: str  # "text" or "reference"
+    mode: str  # "text", "reference", or "ic_reference"
     reference_modality: str = "video"  # "video" or "audio" for reference mode
     targets: List[SliderTargetConfig] = field(default_factory=list)
     guidance_strength: float = 1.0
@@ -72,6 +72,7 @@ class SliderConfig:
     pos_cache_dir: Optional[str] = None
     neg_cache_dir: Optional[str] = None
     text_cache_dir: Optional[str] = None  # defaults to pos_cache_dir if not set
+    reference_cache_dir: Optional[str] = None  # required for ic_reference (v2v)
 
 
 def load_slider_config(path: str) -> SliderConfig:
@@ -83,7 +84,16 @@ def load_slider_config(path: str) -> SliderConfig:
     reference_modality = str(raw.get("reference_modality", "video")).lower()
     guidance_strength = float(raw.get("guidance_strength", 1.0))
     frame_rate = int(raw.get("frame_rate", 25))
-    sample_slider_range = raw.get("sample_slider_range", [-2.0, -1.0, 0.0, 1.0, 2.0])
+    default_slider_range = [-2.0, -1.0, 0.0, 1.0, 2.0]
+    sample_slider_range = raw.get("sample_slider_range", default_slider_range)
+    if isinstance(sample_slider_range, (int, float)):
+        sample_slider_range = [float(sample_slider_range)]
+    elif isinstance(sample_slider_range, str):
+        sample_slider_range = [float(v.strip()) for v in sample_slider_range.split(",") if v.strip()]
+    else:
+        sample_slider_range = [float(v) for v in sample_slider_range]
+    if not sample_slider_range:
+        sample_slider_range = list(default_slider_range)
 
     targets = []
     for t in raw.get("targets", []):
@@ -99,6 +109,7 @@ def load_slider_config(path: str) -> SliderConfig:
     pos_cache_dir = raw.get("pos_cache_dir", None)
     neg_cache_dir = raw.get("neg_cache_dir", None)
     text_cache_dir = raw.get("text_cache_dir", None) or pos_cache_dir
+    reference_cache_dir = raw.get("reference_cache_dir", None)
 
     return SliderConfig(
         mode=mode,
@@ -110,6 +121,7 @@ def load_slider_config(path: str) -> SliderConfig:
         pos_cache_dir=pos_cache_dir,
         neg_cache_dir=neg_cache_dir,
         text_cache_dir=text_cache_dir,
+        reference_cache_dir=reference_cache_dir,
     )
 
 
@@ -220,9 +232,11 @@ class PairedSliderDataset(torch.utils.data.Dataset):
         neg_cache_dir: str,
         text_cache_dir: Optional[str] = None,
         reference_modality: str = "video",
+        reference_cache_dir: Optional[str] = None,
     ):
         self.text_cache_dir = text_cache_dir or pos_cache_dir
         self.reference_modality = reference_modality
+        self.reference_cache_dir = reference_cache_dir
 
         if self.reference_modality == "audio":
             pos_files = sorted(glob.glob(os.path.join(pos_cache_dir, "*_ltx2_audio.safetensors")))
@@ -267,7 +281,14 @@ class PairedSliderDataset(torch.utils.data.Dataset):
                 logger.warning("No text cache for %s, skipping", basename)
                 continue
 
-            self.pairs.append((pos_path, neg_path, te_path, pos_virtual_path, neg_virtual_path))
+            ref_path = None
+            if self.reference_cache_dir:
+                ref_path = os.path.join(self.reference_cache_dir, basename)
+                if not os.path.exists(ref_path):
+                    logger.warning("No IC reference match for %s in %s, skipping", basename, self.reference_cache_dir)
+                    continue
+
+            self.pairs.append((pos_path, neg_path, te_path, pos_virtual_path, neg_virtual_path, ref_path))
 
         if len(self.pairs) == 0:
             raise ValueError(f"No matched pairs found in {pos_cache_dir} and {neg_cache_dir}")
@@ -277,7 +298,7 @@ class PairedSliderDataset(torch.utils.data.Dataset):
         return len(self.pairs)
 
     def __getitem__(self, idx):
-        pos_path, neg_path, te_path, pos_virtual_path, neg_virtual_path = self.pairs[idx]
+        pos_path, neg_path, te_path, pos_virtual_path, neg_virtual_path, ref_path = self.pairs[idx]
 
         pos_sd = load_file(pos_path)
         neg_sd = load_file(neg_path)
@@ -329,12 +350,22 @@ class PairedSliderDataset(torch.utils.data.Dataset):
                 f"pos {pos_latents.shape} vs neg {neg_latents.shape}"
             )
 
-        return {
+        item = {
             "pos_latents": pos_latents,
             "neg_latents": neg_latents,
             "text_embeds": text_embeds,
             "text_mask": text_mask,
         }
+        if ref_path is not None:
+            ref_sd = load_file(ref_path)
+            ref_latents = _find_latent_tensor(ref_sd)
+            if ref_latents.shape[0] != pos_latents.shape[0]:
+                raise ValueError(
+                    f"Reference channel mismatch for {os.path.basename(ref_path)}: "
+                    f"ref {ref_latents.shape} vs pos {pos_latents.shape}"
+                )
+            item["ref_latents"] = ref_latents
+        return item
 
 
 # ---------------------------------------------------------------------------
@@ -832,6 +863,125 @@ class LTX2SliderTrainer:
         network.set_multiplier(1.0)
         return (loss_pos.item() + loss_neg.item()) / 2.0
 
+    def _ic_reference_slider_step(
+        self,
+        transformer,
+        network,
+        batch: Dict[str, torch.Tensor],
+        accelerator: Accelerator,
+        args: argparse.Namespace,
+        dit_dtype: torch.dtype,
+    ) -> float:
+        """One training step for IC-aware slider mode.
+
+        The first implementation reuses the existing v2v IC-LoRA path so the
+        slider direction is learned under a fixed visual reference context.
+        """
+        device = accelerator.device
+
+        pos_latents = batch["pos_latents"].to(device=device, dtype=torch.float32)
+        neg_latents = batch["neg_latents"].to(device=device, dtype=torch.float32)
+        ref_latents = batch["ref_latents"].to(device=device, dtype=torch.float32)
+        text_embeds = batch["text_embeds"].to(device=device, dtype=dit_dtype)
+        text_mask = batch["text_mask"].to(device=device, dtype=torch.int64)
+
+        if text_embeds.dim() == 2:
+            text_embeds = text_embeds.unsqueeze(0)
+        if text_mask.dim() == 1:
+            text_mask = text_mask.unsqueeze(0)
+
+        if pos_latents.shape != neg_latents.shape:
+            raise ValueError(
+                f"IC slider pair shape mismatch: pos {tuple(pos_latents.shape)} vs neg {tuple(neg_latents.shape)}"
+            )
+        if ref_latents.dim() != 5:
+            raise ValueError(f"IC slider expected ref_latents to be 5D [B, C, F, H, W], got {tuple(ref_latents.shape)}")
+        if ref_latents.shape[0] != pos_latents.shape[0]:
+            raise ValueError(
+                f"IC slider batch mismatch: ref {tuple(ref_latents.shape)} vs pos {tuple(pos_latents.shape)}"
+            )
+
+        noise = torch.randn_like(pos_latents)
+
+        seq_len = pos_latents.shape[2] * pos_latents.shape[3] * pos_latents.shape[4]
+        shifted_logit_shift_override = getattr(args, "shifted_logit_shift", None)
+        if shifted_logit_shift_override is not None:
+            shift = float(shifted_logit_shift_override)
+        else:
+            shift = LTX2NetworkTrainer._shifted_logit_normal_shift_for_sequence_length(seq_len)
+        shifted_logit_mode = self._net_trainer._resolve_shifted_logit_mode(args)
+        sigma = LTX2NetworkTrainer._sample_shifted_logit_normal_sigmas(
+            pos_latents.shape[0],
+            torch.full((pos_latents.shape[0],), float(shift), device=device, dtype=torch.float32),
+            std=float(getattr(args, "logit_std", 1.0)),
+            mode=shifted_logit_mode,
+            eps=float(getattr(args, "shifted_logit_eps", 1e-3)),
+            uniform_prob=float(getattr(args, "shifted_logit_uniform_prob", 0.1)),
+        )
+        sigma_exp = sigma.view(-1, 1, 1, 1, 1)
+        noisy_pos = ((1.0 - sigma_exp) * pos_latents + sigma_exp * noise).to(dtype=dit_dtype)
+        noisy_neg = ((1.0 - sigma_exp) * neg_latents + sigma_exp * noise).to(dtype=dit_dtype)
+        model_ts = sigma.unsqueeze(1)
+
+        ic_batch = {
+            "text": text_embeds,
+            "text_mask": text_mask,
+            "ref_latents": {"latents": ref_latents},
+        }
+
+        network.set_multiplier(1.0)
+        with accelerator.autocast():
+            pos_out, _ = self._net_trainer.call_dit(
+                args,
+                accelerator,
+                transformer,
+                pos_latents,
+                ic_batch,
+                noise,
+                noisy_pos,
+                model_ts,
+                dit_dtype,
+            )
+        if not isinstance(pos_out, dict):
+            raise ValueError(f"IC slider expected dict output from call_dit, got {type(pos_out)}")
+        loss_pos = self._compute_masked_mse_loss(
+            pos_out["video_pred"],
+            pos_out["video_target"],
+            pos_out.get("video_loss_mask"),
+        )
+        accelerator.backward(loss_pos)
+
+        del pos_out
+        clean_memory_on_device(device)
+
+        network.set_multiplier(-1.0)
+        with accelerator.autocast():
+            neg_out, _ = self._net_trainer.call_dit(
+                args,
+                accelerator,
+                transformer,
+                neg_latents,
+                ic_batch,
+                noise,
+                noisy_neg,
+                model_ts,
+                dit_dtype,
+            )
+        if not isinstance(neg_out, dict):
+            raise ValueError(f"IC slider expected dict output from call_dit, got {type(neg_out)}")
+        loss_neg = self._compute_masked_mse_loss(
+            neg_out["video_pred"],
+            neg_out["video_target"],
+            neg_out.get("video_loss_mask"),
+        )
+        accelerator.backward(loss_neg)
+
+        del neg_out
+        clean_memory_on_device(device)
+
+        network.set_multiplier(1.0)
+        return (loss_pos.item() + loss_neg.item()) / 2.0
+
     # -- Sampling at multiple slider strengths --------------------------------
 
     def _sample_slider(
@@ -881,6 +1031,7 @@ class LTX2SliderTrainer:
             cfg.neg_cache_dir,
             cfg.text_cache_dir,
             reference_modality=cfg.reference_modality,
+            reference_cache_dir=cfg.reference_cache_dir,
         )
         num_workers = min(getattr(args, "max_data_loader_n_workers", 2), os.cpu_count() or 1)
         dataloader = torch.utils.data.DataLoader(
@@ -923,18 +1074,41 @@ class LTX2SliderTrainer:
             self.slider_config.sample_slider_range = [float(v) for v in args.sample_slider_range.split(",")]
 
         # Validate
-        if self.slider_config.mode not in {"text", "reference"}:
-            raise ValueError(f"Invalid slider mode '{self.slider_config.mode}'. Must be 'text' or 'reference'.")
+        if self.slider_config.mode not in {"text", "reference", "ic_reference"}:
+            raise ValueError(
+                f"Invalid slider mode '{self.slider_config.mode}'. Must be 'text', 'reference', or 'ic_reference'."
+            )
         if self.slider_config.reference_modality not in {"video", "audio"}:
             raise ValueError(
                 f"Invalid reference_modality '{self.slider_config.reference_modality}'. Must be 'video' or 'audio'."
             )
         if self.slider_config.mode == "text" and len(self.slider_config.targets) == 0:
             raise ValueError("Text-only slider mode requires at least one target in slider config")
-        if self.slider_config.mode == "reference":
+        if self.slider_config.mode in {"reference", "ic_reference"}:
             if not self.slider_config.pos_cache_dir or not self.slider_config.neg_cache_dir:
                 raise ValueError("Reference slider mode requires pos_cache_dir and neg_cache_dir in slider config")
-            if self.slider_config.reference_modality == "audio":
+            if self.slider_config.mode == "ic_reference":
+                if not self.slider_config.reference_cache_dir:
+                    raise ValueError("IC reference slider mode requires reference_cache_dir in slider config")
+                if self.slider_config.reference_modality != "video":
+                    raise ValueError("IC reference slider mode currently supports only reference_modality=video")
+                if getattr(args, "ltx_mode", "video") != "video":
+                    raise ValueError("IC reference slider mode currently supports only --ltx2_mode video")
+                requested_ic = str(getattr(args, "ic_lora_strategy", "auto") or "auto").lower()
+                if requested_ic not in {"auto", "none", "v2v"}:
+                    raise ValueError(
+                        f"IC reference slider mode currently supports only --ic_lora_strategy v2v; got {requested_ic}"
+                    )
+                args.ic_lora_strategy = "v2v"
+                if getattr(args, "lora_target_preset", None) is None:
+                    logger.info("Using lora_target_preset=v2v for IC reference slider training")
+                    args.lora_target_preset = "v2v"
+                elif getattr(args, "lora_target_preset", None) != "v2v":
+                    logger.warning(
+                        "IC reference sliders work best with --lora_target_preset v2v; got %s",
+                        args.lora_target_preset,
+                    )
+            elif self.slider_config.reference_modality == "audio":
                 if getattr(args, "ltx_mode", "video") != "audio":
                     raise ValueError("Audio reference sliders require --ltx2_mode audio")
                 if getattr(args, "sample_prompts", None) and not bool(getattr(args, "sample_audio_only", False)):
@@ -1111,7 +1285,7 @@ class LTX2SliderTrainer:
 
         # -- Reference dataloader (if reference mode) -------------------------
         ref_dataloader = None
-        if self.slider_config.mode == "reference":
+        if self.slider_config.mode in {"reference", "ic_reference"}:
             ref_dataloader = self._build_reference_dataloader(args)
 
         # -- Metadata ----------------------------------------------------------
@@ -1136,6 +1310,9 @@ class LTX2SliderTrainer:
             "ss_slider_mode": self.slider_config.mode,
             "ss_slider_guidance_strength": self.slider_config.guidance_strength,
         }
+        if self.slider_config.mode == "ic_reference":
+            metadata["ss_ic_lora_strategy"] = "v2v"
+            metadata["ss_slider_ic_reference_training"] = True
         if args.network_args:
             metadata["ss_network_args"] = str(net_kwargs)
 
@@ -1240,6 +1417,8 @@ class LTX2SliderTrainer:
             logger.info("  latent_frames: %d", getattr(args, "latent_frames", 1))
             logger.info("  latent_height: %d", getattr(args, "latent_height", 512))
             logger.info("  latent_width: %d", getattr(args, "latent_width", 768))
+        elif self.slider_config.mode == "ic_reference":
+            logger.info("  reference_cache_dir: %s", self.slider_config.reference_cache_dir)
 
         # Sample at first if requested
         if should_sample_images(args, 0, epoch=0):
@@ -1264,7 +1443,9 @@ class LTX2SliderTrainer:
                     except StopIteration:
                         ref_iter = iter(ref_dataloader)
                         batch = next(ref_iter)
-                    if self.slider_config.reference_modality == "audio":
+                    if self.slider_config.mode == "ic_reference":
+                        loss = self._ic_reference_slider_step(transformer, network, batch, accelerator, args, dit_dtype)
+                    elif self.slider_config.reference_modality == "audio":
                         loss = self._audio_reference_slider_step(transformer, network, batch, accelerator, args, dit_dtype)
                     else:
                         loss = self._reference_slider_step(transformer, network, batch, accelerator, args, dit_dtype)

@@ -372,6 +372,107 @@ def _materialize_meta_buffer(
     setattr(submodule, attr_name, replacement)
 
 
+_QUANTIZED_LINEAR_CLASS_NAMES = frozenset({"Linear4bit", "Linear8bitLt", "FP8Linear"})
+
+
+def _override_target_is_quantized(submodule: torch.nn.Module, attr_name: str) -> bool:
+    if type(submodule).__name__ in _QUANTIZED_LINEAR_CLASS_NAMES:
+        return True
+    current = getattr(submodule, attr_name, None)
+    if isinstance(current, torch.Tensor) and current.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+        return True
+    return False
+
+
+def apply_text_encoder_checkpoint_overrides(
+    text_encoder: torch.nn.Module,
+    checkpoint_path: str | None,
+    *,
+    prefix: str = "text_encoder.",
+) -> int:
+    """Overlay text-encoder weights stored inside a training checkpoint.
+
+    Full-FT checkpoints save Gemma weights under the ``text_encoder.`` prefix.
+    The runtime Gemma loader still rebuilds the module from ``gemma_root`` /
+    ``gemma_safetensors`` plus the checkpoint connectors, so we need to copy any
+    prefixed overrides on top of the rebuilt module to restore the finetuned
+    Gemma state.
+
+    Overrides whose target module is quantized (bnb 4/8-bit) or fp8-wrapped
+    cannot be assigned as plain tensors, so they are skipped with an aggregated
+    warning; unquantized overrides (embeddings, layernorms, etc.) are still
+    applied.
+    """
+    if not checkpoint_path or not os.path.isfile(checkpoint_path):
+        return 0
+
+    override_keys: list[str] = []
+    with MemoryEfficientSafeOpen(checkpoint_path) as handle:
+        for key in handle.keys():
+            if key.startswith(prefix):
+                override_keys.append(key)
+
+        if not override_keys:
+            return 0
+
+        loaded = 0
+        skipped_quantized: list[str] = []
+        for key in override_keys:
+            module_key = key[len(prefix):]
+            try:
+                submodule, attr_name = _resolve_module_and_attr(text_encoder, module_key)
+            except AttributeError:
+                logger.warning("Ignoring unknown text-encoder override key from checkpoint: %s", key)
+                continue
+
+            if _override_target_is_quantized(submodule, attr_name):
+                skipped_quantized.append(module_key)
+                continue
+
+            current_value = getattr(submodule, attr_name)
+            tensor = handle.get_tensor(key)
+
+            if isinstance(current_value, torch.nn.Parameter):
+                if tuple(current_value.shape) != tuple(tensor.shape):
+                    raise ValueError(
+                        f"Text-encoder override shape mismatch for {module_key}: "
+                        f"checkpoint={tuple(tensor.shape)} runtime={tuple(current_value.shape)}"
+                    )
+                replacement = torch.nn.Parameter(
+                    tensor.to(device=current_value.device, dtype=current_value.dtype),
+                    requires_grad=current_value.requires_grad,
+                )
+                setattr(submodule, attr_name, replacement)
+                loaded += 1
+                continue
+
+            if isinstance(current_value, torch.Tensor):
+                if tuple(current_value.shape) != tuple(tensor.shape):
+                    raise ValueError(
+                        f"Text-encoder override shape mismatch for {module_key}: "
+                        f"checkpoint={tuple(tensor.shape)} runtime={tuple(current_value.shape)}"
+                    )
+                setattr(submodule, attr_name, tensor.to(device=current_value.device, dtype=current_value.dtype))
+                loaded += 1
+                continue
+
+            logger.warning("Ignoring non-tensor text-encoder override target %s (%s)", module_key, type(current_value).__name__)
+
+    if skipped_quantized:
+        logger.warning(
+            "Checkpoint contains %d finetuned text_encoder override(s) whose target modules are "
+            "quantized/fp8 at runtime; they were NOT applied and those layers will use the base "
+            "Gemma weights. Load Gemma in full precision (no --gemma_load_in_4bit/8bit, non-fp8 "
+            "weights) to restore them. Affected keys (first 10): %s",
+            len(skipped_quantized),
+            skipped_quantized[:10],
+        )
+
+    if loaded > 0:
+        logger.info("Applied %d finetuned text-encoder tensors from checkpoint: %s", loaded, checkpoint_path)
+    return loaded
+
+
 def module_ops_from_gemma_root(
     gemma_root: str | None,
     *,
@@ -383,6 +484,7 @@ def module_ops_from_gemma_root(
     bnb_4bit_quant_type: str = "nf4",
     bnb_4bit_use_double_quant: bool = True,
     bnb_4bit_compute_dtype: torch.dtype | None = None,
+    fp8_weight_offload: bool | None = None,
     device: torch.device | None = None,
 ) -> tuple[ModuleOps, ...]:
     # -- gemma_safetensors preprocessing --
@@ -394,6 +496,7 @@ def module_ops_from_gemma_root(
         if not sf_path.exists():
             raise FileNotFoundError(f"Gemma safetensors not found: {gemma_safetensors}")
         gemma_weights_path = gemma_safetensors
+        gemma_root = None
         keep_fp8 = _has_fp8_weights(gemma_safetensors)
         if keep_fp8:
             logger.info("Detected fp8 weights in %s — will keep fp8 in VRAM", gemma_safetensors)
@@ -626,12 +729,15 @@ def module_ops_from_gemma_root(
 
                 if keep_fp8:
                     from musubi_tuner.ltx_2.text_encoders.gemma.fp8_ops import replace_linear_with_fp8
-                    offload_fp8_weights = os.getenv("LTX2_GEMMA_SAFETENSORS_WEIGHT_OFFLOAD", "1").lower() in (
-                        "1",
-                        "true",
-                        "yes",
-                        "on",
-                    )
+                    if fp8_weight_offload is None:
+                        offload_fp8_weights = os.getenv("LTX2_GEMMA_SAFETENSORS_WEIGHT_OFFLOAD", "1").lower() in (
+                            "1",
+                            "true",
+                            "yes",
+                            "on",
+                        )
+                    else:
+                        offload_fp8_weights = bool(fp8_weight_offload)
                     n_replaced = replace_linear_with_fp8(
                         module.model,
                         torch_dtype,

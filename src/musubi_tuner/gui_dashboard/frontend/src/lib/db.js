@@ -25,12 +25,17 @@ export async function getConnection() {
 
 export async function loadParquet(url) {
 	const c = await getConnection();
-	const response = await fetch(url);
+	const response = await fetch(url, { cache: 'no-store' });
 	if (!response.ok || response.status === 204) return null;
 
 	const buffer = await response.arrayBuffer();
 	if (buffer.byteLength === 0) return null;
 
+	try {
+		await db.dropFile('metrics.parquet');
+	} catch {
+		// ignore if not registered yet
+	}
 	await db.registerFileBuffer('metrics.parquet', new Uint8Array(buffer));
 	await c.query(`CREATE OR REPLACE TABLE metrics AS SELECT * FROM read_parquet('metrics.parquet')`);
 	return c;

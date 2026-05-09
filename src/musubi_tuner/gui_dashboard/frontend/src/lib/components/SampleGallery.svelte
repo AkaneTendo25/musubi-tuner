@@ -69,18 +69,20 @@
 	});
 </script>
 
-<div class="bg-gray-900 border border-gray-800 rounded-lg p-4">
-	<h3 class="text-sm font-medium text-gray-400 mb-3">Samples</h3>
+<div class="p-4">
+	<h3 class="text-sm font-medium mb-3" style="color: var(--text-secondary);">Samples</h3>
 
 	{#if samples.length === 0}
-		<p class="text-sm text-gray-600">No samples generated yet</p>
+		<p class="text-sm" style="color: var(--text-muted);">No samples generated yet</p>
 	{:else}
 		<div class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-3">
 			{#each samples as sample}
 				<button
-					class="relative aspect-video bg-gray-800 rounded overflow-hidden border border-gray-700
-							hover:border-blue-500 transition-colors cursor-pointer group"
+					class="relative aspect-video rounded overflow-hidden border transition-colors cursor-pointer group"
 					onclick={() => openViewer(sample.url, sample.type)}
+					style="background: transparent; border-color: var(--border);"
+					onmouseenter={(e) => { e.currentTarget.style.borderColor = 'var(--accent)'; }}
+					onmouseleave={(e) => { e.currentTarget.style.borderColor = 'var(--border)'; }}
 				>
 					{#if sample.type === 'video'}
 						<video
@@ -119,7 +121,9 @@
 		onkeydown={(e) => e.key === 'Escape' && closeViewer()}
 	>
 		{#if viewerType === 'video'}
-			<video src={viewerSrc} class="max-w-[90vw] max-h-[90vh]" controls autoplay></video>
+			<video src={viewerSrc} class="max-w-[90vw] max-h-[90vh]" controls autoplay>
+				<track kind="captions" />
+			</video>
 		{:else if viewerType === 'audio'}
 			<audio src={viewerSrc} controls autoplay></audio>
 		{:else}
