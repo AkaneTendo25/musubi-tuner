@@ -932,7 +932,7 @@
 						</div>
 					</div>
 				</FormGroup>
-				
+
 				<FormGroup title="Metadata">
 					<div class="space-y-2 pt-2">
 						<FormField fieldPath="training.metadata_title" value={t.metadata_title || ''} oninput={(e) => update('metadata_title', e.target.value)} placeholder="LoRA name" tooltip="Model card title" />

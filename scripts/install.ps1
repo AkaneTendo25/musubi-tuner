@@ -2,7 +2,7 @@
 param(
     [string]$InstallRoot = "",
     [string]$RepoUrl = "https://github.com/AkaneTendo25/musubi-tuner.git",
-    [string]$Branch = "ltx-2-dev",
+    [string]$Branch = "ltx-2",
     [string]$RepoDir = "",
     [ValidateSet("cu124", "cu128", "cu130", "cpu")]
     [string]$Cuda = "cu128",

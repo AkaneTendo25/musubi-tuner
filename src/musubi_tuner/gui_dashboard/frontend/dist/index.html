@@ -8,30 +8,41 @@
 		<link rel="preconnect" href="https://fonts.googleapis.com" />
 		<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
 		<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+		<script>
+			(() => {
+				const themes = ['warm-terminal', 'aurora', 'matcha', 'brutalist', 'twilight', 'synthwave', 'sakura', 'deep-sea', 'mono'];
+				try {
+					const theme = localStorage.getItem('theme');
+					if (theme && themes.includes(theme) && theme !== 'warm-terminal') {
+						document.documentElement.classList.add(`theme-${theme}`);
+					}
+				} catch {}
+			})();
+		</script>
 		
-		<link rel="modulepreload" href="/_app/immutable/entry/start.CfdhIRyn.js">
-		<link rel="modulepreload" href="/_app/immutable/chunks/CKJg1xyo.js">
-		<link rel="modulepreload" href="/_app/immutable/chunks/BnyyIW3I.js">
-		<link rel="modulepreload" href="/_app/immutable/chunks/JwuplqmM.js">
-		<link rel="modulepreload" href="/_app/immutable/entry/app.BKoWajeW.js">
-		<link rel="modulepreload" href="/_app/immutable/chunks/-rVGYg6r.js">
-		<link rel="modulepreload" href="/_app/immutable/chunks/C1xtvcKg.js">
-		<link rel="modulepreload" href="/_app/immutable/chunks/CjLuZH5Q.js">
-		<link rel="modulepreload" href="/_app/immutable/chunks/BOmRYYA7.js">
+		<link rel="modulepreload" href="/_app/immutable/entry/start.Bjy-IZc1.js">
+		<link rel="modulepreload" href="/_app/immutable/chunks/-gZNC3--.js">
+		<link rel="modulepreload" href="/_app/immutable/chunks/Tg_qVACn.js">
+		<link rel="modulepreload" href="/_app/immutable/chunks/0yPtegAj.js">
+		<link rel="modulepreload" href="/_app/immutable/entry/app.VNaZEpMl.js">
+		<link rel="modulepreload" href="/_app/immutable/chunks/ampJeEwW.js">
+		<link rel="modulepreload" href="/_app/immutable/chunks/Bpe_nGQ3.js">
+		<link rel="modulepreload" href="/_app/immutable/chunks/RFrpCeNw.js">
+		<link rel="modulepreload" href="/_app/immutable/chunks/DL7J1wnP.js">
 	</head>
 	<body data-sveltekit-prerender="false">
 		<div style="display: contents">
 			<script>
 				{
-					__sveltekit_14lo1pa = {
+					__sveltekit_1piipju = {
 						base: ""
 					};
 
 					const element = document.currentScript.parentElement;
 
 					Promise.all([
-						import("/_app/immutable/entry/start.CfdhIRyn.js"),
-						import("/_app/immutable/entry/app.BKoWajeW.js")
+						import("/_app/immutable/entry/start.Bjy-IZc1.js"),
+						import("/_app/immutable/entry/app.VNaZEpMl.js")
 					]).then(([kit, app]) => {
 						kit.start(app, element);
 					});
