@@ -898,13 +898,13 @@ LTX2_INCLUDE_PATTERNS_AUDIO_V2A = [
     r".*\.video_to_audio_attn\.to_out\.0$",
 ]
 
-# audio_ref_only_ic: ID-LoRA-style audio-reference IC preset.
+# audio_ref_ic: ID-LoRA-style audio-reference IC preset.
 # Targets audio self/cross-attn, audio FFN, and BOTH AV cross-modal directions.
 # Mirrors ID-LoRA target_modules:
 #   - audio_attn1 / audio_attn2
 #   - audio_ff
 #   - audio_to_video_attn / video_to_audio_attn
-LTX2_INCLUDE_PATTERNS_AUDIO_REF_ONLY_IC = [
+LTX2_INCLUDE_PATTERNS_AUDIO_REF_IC = [
     r".*\.audio_attn1\.to_k$",
     r".*\.audio_attn1\.to_q$",
     r".*\.audio_attn1\.to_v$",
@@ -973,7 +973,7 @@ LTX2_LORA_TARGET_PRESETS = {
     "video_sa_ca_ff": LTX2_INCLUDE_PATTERNS_VIDEO_SA_CA_FF,
     "audio": LTX2_INCLUDE_PATTERNS_AUDIO,
     "audio_v2a": LTX2_INCLUDE_PATTERNS_AUDIO_V2A,
-    "audio_ref_only_ic": LTX2_INCLUDE_PATTERNS_AUDIO_REF_ONLY_IC,
+    "audio_ref_ic": LTX2_INCLUDE_PATTERNS_AUDIO_REF_IC,
     "av_ic": LTX2_INCLUDE_PATTERNS_V2V,  # superset: all attn (video+audio+cross-modal) + video FFN + audio FFN
     "video_ref_only_av": LTX2_INCLUDE_PATTERNS_V2V,  # AV target generation with video-reference conditioning only
     "full": LTX2_INCLUDE_PATTERNS_FULL,

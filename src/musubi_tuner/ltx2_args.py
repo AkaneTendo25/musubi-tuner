@@ -143,7 +143,7 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         type=str,
         default="t2v",
             choices=["t2v", "v2v", "video_sa", "video_sa_ff", "video_sa_ca_ff",
-                 "audio", "audio_v2a", "audio_ref_only_ic", "av_ic", "video_ref_only_av", "full", "lycoris"],
+                 "audio", "audio_v2a", "audio_ref_ic", "av_ic", "video_ref_only_av", "full", "lycoris"],
         help=(
             "LoRA target preset: "
             "'t2v' = text-to-video (all attention, default), "
@@ -153,7 +153,7 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
             "'video_sa_ca_ff' = video self-attention + cross-attention + feed-forward, "
             "'audio' = audio-only (audio attn/ffn, no AV cross-modal), "
             "'audio_v2a' = audio preset plus video_to_audio_attn (audio attn/ffn + video_to_audio_attn), "
-            "'audio_ref_only_ic' = ID-LoRA-style AV preset "
+            "'audio_ref_ic' = ID-LoRA-style AV preset "
             "(audio attn/ffn + audio/video cross-modal both directions), "
             "'av_ic' = AV IC preset (use --av_cross_attention_mode / --av_multi_ref for AV variants), "
             "'video_ref_only_av' = AV preset for video-reference conditioning without reference audio, "
@@ -175,13 +175,13 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         choices=list(IC_LORA_STRATEGIES),
         help=(
             "IC-LoRA conditioning strategy. "
-            "'auto' keeps backward-compatible behavior "
-            "(uses 'v2v' when --lora_target_preset=v2v, "
-            "'audio_ref_only_ic' when --lora_target_preset=audio_ref_only_ic, "
+            "'auto' infers the strategy from --lora_target_preset "
+            "(uses 'v2v' for v2v, "
+            "'audio_ref_ic' when --lora_target_preset=audio_ref_ic, "
             "'av_ic' when --lora_target_preset=av_ic, "
             "'video_ref_only_av' when --lora_target_preset=video_ref_only_av, else 'none'). "
             "'v2v' uses reference-video conditioning. "
-            "'audio_ref_only_ic' uses reference-audio conditioning (ID-LoRA-style) in AV or audio-only mode. "
+            "'audio_ref_ic' uses reference-audio conditioning (ID-LoRA-style) in AV or audio-only mode. "
             "'av_ic' uses combined video+audio reference conditioning (requires --ltx2_mode av; "
             "use --av_cross_attention_mode / --av_multi_ref for AV variants). "
             "'video_ref_only_av' uses reference-video conditioning while still training target AV generation "
@@ -214,14 +214,14 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         "--audio_ref_use_negative_positions",
         action=argparse.BooleanOptionalAction,
         default=False,
-        help="For --ic_lora_strategy audio_ref_only_ic: place reference-audio token positions in negative time.",
+        help="For --ic_lora_strategy audio_ref_ic: place reference-audio token positions in negative time.",
     )
     parser.add_argument(
         "--audio_ref_mask_cross_attention_to_reference",
         action=argparse.BooleanOptionalAction,
         default=False,
         help=(
-            "For --ic_lora_strategy audio_ref_only_ic: mask A2V cross-attention so video attends only to target audio, "
+            "For --ic_lora_strategy audio_ref_ic: mask A2V cross-attention so video attends only to target audio, "
             "not reference-audio tokens."
         ),
     )
@@ -230,7 +230,7 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         action=argparse.BooleanOptionalAction,
         default=False,
         help=(
-            "For --ic_lora_strategy audio_ref_only_ic: block reference-audio tokens from attending to text tokens "
+            "For --ic_lora_strategy audio_ref_ic: block reference-audio tokens from attending to text tokens "
             "(target-audio tokens still attend to text; currently ignored in av_ic)."
         ),
     )
@@ -239,7 +239,7 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         type=float,
         default=0.0,
         help=(
-            "For --ic_lora_strategy audio_ref_only_ic sampling: identity guidance scale. "
+            "For --ic_lora_strategy audio_ref_ic sampling: identity guidance scale. "
             "Runs an extra forward pass without reference audio to isolate and amplify "
             "the speaker identity contribution. 0.0 disables. Recommended: 3.0."
         ),
@@ -1395,15 +1395,15 @@ def main() -> None:
         if not any(arg.startswith("include_patterns=") for arg in args.network_args):
             args.lora_target_preset = "audio"
     elif (
-        requested_ic_strategy == "audio_ref_only_ic"
+        requested_ic_strategy == "audio_ref_ic"
         and not explicit_lora_preset
         and not uses_lycoris_module
     ):
         if args.network_args is None:
             args.network_args = []
         if not any(arg.startswith("include_patterns=") for arg in args.network_args):
-            args.lora_target_preset = "audio_ref_only_ic"
-            logger.info("Using lora_target_preset=audio_ref_only_ic for --ic_lora_strategy audio_ref_only_ic")
+            args.lora_target_preset = "audio_ref_ic"
+            logger.info("Using lora_target_preset=audio_ref_ic for --ic_lora_strategy audio_ref_ic")
     elif (
         requested_ic_strategy == "av_ic"
         and not explicit_lora_preset
@@ -1425,8 +1425,8 @@ def main() -> None:
             args.lora_target_preset = "video_ref_only_av"
             logger.info("Using lora_target_preset=video_ref_only_av for --ic_lora_strategy video_ref_only_av")
 
-    if explicit_ic_strategy and requested_ic_strategy == "audio_ref_only_ic" and getattr(args, "ltx_mode", "video") not in {"av", "audio"}:
-        logger.warning("--ic_lora_strategy audio_ref_only_ic works in --ltx2_mode av or audio; current mode is %s", args.ltx_mode)
+    if explicit_ic_strategy and requested_ic_strategy == "audio_ref_ic" and getattr(args, "ltx_mode", "video") not in {"av", "audio"}:
+        logger.warning("--ic_lora_strategy audio_ref_ic works in --ltx2_mode av or audio; current mode is %s", args.ltx_mode)
     if explicit_ic_strategy and requested_ic_strategy == "av_ic" and getattr(args, "ltx_mode", "video") != "av":
         logger.warning("--ic_lora_strategy %s requires --ltx2_mode av; current mode is %s", requested_ic_strategy, args.ltx_mode)
     if explicit_ic_strategy and requested_ic_strategy == "video_ref_only_av" and getattr(args, "ltx_mode", "video") != "av":
@@ -1434,11 +1434,11 @@ def main() -> None:
 
     if (
         explicit_lora_preset
-        and getattr(args, "lora_target_preset", None) == "audio_ref_only_ic"
+        and getattr(args, "lora_target_preset", None) == "audio_ref_ic"
         and getattr(args, "ltx_mode", "video") == "audio"
     ):
         logger.warning(
-            "--lora_target_preset audio_ref_only_ic in --ltx2_mode audio trains cross-modal layers that only "
+            "--lora_target_preset audio_ref_ic in --ltx2_mode audio trains cross-modal layers that only "
             "affect the (dummy) video branch; consider --lora_target_preset audio instead."
         )
     if (

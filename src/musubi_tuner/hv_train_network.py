@@ -389,7 +389,7 @@ def line_to_prompt_dict(line: str) -> dict:
                 continue
 
             m = re.match(r"ra (.+)", parg, re.IGNORECASE)
-            if m:  # reference audio path (audio_ref_only_ic sampling)
+            if m:  # reference audio path (audio_ref_ic sampling)
                 prompt_dict["ref_audio_path"] = m.group(1).strip()
                 continue
 
@@ -693,11 +693,52 @@ class NetworkTrainer:
         optimizer = None
         optimizer_class = None
 
-        # CAME8bit dispatched before the bitsandbytes "8bit" branch since CAME ends in "8bit".
-        if optimizer_type == "CAME8bit".lower():
-            from musubi_tuner.optimizers.came_8bit import CAME8bit
-            logger.info(f"use CAME8bit optimizer (stochastic_rounding, cautious, step_parameter) | {optimizer_kwargs}")
-            optimizer_class = CAME8bit
+        # CAME optimizers dispatched before the bitsandbytes "8bit" branch since CAME8bit ends in "8bit".
+        if optimizer_type in {"came", "camesimple", "came_simple", "came8bit", "came_8bit"}:
+            from musubi_tuner.optimizers.came_8bit import CAME, CAME8bit
+
+            if "stochastic_rounding" not in optimizer_kwargs and (
+                bool(getattr(args, "full_bf16", False))
+                or bool(getattr(args, "fused_backward_pass", False))
+                or getattr(args, "mixed_precision", None) == "bf16"
+            ):
+                optimizer_kwargs["stochastic_rounding"] = True
+                logger.info("CAME: defaulting stochastic_rounding=True for BF16/fused training")
+            optimizer_class = CAME if optimizer_type in {"came", "camesimple", "came_simple"} else CAME8bit
+            logger.info(
+                f"use {optimizer_class.__name__} optimizer "
+                f"(stochastic_rounding, cautious, step_parameter) | {optimizer_kwargs}"
+            )
+            optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
+
+        elif optimizer_type.startswith("torchao_") or optimizer_type.startswith("ao_") or optimizer_type.startswith("torchao."):
+            from musubi_tuner.optimizers.backends import resolve_torchao_optimizer_class
+
+            if "bf16_stochastic_round" not in optimizer_kwargs and (
+                bool(getattr(args, "full_bf16", False))
+                or bool(getattr(args, "fused_backward_pass", False))
+                or getattr(args, "mixed_precision", None) == "bf16"
+            ):
+                optimizer_kwargs["bf16_stochastic_round"] = True
+                logger.info("torchao optimizer: defaulting bf16_stochastic_round=True for BF16/fused training")
+            optimizer_class = resolve_torchao_optimizer_class(args.optimizer_type)
+            logger.info(f"use torchao optimizer {optimizer_class.__name__} | {optimizer_kwargs}")
+            optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
+
+        elif optimizer_type.startswith("optimi_") or optimizer_type.startswith("torchoptimi_") or optimizer_type.startswith("optimi."):
+            from musubi_tuner.optimizers.backends import resolve_optimi_optimizer_class
+
+            if bool(getattr(args, "fused_backward_pass", False)):
+                gradient_release = optimizer_kwargs.get("gradient_release", True)
+                if isinstance(gradient_release, str):
+                    gradient_release = gradient_release.lower() in {"1", "true", "yes", "on"}
+                    optimizer_kwargs["gradient_release"] = gradient_release
+                if gradient_release is not True:
+                    raise ValueError("optimi optimizers require gradient_release=True for --fused_backward_pass")
+                optimizer_kwargs.setdefault("gradient_release", True)
+                logger.info("optimi optimizer: defaulting gradient_release=True for fused backward")
+            optimizer_class = resolve_optimi_optimizer_class(args.optimizer_type)
+            logger.info(f"use torch-optimi optimizer {optimizer_class.__name__} | {optimizer_kwargs}")
             optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
 
         elif optimizer_type.endswith("8bit".lower()):

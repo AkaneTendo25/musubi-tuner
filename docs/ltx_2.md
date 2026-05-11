@@ -1330,7 +1330,7 @@ Use `--lora_target_preset` to control which layers LoRA targets. For custom laye
 | `video_sa_ca_ff` | Video self-attention + cross-attention + video FFN (`attn1`, `attn2`, `ff`) | Video only | Text-guided controls (video detailing, camera-from-image, sparse tracks) |
 | `audio` | Audio attn/FFN only | Audio only | Audio-only training (auto-selected when `--ltx2_mode audio`) |
 | `audio_v2a` | Audio attn/FFN + `video_to_audio_attn` | Audio + V2A cross-modal | Audio preset plus `video_to_audio_attn` (audio queries over video tokens) |
-| `audio_ref_only_ic` | Audio attn/FFN + bidirectional AV cross-modal | Audio + cross-modal | Audio-reference IC-LoRA |
+| `audio_ref_ic` | Audio attn/FFN + bidirectional AV cross-modal | Audio + cross-modal | Audio-reference IC-LoRA |
 | `av_ic` | All attention + video FFN + audio FFN (same as `v2v`) | Video + audio + cross-modal | Joint AV IC-LoRA. Use `--av_cross_attention_mode` for directional variants and `--av_multi_ref` when configuring a multi-reference AV IC run |
 | `video_ref_only_av` | All attention + video FFN + audio FFN (same as `v2v`) | Video + audio + cross-modal | AV training with reference video only; target audio is still generated |
 | `full` | All linear layers for LoRA targeting | Video + audio + cross-modal | Maximum expressiveness, larger file size |
@@ -1686,7 +1686,7 @@ accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 ltx2_tr
   --gradient_checkpointing ^
   --network_module networks.lora_ltx2 ^
   --network_dim 128 --network_alpha 128 ^
-  --lora_target_preset audio_ref_only_ic ^
+  --lora_target_preset audio_ref_ic ^
   --audio_ref_use_negative_positions ^
   --audio_ref_mask_cross_attention_to_reference ^
   --audio_ref_mask_reference_from_text_attention ^
@@ -1708,7 +1708,7 @@ accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 ltx2_tr
   --dataset_config dataset.toml ^
   --ltx2_checkpoint /path/to/ltxav-2.safetensors ^
   --ltx2_mode audio ^
-  --ic_lora_strategy audio_ref_only_ic ^
+  --ic_lora_strategy audio_ref_ic ^
   --fp8_base --fp8_scaled ^
   --blocks_to_swap 10 ^
   --sdpa ^
@@ -1741,12 +1741,12 @@ Reference audio latents are precached automatically when using `--precache_sampl
 
 | Argument | Default | Description |
 |----------|---------|-------------|
-| `--ic_lora_strategy audio_ref_only_ic` | auto | Activates audio-reference IC-LoRA mode (auto-inferred from `--lora_target_preset audio_ref_only_ic`) |
-| `--lora_target_preset audio_ref_only_ic` | — | Targets audio attn/FFN + bidirectional AV cross-modal layers |
+| `--ic_lora_strategy audio_ref_ic` | auto | Activates audio-reference IC-LoRA mode (auto-inferred from `--lora_target_preset audio_ref_ic`) |
+| `--lora_target_preset audio_ref_ic` | — | Targets audio attn/FFN + bidirectional AV cross-modal layers |
 | `--audio_ref_use_negative_positions` | off | Place reference audio in negative RoPE time for positional separation |
 | `--audio_ref_mask_cross_attention_to_reference` | off | Block video from attending to reference audio tokens (AV mode only; no effect in audio-only mode) |
 | `--audio_ref_mask_reference_from_text_attention` | off | Block reference audio from attending to text tokens (`av_ic`: currently unsupported and ignored) |
-| `--audio_ref_identity_guidance_scale` | 0.0 | Override CFG scale for target-audio branch during `audio_ref_only_ic` sampling (0 = use standard guidance scale) |
+| `--audio_ref_identity_guidance_scale` | 0.0 | Override CFG scale for target-audio branch during `audio_ref_ic` sampling (0 = use standard guidance scale) |
 
 ##### Dataset Config Options
 
@@ -1829,8 +1829,8 @@ keyframe_guide_extra_strengths         = [0.7]
 | `v2v` | `video` | ✓ | ✓ |
 | `av_ic` | `av` | ✓ | ✓ |
 | `video_ref_only_av` | `av` | ✓ | ✓ |
-| `audio_ref_only_ic` | `av` | ✓ | ✓ |
-| `audio_ref_only_ic` | `audio` | n/a (no video target) | n/a |
+| `audio_ref_ic` | `av` | ✓ | ✓ |
+| `audio_ref_ic` | `audio` | n/a (no video target) | n/a |
 
 `latent_idx` overwrites the noisy-target tensor before patchify, so it works on every branch that produces video tokens. `keyframe` token-append is wired through the `LTX2Wrapper.forward` path for the simple/audio-ref-only paths and via `build_keyframe_extension` for the v2v / av_ic / video_ref_only_av IC-LoRA branches; in all cases the appended timesteps are `(1 − strength) × sigma` and the predictions are sliced off before loss.
 

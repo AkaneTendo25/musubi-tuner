@@ -54,7 +54,7 @@ IC_LORA_STRATEGIES = (
     "auto",
     "none",
     "v2v",
-    "audio_ref_only_ic",
+    "audio_ref_ic",
     "av_ic",
     "video_ref_only_av",
 )
@@ -65,12 +65,12 @@ AV_CROSS_ATTENTION_MODES = ("both", "a2v_only", "v2a_only", "none")
 
 
 def infer_ic_lora_strategy_from_preset(lora_target_preset: Optional[str]) -> str:
-    """Infer IC-LoRA strategy from LoRA target preset for backward-compatible auto mode."""
+    """Infer IC-LoRA strategy from LoRA target preset."""
     preset = str(lora_target_preset or "").lower()
     if preset == "v2v":
         return "v2v"
-    if preset == "audio_ref_only_ic":
-        return "audio_ref_only_ic"
+    if preset == "audio_ref_ic":
+        return "audio_ref_ic"
     if preset == "av_ic":
         return "av_ic"
     if preset == "video_ref_only_av":
@@ -436,7 +436,7 @@ def _compose_target_audio_loss_mask(
     return _combine_loss_masks(target_audio_loss_mask, cached_audio_loss_mask)
 
 
-def _compose_audio_ref_only_ic_loss_mask(
+def _compose_audio_ref_ic_loss_mask(
     target_audio_loss_mask: Optional[torch.Tensor],
     cached_audio_loss_mask: Optional[torch.Tensor],
     *,
@@ -468,7 +468,8 @@ def _compose_audio_ref_only_ic_loss_mask(
         device=device,
         dtype=target_audio_loss_mask.dtype,
     )
-    return torch.cat([ref_audio_loss_mask, target_audio_loss_mask], dim=1)
+    # audio_ref_ic layout is [target | reference]; reference tokens are clean conditioning.
+    return torch.cat([target_audio_loss_mask, ref_audio_loss_mask], dim=1)
 
 
 def _resolve_batch_captions(batch: Dict[str, Any]) -> Optional[list[str]]:
@@ -607,7 +608,7 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
         device: torch.device,
         dtype: torch.dtype,
     ) -> Dict[str, torch.Tensor]:
-        """Build optional transformer overrides for audio_ref_only_ic training/sampling."""
+        """Build optional transformer overrides for audio_ref_ic training/sampling."""
         overrides: Dict[str, torch.Tensor] = {}
 
         if ref_audio_seq_len <= 0:
@@ -617,17 +618,20 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
         if total_audio_seq_len <= 0:
             return overrides
         ref_tokens = max(0, min(int(ref_audio_seq_len), total_audio_seq_len))
+        tgt_tokens = max(0, total_audio_seq_len - ref_tokens)
+        ref_start = tgt_tokens
+        ref_end = ref_start + ref_tokens
         bsz = int(audio_model_latents.shape[0])
 
         mask_dtype = dtype if dtype in (torch.float16, torch.float32, torch.float64, torch.bfloat16) else torch.float32
         neg_inf = torch.finfo(mask_dtype).min
 
-        # Always generate separate ref/target position arrays for audio_ref_only_ic.
-        # ID-LoRA reference generates positions independently: both ref and target start
-        # at time=0 by default; with negative positions enabled, ref is shifted to t<0.
-        # Without this override the wrapper would compute positions for the combined
-        # sequence, placing target after ref (non-overlapping) — a layout mismatch.
-        # Position override is always applied for audio_ref_only_ic (not gated by a flag).
+        # Always generate separate target/ref position arrays for audio_ref_ic.
+        # The audio-ref layout is [target | reference]: target positions start at
+        # t=0, and reference positions either also start at t=0 or move to t<0.
+        # Without this override the wrapper would compute one continuous grid,
+        # placing reference after target in time, which is a layout mismatch.
+        # Position override is always applied for audio_ref_ic (not gated by a flag).
         use_negative_positions = bool(getattr(args, "audio_ref_use_negative_positions", False))
         if ref_tokens > 0:
             from musubi_tuner.ltx_2.types import AudioLatentShape
@@ -641,9 +645,8 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             else:
                 channels = int(audio_model_latents.shape[1])
                 mel_bins = int(audio_model_latents.shape[3])
-                tgt_tokens = total_audio_seq_len - ref_tokens
 
-                # Generate SEPARATE position arrays for ref and target (matches ID-LoRA reference).
+                # Generate separate position arrays for target and reference.
                 # Target positions always start at 0 (aligned with video time).
                 ref_shape = AudioLatentShape(batch=bsz, channels=channels, frames=ref_tokens, mel_bins=mel_bins)
                 ref_positions = audio_patchifier.get_patch_grid_bounds(ref_shape, device=device).to(dtype=mask_dtype)
@@ -664,7 +667,7 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                 if tgt_tokens <= 0:
                     tgt_positions = tgt_positions[:, :, :0, :]  # empty slice
 
-                audio_positions = torch.cat([ref_positions, tgt_positions], dim=2)
+                audio_positions = torch.cat([tgt_positions, ref_positions], dim=2)
                 overrides["audio_positions_override"] = audio_positions.to(
                     device=device,
                     dtype=audio_model_latents.dtype,
@@ -674,7 +677,7 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             video_seq_len = int(video_latents.shape[2]) * int(video_latents.shape[3]) * int(video_latents.shape[4])
             if video_seq_len > 0:
                 a2v_mask = torch.zeros((bsz, video_seq_len, total_audio_seq_len), device=device, dtype=mask_dtype)
-                a2v_mask[:, :, :ref_tokens] = neg_inf
+                a2v_mask[:, :, ref_start:ref_end] = neg_inf
                 overrides["a2v_cross_attention_mask"] = a2v_mask
 
         if bool(getattr(args, "audio_ref_mask_reference_from_text_attention", False)):
@@ -708,7 +711,7 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                 key_bias[~valid_text] = neg_inf
                 audio_context_mask = key_bias.unsqueeze(1).expand(-1, total_audio_seq_len, -1).clone()
 
-            audio_context_mask[:, :ref_tokens, :] = neg_inf
+            audio_context_mask[:, ref_start:ref_end, :] = neg_inf
             overrides["audio_context_mask"] = audio_context_mask
 
         return overrides
@@ -2562,8 +2565,8 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
         if ic_lora_strategy == "auto":
             ic_lora_strategy = infer_ic_lora_strategy_from_preset(getattr(args, "lora_target_preset", "t2v"))
 
-        if ic_lora_strategy == "audio_ref_only_ic" and self._ltx_mode not in {"av", "audio"}:
-            raise ValueError("--ic_lora_strategy audio_ref_only_ic requires --ltx2_mode av or audio")
+        if ic_lora_strategy == "audio_ref_ic" and self._ltx_mode not in {"av", "audio"}:
+            raise ValueError("--ic_lora_strategy audio_ref_ic requires --ltx2_mode av or audio")
         if ic_lora_strategy == "av_ic" and self._ltx_mode != "av":
             raise ValueError(f"--ic_lora_strategy {ic_lora_strategy} requires --ltx2_mode av")
         if ic_lora_strategy == "video_ref_only_av" and self._ltx_mode != "av":
@@ -2606,7 +2609,7 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             raise ValueError(
                 f"audio_ref_identity_guidance_scale must be >= 0. Got: {args.audio_ref_identity_guidance_scale}"
             )
-        if ic_lora_strategy not in ("audio_ref_only_ic", "av_ic"):
+        if ic_lora_strategy not in ("audio_ref_ic", "av_ic"):
             if (
                 args.audio_ref_use_negative_positions
                 or args.audio_ref_mask_cross_attention_to_reference
@@ -2664,7 +2667,7 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
         # IC-LoRA strategies enable I2V-capable sampling flow in trainer.
         self._i2v_training = ic_lora_strategy in {
             "v2v",
-            "audio_ref_only_ic",
+            "audio_ref_ic",
             "av_ic",
             "video_ref_only_av",
         }
@@ -2701,8 +2704,8 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             md["ss_v2v_training"] = True
         elif self._ic_lora_strategy == "self_ref_v2v":
             md["ss_self_ref_v2v_training"] = True
-        elif self._ic_lora_strategy == "audio_ref_only_ic":
-            md["ss_audio_ref_only_ic_training"] = True
+        elif self._ic_lora_strategy == "audio_ref_ic":
+            md["ss_audio_ref_ic_training"] = True
         elif self._ic_lora_strategy == "av_ic":
             md["ss_av_ic_training"] = True
             av_cross_attention_mode = _normalize_av_cross_attention_mode(
@@ -3369,7 +3372,7 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             )
             or "none"
         ).lower()
-        audio_ref_only_ic_enabled = ic_lora_strategy == "audio_ref_only_ic"
+        audio_ref_ic_enabled = ic_lora_strategy == "audio_ref_ic"
 
         ref_latent_tensors = _collect_reference_tensors(batch, "ref_latents", expected_ndim=5)
         ref_latents = _merge_reference_tensors(ref_latent_tensors, concat_dim=2)
@@ -3502,13 +3505,13 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             resolved_transformer_options: Dict[str, Any] = {"patches_replace": {}}
             ref_audio_seq_len = 0
 
-            if audio_ref_only_ic_enabled:
+            if audio_ref_ic_enabled:
                 ref_audio_latents = batch.get("ref_audio_latents")
                 if isinstance(ref_audio_latents, dict):
                     ref_audio_latents = ref_audio_latents.get("latents")
                 if ref_audio_latents is None:
                     raise ValueError(
-                        "--ic_lora_strategy audio_ref_only_ic requires ref_audio_latents. "
+                        "--ic_lora_strategy audio_ref_ic requires ref_audio_latents. "
                         "Set reference_audio_directory/reference_audio_cache_directory and cache reference audio latents."
                     )
                 if not isinstance(ref_audio_latents, torch.Tensor):
@@ -3551,7 +3554,7 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
 
                 ref_audio_seq_len = int(ref_audio_latents.shape[2])
                 tgt_seq_len = int(audio_latents.shape[2])
-                noisy_audio = torch.cat([ref_audio_latents, noisy_audio], dim=2)
+                noisy_audio = torch.cat([noisy_audio, ref_audio_latents], dim=2)
 
                 audio_timestep_source = audio_timestep_local
                 target_audio_timestep = (
@@ -3564,17 +3567,17 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                     device=accelerator.device,
                     dtype=network_dtype,
                 )
-                audio_timestep_local = torch.cat([ref_audio_timestep, target_audio_timestep], dim=1)
+                audio_timestep_local = torch.cat([target_audio_timestep, ref_audio_timestep], dim=1)
 
                 zero_ref_target = torch.zeros_like(ref_audio_latents)
-                audio_target = torch.cat([zero_ref_target, audio_target], dim=2)
+                audio_target = torch.cat([audio_target, zero_ref_target], dim=2)
 
                 ref_audio_loss_mask = torch.zeros(
                     (audio_latents.shape[0], ref_audio_seq_len),
                     device=accelerator.device,
                     dtype=torch.bool,
                 )
-                audio_loss_mask = torch.cat([ref_audio_loss_mask, audio_loss_mask], dim=1)
+                audio_loss_mask = torch.cat([audio_loss_mask, ref_audio_loss_mask], dim=1)
 
                 resolved_transformer_options = dict(resolved_transformer_options)
                 resolved_transformer_options.update(
@@ -4282,18 +4285,18 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                 if audio_timestep_for_model is None:
                     audio_timestep_for_model = audio_model_timesteps
 
-            if audio_ref_only_ic_enabled:
+            if audio_ref_ic_enabled:
                 ref_audio_latents = batch.get("ref_audio_latents")
                 if isinstance(ref_audio_latents, dict):
                     ref_audio_latents = ref_audio_latents.get("latents")
 
                 if not audio_enabled_for_batch or audio_latents is None or noisy_audio is None:
                     raise ValueError(
-                        "--ic_lora_strategy audio_ref_only_ic requires target audio_latents in every AV batch"
+                        "--ic_lora_strategy audio_ref_ic requires target audio_latents in every AV batch"
                     )
                 if ref_audio_latents is None:
                     raise ValueError(
-                        "--ic_lora_strategy audio_ref_only_ic requires ref_audio_latents. "
+                        "--ic_lora_strategy audio_ref_ic requires ref_audio_latents. "
                         "Set reference_audio_directory/reference_audio_cache_directory and cache reference audio latents."
                     )
                 if not isinstance(ref_audio_latents, torch.Tensor):
@@ -4338,7 +4341,7 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
 
                 ref_audio_seq_len = int(ref_audio_latents.shape[2])
                 tgt_seq_len = int(audio_latents.shape[2])
-                noisy_audio = torch.cat([ref_audio_latents, noisy_audio], dim=2)
+                noisy_audio = torch.cat([noisy_audio, ref_audio_latents], dim=2)
                 _check_finite("noisy_audio_with_reference", noisy_audio)
 
                 audio_timestep_source = audio_timestep_for_model if isinstance(audio_timestep_for_model, torch.Tensor) else audio_model_timesteps
@@ -4352,13 +4355,13 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                     device=accelerator.device,
                     dtype=network_dtype,
                 )
-                audio_timestep_for_model = torch.cat([ref_audio_timestep, target_audio_timestep], dim=1)
+                audio_timestep_for_model = torch.cat([target_audio_timestep, ref_audio_timestep], dim=1)
                 if (
                     isinstance(teacher_noisy_audio_for_self_flow, torch.Tensor)
                     and isinstance(teacher_audio_timestep_for_self_flow, torch.Tensor)
                 ):
                     teacher_noisy_audio_for_self_flow = torch.cat(
-                        [ref_audio_latents, teacher_noisy_audio_for_self_flow],
+                        [teacher_noisy_audio_for_self_flow, ref_audio_latents],
                         dim=2,
                     )
                     teacher_target_audio_timestep = (
@@ -4369,16 +4372,16 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                         )
                     )
                     teacher_audio_timestep_for_self_flow = torch.cat(
-                        [ref_audio_timestep, teacher_target_audio_timestep],
+                        [teacher_target_audio_timestep, ref_audio_timestep],
                         dim=1,
                     )
 
                 if audio_target is None:
-                    raise ValueError("Internal error: audio_target must be initialized before audio_ref_only_ic composition")
+                    raise ValueError("Internal error: audio_target must be initialized before audio_ref_ic composition")
                 zero_ref_target = torch.zeros_like(ref_audio_latents)
-                audio_target = torch.cat([zero_ref_target, audio_target], dim=2)
+                audio_target = torch.cat([audio_target, zero_ref_target], dim=2)
 
-                audio_loss_mask = _compose_audio_ref_only_ic_loss_mask(
+                audio_loss_mask = _compose_audio_ref_ic_loss_mask(
                     audio_loss_mask,
                     _cached_audio_loss_mask(tgt_seq_len, int(audio_latents.shape[0])),
                     batch_size=int(audio_latents.shape[0]),
@@ -4737,7 +4740,7 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             resolved_transformer_options["keyframe_guides"] = keyframe_guides_for_options
         if (
             self._ltx_mode == "av"
-            and audio_ref_only_ic_enabled
+            and audio_ref_ic_enabled
             and audio_enabled_for_batch
             and noisy_audio is not None
             and ref_audio_seq_len > 0
@@ -4975,7 +4978,7 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                     dtype=torch.bool,
                 )
 
-            if getattr(args, "use_audio_length_mask", False) and not audio_ref_only_ic_enabled:
+            if getattr(args, "use_audio_length_mask", False) and not audio_ref_ic_enabled:
                 audio_lengths = batch.get("audio_lengths")
                 if isinstance(audio_lengths, dict):
                     audio_lengths = audio_lengths.get("lengths")

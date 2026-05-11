@@ -189,7 +189,7 @@ class TrainingConfig(BaseModel):
     network_dim: Optional[int] = None
     network_alpha: float = 1.0
     lora_target_preset: Literal[
-        "t2v", "v2v", "video_sa", "video_sa_ff", "video_sa_ca_ff", "audio", "audio_v2a", "audio_ref_only_ic", "av_ic", "video_ref_only_av", "full", "lycoris"
+        "t2v", "v2v", "video_sa", "video_sa_ff", "video_sa_ca_ff", "audio", "audio_v2a", "audio_ref_ic", "av_ic", "video_ref_only_av", "full", "lycoris"
     ] = "t2v"
     network_args: str = ""
     network_weights: str = ""
@@ -214,7 +214,7 @@ class TrainingConfig(BaseModel):
     audio_caption_dropout_rate: float = 0.0
     train_connectors: bool = False
     save_original_lora: bool = True
-    ic_lora_strategy: Literal["auto", "none", "v2v", "audio_ref_only_ic", "av_ic", "video_ref_only_av"] = "auto"
+    ic_lora_strategy: Literal["auto", "none", "v2v", "audio_ref_ic", "av_ic", "video_ref_only_av"] = "auto"
     av_cross_attention_mode: Literal["both", "a2v_only", "v2a_only", "none"] = "both"
     av_multi_ref: bool = False
     audio_ref_use_negative_positions: bool = False

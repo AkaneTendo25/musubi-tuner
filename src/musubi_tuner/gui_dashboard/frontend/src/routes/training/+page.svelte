@@ -38,6 +38,15 @@
 		'adamax',
 		'prodigy',
 		'came',
+		'came8bit',
+		'torchao_adamw8bit',
+		'torchao_adamw4bit',
+		'torchao_adamwfp8',
+		'torchao_adamw',
+		'optimi_stableadamw',
+		'optimi_adamw',
+		'optimi_lion',
+		'optimi_adan',
 	];
 
 	let t = $derived($projectConfig?.training || {});
@@ -451,7 +460,7 @@
 								{ value: 'video_sa_ca_ff', label: 'V:SA+CA+FF' },
 								{ value: 'audio', label: 'audio' },
 								{ value: 'audio_v2a', label: 'audio+V2A' },
-								{ value: 'audio_ref_only_ic', label: 'audio ref IC' },
+								{ value: 'audio_ref_ic', label: 'audio ref IC' },
 								{ value: 'av_ic', label: 'AV IC' },
 								{ value: 'video_ref_only_av', label: 'AV video-ref' },
 								{ value: 'full', label: 'full (all)' }
@@ -463,12 +472,12 @@
 									{ value: 'auto', label: 'auto' },
 									{ value: 'none', label: 'none' },
 									{ value: 'v2v', label: 'v2v' },
-									{ value: 'audio_ref_only_ic', label: 'audio_ref_only_ic' },
+									{ value: 'audio_ref_ic', label: 'audio_ref_ic' },
 									{ value: 'av_ic', label: 'av_ic' },
 									{ value: 'video_ref_only_av', label: 'video_ref_only_av' },
-								]} onchange={(e) => update('ic_lora_strategy', e.target.value)} tooltip="IC-LoRA conditioning strategy. 'auto' follows lora_target_preset; 'audio_ref_only_ic' = audio-reference ID-LoRA style (requires av or audio mode); 'av_ic' = joint video+audio reference conditioning (requires av mode, with extra AV modifiers below); 'video_ref_only_av' = video reference with target AV generation (requires av mode)" />
+								]} onchange={(e) => update('ic_lora_strategy', e.target.value)} tooltip="IC-LoRA conditioning strategy. 'auto' follows lora_target_preset; 'audio_ref_ic' = audio-reference ID-LoRA style (requires av or audio mode); 'av_ic' = joint video+audio reference conditioning (requires av mode, with extra AV modifiers below); 'video_ref_only_av' = video reference with target AV generation (requires av mode)" />
 							</div>
-							{#if t.ic_lora_strategy === 'audio_ref_only_ic' || t.ic_lora_strategy === 'av_ic' || (t.ic_lora_strategy === 'auto' && (t.lora_target_preset === 'audio_ref_only_ic' || t.lora_target_preset === 'av_ic'))}
+							{#if t.ic_lora_strategy === 'audio_ref_ic' || t.ic_lora_strategy === 'av_ic' || (t.ic_lora_strategy === 'auto' && (t.lora_target_preset === 'audio_ref_ic' || t.lora_target_preset === 'av_ic'))}
 								<div class="p-2 space-y-2" style="background: var(--bg-elevated); border-radius: var(--radius-sm); border: 1px solid var(--border-subtle);">
 									<span class="text-[11px] font-medium" style="color: var(--text-muted);">Audio-Reference IC-LoRA</span>
 									{#if t.ic_lora_strategy === 'av_ic' || (t.ic_lora_strategy === 'auto' && t.lora_target_preset === 'av_ic')}

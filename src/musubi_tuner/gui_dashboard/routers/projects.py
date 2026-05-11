@@ -30,7 +30,7 @@ def _project_summary(config: ProjectConfig, path: Path) -> dict:
     for entry in datasets:
         dataset_types[entry.type] = dataset_types.get(entry.type, 0) + 1
 
-    ic_targets = {"v2v", "audio_ref_only_ic", "av_ic", "video_ref_only_av"}
+    ic_targets = {"v2v", "audio_ref_ic", "av_ic", "video_ref_only_av"}
     uses_ic_lora = training.ic_lora_strategy not in ("auto", "none") or training.lora_target_preset in ic_targets
     uses_lycoris = bool(training.lycoris_config) or training.lora_target_preset == "lycoris"
     if uses_lycoris:

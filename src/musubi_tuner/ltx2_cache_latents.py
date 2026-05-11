@@ -960,7 +960,7 @@ def encode_and_save_reference_audio_latents(
     *,
     dtype: torch.dtype,
 ) -> None:
-    """Encode reference-audio files and save latent caches for audio_ref_only_ic training."""
+    """Encode reference-audio files and save latent caches for audio_ref_ic training."""
     skip_existing = getattr(args, "skip_existing", False)
     num_workers = args.num_workers if args.num_workers is not None else max(1, (os.cpu_count() or 2) - 1)
     preferred_ext = getattr(args, "ltx2_audio_ext", None)

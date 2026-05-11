@@ -58,8 +58,8 @@ TARGETABLE_FAMILY_PATTERNS: list[tuple[str, str]] = [
 
 PRESET_CANDIDATES_BY_MODE: dict[str, list[str]] = {
     "video": ["video_sa", "video_sa_ff", "video_sa_ca_ff", "t2v", "v2v", "full"],
-    "av": ["t2v", "v2v", "av_ic", "video_ref_only_av", "audio", "audio_v2a", "audio_ref_only_ic", "full"],
-    "audio": ["audio", "audio_v2a", "audio_ref_only_ic", "t2v", "v2v", "full"],
+    "av": ["t2v", "v2v", "av_ic", "video_ref_only_av", "audio", "audio_v2a", "audio_ref_ic", "full"],
+    "audio": ["audio", "audio_v2a", "audio_ref_ic", "t2v", "v2v", "full"],
 }
 
 
