@@ -437,6 +437,7 @@
 								<FormToggle fieldPath="training.sage_attn" checked={t.sage_attn ?? false} onchange={(e) => update('sage_attn', e.target.checked)} tooltip="Sage Attention backend" />
 								<FormToggle fieldPath="training.xformers" checked={t.xformers ?? false} onchange={(e) => update('xformers', e.target.checked)} tooltip="xFormers attention" />
 								<FormToggle fieldPath="training.gemma_bnb_4bit_disable_double_quant" checked={t.gemma_bnb_4bit_disable_double_quant ?? false} onchange={(e) => update('gemma_bnb_4bit_disable_double_quant', e.target.checked)} tooltip="Disable double quantization (4-bit)" />
+								<FormToggle label="Gemma LOCAL_RANK" fieldPath="training.gemma_bnb_use_local_rank" checked={t.gemma_bnb_use_local_rank ?? false} onchange={(e) => update('gemma_bnb_use_local_rank', e.target.checked)} tooltip="Pin bitsandbytes Gemma loading to LOCAL_RANK for multi-GPU runs." />
 								<FormToggle fieldPath="training.ltx2_audio_only_model" checked={t.ltx2_audio_only_model ?? false} onchange={(e) => update('ltx2_audio_only_model', e.target.checked)} tooltip="Audio-only model architecture" />
 							</div>
 						{/if}
@@ -821,6 +822,7 @@
 							<FormToggle fieldPath="training.dynamo_dynamic" checked={t.dynamo_dynamic ?? false} onchange={(e) => update('dynamo_dynamic', e.target.checked)} disabled={(t.dynamo_backend || 'NO').toUpperCase() === 'NO'} tooltip="TorchDynamo dynamic mode." />
 							<FormToggle fieldPath="training.ddp_gradient_as_bucket_view" checked={t.ddp_gradient_as_bucket_view ?? false} onchange={(e) => update('ddp_gradient_as_bucket_view', e.target.checked)} tooltip="Enable DDP gradient_as_bucket_view." />
 							<FormToggle fieldPath="training.ddp_static_graph" checked={t.ddp_static_graph ?? false} onchange={(e) => update('ddp_static_graph', e.target.checked)} tooltip="Enable DDP static_graph." />
+							<FormToggle label="DDP Find Unused" fieldPath="training.ddp_find_unused_parameters" checked={t.ddp_find_unused_parameters ?? false} onchange={(e) => update('ddp_find_unused_parameters', e.target.checked)} tooltip="Enable DDP find_unused_parameters for branchy training graphs." />
 						</div>
 					</div>
 				</FormGroup>
@@ -865,6 +867,7 @@
 							<FormToggle fieldPath="training.use_precached_sample_prompts" checked={t.use_precached_sample_prompts ?? false} onchange={(e) => update('use_precached_sample_prompts', e.target.checked)} tooltip="Use cached text embeddings" />
 							<FormToggle fieldPath="training.use_precached_sample_latents" checked={t.use_precached_sample_latents ?? false} onchange={(e) => update('use_precached_sample_latents', e.target.checked)} tooltip="Use cached I2V latents" />
 							<FormToggle fieldPath="training.sample_with_offloading" checked={t.sample_with_offloading ?? false} onchange={(e) => update('sample_with_offloading', e.target.checked)} tooltip="Offload during sampling" />
+							<FormToggle label="Optimizer Offload Val" fieldPath="training.offload_optimizer_during_validation" checked={t.offload_optimizer_during_validation ?? false} onchange={(e) => update('offload_optimizer_during_validation', e.target.checked)} tooltip="Move CUDA optimizer state to CPU during validation and sample previews, then restore it." />
 							<FormToggle fieldPath="training.sample_merge_audio" checked={t.sample_merge_audio ?? false} onchange={(e) => update('sample_merge_audio', e.target.checked)} tooltip="Merge audio in samples" />
 							<FormToggle fieldPath="training.sample_at_first" checked={t.sample_at_first ?? false} onchange={(e) => update('sample_at_first', e.target.checked)} tooltip="Generate samples before training" />
 							<FormToggle fieldPath="training.sample_tiled_vae" checked={t.sample_tiled_vae ?? false} onchange={(e) => update('sample_tiled_vae', e.target.checked)} tooltip="Tiled VAE for sampling (saves VRAM)" />

@@ -469,7 +469,13 @@ def save_latent_cache_wan(
     save_latent_cache_common(item_info, sd, ARCHITECTURE_WAN_FULL)
 
 
-def save_latent_cache_ltx2(item_info: ItemInfo, latent: torch.Tensor, extra_tensors: Optional[dict[str, torch.Tensor]] = None):
+def save_latent_cache_ltx2(
+    item_info: ItemInfo,
+    latent: torch.Tensor,
+    extra_tensors: Optional[dict[str, torch.Tensor]] = None,
+    *,
+    atomic: bool = False,
+):
     assert latent.dim() == 4, "latent should be 4D tensor (channel, frame, height, width)"
 
     _, F, H, W = latent.shape
@@ -479,7 +485,7 @@ def save_latent_cache_ltx2(item_info: ItemInfo, latent: torch.Tensor, extra_tens
         for key, value in extra_tensors.items():
             sd[key] = value.detach().cpu().contiguous()
 
-    save_latent_cache_common(item_info, sd, ARCHITECTURE_LTX2_FULL)
+    save_latent_cache_common(item_info, sd, ARCHITECTURE_LTX2_FULL, atomic=atomic)
 
 
 def save_latent_cache_framepack(
@@ -648,7 +654,7 @@ def save_latent_cache_z_image(item_info: ItemInfo, latent: torch.Tensor):
     save_latent_cache_common(item_info, sd, ARCHITECTURE_Z_IMAGE_FULL)
 
 
-def save_latent_cache_common(item_info: ItemInfo, sd: dict[str, torch.Tensor], arch_fullname: str):
+def save_latent_cache_common(item_info: ItemInfo, sd: dict[str, torch.Tensor], arch_fullname: str, *, atomic: bool = False):
     metadata = {
         "architecture": arch_fullname,
         "width": f"{item_info.original_size[0]}",
@@ -667,7 +673,10 @@ def save_latent_cache_common(item_info: ItemInfo, sd: dict[str, torch.Tensor], a
     latent_dir = os.path.dirname(item_info.latent_cache_path)
     os.makedirs(latent_dir, exist_ok=True)
 
-    save_file(sd, item_info.latent_cache_path, metadata=metadata)
+    if atomic:
+        safetensors_utils.save_file_atomic(sd, item_info.latent_cache_path, metadata=metadata)
+    else:
+        save_file(sd, item_info.latent_cache_path, metadata=metadata)
 
 
 def save_text_encoder_output_cache(item_info: ItemInfo, embed: torch.Tensor, mask: Optional[torch.Tensor], is_llm: bool):
@@ -721,6 +730,7 @@ def save_text_encoder_output_cache_ltx2_gemma(
     audio_prompt_embeds: Optional[torch.Tensor] = None,
     video_features: Optional[torch.Tensor] = None,
     audio_features: Optional[torch.Tensor] = None,
+    atomic: bool = False,
 ):
     assert video_prompt_embeds.dim() == 1 or video_prompt_embeds.dim() == 2, (
         f"video_prompt_embeds should be 2D tensor (feature, hidden_size) or (hidden_size,), got {video_prompt_embeds.shape}"
@@ -755,7 +765,7 @@ def save_text_encoder_output_cache_ltx2_gemma(
     if prompt_attention_mask is not None:
         sd["text_mask"] = prompt_attention_mask.detach().cpu()
 
-    save_text_encoder_output_cache_common(item_info, sd, ARCHITECTURE_LTX2_FULL)
+    save_text_encoder_output_cache_common(item_info, sd, ARCHITECTURE_LTX2_FULL, atomic=atomic)
 
 
 def save_text_encoder_output_cache_framepack(
@@ -836,7 +846,13 @@ def save_text_encoder_output_cache_z_image(item_info: ItemInfo, embed: torch.Ten
     save_text_encoder_output_cache_common(item_info, sd, ARCHITECTURE_Z_IMAGE_FULL)
 
 
-def save_text_encoder_output_cache_common(item_info: ItemInfo, sd: dict[str, torch.Tensor], arch_fullname: str):
+def save_text_encoder_output_cache_common(
+    item_info: ItemInfo,
+    sd: dict[str, torch.Tensor],
+    arch_fullname: str,
+    *,
+    atomic: bool = False,
+):
     for key, value in sd.items():
         # NaN check and show warning, replace NaN with 0
         if torch.isnan(value).any():
@@ -869,7 +885,7 @@ def save_text_encoder_output_cache_common(item_info: ItemInfo, sd: dict[str, tor
         text_encoder_output_dir = os.path.dirname(item_info.text_encoder_output_cache_path)
         os.makedirs(text_encoder_output_dir, exist_ok=True)
 
-    safetensors_utils.mem_eff_save_file(sd, item_info.text_encoder_output_cache_path, metadata=metadata)
+    safetensors_utils.mem_eff_save_file(sd, item_info.text_encoder_output_cache_path, metadata=metadata, atomic=atomic)
 
 
 class BucketSelector:

@@ -60,6 +60,14 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         help="Disable bitsandbytes double quant for 4-bit loading.",
     )
     parser.add_argument(
+        "--gemma_bnb_use_local_rank",
+        action="store_true",
+        help=(
+            "For Gemma 8-bit/4-bit loading, place the quantized model on this process's LOCAL_RANK device. "
+            "Useful for multi-GPU accelerate launches; disabled by default to preserve existing loading behavior."
+        ),
+    )
+    parser.add_argument(
         "--gemma_fp8_weight_offload",
         action=argparse.BooleanOptionalAction,
         default=None,

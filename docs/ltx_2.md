@@ -202,6 +202,7 @@ python ltx2_cache_latents.py ^
 - `--sample_latents_cache`: Path for the I2V conditioning latents cache file (default: `<cache_dir>/ltx2_sample_latents_cache.pt`).
 - `--reference_frames`: Number of reference frames to cache for IC-LoRA / V2V (default: `1`).
 - `--reference_downscale`: Spatial downscale factor for cached reference latents (default: `1`).
+- `--atomic_cache_writes`: Opt-in safety mode. Writes cache files to a temporary sibling file first, then replaces the final cache path only after a successful save.
 
 ### Latent Cache Output Files
 
@@ -268,6 +269,7 @@ python ltx2_cache_text_encoder_outputs.py ^
 - `--gemma_bnb_4bit_compute_dtype auto|fp16|bf16|fp32`: Compute dtype for 4-bit operations (default: `auto`, uses `--mixed_precision` dtype).
 - `--ltx2_checkpoint`: Required. Use `--ltx2_text_encoder_checkpoint` to override for text encoder connector weights.
 - `--cache_before_connector`: Also save pre-connector text features (`video_features_{dtype}`, `audio_features_{dtype}`) alongside standard post-connector embeddings. Required for `--train_connectors` during training. Does not change standard cache keys; only adds extra tensors.
+- `--atomic_cache_writes`: Opt-in safety mode. Writes text and prompt cache files to a temporary sibling file first, then replaces the final cache path only after a successful save.
 - 8-bit/4-bit loading requires `--device cuda`.
 
 > [!IMPORTANT]
@@ -480,11 +482,14 @@ NF4 has ~4x higher weight error than FP8 (cosine 0.996 vs 0.9997). The base mode
 | `--use_pinned_memory_for_block_swap` | Use pinned memory for faster CPU↔GPU block transfers |
 | `--gradient_checkpointing` | Reduce VRAM by recomputing activations during backward pass |
 | `--gradient_checkpointing_cpu_offload` | Offload activations to CPU during gradient checkpointing |
+| `--offload_optimizer_during_validation` | Offload CUDA optimizer state to CPU during validation and sample previews (off by default) |
 | `--ffn_chunk_target` | `all`, `video`, or `audio` — enable FFN chunking for selected modules |
 | `--ffn_chunk_size N` | Chunk size for FFN chunking (0 = disabled) |
 | `--split_attn_target` | `none`, `all`, `self`, `cross`, `text_cross`, `av_cross`, `video`, `audio` — split attention target modules |
 | `--split_attn_mode` | `batch` or `query` — split by batch dimension or query length |
 | `--split_attn_chunk_size N` | Chunk size for query-based split attention (0 = default 1024) |
+| `--ddp_find_unused_parameters` | Enable DDP unused-parameter detection for branchy LoRA targets (off by default) |
+| `--gemma_bnb_use_local_rank` | For Gemma 8-bit/4-bit loading, pin the quantized model to this process's `LOCAL_RANK` GPU (off by default) |
 | `--sdpa` | Use PyTorch scaled dot-product attention (recommended default) |
 | `--flash_attn` | Use FlashAttention 2 (requires `flash-attn` package built for your CUDA + PyTorch) |
 | `--flash3` | Use FlashAttention 3 (requires `flash-attn` v3 with Hopper+ GPU) |
@@ -1018,6 +1023,7 @@ python ltx2_cache_dino_features.py ^
 - `--dino_repo_path`: Local `facebookresearch/dinov2` clone containing `hubconf.py`. Uses `torch.hub` with `source="local"` and avoids a GitHub fetch.
 - `--torch_hub_dir`: Torch hub cache directory. Use this when the DINOv2 repo/weights are already pre-populated in a local cache.
 - `--skip_existing`: Skip items that already have cached features.
+- `--atomic_cache_writes`: Opt-in safety mode. Writes each DINO cache through a temporary sibling file before replacing the final path.
 
 Output: `*_ltx2_dino.safetensors` files alongside your latent caches, containing per-frame patch tokens `[T, N_patches, D]`. For `dinov2_vitb14` at 518px input: `N_patches=1369`, `D=768`, so each frame adds ~2MB (float16). Disk usage scales linearly with frame count.
 
@@ -2269,6 +2275,7 @@ Both scripts detect the `[[validation_datasets]]` section and cache latents/text
 |----------|------|---------|-------------|
 | `--validate_every_n_steps` | int | None | Run validation every N training steps |
 | `--validate_every_n_epochs` | int | None | Run validation every N epochs |
+| `--offload_optimizer_during_validation` | flag | off | Temporarily move CUDA optimizer state to CPU while validation/sample previews run |
 
 At least one of these must be set for validation to run. If neither is set, validation is skipped even if `[[validation_datasets]]` is configured.
 

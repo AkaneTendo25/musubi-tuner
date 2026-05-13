@@ -39,7 +39,7 @@ from musubi_tuner.ltx_2.model.audio_vae.audio_vae import LATENT_DOWNSAMPLE_FACTO
 from musubi_tuner.ltx_2.env import get_ltx2_env
 from musubi_tuner.model_defaults import default_ltx2_checkpoint_path
 from musubi_tuner.utils.model_utils import str_to_dtype
-from musubi_tuner.utils.safetensors_utils import MemoryEfficientSafeOpen
+from musubi_tuner.utils.safetensors_utils import MemoryEfficientSafeOpen, atomic_torch_save, save_file_atomic
 
 
 logger = logging.getLogger(__name__)
@@ -94,7 +94,7 @@ def _load_datasets(args: argparse.Namespace) -> Sequence[BaseDataset]:
     return cast(Sequence[BaseDataset], datasets)
 
 
-def encode_and_save_batch(vae, batch: List[ItemInfo], tiling_config=None) -> None:
+def encode_and_save_batch(vae, batch: List[ItemInfo], tiling_config=None, *, atomic_cache_writes: bool = False) -> None:
     contents = torch.stack([torch.from_numpy(item.content) for item in batch])
     if contents.ndim == 4:
         contents = contents.unsqueeze(1)
@@ -161,7 +161,7 @@ def encode_and_save_batch(vae, batch: List[ItemInfo], tiling_config=None) -> Non
                 align_corners=False,
             )[0].clamp(0.0, 1.0)
             extra_tensors = {"video_loss_mask": latent_mask.to(dtype=torch.float32)}
-        save_latent_cache_ltx2(item, latents[idx], extra_tensors=extra_tensors)
+        save_latent_cache_ltx2(item, latents[idx], extra_tensors=extra_tensors, atomic=atomic_cache_writes)
 
 
 def _adjust_ltx2_frame_count(frame_count: int) -> int:
@@ -360,6 +360,7 @@ def encode_and_save_audio_cache(
     dtype: torch.dtype,
     target_fps: float = 25.0,
     audio_only: bool = False,
+    atomic_cache_writes: bool = False,
 ) -> None:
     try:
         import torchaudio
@@ -560,7 +561,10 @@ def encode_and_save_audio_cache(
         "format_version": "1.0.1",
     }
 
-    save_file(sd, audio_cache_path, metadata=metadata)
+    if atomic_cache_writes:
+        save_file_atomic(sd, audio_cache_path, metadata=metadata)
+    else:
+        save_file(sd, audio_cache_path, metadata=metadata)
 
 
 def _find_reference_file(reference_directory: str, stem: str) -> Optional[str]:
@@ -688,6 +692,7 @@ def encode_and_save_latent_guides(
     dataset object at training time, not stored in the cache.
     """
     skip_existing = getattr(args, "skip_existing", False)
+    atomic_cache_writes = bool(getattr(args, "atomic_cache_writes", False))
     num_workers = args.num_workers if args.num_workers is not None else max(1, (os.cpu_count() or 2) - 1)
 
     vae_param = next(vae.parameters())
@@ -797,7 +802,7 @@ def encode_and_save_latent_guides(
                         )
                         guide_item_info.latent_cache_path = cache_path
                         guide_item_info.frame_count = 1
-                        save_latent_cache_ltx2(guide_item_info, guide_latent)
+                        save_latent_cache_ltx2(guide_item_info, guide_latent, atomic=atomic_cache_writes)
                         per_kind_stats[kind]["cached"] += 1
                     except Exception as e:
                         logger.warning("Failed to cache %s for %r: %s", label, stem, e)
@@ -822,6 +827,7 @@ def encode_and_save_reference_latents(
     default_num_frames = max(1, int(getattr(args, "reference_frames", 1) or 1))
     downscale_factor = max(1, getattr(args, "reference_downscale", 1))
     skip_existing = getattr(args, "skip_existing", False)
+    atomic_cache_writes = bool(getattr(args, "atomic_cache_writes", False))
     num_workers = args.num_workers if args.num_workers is not None else max(1, (os.cpu_count() or 2) - 1)
 
     vae_param = next(vae.parameters())
@@ -939,7 +945,7 @@ def encode_and_save_reference_latents(
                         )
                         ref_item_info.latent_cache_path = ref_cache_path
                         ref_item_info.frame_count = num_frames
-                        save_latent_cache_ltx2(ref_item_info, ref_latent)
+                        save_latent_cache_ltx2(ref_item_info, ref_latent, atomic=atomic_cache_writes)
                         cached_count += 1
 
                 except Exception as e:
@@ -962,6 +968,7 @@ def encode_and_save_reference_audio_latents(
 ) -> None:
     """Encode reference-audio files and save latent caches for audio_ref_ic training."""
     skip_existing = getattr(args, "skip_existing", False)
+    atomic_cache_writes = bool(getattr(args, "atomic_cache_writes", False))
     num_workers = args.num_workers if args.num_workers is not None else max(1, (os.cpu_count() or 2) - 1)
     preferred_ext = getattr(args, "ltx2_audio_ext", None)
 
@@ -1054,6 +1061,7 @@ def encode_and_save_reference_audio_latents(
                             dtype=dtype,
                             target_fps=float(ds_target_fps),
                             audio_only=False,
+                            atomic_cache_writes=atomic_cache_writes,
                         )
                         cached_count += 1
                 except Exception as e:
@@ -1362,7 +1370,10 @@ def _precache_sample_latents(args: argparse.Namespace, device: torch.device) -> 
         "version": 1,
         "latent_cache": latent_cache,
     }
-    torch.save(payload, cache_path)
+    if bool(getattr(args, "atomic_cache_writes", False)):
+        atomic_torch_save(payload, cache_path)
+    else:
+        torch.save(payload, cache_path)
     logger.info(
         "Saved %d sample conditioning latents (I2V/V2V/reference-audio) to %s",
         len(latent_cache),
@@ -1467,8 +1478,10 @@ def main() -> None:
                 temporal_config=temporal_config,
             )
 
+        atomic_cache_writes = bool(getattr(args, "atomic_cache_writes", False))
+
         def encode_fn(batch: List[ItemInfo]) -> None:
-            encode_and_save_batch(vae, batch, tiling_config)
+            encode_and_save_batch(vae, batch, tiling_config, atomic_cache_writes=atomic_cache_writes)
 
         # Only pass non-audio datasets to the video encoder; AudioDataset items have
         # content=None (no visual frames) and are handled separately below.
@@ -1574,6 +1587,7 @@ def main() -> None:
                         "ltx2_virtual_height_int32": torch.tensor(int(virtual_height), dtype=torch.int32),
                         "ltx2_virtual_width_int32": torch.tensor(int(virtual_width), dtype=torch.int32),
                     },
+                    atomic=bool(getattr(args, "atomic_cache_writes", False)),
                 )
 
         cache_latents.encode_datasets(list(audio_datasets), encode_audio_only_video_latents, args)
@@ -1650,6 +1664,7 @@ def main() -> None:
                             dtype=audio_dtype,
                             target_fps=ds_target_fps,
                             audio_only=audio_only,
+                            atomic_cache_writes=bool(getattr(args, "atomic_cache_writes", False)),
                         )
                         audio_encoded_count += 1
                     except Exception as e:
@@ -1754,6 +1769,11 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         "--precache_sample_latents",
         action="store_true",
         help="Cache I2V/V2V/reference-audio conditioning latents for sample prompts, then continue normal dataset latent caching.",
+    )
+    parser.add_argument(
+        "--atomic_cache_writes",
+        action="store_true",
+        help="Write cache files to a temporary sibling file and atomically replace the final path after a successful save.",
     )
     parser.add_argument(
         "--sample_prompts",

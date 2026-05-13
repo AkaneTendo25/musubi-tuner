@@ -25,6 +25,7 @@ from musubi_tuner.dataset.image_video_dataset import (
     BaseDataset,
     VideoDataset,
 )
+from musubi_tuner.utils.safetensors_utils import save_file_atomic
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -184,6 +185,11 @@ def main() -> None:
     )
     parser.add_argument("--device", type=str, default=None, help="Torch device (default: cuda if available)")
     parser.add_argument("--skip_existing", action="store_true", help="Skip items that already have dino caches")
+    parser.add_argument(
+        "--atomic_cache_writes",
+        action="store_true",
+        help="Write cache files to a temporary sibling file and atomically replace the final path after a successful save.",
+    )
     parser.add_argument("--num_workers", type=int, default=None, help="Number of workers for dataset loading")
     # These are required by _load_datasets / BlueprintGenerator but unused here
     parser.add_argument("--vae", type=str, default=None)
@@ -252,16 +258,16 @@ def main() -> None:
                     continue
 
                 os.makedirs(os.path.dirname(dino_path), exist_ok=True)
-                save_file(
-                    {"dino_features": patch_tokens},
-                    dino_path,
-                    metadata={
-                        "dino_model": args.dino_model,
-                        "dino_dim": str(dino_dim),
-                        "num_frames": str(patch_tokens.shape[0]),
-                        "num_patches": str(patch_tokens.shape[1]),
-                    },
-                )
+                metadata = {
+                    "dino_model": args.dino_model,
+                    "dino_dim": str(dino_dim),
+                    "num_frames": str(patch_tokens.shape[0]),
+                    "num_patches": str(patch_tokens.shape[1]),
+                }
+                if args.atomic_cache_writes:
+                    save_file_atomic({"dino_features": patch_tokens}, dino_path, metadata=metadata)
+                else:
+                    save_file({"dino_features": patch_tokens}, dino_path, metadata=metadata)
                 total_cached += 1
 
     logger.info("Done. Cached: %d, Skipped: %d", total_cached, total_skipped)

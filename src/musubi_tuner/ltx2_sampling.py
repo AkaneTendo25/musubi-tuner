@@ -836,6 +836,11 @@ class LTX2SamplingMixin:
 
         build_device = accelerator.device
         is_quantized_load = getattr(args, "gemma_load_in_8bit", False) or getattr(args, "gemma_load_in_4bit", False)
+        bnb_device_map = None
+        if is_quantized_load and bool(getattr(args, "gemma_bnb_use_local_rank", False)):
+            local_rank = int(os.environ.get("LOCAL_RANK", getattr(accelerator, "local_process_index", 0) or 0))
+            bnb_device_map = {"": local_rank}
+            logger.info("Gemma quantized load: using LOCAL_RANK device_map %s", bnb_device_map)
 
         self._text_encoder = SingleGPUModelBuilder(
             model_path=str(args.ltx2_checkpoint),
@@ -850,6 +855,7 @@ class LTX2SamplingMixin:
                 bnb_4bit_quant_type=str(getattr(args, "gemma_bnb_4bit_quant_type", "nf4")),
                 bnb_4bit_use_double_quant=not bool(getattr(args, "gemma_bnb_4bit_disable_double_quant", False)),
                 bnb_4bit_compute_dtype=text_encoder_dtype,
+                bnb_device_map=bnb_device_map,
                 fp8_weight_offload=getattr(args, "gemma_fp8_weight_offload", None),
                 device=build_device,
             ),

@@ -24,6 +24,7 @@ from musubi_tuner.dataset.image_video_dataset import (
 )
 from musubi_tuner.ltx_2.env import apply_ltx2_tweaks
 from musubi_tuner.model_defaults import default_gemma_root_path, default_ltx2_checkpoint_path
+from musubi_tuner.utils.safetensors_utils import atomic_torch_save
 
 
 logger = logging.getLogger(__name__)
@@ -53,6 +54,7 @@ def encode_and_save_batch_gemma(
     device: torch.device,
     autocast_dtype: torch.dtype | None,
     audio_video: bool,
+    atomic_cache_writes: bool = False,
 ) -> None:
     if autocast_dtype is not None and device.type == "cuda":
         autocast_context = torch.amp.autocast("cuda", dtype=autocast_dtype)
@@ -81,6 +83,7 @@ def encode_and_save_batch_gemma(
                 video_prompt_embeds=video_embed,
                 audio_prompt_embeds=audio_embed_out,
                 prompt_attention_mask=mask,
+                atomic=atomic_cache_writes,
             )
 
 
@@ -91,6 +94,7 @@ def encode_and_save_batch_pre_connector(
     device: torch.device,
     autocast_dtype: torch.dtype | None,
     audio_video: bool,
+    atomic_cache_writes: bool = False,
 ) -> None:
     """Encode and save with both pre-connector features and post-connector embeddings.
 
@@ -134,6 +138,7 @@ def encode_and_save_batch_pre_connector(
                 prompt_attention_mask=mask,
                 video_features=video_feat_out,
                 audio_features=audio_feat_out,
+                atomic=atomic_cache_writes,
             )
 
 
@@ -268,7 +273,10 @@ def _precache_sample_prompts(
         "audio_video": audio_video,
         "prompt_cache": prompt_cache,
     }
-    torch.save(payload, cache_path)
+    if bool(getattr(args, "atomic_cache_writes", False)):
+        atomic_torch_save(payload, cache_path)
+    else:
+        torch.save(payload, cache_path)
     logger.info("Saved precached sample prompts to %s", cache_path)
 
 
@@ -325,7 +333,10 @@ def _precache_preservation_prompts(
         payload["dop_class_prompt"] = dop_class
         logger.info("Preservation cache: encoded DOP class prompt %r  embed=%s", dop_class, tuple(embed.shape))
 
-    torch.save(payload, cache_path)
+    if bool(getattr(args, "atomic_cache_writes", False)):
+        atomic_torch_save(payload, cache_path)
+    else:
+        torch.save(payload, cache_path)
     logger.info("Saved preservation prompt cache to %s", cache_path)
 
 
@@ -461,6 +472,7 @@ def main() -> None:
         )
 
     cache_before_connector = bool(getattr(args, "cache_before_connector", False))
+    atomic_cache_writes = bool(getattr(args, "atomic_cache_writes", False))
 
     def encode_fn(batch: list[ItemInfo]) -> None:
         if cache_before_connector:
@@ -470,6 +482,7 @@ def main() -> None:
                 device=device,
                 autocast_dtype=autocast_dtype,
                 audio_video=audio_video,
+                atomic_cache_writes=atomic_cache_writes,
             )
         else:
             encode_and_save_batch_gemma(
@@ -478,6 +491,7 @@ def main() -> None:
                 device=device,
                 autocast_dtype=autocast_dtype,
                 audio_video=audio_video,
+                atomic_cache_writes=atomic_cache_writes,
             )
 
     # Text caching is CPU-heavy (tokenization, python-side preprocessing). On Windows, high num_workers
@@ -571,6 +585,11 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         "--precache_sample_prompts",
         action="store_true",
         help="Also cache Gemma embeddings for sample prompts and save to --sample_prompts_cache.",
+    )
+    parser.add_argument(
+        "--atomic_cache_writes",
+        action="store_true",
+        help="Write cache files to a temporary sibling file and atomically replace the final path after a successful save.",
     )
     parser.add_argument(
         "--sample_prompts",

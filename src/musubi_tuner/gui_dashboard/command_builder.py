@@ -176,6 +176,8 @@ def build_cache_latents_cmd(config: ProjectConfig) -> list[str]:
         cmd += ["--device", c.device]
     if c.skip_existing:
         cmd.append("--skip_existing")
+    if c.atomic_cache_writes:
+        cmd.append("--atomic_cache_writes")
     if c.keep_cache:
         cmd.append("--keep_cache")
     if c.num_workers is not None:
@@ -267,6 +269,8 @@ def build_cache_text_cmd(config: ProjectConfig) -> list[str]:
         cmd += ["--mixed_precision", c.mixed_precision]
     if c.skip_existing:
         cmd.append("--skip_existing")
+    if c.atomic_cache_writes:
+        cmd.append("--atomic_cache_writes")
     if c.keep_cache:
         cmd.append("--keep_cache")
     if c.num_workers is not None:
@@ -624,6 +628,8 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
             cmd += ["--gemma_bnb_4bit_quant_type", t.gemma_bnb_4bit_quant_type]
     if t.gemma_bnb_4bit_disable_double_quant:
         cmd.append("--gemma_bnb_4bit_disable_double_quant")
+    if t.gemma_bnb_use_local_rank:
+        cmd.append("--gemma_bnb_use_local_rank")
     if t.gemma_fp8_weight_offload:
         cmd.append("--gemma_fp8_weight_offload")
     else:
@@ -870,6 +876,8 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
         cmd.append("--ddp_gradient_as_bucket_view")
     if t.ddp_static_graph:
         cmd.append("--ddp_static_graph")
+    if t.ddp_find_unused_parameters:
+        cmd.append("--ddp_find_unused_parameters")
 
     # Sampling
     if t.sample_every_n_steps:
@@ -970,6 +978,8 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
         cmd += ["--validate_every_n_steps", str(t.validate_every_n_steps)]
     if t.validate_every_n_epochs is not None:
         cmd += ["--validate_every_n_epochs", str(t.validate_every_n_epochs)]
+    if t.offload_optimizer_during_validation:
+        cmd.append("--offload_optimizer_during_validation")
 
     # Output
     cmd += ["--output_dir", _effective_output_dir(t.output_dir)]
@@ -1427,6 +1437,8 @@ def build_slider_training_cmd(config: ProjectConfig) -> list[str]:
         cmd.append("--gemma_load_in_8bit")
     if t.gemma_load_in_4bit:
         cmd.append("--gemma_load_in_4bit")
+    if t.gemma_bnb_use_local_rank:
+        cmd.append("--gemma_bnb_use_local_rank")
     if t.gemma_fp8_weight_offload:
         cmd.append("--gemma_fp8_weight_offload")
     else:
@@ -1502,6 +1514,8 @@ def build_cache_dino_cmd(config: ProjectConfig) -> list[str]:
         cmd += ["--torch_hub_dir", c.torch_hub_dir]
     if c.skip_existing:
         cmd.append("--skip_existing")
+    if c.atomic_cache_writes:
+        cmd.append("--atomic_cache_writes")
 
     cmd += _split_cli_args(c.cache_dino_extra_args)
     return cmd

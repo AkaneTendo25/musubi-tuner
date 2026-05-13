@@ -484,6 +484,7 @@ def module_ops_from_gemma_root(
     bnb_4bit_quant_type: str = "nf4",
     bnb_4bit_use_double_quant: bool = True,
     bnb_4bit_compute_dtype: torch.dtype | None = None,
+    bnb_device_map=None,
     fp8_weight_offload: bool | None = None,
     device: torch.device | None = None,
 ) -> tuple[ModuleOps, ...]:
@@ -559,7 +560,7 @@ def module_ops_from_gemma_root(
                 local_files_only=True,
                 torch_dtype=torch_dtype,
                 quantization_config=quantization_config,
-                device_map={"": "cuda"},
+                device_map=bnb_device_map if bnb_device_map is not None else {"": "cuda"},
             )
         else:
             if gemma_weights_path is not None:

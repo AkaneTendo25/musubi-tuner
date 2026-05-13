@@ -89,6 +89,7 @@ class CachingConfig(BaseModel):
     vae_dtype: Optional[Literal["float16", "bfloat16", "float32"]] = None
     device: Optional[str] = None
     skip_existing: bool = False
+    atomic_cache_writes: bool = False
     keep_cache: bool = False
     num_workers: Optional[int] = None
     # VAE tiling
@@ -168,6 +169,7 @@ class TrainingConfig(BaseModel):
     gemma_load_in_4bit: bool = False
     gemma_bnb_4bit_quant_type: Literal["nf4", "fp4"] = "nf4"
     gemma_bnb_4bit_disable_double_quant: bool = False
+    gemma_bnb_use_local_rank: bool = False
     gemma_fp8_weight_offload: bool = True
     ltx2_audio_only_model: bool = False
     vae_dtype: Optional[str] = None
@@ -314,6 +316,7 @@ class TrainingConfig(BaseModel):
     ddp_timeout: Optional[int] = None
     ddp_gradient_as_bucket_view: bool = False
     ddp_static_graph: bool = False
+    ddp_find_unused_parameters: bool = False
 
     # Sampling
     sample_every_n_steps: Optional[int] = None
@@ -369,6 +372,7 @@ class TrainingConfig(BaseModel):
     # Validation
     validate_every_n_steps: Optional[int] = None
     validate_every_n_epochs: Optional[int] = None
+    offload_optimizer_during_validation: bool = False
 
     # Output
     output_dir: str = ""

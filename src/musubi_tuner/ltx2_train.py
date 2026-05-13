@@ -29,6 +29,7 @@ from musubi_tuner.hv_train_network import (
     clean_memory_on_device,
     collator_class,
     compute_loss_weighting_for_sd3,
+    offload_optimizer_state_during_validation,
     prepare_accelerator,
     read_config_from_file,
     set_seed,
@@ -5401,6 +5402,15 @@ def main() -> None:
             return True
         return False
 
+    def run_validation_with_optimizer_offload(step: int, epoch: int) -> dict:
+        with offload_optimizer_state_during_validation(
+            optimizer,
+            accelerator,
+            bool(getattr(args, "offload_optimizer_during_validation", False)),
+            logger=logger,
+        ):
+            return run_validation(step, epoch)
+
     def run_sampling_safely(sample_epoch, sample_step: int) -> None:
         """Run sampling preview without allowing failures to interrupt training."""
         optimizer_eval_fn()
@@ -5413,16 +5423,22 @@ def main() -> None:
             cuda_rng_state = None
 
         try:
-            trainer.sample_images(
+            with offload_optimizer_state_during_validation(
+                optimizer,
                 accelerator,
-                args,
-                sample_epoch,
-                sample_step,
-                vae,
-                transformer,
-                sample_parameters,
-                trainer.dit_dtype,
-            )
+                bool(getattr(args, "offload_optimizer_during_validation", False)),
+                logger=logger,
+            ):
+                trainer.sample_images(
+                    accelerator,
+                    args,
+                    sample_epoch,
+                    sample_step,
+                    vae,
+                    transformer,
+                    sample_parameters,
+                    trainer.dit_dtype,
+                )
         except Exception:
             logger.exception("Sampling failed at step=%s epoch=%s; continuing training.", sample_step, sample_epoch)
             try:
@@ -6122,7 +6138,7 @@ def main() -> None:
                 # Run validation at step intervals
                 if should_validate(global_step, epoch, is_epoch_end=False):
                     optimizer_eval_fn()
-                    run_validation(global_step, epoch)
+                    run_validation_with_optimizer_offload(global_step, epoch)
                     optimizer_train_fn()
 
                 if args.save_every_n_steps is not None and global_step % args.save_every_n_steps == 0:
@@ -6161,7 +6177,7 @@ def main() -> None:
         # Run validation at epoch end
         if should_validate(global_step, epoch, is_epoch_end=True):
             optimizer_eval_fn()
-            run_validation(global_step, epoch + 1)
+            run_validation_with_optimizer_offload(global_step, epoch + 1)
             optimizer_train_fn()
 
         if args.save_every_n_epochs is not None and (epoch + 1) % args.save_every_n_epochs == 0:
@@ -6202,7 +6218,7 @@ def main() -> None:
     # Final validation
     if val_dataloader is not None:
         accelerator.print("\nRunning final validation...")
-        run_validation(global_step, num_train_epochs)
+        run_validation_with_optimizer_offload(global_step, num_train_epochs)
 
     if accelerator.is_main_process and (args.save_state or args.save_state_on_train_end):
         train_utils.save_state_on_train_end(args, accelerator)

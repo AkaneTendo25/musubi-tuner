@@ -2,6 +2,7 @@ import ast
 import asyncio
 import argparse
 from collections import defaultdict, deque
+from contextlib import contextmanager
 from datetime import timedelta
 import gc
 import importlib
@@ -222,6 +223,40 @@ def clean_memory_on_device(device: torch.device):
         torch.mps.empty_cache()
 
 
+@contextmanager
+def offload_optimizer_state_during_validation(
+    optimizer,
+    accelerator: Accelerator,
+    enabled: bool,
+    *,
+    logger=None,
+):
+    """Temporarily move CUDA optimizer state to CPU for validation/sampling."""
+    offloaded: list[tuple[dict, str, torch.device]] = []
+    base_optimizer = getattr(optimizer, "optimizer", optimizer)
+    distributed_type_name = getattr(getattr(accelerator, "distributed_type", None), "name", "")
+
+    if enabled and distributed_type_name != "FSDP" and hasattr(base_optimizer, "state"):
+        offloaded_bytes = 0
+        for state in base_optimizer.state.values():
+            for key, value in list(state.items()):
+                if isinstance(value, torch.Tensor) and value.is_cuda:
+                    offloaded.append((state, key, value.device))
+                    offloaded_bytes += value.numel() * value.element_size()
+                    state[key] = value.cpu()
+
+        if offloaded:
+            if logger is not None:
+                logger.info("Offloaded optimizer state to CPU for validation: %.2f GB", offloaded_bytes / (1024**3))
+            clean_memory_on_device(accelerator.device)
+
+    try:
+        yield
+    finally:
+        for state, key, device in offloaded:
+            state[key] = state[key].to(device)
+
+
 # for collate_fn: epoch and step is multiprocessing.Value
 class collator_class:
     def __init__(self, epoch, dataset):
@@ -288,9 +323,13 @@ def prepare_accelerator(args: argparse.Namespace) -> Accelerator:
         ),
         (
             DistributedDataParallelKwargs(
-                gradient_as_bucket_view=args.ddp_gradient_as_bucket_view, static_graph=args.ddp_static_graph
+                gradient_as_bucket_view=args.ddp_gradient_as_bucket_view,
+                static_graph=args.ddp_static_graph,
+                find_unused_parameters=bool(getattr(args, "ddp_find_unused_parameters", False)),
             )
-            if args.ddp_gradient_as_bucket_view or args.ddp_static_graph
+            if args.ddp_gradient_as_bucket_view
+            or args.ddp_static_graph
+            or bool(getattr(args, "ddp_find_unused_parameters", False))
             else None
         ),
     ]
@@ -3850,7 +3889,13 @@ class NetworkTrainer:
         # For --sample_at_first (skip on resume — samples were already generated)
         if global_step == 0 and should_sample_images(args, global_step, epoch=0):
             set_trainer_eval_mode()
-            self.sample_images(accelerator, args, 0, global_step, vae, transformer, sample_parameters, dit_dtype)
+            with offload_optimizer_state_during_validation(
+                optimizer,
+                accelerator,
+                bool(getattr(args, "offload_optimizer_during_validation", False)),
+                logger=logger,
+            ):
+                self.sample_images(accelerator, args, 0, global_step, vae, transformer, sample_parameters, dit_dtype)
             set_trainer_train_mode()
         if len(accelerator.trackers) > 0:
             # log empty object to commit the sample images to wandb
@@ -4536,7 +4581,15 @@ class NetworkTrainer:
                     if should_sampling or should_saving:
                         set_trainer_eval_mode()
                         if should_sampling:
-                            self.sample_images(accelerator, args, None, global_step, vae, transformer, sample_parameters, dit_dtype)
+                            with offload_optimizer_state_during_validation(
+                                optimizer,
+                                accelerator,
+                                bool(getattr(args, "offload_optimizer_during_validation", False)),
+                                logger=logger,
+                            ):
+                                self.sample_images(
+                                    accelerator, args, None, global_step, vae, transformer, sample_parameters, dit_dtype
+                                )
                             if gui_metrics is not None:
                                 gui_metrics.log_event("sample", global_step)
 
@@ -4673,7 +4726,13 @@ class NetworkTrainer:
                     and args.validate_every_n_steps is not None
                     and global_step % args.validate_every_n_steps == 0
                 ):
-                    run_validation(global_step)
+                    with offload_optimizer_state_during_validation(
+                        optimizer,
+                        accelerator,
+                        bool(getattr(args, "offload_optimizer_during_validation", False)),
+                        logger=logger,
+                    ):
+                        run_validation(global_step)
 
                 _prev_step_end_time = time.perf_counter()
                 if global_step >= args.max_train_steps:
@@ -4691,7 +4750,13 @@ class NetworkTrainer:
                 and args.validate_every_n_epochs is not None
                 and (epoch + 1) % args.validate_every_n_epochs == 0
             ):
-                run_validation(global_step, epoch_no=epoch + 1)
+                with offload_optimizer_state_during_validation(
+                    optimizer,
+                    accelerator,
+                    bool(getattr(args, "offload_optimizer_during_validation", False)),
+                    logger=logger,
+                ):
+                    run_validation(global_step, epoch_no=epoch + 1)
 
             accelerator.wait_for_everyone()
 
@@ -4721,7 +4786,18 @@ class NetworkTrainer:
                             "loss_count": len(loss_recorder.loss_list),
                         })
 
-            self.sample_images(accelerator, args, epoch + 1, global_step, vae, transformer, sample_parameters, dit_dtype)
+            offload_epoch_sample_optimizer = bool(getattr(args, "offload_optimizer_during_validation", False)) and (
+                should_sample_images(args, global_step, epoch=epoch + 1)
+            )
+            with offload_optimizer_state_during_validation(
+                optimizer,
+                accelerator,
+                offload_epoch_sample_optimizer,
+                logger=logger,
+            ):
+                self.sample_images(
+                    accelerator, args, epoch + 1, global_step, vae, transformer, sample_parameters, dit_dtype
+                )
             set_trainer_train_mode()
 
             # end of epoch
@@ -4995,6 +5071,11 @@ def setup_parser_common() -> argparse.ArgumentParser:
         action="store_true",
         help="enable static_graph for DDP / DDPでstatic_graphを有効にする",
     )
+    parser.add_argument(
+        "--ddp_find_unused_parameters",
+        action="store_true",
+        help="enable find_unused_parameters for DDP; useful when optional branches leave some trainable params unused",
+    )
 
     parser.add_argument(
         "--sample_every_n_steps",
@@ -5028,6 +5109,11 @@ def setup_parser_common() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="run validation every N epochs (requires validation_datasets in dataset config)",
+    )
+    parser.add_argument(
+        "--offload_optimizer_during_validation",
+        action="store_true",
+        help="temporarily move CUDA optimizer state to CPU during validation and sample previews",
     )
 
     # optimizer and lr scheduler settings

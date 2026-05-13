@@ -1,18 +1,67 @@
 from dataclasses import dataclass
 import os
 import re
+import tempfile
 import numpy as np
 import torch
 import json
 import struct
 from typing import Dict, Any, Union, Optional
 
-from safetensors.torch import load_file
+from safetensors.torch import load_file, save_file
 
 from musubi_tuner.utils.device_utils import synchronize_device
 
 
-def mem_eff_save_file(tensors: Dict[str, torch.Tensor], filename: str, metadata: Dict[str, Any] = None):
+def _make_atomic_temp_path(filename: str) -> str:
+    target_path = os.path.abspath(os.fspath(filename))
+    target_dir = os.path.dirname(target_path)
+    os.makedirs(target_dir, exist_ok=True)
+    fd, temp_path = tempfile.mkstemp(
+        prefix=f".{os.path.basename(target_path)}.",
+        suffix=".tmp",
+        dir=target_dir,
+    )
+    os.close(fd)
+    return temp_path
+
+
+def _remove_temp_file(temp_path: Optional[str]) -> None:
+    if not temp_path:
+        return
+    try:
+        os.remove(temp_path)
+    except FileNotFoundError:
+        pass
+
+
+def save_file_atomic(tensors: Dict[str, torch.Tensor], filename: str, metadata: Dict[str, Any] = None) -> None:
+    temp_path = _make_atomic_temp_path(filename)
+    try:
+        save_file(tensors, temp_path, metadata=metadata)
+        os.replace(temp_path, filename)
+    except Exception:
+        _remove_temp_file(temp_path)
+        raise
+
+
+def atomic_torch_save(obj: Any, filename: str) -> None:
+    temp_path = _make_atomic_temp_path(filename)
+    try:
+        torch.save(obj, temp_path)
+        os.replace(temp_path, filename)
+    except Exception:
+        _remove_temp_file(temp_path)
+        raise
+
+
+def mem_eff_save_file(
+    tensors: Dict[str, torch.Tensor],
+    filename: str,
+    metadata: Dict[str, Any] = None,
+    *,
+    atomic: bool = False,
+):
     """
     memory efficient save file
     """
@@ -62,25 +111,33 @@ def mem_eff_save_file(tensors: Dict[str, torch.Tensor], filename: str, metadata:
     hjson = json.dumps(header).encode("utf-8")
     hjson += b" " * (-(len(hjson) + 8) % _ALIGN)
 
-    with open(filename, "wb") as f:
-        f.write(struct.pack("<Q", len(hjson)))
-        f.write(hjson)
+    temp_path = _make_atomic_temp_path(filename) if atomic else None
+    output_filename = temp_path if temp_path is not None else filename
+    try:
+        with open(output_filename, "wb") as f:
+            f.write(struct.pack("<Q", len(hjson)))
+            f.write(hjson)
 
-        for k, v in tensors.items():
-            if v.numel() == 0:
-                continue
-            if v.is_cuda:
-                # Direct GPU to disk save
-                with torch.cuda.device(v.device):
+            for k, v in tensors.items():
+                if v.numel() == 0:
+                    continue
+                if v.is_cuda:
+                    # Direct GPU to disk save
+                    with torch.cuda.device(v.device):
+                        if v.dim() == 0:  # if scalar, need to add a dimension to work with view
+                            v = v.unsqueeze(0)
+                        tensor_bytes = v.contiguous().view(torch.uint8)
+                        tensor_bytes.cpu().numpy().tofile(f)
+                else:
+                    # CPU tensor save
                     if v.dim() == 0:  # if scalar, need to add a dimension to work with view
                         v = v.unsqueeze(0)
-                    tensor_bytes = v.contiguous().view(torch.uint8)
-                    tensor_bytes.cpu().numpy().tofile(f)
-            else:
-                # CPU tensor save
-                if v.dim() == 0:  # if scalar, need to add a dimension to work with view
-                    v = v.unsqueeze(0)
-                v.contiguous().view(torch.uint8).numpy().tofile(f)
+                    v.contiguous().view(torch.uint8).numpy().tofile(f)
+        if temp_path is not None:
+            os.replace(temp_path, filename)
+    except Exception:
+        _remove_temp_file(temp_path)
+        raise
 
 
 class MemoryEfficientSafeOpen:
