@@ -121,6 +121,8 @@ def iter_active_adapter_bindings(transformer) -> Iterator[Tuple[str, torch.nn.Mo
         adapter_type = None
         if lo_ra_module is not None and isinstance(bound, lo_ra_module):
             adapter_type = "lora"
+        elif bound.__class__.__module__.startswith("musubi_tuner.networks.lokr"):
+            adapter_type = "lora"
         elif lycoris_base_module is not None and isinstance(bound, lycoris_base_module):
             adapter_type = "lycoris"
         if adapter_type is None:
@@ -263,6 +265,24 @@ def get_adapter_norm_samples(transformer, limit: int = 5) -> List[str]:
                     down_norm = down.weight.norm().item()
                 stats.append(
                     f"{name}: up_norm={up_norm:.6f}, down_norm={down_norm:.6f}, mult={float(getattr(bound, 'multiplier', 1.0)):.3f}"
+                )
+            except Exception:
+                pass
+            if len(stats) >= limit:
+                break
+            continue
+
+        if adapter_type == "lora" and bound.__class__.__module__.startswith("musubi_tuner.networks.lokr"):
+            try:
+                parts = []
+                for pn in ("lokr_w1", "lokr_w2", "lokr_w2_a", "lokr_w2_b"):
+                    p = getattr(bound, pn, None)
+                    if isinstance(p, torch.nn.Parameter):
+                        parts.append(f"{pn}_norm={p.detach().float().norm().item():.6f}")
+                    if len(parts) >= 2:
+                        break
+                stats.append(
+                    f"{name}: {' '.join(parts)}, mult={float(getattr(bound, 'multiplier', 1.0)):.3f}"
                 )
             except Exception:
                 pass

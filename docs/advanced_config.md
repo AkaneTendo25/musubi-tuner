@@ -7,6 +7,7 @@
 - [Using configuration files to specify training options](#using-configuration-files-to-specify-training-options--設定ファイルを使用した学習オプションの指定)
 - [How to specify `network_args`](#how-to-specify-network_args--network_argsの指定方法)
 - [LoRA+](#lora)
+- [DoRA](#dora)
 - [Select the target modules of LoRA](#select-the-target-modules-of-lora--loraの対象モジュールを選択する)
 - [Save and view logs in TensorBoard format](#save-and-view-logs-in-tensorboard-format--tensorboard形式のログの保存と参照)
 - [Save and view logs in wandb](#save-and-view-logs-in-wandb--wandbでログの保存と参照)
@@ -145,6 +146,35 @@ LoRA+は、LoRAのUP側（LoRA-B）の学習率を上げることで学習速度
 ```bash
 accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 src/musubi_tuner/hv_train_network.py --dit ... 
     --network_module networks.lora --network_dim 32 --network_args "loraplus_lr_ratio=4" ...
+```
+
+## DoRA
+
+DoRA (Weight-Decomposed Low-Rank Adaptation) keeps the low-rank directional update of LoRA, but learns a separate magnitude vector for each output channel. In practice this often gives stronger adaptation than plain LoRA at the same rank / alpha when the parameter budget is tight.
+
+In musubi-tuner, DoRA is enabled inside the normal LoRA modules for the model families that support it. That means:
+
+- You keep the same `--network_module` you would use for LoRA.
+- You enable DoRA with `--network_args "use_dora=true"`.
+- Saved weights keep the regular LoRA tensors and add a learned magnitude vector automatically.
+
+If `use_dora` is omitted or set to `false`, normal LoRA is used.
+
+Example:
+
+```bash
+accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 src/musubi_tuner/hv_train_network.py --dit ... \
+    --network_module networks.lora --network_dim 32 --network_alpha 32 \
+    --network_args "use_dora=true"
+```
+
+TOML:
+
+```toml
+network_module = "networks.lora"
+network_dim = 32
+network_alpha = 32
+network_args = ["use_dora=true"]
 ```
 
 ## Select the target modules of LoRA / LoRAの対象モジュールを選択する

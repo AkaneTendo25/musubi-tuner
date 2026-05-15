@@ -70,6 +70,16 @@ class GemmaTextEncoderModelBase(torch.nn.Module):
             dtype
         ).max
 
+    def _compute_right_pad_order(self, additive_mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        binary = (additive_mask[:, 0, 0, :] >= 0).to(torch.int32)
+        sort_idx = torch.argsort(binary, dim=-1, descending=True, stable=True)
+        new_binary = torch.gather(binary, 1, sort_idx)
+        new_additive = (new_binary.to(additive_mask.dtype) - 1) * torch.finfo(additive_mask.dtype).max
+        return sort_idx, new_additive[:, None, None, :]
+
+    def _apply_right_pad_order(self, features: torch.Tensor, sort_idx: torch.Tensor) -> torch.Tensor:
+        return torch.gather(features, 1, sort_idx.unsqueeze(-1).expand_as(features))
+
     def _preprocess_text(
         self, text: str, padding_side: str = "left"
     ) -> tuple[torch.Tensor | tuple[torch.Tensor, torch.Tensor | None], torch.Tensor]:

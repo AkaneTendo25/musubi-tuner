@@ -5,6 +5,7 @@ Provides enhancements to LyCORIS:
 - Integration helpers
 """
 
+import importlib.util
 import logging
 import math
 from typing import Any, Dict, Optional
@@ -257,11 +258,7 @@ def validate_lycoris_available() -> bool:
     Returns:
         True if LyCORIS is available, False otherwise
     """
-    try:
-        import lycoris
-        return True
-    except ImportError:
-        return False
+    return importlib.util.find_spec("lycoris") is not None
 
 
 def get_lycoris_info() -> Dict[str, Any]:

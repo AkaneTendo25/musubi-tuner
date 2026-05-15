@@ -23,6 +23,14 @@ from safetensors.torch import load_file
 
 from musubi_tuner.hv_generate_video import setup_parser_compile
 from musubi_tuner.ltx2_defaults import get_ltx2_sampling_preset
+from musubi_tuner.ltx2_lora_utils import (
+    apply_lora_network_for_inference,
+    import_lora_network_module,
+    infer_lora_network_module,
+    load_lora_metadata,
+    lora_module_count,
+    parse_lora_network_args,
+)
 from musubi_tuner.model_defaults import default_gemma_root_path, default_ltx2_checkpoint_path
 from musubi_tuner.ltx2_train_network import LTX2NetworkTrainer
 from musubi_tuner.networks import lora_ltx2
@@ -197,10 +205,11 @@ def parse_args() -> argparse.Namespace:
         "--sample_sigma_schedule",
         type=str,
         default="auto",
-        choices=["auto", "ltx", "ltx23_distilled"],
+        choices=["auto", "ltx", "ltx_latent", "ltx23_distilled"],
         help=(
-            "Sigma schedule. 'auto' uses LTX token-shifted sigmas, and the exact "
-            "LTX-2.3 distilled sigmas for the distilled_two_stage preset."
+            "Sigma schedule. 'auto' uses the official LTX schedule, uses latent-aware "
+            "shifted sigmas for ltx23_hq, and uses the exact LTX-2.3 distilled sigmas "
+            "for the distilled_two_stage preset."
         ),
     )
     parser.add_argument(
@@ -208,7 +217,7 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="auto",
         choices=["auto", "euler", "res_2s"],
-        help="Sampler. 'auto' uses res_2s for full presets and Euler for distilled_two_stage.",
+        help="Sampler. 'auto' uses Euler for standard presets and res_2s for ltx23_hq.",
     )
     parser.add_argument("--guidance_scale", type=float, default=None, help="Guidance scale (1.0 = no guidance)")
     parser.add_argument("--cfg_scale", type=float, default=None, help="CFG scale (overrides guidance_scale when set)")
@@ -468,7 +477,16 @@ def _merge_lora_weights(
     for idx, path in enumerate(weights):
         multiplier = multipliers[idx] if multipliers and len(multipliers) > idx else 1.0
         logger.info("Merging LoRA: %s (multiplier=%.3f)", path, multiplier)
+        metadata = load_lora_metadata(path)
         lora_sd = load_file(path)
+        network_module_name = infer_lora_network_module(metadata, lora_sd)
+        network_module = import_lora_network_module(network_module_name)
+        network_args = parse_lora_network_args(metadata.get("ss_network_args"))
+        logger.info(
+            "LoRA metadata selected network module: %s%s",
+            network_module_name,
+            f" args={network_args}" if network_args else "",
+        )
 
         # Auto-detect connector LoRA and attach connectors to wrapper for merge
         has_connector_lora = any("embeddings_connector" in k for k in lora_sd.keys())
@@ -492,15 +510,44 @@ def _merge_lora_weights(
                 transformer.load_connectors(video_conn, audio_conn)
                 logger.info("Attached connectors to wrapper for connector LoRA merge")
 
-        net = lora_ltx2.create_arch_network_from_weights(
+        net = network_module.create_arch_network_from_weights(
             multiplier,
             lora_sd,
             unet=transformer,
             for_inference=True,
             include_patterns=include_patterns,
             exclude_patterns=exclude_patterns,
+            **network_args,
         )
-        net.merge_to(None, transformer, lora_sd, device=next(transformer.parameters()).device, non_blocking=True)
+        module_count = lora_module_count(net)
+        if module_count == 0:
+            raise ValueError(
+                f"LoRA {path} matched zero modules using {network_module_name}. "
+                "This usually means the adapter architecture or target preset does not match the loaded LTX-2 model."
+            )
+        apply_mode = apply_lora_network_for_inference(
+            net,
+            transformer,
+            lora_sd,
+            merge_device=next(transformer.parameters()).device,
+            non_blocking=True,
+        )
+        if apply_mode == "live":
+            logger.warning(
+                "Applied LoRA as live adapter hooks instead of merging because the transformer has FP8-scaled Linear layers."
+            )
+        else:
+            logger.info("Merged LoRA into transformer weights")
+        merged_loras = list(getattr(transformer, "_musubi_merged_loras", []))
+        merged_loras.append(
+            {
+                "path": path,
+                "network_module": network_module_name,
+                "module_count": module_count,
+                "mode": apply_mode,
+            }
+        )
+        setattr(transformer, "_musubi_merged_loras", merged_loras)
 
         # Copy merged connector weights back to text encoder if available
         if has_connector_lora and text_encoder is not None and getattr(transformer, "has_connectors", lambda: False)():
@@ -594,6 +641,7 @@ def main() -> None:
         loading_device=loading_device,
         dit_weight_dtype=None,
     )
+    trainer.unet = transformer
 
     # -- Merge LoRAs --
     if args.lora_weight:
@@ -605,6 +653,7 @@ def main() -> None:
             args.exclude_patterns,
             ltx2_checkpoint=str(args.ltx2_checkpoint),
         )
+        trainer.unet = transformer
         clean_memory_on_device(device)
 
     # -- Block swap --

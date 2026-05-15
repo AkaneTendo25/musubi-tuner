@@ -561,26 +561,42 @@ body {
 ::-webkit-scrollbar-thumb:hover { background: var(--text-muted); }
 
 /* Tooltip */
-[data-tooltip] { position: relative; }
+[data-tooltip] {
+	position: relative;
+	cursor: help;
+}
 [data-tooltip]::after {
 	display: none;
 }
-.global-tooltip {
+.tooltip-portal {
 	position: fixed;
-	padding: 5px 10px;
-	border-radius: var(--radius-sm);
-	font-size: 11px;
-	line-height: 1.4;
-	font-weight: 400;
-	white-space: normal;
-	max-width: 260px;
+	z-index: 10000;
+	max-width: min(360px, calc(100vw - 16px));
 	width: max-content;
+	padding: 7px 10px;
+	border-radius: var(--radius-sm);
 	background: var(--bg-elevated);
 	color: var(--text-secondary);
 	border: 1px solid var(--border);
 	box-shadow: var(--shadow-md);
+	font-size: 11px;
+	line-height: 1.45;
+	font-weight: 400;
+	white-space: normal;
 	pointer-events: none;
-	z-index: 10000;
+	opacity: 0;
+	transform: translateY(4px);
+	transition: opacity 0.12s ease, transform 0.12s ease;
+}
+.tooltip-portal-positioned {
+	opacity: 1;
+	transform: translateY(0);
+}
+.tooltip-portal-bottom {
+	transform: translateY(-4px);
+}
+.tooltip-portal-bottom.tooltip-portal-positioned {
+	transform: translateY(0);
 }
 
 /* Focus */

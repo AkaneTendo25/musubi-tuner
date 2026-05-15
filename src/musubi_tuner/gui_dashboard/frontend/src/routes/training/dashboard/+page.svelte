@@ -10,6 +10,7 @@
 	import SampleGallery from '$lib/components/SampleGallery.svelte';
 	import ProcessConsole from '$lib/components/ProcessConsole.svelte';
 	import ProcessControls from '$lib/components/ProcessControls.svelte';
+	import ComfyConversionPanel from '$lib/components/ComfyConversionPanel.svelte';
 	import { projectConfig } from '$lib/stores/project.js';
 	import { processStatuses, processLogs, startProcess, stopProcess, preloadLogsIfActive, clearProcessLogs, refreshStatuses, fetchLogs, startLogPolling } from '$lib/stores/processes.js';
 	import { clearMetrics, lossData, gradNormData, lrData, stepTimeData, dataWaitData } from '$lib/stores/metrics.js';
@@ -99,6 +100,7 @@
 			training: {
 				gradient_accumulation_steps: cfg.training?.gradient_accumulation_steps,
 				save_every_n_steps: cfg.training?.save_every_n_steps,
+				save_every_n_epochs: cfg.training?.save_every_n_epochs,
 				sample_every_n_steps: cfg.training?.sample_every_n_steps,
 				sample_every_n_epochs: cfg.training?.sample_every_n_epochs,
 				output_dir: cfg.training?.output_dir,
@@ -106,7 +108,8 @@
 				resume: cfg.training?.resume,
 				autoresume: cfg.training?.autoresume,
 				resume_from_huggingface: cfg.training?.resume_from_huggingface,
-				max_train_steps: cfg.training?.max_train_steps
+				max_train_steps: cfg.training?.max_train_steps,
+				max_train_epochs: cfg.training?.max_train_epochs
 			}
 		});
 
@@ -187,6 +190,26 @@
 		return 'Fresh';
 	}
 
+	function schedulerStatus(liveStatus, metricRows, trainingStats) {
+		const statusStep = Number(liveStatus?.step);
+		const lastMetricStep = Number(metricRows?.[metricRows.length - 1]?.step);
+		const step = Number.isFinite(statusStep)
+			? statusStep
+			: Number.isFinite(lastMetricStep)
+				? lastMetricStep
+				: 0;
+
+		const statusSpeed = Number(liveStatus?.speed_steps_per_sec);
+		const estimatedSpeed = Number(trainingStats?.estimated_steps_per_sec);
+		const speed = Number.isFinite(statusSpeed) && statusSpeed > 0
+			? statusSpeed
+			: Number.isFinite(estimatedSpeed) && estimatedSpeed > 0
+				? estimatedSpeed
+				: null;
+
+		return { step, speed_steps_per_sec: speed };
+	}
+
 	function nextStepEventLabel(interval, step, speed, offLabel = 'Off') {
 		if (!interval || interval <= 0) return offLabel;
 		const current = Math.max(Number(step || 0), 0);
@@ -199,6 +222,28 @@
 		return `${remaining} steps`;
 	}
 
+	function nextEpochEventLabel(epochInterval, liveStatus, trainingStats, offLabel = 'Off') {
+		if (!epochInterval || epochInterval <= 0) return offLabel;
+		const statsStepsPerEpoch = Number(trainingStats?.steps_per_epoch || 0);
+		const statusMaxSteps = Number(liveStatus?.max_steps || 0);
+		const statusMaxEpochs = Number(liveStatus?.max_epochs || 0);
+		const statusStepsPerEpoch = statusMaxSteps > 0 && statusMaxEpochs > 0
+			? Math.ceil(statusMaxSteps / statusMaxEpochs)
+			: 0;
+		const stepsPerEpoch = statsStepsPerEpoch > 0 ? statsStepsPerEpoch : statusStepsPerEpoch;
+		if (stepsPerEpoch <= 0) return `Every ${epochInterval} epochs`;
+
+		const currentStep = Math.max(Number(liveStatus?.step || 0), 0);
+		const completedEpochs = Math.floor(currentStep / stepsPerEpoch);
+		const nextEpoch = Math.ceil((completedEpochs + 1) / epochInterval) * epochInterval;
+		const remainingSteps = Math.max(nextEpoch * stepsPerEpoch - currentStep, 0);
+		if (remainingSteps === 0) return 'Due this epoch';
+		if (liveStatus?.speed_steps_per_sec > 0) {
+			return `${formatDuration(remainingSteps / liveStatus.speed_steps_per_sec)} (${remainingSteps} steps)`;
+		}
+		return `${remainingSteps} steps`;
+	}
+
 	function nextSampleLabel(training, liveStatus, trainingStats) {
 		const stepInterval = Number(training?.sample_every_n_steps || 0);
 		if (stepInterval > 0) {
@@ -207,29 +252,33 @@
 
 		const epochInterval = Number(training?.sample_every_n_epochs || 0);
 		if (epochInterval > 0) {
-			const stepsPerEpoch = Number(trainingStats?.steps_per_epoch || 0);
-			if (stepsPerEpoch > 0 && liveStatus?.step != null) {
-				const completedEpochs = Math.floor(Number(liveStatus.step) / stepsPerEpoch);
-				const nextEpoch = Math.ceil((completedEpochs + 1) / epochInterval) * epochInterval;
-				const remainingSteps = Math.max(nextEpoch * stepsPerEpoch - Number(liveStatus.step), 0);
-				if (remainingSteps === 0) return 'Due this epoch';
-				if (liveStatus?.speed_steps_per_sec > 0) {
-					return `${formatDuration(remainingSteps / liveStatus.speed_steps_per_sec)} (${remainingSteps} steps)`;
-				}
-				return `${remainingSteps} steps`;
-			}
-			return `Every ${epochInterval} epochs`;
+			return nextEpochEventLabel(epochInterval, liveStatus, trainingStats);
 		}
 
 		return 'Off';
+	}
+
+	function nextCheckpointLabel(training, liveStatus, trainingStats) {
+		const stepInterval = Number(training?.save_every_n_steps || 0);
+		if (stepInterval > 0) {
+			return nextStepEventLabel(stepInterval, liveStatus?.step, liveStatus?.speed_steps_per_sec);
+		}
+
+		const epochInterval = Number(training?.save_every_n_epochs || 0);
+		if (epochInterval > 0) {
+			return nextEpochEventLabel(epochInterval, liveStatus, trainingStats, 'Final only');
+		}
+
+		return 'Final only';
 	}
 
 	let effectiveOutputDir = $derived(t.output_dir || 'output');
 	let effectiveOutputName = $derived(t.output_name || 'ltx2_lora');
 	let effectiveBatchSize = $derived(runStats?.effective_batch_size ?? null);
 	let stepsPerEpoch = $derived(runStats?.steps_per_epoch ?? null);
-	let nextCheckpoint = $derived(nextStepEventLabel(Number(t.save_every_n_steps || 0), $status?.step, $status?.speed_steps_per_sec, 'Final only'));
-	let nextSample = $derived(nextSampleLabel(t, $status, runStats));
+	let eventStatus = $derived(schedulerStatus($status, $lossData, runStats));
+	let nextCheckpoint = $derived(nextCheckpointLabel(t, eventStatus, runStats));
+	let nextSample = $derived(nextSampleLabel(t, eventStatus, runStats));
 	let resumeMode = $derived(resumeModeLabel(t));
 	let gpuVramPercent = $derived(ratioPercent(gpu?.vram_used_mb, gpu?.vram_total_mb));
 	let gpuUtilization = $derived(clampPercent(gpu?.utilization));
@@ -431,6 +480,7 @@
 	<!-- Process Controls + Console — always visible -->
 	<div class="space-y-3">
 		<ProcessControls processType="training" status={trainingStatus} onStart={handleStart} onStop={handleStop} />
+		<ComfyConversionPanel />
 		<ProcessConsole lines={trainingLogs} processType="training" initiallyCollapsed={false} />
 	</div>
 

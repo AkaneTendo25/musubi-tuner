@@ -48,6 +48,8 @@ class VideoGemmaTextEncoderModel(GemmaTextEncoderModelBase):
             encoded_input = encoded_input[0]
 
         connector_attention_mask = self._convert_to_additive_mask(attention_mask, encoded_input.dtype)
+        sort_idx, connector_attention_mask = self._compute_right_pad_order(connector_attention_mask)
+        encoded_input = self._apply_right_pad_order(encoded_input, sort_idx)
 
         encoded, encoded_connector_attention_mask = self.embeddings_connector(
             encoded_input,

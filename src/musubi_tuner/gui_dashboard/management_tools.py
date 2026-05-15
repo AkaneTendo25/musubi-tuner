@@ -153,6 +153,34 @@ def _has_hf_token() -> bool:
     return any(path and path.is_file() for path in token_paths)
 
 
+def _resolve_environment_python(repo_root: Path, install_state: dict[str, Any]) -> Path:
+    """Resolve the Python executable used by this checkout.
+
+    The setup script creates a standard venv at ``venv\\Scripts\\python.exe``,
+    but manually installed forks may use a local Conda prefix such as
+    ``ltx-2\\python.exe``. Prefer the recorded state and then common local
+    layouts before falling back to the setup-script default.
+    """
+    state_value = str(install_state.get("venv_python") or "").strip()
+    candidates: list[Path] = []
+    if state_value:
+        state_path = Path(state_value)
+        candidates.append(state_path if state_path.is_absolute() else repo_root / state_path)
+
+    candidates.extend(
+        [
+            repo_root / "venv" / "Scripts" / "python.exe",
+            repo_root / "ltx-2" / "python.exe",
+            repo_root / ".venv" / "Scripts" / "python.exe",
+        ]
+    )
+
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return candidates[0]
+
+
 def _effective_checkpoint(config: ProjectConfig, section_name: str) -> str:
     section = getattr(config, section_name)
     return str(getattr(section, "ltx2_checkpoint", "") or config.default_ltx2_checkpoint or "").strip()
@@ -608,7 +636,7 @@ def get_management_status(repo_root: Path | None = None, project_config: Project
     repo_status = get_repository_status(root, branch, remote_url, state)
 
     install_state = state.get("install", {})
-    venv_python = root / "venv" / "Scripts" / "python.exe"
+    venv_python = _resolve_environment_python(root, install_state)
     frontend_dist = root / "src" / "musubi_tuner" / "gui_dashboard" / "frontend" / "dist" / "index.html"
     dashboard_launcher = root / DASHBOARD_LAUNCHER_NAME
     setup_launcher = root / SETUP_LAUNCHER_NAME

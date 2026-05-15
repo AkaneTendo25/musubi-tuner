@@ -4,6 +4,7 @@ import argparse
 import os
 import sys
 import logging
+import math
 
 from musubi_tuner.hv_train_network import read_config_from_file, setup_parser_common
 from musubi_tuner.ltx_2.env import apply_ltx2_tweaks
@@ -142,8 +143,8 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         "--lora_target_preset",
         type=str,
         default="t2v",
-            choices=["t2v", "v2v", "video_sa", "video_sa_ff", "video_sa_ca_ff",
-                 "audio", "audio_v2a", "audio_ref_only_ic", "av_ic", "video_ref_only_av", "full", "lycoris"],
+            choices=["t2v", "v2v", "video_sa", "video_sa_ff", "video_sa_ca_ff", "character_training",
+                 "audio", "audio_v2a", "audio_ref_ic", "av_ic", "video_ref_only_av", "full", "lycoris"],
         help=(
             "LoRA target preset: "
             "'t2v' = text-to-video (all attention, default), "
@@ -151,9 +152,10 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
             "'video_sa' = video self-attention only, "
             "'video_sa_ff' = video self-attention + video feed-forward, "
             "'video_sa_ca_ff' = video self-attention + cross-attention + feed-forward, "
+            "'character_training' = Character Training (video feed-forward in transformer blocks 20-40), "
             "'audio' = audio-only (audio attn/ffn, no AV cross-modal), "
             "'audio_v2a' = audio preset plus video_to_audio_attn (audio attn/ffn + video_to_audio_attn), "
-            "'audio_ref_only_ic' = ID-LoRA-style AV preset "
+            "'audio_ref_ic' = ID-LoRA-style AV preset "
             "(audio attn/ffn + audio/video cross-modal both directions), "
             "'av_ic' = AV IC preset (use --av_cross_attention_mode / --av_multi_ref for AV variants), "
             "'video_ref_only_av' = AV preset for video-reference conditioning without reference audio, "
@@ -175,13 +177,13 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         choices=list(IC_LORA_STRATEGIES),
         help=(
             "IC-LoRA conditioning strategy. "
-            "'auto' keeps backward-compatible behavior "
-            "(uses 'v2v' when --lora_target_preset=v2v, "
-            "'audio_ref_only_ic' when --lora_target_preset=audio_ref_only_ic, "
+            "'auto' infers the strategy from --lora_target_preset "
+            "(uses 'v2v' for v2v, "
+            "'audio_ref_ic' when --lora_target_preset=audio_ref_ic, "
             "'av_ic' when --lora_target_preset=av_ic, "
             "'video_ref_only_av' when --lora_target_preset=video_ref_only_av, else 'none'). "
             "'v2v' uses reference-video conditioning. "
-            "'audio_ref_only_ic' uses reference-audio conditioning (ID-LoRA-style) in AV or audio-only mode. "
+            "'audio_ref_ic' uses reference-audio conditioning (ID-LoRA-style) in AV or audio-only mode. "
             "'av_ic' uses combined video+audio reference conditioning (requires --ltx2_mode av; "
             "use --av_cross_attention_mode / --av_multi_ref for AV variants). "
             "'video_ref_only_av' uses reference-video conditioning while still training target AV generation "
@@ -214,14 +216,14 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         "--audio_ref_use_negative_positions",
         action=argparse.BooleanOptionalAction,
         default=False,
-        help="For --ic_lora_strategy audio_ref_only_ic: place reference-audio token positions in negative time.",
+        help="For --ic_lora_strategy audio_ref_ic: place reference-audio token positions in negative time.",
     )
     parser.add_argument(
         "--audio_ref_mask_cross_attention_to_reference",
         action=argparse.BooleanOptionalAction,
         default=False,
         help=(
-            "For --ic_lora_strategy audio_ref_only_ic: mask A2V cross-attention so video attends only to target audio, "
+            "For --ic_lora_strategy audio_ref_ic: mask A2V cross-attention so video attends only to target audio, "
             "not reference-audio tokens."
         ),
     )
@@ -230,7 +232,7 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         action=argparse.BooleanOptionalAction,
         default=False,
         help=(
-            "For --ic_lora_strategy audio_ref_only_ic: block reference-audio tokens from attending to text tokens "
+            "For --ic_lora_strategy audio_ref_ic: block reference-audio tokens from attending to text tokens "
             "(target-audio tokens still attend to text; currently ignored in av_ic)."
         ),
     )
@@ -239,7 +241,7 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         type=float,
         default=0.0,
         help=(
-            "For --ic_lora_strategy audio_ref_only_ic sampling: identity guidance scale. "
+            "For --ic_lora_strategy audio_ref_ic sampling: identity guidance scale. "
             "Runs an extra forward pass without reference audio to isolate and amplify "
             "the speaker identity contribution. 0.0 disables. Recommended: 3.0."
         ),
@@ -281,10 +283,11 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         "--sample_sigma_schedule",
         type=str,
         default="auto",
-        choices=["auto", "ltx", "ltx23_distilled"],
+        choices=["auto", "ltx", "ltx_latent", "ltx23_distilled"],
         help=(
-            "Sigma schedule for LTX-2 previews. 'auto' uses LTX token-shifted sigmas, "
-            "and uses the exact LTX-2.3 distilled sigmas for the distilled_two_stage preset."
+            "Sigma schedule for LTX-2 previews. 'auto' uses the official LTX validation schedule, "
+            "uses the latent-aware shifted schedule for ltx23_hq, and uses the exact LTX-2.3 "
+            "distilled sigmas for the distilled_two_stage preset."
         ),
     )
     parser.add_argument(
@@ -292,7 +295,7 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         type=str,
         default="auto",
         choices=["auto", "euler", "res_2s"],
-        help="Sampler for LTX-2 previews. 'auto' uses res_2s for full presets and Euler for distilled_two_stage.",
+        help="Sampler for LTX-2 previews. 'auto' uses Euler for standard presets and res_2s for ltx23_hq.",
     )
     parser.add_argument(
         "--video_cfg_scale",
@@ -1134,7 +1137,9 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         type=str,
         nargs="*",
         help="Key=value args for CREPA, e.g. student_block_idx=16 teacher_block_idx=32 "
-             "lambda_crepa=0.1 tau=1.0 num_neighbors=2 schedule=constant normalize=true",
+             "lambda_crepa=0.5 crepa_lambda_end=0.1 tau=1.0 num_neighbors=2 schedule=cosine "
+             "warmup_steps=100 crepa_decay_steps=0 normalize=true "
+             "crepa_similarity_threshold=0.85 crepa_similarity_ema_decay=0.99 crepa_threshold_mode=permanent",
     )
     parser.add_argument(
         "--self_flow",
@@ -1277,6 +1282,19 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         help="Probability of dropping audio text conditioning per sample while keeping video (0.0 = disabled). "
              "Applied independently before --caption_dropout_rate. AV mode only.",
     )
+    parser.add_argument(
+        "--tread",
+        type=str,
+        nargs="*",
+        default=None,
+        help=(
+            "Enable TREAD token routing for LTX training using key=value settings. "
+            "Examples: --tread selection_ratio=0.5 start_layer_idx=3 end_layer_idx=-4. "
+            "Bare --tread uses defaults matching SimpleTuner LTX-2: selection_ratio=0.5, "
+            "start/end=3/-4 for LTX-2.3 or 2/-2 for LTX-2.0. "
+            "Training-only and supported only on video-token LTX paths."
+        ),
+    )
 
     # -- Cross-Task Synergy (Harmony) --
     parser.add_argument(
@@ -1395,15 +1413,15 @@ def main() -> None:
         if not any(arg.startswith("include_patterns=") for arg in args.network_args):
             args.lora_target_preset = "audio"
     elif (
-        requested_ic_strategy == "audio_ref_only_ic"
+        requested_ic_strategy == "audio_ref_ic"
         and not explicit_lora_preset
         and not uses_lycoris_module
     ):
         if args.network_args is None:
             args.network_args = []
         if not any(arg.startswith("include_patterns=") for arg in args.network_args):
-            args.lora_target_preset = "audio_ref_only_ic"
-            logger.info("Using lora_target_preset=audio_ref_only_ic for --ic_lora_strategy audio_ref_only_ic")
+            args.lora_target_preset = "audio_ref_ic"
+            logger.info("Using lora_target_preset=audio_ref_ic for --ic_lora_strategy audio_ref_ic")
     elif (
         requested_ic_strategy == "av_ic"
         and not explicit_lora_preset
@@ -1425,8 +1443,8 @@ def main() -> None:
             args.lora_target_preset = "video_ref_only_av"
             logger.info("Using lora_target_preset=video_ref_only_av for --ic_lora_strategy video_ref_only_av")
 
-    if explicit_ic_strategy and requested_ic_strategy == "audio_ref_only_ic" and getattr(args, "ltx_mode", "video") not in {"av", "audio"}:
-        logger.warning("--ic_lora_strategy audio_ref_only_ic works in --ltx2_mode av or audio; current mode is %s", args.ltx_mode)
+    if explicit_ic_strategy and requested_ic_strategy == "audio_ref_ic" and getattr(args, "ltx_mode", "video") not in {"av", "audio"}:
+        logger.warning("--ic_lora_strategy audio_ref_ic works in --ltx2_mode av or audio; current mode is %s", args.ltx_mode)
     if explicit_ic_strategy and requested_ic_strategy == "av_ic" and getattr(args, "ltx_mode", "video") != "av":
         logger.warning("--ic_lora_strategy %s requires --ltx2_mode av; current mode is %s", requested_ic_strategy, args.ltx_mode)
     if explicit_ic_strategy and requested_ic_strategy == "video_ref_only_av" and getattr(args, "ltx_mode", "video") != "av":
@@ -1434,11 +1452,11 @@ def main() -> None:
 
     if (
         explicit_lora_preset
-        and getattr(args, "lora_target_preset", None) == "audio_ref_only_ic"
+        and getattr(args, "lora_target_preset", None) == "audio_ref_ic"
         and getattr(args, "ltx_mode", "video") == "audio"
     ):
         logger.warning(
-            "--lora_target_preset audio_ref_only_ic in --ltx2_mode audio trains cross-modal layers that only "
+            "--lora_target_preset audio_ref_ic in --ltx2_mode audio trains cross-modal layers that only "
             "affect the (dummy) video branch; consider --lora_target_preset audio instead."
         )
     if (
@@ -1506,6 +1524,10 @@ def main() -> None:
 
     process_lycoris_config(args, logger)
     apply_lycoris_preset_before_network_creation(args, logger)
+
+    args.differential_guidance_scale = float(getattr(args, "differential_guidance_scale", 3.0))
+    if not math.isfinite(args.differential_guidance_scale):
+        raise ValueError("--differential_guidance_scale must be finite.")
 
     from musubi_tuner.ltx2_train_network import LTX2NetworkTrainer
 

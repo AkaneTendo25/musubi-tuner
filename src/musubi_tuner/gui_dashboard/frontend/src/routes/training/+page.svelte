@@ -17,7 +17,173 @@
 	import { goto } from '$app/navigation';
 	import { onMount } from 'svelte';
 
+	const DEFAULT_NETWORK_MODULE = 'networks.lora_ltx2';
+	const LOKR_NETWORK_MODULE = 'networks.lokr';
+	const DEFAULT_SINKSGD_LEARNING_RATE = '0.001';
+	const DEFAULT_SINKSGD_DORA_OFT_LEARNING_RATE = '0.0005';
+	const DEFAULT_SINKSGD_OPTIMIZER_ARGS = 'spectral_normalization=True scale_lr_with_effective_batch=True normed_momentum=True momentum=0.995 nesterov=True nesterov_coef=0.8 orthogonal_sinkhorn=True sinkhorn_iterations=3';
+	const LOKR_FFN_TARGET_PRESETS = new Set([
+		'v2v',
+		'video_sa_ff',
+		'video_sa_ca_ff',
+		'character_training',
+		'audio',
+		'audio_ref_only_ic',
+		'av_ic',
+		'video_ref_only_av',
+		'full',
+	]);
+
+	function parseLokrFactor(raw) {
+		const match = String(raw || '').match(/(?:^|\s)factor=("[^"]+"|'[^']+'|\S+)/);
+		if (!match) return -1;
+		const parsed = Number(match[1].replace(/^['"]|['"]$/g, ''));
+		return Number.isFinite(parsed) ? Math.round(parsed) : -1;
+	}
+
+	function factorization(dimension, factor = -1) {
+		if (factor > 0 && (dimension % factor) === 0) {
+			let m = factor;
+			let n = dimension / factor;
+			if (m > n) [n, m] = [m, n];
+			return [m, n];
+		}
+		if (factor < 0) factor = dimension;
+		let m = 1;
+		let n = dimension;
+		let length = m + n;
+		while (m < n) {
+			let newM = m + 1;
+			while (dimension % newM !== 0) newM += 1;
+			let newN = dimension / newM;
+			if (newM + newN > length || newM > factor) {
+				break;
+			} else {
+				m = newM;
+				n = newN;
+			}
+		}
+		if (m > n) [n, m] = [m, n];
+		return [m, n];
+	}
+
+	function getLokrDenseThreshold(training) {
+		const networkModule = training.network_module || DEFAULT_NETWORK_MODULE;
+		if (networkModule !== LOKR_NETWORK_MODULE) return null;
+
+		const dim = Number(training.network_dim);
+		if (!Number.isFinite(dim) || dim <= 0) return null;
+
+		const hasGuiFactor = training.lokr_factor !== null && training.lokr_factor !== undefined && training.lokr_factor !== '';
+		const guiFactor = hasGuiFactor ? Number(training.lokr_factor) : NaN;
+		const factor = Number.isFinite(guiFactor) ? Math.round(guiFactor) : parseLokrFactor(training.network_args || '');
+		const includeFfn = LOKR_FFN_TARGET_PRESETS.has(training.lora_target_preset || 't2v');
+		const pairs = [
+			[4096, 4096],
+			[2048, 2048],
+			[4096, 2048],
+			[2048, 4096],
+		];
+		if (includeFfn) {
+			pairs.push(
+				[4096, 16384],
+				[16384, 4096],
+				[2048, 8192],
+				[8192, 2048],
+			);
+		}
+
+		let threshold = 0;
+		for (const [inDim, outDim] of pairs) {
+			const [, inN] = factorization(inDim, factor);
+			const [, outK] = factorization(outDim, factor);
+			threshold = Math.max(threshold, Math.max(outK, inN) / 2);
+		}
+		if (dim < threshold) return null;
+
+		return {
+			dim,
+			threshold,
+			factor,
+			includeFfn,
+		};
+	}
+
 	function update(key, value) { updateSection('training', key, value); }
+	function automaticLearningRate(training) {
+		return training?.use_dora_oft ? `Auto: ${DEFAULT_SINKSGD_DORA_OFT_LEARNING_RATE}` : `Auto: ${DEFAULT_SINKSGD_LEARNING_RATE}`;
+	}
+	function normalizeOptimizerType(value) {
+		return String(value || 'SinkSGD_adv').replace(/[-_]/g, '').toLowerCase();
+	}
+	function isSinkSgdOptimizer(value) {
+		const normalized = normalizeOptimizerType(value);
+		return normalized === 'sinksgd' || normalized === 'sinksgdadv';
+	}
+	function updateOptimizerType(value) {
+		update('optimizer_type', value);
+		if (!isSinkSgdOptimizer(value)) return;
+		update('learning_rate', null);
+		update('optimizer_args', DEFAULT_SINKSGD_OPTIMIZER_ARGS);
+		update('sinksgd_orthogonal_sinkhorn', true);
+		update('sinksgd_compiled_optimizer', false);
+		update('lr_scheduler', 'constant');
+	}
+	function updateNetworkMode(mode) {
+		if (mode === 'lokr') {
+			update('network_module', LOKR_NETWORK_MODULE);
+			update('use_lokr', true);
+			update('use_dora', false);
+			update('use_dokr', false);
+			update('use_dora_oft', false);
+			return;
+		}
+		if (mode === 'dora') {
+			update('network_module', DEFAULT_NETWORK_MODULE);
+			update('use_lokr', false);
+			update('use_dora', true);
+			update('use_dokr', false);
+			update('use_dora_oft', false);
+			return;
+		}
+		if (mode === 'dokr') {
+			update('network_module', LOKR_NETWORK_MODULE);
+			update('use_lokr', false);
+			update('use_dora', false);
+			update('use_dokr', true);
+			update('use_dora_oft', false);
+			return;
+		}
+		if (mode === 'dora_oft') {
+			update('network_module', DEFAULT_NETWORK_MODULE);
+			update('use_lokr', false);
+			update('use_dora', false);
+			update('use_dokr', false);
+			update('use_dora_oft', true);
+			update('scaled_oft', true);
+			return;
+		}
+		update('network_module', DEFAULT_NETWORK_MODULE);
+		update('use_lokr', false);
+		update('use_dora', false);
+		update('use_dokr', false);
+		update('use_dora_oft', false);
+	}
+	function updateUseLokr(enabled) {
+		updateNetworkMode(enabled ? 'lokr' : 'lora');
+	}
+	function updateUseDora(enabled) {
+		updateNetworkMode(enabled ? 'dora' : 'lora');
+	}
+	function updateUseDokr(enabled) {
+		updateNetworkMode(enabled ? 'dokr' : 'lora');
+	}
+	function updateUseDoraOft(enabled) {
+		updateNetworkMode(enabled ? 'dora_oft' : 'lora');
+	}
+	function updateScaledOft(enabled) {
+		update('scaled_oft', t.use_dora_oft ? true : enabled);
+	}
 	async function startTraining() {
 		await startProcess('training');
 		await goto('/training/dashboard');
@@ -25,7 +191,10 @@
 
 	// Common optimizer presets
 	const optimizerOptions = [
+		'SinkSGD_adv',
+		'SinkSGD',
 		'adamw8bit',
+		'came8bit',
 		'adamw',
 		'adafactor',
 		'adagrad',
@@ -38,9 +207,20 @@
 		'adamax',
 		'prodigy',
 		'came',
+		'came8bit',
+		'torchao_adamw8bit',
+		'torchao_adamw4bit',
+		'torchao_adamwfp8',
+		'torchao_adamw',
+		'optimi_stableadamw',
+		'optimi_adamw',
+		'optimi_lion',
+		'optimi_adan',
 	];
 
 	let t = $derived($projectConfig?.training || {});
+	let isLokrBackend = $derived((t.network_module || DEFAULT_NETWORK_MODULE) === LOKR_NETWORK_MODULE);
+	let lokrDenseThreshold = $derived(getLokrDenseThreshold(t));
 	let trainingStatus = $derived($processStatuses.training || { state: 'idle', exit_code: null });
 	let trainingValidation = $derived($processValidation.training || { ok: true, summary: '', errors: [], warnings: [], field_errors: {}, field_warnings: {} });
 	let hasValidationIssues = $derived((trainingValidation.errors?.length || 0) > 0 || (trainingValidation.warnings?.length || 0) > 0);
@@ -435,13 +615,13 @@
 				</FormGroup>
 
 				<FormGroup title="LoRA">
-					<div class="space-y-2 pt-2">
+						<div class="space-y-2 pt-2">
 						{#if $advancedMode}
-							<FormField fieldPath="training.network_module" value={t.network_module || ''} oninput={(e) => update('network_module', e.target.value || 'networks.lora_ltx2')} placeholder="networks.lora_ltx2" tooltip="LTX-2 LoRA network module. Clearing this resets it to the LTX-2 default." />
+							<FormField fieldPath="training.network_module" value={t.network_module || ''} oninput={(e) => update('network_module', e.target.value || DEFAULT_NETWORK_MODULE)} placeholder={DEFAULT_NETWORK_MODULE} tooltip="LTX-2 LoRA network module. Clearing this resets it to the LTX-2 default." />
 						{/if}
 						<div class="grid grid-cols-3 gap-2">
 							<FormField type="number" fieldPath="training.network_dim" value={t.network_dim ?? ''} oninput={(e) => update('network_dim', e.target.value ? Number(e.target.value) : null)} min={1} placeholder="4 for default LoRA" tooltip="LoRA rank. Blank uses the network module default; for the standard LoRA module that is `4`." />
-							<FormField type="number" fieldPath="training.network_alpha" value={t.network_alpha ?? 1.0} oninput={(e) => update('network_alpha', Number(e.target.value))} min={0} step="0.1" tooltip="LoRA alpha" />
+							<FormField type="number" fieldPath="training.network_alpha" value={t.network_alpha ?? ''} oninput={(e) => update('network_alpha', e.target.value ? Number(e.target.value) : null)} min={0} step="0.1" placeholder="Auto: rank" tooltip="LoRA alpha. Blank lets SinkSGD_adv spectral scaling set alpha to rank in the generated command." />
 							<FormSelect fieldPath="training.lora_target_preset" value={t.lora_target_preset || 't2v'} options={[
 								{ value: 't2v', label: 't2v (all attn)' },
 								{ value: 'v2v', label: 'v2v (all attn+FFN)' },
@@ -449,26 +629,59 @@
 								{ value: 'video_sa', label: 'V:SA' },
 								{ value: 'video_sa_ff', label: 'V:SA+FF' },
 								{ value: 'video_sa_ca_ff', label: 'V:SA+CA+FF' },
+								{ value: 'character_training', label: 'Character Training' },
 								{ value: 'audio', label: 'audio' },
 								{ value: 'audio_v2a', label: 'audio+V2A' },
-								{ value: 'audio_ref_only_ic', label: 'audio ref IC' },
+								{ value: 'audio_ref_ic', label: 'audio ref IC' },
 								{ value: 'av_ic', label: 'AV IC' },
 								{ value: 'video_ref_only_av', label: 'AV video-ref' },
 								{ value: 'full', label: 'full (all)' }
 							]} onchange={(e) => update('lora_target_preset', e.target.value)} tooltip="Target layers" />
 						</div>
+						{#if lokrDenseThreshold}
+							<div class="text-[11px] px-3 py-2" style="color: var(--warning); background: color-mix(in srgb, var(--warning) 10%, transparent); border: 1px solid color-mix(in srgb, var(--warning) 24%, var(--border)); border-radius: var(--radius-sm);">
+								For the current LoKr/DoKr target set ({lokrDenseThreshold.includeFfn ? 'attention+FFN' : 'attention-only'}, {lokrDenseThreshold.factor > 0 ? `factor=${lokrDenseThreshold.factor}` : 'balanced factorization'}), dims &gt;= {lokrDenseThreshold.threshold} already use dense LoKr blocks. network_dim={lokrDenseThreshold.dim} will not increase effective LoKr capacity beyond that threshold.
+							</div>
+						{/if}
+						<div class="flex flex-wrap gap-x-4 gap-y-1">
+							<FormToggle label="LoKr" checked={(t.use_lokr ?? false) || (isLokrBackend && !(t.use_dokr ?? false))} onchange={(e) => updateUseLokr(e.target.checked)} tooltip="LoKr uses a Kronecker-structured update, which is usually more parameter-efficient than plain LoRA while keeping higher expressivity at a given size." />
+							<FormToggle label="DoRA" checked={(t.use_dora ?? false) && !isLokrBackend} onchange={(e) => updateUseDora(e.target.checked)} tooltip="DoRA adds a separate magnitude vector on top of LoRA. It usually gives cleaner concept separation and tends to preserve more of the base model's original capability." />
+							<FormToggle label="DokR" checked={(t.use_dokr ?? false) || (isLokrBackend && (t.use_dora ?? false))} onchange={(e) => updateUseDokr(e.target.checked)} tooltip="DokR combines LoKr efficiency with DoRA's magnitude control. In practice this is the strongest all-around option if you want both efficiency and cleaner adaptation." />
+							<FormToggle label="DoRA-OFT" checked={t.use_dora_oft ?? false} onchange={(e) => updateUseDoraOft(e.target.checked)} tooltip="DoRA magnitude learning on top of scaled OFT rotations. Enables use_dora_oft=true and stores OFT tensors plus dora_scale." />
+						</div>
+						{#if isLokrBackend}
+							<div class="grid grid-cols-3 gap-2">
+								<FormField label="LoKr Factor" type="number" fieldPath="training.lokr_factor" value={t.lokr_factor ?? ''} oninput={(e) => update('lokr_factor', e.target.value ? Number(e.target.value) : null)} placeholder="Balanced" step="1" tooltip="Kronecker factorization control for LoKr/DokR. Blank or -1 uses balanced factorization; positive values like 1, 2, or 4 force that smaller factor." />
+							</div>
+						{/if}
+						{#if t.use_dora_oft}
+							<div class="grid grid-cols-4 gap-2">
+								<FormToggle label="Scaled OFT" checked={true} onchange={(e) => updateScaledOft(e.target.checked)} disabled={true} tooltip="Required for DoRA-OFT. Signed optimizers like Adam/CAME need Scaled OFT so the DoRA scale and OFT blocks share a usable step size." />
+								<FormField label="OFT Block Size" type="number" value={t.oft_block_size ?? ''} oninput={(e) => update('oft_block_size', e.target.value ? Number(e.target.value) : null)} min={1} placeholder="Match LoRA dim" tooltip="Block size for OFT rotations. If it does not divide the input width, the backend adjusts it to the nearest valid divisor." />
+								<FormToggle label="Constrained OFT" checked={t.oft_coft ?? false} onchange={(e) => update('oft_coft', e.target.checked)} tooltip="Project OFT rotation parameters into a small neighborhood each step." />
+								<FormToggle label="Block Share" checked={t.oft_block_share ?? false} onchange={(e) => update('oft_block_share', e.target.checked)} tooltip="Share one OFT block across all input blocks." />
+							</div>
+							{#if t.oft_coft}
+								<div class="grid grid-cols-4 gap-2">
+									<FormField label="COFT Eps" type="number" value={t.coft_eps ?? 0.00006} oninput={(e) => update('coft_eps', Number(e.target.value))} min={0} step="0.00001" tooltip="Constraint epsilon for OFT projection." />
+								</div>
+							{/if}
+							<div class="text-xs" style="color: var(--text-muted);">
+								DoRA-OFT checkpoints store OFT tensors plus dora_scale for OFTv2-compatible loaders.
+							</div>
+						{/if}
 						{#if $advancedMode}
 							<div class="grid grid-cols-2 gap-2">
 								<FormSelect fieldPath="training.ic_lora_strategy" value={t.ic_lora_strategy || 'auto'} options={[
 									{ value: 'auto', label: 'auto' },
 									{ value: 'none', label: 'none' },
 									{ value: 'v2v', label: 'v2v' },
-									{ value: 'audio_ref_only_ic', label: 'audio_ref_only_ic' },
+									{ value: 'audio_ref_ic', label: 'audio_ref_ic' },
 									{ value: 'av_ic', label: 'av_ic' },
 									{ value: 'video_ref_only_av', label: 'video_ref_only_av' },
-								]} onchange={(e) => update('ic_lora_strategy', e.target.value)} tooltip="IC-LoRA conditioning strategy. 'auto' follows lora_target_preset; 'audio_ref_only_ic' = audio-reference ID-LoRA style (requires av or audio mode); 'av_ic' = joint video+audio reference conditioning (requires av mode, with extra AV modifiers below); 'video_ref_only_av' = video reference with target AV generation (requires av mode)" />
+								]} onchange={(e) => update('ic_lora_strategy', e.target.value)} tooltip="IC-LoRA conditioning strategy. 'auto' follows lora_target_preset; 'audio_ref_ic' = audio-reference ID-LoRA style (requires av or audio mode); 'av_ic' = joint video+audio reference conditioning (requires av mode, with extra AV modifiers below); 'video_ref_only_av' = video reference with target AV generation (requires av mode)" />
 							</div>
-							{#if t.ic_lora_strategy === 'audio_ref_only_ic' || t.ic_lora_strategy === 'av_ic' || (t.ic_lora_strategy === 'auto' && (t.lora_target_preset === 'audio_ref_only_ic' || t.lora_target_preset === 'av_ic'))}
+							{#if t.ic_lora_strategy === 'audio_ref_ic' || t.ic_lora_strategy === 'av_ic' || (t.ic_lora_strategy === 'auto' && (t.lora_target_preset === 'audio_ref_ic' || t.lora_target_preset === 'av_ic'))}
 								<div class="p-2 space-y-2" style="background: var(--bg-elevated); border-radius: var(--radius-sm); border: 1px solid var(--border-subtle);">
 									<span class="text-[11px] font-medium" style="color: var(--text-muted);">Audio-Reference IC-LoRA</span>
 									{#if t.ic_lora_strategy === 'av_ic' || (t.ic_lora_strategy === 'auto' && t.lora_target_preset === 'av_ic')}
@@ -533,6 +746,32 @@
 								<FormField type="number" fieldPath="training.adaptive_rank_quantile" value={t.adaptive_rank_quantile ?? ''} oninput={(e) => update('adaptive_rank_quantile', e.target.value ? Number(e.target.value) : null)} placeholder="Optional" step="0.01" min={0} max={1} tooltip="Adaptive-rank quantile." />
 								<FormField type="number" fieldPath="training.adaptive_rank_weight" value={t.adaptive_rank_weight ?? ''} oninput={(e) => update('adaptive_rank_weight', e.target.value ? Number(e.target.value) : null)} placeholder="Optional" step="0.1" min={0} tooltip="Adaptive-rank loss weight." />
 							</div>
+							<div class="grid grid-cols-3 gap-2">
+								<FormField label="Budget" type="number" value={t.adaptive_rank_budget ?? ''} oninput={(e) => update('adaptive_rank_budget', e.target.value ? Number(e.target.value) : null)} placeholder="Optional" min={1} tooltip="Shared target sum of effective ranks. Overrides Budget Ratio." />
+								<FormField label="Budget Ratio" type="number" value={t.adaptive_rank_budget_ratio ?? ''} oninput={(e) => update('adaptive_rank_budget_ratio', e.target.value ? Number(e.target.value) : null)} placeholder="Optional" step="0.01" min={0} max={1} tooltip="Shared budget as a ratio of total max rank." />
+								<FormField label="Budget Weight" type="number" value={t.adaptive_rank_budget_weight ?? ''} oninput={(e) => update('adaptive_rank_budget_weight', e.target.value ? Number(e.target.value) : null)} placeholder="Optional" step="0.0001" min={0} tooltip="Loss weight for the shared rank budget." />
+							</div>
+							<div class="grid grid-cols-3 gap-2">
+								<div class="flex items-end pb-0.5">
+									<FormToggle label="Estimate" checked={t.adaptive_rank_estimate ?? false} onchange={(e) => update('adaptive_rank_estimate', e.target.checked)} tooltip="Use or generate ltx2_estimate.json for module-wise rank allocation." />
+								</div>
+								<FormSelect label="Estimate Apply" value={t.adaptive_rank_estimate_apply || ''} options={[{ value: '', label: 'Default target' }, { value: 'target', label: 'Target only' }, { value: 'init', label: 'Init only' }, { value: 'both', label: 'Target + init' }]} onchange={(e) => update('adaptive_rank_estimate_apply', e.target.value || null)} tooltip="How ltx2_estimate.json allocations are applied." />
+								<FormField label="Finalize Start" type="number" value={t.adaptive_rank_finalize_start ?? ''} oninput={(e) => update('adaptive_rank_finalize_start', e.target.value ? Number(e.target.value) : null)} placeholder="Off" step="0.01" min={0} max={1} tooltip="Training progress where adaptive modules convert to static ranks." />
+							</div>
+							<div class="grid grid-cols-3 gap-2">
+								<FormField label="Recover Steps" type="number" value={t.adaptive_rank_finalize_recover_steps ?? ''} oninput={(e) => update('adaptive_rank_finalize_recover_steps', e.target.value ? Number(e.target.value) : null)} placeholder="Off" min={1} tooltip="Recovery window after finalize/prune." />
+								<FormField label="Recover Warmup" type="number" value={t.adaptive_rank_finalize_recover_warmup_steps ?? ''} oninput={(e) => update('adaptive_rank_finalize_recover_warmup_steps', e.target.value ? Number(e.target.value) : null)} placeholder="Off" min={0} tooltip="Warmup steps inside the recovery window." />
+								<div class="flex items-end pb-0.5">
+									<FormToggle label="Hard Prune" checked={t.adaptive_rank_hard_prune ?? false} onchange={(e) => update('adaptive_rank_hard_prune', e.target.checked)} tooltip="Periodically rebuild modules as static lower-rank LoRA during training." />
+								</div>
+							</div>
+							{#if t.adaptive_rank_hard_prune}
+								<div class="grid grid-cols-3 gap-2">
+									<FormField label="Prune Start" type="number" value={t.adaptive_rank_hard_prune_start ?? ''} oninput={(e) => update('adaptive_rank_hard_prune_start', e.target.value ? Number(e.target.value) : null)} placeholder="0.5" step="0.01" min={0} max={1} tooltip="Training progress before hard pruning can start." />
+									<FormField label="Prune Interval" type="number" value={t.adaptive_rank_hard_prune_interval ?? ''} oninput={(e) => update('adaptive_rank_hard_prune_interval', e.target.value ? Number(e.target.value) : null)} placeholder="100" min={1} tooltip="Steps between hard-prune checks." />
+									<FormField label="Min Delta" type="number" value={t.adaptive_rank_hard_prune_min_delta ?? ''} oninput={(e) => update('adaptive_rank_hard_prune_min_delta', e.target.value ? Number(e.target.value) : null)} placeholder="1" min={1} tooltip="Minimum rank reduction before a module is rebuilt." />
+								</div>
+							{/if}
 						{/if}
 						<div class="grid grid-cols-3 gap-x-4 gap-y-1">
 							<FormToggle fieldPath="training.dim_from_weights" checked={t.dim_from_weights ?? false} onchange={(e) => update('dim_from_weights', e.target.checked)} tooltip="Auto-detect dim/alpha from weights" />
@@ -549,7 +788,7 @@
 							<div class="grid grid-cols-3 gap-x-4 gap-y-1">
 								<FormToggle fieldPath="training.nf4_base" checked={t.nf4_base ?? false} onchange={(e) => update('nf4_base', e.target.checked)} tooltip="NF4 4-bit quantization (~75% VRAM savings)" />
 								<FormToggle fieldPath="training.loftq_init" checked={t.loftq_init ?? false} onchange={(e) => update('loftq_init', e.target.checked)} tooltip="LoftQ initialization (compensates NF4 error)" />
-								<FormToggle fieldPath="training.fp8_w8a8" checked={t.fp8_w8a8 ?? false} onchange={(e) => update('fp8_w8a8', e.target.checked)} tooltip="W8A8 activation quantization (requires FP8 Scaled)" />
+								<FormToggle fieldPath="training.fp8_w8a8" checked={t.fp8_w8a8 ?? false} onchange={(e) => update('fp8_w8a8', e.target.checked)} tooltip="W8A8 activation quantization (requires FP8 Base and FP8 Scaled)" />
 								<FormToggle fieldPath="training.awq_calibration" checked={t.awq_calibration ?? false} onchange={(e) => update('awq_calibration', e.target.checked)} tooltip="Activation-aware calibration for NF4" />
 							</div>
 							<div class="grid grid-cols-3 gap-2">
@@ -569,14 +808,20 @@
 				<FormGroup title="Optimizer">
 					<div class="space-y-2 pt-2">
 						<div class="grid grid-cols-2 gap-2">
-							<FormField type="number" fieldPath="training.learning_rate" value={t.learning_rate ?? 2e-6} oninput={(e) => update('learning_rate', Number(e.target.value))} step="any" tooltip="Learning rate" />
-							<FormCombobox fieldPath="training.optimizer_type" value={t.optimizer_type || ''} oninput={(e) => update('optimizer_type', e.target.value)} options={optimizerOptions} placeholder="AdamW" tooltip="Optimizer type. Blank uses the default `AdamW`." />
+							<FormField type="number" fieldPath="training.learning_rate" value={t.learning_rate ?? ''} oninput={(e) => update('learning_rate', e.target.value ? Number(e.target.value) : null)} step="any" placeholder={automaticLearningRate(t)} tooltip="Learning rate. Blank uses 0.001 for SinkSGD_adv, or 0.0005 for DoRA-OFT." />
+							<FormCombobox fieldPath="training.optimizer_type" value={t.optimizer_type || 'SinkSGD_adv'} oninput={(e) => updateOptimizerType(e.target.value)} options={optimizerOptions} placeholder="SinkSGD_adv" tooltip="Optimizer type. Selecting SinkSGD_adv or SinkSGD applies the current dashboard SinkSGD defaults to this project." />
 						</div>
 						<div class="grid grid-cols-3 gap-2">
-							<FormSelect fieldPath="training.lr_scheduler" value={t.lr_scheduler || 'constant'} options={['constant', 'constant_with_warmup', 'cosine', 'cosine_with_restarts', 'linear', 'polynomial', 'rex']} onchange={(e) => update('lr_scheduler', e.target.value)} tooltip="LR schedule" />
+							<FormSelect fieldPath="training.lr_scheduler" value={t.lr_scheduler || 'constant'} options={['constant', 'cosine', 'warmup_stable_decay', 'constant_with_warmup', 'cosine_with_restarts', 'linear', 'polynomial', 'rex']} onchange={(e) => update('lr_scheduler', e.target.value)} tooltip="LR schedule. Constant matches OneTrainer's default; cosine decays over the whole run and can under-drive short runs." />
 							<FormField type="number" fieldPath="training.lr_warmup_steps" value={t.lr_warmup_steps ?? 0} oninput={(e) => update('lr_warmup_steps', Number(e.target.value))} min={0} tooltip="Warmup steps" />
 							<FormField type="number" fieldPath="training.gradient_accumulation_steps" value={t.gradient_accumulation_steps ?? 1} oninput={(e) => update('gradient_accumulation_steps', Number(e.target.value))} min={1} tooltip="Gradient accumulation" />
 						</div>
+						{#if isSinkSgdOptimizer(t.optimizer_type)}
+							<div class="grid grid-cols-2 gap-2">
+								<FormToggle label="Orthogonal Sinkhorn" fieldPath="training.sinksgd_orthogonal_sinkhorn" checked={t.sinksgd_orthogonal_sinkhorn ?? true} onchange={(e) => update('sinksgd_orthogonal_sinkhorn', e.target.checked)} tooltip="Enable OrthoGrad-style projection inside SinkSGD's Sinkhorn normalization. Generated commands set orthogonal_sinkhorn from this toggle." />
+								<FormToggle label="Compiled Optimizer" fieldPath="training.sinksgd_compiled_optimizer" checked={t.sinksgd_compiled_optimizer ?? false} onchange={(e) => update('sinksgd_compiled_optimizer', e.target.checked)} tooltip="Compile SinkSGD's parameter step with torch.compile. First optimizer step may take longer while compiling." />
+							</div>
+						{/if}
 						{#if $advancedMode}
 							<div class="grid grid-cols-2 gap-2">
 								<FormSelect fieldPath="training.accumulation_group_by" value={t.accumulation_group_by || 'none'} options={[{value:'none',label:'None'},{value:'frames',label:'Frames'},{value:'bucket',label:'Bucket'},{value:'dataset',label:'Dataset'}]} onchange={(e) => update('accumulation_group_by', e.target.value)} tooltip="Keep gradient accumulation windows grouped by frame count, full bucket, or dataset. Bucket is safest for mixed frame lengths." />
@@ -584,7 +829,7 @@
 							</div>
 							<div class="grid grid-cols-2 gap-2">
 								<FormField type="number" fieldPath="training.max_grad_norm" value={t.max_grad_norm ?? 1.0} oninput={(e) => update('max_grad_norm', Number(e.target.value))} step="0.1" tooltip="Gradient clipping" />
-								<FormField fieldPath="training.optimizer_args" value={t.optimizer_args || ''} oninput={(e) => update('optimizer_args', e.target.value)} placeholder="key=value ..." tooltip="Extra optimizer args" />
+								<FormField fieldPath="training.optimizer_args" value={t.optimizer_args || ''} oninput={(e) => update('optimizer_args', e.target.value)} placeholder={DEFAULT_SINKSGD_OPTIMIZER_ARGS} tooltip="Extra optimizer args. SinkSGD_adv defaults include normed long momentum, Nesterov coefficient blending, three Sinkhorn iterations, and sqrt effective-batch LR scaling; Orthogonal Sinkhorn is controlled by the visible toggle." />
 							</div>
 							<div class="grid grid-cols-2 gap-2">
 								<FormField type="number" fieldPath="training.lr_decay_steps" value={t.lr_decay_steps ?? ''} oninput={(e) => update('lr_decay_steps', e.target.value ? Number(e.target.value) : null)} placeholder="None" tooltip="LR decay steps" />
@@ -702,8 +947,8 @@
 								<FormSelect fieldPath="training.split_attn_mode" value={t.split_attn_mode || ''} options={[{value:'',label:'None'},{value:'batch',label:'Batch'},{value:'query',label:'Query'}]} onchange={(e) => update('split_attn_mode', e.target.value || null)} disabled={!t.split_attn_target} tooltip="Split mode" />
 							</div>
 							<div class="grid grid-cols-2 gap-2">
-								<FormSelect fieldPath="training.ffn_chunk_target" value={t.ffn_chunk_target || ''} options={[{value:'',label:'None'},{value:'all',label:'All'},{value:'video',label:'Video'},{value:'audio',label:'Audio'}]} onchange={(e) => update('ffn_chunk_target', e.target.value || null)} tooltip="FFN chunking" />
-								<FormField type="number" fieldPath="training.ffn_chunk_size" value={t.ffn_chunk_size ?? 0} oninput={(e) => update('ffn_chunk_size', Number(e.target.value))} disabled={!t.ffn_chunk_target} tooltip="Tokens per chunk" />
+								<FormSelect fieldPath="training.ffn_chunk_target" value={t.ffn_chunk_target || ''} options={[{value:'',label:'None'},{value:'all',label:'All'},{value:'video',label:'Video'},{value:'audio',label:'Audio'}]} onchange={(e) => update('ffn_chunk_target', e.target.value || null)} tooltip="Chunks transformer feed-forward layers by sequence tokens to reduce peak activation VRAM. Use 'all' for low-VRAM video/AV runs; use 'video' if audio is already comfortable." />
+								<FormField type="number" fieldPath="training.ffn_chunk_size" value={t.ffn_chunk_size ?? 0} oninput={(e) => update('ffn_chunk_size', Number(e.target.value))} disabled={!t.ffn_chunk_target} tooltip="Tokens per FFN chunk. 0 disables. Start with 512 for low VRAM, 1024 for mild savings, 256/128 only if still OOM; smaller is slower." />
 							</div>
 							<div class="grid grid-cols-3 gap-x-4 gap-y-1">
 								<FormToggle fieldPath="training.gradient_checkpointing_cpu_offload" checked={t.gradient_checkpointing_cpu_offload ?? false} onchange={(e) => update('gradient_checkpointing_cpu_offload', e.target.checked)} tooltip="Offload checkpointed activations to CPU" />
@@ -842,9 +1087,10 @@
 							]} onchange={(e) => update('sample_sampler', e.target.value)} tooltip="Validation sampler. Auto uses RES 2S for full LTX presets and Euler for distilled two-stage." />
 							<FormSelect fieldPath="training.sample_sigma_schedule" value={t.sample_sigma_schedule || 'auto'} options={[
 								{ value: 'auto', label: 'Auto' },
-								{ value: 'ltx', label: 'LTX Shifted' },
+								{ value: 'ltx', label: 'LTX Default' },
+								{ value: 'ltx_latent', label: 'LTX Latent Shift' },
 								{ value: 'ltx23_distilled', label: 'LTX 2.3 Distilled' }
-							]} onchange={(e) => update('sample_sigma_schedule', e.target.value)} tooltip="Validation sigma schedule. Auto uses latent-aware LTX sigmas." />
+							]} onchange={(e) => update('sample_sigma_schedule', e.target.value)} tooltip="Validation sigma schedule. Auto uses official validation sigmas, latent-aware sigmas for HQ, and distilled sigmas for distilled presets." />
 						</div>
 						<div class="grid grid-cols-2 gap-2">
 							<FormField type="number" fieldPath="training.sample_every_n_steps" value={t.sample_every_n_steps ?? ''} oninput={(e) => update('sample_every_n_steps', e.target.value ? Number(e.target.value) : null)} placeholder="Optional" tooltip="Sample every N steps" />

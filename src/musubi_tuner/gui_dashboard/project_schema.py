@@ -11,12 +11,23 @@ from musubi_tuner.gui_dashboard.cli_defaults import (
     get_ltx2_training_network_module_default,
     get_ltx2_training_output_dir_default,
 )
+from musubi_tuner.ltx2_sinksgd_defaults import (
+    DEFAULT_LTX2_LR_SCHEDULER,
+    DEFAULT_LTX2_OPTIMIZER_TYPE,
+    DEFAULT_LTX2_SINKSGD_OPTIMIZER_ARGS,
+)
 from musubi_tuner.model_defaults import default_gemma_root_path, default_ltx2_checkpoint_path
 
 
 SamplingPreset = Literal["legacy", "defaults", "ltx20", "ltx23", "ltx23_hq", "distilled_two_stage"]
-SampleSigmaSchedule = Literal["auto", "ltx", "ltx23_distilled"]
+SampleSigmaSchedule = Literal["auto", "ltx", "ltx_latent", "ltx23_distilled"]
 SampleSampler = Literal["auto", "euler", "res_2s"]
+LEGACY_SINKSGD_GRAD_ACCUM_OPTIMIZER_ARGS = (
+    "spectral_normalization=True scale_lr_with_grad_accum=True orthogonal_sinkhorn=True"
+)
+LEGACY_SINKSGD_EFFECTIVE_BATCH_OPTIMIZER_ARGS = (
+    "spectral_normalization=True scale_lr_with_effective_batch=True orthogonal_sinkhorn=True"
+)
 
 
 class GeneralConfig(BaseModel):
@@ -187,9 +198,21 @@ class TrainingConfig(BaseModel):
     # LoRA / Network
     network_module: Optional[str] = None
     network_dim: Optional[int] = None
-    network_alpha: float = 1.0
+    network_alpha: Optional[float] = None
     lora_target_preset: Literal[
-        "t2v", "v2v", "video_sa", "video_sa_ff", "video_sa_ca_ff", "audio", "audio_v2a", "audio_ref_only_ic", "av_ic", "video_ref_only_av", "full", "lycoris"
+        "t2v",
+        "v2v",
+        "video_sa",
+        "video_sa_ff",
+        "video_sa_ca_ff",
+        "character_training",
+        "audio",
+        "audio_v2a",
+        "audio_ref_ic",
+        "av_ic",
+        "video_ref_only_av",
+        "full",
+        "lycoris",
     ] = "t2v"
     network_args: str = ""
     network_weights: str = ""
@@ -201,6 +224,16 @@ class TrainingConfig(BaseModel):
     lycoris_config: str = ""
     lycoris_quantized_base_check_mode: Literal["off", "warn", "error"] = "warn"
     init_lokr_norm: Optional[float] = None
+    lokr_factor: Optional[int] = None
+    use_lokr: bool = False
+    use_dora: bool = False
+    use_dokr: bool = False
+    use_dora_oft: bool = False
+    scaled_oft: bool = True
+    oft_block_size: Optional[int] = None
+    oft_coft: bool = False
+    coft_eps: float = 6e-5
+    oft_block_share: bool = False
     rank_dropout: Optional[float] = None
     module_dropout: Optional[float] = None
     adaptive_rank: bool = False
@@ -209,12 +242,24 @@ class TrainingConfig(BaseModel):
     adaptive_rank_init_rank: Optional[int] = None
     adaptive_rank_quantile: Optional[float] = None
     adaptive_rank_weight: Optional[float] = None
+    adaptive_rank_budget: Optional[float] = None
+    adaptive_rank_budget_ratio: Optional[float] = None
+    adaptive_rank_budget_weight: Optional[float] = None
+    adaptive_rank_estimate: bool = False
+    adaptive_rank_estimate_apply: Optional[Literal["target", "init", "both"]] = None
+    adaptive_rank_finalize_start: Optional[float] = None
+    adaptive_rank_finalize_recover_steps: Optional[int] = None
+    adaptive_rank_finalize_recover_warmup_steps: Optional[int] = None
+    adaptive_rank_hard_prune: bool = False
+    adaptive_rank_hard_prune_start: Optional[float] = None
+    adaptive_rank_hard_prune_interval: Optional[int] = None
+    adaptive_rank_hard_prune_min_delta: Optional[int] = None
     caption_dropout_rate: float = 0.0
     video_caption_dropout_rate: float = 0.0
     audio_caption_dropout_rate: float = 0.0
     train_connectors: bool = False
     save_original_lora: bool = True
-    ic_lora_strategy: Literal["auto", "none", "v2v", "audio_ref_only_ic", "av_ic", "video_ref_only_av"] = "auto"
+    ic_lora_strategy: Literal["auto", "none", "v2v", "audio_ref_ic", "av_ic", "video_ref_only_av"] = "auto"
     av_cross_attention_mode: Literal["both", "a2v_only", "v2a_only", "none"] = "both"
     av_multi_ref: bool = False
     audio_ref_use_negative_positions: bool = False
@@ -225,10 +270,12 @@ class TrainingConfig(BaseModel):
     av_bimodal_scale: float = 3.0
 
     # Optimizer
-    learning_rate: float = 2e-6
-    optimizer_type: str = ""
-    optimizer_args: str = ""
-    lr_scheduler: str = "constant"
+    learning_rate: Optional[float] = None
+    optimizer_type: str = DEFAULT_LTX2_OPTIMIZER_TYPE
+    optimizer_args: str = " ".join(DEFAULT_LTX2_SINKSGD_OPTIMIZER_ARGS)
+    sinksgd_orthogonal_sinkhorn: bool = True
+    sinksgd_compiled_optimizer: bool = False
+    lr_scheduler: str = DEFAULT_LTX2_LR_SCHEDULER
     lr_warmup_steps: int = 0
     lr_decay_steps: Optional[int] = 0
     lr_scheduler_num_cycles: Optional[int] = 1
@@ -454,6 +501,14 @@ class TrainingConfig(BaseModel):
     audio_metrics_clap_similarity: bool = False
     audio_metrics_av_onset_alignment: bool = False
 
+    # Token routing
+    tread: bool = False
+    tread_selection_ratio: float = 0.5
+    tread_start_layer_idx: Optional[int] = None
+    tread_end_layer_idx: Optional[int] = None
+    differential_guidance: bool = False
+    differential_guidance_scale: float = 3.0
+
     # CREPA
     crepa: bool = False
     crepa_args: str = ""
@@ -461,12 +516,17 @@ class TrainingConfig(BaseModel):
     crepa_student_block_idx: int = 16
     crepa_teacher_block_idx: int = 32
     crepa_dino_model: Literal["dinov2_vits14", "dinov2_vitb14", "dinov2_vitl14", "dinov2_vitg14"] = "dinov2_vitb14"
-    crepa_lambda: float = 0.1
+    crepa_lambda: float = 0.5
+    crepa_lambda_end: float = 0.1
     crepa_tau: float = 1.0
     crepa_num_neighbors: int = 2
-    crepa_schedule: Literal["constant", "linear", "cosine"] = "constant"
-    crepa_warmup_steps: int = 0
+    crepa_schedule: Literal["constant", "linear", "cosine"] = "cosine"
+    crepa_warmup_steps: int = 100
+    crepa_decay_steps: int = 0
     crepa_normalize: bool = True
+    crepa_similarity_threshold: Optional[float] = 0.85
+    crepa_similarity_ema_decay: float = 0.99
+    crepa_threshold_mode: Literal["permanent", "recoverable"] = "permanent"
 
     # Self-Flow
     self_flow: bool = False
@@ -787,6 +847,10 @@ class ProjectConfig(BaseModel):
                     )
                     if has_old_sampling_values and 'sample_sampling_preset' not in section:
                         section['sample_sampling_preset'] = 'legacy'
+                    if section.get('optimizer_args') == LEGACY_SINKSGD_GRAD_ACCUM_OPTIMIZER_ARGS:
+                        section['optimizer_args'] = " ".join(DEFAULT_LTX2_SINKSGD_OPTIMIZER_ARGS)
+                    elif section.get('optimizer_args') == LEGACY_SINKSGD_EFFECTIVE_BATCH_OPTIMIZER_ARGS:
+                        section['optimizer_args'] = " ".join(DEFAULT_LTX2_SINKSGD_OPTIMIZER_ARGS)
                 elif section_name == 'inference':
                     has_old_generation_values = any(
                         key in section and section.get(key) is not None

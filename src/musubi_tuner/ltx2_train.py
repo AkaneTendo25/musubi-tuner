@@ -34,6 +34,7 @@ from musubi_tuner.hv_train_network import (
     set_seed,
     setup_parser_common,
     should_sample_images,
+    configure_effective_batch_lr_scale,
 )
 from musubi_tuner.modules.scheduling_flow_match_discrete import FlowMatchDiscreteScheduler
 from musubi_tuner.utils import huggingface_utils, model_utils, sai_model_spec, train_utils
@@ -615,16 +616,16 @@ def _validate_full_ft_ic_batch(
                 )
         return
 
-    if ic_lora_strategy == "audio_ref_only_ic":
+    if ic_lora_strategy == "audio_ref_ic":
         if ltx_mode not in {"av", "audio"}:
-            raise ValueError("--ic_lora_strategy audio_ref_only_ic requires --ltx_mode=av or audio")
+            raise ValueError("--ic_lora_strategy audio_ref_ic requires --ltx_mode=av or audio")
         if audio_latents is None:
             raise ValueError(
-                f"{split_name} batch {batch_index} is missing audio_latents required for --ic_lora_strategy audio_ref_only_ic."
+                f"{split_name} batch {batch_index} is missing audio_latents required for --ic_lora_strategy audio_ref_ic."
             )
         if ref_audio_latents is None:
             raise ValueError(
-                f"{split_name} batch {batch_index} is missing ref_audio_latents required for --ic_lora_strategy audio_ref_only_ic. "
+                f"{split_name} batch {batch_index} is missing ref_audio_latents required for --ic_lora_strategy audio_ref_ic. "
                 "Set reference_audio_directory/reference_audio_cache_directory and cache reference audio latents."
             )
         return
@@ -2008,6 +2009,19 @@ def _fused_step_pending_grads(
     return len(params_to_step)
 
 
+def _attach_fused_step_param(optimizer: Any, base_optimizer: Any) -> bool:
+    """Expose a base optimizer's per-parameter step on an accelerator wrapper."""
+    if callable(getattr(optimizer, "step_param", None)):
+        return True
+
+    step_param = getattr(base_optimizer, "step_param", None)
+    if not callable(step_param):
+        return False
+
+    setattr(optimizer, "step_param", step_param)
+    return True
+
+
 def _build_synthetic_motion_latents(
     base_latents: torch.Tensor,
     *,
@@ -2705,7 +2719,7 @@ def ltx2_finetune_setup_parser(parser: argparse.ArgumentParser) -> argparse.Argu
     parser.add_argument(
         "--fused_backward_pass",
         action="store_true",
-        help="Use fused backward pass for Adafactor or BAdam (with use_gradient_release=True)",
+        help="Use fused backward pass for Adafactor, CAME/CAME8bit, SinkSGD, torchao Adam, torch-optimi, or BAdam (with use_gradient_release=True)",
     )
     # BAdam (block-coordinate Adam wrapper).
     # All wrapper kwargs flow through --optimizer_args as key=value entries
@@ -4007,6 +4021,7 @@ def main() -> None:
             float(ft_group_stats.get("text_encoder_lr", 0.0)),
         )
 
+    configure_effective_batch_lr_scale(args, train_dataset_group, accelerator.num_processes)
     optimizer_name, optimizer_args, optimizer, optimizer_train_fn, optimizer_eval_fn = trainer.get_optimizer(
         args, params_to_optimize
     )
@@ -4206,15 +4221,64 @@ def main() -> None:
             badam_gr_active = True
             logger.info("BAdam gradient-release enabled (post-prepare).")
         else:
-            if base_optimizer.__class__.__name__.lower() != "adafactor":
-                raise ValueError(
-                    f"--fused_backward_pass requires Adafactor optimizer or BAdam with "
-                    f"badam_use_gradient_release=True; got {base_optimizer.__class__.__name__}"
+            base_optimizer_name = base_optimizer.__class__.__name__.lower()
+            if base_optimizer_name == "adafactor":
+                import musubi_tuner.modules.adafactor_fused as adafactor_fused
+
+                adafactor_fused.patch_adafactor_fused(optimizer)
+                logger.info("Adafactor fused backward pass enabled.")
+            else:
+                from musubi_tuner.optimizers.backends import (
+                    is_optimi_optimizer_instance,
+                    is_torchao_optimizer_instance,
+                    patch_optimi_fused_step_param,
+                    patch_torchao_fused_step_param,
                 )
 
-            import musubi_tuner.modules.adafactor_fused as adafactor_fused
+                if is_torchao_optimizer_instance(base_optimizer):
+                    if not patch_torchao_fused_step_param(base_optimizer) or not _attach_fused_step_param(optimizer, base_optimizer):
+                        raise ValueError(
+                            f"{base_optimizer.__class__.__name__} fused backward pass requires torchao single-param Adam support"
+                        )
+                    if not bool(getattr(base_optimizer, "bf16_stochastic_round", False)):
+                        logger.warning(
+                            "%s fused backward pass is enabled without bf16_stochastic_round=True. "
+                            "For BF16 full fine-tuning, pass --optimizer_args bf16_stochastic_round=True "
+                            "or omit it to use the LTX2 BF16 default.",
+                            base_optimizer.__class__.__name__,
+                        )
+                    logger.info("%s torchao fused backward pass enabled.", base_optimizer.__class__.__name__)
+                elif is_optimi_optimizer_instance(base_optimizer):
+                    if not bool(getattr(base_optimizer, "defaults", {}).get("gradient_release", False)):
+                        raise ValueError(
+                            f"{base_optimizer.__class__.__name__} fused backward pass requires "
+                            "gradient_release=True. Omit that optimizer arg to use the LTX2 default."
+                        )
+                    if not patch_optimi_fused_step_param(base_optimizer) or not _attach_fused_step_param(optimizer, base_optimizer):
+                        raise ValueError(
+                            f"{base_optimizer.__class__.__name__} fused backward pass requires optimi single-param step support"
+                        )
+                    logger.info("%s torch-optimi fused backward pass enabled.", base_optimizer.__class__.__name__)
+                elif base_optimizer_name in {"came", "came8bit", "sinksgd"}:
+                    if not _attach_fused_step_param(optimizer, base_optimizer):
+                        raise ValueError(f"{base_optimizer.__class__.__name__} fused backward pass requires optimizer.step_param support")
+                    if base_optimizer_name in {"came", "came8bit"} and not any(
+                        bool(group.get("stochastic_rounding", False)) for group in base_optimizer.param_groups
+                    ):
+                        logger.warning(
+                            "%s fused backward pass is enabled without stochastic_rounding=True. "
+                            "For BF16 full fine-tuning, pass --optimizer_args stochastic_rounding=True "
+                            "or omit it to use the LTX2 BF16 default.",
+                            base_optimizer.__class__.__name__,
+                        )
+                    logger.info("%s fused backward pass enabled.", base_optimizer.__class__.__name__)
+                else:
+                    raise ValueError(
+                        f"--fused_backward_pass requires Adafactor, CAME/CAME8bit, SinkSGD, torchao Adam, "
+                        f"torch-optimi, or BAdam with badam_use_gradient_release=True; "
+                        f"got {base_optimizer.__class__.__name__}"
+                    )
 
-            adafactor_fused.patch_adafactor_fused(optimizer)
             hooks_step_enabled = args.max_grad_norm == 0.0
             if not hooks_step_enabled:
                 logger.info(
@@ -4629,6 +4693,41 @@ def main() -> None:
                 save_file(teacher_sd, teacher_file)
         except Exception as e:
             logger.warning("Failed to save Self-Flow teacher EMA state: %s", e)
+
+    def handle_dashboard_stop_request(global_step: int, epoch: int, step_in_epoch: int) -> bool:
+        if not train_utils.dashboard_stop_requested():
+            return False
+
+        if global_step <= 0:
+            accelerator.print("\nDashboard stop requested before training steps completed; exiting without saving state.")
+            train_utils.clear_dashboard_stop_request()
+            accelerator.end_training()
+            return True
+
+        accelerator.print("\nDashboard stop requested; saving interrupt state and exiting training.")
+        optimizer_eval_fn()
+        accelerator.wait_for_everyone()
+        if accelerator.is_main_process:
+            state_dir = train_utils.save_state_on_interrupt(
+                args,
+                accelerator,
+                global_step=global_step,
+                epoch=epoch + 1,
+                step_in_epoch=step_in_epoch,
+            )
+            train_utils.update_resume_metadata(
+                state_dir,
+                {
+                    "loss_avg": loss_recorder.moving_average,
+                    "loss_count": len(loss_recorder.loss_list),
+                    "interrupted": True,
+                },
+            )
+            save_ema_state()
+            save_self_flow_state()
+        train_utils.clear_dashboard_stop_request()
+        accelerator.end_training()
+        return True
 
     def run_validation(step: int, epoch: int) -> dict:
         """Run validation and return metrics."""
@@ -5538,6 +5637,8 @@ def main() -> None:
         metadata["ss_epoch"] = str(epoch + 1)
         transformer.train()
         for step, batch in enumerate(train_dataloader):
+            if handle_dashboard_stop_request(global_step, epoch, step):
+                return
             with accelerator.accumulate(transformer):
                 motion_micro_step += 1
                 batch = _normalize_ltx2_batch_for_call_dit(batch)
@@ -6097,6 +6198,8 @@ def main() -> None:
 
                 if global_step >= args.max_train_steps:
                     break
+                if handle_dashboard_stop_request(global_step, epoch, step + 1):
+                    return
 
         # Run validation at epoch end
         if should_validate(global_step, epoch, is_epoch_end=True):

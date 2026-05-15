@@ -17,7 +17,7 @@ class _BasicTransformerBlock1D(torch.nn.Module):
         dim: int,
         heads: int,
         dim_head: int,
-        rope_type: LTXRopeType = LTXRopeType.INTERLEAVED,
+        rope_type: LTXRopeType = LTXRopeType.SPLIT,
         apply_gated_attention: bool = False,
     ):
         super().__init__()
@@ -83,7 +83,7 @@ class Embeddings1DConnector(torch.nn.Module):
         causal_temporal_positioning (bool): If True, uses causal attention (default=False).
         num_learnable_registers (int | None): Number of learnable registers to replace padded tokens. If None, disables
             register replacement. (default=128)
-        rope_type (LTXRopeType): The RoPE variant to use (default=DEFAULT_ROPE_TYPE).
+        rope_type (LTXRopeType): The RoPE variant to use.
         double_precision_rope (bool): Use double precision rope calculation (default=False).
     """
 
@@ -98,7 +98,7 @@ class Embeddings1DConnector(torch.nn.Module):
         positional_embedding_max_pos: list[int] | None = None,
         causal_temporal_positioning: bool = False,
         num_learnable_registers: int | None = 128,
-        rope_type: LTXRopeType = LTXRopeType.INTERLEAVED,
+        rope_type: LTXRopeType = LTXRopeType.SPLIT,
         double_precision_rope: bool = False,
         apply_gated_attention: bool = False,
     ):
@@ -134,28 +134,18 @@ class Embeddings1DConnector(torch.nn.Module):
     def _replace_padded_with_learnable_registers(
         self, hidden_states: torch.Tensor, attention_mask: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        assert hidden_states.shape[1] % self.num_learnable_registers == 0, (
-            f"Hidden states sequence length {hidden_states.shape[1]} must be divisible by num_learnable_registers "
+        batch_size, seq_len, _ = hidden_states.shape
+        assert seq_len % self.num_learnable_registers == 0, (
+            f"Hidden states sequence length {seq_len} must be divisible by num_learnable_registers "
             f"{self.num_learnable_registers}."
         )
 
-        num_registers_duplications = hidden_states.shape[1] // self.num_learnable_registers
-        learnable_registers = torch.tile(self.learnable_registers, (num_registers_duplications, 1))
-        attention_mask_binary = (attention_mask.squeeze(1).squeeze(1).unsqueeze(-1) >= -9000.0).int()
-
-        non_zero_hidden_states = hidden_states[:, attention_mask_binary.squeeze().bool(), :]
-        non_zero_nums = non_zero_hidden_states.shape[1]
-        pad_length = hidden_states.shape[1] - non_zero_nums
-        adjusted_hidden_states = torch.nn.functional.pad(non_zero_hidden_states, pad=(0, 0, 0, pad_length), value=0)
-        flipped_mask = torch.flip(attention_mask_binary, dims=[1])
-        hidden_states = flipped_mask * adjusted_hidden_states + (1 - flipped_mask) * learnable_registers
-
-        attention_mask = torch.full_like(
-            attention_mask,
-            0.0,
-            dtype=attention_mask.dtype,
-            device=attention_mask.device,
-        )
+        learnable_registers = self.learnable_registers.repeat(seq_len // self.num_learnable_registers, 1)
+        learnable_registers = learnable_registers.to(hidden_states.dtype)
+        learnable_registers = learnable_registers.unsqueeze(0).expand(batch_size, -1, -1)
+        attention_mask_binary = (attention_mask[:, 0, 0, :].unsqueeze(-1) >= 0).to(hidden_states.dtype)
+        hidden_states = attention_mask_binary * hidden_states + (1 - attention_mask_binary) * learnable_registers
+        attention_mask = torch.zeros_like(attention_mask)
 
         return hidden_states, attention_mask
 
@@ -176,7 +166,7 @@ class Embeddings1DConnector(torch.nn.Module):
             hidden_states, attention_mask = self._replace_padded_with_learnable_registers(hidden_states, attention_mask)
 
         indices_grid = torch.arange(hidden_states.shape[1], dtype=torch.float32, device=hidden_states.device)
-        indices_grid = indices_grid[None, None, :]
+        indices_grid = indices_grid[None, None, :].expand(hidden_states.shape[0], -1, -1)
         freq_grid_generator = generate_freq_grid_np if self.double_precision_rope else generate_freq_grid_pytorch
         freqs_cis = precompute_freqs_cis(
             indices_grid=indices_grid,
@@ -201,7 +191,7 @@ class Embeddings1DConnectorConfigurator(ModelConfigurator[Embeddings1DConnector]
     @classmethod
     def from_config(cls: type[Embeddings1DConnector], config: dict) -> Embeddings1DConnector:
         transformer_config = config.get("transformer", {})
-        rope_type = LTXRopeType(transformer_config.get("rope_type", "interleaved"))
+        rope_type = LTXRopeType(transformer_config.get("rope_type", "split"))
         double_precision_rope = transformer_config.get("frequencies_precision", False) == "float64"
         pe_max_pos = transformer_config.get("connector_positional_embedding_max_pos", [1])
         num_attention_heads = transformer_config.get("connector_num_attention_heads", 30)
@@ -224,7 +214,7 @@ class AudioEmbeddings1DConnectorConfigurator(ModelConfigurator[Embeddings1DConne
     @classmethod
     def from_config(cls: type[Embeddings1DConnector], config: dict) -> Embeddings1DConnector:
         transformer_config = config.get("transformer", {})
-        rope_type = LTXRopeType(transformer_config.get("rope_type", "interleaved"))
+        rope_type = LTXRopeType(transformer_config.get("rope_type", "split"))
         double_precision_rope = transformer_config.get("frequencies_precision", False) == "float64"
         pe_max_pos = transformer_config.get("connector_positional_embedding_max_pos", [1])
         num_attention_heads = transformer_config.get(

@@ -903,15 +903,17 @@ class BucketSelector:
     }
 
     @classmethod
-    def resolve_resolution_steps(cls, architecture: str, reference_downscale: int = 1) -> int:
+    def resolve_resolution_steps(
+        cls,
+        architecture: str,
+        reference_downscale: int = 1,
+    ) -> int:
         if architecture not in BucketSelector.ARCHITECTURE_STEPS_MAP:
             raise ValueError(f"Invalid architecture: {architecture}")
 
         reso_steps = BucketSelector.ARCHITECTURE_STEPS_MAP[architecture]
         reference_downscale = max(1, int(reference_downscale or 1))
-        if architecture == ARCHITECTURE_LTX2 and reference_downscale > 1:
-            # LTX2 reference latents are quantized to /32 after spatial downscale.
-            # Make target buckets divisible by 32 * downscale to avoid lossy flooring.
+        if architecture == ARCHITECTURE_LTX2:
             reso_steps *= reference_downscale
         return reso_steps
 
@@ -927,7 +929,10 @@ class BucketSelector:
         self.bucket_area = resolution[0] * resolution[1]
         self.architecture = architecture
 
-        self.reso_steps = BucketSelector.resolve_resolution_steps(architecture, reference_downscale)
+        self.reso_steps = BucketSelector.resolve_resolution_steps(
+            architecture,
+            reference_downscale,
+        )
 
         if not enable_bucket:
             # only define one bucket
@@ -984,7 +989,10 @@ class BucketSelector:
         if reso_steps is None and architecture is None:
             raise ValueError("resolution steps or architecture must be provided")
         if reso_steps is None and architecture is not None:
-            reso_steps = BucketSelector.resolve_resolution_steps(architecture, reference_downscale)
+            reso_steps = BucketSelector.resolve_resolution_steps(
+                architecture,
+                reference_downscale,
+            )
 
         max_area = resolution[0] * resolution[1]
         width, height = image_size

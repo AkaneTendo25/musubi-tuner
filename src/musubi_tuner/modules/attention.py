@@ -15,11 +15,34 @@ except ImportError:
     _flash_attn_forward = None
     flash_attn_func = None
 
-try:
-    from sageattention import sageattn_varlen, sageattn
-except ImportError:
-    sageattn_varlen = None
-    sageattn = None
+_sageattention_import_attempted = False
+sageattn_varlen = None
+sageattn = None
+
+
+def _ensure_sageattention():
+    global _sageattention_import_attempted, sageattn_varlen, sageattn
+
+    if not _sageattention_import_attempted:
+        _sageattention_import_attempted = True
+        try:
+            from sageattention import sageattn_varlen as _sageattn_varlen
+            from sageattention import sageattn as _sageattn
+        except ImportError:
+            sageattn_varlen = None
+            sageattn = None
+        else:
+            sageattn_varlen = _sageattn_varlen
+            sageattn = _sageattn
+
+    return sageattn_varlen, sageattn
+
+
+def _require_sageattention():
+    _sageattn_varlen, _sageattn = _ensure_sageattention()
+    if _sageattn_varlen is None or _sageattn is None:
+        raise ImportError("SageAttention is required for attention mode 'sageattn', but it is not installed.")
+    return _sageattn_varlen, _sageattn
 
 try:
     import xformers.ops as xops
@@ -193,11 +216,12 @@ def attention(
             q, k, v = None, None, None
 
     elif attn_params.attn_mode == "sageattn":
+        _sageattn_varlen, _sageattn = _require_sageattention()
         if attn_params.split_attn:
             x = []
             for i in range(len(q)):
                 # HND seems to cause an error
-                x_i = sageattn(q[i], k[i], v[i])  # B, H, L, D. No dropout support
+                x_i = _sageattn(q[i], k[i], v[i])  # B, H, L, D. No dropout support
                 q[i] = None
                 k[i] = None
                 v[i] = None
@@ -205,7 +229,7 @@ def attention(
             x = torch.cat(x, dim=0)
             q, k, v = None, None, None
         elif attn_params.cu_seqlens is None:  # all tokens are valid
-            x = sageattn(q, k, v)  # B, L, H, D. No dropout support
+            x = _sageattn(q, k, v)  # B, L, H, D. No dropout support
             q, k, v = None, None, None
         else:
             # Reshape to [(bxs), a, d]
@@ -215,7 +239,7 @@ def attention(
             v = v.view(v.shape[0] * v.shape[1], *v.shape[2:])  # [B*L, H, D]
 
             # Assume cu_seqlens_q == cu_seqlens_kv and max_seqlen_q == max_seqlen_kv. No dropout support
-            x = sageattn_varlen(
+            x = _sageattn_varlen(
                 q, k, v, attn_params.cu_seqlens, attn_params.cu_seqlens, attn_params.max_seqlen, attn_params.max_seqlen
             )
             q, k, v = None, None, None

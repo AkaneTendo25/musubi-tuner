@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import shutil
+import time
 from typing import Callable
 
 import accelerate
@@ -19,6 +20,8 @@ EPOCH_STATE_NAME = "{}-{:06d}-state"
 EPOCH_FILE_NAME = "{}-{:06d}"
 EPOCH_DIFFUSERS_DIR_NAME = "{}-{:06d}"
 LAST_STATE_NAME = "{}-state"
+INTERRUPT_STATE_NAME = "{}-interrupt-step{:08d}-state"
+INTERRUPT_STATE_UNIQUE_NAME = "{}-interrupt-step{:08d}-{}-state"
 STEP_STATE_NAME = "{}-step{:08d}-state"
 STEP_FILE_NAME = "{}-step{:08d}"
 STEP_DIFFUSERS_DIR_NAME = "{}-step{:08d}"
@@ -257,6 +260,78 @@ def save_state_on_train_end(
     if args.save_state_to_huggingface:
         logger.info("uploading last state to huggingface.")
         huggingface_utils.upload(args, state_dir, "/" + LAST_STATE_NAME.format(model_name))
+
+
+def save_state_on_interrupt(
+    args: argparse.Namespace,
+    accelerator: accelerate.Accelerator,
+    global_step: int = 0,
+    epoch: int = 0,
+    step_in_epoch: int = 0,
+) -> str:
+    """Save a dashboard stop snapshot without touching normal retention windows."""
+    model_name = args.output_name
+    step_no = max(int(global_step or 0), 0)
+    state_name = INTERRUPT_STATE_NAME.format(model_name, step_no)
+
+    logger.info("")
+    logger.info("saving interrupt state at step %s.", step_no)
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    state_dir = os.path.join(args.output_dir, state_name)
+    if os.path.exists(state_dir):
+        state_name = INTERRUPT_STATE_UNIQUE_NAME.format(model_name, step_no, int(time.time()))
+        state_dir = os.path.join(args.output_dir, state_name)
+    accelerator.save_state(state_dir)
+    save_resume_metadata(state_dir, global_step, step_in_epoch, epoch)
+
+    if args.save_state_to_huggingface:
+        logger.info("uploading interrupt state to huggingface.")
+        huggingface_utils.upload(args, state_dir, "/" + state_name, force_sync_upload=True)
+
+    return state_dir
+
+
+def get_dashboard_stop_request_file() -> str | None:
+    path = os.getenv("MUSUBI_DASHBOARD_STOP_FILE")
+    return path or None
+
+
+def dashboard_stop_requested() -> bool:
+    path = get_dashboard_stop_request_file()
+    return bool(path and os.path.exists(path))
+
+
+def dashboard_stop_mode() -> str | None:
+    path = get_dashboard_stop_request_file()
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        with open(path, encoding="utf-8") as f:
+            raw = f.read().strip()
+    except OSError:
+        return "graceful"
+
+    if not raw:
+        return "graceful"
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return "graceful"
+    if not isinstance(payload, dict):
+        return "graceful"
+    mode = str(payload.get("mode", "graceful")).lower()
+    return "force" if mode == "force" else "graceful"
+
+
+def clear_dashboard_stop_request() -> None:
+    path = get_dashboard_stop_request_file()
+    if not path:
+        return
+    try:
+        os.remove(path)
+    except OSError:
+        pass
 
 
 def get_lin_function(x1: float = 256, y1: float = 0.5, x2: float = 4096, y2: float = 1.15) -> Callable[[float], float]:

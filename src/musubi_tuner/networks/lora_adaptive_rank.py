@@ -1277,14 +1277,15 @@ class AdaptiveRankLoRANetworkMixin:
         return metrics
 
     def build_export_state_dict(self) -> Dict[str, torch.Tensor]:
-        if not self.has_adaptive_rank():
-            return self.state_dict()
-
         export_state: Dict[str, torch.Tensor] = {}
         loras = self.text_encoder_loras + self.unet_loras
         for lora in loras:
-            export_state.update(lora.export_state_dict())
-        return export_state
+            if hasattr(lora, "export_state_dict"):
+                export_state.update(lora.export_state_dict())
+
+        if export_state:
+            return export_state
+        return self.state_dict()
 
     def build_adaptive_rank_report(self) -> Optional[Dict[str, Any]]:
         loras = self.text_encoder_loras + self.unet_loras

@@ -56,6 +56,9 @@ class AVGemmaTextEncoderModel(GemmaTextEncoderModelBase):
             audio_input = encoded_input
 
         connector_attention_mask = self._convert_to_additive_mask(attention_mask, video_input.dtype)
+        sort_idx, connector_attention_mask = self._compute_right_pad_order(connector_attention_mask)
+        video_input = self._apply_right_pad_order(video_input, sort_idx)
+        audio_input = self._apply_right_pad_order(audio_input, sort_idx)
 
         encoded, encoded_connector_attention_mask = self.embeddings_connector(
             video_input,

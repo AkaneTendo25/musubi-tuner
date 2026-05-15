@@ -23,14 +23,24 @@ from musubi_tuner.utils.safetensors_utils import (
 
 
 def detect_network_type(lora_sd: Dict[str, torch.Tensor]) -> str:
-    """Detect network type (lora, loha, lokr) from state dict keys."""
+    """Detect network type from state dict keys."""
+    has_dora_magnitude = any("lora_magnitude_vector" in key for key in lora_sd)
+    has_lokr = any("lokr_w1" in key for key in lora_sd)
+    has_oft = any(".oft_R.weight" in key for key in lora_sd)
+    has_dora_oft = any(".dora_scale" in key for key in lora_sd) and has_oft
+    if has_lokr and has_dora_magnitude:
+        return "dokr"
+    if has_lokr:
+        return "lokr"
+    if has_dora_oft:
+        return "dora_oft"
+    if has_oft:
+        return "oft"
     for key in lora_sd:
         if "lora_down" in key:
             return "lora"
         if "hada_w1_a" in key:
             return "loha"
-        if "lokr_w1" in key:
-            return "lokr"
     return "lora"  # default
 
 
@@ -155,60 +165,14 @@ def load_safetensors_with_lora_and_fp8(
                     from musubi_tuner.networks.lokr import merge_weights_to_tensor as lokr_merge
 
                     model_weight = lokr_merge(model_weight, lora_name, lora_sd, lora_weight_keys, multiplier, calc_device)
+                elif net_type == "dokr":
+                    from musubi_tuner.networks.lokr import merge_weights_to_tensor as dokr_merge
+
+                    model_weight = dokr_merge(model_weight, lora_name, lora_sd, lora_weight_keys, multiplier, calc_device)
                 else:
-                    # standard LoRA (lora_down/lora_up)
-                    down_key = lora_name + ".lora_down.weight"
-                    up_key = lora_name + ".lora_up.weight"
-                    alpha_key = lora_name + ".alpha"
-                    if down_key not in lora_weight_keys or up_key not in lora_weight_keys:
-                        continue
+                    from musubi_tuner.networks.lora import merge_weights_to_tensor as lora_merge
 
-                    # get LoRA weights
-                    down_weight = lora_sd[down_key]
-                    up_weight = lora_sd[up_key]
-
-                    dim = down_weight.size()[0]
-                    alpha = lora_sd.get(alpha_key, dim)
-                    scale = alpha / dim
-
-                    down_weight = down_weight.to(calc_device)
-                    up_weight = up_weight.to(calc_device)
-
-                    original_dtype = model_weight.dtype
-                    if original_dtype.itemsize == 1:  # fp8
-                        # temporarily convert to float16 for calculation
-                        model_weight = model_weight.to(torch.float16)
-                        down_weight = down_weight.to(torch.float16)
-                        up_weight = up_weight.to(torch.float16)
-
-                    # W <- W + U * D
-                    if len(model_weight.size()) == 2:
-                        # linear
-                        if len(up_weight.size()) == 4:  # use linear projection mismatch
-                            up_weight = up_weight.squeeze(3).squeeze(2)
-                            down_weight = down_weight.squeeze(3).squeeze(2)
-                        model_weight = model_weight + multiplier * (up_weight @ down_weight) * scale
-                    elif down_weight.size()[2:4] == (1, 1):
-                        # conv2d 1x1
-                        model_weight = (
-                            model_weight
-                            + multiplier
-                            * (up_weight.squeeze(3).squeeze(2) @ down_weight.squeeze(3).squeeze(2)).unsqueeze(2).unsqueeze(3)
-                            * scale
-                        )
-                    else:
-                        # conv2d 3x3
-                        conved = torch.nn.functional.conv2d(down_weight.permute(1, 0, 2, 3), up_weight).permute(1, 0, 2, 3)
-                        model_weight = model_weight + multiplier * conved * scale
-
-                    if original_dtype.itemsize == 1:  # fp8
-                        model_weight = model_weight.to(original_dtype)  # convert back to original dtype
-
-                    # remove LoRA keys from set
-                    lora_weight_keys.remove(down_key)
-                    lora_weight_keys.remove(up_key)
-                    if alpha_key in lora_weight_keys:
-                        lora_weight_keys.remove(alpha_key)
+                    model_weight = lora_merge(model_weight, lora_name, lora_sd, lora_weight_keys, multiplier, calc_device)
 
             if not keep_on_calc_device and original_device != calc_device:
                 model_weight = model_weight.to(original_device)  # move back to original device

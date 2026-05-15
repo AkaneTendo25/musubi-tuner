@@ -5,7 +5,9 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shlex
 from pathlib import Path
+from typing import Any
 
 from fastapi import APIRouter, Request
 from pydantic import BaseModel
@@ -88,16 +90,258 @@ def _first_training_dataset(config: dict) -> dict:
     return next((d for d in datasets if d.get('type') in ('video', 'image')), datasets[0])
 
 
+def _dataset_frame_count(dataset: dict, default: int = 33) -> int:
+    """Return the frame count that affects runtime memory estimates.
+
+    Image datasets can still carry the video-only target_frames field in saved
+    project JSON, but a single image trains as one source frame.
+    """
+    dataset_type = str(dataset.get('type', 'video')).strip().lower()
+    if dataset_type == 'image':
+        return 1
+    return max(_coerce_int(dataset.get('target_frames', default), default), 1)
+
+
+def _training_dataset_candidates(config: dict) -> list[dict]:
+    """Return datasets relevant to visual training estimates."""
+    datasets = config.get('dataset', {}).get('datasets', [])
+    if not datasets:
+        return []
+    visual = [
+        dataset for dataset in datasets
+        if str(dataset.get('type', '')).strip().lower() in {'video', 'image'}
+    ]
+    return visual or datasets
+
+
+def _dataset_vram_workload(dataset: dict) -> int:
+    """Approximate relative per-batch VRAM pressure for dataset selection."""
+    res_w = max(_coerce_int(dataset.get('resolution_w', 768), 768), 64)
+    res_h = max(_coerce_int(dataset.get('resolution_h', 512), 512), 64)
+    frames = _dataset_frame_count(dataset)
+    batch_size = max(_coerce_int(dataset.get('batch_size', 1), 1), 1)
+    latent_f = max(1, (frames - 1) // 8 + 1)
+    latent_h = max(1, res_h // 32)
+    latent_w = max(1, res_w // 32)
+    return latent_f * latent_h * latent_w * batch_size
+
+
+def _max_vram_training_dataset(config: dict) -> dict:
+    """Return the dataset expected to produce the highest training VRAM peak."""
+    datasets = _training_dataset_candidates(config)
+    if not datasets:
+        return {}
+    return max(datasets, key=_dataset_vram_workload)
+
+
+def _normalize_optimizer_type(value: str | None) -> str:
+    return str(value or 'SinkSGD_adv').replace('-', '').replace('_', '').lower()
+
+
+def _coerce_bool(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    if isinstance(value, (int, float)):
+        return value != 0
+    return str(value).strip().strip("'\"").lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _network_arg_value(raw_args, key: str) -> str | None:
+    if not raw_args:
+        return None
+    if isinstance(raw_args, (list, tuple)):
+        parts = [str(part) for part in raw_args]
+    else:
+        try:
+            parts = shlex.split(str(raw_args), posix=False)
+        except ValueError:
+            parts = str(raw_args).split()
+
+    target_key = key.strip().lower()
+    for part in parts:
+        clean = part.strip()
+        if len(clean) >= 2 and clean[0] == clean[-1] and clean[0] in {"'", '"'}:
+            clean = clean[1:-1]
+        if "=" not in clean:
+            continue
+        name, value = clean.split("=", 1)
+        if name.strip().lower() == target_key:
+            return value.strip()
+    return None
+
+
+def _training_uses_dora(training: dict) -> bool:
+    # Explicit network_args match command_builder behavior and override the GUI toggle.
+    explicit_dora_oft = _network_arg_value(training.get("network_args"), "use_dora_oft")
+    if explicit_dora_oft is not None:
+        return _coerce_bool(explicit_dora_oft)
+    explicit = _network_arg_value(training.get("network_args"), "use_dora")
+    if explicit is not None:
+        return _coerce_bool(explicit)
+    return _coerce_bool(training.get("use_dora")) or _coerce_bool(training.get("use_dokr")) or _coerce_bool(training.get("use_dora_oft"))
+
+
+def _dora_extra_param_ratio(rank: int, preset: str | None) -> float:
+    """Approximate extra trainable parameter ratio for DoRA magnitude vectors.
+
+    DoRA adds one magnitude value per adapted output channel. For square linear
+    layers this is about 1 / (2 * rank) relative to normal LoRA A/B weights.
+    FFN-heavy presets have slightly larger output-channel share.
+    """
+    if rank <= 0:
+        return 0.0
+    preset_value = str(preset or "t2v").strip().lower()
+    ffn_heavy_presets = {
+        "v2v",
+        "video_sa_ff",
+        "video_sa_ca_ff",
+        "character_training",
+        "audio",
+        "audio_ref_ic",
+        "audio_ref_only_ic",
+        "av_ic",
+        "video_ref_only_av",
+        "full",
+    }
+    output_share = 0.65 if preset_value in ffn_heavy_presets else 0.50
+    return min(output_share / rank, 0.25)
+
+
+def _dora_runtime_overhead_gb(
+    *,
+    activations_gb: float,
+    rank: int,
+    preset: str | None,
+    checkpointed: bool,
+) -> float:
+    """Approximate extra runtime peak from DoRA composition tensors.
+
+    The persistent DoRA magnitude vectors are small, often too small to move a
+    one-decimal dashboard estimate. Forward/backward also creates extra
+    activation-shaped tensors for magnitude/norm composition, so model a small
+    activation-like peak separately.
+    """
+    if activations_gb <= 0:
+        return 0.0
+
+    preset_value = str(preset or "t2v").strip().lower()
+    ffn_heavy_presets = {
+        "v2v",
+        "video_sa_ff",
+        "video_sa_ca_ff",
+        "character_training",
+        "audio",
+        "audio_ref_ic",
+        "audio_ref_only_ic",
+        "av_ic",
+        "video_ref_only_av",
+        "full",
+    }
+    base_ratio = 0.06 if preset_value in ffn_heavy_presets else 0.035
+    if not checkpointed:
+        base_ratio *= 1.5
+
+    # Low-rank DoRA has larger relative magnitude-vector and norm-composition
+    # overhead. Keep this modest because the true peak depends on target layer.
+    rank_factor = 1.0 + max(0, 8 - rank) / 16
+    estimate = activations_gb * base_ratio * min(rank_factor, 1.4)
+    return min(max(estimate, 0.05), 0.45)
+
+
+def _optimizer_bytes_per_param(opt_type: str | None, rank: int) -> float:
+    """Approximate optimizer state bytes per trainable LoRA parameter."""
+    normalized = _normalize_optimizer_type(opt_type)
+    if normalized == 'came8bit':
+        # CAME keeps factored second/residual moments and an 8-bit first moment
+        # for tensors above the quantization threshold. Rank-4 LoRA tensors sit
+        # near that threshold, so keep the low-rank estimate conservative.
+        if rank <= 4:
+            return 6.0
+        if rank <= 8:
+            return 3.0
+        return 2.0
+    if normalized in {'sinksgd', 'sinksgdadv'}:
+        # SinkSGD keeps one momentum buffer by default; spectral vectors are tiny
+        # next to LoRA factors and do not move the dashboard estimate.
+        return 4.0
+    if '4bit' in normalized:
+        return 5.0
+    if 'fp8' in normalized:
+        return 6.0
+    if normalized.startswith('optimi') or normalized.startswith('torchoptimi'):
+        return 10.0
+    if '8bit' in normalized:
+        return 6.0
+    if 'schedulefree' in normalized or normalized == 'automagic':
+        return 14.0
+    return 12.0
+
+
+def _chunk_reduction(seq_len: int, chunk_size: int) -> float:
+    if seq_len <= 0 or chunk_size <= 0 or chunk_size >= seq_len:
+        return 0.0
+    return 1.0 - (chunk_size / seq_len)
+
+
+def _ffn_chunk_activation_multiplier(
+    *,
+    video_seq_len: int,
+    audio_seq_len: int,
+    chunk_size: int,
+    target: str | None,
+    mode: str,
+    checkpointed: bool,
+) -> float:
+    """Estimate activation multiplier from FFN sequence chunking.
+
+    FFN chunking reduces the peak feed-forward intermediate activations. It
+    does not reduce model weights or optimizer state, so only the activation
+    component is scaled here.
+    """
+    target_value = str(target or "").strip().lower()
+    if target_value in {"", "none"}:
+        return 1.0
+
+    mode_value = str(mode or "video").strip().lower()
+    chunk = max(int(chunk_size or 0), 0)
+    if chunk <= 0:
+        return 1.0
+
+    if mode_value == "av":
+        video_weight = 0.8 if target_value in {"all", "video"} else 0.0
+        audio_weight = 0.2 if target_value in {"all", "audio"} else 0.0
+        weighted_reduction = (
+            video_weight * _chunk_reduction(video_seq_len, chunk)
+            + audio_weight * _chunk_reduction(audio_seq_len, chunk)
+        )
+    elif mode_value == "audio":
+        weighted_reduction = _chunk_reduction(audio_seq_len, chunk) if target_value in {"all", "audio"} else 0.0
+    else:
+        weighted_reduction = _chunk_reduction(video_seq_len, chunk) if target_value in {"all", "video"} else 0.0
+
+    if weighted_reduction <= 0:
+        return 1.0
+
+    # Without checkpointing, retained autograd tensors dominate, so FFN chunking
+    # mostly trims temporary peaks. With checkpointing/blockwise checkpointing,
+    # the FFN recompute peak is a larger share of the activation estimate.
+    ffn_peak_share = 0.30 if checkpointed else 0.12
+    savings = min(ffn_peak_share * weighted_reduction, 0.35)
+    return max(1.0 - savings, 0.65)
+
+
 def _estimate_training_step_time_sec(config: dict) -> float | None:
     """Estimate wall-clock seconds per optimizer step from the current config."""
     try:
         training = config.get('training', {})
-        dataset = _first_training_dataset(config)
+        dataset = _max_vram_training_dataset(config)
 
         mode = str(training.get('ltx2_mode', 'video')).lower()
         res_w = max(_coerce_int(dataset.get('resolution_w', 768), 768), 64)
         res_h = max(_coerce_int(dataset.get('resolution_h', 512), 512), 64)
-        frames = max(_coerce_int(dataset.get('target_frames', 33), 33), 1)
+        frames = _dataset_frame_count(dataset)
         batch_size = max(_coerce_int(dataset.get('batch_size', training.get('train_batch_size', 1)), 1), 1)
         grad_accum = max(_coerce_int(training.get('gradient_accumulation_steps', 1), 1), 1)
 
@@ -282,8 +526,14 @@ def _calculate_training_stats(config: dict, dataset_stats: DatasetStats | None) 
 
         # Total epochs
         max_steps = _coerce_int(training.get('max_train_steps', 0), 0)
+        max_epochs = _coerce_int(training.get('max_train_epochs', 0), 0)
         total_epochs = None
-        if max_steps and steps_per_epoch:
+        if max_steps and max_epochs and not steps_per_epoch:
+            steps_per_epoch = max(1, (max_steps + max_epochs - 1) // max_epochs)
+        if max_epochs and not max_steps and steps_per_epoch:
+            max_steps = steps_per_epoch * max_epochs
+            total_epochs = float(max_epochs)
+        elif max_steps and steps_per_epoch:
             total_epochs = max_steps / steps_per_epoch
 
         # Estimated time from the same shape/config heuristic used for iteration time.
@@ -338,6 +588,42 @@ def _calculate_training_stats(config: dict, dataset_stats: DatasetStats | None) 
         return None
 
 
+def _read_live_status_steps(run_dir: str | None) -> tuple[int | None, int | None]:
+    """Return live dashboard max steps/epochs if a run has written status.json."""
+    if not run_dir:
+        return None, None
+    try:
+        status_path = Path(run_dir) / "dashboard" / "status.json"
+        status = json.loads(status_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, TypeError):
+        return None, None
+
+    max_steps = _coerce_int(status.get("max_steps"), 0)
+    max_epochs = _coerce_int(status.get("max_epochs"), 0)
+    return (max_steps or None), (max_epochs or None)
+
+
+def _with_live_training_bounds(config_dict: dict[str, Any]) -> dict[str, Any]:
+    """Fill missing max_train_steps from live status so stats work for epoch-limited runs."""
+    training = config_dict.get("training")
+    if not isinstance(training, dict):
+        return config_dict
+    if _coerce_int(training.get("max_train_steps"), 0):
+        return config_dict
+
+    live_max_steps, live_max_epochs = _read_live_status_steps(training.get("output_dir"))
+    if not live_max_steps:
+        return config_dict
+
+    config_dict = dict(config_dict)
+    training = dict(training)
+    training["max_train_steps"] = live_max_steps
+    if live_max_epochs and not _coerce_int(training.get("max_train_epochs"), 0):
+        training["max_train_epochs"] = live_max_epochs
+    config_dict["training"] = training
+    return config_dict
+
+
 def _calculate_vram_stats(config: dict) -> VRAMStats | None:
     """Calculate VRAM usage estimates.
 
@@ -350,11 +636,12 @@ def _calculate_vram_stats(config: dict) -> VRAMStats | None:
     """
     try:
         training = config.get('training', {})
-        ds = _first_training_dataset(config)
+        ds = _max_vram_training_dataset(config)
 
         # ── DiT weights ──
         ltx_version = str(training.get('ltx_version', '2.3'))
-        dit_bf16 = 42.0 if ltx_version == '2.3' else 39.0
+        # Keep model weights in GiB to match the byte-derived components below.
+        dit_bf16 = 39.2 if ltx_version == '2.3' else 36.5
         is_fp8 = bool(training.get('fp8_base'))
         is_w8a8 = bool(training.get('fp8_w8a8'))
         is_nf4 = bool(training.get('nf4_base'))
@@ -372,35 +659,41 @@ def _calculate_vram_stats(config: dict) -> VRAMStats | None:
         lora_base_per_rank = (12.75 if is_av else 6.0) / 1024  # GB per rank
         preset_mult = {
             't2v': 1.0, 'v2v': 1.44, 'video_sa': 0.37, 'video_sa_ff': 0.56,
-            'video_sa_ca_ff': 0.74, 'audio': 0.37, 'audio_v2a': 0.52, 'audio_ref_only_ic': 0.63,
-            'av_ic': 1.44, 'video_ref_only_av': 1.44, 'full': 2.1,
+            'video_sa_ca_ff': 0.74, 'character_training': 0.20, 'audio': 0.37, 'audio_v2a': 0.52, 'audio_ref_ic': 0.63,
+            'audio_ref_only_ic': 0.63, 'av_ic': 1.44, 'video_ref_only_av': 1.44, 'full': 2.1,
         }.get(training.get('lora_target_preset'), 1.0)
+        dora_extra_ratio = (
+            _dora_extra_param_ratio(rank, training.get('lora_target_preset'))
+            if _training_uses_dora(training)
+            else 0.0
+        )
         lora_size_gb = rank * lora_base_per_rank * preset_mult
+        lora_size_gb *= 1.0 + dora_extra_ratio
 
         # ── Optimizer states ──
         lora_param_count = lora_size_gb * (1024 ** 3) / 2  # bf16 -> count
-        opt_type = str(training.get('optimizer_type', 'adamw8bit')).lower()
-        is_8bit = '8bit' in opt_type
-        is_sf = 'schedulefree' in opt_type or opt_type == 'automagic'
-        opt_bytes = 6 if is_8bit else (14 if is_sf else 12)
+        opt_bytes = _optimizer_bytes_per_param(training.get('optimizer_type'), rank)
         optimizer_size_gb = (lora_param_count * opt_bytes) / (1024 ** 3)
 
         # ── Activations ──
         res_w = max(_coerce_int(ds.get('resolution_w', 768), 768), 64)
         res_h = max(_coerce_int(ds.get('resolution_h', 512), 512), 64)
-        frames = max(_coerce_int(ds.get('target_frames', 33), 33), 1)
+        frames = _dataset_frame_count(ds)
         batch_size = max(_coerce_int(ds.get('batch_size', 1), 1), 1)
 
         # Correct VAE compression factors
         latent_f = max(1, (frames - 1) // 8 + 1)
         latent_h = max(1, res_h // 32)
         latent_w = max(1, res_w // 32)
-        seq_len = latent_f * latent_h * latent_w
+        video_seq_len = latent_f * latent_h * latent_w
+        audio_seq_len = frames
+        seq_len = audio_seq_len if mode == 'audio' else video_seq_len
 
         hidden_dim = 2048 if mode == 'audio' else 4096
         bytes_per_val = 1 if is_w8a8 else 2
         grad_ckpt = training.get('gradient_checkpointing', True)
         blockwise = bool(training.get('blockwise_checkpointing'))
+        checkpointed = bool(grad_ckpt or blockwise)
 
         activ_coeff = 10 if not grad_ckpt else (1 if blockwise else 2)
         effective_layers = total_blocks if not blockwise else 2
@@ -408,8 +701,14 @@ def _calculate_vram_stats(config: dict) -> VRAMStats | None:
         activations_gb = (per_layer_bytes * effective_layers) / (1024 ** 3)
         if is_av:
             activations_gb *= 1.25
-        if _coerce_int(training.get('ffn_chunk_size', 0), 0) > 0:
-            activations_gb *= 0.90
+        activations_gb *= _ffn_chunk_activation_multiplier(
+            video_seq_len=video_seq_len,
+            audio_seq_len=audio_seq_len,
+            chunk_size=_coerce_int(training.get('ffn_chunk_size', 0), 0),
+            target=training.get('ffn_chunk_target'),
+            mode=mode,
+            checkpointed=checkpointed,
+        )
         if training.get('split_attn_mode') or training.get('split_attn_target'):
             activations_gb *= 0.92
         if training.get('gradient_checkpointing_cpu_offload') and grad_ckpt:
@@ -464,21 +763,34 @@ def _calculate_vram_stats(config: dict) -> VRAMStats | None:
         if training.get('crepa'):
             crepa_gb = 0.08 if str(training.get('crepa_mode', 'backbone')) == 'dino' else 0.15
 
+        dora_runtime_gb = (
+            _dora_runtime_overhead_gb(
+                activations_gb=activations_gb,
+                rank=rank,
+                preset=training.get('lora_target_preset'),
+                checkpointed=checkpointed,
+            )
+            if dora_extra_ratio > 0.0
+            else 0.0
+        )
+
         peak_training_gb = (model_size_gb + lora_size_gb + optimizer_size_gb + grads_gb +
-                            activations_gb + grad_accum_gb + preservation_gb + self_flow_gb + crepa_gb)
+                            activations_gb + grad_accum_gb + preservation_gb + self_flow_gb +
+                            crepa_gb + dora_runtime_gb)
 
         # Sampling VRAM (VAE loaded, lighter activations)
         peak_sampling_gb = model_size_gb + 0.3 + (activations_gb * 0.3)
         if training.get('sample_with_offloading'):
             peak_sampling_gb *= 0.6
 
-        overhead_gb = grad_accum_gb + preservation_gb + self_flow_gb + crepa_gb
+        overhead_gb = grad_accum_gb + preservation_gb + self_flow_gb + crepa_gb + dora_runtime_gb
         breakdown = {
             'model': round(model_size_gb, 2),
             'lora': round(lora_size_gb, 2),
             'optimizer': round(optimizer_size_gb, 2),
             'gradients': round(grads_gb, 2),
             'activations': round(activations_gb, 2),
+            'dora': round(dora_runtime_gb, 2),
             'overhead': round(overhead_gb, 2),
         }
 
@@ -503,7 +815,7 @@ async def get_project_stats(request: Request):
     if not config:
         return ProjectStats(dataset=None, training=None, vram=None)
 
-    config_dict = config.model_dump()
+    config_dict = _with_live_training_bounds(config.model_dump())
 
     # Dataset stats
     dataset_stats = None
@@ -517,10 +829,7 @@ async def get_project_stats(request: Request):
         if dataset_dir:
             dataset_stats = _scan_dataset(dataset_dir)
 
-    # Training stats (only if we have dataset info)
-    training_stats = None
-    if dataset_stats:
-        training_stats = _calculate_training_stats(config_dict, dataset_stats)
+    training_stats = _calculate_training_stats(config_dict, dataset_stats)
 
     # VRAM stats (can calculate without dataset)
     vram_stats = _calculate_vram_stats(config_dict)

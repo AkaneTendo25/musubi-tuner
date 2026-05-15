@@ -204,6 +204,24 @@ Other options are mostly the same as `hv_train_network.py`. See [HunyuanVideo do
 
 The trained LoRA weights are seemed to be compatible with ComfyUI (may depend on the nodes used).
 
+#### TREAD and DoRA
+
+TREAD is available for Wan2.1 and Wan2.2 training with the same inline CLI style as LTX:
+
+```bash
+--tread selection_ratio=0.5 start_layer_idx=2 end_layer_idx=-2
+```
+
+Bare `--tread` uses those defaults. TREAD only routes Wan video tokens during training; text conditioning is untouched.
+
+To train **DoRA** instead of plain LoRA, keep `--network_module networks.lora_wan` and add:
+
+```bash
+--network_args "use_dora=true"
+```
+
+DoRA keeps the low-rank directional update of LoRA, but learns a separate magnitude vector for each output channel. That usually gives a more precise update than plain LoRA at the same rank.
+
 #### Recommended Min/Max Timestep Settings for Wan2.2
 
 | Model | Min Timestep | Max Timestep |

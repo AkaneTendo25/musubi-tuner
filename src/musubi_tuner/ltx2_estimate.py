@@ -57,9 +57,9 @@ TARGETABLE_FAMILY_PATTERNS: list[tuple[str, str]] = [
 ]
 
 PRESET_CANDIDATES_BY_MODE: dict[str, list[str]] = {
-    "video": ["video_sa", "video_sa_ff", "video_sa_ca_ff", "t2v", "v2v", "full"],
-    "av": ["t2v", "v2v", "av_ic", "video_ref_only_av", "audio", "audio_v2a", "audio_ref_only_ic", "full"],
-    "audio": ["audio", "audio_v2a", "audio_ref_only_ic", "t2v", "v2v", "full"],
+    "video": ["character_training", "video_sa", "video_sa_ff", "video_sa_ca_ff", "t2v", "v2v", "full"],
+    "av": ["t2v", "v2v", "av_ic", "video_ref_only_av", "audio", "audio_v2a", "audio_ref_ic", "full"],
+    "audio": ["audio", "audio_v2a", "audio_ref_ic", "t2v", "v2v", "full"],
 }
 
 
@@ -351,7 +351,10 @@ def _apply_estimation_network(
         for_inference=False,
     )
     network.apply_to(None, transformer, apply_text_encoder=False, apply_unet=True)
-    info = network.load_state_dict(weights_sd, False)
+    if hasattr(network, "load_weights_state_dict"):
+        info = network.load_weights_state_dict(weights_sd, False)
+    else:
+        info = network.load_state_dict(weights_sd, False)
     network.train()
     network.requires_grad_(False)
 

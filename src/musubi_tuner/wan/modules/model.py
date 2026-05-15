@@ -1,6 +1,6 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
 import math
-from typing import Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 import torch
 import torch.nn as nn
@@ -22,6 +22,7 @@ from musubi_tuner.wan.modules.attention import flash_attention
 from musubi_tuner.utils.device_utils import clean_memory_on_device
 from musubi_tuner.modules.custom_offloading_utils import ModelOffloader
 from musubi_tuner.modules.fp8_optimization_utils import apply_fp8_monkey_patch, optimize_state_dict_with_fp8
+from musubi_tuner.tread import MaskInfo, TREADRouter
 
 __all__ = ["WanModel"]
 
@@ -689,6 +690,8 @@ class WanModel(nn.Module):  # ModelMixin, ConfigMixin):
         # offloading
         self.blocks_to_swap = None
         self.offloader = None
+        self._tread_router: Optional[TREADRouter] = None
+        self._tread_routes: Optional[List[Dict[str, Any]]] = None
 
     @property
     def dtype(self):
@@ -788,7 +791,26 @@ class WanModel(nn.Module):  # ModelMixin, ConfigMixin):
             return
         self.offloader.prepare_block_devices_before_forward(self.blocks)
 
-    def forward(self, x, t, context, seq_len, clip_fea=None, y=None, skip_block_indices=None, f_indices=None):
+    def set_router(self, router: TREADRouter, routes: Optional[List[Dict[str, Any]]] = None) -> None:
+        """Attach a TREAD router and pre-normalized route definitions."""
+        self._tread_router = router
+        self._tread_routes = routes
+
+    @staticmethod
+    def _route_freqs(freqs_list: List[torch.Tensor], info: MaskInfo, keep_len: int) -> List[torch.Tensor]:
+        routed_freqs = []
+        for sample_idx, freqs in enumerate(freqs_list):
+            ids_keep = info.ids_keep[sample_idx].to(device=freqs.device)
+            routed_freqs.append(torch.index_select(freqs, 0, ids_keep)[:keep_len])
+        return routed_freqs
+
+    @staticmethod
+    def _routed_grid_sizes(grid_sizes: torch.Tensor, keep_len: int) -> torch.Tensor:
+        routed = torch.ones((grid_sizes.shape[0], 3), dtype=grid_sizes.dtype, device=grid_sizes.device)
+        routed[:, 0] = keep_len
+        return routed
+
+    def forward(self, x, t, context, seq_len, clip_fea=None, y=None, skip_block_indices=None, f_indices=None, force_keep_mask=None):
         r"""
         Forward pass through the diffusion model
 
@@ -809,6 +831,8 @@ class WanModel(nn.Module):  # ModelMixin, ConfigMixin):
                 Indices of blocks to skip during forward pass
             f_indices (List[List[int]], *optional*):
                 Indices of frames used for rotary embeddings, list of lists for each video in the batch
+            force_keep_mask (Tensor, *optional*):
+                Boolean mask used by TREAD to ensure specific video tokens are never dropped
 
         Returns:
             List[Tensor]:
@@ -881,8 +905,55 @@ class WanModel(nn.Module):  # ModelMixin, ConfigMixin):
             clip_fea = None
             context_clip = None
 
-        # arguments
-        kwargs = dict(e=e0, seq_lens=seq_lens, grid_sizes=grid_sizes, freqs=freqs_list, context=context, context_lens=context_lens)
+        tread_routes = self._tread_routes or []
+
+        # LoRA training leaves the frozen base model in eval mode when gradient
+        # checkpointing is off. TREAD should follow the gradient-enabled
+        # training forward, not the module's train/eval flag.
+        base_use_routing = torch.is_grad_enabled()
+        use_tread = base_use_routing and len(tread_routes) > 0
+        routes = tread_routes
+        router = self._tread_router
+        if use_tread and router is None:
+            raise ValueError("TREAD routing requested but no router has been configured. Call set_router before training.")
+        if use_tread and seq_lens.min().item() != seq_lens.max().item():
+            raise ValueError("Wan sparse routing currently requires uniform token lengths within a batch.")
+
+        if use_tread and force_keep_mask is not None:
+            if force_keep_mask.dim() == 1:
+                force_keep_mask = force_keep_mask.unsqueeze(0)
+            if force_keep_mask.dim() > 2:
+                force_keep_mask = force_keep_mask.view(force_keep_mask.shape[0], -1)
+            if force_keep_mask.shape[0] == 1 and x.shape[0] != 1:
+                force_keep_mask = force_keep_mask.expand(x.shape[0], force_keep_mask.shape[1])
+            if force_keep_mask.shape != (x.shape[0], x.shape[1]):
+                raise ValueError(
+                    f"force_keep_mask has shape {tuple(force_keep_mask.shape)}, expected {(x.shape[0], x.shape[1])}"
+                )
+            force_keep_mask = force_keep_mask.to(device=x.device, dtype=torch.bool)
+
+        if routes:
+            total_layers = len(self.blocks)
+
+            def _to_pos(idx: int) -> int:
+                return idx if idx >= 0 else total_layers + idx
+
+            routes = [
+                {
+                    **route,
+                    "start_layer_idx": _to_pos(route["start_layer_idx"]),
+                    "end_layer_idx": _to_pos(route["end_layer_idx"]),
+                }
+                for route in routes
+            ]
+
+        current_seq_lens = seq_lens
+        current_grid_sizes = grid_sizes
+        current_freqs = freqs_list
+        route_ptr = 0
+        routing_now = False
+        route_mask_info: Optional[MaskInfo] = None
+        saved_tokens: Optional[torch.Tensor] = None
 
         if self.blocks_to_swap:
             clean_memory_on_device(device)
@@ -890,16 +961,49 @@ class WanModel(nn.Module):  # ModelMixin, ConfigMixin):
         # print(f"x: {x.shape}, e: {e0.shape}, context: {context.shape}, seq_lens: {seq_lens}")
         input_device = x.device
         for block_idx, block in enumerate(self.blocks):
+            if use_tread and route_ptr < len(routes) and block_idx == routes[route_ptr]["start_layer_idx"]:
+                route = routes[route_ptr]
+                route_mask_info = router.get_mask(
+                    x,
+                    mask_ratio=float(route["selection_ratio"]),
+                    force_keep=force_keep_mask,
+                )
+                saved_tokens = x
+                x = router.start_route(x, route_mask_info)
+                keep_len = x.shape[1]
+                current_seq_lens = torch.full_like(seq_lens, keep_len)
+                current_grid_sizes = self._routed_grid_sizes(grid_sizes, keep_len)
+                current_freqs = self._route_freqs(freqs_list, route_mask_info, keep_len)
+                routing_now = True
+
             is_block_skipped = skip_block_indices is not None and block_idx in skip_block_indices
 
             if self.blocks_to_swap and not is_block_skipped:
                 self.offloader.wait_for_block(block_idx)
 
             if not is_block_skipped:
-                x = block(x, **kwargs)
+                x = block(
+                    x,
+                    e=e0,
+                    seq_lens=current_seq_lens,
+                    grid_sizes=current_grid_sizes,
+                    freqs=current_freqs,
+                    context=context,
+                    context_lens=context_lens,
+                )
 
             if self.blocks_to_swap:
                 self.offloader.submit_move_blocks_forward(self.blocks, block_idx)
+
+            if use_tread and routing_now and route_mask_info is not None and block_idx == routes[route_ptr]["end_layer_idx"]:
+                x = router.end_route(x, route_mask_info, original_x=saved_tokens)
+                current_seq_lens = seq_lens
+                current_grid_sizes = grid_sizes
+                current_freqs = freqs_list
+                routing_now = False
+                route_mask_info = None
+                saved_tokens = None
+                route_ptr += 1
 
         if x.device != input_device:
             x = x.to(input_device)

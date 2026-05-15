@@ -1,4 +1,4 @@
-"""CAME 8-bit optimizer.
+"""CAME optimizers.
 
 Implements:
   - "CAME: Confidence-guided Adaptive Memory Efficient Optimization"
@@ -22,6 +22,7 @@ Features:
 from __future__ import annotations
 
 import gc
+import sys
 from typing import Any
 
 import torch
@@ -91,9 +92,9 @@ class CAME8bit(torch.optim.Optimizer):
         quant_block_size: int = 2048,
     ) -> None:
         if lr is None or lr <= 0.0:
-            raise ValueError("CAME8bit requires lr > 0")
+            raise ValueError(f"{self.__class__.__name__} requires lr > 0")
         if not all(0.0 <= beta <= 1.0 for beta in betas):
-            raise ValueError("CAME8bit betas must be in [0, 1]")
+            raise ValueError(f"{self.__class__.__name__} betas must be in [0, 1]")
 
         defaults = {
             "lr": lr,
@@ -180,18 +181,31 @@ class CAME8bit(torch.optim.Optimizer):
         if grad.dtype in {torch.float16, torch.bfloat16}:
             grad = grad.float()
         if grad.is_sparse:
-            raise RuntimeError("CAME8bit does not support sparse gradients.")
+            raise RuntimeError(f"{self.__class__.__name__} does not support sparse gradients.")
 
         grad_shape = grad.shape
-        use_factor = CAME8bit._should_use_matrix_factorization(grad_shape)
-        should_quantize = CAME8bit._should_quantize_param(grad_shape, group["min_8bit_size"])
+        use_factor = self._should_use_matrix_factorization(grad_shape)
+        should_quantize = self._should_quantize_param(grad_shape, group["min_8bit_size"])
         state = self.state[p]
+        required_keys = {"step", "RMS", "exp_avg"}
+        if use_factor:
+            required_keys.update(
+                {"exp_avg_sq_row", "exp_avg_sq_col", "exp_avg_res_row", "exp_avg_res_col"}
+            )
+        else:
+            required_keys.add("exp_avg_sq")
+
+        # If the optimizer state came from a different optimizer family, or from an
+        # older/incomplete checkpoint, clear it and reinitialize the per-parameter
+        # buffers this optimizer expects.
+        if not required_keys.issubset(state):
+            state.clear()
 
         if len(state) == 0:
             state["step"] = 0
             state["RMS"] = 0
             state["exp_avg"] = (
-                CAME8bit._quantize_param(torch.zeros_like(grad), group["quant_block_size"])
+                self._quantize_param(torch.zeros_like(grad), group["quant_block_size"])
                 if should_quantize
                 else torch.zeros_like(grad)
             )
@@ -202,7 +216,7 @@ class CAME8bit(torch.optim.Optimizer):
                 state["exp_avg_res_col"] = torch.zeros(grad_shape[1]).type_as(grad)
             else:
                 state["exp_avg_sq"] = (
-                    CAME8bit._quantize_param(torch.zeros_like(grad), group["quant_block_size"])
+                    self._quantize_param(torch.zeros_like(grad), group["quant_block_size"])
                     if should_quantize
                     else torch.zeros_like(grad)
                 )
@@ -226,14 +240,14 @@ class CAME8bit(torch.optim.Optimizer):
                 update = update.view(grad_shape)
         else:
             exp_avg_sq = (
-                CAME8bit._dequantize_param(state["exp_avg_sq"])
+                self._dequantize_param(state["exp_avg_sq"])
                 if should_quantize
                 else state["exp_avg_sq"]
             )
             exp_avg_sq.mul_(group["betas"][1]).add_(update, alpha=1.0 - group["betas"][1])
             update = exp_avg_sq.rsqrt()
             state["exp_avg_sq"] = (
-                CAME8bit._quantize_param(exp_avg_sq, group["quant_block_size"])
+                self._quantize_param(exp_avg_sq, group["quant_block_size"])
                 if should_quantize
                 else exp_avg_sq
             )
@@ -242,13 +256,13 @@ class CAME8bit(torch.optim.Optimizer):
         update.div_((self._rms(update) / group["clip_threshold"]).clamp_(min=1.0))
 
         exp_avg = (
-            CAME8bit._dequantize_param(state["exp_avg"])
+            self._dequantize_param(state["exp_avg"])
             if should_quantize
             else state["exp_avg"]
         )
         exp_avg.mul_(group["betas"][0]).add_(update, alpha=1 - group["betas"][0])
         state["exp_avg"] = (
-            CAME8bit._quantize_param(exp_avg, group["quant_block_size"])
+            self._quantize_param(exp_avg, group["quant_block_size"])
             if should_quantize
             else exp_avg
         )
@@ -326,3 +340,38 @@ class CAME8bit(torch.optim.Optimizer):
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+
+
+class CAME(CAME8bit):
+    """Plain CAME optimizer with fp32 optimizer states.
+
+    This shares CAME8bit's per-parameter step path and BF16 stochastic
+    rounding, but never stores optimizer states in 8-bit quantized chunks.
+    """
+
+    def __init__(
+        self,
+        params,
+        lr: float | None = None,
+        eps: tuple[float, float] = (1e-30, 1e-16),
+        clip_threshold: float = 1.0,
+        betas: tuple[float, float, float] = (0.9, 0.999, 0.9999),
+        weight_decay: float = 0.0,
+        stochastic_rounding: bool = False,
+        use_cautious: bool = False,
+    ) -> None:
+        super().__init__(
+            params,
+            lr=lr,
+            eps=eps,
+            clip_threshold=clip_threshold,
+            betas=betas,
+            weight_decay=weight_decay,
+            stochastic_rounding=stochastic_rounding,
+            use_cautious=use_cautious,
+            min_8bit_size=sys.maxsize,
+        )
+
+    @staticmethod
+    def _should_quantize_param(grad_shape: torch.Size, min_8bit_size: int) -> bool:
+        return False

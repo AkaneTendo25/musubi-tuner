@@ -152,7 +152,10 @@ def get_pixel_coords(
     # Broadcast the VAE scale factors so they align with the `(batch, axis, patch, bound)` layout.
     broadcast_shape = [1] * latent_coords.ndim
     broadcast_shape[1] = -1  # axis dimension corresponds to (frame/time, height, width)
-    scale_tensor = torch.tensor(scale_factors, device=latent_coords.device).view(*broadcast_shape)
+    scale_tensor = torch.tensor(
+        [scale_factors.time, scale_factors.height, scale_factors.width],
+        device=latent_coords.device,
+    ).view(*broadcast_shape)
 
     # Apply per-axis scaling to convert latent bounds into pixel-space coordinates.
     pixel_coords = latent_coords * scale_tensor
@@ -160,7 +163,7 @@ def get_pixel_coords(
     if causal_fix:
         # VAE temporal stride for the very first frame is 1 instead of `scale_factors[0]`.
         # Shift and clamp to keep the first-frame timestamps causal and non-negative.
-        pixel_coords[:, 0, ...] = (pixel_coords[:, 0, ...] + 1 - scale_factors[0]).clamp(min=0)
+        pixel_coords[:, 0, ...] = (pixel_coords[:, 0, ...] + 1 - scale_factors.time).clamp(min=0)
 
     return pixel_coords
 

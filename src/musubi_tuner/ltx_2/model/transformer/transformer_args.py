@@ -33,6 +33,8 @@ class TransformerArgs:
     a2v_cross_attention_mask: torch.Tensor | None = None
     v2a_cross_attention_mask: torch.Tensor | None = None
     dcr_detach_mask: torch.Tensor | None = None
+    force_keep_mask: torch.Tensor | None = None
+    positions: torch.Tensor | None = None
 
 
 class TransformerArgsPreprocessor:
@@ -290,6 +292,8 @@ class TransformerArgsPreprocessor:
             a2v_cross_attention_mask=modality.a2v_cross_attention_mask,
             v2a_cross_attention_mask=modality.v2a_cross_attention_mask,
             dcr_detach_mask=modality.dcr_detach_mask,
+            force_keep_mask=modality.force_keep_mask,
+            positions=modality.positions,
         )
 
 

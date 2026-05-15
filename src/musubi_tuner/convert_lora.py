@@ -47,6 +47,11 @@ def convert_from_diffusers(prefix, weights_sd):
     # default LoRA format: {"prefix_module_name.lora_down.weight": weight, "prefix_module_name.lora_up.weight": weight, ...}
 
     # note: Diffusers has no alpha, so alpha is set to rank
+    def restore_special_suffixes(key: str) -> str:
+        if "_lora_magnitude_vector_" in key:
+            return key.replace("_lora_magnitude_vector_", ".lora_magnitude_vector.")
+        return key
+
     new_weights_sd = {}
     lora_dims = {}
     for key, weight in weights_sd.items():
@@ -63,6 +68,9 @@ def convert_from_diffusers(prefix, weights_sd):
             new_key = new_key.replace("_lora_down_", ".lora_down.").replace("_lora_up_", ".lora_up.")
         else:  # LoHa or LoKr
             new_key = new_key.replace("_hada_", ".hada_").replace("_lokr_", ".lokr_")
+            new_key = new_key.replace("_lora_magnitude_vector_", ".lora_magnitude_vector.")
+
+        new_key = restore_special_suffixes(new_key)
 
         if new_key.endswith("_alpha"):
             new_key = new_key.replace("_alpha", ".alpha")
@@ -154,6 +162,9 @@ def convert_to_diffusers(prefix, diffusers_prefix, weights_sd):
                     estimated_type = "LoHa"
                 elif "lokr" in key:
                     estimated_type = "LoKr"
+            elif "lora_magnitude_vector" in key:
+                new_key = f"{diffusers_prefix}.{module_name}.{weight_name}"
+                estimated_type = "DoKr" if estimated_type == "LoKr" else "DoRA"
             else:
                 logger.warning(f"unexpected key: {key} in default LoRA format")
                 continue

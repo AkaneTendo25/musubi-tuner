@@ -101,7 +101,7 @@ explicit = true
 [tool.ruff]
 line-length = 132
 indent-width = 4
-target-version = "py39"
+target-version = "py310"
 
 lint.ignore = [
   "E402",  # module-import-not-at-top-of-file
