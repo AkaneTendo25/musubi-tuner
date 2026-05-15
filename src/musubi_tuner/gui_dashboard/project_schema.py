@@ -288,6 +288,9 @@ class TrainingConfig(BaseModel):
     split_attn_chunk_size: Optional[int] = None
     blockwise_checkpointing: bool = False
     blocks_to_checkpoint: Optional[int] = None
+    ltx2_model_parallel: bool = False
+    ltx2_model_parallel_devices: str = ""
+    ltx2_model_parallel_splits: str = ""
     mixed_precision: str = "no"
     full_fp16: bool = False
     full_bf16: bool = False

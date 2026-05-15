@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shlex
 from pathlib import Path
 from typing import Any
 
@@ -10,6 +11,46 @@ from musubi_tuner.gui_dashboard.project_schema import DatasetEntry, ProjectConfi
 
 def _has_text(value: str | None) -> bool:
     return bool(value and value.strip())
+
+
+def _split_cli_args(raw: str | None) -> list[str]:
+    if not raw:
+        return []
+    try:
+        return shlex.split(raw, posix=False)
+    except ValueError:
+        return []
+
+
+def _accelerate_num_processes(raw: str | None) -> int | None:
+    args = _split_cli_args(raw)
+    for index, arg in enumerate(args):
+        if arg == "--num_processes" and index + 1 < len(args):
+            try:
+                return int(args[index + 1])
+            except ValueError:
+                return None
+        if arg.startswith("--num_processes="):
+            try:
+                return int(arg.split("=", 1)[1])
+            except ValueError:
+                return None
+    return None
+
+
+def _parse_csv_ints(raw: str | None) -> list[int] | None:
+    if not _has_text(raw):
+        return []
+    values: list[int] = []
+    for part in str(raw).split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            values.append(int(part))
+        except ValueError:
+            return None
+    return values
 
 
 def _make_issue(severity: str, field: str | None, message: str, *, label: str | None = None, page: str | None = None) -> dict[str, Any]:
@@ -259,6 +300,157 @@ def validate_training_config(config: ProjectConfig) -> dict[str, Any]:
         message = "LoftQ Init requires NF4 Base."
         errors.append(_make_issue("error", "training.loftq_init", message, label="LoftQ Init", page="training"))
         errors.append(_make_issue("error", "training.nf4_base", message, label="NF4 Base", page="training"))
+
+    if t.ltx2_model_parallel:
+        if t.blocks_to_swap not in (None, 0):
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.blocks_to_swap",
+                    "LTX2 Model Parallel is incompatible with block swapping.",
+                    label="Blocks To Swap",
+                    page="training",
+                )
+            )
+        if t.blockwise_checkpointing:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.blockwise_checkpointing",
+                    "LTX2 Model Parallel is not compatible with blockwise checkpointing yet.",
+                    label="Blockwise Checkpointing",
+                    page="training",
+                )
+            )
+        if t.compile:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.compile",
+                    "LTX2 Model Parallel is not compatible with torch.compile yet.",
+                    label="Compile",
+                    page="training",
+                )
+            )
+
+        accelerate_args = _split_cli_args(t.accelerate_extra_args)
+        if "--multi_gpu" in accelerate_args:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.accelerate_extra_args",
+                    "LTX2 Model Parallel is single-process; remove --multi_gpu from Accelerate Extra Args.",
+                    label="Accelerate Extra Args",
+                    page="training",
+                )
+            )
+        num_processes = _accelerate_num_processes(t.accelerate_extra_args)
+        if num_processes is not None and num_processes != 1:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.accelerate_extra_args",
+                    "LTX2 Model Parallel requires Accelerate --num_processes 1.",
+                    label="Accelerate Extra Args",
+                    page="training",
+                )
+            )
+        elif num_processes is None:
+            warnings.append(
+                _make_issue(
+                    "warning",
+                    "training.accelerate_extra_args",
+                    "LTX2 Model Parallel should be launched with --num_processes 1.",
+                    label="Accelerate Extra Args",
+                    page="training",
+                )
+            )
+
+        device_ids = _parse_csv_ints(t.ltx2_model_parallel_devices)
+        if device_ids is None:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.ltx2_model_parallel_devices",
+                    "Model Parallel Devices must be a comma-separated integer list.",
+                    label="Model Parallel Devices",
+                    page="training",
+                )
+            )
+        elif device_ids:
+            if len(device_ids) < 2:
+                errors.append(
+                    _make_issue(
+                        "error",
+                        "training.ltx2_model_parallel_devices",
+                        "LTX2 Model Parallel requires at least two CUDA devices.",
+                        label="Model Parallel Devices",
+                        page="training",
+                    )
+                )
+            if len(set(device_ids)) != len(device_ids):
+                errors.append(
+                    _make_issue(
+                        "error",
+                        "training.ltx2_model_parallel_devices",
+                        "Model Parallel Devices must be unique.",
+                        label="Model Parallel Devices",
+                        page="training",
+                    )
+                )
+            if device_ids[0] != 0:
+                warnings.append(
+                    _make_issue(
+                        "warning",
+                        "training.ltx2_model_parallel_devices",
+                        "The first model-parallel device should usually be 0 after CUDA_VISIBLE_DEVICES remapping.",
+                        label="Model Parallel Devices",
+                        page="training",
+                    )
+                )
+
+        split_points = _parse_csv_ints(t.ltx2_model_parallel_splits)
+        if split_points is None:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.ltx2_model_parallel_splits",
+                    "Model Parallel Splits must be a comma-separated integer list.",
+                    label="Model Parallel Splits",
+                    page="training",
+                )
+            )
+        elif split_points:
+            if split_points != sorted(split_points) or len(set(split_points)) != len(split_points):
+                errors.append(
+                    _make_issue(
+                        "error",
+                        "training.ltx2_model_parallel_splits",
+                        "Model Parallel Splits must be strictly increasing.",
+                        label="Model Parallel Splits",
+                        page="training",
+                    )
+                )
+            if split_points[0] <= 0 or split_points[-1] >= 48:
+                errors.append(
+                    _make_issue(
+                        "error",
+                        "training.ltx2_model_parallel_splits",
+                        "Model Parallel Splits must be inside the LTX2 transformer block range 1..47.",
+                        label="Model Parallel Splits",
+                        page="training",
+                    )
+                )
+            if device_ids and len(split_points) != len(device_ids) - 1:
+                errors.append(
+                    _make_issue(
+                        "error",
+                        "training.ltx2_model_parallel_splits",
+                        "Model Parallel Splits must contain one fewer value than Model Parallel Devices.",
+                        label="Model Parallel Splits",
+                        page="training",
+                    )
+                )
 
     if t.awq_calibration and not t.nf4_base:
         message = "AWQ Calibration requires NF4 Base."

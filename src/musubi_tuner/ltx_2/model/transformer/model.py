@@ -100,6 +100,7 @@ def _move_transformer_args(
         self_attention_mask=_move_tensor(args.self_attention_mask),
         a2v_cross_attention_mask=_move_tensor(args.a2v_cross_attention_mask),
         v2a_cross_attention_mask=_move_tensor(args.v2a_cross_attention_mask),
+        dcr_detach_mask=_move_tensor(args.dcr_detach_mask),
     )
 
 
@@ -547,6 +548,10 @@ class LTXModel(torch.nn.Module):
                 return f"alloc={a:.2f}GB res={r:.2f}GB max={m:.2f}GB"
             return ""
 
+        if bool(getattr(self, "_ltx2_model_parallel_enabled", False)):
+            print(f"[MODEL_PARALLEL] keeping explicit LTX-2 model-parallel placement | {_vram_summary()}")
+            return
+
         swap_mode = getattr(self, "swap_mode", "default")
         if self.blocks_to_swap and swap_mode in {"aggressive", "aggressive_no_offload"}:
             target_device = torch.device(device)
@@ -673,9 +678,15 @@ class LTXModel(torch.nn.Module):
             transfer_stream = self._transfer_stream
 
         # Process transformer blocks
+        model_parallel_block_devices = getattr(self, "_ltx2_model_parallel_block_devices", None)
         for block_idx, block in enumerate(self.transformer_blocks):
             swap_start = max(0, len(self.transformer_blocks) - int(self.blocks_to_swap or 0))
             in_swap_range = bool(self.blocks_to_swap) and block_idx >= swap_start
+            if model_parallel_block_devices is not None:
+                block_device = model_parallel_block_devices[block_idx]
+                video = _move_transformer_args(video, block_device)
+                audio = _move_transformer_args(audio, block_device)
+
             if force_pytorch_attn and in_swap_range and not getattr(block, "_forced_pytorch_attn", False):
                 from musubi_tuner.ltx_2.model.transformer.attention import Attention, AttentionFunction
 
@@ -908,7 +919,10 @@ class LTXModel(torch.nn.Module):
                 audio_out = _move_transformer_args(audio_out, target_device)
 
         # Ensure outputs are on the same device as output projections (optional)
-        if os.getenv("LTX2_ALIGN_OUTPUT_DEVICE", "0") == "1":
+        align_output_device = os.getenv("LTX2_ALIGN_OUTPUT_DEVICE", "0") == "1" or bool(
+            getattr(self, "_ltx2_model_parallel_enabled", False)
+        )
+        if align_output_device:
             if video_out is not None and isinstance(video_out.x, torch.Tensor):
                 proj_device = self.proj_out.weight.device
                 if video_out.x.device != proj_device:

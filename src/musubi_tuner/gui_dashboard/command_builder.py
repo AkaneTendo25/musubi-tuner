@@ -807,6 +807,12 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
         cmd += ["--log_timestep_distribution_interval", str(t.log_timestep_distribution_interval)]
 
     # Memory
+    if t.ltx2_model_parallel:
+        cmd.append("--ltx2_model_parallel")
+        if t.ltx2_model_parallel_devices:
+            cmd += ["--ltx2_model_parallel_devices", t.ltx2_model_parallel_devices]
+        if t.ltx2_model_parallel_splits:
+            cmd += ["--ltx2_model_parallel_splits", t.ltx2_model_parallel_splits]
     if t.blocks_to_swap is not None:
         cmd += ["--blocks_to_swap", str(t.blocks_to_swap)]
     if t.gradient_checkpointing:

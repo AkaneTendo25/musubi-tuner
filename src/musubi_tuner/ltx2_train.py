@@ -41,6 +41,13 @@ from musubi_tuner.modules.scheduling_flow_match_discrete import FlowMatchDiscret
 from musubi_tuner.utils import huggingface_utils, model_utils, sai_model_spec, train_utils
 from musubi_tuner.utils.safetensors_utils import MemoryEfficientSafeOpen, mem_eff_save_file
 from musubi_tuner.ltx2_train_network import LTX2NetworkTrainer, ltx2_setup_parser
+from musubi_tuner.ltx2_model_parallel import (
+    add_ltx2_model_parallel_args,
+    clip_grad_norm_model_parallel,
+    enable_ltx2_model_parallel,
+    is_ltx2_model_parallel_enabled,
+    validate_ltx2_model_parallel_setup,
+)
 from musubi_tuner.ltx2_motion_preservation import (
     AttentionMapRecorder as _AttentionMapRecorder,
     build_motion_anchor_cache as _build_motion_anchor_cache,
@@ -1528,6 +1535,8 @@ def _fused_step_pending_grads(
     optimizer: Any,
     accelerator: Accelerator,
     max_grad_norm: float,
+    *,
+    ltx2_model_parallel: bool = False,
 ) -> int:
     """Run one fused-style parameter step for any pending grads.
 
@@ -1545,13 +1554,51 @@ def _fused_step_pending_grads(
         return 0
 
     if accelerator.sync_gradients and max_grad_norm != 0.0:
-        accelerator.clip_grad_norm_([p for p, _ in params_to_step], max_grad_norm)
+        _clip_grad_norm_ltx2(
+            [p for p, _ in params_to_step],
+            accelerator,
+            max_grad_norm,
+            ltx2_model_parallel=ltx2_model_parallel,
+            optimizer=optimizer,
+        )
 
     for parameter, param_group in params_to_step:
         optimizer.step_param(parameter, param_group)
         parameter.grad = None
 
     return len(params_to_step)
+
+
+def _unscale_gradients_if_needed(accelerator: Accelerator, optimizer: Any | None = None) -> None:
+    unscale_gradients = getattr(accelerator, "unscale_gradients", None)
+    if not callable(unscale_gradients):
+        return
+    try:
+        unscale_gradients(optimizer)
+    except TypeError:
+        unscale_gradients()
+
+
+def _clip_grad_norm_ltx2(
+    parameters,
+    accelerator: Accelerator,
+    max_grad_norm: float,
+    *,
+    ltx2_model_parallel: bool,
+    optimizer: Any | None = None,
+) -> torch.Tensor | None:
+    if max_grad_norm == 0.0:
+        return None
+
+    parameter_list = list(parameters)
+    if not parameter_list:
+        return None
+
+    if ltx2_model_parallel:
+        _unscale_gradients_if_needed(accelerator, optimizer)
+        return clip_grad_norm_model_parallel(parameter_list, max_grad_norm)
+
+    return accelerator.clip_grad_norm_(parameter_list, max_grad_norm)
 
 
 def _attach_fused_step_param(optimizer: Any, base_optimizer: Any) -> bool:
@@ -1953,6 +2000,12 @@ def ltx2_finetune_setup_parser(parser: argparse.ArgumentParser) -> argparse.Argu
             "even with this option enabled)"
         ),
     )
+    parser.add_argument(
+        "--no_final_save",
+        action="store_true",
+        help="Skip the final checkpoint save. Intended for smoke/stability runs; periodic step/epoch saves still work.",
+    )
+    add_ltx2_model_parallel_args(parser)
     # EMA arguments
     parser.add_argument(
         "--use_ema",
@@ -2868,6 +2921,9 @@ def main() -> None:
     accelerator = prepare_accelerator(args)
     if args.mixed_precision is None:
         args.mixed_precision = accelerator.mixed_precision
+    ltx2_model_parallel = is_ltx2_model_parallel_enabled(args)
+    if ltx2_model_parallel:
+        validate_ltx2_model_parallel_setup(args, accelerator)
 
     # sample prompts (optional)
     sample_parameters = None
@@ -3062,7 +3118,7 @@ def main() -> None:
     # model
     blocks_to_swap = int(getattr(args, "blocks_to_swap", 0) or 0)
     trainer.blocks_to_swap = blocks_to_swap
-    loading_device = "cpu" if blocks_to_swap > 0 else accelerator.device
+    loading_device = "cpu" if blocks_to_swap > 0 or ltx2_model_parallel else accelerator.device
 
     if args.sdpa:
         attn_mode = "torch"
@@ -3087,6 +3143,10 @@ def main() -> None:
 
     transformer.train()
     transformer.requires_grad_(True)
+
+    ltx2_model_parallel_plan = None
+    if ltx2_model_parallel:
+        ltx2_model_parallel_plan = enable_ltx2_model_parallel(transformer, args)
 
     # Clean up memory after model loading
     clean_memory_on_device(accelerator.device)
@@ -3402,7 +3462,11 @@ def main() -> None:
     lr_scheduler = trainer.get_lr_scheduler(args, optimizer, accelerator.num_processes)
 
     # prepare accelerator
-    if blocks_to_swap > 0:
+    if ltx2_model_parallel:
+        transformer = accelerator.prepare(transformer, device_placement=[False])
+        if text_encoder is not None:
+            text_encoder = accelerator.prepare(text_encoder)
+    elif blocks_to_swap > 0:
         transformer = accelerator.prepare(transformer, device_placement=[not blocks_to_swap > 0])
         accelerator.unwrap_model(transformer).move_to_device_except_swap_blocks(accelerator.device)
         accelerator.unwrap_model(transformer).prepare_block_swap_before_forward()
@@ -3628,6 +3692,7 @@ def main() -> None:
         "ss_session_id": session_id,
         "ss_training_started_at": training_started_at,
         "ss_output_name": args.output_name,
+        "ss_no_final_save": bool(getattr(args, "no_final_save", False)),
         "ss_learning_rate": args.learning_rate,
         "ss_num_train_items": num_train_items,
         "ss_num_batches_per_epoch": len(train_dataloader),
@@ -3663,6 +3728,17 @@ def main() -> None:
         "ss_shifted_logit_uniform_prob": getattr(args, "shifted_logit_uniform_prob", 0.1),
         "ss_shifted_logit_shift": getattr(args, "shifted_logit_shift", None),
         "ss_ltx_mode": args.ltx_mode,
+        "ss_ltx2_model_parallel": bool(ltx2_model_parallel),
+        "ss_ltx2_model_parallel_devices": (
+            ",".join(str(device_id) for device_id in ltx2_model_parallel_plan.device_ids)
+            if ltx2_model_parallel_plan is not None
+            else None
+        ),
+        "ss_ltx2_model_parallel_splits": (
+            ",".join(str(split) for split in ltx2_model_parallel_plan.split_points)
+            if ltx2_model_parallel_plan is not None
+            else None
+        ),
         "ss_split_av_passes": bool(getattr(args, "split_av_passes", False)),
         "ss_video_loss_weight": getattr(args, "video_loss_weight", 1.0),
         "ss_audio_loss_weight": getattr(args, "audio_loss_weight", 1.0),
@@ -5357,7 +5433,13 @@ def main() -> None:
                 did_optimizer_step = False
                 if not args.fused_backward_pass:
                     if accelerator.sync_gradients and args.max_grad_norm != 0.0:
-                        accelerator.clip_grad_norm_(transformer.parameters(), args.max_grad_norm)
+                        _clip_grad_norm_ltx2(
+                            transformer.parameters(),
+                            accelerator,
+                            args.max_grad_norm,
+                            ltx2_model_parallel=ltx2_model_parallel,
+                            optimizer=optimizer,
+                        )
                     optimizer.step()
                     did_optimizer_step = bool(accelerator.sync_gradients)
                     lr_scheduler.step()
@@ -5374,7 +5456,12 @@ def main() -> None:
                             optimizer.step()
                             did_fused_step = True
                         else:
-                            pending_steps = _fused_step_pending_grads(optimizer, accelerator, args.max_grad_norm)
+                            pending_steps = _fused_step_pending_grads(
+                                optimizer,
+                                accelerator,
+                                args.max_grad_norm,
+                                ltx2_model_parallel=ltx2_model_parallel,
+                            )
                             did_fused_step = hook_stepped or pending_steps > 0
                         optimizer.zero_grad(set_to_none=True)
                     if did_fused_step:
@@ -5594,25 +5681,28 @@ def main() -> None:
         save_ema_state()
         save_self_flow_state()
 
-    # Save final model
-    final_ckpt_name = f"{args.output_name}.safetensors"
-    if args.save_ema_only and ema_model is not None:
-        # Only save EMA weights as final model
-        save_ema_model(final_ckpt_name, global_step, num_train_epochs)
+    if args.no_final_save:
+        accelerator.print("Skipping final checkpoint save because --no_final_save is set.")
     else:
-        # Save training weights
-        save_model(
-            final_ckpt_name,
-            accelerator.unwrap_model(transformer),
-            global_step,
-            num_train_epochs,
-            force_sync_upload=True,
-            use_memory_efficient_saving=args.mem_eff_save,
-        )
-        # Also save EMA if enabled
-        if ema_model is not None:
+        # Save final model
+        final_ckpt_name = f"{args.output_name}.safetensors"
+        if args.save_ema_only and ema_model is not None:
+            # Only save EMA weights as final model
             save_ema_model(final_ckpt_name, global_step, num_train_epochs)
-    save_self_flow_state()
+        else:
+            # Save training weights
+            save_model(
+                final_ckpt_name,
+                accelerator.unwrap_model(transformer),
+                global_step,
+                num_train_epochs,
+                force_sync_upload=True,
+                use_memory_efficient_saving=args.mem_eff_save,
+            )
+            # Also save EMA if enabled
+            if ema_model is not None:
+                save_ema_model(final_ckpt_name, global_step, num_train_epochs)
+        save_self_flow_state()
     if text_encoder is not None:
         trainer._cleanup_text_encoder(accelerator)
 

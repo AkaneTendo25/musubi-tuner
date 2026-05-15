@@ -672,7 +672,7 @@
 				<FormGroup title="Memory">
 					<div class="space-y-2 pt-2">
 						<div class="grid grid-cols-2 gap-2">
-							<FormField type="number" fieldPath="training.blocks_to_swap" value={t.blocks_to_swap ?? ''} oninput={(e) => update('blocks_to_swap', e.target.value ? Number(e.target.value) : null)} placeholder="0-40" min={0} max={40} tooltip="CPU offload blocks" />
+							<FormField type="number" fieldPath="training.blocks_to_swap" value={t.blocks_to_swap ?? ''} oninput={(e) => update('blocks_to_swap', e.target.value ? Number(e.target.value) : null)} placeholder="0-40" min={0} max={40} disabled={t.ltx2_model_parallel} tooltip="CPU offload blocks" />
 							<FormField type="number" fieldPath="training.max_data_loader_n_workers" value={t.max_data_loader_n_workers ?? ''} oninput={(e) => update('max_data_loader_n_workers', e.target.value === '' ? null : Number(e.target.value))} placeholder="CLI default" min={0} tooltip="Dataloader workers" />
 						</div>
 						<div class="grid grid-cols-3 gap-x-4 gap-y-1">
@@ -707,6 +707,17 @@
 							{/if}
 						</div>
 						{#if $advancedMode}
+							<div class="pt-3 space-y-2" style="border-top: 1px solid var(--border-subtle);">
+								<div class="grid grid-cols-3 gap-x-4 gap-y-1">
+									<FormToggle fieldPath="training.ltx2_model_parallel" checked={t.ltx2_model_parallel ?? false} onchange={(e) => update('ltx2_model_parallel', e.target.checked)} tooltip="Split one LTX-2 transformer across multiple visible CUDA devices. Requires Accelerate --num_processes 1." />
+								</div>
+								{#if t.ltx2_model_parallel}
+									<div class="grid grid-cols-2 gap-2">
+										<FormField fieldPath="training.ltx2_model_parallel_devices" value={t.ltx2_model_parallel_devices || ''} oninput={(e) => update('ltx2_model_parallel_devices', e.target.value)} placeholder="0,1,2" tooltip="Visible CUDA device ids. The first device must match the Accelerate process device, usually 0." />
+										<FormField fieldPath="training.ltx2_model_parallel_splits" value={t.ltx2_model_parallel_splits || ''} oninput={(e) => update('ltx2_model_parallel_splits', e.target.value)} placeholder="16,32" tooltip="Transformer block boundaries. Leave blank for an even split." />
+									</div>
+								{/if}
+							</div>
 							<div class="grid grid-cols-2 gap-2">
 								<FormSelect fieldPath="training.split_attn_target" value={t.split_attn_target || ''} options={[{value:'',label:'None'},{value:'all',label:'All'},{value:'self',label:'Self'},{value:'cross',label:'Cross'}]} onchange={(e) => update('split_attn_target', e.target.value || null)} tooltip="Split attention target" />
 								<FormSelect fieldPath="training.split_attn_mode" value={t.split_attn_mode || ''} options={[{value:'',label:'None'},{value:'batch',label:'Batch'},{value:'query',label:'Query'}]} onchange={(e) => update('split_attn_mode', e.target.value || null)} disabled={!t.split_attn_target} tooltip="Split mode" />
@@ -718,7 +729,7 @@
 							<div class="grid grid-cols-3 gap-x-4 gap-y-1">
 								<FormToggle fieldPath="training.gradient_checkpointing_cpu_offload" checked={t.gradient_checkpointing_cpu_offload ?? false} onchange={(e) => update('gradient_checkpointing_cpu_offload', e.target.checked)} tooltip="Offload checkpointed activations to CPU" />
 								<FormToggle fieldPath="training.split_attn" checked={t.split_attn ?? false} onchange={(e) => update('split_attn', e.target.checked)} tooltip="Legacy --split_attn flag. LTX-2-specific split controls are above." />
-								<FormToggle fieldPath="training.blockwise_checkpointing" checked={t.blockwise_checkpointing ?? false} onchange={(e) => update('blockwise_checkpointing', e.target.checked)} tooltip="Per-block checkpointing" />
+								<FormToggle fieldPath="training.blockwise_checkpointing" checked={t.blockwise_checkpointing ?? false} onchange={(e) => update('blockwise_checkpointing', e.target.checked)} disabled={t.ltx2_model_parallel} tooltip="Per-block checkpointing" />
 								<FormToggle fieldPath="training.use_pinned_memory_for_block_swap" checked={t.use_pinned_memory_for_block_swap ?? false} onchange={(e) => update('use_pinned_memory_for_block_swap', e.target.checked)} tooltip="Pinned memory for block swap" />
 								<FormToggle fieldPath="training.img_in_txt_in_offloading" checked={t.img_in_txt_in_offloading ?? false} onchange={(e) => update('img_in_txt_in_offloading', e.target.checked)} tooltip="Offload img_in/txt_in to CPU" />
 							</div>
@@ -795,20 +806,20 @@
 				<FormGroup title="Compile & CUDA">
 					<div class="space-y-2 pt-2">
 						<div class="grid grid-cols-3 gap-x-4 gap-y-1">
-							<FormToggle fieldPath="training.compile" checked={t.compile ?? false} onchange={(e) => update('compile', e.target.checked)} tooltip="Enable torch.compile" />
-							<FormToggle fieldPath="training.compile_fullgraph" checked={t.compile_fullgraph ?? false} onchange={(e) => update('compile_fullgraph', e.target.checked)} tooltip="Pass --compile_fullgraph." />
+							<FormToggle fieldPath="training.compile" checked={t.compile ?? false} onchange={(e) => update('compile', e.target.checked)} disabled={t.ltx2_model_parallel} tooltip="Enable torch.compile" />
+							<FormToggle fieldPath="training.compile_fullgraph" checked={t.compile_fullgraph ?? false} onchange={(e) => update('compile_fullgraph', e.target.checked)} disabled={t.ltx2_model_parallel || !t.compile} tooltip="Pass --compile_fullgraph." />
 							<FormToggle fieldPath="training.cuda_allow_tf32" checked={t.cuda_allow_tf32 ?? false} onchange={(e) => update('cuda_allow_tf32', e.target.checked)} tooltip="Allow TF32 on Ampere+" />
 							<FormToggle fieldPath="training.cuda_cudnn_benchmark" checked={t.cuda_cudnn_benchmark ?? false} onchange={(e) => update('cuda_cudnn_benchmark', e.target.checked)} tooltip="cuDNN benchmark mode" />
 							<FormToggle fieldPath="training.disable_numpy_memmap" checked={t.disable_numpy_memmap ?? false} onchange={(e) => update('disable_numpy_memmap', e.target.checked)} tooltip="Disable numpy memmap model loading." />
 						</div>
 						<div class="grid grid-cols-3 gap-2">
-							<FormField fieldPath="training.compile_backend" value={t.compile_backend || 'inductor'} oninput={(e) => update('compile_backend', e.target.value)} disabled={!t.compile} tooltip="Compile backend" />
-							<FormField fieldPath="training.compile_mode" value={t.compile_mode || ''} oninput={(e) => update('compile_mode', e.target.value)} placeholder="default" disabled={!t.compile} tooltip="Compile mode (default, reduce-overhead, max-autotune)" />
-							<FormSelect fieldPath="training.compile_dynamic" value={t.compile_dynamic === true ? 'true' : t.compile_dynamic === false ? '' : t.compile_dynamic || ''} options={[{value:'',label:'Default'},{value:'true',label:'true'},{value:'false',label:'false'},{value:'auto',label:'auto'}]} onchange={(e) => update('compile_dynamic', e.target.value || false)} disabled={!t.compile} tooltip="Value for --compile_dynamic." />
+							<FormField fieldPath="training.compile_backend" value={t.compile_backend || 'inductor'} oninput={(e) => update('compile_backend', e.target.value)} disabled={!t.compile || t.ltx2_model_parallel} tooltip="Compile backend" />
+							<FormField fieldPath="training.compile_mode" value={t.compile_mode || ''} oninput={(e) => update('compile_mode', e.target.value)} placeholder="default" disabled={!t.compile || t.ltx2_model_parallel} tooltip="Compile mode (default, reduce-overhead, max-autotune)" />
+							<FormSelect fieldPath="training.compile_dynamic" value={t.compile_dynamic === true ? 'true' : t.compile_dynamic === false ? '' : t.compile_dynamic || ''} options={[{value:'',label:'Default'},{value:'true',label:'true'},{value:'false',label:'false'},{value:'auto',label:'auto'}]} onchange={(e) => update('compile_dynamic', e.target.value || false)} disabled={!t.compile || t.ltx2_model_parallel} tooltip="Value for --compile_dynamic." />
 						</div>
 						<div class="grid grid-cols-2 gap-2">
 							<FormField type="number" fieldPath="training.cuda_memory_fraction" value={t.cuda_memory_fraction ?? ''} oninput={(e) => update('cuda_memory_fraction', e.target.value ? Number(e.target.value) : null)} placeholder="None" step="0.05" min={0} max={1} tooltip="Limit CUDA memory fraction" />
-							<FormField type="number" fieldPath="training.compile_cache_size_limit" value={t.compile_cache_size_limit ?? ''} oninput={(e) => update('compile_cache_size_limit', e.target.value ? Number(e.target.value) : null)} placeholder="Default" disabled={!t.compile} tooltip="torch.compile cache size limit" />
+							<FormField type="number" fieldPath="training.compile_cache_size_limit" value={t.compile_cache_size_limit ?? ''} oninput={(e) => update('compile_cache_size_limit', e.target.value ? Number(e.target.value) : null)} placeholder="Default" disabled={!t.compile || t.ltx2_model_parallel} tooltip="torch.compile cache size limit" />
 						</div>
 						<div class="grid grid-cols-2 gap-2">
 							<FormField fieldPath="training.dynamo_backend" value={t.dynamo_backend || 'NO'} oninput={(e) => update('dynamo_backend', e.target.value || 'NO')} tooltip="Accelerate TorchDynamo backend. Default NO disables it." />

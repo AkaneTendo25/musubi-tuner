@@ -41,6 +41,13 @@ from musubi_tuner.ltx2_lycoris_runtime import (
     validate_lycoris_quantized_base_compatibility,
     validate_lycoris_runtime,
 )
+from musubi_tuner.ltx2_model_parallel import (
+    clip_grad_norm_model_parallel,
+    enable_ltx2_model_parallel,
+    is_ltx2_model_parallel_enabled,
+    place_ltx2_lora_network_for_model_parallel,
+    validate_ltx2_model_parallel_setup,
+)
 
 # LTX-2 latent normalization defaults.
 # These are identity stats (mean=0, std=1). We keep them as a safe fallback and
@@ -574,6 +581,27 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
         # Latent temporal objectives (off by default)
         self._latent_temporal_weighting_config = None
         self._latent_delta_loss_config = None
+
+    def is_model_parallel_enabled(self, args) -> bool:
+        return is_ltx2_model_parallel_enabled(args)
+
+    def validate_model_parallel_setup(self, args, accelerator) -> None:
+        validate_ltx2_model_parallel_setup(args, accelerator)
+
+    def enable_model_parallel_transformer(self, args, accelerator, transformer) -> None:
+        enable_ltx2_model_parallel(transformer, args)
+
+    def place_network_for_model_parallel(self, args, accelerator, transformer, network) -> None:
+        place_ltx2_lora_network_for_model_parallel(network, transformer)
+
+    def clip_grad_norm_for_model_parallel(self, args, accelerator, params, optimizer):
+        unscale_gradients = getattr(accelerator, "unscale_gradients", None)
+        if callable(unscale_gradients):
+            try:
+                unscale_gradients(optimizer)
+            except TypeError:
+                unscale_gradients()
+        return clip_grad_norm_model_parallel(params, args.max_grad_norm)
 
     @staticmethod
     def _apply_caption_dropout(
@@ -1828,12 +1856,28 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
     def _ensure_fp8_buffers_on_device(self, model: torch.nn.Module) -> None:
         if not any(True for _ in model.parameters()):
             return
-        target_device = next(model.parameters()).device
 
         # If block swap is enabled, we must NOT call ensure_fp8_modules_on_device on the entire model
         # because it would move all swapped blocks from CPU to GPU, defeating block swapping.
         # Instead, process only non-swapped parts of the model.
         base_model = model.model if hasattr(model, "model") else model
+        try:
+            from musubi_tuner.ltx2_model_parallel import get_ltx2_model_parallel_plan
+
+            mp_plan = get_ltx2_model_parallel_plan(base_model)
+        except Exception:
+            mp_plan = None
+
+        if mp_plan is not None and hasattr(base_model, "transformer_blocks"):
+            for name, child in base_model.named_children():
+                if name == "transformer_blocks":
+                    continue
+                ensure_fp8_modules_on_device(child, mp_plan.input_device)
+            for idx, block in enumerate(base_model.transformer_blocks):
+                ensure_fp8_modules_on_device(block, mp_plan.block_devices[idx])
+            return
+
+        target_device = next(model.parameters()).device
         blocks_to_swap = getattr(base_model, "blocks_to_swap", 0) or 0
 
         if blocks_to_swap > 0 and hasattr(base_model, "transformer_blocks"):
@@ -1865,9 +1909,15 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
         """
         if not any(True for _ in model.parameters()):
             return
-        target_device = next(model.parameters()).device
 
         base_model = model.model if hasattr(model, "model") else model
+        try:
+            from musubi_tuner.ltx2_model_parallel import get_ltx2_model_parallel_plan
+
+            mp_plan = get_ltx2_model_parallel_plan(base_model)
+        except Exception:
+            mp_plan = None
+
         blocks_to_swap = getattr(base_model, "blocks_to_swap", 0) or 0
 
         def _sync_nf4_buffers(module: torch.nn.Module, device: torch.device) -> None:
@@ -1879,6 +1929,17 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                     w = getattr(submodule, "weight", None)
                     if isinstance(w, torch.Tensor) and w.device != device:
                         submodule.weight = w.to(device)
+
+        if mp_plan is not None and hasattr(base_model, "transformer_blocks"):
+            for name, child in base_model.named_children():
+                if name == "transformer_blocks":
+                    continue
+                _sync_nf4_buffers(child, mp_plan.input_device)
+            for idx, block in enumerate(base_model.transformer_blocks):
+                _sync_nf4_buffers(block, mp_plan.block_devices[idx])
+            return
+
+        target_device = next(model.parameters()).device
 
         if blocks_to_swap > 0 and hasattr(base_model, "transformer_blocks"):
             for name, child in base_model.named_children():

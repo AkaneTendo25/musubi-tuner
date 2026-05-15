@@ -953,6 +953,21 @@ class NetworkTrainer:
         return args.optimizer_type.lower().endswith("schedulefree".lower()) or args.optimizer_type.lower() == "automagic"
 
     # -- Preservation / regularization base-class no-ops --
+    def is_model_parallel_enabled(self, args) -> bool:
+        return False
+
+    def validate_model_parallel_setup(self, args, accelerator) -> None:
+        pass
+
+    def enable_model_parallel_transformer(self, args, accelerator, transformer) -> None:
+        pass
+
+    def place_network_for_model_parallel(self, args, accelerator, transformer, network) -> None:
+        pass
+
+    def clip_grad_norm_for_model_parallel(self, args, accelerator, params, optimizer):
+        return accelerator.clip_grad_norm_(params, args.max_grad_norm)
+
     def pre_train_hook(self, args, accelerator, transformer=None, network=None):
         pass
 
@@ -2666,6 +2681,9 @@ class NetworkTrainer:
             args.mixed_precision = accelerator.mixed_precision
             logger.info(f"mixed precision set to {args.mixed_precision} / mixed precisionを{args.mixed_precision}に設定")
         is_main_process = accelerator.is_main_process
+        model_parallel = self.is_model_parallel_enabled(args)
+        if model_parallel:
+            self.validate_model_parallel_setup(args, accelerator)
 
         # prepare dtype
         weight_dtype = torch.float32
@@ -2705,7 +2723,7 @@ class NetworkTrainer:
         # load DiT model
         blocks_to_swap = args.blocks_to_swap if args.blocks_to_swap else 0
         self.blocks_to_swap = blocks_to_swap
-        loading_device = "cpu" if blocks_to_swap > 0 else accelerator.device
+        loading_device = "cpu" if blocks_to_swap > 0 or model_parallel else accelerator.device
 
         # Reset VRAM tracking for spike analysis
         if torch.cuda.is_available():
@@ -2734,6 +2752,10 @@ class NetworkTrainer:
         transformer.eval()
         transformer.requires_grad_(False)
         _log_vram("AFTER load_transformer (model on CPU)", logger)
+
+        if model_parallel:
+            self.enable_model_parallel_transformer(args, accelerator, transformer)
+            _log_vram("AFTER enable_model_parallel_transformer", logger)
 
         if blocks_to_swap > 0:
             logger.info(
@@ -3002,6 +3024,8 @@ class NetworkTrainer:
         if dit_weight_dtype != dit_dtype and dit_weight_dtype is not None:
             logger.info(f"casting model to {dit_weight_dtype}")
             transformer.to(dit_weight_dtype)
+        if model_parallel:
+            self.place_network_for_model_parallel(args, accelerator, transformer, network)
         _log_vram("BEFORE accelerator.prepare(transformer)", logger)
 
         if blocks_to_swap > 0:
@@ -3011,6 +3035,9 @@ class NetworkTrainer:
             _log_vram("AFTER move_to_device_except_swap_blocks #2", logger)
             accelerator.unwrap_model(transformer).prepare_block_swap_before_forward()
             _log_vram("AFTER prepare_block_swap_before_forward", logger)
+        elif model_parallel:
+            transformer = accelerator.prepare(transformer, device_placement=[False])
+            _log_vram("AFTER accelerator.prepare(transformer) with model-parallel device_placement=[False]", logger)
         else:
             transformer = accelerator.prepare(transformer)
             _log_vram("AFTER accelerator.prepare(transformer) without block swap", logger)
@@ -3043,7 +3070,15 @@ class NetworkTrainer:
         # prepare lr_scheduler (must happen after all optimizer param groups are added)
         lr_scheduler = self.get_lr_scheduler(args, optimizer, accelerator.num_processes)
 
-        if validation_dataloader is not None:
+        if model_parallel:
+            network = accelerator.prepare(network, device_placement=[False])
+            if validation_dataloader is not None:
+                optimizer, train_dataloader, validation_dataloader, lr_scheduler = accelerator.prepare(
+                    optimizer, train_dataloader, validation_dataloader, lr_scheduler
+                )
+            else:
+                optimizer, train_dataloader, lr_scheduler = accelerator.prepare(optimizer, train_dataloader, lr_scheduler)
+        elif validation_dataloader is not None:
             network, optimizer, train_dataloader, validation_dataloader, lr_scheduler = accelerator.prepare(
                 network, optimizer, train_dataloader, validation_dataloader, lr_scheduler
             )
@@ -4416,7 +4451,8 @@ class NetworkTrainer:
                             total_grad_sq = torch.zeros(1, device=accelerator.device)
                             for param in params_to_clip:
                                 if param.grad is not None:
-                                    total_grad_sq += param.grad.detach().float().pow(2).sum()
+                                    grad_sq = param.grad.detach().float().pow(2).sum()
+                                    total_grad_sq += grad_sq.to(device=total_grad_sq.device, non_blocking=True)
                             grad_norm_total_value = total_grad_sq.sqrt().item()
 
                         # Per-modality gradient norm tracking (accumulate on GPU, sync once)
@@ -4432,14 +4468,17 @@ class NetworkTrainer:
                                         if param.grad is not None:
                                             g_sq = param.grad.detach().float().pow(2).sum()
                                             if is_audio:
-                                                audio_grad_sq += g_sq
+                                                audio_grad_sq += g_sq.to(device=audio_grad_sq.device, non_blocking=True)
                                             else:
-                                                video_grad_sq += g_sq
+                                                video_grad_sq += g_sq.to(device=video_grad_sq.device, non_blocking=True)
                                 grad_norm_video_value = video_grad_sq.sqrt().item()
                                 grad_norm_audio_value = audio_grad_sq.sqrt().item()
 
                         if args.max_grad_norm != 0.0:
-                            accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
+                            if model_parallel:
+                                self.clip_grad_norm_for_model_parallel(args, accelerator, params_to_clip, optimizer)
+                            else:
+                                accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
 
                     if _is_first_step:
                         _log_vram("FIRST_ITER: BEFORE optimizer.step", logger)
