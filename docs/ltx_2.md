@@ -1371,6 +1371,7 @@ Example:
 python ltx2_estimate.py ^
   --dataset_config dataset.toml ^
   --ltx2_checkpoint /path/to/ltx-2.3.safetensors ^
+  --mixed_precision bf16 ^
   --ltx_version 2.3 ^
   --ltx2_mode av ^
   --network_module networks.lora_ltx2 ^
@@ -2812,6 +2813,7 @@ When a cache, training, slider training, or inference job is started from the da
 
 **Alternative Trainers**
 - [ai-toolkit](https://github.com/ostris/ai-toolkit) (ostris) — General diffusion fine-tuning toolkit with LTX-2/2.3 LoRA support; slider LoRA training is based on its implementation
+- [diffusion-pipe](https://github.com/tdrussell/diffusion-pipe) — Pipeline-parallel diffusion model trainer with LTX-Video and LTX 2.3 support; initial LTX 2.3 support covers T2I/T2V training, without audio
 - [DiffSynth-Studio](https://github.com/modelscope/DiffSynth-Studio) — ModelScope diffusion synthesis framework with LTX-2/2.3 support
 - [SimpleTuner](https://github.com/bghira/SimpleTuner) — Multi-model fine-tuning framework with LTX-2/2.3 support; `--crepa backbone` mode is inspired by its LayerSync regularizer
 
