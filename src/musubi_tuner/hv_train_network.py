@@ -61,6 +61,8 @@ from musubi_tuner.modules.group_lr_scheduler import GroupWarmupScheduler, parse_
 from musubi_tuner.modules.lr_schedulers import RexLR
 from musubi_tuner.modules.scheduling_flow_match_discrete import FlowMatchDiscreteScheduler
 from musubi_tuner.ltx2_sinksgd_defaults import (
+    DEFAULT_PRODIGY_PLUS_OPTIMIZER_ARGS,
+    DEFAULT_PRODIGY_PLUS_OPTIMIZER_TYPE,
     DEFAULT_LTX2_DORA_OFT_LEARNING_RATE,
     DEFAULT_LTX2_LEARNING_RATE,
     DEFAULT_LTX2_SINKSGD_MOMENTUM,
@@ -69,6 +71,7 @@ from musubi_tuner.ltx2_sinksgd_defaults import (
     DEFAULT_LTX2_SINKSGD_NORMED_MOMENTUM,
     DEFAULT_LTX2_SINKSGD_ORTHOGONAL_SINKHORN,
     DEFAULT_LTX2_SINKSGD_SINKHORN_ITERATIONS,
+    is_prodigy_plus_optimizer,
 )
 import musubi_tuner.networks.lora as lora_module
 from musubi_tuner.networks.optimizer_params_compat import prepare_optimizer_params_compat
@@ -1011,6 +1014,28 @@ class NetworkTrainer:
             optimizer_class = Automagic
             optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
 
+        elif is_prodigy_plus_optimizer(args.optimizer_type):
+            try:
+                from prodigyplus.prodigy_plus_schedulefree import ProdigyPlusScheduleFree
+            except ImportError as exc:
+                raise ImportError(
+                    "Prodigy Plus requires the 'prodigy-plus-schedule-free' package. "
+                    "Install it with `pip install prodigy-plus-schedule-free==2.0.1`."
+                ) from exc
+
+            args.optimizer_type = DEFAULT_PRODIGY_PLUS_OPTIMIZER_TYPE
+            for default_arg in DEFAULT_PRODIGY_PLUS_OPTIMIZER_ARGS:
+                key, value = default_arg.split("=", 1)
+                if key in optimizer_kwargs:
+                    continue
+                try:
+                    optimizer_kwargs[key] = ast.literal_eval(value)
+                except (ValueError, SyntaxError):
+                    optimizer_kwargs[key] = value
+            logger.info(f"use Prodigy Plus Schedule-Free optimizer | lr={lr} | {optimizer_kwargs}")
+            optimizer_class = ProdigyPlusScheduleFree
+            optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
+
         elif optimizer_type in {"sinksgd", "sink_sgd", "sinksgd_adv", "sinksgdadv"}:
             from musubi_tuner.optimizers.sink_sgd import SinkSGD
 
@@ -1174,7 +1199,11 @@ class NetworkTrainer:
             )
 
     def is_schedulefree_optimizer(self, optimizer: torch.optim.Optimizer, args: argparse.Namespace) -> bool:
-        return args.optimizer_type.lower().endswith("schedulefree".lower()) or args.optimizer_type.lower() == "automagic"
+        return (
+            args.optimizer_type.lower().endswith("schedulefree".lower())
+            or is_prodigy_plus_optimizer(args.optimizer_type)
+            or args.optimizer_type.lower() == "automagic"
+        )
 
     # -- Preservation / regularization base-class no-ops --
     def pre_train_hook(self, args, accelerator, transformer=None, network=None):
@@ -5627,8 +5656,8 @@ def setup_parser_common() -> argparse.ArgumentParser:
     parser.add_argument(
         "--lr_scheduler",
         type=str,
-        default="constant",
-        help="scheduler to use for learning rate / 学習率のスケジューラ: linear, cosine, cosine_with_restarts, polynomial, constant (default), constant_with_warmup, adafactor, rex",
+        default="cosine",
+        help="scheduler to use for learning rate / 学習率のスケジューラ: linear, cosine (default), cosine_with_restarts, polynomial, constant, constant_with_warmup, adafactor, rex",
     )
     parser.add_argument(
         "--lr_warmup_steps",

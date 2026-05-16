@@ -21,7 +21,14 @@
 	const LOKR_NETWORK_MODULE = 'networks.lokr';
 	const DEFAULT_SINKSGD_LEARNING_RATE = '0.001';
 	const DEFAULT_SINKSGD_DORA_OFT_LEARNING_RATE = '0.0005';
+	const DEFAULT_LEARNING_RATE = '0.000002';
 	const DEFAULT_SINKSGD_OPTIMIZER_ARGS = 'spectral_normalization=True scale_lr_with_effective_batch=True normed_momentum=True momentum=0.995 nesterov=True nesterov_coef=0.8 orthogonal_sinkhorn=True sinkhorn_iterations=3';
+	const DEFAULT_LR_SCHEDULER = 'cosine';
+	const PPLUS_LR_SCHEDULER = 'constant';
+	const DEFAULT_PPLUS_LEARNING_RATE = '1.0';
+	const DEFAULT_PPLUS_OPTIMIZER_TYPE = 'ProdigyPlusScheduleFree';
+	const DEFAULT_PPLUS_OPTIMIZER_ARGS = 'betas=(0.9,0.99) beta3=None weight_decay=0.0 weight_decay_by_lr=True use_bias_correction=False d0=1e-6 d_coef=1.0 prodigy_steps=0 use_speed=False eps=1e-8 split_groups=True split_groups_mean=False factored=True factored_fp32=True use_stableadamw=True use_cautious=False use_grams=False use_adopt=False d_limiter=True stochastic_rounding=True use_schedulefree=True schedulefree_c=0.0 use_orthograd=False';
+	const DEFAULT_DASHBOARD_OPTIMIZER_TYPE = DEFAULT_PPLUS_OPTIMIZER_TYPE;
 	const DEFAULT_CAME_EPS1 = '1e-30';
 	const DEFAULT_CAME_EPS2 = '1e-16';
 	const LOKR_FFN_TARGET_PRESETS = new Set([
@@ -112,32 +119,62 @@
 	}
 
 	function update(key, value) { updateSection('training', key, value); }
+	function defaultLearningRate(training) {
+		if (isProdigyPlusOptimizer(training?.optimizer_type)) return DEFAULT_PPLUS_LEARNING_RATE;
+		if (isSinkSgdOptimizer(training?.optimizer_type)) {
+			return training?.use_dora_oft ? DEFAULT_SINKSGD_DORA_OFT_LEARNING_RATE : DEFAULT_SINKSGD_LEARNING_RATE;
+		}
+		return DEFAULT_LEARNING_RATE;
+	}
+	function defaultOptimizerArgs(value) {
+		if (isProdigyPlusOptimizer(value)) return DEFAULT_PPLUS_OPTIMIZER_ARGS;
+		if (isSinkSgdOptimizer(value)) return DEFAULT_SINKSGD_OPTIMIZER_ARGS;
+		return '';
+	}
+	function defaultOptimizerType(value) {
+		if (isProdigyPlusOptimizer(value)) return DEFAULT_PPLUS_OPTIMIZER_TYPE;
+		const optimizerType = String(value || DEFAULT_DASHBOARD_OPTIMIZER_TYPE).trim();
+		return optimizerType || DEFAULT_DASHBOARD_OPTIMIZER_TYPE;
+	}
+	function optimizerDefaultsFor(value) {
+		const optimizerType = defaultOptimizerType(value);
+		const isPPlus = isProdigyPlusOptimizer(optimizerType);
+		return {
+			optimizer_type: optimizerType,
+			learning_rate: null,
+			optimizer_args: defaultOptimizerArgs(optimizerType),
+			lr_scheduler: isPPlus ? PPLUS_LR_SCHEDULER : DEFAULT_LR_SCHEDULER,
+			lr_warmup_steps: 0,
+			max_grad_norm: isPPlus ? 0 : 1,
+			sinksgd_orthogonal_sinkhorn: true,
+			sinksgd_compiled_optimizer: false,
+			came_eps1: null,
+			came_eps2: null,
+		};
+	}
 	function automaticLearningRate(training) {
-		return training?.use_dora_oft ? `Auto: ${DEFAULT_SINKSGD_DORA_OFT_LEARNING_RATE}` : `Auto: ${DEFAULT_SINKSGD_LEARNING_RATE}`;
+		return `Auto: ${defaultLearningRate(training)}`;
 	}
 	function normalizeOptimizerType(value) {
-		return String(value || 'SinkSGD_adv').replace(/[-_]/g, '').toLowerCase();
+		return String(value || DEFAULT_DASHBOARD_OPTIMIZER_TYPE).replace(/[-_\s]/g, '').toLowerCase();
 	}
 	function isSinkSgdOptimizer(value) {
 		const normalized = normalizeOptimizerType(value);
 		return normalized === 'sinksgd' || normalized === 'sinksgdadv';
+	}
+	function isProdigyPlusOptimizer(value) {
+		const normalized = normalizeOptimizerType(value);
+		return normalized === 'pplus' || normalized === 'prodigyplus' || normalized === 'prodigyplusschedulefree';
 	}
 	function isCameOptimizer(value) {
 		const normalized = normalizeOptimizerType(value);
 		return normalized === 'came' || normalized === 'camesimple' || normalized === 'came8bit';
 	}
 	function updateOptimizerType(value) {
-		const currentOptimizerArgs = t.optimizer_args || '';
-		update('optimizer_type', value);
-		if (!isSinkSgdOptimizer(value)) {
-			if (currentOptimizerArgs === DEFAULT_SINKSGD_OPTIMIZER_ARGS) update('optimizer_args', '');
-			return;
+		const defaults = optimizerDefaultsFor(value);
+		for (const [key, nextValue] of Object.entries(defaults)) {
+			update(key, nextValue);
 		}
-		update('learning_rate', null);
-		update('optimizer_args', DEFAULT_SINKSGD_OPTIMIZER_ARGS);
-		update('sinksgd_orthogonal_sinkhorn', true);
-		update('sinksgd_compiled_optimizer', false);
-		update('lr_scheduler', 'constant');
 	}
 	function updateNetworkMode(mode) {
 		if (mode === 'lokr') {
@@ -216,6 +253,9 @@
 		'adadelta',
 		'adamax',
 		'prodigy',
+		'Prodigy Plus',
+		'PPlus',
+		'ProdigyPlusScheduleFree',
 		'came',
 		'came8bit',
 		'torchao_adamw8bit',
@@ -819,12 +859,12 @@
 				<FormGroup title="Optimizer">
 					<div class="space-y-2 pt-2">
 						<div class="grid grid-cols-2 gap-2">
-							<FormField type="number" fieldPath="training.learning_rate" value={t.learning_rate ?? ''} oninput={(e) => update('learning_rate', e.target.value ? Number(e.target.value) : null)} step="any" placeholder={automaticLearningRate(t)} tooltip="Learning rate. Blank uses 0.001 for SinkSGD_adv, or 0.0005 for DoRA-OFT." />
-							<FormCombobox fieldPath="training.optimizer_type" value={t.optimizer_type || 'SinkSGD_adv'} oninput={(e) => updateOptimizerType(e.target.value)} options={optimizerOptions} placeholder="SinkSGD_adv" tooltip="Optimizer type. Selecting SinkSGD_adv or SinkSGD applies the current dashboard SinkSGD defaults to this project." />
+							<FormField type="number" fieldPath="training.learning_rate" value={t.learning_rate ?? ''} oninput={(e) => update('learning_rate', e.target.value ? Number(e.target.value) : null)} step="any" placeholder={automaticLearningRate(t)} tooltip="Learning rate. Blank uses 0.001 for SinkSGD_adv, 0.0005 for DoRA-OFT, 1.0 for PPlus, or 0.000002 for other optimizers." />
+							<FormCombobox fieldPath="training.optimizer_type" value={t.optimizer_type || DEFAULT_DASHBOARD_OPTIMIZER_TYPE} oninput={(e) => updateOptimizerType(e.target.value)} options={optimizerOptions} placeholder={DEFAULT_DASHBOARD_OPTIMIZER_TYPE} tooltip="Optimizer type. Selecting an optimizer applies that optimizer's dashboard defaults to this project." />
 						</div>
 						<div class="grid grid-cols-3 gap-2">
-							<FormSelect fieldPath="training.lr_scheduler" value={t.lr_scheduler || 'constant'} options={['constant', 'cosine', 'warmup_stable_decay', 'constant_with_warmup', 'cosine_with_restarts', 'linear', 'polynomial', 'rex']} onchange={(e) => update('lr_scheduler', e.target.value)} tooltip="LR schedule. Constant matches OneTrainer's default; cosine decays over the whole run and can under-drive short runs." />
-							<FormField type="number" fieldPath="training.lr_warmup_steps" value={t.lr_warmup_steps ?? 0} oninput={(e) => update('lr_warmup_steps', Number(e.target.value))} min={0} tooltip="Warmup steps" />
+							<FormSelect fieldPath="training.lr_scheduler" value={isProdigyPlusOptimizer(t.optimizer_type) ? PPLUS_LR_SCHEDULER : (t.lr_scheduler || DEFAULT_LR_SCHEDULER)} options={['constant', 'cosine', 'warmup_stable_decay', 'constant_with_warmup', 'cosine_with_restarts', 'linear', 'polynomial', 'rex']} onchange={(e) => update('lr_scheduler', isProdigyPlusOptimizer(t.optimizer_type) ? PPLUS_LR_SCHEDULER : e.target.value)} tooltip="LR schedule. Cosine is the dashboard default for optimizer-based schedulers. PPlus is schedule-free and stays fixed to constant." />
+							<FormField type="number" fieldPath="training.lr_warmup_steps" value={t.lr_warmup_steps ?? 0} oninput={(e) => update('lr_warmup_steps', Number(e.target.value))} min={0} tooltip="Warmup steps. Use about 10% of total steps for non-PPlus optimizers. If total steps or epochs change on resume, turn on Reset Optimizer and Reset Optimizer Params in Logging & Resume." />
 							<FormField type="number" fieldPath="training.gradient_accumulation_steps" value={t.gradient_accumulation_steps ?? 1} oninput={(e) => update('gradient_accumulation_steps', Number(e.target.value))} min={1} tooltip="Gradient accumulation" />
 						</div>
 						{#if isSinkSgdOptimizer(t.optimizer_type)}
@@ -846,7 +886,7 @@
 							</div>
 							<div class="grid grid-cols-2 gap-2">
 								<FormField type="number" fieldPath="training.max_grad_norm" value={t.max_grad_norm ?? 1.0} oninput={(e) => update('max_grad_norm', Number(e.target.value))} step="0.1" tooltip="Gradient clipping" />
-								<FormField fieldPath="training.optimizer_args" value={t.optimizer_args || ''} oninput={(e) => update('optimizer_args', e.target.value)} placeholder={DEFAULT_SINKSGD_OPTIMIZER_ARGS} tooltip="Extra optimizer args. SinkSGD_adv defaults include normed long momentum, Nesterov coefficient blending, three Sinkhorn iterations, and sqrt effective-batch LR scaling; Orthogonal Sinkhorn is controlled by the visible toggle." />
+								<FormField fieldPath="training.optimizer_args" value={t.optimizer_args || ''} oninput={(e) => update('optimizer_args', e.target.value)} placeholder={defaultOptimizerArgs(t.optimizer_type) || 'None'} tooltip="Extra optimizer args. SinkSGD_adv defaults include normed long momentum, Nesterov coefficient blending, three Sinkhorn iterations, and sqrt effective-batch LR scaling; PPlus defaults use Schedule-Free Prodigy Plus with factored fp32 moments and stochastic rounding; other optimizers usually leave this blank." />
 							</div>
 							<div class="grid grid-cols-2 gap-2">
 								<FormField type="number" fieldPath="training.lr_decay_steps" value={t.lr_decay_steps ?? ''} oninput={(e) => update('lr_decay_steps', e.target.value ? Number(e.target.value) : null)} placeholder="None" tooltip="LR decay steps" />
@@ -871,8 +911,8 @@
 				<FormGroup title="Schedule">
 					<div class="space-y-2 pt-2">
 						<div class="grid grid-cols-2 gap-2">
-							<FormField type="number" fieldPath="training.max_train_steps" value={t.max_train_steps ?? 1600} oninput={(e) => update('max_train_steps', Number(e.target.value))} min={1} tooltip="Total training steps" />
-							<FormField type="number" fieldPath="training.max_train_epochs" value={t.max_train_epochs ?? ''} oninput={(e) => update('max_train_epochs', e.target.value ? Number(e.target.value) : null)} placeholder="Optional" tooltip="Epochs (overrides steps)" />
+							<FormField type="number" fieldPath="training.max_train_steps" value={t.max_train_steps ?? 1600} oninput={(e) => update('max_train_steps', Number(e.target.value))} min={1} tooltip="Total training steps. If changing this for a resumed run, enable the Reset Optimizer and Reset Optimizer Params toggles in the Logging & Resume section." />
+							<FormField type="number" fieldPath="training.max_train_epochs" value={t.max_train_epochs ?? ''} oninput={(e) => update('max_train_epochs', e.target.value ? Number(e.target.value) : null)} placeholder="Optional" tooltip="Epochs override steps. If changing this for a resumed run, enable the Reset Optimizer and Reset Optimizer Params toggles in the Logging & Resume section." />
 						</div>
 						<div class="grid grid-cols-2 gap-2">
 							<FormSelect fieldPath="training.timestep_sampling" value={t.timestep_sampling || 'sigma'} options={['sigma', 'uniform', 'sigmoid', 'shift', 'shifted_logit_normal', 'logsnr']} onchange={(e) => update('timestep_sampling', e.target.value)} tooltip="Timestep sampling" />

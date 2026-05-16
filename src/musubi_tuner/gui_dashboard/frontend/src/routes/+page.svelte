@@ -27,7 +27,10 @@
 	const TEMPLATE_VARIANTS_DISABLED = true;
 	const DEFAULT_SINKSGD_LEARNING_RATE = '0.001';
 	const DEFAULT_SINKSGD_DORA_OFT_LEARNING_RATE = '0.0005';
-	const DEFAULT_SINKSGD_OPTIMIZER_ARGS = 'spectral_normalization=True scale_lr_with_effective_batch=True normed_momentum=True momentum=0.995 nesterov=True nesterov_coef=0.8 orthogonal_sinkhorn=True sinkhorn_iterations=3';
+	const DEFAULT_LEARNING_RATE = '0.000002';
+	const DEFAULT_PPLUS_LEARNING_RATE = '1.0';
+	const DEFAULT_PPLUS_OPTIMIZER_TYPE = 'ProdigyPlusScheduleFree';
+	const DEFAULT_PPLUS_OPTIMIZER_ARGS = 'betas=(0.9,0.99) beta3=None weight_decay=0.0 weight_decay_by_lr=True use_bias_correction=False d0=1e-6 d_coef=1.0 prodigy_steps=0 use_speed=False eps=1e-8 split_groups=True split_groups_mean=False factored=True factored_fp32=True use_stableadamw=True use_cautious=False use_grams=False use_adopt=False d_limiter=True stochastic_rounding=True use_schedulefree=True schedulefree_c=0.0 use_orthograd=False';
 
 	const LORA_FAMILIES = [
 		{
@@ -166,11 +169,12 @@
 				ic_lora_strategy: 'auto',
 				network_dim: 32,
 				network_alpha: null,
-				optimizer_type: 'SinkSGD_adv',
-				optimizer_args: DEFAULT_SINKSGD_OPTIMIZER_ARGS,
+				optimizer_type: DEFAULT_PPLUS_OPTIMIZER_TYPE,
+				optimizer_args: DEFAULT_PPLUS_OPTIMIZER_ARGS,
 				sinksgd_orthogonal_sinkhorn: true,
 				learning_rate: null,
 				lr_scheduler: 'constant',
+				max_grad_norm: 0,
 				gradient_checkpointing: true,
 				timestep_sampling: 'shifted_logit_normal',
 				output_dir: repoOutputDir,
@@ -434,11 +438,36 @@
 	}
 
 	function normalizeOptimizerType(value) {
-		return String(value || 'SinkSGD_adv').replace(/[-_]/g, '').toLowerCase();
+		return String(value || DEFAULT_PPLUS_OPTIMIZER_TYPE).replace(/[-_\s]/g, '').toLowerCase();
+	}
+
+	function isProdigyPlusOptimizer(value) {
+		const optType = normalizeOptimizerType(value);
+		return ['pplus', 'prodigyplus', 'prodigyplusschedulefree'].includes(optType);
+	}
+
+	function isSinkSgdOptimizer(value) {
+		const optType = normalizeOptimizerType(value);
+		return optType === 'sinksgd' || optType === 'sinksgdadv';
+	}
+
+	function displayScheduler(training) {
+		if (isProdigyPlusOptimizer(training?.optimizer_type)) return 'constant';
+		return training?.lr_scheduler || 'cosine';
+	}
+
+	function displayLearningRate(training) {
+		if (training?.learning_rate !== null && training?.learning_rate !== undefined) return training.learning_rate;
+		if (isProdigyPlusOptimizer(training?.optimizer_type)) return DEFAULT_PPLUS_LEARNING_RATE;
+		if (isSinkSgdOptimizer(training?.optimizer_type)) {
+			return training?.use_dora_oft ? DEFAULT_SINKSGD_DORA_OFT_LEARNING_RATE : DEFAULT_SINKSGD_LEARNING_RATE;
+		}
+		return DEFAULT_LEARNING_RATE;
 	}
 
 	function optimizerBytesPerParam(value, rank) {
 		const optType = normalizeOptimizerType(value);
+		if (isProdigyPlusOptimizer(value)) return 10;
 		if (optType === 'came8bit') {
 			// CAME keeps factored second/residual moments and an 8-bit first moment.
 			// Rank-4 LoRA tensors sit near the quantization threshold, so keep that
@@ -1293,7 +1322,7 @@
 			</div>
 			<div>
 				<div class="text-[9px] uppercase" style="color: var(--text-muted);">LR</div>
-				<div class="text-[13px] font-semibold" style="color: var(--text-primary);">{t.learning_rate ?? (t.use_dora_oft ? DEFAULT_SINKSGD_DORA_OFT_LEARNING_RATE : DEFAULT_SINKSGD_LEARNING_RATE)}</div>
+				<div class="text-[13px] font-semibold" style="color: var(--text-primary);">{displayLearningRate(t)}</div>
 			</div>
 			<div>
 				<div class="text-[9px] uppercase" style="color: var(--text-muted);">Dim</div>
@@ -1305,11 +1334,11 @@
 			</div>
 			<div>
 				<div class="text-[9px] uppercase" style="color: var(--text-muted);">Optimizer</div>
-				<div class="text-[13px] font-semibold truncate" style="color: var(--text-primary);">{t.optimizer_type || 'SinkSGD_adv'}</div>
+				<div class="text-[13px] font-semibold truncate" style="color: var(--text-primary);">{t.optimizer_type || DEFAULT_PPLUS_OPTIMIZER_TYPE}</div>
 			</div>
 			<div>
 				<div class="text-[9px] uppercase" style="color: var(--text-muted);">Scheduler</div>
-				<div class="text-[13px] font-semibold truncate" style="color: var(--text-primary);">{(t.lr_scheduler || 'constant').replace('constant_with_warmup','const+warm')}</div>
+				<div class="text-[13px] font-semibold truncate" style="color: var(--text-primary);">{displayScheduler(t).replace('constant_with_warmup','const+warm')}</div>
 			</div>
 			<div>
 				<div class="text-[9px] uppercase" style="color: var(--text-muted);">Swap</div>

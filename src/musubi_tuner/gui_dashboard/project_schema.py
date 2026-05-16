@@ -15,6 +15,11 @@ from musubi_tuner.ltx2_sinksgd_defaults import (
     DEFAULT_LTX2_LR_SCHEDULER,
     DEFAULT_LTX2_OPTIMIZER_TYPE,
     DEFAULT_LTX2_SINKSGD_OPTIMIZER_ARGS,
+    DEFAULT_PRODIGY_PLUS_OPTIMIZER_ARGS,
+    DEFAULT_PRODIGY_PLUS_LR_SCHEDULER,
+    DEFAULT_PRODIGY_PLUS_OPTIMIZER_TYPE,
+    is_prodigy_plus_optimizer,
+    is_sinksgd_optimizer,
 )
 from musubi_tuner.model_defaults import default_gemma_root_path, default_ltx2_checkpoint_path
 
@@ -272,13 +277,13 @@ class TrainingConfig(BaseModel):
 
     # Optimizer
     learning_rate: Optional[float] = None
-    optimizer_type: str = DEFAULT_LTX2_OPTIMIZER_TYPE
-    optimizer_args: str = " ".join(DEFAULT_LTX2_SINKSGD_OPTIMIZER_ARGS)
+    optimizer_type: str = DEFAULT_PRODIGY_PLUS_OPTIMIZER_TYPE
+    optimizer_args: str = " ".join(DEFAULT_PRODIGY_PLUS_OPTIMIZER_ARGS)
     came_eps1: Optional[float] = None
     came_eps2: Optional[float] = None
     sinksgd_orthogonal_sinkhorn: bool = True
     sinksgd_compiled_optimizer: bool = False
-    lr_scheduler: str = DEFAULT_LTX2_LR_SCHEDULER
+    lr_scheduler: str = DEFAULT_PRODIGY_PLUS_LR_SCHEDULER
     lr_warmup_steps: int = 0
     lr_decay_steps: Optional[int] = 0
     lr_scheduler_num_cycles: Optional[int] = 1
@@ -290,12 +295,32 @@ class TrainingConfig(BaseModel):
     gradient_accumulation_steps: int = 1
     accumulation_group_by: Literal["none", "frames", "bucket", "dataset"] = "none"
     accumulation_group_remainder: Literal["drop", "pad", "allow_mixed"] = "drop"
-    max_grad_norm: float = 1.0
+    max_grad_norm: float = 0.0
     audio_lr: Optional[float] = None
     lr_args: str = ""
     lr_group_warmup_args: str = ""
     audio_dim: Optional[int] = None
     audio_alpha: Optional[float] = None
+
+    @model_validator(mode="after")
+    def _apply_optimizer_defaults(self):
+        fields_set = getattr(self, "model_fields_set", set())
+        if "optimizer_args" not in fields_set:
+            if is_prodigy_plus_optimizer(self.optimizer_type):
+                self.optimizer_args = " ".join(DEFAULT_PRODIGY_PLUS_OPTIMIZER_ARGS)
+            elif is_sinksgd_optimizer(self.optimizer_type):
+                self.optimizer_args = " ".join(DEFAULT_LTX2_SINKSGD_OPTIMIZER_ARGS)
+            else:
+                self.optimizer_args = ""
+        if "lr_scheduler" not in fields_set:
+            self.lr_scheduler = (
+                DEFAULT_PRODIGY_PLUS_LR_SCHEDULER
+                if is_prodigy_plus_optimizer(self.optimizer_type)
+                else DEFAULT_LTX2_LR_SCHEDULER
+            )
+        if "max_grad_norm" not in fields_set:
+            self.max_grad_norm = 0.0 if is_prodigy_plus_optimizer(self.optimizer_type) else 1.0
+        return self
 
     # Schedule
     max_train_steps: int = 1600
@@ -844,6 +869,14 @@ class ProjectConfig(BaseModel):
                 if not section.get('gemma_root') and not section.get('gemma_safetensors'):
                     section['gemma_root'] = default_gemma
                 if section_name == 'training':
+                    sinksgd_default_args = " ".join(DEFAULT_LTX2_SINKSGD_OPTIMIZER_ARGS)
+                    old_sinksgd_default_args = {
+                        LEGACY_SINKSGD_GRAD_ACCUM_OPTIMIZER_ARGS,
+                        LEGACY_SINKSGD_EFFECTIVE_BATCH_OPTIMIZER_ARGS,
+                        sinksgd_default_args,
+                    }
+                    if not section.get('optimizer_type') and section.get('optimizer_args') in old_sinksgd_default_args:
+                        section['optimizer_type'] = DEFAULT_LTX2_OPTIMIZER_TYPE
                     has_old_sampling_values = any(
                         key in section and section.get(key) is not None
                         for key in ('height', 'width', 'sample_num_frames')

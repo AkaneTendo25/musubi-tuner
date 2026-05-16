@@ -4259,7 +4259,7 @@ def main() -> None:
                             f"{base_optimizer.__class__.__name__} fused backward pass requires optimi single-param step support"
                         )
                     logger.info("%s torch-optimi fused backward pass enabled.", base_optimizer.__class__.__name__)
-                elif base_optimizer_name in {"came", "came8bit", "sinksgd"}:
+                elif base_optimizer_name in {"came", "came8bit", "sinksgd", "prodigyplusschedulefree"}:
                     if not _attach_fused_step_param(optimizer, base_optimizer):
                         raise ValueError(f"{base_optimizer.__class__.__name__} fused backward pass requires optimizer.step_param support")
                     if base_optimizer_name in {"came", "came8bit"} and not any(
@@ -4274,7 +4274,7 @@ def main() -> None:
                     logger.info("%s fused backward pass enabled.", base_optimizer.__class__.__name__)
                 else:
                     raise ValueError(
-                        f"--fused_backward_pass requires Adafactor, CAME/CAME8bit, SinkSGD, torchao Adam, "
+                        f"--fused_backward_pass requires Adafactor, CAME/CAME8bit, SinkSGD, ProdigyPlusScheduleFree, torchao Adam, "
                         f"torch-optimi, or BAdam with badam_use_gradient_release=True; "
                         f"got {base_optimizer.__class__.__name__}"
                     )

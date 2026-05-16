@@ -13,9 +13,37 @@ from typing import Iterable
 DEFAULT_LTX2_OPTIMIZER_TYPE = "SinkSGD_adv"
 DEFAULT_LTX2_LEARNING_RATE = 1.0e-3
 DEFAULT_LTX2_DORA_OFT_LEARNING_RATE = 5.0e-4
-DEFAULT_LTX2_LR_SCHEDULER = "constant"
+DEFAULT_LTX2_LR_SCHEDULER = "cosine"
+DEFAULT_PRODIGY_PLUS_LR_SCHEDULER = "constant"
 DEFAULT_LTX2_LORA_RANK = 4
 LEGACY_LTX2_LEARNING_RATE = 2.0e-6
+DEFAULT_PRODIGY_PLUS_OPTIMIZER_TYPE = "ProdigyPlusScheduleFree"
+DEFAULT_PRODIGY_PLUS_LEARNING_RATE = 1.0
+DEFAULT_PRODIGY_PLUS_OPTIMIZER_ARGS = (
+    "betas=(0.9,0.99)",
+    "beta3=None",
+    "weight_decay=0.0",
+    "weight_decay_by_lr=True",
+    "use_bias_correction=False",
+    "d0=1e-6",
+    "d_coef=1.0",
+    "prodigy_steps=0",
+    "use_speed=False",
+    "eps=1e-8",
+    "split_groups=True",
+    "split_groups_mean=False",
+    "factored=True",
+    "factored_fp32=True",
+    "use_stableadamw=True",
+    "use_cautious=False",
+    "use_grams=False",
+    "use_adopt=False",
+    "d_limiter=True",
+    "stochastic_rounding=True",
+    "use_schedulefree=True",
+    "schedulefree_c=0.0",
+    "use_orthograd=False",
+)
 DEFAULT_CAME_EPS = (1.0e-30, 1.0e-16)
 DEFAULT_LTX2_SINKSGD_MOMENTUM = 0.995
 DEFAULT_LTX2_SINKSGD_NESTEROV = True
@@ -41,16 +69,18 @@ SINKSGD_LR_SCALE_ARG_KEYS = (
 
 SINKSGD_OPTIMIZER_ALIASES = {
     "sinksgd",
-    "sink_sgd",
     "sinksgd_adv",
     "sinksgdadv",
 }
 CAME_OPTIMIZER_ALIASES = {
     "came",
     "camesimple",
-    "came_simple",
     "came8bit",
-    "came_8bit",
+}
+PRODIGY_PLUS_OPTIMIZER_ALIASES = {
+    "pplus",
+    "prodigyplus",
+    "prodigyplusschedulefree",
 }
 
 
@@ -58,12 +88,21 @@ def normalize_optimizer_type(value: str | None) -> str:
     return str(value or DEFAULT_LTX2_OPTIMIZER_TYPE).strip().lower()
 
 
+def optimizer_alias_key(value: str | None) -> str:
+    normalized = normalize_optimizer_type(value)
+    return "".join(ch for ch in normalized if ch not in {"-", "_", " "})
+
+
 def is_sinksgd_optimizer(value: str | None) -> bool:
-    return normalize_optimizer_type(value) in SINKSGD_OPTIMIZER_ALIASES
+    return optimizer_alias_key(value) in SINKSGD_OPTIMIZER_ALIASES
 
 
 def is_came_optimizer(value: str | None) -> bool:
-    return normalize_optimizer_type(value) in CAME_OPTIMIZER_ALIASES
+    return optimizer_alias_key(value) in CAME_OPTIMIZER_ALIASES
+
+
+def is_prodigy_plus_optimizer(value: str | None) -> bool:
+    return optimizer_alias_key(value) in PRODIGY_PLUS_OPTIMIZER_ALIASES
 
 
 def split_key_value_args(raw: str | Iterable[str] | None) -> list[str]:
@@ -143,11 +182,31 @@ def uses_sinksgd_spectral_scaling(optimizer_type: str | None, optimizer_args: st
 
 def resolve_ltx2_optimizer_type(optimizer_type: str | None) -> str:
     value = str(optimizer_type or "").strip()
-    return value or DEFAULT_LTX2_OPTIMIZER_TYPE
+    if not value:
+        return DEFAULT_LTX2_OPTIMIZER_TYPE
+    if is_prodigy_plus_optimizer(value):
+        return DEFAULT_PRODIGY_PLUS_OPTIMIZER_TYPE
+    return value
 
 
 def resolve_ltx2_optimizer_args(optimizer_type: str | None, optimizer_args: str | Iterable[str] | None) -> list[str]:
     args = split_key_value_args(optimizer_args)
+    if is_prodigy_plus_optimizer(optimizer_type):
+        sinksgd_default_keys = {
+            key_value_arg_key(default_arg)
+            for default_arg in DEFAULT_LTX2_SINKSGD_OPTIMIZER_ARGS
+        }
+        args = [
+            arg
+            for arg in args
+            if key_value_arg_key(arg) not in sinksgd_default_keys
+        ]
+        for default_arg in DEFAULT_PRODIGY_PLUS_OPTIMIZER_ARGS:
+            key, value = default_arg.split("=", 1)
+            if not has_key_value_arg(args, key):
+                args.append(f"{key}={value}")
+        return args
+
     if not is_sinksgd_optimizer(optimizer_type):
         return args
 
@@ -177,6 +236,8 @@ def resolve_ltx2_learning_rate(
 ) -> float:
     if learning_rate is not None:
         return float(learning_rate)
+    if is_prodigy_plus_optimizer(optimizer_type):
+        return DEFAULT_PRODIGY_PLUS_LEARNING_RATE
     if is_sinksgd_optimizer(optimizer_type):
         if network_args_enable_dora_oft(network_args, fallback=use_dora_oft):
             return DEFAULT_LTX2_DORA_OFT_LEARNING_RATE

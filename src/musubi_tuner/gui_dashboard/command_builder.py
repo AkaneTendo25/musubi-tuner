@@ -25,6 +25,8 @@ from musubi_tuner.ltx2_sinksgd_defaults import (
     DEFAULT_CAME_EPS,
     DEFAULT_LTX2_LR_SCHEDULER,
     DEFAULT_LTX2_SINKSGD_OPTIMIZER_ARGS,
+    DEFAULT_PRODIGY_PLUS_LR_SCHEDULER,
+    is_prodigy_plus_optimizer,
     has_key_value_arg,
     is_came_optimizer,
     is_sinksgd_optimizer,
@@ -233,7 +235,7 @@ def _compile_dynamic_value(value) -> str | None:
 
 
 def _drop_default_sinksgd_args_for_non_sinksgd(optimizer_type: str, args_parts: list[str]) -> list[str]:
-    if is_sinksgd_optimizer(optimizer_type):
+    if is_sinksgd_optimizer(optimizer_type) or is_prodigy_plus_optimizer(optimizer_type):
         return args_parts
     if args_parts == list(DEFAULT_LTX2_SINKSGD_OPTIMIZER_ARGS):
         return []
@@ -285,6 +287,12 @@ def _resolved_ltx2_training_defaults(t, network_args_parts: list[str]) -> tuple[
     network_alpha = resolve_ltx2_network_alpha(t.network_alpha, t.network_dim, optimizer_type, optimizer_args_parts)
     audio_alpha = resolve_ltx2_audio_alpha(t.audio_alpha, t.audio_dim, optimizer_type, optimizer_args_parts)
     return optimizer_type, optimizer_args_parts, learning_rate, network_alpha, audio_alpha
+
+
+def _resolved_ltx2_lr_scheduler(optimizer_type: str, lr_scheduler: str | None) -> str:
+    if is_prodigy_plus_optimizer(optimizer_type):
+        return DEFAULT_PRODIGY_PLUS_LR_SCHEDULER
+    return lr_scheduler or DEFAULT_LTX2_LR_SCHEDULER
 
 
 def build_cache_latents_cmd(config: ProjectConfig) -> list[str]:
@@ -843,7 +851,7 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
     cmd += ["--optimizer_type", optimizer_type]
     if optimizer_args_parts:
         cmd += ["--optimizer_args"] + optimizer_args_parts
-    cmd += ["--lr_scheduler", t.lr_scheduler or DEFAULT_LTX2_LR_SCHEDULER]
+    cmd += ["--lr_scheduler", _resolved_ltx2_lr_scheduler(optimizer_type, t.lr_scheduler)]
     cmd += ["--lr_warmup_steps", str(t.lr_warmup_steps)]
     if t.lr_decay_steps is not None:
         cmd += ["--lr_decay_steps", str(t.lr_decay_steps)]

@@ -135,7 +135,7 @@ def _max_vram_training_dataset(config: dict) -> dict:
 
 
 def _normalize_optimizer_type(value: str | None) -> str:
-    return str(value or 'SinkSGD_adv').replace('-', '').replace('_', '').lower()
+    return str(value or 'SinkSGD_adv').replace('-', '').replace('_', '').replace(' ', '').lower()
 
 
 def _coerce_bool(value) -> bool:
@@ -421,6 +421,8 @@ def _dora_runtime_overhead_gb(
 def _optimizer_bytes_per_param(opt_type: str | None, rank: int) -> float:
     """Approximate optimizer state bytes per trainable LoRA parameter."""
     normalized = _normalize_optimizer_type(opt_type)
+    if normalized in {'pplus', 'prodigyplus', 'prodigyplusschedulefree'}:
+        return 10.0
     if normalized == 'came8bit':
         # CAME keeps factored second/residual moments and an 8-bit first moment
         # for tensors above the quantization threshold. Rank-4 LoRA tensors sit
