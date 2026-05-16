@@ -225,3 +225,25 @@ export async function saveProjectNow() {
 		throw new Error(err.detail || 'Failed to save project');
 	}
 }
+
+export async function replaceProjectConfig(config) {
+	if (_saveTimer) {
+		clearTimeout(_saveTimer);
+		_saveTimer = null;
+	}
+	const res = await fetch('/api/project', {
+		method: 'PUT',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify(config)
+	});
+	if (!res.ok) {
+		const err = await res.json();
+		throw new Error(err.detail || 'Failed to import settings');
+	}
+	const data = await res.json();
+	projectConfig.set(data.config);
+	projectLoaded.set(true);
+	const path = get(projectPath);
+	if (data.config?.name && path) addRecentProject(data.config.name, path);
+	return data.config;
+}

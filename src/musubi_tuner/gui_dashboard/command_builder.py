@@ -22,8 +22,11 @@ from musubi_tuner.gui_dashboard.toml_export import (
     export_dataset_toml,
 )
 from musubi_tuner.ltx2_sinksgd_defaults import (
+    DEFAULT_CAME_EPS,
     DEFAULT_LTX2_LR_SCHEDULER,
+    DEFAULT_LTX2_SINKSGD_OPTIMIZER_ARGS,
     has_key_value_arg,
+    is_came_optimizer,
     is_sinksgd_optimizer,
     resolve_ltx2_audio_alpha,
     resolve_ltx2_learning_rate,
@@ -127,7 +130,7 @@ def _remove_network_arg(args_parts: list[str], key: str) -> list[str]:
 
 def _build_network_args_parts(t) -> list[str]:
     args_parts = _split_cli_args(t.network_args)
-    for key in ("use_dora", "use_dora_oft", "scaled_oft"):
+    for key in ("use_dora", "use_dora_oft", "scaled_oft", "decompose_both"):
         args_parts = _remove_network_arg(args_parts, key)
     network_module = _effective_network_module(t.network_module or "")
     use_lokr_backend = network_module == "networks.lokr"
@@ -147,6 +150,7 @@ def _build_network_args_parts(t) -> list[str]:
 
     _append_network_arg(args_parts, "use_dora", use_dora)
     _append_network_arg(args_parts, "factor", lokr_factor if use_lokr_backend else None)
+    _append_network_arg(args_parts, "decompose_both", getattr(t, "lokr_decompose_both", False) if use_lokr_backend else None)
     _append_network_arg(args_parts, "use_dora_oft", t.use_dora_oft)
     if t.use_dora_oft:
         _append_network_arg(args_parts, "scaled_oft", True)
@@ -228,12 +232,34 @@ def _compile_dynamic_value(value) -> str | None:
     return None
 
 
+def _drop_default_sinksgd_args_for_non_sinksgd(optimizer_type: str, args_parts: list[str]) -> list[str]:
+    if is_sinksgd_optimizer(optimizer_type):
+        return args_parts
+    if args_parts == list(DEFAULT_LTX2_SINKSGD_OPTIMIZER_ARGS):
+        return []
+    return args_parts
+
+
+def _apply_came_optimizer_fields(t, optimizer_type: str, args_parts: list[str]) -> list[str]:
+    if not is_came_optimizer(optimizer_type):
+        return args_parts
+    eps1 = getattr(t, "came_eps1", None)
+    eps2 = getattr(t, "came_eps2", None)
+    if eps1 is None and eps2 is None:
+        return args_parts
+
+    eps1 = DEFAULT_CAME_EPS[0] if eps1 is None else float(eps1)
+    eps2 = DEFAULT_CAME_EPS[1] if eps2 is None else float(eps2)
+    return set_key_value_arg(args_parts, "eps", f"({eps1},{eps2})")
+
+
 def _resolved_ltx2_training_defaults(t, network_args_parts: list[str]) -> tuple[str, list[str], float, float | None, float | None]:
     optimizer_type = resolve_ltx2_optimizer_type(t.optimizer_type)
     raw_optimizer_args_parts = split_key_value_args(t.optimizer_args)
     raw_has_orthogonal_sinkhorn = has_key_value_arg(raw_optimizer_args_parts, "orthogonal_sinkhorn")
     raw_has_compiled_optimizer = has_key_value_arg(raw_optimizer_args_parts, "compiled_optimizer")
     optimizer_args_parts = resolve_ltx2_optimizer_args(optimizer_type, t.optimizer_args)
+    optimizer_args_parts = _drop_default_sinksgd_args_for_non_sinksgd(optimizer_type, optimizer_args_parts)
     if is_sinksgd_optimizer(optimizer_type):
         explicit_toggle = "sinksgd_orthogonal_sinkhorn" in getattr(t, "model_fields_set", set())
         if explicit_toggle or not raw_has_orthogonal_sinkhorn:
@@ -249,6 +275,7 @@ def _resolved_ltx2_training_defaults(t, network_args_parts: list[str]) -> tuple[
                 "compiled_optimizer",
                 bool(getattr(t, "sinksgd_compiled_optimizer", False)),
             )
+    optimizer_args_parts = _apply_came_optimizer_fields(t, optimizer_type, optimizer_args_parts)
     learning_rate = resolve_ltx2_learning_rate(
         t.learning_rate,
         optimizer_type,

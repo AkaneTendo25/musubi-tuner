@@ -22,6 +22,8 @@
 	const DEFAULT_SINKSGD_LEARNING_RATE = '0.001';
 	const DEFAULT_SINKSGD_DORA_OFT_LEARNING_RATE = '0.0005';
 	const DEFAULT_SINKSGD_OPTIMIZER_ARGS = 'spectral_normalization=True scale_lr_with_effective_batch=True normed_momentum=True momentum=0.995 nesterov=True nesterov_coef=0.8 orthogonal_sinkhorn=True sinkhorn_iterations=3';
+	const DEFAULT_CAME_EPS1 = '1e-30';
+	const DEFAULT_CAME_EPS2 = '1e-16';
 	const LOKR_FFN_TARGET_PRESETS = new Set([
 		'v2v',
 		'video_sa_ff',
@@ -120,9 +122,17 @@
 		const normalized = normalizeOptimizerType(value);
 		return normalized === 'sinksgd' || normalized === 'sinksgdadv';
 	}
+	function isCameOptimizer(value) {
+		const normalized = normalizeOptimizerType(value);
+		return normalized === 'came' || normalized === 'camesimple' || normalized === 'came8bit';
+	}
 	function updateOptimizerType(value) {
+		const currentOptimizerArgs = t.optimizer_args || '';
 		update('optimizer_type', value);
-		if (!isSinkSgdOptimizer(value)) return;
+		if (!isSinkSgdOptimizer(value)) {
+			if (currentOptimizerArgs === DEFAULT_SINKSGD_OPTIMIZER_ARGS) update('optimizer_args', '');
+			return;
+		}
 		update('learning_rate', null);
 		update('optimizer_args', DEFAULT_SINKSGD_OPTIMIZER_ARGS);
 		update('sinksgd_orthogonal_sinkhorn', true);
@@ -650,8 +660,9 @@
 							<FormToggle label="DoRA-OFT" checked={t.use_dora_oft ?? false} onchange={(e) => updateUseDoraOft(e.target.checked)} tooltip="DoRA magnitude learning on top of scaled OFT rotations. Enables use_dora_oft=true and stores OFT tensors plus dora_scale." />
 						</div>
 						{#if isLokrBackend}
-							<div class="grid grid-cols-3 gap-2">
+							<div class="grid grid-cols-3 gap-2 items-end">
 								<FormField label="LoKr Factor" type="number" fieldPath="training.lokr_factor" value={t.lokr_factor ?? ''} oninput={(e) => update('lokr_factor', e.target.value ? Number(e.target.value) : null)} placeholder="Balanced" step="1" tooltip="Kronecker factorization control for LoKr/DokR. Blank or -1 uses balanced factorization; positive values like 1, 2, or 4 force that smaller factor." />
+								<FormToggle label="Decompose Both" fieldPath="training.lokr_decompose_both" checked={t.lokr_decompose_both ?? false} onchange={(e) => update('lokr_decompose_both', e.target.checked)} tooltip="Pass decompose_both=true to LoKr/DokR. This decomposes both Kronecker factors instead of keeping the first factor dense." />
 							</div>
 						{/if}
 						{#if t.use_dora_oft}
@@ -820,6 +831,12 @@
 							<div class="grid grid-cols-2 gap-2">
 								<FormToggle label="Orthogonal Sinkhorn" fieldPath="training.sinksgd_orthogonal_sinkhorn" checked={t.sinksgd_orthogonal_sinkhorn ?? true} onchange={(e) => update('sinksgd_orthogonal_sinkhorn', e.target.checked)} tooltip="Enable OrthoGrad-style projection inside SinkSGD's Sinkhorn normalization. Generated commands set orthogonal_sinkhorn from this toggle." />
 								<FormToggle label="Compiled Optimizer" fieldPath="training.sinksgd_compiled_optimizer" checked={t.sinksgd_compiled_optimizer ?? false} onchange={(e) => update('sinksgd_compiled_optimizer', e.target.checked)} tooltip="Compile SinkSGD's parameter step with torch.compile. First optimizer step may take longer while compiling." />
+							</div>
+						{/if}
+						{#if isCameOptimizer(t.optimizer_type)}
+							<div class="grid grid-cols-2 gap-2">
+								<FormField label="CAME Eps 1" type="number" fieldPath="training.came_eps1" value={t.came_eps1 ?? ''} oninput={(e) => update('came_eps1', e.target.value ? Number(e.target.value) : null)} step="any" min="0" placeholder={DEFAULT_CAME_EPS1} tooltip="First CAME epsilon for squared-gradient regularization. Blank uses the author's default." />
+								<FormField label="CAME Eps 2" type="number" fieldPath="training.came_eps2" value={t.came_eps2 ?? ''} oninput={(e) => update('came_eps2', e.target.value ? Number(e.target.value) : null)} step="any" min="0" placeholder={DEFAULT_CAME_EPS2} tooltip="Second CAME epsilon for instability regularization. Blank uses the author's default." />
 							</div>
 						{/if}
 						{#if $advancedMode}

@@ -183,6 +183,174 @@ def _training_uses_dora(training: dict) -> bool:
     return _coerce_bool(training.get("use_dora")) or _coerce_bool(training.get("use_dokr")) or _coerce_bool(training.get("use_dora_oft"))
 
 
+def _training_uses_lokr(training: dict) -> bool:
+    network_module = str(training.get("network_module") or "").strip().lower()
+    return network_module == "networks.lokr" or _coerce_bool(training.get("use_lokr")) or _coerce_bool(training.get("use_dokr"))
+
+
+def _lokr_factorization(dimension: int, factor: int = -1) -> tuple[int, int]:
+    """Mirror networks.lokr.factorization without importing the torch backend."""
+    if factor > 0 and (dimension % factor) == 0:
+        m = factor
+        n = dimension // factor
+        if m > n:
+            n, m = m, n
+        return m, n
+    if factor < 0:
+        factor = dimension
+    m, n = 1, dimension
+    length = m + n
+    while m < n:
+        new_m = m + 1
+        while dimension % new_m != 0:
+            new_m += 1
+        new_n = dimension // new_m
+        if new_m + new_n > length or new_m > factor:
+            break
+        m, n = new_m, new_n
+    if m > n:
+        n, m = m, n
+    return m, n
+
+
+def _lokr_factor(training: dict) -> int:
+    raw_factor = training.get("lokr_factor")
+    if raw_factor in (None, ""):
+        raw_factor = _network_arg_value(training.get("network_args"), "factor")
+    factor = _coerce_int(raw_factor, -1)
+    return factor if factor > 0 else -1
+
+
+def _training_lokr_decompose_both(training: dict) -> bool:
+    explicit = _network_arg_value(training.get("network_args"), "decompose_both")
+    if explicit is not None:
+        return _coerce_bool(explicit)
+    return _coerce_bool(training.get("lokr_decompose_both"))
+
+
+def _lokr_module_param_count(in_dim: int, out_dim: int, rank: int, factor: int, decompose_both: bool = False) -> int:
+    in_m, in_n = _lokr_factorization(in_dim, factor)
+    out_l, out_k = _lokr_factorization(out_dim, factor)
+
+    if decompose_both:
+        w1_rank = max(1, min(rank, out_l, in_m))
+        w1_params = w1_rank * (out_l + in_m)
+    else:
+        w1_params = out_l * in_m
+    if rank < max(out_k, in_n) / 2:
+        w2_params = rank * (out_k + in_n)
+    else:
+        # LoKr dense mode stores lokr_w2 directly. The requested rank is only
+        # the switch that selected dense mode, so it must not scale memory.
+        w2_params = out_k * in_n
+    return w1_params + w2_params
+
+
+def _ltx2_lokr_target_shapes(mode: str | None, preset: str | None) -> list[tuple[int, int, int]]:
+    """Return LTX-2 target Linear shapes as (in_dim, out_dim, count)."""
+    mode_value = str(mode or "video").strip().lower()
+    preset_value = str(preset or "t2v").strip().lower()
+    has_video = mode_value != "audio"
+    has_audio = mode_value in {"audio", "av"}
+    block_count = 48
+    shapes: list[tuple[int, int, int]] = []
+
+    def add(in_dim: int, out_dim: int, count: int) -> None:
+        if count > 0:
+            shapes.append((in_dim, out_dim, count))
+
+    def add_video_self_attn() -> None:
+        if has_video:
+            add(4096, 4096, 4 * block_count)
+
+    def add_video_cross_attn() -> None:
+        if has_video:
+            add(4096, 4096, 4 * block_count)
+
+    def add_audio_attn() -> None:
+        if has_audio:
+            add(2048, 2048, 8 * block_count)
+
+    def add_cross_modal_attn() -> None:
+        if not (has_video and has_audio):
+            return
+        # audio_to_video_attn
+        add(4096, 2048, block_count)
+        add(2048, 2048, 2 * block_count)
+        add(2048, 4096, block_count)
+        # video_to_audio_attn
+        add(2048, 2048, 2 * block_count)
+        add(4096, 2048, 2 * block_count)
+
+    def add_all_attn() -> None:
+        add_video_self_attn()
+        add_video_cross_attn()
+        add_audio_attn()
+        add_cross_modal_attn()
+
+    def add_video_ff(count: int = block_count) -> None:
+        if has_video:
+            add(4096, 16384, count)
+            add(16384, 4096, count)
+
+    def add_audio_ff() -> None:
+        if has_audio:
+            add(2048, 8192, block_count)
+            add(8192, 2048, block_count)
+
+    if preset_value in {"t2v", "lycoris"}:
+        add_all_attn()
+    elif preset_value in {"v2v", "av_ic", "video_ref_only_av", "full"}:
+        add_all_attn()
+        add_video_ff()
+        add_audio_ff()
+    elif preset_value == "video_sa":
+        add_video_self_attn()
+    elif preset_value == "video_sa_ff":
+        add_video_self_attn()
+        add_video_ff()
+    elif preset_value == "video_sa_ca_ff":
+        add_video_self_attn()
+        add_video_cross_attn()
+        add_video_ff()
+    elif preset_value == "character_training":
+        add_video_ff(count=21)
+    elif preset_value == "audio":
+        add_audio_attn()
+        add_audio_ff()
+    elif preset_value == "audio_v2a":
+        add_audio_attn()
+        add_audio_ff()
+        if has_video and has_audio:
+            add(2048, 2048, 2 * block_count)
+            add(4096, 2048, 2 * block_count)
+    elif preset_value in {"audio_ref_ic", "audio_ref_only_ic"}:
+        add_audio_attn()
+        add_audio_ff()
+        add_cross_modal_attn()
+    else:
+        add_all_attn()
+
+    return shapes
+
+
+def _estimate_lokr_trainable_param_count(
+    *,
+    rank: int,
+    factor: int,
+    mode: str | None,
+    preset: str | None,
+    include_dora: bool = False,
+    decompose_both: bool = False,
+) -> int:
+    total = 0
+    for in_dim, out_dim, count in _ltx2_lokr_target_shapes(mode, preset):
+        total += _lokr_module_param_count(in_dim, out_dim, rank, factor, decompose_both=decompose_both) * count
+        if include_dora:
+            total += out_dim * count
+    return total
+
+
 def _dora_extra_param_ratio(rank: int, preset: str | None) -> float:
     """Approximate extra trainable parameter ratio for DoRA magnitude vectors.
 
@@ -545,10 +713,21 @@ def _calculate_training_stats(config: dict, dataset_stats: DatasetStats | None) 
 
         # Checkpoint size
         network_dim = max(_coerce_int(training.get('network_dim', 16), 16), 1)
-        # Rough estimate: LoRA size depends on rank and target modules
-        # LTX2 full LoRA is roughly: dim * 2 * hidden_dim * num_layers * 4 bytes
-        # For dim=16, roughly 50-100MB
-        checkpoint_size_mb = network_dim * 5  # Very rough estimate
+        if _training_uses_lokr(training):
+            lokr_param_count = _estimate_lokr_trainable_param_count(
+                rank=network_dim,
+                factor=_lokr_factor(training),
+                mode=training.get('ltx2_mode'),
+                preset=training.get('lora_target_preset'),
+                include_dora=_training_uses_dora(training),
+                decompose_both=_training_lokr_decompose_both(training),
+            )
+            checkpoint_size_mb = (lokr_param_count * 2) / (1024 ** 2)
+        else:
+            # Rough estimate: LoRA size depends on rank and target modules
+            # LTX2 full LoRA is roughly: dim * 2 * hidden_dim * num_layers * 4 bytes
+            # For dim=16, roughly 50-100MB
+            checkpoint_size_mb = network_dim * 5
 
         # Total checkpoints
         save_every_n_steps = _coerce_int(training.get('save_every_n_steps', 0), 0)
@@ -671,7 +850,19 @@ def _calculate_vram_stats(config: dict) -> VRAMStats | None:
         lora_size_gb *= 1.0 + dora_extra_ratio
 
         # ── Optimizer states ──
-        lora_param_count = lora_size_gb * (1024 ** 3) / 2  # bf16 -> count
+        if _training_uses_lokr(training):
+            lokr_param_count = _estimate_lokr_trainable_param_count(
+                rank=rank,
+                factor=_lokr_factor(training),
+                mode=mode,
+                preset=training.get('lora_target_preset'),
+                include_dora=_training_uses_dora(training),
+                decompose_both=_training_lokr_decompose_both(training),
+            )
+            lora_size_gb = (lokr_param_count * 2) / (1024 ** 3)
+            lora_param_count = float(lokr_param_count)
+        else:
+            lora_param_count = lora_size_gb * (1024 ** 3) / 2  # bf16 -> count
         opt_bytes = _optimizer_bytes_per_param(training.get('optimizer_type'), rank)
         optimizer_size_gb = (lora_param_count * opt_bytes) / (1024 ** 3)
 
@@ -770,7 +961,7 @@ def _calculate_vram_stats(config: dict) -> VRAMStats | None:
                 preset=training.get('lora_target_preset'),
                 checkpointed=checkpointed,
             )
-            if dora_extra_ratio > 0.0
+            if _training_uses_dora(training)
             else 0.0
         )
 

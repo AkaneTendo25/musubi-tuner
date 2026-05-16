@@ -225,6 +225,7 @@ class TrainingConfig(BaseModel):
     lycoris_quantized_base_check_mode: Literal["off", "warn", "error"] = "warn"
     init_lokr_norm: Optional[float] = None
     lokr_factor: Optional[int] = None
+    lokr_decompose_both: bool = False
     use_lokr: bool = False
     use_dora: bool = False
     use_dokr: bool = False
@@ -273,6 +274,8 @@ class TrainingConfig(BaseModel):
     learning_rate: Optional[float] = None
     optimizer_type: str = DEFAULT_LTX2_OPTIMIZER_TYPE
     optimizer_args: str = " ".join(DEFAULT_LTX2_SINKSGD_OPTIMIZER_ARGS)
+    came_eps1: Optional[float] = None
+    came_eps2: Optional[float] = None
     sinksgd_orthogonal_sinkhorn: bool = True
     sinksgd_compiled_optimizer: bool = False
     lr_scheduler: str = DEFAULT_LTX2_LR_SCHEDULER

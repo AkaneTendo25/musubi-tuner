@@ -291,6 +291,7 @@ class ManagedProcess:
         self._lock = threading.Lock()
         self._last_progress_signature: tuple[str, str, int] | None = None
         self._graceful_stop_requested = False
+        self._stop_requested = False
         self._stop_file: Optional[Path] = None
         self._force_kill_delay_seconds = _STOP_GRACE_SECONDS
         self._stop_process_refs: list[ProcessRef] = []
@@ -306,6 +307,7 @@ class ManagedProcess:
             self.logs.append(f"$ {' '.join(self.cmd)}\n")
             self._last_progress_signature = None
             self._graceful_stop_requested = False
+            self._stop_requested = False
             self._force_kill_delay_seconds = _STOP_GRACE_SECONDS
             self._stop_process_refs = []
 
@@ -402,6 +404,7 @@ class ManagedProcess:
     def terminate(self):
         with self._lock:
             if self.state == ProcessState.STOPPING:
+                self._stop_requested = True
                 process_refs = list(self._stop_process_refs)
                 if self._graceful_stop_requested:
                     self.logs.append("\n[Force stop requested. Skipping graceful final save...]\n")
@@ -415,6 +418,7 @@ class ManagedProcess:
                     self.logs.append("\n[Force stop requested...]\n")
             elif self.state == ProcessState.RUNNING:
                 self.state = ProcessState.STOPPING
+                self._stop_requested = True
                 process_refs = []
             else:
                 return
@@ -479,6 +483,7 @@ class ManagedProcess:
         return {
             "state": self.state.value,
             "exit_code": self.exit_code,
+            "stop_requested": self._stop_requested,
         }
 
     def get_logs(self, last_n: Optional[int] = None) -> list[str]:
@@ -539,7 +544,7 @@ class ProcessManager:
     def get_status(self, proc_type: ProcessType) -> dict:
         mp = self._processes.get(proc_type)
         if not mp:
-            return {"state": ProcessState.IDLE.value, "exit_code": None}
+            return {"state": ProcessState.IDLE.value, "exit_code": None, "stop_requested": False}
         return mp.get_status()
 
     def get_logs(self, proc_type: ProcessType, last_n: Optional[int] = None) -> list[str]:

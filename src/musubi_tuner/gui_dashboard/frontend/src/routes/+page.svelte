@@ -484,6 +484,137 @@
 		return coerceBool(t?.use_dora) || coerceBool(t?.use_dokr) || coerceBool(t?.use_dora_oft);
 	}
 
+	function trainingUsesLokr(t) {
+		const networkModule = String(t?.network_module || '').trim().toLowerCase();
+		return networkModule === 'networks.lokr' || coerceBool(t?.use_lokr) || coerceBool(t?.use_dokr);
+	}
+
+	function lokrFactorization(dimension, factor = -1) {
+		if (factor > 0 && dimension % factor === 0) {
+			let m = factor;
+			let n = dimension / factor;
+			if (m > n) [n, m] = [m, n];
+			return [m, n];
+		}
+		if (factor < 0) factor = dimension;
+		let m = 1;
+		let n = dimension;
+		const length = m + n;
+		while (m < n) {
+			let newM = m + 1;
+			while (dimension % newM !== 0) newM += 1;
+			const newN = dimension / newM;
+			if (newM + newN > length || newM > factor) break;
+			m = newM;
+			n = newN;
+		}
+		if (m > n) [n, m] = [m, n];
+		return [m, n];
+	}
+
+	function lokrFactor(t) {
+		let rawFactor = t?.lokr_factor;
+		if (rawFactor == null || rawFactor === '') rawFactor = networkArgValue(t?.network_args, 'factor');
+		const factor = Number.parseInt(rawFactor ?? '-1', 10);
+		return Number.isFinite(factor) && factor > 0 ? factor : -1;
+	}
+
+	function lokrModuleParamCount(inDim, outDim, rank, factor) {
+		const [inM, inN] = lokrFactorization(inDim, factor);
+		const [outL, outK] = lokrFactorization(outDim, factor);
+		const w1Params = outL * inM;
+		const w2Params = rank < Math.max(outK, inN) / 2
+			? rank * (outK + inN)
+			: outK * inN;
+		return w1Params + w2Params;
+	}
+
+	function ltx2LokrTargetShapes(mode, preset) {
+		const modeValue = String(mode || 'video').trim().toLowerCase();
+		const presetValue = String(preset || 't2v').trim().toLowerCase();
+		const hasVideo = modeValue !== 'audio';
+		const hasAudio = modeValue === 'audio' || modeValue === 'av';
+		const blockCount = 48;
+		const shapes = [];
+
+		const add = (inDim, outDim, count) => {
+			if (count > 0) shapes.push([inDim, outDim, count]);
+		};
+		const addVideoSelfAttn = () => { if (hasVideo) add(4096, 4096, 4 * blockCount); };
+		const addVideoCrossAttn = () => { if (hasVideo) add(4096, 4096, 4 * blockCount); };
+		const addAudioAttn = () => { if (hasAudio) add(2048, 2048, 8 * blockCount); };
+		const addCrossModalAttn = () => {
+			if (!(hasVideo && hasAudio)) return;
+			add(4096, 2048, blockCount);
+			add(2048, 2048, 2 * blockCount);
+			add(2048, 4096, blockCount);
+			add(2048, 2048, 2 * blockCount);
+			add(4096, 2048, 2 * blockCount);
+		};
+		const addAllAttn = () => {
+			addVideoSelfAttn();
+			addVideoCrossAttn();
+			addAudioAttn();
+			addCrossModalAttn();
+		};
+		const addVideoFf = (count = blockCount) => {
+			if (!hasVideo) return;
+			add(4096, 16384, count);
+			add(16384, 4096, count);
+		};
+		const addAudioFf = () => {
+			if (!hasAudio) return;
+			add(2048, 8192, blockCount);
+			add(8192, 2048, blockCount);
+		};
+
+		if (presetValue === 't2v' || presetValue === 'lycoris') {
+			addAllAttn();
+		} else if (['v2v', 'av_ic', 'video_ref_only_av', 'full'].includes(presetValue)) {
+			addAllAttn();
+			addVideoFf();
+			addAudioFf();
+		} else if (presetValue === 'video_sa') {
+			addVideoSelfAttn();
+		} else if (presetValue === 'video_sa_ff') {
+			addVideoSelfAttn();
+			addVideoFf();
+		} else if (presetValue === 'video_sa_ca_ff') {
+			addVideoSelfAttn();
+			addVideoCrossAttn();
+			addVideoFf();
+		} else if (presetValue === 'character_training') {
+			addVideoFf(21);
+		} else if (presetValue === 'audio') {
+			addAudioAttn();
+			addAudioFf();
+		} else if (presetValue === 'audio_v2a') {
+			addAudioAttn();
+			addAudioFf();
+			if (hasVideo && hasAudio) {
+				add(2048, 2048, 2 * blockCount);
+				add(4096, 2048, 2 * blockCount);
+			}
+		} else if (presetValue === 'audio_ref_ic' || presetValue === 'audio_ref_only_ic') {
+			addAudioAttn();
+			addAudioFf();
+			addCrossModalAttn();
+		} else {
+			addAllAttn();
+		}
+
+		return shapes;
+	}
+
+	function estimateLokrTrainableParamCount({ rank, factor, mode, preset, includeDora = false }) {
+		let total = 0;
+		for (const [inDim, outDim, count] of ltx2LokrTargetShapes(mode, preset)) {
+			total += lokrModuleParamCount(inDim, outDim, rank, factor) * count;
+			if (includeDora) total += outDim * count;
+		}
+		return total;
+	}
+
 	function doraExtraParamRatio(rank, preset) {
 		if (rank <= 0) return 0;
 		const ffnHeavyPresets = new Set(['v2v', 'video_sa_ff', 'video_sa_ca_ff', 'character_training', 'audio', 'audio_ref_ic', 'audio_ref_only_ic', 'av_ic', 'video_ref_only_av', 'full']);
@@ -638,14 +769,25 @@
 		// Base LoRA size in GB per unit rank (t2v preset, video-only)
 		const loraBasePerRank = isAV ? 12.75 / 1024 : 6.0 / 1024;  // GB per rank
 		const presetMultiplier = { t2v: 1.0, v2v: 1.44, video_sa: 0.37, video_sa_ff: 0.56, video_sa_ca_ff: 0.74, character_training: 0.20, audio: 0.37, audio_v2a: 0.52, audio_ref_ic: 0.63, audio_ref_only_ic: 0.63, av_ic: 1.44, video_ref_only_av: 1.44, full: 2.1 }[t.lora_target_preset] || 1.0;
-		const doraExtraRatio = trainingUsesDora(t) ? doraExtraParamRatio(rank, t.lora_target_preset) : 0;
-		const loraParamsGB = rank * loraBasePerRank * presetMultiplier * (1 + doraExtraRatio);
+		const usesDora = trainingUsesDora(t);
+		const doraExtraRatio = usesDora ? doraExtraParamRatio(rank, t.lora_target_preset) : 0;
+		let loraParamsGB = rank * loraBasePerRank * presetMultiplier * (1 + doraExtraRatio);
 
 		// ── Optimizer states ──
 		// AdamW fp32: 12 bytes/param (fp32 master + momentum + variance)
 		// AdamW 8-bit: 6 bytes/param (fp32 master + int8 momentum + int8 variance)
 		// Prodigy/ScheduleFree: ~14 bytes/param
-		const loraParamCount = loraParamsGB * (1024 ** 3) / 2;  // bf16 -> param count
+		let loraParamCount = loraParamsGB * (1024 ** 3) / 2;  // bf16 -> param count
+		if (trainingUsesLokr(t)) {
+			loraParamCount = estimateLokrTrainableParamCount({
+				rank,
+				factor: lokrFactor(t),
+				mode,
+				preset: t.lora_target_preset,
+				includeDora: usesDora,
+			});
+			loraParamsGB = (loraParamCount * 2) / (1024 ** 3);
+		}
 		const optBytesPerParam = optimizerBytesPerParam(t.optimizer_type, rank);
 		const optimStates = (loraParamCount * optBytesPerParam) / (1024 ** 3);
 
@@ -744,7 +886,7 @@
 		const crepaOverhead = t.crepa ? (String(t.crepa_mode || 'backbone') === 'dino' ? 0.08 : 0.15) : 0;
 
 		// ── DoRA runtime ──
-		const doraRuntimeOverhead = doraExtraRatio > 0 ? doraRuntimeOverheadGB({
+		const doraRuntimeOverhead = usesDora ? doraRuntimeOverheadGB({
 			activationsGB: activationTotal,
 			rank,
 			preset: t.lora_target_preset,

@@ -16,6 +16,7 @@ DEFAULT_LTX2_DORA_OFT_LEARNING_RATE = 5.0e-4
 DEFAULT_LTX2_LR_SCHEDULER = "constant"
 DEFAULT_LTX2_LORA_RANK = 4
 LEGACY_LTX2_LEARNING_RATE = 2.0e-6
+DEFAULT_CAME_EPS = (1.0e-30, 1.0e-16)
 DEFAULT_LTX2_SINKSGD_MOMENTUM = 0.995
 DEFAULT_LTX2_SINKSGD_NESTEROV = True
 DEFAULT_LTX2_SINKSGD_NESTEROV_COEF = 0.8
@@ -44,6 +45,13 @@ SINKSGD_OPTIMIZER_ALIASES = {
     "sinksgd_adv",
     "sinksgdadv",
 }
+CAME_OPTIMIZER_ALIASES = {
+    "came",
+    "camesimple",
+    "came_simple",
+    "came8bit",
+    "came_8bit",
+}
 
 
 def normalize_optimizer_type(value: str | None) -> str:
@@ -52,6 +60,10 @@ def normalize_optimizer_type(value: str | None) -> str:
 
 def is_sinksgd_optimizer(value: str | None) -> bool:
     return normalize_optimizer_type(value) in SINKSGD_OPTIMIZER_ALIASES
+
+
+def is_came_optimizer(value: str | None) -> bool:
+    return normalize_optimizer_type(value) in CAME_OPTIMIZER_ALIASES
 
 
 def split_key_value_args(raw: str | Iterable[str] | None) -> list[str]:

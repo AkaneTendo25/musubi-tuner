@@ -1,6 +1,6 @@
 <script>
 	import { page } from '$app/state';
-	import { projectConfig, projectLoaded, closeProject } from '$lib/stores/project.js';
+	import { projectConfig, projectLoaded, closeProject, saveProjectNow, replaceProjectConfig } from '$lib/stores/project.js';
 	import { processStatuses, processValidation } from '$lib/stores/processes.js';
 	import { theme, setTheme, THEMES } from '$lib/stores/theme.js';
 	import { uiMode, setUiMode } from '$lib/stores/uiMode.js';
@@ -9,6 +9,11 @@
 	let showThemePicker = $state(false);
 	let systemInfo = $state(null);
 	let _sysInfoTimer = null;
+	let settingsFileInput = $state(null);
+	let settingsMessage = $state('');
+	let settingsMessageKind = $state('muted');
+	let importingSettings = $state(false);
+	let exportingSettings = $state(false);
 
 	const navItems = [
 		{ href: '/', label: 'Overview', group: 'Workflow', icon: 'M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-4 0h4', always: true },
@@ -92,6 +97,78 @@
 		if (item.href === '/training/dashboard') return 'Monitor';
 		if (item.href === '/settings') return 'Setup';
 		return item.label;
+	}
+
+	function downloadJson(filename, data) {
+		const blob = new Blob([JSON.stringify(data, null, 2) + '\n'], { type: 'application/json' });
+		const url = URL.createObjectURL(blob);
+		const link = document.createElement('a');
+		link.href = url;
+		link.download = filename;
+		document.body.appendChild(link);
+		link.click();
+		link.remove();
+		URL.revokeObjectURL(url);
+	}
+
+	function safeSettingsFilename() {
+		const name = ($projectConfig?.name || 'musubi-dashboard-settings')
+			.toString()
+			.trim()
+			.replace(/[^a-z0-9._-]+/gi, '-')
+			.replace(/^-+|-+$/g, '');
+		return `${name || 'musubi-dashboard-settings'}.json`;
+	}
+
+	async function exportSettings() {
+		if (!$projectConfig) return;
+		exportingSettings = true;
+		settingsMessage = '';
+		try {
+			await saveProjectNow();
+			downloadJson(safeSettingsFilename(), $projectConfig);
+			settingsMessage = 'Exported';
+			settingsMessageKind = 'success';
+		} catch (err) {
+			settingsMessage = err?.message || 'Export failed';
+			settingsMessageKind = 'danger';
+		} finally {
+			exportingSettings = false;
+		}
+	}
+
+	function openSettingsImport() {
+		if (!settingsFileInput || importingSettings) return;
+		settingsFileInput.value = '';
+		settingsFileInput.click();
+	}
+
+	async function importSettings(event) {
+		const file = event.currentTarget.files?.[0];
+		if (!file) return;
+		importingSettings = true;
+		settingsMessage = '';
+		try {
+			const imported = JSON.parse(await file.text());
+			if (!imported || typeof imported !== 'object' || Array.isArray(imported)) {
+				throw new Error('Imported settings must be a JSON object.');
+			}
+			await replaceProjectConfig(imported);
+			settingsMessage = 'Imported';
+			settingsMessageKind = 'success';
+		} catch (err) {
+			settingsMessage = err?.message || 'Import failed';
+			settingsMessageKind = 'danger';
+		} finally {
+			importingSettings = false;
+			event.currentTarget.value = '';
+		}
+	}
+
+	function settingsMessageStyle(kind) {
+		if (kind === 'success') return 'color: var(--success);';
+		if (kind === 'danger') return 'color: var(--danger);';
+		return 'color: var(--text-muted);';
 	}
 
 	let gpu = $derived(systemInfo?.gpus?.[0]);
@@ -186,6 +263,48 @@
 			{/if}
 		{/each}
 
+	</div>
+
+	<!-- Project settings import/export -->
+	<div class="flex-shrink-0 px-2 py-2 space-y-1.5" style="border-top: 1px solid var(--border-subtle);">
+		<input
+			bind:this={settingsFileInput}
+			type="file"
+			accept="application/json,.json"
+			class="hidden"
+			onchange={importSettings}
+		/>
+		<div class="grid grid-cols-2 gap-1">
+			<button
+				type="button"
+				onclick={exportSettings}
+				disabled={!$projectLoaded || exportingSettings}
+				title={$projectLoaded ? 'Export current dashboard settings' : 'Load a project before exporting settings'}
+				class="flex items-center justify-center gap-1.5 px-2 py-[6px] text-[10px] font-medium disabled:opacity-40"
+				style="background: var(--bg-elevated); color: var(--text-secondary); border: 1px solid var(--border-subtle); border-radius: var(--radius-sm);"
+			>
+				<svg class="w-3 h-3 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+					<path d="M12 3v12m0 0l-4-4m4 4l4-4M5 21h14"/>
+				</svg>
+				<span>{exportingSettings ? 'Saving' : 'Export'}</span>
+			</button>
+			<button
+				type="button"
+				onclick={openSettingsImport}
+				disabled={!$projectLoaded || importingSettings}
+				title={$projectLoaded ? 'Import dashboard settings from JSON' : 'Load a project before importing settings'}
+				class="flex items-center justify-center gap-1.5 px-2 py-[6px] text-[10px] font-medium disabled:opacity-40"
+				style="background: var(--bg-elevated); color: var(--text-secondary); border: 1px solid var(--border-subtle); border-radius: var(--radius-sm);"
+			>
+				<svg class="w-3 h-3 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+					<path d="M12 21V9m0 0l-4 4m4-4l4 4M5 3h14"/>
+				</svg>
+				<span>{importingSettings ? 'Loading' : 'Import'}</span>
+			</button>
+		</div>
+		{#if settingsMessage}
+			<div class="px-1 text-[10px] truncate" style="{settingsMessageStyle(settingsMessageKind)}">{settingsMessage}</div>
+		{/if}
 	</div>
 
 	<!-- Hardware stats -->

@@ -5,12 +5,12 @@ import { clearMetrics } from '$lib/stores/metrics.js';
 import { clearStatus } from '$lib/stores/status.js';
 
 export const processStatuses = writable({
-	cache_latents: { state: 'idle', exit_code: null },
-	cache_text: { state: 'idle', exit_code: null },
-	cache_dino: { state: 'idle', exit_code: null },
-	training: { state: 'idle', exit_code: null },
-	inference: { state: 'idle', exit_code: null },
-	slider_training: { state: 'idle', exit_code: null }
+	cache_latents: { state: 'idle', exit_code: null, stop_requested: false },
+	cache_text: { state: 'idle', exit_code: null, stop_requested: false },
+	cache_dino: { state: 'idle', exit_code: null, stop_requested: false },
+	training: { state: 'idle', exit_code: null, stop_requested: false },
+	inference: { state: 'idle', exit_code: null, stop_requested: false },
+	slider_training: { state: 'idle', exit_code: null, stop_requested: false }
 });
 
 export const processLogs = writable({

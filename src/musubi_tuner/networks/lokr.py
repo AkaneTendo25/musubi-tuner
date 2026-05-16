@@ -72,7 +72,12 @@ def _materialize_lokr_weight_from_state_dict(
     sd: Dict[str, torch.Tensor], scale: float, device: torch.device, non_blocking: bool = False
 ) -> torch.Tensor:
     """Materialize a dense LoKr delta weight from a saved state dict."""
-    w1 = sd["lokr_w1"].to(device, dtype=torch.float, non_blocking=non_blocking)
+    if "lokr_w1" in sd:
+        w1 = sd["lokr_w1"].to(device, dtype=torch.float, non_blocking=non_blocking)
+    else:
+        w1a = sd["lokr_w1_a"].to(device, dtype=torch.float, non_blocking=non_blocking)
+        w1b = sd["lokr_w1_b"].to(device, dtype=torch.float, non_blocking=non_blocking)
+        w1 = w1a @ w1b
 
     if "lokr_w2" in sd:
         w2 = sd["lokr_w2"].to(device, dtype=torch.float, non_blocking=non_blocking)
@@ -156,6 +161,18 @@ def _resolve_oft_config_from_state_dict(
     return block_size, block_share, coft, coft_eps
 
 
+def _materialized_lokr_w1_input_dim(module_state: Dict[str, torch.Tensor]) -> int:
+    if "lokr_w1" in module_state:
+        return int(module_state["lokr_w1"].shape[1])
+    return int(module_state["lokr_w1_b"].shape[1])
+
+
+def _lokr_w2_input_dim(module_state: Dict[str, torch.Tensor]) -> int:
+    if "lokr_w2" in module_state:
+        return int(module_state["lokr_w2"].shape[1])
+    return int(module_state["lokr_w2_b"].shape[1])
+
+
 def _rotate_weight_with_oft_state_dict(
     weight: torch.Tensor,
     module_state: Dict[str, torch.Tensor],
@@ -216,6 +233,8 @@ class LoKrModule(torch.nn.Module):
         rank_dropout=None,
         module_dropout=None,
         factor=-1,
+        decompose_both=False,
+        decompose_w1_rank=None,
         **kwargs,
     ):
         super().__init__()
@@ -229,14 +248,21 @@ class LoKrModule(torch.nn.Module):
             out_dim = org_module.out_features
 
         factor = int(factor)
+        self.decompose_both = lora_module._parse_bool_network_arg(decompose_both)
         self.use_w2 = False
 
         # Factorize dimensions
         in_m, in_n = factorization(in_dim, factor)
         out_l, out_k = factorization(out_dim, factor)
 
-        # w1 is always a full matrix (the "scale" factor, small)
-        self.lokr_w1 = nn.Parameter(torch.empty(out_l, in_m))
+        # w1 is usually a full matrix (the "scale" factor, small), but can
+        # also be decomposed for higher-order Kronecker structure.
+        if self.decompose_both:
+            w1_rank = max(1, min(int(decompose_w1_rank or lora_dim), out_l, in_m))
+            self.lokr_w1_a = nn.Parameter(torch.empty(out_l, w1_rank))
+            self.lokr_w1_b = nn.Parameter(torch.empty(w1_rank, in_m))
+        else:
+            self.lokr_w1 = nn.Parameter(torch.empty(out_l, in_m))
 
         # w2: low-rank decomposition if rank is small enough, otherwise full matrix
         if lora_dim < max(out_k, in_n) / 2:
@@ -261,7 +287,11 @@ class LoKrModule(torch.nn.Module):
         self.register_buffer("alpha", torch.tensor(alpha))
 
         # Initialization
-        torch.nn.init.kaiming_uniform_(self.lokr_w1, a=math.sqrt(5))
+        if self.decompose_both:
+            torch.nn.init.kaiming_uniform_(self.lokr_w1_a, a=math.sqrt(5))
+            torch.nn.init.constant_(self.lokr_w1_b, 1)
+        else:
+            torch.nn.init.kaiming_uniform_(self.lokr_w1, a=math.sqrt(5))
         if self.use_w2:
             torch.nn.init.constant_(self.lokr_w2, 0)
         else:
@@ -282,12 +312,31 @@ class LoKrModule(torch.nn.Module):
 
     def get_diff_weight(self):
         """Return materialized weight delta."""
-        w1 = self.lokr_w1
+        if self.decompose_both:
+            w1 = self.lokr_w1_a @ self.lokr_w1_b
+        else:
+            w1 = self.lokr_w1
         if self.use_w2:
             w2 = self.lokr_w2
         else:
             w2 = self.lokr_w2_a @ self.lokr_w2_b
         return make_kron(w1, w2, self.scale)
+
+    def export_state_dict(self) -> Dict[str, torch.Tensor]:
+        state_dict: Dict[str, torch.Tensor] = {
+            f"{self.lora_name}.alpha": self.alpha.detach().clone().to(dtype=torch.float32),
+        }
+        if self.decompose_both:
+            state_dict[f"{self.lora_name}.lokr_w1_a"] = self.lokr_w1_a.detach().clone()
+            state_dict[f"{self.lora_name}.lokr_w1_b"] = self.lokr_w1_b.detach().clone()
+        else:
+            state_dict[f"{self.lora_name}.lokr_w1"] = self.lokr_w1.detach().clone()
+        if self.use_w2:
+            state_dict[f"{self.lora_name}.lokr_w2"] = self.lokr_w2.detach().clone()
+        else:
+            state_dict[f"{self.lora_name}.lokr_w2_a"] = self.lokr_w2_a.detach().clone()
+            state_dict[f"{self.lora_name}.lokr_w2_b"] = self.lokr_w2_b.detach().clone()
+        return state_dict
 
     def forward(self, x):
         org_forwarded = self.org_forward(x)
@@ -325,7 +374,18 @@ class LoKrInfModule(LoKrModule):
     ):
         # no dropout for inference; pass factor from kwargs if present
         factor = kwargs.pop("factor", -1)
-        super().__init__(lora_name, org_module, multiplier, lora_dim, alpha, factor=factor)
+        decompose_both = kwargs.pop("decompose_both", False)
+        decompose_w1_rank = kwargs.pop("decompose_w1_rank", None)
+        super().__init__(
+            lora_name,
+            org_module,
+            multiplier,
+            lora_dim,
+            alpha,
+            factor=factor,
+            decompose_both=decompose_both,
+            decompose_w1_rank=decompose_w1_rank,
+        )
 
         self.org_module_ref = [org_module]
         self.enabled = True
@@ -347,18 +407,7 @@ class LoKrInfModule(LoKrModule):
         if device is None:
             device = org_device
 
-        # get LoKr weights
-        w1 = sd["lokr_w1"].to(device, dtype=torch.float, non_blocking=non_blocking)
-
-        if "lokr_w2" in sd:
-            w2 = sd["lokr_w2"].to(device, dtype=torch.float, non_blocking=non_blocking)
-        else:
-            w2a = sd["lokr_w2_a"].to(device, dtype=torch.float, non_blocking=non_blocking)
-            w2b = sd["lokr_w2_b"].to(device, dtype=torch.float, non_blocking=non_blocking)
-            w2 = w2a @ w2b
-
-        # compute ΔW via Kronecker product
-        diff_weight = make_kron(w1, w2, self.scale)
+        diff_weight = _materialize_lokr_weight_from_state_dict(sd, self.scale, device, non_blocking=non_blocking)
 
         # merge
         weight = weight + self.multiplier * diff_weight
@@ -370,7 +419,10 @@ class LoKrInfModule(LoKrModule):
         if multiplier is None:
             multiplier = self.multiplier
 
-        w1 = self.lokr_w1.to(torch.float)
+        if self.decompose_both:
+            w1 = (self.lokr_w1_a @ self.lokr_w1_b).to(torch.float)
+        else:
+            w1 = self.lokr_w1.to(torch.float)
         if self.use_w2:
             w2 = self.lokr_w2.to(torch.float)
         else:
@@ -405,6 +457,8 @@ class DoKrModule(LoKrModule):
         factor=-1,
         **kwargs,
     ):
+        decompose_both = kwargs.pop("decompose_both", False)
+        decompose_w1_rank = kwargs.pop("decompose_w1_rank", None)
         super().__init__(
             lora_name,
             org_module,
@@ -415,11 +469,14 @@ class DoKrModule(LoKrModule):
             rank_dropout=rank_dropout,
             module_dropout=module_dropout,
             factor=factor,
+            decompose_both=decompose_both,
+            decompose_w1_rank=decompose_w1_rank,
             **kwargs,
         )
 
         self.org_module_ref = [org_module]
-        initial_norm = self._get_base_weight_norm().to(device=self.lokr_w1.device, dtype=self.lokr_w1.dtype)
+        reference_param = self.lokr_w1_a if self.decompose_both else self.lokr_w1
+        initial_norm = self._get_base_weight_norm().to(device=reference_param.device, dtype=reference_param.dtype)
         self.register_buffer("initial_norm", initial_norm.detach().clone())
         self.lora_magnitude_vector = lora_module.DoRAMagnitudeModule(torch.ones_like(initial_norm))
 
@@ -455,17 +512,9 @@ class DoKrModule(LoKrModule):
 
     def export_state_dict(self) -> Dict[str, torch.Tensor]:
         magnitude = _magnitude_ratio_to_absolute(self.lora_magnitude_vector.weight, self.initial_norm)
-        state_dict: Dict[str, torch.Tensor] = {
-            f"{self.lora_name}.lokr_w1": self.lokr_w1.detach().clone(),
-            f"{self.lora_name}.alpha": self.alpha.detach().clone().to(dtype=torch.float32),
-            f"{self.lora_name}.lora_magnitude_vector.weight": magnitude.detach().clone(),
-            f"{self.lora_name}.initial_norm": self.initial_norm.detach().clone(),
-        }
-        if self.use_w2:
-            state_dict[f"{self.lora_name}.lokr_w2"] = self.lokr_w2.detach().clone()
-        else:
-            state_dict[f"{self.lora_name}.lokr_w2_a"] = self.lokr_w2_a.detach().clone()
-            state_dict[f"{self.lora_name}.lokr_w2_b"] = self.lokr_w2_b.detach().clone()
+        state_dict = super().export_state_dict()
+        state_dict[f"{self.lora_name}.lora_magnitude_vector.weight"] = magnitude.detach().clone()
+        state_dict[f"{self.lora_name}.initial_norm"] = self.initial_norm.detach().clone()
         return state_dict
 
     def forward(self, x):
@@ -684,22 +733,14 @@ class DoKrOFTModule(DoKrModule):
 
     def export_state_dict(self) -> Dict[str, torch.Tensor]:
         magnitude = _magnitude_ratio_to_absolute(self.lora_magnitude_vector.weight, self.initial_norm)
-        state_dict: Dict[str, torch.Tensor] = {
-            f"{self.lora_name}.lokr_w1": self.lokr_w1.detach().clone(),
-            f"{self.lora_name}.alpha": self.alpha.detach().clone().to(dtype=torch.float32),
-            f"{self.lora_name}.lora_magnitude_vector.weight": magnitude.detach().clone(),
-            f"{self.lora_name}.initial_norm": self.initial_norm.detach().clone(),
-            f"{self.lora_name}.oft_R.weight": self.oft_R.weight.detach().clone(),
-            f"{self.lora_name}.oft_block_size_metadata": self.oft_block_size_metadata.detach().clone(),
-            f"{self.lora_name}.oft_block_share_metadata": self.oft_block_share_metadata.detach().clone(),
-            f"{self.lora_name}.oft_coft_metadata": self.oft_coft_metadata.detach().clone(),
-            f"{self.lora_name}.coft_eps_metadata": self.coft_eps_metadata.detach().clone(),
-        }
-        if self.use_w2:
-            state_dict[f"{self.lora_name}.lokr_w2"] = self.lokr_w2.detach().clone()
-        else:
-            state_dict[f"{self.lora_name}.lokr_w2_a"] = self.lokr_w2_a.detach().clone()
-            state_dict[f"{self.lora_name}.lokr_w2_b"] = self.lokr_w2_b.detach().clone()
+        state_dict = LoKrModule.export_state_dict(self)
+        state_dict[f"{self.lora_name}.lora_magnitude_vector.weight"] = magnitude.detach().clone()
+        state_dict[f"{self.lora_name}.initial_norm"] = self.initial_norm.detach().clone()
+        state_dict[f"{self.lora_name}.oft_R.weight"] = self.oft_R.weight.detach().clone()
+        state_dict[f"{self.lora_name}.oft_block_size_metadata"] = self.oft_block_size_metadata.detach().clone()
+        state_dict[f"{self.lora_name}.oft_block_share_metadata"] = self.oft_block_share_metadata.detach().clone()
+        state_dict[f"{self.lora_name}.oft_coft_metadata"] = self.oft_coft_metadata.detach().clone()
+        state_dict[f"{self.lora_name}.coft_eps_metadata"] = self.coft_eps_metadata.detach().clone()
         return state_dict
 
     def forward(self, x):
@@ -869,6 +910,7 @@ def create_arch_network(
     factor = int(factor)
     use_dora = lora_module._parse_bool_network_arg(kwargs.get("use_dora", False))
     use_dora_oft = lora_module._parse_bool_network_arg(kwargs.get("use_dora_oft", False))
+    decompose_both = lora_module._parse_bool_network_arg(kwargs.get("decompose_both", False))
     if use_dora and use_dora_oft:
         raise ValueError("use_dora and use_dora_oft cannot both be enabled")
 
@@ -880,7 +922,7 @@ def create_arch_network(
     elif use_dora:
         module_class = DoKrModule
 
-    module_kwargs = {"factor": factor}
+    module_kwargs = {"factor": factor, "decompose_both": decompose_both}
     if use_dora_oft:
         module_kwargs["scaled_oft"] = True
         for key in ("oft_block_size", "oft_coft", "coft_eps", "oft_block_share", "oft_dropout"):
@@ -890,6 +932,7 @@ def create_arch_network(
     forwarded_kwargs = dict(kwargs)
     forwarded_kwargs.pop("use_dora", None)
     forwarded_kwargs.pop("use_dora_oft", None)
+    forwarded_kwargs.pop("decompose_both", None)
 
     network = lora_module.create_network(
         target_replace_modules,
@@ -923,6 +966,7 @@ def create_network_from_weights(
     modules_alpha = {}
     has_dokr_weights = lora_module._parse_bool_network_arg(kwargs.get("use_dora", False))
     has_dokr_oft_weights = lora_module._parse_bool_network_arg(kwargs.get("use_dora_oft", False))
+    decompose_both = lora_module._parse_bool_network_arg(kwargs.get("decompose_both", False))
     per_module_kwargs: Dict[str, Dict[str, object]] = {}
     for key, value in weights_sd.items():
         if "." not in key:
@@ -935,6 +979,10 @@ def create_network_from_weights(
             has_dokr_weights = True
         elif "oft_R.weight" in key:
             has_dokr_oft_weights = True
+        elif "lokr_w1_a" in key:
+            decompose_both = True
+            module_kwargs_for_name = per_module_kwargs.setdefault(lora_name, {})
+            module_kwargs_for_name["decompose_w1_rank"] = int(value.shape[1])
         elif "lokr_w2_a" in key:
             # low-rank mode: dim = w2_a.shape[1]
             dim = value.shape[1]
@@ -955,9 +1003,7 @@ def create_network_from_weights(
             }
             if "oft_R.weight" not in module_state:
                 continue
-            in_features = int(module_state["lokr_w1"].shape[1]) * int(
-                module_state["lokr_w2"].shape[1] if "lokr_w2" in module_state else module_state["lokr_w2_b"].shape[1]
-            )
+            in_features = _materialized_lokr_w1_input_dim(module_state) * _lokr_w2_input_dim(module_state)
             block_size, block_share, coft, coft_eps = _resolve_oft_config_from_state_dict(module_state, in_features)
             module_kwargs_for_name = per_module_kwargs.setdefault(lora_name, {})
             module_kwargs_for_name["oft_block_size"] = block_size
@@ -974,10 +1020,11 @@ def create_network_from_weights(
         module_class = DoKrInfModule if for_inference else DoKrModule
     else:
         module_class = LoKrInfModule if for_inference else LoKrModule
-    module_kwargs = {"factor": factor}
+    module_kwargs = {"factor": factor, "decompose_both": decompose_both}
+    if per_module_kwargs:
+        module_kwargs["per_module_kwargs"] = per_module_kwargs
     if has_dokr_oft_weights:
         module_kwargs["scaled_oft"] = True
-        module_kwargs["per_module_kwargs"] = per_module_kwargs
 
     network = LoKrNetwork(
         target_replace_modules,
@@ -1020,16 +1067,27 @@ def merge_weights_to_tensor(
     Returns model_weight unchanged if no matching LoKr keys found.
     """
     w1_key = lora_name + ".lokr_w1"
+    w1a_key = lora_name + ".lokr_w1_a"
+    w1b_key = lora_name + ".lokr_w1_b"
     w2_key = lora_name + ".lokr_w2"
     w2a_key = lora_name + ".lokr_w2_a"
     w2b_key = lora_name + ".lokr_w2_b"
     alpha_key = lora_name + ".alpha"
     magnitude_key = lora_name + ".lora_magnitude_vector.weight"
 
-    if w1_key not in lora_weight_keys:
+    if w1_key not in lora_weight_keys and w1a_key not in lora_weight_keys:
         return model_weight
 
-    w1 = lora_sd[w1_key].to(calc_device)
+    if w1a_key in lora_weight_keys:
+        w1a = lora_sd[w1a_key].to(calc_device)
+        w1b = lora_sd[w1b_key].to(calc_device)
+        w1 = None
+        w1_consumed_keys = [w1a_key, w1b_key]
+    else:
+        w1 = lora_sd[w1_key].to(calc_device)
+        w1a = None
+        w1b = None
+        w1_consumed_keys = [w1_key]
 
     # determine low-rank vs full matrix mode
     if w2a_key in lora_weight_keys:
@@ -1037,13 +1095,13 @@ def merge_weights_to_tensor(
         w2a = lora_sd[w2a_key].to(calc_device)
         w2b = lora_sd[w2b_key].to(calc_device)
         dim = w2a.shape[1]
-        consumed_keys = [w1_key, w2a_key, w2b_key, alpha_key]
+        consumed_keys = w1_consumed_keys + [w2a_key, w2b_key, alpha_key]
     elif w2_key in lora_weight_keys:
         # full matrix mode
         w2a = None
         w2b = None
         dim = None  # will use scale=1.0
-        consumed_keys = [w1_key, w2_key, alpha_key]
+        consumed_keys = w1_consumed_keys + [w2_key, alpha_key]
     else:
         return model_weight
 
@@ -1064,9 +1122,15 @@ def merge_weights_to_tensor(
     original_dtype = model_weight.dtype
     if original_dtype.itemsize == 1:  # fp8
         model_weight = model_weight.to(torch.float16)
-        w1 = w1.to(torch.float16)
+        if w1a is not None:
+            w1a, w1b = w1a.to(torch.float16), w1b.to(torch.float16)
+        else:
+            w1 = w1.to(torch.float16)
         if w2a is not None:
             w2a, w2b = w2a.to(torch.float16), w2b.to(torch.float16)
+
+    if w1a is not None:
+        w1 = w1a @ w1b
 
     # compute w2
     if w2a is not None:
