@@ -774,6 +774,68 @@ def _network_debug_post_step(
         logger.info("[DEBUG] post_step step=%s selected_delta_norm=%.6g", step_label, math.sqrt(total_delta_sq))
 
 
+def _refresh_prodigy_plus_late_param_group_state(
+    optimizer: torch.optim.Optimizer,
+    *,
+    split_groups: Optional[bool] = None,
+) -> None:
+    """Initialize Prodigy Plus bookkeeping for param groups added after construction."""
+    inner_optimizer = optimizer.optimizer if hasattr(optimizer, "optimizer") else optimizer
+    param_groups = getattr(inner_optimizer, "param_groups", None)
+    defaults = getattr(inner_optimizer, "defaults", None)
+    if not param_groups or not isinstance(defaults, dict):
+        return
+
+    optimizer_module = type(inner_optimizer).__module__
+    is_prodigy_plus = optimizer_module.startswith("prodigyplus") or any(
+        "running_d_numerator" in group or "running_d_denom" in group for group in param_groups
+    )
+    if not is_prodigy_plus:
+        return
+
+    # Match Prodigy Plus semantics for the final pre-step group layout. If
+    # setup adds groups before the first step, honor the requested default;
+    # once training has started, preserve the active split-groups mode.
+    if split_groups is None:
+        default_split_groups = bool(defaults.get("split_groups", False))
+        optimizer_started = bool(getattr(inner_optimizer, "state", None)) or any(
+            group.get("k", 1) != 1 for group in param_groups
+        )
+        if default_split_groups and len(param_groups) > 1 and not optimizer_started:
+            split_groups = True
+        else:
+            for group in param_groups:
+                if "split_groups" in group:
+                    split_groups = bool(group["split_groups"])
+                    break
+            else:
+                split_groups = default_split_groups
+                if split_groups and len(param_groups) == 1:
+                    split_groups = False
+
+    def _first_param_device(group: dict[str, Any]) -> torch.device:
+        for param in group.get("params", []):
+            if isinstance(param, torch.Tensor):
+                return param.device
+        first_group = param_groups[0]
+        tensor = first_group.get("running_d_numerator")
+        if tensor is None:
+            tensor = first_group.get("running_d_denom")
+        if isinstance(tensor, torch.Tensor):
+            return tensor.device
+        return torch.device("cpu")
+
+    groups_requiring_running_state = param_groups if split_groups else param_groups[:1]
+    for group in param_groups:
+        group["split_groups"] = split_groups
+    for group in groups_requiring_running_state:
+        device = _first_param_device(group)
+        if "running_d_numerator" not in group:
+            group["running_d_numerator"] = torch.tensor(0.0, dtype=torch.float32, device=device)
+        if "running_d_denom" not in group:
+            group["running_d_denom"] = torch.tensor(0.0, dtype=torch.float32, device=device)
+
+
 def should_sample_images(args, steps, epoch=None):
     if steps == 0:
         if not args.sample_at_first:
@@ -1542,6 +1604,10 @@ class NetworkTrainer:
         new_network_param_groups, lr_descriptions = self._prepare_network_optimizer_params(args, unwrapped_network)
 
         inner_optimizer = optimizer.optimizer if hasattr(optimizer, "optimizer") else optimizer
+        prodigy_plus_split_groups = next(
+            (bool(group["split_groups"]) for group in inner_optimizer.param_groups if "split_groups" in group),
+            None,
+        )
 
         preserved_extra_groups = []
         preserved_extra_param_ids: set[int] = set()
@@ -1573,6 +1639,7 @@ class NetworkTrainer:
             inner_optimizer.add_param_group(group)
         for group in preserved_extra_groups:
             inner_optimizer.add_param_group(group)
+        _refresh_prodigy_plus_late_param_group_state(inner_optimizer, split_groups=prodigy_plus_split_groups)
 
         for group in inner_optimizer.param_groups:
             if "initial_lr" in group:
@@ -1613,6 +1680,10 @@ class NetworkTrainer:
         new_network_param_groups, lr_descriptions = self._prepare_network_optimizer_params(args, unwrapped_network)
 
         inner_optimizer = optimizer.optimizer if hasattr(optimizer, "optimizer") else optimizer
+        prodigy_plus_split_groups = next(
+            (bool(group["split_groups"]) for group in inner_optimizer.param_groups if "split_groups" in group),
+            None,
+        )
 
         preserved_extra_groups = []
         preserved_extra_param_ids: set[int] = set()
@@ -1642,6 +1713,7 @@ class NetworkTrainer:
             inner_optimizer.add_param_group(group)
         for group in preserved_extra_groups:
             inner_optimizer.add_param_group(group)
+        _refresh_prodigy_plus_late_param_group_state(inner_optimizer, split_groups=prodigy_plus_split_groups)
 
         return lr_descriptions
 
@@ -3315,6 +3387,7 @@ class NetworkTrainer:
                 "weight_decay": 0.0,
                 "group_name": "uncertainty",
             })
+            _refresh_prodigy_plus_late_param_group_state(optimizer)
             logger.info("Added uncertainty log-variance params to optimizer (lr=%.2e)", uncertainty_lr)
 
         def set_trainer_train_mode() -> None:
@@ -3445,6 +3518,7 @@ class NetworkTrainer:
             crepa_params = self._crepa.get_trainable_params()
             if crepa_params:
                 optimizer.add_param_group({"params": crepa_params, "lr": args.learning_rate})
+                _refresh_prodigy_plus_late_param_group_state(optimizer)
                 accelerator.print(f"CREPA: added {sum(p.numel() for p in crepa_params):,} projector params to optimizer")
         if hasattr(self, "_self_flow") and self._self_flow is not None:
             self_flow_params = self._self_flow.get_trainable_params()
@@ -3452,6 +3526,7 @@ class NetworkTrainer:
                 projector_lr = getattr(getattr(self._self_flow, "config", None), "projector_lr", None)
                 effective_projector_lr = float(projector_lr) if projector_lr is not None else float(args.learning_rate)
                 optimizer.add_param_group({"params": self_flow_params, "lr": effective_projector_lr})
+                _refresh_prodigy_plus_late_param_group_state(optimizer)
                 accelerator.print(
                     f"Self-Flow: added {sum(p.numel() for p in self_flow_params):,} projector params to optimizer "
                     f"(lr={effective_projector_lr:g})"
