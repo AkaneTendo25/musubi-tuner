@@ -161,8 +161,8 @@ class PreservationHelper:
         expected_audio_dim = 0
         if av_mode and hasattr(trainer, "_load_ltx2_checkpoint_config"):
             try:
-                cfg = trainer._load_ltx2_checkpoint_config(args)
-                transformer_cfg = cfg.get("transformer", {}) if isinstance(cfg, dict) else {}
+                checkpoint_cfg = trainer._load_ltx2_checkpoint_config(args)
+                transformer_cfg = checkpoint_cfg.get("transformer", {}) if isinstance(checkpoint_cfg, dict) else {}
                 expected_video_dim = int(transformer_cfg.get("cross_attention_dim", 0) or 0)
                 expected_audio_dim = int(transformer_cfg.get("audio_cross_attention_dim", 0) or 0)
             except Exception:
