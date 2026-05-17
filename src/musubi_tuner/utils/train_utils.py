@@ -2,6 +2,7 @@ import argparse
 import json
 import logging
 import os
+import re
 import shutil
 import time
 from typing import Callable
@@ -15,6 +16,7 @@ logging.basicConfig(level=logging.INFO)
 
 
 # checkpointファイル名
+STATE_MANIFEST_NAME = "state_manifest.json"
 RESUME_METADATA_NAME = "resume_metadata.json"
 EPOCH_STATE_NAME = "{}-{:06d}-state"
 EPOCH_FILE_NAME = "{}-{:06d}"
@@ -31,8 +33,10 @@ def save_resume_metadata(state_dir: str, global_step: int, step_in_epoch: int, e
     """Save resume metadata alongside an accelerator state checkpoint."""
     metadata = {"global_step": global_step, "step_in_epoch": step_in_epoch, "epoch": epoch}
     path = os.path.join(state_dir, RESUME_METADATA_NAME)
-    with open(path, "w") as f:
+    tmp_path = path + ".tmp"
+    with open(tmp_path, "w") as f:
         json.dump(metadata, f)
+    os.replace(tmp_path, path)
 
 
 def load_resume_metadata(state_dir: str) -> dict | None:
@@ -45,6 +49,91 @@ def load_resume_metadata(state_dir: str) -> dict | None:
             return json.load(f)
     except Exception:
         return None
+
+
+def save_state_manifest(
+    state_dir: str,
+    *,
+    state_type: str,
+    global_step: int,
+    step_in_epoch: int,
+    epoch: int,
+) -> None:
+    """Write a completion marker after accelerator.save_state() finishes."""
+    path = os.path.join(state_dir, STATE_MANIFEST_NAME)
+    files = sorted(
+        name
+        for name in os.listdir(state_dir)
+        if os.path.isfile(os.path.join(state_dir, name)) and name != STATE_MANIFEST_NAME
+    )
+    manifest = {
+        "format_version": 1,
+        "complete": True,
+        "state_type": state_type,
+        "global_step": int(global_step or 0),
+        "step_in_epoch": int(step_in_epoch or 0),
+        "epoch": int(epoch or 0),
+        "files": files,
+        "saved_at": time.time(),
+    }
+    tmp_path = path + ".tmp"
+    with open(tmp_path, "w") as f:
+        json.dump(manifest, f, indent=2, sort_keys=True)
+    os.replace(tmp_path, path)
+
+
+def load_state_manifest(state_dir: str) -> dict | None:
+    path = os.path.join(state_dir, STATE_MANIFEST_NAME)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path) as f:
+            manifest = json.load(f)
+    except Exception:
+        return None
+    if not isinstance(manifest, dict) or not manifest.get("complete"):
+        return None
+    return manifest
+
+
+def _has_state_payload_files(state_dir: str) -> bool:
+    try:
+        names = os.listdir(state_dir)
+    except OSError:
+        return False
+
+    has_model = any(
+        name in {"model.safetensors", "pytorch_model.bin"} or re.match(r"model_\d+\.(safetensors|bin)$", name)
+        for name in names
+    )
+    has_optimizer = any(name == "optimizer.bin" or re.match(r"optimizer_\d+\.bin$", name) for name in names)
+    return has_model and has_optimizer
+
+
+def is_complete_state_dir(state_dir: str) -> bool:
+    """Return True when a local accelerator state directory still has its required files."""
+    if not os.path.isdir(state_dir):
+        return False
+
+    manifest = load_state_manifest(state_dir)
+    if manifest is not None:
+        files = manifest.get("files")
+        if not isinstance(files, list):
+            return False
+        try:
+            for name in files:
+                if not isinstance(name, str) or not os.path.isfile(os.path.join(state_dir, name)):
+                    return False
+        except OSError:
+            return False
+        return _has_state_payload_files(state_dir)
+
+    metadata_path = os.path.join(state_dir, RESUME_METADATA_NAME)
+    scheduler_path = os.path.join(state_dir, "scheduler.bin")
+    if not os.path.isfile(metadata_path) and not os.path.isfile(scheduler_path):
+        return False
+
+    return _has_state_payload_files(state_dir)
 
 
 def update_resume_metadata(state_dir: str, extra: dict):
@@ -194,6 +283,13 @@ def save_and_remove_state_on_epoch_end(
     state_dir = os.path.join(args.output_dir, EPOCH_STATE_NAME.format(model_name, epoch_no))
     accelerator.save_state(state_dir)
     save_resume_metadata(state_dir, global_step, step_in_epoch, epoch_no)
+    save_state_manifest(
+        state_dir,
+        state_type="epoch",
+        global_step=global_step,
+        step_in_epoch=step_in_epoch,
+        epoch=epoch_no,
+    )
     if args.save_state_to_huggingface:
         logger.info("uploading state to huggingface.")
         huggingface_utils.upload(args, state_dir, "/" + EPOCH_STATE_NAME.format(model_name, epoch_no))
@@ -223,6 +319,13 @@ def save_and_remove_state_stepwise(
     state_dir = os.path.join(args.output_dir, STEP_STATE_NAME.format(model_name, step_no))
     accelerator.save_state(state_dir)
     save_resume_metadata(state_dir, step_no, step_in_epoch, epoch)
+    save_state_manifest(
+        state_dir,
+        state_type="step",
+        global_step=step_no,
+        step_in_epoch=step_in_epoch,
+        epoch=epoch,
+    )
     if args.save_state_to_huggingface:
         logger.info("uploading state to huggingface.")
         huggingface_utils.upload(args, state_dir, "/" + STEP_STATE_NAME.format(model_name, step_no))
@@ -256,6 +359,13 @@ def save_state_on_train_end(
     state_dir = os.path.join(args.output_dir, LAST_STATE_NAME.format(model_name))
     accelerator.save_state(state_dir)
     save_resume_metadata(state_dir, global_step, step_in_epoch, epoch)
+    save_state_manifest(
+        state_dir,
+        state_type="final",
+        global_step=global_step,
+        step_in_epoch=step_in_epoch,
+        epoch=epoch,
+    )
 
     if args.save_state_to_huggingface:
         logger.info("uploading last state to huggingface.")
@@ -284,6 +394,13 @@ def save_state_on_interrupt(
         state_dir = os.path.join(args.output_dir, state_name)
     accelerator.save_state(state_dir)
     save_resume_metadata(state_dir, global_step, step_in_epoch, epoch)
+    save_state_manifest(
+        state_dir,
+        state_type="interrupt",
+        global_step=global_step,
+        step_in_epoch=step_in_epoch,
+        epoch=epoch,
+    )
 
     if args.save_state_to_huggingface:
         logger.info("uploading interrupt state to huggingface.")

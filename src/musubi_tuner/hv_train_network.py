@@ -1802,6 +1802,17 @@ class NetworkTrainer:
             return 0
 
         if not args.resume_from_huggingface:
+            if not train_utils.is_complete_state_dir(args.resume):
+                if getattr(args, "_autoresume_selected", False):
+                    logger.warning(
+                        "autoresume: selected state directory is missing or incomplete, starting from scratch: %s",
+                        args.resume,
+                    )
+                    args.resume = None
+                    self._resume_state_dir = None
+                    return 0
+                raise FileNotFoundError(f"resume state directory is missing or incomplete: {args.resume}")
+
             if getattr(args, "_autoresume_selected", False) and network is not None:
                 unwrapped_network = accelerator.unwrap_model(network)
                 incompatibility = self._local_state_model_incompatibility_reason(unwrapped_network, args.resume)
@@ -1819,7 +1830,18 @@ class NetworkTrainer:
                     return 0
 
             logger.info(f"resume training from local state: {args.resume}")
-            accelerator.load_state(args.resume)
+            try:
+                accelerator.load_state(args.resume)
+            except Exception:
+                if getattr(args, "_autoresume_selected", False) and not train_utils.is_complete_state_dir(args.resume):
+                    logger.warning(
+                        "autoresume: selected state disappeared or became incomplete before loading, starting from scratch: %s",
+                        args.resume,
+                    )
+                    args.resume = None
+                    self._resume_state_dir = None
+                    return 0
+                raise
             self._resume_state_dir = args.resume
             return self._recover_global_step(args.resume)
 
@@ -1895,9 +1917,10 @@ class NetworkTrainer:
     def _find_latest_state_dir(args: argparse.Namespace) -> Optional[str]:
         """Find the latest training state directory in output_dir for --autoresume.
 
-        Scans output_dir for directories ending in '-state' that contain a valid
-        scheduler.bin, reads the global_step from each, and returns the path with
-        the highest step. Works with epoch-based, step-based, and final states.
+        Scans output_dir for directories ending in '-state', reads the
+        global_step from resume_metadata.json or scheduler.bin, and returns the
+        path with the highest step. Works with epoch-based, step-based, final,
+        and interrupt states. Schedule-free optimizers may not save scheduler.bin.
         """
         if not args.output_dir or not os.path.isdir(args.output_dir):
             return None
@@ -1905,31 +1928,39 @@ class NetworkTrainer:
         best_step = -1
         best_path = None
 
-        for entry in os.listdir(args.output_dir):
+        try:
+            entries = os.listdir(args.output_dir)
+        except OSError:
+            return None
+
+        for entry in entries:
             full_path = os.path.join(args.output_dir, entry)
-            if not os.path.isdir(full_path) or not entry.endswith("-state"):
+            if not entry.endswith("-state") or not train_utils.is_complete_state_dir(full_path):
                 continue
 
-            scheduler_path = os.path.join(full_path, "scheduler.bin")
-            if not os.path.exists(scheduler_path):
-                continue
-
-            # Try resume_metadata.json first (new format, only trust non-zero global_step)
-            metadata = train_utils.load_resume_metadata(full_path)
-            if metadata is not None and metadata.get("global_step", 0) > 0:
-                step = int(metadata["global_step"])
+            # Prefer the explicit completion marker, then resume metadata, then old scheduler state.
+            manifest = train_utils.load_state_manifest(full_path)
+            if manifest is not None and manifest.get("global_step", 0) > 0:
+                step = int(manifest["global_step"])
             else:
-                # Fast path: parse step number from step-based directory names
-                step_match = re.search(r"-step(\d+)-state$", entry)
-                if step_match:
-                    step = int(step_match.group(1))
+                metadata = train_utils.load_resume_metadata(full_path)
+                if metadata is not None and metadata.get("global_step", 0) > 0:
+                    step = int(metadata["global_step"])
                 else:
-                    # Epoch-based or final state: read scheduler.bin for actual global_step
-                    try:
-                        scheduler_state = torch.load(scheduler_path, map_location="cpu", weights_only=True)
-                        step = int(scheduler_state["last_epoch"])
-                    except Exception:
-                        continue
+                    # Fast path: parse step number from step-based directory names
+                    step_match = re.search(r"-step(\d+)-state$", entry)
+                    if step_match:
+                        step = int(step_match.group(1))
+                    else:
+                        # Epoch-based or final state: read scheduler.bin for actual global_step
+                        scheduler_path = os.path.join(full_path, "scheduler.bin")
+                        if not os.path.exists(scheduler_path):
+                            continue
+                        try:
+                            scheduler_state = torch.load(scheduler_path, map_location="cpu", weights_only=True)
+                            step = int(scheduler_state["last_epoch"])
+                        except Exception:
+                            continue
 
             if step > best_step:
                 best_step = step
