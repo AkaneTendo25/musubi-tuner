@@ -430,7 +430,7 @@
     "resume_from_huggingface": false,
     "async_upload": false,
     "dataset_manifest": "",
-    "blank_preservation": true,
+    "blank_preservation": false,
     "blank_preservation_args": "",
     "blank_preservation_multiplier": 1,
     "dop": false,
