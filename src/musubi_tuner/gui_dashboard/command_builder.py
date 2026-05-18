@@ -21,6 +21,23 @@ from musubi_tuner.gui_dashboard.toml_export import (
     build_slider_toml_path,
     export_dataset_toml,
 )
+from musubi_tuner.ltx2_sinksgd_defaults import (
+    DEFAULT_CAME_EPS,
+    DEFAULT_LTX2_LR_SCHEDULER,
+    DEFAULT_LTX2_SINKSGD_OPTIMIZER_ARGS,
+    DEFAULT_PRODIGY_PLUS_LR_SCHEDULER,
+    is_prodigy_plus_optimizer,
+    has_key_value_arg,
+    is_came_optimizer,
+    is_sinksgd_optimizer,
+    resolve_ltx2_audio_alpha,
+    resolve_ltx2_learning_rate,
+    resolve_ltx2_network_alpha,
+    resolve_ltx2_optimizer_args,
+    resolve_ltx2_optimizer_type,
+    set_key_value_arg,
+    split_key_value_args,
+)
 
 
 def _find_script(name: str) -> str:
@@ -108,26 +125,90 @@ def _append_network_arg(args_parts: list[str], key: str, value) -> None:
     args_parts.append(f"{key}={value}")
 
 
+def _remove_network_arg(args_parts: list[str], key: str) -> list[str]:
+    prefix = f"{key}="
+    return [part for part in args_parts if not part.startswith(prefix)]
+
+
+def _build_network_args_parts(t) -> list[str]:
+    args_parts = _split_cli_args(t.network_args)
+    for key in ("use_dora", "use_dora_oft", "scaled_oft", "decompose_both"):
+        args_parts = _remove_network_arg(args_parts, key)
+    network_module = _effective_network_module(t.network_module or "")
+    use_lokr_backend = network_module == "networks.lokr"
+    lokr_factor = getattr(t, "lokr_factor", None)
+    if use_lokr_backend and lokr_factor is not None:
+        args_parts = _remove_network_arg(args_parts, "factor")
+    if not t.use_dora_oft:
+        for key in ("oft_block_size", "oft_coft", "coft_eps", "oft_block_share"):
+            args_parts = _remove_network_arg(args_parts, key)
+    use_dora = bool(t.use_dora)
+    if getattr(t, "use_dokr", False):
+        use_dora = True
+    if getattr(t, "use_lokr", False):
+        use_dora = False
+    if not use_lokr_backend and getattr(t, "use_dokr", False):
+        use_dora = False
+
+    _append_network_arg(args_parts, "use_dora", use_dora)
+    _append_network_arg(args_parts, "factor", lokr_factor if use_lokr_backend else None)
+    _append_network_arg(args_parts, "decompose_both", getattr(t, "lokr_decompose_both", False) if use_lokr_backend else None)
+    _append_network_arg(args_parts, "use_dora_oft", t.use_dora_oft)
+    if t.use_dora_oft:
+        _append_network_arg(args_parts, "scaled_oft", True)
+        _append_network_arg(args_parts, "oft_block_size", t.oft_block_size)
+        _append_network_arg(args_parts, "oft_coft", t.oft_coft)
+        _append_network_arg(args_parts, "coft_eps", t.coft_eps if t.oft_coft else None)
+        _append_network_arg(args_parts, "oft_block_share", t.oft_block_share)
+    _append_network_arg(args_parts, "rank_dropout", t.rank_dropout)
+    _append_network_arg(args_parts, "module_dropout", t.module_dropout)
+    _append_network_arg(args_parts, "adaptive_rank", t.adaptive_rank)
+    _append_network_arg(args_parts, "adaptive_rank_target", t.adaptive_rank_target)
+    _append_network_arg(args_parts, "adaptive_rank_min_rank", t.adaptive_rank_min_rank)
+    _append_network_arg(args_parts, "adaptive_rank_init_rank", t.adaptive_rank_init_rank)
+    _append_network_arg(args_parts, "adaptive_rank_quantile", t.adaptive_rank_quantile)
+    _append_network_arg(args_parts, "adaptive_rank_weight", t.adaptive_rank_weight)
+    _append_network_arg(args_parts, "adaptive_rank_budget", t.adaptive_rank_budget)
+    _append_network_arg(args_parts, "adaptive_rank_budget_ratio", t.adaptive_rank_budget_ratio)
+    _append_network_arg(args_parts, "adaptive_rank_budget_weight", t.adaptive_rank_budget_weight)
+    _append_network_arg(args_parts, "adaptive_rank_estimate", t.adaptive_rank_estimate)
+    _append_network_arg(args_parts, "adaptive_rank_estimate_apply", t.adaptive_rank_estimate_apply)
+    _append_network_arg(args_parts, "adaptive_rank_finalize_start", t.adaptive_rank_finalize_start)
+    _append_network_arg(args_parts, "adaptive_rank_finalize_recover_steps", t.adaptive_rank_finalize_recover_steps)
+    _append_network_arg(
+        args_parts,
+        "adaptive_rank_finalize_recover_warmup_steps",
+        t.adaptive_rank_finalize_recover_warmup_steps,
+    )
+    _append_network_arg(args_parts, "adaptive_rank_hard_prune", t.adaptive_rank_hard_prune)
+    _append_network_arg(args_parts, "adaptive_rank_hard_prune_start", t.adaptive_rank_hard_prune_start)
+    _append_network_arg(args_parts, "adaptive_rank_hard_prune_interval", t.adaptive_rank_hard_prune_interval)
+    _append_network_arg(args_parts, "adaptive_rank_hard_prune_min_delta", t.adaptive_rank_hard_prune_min_delta)
+    return args_parts
+
+
 def _append_optional(cmd: list[str], flag: str, value) -> None:
     if value is not None:
         cmd += [flag, str(value)]
 
 
-def _accelerate_executable() -> str:
-    executable_name = "accelerate.exe" if sys.platform == "win32" else "accelerate"
-    executable = Path(sys.executable).parent / executable_name
-    if executable.exists():
-        return str(executable)
-    repo_venv_executable = Path(__file__).resolve().parents[3] / "venv" / ("Scripts" if sys.platform == "win32" else "bin") / executable_name
-    if repo_venv_executable.exists():
-        return str(repo_venv_executable)
-    return "accelerate"
+def _python_executable() -> str:
+    repo_root = Path(__file__).resolve().parents[3]
+    local_candidates = [
+        repo_root / "ltx-2" / ("python.exe" if sys.platform == "win32" else "bin/python"),
+        repo_root / "venv" / ("Scripts/python.exe" if sys.platform == "win32" else "bin/python"),
+        repo_root / ".venv" / ("Scripts/python.exe" if sys.platform == "win32" else "bin/python"),
+    ]
+    for executable in local_candidates:
+        if executable.exists():
+            return str(executable)
+    return sys.executable
 
 
 def _accelerate_launch_prefix(mixed_precision: str, extra_args: str) -> list[str]:
     extra = _split_cli_args(extra_args)
     cmd = [
-        _accelerate_executable(), "launch",
+        _python_executable(), "-u", "-m", "accelerate.commands.accelerate_cli", "launch",
         *extra,
         "--mixed_precision", mixed_precision,
     ]
@@ -153,6 +234,67 @@ def _compile_dynamic_value(value) -> str | None:
     return None
 
 
+def _drop_default_sinksgd_args_for_non_sinksgd(optimizer_type: str, args_parts: list[str]) -> list[str]:
+    if is_sinksgd_optimizer(optimizer_type) or is_prodigy_plus_optimizer(optimizer_type):
+        return args_parts
+    if args_parts == list(DEFAULT_LTX2_SINKSGD_OPTIMIZER_ARGS):
+        return []
+    return args_parts
+
+
+def _apply_came_optimizer_fields(t, optimizer_type: str, args_parts: list[str]) -> list[str]:
+    if not is_came_optimizer(optimizer_type):
+        return args_parts
+    eps1 = getattr(t, "came_eps1", None)
+    eps2 = getattr(t, "came_eps2", None)
+    if eps1 is None and eps2 is None:
+        return args_parts
+
+    eps1 = DEFAULT_CAME_EPS[0] if eps1 is None else float(eps1)
+    eps2 = DEFAULT_CAME_EPS[1] if eps2 is None else float(eps2)
+    return set_key_value_arg(args_parts, "eps", f"({eps1},{eps2})")
+
+
+def _resolved_ltx2_training_defaults(t, network_args_parts: list[str]) -> tuple[str, list[str], float, float | None, float | None]:
+    optimizer_type = resolve_ltx2_optimizer_type(t.optimizer_type)
+    raw_optimizer_args_parts = split_key_value_args(t.optimizer_args)
+    raw_has_orthogonal_sinkhorn = has_key_value_arg(raw_optimizer_args_parts, "orthogonal_sinkhorn")
+    raw_has_compiled_optimizer = has_key_value_arg(raw_optimizer_args_parts, "compiled_optimizer")
+    optimizer_args_parts = resolve_ltx2_optimizer_args(optimizer_type, t.optimizer_args)
+    optimizer_args_parts = _drop_default_sinksgd_args_for_non_sinksgd(optimizer_type, optimizer_args_parts)
+    if is_sinksgd_optimizer(optimizer_type):
+        explicit_toggle = "sinksgd_orthogonal_sinkhorn" in getattr(t, "model_fields_set", set())
+        if explicit_toggle or not raw_has_orthogonal_sinkhorn:
+            optimizer_args_parts = set_key_value_arg(
+                optimizer_args_parts,
+                "orthogonal_sinkhorn",
+                bool(getattr(t, "sinksgd_orthogonal_sinkhorn", True)),
+            )
+        explicit_compiled_toggle = "sinksgd_compiled_optimizer" in getattr(t, "model_fields_set", set())
+        if explicit_compiled_toggle or not raw_has_compiled_optimizer:
+            optimizer_args_parts = set_key_value_arg(
+                optimizer_args_parts,
+                "compiled_optimizer",
+                bool(getattr(t, "sinksgd_compiled_optimizer", False)),
+            )
+    optimizer_args_parts = _apply_came_optimizer_fields(t, optimizer_type, optimizer_args_parts)
+    learning_rate = resolve_ltx2_learning_rate(
+        t.learning_rate,
+        optimizer_type,
+        network_args_parts,
+        use_dora_oft=bool(getattr(t, "use_dora_oft", False)),
+    )
+    network_alpha = resolve_ltx2_network_alpha(t.network_alpha, t.network_dim, optimizer_type, optimizer_args_parts)
+    audio_alpha = resolve_ltx2_audio_alpha(t.audio_alpha, t.audio_dim, optimizer_type, optimizer_args_parts)
+    return optimizer_type, optimizer_args_parts, learning_rate, network_alpha, audio_alpha
+
+
+def _resolved_ltx2_lr_scheduler(optimizer_type: str, lr_scheduler: str | None) -> str:
+    if is_prodigy_plus_optimizer(optimizer_type):
+        return DEFAULT_PRODIGY_PLUS_LR_SCHEDULER
+    return lr_scheduler or DEFAULT_LTX2_LR_SCHEDULER
+
+
 def build_cache_latents_cmd(config: ProjectConfig) -> list[str]:
     """Build CLI args for ltx2_cache_latents.py."""
     toml_path = export_dataset_toml(config)
@@ -162,7 +304,7 @@ def build_cache_latents_cmd(config: ProjectConfig) -> list[str]:
     sample_prompts = _effective_caching_sample_prompts(config)
 
     cmd = [
-        sys.executable,
+        _python_executable(),
         "-u",
         _find_script("ltx2_cache_latents.py"),
         "--dataset_config", str(toml_path),
@@ -249,7 +391,7 @@ def build_cache_text_cmd(config: ProjectConfig) -> list[str]:
     sample_prompts = _effective_caching_sample_prompts(config)
 
     cmd = [
-        sys.executable,
+        _python_executable(),
         "-u",
         _find_script("ltx2_cache_text_encoder_outputs.py"),
         "--dataset_config", str(toml_path),
@@ -325,7 +467,7 @@ def build_inference_cmd(config: ProjectConfig) -> list[str]:
     gemma_root = _effective_gemma_root(config, s.gemma_root, gemma_safetensors)
 
     cmd = [
-        sys.executable,
+        _python_executable(),
         "-u",
         _find_script("ltx2_generate_video.py"),
         "--ltx2_checkpoint", s.ltx2_checkpoint,
@@ -561,21 +703,16 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
     gemma_root = _effective_gemma_root(config, t.gemma_root, gemma_safetensors)
     network_module = _effective_network_module(t.network_module or "")
     sample_prompts = _effective_training_sample_prompts(config)
-    network_args_parts = _split_cli_args(t.network_args)
-
-    _append_network_arg(network_args_parts, "rank_dropout", t.rank_dropout)
-    _append_network_arg(network_args_parts, "module_dropout", t.module_dropout)
-    _append_network_arg(network_args_parts, "adaptive_rank", t.adaptive_rank)
-    _append_network_arg(network_args_parts, "adaptive_rank_target", t.adaptive_rank_target)
-    _append_network_arg(network_args_parts, "adaptive_rank_min_rank", t.adaptive_rank_min_rank)
-    _append_network_arg(network_args_parts, "adaptive_rank_init_rank", t.adaptive_rank_init_rank)
-    _append_network_arg(network_args_parts, "adaptive_rank_quantile", t.adaptive_rank_quantile)
-    _append_network_arg(network_args_parts, "adaptive_rank_weight", t.adaptive_rank_weight)
+    network_args_parts = _build_network_args_parts(t)
+    optimizer_type, optimizer_args_parts, learning_rate, network_alpha, audio_alpha = _resolved_ltx2_training_defaults(
+        t, network_args_parts
+    )
 
     # Use accelerate launch. The Python module form is equivalent to the
     # console script and avoids PATH issues with Windows virtualenvs.
     cmd = _accelerate_launch_prefix(t.mixed_precision, t.accelerate_extra_args)
     cmd.append(_find_script("ltx2_train_network.py"))
+    cmd += ["--mixed_precision", t.mixed_precision]
 
     # Dataset
     if t.config_file:
@@ -657,8 +794,8 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
     cmd += ["--network_module", network_module]
     if t.network_dim is not None:
         cmd += ["--network_dim", str(t.network_dim)]
-    if t.network_alpha != 1:
-        cmd += ["--network_alpha", str(t.network_alpha)]
+    if network_alpha is not None:
+        cmd += ["--network_alpha", str(network_alpha)]
     cmd += ["--lora_target_preset", t.lora_target_preset]
     if t.train_connectors:
         cmd.append("--train_connectors")
@@ -710,12 +847,11 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
         cmd += ["--av_bimodal_scale", str(t.av_bimodal_scale)]
 
     # Optimizer
-    cmd += ["--learning_rate", str(t.learning_rate)]
-    if t.optimizer_type:
-        cmd += ["--optimizer_type", t.optimizer_type]
-    if t.optimizer_args:
-        cmd += ["--optimizer_args"] + _split_cli_args(t.optimizer_args)
-    cmd += ["--lr_scheduler", t.lr_scheduler]
+    cmd += ["--learning_rate", str(learning_rate)]
+    cmd += ["--optimizer_type", optimizer_type]
+    if optimizer_args_parts:
+        cmd += ["--optimizer_args"] + optimizer_args_parts
+    cmd += ["--lr_scheduler", _resolved_ltx2_lr_scheduler(optimizer_type, t.lr_scheduler)]
     cmd += ["--lr_warmup_steps", str(t.lr_warmup_steps)]
     if t.lr_decay_steps is not None:
         cmd += ["--lr_decay_steps", str(t.lr_decay_steps)]
@@ -744,8 +880,8 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
         cmd += ["--lr_group_warmup_args"] + _split_cli_args(t.lr_group_warmup_args)
     if t.audio_dim is not None:
         cmd += ["--audio_dim", str(t.audio_dim)]
-    if t.audio_alpha is not None:
-        cmd += ["--audio_alpha", str(t.audio_alpha)]
+    if audio_alpha is not None:
+        cmd += ["--audio_alpha", str(audio_alpha)]
 
     # Schedule
     if t.max_train_epochs is not None:
@@ -1079,18 +1215,28 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
             args_parts.append(f"teacher_block_idx={t.crepa_teacher_block_idx}")
         if t.crepa_mode == "dino" and t.crepa_dino_model != "dinov2_vitb14":
             args_parts.append(f"dino_model={t.crepa_dino_model}")
-        if t.crepa_lambda != 0.1:
+        if t.crepa_lambda != 0.5:
             args_parts.append(f"lambda_crepa={t.crepa_lambda}")
+        if getattr(t, "crepa_lambda_end", 0.1) != 0.1:
+            args_parts.append(f"crepa_lambda_end={t.crepa_lambda_end}")
         if t.crepa_tau != 1.0:
             args_parts.append(f"tau={t.crepa_tau}")
         if t.crepa_num_neighbors != 2:
             args_parts.append(f"num_neighbors={t.crepa_num_neighbors}")
-        if t.crepa_schedule != "constant":
+        if t.crepa_schedule != "cosine":
             args_parts.append(f"schedule={t.crepa_schedule}")
-        if t.crepa_warmup_steps != 0:
+        if t.crepa_warmup_steps != 100:
             args_parts.append(f"warmup_steps={t.crepa_warmup_steps}")
+        if getattr(t, "crepa_decay_steps", 0) != 0:
+            args_parts.append(f"crepa_decay_steps={t.crepa_decay_steps}")
         if not t.crepa_normalize:
             args_parts.append("normalize=false")
+        if t.crepa_similarity_threshold is None:
+            args_parts.append("crepa_similarity_threshold=off")
+        else:
+            args_parts.append(f"crepa_similarity_threshold={t.crepa_similarity_threshold}")
+        args_parts.append(f"crepa_similarity_ema_decay={t.crepa_similarity_ema_decay}")
+        args_parts.append(f"crepa_threshold_mode={t.crepa_threshold_mode}")
         if args_parts:
             cmd += ["--crepa_args"] + args_parts
 
@@ -1285,6 +1431,22 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
         if args_parts:
             cmd += ["--audio_metrics_args"] + args_parts
 
+    # TREAD token routing
+    if t.tread:
+        cmd.append("--tread")
+        args_parts = []
+        if t.tread_selection_ratio != 0.5:
+            args_parts.append(f"selection_ratio={t.tread_selection_ratio}")
+        if t.tread_start_layer_idx is not None:
+            args_parts.append(f"start_layer_idx={t.tread_start_layer_idx}")
+        if t.tread_end_layer_idx is not None:
+            args_parts.append(f"end_layer_idx={t.tread_end_layer_idx}")
+        cmd += args_parts
+    if t.differential_guidance:
+        cmd.append("--differential_guidance")
+        if t.differential_guidance_scale != 3.0:
+            cmd += ["--differential_guidance_scale", str(t.differential_guidance_scale)]
+
     # Audio features
     if t.audio_loss_balance_mode != "none":
         cmd += ["--audio_loss_balance_mode", t.audio_loss_balance_mode]
@@ -1395,6 +1557,11 @@ def build_slider_training_cmd(config: ProjectConfig) -> list[str]:
     ltx2_checkpoint = _effective_ltx2_checkpoint(config, t.ltx2_checkpoint)
     gemma_safetensors = _effective_gemma_safetensors(config, t.gemma_safetensors)
     gemma_root = _effective_gemma_root(config, t.gemma_root, gemma_safetensors)
+    network_module = _effective_network_module(t.network_module or "")
+    network_args_parts = _build_network_args_parts(t)
+    optimizer_type, optimizer_args_parts, learning_rate, network_alpha, _audio_alpha = _resolved_ltx2_training_defaults(
+        t, network_args_parts
+    )
 
     cmd = _accelerate_launch_prefix(t.mixed_precision, s.accelerate_extra_args)
     cmd.append(_find_script("ltx2_train_slider.py"))
@@ -1443,17 +1610,21 @@ def build_slider_training_cmd(config: ProjectConfig) -> list[str]:
         cmd += ["--sample_slider_range", s.sample_slider_range]
 
     # LoRA — from training config
+    cmd += ["--network_module", network_module]
     if t.network_dim is not None:
         cmd += ["--network_dim", str(t.network_dim)]
-    if t.network_alpha != 1:
-        cmd += ["--network_alpha", str(t.network_alpha)]
+    if network_alpha is not None:
+        cmd += ["--network_alpha", str(network_alpha)]
+    if t.lora_target_preset:
+        cmd += ["--lora_target_preset", t.lora_target_preset]
+    if network_args_parts:
+        cmd += ["--network_args"] + network_args_parts
 
     # Optimizer — from training config
-    cmd += ["--learning_rate", str(t.learning_rate)]
-    if t.optimizer_type:
-        cmd += ["--optimizer_type", t.optimizer_type]
-    if t.optimizer_args:
-        cmd += ["--optimizer_args"] + _split_cli_args(t.optimizer_args)
+    cmd += ["--learning_rate", str(learning_rate)]
+    cmd += ["--optimizer_type", optimizer_type]
+    if optimizer_args_parts:
+        cmd += ["--optimizer_args"] + optimizer_args_parts
     cmd += ["--gradient_accumulation_steps", str(t.gradient_accumulation_steps)]
     cmd += ["--max_grad_norm", str(t.max_grad_norm)]
 
@@ -1474,6 +1645,38 @@ def build_slider_training_cmd(config: ProjectConfig) -> list[str]:
         cmd += ["--output_name", s.output_name]
     if t.save_every_n_steps:
         cmd += ["--save_every_n_steps", str(t.save_every_n_steps)]
+    if t.save_last_n_steps is not None:
+        cmd += ["--save_last_n_steps", str(t.save_last_n_steps)]
+    if t.save_last_n_steps_state is not None:
+        cmd += ["--save_last_n_steps_state", str(t.save_last_n_steps_state)]
+    if t.save_state:
+        cmd.append("--save_state")
+    if t.save_state_on_train_end:
+        cmd.append("--save_state_on_train_end")
+    if t.save_checkpoint_metadata:
+        cmd.append("--save_checkpoint_metadata")
+    if t.no_metadata:
+        cmd.append("--no_metadata")
+    if t.no_convert_to_comfy:
+        cmd.append("--no_convert_to_comfy")
+
+    # HuggingFace upload — from training config
+    if t.huggingface_repo_id:
+        cmd += ["--huggingface_repo_id", t.huggingface_repo_id]
+    if t.huggingface_repo_type:
+        cmd += ["--huggingface_repo_type", t.huggingface_repo_type]
+    if t.huggingface_path_in_repo:
+        cmd += ["--huggingface_path_in_repo", t.huggingface_path_in_repo]
+    if t.huggingface_token:
+        cmd += ["--huggingface_token", t.huggingface_token]
+    if t.huggingface_repo_visibility:
+        cmd += ["--huggingface_repo_visibility", t.huggingface_repo_visibility]
+    if t.save_state_to_huggingface:
+        cmd.append("--save_state_to_huggingface")
+    if t.resume_from_huggingface:
+        cmd.append("--resume_from_huggingface")
+    if t.async_upload:
+        cmd.append("--async_upload")
 
     cmd += _split_cli_args(s.extra_args)
     return cmd
@@ -1486,7 +1689,7 @@ def build_cache_dino_cmd(config: ProjectConfig) -> list[str]:
     t = config.training
 
     cmd = [
-        sys.executable,
+        _python_executable(),
         "-u",
         _find_script("ltx2_cache_dino_features.py"),
         "--dataset_config", str(toml_path),

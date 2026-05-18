@@ -19,7 +19,7 @@ import pyarrow.parquet as pq
 
 from musubi_tuner.gui_dashboard.process_manager import ProcessManager
 from musubi_tuner.gui_dashboard.project_schema import ProjectConfig
-from musubi_tuner.gui_dashboard.routers import datasets, filesystem, processes, projects, stats, system
+from musubi_tuner.gui_dashboard.routers import datasets, filesystem, processes, projects, stats, system, tools
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +29,33 @@ NO_CACHE_HEADERS = {
     "Pragma": "no-cache",
     "Expires": "0",
 }
+
+
+def _clean_metric_rows(rows: list[dict]) -> list[dict]:
+    """Return dashboard rows with resumed-overlap steps deduplicated.
+
+    Metrics are appended to a single file across resumed attempts. When a run is
+    restarted from an earlier global step, old rows for the same step can coexist
+    with newer rows and make charts show stale LR/loss values. Dict insertion
+    order lets the later physical row replace the earlier one while keeping the
+    chart ordered by step.
+    """
+
+    rows_by_step: dict[int, dict] = {}
+    fallback_rows: list[dict] = []
+    for row in rows:
+        clean_row = {}
+        for key, value in row.items():
+            if isinstance(value, float) and math.isnan(value):
+                clean_row[key] = None
+            else:
+                clean_row[key] = value
+        step = clean_row.get("step")
+        if isinstance(step, int):
+            rows_by_step[step] = clean_row
+        else:
+            fallback_rows.append(clean_row)
+    return fallback_rows + [rows_by_step[step] for step in sorted(rows_by_step)]
 
 
 def create_management_app(project_path: Optional[str] = None, dev_frontend_url: Optional[str] = None) -> FastAPI:
@@ -60,6 +87,7 @@ def create_management_app(project_path: Optional[str] = None, dev_frontend_url: 
     app.include_router(filesystem.router)
     app.include_router(system.router)
     app.include_router(stats.router)
+    app.include_router(tools.router)
 
     # Metrics router — dynamically bound to training output_dir
     @app.get("/data/metrics.parquet")
@@ -110,15 +138,7 @@ def create_management_app(project_path: Optional[str] = None, dev_frontend_url: 
             return Response(status_code=204)
         try:
             table = pq.read_table(path)
-            rows = []
-            for row in table.to_pylist():
-                clean_row = {}
-                for key, value in row.items():
-                    if isinstance(value, float) and math.isnan(value):
-                        clean_row[key] = None
-                    else:
-                        clean_row[key] = value
-                rows.append(clean_row)
+            rows = _clean_metric_rows(table.to_pylist())
             return JSONResponse({"rows": rows}, headers=NO_CACHE_HEADERS)
         except Exception:
             return Response(status_code=204)

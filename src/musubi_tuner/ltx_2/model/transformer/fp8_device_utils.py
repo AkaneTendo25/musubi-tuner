@@ -173,6 +173,15 @@ def ensure_fp8_modules_on_device(module: torch.nn.Module, target_device: torch.d
                     if isinstance(lora_up_weight, torch.Tensor) and lora_up_weight.device != target_device:
                         lora_up.to(target_device)
 
+                # Native LoKr/DoKr modules store adapter tensors directly as parameters.
+                if forward_self.__class__.__module__.startswith("musubi_tuner.networks.lokr"):
+                    for param in forward_self.parameters(recurse=True):
+                        if isinstance(param, torch.Tensor) and param.device != target_device:
+                            param.data = param.data.to(device=target_device)
+                    for buf in forward_self.buffers(recurse=True):
+                        if isinstance(buf, torch.Tensor) and buf.device != target_device:
+                            buf.data = buf.data.to(device=target_device)
+
 
 
 def move_fp8_scale_weights(module: torch.nn.Module, target_device: torch.device) -> None:

@@ -114,6 +114,22 @@ accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 src/mus
     --output_dir path/to/output --output_name my-lokr
 ```
 
+### DokR
+
+DokR combines LoKr with DoRA-style magnitude learning. Use the LoKr network module and enable DoRA inside it:
+
+```bash
+accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 src/musubi_tuner/hv_train_network.py \
+    --dit path/to/dit \
+    --dataset_config path/to/toml \
+    --sdpa --mixed_precision bf16 --fp8_base \
+    --optimizer_type adamw8bit --learning_rate 2e-4 --gradient_checkpointing \
+    --network_module networks.lokr --network_dim 32 --network_alpha 16 \
+    --network_args "use_dora=true" \
+    --max_train_epochs 16 --save_every_n_epochs 1 \
+    --output_dir path/to/output --output_name my-dokr
+```
+
 Replace `hv_train_network.py` with the appropriate training script for your architecture (e.g., `wan_train_network.py`, `fpack_train_network.py`, etc.).
 
 <details>
@@ -136,6 +152,8 @@ The following `--network_args` options are available for both LoHa and LoKr, sam
 | `include_patterns=[r'...']` | Include only modules matching the regex patterns |
 
 See [Advanced configuration](advanced_config.md) for details on how to specify `network_args`.
+
+For DokR, add `use_dora=true` to `--network_args`. DoRA-OFT is a separate native OFT mode and should be trained with the LoRA backend, for example `--network_module networks.lora_ltx2 --network_args "use_dora_oft=true" "scaled_oft=true"`.
 
 <details>
 <summary>日本語</summary>
@@ -331,7 +349,11 @@ LoHa/LoKrのネイティブサポートがあるアーキテクチャ（上記�
 
 ### Format conversion / フォーマット変換
 
-`convert_lora.py` is extended to also support format conversion of LoHa/LoKr weights between Musubi Tuner format and Diffusers format for ComfyUI.
+`convert_lora.py` is extended to also support format conversion of LoHa/LoKr/DokR weights between Musubi Tuner format and Diffusers format for ComfyUI.
+
+For LTX-2 training-time Comfy export, non-OFT DokR checkpoints keep native ComfyUI LoKr tensors and translate Musubi's magnitude vector to ComfyUI `dora_scale` using the live base transformer. Converting an arbitrary standalone LTX-2 non-OFT DokR checkpoint to ComfyUI format without the base model is not supported.
+
+DoRA-OFT / DoKr-OFT exports preserve Musubi `*.oft_R.*` rotation tensors. They require Musubi's loader path or a patched/custom ComfyUI loader; stock ComfyUI's OFT loader expects `*.oft_blocks` and does not apply these native LTX OFT rotations.
 
 <details>
 <summary>日本語</summary>

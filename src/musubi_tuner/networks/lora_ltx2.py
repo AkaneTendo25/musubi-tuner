@@ -3,8 +3,9 @@ from __future__ import annotations
 import ast
 import logging
 import types
+import warnings
 from dataclasses import replace
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Union
 
 import torch
 import torch.nn as nn
@@ -374,6 +375,14 @@ class LTX2Wrapper(nn.Module):
         additive_mask = (attention_mask - 1).to(dtype).reshape(
             (attention_mask.shape[0], 1, -1, attention_mask.shape[-1])
         ) * torch.finfo(dtype).max
+        binary_mask = (additive_mask[:, 0, 0, :] >= 0).to(torch.int32)
+        sort_idx = torch.argsort(binary_mask, dim=-1, descending=True, stable=True)
+        reordered_binary = torch.gather(binary_mask, 1, sort_idx)
+        additive_mask = (reordered_binary.to(dtype) - 1) * torch.finfo(dtype).max
+        additive_mask = additive_mask[:, None, None, :]
+        video_features = torch.gather(video_features, 1, sort_idx.unsqueeze(-1).expand_as(video_features))
+        if audio_features is not None:
+            audio_features = torch.gather(audio_features, 1, sort_idx.unsqueeze(-1).expand_as(audio_features))
 
         encoded, encoded_mask = self.embeddings_connector(video_features, additive_mask)
         mask_int = (encoded_mask < 0.000001).to(torch.int64)
@@ -510,6 +519,7 @@ class LTX2Wrapper(nn.Module):
         video_timesteps = None
         video_positions = None
         a2v_cross_attention_mask = None
+        force_keep_mask = None
         if model_video_enabled:
             video_tokens = self._video_patchifier.patchify(video_latents)
             video_seq_len = video_tokens.shape[1]
@@ -562,6 +572,17 @@ class LTX2Wrapper(nn.Module):
                         )
                     video_positions = video_positions_override.to(device=video_positions.device, dtype=video_positions.dtype)
                 a2v_cross_attention_mask = transformer_options.get("a2v_cross_attention_mask")
+                force_keep_mask = transformer_options.get("force_keep_mask")
+                if force_keep_mask is not None:
+                    if not isinstance(force_keep_mask, torch.Tensor):
+                        raise TypeError(f"Expected force_keep_mask to be a torch.Tensor, got: {type(force_keep_mask)}")
+                    if force_keep_mask.dim() > 2:
+                        force_keep_mask = force_keep_mask.view(force_keep_mask.shape[0], -1)
+                    if force_keep_mask.shape != (bsz, video_seq_len):
+                        raise ValueError(
+                            f"force_keep_mask shape mismatch: got {tuple(force_keep_mask.shape)}, expected {(bsz, video_seq_len)}"
+                        )
+                    force_keep_mask = force_keep_mask.to(device=video_tokens.device, dtype=torch.bool)
 
         # Keyframe guide tokens appended to the video stream. Per-token
         # denoise_mask = 1 - strength → effective timestep = mask * sigma:
@@ -587,6 +608,18 @@ class LTX2Wrapper(nn.Module):
                         device=video_timesteps.device, dtype=video_timesteps.dtype
                     )
                     video_timesteps = torch.cat([video_timesteps, extra_ts], dim=1)
+                    if force_keep_mask is None:
+                        force_keep_mask = torch.zeros(
+                            (bsz, video_seq_len),
+                            device=video_tokens.device,
+                            dtype=torch.bool,
+                        )
+                    appended_force_keep = torch.ones(
+                        (bsz, appended_video_token_count),
+                        device=force_keep_mask.device,
+                        dtype=torch.bool,
+                    )
+                    force_keep_mask = torch.cat([force_keep_mask, appended_force_keep], dim=1)
 
         # Connector LoRA: run connectors on pre-connector features if available
         if (
@@ -633,6 +666,7 @@ class LTX2Wrapper(nn.Module):
                 context_mask=attention_mask,
                 attention_mask=video_self_attention_mask,
                 a2v_cross_attention_mask=a2v_cross_attention_mask,
+                force_keep_mask=force_keep_mask,
             )
 
         audio_modality = None
@@ -788,11 +822,27 @@ def load_ltx2_transformer(
     )
 
     configurator = LTXModelConfigurator if audio_video else LTXVideoOnlyModelConfigurator
-    return SingleGPUModelBuilder(
+    builder = SingleGPUModelBuilder(
         model_path=str(model_path),
         model_class_configurator=configurator,
         model_sd_ops=LTXV_MODEL_COMFY_RENAMING_MAP,
-    ).build(device=device, dtype=dtype)
+    )
+    config = builder.model_config()
+    if not config.get("transformer", {}).get("apply_gated_attention", False):
+        from safetensors import safe_open
+
+        with safe_open(str(model_path), framework="pt") as f:
+            if any("to_gate_logits" in key for key in f.keys()):
+                config.setdefault("transformer", {})
+                config["transformer"]["apply_gated_attention"] = True
+
+    meta_model = builder.meta_model(config, builder.module_ops)
+    model_state_dict = builder.load_sd([str(model_path)], sd_ops=builder.model_sd_ops, registry=builder.registry, device=device)
+    sd = model_state_dict.sd
+    if dtype is not None:
+        sd = {key: value.to(dtype=dtype) for key, value in sd.items()}
+    meta_model.load_state_dict(sd, strict=False, assign=True)
+    return builder._return_model(meta_model, device)
 
 
 def load_ltx2_wrapper(
@@ -898,13 +948,13 @@ LTX2_INCLUDE_PATTERNS_AUDIO_V2A = [
     r".*\.video_to_audio_attn\.to_out\.0$",
 ]
 
-# audio_ref_only_ic: ID-LoRA-style audio-reference IC preset.
+# audio_ref_ic: ID-LoRA-style audio-reference IC preset.
 # Targets audio self/cross-attn, audio FFN, and BOTH AV cross-modal directions.
 # Mirrors ID-LoRA target_modules:
 #   - audio_attn1 / audio_attn2
 #   - audio_ff
 #   - audio_to_video_attn / video_to_audio_attn
-LTX2_INCLUDE_PATTERNS_AUDIO_REF_ONLY_IC = [
+LTX2_INCLUDE_PATTERNS_AUDIO_REF_IC = [
     r".*\.audio_attn1\.to_k$",
     r".*\.audio_attn1\.to_q$",
     r".*\.audio_attn1\.to_v$",
@@ -959,6 +1009,13 @@ LTX2_INCLUDE_PATTERNS_VIDEO_SA_CA_FF = [
     r".*\.ff\.net\.2$",
 ]
 
+# character_training: video feed-forward only in mid/late transformer blocks
+# Targets transformer_blocks.20 through transformer_blocks.40 inclusive.
+LTX2_INCLUDE_PATTERNS_CHARACTER_TRAINING = [
+    r".*transformer_blocks\.(?:2[0-9]|3[0-9]|40)\.ff\.net\.0\.proj$",
+    r".*transformer_blocks\.(?:2[0-9]|3[0-9]|40)\.ff\.net\.2$",
+]
+
 # full: All linear layers in transformer blocks
 # Maximum expressiveness, but larger LoRA file and more VRAM usage.
 LTX2_INCLUDE_PATTERNS_FULL = None  # None means no filtering, all Linear layers matched
@@ -971,9 +1028,10 @@ LTX2_LORA_TARGET_PRESETS = {
     "video_sa": LTX2_INCLUDE_PATTERNS_VIDEO_SA,
     "video_sa_ff": LTX2_INCLUDE_PATTERNS_VIDEO_SA_FF,
     "video_sa_ca_ff": LTX2_INCLUDE_PATTERNS_VIDEO_SA_CA_FF,
+    "character_training": LTX2_INCLUDE_PATTERNS_CHARACTER_TRAINING,
     "audio": LTX2_INCLUDE_PATTERNS_AUDIO,
     "audio_v2a": LTX2_INCLUDE_PATTERNS_AUDIO_V2A,
-    "audio_ref_only_ic": LTX2_INCLUDE_PATTERNS_AUDIO_REF_ONLY_IC,
+    "audio_ref_ic": LTX2_INCLUDE_PATTERNS_AUDIO_REF_IC,
     "av_ic": LTX2_INCLUDE_PATTERNS_V2V,  # superset: all attn (video+audio+cross-modal) + video FFN + audio FFN
     "video_ref_only_av": LTX2_INCLUDE_PATTERNS_V2V,  # AV target generation with video-reference conditioning only
     "full": LTX2_INCLUDE_PATTERNS_FULL,
@@ -981,6 +1039,27 @@ LTX2_LORA_TARGET_PRESETS = {
 
 # Default preset (for backwards compatibility)
 LTX2_DEFAULT_INCLUDE_PATTERNS = LTX2_INCLUDE_PATTERNS_T2V
+
+
+def _parse_pattern_list(raw_patterns: Optional[Union[str, List[str]]], option_name: str) -> Optional[List[str]]:
+    if raw_patterns is None:
+        return None
+    if isinstance(raw_patterns, list):
+        return raw_patterns
+    if not isinstance(raw_patterns, str):
+        raise ValueError(f"{option_name} must be a list or a Python list literal string")
+    if raw_patterns.strip() == "":
+        return None
+
+    with warnings.catch_warnings():
+        # Regex escapes like \. are valid for re.compile but noisy inside Python
+        # string literals parsed by ast.literal_eval on Python 3.12+.
+        warnings.simplefilter("ignore", SyntaxWarning)
+        patterns = ast.literal_eval(raw_patterns)
+
+    if not isinstance(patterns, list):
+        raise ValueError(f"{option_name} must evaluate to a list")
+    return patterns
 
 
 def _build_exclude_patterns(
@@ -999,9 +1078,9 @@ def _build_exclude_patterns(
         ])
     if raw_patterns is None:
         return patterns
-    user_patterns = ast.literal_eval(raw_patterns)
-    if not isinstance(user_patterns, list):
-        raise ValueError("exclude_patterns must evaluate to a list")
+    user_patterns = _parse_pattern_list(raw_patterns, "exclude_patterns")
+    if user_patterns is None:
+        return patterns
     patterns.extend(user_patterns)
     return patterns
 
@@ -1105,10 +1184,11 @@ def create_arch_network(
         if lora_target_preset is not None:
             logger.info(f"Using LoRA target preset '{lora_target_preset}' with patterns: {preset_patterns}")
     else:
+        kwargs["include_patterns"] = _parse_pattern_list(kwargs.get("include_patterns"), "include_patterns")
         if lora_target_preset is not None:
-            logger.warning(
-                f"Both lora_target_preset='{lora_target_preset}' and include_patterns are set. "
-                "Using explicit include_patterns, ignoring preset."
+            logger.info(
+                "Explicit include_patterns set; ignoring lora_target_preset='%s'.",
+                lora_target_preset,
             )
 
     # Handle LoftQ: loftq_data is pre-computed from full-precision weights
@@ -1189,7 +1269,6 @@ def load_connectors_from_checkpoint(
     """
     from musubi_tuner.ltx_2.text_encoders.gemma.embeddings_connector import (
         AudioEmbeddings1DConnectorConfigurator,
-        Embeddings1DConnector,
         Embeddings1DConnectorConfigurator,
     )
 

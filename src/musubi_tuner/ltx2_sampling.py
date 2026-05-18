@@ -149,12 +149,12 @@ def _decode_subprocess_output(data: bytes | None) -> str:
 
 
 def infer_ic_lora_strategy_from_preset(lora_target_preset: Optional[str]) -> str:
-    """Infer IC-LoRA strategy from LoRA target preset for backward-compatible auto mode."""
+    """Infer IC-LoRA strategy from LoRA target preset."""
     preset = str(lora_target_preset or "").lower()
     if preset == "v2v":
         return "v2v"
-    if preset == "audio_ref_only_ic":
-        return "audio_ref_only_ic"
+    if preset == "audio_ref_ic":
+        return "audio_ref_ic"
     if preset == "av_ic":
         return "av_ic"
     if preset == "video_ref_only_av":
@@ -611,7 +611,7 @@ class LTX2SamplingMixin:
 
             expected_negative = _normalize_text(param.get("negative_prompt", ""))
             cached_negative = _normalize_text(cache_entry.get("negative_prompt", ""))
-            if expected_negative != cached_negative:
+            if (requires_negative_embed or expected_negative) and expected_negative != cached_negative:
                 raise ValueError(
                     "Negative prompt mismatch with precached embeddings at index "
                     f"{idx} ({cache_path}). Rebuild sample prompt cache or disable "
@@ -1785,8 +1785,8 @@ class LTX2SamplingMixin:
             )
             or "none"
         ).lower()
-        audio_ref_only_sampling = (
-            resolved_ic_strategy == "audio_ref_only_ic"
+        audio_ref_ic_sampling = (
+            resolved_ic_strategy == "audio_ref_ic"
             and self._ltx_mode in {"av", "audio"}
             and isinstance(ref_audio_latent, torch.Tensor)
         )
@@ -1801,14 +1801,14 @@ class LTX2SamplingMixin:
             and self._ltx_mode == "av"
             and v2v_ref_latent is not None
         )
-        if isinstance(ref_audio_latent, torch.Tensor) and resolved_ic_strategy not in ("audio_ref_only_ic", "av_ic"):
+        if isinstance(ref_audio_latent, torch.Tensor) and resolved_ic_strategy not in ("audio_ref_ic", "av_ic"):
             logger.warning(
                 "Audio-ref latent provided but --ic_lora_strategy is '%s'; sample will ignore reference audio.",
                 resolved_ic_strategy,
             )
             ref_audio_latent = None
-            audio_ref_only_sampling = False
-        force_audio_conditioning = audio_ref_only_sampling or av_ic_sampling or video_ref_only_av_sampling
+            audio_ref_ic_sampling = False
+        force_audio_conditioning = audio_ref_ic_sampling or av_ic_sampling or video_ref_only_av_sampling
 
         # Only load audio components here if NOT in offloading mode and not pre-loaded
         # In offloading mode with subprocess enabled (default), audio is decoded in a subprocess.
@@ -2245,15 +2245,15 @@ class LTX2SamplingMixin:
                     f"Expected ref_audio_latents to be 4D [B, C, T, F], got shape: {tuple(ref_audio_latents.shape)}"
                 )
 
-        if ref_audio_latents is not None and resolved_ic_strategy not in ("audio_ref_only_ic", "av_ic"):
+        if ref_audio_latents is not None and resolved_ic_strategy not in ("audio_ref_ic", "av_ic"):
             logger.warning(
                 "Sampling: reference-audio latents provided but --ic_lora_strategy is '%s'; ignoring ref-audio conditioning.",
                 resolved_ic_strategy,
             )
             ref_audio_latents = None
 
-        audio_ref_only_ic_sampling = (
-            resolved_ic_strategy == "audio_ref_only_ic"
+        audio_ref_ic_sampling = (
+            resolved_ic_strategy == "audio_ref_ic"
             and self._ltx_mode in {"av", "audio"}
             and ref_audio_latents is not None
         )
@@ -2282,7 +2282,7 @@ class LTX2SamplingMixin:
                 prompt_mask = None
 
         enable_audio_preview = bool(enable_audio_preview)
-        if not enable_audio_preview and not audio_ref_only_ic_sampling and not av_ic_sampling and not video_ref_only_av_sampling:
+        if not enable_audio_preview and not audio_ref_ic_sampling and not av_ic_sampling and not video_ref_only_av_sampling:
             expected_embed_dim = None
             try:
                 caption_proj = getattr(transformer, "caption_projection", None)
@@ -2677,7 +2677,7 @@ class LTX2SamplingMixin:
         audio_latents = None
         ref_audio_latents_device = None
         ref_audio_seq_len = 0
-        if enable_audio_preview or audio_ref_only_ic_sampling or video_ref_only_av_sampling:
+        if enable_audio_preview or audio_ref_ic_sampling or video_ref_only_av_sampling:
             frame_rate = sample_parameter.get("frame_rate", 25)
             video_shape = VideoPixelShape(
                 batch=1,
@@ -2708,9 +2708,9 @@ class LTX2SamplingMixin:
                 generator=generator,
             )
 
-            if audio_ref_only_ic_sampling:
+            if audio_ref_ic_sampling:
                 if ref_audio_latents is None:
-                    raise ValueError("audio_ref_only_ic sampling requires reference-audio latents")
+                    raise ValueError("audio_ref_ic sampling requires reference-audio latents")
                 ref_audio_latents_device = ref_audio_latents.to(device=transformer_device, dtype=torch.float32)
                 if int(ref_audio_latents_device.shape[0]) != int(audio_latents.shape[0]):
                     raise ValueError(
@@ -2727,7 +2727,7 @@ class LTX2SamplingMixin:
 
         # Identity guidance setup
         _identity_guidance_scale = 0.0
-        if audio_ref_only_ic_sampling and ref_audio_seq_len > 0:
+        if audio_ref_ic_sampling and ref_audio_seq_len > 0:
             _identity_guidance_scale = float(getattr(args, "audio_ref_identity_guidance_scale", 0.0) or 0.0)
             if _identity_guidance_scale > 0.0:
                 logger.info(
@@ -2794,7 +2794,7 @@ class LTX2SamplingMixin:
         )
         if sampler_name == "res_2s" and (
             audio_latents is not None
-            or audio_ref_only_ic_sampling
+            or audio_ref_ic_sampling
             or av_ic_sampling
             or video_ref_only_av_sampling
         ):
@@ -2914,8 +2914,8 @@ class LTX2SamplingMixin:
                 audio_model_input = None
                 audio_timestep_for_model = None
                 if audio_latents is not None:
-                    if audio_ref_only_ic_sampling and ref_audio_latents_device is not None and ref_audio_seq_len > 0:
-                        combined_audio = torch.cat([ref_audio_latents_device, audio_latents], dim=2)
+                    if audio_ref_ic_sampling and ref_audio_latents_device is not None and ref_audio_seq_len > 0:
+                        combined_audio = torch.cat([audio_latents, ref_audio_latents_device], dim=2)
                         audio_model_input = (
                             torch.cat([combined_audio, combined_audio], dim=0)
                             if do_classifier_free_guidance
@@ -2933,7 +2933,7 @@ class LTX2SamplingMixin:
                             device=transformer_device,
                             dtype=dit_dtype,
                         )
-                        audio_timestep_for_model = torch.cat([ref_audio_timestep, target_audio_timestep], dim=1)
+                        audio_timestep_for_model = torch.cat([target_audio_timestep, ref_audio_timestep], dim=1)
                         if do_classifier_free_guidance:
                             audio_timestep_for_model = audio_timestep_for_model.repeat(2, 1)
                     else:
@@ -2965,7 +2965,7 @@ class LTX2SamplingMixin:
                     resolved_transformer_options["keyframe_guides"] = kf_for_main
 
                 if (
-                    audio_ref_only_ic_sampling
+                    audio_ref_ic_sampling
                     and audio_model_input is not None
                     and ref_audio_seq_len > 0
                 ):
@@ -3014,12 +3014,12 @@ class LTX2SamplingMixin:
                 else:
                     video_pred = model_pred
 
-                if audio_ref_only_ic_sampling and audio_pred is not None and ref_audio_seq_len > 0:
+                if audio_ref_ic_sampling and audio_pred is not None and ref_audio_seq_len > 0:
                     if int(audio_pred.shape[2]) <= ref_audio_seq_len:
                         raise ValueError(
                             f"audio_pred length {audio_pred.shape[2]} is too short for ref_audio_seq_len={ref_audio_seq_len}"
                         )
-                    audio_pred = audio_pred[:, :, ref_audio_seq_len:, :]
+                    audio_pred = audio_pred[:, :, : int(audio_latents.shape[2]), :]
 
                 # IMPORTANT: Convert velocity to x0 FIRST, then apply CFG to x0
                 # X0Model wraps the velocity model before guidance is applied.
@@ -3108,7 +3108,7 @@ class LTX2SamplingMixin:
                     if kf_for_bimodal is not None:
                         bimodal_options["keyframe_guides"] = kf_for_bimodal
                     if (
-                        audio_ref_only_ic_sampling
+                        audio_ref_ic_sampling
                         and audio_model_input is not None
                         and ref_audio_seq_len > 0
                     ):
@@ -3133,12 +3133,12 @@ class LTX2SamplingMixin:
                     bm_video = latents.to(dtype=dit_dtype)
                     bm_video_ts = sigma.expand(1).to(device=transformer_device, dtype=dit_dtype)
 
-                    if audio_ref_only_ic_sampling and ref_audio_latents_device is not None and ref_audio_seq_len > 0:
-                        bm_audio_input = torch.cat([ref_audio_latents_device, audio_latents], dim=2).to(dtype=dit_dtype)
+                    if audio_ref_ic_sampling and ref_audio_latents_device is not None and ref_audio_seq_len > 0:
+                        bm_audio_input = torch.cat([audio_latents, ref_audio_latents_device], dim=2).to(dtype=dit_dtype)
                         tgt_seq = int(audio_latents.shape[2])
                         bm_tgt_ts = sigma.expand(tgt_seq).view(1, -1).to(device=transformer_device, dtype=dit_dtype)
                         bm_ref_ts = torch.zeros((1, ref_audio_seq_len), device=transformer_device, dtype=dit_dtype)
-                        bm_audio_ts = torch.cat([bm_ref_ts, bm_tgt_ts], dim=1)
+                        bm_audio_ts = torch.cat([bm_tgt_ts, bm_ref_ts], dim=1)
                     elif audio_latents is not None:
                         bm_audio_input = audio_latents.to(dtype=dit_dtype)
                         bm_audio_ts = sigma.expand(int(audio_latents.shape[2])).view(1, -1).to(
@@ -3177,8 +3177,8 @@ class LTX2SamplingMixin:
 
                     # Bimodal delta for audio
                     if bm_audio_pred is not None and aud_x0_cond is not None:
-                        if audio_ref_only_ic_sampling and ref_audio_seq_len > 0:
-                            bm_audio_pred = bm_audio_pred[:, :, ref_audio_seq_len:, :]
+                        if audio_ref_ic_sampling and ref_audio_seq_len > 0:
+                            bm_audio_pred = bm_audio_pred[:, :, : int(audio_latents.shape[2]), :]
                         bm_audio_pred = bm_audio_pred.to(dtype=audio_latents.dtype)
                         bm_aud_x0_cond = X0PredictionWrapper.velocity_to_x0(
                             audio_latents, bm_audio_pred, sigma.item()
@@ -3202,7 +3202,7 @@ class LTX2SamplingMixin:
                         _stg_mode_arg in ("audio", "both")
                         and audio_pred is not None
                         and audio_latents is not None
-                        and not audio_ref_only_ic_sampling
+                        and not audio_ref_ic_sampling
                     )
 
                     _stg_pert_list = []

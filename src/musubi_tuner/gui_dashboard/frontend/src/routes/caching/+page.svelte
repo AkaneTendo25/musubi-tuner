@@ -12,8 +12,9 @@
 	import { defaultModelDir, describeExactModelScan, effectiveGemmaRoot, effectiveGemmaSafetensors, effectiveLtx2Checkpoint } from '$lib/utils/modelPaths.js';
 	import { startModelDownload, getModelDownloadStatus, cancelModelDownload, formatModelDownloadStatus, getModelDownloadTone, isActiveModelDownload, getModelDownloadPresets, getModelDownloadPreflight, checkPathExists, scanCheckpointsWithProgress, cancelCheckpointScan, formatCheckpointScanStatus, modelDownloadTooltip, formatModelPreflightStatus } from '$lib/utils/modelDownloads.js';
 	import { projectConfig, projectLoaded, updateSection, saveProjectNow } from '$lib/stores/project.js';
-	import { processStatuses, processLogs, startProcess, stopProcess, preloadLogsIfActive, startLogPolling } from '$lib/stores/processes.js';
+	import { processStatuses, processLogs, startProcess, stopProcess, preloadLogsIfActive, startLogPolling, refreshStatuses } from '$lib/stores/processes.js';
 	import { advancedMode } from '$lib/stores/uiMode.js';
+	import { goto } from '$app/navigation';
 	import { onMount } from 'svelte';
 
 	let cwd = $state('');
@@ -41,7 +42,17 @@
 	let ltxScanJobId = $state('');
 	let gemmaScanJobId = $state('');
 	let gemmaSafetensorsScanJobId = $state('');
+	let cacheThenTrainRunning = $state(false);
+	let cacheThenTrainMessage = $state('');
+	let cacheThenTrainError = $state('');
 	let downloadPollTimer = null;
+
+	class CacheThenTrainCancelled extends Error {
+		constructor(message) {
+			super(message);
+			this.name = 'CacheThenTrainCancelled';
+		}
+	}
 
 	onMount(() => {
 		fetch('/api/fs/cwd').then((res) => res.ok ? res.json() : null).then((data) => { cwd = data?.cwd || ''; }).catch(() => {});
@@ -60,9 +71,10 @@
 	function updateCaching(key, value) { updateSection('caching', key, value); }
 
 	let caching = $derived($projectConfig?.caching || {});
-	let latentStatus = $derived($processStatuses.cache_latents || { state: 'idle', exit_code: null });
-	let textStatus = $derived($processStatuses.cache_text || { state: 'idle', exit_code: null });
-	let dinoStatus = $derived($processStatuses.cache_dino || { state: 'idle', exit_code: null });
+	let latentStatus = $derived($processStatuses.cache_latents || { state: 'idle', exit_code: null, stop_requested: false });
+	let textStatus = $derived($processStatuses.cache_text || { state: 'idle', exit_code: null, stop_requested: false });
+	let dinoStatus = $derived($processStatuses.cache_dino || { state: 'idle', exit_code: null, stop_requested: false });
+	let trainingStatus = $derived($processStatuses.training || { state: 'idle', exit_code: null, stop_requested: false });
 	let latentLogs = $derived($processLogs.cache_latents || []);
 	let textLogs = $derived($processLogs.cache_text || []);
 	let dinoLogs = $derived($processLogs.cache_dino || []);
@@ -73,6 +85,12 @@
 	let resolvedGemma = $derived(effectiveGemmaRoot(cwd, $projectConfig, caching.gemma_root || '', activeGemmaSafetensors));
 	let scanTargetGemmaRoot = $derived(effectiveGemmaRoot(cwd, $projectConfig, caching.gemma_root || '', ''));
 	let hasActiveDownload = $derived(Boolean(downloadJobId) && ['queued', 'running', 'cancelling'].includes(downloadState));
+	let cacheThenTrainDisabled = $derived(
+		cacheThenTrainRunning ||
+		isProcessActive(latentStatus) ||
+		isProcessActive(textStatus) ||
+		isProcessActive(trainingStatus)
+	);
 
 	function relatedScanTargets() {
 		return {
@@ -80,6 +98,84 @@
 			gemma: scanTargetGemmaRoot,
 			gemma_safetensors: activeGemmaSafetensors
 		};
+	}
+
+	function isProcessActive(status) {
+		return status?.state === 'running' || status?.state === 'stopping';
+	}
+
+	const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+	async function waitForProcessSuccess(type, label) {
+		let missingPolls = 0;
+		let idlePolls = 0;
+
+		while (true) {
+			const statuses = await refreshStatuses();
+			const status = statuses?.[type];
+
+			if (!status) {
+				missingPolls += 1;
+				if (missingPolls >= 20) {
+					throw new Error(`Lost status while waiting for ${label}`);
+				}
+				await sleep(1500);
+				continue;
+			}
+
+			missingPolls = 0;
+			const state = status.state || 'idle';
+			const exitCode = status.exit_code ?? null;
+
+			if (status.stop_requested) {
+				throw new CacheThenTrainCancelled(`${label} was stopped. Cache then train cancelled.`);
+			}
+			if (state === 'finished' && exitCode === 0) return status;
+			if (state === 'error' || (exitCode !== null && exitCode !== 0)) {
+				throw new Error(`${label} failed${exitCode !== null ? ` with exit code ${exitCode}` : ''}`);
+			}
+
+			if (state === 'idle') {
+				idlePolls += 1;
+				if (idlePolls >= 6) {
+					throw new Error(`${label} did not start`);
+				}
+			} else {
+				idlePolls = 0;
+			}
+
+			await sleep(1500);
+		}
+	}
+
+	async function cacheThenTrain() {
+		if (cacheThenTrainDisabled) return;
+
+		cacheThenTrainRunning = true;
+		cacheThenTrainError = '';
+
+		try {
+			cacheThenTrainMessage = 'Caching latents...';
+			await startProcess('cache_latents');
+			await waitForProcessSuccess('cache_latents', 'Latent caching');
+
+			cacheThenTrainMessage = 'Caching text embeddings...';
+			await startProcess('cache_text');
+			await waitForProcessSuccess('cache_text', 'Text embedding caching');
+
+			cacheThenTrainMessage = 'Starting training...';
+			await startProcess('training');
+			await goto('/training/dashboard');
+		} catch (e) {
+			if (e instanceof CacheThenTrainCancelled) {
+				cacheThenTrainError = '';
+			} else {
+				cacheThenTrainError = e?.message || 'Cache then train failed';
+			}
+		} finally {
+			cacheThenTrainRunning = false;
+			cacheThenTrainMessage = '';
+		}
 	}
 
 	$effect(() => {
@@ -320,9 +416,29 @@
 	</div>
 {:else}
 	<div class="space-y-5">
-		<div>
-			<h2 class="text-base font-semibold" style="color: var(--text-primary);">Caching</h2>
-			<p class="text-[12px]" style="color: var(--text-muted);">Cache latents and text encoder outputs before training.</p>
+		<div class="flex items-start justify-between gap-3">
+			<div>
+				<h2 class="text-base font-semibold" style="color: var(--text-primary);">Caching</h2>
+				<p class="text-[12px]" style="color: var(--text-muted);">Cache latents and text encoder outputs before training.</p>
+			</div>
+			<div class="flex flex-col items-end gap-2">
+				<button
+					type="button"
+					onclick={cacheThenTrain}
+					disabled={cacheThenTrainDisabled}
+					class="px-4 py-2 text-[12px] font-semibold disabled:opacity-50 disabled:cursor-not-allowed whitespace-nowrap"
+					style="background: var(--accent); color: var(--bg-base); border-radius: var(--radius-sm); box-shadow: var(--shadow-sm), var(--glow-accent); font-family: var(--font-label);"
+					onmouseenter={(e) => { if (!e.currentTarget.disabled) e.currentTarget.style.filter = 'brightness(1.1)'; }}
+					onmouseleave={(e) => { e.currentTarget.style.filter = ''; }}
+				>
+					{cacheThenTrainRunning ? (cacheThenTrainMessage || 'Running...') : 'Cache then train'}
+				</button>
+				{#if cacheThenTrainError}
+					<div class="max-w-[28rem] text-right text-[12px] px-2.5 py-1" style="color: var(--danger); background: var(--danger-muted); border-radius: var(--radius-sm);">
+						{cacheThenTrainError}
+					</div>
+				{/if}
+			</div>
 		</div>
 		<!-- Shared Settings -->
 		<div class="p-4 space-y-3" style="background: var(--bg-surface); border: 1px solid var(--border-subtle); border-radius: var(--radius-md);">

@@ -65,7 +65,7 @@ def _amp_context(device: torch.device, dtype: torch.dtype):
     return nullcontext()
 
 
-def _load_datasets(args: argparse.Namespace) -> Sequence[BaseDataset]:
+def _load_dataset_sets(args: argparse.Namespace) -> tuple[list[BaseDataset], list[BaseDataset]]:
     blueprint_generator = BlueprintGenerator(ConfigSanitizer())
     logger.info("Load dataset config from %s", args.dataset_config)
     user_config = config_utils.load_user_config(args.dataset_config)
@@ -74,7 +74,8 @@ def _load_datasets(args: argparse.Namespace) -> Sequence[BaseDataset]:
         blueprint.dataset_group,
         reference_downscale=getattr(args, "reference_downscale", 1),
     )
-    datasets = list(dataset_group.datasets)
+    train_datasets = list(dataset_group.datasets)
+    validation_datasets: list[BaseDataset] = []
 
     if user_config.get("validation_datasets"):
         logger.info("Load validation datasets from dataset config")
@@ -89,9 +90,14 @@ def _load_datasets(args: argparse.Namespace) -> Sequence[BaseDataset]:
             validation_blueprint.dataset_group,
             reference_downscale=getattr(args, "reference_downscale", 1),
         )
-        datasets.extend(validation_dataset_group.datasets)
+        validation_datasets = list(validation_dataset_group.datasets)
 
-    return cast(Sequence[BaseDataset], datasets)
+    return train_datasets, validation_datasets
+
+
+def _load_datasets(args: argparse.Namespace) -> Sequence[BaseDataset]:
+    train_datasets, validation_datasets = _load_dataset_sets(args)
+    return cast(Sequence[BaseDataset], [*train_datasets, *validation_datasets])
 
 
 def encode_and_save_batch(vae, batch: List[ItemInfo], tiling_config=None) -> None:
@@ -960,7 +966,7 @@ def encode_and_save_reference_audio_latents(
     *,
     dtype: torch.dtype,
 ) -> None:
-    """Encode reference-audio files and save latent caches for audio_ref_only_ic training."""
+    """Encode reference-audio files and save latent caches for audio_ref_ic training."""
     skip_existing = getattr(args, "skip_existing", False)
     num_workers = args.num_workers if args.num_workers is not None else max(1, (os.cpu_count() or 2) - 1)
     preferred_ext = getattr(args, "ltx2_audio_ext", None)
@@ -1390,7 +1396,8 @@ def main() -> None:
         _precache_sample_latents(args, device)
         logger.info("Sample latent precaching (I2V/V2V/reference-audio) complete; continuing with dataset latent caching")
 
-    datasets = _load_datasets(args)
+    train_datasets, validation_datasets = _load_dataset_sets(args)
+    datasets = cast(Sequence[BaseDataset], [*train_datasets, *validation_datasets])
     if args.save_dataset_manifest:
         user_config = config_utils.load_user_config(args.dataset_config)
         manifest = config_utils.create_cache_only_dataset_manifest(

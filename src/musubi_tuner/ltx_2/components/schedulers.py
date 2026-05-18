@@ -24,8 +24,9 @@ def build_ltx2_sigmas(
     """Build LTX-2 sigmas from the configured sampling schedule.
 
     ``auto`` uses the exact LTX-2.3 distilled schedule for the distilled
-    two-stage preset at 8 steps. Otherwise it uses ``LTX2Scheduler`` with the
-    latent tensor for token-count-dependent shifting.
+    two-stage preset at 8 steps. It uses the latent-aware shifted schedule only
+    for the HQ preset, matching the upstream HQ pipeline. Standard one-stage and
+    validation sampling use the official default 4096-token anchor.
     """
 
     schedule = str(sigma_schedule or "auto").lower()
@@ -39,14 +40,15 @@ def build_ltx2_sigmas(
         if int(steps) != expected_steps:
             raise ValueError(
                 f"LTX-2.3 distilled sigma schedule requires {expected_steps} steps, got {steps}. "
-                "Use --sample_sigma_schedule ltx or --sample_steps 8."
+                "Use --sample_sigma_schedule ltx, --sample_sigma_schedule ltx_latent, or --sample_steps 8."
             )
         return torch.tensor(LTX23_DISTILLED_SIGMAS, dtype=torch.float32)
 
-    if schedule not in {"auto", "ltx"}:
-        raise ValueError("sigma_schedule must be one of: auto, ltx, ltx23_distilled")
+    if schedule not in {"auto", "ltx", "ltx_latent"}:
+        raise ValueError("sigma_schedule must be one of: auto, ltx, ltx_latent, ltx23_distilled")
 
-    return LTX2Scheduler().execute(steps=int(steps), latent=latent)
+    use_latent_shift = latent is not None and (schedule == "ltx_latent" or (schedule == "auto" and preset == "ltx23_hq"))
+    return LTX2Scheduler().execute(steps=int(steps), latent=latent if use_latent_shift else None)
 
 
 class LTX2Scheduler(SchedulerProtocol):
@@ -64,9 +66,10 @@ class LTX2Scheduler(SchedulerProtocol):
         base_shift: float = 0.95,
         stretch: bool = True,
         terminal: float = 0.1,
+        default_number_of_tokens: int = MAX_SHIFT_ANCHOR,
         **_kwargs,
     ) -> torch.FloatTensor:
-        tokens = math.prod(latent.shape[2:]) if latent is not None else MAX_SHIFT_ANCHOR
+        tokens = math.prod(latent.shape[2:]) if latent is not None else default_number_of_tokens
         sigmas = torch.linspace(1.0, 0.0, steps + 1)
 
         x1 = BASE_SHIFT_ANCHOR

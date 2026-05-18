@@ -235,6 +235,12 @@
 									<span style="color: var(--text-muted);">Activations:</span>
 									<span style="color: var(--text-secondary);">{stats.vram.breakdown.activations} GB</span>
 								</div>
+								{#if stats.vram.breakdown.dora > 0}
+									<div class={statRowClass + ' text-[11px]'}>
+										<span style="color: var(--text-muted);">DoRA Runtime:</span>
+										<span style="color: var(--text-secondary);">{stats.vram.breakdown.dora} GB</span>
+									</div>
+								{/if}
 								<div class={statRowClass + ' text-[11px]'}>
 									<span style="color: var(--text-muted);">Overhead:</span>
 									<span style="color: var(--text-secondary);">{stats.vram.breakdown.overhead} GB</span>

@@ -1,5 +1,6 @@
 import argparse
-from typing import List, Optional
+import math
+from typing import Any, Dict, List, Optional
 from PIL import Image
 
 import numpy as np
@@ -33,11 +34,13 @@ from musubi_tuner.wan.modules.model import WanModel, detect_wan_sd_dtype, load_w
 from musubi_tuner.wan.modules.t5 import T5EncoderModel
 from musubi_tuner.wan.modules.vae import WanVAE
 from musubi_tuner.wan.utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
+from musubi_tuner.tread import TREADRouter, parse_tread_args
 
 
 class WanNetworkTrainer(NetworkTrainer):
     def __init__(self):
         super().__init__()
+        self._tread_enabled: bool = False
 
     # region model specific
 
@@ -101,6 +104,62 @@ class WanNetworkTrainer(NetworkTrainer):
             logger.info(f"Converted timestep_boundary to 0 to 1 range: {self.timestep_boundary}")
 
         self.default_guidance_scale = 1.0  # not used
+
+    @staticmethod
+    def _normalize_video_force_keep_mask(
+        mask: Optional[torch.Tensor],
+        *,
+        batch_size: int,
+        seq_len: int,
+        device: torch.device,
+        label: str,
+    ) -> Optional[torch.Tensor]:
+        if mask is None:
+            return None
+        if not isinstance(mask, torch.Tensor):
+            raise TypeError(f"Expected {label} to be a torch.Tensor, got: {type(mask)}")
+        if mask.dim() == 1:
+            mask = mask.unsqueeze(0)
+        if mask.dim() > 2:
+            mask = mask.view(mask.shape[0], -1)
+        if mask.shape[0] == 1 and batch_size != 1:
+            mask = mask.expand(batch_size, mask.shape[1])
+        if mask.shape[0] != batch_size:
+            raise ValueError(f"{label} batch mismatch: got {mask.shape[0]}, expected {batch_size}")
+        if mask.shape[1] != seq_len:
+            raise ValueError(f"{label} length mismatch: got {mask.shape[1]}, expected {seq_len}")
+        return mask.to(device=device, dtype=torch.bool)
+
+    def _parse_tread_args(
+        self,
+        raw_args: Any,
+        *,
+        total_layers: int,
+    ) -> Optional[Dict[str, Any]]:
+        return parse_tread_args(
+            raw_args,
+            total_layers=total_layers,
+            default_route={"selection_ratio": 0.5, "start_layer_idx": 2, "end_layer_idx": -2},
+        )
+
+    def _setup_tread(
+        self,
+        args: argparse.Namespace,
+        accelerator: Accelerator,
+        transformer,
+    ) -> None:
+        base_model = transformer.model if hasattr(transformer, "model") else transformer
+        parsed_config = self._parse_tread_args(getattr(args, "tread", None), total_layers=len(base_model.blocks))
+        args.tread = parsed_config
+        self._tread_enabled = bool(parsed_config and parsed_config.get("routes"))
+        if not self._tread_enabled:
+            return
+
+        base_model.set_router(
+            TREADRouter(seed=getattr(args, "seed", None) or 42),
+            parsed_config["routes"],
+        )
+        logger.info("TREAD enabled for Wan with routes: %s", parsed_config["routes"])
 
     def process_sample_prompts(
         self,
@@ -482,6 +541,7 @@ class WanNetworkTrainer(NetworkTrainer):
         )
         if args.force_v2_1_time_embedding:
             model.set_time_embedding_v2_1(True)
+        self._setup_tread(args, accelerator, model)
 
         if self.high_low_training:
             # load high noise model
@@ -696,10 +756,27 @@ class WanNetworkTrainer(NetworkTrainer):
         # call DiT
         lat_f, lat_h, lat_w = latents.shape[2:5]
         seq_len = lat_f * lat_h * lat_w // (self.config.patch_size[0] * self.config.patch_size[1] * self.config.patch_size[2])
+        force_keep_mask = None
+        if self._tread_enabled:
+            force_keep_mask = self._normalize_video_force_keep_mask(
+                batch.get("force_keep_mask"),
+                batch_size=noisy_model_input.shape[0],
+                seq_len=seq_len,
+                device=accelerator.device,
+                label="force_keep_mask",
+            )
         latents = latents.to(device=accelerator.device, dtype=network_dtype)
         noisy_model_input = noisy_model_input.to(device=accelerator.device, dtype=network_dtype)
         with accelerator.autocast():
-            model_pred = model(noisy_model_input, t=timesteps, context=context, clip_fea=clip_fea, seq_len=seq_len, y=image_latents)
+            model_pred = model(
+                noisy_model_input,
+                t=timesteps,
+                context=context,
+                clip_fea=clip_fea,
+                seq_len=seq_len,
+                y=image_latents,
+                force_keep_mask=force_keep_mask,
+            )
         model_pred = torch.stack(model_pred, dim=0)  # list to tensor
 
         # flow matching loss
@@ -724,7 +801,18 @@ def wan_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser
     )
     parser.add_argument("--vae_cache_cpu", action="store_true", help="cache features in VAE on CPU")
     parser.add_argument("--one_frame", action="store_true", help="Use one frame sampling method for sample generation")
-
+    parser.add_argument(
+        "--tread",
+        type=str,
+        nargs="*",
+        default=None,
+        help=(
+            "Enable TREAD token routing for Wan training using key=value settings. "
+            "Example: --tread selection_ratio=0.5 start_layer_idx=2 end_layer_idx=-2. "
+            "Bare --tread uses defaults: selection_ratio=0.5, start/end=2/-2 for Wan 2.1 and 2.2. "
+            "Training-only and applies to Wan video tokens."
+        ),
+    )
     # Wan2.2 specific arguments
     parser.add_argument(
         "--force_v2_1_time_embedding", action="store_true", help="Force using 2.1 style time embedding even for Wan 2.2"
@@ -751,6 +839,10 @@ def main():
 
     args = parser.parse_args()
     args = read_config_from_file(args, parser)
+
+    args.differential_guidance_scale = float(getattr(args, "differential_guidance_scale", 3.0))
+    if not math.isfinite(args.differential_guidance_scale):
+        raise ValueError("--differential_guidance_scale must be finite.")
 
     args.dit_dtype = None  # automatically detected
     if args.vae_dtype is None:

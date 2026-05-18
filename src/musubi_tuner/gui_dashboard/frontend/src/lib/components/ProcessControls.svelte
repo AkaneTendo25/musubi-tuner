@@ -78,13 +78,13 @@
 	{:else}
 		<button
 			onclick={handleStop}
-			disabled={loading || status.state === 'stopping'}
+			disabled={loading && status.state !== 'stopping'}
 			class="px-5 py-2 text-[12px] font-semibold disabled:opacity-50"
 			style="background: var(--danger); color: white; border-radius: var(--radius-sm); box-shadow: var(--shadow-sm); font-family: var(--font-label);"
 			onmouseenter={(e) => { e.currentTarget.style.filter = 'brightness(1.1)'; }}
 			onmouseleave={(e) => { e.currentTarget.style.filter = ''; }}
 		>
-			{status.state === 'stopping' ? 'Stopping...' : 'Stop'}
+			{status.state === 'stopping' ? 'Force Stop' : 'Stop'}
 		</button>
 	{/if}
 

@@ -27,6 +27,7 @@ import torch
 from tqdm import tqdm
 from accelerate.utils import TorchDynamoPlugin, set_seed, DynamoBackend
 from accelerate import Accelerator, InitProcessGroupKwargs, DistributedDataParallelKwargs, PartialState
+from safetensors import safe_open
 from safetensors.torch import load_file
 import transformers
 from diffusers.optimization import (
@@ -59,6 +60,19 @@ from musubi_tuner.ogm_ge import compute_ogm_ge_coefficients, maybe_add_ogm_ge_gr
 from musubi_tuner.modules.group_lr_scheduler import GroupWarmupScheduler, parse_group_lr_warmup_args
 from musubi_tuner.modules.lr_schedulers import RexLR
 from musubi_tuner.modules.scheduling_flow_match_discrete import FlowMatchDiscreteScheduler
+from musubi_tuner.ltx2_sinksgd_defaults import (
+    DEFAULT_PRODIGY_PLUS_OPTIMIZER_ARGS,
+    DEFAULT_PRODIGY_PLUS_OPTIMIZER_TYPE,
+    DEFAULT_LTX2_DORA_OFT_LEARNING_RATE,
+    DEFAULT_LTX2_LEARNING_RATE,
+    DEFAULT_LTX2_SINKSGD_MOMENTUM,
+    DEFAULT_LTX2_SINKSGD_NESTEROV,
+    DEFAULT_LTX2_SINKSGD_NESTEROV_COEF,
+    DEFAULT_LTX2_SINKSGD_NORMED_MOMENTUM,
+    DEFAULT_LTX2_SINKSGD_ORTHOGONAL_SINKHORN,
+    DEFAULT_LTX2_SINKSGD_SINKHORN_ITERATIONS,
+    is_prodigy_plus_optimizer,
+)
 import musubi_tuner.networks.lora as lora_module
 from musubi_tuner.networks.optimizer_params_compat import prepare_optimizer_params_compat
 from musubi_tuner.dataset.config_utils import BlueprintGenerator, ConfigSanitizer
@@ -71,6 +85,61 @@ from musubi_tuner.utils import huggingface_utils, model_utils, train_utils, sai_
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
+
+
+def _truthy_optimizer_arg(value: Any) -> bool:
+    if isinstance(value, str):
+        return value.lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def _resolve_effective_batch_lr_scale(args: Any) -> float:
+    explicit_scale = getattr(args, "effective_batch_lr_scale", None)
+    if explicit_scale is not None:
+        try:
+            return max(1.0, float(explicit_scale))
+        except (TypeError, ValueError):
+            logger.warning("Ignoring invalid effective_batch_lr_scale=%r; falling back to computed scale.", explicit_scale)
+
+    accumulation_steps = max(1, int(getattr(args, "gradient_accumulation_steps", 1) or 1))
+    batch_size = max(1.0, float(getattr(args, "train_batch_size", 1) or 1))
+    num_processes = max(1, int(getattr(args, "num_processes", 1) or 1))
+    return batch_size * accumulation_steps * num_processes
+
+
+def configure_effective_batch_lr_scale(args: Any, dataset_group: Any, num_processes: int = 1) -> float:
+    """Store the effective-batch LR scale used by SinkSGD's opt-in scaling arg."""
+    datasets = list(getattr(dataset_group, "datasets", []) or [])
+    total_batches = 0
+    total_items = 0
+    for dataset in datasets:
+        try:
+            dataset_batches = int(len(dataset))
+        except TypeError:
+            dataset_batches = 0
+        batch_size = max(1, int(getattr(dataset, "batch_size", 1) or 1))
+        total_batches += max(0, dataset_batches)
+        total_items += max(0, dataset_batches) * batch_size
+
+    if total_batches > 0 and total_items > 0:
+        batch_size_scale = total_items / total_batches
+    else:
+        batch_size_scale = max(1.0, float(getattr(args, "train_batch_size", 1) or 1))
+
+    accumulation_steps = max(1, int(getattr(args, "gradient_accumulation_steps", 1) or 1))
+    process_scale = max(1, int(num_processes or 1))
+    effective_scale = batch_size_scale * accumulation_steps * process_scale
+    args.effective_batch_lr_scale = effective_scale
+    args.train_batch_size = batch_size_scale
+    args.num_processes = process_scale
+    logger.info(
+        "Effective batch LR scale (raw, pre-sqrt): avg_batch_size=%g gradient_accumulation_steps=%d num_processes=%d -> scale=%g",
+        batch_size_scale,
+        accumulation_steps,
+        process_scale,
+        effective_scale,
+    )
+    return effective_scale
 
 
 def configure_console_output_for_help() -> None:
@@ -389,7 +458,7 @@ def line_to_prompt_dict(line: str) -> dict:
                 continue
 
             m = re.match(r"ra (.+)", parg, re.IGNORECASE)
-            if m:  # reference audio path (audio_ref_only_ic sampling)
+            if m:  # reference audio path (audio_ref_ic sampling)
                 prompt_dict["ref_audio_path"] = m.group(1).strip()
                 continue
 
@@ -570,6 +639,203 @@ def apply_loss_mask(
     return loss, metrics
 
 
+def _env_positive_int(name: str, default: int) -> int:
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except ValueError:
+        return default
+    return max(1, value)
+
+
+def _debug_param_stat(param: torch.nn.Parameter) -> str:
+    with torch.no_grad():
+        value = param.detach()
+        value_f = value.float()
+        return (
+            f"shape={tuple(value.shape)} dtype={value.dtype} "
+            f"param_norm={value_f.norm().item():.6g} "
+            f"param_mean_abs={value_f.abs().mean().item():.6g} "
+            f"param_max_abs={value_f.abs().max().item():.6g}"
+        )
+
+
+def _debug_grad_stat(param: torch.nn.Parameter) -> str:
+    grad = param.grad
+    if grad is None:
+        return "grad=None"
+    with torch.no_grad():
+        grad_f = grad.detach().float()
+        finite = torch.isfinite(grad_f)
+        finite_count = int(finite.sum().item())
+        total_count = grad_f.numel()
+        if finite_count == 0:
+            return f"grad_nonfinite={total_count}/{total_count}"
+        finite_grad = grad_f[finite]
+        return (
+            f"grad_norm={grad_f.norm().item():.6g} "
+            f"grad_mean_abs={finite_grad.abs().mean().item():.6g} "
+            f"grad_max_abs={finite_grad.abs().max().item():.6g} "
+            f"grad_nonfinite={total_count - finite_count}/{total_count}"
+        )
+
+
+def _iter_debug_named_trainable_params(network: torch.nn.Module, max_params: int) -> list[tuple[str, torch.nn.Parameter]]:
+    lora_modules = getattr(network, "unet_loras", None)
+    selected: list[tuple[str, torch.nn.Parameter]] = []
+    if lora_modules:
+        for module in lora_modules:
+            module_name = getattr(module, "lora_name", module.__class__.__name__)
+            for name, param in module.named_parameters():
+                if param.requires_grad:
+                    selected.append((f"{module_name}.{name}", param))
+                    if len(selected) >= max_params:
+                        return selected
+        return selected
+
+    for name, param in network.named_parameters():
+        if param.requires_grad:
+            selected.append((name, param))
+            if len(selected) >= max_params:
+                break
+    return selected
+
+
+def _network_debug_pre_step(
+    network: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    *,
+    step_label: int,
+    max_params: int = 12,
+) -> list[tuple[str, torch.nn.Parameter, torch.Tensor]]:
+    trainable = [(name, param) for name, param in network.named_parameters() if param.requires_grad]
+    grad_none = 0
+    grad_zero = 0
+    grad_nonfinite = 0
+    param_sq = torch.zeros((), device=trainable[0][1].device if trainable else torch.device("cpu"))
+    grad_sq = torch.zeros_like(param_sq)
+
+    with torch.no_grad():
+        for _name, param in trainable:
+            param_sq += param.detach().float().pow(2).sum()
+            if param.grad is None:
+                grad_none += 1
+                continue
+            grad_f = param.grad.detach().float()
+            grad_sq += grad_f.pow(2).sum()
+            if torch.count_nonzero(grad_f).item() == 0:
+                grad_zero += 1
+            if not torch.isfinite(grad_f).all():
+                grad_nonfinite += 1
+
+    lrs = sorted({float(group.get("lr", 0.0)) for group in optimizer.param_groups})
+    logger.info(
+        "[DEBUG] trainable step=%s tensors=%d grad_none=%d grad_zero=%d grad_nonfinite=%d "
+        "param_norm=%.6g grad_norm=%.6g optimizer_lrs=%s",
+        step_label,
+        len(trainable),
+        grad_none,
+        grad_zero,
+        grad_nonfinite,
+        float(param_sq.sqrt().item()),
+        float(grad_sq.sqrt().item()),
+        ",".join(f"{lr:.6g}" for lr in lrs),
+    )
+
+    snapshots: list[tuple[str, torch.nn.Parameter, torch.Tensor]] = []
+    for name, param in _iter_debug_named_trainable_params(network, max_params):
+        logger.info("[DEBUG] param %s: %s | %s", name, _debug_param_stat(param), _debug_grad_stat(param))
+        snapshots.append((name, param, param.detach().clone()))
+    return snapshots
+
+
+def _network_debug_post_step(
+    snapshots: list[tuple[str, torch.nn.Parameter, torch.Tensor]],
+    *,
+    step_label: int,
+) -> None:
+    if not snapshots:
+        return
+
+    with torch.no_grad():
+        total_delta_sq = 0.0
+        for name, param, before in snapshots:
+            after = param.detach()
+            delta = after.float() - before.to(device=after.device, dtype=torch.float32)
+            delta_norm = float(delta.norm().item())
+            after_norm = float(after.float().norm().item())
+            total_delta_sq += delta_norm * delta_norm
+            logger.info(
+                "[DEBUG] post_step step=%s param %s: delta_norm=%.6g delta_to_param=%.6g",
+                step_label,
+                name,
+                delta_norm,
+                delta_norm / max(after_norm, 1e-12),
+            )
+        logger.info("[DEBUG] post_step step=%s selected_delta_norm=%.6g", step_label, math.sqrt(total_delta_sq))
+
+
+def _refresh_prodigy_plus_late_param_group_state(
+    optimizer: torch.optim.Optimizer,
+    *,
+    split_groups: Optional[bool] = None,
+) -> None:
+    """Initialize Prodigy Plus bookkeeping for param groups added after construction."""
+    inner_optimizer = optimizer.optimizer if hasattr(optimizer, "optimizer") else optimizer
+    param_groups = getattr(inner_optimizer, "param_groups", None)
+    defaults = getattr(inner_optimizer, "defaults", None)
+    if not param_groups or not isinstance(defaults, dict):
+        return
+
+    optimizer_module = type(inner_optimizer).__module__
+    is_prodigy_plus = optimizer_module.startswith("prodigyplus") or any(
+        "running_d_numerator" in group or "running_d_denom" in group for group in param_groups
+    )
+    if not is_prodigy_plus:
+        return
+
+    # Match Prodigy Plus semantics for the final pre-step group layout. If
+    # setup adds groups before the first step, honor the requested default;
+    # once training has started, preserve the active split-groups mode.
+    if split_groups is None:
+        default_split_groups = bool(defaults.get("split_groups", False))
+        optimizer_started = bool(getattr(inner_optimizer, "state", None)) or any(
+            group.get("k", 1) != 1 for group in param_groups
+        )
+        if default_split_groups and len(param_groups) > 1 and not optimizer_started:
+            split_groups = True
+        else:
+            for group in param_groups:
+                if "split_groups" in group:
+                    split_groups = bool(group["split_groups"])
+                    break
+            else:
+                split_groups = default_split_groups
+                if split_groups and len(param_groups) == 1:
+                    split_groups = False
+
+    def _first_param_device(group: dict[str, Any]) -> torch.device:
+        for param in group.get("params", []):
+            if isinstance(param, torch.Tensor):
+                return param.device
+        first_group = param_groups[0]
+        tensor = first_group.get("running_d_numerator")
+        if tensor is None:
+            tensor = first_group.get("running_d_denom")
+        if isinstance(tensor, torch.Tensor):
+            return tensor.device
+        return torch.device("cpu")
+
+    groups_requiring_running_state = param_groups if split_groups else param_groups[:1]
+    for group in param_groups:
+        group["split_groups"] = split_groups
+    for group in groups_requiring_running_state:
+        device = _first_param_device(group)
+        if "running_d_numerator" not in group:
+            group["running_d_numerator"] = torch.tensor(0.0, dtype=torch.float32, device=device)
+        if "running_d_denom" not in group:
+            group["running_d_denom"] = torch.tensor(0.0, dtype=torch.float32, device=device)
+
+
 def should_sample_images(args, steps, epoch=None):
     if steps == 0:
         if not args.sample_at_first:
@@ -693,11 +959,52 @@ class NetworkTrainer:
         optimizer = None
         optimizer_class = None
 
-        # CAME8bit dispatched before the bitsandbytes "8bit" branch since CAME ends in "8bit".
-        if optimizer_type == "CAME8bit".lower():
-            from musubi_tuner.optimizers.came_8bit import CAME8bit
-            logger.info(f"use CAME8bit optimizer (stochastic_rounding, cautious, step_parameter) | {optimizer_kwargs}")
-            optimizer_class = CAME8bit
+        # CAME optimizers dispatched before the bitsandbytes "8bit" branch since CAME8bit ends in "8bit".
+        if optimizer_type in {"came", "camesimple", "came_simple", "came8bit", "came_8bit"}:
+            from musubi_tuner.optimizers.came_8bit import CAME, CAME8bit
+
+            if "stochastic_rounding" not in optimizer_kwargs and (
+                bool(getattr(args, "full_bf16", False))
+                or bool(getattr(args, "fused_backward_pass", False))
+                or getattr(args, "mixed_precision", None) == "bf16"
+            ):
+                optimizer_kwargs["stochastic_rounding"] = True
+                logger.info("CAME: defaulting stochastic_rounding=True for BF16/fused training")
+            optimizer_class = CAME if optimizer_type in {"came", "camesimple", "came_simple"} else CAME8bit
+            logger.info(
+                f"use {optimizer_class.__name__} optimizer "
+                f"(stochastic_rounding, cautious, step_parameter) | {optimizer_kwargs}"
+            )
+            optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
+
+        elif optimizer_type.startswith("torchao_") or optimizer_type.startswith("ao_") or optimizer_type.startswith("torchao."):
+            from musubi_tuner.optimizers.backends import resolve_torchao_optimizer_class
+
+            if "bf16_stochastic_round" not in optimizer_kwargs and (
+                bool(getattr(args, "full_bf16", False))
+                or bool(getattr(args, "fused_backward_pass", False))
+                or getattr(args, "mixed_precision", None) == "bf16"
+            ):
+                optimizer_kwargs["bf16_stochastic_round"] = True
+                logger.info("torchao optimizer: defaulting bf16_stochastic_round=True for BF16/fused training")
+            optimizer_class = resolve_torchao_optimizer_class(args.optimizer_type)
+            logger.info(f"use torchao optimizer {optimizer_class.__name__} | {optimizer_kwargs}")
+            optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
+
+        elif optimizer_type.startswith("optimi_") or optimizer_type.startswith("torchoptimi_") or optimizer_type.startswith("optimi."):
+            from musubi_tuner.optimizers.backends import resolve_optimi_optimizer_class
+
+            if bool(getattr(args, "fused_backward_pass", False)):
+                gradient_release = optimizer_kwargs.get("gradient_release", True)
+                if isinstance(gradient_release, str):
+                    gradient_release = gradient_release.lower() in {"1", "true", "yes", "on"}
+                    optimizer_kwargs["gradient_release"] = gradient_release
+                if gradient_release is not True:
+                    raise ValueError("optimi optimizers require gradient_release=True for --fused_backward_pass")
+                optimizer_kwargs.setdefault("gradient_release", True)
+                logger.info("optimi optimizer: defaulting gradient_release=True for fused backward")
+            optimizer_class = resolve_optimi_optimizer_class(args.optimizer_type)
+            logger.info(f"use torch-optimi optimizer {optimizer_class.__name__} | {optimizer_kwargs}")
             optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
 
         elif optimizer_type.endswith("8bit".lower()):
@@ -769,6 +1076,77 @@ class NetworkTrainer:
             optimizer_class = Automagic
             optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
 
+        elif is_prodigy_plus_optimizer(args.optimizer_type):
+            try:
+                from prodigyplus.prodigy_plus_schedulefree import ProdigyPlusScheduleFree
+            except ImportError as exc:
+                raise ImportError(
+                    "Prodigy Plus requires the 'prodigy-plus-schedule-free' package. "
+                    "Install it with `pip install prodigy-plus-schedule-free==2.0.1`."
+                ) from exc
+
+            args.optimizer_type = DEFAULT_PRODIGY_PLUS_OPTIMIZER_TYPE
+            for default_arg in DEFAULT_PRODIGY_PLUS_OPTIMIZER_ARGS:
+                key, value = default_arg.split("=", 1)
+                if key in optimizer_kwargs:
+                    continue
+                try:
+                    optimizer_kwargs[key] = ast.literal_eval(value)
+                except (ValueError, SyntaxError):
+                    optimizer_kwargs[key] = value
+            logger.info(f"use Prodigy Plus Schedule-Free optimizer | lr={lr} | {optimizer_kwargs}")
+            optimizer_class = ProdigyPlusScheduleFree
+            optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
+
+        elif optimizer_type in {"sinksgd", "sink_sgd", "sinksgd_adv", "sinksgdadv"}:
+            from musubi_tuner.optimizers.sink_sgd import SinkSGD
+
+            scale_with_effective_batch = optimizer_kwargs.pop("scale_lr_with_effective_batch", False)
+            scale_with_grad_accum = optimizer_kwargs.pop(
+                "scale_lr_with_grad_accum",
+                optimizer_kwargs.pop("scale_lr_with_gradient_accumulation", False),
+            )
+            if _truthy_optimizer_arg(scale_with_effective_batch):
+                lr_scale = _resolve_effective_batch_lr_scale(args)
+                sqrt_scale = math.sqrt(max(1.0, lr_scale))
+                lr *= sqrt_scale
+                logger.info(
+                    "SinkSGD: scaled learning rate by sqrt(effective_batch=%g)=%.6g -> lr=%s",
+                    lr_scale,
+                    sqrt_scale,
+                    lr,
+                )
+            elif _truthy_optimizer_arg(scale_with_grad_accum):
+                accumulation_steps = max(1, int(getattr(args, "gradient_accumulation_steps", 1) or 1))
+                sqrt_scale = math.sqrt(accumulation_steps)
+                lr *= sqrt_scale
+                logger.info(
+                    "SinkSGD: scaled learning rate by sqrt(gradient_accumulation_steps=%d)=%.6g -> lr=%s",
+                    accumulation_steps,
+                    sqrt_scale,
+                    lr,
+                )
+            optimizer_kwargs.setdefault("momentum", DEFAULT_LTX2_SINKSGD_MOMENTUM)
+            optimizer_kwargs.setdefault("nesterov", DEFAULT_LTX2_SINKSGD_NESTEROV)
+            optimizer_kwargs.setdefault("nesterov_coef", DEFAULT_LTX2_SINKSGD_NESTEROV_COEF)
+            optimizer_kwargs.setdefault("normed_momentum", DEFAULT_LTX2_SINKSGD_NORMED_MOMENTUM)
+            optimizer_kwargs.setdefault("stochastic_rounding", True)
+            optimizer_kwargs.setdefault("sinkhorn_iterations", DEFAULT_LTX2_SINKSGD_SINKHORN_ITERATIONS)
+            optimizer_kwargs.setdefault("orthogonal_sinkhorn", DEFAULT_LTX2_SINKSGD_ORTHOGONAL_SINKHORN)
+            optimizer_kwargs.setdefault("spectral_normalization", True)
+            logger.info(f"use SinkSGD optimizer | lr={lr} | {optimizer_kwargs}")
+            if optimizer_kwargs.get("spectral_normalization", False):
+                logger.info(
+                    "SinkSGD spectral_normalization=True: LR is interpreted as a spectral/RMS-scaled update size. "
+                    "For the OneTrainer-style sqrt-scaled setup, use --optimizer_args spectral_normalization=True "
+                    "scale_lr_with_effective_batch=True with --learning_rate around %g "
+                    "(%g for DoRA-OFT).",
+                    DEFAULT_LTX2_LEARNING_RATE,
+                    DEFAULT_LTX2_DORA_OFT_LEARNING_RATE,
+                )
+            optimizer_class = SinkSGD
+            optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
+
         elif optimizer_type in ("badam", "blockadam", "block_optimizer", "blockoptimizer"):
             # BAdam wraps a base optimizer (built via recursive dispatch) and is wired
             # in the trainer after accelerator.prepare() to enable gradient_release hooks.
@@ -800,7 +1178,20 @@ class NetworkTrainer:
                 optimizer_module = importlib.import_module(".".join(values[:-1]))
                 case_sensitive_optimizer_type = values[-1]
 
-            optimizer_class = getattr(optimizer_module, case_sensitive_optimizer_type)
+            optimizer_class = getattr(optimizer_module, case_sensitive_optimizer_type, None)
+            if optimizer_class is None and optimizer_module is torch.optim:
+                optimizer_class = next(
+                    (
+                        getattr(torch.optim, name)
+                        for name in dir(torch.optim)
+                        if name.lower() == case_sensitive_optimizer_type.lower()
+                    ),
+                    None,
+                )
+            if optimizer_class is None:
+                raise AttributeError(
+                    f"module '{optimizer_module.__name__}' has no optimizer '{case_sensitive_optimizer_type}'"
+                )
             optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
 
         # for logging
@@ -870,7 +1261,11 @@ class NetworkTrainer:
             )
 
     def is_schedulefree_optimizer(self, optimizer: torch.optim.Optimizer, args: argparse.Namespace) -> bool:
-        return args.optimizer_type.lower().endswith("schedulefree".lower()) or args.optimizer_type.lower() == "automagic"
+        return (
+            args.optimizer_type.lower().endswith("schedulefree".lower())
+            or is_prodigy_plus_optimizer(args.optimizer_type)
+            or args.optimizer_type.lower() == "automagic"
+        )
 
     # -- Preservation / regularization base-class no-ops --
     def pre_train_hook(self, args, accelerator, transformer=None, network=None):
@@ -899,6 +1294,27 @@ class NetworkTrainer:
 
     def compute_video_extra_loss(self, args, out, network_dtype):
         return None, {}
+
+    def apply_differential_guidance_target(
+        self,
+        args: argparse.Namespace,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+    ) -> torch.Tensor:
+        """Move the training target relative to the current prediction.
+
+        Mirrors ai-toolkit's differential guidance step:
+        target = pred + scale * (target - pred).
+        """
+        if not bool(getattr(args, "differential_guidance", False)):
+            return target
+        if not bool(getattr(self, "training", False)):
+            return target
+        scale = float(getattr(args, "differential_guidance_scale", 3.0))
+        if not math.isfinite(scale):
+            raise ValueError("--differential_guidance_scale must be finite.")
+        detached_pred = pred.detach().to(device=target.device, dtype=target.dtype)
+        return detached_pred + scale * (target - detached_pred)
 
     def get_dummy_scheduler(self, optimizer: torch.optim.Optimizer) -> Any:
         # dummy scheduler for schedulefree optimizer. supports only empty step(), get_last_lr() and optimizers.
@@ -1188,6 +1604,10 @@ class NetworkTrainer:
         new_network_param_groups, lr_descriptions = self._prepare_network_optimizer_params(args, unwrapped_network)
 
         inner_optimizer = optimizer.optimizer if hasattr(optimizer, "optimizer") else optimizer
+        prodigy_plus_split_groups = next(
+            (bool(group["split_groups"]) for group in inner_optimizer.param_groups if "split_groups" in group),
+            None,
+        )
 
         preserved_extra_groups = []
         preserved_extra_param_ids: set[int] = set()
@@ -1219,6 +1639,7 @@ class NetworkTrainer:
             inner_optimizer.add_param_group(group)
         for group in preserved_extra_groups:
             inner_optimizer.add_param_group(group)
+        _refresh_prodigy_plus_late_param_group_state(inner_optimizer, split_groups=prodigy_plus_split_groups)
 
         for group in inner_optimizer.param_groups:
             if "initial_lr" in group:
@@ -1246,15 +1667,181 @@ class NetworkTrainer:
 
         return refreshed_scheduler, lr_descriptions
 
-    def resume_from_local_or_hf_if_specified(self, accelerator: Accelerator, args: argparse.Namespace) -> int:
+    def _refresh_optimizer_param_groups_after_adaptive_rank_resume(
+        self,
+        args: argparse.Namespace,
+        accelerator: Accelerator,
+        network: Any,
+        optimizer: torch.optim.Optimizer,
+        *,
+        old_network_param_ids: set[int],
+    ) -> List[str]:
+        unwrapped_network = accelerator.unwrap_model(network)
+        new_network_param_groups, lr_descriptions = self._prepare_network_optimizer_params(args, unwrapped_network)
+
+        inner_optimizer = optimizer.optimizer if hasattr(optimizer, "optimizer") else optimizer
+        prodigy_plus_split_groups = next(
+            (bool(group["split_groups"]) for group in inner_optimizer.param_groups if "split_groups" in group),
+            None,
+        )
+
+        preserved_extra_groups = []
+        preserved_extra_param_ids: set[int] = set()
+        for group in inner_optimizer.param_groups:
+            extra_params = [param for param in group["params"] if id(param) not in old_network_param_ids]
+            if not extra_params:
+                continue
+            group_copy = {k: v for k, v in group.items() if k != "params"}
+            group_copy["params"] = extra_params
+            preserved_extra_groups.append(group_copy)
+            preserved_extra_param_ids.update(id(param) for param in extra_params)
+
+        normalized_network_groups = []
+        new_network_param_ids: set[int] = set()
+        for group in new_network_param_groups:
+            group_copy = {k: v for k, v in group.items() if k != "params"}
+            params = list(group["params"])
+            group_copy["params"] = params
+            normalized_network_groups.append(group_copy)
+            new_network_param_ids.update(id(param) for param in params)
+
+        keep_param_ids = new_network_param_ids | preserved_extra_param_ids
+        inner_optimizer.state = self._copy_optimizer_state_subset(inner_optimizer.state, keep_param_ids)
+        inner_optimizer.param_groups = []
+
+        for group in normalized_network_groups:
+            inner_optimizer.add_param_group(group)
+        for group in preserved_extra_groups:
+            inner_optimizer.add_param_group(group)
+        _refresh_prodigy_plus_late_param_group_state(inner_optimizer, split_groups=prodigy_plus_split_groups)
+
+        return lr_descriptions
+
+    @staticmethod
+    def _state_key_shapes_from_safetensors(file_path: str) -> dict[str, tuple[int, ...]]:
+        key_shapes: dict[str, tuple[int, ...]] = {}
+        with safe_open(file_path, framework="pt", device="cpu") as state_file:
+            for key in state_file.keys():
+                try:
+                    key_shapes[key] = tuple(state_file.get_slice(key).get_shape())
+                except Exception:
+                    key_shapes[key] = tuple(state_file.get_tensor(key).shape)
+        return key_shapes
+
+    @staticmethod
+    def _state_key_shapes_from_torch(file_path: str) -> dict[str, tuple[int, ...]]:
+        state_dict = torch.load(file_path, map_location="cpu", weights_only=True)
+        return {key: tuple(tensor.shape) for key, tensor in state_dict.items() if torch.is_tensor(tensor)}
+
+    @classmethod
+    def _load_local_state_model_key_shapes(cls, state_dir: str) -> Optional[dict[str, tuple[int, ...]]]:
+        safetensors_path = os.path.join(state_dir, "model.safetensors")
+        if os.path.exists(safetensors_path):
+            return cls._state_key_shapes_from_safetensors(safetensors_path)
+
+        torch_path = os.path.join(state_dir, "pytorch_model.bin")
+        if os.path.exists(torch_path):
+            return cls._state_key_shapes_from_torch(torch_path)
+
+        return None
+
+    @staticmethod
+    def _non_audio_state_key_shapes(key_shapes: dict[str, tuple[int, ...]]) -> dict[str, tuple[int, ...]]:
+        return {key: shape for key, shape in key_shapes.items() if "audio_" not in key}
+
+    @staticmethod
+    def _format_state_key_examples(keys: list[str], limit: int = 5) -> str:
+        examples = keys[:limit]
+        suffix = "" if len(keys) <= limit else f", ... +{len(keys) - limit} more"
+        return f"{examples}{suffix}"
+
+    @classmethod
+    def _local_state_model_incompatibility_reason(cls, model: torch.nn.Module, state_dir: str) -> Optional[str]:
+        checkpoint_shapes = cls._load_local_state_model_key_shapes(state_dir)
+        if checkpoint_shapes is None:
+            return None
+
+        current_shapes = {key: tuple(tensor.shape) for key, tensor in model.state_dict().items()}
+        current_shapes = cls._non_audio_state_key_shapes(current_shapes)
+        checkpoint_shapes = cls._non_audio_state_key_shapes(checkpoint_shapes)
+
+        current_keys = set(current_shapes.keys())
+        checkpoint_keys = set(checkpoint_shapes.keys())
+        missing_keys = sorted(current_keys - checkpoint_keys)
+        unexpected_keys = sorted(checkpoint_keys - current_keys)
+        shape_mismatches = sorted(
+            key for key in current_keys & checkpoint_keys if current_shapes[key] != checkpoint_shapes[key]
+        )
+
+        if not missing_keys and not unexpected_keys and not shape_mismatches:
+            return None
+
+        details = []
+        if missing_keys:
+            details.append(f"missing checkpoint keys {cls._format_state_key_examples(missing_keys)}")
+        if unexpected_keys:
+            details.append(f"unexpected checkpoint keys {cls._format_state_key_examples(unexpected_keys)}")
+        if shape_mismatches:
+            examples = [
+                f"{key}: checkpoint{checkpoint_shapes[key]} != current{current_shapes[key]}"
+                for key in shape_mismatches[:5]
+            ]
+            suffix = "" if len(shape_mismatches) <= 5 else f", ... +{len(shape_mismatches) - 5} more"
+            details.append(f"shape mismatches {examples}{suffix}")
+        return "; ".join(details)
+
+    def resume_from_local_or_hf_if_specified(
+        self,
+        accelerator: Accelerator,
+        args: argparse.Namespace,
+        network: Optional[torch.nn.Module] = None,
+    ) -> int:
         """Resume training state. Returns the recovered global_step (0 if not resuming)."""
         if not args.resume:
             self._resume_state_dir = None
             return 0
 
         if not args.resume_from_huggingface:
+            if not train_utils.is_complete_state_dir(args.resume):
+                if getattr(args, "_autoresume_selected", False):
+                    logger.warning(
+                        "autoresume: selected state directory is missing or incomplete, starting from scratch: %s",
+                        args.resume,
+                    )
+                    args.resume = None
+                    self._resume_state_dir = None
+                    return 0
+                raise FileNotFoundError(f"resume state directory is missing or incomplete: {args.resume}")
+
+            if getattr(args, "_autoresume_selected", False) and network is not None:
+                unwrapped_network = accelerator.unwrap_model(network)
+                incompatibility = self._local_state_model_incompatibility_reason(unwrapped_network, args.resume)
+                if incompatibility is not None:
+                    logger.warning(
+                        "autoresume: skipping incompatible state directory %s: %s. "
+                        "This usually means the current network target set or rank changed "
+                        "(for example --lora_target_preset, include_patterns, --network_dim, or --network_module). "
+                        "Starting from scratch.",
+                        args.resume,
+                        incompatibility,
+                    )
+                    args.resume = None
+                    self._resume_state_dir = None
+                    return 0
+
             logger.info(f"resume training from local state: {args.resume}")
-            accelerator.load_state(args.resume)
+            try:
+                accelerator.load_state(args.resume)
+            except Exception:
+                if getattr(args, "_autoresume_selected", False) and not train_utils.is_complete_state_dir(args.resume):
+                    logger.warning(
+                        "autoresume: selected state disappeared or became incomplete before loading, starting from scratch: %s",
+                        args.resume,
+                    )
+                    args.resume = None
+                    self._resume_state_dir = None
+                    return 0
+                raise
             self._resume_state_dir = args.resume
             return self._recover_global_step(args.resume)
 
@@ -1330,9 +1917,10 @@ class NetworkTrainer:
     def _find_latest_state_dir(args: argparse.Namespace) -> Optional[str]:
         """Find the latest training state directory in output_dir for --autoresume.
 
-        Scans output_dir for directories ending in '-state' that contain a valid
-        scheduler.bin, reads the global_step from each, and returns the path with
-        the highest step. Works with epoch-based, step-based, and final states.
+        Scans output_dir for directories ending in '-state', reads the
+        global_step from resume_metadata.json or scheduler.bin, and returns the
+        path with the highest step. Works with epoch-based, step-based, final,
+        and interrupt states. Schedule-free optimizers may not save scheduler.bin.
         """
         if not args.output_dir or not os.path.isdir(args.output_dir):
             return None
@@ -1340,31 +1928,39 @@ class NetworkTrainer:
         best_step = -1
         best_path = None
 
-        for entry in os.listdir(args.output_dir):
+        try:
+            entries = os.listdir(args.output_dir)
+        except OSError:
+            return None
+
+        for entry in entries:
             full_path = os.path.join(args.output_dir, entry)
-            if not os.path.isdir(full_path) or not entry.endswith("-state"):
+            if not entry.endswith("-state") or not train_utils.is_complete_state_dir(full_path):
                 continue
 
-            scheduler_path = os.path.join(full_path, "scheduler.bin")
-            if not os.path.exists(scheduler_path):
-                continue
-
-            # Try resume_metadata.json first (new format, only trust non-zero global_step)
-            metadata = train_utils.load_resume_metadata(full_path)
-            if metadata is not None and metadata.get("global_step", 0) > 0:
-                step = int(metadata["global_step"])
+            # Prefer the explicit completion marker, then resume metadata, then old scheduler state.
+            manifest = train_utils.load_state_manifest(full_path)
+            if manifest is not None and manifest.get("global_step", 0) > 0:
+                step = int(manifest["global_step"])
             else:
-                # Fast path: parse step number from step-based directory names
-                step_match = re.search(r"-step(\d+)-state$", entry)
-                if step_match:
-                    step = int(step_match.group(1))
+                metadata = train_utils.load_resume_metadata(full_path)
+                if metadata is not None and metadata.get("global_step", 0) > 0:
+                    step = int(metadata["global_step"])
                 else:
-                    # Epoch-based or final state: read scheduler.bin for actual global_step
-                    try:
-                        scheduler_state = torch.load(scheduler_path, map_location="cpu", weights_only=True)
-                        step = int(scheduler_state["last_epoch"])
-                    except Exception:
-                        continue
+                    # Fast path: parse step number from step-based directory names
+                    step_match = re.search(r"-step(\d+)-state$", entry)
+                    if step_match:
+                        step = int(step_match.group(1))
+                    else:
+                        # Epoch-based or final state: read scheduler.bin for actual global_step
+                        scheduler_path = os.path.join(full_path, "scheduler.bin")
+                        if not os.path.exists(scheduler_path):
+                            continue
+                        try:
+                            scheduler_state = torch.load(scheduler_path, map_location="cpu", weights_only=True)
+                            step = int(scheduler_state["last_epoch"])
+                        except Exception:
+                            continue
 
             if step > best_step:
                 best_step = step
@@ -2010,7 +2606,7 @@ class NetworkTrainer:
         """Return extra metadata to include in LoRA safetensors. Override in subclasses."""
         return {}
 
-    def post_save_checkpoint_hook(self, args, ckpt_file, ckpt_name, accelerator, force_sync_upload=False):
+    def post_save_checkpoint_hook(self, args, ckpt_file, ckpt_name, accelerator, transformer=None, force_sync_upload=False):
         """Hook called after checkpoint is saved. Override in subclasses for architecture-specific processing."""
         pass
 
@@ -2751,7 +3347,10 @@ class NetworkTrainer:
         if args.network_weights is not None:
             # FIXME consider alpha of weights: this assumes that the alpha is not changed
             weights_sd = self.load_network_weights(args.network_weights, network_module)
-            info = network.load_state_dict(weights_sd, False)
+            if hasattr(network, "load_weights_state_dict"):
+                info = network.load_weights_state_dict(weights_sd, False)
+            else:
+                info = network.load_state_dict(weights_sd, False)
             accelerator.print(f"load network weights from {args.network_weights}: {info}")
 
         # LyCORIS + FP8 backend compatibility:
@@ -2800,6 +3399,7 @@ class NetworkTrainer:
 
         # prepare optimizer, data loader etc.
         accelerator.print("prepare optimizer, data loader etc.")
+        configure_effective_batch_lr_scale(args, train_dataset_group, accelerator.num_processes)
 
         trainable_params, lr_descriptions = self._prepare_network_optimizer_params(args, network)
 
@@ -2818,6 +3418,7 @@ class NetworkTrainer:
                 "weight_decay": 0.0,
                 "group_name": "uncertainty",
             })
+            _refresh_prodigy_plus_late_param_group_state(optimizer)
             logger.info("Added uncertainty log-variance params to optimizer (lr=%.2e)", uncertainty_lr)
 
         def set_trainer_train_mode() -> None:
@@ -2948,6 +3549,7 @@ class NetworkTrainer:
             crepa_params = self._crepa.get_trainable_params()
             if crepa_params:
                 optimizer.add_param_group({"params": crepa_params, "lr": args.learning_rate})
+                _refresh_prodigy_plus_late_param_group_state(optimizer)
                 accelerator.print(f"CREPA: added {sum(p.numel() for p in crepa_params):,} projector params to optimizer")
         if hasattr(self, "_self_flow") and self._self_flow is not None:
             self_flow_params = self._self_flow.get_trainable_params()
@@ -2955,6 +3557,7 @@ class NetworkTrainer:
                 projector_lr = getattr(getattr(self._self_flow, "config", None), "projector_lr", None)
                 effective_projector_lr = float(projector_lr) if projector_lr is not None else float(args.learning_rate)
                 optimizer.add_param_group({"params": self_flow_params, "lr": effective_projector_lr})
+                _refresh_prodigy_plus_late_param_group_state(optimizer)
                 accelerator.print(
                     f"Self-Flow: added {sum(p.numel() for p in self_flow_params):,} projector params to optimizer "
                     f"(lr={effective_projector_lr:g})"
@@ -3024,8 +3627,12 @@ class NetworkTrainer:
                         if proj_sd:
                             proj_file = os.path.join(output_dir, "crepa_projector.safetensors")
                             save_file(proj_sd, proj_file)
+                        state_sd = self._crepa.training_state_dict()
+                        if state_sd:
+                            state_file = os.path.join(output_dir, "crepa_state.safetensors")
+                            save_file(state_sd, state_file)
                     except Exception as e:
-                        logger.warning(f"Failed to save CREPA projector to state dir: {e}")
+                        logger.warning(f"Failed to save CREPA state to state dir: {e}")
                 if hasattr(self, "_self_flow") and self._self_flow is not None:
                     try:
                         from safetensors.torch import save_file
@@ -3062,6 +3669,22 @@ class NetworkTrainer:
                 models.pop(i)
             # print(f"load model hook: {len(models)} models will be loaded")
 
+            if hasattr(self, '_crepa') and self._crepa is not None:
+                try:
+                    from safetensors.torch import load_file
+
+                    proj_file = os.path.join(input_dir, "crepa_projector.safetensors")
+                    if os.path.exists(proj_file):
+                        self._crepa.load_state_dict(load_file(proj_file))
+                        logger.info("CREPA: loaded projector state from %s", proj_file)
+
+                    state_file = os.path.join(input_dir, "crepa_state.safetensors")
+                    if os.path.exists(state_file):
+                        self._crepa.load_training_state_dict(load_file(state_file))
+                        logger.info("CREPA: loaded cutoff state from %s", state_file)
+                except Exception as e:
+                    logger.warning(f"Failed to load CREPA state from checkpoint dir: {e}")
+
             if models:
                 try:
                     runtime_state_path = None
@@ -3078,10 +3701,22 @@ class NetworkTrainer:
                         break
 
                     if adaptive_rank_runtime_state is not None:
+                        old_network_param_ids = {
+                            id(param)
+                            for model in models
+                            for param in accelerator.unwrap_model(model).parameters()
+                        }
                         for model in models:
                             unwrapped_model = accelerator.unwrap_model(model)
                             if hasattr(unwrapped_model, "load_adaptive_rank_runtime_state"):
                                 unwrapped_model.load_adaptive_rank_runtime_state(adaptive_rank_runtime_state)
+                        lr_descriptions[:] = self._refresh_optimizer_param_groups_after_adaptive_rank_resume(
+                            args,
+                            accelerator,
+                            network,
+                            optimizer,
+                            old_network_param_ids=old_network_param_ids,
+                        )
                         logger.info("Loaded adaptive rank runtime state from %s", runtime_state_path)
                 except Exception as e:
                     logger.warning(f"Failed to load adaptive rank runtime state: {e}")
@@ -3131,22 +3766,31 @@ class NetworkTrainer:
             if latest:
                 logger.info(f"autoresume: found latest state directory: {latest}")
                 args.resume = latest
+                args._autoresume_selected = True
             else:
                 logger.info("autoresume: no saved state found in output_dir, starting from scratch")
+                args._autoresume_selected = False
+        else:
+            args._autoresume_selected = False
 
         # resume from local or huggingface — must be after num_update_steps_per_epoch is known
 
-        # save param_groups before resume so we can restore them if --reset_optimizer_params
+        # Save CLI-created param group options before resume. accelerate.load_state()
+        # restores optimizer/scheduler param groups from the checkpoint, so changed
+        # CLI values such as learning_rate otherwise do not take effect on resume.
         inner_optimizer = optimizer.optimizer if hasattr(optimizer, "optimizer") else optimizer
+        cli_param_groups = [{k: v for k, v in pg.items() if k != "params"} for pg in inner_optimizer.param_groups]
         if getattr(args, "reset_optimizer_params", False):
-            saved_param_groups = [{k: v for k, v in pg.items() if k != "params"} for pg in inner_optimizer.param_groups]
+            saved_param_groups = [dict(pg) for pg in cli_param_groups]
 
         # load resume metadata (for mid-epoch skip) before accelerator.load_state
         resume_metadata = None
         if args.resume:
             resume_metadata = train_utils.load_resume_metadata(args.resume)
 
-        initial_global_step = self.resume_from_local_or_hf_if_specified(accelerator, args)
+        initial_global_step = self.resume_from_local_or_hf_if_specified(accelerator, args, network)
+        if not args.resume:
+            resume_metadata = None
         if dashboard_metrics_enabled and accelerator.is_main_process:
             from musubi_tuner.gui_dashboard import create_metrics_writer
 
@@ -3154,14 +3798,39 @@ class NetworkTrainer:
 
         # apply optimizer/scheduler resets after resume
         if initial_global_step > 0:
+            if not getattr(args, "reset_optimizer_params", False):
+                cli_lrs = [
+                    float(pg.get("initial_lr", pg.get("lr", 0.0)))
+                    for pg in cli_param_groups
+                    if "lr" in pg or "initial_lr" in pg
+                ]
+                resumed_lrs = [
+                    float(pg.get("initial_lr", pg.get("lr", 0.0)))
+                    for pg in inner_optimizer.param_groups[: len(cli_lrs)]
+                    if "lr" in pg or "initial_lr" in pg
+                ]
+                if len(cli_lrs) == len(resumed_lrs) and any(
+                    not math.isclose(cli_lr, resumed_lr, rel_tol=1e-6, abs_tol=1e-12)
+                    for cli_lr, resumed_lr in zip(cli_lrs, resumed_lrs)
+                ):
+                    accelerator.print(
+                        "warning: resumed optimizer/scheduler LR state does not match the current CLI LR "
+                        f"(CLI={cli_lrs}, resumed={resumed_lrs}). Use --reset_optimizer_params when changing LR on resume."
+                    )
+
             if getattr(args, "reset_optimizer", False):
                 inner_optimizer.state.clear()
                 accelerator.print("reset optimizer state (cleared momentum/variance)")
 
             if getattr(args, "reset_optimizer_params", False):
                 for pg, saved in zip(inner_optimizer.param_groups, saved_param_groups):
+                    for k in list(pg.keys()):
+                        if k != "params" and k not in saved:
+                            del pg[k]
                     for k, v in saved.items():
                         pg[k] = v
+                    if "initial_lr" in saved:
+                        pg["lr"] = saved["initial_lr"]
                 accelerator.print("reset optimizer param groups to CLI values")
 
             if getattr(args, "reset_optimizer", False) or getattr(args, "reset_optimizer_params", False):
@@ -3192,6 +3861,12 @@ class NetworkTrainer:
                 epoch_to_start = max(saved_epoch - 1, 0)
                 if not getattr(args, "reset_dataloader", False):
                     steps_to_skip_in_epoch = step_in_epoch
+                    if steps_to_skip_in_epoch >= len(train_dataloader):
+                        accelerator.print(
+                            f"resume step_in_epoch={steps_to_skip_in_epoch} is >= current batches per epoch "
+                            f"({len(train_dataloader)}); restarting the epoch. This can happen after changing batch size."
+                        )
+                        steps_to_skip_in_epoch = 0
             else:
                 # epoch-end checkpoint: epoch is complete, start from next
                 epoch_to_start = saved_epoch
@@ -3362,7 +4037,7 @@ class NetworkTrainer:
             del train_dataset_group
 
         # function for saving/removing
-        save_dtype = dit_dtype
+        save_dtype = torch.float32
 
         def save_model(ckpt_name: str, unwrapped_nw, steps, epoch_no, force_sync_upload=False):
             os.makedirs(args.output_dir, exist_ok=True)
@@ -3407,7 +4082,9 @@ class NetworkTrainer:
             unwrapped_nw.save_weights(ckpt_file, save_dtype, metadata_to_save)
 
             # Call post-save hook for architecture-specific processing
-            self.post_save_checkpoint_hook(args, ckpt_file, ckpt_name, accelerator, force_sync_upload)
+            self.post_save_checkpoint_hook(
+                args, ckpt_file, ckpt_name, accelerator, transformer=accelerator.unwrap_model(transformer), force_sync_upload=force_sync_upload
+            )
 
             upload_original = (not getattr(args, "convert_to_comfy", True)) or getattr(args, "save_original_lora", True)
             if args.huggingface_repo_id is not None and upload_original:
@@ -3448,6 +4125,73 @@ class NetworkTrainer:
                     accelerator.print(f"removing old Comfy checkpoint: {comfy_old_ckpt_file}")
                     os.remove(comfy_old_ckpt_file)
             train_utils.remove_checkpoint_metadata(old_ckpt_file)
+
+        def handle_dashboard_stop_request(global_step: int, epoch: int, step_in_epoch: int) -> bool:
+            if not train_utils.dashboard_stop_requested():
+                return False
+
+            if train_utils.dashboard_stop_mode() == "force":
+                accelerator.print("\nDashboard force stop requested; exiting without saving interrupt state.")
+                if gui_metrics is not None and accelerator.is_main_process:
+                    gui_metrics.update_status(
+                        step=global_step,
+                        max_steps=args.max_train_steps,
+                        epoch=epoch + 1,
+                        max_epochs=num_train_epochs,
+                        status="stopped",
+                    )
+                    gui_metrics.close()
+                train_utils.clear_dashboard_stop_request()
+                accelerator.end_training()
+                return True
+
+            if global_step <= 0:
+                accelerator.print("\nDashboard stop requested before training steps completed; exiting without saving state.")
+                if gui_metrics is not None and accelerator.is_main_process:
+                    gui_metrics.update_status(
+                        step=global_step,
+                        max_steps=args.max_train_steps,
+                        epoch=epoch + 1,
+                        max_epochs=num_train_epochs,
+                        status="stopped",
+                    )
+                    gui_metrics.close()
+                train_utils.clear_dashboard_stop_request()
+                accelerator.end_training()
+                return True
+
+            accelerator.print("\nDashboard stop requested; saving interrupt state and exiting training.")
+            set_trainer_eval_mode()
+            accelerator.wait_for_everyone()
+            if accelerator.is_main_process:
+                state_dir = train_utils.save_state_on_interrupt(
+                    args,
+                    accelerator,
+                    global_step=global_step,
+                    epoch=epoch + 1,
+                    step_in_epoch=step_in_epoch,
+                )
+                train_utils.update_resume_metadata(
+                    state_dir,
+                    {
+                        "loss_avg": loss_recorder.moving_average,
+                        "loss_count": len(loss_recorder.loss_list),
+                        "interrupted": True,
+                    },
+                )
+                if gui_metrics is not None:
+                    gui_metrics.log_event("interrupt_state", global_step, path=state_dir)
+                    gui_metrics.update_status(
+                        step=global_step,
+                        max_steps=args.max_train_steps,
+                        epoch=epoch + 1,
+                        max_epochs=num_train_epochs,
+                        status="stopped",
+                    )
+                    gui_metrics.close()
+            train_utils.clear_dashboard_stop_request()
+            accelerator.end_training()
+            return True
 
         def run_validation(step: int, epoch_no: int | None = None) -> None:
             if validation_dataloader is None:
@@ -3576,6 +4320,8 @@ class NetworkTrainer:
 
                             video_pred = out["video_pred"]
                             video_target = out["video_target"]
+                            if float(out.get("video_loss_weight", 1.0)) > 0.0:
+                                video_target = self.apply_differential_guidance_target(args, video_pred, video_target)
                             video_loss_mask = out.get("video_loss_mask")
                             _hfato_data = out.get("_hfato")
                             if _hfato_data is not None:
@@ -3668,6 +4414,8 @@ class NetworkTrainer:
                                 model_pred = model_pred.to(device=target.device, dtype=network_dtype)
                             else:
                                 model_pred = model_pred.to(dtype=network_dtype)
+                            if isinstance(model_pred, torch.Tensor) and isinstance(target, torch.Tensor):
+                                target = self.apply_differential_guidance_target(args, model_pred, target)
                             loss = _per_element_loss(model_pred, target, _loss_type, _huber_delta)
                             if weighting is not None:
                                 loss = loss * weighting
@@ -3850,12 +4598,17 @@ class NetworkTrainer:
 
             accelerator.unwrap_model(network).on_epoch_start(transformer)
             _prev_step_end_time = time.perf_counter()
+            loss = None
+            video_loss_value = None
+            audio_loss_value = None
 
             for step, batch in enumerate(train_dataloader):
                 # mid-epoch resume: skip batches already processed before checkpoint
                 if steps_to_skip_in_epoch > 0:
                     steps_to_skip_in_epoch -= 1
                     continue
+                if handle_dashboard_stop_request(global_step, epoch, step):
+                    return
 
                 _step_start_time = time.perf_counter()
                 _data_wait_time = max(0.0, _step_start_time - _prev_step_end_time)
@@ -3993,6 +4746,8 @@ class NetworkTrainer:
 
                         video_pred = out["video_pred"]
                         video_target = out["video_target"]
+                        if float(out.get("video_loss_weight", 1.0)) > 0.0:
+                            video_target = self.apply_differential_guidance_target(args, video_pred, video_target)
                         video_loss_mask = out.get("video_loss_mask")
                         _hfato_data = out.get("_hfato")
                         if _hfato_data is not None:
@@ -4152,6 +4907,8 @@ class NetworkTrainer:
                             model_pred = model_pred.to(device=target.device, dtype=network_dtype)
                         else:
                             model_pred = model_pred.to(dtype=network_dtype)
+                        if isinstance(model_pred, torch.Tensor) and isinstance(target, torch.Tensor):
+                            target = self.apply_differential_guidance_target(args, model_pred, target)
                         loss = _per_element_loss(model_pred, target, _loss_type, _huber_delta)
 
                     if not dict_output and weighting is not None:
@@ -4173,6 +4930,7 @@ class NetworkTrainer:
 
                     # CREPA loss — must be added before backward (shares computation graph)
                     _crepa_value = None
+                    crepa_metrics = {}
                     if hasattr(self, '_crepa') and self._crepa is not None:
                         self._crepa.on_step(global_step)
                         num_latent_frames = latents_tensor.shape[2]
@@ -4181,6 +4939,7 @@ class NetworkTrainer:
                         if crepa_loss is not None:
                             _crepa_value = crepa_loss.detach().item()
                             loss = loss + crepa_loss
+                        crepa_metrics = self._crepa.get_metrics()
                         self._crepa.cleanup_step()
 
                     # Self-Flow loss
@@ -4260,6 +5019,8 @@ class NetworkTrainer:
                         pres_losses["loss/prior_div"] = _prior_div_value
                     if _crepa_value is not None:
                         pres_losses["loss/crepa"] = _crepa_value
+                    if hasattr(self, '_crepa') and self._crepa is not None:
+                        pres_losses.update(crepa_metrics)
                     if latent_temporal_metrics:
                         pres_losses.update(latent_temporal_metrics)
                     if self_flow_metrics:
@@ -4269,41 +5030,7 @@ class NetworkTrainer:
                     if adaptive_rank_metrics:
                         pres_losses.update(adaptive_rank_metrics)
 
-                    # DEBUG: Check if LoRA parameters have gradients (requires LTX2_DEBUG env var)
-                    if os.environ.get("LTX2_DEBUG", "0") == "1":
-                        unwrapped_net = accelerator.unwrap_model(network)
-                        lora_modules = getattr(unwrapped_net, "unet_loras", [])
-                        if lora_modules:
-                            sample_loras = lora_modules[:3]
-                            for lora in sample_loras:
-                                logger.info(
-                                    f"[DEBUG] LoRA {lora.lora_name}: "
-                                    f"up_norm={lora.lora_up.weight.norm().item():.4f}, "
-                                    f"down_norm={lora.lora_down.weight.norm().item():.4f}"
-                                )
-                                up_grad = lora.lora_up.weight.grad
-                                down_grad = lora.lora_down.weight.grad
-                                
-                                up_stat = "None"
-                                if up_grad is not None:
-                                    up_norm = up_grad.norm().item()
-                                    up_nan = torch.isnan(up_grad).any().item()
-                                    up_inf = torch.isinf(up_grad).any().item()
-                                    up_stat = f"norm={up_norm:.6f} nan={up_nan} inf={up_inf}"
-
-                                down_stat = "None"
-                                if down_grad is not None:
-                                    down_norm = down_grad.norm().item()
-                                    down_nan = torch.isnan(down_grad).any().item()
-                                    down_inf = torch.isinf(down_grad).any().item()
-                                    down_stat = f"norm={down_norm:.6f} nan={down_nan} inf={down_inf}"
-
-                                logger.info(
-                                    f"[DEBUG] LoRA Grad {lora.lora_name}:\n"
-                                    f"  UP  : {up_stat}\n"
-                                    f"  DOWN: {down_stat}"
-                                )
-
+                    debug_snapshots = []
                     if accelerator.sync_gradients:
                         # self.all_reduce_network(accelerator, network)  # sync DDP grad manually
                         state = accelerate.PartialState()
@@ -4355,9 +5082,25 @@ class NetworkTrainer:
                         if args.max_grad_norm != 0.0:
                             accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
 
+                        if os.environ.get("LTX2_DEBUG", "0") == "1":
+                            debug_step = global_step + 1
+                            debug_every = _env_positive_int("LTX2_DEBUG_EVERY", 1)
+                            if debug_step % debug_every == 0:
+                                debug_snapshots = _network_debug_pre_step(
+                                    accelerator.unwrap_model(network),
+                                    optimizer,
+                                    step_label=debug_step,
+                                    max_params=_env_positive_int("LTX2_DEBUG_PARAMS", 12),
+                                )
+
                     if _is_first_step:
                         _log_vram("FIRST_ITER: BEFORE optimizer.step", logger)
                     optimizer.step()
+                    if accelerator.sync_gradients:
+                        unwrapped_network = accelerator.unwrap_model(network)
+                        if hasattr(unwrapped_network, "apply_dora_scale_regularization"):
+                            unwrapped_network.apply_dora_scale_regularization()
+                        _network_debug_post_step(debug_snapshots, step_label=global_step + 1)
                     if _is_first_step:
                         _log_vram("FIRST_ITER: AFTER optimizer.step", logger)
                     if (
@@ -4525,6 +5268,8 @@ class NetworkTrainer:
                                     remove_ckpt_name = train_utils.get_step_ckpt_name(args.output_name, remove_step_no)
                                     remove_model(remove_ckpt_name)
                         set_trainer_train_mode()
+                        if handle_dashboard_stop_request(global_step, epoch, step + 1):
+                            return
 
                 current_loss = loss.detach().item()
                 loss_recorder.add(epoch=epoch, step=step, loss=current_loss)
@@ -4637,6 +5382,8 @@ class NetworkTrainer:
                 _prev_step_end_time = time.perf_counter()
                 if global_step >= args.max_train_steps:
                     break
+                if handle_dashboard_stop_request(global_step, epoch, step + 1):
+                    return
 
             # ensure skip counter doesn't carry into next epoch (e.g. if dataset shrunk)
             steps_to_skip_in_epoch = 0
@@ -4994,7 +5741,7 @@ def setup_parser_common() -> argparse.ArgumentParser:
         "--optimizer_type",
         type=str,
         default="",
-        help="Optimizer to use / オプティマイザの種類: AdamW (default), AdamW8bit, AdaFactor. "
+        help="Optimizer to use / オプティマイザの種類: AdamW (default), AdamW8bit, CAME8bit, AdaFactor, SinkSGD. "
         "Also, you can use any optimizer by specifying the full path to the class, like 'torch.optim.AdamW', 'bitsandbytes.optim.AdEMAMix8bit' or 'bitsandbytes.optim.PagedAdEMAMix8bit' etc. / ",
     )
     parser.add_argument(
@@ -5015,8 +5762,8 @@ def setup_parser_common() -> argparse.ArgumentParser:
     parser.add_argument(
         "--lr_scheduler",
         type=str,
-        default="constant",
-        help="scheduler to use for learning rate / 学習率のスケジューラ: linear, cosine, cosine_with_restarts, polynomial, constant (default), constant_with_warmup, adafactor, rex",
+        default="cosine",
+        help="scheduler to use for learning rate / 学習率のスケジューラ: linear, cosine (default), cosine_with_restarts, polynomial, constant, constant_with_warmup, adafactor, rex",
     )
     parser.add_argument(
         "--lr_warmup_steps",
@@ -5184,6 +5931,25 @@ def setup_parser_common() -> argparse.ArgumentParser:
         type=float,
         default=1.0,
         help="Delta (beta) for Huber/smooth_l1 loss. Below this threshold the loss is ~MSE, above it ~MAE. Only used when --loss_type is huber or smooth_l1.",
+    )
+    parser.add_argument(
+        "--differential_guidance",
+        action="store_true",
+        help=(
+            "Apply ai-toolkit-style differential guidance to the training target: "
+            "target = pred + differential_guidance_scale * (target - pred). "
+            "This is off by default and affects the video/main prediction loss."
+        ),
+    )
+    parser.add_argument(
+        "--differential_guidance_scale",
+        type=float,
+        default=3.0,
+        help=(
+            "Multiplier for --differential_guidance. Default 3.0. "
+            "Values between 0.0 and 1.0, such as 0.5, soften the target difference; "
+            "negative values push the opposite direction."
+        ),
     )
     parser.add_argument(
         "--min_timestep",

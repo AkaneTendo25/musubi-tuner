@@ -863,7 +863,7 @@ def setup_parser() -> argparse.ArgumentParser:
     parser.add_argument("--adam_epsilon", type=float, default=1e-8)
     parser.add_argument("--weight_decay", type=float, default=1e-2)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
-    parser.add_argument("--lr_scheduler", type=str, default="constant", choices=["constant", "linear", "cosine"])
+    parser.add_argument("--lr_scheduler", type=str, default="cosine", choices=["constant", "linear", "cosine"])
     parser.add_argument("--lr_warmup_steps", type=int, default=0)
 
     parser.add_argument("--reconstruction_loss", type=str, default="charbonnier", choices=["l1", "mse", "charbonnier"])

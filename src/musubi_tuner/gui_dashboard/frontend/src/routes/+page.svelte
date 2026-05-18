@@ -25,6 +25,12 @@
 
 	const LTX_DOCS_FALLBACK_URL = 'https://github.com/AkaneTendo25/musubi-tuner/blob/ltx-2/docs/ltx_2.md';
 	const TEMPLATE_VARIANTS_DISABLED = true;
+	const DEFAULT_SINKSGD_LEARNING_RATE = '0.001';
+	const DEFAULT_SINKSGD_DORA_OFT_LEARNING_RATE = '0.0005';
+	const DEFAULT_LEARNING_RATE = '0.000002';
+	const DEFAULT_PPLUS_LEARNING_RATE = '1.0';
+	const DEFAULT_PPLUS_OPTIMIZER_TYPE = 'ProdigyPlusScheduleFree';
+	const DEFAULT_PPLUS_OPTIMIZER_ARGS = 'betas=(0.9,0.99) beta3=None weight_decay=0.0 weight_decay_by_lr=True use_bias_correction=False d0=1e-6 d_coef=1.0 prodigy_steps=0 use_speed=False eps=1e-8 split_groups=True split_groups_mean=False factored=True factored_fp32=True use_stableadamw=True use_cautious=False use_grams=False use_adopt=False d_limiter=True stochastic_rounding=True use_schedulefree=True schedulefree_c=0.0 use_orthograd=False';
 
 	const LORA_FAMILIES = [
 		{
@@ -162,9 +168,13 @@
 				lora_target_preset: 't2v',
 				ic_lora_strategy: 'auto',
 				network_dim: 32,
-				network_alpha: 32,
-				optimizer_type: 'adamw8bit',
-				learning_rate: 1e-4,
+				network_alpha: null,
+				optimizer_type: DEFAULT_PPLUS_OPTIMIZER_TYPE,
+				optimizer_args: DEFAULT_PPLUS_OPTIMIZER_ARGS,
+				sinksgd_orthogonal_sinkhorn: true,
+				learning_rate: null,
+				lr_scheduler: 'constant',
+				max_grad_norm: 0,
 				gradient_checkpointing: true,
 				timestep_sampling: 'shifted_logit_normal',
 				output_dir: repoOutputDir,
@@ -397,17 +407,312 @@
 	}
 
 	// VRAM estimation helpers
-	function gemmaSize(cfg) {
-		// Gemma 3 12B: ~24GB fp16, ~12GB 8bit, ~6GB 4bit
-		if (cfg?.gemma_load_in_4bit) return 6;
-		if (cfg?.gemma_load_in_8bit) return 12;
-		return 24;
+	function activeGemmaSafetensors(cfg, sectionCfg) {
+		return sectionCfg?.gemma_safetensors || cfg?.default_gemma_safetensors || '';
+	}
+
+	function isNativeFp8GemmaSafetensors(path) {
+		const normalized = String(path || '').toLowerCase();
+		return !!normalized && (
+			normalized.includes('fp8') ||
+			normalized.includes('float8') ||
+			normalized.includes('e4m3') ||
+			normalized.includes('e5m2') ||
+			normalized.includes('f8_')
+		);
+	}
+
+	function gemmaEstimate(cfg, sectionCfg) {
+		// Gemma 3 12B: ~24GB fp16/bf16, ~12GB native FP8 or 8-bit, ~6GB 4-bit.
+		const safetensorsPath = activeGemmaSafetensors(cfg, sectionCfg);
+		if (sectionCfg?.gemma_load_in_4bit) return { size: 6, label: 'Gemma 4-bit' };
+		if (sectionCfg?.gemma_load_in_8bit) return { size: 12, label: 'Gemma 8-bit' };
+		if (isNativeFp8GemmaSafetensors(safetensorsPath)) return { size: 12, label: 'Gemma FP8' };
+		return { size: 24, label: 'Gemma' };
 	}
 
 	function vaeSize(cfg) {
 		// LTX-2 VAE: ~1.5GB bf16/fp16, ~3GB fp32
 		const dtype = cfg?.vae_dtype || 'bfloat16';
 		return dtype === 'float32' ? 3.0 : 1.5;
+	}
+
+	function normalizeOptimizerType(value) {
+		return String(value || DEFAULT_PPLUS_OPTIMIZER_TYPE).replace(/[-_\s]/g, '').toLowerCase();
+	}
+
+	function isProdigyPlusOptimizer(value) {
+		const optType = normalizeOptimizerType(value);
+		return ['pplus', 'prodigyplus', 'prodigyplusschedulefree'].includes(optType);
+	}
+
+	function isSinkSgdOptimizer(value) {
+		const optType = normalizeOptimizerType(value);
+		return optType === 'sinksgd' || optType === 'sinksgdadv';
+	}
+
+	function displayScheduler(training) {
+		if (isProdigyPlusOptimizer(training?.optimizer_type)) return 'constant';
+		return training?.lr_scheduler || 'cosine';
+	}
+
+	function displayLearningRate(training) {
+		if (training?.learning_rate !== null && training?.learning_rate !== undefined) return training.learning_rate;
+		if (isProdigyPlusOptimizer(training?.optimizer_type)) return DEFAULT_PPLUS_LEARNING_RATE;
+		if (isSinkSgdOptimizer(training?.optimizer_type)) {
+			return training?.use_dora_oft ? DEFAULT_SINKSGD_DORA_OFT_LEARNING_RATE : DEFAULT_SINKSGD_LEARNING_RATE;
+		}
+		return DEFAULT_LEARNING_RATE;
+	}
+
+	function optimizerBytesPerParam(value, rank) {
+		const optType = normalizeOptimizerType(value);
+		if (isProdigyPlusOptimizer(value)) return 10;
+		if (optType === 'came8bit') {
+			// CAME keeps factored second/residual moments and an 8-bit first moment.
+			// Rank-4 LoRA tensors sit near the quantization threshold, so keep that
+			// estimate conservative.
+			if (rank <= 4) return 6;
+			if (rank <= 8) return 3;
+			return 2;
+		}
+		if (optType === 'sinksgd' || optType === 'sinksgdadv') return 4;
+		if (optType.includes('4bit')) return 5;
+		if (optType.includes('fp8')) return 6;
+		if (optType.startsWith('optimi') || optType.startsWith('torchoptimi')) return 10;
+		if (optType.includes('8bit')) return 6;
+		if (optType.includes('schedulefree') || optType === 'automagic') return 14;
+		return 12;
+	}
+
+	function coerceBool(value) {
+		if (typeof value === 'boolean') return value;
+		if (value == null) return false;
+		if (typeof value === 'number') return value !== 0;
+		return ['1', 'true', 'yes', 'y', 'on'].includes(String(value).trim().replace(/^['"]|['"]$/g, '').toLowerCase());
+	}
+
+	function networkArgValue(rawArgs, key) {
+		if (!rawArgs) return null;
+		const parts = Array.isArray(rawArgs) ? rawArgs.map(String) : String(rawArgs).match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g) || [];
+		for (let part of parts) {
+			part = part.trim().replace(/^['"]|['"]$/g, '');
+			const eq = part.indexOf('=');
+			if (eq < 0) continue;
+			if (part.slice(0, eq).trim().toLowerCase() === key.toLowerCase()) return part.slice(eq + 1).trim();
+		}
+		return null;
+	}
+
+	function trainingUsesDora(t) {
+		// Explicit network_args match command_builder behavior and override the GUI toggle.
+		const explicitDoraOft = networkArgValue(t?.network_args, 'use_dora_oft');
+		if (explicitDoraOft != null) return coerceBool(explicitDoraOft);
+		const explicit = networkArgValue(t?.network_args, 'use_dora');
+		if (explicit != null) return coerceBool(explicit);
+		return coerceBool(t?.use_dora) || coerceBool(t?.use_dokr) || coerceBool(t?.use_dora_oft);
+	}
+
+	function trainingUsesLokr(t) {
+		const networkModule = String(t?.network_module || '').trim().toLowerCase();
+		return networkModule === 'networks.lokr' || coerceBool(t?.use_lokr) || coerceBool(t?.use_dokr);
+	}
+
+	function lokrFactorization(dimension, factor = -1) {
+		if (factor > 0 && dimension % factor === 0) {
+			let m = factor;
+			let n = dimension / factor;
+			if (m > n) [n, m] = [m, n];
+			return [m, n];
+		}
+		if (factor < 0) factor = dimension;
+		let m = 1;
+		let n = dimension;
+		const length = m + n;
+		while (m < n) {
+			let newM = m + 1;
+			while (dimension % newM !== 0) newM += 1;
+			const newN = dimension / newM;
+			if (newM + newN > length || newM > factor) break;
+			m = newM;
+			n = newN;
+		}
+		if (m > n) [n, m] = [m, n];
+		return [m, n];
+	}
+
+	function lokrFactor(t) {
+		let rawFactor = t?.lokr_factor;
+		if (rawFactor == null || rawFactor === '') rawFactor = networkArgValue(t?.network_args, 'factor');
+		const factor = Number.parseInt(rawFactor ?? '-1', 10);
+		return Number.isFinite(factor) && factor > 0 ? factor : -1;
+	}
+
+	function lokrModuleParamCount(inDim, outDim, rank, factor) {
+		const [inM, inN] = lokrFactorization(inDim, factor);
+		const [outL, outK] = lokrFactorization(outDim, factor);
+		const w1Params = outL * inM;
+		const w2Params = rank < Math.max(outK, inN) / 2
+			? rank * (outK + inN)
+			: outK * inN;
+		return w1Params + w2Params;
+	}
+
+	function ltx2LokrTargetShapes(mode, preset) {
+		const modeValue = String(mode || 'video').trim().toLowerCase();
+		const presetValue = String(preset || 't2v').trim().toLowerCase();
+		const hasVideo = modeValue !== 'audio';
+		const hasAudio = modeValue === 'audio' || modeValue === 'av';
+		const blockCount = 48;
+		const shapes = [];
+
+		const add = (inDim, outDim, count) => {
+			if (count > 0) shapes.push([inDim, outDim, count]);
+		};
+		const addVideoSelfAttn = () => { if (hasVideo) add(4096, 4096, 4 * blockCount); };
+		const addVideoCrossAttn = () => { if (hasVideo) add(4096, 4096, 4 * blockCount); };
+		const addAudioAttn = () => { if (hasAudio) add(2048, 2048, 8 * blockCount); };
+		const addCrossModalAttn = () => {
+			if (!(hasVideo && hasAudio)) return;
+			add(4096, 2048, blockCount);
+			add(2048, 2048, 2 * blockCount);
+			add(2048, 4096, blockCount);
+			add(2048, 2048, 2 * blockCount);
+			add(4096, 2048, 2 * blockCount);
+		};
+		const addAllAttn = () => {
+			addVideoSelfAttn();
+			addVideoCrossAttn();
+			addAudioAttn();
+			addCrossModalAttn();
+		};
+		const addVideoFf = (count = blockCount) => {
+			if (!hasVideo) return;
+			add(4096, 16384, count);
+			add(16384, 4096, count);
+		};
+		const addAudioFf = () => {
+			if (!hasAudio) return;
+			add(2048, 8192, blockCount);
+			add(8192, 2048, blockCount);
+		};
+
+		if (presetValue === 't2v' || presetValue === 'lycoris') {
+			addAllAttn();
+		} else if (['v2v', 'av_ic', 'video_ref_only_av', 'full'].includes(presetValue)) {
+			addAllAttn();
+			addVideoFf();
+			addAudioFf();
+		} else if (presetValue === 'video_sa') {
+			addVideoSelfAttn();
+		} else if (presetValue === 'video_sa_ff') {
+			addVideoSelfAttn();
+			addVideoFf();
+		} else if (presetValue === 'video_sa_ca_ff') {
+			addVideoSelfAttn();
+			addVideoCrossAttn();
+			addVideoFf();
+		} else if (presetValue === 'character_training') {
+			addVideoFf(21);
+		} else if (presetValue === 'audio') {
+			addAudioAttn();
+			addAudioFf();
+		} else if (presetValue === 'audio_v2a') {
+			addAudioAttn();
+			addAudioFf();
+			if (hasVideo && hasAudio) {
+				add(2048, 2048, 2 * blockCount);
+				add(4096, 2048, 2 * blockCount);
+			}
+		} else if (presetValue === 'audio_ref_ic' || presetValue === 'audio_ref_only_ic') {
+			addAudioAttn();
+			addAudioFf();
+			addCrossModalAttn();
+		} else {
+			addAllAttn();
+		}
+
+		return shapes;
+	}
+
+	function estimateLokrTrainableParamCount({ rank, factor, mode, preset, includeDora = false }) {
+		let total = 0;
+		for (const [inDim, outDim, count] of ltx2LokrTargetShapes(mode, preset)) {
+			total += lokrModuleParamCount(inDim, outDim, rank, factor) * count;
+			if (includeDora) total += outDim * count;
+		}
+		return total;
+	}
+
+	function doraExtraParamRatio(rank, preset) {
+		if (rank <= 0) return 0;
+		const ffnHeavyPresets = new Set(['v2v', 'video_sa_ff', 'video_sa_ca_ff', 'character_training', 'audio', 'audio_ref_ic', 'audio_ref_only_ic', 'av_ic', 'video_ref_only_av', 'full']);
+		const outputShare = ffnHeavyPresets.has(String(preset || 't2v').trim().toLowerCase()) ? 0.65 : 0.50;
+		return Math.min(outputShare / rank, 0.25);
+	}
+
+	function doraRuntimeOverheadGB({ activationsGB, rank, preset, checkpointed }) {
+		if (activationsGB <= 0) return 0;
+		const ffnHeavyPresets = new Set(['v2v', 'video_sa_ff', 'video_sa_ca_ff', 'character_training', 'audio', 'audio_ref_ic', 'audio_ref_only_ic', 'av_ic', 'video_ref_only_av', 'full']);
+		let baseRatio = ffnHeavyPresets.has(String(preset || 't2v').trim().toLowerCase()) ? 0.06 : 0.035;
+		if (!checkpointed) baseRatio *= 1.5;
+		const rankFactor = 1 + Math.max(0, 8 - rank) / 16;
+		const estimate = activationsGB * baseRatio * Math.min(rankFactor, 1.4);
+		return Math.min(Math.max(estimate, 0.05), 0.45);
+	}
+
+	function chunkReduction(seqLen, chunkSize) {
+		if (seqLen <= 0 || chunkSize <= 0 || chunkSize >= seqLen) return 0;
+		return 1 - (chunkSize / seqLen);
+	}
+
+	function datasetFrameCount(ds, fallback = 33) {
+		const datasetType = String(ds?.type || 'video').trim().toLowerCase();
+		if (datasetType === 'image') return 1;
+		return Math.max(Number(ds?.target_frames || fallback), 1);
+	}
+
+	function datasetVramWorkload(ds) {
+		const resW = Math.max(Number(ds?.resolution_w || 768), 64);
+		const resH = Math.max(Number(ds?.resolution_h || 512), 64);
+		const frames = datasetFrameCount(ds);
+		const batchSize = Math.max(Number(ds?.batch_size || 1), 1);
+		const latentFrames = Math.max(1, Math.floor((frames - 1) / 8) + 1);
+		const latentHeight = Math.max(1, Math.floor(resH / 32));
+		const latentWidth = Math.max(1, Math.floor(resW / 32));
+		return latentFrames * latentHeight * latentWidth * batchSize;
+	}
+
+	function maxVramDataset(datasets) {
+		if (!datasets?.length) return {};
+		const visual = datasets.filter((d) => ['video', 'image'].includes(String(d?.type || '').trim().toLowerCase()));
+		const candidates = visual.length ? visual : datasets;
+		return candidates.reduce((best, current) => datasetVramWorkload(current) > datasetVramWorkload(best) ? current : best, candidates[0]);
+	}
+
+	function ffnChunkActivationMultiplier({ videoSeqLen, audioSeqLen, chunkSize, target, mode, checkpointed }) {
+		const targetValue = String(target || '').trim().toLowerCase();
+		if (!targetValue || targetValue === 'none') return 1;
+
+		const chunk = Math.max(Number(chunkSize || 0), 0);
+		if (chunk <= 0) return 1;
+
+		const modeValue = String(mode || 'video').trim().toLowerCase();
+		let weightedReduction = 0;
+		if (modeValue === 'av') {
+			const videoWeight = targetValue === 'all' || targetValue === 'video' ? 0.8 : 0;
+			const audioWeight = targetValue === 'all' || targetValue === 'audio' ? 0.2 : 0;
+			weightedReduction = videoWeight * chunkReduction(videoSeqLen, chunk) + audioWeight * chunkReduction(audioSeqLen, chunk);
+		} else if (modeValue === 'audio') {
+			weightedReduction = targetValue === 'all' || targetValue === 'audio' ? chunkReduction(audioSeqLen, chunk) : 0;
+		} else {
+			weightedReduction = targetValue === 'all' || targetValue === 'video' ? chunkReduction(videoSeqLen, chunk) : 0;
+		}
+
+		if (weightedReduction <= 0) return 1;
+		const ffnPeakShare = checkpointed ? 0.30 : 0.12;
+		const savings = Math.min(ffnPeakShare * weightedReduction, 0.35);
+		return Math.max(1 - savings, 0.65);
 	}
 
 	// Three separate VRAM estimations
@@ -418,10 +723,10 @@
 		// VAE activation memory scales with input resolution and frames.
 		// Base: ~2.5 GB for 512x768x33f. Scales roughly proportional to pixel*frame count.
 		const allDatasets = cfg?.dataset?.datasets || [];
-		const ds = allDatasets.find((d) => d?.type === 'video' || d?.type === 'image') || allDatasets[0] || {};
+		const ds = maxVramDataset(allDatasets);
 		const resW = Math.max(Number(ds.resolution_w || 768), 64);
 		const resH = Math.max(Number(ds.resolution_h || 512), 64);
-		const frames = Math.max(Number(ds.target_frames || 33), 1);
+		const frames = datasetFrameCount(ds);
 		const basePixelFrames = 512 * 768 * 33;
 		const pixelFrames = resW * resH * frames;
 		const resScale = Math.max(0.5, Math.min(pixelFrames / basePixelFrames, 4.0));
@@ -444,14 +749,14 @@
 	function estimateTextCaching(cfg) {
 		if (!cfg?.caching) return null;
 		const c = cfg.caching;
-		const gemma = gemmaSize(c);
+		const gemma = gemmaEstimate(cfg, c);
 		// Buffer for embeddings and intermediate tensors
 		const buffer = 2.0;
-		const total = gemma + buffer;
+		const total = gemma.size + buffer;
 		return {
 			total: Math.max(total, 1),
 			parts: [
-				{ label: 'Gemma', value: gemma, color: 'var(--accent)' },
+				{ label: gemma.label, value: gemma.size, color: 'var(--accent)' },
 				{ label: 'Buffer', value: buffer, color: 'var(--info)' },
 			]
 		};
@@ -461,14 +766,15 @@
 		if (!cfg?.training) return null;
 		const t = cfg.training;
 		const allDatasets = cfg?.dataset?.datasets || [];
-		const ds = allDatasets.find((d) => d?.type === 'video' || d?.type === 'image') || allDatasets[0] || {};
+		const ds = maxVramDataset(allDatasets);
 
 		// ── DiT weights ──
 		// LTX-2 DiT: 48 transformer blocks. VAE/Gemma NOT resident during training.
 		// LTX 2.0: ~19.6B params → BF16 39 GB, FP8 19.5 GB, FP32 78 GB
 		// LTX 2.3: ~21.0B params → BF16 42 GB, FP8 21 GB, FP32 84 GB
 		const ltxVersion = String(t.ltx_version || '2.3');
-		const ditBF16 = ltxVersion === '2.3' ? 42 : 39;
+		// Keep model weights in GiB to match byte-derived activation/optimizer estimates.
+		const ditBF16 = ltxVersion === '2.3' ? 39.2 : 36.5;
 		const isFp8 = !!t.fp8_base;
 		const isW8A8 = !!t.fp8_w8a8;
 		const isNF4 = !!t.nf4_base;
@@ -491,18 +797,27 @@
 		const isAV = mode === 'av';
 		// Base LoRA size in GB per unit rank (t2v preset, video-only)
 		const loraBasePerRank = isAV ? 12.75 / 1024 : 6.0 / 1024;  // GB per rank
-		const presetMultiplier = { t2v: 1.0, v2v: 1.44, video_sa: 0.37, video_sa_ff: 0.56, video_sa_ca_ff: 0.74, audio: 0.37, audio_v2a: 0.52, audio_ref_only_ic: 0.63, av_ic: 1.44, video_ref_only_av: 1.44, full: 2.1 }[t.lora_target_preset] || 1.0;
-		const loraParamsGB = rank * loraBasePerRank * presetMultiplier;
+		const presetMultiplier = { t2v: 1.0, v2v: 1.44, video_sa: 0.37, video_sa_ff: 0.56, video_sa_ca_ff: 0.74, character_training: 0.20, audio: 0.37, audio_v2a: 0.52, audio_ref_ic: 0.63, audio_ref_only_ic: 0.63, av_ic: 1.44, video_ref_only_av: 1.44, full: 2.1 }[t.lora_target_preset] || 1.0;
+		const usesDora = trainingUsesDora(t);
+		const doraExtraRatio = usesDora ? doraExtraParamRatio(rank, t.lora_target_preset) : 0;
+		let loraParamsGB = rank * loraBasePerRank * presetMultiplier * (1 + doraExtraRatio);
 
 		// ── Optimizer states ──
 		// AdamW fp32: 12 bytes/param (fp32 master + momentum + variance)
 		// AdamW 8-bit: 6 bytes/param (fp32 master + int8 momentum + int8 variance)
 		// Prodigy/ScheduleFree: ~14 bytes/param
-		const loraParamCount = loraParamsGB * (1024 ** 3) / 2;  // bf16 -> param count
-		const optType = String(t.optimizer_type || 'adamw8bit').toLowerCase();
-		const is8bitOpt = optType.includes('8bit');
-		const isScheduleFree = optType.includes('schedulefree') || optType === 'automagic';
-		const optBytesPerParam = is8bitOpt ? 6 : (isScheduleFree ? 14 : 12);
+		let loraParamCount = loraParamsGB * (1024 ** 3) / 2;  // bf16 -> param count
+		if (trainingUsesLokr(t)) {
+			loraParamCount = estimateLokrTrainableParamCount({
+				rank,
+				factor: lokrFactor(t),
+				mode,
+				preset: t.lora_target_preset,
+				includeDora: usesDora,
+			});
+			loraParamsGB = (loraParamCount * 2) / (1024 ** 3);
+		}
+		const optBytesPerParam = optimizerBytesPerParam(t.optimizer_type, rank);
 		const optimStates = (loraParamCount * optBytesPerParam) / (1024 ** 3);
 
 		// ── Gradients ──
@@ -516,17 +831,18 @@
 		// DiT hidden_dim: 4096 (video), 2048 (audio)
 		const resolutionW = Math.max(Number(ds.resolution_w || 768), 64);
 		const resolutionH = Math.max(Number(ds.resolution_h || 512), 64);
-		const sourceFrames = Math.max(Number(ds.target_frames || 33), 1);
+		const sourceFrames = datasetFrameCount(ds);
 		const batchSize = Math.max(Number(ds.batch_size || 1), 1);
 
 		const latentFrames = Math.max(1, Math.floor((sourceFrames - 1) / 8) + 1);
 		const latentHeight = Math.max(1, Math.floor(resolutionH / 32));
 		const latentWidth = Math.max(1, Math.floor(resolutionW / 32));
-		let seqTokens = latentFrames * latentHeight * latentWidth;
+		const videoSeqTokens = latentFrames * latentHeight * latentWidth;
+		const audioSeqTokens = Math.round(sourceFrames);
+		let seqTokens = videoSeqTokens;
 
 		// Audio adds ~25 tokens per second of video (at 25fps)
-		const audioTokens = isAV ? Math.round(sourceFrames) : 0;
-		if (mode === 'audio') seqTokens = Math.round(sourceFrames);  // audio-only
+		if (mode === 'audio') seqTokens = audioSeqTokens;  // audio-only
 
 		const hiddenDim = mode === 'audio' ? 2048 : 4096;
 		const bytesPerValue = isW8A8 ? 1 : 2;
@@ -534,6 +850,7 @@
 		// Per-block activation: ~10 tensors of (batch, seq_len, hidden_dim) without checkpointing,
 		// ~2 with gradient checkpointing (only block boundaries stored, recomputed in backward).
 		// With blockwise checkpointing: ~1 (activations offloaded to CPU).
+		const checkpointed = t.gradient_checkpointing !== false || !!t.blockwise_checkpointing;
 		const activCoeff = (t.gradient_checkpointing === false) ? 10 : (t.blockwise_checkpointing ? 1 : 2);
 
 		// Effective stored layers: without checkpointing all 48; with checkpointing, 48 boundaries
@@ -547,7 +864,14 @@
 		if (isAV) activations *= 1.25;
 
 		// Memory-saving techniques
-		if ((t.ffn_chunk_size || 0) > 0) activations *= 0.90;
+		activations *= ffnChunkActivationMultiplier({
+			videoSeqLen: videoSeqTokens,
+			audioSeqLen: audioSeqTokens,
+			chunkSize: t.ffn_chunk_size || 0,
+			target: t.ffn_chunk_target,
+			mode,
+			checkpointed,
+		});
 		if (t.split_attn_mode || t.split_attn_target) activations *= 0.92;
 		// GC CPU offload: activation checkpoints stored on CPU instead of GPU
 		if (t.gradient_checkpointing_cpu_offload && t.gradient_checkpointing !== false) activations *= 0.35;
@@ -590,7 +914,15 @@
 		// ── CREPA ──
 		const crepaOverhead = t.crepa ? (String(t.crepa_mode || 'backbone') === 'dino' ? 0.08 : 0.15) : 0;
 
-		const total = dit + loraParamsGB + optimStates + loraGrads + activationTotal + gradAccumOverhead + preservationOverhead + selfFlowOverhead + crepaOverhead;
+		// ── DoRA runtime ──
+		const doraRuntimeOverhead = usesDora ? doraRuntimeOverheadGB({
+			activationsGB: activationTotal,
+			rank,
+			preset: t.lora_target_preset,
+			checkpointed,
+		}) : 0;
+
+		const total = dit + loraParamsGB + optimStates + loraGrads + activationTotal + gradAccumOverhead + preservationOverhead + selfFlowOverhead + crepaOverhead + doraRuntimeOverhead;
 
 		// Temporary spikes (not steady-state)
 		const hasSamplePrompts = !!(t.sample_prompts || t.sample_prompts_text);
@@ -608,6 +940,7 @@
 		if (gradAccumOverhead > 0) parts.push({ label: 'GradAccum', value: gradAccumOverhead, color: 'var(--info)' });
 		if (preservationOverhead > 0) parts.push({ label: 'Preserv.', value: preservationOverhead, color: 'var(--danger)' });
 		if (selfFlowOverhead > 0) parts.push({ label: 'Self-Flow', value: selfFlowOverhead, color: 'var(--danger)' });
+		if (doraRuntimeOverhead > 0) parts.push({ label: 'DoRA', value: doraRuntimeOverhead, color: 'var(--secondary, var(--warning))' });
 		if (crepaOverhead > 0) parts.push({ label: 'CREPA', value: crepaOverhead, color: 'var(--secondary, var(--info))' });
 
 		return {
@@ -989,7 +1322,7 @@
 			</div>
 			<div>
 				<div class="text-[9px] uppercase" style="color: var(--text-muted);">LR</div>
-				<div class="text-[13px] font-semibold" style="color: var(--text-primary);">{t.learning_rate || '1e-4'}</div>
+				<div class="text-[13px] font-semibold" style="color: var(--text-primary);">{displayLearningRate(t)}</div>
 			</div>
 			<div>
 				<div class="text-[9px] uppercase" style="color: var(--text-muted);">Dim</div>
@@ -997,15 +1330,15 @@
 			</div>
 			<div>
 				<div class="text-[9px] uppercase" style="color: var(--text-muted);">Alpha</div>
-				<div class="text-[13px] font-semibold tabular-nums" style="color: var(--text-primary);">{t.network_alpha || 16}</div>
+				<div class="text-[13px] font-semibold tabular-nums" style="color: var(--text-primary);">{t.network_alpha ?? (t.network_dim || 4)}</div>
 			</div>
 			<div>
 				<div class="text-[9px] uppercase" style="color: var(--text-muted);">Optimizer</div>
-				<div class="text-[13px] font-semibold truncate" style="color: var(--text-primary);">{(t.optimizer_type || 'adamw8bit').replace('adamw8bit','AdamW8')}</div>
+				<div class="text-[13px] font-semibold truncate" style="color: var(--text-primary);">{t.optimizer_type || DEFAULT_PPLUS_OPTIMIZER_TYPE}</div>
 			</div>
 			<div>
 				<div class="text-[9px] uppercase" style="color: var(--text-muted);">Scheduler</div>
-				<div class="text-[13px] font-semibold truncate" style="color: var(--text-primary);">{(t.lr_scheduler || 'cosine').replace('constant_with_warmup','const+warm')}</div>
+				<div class="text-[13px] font-semibold truncate" style="color: var(--text-primary);">{displayScheduler(t).replace('constant_with_warmup','const+warm')}</div>
 			</div>
 			<div>
 				<div class="text-[9px] uppercase" style="color: var(--text-muted);">Swap</div>

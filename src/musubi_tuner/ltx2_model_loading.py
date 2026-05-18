@@ -14,6 +14,7 @@ from musubi_tuner.modules.nf4_optimization_utils import apply_nf4_monkey_patch, 
 from musubi_tuner.utils.lora_utils import load_safetensors_with_lora_and_fp8
 from musubi_tuner.modules.fp8_optimization_utils import apply_fp8_monkey_patch
 from musubi_tuner.modules.w8a8_optimization_utils import apply_w8a8_monkey_patch
+from musubi_tuner.utils.device_utils import clean_memory_on_device
 
 logger = logging.getLogger(__name__)
 
@@ -674,7 +675,8 @@ def load_ltx2_model(
     if torch_dtype is not None:
         _cast_non_fp8_params(base_model, torch_dtype)
     if fp8_w8a8:
-        apply_w8a8_monkey_patch(base_model, w8a8_mode=w8a8_mode)
+        apply_w8a8_monkey_patch(base_model, w8a8_mode=w8a8_mode, state_dict=sd)
+        clean_memory_on_device(_resolved_quant_device)
         _trace_vram_ltx2("AFTER W8A8 monkey patch")
     _trace_vram_ltx2(f"AFTER _cast_non_fp8_params, BEFORE base_model.to({load_device})")
     base_model = base_model.to(load_device)

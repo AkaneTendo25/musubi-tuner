@@ -484,9 +484,10 @@
 							]} onchange={(e) => update('sample_sampler', e.target.value)} tooltip="Denoising sampler. Auto uses RES 2S for full LTX presets and Euler for distilled two-stage." />
 							<FormSelect fieldPath="inference.sample_sigma_schedule" value={s.sample_sigma_schedule || 'auto'} options={[
 								{ value: 'auto', label: 'Auto' },
-								{ value: 'ltx', label: 'LTX Shifted' },
+								{ value: 'ltx', label: 'LTX Default' },
+								{ value: 'ltx_latent', label: 'LTX Latent Shift' },
 								{ value: 'ltx23_distilled', label: 'LTX 2.3 Distilled' }
-							]} onchange={(e) => update('sample_sigma_schedule', e.target.value)} tooltip="Sigma schedule. Auto uses latent-aware LTX sigmas, with the distilled schedule for distilled presets." />
+							]} onchange={(e) => update('sample_sigma_schedule', e.target.value)} tooltip="Sigma schedule. Auto uses official validation sigmas, latent-aware sigmas for HQ, and distilled sigmas for distilled presets." />
 						</div>
 						<div class="grid grid-cols-3 gap-2">
 							<FormField type="number" fieldPath="inference.width" value={s.width ?? ''} oninput={(e) => update('width', e.target.value ? Number(e.target.value) : null)} min={64} step={64} placeholder="Preset" tooltip="Output width override" />

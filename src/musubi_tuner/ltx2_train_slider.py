@@ -1206,7 +1206,16 @@ class LTX2SliderTrainer:
         network.apply_to(None, transformer, apply_text_encoder=False, apply_unet=True)
 
         if getattr(args, "network_weights", None) is not None:
-            info = network.load_weights(args.network_weights)
+            if str(args.network_weights).endswith(".safetensors"):
+                from safetensors.torch import load_file
+
+                weights_sd = load_file(args.network_weights)
+            else:
+                weights_sd = torch.load(args.network_weights, map_location="cpu")
+            if hasattr(network, "load_weights_state_dict"):
+                info = network.load_weights_state_dict(weights_sd, False)
+            else:
+                info = network.load_state_dict(weights_sd, False)
             logger.info("Loaded network weights from %s: %s", args.network_weights, info)
 
         # Gradient checkpointing
@@ -1356,7 +1365,14 @@ class LTX2SliderTrainer:
             unwrapped_nw.save_weights(ckpt_file, save_dtype, metadata_to_save)
 
             # ComfyUI conversion
-            self._net_trainer.post_save_checkpoint_hook(args, ckpt_file, ckpt_name, accelerator, force_sync_upload)
+            self._net_trainer.post_save_checkpoint_hook(
+                args,
+                ckpt_file,
+                ckpt_name,
+                accelerator,
+                transformer=accelerator.unwrap_model(transformer),
+                force_sync_upload=force_sync_upload,
+            )
 
             upload_original = (not getattr(args, "convert_to_comfy", True)) or getattr(args, "save_original_lora", True)
             if getattr(args, "huggingface_repo_id", None) is not None and upload_original:
@@ -1395,6 +1411,45 @@ class LTX2SliderTrainer:
                     os.remove(comfy_old_ckpt_file)
             train_utils.remove_checkpoint_metadata(old_ckpt_file)
 
+        def handle_dashboard_stop_request(global_step: int) -> bool:
+            if not train_utils.dashboard_stop_requested():
+                return False
+
+            if train_utils.dashboard_stop_mode() == "force":
+                accelerator.print("\nDashboard force stop requested; exiting without saving interrupt state.")
+                train_utils.clear_dashboard_stop_request()
+                accelerator.end_training()
+                return True
+
+            if global_step <= 0:
+                accelerator.print("\nDashboard stop requested before training steps completed; exiting without saving state.")
+                train_utils.clear_dashboard_stop_request()
+                accelerator.end_training()
+                return True
+
+            accelerator.print("\nDashboard stop requested; saving interrupt state and exiting slider training.")
+            optimizer_eval_fn()
+            accelerator.wait_for_everyone()
+            if accelerator.is_main_process:
+                state_dir = train_utils.save_state_on_interrupt(
+                    args,
+                    accelerator,
+                    global_step=global_step,
+                    epoch=0,
+                    step_in_epoch=global_step,
+                )
+                train_utils.update_resume_metadata(
+                    state_dir,
+                    {
+                        "loss_avg": loss_recorder.moving_average,
+                        "loss_count": len(loss_recorder.loss_list),
+                        "interrupted": True,
+                    },
+                )
+            train_utils.clear_dashboard_stop_request()
+            accelerator.end_training()
+            return True
+
         # -- Training loop -----------------------------------------------------
         progress_bar = tqdm(
             range(args.max_train_steps), smoothing=0,
@@ -1431,6 +1486,8 @@ class LTX2SliderTrainer:
             ref_iter = iter(ref_dataloader)
 
         while global_step < args.max_train_steps:
+            if handle_dashboard_stop_request(global_step):
+                return
             accelerator.unwrap_model(network).on_step_start()
 
             with accelerator.accumulate(network):
@@ -1512,6 +1569,8 @@ class LTX2SliderTrainer:
                             remove_model(remove_ckpt_name)
 
                 optimizer_train_fn()
+            if handle_dashboard_stop_request(global_step):
+                return
 
         # -- End of training ---------------------------------------------------
         accelerator.end_training()

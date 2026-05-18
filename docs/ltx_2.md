@@ -401,6 +401,8 @@ See the [LyCORIS algorithm list](https://github.com/KohakuBlueleaf/LyCORIS/blob/
 
 No bundled example TOML files are shipped; provide your own config path.
 
+The native `networks.lokr` / DokR implementation used by this repo targets Linear layers only. It is intended for LTX transformer Linear modules and is not full LyCORIS / ComfyUI LoKr parity for Conv2d, Tucker, or alternate LoKr tensor layouts.
+
 ```bash
 # Install LyCORIS first
 pip install lycoris-lora
@@ -836,7 +838,7 @@ All override flags default to `None` (no override, all modules use `--network_di
 
 #### Adaptive LoRA Rank
 
-Implemented only for standard LoRA (`networks.lora_ltx2` / `networks.lora`).
+Implemented for standard LoRA/DoRA (`networks.lora_ltx2` / `networks.lora`). It is not used by LyCORIS.
 Related paper: [Not All Layers Are Created Equal: Adaptive Rank Allocation in Personalized Diffusion Models](https://arxiv.org/abs/2603.21884).
 
 - `--network_args "adaptive_rank=True"`: Enable adaptive rank.
@@ -852,7 +854,8 @@ Related paper: [Not All Layers Are Created Equal: Adaptive Rank Allocation in Pe
 Behavior:
 - Without `adaptive_rank_hard_prune`, modules keep their configured base rank during training.
 - Export writes standard LoRA weights. Inference reads per-module rank from weight shapes; no adaptive-rank runtime logic is required.
-- `--save_state` also writes `adaptive_rank_runtime.json`. `--resume` restores adaptive/static module structure from it before loading model weights.
+- `--save_state` also writes `adaptive_rank_runtime.json`. `--resume` restores adaptive/static module structure from it before loading model and optimizer weights, so finalized or hard-pruned ranks can resume.
+- Keep the same `--network_dim`, `--network_alpha`, `use_dora`, `--lora_target_preset`, `audio_dim`, and `cross_modal_dim` when resuming an adaptive-rank state.
 - Shared-budget loss uses the sum of expected ranks, not the final exported integer ranks.
 - `adaptive_rank_budget` overrides `adaptive_rank_budget_ratio`.
 - With `audio_dim` / `cross_modal_dim`, each module keeps its own local maximum rank.
@@ -896,6 +899,29 @@ Result:
 
 Precedence is: `cross_modal_dropout` override > `audio_dropout` override for audio-only modules > `video_dropout` override for video-only modules > global `--network_dropout`.
 
+#### DoRA
+
+To train **DoRA** instead of plain LoRA, keep `--network_module networks.lora_ltx2` and add:
+
+```bash
+--network_args "use_dora=true"
+```
+
+DoRA (Weight-Decomposed Low-Rank Adaptation) keeps the low-rank directional update of LoRA, but learns a separate magnitude vector for each output channel. This usually makes the update more selective than plain LoRA at the same rank / alpha.
+
+#### DoRA-OFT
+
+DoRA-OFT keeps the LTX-2 LoRA backend and replaces the low-rank update with scaled OFT rotations plus a DoRA magnitude vector:
+
+```bash
+--network_module networks.lora_ltx2 ^
+--network_args "use_dora_oft=true" "scaled_oft=true" "oft_block_size=8"
+```
+
+Saved checkpoints use native OFTv2-style tensors: `*.oft_R.weight`, `*.oft_R.scaled_oft`, `*.dora_scale`, and `*.initial_norm`. The `initial_norm` tensor is kept so inference loaders can apply the learned magnitude relative to the training base model norms.
+
+DoRA-OFT and DoKr-OFT Comfy-format exports preserve these native Musubi `*.oft_R.*` tensors. Stock ComfyUI's OFT adapter expects `*.oft_blocks` and rotates output-channel blocks, while the LTX implementation rotates input/filter space, so these OFT exports require Musubi's loader path or a patched/custom ComfyUI loader.
+
 #### Preservation & Regularization
 
 Optional techniques that constrain how the LoRA modifies the base model. All are disabled by default with zero overhead.
@@ -933,6 +959,17 @@ The `class` parameter should be a general description without your trigger word 
 ```
 `reference_detach` (default `true`) additionally detaches the reference stream when its timestep sigma is exactly 0.
 
+**TREAD** â€” Training-time token routing from the TREAD paper. This uses the same inline `key=value` CLI style as other musubi options:
+```bash
+--tread selection_ratio=0.5 start_layer_idx=3 end_layer_idx=-4
+```
+- Bare `--tread` uses defaults.
+- Default `selection_ratio` is `0.5`.
+- The default block range is `3/-4` for LTX-2.3 and `2/-2` for LTX-2.0.
+- TREAD is training-only and only applies to LTX video-token paths.
+
+A copy-paste 24GB example that combines TREAD with video-only DOP is included at [docs/examples/ltx23_24gb_tread_dop_cli.ps1](./examples/ltx23_24gb_tread_dop_cli.ps1).
+
 | Technique | Extra forwards/step | Extra backwards/step | Recommended multiplier |
 |-----------|-------------------|---------------------|----------------------|
 | `--blank_preservation` | +2 | +1 | 0.5 - 1.0 |
@@ -941,6 +978,7 @@ The `class` parameter should be a general description without your trigger word 
 | `--audio_dop` | +2 (non-audio steps only) | +1 (non-audio steps only) | 0.3 - 1.0 |
 | `--tarp` | 0 | 0 | N/A (mask only) |
 | `--dcr` | 0 | 0 | N/A (gradient routing) |
+| `--tread` | 0 | 0 | N/A (routing only) |
 
 > [!CAUTION]
 > Each preservation technique adds transformer forward passes per step. Audio DOP costs apply only on non-audio steps. TARP and DCR add no extra passes — they modify the existing forward/backward in-place.
@@ -954,7 +992,7 @@ Enable with `--crepa`. All parameters are passed via `--crepa_args` as `key=valu
 ```bash
 accelerate launch ... ltx2_train_network.py ^
   --crepa ^
-  --crepa_args mode=backbone student_block_idx=16 teacher_block_idx=32 lambda_crepa=0.1 tau=1.0 num_neighbors=2 schedule=constant warmup_steps=0 normalize=true
+  --crepa_args mode=backbone student_block_idx=16 teacher_block_idx=32 lambda_crepa=0.1 tau=1.0 num_neighbors=2 schedule=constant warmup_steps=0 normalize=true crepa_similarity_threshold=0.85 crepa_threshold_mode=permanent
 ```
 
 ##### CREPA CLI Flags
@@ -979,16 +1017,21 @@ accelerate launch ... ltx2_train_network.py ^
 | `warmup_steps` | 0 | Steps before CREPA loss reaches full strength (linear ramp from 0) |
 | `max_steps` | 0 | Total training steps for schedule computation. Auto-filled from `--max_train_steps` if not set |
 | `normalize` | `true` | L2-normalize features before computing cosine similarity |
+| `crepa_similarity_threshold` / `similarity_threshold` | 0.85 | Default-on SimpleTuner-style cutoff. When the EMA alignment score reaches this value, CREPA weight becomes 0. Valid range is `0.0` to `0.99` |
+| `crepa_similarity_ema_decay` / `similarity_ema_decay` | 0.99 | EMA smoothing for the cutoff score. Use `similarity_threshold=none` or `crepa_similarity_threshold=none` to disable the similarity cutoff |
+| `crepa_threshold_mode` / `threshold_mode` | `permanent` | `permanent` keeps CREPA off once the cutoff is reached; `recoverable` can re-enable if the EMA drops below the threshold |
+| `crepa_cutoff_step` / `cutoff_step` | 0 | Optional hard global-step cutoff. `0` disables the step cutoff |
 
 ##### CREPA Checkpoint & Resume
 
 - The projector weights (~33M params for backbone mode) are saved as `crepa_projector.safetensors` in the output directory alongside LoRA checkpoints.
-- When resuming training with `--crepa`, projector weights are automatically loaded from `<output_dir>/crepa_projector.safetensors` if the file exists.
+- The similarity EMA and permanent cutoff flag are saved as `crepa_state.safetensors` so resumed LoRA training keeps the same CREPA cutoff state.
+- When resuming training with `--crepa`, projector weights and cutoff state are automatically loaded from the resume state directory if the files exist.
 - The projector is **not needed at inference** — it's only used during training.
 
 ##### CREPA Monitoring
 
-CREPA adds a `loss/crepa` metric to TensorBoard/WandB logs. A healthy CREPA loss should:
+CREPA adds `loss/crepa`, `crepa/alignment_score`, `crepa/alignment_score_ema`, `crepa/similarity_self`, `crepa/weight`, and `crepa/cutoff` metrics to TensorBoard/WandB logs. A healthy CREPA loss should:
 - Start negative (cosine similarity is being maximized)
 - Gradually decrease (more negative = stronger cross-frame alignment)
 - Stabilize after warmup
@@ -1330,7 +1373,7 @@ Use `--lora_target_preset` to control which layers LoRA targets. For custom laye
 | `video_sa_ca_ff` | Video self-attention + cross-attention + video FFN (`attn1`, `attn2`, `ff`) | Video only | Text-guided controls (video detailing, camera-from-image, sparse tracks) |
 | `audio` | Audio attn/FFN only | Audio only | Audio-only training (auto-selected when `--ltx2_mode audio`) |
 | `audio_v2a` | Audio attn/FFN + `video_to_audio_attn` | Audio + V2A cross-modal | Audio preset plus `video_to_audio_attn` (audio queries over video tokens) |
-| `audio_ref_only_ic` | Audio attn/FFN + bidirectional AV cross-modal | Audio + cross-modal | Audio-reference IC-LoRA |
+| `audio_ref_ic` | Audio attn/FFN + bidirectional AV cross-modal | Audio + cross-modal | Audio-reference IC-LoRA |
 | `av_ic` | All attention + video FFN + audio FFN (same as `v2v`) | Video + audio + cross-modal | Joint AV IC-LoRA. Use `--av_cross_attention_mode` for directional variants and `--av_multi_ref` when configuring a multi-reference AV IC run |
 | `video_ref_only_av` | All attention + video FFN + audio FFN (same as `v2v`) | Video + audio + cross-modal | AV training with reference video only; target audio is still generated |
 | `full` | All linear layers for LoRA targeting | Video + audio + cross-modal | Maximum expressiveness, larger file size |
@@ -1365,7 +1408,6 @@ Example:
 python ltx2_estimate.py ^
   --dataset_config dataset.toml ^
   --ltx2_checkpoint /path/to/ltx-2.3.safetensors ^
-  --mixed_precision bf16 ^
   --ltx_version 2.3 ^
   --ltx2_mode av ^
   --network_module networks.lora_ltx2 ^
@@ -1687,7 +1729,7 @@ accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 ltx2_tr
   --gradient_checkpointing ^
   --network_module networks.lora_ltx2 ^
   --network_dim 128 --network_alpha 128 ^
-  --lora_target_preset audio_ref_only_ic ^
+  --lora_target_preset audio_ref_ic ^
   --audio_ref_use_negative_positions ^
   --audio_ref_mask_cross_attention_to_reference ^
   --audio_ref_mask_reference_from_text_attention ^
@@ -1709,7 +1751,7 @@ accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 ltx2_tr
   --dataset_config dataset.toml ^
   --ltx2_checkpoint /path/to/ltxav-2.safetensors ^
   --ltx2_mode audio ^
-  --ic_lora_strategy audio_ref_only_ic ^
+  --ic_lora_strategy audio_ref_ic ^
   --fp8_base --fp8_scaled ^
   --blocks_to_swap 10 ^
   --sdpa ^
@@ -1742,12 +1784,12 @@ Reference audio latents are precached automatically when using `--precache_sampl
 
 | Argument | Default | Description |
 |----------|---------|-------------|
-| `--ic_lora_strategy audio_ref_only_ic` | auto | Activates audio-reference IC-LoRA mode (auto-inferred from `--lora_target_preset audio_ref_only_ic`) |
-| `--lora_target_preset audio_ref_only_ic` | — | Targets audio attn/FFN + bidirectional AV cross-modal layers |
+| `--ic_lora_strategy audio_ref_ic` | auto | Activates audio-reference IC-LoRA mode (auto-inferred from `--lora_target_preset audio_ref_ic`) |
+| `--lora_target_preset audio_ref_ic` | — | Targets audio attn/FFN + bidirectional AV cross-modal layers |
 | `--audio_ref_use_negative_positions` | off | Place reference audio in negative RoPE time for positional separation |
 | `--audio_ref_mask_cross_attention_to_reference` | off | Block video from attending to reference audio tokens (AV mode only; no effect in audio-only mode) |
 | `--audio_ref_mask_reference_from_text_attention` | off | Block reference audio from attending to text tokens (`av_ic`: currently unsupported and ignored) |
-| `--audio_ref_identity_guidance_scale` | 0.0 | Override CFG scale for target-audio branch during `audio_ref_only_ic` sampling (0 = use standard guidance scale) |
+| `--audio_ref_identity_guidance_scale` | 0.0 | Override CFG scale for target-audio branch during `audio_ref_ic` sampling (0 = use standard guidance scale) |
 
 ##### Dataset Config Options
 
@@ -1830,8 +1872,8 @@ keyframe_guide_extra_strengths         = [0.7]
 | `v2v` | `video` | ✓ | ✓ |
 | `av_ic` | `av` | ✓ | ✓ |
 | `video_ref_only_av` | `av` | ✓ | ✓ |
-| `audio_ref_only_ic` | `av` | ✓ | ✓ |
-| `audio_ref_only_ic` | `audio` | n/a (no video target) | n/a |
+| `audio_ref_ic` | `av` | ✓ | ✓ |
+| `audio_ref_ic` | `audio` | n/a (no video target) | n/a |
 
 `latent_idx` overwrites the noisy-target tensor before patchify, so it works on every branch that produces video tokens. `keyframe` token-append is wired through the `LTX2Wrapper.forward` path for the simple/audio-ref-only paths and via `build_keyframe_extension` for the v2v / av_ic / video_ref_only_av IC-LoRA branches; in all cases the appended timesteps are `(1 − strength) × sigma` and the predictions are sliced off before loss.
 
@@ -1908,7 +1950,7 @@ The prompt file format (`--sample_prompts`) — including guidance scale, negati
 | `--sample_i2v_token_timestep_mask` | on | Use I2V token timestep masking (conditioned tokens use t=0). Use `--no-sample_i2v_token_timestep_mask` to disable |
 | `--sample_sampling_preset` | `defaults` | Validation sampling preset. For `--ltx_version 2.3`, this resolves to the LTX-2.3 defaults (`15` steps, `960x544`, `121` frames, CFG/STG defaults, CFG rescale `0.9`). Use `legacy` only to bypass preset defaults |
 | `--sample_sampler` | `auto` | Denoising sampler. `auto` uses `res_2s` for full LTX presets and Euler for `distilled_two_stage` |
-| `--sample_sigma_schedule` | `auto` | Sigma schedule. `auto` uses latent-aware LTX shifted sigmas and the exact LTX-2.3 distilled schedule for the distilled preset |
+| `--sample_sigma_schedule` | `auto` | Sigma schedule. `auto` uses the official LTX validation schedule, switches to latent-aware shifted sigmas for `ltx23_hq`, and uses the exact LTX-2.3 distilled schedule for the distilled preset. Use `ltx_latent` to force latent-aware sigmas. |
 
 #### Precached Sample Prompts
 To avoid loading Gemma during training for sample generation, you can precache the prompt embeddings:
@@ -1951,6 +1993,10 @@ Prompt-level `--w`, `--h`, `--f`, and `--s` values override preset defaults. For
 
 Saved LoRA checkpoints are converted to ComfyUI format by default. Both the original musubi-tuner format and the ComfyUI format are kept. For the standalone conversion utility, see `convert_lora.py`.
 
+For non-OFT DokR (`--network_module networks.lokr --network_args "use_dora=true"`), the saved `*.comfy.safetensors` file preserves native ComfyUI LoKr tensors (`*.lokr_w1`, `*.lokr_w2` or `*.lokr_w2_a` / `*.lokr_w2_b`, `*.alpha`) and translates Musubi's magnitude vector to ComfyUI `*.dora_scale`. The Musubi-only `*.lora_magnitude_vector.weight` and `*.initial_norm` tensors are not written to the stock non-OFT Comfy export. Loading that Comfy file back through the standalone reverse converter can recreate the native DokR checkpoint when the original base transformer is provided.
+
+DoRA-OFT and DoKr-OFT exports are different: they keep Musubi `*.oft_R.*` rotation tensors and metadata. These files are LTX-2 Comfy-format adapter files for Musubi or patched/custom ComfyUI loaders, not stock ComfyUI OFT `*.oft_blocks` files.
+
 | Flag | Behavior |
 |------|----------|
 | *(default)* | Saves both `*.safetensors` (original) and `*.comfy.safetensors` (ComfyUI). |
@@ -1960,6 +2006,8 @@ Saved LoRA checkpoints are converted to ComfyUI format by default. Both the orig
 
 > **Important:** Training can only be resumed from the **original** (non-comfy) checkpoint format. If you plan to use `--resume`, do not use `--no_save_original_lora`.
 > ComfyUI-only LoRA files can still be used for warm-starting via `--network_weights`, `--base_weights`, or `--dim_from_weights`; only full `--resume` requires the original checkpoint plus saved training state.
+> Standalone non-OFT DokR-to-Comfy conversion for LTX-2 requires the base model weights to translate the magnitude vector to ComfyUI `dora_scale`. The automatic training-time export has access to them; a detached non-OFT DokR checkpoint does not.
+> Standalone Comfy-to-Musubi reconstruction likewise requires `--base_model` / `--dit` only for DoRA/DokR `dora_scale` files that do not also preserve `*.oft_R.weight`; DoRA-OFT states with preserved OFT rotation tensors can be converted back without loading the base transformer.
 
 Checkpoint rotation (`--save_last_n_epochs`) cleans up old ComfyUI checkpoints alongside originals. HuggingFace upload (`--huggingface_repo_id`) uploads both formats by default. Use `--no_save_original_lora` to upload only the ComfyUI checkpoint.
 

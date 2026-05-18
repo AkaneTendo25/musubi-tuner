@@ -375,7 +375,15 @@ class FineTuningTrainer:
         optimizer = None
         optimizer_class = None
 
-        if optimizer_type.endswith("8bit".lower()):
+        # CAME8bit dispatched before the bitsandbytes "8bit" branch since CAME ends in "8bit".
+        if optimizer_type == "CAME8bit".lower():
+            from musubi_tuner.optimizers.came_8bit import CAME8bit
+
+            logger.info(f"use CAME8bit optimizer (stochastic_rounding, cautious, step_parameter) | {optimizer_kwargs}")
+            optimizer_class = CAME8bit
+            optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
+
+        elif optimizer_type.endswith("8bit".lower()):
             try:
                 import bitsandbytes as bnb
             except ImportError:
@@ -438,7 +446,20 @@ class FineTuningTrainer:
                 optimizer_module = importlib.import_module(".".join(values[:-1]))
                 case_sensitive_optimizer_type = values[-1]
 
-            optimizer_class = getattr(optimizer_module, case_sensitive_optimizer_type)
+            optimizer_class = getattr(optimizer_module, case_sensitive_optimizer_type, None)
+            if optimizer_class is None and optimizer_module is torch.optim:
+                optimizer_class = next(
+                    (
+                        getattr(torch.optim, name)
+                        for name in dir(torch.optim)
+                        if name.lower() == case_sensitive_optimizer_type.lower()
+                    ),
+                    None,
+                )
+            if optimizer_class is None:
+                raise AttributeError(
+                    f"module '{optimizer_module.__name__}' has no optimizer '{case_sensitive_optimizer_type}'"
+                )
             optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
 
         # for logging
@@ -1108,6 +1129,10 @@ class FineTuningTrainer:
                             accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
 
                     optimizer.step()
+                    if accelerator.sync_gradients:
+                        unwrapped_transformer = accelerator.unwrap_model(transformer)
+                        if hasattr(unwrapped_transformer, "apply_dora_scale_regularization"):
+                            unwrapped_transformer.apply_dora_scale_regularization()
                     lr_scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
 
@@ -1375,7 +1400,7 @@ def setup_parser() -> argparse.ArgumentParser:
         "--optimizer_type",
         type=str,
         default="",
-        help="Optimizer to use / オプティマイザの種類: AdamW (default), AdamW8bit, AdaFactor. "
+        help="Optimizer to use / オプティマイザの種類: AdamW (default), AdamW8bit, CAME8bit, AdaFactor. "
         "Also, you can use any optimizer by specifying the full path to the class, like 'torch.optim.AdamW', 'bitsandbytes.optim.AdEMAMix8bit' or 'bitsandbytes.optim.PagedAdEMAMix8bit' etc. / ",
     )
     parser.add_argument(
@@ -1396,8 +1421,8 @@ def setup_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--lr_scheduler",
         type=str,
-        default="constant",
-        help="scheduler to use for learning rate / 学習率のスケジューラ: linear, cosine, cosine_with_restarts, polynomial, constant (default), constant_with_warmup, adafactor",
+        default="cosine",
+        help="scheduler to use for learning rate / 学習率のスケジューラ: linear, cosine (default), cosine_with_restarts, polynomial, constant, constant_with_warmup, adafactor",
     )
     parser.add_argument(
         "--lr_warmup_steps",
