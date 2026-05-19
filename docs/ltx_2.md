@@ -1544,11 +1544,11 @@ If you used `--reference_downscale` during caching, also pass it during training
 
 ##### Step 6: Sample Prompts
 
-Use `--v <path>` in your sampling prompts file to specify the V2V reference for each prompt. Both images and videos are supported:
+Append `--v <path>` after the prompt text in your sampling prompts file to specify the V2V reference for each prompt. Both images and videos are supported:
 
 ```
---v references/scene_001.png A woman walking through a forest --n blurry, low quality
---v references/scene_002.mp4 A cat sitting on a windowsill --n distorted
+A woman walking through a forest --v references/scene_001.png --n blurry, low quality
+A cat sitting on a windowsill --v references/scene_002.mp4 --n distorted
 ```
 
 The `--sample_include_reference` flag shows the reference side-by-side with the generated output in validation videos.
@@ -1893,7 +1893,7 @@ Guides take effect on both single-stage and two-stage sampling paths.
 
 #### Sampling with Tiled VAE
 
-The prompt file format (`--sample_prompts`) — including guidance scale, negative prompt, and per-prompt inference parameters — is documented in the [Sampling During Training guide](./sampling_during_training.md). LTX-2 extends this with `--v <path>` (IC-LoRA reference) and `--ra <path>` (audio-reference IC-LoRA) prompt prefixes.
+The prompt file format (`--sample_prompts`) — including guidance scale, negative prompt, and per-prompt inference parameters — is documented in the [Sampling During Training guide](./sampling_during_training.md). LTX-2 extends this with `--v <path>` (IC-LoRA reference) and `--ra <path>` (audio-reference IC-LoRA) prompt-line options. Put these options after the prompt text.
 
 | Argument | Default | Description |
 |----------|---------|-------------|

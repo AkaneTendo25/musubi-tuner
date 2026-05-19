@@ -526,7 +526,9 @@ class LoRANetwork(AdaptiveRankLoRANetworkMixin, torch.nn.Module):
         else:
             logger.info(f"create LoRA network. base dim (rank): {lora_dim}, alpha: {alpha}")
             if self.audio_dim is not None:
-                logger.info(f"audio modules: dim (rank): {self.audio_dim}, alpha: {self.audio_alpha if self.audio_alpha is not None else alpha}")
+                logger.info(
+                    f"audio modules: dim (rank): {self.audio_dim}, alpha: {self.audio_alpha if self.audio_alpha is not None else alpha}"
+                )
             if self.cross_modal_dim is not None:
                 logger.info(
                     f"cross-modal modules: dim (rank): {self.cross_modal_dim}, alpha: {self.cross_modal_alpha if self.cross_modal_alpha is not None else alpha}"
@@ -892,12 +894,12 @@ class LoRANetwork(AdaptiveRankLoRANetworkMixin, torch.nn.Module):
             for key in ("lora", "plus"):
                 if not groups[key]:
                     continue
+                suffix = " plus" if key == "plus" else ""
                 param_data = {"params": list(groups[key].values()), "lr": lr_val}
                 if key == "plus" and self.loraplus_lr_ratio:
                     param_data["lr"] = lr_val * self.loraplus_lr_ratio
                 param_data["group_name"] = f"unet_{desc}{suffix}".replace(" ", "_")
                 all_params.append(param_data)
-                suffix = " plus" if key == "plus" else ""
                 lr_descriptions.append(f"unet_{desc}{suffix}")
 
         # Log group breakdown
