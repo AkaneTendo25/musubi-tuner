@@ -44,6 +44,7 @@ DEFAULT_SAMPLE_LATENTS_CACHE = "ltx2_sample_latents_cache.pt"
 # We don't add these to hv_train_network.line_to_prompt_dict to keep that file
 # model-agnostic. Instead, we re-parse the prompt lines after load_prompts.
 
+
 def _parse_ltx2_guide_spec(s: str) -> Optional[Dict[str, Any]]:
     """Parse 'frame_idx:path[:strength]' into a dict; returns None on failure.
 
@@ -113,10 +114,7 @@ def _augment_prompts_with_ltx2_guide_specs(prompts: List[Dict], prompt_file: str
         return
     try:
         with open(prompt_file, "r", encoding="utf-8") as f:
-            raw_lines = [
-                line.strip() for line in f.readlines()
-                if line.strip() and not line.lstrip().startswith("#")
-            ]
+            raw_lines = [line.strip() for line in f.readlines() if line.strip() and not line.lstrip().startswith("#")]
     except OSError as e:
         logger.warning("Could not re-read %s for LTX-2 guide specs: %s", prompt_file, e)
         return
@@ -124,7 +122,8 @@ def _augment_prompts_with_ltx2_guide_specs(prompts: List[Dict], prompt_file: str
         # Sanity check — load_prompts uses the same filtering rules.
         logger.warning(
             "LTX-2 guide spec parsing skipped: re-read line count (%d) != prompt count (%d)",
-            len(raw_lines), len(prompts),
+            len(raw_lines),
+            len(prompts),
         )
         return
     for prompt, raw_line in zip(prompts, raw_lines):
@@ -165,14 +164,11 @@ def infer_ic_lora_strategy_from_preset(lora_target_preset: Optional[str]) -> str
 def _normalize_av_cross_attention_mode(value: Optional[str]) -> str:
     mode = str(value or "both").lower()
     if mode not in {"both", "a2v_only", "v2a_only", "none"}:
-        raise ValueError(
-            "av_cross_attention_mode must be one of ['both', 'a2v_only', 'v2a_only', 'none']"
-        )
+        raise ValueError("av_cross_attention_mode must be one of ['both', 'a2v_only', 'v2a_only', 'none']")
     return mode
 
 
 class LTX2SamplingMixin:
-
     def _get_audio_preview_config(self, args: argparse.Namespace, transformer) -> Dict[str, int | float]:
         if self._audio_preview_config is not None:
             return self._audio_preview_config
@@ -245,9 +241,7 @@ class LTX2SamplingMixin:
         if ref_value.dim() == expected_ndim + 1:
             refs.extend([ref_value[:, i, ...] for i in range(int(ref_value.shape[1]))])
             return refs
-        raise ValueError(
-            f"Expected reference tensor with ndim {expected_ndim} or {expected_ndim + 1}, got {ref_value.dim()}"
-        )
+        raise ValueError(f"Expected reference tensor with ndim {expected_ndim} or {expected_ndim + 1}, got {ref_value.dim()}")
 
     def _load_audio_components(
         self,
@@ -501,9 +495,7 @@ class LTX2SamplingMixin:
         preset_key = str(preset_name or "").lower()
         resolved_preset_key = "ltx23" if preset_key == "defaults" and ltx_version == "2.3" else preset_key
         warn_ltx23_prompt_overrides = (
-            preset is not None
-            and ltx_version == "2.3"
-            and resolved_preset_key in {"ltx23", "ltx23_hq", "distilled_two_stage"}
+            preset is not None and ltx_version == "2.3" and resolved_preset_key in {"ltx23", "ltx23_hq", "distilled_two_stage"}
         )
         for prompt_index, prompt_data in enumerate(prompts):
             prompt_text = prompt_data.get("prompt", "")
@@ -625,9 +617,7 @@ class LTX2SamplingMixin:
             param["prompt_embeds"] = cache_entry["prompt_embeds"]
             param["prompt_attention_mask"] = cache_entry["prompt_attention_mask"]
             if requires_negative_embed or param.get("negative_prompt"):
-                if cache_entry.get("negative_prompt_embeds") is None or cache_entry.get(
-                    "negative_prompt_attention_mask"
-                ) is None:
+                if cache_entry.get("negative_prompt_embeds") is None or cache_entry.get("negative_prompt_attention_mask") is None:
                     raise ValueError(
                         "Missing negative prompt embeddings in cache entry "
                         f"{idx} ({cache_path}); this prompt needs CFG (guidance/cfg != 1), "
@@ -1012,6 +1002,7 @@ class LTX2SamplingMixin:
 
         def prepare_all_embeddings_batch(sample_params_list: List[Dict]) -> None:
             """Load text encoder once and encode ALL prompts before unloading."""
+
             def _requires_negative_embeddings(sample_parameter: Dict) -> bool:
                 cfg_scale = sample_parameter.get("cfg_scale", None)
                 guidance_scale = sample_parameter.get("guidance_scale", self.default_guidance_scale)
@@ -1030,9 +1021,9 @@ class LTX2SamplingMixin:
             missing_indices = []
             for idx, sample_parameter in enumerate(sample_params_list):
                 needs_prompt = sample_parameter.get("prompt_embeds") is None
-                needs_negative = _requires_negative_embeddings(sample_parameter) and sample_parameter.get(
-                    "negative_prompt_embeds"
-                ) is None
+                needs_negative = (
+                    _requires_negative_embeddings(sample_parameter) and sample_parameter.get("negative_prompt_embeds") is None
+                )
                 if needs_prompt or needs_negative:
                     missing_indices.append(idx)
 
@@ -1091,7 +1082,12 @@ class LTX2SamplingMixin:
         if self._ltx_mode == "audio":
             audio_only_preview = True
         enable_audio_preview = (self._audio_video or audio_only_preview) and not disable_audio_preview
-        if not transformer_offloaded and not use_audio_subprocess and enable_audio_preview and getattr(args, "ltx_mode", "video") in {"av", "audio"}:
+        if (
+            not transformer_offloaded
+            and not use_audio_subprocess
+            and enable_audio_preview
+            and getattr(args, "ltx_mode", "video") in {"av", "audio"}
+        ):
             # High VRAM mode without subprocess: pre-load audio to GPU
             audio_dtype = torch.bfloat16 if args.vae_dtype is None else model_utils.str_to_dtype(args.vae_dtype)
             try:
@@ -1126,16 +1122,34 @@ class LTX2SamplingMixin:
                         if transformer_offloaded:
                             ensure_transformer_on_device()
                             self.sample_image_inference(
-                                accelerator, args, transformer, dit_dtype, vae_for_sampling, save_dir, sample_parameter, epoch, steps,
-                                audio_decoder=audio_decoder, vocoder=vocoder,
+                                accelerator,
+                                args,
+                                transformer,
+                                dit_dtype,
+                                vae_for_sampling,
+                                save_dir,
+                                sample_parameter,
+                                epoch,
+                                steps,
+                                audio_decoder=audio_decoder,
+                                vocoder=vocoder,
                             )
                             offload_transformer_if_needed()
                             vae_for_sampling.to_device("cpu")
                             self._cleanup_cuda(accelerator.device)
                         else:
                             self.sample_image_inference(
-                                accelerator, args, transformer, dit_dtype, vae, save_dir, sample_parameter, epoch, steps,
-                                audio_decoder=audio_decoder, vocoder=vocoder,
+                                accelerator,
+                                args,
+                                transformer,
+                                dit_dtype,
+                                vae,
+                                save_dir,
+                                sample_parameter,
+                                epoch,
+                                steps,
+                                audio_decoder=audio_decoder,
+                                vocoder=vocoder,
                             )
                     except Exception as exc:
                         logger.error("Sampling failed for prompt, skipping: %s", exc, exc_info=True)
@@ -1193,8 +1207,17 @@ class LTX2SamplingMixin:
                                 self._cleanup_cuda(accelerator.device)
                             else:
                                 self.sample_image_inference(
-                                    accelerator, args, transformer, dit_dtype, vae, save_dir, sample_parameter, epoch, steps,
-                                    audio_decoder=audio_decoder, vocoder=vocoder,
+                                    accelerator,
+                                    args,
+                                    transformer,
+                                    dit_dtype,
+                                    vae,
+                                    save_dir,
+                                    sample_parameter,
+                                    epoch,
+                                    steps,
+                                    audio_decoder=audio_decoder,
+                                    vocoder=vocoder,
                                 )
                         except Exception as exc:
                             logger.error("Sampling failed for prompt, skipping: %s", exc, exc_info=True)
@@ -1263,6 +1286,7 @@ class LTX2SamplingMixin:
         if is_video:
             try:
                 import av
+
                 container = av.open(ref_path)
                 for i, frame in enumerate(container.decode(video=0)):
                     if i >= num_frames:
@@ -1329,6 +1353,7 @@ class LTX2SamplingMixin:
         frames = []
         if is_video:
             import av
+
             container = av.open(ref_path)
             for i, frame in enumerate(container.decode(video=0)):
                 if i >= max_frames:
@@ -1639,6 +1664,7 @@ class LTX2SamplingMixin:
         keyframe_specs = sample_parameter.get("keyframe_guide_specs") or []
         if latent_idx_specs or keyframe_specs:
             from musubi_tuner.ltx2_inference import LatentIndexGuide, KeyframeGuide
+
             try:
                 vae_checkpoint = getattr(args, "vae", None) or getattr(args, "ltx2_checkpoint", None)
                 if not vae_checkpoint:
@@ -1686,7 +1712,7 @@ class LTX2SamplingMixin:
                             # slice represents. Endpoint training sets this in
                             # _extract_endpoint_keyframes; mirror it here so --gk
                             # samples don't drift to a wider span.
-                            kf_collapse = (kf_idx == 0)
+                            kf_collapse = kf_idx == 0
                             keyframe_guides_resolved.append(
                                 KeyframeGuide(
                                     latent=lat,
@@ -1780,8 +1806,7 @@ class LTX2SamplingMixin:
             getattr(
                 args,
                 "ic_lora_strategy",
-                self._ic_lora_strategy
-                or infer_ic_lora_strategy_from_preset(getattr(args, "lora_target_preset", "t2v")),
+                self._ic_lora_strategy or infer_ic_lora_strategy_from_preset(getattr(args, "lora_target_preset", "t2v")),
             )
             or "none"
         ).lower()
@@ -1797,9 +1822,7 @@ class LTX2SamplingMixin:
             and v2v_ref_latent is not None
         )
         video_ref_only_av_sampling = (
-            resolved_ic_strategy == "video_ref_only_av"
-            and self._ltx_mode == "av"
-            and v2v_ref_latent is not None
+            resolved_ic_strategy == "video_ref_only_av" and self._ltx_mode == "av" and v2v_ref_latent is not None
         )
         if isinstance(ref_audio_latent, torch.Tensor) and resolved_ic_strategy not in ("audio_ref_only_ic", "av_ic"):
             logger.warning(
@@ -1891,17 +1914,13 @@ class LTX2SamplingMixin:
             sample_parameter["prompt_embeds"] = prompt_embeds
             sample_parameter["prompt_attention_mask"] = prompt_mask
             if do_classifier_free_guidance and sample_parameter.get("negative_prompt_embeds") is None:
-                neg_embeds, neg_mask = self._encode_prompt_text(
-                    accelerator, negative_prompt, text_encoder_dtype
-                )
+                neg_embeds, neg_mask = self._encode_prompt_text(accelerator, negative_prompt, text_encoder_dtype)
                 sample_parameter["negative_prompt_embeds"] = neg_embeds
                 sample_parameter["negative_prompt_attention_mask"] = neg_mask
             loaded_text_encoder = True
         elif do_classifier_free_guidance and sample_parameter.get("negative_prompt_embeds") is None:
             text_encoder_dtype = self._build_text_encoder(args, accelerator)
-            neg_embeds, neg_mask = self._encode_prompt_text(
-                accelerator, negative_prompt, text_encoder_dtype
-            )
+            neg_embeds, neg_mask = self._encode_prompt_text(accelerator, negative_prompt, text_encoder_dtype)
             sample_parameter["negative_prompt_embeds"] = neg_embeds
             sample_parameter["negative_prompt_attention_mask"] = neg_mask
             loaded_text_encoder = True
@@ -2018,7 +2037,9 @@ class LTX2SamplingMixin:
                 vocoder=vocoder,
                 offload_transformer_for_decode=bool(getattr(args, "sample_with_offloading", False)),
                 transformer_offload_device=torch.device("cpu"),
-                restore_transformer_device=not (getattr(args, "sample_with_offloading", False) and accelerator.device.type == "cuda"),
+                restore_transformer_device=not (
+                    getattr(args, "sample_with_offloading", False) and accelerator.device.type == "cuda"
+                ),
                 audio_output_path=wav_path if enable_audio_preview else None,
                 use_audio_subprocess=use_audio_subprocess,
                 enable_audio_preview=enable_audio_conditioning,
@@ -2042,9 +2063,7 @@ class LTX2SamplingMixin:
             ref_path = sample_parameter.get("v2v_ref_path")
             if ref_path and os.path.exists(ref_path):
                 try:
-                    ref_video = self._load_reference_for_output(
-                        ref_path, video.shape[3], video.shape[4], video.shape[2]
-                    )
+                    ref_video = self._load_reference_for_output(ref_path, video.shape[3], video.shape[4], video.shape[2])
                     video = torch.cat([ref_video.to(video.device), video], dim=4)
                 except Exception as e:
                     logger.warning(f"Failed to prepend reference to output: {e}")
@@ -2163,6 +2182,7 @@ class LTX2SamplingMixin:
         prompt_embeds = prompt_embeds.to(device=transformer_device, dtype=dit_dtype)
 
         prompt_mask = sample_parameter.get("prompt_attention_mask")
+
         def _normalize_prompt_mask(mask: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
             if mask is None:
                 return None
@@ -2178,23 +2198,17 @@ class LTX2SamplingMixin:
             if negative_prompt_embeds is not None:
                 if negative_prompt_embeds.dim() == 2:
                     negative_prompt_embeds = negative_prompt_embeds.unsqueeze(0)
-                negative_prompt_embeds = negative_prompt_embeds.to(
-                    device=transformer_device, dtype=dit_dtype
-                )
+                negative_prompt_embeds = negative_prompt_embeds.to(device=transformer_device, dtype=dit_dtype)
                 prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds], dim=0)
                 prompt_mask = _normalize_prompt_mask(prompt_mask)
                 negative_prompt_mask = _normalize_prompt_mask(negative_prompt_mask)
                 if prompt_mask is not None and negative_prompt_mask is not None:
                     prompt_mask = torch.cat([negative_prompt_mask, prompt_mask], dim=0)
                 elif prompt_mask is not None:
-                    logger.warning(
-                        "Sampling: negative prompt mask missing; duplicating prompt mask."
-                    )
+                    logger.warning("Sampling: negative prompt mask missing; duplicating prompt mask.")
                     prompt_mask = torch.cat([prompt_mask, prompt_mask], dim=0)
             else:
-                logger.warning(
-                    "Sampling: negative prompt embeddings missing; duplicating prompt embeds."
-                )
+                logger.warning("Sampling: negative prompt embeddings missing; duplicating prompt embeds.")
                 prompt_embeds = torch.cat([prompt_embeds, prompt_embeds], dim=0)
                 prompt_mask = _normalize_prompt_mask(prompt_mask)
                 if prompt_mask is not None:
@@ -2229,8 +2243,7 @@ class LTX2SamplingMixin:
             getattr(
                 args,
                 "ic_lora_strategy",
-                self._ic_lora_strategy
-                or infer_ic_lora_strategy_from_preset(getattr(args, "lora_target_preset", "t2v")),
+                self._ic_lora_strategy or infer_ic_lora_strategy_from_preset(getattr(args, "lora_target_preset", "t2v")),
             )
             or "none"
         ).lower()
@@ -2241,9 +2254,7 @@ class LTX2SamplingMixin:
             if ref_audio_latents.dim() == 3:
                 ref_audio_latents = ref_audio_latents.unsqueeze(0)
             if ref_audio_latents.dim() != 4:
-                raise ValueError(
-                    f"Expected ref_audio_latents to be 4D [B, C, T, F], got shape: {tuple(ref_audio_latents.shape)}"
-                )
+                raise ValueError(f"Expected ref_audio_latents to be 4D [B, C, T, F], got shape: {tuple(ref_audio_latents.shape)}")
 
         if ref_audio_latents is not None and resolved_ic_strategy not in ("audio_ref_only_ic", "av_ic"):
             logger.warning(
@@ -2253,9 +2264,7 @@ class LTX2SamplingMixin:
             ref_audio_latents = None
 
         audio_ref_only_ic_sampling = (
-            resolved_ic_strategy == "audio_ref_only_ic"
-            and self._ltx_mode in {"av", "audio"}
-            and ref_audio_latents is not None
+            resolved_ic_strategy == "audio_ref_only_ic" and self._ltx_mode in {"av", "audio"} and ref_audio_latents is not None
         )
         av_ic_sampling = (
             resolved_ic_strategy == "av_ic"
@@ -2264,9 +2273,7 @@ class LTX2SamplingMixin:
             and v2v_ref_latents is not None
         )
         video_ref_only_av_sampling = (
-            resolved_ic_strategy == "video_ref_only_av"
-            and self._ltx_mode == "av"
-            and v2v_ref_latents is not None
+            resolved_ic_strategy == "video_ref_only_av" and self._ltx_mode == "av" and v2v_ref_latents is not None
         )
 
         attention_overrides = []
@@ -2274,9 +2281,7 @@ class LTX2SamplingMixin:
             from musubi_tuner.ltx_2.model.transformer.attention import AttentionFunction
 
             logger.info("Sampling: disabling FlashAttention for preview")
-            attention_overrides = self._override_attention_function(
-                transformer, AttentionFunction.PYTORCH
-            )
+            attention_overrides = self._override_attention_function(transformer, AttentionFunction.PYTORCH)
             if prompt_mask is not None:
                 logger.info("Sampling: disabling prompt attention mask for preview")
                 prompt_mask = None
@@ -2297,7 +2302,7 @@ class LTX2SamplingMixin:
                     "Sampling: audio preview disabled; using video-only prompt embeddings (half of dim=%s).",
                     current_dim,
                 )
-                prompt_embeds = prompt_embeds[..., : expected_embed_dim]
+                prompt_embeds = prompt_embeds[..., :expected_embed_dim]
 
         # Setup LTX-2 specific stepper
         from musubi_tuner.ltx_2.model.ltx2_scheduler import EulerDiffusionStep, X0PredictionWrapper
@@ -2409,15 +2414,23 @@ class LTX2SamplingMixin:
         if conditioning_latent is not None:
             # Validate conditioning_latent shape
             if conditioning_latent.dim() != 5:
-                logger.warning(f"I2V: conditioning_latent has wrong dimensions {conditioning_latent.shape}, expected [B,C,T,H,W]. Skipping I2V conditioning.")
+                logger.warning(
+                    f"I2V: conditioning_latent has wrong dimensions {conditioning_latent.shape}, expected [B,C,T,H,W]. Skipping I2V conditioning."
+                )
             elif conditioning_latent.shape[2] != 1:
-                logger.warning(f"I2V: conditioning_latent has {conditioning_latent.shape[2]} frames, expected 1. Skipping I2V conditioning.")
+                logger.warning(
+                    f"I2V: conditioning_latent has {conditioning_latent.shape[2]} frames, expected 1. Skipping I2V conditioning."
+                )
             elif latents.shape[2] < 1:
                 logger.warning("I2V: Video latents have no temporal frames. Skipping I2V conditioning.")
             elif conditioning_latent.shape[1] != latents.shape[1]:
-                logger.warning(f"I2V: Channel dimension mismatch - conditioning {conditioning_latent.shape[1]} vs latents {latents.shape[1]}. Skipping I2V conditioning.")
+                logger.warning(
+                    f"I2V: Channel dimension mismatch - conditioning {conditioning_latent.shape[1]} vs latents {latents.shape[1]}. Skipping I2V conditioning."
+                )
             elif conditioning_latent.shape[-2:] != latents.shape[-2:]:
-                logger.warning(f"I2V: Spatial dimension mismatch - conditioning {conditioning_latent.shape[-2:]} vs latents {latents.shape[-2:]}. Skipping I2V conditioning.")
+                logger.warning(
+                    f"I2V: Spatial dimension mismatch - conditioning {conditioning_latent.shape[-2:]} vs latents {latents.shape[-2:]}. Skipping I2V conditioning."
+                )
             else:
                 try:
                     cond_on_device = conditioning_latent.to(device=latents.device, dtype=latents.dtype)
@@ -2466,13 +2479,11 @@ class LTX2SamplingMixin:
                     for gi, g in enumerate(latent_idx_guides):
                         cond = getattr(g, "latent", None)
                         if cond is None or cond.dim() != 5:
-                            logger.warning("Latent guide %d: invalid shape %s, skipping.",
-                                           gi, tuple(getattr(cond, "shape", ())))
+                            logger.warning("Latent guide %d: invalid shape %s, skipping.", gi, tuple(getattr(cond, "shape", ())))
                             continue
                         cond = cond.to(device=latents.device, dtype=latents.dtype)
                         if cond.shape[1] != ch:
-                            logger.warning("Latent guide %d: channel mismatch (%d vs %d), skipping.",
-                                           gi, cond.shape[1], ch)
+                            logger.warning("Latent guide %d: channel mismatch (%d vs %d), skipping.", gi, cond.shape[1], ch)
                             continue
                         if cond.shape[-2:] != latents.shape[-2:]:
                             b_g, c_g, t_g, _, _ = cond.shape
@@ -2486,7 +2497,10 @@ class LTX2SamplingMixin:
                         if idx < 0 or idx + t_g > total_frames:
                             logger.warning(
                                 "Latent guide %d: latent_idx %d + T %d out of range (total %d), skipping.",
-                                gi, idx, t_g, total_frames,
+                                gi,
+                                idx,
+                                t_g,
+                                total_frames,
                             )
                             continue
                         # Conflict with already-locked first-frame I2V slot: a
@@ -2508,7 +2522,8 @@ class LTX2SamplingMixin:
                         if raw_strength < 0.0 or raw_strength > 1.0:
                             logger.warning(
                                 "Latent guide %d: strength=%.3f outside [0,1]; clamping.",
-                                gi, raw_strength,
+                                gi,
+                                raw_strength,
                             )
                         clamped_strength = max(0.0, min(1.0, raw_strength))
                         # strength=0 means no conditioning. Without skipping, the
@@ -2538,7 +2553,9 @@ class LTX2SamplingMixin:
                             seq_len = total_frames * h_lat * w_lat
                             if i2v_conditioning_mask_tokens is None:
                                 i2v_conditioning_mask_tokens = torch.zeros(
-                                    (bsz, seq_len), device=latents.device, dtype=torch.bool,
+                                    (bsz, seq_len),
+                                    device=latents.device,
+                                    dtype=torch.bool,
                                 )
                             tokens_per_frame = h_lat * w_lat
                             for cond, idx, strength in resolved_li_guides:
@@ -2548,7 +2565,8 @@ class LTX2SamplingMixin:
                                 i2v_conditioning_mask_tokens[:, idx * tokens_per_frame : (idx + t_g) * tokens_per_frame] = True
                         logger.info(
                             "Latent guides: %d guide(s) applied at frame indices %s.",
-                            len(resolved_li_guides), [r[1] for r in resolved_li_guides],
+                            len(resolved_li_guides),
+                            [r[1] for r in resolved_li_guides],
                         )
             except Exception as e:
                 logger.error("Latent guides: failed to setup: %s", e, exc_info=True)
@@ -2559,13 +2577,11 @@ class LTX2SamplingMixin:
             for gi, kg in enumerate(keyframe_guides):
                 gl = getattr(kg, "latent", None)
                 if gl is None or gl.dim() != 5:
-                    logger.warning("Keyframe guide %d: invalid shape %s, skipping.",
-                                   gi, tuple(getattr(gl, "shape", ())))
+                    logger.warning("Keyframe guide %d: invalid shape %s, skipping.", gi, tuple(getattr(gl, "shape", ())))
                     continue
                 gl = gl.to(device=latents.device, dtype=latents.dtype)
                 if gl.shape[1] != latents.shape[1]:
-                    logger.warning("Keyframe guide %d: channel mismatch (%d vs %d), skipping.",
-                                   gi, gl.shape[1], latents.shape[1])
+                    logger.warning("Keyframe guide %d: channel mismatch (%d vs %d), skipping.", gi, gl.shape[1], latents.shape[1])
                     continue
                 if gl.shape[-2:] != latents.shape[-2:]:
                     b_g, c_g, t_g, _, _ = gl.shape
@@ -2581,7 +2597,8 @@ class LTX2SamplingMixin:
                         "Keyframe guide %d at frame_idx=0 with strength=%.2f competes with the "
                         "active first-frame I2V lock; skipping. Use strength<1.0 for an "
                         "auxiliary cue, or remove conditioning_latent if this guide should win.",
-                        gi, kf_strength,
+                        gi,
+                        kf_strength,
                     )
                     continue
                 if i2v_lock_active and kf_frame_idx == 0 and 0.9 <= kf_strength < 1.0:
@@ -2591,7 +2608,8 @@ class LTX2SamplingMixin:
                         "but its effect at this strength may be visually indistinguishable from "
                         "a competing lock. Lower strength or set strength=1.0 explicitly to "
                         "indicate intent.",
-                        gi, kf_strength,
+                        gi,
+                        kf_strength,
                     )
                 kf_dict: Dict[str, Any] = {
                     "latent": gl,
@@ -2608,7 +2626,8 @@ class LTX2SamplingMixin:
             if kf_guide_dicts:
                 logger.info(
                     "Keyframe guides: %d guide(s) at frame indices %s.",
-                    len(kf_guide_dicts), [g["frame_idx"] for g in kf_guide_dicts],
+                    len(kf_guide_dicts),
+                    [g["frame_idx"] for g in kf_guide_dicts],
                 )
             else:
                 kf_guide_dicts = None
@@ -2776,10 +2795,13 @@ class LTX2SamplingMixin:
                 PerturbationConfig as _PertCfg,
                 PerturbationType as _PertType,
             )
-            _bimodal_pert_single = _PertCfg(perturbations=[
-                _Pert(type=_PertType.SKIP_A2V_CROSS_ATTN, blocks=None),
-                _Pert(type=_PertType.SKIP_V2A_CROSS_ATTN, blocks=None),
-            ])
+
+            _bimodal_pert_single = _PertCfg(
+                perturbations=[
+                    _Pert(type=_PertType.SKIP_A2V_CROSS_ATTN, blocks=None),
+                    _Pert(type=_PertType.SKIP_V2A_CROSS_ATTN, blocks=None),
+                ]
+            )
             logger.info(
                 "Sampling: modality guidance video=%.2f audio=%.2f (extra forward pass without cross-modal attention)",
                 _video_modality_scale,
@@ -2793,10 +2815,7 @@ class LTX2SamplingMixin:
             sample_parameter.get("sampling_preset") or getattr(args, "sample_sampling_preset", None),
         )
         if sampler_name == "res_2s" and (
-            audio_latents is not None
-            or audio_ref_only_ic_sampling
-            or av_ic_sampling
-            or video_ref_only_av_sampling
+            audio_latents is not None or audio_ref_only_ic_sampling or av_ic_sampling or video_ref_only_av_sampling
         ):
             logger.warning("Sampling: res_2s is not wired for audio/reference-conditioned path yet; using Euler.")
             sampler_name = "euler"
@@ -2917,16 +2936,18 @@ class LTX2SamplingMixin:
                     if audio_ref_only_ic_sampling and ref_audio_latents_device is not None and ref_audio_seq_len > 0:
                         combined_audio = torch.cat([ref_audio_latents_device, audio_latents], dim=2)
                         audio_model_input = (
-                            torch.cat([combined_audio, combined_audio], dim=0)
-                            if do_classifier_free_guidance
-                            else combined_audio
+                            torch.cat([combined_audio, combined_audio], dim=0) if do_classifier_free_guidance else combined_audio
                         )
                         audio_model_input = audio_model_input.to(dtype=dit_dtype)
 
                         tgt_seq_len = int(audio_latents.shape[2])
-                        target_audio_timestep = sigma.expand(tgt_seq_len).view(1, -1).to(
-                            device=transformer_device,
-                            dtype=dit_dtype,
+                        target_audio_timestep = (
+                            sigma.expand(tgt_seq_len)
+                            .view(1, -1)
+                            .to(
+                                device=transformer_device,
+                                dtype=dit_dtype,
+                            )
                         )
                         ref_audio_timestep = torch.zeros(
                             (1, ref_audio_seq_len),
@@ -2938,15 +2959,17 @@ class LTX2SamplingMixin:
                             audio_timestep_for_model = audio_timestep_for_model.repeat(2, 1)
                     else:
                         audio_model_input = (
-                            torch.cat([audio_latents, audio_latents], dim=0)
-                            if do_classifier_free_guidance
-                            else audio_latents
+                            torch.cat([audio_latents, audio_latents], dim=0) if do_classifier_free_guidance else audio_latents
                         )
                         audio_model_input = audio_model_input.to(dtype=dit_dtype)
-                        audio_timestep_for_model = sigma.expand(audio_model_input.shape[0]).to(
-                            device=transformer_device,
-                            dtype=dit_dtype,
-                        ).unsqueeze(1)
+                        audio_timestep_for_model = (
+                            sigma.expand(audio_model_input.shape[0])
+                            .to(
+                                device=transformer_device,
+                                dtype=dit_dtype,
+                            )
+                            .unsqueeze(1)
+                        )
 
                 # Prepare timestep (sigma in [0, 1])
                 timestep_for_model = sigma.expand(latent_model_input.shape[0]).to(device=transformer_device, dtype=dit_dtype)
@@ -2964,11 +2987,7 @@ class LTX2SamplingMixin:
                 if kf_for_main is not None:
                     resolved_transformer_options["keyframe_guides"] = kf_for_main
 
-                if (
-                    audio_ref_only_ic_sampling
-                    and audio_model_input is not None
-                    and ref_audio_seq_len > 0
-                ):
+                if audio_ref_only_ic_sampling and audio_model_input is not None and ref_audio_seq_len > 0:
                     # ID-LoRA disables attention masks during inference (validation config
                     # sets mask_cross_attention_to_reference=false, mask_ref_audio_to_text=false).
                     # The masks are training scaffolding: they force the model to learn proper
@@ -3057,8 +3076,13 @@ class LTX2SamplingMixin:
                     if _identity_guidance_scale > 0.0 and aud_x0_cond is not None:
                         noref_audio = audio_latents.to(dtype=dit_dtype)
                         tgt_seq_len = int(audio_latents.shape[2])
-                        noref_audio_ts = sigma.expand(tgt_seq_len).view(1, -1).to(
-                            device=transformer_device, dtype=dit_dtype,
+                        noref_audio_ts = (
+                            sigma.expand(tgt_seq_len)
+                            .view(1, -1)
+                            .to(
+                                device=transformer_device,
+                                dtype=dit_dtype,
+                            )
                         )
                         noref_video = latents.to(dtype=dit_dtype)
                         noref_video_ts = sigma.expand(1).to(device=transformer_device, dtype=dit_dtype)
@@ -3088,9 +3112,7 @@ class LTX2SamplingMixin:
                         noref_audio_vel = noref_pred[1] if isinstance(noref_pred, (list, tuple)) else None
                         if noref_audio_vel is not None:
                             noref_audio_vel = noref_audio_vel.to(dtype=audio_latents.dtype)
-                            aud_x0_noref = X0PredictionWrapper.velocity_to_x0(
-                                audio_latents, noref_audio_vel, sigma.item()
-                            )
+                            aud_x0_noref = X0PredictionWrapper.velocity_to_x0(audio_latents, noref_audio_vel, sigma.item())
                             audio_x0 = audio_x0 + _identity_guidance_scale * (aud_x0_cond - aud_x0_noref)
 
                 # --- AV Bimodal CFG: extra forward pass with cross-modal attention disabled ---
@@ -3107,11 +3129,7 @@ class LTX2SamplingMixin:
                     kf_for_bimodal = _kf_for_cfg(False)
                     if kf_for_bimodal is not None:
                         bimodal_options["keyframe_guides"] = kf_for_bimodal
-                    if (
-                        audio_ref_only_ic_sampling
-                        and audio_model_input is not None
-                        and ref_audio_seq_len > 0
-                    ):
+                    if audio_ref_only_ic_sampling and audio_model_input is not None and ref_audio_seq_len > 0:
                         bm_sampling_args = copy.copy(args)
                         bm_sampling_args.audio_ref_mask_cross_attention_to_reference = False
                         bm_sampling_args.audio_ref_mask_reference_from_text_attention = False
@@ -3119,7 +3137,9 @@ class LTX2SamplingMixin:
                             self._build_audio_ref_transformer_overrides(
                                 args=bm_sampling_args,
                                 transformer=transformer,
-                                video_latents=latents.to(dtype=dit_dtype).unsqueeze(0) if latents.dim() == 4 else latents.to(dtype=dit_dtype),
+                                video_latents=latents.to(dtype=dit_dtype).unsqueeze(0)
+                                if latents.dim() == 4
+                                else latents.to(dtype=dit_dtype),
                                 text_embeds=prompt_embeds[1:2],
                                 text_mask=prompt_mask[1:2] if prompt_mask is not None else None,
                                 audio_model_latents=audio_model_input[:1] if audio_model_input is not None else None,
@@ -3141,8 +3161,13 @@ class LTX2SamplingMixin:
                         bm_audio_ts = torch.cat([bm_ref_ts, bm_tgt_ts], dim=1)
                     elif audio_latents is not None:
                         bm_audio_input = audio_latents.to(dtype=dit_dtype)
-                        bm_audio_ts = sigma.expand(int(audio_latents.shape[2])).view(1, -1).to(
-                            device=transformer_device, dtype=dit_dtype,
+                        bm_audio_ts = (
+                            sigma.expand(int(audio_latents.shape[2]))
+                            .view(1, -1)
+                            .to(
+                                device=transformer_device,
+                                dtype=dit_dtype,
+                            )
                         )
                     else:
                         bm_audio_input = None
@@ -3180,9 +3205,7 @@ class LTX2SamplingMixin:
                         if audio_ref_only_ic_sampling and ref_audio_seq_len > 0:
                             bm_audio_pred = bm_audio_pred[:, :, ref_audio_seq_len:, :]
                         bm_audio_pred = bm_audio_pred.to(dtype=audio_latents.dtype)
-                        bm_aud_x0_cond = X0PredictionWrapper.velocity_to_x0(
-                            audio_latents, bm_audio_pred, sigma.item()
-                        )
+                        bm_aud_x0_cond = X0PredictionWrapper.velocity_to_x0(audio_latents, bm_audio_pred, sigma.item())
                         audio_x0 = audio_x0 + (_audio_modality_scale - 1) * (aud_x0_cond - bm_aud_x0_cond)
 
                 # --- STG (Spatio-Temporal Guidance): perturbed forward + steer x0 ---
@@ -3196,6 +3219,7 @@ class LTX2SamplingMixin:
                         PerturbationConfig as _PertCfg_STG,
                         PerturbationType as _PertType_STG,
                     )
+
                     _stg_blocks_arg = getattr(args, "stg_blocks", None)
                     _stg_mode_arg = str(getattr(args, "stg_mode", "video"))
                     _stg_audio_allowed = (
@@ -3207,18 +3231,12 @@ class LTX2SamplingMixin:
 
                     _stg_pert_list = []
                     if _stg_mode_arg in ("video", "both"):
-                        _stg_pert_list.append(
-                            _Pert_STG(type=_PertType_STG.SKIP_VIDEO_SELF_ATTN, blocks=_stg_blocks_arg)
-                        )
+                        _stg_pert_list.append(_Pert_STG(type=_PertType_STG.SKIP_VIDEO_SELF_ATTN, blocks=_stg_blocks_arg))
                     if _stg_audio_allowed:
-                        _stg_pert_list.append(
-                            _Pert_STG(type=_PertType_STG.SKIP_AUDIO_SELF_ATTN, blocks=_stg_blocks_arg)
-                        )
+                        _stg_pert_list.append(_Pert_STG(type=_PertType_STG.SKIP_AUDIO_SELF_ATTN, blocks=_stg_blocks_arg))
 
                     if _stg_pert_list:
-                        _stg_perturbations = _BPC_STG(
-                            perturbations=[_PertCfg_STG(perturbations=_stg_pert_list)]
-                        )
+                        _stg_perturbations = _BPC_STG(perturbations=[_PertCfg_STG(perturbations=_stg_pert_list)])
                         _stg_options = {"patches_replace": {}, "perturbations": _stg_perturbations}
                         if i2v_conditioning_mask_tokens is not None:
                             _stg_options["video_conditioning_mask"] = i2v_conditioning_mask_tokens
@@ -3241,15 +3259,16 @@ class LTX2SamplingMixin:
                         _stg_audio_ts = None
                         if _stg_audio_allowed:
                             _stg_audio = audio_latents.to(dtype=dit_dtype)
-                            _stg_audio_ts = sigma.expand(int(audio_latents.shape[2])).view(1, -1).to(
-                                device=transformer_device, dtype=dit_dtype,
+                            _stg_audio_ts = (
+                                sigma.expand(int(audio_latents.shape[2]))
+                                .view(1, -1)
+                                .to(
+                                    device=transformer_device,
+                                    dtype=dit_dtype,
+                                )
                             )
 
-                        _stg_input = (
-                            [_stg_video, _stg_audio]
-                            if self._audio_video and _stg_audio is not None
-                            else _stg_video
-                        )
+                        _stg_input = [_stg_video, _stg_audio] if self._audio_video and _stg_audio is not None else _stg_video
 
                         _stg_pred = transformer(
                             _stg_input,
@@ -3342,6 +3361,7 @@ class LTX2SamplingMixin:
                 use_tiled_vae = getattr(args, "sample_tiled_vae", False)
                 if use_tiled_vae:
                     from musubi_tuner.ltx_2.model.video_vae import TilingConfig, SpatialTilingConfig, TemporalTilingConfig
+
                     tile_size = getattr(args, "sample_vae_tile_size", 512)
                     tile_overlap = getattr(args, "sample_vae_tile_overlap", 64)
                     temporal_tile_size = getattr(args, "sample_vae_temporal_tile_size", 0)
@@ -3362,11 +3382,15 @@ class LTX2SamplingMixin:
                         ),
                     )
                     if temporal_tile_size > 0:
-                        logger.info("Using tiled VAE decode (spatial=%dx%d, temporal=%d/%d)",
-                                   tile_size, tile_overlap, temporal_tile_size, temporal_tile_overlap)
+                        logger.info(
+                            "Using tiled VAE decode (spatial=%dx%d, temporal=%d/%d)",
+                            tile_size,
+                            tile_overlap,
+                            temporal_tile_size,
+                            temporal_tile_overlap,
+                        )
                     else:
-                        logger.info("Using tiled VAE decode (spatial=%dx%d, no temporal tiling)",
-                                   tile_size, tile_overlap)
+                        logger.info("Using tiled VAE decode (spatial=%dx%d, no temporal tiling)", tile_size, tile_overlap)
                     video = vae.tiled_decode(latents.squeeze(0), tiling_config)
                     if video.dim() == 4:  # [C, T, H, W]
                         video = video.unsqueeze(0)  # [1, C, T, H, W]
@@ -3587,16 +3611,13 @@ class LTX2SamplingMixin:
                 combined_tokens = torch.cat([ref_tokens, target_tokens], dim=1)
 
                 # Target conditioning mask (all False = all denoised)
-                target_conditioning_mask = torch.zeros(
-                    (bsz, target_seq_len), device=transformer_device, dtype=torch.bool
-                )
+                target_conditioning_mask = torch.zeros((bsz, target_seq_len), device=transformer_device, dtype=torch.bool)
                 conditioning_mask = torch.cat([ref_conditioning_mask, target_conditioning_mask], dim=1)
 
                 # Per-token timesteps: ref=0, target=sigma
-                combined_timesteps = sigma.view(1, 1).expand(bsz, ref_seq_len + target_seq_len)
-                combined_timesteps = torch.where(
-                    conditioning_mask, torch.zeros_like(combined_timesteps), combined_timesteps
-                )
+                step_sigma = sigma.view(1).expand(bsz)
+                combined_timesteps = step_sigma.view(bsz, 1).expand(bsz, ref_seq_len + target_seq_len)
+                combined_timesteps = torch.where(conditioning_mask, torch.zeros_like(combined_timesteps), combined_timesteps)
 
                 perturbations = BatchedPerturbationConfig.empty(bsz)
 
@@ -3604,7 +3625,8 @@ class LTX2SamplingMixin:
                     # Duplicate everything for CFG (unconditional + conditional)
                     cfg_tokens = combined_tokens.repeat(2, 1, 1)
                     cfg_timesteps = combined_timesteps.repeat(2, 1)
-                    cfg_positions = combined_positions.repeat(2, 1, 1)
+                    cfg_positions = combined_positions.repeat(2, 1, 1, 1)
+                    cfg_sigma = step_sigma.repeat(2)
                     cfg_perturbations = BatchedPerturbationConfig.empty(bsz * 2)
 
                     video_modality = Modality(
@@ -3613,7 +3635,7 @@ class LTX2SamplingMixin:
                         timesteps=cfg_timesteps,
                         positions=cfg_positions,
                         context=prompt_embeds,  # already [neg+pos, seq, dim] from CFG setup
-                        sigma=sigma,
+                        sigma=cfg_sigma,
                         context_mask=prompt_mask,
                     )
                     pred_tokens, _ = base_model(video_modality, None, cfg_perturbations)
@@ -3626,15 +3648,21 @@ class LTX2SamplingMixin:
                     vel_uncond_5d = patchifier.unpatchify(
                         vel_uncond,
                         output_shape=VideoLatentShape(
-                            batch=bsz, channels=int(latents.shape[1]),
-                            frames=tgt_frames, height=tgt_height, width=tgt_width,
+                            batch=bsz,
+                            channels=int(latents.shape[1]),
+                            frames=tgt_frames,
+                            height=tgt_height,
+                            width=tgt_width,
                         ),
                     ).to(dtype=latents.dtype)
                     vel_cond_5d = patchifier.unpatchify(
                         vel_cond,
                         output_shape=VideoLatentShape(
-                            batch=bsz, channels=int(latents.shape[1]),
-                            frames=tgt_frames, height=tgt_height, width=tgt_width,
+                            batch=bsz,
+                            channels=int(latents.shape[1]),
+                            frames=tgt_frames,
+                            height=tgt_height,
+                            width=tgt_width,
                         ),
                     ).to(dtype=latents.dtype)
 
@@ -3665,7 +3693,7 @@ class LTX2SamplingMixin:
                         timesteps=combined_timesteps,
                         positions=combined_positions,
                         context=prompt_embeds,
-                        sigma=sigma,
+                        sigma=step_sigma,
                         context_mask=prompt_mask,
                     )
                     pred_tokens, _ = base_model(video_modality, None, perturbations)
@@ -3675,8 +3703,11 @@ class LTX2SamplingMixin:
                     target_pred_5d = patchifier.unpatchify(
                         target_pred,
                         output_shape=VideoLatentShape(
-                            batch=bsz, channels=int(latents.shape[1]),
-                            frames=tgt_frames, height=tgt_height, width=tgt_width,
+                            batch=bsz,
+                            channels=int(latents.shape[1]),
+                            frames=tgt_frames,
+                            height=tgt_height,
+                            width=tgt_width,
                         ),
                     ).to(dtype=latents.dtype)
 
@@ -3704,6 +3735,7 @@ class LTX2SamplingMixin:
                 use_tiled_vae = getattr(args, "sample_tiled_vae", False)
                 if use_tiled_vae:
                     from musubi_tuner.ltx_2.model.video_vae import TilingConfig, SpatialTilingConfig, TemporalTilingConfig
+
                     tile_size = getattr(args, "sample_vae_tile_size", 512)
                     tile_overlap = getattr(args, "sample_vae_tile_overlap", 64)
                     temporal_tile_size = getattr(args, "sample_vae_temporal_tile_size", 0)
@@ -3712,7 +3744,9 @@ class LTX2SamplingMixin:
                     effective_temporal_overlap = temporal_tile_overlap if temporal_tile_size > 0 else 0
                     tiling_config = TilingConfig(
                         spatial_config=SpatialTilingConfig(tile_size_in_pixels=tile_size, tile_overlap_in_pixels=tile_overlap),
-                        temporal_config=TemporalTilingConfig(tile_size_in_frames=effective_temporal_size, tile_overlap_in_frames=effective_temporal_overlap),
+                        temporal_config=TemporalTilingConfig(
+                            tile_size_in_frames=effective_temporal_size, tile_overlap_in_frames=effective_temporal_overlap
+                        ),
                     )
                     video = vae.tiled_decode(latents.squeeze(0), tiling_config)
                     if video.dim() == 4:
@@ -3784,9 +3818,7 @@ class LTX2SamplingMixin:
         original_vae_device = getattr(vae, "device", torch.device("cpu"))
         original_vae_dtype = getattr(vae, "dtype", torch.float32)
         resolved_ic_strategy = str(getattr(args, "ic_lora_strategy", "none") or "none").lower()
-        av_cross_attention_mode = _normalize_av_cross_attention_mode(
-            getattr(args, "av_cross_attention_mode", "both")
-        )
+        av_cross_attention_mode = _normalize_av_cross_attention_mode(getattr(args, "av_cross_attention_mode", "both"))
         av_ic_a2v_enabled = av_cross_attention_mode in {"both", "a2v_only"}
         av_ic_v2a_enabled = av_cross_attention_mode in {"both", "v2a_only"}
 
@@ -3828,13 +3860,18 @@ class LTX2SamplingMixin:
 
         ref_video_coords = video_patchifier.get_patch_grid_bounds(
             output_shape=VideoLatentShape(
-                batch=bsz, channels=int(v2v_ref_latents.shape[1]),
-                frames=ref_frames, height=ref_h, width=ref_w,
+                batch=bsz,
+                channels=int(v2v_ref_latents.shape[1]),
+                frames=ref_frames,
+                height=ref_h,
+                width=ref_w,
             ),
             device=transformer_device,
         )
         ref_video_pos = get_pixel_coords(
-            latent_coords=ref_video_coords, scale_factors=SpatioTemporalScaleFactors.default(), causal_fix=True,
+            latent_coords=ref_video_coords,
+            scale_factors=SpatioTemporalScaleFactors.default(),
+            causal_fix=True,
         ).to(dtype=dit_dtype)
         ref_video_pos[:, 0, ...] = ref_video_pos[:, 0, ...] / frame_rate_sample
         if reference_downscale_factor != 1:
@@ -3844,13 +3881,18 @@ class LTX2SamplingMixin:
 
         tgt_video_coords = video_patchifier.get_patch_grid_bounds(
             output_shape=VideoLatentShape(
-                batch=bsz, channels=int(latents.shape[1]),
-                frames=tgt_frames, height=tgt_h, width=tgt_w,
+                batch=bsz,
+                channels=int(latents.shape[1]),
+                frames=tgt_frames,
+                height=tgt_h,
+                width=tgt_w,
             ),
             device=transformer_device,
         )
         tgt_video_pos = get_pixel_coords(
-            latent_coords=tgt_video_coords, scale_factors=SpatioTemporalScaleFactors.default(), causal_fix=True,
+            latent_coords=tgt_video_coords,
+            scale_factors=SpatioTemporalScaleFactors.default(),
+            causal_fix=True,
         ).to(dtype=dit_dtype)
         tgt_video_pos[:, 0, ...] = tgt_video_pos[:, 0, ...] / frame_rate_sample
         video_combined_pos = torch.cat([ref_video_pos, tgt_video_pos], dim=2)
@@ -3932,11 +3974,7 @@ class LTX2SamplingMixin:
         tgt_audio_seq_len = audio_length
         tgt_audio_shape = AudioLatentShape(batch=bsz, channels=channels_audio, frames=tgt_audio_seq_len, mel_bins=mel_bins)
         tgt_audio_pos = audio_patchifier.get_patch_grid_bounds(tgt_audio_shape, device=transformer_device).to(dtype=dit_dtype)
-        audio_combined_pos = (
-            torch.cat([ref_audio_pos, tgt_audio_pos], dim=2)
-            if ref_audio_pos is not None
-            else tgt_audio_pos
-        )
+        audio_combined_pos = torch.cat([ref_audio_pos, tgt_audio_pos], dim=2) if ref_audio_pos is not None else tgt_audio_pos
 
         # Context splitting (done per-step if CFG is enabled due to batch doubling)
         if not do_classifier_free_guidance:
@@ -3958,7 +3996,11 @@ class LTX2SamplingMixin:
 
         logger.info(
             "AV_IC sampling: %d steps, ref_video_frames=%d, tgt_video_frames=%d, ref_audio_T=%d, tgt_audio_T=%d",
-            sample_steps, ref_frames, tgt_frames, ref_audio_seq_len, tgt_audio_seq_len,
+            sample_steps,
+            ref_frames,
+            tgt_frames,
+            ref_audio_seq_len,
+            tgt_audio_seq_len,
         )
 
         with torch.no_grad():
@@ -3988,14 +4030,20 @@ class LTX2SamplingMixin:
 
                 total_video_seq = ref_video_seq_len + tgt_video_seq
                 total_audio_seq = audio_tokens.shape[1]
-                mask_dtype = dit_dtype if dit_dtype in (torch.float16, torch.float32, torch.float64, torch.bfloat16) else torch.float32
+                mask_dtype = (
+                    dit_dtype if dit_dtype in (torch.float16, torch.float32, torch.float64, torch.bfloat16) else torch.float32
+                )
                 neg_inf = torch.finfo(mask_dtype).min
                 a2v_mask = None
                 if not av_ic_a2v_enabled:
-                    a2v_mask = torch.full((bsz, total_video_seq, total_audio_seq), neg_inf, device=transformer_device, dtype=mask_dtype)
+                    a2v_mask = torch.full(
+                        (bsz, total_video_seq, total_audio_seq), neg_inf, device=transformer_device, dtype=mask_dtype
+                    )
                 v2a_mask = None
                 if not av_ic_v2a_enabled:
-                    v2a_mask = torch.full((bsz, total_audio_seq, total_video_seq), neg_inf, device=transformer_device, dtype=mask_dtype)
+                    v2a_mask = torch.full(
+                        (bsz, total_audio_seq, total_video_seq), neg_inf, device=transformer_device, dtype=mask_dtype
+                    )
 
                 if do_classifier_free_guidance:
                     # Duplicate for CFG: [unconditional, conditional]
@@ -4045,8 +4093,11 @@ class LTX2SamplingMixin:
                         return video_patchifier.unpatchify(
                             vel,
                             output_shape=VideoLatentShape(
-                                batch=bsz, channels=int(latents.shape[1]),
-                                frames=tgt_frames, height=tgt_h, width=tgt_w,
+                                batch=bsz,
+                                channels=int(latents.shape[1]),
+                                frames=tgt_frames,
+                                height=tgt_h,
+                                width=tgt_w,
                             ),
                         ).to(dtype=latents.dtype)
 
@@ -4054,8 +4105,10 @@ class LTX2SamplingMixin:
                         return audio_patchifier.unpatchify(
                             vel,
                             output_shape=AudioLatentShape(
-                                batch=bsz, channels=channels_audio,
-                                frames=tgt_audio_seq_len, mel_bins=mel_bins,
+                                batch=bsz,
+                                channels=channels_audio,
+                                frames=tgt_audio_seq_len,
+                                mel_bins=mel_bins,
                             ),
                         ).to(dtype=audio_latents.dtype)
 
@@ -4132,15 +4185,20 @@ class LTX2SamplingMixin:
                     video_vel_5d = video_patchifier.unpatchify(
                         video_vel,
                         output_shape=VideoLatentShape(
-                            batch=bsz, channels=int(latents.shape[1]),
-                            frames=tgt_frames, height=tgt_h, width=tgt_w,
+                            batch=bsz,
+                            channels=int(latents.shape[1]),
+                            frames=tgt_frames,
+                            height=tgt_h,
+                            width=tgt_w,
                         ),
                     ).to(dtype=latents.dtype)
                     audio_vel_4d = audio_patchifier.unpatchify(
                         audio_vel,
                         output_shape=AudioLatentShape(
-                            batch=bsz, channels=channels_audio,
-                            frames=tgt_audio_seq_len, mel_bins=mel_bins,
+                            batch=bsz,
+                            channels=channels_audio,
+                            frames=tgt_audio_seq_len,
+                            mel_bins=mel_bins,
                         ),
                     ).to(dtype=audio_latents.dtype)
 
@@ -4168,6 +4226,7 @@ class LTX2SamplingMixin:
                 use_tiled_vae = getattr(args, "sample_tiled_vae", False)
                 if use_tiled_vae:
                     from musubi_tuner.ltx_2.model.video_vae import TilingConfig, SpatialTilingConfig, TemporalTilingConfig
+
                     tile_size = getattr(args, "sample_vae_tile_size", 512)
                     tile_overlap = getattr(args, "sample_vae_tile_overlap", 64)
                     temporal_tile_size = getattr(args, "sample_vae_temporal_tile_size", 0)
@@ -4176,7 +4235,9 @@ class LTX2SamplingMixin:
                     effective_temporal_overlap = temporal_tile_overlap if temporal_tile_size > 0 else 0
                     tiling_config = TilingConfig(
                         spatial_config=SpatialTilingConfig(tile_size_in_pixels=tile_size, tile_overlap_in_pixels=tile_overlap),
-                        temporal_config=TemporalTilingConfig(tile_size_in_frames=effective_temporal_size, tile_overlap_in_frames=effective_temporal_overlap),
+                        temporal_config=TemporalTilingConfig(
+                            tile_size_in_frames=effective_temporal_size, tile_overlap_in_frames=effective_temporal_overlap
+                        ),
                     )
                     video = vae.tiled_decode(latents.squeeze(0), tiling_config)
                     if video.dim() == 4:
@@ -4357,10 +4418,9 @@ class LTX2SamplingMixin:
         attention_overrides = []
         if getattr(args, "sample_disable_flash_attn", True):
             from musubi_tuner.ltx_2.model.transformer.attention import AttentionFunction
+
             logger.info("Two-stage sampling: disabling FlashAttention for preview")
-            attention_overrides = self._override_attention_function(
-                transformer, AttentionFunction.PYTORCH
-            )
+            attention_overrides = self._override_attention_function(transformer, AttentionFunction.PYTORCH)
 
         try:
             # Run two-stage inference
