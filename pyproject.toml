@@ -65,6 +65,7 @@ dev = [
   "tensorboard",
   "prompt-toolkit==3.0.51",
   "ruff>=0.12.10",
+  "pre-commit>=4.6.0",
 ]
 
 [build-system]
