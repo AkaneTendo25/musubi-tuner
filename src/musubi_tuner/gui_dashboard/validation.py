@@ -53,6 +53,42 @@ def _parse_csv_ints(raw: str | None) -> list[int] | None:
     return values
 
 
+def _parse_remote_stage_specs(raw: str | None) -> tuple[list[tuple[str, int, int, int]], str | None]:
+    if not _has_text(raw):
+        return [], None
+    specs: list[tuple[str, int, int, int]] = []
+    previous_end: int | None = None
+    for index, entry in enumerate(str(raw).split(";")):
+        entry = entry.strip()
+        if not entry:
+            continue
+        parts = entry.rsplit(":", 3)
+        if len(parts) != 4:
+            return [], "Remote Stage Specs entries must use host:port:start:end."
+        host, port_raw, start_raw, end_raw = (part.strip() for part in parts)
+        if not host:
+            return [], f"Remote stage #{index + 1} host must not be empty."
+        try:
+            port = int(port_raw)
+            start = int(start_raw)
+            end = int(end_raw)
+        except ValueError:
+            return [], f"Remote stage #{index + 1} port/start/end must be integers."
+        if not (0 < port < 65536):
+            return [], f"Remote stage #{index + 1} port must be in 1..65535."
+        if start < 0:
+            return [], f"Remote stage #{index + 1} start block must be >= 0."
+        if end <= start:
+            return [], f"Remote stage #{index + 1} end block must be greater than start block."
+        if previous_end is not None and start != previous_end:
+            return [], "Remote Stage Specs must be contiguous."
+        previous_end = end
+        specs.append((host, port, start, end))
+    if not specs:
+        return [], "Remote Stage Specs must contain at least one stage."
+    return specs, None
+
+
 def _make_issue(severity: str, field: str | None, message: str, *, label: str | None = None, page: str | None = None) -> dict[str, Any]:
     issue: dict[str, Any] = {
         "severity": severity,
@@ -302,6 +338,11 @@ def validate_training_config(config: ProjectConfig) -> dict[str, Any]:
         errors.append(_make_issue("error", "training.nf4_base", message, label="NF4 Base", page="training"))
 
     if t.ltx2_model_parallel:
+        if t.ltx2_remote_stage:
+            message = "LTX2 Model Parallel and LTX2 Remote Stage cannot be enabled together."
+            errors.append(_make_issue("error", "training.ltx2_model_parallel", message, label="Model Parallel", page="training"))
+            errors.append(_make_issue("error", "training.ltx2_remote_stage", message, label="Remote Stage", page="training"))
+
         if t.blocks_to_swap not in (None, 0):
             errors.append(
                 _make_issue(
@@ -449,8 +490,211 @@ def validate_training_config(config: ProjectConfig) -> dict[str, Any]:
                         "Model Parallel Splits must contain one fewer value than Model Parallel Devices.",
                         label="Model Parallel Splits",
                         page="training",
+                )
+            )
+
+        if t.ltx2_mp_profile_log_every <= 0:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.ltx2_mp_profile_log_every",
+                    "Model-parallel profile log interval must be greater than 0.",
+                    label="MP Profile Log Every",
+                    page="training",
+                )
+            )
+        if t.ltx2_mp_int8_block_size <= 0:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.ltx2_mp_int8_block_size",
+                    "Model-parallel codec block size must be greater than 0.",
+                    label="MP Codec Block Size",
+                    page="training",
+                )
+            )
+
+    if t.ltx2_remote_stage:
+        if t.blocks_to_swap not in (None, 0):
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.blocks_to_swap",
+                    "LTX2 Remote Stage is incompatible with block swapping.",
+                    label="Blocks To Swap",
+                    page="training",
+                )
+            )
+        if t.blockwise_checkpointing:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.blockwise_checkpointing",
+                    "LTX2 Remote Stage is not compatible with blockwise checkpointing yet.",
+                    label="Blockwise Checkpointing",
+                    page="training",
+                )
+            )
+        if t.compile:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.compile",
+                    "LTX2 Remote Stage is not compatible with torch.compile yet.",
+                    label="Compile",
+                    page="training",
+                )
+            )
+
+        accelerate_args = _split_cli_args(t.accelerate_extra_args)
+        if "--multi_gpu" in accelerate_args:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.accelerate_extra_args",
+                    "LTX2 Remote Stage is single-process; remove --multi_gpu from Accelerate Extra Args.",
+                    label="Accelerate Extra Args",
+                    page="training",
+                )
+            )
+        num_processes = _accelerate_num_processes(t.accelerate_extra_args)
+        if num_processes is not None and num_processes != 1:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.accelerate_extra_args",
+                    "LTX2 Remote Stage requires Accelerate --num_processes 1.",
+                    label="Accelerate Extra Args",
+                    page="training",
+                )
+            )
+        elif num_processes is None:
+            warnings.append(
+                _make_issue(
+                    "warning",
+                    "training.accelerate_extra_args",
+                    "LTX2 Remote Stage should be launched with --num_processes 1.",
+                    label="Accelerate Extra Args",
+                    page="training",
+                )
+            )
+
+        specs, specs_error = _parse_remote_stage_specs(t.ltx2_remote_stage_specs)
+        if specs_error:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.ltx2_remote_stage_specs",
+                    specs_error,
+                    label="Remote Stage Specs",
+                    page="training",
+                )
+            )
+        elif specs:
+            first_start = specs[0][2]
+            last_end = specs[-1][3]
+            if first_start < 0 or last_end > 48:
+                errors.append(
+                    _make_issue(
+                        "error",
+                        "training.ltx2_remote_stage_specs",
+                        "Remote Stage Specs block ranges must stay inside 0..48 for LTX-2.",
+                        label="Remote Stage Specs",
+                        page="training",
                     )
                 )
+            if last_end != 48:
+                errors.append(
+                    _make_issue(
+                        "error",
+                        "training.ltx2_remote_stage_specs",
+                        "Remote Stage Specs must currently cover the suffix through block 48.",
+                        label="Remote Stage Specs",
+                        page="training",
+                    )
+                )
+        else:
+            if not _has_text(t.ltx2_remote_stage_host):
+                errors.append(
+                    _make_issue(
+                        "error",
+                        "training.ltx2_remote_stage_host",
+                        "Remote Stage Host is required when specs are empty.",
+                        label="Remote Stage Host",
+                        page="training",
+                    )
+                )
+            if not (0 < int(t.ltx2_remote_stage_port) < 65536):
+                errors.append(
+                    _make_issue(
+                        "error",
+                        "training.ltx2_remote_stage_port",
+                        "Remote Stage Port must be in 1..65535.",
+                        label="Remote Stage Port",
+                        page="training",
+                    )
+                )
+            if t.ltx2_remote_stage_split < 0 or t.ltx2_remote_stage_split >= 48:
+                errors.append(
+                    _make_issue(
+                        "error",
+                        "training.ltx2_remote_stage_split",
+                        "Remote Stage Split must be a block index in 0..47.",
+                        label="Remote Stage Split",
+                        page="training",
+                    )
+                )
+
+        if t.ltx2_remote_stage_timeout <= 0:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.ltx2_remote_stage_timeout",
+                    "Remote Stage Timeout must be greater than 0.",
+                    label="Remote Stage Timeout",
+                    page="training",
+                )
+            )
+        if t.ltx2_remote_stage_int8_block_size <= 0:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.ltx2_remote_stage_int8_block_size",
+                    "Remote Stage codec block size must be greater than 0.",
+                    label="Remote Stage Codec Block Size",
+                    page="training",
+                )
+            )
+        if t.ltx2_remote_stage_metadata_cache_size <= 0:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.ltx2_remote_stage_metadata_cache_size",
+                    "Remote Stage Metadata Cache Size must be greater than 0.",
+                    label="Remote Metadata Cache Size",
+                    page="training",
+                )
+            )
+        if t.ltx2_remote_stage_aq_cache_size < 0:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.ltx2_remote_stage_aq_cache_size",
+                    "Remote Stage AQ Cache Size must be >= 0.",
+                    label="Remote AQ Cache Size",
+                    page="training",
+                )
+            )
+        if t.ltx2_remote_stage_trainable_scope != "auto" and not t.ltx2_remote_stage_trainable:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.ltx2_remote_stage_trainable_scope",
+                    "Remote Stage Trainable Scope requires Remote Stage Trainable.",
+                    label="Remote Trainable Scope",
+                    page="training",
+                )
+            )
 
     if t.awq_calibration and not t.nf4_base:
         message = "AWQ Calibration requires NF4 Base."
@@ -569,6 +813,341 @@ def validate_training_config(config: ProjectConfig) -> dict[str, Any]:
             )
         for index, entry in enumerate(config.dataset.datasets):
             _validate_dataset_entry(entry, index, errors=errors, warnings=warnings)
+
+    return _build_report(errors, warnings)
+
+
+def _has_remote_stage_server_checkpoint(config: ProjectConfig) -> bool:
+    return _has_text(config.remote_stage_server.ltx2_checkpoint) or _has_text(config.default_ltx2_checkpoint)
+
+
+def validate_remote_stage_server_config(config: ProjectConfig) -> dict[str, Any]:
+    """Validate the remote stage server launcher config."""
+    r = config.remote_stage_server
+    errors: list[dict[str, Any]] = []
+    warnings: list[dict[str, Any]] = []
+
+    if not _has_remote_stage_server_checkpoint(config):
+        errors.append(
+            _make_issue(
+                "error",
+                "remote_stage_server.ltx2_checkpoint",
+                "LTX-2 Checkpoint is required.",
+                label="LTX-2 Checkpoint",
+                page="training",
+            )
+        )
+
+    if _has_text(r.ltx2_checkpoint):
+        checkpoint_path = _resolve_project_path(config, r.ltx2_checkpoint)
+        if checkpoint_path is not None and not checkpoint_path.exists():
+            errors.append(
+                _make_issue(
+                    "error",
+                    "remote_stage_server.ltx2_checkpoint",
+                    f"LTX-2 Checkpoint file not found: {checkpoint_path}",
+                    label="LTX-2 Checkpoint",
+                    page="training",
+                )
+            )
+
+    if not _has_text(r.bind):
+        errors.append(
+            _make_issue(
+                "error",
+                "remote_stage_server.bind",
+                "Bind host is required.",
+                label="Bind",
+                page="training",
+            )
+        )
+
+    if not (0 < int(r.port) < 65536):
+        errors.append(
+            _make_issue(
+                "error",
+                "remote_stage_server.port",
+                "Port must be in 1..65535.",
+                label="Port",
+                page="training",
+            )
+        )
+
+    if not _has_text(r.device):
+        errors.append(
+            _make_issue(
+                "error",
+                "remote_stage_server.device",
+                "Device is required.",
+                label="Device",
+                page="training",
+            )
+        )
+
+    if r.split < 0:
+        errors.append(
+            _make_issue(
+                "error",
+                "remote_stage_server.split",
+                "Split block index must be >= 0.",
+                label="Split",
+                page="training",
+            )
+        )
+    if r.end != -1 and r.end <= r.split:
+        errors.append(
+            _make_issue(
+                "error",
+                "remote_stage_server.end",
+                "End block index must be greater than Split, or left at -1.",
+                label="End",
+                page="training",
+            )
+        )
+
+    if r.stage_only_device_placement and r.full_model_device_placement:
+        message = "Stage-only device placement and full-model device placement cannot both be enabled."
+        errors.append(_make_issue("error", "remote_stage_server.stage_only_device_placement", message, label="Stage Only Device Placement", page="training"))
+        errors.append(_make_issue("error", "remote_stage_server.full_model_device_placement", message, label="Full Model Device Placement", page="training"))
+
+    if r.block_only_load and r.full_model_device_placement:
+        errors.append(
+            _make_issue(
+                "error",
+                "remote_stage_server.block_only_load",
+                "Block-only load is incompatible with full-model device placement.",
+                label="Block Only Load",
+                page="training",
+            )
+        )
+
+    if not r.trainable and r.trainable_scope != "auto":
+        errors.append(
+            _make_issue(
+                "error",
+                "remote_stage_server.trainable_scope",
+                "Trainable scope requires trainable mode.",
+                label="Trainable Scope",
+                page="training",
+            )
+        )
+
+    if r.int8_block_size <= 0:
+        errors.append(
+            _make_issue(
+                "error",
+                "remote_stage_server.int8_block_size",
+                "Int8 block size must be greater than 0.",
+                label="Int8 Block Size",
+                page="training",
+            )
+        )
+
+    if r.nf4_block_size <= 0:
+        errors.append(
+            _make_issue(
+                "error",
+                "remote_stage_server.nf4_block_size",
+                "NF4 block size must be greater than 0.",
+                label="NF4 Block Size",
+                page="training",
+            )
+        )
+
+    if r.split_attn_chunk_size < 0:
+        errors.append(
+            _make_issue(
+                "error",
+                "remote_stage_server.split_attn_chunk_size",
+                "Split-attention chunk size must be >= 0.",
+                label="Split Attn Chunk Size",
+                page="training",
+            )
+        )
+
+    if r.ffn_chunk_size < 0:
+        errors.append(
+            _make_issue(
+                "error",
+                "remote_stage_server.ffn_chunk_size",
+                "FFN chunk size must be >= 0.",
+                label="FFN Chunk Size",
+                page="training",
+            )
+        )
+
+    if r.network_lr is not None and r.network_lr <= 0:
+        errors.append(
+            _make_issue(
+                "error",
+                "remote_stage_server.network_lr",
+                "Network learning rate must be greater than 0.",
+                label="Network LR",
+                page="training",
+            )
+        )
+
+    if r.learning_rate is not None and r.learning_rate <= 0:
+        errors.append(
+            _make_issue(
+                "error",
+                "remote_stage_server.learning_rate",
+                "Learning rate must be greater than 0.",
+                label="Learning Rate",
+                page="training",
+            )
+        )
+
+    return _build_report(errors, warnings)
+
+
+def validate_remote_stage_launcher_config(config: ProjectConfig) -> dict[str, Any]:
+    """Validate the master-side SSH orchestration config."""
+    launcher = config.remote_stage_launcher
+    server = config.remote_stage_server
+    training = config.training
+    errors: list[dict[str, Any]] = []
+    warnings: list[dict[str, Any]] = []
+
+    if not training.ltx2_remote_stage:
+        errors.append(
+            _make_issue(
+                "error",
+                "training.ltx2_remote_stage",
+                "Enable Remote Stage before launching remote slaves.",
+                label="Remote Stage",
+                page="training",
+            )
+        )
+
+    if not _has_text(launcher.remote_root):
+        errors.append(
+            _make_issue(
+                "error",
+                "remote_stage_launcher.remote_root",
+                "Remote root path is required.",
+                label="Remote Root",
+                page="training",
+            )
+        )
+
+    if not _has_text(launcher.remote_python):
+        errors.append(
+            _make_issue(
+                "error",
+                "remote_stage_launcher.remote_python",
+                "Remote Python executable is required.",
+                label="Remote Python",
+                page="training",
+            )
+        )
+
+    if not (0 < int(launcher.ssh_port) < 65536):
+        errors.append(
+            _make_issue(
+                "error",
+                "remote_stage_launcher.ssh_port",
+                "SSH port must be in 1..65535.",
+                label="SSH Port",
+                page="training",
+            )
+        )
+
+    if launcher.ready_timeout <= 0:
+        errors.append(
+            _make_issue(
+                "error",
+                "remote_stage_launcher.ready_timeout",
+                "Ready timeout must be greater than 0.",
+                label="Ready Timeout",
+                page="training",
+            )
+        )
+
+    if launcher.ready_poll_interval <= 0:
+        errors.append(
+            _make_issue(
+                "error",
+                "remote_stage_launcher.ready_poll_interval",
+                "Ready poll interval must be greater than 0.",
+                label="Ready Poll Interval",
+                page="training",
+            )
+        )
+
+    if server.bind in {"127.0.0.1", "localhost", "::1"}:
+        errors.append(
+            _make_issue(
+                "error",
+                "remote_stage_server.bind",
+                "Remote stage servers are bound to loopback only; remote orchestration will not be reachable from other machines.",
+                label="Bind",
+                page="training",
+            )
+        )
+
+    try:
+        specs, specs_error = _parse_remote_stage_specs(training.ltx2_remote_stage_specs)
+    except Exception as exc:
+        errors.append(
+            _make_issue(
+                "error",
+                "training.ltx2_remote_stage_specs",
+                str(exc),
+                label="Remote Stage Specs",
+                page="training",
+            )
+        )
+        specs = []
+    else:
+        if specs_error is not None:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.ltx2_remote_stage_specs",
+                    specs_error,
+                    label="Remote Stage Specs",
+                    page="training",
+                )
+            )
+        elif not specs and training.ltx2_remote_stage_split < 0:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.ltx2_remote_stage_split",
+                    "Set either Remote Stage Specs or a single remote stage split before launching slaves.",
+                    label="Remote Stage Split",
+                    page="training",
+                )
+            )
+        else:
+            for idx, spec in enumerate(specs):
+                host = spec[0]
+                if host in {"127.0.0.1", "localhost", "::1"}:
+                    errors.append(
+                        _make_issue(
+                            "error",
+                            "training.ltx2_remote_stage_specs",
+                            f"Remote stage spec {idx} targets loopback host {host!r}; use the machine's reachable LAN address or DNS name.",
+                            label="Remote Stage Specs",
+                            page="training",
+                        )
+                    )
+                    break
+
+    if launcher.ssh_extra_args:
+        try:
+            shlex.split(launcher.ssh_extra_args, posix=False)
+        except ValueError as exc:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "remote_stage_launcher.ssh_extra_args",
+                    f"Invalid SSH extra args: {exc}",
+                    label="SSH Extra Args",
+                    page="training",
+                )
+            )
 
     return _build_report(errors, warnings)
 
@@ -769,6 +1348,10 @@ def validate_inference_config(config: ProjectConfig) -> dict[str, Any]:
 def validate_process_config(proc_type: str, config: ProjectConfig) -> dict[str, Any]:
     if proc_type == "training":
         return validate_training_config(config)
+    if proc_type == "remote_stage_server":
+        return validate_remote_stage_server_config(config)
+    if proc_type == "remote_stage_launcher":
+        return validate_remote_stage_launcher_config(config)
     if proc_type == "cache_latents":
         return validate_cache_latents_config(config)
     if proc_type == "cache_text":

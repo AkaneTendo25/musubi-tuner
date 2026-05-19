@@ -19,6 +19,8 @@ from musubi_tuner.gui_dashboard.command_builder import (
     build_cache_latents_cmd,
     build_cache_text_cmd,
     build_inference_cmd,
+    build_remote_stage_launcher_cmd,
+    build_remote_stage_server_cmd,
     build_slider_training_cmd,
     build_training_cmd,
 )
@@ -28,7 +30,7 @@ from musubi_tuner.gui_dashboard.validation import validate_process_config
 
 router = APIRouter(tags=["processes"])
 
-VALID_TYPES = ("cache_latents", "cache_text", "cache_dino", "training", "inference", "slider_training")
+VALID_TYPES = ("cache_latents", "cache_text", "cache_dino", "training", "remote_stage_launcher", "remote_stage_server", "inference", "slider_training")
 
 
 def _get_pm(request: Request) -> ProcessManager:
@@ -57,6 +59,10 @@ def _build_cmd(proc_type: str, config):
         return build_cache_dino_cmd(config)
     elif proc_type == "training":
         return build_training_cmd(config)
+    elif proc_type == "remote_stage_launcher":
+        return build_remote_stage_launcher_cmd(config)
+    elif proc_type == "remote_stage_server":
+        return build_remote_stage_server_cmd(config)
     elif proc_type == "inference":
         return build_inference_cmd(config)
     elif proc_type == "slider_training":

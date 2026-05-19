@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import shlex
 import sys
+import tempfile
 from pathlib import Path
 
 from musubi_tuner.gui_dashboard.cli_defaults import (
@@ -93,6 +95,18 @@ def _split_cli_args(raw: str) -> list[str]:
         else:
             normalized.append(part)
     return normalized
+
+
+def _remote_stage_orchestrator_config_path(config: ProjectConfig) -> Path:
+    project_key = config.project_dir or config.name or "default"
+    digest = hashlib.sha1(project_key.encode("utf-8")).hexdigest()[:12]
+    return Path(tempfile.gettempdir()) / f"ltx2_remote_stage_orchestrator_{digest}.json"
+
+
+def _write_remote_stage_orchestrator_config(config: ProjectConfig) -> Path:
+    path = _remote_stage_orchestrator_config_path(config)
+    path.write_text(config.model_dump_json(indent=2), encoding="utf-8")
+    return path
 
 
 def _append_network_arg(args_parts: list[str], key: str, value) -> None:
@@ -813,6 +827,56 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
             cmd += ["--ltx2_model_parallel_devices", t.ltx2_model_parallel_devices]
         if t.ltx2_model_parallel_splits:
             cmd += ["--ltx2_model_parallel_splits", t.ltx2_model_parallel_splits]
+        if t.ltx2_mp_profile_transfers:
+            cmd.append("--ltx2_mp_profile_transfers")
+        if t.ltx2_mp_profile_log_every != 20:
+            cmd += ["--ltx2_mp_profile_log_every", str(t.ltx2_mp_profile_log_every)]
+        if t.ltx2_mp_activation_codec != "none":
+            cmd += ["--ltx2_mp_activation_codec", t.ltx2_mp_activation_codec]
+        if t.ltx2_mp_grad_codec != "none":
+            cmd += ["--ltx2_mp_grad_codec", t.ltx2_mp_grad_codec]
+        if t.ltx2_mp_int8_block_size != 256:
+            cmd += ["--ltx2_mp_int8_block_size", str(t.ltx2_mp_int8_block_size)]
+    if t.ltx2_remote_stage:
+        cmd.append("--ltx2_remote_stage")
+        if t.ltx2_remote_stage_specs:
+            cmd += ["--ltx2_remote_stage_specs", t.ltx2_remote_stage_specs]
+        else:
+            cmd += ["--ltx2_remote_stage_host", t.ltx2_remote_stage_host]
+            cmd += ["--ltx2_remote_stage_port", str(t.ltx2_remote_stage_port)]
+            cmd += ["--ltx2_remote_stage_split", str(t.ltx2_remote_stage_split)]
+        if t.ltx2_remote_stage_timeout != 600.0:
+            cmd += ["--ltx2_remote_stage_timeout", str(t.ltx2_remote_stage_timeout)]
+        if t.ltx2_remote_stage_codec != "none":
+            cmd += ["--ltx2_remote_stage_codec", t.ltx2_remote_stage_codec]
+        if t.ltx2_remote_stage_grad_codec != "none":
+            cmd += ["--ltx2_remote_stage_grad_codec", t.ltx2_remote_stage_grad_codec]
+        if t.ltx2_remote_stage_int8_block_size != 256:
+            cmd += ["--ltx2_remote_stage_int8_block_size", str(t.ltx2_remote_stage_int8_block_size)]
+        if not t.ltx2_remote_stage_metadata_cache:
+            cmd.append("--no-ltx2_remote_stage_metadata_cache")
+        if t.ltx2_remote_stage_metadata_cache_size != 8:
+            cmd += ["--ltx2_remote_stage_metadata_cache_size", str(t.ltx2_remote_stage_metadata_cache_size)]
+        if t.ltx2_remote_stage_aq_key_mode != "sample":
+            cmd += ["--ltx2_remote_stage_aq_key_mode", t.ltx2_remote_stage_aq_key_mode]
+        if not t.ltx2_remote_stage_aq_stochastic:
+            cmd.append("--no-ltx2_remote_stage_aq_stochastic")
+        if t.ltx2_remote_stage_aq_cache_size != 0:
+            cmd += ["--ltx2_remote_stage_aq_cache_size", str(t.ltx2_remote_stage_aq_cache_size)]
+        if t.ltx2_remote_stage_trainable:
+            cmd.append("--ltx2_remote_stage_trainable")
+            if t.ltx2_remote_stage_trainable_scope != "auto":
+                cmd += ["--ltx2_remote_stage_trainable_scope", t.ltx2_remote_stage_trainable_scope]
+            if t.ltx2_remote_stage_learning_rate is not None:
+                cmd += ["--ltx2_remote_stage_learning_rate", str(t.ltx2_remote_stage_learning_rate)]
+            if t.ltx2_remote_stage_weight_decay != 0.01:
+                cmd += ["--ltx2_remote_stage_weight_decay", str(t.ltx2_remote_stage_weight_decay)]
+            if t.ltx2_remote_stage_max_grad_norm != 0.0:
+                cmd += ["--ltx2_remote_stage_max_grad_norm", str(t.ltx2_remote_stage_max_grad_norm)]
+            if t.ltx2_remote_stage_checkpoint_dir:
+                cmd += ["--ltx2_remote_stage_checkpoint_dir", t.ltx2_remote_stage_checkpoint_dir]
+        if t.ltx2_remote_stage_prune_local_blocks:
+            cmd.append("--ltx2_remote_stage_prune_local_blocks")
     if t.blocks_to_swap is not None:
         cmd += ["--blocks_to_swap", str(t.blocks_to_swap)]
     if t.gradient_checkpointing:
@@ -1396,6 +1460,128 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
 
     cmd += _split_cli_args(t.extra_args)
     return cmd
+
+
+def _remote_stage_server_arglist(config: ProjectConfig) -> list[str]:
+    r = config.remote_stage_server
+    ltx2_checkpoint = r.ltx2_checkpoint or config.default_ltx2_checkpoint or str(_default_model_dir(config) / DEFAULT_LTX2_CHECKPOINT_NAME)
+
+    cmd: list[str] = [
+        "--ltx2_checkpoint",
+        ltx2_checkpoint,
+        "--bind",
+        r.bind,
+        "--port",
+        str(r.port),
+        "--device",
+        r.device,
+        "--dtype",
+        r.dtype,
+        "--split",
+        str(r.split),
+    ]
+
+    if r.end != -1:
+        cmd += ["--end", str(r.end)]
+    if r.load_device:
+        cmd += ["--load_device", r.load_device]
+    if r.trainable:
+        cmd.append("--trainable")
+        if r.trainable_scope != "auto":
+            cmd += ["--trainable_scope", r.trainable_scope]
+        if r.learning_rate is not None:
+            cmd += ["--learning_rate", str(r.learning_rate)]
+        if r.weight_decay != 0.01:
+            cmd += ["--weight_decay", str(r.weight_decay)]
+        if r.max_grad_norm != 0.0:
+            cmd += ["--max_grad_norm", str(r.max_grad_norm)]
+    if r.prune_non_stage_blocks:
+        cmd.append("--prune_non_stage_blocks")
+    if r.stage_only_device_placement:
+        cmd.append("--stage_only_device_placement")
+    if r.full_model_device_placement:
+        cmd.append("--full_model_device_placement")
+    if r.block_only_load:
+        cmd.append("--block_only_load")
+    if r.network_module:
+        cmd += ["--network_module", r.network_module]
+    if r.network_dim is not None:
+        cmd += ["--network_dim", str(r.network_dim)]
+    if r.network_alpha is not None:
+        cmd += ["--network_alpha", str(r.network_alpha)]
+    if r.network_dropout is not None:
+        cmd += ["--network_dropout", str(r.network_dropout)]
+    if r.network_args:
+        cmd += ["--network_args"] + _split_cli_args(r.network_args)
+    if r.network_weights:
+        cmd += ["--network_weights", r.network_weights]
+    if r.network_lr is not None:
+        cmd += ["--network_lr", str(r.network_lr)]
+    if r.ltx2_mode:
+        cmd += ["--ltx2_mode", r.ltx2_mode]
+    if r.ltx2_audio_only_model:
+        cmd.append("--ltx2_audio_only_model")
+    if r.attn_mode:
+        cmd += ["--attn_mode", r.attn_mode]
+    if r.fp8_scaled:
+        cmd.append("--fp8_scaled")
+    if r.fp8_w8a8:
+        cmd.append("--fp8_w8a8")
+        if r.w8a8_mode != "int8":
+            cmd += ["--w8a8_mode", r.w8a8_mode]
+    if r.fp8_upcast:
+        cmd.append("--fp8_upcast")
+    if r.fp8_upcast_stochastic:
+        cmd.append("--fp8_upcast_stochastic")
+    if r.fp8_upcast_seed != 0:
+        cmd += ["--fp8_upcast_seed", str(r.fp8_upcast_seed)]
+    if r.fp8_keep_blocks:
+        cmd += ["--fp8_keep_blocks", r.fp8_keep_blocks]
+    if r.nf4_base:
+        cmd.append("--nf4_base")
+    if r.nf4_block_size != 32:
+        cmd += ["--nf4_block_size", str(r.nf4_block_size)]
+    if r.split_attn_target:
+        cmd += ["--split_attn_target", r.split_attn_target]
+    if r.split_attn_mode:
+        cmd += ["--split_attn_mode", r.split_attn_mode]
+    if r.split_attn_chunk_size:
+        cmd += ["--split_attn_chunk_size", str(r.split_attn_chunk_size)]
+    if r.ffn_chunk_target:
+        cmd += ["--ffn_chunk_target", r.ffn_chunk_target]
+    if r.ffn_chunk_size:
+        cmd += ["--ffn_chunk_size", str(r.ffn_chunk_size)]
+    if r.quantize_device:
+        cmd += ["--quantize_device", r.quantize_device]
+    if r.int8_block_size != 256:
+        cmd += ["--int8_block_size", str(r.int8_block_size)]
+    if r.log_level and r.log_level != "INFO":
+        cmd += ["--log_level", r.log_level]
+
+    cmd += _split_cli_args(r.extra_args)
+    return cmd
+
+
+def build_remote_stage_server_cmd(config: ProjectConfig) -> list[str]:
+    """Build CLI args for ltx2_remote_stage_server.py."""
+    return [
+        sys.executable,
+        "-u",
+        _find_script("ltx2_remote_stage_server.py"),
+        *_remote_stage_server_arglist(config),
+    ]
+
+
+def build_remote_stage_launcher_cmd(config: ProjectConfig) -> list[str]:
+    """Build CLI args for ltx2_remote_stage_launcher.py."""
+    launcher_config_path = _write_remote_stage_orchestrator_config(config)
+    return [
+        sys.executable,
+        "-u",
+        _find_script("ltx2_remote_stage_launcher.py"),
+        "--project_config_json",
+        str(launcher_config_path),
+    ]
 
 
 def build_slider_training_cmd(config: ProjectConfig) -> list[str]:

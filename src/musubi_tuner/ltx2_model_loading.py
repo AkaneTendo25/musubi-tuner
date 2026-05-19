@@ -5,7 +5,7 @@ import re
 import logging
 
 import torch
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 from tqdm import tqdm
 
@@ -16,6 +16,8 @@ from musubi_tuner.modules.fp8_optimization_utils import apply_fp8_monkey_patch
 from musubi_tuner.modules.w8a8_optimization_utils import apply_w8a8_monkey_patch
 
 logger = logging.getLogger(__name__)
+
+_TRANSFORMER_BLOCK_KEY_RE = re.compile(r"(?:^|\.)transformer_blocks\.(\d+)\.")
 
 # Modules to keep in high precision for FP8 quantization.
 # Excludes sensitive projection, conditioning, and normalization layers.
@@ -90,6 +92,62 @@ def build_fp8_keep_block_exclude_keys(value: Any, num_blocks: Optional[int]) -> 
             f"--fp8_keep_blocks contains invalid block indices {invalid}; valid range is 0..{num_blocks - 1}"
         )
     return [f"transformer_blocks.{idx}." for idx in block_indices]
+
+
+def should_load_ltx2_transformer_block_key(key: str, *, keep_start: int, keep_end: int) -> bool:
+    """Return whether a checkpoint key belongs to the requested transformer block range.
+
+    Non-transformer-block tensors are shared by every stage and are always kept.
+    """
+
+    match = _TRANSFORMER_BLOCK_KEY_RE.search(str(key))
+    if match is None:
+        return True
+    block_index = int(match.group(1))
+    return int(keep_start) <= block_index < int(keep_end)
+
+
+def _resolve_transformer_block_load_range(
+    transformer_block_load_range: tuple[int, int | None] | None,
+    *,
+    num_transformer_blocks: int,
+) -> tuple[int, int] | None:
+    if transformer_block_load_range is None:
+        return None
+    keep_start, keep_end = transformer_block_load_range
+    keep_start = int(keep_start)
+    keep_end = num_transformer_blocks if keep_end is None else int(keep_end)
+    if keep_start < 0 or keep_end < keep_start or keep_end > num_transformer_blocks:
+        raise ValueError(
+            f"invalid transformer_block_load_range {keep_start}:{keep_end} "
+            f"for {num_transformer_blocks} transformer blocks"
+        )
+    return keep_start, keep_end
+
+
+def _prune_transformer_blocks_to_range(
+    model: torch.nn.Module,
+    *,
+    keep_start: int,
+    keep_end: int,
+) -> int:
+    blocks = getattr(model, "transformer_blocks", None)
+    if blocks is None:
+        raise RuntimeError("LTX-2 range-aware loading requires transformer_blocks on the base model")
+    replaced = 0
+    for idx in range(len(blocks)):
+        if keep_start <= idx < keep_end:
+            continue
+        blocks[idx] = torch.nn.Identity()
+        replaced += 1
+    if replaced:
+        logger.info(
+            "LTX-2 range-aware load: kept transformer blocks %d:%d, replaced %d unloaded blocks",
+            keep_start,
+            keep_end,
+            replaced,
+        )
+    return replaced
 
 
 def detect_ltx2_dtype(model_path: str) -> torch.dtype:
@@ -333,6 +391,7 @@ def load_ltx2_model(
     awq_calibration: bool = False,
     awq_alpha: float = 0.25,
     awq_num_batches: int = 8,
+    transformer_block_load_range: tuple[int, int | None] | None = None,
     **_: Any,
 ):
     """Load LTX-2 (video, audio-video, or audio-only) transformer
@@ -452,6 +511,24 @@ def load_ltx2_model(
     with torch.device("meta"):
         base_model = configurator.from_config(config)
     num_transformer_blocks = len(getattr(base_model, "transformer_blocks", []) or [])
+    resolved_block_load_range = _resolve_transformer_block_load_range(
+        transformer_block_load_range,
+        num_transformer_blocks=num_transformer_blocks,
+    )
+    state_dict_key_filter: Callable[[str], bool] | None = None
+    if resolved_block_load_range is not None:
+        keep_start, keep_end = resolved_block_load_range
+
+        def state_dict_key_filter(key: str) -> bool:
+            renamed_key = LTXV_MODEL_COMFY_RENAMING_MAP.apply_to_key(key)
+            normalized_key = renamed_key if renamed_key is not None else key
+            return should_load_ltx2_transformer_block_key(
+                normalized_key,
+                keep_start=keep_start,
+                keep_end=keep_end,
+            )
+
+        logger.info("LTX-2 range-aware load enabled for transformer blocks %d:%d", keep_start, keep_end)
     fp8_block_exclude_keys = (
         build_fp8_keep_block_exclude_keys(fp8_keep_blocks, num_transformer_blocks) if fp8_scaled else []
     )
@@ -505,6 +582,8 @@ def load_ltx2_model(
             for model_file in model_files:
                 with MemoryEfficientSafeOpen(model_file) as f:
                     for key in tqdm(f.keys(), desc=f"Loading {os.path.basename(model_file)}", unit="key"):
+                        if state_dict_key_filter is not None and not state_dict_key_filter(key):
+                            continue
                         sd[key] = f.get_tensor(key)
             # Load pre-computed LoftQ data from companion file if --loftq_init
             if loftq_init and lora_rank > 0:
@@ -539,6 +618,7 @@ def load_ltx2_model(
                 calc_device=torch.device("cpu"),
                 move_to_device=False,
                 dit_weight_dtype=None,
+                key_filter=state_dict_key_filter,
             )
             # Rename keys (must happen before LoftQ since lora_name is built from key paths)
             renamed_sd: dict[str, torch.Tensor] = {}
@@ -617,6 +697,7 @@ def load_ltx2_model(
                 exclude_layer_keys=nf4_exclude_keys,
                 block_size=nf4_block_size,
                 move_to_device=not load_weights_on_cpu and load_device == target_device,
+                key_filter=state_dict_key_filter,
             )
             _skip_rename = False
     elif fp8_scaled:
@@ -633,6 +714,7 @@ def load_ltx2_model(
             dit_weight_dtype=None,
             target_keys=["transformer_blocks"],
             exclude_keys=fp8_exclude_keys,
+            key_filter=state_dict_key_filter,
         )
     else:
         sd = load_safetensors_with_lora_and_fp8(
@@ -645,6 +727,7 @@ def load_ltx2_model(
             dit_weight_dtype=torch_dtype,
             target_keys=None,
             exclude_keys=None,
+            key_filter=state_dict_key_filter,
         )
 
     if not (nf4_base and locals().get("_skip_rename", False)):
@@ -671,6 +754,9 @@ def load_ltx2_model(
     _trace_vram_ltx2("AFTER apply monkey patch")
     base_model.load_state_dict(sd, strict=False, assign=True)
     _trace_vram_ltx2("AFTER load_state_dict (model still on meta/cpu)")
+    if resolved_block_load_range is not None:
+        keep_start, keep_end = resolved_block_load_range
+        _prune_transformer_blocks_to_range(base_model, keep_start=keep_start, keep_end=keep_end)
     if torch_dtype is not None:
         _cast_non_fp8_params(base_model, torch_dtype)
     if fp8_w8a8:

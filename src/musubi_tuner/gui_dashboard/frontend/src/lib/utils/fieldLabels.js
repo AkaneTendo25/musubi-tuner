@@ -1,5 +1,6 @@
 const ACRONYMS = new Map([
 	['av', 'AV'],
+	['aq', 'AQ'],
 	['awq', 'AWQ'],
 	['cfg', 'CFG'],
 	['cts', 'CTS'],
@@ -22,6 +23,7 @@ const ACRONYMS = new Map([
 	['lokr', 'LoKr'],
 	['lora', 'LoRA'],
 	['ltx2', 'LTX-2'],
+	['mp', 'MP'],
 	['nf4', 'NF4'],
 	['numpy', 'NumPy'],
 	['ogm', 'OGM'],
@@ -29,6 +31,7 @@ const ACRONYMS = new Map([
 	['tarp', 'TARP'],
 	['tb', 'TB'],
 	['tf32', 'TF32'],
+	['ssh', 'SSH'],
 	['vae', 'VAE'],
 	['v2a', 'V2A'],
 	['v2v', 'V2V'],

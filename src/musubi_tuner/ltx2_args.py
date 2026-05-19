@@ -8,6 +8,7 @@ import logging
 from musubi_tuner.hv_train_network import read_config_from_file, setup_parser_common
 from musubi_tuner.ltx_2.env import apply_ltx2_tweaks
 from musubi_tuner.ltx2_model_parallel import add_ltx2_model_parallel_args
+from musubi_tuner.ltx2_remote_stage import add_ltx2_remote_stage_args
 from musubi_tuner.ltx2_lycoris_runtime import apply_lycoris_preset_before_network_creation, is_lycoris_requested, process_lycoris_config
 from musubi_tuner.ltx2_train_network import IC_LORA_STRATEGIES
 from musubi_tuner.model_defaults import default_gemma_root_path, default_ltx2_checkpoint_path
@@ -112,6 +113,7 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         help="Load physically audio-only LTX-2 transformer (omit video modules). Requires --ltx2_mode audio.",
     )
     add_ltx2_model_parallel_args(parser)
+    add_ltx2_remote_stage_args(parser)
     parser.add_argument(
         "--split_attn_target",
         type=str,

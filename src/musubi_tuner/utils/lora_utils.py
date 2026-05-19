@@ -1,6 +1,6 @@
 import os
 import re
-from typing import Dict, List, Optional, Union
+from typing import Callable, Dict, List, Optional, Union
 import torch
 
 import logging
@@ -74,6 +74,7 @@ def load_safetensors_with_lora_and_fp8(
     exclude_keys: Optional[List[str]] = None,
     disable_numpy_memmap: bool = False,
     weight_transform_hooks: Optional[WeightTransformHooks] = None,
+    key_filter: Optional[Callable[[str], bool]] = None,
 ) -> dict[str, torch.Tensor]:
     """
     Merge LoRA weights into the state dict of a model with fp8 optimization if needed.
@@ -89,6 +90,7 @@ def load_safetensors_with_lora_and_fp8(
         exclude_keys (Optional[List[str]]): Keys to exclude from optimization.
         disable_numpy_memmap (bool): Whether to disable numpy memmap when loading safetensors.
         weight_transform_hooks (Optional[WeightTransformHooks]): Hooks for transforming weights during loading.
+        key_filter (Optional[Callable[[str], bool]]): Optional predicate for skipping checkpoint keys before tensor loading.
     """
 
     # if the file name ends with 00001-of-00004 etc, we need to load the files with the same prefix
@@ -227,6 +229,7 @@ def load_safetensors_with_lora_and_fp8(
         weight_hook=weight_hook,
         disable_numpy_memmap=disable_numpy_memmap,
         weight_transform_hooks=weight_transform_hooks,
+        key_filter=key_filter,
     )
 
     for lora_weight_keys in list_of_lora_weight_keys:
@@ -250,6 +253,7 @@ def load_safetensors_with_fp8_optimization_and_hook(
     weight_hook: callable = None,
     disable_numpy_memmap: bool = False,
     weight_transform_hooks: Optional[WeightTransformHooks] = None,
+    key_filter: Optional[Callable[[str], bool]] = None,
 ) -> dict[str, torch.Tensor]:
     """
     Load state dict from safetensors files and merge LoRA weights into the state dict with fp8 optimization if needed.
@@ -268,6 +272,7 @@ def load_safetensors_with_fp8_optimization_and_hook(
             weight_hook=weight_hook,
             disable_numpy_memmap=disable_numpy_memmap,
             weight_transform_hooks=weight_transform_hooks,
+            key_filter=key_filter,
         )
     else:
         logger.info(
@@ -277,7 +282,7 @@ def load_safetensors_with_fp8_optimization_and_hook(
         for model_file in model_files:
             with MemoryEfficientSafeOpen(model_file, disable_numpy_memmap=disable_numpy_memmap) as original_f:
                 f = TensorWeightAdapter(weight_transform_hooks, original_f) if weight_transform_hooks is not None else original_f
-                all_keys = f.keys()
+                all_keys = [key for key in f.keys() if key_filter is None or key_filter(key)]
 
                 # Detect pre-quantized FP8 checkpoint scale keys
                 checkpoint_scale_keys = set(k for k in all_keys if k.endswith(".weight_scale") or k.endswith(".input_scale"))

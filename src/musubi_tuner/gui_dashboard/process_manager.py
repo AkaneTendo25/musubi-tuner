@@ -16,7 +16,7 @@ from typing import Literal, Optional
 
 logger = logging.getLogger(__name__)
 
-ProcessType = Literal["cache_latents", "cache_text", "cache_dino", "training", "inference", "slider_training"]
+ProcessType = Literal["cache_latents", "cache_text", "cache_dino", "training", "remote_stage_launcher", "remote_stage_server", "inference", "slider_training"]
 ProcessRef = tuple[int, float | None]
 
 # Windows-specific flags for clean subprocess shutdown
@@ -485,6 +485,6 @@ class ProcessManager:
 
     def get_all_statuses(self) -> dict[str, dict]:
         result = {}
-        for pt in ("cache_latents", "cache_text", "cache_dino", "training", "inference", "slider_training"):
+        for pt in ("cache_latents", "cache_text", "cache_dino", "training", "remote_stage_launcher", "remote_stage_server", "inference", "slider_training"):
             result[pt] = self.get_status(pt)
         return result

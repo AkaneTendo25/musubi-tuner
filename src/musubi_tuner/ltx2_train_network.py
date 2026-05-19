@@ -48,6 +48,15 @@ from musubi_tuner.ltx2_model_parallel import (
     place_ltx2_lora_network_for_model_parallel,
     validate_ltx2_model_parallel_setup,
 )
+from musubi_tuner.ltx2_remote_stage import (
+    build_ltx2_remote_stage_cache_key,
+    enable_ltx2_remote_stage,
+    get_ltx2_remote_stage_local_keep_range,
+    is_ltx2_remote_stage_enabled,
+    prune_ltx2_remote_stage_local_blocks,
+    set_ltx2_remote_stage_cache_key,
+    validate_ltx2_remote_stage_setup,
+)
 
 # LTX-2 latent normalization defaults.
 # These are identity stats (mean=0, std=1). We keep them as a safe fallback and
@@ -583,18 +592,35 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
         self._latent_delta_loss_config = None
 
     def is_model_parallel_enabled(self, args) -> bool:
-        return is_ltx2_model_parallel_enabled(args)
+        return is_ltx2_model_parallel_enabled(args) or is_ltx2_remote_stage_enabled(args)
 
     def validate_model_parallel_setup(self, args, accelerator) -> None:
+        if is_ltx2_model_parallel_enabled(args) and is_ltx2_remote_stage_enabled(args):
+            raise RuntimeError("--ltx2_model_parallel and --ltx2_remote_stage cannot be combined")
+        if is_ltx2_remote_stage_enabled(args):
+            if accelerator.num_processes > 1:
+                raise RuntimeError("--ltx2_remote_stage requires Accelerate --num_processes 1")
+            validate_ltx2_remote_stage_setup(args)
+            return
         validate_ltx2_model_parallel_setup(args, accelerator)
 
     def enable_model_parallel_transformer(self, args, accelerator, transformer) -> None:
+        if is_ltx2_remote_stage_enabled(args):
+            enable_ltx2_remote_stage(transformer, args)
+            prune_ltx2_remote_stage_local_blocks(transformer, args)
+            transformer.to(accelerator.device)
+            return
         enable_ltx2_model_parallel(transformer, args)
 
     def place_network_for_model_parallel(self, args, accelerator, transformer, network) -> None:
+        if is_ltx2_remote_stage_enabled(args):
+            network.to(accelerator.device)
+            return
         place_ltx2_lora_network_for_model_parallel(network, transformer)
 
     def clip_grad_norm_for_model_parallel(self, args, accelerator, params, optimizer):
+        if is_ltx2_remote_stage_enabled(args) and not is_ltx2_model_parallel_enabled(args):
+            return accelerator.clip_grad_norm_(params, args.max_grad_norm)
         unscale_gradients = getattr(accelerator, "unscale_gradients", None)
         if callable(unscale_gradients):
             try:
@@ -2761,6 +2787,15 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             md["ss_latent_delta_loss"] = True
             if getattr(args, "latent_delta_loss_args", None):
                 md["ss_latent_delta_loss_args"] = " ".join(args.latent_delta_loss_args)
+        if is_ltx2_remote_stage_enabled(args):
+            md["ss_ltx2_remote_stage_codec"] = getattr(args, "ltx2_remote_stage_codec", "none")
+            md["ss_ltx2_remote_stage_grad_codec"] = getattr(args, "ltx2_remote_stage_grad_codec", "none")
+            md["ss_ltx2_remote_stage_metadata_cache"] = bool(getattr(args, "ltx2_remote_stage_metadata_cache", True))
+            md["ss_ltx2_remote_stage_metadata_cache_size"] = int(
+                getattr(args, "ltx2_remote_stage_metadata_cache_size", 8)
+            )
+            md["ss_ltx2_remote_stage_aq_key_mode"] = getattr(args, "ltx2_remote_stage_aq_key_mode", "sample")
+            md["ss_ltx2_remote_stage_trainable_scope"] = getattr(args, "ltx2_remote_stage_trainable_scope", "auto")
         if self._ic_lora_strategy == "v2v":
             md["ss_v2v_training"] = True
         elif self._ic_lora_strategy == "self_ref_v2v":
@@ -2854,6 +2889,7 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
         torch_dtype_to_use = dit_weight_dtype or self.dit_dtype or torch.float32
         if dit_weight_dtype is None:
             logger.info("LTX-2 weight dtype not set; using %s for loading", torch_dtype_to_use)
+        transformer_block_load_range = get_ltx2_remote_stage_local_keep_range(args)
         transformer = load_ltx2_model(
             model_path=dit_path,
             device=accelerator.device,
@@ -2883,6 +2919,7 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             awq_calibration=bool(getattr(args, "awq_calibration", False)),
             awq_alpha=float(getattr(args, "awq_alpha", 0.25)),
             awq_num_batches=int(getattr(args, "awq_num_batches", 8)),
+            transformer_block_load_range=transformer_block_load_range,
         )
 
         transformer.eval()
@@ -3659,6 +3696,11 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                 self._ensure_fp8_buffers_on_device(transformer)
             elif getattr(args, "nf4_base", False):
                 self._ensure_nf4_buffers_on_device(transformer)
+            if is_ltx2_remote_stage_enabled(args):
+                set_ltx2_remote_stage_cache_key(
+                    transformer,
+                    build_ltx2_remote_stage_cache_key(args, batch, timesteps=model_timesteps, noise=noise),
+                )
             with accelerator.autocast():
                 model_pred = transformer(
                     [video_latents, noisy_audio],
@@ -4953,6 +4995,11 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
 
         if getattr(args, "fp8_base", False) or getattr(args, "fp8_scaled", False):
             self._ensure_fp8_buffers_on_device(transformer)
+        if is_ltx2_remote_stage_enabled(args):
+            set_ltx2_remote_stage_cache_key(
+                transformer,
+                build_ltx2_remote_stage_cache_key(args, batch, timesteps=model_timesteps, noise=noise),
+            )
         with accelerator.autocast():
             model_pred = transformer(
                 model_input,

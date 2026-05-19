@@ -2595,6 +2595,13 @@ class NetworkTrainer:
         if args.num_timestep_buckets is not None:
             logger.info(f"Using timestep bucketing. Number of buckets: {args.num_timestep_buckets}")
         self.num_timestep_buckets = args.num_timestep_buckets  # None or int, None makes all the behavior same as before
+        if (
+            bool(getattr(args, "ltx2_remote_stage", False))
+            and str(getattr(args, "ltx2_remote_stage_codec", "none") or "none").lower().startswith("aq-")
+            and str(getattr(args, "ltx2_remote_stage_aq_key_mode", "sample") or "sample").lower() != "off"
+        ):
+            # AQ remote-stage compression needs stable sample identity for delta caches.
+            os.environ["LTX2_COLLECT_BATCH_ITEM_KEYS"] = "1"
 
         current_epoch = Value("i", 0)  # shared between processes
 
@@ -3520,6 +3527,25 @@ class NetworkTrainer:
                 metadata_to_save.update({k: str(v) for k, v in extra_md.items()})
 
             unwrapped_nw.save_weights(ckpt_file, save_dtype, metadata_to_save)
+
+            if bool(getattr(args, "ltx2_remote_stage", False)) and bool(
+                getattr(args, "ltx2_remote_stage_trainable", False)
+            ):
+                remote_checkpoint_dir = getattr(args, "ltx2_remote_stage_checkpoint_dir", None) or args.output_dir
+                try:
+                    from musubi_tuner.ltx2_remote_stage import save_ltx2_remote_stage_state
+
+                    responses = save_ltx2_remote_stage_state(
+                        transformer,
+                        checkpoint_dir=remote_checkpoint_dir,
+                        checkpoint_name=ckpt_name,
+                    )
+                    for response in responses:
+                        path = response.get("path")
+                        if path:
+                            accelerator.print(f"saved remote stage checkpoint: {path}")
+                except Exception as e:
+                    logger.warning("Failed to save remote LTX-2 stage checkpoint: %s", e)
 
             # Call post-save hook for architecture-specific processing
             self.post_save_checkpoint_hook(args, ckpt_file, ckpt_name, accelerator, force_sync_upload)
@@ -4483,6 +4509,16 @@ class NetworkTrainer:
                     if _is_first_step:
                         _log_vram("FIRST_ITER: BEFORE optimizer.step", logger)
                     optimizer.step()
+                    if accelerator.sync_gradients and bool(getattr(args, "ltx2_remote_stage", False)) and bool(
+                        getattr(args, "ltx2_remote_stage_trainable", False)
+                    ):
+                        try:
+                            from musubi_tuner.ltx2_remote_stage import optimizer_step_ltx2_remote_stage
+
+                            optimizer_step_ltx2_remote_stage(transformer)
+                        except Exception as e:
+                            logger.warning("Remote LTX-2 stage optimizer step failed: %s", e)
+                            raise
                     if _is_first_step:
                         _log_vram("FIRST_ITER: AFTER optimizer.step", logger)
                     if (
@@ -4501,6 +4537,16 @@ class NetworkTrainer:
                             logger.warning("Self-Flow EMA update failed: %s", e)
                     lr_scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
+                    if accelerator.sync_gradients and bool(getattr(args, "ltx2_remote_stage", False)) and bool(
+                        getattr(args, "ltx2_remote_stage_trainable", False)
+                    ):
+                        try:
+                            from musubi_tuner.ltx2_remote_stage import zero_grad_ltx2_remote_stage
+
+                            zero_grad_ltx2_remote_stage(transformer)
+                        except Exception as e:
+                            logger.warning("Remote LTX-2 stage zero_grad failed: %s", e)
+                            raise
                     _prev_step_end_time = time.perf_counter()
                     if _is_first_step:
                         _log_vram("FIRST_ITER: AFTER zero_grad (end of first step)", logger)

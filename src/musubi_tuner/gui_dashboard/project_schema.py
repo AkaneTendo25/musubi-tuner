@@ -17,6 +17,10 @@ from musubi_tuner.model_defaults import default_gemma_root_path, default_ltx2_ch
 SamplingPreset = Literal["legacy", "defaults", "ltx20", "ltx23", "ltx23_hq", "distilled_two_stage"]
 SampleSigmaSchedule = Literal["auto", "ltx", "ltx23_distilled"]
 SampleSampler = Literal["auto", "euler", "res_2s"]
+LTX2BoundaryCodec = Literal["none", "int8", "int4"]
+LTX2RemoteActivationCodec = Literal["none", "int8", "int4", "aq-int8", "aq-int4"]
+LTX2RemoteAqKeyMode = Literal["sample", "sample_timestep", "sample_timestep_noise", "off"]
+LTX2RemoteTrainableScope = Literal["auto", "lora", "blocks"]
 
 
 class GeneralConfig(BaseModel):
@@ -291,6 +295,32 @@ class TrainingConfig(BaseModel):
     ltx2_model_parallel: bool = False
     ltx2_model_parallel_devices: str = ""
     ltx2_model_parallel_splits: str = ""
+    ltx2_mp_profile_transfers: bool = False
+    ltx2_mp_profile_log_every: int = 20
+    ltx2_mp_activation_codec: LTX2BoundaryCodec = "none"
+    ltx2_mp_grad_codec: LTX2BoundaryCodec = "none"
+    ltx2_mp_int8_block_size: int = 256
+    ltx2_remote_stage: bool = False
+    ltx2_remote_stage_host: str = "127.0.0.1"
+    ltx2_remote_stage_port: int = 7788
+    ltx2_remote_stage_split: int = -1
+    ltx2_remote_stage_specs: str = ""
+    ltx2_remote_stage_timeout: float = 600.0
+    ltx2_remote_stage_codec: LTX2RemoteActivationCodec = "none"
+    ltx2_remote_stage_grad_codec: LTX2BoundaryCodec = "none"
+    ltx2_remote_stage_int8_block_size: int = 256
+    ltx2_remote_stage_metadata_cache: bool = True
+    ltx2_remote_stage_metadata_cache_size: int = 8
+    ltx2_remote_stage_aq_key_mode: LTX2RemoteAqKeyMode = "sample"
+    ltx2_remote_stage_aq_stochastic: bool = True
+    ltx2_remote_stage_aq_cache_size: int = 0
+    ltx2_remote_stage_trainable: bool = False
+    ltx2_remote_stage_trainable_scope: LTX2RemoteTrainableScope = "auto"
+    ltx2_remote_stage_learning_rate: Optional[float] = None
+    ltx2_remote_stage_weight_decay: float = 0.01
+    ltx2_remote_stage_max_grad_norm: float = 0.0
+    ltx2_remote_stage_checkpoint_dir: str = ""
+    ltx2_remote_stage_prune_local_blocks: bool = False
     mixed_precision: str = "no"
     full_fp16: bool = False
     full_bf16: bool = False
@@ -696,6 +726,65 @@ class InferenceConfig(BaseModel):
     extra_args: str = ""
 
 
+class RemoteStageServerConfig(BaseModel):
+    ltx2_checkpoint: str = ""
+    bind: str = "0.0.0.0"
+    port: int = 7788
+    device: str = "cuda:0"
+    load_device: Optional[str] = None
+    dtype: Literal["bfloat16", "float16", "float32", "bf16", "fp16", "fp32"] = "bfloat16"
+    split: int = 0
+    end: int = -1
+    trainable: bool = False
+    trainable_scope: LTX2RemoteTrainableScope = "auto"
+    learning_rate: Optional[float] = None
+    weight_decay: float = 0.01
+    max_grad_norm: float = 0.0
+    prune_non_stage_blocks: bool = False
+    stage_only_device_placement: bool = True
+    full_model_device_placement: bool = False
+    block_only_load: bool = True
+    network_module: Optional[str] = None
+    network_dim: Optional[int] = None
+    network_alpha: Optional[float] = None
+    network_dropout: Optional[float] = None
+    network_args: str = ""
+    network_weights: str = ""
+    network_lr: Optional[float] = None
+    ltx2_mode: Literal["video", "av", "audio"] = "video"
+    ltx2_audio_only_model: bool = False
+    attn_mode: Literal["torch", "sdpa", "flash", "flash3", "xformers"] = "sdpa"
+    fp8_scaled: bool = False
+    fp8_w8a8: bool = False
+    w8a8_mode: Literal["int8", "fp8"] = "int8"
+    fp8_upcast: bool = False
+    fp8_upcast_stochastic: bool = False
+    fp8_upcast_seed: int = 0
+    fp8_keep_blocks: str = ""
+    nf4_base: bool = False
+    nf4_block_size: int = 32
+    split_attn_target: Optional[str] = None
+    split_attn_mode: Optional[str] = None
+    split_attn_chunk_size: int = 0
+    ffn_chunk_target: Optional[str] = None
+    ffn_chunk_size: int = 0
+    quantize_device: Optional[str] = None
+    int8_block_size: int = 256
+    log_level: str = "INFO"
+    extra_args: str = ""
+
+
+class RemoteStageLauncherConfig(BaseModel):
+    ssh_user: str = ""
+    ssh_port: int = 22
+    ssh_extra_args: str = ""
+    remote_root: str = ""
+    remote_python: str = "python"
+    ready_timeout: float = 120.0
+    ready_poll_interval: float = 2.0
+    log_level: str = "INFO"
+
+
 class SliderTargetConfig(BaseModel):
     positive: str = ""
     negative: str = ""
@@ -744,6 +833,8 @@ class ProjectConfig(BaseModel):
     dataset: DatasetConfig = Field(default_factory=DatasetConfig)
     caching: CachingConfig = Field(default_factory=CachingConfig)
     training: TrainingConfig = Field(default_factory=TrainingConfig)
+    remote_stage_launcher: RemoteStageLauncherConfig = Field(default_factory=RemoteStageLauncherConfig)
+    remote_stage_server: RemoteStageServerConfig = Field(default_factory=RemoteStageServerConfig)
     inference: InferenceConfig = Field(default_factory=InferenceConfig)
     slider: SliderConfig = Field(default_factory=SliderConfig)
 
@@ -774,7 +865,7 @@ class ProjectConfig(BaseModel):
             data['default_ltx2_checkpoint'] = default_ltx
             data['default_gemma_root'] = default_gemma
 
-            for section_name in ('caching', 'training', 'inference'):
+            for section_name in ('caching', 'training', 'remote_stage_server', 'inference'):
                 section = data.get(section_name)
                 if section is None:
                     section = {}
@@ -785,7 +876,7 @@ class ProjectConfig(BaseModel):
 
                 if not section.get('ltx2_checkpoint'):
                     section['ltx2_checkpoint'] = default_ltx
-                if not section.get('gemma_root') and not section.get('gemma_safetensors'):
+                if section_name in ('caching', 'training', 'inference') and not section.get('gemma_root') and not section.get('gemma_safetensors'):
                     section['gemma_root'] = default_gemma
                 if section_name == 'training':
                     has_old_sampling_values = any(

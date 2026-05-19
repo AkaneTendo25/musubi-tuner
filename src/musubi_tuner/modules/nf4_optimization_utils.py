@@ -9,7 +9,7 @@ weights (as derived in the QLoRA paper).  Weights are stored as packed uint8 (tw
 """
 
 import os
-from typing import List, Optional, Tuple, Union
+from typing import Callable, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -239,6 +239,7 @@ def load_safetensors_with_nf4_optimization(
     weight_hook=None,
     disable_numpy_memmap: bool = False,
     weight_transform_hooks: Optional[WeightTransformHooks] = None,
+    key_filter: Optional[Callable[[str], bool]] = None,
 ) -> dict:
     """Load safetensors and quantize target layers to NF4.
 
@@ -264,7 +265,7 @@ def load_safetensors_with_nf4_optimization(
                 if weight_transform_hooks is not None
                 else original_f
             )
-            keys = f.keys()
+            keys = [key for key in f.keys() if key_filter is None or key_filter(key)]
             for key in tqdm(keys, desc=f"Loading {os.path.basename(model_file)}", unit="key"):
                 value = f.get_tensor(key)
                 original_device = value.device

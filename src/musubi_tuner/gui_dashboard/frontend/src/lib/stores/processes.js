@@ -9,6 +9,8 @@ export const processStatuses = writable({
 	cache_text: { state: 'idle', exit_code: null },
 	cache_dino: { state: 'idle', exit_code: null },
 	training: { state: 'idle', exit_code: null },
+	remote_stage_launcher: { state: 'idle', exit_code: null },
+	remote_stage_server: { state: 'idle', exit_code: null },
 	inference: { state: 'idle', exit_code: null },
 	slider_training: { state: 'idle', exit_code: null }
 });
@@ -18,6 +20,8 @@ export const processLogs = writable({
 	cache_text: [],
 	cache_dino: [],
 	training: [],
+	remote_stage_launcher: [],
+	remote_stage_server: [],
 	inference: [],
 	slider_training: []
 });
@@ -27,6 +31,8 @@ export const processConsoleUi = writable({
 	cache_text: { collapsed: null },
 	cache_dino: { collapsed: null },
 	training: { collapsed: null },
+	remote_stage_launcher: { collapsed: null },
+	remote_stage_server: { collapsed: null },
 	inference: { collapsed: null },
 	slider_training: { collapsed: null }
 });
@@ -47,6 +53,8 @@ export const processValidation = writable({
 	cache_text: emptyValidation(),
 	cache_dino: emptyValidation(),
 	training: emptyValidation(),
+	remote_stage_launcher: emptyValidation(),
+	remote_stage_server: emptyValidation(),
 	inference: emptyValidation(),
 	slider_training: emptyValidation()
 });
@@ -161,6 +169,8 @@ export function clearProcessLogs(type = null) {
 				cache_text: [],
 				cache_dino: [],
 				training: [],
+				remote_stage_launcher: [],
+				remote_stage_server: [],
 				inference: [],
 				slider_training: []
 			};

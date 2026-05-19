@@ -1,5 +1,5 @@
 import os
-from typing import List, Optional, Union
+from typing import Callable, List, Optional, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -247,6 +247,7 @@ def load_safetensors_with_fp8_optimization(
     block_size: Optional[int] = 64,
     disable_numpy_memmap: bool = False,
     weight_transform_hooks: Optional[WeightTransformHooks] = None,
+    key_filter: Optional[Callable[[str], bool]] = None,
 ) -> dict:
     """
     Load weight tensors from safetensors files and merge LoRA weights into the state dict with explicit FP8 optimization.
@@ -264,6 +265,7 @@ def load_safetensors_with_fp8_optimization(
         block_size (int, optional): Block size for block-wise quantization (used if quantization_mode is "block")
         disable_numpy_memmap (bool): Disable numpy memmap when loading safetensors
         weight_transform_hooks (WeightTransformHooks, optional): Hooks for weight transformation during loading
+        key_filter (Callable[[str], bool], optional): Optional predicate for skipping checkpoint keys before tensor loading.
 
     Returns:
         dict: FP8 optimized state dict
@@ -295,7 +297,7 @@ def load_safetensors_with_fp8_optimization(
         with MemoryEfficientSafeOpen(model_file, disable_numpy_memmap=disable_numpy_memmap) as original_f:
             f = TensorWeightAdapter(weight_transform_hooks, original_f) if weight_transform_hooks is not None else original_f
 
-            keys = f.keys()
+            keys = [key for key in f.keys() if key_filter is None or key_filter(key)]
 
             # Detect pre-quantized FP8 checkpoint (e.g. ltx-2.3-22b-dev-fp8.safetensors)
             # These have weight_scale/input_scale keys alongside F8_E4M3 weights.

@@ -28,6 +28,7 @@ from musubi_tuner.ltx_2.model.transformer.transformer_args import (
     TransformerArgsPreprocessor,
 )
 from musubi_tuner.ltx_2.utils import to_denoised
+from musubi_tuner.ltx2_model_parallel import ModelParallelTransferConfig, move_ltx2_model_parallel_activation
 
 logger = logging.getLogger(__name__)
 
@@ -68,7 +69,10 @@ def _disable_checkpoint_determinism_check() -> None:
 
 
 def _move_transformer_args(
-    args: TransformerArgs | None, device: torch.device
+    args: TransformerArgs | None,
+    device: torch.device,
+    model_parallel_transfer_config: ModelParallelTransferConfig | None = None,
+    transfer_label: str = "activation",
 ) -> TransformerArgs | None:
     if args is None:
         return None
@@ -85,9 +89,20 @@ def _move_transformer_args(
             return type(value)(_move_tensor(v) for v in value)
         return value
 
+    moved_x = (
+        move_ltx2_model_parallel_activation(
+            args.x,
+            device,
+            model_parallel_transfer_config,
+            label=transfer_label,
+        )
+        if model_parallel_transfer_config is not None
+        else _move_tensor(args.x)
+    )
+
     return replace(
         args,
-        x=_move_tensor(args.x),
+        x=moved_x,
         context=_move_tensor(args.context),
         context_mask=_move_tensor(args.context_mask),
         timesteps=_move_tensor(args.timesteps),
@@ -679,13 +694,55 @@ class LTXModel(torch.nn.Module):
 
         # Process transformer blocks
         model_parallel_block_devices = getattr(self, "_ltx2_model_parallel_block_devices", None)
+        model_parallel_transfer_config = getattr(self, "_ltx2_model_parallel_transfer_config", None)
+        remote_stage_group = getattr(self, "_ltx2_remote_stage_group", None)
+        remote_stage_client = getattr(self, "_ltx2_remote_stage_client", None)
+        remote_stage_split = getattr(self, "_ltx2_remote_stage_split", None)
+        remote_stage_cache_key = getattr(self, "_ltx2_remote_stage_cache_key", None)
         for block_idx, block in enumerate(self.transformer_blocks):
+            # Remote-stage mode is explicitly attached by the trainer only when
+            # --ltx2_remote_stage is enabled. At the split boundary, local
+            # execution stops and autograd continues through the TCP RPC wrapper
+            # so the local prefix still receives boundary activation gradients.
+            if remote_stage_group is not None and block_idx == remote_stage_split:
+                from musubi_tuner.ltx2_remote_stage import run_remote_ltx2_stage_chain
+
+                video, audio = run_remote_ltx2_stage_chain(
+                    remote_stage_group,
+                    video,
+                    audio,
+                    perturbations,
+                    cache_key=remote_stage_cache_key,
+                )
+                break
+            if remote_stage_group is None and remote_stage_client is not None and block_idx == remote_stage_split:
+                from musubi_tuner.ltx2_remote_stage import run_remote_ltx2_stage
+
+                video, audio = run_remote_ltx2_stage(
+                    remote_stage_client,
+                    video,
+                    audio,
+                    perturbations,
+                    cache_key=remote_stage_cache_key,
+                )
+                break
+
             swap_start = max(0, len(self.transformer_blocks) - int(self.blocks_to_swap or 0))
             in_swap_range = bool(self.blocks_to_swap) and block_idx >= swap_start
             if model_parallel_block_devices is not None:
                 block_device = model_parallel_block_devices[block_idx]
-                video = _move_transformer_args(video, block_device)
-                audio = _move_transformer_args(audio, block_device)
+                video = _move_transformer_args(
+                    video,
+                    block_device,
+                    model_parallel_transfer_config,
+                    f"video:block{block_idx}",
+                )
+                audio = _move_transformer_args(
+                    audio,
+                    block_device,
+                    model_parallel_transfer_config,
+                    f"audio:block{block_idx}",
+                )
 
             if force_pytorch_attn and in_swap_range and not getattr(block, "_forced_pytorch_attn", False):
                 from musubi_tuner.ltx_2.model.transformer.attention import Attention, AttentionFunction

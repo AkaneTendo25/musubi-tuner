@@ -18,9 +18,17 @@
 	import { onMount } from 'svelte';
 
 	function update(key, value) { updateSection('training', key, value); }
+	function updateRemoteStageLauncher(key, value) { updateSection('remote_stage_launcher', key, value); }
+	function updateRemoteStageServer(key, value) { updateSection('remote_stage_server', key, value); }
 	async function startTraining() {
 		await startProcess('training');
 		await goto('/training/dashboard');
+	}
+	async function startRemoteStageLauncher() {
+		await startProcess('remote_stage_launcher');
+	}
+	async function startRemoteStageServer() {
+		await startProcess('remote_stage_server');
 	}
 
 	// Common optimizer presets
@@ -48,11 +56,21 @@
 		'optimi_lion',
 		'optimi_adan',
 	];
+	const boundaryCodecOptions = ['none', 'int8', 'int4'];
+	const remoteActivationCodecOptions = ['none', 'int8', 'int4', 'aq-int8', 'aq-int4'];
 
 	let t = $derived($projectConfig?.training || {});
+	let rl = $derived($projectConfig?.remote_stage_launcher || {});
+	let rs = $derived($projectConfig?.remote_stage_server || {});
 	let trainingStatus = $derived($processStatuses.training || { state: 'idle', exit_code: null });
+	let remoteStageLauncherStatus = $derived($processStatuses.remote_stage_launcher || { state: 'idle', exit_code: null });
+	let remoteStageServerStatus = $derived($processStatuses.remote_stage_server || { state: 'idle', exit_code: null });
 	let trainingValidation = $derived($processValidation.training || { ok: true, summary: '', errors: [], warnings: [], field_errors: {}, field_warnings: {} });
+	let remoteStageLauncherValidation = $derived($processValidation.remote_stage_launcher || { ok: true, summary: '', errors: [], warnings: [], field_errors: {}, field_warnings: {} });
+	let remoteStageServerValidation = $derived($processValidation.remote_stage_server || { ok: true, summary: '', errors: [], warnings: [], field_errors: {}, field_warnings: {} });
 	let hasValidationIssues = $derived((trainingValidation.errors?.length || 0) > 0 || (trainingValidation.warnings?.length || 0) > 0);
+	let hasRemoteStageLauncherValidationIssues = $derived((remoteStageLauncherValidation.errors?.length || 0) > 0 || (remoteStageLauncherValidation.warnings?.length || 0) > 0);
+	let hasRemoteStageServerValidationIssues = $derived((remoteStageServerValidation.errors?.length || 0) > 0 || (remoteStageServerValidation.warnings?.length || 0) > 0);
 	let hasDatasetValidationErrors = $derived((trainingValidation.errors || []).some((issue) => issue.page === 'dataset'));
 	let validationTimer = null;
 	let cwd = $state('');
@@ -353,6 +371,14 @@
 		return Boolean(fieldError(field));
 	}
 
+	function remoteFieldError(field) {
+		return remoteStageServerValidation.field_errors?.[field]?.[0] || '';
+	}
+
+	function remoteFieldInvalid(field) {
+		return Boolean(remoteFieldError(field));
+	}
+
 	$effect(() => {
 		if (!$projectLoaded || !$projectConfig) return;
 
@@ -360,6 +386,8 @@
 		const configSnapshot = $projectConfig;
 		validationTimer = setTimeout(() => {
 			validateProcess('training', configSnapshot).catch(() => {});
+			validateProcess('remote_stage_launcher', configSnapshot).catch(() => {});
+			validateProcess('remote_stage_server', configSnapshot).catch(() => {});
 		}, 250);
 
 		return () => clearTimeout(validationTimer);
@@ -672,7 +700,7 @@
 				<FormGroup title="Memory">
 					<div class="space-y-2 pt-2">
 						<div class="grid grid-cols-2 gap-2">
-							<FormField type="number" fieldPath="training.blocks_to_swap" value={t.blocks_to_swap ?? ''} oninput={(e) => update('blocks_to_swap', e.target.value ? Number(e.target.value) : null)} placeholder="0-40" min={0} max={40} disabled={t.ltx2_model_parallel} tooltip="CPU offload blocks" />
+							<FormField type="number" fieldPath="training.blocks_to_swap" value={t.blocks_to_swap ?? ''} oninput={(e) => update('blocks_to_swap', e.target.value ? Number(e.target.value) : null)} placeholder="0-40" min={0} max={40} disabled={t.ltx2_model_parallel || t.ltx2_remote_stage} tooltip="CPU offload blocks" />
 							<FormField type="number" fieldPath="training.max_data_loader_n_workers" value={t.max_data_loader_n_workers ?? ''} oninput={(e) => update('max_data_loader_n_workers', e.target.value === '' ? null : Number(e.target.value))} placeholder="CLI default" min={0} tooltip="Dataloader workers" />
 						</div>
 						<div class="grid grid-cols-3 gap-x-4 gap-y-1">
@@ -710,11 +738,65 @@
 							<div class="pt-3 space-y-2" style="border-top: 1px solid var(--border-subtle);">
 								<div class="grid grid-cols-3 gap-x-4 gap-y-1">
 									<FormToggle fieldPath="training.ltx2_model_parallel" checked={t.ltx2_model_parallel ?? false} onchange={(e) => update('ltx2_model_parallel', e.target.checked)} tooltip="Split one LTX-2 transformer across multiple visible CUDA devices. Requires Accelerate --num_processes 1." />
+									<FormToggle fieldPath="training.ltx2_remote_stage" checked={t.ltx2_remote_stage ?? false} onchange={(e) => update('ltx2_remote_stage', e.target.checked)} tooltip="Split one LTX-2 transformer between this trainer and one or more remote TCP stage servers. Requires Accelerate --num_processes 1." />
 								</div>
 								{#if t.ltx2_model_parallel}
 									<div class="grid grid-cols-2 gap-2">
 										<FormField fieldPath="training.ltx2_model_parallel_devices" value={t.ltx2_model_parallel_devices || ''} oninput={(e) => update('ltx2_model_parallel_devices', e.target.value)} placeholder="0,1,2" tooltip="Visible CUDA device ids. The first device must match the Accelerate process device, usually 0." />
 										<FormField fieldPath="training.ltx2_model_parallel_splits" value={t.ltx2_model_parallel_splits || ''} oninput={(e) => update('ltx2_model_parallel_splits', e.target.value)} placeholder="16,32" tooltip="Transformer block boundaries. Leave blank for an even split." />
+									</div>
+									<div class="grid grid-cols-3 gap-2">
+										<FormSelect fieldPath="training.ltx2_mp_activation_codec" value={t.ltx2_mp_activation_codec || 'none'} options={boundaryCodecOptions} onchange={(e) => update('ltx2_mp_activation_codec', e.target.value)} tooltip="Optional activation codec at local CUDA device boundaries." />
+										<FormSelect fieldPath="training.ltx2_mp_grad_codec" value={t.ltx2_mp_grad_codec || 'none'} options={boundaryCodecOptions} onchange={(e) => update('ltx2_mp_grad_codec', e.target.value)} tooltip="Optional backward activation-gradient codec at local CUDA device boundaries." />
+										<FormField type="number" fieldPath="training.ltx2_mp_int8_block_size" value={t.ltx2_mp_int8_block_size ?? 256} oninput={(e) => update('ltx2_mp_int8_block_size', Number(e.target.value))} min={1} tooltip="Block size for local model-parallel int8/int4 codecs." />
+									</div>
+									<div class="grid grid-cols-3 gap-x-4 gap-y-1">
+										<FormToggle fieldPath="training.ltx2_mp_profile_transfers" checked={t.ltx2_mp_profile_transfers ?? false} onchange={(e) => update('ltx2_mp_profile_transfers', e.target.checked)} tooltip="Log model-parallel transfer bytes and timing." />
+									</div>
+									<FormField type="number" fieldPath="training.ltx2_mp_profile_log_every" value={t.ltx2_mp_profile_log_every ?? 20} oninput={(e) => update('ltx2_mp_profile_log_every', Number(e.target.value))} min={1} disabled={!t.ltx2_mp_profile_transfers} tooltip="Log every N local model-parallel transfers when profiling is enabled." />
+								{/if}
+								{#if t.ltx2_remote_stage}
+									<div class="pt-3 space-y-2" style="border-top: 1px solid var(--border-subtle);">
+										<div class="flex items-center justify-between gap-3">
+											<span class="text-[11px] font-medium uppercase tracking-wider" style="color: var(--text-muted);">Remote Master</span>
+											<span class="text-[11px]" style="color: var(--text-muted);">Coordinator side only. Connects to stage servers listed below.</span>
+										</div>
+									<div class="grid grid-cols-2 gap-2">
+										<FormField fieldPath="training.ltx2_remote_stage_specs" value={t.ltx2_remote_stage_specs || ''} oninput={(e) => update('ltx2_remote_stage_specs', e.target.value)} placeholder="pc-a:17810:24:47;pc-b:17811:47:48" tooltip="Ordered remote stages as host:port:start:end. Overrides host/port/split fields when set." />
+										<FormField type="number" fieldPath="training.ltx2_remote_stage_timeout" value={t.ltx2_remote_stage_timeout ?? 600} oninput={(e) => update('ltx2_remote_stage_timeout', Number(e.target.value))} min={1} step="1" tooltip="Socket timeout in seconds for remote-stage requests." />
+									</div>
+									<div class="grid grid-cols-3 gap-2">
+										<FormField fieldPath="training.ltx2_remote_stage_host" value={t.ltx2_remote_stage_host || '127.0.0.1'} oninput={(e) => update('ltx2_remote_stage_host', e.target.value)} disabled={Boolean(t.ltx2_remote_stage_specs)} tooltip="Single remote stage host. Ignored when Remote Stage Specs is set." />
+										<FormField type="number" fieldPath="training.ltx2_remote_stage_port" value={t.ltx2_remote_stage_port ?? 7788} oninput={(e) => update('ltx2_remote_stage_port', Number(e.target.value))} min={1} max={65535} disabled={Boolean(t.ltx2_remote_stage_specs)} tooltip="Single remote stage TCP port. Ignored when Remote Stage Specs is set." />
+										<FormField type="number" fieldPath="training.ltx2_remote_stage_split" value={t.ltx2_remote_stage_split ?? -1} oninput={(e) => update('ltx2_remote_stage_split', Number(e.target.value))} min={0} max={47} disabled={Boolean(t.ltx2_remote_stage_specs)} tooltip="First transformer block index to run on the single remote stage." />
+									</div>
+									<div class="grid grid-cols-3 gap-2">
+										<FormSelect fieldPath="training.ltx2_remote_stage_codec" value={t.ltx2_remote_stage_codec || 'none'} options={remoteActivationCodecOptions} onchange={(e) => update('ltx2_remote_stage_codec', e.target.value)} tooltip="Forward boundary activation codec for remote transport. AQ codecs use keyed activation deltas." />
+										<FormSelect fieldPath="training.ltx2_remote_stage_grad_codec" value={t.ltx2_remote_stage_grad_codec || 'none'} options={boundaryCodecOptions} onchange={(e) => update('ltx2_remote_stage_grad_codec', e.target.value)} tooltip="Backward activation-gradient codec for remote transport." />
+										<FormField type="number" fieldPath="training.ltx2_remote_stage_int8_block_size" value={t.ltx2_remote_stage_int8_block_size ?? 256} oninput={(e) => update('ltx2_remote_stage_int8_block_size', Number(e.target.value))} min={1} tooltip="Block size for remote int8/int4/AQ codecs." />
+									</div>
+									<div class="grid grid-cols-3 gap-2">
+										<FormSelect fieldPath="training.ltx2_remote_stage_aq_key_mode" value={t.ltx2_remote_stage_aq_key_mode || 'sample'} options={['sample', 'sample_timestep', 'sample_timestep_noise', 'off']} onchange={(e) => update('ltx2_remote_stage_aq_key_mode', e.target.value)} disabled={!String(t.ltx2_remote_stage_codec || '').startsWith('aq-')} tooltip="Cache key granularity for AQ delta activations." />
+										<FormField type="number" fieldPath="training.ltx2_remote_stage_aq_cache_size" value={t.ltx2_remote_stage_aq_cache_size ?? 0} oninput={(e) => update('ltx2_remote_stage_aq_cache_size', Number(e.target.value))} min={0} disabled={!String(t.ltx2_remote_stage_codec || '').startsWith('aq-')} tooltip="Max AQ cache entries per side. 0 keeps all keyed entries." />
+										<FormField type="number" fieldPath="training.ltx2_remote_stage_metadata_cache_size" value={t.ltx2_remote_stage_metadata_cache_size ?? 8} oninput={(e) => update('ltx2_remote_stage_metadata_cache_size', Number(e.target.value))} min={1} disabled={!t.ltx2_remote_stage_metadata_cache} tooltip="LRU size for cached static TransformerArgs metadata." />
+									</div>
+									<div class="grid grid-cols-3 gap-x-4 gap-y-1">
+										<FormToggle fieldPath="training.ltx2_remote_stage_metadata_cache" checked={t.ltx2_remote_stage_metadata_cache ?? true} onchange={(e) => update('ltx2_remote_stage_metadata_cache', e.target.checked)} tooltip="Cache static metadata on remote stage servers and resend only dynamic tensors on cache hits." />
+										<FormToggle fieldPath="training.ltx2_remote_stage_aq_stochastic" checked={t.ltx2_remote_stage_aq_stochastic ?? true} onchange={(e) => update('ltx2_remote_stage_aq_stochastic', e.target.checked)} disabled={!String(t.ltx2_remote_stage_codec || '').startsWith('aq-')} tooltip="Use stochastic unbiased rounding for AQ delta and AQ-controlled gradient codecs." />
+										<FormToggle fieldPath="training.ltx2_remote_stage_prune_local_blocks" checked={t.ltx2_remote_stage_prune_local_blocks ?? false} onchange={(e) => update('ltx2_remote_stage_prune_local_blocks', e.target.checked)} tooltip="Replace remote-owned local transformer blocks with placeholders after remote setup to reduce local VRAM." />
+										<FormToggle fieldPath="training.ltx2_remote_stage_trainable" checked={t.ltx2_remote_stage_trainable ?? false} onchange={(e) => update('ltx2_remote_stage_trainable', e.target.checked)} tooltip="Ask remote servers to own trainable parameters and step their optimizer after backward." />
+									</div>
+									{#if t.ltx2_remote_stage_trainable}
+										<div class="grid grid-cols-3 gap-2">
+											<FormSelect fieldPath="training.ltx2_remote_stage_trainable_scope" value={t.ltx2_remote_stage_trainable_scope || 'auto'} options={['auto', 'lora', 'blocks']} onchange={(e) => update('ltx2_remote_stage_trainable_scope', e.target.value)} tooltip="Expected remote trainable parameter scope reported by the server." />
+											<FormField type="number" fieldPath="training.ltx2_remote_stage_learning_rate" value={t.ltx2_remote_stage_learning_rate ?? ''} oninput={(e) => update('ltx2_remote_stage_learning_rate', e.target.value ? Number(e.target.value) : null)} placeholder="Server value" step="0.000001" tooltip="Learning rate recorded in local checkpoint metadata. Server launch controls updates." />
+											<FormField type="number" fieldPath="training.ltx2_remote_stage_weight_decay" value={t.ltx2_remote_stage_weight_decay ?? 0.01} oninput={(e) => update('ltx2_remote_stage_weight_decay', Number(e.target.value))} step="0.001" min={0} tooltip="Weight decay recorded in local checkpoint metadata. Server launch controls updates." />
+										</div>
+										<div class="grid grid-cols-2 gap-2">
+											<FormField type="number" fieldPath="training.ltx2_remote_stage_max_grad_norm" value={t.ltx2_remote_stage_max_grad_norm ?? 0} oninput={(e) => update('ltx2_remote_stage_max_grad_norm', Number(e.target.value))} min={0} step="0.1" tooltip="Remote grad clip norm recorded in metadata. 0 disables clipping on compatible servers." />
+											<PathInput fieldPath="training.ltx2_remote_stage_checkpoint_dir" value={t.ltx2_remote_stage_checkpoint_dir || ''} oninput={(e) => update('ltx2_remote_stage_checkpoint_dir', e.target.value)} tooltip="Directory path as seen by each remote server for remote trainable checkpoint shards. Blank sends output_dir." />
+										</div>
+									{/if}
 									</div>
 								{/if}
 							</div>
@@ -729,7 +811,7 @@
 							<div class="grid grid-cols-3 gap-x-4 gap-y-1">
 								<FormToggle fieldPath="training.gradient_checkpointing_cpu_offload" checked={t.gradient_checkpointing_cpu_offload ?? false} onchange={(e) => update('gradient_checkpointing_cpu_offload', e.target.checked)} tooltip="Offload checkpointed activations to CPU" />
 								<FormToggle fieldPath="training.split_attn" checked={t.split_attn ?? false} onchange={(e) => update('split_attn', e.target.checked)} tooltip="Legacy --split_attn flag. LTX-2-specific split controls are above." />
-								<FormToggle fieldPath="training.blockwise_checkpointing" checked={t.blockwise_checkpointing ?? false} onchange={(e) => update('blockwise_checkpointing', e.target.checked)} disabled={t.ltx2_model_parallel} tooltip="Per-block checkpointing" />
+								<FormToggle fieldPath="training.blockwise_checkpointing" checked={t.blockwise_checkpointing ?? false} onchange={(e) => update('blockwise_checkpointing', e.target.checked)} disabled={t.ltx2_model_parallel || t.ltx2_remote_stage} tooltip="Per-block checkpointing" />
 								<FormToggle fieldPath="training.use_pinned_memory_for_block_swap" checked={t.use_pinned_memory_for_block_swap ?? false} onchange={(e) => update('use_pinned_memory_for_block_swap', e.target.checked)} tooltip="Pinned memory for block swap" />
 								<FormToggle fieldPath="training.img_in_txt_in_offloading" checked={t.img_in_txt_in_offloading ?? false} onchange={(e) => update('img_in_txt_in_offloading', e.target.checked)} tooltip="Offload img_in/txt_in to CPU" />
 							</div>
@@ -806,20 +888,20 @@
 				<FormGroup title="Compile & CUDA">
 					<div class="space-y-2 pt-2">
 						<div class="grid grid-cols-3 gap-x-4 gap-y-1">
-							<FormToggle fieldPath="training.compile" checked={t.compile ?? false} onchange={(e) => update('compile', e.target.checked)} disabled={t.ltx2_model_parallel} tooltip="Enable torch.compile" />
-							<FormToggle fieldPath="training.compile_fullgraph" checked={t.compile_fullgraph ?? false} onchange={(e) => update('compile_fullgraph', e.target.checked)} disabled={t.ltx2_model_parallel || !t.compile} tooltip="Pass --compile_fullgraph." />
+							<FormToggle fieldPath="training.compile" checked={t.compile ?? false} onchange={(e) => update('compile', e.target.checked)} disabled={t.ltx2_model_parallel || t.ltx2_remote_stage} tooltip="Enable torch.compile" />
+							<FormToggle fieldPath="training.compile_fullgraph" checked={t.compile_fullgraph ?? false} onchange={(e) => update('compile_fullgraph', e.target.checked)} disabled={t.ltx2_model_parallel || t.ltx2_remote_stage || !t.compile} tooltip="Pass --compile_fullgraph." />
 							<FormToggle fieldPath="training.cuda_allow_tf32" checked={t.cuda_allow_tf32 ?? false} onchange={(e) => update('cuda_allow_tf32', e.target.checked)} tooltip="Allow TF32 on Ampere+" />
 							<FormToggle fieldPath="training.cuda_cudnn_benchmark" checked={t.cuda_cudnn_benchmark ?? false} onchange={(e) => update('cuda_cudnn_benchmark', e.target.checked)} tooltip="cuDNN benchmark mode" />
 							<FormToggle fieldPath="training.disable_numpy_memmap" checked={t.disable_numpy_memmap ?? false} onchange={(e) => update('disable_numpy_memmap', e.target.checked)} tooltip="Disable numpy memmap model loading." />
 						</div>
 						<div class="grid grid-cols-3 gap-2">
-							<FormField fieldPath="training.compile_backend" value={t.compile_backend || 'inductor'} oninput={(e) => update('compile_backend', e.target.value)} disabled={!t.compile || t.ltx2_model_parallel} tooltip="Compile backend" />
-							<FormField fieldPath="training.compile_mode" value={t.compile_mode || ''} oninput={(e) => update('compile_mode', e.target.value)} placeholder="default" disabled={!t.compile || t.ltx2_model_parallel} tooltip="Compile mode (default, reduce-overhead, max-autotune)" />
-							<FormSelect fieldPath="training.compile_dynamic" value={t.compile_dynamic === true ? 'true' : t.compile_dynamic === false ? '' : t.compile_dynamic || ''} options={[{value:'',label:'Default'},{value:'true',label:'true'},{value:'false',label:'false'},{value:'auto',label:'auto'}]} onchange={(e) => update('compile_dynamic', e.target.value || false)} disabled={!t.compile || t.ltx2_model_parallel} tooltip="Value for --compile_dynamic." />
+							<FormField fieldPath="training.compile_backend" value={t.compile_backend || 'inductor'} oninput={(e) => update('compile_backend', e.target.value)} disabled={!t.compile || t.ltx2_model_parallel || t.ltx2_remote_stage} tooltip="Compile backend" />
+							<FormField fieldPath="training.compile_mode" value={t.compile_mode || ''} oninput={(e) => update('compile_mode', e.target.value)} placeholder="default" disabled={!t.compile || t.ltx2_model_parallel || t.ltx2_remote_stage} tooltip="Compile mode (default, reduce-overhead, max-autotune)" />
+							<FormSelect fieldPath="training.compile_dynamic" value={t.compile_dynamic === true ? 'true' : t.compile_dynamic === false ? '' : t.compile_dynamic || ''} options={[{value:'',label:'Default'},{value:'true',label:'true'},{value:'false',label:'false'},{value:'auto',label:'auto'}]} onchange={(e) => update('compile_dynamic', e.target.value || false)} disabled={!t.compile || t.ltx2_model_parallel || t.ltx2_remote_stage} tooltip="Value for --compile_dynamic." />
 						</div>
 						<div class="grid grid-cols-2 gap-2">
 							<FormField type="number" fieldPath="training.cuda_memory_fraction" value={t.cuda_memory_fraction ?? ''} oninput={(e) => update('cuda_memory_fraction', e.target.value ? Number(e.target.value) : null)} placeholder="None" step="0.05" min={0} max={1} tooltip="Limit CUDA memory fraction" />
-							<FormField type="number" fieldPath="training.compile_cache_size_limit" value={t.compile_cache_size_limit ?? ''} oninput={(e) => update('compile_cache_size_limit', e.target.value ? Number(e.target.value) : null)} placeholder="Default" disabled={!t.compile || t.ltx2_model_parallel} tooltip="torch.compile cache size limit" />
+							<FormField type="number" fieldPath="training.compile_cache_size_limit" value={t.compile_cache_size_limit ?? ''} oninput={(e) => update('compile_cache_size_limit', e.target.value ? Number(e.target.value) : null)} placeholder="Default" disabled={!t.compile || t.ltx2_model_parallel || t.ltx2_remote_stage} tooltip="torch.compile cache size limit" />
 						</div>
 						<div class="grid grid-cols-2 gap-2">
 							<FormField fieldPath="training.dynamo_backend" value={t.dynamo_backend || 'NO'} oninput={(e) => update('dynamo_backend', e.target.value || 'NO')} tooltip="Accelerate TorchDynamo backend. Default NO disables it." />
@@ -997,6 +1079,146 @@
 				<div class="space-y-2 pt-2">
 					<FormField fieldPath="training.accelerate_extra_args" value={t.accelerate_extra_args || ''} oninput={(e) => update('accelerate_extra_args', e.target.value)} placeholder="--num_processes 2 --main_process_port 29501" tooltip="Extra arguments appended to `accelerate launch` before the training script path." />
 					<FormField fieldPath="training.extra_args" value={t.extra_args || ''} oninput={(e) => update('extra_args', e.target.value)} placeholder="--flag value --other_flag" tooltip="Extra arguments appended to the LTX-2 training script command. Use this for any CLI option without a dedicated dashboard control." />
+				</div>
+			</FormGroup>
+		{/if}
+
+		{#if $advancedMode}
+				{#if t.ltx2_remote_stage}
+					<FormGroup title="Remote Master">
+						<div class="space-y-3 pt-2">
+							<p class="text-[11px]" style="color: var(--text-muted);">
+								Launch SSH sessions for the remote stage servers described by the training spec. The launcher stays attached so stop cleanly tears down the remote processes.
+							</p>
+							{#if hasRemoteStageLauncherValidationIssues}
+								<div class="p-3 space-y-2" style="background: {remoteStageLauncherValidation.errors?.length ? 'var(--danger-muted)' : 'var(--bg-elevated)'}; border: 1px solid {remoteStageLauncherValidation.errors?.length ? 'var(--danger)' : 'var(--border)'}; border-radius: var(--radius-sm);">
+									<div class="text-[12px] font-medium" style="color: {remoteStageLauncherValidation.errors?.length ? 'var(--danger)' : 'var(--text-primary)'};">
+										{remoteStageLauncherValidation.summary}
+									</div>
+									{#if remoteStageLauncherValidation.errors?.length}
+										<div class="space-y-1">
+											{#each remoteStageLauncherValidation.errors as issue}
+												<div class="text-[12px]" style="color: var(--text-primary);">{issue.message}</div>
+											{/each}
+										</div>
+									{/if}
+									{#if remoteStageLauncherValidation.warnings?.length}
+										<div class="space-y-1">
+											{#each remoteStageLauncherValidation.warnings as issue}
+												<div class="text-[12px]" style="color: var(--text-secondary);">{issue.message}</div>
+											{/each}
+										</div>
+									{/if}
+								</div>
+							{/if}
+							<div class="grid grid-cols-3 gap-2">
+								<FormField fieldPath="remote_stage_launcher.ssh_user" value={rl.ssh_user || ''} oninput={(e) => updateRemoteStageLauncher('ssh_user', e.target.value)} placeholder="Optional" tooltip="SSH username used to launch remote stage servers" />
+								<FormField type="number" fieldPath="remote_stage_launcher.ssh_port" value={rl.ssh_port ?? 22} oninput={(e) => updateRemoteStageLauncher('ssh_port', Number(e.target.value))} min={1} max={65535} tooltip="SSH port used for remote orchestration" />
+								<FormField fieldPath="remote_stage_launcher.remote_python" value={rl.remote_python || 'python'} oninput={(e) => updateRemoteStageLauncher('remote_python', e.target.value)} tooltip="Python executable on each remote machine" />
+							</div>
+							<div class="grid grid-cols-2 gap-2">
+								<FormField fieldPath="remote_stage_launcher.remote_root" value={rl.remote_root || ''} oninput={(e) => updateRemoteStageLauncher('remote_root', e.target.value)} placeholder="G:\\repos\\ltx2-tuner" tooltip="Repository root path on each remote machine" />
+								<FormField type="number" fieldPath="remote_stage_launcher.ready_timeout" value={rl.ready_timeout ?? 120} oninput={(e) => updateRemoteStageLauncher('ready_timeout', Number(e.target.value))} min={1} step="1" tooltip="Seconds to wait for each remote stage TCP port to come up" />
+							</div>
+							<div class="grid grid-cols-2 gap-2">
+								<FormField fieldPath="remote_stage_launcher.ssh_extra_args" value={rl.ssh_extra_args || ''} oninput={(e) => updateRemoteStageLauncher('ssh_extra_args', e.target.value)} placeholder="-i key -o StrictHostKeyChecking=no" tooltip="Extra SSH flags appended before the remote host target" />
+								<FormField type="number" fieldPath="remote_stage_launcher.ready_poll_interval" value={rl.ready_poll_interval ?? 2} oninput={(e) => updateRemoteStageLauncher('ready_poll_interval', Number(e.target.value))} min={0.1} step="0.1" tooltip="Polling interval for remote stage readiness checks" />
+							</div>
+							<div class="flex items-center gap-4 pt-1">
+								<ProcessControls processType="remote_stage_launcher" status={remoteStageLauncherStatus} onStart={startRemoteStageLauncher} onStop={() => stopProcess('remote_stage_launcher')} />
+							</div>
+							<CommandPanel processType="remote_stage_launcher" defaultFilename="remote_stage_launcher.bat" />
+						</div>
+					</FormGroup>
+				{/if}
+
+				<FormGroup title="Remote Slave">
+				<div class="space-y-3 pt-2">
+					<p class="text-[11px]" style="color: var(--text-muted);">
+						Launch this machine as a stage server. The coordinator connects to this process over TCP and owns the training loop.
+					</p>
+					{#if hasRemoteStageServerValidationIssues}
+						<div class="p-3 space-y-2" style="background: {remoteStageServerValidation.errors?.length ? 'var(--danger-muted)' : 'var(--bg-elevated)'}; border: 1px solid {remoteStageServerValidation.errors?.length ? 'var(--danger)' : 'var(--border)'}; border-radius: var(--radius-sm);">
+							<div class="text-[12px] font-medium" style="color: {remoteStageServerValidation.errors?.length ? 'var(--danger)' : 'var(--text-primary)'};">
+								{remoteStageServerValidation.summary}
+							</div>
+							{#if remoteStageServerValidation.errors?.length}
+								<div class="space-y-1">
+									{#each remoteStageServerValidation.errors as issue}
+										<div class="text-[12px]" style="color: var(--text-primary);">{issue.message}</div>
+									{/each}
+								</div>
+							{/if}
+							{#if remoteStageServerValidation.warnings?.length}
+								<div class="space-y-1">
+									{#each remoteStageServerValidation.warnings as issue}
+										<div class="text-[12px]" style="color: var(--text-secondary);">{issue.message}</div>
+									{/each}
+								</div>
+							{/if}
+						</div>
+					{/if}
+					<div class="grid grid-cols-2 gap-2">
+						<PathInput
+							fieldPath="remote_stage_server.ltx2_checkpoint"
+							value={rs.ltx2_checkpoint || ''}
+							oninput={(e) => updateRemoteStageServer('ltx2_checkpoint', e.target.value)}
+							showFiles
+							tooltip="Local checkpoint path used by this remote server"
+							invalid={remoteFieldInvalid('remote_stage_server.ltx2_checkpoint')}
+							error={remoteFieldError('remote_stage_server.ltx2_checkpoint')}
+						/>
+						<FormField fieldPath="remote_stage_server.bind" value={rs.bind || '0.0.0.0'} oninput={(e) => updateRemoteStageServer('bind', e.target.value)} tooltip="Bind host for the stage server listener" />
+					</div>
+					<div class="grid grid-cols-3 gap-2">
+						<FormField type="number" fieldPath="remote_stage_server.port" value={rs.port ?? 7788} oninput={(e) => updateRemoteStageServer('port', Number(e.target.value))} min={1} max={65535} tooltip="TCP port for the stage server" />
+						<FormField fieldPath="remote_stage_server.device" value={rs.device || 'cuda:0'} oninput={(e) => updateRemoteStageServer('device', e.target.value)} tooltip="CUDA device used by this remote server" />
+						<FormField fieldPath="remote_stage_server.load_device" value={rs.load_device || ''} oninput={(e) => updateRemoteStageServer('load_device', e.target.value || null)} placeholder="Auto" tooltip="Optional device used while loading the checkpoint" />
+					</div>
+					<div class="grid grid-cols-3 gap-2">
+						<FormField type="number" fieldPath="remote_stage_server.split" value={rs.split ?? 0} oninput={(e) => updateRemoteStageServer('split', Number(e.target.value))} min={0} placeholder="0" tooltip="First transformer block owned by this server" />
+						<FormField type="number" fieldPath="remote_stage_server.end" value={rs.end ?? -1} oninput={(e) => updateRemoteStageServer('end', Number(e.target.value))} placeholder="-1" tooltip="Exclusive final transformer block. Leave at -1 to use the tail range." />
+						<FormSelect fieldPath="remote_stage_server.dtype" value={rs.dtype || 'bfloat16'} options={['bfloat16', 'float16', 'float32', 'bf16', 'fp16', 'fp32']} onchange={(e) => updateRemoteStageServer('dtype', e.target.value)} tooltip="Checkpoint dtype for the remote stage" />
+					</div>
+					<div class="grid grid-cols-3 gap-x-4 gap-y-1">
+						<FormToggle fieldPath="remote_stage_server.block_only_load" checked={rs.block_only_load ?? true} onchange={(e) => updateRemoteStageServer('block_only_load', e.target.checked)} tooltip="Load only the owned block range and leave shared modules on meta" />
+						<FormToggle fieldPath="remote_stage_server.prune_non_stage_blocks" checked={rs.prune_non_stage_blocks ?? false} onchange={(e) => updateRemoteStageServer('prune_non_stage_blocks', e.target.checked)} tooltip="Replace non-owned blocks with placeholders after load" />
+						<FormToggle fieldPath="remote_stage_server.stage_only_device_placement" checked={rs.stage_only_device_placement ?? true} onchange={(e) => updateRemoteStageServer('stage_only_device_placement', e.target.checked)} tooltip="Keep non-owned modules on the load device and move only the owned stage to GPU" />
+						<FormToggle fieldPath="remote_stage_server.full_model_device_placement" checked={rs.full_model_device_placement ?? false} onchange={(e) => updateRemoteStageServer('full_model_device_placement', e.target.checked)} tooltip="Move the full loaded model to the target device" />
+						<FormToggle fieldPath="remote_stage_server.trainable" checked={rs.trainable ?? false} onchange={(e) => updateRemoteStageServer('trainable', e.target.checked)} tooltip="Let the remote server own and update trainable parameters" />
+					</div>
+					{#if rs.trainable}
+						<div class="grid grid-cols-3 gap-2">
+							<FormSelect fieldPath="remote_stage_server.trainable_scope" value={rs.trainable_scope || 'auto'} options={['auto', 'lora', 'blocks']} onchange={(e) => updateRemoteStageServer('trainable_scope', e.target.value)} tooltip="Which remote parameters the server should optimize" />
+							<FormField type="number" fieldPath="remote_stage_server.learning_rate" value={rs.learning_rate ?? ''} oninput={(e) => updateRemoteStageServer('learning_rate', e.target.value ? Number(e.target.value) : null)} placeholder="Server value" step="0.000001" tooltip="Remote optimizer learning rate" />
+							<FormField type="number" fieldPath="remote_stage_server.weight_decay" value={rs.weight_decay ?? 0.01} oninput={(e) => updateRemoteStageServer('weight_decay', Number(e.target.value))} min={0} step="0.001" tooltip="Remote optimizer weight decay" />
+						</div>
+						<div class="grid grid-cols-2 gap-2">
+							<FormField type="number" fieldPath="remote_stage_server.max_grad_norm" value={rs.max_grad_norm ?? 0} oninput={(e) => updateRemoteStageServer('max_grad_norm', Number(e.target.value))} min={0} step="0.1" tooltip="Remote gradient clipping norm" />
+							<FormField fieldPath="remote_stage_server.network_module" value={rs.network_module || ''} oninput={(e) => updateRemoteStageServer('network_module', e.target.value)} placeholder="Optional" tooltip="LoRA network module name for remote-owned adapters" />
+						</div>
+						<div class="grid grid-cols-3 gap-2">
+							<FormField type="number" fieldPath="remote_stage_server.network_dim" value={rs.network_dim ?? ''} oninput={(e) => updateRemoteStageServer('network_dim', e.target.value ? Number(e.target.value) : null)} placeholder="Optional" min={1} tooltip="Remote LoRA rank" />
+							<FormField type="number" fieldPath="remote_stage_server.network_alpha" value={rs.network_alpha ?? ''} oninput={(e) => updateRemoteStageServer('network_alpha', e.target.value ? Number(e.target.value) : null)} placeholder="Optional" step="0.1" tooltip="Remote LoRA alpha" />
+							<FormField type="number" fieldPath="remote_stage_server.network_lr" value={rs.network_lr ?? ''} oninput={(e) => updateRemoteStageServer('network_lr', e.target.value ? Number(e.target.value) : null)} placeholder="Optional" step="0.000001" tooltip="Optional LoRA learning rate override" />
+						</div>
+						<div class="grid grid-cols-2 gap-2">
+							<FormField fieldPath="remote_stage_server.network_weights" value={rs.network_weights || ''} oninput={(e) => updateRemoteStageServer('network_weights', e.target.value)} placeholder="Optional" tooltip="Remote LoRA weights file" />
+							<FormField fieldPath="remote_stage_server.network_args" value={rs.network_args || ''} oninput={(e) => updateRemoteStageServer('network_args', e.target.value)} placeholder="key=value key=value" tooltip="Extra key=value args passed to the remote network module" />
+						</div>
+					{/if}
+					<div class="grid grid-cols-2 gap-2">
+						<FormField type="number" fieldPath="remote_stage_server.int8_block_size" value={rs.int8_block_size ?? 256} oninput={(e) => updateRemoteStageServer('int8_block_size', Number(e.target.value))} min={1} tooltip="Block size for remote low-bit codecs" />
+						<FormField fieldPath="remote_stage_server.quantize_device" value={rs.quantize_device || ''} oninput={(e) => updateRemoteStageServer('quantize_device', e.target.value || null)} placeholder="Optional" tooltip="Optional device used for quantization work" />
+					</div>
+					<div class="grid grid-cols-2 gap-2">
+						<FormField fieldPath="remote_stage_server.extra_args" value={rs.extra_args || ''} oninput={(e) => updateRemoteStageServer('extra_args', e.target.value)} placeholder="--flag value" tooltip="Extra CLI arguments appended to the remote stage server command" />
+						<FormField fieldPath="remote_stage_server.log_level" value={rs.log_level || 'INFO'} oninput={(e) => updateRemoteStageServer('log_level', e.target.value)} placeholder="INFO" tooltip="Remote server log level" />
+					</div>
+					<div class="flex items-center gap-4 pt-1">
+						<ProcessControls processType="remote_stage_server" status={remoteStageServerStatus} onStart={startRemoteStageServer} onStop={() => stopProcess('remote_stage_server')} />
+					</div>
+					<CommandPanel processType="remote_stage_server" defaultFilename="remote_stage_server.bat" />
 				</div>
 			</FormGroup>
 		{/if}

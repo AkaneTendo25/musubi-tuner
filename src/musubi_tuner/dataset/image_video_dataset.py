@@ -1296,7 +1296,10 @@ class BucketBatchManager:
         ref_audio_latents_per_item = []
         ref_audio_lengths_per_item = []
         dino_features_per_item = []
-        diag_collect_keys = os.getenv("LTX2_NAN_DIAG", "0") == "1"
+        collect_item_keys = (
+            os.getenv("LTX2_COLLECT_BATCH_ITEM_KEYS", "0") == "1"
+            or os.getenv("LTX2_NAN_DIAG", "0") == "1"
+        )
         item_keys = []
         latent_cache_paths = []
         audio_cache_paths = []
@@ -1446,7 +1449,7 @@ class BucketBatchManager:
                 [item_ref_audio_lengths[idx] for idx in sorted(item_ref_audio_lengths.keys())] if item_ref_audio_lengths else None
             )
 
-            if diag_collect_keys:
+            if collect_item_keys:
                 item_keys.append(item_info.item_key)
                 latent_cache_paths.append(item_info.latent_cache_path)
                 audio_cache_paths.append(audio_latent_cache_path)
@@ -1878,7 +1881,7 @@ class BucketBatchManager:
             if conditions:
                 batch_tensor_data["conditions"] = conditions
 
-        if diag_collect_keys:
+        if collect_item_keys:
             batch_tensor_data["item_keys"] = item_keys
             batch_tensor_data["latent_cache_paths"] = latent_cache_paths
             batch_tensor_data["audio_cache_paths"] = audio_cache_paths

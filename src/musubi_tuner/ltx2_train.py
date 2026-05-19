@@ -38,6 +38,14 @@ from musubi_tuner.hv_train_network import (
     should_sample_images,
 )
 from musubi_tuner.modules.scheduling_flow_match_discrete import FlowMatchDiscreteScheduler
+from musubi_tuner.ogm_ge import compute_ogm_ge_coefficients
+from musubi_tuner.audio_loss_balance import (
+    compute_ema_magnitude_audio_weight,
+    compute_inverse_frequency_audio_weight,
+    compute_uncertainty_weighted_loss,
+    update_audio_presence_ema,
+    update_loss_ema,
+)
 from musubi_tuner.utils import huggingface_utils, model_utils, sai_model_spec, train_utils
 from musubi_tuner.utils.safetensors_utils import MemoryEfficientSafeOpen, mem_eff_save_file
 from musubi_tuner.ltx2_train_network import LTX2NetworkTrainer, ltx2_setup_parser
@@ -47,6 +55,15 @@ from musubi_tuner.ltx2_model_parallel import (
     enable_ltx2_model_parallel,
     is_ltx2_model_parallel_enabled,
     validate_ltx2_model_parallel_setup,
+)
+from musubi_tuner.ltx2_remote_stage import (
+    enable_ltx2_remote_stage,
+    is_ltx2_remote_stage_enabled,
+    optimizer_step_ltx2_remote_stage,
+    prune_ltx2_remote_stage_local_blocks,
+    save_ltx2_remote_stage_state,
+    validate_ltx2_remote_stage_setup,
+    zero_grad_ltx2_remote_stage,
 )
 from musubi_tuner.ltx2_motion_preservation import (
     AttentionMapRecorder as _AttentionMapRecorder,
@@ -2538,6 +2555,27 @@ def ltx2_finetune_setup_parser(parser: argparse.ArgumentParser) -> argparse.Argu
         help="Freeze attention geometry params (to_q/to_k/q_norm/k_norm) during full fine-tuning.",
     )
     parser.add_argument(
+        "--freeze_audio_params",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Full-FT only: freeze all params whose name contains 'audio_' (audio_attn1/audio_attn2/"
+            "audio_to_video_attn/video_to_audio_attn inside transformer blocks plus audio_adaln_single/"
+            "audio_norm_out at the model level). Lets the video branch keep adapting while audio "
+            "remains at its pretrained values."
+        ),
+    )
+    parser.add_argument(
+        "--audio_param_lr_scale",
+        type=float,
+        default=1.0,
+        help=(
+            "Full-FT only: extra LR scale applied to audio_* params (mirrors LoRA's --audio_lr but "
+            "expressed as a scale of --learning_rate). Use values < 1 to slow audio learning; set 0 "
+            "to freeze (equivalent to --freeze_audio_params)."
+        ),
+    )
+    parser.add_argument(
         "--image_prior_ft",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -2922,8 +2960,23 @@ def main() -> None:
     if args.mixed_precision is None:
         args.mixed_precision = accelerator.mixed_precision
     ltx2_model_parallel = is_ltx2_model_parallel_enabled(args)
+    ltx2_remote_stage = is_ltx2_remote_stage_enabled(args)
+    if ltx2_model_parallel and ltx2_remote_stage:
+        raise RuntimeError("--ltx2_model_parallel and --ltx2_remote_stage are experimental paths and cannot be combined")
     if ltx2_model_parallel:
         validate_ltx2_model_parallel_setup(args, accelerator)
+    if ltx2_remote_stage:
+        if int(getattr(accelerator, "num_processes", 1)) != 1:
+            raise RuntimeError("LTX2 remote stage is single-process only; use accelerate --num_processes 1")
+        if int(getattr(args, "blocks_to_swap", 0) or 0) > 0:
+            raise RuntimeError("LTX2 remote stage is incompatible with --blocks_to_swap in the current implementation")
+        if bool(getattr(args, "blockwise_checkpointing", False)):
+            raise RuntimeError(
+                "LTX2 remote stage is incompatible with --blockwise_checkpointing in the current implementation"
+            )
+        if bool(getattr(args, "compile", False)):
+            raise RuntimeError("LTX2 remote stage is incompatible with --compile in the current implementation")
+        validate_ltx2_remote_stage_setup(args)
 
     # sample prompts (optional)
     sample_parameters = None
@@ -3118,7 +3171,8 @@ def main() -> None:
     # model
     blocks_to_swap = int(getattr(args, "blocks_to_swap", 0) or 0)
     trainer.blocks_to_swap = blocks_to_swap
-    loading_device = "cpu" if blocks_to_swap > 0 or ltx2_model_parallel else accelerator.device
+    remote_prune_local_blocks = ltx2_remote_stage and bool(getattr(args, "ltx2_remote_stage_prune_local_blocks", False))
+    loading_device = "cpu" if blocks_to_swap > 0 or ltx2_model_parallel or remote_prune_local_blocks else accelerator.device
 
     if args.sdpa:
         attn_mode = "torch"
@@ -3147,6 +3201,11 @@ def main() -> None:
     ltx2_model_parallel_plan = None
     if ltx2_model_parallel:
         ltx2_model_parallel_plan = enable_ltx2_model_parallel(transformer, args)
+    if ltx2_remote_stage:
+        enable_ltx2_remote_stage(transformer, args)
+        prune_ltx2_remote_stage_local_blocks(transformer, args)
+        if remote_prune_local_blocks:
+            transformer.to(accelerator.device)
 
     # Clean up memory after model loading
     clean_memory_on_device(accelerator.device)
@@ -3272,6 +3331,22 @@ def main() -> None:
             )
         text_encoder.train()
 
+    if bool(getattr(args, "freeze_audio_params", False)) or float(getattr(args, "audio_param_lr_scale", 1.0) or 0.0) == 0.0:
+        # Freeze all audio modules. Catches audio_attn1/audio_attn2/audio_to_video_attn/
+        # video_to_audio_attn inside transformer blocks AND model-level audio_adaln_single /
+        # audio_norm_out / audio_proj. Setting requires_grad=False makes _build_full_ft_param_groups
+        # skip them naturally and also prevents gradient computation.
+        _frozen_audio_count = 0
+        for _name, _param in transformer.named_parameters():
+            if "audio_" in _name:
+                _param.requires_grad_(False)
+                _frozen_audio_count += 1
+        if _frozen_audio_count:
+            logger.info(
+                "Full-FT freezing audio params: %d tensors with 'audio_' in name set requires_grad=False.",
+                _frozen_audio_count,
+            )
+
     params_to_optimize, param_names, ft_group_stats = _build_full_ft_param_groups(
         transformer,
         args.learning_rate,
@@ -3282,6 +3357,44 @@ def main() -> None:
         attn_geometry_lr_scale=float(getattr(args, "attn_geometry_lr_scale", 1.0) or 0.0),
         freeze_attn_geometry=bool(getattr(args, "freeze_attn_geometry", False)),
     )
+
+    # Audio param LR scale: post-process param_groups to extract audio_* params
+    # into a separate group with scaled LR. Only applies when scale != 1.0 and
+    # audio params aren't already frozen (handled above).
+    _audio_lr_scale = float(getattr(args, "audio_param_lr_scale", 1.0) or 1.0)
+    if _audio_lr_scale != 1.0 and _audio_lr_scale > 0.0:
+        param_to_name: dict[int, str] = {}
+        for _name, _param in transformer.named_parameters():
+            param_to_name[id(_param)] = _name
+        audio_groups: dict[float, list[torch.nn.Parameter]] = {}
+        new_groups = []
+        new_name_groups = []
+        for _grp, _names in zip(params_to_optimize, param_names):
+            kept_params = []
+            kept_names = []
+            for _param, _name in zip(_grp["params"], _names):
+                if "audio_" in _name:
+                    base_lr = float(_grp.get("lr", args.learning_rate))
+                    audio_groups.setdefault(base_lr * _audio_lr_scale, []).append(_param)
+                else:
+                    kept_params.append(_param)
+                    kept_names.append(_name)
+            if kept_params:
+                new_grp = dict(_grp)
+                new_grp["params"] = kept_params
+                new_groups.append(new_grp)
+                new_name_groups.append(kept_names)
+        for scaled_lr in sorted(audio_groups.keys()):
+            new_groups.append({"params": audio_groups[scaled_lr], "lr": scaled_lr})
+            new_name_groups.append(["<audio_group>"])
+        n_audio = sum(len(audio_groups[k]) for k in audio_groups)
+        if n_audio > 0:
+            logger.info(
+                "Full-FT audio_param_lr_scale=%.4f applied: %d audio param tensors moved to separate group(s).",
+                _audio_lr_scale, n_audio,
+            )
+            params_to_optimize = new_groups
+            param_names = new_name_groups
     if text_encoder is not None:
         text_encoder_lr = getattr(args, "full_ft_text_encoder_lr", None)
         if text_encoder_lr is None:
@@ -3728,17 +3841,6 @@ def main() -> None:
         "ss_shifted_logit_uniform_prob": getattr(args, "shifted_logit_uniform_prob", 0.1),
         "ss_shifted_logit_shift": getattr(args, "shifted_logit_shift", None),
         "ss_ltx_mode": args.ltx_mode,
-        "ss_ltx2_model_parallel": bool(ltx2_model_parallel),
-        "ss_ltx2_model_parallel_devices": (
-            ",".join(str(device_id) for device_id in ltx2_model_parallel_plan.device_ids)
-            if ltx2_model_parallel_plan is not None
-            else None
-        ),
-        "ss_ltx2_model_parallel_splits": (
-            ",".join(str(split) for split in ltx2_model_parallel_plan.split_points)
-            if ltx2_model_parallel_plan is not None
-            else None
-        ),
         "ss_split_av_passes": bool(getattr(args, "split_av_passes", False)),
         "ss_video_loss_weight": getattr(args, "video_loss_weight", 1.0),
         "ss_audio_loss_weight": getattr(args, "audio_loss_weight", 1.0),
@@ -3836,6 +3938,48 @@ def main() -> None:
         "ss_full_ft_frozen_blocks_applied": ft_group_stats.get("frozen_blocks"),
         "ss_full_ft_text_encoder_lr_group": ft_group_stats.get("text_encoder_lr", None),
     }
+
+    if ltx2_model_parallel:
+        metadata.update(
+            {
+                "ss_ltx2_model_parallel": True,
+                "ss_ltx2_model_parallel_devices": (
+                    ",".join(str(device_id) for device_id in ltx2_model_parallel_plan.device_ids)
+                    if ltx2_model_parallel_plan is not None
+                    else None
+                ),
+                "ss_ltx2_model_parallel_splits": (
+                    ",".join(str(split) for split in ltx2_model_parallel_plan.split_points)
+                    if ltx2_model_parallel_plan is not None
+                    else None
+                ),
+                "ss_ltx2_mp_activation_codec": getattr(args, "ltx2_mp_activation_codec", "none"),
+                "ss_ltx2_mp_grad_codec": getattr(args, "ltx2_mp_grad_codec", "none"),
+                "ss_ltx2_mp_int8_block_size": getattr(args, "ltx2_mp_int8_block_size", 256),
+            }
+        )
+
+    if ltx2_remote_stage:
+        metadata.update(
+            {
+                "ss_ltx2_remote_stage": True,
+                "ss_ltx2_remote_stage_host": getattr(args, "ltx2_remote_stage_host", None),
+                "ss_ltx2_remote_stage_port": getattr(args, "ltx2_remote_stage_port", None),
+                "ss_ltx2_remote_stage_split": getattr(args, "ltx2_remote_stage_split", None),
+                "ss_ltx2_remote_stage_specs": getattr(args, "ltx2_remote_stage_specs", None),
+                "ss_ltx2_remote_stage_codec": getattr(args, "ltx2_remote_stage_codec", "none"),
+                "ss_ltx2_remote_stage_grad_codec": getattr(args, "ltx2_remote_stage_grad_codec", "none"),
+                "ss_ltx2_remote_stage_metadata_cache": getattr(args, "ltx2_remote_stage_metadata_cache", None),
+                "ss_ltx2_remote_stage_metadata_cache_size": getattr(args, "ltx2_remote_stage_metadata_cache_size", None),
+                "ss_ltx2_remote_stage_aq_key_mode": getattr(args, "ltx2_remote_stage_aq_key_mode", None),
+                "ss_ltx2_remote_stage_trainable": bool(getattr(args, "ltx2_remote_stage_trainable", False)),
+                "ss_ltx2_remote_stage_trainable_scope": getattr(args, "ltx2_remote_stage_trainable_scope", None),
+                "ss_ltx2_remote_stage_learning_rate": getattr(args, "ltx2_remote_stage_learning_rate", None),
+                "ss_ltx2_remote_stage_weight_decay": getattr(args, "ltx2_remote_stage_weight_decay", None),
+                "ss_ltx2_remote_stage_max_grad_norm": getattr(args, "ltx2_remote_stage_max_grad_norm", None),
+                "ss_ltx2_remote_stage_checkpoint_dir": getattr(args, "ltx2_remote_stage_checkpoint_dir", None),
+            }
+        )
 
     checkpoint_extra_metadata = {k: str(v) for k, v in trainer.get_checkpoint_metadata(args).items()}
     if checkpoint_extra_metadata:
@@ -4008,6 +4152,21 @@ def main() -> None:
             if self_flow_loss is not None:
                 _md["loss_self_flow"] = self_flow_loss.detach().item()
             train_utils.save_checkpoint_metadata(ckpt_file, _md)
+
+        if ltx2_remote_stage and bool(getattr(args, "ltx2_remote_stage_trainable", False)):
+            remote_checkpoint_dir = getattr(args, "ltx2_remote_stage_checkpoint_dir", None) or args.output_dir
+            try:
+                responses = save_ltx2_remote_stage_state(
+                    transformer,
+                    checkpoint_dir=remote_checkpoint_dir,
+                    checkpoint_name=ckpt_name,
+                )
+                for response in responses:
+                    path = response.get("path")
+                    if path:
+                        accelerator.print(f"saved remote stage checkpoint: {path}")
+            except Exception as exc:
+                logger.warning("Failed to save remote LTX-2 stage checkpoint: %s", exc)
 
     def remove_model(old_ckpt_name: str) -> None:
         old_ckpt_file = os.path.join(args.output_dir, old_ckpt_name)
@@ -5009,6 +5168,62 @@ def main() -> None:
         args, trainer, transformer, val_dataloader, noise_scheduler, accelerator,
     )
 
+    audio_loss_balance_mode = str(getattr(args, "audio_loss_balance_mode", "none") or "none").lower()
+    audio_loss_balance_beta = float(getattr(args, "audio_loss_balance_beta", 0.01))
+    audio_loss_balance_eps = float(getattr(args, "audio_loss_balance_eps", 0.05))
+    audio_loss_balance_min = float(getattr(args, "audio_loss_balance_min", 0.05))
+    audio_loss_balance_max = float(getattr(args, "audio_loss_balance_max", 4.0))
+    audio_loss_balance_ema_init = float(getattr(args, "audio_loss_balance_ema_init", 1.0))
+    audio_loss_balance_target_ratio = float(getattr(args, "audio_loss_balance_target_ratio", 0.33))
+    audio_loss_balance_ema_decay = float(getattr(args, "audio_loss_balance_ema_decay", 0.99))
+    ogm_ge_alpha = float(getattr(args, "ogm_ge_alpha", 0.3))
+
+    cli_video_loss_weight = float(getattr(args, "video_loss_weight", 1.0))
+    cli_audio_loss_weight = float(getattr(args, "audio_loss_weight", 1.0))
+
+    audio_presence_ema = min(max(audio_loss_balance_ema_init, 1e-6), 1.0)
+    audio_loss_ema = max(audio_loss_balance_ema_init, 1e-6)
+    video_loss_ema = max(audio_loss_balance_ema_init, 1e-6)
+
+    uncertainty_log_var_video = uncertainty_log_var_audio = None
+    if audio_loss_balance_mode == "uncertainty":
+        device_for_uncert = accelerator.device if accelerator is not None else torch.device("cpu")
+        uncertainty_log_var_video = torch.nn.Parameter(torch.zeros(1, device=device_for_uncert))
+        uncertainty_log_var_audio = torch.nn.Parameter(torch.zeros(1, device=device_for_uncert))
+        uncertainty_lr = float(getattr(args, "uncertainty_lr", None) or args.learning_rate)
+        try:
+            optimizer.add_param_group(
+                {"params": [uncertainty_log_var_video, uncertainty_log_var_audio], "lr": uncertainty_lr}
+            )
+            logger.info(
+                "Uncertainty weighting enabled: 2 learnable log-variance params added to optimizer, lr=%g",
+                uncertainty_lr,
+            )
+        except Exception as e:
+            logger.warning(
+                "Failed to add uncertainty params to optimizer (%s); uncertainty mode will not learn variances.",
+                e,
+            )
+
+    if audio_loss_balance_mode == "ogm_ge":
+        logger.info("OGM-GE audio/video balancing enabled: alpha=%.4f", ogm_ge_alpha)
+    elif audio_loss_balance_mode == "ema_mag":
+        logger.info(
+            "EMA-magnitude audio balancing enabled: target_ratio=%.4f ema_decay=%.4f min=%.4f max=%.4f",
+            audio_loss_balance_target_ratio,
+            audio_loss_balance_ema_decay,
+            audio_loss_balance_min,
+            audio_loss_balance_max,
+        )
+    elif audio_loss_balance_mode == "inv_freq":
+        logger.info(
+            "Inverse-frequency audio balancing enabled: beta=%.4f eps=%.4f min=%.4f max=%.4f",
+            audio_loss_balance_beta,
+            audio_loss_balance_eps,
+            audio_loss_balance_min,
+            audio_loss_balance_max,
+        )
+
     for epoch in range(epoch_to_start, num_train_epochs):
         current_epoch.value = epoch + 1
         metadata["ss_epoch"] = str(epoch + 1)
@@ -5063,6 +5278,8 @@ def main() -> None:
                             out.get("skip_reason", "unknown"),
                         )
                         optimizer.zero_grad(set_to_none=True)
+                        if ltx2_remote_stage and bool(getattr(args, "ltx2_remote_stage_trainable", False)):
+                            zero_grad_ltx2_remote_stage(transformer)
                         continue
 
                     _loss_type = getattr(args, "loss_type", "mse")
@@ -5079,13 +5296,16 @@ def main() -> None:
                         loss_type=_loss_type,
                         huber_delta=_huber_delta,
                     )
-                    video_weight = float(out.get("video_loss_weight", 1.0))
-                    loss = video_loss * video_weight
+                    # Base weights: dataset config × CLI override.
+                    video_weight = float(out.get("video_loss_weight", 1.0)) * cli_video_loss_weight
 
                     audio_pred = out.get("audio_pred")
                     audio_target = out.get("audio_target")
                     audio_loss_mask = out.get("audio_loss_mask")
-                    if audio_pred is not None and audio_target is not None:
+                    audio_loss = None
+                    audio_weight = None
+                    has_audio_loss = audio_pred is not None and audio_target is not None
+                    if has_audio_loss:
                         audio_loss = _masked_mse(
                             audio_pred,
                             audio_target,
@@ -5095,8 +5315,96 @@ def main() -> None:
                             loss_type=_loss_type,
                             huber_delta=_huber_delta,
                         )
-                        audio_weight = float(out.get("audio_loss_weight", 1.0))
-                        loss = loss + audio_loss * audio_weight
+                        audio_weight = float(out.get("audio_loss_weight", 1.0)) * cli_audio_loss_weight
+
+                    # Uncertainty mode replaces the manual sum with Kendall et al. weighting.
+                    if (
+                        audio_loss_balance_mode == "uncertainty"
+                        and has_audio_loss
+                        and uncertainty_log_var_video is not None
+                        and uncertainty_log_var_audio is not None
+                    ):
+                        loss = compute_uncertainty_weighted_loss(
+                            video_loss, audio_loss,
+                            uncertainty_log_var_video, uncertainty_log_var_audio,
+                        )
+                        if (global_step % 50) == 0:
+                            logger.info(
+                                "[Uncertainty step %d] log_var_v=%.4f log_var_a=%.4f",
+                                global_step,
+                                float(uncertainty_log_var_video.detach().item()),
+                                float(uncertainty_log_var_audio.detach().item()),
+                            )
+                    elif audio_loss_balance_mode == "ogm_ge" and has_audio_loss:
+                        ogm_ge_state = compute_ogm_ge_coefficients(
+                            video_loss=video_loss,
+                            audio_loss=audio_loss,
+                            alpha=ogm_ge_alpha,
+                        )
+                        video_weight = video_weight * float(ogm_ge_state.video_coeff)
+                        audio_weight = audio_weight * float(ogm_ge_state.audio_coeff)
+                        if (global_step % 50) == 0:
+                            logger.info(
+                                "[OGM-GE step %d] dominant=%s discrepancy=%.4f v_coeff=%.4f a_coeff=%.4f",
+                                global_step,
+                                ogm_ge_state.dominant,
+                                ogm_ge_state.discrepancy,
+                                ogm_ge_state.video_coeff,
+                                ogm_ge_state.audio_coeff,
+                            )
+                        loss = video_loss * video_weight + audio_loss * audio_weight
+                    else:
+                        # ema_mag / inv_freq / none all use the additive form with possibly-rescaled audio weight.
+                        if audio_loss_balance_mode == "ema_mag":
+                            video_loss_item = max(float(video_loss.detach().item()), 1e-12)
+                            video_loss_ema = update_loss_ema(
+                                loss_ema=video_loss_ema,
+                                loss_value=video_loss_item,
+                                ema_decay=audio_loss_balance_ema_decay,
+                            )
+                        if audio_loss_balance_mode == "inv_freq":
+                            audio_presence_ema = update_audio_presence_ema(
+                                audio_presence_ema=audio_presence_ema,
+                                balance_beta=audio_loss_balance_beta,
+                                has_audio_loss=has_audio_loss,
+                            )
+
+                        loss = video_loss * video_weight
+                        if has_audio_loss:
+                            if audio_loss_balance_mode == "inv_freq":
+                                audio_weight = compute_inverse_frequency_audio_weight(
+                                    base_audio_weight=audio_weight,
+                                    audio_presence_ema=audio_presence_ema,
+                                    balance_eps=audio_loss_balance_eps,
+                                    balance_min=audio_loss_balance_min,
+                                    balance_max=audio_loss_balance_max,
+                                )
+                                if (global_step % 50) == 0:
+                                    logger.info(
+                                        "[inv_freq step %d] audio_presence_ema=%.4f audio_weight=%.4f",
+                                        global_step, audio_presence_ema, audio_weight,
+                                    )
+                            elif audio_loss_balance_mode == "ema_mag":
+                                audio_loss_item = max(float(audio_loss.detach().item()), 1e-12)
+                                audio_loss_ema = update_loss_ema(
+                                    loss_ema=audio_loss_ema,
+                                    loss_value=audio_loss_item,
+                                    ema_decay=audio_loss_balance_ema_decay,
+                                )
+                                audio_weight = compute_ema_magnitude_audio_weight(
+                                    base_audio_weight=audio_weight,
+                                    audio_loss_ema=audio_loss_ema,
+                                    video_loss_ema=video_loss_ema,
+                                    target_audio_ratio=audio_loss_balance_target_ratio,
+                                    balance_min=audio_loss_balance_min,
+                                    balance_max=audio_loss_balance_max,
+                                )
+                                if (global_step % 50) == 0:
+                                    logger.info(
+                                        "[ema_mag step %d] v_ema=%.4f a_ema=%.4f audio_weight=%.4f",
+                                        global_step, video_loss_ema, audio_loss_ema, audio_weight,
+                                    )
+                            loss = loss + audio_loss * audio_weight
                 else:
                     _loss_type = getattr(args, "loss_type", "mse")
                     _huber_delta = float(getattr(args, "huber_delta", 1.0))
@@ -5441,6 +5749,10 @@ def main() -> None:
                             optimizer=optimizer,
                         )
                     optimizer.step()
+                    if accelerator.sync_gradients and ltx2_remote_stage and bool(
+                        getattr(args, "ltx2_remote_stage_trainable", False)
+                    ):
+                        optimizer_step_ltx2_remote_stage(transformer)
                     did_optimizer_step = bool(accelerator.sync_gradients)
                     lr_scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
@@ -5463,7 +5775,13 @@ def main() -> None:
                                 ltx2_model_parallel=ltx2_model_parallel,
                             )
                             did_fused_step = hook_stepped or pending_steps > 0
+                        if did_fused_step and ltx2_remote_stage and bool(
+                            getattr(args, "ltx2_remote_stage_trainable", False)
+                        ):
+                            optimizer_step_ltx2_remote_stage(transformer)
                         optimizer.zero_grad(set_to_none=True)
+                        if ltx2_remote_stage and bool(getattr(args, "ltx2_remote_stage_trainable", False)):
+                            zero_grad_ltx2_remote_stage(transformer)
                     if did_fused_step:
                         lr_scheduler.step()
                     did_optimizer_step = did_fused_step
