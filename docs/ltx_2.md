@@ -1987,6 +1987,10 @@ Mid-epoch checkpoints record `step_in_epoch` in `resume_metadata.json`. On resum
 
 The moving average loss is saved in state checkpoints and restored on resume.
 
+Newly saved state directories also include `state_manifest.json`, written only after the accelerator state save completes. `--autoresume` and the dashboard resume detector ignore incomplete state directories, so a crashed or force-killed save is not selected accidentally.
+
+When training is launched from the dashboard, pressing Stop first requests a graceful interrupt save. The trainer writes an `*-interrupt-step########-state` directory with resume metadata, then exits. Pressing Stop again while the process is already stopping requests a force stop and skips the interrupt save.
+
 ---
 
 ## Merge LoRA into Base Model

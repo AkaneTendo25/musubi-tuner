@@ -114,7 +114,7 @@ def _log_vram(tag: str, logger=None):
         max_alloc = torch.cuda.max_memory_allocated() / (1024**3)
         # Update global peak tracker
         global_peak_alloc, global_peak_reserved = _update_global_peak()
-        msg = f"[VRAM_TRACE] {tag}: allocated={alloc:.2f}GB reserved={reserved:.2f}GB max_allocated={max_alloc:.2f}GB PEAK_SINCE_START={global_peak_reserved/1024:.2f}GB"
+        msg = f"[VRAM_TRACE] {tag}: allocated={alloc:.2f}GB reserved={reserved:.2f}GB max_allocated={max_alloc:.2f}GB PEAK_SINCE_START={global_peak_reserved / 1024:.2f}GB"
         if logger:
             logger.info(msg)
         else:
@@ -182,8 +182,7 @@ def _log_cuda_memory_stats(tag: str, *, latents_shape: Optional[tuple] = None) -
             )
         else:
             logger.info(
-                "CUDA mem [%s] alloc=%.0fMB reserved=%.0fMB max_alloc=%.0fMB max_reserved=%.0fMB "
-                "PEAK_SINCE_START=%.0fMB",
+                "CUDA mem [%s] alloc=%.0fMB reserved=%.0fMB max_alloc=%.0fMB max_reserved=%.0fMB PEAK_SINCE_START=%.0fMB",
                 tag,
                 alloc,
                 reserved,
@@ -327,9 +326,7 @@ def prepare_accelerator(args: argparse.Namespace) -> Accelerator:
                 static_graph=args.ddp_static_graph,
                 find_unused_parameters=bool(getattr(args, "ddp_find_unused_parameters", False)),
             )
-            if args.ddp_gradient_as_bucket_view
-            or args.ddp_static_graph
-            or bool(getattr(args, "ddp_find_unused_parameters", False))
+            if args.ddp_gradient_as_bucket_view or args.ddp_static_graph or bool(getattr(args, "ddp_find_unused_parameters", False))
             else None
         ),
     ]
@@ -745,8 +742,7 @@ class NetworkTrainer:
                 logger.info("CAME: defaulting stochastic_rounding=True for BF16/fused training")
             optimizer_class = CAME if optimizer_type in {"came", "camesimple", "came_simple"} else CAME8bit
             logger.info(
-                f"use {optimizer_class.__name__} optimizer "
-                f"(stochastic_rounding, cautious, step_parameter) | {optimizer_kwargs}"
+                f"use {optimizer_class.__name__} optimizer (stochastic_rounding, cautious, step_parameter) | {optimizer_kwargs}"
             )
             optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
 
@@ -764,7 +760,11 @@ class NetworkTrainer:
             logger.info(f"use torchao optimizer {optimizer_class.__name__} | {optimizer_kwargs}")
             optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
 
-        elif optimizer_type.startswith("optimi_") or optimizer_type.startswith("torchoptimi_") or optimizer_type.startswith("optimi."):
+        elif (
+            optimizer_type.startswith("optimi_")
+            or optimizer_type.startswith("torchoptimi_")
+            or optimizer_type.startswith("optimi.")
+        ):
             from musubi_tuner.optimizers.backends import resolve_optimi_optimizer_class
 
             if bool(getattr(args, "fused_backward_pass", False)):
@@ -845,6 +845,7 @@ class NetworkTrainer:
 
         elif optimizer_type == "automagic":
             from musubi_tuner.optimizers.automagic import Automagic
+
             logger.info(f"use Automagic optimizer | lr={lr} | {optimizer_kwargs}")
             optimizer_class = Automagic
             optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
@@ -857,7 +858,9 @@ class NetworkTrainer:
             base_type = str(optimizer_kwargs.get("base_optimizer_type") or "AdamW")
             if base_type.lower() in ("badam", "blockadam", "block_optimizer", "blockoptimizer"):
                 raise ValueError("base_optimizer_type must name the wrapped optimizer, not BAdam")
-            logger.info(f"BAdam: building base optimizer '{base_type}' (wrap deferred to trainer) | wrapper_kwargs={optimizer_kwargs}")
+            logger.info(
+                f"BAdam: building base optimizer '{base_type}' (wrap deferred to trainer) | wrapper_kwargs={optimizer_kwargs}"
+            )
             saved_optimizer_type = args.optimizer_type
             saved_optimizer_args = args.optimizer_args
             args.optimizer_type = base_type
@@ -1060,9 +1063,7 @@ class NetworkTrainer:
                 lr_scheduler_type = values[-1]
             lr_scheduler_class = getattr(lr_scheduler_module, lr_scheduler_type)
             lr_scheduler = lr_scheduler_class(optimizer, **lr_scheduler_kwargs)
-            return self._maybe_wrap_group_warmup_scheduler(
-                lr_scheduler, optimizer, num_warmup_steps, group_lr_warmup_overrides
-            )
+            return self._maybe_wrap_group_warmup_scheduler(lr_scheduler, optimizer, num_warmup_steps, group_lr_warmup_overrides)
 
         if name.startswith("adafactor"):
             assert type(optimizer) == transformers.optimization.Adafactor, (
@@ -1348,8 +1349,30 @@ class NetworkTrainer:
             return 0
 
         if not args.resume_from_huggingface:
+            if not train_utils.is_complete_state_dir(args.resume):
+                if getattr(args, "_autoresume_selected", False):
+                    logger.warning(
+                        "autoresume: selected state directory is missing or incomplete, starting from scratch: %s",
+                        args.resume,
+                    )
+                    args.resume = None
+                    self._resume_state_dir = None
+                    return 0
+                raise FileNotFoundError(f"resume state directory is missing or incomplete: {args.resume}")
+
             logger.info(f"resume training from local state: {args.resume}")
-            accelerator.load_state(args.resume)
+            try:
+                accelerator.load_state(args.resume)
+            except Exception:
+                if getattr(args, "_autoresume_selected", False) and not train_utils.is_complete_state_dir(args.resume):
+                    logger.warning(
+                        "autoresume: selected state disappeared or became incomplete before loading, starting from scratch: %s",
+                        args.resume,
+                    )
+                    args.resume = None
+                    self._resume_state_dir = None
+                    return 0
+                raise
             self._resume_state_dir = args.resume
             return self._recover_global_step(args.resume)
 
@@ -1425,8 +1448,7 @@ class NetworkTrainer:
     def _find_latest_state_dir(args: argparse.Namespace) -> Optional[str]:
         """Find the latest training state directory in output_dir for --autoresume.
 
-        Scans output_dir for directories ending in '-state' that contain a valid
-        scheduler.bin, reads the global_step from each, and returns the path with
+        Scans output_dir for complete directories ending in '-state', reads the global_step from each, and returns the path with
         the highest step. Works with epoch-based, step-based, and final states.
         """
         if not args.output_dir or not os.path.isdir(args.output_dir):
@@ -1440,9 +1462,12 @@ class NetworkTrainer:
             if not os.path.isdir(full_path) or not entry.endswith("-state"):
                 continue
 
+            if not train_utils.is_complete_state_dir(full_path):
+                continue
+
             scheduler_path = os.path.join(full_path, "scheduler.bin")
             if not os.path.exists(scheduler_path):
-                continue
+                scheduler_path = None
 
             # Try resume_metadata.json first (new format, only trust non-zero global_step)
             metadata = train_utils.load_resume_metadata(full_path)
@@ -1455,6 +1480,8 @@ class NetworkTrainer:
                     step = int(step_match.group(1))
                 else:
                     # Epoch-based or final state: read scheduler.bin for actual global_step
+                    if scheduler_path is None:
+                        continue
                     try:
                         scheduler_state = torch.load(scheduler_path, map_location="cpu", weights_only=True)
                         step = int(scheduler_state["last_epoch"])
@@ -2653,9 +2680,7 @@ class NetworkTrainer:
                     "general": user_config.get("general", {}),
                     "datasets": user_config.get("validation_datasets", []),
                 }
-                validation_blueprint = blueprint_generator.generate(
-                    validation_user_config, args, architecture=self.architecture
-                )
+                validation_blueprint = blueprint_generator.generate(validation_user_config, args, architecture=self.architecture)
                 validation_dataset_group = config_utils.generate_dataset_group_by_blueprint(
                     validation_blueprint.dataset_group,
                     training=True,
@@ -2718,7 +2743,11 @@ class NetworkTrainer:
         vae_dtype = torch.float16 if args.vae_dtype is None else model_utils.str_to_dtype(args.vae_dtype)
         sample_parameters = None
         vae = None
-        if args.sample_prompts or getattr(args, "precache_sample_prompts", False) or getattr(args, "use_precached_sample_prompts", False):
+        if (
+            args.sample_prompts
+            or getattr(args, "precache_sample_prompts", False)
+            or getattr(args, "use_precached_sample_prompts", False)
+        ):
             sample_prompt_path = args.sample_prompts or ""
             sample_parameters = self.process_sample_prompts(args, accelerator, sample_prompt_path)
 
@@ -2769,8 +2798,11 @@ class NetworkTrainer:
                 f"enable swap {blocks_to_swap} blocks to CPU from device: {accelerator.device}, use pinned memory: {args.use_pinned_memory_for_block_swap}"
             )
             transformer.enable_block_swap(
-                blocks_to_swap, accelerator.device, supports_backward=True, use_pinned_memory=args.use_pinned_memory_for_block_swap,
-                swap_norms=getattr(args, 'swap_norms', False)
+                blocks_to_swap,
+                accelerator.device,
+                supports_backward=True,
+                use_pinned_memory=args.use_pinned_memory_for_block_swap,
+                swap_norms=getattr(args, "swap_norms", False),
             )
             _log_vram("AFTER enable_block_swap (offloader created)", logger)
             transformer.move_to_device_except_swap_blocks(accelerator.device)
@@ -2813,6 +2845,7 @@ class NetworkTrainer:
         # which gets JSON-serialized for metadata.
         _loftq_net_kwargs = dict(net_kwargs)
         from musubi_tuner.ltx2_train_network import load_ltx2_model
+
         _loftq_data = getattr(load_ltx2_model, "_loftq_data", None)
         if _loftq_data is not None:
             _loftq_net_kwargs["loftq_data"] = _loftq_data
@@ -2871,9 +2904,7 @@ class NetworkTrainer:
             blocks_to_ckpt = getattr(args, "blocks_to_checkpoint", -1)
             if getattr(args, "blockwise_checkpointing", False):
                 transformer.enable_gradient_checkpointing(
-                    args.gradient_checkpointing_cpu_offload, 
-                    weight_cpu_offloading=True,
-                    blocks_to_checkpoint=blocks_to_ckpt
+                    args.gradient_checkpointing_cpu_offload, weight_cpu_offloading=True, blocks_to_checkpoint=blocks_to_ckpt
                 )
                 if hasattr(transformer, "transformer_blocks"):
                     total_blocks = len(transformer.transformer_blocks)
@@ -2895,8 +2926,7 @@ class NetworkTrainer:
                             block.use_pinned_memory = True
             else:
                 transformer.enable_gradient_checkpointing(
-                    args.gradient_checkpointing_cpu_offload,
-                    blocks_to_checkpoint=blocks_to_ckpt
+                    args.gradient_checkpointing_cpu_offload, blocks_to_checkpoint=blocks_to_ckpt
                 )
             try:
                 network.enable_gradient_checkpointing(
@@ -2921,12 +2951,14 @@ class NetworkTrainer:
             uncertainty_lr = float(getattr(args, "uncertainty_lr", None) or args.learning_rate)
             uncertainty_log_var_video = uncertainty_log_var_video.to(device=accelerator.device)
             uncertainty_log_var_audio = uncertainty_log_var_audio.to(device=accelerator.device)
-            optimizer.add_param_group({
-                "params": [uncertainty_log_var_video, uncertainty_log_var_audio],
-                "lr": uncertainty_lr,
-                "weight_decay": 0.0,
-                "group_name": "uncertainty",
-            })
+            optimizer.add_param_group(
+                {
+                    "params": [uncertainty_log_var_video, uncertainty_log_var_audio],
+                    "lr": uncertainty_lr,
+                    "weight_decay": 0.0,
+                    "group_name": "uncertainty",
+                }
+            )
             logger.info("Added uncertainty log-variance params to optimizer (lr=%.2e)", uncertainty_lr)
 
         def set_trainer_train_mode() -> None:
@@ -3058,7 +3090,7 @@ class NetworkTrainer:
         # Otherwise torch LR schedulers can fail with:
         #   ValueError: zip() argument 2 is shorter than argument 1
         self.pre_train_hook(args, accelerator, transformer=transformer, network=network)
-        if hasattr(self, '_crepa') and self._crepa is not None:
+        if hasattr(self, "_crepa") and self._crepa is not None:
             crepa_params = self._crepa.get_trainable_params()
             if crepa_params:
                 optimizer.add_param_group({"params": crepa_params, "lr": args.learning_rate})
@@ -3139,9 +3171,10 @@ class NetworkTrainer:
                         logger.warning(f"Failed to save adaptive rank runtime state: {e}")
 
                 # Save CREPA projector into state directory so it matches the optimizer state
-                if hasattr(self, '_crepa') and self._crepa is not None:
+                if hasattr(self, "_crepa") and self._crepa is not None:
                     try:
                         from safetensors.torch import save_file
+
                         proj_sd = self._crepa.state_dict()
                         if proj_sd:
                             proj_file = os.path.join(output_dir, "crepa_projector.safetensors")
@@ -3167,6 +3200,7 @@ class NetworkTrainer:
                 if uncertainty_log_var_video is not None:
                     try:
                         from safetensors.torch import save_file
+
                         save_file(
                             {"log_var_video": uncertainty_log_var_video.data, "log_var_audio": uncertainty_log_var_audio.data},
                             os.path.join(output_dir, "uncertainty_log_vars.safetensors"),
@@ -3228,6 +3262,7 @@ class NetworkTrainer:
             if uncertainty_log_var_video is not None:
                 try:
                     from safetensors.torch import load_file
+
                     lv_file = os.path.join(input_dir, "uncertainty_log_vars.safetensors")
                     if os.path.exists(lv_file):
                         lv_sd = load_file(lv_file)
@@ -3235,7 +3270,8 @@ class NetworkTrainer:
                         uncertainty_log_var_audio.data.copy_(lv_sd["log_var_audio"])
                         logger.info(
                             "Loaded uncertainty log-variance params: video=%.4f, audio=%.4f",
-                            uncertainty_log_var_video.item(), uncertainty_log_var_audio.item(),
+                            uncertainty_log_var_video.item(),
+                            uncertainty_log_var_audio.item(),
                         )
                 except Exception as e:
                     logger.warning(f"Failed to load uncertainty log-variance params: {e}")
@@ -3253,8 +3289,12 @@ class NetworkTrainer:
             if latest:
                 logger.info(f"autoresume: found latest state directory: {latest}")
                 args.resume = latest
+                args._autoresume_selected = True
             else:
                 logger.info("autoresume: no saved state found in output_dir, starting from scratch")
+                args._autoresume_selected = False
+        else:
+            args._autoresume_selected = False
 
         # resume from local or huggingface — must be after num_update_steps_per_epoch is known
 
@@ -3459,8 +3499,11 @@ class NetworkTrainer:
             )
 
         progress_bar = tqdm(
-            range(args.max_train_steps), initial=initial_global_step, smoothing=0,
-            disable=not accelerator.is_local_main_process, desc="steps",
+            range(args.max_train_steps),
+            initial=initial_global_step,
+            smoothing=0,
+            disable=not accelerator.is_local_main_process,
+            desc="steps",
         )
 
         global_step = initial_global_step
@@ -3528,9 +3571,7 @@ class NetworkTrainer:
 
             unwrapped_nw.save_weights(ckpt_file, save_dtype, metadata_to_save)
 
-            if bool(getattr(args, "ltx2_remote_stage", False)) and bool(
-                getattr(args, "ltx2_remote_stage_trainable", False)
-            ):
+            if bool(getattr(args, "ltx2_remote_stage", False)) and bool(getattr(args, "ltx2_remote_stage_trainable", False)):
                 remote_checkpoint_dir = getattr(args, "ltx2_remote_stage_checkpoint_dir", None) or args.output_dir
                 try:
                     from musubi_tuner.ltx2_remote_stage import save_ltx2_remote_stage_state
@@ -3590,6 +3631,73 @@ class NetworkTrainer:
                     os.remove(comfy_old_ckpt_file)
             train_utils.remove_checkpoint_metadata(old_ckpt_file)
 
+        def handle_dashboard_stop_request(global_step: int, epoch: int, step_in_epoch: int) -> bool:
+            if not train_utils.dashboard_stop_requested():
+                return False
+
+            if train_utils.dashboard_stop_mode() == "force":
+                accelerator.print("\nDashboard force stop requested; exiting without saving interrupt state.")
+                if gui_metrics is not None and accelerator.is_main_process:
+                    gui_metrics.update_status(
+                        step=global_step,
+                        max_steps=args.max_train_steps,
+                        epoch=epoch + 1,
+                        max_epochs=num_train_epochs,
+                        status="stopped",
+                    )
+                    gui_metrics.close()
+                train_utils.clear_dashboard_stop_request()
+                accelerator.end_training()
+                return True
+
+            if global_step <= 0:
+                accelerator.print("\nDashboard stop requested before training steps completed; exiting without saving state.")
+                if gui_metrics is not None and accelerator.is_main_process:
+                    gui_metrics.update_status(
+                        step=global_step,
+                        max_steps=args.max_train_steps,
+                        epoch=epoch + 1,
+                        max_epochs=num_train_epochs,
+                        status="stopped",
+                    )
+                    gui_metrics.close()
+                train_utils.clear_dashboard_stop_request()
+                accelerator.end_training()
+                return True
+
+            accelerator.print("\nDashboard stop requested; saving interrupt state and exiting training.")
+            set_trainer_eval_mode()
+            accelerator.wait_for_everyone()
+            if accelerator.is_main_process:
+                state_dir = train_utils.save_state_on_interrupt(
+                    args,
+                    accelerator,
+                    global_step=global_step,
+                    epoch=epoch + 1,
+                    step_in_epoch=step_in_epoch,
+                )
+                train_utils.update_resume_metadata(
+                    state_dir,
+                    {
+                        "loss_avg": loss_recorder.moving_average,
+                        "loss_count": len(loss_recorder.loss_list),
+                        "interrupted": True,
+                    },
+                )
+                if gui_metrics is not None:
+                    gui_metrics.log_event("interrupt_state", global_step, path=state_dir)
+                    gui_metrics.update_status(
+                        step=global_step,
+                        max_steps=args.max_train_steps,
+                        epoch=epoch + 1,
+                        max_epochs=num_train_epochs,
+                        status="stopped",
+                    )
+                    gui_metrics.close()
+            train_utils.clear_dashboard_stop_request()
+            accelerator.end_training()
+            return True
+
         def run_validation(step: int, epoch_no: int | None = None) -> None:
             if validation_dataloader is None:
                 return
@@ -3640,11 +3748,15 @@ class NetworkTrainer:
                         _hfato_config = getattr(self, "_hfato_config", None)
                         if _hfato_config is not None and latents_tensor.dim() == 5:
                             import random as _hfato_rand
+
                             if _hfato_rand.random() < _hfato_config.probability:
                                 from musubi_tuner.hfato import degrade_latents
+
                                 batch["_hfato"] = {"clean_latents": latents_tensor}
                                 latents_tensor = degrade_latents(
-                                    latents_tensor, _hfato_config.scale_factor, _hfato_config.interpolation,
+                                    latents_tensor,
+                                    _hfato_config.scale_factor,
+                                    _hfato_config.interpolation,
                                 )
 
                         noisy_model_input, timesteps = self.get_noisy_model_input_and_timesteps(
@@ -3721,6 +3833,7 @@ class NetworkTrainer:
                             _hfato_data = out.get("_hfato")
                             if _hfato_data is not None:
                                 from musubi_tuner.hfato import hfato_x0_loss
+
                                 video_loss = hfato_x0_loss(
                                     video_pred.to(dtype=network_dtype),
                                     _hfato_data["noisy"].to(device=video_pred.device, dtype=network_dtype),
@@ -3744,8 +3857,10 @@ class NetworkTrainer:
                             ):
                                 audio_loss = _masked_loss(audio_pred, audio_target, audio_loss_mask)
                                 loss = compute_uncertainty_weighted_loss(
-                                    video_loss, audio_loss,
-                                    uncertainty_log_var_video, uncertainty_log_var_audio,
+                                    video_loss,
+                                    audio_loss,
+                                    uncertainty_log_var_video,
+                                    uncertainty_log_var_audio,
                                 )
                             elif audio_loss_balance_mode == "ogm_ge" and has_audio_loss:
                                 audio_loss = _masked_loss(audio_pred, audio_target, audio_loss_mask)
@@ -3999,6 +4114,9 @@ class NetworkTrainer:
             _prev_step_end_time = time.perf_counter()
 
             for step, batch in enumerate(train_dataloader):
+                if handle_dashboard_stop_request(global_step, epoch, step):
+                    return
+
                 # mid-epoch resume: skip batches already processed before checkpoint
                 if steps_to_skip_in_epoch > 0:
                     steps_to_skip_in_epoch -= 1
@@ -4007,7 +4125,7 @@ class NetworkTrainer:
                 _step_start_time = time.perf_counter()
                 _data_wait_time = max(0.0, _step_start_time - _prev_step_end_time)
                 # VRAM spike tracing for first iteration
-                _is_first_step = (epoch == epoch_to_start and step == 0)
+                _is_first_step = epoch == epoch_to_start and step == 0
                 if _is_first_step:
                     _log_vram("FIRST_ITER: before batch processing", logger)
                 # torch.compiler.cudagraph_mark_step_begin() # for cudagraphs
@@ -4047,11 +4165,15 @@ class NetworkTrainer:
                     _hfato_config = getattr(self, "_hfato_config", None)
                     if _hfato_config is not None and latents_tensor.dim() == 5:
                         import random as _hfato_rand
+
                         if _hfato_rand.random() < _hfato_config.probability:
                             from musubi_tuner.hfato import degrade_latents
+
                             batch["_hfato"] = {"clean_latents": latents_tensor}
                             latents_tensor = degrade_latents(
-                                latents_tensor, _hfato_config.scale_factor, _hfato_config.interpolation,
+                                latents_tensor,
+                                _hfato_config.scale_factor,
+                                _hfato_config.interpolation,
                             )
 
                     # calculate model input and timesteps
@@ -4144,6 +4266,7 @@ class NetworkTrainer:
                         _hfato_data = out.get("_hfato")
                         if _hfato_data is not None:
                             from musubi_tuner.hfato import hfato_x0_loss
+
                             video_loss = hfato_x0_loss(
                                 video_pred.to(dtype=network_dtype),
                                 _hfato_data["noisy"].to(device=video_pred.device, dtype=network_dtype),
@@ -4165,8 +4288,10 @@ class NetworkTrainer:
                             audio_loss_raw = _masked_loss(audio_pred, audio_target, audio_loss_mask, tag="audio")
                             audio_loss_value = audio_loss_raw.detach().item()
                             loss = compute_uncertainty_weighted_loss(
-                                video_loss, audio_loss_raw,
-                                uncertainty_log_var_video, uncertainty_log_var_audio,
+                                video_loss,
+                                audio_loss_raw,
+                                uncertainty_log_var_video,
+                                uncertainty_log_var_audio,
                             )
                         elif audio_loss_balance_mode == "ogm_ge" and has_audio_loss:
                             audio_loss = _masked_loss(audio_pred, audio_target, audio_loss_mask, tag="audio")
@@ -4250,7 +4375,7 @@ class NetworkTrainer:
                                 audio_diagnostics["audio_latent/pred_absmax"] = ap.abs().max().item()
 
                                 # Task 3: Latent-space SNR (dB)
-                                target_power = (at ** 2).mean()
+                                target_power = (at**2).mean()
                                 error_power = ((at - ap) ** 2).mean()
                                 if error_power > 0:
                                     audio_diagnostics["audio_latent/snr_db"] = (
@@ -4262,9 +4387,7 @@ class NetworkTrainer:
                                 if audio_sigma is not None:
                                     sigma = audio_sigma.detach().float()
                                     # Per-sample MSE (reduce over C, T, F)
-                                    per_sample = ((ap - at) ** 2).mean(
-                                        dim=list(range(1, ap.dim()))
-                                    )
+                                    per_sample = ((ap - at) ** 2).mean(dim=list(range(1, ap.dim())))
                                     high_mask = sigma > 0.5
                                     mid_mask = (sigma >= 0.1) & (sigma <= 0.5)
                                     low_mask = sigma < 0.1
@@ -4280,19 +4403,26 @@ class NetworkTrainer:
                             audio_diagnostics["loss/audio_video_ratio"] = audio_loss_value / video_loss_value
 
                         # Extended audio metrics (standalone module, no-op when off)
-                        if getattr(self, '_audio_metrics', None) is not None:
+                        if getattr(self, "_audio_metrics", None) is not None:
                             self._audio_metrics.on_step(global_step)
-                            audio_diagnostics.update(self._audio_metrics.compute_latent_metrics(
-                                ap, at,
-                                video_pred=out.get("video_pred"),
-                                video_target=out.get("video_target"),
-                            ))
+                            audio_diagnostics.update(
+                                self._audio_metrics.compute_latent_metrics(
+                                    ap,
+                                    at,
+                                    video_pred=out.get("video_pred"),
+                                    video_target=out.get("video_target"),
+                                )
+                            )
                             if self._audio_metrics.should_compute_mel(global_step):
-                                _mel_decoder = getattr(self, '_get_audio_decoder_for_metrics', lambda: None)()
+                                _mel_decoder = getattr(self, "_get_audio_decoder_for_metrics", lambda: None)()
                                 if _mel_decoder is not None:
-                                    audio_diagnostics.update(self._audio_metrics.compute_mel_metrics(
-                                        out.get("audio_pred"), out.get("audio_target"), _mel_decoder,
-                                    ))
+                                    audio_diagnostics.update(
+                                        self._audio_metrics.compute_mel_metrics(
+                                            out.get("audio_pred"),
+                                            out.get("audio_target"),
+                                            _mel_decoder,
+                                        )
+                                    )
 
                     else:
                         if isinstance(target, torch.Tensor):
@@ -4313,14 +4443,15 @@ class NetworkTrainer:
                     _prior_div_value = None
                     if dict_output:
                         _prior_div = self.compute_prior_divergence_addition(
-                            args, accelerator, transformer, network, video_pred, network_dtype)
+                            args, accelerator, transformer, network, video_pred, network_dtype
+                        )
                         if _prior_div is not None:
                             _prior_div_value = _prior_div.detach().item()
                             loss = loss + _prior_div
 
                     # CREPA loss — must be added before backward (shares computation graph)
                     _crepa_value = None
-                    if hasattr(self, '_crepa') and self._crepa is not None:
+                    if hasattr(self, "_crepa") and self._crepa is not None:
                         self._crepa.on_step(global_step)
                         num_latent_frames = latents_tensor.shape[2]
                         dino_features = batch.get("conditions", {}).get("dino_features", None)
@@ -4430,7 +4561,7 @@ class NetworkTrainer:
                                 )
                                 up_grad = lora.lora_up.weight.grad
                                 down_grad = lora.lora_down.weight.grad
-                                
+
                                 up_stat = "None"
                                 if up_grad is not None:
                                     up_norm = up_grad.norm().item()
@@ -4445,11 +4576,7 @@ class NetworkTrainer:
                                     down_inf = torch.isinf(down_grad).any().item()
                                     down_stat = f"norm={down_norm:.6f} nan={down_nan} inf={down_inf}"
 
-                                logger.info(
-                                    f"[DEBUG] LoRA Grad {lora.lora_name}:\n"
-                                    f"  UP  : {up_stat}\n"
-                                    f"  DOWN: {down_stat}"
-                                )
+                                logger.info(f"[DEBUG] LoRA Grad {lora.lora_name}:\n  UP  : {up_stat}\n  DOWN: {down_stat}")
 
                     if accelerator.sync_gradients:
                         # self.all_reduce_network(accelerator, network)  # sync DDP grad manually
@@ -4458,7 +4585,7 @@ class NetworkTrainer:
                             for param in network.parameters():
                                 if param.grad is not None:
                                     param.grad = accelerator.reduce(param.grad, reduction="mean")
-                            if hasattr(self, '_crepa') and self._crepa is not None:
+                            if hasattr(self, "_crepa") and self._crepa is not None:
                                 for param in self._crepa.get_trainable_params():
                                     if param.grad is not None:
                                         param.grad = accelerator.reduce(param.grad, reduction="mean")
@@ -4468,7 +4595,7 @@ class NetworkTrainer:
                                         param.grad = accelerator.reduce(param.grad, reduction="mean")
 
                         params_to_clip = list(accelerator.unwrap_model(network).get_trainable_params())
-                        if hasattr(self, '_crepa') and self._crepa is not None:
+                        if hasattr(self, "_crepa") and self._crepa is not None:
                             params_to_clip.extend(self._crepa.get_trainable_params())
                         if hasattr(self, "_self_flow") and self._self_flow is not None:
                             params_to_clip.extend(self._self_flow.get_trainable_params())
@@ -4509,8 +4636,10 @@ class NetworkTrainer:
                     if _is_first_step:
                         _log_vram("FIRST_ITER: BEFORE optimizer.step", logger)
                     optimizer.step()
-                    if accelerator.sync_gradients and bool(getattr(args, "ltx2_remote_stage", False)) and bool(
-                        getattr(args, "ltx2_remote_stage_trainable", False)
+                    if (
+                        accelerator.sync_gradients
+                        and bool(getattr(args, "ltx2_remote_stage", False))
+                        and bool(getattr(args, "ltx2_remote_stage_trainable", False))
                     ):
                         try:
                             from musubi_tuner.ltx2_remote_stage import optimizer_step_ltx2_remote_stage
@@ -4521,11 +4650,7 @@ class NetworkTrainer:
                             raise
                     if _is_first_step:
                         _log_vram("FIRST_ITER: AFTER optimizer.step", logger)
-                    if (
-                        accelerator.sync_gradients
-                        and hasattr(self, "_self_flow")
-                        and self._self_flow is not None
-                    ):
+                    if accelerator.sync_gradients and hasattr(self, "_self_flow") and self._self_flow is not None:
                         try:
                             # Use stored network ref: may be LoRA network or transformer (full fine-tuning).
                             _sf_net = getattr(self, "_self_flow_network", None) or (
@@ -4537,8 +4662,10 @@ class NetworkTrainer:
                             logger.warning("Self-Flow EMA update failed: %s", e)
                     lr_scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
-                    if accelerator.sync_gradients and bool(getattr(args, "ltx2_remote_stage", False)) and bool(
-                        getattr(args, "ltx2_remote_stage_trainable", False)
+                    if (
+                        accelerator.sync_gradients
+                        and bool(getattr(args, "ltx2_remote_stage", False))
+                        and bool(getattr(args, "ltx2_remote_stage_trainable", False))
                     ):
                         try:
                             from musubi_tuner.ltx2_remote_stage import zero_grad_ltx2_remote_stage
@@ -4629,9 +4756,7 @@ class NetworkTrainer:
                                 reallocate_report["fixed_budget"],
                                 reallocate_report["remaining_budget"],
                             )
-                    if timestep_tb_buffers is not None and (
-                        global_step == 1 or global_step % timestep_tb_interval == 0
-                    ):
+                    if timestep_tb_buffers is not None and (global_step == 1 or global_step % timestep_tb_interval == 0):
                         for name, chunks in timestep_tb_buffers.items():
                             if not chunks:
                                 continue
@@ -4656,7 +4781,8 @@ class NetworkTrainer:
                     if modality_freezer is not None:
                         modality_freezer.update_losses(video_loss_value, audio_loss_value)
                         modality_freezer.maybe_update_freeze(
-                            global_step, accelerator.unwrap_model(network),
+                            global_step,
+                            accelerator.unwrap_model(network),
                         )
 
                     # to avoid calling optimizer_eval_fn() too frequently, we call it only when we need to sample images or save the model
@@ -4694,10 +4820,13 @@ class NetworkTrainer:
                                         args.output_dir,
                                         train_utils.STEP_STATE_NAME.format(args.output_name, global_step),
                                     )
-                                    train_utils.update_resume_metadata(_state_dir, {
-                                        "loss_avg": loss_recorder.moving_average,
-                                        "loss_count": len(loss_recorder.loss_list),
-                                    })
+                                    train_utils.update_resume_metadata(
+                                        _state_dir,
+                                        {
+                                            "loss_avg": loss_recorder.moving_average,
+                                            "loss_count": len(loss_recorder.loss_list),
+                                        },
+                                    )
 
                                 remove_step_no = train_utils.get_remove_step_no(args, global_step)
                                 if remove_step_no is not None:
@@ -4727,8 +4856,17 @@ class NetworkTrainer:
 
                 if len(accelerator.trackers) > 0:
                     logs = self.generate_step_logs(
-                        args, current_loss, avr_loss, lr_scheduler, lr_descriptions, optimizer, keys_scaled, mean_norm, maximum_norm,
-                        video_loss=video_loss_value, audio_loss=audio_loss_value,
+                        args,
+                        current_loss,
+                        avr_loss,
+                        lr_scheduler,
+                        lr_descriptions,
+                        optimizer,
+                        keys_scaled,
+                        mean_norm,
+                        maximum_norm,
+                        video_loss=video_loss_value,
+                        audio_loss=audio_loss_value,
                         mask_metrics=mask_metrics if mask_metrics else None,
                     )
                     if audio_weight_effective_value is not None:
@@ -4779,6 +4917,7 @@ class NetworkTrainer:
                                     tracker.writer.add_histogram("lr/automagic_lrs", lr_tensor, global_step)
                                 elif tracker.name == "wandb":
                                     import wandb
+
                                     tracker.log({"lr/automagic_lrs": wandb.Histogram(lr_tensor.cpu().numpy())}, step=global_step)
 
                 # GUI dashboard per-step metrics
@@ -4820,6 +4959,9 @@ class NetworkTrainer:
                         run_validation(global_step)
 
                 _prev_step_end_time = time.perf_counter()
+                if handle_dashboard_stop_request(global_step, epoch, step + 1):
+                    return
+
                 if global_step >= args.max_train_steps:
                     break
 
@@ -4866,10 +5008,13 @@ class NetworkTrainer:
                             args.output_dir,
                             train_utils.EPOCH_STATE_NAME.format(args.output_name, epoch + 1),
                         )
-                        train_utils.update_resume_metadata(_state_dir, {
-                            "loss_avg": loss_recorder.moving_average,
-                            "loss_count": len(loss_recorder.loss_list),
-                        })
+                        train_utils.update_resume_metadata(
+                            _state_dir,
+                            {
+                                "loss_avg": loss_recorder.moving_average,
+                                "loss_count": len(loss_recorder.loss_list),
+                            },
+                        )
 
             offload_epoch_sample_optimizer = bool(getattr(args, "offload_optimizer_during_validation", False)) and (
                 should_sample_images(args, global_step, epoch=epoch + 1)
@@ -4880,9 +5025,7 @@ class NetworkTrainer:
                 offload_epoch_sample_optimizer,
                 logger=logger,
             ):
-                self.sample_images(
-                    accelerator, args, epoch + 1, global_step, vae, transformer, sample_parameters, dit_dtype
-                )
+                self.sample_images(accelerator, args, epoch + 1, global_step, vae, transformer, sample_parameters, dit_dtype)
             set_trainer_train_mode()
 
             # end of epoch
@@ -4912,10 +5055,13 @@ class NetworkTrainer:
                 args.output_dir,
                 train_utils.LAST_STATE_NAME.format(args.output_name),
             )
-            train_utils.update_resume_metadata(_state_dir, {
-                "loss_avg": loss_recorder.moving_average,
-                "loss_count": len(loss_recorder.loss_list),
-            })
+            train_utils.update_resume_metadata(
+                _state_dir,
+                {
+                    "loss_avg": loss_recorder.moving_average,
+                    "loss_count": len(loss_recorder.loss_list),
+                },
+            )
 
         if is_main_process:
             ckpt_name = train_utils.get_last_ckpt_name(args.output_name)
@@ -5280,8 +5426,16 @@ def setup_parser_common() -> argparse.ArgumentParser:
     )
 
     parser.add_argument("--fp8_base", action="store_true", help="use fp8 for base model / base modelにfp8を使う")
-    parser.add_argument("--full_fp16", action="store_true", help="fp16 training including gradients (uses stochastic rounding) / 勾配も含めてfp16で学習する")
-    parser.add_argument("--full_bf16", action="store_true", help="bf16 training including gradients (uses stochastic rounding) / 勾配も含めてbf16で学習する")
+    parser.add_argument(
+        "--full_fp16",
+        action="store_true",
+        help="fp16 training including gradients (uses stochastic rounding) / 勾配も含めてfp16で学習する",
+    )
+    parser.add_argument(
+        "--full_bf16",
+        action="store_true",
+        help="bf16 training including gradients (uses stochastic rounding) / 勾配も含めてbf16で学習する",
+    )
 
     parser.add_argument(
         "--dynamo_backend",
@@ -5332,7 +5486,7 @@ def setup_parser_common() -> argparse.ArgumentParser:
         "--disable_numpy_memmap",
         action="store_true",
         help="Disable numpy memory mapping for model loading. Only for Wan, FramePack, Qwen-Image and FLUX.2. Increases RAM usage but speeds up model loading in some cases."
-        " / モデル読み込み時のnumpyメモリマッピングを無効にします。Wan、FramePack、Qwen-Image、FLUX.2で有効です。RAM使用量が増えますが、場合によってはモデルの読み込"
+        " / モデル読み込み時のnumpyメモリマッピングを無効にします。Wan、FramePack、Qwen-Image、FLUX.2で有効です。RAM使用量が増えますが、場合によってはモデルの読み込",
     )
 
     # parser.add_argument("--flow_shift", type=float, default=7.0, help="Shift factor for flow matching schedulers")
@@ -5341,7 +5495,19 @@ def setup_parser_common() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--timestep_sampling",
-        choices=["sigma", "uniform", "sigmoid", "shift", "flux_shift", "flux2_shift", "qwen_shift", "logsnr", "qinglong_flux", "qinglong_qwen", "shifted_logit_normal"],
+        choices=[
+            "sigma",
+            "uniform",
+            "sigmoid",
+            "shift",
+            "flux_shift",
+            "flux2_shift",
+            "qwen_shift",
+            "logsnr",
+            "qinglong_flux",
+            "qinglong_qwen",
+            "shifted_logit_normal",
+        ],
         default="sigma",
         help="Method to sample timesteps: sigma-based, uniform random, sigmoid of random normal, shift of sigmoid, flux shift, "
         "or shifted_logit_normal (sequence-length-adaptive LTX-2 method)."

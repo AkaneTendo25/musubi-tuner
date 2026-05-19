@@ -304,7 +304,7 @@ class PairedSliderDataset(torch.utils.data.Dataset):
         neg_sd = load_file(neg_path)
         te_sd = load_file(te_path)
 
-        text_embeds = _find_text_tensor(te_sd)        # [seq_len, dim]
+        text_embeds = _find_text_tensor(te_sd)  # [seq_len, dim]
         text_mask = te_sd.get("text_mask", torch.ones(text_embeds.shape[0]))  # [seq_len]
 
         if self.reference_modality == "audio":
@@ -342,13 +342,10 @@ class PairedSliderDataset(torch.utils.data.Dataset):
                 "text_mask": text_mask,
             }
 
-        pos_latents = _find_latent_tensor(pos_sd)    # [C, F, H, W]
-        neg_latents = _find_latent_tensor(neg_sd)     # [C, F, H, W]
+        pos_latents = _find_latent_tensor(pos_sd)  # [C, F, H, W]
+        neg_latents = _find_latent_tensor(neg_sd)  # [C, F, H, W]
         if pos_latents.shape != neg_latents.shape:
-            raise ValueError(
-                f"Shape mismatch for {os.path.basename(pos_path)}: "
-                f"pos {pos_latents.shape} vs neg {neg_latents.shape}"
-            )
+            raise ValueError(f"Shape mismatch for {os.path.basename(pos_path)}: pos {pos_latents.shape} vs neg {neg_latents.shape}")
 
         item = {
             "pos_latents": pos_latents,
@@ -405,15 +402,11 @@ class LTX2SliderTrainer:
         batch_size, _channels, frames, height, width = latents.shape
         seq_len = frames * height * width
         first_frame_tokens = height * width
-        video_conditioning_mask = torch.zeros(
-            (batch_size, seq_len), device=accelerator.device, dtype=torch.bool
-        )
+        video_conditioning_mask = torch.zeros((batch_size, seq_len), device=accelerator.device, dtype=torch.bool)
         if first_frame_tokens > 0:
             video_conditioning_mask[:, :first_frame_tokens] = True
 
-        video_loss_mask = torch.ones(
-            (batch_size, 1, frames, 1, 1), device=accelerator.device, dtype=torch.bool
-        )
+        video_loss_mask = torch.ones((batch_size, 1, frames, 1, 1), device=accelerator.device, dtype=torch.bool)
         video_loss_mask[:, :, 0:1, :, :] = False
 
         transformer_options = {
@@ -549,9 +542,7 @@ class LTX2SliderTrainer:
         tgt_e, tgt_m = self.cached_embeds[target.target_class]
 
         # Pad and batch for 3-pass: [positive, neutral, negative]
-        text_3x, mask_3x = _pad_and_batch(
-            [(pos_e, pos_m), (neu_e, neu_m), (neg_e, neg_m)], device, dit_dtype
-        )
+        text_3x, mask_3x = _pad_and_batch([(pos_e, pos_m), (neu_e, neu_m), (neg_e, neg_m)], device, dit_dtype)
 
         # No-grad 3-pass forward (LoRA disabled)
         network.set_multiplier(0.0)
@@ -891,15 +882,11 @@ class LTX2SliderTrainer:
             text_mask = text_mask.unsqueeze(0)
 
         if pos_latents.shape != neg_latents.shape:
-            raise ValueError(
-                f"IC slider pair shape mismatch: pos {tuple(pos_latents.shape)} vs neg {tuple(neg_latents.shape)}"
-            )
+            raise ValueError(f"IC slider pair shape mismatch: pos {tuple(pos_latents.shape)} vs neg {tuple(neg_latents.shape)}")
         if ref_latents.dim() != 5:
             raise ValueError(f"IC slider expected ref_latents to be 5D [B, C, F, H, W], got {tuple(ref_latents.shape)}")
         if ref_latents.shape[0] != pos_latents.shape[0]:
-            raise ValueError(
-                f"IC slider batch mismatch: ref {tuple(ref_latents.shape)} vs pos {tuple(pos_latents.shape)}"
-            )
+            raise ValueError(f"IC slider batch mismatch: ref {tuple(ref_latents.shape)} vs pos {tuple(pos_latents.shape)}")
 
         noise = torch.randn_like(pos_latents)
 
@@ -1009,9 +996,7 @@ class LTX2SliderTrainer:
             original_name = args.output_name
             args.output_name = f"{original_name}_mult{mult:+.1f}"
 
-            self._net_trainer.sample_images(
-                accelerator, args, None, global_step, vae, transformer, sample_parameters, dit_dtype
-            )
+            self._net_trainer.sample_images(accelerator, args, None, global_step, vae, transformer, sample_parameters, dit_dtype)
 
             args.output_name = original_name
 
@@ -1075,13 +1060,9 @@ class LTX2SliderTrainer:
 
         # Validate
         if self.slider_config.mode not in {"text", "reference", "ic_reference"}:
-            raise ValueError(
-                f"Invalid slider mode '{self.slider_config.mode}'. Must be 'text', 'reference', or 'ic_reference'."
-            )
+            raise ValueError(f"Invalid slider mode '{self.slider_config.mode}'. Must be 'text', 'reference', or 'ic_reference'.")
         if self.slider_config.reference_modality not in {"video", "audio"}:
-            raise ValueError(
-                f"Invalid reference_modality '{self.slider_config.reference_modality}'. Must be 'video' or 'audio'."
-            )
+            raise ValueError(f"Invalid reference_modality '{self.slider_config.reference_modality}'. Must be 'video' or 'audio'.")
         if self.slider_config.mode == "text" and len(self.slider_config.targets) == 0:
             raise ValueError("Text-only slider mode requires at least one target in slider config")
         if self.slider_config.mode in {"reference", "ic_reference"}:
@@ -1096,9 +1077,7 @@ class LTX2SliderTrainer:
                     raise ValueError("IC reference slider mode currently supports only --ltx2_mode video")
                 requested_ic = str(getattr(args, "ic_lora_strategy", "auto") or "auto").lower()
                 if requested_ic not in {"auto", "none", "v2v"}:
-                    raise ValueError(
-                        f"IC reference slider mode currently supports only --ic_lora_strategy v2v; got {requested_ic}"
-                    )
+                    raise ValueError(f"IC reference slider mode currently supports only --ic_lora_strategy v2v; got {requested_ic}")
                 args.ic_lora_strategy = "v2v"
                 if getattr(args, "lora_target_preset", None) is None:
                     logger.info("Using lora_target_preset=v2v for IC reference slider training")
@@ -1142,7 +1121,9 @@ class LTX2SliderTrainer:
 
         # Precision
         dit_dtype = torch.bfloat16 if args.dit_dtype is None else model_utils.str_to_dtype(args.dit_dtype)
-        dit_weight_dtype = (None if getattr(args, "fp8_scaled", False) else torch.float8_e4m3fn) if getattr(args, "fp8_base", False) else dit_dtype
+        dit_weight_dtype = (
+            (None if getattr(args, "fp8_scaled", False) else torch.float8_e4m3fn) if getattr(args, "fp8_base", False) else dit_dtype
+        )
 
         # -- Sample prompt setup (for preview during training) ----------------
         vae_dtype = torch.float16 if args.vae_dtype is None else model_utils.str_to_dtype(args.vae_dtype)
@@ -1172,7 +1153,9 @@ class LTX2SliderTrainer:
         if blocks_to_swap > 0:
             logger.info("Enable block swap: %d blocks", blocks_to_swap)
             transformer.enable_block_swap(
-                blocks_to_swap, accelerator.device, supports_backward=True,
+                blocks_to_swap,
+                accelerator.device,
+                supports_backward=True,
                 use_pinned_memory=getattr(args, "use_pinned_memory_for_block_swap", False),
                 swap_norms=getattr(args, "swap_norms", False),
             )
@@ -1190,12 +1173,24 @@ class LTX2SliderTrainer:
 
         if hasattr(network_module_imported, "create_arch_network"):
             network = network_module_imported.create_arch_network(
-                1.0, args.network_dim, args.network_alpha, vae, None, transformer,
-                neuron_dropout=args.network_dropout, **net_kwargs,
+                1.0,
+                args.network_dim,
+                args.network_alpha,
+                vae,
+                None,
+                transformer,
+                neuron_dropout=args.network_dropout,
+                **net_kwargs,
             )
         else:
             network = network_module_imported.create_network(
-                1.0, args.network_dim, args.network_alpha, vae, None, transformer, **net_kwargs,
+                1.0,
+                args.network_dim,
+                args.network_alpha,
+                vae,
+                None,
+                transformer,
+                **net_kwargs,
             )
         if network is None:
             raise RuntimeError("Failed to create LoRA network")
@@ -1257,8 +1252,8 @@ class LTX2SliderTrainer:
 
         # -- Optimizer & scheduler ---------------------------------------------
         trainable_params, lr_descriptions = network.prepare_optimizer_params(unet_lr=args.learning_rate)
-        optimizer_name, optimizer_args_str, optimizer, optimizer_train_fn, optimizer_eval_fn = (
-            NetworkTrainer().get_optimizer(args, trainable_params)
+        optimizer_name, optimizer_args_str, optimizer, optimizer_train_fn, optimizer_eval_fn = NetworkTrainer().get_optimizer(
+            args, trainable_params
         )
 
         lr_scheduler = NetworkTrainer().get_lr_scheduler(args, optimizer, accelerator.num_processes)
@@ -1361,6 +1356,7 @@ class LTX2SliderTrainer:
             upload_original = (not getattr(args, "convert_to_comfy", True)) or getattr(args, "save_original_lora", True)
             if getattr(args, "huggingface_repo_id", None) is not None and upload_original:
                 from musubi_tuner.utils import huggingface_utils
+
                 huggingface_utils.upload(args, ckpt_file, "/" + ckpt_name, force_sync_upload=force_sync_upload)
 
             if getattr(args, "save_checkpoint_metadata", False):
@@ -1395,10 +1391,51 @@ class LTX2SliderTrainer:
                     os.remove(comfy_old_ckpt_file)
             train_utils.remove_checkpoint_metadata(old_ckpt_file)
 
+        def handle_dashboard_stop_request(global_step: int) -> bool:
+            if not train_utils.dashboard_stop_requested():
+                return False
+
+            if train_utils.dashboard_stop_mode() == "force":
+                accelerator.print("\nDashboard force stop requested; exiting without saving interrupt state.")
+                train_utils.clear_dashboard_stop_request()
+                accelerator.end_training()
+                return True
+
+            if global_step <= 0:
+                accelerator.print("\nDashboard stop requested before training steps completed; exiting without saving state.")
+                train_utils.clear_dashboard_stop_request()
+                accelerator.end_training()
+                return True
+
+            accelerator.print("\nDashboard stop requested; saving interrupt state and exiting slider training.")
+            optimizer_eval_fn()
+            accelerator.wait_for_everyone()
+            if accelerator.is_main_process:
+                state_dir = train_utils.save_state_on_interrupt(
+                    args,
+                    accelerator,
+                    global_step=global_step,
+                    epoch=0,
+                    step_in_epoch=global_step,
+                )
+                train_utils.update_resume_metadata(
+                    state_dir,
+                    {
+                        "loss_avg": loss_recorder.moving_average,
+                        "loss_count": len(loss_recorder.loss_list),
+                        "interrupted": True,
+                    },
+                )
+            train_utils.clear_dashboard_stop_request()
+            accelerator.end_training()
+            return True
+
         # -- Training loop -----------------------------------------------------
         progress_bar = tqdm(
-            range(args.max_train_steps), smoothing=0,
-            disable=not accelerator.is_local_main_process, desc="steps",
+            range(args.max_train_steps),
+            smoothing=0,
+            disable=not accelerator.is_local_main_process,
+            desc="steps",
         )
 
         global_step = 0
@@ -1423,7 +1460,9 @@ class LTX2SliderTrainer:
         # Sample at first if requested
         if should_sample_images(args, 0, epoch=0):
             optimizer_eval_fn()
-            self._sample_slider(accelerator, args, transformer, vae, accelerator.unwrap_model(network), sample_parameters, dit_dtype, 0)
+            self._sample_slider(
+                accelerator, args, transformer, vae, accelerator.unwrap_model(network), sample_parameters, dit_dtype, 0
+            )
             optimizer_train_fn()
 
         ref_iter = None
@@ -1431,6 +1470,9 @@ class LTX2SliderTrainer:
             ref_iter = iter(ref_dataloader)
 
         while global_step < args.max_train_steps:
+            if handle_dashboard_stop_request(global_step):
+                return
+
             accelerator.unwrap_model(network).on_step_start()
 
             with accelerator.accumulate(network):
@@ -1483,18 +1525,21 @@ class LTX2SliderTrainer:
 
             # Sampling
             should_sampling = should_sample_images(args, global_step, epoch=None)
-            should_saving = (
-                getattr(args, "save_every_n_steps", None) is not None
-                and global_step % args.save_every_n_steps == 0
-            )
+            should_saving = getattr(args, "save_every_n_steps", None) is not None and global_step % args.save_every_n_steps == 0
 
             if should_sampling or should_saving:
                 optimizer_eval_fn()
 
                 if should_sampling:
                     self._sample_slider(
-                        accelerator, args, transformer, vae,
-                        accelerator.unwrap_model(network), sample_parameters, dit_dtype, global_step,
+                        accelerator,
+                        args,
+                        transformer,
+                        vae,
+                        accelerator.unwrap_model(network),
+                        sample_parameters,
+                        dit_dtype,
+                        global_step,
                     )
 
                 if should_saving:
@@ -1504,7 +1549,9 @@ class LTX2SliderTrainer:
                         save_model(ckpt_name, accelerator.unwrap_model(network), global_step, 0)
 
                         if getattr(args, "save_state", False):
-                            train_utils.save_and_remove_state_stepwise(args, accelerator, global_step)
+                            train_utils.save_and_remove_state_stepwise(
+                                args, accelerator, global_step, epoch=0, step_in_epoch=global_step
+                            )
 
                         remove_step_no = train_utils.get_remove_step_no(args, global_step)
                         if remove_step_no is not None:
@@ -1513,12 +1560,15 @@ class LTX2SliderTrainer:
 
                 optimizer_train_fn()
 
+            if handle_dashboard_stop_request(global_step):
+                return
+
         # -- End of training ---------------------------------------------------
         accelerator.end_training()
         optimizer_eval_fn()
 
         if is_main_process and (getattr(args, "save_state", False) or getattr(args, "save_state_on_train_end", False)):
-            train_utils.save_state_on_train_end(args, accelerator)
+            train_utils.save_state_on_train_end(args, accelerator, global_step=global_step, epoch=0, step_in_epoch=global_step)
 
         if is_main_process:
             ckpt_name = train_utils.get_last_ckpt_name(args.output_name)
@@ -1534,27 +1584,39 @@ class LTX2SliderTrainer:
 def slider_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     """Add slider-specific arguments."""
     parser.add_argument(
-        "--slider_config", type=str, required=True,
+        "--slider_config",
+        type=str,
+        required=True,
         help="Path to slider targets TOML file",
     )
     parser.add_argument(
-        "--latent_frames", type=int, default=1,
+        "--latent_frames",
+        type=int,
+        default=1,
         help="Number of latent frames for text-only mode (1=image, >1=video)",
     )
     parser.add_argument(
-        "--latent_height", type=int, default=512,
+        "--latent_height",
+        type=int,
+        default=512,
         help="Pixel height for synthetic latents (text-only mode)",
     )
     parser.add_argument(
-        "--latent_width", type=int, default=768,
+        "--latent_width",
+        type=int,
+        default=768,
         help="Pixel width for synthetic latents (text-only mode)",
     )
     parser.add_argument(
-        "--guidance_strength", type=float, default=None,
+        "--guidance_strength",
+        type=float,
+        default=None,
         help="Override guidance strength from slider config",
     )
     parser.add_argument(
-        "--sample_slider_range", type=str, default=None,
+        "--sample_slider_range",
+        type=str,
+        default=None,
         help="Comma-separated multiplier values for preview, e.g. '-2,-1,0,1,2'",
     )
     return parser

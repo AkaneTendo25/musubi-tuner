@@ -111,17 +111,23 @@ def _all_manifest_datasets_are_audio(manifest: dict) -> bool:
 
 def _is_attention_geometry_param(param_name: str) -> bool:
     # Attention geometry parameters most tied to motion priors.
-    return re.search(
-        r"(?:^|\.)(?:attn\d+|audio_attn\d+|audio_to_video_attn|video_to_audio_attn)\.(?:to_q|to_k|q_norm|k_norm)\.",
-        param_name,
-    ) is not None
+    return (
+        re.search(
+            r"(?:^|\.)(?:attn\d+|audio_attn\d+|audio_to_video_attn|video_to_audio_attn)\.(?:to_q|to_k|q_norm|k_norm)\.",
+            param_name,
+        )
+        is not None
+    )
 
 
 def _is_self_attention_geometry_param(param_name: str) -> bool:
-    return re.search(
-        r"(?:^|\.)(?:attn1|audio_attn1)\.(?:to_q|to_k|q_norm|k_norm)\.",
-        param_name,
-    ) is not None
+    return (
+        re.search(
+            r"(?:^|\.)(?:attn1|audio_attn1)\.(?:to_q|to_k|q_norm|k_norm)\.",
+            param_name,
+        )
+        is not None
+    )
 
 
 class EMAModel:
@@ -374,8 +380,7 @@ def _add_full_ft_text_encoder_args(parser: argparse.ArgumentParser) -> argparse.
         type=float,
         default=None,
         help=(
-            "Learning rate for text-encoder parameters when --full_ft_train_text_encoder is enabled. "
-            "Defaults to --learning_rate."
+            "Learning rate for text-encoder parameters when --full_ft_train_text_encoder is enabled. Defaults to --learning_rate."
         ),
     )
     parser.add_argument(
@@ -449,8 +454,7 @@ def _validate_full_ft_ic_batch(
             )
         if ref_latents.shape[0] != latents.shape[0]:
             raise ValueError(
-                f"{split_name} batch {batch_index} latents/ref_latents batch mismatch: "
-                f"{latents.shape[0]} vs {ref_latents.shape[0]}"
+                f"{split_name} batch {batch_index} latents/ref_latents batch mismatch: {latents.shape[0]} vs {ref_latents.shape[0]}"
             )
         if ref_latents.shape[1] != latents.shape[1]:
             raise ValueError(
@@ -497,8 +501,7 @@ def _validate_full_ft_ic_batch(
             )
         if ref_latents.shape[0] != latents.shape[0]:
             raise ValueError(
-                f"{split_name} batch {batch_index} latents/ref_latents batch mismatch: "
-                f"{latents.shape[0]} vs {ref_latents.shape[0]}"
+                f"{split_name} batch {batch_index} latents/ref_latents batch mismatch: {latents.shape[0]} vs {ref_latents.shape[0]}"
             )
         if ref_latents.shape[1] != latents.shape[1]:
             raise ValueError(
@@ -539,8 +542,7 @@ def _validate_full_ft_ic_batch(
             )
         if ref_latents.shape[0] != latents.shape[0]:
             raise ValueError(
-                f"{split_name} batch {batch_index} latents/ref_latents batch mismatch: "
-                f"{latents.shape[0]} vs {ref_latents.shape[0]}"
+                f"{split_name} batch {batch_index} latents/ref_latents batch mismatch: {latents.shape[0]} vs {ref_latents.shape[0]}"
             )
         if ref_latents.shape[1] != latents.shape[1]:
             raise ValueError(
@@ -610,18 +612,14 @@ def _run_image_prior_ft_preflight(
         try:
             batch = dataset_group[batch_index]
         except Exception as exc:
-            raise ValueError(
-                f"{split_name} Image-prior full-FT preflight failed while loading batch {batch_index}: {exc}"
-            ) from exc
+            raise ValueError(f"{split_name} Image-prior full-FT preflight failed while loading batch {batch_index}: {exc}") from exc
 
         batch = _normalize_ltx2_batch_for_call_dit(batch)
         latents = _get_ltx2_batch_tensor(batch, "latents")
         if latents is None:
             raise ValueError(f"{split_name} batch {batch_index} is missing latents")
         if latents.dim() != 5:
-            raise ValueError(
-                f"{split_name} batch {batch_index} latents must be 5D [B, C, F, H, W], got {tuple(latents.shape)}"
-            )
+            raise ValueError(f"{split_name} batch {batch_index} latents must be 5D [B, C, F, H, W], got {tuple(latents.shape)}")
         if int(latents.shape[2]) != 1:
             raise ValueError(
                 f"--image_prior_ft expects image-only cached latents with F=1. "
@@ -848,13 +846,18 @@ def _is_ewc_target_param(name: str, target: str) -> bool:
     if target == "all_trainable":
         return True
     if target == "attn_norm_bias":
-        return re.search(
-            r"(?:^|\.)(?:attn\d+|audio_attn\d+|audio_to_video_attn|video_to_audio_attn)\.(?:q_norm|k_norm)\.weight$",
-            name,
-        ) is not None or re.search(
-            r"(?:^|\.)(?:attn\d+|audio_attn\d+|audio_to_video_attn|video_to_audio_attn)\.(?:to_q|to_k)\.bias$",
-            name,
-        ) is not None
+        return (
+            re.search(
+                r"(?:^|\.)(?:attn\d+|audio_attn\d+|audio_to_video_attn|video_to_audio_attn)\.(?:q_norm|k_norm)\.weight$",
+                name,
+            )
+            is not None
+            or re.search(
+                r"(?:^|\.)(?:attn\d+|audio_attn\d+|audio_to_video_attn|video_to_audio_attn)\.(?:to_q|to_k)\.bias$",
+                name,
+            )
+            is not None
+        )
     if target == "attn_geometry":
         return _is_attention_geometry_param(name)
     return False
@@ -1293,6 +1296,7 @@ def _register_grad_norm_hooks(
                     state["norms"][pname] = float(p.grad.detach().norm(2).item())
                 except Exception:
                     pass
+
             return _hook
 
         try:
@@ -1308,7 +1312,10 @@ def _register_grad_norm_hooks(
 
     logger.info(
         "grad_norm: hooked %d tensors (target=%s, every=%d steps, top_k=%d).",
-        n, target, interval, top_k,
+        n,
+        target,
+        interval,
+        top_k,
     )
     return state
 
@@ -1393,12 +1400,24 @@ def _build_output_drift_state(
                 fixed_t = [fixed_t_value] * bsz
                 try:
                     noisy_model_input, timesteps = trainer.get_noisy_model_input_and_timesteps(
-                        args, noise, latents_tensor, fixed_t,
-                        noise_scheduler, accelerator.device, trainer.dit_dtype,
+                        args,
+                        noise,
+                        latents_tensor,
+                        fixed_t,
+                        noise_scheduler,
+                        accelerator.device,
+                        trainer.dit_dtype,
                     )
                     model_pred, _ = trainer.call_dit(
-                        args, accelerator, transformer, latents_tensor, batch, noise,
-                        noisy_model_input, timesteps, trainer.dit_dtype,
+                        args,
+                        accelerator,
+                        transformer,
+                        latents_tensor,
+                        batch,
+                        noise,
+                        noisy_model_input,
+                        timesteps,
+                        trainer.dit_dtype,
                     )
                 except Exception as exc:
                     logger.warning("output_drift: probe build failed for a batch: %s", exc)
@@ -1414,13 +1433,15 @@ def _build_output_drift_state(
                 if ref_pred_cpu is None:
                     continue
 
-                probes.append({
-                    "batch_cpu": _move_batch_to_cpu(batch),
-                    "latents_cpu": latents_tensor.detach().cpu().clone(),
-                    "noise_cpu": noise.detach().cpu().clone(),
-                    "timesteps_override": list(fixed_t),
-                    "ref_pred_cpu": ref_pred_cpu,
-                })
+                probes.append(
+                    {
+                        "batch_cpu": _move_batch_to_cpu(batch),
+                        "latents_cpu": latents_tensor.detach().cpu().clone(),
+                        "noise_cpu": noise.detach().cpu().clone(),
+                        "timesteps_override": list(fixed_t),
+                        "ref_pred_cpu": ref_pred_cpu,
+                    }
+                )
     finally:
         if was_training:
             transformer.train()
@@ -1430,7 +1451,9 @@ def _build_output_drift_state(
         return None
     logger.info(
         "output_drift: captured %d probe batches at t=%.1f, every=%d steps.",
-        len(probes), fixed_t_value, interval,
+        len(probes),
+        fixed_t_value,
+        interval,
     )
     return {"probes": probes, "interval": interval, "fixed_t": fixed_t_value}
 
@@ -1462,12 +1485,24 @@ def _compute_output_drift_logs(
                 noise = probe["noise_cpu"].to(device=device)
                 try:
                     noisy_model_input, timesteps = trainer.get_noisy_model_input_and_timesteps(
-                        args, noise, latents_tensor, probe["timesteps_override"],
-                        noise_scheduler, device, trainer.dit_dtype,
+                        args,
+                        noise,
+                        latents_tensor,
+                        probe["timesteps_override"],
+                        noise_scheduler,
+                        device,
+                        trainer.dit_dtype,
                     )
                     model_pred, _ = trainer.call_dit(
-                        args, accelerator, transformer, latents_tensor, batch, noise,
-                        noisy_model_input, timesteps, trainer.dit_dtype,
+                        args,
+                        accelerator,
+                        transformer,
+                        latents_tensor,
+                        batch,
+                        noise,
+                        noisy_model_input,
+                        timesteps,
+                        trainer.dit_dtype,
                     )
                 except Exception as exc:
                     logger.warning("output_drift: forward failed: %s", exc)
@@ -1488,7 +1523,10 @@ def _compute_output_drift_logs(
                     continue
                 mse_vals.append(float((cur_f - ref).square().mean().item()))
                 cos = torch.nn.functional.cosine_similarity(
-                    cur_f.flatten().unsqueeze(0), ref.flatten().unsqueeze(0), dim=1, eps=1e-8,
+                    cur_f.flatten().unsqueeze(0),
+                    ref.flatten().unsqueeze(0),
+                    dim=1,
+                    eps=1e-8,
                 ).item()
                 cos_vals.append(float(cos))
     finally:
@@ -1981,9 +2019,10 @@ def _apply_image_prior_ft_defaults(args: argparse.Namespace) -> None:
         if float(getattr(args, "motion_attention_preservation_weight", 0.0) or 0.0) <= 0.0:
             args.motion_attention_preservation_weight = 0.1
 
-    if getattr(args, "image_prior_ft_task_route", "appearance") != "all" or getattr(
-        args, "image_prior_ft_motion_route", "motion"
-    ) != "all":
+    if (
+        getattr(args, "image_prior_ft_task_route", "appearance") != "all"
+        or getattr(args, "image_prior_ft_motion_route", "motion") != "all"
+    ):
         args.motion_preservation_separate_backward = True
         if bool(getattr(args, "fused_backward_pass", False)):
             args.motion_preservation_fused_defer_step = True
@@ -2007,8 +2046,13 @@ def ltx2_finetune_setup_parser(parser: argparse.ArgumentParser) -> argparse.Argu
     # All wrapper kwargs flow through --optimizer_args as key=value entries
     # (e.g. base_optimizer_type=CAME8Bit switch_block_every=25 use_gradient_release=True).
     # The inner optimizer's kwargs are passed via --base_optimizer_args.
-    parser.add_argument("--base_optimizer_args", type=str, default=None, nargs="*",
-                        help="Inner optimizer kwargs when --optimizer_type=BAdam (e.g. stochastic_rounding=True use_cautious=False).")
+    parser.add_argument(
+        "--base_optimizer_args",
+        type=str,
+        default=None,
+        nargs="*",
+        help="Inner optimizer kwargs when --optimizer_type=BAdam (e.g. stochastic_rounding=True use_cautious=False).",
+    )
     parser.add_argument(
         "--mem_eff_save",
         action="store_true",
@@ -2313,8 +2357,7 @@ def ltx2_finetune_setup_parser(parser: argparse.ArgumentParser) -> argparse.Argu
         type=int,
         default=0,
         help=(
-            "Stream teacher replay targets from CPU in frame chunks to reduce peak VRAM. "
-            "0 disables chunking (faster, higher VRAM)."
+            "Stream teacher replay targets from CPU in frame chunks to reduce peak VRAM. 0 disables chunking (faster, higher VRAM)."
         ),
     )
     parser.add_argument(
@@ -2727,7 +2770,7 @@ def _prepare_state_dict_for_save(state_dict: dict, args) -> tuple[dict, dict[str
     renamed: dict = {}
     for key, value in state_dict.items():
         if key.startswith("model."):
-            new_key = "model.diffusion_model." + key[len("model."):]
+            new_key = "model.diffusion_model." + key[len("model.") :]
             renamed[new_key] = value
         else:
             renamed[key] = value
@@ -2829,9 +2872,7 @@ def main() -> None:
 
     trainer.handle_model_specific_args(args)
     if getattr(args, "ltx_mode", "video") == "av" and not getattr(args, "av_use_video_prompt_embeds", False):
-        logger.info(
-            "Enabling av_use_video_prompt_embeds for AV mode compatibility when batches have no audio latents."
-        )
+        logger.info("Enabling av_use_video_prompt_embeds for AV mode compatibility when batches have no audio latents.")
         args.av_use_video_prompt_embeds = True
 
     if args.motion_preservation and getattr(args, "ltx_mode", "video") != "video":
@@ -2866,9 +2907,7 @@ def main() -> None:
     if args.motion_preservation:
         anchor_source = str(getattr(args, "motion_preservation_anchor_source", "synthetic") or "synthetic").lower()
         if anchor_source not in {"dataset", "synthetic", "hybrid"}:
-            raise ValueError(
-                "motion_preservation_anchor_source must be one of: dataset, synthetic, hybrid"
-            )
+            raise ValueError("motion_preservation_anchor_source must be one of: dataset, synthetic, hybrid")
         if int(getattr(args, "motion_preservation_synthetic_frames", 8) or 0) < 2:
             raise ValueError("motion_preservation_synthetic_frames must be >= 2")
         temporal_corr = float(getattr(args, "motion_preservation_synthetic_temporal_corr", 0.92))
@@ -2916,8 +2955,7 @@ def main() -> None:
         raise ValueError("motion_attention_preservation_temperature must be > 0")
     if args.motion_attention_preservation and bool(getattr(args, "gradient_checkpointing", False)):
         logger.info(
-            "motion_attention_preservation with gradient_checkpointing enabled: "
-            "using native attention-forward capture path."
+            "motion_attention_preservation with gradient_checkpointing enabled: using native attention-forward capture path."
         )
     if float(getattr(args, "ewc_lambda", 0.0) or 0.0) < 0.0:
         raise ValueError("ewc_lambda must be >= 0")
@@ -2937,8 +2975,12 @@ def main() -> None:
             "Resetting attn_geometry_lr_scale to 1.0 for clarity."
         )
         args.attn_geometry_lr_scale = 1.0
-    if bool(getattr(args, "motion_preservation_anchor_cache_rebuild", False)) and not getattr(args, "motion_preservation_anchor_cache_path", None):
-        logger.warning("motion_preservation_anchor_cache_rebuild is set but motion_preservation_anchor_cache_path is empty; ignoring rebuild flag.")
+    if bool(getattr(args, "motion_preservation_anchor_cache_rebuild", False)) and not getattr(
+        args, "motion_preservation_anchor_cache_path", None
+    ):
+        logger.warning(
+            "motion_preservation_anchor_cache_rebuild is set but motion_preservation_anchor_cache_path is empty; ignoring rebuild flag."
+        )
     if bool(getattr(args, "ewc_cache_rebuild", False)) and not getattr(args, "ewc_cache_path", None):
         logger.warning("ewc_cache_rebuild is set but ewc_cache_path is empty; ignoring rebuild flag.")
     if bool(getattr(args, "motion_prior_cache_only", False)) and not bool(getattr(args, "motion_preservation", False)):
@@ -2971,9 +3013,7 @@ def main() -> None:
         if int(getattr(args, "blocks_to_swap", 0) or 0) > 0:
             raise RuntimeError("LTX2 remote stage is incompatible with --blocks_to_swap in the current implementation")
         if bool(getattr(args, "blockwise_checkpointing", False)):
-            raise RuntimeError(
-                "LTX2 remote stage is incompatible with --blockwise_checkpointing in the current implementation"
-            )
+            raise RuntimeError("LTX2 remote stage is incompatible with --blockwise_checkpointing in the current implementation")
         if bool(getattr(args, "compile", False)):
             raise RuntimeError("LTX2 remote stage is incompatible with --compile in the current implementation")
         validate_ltx2_remote_stage_setup(args)
@@ -2981,7 +3021,11 @@ def main() -> None:
     # sample prompts (optional)
     sample_parameters = None
     vae = None
-    if args.sample_prompts or getattr(args, "precache_sample_prompts", False) or getattr(args, "use_precached_sample_prompts", False):
+    if (
+        args.sample_prompts
+        or getattr(args, "precache_sample_prompts", False)
+        or getattr(args, "use_precached_sample_prompts", False)
+    ):
         sample_prompt_path = args.sample_prompts or ""
         sample_parameters = trainer.process_sample_prompts(args, accelerator, sample_prompt_path)
         vae = trainer.load_vae(args, vae_dtype=model_utils.str_to_dtype(args.vae_dtype), vae_path=args.vae)
@@ -3072,10 +3116,7 @@ def main() -> None:
         logger=logger,
     )
     if accumulation_sampler is None:
-        if (
-            int(args.gradient_accumulation_steps) > 1
-            and int(accumulation_sampler_stats.get("bucket_groups", 0)) > 1
-        ):
+        if int(args.gradient_accumulation_steps) > 1 and int(accumulation_sampler_stats.get("bucket_groups", 0)) > 1:
             logger.warning(
                 "gradient_accumulation_steps=%d with %d dataset bucket groups: accumulation windows may mix "
                 "frame counts/resolutions. Use --accumulation_group_by bucket for opt-in grouped windows.",
@@ -3211,9 +3252,7 @@ def main() -> None:
     clean_memory_on_device(accelerator.device)
 
     if blocks_to_swap > 0:
-        logger.info(
-            "enable swap %s blocks to CPU from device: %s", blocks_to_swap, accelerator.device
-        )
+        logger.info("enable swap %s blocks to CPU from device: %s", blocks_to_swap, accelerator.device)
         transformer.enable_block_swap(
             blocks_to_swap,
             accelerator.device,
@@ -3255,9 +3294,7 @@ def main() -> None:
                 blocks_to_swap=blocks_to_swap,
             )
             if not motion_attention_modules:
-                logger.warning(
-                    "motion_attention_preservation requested but no matching attn1 modules were found; disabling it."
-                )
+                logger.warning("motion_attention_preservation requested but no matching attn1 modules were found; disabling it.")
                 args.motion_attention_preservation = False
             else:
                 logger.info(
@@ -3295,11 +3332,7 @@ def main() -> None:
                 temporal_anchor_count = 0
                 for entry in motion_anchor_cache:
                     anchor_latents = entry.get("anchor_latents")
-                    if (
-                        isinstance(anchor_latents, torch.Tensor)
-                        and anchor_latents.dim() == 5
-                        and int(anchor_latents.shape[2]) > 1
-                    ):
+                    if isinstance(anchor_latents, torch.Tensor) and anchor_latents.dim() == 5 and int(anchor_latents.shape[2]) > 1:
                         temporal_anchor_count += 1
                 if temporal_anchor_count <= 0:
                     raise ValueError(
@@ -3322,8 +3355,10 @@ def main() -> None:
             raise RuntimeError("Failed to initialize text encoder despite --full_ft_train_text_encoder.")
         text_encoder = trainer._text_encoder
         text_encoder_model = getattr(text_encoder, "model", None)
-        if bool(getattr(text_encoder, "_has_fp8_model", False)) or bool(getattr(text_encoder_model, "is_loaded_in_8bit", False)) or bool(
-            getattr(text_encoder_model, "is_loaded_in_4bit", False)
+        if (
+            bool(getattr(text_encoder, "_has_fp8_model", False))
+            or bool(getattr(text_encoder_model, "is_loaded_in_8bit", False))
+            or bool(getattr(text_encoder_model, "is_loaded_in_4bit", False))
         ):
             raise ValueError(
                 "--full_ft_train_text_encoder requires full-precision Gemma weights. "
@@ -3391,7 +3426,8 @@ def main() -> None:
         if n_audio > 0:
             logger.info(
                 "Full-FT audio_param_lr_scale=%.4f applied: %d audio param tensors moved to separate group(s).",
-                _audio_lr_scale, n_audio,
+                _audio_lr_scale,
+                n_audio,
             )
             params_to_optimize = new_groups
             param_names = new_name_groups
@@ -3421,12 +3457,8 @@ def main() -> None:
     image_prior_ft_route_state = _build_image_prior_ft_route_state(transformer, args)
     if image_prior_ft_route_state is not None:
         ft_group_stats = dict(ft_group_stats)
-        ft_group_stats["image_prior_ft_motion_param_count"] = len(
-            image_prior_ft_route_state.get("motion_param_names", [])
-        )
-        ft_group_stats["image_prior_ft_appearance_param_count"] = len(
-            image_prior_ft_route_state.get("appearance_param_names", [])
-        )
+        ft_group_stats["image_prior_ft_motion_param_count"] = len(image_prior_ft_route_state.get("motion_param_names", []))
+        ft_group_stats["image_prior_ft_appearance_param_count"] = len(image_prior_ft_route_state.get("appearance_param_names", []))
         logger.info(
             "Image-prior full-FT routing: task=%s motion=%s target=%s motion_params=%d appearance_params=%d",
             image_prior_ft_route_state.get("task_route", "all"),
@@ -3470,7 +3502,7 @@ def main() -> None:
             if shadow_bytes > 0:
                 logger.info(
                     "Self-Flow full-FT teacher EMA shadow size: %.2f GB across %d tensors",
-                    float(shadow_bytes) / (1024.0 ** 3),
+                    float(shadow_bytes) / (1024.0**3),
                     len(shadow_params),
                 )
 
@@ -3515,7 +3547,7 @@ def main() -> None:
         # the factory and must be excluded here. Values fall back to raw string when
         # they are not Python literals.
         wrapper_kwargs: dict[str, Any] = {}
-        for entry in (args.optimizer_args or []):
+        for entry in args.optimizer_args or []:
             if "=" not in entry:
                 raise ValueError(f"Invalid --optimizer_args entry (expected key=value): {entry}")
             k, v = entry.split("=", 1)
@@ -3526,8 +3558,7 @@ def main() -> None:
         wrapper_kwargs.pop("base_optimizer_type", None)
         if wrapper_kwargs.get("use_gradient_release", False) and not wrapper_kwargs.get("use_fp32_active_copy", True):
             raise ValueError(
-                "use_gradient_release=True requires use_fp32_active_copy=True; "
-                "the per-param step path operates on HP fp32 copies."
+                "use_gradient_release=True requires use_fp32_active_copy=True; the per-param step path operates on HP fp32 copies."
             )
 
         # create_badam_optimizer reads its config via getattr(args, 'badam_*', default).
@@ -3621,7 +3652,8 @@ def main() -> None:
             _uc = config_utils.load_user_config(_path)
             _bp = blueprint_generator.generate(_uc, args, architecture=trainer.architecture)
             _dg = config_utils.generate_dataset_group_by_blueprint(
-                _bp.dataset_group, training=False,
+                _bp.dataset_group,
+                training=False,
                 num_timestep_buckets=args.num_timestep_buckets,
                 shared_epoch=current_epoch,
                 reference_downscale=getattr(args, "reference_downscale", 1),
@@ -3631,8 +3663,12 @@ def main() -> None:
                 continue
             _col = collator_class(current_epoch, _dg if args.max_data_loader_n_workers == 0 else None)
             _dl = torch.utils.data.DataLoader(
-                _dg, batch_size=1, shuffle=False, collate_fn=_col,
-                num_workers=n_workers, persistent_workers=False,
+                _dg,
+                batch_size=1,
+                shuffle=False,
+                collate_fn=_col,
+                num_workers=n_workers,
+                persistent_workers=False,
             )
             _dl = accelerator.prepare(_dl)
             extra_val_dataloaders[_cat] = _dl
@@ -3654,8 +3690,10 @@ def main() -> None:
         ema_device = torch.device("cpu") if args.ema_cpu_offload else None
         logger.info(
             "Initializing EMA with decay=%.6f, update_after_step=%d, update_every=%d, device=%s",
-            args.ema_decay, args.ema_update_after_step, args.ema_update_every,
-            "cpu" if args.ema_cpu_offload else "same as model"
+            args.ema_decay,
+            args.ema_update_after_step,
+            args.ema_update_every,
+            "cpu" if args.ema_cpu_offload else "same as model",
         )
         if not args.ema_cpu_offload:
             logger.warning(
@@ -3719,7 +3757,9 @@ def main() -> None:
                 )
 
                 if is_torchao_optimizer_instance(base_optimizer):
-                    if not patch_torchao_fused_step_param(base_optimizer) or not _attach_fused_step_param(optimizer, base_optimizer):
+                    if not patch_torchao_fused_step_param(base_optimizer) or not _attach_fused_step_param(
+                        optimizer, base_optimizer
+                    ):
                         raise ValueError(
                             f"{base_optimizer.__class__.__name__} fused backward pass requires torchao single-param Adam support"
                         )
@@ -3744,7 +3784,9 @@ def main() -> None:
                     logger.info("%s torch-optimi fused backward pass enabled.", base_optimizer.__class__.__name__)
                 elif base_optimizer_name in {"came", "came8bit"}:
                     if not _attach_fused_step_param(optimizer, base_optimizer):
-                        raise ValueError(f"{base_optimizer.__class__.__name__} fused backward pass requires optimizer.step_param support")
+                        raise ValueError(
+                            f"{base_optimizer.__class__.__name__} fused backward pass requires optimizer.step_param support"
+                        )
                     if not any(bool(group.get("stochastic_rounding", False)) for group in base_optimizer.param_groups):
                         logger.warning(
                             "%s fused backward pass is enabled without stochastic_rounding=True. "
@@ -3785,8 +3827,7 @@ def main() -> None:
                                 if not accelerator.sync_gradients:
                                     return
                                 if fused_step_state is not None and (
-                                    fused_step_state.get("defer_step", False)
-                                    or fused_step_state.get("suspend_step", False)
+                                    fused_step_state.get("defer_step", False) or fused_step_state.get("suspend_step", False)
                                 ):
                                     return
                                 optimizer.step_param(tensor, p_group)
@@ -3851,33 +3892,17 @@ def main() -> None:
         "ss_motion_preservation_mode": getattr(args, "motion_preservation_mode", "temporal"),
         "ss_motion_preservation_multiplier": getattr(args, "motion_preservation_multiplier", 0.0),
         "ss_motion_preservation_anchor_cache_size": getattr(args, "motion_preservation_anchor_cache_size", 0),
-        "ss_motion_preservation_anchor_cache_auto": bool(
-            getattr(args, "motion_preservation_anchor_cache_auto", False)
-        ),
-        "ss_motion_preservation_anchor_cache_auto_ratio": getattr(
-            args, "motion_preservation_anchor_cache_auto_ratio", 0.2
-        ),
-        "ss_motion_preservation_anchor_cache_auto_min": getattr(
-            args, "motion_preservation_anchor_cache_auto_min", 8
-        ),
-        "ss_motion_preservation_anchor_cache_auto_max": getattr(
-            args, "motion_preservation_anchor_cache_auto_max", 64
-        ),
+        "ss_motion_preservation_anchor_cache_auto": bool(getattr(args, "motion_preservation_anchor_cache_auto", False)),
+        "ss_motion_preservation_anchor_cache_auto_ratio": getattr(args, "motion_preservation_anchor_cache_auto_ratio", 0.2),
+        "ss_motion_preservation_anchor_cache_auto_min": getattr(args, "motion_preservation_anchor_cache_auto_min", 8),
+        "ss_motion_preservation_anchor_cache_auto_max": getattr(args, "motion_preservation_anchor_cache_auto_max", 64),
         "ss_motion_preservation_anchor_cache_path": getattr(args, "motion_preservation_anchor_cache_path", None),
-        "ss_motion_preservation_anchor_cache_rebuild": bool(
-            getattr(args, "motion_preservation_anchor_cache_rebuild", False)
-        ),
+        "ss_motion_preservation_anchor_cache_rebuild": bool(getattr(args, "motion_preservation_anchor_cache_rebuild", False)),
         "ss_motion_preservation_anchor_source": getattr(args, "motion_preservation_anchor_source", "synthetic"),
         "ss_motion_preservation_synthetic_frames": getattr(args, "motion_preservation_synthetic_frames", 8),
-        "ss_motion_preservation_synthetic_temporal_corr": getattr(
-            args, "motion_preservation_synthetic_temporal_corr", 0.92
-        ),
-        "ss_motion_preservation_synthetic_dataset_mix": getattr(
-            args, "motion_preservation_synthetic_dataset_mix", 0.25
-        ),
-        "ss_motion_preservation_synthetic_content_seeded": getattr(
-            args, "motion_preservation_synthetic_content_seeded", True
-        ),
+        "ss_motion_preservation_synthetic_temporal_corr": getattr(args, "motion_preservation_synthetic_temporal_corr", 0.92),
+        "ss_motion_preservation_synthetic_dataset_mix": getattr(args, "motion_preservation_synthetic_dataset_mix", 0.25),
+        "ss_motion_preservation_synthetic_content_seeded": getattr(args, "motion_preservation_synthetic_content_seeded", True),
         "ss_motion_preservation_warmup_steps": getattr(args, "motion_preservation_warmup_steps", 0),
         "ss_motion_preservation_interval": getattr(args, "motion_preservation_interval", 1),
         "ss_motion_preservation_probability": getattr(args, "motion_preservation_probability", None),
@@ -3896,15 +3921,9 @@ def main() -> None:
         "ss_motion_attention_preservation_loss": getattr(args, "motion_attention_preservation_loss", "kl"),
         "ss_motion_attention_preservation_queries": getattr(args, "motion_attention_preservation_queries", 0),
         "ss_motion_attention_preservation_keys": getattr(args, "motion_attention_preservation_keys", 0),
-        "ss_motion_attention_preservation_per_head": bool(
-            getattr(args, "motion_attention_preservation_per_head", False)
-        ),
-        "ss_motion_attention_preservation_temperature": getattr(
-            args, "motion_attention_preservation_temperature", 1.0
-        ),
-        "ss_motion_attention_preservation_symmetric_kl": bool(
-            getattr(args, "motion_attention_preservation_symmetric_kl", False)
-        ),
+        "ss_motion_attention_preservation_per_head": bool(getattr(args, "motion_attention_preservation_per_head", False)),
+        "ss_motion_attention_preservation_temperature": getattr(args, "motion_attention_preservation_temperature", 1.0),
+        "ss_motion_attention_preservation_symmetric_kl": bool(getattr(args, "motion_attention_preservation_symmetric_kl", False)),
         "ss_motion_attention_preservation_blocks": getattr(args, "motion_attention_preservation_blocks", None),
         "ss_ewc_lambda": getattr(args, "ewc_lambda", 0.0),
         "ss_ewc_num_batches": getattr(args, "ewc_num_batches", 0),
@@ -4033,12 +4052,8 @@ def main() -> None:
             "setup/trainable_attn_geometry_count": float(ft_group_stats.get("trainable_attn_geometry_count", 0)),
             "setup/attn_geometry_lr_scale": float(getattr(args, "attn_geometry_lr_scale", 1.0)),
             "setup/image_prior_ft": float(bool(getattr(args, "image_prior_ft", False))),
-            "setup/image_prior_ft_motion_param_count": float(
-                ft_group_stats.get("image_prior_ft_motion_param_count", 0)
-            ),
-            "setup/image_prior_ft_appearance_param_count": float(
-                ft_group_stats.get("image_prior_ft_appearance_param_count", 0)
-            ),
+            "setup/image_prior_ft_motion_param_count": float(ft_group_stats.get("image_prior_ft_motion_param_count", 0)),
+            "setup/image_prior_ft_appearance_param_count": float(ft_group_stats.get("image_prior_ft_appearance_param_count", 0)),
         }
         for i, scale in enumerate(ft_group_stats.get("lr_scales", [])):
             setup_logs[f"setup/lr_scale/group_{i}"] = float(scale)
@@ -4056,9 +4071,7 @@ def main() -> None:
     self_flow_loss = None
     del train_dataset_group
 
-    def save_model(
-        ckpt_name: str, unwrapped_model, steps, epoch_no, force_sync_upload=False, use_memory_efficient_saving=False
-    ):
+    def save_model(ckpt_name: str, unwrapped_model, steps, epoch_no, force_sync_upload=False, use_memory_efficient_saving=False):
         os.makedirs(args.output_dir, exist_ok=True)
         ckpt_file = os.path.join(args.output_dir, ckpt_name)
 
@@ -4249,6 +4262,47 @@ def main() -> None:
         except Exception as e:
             logger.warning("Failed to save Self-Flow teacher EMA state: %s", e)
 
+    def handle_dashboard_stop_request(global_step: int, epoch: int, step_in_epoch: int) -> bool:
+        if not train_utils.dashboard_stop_requested():
+            return False
+
+        if train_utils.dashboard_stop_mode() == "force":
+            accelerator.print("\nDashboard force stop requested; exiting without saving interrupt state.")
+            train_utils.clear_dashboard_stop_request()
+            accelerator.end_training()
+            return True
+
+        if global_step <= 0:
+            accelerator.print("\nDashboard stop requested before training steps completed; exiting without saving state.")
+            train_utils.clear_dashboard_stop_request()
+            accelerator.end_training()
+            return True
+
+        accelerator.print("\nDashboard stop requested; saving interrupt state and exiting training.")
+        optimizer_eval_fn()
+        accelerator.wait_for_everyone()
+        if accelerator.is_main_process:
+            state_dir = train_utils.save_state_on_interrupt(
+                args,
+                accelerator,
+                global_step=global_step,
+                epoch=epoch + 1,
+                step_in_epoch=step_in_epoch,
+            )
+            train_utils.update_resume_metadata(
+                state_dir,
+                {
+                    "loss_avg": loss_recorder.moving_average,
+                    "loss_count": len(loss_recorder.loss_list),
+                    "interrupted": True,
+                },
+            )
+            save_ema_state()
+            save_self_flow_state()
+        train_utils.clear_dashboard_stop_request()
+        accelerator.end_training()
+        return True
+
     def run_validation(step: int, epoch: int) -> dict:
         """Run validation and return metrics."""
         if val_dataloader is None:
@@ -4264,9 +4318,7 @@ def main() -> None:
 
         self_flow_network = getattr(trainer, "_self_flow_network", None)
         self_flow_network_was_training = (
-            bool(getattr(self_flow_network, "training", False))
-            if self_flow_network is not None
-            else None
+            bool(getattr(self_flow_network, "training", False)) if self_flow_network is not None else None
         )
         force_self_flow_capture = bool(
             getattr(args, "self_flow", False)
@@ -4363,9 +4415,13 @@ def main() -> None:
                     _val_loss_type = getattr(args, "loss_type", "mse")
                     _val_huber_delta = float(getattr(args, "huber_delta", 1.0))
                     video_loss = _masked_mse(
-                        video_pred, video_target, video_loss_mask,
-                        weighting=weighting, dtype=trainer.dit_dtype,
-                        loss_type=_val_loss_type, huber_delta=_val_huber_delta,
+                        video_pred,
+                        video_target,
+                        video_loss_mask,
+                        weighting=weighting,
+                        dtype=trainer.dit_dtype,
+                        loss_type=_val_loss_type,
+                        huber_delta=_val_huber_delta,
                     )
                     val_video_losses.append(video_loss.item())
 
@@ -4374,9 +4430,13 @@ def main() -> None:
                     if audio_pred is not None and audio_target is not None:
                         audio_loss_mask = out.get("audio_loss_mask")
                         audio_loss = _masked_mse(
-                            audio_pred, audio_target, audio_loss_mask,
-                            weighting=weighting, dtype=trainer.dit_dtype,
-                            loss_type=_val_loss_type, huber_delta=_val_huber_delta,
+                            audio_pred,
+                            audio_target,
+                            audio_loss_mask,
+                            weighting=weighting,
+                            dtype=trainer.dit_dtype,
+                            loss_type=_val_loss_type,
+                            huber_delta=_val_huber_delta,
                         )
                         val_audio_losses.append(audio_loss.item())
                         video_weight = float(out.get("video_loss_weight", 1.0))
@@ -4395,9 +4455,7 @@ def main() -> None:
                     if _val_loss_type in ("mae", "l1"):
                         loss = torch.nn.functional.l1_loss(model_pred, target, reduction="none")
                     elif _val_loss_type in ("huber", "smooth_l1"):
-                        loss = torch.nn.functional.smooth_l1_loss(
-                            model_pred, target, reduction="none", beta=_val_huber_delta
-                        )
+                        loss = torch.nn.functional.smooth_l1_loss(model_pred, target, reduction="none", beta=_val_huber_delta)
                     else:
                         loss = torch.nn.functional.mse_loss(model_pred, target, reduction="none")
                     if weighting is not None:
@@ -4469,24 +4527,14 @@ def main() -> None:
                 motion_total_loss = None
                 motion_preservation_prob = getattr(args, "motion_preservation_probability", None)
                 if motion_preservation_prob is None:
-                    should_apply_motion_replay = (
-                        (step + num_batches + 1) % int(args.motion_preservation_interval) == 0
-                    )
+                    should_apply_motion_replay = (step + num_batches + 1) % int(args.motion_preservation_interval) == 0
                 else:
                     should_apply_motion_replay = random.random() < float(motion_preservation_prob)
 
-                if (
-                    args.motion_preservation
-                    and motion_anchor_cache
-                    and should_apply_motion_replay
-                ):
+                if args.motion_preservation and motion_anchor_cache and should_apply_motion_replay:
                     anchor = random.choice(motion_anchor_cache)
-                    anchor_latents = _move_to_device(
-                        anchor["anchor_latents"], accelerator.device, dtype=trainer.dit_dtype
-                    )
-                    anchor_noise = _move_to_device(
-                        anchor["anchor_noise"], accelerator.device, dtype=trainer.dit_dtype
-                    )
+                    anchor_latents = _move_to_device(anchor["anchor_latents"], accelerator.device, dtype=trainer.dit_dtype)
+                    anchor_noise = _move_to_device(anchor["anchor_noise"], accelerator.device, dtype=trainer.dit_dtype)
 
                     sigma_idx: Optional[int] = None
                     anchor_sigmas = anchor.get("anchor_sigmas") or []
@@ -4509,35 +4557,21 @@ def main() -> None:
                         anchor_noisy_input = _move_to_device(
                             anchor["anchor_noisy_input"], accelerator.device, dtype=trainer.dit_dtype
                         )
-                        anchor_model_timesteps = _move_to_device(
-                            anchor["anchor_model_timesteps"], accelerator.device
-                        )
+                        anchor_model_timesteps = _move_to_device(anchor["anchor_model_timesteps"], accelerator.device)
                         teacher_video_pred = anchor.get("teacher_video_pred")
 
-                    anchor_batch = _move_to_device(
-                        anchor["anchor_batch"], accelerator.device, dtype=trainer.dit_dtype
-                    )
+                    anchor_batch = _move_to_device(anchor["anchor_batch"], accelerator.device, dtype=trainer.dit_dtype)
                     if isinstance(teacher_video_pred, torch.Tensor):
-                        original_first_frame_p = float(
-                            getattr(args, "ltx2_first_frame_conditioning_p", 0.0)
-                        )
+                        original_first_frame_p = float(getattr(args, "ltx2_first_frame_conditioning_p", 0.0))
                         try:
                             setattr(args, "ltx2_first_frame_conditioning_p", 0.0)
                             if args.motion_attention_preservation and motion_attention_modules:
                                 attn_recorder = _AttentionMapRecorder(
                                     motion_attention_modules,
-                                    max_queries=int(
-                                        getattr(args, "motion_attention_preservation_queries", 32)
-                                        or 32
-                                    ),
-                                    max_keys=int(
-                                        getattr(args, "motion_attention_preservation_keys", 64)
-                                        or 64
-                                    ),
+                                    max_queries=int(getattr(args, "motion_attention_preservation_queries", 32) or 32),
+                                    max_keys=int(getattr(args, "motion_attention_preservation_keys", 64) or 64),
                                     capture_grad=False,
-                                    keep_heads=bool(
-                                        getattr(args, "motion_attention_preservation_per_head", False)
-                                    ),
+                                    keep_heads=bool(getattr(args, "motion_attention_preservation_per_head", False)),
                                 )
                                 attn_recorder.__enter__()
                                 try:
@@ -4571,10 +4605,7 @@ def main() -> None:
                         finally:
                             setattr(args, "ltx2_first_frame_conditioning_p", original_first_frame_p)
 
-                        if (
-                            isinstance(motion_pred, dict)
-                            and not motion_pred.get("_skip_step")
-                        ):
+                        if isinstance(motion_pred, dict) and not motion_pred.get("_skip_step"):
                             student_video_pred = motion_pred["video_pred"]
                             motion_pres_loss_raw = _compute_motion_preservation_loss(
                                 args,
@@ -4584,9 +4615,7 @@ def main() -> None:
                                 dtype=trainer.dit_dtype,
                             )
                             motion_multiplier = float(args.motion_preservation_multiplier)
-                            motion_warmup = int(
-                                getattr(args, "motion_preservation_warmup_steps", 0) or 0
-                            )
+                            motion_warmup = int(getattr(args, "motion_preservation_warmup_steps", 0) or 0)
                             if motion_warmup > 0 and step < motion_warmup:
                                 motion_multiplier = motion_multiplier * (step / motion_warmup)
                             motion_pres_loss = motion_pres_loss_raw * motion_multiplier
@@ -4604,18 +4633,9 @@ def main() -> None:
                                     if isinstance(mapped, dict):
                                         teacher_attn_maps = mapped
 
-                            if (
-                                args.motion_attention_preservation
-                                and isinstance(teacher_attn_maps, dict)
-                                and student_attn_maps
-                            ):
-                                attn_temperature = float(
-                                    getattr(args, "motion_attention_preservation_temperature", 1.0)
-                                    or 1.0
-                                )
-                                symmetric_kl = bool(
-                                    getattr(args, "motion_attention_preservation_symmetric_kl", False)
-                                )
+                            if args.motion_attention_preservation and isinstance(teacher_attn_maps, dict) and student_attn_maps:
+                                attn_temperature = float(getattr(args, "motion_attention_preservation_temperature", 1.0) or 1.0)
+                                symmetric_kl = bool(getattr(args, "motion_attention_preservation_symmetric_kl", False))
                                 per_block_losses: list[torch.Tensor] = []
                                 for module_name, student_map in student_attn_maps.items():
                                     teacher_map = teacher_attn_maps.get(module_name)
@@ -4642,12 +4662,8 @@ def main() -> None:
                                         teacher_dist = teacher_dist.clamp_min(1e-8).pow(inv_temp)
                                     student_dist = student_dist.clamp_min(1e-6)
                                     teacher_dist = teacher_dist.clamp_min(1e-6)
-                                    student_dist = student_dist / student_dist.sum(
-                                        dim=-1, keepdim=True
-                                    ).clamp_min(1e-6)
-                                    teacher_dist = teacher_dist / teacher_dist.sum(
-                                        dim=-1, keepdim=True
-                                    ).clamp_min(1e-6)
+                                    student_dist = student_dist / student_dist.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+                                    teacher_dist = teacher_dist / teacher_dist.sum(dim=-1, keepdim=True).clamp_min(1e-6)
 
                                     if getattr(args, "motion_attention_preservation_loss", "kl") == "kl":
                                         kl_t2s = torch.nn.functional.kl_div(
@@ -4665,18 +4681,13 @@ def main() -> None:
                                         else:
                                             block_loss = kl_t2s
                                     else:
-                                        block_loss = torch.nn.functional.mse_loss(
-                                            student_dist, teacher_dist
-                                        )
+                                        block_loss = torch.nn.functional.mse_loss(student_dist, teacher_dist)
                                     per_block_losses.append(block_loss)
 
                                 if per_block_losses:
                                     attn_pres_loss_raw = torch.stack(per_block_losses).mean()
-                                    attn_pres_loss = (
-                                        attn_pres_loss_raw
-                                        * float(
-                                            getattr(args, "motion_attention_preservation_weight", 0.0)
-                                        )
+                                    attn_pres_loss = attn_pres_loss_raw * float(
+                                        getattr(args, "motion_attention_preservation_weight", 0.0)
                                     )
                                     motion_total_loss = motion_total_loss + attn_pres_loss
 
@@ -4759,19 +4770,34 @@ def main() -> None:
                         override_t = [float(fixed_t)] * bsz
                         try:
                             noisy_model_input, timesteps = trainer.get_noisy_model_input_and_timesteps(
-                                args, noise, latents_tensor, override_t,
-                                noise_scheduler, accelerator.device, trainer.dit_dtype,
+                                args,
+                                noise,
+                                latents_tensor,
+                                override_t,
+                                noise_scheduler,
+                                accelerator.device,
+                                trainer.dit_dtype,
                             )
                         except Exception as exc:
                             logger.warning("val/t%s: get_noisy failed: %s", fixed_t, exc)
                             break
                         weighting = compute_loss_weighting_for_sd3(
-                            args.weighting_scheme, noise_scheduler, timesteps,
-                            accelerator.device, trainer.dit_dtype,
+                            args.weighting_scheme,
+                            noise_scheduler,
+                            timesteps,
+                            accelerator.device,
+                            trainer.dit_dtype,
                         )
                         model_pred, target = trainer.call_dit(
-                            args, accelerator, transformer, latents_tensor, batch, noise,
-                            noisy_model_input, timesteps, trainer.dit_dtype,
+                            args,
+                            accelerator,
+                            transformer,
+                            latents_tensor,
+                            batch,
+                            noise,
+                            noisy_model_input,
+                            timesteps,
+                            trainer.dit_dtype,
                         )
                         _val_lt = getattr(args, "loss_type", "mse")
                         _val_hd = float(getattr(args, "huber_delta", 1.0))
@@ -4782,9 +4808,13 @@ def main() -> None:
                             v_tgt = model_pred["video_target"]
                             v_mask = model_pred.get("video_loss_mask")
                             v_loss = _masked_mse(
-                                v_pred, v_tgt, v_mask,
-                                weighting=weighting, dtype=trainer.dit_dtype,
-                                loss_type=_val_lt, huber_delta=_val_hd,
+                                v_pred,
+                                v_tgt,
+                                v_mask,
+                                weighting=weighting,
+                                dtype=trainer.dit_dtype,
+                                loss_type=_val_lt,
+                                huber_delta=_val_hd,
                             )
                             mt_video_losses.append(v_loss.item())
                             a_pred = model_pred.get("audio_pred")
@@ -4792,9 +4822,13 @@ def main() -> None:
                             if a_pred is not None and a_tgt is not None:
                                 a_mask = model_pred.get("audio_loss_mask")
                                 a_loss = _masked_mse(
-                                    a_pred, a_tgt, a_mask,
-                                    weighting=weighting, dtype=trainer.dit_dtype,
-                                    loss_type=_val_lt, huber_delta=_val_hd,
+                                    a_pred,
+                                    a_tgt,
+                                    a_mask,
+                                    weighting=weighting,
+                                    dtype=trainer.dit_dtype,
+                                    loss_type=_val_lt,
+                                    huber_delta=_val_hd,
                                 )
                                 mt_audio_losses.append(a_loss.item())
                                 v_w = float(model_pred.get("video_loss_weight", 1.0))
@@ -4812,7 +4846,10 @@ def main() -> None:
                                 per_el = torch.nn.functional.l1_loss(model_pred, target, reduction="none")
                             elif _val_lt in ("huber", "smooth_l1"):
                                 per_el = torch.nn.functional.smooth_l1_loss(
-                                    model_pred, target, reduction="none", beta=_val_hd,
+                                    model_pred,
+                                    target,
+                                    reduction="none",
+                                    beta=_val_hd,
                                 )
                             else:
                                 per_el = torch.nn.functional.mse_loss(model_pred, target, reduction="none")
@@ -4865,19 +4902,34 @@ def main() -> None:
                         noise = torch.randn_like(latents_tensor)
                         try:
                             noisy_model_input, timesteps = trainer.get_noisy_model_input_and_timesteps(
-                                args, noise, latents_tensor, batch.get("timesteps"),
-                                noise_scheduler, accelerator.device, trainer.dit_dtype,
+                                args,
+                                noise,
+                                latents_tensor,
+                                batch.get("timesteps"),
+                                noise_scheduler,
+                                accelerator.device,
+                                trainer.dit_dtype,
                             )
                         except Exception as exc:
                             logger.warning("val/%s: get_noisy failed: %s", cat_name, exc)
                             break
                         weighting = compute_loss_weighting_for_sd3(
-                            args.weighting_scheme, noise_scheduler, timesteps,
-                            accelerator.device, trainer.dit_dtype,
+                            args.weighting_scheme,
+                            noise_scheduler,
+                            timesteps,
+                            accelerator.device,
+                            trainer.dit_dtype,
                         )
                         model_pred, target = trainer.call_dit(
-                            args, accelerator, transformer, latents_tensor, batch, noise,
-                            noisy_model_input, timesteps, trainer.dit_dtype,
+                            args,
+                            accelerator,
+                            transformer,
+                            latents_tensor,
+                            batch,
+                            noise,
+                            noisy_model_input,
+                            timesteps,
+                            trainer.dit_dtype,
                         )
                         _val_lt = getattr(args, "loss_type", "mse")
                         _val_hd = float(getattr(args, "huber_delta", 1.0))
@@ -4888,9 +4940,13 @@ def main() -> None:
                             v_tgt = model_pred["video_target"]
                             v_mask = model_pred.get("video_loss_mask")
                             v_loss = _masked_mse(
-                                v_pred, v_tgt, v_mask,
-                                weighting=weighting, dtype=trainer.dit_dtype,
-                                loss_type=_val_lt, huber_delta=_val_hd,
+                                v_pred,
+                                v_tgt,
+                                v_mask,
+                                weighting=weighting,
+                                dtype=trainer.dit_dtype,
+                                loss_type=_val_lt,
+                                huber_delta=_val_hd,
                             )
                             c_video.append(v_loss.item())
                             a_pred = model_pred.get("audio_pred")
@@ -4898,9 +4954,13 @@ def main() -> None:
                             if a_pred is not None and a_tgt is not None:
                                 a_mask = model_pred.get("audio_loss_mask")
                                 a_loss = _masked_mse(
-                                    a_pred, a_tgt, a_mask,
-                                    weighting=weighting, dtype=trainer.dit_dtype,
-                                    loss_type=_val_lt, huber_delta=_val_hd,
+                                    a_pred,
+                                    a_tgt,
+                                    a_mask,
+                                    weighting=weighting,
+                                    dtype=trainer.dit_dtype,
+                                    loss_type=_val_lt,
+                                    huber_delta=_val_hd,
                                 )
                                 c_audio.append(a_loss.item())
                                 v_w = float(model_pred.get("video_loss_weight", 1.0))
@@ -4918,7 +4978,10 @@ def main() -> None:
                                 per_el = torch.nn.functional.l1_loss(model_pred, target, reduction="none")
                             elif _val_lt in ("huber", "smooth_l1"):
                                 per_el = torch.nn.functional.smooth_l1_loss(
-                                    model_pred, target, reduction="none", beta=_val_hd,
+                                    model_pred,
+                                    target,
+                                    reduction="none",
+                                    beta=_val_hd,
                                 )
                             else:
                                 per_el = torch.nn.functional.mse_loss(model_pred, target, reduction="none")
@@ -5063,9 +5126,7 @@ def main() -> None:
             blocks_to_swap=blocks_to_swap,
         )
         if not motion_attention_modules:
-            logger.warning(
-                "motion_attention_preservation requested but no matching attn1 modules were found; disabling it."
-            )
+            logger.warning("motion_attention_preservation requested but no matching attn1 modules were found; disabling it.")
             args.motion_attention_preservation = False
         else:
             logger.info(
@@ -5161,11 +5222,14 @@ def main() -> None:
             logger.warning("EWC requested but statistics were not built; disabling EWC loss.")
 
     weight_drift_state: Optional[dict[str, Any]] = _build_weight_drift_state(args, transformer)
-    grad_norm_state: Optional[dict[str, Any]] = _register_grad_norm_hooks(
-        args, accelerator.unwrap_model(transformer)
-    )
+    grad_norm_state: Optional[dict[str, Any]] = _register_grad_norm_hooks(args, accelerator.unwrap_model(transformer))
     output_drift_state: Optional[dict[str, Any]] = _build_output_drift_state(
-        args, trainer, transformer, val_dataloader, noise_scheduler, accelerator,
+        args,
+        trainer,
+        transformer,
+        val_dataloader,
+        noise_scheduler,
+        accelerator,
     )
 
     audio_loss_balance_mode = str(getattr(args, "audio_loss_balance_mode", "none") or "none").lower()
@@ -5192,9 +5256,7 @@ def main() -> None:
         uncertainty_log_var_audio = torch.nn.Parameter(torch.zeros(1, device=device_for_uncert))
         uncertainty_lr = float(getattr(args, "uncertainty_lr", None) or args.learning_rate)
         try:
-            optimizer.add_param_group(
-                {"params": [uncertainty_log_var_video, uncertainty_log_var_audio], "lr": uncertainty_lr}
-            )
+            optimizer.add_param_group({"params": [uncertainty_log_var_video, uncertainty_log_var_audio], "lr": uncertainty_lr})
             logger.info(
                 "Uncertainty weighting enabled: 2 learnable log-variance params added to optimizer, lr=%g",
                 uncertainty_lr,
@@ -5229,6 +5291,9 @@ def main() -> None:
         metadata["ss_epoch"] = str(epoch + 1)
         transformer.train()
         for step, batch in enumerate(train_dataloader):
+            if handle_dashboard_stop_request(global_step, epoch, step):
+                return
+
             with accelerator.accumulate(transformer):
                 motion_micro_step += 1
                 batch = _normalize_ltx2_batch_for_call_dit(batch)
@@ -5325,8 +5390,10 @@ def main() -> None:
                         and uncertainty_log_var_audio is not None
                     ):
                         loss = compute_uncertainty_weighted_loss(
-                            video_loss, audio_loss,
-                            uncertainty_log_var_video, uncertainty_log_var_audio,
+                            video_loss,
+                            audio_loss,
+                            uncertainty_log_var_video,
+                            uncertainty_log_var_audio,
                         )
                         if (global_step % 50) == 0:
                             logger.info(
@@ -5382,7 +5449,9 @@ def main() -> None:
                                 if (global_step % 50) == 0:
                                     logger.info(
                                         "[inv_freq step %d] audio_presence_ema=%.4f audio_weight=%.4f",
-                                        global_step, audio_presence_ema, audio_weight,
+                                        global_step,
+                                        audio_presence_ema,
+                                        audio_weight,
                                     )
                             elif audio_loss_balance_mode == "ema_mag":
                                 audio_loss_item = max(float(audio_loss.detach().item()), 1e-12)
@@ -5402,7 +5471,10 @@ def main() -> None:
                                 if (global_step % 50) == 0:
                                     logger.info(
                                         "[ema_mag step %d] v_ema=%.4f a_ema=%.4f audio_weight=%.4f",
-                                        global_step, video_loss_ema, audio_loss_ema, audio_weight,
+                                        global_step,
+                                        video_loss_ema,
+                                        audio_loss_ema,
+                                        audio_weight,
                                     )
                             loss = loss + audio_loss * audio_weight
                 else:
@@ -5463,7 +5535,7 @@ def main() -> None:
                 pending_motion_route_context = None
                 motion_preservation_prob = getattr(args, "motion_preservation_probability", None)
                 if motion_preservation_prob is None:
-                    should_apply_motion_replay = (motion_micro_step % int(args.motion_preservation_interval) == 0)
+                    should_apply_motion_replay = motion_micro_step % int(args.motion_preservation_interval) == 0
                 else:
                     should_apply_motion_replay = random.random() < float(motion_preservation_prob)
                 if ewc_state is not None and float(getattr(args, "ewc_lambda", 0.0) or 0.0) > 0.0:
@@ -5485,11 +5557,7 @@ def main() -> None:
                     and separate_motion_backward
                     and (
                         _image_prior_ft_routing_active(image_prior_ft_route_state)
-                        or (
-                            args.motion_preservation
-                            and motion_anchor_cache
-                            and should_apply_motion_replay
-                        )
+                        or (args.motion_preservation and motion_anchor_cache and should_apply_motion_replay)
                     )
                 )
                 if fused_step_state is not None:
@@ -5499,23 +5567,13 @@ def main() -> None:
                     # Backprop task loss first so replay graph does not overlap it in memory.
                     image_prior_ft_task_grad_snapshot = _image_prior_ft_snapshot_task_route_grads(image_prior_ft_route_state)
                     accelerator.backward(loss)
-                    image_prior_ft_task_grads_restored = _image_prior_ft_restore_task_route_grads(
-                        image_prior_ft_task_grad_snapshot
-                    )
+                    image_prior_ft_task_grads_restored = _image_prior_ft_restore_task_route_grads(image_prior_ft_task_grad_snapshot)
                     total_loss_for_logging = loss.detach()
-                if (
-                    args.motion_preservation
-                    and motion_anchor_cache
-                    and should_apply_motion_replay
-                ):
+                if args.motion_preservation and motion_anchor_cache and should_apply_motion_replay:
                     anchor = random.choice(motion_anchor_cache)
-                    anchor_latents = _move_to_device(
-                        anchor["anchor_latents"], accelerator.device, dtype=trainer.dit_dtype
-                    )
+                    anchor_latents = _move_to_device(anchor["anchor_latents"], accelerator.device, dtype=trainer.dit_dtype)
                     replay_anchor_frames = int(anchor_latents.shape[2]) if anchor_latents.dim() >= 3 else None
-                    anchor_noise = _move_to_device(
-                        anchor["anchor_noise"], accelerator.device, dtype=trainer.dit_dtype
-                    )
+                    anchor_noise = _move_to_device(anchor["anchor_noise"], accelerator.device, dtype=trainer.dit_dtype)
                     sigma_idx: Optional[int] = None
                     anchor_sigmas = anchor.get("anchor_sigmas") or []
                     teacher_video_preds = anchor.get("teacher_video_preds")
@@ -5538,9 +5596,7 @@ def main() -> None:
                         anchor_noisy_input = _move_to_device(
                             anchor["anchor_noisy_input"], accelerator.device, dtype=trainer.dit_dtype
                         )
-                        anchor_model_timesteps = _move_to_device(
-                            anchor["anchor_model_timesteps"], accelerator.device
-                        )
+                        anchor_model_timesteps = _move_to_device(anchor["anchor_model_timesteps"], accelerator.device)
                         if isinstance(anchor_model_timesteps, torch.Tensor) and anchor_model_timesteps.numel() > 0:
                             replay_sigma_value = float(anchor_model_timesteps.view(-1)[0].detach().float().item() / 1000.0)
                         teacher_video_pred = anchor.get("teacher_video_pred")
@@ -5549,9 +5605,7 @@ def main() -> None:
                                 "Motion replay: teacher_video_pred is %s instead of Tensor, skipping replay this step",
                                 type(teacher_video_pred).__name__,
                             )
-                    anchor_batch = _move_to_device(
-                        anchor["anchor_batch"], accelerator.device, dtype=trainer.dit_dtype
-                    )
+                    anchor_batch = _move_to_device(anchor["anchor_batch"], accelerator.device, dtype=trainer.dit_dtype)
 
                     original_first_frame_p = float(getattr(args, "ltx2_first_frame_conditioning_p", 0.0))
                     # Force first-frame conditioning probability to 0 during motion replay so that
@@ -5561,9 +5615,7 @@ def main() -> None:
                     # preservation loss signal.
                     setattr(args, "ltx2_first_frame_conditioning_p", 0.0)
                     try:
-                        pending_motion_route_context = _image_prior_ft_route_context(
-                            image_prior_ft_route_state, "motion"
-                        )
+                        pending_motion_route_context = _image_prior_ft_route_context(image_prior_ft_route_state, "motion")
                         pending_motion_route_context.__enter__()
                         if args.motion_attention_preservation and motion_attention_modules:
                             attn_recorder = _AttentionMapRecorder(
@@ -5619,7 +5671,11 @@ def main() -> None:
                     finally:
                         setattr(args, "ltx2_first_frame_conditioning_p", original_first_frame_p)
 
-                    if isinstance(motion_pred, dict) and not motion_pred.get("_skip_step") and isinstance(teacher_video_pred, torch.Tensor):
+                    if (
+                        isinstance(motion_pred, dict)
+                        and not motion_pred.get("_skip_step")
+                        and isinstance(teacher_video_pred, torch.Tensor)
+                    ):
                         student_video_pred = motion_pred["video_pred"]
                         motion_pres_loss_raw = _compute_motion_preservation_loss(
                             args,
@@ -5646,17 +5702,9 @@ def main() -> None:
                                 mapped = teacher_attn_maps_multi[0]
                                 if isinstance(mapped, dict):
                                     teacher_attn_maps = mapped
-                        if (
-                            args.motion_attention_preservation
-                            and isinstance(teacher_attn_maps, dict)
-                            and student_attn_maps
-                        ):
-                            attn_temperature = float(
-                                getattr(args, "motion_attention_preservation_temperature", 1.0) or 1.0
-                            )
-                            symmetric_kl = bool(
-                                getattr(args, "motion_attention_preservation_symmetric_kl", False)
-                            )
+                        if args.motion_attention_preservation and isinstance(teacher_attn_maps, dict) and student_attn_maps:
+                            attn_temperature = float(getattr(args, "motion_attention_preservation_temperature", 1.0) or 1.0)
+                            symmetric_kl = bool(getattr(args, "motion_attention_preservation_symmetric_kl", False))
                             per_block_losses: list[torch.Tensor] = []
                             for module_name, student_map in student_attn_maps.items():
                                 teacher_map = teacher_attn_maps.get(module_name)
@@ -5665,14 +5713,14 @@ def main() -> None:
                                 if teacher_map.shape != student_map.shape:
                                     logger.warning(
                                         "Motion preservation: attention map shape mismatch for module %s (student=%s teacher=%s), skipping",
-                                        module_name, student_map.shape, teacher_map.shape,
+                                        module_name,
+                                        student_map.shape,
+                                        teacher_map.shape,
                                     )
                                     continue
 
                                 student_dist = student_map.to(torch.float32)
-                                teacher_dist = teacher_map.to(
-                                    device=student_dist.device, dtype=torch.float32, non_blocking=True
-                                )
+                                teacher_dist = teacher_map.to(device=student_dist.device, dtype=torch.float32, non_blocking=True)
                                 if attn_temperature != 1.0:
                                     inv_temp = 1.0 / max(1e-6, attn_temperature)
                                     student_dist = student_dist.clamp_min(1e-8).pow(inv_temp)
@@ -5703,17 +5751,14 @@ def main() -> None:
 
                             if per_block_losses:
                                 attn_pres_loss_raw = torch.stack(per_block_losses).mean()
-                                attn_pres_loss = (
-                                    attn_pres_loss_raw
-                                    * float(getattr(args, "motion_attention_preservation_weight", 0.0))
+                                attn_pres_loss = attn_pres_loss_raw * float(
+                                    getattr(args, "motion_attention_preservation_weight", 0.0)
                                 )
                                 motion_total_loss = motion_total_loss + attn_pres_loss
 
                 if motion_total_loss is not None and isinstance(loss, torch.Tensor):
                     base_task_abs = loss.detach().to(torch.float32).abs().clamp_min(1e-8)
-                    motion_to_task_ratio = (
-                        motion_total_loss.detach().to(torch.float32).abs() / base_task_abs
-                    ).item()
+                    motion_to_task_ratio = (motion_total_loss.detach().to(torch.float32).abs() / base_task_abs).item()
 
                 if separate_motion_backward:
                     if motion_total_loss is not None:
@@ -5749,8 +5794,10 @@ def main() -> None:
                             optimizer=optimizer,
                         )
                     optimizer.step()
-                    if accelerator.sync_gradients and ltx2_remote_stage and bool(
-                        getattr(args, "ltx2_remote_stage_trainable", False)
+                    if (
+                        accelerator.sync_gradients
+                        and ltx2_remote_stage
+                        and bool(getattr(args, "ltx2_remote_stage_trainable", False))
                     ):
                         optimizer_step_ltx2_remote_stage(transformer)
                     did_optimizer_step = bool(accelerator.sync_gradients)
@@ -5775,9 +5822,7 @@ def main() -> None:
                                 ltx2_model_parallel=ltx2_model_parallel,
                             )
                             did_fused_step = hook_stepped or pending_steps > 0
-                        if did_fused_step and ltx2_remote_stage and bool(
-                            getattr(args, "ltx2_remote_stage_trainable", False)
-                        ):
+                        if did_fused_step and ltx2_remote_stage and bool(getattr(args, "ltx2_remote_stage_trainable", False)):
                             optimizer_step_ltx2_remote_stage(transformer)
                         optimizer.zero_grad(set_to_none=True)
                         if ltx2_remote_stage and bool(getattr(args, "ltx2_remote_stage_trainable", False)):
@@ -5808,17 +5853,13 @@ def main() -> None:
                 if bool(getattr(args, "image_prior_ft", False)):
                     logs["image_prior_ft/image_only"] = 1.0
                     logs["image_prior_ft/task_motion_blocked"] = float(
-                        image_prior_ft_route_state is not None
-                        and image_prior_ft_route_state.get("task_route") == "appearance"
+                        image_prior_ft_route_state is not None and image_prior_ft_route_state.get("task_route") == "appearance"
                     )
                     logs["image_prior_ft/motion_appearance_blocked"] = float(
-                        image_prior_ft_route_state is not None
-                        and image_prior_ft_route_state.get("motion_route") == "motion"
+                        image_prior_ft_route_state is not None and image_prior_ft_route_state.get("motion_route") == "motion"
                     )
                     logs["image_prior_ft/task_grads_restored"] = float(image_prior_ft_task_grads_restored)
-                logs["motion/apply"] = float(
-                    bool(args.motion_preservation and motion_anchor_cache and should_apply_motion_replay)
-                )
+                logs["motion/apply"] = float(bool(args.motion_preservation and motion_anchor_cache and should_apply_motion_replay))
                 lr_scales = ft_group_stats.get("lr_scales", [])
                 for i, param_group in enumerate(optimizer.param_groups):
                     lr_value = param_group.get("lr", current_lr)
@@ -5889,9 +5930,16 @@ def main() -> None:
                 if output_drift_state is not None:
                     _interval = int(output_drift_state.get("interval", 0) or 0)
                     if _interval > 0 and global_step > 0 and global_step % _interval == 0:
-                        logs.update(_compute_output_drift_logs(
-                            output_drift_state, trainer, transformer, args, noise_scheduler, accelerator,
-                        ))
+                        logs.update(
+                            _compute_output_drift_logs(
+                                output_drift_state,
+                                trainer,
+                                transformer,
+                                args,
+                                noise_scheduler,
+                                accelerator,
+                            )
+                        )
                 progress_logs: dict[str, Any] = {
                     "loss": logs.get("loss"),
                     "lr": logs.get("lr"),
@@ -5934,10 +5982,14 @@ def main() -> None:
                         remove_model(train_utils.get_step_ckpt_name(args.output_name, remove_step_no))
                         # Also remove old EMA checkpoint if exists
                         if ema_model is not None:
-                            old_ema_name = train_utils.get_step_ckpt_name(args.output_name, remove_step_no).replace(".safetensors", "_ema.safetensors")
+                            old_ema_name = train_utils.get_step_ckpt_name(args.output_name, remove_step_no).replace(
+                                ".safetensors", "_ema.safetensors"
+                            )
                             remove_model(old_ema_name)
                     if args.save_state:
-                        train_utils.save_and_remove_state_stepwise(args, accelerator, global_step)
+                        train_utils.save_and_remove_state_stepwise(
+                            args, accelerator, global_step, epoch=epoch + 1, step_in_epoch=step + 1
+                        )
                         save_ema_state()
                         save_self_flow_state()
                     clean_memory_on_device(accelerator.device)
@@ -5947,6 +5999,8 @@ def main() -> None:
 
                 if global_step >= args.max_train_steps:
                     break
+                if handle_dashboard_stop_request(global_step, epoch, step + 1):
+                    return
 
         # Run validation at epoch end
         if should_validate(global_step, epoch, is_epoch_end=True):
@@ -5975,7 +6029,9 @@ def main() -> None:
             if remove_epoch_no is not None:
                 remove_model(train_utils.get_epoch_ckpt_name(args.output_name, remove_epoch_no))
             if args.save_state:
-                train_utils.save_and_remove_state_on_epoch_end(args, accelerator, epoch + 1)
+                train_utils.save_and_remove_state_on_epoch_end(
+                    args, accelerator, epoch + 1, global_step=global_step, step_in_epoch=0
+                )
                 save_ema_state()
                 save_self_flow_state()
             clean_memory_on_device(accelerator.device)
@@ -5995,7 +6051,7 @@ def main() -> None:
         run_validation_with_optimizer_offload(global_step, num_train_epochs)
 
     if accelerator.is_main_process and (args.save_state or args.save_state_on_train_end):
-        train_utils.save_state_on_train_end(args, accelerator)
+        train_utils.save_state_on_train_end(args, accelerator, global_step=global_step, epoch=num_train_epochs, step_in_epoch=0)
         save_ema_state()
         save_self_flow_state()
 

@@ -27,10 +27,20 @@ from musubi_tuner.gui_dashboard.command_builder import (
 from musubi_tuner.gui_dashboard.process_manager import ProcessManager
 from musubi_tuner.gui_dashboard.project_schema import ProjectConfig
 from musubi_tuner.gui_dashboard.validation import validate_process_config
+from musubi_tuner.utils import train_utils
 
 router = APIRouter(tags=["processes"])
 
-VALID_TYPES = ("cache_latents", "cache_text", "cache_dino", "training", "remote_stage_launcher", "remote_stage_server", "inference", "slider_training")
+VALID_TYPES = (
+    "cache_latents",
+    "cache_text",
+    "cache_dino",
+    "training",
+    "remote_stage_launcher",
+    "remote_stage_server",
+    "inference",
+    "slider_training",
+)
 
 
 def _get_pm(request: Request) -> ProcessManager:
@@ -109,9 +119,17 @@ def _has_local_autoresume_state(config: ProjectConfig) -> bool:
     if run_dir is None or not run_dir.is_dir():
         return False
 
-    for path in run_dir.iterdir():
-        if path.is_dir() and path.name.endswith("-state") and (path / "scheduler.bin").exists():
-            return True
+    try:
+        state_paths = list(run_dir.iterdir())
+    except OSError:
+        return False
+
+    for path in state_paths:
+        try:
+            if path.name.endswith("-state") and train_utils.is_complete_state_dir(str(path)):
+                return True
+        except OSError:
+            continue
     return False
 
 

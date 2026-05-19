@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import locale
@@ -9,14 +10,26 @@ import re
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
+import time
 from collections import deque
 from enum import Enum
+from pathlib import Path
 from typing import Literal, Optional
 
 logger = logging.getLogger(__name__)
 
-ProcessType = Literal["cache_latents", "cache_text", "cache_dino", "training", "remote_stage_launcher", "remote_stage_server", "inference", "slider_training"]
+ProcessType = Literal[
+    "cache_latents",
+    "cache_text",
+    "cache_dino",
+    "training",
+    "remote_stage_launcher",
+    "remote_stage_server",
+    "inference",
+    "slider_training",
+]
 ProcessRef = tuple[int, float | None]
 
 # Windows-specific flags for clean subprocess shutdown
@@ -143,7 +156,7 @@ def _decode_output(data: bytes) -> str:
     return data.decode("utf-8", errors="replace")
 
 
-_LINE_BREAK_RE = re.compile(br"[\r\n]+")
+_LINE_BREAK_RE = re.compile(rb"[\r\n]+")
 
 
 _TQDM_PROGRESS_RE = re.compile(
@@ -268,10 +281,17 @@ class ProcessState(str, Enum):
 class ManagedProcess:
     """Wraps a subprocess with state tracking and log buffering."""
 
-    def __init__(self, cmd: list[str], cwd: Optional[str] = None, env: Optional[dict[str, str]] = None):
+    def __init__(
+        self,
+        cmd: list[str],
+        cwd: Optional[str] = None,
+        env: Optional[dict[str, str]] = None,
+        proc_type: Optional[str] = None,
+    ):
         self.cmd = cmd
         self.cwd = cwd
         self.env = env
+        self.proc_type = proc_type
         self.state = ProcessState.IDLE
         self.exit_code: Optional[int] = None
         self.logs: deque[str] = deque(maxlen=5000)
@@ -279,6 +299,10 @@ class ManagedProcess:
         self._reader_thread: Optional[threading.Thread] = None
         self._lock = threading.Lock()
         self._last_progress_signature: tuple[str, str, int] | None = None
+        self._graceful_stop_requested = False
+        self._stop_requested = False
+        self._stop_file: Optional[Path] = None
+        self._force_kill_delay_seconds = _STOP_GRACE_SECONDS
         self._stop_process_refs: list[ProcessRef] = []
 
     def start(self):
@@ -291,6 +315,9 @@ class ManagedProcess:
             self.logs.clear()
             self.logs.append(f"$ {' '.join(self.cmd)}\n")
             self._last_progress_signature = None
+            self._graceful_stop_requested = False
+            self._stop_requested = False
+            self._force_kill_delay_seconds = _STOP_GRACE_SECONDS
             self._stop_process_refs = []
 
             self._proc = subprocess.Popen(
@@ -304,10 +331,24 @@ class ManagedProcess:
                 bufsize=0,
             )
 
-            self._reader_thread = threading.Thread(
-                target=self._read_output, daemon=True
-            )
+            self._reader_thread = threading.Thread(target=self._read_output, daemon=True)
             self._reader_thread.start()
+
+    def _supports_graceful_stop(self) -> bool:
+        return self.proc_type in {"training", "slider_training"}
+
+    def _request_graceful_training_stop(self) -> bool:
+        if not self._supports_graceful_stop() or not self._stop_file:
+            return False
+        try:
+            self._stop_file.parent.mkdir(parents=True, exist_ok=True)
+            self._stop_file.write_text(json.dumps({"mode": "graceful", "time": time.time()}), encoding="utf-8")
+            self._graceful_stop_requested = True
+            self.logs.append("\n[Graceful training stop requested. Waiting for interrupt state save...]\n")
+            return True
+        except OSError as exc:
+            self.logs.append(f"\n[Failed to request graceful training stop: {exc}. Sending interrupt instead.]\n")
+            return False
 
     def _finalize_process_state(self):
         with self._lock:
@@ -370,10 +411,21 @@ class ManagedProcess:
     def terminate(self):
         with self._lock:
             if self.state == ProcessState.STOPPING:
+                self._stop_requested = True
                 process_refs = list(self._stop_process_refs)
-                self.logs.append("\n[Force stop requested...]\n")
+                if self._graceful_stop_requested:
+                    self.logs.append("\n[Force stop requested. Skipping graceful final save...]\n")
+                    if self._stop_file:
+                        try:
+                            self._stop_file.parent.mkdir(parents=True, exist_ok=True)
+                            self._stop_file.write_text(json.dumps({"mode": "force", "time": time.time()}), encoding="utf-8")
+                        except OSError:
+                            pass
+                else:
+                    self.logs.append("\n[Force stop requested...]\n")
             elif self.state == ProcessState.RUNNING:
                 self.state = ProcessState.STOPPING
+                self._stop_requested = True
                 self.logs.append("\n[Stopping process...]\n")
                 process_refs = []
             else:
@@ -382,10 +434,22 @@ class ManagedProcess:
         if not self._proc:
             return
 
-        if not process_refs:
+        force_stop = self._graceful_stop_requested
+        if force_stop:
+            process_refs = _dedupe_process_refs(process_refs + _collect_process_tree_refs(self._proc.pid))
+            self._force_kill_delay_seconds = 0
+            with self._lock:
+                self._stop_process_refs = list(process_refs)
+        elif not process_refs:
             process_refs = _collect_process_tree_refs(self._proc.pid)
             with self._lock:
                 self._stop_process_refs = list(process_refs)
+
+            if self._request_graceful_training_stop():
+                self._force_kill_delay_seconds = 600
+                t = threading.Thread(target=self._force_kill, args=(process_refs,), daemon=True)
+                t.start()
+                return
 
             if sys.platform == "win32":
                 try:
@@ -404,7 +468,7 @@ class ManagedProcess:
     def _force_kill(self, process_refs: list[ProcessRef]):
         if self._proc:
             try:
-                self._proc.wait(timeout=_STOP_GRACE_SECONDS)
+                self._proc.wait(timeout=self._force_kill_delay_seconds)
             except subprocess.TimeoutExpired:
                 self.logs.append("\n[Force killing process tree...]\n")
                 _kill_process_refs(_dedupe_process_refs(process_refs + _collect_process_tree_refs(self._proc.pid)))
@@ -425,6 +489,7 @@ class ManagedProcess:
         return {
             "state": self.state.value,
             "exit_code": self.exit_code,
+            "stop_requested": self._stop_requested,
         }
 
     def get_logs(self, last_n: Optional[int] = None) -> list[str]:
@@ -457,8 +522,16 @@ class ProcessManager:
             env["PYTHONUNBUFFERED"] = "1"
             if proc_type in ("training", "slider_training"):
                 env["MUSUBI_DASHBOARD_METRICS"] = "1"
+                stop_file = Path(tempfile.gettempdir()) / f"musubi_dashboard_stop_{os.getpid()}_{proc_type}.flag"
+                try:
+                    stop_file.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                env["MUSUBI_DASHBOARD_STOP_FILE"] = str(stop_file)
 
-            mp = ManagedProcess(cmd, cwd=cwd, env=env)
+            mp = ManagedProcess(cmd, cwd=cwd, env=env, proc_type=proc_type)
+            if proc_type in ("training", "slider_training"):
+                mp._stop_file = Path(env["MUSUBI_DASHBOARD_STOP_FILE"])
             self._processes[proc_type] = mp
 
         mp.start()
@@ -474,7 +547,7 @@ class ProcessManager:
     def get_status(self, proc_type: ProcessType) -> dict:
         mp = self._processes.get(proc_type)
         if not mp:
-            return {"state": ProcessState.IDLE.value, "exit_code": None}
+            return {"state": ProcessState.IDLE.value, "exit_code": None, "stop_requested": False}
         return mp.get_status()
 
     def get_logs(self, proc_type: ProcessType, last_n: Optional[int] = None) -> list[str]:
@@ -485,6 +558,15 @@ class ProcessManager:
 
     def get_all_statuses(self) -> dict[str, dict]:
         result = {}
-        for pt in ("cache_latents", "cache_text", "cache_dino", "training", "remote_stage_launcher", "remote_stage_server", "inference", "slider_training"):
+        for pt in (
+            "cache_latents",
+            "cache_text",
+            "cache_dino",
+            "training",
+            "remote_stage_launcher",
+            "remote_stage_server",
+            "inference",
+            "slider_training",
+        ):
             result[pt] = self.get_status(pt)
         return result
