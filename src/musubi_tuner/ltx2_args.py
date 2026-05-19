@@ -9,7 +9,11 @@ from musubi_tuner.hv_train_network import read_config_from_file, setup_parser_co
 from musubi_tuner.ltx_2.env import apply_ltx2_tweaks
 from musubi_tuner.ltx2_model_parallel import add_ltx2_model_parallel_args
 from musubi_tuner.ltx2_remote_stage import add_ltx2_remote_stage_args
-from musubi_tuner.ltx2_lycoris_runtime import apply_lycoris_preset_before_network_creation, is_lycoris_requested, process_lycoris_config
+from musubi_tuner.ltx2_lycoris_runtime import (
+    apply_lycoris_preset_before_network_creation,
+    is_lycoris_requested,
+    process_lycoris_config,
+)
 from musubi_tuner.ltx2_train_network import IC_LORA_STRATEGIES
 from musubi_tuner.model_defaults import default_gemma_root_path, default_ltx2_checkpoint_path
 
@@ -80,7 +84,8 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
     )
 
     parser.add_argument(
-        "--ltx2_mode", "--ltx_mode",
+        "--ltx2_mode",
+        "--ltx_mode",
         dest="ltx_mode",
         type=str,
         default="v",
@@ -119,10 +124,7 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         type=str,
         default=None,
         choices=["none", "all", "self", "cross", "text_cross", "av_cross", "video", "audio"],
-        help=(
-            "Enable split attention for selected modules. "
-            "Targets: none/all/self/cross/text_cross/av_cross/video/audio."
-        ),
+        help=("Enable split attention for selected modules. Targets: none/all/self/cross/text_cross/av_cross/video/audio."),
     )
     parser.add_argument(
         "--split_attn_mode",
@@ -154,8 +156,20 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         "--lora_target_preset",
         type=str,
         default="t2v",
-            choices=["t2v", "v2v", "video_sa", "video_sa_ff", "video_sa_ca_ff",
-                 "audio", "audio_v2a", "audio_ref_ic", "av_ic", "video_ref_only_av", "full", "lycoris"],
+        choices=[
+            "t2v",
+            "v2v",
+            "video_sa",
+            "video_sa_ff",
+            "video_sa_ca_ff",
+            "audio",
+            "audio_v2a",
+            "audio_ref_ic",
+            "av_ic",
+            "video_ref_only_av",
+            "full",
+            "lycoris",
+        ],
         help=(
             "LoRA target preset: "
             "'t2v' = text-to-video (all attention, default), "
@@ -513,21 +527,21 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         type=float,
         default=None,
         help="Learning rate for uncertainty weighting log-variance parameters. "
-             "Defaults to --learning_rate. Only used with --audio_loss_balance_mode=uncertainty.",
+        "Defaults to --learning_rate. Only used with --audio_loss_balance_mode=uncertainty.",
     )
     parser.add_argument(
         "--ogm_ge_alpha",
         type=float,
         default=0.3,
         help="OGM-GE modulation strength. Higher values attenuate the dominant modality more strongly. "
-             "Only used with --audio_loss_balance_mode=ogm_ge.",
+        "Only used with --audio_loss_balance_mode=ogm_ge.",
     )
     parser.add_argument(
         "--ogm_ge_noise_std",
         type=float,
         default=0.0,
         help="Optional GE gradient-noise scale for OGM-GE. 0 disables noise injection. "
-             "Only used with --audio_loss_balance_mode=ogm_ge.",
+        "Only used with --audio_loss_balance_mode=ogm_ge.",
     )
     parser.add_argument(
         "--independent_audio_timestep",
@@ -665,8 +679,7 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         type=str,
         default=None,
         help=(
-            "Path to LyCORIS TOML configuration file. "
-            "Use this for module-level algorithm settings without bundled example files."
+            "Path to LyCORIS TOML configuration file. Use this for module-level algorithm settings without bundled example files."
         ),
     )
     parser.add_argument(
@@ -957,19 +970,13 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         "--sample_stage1_distilled_lora_multiplier",
         type=float,
         default=None,
-        help=(
-            "Optional distilled LoRA multiplier for two-stage stage 1. "
-            "If omitted, res_2s two-stage uses 0.25; Euler uses 0.0."
-        ),
+        help=("Optional distilled LoRA multiplier for two-stage stage 1. If omitted, res_2s two-stage uses 0.25; Euler uses 0.0."),
     )
     parser.add_argument(
         "--sample_stage2_distilled_lora_multiplier",
         type=float,
         default=None,
-        help=(
-            "Optional distilled LoRA multiplier for two-stage stage 2. "
-            "If omitted, res_2s two-stage uses 0.5; Euler uses 1.0."
-        ),
+        help=("Optional distilled LoRA multiplier for two-stage stage 2. If omitted, res_2s two-stage uses 0.5; Euler uses 1.0."),
     )
 
     parser.add_argument(
@@ -1011,7 +1018,7 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         type=int,
         default=-1,
         help="Number of blocks to checkpoint. -1 = all (default), 0 = none, N = last N blocks. "
-             "Use with --blockwise_checkpointing to trade VRAM for speed on 12-16GB cards.",
+        "Use with --blockwise_checkpointing to trade VRAM for speed on 12-16GB cards.",
     )
     parser.add_argument(
         "--no_convert_to_comfy",
@@ -1019,14 +1026,14 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         dest="convert_to_comfy",
         default=True,
         help="Disable automatic conversion of saved LoRA to ComfyUI format. "
-             "By default, both original and ComfyUI checkpoints are saved.",
+        "By default, both original and ComfyUI checkpoints are saved.",
     )
     parser.add_argument(
         "--save_original_lora",
         action="store_true",
         default=True,
         help="(Default: True) Keep the original non-Comfy LoRA alongside the ComfyUI-converted checkpoint. "
-             "Use --no_save_original_lora to disable.",
+        "Use --no_save_original_lora to disable.",
     )
     parser.add_argument(
         "--no_save_original_lora",
@@ -1073,20 +1080,20 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         "--use_precached_preservation",
         action="store_true",
         help="Load preservation embeddings from precached .pt file instead of loading Gemma. "
-             "Run ltx2_cache_text_encoder_outputs.py with --precache_preservation_prompts first.",
+        "Run ltx2_cache_text_encoder_outputs.py with --precache_preservation_prompts first.",
     )
     parser.add_argument(
         "--preservation_prompts_cache",
         type=str,
         default=None,
         help="Path to precached preservation prompt embeddings (.pt). "
-             "Defaults to <cache_directory>/ltx2_preservation_cache.pt. Requires --use_precached_preservation.",
+        "Defaults to <cache_directory>/ltx2_preservation_cache.pt. Requires --use_precached_preservation.",
     )
     parser.add_argument(
         "--audio_dop",
         action="store_true",
         help="Audio DOP: preserve base model audio predictions on non-audio batches. "
-             "Only active in AV mode (--ltx2_mode av). Adds +2 forwards and +1 backward on non-audio steps.",
+        "Only active in AV mode (--ltx2_mode av). Adds +2 forwards and +1 backward on non-audio steps.",
     )
     parser.add_argument(
         "--audio_dop_args",
@@ -1124,14 +1131,14 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         "--audio_metrics",
         action="store_true",
         help="Enable audio quality metrics logging. Tier 1 (latent-space) runs every step at ~0 cost. "
-             "Tier 2 (mel-space) and Tier 3 (embedding-space) are opt-in via --audio_metrics_args.",
+        "Tier 2 (mel-space) and Tier 3 (embedding-space) are opt-in via --audio_metrics_args.",
     )
     parser.add_argument(
         "--audio_metrics_args",
         type=str,
         nargs="*",
         help="Key=value args for audio metrics, e.g. mel_metrics=true fad=true clap_similarity=true "
-             "latent_fd_compute_every=50 mel_compute_every=100",
+        "latent_fd_compute_every=50 mel_compute_every=100",
     )
 
     # -- CREPA (Cross-frame Representation Alignment) --
@@ -1139,21 +1146,21 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         "--crepa",
         action="store_true",
         help="Enable CREPA temporal consistency regularization (arxiv 2506.09229). "
-             "Aligns DiT hidden states across video frames via a small projector MLP.",
+        "Aligns DiT hidden states across video frames via a small projector MLP.",
     )
     parser.add_argument(
         "--crepa_args",
         type=str,
         nargs="*",
         help="Key=value args for CREPA, e.g. student_block_idx=16 teacher_block_idx=32 "
-             "lambda_crepa=0.1 tau=1.0 num_neighbors=2 schedule=constant normalize=true",
+        "lambda_crepa=0.1 tau=1.0 num_neighbors=2 schedule=constant normalize=true",
     )
     parser.add_argument(
         "--self_flow",
         action="store_true",
         help="Enable Self-Flow regularization (dual-timestep noising + EMA-teacher feature alignment). "
-             "Supported for --ltx_mode video and --ltx_mode av (video branch only in av). "
-             "Single-frame image-like samples are supported via --ltx_mode video.",
+        "Supported for --ltx_mode video and --ltx_mode av (video branch only in av). "
+        "Single-frame image-like samples are supported via --ltx_mode video.",
     )
     parser.add_argument(
         "--self_flow_args",
@@ -1183,10 +1190,7 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         "--latent_temporal_weighting_args",
         type=str,
         nargs="*",
-        help=(
-            "Key=value args for latent temporal weighting, e.g. "
-            "alpha=0.5 mode=log normalize=mean clip_min=0.5 clip_max=2.0"
-        ),
+        help=("Key=value args for latent temporal weighting, e.g. alpha=0.5 mode=log normalize=mean clip_min=0.5 clip_max=2.0"),
     )
     parser.add_argument(
         "--latent_delta_loss",
@@ -1212,15 +1216,14 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         "--hfato",
         action="store_true",
         help="Enable HFATO: degrades clean latents via downsample-upsample before "
-             "noise addition, then supervises model to reconstruct original clean "
-             "latents.  Forces high-frequency detail recovery (ViBe, arxiv 2603.23326).",
+        "noise addition, then supervises model to reconstruct original clean "
+        "latents.  Forces high-frequency detail recovery (ViBe, arxiv 2603.23326).",
     )
     parser.add_argument(
         "--hfato_args",
         type=str,
         nargs="*",
-        help="Key=value args for HFATO, e.g. scale_factor=0.5 interpolation=bilinear "
-             "probability=1.0",
+        help="Key=value args for HFATO, e.g. scale_factor=0.5 interpolation=bilinear probability=1.0",
     )
 
     # -- Per-module learning rate groups --
@@ -1229,7 +1232,7 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         type=float,
         default=None,
         help="Learning rate for audio LoRA modules (audio_attn, audio_ff, cross-modal). "
-             "Overridden by more specific --lr_args patterns. Defaults to --learning_rate.",
+        "Overridden by more specific --lr_args patterns. Defaults to --learning_rate.",
     )
     parser.add_argument(
         "--lr_args",
@@ -1237,8 +1240,8 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         nargs="*",
         default=None,
         help="Per-module learning rate overrides (pattern=lr). Patterns are matched via regex "
-             "against LoRA module names. Example: --lr_args audio_attn=1e-6 audio_ff=1e-6 "
-             "video_to_audio=1e-5",
+        "against LoRA module names. Example: --lr_args audio_attn=1e-6 audio_ff=1e-6 "
+        "video_to_audio=1e-5",
     )
     parser.add_argument(
         "--lr_group_warmup_args",
@@ -1246,8 +1249,8 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         nargs="*",
         default=None,
         help="Optional per-group warmup overrides (pattern=steps) applied on top of the selected "
-             "scheduler family. Patterns match optimizer group names such as unet_audio, "
-             "unet_video, or unet_audio_attn. Example: --lr_group_warmup_args audio=500 video=1500",
+        "scheduler family. Patterns match optimizer group names such as unet_audio, "
+        "unet_video, or unet_audio_attn. Example: --lr_group_warmup_args audio=500 video=1500",
     )
 
     # -- Per-module rank (dim) overrides --
@@ -1256,14 +1259,14 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         type=int,
         default=None,
         help="LoRA rank (dim) for audio modules (names containing 'audio_'). "
-             "Defaults to --network_dim. Allows lower rank for audio to reduce overfitting.",
+        "Defaults to --network_dim. Allows lower rank for audio to reduce overfitting.",
     )
     parser.add_argument(
         "--audio_alpha",
         type=float,
         default=None,
         help="LoRA alpha for audio modules. Defaults to --network_alpha. "
-             "Typically set equal to --audio_dim for consistent scaling.",
+        "Typically set equal to --audio_dim for consistent scaling.",
     )
 
     # -- Caption dropout --
@@ -1272,22 +1275,42 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         type=float,
         default=0.0,
         help="Probability of dropping ALL text conditioning for each sample (0.0 = disabled). "
-             "Zeros out both video and audio text embeddings and mask. "
-             "For per-modality dropout, use --video_caption_dropout_rate / --audio_caption_dropout_rate.",
+        "Zeros out both video and audio text embeddings and mask. "
+        "For per-modality dropout, use --video_caption_dropout_rate / --audio_caption_dropout_rate.",
     )
     parser.add_argument(
         "--video_caption_dropout_rate",
         type=float,
         default=0.0,
         help="Probability of dropping video text conditioning per sample while keeping audio (0.0 = disabled). "
-             "Applied independently before --caption_dropout_rate. AV mode only.",
+        "Applied independently before --caption_dropout_rate. AV mode only.",
     )
     parser.add_argument(
         "--audio_caption_dropout_rate",
         type=float,
         default=0.0,
         help="Probability of dropping audio text conditioning per sample while keeping video (0.0 = disabled). "
-             "Applied independently before --caption_dropout_rate. AV mode only.",
+        "Applied independently before --caption_dropout_rate. AV mode only.",
+    )
+    parser.add_argument(
+        "--tread",
+        action="store_true",
+        help=(
+            "Enable TREAD token routing for LTX training. Bare --tread uses defaults: "
+            "selection_ratio=0.5, start/end=3/-4 for LTX-2.3 or 2/-2 for LTX-2.0. "
+            "Training-only; default target is video, with target=audio/both available for audio-enabled LTX paths."
+        ),
+    )
+    parser.add_argument(
+        "--tread_args",
+        type=str,
+        nargs="*",
+        default=None,
+        help=(
+            "Optional key=value settings for --tread. "
+            "Examples: --tread --tread_args target=video selection_ratio=0.5 start_layer_idx=3 end_layer_idx=-4. "
+            "Aliases: modality, ratio, start, end."
+        ),
     )
 
     # -- Cross-Task Synergy (Harmony) --
@@ -1296,14 +1319,14 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         type=float,
         default=0.0,
         help="Weight for video-driven audio auxiliary loss (clean video + noisy audio). "
-             "0 = disabled. Harmony (2025) uses 0.3. Requires --ltx2_mode av with audio data.",
+        "0 = disabled. Harmony (2025) uses 0.3. Requires --ltx2_mode av with audio data.",
     )
     parser.add_argument(
         "--cts_lambda_audio_driven",
         type=float,
         default=0.0,
         help="Weight for audio-driven video auxiliary loss (noisy video + clean audio). "
-             "0 = disabled. Harmony (2025) uses 0.1. Requires --ltx2_mode av with audio data.",
+        "0 = disabled. Harmony (2025) uses 0.1. Requires --ltx2_mode av with audio data.",
     )
 
     # -- Modality freezing (G2D) --
@@ -1312,15 +1335,15 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         type=int,
         default=0,
         help="Check modality freeze state every N steps (0 = disabled). "
-             "When audio loss EMA / video loss EMA drops below --modality_freeze_ratio_threshold, "
-             "audio LoRA params are frozen. Vice versa for video.",
+        "When audio loss EMA / video loss EMA drops below --modality_freeze_ratio_threshold, "
+        "audio LoRA params are frozen. Vice versa for video.",
     )
     parser.add_argument(
         "--modality_freeze_ratio_threshold",
         type=float,
         default=0.5,
         help="Audio/video loss EMA ratio below which the lower-loss modality's LoRA is frozen. "
-             "Default 0.5: freeze audio when audio_loss < 0.5 * video_loss.",
+        "Default 0.5: freeze audio when audio_loss < 0.5 * video_loss.",
     )
     parser.add_argument(
         "--modality_freeze_warmup_steps",
@@ -1375,12 +1398,8 @@ def main() -> None:
         else:
             logger.info("LTX2_SWAP_TRAIN_FULL=1 already set (blocks_to_swap=%d)", blocks_to_swap)
 
-    explicit_lora_preset = any(
-        arg == "--lora_target_preset" or arg.startswith("--lora_target_preset=") for arg in sys.argv
-    )
-    explicit_ic_strategy = any(
-        arg == "--ic_lora_strategy" or arg.startswith("--ic_lora_strategy=") for arg in sys.argv
-    )
+    explicit_lora_preset = any(arg == "--lora_target_preset" or arg.startswith("--lora_target_preset=") for arg in sys.argv)
+    explicit_ic_strategy = any(arg == "--ic_lora_strategy" or arg.startswith("--ic_lora_strategy=") for arg in sys.argv)
 
     if getattr(args, "dit", None) is not None and args.dit != args.ltx2_checkpoint:
         logger.warning("Ignoring --dit for LTX-2; using --ltx2_checkpoint instead")
@@ -1406,38 +1425,30 @@ def main() -> None:
             args.network_args = []
         if not any(arg.startswith("include_patterns=") for arg in args.network_args):
             args.lora_target_preset = "audio"
-    elif (
-        requested_ic_strategy == "audio_ref_ic"
-        and not explicit_lora_preset
-        and not uses_lycoris_module
-    ):
+    elif requested_ic_strategy == "audio_ref_ic" and not explicit_lora_preset and not uses_lycoris_module:
         if args.network_args is None:
             args.network_args = []
         if not any(arg.startswith("include_patterns=") for arg in args.network_args):
             args.lora_target_preset = "audio_ref_ic"
             logger.info("Using lora_target_preset=audio_ref_ic for --ic_lora_strategy audio_ref_ic")
-    elif (
-        requested_ic_strategy == "av_ic"
-        and not explicit_lora_preset
-        and not uses_lycoris_module
-    ):
+    elif requested_ic_strategy == "av_ic" and not explicit_lora_preset and not uses_lycoris_module:
         if args.network_args is None:
             args.network_args = []
         if not any(arg.startswith("include_patterns=") for arg in args.network_args):
             args.lora_target_preset = "av_ic"
             logger.info("Using lora_target_preset=av_ic for --ic_lora_strategy av_ic")
-    elif (
-        requested_ic_strategy == "video_ref_only_av"
-        and not explicit_lora_preset
-        and not uses_lycoris_module
-    ):
+    elif requested_ic_strategy == "video_ref_only_av" and not explicit_lora_preset and not uses_lycoris_module:
         if args.network_args is None:
             args.network_args = []
         if not any(arg.startswith("include_patterns=") for arg in args.network_args):
             args.lora_target_preset = "video_ref_only_av"
             logger.info("Using lora_target_preset=video_ref_only_av for --ic_lora_strategy video_ref_only_av")
 
-    if explicit_ic_strategy and requested_ic_strategy == "audio_ref_ic" and getattr(args, "ltx_mode", "video") not in {"av", "audio"}:
+    if (
+        explicit_ic_strategy
+        and requested_ic_strategy == "audio_ref_ic"
+        and getattr(args, "ltx_mode", "video") not in {"av", "audio"}
+    ):
         logger.warning("--ic_lora_strategy audio_ref_ic works in --ltx2_mode av or audio; current mode is %s", args.ltx_mode)
     if explicit_ic_strategy and requested_ic_strategy == "av_ic" and getattr(args, "ltx_mode", "video") != "av":
         logger.warning("--ic_lora_strategy %s requires --ltx2_mode av; current mode is %s", requested_ic_strategy, args.ltx_mode)

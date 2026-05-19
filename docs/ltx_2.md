@@ -938,6 +938,18 @@ The `class` parameter should be a general description without your trigger word 
 ```
 `reference_detach` (default `true`) additionally detaches the reference stream when its timestep sigma is exactly 0.
 
+**TREAD** - Training-time token routing for LTX token streams. This is opt-in. Enable it with `--tread`; optional settings use `--tread_args`:
+```bash
+--tread --tread_args selection_ratio=0.5 start_layer_idx=3 end_layer_idx=-4
+--tread --tread_args target=audio selection_ratio=0.5 start_layer_idx=3 end_layer_idx=-4
+```
+- Bare `--tread` uses defaults.
+- Default `target` is `video`. `target=audio` routes audio tokens, and `target=both` routes both video and audio tokens. Audio targets require an audio-enabled LTX mode.
+- Default `selection_ratio` is `0.5`.
+- The default block range is `3/-4` for LTX-2.3 and `2/-2` for LTX-2.0.
+- `--tread_args` accepts `target`, `selection_ratio`, `start_layer_idx`, and `end_layer_idx`; aliases are `modality`, `ratio`, `start`, and `end`.
+- TREAD is training-only. Video targets require a video-enabled path; audio-only training must use `target=audio`.
+
 | Technique | Extra forwards/step | Extra backwards/step | Recommended multiplier |
 |-----------|-------------------|---------------------|----------------------|
 | `--blank_preservation` | +2 | +1 | 0.5 - 1.0 |
@@ -946,9 +958,10 @@ The `class` parameter should be a general description without your trigger word 
 | `--audio_dop` | +2 (non-audio steps only) | +1 (non-audio steps only) | 0.3 - 1.0 |
 | `--tarp` | 0 | 0 | N/A (mask only) |
 | `--dcr` | 0 | 0 | N/A (gradient routing) |
+| `--tread` / `--tread_args` | 0 | 0 | N/A (routing only) |
 
 > [!CAUTION]
-> Each preservation technique adds transformer forward passes per step. Audio DOP costs apply only on non-audio steps. TARP and DCR add no extra passes — they modify the existing forward/backward in-place.
+> Each preservation technique adds transformer forward passes per step. Audio DOP costs apply only on non-audio steps. TARP, DCR, and TREAD add no extra passes; they modify the existing forward/backward in-place.
 
 #### CREPA (Cross-frame Representation Alignment)
 
@@ -1210,13 +1223,6 @@ accelerate launch ... ltx2_train_network.py ^
   --latent_temporal_weighting_args alpha=0.5 mode=log normalize=mean clip_min=0.5 clip_max=2.0 ^
   --latent_delta_loss ^
   --latent_delta_loss_args weight=0.03 order=1 target=x0 sigma_min=0.05 sigma_max=0.85
-
-# Lower-weight full fine-tune
-accelerate launch ... ltx2_train_network.py ^
-  --latent_temporal_weighting ^
-  --latent_temporal_weighting_args alpha=0.25 clip_max=1.5 ^
-  --latent_delta_loss ^
-  --latent_delta_loss_args weight=0.01 order=1 target=x0 sigma_min=0.05 sigma_max=0.85
 ```
 
 When both flags are off, the trainer does not attach latent-temporal context and the training loss path is unchanged.

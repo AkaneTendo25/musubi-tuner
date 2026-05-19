@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import math
 import shlex
 from pathlib import Path
 from typing import Any
 
 from musubi_tuner.gui_dashboard.project_schema import DatasetEntry, ProjectConfig
+from musubi_tuner.tread import default_ltx_tread_route, parse_tread_args
 
 
 def _has_text(value: str | None) -> bool:
@@ -89,7 +91,9 @@ def _parse_remote_stage_specs(raw: str | None) -> tuple[list[tuple[str, int, int
     return specs, None
 
 
-def _make_issue(severity: str, field: str | None, message: str, *, label: str | None = None, page: str | None = None) -> dict[str, Any]:
+def _make_issue(
+    severity: str, field: str | None, message: str, *, label: str | None = None, page: str | None = None
+) -> dict[str, Any]:
     issue: dict[str, Any] = {
         "severity": severity,
         "message": message,
@@ -135,7 +139,9 @@ def _dataset_source_label(index: int) -> str:
     return f"Dataset #{index + 1}"
 
 
-def _validate_dataset_entry(entry: DatasetEntry, index: int, *, errors: list[dict[str, Any]], warnings: list[dict[str, Any]]) -> None:
+def _validate_dataset_entry(
+    entry: DatasetEntry, index: int, *, errors: list[dict[str, Any]], warnings: list[dict[str, Any]]
+) -> None:
     field_base = f"dataset.datasets[{index}]"
     label = _dataset_source_label(index)
 
@@ -490,8 +496,8 @@ def validate_training_config(config: ProjectConfig) -> dict[str, Any]:
                         "Model Parallel Splits must contain one fewer value than Model Parallel Devices.",
                         label="Model Parallel Splits",
                         page="training",
+                    )
                 )
-            )
 
         if t.ltx2_mp_profile_log_every <= 0:
             errors.append(
@@ -701,6 +707,84 @@ def validate_training_config(config: ProjectConfig) -> dict[str, Any]:
         errors.append(_make_issue("error", "training.awq_calibration", message, label="AWQ Calibration", page="training"))
         errors.append(_make_issue("error", "training.nf4_base", message, label="NF4 Base", page="training"))
 
+    if t.tread:
+        tread_args_parts = _split_cli_args(t.tread_args)
+        if t.tread_target != "video":
+            tread_args_parts.append(f"target={t.tread_target}")
+        if t.tread_selection_ratio != 0.5:
+            tread_args_parts.append(f"selection_ratio={t.tread_selection_ratio}")
+        if t.tread_start_layer_idx is not None:
+            tread_args_parts.append(f"start_layer_idx={t.tread_start_layer_idx}")
+        if t.tread_end_layer_idx is not None:
+            tread_args_parts.append(f"end_layer_idx={t.tread_end_layer_idx}")
+        parsed_tread_config = None
+        try:
+            parsed_tread_config = parse_tread_args(
+                tread_args_parts,
+                total_layers=48,
+                default_route=default_ltx_tread_route(t.ltx_version),
+            )
+        except (TypeError, ValueError) as exc:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.tread_args",
+                    f"TREAD Args are invalid: {exc}",
+                    label="TREAD Args",
+                    page="techniques",
+                )
+            )
+        tread_targets = {
+            str(route.get("target", "video")).lower()
+            for route in ((parsed_tread_config or {}).get("routes") or [{"target": "video"}])
+        }
+        wants_video_tread = any(target in {"video", "both"} for target in tread_targets)
+        wants_audio_tread = any(target in {"audio", "both"} for target in tread_targets)
+        try:
+            tread_selection_ratio = float(t.tread_selection_ratio)
+        except (TypeError, ValueError):
+            tread_selection_ratio = float("nan")
+        if not math.isfinite(tread_selection_ratio) or not 0.0 <= tread_selection_ratio < 1.0:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.tread_selection_ratio",
+                    "TREAD Selection Ratio must be at least 0.0 and less than 1.0.",
+                    label="TREAD Selection Ratio",
+                    page="techniques",
+                )
+            )
+        if wants_video_tread and (t.ltx2_mode == "audio" or t.ltx2_audio_only_model):
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.tread",
+                    "TREAD target=video requires a video-enabled LTX path. Use target=audio for audio-only training.",
+                    label="TREAD",
+                    page="techniques",
+                )
+            )
+        if wants_audio_tread and t.ltx2_mode == "video":
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.tread",
+                    "TREAD target=audio requires an audio-enabled LTX mode.",
+                    label="TREAD",
+                    page="techniques",
+                )
+            )
+        if t.ltx2_remote_stage:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.tread",
+                    "TREAD cannot be combined with this execution mode because routing changes token lengths across blocks.",
+                    label="TREAD",
+                    page="techniques",
+                )
+            )
+
     if not t.save_every_n_steps and not t.save_every_n_epochs:
         warnings.append(
             _make_issue(
@@ -907,8 +991,24 @@ def validate_remote_stage_server_config(config: ProjectConfig) -> dict[str, Any]
 
     if r.stage_only_device_placement and r.full_model_device_placement:
         message = "Stage-only device placement and full-model device placement cannot both be enabled."
-        errors.append(_make_issue("error", "remote_stage_server.stage_only_device_placement", message, label="Stage Only Device Placement", page="training"))
-        errors.append(_make_issue("error", "remote_stage_server.full_model_device_placement", message, label="Full Model Device Placement", page="training"))
+        errors.append(
+            _make_issue(
+                "error",
+                "remote_stage_server.stage_only_device_placement",
+                message,
+                label="Stage Only Device Placement",
+                page="training",
+            )
+        )
+        errors.append(
+            _make_issue(
+                "error",
+                "remote_stage_server.full_model_device_placement",
+                message,
+                label="Full Model Device Placement",
+                page="training",
+            )
+        )
 
     if r.block_only_load and r.full_model_device_placement:
         errors.append(
@@ -1152,7 +1252,9 @@ def validate_remote_stage_launcher_config(config: ProjectConfig) -> dict[str, An
     return _build_report(errors, warnings)
 
 
-def _validate_sample_prompt_path(config: ProjectConfig, raw_path: str | None, *, errors: list[dict[str, Any]], field: str, label: str, page: str) -> None:
+def _validate_sample_prompt_path(
+    config: ProjectConfig, raw_path: str | None, *, errors: list[dict[str, Any]], field: str, label: str, page: str
+) -> None:
     sample_prompts_path = _resolve_project_path(config, raw_path)
     if sample_prompts_path is not None and not sample_prompts_path.exists():
         errors.append(

@@ -28,6 +28,7 @@ from musubi_tuner.gui_dashboard.toml_export import (
 def _find_script(name: str) -> str:
     """Find a script in the musubi_tuner package."""
     import musubi_tuner
+
     pkg_dir = Path(musubi_tuner.__file__).parent
     script = pkg_dir / name
     if script.exists():
@@ -132,7 +133,9 @@ def _accelerate_executable() -> str:
     executable = Path(sys.executable).parent / executable_name
     if executable.exists():
         return str(executable)
-    repo_venv_executable = Path(__file__).resolve().parents[3] / "venv" / ("Scripts" if sys.platform == "win32" else "bin") / executable_name
+    repo_venv_executable = (
+        Path(__file__).resolve().parents[3] / "venv" / ("Scripts" if sys.platform == "win32" else "bin") / executable_name
+    )
     if repo_venv_executable.exists():
         return str(repo_venv_executable)
     return "accelerate"
@@ -141,9 +144,11 @@ def _accelerate_executable() -> str:
 def _accelerate_launch_prefix(mixed_precision: str, extra_args: str) -> list[str]:
     extra = _split_cli_args(extra_args)
     cmd = [
-        _accelerate_executable(), "launch",
+        _accelerate_executable(),
+        "launch",
         *extra,
-        "--mixed_precision", mixed_precision,
+        "--mixed_precision",
+        mixed_precision,
     ]
     return cmd
 
@@ -179,9 +184,12 @@ def build_cache_latents_cmd(config: ProjectConfig) -> list[str]:
         sys.executable,
         "-u",
         _find_script("ltx2_cache_latents.py"),
-        "--dataset_config", str(toml_path),
-        "--ltx2_checkpoint", ltx2_checkpoint,
-        "--ltx2_mode", c.ltx2_mode,
+        "--dataset_config",
+        str(toml_path),
+        "--ltx2_checkpoint",
+        ltx2_checkpoint,
+        "--ltx2_mode",
+        c.ltx2_mode,
     ]
 
     if c.vae_dtype:
@@ -268,9 +276,12 @@ def build_cache_text_cmd(config: ProjectConfig) -> list[str]:
         sys.executable,
         "-u",
         _find_script("ltx2_cache_text_encoder_outputs.py"),
-        "--dataset_config", str(toml_path),
-        "--ltx2_checkpoint", ltx2_checkpoint,
-        "--ltx2_mode", c.ltx2_mode,
+        "--dataset_config",
+        str(toml_path),
+        "--ltx2_checkpoint",
+        ltx2_checkpoint,
+        "--ltx2_mode",
+        c.ltx2_mode,
     ]
 
     if gemma_root:
@@ -346,8 +357,10 @@ def build_inference_cmd(config: ProjectConfig) -> list[str]:
         sys.executable,
         "-u",
         _find_script("ltx2_generate_video.py"),
-        "--ltx2_checkpoint", s.ltx2_checkpoint,
-        "--ltx2_mode", s.ltx2_mode,
+        "--ltx2_checkpoint",
+        s.ltx2_checkpoint,
+        "--ltx2_mode",
+        s.ltx2_mode,
     ]
 
     if s.vae:
@@ -1365,6 +1378,22 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
         if args_parts:
             cmd += ["--audio_metrics_args"] + args_parts
 
+    # TREAD token routing
+    if t.tread:
+        cmd.append("--tread")
+        args_parts = []
+        _append_key_value_args(args_parts, t.tread_args)
+        if t.tread_target != "video":
+            args_parts.append(f"target={t.tread_target}")
+        if t.tread_selection_ratio != 0.5:
+            args_parts.append(f"selection_ratio={t.tread_selection_ratio}")
+        if t.tread_start_layer_idx is not None:
+            args_parts.append(f"start_layer_idx={t.tread_start_layer_idx}")
+        if t.tread_end_layer_idx is not None:
+            args_parts.append(f"end_layer_idx={t.tread_end_layer_idx}")
+        if args_parts:
+            cmd += ["--tread_args"] + args_parts
+
     # Audio features
     if t.audio_loss_balance_mode != "none":
         cmd += ["--audio_loss_balance_mode", t.audio_loss_balance_mode]
@@ -1464,7 +1493,9 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
 
 def _remote_stage_server_arglist(config: ProjectConfig) -> list[str]:
     r = config.remote_stage_server
-    ltx2_checkpoint = r.ltx2_checkpoint or config.default_ltx2_checkpoint or str(_default_model_dir(config) / DEFAULT_LTX2_CHECKPOINT_NAME)
+    ltx2_checkpoint = (
+        r.ltx2_checkpoint or config.default_ltx2_checkpoint or str(_default_model_dir(config) / DEFAULT_LTX2_CHECKPOINT_NAME)
+    )
 
     cmd: list[str] = [
         "--ltx2_checkpoint",
@@ -1693,9 +1724,12 @@ def build_cache_dino_cmd(config: ProjectConfig) -> list[str]:
         sys.executable,
         "-u",
         _find_script("ltx2_cache_dino_features.py"),
-        "--dataset_config", str(toml_path),
-        "--dino_model", t.crepa_dino_model,  # Use training model setting, not caching
-        "--dino_batch_size", str(c.dino_batch_size),
+        "--dataset_config",
+        str(toml_path),
+        "--dino_model",
+        t.crepa_dino_model,  # Use training model setting, not caching
+        "--dino_batch_size",
+        str(c.dino_batch_size),
     ]
 
     if c.device:

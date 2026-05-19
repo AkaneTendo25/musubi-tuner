@@ -195,7 +195,18 @@ class TrainingConfig(BaseModel):
     network_dim: Optional[int] = None
     network_alpha: float = 1.0
     lora_target_preset: Literal[
-        "t2v", "v2v", "video_sa", "video_sa_ff", "video_sa_ca_ff", "audio", "audio_v2a", "audio_ref_ic", "av_ic", "video_ref_only_av", "full", "lycoris"
+        "t2v",
+        "v2v",
+        "video_sa",
+        "video_sa_ff",
+        "video_sa_ca_ff",
+        "audio",
+        "audio_v2a",
+        "audio_ref_ic",
+        "av_ic",
+        "video_ref_only_av",
+        "full",
+        "lycoris",
     ] = "t2v"
     network_args: str = ""
     network_weights: str = ""
@@ -491,6 +502,14 @@ class TrainingConfig(BaseModel):
     audio_metrics_clap_similarity: bool = False
     audio_metrics_av_onset_alignment: bool = False
 
+    # Token routing
+    tread: bool = False
+    tread_args: str = ""
+    tread_target: Literal["video", "audio", "both"] = "video"
+    tread_selection_ratio: float = 0.5
+    tread_start_layer_idx: Optional[int] = None
+    tread_end_layer_idx: Optional[int] = None
+
     # CREPA
     crepa: bool = False
     crepa_args: str = ""
@@ -617,7 +636,6 @@ class TrainingConfig(BaseModel):
     keyframe_max_random_interior: int = 0
     accelerate_extra_args: str = ""
     extra_args: str = ""
-
 
 
 class InferenceConfig(BaseModel):
@@ -838,34 +856,34 @@ class ProjectConfig(BaseModel):
     inference: InferenceConfig = Field(default_factory=InferenceConfig)
     slider: SliderConfig = Field(default_factory=SliderConfig)
 
-    @model_validator(mode='before')
+    @model_validator(mode="before")
     @classmethod
     def _migrate_sampling_key(cls, data):
         """Backward compat: rename old 'sampling' key to 'inference'."""
-        if isinstance(data, dict) and 'sampling' in data and 'inference' not in data:
-            data['inference'] = data.pop('sampling')
+        if isinstance(data, dict) and "sampling" in data and "inference" not in data:
+            data["inference"] = data.pop("sampling")
         if isinstance(data, dict):
-            training = data.get('training')
+            training = data.get("training")
             if training is None:
-                data['training'] = {
-                    'output_dir': get_ltx2_training_output_dir_default(),
-                    'network_module': get_ltx2_training_network_module_default(),
+                data["training"] = {
+                    "output_dir": get_ltx2_training_output_dir_default(),
+                    "network_module": get_ltx2_training_network_module_default(),
                 }
             elif isinstance(training, dict):
                 training = dict(training)
-                if not training.get('output_dir'):
-                    training['output_dir'] = get_ltx2_training_output_dir_default()
-                if not training.get('network_module'):
-                    training['network_module'] = get_ltx2_training_network_module_default()
-                data['training'] = training
+                if not training.get("output_dir"):
+                    training["output_dir"] = get_ltx2_training_output_dir_default()
+                if not training.get("network_module"):
+                    training["network_module"] = get_ltx2_training_network_module_default()
+                data["training"] = training
 
-            model_dir = data.get('model_dir') or None
-            default_ltx = data.get('default_ltx2_checkpoint') or default_ltx2_checkpoint_path(model_dir)
-            default_gemma = data.get('default_gemma_root') or default_gemma_root_path(model_dir)
-            data['default_ltx2_checkpoint'] = default_ltx
-            data['default_gemma_root'] = default_gemma
+            model_dir = data.get("model_dir") or None
+            default_ltx = data.get("default_ltx2_checkpoint") or default_ltx2_checkpoint_path(model_dir)
+            default_gemma = data.get("default_gemma_root") or default_gemma_root_path(model_dir)
+            data["default_ltx2_checkpoint"] = default_ltx
+            data["default_gemma_root"] = default_gemma
 
-            for section_name in ('caching', 'training', 'remote_stage_server', 'inference'):
+            for section_name in ("caching", "training", "remote_stage_server", "inference"):
                 section = data.get(section_name)
                 if section is None:
                     section = {}
@@ -874,26 +892,29 @@ class ProjectConfig(BaseModel):
                 else:
                     section = dict(section)
 
-                if not section.get('ltx2_checkpoint'):
-                    section['ltx2_checkpoint'] = default_ltx
-                if section_name in ('caching', 'training', 'inference') and not section.get('gemma_root') and not section.get('gemma_safetensors'):
-                    section['gemma_root'] = default_gemma
-                if section_name == 'training':
+                if not section.get("ltx2_checkpoint"):
+                    section["ltx2_checkpoint"] = default_ltx
+                if (
+                    section_name in ("caching", "training", "inference")
+                    and not section.get("gemma_root")
+                    and not section.get("gemma_safetensors")
+                ):
+                    section["gemma_root"] = default_gemma
+                if section_name == "training":
                     has_old_sampling_values = any(
-                        key in section and section.get(key) is not None
-                        for key in ('height', 'width', 'sample_num_frames')
+                        key in section and section.get(key) is not None for key in ("height", "width", "sample_num_frames")
                     )
-                    if has_old_sampling_values and 'sample_sampling_preset' not in section:
-                        section['sample_sampling_preset'] = 'legacy'
-                elif section_name == 'inference':
+                    if has_old_sampling_values and "sample_sampling_preset" not in section:
+                        section["sample_sampling_preset"] = "legacy"
+                elif section_name == "inference":
                     has_old_generation_values = any(
                         key in section and section.get(key) is not None
-                        for key in ('height', 'width', 'frame_count', 'frame_rate', 'sample_steps', 'guidance_scale')
+                        for key in ("height", "width", "frame_count", "frame_rate", "sample_steps", "guidance_scale")
                     )
-                    if has_old_generation_values and 'sampling_preset' not in section:
-                        section['sampling_preset'] = 'legacy'
+                    if has_old_generation_values and "sampling_preset" not in section:
+                        section["sampling_preset"] = "legacy"
                 data[section_name] = section
-            data['version'] = max(int(data.get('version') or 1), 2)
+            data["version"] = max(int(data.get("version") or 1), 2)
         return data
 
     def save(self, path: Optional[Path] = None):

@@ -172,6 +172,44 @@
 			</div>
 		</div>
 
+		<!-- TREAD -->
+		<div style="background: var(--bg-surface); border: 1px solid var(--border-subtle); border-radius: var(--radius-md); position: relative; overflow: hidden;">
+			<div style="position: absolute; top: 0; left: 0; right: 0; height: 2px; background: linear-gradient(90deg, transparent, var(--accent), var(--secondary, var(--accent)), transparent); opacity: 0.5;"></div>
+
+			<div class="p-5 pb-0">
+				<div class="flex items-center gap-3 mb-2">
+					<div class="w-8 h-8 flex items-center justify-center flex-shrink-0" style="background: var(--accent-muted); border-radius: var(--radius-sm);">
+						<svg class="w-4 h-4" style="color: var(--accent);" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.5"><path d="M4.5 6.75h15M4.5 12h15m-15 5.25h15"/></svg>
+					</div>
+					<div>
+						<div class="text-[13px] font-semibold" style="color: var(--text-primary);">TREAD</div>
+						<div class="text-[11px]" style="color: var(--text-muted);">Sparse token routing during selected transformer layers</div>
+					</div>
+				</div>
+				<p class="text-[12px] leading-relaxed mb-3" style="color: var(--text-secondary);">
+					Token routing keeps clean conditioning tokens and routes a subset of noisy video or audio tokens through the selected transformer window. Safe default: off.
+				</p>
+			</div>
+
+			<div class="p-5 pt-0 space-y-3">
+				<div class="p-3" style="background: var(--bg-elevated); border-radius: var(--radius-sm); border: 1px solid var(--border-subtle);">
+					<div class="flex items-center justify-between mb-2">
+						<span class="text-[12px] font-semibold" style="color: var(--text-primary);">TREAD</span>
+						<FormToggle fieldPath="training.tread" checked={$projectConfig?.training?.tread ?? false} onchange={(e) => updateTraining('tread', e.target.checked)} />
+					</div>
+					<div class="grid grid-cols-4 gap-2">
+						<FormSelect fieldPath="training.tread_target" label="Target" value={$projectConfig?.training?.tread_target || 'video'} onchange={(e) => updateTraining('tread_target', e.target.value)} options={[{value: 'video', label: 'Video'}, {value: 'audio', label: 'Audio'}, {value: 'both', label: 'Both'}]} disabled={!$projectConfig?.training?.tread} tooltip="Token stream routed by TREAD. Video is the safe default; audio and both require an audio-enabled LTX mode." />
+						<FormField fieldPath="training.tread_selection_ratio" label="Selection Ratio" type="number" value={$projectConfig?.training?.tread_selection_ratio ?? 0.5} oninput={(e) => updateTraining('tread_selection_ratio', Number(e.target.value))} step="0.05" min={0} max={0.95} disabled={!$projectConfig?.training?.tread} tooltip="Fraction of selected-stream tokens affected by TREAD routing. Default 0.5. Valid range [0, 1)." />
+						<FormField fieldPath="training.tread_start_layer_idx" label="Start Layer" type="number" value={$projectConfig?.training?.tread_start_layer_idx ?? ''} oninput={(e) => updateTraining('tread_start_layer_idx', e.target.value ? Number(e.target.value) : null)} placeholder="Auto" disabled={!$projectConfig?.training?.tread} tooltip="First transformer layer to route. Blank uses 3 for LTX-2.3 and 2 for LTX-2.0." />
+						<FormField fieldPath="training.tread_end_layer_idx" label="End Layer" type="number" value={$projectConfig?.training?.tread_end_layer_idx ?? ''} oninput={(e) => updateTraining('tread_end_layer_idx', e.target.value ? Number(e.target.value) : null)} placeholder="Auto" disabled={!$projectConfig?.training?.tread} tooltip="Last routed layer. Negative values count from the end. Blank uses -4 for LTX-2.3 and -2 for LTX-2.0." />
+					</div>
+					<div class="mt-2">
+						<FormField fieldPath="training.tread_args" value={$projectConfig?.training?.tread_args || ''} oninput={(e) => updateTraining('tread_args', e.target.value)} placeholder="target=video selection_ratio=0.5 start_layer_idx=3 end_layer_idx=-4" disabled={!$projectConfig?.training?.tread} tooltip="Additional values passed after --tread_args. Structured fields above override matching values here." />
+					</div>
+				</div>
+			</div>
+		</div>
+
 		<!-- Self-Flow -->
 		<div style="background: var(--bg-surface); border: 1px solid var(--border-subtle); border-radius: var(--radius-md); position: relative; overflow: hidden;">
 			<div style="position: absolute; top: 0; left: 0; right: 0; height: 2px; background: linear-gradient(90deg, transparent, var(--accent), var(--secondary, var(--accent)), transparent); opacity: 0.5;"></div>

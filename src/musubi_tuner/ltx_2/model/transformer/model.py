@@ -1,6 +1,6 @@
 from dataclasses import replace
 from enum import Enum
-from typing import Optional
+from typing import Any, Optional
 import os
 
 import logging
@@ -29,6 +29,7 @@ from musubi_tuner.ltx_2.model.transformer.transformer_args import (
 )
 from musubi_tuner.ltx_2.utils import to_denoised
 from musubi_tuner.ltx2_model_parallel import ModelParallelTransferConfig, move_ltx2_model_parallel_activation
+from musubi_tuner.tread import MaskInfo, TREADRouter
 
 logger = logging.getLogger(__name__)
 
@@ -41,10 +42,14 @@ def _move_non_linear_params(module: nn.Module, device: torch.device) -> None:
             # Move bias and scale_weight if they exist and are on wrong device
             if submodule.bias is not None and submodule.bias.device != device:
                 submodule.bias.data = submodule.bias.data.to(device, non_blocking=non_blocking)
-            if hasattr(submodule, "scale_weight") and submodule.scale_weight is not None and submodule.scale_weight.device != device:
+            if (
+                hasattr(submodule, "scale_weight")
+                and submodule.scale_weight is not None
+                and submodule.scale_weight.device != device
+            ):
                 submodule.scale_weight.data = submodule.scale_weight.data.to(device, non_blocking=non_blocking)
             continue
-        
+
         # For non-linear modules, we only move its DIRECT parameters/buffers to avoid recursing into Linear children
         for param in submodule.parameters(recurse=False):
             if param.device != device:
@@ -78,6 +83,7 @@ def _move_transformer_args(
         return None
     if args.x.device == device:
         return args
+
     # Note: We use synchronous moves (non_blocking=False) for checkpoint recomputation
     # to ensure data is fully available before computation. Async moves can cause issues.
     def _move_tensor(value):
@@ -116,6 +122,7 @@ def _move_transformer_args(
         a2v_cross_attention_mask=_move_tensor(args.a2v_cross_attention_mask),
         v2a_cross_attention_mask=_move_tensor(args.v2a_cross_attention_mask),
         dcr_detach_mask=_move_tensor(args.dcr_detach_mask),
+        force_keep_mask=_move_tensor(args.force_keep_mask),
     )
 
 
@@ -184,6 +191,8 @@ class LTXModel(torch.nn.Module):
         self.audio_cross_attention_dim = audio_cross_attention_dim
         self.caption_proj_before_connector = caption_proj_before_connector
         self.cross_attention_adaln = cross_attention_adaln
+        self._tread_router: TREADRouter | None = None
+        self._tread_routes: list[dict[str, Any]] | None = None
         cross_pe_max_pos = None
         if model_type.is_video_enabled():
             if positional_embedding_max_pos is None:
@@ -463,11 +472,11 @@ class LTXModel(torch.nn.Module):
         # But for safety/simplicity we can update blocks with current state
         offload = getattr(self, "activation_cpu_offloading", False)
         for block in self.transformer_blocks:
-             if enable:
-                 block.enable_gradient_checkpointing(offload)
-             else:
-                 block.gradient_checkpointing = False
-                 block.activation_cpu_offloading = False
+            if enable:
+                block.enable_gradient_checkpointing(offload)
+            else:
+                block.gradient_checkpointing = False
+                block.activation_cpu_offloading = False
 
     # NOTE: enable_gradient_checkpointing is defined later in the file with extended signature
 
@@ -555,6 +564,7 @@ class LTXModel(torch.nn.Module):
 
     def move_to_device_except_swap_blocks(self, device: torch.device) -> None:
         import torch  # ensure available
+
         def _vram_summary():
             if torch.cuda.is_available():
                 a = torch.cuda.memory_allocated() / (1024**3)
@@ -595,8 +605,10 @@ class LTXModel(torch.nn.Module):
                 else:
                     block.to(target_device)
                     gpu_blocks.append(idx)
-            print(f"[BLOCK_SWAP] aggressive: blocks {gpu_blocks[0]}-{gpu_blocks[-1]} on GPU, "
-                  f"blocks {cpu_blocks[0]}-{cpu_blocks[-1]} on CPU | {_vram_summary()}")
+            print(
+                f"[BLOCK_SWAP] aggressive: blocks {gpu_blocks[0]}-{gpu_blocks[-1]} on GPU, "
+                f"blocks {cpu_blocks[0]}-{cpu_blocks[-1]} on CPU | {_vram_summary()}"
+            )
             return
 
         if self.blocks_to_swap:
@@ -617,8 +629,7 @@ class LTXModel(torch.nn.Module):
                 else:
                     block.to(target_device)
             last_block = len(self.transformer_blocks) - 1
-            print(f"[BLOCK_SWAP] blocks 0-{swap_start-1} on GPU, "
-                  f"blocks {swap_start}-{last_block} on CPU | {_vram_summary()}")
+            print(f"[BLOCK_SWAP] blocks 0-{swap_start - 1} on GPU, blocks {swap_start}-{last_block} on CPU | {_vram_summary()}")
         else:
             print(f"[BLOCK_SWAP] all blocks on {device} | {_vram_summary()}")
 
@@ -627,6 +638,177 @@ class LTXModel(torch.nn.Module):
             return
         self.offloader.prepare_block_devices_before_forward(self.transformer_blocks)
         # Note: Non-linear params are handled by the offloader (kept on GPU)
+
+    def set_router(self, router: TREADRouter | None, routes: Optional[list[dict[str, Any]]] = None) -> None:
+        """Attach or clear a TREAD router and pre-normalized route definitions."""
+        self._tread_router = router
+        self._tread_routes = routes
+
+    @staticmethod
+    def _route_rope(rope: Any, info: MaskInfo, keep_len: int):
+        if rope is None:
+            return None
+
+        def _route_one(r: torch.Tensor) -> torch.Tensor:
+            batch_size = info.ids_shuffle.shape[0]
+            if r.dim() == 2:
+                r = r.unsqueeze(0)
+            if r.dim() >= 3:
+                if r.shape[0] == 1 and batch_size != 1:
+                    r = r.expand(batch_size, *r.shape[1:])
+                elif r.shape[0] != batch_size:
+                    raise ValueError(f"TREAD expected rope batch size {batch_size}, got {r.shape[0]} for shape {tuple(r.shape)}.")
+            if r.dim() == 3:
+                gather_idx = info.ids_shuffle.to(device=r.device).unsqueeze(-1).expand_as(r)
+                routed = torch.take_along_dim(r, gather_idx, dim=1)
+                return routed[:, :keep_len, :]
+            if r.dim() == 4:
+                gather_idx = info.ids_shuffle.to(device=r.device)[:, None, :, None].expand(
+                    r.shape[0],
+                    r.shape[1],
+                    r.shape[2],
+                    r.shape[3],
+                )
+                routed = torch.take_along_dim(r, gather_idx, dim=2)
+                return routed[:, :, :keep_len, :]
+            raise ValueError(f"Unexpected rotary embedding shape for routing: {tuple(r.shape)}")
+
+        if isinstance(rope, tuple):
+            return tuple(_route_one(r) for r in rope)
+        return _route_one(rope)
+
+    @staticmethod
+    def _route_token_tensor(value: Any, info: MaskInfo, keep_len: int) -> Any:
+        """Route tensors whose second dimension is aligned to video tokens."""
+        if value is None:
+            return None
+        if isinstance(value, tuple) and len(value) == 4 and isinstance(value[1], torch.Tensor):
+            unique_values, inverse_indices_1d, value_batch_size, num_tokens = value
+            seq_len = info.mask.shape[1]
+            if num_tokens != seq_len:
+                return value
+            batch_size = info.ids_shuffle.shape[0]
+            inverse = inverse_indices_1d.view(value_batch_size, num_tokens)
+            if value_batch_size == 1 and batch_size != 1:
+                inverse = inverse.expand(batch_size, num_tokens)
+            elif value_batch_size != batch_size:
+                if inverse_indices_1d.numel() != batch_size * num_tokens:
+                    raise ValueError(f"Cannot route timestep tuple with batch {value_batch_size}; route batch is {batch_size}")
+                inverse = inverse_indices_1d.view(batch_size, num_tokens)
+            gather_idx = info.ids_shuffle.to(device=inverse.device).expand_as(inverse)
+            routed_inverse = torch.take_along_dim(inverse, gather_idx, dim=1)[:, :keep_len]
+            return unique_values, routed_inverse.reshape(-1), batch_size, keep_len
+        if not isinstance(value, torch.Tensor):
+            return value
+
+        seq_len = info.mask.shape[1]
+        batch_size = info.ids_shuffle.shape[0]
+        if value.dim() == 2 and value.shape[0] in (1, batch_size) and value.shape[1] == seq_len:
+            routed_value = value
+            if routed_value.shape[0] == 1 and batch_size != 1:
+                routed_value = routed_value.expand(batch_size, routed_value.shape[1])
+            gather_idx = info.ids_shuffle.to(device=routed_value.device).expand_as(routed_value)
+            return torch.take_along_dim(routed_value, gather_idx, dim=1)[:, :keep_len]
+        if value.dim() >= 3 and value.shape[0] in (1, batch_size) and value.shape[1] == seq_len:
+            routed_value = value
+            if routed_value.shape[0] == 1 and batch_size != 1:
+                routed_value = routed_value.expand(batch_size, *routed_value.shape[1:])
+            view_shape = [batch_size, info.ids_shuffle.shape[1]] + [1] * (routed_value.dim() - 2)
+            gather_idx = info.ids_shuffle.to(device=routed_value.device).view(*view_shape).expand_as(routed_value)
+            return torch.take_along_dim(routed_value, gather_idx, dim=1)[:, :keep_len, ...]
+        return value
+
+    @staticmethod
+    def _assert_token_length(name: str, value: Any, expected_len: int, original_len: int | None = None) -> None:
+        if value is None:
+            return
+        if isinstance(value, tuple) and len(value) == 4 and isinstance(value[1], torch.Tensor):
+            num_tokens = int(value[3])
+            if num_tokens not in (1, expected_len):
+                raise ValueError(
+                    f"{name} still has {num_tokens} tokens after routing, expected {expected_len}. "
+                    "This indicates a TREAD token-aligned tensor was not routed."
+                )
+            return
+        if isinstance(value, (tuple, list)):
+            for idx, item in enumerate(value):
+                LTXModel._assert_token_length(f"{name}[{idx}]", item, expected_len, original_len)
+            return
+        if not isinstance(value, torch.Tensor) or value.dim() < 2:
+            return
+
+        token_dims = [1]
+        if value.dim() >= 3:
+            token_dims.append(2)
+        if any(value.shape[dim] == expected_len for dim in token_dims):
+            return
+        if original_len is not None and any(value.shape[dim] == original_len for dim in token_dims):
+            raise ValueError(
+                f"{name} still has original token length {original_len} after routing, expected {expected_len}. "
+                "This indicates a TREAD token-aligned tensor was not routed."
+            )
+
+    @staticmethod
+    def _route_attention_mask_dim(
+        mask: torch.Tensor | None,
+        info: MaskInfo,
+        dim: int,
+        keep_len: int,
+    ) -> torch.Tensor | None:
+        if mask is None:
+            return None
+
+        batch_size = info.ids_shuffle.shape[0]
+        if mask.dim() == 2:
+            mask = mask.unsqueeze(0)
+            dim += 1
+
+        if mask.shape[0] == 1 and batch_size != 1:
+            mask = mask.expand(batch_size, *mask.shape[1:])
+        elif mask.shape[0] != batch_size:
+            raise ValueError(
+                f"TREAD expected attention-mask batch size {batch_size}, got {mask.shape[0]} for shape {tuple(mask.shape)}."
+            )
+
+        seq_len = info.mask.shape[1]
+        if mask.shape[dim] != seq_len:
+            raise ValueError(f"TREAD expected attention-mask dimension {dim} to have length {seq_len}, got {mask.shape[dim]}.")
+
+        view_shape = [batch_size] + [1] * (mask.dim() - 1)
+        view_shape[dim] = info.ids_shuffle.shape[1]
+        expand_shape = list(mask.shape)
+        expand_shape[dim] = info.ids_shuffle.shape[1]
+        gather_idx = info.ids_shuffle.to(device=mask.device).view(*view_shape).expand(*expand_shape)
+        routed = torch.take_along_dim(mask, gather_idx, dim=dim)
+
+        slices = [slice(None)] * routed.dim()
+        slices[dim] = slice(0, keep_len)
+        return routed[tuple(slices)]
+
+    @classmethod
+    def _route_self_attention_mask(cls, mask: torch.Tensor | None, info: MaskInfo, keep_len: int) -> torch.Tensor | None:
+        if mask is None:
+            return None
+        first_dim = 0 if mask.dim() == 2 else mask.dim() - 2
+        routed = cls._route_attention_mask_dim(mask, info, first_dim, keep_len)
+        if routed is None:
+            return None
+        second_dim = 1 if routed.dim() == 2 else routed.dim() - 1
+        return cls._route_attention_mask_dim(routed, info, second_dim, keep_len)
+
+    @classmethod
+    def _route_query_attention_mask(cls, mask: torch.Tensor | None, info: MaskInfo, keep_len: int) -> torch.Tensor | None:
+        if mask is None:
+            return None
+        dim = 0 if mask.dim() == 2 else mask.dim() - 2
+        return cls._route_attention_mask_dim(mask, info, dim, keep_len)
+
+    @classmethod
+    def _route_key_attention_mask(cls, mask: torch.Tensor | None, info: MaskInfo, keep_len: int) -> torch.Tensor | None:
+        if mask is None:
+            return None
+        dim = 1 if mask.dim() == 2 else mask.dim() - 1
+        return cls._route_attention_mask_dim(mask, info, dim, keep_len)
 
     def _process_transformer_blocks(
         self,
@@ -672,7 +854,7 @@ class LTXModel(torch.nn.Module):
             gpu_device = video.x.device
         elif audio is not None and isinstance(audio.x, torch.Tensor):
             gpu_device = audio.x.device
-            
+
         cpu_device = torch.device("cpu")
 
         # If offloading is enabled for all blocks, move initial inputs to CPU so the first block's checkpoint saves CPU tensors
@@ -692,6 +874,43 @@ class LTXModel(torch.nn.Module):
                 self._transfer_stream = torch.cuda.Stream(device=gpu_device)
             transfer_stream = self._transfer_stream
 
+        tread_routes = self._tread_routes or []
+        base_use_routing = torch.is_grad_enabled()
+        use_tread = base_use_routing and len(tread_routes) > 0
+        routes = tread_routes
+        router = self._tread_router
+        if use_tread and router is None:
+            raise ValueError("TREAD routing requested but no router has been configured. Call set_router before training.")
+
+        route_ptr = 0
+        routing_now = False
+        video_route_mask_info: MaskInfo | None = None
+        audio_route_mask_info: MaskInfo | None = None
+        saved_video_x: torch.Tensor | None = None
+        saved_audio_x: torch.Tensor | None = None
+        original_video_timesteps = video.timesteps if video is not None else None
+        original_video_embedded_timestep = video.embedded_timestep if video is not None else None
+        original_video_prompt_timestep = video.prompt_timestep if video is not None else None
+        original_video_cross_scale_shift_timestep = video.cross_scale_shift_timestep if video is not None else None
+        original_video_cross_gate_timestep = video.cross_gate_timestep if video is not None else None
+        original_video_dcr_detach_mask = video.dcr_detach_mask if video is not None else None
+        original_video_force_keep_mask = video.force_keep_mask if video is not None else None
+        original_video_pe = video.positional_embeddings if video is not None else None
+        original_video_cross_pe = video.cross_positional_embeddings if video is not None else None
+        original_video_self_mask = video.self_attention_mask if video is not None else None
+        original_video_a2v_mask = video.a2v_cross_attention_mask if video is not None else None
+        original_audio_timesteps = audio.timesteps if audio is not None else None
+        original_audio_embedded_timestep = audio.embedded_timestep if audio is not None else None
+        original_audio_prompt_timestep = audio.prompt_timestep if audio is not None else None
+        original_audio_cross_scale_shift_timestep = audio.cross_scale_shift_timestep if audio is not None else None
+        original_audio_cross_gate_timestep = audio.cross_gate_timestep if audio is not None else None
+        original_audio_dcr_detach_mask = audio.dcr_detach_mask if audio is not None else None
+        original_audio_force_keep_mask = audio.force_keep_mask if audio is not None else None
+        original_audio_pe = audio.positional_embeddings if audio is not None else None
+        original_audio_cross_pe = audio.cross_positional_embeddings if audio is not None else None
+        original_audio_self_mask = audio.self_attention_mask if audio is not None else None
+        original_audio_v2a_mask = audio.v2a_cross_attention_mask if audio is not None else None
+
         # Process transformer blocks
         model_parallel_block_devices = getattr(self, "_ltx2_model_parallel_block_devices", None)
         model_parallel_transfer_config = getattr(self, "_ltx2_model_parallel_transfer_config", None)
@@ -700,6 +919,275 @@ class LTXModel(torch.nn.Module):
         remote_stage_split = getattr(self, "_ltx2_remote_stage_split", None)
         remote_stage_cache_key = getattr(self, "_ltx2_remote_stage_cache_key", None)
         for block_idx, block in enumerate(self.transformer_blocks):
+            if use_tread and route_ptr < len(routes) and block_idx == routes[route_ptr]["start_layer_idx"]:
+                route = routes[route_ptr]
+                route_target = str(route.get("target", "video")).lower()
+                route_video = (
+                    route_target in {"video", "both"}
+                    and video is not None
+                    and bool(video.enabled)
+                    and isinstance(video.x, torch.Tensor)
+                    and video.x.numel() > 0
+                )
+                route_audio = (
+                    route_target in {"audio", "both"}
+                    and audio is not None
+                    and bool(audio.enabled)
+                    and isinstance(audio.x, torch.Tensor)
+                    and audio.x.numel() > 0
+                )
+
+                if not route_video and not route_audio:
+                    route_ptr += 1
+                else:
+                    routed_video_a2v_mask = original_video_a2v_mask
+                    routed_audio_v2a_mask = original_audio_v2a_mask
+                    video_keep_len = None
+                    video_original_len = None
+                    audio_keep_len = None
+                    audio_original_len = None
+
+                    if route_video:
+                        video_route_mask_info = router.get_mask(
+                            video.x,
+                            mask_ratio=float(route["selection_ratio"]),
+                            force_keep=video.force_keep_mask,
+                        )
+                        saved_video_x = video.x.clone()
+                        routed_video_x = router.start_route(video.x, video_route_mask_info)
+                        video_keep_len = int(routed_video_x.shape[1])
+                        video_original_len = int(video.x.shape[1])
+                        if not getattr(self, "_tread_video_shape_logged", False):
+                            force_keep_count = 0
+                            if isinstance(video.force_keep_mask, torch.Tensor):
+                                force_keep_count = int(
+                                    video.force_keep_mask.reshape(video.force_keep_mask.shape[0], -1).sum(dim=1).max().item()
+                                )
+                            requested_drop_ratio = float(route["selection_ratio"])
+                            actual_keep_ratio = float(video_keep_len) / float(max(video_original_len, 1))
+                            actual_drop_ratio = 1.0 - actual_keep_ratio
+                            logger.info(
+                                "LTX-2 TREAD video routing active: seq_len=%s keep_len=%s requested_drop_ratio=%.4f "
+                                "actual_drop_ratio=%.4f actual_keep_ratio=%.4f force_keep_max=%s route_layers=%s..%s",
+                                video_original_len,
+                                video_keep_len,
+                                requested_drop_ratio,
+                                actual_drop_ratio,
+                                actual_keep_ratio,
+                                force_keep_count,
+                                route["start_layer_idx"],
+                                route["end_layer_idx"],
+                            )
+                            if requested_drop_ratio > 0.0 and actual_drop_ratio < requested_drop_ratio * 0.5:
+                                logger.warning(
+                                    "LTX-2 TREAD video routing kept many forced tokens: requested_drop_ratio=%.4f but "
+                                    "actual_drop_ratio=%.4f. Training speedup may be small.",
+                                    requested_drop_ratio,
+                                    actual_drop_ratio,
+                                )
+                            self._tread_video_shape_logged = True
+                        video = replace(
+                            video,
+                            x=routed_video_x,
+                            timesteps=self._route_token_tensor(original_video_timesteps, video_route_mask_info, video_keep_len),
+                            embedded_timestep=self._route_token_tensor(
+                                original_video_embedded_timestep, video_route_mask_info, video_keep_len
+                            ),
+                            prompt_timestep=self._route_token_tensor(
+                                original_video_prompt_timestep, video_route_mask_info, video_keep_len
+                            ),
+                            cross_scale_shift_timestep=self._route_token_tensor(
+                                original_video_cross_scale_shift_timestep,
+                                video_route_mask_info,
+                                video_keep_len,
+                            ),
+                            cross_gate_timestep=self._route_token_tensor(
+                                original_video_cross_gate_timestep,
+                                video_route_mask_info,
+                                video_keep_len,
+                            ),
+                            dcr_detach_mask=self._route_token_tensor(
+                                original_video_dcr_detach_mask, video_route_mask_info, video_keep_len
+                            ),
+                            force_keep_mask=self._route_token_tensor(
+                                original_video_force_keep_mask, video_route_mask_info, video_keep_len
+                            ),
+                            positional_embeddings=self._route_rope(original_video_pe, video_route_mask_info, video_keep_len),
+                            cross_positional_embeddings=self._route_rope(
+                                original_video_cross_pe, video_route_mask_info, video_keep_len
+                            ),
+                            self_attention_mask=self._route_self_attention_mask(
+                                original_video_self_mask, video_route_mask_info, video_keep_len
+                            ),
+                        )
+                    if route_audio:
+                        audio_route_mask_info = router.get_mask(
+                            audio.x,
+                            mask_ratio=float(route["selection_ratio"]),
+                            force_keep=audio.force_keep_mask,
+                        )
+                        saved_audio_x = audio.x.clone()
+                        routed_audio_x = router.start_route(audio.x, audio_route_mask_info)
+                        audio_keep_len = int(routed_audio_x.shape[1])
+                        audio_original_len = int(audio.x.shape[1])
+                        if not getattr(self, "_tread_audio_shape_logged", False):
+                            force_keep_count = 0
+                            if isinstance(audio.force_keep_mask, torch.Tensor):
+                                force_keep_count = int(
+                                    audio.force_keep_mask.reshape(audio.force_keep_mask.shape[0], -1).sum(dim=1).max().item()
+                                )
+                            requested_drop_ratio = float(route["selection_ratio"])
+                            actual_keep_ratio = float(audio_keep_len) / float(max(audio_original_len, 1))
+                            actual_drop_ratio = 1.0 - actual_keep_ratio
+                            logger.info(
+                                "LTX-2 TREAD audio routing active: seq_len=%s keep_len=%s requested_drop_ratio=%.4f "
+                                "actual_drop_ratio=%.4f actual_keep_ratio=%.4f force_keep_max=%s route_layers=%s..%s",
+                                audio_original_len,
+                                audio_keep_len,
+                                requested_drop_ratio,
+                                actual_drop_ratio,
+                                actual_keep_ratio,
+                                force_keep_count,
+                                route["start_layer_idx"],
+                                route["end_layer_idx"],
+                            )
+                            if requested_drop_ratio > 0.0 and actual_drop_ratio < requested_drop_ratio * 0.5:
+                                logger.warning(
+                                    "LTX-2 TREAD audio routing kept many forced tokens: requested_drop_ratio=%.4f but "
+                                    "actual_drop_ratio=%.4f. Training speedup may be small.",
+                                    requested_drop_ratio,
+                                    actual_drop_ratio,
+                                )
+                            self._tread_audio_shape_logged = True
+                        audio = replace(
+                            audio,
+                            x=routed_audio_x,
+                            timesteps=self._route_token_tensor(original_audio_timesteps, audio_route_mask_info, audio_keep_len),
+                            embedded_timestep=self._route_token_tensor(
+                                original_audio_embedded_timestep, audio_route_mask_info, audio_keep_len
+                            ),
+                            prompt_timestep=self._route_token_tensor(
+                                original_audio_prompt_timestep, audio_route_mask_info, audio_keep_len
+                            ),
+                            cross_scale_shift_timestep=self._route_token_tensor(
+                                original_audio_cross_scale_shift_timestep,
+                                audio_route_mask_info,
+                                audio_keep_len,
+                            ),
+                            cross_gate_timestep=self._route_token_tensor(
+                                original_audio_cross_gate_timestep,
+                                audio_route_mask_info,
+                                audio_keep_len,
+                            ),
+                            dcr_detach_mask=self._route_token_tensor(
+                                original_audio_dcr_detach_mask, audio_route_mask_info, audio_keep_len
+                            ),
+                            force_keep_mask=self._route_token_tensor(
+                                original_audio_force_keep_mask, audio_route_mask_info, audio_keep_len
+                            ),
+                            positional_embeddings=self._route_rope(original_audio_pe, audio_route_mask_info, audio_keep_len),
+                            cross_positional_embeddings=self._route_rope(
+                                original_audio_cross_pe, audio_route_mask_info, audio_keep_len
+                            ),
+                            self_attention_mask=self._route_self_attention_mask(
+                                original_audio_self_mask, audio_route_mask_info, audio_keep_len
+                            ),
+                        )
+
+                    if route_video:
+                        routed_video_a2v_mask = self._route_query_attention_mask(
+                            routed_video_a2v_mask,
+                            video_route_mask_info,
+                            video_keep_len,
+                        )
+                        routed_audio_v2a_mask = self._route_key_attention_mask(
+                            routed_audio_v2a_mask,
+                            video_route_mask_info,
+                            video_keep_len,
+                        )
+                    if route_audio:
+                        routed_video_a2v_mask = self._route_key_attention_mask(
+                            routed_video_a2v_mask,
+                            audio_route_mask_info,
+                            audio_keep_len,
+                        )
+                        routed_audio_v2a_mask = self._route_query_attention_mask(
+                            routed_audio_v2a_mask,
+                            audio_route_mask_info,
+                            audio_keep_len,
+                        )
+
+                    if video is not None and (route_video or route_audio):
+                        video = replace(video, a2v_cross_attention_mask=routed_video_a2v_mask)
+                    if audio is not None and (route_video or route_audio):
+                        audio = replace(audio, v2a_cross_attention_mask=routed_audio_v2a_mask)
+
+                    if route_video:
+                        self._assert_token_length("video.timesteps", video.timesteps, video_keep_len, video_original_len)
+                        self._assert_token_length(
+                            "video.embedded_timestep", video.embedded_timestep, video_keep_len, video_original_len
+                        )
+                        self._assert_token_length(
+                            "video.prompt_timestep", video.prompt_timestep, video_keep_len, video_original_len
+                        )
+                        self._assert_token_length(
+                            "video.cross_scale_shift_timestep",
+                            video.cross_scale_shift_timestep,
+                            video_keep_len,
+                            video_original_len,
+                        )
+                        self._assert_token_length(
+                            "video.cross_gate_timestep", video.cross_gate_timestep, video_keep_len, video_original_len
+                        )
+                        self._assert_token_length(
+                            "video.dcr_detach_mask", video.dcr_detach_mask, video_keep_len, video_original_len
+                        )
+                        self._assert_token_length(
+                            "video.force_keep_mask", video.force_keep_mask, video_keep_len, video_original_len
+                        )
+                        self._assert_token_length(
+                            "video.positional_embeddings", video.positional_embeddings, video_keep_len, video_original_len
+                        )
+                        self._assert_token_length(
+                            "video.cross_positional_embeddings",
+                            video.cross_positional_embeddings,
+                            video_keep_len,
+                            video_original_len,
+                        )
+                    if route_audio:
+                        self._assert_token_length("audio.timesteps", audio.timesteps, audio_keep_len, audio_original_len)
+                        self._assert_token_length(
+                            "audio.embedded_timestep", audio.embedded_timestep, audio_keep_len, audio_original_len
+                        )
+                        self._assert_token_length(
+                            "audio.prompt_timestep", audio.prompt_timestep, audio_keep_len, audio_original_len
+                        )
+                        self._assert_token_length(
+                            "audio.cross_scale_shift_timestep",
+                            audio.cross_scale_shift_timestep,
+                            audio_keep_len,
+                            audio_original_len,
+                        )
+                        self._assert_token_length(
+                            "audio.cross_gate_timestep", audio.cross_gate_timestep, audio_keep_len, audio_original_len
+                        )
+                        self._assert_token_length(
+                            "audio.dcr_detach_mask", audio.dcr_detach_mask, audio_keep_len, audio_original_len
+                        )
+                        self._assert_token_length(
+                            "audio.force_keep_mask", audio.force_keep_mask, audio_keep_len, audio_original_len
+                        )
+                        self._assert_token_length(
+                            "audio.positional_embeddings", audio.positional_embeddings, audio_keep_len, audio_original_len
+                        )
+                        self._assert_token_length(
+                            "audio.cross_positional_embeddings",
+                            audio.cross_positional_embeddings,
+                            audio_keep_len,
+                            audio_original_len,
+                        )
+                    routing_now = True
+
             # Remote-stage mode is explicitly attached by the trainer only when
             # --ltx2_remote_stage is enabled. At the split boundary, local
             # execution stops and autograd continues through the TCP RPC wrapper
@@ -790,7 +1278,7 @@ class LTXModel(torch.nn.Module):
 
             # Phase 2: Prefetch Next k Blocks
             # Trigger load for N+1..N+k on Transfer Stream while N is about to compute
-            prefetch_window = getattr(self, '_prefetch_window', 1)
+            prefetch_window = getattr(self, "_prefetch_window", 1)
             if transfer_stream is not None and getattr(block, "weight_cpu_offloading", False):
                 for offset in range(1, prefetch_window + 1):
                     look_idx = block_idx + offset
@@ -858,7 +1346,57 @@ class LTXModel(torch.nn.Module):
                 if not getattr(block, "weight_cpu_offloading", False):
                     self.offloader.submit_move_blocks_forward(self.transformer_blocks, block_idx)
                 if not self.offloader.forward_only:
-                    pass # Keep non-linear params on GPU for backward pass
+                    pass  # Keep non-linear params on GPU for backward pass
+
+            if (
+                use_tread
+                and routing_now
+                and (video_route_mask_info is not None or audio_route_mask_info is not None)
+                and block_idx == routes[route_ptr]["end_layer_idx"]
+            ):
+                if video_route_mask_info is not None and video is not None:
+                    video = replace(
+                        video,
+                        x=router.end_route(video.x, video_route_mask_info, original_x=saved_video_x),
+                        timesteps=original_video_timesteps,
+                        embedded_timestep=original_video_embedded_timestep,
+                        prompt_timestep=original_video_prompt_timestep,
+                        cross_scale_shift_timestep=original_video_cross_scale_shift_timestep,
+                        cross_gate_timestep=original_video_cross_gate_timestep,
+                        dcr_detach_mask=original_video_dcr_detach_mask,
+                        force_keep_mask=original_video_force_keep_mask,
+                        positional_embeddings=original_video_pe,
+                        cross_positional_embeddings=original_video_cross_pe,
+                        self_attention_mask=original_video_self_mask,
+                        a2v_cross_attention_mask=original_video_a2v_mask,
+                    )
+                elif video is not None:
+                    video = replace(video, a2v_cross_attention_mask=original_video_a2v_mask)
+
+                if audio_route_mask_info is not None and audio is not None:
+                    audio = replace(
+                        audio,
+                        x=router.end_route(audio.x, audio_route_mask_info, original_x=saved_audio_x),
+                        timesteps=original_audio_timesteps,
+                        embedded_timestep=original_audio_embedded_timestep,
+                        prompt_timestep=original_audio_prompt_timestep,
+                        cross_scale_shift_timestep=original_audio_cross_scale_shift_timestep,
+                        cross_gate_timestep=original_audio_cross_gate_timestep,
+                        dcr_detach_mask=original_audio_dcr_detach_mask,
+                        force_keep_mask=original_audio_force_keep_mask,
+                        positional_embeddings=original_audio_pe,
+                        cross_positional_embeddings=original_audio_cross_pe,
+                        self_attention_mask=original_audio_self_mask,
+                        v2a_cross_attention_mask=original_audio_v2a_mask,
+                    )
+                elif audio is not None:
+                    audio = replace(audio, v2a_cross_attention_mask=original_audio_v2a_mask)
+                saved_video_x = None
+                saved_audio_x = None
+                video_route_mask_info = None
+                audio_route_mask_info = None
+                routing_now = False
+                route_ptr += 1
 
         return video, audio
 
@@ -875,21 +1413,21 @@ class LTXModel(torch.nn.Module):
         if isinstance(embedded_timestep, tuple) and len(embedded_timestep) == 4:
             unique_embedded, inverse_indices_1d, B, T = embedded_timestep
             embedded_timestep = unique_embedded[inverse_indices_1d].view(B, T, -1)
-        
+
         # AdaLN Structural Fix: Force modulation to happen in Float32 to prevent overflow (10^18 issue)
         # This is strictly required for stability when large activations meet scale factors.
         x_32 = x.to(torch.float32)
         embedded_32 = embedded_timestep.to(device=x.device, dtype=torch.float32)
-        
+
         # Apply scale-shift modulation in float32
         scale_shift_values = scale_shift_table[None, None].to(device=x.device, dtype=torch.float32) + embedded_32[:, :, None]
         shift, scale = scale_shift_values[:, :, 0], scale_shift_values[:, :, 1]
 
         # LayerNorm in float32 (using functional to avoid in-place module dtype modification)
         x_32 = torch.nn.functional.layer_norm(x_32, norm_out.normalized_shape, eps=norm_out.eps)
-        
+
         x_32 = x_32 * (1 + scale) + shift
-        
+
         # Back to original dtype for projection
         x = x_32.to(x.dtype)
         x = proj_out(x)
@@ -903,7 +1441,7 @@ class LTXModel(torch.nn.Module):
     ) -> None:
         """
         Enable gradient checkpointing with optional CPU offloading.
-        
+
         Args:
             activation_cpu_offloading: If True, offload activations to CPU (save memory).
             weight_cpu_offloading: If True, use block-level weight offloading (ultra-low VRAM).
@@ -1063,5 +1601,6 @@ class X0Model(torch.nn.Module):
         denoised_video = to_denoised(video.latent, vx, video.timesteps) if vx is not None else None
         denoised_audio = to_denoised(audio.latent, ax, audio.timesteps) if ax is not None else None
         return denoised_video, denoised_audio
-logger = logging.getLogger(__name__)
 
+
+logger = logging.getLogger(__name__)

@@ -33,6 +33,7 @@ class TransformerArgs:
     a2v_cross_attention_mask: torch.Tensor | None = None
     v2a_cross_attention_mask: torch.Tensor | None = None
     dcr_detach_mask: torch.Tensor | None = None
+    force_keep_mask: torch.Tensor | None = None
 
 
 class TransformerArgsPreprocessor:
@@ -73,18 +74,18 @@ class TransformerArgsPreprocessor:
         use_unique_optimization: bool = True,
     ) -> tuple:
         """Prepare timestep embeddings.
-        
+
         When use_unique_optimization is True (default), computes embeddings only for unique timestep
         values and returns a tuple format for lazy expansion. This drastically reduces VRAM during
         inference when many tokens share the same timestep.
-        
+
         Returns:
             If optimized: tuple of (unique_emb, inverse_indices_1d, batch_size, num_tokens)
             If not optimized: regular tensor [batch_size, num_tokens, dim]
         """
         timestep_scaled = timestep * self.timestep_scale_multiplier
         adaln_module = self.adaln if adaln is None else adaln
-        
+
         # Get original shape for reconstruction
         orig_shape = timestep_scaled.shape
         B = batch_size
@@ -93,14 +94,14 @@ class TransformerArgsPreprocessor:
         if use_unique_optimization:
             # Pre-compute embeddings only for unique timestep values
             unique_timesteps, inverse_indices_1d = torch.unique(timestep_scaled.flatten(), return_inverse=True)
-            
+
             # Compute embeddings for unique timesteps only
             unique_emb, unique_embedded = adaln_module(
                 unique_timesteps,
                 hidden_dtype=hidden_dtype,
             )
             del unique_timesteps
-            
+
             # Store as tuple, expand on-demand in get_ada_values
             timestep_out = (unique_emb, inverse_indices_1d, B, T)
             embedded_timestep_out = (unique_embedded, inverse_indices_1d, B, T)
@@ -111,7 +112,7 @@ class TransformerArgsPreprocessor:
                 timestep_scaled.flatten(),
                 hidden_dtype=hidden_dtype,
             )
-            
+
             # Second dimension is 1 or number of tokens (if timestep_per_token)
             timestep_emb = timestep_emb.view(batch_size, -1, timestep_emb.shape[-1])
             embedded_timestep = embedded_timestep.view(batch_size, -1, embedded_timestep.shape[-1])
@@ -143,14 +144,10 @@ class TransformerArgsPreprocessor:
         # Validate common 2D token masks early to avoid downstream attention errors.
         if attention_mask is not None and attention_mask.dim() == 2:
             if int(attention_mask.shape[0]) != batch_size:
-                raise ValueError(
-                    "Context mask batch mismatch: "
-                    f"got {int(attention_mask.shape[0])}, expected {batch_size}."
-                )
+                raise ValueError(f"Context mask batch mismatch: got {int(attention_mask.shape[0])}, expected {batch_size}.")
             if int(attention_mask.shape[-1]) != int(context.shape[1]):
                 raise ValueError(
-                    "Context mask length mismatch: "
-                    f"got {int(attention_mask.shape[-1])}, expected {int(context.shape[1])}."
+                    f"Context mask length mismatch: got {int(attention_mask.shape[-1])}, expected {int(context.shape[1])}."
                 )
 
         return context, attention_mask
@@ -168,13 +165,11 @@ class TransformerArgsPreprocessor:
         if attention_mask.dtype == torch.bool:
             attention_mask = attention_mask.to(torch.int64)
 
-        return (attention_mask - 1).to(x_dtype).reshape(
-            (attention_mask.shape[0], 1, -1, attention_mask.shape[-1])
-        ) * torch.finfo(x_dtype).max
+        return (attention_mask - 1).to(x_dtype).reshape((attention_mask.shape[0], 1, -1, attention_mask.shape[-1])) * torch.finfo(
+            x_dtype
+        ).max
 
-    def _prepare_self_attention_mask(
-        self, attention_mask: torch.Tensor | None, x_dtype: torch.dtype
-    ) -> torch.Tensor | None:
+    def _prepare_self_attention_mask(self, attention_mask: torch.Tensor | None, x_dtype: torch.dtype) -> torch.Tensor | None:
         if attention_mask is None:
             return None
 
@@ -290,6 +285,7 @@ class TransformerArgsPreprocessor:
             a2v_cross_attention_mask=modality.a2v_cross_attention_mask,
             v2a_cross_attention_mask=modality.v2a_cross_attention_mask,
             dcr_detach_mask=modality.dcr_detach_mask,
+            force_keep_mask=modality.force_keep_mask,
         )
 
 

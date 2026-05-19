@@ -95,7 +95,8 @@ def build_keyframe_extension(
             g_strength = g_strength_raw.to(device=device, dtype=torch.float32)
             if torch.any((g_strength < 0.0) | (g_strength > 1.0)):
                 logger.warning(
-                    "keyframe_guides[%d]: per-sample strength has values outside [0,1]; clamping.", gi,
+                    "keyframe_guides[%d]: per-sample strength has values outside [0,1]; clamping.",
+                    gi,
                 )
                 g_strength = g_strength.clamp(0.0, 1.0)
             g_strength_is_per_sample = True
@@ -105,7 +106,8 @@ def build_keyframe_extension(
             if g_strength < 0.0 or g_strength > 1.0:
                 logger.warning(
                     "keyframe_guides[%d]: strength=%.3f outside [0,1]; clamping.",
-                    gi, g_strength,
+                    gi,
+                    g_strength,
                 )
                 g_strength = max(0.0, min(1.0, g_strength))
             g_strength_is_per_sample = False
@@ -118,9 +120,7 @@ def build_keyframe_extension(
         g_latent = g_latent.to(device=device, dtype=dtype)
         g_b, g_c, g_t, g_h, g_w = g_latent.shape
         if g_b != bsz or g_c != video_channels:
-            raise ValueError(
-                f"keyframe_guides[{gi}] shape {(g_b, g_c)} does not match video (B,C)=({bsz},{video_channels})"
-            )
+            raise ValueError(f"keyframe_guides[{gi}] shape {(g_b, g_c)} does not match video (B,C)=({bsz},{video_channels})")
 
         # Per-sample dropout: for samples where strength=0 (losers in a
         # per-sample Bernoulli), replace clean target-derived content with
@@ -128,7 +128,7 @@ def build_keyframe_extension(
         # content tagged as fully noisy (denoise_mask=1) — a leak that biases
         # the off-regime away from "no signal".
         if g_strength_is_per_sample:
-            losers = (g_strength <= 0.0)
+            losers = g_strength <= 0.0
             if bool(losers.any().item()):
                 g_latent = g_latent.clone()
                 noise = torch.randn_like(g_latent)
@@ -139,7 +139,11 @@ def build_keyframe_extension(
         g_tokens = patchifier.patchify(g_latent)
         g_coords = patchifier.get_patch_grid_bounds(
             output_shape=VideoLatentShape(
-                batch=bsz, channels=g_c, frames=g_t, height=g_h, width=g_w,
+                batch=bsz,
+                channels=g_c,
+                frames=g_t,
+                height=g_h,
+                width=g_w,
             ),
             device=device,
         )
@@ -166,7 +170,10 @@ def build_keyframe_extension(
             g_mask = (1.0 - g_strength).unsqueeze(-1).expand(bsz, g_count).to(dtype=dtype)
         else:
             g_mask = torch.full(
-                (bsz, g_count), 1.0 - g_strength, device=device, dtype=dtype,
+                (bsz, g_count),
+                1.0 - g_strength,
+                device=device,
+                dtype=dtype,
             )
 
         chunks_t.append(g_tokens)
@@ -183,9 +190,7 @@ def build_keyframe_extension(
     return appended_tokens, appended_positions, appended_mask, appended_count
 
 
-def _split_av_context(
-    model: nn.Module, context: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor]:
+def _split_av_context(model: nn.Module, context: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Split a concatenated AV context tensor into (video_context, audio_context).
 
     LTX-2.0 (caption_proj_before_connector=False): context is raw text embeddings
@@ -210,12 +215,7 @@ def _split_av_context(
                 if isinstance(cc, int) and cc > 0:
                     split_video_dim = cc
                     split_audio_dim = cc
-    if (
-        isinstance(split_video_dim, int)
-        and isinstance(split_audio_dim, int)
-        and split_video_dim > 0
-        and split_audio_dim > 0
-    ):
+    if isinstance(split_video_dim, int) and isinstance(split_audio_dim, int) and split_video_dim > 0 and split_audio_dim > 0:
         expected_total = split_video_dim + split_audio_dim
         if expected_total == context.shape[-1]:
             return (
@@ -246,21 +246,13 @@ def _patch_lora_load_state_dict_for_audio(network: lora.LoRANetwork) -> lora.LoR
         non_audio_missing = _filter_audio_keys(missing)
         non_audio_unexpected = _filter_audio_keys(unexpected)
         if non_audio_missing:
-            raise RuntimeError(
-                f"Missing non-audio LoRA keys in state_dict: {non_audio_missing[:10]}"
-            )
+            raise RuntimeError(f"Missing non-audio LoRA keys in state_dict: {non_audio_missing[:10]}")
         if non_audio_unexpected:
-            raise RuntimeError(
-                f"Unexpected non-audio LoRA keys in state_dict: {non_audio_unexpected[:10]}"
-            )
+            raise RuntimeError(f"Unexpected non-audio LoRA keys in state_dict: {non_audio_unexpected[:10]}")
         if missing and not non_audio_missing:
-            logger.warning(
-                "LTX2 LoRA: missing audio keys in checkpoint; initializing audio LoRA weights."
-            )
+            logger.warning("LTX2 LoRA: missing audio keys in checkpoint; initializing audio LoRA weights.")
         if unexpected and not non_audio_unexpected:
-            logger.warning(
-                "LTX2 LoRA: unexpected audio keys in checkpoint; ignoring audio LoRA weights."
-            )
+            logger.warning("LTX2 LoRA: unexpected audio keys in checkpoint; ignoring audio LoRA weights.")
         try:
             incompatible = torch.nn.modules.module._IncompatibleKeys(  # type: ignore[attr-defined]
                 missing_keys=non_audio_missing,
@@ -328,7 +320,12 @@ class LTX2Wrapper(nn.Module):
         raise AttributeError("Underlying LTX2 model does not support gradient checkpointing")
 
     def enable_block_swap(
-        self, blocks_to_swap: int, device: torch.device, supports_backward: bool, use_pinned_memory: bool = False, swap_norms: bool = False
+        self,
+        blocks_to_swap: int,
+        device: torch.device,
+        supports_backward: bool,
+        use_pinned_memory: bool = False,
+        swap_norms: bool = False,
     ):
         return self.model.enable_block_swap(blocks_to_swap, device, supports_backward, use_pinned_memory, swap_norms=swap_norms)
 
@@ -510,6 +507,7 @@ class LTX2Wrapper(nn.Module):
         video_timesteps = None
         video_positions = None
         a2v_cross_attention_mask = None
+        force_keep_mask = None
         if model_video_enabled:
             video_tokens = self._video_patchifier.patchify(video_latents)
             video_seq_len = video_tokens.shape[1]
@@ -562,6 +560,17 @@ class LTX2Wrapper(nn.Module):
                         )
                     video_positions = video_positions_override.to(device=video_positions.device, dtype=video_positions.dtype)
                 a2v_cross_attention_mask = transformer_options.get("a2v_cross_attention_mask")
+                force_keep_mask = transformer_options.get("force_keep_mask")
+                if force_keep_mask is not None:
+                    if not isinstance(force_keep_mask, torch.Tensor):
+                        raise TypeError(f"Expected force_keep_mask to be a torch.Tensor, got: {type(force_keep_mask)}")
+                    if force_keep_mask.dim() > 2:
+                        force_keep_mask = force_keep_mask.view(force_keep_mask.shape[0], -1)
+                    if force_keep_mask.shape != (bsz, video_seq_len):
+                        raise ValueError(
+                            f"force_keep_mask shape mismatch: got {tuple(force_keep_mask.shape)}, expected {(bsz, video_seq_len)}"
+                        )
+                    force_keep_mask = force_keep_mask.to(device=video_tokens.device, dtype=torch.bool)
 
         # Keyframe guide tokens appended to the video stream. Per-token
         # denoise_mask = 1 - strength → effective timestep = mask * sigma:
@@ -583,10 +592,20 @@ class LTX2Wrapper(nn.Module):
                     video_tokens = torch.cat([video_tokens, appended_tokens], dim=1)
                     video_positions = torch.cat([video_positions, appended_positions], dim=2)
                     # sigma: [B]; broadcast to per-token effective timestep.
-                    extra_ts = (appended_mask * sigma.view(bsz, 1)).to(
-                        device=video_timesteps.device, dtype=video_timesteps.dtype
-                    )
+                    extra_ts = (appended_mask * sigma.view(bsz, 1)).to(device=video_timesteps.device, dtype=video_timesteps.dtype)
                     video_timesteps = torch.cat([video_timesteps, extra_ts], dim=1)
+                    if force_keep_mask is None:
+                        force_keep_mask = torch.zeros(
+                            (bsz, video_seq_len),
+                            device=video_tokens.device,
+                            dtype=torch.bool,
+                        )
+                    appended_force_keep = torch.ones(
+                        (bsz, appended_video_token_count),
+                        device=force_keep_mask.device,
+                        dtype=torch.bool,
+                    )
+                    force_keep_mask = torch.cat([force_keep_mask, appended_force_keep], dim=1)
 
         # Connector LoRA: run connectors on pre-connector features if available
         if (
@@ -597,9 +616,7 @@ class LTX2Wrapper(nn.Module):
             raw_video_features = transformer_options["video_features"]
             raw_audio_features = transformer_options.get("audio_features")
             features_mask = transformer_options.get("features_attention_mask", attention_mask)
-            video_ctx, audio_ctx, connector_mask = self._run_connectors(
-                raw_video_features, raw_audio_features, features_mask
-            )
+            video_ctx, audio_ctx, connector_mask = self._run_connectors(raw_video_features, raw_audio_features, features_mask)
             if audio_ctx is not None:
                 context = torch.cat([video_ctx, audio_ctx], dim=-1)
             else:
@@ -610,12 +627,7 @@ class LTX2Wrapper(nn.Module):
         audio_context = context
         audio_context_mask = attention_mask
         v2a_cross_attention_mask = None
-        if (
-            model_video_enabled
-            and not audio_only
-            and audio_latents is not None
-            and isinstance(context, torch.Tensor)
-        ):
+        if model_video_enabled and not audio_only and audio_latents is not None and isinstance(context, torch.Tensor):
             video_context, audio_context = _split_av_context(self.model, context)
 
         video_modality = None
@@ -633,10 +645,12 @@ class LTX2Wrapper(nn.Module):
                 context_mask=attention_mask,
                 attention_mask=video_self_attention_mask,
                 a2v_cross_attention_mask=a2v_cross_attention_mask,
+                force_keep_mask=force_keep_mask,
             )
 
         audio_modality = None
         audio_shape = None
+        audio_force_keep_mask = None
         if audio_latents is not None:
             if not isinstance(audio_latents, torch.Tensor) or audio_latents.dim() != 4:
                 raise ValueError(f"Expected audio latents shape [B, C, T, F], got: {getattr(audio_latents, 'shape', None)}")
@@ -671,6 +685,18 @@ class LTX2Wrapper(nn.Module):
                 if "audio_context_mask" in transformer_options:
                     audio_context_mask = transformer_options.get("audio_context_mask")
                 v2a_cross_attention_mask = transformer_options.get("v2a_cross_attention_mask")
+                audio_force_keep_mask = transformer_options.get("audio_force_keep_mask")
+                if audio_force_keep_mask is not None:
+                    if not isinstance(audio_force_keep_mask, torch.Tensor):
+                        raise TypeError(f"Expected audio_force_keep_mask to be a torch.Tensor, got: {type(audio_force_keep_mask)}")
+                    if audio_force_keep_mask.dim() > 2:
+                        audio_force_keep_mask = audio_force_keep_mask.view(audio_force_keep_mask.shape[0], -1)
+                    if audio_force_keep_mask.shape != (bsz, audio_seq_len):
+                        raise ValueError(
+                            "audio_force_keep_mask shape mismatch: "
+                            f"got {tuple(audio_force_keep_mask.shape)}, expected {(bsz, audio_seq_len)}"
+                        )
+                    audio_force_keep_mask = audio_force_keep_mask.to(device=audio_tokens.device, dtype=torch.bool)
 
             audio_modality = Modality(
                 enabled=(True if audio_enabled is None else bool(audio_enabled)),
@@ -681,16 +707,12 @@ class LTX2Wrapper(nn.Module):
                 sigma=audio_sigma,
                 context_mask=audio_context_mask,
                 v2a_cross_attention_mask=v2a_cross_attention_mask,
+                force_keep_mask=audio_force_keep_mask,
             )
 
         # TARP: windowed A2V cross-attention mask
         tarp_config = transformer_options.get("tarp_config") if isinstance(transformer_options, dict) else None
-        if (
-            tarp_config is not None
-            and video_modality is not None
-            and audio_modality is not None
-            and audio_seq_len > 0
-        ):
+        if tarp_config is not None and video_modality is not None and audio_modality is not None and audio_seq_len > 0:
             from musubi_tuner.tarp_dcr import compute_tarp_a2v_mask, compute_tarp_v2a_mask
 
             spatial_per_frame = video_seq_len // vframes
@@ -984,7 +1006,9 @@ LTX2_DEFAULT_INCLUDE_PATTERNS = LTX2_INCLUDE_PATTERNS_T2V
 
 
 def _build_exclude_patterns(
-    raw_patterns: Optional[str], audio_video: bool = False, connector_lora: bool = False,  # noqa: ARG001
+    raw_patterns: Optional[str],
+    audio_video: bool = False,
+    connector_lora: bool = False,  # noqa: ARG001
 ) -> List[str]:
     """Build exclude patterns list, including connector exclusions."""
     patterns: List[str] = [
@@ -993,10 +1017,12 @@ def _build_exclude_patterns(
         r".*text_embedding_projection\.audio_aggregate_embed.*",
     ]
     if not connector_lora:
-        patterns.extend([
-            r".*embeddings_connector\..*",
-            r".*audio_embeddings_connector\..*",
-        ])
+        patterns.extend(
+            [
+                r".*embeddings_connector\..*",
+                r".*audio_embeddings_connector\..*",
+            ]
+        )
     if raw_patterns is None:
         return patterns
     user_patterns = ast.literal_eval(raw_patterns)
@@ -1011,10 +1037,7 @@ def _get_include_patterns_for_preset(preset: Optional[str]) -> Optional[List[str
     if preset is None:
         return LTX2_DEFAULT_INCLUDE_PATTERNS
     if preset not in LTX2_LORA_TARGET_PRESETS:
-        raise ValueError(
-            f"Unknown lora_target_preset: {preset!r}. "
-            f"Valid presets: {list(LTX2_LORA_TARGET_PRESETS.keys())}"
-        )
+        raise ValueError(f"Unknown lora_target_preset: {preset!r}. Valid presets: {list(LTX2_LORA_TARGET_PRESETS.keys())}")
     return LTX2_LORA_TARGET_PRESETS[preset]
 
 
@@ -1092,7 +1115,9 @@ def create_arch_network(
 
     connector_lora = kwargs.pop("connector_lora", False)
     kwargs["exclude_patterns"] = _build_exclude_patterns(
-        kwargs.get("exclude_patterns"), audio_video=audio_video, connector_lora=connector_lora,
+        kwargs.get("exclude_patterns"),
+        audio_video=audio_video,
+        connector_lora=connector_lora,
     )
 
     target_modules = LTX2_TARGET_REPLACE_MODULES_WITH_CONNECTOR if connector_lora else LTX2_TARGET_REPLACE_MODULES
@@ -1158,7 +1183,9 @@ def create_arch_network_from_weights(
         connector_lora = any("embeddings_connector" in k for k in weights_sd.keys())
 
     kwargs["exclude_patterns"] = _build_exclude_patterns(
-        kwargs.get("exclude_patterns"), audio_video=audio_video, connector_lora=connector_lora,
+        kwargs.get("exclude_patterns"),
+        audio_video=audio_video,
+        connector_lora=connector_lora,
     )
 
     target_modules = LTX2_TARGET_REPLACE_MODULES_WITH_CONNECTOR if connector_lora else LTX2_TARGET_REPLACE_MODULES
@@ -1189,7 +1216,6 @@ def load_connectors_from_checkpoint(
     """
     from musubi_tuner.ltx_2.text_encoders.gemma.embeddings_connector import (
         AudioEmbeddings1DConnectorConfigurator,
-        Embeddings1DConnector,
         Embeddings1DConnectorConfigurator,
     )
 
@@ -1210,10 +1236,10 @@ def load_connectors_from_checkpoint(
         with safe_open(path, framework="pt", device=str(device)) as f:
             for key in f.keys():
                 if key.startswith(video_prefix):
-                    local_key = key[len(video_prefix):]
+                    local_key = key[len(video_prefix) :]
                     video_sd[local_key] = f.get_tensor(key).to(dtype=dtype)
                 elif key.startswith(audio_prefix) and audio_connector is not None:
-                    local_key = key[len(audio_prefix):]
+                    local_key = key[len(audio_prefix) :]
                     audio_sd[local_key] = f.get_tensor(key).to(dtype=dtype)
 
     if video_sd:
