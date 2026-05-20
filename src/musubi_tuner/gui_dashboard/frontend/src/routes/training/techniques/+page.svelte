@@ -666,6 +666,20 @@
 					</div>
 				</div>
 
+				<div class="p-3" style="background: var(--bg-elevated); border-radius: var(--radius-sm); border: 1px solid var(--border-subtle);">
+					<div class="flex items-center justify-between mb-1">
+						<span class="text-[12px] font-semibold" style="color: var(--text-primary);">AV Attention Loss</span>
+						<FormToggle fieldPath="training.av_attention_loss_weighting" checked={$projectConfig?.training?.av_attention_loss_weighting ?? false} onchange={(e) => updateTraining('av_attention_loss_weighting', e.target.checked)} />
+					</div>
+					<p class="text-[11px] leading-relaxed mb-2" style="color: var(--text-muted);">
+						Uses A2V/V2A attention concentration to upweight selected denoising loss tokens. Requires AV mode.
+					</p>
+					<div class="grid grid-cols-2 gap-2">
+						<FormField type="number" fieldPath="training.av_attention_loss_max" value={$projectConfig?.training?.av_attention_loss_max ?? 1.5} oninput={(e) => updateTraining('av_attention_loss_max', Number(e.target.value))} step="0.05" min={1} disabled={!$projectConfig?.training?.av_attention_loss_weighting} tooltip="Maximum token loss multiplier. Default 1.5." />
+						<FormField type="number" fieldPath="training.av_attention_loss_warmup_steps" value={$projectConfig?.training?.av_attention_loss_warmup_steps ?? 400} oninput={(e) => updateTraining('av_attention_loss_warmup_steps', Number(e.target.value))} step="50" min={0} disabled={!$projectConfig?.training?.av_attention_loss_weighting} tooltip="Steps before reaching the maximum multiplier." />
+					</div>
+				</div>
+
 				<!-- Audio Quality Metrics -->
 				<div class="p-3" style="background: var(--bg-elevated); border-radius: var(--radius-sm); border: 1px solid var(--border-subtle);">
 					<div class="flex items-center justify-between mb-1">

@@ -995,6 +995,9 @@ class NetworkTrainer:
     def modify_video_loss_per_element(self, args, per_elem, out, network_dtype):
         return per_elem, {}
 
+    def modify_audio_loss_per_element(self, args, per_elem, out, network_dtype):
+        return per_elem, {}
+
     def compute_video_extra_loss(self, args, out, network_dtype):
         return None, {}
 
@@ -3780,6 +3783,7 @@ class NetworkTrainer:
                             args.weighting_scheme, noise_scheduler, timesteps, accelerator.device, dit_dtype
                         )
 
+                        self._current_train_global_step = global_step
                         model_pred, target = self.call_dit(
                             args,
                             accelerator,
@@ -3831,6 +3835,8 @@ class NetworkTrainer:
                                     per_elem = per_elem * w
                                 if tag == "video":
                                     per_elem, _ = self.modify_video_loss_per_element(args, per_elem, out, network_dtype)
+                                elif tag == "audio":
+                                    per_elem, _ = self.modify_audio_loss_per_element(args, per_elem, out, network_dtype)
                                 loss, _ = apply_loss_mask(per_elem, mask)
                                 return loss
 
@@ -3862,7 +3868,7 @@ class NetworkTrainer:
                                 and uncertainty_log_var_video is not None
                                 and uncertainty_log_var_audio is not None
                             ):
-                                audio_loss = _masked_loss(audio_pred, audio_target, audio_loss_mask)
+                                audio_loss = _masked_loss(audio_pred, audio_target, audio_loss_mask, tag="audio")
                                 loss = compute_uncertainty_weighted_loss(
                                     video_loss,
                                     audio_loss,
@@ -3870,7 +3876,7 @@ class NetworkTrainer:
                                     uncertainty_log_var_audio,
                                 )
                             elif audio_loss_balance_mode == "ogm_ge" and has_audio_loss:
-                                audio_loss = _masked_loss(audio_pred, audio_target, audio_loss_mask)
+                                audio_loss = _masked_loss(audio_pred, audio_target, audio_loss_mask, tag="audio")
                                 ogm_ge_state = compute_ogm_ge_coefficients(
                                     float(video_loss.detach().item()),
                                     float(audio_loss.detach().item()),
@@ -3896,7 +3902,7 @@ class NetworkTrainer:
                                         has_audio_loss=has_audio_loss,
                                     )
                                 if has_audio_loss:
-                                    audio_loss = _masked_loss(audio_pred, audio_target, audio_loss_mask)
+                                    audio_loss = _masked_loss(audio_pred, audio_target, audio_loss_mask, tag="audio")
                                     audio_weight = float(out.get("audio_loss_weight", 1.0))
                                     if audio_loss_balance_mode == "inv_freq":
                                         audio_weight = compute_inverse_frequency_audio_weight(
@@ -4200,6 +4206,7 @@ class NetworkTrainer:
 
                     if _is_first_step:
                         _log_vram("FIRST_ITER: BEFORE call_dit (forward pass)", logger)
+                    self._current_train_global_step = global_step
                     model_pred, target = self.call_dit(
                         args,
                         accelerator,
@@ -4259,6 +4266,10 @@ class NetworkTrainer:
                                 per_elem = per_elem * w
                             if tag == "video":
                                 per_elem, modifier_metrics = self.modify_video_loss_per_element(args, per_elem, out, network_dtype)
+                                for k, v in modifier_metrics.items():
+                                    mask_metrics[k] = v
+                            elif tag == "audio":
+                                per_elem, modifier_metrics = self.modify_audio_loss_per_element(args, per_elem, out, network_dtype)
                                 for k, v in modifier_metrics.items():
                                     mask_metrics[k] = v
                             loss, metrics = apply_loss_mask(per_elem, mask)

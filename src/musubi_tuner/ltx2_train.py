@@ -12,7 +12,7 @@ import random
 import re
 import time
 from multiprocessing import Value
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import toml
 import torch
@@ -253,6 +253,7 @@ def _masked_mse(
     dtype: torch.dtype,
     loss_type: str = "mse",
     huber_delta: float = 1.0,
+    per_elem_modifier: Optional[Callable[[torch.Tensor], tuple[torch.Tensor, dict[str, float]]]] = None,
 ) -> torch.Tensor:
     if isinstance(tgt, torch.Tensor):
         pred = pred.to(device=tgt.device, dtype=dtype)
@@ -270,6 +271,8 @@ def _masked_mse(
             while w.dim() > per_elem.dim() and w.shape[-1] == 1:
                 w = w.squeeze(-1)
         per_elem = per_elem * w
+    if per_elem_modifier is not None:
+        per_elem, _ = per_elem_modifier(per_elem)
     if mask is None:
         return per_elem.mean()
 
@@ -2819,6 +2822,7 @@ def _setup_ltx2_full_ft_pre_train_hooks(
     # Full fine-tuning does not use LTX2NetworkTrainer.pre_train_hook, so
     # opt-in shared hooks that do not add optimizer parameters are installed here.
     trainer._setup_av_cross_grad_surgery(args, accelerator, transformer=transformer, network=None)
+    trainer._setup_av_attention_loss_weighting(args, accelerator, transformer=transformer)
 
 
 def main() -> None:
@@ -4000,6 +4004,9 @@ def main() -> None:
         "ss_av_cross_grad_surgery_args": (
             " ".join(args.av_cross_grad_surgery_args) if getattr(args, "av_cross_grad_surgery_args", None) else None
         ),
+        "ss_av_attention_loss_weighting": bool(getattr(args, "av_attention_loss_weighting", False)),
+        "ss_av_attention_loss_max": getattr(args, "av_attention_loss_max", 1.5),
+        "ss_av_attention_loss_warmup_steps": getattr(args, "av_attention_loss_warmup_steps", 400),
         "ss_freeze_early_blocks": getattr(args, "freeze_early_blocks", 0),
         "ss_freeze_block_indices": getattr(args, "freeze_block_indices", None),
         "ss_block_lr_scales": getattr(args, "block_lr_scales", None),
@@ -5404,6 +5411,7 @@ def main() -> None:
                     args.weighting_scheme, noise_scheduler, timesteps, accelerator.device, trainer.dit_dtype
                 )
 
+                trainer._current_train_global_step = global_step
                 model_pred, target = trainer.call_dit(
                     args,
                     accelerator,
@@ -5442,6 +5450,9 @@ def main() -> None:
                         dtype=trainer.dit_dtype,
                         loss_type=_loss_type,
                         huber_delta=_huber_delta,
+                        per_elem_modifier=lambda per_elem: trainer.modify_video_loss_per_element(
+                            args, per_elem, out, trainer.dit_dtype
+                        ),
                     )
                     # Base weights: dataset config × CLI override.
                     video_weight = float(out.get("video_loss_weight", 1.0)) * cli_video_loss_weight
@@ -5461,6 +5472,9 @@ def main() -> None:
                             dtype=trainer.dit_dtype,
                             loss_type=_loss_type,
                             huber_delta=_huber_delta,
+                            per_elem_modifier=lambda per_elem: trainer.modify_audio_loss_per_element(
+                                args, per_elem, out, trainer.dit_dtype
+                            ),
                         )
                         audio_weight = float(out.get("audio_loss_weight", 1.0)) * cli_audio_loss_weight
 

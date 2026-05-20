@@ -1140,6 +1140,23 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         nargs="*",
         help=("Key=value args for AV cross grad surgery, e.g. a2v=0:0,1-10:0.1,40-47:0.3 v2a=40-47:0.3 projections=k,v"),
     )
+    parser.add_argument(
+        "--av_attention_loss_weighting",
+        action="store_true",
+        help="Enable AV cross-attention-derived loss weighting. Requires --ltx2_mode av.",
+    )
+    parser.add_argument(
+        "--av_attention_loss_max",
+        type=float,
+        default=1.5,
+        help="Maximum per-token multiplier for --av_attention_loss_weighting. Default: 1.5.",
+    )
+    parser.add_argument(
+        "--av_attention_loss_warmup_steps",
+        type=int,
+        default=400,
+        help="Warmup steps before --av_attention_loss_weighting reaches --av_attention_loss_max. Default: 400.",
+    )
 
     # -- Audio Metrics --
     parser.add_argument(

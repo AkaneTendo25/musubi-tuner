@@ -1366,6 +1366,12 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
         _append_key_value_args(args_parts, t.av_cross_grad_surgery_args)
         if args_parts:
             cmd += ["--av_cross_grad_surgery_args"] + args_parts
+    if t.av_attention_loss_weighting:
+        cmd.append("--av_attention_loss_weighting")
+        if t.av_attention_loss_max != 1.5:
+            cmd += ["--av_attention_loss_max", str(t.av_attention_loss_max)]
+        if t.av_attention_loss_warmup_steps != 400:
+            cmd += ["--av_attention_loss_warmup_steps", str(t.av_attention_loss_warmup_steps)]
 
     # Audio Metrics
     if t.audio_metrics:

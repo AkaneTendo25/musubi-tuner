@@ -1003,6 +1003,12 @@ Bare `--av_cross_grad_surgery` uses the OmniNFT-inspired A2V schedule `a2v=0:0,1
 ```
 Schedule entries are comma-separated `block:scale` or `start-end:scale` selectors. Scales must be in `[0, 1]`. Blocks not listed keep normal gradients.
 
+**AV Attention Loss Weighting** — Uses detached A2V/V2A cross-attention concentration to upweight selected video and audio denoising loss tokens during the existing forward pass. This is opt-in and requires `--ltx2_mode av`.
+```bash
+--av_attention_loss_weighting --av_attention_loss_max 1.5 --av_attention_loss_warmup_steps 400
+```
+The multiplier warms from `1.0` to `--av_attention_loss_max`; tokens without captured attention keep normal loss weight.
+
 **Cross-Task Synergy** — Auxiliary AV losses with one modality clean (timestep=0), intended to provide cross-modal alignment targets. Adds two extra forward passes per AV batch. From [Harmony](https://arxiv.org/abs/2511.21579).
 ```bash
 --cts_lambda_video_driven 0.3 --cts_lambda_audio_driven 0.1
@@ -1031,10 +1037,11 @@ CTS can be combined with TARP. Keep it off unless AV sync or cross-modal alignme
 | `--dcr` | 0 | 0 | N/A (gradient routing) |
 | `--av_cross_grad_surgery` | 0 | 0 | A2V K/V: 0:0, 1-10:0.1, 40-47:0.3 |
 | `--cts_lambda_*` | +1 per enabled direction | 0 | 0.1 - 0.3 |
+| `--av_attention_loss_weighting` | 0 | 0 | Max 1.5, warmup 400 steps |
 | `--tread` / `--tread_args` | 0 | 0 | N/A (routing only) |
 
 > [!CAUTION]
-> Some preservation techniques add transformer forward passes per step. Audio DOP costs apply only on non-audio steps. CTS adds one forward per enabled direction. TARP, DCR, AV Cross Grad Surgery, and TREAD add no extra passes; they modify the existing forward/backward in-place.
+> Some preservation techniques add transformer forward passes per step. Audio DOP costs apply only on non-audio steps. CTS adds one forward per enabled direction. TARP, DCR, AV Cross Grad Surgery, AV Attention Loss Weighting, and TREAD add no extra passes; they modify the existing forward/backward in-place.
 
 #### CREPA (Cross-frame Representation Alignment)
 

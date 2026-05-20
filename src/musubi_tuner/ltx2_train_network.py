@@ -61,6 +61,12 @@ from musubi_tuner.ltx2_av_cross_grad_surgery import (
     install_av_cross_grad_surgery,
     parse_av_cross_grad_surgery_args,
 )
+from musubi_tuner.ltx2_av_attention_loss import (
+    AVAttentionLossConfig,
+    apply_av_attention_loss_weighting,
+    collect_av_attention_loss_modules,
+    install_av_attention_loss_recorders,
+)
 from musubi_tuner.tread import TREADRouter, default_ltx_tread_route, parse_tread_args
 
 # LTX-2 latent normalization defaults.
@@ -608,6 +614,10 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
         self._dcr_reference_detach: bool = True
         self._av_cross_grad_surgery_handle = None
         self._av_cross_grad_surgery_config = None
+        self._av_attention_loss_handle = None
+        self._av_attention_loss_config = None
+        self._av_attention_loss_modules: list[tuple[str, str, torch.nn.Module]] = []
+        self._current_train_global_step: int = 0
 
         # CREPA (off by default)
         self._crepa = None
@@ -903,6 +913,7 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
         self._setup_preservation(args, accelerator)
         self._setup_tarp_dcr(args)
         self._setup_av_cross_grad_surgery(args, accelerator, transformer, network)
+        self._setup_av_attention_loss_weighting(args, accelerator, transformer)
         self._setup_crepa(args, accelerator, transformer)
         self._setup_self_flow(args, accelerator, transformer, network)
         self._setup_audio_metrics(args)
@@ -946,17 +957,23 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             logger.info("Latent delta loss enabled: %s", self._latent_delta_loss_config)
 
     def modify_video_loss_per_element(self, args, per_elem: torch.Tensor, out: Dict[str, Any], network_dtype):
-        if self._latent_temporal_weighting_config is None:
-            return per_elem, {}
-        if float(out.get("video_loss_weight", 1.0)) <= 0.0:
-            return per_elem, {}
-        from musubi_tuner.ltx2_latent_temporal import apply_latent_temporal_weighting
+        metrics: dict[str, float] = {}
+        if self._latent_temporal_weighting_config is not None and float(out.get("video_loss_weight", 1.0)) > 0.0:
+            from musubi_tuner.ltx2_latent_temporal import apply_latent_temporal_weighting
 
-        return apply_latent_temporal_weighting(
-            per_elem,
-            out.get("_latent_temporal"),
-            self._latent_temporal_weighting_config,
-        )
+            per_elem, latent_metrics = apply_latent_temporal_weighting(
+                per_elem,
+                out.get("_latent_temporal"),
+                self._latent_temporal_weighting_config,
+            )
+            metrics.update(latent_metrics)
+
+        per_elem, attn_metrics = self._apply_av_attention_loss_weighting(per_elem, modality="video")
+        metrics.update(attn_metrics)
+        return per_elem, metrics
+
+    def modify_audio_loss_per_element(self, args, per_elem: torch.Tensor, out: Dict[str, Any], network_dtype):
+        return self._apply_av_attention_loss_weighting(per_elem, modality="audio")
 
     def compute_video_extra_loss(self, args, out: Dict[str, Any], network_dtype):
         if self._latent_delta_loss_config is None:
@@ -1135,6 +1152,55 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             "AV cross grad surgery enabled: %s; installed %d projection hooks",
             config.format_summary(),
             len(handle.installed),
+        )
+
+    def _setup_av_attention_loss_weighting(self, args: argparse.Namespace, accelerator=None, transformer=None) -> None:
+        """Install optional AV cross-attention recording for loss weighting."""
+        if self._av_attention_loss_handle is not None:
+            self._av_attention_loss_handle.remove()
+            self._av_attention_loss_handle = None
+        self._av_attention_loss_config = None
+        self._av_attention_loss_modules = []
+
+        if not bool(getattr(args, "av_attention_loss_weighting", False)):
+            return
+        if self._ltx_mode != "av":
+            raise ValueError("--av_attention_loss_weighting requires --ltx2_mode av")
+        if bool(getattr(args, "ltx2_audio_only_model", False)):
+            raise ValueError("--av_attention_loss_weighting requires a video+audio transformer, not --ltx2_audio_only_model")
+        if transformer is None:
+            raise ValueError("--av_attention_loss_weighting requires transformer modules to be available")
+
+        if accelerator is not None and hasattr(accelerator, "unwrap_model"):
+            transformer = accelerator.unwrap_model(transformer)
+        config = AVAttentionLossConfig(
+            max_weight=float(getattr(args, "av_attention_loss_max", 1.5)),
+            warmup_steps=int(getattr(args, "av_attention_loss_warmup_steps", 400)),
+        )
+        modules = collect_av_attention_loss_modules(transformer)
+        handle = install_av_attention_loss_recorders(modules, config)
+        self._av_attention_loss_config = config
+        self._av_attention_loss_modules = modules
+        self._av_attention_loss_handle = handle
+        logger.info(
+            "AV attention loss weighting enabled: max=%.3f warmup_steps=%d modules=%d",
+            config.max_weight,
+            config.warmup_steps,
+            len(modules),
+        )
+
+    def _apply_av_attention_loss_weighting(
+        self,
+        per_elem: torch.Tensor,
+        *,
+        modality: str,
+    ) -> tuple[torch.Tensor, dict[str, float]]:
+        return apply_av_attention_loss_weighting(
+            per_elem,
+            self._av_attention_loss_modules,
+            self._av_attention_loss_config,
+            modality=modality,
+            global_step=getattr(self, "_current_train_global_step", 0),
         )
 
     def _setup_preservation(self, args: argparse.Namespace, accelerator: Accelerator) -> None:
@@ -2701,6 +2767,19 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
         if self._ltx2_audio_only_model and self._ltx_mode != "audio":
             raise ValueError("--ltx2_audio_only_model requires --ltx2_mode audio")
         self.default_guidance_scale = 1.0
+        if bool(getattr(args, "av_attention_loss_weighting", False)):
+            if self._ltx_mode != "av":
+                raise ValueError("--av_attention_loss_weighting requires --ltx2_mode av")
+            if self._ltx2_audio_only_model:
+                raise ValueError("--av_attention_loss_weighting requires a video+audio transformer")
+        av_attention_loss_max = float(getattr(args, "av_attention_loss_max", 1.5))
+        av_attention_loss_warmup_steps = int(getattr(args, "av_attention_loss_warmup_steps", 400))
+        if av_attention_loss_max < 1.0:
+            raise ValueError(f"av_attention_loss_max must be >= 1.0. Got: {av_attention_loss_max}")
+        if av_attention_loss_warmup_steps < 0:
+            raise ValueError(f"av_attention_loss_warmup_steps must be >= 0. Got: {av_attention_loss_warmup_steps}")
+        args.av_attention_loss_max = av_attention_loss_max
+        args.av_attention_loss_warmup_steps = av_attention_loss_warmup_steps
         audio_only_sequence_resolution = int(getattr(args, "audio_only_sequence_resolution", 64))
         if audio_only_sequence_resolution != 0 and audio_only_sequence_resolution < 32:
             raise ValueError(
@@ -2960,6 +3039,10 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                 md["ss_av_cross_grad_surgery_config"] = self._av_cross_grad_surgery_config.format_summary()
             if getattr(args, "av_cross_grad_surgery_args", None):
                 md["ss_av_cross_grad_surgery_args"] = " ".join(args.av_cross_grad_surgery_args)
+        if bool(getattr(args, "av_attention_loss_weighting", False)):
+            md["ss_av_attention_loss_weighting"] = True
+            md["ss_av_attention_loss_max"] = float(getattr(args, "av_attention_loss_max", 1.5))
+            md["ss_av_attention_loss_warmup_steps"] = int(getattr(args, "av_attention_loss_warmup_steps", 400))
         if is_ltx2_remote_stage_enabled(args):
             md["ss_ltx2_remote_stage_codec"] = getattr(args, "ltx2_remote_stage_codec", "none")
             md["ss_ltx2_remote_stage_grad_codec"] = getattr(args, "ltx2_remote_stage_grad_codec", "none")

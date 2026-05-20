@@ -766,6 +766,48 @@ def validate_training_config(config: ProjectConfig) -> dict[str, Any]:
                 )
             )
 
+    if t.av_attention_loss_weighting:
+        if t.ltx2_mode != "av":
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.av_attention_loss_weighting",
+                    "AV Attention Loss Weighting requires LTX2 Mode = av.",
+                    label="AV Attention Loss Weighting",
+                    page="training",
+                )
+            )
+        if t.ltx2_audio_only_model:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.av_attention_loss_weighting",
+                    "AV Attention Loss Weighting requires a video+audio transformer, not Audio-only Model.",
+                    label="AV Attention Loss Weighting",
+                    page="training",
+                )
+            )
+        if t.av_attention_loss_max < 1.0:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.av_attention_loss_max",
+                    "AV Attention Loss Max must be >= 1.0.",
+                    label="AV Attention Loss Max",
+                    page="training",
+                )
+            )
+        if t.av_attention_loss_warmup_steps < 0:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.av_attention_loss_warmup_steps",
+                    "AV Attention Loss Warmup Steps must be >= 0.",
+                    label="AV Attention Loss Warmup",
+                    page="training",
+                )
+            )
+
     if t.tread:
         tread_args_parts = _split_cli_args(t.tread_args)
         if t.tread_target != "video":

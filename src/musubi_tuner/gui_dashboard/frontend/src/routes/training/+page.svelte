@@ -542,6 +542,13 @@
 								{#if t.av_cross_grad_surgery}
 									<FormField fieldPath="training.av_cross_grad_surgery_args" value={t.av_cross_grad_surgery_args || ''} oninput={(e) => update('av_cross_grad_surgery_args', e.target.value)} placeholder="a2v=0:0,1-10:0.1,40-47:0.3 projections=k,v" tooltip="Optional key=value args. Empty uses the OmniNFT A2V K/V schedule." invalid={fieldInvalid('training.av_cross_grad_surgery_args')} error={fieldError('training.av_cross_grad_surgery_args')} />
 								{/if}
+								<FormToggle label="AV Attention Loss" fieldPath="training.av_attention_loss_weighting" checked={t.av_attention_loss_weighting ?? false} onchange={(e) => update('av_attention_loss_weighting', e.target.checked)} tooltip="Use A2V/V2A attention concentration to upweight selected video/audio loss tokens. Requires LTX2 mode av." />
+								{#if t.av_attention_loss_weighting}
+									<div class="grid grid-cols-2 gap-2">
+										<FormField type="number" fieldPath="training.av_attention_loss_max" value={t.av_attention_loss_max ?? 1.5} oninput={(e) => update('av_attention_loss_max', Number(e.target.value))} step="0.05" min={1} tooltip="Maximum token loss multiplier. Default: 1.5" invalid={fieldInvalid('training.av_attention_loss_max')} error={fieldError('training.av_attention_loss_max')} />
+										<FormField type="number" fieldPath="training.av_attention_loss_warmup_steps" value={t.av_attention_loss_warmup_steps ?? 400} oninput={(e) => update('av_attention_loss_warmup_steps', Number(e.target.value))} step="50" min={0} tooltip="Steps before the multiplier reaches max. Default: 400" invalid={fieldInvalid('training.av_attention_loss_warmup_steps')} error={fieldError('training.av_attention_loss_warmup_steps')} />
+									</div>
+								{/if}
 							</div>
 						{/if}
 						{#if $advancedMode}

@@ -494,6 +494,9 @@ class TrainingConfig(BaseModel):
     dcr_reference_detach: bool = True
     av_cross_grad_surgery: bool = False
     av_cross_grad_surgery_args: str = ""
+    av_attention_loss_weighting: bool = False
+    av_attention_loss_max: float = 1.5
+    av_attention_loss_warmup_steps: int = 400
 
     # Audio Metrics
     audio_metrics: bool = False
