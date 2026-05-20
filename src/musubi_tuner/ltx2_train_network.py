@@ -2916,7 +2916,7 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             md["ss_reference_downscale_factor"] = ref_downscale
         return md
 
-    def post_save_checkpoint_hook(self, args, ckpt_file, ckpt_name, accelerator, force_sync_upload=False):
+    def post_save_checkpoint_hook(self, args, ckpt_file, ckpt_name, accelerator, force_sync_upload=False, unwrapped_nw=None):
         """Convert saved LoRA to ComfyUI format."""
         if not getattr(args, "convert_to_comfy", True):
             return
@@ -2926,7 +2926,13 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
 
             comfy_ckpt_name = ckpt_name.replace(".safetensors", ".comfy.safetensors")
             comfy_ckpt_file = os.path.join(args.output_dir, comfy_ckpt_name)
-            convert_lora_to_comfy(ckpt_file, comfy_ckpt_file, verbose=False)
+            conversion_network = None
+            if unwrapped_nw is not None:
+                try:
+                    conversion_network = accelerator.unwrap_model(unwrapped_nw)
+                except Exception:
+                    conversion_network = unwrapped_nw
+            convert_lora_to_comfy(ckpt_file, comfy_ckpt_file, verbose=False, network=conversion_network)
             accelerator.print(f"Saved ComfyUI-compatible LoRA: {comfy_ckpt_file}")
 
             # Upload ComfyUI version to HuggingFace if enabled

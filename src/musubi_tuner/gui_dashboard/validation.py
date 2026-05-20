@@ -7,6 +7,7 @@ import shlex
 from pathlib import Path
 from typing import Any
 
+from musubi_tuner.gui_dashboard.cli_defaults import get_ltx2_training_network_module_default
 from musubi_tuner.gui_dashboard.project_schema import DatasetEntry, ProjectConfig
 from musubi_tuner.tread import default_ltx_tread_route, parse_tread_args
 
@@ -342,6 +343,19 @@ def validate_training_config(config: ProjectConfig) -> dict[str, Any]:
         message = "LoftQ Init requires NF4 Base."
         errors.append(_make_issue("error", "training.loftq_init", message, label="LoftQ Init", page="training"))
         errors.append(_make_issue("error", "training.nf4_base", message, label="NF4 Base", page="training"))
+
+    if t.use_dora:
+        network_module = t.network_module or get_ltx2_training_network_module_default()
+        if network_module in {"networks.loha", "networks.lokr", "lycoris.kohya"}:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.use_dora",
+                    "DoRA is currently available only with the native LoRA backend.",
+                    label="DoRA",
+                    page="training",
+                )
+            )
 
     if t.ltx2_model_parallel:
         if t.ltx2_remote_stage:

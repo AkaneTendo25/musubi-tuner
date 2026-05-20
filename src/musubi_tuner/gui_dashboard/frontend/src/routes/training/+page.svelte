@@ -495,6 +495,9 @@
 								{ value: 'full', label: 'full (all)' }
 							]} onchange={(e) => update('lora_target_preset', e.target.value)} tooltip="Target layers" />
 						</div>
+						<div class="grid grid-cols-3 gap-x-4 gap-y-1">
+							<FormToggle label="DoRA" fieldPath="training.use_dora" checked={t.use_dora ?? false} onchange={(e) => update('use_dora', e.target.checked)} tooltip="Train LoRA with a separate magnitude vector. Passed as use_dora=true in network args." />
+						</div>
 						{#if $advancedMode}
 							<div class="grid grid-cols-2 gap-2">
 								<FormSelect fieldPath="training.ic_lora_strategy" value={t.ic_lora_strategy || 'auto'} options={[

@@ -218,6 +218,7 @@ class TrainingConfig(BaseModel):
     lycoris_config: str = ""
     lycoris_quantized_base_check_mode: Literal["off", "warn", "error"] = "warn"
     init_lokr_norm: Optional[float] = None
+    use_dora: bool = False
     rank_dropout: Optional[float] = None
     module_dropout: Optional[float] = None
     adaptive_rank: bool = False

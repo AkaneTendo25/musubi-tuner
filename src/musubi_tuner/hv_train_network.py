@@ -2132,7 +2132,7 @@ class NetworkTrainer:
         """Return extra metadata to include in LoRA safetensors. Override in subclasses."""
         return {}
 
-    def post_save_checkpoint_hook(self, args, ckpt_file, ckpt_name, accelerator, force_sync_upload=False):
+    def post_save_checkpoint_hook(self, args, ckpt_file, ckpt_name, accelerator, force_sync_upload=False, **kwargs):
         """Hook called after checkpoint is saved. Override in subclasses for architecture-specific processing."""
         pass
 
@@ -3589,7 +3589,14 @@ class NetworkTrainer:
                     logger.warning("Failed to save remote LTX-2 stage checkpoint: %s", e)
 
             # Call post-save hook for architecture-specific processing
-            self.post_save_checkpoint_hook(args, ckpt_file, ckpt_name, accelerator, force_sync_upload)
+            self.post_save_checkpoint_hook(
+                args,
+                ckpt_file,
+                ckpt_name,
+                accelerator,
+                force_sync_upload,
+                unwrapped_nw=unwrapped_nw,
+            )
 
             upload_original = (not getattr(args, "convert_to_comfy", True)) or getattr(args, "save_original_lora", True)
             if args.huggingface_repo_id is not None and upload_original:

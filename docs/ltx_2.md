@@ -35,6 +35,7 @@ Caching scripts (`ltx2_cache_latents.py`, `ltx2_cache_text_encoder_outputs.py`) 
   - [Choosing Model Version for Training (2.0 vs 2.3)](#choosing-model-version-for-training-20-vs-23)
   - [Source-Free Training from Cache](#optional-source-free-training-from-cache)
   - [Standard LoRA Training](#standard-lora-training)
+  - [DoRA LoRA Training](#dora-lora-training)
   - [Advanced: LyCORIS/LoKR Training](#advanced-lycorislokr-training)
   - [Training Arguments](#training-arguments)
     - [Memory Optimization](#memory-optimization)
@@ -392,6 +393,24 @@ Pre-quantized FP8 checkpoints (`*fp8*.safetensors`) are supported — `--fp8_bas
 For LTX-2 checkpoints, replace:
 - `--ltx2_checkpoint /path/to/ltx-2.3.safetensors` -> `--ltx2_checkpoint /path/to/ltx-2.safetensors`
 - `--ltx_version 2.3` -> `--ltx_version 2.0`
+
+### DoRA LoRA Training
+
+DoRA adds a separate learnable magnitude vector to the standard LTX-2 LoRA backend. It is opt-in and uses the same target presets, rank, alpha, optimizer, and dataset settings as regular LoRA.
+
+```bash
+accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 ltx2_train_network.py ^
+  ... (same args as standard LoRA) ^
+  --network_module networks.lora_ltx2 ^
+  --network_dim 32 ^
+  --network_alpha 16 ^
+  --network_args "use_dora=true" ^
+  --output_name ltx2_dora
+```
+
+In the dashboard, enable the **DoRA** toggle in the LoRA section. When disabled, the generated command does not include `use_dora=true`.
+
+Training-time ComfyUI export is supported for DoRA LoRA. The native Musubi checkpoint stores `lora_magnitude_vector.weight`; the generated `*.comfy.safetensors` file stores the equivalent ComfyUI `dora_scale` tensors.
 
 ### Advanced: LyCORIS/LoKR Training
 
@@ -1972,6 +1991,8 @@ Saved LoRA checkpoints are converted to ComfyUI format by default. Both the orig
 
 > **Important:** Training can only be resumed from the **original** (non-comfy) checkpoint format. If you plan to use `--resume`, do not use `--no_save_original_lora`.
 > ComfyUI-only LoRA files can still be used for warm-starting via `--network_weights`, `--base_weights`, or `--dim_from_weights`; only full `--resume` requires the original checkpoint plus saved training state.
+
+For DoRA LoRA, keep the original `*.safetensors` file for Musubi loading and resume. The training-time ComfyUI export is intended for ComfyUI and stores `dora_scale`; converting that file back to native Musubi DoRA requires base-weight information that is not present in the standalone ComfyUI checkpoint.
 
 Checkpoint rotation (`--save_last_n_epochs`) cleans up old ComfyUI checkpoints alongside originals. HuggingFace upload (`--huggingface_repo_id`) uploads both formats by default. Use `--no_save_original_lora` to upload only the ComfyUI checkpoint.
 

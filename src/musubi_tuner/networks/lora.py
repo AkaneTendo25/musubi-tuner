@@ -27,6 +27,246 @@ logging.basicConfig(level=logging.INFO)
 HUNYUAN_TARGET_REPLACE_MODULES = ["MMDoubleStreamBlock", "MMSingleStreamBlock"]
 
 
+def _parse_bool_network_arg(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return bool(value)
+
+
+def _effective_weight_dtype(
+    weight: torch.Tensor,
+    scale_weight: Optional[torch.Tensor],
+    dtype: Optional[torch.dtype],
+) -> torch.dtype:
+    if dtype is not None:
+        return dtype
+    if isinstance(scale_weight, torch.Tensor) and scale_weight.is_floating_point() and scale_weight.dtype.itemsize >= 2:
+        return scale_weight.dtype
+    if weight.is_floating_point() and weight.dtype.itemsize >= 2:
+        return weight.dtype
+    return torch.float32
+
+
+def _get_scaled_weight(
+    weight: torch.Tensor,
+    scale_weight: torch.Tensor,
+    *,
+    dtype: Optional[torch.dtype] = None,
+    device: Optional[Union[str, torch.device]] = None,
+    detach: bool = False,
+    non_blocking: bool = False,
+) -> torch.Tensor:
+    if detach:
+        weight = weight.detach()
+        scale_weight = scale_weight.detach()
+    target_dtype = _effective_weight_dtype(weight, scale_weight, dtype)
+    target_device = device if device is not None else weight.device
+    dense_weight = weight.to(device=target_device, dtype=target_dtype, non_blocking=non_blocking)
+    scale = scale_weight.to(device=target_device, dtype=target_dtype, non_blocking=non_blocking)
+    if scale.ndim < 3:
+        return dense_weight * scale
+
+    out_features, num_blocks, _ = scale.shape
+    dense_weight = dense_weight.contiguous().view(out_features, num_blocks, -1)
+    dense_weight = dense_weight * scale
+    return dense_weight.view(weight.shape)
+
+
+def _get_effective_module_weight(
+    module: torch.nn.Module,
+    *,
+    dtype: Optional[torch.dtype] = None,
+    device: Optional[Union[str, torch.device]] = None,
+    detach: bool = False,
+    non_blocking: bool = False,
+) -> torch.Tensor:
+    weight = getattr(module, "weight", None)
+    if not isinstance(weight, torch.Tensor):
+        raise AttributeError(f"{module.__class__.__name__} has no tensor weight")
+
+    scale_weight = getattr(module, "scale_weight", None)
+    if isinstance(scale_weight, torch.Tensor):
+        if all(hasattr(module, attr) for attr in ("nf4_out_features", "nf4_in_features", "nf4_block_size")):
+            from musubi_tuner.modules.nf4_optimization_utils import dequantize_nf4_block
+
+            if detach:
+                weight = weight.detach()
+                scale_weight = scale_weight.detach()
+            target_dtype = _effective_weight_dtype(weight, scale_weight, dtype)
+            target_device = device if device is not None else weight.device
+            dense_weight = dequantize_nf4_block(
+                weight.to(device=target_device, non_blocking=non_blocking),
+                scale_weight.to(device=target_device, non_blocking=non_blocking),
+                int(getattr(module, "nf4_out_features")),
+                int(getattr(module, "nf4_in_features")),
+                int(getattr(module, "nf4_block_size")),
+                scale_weight.dtype,
+            )
+            awq_scales = getattr(module, "awq_scales", None)
+            if isinstance(awq_scales, torch.Tensor):
+                awq_scales = awq_scales.to(device=dense_weight.device, dtype=dense_weight.dtype, non_blocking=non_blocking)
+                dense_weight = dense_weight / awq_scales.unsqueeze(0)
+            return dense_weight.to(dtype=target_dtype)
+
+        return _get_scaled_weight(
+            weight,
+            scale_weight,
+            dtype=dtype,
+            device=device,
+            detach=detach,
+            non_blocking=non_blocking,
+        )
+
+    if detach:
+        weight = weight.detach()
+    target_dtype = dtype
+    if target_dtype is None and (not weight.is_floating_point() or weight.dtype.itemsize < 2):
+        target_dtype = torch.float32
+    if target_dtype is None and device is None:
+        return weight
+    to_kwargs: Dict[str, Any] = {"non_blocking": non_blocking}
+    if target_dtype is not None:
+        to_kwargs["dtype"] = target_dtype
+    if device is not None:
+        to_kwargs["device"] = device
+    return weight.to(**to_kwargs)
+
+
+def _get_dora_compute_dtype(weight: torch.Tensor) -> torch.dtype:
+    if not weight.is_floating_point() or weight.dtype.itemsize < 2:
+        return torch.float32
+    if weight.dtype in (torch.float16, torch.bfloat16):
+        return torch.float32
+    return weight.dtype
+
+
+def _get_lora_weight_from_tensors(down_weight: torch.Tensor, up_weight: torch.Tensor) -> torch.Tensor:
+    if len(down_weight.size()) == 2:
+        return up_weight @ down_weight
+    if down_weight.size()[2:4] == (1, 1):
+        return (up_weight.squeeze(3).squeeze(2) @ down_weight.squeeze(3).squeeze(2)).unsqueeze(2).unsqueeze(3)
+    return torch.nn.functional.conv2d(down_weight.permute(1, 0, 2, 3), up_weight).permute(1, 0, 2, 3)
+
+
+def _get_split_lora_weight(split_dims: List[int], down_weights: List[torch.Tensor], up_weights: List[torch.Tensor]) -> torch.Tensor:
+    total_dims = sum(split_dims)
+    in_dim = down_weights[0].size(1)
+    device = down_weights[0].device
+    dtype = down_weights[0].dtype
+    weight = torch.zeros((total_dims, in_dim), device=device, dtype=dtype)
+
+    offset = 0
+    for split_dim, down_weight, up_weight in zip(split_dims, down_weights, up_weights):
+        weight[offset : offset + split_dim] = up_weight @ down_weight
+        offset += split_dim
+
+    return weight
+
+
+def _get_linear_weight_norm_factored(
+    base_weight: torch.Tensor,
+    down_weight: torch.Tensor,
+    up_weight: torch.Tensor,
+    scaling: float,
+) -> torch.Tensor:
+    compute_dtype = _get_dora_compute_dtype(base_weight)
+    base_weight = base_weight.to(dtype=compute_dtype)
+    down_weight = down_weight.to(device=base_weight.device, dtype=compute_dtype)
+    up_weight = up_weight.to(device=base_weight.device, dtype=compute_dtype)
+
+    w_norm_sq = (base_weight * base_weight).sum(dim=1)
+    if float(scaling) == 0.0:
+        return torch.sqrt(w_norm_sq.clamp_min_(0))
+
+    u_term = base_weight @ down_weight.transpose(0, 1)
+    gram = down_weight @ down_weight.transpose(0, 1)
+    cross_term = (up_weight * u_term).sum(dim=1)
+    ba_norm_sq = ((up_weight @ gram) * up_weight).sum(dim=1)
+    norm_sq = w_norm_sq + (2.0 * float(scaling)) * cross_term + (float(scaling) * float(scaling)) * ba_norm_sq
+    return torch.sqrt(norm_sq.clamp_min_(0))
+
+
+def _get_conv_weight_norm_factored(
+    base_weight: torch.Tensor,
+    down_weight: torch.Tensor,
+    up_weight: torch.Tensor,
+    scaling: float,
+) -> torch.Tensor:
+    out_channels = base_weight.shape[0]
+    flat_weight = base_weight.reshape(out_channels, -1)
+    flat_down = down_weight.reshape(down_weight.shape[0], -1)
+    flat_up = up_weight.reshape(out_channels, -1)
+    norms = _get_linear_weight_norm_factored(flat_weight, flat_down, flat_up, scaling)
+    return norms.view((1, out_channels) + (1,) * max(0, base_weight.dim() - 2))
+
+
+def _get_dense_weight_norm(base_weight: torch.Tensor, lora_weight: torch.Tensor, scaling: float) -> torch.Tensor:
+    compute_dtype = _get_dora_compute_dtype(base_weight)
+    total = base_weight.to(dtype=compute_dtype) + float(scaling) * lora_weight.to(device=base_weight.device, dtype=compute_dtype)
+    if total.dim() == 2:
+        return torch.linalg.vector_norm(total, dim=1)
+    dims = tuple(range(1, total.dim()))
+    return total.norm(p=2, dim=dims, keepdim=True).transpose(1, 0)
+
+
+def _get_dora_weight_norm(
+    base_weight: torch.Tensor,
+    down_weight: Union[torch.Tensor, List[torch.Tensor]],
+    up_weight: Union[torch.Tensor, List[torch.Tensor]],
+    scaling: float,
+    split_dims: Optional[List[int]] = None,
+) -> torch.Tensor:
+    if split_dims is not None:
+        lora_weight = _get_split_lora_weight(split_dims, down_weight, up_weight)
+        return _get_dense_weight_norm(base_weight, lora_weight, scaling)
+
+    if base_weight.dim() == 2:
+        return _get_linear_weight_norm_factored(base_weight, down_weight, up_weight, scaling)
+    return _get_conv_weight_norm_factored(base_weight, down_weight, up_weight, scaling)
+
+
+def _reshape_dora_factor_for_weight(factor: torch.Tensor, base_weight: torch.Tensor) -> torch.Tensor:
+    return factor.reshape(-1).view(base_weight.shape[0], *([1] * (base_weight.dim() - 1)))
+
+
+def _reshape_dora_factor_for_output(factor: torch.Tensor, output: torch.Tensor, is_conv2d: bool) -> torch.Tensor:
+    flat_factor = factor.reshape(-1)
+    if is_conv2d:
+        return flat_factor.view(1, -1, *([1] * (output.dim() - 2)))
+    return flat_factor.view(*([1] * (output.dim() - 1)), -1)
+
+
+def _remove_module_bias(base_output: torch.Tensor, bias: Optional[torch.Tensor], is_conv2d: bool) -> torch.Tensor:
+    if bias is None:
+        return base_output
+    if bias.device != base_output.device or bias.dtype != base_output.dtype:
+        bias = bias.to(device=base_output.device, dtype=base_output.dtype)
+    if is_conv2d:
+        return base_output - bias.view(1, -1, *([1] * (base_output.dim() - 2)))
+    return base_output - bias.view(*([1] * (base_output.dim() - 1)), -1)
+
+
+def _apply_dora_weight_merge(
+    base_weight: torch.Tensor, delta_weight: torch.Tensor, magnitude: torch.Tensor, weight_norm: torch.Tensor
+) -> torch.Tensor:
+    if weight_norm.is_floating_point():
+        eps = 1e-12 if weight_norm.dtype in (torch.float32, torch.float64) else 1e-6
+        weight_norm = weight_norm.clamp_min(eps)
+    factor = magnitude.to(device=weight_norm.device, dtype=weight_norm.dtype) / weight_norm
+    return _reshape_dora_factor_for_weight(factor, base_weight) * (base_weight + delta_weight)
+
+
+class DoRAMagnitudeModule(torch.nn.Module):
+    def __init__(self, weight: torch.Tensor):
+        super().__init__()
+        self.weight = torch.nn.Parameter(weight)
+        self.weight._is_dora_scale = True
+
+
 class LoRAModule(AdaptiveRankLoRAModuleMixin, torch.nn.Module):
     """
     replaces forward method of the original Linear, instead of replacing the original Linear module.
@@ -304,6 +544,260 @@ class LoRAInfModule(LoRAModule):
         return self.default_forward(x)
 
 
+class DoRAModule(LoRAModule):
+    def __init__(
+        self,
+        lora_name,
+        org_module: torch.nn.Module,
+        multiplier=1.0,
+        lora_dim=4,
+        alpha=1,
+        dropout=None,
+        rank_dropout=None,
+        module_dropout=None,
+        split_dims: Optional[List[int]] = None,
+        **kwargs,
+    ):
+        super().__init__(
+            lora_name,
+            org_module,
+            multiplier,
+            lora_dim,
+            alpha,
+            dropout=dropout,
+            rank_dropout=rank_dropout,
+            module_dropout=module_dropout,
+            split_dims=split_dims,
+            **kwargs,
+        )
+
+        self.org_module_ref = [org_module]
+        magnitude = self._get_weight_norm(self.multiplier * self.scale)
+        reference_param = self.lora_down[0].weight if self.split_dims is not None else self.lora_down.weight
+        magnitude = magnitude.to(device=reference_param.device, dtype=reference_param.dtype)
+        self.lora_magnitude_vector = DoRAMagnitudeModule(magnitude)
+
+    def _get_base_module(self) -> torch.nn.Module:
+        if hasattr(self, "org_module"):
+            return self.org_module
+        return self.org_module_ref[0]
+
+    def _get_is_conv2d(self) -> bool:
+        return self._get_base_module().__class__.__name__ == "Conv2d"
+
+    def _apply_adaptive_rank_to_down_weight(self, down_weight: torch.Tensor) -> torch.Tensor:
+        if not self.adaptive_rank:
+            return down_weight
+
+        rank_weights = self._adaptive_rank_weights(self.lora_dim, dtype=down_weight.dtype, device=down_weight.device)
+        if down_weight.dim() == 2:
+            return down_weight * rank_weights[:, None]
+        return down_weight * rank_weights[:, None, None, None]
+
+    def _get_weight_norm(self, scaling: float) -> torch.Tensor:
+        org_module = self._get_base_module()
+        with torch.no_grad():
+            base_weight = _get_effective_module_weight(org_module, detach=True)
+            if self.split_dims is None:
+                return _get_dora_weight_norm(
+                    base_weight,
+                    self._apply_adaptive_rank_to_down_weight(self.lora_down.weight),
+                    self.lora_up.weight,
+                    scaling,
+                )
+            return _get_dora_weight_norm(
+                base_weight,
+                [self._apply_adaptive_rank_to_down_weight(module.weight) for module in self.lora_down],
+                [module.weight for module in self.lora_up],
+                scaling,
+                split_dims=self.split_dims,
+            )
+
+    def _get_delta_weight(self, multiplier: Optional[float] = None) -> torch.Tensor:
+        multiplier = self.multiplier if multiplier is None else multiplier
+        scaling = multiplier * self.scale
+
+        if self.split_dims is None:
+            down_weight = self._apply_adaptive_rank_to_down_weight(self.lora_down.weight.to(torch.float))
+            return _get_lora_weight_from_tensors(down_weight, self.lora_up.weight.to(torch.float)) * scaling
+        return (
+            _get_split_lora_weight(
+                self.split_dims,
+                [self._apply_adaptive_rank_to_down_weight(module.weight.to(torch.float)) for module in self.lora_down],
+                [module.weight.to(torch.float) for module in self.lora_up],
+            )
+            * scaling
+        )
+
+    def _get_lora_output(self, x: torch.Tensor) -> tuple[torch.Tensor, float]:
+        if self.split_dims is None:
+            lx = self.lora_down(x)
+
+            if self.dropout is not None and self.training:
+                lx = torch.nn.functional.dropout(lx, p=self.dropout)
+
+            if self.rank_dropout is not None and self.training:
+                mask = torch.rand((lx.size(0), self.lora_dim), device=lx.device) > self.rank_dropout
+                if len(lx.size()) == 3:
+                    mask = mask.unsqueeze(1)
+                elif len(lx.size()) == 4:
+                    mask = mask.unsqueeze(-1).unsqueeze(-1)
+                lx = lx * mask
+                scale = self.scale * (1.0 / (1.0 - self.rank_dropout))
+            else:
+                scale = self.scale
+
+            if self.adaptive_rank:
+                rank_weights = self._adaptive_rank_weights(self.lora_dim, dtype=lx.dtype, device=lx.device)
+                lx = lx * self._reshape_rank_weights(rank_weights, lx)
+
+            return self.lora_up(lx), scale
+
+        lxs = [lora_down(x) for lora_down in self.lora_down]
+
+        if self.dropout is not None and self.training:
+            lxs = [torch.nn.functional.dropout(lx, p=self.dropout) for lx in lxs]
+
+        if self.rank_dropout is not None and self.training:
+            masks = [torch.rand((lx.size(0), self.lora_dim), device=lx.device) > self.rank_dropout for lx in lxs]
+            for i in range(len(lxs)):
+                if len(lxs[i].size()) == 3:
+                    masks[i] = masks[i].unsqueeze(1)
+                elif len(lxs[i].size()) == 4:
+                    masks[i] = masks[i].unsqueeze(-1).unsqueeze(-1)
+                lxs[i] = lxs[i] * masks[i]
+            scale = self.scale * (1.0 / (1.0 - self.rank_dropout))
+        else:
+            scale = self.scale
+
+        if self.adaptive_rank:
+            rank_weights = self._adaptive_rank_weights(self.lora_dim, dtype=lxs[0].dtype, device=lxs[0].device)
+            lxs = [lx * self._reshape_rank_weights(rank_weights, lx) for lx in lxs]
+
+        lxs = [lora_up(lx) for lora_up, lx in zip(self.lora_up, lxs)]
+        return torch.cat(lxs, dim=-1), scale
+
+    def export_state_dict(self) -> Dict[str, torch.Tensor]:
+        state_dict = super().export_state_dict()
+        state_dict[f"{self.lora_name}.lora_magnitude_vector.weight"] = self.lora_magnitude_vector.weight.detach().clone()
+        return state_dict
+
+    def forward(self, x):
+        org_forwarded = self.org_forward(x)
+
+        if self.module_dropout is not None and self.training:
+            if torch.rand(1, device=x.device) < self.module_dropout:
+                return org_forwarded
+
+        lora_output, scale = self._get_lora_output(x)
+        effective_scale = self.multiplier * scale
+
+        magnitude = self.lora_magnitude_vector.weight
+        weight_norm = self._get_weight_norm(effective_scale)
+        if weight_norm.device != magnitude.device:
+            weight_norm = weight_norm.to(device=magnitude.device)
+        if weight_norm.is_floating_point():
+            eps = 1e-12 if weight_norm.dtype in (torch.float32, torch.float64) else 1e-6
+            weight_norm = weight_norm.clamp_min(eps)
+
+        org_module = self.org_module_ref[0]
+        base_without_bias = _remove_module_bias(org_forwarded, org_module.bias, self._get_is_conv2d())
+        mag_norm_scale = _reshape_dora_factor_for_output(
+            magnitude / weight_norm,
+            lora_output,
+            self._get_is_conv2d(),
+        )
+
+        compose_dtype = torch.promote_types(torch.promote_types(base_without_bias.dtype, lora_output.dtype), mag_norm_scale.dtype)
+        factor = mag_norm_scale.to(compose_dtype)
+        delta = (factor - 1.0) * base_without_bias.to(compose_dtype) + factor * (lora_output.to(compose_dtype) * effective_scale)
+
+        return org_forwarded + delta.to(org_forwarded.dtype)
+
+
+class DoRAInfModule(DoRAModule):
+    def __init__(
+        self,
+        lora_name,
+        org_module: torch.nn.Module,
+        multiplier=1.0,
+        lora_dim=4,
+        alpha=1,
+        **kwargs,
+    ):
+        super().__init__(lora_name, org_module, multiplier, lora_dim, alpha, **kwargs)
+
+        self.enabled = True
+        self.network: LoRANetwork = None
+
+    def set_network(self, network):
+        self.network = network
+
+    def merge_to(self, sd, dtype, device, non_blocking=False):
+        org_module = self.org_module_ref[0]
+        org_sd = org_module.state_dict()
+        org_dtype = org_sd["weight"].dtype
+        org_device = org_sd["weight"].device
+
+        if device is None:
+            device = org_device
+        if dtype is None:
+            dtype = org_dtype
+
+        base_weight = _get_effective_module_weight(
+            org_module,
+            dtype=torch.float,
+            device=device,
+            detach=True,
+            non_blocking=non_blocking,
+        )
+        if self.split_dims is None:
+            down_weight = sd["lora_down.weight"].to(device, dtype=torch.float, non_blocking=non_blocking)
+            up_weight = sd["lora_up.weight"].to(device, dtype=torch.float, non_blocking=non_blocking)
+            delta_weight = _get_lora_weight_from_tensors(down_weight, up_weight) * (self.multiplier * self.scale)
+            weight_norm = _get_dora_weight_norm(base_weight, down_weight, up_weight, self.multiplier * self.scale)
+        else:
+            down_weight = [
+                sd[f"lora_down.{i}.weight"].to(device, dtype=torch.float, non_blocking=non_blocking)
+                for i in range(len(self.split_dims))
+            ]
+            up_weight = [
+                sd[f"lora_up.{i}.weight"].to(device, dtype=torch.float, non_blocking=non_blocking)
+                for i in range(len(self.split_dims))
+            ]
+            delta_weight = _get_split_lora_weight(self.split_dims, down_weight, up_weight) * (self.multiplier * self.scale)
+            weight_norm = _get_dora_weight_norm(
+                base_weight,
+                down_weight,
+                up_weight,
+                self.multiplier * self.scale,
+                split_dims=self.split_dims,
+            )
+
+        magnitude = sd["lora_magnitude_vector.weight"].to(device, dtype=weight_norm.dtype, non_blocking=non_blocking)
+        merged_weight = _apply_dora_weight_merge(base_weight, delta_weight, magnitude, weight_norm)
+        org_sd["weight"] = merged_weight.to(org_device, dtype=dtype)
+        org_module.load_state_dict(org_sd)
+
+    def get_weight(self, multiplier=None):
+        multiplier = self.multiplier if multiplier is None else multiplier
+        org_module = self.org_module_ref[0]
+        base_weight = _get_effective_module_weight(org_module, dtype=torch.float)
+        delta_weight = self._get_delta_weight(multiplier=multiplier).to(base_weight.device)
+        weight_norm = self._get_weight_norm(multiplier * self.scale).to(base_weight.device)
+        magnitude = self.lora_magnitude_vector.weight.to(device=base_weight.device, dtype=weight_norm.dtype)
+        merged_weight = _apply_dora_weight_merge(base_weight, delta_weight, magnitude, weight_norm)
+        return merged_weight - base_weight
+
+    def default_forward(self, x):
+        return DoRAModule.forward(self, x)
+
+    def forward(self, x):
+        if not self.enabled:
+            return self.org_forward(x)
+        return self.default_forward(x)
+
+
 def create_arch_network(
     multiplier: float,
     network_dim: Optional[int],
@@ -359,6 +853,8 @@ def create_network(
         network_dim = 4  # default
     if network_alpha is None:
         network_alpha = 1.0
+
+    use_dora = _parse_bool_network_arg(kwargs.get("use_dora", False))
 
     # extract dim/alpha for conv2d, and block dim
     conv_dim = kwargs.get("conv_dim", None)
@@ -418,7 +914,7 @@ def create_network(
         include_patterns = ast.literal_eval(include_patterns)
 
     if module_class is None:
-        module_class = LoRAModule
+        module_class = DoRAModule if use_dora else LoRAModule
 
     # too many arguments ( ^ω^)･･･
     network = LoRANetwork(
@@ -1117,6 +1613,7 @@ def create_network_from_weights(
     # get dim/alpha mapping
     modules_dim = {}
     modules_alpha = {}
+    has_dora_weights = _parse_bool_network_arg(kwargs.get("use_dora", False))
     for key, value in weights_sd.items():
         if "." not in key:
             continue
@@ -1128,9 +1625,14 @@ def create_network_from_weights(
             dim = value.shape[0]
             modules_dim[lora_name] = dim
             # logger.info(lora_name, value.size(), dim)
+        elif "lora_magnitude_vector" in key:
+            has_dora_weights = True
 
     if module_class is None:
-        module_class = LoRAInfModule if for_inference else LoRAModule
+        if has_dora_weights:
+            module_class = DoRAInfModule if for_inference else DoRAModule
+        else:
+            module_class = LoRAInfModule if for_inference else LoRAModule
 
     network = LoRANetwork(
         target_replace_modules,
