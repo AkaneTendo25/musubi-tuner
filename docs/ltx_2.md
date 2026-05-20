@@ -820,6 +820,19 @@ Logged to TensorBoard: `modality_freeze/state` (0=both active, 1=audio frozen, -
 
 For audio-overfitting cases, modality freezing can be combined with `--audio_loss_balance_mode ema_mag`, a lower `--audio_lr`, and lower audio LoRA rank.
 
+#### Optimizers
+
+LTX-2 training accepts optimizer selection through `--optimizer_type`; optimizer arguments are passed with `--optimizer_args "key=value" ...`. Optional package rows require that package to be installed in the active Python environment.
+
+| Optimizer | Use when | Extra package | Fused backward | Notes |
+| --- | --- | --- | --- | --- |
+| `AdamW` | You want the standard PyTorch optimizer path. | No | No | Pass regular AdamW constructor options through `--optimizer_args`. |
+| `AdamW8bit`, `PagedAdamW8bit`, `PagedAdam8bit` | You want bitsandbytes optimizer-state memory savings. | `bitsandbytes` | No | The paged variants require a bitsandbytes build that provides those classes. |
+| `Adafactor` | You want Adafactor's factored optimizer state and scheduler behavior. | No | Yes | If `relative_step` is omitted, it defaults to `True`; relative-step mode uses the Adafactor scheduler path. |
+| `CAME`, `CAMESimple`, `came_simple` | You want CAME without 8-bit optimizer-state quantization. | No | Yes | Supports `stochastic_rounding`, `use_cautious`, and related CAME args through `--optimizer_args`. |
+| `CAME8bit`, `came_8bit` | You want CAME with block-wise 8-bit optimizer state for eligible tensors. | No | Yes | Supports the same CAME args plus 8-bit state settings such as `min_8bit_size` and `quant_block_size`. |
+| `SinkSGD`, `SinkSGD_adv`, `sinksgd`, `sink_sgd`, `sinksgdadv` | You want Sinkhorn-normalized SGD with momentum for LoRA-style training. | No | Yes | Supports `momentum`, `nesterov`, `nesterov_coef`, `normed_momentum`, `weight_decay`, `sinkhorn_iterations`, `orthogonal_sinkhorn`, `orthogonal_gradient`, `spectral_normalization`, and `state_precision`. State precision modes are `auto`, `fp32`, and `bf16_sr`. Optional LR scaling requires explicit args such as `scale_lr_with_grad_accum=True` or `scale_lr_with_effective_batch=True`. |
+
 #### Per-Module Learning Rates
 
 Set different learning rates for audio vs. video LoRA modules. Useful when audio modules need a lower LR to stabilize AV training.
@@ -2029,7 +2042,7 @@ For IC-LoRA / V2V training, you can also precache the conditioning image latents
 | `--sample_stage1_distilled_lora_multiplier` | auto | Optional stage-1 distilled LoRA strength. With `res_2s`, auto uses `0.25`; with Euler, auto uses `0.0` |
 | `--sample_stage2_distilled_lora_multiplier` | auto | Optional stage-2 distilled LoRA strength. With `res_2s`, auto uses `0.5`; with Euler, auto uses `1.0` |
 
-Code-backed LTX-2.3 preview starting point:
+LTX-2.3 preview starting point:
 
 ```bash
 --sample_sampling_preset ltx23 ^
@@ -2436,6 +2449,7 @@ reference_cache_directory/                  # IC-LoRA only
 | Missing `*_ltx2_audio.safetensors` | Audio caching skipped | Re-run latent caching with `--ltx2_mode av` |
 | Gemma connector weights missing | Incorrect checkpoint | Ensure `--ltx2_checkpoint` (or `--ltx2_text_encoder_checkpoint`) contains Gemma connector weights |
 | Gemma OOM | Model too large | Use `--gemma_load_in_8bit` or `--gemma_load_in_4bit` with `--device cuda`, or use `--gemma_safetensors` with an FP8 file |
+| Startup OOM with `--dop` or `--blank_preservation` | Live preservation-prompt encoding briefly loads Gemma alongside the model; DOP/blank preservation do not need Gemma after startup. | Precache with `--precache_preservation_prompts`, then train with `--use_precached_preservation`. |
 | Audio caching fails | torchaudio missing | Install torchaudio before running `ltx2_cache_latents.py` |
 | Sampling OOM | VAE decode too large | Enable `--sample_tiled_vae` or reduce `--sample_vae_temporal_tile_size` |
 | Crash with block swap (esp. RTX 5090) | `--use_pinned_memory_for_block_swap` bug | Remove `--use_pinned_memory_for_block_swap` from training arguments |

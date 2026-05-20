@@ -47,6 +47,8 @@
 		'prodigy',
 		'came',
 		'came8bit',
+		'SinkSGD_adv',
+		'SinkSGD',
 		'torchao_adamw8bit',
 		'torchao_adamw4bit',
 		'torchao_adamwfp8',

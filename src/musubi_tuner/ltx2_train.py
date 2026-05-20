@@ -2048,7 +2048,7 @@ def ltx2_finetune_setup_parser(parser: argparse.ArgumentParser) -> argparse.Argu
     parser.add_argument(
         "--fused_backward_pass",
         action="store_true",
-        help="Use fused backward pass for Adafactor, CAME/CAME8bit, torchao Adam, torch-optimi, or BAdam (with use_gradient_release=True)",
+        help="Use fused backward pass for Adafactor, CAME/CAME8bit, SinkSGD, torchao Adam, torch-optimi, or BAdam (with use_gradient_release=True)",
     )
     # BAdam (block-coordinate Adam wrapper).
     # All wrapper kwargs flow through --optimizer_args as key=value entries
@@ -3843,12 +3843,14 @@ def main() -> None:
                             f"{base_optimizer.__class__.__name__} fused backward pass requires optimi single-param step support"
                         )
                     logger.info("%s torch-optimi fused backward pass enabled.", base_optimizer.__class__.__name__)
-                elif base_optimizer_name in {"came", "came8bit"}:
+                elif base_optimizer_name in {"came", "came8bit", "sinksgd"}:
                     if not _attach_fused_step_param(optimizer, base_optimizer):
                         raise ValueError(
                             f"{base_optimizer.__class__.__name__} fused backward pass requires optimizer.step_param support"
                         )
-                    if not any(bool(group.get("stochastic_rounding", False)) for group in base_optimizer.param_groups):
+                    if base_optimizer_name in {"came", "came8bit"} and not any(
+                        bool(group.get("stochastic_rounding", False)) for group in base_optimizer.param_groups
+                    ):
                         logger.warning(
                             "%s fused backward pass is enabled without stochastic_rounding=True. "
                             "For BF16 full fine-tuning, pass --optimizer_args stochastic_rounding=True "
@@ -3858,7 +3860,7 @@ def main() -> None:
                     logger.info("%s fused backward pass enabled.", base_optimizer.__class__.__name__)
                 else:
                     raise ValueError(
-                        f"--fused_backward_pass requires Adafactor, CAME/CAME8bit, torchao Adam, "
+                        f"--fused_backward_pass requires Adafactor, CAME/CAME8bit, SinkSGD, torchao Adam, "
                         f"torch-optimi, or BAdam with badam_use_gradient_release=True; "
                         f"got {base_optimizer.__class__.__name__}"
                     )

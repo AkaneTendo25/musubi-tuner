@@ -729,8 +729,37 @@ class NetworkTrainer:
         optimizer = None
         optimizer_class = None
 
+        if optimizer_type in {"sinksgd", "sink_sgd", "sinksgd_adv", "sinksgdadv"}:
+            from musubi_tuner.optimizers.sink_sgd import SinkSGD
+
+            def pop_bool_arg(*names: str) -> bool:
+                for name in names:
+                    if name not in optimizer_kwargs:
+                        continue
+                    value = optimizer_kwargs.pop(name)
+                    if isinstance(value, str):
+                        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+                    return bool(value)
+                return False
+
+            if pop_bool_arg("scale_lr_with_grad_accum", "scale_lr_with_gradient_accumulation"):
+                grad_accum = max(float(getattr(args, "gradient_accumulation_steps", 1) or 1), 1.0)
+                lr *= math.sqrt(grad_accum)
+                logger.info("SinkSGD: scaled learning rate by sqrt(gradient_accumulation_steps=%g) -> lr=%s", grad_accum, lr)
+
+            if pop_bool_arg("scale_lr_with_effective_batch"):
+                train_batch_size = max(float(getattr(args, "train_batch_size", 1) or 1), 1.0)
+                grad_accum = max(float(getattr(args, "gradient_accumulation_steps", 1) or 1), 1.0)
+                effective_batch = train_batch_size * grad_accum
+                lr *= math.sqrt(effective_batch)
+                logger.info("SinkSGD: scaled learning rate by sqrt(effective_batch=%g) -> lr=%s", effective_batch, lr)
+
+            logger.info(f"use SinkSGD optimizer | lr={lr} | {optimizer_kwargs}")
+            optimizer_class = SinkSGD
+            optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
+
         # CAME optimizers dispatched before the bitsandbytes "8bit" branch since CAME8bit ends in "8bit".
-        if optimizer_type in {"came", "camesimple", "came_simple", "came8bit", "came_8bit"}:
+        elif optimizer_type in {"came", "camesimple", "came_simple", "came8bit", "came_8bit"}:
             from musubi_tuner.optimizers.came_8bit import CAME, CAME8bit
 
             if "stochastic_rounding" not in optimizer_kwargs and (
@@ -5370,7 +5399,7 @@ def setup_parser_common() -> argparse.ArgumentParser:
         "--optimizer_type",
         type=str,
         default="",
-        help="Optimizer to use / オプティマイザの種類: AdamW (default), AdamW8bit, AdaFactor. "
+        help="Optimizer to use / オプティマイザの種類: AdamW (default), AdamW8bit, AdaFactor, CAME, SinkSGD. "
         "Also, you can use any optimizer by specifying the full path to the class, like 'torch.optim.AdamW', 'bitsandbytes.optim.AdEMAMix8bit' or 'bitsandbytes.optim.PagedAdEMAMix8bit' etc. / ",
     )
     parser.add_argument(
