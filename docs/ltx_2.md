@@ -993,6 +993,16 @@ TARP can be combined with `--cts_lambda_video_driven` / `--cts_lambda_audio_driv
 
 DCR can be combined with the audio-aware sampler, `--audio_loss_balance_mode ema_mag`, and per-modality caption dropout. For `av_ic` runs, keep `reference_detach=true` unless you specifically want gradients through clean reference streams.
 
+**AV Cross Grad Surgery** — Branch-aware gradient scaling for LTX-2 AV cross-modal K/V projections. Forward values are unchanged; the hook only scales the backward path through selected `audio_to_video_attn.to_k`, `audio_to_video_attn.to_v`, `video_to_audio_attn.to_k`, and `video_to_audio_attn.to_v` projections. This is opt-in and requires `--ltx2_mode av`.
+```bash
+--av_cross_grad_surgery
+```
+Bare `--av_cross_grad_surgery` uses the OmniNFT-inspired A2V schedule `a2v=0:0,1-10:0.1,40-47:0.3` with `projections=k,v`. Custom schedules use `--av_cross_grad_surgery_args`:
+```bash
+--av_cross_grad_surgery --av_cross_grad_surgery_args a2v=0:0,1-10:0.1,40-47:0.3 v2a=40-47:0.3 projections=k,v
+```
+Schedule entries are comma-separated `block:scale` or `start-end:scale` selectors. Scales must be in `[0, 1]`. Blocks not listed keep normal gradients.
+
 **Cross-Task Synergy** — Auxiliary AV losses with one modality clean (timestep=0), intended to provide cross-modal alignment targets. Adds two extra forward passes per AV batch. From [Harmony](https://arxiv.org/abs/2511.21579).
 ```bash
 --cts_lambda_video_driven 0.3 --cts_lambda_audio_driven 0.1
@@ -1019,11 +1029,12 @@ CTS can be combined with TARP. Keep it off unless AV sync or cross-modal alignme
 | `--audio_dop` | +2 (non-audio steps only) | +1 (non-audio steps only) | 0.3 - 1.0 |
 | `--tarp` | 0 | 0 | N/A (mask only) |
 | `--dcr` | 0 | 0 | N/A (gradient routing) |
+| `--av_cross_grad_surgery` | 0 | 0 | A2V K/V: 0:0, 1-10:0.1, 40-47:0.3 |
 | `--cts_lambda_*` | +1 per enabled direction | 0 | 0.1 - 0.3 |
 | `--tread` / `--tread_args` | 0 | 0 | N/A (routing only) |
 
 > [!CAUTION]
-> Some preservation techniques add transformer forward passes per step. Audio DOP costs apply only on non-audio steps. CTS adds one forward per enabled direction. TARP, DCR, and TREAD add no extra passes; they modify the existing forward/backward in-place.
+> Some preservation techniques add transformer forward passes per step. Audio DOP costs apply only on non-audio steps. CTS adds one forward per enabled direction. TARP, DCR, AV Cross Grad Surgery, and TREAD add no extra passes; they modify the existing forward/backward in-place.
 
 #### CREPA (Cross-frame Representation Alignment)
 

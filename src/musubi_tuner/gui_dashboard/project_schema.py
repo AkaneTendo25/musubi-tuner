@@ -492,6 +492,8 @@ class TrainingConfig(BaseModel):
     dcr: bool = False
     dcr_args: str = ""
     dcr_reference_detach: bool = True
+    av_cross_grad_surgery: bool = False
+    av_cross_grad_surgery_args: str = ""
 
     # Audio Metrics
     audio_metrics: bool = False

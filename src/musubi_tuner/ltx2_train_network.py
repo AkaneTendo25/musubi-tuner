@@ -57,6 +57,10 @@ from musubi_tuner.ltx2_remote_stage import (
     set_ltx2_remote_stage_cache_key,
     validate_ltx2_remote_stage_setup,
 )
+from musubi_tuner.ltx2_av_cross_grad_surgery import (
+    install_av_cross_grad_surgery,
+    parse_av_cross_grad_surgery_args,
+)
 from musubi_tuner.tread import TREADRouter, default_ltx_tread_route, parse_tread_args
 
 # LTX-2 latent normalization defaults.
@@ -79,6 +83,18 @@ IC_LORA_STRATEGIES = (
 # any IC-LoRA strategy. latent_idx is applied via 5D paste pre-patchify;
 # keyframe is appended via `build_keyframe_extension`.
 AV_CROSS_ATTENTION_MODES = ("both", "a2v_only", "v2a_only", "none")
+
+
+def _network_has_av_cross_projection_lora(network: torch.nn.Module, projections: Tuple[str, ...]) -> bool:
+    loras = getattr(network, "unet_loras", None)
+    if not loras:
+        return True
+    projection_tokens = tuple(f"to_{projection}" for projection in projections)
+    for lora_module in loras:
+        name = str(getattr(lora_module, "lora_name", ""))
+        if ("audio_to_video_attn" in name or "video_to_audio_attn" in name) and any(token in name for token in projection_tokens):
+            return True
+    return False
 
 
 def infer_ic_lora_strategy_from_preset(lora_target_preset: Optional[str]) -> str:
@@ -590,6 +606,8 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
         self._dcr_enabled: bool = False
         self._tarp_window_multiplier: int = 3
         self._dcr_reference_detach: bool = True
+        self._av_cross_grad_surgery_handle = None
+        self._av_cross_grad_surgery_config = None
 
         # CREPA (off by default)
         self._crepa = None
@@ -884,6 +902,7 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
     def pre_train_hook(self, args: argparse.Namespace, accelerator: Accelerator, transformer=None, network=None) -> None:
         self._setup_preservation(args, accelerator)
         self._setup_tarp_dcr(args)
+        self._setup_av_cross_grad_surgery(args, accelerator, transformer, network)
         self._setup_crepa(args, accelerator, transformer)
         self._setup_self_flow(args, accelerator, transformer, network)
         self._setup_audio_metrics(args)
@@ -1069,6 +1088,54 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             if self._ltx_mode != "av":
                 raise ValueError("--dcr requires --ltx2_mode av")
             logger.info("DCR enabled: per-sample routing, reference_detach=%s", self._dcr_reference_detach)
+
+    def _setup_av_cross_grad_surgery(self, args: argparse.Namespace, accelerator=None, transformer=None, network=None) -> None:
+        """Install optional AV cross-modal projection gradient scaling hooks."""
+        if self._av_cross_grad_surgery_handle is not None:
+            self._av_cross_grad_surgery_handle.remove()
+            self._av_cross_grad_surgery_handle = None
+        self._av_cross_grad_surgery_config = None
+        args.av_cross_grad_surgery_config = None
+
+        if not bool(getattr(args, "av_cross_grad_surgery", False)):
+            return
+        if self._ltx_mode != "av":
+            raise ValueError("--av_cross_grad_surgery requires --ltx2_mode av")
+        if bool(getattr(args, "ltx2_audio_only_model", False)):
+            raise ValueError("--av_cross_grad_surgery requires a video+audio transformer, not --ltx2_audio_only_model")
+        if is_ltx2_remote_stage_enabled(args):
+            raise ValueError("--av_cross_grad_surgery is not supported with --ltx2_remote_stage")
+        if transformer is None:
+            raise ValueError("--av_cross_grad_surgery requires transformer modules to be available")
+
+        if accelerator is not None and hasattr(accelerator, "unwrap_model"):
+            transformer = accelerator.unwrap_model(transformer)
+        base_model = transformer.model if hasattr(transformer, "model") else transformer
+        blocks = getattr(base_model, "transformer_blocks", None)
+        if blocks is None:
+            raise ValueError("--av_cross_grad_surgery requires an LTX-2 transformer with transformer_blocks")
+        total_layers = len(blocks)
+        config = parse_av_cross_grad_surgery_args(
+            getattr(args, "av_cross_grad_surgery_args", None),
+            total_layers=total_layers,
+        )
+        handle = install_av_cross_grad_surgery(transformer, config)
+        self._av_cross_grad_surgery_handle = handle
+        self._av_cross_grad_surgery_config = config
+        args.av_cross_grad_surgery_config = config
+
+        if network is not None and not _network_has_av_cross_projection_lora(network, config.projections):
+            logger.warning(
+                "AV cross grad surgery installed on the base transformer, but the LoRA network does not appear "
+                "to target matching AV cross-modal K/V projections. This is useful for full-FT, but may be a no-op "
+                "for LoRA-only training."
+            )
+
+        logger.info(
+            "AV cross grad surgery enabled: %s; installed %d projection hooks",
+            config.format_summary(),
+            len(handle.installed),
+        )
 
     def _setup_preservation(self, args: argparse.Namespace, accelerator: Accelerator) -> None:
         """Parse preservation CLI flags and prepare helper.  No-op when no flags are set."""
@@ -2887,6 +2954,12 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             md["ss_latent_delta_loss"] = True
             if getattr(args, "latent_delta_loss_args", None):
                 md["ss_latent_delta_loss_args"] = " ".join(args.latent_delta_loss_args)
+        if bool(getattr(args, "av_cross_grad_surgery", False)):
+            md["ss_av_cross_grad_surgery"] = True
+            if self._av_cross_grad_surgery_config is not None:
+                md["ss_av_cross_grad_surgery_config"] = self._av_cross_grad_surgery_config.format_summary()
+            if getattr(args, "av_cross_grad_surgery_args", None):
+                md["ss_av_cross_grad_surgery_args"] = " ".join(args.av_cross_grad_surgery_args)
         if is_ltx2_remote_stage_enabled(args):
             md["ss_ltx2_remote_stage_codec"] = getattr(args, "ltx2_remote_stage_codec", "none")
             md["ss_ltx2_remote_stage_grad_codec"] = getattr(args, "ltx2_remote_stage_grad_codec", "none")

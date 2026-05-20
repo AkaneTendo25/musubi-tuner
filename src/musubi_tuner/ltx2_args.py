@@ -1125,6 +1125,21 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         nargs="*",
         help="Key=value args for DCR, e.g. reference_detach=true",
     )
+    parser.add_argument(
+        "--av_cross_grad_surgery",
+        action="store_true",
+        help=(
+            "Enable branch-aware gradient scaling for AV cross-modal K/V projections. "
+            "Only active in --ltx2_mode av. With no args, uses the OmniNFT A2V schedule "
+            "a2v=0:0,1-10:0.1,40-47:0.3."
+        ),
+    )
+    parser.add_argument(
+        "--av_cross_grad_surgery_args",
+        type=str,
+        nargs="*",
+        help=("Key=value args for AV cross grad surgery, e.g. a2v=0:0,1-10:0.1,40-47:0.3 v2a=40-47:0.3 projections=k,v"),
+    )
 
     # -- Audio Metrics --
     parser.add_argument(

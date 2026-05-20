@@ -537,6 +537,12 @@
 									</div>
 								</div>
 							{/if}
+							<div class="p-2 space-y-2" style="background: var(--bg-elevated); border-radius: var(--radius-sm); border: 1px solid var(--border-subtle);">
+								<FormToggle label="AV Cross Grad Surgery" fieldPath="training.av_cross_grad_surgery" checked={t.av_cross_grad_surgery ?? false} onchange={(e) => update('av_cross_grad_surgery', e.target.checked)} tooltip="Scale gradients through AV cross-modal K/V projections by block. Requires LTX2 mode av." />
+								{#if t.av_cross_grad_surgery}
+									<FormField fieldPath="training.av_cross_grad_surgery_args" value={t.av_cross_grad_surgery_args || ''} oninput={(e) => update('av_cross_grad_surgery_args', e.target.value)} placeholder="a2v=0:0,1-10:0.1,40-47:0.3 projections=k,v" tooltip="Optional key=value args. Empty uses the OmniNFT A2V K/V schedule." invalid={fieldInvalid('training.av_cross_grad_surgery_args')} error={fieldError('training.av_cross_grad_surgery_args')} />
+								{/if}
+							</div>
 						{/if}
 						{#if $advancedMode}
 						<FormField fieldPath="training.network_args" value={t.network_args || ''} oninput={(e) => update('network_args', e.target.value)} placeholder="key=value ..." tooltip="Extra network args (space-separated key=value)" />

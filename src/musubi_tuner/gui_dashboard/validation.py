@@ -9,6 +9,7 @@ from typing import Any
 
 from musubi_tuner.gui_dashboard.cli_defaults import get_ltx2_training_network_module_default
 from musubi_tuner.gui_dashboard.project_schema import DatasetEntry, ProjectConfig
+from musubi_tuner.ltx2_av_cross_grad_surgery import parse_av_cross_grad_surgery_args
 from musubi_tuner.tread import default_ltx_tread_route, parse_tread_args
 
 
@@ -720,6 +721,50 @@ def validate_training_config(config: ProjectConfig) -> dict[str, Any]:
         message = "AWQ Calibration requires NF4 Base."
         errors.append(_make_issue("error", "training.awq_calibration", message, label="AWQ Calibration", page="training"))
         errors.append(_make_issue("error", "training.nf4_base", message, label="NF4 Base", page="training"))
+
+    if t.av_cross_grad_surgery:
+        if t.ltx2_mode != "av":
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.av_cross_grad_surgery",
+                    "AV Cross Grad Surgery requires LTX2 Mode = av.",
+                    label="AV Cross Grad Surgery",
+                    page="training",
+                )
+            )
+        if t.ltx2_audio_only_model:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.av_cross_grad_surgery",
+                    "AV Cross Grad Surgery requires a video+audio transformer, not Audio-only Model.",
+                    label="AV Cross Grad Surgery",
+                    page="training",
+                )
+            )
+        if t.ltx2_remote_stage:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.av_cross_grad_surgery",
+                    "AV Cross Grad Surgery is not supported with Remote Stage.",
+                    label="AV Cross Grad Surgery",
+                    page="training",
+                )
+            )
+        try:
+            parse_av_cross_grad_surgery_args(_split_cli_args(t.av_cross_grad_surgery_args), total_layers=48)
+        except (TypeError, ValueError) as exc:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.av_cross_grad_surgery_args",
+                    f"AV Cross Grad Surgery Args are invalid: {exc}",
+                    label="AV Cross Grad Surgery Args",
+                    page="training",
+                )
+            )
 
     if t.tread:
         tread_args_parts = _split_cli_args(t.tread_args)

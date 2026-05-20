@@ -1360,6 +1360,12 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
             args_parts.append("reference_detach=false")
         if args_parts:
             cmd += ["--dcr_args"] + args_parts
+    if t.av_cross_grad_surgery:
+        cmd.append("--av_cross_grad_surgery")
+        args_parts = []
+        _append_key_value_args(args_parts, t.av_cross_grad_surgery_args)
+        if args_parts:
+            cmd += ["--av_cross_grad_surgery_args"] + args_parts
 
     # Audio Metrics
     if t.audio_metrics:

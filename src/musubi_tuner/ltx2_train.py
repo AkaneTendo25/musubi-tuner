@@ -2810,6 +2810,17 @@ def _prepare_state_dict_for_save(state_dict: dict, args) -> tuple[dict, dict[str
     return renamed, extra_metadata
 
 
+def _setup_ltx2_full_ft_pre_train_hooks(
+    args: argparse.Namespace,
+    accelerator: Accelerator | None,
+    trainer: LTX2NetworkTrainer,
+    transformer: torch.nn.Module,
+) -> None:
+    # Full fine-tuning does not use LTX2NetworkTrainer.pre_train_hook, so
+    # opt-in shared hooks that do not add optimizer parameters are installed here.
+    trainer._setup_av_cross_grad_surgery(args, accelerator, transformer=transformer, network=None)
+
+
 def main() -> None:
     parser = setup_parser_common()
     parser = ltx2_setup_parser(parser)
@@ -3512,6 +3523,8 @@ def main() -> None:
             len(image_prior_ft_route_state.get("appearance_param_names", [])),
         )
 
+    _setup_ltx2_full_ft_pre_train_hooks(args, accelerator, trainer, transformer)
+
     self_flow_projector_param_count = 0
     if bool(getattr(args, "self_flow", False)):
         self_flow_args = list(getattr(args, "self_flow_args", None) or [])
@@ -3978,6 +3991,15 @@ def main() -> None:
         "ss_self_flow": bool(getattr(args, "self_flow", False)),
         "ss_self_flow_args": getattr(args, "self_flow_args", None),
         "ss_self_flow_projector_params": self_flow_projector_param_count,
+        "ss_av_cross_grad_surgery": bool(getattr(args, "av_cross_grad_surgery", False)),
+        "ss_av_cross_grad_surgery_config": (
+            args.av_cross_grad_surgery_config.format_summary()
+            if getattr(args, "av_cross_grad_surgery_config", None) is not None
+            else None
+        ),
+        "ss_av_cross_grad_surgery_args": (
+            " ".join(args.av_cross_grad_surgery_args) if getattr(args, "av_cross_grad_surgery_args", None) else None
+        ),
         "ss_freeze_early_blocks": getattr(args, "freeze_early_blocks", 0),
         "ss_freeze_block_indices": getattr(args, "freeze_block_indices", None),
         "ss_block_lr_scales": getattr(args, "block_lr_scales", None),
