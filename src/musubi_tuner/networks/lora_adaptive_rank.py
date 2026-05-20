@@ -63,26 +63,14 @@ def parse_adaptive_rank_network_kwargs(kwargs: Dict[str, Any]) -> Dict[str, Any]
         "adaptive_rank_estimate_report": _coerce_str(kwargs.get("adaptive_rank_estimate_report", None)),
         "adaptive_rank_estimate_key": _coerce_str(kwargs.get("adaptive_rank_estimate_key", None)),
         "adaptive_rank_estimate_apply": _coerce_lower_str(kwargs.get("adaptive_rank_estimate_apply", None)),
-        "adaptive_rank_estimate_reallocate_interval": _coerce_int(
-            kwargs.get("adaptive_rank_estimate_reallocate_interval", None)
-        ),
-        "adaptive_rank_estimate_reallocate_start": _coerce_float(
-            kwargs.get("adaptive_rank_estimate_reallocate_start", None)
-        ),
-        "adaptive_rank_estimate_reallocate_apply": _coerce_lower_str(
-            kwargs.get("adaptive_rank_estimate_reallocate_apply", None)
-        ),
+        "adaptive_rank_estimate_reallocate_interval": _coerce_int(kwargs.get("adaptive_rank_estimate_reallocate_interval", None)),
+        "adaptive_rank_estimate_reallocate_start": _coerce_float(kwargs.get("adaptive_rank_estimate_reallocate_start", None)),
+        "adaptive_rank_estimate_reallocate_apply": _coerce_lower_str(kwargs.get("adaptive_rank_estimate_reallocate_apply", None)),
         "adaptive_rank_finalize_start": _coerce_float(kwargs.get("adaptive_rank_finalize_start", None)),
         "adaptive_rank_finalize_recover_steps": _coerce_int(kwargs.get("adaptive_rank_finalize_recover_steps", None)),
-        "adaptive_rank_finalize_recover_warmup_steps": _coerce_int(
-            kwargs.get("adaptive_rank_finalize_recover_warmup_steps", None)
-        ),
-        "adaptive_rank_finalize_recover_lr_scale": _coerce_float(
-            kwargs.get("adaptive_rank_finalize_recover_lr_scale", None)
-        ),
-        "adaptive_rank_finalize_recover_scheduler": _coerce_lower_str(
-            kwargs.get("adaptive_rank_finalize_recover_scheduler", None)
-        ),
+        "adaptive_rank_finalize_recover_warmup_steps": _coerce_int(kwargs.get("adaptive_rank_finalize_recover_warmup_steps", None)),
+        "adaptive_rank_finalize_recover_lr_scale": _coerce_float(kwargs.get("adaptive_rank_finalize_recover_lr_scale", None)),
+        "adaptive_rank_finalize_recover_scheduler": _coerce_lower_str(kwargs.get("adaptive_rank_finalize_recover_scheduler", None)),
         "adaptive_rank_hard_prune": _coerce_bool(kwargs.get("adaptive_rank_hard_prune", None), default=False),
         "adaptive_rank_hard_prune_start": _coerce_float(kwargs.get("adaptive_rank_hard_prune_start", None)),
         "adaptive_rank_hard_prune_interval": _coerce_int(kwargs.get("adaptive_rank_hard_prune_interval", None)),
@@ -126,9 +114,7 @@ class AdaptiveRankLoRAModuleMixin:
 
         if self.adaptive_rank:
             init_lambda = self._lambda_from_rank(init_rank, self.adaptive_rank_quantile)
-            self.rank_lambda_param = torch.nn.Parameter(
-                torch.tensor(self._inverse_softplus(init_lambda), dtype=torch.float32)
-            )
+            self.rank_lambda_param = torch.nn.Parameter(torch.tensor(self._inverse_softplus(init_lambda), dtype=torch.float32))
 
     @staticmethod
     def _lambda_from_rank(rank: int, quantile: float) -> float:
@@ -205,9 +191,9 @@ class AdaptiveRankLoRAModuleMixin:
             down_weight = self.lora_down.weight.detach().clone()
             up_weight = self.lora_up.weight.detach().clone()
             if self.adaptive_rank:
-                rank_weights = self._adaptive_rank_weights(
-                    self.lora_dim, dtype=down_weight.dtype, device=down_weight.device
-                )[:export_rank].sqrt()
+                rank_weights = self._adaptive_rank_weights(self.lora_dim, dtype=down_weight.dtype, device=down_weight.device)[
+                    :export_rank
+                ].sqrt()
                 down_weight = down_weight[:export_rank]
                 up_weight = up_weight[:, :export_rank]
                 if down_weight.dim() == 2:
@@ -230,9 +216,7 @@ class AdaptiveRankLoRAModuleMixin:
             rank_weights = self._adaptive_rank_weights(
                 self.lora_dim, dtype=self.lora_down[0].weight.dtype, device=self.lora_down[0].weight.device
             )[:export_rank].sqrt()
-            alpha = self._export_alpha(
-                export_rank, dtype=self.lora_down[0].weight.dtype, device=self.lora_down[0].weight.device
-            )
+            alpha = self._export_alpha(export_rank, dtype=self.lora_down[0].weight.dtype, device=self.lora_down[0].weight.device)
         else:
             alpha = self.alpha.detach().clone().to(device=self.lora_down[0].weight.device, dtype=torch.float32)
 
@@ -436,11 +420,7 @@ class AdaptiveRankLoRAModuleMixin:
         alpha_value = float(
             state.get(
                 "alpha",
-                (
-                    self.alpha.detach().cpu().item()
-                    if isinstance(self.alpha, torch.Tensor)
-                    else float(self.alpha)
-                ),
+                (self.alpha.detach().cpu().item() if isinstance(self.alpha, torch.Tensor) else float(self.alpha)),
             )
         )
         if isinstance(self.alpha, torch.Tensor):
@@ -611,9 +591,7 @@ class AdaptiveRankLoRANetworkMixin:
             logger.info(
                 "adaptive rank estimate reallocate: interval=%s, start=%s, apply=%s",
                 self.adaptive_rank_estimate_reallocate_interval,
-                self.adaptive_rank_estimate_reallocate_start
-                if self.adaptive_rank_estimate_reallocate_start is not None
-                else 0.0,
+                self.adaptive_rank_estimate_reallocate_start if self.adaptive_rank_estimate_reallocate_start is not None else 0.0,
                 self.adaptive_rank_estimate_reallocate_apply
                 if self.adaptive_rank_estimate_reallocate_apply is not None
                 else "target",
@@ -622,15 +600,11 @@ class AdaptiveRankLoRANetworkMixin:
             logger.info(
                 "adaptive rank finalize: start=%s, recover_steps=%s, recover_warmup=%s, recover_lr_scale=%s, recover_scheduler=%s",
                 self.adaptive_rank_finalize_start,
-                self.adaptive_rank_finalize_recover_steps
-                if self.adaptive_rank_finalize_recover_steps is not None
-                else "off",
+                self.adaptive_rank_finalize_recover_steps if self.adaptive_rank_finalize_recover_steps is not None else "off",
                 self.adaptive_rank_finalize_recover_warmup_steps
                 if self.adaptive_rank_finalize_recover_warmup_steps is not None
                 else 0,
-                self.adaptive_rank_finalize_recover_lr_scale
-                if self.adaptive_rank_finalize_recover_lr_scale is not None
-                else 1.0,
+                self.adaptive_rank_finalize_recover_lr_scale if self.adaptive_rank_finalize_recover_lr_scale is not None else 1.0,
                 self.adaptive_rank_finalize_recover_scheduler
                 if self.adaptive_rank_finalize_recover_scheduler is not None
                 else "auto",
@@ -784,9 +758,7 @@ class AdaptiveRankLoRANetworkMixin:
         if max_train_steps is None or max_train_steps <= 0:
             return False
 
-        start = 0.0 if self.adaptive_rank_estimate_reallocate_start is None else float(
-            self.adaptive_rank_estimate_reallocate_start
-        )
+        start = 0.0 if self.adaptive_rank_estimate_reallocate_start is None else float(self.adaptive_rank_estimate_reallocate_start)
         start = min(max(start, 0.0), 1.0)
         progress = float(self._adaptive_rank_global_step) / float(max_train_steps)
         progress = min(max(progress, 0.0), 1.0)
@@ -983,9 +955,7 @@ class AdaptiveRankLoRANetworkMixin:
         if not self.adaptive_rank or self.adaptive_rank_estimate_report is None:
             return
 
-        adaptive_loras = [
-            lora for lora in (self.text_encoder_loras + self.unet_loras) if getattr(lora, "adaptive_rank", False)
-        ]
+        adaptive_loras = [lora for lora in (self.text_encoder_loras + self.unet_loras) if getattr(lora, "adaptive_rank", False)]
         if not adaptive_loras:
             return
 
@@ -1039,9 +1009,7 @@ class AdaptiveRankLoRANetworkMixin:
         return total_max_rank + (final_target_budget - total_max_rank) * schedule_factor
 
     def get_adaptive_rank_budget_loss(self) -> Optional[torch.Tensor]:
-        adaptive_loras = [
-            lora for lora in (self.text_encoder_loras + self.unet_loras) if getattr(lora, "adaptive_rank", False)
-        ]
+        adaptive_loras = [lora for lora in (self.text_encoder_loras + self.unet_loras) if getattr(lora, "adaptive_rank", False)]
         target_budget = self._get_adaptive_rank_budget_target(adaptive_loras)
         budget_weight = self.adaptive_rank_budget_weight
         if target_budget is None:
@@ -1115,9 +1083,7 @@ class AdaptiveRankLoRANetworkMixin:
         if not force and not self.should_finalize_adaptive_rank():
             return None
 
-        adaptive_loras = [
-            lora for lora in (self.text_encoder_loras + self.unet_loras) if getattr(lora, "adaptive_rank", False)
-        ]
+        adaptive_loras = [lora for lora in (self.text_encoder_loras + self.unet_loras) if getattr(lora, "adaptive_rank", False)]
         if not adaptive_loras:
             self._adaptive_rank_finalized = True
             return None
@@ -1157,16 +1123,12 @@ class AdaptiveRankLoRANetworkMixin:
         if self._adaptive_rank_estimate_scores is None or self._adaptive_rank_estimate_total_target_budget is None:
             return None
         apply_mode = (
-            self.adaptive_rank_estimate_reallocate_apply
-            if self.adaptive_rank_estimate_reallocate_apply is not None
-            else "target"
+            self.adaptive_rank_estimate_reallocate_apply if self.adaptive_rank_estimate_reallocate_apply is not None else "target"
         )
         if apply_mode not in ("target", "init", "both"):
             raise ValueError(f"Unsupported adaptive_rank_estimate_reallocate_apply: {apply_mode}")
 
-        report_loras = [
-            lora for lora in (self.text_encoder_loras + self.unet_loras) if getattr(lora, "was_adaptive_rank", False)
-        ]
+        report_loras = [lora for lora in (self.text_encoder_loras + self.unet_loras) if getattr(lora, "was_adaptive_rank", False)]
         adaptive_loras = [lora for lora in report_loras if getattr(lora, "adaptive_rank", False)]
         if not adaptive_loras:
             return None
@@ -1277,14 +1239,15 @@ class AdaptiveRankLoRANetworkMixin:
         return metrics
 
     def build_export_state_dict(self) -> Dict[str, torch.Tensor]:
-        if not self.has_adaptive_rank():
-            return self.state_dict()
-
         export_state: Dict[str, torch.Tensor] = {}
         loras = self.text_encoder_loras + self.unet_loras
         for lora in loras:
-            export_state.update(lora.export_state_dict())
-        return export_state
+            if hasattr(lora, "export_state_dict"):
+                export_state.update(lora.export_state_dict())
+
+        if export_state:
+            return export_state
+        return self.state_dict()
 
     def build_adaptive_rank_report(self) -> Optional[Dict[str, Any]]:
         loras = self.text_encoder_loras + self.unet_loras
@@ -1365,9 +1328,7 @@ class AdaptiveRankLoRANetworkMixin:
                 "finalize_events": int(self._adaptive_rank_finalize_events),
                 "finalized_modules": int(self._adaptive_rank_finalized_modules),
                 "last_hard_prune_step": (
-                    int(self._adaptive_rank_last_hard_prune_step)
-                    if self._adaptive_rank_last_hard_prune_step is not None
-                    else None
+                    int(self._adaptive_rank_last_hard_prune_step) if self._adaptive_rank_last_hard_prune_step is not None else None
                 ),
                 "hard_prune_events": int(self._adaptive_rank_hard_prune_events),
                 "hard_pruned_modules": int(self._adaptive_rank_hard_pruned_modules),
@@ -1412,9 +1373,7 @@ class AdaptiveRankLoRANetworkMixin:
         else:
             self._adaptive_rank_estimate_scores = None
         total_target_budget = network_state.get("estimate_total_target_budget")
-        self._adaptive_rank_estimate_total_target_budget = (
-            None if total_target_budget is None else float(total_target_budget)
-        )
+        self._adaptive_rank_estimate_total_target_budget = None if total_target_budget is None else float(total_target_budget)
         self._adaptive_rank_estimate_applied = bool(network_state.get("estimate_applied", self._adaptive_rank_estimate_applied))
         self._adaptive_rank_global_step = int(network_state.get("global_step", self._adaptive_rank_global_step))
         max_train_steps = network_state.get("max_train_steps")
@@ -1426,14 +1385,10 @@ class AdaptiveRankLoRANetworkMixin:
         )
         self._adaptive_rank_finalized = bool(network_state.get("finalized", self._adaptive_rank_finalized))
         self._adaptive_rank_finalize_events = int(network_state.get("finalize_events", self._adaptive_rank_finalize_events))
-        self._adaptive_rank_finalized_modules = int(
-            network_state.get("finalized_modules", self._adaptive_rank_finalized_modules)
-        )
+        self._adaptive_rank_finalized_modules = int(network_state.get("finalized_modules", self._adaptive_rank_finalized_modules))
         last_hard_prune = network_state.get("last_hard_prune_step")
         self._adaptive_rank_last_hard_prune_step = None if last_hard_prune is None else int(last_hard_prune)
-        self._adaptive_rank_hard_prune_events = int(
-            network_state.get("hard_prune_events", self._adaptive_rank_hard_prune_events)
-        )
+        self._adaptive_rank_hard_prune_events = int(network_state.get("hard_prune_events", self._adaptive_rank_hard_prune_events))
         self._adaptive_rank_hard_pruned_modules = int(
             network_state.get("hard_pruned_modules", self._adaptive_rank_hard_pruned_modules)
         )

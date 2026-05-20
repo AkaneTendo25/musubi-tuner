@@ -520,16 +520,20 @@ class LTX2SamplingMixin:
                     width = int(param["width"])
                     height = int(param["height"])
                     aspect = max(width, height) / max(min(width, height), 1)
-                    common_video_aspect = 16.0 / 9.0
-                    near_common_aspect = abs(aspect - common_video_aspect) <= 0.08
-                    if min(width, height) < 544 or not near_common_aspect:
+                    preset_aspect = max(default_width, default_height) / max(min(default_width, default_height), 1)
+                    near_preset_aspect = abs(aspect - preset_aspect) <= 0.08
+                    if min(width, height) < min(default_width, default_height) or not near_preset_aspect:
                         logger.warning(
                             "Sample prompt %d overrides the LTX-2.3 preset geometry to %dx%d. "
                             "Small square or 4:3 previews can look severely degraded; "
-                            "prefer 960x544 or 544x960, or leave --w/--h unset to inherit the preset.",
+                            "prefer %dx%d or %dx%d, or leave --w/--h unset to inherit the preset.",
                             prompt_index,
                             width,
                             height,
+                            default_width,
+                            default_height,
+                            default_height,
+                            default_width,
                         )
                 if "sample_steps" in prompt_data and int(param["sample_steps"]) != int(default_sample_steps):
                     logger.warning(

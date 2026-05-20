@@ -11,7 +11,7 @@ Supports LoRA training for both **LTX-2 (19B)** and **LTX-2.3 (22B)** models wit
 
 Version choice for training is controlled by `--ltx_version` (default: `2.3`) in `ltx2_train_network.py`. The trainer auto-detects the checkpoint version from metadata and warns on mismatch.
 
-Caching scripts (`ltx2_cache_latents.py`, `ltx2_cache_text_encoder_outputs.py`) do not use `--ltx_version`; they work with both LTX-2 and LTX-2.3 checkpoints directly via `--ltx2_checkpoint`.
+Caching scripts (`ltx2_cache_latents.py`, `ltx2_cache_text_encoder_outputs.py`) also accept `--ltx_version`, but only for sample-prompt precaching defaults (`--precache_sample_latents` / `--precache_sample_prompts`). Dataset cache compatibility is still driven by `--ltx2_checkpoint` and `--ltx2_mode`.
 
 ---
 
@@ -20,6 +20,7 @@ Caching scripts (`ltx2_cache_latents.py`, `ltx2_cache_text_encoder_outputs.py`) 
 - [Installation](#installation)
   - [CUDA Version](#cuda-version)
   - [Downloading Required Models](#downloading-required-models)
+- [Supported Model Versions](#supported-model-versions)
 - [Supported Dataset Types](#supported-dataset-types)
 - [1. Caching Latents](#1-caching-latents)
   - [Latent Caching Command](#latent-caching-command)
@@ -33,7 +34,7 @@ Caching scripts (`ltx2_cache_latents.py`, `ltx2_cache_text_encoder_outputs.py`) 
   - [Loading Gemma from a Single Safetensors File](#loading-gemma-from-a-single-safetensors-file)
 - [3. Training](#3-training)
   - [Choosing Model Version for Training (2.0 vs 2.3)](#choosing-model-version-for-training-20-vs-23)
-  - [Source-Free Training from Cache](#optional-source-free-training-from-cache)
+  - [Optional: Source-Free Training from Cache](#optional-source-free-training-from-cache)
   - [Standard LoRA Training](#standard-lora-training)
   - [DoRA LoRA Training](#dora-lora-training)
   - [Advanced: LyCORIS/LoKR Training](#advanced-lycorislokr-training)
@@ -62,8 +63,8 @@ Caching scripts (`ltx2_cache_latents.py`, `ltx2_cache_text_encoder_outputs.py`) 
     - [Audio Quality Metrics](#audio-quality-metrics)
     - [Timestep Sampling](#timestep-sampling)
     - [LoRA Targets](#lora-targets)
-      - [LoRA Target Estimation](#lora-target-estimation-ltx2_estimatepy)
-      - [Connector LoRA](#connector-lora---train_connectors)
+      - [LoRA Target Estimation (`ltx2_estimate.py`)](#lora-target-estimation-ltx2_estimatepy)
+      - [Connector LoRA (`--train_connectors`)](#connector-lora---train_connectors)
     - [IC-LoRA / Video-to-Video Training](#ic-lora--video-to-video-training)
     - [Audio-Reference IC-LoRA](#audio-reference-ic-lora)
     - [Latent Guides](#latent-guides)
@@ -91,13 +92,13 @@ Caching scripts (`ltx2_cache_latents.py`, `ltx2_cache_text_encoder_outputs.py`) 
   - [Caching](#caching)
   - [Training Arguments](#training-arguments-1)
   - [Example](#example)
-  - [How It Works](#how-it-works-1)
+  - [How It Works](#how-it-works-2)
   - [Tips](#tips)
 - [Directory Structure](#directory-structure)
   - [Raw Dataset Layout (Example)](#raw-dataset-layout-example)
   - [Cache Directory Layout (After Caching)](#cache-directory-layout-after-caching)
 - [Troubleshooting](#troubleshooting)
-  - [Audio/Voice Training with Mixed Datasets](#audiovoice-training-with-mixed-datasets)
+  - [Mixed Audio-Video Training](#mixed-audio-video-training)
   - [Technical Notes](#technical-notes)
 - [4. Slider LoRA Training](#4-slider-lora-training)
   - [4a. Text-Only Mode](#4a-text-only-mode)
@@ -412,6 +413,20 @@ In the dashboard, enable the **DoRA** toggle in the LoRA section. When disabled,
 
 Training-time ComfyUI export is supported for DoRA LoRA. The native Musubi checkpoint stores `lora_magnitude_vector.weight`; the generated `*.comfy.safetensors` file stores the equivalent ComfyUI `dora_scale` tensors.
 
+The same `use_dora=true` flag enables DokR when the native LoKr backend is selected:
+
+```bash
+accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 ltx2_train_network.py ^
+  ... (same args as standard LoRA) ^
+  --network_module networks.lokr ^
+  --network_dim 16 ^
+  --network_alpha 16 ^
+  --network_args "use_dora=true" ^
+  --output_name ltx2_dokr
+```
+
+DokR is also opt-in. Without `use_dora=true`, `networks.lokr` keeps the regular LoKr path.
+
 ### Advanced: LyCORIS/LoKR Training
 
 musubi-tuner supports advanced LoRA algorithms (LoKR, LoHA, LoCoN, etc.) via:
@@ -468,7 +483,7 @@ accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 ltx2_tr
 
 ### Training Arguments
 
-All training arguments can be placed in a `.toml` config file instead of on the command line via `--config_file config.toml`. See the [configuration files guide](./advanced_config.md#using-configuration-files-to-specify-training-options) for format details.
+All training arguments can be placed in a `.toml` config file instead of on the command line via `--config_file config.toml`. See the [configuration files guide](./advanced_config.md) for format details.
 
 #### Memory Optimization
 
@@ -646,15 +661,20 @@ accelerate launch ... ltx2_train_network.py ^
 - `--min_audio_batches_per_accum`: Minimum number of audio-bearing microbatches per gradient accumulation window.
 - `--audio_batch_probability`: Probability of selecting an audio-bearing batch when both audio and non-audio batches are available.
   - `--min_audio_batches_per_accum` and `--audio_batch_probability` are mutually exclusive.
+  - In LTX-2 training these flags enable an audio-aware DataLoader sampler. They cannot be combined with `--accumulation_group_by`, because PyTorch only accepts one sampler for the DataLoader.
+  - They can be combined with `--audio_loss_balance_mode`, per-modality caption dropout, `--audio_supervision_mode`, `--dcr`, and `--tarp`.
+  - For a first mixed AV trial, `--audio_batch_probability 0.4` is a reasonable starting point. With gradient accumulation, use `--min_audio_batches_per_accum 1` instead.
 - `--accumulation_group_by none|frames|bucket|dataset`: Opt-in ordering for gradient accumulation windows. `bucket` keeps each virtual batch on one full dataset bucket key (resolution/frame/audio), which is useful for mixed frame-length datasets with `--gradient_accumulation_steps > 1`.
 - `--accumulation_group_remainder drop|pad|allow_mixed`: Handles buckets that do not divide evenly by the accumulation window. `drop` skips incomplete windows, `pad` repeats same-group batches, and `allow_mixed` keeps all batches but may mix groups in final windows.
 - `caption_extension`: For directory datasets, use a different caption file suffix to select alternate captions. For example, `caption_extension = ".target.txt"` reads `clip.target.txt` for `clip.mp4`/`clip.png`. This is the directory-dataset equivalent of JSONL caption routing.
 - `--caption_field`: For JSONL datasets, use this metadata field instead of `caption` when caching/training text embeddings. For I2V/reference datasets, store fields such as `target_caption` and `reference_caption`, then cache with `--caption_field target_caption` when the text conditioning should describe the target video/motion.
-- `--caption_dropout_rate`: Probability of dropping ALL text conditioning (video + audio) for a sample during training (default: `0.0`, disabled). When triggered, the sample's text embeddings are zeroed out and the attention mask is cleared, training the model to generate without text guidance. This enables classifier-free guidance (CFG) at inference.
+- `--caption_dropout_rate`: Probability of dropping ALL text conditioning (video + audio) for a sample during training (default: `0.0`, disabled). When triggered, the sample's text embeddings are zeroed and the attention mask is disabled except for one placeholder token kept active for shape/runtime safety. This trains the model to generate without text guidance and enables classifier-free guidance (CFG) at inference.
 - `--video_caption_dropout_rate`: Probability of dropping only the video text conditioning while keeping audio text conditioning (default: `0.0`). AV mode only. Applied independently per sample before `--caption_dropout_rate`.
 - `--audio_caption_dropout_rate`: Probability of dropping only the audio text conditioning while keeping video text conditioning (default: `0.0`). AV mode only. Applied independently per sample before `--caption_dropout_rate`.
 
 The three dropout rates are independent. For a given sample, the per-modality dropout is applied first (on the separate `video_prompt_embeds` / `audio_prompt_embeds`), then the joint dropout is applied on the concatenated result. A sample can end up with: both modalities present, video-only, audio-only, or fully unconditional.
+
+For balanced AV or `av_ic` runs, per-modality dropout can be combined with the audio-aware sampler, `--audio_loss_balance_mode ema_mag`, and `--dcr`. A modest first pass is `--video_caption_dropout_rate 0.05 --audio_caption_dropout_rate 0.10`.
 
 #### Loss Function Type
 
@@ -707,6 +727,8 @@ Recommended start values:
 - `--audio_loss_balance_min 0.05 --audio_loss_balance_max 3.0` (conservative clamp range)
 - `--audio_loss_balance_ema_init 1.0` (no warm-start boost; use `0.5` only if you want stronger early audio emphasis)
 
+For audio-starved mixed datasets, `inv_freq` can be combined with `--audio_batch_probability` or `--min_audio_batches_per_accum`, plus `--audio_supervision_mode warn --audio_supervision_min_ratio 0.5`.
+
 **`ema_mag` mode** — dynamic balancing by matching audio-loss EMA magnitude to a target fraction of video-loss EMA. Bidirectional: can dampen audio (weight < 1.0) when audio loss exceeds `target_ratio * video_loss`, or boost it when audio loss is below that target.
 
 - `--audio_loss_balance_target_ratio`: Target audio/video loss magnitude ratio (default: 0.33 — audio loss targets ~33% of video loss).
@@ -723,6 +745,8 @@ Example:
 ```
 
 Use `ema_mag` when audio and video losses have different natural magnitudes and you want automatic scaling instead of manual `--audio_loss_weight` tuning.
+
+For balanced AV or `av_ic` runs, `--audio_loss_balance_target_ratio 0.33` can be combined with the audio-aware sampler, per-modality caption dropout, and `--dcr`. If audio improves while video or identity quality drifts, try a lower target such as `0.25` together with lower `--audio_lr`, lower `--audio_dim`, or modality freezing.
 
 **`uncertainty` mode** — learnable homoscedastic uncertainty weighting ([Kendall et al., CVPR 2018](https://arxiv.org/abs/1705.07115)). Two log-variance scalars (`log_var_video`, `log_var_audio`) are added to the optimizer and learned jointly with LoRA weights. The combined loss is:
 
@@ -774,6 +798,8 @@ On video-only batches (no audio in the current batch), falls back to standard `v
 - `--audio_supervision_check_interval`: Run supervision checks every N expected AV batches.
 - `--audio_supervision_min_ratio`: Minimum supervised/expected ratio required by the monitor.
 
+For mixed datasets where `loss_a` is absent for long stretches, the supervision monitor can be combined with the audio-aware sampler and `--audio_loss_balance_mode inv_freq`. Use `warn` first to confirm the ratio before switching to `error`.
+
 #### Modality Freezing (G2D)
 
 Adaptive modality freezing based on per-modality loss EMA ratio, inspired by G2D Sequential Modality Prioritization ([arXiv 2506.21514](https://arxiv.org/abs/2506.21514)). When one modality's loss is significantly lower than the other, its LoRA parameters are frozen (`requires_grad=False`) so the under-performing modality can train without gradient interference.
@@ -791,6 +817,8 @@ Example:
 ```
 
 Logged to TensorBoard: `modality_freeze/state` (0=both active, 1=audio frozen, -1=video frozen), `modality_freeze/video_loss_ema`, `modality_freeze/audio_loss_ema`.
+
+For audio-overfitting cases, modality freezing can be combined with `--audio_loss_balance_mode ema_mag`, a lower `--audio_lr`, and lower audio LoRA rank.
 
 #### Per-Module Learning Rates
 
@@ -831,6 +859,8 @@ Example:
 
 This keeps audio groups on a shorter warmup and video groups on a longer warmup without changing existing behavior unless `--lr_group_warmup_args` is provided.
 
+When audio learns faster than video, a lower `--audio_lr` such as `3e-5` with a `1e-4` base LR can be combined with `--audio_loss_balance_mode ema_mag` and lower audio LoRA rank.
+
 #### Per-Module LoRA Rank
 
 Set different LoRA rank (dim) for audio vs. video modules.
@@ -857,6 +887,8 @@ Result:
 Precedence is: `cross_modal_*` override > `audio_*` override > base `--network_dim` / `--network_alpha`.
 
 All override flags default to `None` (no override, all modules use `--network_dim`/`--network_alpha`). Not used with LyCORIS — use the LyCORIS per-module config instead. At inference, each module's rank is read from saved weight shapes (`lora_down.shape[0]`), so no flags are needed for loading.
+
+For AV runs where audio overfits before video, `--audio_dim 8 --audio_alpha 8` can be combined with lower `--audio_lr`, `--audio_loss_balance_mode ema_mag`, and modality freezing.
 
 #### Adaptive LoRA Rank
 
@@ -951,11 +983,21 @@ The `class` parameter should be a general description without your trigger word 
 ```
 `window_multiplier` controls the A2V window size: `s = multiplier * floor(audio_tokens / video_frames)`. Default 3 (each frame sees 3x its proportional share of audio). V2A always uses nearest-neighbour (s=1).
 
+TARP can be combined with `--cts_lambda_video_driven` / `--cts_lambda_audio_driven` when lip sync or cross-modal alignment is the main target.
+
 **DCR (Dynamic Context Routing)** — Per-sample gradient detachment in cross-attention for mixed audio/video batches. When a sample lacks audio (zero-padded) or uses a clean reference (sigma=0), DCR detaches that stream's cross-attention context, preventing gradient flow through absent or reference-only streams. Forward values are unchanged; only the gradient path is masked. Requires `--ltx2_mode av`. From [arXiv:2603.18600](https://arxiv.org/abs/2603.18600).
 ```bash
 --dcr --dcr_args reference_detach=true
 ```
 `reference_detach` (default `true`) additionally detaches the reference stream when its timestep sigma is exactly 0.
+
+DCR can be combined with the audio-aware sampler, `--audio_loss_balance_mode ema_mag`, and per-modality caption dropout. For `av_ic` runs, keep `reference_detach=true` unless you specifically want gradients through clean reference streams.
+
+**Cross-Task Synergy** — Auxiliary AV losses with one modality clean (timestep=0), intended to provide cross-modal alignment targets. Adds two extra forward passes per AV batch. From [Harmony](https://arxiv.org/abs/2511.21579).
+```bash
+--cts_lambda_video_driven 0.3 --cts_lambda_audio_driven 0.1
+```
+CTS can be combined with TARP. Keep it off unless AV sync or cross-modal alignment is the target and the extra compute is acceptable.
 
 **TREAD** - Training-time token routing for LTX token streams. This is opt-in. Enable it with `--tread`; optional settings use `--tread_args`:
 ```bash
@@ -969,7 +1011,7 @@ The `class` parameter should be a general description without your trigger word 
 - `--tread_args` accepts `target`, `selection_ratio`, `start_layer_idx`, and `end_layer_idx`; aliases are `modality`, `ratio`, `start`, and `end`.
 - TREAD is training-only. Video targets require a video-enabled path; audio-only training must use `target=audio`.
 
-| Technique | Extra forwards/step | Extra backwards/step | Recommended multiplier |
+| Technique | Extra forwards/step | Extra backwards/step | Starting value / multiplier |
 |-----------|-------------------|---------------------|----------------------|
 | `--blank_preservation` | +2 | +1 | 0.5 - 1.0 |
 | `--dop` | +2 | +1 | 0.5 - 1.0 |
@@ -977,10 +1019,11 @@ The `class` parameter should be a general description without your trigger word 
 | `--audio_dop` | +2 (non-audio steps only) | +1 (non-audio steps only) | 0.3 - 1.0 |
 | `--tarp` | 0 | 0 | N/A (mask only) |
 | `--dcr` | 0 | 0 | N/A (gradient routing) |
+| `--cts_lambda_*` | +1 per enabled direction | 0 | 0.1 - 0.3 |
 | `--tread` / `--tread_args` | 0 | 0 | N/A (routing only) |
 
 > [!CAUTION]
-> Each preservation technique adds transformer forward passes per step. Audio DOP costs apply only on non-audio steps. TARP, DCR, and TREAD add no extra passes; they modify the existing forward/backward in-place.
+> Some preservation techniques add transformer forward passes per step. Audio DOP costs apply only on non-audio steps. CTS adds one forward per enabled direction. TARP, DCR, and TREAD add no extra passes; they modify the existing forward/backward in-place.
 
 #### CREPA (Cross-frame Representation Alignment)
 
@@ -1620,7 +1663,7 @@ Supported modes:
 
 ##### Recommended settings
 
-The ID-LoRA reference configuration enables all of the following. A warning is emitted at training start if any are missing:
+The ID-LoRA reference configuration uses the following settings. The trainer warns when the main audio-reference separation flags are off, and warns about first-frame conditioning only when it is effectively disabled in AV mode.
 
 | Setting | Recommended value | Why |
 |---------|-------------------|-----|
@@ -1922,8 +1965,8 @@ The prompt file format (`--sample_prompts`) — including guidance scale, negati
 
 | Argument | Default | Description |
 |----------|---------|-------------|
-| `--height` | 512 | Base sample output height. With the default sampling preset, LTX-2.3 uses `544` unless the prompt line sets `--h` |
-| `--width` | 768 | Base sample output width. With the default sampling preset, LTX-2.3 uses `960` unless the prompt line sets `--w` |
+| `--height` | 512 | Base sample output height. With the default sampling preset, LTX-2.3 uses `512` unless the prompt line sets `--h` |
+| `--width` | 768 | Base sample output width. With the default sampling preset, LTX-2.3 uses `768` unless the prompt line sets `--w` |
 | `--sample_num_frames` | 45 | Base sample frame count. With the default sampling preset, LTX-2.3 uses `121` unless the prompt line sets `--f` |
 | `--sample_with_offloading` | off | Offload DiT to CPU between sampling prompts to save VRAM |
 | `--sample_tiled_vae` | off | Enable tiled VAE decoding during sampling to reduce VRAM |
@@ -1937,7 +1980,7 @@ The prompt file format (`--sample_prompts`) — including guidance scale, negati
 | `--sample_audio_subprocess` | on | Decode audio in a subprocess to avoid OOM crashes. Use `--no-sample_audio_subprocess` to decode in-process |
 | `--sample_disable_flash_attn` | off | Force SDPA instead of FlashAttention during sampling |
 | `--sample_i2v_token_timestep_mask` | on | Use I2V token timestep masking (conditioned tokens use t=0). Use `--no-sample_i2v_token_timestep_mask` to disable |
-| `--sample_sampling_preset` | `defaults` | Validation sampling preset. For `--ltx_version 2.3`, this resolves to the LTX-2.3 defaults (`15` steps, `960x544`, `121` frames, CFG/STG defaults, CFG rescale `0.9`). Use `legacy` only to bypass preset defaults |
+| `--sample_sampling_preset` | `defaults` | Validation sampling preset. For `--ltx_version 2.3`, this resolves to the LTX-2.3 defaults (`30` steps, `768x512`, `121` frames, CFG/STG defaults, CFG rescale `0.7`). Use `legacy` only to bypass preset defaults |
 | `--sample_sampler` | `auto` | Denoising sampler. `auto` uses `res_2s` for full LTX presets and Euler for `distilled_two_stage` |
 | `--sample_sigma_schedule` | `auto` | Sigma schedule. `auto` uses latent-aware LTX shifted sigmas and the exact LTX-2.3 distilled schedule for the distilled preset |
 
@@ -1992,7 +2035,7 @@ Saved LoRA checkpoints are converted to ComfyUI format by default. Both the orig
 > **Important:** Training can only be resumed from the **original** (non-comfy) checkpoint format. If you plan to use `--resume`, do not use `--no_save_original_lora`.
 > ComfyUI-only LoRA files can still be used for warm-starting via `--network_weights`, `--base_weights`, or `--dim_from_weights`; only full `--resume` requires the original checkpoint plus saved training state.
 
-For DoRA LoRA, keep the original `*.safetensors` file for Musubi loading and resume. The training-time ComfyUI export is intended for ComfyUI and stores `dora_scale`; converting that file back to native Musubi DoRA requires base-weight information that is not present in the standalone ComfyUI checkpoint.
+For DoRA LoRA and DokR LoKr, keep the original `*.safetensors` file for Musubi loading and resume. The training-time ComfyUI export is intended for ComfyUI and stores `dora_scale`; converting that file back to native Musubi DoRA/DokR requires base-weight information that is not present in the standalone ComfyUI checkpoint.
 
 Checkpoint rotation (`--save_last_n_epochs`) cleans up old ComfyUI checkpoints alongside originals. HuggingFace upload (`--huggingface_repo_id`) uploads both formats by default. Use `--no_save_original_lora` to upload only the ComfyUI checkpoint.
 
@@ -2288,7 +2331,7 @@ cache_directory = "cache/val"
 target_frames = [1, 17, 33, 49]
 ```
 
-The `cache_directory` for validation must be different from the training cache directory.
+Use a separate `cache_directory` for validation data to avoid mixing training and validation cache files.
 
 ### Caching
 
@@ -2324,7 +2367,7 @@ accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 ltx2_tr
 
 1. A separate validation dataloader is created with `batch_size=1` and `shuffle=False` (deterministic order).
 2. At the configured interval, the model switches to eval mode and runs inference on all validation samples with `torch.no_grad()`.
-3. The average MSE loss is computed and logged as `val_loss` to TensorBoard/WandB.
+3. The average validation loss is computed with the active `--loss_type` and logged as `val_loss` to TensorBoard/WandB.
 4. The model is restored to training mode and training continues.
 
 ### Tips
@@ -2391,85 +2434,119 @@ reference_cache_directory/                  # IC-LoRA only
 | `loss_a` too low but `loss_v` still high (audio overfitting) | Audio latent space converges faster than video; audio gradients dominate shared weights | Lower `--audio_loss_weight` (e.g., 0.3), or use `--audio_loss_balance_mode ema_mag` to auto-dampen audio when it exceeds `target_ratio × video_loss`. Reduce audio learning rate with `--audio_lr 1e-6` or fine-grained `--lr_args audio_attn=1e-6 audio_ff=1e-6`. Disable `--audio_dop` / `--audio_silence_regularizer` if active — they add more audio signal. |
 | `loss_a` absent or not dropping in mixed dataset (audio starvation) | Audio batches too rare — non-audio steps outnumber audio steps, audio branch gets insufficient supervision | Increase `num_repeats` on audio datasets (target 30-50% audio steps). Add `--audio_loss_balance_mode inv_freq` to auto-boost audio weight. Use `--audio_dop` or `--audio_silence_regularizer` to provide audio signal on non-audio steps. Check caching summary for `failed > 0`. |
 
-### Audio/Voice Training with Mixed Datasets
+### Mixed Audio-Video Training
 
-Audio overfits faster than video due to lower-dimensional latent space and simpler temporal structure. In mixed datasets, audio batches are also a minority — non-audio steps update shared weights without audio supervision, causing audio drift. The tools below address both problems.
+Use this section for joint AV LoRA (`--ltx2_mode av`) when the dataset mixes audio-bearing clips with silent, video-only, image, or reference-conditioned samples. The common failure modes are audio starvation (`loss_a` is absent or rare) and audio overfitting (`loss_a` drops much faster than `loss_v` while video, identity, or motion quality drifts). These controls are training-only; the saved LoRA loads normally at inference.
 
-**1. Oversample audio items** — set `num_repeats` so audio batches are 30-50% of steps:
+**1. Keep audio batches visible.** Use dataset `num_repeats` so audio-bearing clips are not outnumbered by non-audio samples:
 ```toml
 [[datasets]]
 video_directory = "audio_video_clips"
 num_repeats = 5
 ```
 
-**2. Lower audio learning rate** — audio converges faster, so reduce its LR relative to video. Use `--audio_lr` for a blanket reduction or `--lr_args` for per-module control. Joint AV training typically needs a lower base LR than video-only (UniAVGen uses 4x lower LR for joint vs single-modality training).
+You can also use the audio-aware sampler when both audio and non-audio batches are available:
+```bash
+--audio_batch_probability 0.4
 ```
+With gradient accumulation, prefer a hard quota:
+```bash
+--gradient_accumulation_steps 4 --min_audio_batches_per_accum 1
+```
+Do not combine `--audio_batch_probability` / `--min_audio_batches_per_accum` with `--accumulation_group_by`; both need to own DataLoader sampling. See [Audio-Video Support](#audio-video-support).
+
+**2. Separate incompatible batches.** Use `--separate_audio_buckets` when audio and non-audio items share a dataset at `batch_size > 1`. This avoids text-embedding shape mismatches and keeps non-audio batches cheaper.
+
+**3. Lower audio learning rate.** Audio modules may need a lower LR than video modules in mixed AV runs. Use `--audio_lr` for a broad audio-side override or `--lr_args` for module-level control:
+```bash
 --learning_rate 1e-4 --audio_lr 3e-5
 ```
 
-**3. Lower audio LoRA rank** — audio needs less adaptation capacity. Use `--audio_dim` to set a smaller rank for audio modules while keeping video rank higher:
-```
+**4. Lower audio LoRA rank.** Use `--audio_dim` / `--audio_alpha` when audio modules should have less adaptation capacity than video modules:
+```bash
 --network_dim 32 --audio_dim 8 --audio_alpha 8
 ```
 
-**4. `--audio_dop`** — preserves base model audio predictions on non-audio steps. Runs LoRA OFF/ON forwards on silence audio latents, MSE on audio branch only. +2 fwd / +1 bwd per non-audio step, zero cost on audio batches. Logged as `loss/audio_dop`. Mutually exclusive with `--audio_silence_regularizer`.
+**5. Balance audio/video losses.** `--audio_loss_balance_mode` controls dynamic audio loss weighting:
+- `inv_freq`: scales audio by inverse audio-batch frequency EMA; useful when audio batches are rare.
+- `ema_mag`: tracks audio/video loss EMAs and scales audio toward `--audio_loss_balance_target_ratio`; can boost or dampen audio.
+- `uncertainty`: learns two log-variance scalars jointly with LoRA parameters.
+- `ogm_ge`: attenuates the lower-loss / faster-learning modality on each AV step.
+
+Examples:
+```bash
+--audio_loss_balance_mode inv_freq --audio_loss_balance_min 0.05 --audio_loss_balance_max 4.0
 ```
+```bash
+--audio_loss_balance_mode ema_mag --audio_loss_balance_target_ratio 0.33
+```
+
+For audio-starved runs, combine `inv_freq` with the supervision monitor:
+```bash
+--audio_loss_balance_mode inv_freq ^
+--audio_supervision_mode warn ^
+--audio_supervision_min_ratio 0.5
+```
+
+When audio overfits before video, combine a lower audio LR/rank with `ema_mag`:
+```bash
+--learning_rate 1e-4 --audio_lr 3e-5 ^
+--network_dim 32 --audio_dim 8 --audio_alpha 8 ^
+--audio_loss_balance_mode ema_mag ^
+--audio_loss_balance_target_ratio 0.25
+```
+
+**6. Add signal on non-audio steps only when needed.** `--audio_dop` preserves base audio predictions on non-audio batches. It runs LoRA-off and LoRA-on forwards on synthetic silence audio latents, logs `loss/audio_dop`, and has no cost on batches that already contain audio:
+```bash
 --audio_dop --audio_dop_args multiplier=0.5
 ```
 
-**5. `--audio_silence_regularizer`** — converts non-audio batches to audio batches with silence target. Cheaper than DOP (+0 extra forwards) but silence is an approximation.
-```
+`--audio_silence_regularizer` instead trains missing-audio batches toward silence. It is cheaper than Audio DOP, but silence is a training target rather than a preservation reference:
+```bash
 --audio_silence_regularizer --audio_silence_regularizer_weight 0.5
 ```
 
-**6. Loss balancing** (`--audio_loss_balance_mode`) — four modes for dynamic audio loss weight adjustment:
-- `inv_freq` — scales audio weight by inverse of audio-batch frequency EMA. Compensates when audio batches are rare:
-  ```
-  --audio_loss_balance_mode inv_freq --audio_loss_balance_min 0.05 --audio_loss_balance_max 4.0
-  ```
-- `ema_mag` — tracks audio/video loss magnitude EMAs and scales audio weight to match a target ratio (default 0.33). Bidirectional — dampens audio when too high, boosts when too low:
-  ```
-  --audio_loss_balance_mode ema_mag --audio_loss_balance_target_ratio 0.33
-  ```
-- `uncertainty` — two learnable log-variance scalars optimized jointly with LoRA weights ([Kendall et al., CVPR 2018](https://arxiv.org/abs/1705.07115)). Reduces manual loss-weight tuning because the scalars are learned via backpropagation:
-  ```
-  --audio_loss_balance_mode uncertainty
-  ```
-- `ogm_ge` — attenuates the lower-loss / faster-learning modality on each AV step. Optional gradient noise is available but disabled by default:
-  ```
-  --audio_loss_balance_mode ogm_ge --ogm_ge_alpha 0.3
-  ```
+`--audio_dop` and `--audio_silence_regularizer` are mutually exclusive. Prefer checking sampler balance and `loss_a` first, because both add extra audio supervision.
 
-**7. Independent modality dropout** — drop video or audio text conditioning independently per sample. Serves as both anti-dominance regularization and CFG training:
-```
---video_caption_dropout_rate 0.1 --audio_caption_dropout_rate 0.15
+**7. Drop modality text conditioning independently.** Per-modality caption dropout can regularize AV conditioning and train mixed conditional states:
+```bash
+--video_caption_dropout_rate 0.05 --audio_caption_dropout_rate 0.10
 ```
 
-**8. Modality freezing** — auto-freezes the dominant modality's LoRA when loss ratio crosses a threshold, inspired by G2D Sequential Modality Prioritization ([arXiv 2506.21514](https://arxiv.org/abs/2506.21514)). Lets the under-performing modality train without gradient interference:
-```
---modality_freeze_check_interval 500 --modality_freeze_ratio_threshold 0.5
+This can be combined with the audio-aware sampler, `--audio_loss_balance_mode ema_mag`, and `--dcr`.
+
+**8. Freeze the faster modality when it dominates.** Modality freezing toggles audio/video LoRA parameters based on the audio/video loss EMA ratio:
+```bash
+--modality_freeze_check_interval 500 ^
+--modality_freeze_ratio_threshold 0.5 ^
+--modality_freeze_warmup_steps 200
 ```
 
-**9. Self-Flow audio alignment** — anchors audio hidden states to the base model's representations via cosine similarity loss, intended to reduce audio feature drift during LoRA adaptation:
-```
+Logged metrics include `modality_freeze/state`, `modality_freeze/video_loss_ema`, and `modality_freeze/audio_loss_ema`.
+
+**9. Use Self-Flow when representation alignment is part of the run.** `--self_flow` can add video and audio representation-alignment terms in AV mode. Keep its detailed setup in the [Self-Flow](#self-flow-self-supervised-flow-matching) section, and only enable audio alignment when you intentionally want that extra objective:
+```bash
 --self_flow --self_flow_args lambda_self_flow=0.1 lambda_audio=0.1 teacher_mode=base
 ```
 
-**10. Cross-Task Synergy** — auxiliary losses with one modality clean (timestep=0) provide stable cross-modal alignment targets ([Harmony, 2025](https://arxiv.org/abs/2511.21579)). Adds two extra forward passes per AV batch:
+**10. Route cross-modal gradients deliberately for `av_ic` and sync-sensitive runs.** `--dcr --dcr_args reference_detach=true` can be combined with the audio-aware sampler, `ema_mag`, and per-modality caption dropout. Add `--tarp` or Cross-Task Synergy only when AV sync or cross-modal alignment is the target and the compute cost is acceptable:
+```bash
+--dcr --dcr_args reference_detach=true
 ```
+```bash
 --cts_lambda_video_driven 0.3 --cts_lambda_audio_driven 0.1
 ```
 
-**11. Diagnostics** — per-modality gradient norms (`grad_norm/video`, `grad_norm/audio`, `grad_norm/audio_video_ratio`) are logged automatically in AV mode. A ratio deviating >3x from its initial value indicates modality imbalance.
-
-**12. Per-group warmup overrides** — keep the same scheduler family but stretch warmup differently for audio and video LR groups:
-```
+**11. Override warmup by optimizer group when needed.** Per-group warmup keeps the same scheduler family but can stretch warmup differently for audio and video groups:
+```bash
 --lr_group_warmup_args audio=500 video=1500
 ```
 
-- If `failed > 0` in latent caching summary, audio extraction is broken for those items
-- After mode switch (video→AV), re-run both latent and text encoder caching without `--skip_existing`
-- `loss_a` dropping = audio learning; absent/zero = no audio batches forming; degrades over time = forgetting
+**12. Check the basics before scaling.**
+- If `failed > 0` in latent caching summary, audio extraction is broken for those items.
+- After switching from video-only to AV mode, re-run both latent and text encoder caching without `--skip_existing`.
+- `loss_a` dropping means audio is learning; absent/zero usually means no audio batches are forming; degradation over time can indicate forgetting.
+- Track `grad_norm/video`, `grad_norm/audio`, and `grad_norm/audio_video_ratio` during AV runs.
 
 ### Technical Notes
 

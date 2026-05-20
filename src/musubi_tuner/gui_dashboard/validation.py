@@ -346,13 +346,13 @@ def validate_training_config(config: ProjectConfig) -> dict[str, Any]:
 
     if t.use_dora:
         network_module = t.network_module or get_ltx2_training_network_module_default()
-        if network_module in {"networks.loha", "networks.lokr", "lycoris.kohya"}:
+        if network_module in {"networks.loha", "lycoris.kohya"}:
             errors.append(
                 _make_issue(
                     "error",
                     "training.use_dora",
-                    "DoRA is currently available only with the native LoRA backend.",
-                    label="DoRA",
+                    "DoRA/DokR is currently available only with the native LoRA or native LoKr backend.",
+                    label="DoRA/DokR",
                     page="training",
                 )
             )

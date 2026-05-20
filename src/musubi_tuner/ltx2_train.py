@@ -21,6 +21,11 @@ from tqdm import tqdm
 from safetensors.torch import save_file
 
 from musubi_tuner.dataset.accumulation_group_sampler import build_accumulation_group_sampler
+from musubi_tuner.dataset.audio_quota_sampler import (
+    build_audio_sampler,
+    split_concat_indices_by_audio,
+    sync_dataset_group_epoch_without_loading,
+)
 from musubi_tuner.dataset import config_utils
 from musubi_tuner.dataset.config_utils import BlueprintGenerator, ConfigSanitizer
 from musubi_tuner.dataset.image_video_dataset import ARCHITECTURE_LTX2
@@ -3115,6 +3120,18 @@ def main() -> None:
         shared_epoch=current_epoch,
         logger=logger,
     )
+    train_audio_sampler = None
+    train_audio_sampler_mode = None
+    train_audio_sampler_stats: dict[str, Any] = {}
+    audio_sampler_requested = (
+        int(getattr(args, "min_audio_batches_per_accum", 0) or 0) > 0 or getattr(args, "audio_batch_probability", None) is not None
+    )
+    if accumulation_sampler is not None and audio_sampler_requested:
+        raise ValueError(
+            "--min_audio_batches_per_accum / --audio_batch_probability cannot be combined with "
+            "--accumulation_group_by. Disable accumulation grouping or use dataset repeats/loss balancing instead."
+        )
+
     if accumulation_sampler is None:
         if int(args.gradient_accumulation_steps) > 1 and int(accumulation_sampler_stats.get("bucket_groups", 0)) > 1:
             logger.warning(
@@ -3123,10 +3140,36 @@ def main() -> None:
                 int(args.gradient_accumulation_steps),
                 int(accumulation_sampler_stats["bucket_groups"]),
             )
+
+        train_audio_sampler, train_audio_sampler_mode, train_audio_sampler_stats = build_audio_sampler(
+            dataset_group=train_dataset_group,
+            gradient_accumulation_steps=int(args.gradient_accumulation_steps),
+            min_audio_batches_per_accum=int(getattr(args, "min_audio_batches_per_accum", 0) or 0),
+            audio_batch_probability=getattr(args, "audio_batch_probability", None),
+            seed=int(args.seed),
+        )
+        if train_audio_sampler_mode == "quota":
+            logger.info(
+                "Audio quota sampler enabled: min_audio_batches_per_accum=%d, accumulation_steps=%d, "
+                "audio_batches=%d, non_audio_batches=%d",
+                train_audio_sampler_stats["min_audio_batches_per_accum"],
+                train_audio_sampler_stats["accumulation_steps"],
+                train_audio_sampler_stats["audio_batches"],
+                train_audio_sampler_stats["non_audio_batches"],
+            )
+        elif train_audio_sampler_mode == "probability":
+            logger.info(
+                "Audio probability sampler enabled: audio_batch_probability=%.3f, audio_batches=%d, non_audio_batches=%d",
+                train_audio_sampler_stats["audio_batch_probability"],
+                train_audio_sampler_stats["audio_batches"],
+                train_audio_sampler_stats["non_audio_batches"],
+            )
+
         train_dataloader = torch.utils.data.DataLoader(
             train_dataset_group,
             batch_size=1,
-            shuffle=True,
+            shuffle=train_audio_sampler is None,
+            sampler=train_audio_sampler,
             collate_fn=collator,
             num_workers=n_workers,
             persistent_workers=args.persistent_data_loader_workers,
@@ -3152,6 +3195,7 @@ def main() -> None:
             num_workers=n_workers,
             persistent_workers=args.persistent_data_loader_workers,
         )
+    train_dataset_group_for_audio_sampler = train_dataset_group if train_audio_sampler is not None else None
 
     # Validation dataset (optional)
     val_dataloader = None
@@ -4069,7 +4113,8 @@ def main() -> None:
     global_step = 0
     loss_recorder = train_utils.LossRecorder()
     self_flow_loss = None
-    del train_dataset_group
+    if train_dataset_group_for_audio_sampler is None:
+        del train_dataset_group
 
     def save_model(ckpt_name: str, unwrapped_model, steps, epoch_no, force_sync_upload=False, use_memory_efficient_saving=False):
         os.makedirs(args.output_dir, exist_ok=True)
@@ -5288,6 +5333,21 @@ def main() -> None:
 
     for epoch in range(epoch_to_start, num_train_epochs):
         current_epoch.value = epoch + 1
+        if train_audio_sampler is not None:
+            if train_dataset_group_for_audio_sampler is None:
+                raise RuntimeError("Internal error: audio sampler is enabled but the dataset group was released")
+            sync_dataset_group_epoch_without_loading(train_dataset_group_for_audio_sampler, epoch + 1, logger=logger)
+            audio_indices, non_audio_indices = split_concat_indices_by_audio(train_dataset_group_for_audio_sampler)
+            if len(audio_indices) == 0:
+                raise ValueError(
+                    f"No audio-bearing batches available at epoch {epoch + 1} while "
+                    f"{'--min_audio_batches_per_accum' if train_audio_sampler_mode == 'quota' else '--audio_batch_probability'} is enabled."
+                )
+            if hasattr(train_audio_sampler, "update_groups"):
+                train_audio_sampler.update_groups(audio_indices, non_audio_indices)
+            if hasattr(train_audio_sampler, "set_epoch"):
+                train_audio_sampler.set_epoch(epoch)
+
         metadata["ss_epoch"] = str(epoch + 1)
         transformer.train()
         for step, batch in enumerate(train_dataloader):

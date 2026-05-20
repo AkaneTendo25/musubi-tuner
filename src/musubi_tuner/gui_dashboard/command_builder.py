@@ -253,8 +253,6 @@ def build_cache_latents_cmd(config: ProjectConfig) -> list[str]:
         if c.sample_latents_cache:
             cmd += ["--sample_latents_cache", c.sample_latents_cache]
 
-    if c.quantize_device:
-        cmd += ["--quantize_device", c.quantize_device]
     if c.save_dataset_manifest:
         cmd += ["--save_dataset_manifest", c.save_dataset_manifest]
 

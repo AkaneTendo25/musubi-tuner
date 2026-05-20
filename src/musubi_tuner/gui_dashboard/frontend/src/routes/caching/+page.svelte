@@ -370,7 +370,6 @@
 				<div class="grid grid-cols-2 xl:grid-cols-4 gap-3">
 					<FormSelect fieldPath="caching.vae_dtype" value={caching.vae_dtype || ''} options={[{ value: '', label: 'bfloat16 (default)' }, 'float16', 'bfloat16', 'float32']} onchange={(e) => updateCaching('vae_dtype', e.target.value || null)} tooltip="VAE dtype for latent caching. Blank uses the default `bfloat16`." />
 					<FormField fieldPath="caching.device" value={caching.device || ''} oninput={(e) => updateCaching('device', e.target.value || null)} placeholder="Auto" tooltip="Torch device. Leave blank to auto-select the runtime device." />
-					<FormSelect fieldPath="caching.quantize_device" value={caching.quantize_device || ''} options={[{ value: '', label: 'Auto' }, { value: 'cuda', label: 'CUDA' }, { value: 'cpu', label: 'CPU' }]} onchange={(e) => updateCaching('quantize_device', e.target.value || null)} tooltip="Device for quantization-related work. Blank auto-selects." />
 					<FormToggle fieldPath="caching.keep_cache" checked={caching.keep_cache ?? false} onchange={(e) => updateCaching('keep_cache', e.target.checked)} tooltip="Keep old cache files when re-caching" />
 				</div>
 				<PathInput fieldPath="caching.save_dataset_manifest" value={caching.save_dataset_manifest || ''} oninput={(e) => updateCaching('save_dataset_manifest', e.target.value)} showFiles tooltip="Optional path to write a dataset manifest during latent caching." />

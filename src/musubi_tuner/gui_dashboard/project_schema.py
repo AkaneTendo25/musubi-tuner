@@ -139,8 +139,6 @@ class CachingConfig(BaseModel):
     dino_batch_size: int = 16
     dino_repo_path: str = ""
     torch_hub_dir: str = ""
-    # Quantization device
-    quantize_device: Optional[str] = None
     # Connector LoRA
     cache_before_connector: bool = False
     # Dataset manifest

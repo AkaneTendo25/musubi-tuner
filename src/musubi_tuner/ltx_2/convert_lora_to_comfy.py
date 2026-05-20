@@ -10,8 +10,8 @@ Training format:
 ComfyUI format:
   - Keys: diffusion_model.transformer_blocks.0.attn1.to_k.lora_A.weight
   - Uses dots as separators
-  - No alpha keys (not used by ComfyUI)
   - Renames lora_down -> lora_A, lora_up -> lora_B
+  - Folds alpha into lora_B for standard LoRA
   - Uses .dora_scale for ComfyUI's DoRA-aware loaders
 """
 
@@ -22,6 +22,7 @@ from pathlib import Path
 import torch
 
 from musubi_tuner.networks import lora as lora_module
+from musubi_tuner.networks import lokr as lokr_module
 
 
 def _group_lora_keys_by_module(state_dict):
@@ -61,18 +62,15 @@ def _reshape_dora_scale_for_comfy_output_axis(dora_scale, base_weight):
     return dora_scale.reshape(-1).view(base_weight.shape[0], *([1] * (base_weight.dim() - 1)))
 
 
-def _convert_dora_magnitude_to_comfy_scale(module_name, module_state, base_module):
-    if "lora_magnitude_vector.weight" not in module_state:
-        return None
-    if "lora_down.weight" not in module_state or "lora_up.weight" not in module_state:
-        raise ValueError(f"DoRA module {module_name} is missing LoRA weights")
+def _module_state_is_lokr(module_state):
+    return any(key in module_state for key in ("lokr_w1", "lokr_w2", "lokr_w2_a", "lokr_w2_b"))
 
-    base_weight = lora_module._get_effective_module_weight(base_module, dtype=torch.float, detach=True)
-    down_weight = module_state["lora_down.weight"].to(device=base_weight.device, dtype=torch.float)
-    up_weight = module_state["lora_up.weight"].to(device=base_weight.device, dtype=torch.float)
-    magnitude = module_state["lora_magnitude_vector.weight"].to(device=base_weight.device, dtype=torch.float)
 
-    rank = int(down_weight.shape[0])
+def _resolve_lokr_scale(module_state):
+    if "lokr_w2" in module_state:
+        return 1.0
+
+    rank = int(module_state["lokr_w2_a"].shape[1])
     alpha = module_state.get("alpha", None)
     if isinstance(alpha, torch.Tensor):
         alpha = float(alpha.item())
@@ -80,9 +78,39 @@ def _convert_dora_magnitude_to_comfy_scale(module_name, module_state, base_modul
         alpha = float(rank)
     else:
         alpha = float(alpha)
+    return alpha / float(rank)
 
-    scaling = alpha / float(rank)
-    weight_norm = lora_module._get_dora_weight_norm(base_weight, down_weight, up_weight, scaling)
+
+def _convert_dora_magnitude_to_comfy_scale(module_name, module_state, base_module):
+    if "lora_magnitude_vector.weight" not in module_state:
+        return None
+
+    base_weight = lora_module._get_effective_module_weight(base_module, dtype=torch.float, detach=True)
+    magnitude = module_state["lora_magnitude_vector.weight"].to(device=base_weight.device, dtype=torch.float)
+
+    if "lora_down.weight" in module_state and "lora_up.weight" in module_state:
+        down_weight = module_state["lora_down.weight"].to(device=base_weight.device, dtype=torch.float)
+        up_weight = module_state["lora_up.weight"].to(device=base_weight.device, dtype=torch.float)
+
+        rank = int(down_weight.shape[0])
+        alpha = module_state.get("alpha", None)
+        if isinstance(alpha, torch.Tensor):
+            alpha = float(alpha.item())
+        elif alpha is None:
+            alpha = float(rank)
+        else:
+            alpha = float(alpha)
+
+        scaling = alpha / float(rank)
+        weight_norm = lora_module._get_dora_weight_norm(base_weight, down_weight, up_weight, scaling)
+    elif _module_state_is_lokr(module_state):
+        scale = _resolve_lokr_scale(module_state)
+        diff_weight = lokr_module._materialize_lokr_weight_from_state_dict(module_state, scale, base_weight.device)
+        diff_weight = diff_weight.to(device=base_weight.device, dtype=base_weight.dtype)
+        weight_norm = torch.linalg.vector_norm(base_weight + diff_weight, dim=1)
+    else:
+        raise ValueError(f"DoRA/DokR module {module_name} is missing supported adapter weights")
+
     base_norm = _get_comfy_output_axis_norm(base_weight)
     if weight_norm.is_floating_point():
         eps = 1e-12 if weight_norm.dtype in (torch.float32, torch.float64) else 1e-6
@@ -95,7 +123,7 @@ def _convert_dora_magnitude_to_comfy_scale(module_name, module_state, base_modul
     return _reshape_dora_scale_for_comfy_output_axis(dora_scale, base_weight).to(device=target.device, dtype=target.dtype)
 
 
-def convert_key_to_comfy(key):
+def convert_key_to_comfy(key, preserve_alpha=False):
     """
     Convert a training format key to ComfyUI format
 
@@ -103,8 +131,8 @@ def convert_key_to_comfy(key):
         lora_unet_model_transformer_blocks_0_attn1_to_k.lora_down.weight
         -> diffusion_model.transformer_blocks.0.attn1.to_k.lora_A.weight
     """
-    # Skip alpha keys - ComfyUI doesn't use them
-    if ".alpha" in key:
+    # Standard ComfyUI LoRA ignores alpha; LoKr keeps it.
+    if ".alpha" in key and not preserve_alpha:
         return None
 
     # Split into main part and weight part
@@ -224,6 +252,18 @@ def convert_key_from_comfy(key):
     elif key.endswith(".dora_scale"):
         weight_part = "lora_magnitude_vector.weight"
         path = key[: -len(".dora_scale")]
+    elif key.endswith(".lokr_w1"):
+        weight_part = "lokr_w1"
+        path = key[: -len(".lokr_w1")]
+    elif key.endswith(".lokr_w2"):
+        weight_part = "lokr_w2"
+        path = key[: -len(".lokr_w2")]
+    elif key.endswith(".lokr_w2_a"):
+        weight_part = "lokr_w2_a"
+        path = key[: -len(".lokr_w2_a")]
+    elif key.endswith(".lokr_w2_b"):
+        weight_part = "lokr_w2_b"
+        path = key[: -len(".lokr_w2_b")]
     else:
         return None
 
@@ -248,7 +288,9 @@ def is_comfy_lora_state_dict(weights_sd):
     if not weights_sd:
         return False
     keys = list(weights_sd.keys())
-    return any(key.startswith("diffusion_model.") and (".lora_" in key or key.endswith(".dora_scale")) for key in keys)
+    return any(
+        key.startswith("diffusion_model.") and (".lora_" in key or ".lokr_" in key or key.endswith(".dora_scale")) for key in keys
+    )
 
 
 def convert_lora_to_comfy_state_dict(trained_state_dict, verbose=False, network=None):
@@ -266,6 +308,7 @@ def convert_lora_to_comfy_state_dict(trained_state_dict, verbose=False, network=
             lora_alpha[lora_name] = tensor
 
     grouped_modules = _group_lora_keys_by_module(trained_state_dict)
+    lokr_modules = {module_name for module_name, module_state in grouped_modules.items() if _module_state_is_lokr(module_state)}
     dora_modules = [
         module_name for module_name, module_state in grouped_modules.items() if "lora_magnitude_vector.weight" in module_state
     ]
@@ -298,7 +341,9 @@ def convert_lora_to_comfy_state_dict(trained_state_dict, verbose=False, network=
     failed = 0
 
     for key, tensor in trained_state_dict.items():
-        new_key = convert_key_to_comfy(key)
+        lora_name = key.rsplit(".", 1)[0] if key.endswith(".alpha") else key.split(".", 1)[0]
+        preserve_alpha = key.endswith(".alpha") and lora_name in lokr_modules
+        new_key = convert_key_to_comfy(key, preserve_alpha=preserve_alpha)
 
         if new_key is None:
             if ".alpha" in key:
