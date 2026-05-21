@@ -3211,8 +3211,12 @@ class NetworkTrainer:
                         if proj_sd:
                             proj_file = os.path.join(output_dir, "crepa_projector.safetensors")
                             save_file(proj_sd, proj_file)
+                        train_sd = self._crepa.training_state_dict()
+                        if train_sd:
+                            state_file = os.path.join(output_dir, "crepa_state.safetensors")
+                            save_file(train_sd, state_file)
                     except Exception as e:
-                        logger.warning(f"Failed to save CREPA projector to state dir: {e}")
+                        logger.warning(f"Failed to save CREPA state to state dir: {e}")
                 if hasattr(self, "_self_flow") and self._self_flow is not None:
                     try:
                         from safetensors.torch import save_file
@@ -3273,6 +3277,21 @@ class NetworkTrainer:
                         logger.info("Loaded adaptive rank runtime state from %s", runtime_state_path)
                 except Exception as e:
                     logger.warning(f"Failed to load adaptive rank runtime state: {e}")
+
+            if hasattr(self, "_crepa") and self._crepa is not None:
+                try:
+                    from safetensors.torch import load_file
+
+                    proj_file = os.path.join(input_dir, "crepa_projector.safetensors")
+                    if os.path.exists(proj_file):
+                        self._crepa.load_state_dict(load_file(proj_file))
+                        logger.info("CREPA: loaded projector state from %s", proj_file)
+
+                    state_file = os.path.join(input_dir, "crepa_state.safetensors")
+                    if os.path.exists(state_file):
+                        self._crepa.load_training_state_dict(load_file(state_file))
+                except Exception as e:
+                    logger.warning(f"Failed to load CREPA state from checkpoint dir: {e}")
 
             if hasattr(self, "_self_flow") and self._self_flow is not None:
                 try:
@@ -3984,7 +4003,11 @@ class NetworkTrainer:
                                 num_latent_frames = int(latents_tensor.shape[2]) if latents_tensor.dim() >= 3 else 0
                                 conditions = batch.get("conditions", {})
                                 dino_features = conditions.get("dino_features") if isinstance(conditions, dict) else None
-                                crepa_loss = self._crepa.compute_loss(num_latent_frames, dino_features=dino_features)
+                                crepa_loss = self._crepa.compute_loss(
+                                    num_latent_frames,
+                                    dino_features=dino_features,
+                                    update_cutoff=False,
+                                )
                                 if crepa_loss is not None:
                                     loss = loss + crepa_loss
                             finally:
@@ -4498,6 +4521,7 @@ class NetworkTrainer:
 
                     # CREPA loss — must be added before backward (shares computation graph)
                     _crepa_value = None
+                    crepa_metrics = {}
                     if hasattr(self, "_crepa") and self._crepa is not None:
                         self._crepa.on_step(global_step)
                         num_latent_frames = latents_tensor.shape[2]
@@ -4506,6 +4530,7 @@ class NetworkTrainer:
                         if crepa_loss is not None:
                             _crepa_value = crepa_loss.detach().item()
                             loss = loss + crepa_loss
+                        crepa_metrics = self._crepa.get_metrics()
                         self._crepa.cleanup_step()
 
                     # Self-Flow loss
@@ -4585,6 +4610,8 @@ class NetworkTrainer:
                         pres_losses["loss/prior_div"] = _prior_div_value
                     if _crepa_value is not None:
                         pres_losses["loss/crepa"] = _crepa_value
+                    if crepa_metrics:
+                        pres_losses.update(crepa_metrics)
                     if latent_temporal_metrics:
                         pres_losses.update(latent_temporal_metrics)
                     if self_flow_metrics:

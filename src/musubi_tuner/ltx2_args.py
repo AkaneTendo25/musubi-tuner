@@ -1185,7 +1185,8 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         type=str,
         nargs="*",
         help="Key=value args for CREPA, e.g. student_block_idx=16 teacher_block_idx=32 "
-        "lambda_crepa=0.1 tau=1.0 num_neighbors=2 schedule=constant normalize=true",
+        "lambda_crepa=0.1 tau=1.0 num_neighbors=2 schedule=constant normalize=true "
+        "similarity_threshold=0.9 similarity_ema_decay=0.99 threshold_mode=permanent",
     )
     parser.add_argument(
         "--self_flow",

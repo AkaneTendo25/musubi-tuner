@@ -151,6 +151,17 @@
 						</div>
 					</div>
 				</div>
+
+				<div class="p-3" style="background: var(--bg-elevated); border-radius: var(--radius-sm); border: 1px solid var(--border-subtle);">
+					<div class="text-[11px] font-semibold mb-2" style="color: var(--text-primary);">EMA Cutoff</div>
+					<div class="grid grid-cols-4 gap-2">
+						<FormField label="Threshold" type="number" fieldPath="training.crepa_similarity_threshold" value={$projectConfig?.training?.crepa_similarity_threshold ?? ''} oninput={(e) => updateTraining('crepa_similarity_threshold', e.target.value === '' ? null : Number(e.target.value))} step="0.01" min={0} max={1} placeholder="Off" disabled={!$projectConfig?.training?.crepa} tooltip="Stops CREPA when EMA alignment reaches this cosine score. Blank keeps cutoff disabled." />
+						<FormField label="EMA Decay" type="number" fieldPath="training.crepa_similarity_ema_decay" value={$projectConfig?.training?.crepa_similarity_ema_decay ?? 0.99} oninput={(e) => updateTraining('crepa_similarity_ema_decay', Number(e.target.value))} step="0.001" min={0} max={0.999} disabled={!$projectConfig?.training?.crepa || $projectConfig?.training?.crepa_similarity_threshold == null} tooltip="Smoothing for the alignment score used by cutoff." />
+						<FormSelect label="Mode" fieldPath="training.crepa_threshold_mode" value={$projectConfig?.training?.crepa_threshold_mode || 'permanent'} onchange={(e) => updateTraining('crepa_threshold_mode', e.target.value)} options={[{value: 'permanent', label: 'Permanent'}, {value: 'recoverable', label: 'Recoverable'}]} disabled={!$projectConfig?.training?.crepa || $projectConfig?.training?.crepa_similarity_threshold == null} tooltip="Permanent keeps CREPA off after cutoff. Recoverable rechecks the score each step." />
+						<FormField label="Step Cutoff" type="number" fieldPath="training.crepa_cutoff_step" value={$projectConfig?.training?.crepa_cutoff_step ?? 0} oninput={(e) => updateTraining('crepa_cutoff_step', Number(e.target.value))} min={0} placeholder="0" disabled={!$projectConfig?.training?.crepa} tooltip="Optional global step where CREPA is disabled. 0 keeps this disabled." />
+					</div>
+				</div>
+
 				<FormField fieldPath="training.crepa_args" value={$projectConfig?.training?.crepa_args || ''} oninput={(e) => updateTraining('crepa_args', e.target.value)} placeholder="key=value ..." tooltip="Additional values passed after --crepa_args." />
 
 				<!-- DINOv2 Caching (for CREPA dino mode) -->

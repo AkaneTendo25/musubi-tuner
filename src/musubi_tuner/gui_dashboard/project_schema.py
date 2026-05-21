@@ -527,6 +527,10 @@ class TrainingConfig(BaseModel):
     crepa_schedule: Literal["constant", "linear", "cosine"] = "constant"
     crepa_warmup_steps: int = 0
     crepa_normalize: bool = True
+    crepa_cutoff_step: int = 0
+    crepa_similarity_threshold: Optional[float] = None
+    crepa_similarity_ema_decay: float = 0.99
+    crepa_threshold_mode: Literal["permanent", "recoverable"] = "permanent"
 
     # Self-Flow
     self_flow: bool = False

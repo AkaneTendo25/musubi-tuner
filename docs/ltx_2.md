@@ -1070,6 +1070,14 @@ accelerate launch ... ltx2_train_network.py ^
   --crepa_args mode=backbone student_block_idx=16 teacher_block_idx=32 lambda_crepa=0.1 tau=1.0 num_neighbors=2 schedule=constant warmup_steps=0 normalize=true
 ```
 
+Optional EMA cutoff can disable the CREPA loss once the alignment score is already high enough:
+
+```bash
+accelerate launch ... ltx2_train_network.py ^
+  --crepa ^
+  --crepa_args similarity_threshold=0.90 similarity_ema_decay=0.99 threshold_mode=permanent
+```
+
 ##### CREPA CLI Flags
 
 | Flag | Type | Description |
@@ -1092,19 +1100,26 @@ accelerate launch ... ltx2_train_network.py ^
 | `warmup_steps` | 0 | Steps before CREPA loss reaches full strength (linear ramp from 0) |
 | `max_steps` | 0 | Total training steps for schedule computation. Auto-filled from `--max_train_steps` if not set |
 | `normalize` | `true` | L2-normalize features before computing cosine similarity |
+| `similarity_threshold` | off | Enables EMA cutoff when set to a value from 0 to 1. CREPA is disabled after the smoothed alignment score reaches this value |
+| `similarity_ema_decay` | 0.99 | Smoothing factor for the cutoff score. Higher values react more slowly |
+| `threshold_mode` | `permanent` | `permanent` keeps CREPA off after cutoff; `recoverable` can resume CREPA if the score drops again |
+| `cutoff_step` | 0 | Optional global step where CREPA is disabled regardless of score. 0 keeps this disabled |
 
 ##### CREPA Checkpoint & Resume
 
 - The projector weights (~33M params for backbone mode) are saved as `crepa_projector.safetensors` in the output directory alongside LoRA checkpoints.
 - When resuming training with `--crepa`, projector weights are automatically loaded from `<output_dir>/crepa_projector.safetensors` if the file exists.
+- EMA cutoff state is saved as `crepa_state.safetensors` when training state saving is enabled, so a permanent cutoff remains permanent after resume.
 - The projector is **not needed at inference** — it's only used during training.
 
 ##### CREPA Monitoring
 
-CREPA adds a `loss/crepa` metric to TensorBoard/WandB logs. A healthy CREPA loss should:
+CREPA adds `loss/crepa` to TensorBoard/WandB logs. With EMA cutoff enabled, it also logs `crepa/weight`, `crepa/cutoff`, `crepa/alignment_score`, `crepa/similarity_self`, and `crepa/alignment_score_ema`. A healthy CREPA loss should:
 - Start negative (cosine similarity is being maximized)
 - Gradually decrease (more negative = stronger cross-frame alignment)
 - Stabilize after warmup
+
+Use EMA cutoff when CREPA is helpful early but you do not want it to keep pushing already-aligned clips for the whole run. Start with a high threshold such as 0.90-0.95; leave it off if you want the existing CREPA behavior.
 
 ##### CREPA Compatibility
 

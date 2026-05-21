@@ -1304,14 +1304,39 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
 
         # Build config — convert types from string values
         cfg_kwargs: Dict[str, Any] = {}
-        _int_keys = {"student_block_idx", "teacher_block_idx", "num_neighbors", "warmup_steps", "max_steps"}
-        _float_keys = {"lambda_crepa", "tau"}
+        aliases = {
+            "crepa_lambda": "lambda_crepa",
+            "crepa_tau": "tau",
+            "crepa_num_neighbors": "num_neighbors",
+            "crepa_scheduler": "schedule",
+            "crepa_schedule": "schedule",
+            "crepa_warmup_steps": "warmup_steps",
+            "crepa_decay_steps": "max_steps",
+            "crepa_max_steps": "max_steps",
+            "crepa_cutoff_step": "cutoff_step",
+            "crepa_similarity_threshold": "similarity_threshold",
+            "crepa_similarity_ema_decay": "similarity_ema_decay",
+            "crepa_threshold_mode": "threshold_mode",
+        }
+        _int_keys = {
+            "student_block_idx",
+            "teacher_block_idx",
+            "num_neighbors",
+            "warmup_steps",
+            "max_steps",
+            "cutoff_step",
+        }
+        _float_keys = {"lambda_crepa", "tau", "similarity_threshold", "similarity_ema_decay"}
         _bool_keys = {"normalize"}
         for k, v in kw.items():
+            k = aliases.get(k, k)
             if k in _int_keys:
                 cfg_kwargs[k] = int(v)
             elif k in _float_keys:
-                cfg_kwargs[k] = float(v)
+                if k == "similarity_threshold" and str(v).strip().lower() in {"", "off", "none", "false", "disabled"}:
+                    cfg_kwargs[k] = None
+                else:
+                    cfg_kwargs[k] = float(v)
             elif k in _bool_keys:
                 cfg_kwargs[k] = v.lower() in ("true", "1", "yes")
             else:
@@ -1341,6 +1366,11 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                 sd = load_file(proj_path)
                 module.load_state_dict(sd)
                 logger.info("CREPA: resumed projector weights from %s", proj_path)
+            state_path = os.path.join(args.resume, "crepa_state.safetensors")
+            if os.path.exists(state_path):
+                from safetensors.torch import load_file
+
+                module.load_training_state_dict(load_file(state_path))
 
         self._crepa = module
 

@@ -1183,6 +1183,14 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
             args_parts.append(f"warmup_steps={t.crepa_warmup_steps}")
         if not t.crepa_normalize:
             args_parts.append("normalize=false")
+        if t.crepa_cutoff_step != 0:
+            args_parts.append(f"cutoff_step={t.crepa_cutoff_step}")
+        if t.crepa_similarity_threshold is not None:
+            args_parts.append(f"similarity_threshold={t.crepa_similarity_threshold}")
+            if t.crepa_similarity_ema_decay != 0.99:
+                args_parts.append(f"similarity_ema_decay={t.crepa_similarity_ema_decay}")
+            if t.crepa_threshold_mode != "permanent":
+                args_parts.append(f"threshold_mode={t.crepa_threshold_mode}")
         if args_parts:
             cmd += ["--crepa_args"] + args_parts
 
