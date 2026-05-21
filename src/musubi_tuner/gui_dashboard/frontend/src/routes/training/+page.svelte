@@ -67,12 +67,13 @@
 	let trainingStatus = $derived($processStatuses.training || { state: 'idle', exit_code: null });
 	let remoteStageLauncherStatus = $derived($processStatuses.remote_stage_launcher || { state: 'idle', exit_code: null });
 	let remoteStageServerStatus = $derived($processStatuses.remote_stage_server || { state: 'idle', exit_code: null });
+	let remoteStageEnabled = $derived(Boolean(t.ltx2_remote_stage));
 	let trainingValidation = $derived($processValidation.training || { ok: true, summary: '', errors: [], warnings: [], field_errors: {}, field_warnings: {} });
 	let remoteStageLauncherValidation = $derived($processValidation.remote_stage_launcher || { ok: true, summary: '', errors: [], warnings: [], field_errors: {}, field_warnings: {} });
 	let remoteStageServerValidation = $derived($processValidation.remote_stage_server || { ok: true, summary: '', errors: [], warnings: [], field_errors: {}, field_warnings: {} });
 	let hasValidationIssues = $derived((trainingValidation.errors?.length || 0) > 0 || (trainingValidation.warnings?.length || 0) > 0);
-	let hasRemoteStageLauncherValidationIssues = $derived((remoteStageLauncherValidation.errors?.length || 0) > 0 || (remoteStageLauncherValidation.warnings?.length || 0) > 0);
-	let hasRemoteStageServerValidationIssues = $derived((remoteStageServerValidation.errors?.length || 0) > 0 || (remoteStageServerValidation.warnings?.length || 0) > 0);
+	let hasRemoteStageLauncherValidationIssues = $derived(remoteStageEnabled && ((remoteStageLauncherValidation.errors?.length || 0) > 0 || (remoteStageLauncherValidation.warnings?.length || 0) > 0));
+	let hasRemoteStageServerValidationIssues = $derived(remoteStageEnabled && ((remoteStageServerValidation.errors?.length || 0) > 0 || (remoteStageServerValidation.warnings?.length || 0) > 0));
 	let hasDatasetValidationErrors = $derived((trainingValidation.errors || []).some((issue) => issue.page === 'dataset'));
 	let validationTimer = null;
 	let cwd = $state('');
@@ -374,6 +375,7 @@
 	}
 
 	function remoteFieldError(field) {
+		if (!remoteStageEnabled) return '';
 		return remoteStageServerValidation.field_errors?.[field]?.[0] || '';
 	}
 
@@ -388,8 +390,10 @@
 		const configSnapshot = $projectConfig;
 		validationTimer = setTimeout(() => {
 			validateProcess('training', configSnapshot).catch(() => {});
-			validateProcess('remote_stage_launcher', configSnapshot).catch(() => {});
-			validateProcess('remote_stage_server', configSnapshot).catch(() => {});
+			if (configSnapshot.training?.ltx2_remote_stage) {
+				validateProcess('remote_stage_launcher', configSnapshot).catch(() => {});
+				validateProcess('remote_stage_server', configSnapshot).catch(() => {});
+			}
 		}, 250);
 
 		return () => clearTimeout(validationTimer);
@@ -1150,6 +1154,7 @@
 					</FormGroup>
 				{/if}
 
+				{#if t.ltx2_remote_stage}
 				<FormGroup title="Remote Slave">
 				<div class="space-y-3 pt-2">
 					<p class="text-[11px]" style="color: var(--text-muted);">
@@ -1239,6 +1244,7 @@
 					<CommandPanel processType="remote_stage_server" defaultFilename="remote_stage_server.bat" />
 				</div>
 			</FormGroup>
+				{/if}
 		{/if}
 
 		<!-- Controls -->

@@ -5,16 +5,29 @@ export const status = writable(null);
 
 let _unsub = null;
 let _interval = null;
+let _ignoreBeforeTime = 0;
 
 export function clearStatus() {
 	status.set(null);
+}
+
+export function ignoreStatusBefore(epochSeconds) {
+	const numeric = Number(epochSeconds);
+	_ignoreBeforeTime = Number.isFinite(numeric) && numeric > 0 ? numeric : 0;
+	clearStatus();
 }
 
 async function fetchStatus() {
 	try {
 		const res = await fetch('/data/status.json', { cache: 'no-store' });
 		if (res.ok && res.status !== 204) {
-			status.set(await res.json());
+			const payload = await res.json();
+			const statusTime = Number(payload?.time || 0);
+			if (_ignoreBeforeTime > 0 && (!Number.isFinite(statusTime) || statusTime < _ignoreBeforeTime)) {
+				clearStatus();
+				return;
+			}
+			status.set(payload);
 		} else if (res.status === 204) {
 			clearStatus();
 		}

@@ -3,9 +3,10 @@
 	import PathInput from '$lib/components/PathInput.svelte';
 	import StatsPanel from '$lib/components/StatsPanel.svelte';
 	import VramEstimateCard from '$lib/components/VramEstimateCard.svelte';
+	import { CACHE_THEN_TRAIN_STAGES, buildCacheThenTrainIdleSummary, buildCacheThenTrainProgress, isProcessActive, prepareCacheThenTrainConfig } from '$lib/utils/cacheWorkflow.js';
 	import { defaultModelDir, effectiveGemmaRoot, effectiveLtx2Checkpoint } from '$lib/utils/modelPaths.js';
-	import { projectConfig, projectLoaded, createProject, loadProjectFromPath, saveProjectDebounced, recentProjects, removeRecentProject, restoreRecentProject, closeProject } from '$lib/stores/project.js';
-	import { processStatuses } from '$lib/stores/processes.js';
+	import { projectConfig, projectLoaded, createProject, loadProjectFromPath, saveProjectDebounced, saveProjectNow, recentProjects, removeRecentProject, restoreRecentProject, closeProject } from '$lib/stores/project.js';
+	import { processLogs, processStatuses, preloadLogsIfActive, startLogPolling, startProcess, stopProcess, refreshStatuses } from '$lib/stores/processes.js';
 	import { status } from '$lib/stores/status.js';
 	import { onMount } from 'svelte';
 
@@ -22,9 +23,21 @@
 	let removedRecentProjects = $state([]);
 	let recentProjectSummaries = $state({});
 	let recentProjectSummaryLoading = $state({});
+	let cacheThenTrainRunning = $state(false);
+	let cacheThenTrainMessage = $state('');
+	let cacheThenTrainError = $state('');
+	let cacheThenTrainPhase = $state('idle');
+	let cacheThenTrainEngaged = $state(false);
+	let cacheThenTrainStopRequested = $state(false);
+	let cacheThenTrainStopPending = $state(false);
+	let workflowStats = $state(null);
+	let workflowStatsLoading = $state(false);
+	let workflowStatsSnapshot = '';
+	let workflowStatsTimer = null;
 
 	const LTX_DOCS_FALLBACK_URL = 'https://github.com/AkaneTendo25/musubi-tuner/blob/ltx-2/docs/ltx_2.md';
 	const TEMPLATE_VARIANTS_DISABLED = true;
+	const CACHE_THEN_TRAIN_SESSION_KEY = 'musubi.cacheThenTrain.engaged';
 
 	const LORA_FAMILIES = [
 		{
@@ -95,12 +108,39 @@
 		} catch {}
 	});
 
+	onMount(() => {
+		const processTypes = CACHE_THEN_TRAIN_STAGES.map((stage) => stage.processType).filter(Boolean);
+		let logTimer = null;
+		const statusTimer = setInterval(() => {
+			void refreshStatuses();
+		}, 1000);
+		void (async () => {
+			const statuses = await refreshStatuses();
+			if (readCacheThenTrainSession() && hasActiveWorkflowProcess(statuses || $processStatuses)) {
+				cacheThenTrainEngaged = true;
+			}
+			await preloadLogsIfActive(processTypes);
+			logTimer = startLogPolling(processTypes, 1000);
+		})();
+		return () => {
+			clearInterval(statusTimer);
+			if (logTimer) clearInterval(logTimer);
+		};
+	});
+
 	$effect(() => {
 		if ($projectLoaded) return;
 		for (const project of $recentProjects) {
 			const path = project?.path;
 			if (!path || recentProjectSummaries[path] || recentProjectSummaryLoading[path]) continue;
 			void loadRecentProjectSummary(path);
+		}
+	});
+
+	$effect(() => {
+		if (!cacheThenTrainEngaged || cacheThenTrainRunning) return;
+		if (!hasActiveWorkflowProcess($processStatuses)) {
+			setCacheThenTrainEngaged(false);
 		}
 	});
 
@@ -396,6 +436,165 @@
 		saveProjectDebounced();
 	}
 
+	function readCacheThenTrainSession() {
+		try {
+			return typeof sessionStorage !== 'undefined' && sessionStorage.getItem(CACHE_THEN_TRAIN_SESSION_KEY) === '1';
+		} catch {
+			return false;
+		}
+	}
+
+	function setCacheThenTrainEngaged(value) {
+		cacheThenTrainEngaged = value;
+		try {
+			if (typeof sessionStorage === 'undefined') return;
+			if (value) {
+				sessionStorage.setItem(CACHE_THEN_TRAIN_SESSION_KEY, '1');
+			} else {
+				sessionStorage.removeItem(CACHE_THEN_TRAIN_SESSION_KEY);
+			}
+		} catch {}
+	}
+
+	function activeWorkflowProcess(statuses, preferredStage = null) {
+		if (preferredStage?.processType && isProcessActive(statuses?.[preferredStage.processType])) {
+			return preferredStage;
+		}
+		return CACHE_THEN_TRAIN_STAGES.find((stage) => stage.processType && isProcessActive(statuses?.[stage.processType])) || null;
+	}
+
+	function hasActiveWorkflowProcess(statuses) {
+		return !!activeWorkflowProcess(statuses);
+	}
+
+	class CacheThenTrainCancelled extends Error {
+		constructor(message) {
+			super(message);
+			this.name = 'CacheThenTrainCancelled';
+		}
+	}
+
+	const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+	async function waitForProcessSuccess(type, label) {
+		let missingPolls = 0;
+		let idlePolls = 0;
+
+		while (true) {
+			if (cacheThenTrainStopRequested) throw new CacheThenTrainCancelled(`${label} was stopped.`);
+
+			const statuses = await refreshStatuses();
+			const processStatus = statuses?.[type];
+
+			if (!processStatus) {
+				missingPolls += 1;
+				if (missingPolls >= 20) throw new Error(`Lost status while waiting for ${label}`);
+				await sleep(1500);
+				continue;
+			}
+
+			missingPolls = 0;
+			const state = processStatus.state || 'idle';
+			const exitCode = processStatus.exit_code ?? null;
+
+			if (processStatus.stop_requested) throw new CacheThenTrainCancelled(`${label} was stopped.`);
+			if (state === 'finished' && exitCode === 0) return processStatus;
+			if (state === 'error' || (exitCode !== null && exitCode !== 0)) {
+				throw new Error(`${label} failed${exitCode !== null ? ` with exit code ${exitCode}` : ''}`);
+			}
+
+			if (state === 'idle') {
+				idlePolls += 1;
+				if (idlePolls >= 6) throw new Error(`${label} did not start`);
+			} else {
+				idlePolls = 0;
+			}
+
+			await sleep(1500);
+		}
+	}
+
+	async function cacheThenTrain() {
+		if (cacheThenTrainDisabled) return;
+
+		cacheThenTrainRunning = true;
+		setCacheThenTrainEngaged(true);
+		cacheThenTrainError = '';
+		cacheThenTrainPhase = 'dataset';
+		cacheThenTrainStopRequested = false;
+		cacheThenTrainStopPending = false;
+
+		try {
+			cacheThenTrainMessage = 'Preparing dataset...';
+			const prepared = prepareCacheThenTrainConfig($projectConfig);
+			if (prepared.changed) {
+				projectConfig.set(prepared.config);
+				await saveProjectNow();
+			}
+
+			if (cacheThenTrainStopRequested) throw new CacheThenTrainCancelled('Workflow was stopped.');
+			cacheThenTrainPhase = 'latents';
+			cacheThenTrainMessage = 'Caching latents...';
+			await startProcess('cache_latents');
+			await waitForProcessSuccess('cache_latents', 'Latent caching');
+			if (cacheThenTrainStopRequested) throw new CacheThenTrainCancelled('Workflow was stopped.');
+
+			cacheThenTrainPhase = 'text';
+			cacheThenTrainMessage = 'Caching text...';
+			await startProcess('cache_text');
+			await waitForProcessSuccess('cache_text', 'Text caching');
+			if (cacheThenTrainStopRequested) throw new CacheThenTrainCancelled('Workflow was stopped.');
+
+			cacheThenTrainPhase = 'training';
+			cacheThenTrainMessage = 'Starting training...';
+			await startProcess('training');
+		} catch (e) {
+			cacheThenTrainError = e instanceof CacheThenTrainCancelled ? '' : (e?.message || 'Cache & Start Training failed');
+		} finally {
+			cacheThenTrainRunning = false;
+			cacheThenTrainMessage = '';
+			cacheThenTrainPhase = 'idle';
+			cacheThenTrainStopPending = false;
+		}
+	}
+
+	async function stopCacheThenTrain() {
+		if (cacheThenTrainStopPending) return;
+		cacheThenTrainStopRequested = true;
+		cacheThenTrainStopPending = true;
+		cacheThenTrainError = '';
+
+		try {
+			const statuses = (await refreshStatuses()) || $processStatuses;
+			const activeStage = activeWorkflowProcess(statuses, cacheThenTrainProgress.activeStage);
+			const processType = activeStage?.processType;
+			if (processType && isProcessActive(statuses?.[processType])) {
+				cacheThenTrainMessage = `Stopping ${activeStage.label.toLowerCase()}...`;
+				await stopProcess(processType);
+			} else {
+				cacheThenTrainMessage = 'Stopping workflow...';
+			}
+			await refreshStatuses();
+		} catch (e) {
+			cacheThenTrainError = e?.message || 'Failed to stop workflow';
+		} finally {
+			cacheThenTrainStopPending = false;
+		}
+	}
+
+	async function loadWorkflowStats() {
+		const expectedSnapshot = workflowStatsSnapshot;
+		try {
+			const res = await fetch('/api/stats');
+			if (expectedSnapshot !== workflowStatsSnapshot) return;
+			workflowStats = res.ok ? await res.json() : null;
+		} catch {
+			if (expectedSnapshot === workflowStatsSnapshot) workflowStats = null;
+		} finally {
+			if (expectedSnapshot === workflowStatsSnapshot) workflowStatsLoading = false;
+		}
+	}
+
 	// VRAM estimation helpers
 	function gemmaSize(cfg) {
 		// Gemma 3 12B: ~24GB fp16, ~12GB 8bit, ~6GB 4bit
@@ -630,6 +829,77 @@
 	let vramTrain = $derived(estimateTraining(cfg));
 	let vramTotal = $derived(systemInfo?.gpus?.[0] ? Math.round(systemInfo.gpus[0].vram_total_mb / 1024) : 24);
 	let gpu = $derived(systemInfo?.gpus?.[0]);
+	let cacheThenTrainDisabled = $derived(
+		cacheThenTrainRunning ||
+		isProcessActive($processStatuses.cache_latents) ||
+		isProcessActive($processStatuses.cache_text) ||
+		isProcessActive($processStatuses.training)
+	);
+	let cacheThenTrainProgress = $derived.by(() => buildCacheThenTrainProgress({
+		statuses: $processStatuses,
+		logs: $processLogs,
+		trainingStatus: $status,
+		config: cfg,
+		fallbackStageId: cacheThenTrainPhase,
+		fallbackMessage: cacheThenTrainMessage,
+		workflowRunning: cacheThenTrainRunning,
+	}));
+	let cacheThenTrainProcessActive = $derived(
+		cacheThenTrainRunning ||
+		CACHE_THEN_TRAIN_STAGES.some((stage) => stage.processType && isProcessActive($processStatuses[stage.processType]))
+	);
+	let cacheThenTrainWorkflowActive = $derived(
+		cacheThenTrainEngaged ||
+		cacheThenTrainRunning ||
+		cacheThenTrainProcessActive ||
+		cacheThenTrainPhase !== 'idle' ||
+		cacheThenTrainStopPending
+	);
+	let cacheThenTrainCanStop = $derived(
+		(cacheThenTrainRunning || cacheThenTrainProcessActive) &&
+		!cacheThenTrainStopPending
+	);
+	let cacheThenTrainProgressVisible = $derived(cacheThenTrainWorkflowActive);
+	let cacheThenTrainIdleSummary = $derived(
+		workflowStatsLoading
+			? {
+				label: 'Estimating Runtime',
+				detail: 'Reading dataset and training settings',
+				metrics: [],
+			}
+			: buildCacheThenTrainIdleSummary(cfg, workflowStats)
+	);
+
+	$effect(() => {
+		if (!$projectLoaded || !cfg) {
+			workflowStats = null;
+			workflowStatsLoading = false;
+			workflowStatsSnapshot = '';
+			if (workflowStatsTimer) clearTimeout(workflowStatsTimer);
+			return;
+		}
+
+		const snapshot = JSON.stringify({
+			dataset: cfg.dataset,
+			caching: {
+				ltx2_mode: cfg.caching?.ltx2_mode,
+			},
+			training: {
+				ltx2_mode: cfg.training?.ltx2_mode,
+				max_train_steps: cfg.training?.max_train_steps,
+				gradient_accumulation_steps: cfg.training?.gradient_accumulation_steps,
+				network_dim: cfg.training?.network_dim,
+				lora_target_preset: cfg.training?.lora_target_preset,
+				fp8_base: cfg.training?.fp8_base,
+			},
+		});
+		if (snapshot === workflowStatsSnapshot) return;
+
+		workflowStatsSnapshot = snapshot;
+		if (workflowStatsTimer) clearTimeout(workflowStatsTimer);
+		workflowStatsLoading = true;
+		workflowStatsTimer = setTimeout(loadWorkflowStats, 900);
+	});
 
 	// Training progress from status store
 	let trainingProgress = $derived.by(() => {
@@ -909,18 +1179,114 @@
 {:else}
 	<div class="space-y-4">
 		<!-- Header -->
-		<div class="flex items-center gap-3">
+		<div class="flex flex-wrap items-center gap-3">
 			<input
 				type="text"
 				value={cfg?.name || ''}
 				oninput={(e) => updateConfig('name', e.target.value)}
-				class="text-base font-semibold bg-transparent border-none outline-none flex-1 min-w-0"
+				class="text-base font-semibold bg-transparent border-none outline-none flex-1 min-w-[12rem]"
 				style="color: var(--text-primary); padding: 0;"
 			/>
 			<span class="text-[10px] font-medium px-2 py-0.5" style="background: var(--accent-muted); color: var(--accent); border-radius: var(--radius-full);">{t.ltx2_mode || 'video'}</span>
 			<span class="text-[10px] font-medium px-2 py-0.5" style="background: var(--bg-elevated); color: var(--text-muted); border-radius: var(--radius-full);">{t.fp8_base ? 'FP8' : 'BF16'}</span>
 		</div>
 		<div class="text-[11px] font-mono truncate -mt-3" style="color: var(--text-muted);">{cfg?.project_dir || ''}</div>
+		{#if cacheThenTrainError}
+			<div class="text-[12px] px-3 py-2" style="color: var(--danger); background: var(--danger-muted); border-radius: var(--radius-sm);">{cacheThenTrainError}</div>
+		{/if}
+
+		<div class="workflow-panel p-4">
+			<div class="flex flex-col xl:flex-row xl:items-start justify-between gap-4">
+				<div class="workflow-main min-w-0">
+					<div class="flex flex-wrap items-center justify-between gap-3 mb-2">
+						<div class="text-[11px] font-semibold uppercase tracking-wider" style="color: var(--text-muted); font-family: var(--font-label);">Project Workflow</div>
+					</div>
+
+					<div class="workflow-stages" aria-label="Cache and training stages">
+						{#each cacheThenTrainProgress.stages as stage, index}
+							<a
+								href={stage.href}
+								class="workflow-stage"
+								class:workflow-stage-active={stage.state === 'active'}
+								class:workflow-stage-complete={stage.state === 'complete'}
+								aria-current={stage.state === 'active' ? 'step' : undefined}
+							>
+								<span class="workflow-stage-number">{index + 1}</span>
+								<span>{stage.label}</span>
+							</a>
+							{#if index < cacheThenTrainProgress.stages.length - 1}
+								<span class="workflow-stage-arrow">→</span>
+							{/if}
+						{/each}
+					</div>
+				</div>
+
+				<div class="workflow-actions">
+					{#if cacheThenTrainWorkflowActive && cacheThenTrainProgress.navHref}
+						<a href={cacheThenTrainProgress.navHref} class="workflow-secondary-action">
+							{cacheThenTrainProgress.navLabel}
+						</a>
+					{/if}
+					{#if cacheThenTrainWorkflowActive}
+						<button
+							type="button"
+							onclick={stopCacheThenTrain}
+							disabled={!cacheThenTrainCanStop}
+							class="workflow-stop-action disabled:opacity-50 disabled:cursor-not-allowed"
+						>
+							{cacheThenTrainStopPending ? 'Stopping...' : 'Stop'}
+						</button>
+					{/if}
+					<button
+						type="button"
+						onclick={cacheThenTrain}
+						disabled={cacheThenTrainDisabled}
+						class="workflow-primary-action disabled:opacity-50 disabled:cursor-not-allowed"
+					>
+						{cacheThenTrainWorkflowActive && cacheThenTrainDisabled ? 'Workflow Running' : 'Cache & Start Training'}
+					</button>
+				</div>
+			</div>
+
+			<div
+				class="workflow-progress-zone"
+				class:workflow-progress-zone-visible={cacheThenTrainProgressVisible}
+				aria-live="polite"
+			>
+				{#if cacheThenTrainProgressVisible}
+					<div class="workflow-progress-copy">
+						<div class="workflow-progress-text">
+							<span class="workflow-progress-label">{cacheThenTrainProgress.label}</span>
+							<span class="workflow-progress-detail">{cacheThenTrainProgress.detail}</span>
+						</div>
+						<strong class="workflow-progress-percent">{Math.round(cacheThenTrainProgress.percent)}%</strong>
+					</div>
+					<div class="workflow-progress" aria-label="Workflow progress">
+						<div class="workflow-progress-fill" style="width: {cacheThenTrainProgress.percent}%;"></div>
+					</div>
+				{:else}
+					<div class="workflow-idle-summary">
+						<div class="workflow-idle-copy">
+							{#if workflowStatsLoading}
+								<span class="workflow-idle-spinner" aria-hidden="true"></span>
+							{/if}
+							<span class="workflow-progress-label">{cacheThenTrainIdleSummary.label}</span>
+							<span class="workflow-progress-detail">{cacheThenTrainIdleSummary.detail}</span>
+						</div>
+						{#if cacheThenTrainIdleSummary.metrics?.length}
+							<div class="workflow-idle-metrics" aria-label="Workflow estimate metrics">
+								{#each cacheThenTrainIdleSummary.metrics as metric}
+									<div class="workflow-idle-metric">
+										<span class="workflow-idle-metric-value">{metric.value}</span>
+										<span class="workflow-idle-metric-label">{metric.label}</span>
+									</div>
+								{/each}
+							</div>
+						{/if}
+					</div>
+				{/if}
+			</div>
+		</div>
 
 		<!-- VRAM Estimation -->
 		<div class="p-4" style="background: var(--bg-surface); border: 1px solid var(--border-subtle); border-radius: var(--radius-md);">
@@ -1102,6 +1468,337 @@
 {/if}
 
 <style>
+	.workflow-panel {
+		background: color-mix(in srgb, var(--accent) 4%, var(--bg-surface));
+		border: 1px solid var(--border-subtle);
+		border-radius: var(--radius-md);
+	}
+
+	.workflow-main {
+		flex: 1 1 auto;
+	}
+
+	.workflow-stages {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: 0.4rem;
+	}
+
+	.workflow-stage {
+		display: inline-flex;
+		align-items: center;
+		gap: 0.45rem;
+		min-height: 2rem;
+		padding: 0.42rem 0.7rem;
+		background: var(--bg-elevated);
+		border: 1px solid var(--border);
+		border-radius: var(--radius-sm);
+		color: var(--text-secondary);
+		font-size: 12px;
+		font-weight: 600;
+		transition: background-color 140ms ease, border-color 140ms ease, color 140ms ease;
+	}
+
+	.workflow-stage:hover {
+		background: color-mix(in srgb, var(--accent) 8%, var(--bg-elevated));
+		border-color: color-mix(in srgb, var(--accent) 28%, var(--border));
+		color: var(--text-primary);
+	}
+
+	.workflow-stage-active {
+		background: color-mix(in srgb, var(--accent) 12%, var(--bg-elevated));
+		border-color: color-mix(in srgb, var(--accent) 42%, var(--border));
+		box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 16%, transparent);
+		color: var(--text-primary);
+	}
+
+	.workflow-stage-complete {
+		background: color-mix(in srgb, var(--accent) 6%, var(--bg-elevated));
+		color: var(--text-primary);
+	}
+
+	.workflow-stage-number {
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		width: 1rem;
+		height: 1rem;
+		border-radius: var(--radius-full);
+		background: color-mix(in srgb, var(--text-muted) 16%, transparent);
+		color: var(--text-primary);
+		font-size: 10px;
+		font-variant-numeric: tabular-nums;
+	}
+
+	.workflow-stage-active .workflow-stage-number {
+		background: var(--accent);
+		color: var(--bg-base);
+	}
+
+	.workflow-stage-arrow {
+		color: var(--text-muted);
+		font-size: 12px;
+	}
+
+	.workflow-progress-zone {
+		display: flex;
+		flex-direction: column;
+		justify-content: center;
+		height: 4.8rem;
+		margin-top: 0.7rem;
+		overflow: hidden;
+	}
+
+	.workflow-progress-zone-visible {
+		height: 4.8rem;
+	}
+
+	.workflow-idle-summary {
+		display: flex;
+		flex-direction: column;
+		gap: 0.6rem;
+		min-width: 0;
+	}
+
+	.workflow-progress-copy {
+		display: flex;
+		align-items: flex-end;
+		justify-content: space-between;
+		gap: 1rem;
+		margin-bottom: 0.4rem;
+	}
+
+	.workflow-progress-text {
+		display: flex;
+		flex-wrap: nowrap;
+		align-items: baseline;
+		gap: 0.35rem 0.65rem;
+		min-width: 0;
+		overflow: hidden;
+	}
+
+	.workflow-idle-copy {
+		display: flex;
+		flex-wrap: nowrap;
+		align-items: baseline;
+		gap: 0.65rem;
+		line-height: 1.35;
+		min-width: 0;
+		overflow: hidden;
+	}
+
+	.workflow-idle-metrics {
+		display: flex;
+		flex-wrap: nowrap;
+		gap: 0.45rem;
+		overflow-x: auto;
+		overflow-y: hidden;
+		padding-bottom: 1px;
+		scrollbar-width: none;
+	}
+
+	.workflow-idle-metrics::-webkit-scrollbar {
+		display: none;
+	}
+
+	.workflow-idle-metric {
+		display: inline-flex;
+		flex: 0 0 auto;
+		align-items: baseline;
+		gap: 0.4rem;
+		min-height: 2rem;
+		padding: 0.35rem 0.6rem;
+		background: color-mix(in srgb, var(--bg-elevated) 72%, transparent);
+		border: 1px solid color-mix(in srgb, var(--border) 85%, transparent);
+		border-radius: var(--radius-sm);
+	}
+
+	.workflow-idle-metric-value {
+		color: var(--text-primary);
+		font-size: 13px;
+		font-weight: 700;
+		font-variant-numeric: tabular-nums;
+		line-height: 1;
+	}
+
+	.workflow-idle-metric-label {
+		color: var(--text-muted);
+		font-size: 10px;
+		font-weight: 600;
+		line-height: 1;
+		text-transform: uppercase;
+	}
+
+	.workflow-idle-spinner {
+		width: 0.85rem;
+		height: 0.85rem;
+		border: 2px solid color-mix(in srgb, var(--text-muted) 30%, transparent);
+		border-top-color: var(--accent);
+		border-radius: var(--radius-full);
+		animation: workflow-spin 700ms linear infinite;
+		transform: translateY(0.08rem);
+	}
+
+	@keyframes workflow-spin {
+		to {
+			transform: translateY(0.08rem) rotate(360deg);
+		}
+	}
+
+	.workflow-progress {
+		position: relative;
+		height: 0.65rem;
+		overflow: hidden;
+		background: color-mix(in srgb, var(--bg-elevated) 78%, var(--bg-base));
+		border: 1px solid var(--border);
+		border-radius: var(--radius-full);
+	}
+
+	.workflow-progress-zone-visible .workflow-progress {
+		border-color: color-mix(in srgb, var(--accent) 42%, var(--border));
+		box-shadow:
+			0 0 0 1px color-mix(in srgb, var(--accent) 10%, transparent),
+			0 0 14px color-mix(in srgb, var(--accent) 16%, transparent),
+			inset 0 0 6px rgba(0, 0, 0, 0.22);
+	}
+
+	.workflow-progress-fill {
+		position: relative;
+		height: 100%;
+		min-width: 0;
+		background: linear-gradient(90deg, color-mix(in srgb, var(--accent) 70%, var(--info)), var(--accent));
+		border-radius: inherit;
+		box-shadow:
+			0 0 10px color-mix(in srgb, var(--accent) 34%, transparent),
+			0 0 20px color-mix(in srgb, var(--accent) 18%, transparent);
+		transition: width 180ms ease;
+	}
+
+	.workflow-progress-fill::after {
+		content: '';
+		position: absolute;
+		inset: 0;
+		background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.18), transparent);
+		animation: workflow-progress-glow 1800ms ease-in-out infinite;
+		transform: translateX(-100%);
+	}
+
+	@keyframes workflow-progress-glow {
+		0% {
+			transform: translateX(-100%);
+			opacity: 0;
+		}
+		45% {
+			opacity: 1;
+		}
+		100% {
+			transform: translateX(100%);
+			opacity: 0;
+		}
+	}
+
+	@media (prefers-reduced-motion: reduce) {
+		.workflow-progress-fill::after {
+			animation: none;
+			opacity: 0;
+		}
+	}
+
+	.workflow-progress-label {
+		color: var(--text-primary);
+		font-size: 13px;
+		font-weight: 650;
+		line-height: 1.35;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+
+	.workflow-progress-detail {
+		color: var(--text-muted);
+		font-size: 11px;
+		font-variant-numeric: tabular-nums;
+		line-height: 1.35;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+
+	.workflow-progress-percent {
+		color: var(--text-primary);
+		font-size: 15px;
+		font-weight: 750;
+		font-variant-numeric: tabular-nums;
+		line-height: 1;
+	}
+
+	.workflow-actions {
+		display: flex;
+		flex: 0 0 auto;
+		flex-wrap: wrap;
+		gap: 0.5rem;
+		justify-content: flex-end;
+	}
+
+	.workflow-primary-action,
+	.workflow-secondary-action,
+	.workflow-stop-action {
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		min-height: 2.4rem;
+		padding: 0.58rem 0.95rem;
+		border-radius: var(--radius-sm);
+		font-family: var(--font-label);
+		font-size: 12px;
+		font-weight: 700;
+		white-space: nowrap;
+		transition: background-color 140ms ease, border-color 140ms ease, color 140ms ease;
+	}
+
+	.workflow-primary-action {
+		min-width: 13rem;
+		background: var(--accent);
+		border: 1px solid color-mix(in srgb, var(--accent) 80%, var(--border));
+		box-shadow: var(--shadow-sm), var(--glow-accent);
+		color: var(--bg-base);
+	}
+
+	.workflow-secondary-action {
+		background: color-mix(in srgb, var(--accent) 8%, var(--bg-elevated));
+		border: 1px solid color-mix(in srgb, var(--accent) 24%, var(--border));
+		color: var(--text-primary);
+	}
+
+	.workflow-secondary-action:hover {
+		background: color-mix(in srgb, var(--accent) 13%, var(--bg-elevated));
+		border-color: color-mix(in srgb, var(--accent) 36%, var(--border));
+	}
+
+	.workflow-stop-action {
+		background: var(--bg-elevated);
+		border: 1px solid color-mix(in srgb, var(--danger) 34%, var(--border));
+		color: var(--danger);
+	}
+
+	.workflow-stop-action:hover:not(:disabled) {
+		background: var(--danger-muted);
+	}
+
+	@media (max-width: 640px) {
+		.workflow-actions,
+		.workflow-primary-action,
+		.workflow-secondary-action,
+		.workflow-stop-action {
+			width: 100%;
+		}
+
+		.workflow-actions {
+			justify-content: stretch;
+		}
+	}
+
 	.choice-pill {
 		padding: 0.45rem 0.7rem;
 		font-size: 11px;

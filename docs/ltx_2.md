@@ -353,6 +353,8 @@ accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 ltx2_tr
 
 Use `--dataset_manifest` instead of `--dataset_config`.
 
+Dashboard workflow: the Project page has a **Cache & Start Training** action. It runs latent caching, waits for success, runs text caching, waits for success, and then starts training. The Project page shows the active stage, shared progress, a stop button for the running stage, and links to open the relevant caching or training view. If no dataset manifest path is set, the action uses `dataset_manifest.json` in the project folder and sets both caching and training to that manifest before it starts.
+
 ### Standard LoRA Training
 ```bash
 accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 ltx2_train_network.py ^

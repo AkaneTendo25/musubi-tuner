@@ -7,13 +7,11 @@ import json
 import os
 import shlex
 import subprocess
-from pathlib import Path
 from typing import Optional
 
 from fastapi import APIRouter, Body, HTTPException, Query, Request
 from sse_starlette.sse import EventSourceResponse
 
-from musubi_tuner.gui_dashboard.cli_defaults import get_ltx2_training_output_dir_default
 from musubi_tuner.gui_dashboard.command_builder import (
     build_cache_dino_cmd,
     build_cache_latents_cmd,
@@ -26,8 +24,12 @@ from musubi_tuner.gui_dashboard.command_builder import (
 )
 from musubi_tuner.gui_dashboard.process_manager import ProcessManager
 from musubi_tuner.gui_dashboard.project_schema import ProjectConfig
+from musubi_tuner.gui_dashboard.training_dashboard_state import (
+    clear_training_dashboard_files,
+    training_is_resume,
+    write_training_launch_status,
+)
 from musubi_tuner.gui_dashboard.validation import validate_process_config
-from musubi_tuner.utils import train_utils
 
 router = APIRouter(tags=["processes"])
 
@@ -103,58 +105,6 @@ def _validate_process_or_raise(proc_type: str, config) -> dict:
     return report
 
 
-def _get_training_run_dir(config: ProjectConfig) -> Optional[Path]:
-    if not config.project_dir:
-        return None
-
-    output_dir = config.training.output_dir or get_ltx2_training_output_dir_default()
-    run_dir = Path(output_dir)
-    if not run_dir.is_absolute():
-        run_dir = Path(config.project_dir) / run_dir
-    return run_dir
-
-
-def _has_local_autoresume_state(config: ProjectConfig) -> bool:
-    run_dir = _get_training_run_dir(config)
-    if run_dir is None or not run_dir.is_dir():
-        return False
-
-    try:
-        state_paths = list(run_dir.iterdir())
-    except OSError:
-        return False
-
-    for path in state_paths:
-        try:
-            if path.name.endswith("-state") and train_utils.is_complete_state_dir(str(path)):
-                return True
-        except OSError:
-            continue
-    return False
-
-
-def _training_is_resume(config: ProjectConfig) -> bool:
-    t = config.training
-    if t.resume or t.resume_from_huggingface:
-        return True
-    return bool(t.autoresume and _has_local_autoresume_state(config))
-
-
-def _clear_training_dashboard_files(config: ProjectConfig) -> None:
-    run_dir = _get_training_run_dir(config)
-    if run_dir is None:
-        return
-
-    dashboard_dir = run_dir / "dashboard"
-    for filename in ("metrics.parquet", "status.json", "events.json"):
-        path = dashboard_dir / filename
-        try:
-            if path.exists():
-                os.remove(path)
-        except OSError:
-            pass
-
-
 @router.post("/api/processes/{proc_type}/validate")
 async def validate_process(proc_type: str, request: Request, project_config: ProjectConfig | None = Body(default=None)):
     _validate_type(proc_type)
@@ -169,8 +119,9 @@ async def start_process(proc_type: str, request: Request):
     config = _get_config(request)
     _validate_process_or_raise(proc_type, config)
 
-    if proc_type == "training" and not _training_is_resume(config):
-        _clear_training_dashboard_files(config)
+    if proc_type == "training":
+        clear_training_dashboard_files(config, keep_history=training_is_resume(config))
+        write_training_launch_status(config)
 
     try:
         cmd = _build_cmd(proc_type, config)

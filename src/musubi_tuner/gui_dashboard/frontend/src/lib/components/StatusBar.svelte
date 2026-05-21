@@ -45,9 +45,14 @@ let statusLabel = $derived(active ? 'Live Status' : 'Inactive');
 				Step {active ? ($status?.step?.toLocaleString() ?? 0) : 0} / {active ? ($status?.max_steps?.toLocaleString() ?? 0) : 0}
 			</div>
 		</div>
-		<div class="h-1 mt-2 overflow-hidden" style="background: var(--border); border-radius: var(--radius-full);">
+		<div
+			class="h-1 mt-2 overflow-hidden training-status-progress-track"
+			class:training-status-progress-track-active={active}
+			style="background: var(--border); border-radius: var(--radius-full);"
+		>
 			<div
-				class="h-full transition-all duration-500"
+				class="h-full transition-all duration-500 training-status-progress-fill"
+				class:training-status-progress-fill-active={active}
 				style="width: {active ? progress : 0}%; background: {active ? 'var(--accent)' : 'var(--text-muted)'}; border-radius: var(--radius-full);"
 			></div>
 		</div>
@@ -66,3 +71,53 @@ let statusLabel = $derived(active ? 'Live Status' : 'Inactive');
 		<MetricCard label="ETA" value={active ? formatTime($eta) : '--'} inactive={!active} />
 	</div>
 </div>
+
+<style>
+	.training-status-progress-track-active {
+		border-color: color-mix(in srgb, var(--accent) 36%, var(--border));
+		box-shadow:
+			0 0 0 1px color-mix(in srgb, var(--accent) 9%, transparent),
+			0 0 12px color-mix(in srgb, var(--accent) 14%, transparent);
+	}
+
+	.training-status-progress-fill {
+		position: relative;
+		overflow: hidden;
+	}
+
+	.training-status-progress-fill-active {
+		box-shadow:
+			0 0 9px color-mix(in srgb, var(--accent) 32%, transparent),
+			0 0 18px color-mix(in srgb, var(--accent) 16%, transparent);
+	}
+
+	.training-status-progress-fill-active::after {
+		content: '';
+		position: absolute;
+		inset: 0;
+		background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.18), transparent);
+		animation: training-status-progress-glow 1800ms ease-in-out infinite;
+		transform: translateX(-100%);
+	}
+
+	@keyframes training-status-progress-glow {
+		0% {
+			transform: translateX(-100%);
+			opacity: 0;
+		}
+		45% {
+			opacity: 1;
+		}
+		100% {
+			transform: translateX(100%);
+			opacity: 0;
+		}
+	}
+
+	@media (prefers-reduced-motion: reduce) {
+		.training-status-progress-fill-active::after {
+			animation: none;
+			opacity: 0;
+		}
+	}
+</style>

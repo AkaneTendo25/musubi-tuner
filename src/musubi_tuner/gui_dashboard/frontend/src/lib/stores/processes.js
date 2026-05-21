@@ -2,7 +2,7 @@ import { writable } from 'svelte/store';
 import { get } from 'svelte/store';
 import { projectConfig, saveProjectNow } from '$lib/stores/project.js';
 import { clearMetrics } from '$lib/stores/metrics.js';
-import { clearStatus } from '$lib/stores/status.js';
+import { ignoreStatusBefore } from '$lib/stores/status.js';
 
 export const processStatuses = writable({
 	cache_latents: { state: 'idle', exit_code: null },
@@ -223,7 +223,7 @@ export async function startProcess(type) {
 	await validateProcess(type, get(projectConfig));
 	if (type === 'training') {
 		clearMetrics();
-		clearStatus();
+		ignoreStatusBefore(Date.now() / 1000);
 		clearProcessLogs(type);
 		setProcessStatus(type, { state: 'running', exit_code: null });
 	}

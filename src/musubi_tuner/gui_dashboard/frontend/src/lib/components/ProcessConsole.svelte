@@ -2,7 +2,7 @@
 	import { tick } from 'svelte';
 	import { processConsoleUi, setProcessConsoleCollapsed } from '$lib/stores/processes.js';
 
-	let { lines = [], maxLines = 1000, initiallyCollapsed = false, processType = null } = $props();
+	let { lines = [], maxLines = 1000, initiallyCollapsed = false, processType = null, emptyMessage = 'No output yet' } = $props();
 
 	let container = $state(null);
 	let autoScroll = $state(true);
@@ -103,7 +103,7 @@
 			>{clean}</div>
 		{/each}
 		{#if displayLines.length === 0}
-			<div class="italic" style="color: var(--console-text-muted);">No output yet</div>
+			<div class="italic" style="color: var(--console-text-muted);">{emptyMessage}</div>
 		{/if}
 	</div>
 

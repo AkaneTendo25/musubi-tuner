@@ -25,6 +25,9 @@
 	let trainingLogs = $derived($processLogs.training || []);
 	let trainingActive = $derived(trainingLive);
 	let showDashboardData = $derived(trainingLive);
+	let trainingConsoleEmptyMessage = $derived(
+		trainingLive ? 'Training process launched. Waiting for console output...' : 'No output yet'
+	);
 
 	let systemInfo = $state(null);
 	let stats = $state(null);
@@ -431,7 +434,7 @@
 	<!-- Process Controls + Console — always visible -->
 	<div class="space-y-3">
 		<ProcessControls processType="training" status={trainingStatus} onStart={handleStart} onStop={handleStop} />
-		<ProcessConsole lines={trainingLogs} processType="training" initiallyCollapsed={false} />
+		<ProcessConsole lines={trainingLogs} processType="training" initiallyCollapsed={false} emptyMessage={trainingConsoleEmptyMessage} />
 	</div>
 
 	{#if showDashboardData}

@@ -12,6 +12,11 @@ from PIL import Image
 
 import logging
 
+from musubi_tuner.gui_dashboard.cache_progress import (
+    cache_progress_total,
+    create_cache_progress_writer_from_env,
+    should_update_cache_progress,
+)
 from musubi_tuner.dataset.image_video_dataset import BaseDataset, ItemInfo, save_latent_cache, ARCHITECTURE_HUNYUAN_VIDEO
 from musubi_tuner.hunyuan_model.vae import load_vae
 from musubi_tuner.hunyuan_model.autoencoder_kl_causal_3d import AutoencoderKLCausal3D
@@ -287,11 +292,18 @@ def encode_and_save_batch(vae: AutoencoderKLCausal3D, batch: list[ItemInfo]):
 def encode_datasets(datasets: list[BaseDataset], encode: callable, args: argparse.Namespace, supports_alpha: bool = False):
     """Common function to encode datasets. This function is called from multiple architecture scripts."""
     num_workers = args.num_workers if args.num_workers is not None else max(1, os.cpu_count() - 1)
+    progress_writer = create_cache_progress_writer_from_env()
     for i, dataset in enumerate(datasets):
         logger.info(f"Encoding dataset [{i}]")
         all_latent_cache_paths = []
+        total_items = cache_progress_total(dataset)
+        processed_items = 0
+        last_progress_items = 0
+        if progress_writer is not None:
+            progress_writer.update(dataset_index=i, current_items=0, total_items=total_items)
         for _, batch in tqdm(dataset.retrieve_latent_cache_batches(num_workers)):
             batch: list[ItemInfo] = batch
+            original_batch_size = len(batch)
             if not supports_alpha:
                 # make sure content has 3 channels
                 for item in batch:
@@ -309,12 +321,25 @@ def encode_datasets(datasets: list[BaseDataset], encode: callable, args: argpars
             if args.skip_existing:
                 filtered_batch = [item for item in batch if not os.path.exists(item.latent_cache_path)]
                 if len(filtered_batch) == 0:
+                    processed_items += original_batch_size
+                    if progress_writer is not None and should_update_cache_progress(
+                        processed_items, total_items, last_progress_items
+                    ):
+                        progress_writer.update(dataset_index=i, current_items=processed_items, total_items=total_items)
+                        last_progress_items = processed_items
                     continue
                 batch = filtered_batch
 
             bs = args.batch_size if args.batch_size is not None else len(batch)
-            for i in range(0, len(batch), bs):
-                encode(batch[i : i + bs])
+            for start in range(0, len(batch), bs):
+                encode(batch[start : start + bs])
+            processed_items += original_batch_size
+            if progress_writer is not None and should_update_cache_progress(processed_items, total_items, last_progress_items):
+                progress_writer.update(dataset_index=i, current_items=processed_items, total_items=total_items)
+                last_progress_items = processed_items
+
+        if progress_writer is not None and processed_items > last_progress_items:
+            progress_writer.update(dataset_index=i, current_items=processed_items, total_items=total_items)
 
         # normalize paths
         all_latent_cache_paths = [os.path.normpath(p) for p in all_latent_cache_paths]

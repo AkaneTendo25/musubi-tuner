@@ -163,20 +163,63 @@ _TQDM_PROGRESS_RE = re.compile(
     r"^(?P<label>.*?)(?::)?\s*(?P<pct>\d+)%\|.*?\|\s*(?P<current>\d+)/(?P<total>\d+)",
     re.IGNORECASE,
 )
+_TQDM_ITER_RE = re.compile(r"^(?P<label>.*?)(?::)?\s*(?P<current>\d+)it\s+\[", re.IGNORECASE)
+_CACHE_ENCODING_RE = re.compile(r"Encoding dataset \[(?P<dataset>\d+)\]")
+
+
+def _parse_tqdm_progress(line: str) -> dict[str, int | str | None] | None:
+    match = _TQDM_PROGRESS_RE.match(line.strip())
+    if match:
+        current = int(match.group("current"))
+        total = int(match.group("total"))
+        if total <= 0:
+            return None
+
+        label = (match.group("label") or "").strip()
+        unit = "step" if label.lower() == "steps" else "batch"
+        return {
+            "label": label,
+            "unit": unit,
+            "current": current,
+            "total": total,
+            "percent": max(0, min(100, int(match.group("pct")))),
+        }
+
+    match = _TQDM_ITER_RE.match(line.strip())
+    if match:
+        current = int(match.group("current"))
+        label = (match.group("label") or "").strip()
+        return {
+            "label": label,
+            "unit": "iteration",
+            "current": current,
+            "total": None,
+            "percent": None,
+        }
+
+    return None
 
 
 def _progress_signature(line: str) -> tuple[str, str, int] | None:
-    match = _TQDM_PROGRESS_RE.match(line.strip())
-    if not match:
+    progress = _parse_tqdm_progress(line)
+    if progress is None:
         return None
 
-    label = (match.group("label") or "").strip().lower()
-    pct = int(match.group("pct"))
-    current = int(match.group("current"))
+    label = str(progress["label"]).lower()
+    current = int(progress["current"])
 
     if label == "steps":
-        return ("steps", match.group("total"), current)
+        return ("steps", str(progress["total"]), current)
+    if progress.get("total") is None:
+        return ("iteration", label, current)
+    pct = int(progress["percent"] or 0)
     return ("progress", label, pct)
+
+
+def _cache_process_accepts_progress(proc_type: Optional[str], cache_progress_started: bool) -> bool:
+    if proc_type in {"cache_latents", "cache_text", "cache_dino"}:
+        return cache_progress_started
+    return True
 
 
 def _dedupe_process_refs(refs: list[ProcessRef]) -> list[ProcessRef]:
@@ -287,11 +330,13 @@ class ManagedProcess:
         cwd: Optional[str] = None,
         env: Optional[dict[str, str]] = None,
         proc_type: Optional[str] = None,
+        progress_file: Optional[Path] = None,
     ):
         self.cmd = cmd
         self.cwd = cwd
         self.env = env
         self.proc_type = proc_type
+        self.progress_file = progress_file
         self.state = ProcessState.IDLE
         self.exit_code: Optional[int] = None
         self.logs: deque[str] = deque(maxlen=5000)
@@ -299,6 +344,8 @@ class ManagedProcess:
         self._reader_thread: Optional[threading.Thread] = None
         self._lock = threading.Lock()
         self._last_progress_signature: tuple[str, str, int] | None = None
+        self._last_tqdm_progress: dict[str, int | str | None] | None = None
+        self._cache_progress_started = False
         self._graceful_stop_requested = False
         self._stop_requested = False
         self._stop_file: Optional[Path] = None
@@ -314,7 +361,14 @@ class ManagedProcess:
             self.exit_code = None
             self.logs.clear()
             self.logs.append(f"$ {' '.join(self.cmd)}\n")
+            if self.progress_file:
+                try:
+                    self.progress_file.unlink(missing_ok=True)
+                except OSError:
+                    pass
             self._last_progress_signature = None
+            self._last_tqdm_progress = None
+            self._cache_progress_started = False
             self._graceful_stop_requested = False
             self._stop_requested = False
             self._force_kill_delay_seconds = _STOP_GRACE_SECONDS
@@ -393,6 +447,14 @@ class ManagedProcess:
         self._finalize_process_state()
 
     def _append_log_line(self, line: str) -> bool:
+        if self.proc_type in {"cache_latents", "cache_text", "cache_dino"} and _CACHE_ENCODING_RE.search(line):
+            self._cache_progress_started = True
+            self._last_tqdm_progress = None
+            self._last_progress_signature = None
+
+        parsed_progress = _parse_tqdm_progress(line)
+        if parsed_progress is not None and _cache_process_accepts_progress(self.proc_type, self._cache_progress_started):
+            self._last_tqdm_progress = parsed_progress
         signature = _progress_signature(line)
         if signature is not None:
             if signature == self._last_progress_signature:
@@ -486,11 +548,19 @@ class ManagedProcess:
                 self._finalize_process_state()
 
     def get_status(self) -> dict:
-        return {
+        status = {
             "state": self.state.value,
             "exit_code": self.exit_code,
             "stop_requested": self._stop_requested,
         }
+        if self.progress_file and self.progress_file.is_file():
+            try:
+                status["progress"] = json.loads(self.progress_file.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                pass
+        if self._last_tqdm_progress is not None:
+            status["log_progress"] = self._last_tqdm_progress
+        return status
 
     def get_logs(self, last_n: Optional[int] = None) -> list[str]:
         if last_n is None:
@@ -529,7 +599,13 @@ class ProcessManager:
                     pass
                 env["MUSUBI_DASHBOARD_STOP_FILE"] = str(stop_file)
 
-            mp = ManagedProcess(cmd, cwd=cwd, env=env, proc_type=proc_type)
+            progress_file = None
+            if proc_type in ("cache_latents", "cache_text", "cache_dino") and cwd:
+                progress_file = Path(cwd) / "dashboard" / f"{proc_type}_status.json"
+                env["MUSUBI_DASHBOARD_PROCESS_TYPE"] = proc_type
+                env["MUSUBI_DASHBOARD_CACHE_STATUS_FILE"] = str(progress_file)
+
+            mp = ManagedProcess(cmd, cwd=cwd, env=env, proc_type=proc_type, progress_file=progress_file)
             if proc_type in ("training", "slider_training"):
                 mp._stop_file = Path(env["MUSUBI_DASHBOARD_STOP_FILE"])
             self._processes[proc_type] = mp
