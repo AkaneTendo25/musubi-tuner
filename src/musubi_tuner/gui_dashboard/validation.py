@@ -912,6 +912,56 @@ def validate_training_config(config: ProjectConfig) -> dict[str, Any]:
                 )
             )
 
+    if t.video_anchor_training:
+        try:
+            video_anchor_probability = float(t.video_anchor_probability)
+        except (TypeError, ValueError):
+            video_anchor_probability = float("nan")
+        if not math.isfinite(video_anchor_probability) or not 0.0 <= video_anchor_probability <= 1.0:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.video_anchor_probability",
+                    "Video Anchor Probability must be a finite number in the inclusive range 0.0 to 1.0.",
+                    label="Video Anchor Probability",
+                    page="techniques",
+                )
+            )
+        try:
+            video_anchor_count = int(t.video_anchor_count)
+        except (TypeError, ValueError):
+            video_anchor_count = -1
+        if video_anchor_count < 0:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.video_anchor_count",
+                    "Video Anchor Count must be at least 0.",
+                    label="Video Anchor Count",
+                    page="techniques",
+                )
+            )
+        if str(t.video_anchor_strategy or "endpoints_random") == "random" and video_anchor_count < 1:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.video_anchor_count",
+                    "Video Anchor Count must be at least 1 when Video Anchor Strategy is random.",
+                    label="Video Anchor Count",
+                    page="techniques",
+                )
+            )
+        if t.ltx2_mode == "audio" or t.ltx2_audio_only_model:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.video_anchor_training",
+                    "Video Anchor Training requires a video-target training path and cannot be used with audio-only training.",
+                    label="Video Anchor Training",
+                    page="techniques",
+                )
+            )
+
     if not t.save_every_n_steps and not t.save_every_n_epochs:
         warnings.append(
             _make_issue(

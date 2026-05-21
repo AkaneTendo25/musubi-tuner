@@ -89,6 +89,7 @@ IC_LORA_STRATEGIES = (
 # any IC-LoRA strategy. latent_idx is applied via 5D paste pre-patchify;
 # keyframe is appended via `build_keyframe_extension`.
 AV_CROSS_ATTENTION_MODES = ("both", "a2v_only", "v2a_only", "none")
+VIDEO_ANCHOR_STRATEGIES = ("endpoints", "random", "endpoints_random")
 
 
 def _network_has_av_cross_projection_lora(network: torch.nn.Module, projections: Tuple[str, ...]) -> bool:
@@ -339,6 +340,168 @@ def _extract_endpoint_keyframes(
                     }
                 )
     return out
+
+
+def _normalize_video_anchor_strategy(value: Optional[str]) -> str:
+    strategy = str(value or "endpoints_random").lower()
+    if strategy not in VIDEO_ANCHOR_STRATEGIES:
+        raise ValueError(f"video_anchor_strategy must be one of {list(VIDEO_ANCHOR_STRATEGIES)}. Got: {strategy}")
+    return strategy
+
+
+def _resolve_video_anchor_config(args: argparse.Namespace, *, ltx_mode: str) -> Tuple[bool, float, int, str]:
+    enabled = bool(getattr(args, "video_anchor_training", False))
+    if not enabled:
+        return False, 0.0, 0, "endpoints_random"
+
+    probability = float(getattr(args, "video_anchor_probability", 0.5))
+    count = int(getattr(args, "video_anchor_count", 1))
+    strategy = _normalize_video_anchor_strategy(getattr(args, "video_anchor_strategy", "endpoints_random"))
+
+    if not math.isfinite(probability) or probability < 0.0 or probability > 1.0:
+        raise ValueError(f"video_anchor_probability must be a finite number in [0, 1]. Got: {probability}")
+    if count < 0:
+        raise ValueError(f"video_anchor_count must be >= 0. Got: {count}")
+    if strategy == "random" and count < 1:
+        raise ValueError("video_anchor_count must be at least 1 when video_anchor_strategy='random'.")
+    if enabled and (str(ltx_mode).lower() == "audio" or bool(getattr(args, "ltx2_audio_only_model", False))):
+        raise ValueError(
+            "--video_anchor_training requires a video-target training path and cannot be used with audio-only training"
+        )
+
+    return enabled, probability, count, strategy
+
+
+def _build_video_anchor_frame_mask(
+    *,
+    latents: torch.Tensor,
+    probability: float,
+    count: int,
+    strategy: str,
+    device: torch.device,
+) -> Optional[torch.Tensor]:
+    if latents.dim() != 5:
+        raise ValueError(f"_build_video_anchor_frame_mask expects 5D latents, got shape {tuple(latents.shape)}")
+
+    probability = float(probability)
+    if not math.isfinite(probability) or probability < 0.0 or probability > 1.0:
+        raise ValueError(f"video_anchor_probability must be a finite number in [0, 1]. Got: {probability}")
+
+    count = int(count)
+    if count < 0:
+        raise ValueError(f"video_anchor_count must be >= 0. Got: {count}")
+
+    strategy = _normalize_video_anchor_strategy(strategy)
+    if strategy == "random" and count < 1:
+        raise ValueError("video_anchor_count must be at least 1 when video_anchor_strategy='random'.")
+    if probability <= 0.0:
+        return None
+
+    bsz = int(latents.shape[0])
+    frames = int(latents.shape[2])
+    if frames <= 0:
+        return None
+
+    anchor_frame_mask = torch.zeros((bsz, frames), device=device, dtype=torch.bool)
+    any_anchor = False
+
+    for sample_idx in range(bsz):
+        if probability < 1.0 and bool(torch.rand((), device=device) >= probability):
+            continue
+
+        selected_frames: list[int] = []
+        if strategy in {"endpoints", "endpoints_random"}:
+            selected_frames.append(0)
+            if frames > 1:
+                selected_frames.append(frames - 1)
+
+        if strategy in {"random", "endpoints_random"} and count > 0:
+            used = set(selected_frames)
+            candidate_frames = [frame_idx for frame_idx in range(frames) if frame_idx not in used]
+            if candidate_frames:
+                perm = torch.randperm(len(candidate_frames), device=device)
+                added = 0
+                for perm_idx in perm.tolist():
+                    candidate_frame = int(candidate_frames[perm_idx])
+                    if candidate_frame in used:
+                        continue
+                    used.add(candidate_frame)
+                    selected_frames.append(candidate_frame)
+                    added += 1
+                    if added >= count:
+                        break
+
+        if selected_frames:
+            anchor_frame_mask[sample_idx, selected_frames] = True
+            any_anchor = True
+
+    return anchor_frame_mask if any_anchor else None
+
+
+def _frame_mask_to_token_mask(frame_mask: torch.Tensor, *, tokens_per_frame: int, device: torch.device) -> torch.Tensor:
+    if frame_mask.dim() != 2:
+        raise ValueError(f"frame_mask must be 2D [B,F], got shape {tuple(frame_mask.shape)}")
+    if tokens_per_frame <= 0:
+        return torch.zeros((frame_mask.shape[0], 0), device=device, dtype=torch.bool)
+
+    return (
+        frame_mask.to(device=device, dtype=torch.bool)[:, :, None].expand(-1, -1, tokens_per_frame).reshape(frame_mask.shape[0], -1)
+    )
+
+
+def _frame_mask_to_loss_mask(frame_mask: torch.Tensor, *, use_5d: bool, device: torch.device) -> torch.Tensor:
+    if frame_mask.dim() != 2:
+        raise ValueError(f"frame_mask must be 2D [B,F], got shape {tuple(frame_mask.shape)}")
+
+    frame_loss_mask = ~frame_mask.to(device=device, dtype=torch.bool)
+    bsz, frames = frame_loss_mask.shape
+    if use_5d:
+        return frame_loss_mask.view(bsz, 1, frames, 1, 1)
+    return frame_loss_mask
+
+
+def _apply_video_anchor_training(
+    *,
+    enabled: bool,
+    latents: torch.Tensor,
+    model_noisy_video: torch.Tensor,
+    probability: float,
+    count: int,
+    strategy: str,
+    device: torch.device,
+    first_frame_conditioning_enabled: Optional[torch.Tensor] = None,
+    latent_idx_guide_slot: Optional[Tuple[int, int]] = None,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    if not enabled:
+        return model_noisy_video, None
+
+    video_anchor_frame_mask = _build_video_anchor_frame_mask(
+        latents=latents,
+        probability=probability,
+        count=count,
+        strategy=strategy,
+        device=device,
+    )
+    if video_anchor_frame_mask is None:
+        return model_noisy_video, None
+
+    video_anchor_frame_mask = video_anchor_frame_mask.clone()
+    if first_frame_conditioning_enabled is not None and video_anchor_frame_mask.shape[1] > 0:
+        first_frame_conditioning_enabled = first_frame_conditioning_enabled.to(device=device, dtype=torch.bool)
+        video_anchor_frame_mask[first_frame_conditioning_enabled, 0] = False
+    if latent_idx_guide_slot is not None:
+        slot_idx, slot_t = latent_idx_guide_slot
+        video_anchor_frame_mask[:, slot_idx : slot_idx + slot_t] = False
+    if not bool(video_anchor_frame_mask.any().item()):
+        return model_noisy_video, None
+
+    clean_latents = latents.to(device=model_noisy_video.device, dtype=model_noisy_video.dtype)
+    anchored_video = torch.where(
+        video_anchor_frame_mask[:, None, :, None, None],
+        clean_latents,
+        model_noisy_video,
+    )
+    return anchored_video, video_anchor_frame_mask
 
 
 def _normalize_av_cross_attention_mode(value: Optional[str]) -> str:
@@ -2796,6 +2959,12 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
         self._ltx2_audio_only_model = bool(getattr(args, "ltx2_audio_only_model", False))
         if self._ltx2_audio_only_model and self._ltx_mode != "audio":
             raise ValueError("--ltx2_audio_only_model requires --ltx2_mode audio")
+        (
+            args.video_anchor_training,
+            args.video_anchor_probability,
+            args.video_anchor_count,
+            args.video_anchor_strategy,
+        ) = _resolve_video_anchor_config(args, ltx_mode=self._ltx_mode)
         self.default_guidance_scale = 1.0
         if bool(getattr(args, "av_attention_loss_weighting", False)):
             if self._ltx_mode != "av":
@@ -3467,6 +3636,12 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
 
         if timesteps is None or not isinstance(timesteps, torch.Tensor):
             raise TypeError(f"Expected timesteps to be a torch.Tensor, got: {type(timesteps)}")
+        (
+            video_anchor_training_enabled,
+            video_anchor_probability,
+            video_anchor_count,
+            video_anchor_strategy,
+        ) = _resolve_video_anchor_config(args, ltx_mode=self._ltx_mode)
 
         conditions = batch.get("conditions")
         if conditions is not None:
@@ -4168,6 +4343,18 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                     keyframe_guides_for_options = []
                 keyframe_guides_for_options.extend(_endpoint_guides)
 
+        model_noisy_video, video_anchor_frame_mask = _apply_video_anchor_training(
+            enabled=video_anchor_training_enabled,
+            latents=latents,
+            model_noisy_video=model_noisy_video,
+            probability=video_anchor_probability,
+            count=video_anchor_count,
+            strategy=video_anchor_strategy,
+            device=accelerator.device,
+            first_frame_conditioning_enabled=video_conditioning_enabled,
+            latent_idx_guide_slot=latent_idx_guide_slot,
+        )
+
         if ref_latents is not None and ic_lora_strategy == "v2v":
             from musubi_tuner.ltx_2.components.patchifiers import VideoLatentPatchifier, get_pixel_coords
             from musubi_tuner.ltx_2.guidance.perturbations import BatchedPerturbationConfig
@@ -4205,6 +4392,13 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                 _slot_start = _slot_idx * _tokens_per_frame
                 _slot_stop = (_slot_idx + _slot_T) * _tokens_per_frame
                 target_conditioning_mask[:, _slot_start:_slot_stop] = True
+            if video_anchor_frame_mask is not None:
+                _tokens_per_frame = tgt_height * tgt_width
+                target_conditioning_mask = target_conditioning_mask | _frame_mask_to_token_mask(
+                    video_anchor_frame_mask,
+                    tokens_per_frame=_tokens_per_frame,
+                    device=accelerator.device,
+                )
             conditioning_mask = torch.cat([ref_conditioning_mask, target_conditioning_mask], dim=1)
 
             combined_timesteps = sigma.view(bsz, 1).expand(bsz, ref_seq_len + target_seq_len)
@@ -4423,6 +4617,13 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                 _slot_idx, _slot_T = latent_idx_guide_slot
                 _tokens_per_frame = int(latents.shape[3]) * int(latents.shape[4])
                 tgt_video_cond_mask[:, _slot_idx * _tokens_per_frame : (_slot_idx + _slot_T) * _tokens_per_frame] = True
+            if video_anchor_frame_mask is not None:
+                _tokens_per_frame = int(latents.shape[3]) * int(latents.shape[4])
+                tgt_video_cond_mask = tgt_video_cond_mask | _frame_mask_to_token_mask(
+                    video_anchor_frame_mask,
+                    tokens_per_frame=_tokens_per_frame,
+                    device=accelerator.device,
+                )
             video_cond_mask = torch.cat([ref_video_cond_mask, tgt_video_cond_mask], dim=1)
 
             video_combined_ts = sigma.view(bsz, 1).expand(bsz, ref_video_seq_len + tgt_video_seq_len)
@@ -5024,6 +5225,13 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                 _slot_idx, _slot_T = latent_idx_guide_slot
                 _tokens_per_frame = int(latents.shape[3]) * int(latents.shape[4])
                 tgt_video_cond_mask[:, _slot_idx * _tokens_per_frame : (_slot_idx + _slot_T) * _tokens_per_frame] = True
+            if video_anchor_frame_mask is not None:
+                _tokens_per_frame = int(latents.shape[3]) * int(latents.shape[4])
+                tgt_video_cond_mask = tgt_video_cond_mask | _frame_mask_to_token_mask(
+                    video_anchor_frame_mask,
+                    tokens_per_frame=_tokens_per_frame,
+                    device=accelerator.device,
+                )
             video_cond_mask = torch.cat([ref_video_cond_mask, tgt_video_cond_mask], dim=1)
 
             video_combined_ts = sigma.view(bsz, 1).expand(bsz, ref_video_seq_len + tgt_video_seq_len)
@@ -5320,6 +5528,29 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                     latent_idx_guide_loss_mask.shape[0], 1, latent_idx_guide_loss_mask.shape[1], 1, 1
                 )
                 video_loss_mask = video_loss_mask & _expand
+        if video_anchor_frame_mask is not None:
+            bsz, _c, frames, height, width = latents.shape
+            tokens_per_frame = height * width
+            anchor_token_mask = _frame_mask_to_token_mask(
+                video_anchor_frame_mask,
+                tokens_per_frame=tokens_per_frame,
+                device=accelerator.device,
+            )
+            if video_conditioning_mask_tokens is None:
+                video_conditioning_mask_tokens = anchor_token_mask
+            else:
+                video_conditioning_mask_tokens = video_conditioning_mask_tokens | anchor_token_mask
+            anchor_loss_mask = _frame_mask_to_loss_mask(
+                video_anchor_frame_mask,
+                use_5d=bool(getattr(args, "video_loss_mask_5d", False)),
+                device=accelerator.device,
+            )
+            if video_loss_mask is None:
+                video_loss_mask = anchor_loss_mask
+            elif video_loss_mask.dim() == 2:
+                video_loss_mask = video_loss_mask & anchor_loss_mask
+            elif video_loss_mask.dim() == 5:
+                video_loss_mask = video_loss_mask & anchor_loss_mask
         video_loss_mask = _combine_loss_masks(video_loss_mask, _cached_video_loss_mask(as_tokens=False))
 
         resolved_transformer_options = dict(transformer_options)

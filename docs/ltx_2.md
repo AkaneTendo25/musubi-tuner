@@ -2009,6 +2009,34 @@ Caveats and tradeoffs:
 - **Distribution under defaults**: defaults `first_p=1.0, last_p=1.0, interior_p=0.0` train two-ended interpolation. Single-anchor i2v (set `last_p=0`) and last-anchor extension (set `first_p=0`) are out-of-distribution unless you train with those probabilities directly.
 - **`strength=0` keyframes are skipped entirely** (they would otherwise add tokens to attention with no useful signal). At inference, this means a `--gk` guide with `:0.0` is equivalent to omitting it.
 
+##### Video Anchor Training
+
+Optional training-time augmentation for workflows that use clean video frames as anchors. During some training samples, selected target frames are kept as known frames while the model trains on the rest of the video.
+
+| Flag | Default | Description |
+|---|---|---|
+| `--video_anchor_training` | off | Master enable. When unset, generated commands do not include the video-anchor flags. |
+| `--video_anchor_probability` | `0.5` | Per-sample probability of applying video-anchor training. |
+| `--video_anchor_count` | `1` | Number of random anchors to add per sample when the strategy includes random anchors. |
+| `--video_anchor_strategy` | `endpoints_random` | `endpoints` keeps first/last frames only, `random` samples anchors uniformly, and `endpoints_random` combines both. |
+
+Use this only when your target workflow benefits from anchor-like conditioning, such as first/last-frame control, video-to-video refinement, reference-guided training, or experiments where the model should see fixed in-clip frames while learning the surrounding motion. It is not a general quality switch for every run.
+
+Suggested starting point:
+```
+--video_anchor_training \
+--video_anchor_probability 0.25 \
+--video_anchor_count 1 \
+--video_anchor_strategy endpoints_random
+```
+
+Caveats and tradeoffs:
+
+- **Video target required**: `--video_anchor_training` is rejected for `--ltx2_mode audio` and audio-only checkpoints because there are no video target latents to anchor.
+- **Random strategy needs anchors**: `--video_anchor_strategy random` requires `--video_anchor_count >= 1`; use `endpoints` if you only want first/last-frame anchors.
+- **No inference behavior is added**: this is training-only.
+- **No guaranteed quality gain**: evaluate against your target prompts and sampling workflow before using it as a default.
+
 ##### Sample Prompt Flags
 
 | Flag | Meaning |

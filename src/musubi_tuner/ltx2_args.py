@@ -760,6 +760,37 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         ),
     )
     parser.add_argument(
+        "--video_anchor_training",
+        action="store_true",
+        help=(
+            "Enable video-anchor training: copy selected target latent frames back into the noisy input, "
+            "zero their timesteps, and exclude them from loss. Off by default."
+        ),
+    )
+    parser.add_argument(
+        "--video_anchor_probability",
+        type=float,
+        default=0.5,
+        help=("Per-sample probability of applying video-anchor training when --video_anchor_training is set. Default 0.5."),
+    )
+    parser.add_argument(
+        "--video_anchor_count",
+        type=int,
+        default=1,
+        help=("Number of random anchors to add per sample when --video_anchor_strategy includes random anchors. Default 1."),
+    )
+    parser.add_argument(
+        "--video_anchor_strategy",
+        type=str,
+        default="endpoints_random",
+        choices=["endpoints", "random", "endpoints_random"],
+        help=(
+            "Anchor placement strategy for --video_anchor_training. "
+            "'endpoints' keeps first/last frames only, 'random' samples anchors uniformly, "
+            "and 'endpoints_random' combines both."
+        ),
+    )
+    parser.add_argument(
         "--fp8_scaled",
         action="store_true",
         help="use scaled fp8 for DiT / DiTにスケーリングされたfp8を使う",

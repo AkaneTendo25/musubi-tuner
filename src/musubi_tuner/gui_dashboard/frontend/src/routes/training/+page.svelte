@@ -755,6 +755,22 @@
 									<FormField type="number" fieldPath="training.keyframe_max_random_interior" value={t.keyframe_max_random_interior ?? 0} oninput={(e) => update('keyframe_max_random_interior', Number(e.target.value))} step="1" min={0} tooltip="Cap on number of random interior keyframes per batch when keyframe_random_interior_p triggers." />
 								</div>
 							{/if}
+							<div class="pt-3 space-y-2" style="border-top: 1px solid var(--border-subtle);">
+								<div class="flex items-center justify-between">
+									<span class="text-[11px] font-medium uppercase tracking-wider" style="color: var(--text-muted);">Video Anchor Training</span>
+								</div>
+								<p class="text-[11px]" style="color: var(--text-muted);">
+									Replace selected target frames in the noisy input with the clean target latent, zero their timesteps, and exclude them from loss.
+								</p>
+								<FormToggle fieldPath="training.video_anchor_training" checked={t.video_anchor_training ?? false} onchange={(e) => update('video_anchor_training', e.target.checked)} tooltip="Master enable for video-anchor training. When off, the fields below are not emitted to the CLI." />
+								{#if t.video_anchor_training}
+									<div class="grid grid-cols-3 gap-2">
+										<FormField type="number" fieldPath="training.video_anchor_probability" value={t.video_anchor_probability ?? 0.5} oninput={(e) => update('video_anchor_probability', Number(e.target.value))} step="0.05" min={0} max={1} tooltip="Per-sample probability of applying anchor training." />
+										<FormField type="number" fieldPath="training.video_anchor_count" value={t.video_anchor_count ?? 1} oninput={(e) => update('video_anchor_count', Number(e.target.value))} step="1" min={0} tooltip="Number of random anchors to add per sample when random anchors are enabled." />
+										<FormSelect fieldPath="training.video_anchor_strategy" value={t.video_anchor_strategy || 'endpoints_random'} options={[{value:'endpoints',label:'Endpoints'},{value:'random',label:'Random'},{value:'endpoints_random',label:'Endpoints + Random'}]} onchange={(e) => update('video_anchor_strategy', e.target.value)} tooltip="Anchor placement strategy." />
+									</div>
+								{/if}
+							</div>
 						</div>
 						{#if $advancedMode}
 							<div class="pt-3 space-y-2" style="border-top: 1px solid var(--border-subtle);">

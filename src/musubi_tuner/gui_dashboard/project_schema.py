@@ -646,6 +646,11 @@ class TrainingConfig(BaseModel):
     keyframe_last_frame_p: float = 1.0
     keyframe_random_interior_p: float = 0.0
     keyframe_max_random_interior: int = 0
+    # Video-anchor training (hard target-frame replacement)
+    video_anchor_training: bool = False
+    video_anchor_probability: float = 0.5
+    video_anchor_count: int = 1
+    video_anchor_strategy: Literal["endpoints", "random", "endpoints_random"] = "endpoints_random"
     accelerate_extra_args: str = ""
     extra_args: str = ""
 

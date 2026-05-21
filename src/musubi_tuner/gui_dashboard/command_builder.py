@@ -1511,6 +1511,11 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
         cmd += ["--keyframe_last_frame_p", str(getattr(t, "keyframe_last_frame_p", 1.0))]
         cmd += ["--keyframe_random_interior_p", str(getattr(t, "keyframe_random_interior_p", 0.0))]
         cmd += ["--keyframe_max_random_interior", str(int(getattr(t, "keyframe_max_random_interior", 0)))]
+    if getattr(t, "video_anchor_training", False):
+        cmd += ["--video_anchor_training"]
+        cmd += ["--video_anchor_probability", str(getattr(t, "video_anchor_probability", 0.5))]
+        cmd += ["--video_anchor_count", str(int(getattr(t, "video_anchor_count", 1)))]
+        cmd += ["--video_anchor_strategy", str(getattr(t, "video_anchor_strategy", "endpoints_random"))]
 
     cmd += _split_cli_args(t.extra_args)
     return cmd
