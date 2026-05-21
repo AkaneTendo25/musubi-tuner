@@ -221,6 +221,35 @@
 			</div>
 		</div>
 
+		<!-- Differential Guidance -->
+		<div style="background: var(--bg-surface); border: 1px solid var(--border-subtle); border-radius: var(--radius-md); position: relative; overflow: hidden;">
+			<div style="position: absolute; top: 0; left: 0; right: 0; height: 2px; background: linear-gradient(90deg, transparent, var(--accent), var(--secondary, var(--accent)), transparent); opacity: 0.5;"></div>
+
+			<div class="p-5 pb-0">
+				<div class="flex items-center gap-3 mb-2">
+					<div class="w-8 h-8 flex items-center justify-center flex-shrink-0" style="background: var(--accent-muted); border-radius: var(--radius-sm);">
+						<svg class="w-4 h-4" style="color: var(--accent);" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.5"><path d="M4.5 12h15m0 0-5.25-5.25M19.5 12l-5.25 5.25M4.5 6.75l4.5 4.5-4.5 4.5"/></svg>
+					</div>
+					<div>
+						<div class="text-[13px] font-semibold" style="color: var(--text-primary);">Differential Guidance</div>
+						<div class="text-[11px]" style="color: var(--text-muted);">Prediction-relative target scaling</div>
+					</div>
+					<div class="ml-auto">
+						<FormToggle fieldPath="training.differential_guidance" checked={$projectConfig?.training?.differential_guidance ?? false} onchange={(e) => updateTraining('differential_guidance', e.target.checked)} />
+					</div>
+				</div>
+				<p class="text-[12px] leading-relaxed mb-3" style="color: var(--text-secondary);">
+					Changes the video/main target delta during training. Default scale is 3.0 when enabled; scale 1.0 leaves the target unchanged.
+				</p>
+			</div>
+
+			<div class="p-5 pt-0">
+				<div class="grid grid-cols-4 gap-2">
+					<FormField fieldPath="training.differential_guidance_scale" label="Scale" type="number" value={$projectConfig?.training?.differential_guidance_scale ?? 3.0} oninput={(e) => updateTraining('differential_guidance_scale', Number(e.target.value))} step="0.1" disabled={!$projectConfig?.training?.differential_guidance} tooltip="Default 3.0. 1.0 keeps the original target; >1 strengthens the target delta; 0-1 softens it." />
+				</div>
+			</div>
+		</div>
+
 		<!-- Self-Flow -->
 		<div style="background: var(--bg-surface); border: 1px solid var(--border-subtle); border-radius: var(--radius-md); position: relative; overflow: hidden;">
 			<div style="position: absolute; top: 0; left: 0; right: 0; height: 2px; background: linear-gradient(90deg, transparent, var(--accent), var(--secondary, var(--accent)), transparent); opacity: 0.5;"></div>

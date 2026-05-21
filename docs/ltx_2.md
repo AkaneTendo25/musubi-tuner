@@ -1042,6 +1042,16 @@ CTS can be combined with TARP. Keep it off unless AV sync or cross-modal alignme
 - `--tread_args` accepts `target`, `selection_ratio`, `start_layer_idx`, and `end_layer_idx`; aliases are `modality`, `ratio`, `start`, and `end`.
 - TREAD is training-only. Video targets require a video-enabled path; audio-only training must use `target=audio`.
 
+**Differential Guidance** - Prediction-relative scaling for the video/main training target. This is opt-in:
+```bash
+--differential_guidance
+```
+It applies this transform before the normal video/main prediction loss:
+```text
+target = pred + scale * (target - pred)
+```
+The default scale is `3.0` when enabled. Use `--differential_guidance_scale` to override it. Scale `1.0` is unchanged, values above `1.0` strengthen the target delta, and values between `0.0` and `1.0` soften it. The feature affects training loss only and does not change inference.
+
 | Technique | Extra forwards/step | Extra backwards/step | Starting value / multiplier |
 |-----------|-------------------|---------------------|----------------------|
 | `--blank_preservation` | +2 | +1 | 0.5 - 1.0 |
@@ -1054,9 +1064,10 @@ CTS can be combined with TARP. Keep it off unless AV sync or cross-modal alignme
 | `--cts_lambda_*` | +1 per enabled direction | 0 | 0.1 - 0.3 |
 | `--av_attention_loss_weighting` | 0 | 0 | Max 1.5, warmup 400 steps |
 | `--tread` / `--tread_args` | 0 | 0 | N/A (routing only) |
+| `--differential_guidance` | 0 | 0 | Default scale 3.0 when enabled; scale 1.0 = unchanged |
 
 > [!CAUTION]
-> Some preservation techniques add transformer forward passes per step. Audio DOP costs apply only on non-audio steps. CTS adds one forward per enabled direction. TARP, DCR, AV Cross Grad Surgery, AV Attention Loss Weighting, and TREAD add no extra passes; they modify the existing forward/backward in-place.
+> Some preservation techniques add transformer forward passes per step. Audio DOP costs apply only on non-audio steps. CTS adds one forward per enabled direction. TARP, DCR, AV Cross Grad Surgery, AV Attention Loss Weighting, TREAD, and Differential Guidance add no extra passes; they modify the existing forward/backward in-place.
 
 #### CREPA (Cross-frame Representation Alignment)
 

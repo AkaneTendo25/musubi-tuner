@@ -886,6 +886,32 @@ def validate_training_config(config: ProjectConfig) -> dict[str, Any]:
                 )
             )
 
+    if t.differential_guidance:
+        try:
+            differential_guidance_scale = float(t.differential_guidance_scale)
+        except (TypeError, ValueError):
+            differential_guidance_scale = float("nan")
+        if not math.isfinite(differential_guidance_scale):
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.differential_guidance_scale",
+                    "Differential Guidance Scale must be a finite number.",
+                    label="Differential Guidance Scale",
+                    page="techniques",
+                )
+            )
+        if t.ltx2_mode == "audio" or t.ltx2_audio_only_model:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.differential_guidance",
+                    "Differential Guidance requires a video/main prediction loss and cannot be used with audio-only training.",
+                    label="Differential Guidance",
+                    page="techniques",
+                )
+            )
+
     if not t.save_every_n_steps and not t.save_every_n_epochs:
         warnings.append(
             _make_issue(

@@ -1,6 +1,7 @@
 """LTX-2 argument parser and training entry point."""
 
 import argparse
+import math
 import os
 import sys
 import logging
@@ -1406,6 +1407,13 @@ def main() -> None:
         if args.ltx_mode in short_map:
             args.ltx_mode = short_map[args.ltx_mode]
     apply_ltx2_tweaks(args)
+    args.differential_guidance_scale = float(getattr(args, "differential_guidance_scale", 3.0))
+    if not math.isfinite(args.differential_guidance_scale):
+        raise ValueError("--differential_guidance_scale must be finite.")
+    if bool(getattr(args, "differential_guidance", False)) and (
+        getattr(args, "ltx_mode", "video") == "audio" or bool(getattr(args, "ltx2_audio_only_model", False))
+    ):
+        raise ValueError("--differential_guidance requires a video/main prediction loss and cannot be used in audio-only mode.")
     if getattr(args, "auto_blocks_to_checkpoint", False):
         if getattr(args, "blockwise_checkpointing", False) and int(getattr(args, "blocks_to_swap", 0) or 0) > 0:
             if int(getattr(args, "blocks_to_checkpoint", -1)) == -1:

@@ -1413,6 +1413,12 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
         if args_parts:
             cmd += ["--tread_args"] + args_parts
 
+    # Differential guidance
+    if t.differential_guidance:
+        cmd.append("--differential_guidance")
+        if t.differential_guidance_scale != 3.0:
+            cmd += ["--differential_guidance_scale", str(t.differential_guidance_scale)]
+
     # Audio features
     if t.audio_loss_balance_mode != "none":
         cmd += ["--audio_loss_balance_mode", t.audio_loss_balance_mode]

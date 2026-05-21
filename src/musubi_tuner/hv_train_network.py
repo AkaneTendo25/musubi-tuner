@@ -1030,6 +1030,22 @@ class NetworkTrainer:
     def compute_video_extra_loss(self, args, out, network_dtype):
         return None, {}
 
+    def apply_differential_guidance_target(
+        self,
+        args: argparse.Namespace,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+    ) -> torch.Tensor:
+        if not bool(getattr(args, "differential_guidance", False)):
+            return target
+        scale = float(getattr(args, "differential_guidance_scale", 3.0))
+        if not math.isfinite(scale):
+            raise ValueError("--differential_guidance_scale must be finite.")
+        if scale == 1.0:
+            return target
+        detached_pred = pred.detach().to(device=target.device, dtype=target.dtype)
+        return detached_pred + scale * (target - detached_pred)
+
     def get_dummy_scheduler(self, optimizer: torch.optim.Optimizer) -> Any:
         # dummy scheduler for schedulefree optimizer. supports only empty step(), get_last_lr() and optimizers.
         # this scheduler is used for logging only.
@@ -4332,6 +4348,7 @@ class NetworkTrainer:
 
                         video_pred = out["video_pred"]
                         video_target = out["video_target"]
+                        video_target_for_loss = self.apply_differential_guidance_target(args, video_pred, video_target)
                         video_loss_mask = out.get("video_loss_mask")
                         _hfato_data = out.get("_hfato")
                         if _hfato_data is not None:
@@ -4345,7 +4362,7 @@ class NetworkTrainer:
                                 video_loss_mask,
                             )
                         else:
-                            video_loss = _masked_loss(video_pred, video_target, video_loss_mask, tag="video")
+                            video_loss = _masked_loss(video_pred, video_target_for_loss, video_loss_mask, tag="video")
 
                         audio_pred = out.get("audio_pred")
                         audio_target = out.get("audio_target")
@@ -4497,6 +4514,7 @@ class NetworkTrainer:
                     else:
                         if isinstance(target, torch.Tensor):
                             model_pred = model_pred.to(device=target.device, dtype=network_dtype)
+                            target = self.apply_differential_guidance_target(args, model_pred, target)
                         else:
                             model_pred = model_pred.to(dtype=network_dtype)
                         loss = _per_element_loss(model_pred, target, _loss_type, _huber_delta)
@@ -5636,6 +5654,23 @@ def setup_parser_common() -> argparse.ArgumentParser:
         type=float,
         default=1.0,
         help="Delta (beta) for Huber/smooth_l1 loss. Below this threshold the loss is ~MSE, above it ~MAE. Only used when --loss_type is huber or smooth_l1.",
+    )
+    parser.add_argument(
+        "--differential_guidance",
+        action="store_true",
+        help=(
+            "Apply prediction-relative target scaling to the video/main training target: "
+            "target = pred + differential_guidance_scale * (target - pred). Off by default."
+        ),
+    )
+    parser.add_argument(
+        "--differential_guidance_scale",
+        type=float,
+        default=3.0,
+        help=(
+            "Multiplier for --differential_guidance. Default 3.0. 1.0 is unchanged; "
+            ">1 strengthens the target delta; values between 0 and 1 soften it."
+        ),
     )
     parser.add_argument(
         "--min_timestep",

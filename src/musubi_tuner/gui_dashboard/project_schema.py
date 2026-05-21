@@ -514,6 +514,10 @@ class TrainingConfig(BaseModel):
     tread_start_layer_idx: Optional[int] = None
     tread_end_layer_idx: Optional[int] = None
 
+    # Differential Guidance
+    differential_guidance: bool = False
+    differential_guidance_scale: float = 3.0
+
     # CREPA
     crepa: bool = False
     crepa_args: str = ""
