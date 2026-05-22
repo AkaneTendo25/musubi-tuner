@@ -507,6 +507,7 @@ NF4 has ~4x higher weight error than FP8 (cosine 0.996 vs 0.9997). The base mode
 - `--fp8_base`: keep base model weights in FP8 path (~19 GB VRAM).
 - `--fp8_scaled`: quantize checkpoint weights to FP8 at load time. Works with both standard (bf16/fp16/fp32) and pre-quantized FP8 checkpoints (the latter are dequantized to bf16 first, then re-quantized).
 - `--fp8_keep_blocks "0,1,2,45"`: with `--fp8_scaled`, keep selected transformer blocks in high precision instead of FP8. Comma lists and ranges such as `0-2,45` are accepted. This is useful for testing whether boundary or otherwise sensitive blocks should avoid FP8 quantization.
+- `--fp8_w8a8`: with `--fp8_base --fp8_scaled`, use W8A8 activation quantization for LoRA training. `--w8a8_mode int8` is the default; `--w8a8_mode fp8` keeps FP8 weights and dequantizes transiently.
 - `--nf4_base`: NF4 4-bit quantization (~10 GB VRAM). Mutually exclusive with `--fp8_base`. See [NF4 Quantization](#nf4-quantization) below.
 - `--quantize_device cpu|cuda|gpu`: Device for NF4/FP8 quantization at startup (default: `cuda`). `cpu` loads and quantizes weights on CPU, then moves to GPU. `cuda` loads and quantizes directly on GPU. Overrides `LTX2_NF4_CALC_DEVICE` / `LTX2_FP8_CALC_DEVICE` env vars.
 

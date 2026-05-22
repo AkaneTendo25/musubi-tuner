@@ -339,6 +339,10 @@ def validate_training_config(config: ProjectConfig) -> dict[str, Any]:
         message = "W8A8 requires FP8 Scaled."
         errors.append(_make_issue("error", "training.fp8_w8a8", message, label="W8A8", page="training"))
         errors.append(_make_issue("error", "training.fp8_scaled", message, label="FP8 Scaled", page="training"))
+    if t.fp8_w8a8 and not t.fp8_base:
+        message = "W8A8 requires FP8 Base."
+        errors.append(_make_issue("error", "training.fp8_w8a8", message, label="W8A8", page="training"))
+        errors.append(_make_issue("error", "training.fp8_base", message, label="FP8 Base", page="training"))
 
     if t.loftq_init and not t.nf4_base:
         message = "LoftQ Init requires NF4 Base."

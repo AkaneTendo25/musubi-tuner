@@ -609,7 +609,7 @@
 							<div class="grid grid-cols-3 gap-x-4 gap-y-1">
 								<FormToggle fieldPath="training.nf4_base" checked={t.nf4_base ?? false} onchange={(e) => update('nf4_base', e.target.checked)} tooltip="NF4 4-bit quantization (~75% VRAM savings)" />
 								<FormToggle fieldPath="training.loftq_init" checked={t.loftq_init ?? false} onchange={(e) => update('loftq_init', e.target.checked)} tooltip="LoftQ initialization (compensates NF4 error)" />
-								<FormToggle fieldPath="training.fp8_w8a8" checked={t.fp8_w8a8 ?? false} onchange={(e) => update('fp8_w8a8', e.target.checked)} tooltip="W8A8 activation quantization (requires FP8 Scaled)" />
+								<FormToggle fieldPath="training.fp8_w8a8" checked={t.fp8_w8a8 ?? false} onchange={(e) => update('fp8_w8a8', e.target.checked)} tooltip="W8A8 activation quantization (requires FP8 Base and FP8 Scaled)" />
 								<FormToggle fieldPath="training.awq_calibration" checked={t.awq_calibration ?? false} onchange={(e) => update('awq_calibration', e.target.checked)} tooltip="Activation-aware calibration for NF4" />
 							</div>
 							<div class="grid grid-cols-3 gap-2">

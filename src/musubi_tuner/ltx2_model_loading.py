@@ -10,7 +10,11 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 from tqdm import tqdm
 
 from musubi_tuner.utils.safetensors_utils import MemoryEfficientSafeOpen
-from musubi_tuner.modules.nf4_optimization_utils import apply_nf4_monkey_patch, load_safetensors_with_nf4_optimization, DEFAULT_NF4_BLOCK_SIZE
+from musubi_tuner.modules.nf4_optimization_utils import (
+    apply_nf4_monkey_patch,
+    load_safetensors_with_nf4_optimization,
+    DEFAULT_NF4_BLOCK_SIZE,
+)
 from musubi_tuner.utils.lora_utils import load_safetensors_with_lora_and_fp8
 from musubi_tuner.modules.fp8_optimization_utils import apply_fp8_monkey_patch
 from musubi_tuner.modules.w8a8_optimization_utils import apply_w8a8_monkey_patch
@@ -88,9 +92,7 @@ def build_fp8_keep_block_exclude_keys(value: Any, num_blocks: Optional[int]) -> 
         raise ValueError("--fp8_keep_blocks requires a model with transformer_blocks")
     invalid = [idx for idx in block_indices if idx < 0 or idx >= num_blocks]
     if invalid:
-        raise ValueError(
-            f"--fp8_keep_blocks contains invalid block indices {invalid}; valid range is 0..{num_blocks - 1}"
-        )
+        raise ValueError(f"--fp8_keep_blocks contains invalid block indices {invalid}; valid range is 0..{num_blocks - 1}")
     return [f"transformer_blocks.{idx}." for idx in block_indices]
 
 
@@ -119,8 +121,7 @@ def _resolve_transformer_block_load_range(
     keep_end = num_transformer_blocks if keep_end is None else int(keep_end)
     if keep_start < 0 or keep_end < keep_start or keep_end > num_transformer_blocks:
         raise ValueError(
-            f"invalid transformer_block_load_range {keep_start}:{keep_end} "
-            f"for {num_transformer_blocks} transformer blocks"
+            f"invalid transformer_block_load_range {keep_start}:{keep_end} for {num_transformer_blocks} transformer blocks"
         )
     return keep_start, keep_end
 
@@ -314,8 +315,12 @@ def _apply_memory_optimization_settings(
                 block.audio_ff.chunk_size = ffn_chunk_size
                 ffn_count += 1
         if ffn_count > 0:
-            logger.info("Applied FFN chunking (chunk_size=%d) to %d FeedForward modules (target=%s)",
-                       ffn_chunk_size, ffn_count, ffn_chunk_target)
+            logger.info(
+                "Applied FFN chunking (chunk_size=%d) to %d FeedForward modules (target=%s)",
+                ffn_chunk_size,
+                ffn_count,
+                ffn_chunk_target,
+            )
 
     # Apply split attention settings
     if split_attn_target and split_attn_target != "none" and split_attn_mode:
@@ -358,8 +363,13 @@ def _apply_memory_optimization_settings(
                 attn_count += 1
 
         if attn_count > 0:
-            logger.info("Applied split attention (mode=%s, chunk_size=%d) to %d Attention modules (target=%s)",
-                       split_attn_mode, split_attn_chunk_size, attn_count, split_attn_target)
+            logger.info(
+                "Applied split attention (mode=%s, chunk_size=%d) to %d Attention modules (target=%s)",
+                split_attn_mode,
+                split_attn_chunk_size,
+                attn_count,
+                split_attn_target,
+            )
 
 
 def load_ltx2_model(
@@ -409,6 +419,7 @@ def load_ltx2_model(
     Returns:
         Loaded LTX-2 transformer model
     """
+
     def _cast_non_fp8_params(model: torch.nn.Module, target_dtype: torch.dtype) -> None:
         for module in model.modules():
             is_quantized_linear = isinstance(module, torch.nn.Linear) and hasattr(module, "scale_weight")
@@ -431,7 +442,9 @@ def load_ltx2_model(
         if target_device.type == "cuda":
             _resolved_quant_device = target_device
         else:
-            logger.warning("Quantize device '%s' requested GPU, but target device is %s; falling back to CPU.", _qdev_raw, target_device)
+            logger.warning(
+                "Quantize device '%s' requested GPU, but target device is %s; falling back to CPU.", _qdev_raw, target_device
+            )
             _resolved_quant_device = torch.device("cpu")
     else:
         _resolved_quant_device = torch.device("cpu")
@@ -487,6 +500,7 @@ def load_ltx2_model(
     # Auto-detect gated attention from checkpoint keys
     if not config.get("transformer", {}).get("apply_gated_attention", False):
         from safetensors import safe_open
+
         _check_path = model_path if isinstance(model_path, str) else model_path[0]
         with safe_open(_check_path, framework="pt") as f:
             if any("to_gate_logits" in k for k in f.keys()):
@@ -529,9 +543,7 @@ def load_ltx2_model(
             )
 
         logger.info("LTX-2 range-aware load enabled for transformer blocks %d:%d", keep_start, keep_end)
-    fp8_block_exclude_keys = (
-        build_fp8_keep_block_exclude_keys(fp8_keep_blocks, num_transformer_blocks) if fp8_scaled else []
-    )
+    fp8_block_exclude_keys = build_fp8_keep_block_exclude_keys(fp8_keep_blocks, num_transformer_blocks) if fp8_scaled else []
     if fp8_block_exclude_keys:
         logger.info(
             "LTX-2 fp8: keeping transformer blocks in high precision: %s",
@@ -557,6 +569,7 @@ def load_ltx2_model(
         _pre_quantized = False
         try:
             from safetensors import safe_open as _safe_open
+
             with _safe_open(_check_path, framework="pt") as _f:
                 _meta = _f.metadata()
                 _pre_quantized = _meta is not None and _meta.get("nf4_quantized") == "true"
@@ -574,7 +587,8 @@ def load_ltx2_model(
             if _saved_bs != nf4_block_size:
                 logger.info(
                     "Using block_size=%d from pre-quantized model (--nf4_block_size=%d ignored)",
-                    _saved_bs, nf4_block_size,
+                    _saved_bs,
+                    nf4_block_size,
                 )
                 nf4_block_size = _saved_bs
             logger.info("Detected pre-quantized NF4 model (block_size=%d), skipping quantization", nf4_block_size)
@@ -589,6 +603,7 @@ def load_ltx2_model(
             if loftq_init and lora_rank > 0:
                 from musubi_tuner.ltx2_quantize_model import loftq_path_for_model
                 from safetensors.torch import load_file as _load_file
+
                 _loftq_file = loftq_path_for_model(_check_path, lora_rank)
                 if os.path.isfile(_loftq_file):
                     logger.info("Loading pre-computed LoftQ data from %s", _loftq_file)
@@ -744,9 +759,7 @@ def load_ltx2_model(
             m = torch.cuda.max_memory_allocated() / (1024**3)
             logger.info(f"[VRAM_TRACE_LTX2] {tag}: alloc={a:.2f}GB res={r:.2f}GB max={m:.2f}GB")
 
-    _trace_vram_ltx2(
-        f"AFTER state dict loading (state_device={state_device}, quantize_device={_resolved_quant_device})"
-    )
+    _trace_vram_ltx2(f"AFTER state dict loading (state_device={state_device}, quantize_device={_resolved_quant_device})")
     if nf4_base:
         apply_nf4_monkey_patch(base_model, sd, block_size=nf4_block_size, awq_scales=_awq_scales)
     elif fp8_scaled:
@@ -760,7 +773,7 @@ def load_ltx2_model(
     if torch_dtype is not None:
         _cast_non_fp8_params(base_model, torch_dtype)
     if fp8_w8a8:
-        apply_w8a8_monkey_patch(base_model, w8a8_mode=w8a8_mode)
+        apply_w8a8_monkey_patch(base_model, w8a8_mode=w8a8_mode, state_dict=sd)
         _trace_vram_ltx2("AFTER W8A8 monkey patch")
     _trace_vram_ltx2(f"AFTER _cast_non_fp8_params, BEFORE base_model.to({load_device})")
     base_model = base_model.to(load_device)
