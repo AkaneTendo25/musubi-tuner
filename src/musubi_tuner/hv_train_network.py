@@ -789,6 +789,13 @@ class NetworkTrainer:
             logger.info(f"use torchao optimizer {optimizer_class.__name__} | {optimizer_kwargs}")
             optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
 
+        elif optimizer_type in {"qgalore", "q_galore", "qgaloreadamw8bit", "q_galore_adamw8bit", "q-galore-adamw8bit"}:
+            from musubi_tuner.optimizers.q_galore import QGaLoreAdamW8bit
+
+            optimizer_class = QGaLoreAdamW8bit
+            logger.info(f"use Q-GaLore AdamW8bit optimizer | {optimizer_kwargs}")
+            optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
+
         elif (
             optimizer_type.startswith("optimi_")
             or optimizer_type.startswith("torchoptimi_")

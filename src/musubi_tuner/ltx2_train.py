@@ -1609,7 +1609,8 @@ def _fused_step_pending_grads(
     params_to_step: list[tuple[torch.Tensor, Any]] = []
     for param_group in optimizer.param_groups:
         for parameter in param_group.get("params", []):
-            if parameter is None or parameter.grad is None:
+            has_float_grad = getattr(parameter, "float_grad", None) is not None
+            if parameter is None or (parameter.grad is None and not has_float_grad):
                 continue
             params_to_step.append((parameter, param_group))
 
@@ -1628,6 +1629,8 @@ def _fused_step_pending_grads(
     for parameter, param_group in params_to_step:
         optimizer.step_param(parameter, param_group)
         parameter.grad = None
+        if getattr(parameter, "float_grad", None) is not None:
+            parameter.float_grad = None
 
     return len(params_to_step)
 
@@ -1759,6 +1762,7 @@ def _build_full_ft_param_groups(
     attn_geometry_lr_scale: float,
     freeze_attn_geometry: bool,
     exclude_param_prefixes: Optional[list[str]] = None,
+    qgalore_group_kwargs: Optional[dict[str, Any]] = None,
 ) -> tuple[list[dict[str, Any]], list[list[str]], dict[str, Any]]:
     if base_lr <= 0:
         raise ValueError(f"learning_rate must be > 0 for full fine-tune, got {base_lr}")
@@ -1775,8 +1779,12 @@ def _build_full_ft_param_groups(
 
     grouped_params: dict[float, list[torch.nn.Parameter]] = {}
     grouped_names: dict[float, list[str]] = {}
+    qgalore_grouped_params: dict[float, list[torch.nn.Parameter]] = {}
+    qgalore_grouped_names: dict[float, list[str]] = {}
     frozen_param_count = 0
     trainable_param_count = 0
+    qgalore_param_count = 0
+    qgalore_param_numel = 0
     frozen_attn_geometry_count = 0
     trainable_attn_geometry_count = 0
     trainable_by_block: dict[str, int] = {}
@@ -1785,12 +1793,14 @@ def _build_full_ft_param_groups(
     for name, param in transformer.named_parameters():
         if any(name.startswith(prefix) for prefix in excluded_prefixes):
             continue
-        if not param.requires_grad:
+        is_qgalore_param = bool(getattr(param, "_qgalore_weight", False))
+        if not param.requires_grad and not is_qgalore_param:
             continue
 
         block_index = _extract_transformer_block_index(name)
         if block_index is not None and block_index in frozen_blocks:
-            param.requires_grad_(False)
+            if param.requires_grad:
+                param.requires_grad_(False)
             frozen_param_count += 1
             if _is_attention_geometry_param(name):
                 frozen_attn_geometry_count += 1
@@ -1807,21 +1817,29 @@ def _build_full_ft_param_groups(
         is_attn_geometry = _is_attention_geometry_param(name)
         if is_attn_geometry:
             if freeze_attn_geometry:
-                param.requires_grad_(False)
+                if param.requires_grad:
+                    param.requires_grad_(False)
                 frozen_param_count += 1
                 frozen_attn_geometry_count += 1
                 continue
             scale *= float(attn_geometry_lr_scale)
 
         if scale <= 0.0:
-            param.requires_grad_(False)
+            if param.requires_grad:
+                param.requires_grad_(False)
             frozen_param_count += 1
             if is_attn_geometry:
                 frozen_attn_geometry_count += 1
             continue
 
-        grouped_params.setdefault(scale, []).append(param)
-        grouped_names.setdefault(scale, []).append(name)
+        if is_qgalore_param:
+            qgalore_grouped_params.setdefault(scale, []).append(param)
+            qgalore_grouped_names.setdefault(scale, []).append(name)
+            qgalore_param_count += 1
+            qgalore_param_numel += int(param.numel())
+        else:
+            grouped_params.setdefault(scale, []).append(param)
+            grouped_names.setdefault(scale, []).append(name)
         trainable_param_count += 1
         if is_attn_geometry:
             trainable_attn_geometry_count += 1
@@ -1831,14 +1849,27 @@ def _build_full_ft_param_groups(
 
     # Keep order deterministic by scale value.
     scales = sorted(grouped_params.keys())
+    qgalore_scales = sorted(qgalore_grouped_params.keys())
     param_groups = [{"params": grouped_params[s], "lr": base_lr * s} for s in scales]
     param_name_groups = [grouped_names[s] for s in scales]
+    if qgalore_grouped_params:
+        if not qgalore_group_kwargs:
+            raise ValueError("Q-GaLore parameters were found, but qgalore_group_kwargs was not provided.")
+        for scale in qgalore_scales:
+            group = {"params": qgalore_grouped_params[scale], "lr": base_lr * scale}
+            group.update(qgalore_group_kwargs)
+            param_groups.append(group)
+            param_name_groups.append(qgalore_grouped_names[scale])
 
     stats = {
         "frozen_param_count": frozen_param_count,
         "trainable_param_count": trainable_param_count,
-        "num_lr_groups": len(scales),
-        "lr_scales": scales,
+        "qgalore_param_count": qgalore_param_count,
+        "qgalore_param_numel": qgalore_param_numel,
+        "num_lr_groups": len(scales) + len(qgalore_scales),
+        "qgalore_lr_scales": qgalore_scales,
+        "num_qgalore_lr_groups": len(qgalore_scales),
+        "lr_scales": scales + qgalore_scales,
         "frozen_blocks": sorted(frozen_blocks),
         "block_lr_rules": block_lr_rules,
         "trainable_by_block": trainable_by_block,
@@ -2073,6 +2104,103 @@ def ltx2_finetune_setup_parser(parser: argparse.ArgumentParser) -> argparse.Argu
         "--no_final_save",
         action="store_true",
         help="Skip the final checkpoint save. Intended for smoke/stability runs; periodic step/epoch saves still work.",
+    )
+    parser.add_argument(
+        "--qgalore_full_ft",
+        action="store_true",
+        default=False,
+        help=(
+            "Enable experimental Q-GaLore full fine-tuning for selected LTX-2 Linear weights. "
+            "Use with --optimizer_type QGaLoreAdamW8bit."
+        ),
+    )
+    parser.add_argument(
+        "--qgalore_targets",
+        type=str,
+        default="video",
+        help=(
+            "Comma-separated Q-GaLore target scopes: video, audio, ff, attn, blocks, non_block, all. "
+            "Default: video (attn1/attn2/ff inside transformer blocks)."
+        ),
+    )
+    parser.add_argument("--qgalore_rank", type=int, default=256, help="Q-GaLore low-rank gradient rank.")
+    parser.add_argument(
+        "--qgalore_update_proj_gap",
+        type=int,
+        default=200,
+        help="Q-GaLore SVD/projection refresh interval in optimizer steps.",
+    )
+    parser.add_argument(
+        "--qgalore_scale",
+        type=float,
+        default=0.25,
+        help="Q-GaLore projected update scale. The upstream Q-GaLore recipes commonly use 0.25.",
+    )
+    parser.add_argument("--qgalore_proj_type", type=str, default="std", help="Q-GaLore projection type. Only std is supported.")
+    parser.add_argument(
+        "--qgalore_proj_quant",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Quantize Q-GaLore projection matrices. Enabled by default.",
+    )
+    parser.add_argument("--qgalore_proj_bits", type=int, default=4, help="Projection matrix quantization bits.")
+    parser.add_argument("--qgalore_proj_group_size", type=int, default=256, help="Projection quantization group size.")
+    parser.add_argument("--qgalore_weight_bits", type=int, default=8, help="Q-GaLore Linear weight quantization bits.")
+    parser.add_argument("--qgalore_weight_group_size", type=int, default=256, help="Q-GaLore Linear weight group size.")
+    parser.add_argument(
+        "--qgalore_stochastic_round",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use stochastic rounding when re-quantizing Q-GaLore Linear weights. Enabled by default.",
+    )
+    parser.add_argument(
+        "--qgalore_min_weight_numel",
+        type=int,
+        default=16384,
+        help="Skip Linear weights smaller than this many elements when replacing with Q-GaLore Linear.",
+    )
+    parser.add_argument(
+        "--qgalore_max_modules",
+        type=int,
+        default=None,
+        help="Optional cap on the number of Linear modules replaced by Q-GaLore, useful for smoke tests.",
+    )
+    parser.add_argument(
+        "--qgalore_load_on_cpu",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Load the LTX-2 transformer on CPU before Q-GaLore replacement, then move quantized weights to GPU. "
+            "Enabled by default to avoid the bf16 GPU load spike."
+        ),
+    )
+    parser.add_argument("--qgalore_cos_threshold", type=float, default=0.4, help="Q-GaLore lazy subspace cosine threshold.")
+    parser.add_argument("--qgalore_gamma_proj", type=float, default=2.0, help="Q-GaLore projection-gap growth factor.")
+    parser.add_argument("--qgalore_queue_size", type=int, default=5, help="Q-GaLore lazy subspace cosine queue size.")
+    parser.add_argument(
+        "--qgalore_svd_method",
+        type=str,
+        default="full",
+        choices=["full", "lowrank"],
+        help="Projection SVD method. full matches upstream Q-GaLore; lowrank uses torch.svd_lowrank for large LTX matrices.",
+    )
+    parser.add_argument(
+        "--qgalore_svd_oversampling",
+        type=int,
+        default=32,
+        help="Extra randomized-SVD vectors when --qgalore_svd_method=lowrank.",
+    )
+    parser.add_argument(
+        "--qgalore_svd_niter",
+        type=int,
+        default=1,
+        help="Power iterations for --qgalore_svd_method=lowrank.",
+    )
+    parser.add_argument(
+        "--qgalore_dequantize_save",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Dequantize Q-GaLore Linear weights back to normal checkpoint tensors when saving. Enabled by default.",
     )
     add_ltx2_model_parallel_args(parser)
     # EMA arguments
@@ -2853,6 +2981,29 @@ def main() -> None:
         logger.warning("Ignoring --weighting_scheme for LTX-2; forcing weighting_scheme=none")
     args.weighting_scheme = "none"
 
+    if bool(getattr(args, "qgalore_full_ft", False)):
+        from musubi_tuner.optimizers.q_galore import is_qgalore_optimizer_type
+
+        if bool(getattr(args, "fp8_base", False)) or bool(getattr(args, "fp8_scaled", False)):
+            raise ValueError(
+                "--qgalore_full_ft already quantizes selected Linear weights; do not combine it with --fp8_base/--fp8_scaled."
+            )
+        if bool(getattr(args, "nf4_base", False)):
+            raise ValueError("--qgalore_full_ft cannot be combined with --nf4_base.")
+        if not getattr(args, "optimizer_type", None):
+            args.optimizer_type = "QGaLoreAdamW8bit"
+            logger.info("Q-GaLore full-FT: defaulting --optimizer_type QGaLoreAdamW8bit")
+        elif not is_qgalore_optimizer_type(str(args.optimizer_type)):
+            raise ValueError("--qgalore_full_ft requires --optimizer_type QGaLoreAdamW8bit")
+        if not bool(getattr(args, "fused_backward_pass", False)):
+            raise ValueError(
+                "--qgalore_full_ft requires --fused_backward_pass so dense per-layer gradients are stepped and released immediately."
+            )
+        if bool(getattr(args, "fused_backward_pass", False)) and float(getattr(args, "max_grad_norm", 0.0) or 0.0) != 0.0:
+            raise ValueError(
+                "Q-GaLore fused backward requires --max_grad_norm 0 because uint8 weight float_grad cannot use global clipping."
+            )
+
     os.environ["LTX2_FULL_FT_OFFLOAD_TRAINABLE_SWAP"] = "1"
     ft_swap_mode = str(getattr(args, "ltx2_finetune_block_swap_mode", "default") or "default").lower()
     raw_swap_mask = getattr(args, "ltx2_finetune_block_swap_mask", "all")
@@ -3272,7 +3423,12 @@ def main() -> None:
     blocks_to_swap = int(getattr(args, "blocks_to_swap", 0) or 0)
     trainer.blocks_to_swap = blocks_to_swap
     remote_prune_local_blocks = ltx2_remote_stage and bool(getattr(args, "ltx2_remote_stage_prune_local_blocks", False))
-    loading_device = "cpu" if blocks_to_swap > 0 or ltx2_model_parallel or remote_prune_local_blocks else accelerator.device
+    qgalore_cpu_load = bool(getattr(args, "qgalore_full_ft", False)) and bool(getattr(args, "qgalore_load_on_cpu", True))
+    loading_device = (
+        "cpu" if blocks_to_swap > 0 or ltx2_model_parallel or remote_prune_local_blocks or qgalore_cpu_load else accelerator.device
+    )
+    if qgalore_cpu_load:
+        logger.info("Q-GaLore CPU load enabled: load/replace/quantize transformer on CPU before moving to %s", accelerator.device)
 
     if args.sdpa:
         attn_mode = "torch"
@@ -3297,6 +3453,32 @@ def main() -> None:
 
     transformer.train()
     transformer.requires_grad_(True)
+    qgalore_summary = None
+    if bool(getattr(args, "qgalore_full_ft", False)):
+        from musubi_tuner.optimizers.q_galore import replace_ltx2_linear_with_qgalore
+
+        qgalore_summary = replace_ltx2_linear_with_qgalore(
+            transformer,
+            targets=getattr(args, "qgalore_targets", "video"),
+            weight_bits=int(getattr(args, "qgalore_weight_bits", 8) or 8),
+            weight_group_size=int(getattr(args, "qgalore_weight_group_size", 256) or 256),
+            stochastic_round=bool(getattr(args, "qgalore_stochastic_round", True)),
+            min_weight_numel=int(getattr(args, "qgalore_min_weight_numel", 16384) or 0),
+            max_modules=getattr(args, "qgalore_max_modules", None),
+        )
+        logger.info(
+            "Q-GaLore full-FT: replaced %d Linear weights (%.3fB params) targets=%s skipped_not_target=%d skipped_small=%d skipped_group_size=%d",
+            qgalore_summary.replaced,
+            float(qgalore_summary.replaced_numel) / 1_000_000_000.0,
+            getattr(args, "qgalore_targets", "video"),
+            qgalore_summary.skipped_not_target,
+            qgalore_summary.skipped_small,
+            qgalore_summary.skipped_group_size,
+        )
+        if qgalore_summary.replaced <= 0:
+            raise ValueError(
+                "Q-GaLore full-FT did not replace any Linear modules; check --qgalore_targets and --qgalore_min_weight_numel."
+            )
 
     ltx2_model_parallel_plan = None
     if ltx2_model_parallel:
@@ -3441,6 +3623,12 @@ def main() -> None:
                 _frozen_audio_count,
             )
 
+    qgalore_group_kwargs = None
+    if bool(getattr(args, "qgalore_full_ft", False)):
+        from musubi_tuner.optimizers.q_galore import qgalore_group_kwargs_from_args
+
+        qgalore_group_kwargs = qgalore_group_kwargs_from_args(args)
+
     params_to_optimize, param_names, ft_group_stats = _build_full_ft_param_groups(
         transformer,
         args.learning_rate,
@@ -3450,6 +3638,7 @@ def main() -> None:
         non_block_lr_scale=float(getattr(args, "non_block_lr_scale", 1.0) or 0.0),
         attn_geometry_lr_scale=float(getattr(args, "attn_geometry_lr_scale", 1.0) or 0.0),
         freeze_attn_geometry=bool(getattr(args, "freeze_attn_geometry", False)),
+        qgalore_group_kwargs=qgalore_group_kwargs,
     )
 
     # Audio param LR scale: post-process param_groups to extract audio_* params
@@ -3574,6 +3763,24 @@ def main() -> None:
         ft_group_stats["num_lr_groups"],
         ft_group_stats["lr_scales"],
     )
+    if bool(getattr(args, "qgalore_full_ft", False)):
+        logger.info(
+            "Q-GaLore optimizer groups: tensors=%d params=%.3fB groups=%d scales=%s rank=%d gap=%d scale=%g",
+            int(ft_group_stats.get("qgalore_param_count", 0)),
+            float(ft_group_stats.get("qgalore_param_numel", 0)) / 1_000_000_000.0,
+            int(ft_group_stats.get("num_qgalore_lr_groups", 0)),
+            ft_group_stats.get("qgalore_lr_scales", []),
+            int(getattr(args, "qgalore_rank", 256)),
+            int(getattr(args, "qgalore_update_proj_gap", 200)),
+            float(getattr(args, "qgalore_scale", 0.25)),
+        )
+        logger.info(
+            "Q-GaLore projection: svd_method=%s oversampling=%d niter=%d proj_quant=%s",
+            str(getattr(args, "qgalore_svd_method", "full")),
+            int(getattr(args, "qgalore_svd_oversampling", 32)),
+            int(getattr(args, "qgalore_svd_niter", 1)),
+            bool(getattr(args, "qgalore_proj_quant", True)),
+        )
     if ft_group_stats["frozen_blocks"]:
         logger.info("Full-FT frozen blocks: %s", ft_group_stats["frozen_blocks"])
     if ft_group_stats["block_lr_rules"]:
@@ -3816,8 +4023,15 @@ def main() -> None:
                     patch_optimi_fused_step_param,
                     patch_torchao_fused_step_param,
                 )
+                from musubi_tuner.optimizers.q_galore import is_qgalore_optimizer_instance
 
-                if is_torchao_optimizer_instance(base_optimizer):
+                if is_qgalore_optimizer_instance(base_optimizer):
+                    if args.max_grad_norm != 0.0:
+                        raise ValueError("Q-GaLore fused backward requires --max_grad_norm 0")
+                    if not _attach_fused_step_param(optimizer, base_optimizer):
+                        raise ValueError("Q-GaLore fused backward pass requires optimizer.step_param support")
+                    logger.info("%s fused backward pass enabled.", base_optimizer.__class__.__name__)
+                elif is_torchao_optimizer_instance(base_optimizer):
                     if not patch_torchao_fused_step_param(base_optimizer) or not _attach_fused_step_param(
                         optimizer, base_optimizer
                     ):
@@ -3860,7 +4074,7 @@ def main() -> None:
                     logger.info("%s fused backward pass enabled.", base_optimizer.__class__.__name__)
                 else:
                     raise ValueError(
-                        f"--fused_backward_pass requires Adafactor, CAME/CAME8bit, SinkSGD, torchao Adam, "
+                        f"--fused_backward_pass requires Adafactor, CAME/CAME8bit, SinkSGD, Q-GaLore, torchao Adam, "
                         f"torch-optimi, or BAdam with badam_use_gradient_release=True; "
                         f"got {base_optimizer.__class__.__name__}"
                     )
@@ -3878,10 +4092,12 @@ def main() -> None:
                 "hook_stepped": False,
                 "hooks_step_enabled": hooks_step_enabled,
             }
+            from musubi_tuner.optimizers.q_galore import is_qgalore_parameter
 
             for param_group, param_name_group in zip(optimizer.param_groups, param_names):
                 for parameter, param_name in zip(param_group["params"], param_name_group):
-                    if parameter.requires_grad:
+                    is_qgalore_weight = is_qgalore_parameter(parameter)
+                    if parameter.requires_grad or is_qgalore_weight:
 
                         def create_grad_hook(p_name, p_group):
                             def grad_hook(tensor: torch.Tensor):
@@ -3899,7 +4115,10 @@ def main() -> None:
 
                             return grad_hook
 
-                        parameter.register_post_accumulate_grad_hook(create_grad_hook(param_name, param_group))
+                        if is_qgalore_weight:
+                            parameter.backward_hook = create_grad_hook(param_name, param_group)
+                        else:
+                            parameter.register_post_accumulate_grad_hook(create_grad_hook(param_name, param_group))
 
     # scheduler
     noise_scheduler = FlowMatchDiscreteScheduler(shift=args.discrete_flow_shift, reverse=True, solver="euler")
@@ -3931,6 +4150,20 @@ def main() -> None:
         "ss_fp8_base": bool(getattr(args, "fp8_base", False)),
         "ss_full_fp16": bool(getattr(args, "full_fp16", False)),
         "ss_full_bf16": bool(getattr(args, "full_bf16", False)),
+        "ss_qgalore_full_ft": bool(getattr(args, "qgalore_full_ft", False)),
+        "ss_qgalore_targets": getattr(args, "qgalore_targets", None),
+        "ss_qgalore_rank": getattr(args, "qgalore_rank", None),
+        "ss_qgalore_update_proj_gap": getattr(args, "qgalore_update_proj_gap", None),
+        "ss_qgalore_scale": getattr(args, "qgalore_scale", None),
+        "ss_qgalore_proj_quant": bool(getattr(args, "qgalore_proj_quant", False)),
+        "ss_qgalore_proj_bits": getattr(args, "qgalore_proj_bits", None),
+        "ss_qgalore_load_on_cpu": bool(getattr(args, "qgalore_load_on_cpu", True)),
+        "ss_qgalore_svd_method": getattr(args, "qgalore_svd_method", None),
+        "ss_qgalore_svd_oversampling": getattr(args, "qgalore_svd_oversampling", None),
+        "ss_qgalore_svd_niter": getattr(args, "qgalore_svd_niter", None),
+        "ss_qgalore_weight_group_size": getattr(args, "qgalore_weight_group_size", None),
+        "ss_qgalore_replaced_modules": getattr(qgalore_summary, "replaced", 0) if qgalore_summary is not None else 0,
+        "ss_qgalore_replaced_numel": getattr(qgalore_summary, "replaced_numel", 0) if qgalore_summary is not None else 0,
         "ss_weighting_scheme": args.weighting_scheme,
         "ss_logit_mean": args.logit_mean,
         "ss_logit_std": args.logit_std,
@@ -4129,6 +4362,8 @@ def main() -> None:
             "setup/image_prior_ft": float(bool(getattr(args, "image_prior_ft", False))),
             "setup/image_prior_ft_motion_param_count": float(ft_group_stats.get("image_prior_ft_motion_param_count", 0)),
             "setup/image_prior_ft_appearance_param_count": float(ft_group_stats.get("image_prior_ft_appearance_param_count", 0)),
+            "setup/qgalore_param_count": float(ft_group_stats.get("qgalore_param_count", 0)),
+            "setup/qgalore_param_numel": float(ft_group_stats.get("qgalore_param_numel", 0)),
         }
         for i, scale in enumerate(ft_group_stats.get("lr_scales", [])):
             setup_logs[f"setup/lr_scale/group_{i}"] = float(scale)
@@ -4196,6 +4431,10 @@ def main() -> None:
                 state_dict[f"text_encoder.{name}"] = param.data
             for name, buf in text_encoder_ref.named_buffers():
                 state_dict[f"text_encoder.{name}"] = buf
+        if bool(getattr(args, "qgalore_full_ft", False)) and bool(getattr(args, "qgalore_dequantize_save", True)):
+            from musubi_tuner.optimizers.q_galore import dequantize_qgalore_state_dict
+
+            state_dict = dequantize_qgalore_state_dict(save_model_ref, state_dict)
         state_dict, extra_meta = _prepare_state_dict_for_save(state_dict, args)
         if extra_meta:
             metadata_to_save.update(extra_meta)
