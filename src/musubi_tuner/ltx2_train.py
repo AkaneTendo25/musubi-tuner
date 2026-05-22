@@ -1741,6 +1741,44 @@ def _extract_transformer_block_index(param_name: str) -> Optional[int]:
     return int(match.group(1))
 
 
+def _format_int_ranges(values: list[int]) -> str:
+    if not values:
+        return "none"
+
+    ranges: list[str] = []
+    start = prev = values[0]
+    for value in values[1:]:
+        if value == prev + 1:
+            prev = value
+            continue
+        ranges.append(str(start) if start == prev else f"{start}-{prev}")
+        start = prev = value
+    ranges.append(str(start) if start == prev else f"{start}-{prev}")
+    return ",".join(ranges)
+
+
+def _summarize_qgalore_replacement_coverage(replaced_names: list[str] | None) -> dict[str, Any]:
+    by_block: dict[int, int] = {}
+    non_block = 0
+    for name in replaced_names or []:
+        block_index = _extract_transformer_block_index(name)
+        if block_index is None:
+            non_block += 1
+            continue
+        by_block[block_index] = by_block.get(block_index, 0) + 1
+
+    touched_blocks = sorted(by_block)
+    per_block_counts = list(by_block.values())
+    return {
+        "touched_blocks": touched_blocks,
+        "touched_block_count": len(touched_blocks),
+        "touched_block_ranges": _format_int_ranges(touched_blocks),
+        "per_block_min": min(per_block_counts) if per_block_counts else 0,
+        "per_block_max": max(per_block_counts) if per_block_counts else 0,
+        "non_block": non_block,
+    }
+
+
 def _resolve_block_lr_scale(block_index: int, rules: list[tuple[int, Optional[int], float]]) -> Optional[float]:
     for start, end, scale in rules:
         if end is None:
@@ -3475,6 +3513,15 @@ def main() -> None:
             qgalore_summary.skipped_small,
             qgalore_summary.skipped_group_size,
         )
+        qgalore_coverage = _summarize_qgalore_replacement_coverage(qgalore_summary.replaced_names)
+        logger.info(
+            "Q-GaLore full-FT coverage: touched_blocks=%d ranges=%s linears_per_touched_block=%d-%d non_block_linears=%d",
+            qgalore_coverage["touched_block_count"],
+            qgalore_coverage["touched_block_ranges"],
+            qgalore_coverage["per_block_min"],
+            qgalore_coverage["per_block_max"],
+            qgalore_coverage["non_block"],
+        )
         if qgalore_summary.replaced <= 0:
             raise ValueError(
                 "Q-GaLore full-FT did not replace any Linear modules; check --qgalore_targets and --qgalore_min_weight_numel."
@@ -3849,6 +3896,8 @@ def main() -> None:
             ("reset_state_on_switch", True),
             ("use_gradient_release", False),
             ("bread_sgd", False),
+            ("bread_sgd_mode", "all"),
+            ("bread_sgd_window_blocks", 0),
             ("bread_sgd_lr_scale", 1.0),
             ("bread_sgd_use_sign", False),
             ("allow_distributed", False),

@@ -14,7 +14,6 @@ from __future__ import annotations
 import random
 import re
 import warnings
-from collections import defaultdict
 from typing import Any, Iterable, Sequence
 
 import torch
@@ -131,9 +130,7 @@ def infer_transformer_block_prefixes(
                 continue
             remainder.append(name)
         prefixes = [(prefix,) for prefix in embed_prefixes.values()]
-        prefixes.extend(
-            (prefixes_by_index[index],) for index in sorted(prefixes_by_index)
-        )
+        prefixes.extend((prefixes_by_index[index],) for index in sorted(prefixes_by_index))
         if include_lm_head and remainder:
             prefixes.append(tuple(remainder))
 
@@ -172,6 +169,8 @@ class BlockOptimizer(torch.optim.Optimizer):
         purge_inactive_state: bool = True,
         reset_state_on_switch: bool = True,
         bread_sgd_enabled: bool = False,
+        bread_sgd_mode: str = "all",
+        bread_sgd_window_blocks: int = 0,
         bread_sgd_lr_scale: float = 1.0,
         bread_sgd_use_sign: bool = False,
         verbose: int = 1,
@@ -209,9 +208,25 @@ class BlockOptimizer(torch.optim.Optimizer):
         self._gr_fused_step_state: dict[str, Any] | None = None
         self._gr_hook_handles: list[Any] = []
         self.bread_sgd_enabled = bool(bread_sgd_enabled)
+        self.bread_sgd_mode = str(bread_sgd_mode).lower()
+        self.bread_sgd_window_blocks = int(bread_sgd_window_blocks)
         self.bread_sgd_lr_scale = float(bread_sgd_lr_scale)
         self.bread_sgd_use_sign = bool(bread_sgd_use_sign)
+        if not self.bread_sgd_enabled:
+            self.bread_sgd_mode = "disabled"
+        if self.bread_sgd_mode in {"off", "false", "0", "none"}:
+            self.bread_sgd_mode = "disabled"
+        if self.bread_sgd_mode in {"true", "1", "on", "enabled"}:
+            self.bread_sgd_mode = "all"
+        if self.bread_sgd_mode not in {"disabled", "all", "partial", "window"}:
+            raise ValueError("bread_sgd_mode must be disabled, all, partial, or window")
+        if self.bread_sgd_window_blocks < 0:
+            raise ValueError("bread_sgd_window_blocks must be >= 0")
+        if self.bread_sgd_mode == "window" and self.bread_sgd_window_blocks < 1:
+            raise ValueError("bread_sgd_window_blocks must be >= 1 when bread_sgd_mode=window")
         self._bread_sgd_hook_handles: list[Any] = []
+        self._bread_sgd_param_ids: set[int] = set()
+        self._source_group_by_param_id: dict[int, dict[str, Any]] = {}
 
         fp32_params = [name for name, param in self.named_parameters_list if param.dtype == torch.float32]
         if fp32_params and self.use_fp32_active_copy:
@@ -224,9 +239,7 @@ class BlockOptimizer(torch.optim.Optimizer):
 
         if start_block is not None:
             if start_block >= len(self.block_prefixes):
-                raise ValueError(
-                    f"start_block={start_block} is outside {len(self.block_prefixes)} BAdam blocks"
-                )
+                raise ValueError(f"start_block={start_block} is outside {len(self.block_prefixes)} BAdam blocks")
             self.current_block_idx = int(start_block)
         elif self.switch_mode == "descending":
             self.current_block_idx = len(self.block_prefixes) - 1
@@ -239,6 +252,7 @@ class BlockOptimizer(torch.optim.Optimizer):
         self.param_groups = base_optimizer.param_groups
         self.defaults = base_optimizer.defaults
         self.state = base_optimizer.state
+        self._source_group_by_param_id = self._build_source_group_lookup()
 
         self.switch_trainable_params(advance=False)
 
@@ -288,6 +302,40 @@ class BlockOptimizer(torch.optim.Optimizer):
             return True
         return self.include_non_block and id(param) not in self._block_managed_param_ids
 
+    def _build_source_group_lookup(self) -> dict[int, dict[str, Any]]:
+        lookup: dict[int, dict[str, Any]] = {}
+        for group in self.param_groups:
+            for param in group.get("params", []):
+                if isinstance(param, torch.nn.Parameter):
+                    lookup[id(param)] = group
+        return lookup
+
+    def _select_bread_sgd_param_ids(
+        self,
+        active_status: Sequence[tuple[str, torch.nn.Parameter, bool]],
+    ) -> set[int]:
+        """Select inactive parameters that receive BREAD's lightweight SGD update."""
+        if not self.bread_sgd_enabled or self.bread_sgd_mode == "disabled":
+            return set()
+
+        if self.bread_sgd_mode == "all":
+            return {id(param) for _name, param, is_active in active_status if not is_active}
+
+        start = self.current_block_idx + 1
+        stop = len(self.block_prefixes)
+        if self.bread_sgd_mode == "window":
+            stop = min(stop, start + self.bread_sgd_window_blocks)
+        elif self.bread_sgd_window_blocks > 0:
+            stop = min(stop, start + self.bread_sgd_window_blocks)
+        if start >= stop:
+            return set()
+
+        correction_prefixes = tuple(prefix for group in self.block_prefixes[start:stop] for prefix in group)
+        if not correction_prefixes:
+            return set()
+
+        return {id(param) for name, param, is_active in active_status if not is_active and _matches_any(name, correction_prefixes)}
+
     def switch_trainable_params(self, *, advance: bool = True) -> None:
         if advance:
             self._advance_block_idx()
@@ -296,24 +344,30 @@ class BlockOptimizer(torch.optim.Optimizer):
         active_ids: set[int] = set()
         active_names: list[str] = []
         inactive_count = 0
+        active_status: list[tuple[str, torch.nn.Parameter, bool]] = []
 
         for name, param in self.named_parameters_list:
             is_active = self._is_always_active(name, param) or _matches_any(
                 name,
                 active_prefixes,
             )
-            # BREAD-SGD keeps requires_grad on inactive params so backward computes
-            # their grads, then a post-accumulate hook applies a cheap SGD update.
-            param.requires_grad_(is_active or self.bread_sgd_enabled)
+            active_status.append((name, param, is_active))
             if is_active:
                 active_ids.add(id(param))
                 if self.verbose >= 2:
                     active_names.append(name)
-            else:
+
+        self._bread_sgd_param_ids = self._select_bread_sgd_param_ids(active_status)
+
+        for name, param, is_active in active_status:
+            has_bread_sgd = id(param) in self._bread_sgd_param_ids
+            param.requires_grad_(is_active or has_bread_sgd)
+            if not is_active:
                 inactive_count += 1
+            if not is_active and not has_bread_sgd:
                 param.grad = None
-                if self.purge_inactive_state:
-                    self.base_optimizer.state.pop(param, None)
+            if not is_active and self.purge_inactive_state:
+                self.base_optimizer.state.pop(param, None)
 
         self._active_param_ids = active_ids
 
@@ -326,18 +380,19 @@ class BlockOptimizer(torch.optim.Optimizer):
 
         if self._gradient_release_enabled:
             self._refresh_gradient_release_hooks()
-        if self.bread_sgd_enabled:
+        if self.bread_sgd_enabled and self.bread_sgd_mode != "disabled":
             self._refresh_bread_sgd_hooks()
 
         if self.verbose >= 1:
             self._log(
                 "info",
-                "BAdam active block %d/%d prefixes=%s active_params=%d inactive_params=%d",
+                "BAdam active block %d/%d prefixes=%s active_params=%d inactive_params=%d bread_sgd_params=%d",
                 self.current_block_idx,
                 len(self.block_prefixes),
                 list(active_prefixes),
                 len(active_ids),
                 inactive_count,
+                len(self._bread_sgd_param_ids),
             )
         if active_names:
             self._log("info", "BAdam active parameter names: %s", active_names)
@@ -435,6 +490,8 @@ class BlockOptimizer(torch.optim.Optimizer):
         self._gr_max_grad_norm = float(max_grad_norm or 0.0)
         self._gr_fused_step_state = fused_step_state
         self._refresh_gradient_release_hooks()
+        if self.bread_sgd_enabled and self.bread_sgd_mode != "disabled":
+            self._refresh_bread_sgd_hooks()
         if self.verbose >= 1:
             self._log(
                 "info",
@@ -456,9 +513,7 @@ class BlockOptimizer(torch.optim.Optimizer):
             return
         self._unregister_gradient_release_hooks()
         for lp_param, hp_param in self._lp_to_hp.items():
-            handle = lp_param.register_post_accumulate_grad_hook(
-                self._make_grad_release_hook(lp_param, hp_param)
-            )
+            handle = lp_param.register_post_accumulate_grad_hook(self._make_grad_release_hook(lp_param, hp_param))
             self._gr_hook_handles.append(handle)
 
     def _unregister_bread_sgd_hooks(self) -> None:
@@ -470,7 +525,7 @@ class BlockOptimizer(torch.optim.Optimizer):
         self._bread_sgd_hook_handles = []
 
     def _refresh_bread_sgd_hooks(self) -> None:
-        """Register cheap SGD hook on every inactive param.
+        """Register cheap SGD hooks on selected inactive params.
 
         Implements BREAD's "landscape correction" idea (Luo et al. 2025): when a
         block is frozen, applying a small on-the-fly SGD update during the same
@@ -478,29 +533,29 @@ class BlockOptimizer(torch.optim.Optimizer):
         current optimum. Updates use the wrapper's current LR scaled by
         bread_sgd_lr_scale; grads are released immediately after the update.
         """
-        if not self.bread_sgd_enabled:
+        if not self.bread_sgd_enabled or self.bread_sgd_mode == "disabled":
             return
         self._unregister_bread_sgd_hooks()
         for name, param in self.named_parameters_list:
-            if id(param) in self._active_param_ids:
+            if id(param) not in self._bread_sgd_param_ids:
                 continue
-            handle = param.register_post_accumulate_grad_hook(
-                self._make_bread_sgd_hook()
-            )
+            handle = param.register_post_accumulate_grad_hook(self._make_bread_sgd_hook(param))
             self._bread_sgd_hook_handles.append(handle)
 
-    def _make_bread_sgd_hook(self):
+    def _make_bread_sgd_hook(self, param: torch.nn.Parameter):
         def hook(p: torch.Tensor) -> None:
             if p.grad is None:
                 return
-            lr = float(self.param_groups[0].get("lr", 0.0)) * self.bread_sgd_lr_scale
+            group = self._source_group_by_param_id.get(id(param), self.param_groups[0])
+            lr = float(group.get("lr", 0.0)) * self.bread_sgd_lr_scale
             if lr == 0.0:
                 p.grad = None
                 return
-            if self.bread_sgd_use_sign:
-                p.data.add_(p.grad.data.sign(), alpha=-lr)
-            else:
-                p.data.add_(p.grad.data, alpha=-lr)
+            with torch.no_grad():
+                if self.bread_sgd_use_sign:
+                    p.add_(p.grad.detach().sign(), alpha=-lr)
+                else:
+                    p.add_(p.grad.detach(), alpha=-lr)
             p.grad = None
 
         return hook
@@ -522,9 +577,7 @@ class BlockOptimizer(torch.optim.Optimizer):
             if not sync:
                 return
             fss = self._gr_fused_step_state
-            if fss is not None and (
-                bool(fss.get("defer_step")) or bool(fss.get("suspend_step"))
-            ):
+            if fss is not None and (bool(fss.get("defer_step")) or bool(fss.get("suspend_step"))):
                 return
             self._step_single_hp_param(hp_param)
             lp_param.data.copy_(hp_param.detach().to(lp_param.dtype))
@@ -633,15 +686,11 @@ class BlockOptimizer(torch.optim.Optimizer):
 
         if isinstance(badam_state, dict):
             self.global_step = int(badam_state.get("global_step", self.global_step))
-            current_block_idx = int(
-                badam_state.get("current_block_idx", self.current_block_idx)
-            )
+            current_block_idx = int(badam_state.get("current_block_idx", self.current_block_idx))
             if 0 <= current_block_idx < len(self.block_prefixes):
                 self.current_block_idx = current_block_idx
             random_order = badam_state.get("random_order", [])
-            if isinstance(random_order, list) and all(
-                isinstance(item, int) for item in random_order
-            ):
+            if isinstance(random_order, list) and all(isinstance(item, int) for item in random_order):
                 self._random_order = list(random_order)
         self.switch_trainable_params(advance=False)
         self.base_optimizer.load_state_dict(state_dict)
@@ -670,11 +719,7 @@ def create_badam_optimizer(
 
     flat_trainable = flatten_optimizer_params(list(trainable_params))
     trainable_ids = {id(param) for param in flat_trainable}
-    named_parameters = [
-        (name, param)
-        for name, param in transformer.named_parameters()
-        if id(param) in trainable_ids
-    ]
+    named_parameters = [(name, param) for name, param in transformer.named_parameters() if id(param) in trainable_ids]
 
     matched_ids = {id(param) for _name, param in named_parameters}
     unmatched_count = len(trainable_ids - matched_ids)
@@ -688,28 +733,20 @@ def create_badam_optimizer(
         )
     if unmatched_count and logger is not None:
         logger.warning(
-            "BAdam: %d trainable parameter(s) are not named by the transformer and "
-            "will remain always active with synthetic names.",
+            "BAdam: %d trainable parameter(s) are not named by the transformer and will remain always active with synthetic names.",
             unmatched_count,
         )
     if unmatched_count and allow_unmatched:
         matched_ids = {id(param) for _name, param in named_parameters}
-        unmatched_params = [
-            param for param in flat_trainable if id(param) not in matched_ids
-        ]
-        named_parameters.extend(
-            (f"badam_unmatched.{index}", param)
-            for index, param in enumerate(unmatched_params)
-        )
+        unmatched_params = [param for param in flat_trainable if id(param) not in matched_ids]
+        named_parameters.extend((f"badam_unmatched.{index}", param) for index, param in enumerate(unmatched_params))
     if not named_parameters:
         raise ValueError(
             "BAdam found no trainable transformer parameters. It is intended for "
             "full or partial transformer fine-tuning, not pure LoRA parameter sets."
         )
 
-    configured_prefixes = normalize_block_prefixes(
-        getattr(args, "badam_block_prefixes", []) or []
-    )
+    configured_prefixes = normalize_block_prefixes(getattr(args, "badam_block_prefixes", []) or [])
     prefix_mode = str(getattr(args, "badam_block_prefix_mode", "transformer_blocks")).lower()
     if configured_prefixes:
         block_prefixes = configured_prefixes
@@ -723,8 +760,7 @@ def create_badam_optimizer(
         block_prefixes = []
     if not block_prefixes:
         raise ValueError(
-            "BAdam could not infer any transformer block prefixes from trainable "
-            "parameters. Set badam_block_prefixes explicitly."
+            "BAdam could not infer any transformer block prefixes from trainable parameters. Set badam_block_prefixes explicitly."
         )
 
     wrapper = BlockOptimizer(
@@ -735,14 +771,15 @@ def create_badam_optimizer(
         switch_mode=str(getattr(args, "badam_switch_mode", "random")).lower(),
         start_block=getattr(args, "badam_start_block", None),
         always_active_prefixes=(
-            list(getattr(args, "badam_always_active_prefixes", []) or [])
-            + list(getattr(args, "badam_active_modules", []) or [])
+            list(getattr(args, "badam_always_active_prefixes", []) or []) + list(getattr(args, "badam_active_modules", []) or [])
         ),
         include_non_block=bool(getattr(args, "badam_include_non_block", True)),
         use_fp32_active_copy=bool(getattr(args, "badam_use_fp32_active_copy", True)),
         purge_inactive_state=bool(getattr(args, "badam_purge_inactive_state", True)),
         reset_state_on_switch=bool(getattr(args, "badam_reset_state_on_switch", True)),
         bread_sgd_enabled=bool(getattr(args, "badam_bread_sgd", False)),
+        bread_sgd_mode=str(getattr(args, "badam_bread_sgd_mode", "all")).lower(),
+        bread_sgd_window_blocks=int(getattr(args, "badam_bread_sgd_window_blocks", 0)),
         bread_sgd_lr_scale=float(getattr(args, "badam_bread_sgd_lr_scale", 1.0)),
         bread_sgd_use_sign=bool(getattr(args, "badam_bread_sgd_use_sign", False)),
         verbose=int(getattr(args, "badam_verbose", 1)),
@@ -755,6 +792,6 @@ def create_badam_optimizer(
             len(block_prefixes),
             wrapper.switch_block_every,
             wrapper.switch_mode,
-            "on" if wrapper.bread_sgd_enabled else "off",
+            wrapper.bread_sgd_mode if wrapper.bread_sgd_enabled else "off",
         )
     return wrapper
