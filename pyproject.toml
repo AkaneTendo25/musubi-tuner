@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "accelerate==1.6.0",
+    "apollo-torch==1.0.3",
     "av==14.0.1",
     "bitsandbytes",
     "diffusers==0.32.1",
@@ -13,10 +14,13 @@ dependencies = [
     "huggingface-hub==0.34.3",
     "opencv-python==4.10.0.84",
     "pillow>=11.3.0",
+    "prodigy-plus-schedule-free==2.0.1",
     "safetensors>=0.4.5",
     # "sageattention>=1.0.6",
+    "schedulefree==1.4.1",
     "toml==0.10.2",
     "tqdm==4.67.1",
+    "torch-optimi==0.3.3",
     "transformers==4.56.1",
     "voluptuous==0.15.2",
     # Wan2.1
@@ -30,14 +34,17 @@ dependencies = [
 cu124 = [
     "torch>=2.5.1",
     "torchvision>=0.20.1",
+    "torchaudio>=2.5.1",
 ]
 cu128 = [
     "torch>=2.7.1",
     "torchvision>=0.22.1",
+    "torchaudio>=2.7.1",
 ]
 cu130 = [
     "torch>=2.9.1",
     "torchvision>=0.24.1",
+    "torchaudio>=2.9.1",
 ]
 gui = [
     "gradio>=4.0.0, <6.0.0",
@@ -79,6 +86,11 @@ torch = [
   { index = "pytorch-cu130", extra = "cu130" },
 ]
 torchvision = [
+  { index = "pytorch-cu124", extra = "cu124" },
+  { index = "pytorch-cu128", extra = "cu128" },
+  { index = "pytorch-cu130", extra = "cu130" },
+]
+torchaudio = [
   { index = "pytorch-cu124", extra = "cu124" },
   { index = "pytorch-cu128", extra = "cu128" },
   { index = "pytorch-cu130", extra = "cu130" },
