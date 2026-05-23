@@ -12,6 +12,8 @@ import torch.nn.functional as F
 from torch import Tensor
 from torch.nn import Parameter
 
+from musubi_tuner.utils.safetensors_utils import LazyTensorForSave
+
 try:
     from bitsandbytes.optim.optimizer import Optimizer2State
     import bitsandbytes.functional as bnb_F
@@ -354,14 +356,26 @@ class QGaLoreLinear(nn.Module):
         return QGaLoreLinearFunction.apply(input, self.weight, self.bias)
 
     @torch.no_grad()
-    def dequantized_weight(self, dtype: torch.dtype | None = None) -> torch.Tensor:
+    def dequantized_weight(
+        self,
+        dtype: torch.dtype | None = None,
+        *,
+        device: torch.device | str | None = None,
+    ) -> torch.Tensor:
         self._refresh_weight_attrs()
+        weight = self.weight
+        scales = self.scales
+        zeros = self.zeros
+        if device is not None:
+            weight = weight.to(device=device)
+            scales = scales.to(device=device)
+            zeros = zeros.to(device=device)
         return _dequantize_affine_uint(
-            self.weight,
+            weight,
             dtype=dtype or self.compute_dtype,
             group_size=self.group_size,
-            scales=self.scales,
-            zeros=self.zeros,
+            scales=scales,
+            zeros=zeros,
         )
 
 
@@ -479,12 +493,25 @@ def dequantize_qgalore_state_dict(
     state_dict: dict[str, torch.Tensor],
     *,
     dtype: torch.dtype | None = None,
+    lazy: bool = False,
+    device: torch.device | str | None = None,
 ) -> dict[str, torch.Tensor]:
     for module_name, module in model.named_modules():
         if not isinstance(module, QGaLoreLinear):
             continue
         weight_key = f"{module_name}.weight"
-        state_dict[weight_key] = module.dequantized_weight(dtype=dtype)
+        target_dtype = dtype or module.compute_dtype
+        if lazy:
+            state_dict[weight_key] = LazyTensorForSave(
+                shape=tuple(module.weight.shape),
+                dtype=target_dtype,
+                materialize_fn=lambda module=module, target_dtype=target_dtype: module.dequantized_weight(
+                    dtype=target_dtype,
+                    device=device,
+                ),
+            )
+        else:
+            state_dict[weight_key] = module.dequantized_weight(dtype=target_dtype)
         state_dict.pop(f"{module_name}.scales", None)
         state_dict.pop(f"{module_name}.zeros", None)
     return state_dict

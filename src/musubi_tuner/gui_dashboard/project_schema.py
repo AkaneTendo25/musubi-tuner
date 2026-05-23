@@ -702,6 +702,16 @@ class FullFinetuneConfig(TrainingConfig):
     qgalore_svd_oversampling: int = 32
     qgalore_svd_niter: int = 1
     qgalore_dequantize_save: bool = True
+    qgalore_streaming_dequantize_save: bool = False
+    qgalore_streaming_dequantize_device: Literal["cpu", "cuda"] = "cpu"
+
+    # APOLLO full fine-tune.
+    apollo_rank: int = 256
+    apollo_update_proj_gap: int = 200
+    apollo_scale: float = 1.0
+    apollo_proj: Literal["random", "svd"] = "random"
+    apollo_proj_type: Literal["std", "reverse_std", "left", "right"] = "std"
+    apollo_scale_type: Literal["channel", "tensor"] = "channel"
 
     # Full fine-tune-only controls.
     ltx2_finetune_block_swap_mode: Literal["default", "linear", "full"] = "default"

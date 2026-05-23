@@ -1,4 +1,6 @@
 from dataclasses import dataclass
+import gc
+import math
 import os
 import re
 import tempfile
@@ -6,7 +8,7 @@ import numpy as np
 import torch
 import json
 import struct
-from typing import Dict, Any, Union, Optional
+from typing import Callable, Dict, Any, Union, Optional
 
 from safetensors.torch import load_file, save_file
 
@@ -55,8 +57,69 @@ def atomic_torch_save(obj: Any, filename: str) -> None:
         raise
 
 
+@dataclass
+class LazyTensorForSave:
+    """Tensor descriptor materialized only when the safetensors writer reaches it."""
+
+    shape: tuple[int, ...]
+    dtype: torch.dtype
+    materialize_fn: Callable[[], torch.Tensor]
+
+    def numel(self) -> int:
+        return math.prod(self.shape)
+
+    def element_size(self) -> int:
+        return torch.empty((), dtype=self.dtype).element_size()
+
+    def materialize(self) -> torch.Tensor:
+        tensor = self.materialize_fn()
+        if tuple(tensor.shape) != self.shape:
+            raise ValueError(f"Lazy tensor shape changed during materialization: expected {self.shape}, got {tuple(tensor.shape)}")
+        if tensor.dtype != self.dtype:
+            tensor = tensor.to(dtype=self.dtype)
+        return tensor
+
+    def to(self, *args, **kwargs) -> "LazyTensorForSave":
+        target_dtype = kwargs.get("dtype", None)
+        for arg in args:
+            if isinstance(arg, torch.dtype):
+                target_dtype = arg
+            elif isinstance(arg, torch.Tensor):
+                target_dtype = arg.dtype
+        if target_dtype is None:
+            target_dtype = self.dtype
+
+        def materialize() -> torch.Tensor:
+            return self.materialize().to(*args, **kwargs)
+
+        return LazyTensorForSave(shape=self.shape, dtype=target_dtype, materialize_fn=materialize)
+
+
+def _tensor_numel(tensor: torch.Tensor | LazyTensorForSave) -> int:
+    return tensor.numel() if isinstance(tensor, LazyTensorForSave) else tensor.numel()
+
+
+def _tensor_shape(tensor: torch.Tensor | LazyTensorForSave) -> list[int]:
+    return list(tensor.shape)
+
+
+def _tensor_dtype(tensor: torch.Tensor | LazyTensorForSave) -> torch.dtype:
+    return tensor.dtype
+
+
+def _tensor_element_size(tensor: torch.Tensor | LazyTensorForSave) -> int:
+    return tensor.element_size() if isinstance(tensor, LazyTensorForSave) else tensor.element_size()
+
+
+def _write_tensor_bytes(f, tensor: torch.Tensor) -> None:
+    if tensor.dim() == 0:
+        tensor = tensor.unsqueeze(0)
+    tensor_bytes = tensor.contiguous().view(torch.uint8)
+    tensor_bytes.cpu().numpy().tofile(f)
+
+
 def mem_eff_save_file(
-    tensors: Dict[str, torch.Tensor],
+    tensors: Dict[str, torch.Tensor | LazyTensorForSave],
     filename: str,
     metadata: Dict[str, Any] = None,
     *,
@@ -101,11 +164,11 @@ def mem_eff_save_file(
     if metadata:
         header["__metadata__"] = validate_metadata(metadata)
     for k, v in tensors.items():
-        if v.numel() == 0:  # empty tensor
-            header[k] = {"dtype": _TYPES[v.dtype], "shape": list(v.shape), "data_offsets": [offset, offset]}
+        if _tensor_numel(v) == 0:  # empty tensor
+            header[k] = {"dtype": _TYPES[_tensor_dtype(v)], "shape": _tensor_shape(v), "data_offsets": [offset, offset]}
         else:
-            size = v.numel() * v.element_size()
-            header[k] = {"dtype": _TYPES[v.dtype], "shape": list(v.shape), "data_offsets": [offset, offset + size]}
+            size = _tensor_numel(v) * _tensor_element_size(v)
+            header[k] = {"dtype": _TYPES[_tensor_dtype(v)], "shape": _tensor_shape(v), "data_offsets": [offset, offset + size]}
             offset += size
 
     hjson = json.dumps(header).encode("utf-8")
@@ -119,20 +182,23 @@ def mem_eff_save_file(
             f.write(hjson)
 
             for k, v in tensors.items():
-                if v.numel() == 0:
+                if _tensor_numel(v) == 0:
                     continue
-                if v.is_cuda:
-                    # Direct GPU to disk save
-                    with torch.cuda.device(v.device):
-                        if v.dim() == 0:  # if scalar, need to add a dimension to work with view
-                            v = v.unsqueeze(0)
-                        tensor_bytes = v.contiguous().view(torch.uint8)
-                        tensor_bytes.cpu().numpy().tofile(f)
-                else:
-                    # CPU tensor save
-                    if v.dim() == 0:  # if scalar, need to add a dimension to work with view
-                        v = v.unsqueeze(0)
-                    v.contiguous().view(torch.uint8).numpy().tofile(f)
+                materialized = v.materialize() if isinstance(v, LazyTensorForSave) else v
+                try:
+                    if materialized.is_cuda:
+                        # Direct GPU to disk save
+                        with torch.cuda.device(materialized.device):
+                            _write_tensor_bytes(f, materialized)
+                    else:
+                        # CPU tensor save
+                        _write_tensor_bytes(f, materialized)
+                finally:
+                    if isinstance(v, LazyTensorForSave):
+                        del materialized
+                        gc.collect()
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
         if temp_path is not None:
             os.replace(temp_path, filename)
     except Exception:

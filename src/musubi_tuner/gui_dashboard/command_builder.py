@@ -1758,6 +1758,10 @@ def build_full_finetune_cmd(config: ProjectConfig) -> list[str]:
             cmd.append("--no-qgalore_load_on_cpu")
         if not t.qgalore_dequantize_save:
             cmd.append("--no-qgalore_dequantize_save")
+        if t.qgalore_streaming_dequantize_save:
+            cmd.append("--qgalore_streaming_dequantize_save")
+            if t.qgalore_streaming_dequantize_device != "cpu":
+                cmd += ["--qgalore_streaming_dequantize_device", t.qgalore_streaming_dequantize_device]
         if t.qgalore_cos_threshold != 0.4:
             cmd += ["--qgalore_cos_threshold", str(t.qgalore_cos_threshold)]
         if t.qgalore_gamma_proj != 2.0:
@@ -1770,6 +1774,28 @@ def build_full_finetune_cmd(config: ProjectConfig) -> list[str]:
             cmd += ["--qgalore_svd_oversampling", str(t.qgalore_svd_oversampling)]
         if t.qgalore_svd_niter != 1:
             cmd += ["--qgalore_svd_niter", str(t.qgalore_svd_niter)]
+
+    # APOLLO
+    _optimizer_type = (t.optimizer_type or "").lower()
+    if _optimizer_type in {
+        "apollo",
+        "apollo_adamw",
+        "apolloadamw",
+        "qapollo",
+        "q_apollo",
+        "qapollo_adamw",
+        "qapolloadamw",
+        "q_apollo_adamw",
+    } or _optimizer_type.startswith("apollo_torch."):
+        cmd += ["--apollo_rank", str(t.apollo_rank)]
+        cmd += ["--apollo_update_proj_gap", str(t.apollo_update_proj_gap)]
+        cmd += ["--apollo_scale", str(t.apollo_scale)]
+        if t.apollo_proj != "random":
+            cmd += ["--apollo_proj", t.apollo_proj]
+        if t.apollo_proj_type != "std":
+            cmd += ["--apollo_proj_type", t.apollo_proj_type]
+        if t.apollo_scale_type != "channel":
+            cmd += ["--apollo_scale_type", t.apollo_scale_type]
 
     # Sampling
     if t.sample_every_n_steps:

@@ -1801,6 +1801,7 @@ def _build_full_ft_param_groups(
     freeze_attn_geometry: bool,
     exclude_param_prefixes: Optional[list[str]] = None,
     qgalore_group_kwargs: Optional[dict[str, Any]] = None,
+    apollo_group_kwargs: Optional[dict[str, Any]] = None,
 ) -> tuple[list[dict[str, Any]], list[list[str]], dict[str, Any]]:
     if base_lr <= 0:
         raise ValueError(f"learning_rate must be > 0 for full fine-tune, got {base_lr}")
@@ -1819,10 +1820,14 @@ def _build_full_ft_param_groups(
     grouped_names: dict[float, list[str]] = {}
     qgalore_grouped_params: dict[float, list[torch.nn.Parameter]] = {}
     qgalore_grouped_names: dict[float, list[str]] = {}
+    apollo_grouped_params: dict[float, list[torch.nn.Parameter]] = {}
+    apollo_grouped_names: dict[float, list[str]] = {}
     frozen_param_count = 0
     trainable_param_count = 0
     qgalore_param_count = 0
     qgalore_param_numel = 0
+    apollo_param_count = 0
+    apollo_param_numel = 0
     frozen_attn_geometry_count = 0
     trainable_attn_geometry_count = 0
     trainable_by_block: dict[str, int] = {}
@@ -1875,6 +1880,11 @@ def _build_full_ft_param_groups(
             qgalore_grouped_names.setdefault(scale, []).append(name)
             qgalore_param_count += 1
             qgalore_param_numel += int(param.numel())
+        elif apollo_group_kwargs is not None and param.dim() == 2:
+            apollo_grouped_params.setdefault(scale, []).append(param)
+            apollo_grouped_names.setdefault(scale, []).append(name)
+            apollo_param_count += 1
+            apollo_param_numel += int(param.numel())
         else:
             grouped_params.setdefault(scale, []).append(param)
             grouped_names.setdefault(scale, []).append(name)
@@ -1887,9 +1897,18 @@ def _build_full_ft_param_groups(
 
     # Keep order deterministic by scale value.
     scales = sorted(grouped_params.keys())
+    apollo_scales = sorted(apollo_grouped_params.keys())
     qgalore_scales = sorted(qgalore_grouped_params.keys())
     param_groups = [{"params": grouped_params[s], "lr": base_lr * s} for s in scales]
     param_name_groups = [grouped_names[s] for s in scales]
+    if apollo_grouped_params:
+        if not apollo_group_kwargs:
+            raise ValueError("APOLLO parameters were found, but apollo_group_kwargs was not provided.")
+        for scale in apollo_scales:
+            group = {"params": apollo_grouped_params[scale], "lr": base_lr * scale}
+            group.update(apollo_group_kwargs)
+            param_groups.append(group)
+            param_name_groups.append(apollo_grouped_names[scale])
     if qgalore_grouped_params:
         if not qgalore_group_kwargs:
             raise ValueError("Q-GaLore parameters were found, but qgalore_group_kwargs was not provided.")
@@ -1904,10 +1923,14 @@ def _build_full_ft_param_groups(
         "trainable_param_count": trainable_param_count,
         "qgalore_param_count": qgalore_param_count,
         "qgalore_param_numel": qgalore_param_numel,
-        "num_lr_groups": len(scales) + len(qgalore_scales),
+        "apollo_param_count": apollo_param_count,
+        "apollo_param_numel": apollo_param_numel,
+        "num_lr_groups": len(scales) + len(apollo_scales) + len(qgalore_scales),
+        "apollo_lr_scales": apollo_scales,
         "qgalore_lr_scales": qgalore_scales,
+        "num_apollo_lr_groups": len(apollo_scales),
         "num_qgalore_lr_groups": len(qgalore_scales),
-        "lr_scales": scales + qgalore_scales,
+        "lr_scales": scales + apollo_scales + qgalore_scales,
         "frozen_blocks": sorted(frozen_blocks),
         "block_lr_rules": block_lr_rules,
         "trainable_by_block": trainable_by_block,
@@ -2117,7 +2140,10 @@ def ltx2_finetune_setup_parser(parser: argparse.ArgumentParser) -> argparse.Argu
     parser.add_argument(
         "--fused_backward_pass",
         action="store_true",
-        help="Use fused backward pass for Adafactor, CAME/CAME8bit, SinkSGD, torchao Adam, torch-optimi, or BAdam (with use_gradient_release=True)",
+        help=(
+            "Use fused backward pass for Adafactor, CAME/CAME8bit, SinkSGD, Q-GaLore, APOLLO, "
+            "torchao Adam, torch-optimi, or BAdam (with use_gradient_release=True)"
+        ),
     )
     # BAdam (block-coordinate Adam wrapper).
     # All wrapper kwargs flow through --optimizer_args as key=value entries
@@ -2239,6 +2265,58 @@ def ltx2_finetune_setup_parser(parser: argparse.ArgumentParser) -> argparse.Argu
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Dequantize Q-GaLore Linear weights back to normal checkpoint tensors when saving. Enabled by default.",
+    )
+    parser.add_argument(
+        "--qgalore_streaming_dequantize_save",
+        action="store_true",
+        help=(
+            "When saving a dequantized Q-GaLore/QAPOLLO checkpoint, materialize and write one dequantized Linear "
+            "weight at a time instead of building all dense weights in memory. This reduces save-time VRAM peaks."
+        ),
+    )
+    parser.add_argument(
+        "--qgalore_streaming_dequantize_device",
+        type=str,
+        default="cpu",
+        choices=["cpu", "cuda"],
+        help=(
+            "Device used for each temporary dequantized Q-GaLore save tensor when "
+            "--qgalore_streaming_dequantize_save is enabled. Default: cpu."
+        ),
+    )
+    parser.add_argument("--apollo_rank", type=int, default=256, help="APOLLO low-rank auxiliary optimizer-state rank.")
+    parser.add_argument(
+        "--apollo_update_proj_gap",
+        type=int,
+        default=200,
+        help="APOLLO projection refresh interval in optimizer steps.",
+    )
+    parser.add_argument(
+        "--apollo_scale",
+        type=float,
+        default=1.0,
+        help="APOLLO update scale. Upstream APOLLO uses 1.0 for channel-wise APOLLO.",
+    )
+    parser.add_argument(
+        "--apollo_proj",
+        type=str,
+        default="random",
+        choices=["random", "svd"],
+        help="APOLLO projection source. random is the upstream APOLLO default; svd uses the GaLore projector.",
+    )
+    parser.add_argument(
+        "--apollo_proj_type",
+        type=str,
+        default="std",
+        choices=["std", "reverse_std", "left", "right"],
+        help="APOLLO projection orientation.",
+    )
+    parser.add_argument(
+        "--apollo_scale_type",
+        type=str,
+        default="channel",
+        choices=["channel", "tensor"],
+        help="APOLLO gradient scaling granularity. channel is APOLLO; tensor is APOLLO-Mini style.",
     )
     add_ltx2_model_parallel_args(parser)
     # EMA arguments
@@ -3020,6 +3098,7 @@ def main() -> None:
     args.weighting_scheme = "none"
 
     if bool(getattr(args, "qgalore_full_ft", False)):
+        from musubi_tuner.optimizers.backends import is_qapollo_optimizer_type
         from musubi_tuner.optimizers.q_galore import is_qgalore_optimizer_type
 
         if bool(getattr(args, "fp8_base", False)) or bool(getattr(args, "fp8_scaled", False)):
@@ -3031,8 +3110,8 @@ def main() -> None:
         if not getattr(args, "optimizer_type", None):
             args.optimizer_type = "QGaLoreAdamW8bit"
             logger.info("Q-GaLore full-FT: defaulting --optimizer_type QGaLoreAdamW8bit")
-        elif not is_qgalore_optimizer_type(str(args.optimizer_type)):
-            raise ValueError("--qgalore_full_ft requires --optimizer_type QGaLoreAdamW8bit")
+        elif not (is_qgalore_optimizer_type(str(args.optimizer_type)) or is_qapollo_optimizer_type(str(args.optimizer_type))):
+            raise ValueError("--qgalore_full_ft requires --optimizer_type QGaLoreAdamW8bit or QAPOLLOAdamW")
         if not bool(getattr(args, "fused_backward_pass", False)):
             raise ValueError(
                 "--qgalore_full_ft requires --fused_backward_pass so dense per-layer gradients are stepped and released immediately."
@@ -3041,6 +3120,13 @@ def main() -> None:
             raise ValueError(
                 "Q-GaLore fused backward requires --max_grad_norm 0 because uint8 weight float_grad cannot use global clipping."
             )
+
+    if int(getattr(args, "apollo_rank", 256) or 0) <= 0:
+        raise ValueError("--apollo_rank must be > 0")
+    if int(getattr(args, "apollo_update_proj_gap", 200) or 0) <= 0:
+        raise ValueError("--apollo_update_proj_gap must be > 0")
+    if float(getattr(args, "apollo_scale", 1.0) or 0.0) <= 0.0:
+        raise ValueError("--apollo_scale must be > 0")
 
     os.environ["LTX2_FULL_FT_OFFLOAD_TRAINABLE_SWAP"] = "1"
     ft_swap_mode = str(getattr(args, "ltx2_finetune_block_swap_mode", "default") or "default").lower()
@@ -3670,11 +3756,20 @@ def main() -> None:
                 _frozen_audio_count,
             )
 
+    from musubi_tuner.optimizers.backends import apollo_group_kwargs_from_args, is_apollo_optimizer_type, is_qapollo_optimizer_type
+
+    optimizer_type_for_groups = str(getattr(args, "optimizer_type", "") or "")
+    apollo_group_kwargs = None
+    if is_apollo_optimizer_type(optimizer_type_for_groups):
+        apollo_group_kwargs = apollo_group_kwargs_from_args(args)
+
     qgalore_group_kwargs = None
     if bool(getattr(args, "qgalore_full_ft", False)):
         from musubi_tuner.optimizers.q_galore import qgalore_group_kwargs_from_args
 
-        qgalore_group_kwargs = qgalore_group_kwargs_from_args(args)
+        qgalore_group_kwargs = (
+            apollo_group_kwargs if is_qapollo_optimizer_type(optimizer_type_for_groups) else qgalore_group_kwargs_from_args(args)
+        )
 
     params_to_optimize, param_names, ft_group_stats = _build_full_ft_param_groups(
         transformer,
@@ -3686,6 +3781,7 @@ def main() -> None:
         attn_geometry_lr_scale=float(getattr(args, "attn_geometry_lr_scale", 1.0) or 0.0),
         freeze_attn_geometry=bool(getattr(args, "freeze_attn_geometry", False)),
         qgalore_group_kwargs=qgalore_group_kwargs,
+        apollo_group_kwargs=apollo_group_kwargs,
     )
 
     # Audio param LR scale: post-process param_groups to extract audio_* params
@@ -3811,22 +3907,49 @@ def main() -> None:
         ft_group_stats["lr_scales"],
     )
     if bool(getattr(args, "qgalore_full_ft", False)):
+        if is_qapollo_optimizer_type(optimizer_type_for_groups):
+            logger.info(
+                "QAPOLLO quantized Linear groups: tensors=%d params=%.3fB groups=%d scales=%s rank=%d gap=%d scale=%g proj=%s scale_type=%s",
+                int(ft_group_stats.get("qgalore_param_count", 0)),
+                float(ft_group_stats.get("qgalore_param_numel", 0)) / 1_000_000_000.0,
+                int(ft_group_stats.get("num_qgalore_lr_groups", 0)),
+                ft_group_stats.get("qgalore_lr_scales", []),
+                int(getattr(args, "apollo_rank", 256)),
+                int(getattr(args, "apollo_update_proj_gap", 200)),
+                float(getattr(args, "apollo_scale", 1.0)),
+                str(getattr(args, "apollo_proj", "random")),
+                str(getattr(args, "apollo_scale_type", "channel")),
+            )
+        else:
+            logger.info(
+                "Q-GaLore optimizer groups: tensors=%d params=%.3fB groups=%d scales=%s rank=%d gap=%d scale=%g",
+                int(ft_group_stats.get("qgalore_param_count", 0)),
+                float(ft_group_stats.get("qgalore_param_numel", 0)) / 1_000_000_000.0,
+                int(ft_group_stats.get("num_qgalore_lr_groups", 0)),
+                ft_group_stats.get("qgalore_lr_scales", []),
+                int(getattr(args, "qgalore_rank", 256)),
+                int(getattr(args, "qgalore_update_proj_gap", 200)),
+                float(getattr(args, "qgalore_scale", 0.25)),
+            )
+            logger.info(
+                "Q-GaLore projection: svd_method=%s oversampling=%d niter=%d proj_quant=%s",
+                str(getattr(args, "qgalore_svd_method", "full")),
+                int(getattr(args, "qgalore_svd_oversampling", 32)),
+                int(getattr(args, "qgalore_svd_niter", 1)),
+                bool(getattr(args, "qgalore_proj_quant", True)),
+            )
+    if apollo_group_kwargs is not None:
         logger.info(
-            "Q-GaLore optimizer groups: tensors=%d params=%.3fB groups=%d scales=%s rank=%d gap=%d scale=%g",
-            int(ft_group_stats.get("qgalore_param_count", 0)),
-            float(ft_group_stats.get("qgalore_param_numel", 0)) / 1_000_000_000.0,
-            int(ft_group_stats.get("num_qgalore_lr_groups", 0)),
-            ft_group_stats.get("qgalore_lr_scales", []),
-            int(getattr(args, "qgalore_rank", 256)),
-            int(getattr(args, "qgalore_update_proj_gap", 200)),
-            float(getattr(args, "qgalore_scale", 0.25)),
-        )
-        logger.info(
-            "Q-GaLore projection: svd_method=%s oversampling=%d niter=%d proj_quant=%s",
-            str(getattr(args, "qgalore_svd_method", "full")),
-            int(getattr(args, "qgalore_svd_oversampling", 32)),
-            int(getattr(args, "qgalore_svd_niter", 1)),
-            bool(getattr(args, "qgalore_proj_quant", True)),
+            "APOLLO optimizer groups: tensors=%d params=%.3fB groups=%d scales=%s rank=%d gap=%d scale=%g proj=%s scale_type=%s",
+            int(ft_group_stats.get("apollo_param_count", 0)),
+            float(ft_group_stats.get("apollo_param_numel", 0)) / 1_000_000_000.0,
+            int(ft_group_stats.get("num_apollo_lr_groups", 0)),
+            ft_group_stats.get("apollo_lr_scales", []),
+            int(getattr(args, "apollo_rank", 256)),
+            int(getattr(args, "apollo_update_proj_gap", 200)),
+            float(getattr(args, "apollo_scale", 1.0)),
+            str(getattr(args, "apollo_proj", "random")),
+            str(getattr(args, "apollo_scale_type", "channel")),
         )
     if ft_group_stats["frozen_blocks"]:
         logger.info("Full-FT frozen blocks: %s", ft_group_stats["frozen_blocks"])
@@ -4067,8 +4190,10 @@ def main() -> None:
                 logger.info("Adafactor fused backward pass enabled.")
             else:
                 from musubi_tuner.optimizers.backends import (
+                    is_apollo_optimizer_instance,
                     is_optimi_optimizer_instance,
                     is_torchao_optimizer_instance,
+                    patch_apollo_fused_step_param,
                     patch_optimi_fused_step_param,
                     patch_torchao_fused_step_param,
                 )
@@ -4106,6 +4231,12 @@ def main() -> None:
                             f"{base_optimizer.__class__.__name__} fused backward pass requires optimi single-param step support"
                         )
                     logger.info("%s torch-optimi fused backward pass enabled.", base_optimizer.__class__.__name__)
+                elif is_apollo_optimizer_instance(base_optimizer):
+                    if not patch_apollo_fused_step_param(base_optimizer) or not _attach_fused_step_param(optimizer, base_optimizer):
+                        raise ValueError(
+                            f"{base_optimizer.__class__.__name__} fused backward pass requires APOLLO step_param support"
+                        )
+                    logger.info("%s APOLLO fused backward pass enabled.", base_optimizer.__class__.__name__)
                 elif base_optimizer_name in {"came", "came8bit", "sinksgd"}:
                     if not _attach_fused_step_param(optimizer, base_optimizer):
                         raise ValueError(
@@ -4123,8 +4254,8 @@ def main() -> None:
                     logger.info("%s fused backward pass enabled.", base_optimizer.__class__.__name__)
                 else:
                     raise ValueError(
-                        f"--fused_backward_pass requires Adafactor, CAME/CAME8bit, SinkSGD, Q-GaLore, torchao Adam, "
-                        f"torch-optimi, or BAdam with badam_use_gradient_release=True; "
+                        f"--fused_backward_pass requires Adafactor, CAME/CAME8bit, SinkSGD, Q-GaLore, APOLLO, "
+                        f"torchao Adam, torch-optimi, or BAdam with badam_use_gradient_release=True; "
                         f"got {base_optimizer.__class__.__name__}"
                     )
 
@@ -4213,6 +4344,12 @@ def main() -> None:
         "ss_qgalore_weight_group_size": getattr(args, "qgalore_weight_group_size", None),
         "ss_qgalore_replaced_modules": getattr(qgalore_summary, "replaced", 0) if qgalore_summary is not None else 0,
         "ss_qgalore_replaced_numel": getattr(qgalore_summary, "replaced_numel", 0) if qgalore_summary is not None else 0,
+        "ss_apollo_rank": getattr(args, "apollo_rank", None),
+        "ss_apollo_update_proj_gap": getattr(args, "apollo_update_proj_gap", None),
+        "ss_apollo_scale": getattr(args, "apollo_scale", None),
+        "ss_apollo_proj": getattr(args, "apollo_proj", None),
+        "ss_apollo_proj_type": getattr(args, "apollo_proj_type", None),
+        "ss_apollo_scale_type": getattr(args, "apollo_scale_type", None),
         "ss_weighting_scheme": args.weighting_scheme,
         "ss_logit_mean": args.logit_mean,
         "ss_logit_std": args.logit_std,
@@ -4483,7 +4620,18 @@ def main() -> None:
         if bool(getattr(args, "qgalore_full_ft", False)) and bool(getattr(args, "qgalore_dequantize_save", True)):
             from musubi_tuner.optimizers.q_galore import dequantize_qgalore_state_dict
 
-            state_dict = dequantize_qgalore_state_dict(save_model_ref, state_dict)
+            streaming_qgalore_save = bool(getattr(args, "qgalore_streaming_dequantize_save", False))
+            if streaming_qgalore_save:
+                accelerator.print(
+                    "Using streaming Q-GaLore dequantized save "
+                    f"(device={getattr(args, 'qgalore_streaming_dequantize_device', 'cpu')})"
+                )
+            state_dict = dequantize_qgalore_state_dict(
+                save_model_ref,
+                state_dict,
+                lazy=streaming_qgalore_save,
+                device=getattr(args, "qgalore_streaming_dequantize_device", "cpu") if streaming_qgalore_save else None,
+            )
         state_dict, extra_meta = _prepare_state_dict_for_save(state_dict, args)
         if extra_meta:
             metadata_to_save.update(extra_meta)

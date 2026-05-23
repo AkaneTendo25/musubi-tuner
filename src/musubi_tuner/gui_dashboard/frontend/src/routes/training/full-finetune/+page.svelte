@@ -22,6 +22,8 @@
 	const optimizerOptions = [
 		'Adafactor',
 		'QGaLoreAdamW8bit',
+		'APOLLOAdamW',
+		'QAPOLLOAdamW',
 		'BAdam',
 		'AdamW8bit',
 		'PagedAdamW8bit',
@@ -313,15 +315,63 @@
 		update('qgalore_rank', 256);
 		update('qgalore_update_proj_gap', 200);
 		update('qgalore_scale', 0.25);
+		update('qgalore_proj_type', 'std');
+		update('qgalore_proj_quant', true);
+		update('qgalore_proj_bits', 4);
+		update('qgalore_proj_group_size', 256);
+		update('qgalore_weight_bits', 8);
+		update('qgalore_weight_group_size', 256);
+		update('qgalore_stochastic_round', true);
 		update('qgalore_load_on_cpu', true);
 		update('qgalore_svd_method', 'lowrank');
 		update('qgalore_svd_oversampling', 32);
 		update('qgalore_svd_niter', 1);
+		update('qgalore_dequantize_save', true);
+		update('qgalore_streaming_dequantize_save', true);
+		update('qgalore_streaming_dequantize_device', 'cpu');
+		update('qgalore_cos_threshold', 0.4);
+		update('qgalore_gamma_proj', 2.0);
+		update('qgalore_queue_size', 5);
+	}
+
+	function applyApolloRecommendation(quantized = false) {
+		update('optimizer_type', quantized ? 'QAPOLLOAdamW' : 'APOLLOAdamW');
+		update('optimizer_args', '');
+		update('base_optimizer_args', '');
+		update('qgalore_full_ft', quantized);
+		update('learning_rate', quantized ? 1e-5 : 1e-6);
+		update('max_grad_norm', quantized ? 0.0 : 1.0);
+		update('fused_backward_pass', true);
+		update('full_bf16', true);
+		update('full_fp16', false);
+		update('apollo_rank', 256);
+		update('apollo_update_proj_gap', 200);
+		update('apollo_scale', 1.0);
+		update('apollo_proj', 'random');
+		update('apollo_proj_type', 'std');
+		update('apollo_scale_type', 'channel');
+		if (quantized) {
+			update('fp8_base', false);
+			update('fp8_scaled', false);
+			update('nf4_base', false);
+			update('qgalore_targets', 'video');
+			update('qgalore_load_on_cpu', true);
+			update('qgalore_weight_bits', 8);
+			update('qgalore_weight_group_size', 256);
+			update('qgalore_stochastic_round', true);
+			update('qgalore_dequantize_save', true);
+			update('qgalore_streaming_dequantize_save', true);
+			update('qgalore_streaming_dequantize_device', 'cpu');
+		}
 	}
 
 	function applyRecommendedOptimizerArgs() {
 		const optimizer = (t.optimizer_type || '').toLowerCase();
-		if (optimizer.includes('qgalore')) {
+		if (optimizer.includes('qapollo')) {
+			applyApolloRecommendation(true);
+		} else if (optimizer.includes('apollo')) {
+			applyApolloRecommendation(false);
+		} else if (optimizer.includes('qgalore')) {
 			applyQgaloreRecommendation();
 		} else if (optimizer.includes('badam')) {
 			applyBadamRecommendation();
@@ -565,6 +615,8 @@
 					<FormToggle fieldPath="full_finetune.qgalore_proj_quant" checked={t.qgalore_proj_quant ?? true} onchange={(e) => update('qgalore_proj_quant', e.target.checked)} />
 					<FormToggle fieldPath="full_finetune.qgalore_stochastic_round" checked={t.qgalore_stochastic_round ?? true} onchange={(e) => update('qgalore_stochastic_round', e.target.checked)} />
 					<FormToggle fieldPath="full_finetune.qgalore_load_on_cpu" checked={t.qgalore_load_on_cpu ?? true} onchange={(e) => update('qgalore_load_on_cpu', e.target.checked)} />
+					<FormToggle fieldPath="full_finetune.qgalore_dequantize_save" checked={t.qgalore_dequantize_save ?? true} onchange={(e) => update('qgalore_dequantize_save', e.target.checked)} />
+					<FormToggle fieldPath="full_finetune.qgalore_streaming_dequantize_save" checked={t.qgalore_streaming_dequantize_save ?? false} onchange={(e) => update('qgalore_streaming_dequantize_save', e.target.checked)} />
 				</div>
 				<div class="grid grid-cols-2 gap-2">
 					<FormField fieldPath="full_finetune.qgalore_targets" value={t.qgalore_targets || 'video'} oninput={(e) => update('qgalore_targets', e.target.value)} />
@@ -574,8 +626,11 @@
 				</div>
 				<div class="grid grid-cols-2 gap-2">
 					<FormSelect fieldPath="full_finetune.qgalore_svd_method" value={t.qgalore_svd_method || 'full'} options={['full', 'lowrank']} onchange={(e) => update('qgalore_svd_method', e.target.value)} />
+					<FormSelect fieldPath="full_finetune.qgalore_streaming_dequantize_device" value={t.qgalore_streaming_dequantize_device || 'cpu'} options={['cpu', 'cuda']} onchange={(e) => update('qgalore_streaming_dequantize_device', e.target.value)} disabled={!(t.qgalore_streaming_dequantize_save ?? false)} />
+					<FormSelect fieldPath="full_finetune.qgalore_proj_type" value={t.qgalore_proj_type || 'std'} options={['std']} onchange={(e) => update('qgalore_proj_type', e.target.value)} />
 					<FormField type="number" fieldPath="full_finetune.qgalore_proj_bits" value={t.qgalore_proj_bits ?? 4} oninput={(e) => update('qgalore_proj_bits', Number(e.target.value))} min={1} />
 					<FormField type="number" fieldPath="full_finetune.qgalore_proj_group_size" value={t.qgalore_proj_group_size ?? 256} oninput={(e) => update('qgalore_proj_group_size', Number(e.target.value))} min={1} />
+					<FormField type="number" fieldPath="full_finetune.qgalore_weight_bits" value={t.qgalore_weight_bits ?? 8} oninput={(e) => update('qgalore_weight_bits', Number(e.target.value))} min={1} />
 					<FormField type="number" fieldPath="full_finetune.qgalore_weight_group_size" value={t.qgalore_weight_group_size ?? 256} oninput={(e) => update('qgalore_weight_group_size', Number(e.target.value))} min={1} />
 				</div>
 				<div class="grid grid-cols-2 gap-2">
@@ -583,6 +638,24 @@
 					<FormField type="number" fieldPath="full_finetune.qgalore_max_modules" value={t.qgalore_max_modules ?? ''} oninput={(e) => update('qgalore_max_modules', numberOrNull(e.target.value))} min={1} />
 					<FormField type="number" fieldPath="full_finetune.qgalore_svd_oversampling" value={t.qgalore_svd_oversampling ?? 32} oninput={(e) => update('qgalore_svd_oversampling', Number(e.target.value))} min={0} />
 					<FormField type="number" fieldPath="full_finetune.qgalore_svd_niter" value={t.qgalore_svd_niter ?? 1} oninput={(e) => update('qgalore_svd_niter', Number(e.target.value))} min={0} />
+					<FormField type="number" fieldPath="full_finetune.qgalore_cos_threshold" value={t.qgalore_cos_threshold ?? 0.4} oninput={(e) => update('qgalore_cos_threshold', Number(e.target.value))} min={0} max={1} step="0.01" />
+					<FormField type="number" fieldPath="full_finetune.qgalore_gamma_proj" value={t.qgalore_gamma_proj ?? 2.0} oninput={(e) => update('qgalore_gamma_proj', Number(e.target.value))} min={0} step="0.1" />
+					<FormField type="number" fieldPath="full_finetune.qgalore_queue_size" value={t.qgalore_queue_size ?? 5} oninput={(e) => update('qgalore_queue_size', Number(e.target.value))} min={1} />
+				</div>
+			</div>
+		</FormGroup>
+
+		<FormGroup title="APOLLO">
+			<div class="space-y-2 pt-2">
+				<div class="grid grid-cols-2 gap-2">
+					<FormField type="number" fieldPath="full_finetune.apollo_rank" value={t.apollo_rank ?? 256} oninput={(e) => update('apollo_rank', Number(e.target.value))} min={1} />
+					<FormField type="number" fieldPath="full_finetune.apollo_update_proj_gap" value={t.apollo_update_proj_gap ?? 200} oninput={(e) => update('apollo_update_proj_gap', Number(e.target.value))} min={1} />
+					<FormField type="number" fieldPath="full_finetune.apollo_scale" value={t.apollo_scale ?? 1.0} oninput={(e) => update('apollo_scale', Number(e.target.value))} step="0.01" min={0} />
+					<FormSelect fieldPath="full_finetune.apollo_scale_type" value={t.apollo_scale_type || 'channel'} options={['channel', 'tensor']} onchange={(e) => update('apollo_scale_type', e.target.value)} />
+				</div>
+				<div class="grid grid-cols-2 gap-2">
+					<FormSelect fieldPath="full_finetune.apollo_proj" value={t.apollo_proj || 'random'} options={['random', 'svd']} onchange={(e) => update('apollo_proj', e.target.value)} />
+					<FormSelect fieldPath="full_finetune.apollo_proj_type" value={t.apollo_proj_type || 'std'} options={['std', 'reverse_std', 'left', 'right']} onchange={(e) => update('apollo_proj_type', e.target.value)} />
 				</div>
 			</div>
 		</FormGroup>

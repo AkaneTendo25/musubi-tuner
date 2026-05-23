@@ -796,6 +796,13 @@ class NetworkTrainer:
             logger.info(f"use Q-GaLore AdamW8bit optimizer | {optimizer_kwargs}")
             optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
 
+        elif optimizer_type.startswith("apollo") or optimizer_type.startswith("qapollo") or optimizer_type.startswith("q_apollo"):
+            from musubi_tuner.optimizers.backends import resolve_apollo_optimizer_class
+
+            optimizer_class = resolve_apollo_optimizer_class(args.optimizer_type)
+            logger.info(f"use APOLLO optimizer {optimizer_class.__name__} | {optimizer_kwargs}")
+            optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
+
         elif (
             optimizer_type.startswith("optimi_")
             or optimizer_type.startswith("torchoptimi_")

@@ -1131,13 +1131,27 @@ def validate_full_finetune_config(config: ProjectConfig) -> dict[str, Any]:
 
     if t.qgalore_full_ft:
         opt = str(t.optimizer_type or "").lower()
-        qgalore_aliases = {"", "qgalore", "q_galore", "qgaloreadamw8bit", "q_galore_adamw8bit", "q-galore-adamw8bit"}
+        qgalore_aliases = {
+            "",
+            "qgalore",
+            "q_galore",
+            "qgaloreadamw8bit",
+            "q_galore_adamw8bit",
+            "q-galore-adamw8bit",
+            "qapollo",
+            "q_apollo",
+            "qapollo_adamw",
+            "qapolloadamw",
+            "q_apollo_adamw",
+            "apollo_torch.qapolloadamw",
+            "apollo_torch.q_apollo.adamw",
+        }
         if opt not in qgalore_aliases:
             errors.append(
                 _make_issue(
                     "error",
                     "full_finetune.optimizer_type",
-                    "Q-GaLore full fine-tuning requires optimizer type QGaLoreAdamW8bit.",
+                    "Quantized full fine-tuning requires optimizer type QGaLoreAdamW8bit or QAPOLLOAdamW.",
                     label="Optimizer",
                     page="full_finetune",
                 )
