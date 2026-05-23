@@ -16,6 +16,7 @@ from musubi_tuner.gui_dashboard.command_builder import (
     build_cache_dino_cmd,
     build_cache_latents_cmd,
     build_cache_text_cmd,
+    build_full_finetune_cmd,
     build_inference_cmd,
     build_remote_stage_launcher_cmd,
     build_remote_stage_server_cmd,
@@ -38,6 +39,7 @@ VALID_TYPES = (
     "cache_text",
     "cache_dino",
     "training",
+    "full_finetune",
     "remote_stage_launcher",
     "remote_stage_server",
     "inference",
@@ -71,6 +73,8 @@ def _build_cmd(proc_type: str, config):
         return build_cache_dino_cmd(config)
     elif proc_type == "training":
         return build_training_cmd(config)
+    elif proc_type == "full_finetune":
+        return build_full_finetune_cmd(config)
     elif proc_type == "remote_stage_launcher":
         return build_remote_stage_launcher_cmd(config)
     elif proc_type == "remote_stage_server":
@@ -119,9 +123,9 @@ async def start_process(proc_type: str, request: Request):
     config = _get_config(request)
     _validate_process_or_raise(proc_type, config)
 
-    if proc_type == "training":
-        clear_training_dashboard_files(config, keep_history=training_is_resume(config))
-        write_training_launch_status(config)
+    if proc_type in {"training", "full_finetune"}:
+        clear_training_dashboard_files(config, keep_history=training_is_resume(config, proc_type), process_type=proc_type)
+        write_training_launch_status(config, process_type=proc_type)
 
     try:
         cmd = _build_cmd(proc_type, config)

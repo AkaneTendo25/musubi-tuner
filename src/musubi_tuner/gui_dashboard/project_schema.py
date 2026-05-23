@@ -655,6 +655,90 @@ class TrainingConfig(BaseModel):
     extra_args: str = ""
 
 
+class FullFinetuneConfig(TrainingConfig):
+    model_config = ConfigDict(extra="ignore")
+
+    # Defaults are tuned for real runs rather than dashboard smoke tests.
+    learning_rate: float = 1e-6
+    optimizer_type: str = "Adafactor"
+    lr_scheduler: str = "constant_with_warmup"
+    lr_warmup_steps: int = 500
+    max_train_steps: int = 50000
+    gradient_checkpointing: bool = True
+    full_bf16: bool = True
+    flash_attn: bool = True
+    fused_backward_pass: bool = True
+    mem_eff_save: bool = True
+    output_name: str = "ltx2_full_ft"
+    save_every_n_steps: Optional[int] = 1000
+    network_module: Optional[str] = None
+
+    # Full fine-tune optimizer/saving options.
+    base_optimizer_args: str = ""
+    no_final_save: bool = False
+    save_comfy_format: bool = False
+    save_merged_checkpoint: bool = False
+
+    # Q-GaLore full fine-tune.
+    qgalore_full_ft: bool = False
+    qgalore_targets: str = "all"
+    qgalore_rank: int = 256
+    qgalore_update_proj_gap: int = 200
+    qgalore_scale: float = 0.25
+    qgalore_proj_type: str = "std"
+    qgalore_proj_quant: bool = True
+    qgalore_proj_bits: int = 4
+    qgalore_proj_group_size: int = 256
+    qgalore_weight_bits: int = 8
+    qgalore_weight_group_size: int = 256
+    qgalore_stochastic_round: bool = True
+    qgalore_min_weight_numel: int = 16384
+    qgalore_max_modules: Optional[int] = None
+    qgalore_load_on_cpu: bool = True
+    qgalore_cos_threshold: float = 0.4
+    qgalore_gamma_proj: float = 2.0
+    qgalore_queue_size: int = 5
+    qgalore_svd_method: Literal["full", "lowrank"] = "lowrank"
+    qgalore_svd_oversampling: int = 32
+    qgalore_svd_niter: int = 1
+    qgalore_dequantize_save: bool = True
+
+    # Full fine-tune-only controls.
+    ltx2_finetune_block_swap_mode: Literal["default", "linear", "full"] = "default"
+    ltx2_finetune_block_swap_mask: str = "all"
+    freeze_early_blocks: int = 0
+    freeze_block_indices: str = ""
+    block_lr_scales: str = ""
+    non_block_lr_scale: float = 1.0
+    attn_geometry_lr_scale: float = 1.0
+    freeze_attn_geometry: bool = False
+    freeze_audio_params: bool = False
+    audio_param_lr_scale: float = 1.0
+
+    # EMA and validation.
+    use_ema: bool = False
+    ema_decay: float = 0.9999
+    ema_update_after_step: int = 100
+    ema_update_every: int = 1
+    save_ema_only: bool = False
+    ema_cpu_offload: bool = False
+    validation_dataset_config: str = ""
+    validation_extra_configs: str = ""
+    num_validation_batches: Optional[int] = None
+    validation_timesteps: str = ""
+
+    # Instrumentation.
+    log_weight_drift_every: int = 0
+    weight_drift_target: Literal["attn_norm_bias", "attn_geometry", "all_trainable"] = "all_trainable"
+    weight_drift_top_k: int = 20
+    log_grad_norm_every: int = 0
+    grad_norm_target: Literal["attn_norm_bias", "attn_geometry", "all_trainable"] = "all_trainable"
+    grad_norm_top_k: int = 20
+    log_output_drift_every: int = 0
+    output_drift_batches: int = 1
+    output_drift_timestep: float = 500.0
+
+
 class InferenceConfig(BaseModel):
     ltx2_checkpoint: str = ""
     vae: str = ""
@@ -868,6 +952,7 @@ class ProjectConfig(BaseModel):
     dataset: DatasetConfig = Field(default_factory=DatasetConfig)
     caching: CachingConfig = Field(default_factory=CachingConfig)
     training: TrainingConfig = Field(default_factory=TrainingConfig)
+    full_finetune: FullFinetuneConfig = Field(default_factory=FullFinetuneConfig)
     remote_stage_launcher: RemoteStageLauncherConfig = Field(default_factory=RemoteStageLauncherConfig)
     remote_stage_server: RemoteStageServerConfig = Field(default_factory=RemoteStageServerConfig)
     inference: InferenceConfig = Field(default_factory=InferenceConfig)
@@ -900,7 +985,14 @@ class ProjectConfig(BaseModel):
             data["default_ltx2_checkpoint"] = default_ltx
             data["default_gemma_root"] = default_gemma
 
-            for section_name in ("caching", "training", "remote_stage_server", "inference"):
+            full_finetune = data.get("full_finetune")
+            if isinstance(full_finetune, dict):
+                full_finetune = dict(full_finetune)
+                if not full_finetune.get("output_dir"):
+                    full_finetune["output_dir"] = get_ltx2_training_output_dir_default()
+                data["full_finetune"] = full_finetune
+
+            for section_name in ("caching", "training", "full_finetune", "remote_stage_server", "inference"):
                 section = data.get(section_name)
                 if section is None:
                     section = {}
@@ -909,10 +1001,12 @@ class ProjectConfig(BaseModel):
                 else:
                     section = dict(section)
 
+                if section_name in ("training", "full_finetune") and not section.get("output_dir"):
+                    section["output_dir"] = get_ltx2_training_output_dir_default()
                 if not section.get("ltx2_checkpoint"):
                     section["ltx2_checkpoint"] = default_ltx
                 if (
-                    section_name in ("caching", "training", "inference")
+                    section_name in ("caching", "training", "full_finetune", "inference")
                     and not section.get("gemma_root")
                     and not section.get("gemma_safetensors")
                 ):

@@ -16,18 +16,28 @@
 	import { status, clearStatus } from '$lib/stores/status.js';
 	import { onMount } from 'svelte';
 
-	let t = $derived($projectConfig?.training || {});
 	let projectName = $derived($projectConfig?.name || 'Untitled');
 
 	let rawTrainingStatus = $derived($processStatuses.training || { state: 'idle', exit_code: null });
-	let trainingLive = $derived(rawTrainingStatus.state === 'running' || rawTrainingStatus.state === 'stopping');
-	let trainingStatus = $derived(rawTrainingStatus);
-	let trainingLogs = $derived($processLogs.training || []);
+	let rawFullFinetuneStatus = $derived($processStatuses.full_finetune || { state: 'idle', exit_code: null });
+	let activeProcessType = $derived.by(() => {
+		if (rawFullFinetuneStatus.state === 'running' || rawFullFinetuneStatus.state === 'stopping') return 'full_finetune';
+		if (rawTrainingStatus.state === 'running' || rawTrainingStatus.state === 'stopping') return 'training';
+		if (rawFullFinetuneStatus.state === 'finished' || rawFullFinetuneStatus.state === 'error') return 'full_finetune';
+		return 'training';
+	});
+	let t = $derived(activeProcessType === 'full_finetune' ? ($projectConfig?.full_finetune || {}) : ($projectConfig?.training || {}));
+	let trainingLive = $derived(activeProcessType === 'full_finetune'
+		? (rawFullFinetuneStatus.state === 'running' || rawFullFinetuneStatus.state === 'stopping')
+		: (rawTrainingStatus.state === 'running' || rawTrainingStatus.state === 'stopping'));
+	let trainingStatus = $derived(activeProcessType === 'full_finetune' ? rawFullFinetuneStatus : rawTrainingStatus);
+	let trainingLogs = $derived($processLogs[activeProcessType] || []);
 	let trainingActive = $derived(trainingLive);
 	let showDashboardData = $derived(trainingLive);
 	let trainingConsoleEmptyMessage = $derived(
 		trainingLive ? 'Training process launched. Waiting for console output...' : 'No output yet'
 	);
+	let configHref = $derived(activeProcessType === 'full_finetune' ? '/training/full-finetune' : '/training');
 
 	let systemInfo = $state(null);
 	let stats = $state(null);
@@ -66,13 +76,15 @@
 		const init = async () => {
 			const statuses = await refreshStatuses();
 			if (disposed) return;
-			const state = statuses?.training?.state;
-			if (state === 'running' || state === 'stopping') {
-				await preloadLogsIfActive('training');
+			const trainingState = statuses?.training?.state;
+			const fullFinetuneState = statuses?.full_finetune?.state;
+			if (trainingState === 'running' || trainingState === 'stopping' || fullFinetuneState === 'running' || fullFinetuneState === 'stopping') {
+				await preloadLogsIfActive(['training', 'full_finetune']);
 			} else {
 				clearMetrics();
 				clearStatus();
 				clearProcessLogs('training');
+				clearProcessLogs('full_finetune');
 			}
 
 			await Promise.all([fetchSystemInfo(), fetchStats()]);
@@ -81,7 +93,7 @@
 
 		const systemInterval = setInterval(fetchSystemInfo, 1000);
 		const statsInterval = setInterval(fetchStats, 3000);
-		const logInterval = startLogPolling('training', 1000);
+		const logInterval = startLogPolling(['training', 'full_finetune'], 1000);
 		return () => {
 			disposed = true;
 			clearInterval(systemInterval);
@@ -99,6 +111,7 @@
 
 		const snapshot = JSON.stringify({
 			dataset: cfg.dataset,
+			activeProcessType,
 			training: {
 				gradient_accumulation_steps: cfg.training?.gradient_accumulation_steps,
 				save_every_n_steps: cfg.training?.save_every_n_steps,
@@ -110,6 +123,18 @@
 				autoresume: cfg.training?.autoresume,
 				resume_from_huggingface: cfg.training?.resume_from_huggingface,
 				max_train_steps: cfg.training?.max_train_steps
+			},
+			full_finetune: {
+				gradient_accumulation_steps: cfg.full_finetune?.gradient_accumulation_steps,
+				save_every_n_steps: cfg.full_finetune?.save_every_n_steps,
+				sample_every_n_steps: cfg.full_finetune?.sample_every_n_steps,
+				sample_every_n_epochs: cfg.full_finetune?.sample_every_n_epochs,
+				output_dir: cfg.full_finetune?.output_dir,
+				output_name: cfg.full_finetune?.output_name,
+				resume: cfg.full_finetune?.resume,
+				autoresume: cfg.full_finetune?.autoresume,
+				resume_from_huggingface: cfg.full_finetune?.resume_from_huggingface,
+				max_train_steps: cfg.full_finetune?.max_train_steps
 			}
 		});
 
@@ -137,12 +162,12 @@
 	});
 
 	async function handleStart() {
-		await startProcess('training');
-		await fetchLogs('training');
+		await startProcess(activeProcessType);
+		await fetchLogs(activeProcessType);
 	}
 
 	async function handleStop() {
-		await stopProcess('training');
+		await stopProcess(activeProcessType);
 	}
 
 	function formatDuration(seconds) {
@@ -258,7 +283,7 @@
 <div class="space-y-4">
 	<div class="flex items-center justify-between">
 		<h2 class="text-base font-semibold" style="color: var(--text-primary);">Training Dashboard</h2>
-		<a href="/training" class="px-3 py-1.5 text-[12px] font-medium" style="background: var(--bg-elevated); border: 1px solid var(--border); color: var(--text-secondary); border-radius: var(--radius-sm);">Config</a>
+		<a href={configHref} class="px-3 py-1.5 text-[12px] font-medium" style="background: var(--bg-elevated); border: 1px solid var(--border); color: var(--text-secondary); border-radius: var(--radius-sm);">Config</a>
 	</div>
 
 	<!-- Status + Hardware row -->
@@ -433,8 +458,8 @@
 
 	<!-- Process Controls + Console — always visible -->
 	<div class="space-y-3">
-		<ProcessControls processType="training" status={trainingStatus} onStart={handleStart} onStop={handleStop} />
-		<ProcessConsole lines={trainingLogs} processType="training" initiallyCollapsed={false} emptyMessage={trainingConsoleEmptyMessage} />
+		<ProcessControls processType={activeProcessType} status={trainingStatus} onStart={handleStart} onStop={handleStop} />
+		<ProcessConsole lines={trainingLogs} processType={activeProcessType} initiallyCollapsed={false} emptyMessage={trainingConsoleEmptyMessage} />
 	</div>
 
 	{#if showDashboardData}

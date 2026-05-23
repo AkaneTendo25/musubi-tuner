@@ -227,6 +227,10 @@ def _has_training_checkpoint(config: ProjectConfig) -> bool:
     return _has_text(config.training.ltx2_checkpoint) or _has_text(config.default_ltx2_checkpoint)
 
 
+def _has_full_finetune_checkpoint(config: ProjectConfig) -> bool:
+    return _has_text(config.full_finetune.ltx2_checkpoint) or _has_text(config.default_ltx2_checkpoint)
+
+
 def _has_inference_checkpoint(config: ProjectConfig) -> bool:
     return _has_text(config.inference.ltx2_checkpoint) or _has_text(config.default_ltx2_checkpoint)
 
@@ -1082,6 +1086,100 @@ def validate_training_config(config: ProjectConfig) -> dict[str, Any]:
     return _build_report(errors, warnings)
 
 
+def validate_full_finetune_config(config: ProjectConfig) -> dict[str, Any]:
+    """Validate GUI full fine-tune config before launch."""
+    t = config.full_finetune
+    errors: list[dict[str, Any]] = []
+    warnings: list[dict[str, Any]] = []
+    effective_gemma_safetensors = _effective_gemma_safetensors(t.gemma_safetensors, config.default_gemma_safetensors)
+
+    if not _has_full_finetune_checkpoint(config):
+        errors.append(
+            _make_issue(
+                "error",
+                "full_finetune.ltx2_checkpoint",
+                "LTX-2 Checkpoint is required.",
+                label="LTX-2 Checkpoint",
+                page="full_finetune",
+            )
+        )
+
+    if t.log_with == "tensorboard" and not _has_text(t.logging_dir):
+        errors.append(
+            _make_issue(
+                "error",
+                "full_finetune.logging_dir",
+                "Log Dir is required when Logger is set to TensorBoard.",
+                label="Log Dir",
+                page="full_finetune",
+            )
+        )
+
+    _validate_gemma_quantization_combo(
+        errors=errors,
+        gemma_load_in_8bit=t.gemma_load_in_8bit,
+        gemma_load_in_4bit=t.gemma_load_in_4bit,
+        gemma_safetensors=effective_gemma_safetensors,
+        field_prefix="full_finetune",
+        page="full_finetune",
+    )
+
+    if t.full_fp16 and t.full_bf16:
+        message = "Full FP16 and Full BF16 cannot be enabled together."
+        errors.append(_make_issue("error", "full_finetune.full_fp16", message, label="Full FP16", page="full_finetune"))
+        errors.append(_make_issue("error", "full_finetune.full_bf16", message, label="Full BF16", page="full_finetune"))
+
+    if t.qgalore_full_ft:
+        opt = str(t.optimizer_type or "").lower()
+        qgalore_aliases = {"", "qgalore", "q_galore", "qgaloreadamw8bit", "q_galore_adamw8bit", "q-galore-adamw8bit"}
+        if opt not in qgalore_aliases:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "full_finetune.optimizer_type",
+                    "Q-GaLore full fine-tuning requires optimizer type QGaLoreAdamW8bit.",
+                    label="Optimizer",
+                    page="full_finetune",
+                )
+            )
+        if not t.fused_backward_pass:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "full_finetune.fused_backward_pass",
+                    "Q-GaLore full fine-tuning requires fused backward.",
+                    label="Fused Backward",
+                    page="full_finetune",
+                )
+            )
+        if float(t.max_grad_norm or 0.0) != 0.0:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "full_finetune.max_grad_norm",
+                    "Q-GaLore fused backward requires Max Grad Norm = 0.",
+                    label="Max Grad Norm",
+                    page="full_finetune",
+                )
+            )
+        if t.fp8_base or t.fp8_scaled:
+            message = "Q-GaLore full fine-tuning cannot be combined with FP8 base/scaled loading."
+            errors.append(_make_issue("error", "full_finetune.fp8_base", message, label="FP8 Base", page="full_finetune"))
+            errors.append(_make_issue("error", "full_finetune.fp8_scaled", message, label="FP8 Scaled", page="full_finetune"))
+        if t.nf4_base:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "full_finetune.nf4_base",
+                    "Q-GaLore full fine-tuning cannot be combined with NF4 base loading.",
+                    label="NF4 Base",
+                    page="full_finetune",
+                )
+            )
+
+    return _build_report(errors, warnings)
+
+
 def _has_remote_stage_server_checkpoint(config: ProjectConfig) -> bool:
     return _has_text(config.remote_stage_server.ltx2_checkpoint) or _has_text(config.default_ltx2_checkpoint)
 
@@ -1631,6 +1729,8 @@ def validate_inference_config(config: ProjectConfig) -> dict[str, Any]:
 def validate_process_config(proc_type: str, config: ProjectConfig) -> dict[str, Any]:
     if proc_type == "training":
         return validate_training_config(config)
+    if proc_type == "full_finetune":
+        return validate_full_finetune_config(config)
     if proc_type == "remote_stage_server":
         return validate_remote_stage_server_config(config)
     if proc_type == "remote_stage_launcher":

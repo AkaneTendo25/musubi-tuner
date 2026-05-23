@@ -78,6 +78,25 @@ def _effective_training_sample_prompts(config: ProjectConfig) -> str:
     return ""
 
 
+def _effective_full_finetune_sample_prompts(config: ProjectConfig) -> str:
+    training = config.training
+    full_finetune = getattr(config, "full_finetune", None)
+    if full_finetune is None:
+        return _effective_training_sample_prompts(config)
+    if full_finetune.sample_prompts:
+        return full_finetune.sample_prompts
+    if full_finetune.sample_prompts_text.strip():
+        output_path = _generated_sample_prompts_path(config)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(full_finetune.sample_prompts_text, encoding="utf-8")
+        return str(output_path)
+    if training.sample_prompts:
+        return training.sample_prompts
+    if training.sample_prompts_text.strip():
+        return _effective_training_sample_prompts(config)
+    return ""
+
+
 def _effective_caching_sample_prompts(config: ProjectConfig) -> str:
     caching = config.caching
     if caching.sample_prompts:
@@ -1516,6 +1535,424 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
         cmd += ["--video_anchor_probability", str(getattr(t, "video_anchor_probability", 0.5))]
         cmd += ["--video_anchor_count", str(int(getattr(t, "video_anchor_count", 1)))]
         cmd += ["--video_anchor_strategy", str(getattr(t, "video_anchor_strategy", "endpoints_random"))]
+
+    cmd += _split_cli_args(t.extra_args)
+    return cmd
+
+
+def build_full_finetune_cmd(config: ProjectConfig) -> list[str]:
+    """Build CLI args for full-parameter LTX-2 fine-tuning via accelerate launch."""
+    toml_path = export_dataset_toml(config)
+    t = config.full_finetune
+    ltx2_checkpoint = _effective_ltx2_checkpoint(config, t.ltx2_checkpoint)
+    gemma_safetensors = _effective_gemma_safetensors(config, t.gemma_safetensors)
+    gemma_root = _effective_gemma_root(config, t.gemma_root, gemma_safetensors)
+    sample_prompts = _effective_full_finetune_sample_prompts(config)
+
+    cmd = _accelerate_launch_prefix(t.mixed_precision, t.accelerate_extra_args)
+    cmd.append(_find_script("ltx2_train.py"))
+
+    # Dataset
+    if t.config_file:
+        cmd += ["--config_file", t.config_file]
+    if t.dataset_manifest:
+        cmd += ["--dataset_manifest", t.dataset_manifest]
+    elif t.dataset_config:
+        cmd += ["--dataset_config", t.dataset_config]
+    else:
+        cmd += ["--dataset_config", str(toml_path)]
+
+    # Model
+    cmd += ["--ltx2_checkpoint", ltx2_checkpoint]
+    if gemma_root:
+        cmd += ["--gemma_root", gemma_root]
+    if gemma_safetensors:
+        cmd += ["--gemma_safetensors", gemma_safetensors]
+    cmd += ["--ltx2_mode", t.ltx2_mode]
+    if t.ltx_version != "2.3":
+        cmd += ["--ltx_version", t.ltx_version]
+    if t.ltx_version_check_mode != "warn":
+        cmd += ["--ltx_version_check_mode", t.ltx_version_check_mode]
+    if t.vae_dtype:
+        cmd += ["--vae_dtype", t.vae_dtype]
+    if t.fp8_base:
+        cmd.append("--fp8_base")
+    if t.fp8_scaled:
+        cmd.append("--fp8_scaled")
+    if t.fp8_keep_blocks:
+        cmd += ["--fp8_keep_blocks", t.fp8_keep_blocks]
+    if t.flash_attn:
+        cmd.append("--flash_attn")
+    if t.flash3:
+        cmd.append("--flash3")
+    if t.sdpa:
+        cmd.append("--sdpa")
+    if t.sage_attn:
+        cmd.append("--sage_attn")
+    if t.xformers:
+        cmd.append("--xformers")
+    if t.gemma_load_in_8bit:
+        cmd.append("--gemma_load_in_8bit")
+    if t.gemma_load_in_4bit:
+        cmd.append("--gemma_load_in_4bit")
+        if t.gemma_bnb_4bit_quant_type != "nf4":
+            cmd += ["--gemma_bnb_4bit_quant_type", t.gemma_bnb_4bit_quant_type]
+    if t.gemma_bnb_4bit_disable_double_quant:
+        cmd.append("--gemma_bnb_4bit_disable_double_quant")
+    if t.gemma_bnb_use_local_rank:
+        cmd.append("--gemma_bnb_use_local_rank")
+    if t.gemma_fp8_weight_offload:
+        cmd.append("--gemma_fp8_weight_offload")
+    else:
+        cmd.append("--no-gemma_fp8_weight_offload")
+    if t.ltx2_audio_only_model:
+        cmd.append("--ltx2_audio_only_model")
+
+    # Optimizer
+    cmd += ["--learning_rate", str(t.learning_rate)]
+    if t.optimizer_type:
+        cmd += ["--optimizer_type", t.optimizer_type]
+    if t.optimizer_args:
+        cmd += ["--optimizer_args"] + _split_cli_args(t.optimizer_args)
+    if t.base_optimizer_args:
+        cmd += ["--base_optimizer_args"] + _split_cli_args(t.base_optimizer_args)
+    cmd += ["--lr_scheduler", t.lr_scheduler]
+    cmd += ["--lr_warmup_steps", str(t.lr_warmup_steps)]
+    if t.lr_decay_steps is not None:
+        cmd += ["--lr_decay_steps", str(t.lr_decay_steps)]
+    if t.lr_scheduler_num_cycles is not None:
+        cmd += ["--lr_scheduler_num_cycles", str(t.lr_scheduler_num_cycles)]
+    if t.lr_scheduler_power is not None:
+        cmd += ["--lr_scheduler_power", str(t.lr_scheduler_power)]
+    if t.lr_scheduler_min_lr_ratio is not None:
+        cmd += ["--lr_scheduler_min_lr_ratio", str(t.lr_scheduler_min_lr_ratio)]
+    if t.lr_scheduler_type:
+        cmd += ["--lr_scheduler_type", t.lr_scheduler_type]
+    if t.lr_scheduler_args:
+        cmd += ["--lr_scheduler_args"] + _split_cli_args(t.lr_scheduler_args)
+    if t.lr_scheduler_timescale is not None:
+        cmd += ["--lr_scheduler_timescale", str(t.lr_scheduler_timescale)]
+    cmd += ["--gradient_accumulation_steps", str(t.gradient_accumulation_steps)]
+    if t.accumulation_group_by != "none":
+        cmd += ["--accumulation_group_by", t.accumulation_group_by]
+        cmd += ["--accumulation_group_remainder", t.accumulation_group_remainder]
+    cmd += ["--max_grad_norm", str(t.max_grad_norm)]
+    if t.lr_args:
+        cmd += ["--lr_args"] + _split_cli_args(t.lr_args)
+    if t.lr_group_warmup_args:
+        cmd += ["--lr_group_warmup_args"] + _split_cli_args(t.lr_group_warmup_args)
+
+    # Schedule
+    if t.max_train_epochs is not None:
+        cmd += ["--max_train_epochs", str(t.max_train_epochs)]
+    else:
+        cmd += ["--max_train_steps", str(t.max_train_steps)]
+    cmd += ["--timestep_sampling", _ltx2_timestep_sampling(t.timestep_sampling)]
+    cmd += ["--discrete_flow_shift", str(t.discrete_flow_shift)]
+    if t.seed is not None:
+        cmd += ["--seed", str(t.seed)]
+    if t.guidance_scale is not None:
+        cmd += ["--guidance_scale", str(t.guidance_scale)]
+    if t.sigmoid_scale is not None:
+        cmd += ["--sigmoid_scale", str(t.sigmoid_scale)]
+    if t.logit_mean is not None:
+        cmd += ["--logit_mean", str(t.logit_mean)]
+    if t.logit_std is not None:
+        cmd += ["--logit_std", str(t.logit_std)]
+    if t.mode_scale is not None:
+        cmd += ["--mode_scale", str(t.mode_scale)]
+    if t.min_timestep is not None:
+        cmd += ["--min_timestep", str(t.min_timestep)]
+    if t.max_timestep is not None:
+        cmd += ["--max_timestep", str(t.max_timestep)]
+    if t.shifted_logit_mode:
+        cmd += ["--shifted_logit_mode", t.shifted_logit_mode]
+    if t.shifted_logit_eps != 1e-3:
+        cmd += ["--shifted_logit_eps", str(t.shifted_logit_eps)]
+    if t.shifted_logit_uniform_prob != 0.1:
+        cmd += ["--shifted_logit_uniform_prob", str(t.shifted_logit_uniform_prob)]
+    if t.shifted_logit_shift is not None:
+        cmd += ["--shifted_logit_shift", str(t.shifted_logit_shift)]
+    if t.shifted_logit_clamp_auto_shift:
+        cmd.append("--shifted_logit_clamp_auto_shift")
+    if t.shifted_logit_min_shift != 0.95:
+        cmd += ["--shifted_logit_min_shift", str(t.shifted_logit_min_shift)]
+    if t.shifted_logit_max_shift != 2.05:
+        cmd += ["--shifted_logit_max_shift", str(t.shifted_logit_max_shift)]
+    if t.preserve_distribution_shape:
+        cmd.append("--preserve_distribution_shape")
+    if t.num_timestep_buckets is not None:
+        cmd += ["--num_timestep_buckets", str(t.num_timestep_buckets)]
+    if t.show_timesteps:
+        cmd += ["--show_timesteps", t.show_timesteps]
+
+    # Memory and execution
+    if t.blocks_to_swap is not None:
+        cmd += ["--blocks_to_swap", str(t.blocks_to_swap)]
+    if t.gradient_checkpointing:
+        cmd.append("--gradient_checkpointing")
+    if t.gradient_checkpointing_cpu_offload:
+        cmd.append("--gradient_checkpointing_cpu_offload")
+    if t.blockwise_checkpointing:
+        cmd.append("--blockwise_checkpointing")
+    if t.blocks_to_checkpoint is not None:
+        cmd += ["--blocks_to_checkpoint", str(t.blocks_to_checkpoint)]
+    if t.full_fp16:
+        cmd.append("--full_fp16")
+    if t.full_bf16:
+        cmd.append("--full_bf16")
+    if t.fused_backward_pass:
+        cmd.append("--fused_backward_pass")
+    if t.mem_eff_save:
+        cmd.append("--mem_eff_save")
+    if t.ffn_chunk_target:
+        cmd += ["--ffn_chunk_target", t.ffn_chunk_target]
+    if t.ffn_chunk_size:
+        cmd += ["--ffn_chunk_size", str(t.ffn_chunk_size)]
+    if t.use_pinned_memory_for_block_swap:
+        cmd.append("--use_pinned_memory_for_block_swap")
+    if t.img_in_txt_in_offloading:
+        cmd.append("--img_in_txt_in_offloading")
+    if t.ltx2_finetune_block_swap_mode != "default":
+        cmd += ["--ltx2_finetune_block_swap_mode", t.ltx2_finetune_block_swap_mode]
+    if t.ltx2_finetune_block_swap_mask != "all":
+        cmd += ["--ltx2_finetune_block_swap_mask", t.ltx2_finetune_block_swap_mask]
+    if t.freeze_early_blocks:
+        cmd += ["--freeze_early_blocks", str(t.freeze_early_blocks)]
+    if t.freeze_block_indices:
+        cmd += ["--freeze_block_indices", t.freeze_block_indices]
+    if t.block_lr_scales:
+        cmd += ["--block_lr_scales"] + _split_cli_args(t.block_lr_scales)
+    if t.non_block_lr_scale != 1.0:
+        cmd += ["--non_block_lr_scale", str(t.non_block_lr_scale)]
+    if t.attn_geometry_lr_scale != 1.0:
+        cmd += ["--attn_geometry_lr_scale", str(t.attn_geometry_lr_scale)]
+    if t.freeze_attn_geometry:
+        cmd.append("--freeze_attn_geometry")
+    if t.freeze_audio_params:
+        cmd.append("--freeze_audio_params")
+    if t.audio_param_lr_scale != 1.0:
+        cmd += ["--audio_param_lr_scale", str(t.audio_param_lr_scale)]
+
+    # Q-GaLore
+    if t.qgalore_full_ft:
+        cmd.append("--qgalore_full_ft")
+        cmd += ["--qgalore_targets", t.qgalore_targets]
+        cmd += ["--qgalore_rank", str(t.qgalore_rank)]
+        cmd += ["--qgalore_update_proj_gap", str(t.qgalore_update_proj_gap)]
+        cmd += ["--qgalore_scale", str(t.qgalore_scale)]
+        if t.qgalore_proj_type != "std":
+            cmd += ["--qgalore_proj_type", t.qgalore_proj_type]
+        cmd += ["--qgalore_proj_bits", str(t.qgalore_proj_bits)]
+        cmd += ["--qgalore_proj_group_size", str(t.qgalore_proj_group_size)]
+        cmd += ["--qgalore_weight_bits", str(t.qgalore_weight_bits)]
+        cmd += ["--qgalore_weight_group_size", str(t.qgalore_weight_group_size)]
+        cmd += ["--qgalore_min_weight_numel", str(t.qgalore_min_weight_numel)]
+        if t.qgalore_max_modules is not None:
+            cmd += ["--qgalore_max_modules", str(t.qgalore_max_modules)]
+        if not t.qgalore_proj_quant:
+            cmd.append("--no-qgalore_proj_quant")
+        if not t.qgalore_stochastic_round:
+            cmd.append("--no-qgalore_stochastic_round")
+        if not t.qgalore_load_on_cpu:
+            cmd.append("--no-qgalore_load_on_cpu")
+        if not t.qgalore_dequantize_save:
+            cmd.append("--no-qgalore_dequantize_save")
+        if t.qgalore_cos_threshold != 0.4:
+            cmd += ["--qgalore_cos_threshold", str(t.qgalore_cos_threshold)]
+        if t.qgalore_gamma_proj != 2.0:
+            cmd += ["--qgalore_gamma_proj", str(t.qgalore_gamma_proj)]
+        if t.qgalore_queue_size != 5:
+            cmd += ["--qgalore_queue_size", str(t.qgalore_queue_size)]
+        if t.qgalore_svd_method != "full":
+            cmd += ["--qgalore_svd_method", t.qgalore_svd_method]
+        if t.qgalore_svd_oversampling != 32:
+            cmd += ["--qgalore_svd_oversampling", str(t.qgalore_svd_oversampling)]
+        if t.qgalore_svd_niter != 1:
+            cmd += ["--qgalore_svd_niter", str(t.qgalore_svd_niter)]
+
+    # Sampling
+    if t.sample_every_n_steps:
+        cmd += ["--sample_every_n_steps", str(t.sample_every_n_steps)]
+    if t.sample_every_n_epochs:
+        cmd += ["--sample_every_n_epochs", str(t.sample_every_n_epochs)]
+    if sample_prompts:
+        cmd += ["--sample_prompts", sample_prompts]
+    if t.precache_sample_prompts:
+        cmd.append("--precache_sample_prompts")
+    if t.use_precached_sample_prompts:
+        cmd.append("--use_precached_sample_prompts")
+    if t.sample_prompts_cache:
+        cmd += ["--sample_prompts_cache", t.sample_prompts_cache]
+    if t.use_precached_sample_latents:
+        cmd.append("--use_precached_sample_latents")
+    if t.sample_latents_cache:
+        cmd += ["--sample_latents_cache", t.sample_latents_cache]
+    cmd += ["--sample_sampling_preset", t.sample_sampling_preset]
+    if t.sample_sigma_schedule != "auto":
+        cmd += ["--sample_sigma_schedule", t.sample_sigma_schedule]
+    if t.sample_sampler != "auto":
+        cmd += ["--sample_sampler", t.sample_sampler]
+    _append_optional(cmd, "--height", t.height)
+    _append_optional(cmd, "--width", t.width)
+    _append_optional(cmd, "--sample_num_frames", t.sample_num_frames)
+    _append_optional(cmd, "--video_cfg_scale", t.video_cfg_scale)
+    _append_optional(cmd, "--audio_cfg_scale", t.audio_cfg_scale)
+    if t.sample_with_offloading:
+        cmd.append("--sample_with_offloading")
+    if t.sample_merge_audio:
+        cmd.append("--sample_merge_audio")
+    if t.sample_disable_audio:
+        cmd.append("--sample_disable_audio")
+    if t.sample_at_first:
+        cmd.append("--sample_at_first")
+    if t.sample_tiled_vae:
+        cmd.append("--sample_tiled_vae")
+    if t.sample_vae_tile_size is not None:
+        cmd += ["--sample_vae_tile_size", str(t.sample_vae_tile_size)]
+    if t.sample_vae_tile_overlap is not None:
+        cmd += ["--sample_vae_tile_overlap", str(t.sample_vae_tile_overlap)]
+    if t.sample_vae_temporal_tile_size is not None:
+        cmd += ["--sample_vae_temporal_tile_size", str(t.sample_vae_temporal_tile_size)]
+    if t.sample_vae_temporal_tile_overlap is not None:
+        cmd += ["--sample_vae_temporal_tile_overlap", str(t.sample_vae_temporal_tile_overlap)]
+    if t.sample_two_stage:
+        cmd.append("--sample_two_stage")
+    if t.sample_audio_only:
+        cmd.append("--sample_audio_only")
+    if t.sample_disable_flash_attn:
+        cmd.append("--sample_disable_flash_attn")
+    if not t.sample_i2v_token_timestep_mask:
+        cmd.append("--no-sample_i2v_token_timestep_mask")
+    if not t.sample_audio_subprocess:
+        cmd.append("--no-sample_audio_subprocess")
+    if t.sample_include_reference:
+        cmd.append("--sample_include_reference")
+    if t.reference_downscale != 1:
+        cmd += ["--reference_downscale", str(t.reference_downscale)]
+    if t.reference_frames != 1:
+        cmd += ["--reference_frames", str(t.reference_frames)]
+
+    # Validation
+    if t.validate_every_n_steps is not None:
+        cmd += ["--validate_every_n_steps", str(t.validate_every_n_steps)]
+    if t.validate_every_n_epochs is not None:
+        cmd += ["--validate_every_n_epochs", str(t.validate_every_n_epochs)]
+    if t.validation_dataset_config:
+        cmd += ["--validation_dataset_config", t.validation_dataset_config]
+    if t.validation_extra_configs:
+        cmd += ["--validation_extra_configs"] + _split_cli_args(t.validation_extra_configs)
+    if t.num_validation_batches is not None:
+        cmd += ["--num_validation_batches", str(t.num_validation_batches)]
+    if t.validation_timesteps:
+        cmd += ["--validation_timesteps", t.validation_timesteps]
+    if t.offload_optimizer_during_validation:
+        cmd.append("--offload_optimizer_during_validation")
+
+    # Output
+    cmd += ["--output_dir", _effective_output_dir(t.output_dir)]
+    if t.output_name:
+        cmd += ["--output_name", t.output_name]
+    if t.save_every_n_epochs:
+        cmd += ["--save_every_n_epochs", str(t.save_every_n_epochs)]
+    if t.save_every_n_steps:
+        cmd += ["--save_every_n_steps", str(t.save_every_n_steps)]
+    if t.save_last_n_epochs is not None:
+        cmd += ["--save_last_n_epochs", str(t.save_last_n_epochs)]
+    if t.save_last_n_steps is not None:
+        cmd += ["--save_last_n_steps", str(t.save_last_n_steps)]
+    if t.save_state:
+        cmd.append("--save_state")
+    if t.save_state_on_train_end:
+        cmd.append("--save_state_on_train_end")
+    if t.no_final_save:
+        cmd.append("--no_final_save")
+    if t.save_checkpoint_metadata:
+        cmd.append("--save_checkpoint_metadata")
+    if t.no_metadata:
+        cmd.append("--no_metadata")
+    if t.no_convert_to_comfy:
+        cmd.append("--no_convert_to_comfy")
+    if t.save_comfy_format:
+        cmd.append("--save_comfy_format")
+    if t.save_merged_checkpoint:
+        cmd.append("--save_merged_checkpoint")
+    if t.log_with:
+        cmd += ["--log_with", t.log_with]
+    if t.log_with and t.logging_dir:
+        cmd += ["--logging_dir", t.logging_dir]
+    if t.log_prefix:
+        cmd += ["--log_prefix", t.log_prefix]
+    if t.log_tracker_name:
+        cmd += ["--log_tracker_name", t.log_tracker_name]
+    if t.log_tracker_config:
+        cmd += ["--log_tracker_config", t.log_tracker_config]
+    if t.log_config:
+        cmd.append("--log_config")
+    if t.wandb_run_name:
+        cmd += ["--wandb_run_name", t.wandb_run_name]
+    if t.wandb_api_key:
+        cmd += ["--wandb_api_key", t.wandb_api_key]
+    if t.log_cuda_memory_every_n_steps is not None:
+        cmd += ["--log_cuda_memory_every_n_steps", str(t.log_cuda_memory_every_n_steps)]
+    if t.resume:
+        cmd += ["--resume", t.resume]
+    if t.autoresume:
+        cmd.append("--autoresume")
+    if t.reset_optimizer:
+        cmd.append("--reset_optimizer")
+    if t.reset_optimizer_params:
+        cmd.append("--reset_optimizer_params")
+    if t.reset_dataloader:
+        cmd.append("--reset_dataloader")
+    if t.training_comment:
+        cmd += ["--training_comment", t.training_comment]
+    if t.loss_type != "mse":
+        cmd += ["--loss_type", t.loss_type]
+    if t.loss_type in ("huber", "smooth_l1") and t.huber_delta != 1.0:
+        cmd += ["--huber_delta", str(t.huber_delta)]
+
+    # EMA and instrumentation
+    if t.use_ema:
+        cmd.append("--use_ema")
+        if t.ema_decay != 0.9999:
+            cmd += ["--ema_decay", str(t.ema_decay)]
+        if t.ema_update_after_step != 100:
+            cmd += ["--ema_update_after_step", str(t.ema_update_after_step)]
+        if t.ema_update_every != 1:
+            cmd += ["--ema_update_every", str(t.ema_update_every)]
+        if t.save_ema_only:
+            cmd.append("--save_ema_only")
+        if t.ema_cpu_offload:
+            cmd.append("--ema_cpu_offload")
+    if t.log_weight_drift_every:
+        cmd += ["--log_weight_drift_every", str(t.log_weight_drift_every)]
+        cmd += ["--weight_drift_target", t.weight_drift_target]
+        cmd += ["--weight_drift_top_k", str(t.weight_drift_top_k)]
+    if t.log_grad_norm_every:
+        cmd += ["--log_grad_norm_every", str(t.log_grad_norm_every)]
+        cmd += ["--grad_norm_target", t.grad_norm_target]
+        cmd += ["--grad_norm_top_k", str(t.grad_norm_top_k)]
+    if t.log_output_drift_every:
+        cmd += ["--log_output_drift_every", str(t.log_output_drift_every)]
+        cmd += ["--output_drift_batches", str(t.output_drift_batches)]
+        cmd += ["--output_drift_timestep", str(t.output_drift_timestep)]
+
+    # TREAD token routing
+    if t.tread:
+        cmd.append("--tread")
+        args_parts = []
+        _append_key_value_args(args_parts, t.tread_args)
+        if t.tread_target != "video":
+            args_parts.append(f"target={t.tread_target}")
+        if t.tread_selection_ratio != 0.5:
+            args_parts.append(f"selection_ratio={t.tread_selection_ratio}")
+        if t.tread_start_layer_idx is not None:
+            args_parts.append(f"start_layer_idx={t.tread_start_layer_idx}")
+        if t.tread_end_layer_idx is not None:
+            args_parts.append(f"end_layer_idx={t.tread_end_layer_idx}")
+        if args_parts:
+            cmd += ["--tread_args"] + args_parts
 
     cmd += _split_cli_args(t.extra_args)
     return cmd

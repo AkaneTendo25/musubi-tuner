@@ -25,6 +25,7 @@ ProcessType = Literal[
     "cache_text",
     "cache_dino",
     "training",
+    "full_finetune",
     "remote_stage_launcher",
     "remote_stage_server",
     "inference",
@@ -389,7 +390,7 @@ class ManagedProcess:
             self._reader_thread.start()
 
     def _supports_graceful_stop(self) -> bool:
-        return self.proc_type in {"training", "slider_training"}
+        return self.proc_type in {"training", "full_finetune", "slider_training"}
 
     def _request_graceful_training_stop(self) -> bool:
         if not self._supports_graceful_stop() or not self._stop_file:
@@ -590,7 +591,7 @@ class ProcessManager:
             env["PYTHONIOENCODING"] = "utf-8"
             env["PYTHONUTF8"] = "1"
             env["PYTHONUNBUFFERED"] = "1"
-            if proc_type in ("training", "slider_training"):
+            if proc_type in ("training", "full_finetune", "slider_training"):
                 env["MUSUBI_DASHBOARD_METRICS"] = "1"
                 stop_file = Path(tempfile.gettempdir()) / f"musubi_dashboard_stop_{os.getpid()}_{proc_type}.flag"
                 try:
@@ -606,7 +607,7 @@ class ProcessManager:
                 env["MUSUBI_DASHBOARD_CACHE_STATUS_FILE"] = str(progress_file)
 
             mp = ManagedProcess(cmd, cwd=cwd, env=env, proc_type=proc_type, progress_file=progress_file)
-            if proc_type in ("training", "slider_training"):
+            if proc_type in ("training", "full_finetune", "slider_training"):
                 mp._stop_file = Path(env["MUSUBI_DASHBOARD_STOP_FILE"])
             self._processes[proc_type] = mp
 
@@ -639,6 +640,7 @@ class ProcessManager:
             "cache_text",
             "cache_dino",
             "training",
+            "full_finetune",
             "remote_stage_launcher",
             "remote_stage_server",
             "inference",

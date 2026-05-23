@@ -169,6 +169,7 @@ def create_management_app(project_path: Optional[str] = None, dev_frontend_url: 
 
     # SvelteKit frontend (must be last — catches all routes)
     if os.path.isdir(FRONTEND_DIST):
+
         @app.get("/{full_path:path}")
         async def serve_frontend(full_path: str):
             normalized = (full_path or "").lstrip("/")
@@ -187,6 +188,7 @@ def create_management_app(project_path: Optional[str] = None, dev_frontend_url: 
                 return FileResponse(file_path, headers=NO_CACHE_HEADERS)
             return FileResponse(os.path.join(FRONTEND_DIST, "index.html"), headers=NO_CACHE_HEADERS)
     else:
+
         @app.get("/")
         async def no_frontend():
             return HTMLResponse(
@@ -200,8 +202,14 @@ def create_management_app(project_path: Optional[str] = None, dev_frontend_url: 
 def _get_run_dir(app: FastAPI) -> Optional[str]:
     """Get the current training output directory from project config."""
     config: ProjectConfig | None = app.state.project_config
-    if config and config.training.output_dir:
-        run_dir = Path(config.training.output_dir)
+    if not config:
+        return None
+
+    pm: ProcessManager = app.state.process_manager
+    process_type = "full_finetune" if pm.get_status("full_finetune").get("state") in {"running", "stopping"} else "training"
+    section = config.full_finetune if process_type == "full_finetune" else config.training
+    if section.output_dir:
+        run_dir = Path(section.output_dir)
         if not run_dir.is_absolute() and config.project_dir:
             run_dir = Path(config.project_dir) / run_dir
         return str(run_dir)
@@ -210,5 +218,6 @@ def _get_run_dir(app: FastAPI) -> Optional[str]:
 
 def _training_dashboard_active(app: FastAPI) -> bool:
     pm: ProcessManager = app.state.process_manager
-    state = pm.get_status("training").get("state")
-    return state in {"running", "stopping"}
+    return any(
+        pm.get_status(process_type).get("state") in {"running", "stopping"} for process_type in ("training", "full_finetune")
+    )
