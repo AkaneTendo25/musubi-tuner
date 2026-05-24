@@ -2230,12 +2230,13 @@ def ltx2_finetune_setup_parser(parser: argparse.ArgumentParser) -> argparse.Argu
         help="Optional cap on the number of Linear modules replaced by Q-GaLore, useful for smoke tests.",
     )
     parser.add_argument(
-        "--qgalore_load_on_cpu",
-        action=argparse.BooleanOptionalAction,
-        default=True,
+        "--qgalore_load_device",
+        type=str,
+        default="cuda",
+        choices=["cuda", "cpu"],
         help=(
-            "Load the LTX-2 transformer on CPU before Q-GaLore replacement, then move quantized weights to GPU. "
-            "Enabled by default to avoid the bf16 GPU load spike."
+            "Device used for the initial LTX-2 transformer load before Q-GaLore/QAPOLLO Linear replacement. "
+            "cuda is faster and is the default; cpu avoids the temporary bf16 GPU load spike."
         ),
     )
     parser.add_argument("--qgalore_cos_threshold", type=float, default=0.4, help="Q-GaLore lazy subspace cosine threshold.")
@@ -3547,7 +3548,11 @@ def main() -> None:
     blocks_to_swap = int(getattr(args, "blocks_to_swap", 0) or 0)
     trainer.blocks_to_swap = blocks_to_swap
     remote_prune_local_blocks = ltx2_remote_stage and bool(getattr(args, "ltx2_remote_stage_prune_local_blocks", False))
-    qgalore_cpu_load = bool(getattr(args, "qgalore_full_ft", False)) and bool(getattr(args, "qgalore_load_on_cpu", True))
+    qgalore_load_device = str(getattr(args, "qgalore_load_device", "cuda") or "cuda").lower()
+    if qgalore_load_device not in {"cuda", "cpu"}:
+        raise ValueError(f"--qgalore_load_device must be 'cuda' or 'cpu', got {qgalore_load_device!r}")
+    args.qgalore_load_device = qgalore_load_device
+    qgalore_cpu_load = bool(getattr(args, "qgalore_full_ft", False)) and qgalore_load_device == "cpu"
     loading_device = (
         "cpu" if blocks_to_swap > 0 or ltx2_model_parallel or remote_prune_local_blocks or qgalore_cpu_load else accelerator.device
     )
@@ -4116,7 +4121,48 @@ def main() -> None:
         except Exception as exc:
             logger.warning("validation_extra_configs[%s]: failed to load %s: %s", _cat, _path, exc)
 
-    trainer.resume_from_local_or_hf_if_specified(accelerator, args)
+    if getattr(args, "autoresume", False) and not args.resume:
+        latest = trainer._find_latest_state_dir(args)
+        if latest:
+            logger.info("autoresume: found latest state directory: %s", latest)
+            args.resume = latest
+            args._autoresume_selected = True
+        else:
+            logger.info("autoresume: no saved state found in output_dir, starting from scratch")
+            args._autoresume_selected = False
+    else:
+        args._autoresume_selected = False
+
+    inner_optimizer = optimizer.optimizer if hasattr(optimizer, "optimizer") else optimizer
+    saved_param_groups = None
+    if getattr(args, "reset_optimizer_params", False):
+        saved_param_groups = [{k: v for k, v in pg.items() if k != "params"} for pg in inner_optimizer.param_groups]
+
+    resume_metadata = train_utils.load_resume_metadata(args.resume) if args.resume else None
+    initial_global_step = trainer.resume_from_local_or_hf_if_specified(accelerator, args)
+
+    if initial_global_step > 0:
+        if getattr(args, "reset_optimizer", False):
+            inner_optimizer.state.clear()
+            accelerator.print("reset optimizer state (cleared momentum/variance)")
+
+        if getattr(args, "reset_optimizer_params", False) and saved_param_groups is not None:
+            for pg, saved in zip(inner_optimizer.param_groups, saved_param_groups):
+                for k, v in saved.items():
+                    pg[k] = v
+            accelerator.print("reset optimizer param groups to CLI values")
+
+        if getattr(args, "reset_optimizer", False) or getattr(args, "reset_optimizer_params", False):
+            for pg in inner_optimizer.param_groups:
+                if "initial_lr" in pg:
+                    pg["lr"] = pg["initial_lr"]
+                    del pg["initial_lr"]
+            new_inner_scheduler = trainer.get_lr_scheduler(args, inner_optimizer, accelerator.num_processes)
+            if hasattr(lr_scheduler, "scheduler"):
+                lr_scheduler.scheduler = new_inner_scheduler
+            else:
+                lr_scheduler = new_inner_scheduler
+            accelerator.print("recreated LR scheduler (restarting schedule from step 0)")
 
     # Initialize EMA after model is prepared
     ema_model = None
@@ -4337,7 +4383,7 @@ def main() -> None:
         "ss_qgalore_scale": getattr(args, "qgalore_scale", None),
         "ss_qgalore_proj_quant": bool(getattr(args, "qgalore_proj_quant", False)),
         "ss_qgalore_proj_bits": getattr(args, "qgalore_proj_bits", None),
-        "ss_qgalore_load_on_cpu": bool(getattr(args, "qgalore_load_on_cpu", True)),
+        "ss_qgalore_load_device": getattr(args, "qgalore_load_device", "cuda"),
         "ss_qgalore_svd_method": getattr(args, "qgalore_svd_method", None),
         "ss_qgalore_svd_oversampling": getattr(args, "qgalore_svd_oversampling", None),
         "ss_qgalore_svd_niter": getattr(args, "qgalore_svd_niter", None),
@@ -4559,11 +4605,15 @@ def main() -> None:
             setup_logs[f"setup/group_{i}_param_numel"] = float(sum(int(p.numel()) for p in params))
         accelerator.log(setup_logs, step=0)
 
-    progress_bar = tqdm(range(args.max_train_steps), smoothing=0, disable=not accelerator.is_local_main_process, desc="steps")
-
     epoch_to_start = 0
-    global_step = 0
+    steps_to_skip_in_epoch = 0
+    global_step = initial_global_step
     loss_recorder = train_utils.LossRecorder()
+    if initial_global_step > 0 and getattr(trainer, "_resume_state_dir", None):
+        _meta = train_utils.load_resume_metadata(trainer._resume_state_dir)
+        if _meta and "loss_avg" in _meta:
+            loss_recorder.prefill(_meta["loss_avg"], _meta.get("loss_count", 0))
+            accelerator.print(f"  restored loss average: {_meta['loss_avg']:.4f} (from {_meta.get('loss_count', 0)} steps)")
     self_flow_loss = None
     if train_dataset_group_for_audio_sampler is None:
         del train_dataset_group
@@ -5600,13 +5650,47 @@ def main() -> None:
                     pass
             optimizer_train_fn()
 
-    # For --sample_at_first
-    if should_sample_images(args, global_step, epoch=0):
-        run_sampling_safely(0, global_step)
-
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
     num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
     metadata["ss_num_epochs"] = str(num_train_epochs)
+
+    resume_batch_offset = 0
+    if initial_global_step > 0 and resume_metadata is not None and resume_metadata.get("global_step", 0) > 0:
+        saved_epoch = int(resume_metadata.get("epoch", 1) or 1)
+        saved_step_in_epoch = int(resume_metadata.get("step_in_epoch", 0) or 0)
+        if not getattr(args, "reset_dataloader", False) and saved_step_in_epoch > 0:
+            resume_batch_offset = saved_step_in_epoch % max(len(train_dataloader), 1)
+            if resume_batch_offset > 0:
+                epoch_to_start = max(saved_epoch - 1, 0)
+                steps_to_skip_in_epoch = resume_batch_offset
+            else:
+                epoch_to_start = max(saved_epoch, 0)
+        else:
+            inferred_batch_count = initial_global_step * args.gradient_accumulation_steps
+            resume_batch_offset = inferred_batch_count % max(len(train_dataloader), 1)
+            epoch_to_start = inferred_batch_count // max(len(train_dataloader), 1)
+            if not getattr(args, "reset_dataloader", False):
+                steps_to_skip_in_epoch = resume_batch_offset
+    else:
+        inferred_batch_count = initial_global_step * args.gradient_accumulation_steps
+        epoch_to_start = inferred_batch_count // max(len(train_dataloader), 1) if initial_global_step > 0 else 0
+        if initial_global_step > 0 and not getattr(args, "reset_dataloader", False):
+            steps_to_skip_in_epoch = inferred_batch_count % max(len(train_dataloader), 1)
+
+    last_resume_epoch = max(epoch_to_start + 1, 1)
+    last_resume_step_in_epoch = steps_to_skip_in_epoch
+
+    progress_bar = tqdm(
+        range(args.max_train_steps),
+        initial=initial_global_step,
+        smoothing=0,
+        disable=not accelerator.is_local_main_process,
+        desc="steps",
+    )
+
+    # For --sample_at_first
+    if should_sample_images(args, global_step, epoch=0):
+        run_sampling_safely(0, global_step)
 
     accelerator.print("running training / 学習開始")
     accelerator.print(f"  num examples / サンプル数: {num_train_items}")
@@ -5620,6 +5704,11 @@ def main() -> None:
     )
     accelerator.print(f"  gradient accumulation steps / 勾配を合計するステップ数 = {args.gradient_accumulation_steps}")
     accelerator.print(f"  total optimization steps / 学習ステップ数: {args.max_train_steps}")
+    if initial_global_step > 0:
+        msg = f"  resuming from step {initial_global_step}, epoch {epoch_to_start + 1}/{num_train_epochs}"
+        if steps_to_skip_in_epoch > 0:
+            msg += f", skipping {steps_to_skip_in_epoch} batches in epoch"
+        accelerator.print(msg)
 
     optimizer_train_fn()
 
@@ -5820,6 +5909,10 @@ def main() -> None:
         for step, batch in enumerate(train_dataloader):
             if handle_dashboard_stop_request(global_step, epoch, step):
                 return
+
+            if steps_to_skip_in_epoch > 0:
+                steps_to_skip_in_epoch -= 1
+                continue
 
             with accelerator.accumulate(transformer):
                 motion_micro_step += 1
@@ -6374,6 +6467,8 @@ def main() -> None:
             if accelerator.sync_gradients:
                 progress_bar.update(1)
                 global_step += 1
+                last_resume_epoch = epoch + 1
+                last_resume_step_in_epoch = step + 1
                 current_loss = loss_for_step.item()
                 loss_recorder.add(epoch=epoch, step=step, loss=current_loss)
 
@@ -6566,6 +6661,8 @@ def main() -> None:
                 train_utils.save_and_remove_state_on_epoch_end(
                     args, accelerator, epoch + 1, global_step=global_step, step_in_epoch=0
                 )
+                last_resume_epoch = epoch + 1
+                last_resume_step_in_epoch = 0
                 save_ema_state()
                 save_self_flow_state()
             clean_memory_on_device(accelerator.device)
@@ -6585,7 +6682,13 @@ def main() -> None:
         run_validation_with_optimizer_offload(global_step, num_train_epochs)
 
     if accelerator.is_main_process and (args.save_state or args.save_state_on_train_end):
-        train_utils.save_state_on_train_end(args, accelerator, global_step=global_step, epoch=num_train_epochs, step_in_epoch=0)
+        train_utils.save_state_on_train_end(
+            args,
+            accelerator,
+            global_step=global_step,
+            epoch=last_resume_epoch,
+            step_in_epoch=last_resume_step_in_epoch,
+        )
         save_ema_state()
         save_self_flow_state()
 

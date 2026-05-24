@@ -694,7 +694,7 @@ class FullFinetuneConfig(TrainingConfig):
     qgalore_stochastic_round: bool = True
     qgalore_min_weight_numel: int = 16384
     qgalore_max_modules: Optional[int] = None
-    qgalore_load_on_cpu: bool = True
+    qgalore_load_device: Literal["cuda", "cpu"] = "cuda"
     qgalore_cos_threshold: float = 0.4
     qgalore_gamma_proj: float = 2.0
     qgalore_queue_size: int = 5
@@ -712,6 +712,7 @@ class FullFinetuneConfig(TrainingConfig):
     apollo_proj: Literal["random", "svd"] = "random"
     apollo_proj_type: Literal["std", "reverse_std", "left", "right"] = "std"
     apollo_scale_type: Literal["channel", "tensor"] = "channel"
+    qapollo_optim_bits: Literal[8, 32] = 8
 
     # Full fine-tune-only controls.
     ltx2_finetune_block_swap_mode: Literal["default", "linear", "full"] = "default"

@@ -49,6 +49,13 @@ def is_qgalore_parameter(parameter: Any) -> bool:
     return bool(getattr(parameter, "_qgalore_weight", False))
 
 
+def register_qgalore_resume_safe_globals() -> None:
+    """Allow PyTorch 2.6+ weights-only loading of Q-GaLore optimizer state."""
+    add_safe_globals = getattr(torch.serialization, "add_safe_globals", None)
+    if add_safe_globals is not None:
+        add_safe_globals([QGaLoreProjector])
+
+
 def _quantize_affine_uint(
     weight: torch.Tensor,
     *,
@@ -158,6 +165,7 @@ class QGaLoreProjector:
         if full_rank_grad.dim() != 2:
             raise RuntimeError(f"Q-GaLore expects 2-D gradients, got shape {tuple(full_rank_grad.shape)}")
 
+        self._move_state_to_device(full_rank_grad.device)
         use_right = full_rank_grad.shape[0] >= full_rank_grad.shape[1]
         if self.ortho_matrix is None or step % self.update_proj_gap == 0:
             float_ortho_matrix = self._get_orthogonal_matrix(full_rank_grad, "right" if use_right else "left")
@@ -171,12 +179,23 @@ class QGaLoreProjector:
         return torch.matmul(ortho.t(), full_rank_grad)
 
     def project_back(self, low_rank_grad: torch.Tensor) -> torch.Tensor:
+        self._move_state_to_device(low_rank_grad.device)
         ortho = self._load_ortho_matrix()
         if low_rank_grad.shape[0] >= low_rank_grad.shape[1]:
             full_rank_grad = torch.matmul(low_rank_grad, ortho)
         else:
             full_rank_grad = torch.matmul(ortho, low_rank_grad)
         return full_rank_grad * self.scale
+
+    def _move_state_to_device(self, device: torch.device) -> None:
+        if self.ortho_matrix is not None and self.ortho_matrix.device != device:
+            self.ortho_matrix = self.ortho_matrix.to(device=device)
+        if self.ortho_matrix_scales is not None and self.ortho_matrix_scales.device != device:
+            self.ortho_matrix_scales = self.ortho_matrix_scales.to(device=device)
+        if self.ortho_matrix_zeros is not None and self.ortho_matrix_zeros.device != device:
+            self.ortho_matrix_zeros = self.ortho_matrix_zeros.to(device=device)
+        if self.past_ortho_vector is not None and self.past_ortho_vector.device != device:
+            self.past_ortho_vector = self.past_ortho_vector.to(device=device)
 
     def _maybe_extend_gap(self, ortho_matrix: torch.Tensor, *, use_right: bool) -> None:
         if self.past_ortho_vector is not None and self.queue_size > 0:

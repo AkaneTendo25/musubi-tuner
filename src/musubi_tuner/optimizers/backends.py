@@ -146,16 +146,87 @@ def is_qapollo_optimizer_type(optimizer_type: str | None) -> bool:
     return opt == "apollo_torch.qapolloadamw" or opt.startswith("apollo_torch.q_apollo.")
 
 
+def register_apollo_resume_safe_globals() -> None:
+    """Allow PyTorch 2.6+ weights-only loading of APOLLO optimizer state.
+
+    APOLLO stores its projector object in the optimizer checkpoint. PyTorch 2.6
+    changed torch.load's default to weights_only=True, so the class must be
+    allowlisted before Accelerate loads optimizer.bin.
+    """
+    try:
+        from apollo_torch.random_projector import GradientProjector
+    except ImportError:
+        return
+
+    add_safe_globals = getattr(torch.serialization, "add_safe_globals", None)
+    if add_safe_globals is not None:
+        add_safe_globals([GradientProjector])
+    patch_apollo_projector_device_transfer()
+
+
+def _move_apollo_projector_value(value: Any, device: torch.device) -> Any:
+    if torch.is_tensor(value):
+        return value.to(device=device) if value.device != device else value
+    if isinstance(value, list):
+        return [_move_apollo_projector_value(item, device) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_move_apollo_projector_value(item, device) for item in value)
+    return value
+
+
+def _move_apollo_projector_to_device(projector: Any, device: torch.device) -> None:
+    if not hasattr(projector, "ortho_matrix"):
+        return
+    projector.ortho_matrix = _move_apollo_projector_value(projector.ortho_matrix, device)
+
+
+def patch_apollo_projector_device_transfer() -> None:
+    """Make APOLLO projector checkpoints device-safe after optimizer resume."""
+    try:
+        from apollo_torch.random_projector import GradientProjector
+        from apollo_torch.svd_projector import GaLoreProjector
+    except ImportError:
+        return
+
+    for projector_class in (GradientProjector, GaLoreProjector):
+        if not getattr(projector_class, "_musubi_device_safe_project", False):
+            original_project = projector_class.project
+
+            def project(self, full_rank_grad, iter, _original_project=original_project):
+                _move_apollo_projector_to_device(self, full_rank_grad.device)
+                return _original_project(self, full_rank_grad, iter)
+
+            projector_class.project = project
+            projector_class._musubi_device_safe_project = True
+
+        if hasattr(projector_class, "project_back") and not getattr(projector_class, "_musubi_device_safe_project_back", False):
+            original_project_back = projector_class.project_back
+
+            def project_back(self, low_rank_grad, _original_project_back=original_project_back):
+                _move_apollo_projector_to_device(self, low_rank_grad.device)
+                return _original_project_back(self, low_rank_grad)
+
+            projector_class.project_back = project_back
+            projector_class._musubi_device_safe_project_back = True
+
+
 def resolve_apollo_optimizer_class(optimizer_type: str):
+    patch_apollo_projector_device_transfer()
     opt = optimizer_type.lower()
     if opt in APOLLO_OPTIMIZER_ALIASES:
         class_name = APOLLO_OPTIMIZER_ALIASES[opt]
-        return _load_class(("apollo_torch",), class_name, "apollo-torch")
+        optimizer_class = _load_class(("apollo_torch",), class_name, "apollo-torch")
+        if class_name == "QAPOLLOAdamW":
+            return _patch_qapollo_adamw_optim_bits(optimizer_class)
+        return optimizer_class
 
     values = optimizer_type.split(".")
     module_name = ".".join(values[:-1])
     class_name = values[-1]
-    return _load_class((module_name,), class_name, "apollo-torch")
+    optimizer_class = _load_class((module_name,), class_name, "apollo-torch")
+    if is_qapollo_optimizer_type(optimizer_type):
+        return _patch_qapollo_adamw_optim_bits(optimizer_class)
+    return optimizer_class
 
 
 def is_torchao_optimizer_instance(optimizer: Any) -> bool:
@@ -167,11 +238,187 @@ def is_optimi_optimizer_instance(optimizer: Any) -> bool:
 
 
 def is_apollo_optimizer_instance(optimizer: Any) -> bool:
-    return optimizer.__class__.__module__ in {"apollo_torch.apollo", "apollo_torch.q_apollo"}
+    return bool(getattr(optimizer, "_musubi_apollo_optimizer", False)) or optimizer.__class__.__module__ in {
+        "apollo_torch.apollo",
+        "apollo_torch.q_apollo",
+    }
 
 
 def is_qapollo_optimizer_instance(optimizer: Any) -> bool:
-    return optimizer.__class__.__module__ == "apollo_torch.q_apollo"
+    return bool(getattr(optimizer, "_musubi_qapollo_optimizer", False)) or optimizer.__class__.__module__ == "apollo_torch.q_apollo"
+
+
+def _patch_qapollo_adamw_optim_bits(optimizer_class: Any):
+    """Return a QAPOLLO AdamW class that honors optim_bits.
+
+    apollo-torch 1.0.3 exposes an optim_bits argument on q_apollo.AdamW, but its
+    constructor passes a hard-coded 32 to bitsandbytes Optimizer2State. Keep the
+    upstream update logic and only replace the constructor so QAPOLLO can use
+    quantized optimizer state when requested.
+    """
+    if getattr(optimizer_class, "_musubi_qapollo_honors_optim_bits", False):
+        return optimizer_class
+
+    try:
+        from bitsandbytes.optim.optimizer import Optimizer2State
+    except ImportError as exc:  # pragma: no cover - resolved by apollo-torch users
+        raise ImportError("QAPOLLOAdamW requires bitsandbytes") from exc
+
+    class MusubiQAPOLLOAdamW(optimizer_class):
+        _musubi_apollo_optimizer = True
+        _musubi_qapollo_optimizer = True
+        _musubi_qapollo_honors_optim_bits = True
+
+        def __init__(
+            self,
+            params,
+            lr=1e-3,
+            betas=(0.9, 0.999),
+            eps=1e-8,
+            weight_decay=1e-2,
+            amsgrad=False,
+            optim_bits=8,
+            args=None,
+            min_8bit_size=4096,
+            percentile_clipping=100,
+            block_wise=True,
+            is_paged=False,
+            scale_front: bool = False,
+            no_deprecation_warning: bool = True,
+        ):
+            del amsgrad, no_deprecation_warning  # kept for upstream signature compatibility
+            optim_bits = int(optim_bits)
+            if optim_bits not in {8, 32}:
+                raise ValueError(f"QAPOLLOAdamW supports optim_bits=8 or 32, got {optim_bits}")
+
+            Optimizer2State.__init__(
+                self,
+                "adam",
+                params,
+                lr,
+                betas,
+                eps,
+                weight_decay,
+                optim_bits,
+                args,
+                min_8bit_size,
+                percentile_clipping,
+                block_wise,
+                is_paged=is_paged,
+            )
+            self.scale_front = scale_front
+            self._musubi_optim_bits = optim_bits
+            self.init_seeds()
+
+        @torch.no_grad()
+        def update_step(self, group, p, gindex, pindex, flag_use_float_grad=False):
+            from bitsandbytes import functional as bnb_F
+
+            p.data = p.data.contiguous()
+            if flag_use_float_grad:
+                p.float_grad = p.float_grad.contiguous()
+                grad = p.float_grad
+            else:
+                p.grad = p.grad.contiguous()
+                grad = p.grad
+
+            state = self.state[p]
+            config = self.get_config(gindex, pindex, group)
+
+            lr = group["lr"]
+            if "rank" in group:
+                lr = 1.0
+
+            state["step"] += 1
+            step = state["step"]
+
+            if config["percentile_clipping"] < 100:
+                _current_gnorm, _clip_value, gnorm_scale = bnb_F.percentile_clipping(
+                    grad,
+                    state["gnorm_vec"],
+                    step,
+                    config["percentile_clipping"],
+                )
+            else:
+                gnorm_scale = 1.0
+
+            if state["state1"].dtype == torch.float:
+                bnb_F.optimizer_update_32bit(
+                    self.optimizer_name,
+                    g=grad,
+                    p=p,
+                    state1=state["state1"],
+                    beta1=config["betas"][0],
+                    eps=config["eps"],
+                    step=step,
+                    lr=lr,
+                    state2=state["state2"],
+                    beta2=config["betas"][1],
+                    gnorm_scale=gnorm_scale,
+                    unorm_vec=state["unorm_vec"] if config["max_unorm"] > 0.0 else None,
+                    max_unorm=config["max_unorm"],
+                    skip_zeros=config["skip_zeros"],
+                    weight_decay=0.0,
+                )
+                return
+
+            if state["state1"].dtype == torch.uint8 and not config["block_wise"]:
+                bnb_F.optimizer_update_8bit(
+                    self.optimizer_name,
+                    grad,
+                    p,
+                    state["state1"],
+                    state["state2"],
+                    config["betas"][0],
+                    config["betas"][1],
+                    config["eps"],
+                    step,
+                    lr,
+                    state["qmap1"],
+                    state["qmap2"],
+                    state["max1"],
+                    state["max2"],
+                    state["new_max1"],
+                    state["new_max2"],
+                    0.0,
+                    gnorm_scale=gnorm_scale,
+                    unorm_vec=state["unorm_vec"] if config["max_unorm"] > 0.0 else None,
+                    max_unorm=config["max_unorm"],
+                )
+                state["max1"], state["new_max1"] = state["new_max1"], state["max1"]
+                state["max2"], state["new_max2"] = state["new_max2"], state["max2"]
+                return
+
+            if state["state1"].dtype == torch.uint8 and config["block_wise"]:
+                bnb_F.optimizer_update_8bit_blockwise(
+                    self.optimizer_name,
+                    grad,
+                    p,
+                    state["state1"],
+                    state["state2"],
+                    config["betas"][0],
+                    config["betas"][1],
+                    config["betas"][2] if len(config["betas"]) >= 3 else 0.0,
+                    config.get("alpha", 0.0),
+                    config["eps"],
+                    step,
+                    lr,
+                    state["qmap1"],
+                    state["qmap2"],
+                    state["absmax1"],
+                    state["absmax2"],
+                    0.0,
+                    gnorm_scale=gnorm_scale,
+                    skip_zeros=config["skip_zeros"],
+                )
+                return
+
+            raise RuntimeError(f"Unsupported QAPOLLO state dtype: {state['state1'].dtype}")
+
+    MusubiQAPOLLOAdamW.__name__ = getattr(optimizer_class, "__name__", "QAPOLLOAdamW")
+    MusubiQAPOLLOAdamW.__qualname__ = getattr(optimizer_class, "__qualname__", MusubiQAPOLLOAdamW.__name__)
+    MusubiQAPOLLOAdamW.__module__ = getattr(optimizer_class, "__module__", __name__)
+    return MusubiQAPOLLOAdamW
 
 
 def patch_optimi_fused_step_param(optimizer: Any) -> bool:

@@ -322,7 +322,7 @@
 		update('qgalore_weight_bits', 8);
 		update('qgalore_weight_group_size', 256);
 		update('qgalore_stochastic_round', true);
-		update('qgalore_load_on_cpu', true);
+		update('qgalore_load_device', 'cuda');
 		update('qgalore_svd_method', 'lowrank');
 		update('qgalore_svd_oversampling', 32);
 		update('qgalore_svd_niter', 1);
@@ -350,12 +350,13 @@
 		update('apollo_proj', 'random');
 		update('apollo_proj_type', 'std');
 		update('apollo_scale_type', 'channel');
+		update('qapollo_optim_bits', 8);
 		if (quantized) {
 			update('fp8_base', false);
 			update('fp8_scaled', false);
 			update('nf4_base', false);
 			update('qgalore_targets', 'video');
-			update('qgalore_load_on_cpu', true);
+			update('qgalore_load_device', 'cuda');
 			update('qgalore_weight_bits', 8);
 			update('qgalore_weight_group_size', 256);
 			update('qgalore_stochastic_round', true);
@@ -614,7 +615,7 @@
 					<FormToggle fieldPath="full_finetune.qgalore_full_ft" checked={t.qgalore_full_ft ?? false} onchange={(e) => update('qgalore_full_ft', e.target.checked)} />
 					<FormToggle fieldPath="full_finetune.qgalore_proj_quant" checked={t.qgalore_proj_quant ?? true} onchange={(e) => update('qgalore_proj_quant', e.target.checked)} />
 					<FormToggle fieldPath="full_finetune.qgalore_stochastic_round" checked={t.qgalore_stochastic_round ?? true} onchange={(e) => update('qgalore_stochastic_round', e.target.checked)} />
-					<FormToggle fieldPath="full_finetune.qgalore_load_on_cpu" checked={t.qgalore_load_on_cpu ?? true} onchange={(e) => update('qgalore_load_on_cpu', e.target.checked)} />
+					<FormSelect fieldPath="full_finetune.qgalore_load_device" value={t.qgalore_load_device || 'cuda'} options={['cuda', 'cpu']} onchange={(e) => update('qgalore_load_device', e.target.value)} />
 					<FormToggle fieldPath="full_finetune.qgalore_dequantize_save" checked={t.qgalore_dequantize_save ?? true} onchange={(e) => update('qgalore_dequantize_save', e.target.checked)} />
 					<FormToggle fieldPath="full_finetune.qgalore_streaming_dequantize_save" checked={t.qgalore_streaming_dequantize_save ?? false} onchange={(e) => update('qgalore_streaming_dequantize_save', e.target.checked)} />
 				</div>
@@ -656,6 +657,7 @@
 				<div class="grid grid-cols-2 gap-2">
 					<FormSelect fieldPath="full_finetune.apollo_proj" value={t.apollo_proj || 'random'} options={['random', 'svd']} onchange={(e) => update('apollo_proj', e.target.value)} />
 					<FormSelect fieldPath="full_finetune.apollo_proj_type" value={t.apollo_proj_type || 'std'} options={['std', 'reverse_std', 'left', 'right']} onchange={(e) => update('apollo_proj_type', e.target.value)} />
+					<FormSelect label="QAPOLLO State Bits" fieldPath="full_finetune.qapollo_optim_bits" value={String(t.qapollo_optim_bits ?? 8)} options={['8', '32']} onchange={(e) => update('qapollo_optim_bits', Number(e.target.value))} tooltip="bitsandbytes optimizer-state width for QAPOLLOAdamW. 8 is the low-VRAM default; 32 is a diagnostic/stability fallback." />
 				</div>
 			</div>
 		</FormGroup>

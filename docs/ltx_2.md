@@ -2285,6 +2285,17 @@ python ltx2_merge_lora_to_model.py ^
   --save_merged_model merged_model.safetensors
 ```
 
+To write a full checkpoint for a packaged base model, add `--save_full_model`:
+
+```bash
+python ltx2_merge_lora_to_model.py ^
+  --dit base_model.safetensors ^
+  --lora_weight lora_A.safetensors lora_B.safetensors ^
+  --lora_multiplier 1.0 1.0 ^
+  --save_merged_model merged_full_model.safetensors ^
+  --save_full_model
+```
+
 ### Merge-to-Base Arguments
 <sub>[↑ contents](#table-of-contents)</sub>
 
@@ -2294,12 +2305,15 @@ python ltx2_merge_lora_to_model.py ^
 - `--save_merged_model`: Output merged model path (required).
 - `--device cpu|cuda`: Device for merge computation (default: cuda). Pass `--device cpu` to run on system RAM if you don't have enough VRAM.
 - `--audio_video`: Load as audio-video model (for LTXAV checkpoints).
+- `--audio_only`: Load as audio-only model.
+- `--save_full_model`: Save a full checkpoint by replacing transformer weights in `--dit` and copying all other tensors from the original checkpoint. If `--dit` uses ComfyUI-style `model.diffusion_model.*` keys, that layout is preserved.
 
 ### Merge-to-Base Notes
 <sub>[↑ contents](#table-of-contents)</sub>
 
 - The output contains only transformer weights (VAE, vocoder, and text encoder are loaded separately by training/inference scripts).
 - Original checkpoint metadata is preserved, so the merged file is directly usable with `--ltx2_checkpoint`.
+- With `--save_full_model`, the output also contains non-transformer tensors copied from `--dit`. This is intended for packaged checkpoints where the base file includes components such as VAE, vocoder, or text encoder tensors.
 - FP8 base models cannot be merged directly — merge into the bf16 base, then use `--fp8_base` at training time for on-the-fly quantization.
 
 ---
@@ -3229,7 +3243,7 @@ For audio-video runs, use `target=both` if both token streams should be routed:
 --tread --tread_args target=both selection_ratio=0.5
 ```
 
-The benchmark matrices below are 100-step single-GPU capacity/speed runs on cached video benchmark subsets with dataset `batch_size = 1` and no gradient accumulation. Unless stated otherwise, the tables use bf16 weights/training, FlashAttention, gradient checkpointing, and `blocks_to_swap=0`; runs were checked for finite loss, and resulting checkpoints were separately checked with non-noise previews where sampling was run.
+The benchmark matrices below are 100-step single-GPU capacity/speed runs on cached video benchmark subsets with dataset `batch_size = 1` and no gradient accumulation. They were measured on NVIDIA H100 80GB HBM3 GPUs; the separate 24 GB fit sweep below is explicitly labeled as RTX 3090. Unless stated otherwise, the tables use bf16 weights/training, FlashAttention, gradient checkpointing, and `blocks_to_swap=0`; runs were checked for finite loss, and resulting checkpoints were separately checked with non-noise previews where sampling was run.
 
 Here is the measured Adafactor full-parameter benchmark matrix on a cached 32-clip video dataset. It used Adafactor with manual learning rate, fused Adafactor stepping, and no block swapping. Each row is `peak VRAM / median s per optimizer step`; `OOM (>80 GB)` means the configuration OOMed.
 
@@ -3355,7 +3369,7 @@ If the base optimizer supports its own stochastic rounding or optimizer-specific
 
 Q-GaLore is a quantized full-parameter fine-tuning path. Eligible LTX-2 `Linear` modules are replaced with `QGaLoreLinear` wrappers that store 8-bit quantized base weights. During training, wrapped weights are dequantized for forward/backward, dense gradients are computed for those weights, gradients are projected to rank `--qgalore_rank`, and bitsandbytes AdamW8bit applies the projected update back to the base weight shape. The updated weights are quantized again for runtime storage. With `--qgalore_dequantize_save`, enabled by default, checkpoints are saved as standard checkpoint tensors. `--qgalore_streaming_dequantize_save` is an optional lower-VRAM checkpoint export path that dequantizes and writes one selected `Linear` weight at a time; its default temporary dequantization device is CPU.
 
-**Technical tradeoffs**. Rank, projection refresh interval, projection scale, projection quantization, and target selection are training hyperparameters. Lower rank reduces memory and constrains the projected update. The `QGaLoreLinear` wrapper stores selected base weights in 8-bit form; projection matrices can be quantized separately with `--qgalore_proj_quant`, `--qgalore_proj_bits`, and `--qgalore_proj_group_size`. In the measured tables this is a VRAM reduction path, not a speed path: wrapped weights are dequantized for forward/backward, dense gradients are computed, and projection/update/requantization work is added around the optimizer step. Narrower target sets reduce the number of Q-GaLore-wrapped weights. Unwrapped trainable parameters remain in standard optimizer groups unless another freeze or learning-rate-scale option disables them. `--qgalore_load_on_cpu` lowers the initial GPU peak by loading, replacing, and quantizing the transformer on CPU before moving the quantized modules to GPU. `--qgalore_targets video` Q-GaLore-wraps eligible Linear weights in the video stream inside each transformer block: `attn1`, `attn2`, and `ff`. It does not Q-GaLore-wrap audio/cross-audio modules or non-block Linear layers. `--qgalore_targets all` wraps every eligible Linear layer, including non-block layers and audio-side layers when they are present.
+**Technical tradeoffs**. Rank, projection refresh interval, projection scale, projection quantization, and target selection are training hyperparameters. Lower rank reduces memory and constrains the projected update. The `QGaLoreLinear` wrapper stores selected base weights in 8-bit form; projection matrices can be quantized separately with `--qgalore_proj_quant`, `--qgalore_proj_bits`, and `--qgalore_proj_group_size`. In the measured tables this is a VRAM reduction path, not a speed path: wrapped weights are dequantized for forward/backward, dense gradients are computed, and projection/update/requantization work is added around the optimizer step. Narrower target sets reduce the number of Q-GaLore-wrapped weights. Unwrapped trainable parameters remain in standard optimizer groups unless another freeze or learning-rate-scale option disables them. `--qgalore_load_device cpu` lowers the initial GPU peak by loading, replacing, and quantizing the transformer on CPU before moving the quantized modules to GPU. `--qgalore_targets video` Q-GaLore-wraps eligible Linear weights in the video stream inside each transformer block: `attn1`, `attn2`, and `ff`. It does not Q-GaLore-wrap audio/cross-audio modules or non-block Linear layers. `--qgalore_targets all` wraps every eligible Linear layer, including non-block layers and audio-side layers when they are present.
 
 Required constraints are enforced by the trainer:
 
@@ -3382,7 +3396,7 @@ accelerate launch --num_processes 1 --num_cpu_threads_per_process 1 --mixed_prec
   --optimizer_type QGaLoreAdamW8bit \
   --optimizer_args weight_decay=0.0 min_8bit_size=4096 \
   --qgalore_full_ft \
-  --qgalore_load_on_cpu \
+  --qgalore_load_device cpu \
   --qgalore_targets all \
   --qgalore_rank 256 \
   --qgalore_update_proj_gap 200 \
@@ -3410,7 +3424,7 @@ accelerate launch --num_processes 1 --num_cpu_threads_per_process 1 --mixed_prec
   --output_name ltx23_qgalore_full
 ```
 
-Measured Q-GaLore all-target benchmark matrix on the exact-resolution cached video subset used for the BAdam/Q-GaLore/QAPOLLO sweeps. It used bf16 compute, gradient checkpointing, FlashAttention, Q-GaLore AdamW8bit, `rank=256`, `targets=all`, low-rank SVD, 4-bit projection quantization, stochastic rounding, fused backward, `--max_grad_norm 0`, `--qgalore_load_on_cpu`, and no block swapping.
+Measured Q-GaLore all-target benchmark matrix on the exact-resolution cached video subset used for the BAdam/Q-GaLore/QAPOLLO sweeps. It used bf16 compute, gradient checkpointing, FlashAttention, Q-GaLore AdamW8bit, `rank=256`, `targets=all`, low-rank SVD, 4-bit projection quantization, stochastic rounding, fused backward, `--max_grad_norm 0`, `--qgalore_load_device cpu`, and no block swapping.
 Each row is `peak VRAM / median s per optimizer step`; `OOM (>80 GB)` means the configuration OOMed.
 
 | Resolution | Frames | video | av | v2v | v2v_av |
@@ -3445,7 +3459,7 @@ Each row is `peak VRAM / median s per optimizer step`; `OOM (>80 GB)` means the 
 
 APOLLO (`apollo-torch`) is an optimizer-state memory reduction method for full-parameter training. `APOLLOAdamW` applies APOLLO low-rank auxiliary optimizer state to 2-D trainable tensors; non-2-D tensors stay in ordinary AdamW-style groups inside the same optimizer. Dense APOLLO keeps the base checkpoint weights as normal dense weights, so it reduces optimizer-state memory without reducing memory used by dense base weights.
 
-`QAPOLLOAdamW` combines APOLLO optimizer updates with the same quantized `Linear` replacement path used by Q-GaLore. Enable it with `--qgalore_full_ft --optimizer_type QAPOLLOAdamW`. The selected `Linear` weights are stored through the `QGaLoreLinear` wrappers, while optimizer projection settings come from the `--apollo_*` arguments. In QAPOLLO runs, `--qgalore_targets`, `--qgalore_load_on_cpu`, `--qgalore_weight_bits`, `--qgalore_weight_group_size`, `--qgalore_stochastic_round`, and `--qgalore_dequantize_save` control the quantized wrapper behavior; use `--apollo_rank`, `--apollo_update_proj_gap`, `--apollo_scale`, `--apollo_proj`, `--apollo_proj_type`, and `--apollo_scale_type` for the optimizer projection. The shared `qgalore_*` arguments describe the quantized storage wrapper; the APOLLO update rule is selected by `QAPOLLOAdamW` and the `apollo_*` arguments.
+`QAPOLLOAdamW` combines APOLLO optimizer updates with the same quantized `Linear` replacement path used by Q-GaLore. Enable it with `--qgalore_full_ft --optimizer_type QAPOLLOAdamW`. The selected `Linear` weights are stored through the `QGaLoreLinear` wrappers, while optimizer projection settings come from the `--apollo_*` arguments. In QAPOLLO runs, `--qgalore_targets`, `--qgalore_load_device`, `--qgalore_weight_bits`, `--qgalore_weight_group_size`, `--qgalore_stochastic_round`, and `--qgalore_dequantize_save` control the quantized wrapper behavior; use `--apollo_rank`, `--apollo_update_proj_gap`, `--apollo_scale`, `--apollo_proj`, `--apollo_proj_type`, and `--apollo_scale_type` for the optimizer projection. The shared `qgalore_*` arguments describe the quantized storage wrapper; the APOLLO update rule is selected by `QAPOLLOAdamW` and the `apollo_*` arguments. `optim_bits=8` is the local QAPOLLO default for bitsandbytes optimizer state; `optim_bits=32` is available as a diagnostic or stability fallback and uses more optimizer-state memory.
 
 **Technical tradeoffs**. The local APOLLO default is `--apollo_proj random`, so it does not run Q-GaLore SVD initialization or SVD refresh. Dense `APOLLOAdamW` still keeps dense base weights. `QAPOLLOAdamW` has the same dequantize-forward/backward and requantize-storage costs as the quantized Q-GaLore wrapper path, but uses APOLLO's projected-gradient scaling update instead of the Q-GaLore AdamW8bit projected-update rule.
 
@@ -3465,9 +3479,8 @@ accelerate launch --num_processes 1 --num_cpu_threads_per_process 1 --mixed_prec
   --blocks_to_swap 0 \
   --learning_rate 1e-5 \
   --optimizer_type QAPOLLOAdamW \
-  --optimizer_args weight_decay=0.0 min_8bit_size=4096 \
+  --optimizer_args weight_decay=0.0 min_8bit_size=4096 optim_bits=8 \
   --qgalore_full_ft \
-  --qgalore_load_on_cpu \
   --qgalore_targets all \
   --qgalore_weight_bits 8 \
   --qgalore_weight_group_size 256 \
@@ -3498,20 +3511,20 @@ Common APOLLO/QAPOLLO configuration variants:
 - For dense APOLLO without quantized `Linear` storage, use `--optimizer_type APOLLOAdamW`, remove the `--qgalore_*` arguments, and set `--max_grad_norm 1.0` if global gradient clipping is needed. This keeps the base transformer weights dense.
 - For narrower quantized coverage, change `--qgalore_targets all` to `--qgalore_targets video`. This wraps only video-side eligible `Linear` weights and reduces the wrapped parameter set, but does not update the audio-side eligible `Linear` weights through the quantized wrapper path.
 - `--apollo_rank`, `--apollo_update_proj_gap`, `--apollo_scale`, `--apollo_proj`, `--apollo_proj_type`, and `--apollo_scale_type` control the APOLLO optimizer projection. Higher rank increases optimizer memory and may change convergence.
-
-TODO: find an post QAPOLLO benchmark numbers.
+- `optim_bits=8` or `optim_bits=32` controls QAPOLLO optimizer-state storage width. It is separate from model-weight precision and from the Q-GaLore wrapper's `--qgalore_weight_bits`.
 
 ### Optimizing VRAM Usage
 <sub>[↑ contents](#table-of-contents)</sub>
 
 The dense bf16 Adafactor video-only rows are around 54-66 GB, and AV rows add roughly 20 GB in the measured matrix. BAdam reduces active optimizer and gradient state, but the measured LTX-2.3 long runs reached a loss plateau. For an initial 24 GB video-only fit test, use Q-GaLore:
 
-- Use `--qgalore_full_ft --qgalore_load_on_cpu` to avoid loading the full bf16 transformer onto GPU before Q-GaLore replacement.
+- Use `--qgalore_full_ft --qgalore_load_device cpu` to avoid loading the full bf16 transformer onto GPU before Q-GaLore replacement.
 - For `832x480x49`, the measured video-only RTX 3090 sweep stayed under 24 GB with `targets=video` at ranks 128, 256, and 384. Start with `rank=256`; use `rank=128` for more headroom, or `rank=384` only after the lower-rank run completes with headroom. In that sweep, peak VRAM was `20,821 MiB` at rank 128, `21,979 MiB` at rank 256, and `23,053 MiB` at rank 384, with roughly `4-5 s/step`. Exact VRAM and step time still depend on the GPU, driver, attention backend, storage/cache state, and dataloader settings.
 - Keep first consumer-GPU tests to video-only, 480p or lower, and short frame counts such as T=33 or T=49.
 - Keep `--blocks_to_swap 0` for the measured Q-GaLore command unless you are explicitly testing CPU offload.
 - Use `--mem_eff_save` for checkpoint writes. Add `--qgalore_streaming_dequantize_save` if dense Q-GaLore/QAPOLLO checkpoint export exceeds available VRAM during saving; this uses more CPU work during saving. Merged checkpoints are large because they contain the fine-tuned base model, not an adapter.
 - For initial fit tests, defer AV, 720p, training-time sampling, and frequent validation until a video-only baseline succeeds.
+- Dense `APOLLOAdamW` is not a 24 GB path because the base transformer weights remain dense. QAPOLLO can be tested as a separate 24 GB-class path for video-only runs, but it needs CPU-side initial load and streaming checkpoint export if load-time or save-time peaks exceed steady-state training VRAM.
 
 24 GB video-only starting command:
 
@@ -3533,7 +3546,7 @@ accelerate launch --num_processes 1 --num_cpu_threads_per_process 1 --mixed_prec
   --optimizer_type QGaLoreAdamW8bit \
   --optimizer_args weight_decay=0.0 min_8bit_size=4096 \
   --qgalore_full_ft \
-  --qgalore_load_on_cpu \
+  --qgalore_load_device cpu \
   --qgalore_targets video \
   --qgalore_rank 256 \
   --qgalore_update_proj_gap 200 \

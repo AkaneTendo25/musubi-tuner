@@ -797,8 +797,10 @@ class NetworkTrainer:
             optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
 
         elif optimizer_type.startswith("apollo") or optimizer_type.startswith("qapollo") or optimizer_type.startswith("q_apollo"):
-            from musubi_tuner.optimizers.backends import resolve_apollo_optimizer_class
+            from musubi_tuner.optimizers.backends import is_qapollo_optimizer_type, resolve_apollo_optimizer_class
 
+            if is_qapollo_optimizer_type(args.optimizer_type):
+                optimizer_kwargs.setdefault("optim_bits", 8)
             optimizer_class = resolve_apollo_optimizer_class(args.optimizer_type)
             logger.info(f"use APOLLO optimizer {optimizer_class.__name__} | {optimizer_kwargs}")
             optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
@@ -1422,6 +1424,7 @@ class NetworkTrainer:
                     return 0
                 raise FileNotFoundError(f"resume state directory is missing or incomplete: {args.resume}")
 
+            self._register_optimizer_resume_safe_globals(args)
             logger.info(f"resume training from local state: {args.resume}")
             try:
                 accelerator.load_state(args.resume)
@@ -1479,10 +1482,29 @@ class NetworkTrainer:
                 "No files found in the specified repo id/path/revision / 指定されたリポジトリID/パス/リビジョンにファイルが見つかりませんでした"
             )
         dirname = os.path.dirname(results[0])
+        self._register_optimizer_resume_safe_globals(args)
         accelerator.load_state(dirname)
         self._resume_state_dir = dirname
 
         return self._recover_global_step(dirname)
+
+    @staticmethod
+    def _register_optimizer_resume_safe_globals(args: argparse.Namespace) -> None:
+        optimizer_type = getattr(args, "optimizer_type", None)
+        try:
+            from musubi_tuner.optimizers.backends import is_apollo_optimizer_type, register_apollo_resume_safe_globals
+
+            if is_apollo_optimizer_type(optimizer_type):
+                register_apollo_resume_safe_globals()
+        except Exception as exc:
+            logger.debug("could not register optimizer resume safe globals for %s: %s", optimizer_type, exc)
+        try:
+            from musubi_tuner.optimizers.q_galore import is_qgalore_optimizer_type, register_qgalore_resume_safe_globals
+
+            if is_qgalore_optimizer_type(optimizer_type):
+                register_qgalore_resume_safe_globals()
+        except Exception as exc:
+            logger.debug("could not register Q-GaLore resume safe globals for %s: %s", optimizer_type, exc)
 
     @staticmethod
     def _recover_global_step(state_dir: str) -> int:

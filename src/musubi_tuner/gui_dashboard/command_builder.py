@@ -117,6 +117,24 @@ def _split_cli_args(raw: str) -> list[str]:
     return normalized
 
 
+def _cli_args_has_key(args: list[str], key: str) -> bool:
+    prefix = f"{key}="
+    return any(part == key or part.startswith(prefix) for part in args)
+
+
+def _is_qapollo_optimizer_type(optimizer_type: str | None) -> bool:
+    opt = (optimizer_type or "").lower()
+    return opt in {
+        "qapollo",
+        "q_apollo",
+        "qapollo_adamw",
+        "qapolloadamw",
+        "q_apollo_adamw",
+        "apollo_torch.qapolloadamw",
+        "apollo_torch.q_apollo.adamw",
+    } or opt.startswith("apollo_torch.q_apollo.")
+
+
 def _remote_stage_orchestrator_config_path(config: ProjectConfig) -> Path:
     project_key = config.project_dir or config.name or "default"
     digest = hashlib.sha1(project_key.encode("utf-8")).hexdigest()[:12]
@@ -1612,8 +1630,11 @@ def build_full_finetune_cmd(config: ProjectConfig) -> list[str]:
     cmd += ["--learning_rate", str(t.learning_rate)]
     if t.optimizer_type:
         cmd += ["--optimizer_type", t.optimizer_type]
-    if t.optimizer_args:
-        cmd += ["--optimizer_args"] + _split_cli_args(t.optimizer_args)
+    optimizer_args = _split_cli_args(t.optimizer_args)
+    if _is_qapollo_optimizer_type(t.optimizer_type) and not _cli_args_has_key(optimizer_args, "optim_bits"):
+        optimizer_args.append(f"optim_bits={getattr(t, 'qapollo_optim_bits', 8)}")
+    if optimizer_args:
+        cmd += ["--optimizer_args"] + optimizer_args
     if t.base_optimizer_args:
         cmd += ["--base_optimizer_args"] + _split_cli_args(t.base_optimizer_args)
     cmd += ["--lr_scheduler", t.lr_scheduler]
@@ -1754,8 +1775,9 @@ def build_full_finetune_cmd(config: ProjectConfig) -> list[str]:
             cmd.append("--no-qgalore_proj_quant")
         if not t.qgalore_stochastic_round:
             cmd.append("--no-qgalore_stochastic_round")
-        if not t.qgalore_load_on_cpu:
-            cmd.append("--no-qgalore_load_on_cpu")
+        qgalore_load_device = getattr(t, "qgalore_load_device", "cuda") or "cuda"
+        if qgalore_load_device != "cuda":
+            cmd += ["--qgalore_load_device", qgalore_load_device]
         if not t.qgalore_dequantize_save:
             cmd.append("--no-qgalore_dequantize_save")
         if t.qgalore_streaming_dequantize_save:
