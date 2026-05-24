@@ -3178,11 +3178,11 @@ When a cache, training, slider training, or inference job is started from the da
 
 Full-parameter fine-tuning updates LTX-2 transformer checkpoint weights directly, without attaching or saving a LoRA adapter. Large video transformer training must hold base weights, gradients, optimizer state, activations, and checkpoint-save buffers rather than only a small adapter, so dense full-parameter setups require substantially more GPU memory than LoRA training.
 
-The practical difference from LoRA is the trainable surface. LoRA trains additional low-rank adapter matrices and keeps the base transformer weights frozen; full-parameter fine-tuning changes the transformer weights themselves. This makes the saved artifact a fine-tuned base checkpoint instead of an adapter that must be loaded next to the original checkpoint. It also lets training update weights outside the layers and ranks selected by a LoRA target preset, which can be relevant when changes are needed outside the selected LoRA target layers. The cost is substantially higher VRAM, larger checkpoints, slower iteration, and greater risk of degrading behavior outside the training distribution if the dataset, learning rate, or regularization are poor.
+The practical difference from LoRA is the trainable surface. LoRA trains additional low-rank adapter matrices and keeps the base transformer weights frozen; full-parameter fine-tuning changes the transformer weights themselves. This makes the saved artifact a fine-tuned base checkpoint instead of an adapter that must be loaded next to the original checkpoint. It can update weights outside the layers selected by a LoRA target preset. The cost is substantially higher VRAM, larger checkpoints, slower iteration, and greater risk of degrading behavior outside the training distribution if the dataset, learning rate, or regularization are poor.
 
 The same LTX-2 modality paths used by LoRA training are available in full-parameter training. Set `--ltx2_mode video`, `--ltx2_mode av`, or `--ltx2_mode audio` to match the cached dataset. Use `--ltx2_audio_only_model` only when loading a physically audio-only checkpoint variant; it still requires `--ltx2_mode audio`.
 
-Reference-conditioned runs use `--ic_lora_strategy`: `v2v` for video-to-video/reference-video training in video mode, `audio_ref_ic` for reference-audio conditioning in AV or audio mode, `av_ic` for combined video+audio reference conditioning in AV mode, and `video_ref_only_av` for reference-video conditioning with target AV loss in AV mode. These strategies are implemented in `ltx2_train.py` and route the corresponding conditioning and loss path. For full-parameter commands, set `--ic_lora_strategy` explicitly; `--lora_target_preset` remains the LoRA layer-targeting preset.
+Reference-conditioned runs use `--ic_lora_strategy`: `v2v` for video-to-video/reference-video training in video mode, `audio_ref_ic` for reference-audio conditioning in AV or audio mode, `av_ic` for combined video+audio reference conditioning in AV mode, and `video_ref_only_av` for reference-video conditioning with target AV loss in AV mode. These strategies are implemented in `ltx2_train.py` and route the corresponding conditioning and loss path. For full-parameter commands, set `--ic_lora_strategy` explicitly; `--lora_target_preset` is not used to choose full-parameter trainable layers.
 
 Use `ltx2_train.py` for these commands. `ltx2_train_network.py` is the LoRA/network trainer entry point.
 
@@ -3194,7 +3194,7 @@ Dataset preparation is the same as LoRA training: create the dataset TOML, cache
 ### Adafactor
 <sub>[↑ contents](#table-of-contents)</sub>
 
-Adafactor is the dense bf16 full-parameter optimizer path documented here. It reduces optimizer-state memory by storing factored row and column second-moment statistics for matrix-shaped parameters, rather than full Adam-style moment tensors. The LTX-2.3 Adafactor path uses `--fused_backward_pass`, which adds a per-parameter `step_param` path. When `--max_grad_norm 0` is used, the trainer can step and clear gradients from backward hooks. When global gradient clipping is enabled, as in the benchmark table below, the trainer delays per-parameter stepping until the gradient synchronization point to preserve clipping correctness. The fused Adafactor implementation applies stochastic rounding when fp32 updates are written back into bf16 parameters.
+Adafactor is the dense bf16 full-parameter optimizer path documented here. It reduces optimizer-state memory by storing factored row and column second-moment statistics for matrix-shaped parameters, rather than full Adam-style moment tensors. This path originates from the Qwen-Image full fine-tuning implemented by kohya-ss in [PR #492](https://github.com/kohya-ss/musubi-tuner/pull/492). The LTX-2.3 Adafactor path uses `--fused_backward_pass`, which adds a per-parameter `step_param` path related to the [optimizer-step-in-backward pattern](https://docs.pytorch.org/tutorials/intermediate/optimizer_step_in_backward_tutorial.html). When `--max_grad_norm 0` is used, the trainer can step and clear gradients from backward hooks. When global gradient clipping is enabled, as in the benchmark table below, the trainer delays per-parameter stepping until the gradient synchronization point to preserve clipping correctness. The fused Adafactor implementation applies stochastic rounding when fp32 updates are written back into bf16 parameters.
 
 **Technical tradeoffs**. This is dense bf16 training. The base model weights stay on GPU, every trainable tensor receives an update every optimizer step, and AV/reference modes add activation and conditioning memory. In the measured LTX-2.3 benchmark table, video-only rows are around 54-66 GB; AV and v2v-AV rows can approach or exceed an 80 GB GPU.
 
@@ -3220,7 +3220,6 @@ accelerate launch --num_processes 1 --num_cpu_threads_per_process 1 --mixed_prec
   --lr_warmup_steps 500 \
   --timestep_sampling shifted_logit_normal \
   --fused_backward_pass \
-  --mem_eff_save \
   --save_every_n_steps 5000 \
   --save_state \
   --save_state_on_train_end \
@@ -3243,7 +3242,10 @@ For audio-video runs, use `target=both` if both token streams should be routed:
 --tread --tread_args target=both selection_ratio=0.5
 ```
 
-The benchmark matrices below are 100-step single-GPU capacity/speed runs on cached video benchmark subsets with dataset `batch_size = 1` and no gradient accumulation. They were measured on NVIDIA H100 80GB HBM3 GPUs; the separate 24 GB fit sweep below is explicitly labeled as RTX 3090. Unless stated otherwise, the tables use bf16 weights/training, FlashAttention, gradient checkpointing, and `blocks_to_swap=0`; runs were checked for finite loss, and resulting checkpoints were separately checked with non-noise previews where sampling was run.
+The benchmark matrices below are 100-step single-GPU capacity/speed runs on cached video benchmark subsets with dataset `batch_size = 1` and no gradient accumulation. Unless stated otherwise, the tables use bf16 weights/training, FlashAttention, gradient checkpointing, and `blocks_to_swap=0`; runs were checked for finite loss, and resulting checkpoints were separately checked with non-noise previews where sampling was run.
+
+> [!NOTE]
+> Each benchmark row in this and later benchmark tables was measured on one NVIDIA H100 80GB HBM3 GPU unless explicitly labeled otherwise.
 
 Here is the measured Adafactor full-parameter benchmark matrix on a cached 32-clip video dataset. It used Adafactor with manual learning rate, fused Adafactor stepping, and no block swapping. Each row is `peak VRAM / median s per optimizer step`; `OOM (>80 GB)` means the configuration OOMed.
 
@@ -3315,7 +3317,6 @@ accelerate launch --num_processes 1 --num_cpu_threads_per_process 1 --mixed_prec
   --lr_warmup_steps 500 \
   --timestep_sampling shifted_logit_normal \
   --fused_backward_pass \
-  --mem_eff_save \
   --save_every_n_steps 5000 \
   --save_state \
   --save_state_on_train_end \
@@ -3415,7 +3416,6 @@ accelerate launch --num_processes 1 --num_cpu_threads_per_process 1 --mixed_prec
   --lr_warmup_steps 500 \
   --timestep_sampling shifted_logit_normal \
   --fused_backward_pass \
-  --mem_eff_save \
   --save_every_n_steps 5000 \
   --save_state \
   --save_state_on_train_end \
@@ -3459,9 +3459,9 @@ Each row is `peak VRAM / median s per optimizer step`; `OOM (>80 GB)` means the 
 
 APOLLO (`apollo-torch`) is an optimizer-state memory reduction method for full-parameter training. `APOLLOAdamW` applies APOLLO low-rank auxiliary optimizer state to 2-D trainable tensors; non-2-D tensors stay in ordinary AdamW-style groups inside the same optimizer. Dense APOLLO keeps the base checkpoint weights as normal dense weights, so it reduces optimizer-state memory without reducing memory used by dense base weights.
 
-`QAPOLLOAdamW` combines APOLLO optimizer updates with the same quantized `Linear` replacement path used by Q-GaLore. Enable it with `--qgalore_full_ft --optimizer_type QAPOLLOAdamW`. The selected `Linear` weights are stored through the `QGaLoreLinear` wrappers, while optimizer projection settings come from the `--apollo_*` arguments. In QAPOLLO runs, `--qgalore_targets`, `--qgalore_load_device`, `--qgalore_weight_bits`, `--qgalore_weight_group_size`, `--qgalore_stochastic_round`, and `--qgalore_dequantize_save` control the quantized wrapper behavior; use `--apollo_rank`, `--apollo_update_proj_gap`, `--apollo_scale`, `--apollo_proj`, `--apollo_proj_type`, and `--apollo_scale_type` for the optimizer projection. The shared `qgalore_*` arguments describe the quantized storage wrapper; the APOLLO update rule is selected by `QAPOLLOAdamW` and the `apollo_*` arguments. `optim_bits=8` is the local QAPOLLO default for bitsandbytes optimizer state; `optim_bits=32` is available as a diagnostic or stability fallback and uses more optimizer-state memory.
+`QAPOLLOAdamW` combines APOLLO optimizer updates with the same quantized `Linear` replacement path used by Q-GaLore. Enable it with `--qgalore_full_ft --optimizer_type QAPOLLOAdamW`. The selected `Linear` weights are stored through the `QGaLoreLinear` wrappers, while optimizer projection settings come from the `--apollo_*` arguments. In QAPOLLO runs, `--qgalore_targets`, `--qgalore_load_device`, `--qgalore_weight_bits`, `--qgalore_weight_group_size`, `--qgalore_stochastic_round`, and `--qgalore_dequantize_save` control the quantized wrapper behavior; use `--apollo_rank`, `--apollo_update_proj_gap`, `--apollo_scale`, `--apollo_proj`, `--apollo_proj_type`, and `--apollo_scale_type` for the optimizer projection. The shared `qgalore_*` arguments describe the quantized storage wrapper; the APOLLO update rule is selected by `QAPOLLOAdamW` and the `apollo_*` arguments. QAPOLLO uses `optim_bits=8` by default for bitsandbytes optimizer state; `optim_bits=32` is available as a diagnostic or stability fallback and uses more optimizer-state memory.
 
-**Technical tradeoffs**. The local APOLLO default is `--apollo_proj random`, so it does not run Q-GaLore SVD initialization or SVD refresh. Dense `APOLLOAdamW` still keeps dense base weights. `QAPOLLOAdamW` has the same dequantize-forward/backward and requantize-storage costs as the quantized Q-GaLore wrapper path, but uses APOLLO's projected-gradient scaling update instead of the Q-GaLore AdamW8bit projected-update rule.
+**Technical tradeoffs**. The default APOLLO projection is `--apollo_proj random`, so it does not run Q-GaLore SVD initialization or SVD refresh. Dense `APOLLOAdamW` still keeps dense base weights. `QAPOLLOAdamW` has the same dequantize-forward/backward and requantize-storage costs as the quantized Q-GaLore wrapper path, but uses APOLLO's projected-gradient scaling update instead of the Q-GaLore AdamW8bit projected-update rule.
 
 Example LTX-2.3 QAPOLLO all-target command:
 
@@ -3496,7 +3496,6 @@ accelerate launch --num_processes 1 --num_cpu_threads_per_process 1 --mixed_prec
   --lr_warmup_steps 500 \
   --timestep_sampling shifted_logit_normal \
   --fused_backward_pass \
-  --mem_eff_save \
   --qgalore_streaming_dequantize_save \
   --save_every_n_steps 5000 \
   --save_state \
@@ -3513,20 +3512,53 @@ Common APOLLO/QAPOLLO configuration variants:
 - `--apollo_rank`, `--apollo_update_proj_gap`, `--apollo_scale`, `--apollo_proj`, `--apollo_proj_type`, and `--apollo_scale_type` control the APOLLO optimizer projection. Higher rank increases optimizer memory and may change convergence.
 - `optim_bits=8` or `optim_bits=32` controls QAPOLLO optimizer-state storage width. It is separate from model-weight precision and from the Q-GaLore wrapper's `--qgalore_weight_bits`.
 
+Measured QAPOLLO all-target rows on the exact-resolution cached video subset used for the BAdam/Q-GaLore/QAPOLLO sweeps. It used bf16 compute, gradient checkpointing, FlashAttention, QAPOLLOAdamW with `optim_bits=8`, `rank=256`, `targets=all`, random APOLLO projection, stochastic rounding, fused backward, `--max_grad_norm 0`, default `--qgalore_load_device cuda`, and no block swapping.
+Each row is `training-phase peak VRAM / median s per optimizer step`; `OOM (>80 GB)` means the configuration OOMed. QAPOLLO can have a higher temporary peak while loading and replacing the base transformer; use `--qgalore_load_device cpu` when the load-time peak is the limiting factor.
+The `optim_bits=8` QAPOLLO path was checked for finite loss and non-noise preview generation. Quantized `Linear` full-parameter paths still need longer large-dataset validation; stable convergence settings and numerical-stability margins are not established by this benchmark table.
+
+| Resolution | Frames | video | av | v2v | v2v_av |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 832x480 | 17 | 22.2 GB / 2.46 s | 32.2 GB / 4.97 s | 22.5 GB / 2.85 s | 34.5 GB / 5.35 s |
+| 832x480 | 33 | 22.6 GB / 3.01 s | 32.4 GB / 5.54 s | 23.2 GB / 3.69 s | 35.6 GB / 6.28 s |
+| 832x480 | 49 | 22.5 GB / 3.61 s | 34.3 GB / 6.13 s | 24.5 GB / 4.61 s | 37.6 GB / 7.30 s |
+| 832x480 | 65 | 23.1 GB / 4.21 s | 35.9 GB / 6.81 s | 25.9 GB / 5.57 s | 39.6 GB / 8.41 s |
+| 832x480 | 81 | 24.4 GB / 4.82 s | 36.7 GB / 7.47 s | 27.6 GB / 6.56 s | 43.2 GB / 9.56 s |
+| 832x480 | 97 | 24.6 GB / 5.48 s | 37.6 GB / 8.12 s | 28.9 GB / 7.65 s | 42.9 GB / 10.78 s |
+| 832x480 | 113 | 25.1 GB / 6.10 s | 39.3 GB / 8.90 s | 30.7 GB / 8.74 s | 45.3 GB / 12.15 s |
+| 832x480 | 129 | 26.4 GB / 6.69 s | 40.2 GB / 9.52 s | 32.9 GB / 9.99 s | 48.3 GB / 13.45 s |
+| 832x480 | 145 | 26.4 GB / 7.41 s | 40.2 GB / 10.35 s | 33.7 GB / 11.11 s | 47.9 GB / 14.83 s |
+| 832x480 | 161 | 26.6 GB / 8.03 s | 40.2 GB / 11.09 s | 33.4 GB / 12.33 s | 49.5 GB / 16.15 s |
+| 832x480 | 193 | 28.4 GB / 9.44 s | 43.8 GB / 12.58 s | 35.3 GB / 15.09 s | 52.5 GB / 19.07 s |
+| 832x480 | 241 | 30.9 GB / 11.63 s | 46.8 GB / 15.06 s | 39.4 GB / 19.27 s | 58.2 GB / 23.95 s |
+| 1280x720 | 17 | 22.8 GB / 3.54 s | 34.7 GB / 6.04 s | 24.8 GB / 4.53 s | 37.1 GB / 7.47 s |
+| 1280x720 | 33 | 24.2 GB / 4.89 s | 36.9 GB / 7.43 s | 27.7 GB / 6.74 s | 43.0 GB / 9.82 s |
+| 1280x720 | 49 | 25.5 GB / 6.30 s | 38.9 GB / 9.16 s | 31.8 GB / 9.18 s | 47.2 GB / 12.55 s |
+| 1280x720 | 65 | 27.2 GB / 7.81 s | 40.5 GB / 10.72 s | 34.2 GB / 12.05 s | 50.4 GB / 15.63 s |
+| 1280x720 | 81 | 28.4 GB / 9.35 s | 43.1 GB / 12.50 s | 35.2 GB / 14.97 s |  |
+| 1280x720 | 97 | 30.6 GB / 10.88 s | 45.0 GB / 14.22 s |  |  |
+| 1280x720 | 113 |  |  |  |  |
+| 1280x720 | 129 |  |  |  |  |
+| 1280x720 | 145 |  |  |  |  |
+| 1280x720 | 161 |  |  |  |  |
+| 1280x720 | 193 |  |  |  |  |
+| 1280x720 | 241 |  |  |  |  |
 ### Optimizing VRAM Usage
 <sub>[↑ contents](#table-of-contents)</sub>
 
-The dense bf16 Adafactor video-only rows are around 54-66 GB, and AV rows add roughly 20 GB in the measured matrix. BAdam reduces active optimizer and gradient state, but the measured LTX-2.3 long runs reached a loss plateau. For an initial 24 GB video-only fit test, use Q-GaLore:
+Dense bf16 Adafactor video-only rows are around 54-66 GB, and AV rows add roughly 20 GB in the measured matrix. BAdam reduces active optimizer and gradient state, but the dense base transformer weights still stay resident and the full transformer forward still runs every step. In the measured LTX-2.3 runs, BAdam did not bring this model into the 24 GB class, and the long runs also reached a loss plateau.
 
-- Use `--qgalore_full_ft --qgalore_load_device cpu` to avoid loading the full bf16 transformer onto GPU before Q-GaLore replacement.
-- For `832x480x49`, the measured video-only RTX 3090 sweep stayed under 24 GB with `targets=video` at ranks 128, 256, and 384. Start with `rank=256`; use `rank=128` for more headroom, or `rank=384` only after the lower-rank run completes with headroom. In that sweep, peak VRAM was `20,821 MiB` at rank 128, `21,979 MiB` at rank 256, and `23,053 MiB` at rank 384, with roughly `4-5 s/step`. Exact VRAM and step time still depend on the GPU, driver, attention backend, storage/cache state, and dataloader settings.
-- Keep first consumer-GPU tests to video-only, 480p or lower, and short frame counts such as T=33 or T=49.
-- Keep `--blocks_to_swap 0` for the measured Q-GaLore command unless you are explicitly testing CPU offload.
-- Use `--mem_eff_save` for checkpoint writes. Add `--qgalore_streaming_dequantize_save` if dense Q-GaLore/QAPOLLO checkpoint export exceeds available VRAM during saving; this uses more CPU work during saving. Merged checkpoints are large because they contain the fine-tuned base model, not an adapter.
-- For initial fit tests, defer AV, 720p, training-time sampling, and frequent validation until a video-only baseline succeeds.
-- Dense `APOLLOAdamW` is not a 24 GB path because the base transformer weights remain dense. QAPOLLO can be tested as a separate 24 GB-class path for video-only runs, but it needs CPU-side initial load and streaming checkpoint export if load-time or save-time peaks exceed steady-state training VRAM.
+For 24 GB-class video-only tests, use a quantized `Linear` replacement path:
 
-24 GB video-only starting command:
+- Start with Q-GaLore: `--qgalore_full_ft --qgalore_load_device cpu --qgalore_targets video --qgalore_rank 256`.
+- To test QAPOLLO in the same 24 GB-class envelope, start from the QAPOLLO command above and use `--qgalore_load_device cpu --qgalore_targets video` with `optim_bits=8`. QAPOLLO uses `QAPOLLOAdamW` and the `--apollo_*` optimizer settings instead of Q-GaLore's SVD projection settings.
+- For `832x480x49`, expect roughly 21-23 GB on a 24 GB GPU, depending on rank, desktop VRAM use, and the local CUDA stack. Use `rank=128` for more headroom; try `rank=384` only after the lower-rank run leaves headroom.
+- On a display-attached RTX 3090, measured video-only 24 GB-class fit checks were roughly `10-12 s/it`, depending on frame count and method. On an RTX 4090, a conservative expectation is roughly `7-10 s/it`, but this is an estimate rather than a measured result in this document. Treat these as speed orientations only; storage, driver, desktop VRAM use, and attention backend can move them.
+- For longer contexts such as `512x512x65`, expect the run to sit close to the 24 GB limit and to be substantially slower than the short-context fit test. Start with T=33 or T=49 before scaling to T=65.
+- Defer AV, 720p, training-time sampling, and frequent validation until a video-only baseline saves and resumes successfully on the target GPU.
+- Dense `APOLLOAdamW` is not a 24 GB path because the base transformer weights remain dense. The 24 GB-class APOLLO route is QAPOLLO, with similar load/save constraints to Q-GaLore.
+- Regular full-parameter checkpoint writes use the memory-efficient safetensors writer. Add `--qgalore_streaming_dequantize_save` if dense Q-GaLore/QAPOLLO checkpoint export exceeds available VRAM during saving; this uses more CPU work during saving. Merged checkpoints are large because they contain the fine-tuned base model, not an adapter.
+
+Example Q-GaLore video-only command:
 
 ```bash
 accelerate launch --num_processes 1 --num_cpu_threads_per_process 1 --mixed_precision bf16 ltx2_train.py \
@@ -3565,7 +3597,6 @@ accelerate launch --num_processes 1 --num_cpu_threads_per_process 1 --mixed_prec
   --lr_warmup_steps 500 \
   --timestep_sampling shifted_logit_normal \
   --fused_backward_pass \
-  --mem_eff_save \
   --qgalore_streaming_dequantize_save \
   --save_every_n_steps 5000 \
   --save_state \
@@ -3575,7 +3606,7 @@ accelerate launch --num_processes 1 --num_cpu_threads_per_process 1 --mixed_prec
   --output_name ltx23_qgalore_24gb_video
 ```
 
-Keep the first longer run video-only and short-context until checkpoint save/resume has been validated on the target GPU.
+For longer runs, start with video-only short-context training until checkpoint save and resume have been validated on the target GPU.
 
 ---
 
@@ -3593,6 +3624,12 @@ Keep the first longer run video-only and short-context until checkpoint save/res
 
 **Research**
 - [ID-LoRA](https://github.com/ID-LoRA/ID-LoRA) — In-context identity LoRA; the audio-reference IC-LoRA implementation in this trainer is based on this approach
+- [Adafactor (ICML 2018)](https://proceedings.mlr.press/v80/shazeer18a.html) — Factored second-moment optimizer-state background for the Adafactor full-parameter path
+- [BAdam (arXiv 2404.02827)](https://arxiv.org/abs/2404.02827) — Block-coordinate Adam-style full-parameter optimization background for the BAdam path
+- [BREAD / Landscape Correction (OpenReview)](https://openreview.net/forum?id=zs6bRl05g8) — Block-coordinate landscape-correction background for the BREAD-SGD ablation
+- [GaLore (arXiv 2403.03507)](https://arxiv.org/abs/2403.03507) — Gradient low-rank projection background for Q-GaLore-style optimizer-state reduction
+- [Q-GaLore (arXiv 2407.08296)](https://arxiv.org/abs/2407.08296) — Quantized low-rank gradient-projection background for `--qgalore_full_ft`
+- [APOLLO (arXiv 2412.05270)](https://arxiv.org/abs/2412.05270) — Low-rank optimizer-state background for `APOLLOAdamW` and `QAPOLLOAdamW`
 - [QLoRA (arXiv 2305.14314)](https://arxiv.org/abs/2305.14314) — Introduces NF4 quantization used by the `--nf4_base` implementation
 - [LoftQ (arXiv 2310.08659)](https://arxiv.org/abs/2310.08659) — Quantization-aware LoRA initialization used by `--loftq_init`
 - [AWQ (arXiv 2306.00978)](https://arxiv.org/abs/2306.00978) — Activation-aware quantization background for `--awq_calibration`
