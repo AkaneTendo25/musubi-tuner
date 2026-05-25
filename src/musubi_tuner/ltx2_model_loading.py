@@ -422,7 +422,9 @@ def load_ltx2_model(
 
     def _cast_non_fp8_params(model: torch.nn.Module, target_dtype: torch.dtype) -> None:
         for module in model.modules():
-            is_quantized_linear = isinstance(module, torch.nn.Linear) and hasattr(module, "scale_weight")
+            is_quantized_linear = isinstance(module, torch.nn.Linear) and (
+                hasattr(module, "scale_weight") or hasattr(module, "_nvfp4_quantized")
+            )
             if is_quantized_linear:
                 continue
             for _, param in module.named_parameters(recurse=False):
@@ -554,7 +556,23 @@ def load_ltx2_model(
 
     _awq_scales = None  # populated if AWQ calibration is used
 
-    if nf4_base:
+    # --- Auto-detect NVFP4 (Lightricks pre-quantized FP4 E2M1) ---
+    _is_nvfp4 = False
+    if not nf4_base and not fp8_scaled:
+        from musubi_tuner.modules.nvfp4_utils import detect_nvfp4_checkpoint
+        _check_path = model_path if isinstance(model_path, str) else model_path[0]
+        _is_nvfp4 = detect_nvfp4_checkpoint(_check_path)
+
+    if _is_nvfp4:
+        from musubi_tuner.modules.nvfp4_utils import load_nvfp4_state_dict, apply_nvfp4_monkey_patch
+        logger.info("Detected NVFP4 (Lightricks FP4 E2M1) checkpoint — loading with on-the-fly dequantization")
+        sd = load_nvfp4_state_dict(
+            model_files=model_path if isinstance(model_path, list) else [model_path],
+            state_dict_key_filter=state_dict_key_filter,
+            move_to_device=not load_weights_on_cpu and load_device == target_device,
+            target_device=load_device if (not load_weights_on_cpu and load_device == target_device) else None,
+        )
+    elif nf4_base:
         nf4_calc_device = _resolved_quant_device
         logger.info("LTX-2 nf4: quantization device = %s", nf4_calc_device)
         model_files = model_path if isinstance(model_path, list) else [model_path]
@@ -760,7 +778,10 @@ def load_ltx2_model(
             logger.info(f"[VRAM_TRACE_LTX2] {tag}: alloc={a:.2f}GB res={r:.2f}GB max={m:.2f}GB")
 
     _trace_vram_ltx2(f"AFTER state dict loading (state_device={state_device}, quantize_device={_resolved_quant_device})")
-    if nf4_base:
+    if _is_nvfp4:
+        from musubi_tuner.modules.nvfp4_utils import apply_nvfp4_monkey_patch
+        apply_nvfp4_monkey_patch(base_model, sd)
+    elif nf4_base:
         apply_nf4_monkey_patch(base_model, sd, block_size=nf4_block_size, awq_scales=_awq_scales)
     elif fp8_scaled:
         apply_fp8_monkey_patch(base_model, sd, use_scaled_mm=False)

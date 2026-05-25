@@ -1601,8 +1601,12 @@ def build_full_finetune_cmd(config: ProjectConfig) -> list[str]:
         cmd.append("--fp8_base")
     if t.fp8_scaled:
         cmd.append("--fp8_scaled")
-    if t.fp8_keep_blocks:
+    if getattr(t, "fp8_keep_blocks", ""):
         cmd += ["--fp8_keep_blocks", t.fp8_keep_blocks]
+    if t.nf4_base:
+        cmd.append("--nf4_base")
+    if getattr(t, "nf4_block_size", 32) != 32:
+        cmd += ["--nf4_block_size", str(t.nf4_block_size)]
     if t.flash_attn:
         cmd.append("--flash_attn")
     if t.flash3:
