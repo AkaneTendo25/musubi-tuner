@@ -50,7 +50,12 @@ def _effective_gemma_root(config: ProjectConfig, explicit: str, gemma_safetensor
     return explicit or config.default_gemma_root or str(_default_model_dir(config) / DEFAULT_GEMMA_ROOT_NAME)
 
 
-def _effective_gemma_safetensors(config: ProjectConfig, explicit: str) -> str:
+def _effective_gemma_safetensors(config: ProjectConfig, explicit: str, explicit_gemma_root: str = "") -> str:
+    # If the user has explicitly set gemma_root on this section AND it points to
+    # a real directory, suppress the default_gemma_safetensors fallback so that
+    # gemma_root takes priority.
+    if explicit_gemma_root and Path(explicit_gemma_root).is_dir():
+        return explicit or ""
     return explicit or config.default_gemma_safetensors or ""
 
 
@@ -305,7 +310,7 @@ def build_cache_text_cmd(config: ProjectConfig) -> list[str]:
     c = config.caching
     t = config.training
     ltx2_checkpoint = _effective_ltx2_checkpoint(config, c.ltx2_checkpoint)
-    gemma_safetensors = _effective_gemma_safetensors(config, c.gemma_safetensors)
+    gemma_safetensors = _effective_gemma_safetensors(config, c.gemma_safetensors, c.gemma_root)
     gemma_root = _effective_gemma_root(config, c.gemma_root, gemma_safetensors)
     sample_prompts = _effective_caching_sample_prompts(config)
 
@@ -387,7 +392,7 @@ def build_cache_text_cmd(config: ProjectConfig) -> list[str]:
 def build_inference_cmd(config: ProjectConfig) -> list[str]:
     """Build CLI args for ltx2_generate_video.py."""
     s = config.inference
-    gemma_safetensors = _effective_gemma_safetensors(config, s.gemma_safetensors)
+    gemma_safetensors = _effective_gemma_safetensors(config, s.gemma_safetensors, s.gemma_root)
     gemma_root = _effective_gemma_root(config, s.gemma_root, gemma_safetensors)
 
     cmd = [
@@ -625,7 +630,7 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
     toml_path = export_dataset_toml(config)
     t = config.training
     ltx2_checkpoint = _effective_ltx2_checkpoint(config, t.ltx2_checkpoint)
-    gemma_safetensors = _effective_gemma_safetensors(config, t.gemma_safetensors)
+    gemma_safetensors = _effective_gemma_safetensors(config, t.gemma_safetensors, t.gemma_root)
     gemma_root = _effective_gemma_root(config, t.gemma_root, gemma_safetensors)
     network_module = _effective_network_module(t.network_module or "")
     sample_prompts = _effective_training_sample_prompts(config)
@@ -1567,7 +1572,7 @@ def build_full_finetune_cmd(config: ProjectConfig) -> list[str]:
     toml_path = export_dataset_toml(config)
     t = config.full_finetune
     ltx2_checkpoint = _effective_ltx2_checkpoint(config, t.ltx2_checkpoint)
-    gemma_safetensors = _effective_gemma_safetensors(config, t.gemma_safetensors)
+    gemma_safetensors = _effective_gemma_safetensors(config, t.gemma_safetensors, t.gemma_root)
     gemma_root = _effective_gemma_root(config, t.gemma_root, gemma_safetensors)
     sample_prompts = _effective_full_finetune_sample_prompts(config)
 
@@ -2178,7 +2183,7 @@ def build_slider_training_cmd(config: ProjectConfig) -> list[str]:
     t = config.training
     slider_toml = _write_slider_toml(config, build_slider_toml_path(config))
     ltx2_checkpoint = _effective_ltx2_checkpoint(config, t.ltx2_checkpoint)
-    gemma_safetensors = _effective_gemma_safetensors(config, t.gemma_safetensors)
+    gemma_safetensors = _effective_gemma_safetensors(config, t.gemma_safetensors, t.gemma_root)
     gemma_root = _effective_gemma_root(config, t.gemma_root, gemma_safetensors)
 
     cmd = _accelerate_launch_prefix(t.mixed_precision, s.accelerate_extra_args)
