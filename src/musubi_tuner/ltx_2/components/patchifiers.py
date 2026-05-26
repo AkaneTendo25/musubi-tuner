@@ -133,9 +133,20 @@ class VideoLatentPatchifier(Patchifier):
         return latent_coords
 
 
+def _patch_axis_scale_factors(scale_factors: SpatioTemporalScaleFactors | Tuple[int, int, int]) -> Tuple[int, int, int]:
+    if all(hasattr(scale_factors, attr) for attr in ("time", "height", "width")):
+        return int(scale_factors.time), int(scale_factors.height), int(scale_factors.width)
+
+    try:
+        temporal, height, width = scale_factors
+    except (TypeError, ValueError) as exc:
+        raise ValueError("scale_factors must provide time/height/width or be a 3-item tuple") from exc
+    return int(temporal), int(height), int(width)
+
+
 def get_pixel_coords(
     latent_coords: torch.Tensor,
-    scale_factors: SpatioTemporalScaleFactors,
+    scale_factors: SpatioTemporalScaleFactors | Tuple[int, int, int],
     causal_fix: bool = False,
 ) -> torch.Tensor:
     """
@@ -144,23 +155,24 @@ def get_pixel_coords(
     Optionally compensate for causal encoding that keeps the first frame at unit temporal scale.
     Args:
         latent_coords: Tensor of latent bounds shaped `(batch, 3, num_patches, 2)`.
-        scale_factors: SpatioTemporalScaleFactors tuple `(temporal, height, width)` with integer scale factors applied
-        per axis.
+        scale_factors: SpatioTemporalScaleFactors or legacy tuple `(temporal, height, width)` with integer scale
+        factors applied per axis.
         causal_fix: When True, rewrites the temporal axis of the first frame so causal VAEs
             that treat frame zero differently still yield non-negative timestamps.
     """
     # Broadcast the VAE scale factors so they align with the `(batch, axis, patch, bound)` layout.
     broadcast_shape = [1] * latent_coords.ndim
     broadcast_shape[1] = -1  # axis dimension corresponds to (frame/time, height, width)
-    scale_tensor = torch.tensor(scale_factors, device=latent_coords.device).view(*broadcast_shape)
+    axis_scale_factors = _patch_axis_scale_factors(scale_factors)
+    scale_tensor = torch.tensor(axis_scale_factors, device=latent_coords.device).view(*broadcast_shape)
 
     # Apply per-axis scaling to convert latent bounds into pixel-space coordinates.
     pixel_coords = latent_coords * scale_tensor
 
     if causal_fix:
-        # VAE temporal stride for the very first frame is 1 instead of `scale_factors[0]`.
+        # VAE temporal stride for the very first frame is 1 instead of the regular temporal scale.
         # Shift and clamp to keep the first-frame timestamps causal and non-negative.
-        pixel_coords[:, 0, ...] = (pixel_coords[:, 0, ...] + 1 - scale_factors[0]).clamp(min=0)
+        pixel_coords[:, 0, ...] = (pixel_coords[:, 0, ...] + 1 - axis_scale_factors[0]).clamp(min=0)
 
     return pixel_coords
 
