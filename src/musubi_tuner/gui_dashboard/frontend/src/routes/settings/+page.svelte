@@ -199,7 +199,7 @@
 							<div class="font-mono" style="color: var(--text-primary);">{management.repo.remote_head_short || '--'}</div>
 						</div>
 						<div>
-							<div style="color: var(--text-muted);">Dirty Worktree</div>
+							<div style="color: var(--text-muted);">Tracked Changes</div>
 							<div style="color: {management.repo.dirty ? 'var(--warning)' : 'var(--success)'};">{management.repo.dirty ? 'Yes' : 'No'}</div>
 						</div>
 						<div>
@@ -248,6 +248,94 @@
 					</div>
 				</div>
 			</div>
+
+			{#if management.install.backup?.present}
+				<div
+					class="p-5 space-y-4"
+					style="background: var(--bg-surface); border: 1px solid var(--border-subtle); border-radius: var(--radius-md);"
+				>
+					<div class="flex items-center justify-between gap-3">
+						<div
+							class="text-[11px] font-semibold uppercase tracking-wider"
+							style="color: var(--text-muted); font-family: var(--font-label);"
+						>
+							Last Setup Backup
+						</div>
+						<div
+							class="px-2 py-1 text-[10px] font-semibold uppercase"
+							style="border-radius: var(--radius-sm); background: {management.install.backup.available
+								? 'var(--success-muted, rgba(34,197,94,0.10))'
+								: 'var(--warning-muted, rgba(245,158,11,0.10))'}; color: {management.install.backup.available
+								? 'var(--success)'
+								: 'var(--warning)'};"
+						>
+							{management.install.backup.available ? 'Available' : 'Missing'}
+						</div>
+					</div>
+					<div class="grid grid-cols-2 gap-3 text-[12px]">
+						<div>
+							<div style="color: var(--text-muted);">Created</div>
+							<div style="color: var(--text-primary);">{management.install.backup.created_label}</div>
+						</div>
+						<div>
+							<div style="color: var(--text-muted);">Stash Ref</div>
+							<div class="font-mono break-all" style="color: var(--text-primary);">{management.install.backup.stash_ref || '--'}</div>
+						</div>
+						<div class="col-span-2">
+							<div style="color: var(--text-muted);">Recovery Target</div>
+							<div class="font-mono break-all" style="color: var(--text-primary);">{management.install.backup.recovery_target || '--'}</div>
+						</div>
+					</div>
+					{#if management.install.backup.files?.length}
+						<div class="space-y-2">
+							<div
+								class="text-[11px] font-semibold uppercase tracking-wider"
+								style="color: var(--text-muted); font-family: var(--font-label);"
+							>
+								Backed-Up Files
+							</div>
+							<div class="max-h-40 overflow-auto space-y-1 text-[11px]">
+								{#each management.install.backup.files as item}
+									<div
+										class="font-mono break-all px-2 py-1"
+										style="background: var(--bg-elevated); border-radius: var(--radius-sm); color: var(--text-secondary);"
+									>
+										{item}
+									</div>
+								{/each}
+							</div>
+						</div>
+					{/if}
+					{#if management.install.backup.commands?.length}
+						<div class="space-y-2">
+							<div
+								class="text-[11px] font-semibold uppercase tracking-wider"
+								style="color: var(--text-muted); font-family: var(--font-label);"
+							>
+								Recovery Commands
+							</div>
+							<div class="space-y-1 text-[11px]">
+								{#each management.install.backup.commands as item}
+									<div
+										class="font-mono break-all px-2 py-1"
+										style="background: var(--bg-elevated); border-radius: var(--radius-sm); color: var(--text-secondary);"
+									>
+										{item}
+									</div>
+								{/each}
+							</div>
+						</div>
+					{/if}
+					{#if management.install.backup.error}
+						<div
+							class="px-3 py-2 text-[12px]"
+							style="background: color-mix(in srgb, var(--warning) 10%, transparent); border-radius: var(--radius-sm); color: var(--text-secondary);"
+						>
+							{management.install.backup.error}
+						</div>
+					{/if}
+				</div>
+			{/if}
 
 			<div class="p-5 space-y-4" style="background: var(--bg-surface); border: 1px solid var(--border-subtle); border-radius: var(--radius-md);">
 				<div class="text-[11px] font-semibold uppercase tracking-wider" style="color: var(--text-muted); font-family: var(--font-label);">Launchers & Shortcuts</div>
@@ -451,6 +539,23 @@
 				<div class="text-[11px] font-semibold uppercase tracking-wider" style="color: var(--text-muted); font-family: var(--font-label);">Recommended Next Steps</div>
 				{#each management.recommendations as item}
 					<div class="px-3 py-2 text-[12px]" style="background: var(--bg-elevated); border-radius: var(--radius-sm); color: var(--text-secondary);">
+						{item}
+					</div>
+				{/each}
+			</div>
+		{/if}
+
+		{#if management.notices?.length}
+			<div
+				class="p-5 space-y-2"
+				style="background: var(--bg-surface); border: 1px solid var(--border-subtle); border-radius: var(--radius-md);"
+			>
+				<div class="text-[11px] font-semibold uppercase tracking-wider" style="color: var(--accent); font-family: var(--font-label);">Notices</div>
+				{#each management.notices as item}
+					<div
+						class="px-3 py-2 text-[12px]"
+						style="background: var(--bg-elevated); border-radius: var(--radius-sm); color: var(--text-secondary);"
+					>
 						{item}
 					</div>
 				{/each}

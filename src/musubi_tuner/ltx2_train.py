@@ -1910,7 +1910,7 @@ def _build_full_ft_param_groups(
             param_groups.append(group)
             param_name_groups.append(apollo_grouped_names[scale])
     if qgalore_grouped_params:
-        if not qgalore_group_kwargs:
+        if qgalore_group_kwargs is None:
             raise ValueError("Q-GaLore parameters were found, but qgalore_group_kwargs was not provided.")
         for scale in qgalore_scales:
             group = {"params": qgalore_grouped_params[scale], "lr": base_lr * scale}
@@ -3353,7 +3353,8 @@ def main() -> None:
         manifest_validation_dataset_group = config_utils.generate_dataset_group_by_manifest(
             dataset_manifest,
             split="validation",
-            training=False,
+            # Cache-only validation manifests still need bucket preparation; the DataLoader below stays non-shuffled.
+            training=True,
             num_timestep_buckets=args.num_timestep_buckets,
             shared_epoch=current_epoch,
             reference_downscale=getattr(args, "reference_downscale", 1),
@@ -3497,7 +3498,8 @@ def main() -> None:
         val_blueprint = blueprint_generator.generate(val_user_config, args, architecture=trainer.architecture)
         val_dataset_group = config_utils.generate_dataset_group_by_blueprint(
             val_blueprint.dataset_group,
-            training=False,  # validation mode
+            # Cache-only validation datasets still need bucket preparation; the DataLoader below stays non-shuffled.
+            training=True,
             num_timestep_buckets=args.num_timestep_buckets,
             shared_epoch=current_epoch,
             reference_downscale=getattr(args, "reference_downscale", 1),

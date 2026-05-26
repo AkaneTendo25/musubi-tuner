@@ -10,6 +10,8 @@ param(
     [string]$PythonVersion = "3.12",
     [int]$Port = 7860,
     [string]$DashboardHost = "127.0.0.1",
+    [ValidateSet("Safe", "StashAndUpdate")]
+    [string]$UpdatePolicy = "Safe",
     [switch]$NonInteractive,
     [switch]$StrictPreflight,
     [switch]$PreflightOnly
@@ -22,6 +24,8 @@ $script:LogFile = Join-Path $env:TEMP ("musubi_ltx2_install_{0:yyyyMMdd_HHmmss}.
 New-Item -Path $script:LogFile -ItemType File -Force | Out-Null
 $script:SessionId = [Guid]::NewGuid().ToString()
 $script:CurrentStep = "bootstrap"
+$script:LastRepositorySyncSucceeded = $false
+$script:LastRepositoryBackup = $null
 $script:InstallStateFileName = ".musubi_install_state.json"
 $script:DashboardLauncherName = "launch_musubi_dashboard.cmd"
 $script:SetupLauncherName = "launch_musubi_setup.cmd"
@@ -123,6 +127,20 @@ function Invoke-External {
     $exitCode = $LASTEXITCODE
     if ($exitCode -ne 0) {
         throw "Command failed with exit code ${exitCode}: $FilePath $($Arguments -join ' ')"
+    }
+}
+
+function Write-ExternalOutputLines {
+    param(
+        [object[]]$Output = @(),
+        [ValidateSet("INFO", "WARN", "ERROR", "OK")][string]$Level = "WARN"
+    )
+
+    foreach ($line in @($Output)) {
+        $text = ([string]$line).TrimEnd()
+        if (-not [string]::IsNullOrWhiteSpace($text)) {
+            Write-Log ("  {0}" -f $text) $Level
+        }
     }
 }
 
@@ -256,6 +274,110 @@ function Get-InstallState {
     }
 }
 
+function Get-GitStatusEntryPath {
+    param([Parameter(Mandatory = $true)][string]$Line)
+
+    if ($Line.Length -lt 4) {
+        return ""
+    }
+    return $Line.Substring(3)
+}
+
+function Format-GitStatusEntry {
+    param([Parameter(Mandatory = $true)][string]$Line)
+
+    $statusCode = if ($Line.Length -ge 2) { $Line.Substring(0, 2) } else { $Line }
+    $path = Get-GitStatusEntryPath -Line $Line
+    $label = switch -Exact ($statusCode) {
+        "??" { "untracked" }
+        " M" { "modified" }
+        "M " { "staged" }
+        "MM" { "modified" }
+        " A" { "added" }
+        "A " { "staged add" }
+        " D" { "deleted" }
+        "D " { "staged delete" }
+        default {
+            $trimmed = $statusCode.Trim()
+            if ([string]::IsNullOrWhiteSpace($trimmed)) { "changed" } else { $trimmed }
+        }
+    }
+
+    return "{0}: {1}" -f $label, $path
+}
+
+function Format-StatusFileList {
+    param(
+        [object[]]$Items = @(),
+        [int]$MaxItems = 5
+    )
+
+    $values = @(@($Items) | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
+    if ($values.Count -eq 0) {
+        return ""
+    }
+
+    $shown = @($values | Select-Object -First $MaxItems)
+    $suffix = if ($values.Count -gt $MaxItems) { " (+{0} more)" -f ($values.Count - $MaxItems) } else { "" }
+    return "{0}{1}" -f ($shown -join ", "), $suffix
+}
+
+function Get-StashRecoveryCommands {
+    param([string]$StashTarget = "")
+
+    if ([string]::IsNullOrWhiteSpace($StashTarget)) {
+        return @()
+    }
+
+    return @(
+        "git stash show --include-untracked --name-only $StashTarget",
+        "git stash show --include-untracked -p $StashTarget",
+        "git stash apply $StashTarget",
+        "git stash pop $StashTarget"
+    )
+}
+
+function Get-GitStatusPorcelain {
+    param(
+        [Parameter(Mandatory = $true)][string]$GitExe,
+        [Parameter(Mandatory = $true)][string]$RepoPath
+    )
+
+    $output = & $GitExe -C $RepoPath status --porcelain -- . 2>$null
+    $exitCode = $LASTEXITCODE
+    $trackedOutput = [System.Collections.ArrayList]::new()
+    $untrackedOutput = [System.Collections.ArrayList]::new()
+
+    if ($exitCode -eq 0) {
+        foreach ($line in @($output)) {
+            if ([string]::IsNullOrWhiteSpace($line)) {
+                continue
+            }
+
+            $statusCode = if ($line.Length -ge 2) { $line.Substring(0, 2) } else { $line }
+            if ($statusCode -eq "??") {
+                [void]$untrackedOutput.Add($line)
+            } else {
+                [void]$trackedOutput.Add($line)
+            }
+        }
+    }
+
+    $trackedLines = @($trackedOutput | ForEach-Object { [string]$_ })
+    $untrackedLines = @($untrackedOutput | ForEach-Object { [string]$_ })
+    $allLines = @($output | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
+
+    return [pscustomobject]@{
+        ExitCode = $exitCode
+        Output = $allLines
+        TrackedOutput = $trackedLines
+        UntrackedOutput = $untrackedLines
+        ChangedFiles = @($trackedLines | ForEach-Object { Format-GitStatusEntry -Line $_ })
+        UntrackedFiles = @($untrackedLines | ForEach-Object { Format-GitStatusEntry -Line $_ })
+        LocalFiles = @($allLines | ForEach-Object { Format-GitStatusEntry -Line $_ })
+    }
+}
+
 function Save-InstallState {
     param(
         [Parameter(Mandatory = $true)][string]$RepoPath,
@@ -366,6 +488,11 @@ function Get-RepositoryStatus {
         diverged = $false
         update_available = $false
         can_auto_update = $false
+        tracked_dirty = $false
+        has_untracked = $false
+        changed_files = @()
+        untracked_files = @()
+        local_files = @()
         summary = "Repository not found"
         error = ""
     }
@@ -397,9 +524,14 @@ function Get-RepositoryStatus {
         $status.branch = $branch.Trim()
     }
 
-    $porcelain = & $GitExe -C $RepoPath status --porcelain 2>$null
-    if ($LASTEXITCODE -eq 0) {
-        $status.dirty = -not [string]::IsNullOrWhiteSpace(($porcelain | Out-String).Trim())
+    $porcelain = Get-GitStatusPorcelain -GitExe $GitExe -RepoPath $RepoPath
+    if ($porcelain.ExitCode -eq 0) {
+        $status.changed_files = @($porcelain.ChangedFiles)
+        $status.untracked_files = @($porcelain.UntrackedFiles)
+        $status.local_files = @($porcelain.LocalFiles)
+        $status.tracked_dirty = @($porcelain.TrackedOutput).Count -gt 0
+        $status.has_untracked = @($porcelain.UntrackedOutput).Count -gt 0
+        $status.dirty = $status.tracked_dirty
     }
 
     $originUrl = (& $GitExe -C $RepoPath remote get-url origin 2>$null | Select-Object -First 1)
@@ -455,8 +587,8 @@ function Get-RepositoryStatus {
         }
     }
 
-    if ($status.dirty) {
-        $status.summary = "Local changes detected; safe auto-update is disabled"
+    if ($status.tracked_dirty) {
+        $status.summary = "Tracked local changes detected ($(@($status.changed_files).Count) file(s)); safe auto-update is disabled"
     } elseif ($status.diverged) {
         $status.summary = "Local branch and origin have diverged"
     } elseif ($status.update_available) {
@@ -467,11 +599,13 @@ function Get-RepositoryStatus {
         $status.summary = "No origin remote configured; update checks are unavailable"
     } elseif ($status.fetch_attempted -and (-not $status.fetch_succeeded)) {
         $status.summary = "Origin fetch failed; review git remote configuration and network access"
+    } elseif ($status.has_untracked) {
+        $status.summary = "Repository is up to date; untracked local files are present and will be left in place"
     } else {
         $status.summary = "Repository is up to date"
     }
 
-    $status.can_auto_update = $status.update_available -and (-not $status.dirty) -and (-not $status.diverged)
+    $status.can_auto_update = $status.update_available -and (-not $status.tracked_dirty) -and (-not $status.diverged)
     return [pscustomobject]$status
 }
 
@@ -1038,9 +1172,12 @@ function Sync-Repository {
         [Parameter(Mandatory = $true)][string]$GitExe,
         [Parameter(Mandatory = $true)][string]$RepoPath,
         [Parameter(Mandatory = $true)][string]$RemoteUrl,
-        [Parameter(Mandatory = $true)][string]$BranchName
+        [Parameter(Mandatory = $true)][string]$BranchName,
+        [ValidateSet("Safe", "StashAndUpdate")][string]$UpdatePolicy = "Safe"
     )
 
+    $script:LastRepositorySyncSucceeded = $false
+    $script:LastRepositoryBackup = $null
     $parent = Split-Path -Parent $RepoPath
     if (-not (Test-Path $parent)) {
         New-Item -Path $parent -ItemType Directory -Force | Out-Null
@@ -1055,6 +1192,7 @@ function Sync-Repository {
             $RemoteUrl,
             $RepoPath
         ) -MaxAttempts 3 -DelaySeconds 5
+        $script:LastRepositorySyncSucceeded = $true
         return
     }
 
@@ -1063,18 +1201,97 @@ function Sync-Repository {
     }
 
     Write-Log "Updating existing repository at $RepoPath..."
-    $statusOut = & $GitExe -C $RepoPath status --porcelain
-    if ($LASTEXITCODE -ne 0) {
+    $statusOut = Get-GitStatusPorcelain -GitExe $GitExe -RepoPath $RepoPath
+    if ($statusOut.ExitCode -ne 0) {
         throw "Failed to inspect git status in $RepoPath"
     }
-    if ($statusOut) {
-        Write-Log "Repository has local changes. Skipping update to avoid conflicts." "WARN"
+    if (@($statusOut.TrackedOutput).Count -gt 0 -and $UpdatePolicy -eq "Safe") {
+        $changeSummary = Format-StatusFileList -Items $statusOut.ChangedFiles
+        Write-Log "Tracked local changes were found. Safe update is leaving the repository unchanged." "WARN"
+        Write-Log ("Changed files: {0}" -f $changeSummary) "WARN"
+        Write-Log "Run setup again with -UpdatePolicy StashAndUpdate to back up these changes with git stash and update." "WARN"
         return
+    }
+    if (@($statusOut.UntrackedOutput).Count -gt 0 -and $UpdatePolicy -eq "Safe") {
+        $untrackedSummary = Format-StatusFileList -Items $statusOut.UntrackedFiles
+        Write-Log ("Untracked local files will be left in place during the update: {0}" -f $untrackedSummary) "INFO"
+        $conflictMessage = "If Git reports that an untracked file would be overwritten, rerun with -UpdatePolicy StashAndUpdate or move that file."
+        Write-Log $conflictMessage "INFO"
+    }
+    if (@($statusOut.Output).Count -gt 0 -and $UpdatePolicy -eq "StashAndUpdate") {
+        $backupStamp = Get-Date -Format "yyyyMMdd_HHmmss"
+        $backupUtc = (Get-Date).ToUniversalTime().ToString("o")
+        $stashMessage = "musubi setup backup $backupStamp"
+        $backupFiles = @($statusOut.LocalFiles)
+        Write-Log "Backing up local changes with git stash before updating."
+        Write-Log "This backup will not be reapplied automatically after the update."
+        $stashOutput = & $GitExe -C $RepoPath stash push --include-untracked -m $stashMessage 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            Write-Log "Could not create the git stash backup. The repository was not updated." "WARN"
+            Write-ExternalOutputLines -Output $stashOutput -Level "WARN"
+            return
+        }
+        Write-ExternalOutputLines -Output $stashOutput -Level "INFO"
+        $stashRef = (& $GitExe -C $RepoPath stash list --format="%gd%x09%H%x09%s" -n 1 2>$null | Select-Object -First 1)
+        $stashName = ""
+        $stashSha = ""
+        $stashSubject = ""
+        if ($LASTEXITCODE -eq 0 -and $stashRef) {
+            $stashParts = $stashRef.Trim().Split("`t", 3)
+            if ($stashParts.Count -ge 1) {
+                $stashName = $stashParts[0]
+            }
+            if ($stashParts.Count -ge 2) {
+                $stashSha = $stashParts[1]
+            }
+            if ($stashParts.Count -ge 3) {
+                $stashSubject = $stashParts[2]
+            }
+            Write-Log ("Backup created: {0} {1}" -f $stashName, $stashSubject).Trim() "OK"
+        } else {
+            Write-Log ("Backup created with message: {0}" -f $stashMessage) "OK"
+        }
+        $stashTarget = if (-not [string]::IsNullOrWhiteSpace($stashSha)) { $stashSha } else { $stashName }
+        $script:LastRepositoryBackup = [ordered]@{
+            created_utc = $backupUtc
+            message = $stashMessage
+            stash_ref = $stashName
+            stash_sha = $stashSha
+            stash_subject = $stashSubject
+            recovery_target = $stashTarget
+            files = $backupFiles
+            commands = Get-StashRecoveryCommands -StashTarget $stashTarget
+        }
+        if (@($script:LastRepositoryBackup["commands"]).Count -ge 3) {
+            Write-Log "To see backed-up files:" "INFO"
+            Write-Log ("  {0}" -f $script:LastRepositoryBackup["commands"][0]) "INFO"
+            Write-Log "To restore them into the updated repo:" "INFO"
+            Write-Log ("  {0}" -f $script:LastRepositoryBackup["commands"][2]) "INFO"
+        }
     }
 
     Invoke-ExternalWithRetry -FilePath $GitExe -Arguments @("-C", $RepoPath, "fetch", "origin", $BranchName) -MaxAttempts 3 -DelaySeconds 5
-    Invoke-External -FilePath $GitExe -Arguments @("-C", $RepoPath, "checkout", $BranchName)
-    Invoke-ExternalWithRetry -FilePath $GitExe -Arguments @("-C", $RepoPath, "pull", "--ff-only", "origin", $BranchName) -MaxAttempts 3 -DelaySeconds 5
+    $checkoutOutput = & $GitExe -C $RepoPath checkout $BranchName 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        Write-Log "Git could not check out the requested branch. The repository was not updated." "WARN"
+        Write-ExternalOutputLines -Output $checkoutOutput -Level "WARN"
+        Write-Log "No local files were deleted by setup. Resolve the Git message above and rerun setup." "WARN"
+        return
+    }
+    $pullOutput = & $GitExe -C $RepoPath pull --ff-only origin $BranchName 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        Write-Log "Git could not fast-forward the repository. The repository was not updated." "WARN"
+        Write-ExternalOutputLines -Output $pullOutput -Level "WARN"
+        Write-Log "No local files were deleted by setup. Untracked files may conflict with incoming repository files." "WARN"
+        Write-Log "Move the conflicting files or rerun setup with -UpdatePolicy StashAndUpdate." "WARN"
+        return
+    }
+    Write-ExternalOutputLines -Output $pullOutput -Level "INFO"
+    if ($UpdatePolicy -eq "StashAndUpdate" -and @($statusOut.Output).Count -gt 0) {
+        $stashReminder = "Local changes remain backed up in git stash. Review them with 'git stash list' before applying or dropping them."
+        Write-Log $stashReminder "WARN"
+    }
+    $script:LastRepositorySyncSucceeded = $true
 }
 
 function Ensure-Venv {
@@ -1184,9 +1401,9 @@ function Write-LauncherScript {
     $contents = @(
         "@echo off",
         "setlocal",
-        "for %%I in (""%~dp0."") do set ""REPO_DIR=%%~fI\\""",
-        "set ""PYTHONPATH=%REPO_DIR%src;%PYTHONPATH%""",
-        "set ""VENV_PY=%REPO_DIR%venv\Scripts\python.exe""",
+        "for %%I in (""%~dp0."") do set ""REPO_DIR=%%~fI""",
+        "set ""PYTHONPATH=%REPO_DIR%\src;%PYTHONPATH%""",
+        "set ""VENV_PY=%REPO_DIR%\venv\Scripts\python.exe""",
         "if not exist ""%VENV_PY%"" (",
         "  echo Virtual environment python not found: %VENV_PY%",
         "  pause",
@@ -1219,9 +1436,9 @@ function Write-SetupLauncherScript {
     $contents = @(
         "@echo off",
         "setlocal",
-        "for %%I in (""%~dp0."") do set ""REPO_DIR=%%~fI\\""",
-        "for %%I in (""%REPO_DIR%.."") do set ""INSTALL_ROOT=%%~fI""",
-        "set ""INSTALL_PS=%REPO_DIR%scripts\install.ps1""",
+        "for %%I in (""%~dp0."") do set ""REPO_DIR=%%~fI""",
+        "for %%I in (""%REPO_DIR%\.."") do set ""INSTALL_ROOT=%%~fI""",
+        "set ""INSTALL_PS=%REPO_DIR%\scripts\install.ps1""",
         "if not exist ""%INSTALL_PS%"" (",
         "  echo Installer script not found: %INSTALL_PS%",
         "  pause",
@@ -1348,6 +1565,49 @@ function Select-Branch {
             continue
         }
 
+        Write-Host "Invalid selection." -ForegroundColor Yellow
+    }
+}
+
+function Select-UpdatePolicy {
+    param(
+        [Parameter(Mandatory = $true)][string]$CurrentPolicy,
+        [Parameter(Mandatory = $true)]$RepoStatus,
+        [Parameter(Mandatory = $true)][bool]$BranchSwitchRequested,
+        [switch]$SkipPrompt
+    )
+
+    if ($SkipPrompt -or $CurrentPolicy -eq "StashAndUpdate" -or (-not $RepoStatus.tracked_dirty)) {
+        return $CurrentPolicy
+    }
+    if ((-not $RepoStatus.update_available) -and (-not $BranchSwitchRequested)) {
+        return $CurrentPolicy
+    }
+
+    while ($true) {
+        Write-Host ""
+        Write-Host "============================================================" -ForegroundColor Cyan
+        Write-Host " Musubi LTX-2 Setup / Update - Local Changes" -ForegroundColor Cyan
+        Write-Host "============================================================" -ForegroundColor Cyan
+        Write-Host "Tracked local changes were found. Safe update will not overwrite or delete them." -ForegroundColor Yellow
+        Write-Host ("Changed files: {0}" -f (Format-StatusFileList -Items $RepoStatus.changed_files)) -ForegroundColor DarkGray
+        Write-Host ""
+        Write-Host " S. Skip repository update for this run (safe default)"
+        Write-Host " B. Back up local changes with git stash, then update"
+        Write-Host ""
+        Write-Host "The stash backup will not be reapplied automatically after setup finishes." -ForegroundColor DarkGray
+        Write-Host "Press [Enter]/[S] to keep the safe default, or [Q] to quit." -ForegroundColor DarkGray
+
+        $choice = (Read-SelectionInput).Trim().ToUpperInvariant()
+        if ([string]::IsNullOrWhiteSpace($choice) -or $choice -eq "S") {
+            return "Safe"
+        }
+        if ($choice -eq "B") {
+            return "StashAndUpdate"
+        }
+        if ($choice -eq "Q") {
+            throw "Installation cancelled by user."
+        }
         Write-Host "Invalid selection." -ForegroundColor Yellow
     }
 }
@@ -1555,6 +1815,7 @@ try {
     Write-Log "CUDA target: $Cuda"
     Write-Log "Preferred Python: $PythonVersion"
     Write-Log "Dashboard host: $DashboardHost"
+    Write-Log "Update policy: $UpdatePolicy"
     Write-Log ("Browser URL: {0}" -f (Get-BrowserUrl -HostValue $DashboardHost -PortValue $Port))
     Ensure-Tls12ForLegacyPowerShell
 
@@ -1585,6 +1846,7 @@ try {
     $stateFrontendCommit = ""
     $stateFrontendTimestampUtc = ""
     $stateCuda = ""
+    $stateLastBackup = $null
     if ($existingState) {
         $stateLastSuccessUtc = [string](Get-NestedPropertyValue -Object $existingState -Path @("install", "last_success_utc") -Default "")
         $stateDepsCommit = [string](Get-NestedPropertyValue -Object $existingState -Path @("install", "deps_commit") -Default "")
@@ -1592,10 +1854,22 @@ try {
         $stateFrontendCommit = [string](Get-NestedPropertyValue -Object $existingState -Path @("install", "frontend_commit") -Default "")
         $stateFrontendTimestampUtc = [string](Get-NestedPropertyValue -Object $existingState -Path @("install", "frontend_timestamp_utc") -Default "")
         $stateCuda = [string](Get-OptionalPropertyValue -Object $existingState -Name "cuda" -Default "")
+        $stateLastBackup = Get-NestedPropertyValue -Object $existingState -Path @("install", "last_backup") -Default $null
     }
 
+    $branchSwitchRequested = $repoExists -and $repoStatus.is_git_repo -and (-not [string]::IsNullOrWhiteSpace($repoStatus.branch)) -and ($repoStatus.branch -ne $Branch)
+    $updatePolicyArgs = @{
+        CurrentPolicy = $UpdatePolicy
+        RepoStatus = $repoStatus
+        BranchSwitchRequested = $branchSwitchRequested
+        SkipPrompt = [bool]$NonInteractive
+    }
+    $UpdatePolicy = Select-UpdatePolicy @updatePolicyArgs
+    $stashCanHandleTrackedChanges = $UpdatePolicy -eq "StashAndUpdate" -and $repoStatus.tracked_dirty
+
     $comparisonTargetRef = ""
-    if ($repoStatus.can_auto_update -and $repoStatus.remote_head) {
+    $canCompareRemote = $repoStatus.can_auto_update -or ($UpdatePolicy -eq "StashAndUpdate" -and $repoStatus.update_available)
+    if ($canCompareRemote -and $repoStatus.remote_head) {
         $comparisonTargetRef = $repoStatus.remote_head
     } elseif ($repoStatus.head) {
         $comparisonTargetRef = $repoStatus.head
@@ -1615,34 +1889,43 @@ try {
     if ($gitExeObj -and $repoStatus.is_git_repo -and $comparisonTargetRef) {
         if ($stateDepsCommit) {
             $depsChanged = Test-GitPathsChanged -GitExe $gitExeObj.Source -RepoPath $RepoDir -FromRef $stateDepsCommit -ToRef $comparisonTargetRef -PathSpecs $dependencyPathSpecs
-        } elseif ($repoStatus.can_auto_update -and $repoStatus.head) {
+        } elseif ($canCompareRemote -and $repoStatus.head) {
             $depsChanged = Test-GitPathsChanged -GitExe $gitExeObj.Source -RepoPath $RepoDir -FromRef $repoStatus.head -ToRef $comparisonTargetRef -PathSpecs $dependencyPathSpecs
         }
 
         if ($stateFrontendCommit) {
             $frontendChanged = Test-GitPathsChanged -GitExe $gitExeObj.Source -RepoPath $RepoDir -FromRef $stateFrontendCommit -ToRef $comparisonTargetRef -PathSpecs $frontendPathSpecs
-        } elseif ($repoStatus.can_auto_update -and $repoStatus.head) {
+        } elseif ($canCompareRemote -and $repoStatus.head) {
             $frontendChanged = Test-GitPathsChanged -GitExe $gitExeObj.Source -RepoPath $RepoDir -FromRef $repoStatus.head -ToRef $comparisonTargetRef -PathSpecs $frontendPathSpecs
         }
     }
 
-    $branchSwitchRequested = $repoExists -and $repoStatus.is_git_repo -and (-not [string]::IsNullOrWhiteSpace($repoStatus.branch)) -and ($repoStatus.branch -ne $Branch)
-    $defaultCloneOrUpdate = (-not $repoExists) -or (($branchSwitchRequested) -and (-not $repoStatus.dirty)) -or $repoStatus.can_auto_update
+    $defaultCloneOrUpdate = (
+        (-not $repoExists) -or
+        ($branchSwitchRequested -and ((-not $repoStatus.tracked_dirty) -or $stashCanHandleTrackedChanges)) -or
+        $repoStatus.can_auto_update -or
+        ($stashCanHandleTrackedChanges -and $repoStatus.update_available)
+    )
     $defaultCreateVenv = -not $venvExists
     $defaultInstallDeps = (-not $venvExists) -or $depsChanged -or (($stateCuda) -and ($stateCuda -ne $Cuda))
     $defaultBuildFrontend = ($repoExists -and (-not $frontendDistExists)) -or $frontendChanged
     $defaultCreateShortcut = -not ($dashboardShortcutExists -and $setupShortcutExists)
+    $localChangeSummary = Format-StatusFileList -Items $repoStatus.changed_files -MaxItems 3
 
     $cloneBaseReason = if (-not $repoExists) {
         "required because repository does not exist yet"
-    } elseif ($branchSwitchRequested -and $repoStatus.dirty) {
-        "branch switch requested ($($repoStatus.branch) -> $Branch), but local changes block automatic checkout"
+    } elseif ($branchSwitchRequested -and $repoStatus.tracked_dirty -and $UpdatePolicy -eq "StashAndUpdate") {
+        "branch switch requested; tracked changes will be backed up with git stash before checkout"
+    } elseif ($branchSwitchRequested -and $repoStatus.tracked_dirty) {
+        "branch switch requested, but tracked local changes block safe checkout: $localChangeSummary"
     } elseif ($branchSwitchRequested) {
         "recommended because setup is configured for branch '$Branch' while the repo is on '$($repoStatus.branch)'"
-    } elseif ($repoStatus.dirty -and $repoStatus.update_available) {
-        "local changes detected; update is available but not auto-selected"
-    } elseif ($repoStatus.dirty) {
-        "local changes detected; repo sync is left off to avoid conflicts"
+    } elseif ($repoStatus.tracked_dirty -and $repoStatus.update_available -and $UpdatePolicy -eq "StashAndUpdate") {
+        "tracked local changes will be backed up with git stash before updating"
+    } elseif ($repoStatus.tracked_dirty -and $repoStatus.update_available) {
+        "tracked local changes detected; safe update is not auto-selected: $localChangeSummary"
+    } elseif ($repoStatus.tracked_dirty) {
+        "tracked local changes detected; repo sync is left off to avoid conflicts: $localChangeSummary"
     } elseif (-not $repoStatus.origin_configured -and $repoStatus.is_git_repo) {
         "origin remote is missing; automatic update checks are unavailable"
     } elseif ($repoStatus.update_available) {
@@ -1689,6 +1972,7 @@ try {
         ("Mode: {0}" -f $(if ($repoExists) { "manage existing install" } else { "first-time setup" })),
         ("Configured branch: {0}" -f $Branch),
         ("Checked-out repo branch: {0}" -f $(if ($repoStatus.branch) { $repoStatus.branch } else { "unknown" })),
+        ("Update policy: {0}" -f $UpdatePolicy),
         ("Repo: {0}" -f $repoStatus.summary),
         ("Venv: {0}" -f $(if ($venvExists) { "ready" } else { "missing" })),
         ("Python deps: {0}" -f $(if ($defaultInstallDeps) { $installDepsBaseReason } else { "no reinstall recommended" })),
@@ -1696,6 +1980,13 @@ try {
         ("Shortcuts: dashboard={0}, setup={1}" -f $(if ($dashboardShortcutExists) { "present" } else { "missing" }), $(if ($setupShortcutExists) { "present" } else { "missing" })),
         ("Last successful setup: {0}" -f (Format-StateTimestamp -Timestamp $stateLastSuccessUtc))
     )
+    if (@($repoStatus.changed_files).Count -gt 0) {
+        $overviewLines += ("Tracked changes: {0}" -f (Format-StatusFileList -Items $repoStatus.changed_files))
+    }
+    if (@($repoStatus.untracked_files).Count -gt 0) {
+        $untrackedSummary = Format-StatusFileList -Items $repoStatus.untracked_files
+        $overviewLines += ("Untracked files: {0}" -f $untrackedSummary)
+    }
 
     $actions = [System.Collections.ArrayList]::new()
     [void]$actions.Add([pscustomobject]@{
@@ -1792,6 +2083,7 @@ try {
         python_version = $PythonVersion
         dashboard_host = $DashboardHost
         port = $Port
+        update_policy = $UpdatePolicy
         repo = [ordered]@{
             last_checked_utc = ""
             head = ""
@@ -1804,6 +2096,8 @@ try {
             local_ahead_count = 0
             remote_ahead_count = 0
             diverged = $false
+            tracked_dirty = $false
+            has_untracked = $false
             last_sync_utc = ""
         }
         install = [ordered]@{
@@ -1812,6 +2106,7 @@ try {
             deps_timestamp_utc = $stateDepsTimestampUtc
             frontend_commit = $stateFrontendCommit
             frontend_timestamp_utc = $stateFrontendTimestampUtc
+            last_backup = $stateLastBackup
             venv_python = $venvPythonPath
             venv_exists = $venvExists
             dashboard_launcher_path = Join-Path $RepoDir $script:DashboardLauncherName
@@ -1825,8 +2120,16 @@ try {
         if (-not $gitExeObj) {
             throw "git is required for clone/update. Enable 'Install Git' or install git manually."
         }
+        $script:LastRepositorySyncSucceeded = $false
         Invoke-Step -Name "SyncRepository" -Action {
-            Sync-Repository -GitExe $gitExeObj.Source -RepoPath $RepoDir -RemoteUrl $RepoUrl -BranchName $Branch
+            $syncArgs = @{
+                GitExe = $gitExeObj.Source
+                RepoPath = $RepoDir
+                RemoteUrl = $RepoUrl
+                BranchName = $Branch
+                UpdatePolicy = $UpdatePolicy
+            }
+            Sync-Repository @syncArgs
         }
     } elseif (-not (Test-Path $RepoDir)) {
         throw "Repository directory does not exist: $RepoDir"
@@ -1841,12 +2144,17 @@ try {
     $stateData["repo"]["remote_head"] = $repoStatus.remote_head
     $stateData["repo"]["remote_head_short"] = $repoStatus.remote_head_short
     $stateData["repo"]["dirty"] = [bool]$repoStatus.dirty
+    $stateData["repo"]["tracked_dirty"] = [bool]$repoStatus.tracked_dirty
+    $stateData["repo"]["has_untracked"] = [bool]$repoStatus.has_untracked
     $stateData["repo"]["update_available"] = [bool]$repoStatus.update_available
     $stateData["repo"]["local_ahead_count"] = [int]$repoStatus.local_ahead_count
     $stateData["repo"]["remote_ahead_count"] = [int]$repoStatus.remote_ahead_count
     $stateData["repo"]["diverged"] = [bool]$repoStatus.diverged
-    if (Get-ActionState -Actions $actions -Key "CloneOrUpdate") {
+    if ((Get-ActionState -Actions $actions -Key "CloneOrUpdate") -and $script:LastRepositorySyncSucceeded) {
         $stateData["repo"]["last_sync_utc"] = (Get-Date).ToUniversalTime().ToString("o")
+    }
+    if ($script:LastRepositoryBackup) {
+        $stateData["install"]["last_backup"] = $script:LastRepositoryBackup
     }
     Save-InstallState -RepoPath $RepoDir -State $stateData
 

@@ -100,6 +100,102 @@ def _git_run(repo_root: Path, *args: str, timeout: int = 10) -> subprocess.Compl
         return None
 
 
+def _git_status_path(line: str) -> str:
+    return line[3:] if len(line) >= 4 else ""
+
+
+def _format_git_status_entry(line: str) -> str:
+    status = line[:2] if len(line) >= 2 else line
+    path = _git_status_path(line)
+    labels = {
+        "??": "untracked",
+        " M": "modified",
+        "M ": "staged",
+        "MM": "modified",
+        " A": "added",
+        "A ": "staged add",
+        " D": "deleted",
+        "D ": "staged delete",
+    }
+    label = labels.get(status, status.strip() or "changed")
+    return f"{label}: {path}"
+
+
+def _format_file_list(items: list[str], max_items: int = 5) -> str:
+    shown = items[:max_items]
+    suffix = f" (+{len(items) - max_items} more)" if len(items) > max_items else ""
+    return f"{', '.join(shown)}{suffix}"
+
+
+def _string_list(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [str(item) for item in value if str(item).strip()]
+    if isinstance(value, str) and value.strip():
+        return [value]
+    return []
+
+
+def _stash_recovery_commands(target: str) -> list[str]:
+    if not target:
+        return []
+    return [
+        f"git stash show --include-untracked --name-only {target}",
+        f"git stash show --include-untracked -p {target}",
+        f"git stash apply {target}",
+        f"git stash pop {target}",
+    ]
+
+
+def _build_backup_status(repo_root: Path, install_state: dict[str, Any]) -> dict[str, Any]:
+    raw = install_state.get("last_backup")
+    if not isinstance(raw, dict):
+        return {
+            "present": False,
+            "available": False,
+            "created_utc": "",
+            "created_label": "never",
+            "message": "",
+            "stash_ref": "",
+            "stash_sha": "",
+            "stash_subject": "",
+            "recovery_target": "",
+            "files": [],
+            "commands": [],
+            "error": "",
+        }
+
+    target = str(raw.get("recovery_target") or raw.get("stash_sha") or raw.get("stash_ref") or "").strip()
+    files = _string_list(raw.get("files"))
+    commands = _string_list(raw.get("commands")) or _stash_recovery_commands(target)
+    error = ""
+    available = False
+
+    if target:
+        show_proc = _git_run(repo_root, "stash", "show", "--include-untracked", "--name-only", target)
+        if show_proc and show_proc.returncode == 0:
+            available = True
+            fresh_files = [line.strip() for line in show_proc.stdout.splitlines() if line.strip()]
+            if fresh_files:
+                files = fresh_files
+        else:
+            error = "The recorded stash backup was not found. It may have been applied, popped, or dropped."
+
+    return {
+        "present": True,
+        "available": available,
+        "created_utc": str(raw.get("created_utc") or ""),
+        "created_label": _format_timestamp(str(raw.get("created_utc") or "")),
+        "message": str(raw.get("message") or ""),
+        "stash_ref": str(raw.get("stash_ref") or ""),
+        "stash_sha": str(raw.get("stash_sha") or ""),
+        "stash_subject": str(raw.get("stash_subject") or ""),
+        "recovery_target": target,
+        "files": files,
+        "commands": commands,
+        "error": error,
+    }
+
+
 def _git_value(repo_root: Path, *args: str, timeout: int = 10) -> str:
     result = _git_run(repo_root, *args, timeout=timeout)
     if not result or result.returncode != 0:
@@ -190,7 +286,9 @@ def _check_required_path(
         return _doctor_item(key, label, "ok", f"Found at {path}", page=page, path=str(path))
 
     noun = "file" if expected == "file" else "directory"
-    return _doctor_item(key, label, "warning" if optional else "error", f"Expected {noun} is missing: {path}", page=page, path=str(path))
+    return _doctor_item(
+        key, label, "warning" if optional else "error", f"Expected {noun} is missing: {path}", page=page, path=str(path)
+    )
 
 
 def _dataset_source_status(config: ProjectConfig) -> dict[str, Any]:
@@ -305,14 +403,18 @@ def build_doctor_status(
             "node",
             "Node.js / npm",
             "ok" if _command_exists("npm.cmd", "npm") else "warning",
-            "npm is available for frontend rebuilds." if _command_exists("npm.cmd", "npm") else "npm is not available. Setup / Update can still repair this.",
+            "npm is available for frontend rebuilds."
+            if _command_exists("npm.cmd", "npm")
+            else "npm is not available. Setup / Update can still repair this.",
             page="/settings",
         ),
         _doctor_item(
             "frontend_dist",
             "Frontend Build",
             "ok" if install["frontend_dist_exists"] else "warning",
-            "Dashboard frontend build is present." if install["frontend_dist_exists"] else "Frontend dist is missing and should be rebuilt through Setup / Update.",
+            "Dashboard frontend build is present."
+            if install["frontend_dist_exists"]
+            else "Frontend dist is missing and should be rebuilt through Setup / Update.",
             page="/settings",
             path=install["frontend_dist_path"],
         ),
@@ -320,7 +422,9 @@ def build_doctor_status(
             "hf_token",
             "Hugging Face Auth",
             "ok" if _has_hf_token() else "warning",
-            "HF token detected." if _has_hf_token() else "No HF token detected. Public downloads may work, gated/private repos will not.",
+            "HF token detected."
+            if _has_hf_token()
+            else "No HF token detected. Public downloads may work, gated/private repos will not.",
             page="/settings",
         ),
     ]
@@ -505,6 +609,11 @@ def get_repository_status(repo_root: Path, branch: str, remote_url: str, state: 
         "diverged": False,
         "update_available": False,
         "can_auto_update": False,
+        "tracked_dirty": False,
+        "has_untracked": False,
+        "changed_files": [],
+        "untracked_files": [],
+        "local_files": [],
         "fetch_attempted": False,
         "fetch_succeeded": False,
         "offline": False,
@@ -532,9 +641,17 @@ def get_repository_status(repo_root: Path, branch: str, remote_url: str, state: 
     if branch_proc and branch_proc.returncode == 0:
         result["branch"] = branch_proc.stdout.strip()
 
-    status_proc = _git_run(repo_root, "status", "--porcelain")
+    status_proc = _git_run(repo_root, "status", "--porcelain", "--", ".")
     if status_proc and status_proc.returncode == 0:
-        result["dirty"] = bool(status_proc.stdout.strip())
+        status_lines = [line for line in status_proc.stdout.splitlines() if line.strip()]
+        tracked_lines = [line for line in status_lines if not line.startswith("?? ")]
+        untracked_lines = [line for line in status_lines if line.startswith("?? ")]
+        result["changed_files"] = [_format_git_status_entry(line) for line in tracked_lines]
+        result["untracked_files"] = [_format_git_status_entry(line) for line in untracked_lines]
+        result["local_files"] = [_format_git_status_entry(line) for line in status_lines]
+        result["tracked_dirty"] = bool(tracked_lines)
+        result["has_untracked"] = bool(untracked_lines)
+        result["dirty"] = bool(tracked_lines)
 
     origin_url = remote_url.strip() or _git_value(repo_root, "remote", "get-url", "origin")
     result["origin_configured"] = bool(origin_url)
@@ -580,7 +697,7 @@ def get_repository_status(repo_root: Path, branch: str, remote_url: str, state: 
         result["origin_error"] = "Could not reach the origin host to check for updates"
 
     if result["dirty"]:
-        result["summary"] = "Local changes detected; safe auto-update is disabled"
+        result["summary"] = f"Tracked local changes detected ({len(result['changed_files'])} file(s)); safe auto-update is disabled"
     elif result["diverged"]:
         result["summary"] = "Local branch and origin have diverged"
     elif result["update_available"]:
@@ -593,10 +710,12 @@ def get_repository_status(repo_root: Path, branch: str, remote_url: str, state: 
         result["summary"] = "Origin fetch failed; review git remote configuration and network access"
     elif offline:
         result["summary"] = "Could not reach the origin host to check for updates"
+    elif result["has_untracked"]:
+        result["summary"] = "Repository is up to date; untracked local files are present and will be left in place"
     else:
         result["summary"] = "Repository is up to date"
 
-    result["can_auto_update"] = result["update_available"] and not result["dirty"] and not result["diverged"]
+    result["can_auto_update"] = result["update_available"] and not result["tracked_dirty"] and not result["diverged"]
     return result
 
 
@@ -616,8 +735,12 @@ def get_management_status(repo_root: Path | None = None, project_config: Project
     dashboard_shortcut = desktop / DASHBOARD_SHORTCUT_NAME
     setup_shortcut = desktop / SETUP_SHORTCUT_NAME
 
-    compare_target = repo_status["remote_head"] if repo_status["can_auto_update"] and repo_status["remote_head"] else repo_status["head"]
-    deps_changed = _git_paths_changed(root, str(install_state.get("deps_commit") or ""), compare_target, ["pyproject.toml", "uv.lock"])
+    compare_target = (
+        repo_status["remote_head"] if repo_status["can_auto_update"] and repo_status["remote_head"] else repo_status["head"]
+    )
+    deps_changed = _git_paths_changed(
+        root, str(install_state.get("deps_commit") or ""), compare_target, ["pyproject.toml", "uv.lock"]
+    )
     frontend_changed = _git_paths_changed(
         root,
         str(install_state.get("frontend_commit") or ""),
@@ -633,11 +756,17 @@ def get_management_status(repo_root: Path | None = None, project_config: Project
 
     deps_recommended = (not venv_python.exists()) or bool(deps_changed)
     frontend_recommended = (not frontend_dist.exists()) or bool(frontend_changed)
+    backup_status = _build_backup_status(root, install_state)
 
+    notices: list[str] = []
     recommendations: list[str] = []
     warnings: list[str] = []
 
-    if repo_status["update_available"]:
+    if repo_status["update_available"] and repo_status["tracked_dirty"]:
+        recommendations.append(
+            "Open Setup / Update to choose whether to skip the repo update or stash local changes before updating."
+        )
+    elif repo_status["update_available"]:
         recommendations.append("Run Setup / Update to pull the latest repository changes.")
     if deps_recommended:
         recommendations.append("Reinstall Python dependencies so the environment matches the selected repo revision.")
@@ -651,18 +780,30 @@ def get_management_status(repo_root: Path | None = None, project_config: Project
         recommendations.append("Configure an origin remote or reclone through Setup / Update if you want automatic update checks.")
     if repo_status["branch"] and branch and repo_status["branch"] != branch and not repo_status["dirty"]:
         recommendations.append(f"Open Setup / Update on '{branch}' to switch the working copy away from '{repo_status['branch']}'.")
+    if repo_status["untracked_files"]:
+        untracked_files = _format_file_list(repo_status["untracked_files"])
+        notices.append(f"Untracked local files are present and will be left in place by safe updates: {untracked_files}.")
+    if backup_status["present"] and backup_status["available"]:
+        notices.append("A setup backup is available below with file list and recovery commands.")
+    if backup_status["present"] and backup_status["error"]:
+        warnings.append(backup_status["error"])
     if repo_status["dirty"]:
-        warnings.append("Repository has local changes. Automatic update remains disabled to avoid conflicts.")
+        changed_files = _format_file_list(repo_status["changed_files"])
+        warnings.append(f"Repository has tracked local changes. Safe update will not overwrite them: {changed_files}.")
     if not install_state:
         warnings.append("Install state has not been recorded yet. Rerunning Setup / Update will register this installation.")
     if state_error:
         warnings.append(state_error)
     if repo_status["branch"] and branch and repo_status["branch"] != branch:
-        warnings.append(f"Repository is currently checked out on '{repo_status['branch']}', but setup is configured for '{branch}'.")
+        warnings.append(
+            f"Repository is currently checked out on '{repo_status['branch']}', but setup is configured for '{branch}'."
+        )
     if not repo_status["origin_configured"] and repo_status["is_git_repo"]:
         warnings.append("No origin remote is configured, so update availability cannot be checked automatically.")
     if not setup_launcher.exists() and (root / "scripts" / "install.ps1").exists():
-        warnings.append("Setup launcher is missing. The dashboard can still open Setup / Update directly and recreate the launcher.")
+        warnings.append(
+            "Setup launcher is missing. The dashboard can still open Setup / Update directly and recreate the launcher."
+        )
     if not dashboard_launcher.exists():
         warnings.append("Dashboard launcher is missing. Rerunning Setup / Update will recreate it.")
 
@@ -694,14 +835,18 @@ def get_management_status(repo_root: Path | None = None, project_config: Project
             "frontend_commit": install_state.get("frontend_commit", ""),
             "frontend_timestamp_utc": install_state.get("frontend_timestamp_utc", ""),
             "frontend_timestamp_label": _format_timestamp(install_state.get("frontend_timestamp_utc")),
+            "backup": backup_status,
             "deps_recommended": deps_recommended,
             "frontend_recommended": frontend_recommended,
         },
         "actions": {
             "can_launch_setup": (setup_launcher.exists() or (root / "scripts" / "install.ps1").exists()),
             "can_open_repo": root.exists(),
-            "setup_launch_mode": "launcher" if setup_launcher.exists() else ("direct" if (root / "scripts" / "install.ps1").exists() else "unavailable"),
+            "setup_launch_mode": "launcher"
+            if setup_launcher.exists()
+            else ("direct" if (root / "scripts" / "install.ps1").exists() else "unavailable"),
         },
+        "notices": notices,
         "warnings": warnings,
         "recommendations": recommendations,
         "checked_utc": _utc_now_iso(),
@@ -714,7 +859,12 @@ def launch_setup_tool(repo_root: Path | None = None, branch_override: str | None
     root = find_repo_root(repo_root)
     state, _ = load_install_state_info(root)
     setup_launcher = root / SETUP_LAUNCHER_NAME
-    branch = (branch_override or str(state.get("branch") or "").strip() or _git_value(root, "rev-parse", "--abbrev-ref", "HEAD") or DEFAULT_BRANCH).strip()
+    branch = (
+        branch_override
+        or str(state.get("branch") or "").strip()
+        or _git_value(root, "rev-parse", "--abbrev-ref", "HEAD")
+        or DEFAULT_BRANCH
+    ).strip()
 
     if setup_launcher.exists():
         cmd = ["cmd", "/c", str(setup_launcher), "-Branch", branch]
