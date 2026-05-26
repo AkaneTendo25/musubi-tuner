@@ -21,8 +21,8 @@ logger = logging.getLogger(__name__)
 
 # Thread-local storage for tracking last loaded swapped block during backward
 import threading
-_swap_backward_state = threading.local()
 
+_swap_backward_state = threading.local()
 
 
 def _unpack_transformer_args(args: TransformerArgs | None) -> tuple[list[Any], bool]:
@@ -38,6 +38,33 @@ def _reconstruct_transformer_args(values: list[Any], is_none: bool) -> Transform
     field_names = [f.name for f in fields(TransformerArgs)]
     kwargs = dict(zip(field_names, values))
     return TransformerArgs(**kwargs)
+
+
+def _repack_block_checkpoint_outputs(
+    video: TransformerArgs | None,
+    audio: TransformerArgs | None,
+    outputs: tuple[Any, ...],
+) -> tuple[TransformerArgs | None, TransformerArgs | None]:
+    """Restore block checkpoint tensor outputs to their modality slots."""
+    if len(outputs) > 0 and isinstance(outputs[0], TransformerArgs):
+        return outputs
+    if len(outputs) > 1 and isinstance(outputs[1], TransformerArgs):
+        return outputs
+
+    output_idx = 0
+    out_video = None
+    if video is not None:
+        res_v_x = outputs[output_idx] if output_idx < len(outputs) else None
+        output_idx += 1
+        out_video = replace(video, x=res_v_x) if isinstance(res_v_x, torch.Tensor) else video
+
+    out_audio = None
+    if audio is not None:
+        res_a_x = outputs[output_idx] if output_idx < len(outputs) else None
+        output_idx += 1
+        out_audio = replace(audio, x=res_a_x) if isinstance(res_a_x, torch.Tensor) else audio
+
+    return out_video, out_audio
 
 
 def _run_attn_with_optional_fp32_retry(
@@ -102,7 +129,7 @@ class TransformerConfig:
 
 def _move_non_linear_params(module: torch.nn.Module, device: torch.device, skip_trainable: bool = True) -> None:
     """Move non-linear params/buffers to device; Linear weights are handled by offloader.
-    
+
     Args:
         module: Module to process
         device: Target device
@@ -111,18 +138,22 @@ def _move_non_linear_params(module: torch.nn.Module, device: torch.device, skip_
     non_blocking = device.type != "cpu"
     # Only skip trainable parameters when moving TO CPU (offloading), not when loading TO GPU
     should_skip_trainable = skip_trainable and device.type == "cpu"
-    
+
     for submodule in module.modules():
         if isinstance(submodule, torch.nn.Linear):
             # Move bias and scale_weight if they exist and are on wrong device
             if submodule.bias is not None and submodule.bias.device != device:
                 if not (should_skip_trainable and submodule.bias.requires_grad):
                     submodule.bias.data = submodule.bias.data.to(device, non_blocking=non_blocking)
-            if hasattr(submodule, "scale_weight") and submodule.scale_weight is not None and submodule.scale_weight.device != device:
+            if (
+                hasattr(submodule, "scale_weight")
+                and submodule.scale_weight is not None
+                and submodule.scale_weight.device != device
+            ):
                 if not (should_skip_trainable and submodule.scale_weight.requires_grad):
                     submodule.scale_weight.data = submodule.scale_weight.data.to(device, non_blocking=non_blocking)
             continue
-        
+
         # For non-linear modules, we only move its DIRECT parameters/buffers to avoid recursing into Linear children
         for param in submodule.parameters(recurse=False):
             if param.device != device:
@@ -168,7 +199,9 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 apply_gated_attention=video.apply_gated_attention,
             )
             self.ff = FeedForward(video.dim, dim_out=video.dim)
-            self.scale_shift_table = torch.nn.Parameter(torch.empty(adaln_embedding_coefficient(video.cross_attention_adaln), video.dim))
+            self.scale_shift_table = torch.nn.Parameter(
+                torch.empty(adaln_embedding_coefficient(video.cross_attention_adaln), video.dim)
+            )
 
         if audio is not None:
             self.audio_attn1 = Attention(
@@ -192,7 +225,9 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 apply_gated_attention=audio.apply_gated_attention,
             )
             self.audio_ff = FeedForward(audio.dim, dim_out=audio.dim)
-            self.audio_scale_shift_table = torch.nn.Parameter(torch.empty(adaln_embedding_coefficient(audio.cross_attention_adaln), audio.dim))
+            self.audio_scale_shift_table = torch.nn.Parameter(
+                torch.empty(adaln_embedding_coefficient(audio.cross_attention_adaln), audio.dim)
+            )
 
         if audio is not None and video is not None:
             # Q: Video, K,V: Audio
@@ -224,8 +259,7 @@ class BasicAVTransformerBlock(torch.nn.Module):
 
         self.norm_eps = norm_eps
         self.cross_attention_adaln = bool(
-            (video is not None and video.cross_attention_adaln)
-            or (audio is not None and audio.cross_attention_adaln)
+            (video is not None and video.cross_attention_adaln) or (audio is not None and audio.cross_attention_adaln)
         )
         if self.cross_attention_adaln and video is not None:
             self.prompt_scale_shift_table = torch.nn.Parameter(torch.empty(2, video.dim))
@@ -245,13 +279,13 @@ class BasicAVTransformerBlock(torch.nn.Module):
         self, scale_shift_table: torch.Tensor, batch_size: int, timestep, indices: slice, num_tokens: int = None
     ) -> tuple[torch.Tensor, ...]:
         """Get adaptive normalization values from scale_shift_table and timestep embeddings.
-        
+
         Supports two modes:
         1. Regular mode: timestep is a tensor [B, num_tokens, dim]
         2. Optimized mode: timestep is tuple (unique_emb, inverse_indices_1d, orig_batch_size, orig_num_tokens)
            This mode computes ada values only on unique embeddings and expands using inverse indices,
            drastically reducing VRAM usage during inference when many tokens share the same timestep.
-        
+
         Optimization source: Kijai's ComfyUI patch
         https://github.com/Comfy-Org/ComfyUI/commit/ac4daffd80cecbc56ee0e31f2b521114fa0f8e08
         """
@@ -261,15 +295,14 @@ class BasicAVTransformerBlock(torch.nn.Module):
         if isinstance(timestep, tuple) and len(timestep) == 4:
             unique_emb, inverse_indices_1d, orig_batch_size, orig_num_tokens = timestep
 
-            # Compute ada values on unique embeddings only  
+            # Compute ada values on unique embeddings only
             unique_reshaped = unique_emb.reshape(len(unique_emb), num_ada_params, -1)[:, indices, :]
             table_values = scale_shift_table[indices].unsqueeze(0).to(device=unique_emb.device, dtype=unique_emb.dtype)
             unique_ada = (table_values + unique_reshaped).unbind(dim=1)
 
             # Expand each ada value using inverse indices
             ada_values = tuple(
-                unique_val[inverse_indices_1d].view(orig_batch_size, orig_num_tokens, -1)
-                for unique_val in unique_ada
+                unique_val[inverse_indices_1d].view(orig_batch_size, orig_num_tokens, -1) for unique_val in unique_ada
             )
             return ada_values
 
@@ -301,12 +334,14 @@ class BasicAVTransformerBlock(torch.nn.Module):
         num_tokens: int = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         scale_shift_ada_values = self.get_ada_values(
-            scale_shift_table[:num_scale_shift_values, :], batch_size, scale_shift_timestep, slice(None, None),
-            num_tokens=num_tokens
+            scale_shift_table[:num_scale_shift_values, :],
+            batch_size,
+            scale_shift_timestep,
+            slice(None, None),
+            num_tokens=num_tokens,
         )
         gate_ada_values = self.get_ada_values(
-            scale_shift_table[num_scale_shift_values:, :], batch_size, gate_timestep, slice(None, None),
-            num_tokens=num_tokens
+            scale_shift_table[num_scale_shift_values:, :], batch_size, gate_timestep, slice(None, None), num_tokens=num_tokens
         )
 
         scale_shift_chunks = [t.squeeze(2) for t in scale_shift_ada_values]
@@ -343,8 +378,7 @@ class BasicAVTransformerBlock(torch.nn.Module):
                     self.norm_eps,
                 )
             attn_input = (
-                rms_norm(x, eps=self.norm_eps).to(torch.float32) * (1 + scale_q.to(torch.float32))
-                + shift_q.to(torch.float32)
+                rms_norm(x, eps=self.norm_eps).to(torch.float32) * (1 + scale_q.to(torch.float32)) + shift_q.to(torch.float32)
             ).to(x.dtype)
             return attn(attn_input, context=context, mask=context_mask) * gate
         return attn(rms_norm(x, eps=self.norm_eps), context=context, mask=context_mask)
@@ -380,14 +414,14 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 # Key insight: During FORWARD, offloader loads block to GPU before checkpoint_wrapper runs
                 # During BACKWARD recomputation, block is on CPU (was unloaded after forward)
                 # So we detect backward by checking if block is on CPU
-                if getattr(self, 'swap_weight_offload', False):
+                if getattr(self, "swap_weight_offload", False):
                     first_param = next(self.parameters(), None)
                     block_on_cpu = first_param is not None and first_param.device.type == "cpu"
 
                     if block_on_cpu:
                         # Block is on CPU → we're in backward recomputation
                         # Unload previous block before loading current to prevent VRAM accumulation
-                        prev_block = getattr(_swap_backward_state, 'last_loaded_block', None)
+                        prev_block = getattr(_swap_backward_state, "last_loaded_block", None)
                         if prev_block is not None and prev_block is not self:
                             prev_block.to("cpu")
                             if torch.cuda.is_available():
@@ -409,7 +443,7 @@ class BasicAVTransformerBlock(torch.nn.Module):
 
                 # For non-swapped (permanent) blocks: unload any pending swapped block from backward
                 # This handles transition from swapped blocks (18) to permanent blocks (17→0)
-                elif getattr(_swap_backward_state, 'last_loaded_block', None) is not None:
+                elif getattr(_swap_backward_state, "last_loaded_block", None) is not None:
                     prev_block = _swap_backward_state.last_loaded_block
                     prev_block.to("cpu")
                     if torch.cuda.is_available():
@@ -421,6 +455,7 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 # inputs may arrive on CPU (from model-level CPU offloading). Move them to GPU
                 # before running the forward pass, since LoRA and other trainable weights are on GPU.
                 if self.activation_cpu_offloading and not self.weight_cpu_offloading:
+
                     def _move_to_device(val):
                         """Recursively move tensors to target device, handling tuples."""
                         if isinstance(val, torch.Tensor):
@@ -453,7 +488,7 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 # 2. Re-load them to GPU during backward
                 # 3. Handle weight offloading hooks if provided
                 # 4. Return TENSORS (because autograd strips objects)
-                
+
                 outputs = block_checkpoint(
                     checkpoint_wrapper,
                     *flat_inputs,
@@ -461,56 +496,11 @@ class BasicAVTransformerBlock(torch.nn.Module):
                     load_fn=load_fn,
                     offload_fn=offload_fn,
                 )
-                
-                # Reconstruct TransformerArgs from returned tensors
-                # block_checkpoint/autograd returns a tuple of tensors.
-                # output structure corresponds to what checkpoint_wrapper returns.
-                # wrapper returns self._forward -> (video_out, audio_out)
-                # each is TransformerArgs which has .x tensor.
-                # So outputs will correspond to (video_out.x, audio_out.x) 
-                
-                # Note: BlockCheckpointFunction logic flattens outputs. 
-                # If _forward returns (v, a), and v.x is tensor, a.x is tensor/None...
-                # We need to ensure we map them back correctly.
-                
-                # Let's peek at expected returns of _forward: tuple[TransformerArgs|None, TransformerArgs|None]
-                # If audio is None, we get (v, None).
-                
-                # Check if outputs are already TransformerArgs (No-Grad path returns objects directly)
-                is_obj = False
-                if len(outputs) > 0 and isinstance(outputs[0], TransformerArgs):
-                    is_obj = True
-                elif len(outputs) > 1 and isinstance(outputs[1], TransformerArgs):
-                    is_obj = True
-                
-                if is_obj:
-                    # In no-grad mode, block_checkpoint returns the objects directly
-                    return outputs
-
-                # Re-wrapping logic for Tensors (Grad path):
-                res_v_x = outputs[0] if len(outputs) > 0 else None
-                res_a_x = outputs[1] if len(outputs) > 1 else None
-                
-                out_video = None
-                if video is not None:
-                     # Use dataclasses.replace to create new object with updated x
-                     if isinstance(res_v_x, torch.Tensor):
-                         out_video = replace(video, x=res_v_x)
-                     else:
-                         out_video = video
-                
-                out_audio = None
-                if audio is not None:
-                     if res_a_x is not None and isinstance(res_a_x, torch.Tensor):
-                         out_audio = replace(audio, x=res_a_x)
-                     else:
-                         out_audio = audio
-                      
-                return out_video, out_audio
+                return _repack_block_checkpoint_outputs(video, audio, outputs)
             else:
                 # Standard gradient checkpointing
                 return checkpoint.checkpoint(checkpoint_wrapper, *flat_inputs, use_reentrant=False, determinism_check="none")
-        
+
         return self._forward(video, audio, perturbations)
 
     def _forward(  # noqa: PLR0915
@@ -525,21 +515,15 @@ class BasicAVTransformerBlock(torch.nn.Module):
         # Clamp FFN outputs to prevent bf16 overflow (max ~65504).
         # Set LTX2_FFN_CLAMP=60000 to enable. Default: disabled (0).
         ffn_clamp = float(os.getenv("LTX2_FFN_CLAMP", "0"))
-        force_pytorch_cross_attn = (
-            os.getenv("LTX2_FORCE_PYTORCH_CROSS_ATTN", "0") == "1"
-            or getattr(self, "_force_pytorch_cross_attn", False)
+        force_pytorch_cross_attn = os.getenv("LTX2_FORCE_PYTORCH_CROSS_ATTN", "0") == "1" or getattr(
+            self, "_force_pytorch_cross_attn", False
         )
-        force_fp32_cross_attn = (
-            os.getenv("LTX2_CROSS_ATTN_FP32", "0") == "1"
-            or getattr(self, "_force_fp32_cross_attn", False)
+        force_fp32_cross_attn = os.getenv("LTX2_CROSS_ATTN_FP32", "0") == "1" or getattr(self, "_force_fp32_cross_attn", False)
+        force_pytorch_audio_ctx = os.getenv("LTX2_FORCE_PYTORCH_AUDIO_CTX_ATTN", "0") == "1" or getattr(
+            self, "_force_pytorch_audio_ctx_attn", False
         )
-        force_pytorch_audio_ctx = (
-            os.getenv("LTX2_FORCE_PYTORCH_AUDIO_CTX_ATTN", "0") == "1"
-            or getattr(self, "_force_pytorch_audio_ctx_attn", False)
-        )
-        force_fp32_audio_ctx = (
-            os.getenv("LTX2_AUDIO_CTX_ATTN_FP32", "0") == "1"
-            or getattr(self, "_force_fp32_audio_ctx_attn", False)
+        force_fp32_audio_ctx = os.getenv("LTX2_AUDIO_CTX_ATTN_FP32", "0") == "1" or getattr(
+            self, "_force_fp32_audio_ctx_attn", False
         )
 
         def _check_finite_local(tag: str, tensor: torch.Tensor | None) -> None:
@@ -604,7 +588,7 @@ class BasicAVTransformerBlock(torch.nn.Module):
             target_device = video.x.device
         elif audio is not None and isinstance(audio.x, torch.Tensor):
             target_device = audio.x.device
-        
+
         if target_device is not None:
             _move_non_linear_params(self, target_device)
             ensure_fp8_modules_on_device(self, target_device)
@@ -633,7 +617,10 @@ class BasicAVTransformerBlock(torch.nn.Module):
             )
             if not perturbations.all_in_batch(PerturbationType.SKIP_VIDEO_SELF_ATTN, self.idx):
                 # AdaLN Structural Fix: Force modulation to happen in Float32 to prevent overflow (10^18 issue)
-                norm_vx = (rms_norm(vx, eps=self.norm_eps).to(torch.float32) * (1 + vscale_msa.to(torch.float32)) + vshift_msa.to(torch.float32)).to(vx.dtype)
+                norm_vx = (
+                    rms_norm(vx, eps=self.norm_eps).to(torch.float32) * (1 + vscale_msa.to(torch.float32))
+                    + vshift_msa.to(torch.float32)
+                ).to(vx.dtype)
                 v_mask = perturbations.mask_like(PerturbationType.SKIP_VIDEO_SELF_ATTN, self.idx, vx)
                 attn1_out = _attn_with_retry(
                     self.attn1,
@@ -671,7 +658,10 @@ class BasicAVTransformerBlock(torch.nn.Module):
 
             if not perturbations.all_in_batch(PerturbationType.SKIP_AUDIO_SELF_ATTN, self.idx):
                 # AdaLN Structural Fix
-                norm_ax = (rms_norm(ax, eps=self.norm_eps).to(torch.float32) * (1 + ascale_msa.to(torch.float32)) + ashift_msa.to(torch.float32)).to(ax.dtype)
+                norm_ax = (
+                    rms_norm(ax, eps=self.norm_eps).to(torch.float32) * (1 + ascale_msa.to(torch.float32))
+                    + ashift_msa.to(torch.float32)
+                ).to(ax.dtype)
                 a_mask = perturbations.mask_like(PerturbationType.SKIP_AUDIO_SELF_ATTN, self.idx, ax)
                 audio_attn1_out = _attn_with_retry(
                     self.audio_attn1,
@@ -742,8 +732,14 @@ class BasicAVTransformerBlock(torch.nn.Module):
 
             if run_a2v and not perturbations.all_in_batch(PerturbationType.SKIP_A2V_CROSS_ATTN, self.idx):
                 # AdaLN Structural Fix
-                vx_scaled = (vx_norm3.to(torch.float32) * (1 + scale_ca_video_hidden_states_a2v.to(torch.float32)) + shift_ca_video_hidden_states_a2v.to(torch.float32)).to(vx.dtype)
-                ax_scaled = (ax_norm3.to(torch.float32) * (1 + scale_ca_audio_hidden_states_a2v.to(torch.float32)) + shift_ca_audio_hidden_states_a2v.to(torch.float32)).to(ax.dtype)
+                vx_scaled = (
+                    vx_norm3.to(torch.float32) * (1 + scale_ca_video_hidden_states_a2v.to(torch.float32))
+                    + shift_ca_video_hidden_states_a2v.to(torch.float32)
+                ).to(vx.dtype)
+                ax_scaled = (
+                    ax_norm3.to(torch.float32) * (1 + scale_ca_audio_hidden_states_a2v.to(torch.float32))
+                    + shift_ca_audio_hidden_states_a2v.to(torch.float32)
+                ).to(ax.dtype)
                 # DCR: detach audio context AFTER AdaLN so scale/shift params also don't get noisy gradients
                 if dcr_audio_mask is not None:
                     ax_scaled = ax_scaled * dcr_audio_mask + ax_scaled.detach() * (1 - dcr_audio_mask)
@@ -766,8 +762,14 @@ class BasicAVTransformerBlock(torch.nn.Module):
 
             if run_v2a and not perturbations.all_in_batch(PerturbationType.SKIP_V2A_CROSS_ATTN, self.idx):
                 # AdaLN Structural Fix
-                ax_scaled = (ax_norm3.to(torch.float32) * (1 + scale_ca_audio_hidden_states_v2a.to(torch.float32)) + shift_ca_audio_hidden_states_v2a.to(torch.float32)).to(ax.dtype)
-                vx_scaled = (vx_norm3.to(torch.float32) * (1 + scale_ca_video_hidden_states_v2a.to(torch.float32)) + shift_ca_video_hidden_states_v2a.to(torch.float32)).to(vx.dtype)
+                ax_scaled = (
+                    ax_norm3.to(torch.float32) * (1 + scale_ca_audio_hidden_states_v2a.to(torch.float32))
+                    + shift_ca_audio_hidden_states_v2a.to(torch.float32)
+                ).to(ax.dtype)
+                vx_scaled = (
+                    vx_norm3.to(torch.float32) * (1 + scale_ca_video_hidden_states_v2a.to(torch.float32))
+                    + shift_ca_video_hidden_states_v2a.to(torch.float32)
+                ).to(vx.dtype)
                 # DCR: detach video context AFTER AdaLN
                 if dcr_video_mask is not None:
                     vx_scaled = vx_scaled * dcr_video_mask + vx_scaled.detach() * (1 - dcr_video_mask)
@@ -810,7 +812,10 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 self.scale_shift_table, vx.shape[0], video.timesteps, mlp_slice, num_tokens=vx.shape[1]
             )
             # AdaLN Structural Fix
-            vx_scaled = (rms_norm(vx, eps=self.norm_eps).to(torch.float32) * (1 + vscale_mlp.to(torch.float32)) + vshift_mlp.to(torch.float32)).to(vx.dtype)
+            vx_scaled = (
+                rms_norm(vx, eps=self.norm_eps).to(torch.float32) * (1 + vscale_mlp.to(torch.float32))
+                + vshift_mlp.to(torch.float32)
+            ).to(vx.dtype)
             ff_out = self.ff(vx_scaled) * vgate_mlp
             if ffn_clamp > 0:
                 ff_out = ff_out.clamp(-ffn_clamp, ffn_clamp)
@@ -825,7 +830,10 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 self.audio_scale_shift_table, ax.shape[0], audio.timesteps, mlp_slice, num_tokens=ax.shape[1]
             )
             # AdaLN Structural Fix
-            ax_scaled = (rms_norm(ax, eps=self.norm_eps).to(torch.float32) * (1 + ascale_mlp.to(torch.float32)) + ashift_mlp.to(torch.float32)).to(ax.dtype)
+            ax_scaled = (
+                rms_norm(ax, eps=self.norm_eps).to(torch.float32) * (1 + ascale_mlp.to(torch.float32))
+                + ashift_mlp.to(torch.float32)
+            ).to(ax.dtype)
             audio_ff_out = self.audio_ff(ax_scaled) * agate_mlp
             if ffn_clamp > 0:
                 audio_ff_out = audio_ff_out.clamp(-ffn_clamp, ffn_clamp)
@@ -918,15 +926,11 @@ def apply_cross_attention_adaln(
     if prompt_adaln_fp32:
         # Keep prompt AdaLN modulation in float32 to match the stability fix
         # used in the self-attention / FF / output AdaLN paths.
-        attn_input = (
-            rms_norm(x, eps=norm_eps).to(torch.float32) * (1 + q_scale.to(torch.float32))
-            + q_shift.to(torch.float32)
-        ).to(x.dtype)
-        encoder_hidden_states = (
-            context.to(torch.float32) * (1 + scale_kv) + shift_kv
-        ).to(context.dtype)
+        attn_input = (rms_norm(x, eps=norm_eps).to(torch.float32) * (1 + q_scale.to(torch.float32)) + q_shift.to(torch.float32)).to(
+            x.dtype
+        )
+        encoder_hidden_states = (context.to(torch.float32) * (1 + scale_kv) + shift_kv).to(context.dtype)
     else:
         attn_input = rms_norm(x, eps=norm_eps) * (1 + q_scale.to(x.dtype)) + q_shift.to(x.dtype)
         encoder_hidden_states = context * (1 + scale_kv.to(context.dtype)) + shift_kv.to(context.dtype)
     return attn(attn_input, context=encoder_hidden_states, mask=context_mask) * q_gate
-

@@ -566,6 +566,8 @@ NF4 has ~4x higher weight error than FP8 (cosine 0.996 vs 0.9997). The base mode
 | `--use_pinned_memory_for_block_swap` | Use pinned memory for faster CPU↔GPU block transfers |
 | `--gradient_checkpointing` | Reduce VRAM by recomputing activations during backward pass |
 | `--gradient_checkpointing_cpu_offload` | Offload activations to CPU during gradient checkpointing |
+| `--blockwise_checkpointing` | Checkpoint transformer blocks individually and reload block state around backward. Lowest peak VRAM, but heavy CPU↔GPU traffic and recompute. |
+| `--blocks_to_checkpoint N` | Number of transformer blocks to handle with blockwise checkpointing. `-1` or omitted means all blocks; smaller values checkpoint only the final N blocks. |
 | `--offload_optimizer_during_validation` | Offload CUDA optimizer state to CPU during validation and sample previews (off by default) |
 | `--ffn_chunk_target` | `all`, `video`, or `audio` — enable FFN chunking for selected modules |
 | `--ffn_chunk_size N` | Chunk size for FFN chunking (0 = disabled) |
@@ -577,6 +579,14 @@ NF4 has ~4x higher weight error than FP8 (cosine 0.996 vs 0.9997). The base mode
 | `--sdpa` | Use PyTorch scaled dot-product attention (recommended default) |
 | `--flash_attn` | Use FlashAttention 2 (requires `flash-attn` package built for your CUDA + PyTorch) |
 | `--flash3` | Use FlashAttention 3 (requires `flash-attn` v3 with Hopper+ GPU) |
+
+#### Blockwise Checkpointing
+<sub>[↑ contents](#table-of-contents)</sub>
+
+`--blockwise_checkpointing` checkpoints transformer blocks individually and reloads block state during backward. This shifts more state through CPU memory and increases recomputation cost.
+
+Peak VRAM is dataset- and bucket-dependent. On the 832x480x49 video dataset it is typically around 4-6 GiB when using `--blocks_to_swap 47`. The tradeoff is speed: expect roughly `15-30+ s/step` at that setting depending on GPU, PCIe bandwidth, CPU/RAM speed, resolution, frame count, attention backend, and LoRA target/rank. Smaller `--blocks_to_swap` values reduce CPU pressure, raise VRAM, and usually improve step time.
+`--blocks_to_checkpoint -1` applies blockwise checkpointing to all transformer blocks.
 
 #### Aggressive VRAM Optimization (8-16GB GPUs)
 <sub>[↑ contents](#table-of-contents)</sub>
@@ -597,6 +607,8 @@ accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 ltx2_tr
   --use_pinned_memory_for_block_swap ^
   --gradient_checkpointing ^
   --gradient_checkpointing_cpu_offload ^
+  --blockwise_checkpointing ^
+  --blocks_to_checkpoint -1 ^
   --sdpa ^
   --network_module networks.lora_ltx2 ^
   --network_dim 16 ^

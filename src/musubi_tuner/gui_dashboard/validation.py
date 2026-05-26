@@ -366,6 +366,17 @@ def validate_training_config(config: ProjectConfig) -> dict[str, Any]:
                 )
             )
 
+    if t.blockwise_checkpointing:
+        warnings.append(
+            _make_issue(
+                "warning",
+                "training.blockwise_checkpointing",
+                "Blockwise checkpointing checkpoints blocks individually and reloads state during backward. On the 832x480x49 video dataset, peak VRAM is typically 4-6 GiB with --blocks_to_swap 47.",
+                label="Blockwise Checkpointing",
+                page="training",
+            )
+        )
+
     if t.ltx2_model_parallel:
         if t.ltx2_remote_stage:
             message = "LTX2 Model Parallel and LTX2 Remote Stage cannot be enabled together."
