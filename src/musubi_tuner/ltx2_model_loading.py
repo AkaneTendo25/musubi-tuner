@@ -489,6 +489,8 @@ def load_ltx2_model(
         attn_type = "flash_attention_3"
     elif attn_mode in {"flash", "flash_attention_2"}:
         attn_type = "flash_attention_2"
+    elif attn_mode in {"sageattn", "sage_attention"}:
+        attn_type = "sage_attention"
     elif attn_mode in {"torch", "sdpa"}:
         attn_type = "pytorch"
     if attn_type is not None:

@@ -3339,6 +3339,8 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             attn_mode = "flash"
         elif args.flash3:
             attn_mode = "flash3"
+        elif getattr(args, "sage_attn", False):
+            attn_mode = "sageattn"
         elif args.xformers:
             attn_mode = "xformers"
         else:
