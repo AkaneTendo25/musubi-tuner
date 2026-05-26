@@ -1118,6 +1118,7 @@ class LTX2SliderTrainer:
         if args.mixed_precision is None:
             args.mixed_precision = accelerator.mixed_precision
         is_main_process = accelerator.is_main_process
+        dashboard_metrics_enabled = getattr(args, "gui", False) or os.getenv("MUSUBI_DASHBOARD_METRICS") == "1"
 
         # Precision
         dit_dtype = torch.bfloat16 if args.dit_dtype is None else model_utils.str_to_dtype(args.dit_dtype)
@@ -1408,6 +1409,20 @@ class LTX2SliderTrainer:
                 init_kwargs=init_kwargs,
             )
 
+        # -- Dashboard metrics writer (Parquet for GUI charts) -----------------
+        gui_metrics = None
+        if dashboard_metrics_enabled and accelerator.is_main_process:
+            from musubi_tuner.gui_dashboard import create_metrics_writer
+
+            gui_metrics = create_metrics_writer(args.output_dir, reset=initial_global_step == 0)
+            gui_metrics.update_status(
+                step=initial_global_step,
+                max_steps=args.max_train_steps,
+                epoch=0,
+                max_epochs=0,
+                status="starting",
+            )
+
         # -- Save / remove helpers ---------------------------------------------
         save_dtype = dit_dtype
 
@@ -1461,6 +1476,17 @@ class LTX2SliderTrainer:
                     os.remove(comfy_old_ckpt_file)
             train_utils.remove_checkpoint_metadata(old_ckpt_file)
 
+        def _close_gui_metrics(status: str = "stopped"):
+            if gui_metrics is not None:
+                gui_metrics.update_status(
+                    step=global_step,
+                    max_steps=args.max_train_steps,
+                    epoch=0,
+                    max_epochs=0,
+                    status=status,
+                )
+                gui_metrics.close()
+
         def handle_dashboard_stop_request(global_step: int) -> bool:
             if not train_utils.dashboard_stop_requested():
                 return False
@@ -1468,12 +1494,14 @@ class LTX2SliderTrainer:
             if train_utils.dashboard_stop_mode() == "force":
                 accelerator.print("\nDashboard force stop requested; exiting without saving interrupt state.")
                 train_utils.clear_dashboard_stop_request()
+                _close_gui_metrics("stopped")
                 accelerator.end_training()
                 return True
 
             if global_step <= 0:
                 accelerator.print("\nDashboard stop requested before training steps completed; exiting without saving state.")
                 train_utils.clear_dashboard_stop_request()
+                _close_gui_metrics("stopped")
                 accelerator.end_training()
                 return True
 
@@ -1496,7 +1524,10 @@ class LTX2SliderTrainer:
                         "interrupted": True,
                     },
                 )
+                if gui_metrics is not None:
+                    gui_metrics.log_event("interrupt_state", global_step, path=str(state_dir))
             train_utils.clear_dashboard_stop_request()
+            _close_gui_metrics("stopped")
             accelerator.end_training()
             return True
 
@@ -1537,6 +1568,8 @@ class LTX2SliderTrainer:
             self._sample_slider(
                 accelerator, args, transformer, vae, accelerator.unwrap_model(network), sample_parameters, dit_dtype, 0
             )
+            if gui_metrics is not None:
+                gui_metrics.log_event("sample", 0)
             optimizer_train_fn()
 
         ref_iter = None
@@ -1548,6 +1581,9 @@ class LTX2SliderTrainer:
                 return
 
             accelerator.unwrap_model(network).on_step_start()
+
+            grad_norm_value = None
+            _step_start_time = time.perf_counter()
 
             with accelerator.accumulate(network):
                 if self.slider_config.mode == "text":
@@ -1569,7 +1605,7 @@ class LTX2SliderTrainer:
                 # Gradient clipping
                 if accelerator.sync_gradients and getattr(args, "max_grad_norm", 0.0) != 0.0:
                     params_to_clip = accelerator.unwrap_model(network).get_trainable_params()
-                    accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
+                    grad_norm_value = accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
 
                 if accelerator.sync_gradients:
                     optimizer.step()
@@ -1595,7 +1631,28 @@ class LTX2SliderTrainer:
                     "loss/average": avr_loss,
                     "lr/unet": float(lrs[0]) if lrs else 0.0,
                 }
+                if grad_norm_value is not None:
+                    logs["grad_norm"] = float(grad_norm_value) if not isinstance(grad_norm_value, float) else grad_norm_value
                 accelerator.log(logs, step=global_step)
+
+            if gui_metrics is not None:
+                step_time = time.perf_counter() - _step_start_time
+                gui_metrics.log(
+                    step=global_step,
+                    epoch=0,
+                    loss=loss,
+                    avr_loss=avr_loss,
+                    grad_norm=float(grad_norm_value) if grad_norm_value is not None else None,
+                    lr=float(lr_scheduler.get_last_lr()[0]) if lr_scheduler.get_last_lr() else 0.0,
+                    step_time=step_time,
+                )
+                gui_metrics.update_status(
+                    step=global_step,
+                    max_steps=args.max_train_steps,
+                    epoch=0,
+                    max_epochs=0,
+                    status="training",
+                )
 
             # Sampling
             should_sampling = should_sample_images(args, global_step, epoch=None)
@@ -1615,12 +1672,16 @@ class LTX2SliderTrainer:
                         dit_dtype,
                         global_step,
                     )
+                    if gui_metrics is not None:
+                        gui_metrics.log_event("sample", global_step)
 
                 if should_saving:
                     accelerator.wait_for_everyone()
                     if accelerator.is_main_process:
                         ckpt_name = train_utils.get_step_ckpt_name(args.output_name, global_step)
                         save_model(ckpt_name, accelerator.unwrap_model(network), global_step, 0)
+                        if gui_metrics is not None:
+                            gui_metrics.log_event("checkpoint", global_step)
 
                         if getattr(args, "save_state", False):
                             train_utils.save_and_remove_state_stepwise(
@@ -1647,7 +1708,11 @@ class LTX2SliderTrainer:
         if is_main_process:
             ckpt_name = train_utils.get_last_ckpt_name(args.output_name)
             save_model(ckpt_name, accelerator.unwrap_model(network), global_step, 0, force_sync_upload=True)
+            if gui_metrics is not None:
+                gui_metrics.log_event("checkpoint", global_step)
             logger.info("Slider training complete. Model saved.")
+
+        _close_gui_metrics("completed")
 
 
 # ---------------------------------------------------------------------------

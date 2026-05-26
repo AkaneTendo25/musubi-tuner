@@ -2295,6 +2295,28 @@ def build_slider_training_cmd(config: ProjectConfig) -> list[str]:
     _append_optional(cmd, "--sample_num_frames", t.sample_num_frames)
     _append_optional(cmd, "--video_cfg_scale", t.video_cfg_scale)
 
+    # Logging — inherited from training config (same pattern as build_training_cmd)
+    if t.log_with:
+        cmd += ["--log_with", t.log_with]
+    if t.log_with and t.logging_dir:
+        cmd += ["--logging_dir", t.logging_dir]
+    if t.log_prefix:
+        cmd += ["--log_prefix", t.log_prefix]
+    if t.log_tracker_name:
+        cmd += ["--log_tracker_name", t.log_tracker_name]
+    if t.log_tracker_config:
+        cmd += ["--log_tracker_config", t.log_tracker_config]
+    if t.log_config:
+        cmd.append("--log_config")
+    if t.wandb_run_name:
+        cmd += ["--wandb_run_name", t.wandb_run_name]
+    if t.wandb_api_key:
+        cmd += ["--wandb_api_key", t.wandb_api_key]
+    if t.log_cuda_memory_every_n_steps is not None:
+        cmd += ["--log_cuda_memory_every_n_steps", str(t.log_cuda_memory_every_n_steps)]
+    if t.save_checkpoint_metadata:
+        cmd.append("--save_checkpoint_metadata")
+
     cmd += _split_cli_args(s.extra_args)
     return cmd
 
