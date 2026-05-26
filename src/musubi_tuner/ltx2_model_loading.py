@@ -156,6 +156,13 @@ def detect_ltx2_dtype(model_path: str) -> torch.dtype:
     if not os.path.isfile(model_path):
         raise FileNotFoundError(f"LTX-2 weights must be a .safetensors file. Got: {model_path}")
 
+    # NVFP4 checkpoints store weight_scale tensors as float8_e4m3fn which would
+    # be misidentified as fp8 model weights.  Detect NVFP4 early and skip those
+    # quantization-internal keys so we return the true model dtype (bf16),
+    # mirroring the behaviour of NF4 checkpoints.
+    from musubi_tuner.modules.nvfp4_utils import detect_nvfp4_checkpoint
+    _is_nvfp4 = detect_nvfp4_checkpoint(model_path)
+
     with MemoryEfficientSafeOpen(model_path) as handle:
         keys = list(handle.keys())
         if not keys:
@@ -166,6 +173,9 @@ def detect_ltx2_dtype(model_path: str) -> torch.dtype:
 
         # Avoid loading tensors: inspect header dtype for each key.
         for key in keys:
+            # Skip NVFP4 quantization metadata keys — these are not model weights.
+            if _is_nvfp4 and (key.endswith(".weight_scale") or key.endswith(".weight_scale_2")):
+                continue
             meta = handle.header.get(key)
             if not isinstance(meta, dict) or "dtype" not in meta:
                 continue

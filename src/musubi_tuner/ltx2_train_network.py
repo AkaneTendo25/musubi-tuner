@@ -2932,9 +2932,9 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             logger.info("--no_convert_to_comfy is set; original LoRA is always saved (--save_original_lora has no extra effect).")
 
         if self.dit_dtype == torch.float16:
-            assert args.mixed_precision in ["fp16", "no"], "LTX-2 weights are fp16; mixed precision must be fp16 or no"
+            assert args.mixed_precision in [None, "fp16", "no"], "LTX-2 weights are fp16; mixed precision must be fp16 or no"
         elif self.dit_dtype == torch.bfloat16:
-            assert args.mixed_precision in ["bf16", "no"], "LTX-2 weights are bf16; mixed precision must be bf16 or no"
+            assert args.mixed_precision in [None, "bf16", "no"], "LTX-2 weights are bf16; mixed precision must be bf16 or no"
 
         args.dit_dtype = model_utils.dtype_to_str(self.dit_dtype)
 
