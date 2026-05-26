@@ -67,6 +67,7 @@ def _resolve_default_preservation_cache(args: argparse.Namespace) -> str:
 # Config dataclass
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class PreservationConfig:
     blank_preservation: bool = False
@@ -98,6 +99,7 @@ class PreservationConfig:
 # ---------------------------------------------------------------------------
 # Helper class
 # ---------------------------------------------------------------------------
+
 
 class PreservationHelper:
     def __init__(self, config: PreservationConfig) -> None:
@@ -161,8 +163,8 @@ class PreservationHelper:
         expected_audio_dim = 0
         if av_mode and hasattr(trainer, "_load_ltx2_checkpoint_config"):
             try:
-                cfg = trainer._load_ltx2_checkpoint_config(args)
-                transformer_cfg = cfg.get("transformer", {}) if isinstance(cfg, dict) else {}
+                checkpoint_cfg = trainer._load_ltx2_checkpoint_config(args)
+                transformer_cfg = checkpoint_cfg.get("transformer", {}) if isinstance(checkpoint_cfg, dict) else {}
                 expected_video_dim = int(transformer_cfg.get("cross_attention_dim", 0) or 0)
                 expected_audio_dim = int(transformer_cfg.get("audio_cross_attention_dim", 0) or 0)
             except Exception:
@@ -190,7 +192,12 @@ class PreservationHelper:
                 )
             cfg.dop_embed = embed
             cfg.dop_mask = mask
-            logger.info("Preservation: encoded DOP class prompt %r  embed=%s (av_mode=%s)", cfg.dop_class_prompt, tuple(embed.shape), av_mode)
+            logger.info(
+                "Preservation: encoded DOP class prompt %r  embed=%s (av_mode=%s)",
+                cfg.dop_class_prompt,
+                tuple(embed.shape),
+                av_mode,
+            )
 
         # unload text encoder
         trainer._text_encoder = None
@@ -222,7 +229,8 @@ class PreservationHelper:
                 if cached_class != cfg.dop_class_prompt:
                     logger.warning(
                         "DOP class prompt mismatch: cache has %r, training uses %r. Using cached embeddings.",
-                        cached_class, cfg.dop_class_prompt,
+                        cached_class,
+                        cfg.dop_class_prompt,
                     )
                 logger.info("Preservation: loaded DOP class prompt %r  embed=%s", cached_class, tuple(cfg.dop_embed.shape))
             else:
