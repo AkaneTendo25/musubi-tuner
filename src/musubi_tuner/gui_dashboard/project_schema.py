@@ -712,6 +712,7 @@ class FullFinetuneConfig(TrainingConfig):
     apollo_proj: Literal["random", "svd"] = "random"
     apollo_proj_type: Literal["std", "reverse_std", "left", "right"] = "std"
     apollo_scale_type: Literal["channel", "tensor"] = "channel"
+    apollo_update_rule: Literal["apollo", "fira"] = "apollo"
     qapollo_optim_bits: Literal[8, 32] = 8
 
     # Full fine-tune-only controls.

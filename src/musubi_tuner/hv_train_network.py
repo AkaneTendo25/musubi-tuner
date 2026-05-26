@@ -1529,6 +1529,23 @@ class NetworkTrainer:
             return 0
 
     @staticmethod
+    def _state_dir_matches_output_name(entry: str, output_name: Optional[str]) -> bool:
+        """Return True when entry is a state directory generated for output_name."""
+        if not output_name:
+            return True
+
+        escaped = re.escape(str(output_name))
+        pattern = (
+            rf"^{escaped}(?:"
+            r"-state"
+            r"|-\d{6}-state"
+            r"|-step\d+-state"
+            r"|-interrupt-step\d+(?:-\d+)?-state"
+            r")$"
+        )
+        return re.match(pattern, entry) is not None
+
+    @staticmethod
     def _find_latest_state_dir(args: argparse.Namespace) -> Optional[str]:
         """Find the latest training state directory in output_dir for --autoresume.
 
@@ -1540,10 +1557,14 @@ class NetworkTrainer:
 
         best_step = -1
         best_path = None
+        output_name = getattr(args, "output_name", None)
 
         for entry in os.listdir(args.output_dir):
             full_path = os.path.join(args.output_dir, entry)
             if not os.path.isdir(full_path) or not entry.endswith("-state"):
+                continue
+
+            if not NetworkTrainer._state_dir_matches_output_name(entry, output_name):
                 continue
 
             if not train_utils.is_complete_state_dir(full_path):

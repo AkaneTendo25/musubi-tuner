@@ -1818,6 +1818,8 @@ def build_full_finetune_cmd(config: ProjectConfig) -> list[str]:
             cmd += ["--apollo_proj_type", t.apollo_proj_type]
         if t.apollo_scale_type != "channel":
             cmd += ["--apollo_scale_type", t.apollo_scale_type]
+        if t.apollo_update_rule != "apollo":
+            cmd += ["--apollo_update_rule", t.apollo_update_rule]
 
     # Sampling
     if t.sample_every_n_steps:

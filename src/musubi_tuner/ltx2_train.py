@@ -2319,6 +2319,18 @@ def ltx2_finetune_setup_parser(parser: argparse.ArgumentParser) -> argparse.Argu
         choices=["channel", "tensor"],
         help="APOLLO gradient scaling granularity. channel is APOLLO; tensor is APOLLO-Mini style.",
     )
+    parser.add_argument(
+        "--apollo_update_rule",
+        type=str,
+        default="apollo",
+        choices=["apollo", "fira"],
+        help=(
+            "APOLLO/QAPOLLO update rule. 'apollo' (default) scales the full-rank gradient by the "
+            "channel-wise factor. 'fira' applies the exact projected-back Adam update inside the "
+            "low-rank subspace and the channel-scaled residual (G - P P^T G) outside it. 'fira' "
+            "requires a projector exposing project_back (both --apollo_proj random and svd do)."
+        ),
+    )
     add_ltx2_model_parallel_args(parser)
     # EMA arguments
     parser.add_argument(
@@ -3916,7 +3928,7 @@ def main() -> None:
     if bool(getattr(args, "qgalore_full_ft", False)):
         if is_qapollo_optimizer_type(optimizer_type_for_groups):
             logger.info(
-                "QAPOLLO quantized Linear groups: tensors=%d params=%.3fB groups=%d scales=%s rank=%d gap=%d scale=%g proj=%s scale_type=%s",
+                "QAPOLLO quantized Linear groups: tensors=%d params=%.3fB groups=%d scales=%s rank=%d gap=%d scale=%g proj=%s scale_type=%s update_rule=%s",
                 int(ft_group_stats.get("qgalore_param_count", 0)),
                 float(ft_group_stats.get("qgalore_param_numel", 0)) / 1_000_000_000.0,
                 int(ft_group_stats.get("num_qgalore_lr_groups", 0)),
@@ -3926,6 +3938,7 @@ def main() -> None:
                 float(getattr(args, "apollo_scale", 1.0)),
                 str(getattr(args, "apollo_proj", "random")),
                 str(getattr(args, "apollo_scale_type", "channel")),
+                str(getattr(args, "apollo_update_rule", "apollo")),
             )
         else:
             logger.info(
@@ -3947,7 +3960,7 @@ def main() -> None:
             )
     if apollo_group_kwargs is not None:
         logger.info(
-            "APOLLO optimizer groups: tensors=%d params=%.3fB groups=%d scales=%s rank=%d gap=%d scale=%g proj=%s scale_type=%s",
+            "APOLLO optimizer groups: tensors=%d params=%.3fB groups=%d scales=%s rank=%d gap=%d scale=%g proj=%s scale_type=%s update_rule=%s",
             int(ft_group_stats.get("apollo_param_count", 0)),
             float(ft_group_stats.get("apollo_param_numel", 0)) / 1_000_000_000.0,
             int(ft_group_stats.get("num_apollo_lr_groups", 0)),
@@ -3957,6 +3970,7 @@ def main() -> None:
             float(getattr(args, "apollo_scale", 1.0)),
             str(getattr(args, "apollo_proj", "random")),
             str(getattr(args, "apollo_scale_type", "channel")),
+            str(getattr(args, "apollo_update_rule", "apollo")),
         )
     if ft_group_stats["frozen_blocks"]:
         logger.info("Full-FT frozen blocks: %s", ft_group_stats["frozen_blocks"])
@@ -4398,6 +4412,7 @@ def main() -> None:
         "ss_apollo_proj": getattr(args, "apollo_proj", None),
         "ss_apollo_proj_type": getattr(args, "apollo_proj_type", None),
         "ss_apollo_scale_type": getattr(args, "apollo_scale_type", None),
+        "ss_apollo_update_rule": getattr(args, "apollo_update_rule", None),
         "ss_weighting_scheme": args.weighting_scheme,
         "ss_logit_mean": args.logit_mean,
         "ss_logit_std": args.logit_std,

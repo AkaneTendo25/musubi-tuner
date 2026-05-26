@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "accelerate==1.6.0",
+    "adv_optm==2.2.3",
     "apollo-torch==1.0.3",
     "av==14.0.1",
     "bitsandbytes",

@@ -178,6 +178,10 @@ class LTX2Env:
     # recommended=False
     align_audio_latents_cache: bool = False
 
+    # Preserve original audio timing by skipping cache/train duration alignment.
+    # recommended=False
+    preserve_audio_timing: bool = False
+
     # Use video_prompt_embeds as AV fallback when audio missing.
     # recommended=False
     av_use_video_prompt_embeds: bool = False
@@ -283,6 +287,8 @@ def apply_ltx2_tweaks(args) -> None:
 
     args.align_audio_latents_train = t.align_audio_latents_train
     args.align_audio_latents_cache = t.align_audio_latents_cache
+    if getattr(args, "preserve_audio_timing", None) is None:
+        args.preserve_audio_timing = t.preserve_audio_timing
     args.av_use_video_prompt_embeds = t.av_use_video_prompt_embeds
     args.video_loss_mask_5d = t.video_loss_mask_5d
     args.align_output_device = t.align_output_device
@@ -293,10 +299,7 @@ def apply_ltx2_tweaks(args) -> None:
 
     # Apply global FP8 offload behavior.
     fp8_offload_enabled = t.fp8_offload_upcast
-    if (
-        getattr(args, "blockwise_checkpointing", False)
-        and t.blockwise_fp8_offload_upcast
-    ):
+    if getattr(args, "blockwise_checkpointing", False) and t.blockwise_fp8_offload_upcast:
         fp8_offload_enabled = True
     set_fp8_offload_upcast(fp8_offload_enabled)
     set_fp8_offload_restore_bf16(t.fp8_offload_restore_bf16)
@@ -318,9 +321,7 @@ def apply_ltx2_tweaks(args) -> None:
         "LTX2_FORCE_PYTORCH_AUDIO_CTX_ATTN",
         t.force_pytorch_audio_ctx_attn or t.attn_stability or t.safe_swap_attn,
     )
-    _set_env_bool(
-        "LTX2_AUDIO_CTX_ATTN_FP32", t.audio_ctx_attn_fp32 or t.attn_stability_fp32
-    )
+    _set_env_bool("LTX2_AUDIO_CTX_ATTN_FP32", t.audio_ctx_attn_fp32 or t.attn_stability_fp32)
     _set_env_bool(
         "LTX2_FORCE_PYTORCH_CROSS_ATTN",
         t.force_pytorch_cross_attn or t.attn_stability or t.safe_swap_attn,
@@ -329,9 +330,7 @@ def apply_ltx2_tweaks(args) -> None:
     _set_env_bool("LTX2_PROMPT_ADALN_FP32", t.prompt_adaln_fp32)
     _set_env_bool("LTX2_CROSS_ATTN_SWAP_ONLY", t.cross_attn_swap_only)
     _set_env_bool("LTX2_AUDIO_CTX_ATTN_SWAP_ONLY", t.audio_ctx_attn_swap_only)
-    _set_env_bool(
-        "LTX2_ATTN_FP32_RETRY", t.attn_fp32_retry or t.safe_swap_attn or t.fp8_swap_safe
-    )
+    _set_env_bool("LTX2_ATTN_FP32_RETRY", t.attn_fp32_retry or t.safe_swap_attn or t.fp8_swap_safe)
     _set_env_bool("LTX2_NAN_SUBLAYER_DIAG", t.nan_sublayer_diag)
     _set_env_bool("LTX2_NAN_BLOCK_DIAG", t.nan_block_diag)
     _set_env_bool("LTX2_NAN_DIAG", t.nan_diag)

@@ -82,9 +82,7 @@ def _load_datasets(args: argparse.Namespace) -> Sequence[BaseDataset]:
             "general": user_config.get("general", {}),
             "datasets": user_config.get("validation_datasets", []),
         }
-        validation_blueprint = blueprint_generator.generate(
-            validation_user_config, args, architecture=ARCHITECTURE_LTX2
-        )
+        validation_blueprint = blueprint_generator.generate(validation_user_config, args, architecture=ARCHITECTURE_LTX2)
         validation_dataset_group = config_utils.generate_dataset_group_by_blueprint(
             validation_blueprint.dataset_group,
             reference_downscale=getattr(args, "reference_downscale", 1),
@@ -152,7 +150,9 @@ def encode_and_save_batch(vae, batch: List[ItemInfo], tiling_config=None, *, ato
         extra_tensors = None
         if has_loss_masks:
             latent_mask = torch.nn.functional.interpolate(
-                loss_masks[idx].view(1, 1, loss_masks[idx].shape[0], loss_masks[idx].shape[1], loss_masks[idx].shape[2]).to(
+                loss_masks[idx]
+                .view(1, 1, loss_masks[idx].shape[0], loss_masks[idx].shape[1], loss_masks[idx].shape[2])
+                .to(
                     device=latents.device,
                     dtype=torch.float32,
                 ),
@@ -252,8 +252,7 @@ def build_audio_only_video_latent(
     frame_count = _estimate_video_frame_count_from_audio(audio_path, target_fps=target_fps)
     if frame_count is None:
         raise ValueError(
-            f"Could not determine audio duration for {audio_path}. "
-            "Audio-only mode requires duration-aware video latent geometry."
+            f"Could not determine audio duration for {audio_path}. Audio-only mode requires duration-aware video latent geometry."
         )
     virtual_latent_frames = max((frame_count - 1) // int(temporal_downsample_factor) + 1, 1)
     # Audio-only training does not optimize video loss, so huge virtual spatial geometry
@@ -360,6 +359,7 @@ def encode_and_save_audio_cache(
     dtype: torch.dtype,
     target_fps: float = 25.0,
     audio_only: bool = False,
+    preserve_audio_timing: bool = False,
     atomic_cache_writes: bool = False,
 ) -> None:
     try:
@@ -472,8 +472,9 @@ def encode_and_save_audio_cache(
     # Pitch-preserving time stretch when source audio duration doesn't match target video duration.
     # Skip for audio-only mode: frame_count is virtual (derived from the audio itself then adjusted
     # to N%8==1), so time-stretching would circularly compress the audio by 1-8%.
+    # Skip as well when preserve_audio_timing is enabled.
     frame_count = getattr(item_info, "frame_count", None)
-    if not audio_only and isinstance(frame_count, int) and frame_count > 0 and waveform.shape[-1] > 0:
+    if not audio_only and not preserve_audio_timing and isinstance(frame_count, int) and frame_count > 0 and waveform.shape[-1] > 0:
         expected_duration = float(frame_count) / max(float(target_fps), 1.0)
         actual_duration = float(waveform.shape[-1]) / float(sample_rate)
         if actual_duration > 0 and abs(actual_duration - expected_duration) / actual_duration > 0.01:
@@ -498,7 +499,7 @@ def encode_and_save_audio_cache(
 
     latents = latents[0].detach().cpu().contiguous()
     original_steps = int(latents.shape[1])
-    align_audio = get_ltx2_env().align_audio_latents_cache
+    align_audio = get_ltx2_env().align_audio_latents_cache and not preserve_audio_timing
     if align_audio:
         expected_steps = _expected_audio_latent_length_for_item(
             item_info,
@@ -529,7 +530,9 @@ def encode_and_save_audio_cache(
         if original_steps > 0 and waveform_seconds > 0:
             latents_per_second = float(original_steps) / waveform_seconds
         else:
-            latents_per_second = float(sample_rate) / float(getattr(encoder, "mel_hop_length", 160)) / float(LATENT_DOWNSAMPLE_FACTOR)
+            latents_per_second = (
+                float(sample_rate) / float(getattr(encoder, "mel_hop_length", 160)) / float(LATENT_DOWNSAMPLE_FACTOR)
+            )
         for start_s, end_s in loss_mask_intervals:
             start_idx = max(0, min(time_steps, int(math.floor(float(start_s) * latents_per_second))))
             end_idx = max(start_idx, min(time_steps, int(math.ceil(float(end_s) * latents_per_second))))
@@ -713,7 +716,9 @@ def encode_and_save_latent_guides(
             logger.warning(
                 "[Dataset %s] latent_idx_guide_directory=%r but latent_idx_guide_cache_directory=%r — "
                 "both must be set together; skipping latent_idx-guide caching for this dataset",
-                ds_idx, latidx_src, latidx_cache,
+                ds_idx,
+                latidx_src,
+                latidx_cache,
             )
 
         kf_src = getattr(ds, "keyframe_guide_directory", None)
@@ -724,7 +729,9 @@ def encode_and_save_latent_guides(
             logger.warning(
                 "[Dataset %s] keyframe_guide_directory=%r but keyframe_guide_cache_directory=%r — "
                 "both must be set together; skipping keyframe-guide caching for this dataset",
-                ds_idx, kf_src, kf_cache,
+                ds_idx,
+                kf_src,
+                kf_cache,
             )
 
         # Multi-keyframe extras: each extra is its own (directory, cache_directory)
@@ -752,11 +759,13 @@ def encode_and_save_latent_guides(
 
                 for kind, src_dir, _cache_dir, label in plans:
                     if kind == "latent_idx":
-                        cache_path = getattr(item_info, "latent_idx_guide_cache_path", None) \
-                            or ds.get_latent_idx_guide_cache_path(item_info)
+                        cache_path = getattr(item_info, "latent_idx_guide_cache_path", None) or ds.get_latent_idx_guide_cache_path(
+                            item_info
+                        )
                     elif kind == "keyframe":
-                        cache_path = getattr(item_info, "keyframe_guide_cache_path", None) \
-                            or ds.get_keyframe_guide_cache_path(item_info)
+                        cache_path = getattr(item_info, "keyframe_guide_cache_path", None) or ds.get_keyframe_guide_cache_path(
+                            item_info
+                        )
                     else:  # keyframe_extra_<i>
                         # Build cache path directly from the per-extra cache_dir.
                         w_b, h_b = item_info.original_size
@@ -812,7 +821,11 @@ def encode_and_save_latent_guides(
             stats = per_kind_stats[kind]
             logger.info(
                 "[Dataset %s] %s caching done: %s cached, %s skipped, %s missing",
-                ds_idx, kind, stats["cached"], stats["skipped"], stats["missing"],
+                ds_idx,
+                kind,
+                stats["cached"],
+                stats["skipped"],
+                stats["missing"],
             )
 
 
@@ -901,7 +914,9 @@ def encode_and_save_reference_latents(
                 bucket_reso = (item_info.bucket_size[0], item_info.bucket_size[1])
 
                 try:
-                    ref_cache_paths = getattr(item_info, "reference_latent_cache_paths", None) or ds.get_reference_latent_cache_paths(item_info)
+                    ref_cache_paths = getattr(
+                        item_info, "reference_latent_cache_paths", None
+                    ) or ds.get_reference_latent_cache_paths(item_info)
                     for ref_idx, (ref_dir, ref_cache_path) in enumerate(zip(ref_dirs, ref_cache_paths)):
                         if skip_existing and os.path.exists(ref_cache_path):
                             skipped_count += 1
@@ -1019,7 +1034,9 @@ def encode_and_save_reference_audio_latents(
                 stem = os.path.splitext(os.path.basename(source_key))[0]
                 ref_audio_path = None
                 try:
-                    ref_audio_cache_paths = getattr(item_info, "reference_audio_latent_cache_paths", None) or ds.get_reference_audio_latent_cache_paths(item_info)
+                    ref_audio_cache_paths = getattr(
+                        item_info, "reference_audio_latent_cache_paths", None
+                    ) or ds.get_reference_audio_latent_cache_paths(item_info)
                     for ref_audio_dir, ref_audio_cache_path in zip(ref_audio_dirs, ref_audio_cache_paths):
                         if skip_existing and os.path.exists(ref_audio_cache_path):
                             skipped_count += 1
@@ -1061,6 +1078,7 @@ def encode_and_save_reference_audio_latents(
                             dtype=dtype,
                             target_fps=float(ds_target_fps),
                             audio_only=False,
+                            preserve_audio_timing=bool(getattr(args, "preserve_audio_timing", False)),
                             atomic_cache_writes=atomic_cache_writes,
                         )
                         cached_count += 1
@@ -1097,10 +1115,7 @@ def _precache_sample_latents(args: argparse.Namespace, device: torch.device) -> 
     prompts_with_refs = [
         (i, p)
         for i, p in enumerate(prompts)
-        if p.get("image_path")
-        or p.get("v2v_ref_path")
-        or p.get("ref_audio_path")
-        or p.get("reference_audio_path")
+        if p.get("image_path") or p.get("v2v_ref_path") or p.get("ref_audio_path") or p.get("reference_audio_path")
     ]
     if not prompts_with_refs:
         logger.info("No I2V/V2V/reference-audio entries found in sample prompts - nothing to cache")
@@ -1120,6 +1135,7 @@ def _precache_sample_latents(args: argparse.Namespace, device: torch.device) -> 
     need_audio_encoder = ref_audio_count > 0
 
     from musubi_tuner.ltx2_defaults import get_ltx2_sampling_preset
+
     _preset = get_ltx2_sampling_preset(
         getattr(args, "sample_sampling_preset", "defaults"),
         ltx_version=str(getattr(args, "ltx_version", "2.3")),
@@ -1332,11 +1348,7 @@ def _precache_sample_latents(args: argparse.Namespace, device: torch.device) -> 
             except Exception as e:
                 logger.error(f"Failed to encode reference audio for prompt #{idx} '{ref_audio_path}': {e}")
 
-        if (
-            "conditioning_latent" in cache_entry
-            or "v2v_ref_latent" in cache_entry
-            or "ref_audio_latent" in cache_entry
-        ):
+        if "conditioning_latent" in cache_entry or "v2v_ref_latent" in cache_entry or "ref_audio_latent" in cache_entry:
             latent_cache.append(cache_entry)
 
     if vae_encoder is not None:
@@ -1346,6 +1358,7 @@ def _precache_sample_latents(args: argparse.Namespace, device: torch.device) -> 
     if audio_processor is not None:
         del audio_processor
     from musubi_tuner.utils.device_utils import clean_memory_on_device
+
     clean_memory_on_device(device)
 
     if args.sample_latents_cache:
@@ -1428,7 +1441,6 @@ def main() -> None:
         logger.info("All datasets are audio-only; automatically switching to --ltx2_mode audio")
         audio_only = True
 
-
     if not audio_only:
         if args.vae is None:
             if getattr(args, "ltx2_checkpoint", None) is None:
@@ -1456,16 +1468,18 @@ def main() -> None:
         temporal_config = None
 
         if args.vae_spatial_tile_size is not None:
-            logger.info("Enabling spatial tiling: size=%s, overlap=%s",
-                        args.vae_spatial_tile_size, args.vae_spatial_tile_overlap)
+            logger.info("Enabling spatial tiling: size=%s, overlap=%s", args.vae_spatial_tile_size, args.vae_spatial_tile_overlap)
             spatial_config = SpatialTilingConfig(
                 tile_size_in_pixels=args.vae_spatial_tile_size,
                 tile_overlap_in_pixels=args.vae_spatial_tile_overlap,
             )
 
         if args.vae_temporal_tile_size is not None:
-            logger.info("Enabling temporal tiling: size=%s frames, overlap=%s frames",
-                        args.vae_temporal_tile_size, args.vae_temporal_tile_overlap)
+            logger.info(
+                "Enabling temporal tiling: size=%s frames, overlap=%s frames",
+                args.vae_temporal_tile_size,
+                args.vae_temporal_tile_overlap,
+            )
             temporal_config = TemporalTilingConfig(
                 tile_size_in_frames=args.vae_temporal_tile_size,
                 tile_overlap_in_frames=args.vae_temporal_tile_overlap,
@@ -1508,8 +1522,7 @@ def main() -> None:
             latent_channels = infer_video_in_channels_from_checkpoint(args.ltx2_checkpoint)
             if latent_channels is None:
                 raise ValueError(
-                    "Unable to infer video input channels from --ltx2_checkpoint; "
-                    "set --audio_video_latent_channels explicitly."
+                    "Unable to infer video input channels from --ltx2_checkpoint; set --audio_video_latent_channels explicitly."
                 )
         latent_channels = int(latent_channels)
         if target_fps <= 0:
@@ -1537,8 +1550,7 @@ def main() -> None:
             if not unique_resolutions:
                 target_width, target_height = config_utils.BaseDatasetParams.resolution
                 logger.warning(
-                    "Could not infer target resolution from audio datasets; "
-                    "falling back to default dataset resolution %sx%s.",
+                    "Could not infer target resolution from audio datasets; falling back to default dataset resolution %sx%s.",
                     target_width,
                     target_height,
                 )
@@ -1555,9 +1567,7 @@ def main() -> None:
                 target_width, target_height = unique_resolutions[0]
 
         if target_width < 32 or target_height < 32:
-            raise ValueError(
-                f"Audio-only target resolution must be >= 32x32, got {target_width}x{target_height}."
-            )
+            raise ValueError(f"Audio-only target resolution must be >= 32x32, got {target_width}x{target_height}.")
         audio_only_sequence_resolution = int(getattr(args, "audio_only_sequence_resolution", 64))
         if audio_only_sequence_resolution != 0 and audio_only_sequence_resolution < 32:
             raise ValueError(
@@ -1664,6 +1674,7 @@ def main() -> None:
                             dtype=audio_dtype,
                             target_fps=ds_target_fps,
                             audio_only=audio_only,
+                            preserve_audio_timing=bool(getattr(args, "preserve_audio_timing", False)),
                             atomic_cache_writes=bool(getattr(args, "atomic_cache_writes", False)),
                         )
                         audio_encoded_count += 1
@@ -1695,7 +1706,8 @@ def main() -> None:
 
 def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     parser.add_argument(
-        "--ltx2_mode", "--ltx_mode",
+        "--ltx2_mode",
+        "--ltx_mode",
         dest="ltx_mode",
         type=str,
         default="v",
@@ -1709,10 +1721,30 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         help="Path to LTX-2 checkpoint (.safetensors)",
     )
     parser.add_argument("--vae_chunk_size", type=int, default=None, help="chunk size for CausalConv3d in VAE")
-    parser.add_argument("--vae_spatial_tile_size", type=int, default=None, help="Spatial tile size in pixels (e.g. 512). Must be >= 64 and divisible by 32.")
-    parser.add_argument("--vae_spatial_tile_overlap", type=int, default=64, help="Spatial tile overlap in pixels (default 64). Must be divisible by 32.")
-    parser.add_argument("--vae_temporal_tile_size", type=int, default=None, help="Temporal tile size in frames (e.g. 64). Must be >= 16 and divisible by 8.")
-    parser.add_argument("--vae_temporal_tile_overlap", type=int, default=24, help="Temporal tile overlap in frames (default 24). Must be divisible by 8.")
+    parser.add_argument(
+        "--vae_spatial_tile_size",
+        type=int,
+        default=None,
+        help="Spatial tile size in pixels (e.g. 512). Must be >= 64 and divisible by 32.",
+    )
+    parser.add_argument(
+        "--vae_spatial_tile_overlap",
+        type=int,
+        default=64,
+        help="Spatial tile overlap in pixels (default 64). Must be divisible by 32.",
+    )
+    parser.add_argument(
+        "--vae_temporal_tile_size",
+        type=int,
+        default=None,
+        help="Temporal tile size in frames (e.g. 64). Must be >= 16 and divisible by 8.",
+    )
+    parser.add_argument(
+        "--vae_temporal_tile_overlap",
+        type=int,
+        default=24,
+        help="Temporal tile overlap in frames (default 24). Must be divisible by 8.",
+    )
     parser.add_argument(
         "--ltx2_audio_source",
         type=str,
@@ -1763,6 +1795,15 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         help=(
             "Virtual pixel resolution used to derive audio-only sequence length for timestep sampling. "
             "Use 0 to fall back to dataset/target resolution behavior."
+        ),
+    )
+    parser.add_argument(
+        "--preserve_audio_timing",
+        action="store_true",
+        default=None,
+        help=(
+            "Preserve original audio duration by skipping pitch-preserving time stretch and audio-latent "
+            "duration alignment during cache generation."
         ),
     )
     parser.add_argument(

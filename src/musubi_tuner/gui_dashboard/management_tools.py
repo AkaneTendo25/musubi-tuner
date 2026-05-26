@@ -159,18 +159,22 @@ def _build_backup_status(repo_root: Path, install_state: dict[str, Any]) -> dict
             "stash_sha": "",
             "stash_subject": "",
             "recovery_target": "",
+            "file_backup_path": "",
+            "file_backup_available": False,
             "files": [],
             "commands": [],
             "error": "",
         }
 
     target = str(raw.get("recovery_target") or raw.get("stash_sha") or raw.get("stash_ref") or "").strip()
+    file_backup_path = str(raw.get("file_backup_path") or "").strip()
     files = _string_list(raw.get("files"))
     commands = _string_list(raw.get("commands")) or _stash_recovery_commands(target)
     error = ""
     available = False
+    file_backup_available = bool(file_backup_path and Path(file_backup_path).exists())
 
-    if target:
+    if target and target != file_backup_path:
         show_proc = _git_run(repo_root, "stash", "show", "--include-untracked", "--name-only", target)
         if show_proc and show_proc.returncode == 0:
             available = True
@@ -179,6 +183,10 @@ def _build_backup_status(repo_root: Path, install_state: dict[str, Any]) -> dict
                 files = fresh_files
         else:
             error = "The recorded stash backup was not found. It may have been applied, popped, or dropped."
+    if file_backup_available:
+        available = True
+    elif file_backup_path and not error:
+        error = "The recorded local-file backup folder was not found. It may have been moved or deleted."
 
     return {
         "present": True,
@@ -190,6 +198,8 @@ def _build_backup_status(repo_root: Path, install_state: dict[str, Any]) -> dict
         "stash_sha": str(raw.get("stash_sha") or ""),
         "stash_subject": str(raw.get("stash_subject") or ""),
         "recovery_target": target,
+        "file_backup_path": file_backup_path,
+        "file_backup_available": file_backup_available,
         "files": files,
         "commands": commands,
         "error": error,
@@ -762,7 +772,11 @@ def get_management_status(repo_root: Path | None = None, project_config: Project
     recommendations: list[str] = []
     warnings: list[str] = []
 
-    if repo_status["update_available"] and repo_status["tracked_dirty"]:
+    if repo_status["diverged"]:
+        recommendations.append(
+            "Resolve the diverged Git branch manually; Setup / Update only performs fast-forward repository updates."
+        )
+    elif repo_status["update_available"] and repo_status["tracked_dirty"]:
         recommendations.append(
             "Open Setup / Update to choose whether to skip the repo update or stash local changes before updating."
         )

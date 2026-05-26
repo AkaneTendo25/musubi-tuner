@@ -285,6 +285,12 @@
 							<div style="color: var(--text-muted);">Recovery Target</div>
 							<div class="font-mono break-all" style="color: var(--text-primary);">{management.install.backup.recovery_target || '--'}</div>
 						</div>
+						{#if management.install.backup.file_backup_path}
+							<div class="col-span-2">
+								<div style="color: var(--text-muted);">Backup Folder</div>
+								<div class="font-mono break-all" style="color: var(--text-primary);">{management.install.backup.file_backup_path}</div>
+							</div>
+						{/if}
 					</div>
 					{#if management.install.backup.files?.length}
 						<div class="space-y-2">

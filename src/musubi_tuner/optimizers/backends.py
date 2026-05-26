@@ -445,6 +445,7 @@ def apollo_group_kwargs_from_args(args: Any) -> dict[str, Any]:
         "proj": str(getattr(args, "apollo_proj", "random")),
         "proj_type": str(getattr(args, "apollo_proj_type", "std")),
         "scale_type": str(getattr(args, "apollo_scale_type", "channel")),
+        "update_rule": str(getattr(args, "apollo_update_rule", "apollo")),
     }
 
 
@@ -494,6 +495,51 @@ def _apollo_apply_norm_growth_limiter(
     return scaled_grad
 
 
+def _fira_split_update(
+    projector: Any,
+    norm_grad: torch.Tensor,
+    low_rank_grad: torch.Tensor,
+    full_rank_grad: torch.Tensor,
+    scaling_factor: torch.Tensor,
+    *,
+    negate_proj_adam: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fira update decomposition for an APOLLO/QAPOLLO low-rank group.
+
+    Returns ``(proj_adam, scaled_residual)`` where:
+      * ``proj_adam`` is the exact in-subspace Adam direction projected back to full
+        rank, ``P @ Adam(P^T G)``;
+      * ``scaled_residual`` is the gradient residual outside the subspace,
+        ``G - P P^T G``, scaled channel-wise by ``scaling_factor``.
+
+    The caller is expected to apply the norm-growth limiter to ``scaled_residual``,
+    sum the two terms, apply ``sqrt(scale)``, and finally apply the learning rate.
+
+    ``negate_proj_adam`` accounts for the sign convention of the in-subspace Adam
+    direction:
+      * non-quantized APOLLO computes ``norm_grad = exp_avg / denom`` (= +Adam dir),
+        so ``negate_proj_adam=False``;
+      * QAPOLLO runs the bitsandbytes step with lr=1.0 into a zeroed ``p.data``, so
+        ``norm_grad = p.data = -Adam dir`` and ``negate_proj_adam=True`` restores the
+        descent sign.
+
+    ``scaling_factor`` already broadcasts onto ``full_rank_grad`` in the existing
+    APOLLO path; the residual shares ``full_rank_grad``'s shape, so the same
+    broadcast applies unchanged.
+    """
+    project_back = getattr(projector, "project_back", None)
+    if not callable(project_back):
+        raise RuntimeError(
+            "--apollo_update_rule fira requires a projector exposing project_back(); the active "
+            f"projector {type(projector).__name__!r} does not. Use --apollo_proj random or svd."
+        )
+    proj_adam = project_back(norm_grad)
+    if negate_proj_adam:
+        proj_adam = -proj_adam
+    residual = full_rank_grad - project_back(low_rank_grad)
+    return proj_adam, scaling_factor * residual
+
+
 def _patch_apollo_adamw_fused_step_param(optimizer: Any) -> bool:
     def step_param(self, p: torch.nn.Parameter, group: dict[str, Any]) -> None:
         with torch.no_grad():
@@ -539,12 +585,19 @@ def _patch_apollo_adamw_fused_step_param(optimizer: Any) -> bool:
             update = exp_avg / denom
             if "rank" in group:
                 scaling_factor = _apollo_scaling_factor(group, update, low_rank_grad, norm_dim)
-                update = grad * scaling_factor
-                if bool(getattr(self, "scale_front", False)):
-                    update = update * math.sqrt(float(group["scale"]))
-                update = _apollo_apply_norm_growth_limiter(self, state, group, update)
-                if not bool(getattr(self, "scale_front", False)):
-                    update = update * math.sqrt(float(group["scale"]))
+                if str(group.get("update_rule", "apollo")) == "fira":
+                    proj_adam, scaled_residual = _fira_split_update(
+                        state["projector"], update, low_rank_grad, grad, scaling_factor, negate_proj_adam=False
+                    )
+                    scaled_residual = _apollo_apply_norm_growth_limiter(self, state, group, scaled_residual)
+                    update = (proj_adam + scaled_residual) * math.sqrt(float(group["scale"]))
+                else:
+                    update = grad * scaling_factor
+                    if bool(getattr(self, "scale_front", False)):
+                        update = update * math.sqrt(float(group["scale"]))
+                    update = _apollo_apply_norm_growth_limiter(self, state, group, update)
+                    if not bool(getattr(self, "scale_front", False)):
+                        update = update * math.sqrt(float(group["scale"]))
 
             p.add_(update, alpha=-step_size)
             if group["weight_decay"] > 0.0:
@@ -616,12 +669,21 @@ def _patch_qapollo_adamw_fused_step_param(optimizer: Any) -> bool:
                 norm_grad = p.data.clone()
                 norm_dim = 0 if norm_grad.shape[0] < norm_grad.shape[1] else 1
                 scaling_factor = _apollo_scaling_factor(group, norm_grad, low_rank_grad, norm_dim)
-                scaled_grad = full_rank_grad * scaling_factor
-                if bool(getattr(self, "scale_front", False)):
-                    scaled_grad = scaled_grad * math.sqrt(float(group["scale"]))
-                scaled_grad = _apollo_apply_norm_growth_limiter(self, state, group, scaled_grad)
-                if not bool(getattr(self, "scale_front", False)):
-                    scaled_grad = scaled_grad * math.sqrt(float(group["scale"]))
+                if str(group.get("update_rule", "apollo")) == "fira":
+                    # QAPOLLO ran the bnb step with lr=1.0 into a zeroed p.data, so
+                    # norm_grad = -Adam direction; negate_proj_adam restores the descent sign.
+                    proj_adam, scaled_residual = _fira_split_update(
+                        state["projector"], norm_grad, low_rank_grad, full_rank_grad, scaling_factor, negate_proj_adam=True
+                    )
+                    scaled_residual = _apollo_apply_norm_growth_limiter(self, state, group, scaled_residual)
+                    scaled_grad = (proj_adam + scaled_residual) * math.sqrt(float(group["scale"]))
+                else:
+                    scaled_grad = full_rank_grad * scaling_factor
+                    if bool(getattr(self, "scale_front", False)):
+                        scaled_grad = scaled_grad * math.sqrt(float(group["scale"]))
+                    scaled_grad = _apollo_apply_norm_growth_limiter(self, state, group, scaled_grad)
+                    if not bool(getattr(self, "scale_front", False)):
+                        scaled_grad = scaled_grad * math.sqrt(float(group["scale"]))
 
                 p.data = saved_data.add_(scaled_grad, alpha=-group["lr"])
                 if group.get("weight_decay", 0) > 0:

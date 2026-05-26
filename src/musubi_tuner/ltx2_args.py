@@ -550,6 +550,15 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         help="Sample independent timesteps for audio noising/conditioning in AV and audio modes.",
     )
     parser.add_argument(
+        "--preserve_audio_timing",
+        action="store_true",
+        default=None,
+        help=(
+            "Preserve original audio duration by skipping audio time-stretching and duration alignment. "
+            "Useful when you want audio timing/tempo to remain unchanged even if video frame count differs."
+        ),
+    )
+    parser.add_argument(
         "--audio_only_sequence_resolution",
         type=int,
         default=64,

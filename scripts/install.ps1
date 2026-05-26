@@ -144,6 +144,27 @@ function Write-ExternalOutputLines {
     }
 }
 
+function Invoke-ExternalCapture {
+    param(
+        [Parameter(Mandatory = $true)][string]$FilePath,
+        [string[]]$Arguments = @()
+    )
+
+    $previousErrorAction = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        $output = & $FilePath @Arguments 2>&1
+        $exitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousErrorAction
+    }
+
+    return [pscustomobject]@{
+        ExitCode = $exitCode
+        Output = @($output)
+    }
+}
+
 function Refresh-Path {
     $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
     $machinePath = [Environment]::GetEnvironmentVariable("Path", "Machine")
@@ -376,6 +397,184 @@ function Get-GitStatusPorcelain {
         UntrackedFiles = @($untrackedLines | ForEach-Object { Format-GitStatusEntry -Line $_ })
         LocalFiles = @($allLines | ForEach-Object { Format-GitStatusEntry -Line $_ })
     }
+}
+
+function Convert-GitPathToLocalPath {
+    param(
+        [Parameter(Mandatory = $true)][string]$RootPath,
+        [Parameter(Mandatory = $true)][string]$GitPath
+    )
+
+    $relativePath = $GitPath -replace "/", [System.IO.Path]::DirectorySeparatorChar
+    $rootFull = [System.IO.Path]::GetFullPath($RootPath)
+    $candidate = [System.IO.Path]::GetFullPath((Join-Path $rootFull $relativePath))
+    $rootPrefix = $rootFull
+    if (-not $rootPrefix.EndsWith([string][System.IO.Path]::DirectorySeparatorChar)) {
+        $rootPrefix = "{0}{1}" -f $rootPrefix, [System.IO.Path]::DirectorySeparatorChar
+    }
+
+    if (-not $candidate.StartsWith($rootPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+        return ""
+    }
+    return $candidate
+}
+
+function Format-IncomingLocalConflict {
+    param([Parameter(Mandatory = $true)]$Conflict)
+
+    $label = if ($Conflict.ignored) { "ignored" } else { "untracked" }
+    return "{0}: {1}" -f $label, $Conflict.path
+}
+
+function Get-IncomingLocalPathConflicts {
+    param(
+        [Parameter(Mandatory = $true)][string]$GitExe,
+        [Parameter(Mandatory = $true)][string]$RepoPath,
+        [Parameter(Mandatory = $true)][string]$TargetRef
+    )
+
+    $verifyResult = Invoke-ExternalCapture -FilePath $GitExe -Arguments @("-C", $RepoPath, "rev-parse", "--verify", $TargetRef)
+    if ($verifyResult.ExitCode -ne 0) {
+        return @()
+    }
+
+    $diffResult = Invoke-ExternalCapture -FilePath $GitExe -Arguments @("-C", $RepoPath, "diff", "--name-only", "--diff-filter=ACMRTUXB", "HEAD..$TargetRef", "--", ".")
+    if ($diffResult.ExitCode -ne 0) {
+        return @()
+    }
+
+    $conflicts = [System.Collections.ArrayList]::new()
+    foreach ($rawPath in @($diffResult.Output)) {
+        $gitPath = ([string]$rawPath).Trim()
+        if ([string]::IsNullOrWhiteSpace($gitPath)) {
+            continue
+        }
+
+        $trackedResult = Invoke-ExternalCapture -FilePath $GitExe -Arguments @("-C", $RepoPath, "ls-files", "--error-unmatch", "--", $gitPath)
+        if ($trackedResult.ExitCode -eq 0) {
+            continue
+        }
+
+        $localPath = Convert-GitPathToLocalPath -RootPath $RepoPath -GitPath $gitPath
+        if ([string]::IsNullOrWhiteSpace($localPath) -or (-not (Test-Path -LiteralPath $localPath))) {
+            continue
+        }
+
+        $ignoredResult = Invoke-ExternalCapture -FilePath $GitExe -Arguments @("-C", $RepoPath, "check-ignore", "-q", "--", $gitPath)
+        $ignored = $ignoredResult.ExitCode -eq 0
+        [void]$conflicts.Add([pscustomobject]@{
+            path = $gitPath
+            local_path = $localPath
+            ignored = $ignored
+        })
+    }
+
+    return @($conflicts)
+}
+
+function Backup-IncomingLocalPathConflicts {
+    param(
+        [Parameter(Mandatory = $true)][string]$RepoPath,
+        [Parameter(Mandatory = $true)][object[]]$Conflicts
+    )
+
+    if (@($Conflicts).Count -eq 0) {
+        return $null
+    }
+
+    $backupStamp = Get-Date -Format "yyyyMMdd_HHmmss"
+    $backupUtc = (Get-Date).ToUniversalTime().ToString("o")
+    $backupRoot = Join-Path $RepoPath (Join-Path ".musubi_setup_backups" "incoming_$backupStamp")
+    New-Item -Path $backupRoot -ItemType Directory -Force | Out-Null
+
+    $backedUpFiles = [System.Collections.ArrayList]::new()
+    foreach ($conflict in @($Conflicts)) {
+        $destination = Convert-GitPathToLocalPath -RootPath $backupRoot -GitPath ([string]$conflict.path)
+        if ([string]::IsNullOrWhiteSpace($destination)) {
+            continue
+        }
+
+        $destinationParent = Split-Path -Parent $destination
+        if (-not (Test-Path -LiteralPath $destinationParent)) {
+            New-Item -Path $destinationParent -ItemType Directory -Force | Out-Null
+        }
+
+        Copy-Item -LiteralPath ([string]$conflict.local_path) -Destination $destination -Recurse -Force
+        [void]$backedUpFiles.Add((Format-IncomingLocalConflict -Conflict $conflict))
+    }
+
+    return [ordered]@{
+        created_utc = $backupUtc
+        path = $backupRoot
+        files = @($backedUpFiles | ForEach-Object { [string]$_ })
+        commands = @(
+            "explorer `"$backupRoot`""
+        )
+    }
+}
+
+function Add-SetupFileBackupRecord {
+    param(
+        [Parameter(Mandatory = $true)][string]$CreatedUtc,
+        [Parameter(Mandatory = $true)][string]$BackupPath,
+        [Parameter(Mandatory = $true)][string[]]$Files
+    )
+
+    if ($Files.Count -eq 0) {
+        return
+    }
+
+    if ($null -eq $script:LastRepositoryBackup) {
+        $script:LastRepositoryBackup = [ordered]@{
+            created_utc = $CreatedUtc
+            message = "musubi setup file backup"
+            stash_ref = ""
+            stash_sha = ""
+            stash_subject = ""
+            recovery_target = $BackupPath
+            files = @()
+            commands = @()
+        }
+    }
+
+    $script:LastRepositoryBackup["file_backup_path"] = $BackupPath
+    $script:LastRepositoryBackup["file_backup_files"] = @(@($script:LastRepositoryBackup["file_backup_files"]) + @($Files))
+    $script:LastRepositoryBackup["files"] = @(@($script:LastRepositoryBackup["files"]) + @($Files))
+    $script:LastRepositoryBackup["commands"] = @(@($script:LastRepositoryBackup["commands"]) + @("explorer `"$BackupPath`""))
+}
+
+function Write-GeneratedTextFile {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string[]]$Contents,
+        [Parameter(Mandatory = $true)][string]$Label
+    )
+
+    if (Test-Path -LiteralPath $Path) {
+        $existing = @(Get-Content -LiteralPath $Path -ErrorAction SilentlyContinue)
+        $changed = $existing.Count -ne $Contents.Count
+        if (-not $changed) {
+            for ($i = 0; $i -lt $Contents.Count; $i++) {
+                if ([string]$existing[$i] -ne [string]$Contents[$i]) {
+                    $changed = $true
+                    break
+                }
+            }
+        }
+
+        if ($changed) {
+            $backupStamp = Get-Date -Format "yyyyMMdd_HHmmss"
+            $backupUtc = (Get-Date).ToUniversalTime().ToString("o")
+            $backupRoot = Join-Path (Split-Path -Parent $Path) (Join-Path ".musubi_setup_backups" "generated_$backupStamp")
+            New-Item -Path $backupRoot -ItemType Directory -Force | Out-Null
+            $backupPath = Join-Path $backupRoot (Split-Path -Leaf $Path)
+            Copy-Item -LiteralPath $Path -Destination $backupPath -Force
+            Write-Log ("Existing {0} differs from the generated version. Backup created: {1}" -f $Label, $backupPath) "INFO"
+            Add-SetupFileBackupRecord -CreatedUtc $backupUtc -BackupPath $backupRoot -Files @("generated: $(Split-Path -Leaf $Path)")
+        }
+    }
+
+    Set-Content -Path $Path -Value $Contents -Encoding ASCII
 }
 
 function Save-InstallState {
@@ -1209,7 +1408,7 @@ function Sync-Repository {
         $changeSummary = Format-StatusFileList -Items $statusOut.ChangedFiles
         Write-Log "Tracked local changes were found. Safe update is leaving the repository unchanged." "WARN"
         Write-Log ("Changed files: {0}" -f $changeSummary) "WARN"
-        Write-Log "Run setup again with -UpdatePolicy StashAndUpdate to back up these changes with git stash and update." "WARN"
+        Write-Log "Run setup again with -UpdatePolicy StashAndUpdate to back up these changes before updating." "WARN"
         return
     }
     if (@($statusOut.UntrackedOutput).Count -gt 0 -and $UpdatePolicy -eq "Safe") {
@@ -1225,18 +1424,22 @@ function Sync-Repository {
         $backupFiles = @($statusOut.LocalFiles)
         Write-Log "Backing up local changes with git stash before updating."
         Write-Log "This backup will not be reapplied automatically after the update."
-        $stashOutput = & $GitExe -C $RepoPath stash push --include-untracked -m $stashMessage 2>&1
-        if ($LASTEXITCODE -ne 0) {
+        $stashResult = Invoke-ExternalCapture -FilePath $GitExe -Arguments @("-C", $RepoPath, "stash", "push", "--include-untracked", "-m", $stashMessage)
+        if ($stashResult.ExitCode -ne 0) {
             Write-Log "Could not create the git stash backup. The repository was not updated." "WARN"
-            Write-ExternalOutputLines -Output $stashOutput -Level "WARN"
+            Write-ExternalOutputLines -Output $stashResult.Output -Level "WARN"
             return
         }
-        Write-ExternalOutputLines -Output $stashOutput -Level "INFO"
-        $stashRef = (& $GitExe -C $RepoPath stash list --format="%gd%x09%H%x09%s" -n 1 2>$null | Select-Object -First 1)
+        Write-ExternalOutputLines -Output $stashResult.Output -Level "INFO"
+        $stashListResult = Invoke-ExternalCapture -FilePath $GitExe -Arguments @("-C", $RepoPath, "stash", "list", "--format=%gd%x09%H%x09%s")
+        $stashRef = ""
+        if ($stashListResult.ExitCode -eq 0) {
+            $stashRef = @($stashListResult.Output | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } | Select-Object -First 1)
+        }
         $stashName = ""
         $stashSha = ""
         $stashSubject = ""
-        if ($LASTEXITCODE -eq 0 -and $stashRef) {
+        if ($stashListResult.ExitCode -eq 0 -and $stashRef) {
             $stashParts = $stashRef.Trim().Split("`t", 3)
             if ($stashParts.Count -ge 1) {
                 $stashName = $stashParts[0]
@@ -1271,22 +1474,50 @@ function Sync-Repository {
     }
 
     Invoke-ExternalWithRetry -FilePath $GitExe -Arguments @("-C", $RepoPath, "fetch", "origin", $BranchName) -MaxAttempts 3 -DelaySeconds 5
-    $checkoutOutput = & $GitExe -C $RepoPath checkout $BranchName 2>&1
-    if ($LASTEXITCODE -ne 0) {
+    $remoteRef = "origin/$BranchName"
+    $incomingConflicts = @(Get-IncomingLocalPathConflicts -GitExe $GitExe -RepoPath $RepoPath -TargetRef $remoteRef)
+    if ($incomingConflicts.Count -gt 0) {
+        $conflictSummary = Format-StatusFileList -Items @($incomingConflicts | ForEach-Object { Format-IncomingLocalConflict -Conflict $_ })
+        if ($UpdatePolicy -eq "Safe") {
+            Write-Log "Incoming repository changes would write paths that already exist as local files. Safe update is leaving the repository unchanged." "WARN"
+            Write-Log ("Conflicting local paths: {0}" -f $conflictSummary) "WARN"
+            Write-Log "Move those files or rerun with -UpdatePolicy StashAndUpdate to copy them into .musubi_setup_backups before updating." "WARN"
+            return
+        }
+
+        Write-Log "Incoming repository changes conflict with local untracked or ignored files. Copying those files before updating." "WARN"
+        try {
+            $fileBackup = Backup-IncomingLocalPathConflicts -RepoPath $RepoPath -Conflicts $incomingConflicts
+        } catch {
+            Write-Log ("Could not copy local-file backup. The repository was not updated: {0}" -f $_.Exception.Message) "WARN"
+            return
+        }
+        if (-not $fileBackup) {
+            Write-Log "Could not create a local-file backup. The repository was not updated." "WARN"
+            return
+        }
+
+        Write-Log ("Local-file backup created: {0}" -f $fileBackup["path"]) "OK"
+        Add-SetupFileBackupRecord -CreatedUtc $fileBackup["created_utc"] -BackupPath $fileBackup["path"] -Files @($fileBackup["files"])
+    }
+
+    $checkoutResult = Invoke-ExternalCapture -FilePath $GitExe -Arguments @("-C", $RepoPath, "checkout", $BranchName)
+    if ($checkoutResult.ExitCode -ne 0) {
         Write-Log "Git could not check out the requested branch. The repository was not updated." "WARN"
-        Write-ExternalOutputLines -Output $checkoutOutput -Level "WARN"
+        Write-ExternalOutputLines -Output $checkoutResult.Output -Level "WARN"
         Write-Log "No local files were deleted by setup. Resolve the Git message above and rerun setup." "WARN"
         return
     }
-    $pullOutput = & $GitExe -C $RepoPath pull --ff-only origin $BranchName 2>&1
-    if ($LASTEXITCODE -ne 0) {
+    Write-ExternalOutputLines -Output $checkoutResult.Output -Level "INFO"
+    $pullResult = Invoke-ExternalCapture -FilePath $GitExe -Arguments @("-C", $RepoPath, "pull", "--ff-only", "origin", $BranchName)
+    if ($pullResult.ExitCode -ne 0) {
         Write-Log "Git could not fast-forward the repository. The repository was not updated." "WARN"
-        Write-ExternalOutputLines -Output $pullOutput -Level "WARN"
+        Write-ExternalOutputLines -Output $pullResult.Output -Level "WARN"
         Write-Log "No local files were deleted by setup. Untracked files may conflict with incoming repository files." "WARN"
         Write-Log "Move the conflicting files or rerun setup with -UpdatePolicy StashAndUpdate." "WARN"
         return
     }
-    Write-ExternalOutputLines -Output $pullOutput -Level "INFO"
+    Write-ExternalOutputLines -Output $pullResult.Output -Level "INFO"
     if ($UpdatePolicy -eq "StashAndUpdate" -and @($statusOut.Output).Count -gt 0) {
         $stashReminder = "Local changes remain backed up in git stash. Review them with 'git stash list' before applying or dropping them."
         Write-Log $stashReminder "WARN"
@@ -1417,7 +1648,7 @@ function Write-LauncherScript {
         "if not ""%EXIT_CODE%""==""0"" pause",
         "exit /b %EXIT_CODE%"
     )
-    Set-Content -Path $launcherPath -Value $contents -Encoding ASCII
+    Write-GeneratedTextFile -Path $launcherPath -Contents $contents -Label "dashboard launcher"
     return $launcherPath
 }
 
@@ -1449,7 +1680,7 @@ function Write-SetupLauncherScript {
         "if not ""%EXIT_CODE%""==""0"" pause",
         "exit /b %EXIT_CODE%"
     )
-    Set-Content -Path $launcherPath -Value $contents -Encoding ASCII
+    Write-GeneratedTextFile -Path $launcherPath -Contents $contents -Label "setup launcher"
     return $launcherPath
 }
 
@@ -1593,9 +1824,9 @@ function Select-UpdatePolicy {
         Write-Host ("Changed files: {0}" -f (Format-StatusFileList -Items $RepoStatus.changed_files)) -ForegroundColor DarkGray
         Write-Host ""
         Write-Host " S. Skip repository update for this run (safe default)"
-        Write-Host " B. Back up local changes with git stash, then update"
+        Write-Host " B. Back up local changes, then update"
         Write-Host ""
-        Write-Host "The stash backup will not be reapplied automatically after setup finishes." -ForegroundColor DarkGray
+        Write-Host "Backups will not be reapplied automatically after setup finishes." -ForegroundColor DarkGray
         Write-Host "Press [Enter]/[S] to keep the safe default, or [Q] to quit." -ForegroundColor DarkGray
 
         $choice = (Read-SelectionInput).Trim().ToUpperInvariant()
@@ -1920,6 +2151,8 @@ try {
         "branch switch requested, but tracked local changes block safe checkout: $localChangeSummary"
     } elseif ($branchSwitchRequested) {
         "recommended because setup is configured for branch '$Branch' while the repo is on '$($repoStatus.branch)'"
+    } elseif ($repoStatus.diverged) {
+        "local branch and origin have diverged; resolve Git history manually because setup only fast-forwards"
     } elseif ($repoStatus.tracked_dirty -and $repoStatus.update_available -and $UpdatePolicy -eq "StashAndUpdate") {
         "tracked local changes will be backed up with git stash before updating"
     } elseif ($repoStatus.tracked_dirty -and $repoStatus.update_available) {
@@ -2217,6 +2450,9 @@ try {
     $setupLauncherPath = $script:setupLauncherPathInternal
     $stateData["install"]["dashboard_launcher_path"] = $launcherPath
     $stateData["install"]["setup_launcher_path"] = $setupLauncherPath
+    if ($script:LastRepositoryBackup) {
+        $stateData["install"]["last_backup"] = $script:LastRepositoryBackup
+    }
     Save-InstallState -RepoPath $RepoDir -State $stateData
     Write-Log "Dashboard launcher ready: $launcherPath" "OK"
     Write-Log "Setup/update launcher ready: $setupLauncherPath" "OK"

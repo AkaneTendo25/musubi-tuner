@@ -4558,7 +4558,7 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             if av_ic_audio_latents.dim() != 4:
                 raise ValueError(f"Expected audio_latents to be 4D [B, C, T, F], got shape: {tuple(av_ic_audio_latents.shape)}")
             av_ic_audio_latents = av_ic_audio_latents.to(device=accelerator.device, dtype=network_dtype)
-            if getattr(args, "align_audio_latents_train", False):
+            if getattr(args, "align_audio_latents_train", False) and not getattr(args, "preserve_audio_timing", False):
                 expected_length = self._calculate_expected_audio_latent_length(
                     args,
                     transformer,
@@ -4954,7 +4954,7 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                 audio_latents = audio_latents.to(device=accelerator.device, dtype=network_dtype)
                 _check_finite("audio_latents", audio_latents)
                 _log_stats("audio_latents", audio_latents)
-                if getattr(args, "align_audio_latents_train", False):
+                if getattr(args, "align_audio_latents_train", False) and not getattr(args, "preserve_audio_timing", False):
                     expected_length = self._calculate_expected_audio_latent_length(
                         args,
                         transformer,
