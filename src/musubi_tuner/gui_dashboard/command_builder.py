@@ -2266,6 +2266,34 @@ def build_slider_training_cmd(config: ProjectConfig) -> list[str]:
         cmd += ["--output_name", s.output_name]
     if t.save_every_n_steps:
         cmd += ["--save_every_n_steps", str(t.save_every_n_steps)]
+    if t.autoresume:
+        cmd.append("--autoresume")
+
+    # Sampling — inherited from training config (same pattern as build_training_cmd)
+    sample_prompts = _effective_training_sample_prompts(config)
+    if t.sample_every_n_steps:
+        cmd += ["--sample_every_n_steps", str(t.sample_every_n_steps)]
+    if t.sample_every_n_epochs:
+        cmd += ["--sample_every_n_epochs", str(t.sample_every_n_epochs)]
+    if sample_prompts:
+        cmd += ["--sample_prompts", sample_prompts]
+    if t.sample_at_first:
+        cmd.append("--sample_at_first")
+    cmd += ["--sample_sampling_preset", t.sample_sampling_preset]
+    if t.sample_sigma_schedule != "auto":
+        cmd += ["--sample_sigma_schedule", t.sample_sigma_schedule]
+    if t.sample_sampler != "auto":
+        cmd += ["--sample_sampler", t.sample_sampler]
+    if t.sample_use_default_negative_prompt is True:
+        cmd.append("--sample_use_default_negative_prompt")
+    elif t.sample_use_default_negative_prompt is False:
+        cmd.append("--no-sample_use_default_negative_prompt")
+    if t.sample_with_offloading:
+        cmd.append("--sample_with_offloading")
+    _append_optional(cmd, "--height", t.height)
+    _append_optional(cmd, "--width", t.width)
+    _append_optional(cmd, "--sample_num_frames", t.sample_num_frames)
+    _append_optional(cmd, "--video_cfg_scale", t.video_cfg_scale)
 
     cmd += _split_cli_args(s.extra_args)
     return cmd

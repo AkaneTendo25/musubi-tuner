@@ -1125,6 +1125,10 @@ class LTX2SliderTrainer:
             (None if getattr(args, "fp8_scaled", False) else torch.float8_e4m3fn) if getattr(args, "fp8_base", False) else dit_dtype
         )
 
+        # -- Pre-cache slider prompt embeddings (before DiT to avoid VRAM collision) --
+        if self.slider_config.mode == "text":
+            self._precache_slider_prompts(args, accelerator)
+
         # -- Sample prompt setup (for preview during training) ----------------
         vae_dtype = torch.float16 if args.vae_dtype is None else model_utils.str_to_dtype(args.vae_dtype)
         sample_parameters = None
@@ -1134,6 +1138,24 @@ class LTX2SliderTrainer:
             vae = self._net_trainer.load_vae(args, vae_dtype=vae_dtype, vae_path=args.vae)
             vae.requires_grad_(False)
             vae.eval()
+
+        # -- Pre-cache sample prompt embeddings (before DiT to avoid VRAM collision) --
+        if sample_parameters is not None:
+            needs_encoding = any(p.get("prompt_embeds") is None for p in sample_parameters)
+            if needs_encoding:
+                te_dtype = self._net_trainer._build_text_encoder(args, accelerator)
+                for sp in sample_parameters:
+                    if sp.get("prompt_embeds") is None:
+                        embed, mask = self._net_trainer._encode_prompt_text(accelerator, sp.get("prompt", ""), te_dtype)
+                        sp["prompt_embeds"] = embed
+                        sp["prompt_attention_mask"] = mask
+                        neg = sp.get("negative_prompt")
+                        if neg:
+                            ne, nm = self._net_trainer._encode_prompt_text(accelerator, neg, te_dtype)
+                            sp["negative_prompt_embeds"] = ne
+                            sp["negative_prompt_attention_mask"] = nm
+                self._net_trainer._cleanup_text_encoder(accelerator)
+                clean_memory_on_device(accelerator.device)
 
         # -- Load transformer -------------------------------------------------
         blocks_to_swap = int(getattr(args, "blocks_to_swap", 0) or 0)
@@ -1227,29 +1249,6 @@ class LTX2SliderTrainer:
             except TypeError:
                 network.enable_gradient_checkpointing()
 
-        # -- Pre-cache slider prompt embeddings --------------------------------
-        if self.slider_config.mode == "text":
-            self._precache_slider_prompts(args, accelerator)
-
-        # -- Pre-cache sample prompt embeddings --------------------------------
-        if sample_parameters is not None:
-            # Encode sample prompts if they don't already have embeddings
-            needs_encoding = any(p.get("prompt_embeds") is None for p in sample_parameters)
-            if needs_encoding:
-                te_dtype = self._net_trainer._build_text_encoder(args, accelerator)
-                for sp in sample_parameters:
-                    if sp.get("prompt_embeds") is None:
-                        embed, mask = self._net_trainer._encode_prompt_text(accelerator, sp.get("prompt", ""), te_dtype)
-                        sp["prompt_embeds"] = embed
-                        sp["prompt_attention_mask"] = mask
-                        neg = sp.get("negative_prompt")
-                        if neg:
-                            ne, nm = self._net_trainer._encode_prompt_text(accelerator, neg, te_dtype)
-                            sp["negative_prompt_embeds"] = ne
-                            sp["negative_prompt_attention_mask"] = nm
-                self._net_trainer._cleanup_text_encoder(accelerator)
-                clean_memory_on_device(accelerator.device)
-
         # -- Optimizer & scheduler ---------------------------------------------
         trainable_params, lr_descriptions = network.prepare_optimizer_params(unet_lr=args.learning_rate)
         optimizer_name, optimizer_args_str, optimizer, optimizer_train_fn, optimizer_eval_fn = NetworkTrainer().get_optimizer(
@@ -1277,6 +1276,77 @@ class LTX2SliderTrainer:
             transformer.eval()
 
         accelerator.unwrap_model(network).prepare_grad_etc(transformer)
+
+        # -- Resume from saved state (autoresume / --resume) --------------------
+        initial_global_step = 0
+        if getattr(args, "autoresume", False) and not getattr(args, "resume", None):
+            latest = self._net_trainer._find_latest_state_dir(args)
+            if latest:
+                logger.info(f"autoresume: found latest state directory: {latest}")
+                args.resume = latest
+                args._autoresume_selected = True
+            else:
+                logger.info("autoresume: no saved state found in output_dir, starting from scratch")
+                args._autoresume_selected = False
+        else:
+            args._autoresume_selected = getattr(args, "_autoresume_selected", False)
+
+        if getattr(args, "resume", None):
+            if not train_utils.is_complete_state_dir(args.resume):
+                if getattr(args, "_autoresume_selected", False):
+                    logger.warning("autoresume: selected state directory is missing or incomplete, starting from scratch: %s", args.resume)
+                    args.resume = None
+                else:
+                    raise FileNotFoundError(f"resume state directory is missing or incomplete: {args.resume}")
+
+        if getattr(args, "resume", None):
+            self._net_trainer._register_optimizer_resume_safe_globals(args)
+            logger.info(f"Resuming slider training from state: {args.resume}")
+            accelerator.load_state(args.resume)
+            resume_step = self._net_trainer._recover_global_step(args.resume)
+            if resume_step > 0:
+                initial_global_step = resume_step
+                logger.info(f"Recovered global_step={initial_global_step} from resume state")
+
+        # -- Fallback: resume from latest LoRA checkpoint if no state dir ------
+        # If autoresume is enabled but no state directory was found (e.g. crash
+        # without graceful save), scan output_dir for the highest-step LoRA
+        # checkpoint matching output_name and load its weights.
+        if (
+            initial_global_step == 0
+            and getattr(args, "autoresume", False)
+            and getattr(args, "network_weights", None) is None
+            and args.output_dir
+            and os.path.isdir(args.output_dir)
+        ):
+            import re as _re
+
+            best_step = 0
+            best_path = None
+            step_pattern = _re.compile(
+                _re.escape(args.output_name) + r"-step(\d+)\.safetensors$"
+            )
+            for entry in os.listdir(args.output_dir):
+                m = step_pattern.match(entry)
+                if m:
+                    step = int(m.group(1))
+                    full = os.path.join(args.output_dir, entry)
+                    if step > best_step and os.path.isfile(full):
+                        best_step = step
+                        best_path = full
+            if best_path is not None:
+                logger.info(
+                    "autoresume: no state dir found, but found LoRA checkpoint at step %d: %s",
+                    best_step,
+                    best_path,
+                )
+                info = accelerator.unwrap_model(network).load_weights(best_path)
+                logger.info("Loaded LoRA weights for resume: %s", info)
+                initial_global_step = best_step
+                logger.info(
+                    "Resuming from step %d (optimizer/scheduler re-initialized — weights only)",
+                    initial_global_step,
+                )
 
         # -- Reference dataloader (if reference mode) -------------------------
         ref_dataloader = None
@@ -1438,14 +1508,18 @@ class LTX2SliderTrainer:
             desc="steps",
         )
 
-        global_step = 0
+        global_step = initial_global_step
         loss_recorder = train_utils.LossRecorder()
 
         clean_memory_on_device(accelerator.device)
         optimizer_train_fn()
         optimizer.zero_grad(set_to_none=True)
 
-        logger.info("Starting slider training")
+        if initial_global_step > 0:
+            progress_bar.update(initial_global_step)
+            logger.info("Resuming slider training from step %d", initial_global_step)
+        else:
+            logger.info("Starting slider training")
         logger.info("  mode: %s", self.slider_config.mode)
         logger.info("  max_train_steps: %d", args.max_train_steps)
         logger.info("  learning_rate: %s", args.learning_rate)
