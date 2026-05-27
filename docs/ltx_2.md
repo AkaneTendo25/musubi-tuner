@@ -3659,8 +3659,8 @@ For longer runs, start with video-only short-context training until checkpoint s
 
 **LTX Resources**
 - [LTX-2](https://github.com/Lightricks/LTX-2) — LTX-2/2.3 model and pipeline resources
-- [LTX-Video](https://github.com/Lightricks/LTX-Video) — LTX model resources, inference tooling, ComfyUI nodes, and model weights
 - [LTX Documentation](https://docs.ltx.video/open-source-model/getting-started/overview) — Unified docs hub: open-source model, API reference, ComfyUI integration, LoRA usage, and LTX-2 trainer guide
+- [LTX Discord](https://discord.gg/epQmav9hAR) — Official LTX team Discord
 
 **Alternative Trainers**
 - [ai-toolkit](https://github.com/ostris/ai-toolkit) (ostris) — General diffusion fine-tuning toolkit with LTX-2/2.3 LoRA support; slider LoRA training is based on its implementation
@@ -3670,7 +3670,7 @@ For longer runs, start with video-only short-context training until checkpoint s
 
 **Community Resources**
 - [awesome-ltx2](https://github.com/wildminder/awesome-ltx2) — Curated list of LTX-2 resources, tools, models, and guides
-- [Banodoco Discord](https://discord.gg/SrkBPTzw) — Active AI video generation community; discussions on LTX-2 training, workflows, and research
+- [Banodoco Discord](https://discord.gg/BdvB5E7rsZ) — Active AI video generation community; discussions on LTX-2 training, workflows, and research
 - [Windows Installation Guide](https://github.com/AkaneTendo25/musubi-tuner/discussions/19) — Windows-specific setup (Python 3.12, CUDA, Flash Attention 2), dependencies, troubleshooting
 - [LTX-2 Training Optimizers](https://github.com/AkaneTendo25/musubi-tuner/discussions/21) — Optimizer comparison for LTX-2 training: AdamW, Prodigy, Muon, CAME, and recommended settings
 - [LTX-2 Audio Dataset Builder](https://github.com/dorpxam/LTX-2-Audio-Dataset-Builder) — Tool to automate audio dataset creation: transforms raw audio into clean, captioned segments optimized for LTX-2 audio-only training
