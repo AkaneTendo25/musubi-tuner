@@ -13,6 +13,7 @@ dependencies = [
     "diffusers==0.32.1",
     "einops==0.7.0",
     "huggingface-hub==0.34.3",
+    "lpips==0.1.4",
     "opencv-python==4.10.0.84",
     "pillow>=11.3.0",
     "prodigy-plus-schedule-free==2.0.1",

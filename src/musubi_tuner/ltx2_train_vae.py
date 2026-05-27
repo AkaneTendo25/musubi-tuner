@@ -15,10 +15,12 @@ import os
 import random
 from contextlib import nullcontext
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Iterable, Optional, Sequence
 
 import torch
 import torch.nn.functional as F
+from torch import nn
 from accelerate import Accelerator
 from safetensors import safe_open
 from tqdm import tqdm
@@ -58,6 +60,46 @@ def _load_ltx2_config_metadata(path: str) -> str:
     if metadata is None or "config" not in metadata:
         raise ValueError(f"{path} does not contain LTX-2 config metadata")
     return metadata["config"]
+
+
+def _load_ltx2_config_metadata_for_args(args: argparse.Namespace) -> str:
+    try:
+        return _load_ltx2_config_metadata(args.vae)
+    except ValueError:
+        metadata = _load_checkpoint_metadata(args.vae)
+        base_vae_path = args.vae_base or metadata.get("ss_vae_base")
+        if base_vae_path is None:
+            raise
+        args.vae_base = str(base_vae_path)
+        return _load_ltx2_config_metadata(str(base_vae_path))
+
+
+def _load_checkpoint_metadata(path: str) -> dict[str, str]:
+    with safe_open(path, framework="pt") as handle:
+        metadata = handle.metadata()
+    return dict(metadata or {})
+
+
+def _checkpoint_has_prefix(path: str, prefix: str) -> bool:
+    with safe_open(path, framework="pt") as handle:
+        for key in handle.keys():
+            if key.startswith(prefix):
+                return True
+    return False
+
+
+def _load_prefixed_tensors(path: str, prefixes: Sequence[str], *, dtype: Optional[torch.dtype] = None) -> dict[str, torch.Tensor]:
+    tensors: dict[str, torch.Tensor] = {}
+    with safe_open(path, framework="pt") as handle:
+        for key in handle.keys():
+            for prefix in prefixes:
+                if key.startswith(prefix):
+                    tensor = handle.get_tensor(key)
+                    if dtype is not None and tensor.dtype.is_floating_point:
+                        tensor = tensor.to(dtype=dtype)
+                    tensors[key[len(prefix) :]] = tensor
+                    break
+    return tensors
 
 
 def _amp_context(device: torch.device, dtype: torch.dtype):
@@ -201,6 +243,216 @@ def _masked_mean(loss_map: torch.Tensor, mask: Optional[torch.Tensor]) -> torch.
     return (loss_map * mask).sum() / denom.clamp_min(1.0)
 
 
+def _set_requires_grad(module: Optional[torch.nn.Module], requires_grad: bool) -> None:
+    if module is None:
+        return
+    for parameter in module.parameters():
+        parameter.requires_grad_(requires_grad)
+
+
+def _flatten_video_frames(tensor: torch.Tensor) -> torch.Tensor:
+    if tensor.ndim != 5:
+        raise ValueError(f"Expected BCHWD video tensor, got {tuple(tensor.shape)}")
+    batch, channels, frames, height, width = tensor.shape
+    return tensor.permute(0, 2, 1, 3, 4).reshape(batch * frames, channels, height, width)
+
+
+def _sample_frame_indices(frame_count: int, sample_count: int) -> list[int]:
+    if frame_count <= 0:
+        return []
+    sample_count = max(1, min(frame_count, sample_count))
+    if sample_count == frame_count:
+        return list(range(frame_count))
+    if sample_count == 1:
+        return [frame_count // 2]
+    return sorted(set(int(round(x)) for x in torch.linspace(0, frame_count - 1, sample_count).tolist()))
+
+
+_LPIPS_MEAN = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(1, 3, 1, 1)
+_LPIPS_STD = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(1, 3, 1, 1)
+
+
+@lru_cache(maxsize=4)
+def _get_lpips_model(device_type: str) -> Optional[nn.Module]:
+    try:
+        import lpips
+    except Exception as exc:  # pragma: no cover - optional dependency
+        logger.warning("lpips package unavailable, trying VGG perceptual fallback: %s", exc)
+        return None
+
+    try:
+        model = lpips.LPIPS(net="vgg", verbose=False).eval()
+    except Exception as exc:  # pragma: no cover - package/weight issue
+        logger.warning("Failed to initialize LPIPS VGG model, trying VGG perceptual fallback: %s", exc)
+        return None
+
+    model.requires_grad_(False)
+    return model.to(device=device_type)
+
+
+@lru_cache(maxsize=4)
+def _get_vgg16_feature_slices(device_type: str) -> Optional[tuple[nn.Module, ...]]:
+    try:
+        from torchvision.models import VGG16_Weights, vgg16
+    except Exception as exc:  # pragma: no cover - optional dependency
+        logger.warning("torchvision VGG16 unavailable, using lightweight perceptual proxy: %s", exc)
+        return None
+
+    try:
+        weights = VGG16_Weights.IMAGENET1K_V1
+        vgg = vgg16(weights=weights).features.eval()
+    except Exception as exc:  # pragma: no cover - optional weights/download failure
+        logger.warning("Failed to load pretrained VGG16 weights, using lightweight perceptual proxy: %s", exc)
+        return None
+
+    vgg.requires_grad_(False)
+    vgg = vgg.to(device=device_type)
+    slices = (
+        nn.Sequential(*vgg[:4]),
+        nn.Sequential(*vgg[4:9]),
+        nn.Sequential(*vgg[9:16]),
+        nn.Sequential(*vgg[16:23]),
+    )
+    for module in slices:
+        module.requires_grad_(False)
+        module.eval()
+    return slices
+
+
+def _feature_pyramid_loss(recon: torch.Tensor, target: torch.Tensor, backend: str) -> torch.Tensor:
+    """Perceptual loss with real LPIPS first, then VGG/proxy fallbacks.
+
+    Explicit backends fail if unavailable; auto degrades to the next option.
+    """
+
+    backend = backend.lower()
+    if backend not in {"auto", "lpips", "vgg16", "proxy"}:
+        raise ValueError(f"Unsupported feature_loss_backend: {backend}")
+
+    if backend in {"auto", "lpips"}:
+        lpips_model = _get_lpips_model(recon.device.type)
+        if lpips_model is not None:
+            return lpips_model(recon.float(), target.float(), normalize=False).mean()
+        if backend == "lpips":
+            raise RuntimeError("feature_loss_backend=lpips requested, but the lpips package/model is unavailable")
+
+    if backend in {"auto", "vgg16"}:
+        slices = _get_vgg16_feature_slices(recon.device.type)
+        if slices is not None:
+            recon_in = ((recon.float() + 1.0) * 0.5).clamp(0.0, 1.0)
+            target_in = ((target.float() + 1.0) * 0.5).clamp(0.0, 1.0)
+            mean = _LPIPS_MEAN.to(device=recon.device, dtype=recon_in.dtype)
+            std = _LPIPS_STD.to(device=recon.device, dtype=recon_in.dtype)
+            recon_in = (recon_in - mean) / std
+            target_in = (target_in - mean) / std
+
+            loss = torch.zeros((), device=recon.device, dtype=recon.float().dtype)
+            x = recon_in
+            y = target_in
+            for block in slices:
+                x = block(x)
+                y = block(y)
+                x_norm = F.normalize(x, p=2, dim=1, eps=1e-10)
+                y_norm = F.normalize(y, p=2, dim=1, eps=1e-10)
+                loss = loss + (x_norm - y_norm).square().mean(dim=(1, 2, 3)).mean()
+            return loss
+        if backend == "vgg16":
+            raise RuntimeError("feature_loss_backend=vgg16 requested, but pretrained torchvision VGG16 is unavailable")
+
+    if backend == "auto":
+        logger.warning("Using lightweight perceptual proxy because LPIPS and VGG16 backends are unavailable")
+    elif backend != "proxy":
+        raise RuntimeError(f"feature_loss_backend={backend} is unavailable")
+
+    def _gray(x: torch.Tensor) -> torch.Tensor:
+        return x.mean(dim=1, keepdim=True)
+
+    def _sobel_features(x: torch.Tensor) -> torch.Tensor:
+        gray = _gray(x)
+        kx = torch.tensor(
+            [[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]],
+            device=x.device,
+            dtype=x.dtype,
+        ).view(1, 1, 3, 3)
+        ky = torch.tensor(
+            [[-1.0, -2.0, -1.0], [0.0, 0.0, 0.0], [1.0, 2.0, 1.0]],
+            device=x.device,
+            dtype=x.dtype,
+        ).view(1, 1, 3, 3)
+        lap = torch.tensor(
+            [[0.0, 1.0, 0.0], [1.0, -4.0, 1.0], [0.0, 1.0, 0.0]],
+            device=x.device,
+            dtype=x.dtype,
+        ).view(1, 1, 3, 3)
+        fx = F.conv2d(gray, kx, padding=1)
+        fy = F.conv2d(gray, ky, padding=1)
+        fl = F.conv2d(gray, lap, padding=1)
+        blur = F.avg_pool2d(x, kernel_size=3, stride=1, padding=1)
+        return torch.cat([x, blur, fx, fy, fl], dim=1)
+
+    total = torch.zeros((), device=recon.device, dtype=recon.dtype)
+    recon_level = recon
+    target_level = target
+    for _ in range(3):
+        total = total + F.l1_loss(_sobel_features(recon_level), _sobel_features(target_level))
+        if min(int(recon_level.shape[-2]), int(recon_level.shape[-1])) < 8:
+            break
+        recon_level = F.avg_pool2d(recon_level, kernel_size=2, stride=2)
+        target_level = F.avg_pool2d(target_level, kernel_size=2, stride=2)
+    return total
+
+
+def _frequency_distribution_loss(recon: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    recon_gray = recon.float().mean(dim=1)
+    target_gray = target.float().mean(dim=1)
+    recon_fft = torch.fft.rfft2(recon_gray)
+    target_fft = torch.fft.rfft2(target_gray)
+    recon_mag = torch.log1p(recon_fft.abs())
+    target_mag = torch.log1p(target_fft.abs())
+
+    height = recon_mag.shape[-2]
+    width = recon_mag.shape[-1]
+    y_freq = torch.fft.fftfreq(height, device=recon.device).abs().view(1, height, 1)
+    x_freq_len = max((width - 1) * 2, 1)
+    x_freq = torch.fft.rfftfreq(x_freq_len, device=recon.device).abs().view(1, 1, width)
+    freq_weight = torch.sqrt(y_freq.square() + x_freq.square())
+    freq_weight = freq_weight / freq_weight.max().clamp_min(1e-6)
+    freq_weight = 0.25 + 0.75 * freq_weight
+    return ((recon_mag - target_mag).abs() * freq_weight).mean()
+
+
+class PatchDiscriminator(nn.Module):
+    def __init__(self, in_channels: int = 3, base_channels: int = 64, max_channels: int = 512, num_layers: int = 4):
+        super().__init__()
+        layers: list[nn.Module] = []
+        channels = base_channels
+        layers.append(nn.utils.spectral_norm(nn.Conv2d(in_channels, channels, kernel_size=4, stride=2, padding=1)))
+        layers.append(nn.LeakyReLU(0.2, inplace=True))
+        for _ in range(1, num_layers):
+            next_channels = min(channels * 2, max_channels)
+            layers.append(nn.utils.spectral_norm(nn.Conv2d(channels, next_channels, kernel_size=4, stride=2, padding=1)))
+            layers.append(nn.LeakyReLU(0.2, inplace=True))
+            channels = next_channels
+        layers.append(nn.utils.spectral_norm(nn.Conv2d(channels, channels, kernel_size=3, stride=1, padding=1)))
+        layers.append(nn.LeakyReLU(0.2, inplace=True))
+        layers.append(nn.utils.spectral_norm(nn.Conv2d(channels, 1, kernel_size=3, stride=1, padding=1)))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+def _gan_generator_loss(discriminator: nn.Module, fake_frames: torch.Tensor) -> torch.Tensor:
+    logits = discriminator(fake_frames)
+    return F.mse_loss(logits, torch.ones_like(logits))
+
+
+def _gan_discriminator_loss(discriminator: nn.Module, real_frames: torch.Tensor, fake_frames: torch.Tensor) -> torch.Tensor:
+    real_logits = discriminator(real_frames)
+    fake_logits = discriminator(fake_frames)
+    return 0.5 * (F.mse_loss(real_logits, torch.ones_like(real_logits)) + F.mse_loss(fake_logits, torch.zeros_like(fake_logits)))
+
+
 def compute_vae_loss(
     *,
     encoder: torch.nn.Module,
@@ -210,6 +462,7 @@ def compute_vae_loss(
     train_encoder: bool,
     reference_encoder: Optional[torch.nn.Module] = None,
     tiling_config: Optional[TilingConfig] = None,
+    discriminator: Optional[torch.nn.Module] = None,
 ) -> tuple[torch.Tensor, dict[str, float], torch.Tensor, torch.Tensor]:
     pixels = batch.pixels
     mask = batch.masks
@@ -253,6 +506,13 @@ def compute_vae_loss(
         if mask is not None:
             mask = mask[..., :height, :width]
 
+    if mask is not None:
+        recon_for_aux = recon * mask
+        target_for_aux = target * mask
+    else:
+        recon_for_aux = recon
+        target_for_aux = target
+
     recon_loss = _masked_mean(
         _elementwise_reconstruction_loss(recon, target, args.reconstruction_loss, args.charbonnier_eps),
         mask,
@@ -266,6 +526,30 @@ def compute_vae_loss(
         temporal_loss = (recon_delta - target_delta).abs().mean()
         total_loss = total_loss + temporal_loss * float(args.temporal_loss_weight)
 
+    feature_loss = torch.zeros((), device=total_loss.device, dtype=total_loss.dtype)
+    if float(getattr(args, "feature_loss_weight", 0.0)) > 0:
+        feature_loss = _feature_pyramid_loss(
+            _flatten_video_frames(recon_for_aux),
+            _flatten_video_frames(target_for_aux),
+            args.feature_loss_backend,
+        )
+        total_loss = total_loss + feature_loss * float(args.feature_loss_weight)
+
+    frequency_loss = torch.zeros((), device=total_loss.device, dtype=total_loss.dtype)
+    if float(getattr(args, "frequency_loss_weight", 0.0)) > 0:
+        frequency_loss = _frequency_distribution_loss(
+            _flatten_video_frames(recon_for_aux),
+            _flatten_video_frames(target_for_aux),
+        )
+        total_loss = total_loss + frequency_loss * float(args.frequency_loss_weight)
+
+    gan_gen_loss = torch.zeros((), device=total_loss.device, dtype=total_loss.dtype)
+    if discriminator is not None and float(getattr(args, "gan_loss_weight", 0.0)) > 0:
+        gan_frame_indices = _sample_frame_indices(int(recon.shape[2]), int(getattr(args, "gan_frame_sample_count", 4)))
+        recon_frames = recon[:, :, gan_frame_indices].contiguous().reshape(-1, recon.shape[1], recon.shape[-2], recon.shape[-1])
+        gan_gen_loss = _gan_generator_loss(discriminator, recon_frames)
+        total_loss = total_loss + gan_gen_loss * float(args.gan_loss_weight)
+
     latent_reg_loss = torch.zeros((), device=total_loss.device, dtype=total_loss.dtype)
     if train_encoder and reference_encoder is not None and float(args.latent_regularization_weight) > 0:
         with torch.no_grad():
@@ -278,6 +562,9 @@ def compute_vae_loss(
         "recon_loss": float(recon_loss.detach().float().cpu()),
         "temporal_loss": float(temporal_loss.detach().float().cpu()),
         "latent_reg_loss": float(latent_reg_loss.detach().float().cpu()),
+        "feature_loss": float(feature_loss.detach().float().cpu()),
+        "frequency_loss": float(frequency_loss.detach().float().cpu()),
+        "gan_gen_loss": float(gan_gen_loss.detach().float().cpu()),
     }
     return total_loss, metrics, recon.detach(), target.detach()
 
@@ -321,25 +608,47 @@ def load_vae_components(
     *,
     load_reference_encoder: bool,
 ) -> tuple[torch.nn.Module, torch.nn.Module, Optional[torch.nn.Module]]:
-    logger.info("Loading LTX-2 VAE encoder from %s", args.vae)
+    source_path = str(args.vae)
+    source_metadata = _load_checkpoint_metadata(source_path)
+    base_vae_path = args.vae_base or source_metadata.get("ss_vae_base") or None
+    source_has_encoder = _checkpoint_has_prefix(source_path, "vae.encoder.")
+    source_is_decoder_only = not source_has_encoder
+
+    if source_is_decoder_only and base_vae_path is None:
+        raise ValueError("Decoder-only VAE checkpoints need --vae_base or ss_vae_base metadata so the encoder can be restored")
+    if source_is_decoder_only:
+        args.vae_base = str(base_vae_path)
+
+    load_path = str(base_vae_path) if source_is_decoder_only else source_path
+    logger.info("Loading LTX-2 VAE encoder from %s", load_path)
     encoder = SingleGPUModelBuilder(
-        model_path=str(args.vae),
+        model_path=load_path,
         model_class_configurator=VideoEncoderConfigurator,
         model_sd_ops=VAE_ENCODER_COMFY_KEYS_FILTER,
     ).build(device=device, dtype=dtype)
 
-    logger.info("Loading LTX-2 VAE decoder from %s", args.vae)
+    logger.info("Loading LTX-2 VAE decoder from %s", load_path)
     decoder = SingleGPUModelBuilder(
-        model_path=str(args.vae),
+        model_path=load_path,
         model_class_configurator=VideoDecoderConfigurator,
         model_sd_ops=VAE_DECODER_COMFY_KEYS_FILTER,
     ).build(device=device, dtype=dtype)
 
+    if source_is_decoder_only:
+        logger.info("Overlaying decoder-only weights from %s", source_path)
+        decoder_sd = _load_prefixed_tensors(source_path, ("vae.decoder.", "vae.per_channel_statistics."), dtype=dtype)
+        missing_keys, unexpected_keys = decoder.load_state_dict(decoder_sd, strict=False)
+        if unexpected_keys:
+            logger.warning("Unexpected decoder-only checkpoint keys ignored: %s", sorted(unexpected_keys))
+        if missing_keys:
+            logger.info("Decoder-only overlay left base weights in place for missing keys: %s", sorted(missing_keys))
+
     reference_encoder = None
     if load_reference_encoder:
-        logger.info("Loading frozen reference encoder for latent regularization")
+        reference_path = str(args.vae_base or load_path)
+        logger.info("Loading frozen reference encoder for latent regularization from %s", reference_path)
         reference_encoder = SingleGPUModelBuilder(
-            model_path=str(args.vae),
+            model_path=reference_path,
             model_class_configurator=VideoEncoderConfigurator,
             model_sd_ops=VAE_ENCODER_COMFY_KEYS_FILTER,
         ).build(device=device, dtype=dtype)
@@ -361,6 +670,16 @@ def _build_optimizer(args: argparse.Namespace, parameters: Iterable[torch.nn.Par
         betas=(args.adam_beta1, args.adam_beta2),
         weight_decay=args.weight_decay,
         eps=args.adam_epsilon,
+    )
+
+
+def _build_discriminator_optimizer(args: argparse.Namespace, parameters: Iterable[torch.nn.Parameter]) -> torch.optim.Optimizer:
+    return torch.optim.AdamW(
+        parameters,
+        lr=args.discriminator_learning_rate,
+        betas=(args.discriminator_beta1, args.discriminator_beta2),
+        weight_decay=args.discriminator_weight_decay,
+        eps=args.discriminator_epsilon,
     )
 
 
@@ -465,8 +784,16 @@ def save_vae_checkpoint(
         "ss_reconstruction_loss_weight": str(args.reconstruction_loss_weight),
         "ss_temporal_loss_weight": str(args.temporal_loss_weight),
         "ss_latent_regularization_weight": str(args.latent_regularization_weight),
+        "ss_feature_loss_weight": str(args.feature_loss_weight),
+        "ss_feature_loss_backend": args.feature_loss_backend,
+        "ss_frequency_loss_weight": str(args.frequency_loss_weight),
+        "ss_gan_loss_weight": str(args.gan_loss_weight),
         "ss_vae_dtype": args.vae_dtype,
     }
+    if args.save_format == "decoder":
+        metadata["ss_vae_base"] = args.vae_base or args.vae or args.ltx2_checkpoint
+    elif args.vae_base is not None:
+        metadata["ss_vae_base"] = args.vae_base
     if args.save_dtype is not None:
         metadata["ss_save_dtype"] = args.save_dtype
     if val_loss is not None:
@@ -569,9 +896,7 @@ def evaluate(
     decoder.eval()
 
     losses: list[float] = []
-    for batch_idx, batch in enumerate(
-        _iter_raw_batches(datasets, args.max_data_loader_n_workers, shuffle_datasets=False)
-    ):
+    for batch_idx, batch in enumerate(_iter_raw_batches(datasets, args.max_data_loader_n_workers, shuffle_datasets=False)):
         if batch_idx >= max_batches:
             break
         prepared = prepare_batch(batch, device, dtype)
@@ -613,7 +938,7 @@ def train(args: argparse.Namespace) -> None:
 
     if args.vae is None:
         args.vae = args.ltx2_checkpoint
-    config_json = _load_ltx2_config_metadata(args.vae)
+    config_json = _load_ltx2_config_metadata_for_args(args)
     vae_dtype = str_to_dtype(args.vae_dtype)
     device = accelerator.device
 
@@ -623,6 +948,8 @@ def train(args: argparse.Namespace) -> None:
         raise ValueError("No image/video datasets found for VAE training")
 
     train_encoder = args.train_target == "encoder_decoder"
+    if args.save_format == "decoder" and train_encoder:
+        raise ValueError("--save_format decoder is only valid when --train_target decoder")
     load_reference_encoder = train_encoder and float(args.latent_regularization_weight) > 0
     encoder, decoder, reference_encoder = load_vae_components(
         args,
@@ -643,10 +970,41 @@ def train(args: argparse.Namespace) -> None:
     optimizer = _build_optimizer(args, (p for p in trainable_parameters if p.requires_grad))
     scheduler = _build_scheduler(args, optimizer)
 
+    discriminator = None
+    discriminator_optimizer = None
+    if float(args.gan_loss_weight) > 0:
+        discriminator = PatchDiscriminator(
+            in_channels=3,
+            base_channels=args.gan_base_channels,
+            max_channels=args.gan_max_channels,
+            num_layers=args.gan_num_layers,
+        ).to(device=device, dtype=torch.float32)
+        discriminator.train(True)
+        discriminator_optimizer = _build_discriminator_optimizer(args, (p for p in discriminator.parameters() if p.requires_grad))
+
     if train_encoder:
-        encoder, decoder, optimizer, scheduler = accelerator.prepare(encoder, decoder, optimizer, scheduler)
+        if discriminator is not None:
+            encoder, decoder, discriminator, optimizer, scheduler, discriminator_optimizer = accelerator.prepare(
+                encoder,
+                decoder,
+                discriminator,
+                optimizer,
+                scheduler,
+                discriminator_optimizer,
+            )
+        else:
+            encoder, decoder, optimizer, scheduler = accelerator.prepare(encoder, decoder, optimizer, scheduler)
     else:
-        decoder, optimizer, scheduler = accelerator.prepare(decoder, optimizer, scheduler)
+        if discriminator is not None:
+            decoder, discriminator, optimizer, scheduler, discriminator_optimizer = accelerator.prepare(
+                decoder,
+                discriminator,
+                optimizer,
+                scheduler,
+                discriminator_optimizer,
+            )
+        else:
+            decoder, optimizer, scheduler = accelerator.prepare(decoder, optimizer, scheduler)
 
     resume_global_step = 0
     resume_epoch = 0
@@ -691,6 +1049,8 @@ def train(args: argparse.Namespace) -> None:
         ):
             prepared = prepare_batch(raw_batch, device, vae_dtype)
             with accelerator.accumulate(decoder):
+                if discriminator is not None and float(args.gan_loss_weight) > 0:
+                    _set_requires_grad(discriminator, False)
                 with _amp_context(device, vae_dtype):
                     loss, metrics, recon, target = compute_vae_loss(
                         encoder=encoder,
@@ -700,6 +1060,7 @@ def train(args: argparse.Namespace) -> None:
                         train_encoder=train_encoder,
                         reference_encoder=reference_encoder,
                         tiling_config=tiling_config,
+                        discriminator=discriminator,
                     )
                 accelerator.backward(loss)
 
@@ -709,6 +1070,28 @@ def train(args: argparse.Namespace) -> None:
                     optimizer.step()
                     scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
+
+                    if discriminator is not None and discriminator_optimizer is not None and float(args.gan_loss_weight) > 0:
+                        _set_requires_grad(discriminator, True)
+                        discriminator_optimizer.zero_grad(set_to_none=True)
+                        gan_frame_indices = _sample_frame_indices(int(recon.shape[2]), int(args.gan_frame_sample_count))
+                        fake_frames = (
+                            recon[:, :, gan_frame_indices]
+                            .contiguous()
+                            .reshape(-1, recon.shape[1], recon.shape[-2], recon.shape[-1])
+                        )
+                        real_frames = (
+                            target[:, :, gan_frame_indices]
+                            .contiguous()
+                            .reshape(-1, target.shape[1], target.shape[-2], target.shape[-1])
+                        )
+                        disc_loss = _gan_discriminator_loss(discriminator, real_frames.float(), fake_frames.float())
+                        accelerator.backward(disc_loss)
+                        if args.max_grad_norm > 0:
+                            accelerator.clip_grad_norm_(discriminator.parameters(), args.max_grad_norm)
+                        discriminator_optimizer.step()
+                        discriminator_optimizer.zero_grad(set_to_none=True)
+                        _set_requires_grad(discriminator, False)
 
                     global_step += 1
                     last_recon = recon
@@ -720,13 +1103,16 @@ def train(args: argparse.Namespace) -> None:
 
                     if args.log_every_n_steps > 0 and global_step % args.log_every_n_steps == 0:
                         logger.info(
-                            "step=%d epoch=%d loss=%.6f recon=%.6f temporal=%.6f latent_reg=%.6f lr=%.3e",
+                            "step=%d epoch=%d loss=%.6f recon=%.6f temporal=%.6f latent_reg=%.6f feature=%.6f freq=%.6f gan=%.6f lr=%.3e",
                             global_step,
                             epoch,
                             metrics["loss"],
                             metrics["recon_loss"],
                             metrics["temporal_loss"],
                             metrics["latent_reg_loss"],
+                            metrics["feature_loss"],
+                            metrics["frequency_loss"],
+                            metrics["gan_gen_loss"],
                             scheduler.get_last_lr()[0],
                         )
 
@@ -842,13 +1228,26 @@ def setup_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dataset_config", type=str, required=True, help="Dataset TOML with image/video datasets")
     parser.add_argument("--ltx2_checkpoint", type=str, default=None, help="Base LTX-2 checkpoint. Used when --vae is omitted.")
     parser.add_argument("--vae", type=str, default=None, help="VAE checkpoint. Defaults to --ltx2_checkpoint.")
+    parser.add_argument(
+        "--vae_base",
+        type=str,
+        default=None,
+        help="Base full VAE checkpoint used to restore the encoder when --vae is a decoder-only checkpoint.",
+    )
     parser.add_argument("--output_dir", type=str, default="output")
     parser.add_argument("--output_name", type=str, default="ltx2_vae")
     parser.add_argument("--train_target", type=str, default="decoder", choices=["decoder", "encoder_decoder"])
-    parser.add_argument("--save_format", type=str, default="full", choices=["full", "decoder"],
-                        help="full saves frozen/trained encoder plus decoder; decoder saves decoder-only.")
+    parser.add_argument(
+        "--save_format",
+        type=str,
+        default="full",
+        choices=["full", "decoder"],
+        help="full saves frozen/trained encoder plus decoder; decoder saves decoder-only weights with base metadata.",
+    )
 
-    parser.add_argument("--vae_dtype", type=str, default="bfloat16", choices=["float32", "fp32", "bfloat16", "bf16", "float16", "fp16"])
+    parser.add_argument(
+        "--vae_dtype", type=str, default="bfloat16", choices=["float32", "fp32", "bfloat16", "bf16", "float16", "fp16"]
+    )
     parser.add_argument("--save_dtype", type=str, default=None, choices=["float32", "fp32", "bfloat16", "bf16", "float16", "fp16"])
     parser.add_argument("--mixed_precision", type=str, default="bf16", choices=["no", "fp16", "bf16"])
     parser.add_argument("--seed", type=int, default=None)
@@ -870,19 +1269,53 @@ def setup_parser() -> argparse.ArgumentParser:
     parser.add_argument("--reconstruction_loss_weight", type=float, default=1.0)
     parser.add_argument("--charbonnier_eps", type=float, default=1e-3)
     parser.add_argument("--temporal_loss_weight", type=float, default=0.05)
-    parser.add_argument("--latent_regularization_weight", type=float, default=0.0,
-                        help="Only used with --train_target encoder_decoder; keeps new encoder latents near base encoder latents.")
+    parser.add_argument(
+        "--latent_regularization_weight",
+        type=float,
+        default=0.0,
+        help="Only used with --train_target encoder_decoder; keeps new encoder latents near base encoder latents.",
+    )
+    parser.add_argument("--feature_loss_weight", type=float, default=0.0, help="Perceptual loss weight.")
+    parser.add_argument(
+        "--feature_loss_backend",
+        type=str,
+        default="auto",
+        choices=["auto", "lpips", "vgg16", "proxy"],
+        help="Perceptual backend. Use lpips to require true LPIPS; auto falls back to VGG16/proxy.",
+    )
+    parser.add_argument("--frequency_loss_weight", type=float, default=0.0, help="Frequency-domain distribution loss.")
+    parser.add_argument("--gan_loss_weight", type=float, default=0.0, help="PatchGAN generator loss weight.")
+    parser.add_argument("--gan_frame_sample_count", type=int, default=4, help="How many frames per sample to feed into GAN loss.")
+    parser.add_argument("--gan_base_channels", type=int, default=64)
+    parser.add_argument("--gan_max_channels", type=int, default=512)
+    parser.add_argument("--gan_num_layers", type=int, default=4)
+    parser.add_argument("--discriminator_learning_rate", type=float, default=1e-4)
+    parser.add_argument("--discriminator_beta1", type=float, default=0.5)
+    parser.add_argument("--discriminator_beta2", type=float, default=0.999)
+    parser.add_argument("--discriminator_weight_decay", type=float, default=0.0)
+    parser.add_argument("--discriminator_epsilon", type=float, default=1e-8)
 
     parser.add_argument("--decode_timestep", type=float, default=0.05)
     parser.add_argument("--decode_noise_scale", type=float, default=0.025)
-    parser.add_argument("--disable_decode_noise", action="store_true",
-                        help="Disable decoder latent noise injection for deterministic reconstruction training.")
+    parser.add_argument(
+        "--disable_decode_noise",
+        action="store_true",
+        help="Disable decoder latent noise injection for deterministic reconstruction training.",
+    )
     parser.add_argument("--vae_chunk_size", type=int, default=None, help="Set CausalConv3d temporal chunk size")
-    parser.add_argument("--vae_spatial_tile_size", type=int, default=None,
-                        help="No-grad encoder tiling size in pixels. Decoder tiling is not used for training.")
+    parser.add_argument(
+        "--vae_spatial_tile_size",
+        type=int,
+        default=None,
+        help="No-grad encoder tiling size in pixels. Decoder tiling is not used for training.",
+    )
     parser.add_argument("--vae_spatial_tile_overlap", type=int, default=64)
-    parser.add_argument("--vae_temporal_tile_size", type=int, default=None,
-                        help="No-grad encoder tiling size in frames. Decoder tiling is not used for training.")
+    parser.add_argument(
+        "--vae_temporal_tile_size",
+        type=int,
+        default=None,
+        help="No-grad encoder tiling size in frames. Decoder tiling is not used for training.",
+    )
     parser.add_argument("--vae_temporal_tile_overlap", type=int, default=24)
 
     parser.add_argument("--max_data_loader_n_workers", type=int, default=max(1, min(8, (os.cpu_count() or 2) - 1)))
