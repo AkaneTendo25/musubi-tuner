@@ -3620,6 +3620,8 @@ accelerate launch --num_processes 1 --num_cpu_threads_per_process 1 --mixed_prec
 
 For longer runs, start with video-only short-context training until checkpoint save and resume have been validated on the target GPU.
 
+**FP8 full fine-tuning (`--fp8_fft`).** Replaces attention/FFN `Linear` layers with FP8 forward/backward GEMMs (`torch._scaled_mm`, per-tensor dynamic scaling) over bf16 master weights; optimizer-agnostic. Requires FP8 tensor cores (compute capability ≥ 8.9; Ada/Hopper). At `832x480x49`: ~10 GB less than bf16, ~1.05x step time with the region-compiled GEMM (`--fp8_fft_compile`, default on; ~1.4x without). Not a 24 GB-class path — use the int8 routes above for that. Flags: `--fp8_fft_targets` (same tokens as `--qgalore_targets`), `--fp8_fft_grad_dtype {e4m3,e5m2}`, `--fp8_fft_min_numel`, `--fp8_fft_compile`. Mutually exclusive with `--qgalore_full_ft`, `--fp8_scaled`, `--ltx2_model_parallel`.
+
 ---
 
 ## References

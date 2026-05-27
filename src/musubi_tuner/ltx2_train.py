@@ -3632,6 +3632,45 @@ def main() -> None:
                 "Q-GaLore full-FT did not replace any Linear modules; check --qgalore_targets and --qgalore_min_weight_numel."
             )
 
+    fp8_fft_summary = None
+    if bool(getattr(args, "fp8_fft", False)):
+        if bool(getattr(args, "qgalore_full_ft", False)):
+            raise ValueError("--fp8_fft is mutually exclusive with --qgalore_full_ft (both replace the same Linear layers).")
+        if bool(getattr(args, "fp8_scaled", False)):
+            raise ValueError(
+                "--fp8_fft is mutually exclusive with --fp8_scaled (fp8_scaled is weight-storage for inference/LoRA, not FP8 training)."
+            )
+        if ltx2_model_parallel:
+            raise ValueError("--fp8_fft is not yet supported together with --ltx2_model_parallel.")
+        from musubi_tuner.modules.fp8_training import (
+            assert_fp8_training_supported,
+            convert_ltx2_to_fp8_training,
+            resolve_fp8_dtype,
+        )
+
+        assert_fp8_training_supported()
+        fp8_fft_summary = convert_ltx2_to_fp8_training(
+            transformer,
+            targets=getattr(args, "fp8_fft_targets", "video"),
+            grad_dtype=resolve_fp8_dtype(getattr(args, "fp8_fft_grad_dtype", "e4m3")),
+            min_weight_numel=int(getattr(args, "fp8_fft_min_numel", 16384) or 0),
+            compile_gemm=bool(getattr(args, "fp8_fft_compile", True)),
+        )
+        logger.info(
+            "FP8 full-FT: replaced %d Linear layers (%.3fB params) targets=%s grad_dtype=%s compile=%s "
+            "skipped_not_target=%d skipped_dims=%d skipped_small=%d",
+            fp8_fft_summary.replaced,
+            float(fp8_fft_summary.replaced_numel) / 1_000_000_000.0,
+            getattr(args, "fp8_fft_targets", "video"),
+            getattr(args, "fp8_fft_grad_dtype", "e4m3"),
+            bool(getattr(args, "fp8_fft_compile", True)),
+            fp8_fft_summary.skipped_not_target,
+            fp8_fft_summary.skipped_dims,
+            fp8_fft_summary.skipped_small,
+        )
+        if fp8_fft_summary.replaced <= 0:
+            raise ValueError("--fp8_fft did not replace any Linear modules; check --fp8_fft_targets / --fp8_fft_min_numel.")
+
     ltx2_model_parallel_plan = None
     if ltx2_model_parallel:
         ltx2_model_parallel_plan = enable_ltx2_model_parallel(transformer, args)
