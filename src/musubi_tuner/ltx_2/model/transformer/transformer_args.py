@@ -345,15 +345,15 @@ class MultiModalTransformerArgsPreprocessor:
             x_dtype=modality.latent.dtype,
         )
 
-        cross_timestep = modality.timesteps
+        cross_gate_timestep = modality.timesteps
         if cross_modality is not None and getattr(cross_modality, "sigma", None) is not None:
-            sigma = cross_modality.sigma
-            if sigma.ndim == 1:
-                sigma = sigma.view(modality.timesteps.shape[0], 1)
-            cross_timestep = sigma.view(modality.timesteps.shape[0], 1).expand_as(modality.timesteps)
+            cross_gate_timestep = cross_modality.sigma
+            if cross_gate_timestep.ndim == 1:
+                cross_gate_timestep = cross_gate_timestep.view(modality.timesteps.shape[0], 1)
 
         cross_scale_shift_timestep, cross_gate_timestep = self._prepare_cross_attention_timestep(
-            timestep=cross_timestep,
+            scale_shift_timestep=modality.timesteps,
+            gate_timestep=cross_gate_timestep,
             timestep_scale_multiplier=self.simple_preprocessor.timestep_scale_multiplier,
             batch_size=transformer_args.x.shape[0],
             hidden_dtype=modality.latent.dtype,
@@ -368,23 +368,25 @@ class MultiModalTransformerArgsPreprocessor:
 
     def _prepare_cross_attention_timestep(
         self,
-        timestep: torch.Tensor,
+        scale_shift_timestep: torch.Tensor,
+        gate_timestep: torch.Tensor,
         timestep_scale_multiplier: int,
         batch_size: int,
         hidden_dtype: torch.dtype,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Prepare cross attention timestep embeddings."""
-        timestep = timestep * timestep_scale_multiplier
+        scale_shift_timestep = scale_shift_timestep * timestep_scale_multiplier
+        gate_timestep = gate_timestep * timestep_scale_multiplier
 
         av_ca_factor = self.av_ca_timestep_scale_multiplier / timestep_scale_multiplier
 
         scale_shift_timestep, _ = self.cross_scale_shift_adaln(
-            timestep.flatten(),
+            scale_shift_timestep.flatten(),
             hidden_dtype=hidden_dtype,
         )
         scale_shift_timestep = scale_shift_timestep.view(batch_size, -1, scale_shift_timestep.shape[-1])
         gate_noise_timestep, _ = self.cross_gate_adaln(
-            timestep.flatten() * av_ca_factor,
+            gate_timestep.flatten() * av_ca_factor,
             hidden_dtype=hidden_dtype,
         )
         gate_noise_timestep = gate_noise_timestep.view(batch_size, -1, gate_noise_timestep.shape[-1])
