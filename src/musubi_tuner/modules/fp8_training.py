@@ -40,7 +40,7 @@ def assert_fp8_training_supported(device: torch.device | int | None = None) -> N
     if not is_fp8_training_supported(device):
         cap = torch.cuda.get_device_capability(device) if torch.cuda.is_available() else None
         raise RuntimeError(
-            f"--fp8_fft requires FP8 tensor cores (compute capability >= 8.9 / Ada or Hopper); "
+            f"--fp8_gemm requires FP8 tensor cores (compute capability >= 8.9 / Ada or Hopper); "
             f"got {cap}. torch._scaled_mm cannot run FP8 GEMMs on this GPU. "
             f"Use int8 full-FT (--qgalore_full_ft) on pre-Ada hardware instead."
         )
@@ -86,7 +86,7 @@ def _fp8_gemm_compiled(*args) -> torch.Tensor:
         return _scaled_matmul_compiled(*args)
     except Exception as e:  # noqa: BLE001
         if not _compile_disabled:
-            logger.warning("--fp8_fft_compile: compiled FP8 GEMM failed (%s); using eager FP8 GEMM.", e)
+            logger.warning("--fp8_gemm_compile: compiled FP8 GEMM failed (%s); using eager FP8 GEMM.", e)
             _compile_disabled = True
         return _scaled_matmul(*args)
 
@@ -112,7 +112,7 @@ def _get_matmul(compile_gemm: bool) -> Callable[..., torch.Tensor]:
             _scaled_matmul_compiled = torch.compile(_scaled_matmul, dynamic=False)
         except Exception as e:  # noqa: BLE001
             _compile_disabled = True
-            logger.warning("--fp8_fft_compile: torch.compile unavailable (%s); using eager FP8 GEMM.", e)
+            logger.warning("--fp8_gemm_compile: torch.compile unavailable (%s); using eager FP8 GEMM.", e)
             return _scaled_matmul
     return _fp8_gemm_compiled
 
@@ -171,7 +171,7 @@ class Fp8FftSummary:
 def ltx2_fp8_filter(targets: str | Iterable[str] = "video", min_weight_numel: int = 16384) -> Callable[[nn.Linear, str], bool]:
     """Filter for the big LTX-2 attention/FFN GEMMs; excludes gates, norms, AdaLN.
 
-    Reuses Q-GaLore's LTX-2 target matching so --fp8_fft_targets behaves like
+    Reuses Q-GaLore's LTX-2 target matching so --fp8_gemm_targets behaves like
     --qgalore_targets (video / audio / attn / ff / blocks / all).
     """
     from musubi_tuner.optimizers.q_galore import _matches_ltx2_target, _parse_target_tokens

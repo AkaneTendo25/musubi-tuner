@@ -827,7 +827,7 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         help="W8A8 quantization format: int8 (Turing+, default) or fp8 (Ada Lovelace+).",
     )
     parser.add_argument(
-        "--fp8_fft",
+        "--fp8_gemm",
         action="store_true",
         help=(
             "Full-parameter fine-tuning in FP8: replace attention/FFN Linear layers with "
@@ -837,30 +837,30 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         ),
     )
     parser.add_argument(
-        "--fp8_fft_targets",
+        "--fp8_gemm_targets",
         type=str,
         default="video",
         help="Which LTX-2 Linear layers to run in FP8 (same tokens as --qgalore_targets: video/audio/attn/ff/blocks/all).",
     )
     parser.add_argument(
-        "--fp8_fft_grad_dtype",
+        "--fp8_gemm_grad_dtype",
         type=str,
         default="e4m3",
         choices=["e4m3", "e5m2"],
         help="FP8 format for gradients. e4m3 (default) is more accurate; e5m2 has wider range (safer against gradient spikes).",
     )
     parser.add_argument(
-        "--fp8_fft_min_numel",
+        "--fp8_gemm_min_numel",
         type=int,
         default=16384,
-        help="Skip Linear layers with fewer than this many weight elements when applying --fp8_fft.",
+        help="Skip Linear layers with fewer than this many weight elements when applying --fp8_gemm.",
     )
     parser.add_argument(
-        "--fp8_fft_compile",
+        "--fp8_gemm_compile",
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Region-compile the FP8 GEMM (torch.compile) to fuse the per-tensor scaling. "
-        "On by default; ~halves the FP8 GEMM step time with no quality change. Use --no-fp8_fft_compile to disable.",
+        "On by default; ~halves the FP8 GEMM step time with no quality change. Use --no-fp8_gemm_compile to disable.",
     )
     parser.add_argument(
         "--nf4_base",
