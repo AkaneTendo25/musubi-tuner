@@ -863,6 +863,43 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         "On by default; ~halves the FP8 GEMM step time with no quality change. Use --no-fp8_gemm_compile to disable.",
     )
     parser.add_argument(
+        "--int8_weights",
+        action="store_true",
+        help=(
+            "Full-parameter fine-tuning with int8-quantized resident weights (1 byte/param, no bf16 master); "
+            "the optimizer updates them in place with stochastic rounding. Forward/backward dequantize to bf16, "
+            "so no FP8 tensor cores are required (runs on Ampere). Requires --fused_backward_pass and a factored "
+            "optimizer (Adafactor) for the memory win. Mutually exclusive with --fp8_gemm / --qgalore_full_ft / --fp8_scaled."
+        ),
+    )
+    parser.add_argument(
+        "--int8_weights_targets",
+        type=str,
+        default="video",
+        help="Which LTX-2 Linear layers to store in int8 (same tokens as --qgalore_targets: video/audio/attn/ff/blocks/all).",
+    )
+    parser.add_argument(
+        "--int8_weights_min_numel",
+        type=int,
+        default=16384,
+        help="Skip Linear layers with fewer than this many weight elements when applying --int8_weights.",
+    )
+    parser.add_argument(
+        "--int8_weights_group_size",
+        type=int,
+        default=0,
+        help="int8 quantization granularity for --int8_weights: 0 = row-wise (one scale per output channel); "
+        ">0 = group-wise along the input dim (e.g. 128/256 — finer scales, lower error and less update drift).",
+    )
+    parser.add_argument(
+        "--int8_weights_outlier_quantile",
+        type=float,
+        default=1.0,
+        help="set the int8 scale from a per-row/group quantile of |w| instead of the absmax (default 1.0 = absmax). "
+        "Values like 0.999 clip the top 0.1%% of weights to ±127·scale, giving the bulk a tighter grid — "
+        "useful when a heavy outlier tail inflates absmax and coarsens every other weight.",
+    )
+    parser.add_argument(
         "--nf4_base",
         action="store_true",
         help="use NF4 4-bit quantization for base DiT model (reduces VRAM ~75%%)",

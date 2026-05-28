@@ -3622,6 +3622,8 @@ For longer runs, start with video-only short-context training until checkpoint s
 
 **FP8 full fine-tuning (`--fp8_gemm`).** Replaces attention/FFN `Linear` layers with FP8 forward/backward GEMMs (`torch._scaled_mm`, per-tensor dynamic scaling) over bf16 master weights; optimizer-agnostic. Requires FP8 tensor cores (compute capability ≥ 8.9; Ada/Hopper). At `832x480x49`: ~10 GB less than bf16, ~1.05x step time with the region-compiled GEMM (`--fp8_gemm_compile`, default on; ~1.4x without). Not a 24 GB-class path — use the int8 routes above for that. Flags: `--fp8_gemm_targets` (same tokens as `--qgalore_targets`), `--fp8_gemm_grad_dtype {e4m3,e5m2}`, `--fp8_gemm_min_numel`, `--fp8_gemm_compile`. Mutually exclusive with `--qgalore_full_ft`, `--fp8_scaled`, `--ltx2_model_parallel`.
 
+**Int8 full fine-tuning (`--int8_weights`).** Stores trainable `Linear` weights as int8 (symmetric, per-row or per-group scale) with no bf16 master; the optimizer updates the int8 storage in place via stochastic rounding, while forward/backward dequantize to bf16 for the GEMM. Requires `--fused_backward_pass` and a factored optimizer (Adafactor) so bf16 gradients do not all materialize at once. At `832x480x49`: ~43 GB peak / ~3.4 s/step on the video target set. Flags: `--int8_weights_targets` (same tokens as `--qgalore_targets`), `--int8_weights_group_size 128` for group-wise scales (finer grid, lower per-step quantization noise), `--int8_weights_outlier_quantile 0.999` to set the scale from a per-row/group quantile of `|w|` rather than the absmax (clips a heavy outlier tail to tighten the bulk grid), `--int8_weights_min_numel` to skip small layers. Mutually exclusive with `--fp8_gemm`, `--qgalore_full_ft`, `--fp8_scaled`.
+
 ---
 
 ## References

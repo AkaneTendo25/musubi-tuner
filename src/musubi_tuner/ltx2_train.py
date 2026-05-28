@@ -3671,6 +3671,47 @@ def main() -> None:
         if fp8_gemm_summary.replaced <= 0:
             raise ValueError("--fp8_gemm did not replace any Linear modules; check --fp8_gemm_targets / --fp8_gemm_min_numel.")
 
+    int8_weights_summary = None
+    if bool(getattr(args, "int8_weights", False)):
+        if bool(getattr(args, "fp8_gemm", False)):
+            raise ValueError("--int8_weights is mutually exclusive with --fp8_gemm.")
+        if bool(getattr(args, "qgalore_full_ft", False)):
+            raise ValueError("--int8_weights is mutually exclusive with --qgalore_full_ft (both replace the same Linear weights).")
+        if bool(getattr(args, "fp8_scaled", False)):
+            raise ValueError("--int8_weights is mutually exclusive with --fp8_scaled.")
+        if ltx2_model_parallel:
+            raise ValueError("--int8_weights is not yet supported together with --ltx2_model_parallel.")
+        if not bool(getattr(args, "fused_backward_pass", False)):
+            raise ValueError(
+                "--int8_weights requires --fused_backward_pass; otherwise full bf16 gradients for all weights "
+                "materialize at once (~2 bytes/param) and negate the int8 weight saving."
+            )
+        from musubi_tuner.modules.int8_training import convert_to_int8_training
+        from musubi_tuner.modules.fp8_training import ltx2_fp8_filter
+
+        _i8_min = int(getattr(args, "int8_weights_min_numel", 16384) or 0)
+        _i8_target = ltx2_fp8_filter(getattr(args, "int8_weights_targets", "video"), _i8_min)
+
+        def _i8_keep(mod, fqn):
+            return bool(_i8_target(mod, fqn)) and mod.weight.numel() >= _i8_min
+
+        _i8_group = int(getattr(args, "int8_weights_group_size", 0) or 0)
+        _i8_outlier_q = float(getattr(args, "int8_weights_outlier_quantile", 1.0) or 1.0)
+        int8_weights_summary = convert_to_int8_training(
+            transformer, filter_fn=_i8_keep, group_size=_i8_group, outlier_clip_quantile=_i8_outlier_q
+        )
+        logger.info(
+            "int8 weight-only QT: replaced %d Linear layers targets=%s group_size=%d outlier_clip_quantile=%g (1 byte/param, stochastic-rounding updates)",
+            int8_weights_summary,
+            getattr(args, "int8_weights_targets", "video"),
+            _i8_group,
+            _i8_outlier_q,
+        )
+        if int8_weights_summary <= 0:
+            raise ValueError(
+                "--int8_weights did not replace any Linear modules; check --int8_weights_targets / --int8_weights_min_numel."
+            )
+
     ltx2_model_parallel_plan = None
     if ltx2_model_parallel:
         ltx2_model_parallel_plan = enable_ltx2_model_parallel(transformer, args)
@@ -4679,6 +4720,8 @@ def main() -> None:
         ckpt_file = os.path.join(args.output_dir, ckpt_name)
 
         accelerator.print(f"\nsaving checkpoint: {ckpt_file}")
+        if torch.cuda.is_available():
+            accelerator.print(f"peak VRAM (torch.cuda.max_memory_allocated): {torch.cuda.max_memory_allocated() / 1024**3:.2f} GB")
         metadata["ss_training_finished_at"] = str(time.time())
         metadata["ss_steps"] = str(steps)
         metadata["ss_epoch"] = str(epoch_no)
@@ -4738,6 +4781,11 @@ def main() -> None:
                 lazy=streaming_qgalore_save,
                 device=getattr(args, "qgalore_streaming_dequantize_device", "cpu") if streaming_qgalore_save else None,
             )
+        if bool(getattr(args, "int8_weights", False)):
+            # dequantize Int8QTWeight -> bf16 so the checkpoint is a standard, directly loadable file
+            from musubi_tuner.modules.int8_training import Int8QTWeight
+
+            state_dict = {k: (v.dequantize() if isinstance(v, Int8QTWeight) else v) for k, v in state_dict.items()}
         state_dict, extra_meta = _prepare_state_dict_for_save(state_dict, args)
         if extra_meta:
             metadata_to_save.update(extra_meta)

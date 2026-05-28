@@ -68,8 +68,13 @@ def adafactor_step_param(self, p, group):
         else:
             state["exp_avg_sq"] = state["exp_avg_sq"].to(grad)
 
+    # Int8QTWeight (int8 weight-only QT): work on a plain dequantized fp32 copy, then
+    # write back via p.copy_(), which re-quantizes to int8 with stochastic rounding.
+    is_int8_qt = hasattr(p, "int_data") and hasattr(p, "dequantize")
     p_data_fp32 = p
-    if p.dtype in {torch.float16, torch.bfloat16}:
+    if is_int8_qt:
+        p_data_fp32 = p.dequantize().float()
+    elif p.dtype in {torch.float16, torch.bfloat16}:
         p_data_fp32 = p_data_fp32.float()
 
     state["step"] += 1
@@ -110,7 +115,9 @@ def adafactor_step_param(self, p, group):
     # if p.dtype in {torch.float16, torch.bfloat16}:
     #    p.copy_(p_data_fp32)
 
-    if p.dtype == torch.bfloat16:
+    if is_int8_qt:
+        p.copy_(p_data_fp32)
+    elif p.dtype == torch.bfloat16:
         copy_stochastic_(p, p_data_fp32)
     elif p.dtype == torch.float16:
         p.copy_(p_data_fp32)
