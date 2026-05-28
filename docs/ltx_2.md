@@ -3669,6 +3669,7 @@ For longer runs, start with video-only short-context training until checkpoint s
 - [diffusion-pipe](https://github.com/tdrussell/diffusion-pipe) — Pipeline-parallel diffusion model trainer with LTX-Video and LTX 2.3 support; initial LTX 2.3 support covers T2I/T2V training, without audio
 - [DiffSynth-Studio](https://github.com/modelscope/DiffSynth-Studio) — ModelScope diffusion synthesis framework with LTX-2/2.3 support
 - [SimpleTuner](https://github.com/bghira/SimpleTuner) — Multi-model fine-tuning framework with LTX-2/2.3 support; `--crepa backbone` mode is inspired by its LayerSync regularizer
+- [rs-nodes](https://github.com/richservo/rs-nodes) — ComfyUI node pack with an in-process LTX-2 LoRA trainer that reuses the already-loaded transformer; supports subject/style/motion training with divergence detection and quantization options
 
 **Community Resources**
 - [awesome-ltx2](https://github.com/wildminder/awesome-ltx2) — Curated list of LTX-2 resources, tools, models, and guides

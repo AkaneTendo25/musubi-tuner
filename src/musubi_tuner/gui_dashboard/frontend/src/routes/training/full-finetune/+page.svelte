@@ -646,6 +646,34 @@
 			</div>
 		</FormGroup>
 
+		<FormGroup title="FP8 GEMM (full-FT, sm_89+)">
+			<div class="space-y-2 pt-2">
+				<div class="grid grid-cols-2 gap-x-4 gap-y-1">
+					<FormToggle fieldPath="full_finetune.fp8_gemm" checked={t.fp8_gemm ?? false} onchange={(e) => update('fp8_gemm', e.target.checked)} tooltip="Replace attention/FFN Linear layers with FP8 GEMMs. Mutually exclusive with LoRA / qgalore_full_ft / fp8_scaled." />
+					<FormToggle fieldPath="full_finetune.fp8_gemm_compile" checked={t.fp8_gemm_compile ?? true} onchange={(e) => update('fp8_gemm_compile', e.target.checked)} tooltip="Region-compile the FP8 GEMM to fuse per-tensor scaling (~halves step time)." />
+				</div>
+				<div class="grid grid-cols-2 gap-2">
+					<FormField fieldPath="full_finetune.fp8_gemm_targets" value={t.fp8_gemm_targets || 'video'} oninput={(e) => update('fp8_gemm_targets', e.target.value)} placeholder="video" tooltip="Which LTX-2 Linear layers to run in FP8 (video/audio/attn/ff/blocks/all)." />
+					<FormSelect fieldPath="full_finetune.fp8_gemm_grad_dtype" value={t.fp8_gemm_grad_dtype || 'e4m3'} options={['e4m3', 'e5m2']} onchange={(e) => update('fp8_gemm_grad_dtype', e.target.value)} tooltip="FP8 format for gradients. e4m3 = more accurate; e5m2 = wider range." />
+					<FormField type="number" fieldPath="full_finetune.fp8_gemm_min_numel" value={t.fp8_gemm_min_numel ?? 16384} oninput={(e) => update('fp8_gemm_min_numel', Number(e.target.value))} min={0} tooltip="Skip Linear layers with fewer than this many weight elements." />
+				</div>
+			</div>
+		</FormGroup>
+
+		<FormGroup title="Int8 weight-only (full-FT, Ampere+)">
+			<div class="space-y-2 pt-2">
+				<div class="grid grid-cols-2 gap-x-4 gap-y-1">
+					<FormToggle fieldPath="full_finetune.int8_weights" checked={t.int8_weights ?? false} onchange={(e) => update('int8_weights', e.target.checked)} tooltip="Store trainable Linear weights as int8 with stochastic-rounding updates. Requires fused_backward_pass and a factored optimizer. Mutually exclusive with fp8_gemm / qgalore_full_ft / fp8_scaled." />
+				</div>
+				<div class="grid grid-cols-2 gap-2">
+					<FormField fieldPath="full_finetune.int8_weights_targets" value={t.int8_weights_targets || 'video'} oninput={(e) => update('int8_weights_targets', e.target.value)} placeholder="video" tooltip="Which LTX-2 Linear layers to store in int8 (video/audio/attn/ff/blocks/all)." />
+					<FormField type="number" fieldPath="full_finetune.int8_weights_group_size" value={t.int8_weights_group_size ?? 0} oninput={(e) => update('int8_weights_group_size', Number(e.target.value))} min={0} tooltip="0 = row-wise (one scale per output channel); >0 = group-wise along input dim (128/256 = finer scales, less drift)." />
+					<FormField type="number" fieldPath="full_finetune.int8_weights_min_numel" value={t.int8_weights_min_numel ?? 16384} oninput={(e) => update('int8_weights_min_numel', Number(e.target.value))} min={0} tooltip="Skip Linear layers with fewer than this many weight elements." />
+					<FormField type="number" fieldPath="full_finetune.int8_weights_outlier_quantile" value={t.int8_weights_outlier_quantile ?? 1.0} oninput={(e) => update('int8_weights_outlier_quantile', Number(e.target.value))} min={0} max={1} step="0.001" tooltip="Set the int8 scale from a per-row/group quantile of |w| (default 1.0 = absmax). 0.999 clips the top 0.1% to give the bulk a tighter grid." />
+				</div>
+			</div>
+		</FormGroup>
+
 		<FormGroup title="APOLLO">
 			<div class="space-y-2 pt-2">
 				<div class="grid grid-cols-2 gap-2">
@@ -678,6 +706,7 @@
 					<FormToggle fieldPath="full_finetune.freeze_attn_geometry" checked={t.freeze_attn_geometry ?? false} onchange={(e) => update('freeze_attn_geometry', e.target.checked)} />
 					<FormToggle fieldPath="full_finetune.freeze_audio_params" checked={t.freeze_audio_params ?? false} onchange={(e) => update('freeze_audio_params', e.target.checked)} />
 					<FormField type="number" fieldPath="full_finetune.audio_param_lr_scale" value={t.audio_param_lr_scale ?? 1.0} oninput={(e) => update('audio_param_lr_scale', Number(e.target.value))} step="0.1" min={0} />
+					<FormToggle fieldPath="full_finetune.preserve_audio_timing" checked={t.preserve_audio_timing ?? false} onchange={(e) => update('preserve_audio_timing', e.target.checked)} tooltip="Preserve original audio duration by skipping audio time-stretching and duration alignment." />
 				</div>
 			</div>
 		</FormGroup>

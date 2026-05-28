@@ -130,6 +130,7 @@ class CachingConfig(BaseModel):
     ltx2_audio_dir: str = ""
     ltx2_audio_ext: str = ".wav"
     ltx2_audio_dtype: Optional[str] = None
+    preserve_audio_timing: bool = False
     audio_video_latent_channels: Optional[int] = None
     audio_video_latent_dtype: Optional[str] = None
     audio_only_target_resolution: Optional[int] = None
@@ -635,6 +636,9 @@ class TrainingConfig(BaseModel):
     video_loss_weight: float = 1.0
     audio_loss_weight: float = 1.0
 
+    # Audio timing (also applies to caching when set on training side)
+    preserve_audio_timing: bool = False
+
     # Misc
     separate_audio_buckets: bool = False
     max_data_loader_n_workers: Optional[int] = None
@@ -678,6 +682,20 @@ class FullFinetuneConfig(TrainingConfig):
     no_final_save: bool = False
     save_comfy_format: bool = False
     save_merged_checkpoint: bool = False
+
+    # FP8 GEMM full-FT (sm_89+, mutually exclusive with LoRA / qgalore_full_ft / fp8_scaled).
+    fp8_gemm: bool = False
+    fp8_gemm_targets: str = "video"
+    fp8_gemm_grad_dtype: Literal["e4m3", "e5m2"] = "e4m3"
+    fp8_gemm_min_numel: int = 16384
+    fp8_gemm_compile: bool = True
+
+    # int8 weight-only FFT (requires fused_backward_pass + factored optimizer).
+    int8_weights: bool = False
+    int8_weights_targets: str = "video"
+    int8_weights_min_numel: int = 16384
+    int8_weights_group_size: int = 0
+    int8_weights_outlier_quantile: float = 1.0
 
     # Q-GaLore full fine-tune.
     qgalore_full_ft: bool = False

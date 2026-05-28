@@ -292,6 +292,8 @@ def build_cache_latents_cmd(config: ProjectConfig) -> list[str]:
 
     if c.save_dataset_manifest:
         cmd += ["--save_dataset_manifest", c.save_dataset_manifest]
+    if getattr(c, "preserve_audio_timing", False):
+        cmd.append("--preserve_audio_timing")
 
     cmd += _split_cli_args(c.cache_latents_extra_args)
     return cmd
@@ -721,6 +723,8 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
             cmd += ["--awq_num_batches", str(t.awq_num_batches)]
     if t.quantize_device:
         cmd += ["--quantize_device", t.quantize_device]
+    if getattr(t, "preserve_audio_timing", False):
+        cmd.append("--preserve_audio_timing")
 
     # LoRA / Network
     cmd += ["--network_module", network_module]
@@ -1754,6 +1758,33 @@ def build_full_finetune_cmd(config: ProjectConfig) -> list[str]:
         cmd.append("--freeze_audio_params")
     if t.audio_param_lr_scale != 1.0:
         cmd += ["--audio_param_lr_scale", str(t.audio_param_lr_scale)]
+
+    # fp8_gemm full-FT (FP8 GEMM for attn/FFN Linears; sm_89+).
+    if getattr(t, "fp8_gemm", False):
+        cmd.append("--fp8_gemm")
+        if getattr(t, "fp8_gemm_targets", "video") != "video":
+            cmd += ["--fp8_gemm_targets", t.fp8_gemm_targets]
+        if getattr(t, "fp8_gemm_grad_dtype", "e4m3") != "e4m3":
+            cmd += ["--fp8_gemm_grad_dtype", t.fp8_gemm_grad_dtype]
+        if getattr(t, "fp8_gemm_min_numel", 16384) != 16384:
+            cmd += ["--fp8_gemm_min_numel", str(t.fp8_gemm_min_numel)]
+        if not getattr(t, "fp8_gemm_compile", True):
+            cmd.append("--no-fp8_gemm_compile")
+
+    # int8 weight-only full-FT (resident int8 weights + SR update).
+    if getattr(t, "int8_weights", False):
+        cmd.append("--int8_weights")
+        if getattr(t, "int8_weights_targets", "video") != "video":
+            cmd += ["--int8_weights_targets", t.int8_weights_targets]
+        if getattr(t, "int8_weights_min_numel", 16384) != 16384:
+            cmd += ["--int8_weights_min_numel", str(t.int8_weights_min_numel)]
+        if getattr(t, "int8_weights_group_size", 0) != 0:
+            cmd += ["--int8_weights_group_size", str(t.int8_weights_group_size)]
+        if getattr(t, "int8_weights_outlier_quantile", 1.0) != 1.0:
+            cmd += ["--int8_weights_outlier_quantile", str(t.int8_weights_outlier_quantile)]
+
+    if getattr(t, "preserve_audio_timing", False):
+        cmd.append("--preserve_audio_timing")
 
     # Q-GaLore
     if t.qgalore_full_ft:

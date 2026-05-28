@@ -7,6 +7,7 @@ import logging
 import locale
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -274,6 +275,60 @@ class LTX2SamplingMixin:
         audio_decoder.eval()
         vocoder.eval()
         return audio_decoder, vocoder
+
+    @staticmethod
+    def _publish_sample_sources(save_dir: str, prompt_idx: int, sample_parameter: Dict) -> None:
+        """Copy IC-LoRA / I2V source inputs into <save_dir> so the dashboard can serve them.
+
+        Names are sticky per (prompt_idx, kind): one copy per prompt, refreshed if the
+        source path changes between epochs. Sources outside the static-mount root would
+        otherwise be unreachable from the browser.
+        """
+        try:
+            os.makedirs(save_dir, exist_ok=True)
+        except OSError:
+            return
+        sources = {
+            "i2v": sample_parameter.get("image_path"),
+            "v2v": sample_parameter.get("v2v_ref_path"),
+            "refaudio": sample_parameter.get("ref_audio_path"),
+        }
+        for kind, src in sources.items():
+            if not src:
+                continue
+            try:
+                if not os.path.isfile(src):
+                    continue
+                ext = os.path.splitext(src)[1].lower() or ".bin"
+                dst = os.path.join(save_dir, f"_source_p{prompt_idx:02d}_{kind}{ext}")
+                # Remove any stale entries for this (prompt, kind) with a different extension
+                # so the dashboard never picks up a leftover from a previous run's source path.
+                for stale in os.listdir(save_dir):
+                    if stale == os.path.basename(dst):
+                        continue
+                    prefix = f"_source_p{prompt_idx:02d}_{kind}."
+                    if stale.startswith(prefix):
+                        try:
+                            os.remove(os.path.join(save_dir, stale))
+                        except OSError:
+                            pass
+                # Skip the copy if the destination is already up-to-date with the source.
+                try:
+                    src_stat = os.stat(src)
+                    dst_stat = os.stat(dst) if os.path.exists(dst) else None
+                except OSError:
+                    dst_stat = None
+                    src_stat = None
+                if (
+                    dst_stat is not None
+                    and src_stat is not None
+                    and dst_stat.st_size == src_stat.st_size
+                    and dst_stat.st_mtime >= src_stat.st_mtime
+                ):
+                    continue
+                shutil.copyfile(src, dst)
+            except Exception as exc:
+                logger.warning("Sampling: failed to publish %s source %r: %s", kind, src, exc)
 
     @staticmethod
     def _save_audio_wav(path: str, audio: torch.Tensor, sample_rate: int) -> None:
@@ -1980,6 +2035,9 @@ class LTX2SamplingMixin:
         )
         wav_path = os.path.join(save_dir, save_path) + ".wav"
 
+        if accelerator.is_main_process:
+            self._publish_sample_sources(save_dir, prompt_idx, sample_parameter)
+
         # Check if two-stage inference is enabled
         use_two_stage = bool(getattr(args, "sample_two_stage", False))
         spatial_upsampler_path = getattr(args, "spatial_upsampler_path", None)
@@ -2088,6 +2146,8 @@ class LTX2SamplingMixin:
         except:
             wandb = None
 
+        tb_writer = self._get_tensorboard_writer(accelerator) if accelerator.is_main_process else None
+
         video_path = None
         if video is not None:
             if video.shape[2] == 1:
@@ -2095,15 +2155,42 @@ class LTX2SamplingMixin:
                 if wandb_tracker is not None and wandb is not None:
                     for image_path in image_paths:
                         wandb_tracker.log({f"sample_{prompt_idx}": wandb.Image(image_path)}, step=steps)
+                if tb_writer is not None:
+                    try:
+                        img = video[:, :, 0, :, :].detach().cpu().float().clamp(0, 1)
+                        tb_writer.add_image(f"samples/prompt_{prompt_idx:02d}", img[0], global_step=steps)
+                    except Exception as exc:
+                        logger.warning("Sampling: failed to log image to TensorBoard: %s", exc)
             else:
                 video_path = os.path.join(save_dir, save_path) + ".mp4"
                 save_videos_grid(video, video_path)
                 if wandb_tracker is not None and wandb is not None:
                     wandb_tracker.log({f"sample_{prompt_idx}": wandb.Video(video_path)}, step=steps)
+                if tb_writer is not None:
+                    try:
+                        vid = video.permute(0, 2, 1, 3, 4).detach().cpu().float().clamp(0, 1)
+                        vid_uint8 = (vid * 255).to(torch.uint8)
+                        tb_writer.add_video(f"samples/prompt_{prompt_idx:02d}", vid_uint8, global_step=steps, fps=24)
+                    except Exception as exc:
+                        logger.warning("Sampling: failed to log video to TensorBoard: %s", exc)
         if audio_waveform is not None:
             wav_path = os.path.join(save_dir, save_path) + ".wav"
             sample_rate = int(getattr(vocoder, "output_sample_rate", 24000)) if vocoder is not None else 24000
             self._save_audio_wav(wav_path, audio_waveform, sample_rate)
+            if tb_writer is not None:
+                try:
+                    aud = audio_waveform.detach().cpu().float()
+                    if aud.dim() > 1:
+                        aud = aud.mean(dim=0)
+                    aud = aud.clamp(-1, 1).unsqueeze(0)
+                    tb_writer.add_audio(
+                        f"samples/prompt_{prompt_idx:02d}_audio",
+                        aud,
+                        global_step=steps,
+                        sample_rate=sample_rate,
+                    )
+                except Exception as exc:
+                    logger.warning("Sampling: failed to log audio to TensorBoard: %s", exc)
             if self._audio_metrics is not None:
                 sample_metrics = self._audio_metrics.on_sample(
                     waveform=audio_waveform,

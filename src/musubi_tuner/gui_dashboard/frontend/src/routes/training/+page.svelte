@@ -1078,6 +1078,7 @@
 							<FormField type="number" fieldPath="training.video_loss_weight" value={t.video_loss_weight ?? 1.0} oninput={(e) => update('video_loss_weight', Number(e.target.value))} step="0.1" tooltip="Video loss multiplier" />
 							<FormField type="number" fieldPath="training.audio_loss_weight" value={t.audio_loss_weight ?? 1.0} oninput={(e) => update('audio_loss_weight', Number(e.target.value))} step="0.1" tooltip="Audio loss multiplier" />
 						</div>
+						<FormToggle fieldPath="training.preserve_audio_timing" checked={t.preserve_audio_timing ?? false} onchange={(e) => update('preserve_audio_timing', e.target.checked)} tooltip="Preserve original audio duration by skipping audio time-stretching and duration alignment." />
 					</div>
 				</FormGroup>
 

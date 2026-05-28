@@ -426,6 +426,7 @@
 								{/if}
 							{/if}
 							{#if $advancedMode}
+								<FormToggle fieldPath="caching.preserve_audio_timing" checked={caching.preserve_audio_timing ?? false} onchange={(e) => updateCaching('preserve_audio_timing', e.target.checked)} tooltip="Preserve original audio duration by skipping audio time-stretching and audio-latent duration alignment." />
 								<div class="grid grid-cols-2 gap-2">
 									<FormField fieldPath="caching.ltx2_audio_dtype" value={caching.ltx2_audio_dtype || ''} oninput={(e) => updateCaching('ltx2_audio_dtype', e.target.value)} placeholder="Auto" tooltip="Audio latent dtype" />
 									<FormField type="number" fieldPath="caching.audio_only_sequence_resolution" value={caching.audio_only_sequence_resolution ?? 64} oninput={(e) => updateCaching('audio_only_sequence_resolution', Number(e.target.value))} min={1} tooltip="Audio-only sequence resolution" />
