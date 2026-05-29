@@ -1324,6 +1324,13 @@ class LTX2SliderTrainer:
         else:
             transformer = accelerator.prepare(transformer)
 
+        # The frozen base transformer was added to accelerator._models by prepare(),
+        # which means save_state() would serialize it (~13 GB) even though its weights
+        # never change during LoRA/slider training.  Remove it so only the LoRA
+        # network (prepared below) is included in state checkpoints.
+        _unwrapped_transformer = accelerator.unwrap_model(transformer)
+        accelerator._models = [m for m in accelerator._models if accelerator.unwrap_model(m) is not _unwrapped_transformer]
+
         # torch.compile the DiT blocks (mirrors LTX2NetworkTrainer in ltx2_train_network.py).
         # Must run after prepare()/_models filtering and before the network is prepared.
         # blocks_to_swap was set on _net_trainer above, so its disable_linear path is correct.

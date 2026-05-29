@@ -3195,6 +3195,13 @@ class NetworkTrainer:
             transformer = accelerator.prepare(transformer)
             _log_vram("AFTER accelerator.prepare(transformer) without block swap", logger)
 
+        # The frozen base transformer was added to accelerator._models by prepare(),
+        # which means save_state() would serialize it (~13 GB) even though its weights
+        # never change during LoRA training.  Remove it so only the LoRA network
+        # (prepared below) is included in state checkpoints.
+        _unwrapped_transformer = accelerator.unwrap_model(transformer)
+        accelerator._models = [m for m in accelerator._models if accelerator.unwrap_model(m) is not _unwrapped_transformer]
+
         if args.compile:
             transformer = self.compile_transformer(args, transformer)
             transformer.__dict__["_orig_mod"] = transformer  # for annoying accelerator checks
