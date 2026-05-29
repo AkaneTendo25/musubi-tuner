@@ -16,7 +16,7 @@ import re
 import random
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 import toml
@@ -46,6 +46,36 @@ from musubi_tuner.ltx2_train_network import (
 )
 from musubi_tuner.ltx_2.env import apply_ltx2_tweaks
 from musubi_tuner.utils import model_utils, train_utils
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _argv_to_command_list() -> list:
+    """Group ``sys.argv`` into ``[flag, value]`` pairs for JSON metadata.
+
+    Boolean flags (``--gradient_checkpointing``) become single-element lists.
+    Flags with values (``--learning_rate 0.0002``) become two-element lists.
+    Positional tokens (script path) become single-element lists.
+    """
+    result: list[list[str]] = []
+    argv = sys.argv
+    i = 0
+    while i < len(argv):
+        token = argv[i]
+        if token.startswith("--"):
+            if i + 1 < len(argv) and not argv[i + 1].startswith("--"):
+                result.append([token, argv[i + 1]])
+                i += 2
+            else:
+                result.append([token])
+                i += 1
+        else:
+            result.append([token])
+            i += 1
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1402,7 +1432,7 @@ class LTX2SliderTrainer:
                 init_kwargs["wandb"] = {"name": args.wandb_run_name}
             if getattr(args, "log_tracker_config", None) is not None:
                 init_kwargs = toml.load(args.log_tracker_config)
-            tracker_name = getattr(args, "log_tracker_name", None) or "slider_train"
+            tracker_name = getattr(args, "log_tracker_name", None) or getattr(args, "output_name", "slider_train")
             accelerator.init_trackers(
                 tracker_name,
                 config=train_utils.get_sanitized_config_or_none(args),
@@ -1447,21 +1477,26 @@ class LTX2SliderTrainer:
             if getattr(args, "save_checkpoint_metadata", False):
                 from datetime import datetime
 
-                _md = {
+                _training = {
                     "step": steps,
                     "epoch": epoch_no,
                     "timestamp": datetime.now().isoformat(timespec="seconds"),
                 }
                 try:
-                    _md["loss"] = float(loss)
+                    _training["loss"] = float(loss)
                 except Exception:
                     pass
                 if loss_recorder.loss_list:
-                    _md["loss_avg"] = loss_recorder.moving_average
+                    _training["loss_avg"] = loss_recorder.moving_average
                 try:
-                    _md["lr"] = float(lr_scheduler.get_last_lr()[0])
+                    _training["lr"] = float(lr_scheduler.get_last_lr()[0])
                 except Exception:
                     pass
+                _md = {
+                    "training": _training,
+                    "command": _argv_to_command_list(),
+                    "slider_config": asdict(self.slider_config),
+                }
                 train_utils.save_checkpoint_metadata(ckpt_file, _md)
 
         def remove_model(old_ckpt_name):

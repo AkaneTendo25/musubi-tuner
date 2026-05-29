@@ -2316,6 +2316,12 @@ def build_slider_training_cmd(config: ProjectConfig) -> list[str]:
         cmd += ["--log_cuda_memory_every_n_steps", str(t.log_cuda_memory_every_n_steps)]
     if t.save_checkpoint_metadata:
         cmd.append("--save_checkpoint_metadata")
+    if t.no_metadata:
+        cmd.append("--no_metadata")
+    if t.no_convert_to_comfy:
+        cmd.append("--no_convert_to_comfy")
+    if not t.save_original_lora:
+        cmd.append("--no_save_original_lora")
 
     cmd += _split_cli_args(s.extra_args)
     return cmd
