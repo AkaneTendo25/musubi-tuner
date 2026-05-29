@@ -2315,8 +2315,10 @@ def build_slider_training_cmd(config: ProjectConfig) -> list[str]:
     # Timestep / sigma distribution — slider reads these via getattr in its loop.
     # Excludes timestep_sampling/discrete_flow_shift/weighting_scheme (slider hardcodes
     # shifted_logit_normal sampling) and guidance_scale (slider uses its own guidance_strength).
-    if t.logit_mean is not None:
-        cmd += ["--logit_mean", str(t.logit_mean)]
+    # --logit_mean is intentionally NOT forwarded: it belongs to the standard
+    # logit_normal weighting scheme. The slider's shifted_logit_normal sampler takes
+    # its mean from the per-sequence-length shift (or --shifted_logit_shift), so
+    # logit_mean would be inert for sliders. --shifted_logit_shift is the equivalent.
     if t.logit_std is not None:
         cmd += ["--logit_std", str(t.logit_std)]
     if t.min_timestep is not None:
@@ -2409,6 +2411,10 @@ def build_slider_training_cmd(config: ProjectConfig) -> list[str]:
         cmd += ["--metadata_license", t.metadata_license]
     if t.metadata_tags:
         cmd += ["--metadata_tags", t.metadata_tags]
+    if t.metadata_reso:
+        cmd += ["--metadata_reso", t.metadata_reso]
+    if t.metadata_arch:
+        cmd += ["--metadata_arch", t.metadata_arch]
 
     # Sampling — inherited from training config (same pattern as build_training_cmd)
     sample_prompts = _effective_training_sample_prompts(config)

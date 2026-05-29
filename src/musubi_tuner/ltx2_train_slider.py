@@ -1313,6 +1313,14 @@ class LTX2SliderTrainer:
 
         lr_scheduler = NetworkTrainer().get_lr_scheduler(args, optimizer, accelerator.num_processes)
 
+        # Save base param_groups (from CLI) before any resume so we can restore them
+        # if --reset_optimizer_params is set. Mirrors NetworkTrainer.train(); the
+        # slider has its own loop and must replicate this resume-time behavior.
+        inner_optimizer = optimizer.optimizer if hasattr(optimizer, "optimizer") else optimizer
+        saved_param_groups = None
+        if getattr(args, "reset_optimizer_params", False):
+            saved_param_groups = [{k: v for k, v in pg.items() if k != "params"} for pg in inner_optimizer.param_groups]
+
         # -- Prepare with accelerator ------------------------------------------
         if dit_weight_dtype != dit_dtype and dit_weight_dtype is not None:
             transformer.to(dit_weight_dtype)
@@ -1378,6 +1386,37 @@ class LTX2SliderTrainer:
             if resume_step > 0:
                 initial_global_step = resume_step
                 logger.info(f"Recovered global_step={initial_global_step} from resume state")
+
+            # Optimizer/scheduler resets after a state-dir resume (mirrors
+            # NetworkTrainer.train()). Only meaningful when optimizer state was
+            # actually loaded (initial_global_step > 0); the weights-only fallback
+            # below re-initializes the optimizer anyway.
+            if initial_global_step > 0:
+                if getattr(args, "reset_optimizer", False):
+                    inner_optimizer.state.clear()
+                    accelerator.print("reset optimizer state (cleared momentum/variance)")
+
+                if getattr(args, "reset_optimizer_params", False) and saved_param_groups is not None:
+                    for pg, saved in zip(inner_optimizer.param_groups, saved_param_groups):
+                        for k, v in saved.items():
+                            pg[k] = v
+                    accelerator.print("reset optimizer param groups to CLI values")
+
+                if getattr(args, "reset_optimizer", False) or getattr(args, "reset_optimizer_params", False):
+                    # reset lr to base value so the new scheduler starts from the correct base
+                    # (scheduler __init__ uses current group['lr'], not initial_lr)
+                    for pg in inner_optimizer.param_groups:
+                        if "initial_lr" in pg:
+                            pg["lr"] = pg["initial_lr"]
+                            del pg["initial_lr"]
+                    new_inner_scheduler = NetworkTrainer().get_lr_scheduler(args, inner_optimizer, accelerator.num_processes)
+                    # replace the inner scheduler while keeping the AcceleratedScheduler wrapper
+                    # (the wrapper gates stepping on sync_gradients for gradient accumulation)
+                    if hasattr(lr_scheduler, "scheduler"):
+                        lr_scheduler.scheduler = new_inner_scheduler
+                    else:
+                        lr_scheduler = new_inner_scheduler
+                    accelerator.print("recreated LR scheduler (restarting schedule from step 0)")
 
         # -- Fallback: resume from latest LoRA checkpoint if no state dir ------
         # If autoresume is enabled but no state directory was found (e.g. crash
@@ -1712,6 +1751,14 @@ class LTX2SliderTrainer:
                     optimizer.step()
                     lr_scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
+
+                    # LoRA max-norm regularization (mirrors hv_train_network.py).
+                    # The slider has its own loop, so this must be applied here;
+                    # the network method self-guards for non-LoRA networks.
+                    if getattr(args, "scale_weight_norms", None):
+                        accelerator.unwrap_model(network).apply_max_norm_regularization(
+                            args.scale_weight_norms, accelerator.device
+                        )
 
             if not accelerator.sync_gradients:
                 continue
