@@ -2237,6 +2237,10 @@ def build_slider_training_cmd(config: ProjectConfig) -> list[str]:
         cmd += ["--latent_frames", str(s.latent_frames)]
         cmd += ["--latent_height", str(s.latent_height)]
         cmd += ["--latent_width", str(s.latent_width)]
+    else:
+        # First-frame conditioning probability — only meaningful for reference
+        # (image/video pair) sliders, read by the reference training step.
+        cmd += ["--ltx2_first_frame_conditioning_p", str(t.ltx2_first_frame_conditioning_p)]
     if s.guidance_strength != 1.0:
         cmd += ["--guidance_strength", str(s.guidance_strength)]
     if s.sample_slider_range != "-2,-1,0,1,2":
@@ -2247,6 +2251,30 @@ def build_slider_training_cmd(config: ProjectConfig) -> list[str]:
         cmd += ["--network_dim", str(t.network_dim)]
     if t.network_alpha != 1:
         cmd += ["--network_alpha", str(t.network_alpha)]
+
+    # Network module + args — from training config.
+    # The slider trainer only defaults network_module when it is None, so forwarding
+    # the GUI value (and ic_reference override above) is safe.
+    network_args_parts = _split_cli_args(t.network_args)
+    _append_network_arg(network_args_parts, "rank_dropout", t.rank_dropout)
+    _append_network_arg(network_args_parts, "module_dropout", t.module_dropout)
+    _append_network_arg(network_args_parts, "use_dora", t.use_dora)
+    _append_network_arg(network_args_parts, "adaptive_rank", t.adaptive_rank)
+    _append_network_arg(network_args_parts, "adaptive_rank_target", t.adaptive_rank_target)
+    _append_network_arg(network_args_parts, "adaptive_rank_min_rank", t.adaptive_rank_min_rank)
+    _append_network_arg(network_args_parts, "adaptive_rank_init_rank", t.adaptive_rank_init_rank)
+    _append_network_arg(network_args_parts, "adaptive_rank_quantile", t.adaptive_rank_quantile)
+    _append_network_arg(network_args_parts, "adaptive_rank_weight", t.adaptive_rank_weight)
+    if t.network_module:
+        cmd += ["--network_module", _effective_network_module(t.network_module)]
+    if network_args_parts:
+        cmd += ["--network_args"] + network_args_parts
+    if t.network_weights:
+        cmd += ["--network_weights", t.network_weights]
+    if t.network_dropout is not None:
+        cmd += ["--network_dropout", str(t.network_dropout)]
+    if t.scale_weight_norms is not None:
+        cmd += ["--scale_weight_norms", str(t.scale_weight_norms)]
 
     # Optimizer — from training config
     cmd += ["--learning_rate", str(t.learning_rate)]
