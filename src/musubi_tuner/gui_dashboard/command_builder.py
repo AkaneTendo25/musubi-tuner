@@ -2213,6 +2213,14 @@ def build_slider_training_cmd(config: ProjectConfig) -> list[str]:
         cmd += ["--fp8_keep_blocks", t.fp8_keep_blocks]
     if t.flash_attn:
         cmd.append("--flash_attn")
+    if t.flash3:
+        cmd.append("--flash3")
+    if t.sdpa:
+        cmd.append("--sdpa")
+    if t.sage_attn:
+        cmd.append("--sage_attn")
+    if t.xformers:
+        cmd.append("--xformers")
     if t.gemma_load_in_8bit:
         cmd.append("--gemma_load_in_8bit")
     if t.gemma_load_in_4bit:
@@ -2249,10 +2257,54 @@ def build_slider_training_cmd(config: ProjectConfig) -> list[str]:
     cmd += ["--gradient_accumulation_steps", str(t.gradient_accumulation_steps)]
     cmd += ["--max_grad_norm", str(t.max_grad_norm)]
 
+    # LR scheduler — from training config
+    cmd += ["--lr_scheduler", t.lr_scheduler]
+    cmd += ["--lr_warmup_steps", str(t.lr_warmup_steps)]
+    if t.lr_decay_steps is not None:
+        cmd += ["--lr_decay_steps", str(t.lr_decay_steps)]
+    if t.lr_scheduler_num_cycles is not None:
+        cmd += ["--lr_scheduler_num_cycles", str(t.lr_scheduler_num_cycles)]
+    if t.lr_scheduler_power is not None:
+        cmd += ["--lr_scheduler_power", str(t.lr_scheduler_power)]
+    if t.lr_scheduler_min_lr_ratio is not None:
+        cmd += ["--lr_scheduler_min_lr_ratio", str(t.lr_scheduler_min_lr_ratio)]
+    if t.lr_scheduler_type:
+        cmd += ["--lr_scheduler_type", t.lr_scheduler_type]
+    if t.lr_scheduler_args:
+        cmd += ["--lr_scheduler_args"] + _split_cli_args(t.lr_scheduler_args)
+    if t.lr_scheduler_timescale is not None:
+        cmd += ["--lr_scheduler_timescale", str(t.lr_scheduler_timescale)]
+
     # Schedule — slider override for steps
     cmd += ["--max_train_steps", str(s.max_train_steps)]
     if t.seed is not None:
         cmd += ["--seed", str(t.seed)]
+
+    # Timestep / sigma distribution — slider reads these via getattr in its loop.
+    # Excludes timestep_sampling/discrete_flow_shift/weighting_scheme (slider hardcodes
+    # shifted_logit_normal sampling) and guidance_scale (slider uses its own guidance_strength).
+    if t.logit_mean is not None:
+        cmd += ["--logit_mean", str(t.logit_mean)]
+    if t.logit_std is not None:
+        cmd += ["--logit_std", str(t.logit_std)]
+    if t.min_timestep is not None:
+        cmd += ["--min_timestep", str(t.min_timestep)]
+    if t.max_timestep is not None:
+        cmd += ["--max_timestep", str(t.max_timestep)]
+    if t.shifted_logit_mode:
+        cmd += ["--shifted_logit_mode", t.shifted_logit_mode]
+    if t.shifted_logit_eps != 1e-3:
+        cmd += ["--shifted_logit_eps", str(t.shifted_logit_eps)]
+    if t.shifted_logit_uniform_prob != 0.1:
+        cmd += ["--shifted_logit_uniform_prob", str(t.shifted_logit_uniform_prob)]
+    if t.shifted_logit_shift is not None:
+        cmd += ["--shifted_logit_shift", str(t.shifted_logit_shift)]
+    if t.shifted_logit_clamp_auto_shift:
+        cmd.append("--shifted_logit_clamp_auto_shift")
+    if t.shifted_logit_min_shift != 0.95:
+        cmd += ["--shifted_logit_min_shift", str(t.shifted_logit_min_shift)]
+    if t.shifted_logit_max_shift != 2.05:
+        cmd += ["--shifted_logit_max_shift", str(t.shifted_logit_max_shift)]
 
     # Memory — from training config
     if t.blocks_to_swap is not None:
@@ -2266,6 +2318,20 @@ def build_slider_training_cmd(config: ProjectConfig) -> list[str]:
         cmd += ["--output_name", s.output_name]
     if t.save_every_n_steps:
         cmd += ["--save_every_n_steps", str(t.save_every_n_steps)]
+    if t.save_last_n_steps is not None:
+        cmd += ["--save_last_n_steps", str(t.save_last_n_steps)]
+    if t.save_last_n_steps_state is not None:
+        cmd += ["--save_last_n_steps_state", str(t.save_last_n_steps_state)]
+    if t.save_state:
+        cmd.append("--save_state")
+    if t.save_state_on_train_end:
+        cmd.append("--save_state_on_train_end")
+    if t.resume:
+        cmd += ["--resume", t.resume]
+    if t.reset_optimizer:
+        cmd.append("--reset_optimizer")
+    if t.reset_optimizer_params:
+        cmd.append("--reset_optimizer_params")
     if t.autoresume:
         cmd.append("--autoresume")
 

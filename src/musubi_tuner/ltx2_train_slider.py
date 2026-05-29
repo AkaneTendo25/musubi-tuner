@@ -562,8 +562,11 @@ class LTX2SliderTrainer:
         sigma_exp = sigma.view(1, 1, 1, 1, 1)
         noisy = sigma_exp * noise  # pure noise scaled by sigma
 
-        # Timestep for model: sigma as [B, 1]
-        model_ts = sigma.unsqueeze(1)
+        # Timestep for model: sigma as [B, 1]. Cast to dit_dtype so attention
+        # backends that require fp16/bf16 inputs (SageAttention, FlashAttention3)
+        # receive matching-precision hidden states. Mirrors call_dit in the
+        # standard trainer, which casts timesteps to network_dtype.
+        model_ts = sigma.unsqueeze(1).to(dtype=dit_dtype)
 
         # Get cached embeddings
         pos_e, pos_m = self.cached_embeds[target.positive]
@@ -692,7 +695,8 @@ class LTX2SliderTrainer:
         # Create noisy versions (flow matching interpolation)
         noisy_pos = ((1.0 - sigma_exp) * pos_latents + sigma_exp * noise).to(dtype=dit_dtype)
         noisy_neg = ((1.0 - sigma_exp) * neg_latents + sigma_exp * noise).to(dtype=dit_dtype)
-        model_ts = sigma.unsqueeze(1)
+        # Cast timestep to dit_dtype for fp16/bf16-only attention backends (see text step).
+        model_ts = sigma.unsqueeze(1).to(dtype=dit_dtype)
 
         # Flow matching velocity targets
         target_pos = (noise - pos_latents).to(dtype=dit_dtype)
@@ -938,7 +942,9 @@ class LTX2SliderTrainer:
         sigma_exp = sigma.view(-1, 1, 1, 1, 1)
         noisy_pos = ((1.0 - sigma_exp) * pos_latents + sigma_exp * noise).to(dtype=dit_dtype)
         noisy_neg = ((1.0 - sigma_exp) * neg_latents + sigma_exp * noise).to(dtype=dit_dtype)
-        model_ts = sigma.unsqueeze(1)
+        # call_dit casts timesteps to network_dtype internally, but cast here too
+        # for consistency with the other slider paths.
+        model_ts = sigma.unsqueeze(1).to(dtype=dit_dtype)
 
         ic_batch = {
             "text": text_embeds,
@@ -1140,13 +1146,19 @@ class LTX2SliderTrainer:
         session_id = random.randint(0, 2**32)
         training_started_at = time.time()
 
-        # Model-specific init (sets _ltx_mode, _audio_video, etc.)
-        self._net_trainer.handle_model_specific_args(args)
-
-        # Prepare accelerator
+        # Prepare accelerator FIRST so args.mixed_precision is resolved before
+        # handle_model_specific_args runs. handle_model_specific_args casts an
+        # fp32 checkpoint's compute dtype to bf16/fp16, but only when
+        # args.mixed_precision is already set — otherwise dit_dtype stays fp32
+        # and the model loads/computes in full fp32 (slower, more VRAM, and
+        # incompatible with fp16/bf16-only attention backends like SageAttention).
         accelerator = prepare_accelerator(args)
         if args.mixed_precision is None:
             args.mixed_precision = accelerator.mixed_precision
+
+        # Model-specific init (sets _ltx_mode, _audio_video, dit_dtype, etc.)
+        self._net_trainer.handle_model_specific_args(args)
+
         is_main_process = accelerator.is_main_process
         dashboard_metrics_enabled = getattr(args, "gui", False) or os.getenv("MUSUBI_DASHBOARD_METRICS") == "1"
 
@@ -1197,8 +1209,21 @@ class LTX2SliderTrainer:
             torch.cuda.reset_peak_memory_stats()
 
         logger.info("Loading DiT model from %s", args.dit)
+        # Determine attention mode from args (mirror LTX2NetworkTrainer.load_transformer)
+        if getattr(args, "sdpa", False):
+            attn_mode = "torch"
+        elif getattr(args, "flash_attn", False):
+            attn_mode = "flash"
+        elif getattr(args, "flash3", False):
+            attn_mode = "flash3"
+        elif getattr(args, "sage_attn", False):
+            attn_mode = "sageattn"
+        elif getattr(args, "xformers", False):
+            attn_mode = "xformers"
+        else:
+            attn_mode = "torch"
         transformer = self._net_trainer.load_transformer(
-            accelerator, args, args.dit, "torch", False, loading_device, dit_weight_dtype
+            accelerator, args, args.dit, attn_mode, False, loading_device, dit_weight_dtype
         )
         transformer.eval()
         transformer.requires_grad_(False)
