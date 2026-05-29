@@ -2200,6 +2200,10 @@ def build_slider_training_cmd(config: ProjectConfig) -> list[str]:
         cmd += ["--gemma_safetensors", gemma_safetensors]
     if t.ltx2_mode:
         cmd += ["--ltx2_mode", t.ltx2_mode]
+    if t.ltx_version:
+        cmd += ["--ltx_version", t.ltx_version]
+    if t.vae_dtype:
+        cmd += ["--vae_dtype", t.vae_dtype]
     if s.mode == "ic_reference":
         cmd += ["--lora_target_preset", "v2v"]
         cmd += ["--ic_lora_strategy", "v2v"]
@@ -2340,6 +2344,37 @@ def build_slider_training_cmd(config: ProjectConfig) -> list[str]:
     if t.gradient_checkpointing:
         cmd.append("--gradient_checkpointing")
 
+    # Compile / dynamo — from training config
+    if t.compile:
+        cmd.append("--compile")
+        if t.compile_backend:
+            cmd += ["--compile_backend", t.compile_backend]
+        if t.compile_mode:
+            cmd += ["--compile_mode", t.compile_mode]
+        compile_dynamic = _compile_dynamic_value(t.compile_dynamic)
+        if compile_dynamic:
+            cmd += ["--compile_dynamic", compile_dynamic]
+        if t.compile_fullgraph:
+            cmd.append("--compile_fullgraph")
+        if t.compile_cache_size_limit is not None:
+            cmd += ["--compile_cache_size_limit", str(t.compile_cache_size_limit)]
+    if t.dynamo_backend != "NO":
+        cmd += ["--dynamo_backend", t.dynamo_backend]
+        if t.dynamo_mode:
+            cmd += ["--dynamo_mode", t.dynamo_mode]
+        if t.dynamo_fullgraph:
+            cmd.append("--dynamo_fullgraph")
+        if t.dynamo_dynamic:
+            cmd.append("--dynamo_dynamic")
+
+    # CUDA performance — from training config
+    if t.cuda_allow_tf32:
+        cmd.append("--cuda_allow_tf32")
+    if t.cuda_cudnn_benchmark:
+        cmd.append("--cuda_cudnn_benchmark")
+    if t.cuda_memory_fraction is not None:
+        cmd += ["--cuda_memory_fraction", str(t.cuda_memory_fraction)]
+
     # Output — dir from training, name from slider
     cmd += ["--output_dir", _effective_output_dir(t.output_dir)]
     if s.output_name:
@@ -2362,6 +2397,18 @@ def build_slider_training_cmd(config: ProjectConfig) -> list[str]:
         cmd.append("--reset_optimizer_params")
     if t.autoresume:
         cmd.append("--autoresume")
+
+    # Model metadata — embedded in saved safetensors, useful for distribution
+    if t.metadata_title:
+        cmd += ["--metadata_title", t.metadata_title]
+    if t.metadata_author:
+        cmd += ["--metadata_author", t.metadata_author]
+    if t.metadata_description:
+        cmd += ["--metadata_description", t.metadata_description]
+    if t.metadata_license:
+        cmd += ["--metadata_license", t.metadata_license]
+    if t.metadata_tags:
+        cmd += ["--metadata_tags", t.metadata_tags]
 
     # Sampling — inherited from training config (same pattern as build_training_cmd)
     sample_prompts = _effective_training_sample_prompts(config)

@@ -1324,6 +1324,14 @@ class LTX2SliderTrainer:
         else:
             transformer = accelerator.prepare(transformer)
 
+        # torch.compile the DiT blocks (mirrors LTX2NetworkTrainer in ltx2_train_network.py).
+        # Must run after prepare()/_models filtering and before the network is prepared.
+        # blocks_to_swap was set on _net_trainer above, so its disable_linear path is correct.
+        # Compilation is lazy: it triggers on the first forward pass, not here.
+        if args.compile:
+            transformer = self._net_trainer.compile_transformer(args, transformer)
+            transformer.__dict__["_orig_mod"] = transformer  # for annoying accelerator checks
+
         network, optimizer, lr_scheduler = accelerator.prepare(network, optimizer, lr_scheduler)
 
         if args.gradient_checkpointing:
@@ -1444,6 +1452,32 @@ class LTX2SliderTrainer:
             metadata["ss_sd_model_name"] = sd_model_name
 
         metadata = {k: str(v) for k, v in metadata.items()}
+
+        # User-facing SAI model-spec metadata (title/author/license/tags/etc.),
+        # embedded in saved safetensors for distribution. Mirrors the standard trainer.
+        from musubi_tuner.utils import sai_model_spec
+
+        sai_title = getattr(args, "metadata_title", None) or args.output_name
+        if getattr(args, "min_timestep", None) is not None or getattr(args, "max_timestep", None) is not None:
+            md_min = args.min_timestep if args.min_timestep is not None else 0
+            md_max = args.max_timestep if args.max_timestep is not None else 1000
+            md_timesteps = (md_min, md_max)
+        else:
+            md_timesteps = None
+        sai_metadata = sai_model_spec.build_metadata(
+            None,
+            self._net_trainer.architecture,
+            time.time(),
+            sai_title,
+            getattr(args, "metadata_reso", None),
+            getattr(args, "metadata_author", None),
+            getattr(args, "metadata_description", None),
+            getattr(args, "metadata_license", None),
+            getattr(args, "metadata_tags", None),
+            timesteps=md_timesteps,
+            custom_arch=getattr(args, "metadata_arch", None),
+        )
+        metadata.update(sai_metadata)
 
         minimum_metadata = {}
         for key in ["ss_base_model_version", "ss_network_module", "ss_network_dim", "ss_network_alpha", "ss_network_args"]:

@@ -19,6 +19,13 @@ from musubi_tuner.ltx_2.utils import rms_norm
 
 logger = logging.getLogger(__name__)
 
+# Resolved once at import so torch.compile can treat it as a compile-time
+# constant. When False (default; LTX2_ATTN_FP32_RETRY unset), the data-dependent
+# `torch.isfinite(out).all()` branch in _run_attn_with_optional_fp32_retry is
+# statically pruned by Dynamo instead of forcing a graph break in every block.
+# Reading it per-forward via os.getenv prevented constant folding.
+_ATTN_RETRY_FP32 = os.getenv("LTX2_ATTN_FP32_RETRY", "0") == "1"
+
 # Thread-local storage for tracking last loaded swapped block during backward
 import threading
 
@@ -38,6 +45,11 @@ def _reconstruct_transformer_args(values: list[Any], is_none: bool) -> Transform
     field_names = [f.name for f in fields(TransformerArgs)]
     kwargs = dict(zip(field_names, values))
     return TransformerArgs(**kwargs)
+    # NOTE: do not replace fields() with a precomputed constant here. Tested: it
+    # eliminates this graph break but causes torch.compile to trace more of the
+    # grad-sensitive block, which then recompiles on the slider's per-step
+    # grad_mode flips (~64 recompiles, ~3.9s/it vs ~2.0s/it). The break is
+    # benign / mildly beneficial for the compiled path.
 
 
 def _repack_block_checkpoint_outputs(
@@ -86,6 +98,21 @@ def _run_attn_with_optional_fp32_retry(
     same FlashAttention kernel in fp32 can still leave the graph in a bad state for
     backward when swap/fp8/checkpointing are active.
     """
+
+    # Fast path: no fp32 retry and no pytorch-backend override. This avoids both
+    # the data-dependent branch (torch.isfinite(...).all()) and the attribute
+    # mutation below, both of which force a torch.compile graph break in every
+    # block. attn_retry_fp32 defaults False (LTX2_ATTN_FP32_RETRY unset), so this
+    # is the normal training path. Behavior is identical to the general path when
+    # both flags are off.
+    if not attn_retry_fp32 and not force_pytorch:
+        if force_fp32:
+            x = x_in.to(torch.float32)
+            ctx = context.to(torch.float32) if isinstance(context, torch.Tensor) else None
+            pe_local = pe.to(torch.float32) if isinstance(pe, torch.Tensor) else None
+            k_pe_local = k_pe.to(torch.float32) if isinstance(k_pe, torch.Tensor) else None
+            return attn_module(x, context=ctx, mask=mask, pe=pe_local, k_pe=k_pe_local).to(dtype=x_in.dtype)
+        return attn_module(x_in, context=context, mask=mask, pe=pe, k_pe=k_pe)
 
     original_fn = getattr(attn_module, "attention_function", None)
 
@@ -511,7 +538,7 @@ class BasicAVTransformerBlock(torch.nn.Module):
     ) -> tuple[TransformerArgs | None, TransformerArgs | None]:
         sublayer_diag = os.getenv("LTX2_NAN_SUBLAYER_DIAG", "0") == "1"
         v2a_diag = os.getenv("LTX2_V2A_DIAG", "0") == "1"
-        attn_retry_fp32 = os.getenv("LTX2_ATTN_FP32_RETRY", "0") == "1"
+        attn_retry_fp32 = _ATTN_RETRY_FP32
         # Clamp FFN outputs to prevent bf16 overflow (max ~65504).
         # Set LTX2_FFN_CLAMP=60000 to enable. Default: disabled (0).
         ffn_clamp = float(os.getenv("LTX2_FFN_CLAMP", "0"))
