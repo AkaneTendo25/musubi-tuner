@@ -4,11 +4,8 @@
 	import { processStatuses, processValidation } from '$lib/stores/processes.js';
 	import { theme, setTheme, THEMES } from '$lib/stores/theme.js';
 	import { uiMode, setUiMode } from '$lib/stores/uiMode.js';
-	import { onMount, onDestroy } from 'svelte';
 
 	let showThemePicker = $state(false);
-	let systemInfo = $state(null);
-	let _sysInfoTimer = null;
 
 	const navItems = [
 		{ href: '/', label: 'Overview', group: 'Workflow', icon: 'M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-4 0h4', always: true, statusTypes: ['cache_latents', 'cache_text', 'training', 'full_finetune'] },
@@ -104,34 +101,16 @@
 		return item.label;
 	}
 
-	let gpu = $derived(systemInfo?.gpus?.[0]);
-
-	onMount(async () => {
-		try {
-			const res = await fetch('/api/system/info');
-			if (res.ok) systemInfo = await res.json();
-		} catch {}
-		_sysInfoTimer = setInterval(async () => {
-			try {
-				const res = await fetch('/api/system/info');
-				if (res.ok) systemInfo = await res.json();
-			} catch {}
-		}, 30000);
-	});
-
-	onDestroy(() => {
-		if (_sysInfoTimer) clearInterval(_sysInfoTimer);
-	});
 </script>
 
 <nav class="w-52 flex-shrink-0 flex flex-col h-screen sticky top-0" style="background: var(--sidebar-bg); border-right: 1px solid var(--border-subtle);">
 	<!-- Logo -->
-	<div class="px-4 py-4" style="border-bottom: 1px solid var(--border-subtle);">
-		<div class="flex items-center gap-2">
+	<div class="h-12 px-3 flex items-center" style="border-bottom: 1px solid var(--border-subtle);">
+		<div class="flex items-center gap-2 min-w-0 w-full">
 			<div class="w-6 h-6 flex items-center justify-center flex-shrink-0" style="background: var(--logo-bg); box-shadow: var(--logo-shadow); border-radius: var(--logo-radius); clip-path: var(--logo-clip);">
 				<span class="text-[10px] font-bold" style="color: var(--bg-base);">M</span>
 			</div>
-			<div class="text-[12px] font-semibold truncate flex-1" style="color: var(--text-primary);">
+			<div class="text-[12px] font-semibold truncate flex-1 min-w-0" style="color: var(--text-primary);" title={$projectConfig?.name || 'Musubi Tuner'}>
 				{$projectConfig?.name || 'Musubi Tuner'}
 			</div>
 			{#if $projectLoaded}
@@ -182,7 +161,7 @@
 							<svg class="w-[14px] h-[14px] flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
 								<path d="{item.icon}"/>
 							</svg>
-							<span class="flex-1">{navLabel(item)}</span>
+							<span class="flex-1 truncate">{navLabel(item)}</span>
 							{#if validation.count > 0}
 								<span
 									class="text-[10px] font-bold tabular-nums flex-shrink-0 inline-flex items-center justify-center"
@@ -199,47 +178,6 @@
 		{/each}
 
 	</div>
-
-	<!-- Hardware stats -->
-	{#if systemInfo}
-		<div class="flex-shrink-0 px-3 py-2.5 space-y-1" style="border-top: 1px solid var(--border-subtle);">
-			{#if gpu}
-				<div class="flex items-center gap-1.5 text-[11px]" style="color: var(--text-secondary);">
-					<span style="font-size: 12px;">🖥️</span>
-					<span class="truncate flex-1">{gpu.name.replace('NVIDIA ','').replace('GeForce ','')}</span>
-					<span class="tabular-nums flex-shrink-0 font-medium" style="color: var(--accent);">{(gpu.vram_used_mb / 1024).toFixed(1)}/{(gpu.vram_total_mb / 1024).toFixed(0)}G</span>
-				</div>
-			{/if}
-			{#if systemInfo.ram}
-				<div class="flex items-center gap-1.5 text-[11px]" style="color: var(--text-secondary);">
-					<span style="font-size: 12px;">💾</span>
-					<span class="flex-1">RAM</span>
-					<span class="tabular-nums flex-shrink-0">{systemInfo.ram.used_gb}/{systemInfo.ram.total_gb} GB</span>
-				</div>
-			{/if}
-			{#if systemInfo.disk}
-				<div class="flex items-center gap-1.5 text-[11px]" style="color: var(--text-secondary);">
-					<span style="font-size: 12px;">💽</span>
-					<span class="flex-1">Disk</span>
-					<span class="tabular-nums flex-shrink-0">{systemInfo.disk.free_gb} GB free</span>
-				</div>
-			{/if}
-			{#if systemInfo.cpu}
-				<div class="flex items-center gap-1.5 text-[11px]" style="color: var(--text-secondary);">
-					<span style="font-size: 12px;">🧠</span>
-					<span class="flex-1">CPU</span>
-					<span class="tabular-nums flex-shrink-0">{systemInfo.cpu.cores}c</span>
-				</div>
-			{/if}
-			{#if systemInfo.python}
-				<div class="flex items-center gap-1.5 text-[11px]" style="color: var(--text-secondary);">
-					<span style="font-size: 12px;">🐍</span>
-					<span class="flex-1">Python</span>
-					<span class="flex-shrink-0">{systemInfo.python}</span>
-				</div>
-			{/if}
-		</div>
-	{/if}
 
 	<div class="flex-shrink-0 px-2 py-2 space-y-1" style="border-top: 1px solid var(--border-subtle);">
 		<div class="px-3 text-[10px] font-semibold uppercase tracking-wider" style="color: var(--text-muted); font-family: var(--font-label);">
@@ -277,9 +215,10 @@
 		</div>
 	</div>
 
-	<!-- Theme picker — pinned at bottom -->
 	<div class="flex-shrink-0 px-2 py-2 relative" style="border-top: 1px solid var(--border-subtle);">
 		<button
+			type="button"
+			aria-label="Choose dashboard theme"
 			onclick={() => showThemePicker = !showThemePicker}
 			class="w-full flex items-center gap-2 px-3 py-[7px] text-[12px] font-medium"
 			style="color: var(--text-muted); border-radius: var(--radius-sm);"
@@ -287,7 +226,7 @@
 			onmouseleave={(e) => { e.currentTarget.style.background = 'transparent'; e.currentTarget.style.color = 'var(--text-muted)'; }}
 		>
 			<span class="w-3 h-3 rounded-full flex-shrink-0" style="background: {currentTheme.swatch}; box-shadow: 0 0 6px {currentTheme.swatch}40;"></span>
-			<span class="flex-1 text-left">{currentTheme.name}</span>
+			<span class="flex-1 text-left truncate">{currentTheme.name}</span>
 			<svg class="w-3 h-3 transition-transform {showThemePicker ? 'rotate-180' : ''}" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path d="M19 9l-7 7-7-7"/></svg>
 		</button>
 
@@ -302,8 +241,9 @@
 			<div class="absolute bottom-full left-2 right-2 mb-1 p-1.5 z-50" style="background: var(--bg-elevated); border: 1px solid var(--border); border-radius: var(--radius-md); box-shadow: var(--shadow-lg);">
 				{#each THEMES as t}
 					<button
+						type="button"
 						onclick={() => { setTheme(t.id); showThemePicker = false; }}
-						class="w-full flex items-center gap-2.5 px-2.5 py-[7px] text-[11px] font-medium transition-colors"
+						class="w-full flex items-center gap-2.5 px-2.5 py-[7px] text-[11px] font-medium"
 						style="border-radius: var(--radius-sm); {$theme === t.id ? `background: var(--accent-muted); color: var(--accent);` : `color: var(--text-secondary);`}"
 						onmouseenter={(e) => { if ($theme !== t.id) e.currentTarget.style.background = 'var(--bg-hover)'; }}
 						onmouseleave={(e) => { if ($theme !== t.id) e.currentTarget.style.background = 'transparent'; }}

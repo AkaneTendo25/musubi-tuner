@@ -5,6 +5,7 @@
 	import VramEstimateCard from '$lib/components/VramEstimateCard.svelte';
 	import { CACHE_THEN_TRAIN_STAGES, buildCacheThenTrainIdleSummary, buildCacheThenTrainProgress, isProcessActive, prepareCacheThenTrainConfig } from '$lib/utils/cacheWorkflow.js';
 	import { defaultModelDir, effectiveGemmaRoot, effectiveLtx2Checkpoint } from '$lib/utils/modelPaths.js';
+	import { estimateLatentCaching as estimateLatentCachingVram, estimateTextCaching as estimateTextCachingVram, estimateTraining as estimateTrainingVram } from '$lib/utils/vramEstimate.js';
 	import { projectConfig, projectLoaded, createProject, loadProjectFromPath, saveProjectDebounced, saveProjectNow, recentProjects, removeRecentProject, restoreRecentProject, closeProject } from '$lib/stores/project.js';
 	import { processLogs, processStatuses, preloadLogsIfActive, startLogPolling, startProcess, stopProcess, refreshStatuses } from '$lib/stores/processes.js';
 	import { status } from '$lib/stores/status.js';
@@ -824,9 +825,9 @@
 	let valDatasets = $derived(cfg?.dataset?.validation_datasets || []);
 	let t = $derived(cfg?.training || {});
 	let c = $derived(cfg?.caching || {});
-	let vramLatent = $derived(estimateLatentCaching(cfg));
-	let vramText = $derived(estimateTextCaching(cfg));
-	let vramTrain = $derived(estimateTraining(cfg));
+	let vramLatent = $derived(estimateLatentCachingVram(cfg));
+	let vramText = $derived(estimateTextCachingVram(cfg));
+	let vramTrain = $derived(estimateTrainingVram(cfg));
 	let vramTotal = $derived(systemInfo?.gpus?.[0] ? Math.round(systemInfo.gpus[0].vram_total_mb / 1024) : 24);
 	let gpu = $derived(systemInfo?.gpus?.[0]);
 	let cacheThenTrainDisabled = $derived(
@@ -1178,19 +1179,6 @@
 	</div>
 {:else}
 	<div class="space-y-4">
-		<!-- Header -->
-		<div class="flex flex-wrap items-center gap-3">
-			<input
-				type="text"
-				value={cfg?.name || ''}
-				oninput={(e) => updateConfig('name', e.target.value)}
-				class="text-base font-semibold bg-transparent border-none outline-none flex-1 min-w-[12rem]"
-				style="color: var(--text-primary); padding: 0;"
-			/>
-			<span class="text-[10px] font-medium px-2 py-0.5" style="background: var(--accent-muted); color: var(--accent); border-radius: var(--radius-full);">{t.ltx2_mode || 'video'}</span>
-			<span class="text-[10px] font-medium px-2 py-0.5" style="background: var(--bg-elevated); color: var(--text-muted); border-radius: var(--radius-full);">{t.fp8_base ? 'FP8' : 'BF16'}</span>
-		</div>
-		<div class="text-[11px] font-mono truncate -mt-3" style="color: var(--text-muted);">{cfg?.project_dir || ''}</div>
 		{#if cacheThenTrainError}
 			<div class="text-[12px] px-3 py-2" style="color: var(--danger); background: var(--danger-muted); border-radius: var(--radius-sm);">{cacheThenTrainError}</div>
 		{/if}

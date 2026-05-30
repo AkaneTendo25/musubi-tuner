@@ -189,7 +189,16 @@ export function formatModelDownloadStatus(status) {
 	if (!status) return '';
 	const downloaded = formatBytes(status.bytes_downloaded);
 	const total = formatBytes(status.total_bytes);
-	const progress = downloaded && total ? ` ${downloaded} / ${total}` : downloaded ? ` ${downloaded}` : '';
+	const bundleProgress = downloaded && total ? `${downloaded} / ${total} total` : downloaded ? `${downloaded} total` : '';
+	const currentDownloaded = formatBytes(status.current_file_bytes_downloaded);
+	const currentTotal = formatBytes(status.current_file_total_bytes);
+	const hasMultiFileProgress = Number(status.total_files || 0) > 1 && currentDownloaded;
+	const currentProgress = currentDownloaded && currentTotal
+		? `${currentDownloaded} / ${currentTotal}`
+		: currentDownloaded;
+	const progress = hasMultiFileProgress
+		? ` ${currentProgress}${bundleProgress ? ` - ${bundleProgress}` : ''}`
+		: bundleProgress ? ` ${bundleProgress.replace(' total', '')}` : '';
 
 	switch (status.state) {
 		case 'queued':

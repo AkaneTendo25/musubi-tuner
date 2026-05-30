@@ -113,7 +113,11 @@ def _estimate_training_step_time_sec(config: dict) -> float | None:
         elif mode == "audio":
             step_time *= 0.55
 
-        if training.get("gradient_checkpointing", True):
+        blocks_to_checkpoint = _coerce_int(training.get("blocks_to_checkpoint", -1), -1)
+        grad_ckpt = blocks_to_checkpoint != 0 and bool(
+            training.get("gradient_checkpointing", True) or training.get("blockwise_checkpointing")
+        )
+        if grad_ckpt:
             step_time *= 1.20
         if training.get("blockwise_checkpointing"):
             step_time *= 1.08
@@ -365,9 +369,17 @@ def _calculate_vram_stats(config: dict) -> VRAMStats | None:
         dit_base = (dit_bf16 / 4) if is_nf4 else (dit_bf16 / 2) if is_fp8 else dit_bf16
 
         total_blocks = 48
+        blocks_to_checkpoint = _coerce_int(training.get("blocks_to_checkpoint", -1), -1)
+        blockwise = bool(training.get("blockwise_checkpointing")) and blocks_to_checkpoint != 0
+        checkpointed_blocks = 0
+        if blocks_to_checkpoint != 0:
+            checkpointed_blocks = total_blocks if blocks_to_checkpoint < 0 else min(max(blocks_to_checkpoint, 0), total_blocks)
         blocks_to_swap = min(max(_coerce_int(training.get("blocks_to_swap", 0), 0), 0), total_blocks - 1)
-        swap_savings = blocks_to_swap * (dit_base / total_blocks) * 0.95
-        model_size_gb = max(dit_base - swap_savings, 1.0)
+        block_size_gb = dit_base / total_blocks
+        swap_savings = blocks_to_swap * block_size_gb * 0.95
+        resident_blocks_after_swap = max(total_blocks - (swap_savings / max(block_size_gb, 0.0001)), 0)
+        blockwise_weight_savings = min(checkpointed_blocks, resident_blocks_after_swap) * block_size_gb * 0.80 if blockwise else 0.0
+        model_size_gb = max(dit_base - swap_savings - blockwise_weight_savings, 1.0)
 
         # ── LoRA weights ──
         rank = max(_coerce_int(training.get("network_dim", 16), 16), 1)
@@ -421,13 +433,16 @@ def _calculate_vram_stats(config: dict) -> VRAMStats | None:
 
         hidden_dim = 2048 if mode == "audio" else 4096
         bytes_per_val = 1 if is_w8a8 else 2
-        grad_ckpt = training.get("gradient_checkpointing", True)
-        blockwise = bool(training.get("blockwise_checkpointing"))
+        grad_ckpt = bool(training.get("gradient_checkpointing", True) or blockwise) and blocks_to_checkpoint != 0
 
-        activ_coeff = 10 if not grad_ckpt else (1 if blockwise else 2)
-        effective_layers = total_blocks if not blockwise else 2
-        per_layer_bytes = activ_coeff * batch_size * seq_len * hidden_dim * bytes_per_val
-        activations_gb = (per_layer_bytes * effective_layers) / (1024**3)
+        if not grad_ckpt:
+            activation_units = total_blocks * 10
+        elif blockwise:
+            standard_blocks = total_blocks - checkpointed_blocks
+            activation_units = max(2, standard_blocks + 2)
+        else:
+            activation_units = total_blocks * 2
+        activations_gb = (batch_size * seq_len * hidden_dim * bytes_per_val * activation_units) / (1024**3)
         if is_av:
             activations_gb *= 1.25
         if _coerce_int(training.get("ffn_chunk_size", 0), 0) > 0:

@@ -37,8 +37,6 @@
 	let trainingConsoleEmptyMessage = $derived(
 		trainingLive ? 'Training process launched. Waiting for console output...' : 'No output yet'
 	);
-	let configHref = $derived(activeProcessType === 'full_finetune' ? '/training/full-finetune' : '/training');
-
 	let systemInfo = $state(null);
 	let stats = $state(null);
 	let peakVramMb = $state(0);
@@ -281,11 +279,6 @@
 </script>
 
 <div class="space-y-4">
-	<div class="flex items-center justify-between">
-		<h2 class="text-base font-semibold" style="color: var(--text-primary);">Training Dashboard</h2>
-		<a href={configHref} class="px-3 py-1.5 text-[12px] font-medium" style="background: var(--bg-elevated); border: 1px solid var(--border); color: var(--text-secondary); border-radius: var(--radius-sm);">Config</a>
-	</div>
-
 	<!-- Status + Hardware row -->
 	<StatusBar active={trainingActive} />
 

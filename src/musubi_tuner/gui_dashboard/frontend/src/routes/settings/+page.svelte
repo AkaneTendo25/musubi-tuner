@@ -141,13 +141,6 @@
 </script>
 
 <div class="space-y-5">
-	<div>
-		<h2 class="text-base font-semibold" style="color: var(--text-primary);">Setup & Updates</h2>
-		<p class="text-[12px]" style="color: var(--text-muted);">
-			Manage this install from the dashboard: check repo/update status, confirm shortcuts still exist, and reopen the same Setup / Update tool used for first-time installation.
-		</p>
-	</div>
-
 	{#if actionMessage}
 		<div class="px-3 py-2 text-[12px]" style="color: {accentTone(actionTone)}; background: {accentBg(actionTone)}; border-radius: var(--radius-sm); border: 1px solid color-mix(in srgb, {accentTone(actionTone)} 28%, var(--border));">
 			{actionMessage}

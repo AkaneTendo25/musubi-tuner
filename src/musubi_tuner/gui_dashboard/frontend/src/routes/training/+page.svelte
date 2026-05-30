@@ -10,7 +10,8 @@
 	import ProcessControls from '$lib/components/ProcessControls.svelte';
 	import CommandPanel from '$lib/components/CommandPanel.svelte';
 	import { defaultModelDir, describeExactModelScan, effectiveGemmaRoot, effectiveGemmaSafetensors, effectiveLtx2Checkpoint } from '$lib/utils/modelPaths.js';
-	import { startModelDownload, getModelDownloadStatus, cancelModelDownload, formatModelDownloadStatus, getModelDownloadTone, isActiveModelDownload, getModelDownloadPresets, getModelDownloadPreflight, checkPathExists, scanCheckpointsWithProgress, cancelCheckpointScan, formatCheckpointScanStatus, modelDownloadTooltip, formatModelPreflightStatus } from '$lib/utils/modelDownloads.js';
+	import { getModelDownloadPresets, checkPathExists, scanCheckpointsWithProgress, cancelCheckpointScan, formatCheckpointScanStatus, modelDownloadTooltip } from '$lib/utils/modelDownloads.js';
+	import { cancelSharedModelDownload, modelDownloadState, resumeModelDownloadPolling, startSharedModelDownload } from '$lib/stores/modelDownloads.js';
 	import { projectConfig, projectLoaded, updateSection, saveProjectNow } from '$lib/stores/project.js';
 	import { processStatuses, processValidation, startProcess, stopProcess, validateProcess } from '$lib/stores/processes.js';
 	import { advancedMode } from '$lib/stores/uiMode.js';
@@ -77,11 +78,6 @@
 	let hasDatasetValidationErrors = $derived((trainingValidation.errors || []).some((issue) => issue.page === 'dataset'));
 	let validationTimer = null;
 	let cwd = $state('');
-	let downloading = $state('');
-	let downloadJobId = $state('');
-	let downloadState = $state('');
-	let modelStatus = $state('');
-	let modelStatusTone = $state('muted');
 	let downloadPresets = $state({});
 	let ltxDownloadExists = $state(false);
 	let gemmaDownloadExists = $state(false);
@@ -101,7 +97,6 @@
 	let ltxScanJobId = $state('');
 	let gemmaScanJobId = $state('');
 	let gemmaSafetensorsScanJobId = $state('');
-	let downloadPollTimer = null;
 
 	onMount(async () => {
 		try {
@@ -111,8 +106,8 @@
 		try {
 			downloadPresets = await getModelDownloadPresets();
 		} catch {}
+		resumeModelDownloadPolling();
 		return () => {
-			clearTimeout(downloadPollTimer);
 			if (ltxScanJobId) cancelCheckpointScan(ltxScanJobId).catch(() => {});
 			if (gemmaScanJobId) cancelCheckpointScan(gemmaScanJobId).catch(() => {});
 			if (gemmaSafetensorsScanJobId) cancelCheckpointScan(gemmaSafetensorsScanJobId).catch(() => {});
@@ -125,7 +120,10 @@
 	let gemmaRootDisabled = $derived(Boolean(activeGemmaSafetensors));
 	let resolvedGemma = $derived(effectiveGemmaRoot(cwd, $projectConfig, t.gemma_root || '', activeGemmaSafetensors));
 	let scanTargetGemmaRoot = $derived(effectiveGemmaRoot(cwd, $projectConfig, t.gemma_root || '', ''));
-	let hasActiveDownload = $derived(Boolean(downloadJobId) && ['queued', 'running', 'cancelling'].includes(downloadState));
+	let downloadState = $derived($modelDownloadState.state || '');
+	let modelStatus = $derived($modelDownloadState.message || '');
+	let modelStatusTone = $derived($modelDownloadState.tone || 'muted');
+	let hasActiveDownload = $derived(Boolean($modelDownloadState.jobId) && ['queued', 'running', 'cancelling'].includes(downloadState));
 
 	function relatedScanTargets() {
 		return {
@@ -295,75 +293,17 @@
 		}
 	}
 
-	function setModelStatus(status) {
-		modelStatus = formatModelDownloadStatus(status);
-		modelStatusTone = getModelDownloadTone(status);
-		downloadState = status?.state || '';
-	}
-
-	async function finalizeDownload(status) {
-		if (status.state === 'completed' && status.path) {
-			update('ltx2_checkpoint', downloading === 'ltxav' ? status.path : t.ltx2_checkpoint || '');
-			if (downloading === 'gemma-unsloth') {
-				update('gemma_root', status.path);
-				update('gemma_safetensors', '');
-			}
-			projectConfig.update((config) => config ? { ...config, model_dir: modelDir } : config);
-			await saveProjectNow();
-		}
-		downloadJobId = '';
-		downloading = '';
-	}
-
-	async function pollDownload(jobId) {
-		clearTimeout(downloadPollTimer);
-		try {
-			const status = await getModelDownloadStatus(jobId);
-			setModelStatus(status);
-			if (!isActiveModelDownload(status)) {
-				await finalizeDownload(status);
-				return;
-			}
-			downloadPollTimer = setTimeout(() => pollDownload(jobId), 1000);
-		} catch (e) {
-			setModelStatus({ state: 'failed', error: e.message || 'Download status failed' });
-			downloadJobId = '';
-			downloading = '';
-		}
-	}
-
 	async function downloadModel(preset) {
-		if (downloadJobId) return;
+		if (hasActiveDownload) return;
 		const targetPath = preset === 'ltxav' ? resolvedLtx : resolvedGemma;
 		if (!targetPath) return;
-		try {
-			const preflight = await getModelDownloadPreflight(preset, targetPath);
-			setModelStatus({
-				state: preflight.ok ? 'queued' : 'failed',
-				message: formatModelPreflightStatus(preflight),
-				error: preflight.errors?.join('; ')
-			});
-			if (!preflight.ok) return;
-			const job = await startModelDownload(preset, targetPath);
-			downloading = preset;
-			downloadJobId = job.job_id || '';
-			setModelStatus(job);
-			if (downloadJobId) {
-				await pollDownload(downloadJobId);
-			}
-		} catch (e) {
-			setModelStatus({ state: 'failed', error: e.message || 'Download failed' });
-		}
+		projectConfig.update((config) => config ? { ...config, model_dir: modelDir } : config);
+		await saveProjectNow();
+		await startSharedModelDownload({ preset, targetPath, modelDir, section: 'training' });
 	}
 
 	async function stopDownload() {
-		if (!downloadJobId) return;
-		try {
-			const status = await cancelModelDownload(downloadJobId);
-			setModelStatus(status);
-		} catch (e) {
-			setModelStatus({ state: 'failed', error: e.message || 'Cancel failed' });
-		}
+		await cancelSharedModelDownload();
 	}
 
 	function fieldError(field) {
@@ -406,10 +346,6 @@
 	</div>
 {:else}
 	<div class="space-y-4">
-		<div>
-			<h2 class="text-base font-semibold" style="color: var(--text-primary);">Training</h2>
-			<p class="text-[12px]" style="color: var(--text-muted);">Configure and run LoRA training.</p>
-		</div>
 		<!-- Two-column layout -->
 		<div class="grid grid-cols-1 xl:grid-cols-2 gap-4">
 			<!-- Left column -->
@@ -849,16 +785,11 @@
 							<div class="grid grid-cols-3 gap-x-4 gap-y-1">
 								<FormToggle fieldPath="training.gradient_checkpointing_cpu_offload" checked={t.gradient_checkpointing_cpu_offload ?? false} onchange={(e) => update('gradient_checkpointing_cpu_offload', e.target.checked)} tooltip="Offload checkpointed activations to CPU" />
 								<FormToggle fieldPath="training.split_attn" checked={t.split_attn ?? false} onchange={(e) => update('split_attn', e.target.checked)} tooltip="Legacy --split_attn flag. LTX-2-specific split controls are above." />
-								<FormToggle fieldPath="training.blockwise_checkpointing" checked={t.blockwise_checkpointing ?? false} onchange={(e) => update('blockwise_checkpointing', e.target.checked)} disabled={t.ltx2_model_parallel || t.ltx2_remote_stage} tooltip="Checkpoint blocks individually and reload state during backward." />
+								<FormToggle fieldPath="training.blockwise_checkpointing" checked={t.blockwise_checkpointing ?? false} onchange={(e) => update('blockwise_checkpointing', e.target.checked)} disabled={t.ltx2_model_parallel || t.ltx2_remote_stage} tooltip="Checkpoint transformer blocks individually and reload/offload block weights during backward. Reduces VRAM as blocks_to_checkpoint increases; slower and not available with model parallel or remote stage." />
 								<FormToggle fieldPath="training.use_pinned_memory_for_block_swap" checked={t.use_pinned_memory_for_block_swap ?? false} onchange={(e) => update('use_pinned_memory_for_block_swap', e.target.checked)} tooltip="Pinned memory for block swap" />
 								<FormToggle fieldPath="training.img_in_txt_in_offloading" checked={t.img_in_txt_in_offloading ?? false} onchange={(e) => update('img_in_txt_in_offloading', e.target.checked)} tooltip="Offload img_in/txt_in to CPU" />
 							</div>
-							{#if t.blockwise_checkpointing}
-								<div class="p-2 text-[11px] leading-relaxed" style="background: var(--warning-muted); border: 1px solid var(--warning); border-radius: var(--radius-sm); color: var(--text-primary);">
-									Blockwise checkpointing checkpoints blocks individually and reloads state during backward. On the 832x480x49 video dataset, peak VRAM is typically 4-6 GiB with `--blocks_to_swap 47`.
-								</div>
-							{/if}
-							<FormField type="number" fieldPath="training.blocks_to_checkpoint" value={t.blocks_to_checkpoint ?? ''} oninput={(e) => update('blocks_to_checkpoint', e.target.value ? Number(e.target.value) : null)} placeholder="All" disabled={!t.blockwise_checkpointing} tooltip="Blocks handled by blockwise checkpointing. -1 or blank checkpoints all blocks." />
+							<FormField type="number" fieldPath="training.blocks_to_checkpoint" value={t.blocks_to_checkpoint ?? ''} oninput={(e) => update('blocks_to_checkpoint', e.target.value ? Number(e.target.value) : null)} placeholder="All" disabled={!t.blockwise_checkpointing} tooltip="Number of transformer blocks handled by blockwise checkpointing. Blank or -1 checkpoints all blocks; 0 disables it. Higher values reduce VRAM and increase recompute/offload overhead." />
 							<FormField type="number" fieldPath="training.split_attn_chunk_size" value={t.split_attn_chunk_size ?? ''} oninput={(e) => update('split_attn_chunk_size', e.target.value ? Number(e.target.value) : null)} placeholder="Auto" disabled={!t.split_attn_target} tooltip="Split attention chunk size" />
 						{/if}
 					</div>

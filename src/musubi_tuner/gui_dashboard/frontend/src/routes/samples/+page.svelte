@@ -311,11 +311,6 @@
 	</div>
 {:else}
 	<div class="space-y-4">
-		<div>
-			<h2 class="text-base font-semibold" style="color: var(--text-primary);">Sample Prompts</h2>
-			<p class="text-[12px] mt-0.5" style="color: var(--text-muted);">Prompts for periodic sample generation during training. They are stored in the project automatically; a `.txt` file is optional.</p>
-		</div>
-
 		<div class="flex items-end gap-2">
 			<div class="flex-1">
 				<PathInput label="Prompts File" bind:value={filePath} showFiles tooltip="Optional path to import from or export to a sample prompts text file (.txt)." />

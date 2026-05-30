@@ -37,6 +37,7 @@ async def browse_directory(
         # Return root drives on Windows, / on Unix
         if os.name == "nt":
             import string
+
             drives = []
             for letter in string.ascii_uppercase:
                 drive = f"{letter}:\\"
@@ -58,17 +59,21 @@ async def browse_directory(
             if item.name.startswith("."):
                 continue
             if item.is_dir():
-                entries.append({
-                    "name": item.name,
-                    "path": str(item),
-                    "is_dir": True,
-                })
+                entries.append(
+                    {
+                        "name": item.name,
+                        "path": str(item),
+                        "is_dir": True,
+                    }
+                )
             elif show_files:
-                entries.append({
-                    "name": item.name,
-                    "path": str(item),
-                    "is_dir": False,
-                })
+                entries.append(
+                    {
+                        "name": item.name,
+                        "path": str(item),
+                        "is_dir": False,
+                    }
+                )
     except PermissionError:
         pass
 
@@ -284,7 +289,9 @@ def _completed_scan_payload(scan_type: str, target_name: str, results: list[str]
     return _scan_job_payload(job)
 
 
-def _scan_target_specs(scan_type: str, target_path: str, related_targets: dict[str, str] | None = None) -> dict[tuple[str, str], tuple[str, str]]:
+def _scan_target_specs(
+    scan_type: str, target_path: str, related_targets: dict[str, str] | None = None
+) -> dict[tuple[str, str], tuple[str, str]]:
     specs: dict[tuple[str, str], tuple[str, str]] = {}
 
     def add(target_type: str, path_or_name: str):
@@ -316,7 +323,11 @@ def _scan_exact_targets(
         return results
 
     def _matches_file(scan_type: str, item: Path, target_name: str) -> bool:
-        return scan_type in {"ltx2", "gemma_safetensors"} and _same_leaf_name(item.name, target_name) and item.suffix.casefold() in _SAFETENSORS_SUFFIXES
+        return (
+            scan_type in {"ltx2", "gemma_safetensors"}
+            and _same_leaf_name(item.name, target_name)
+            and item.suffix.casefold() in _SAFETENSORS_SUFFIXES
+        )
 
     def _matches_dir(scan_type: str, item: Path, target_name: str) -> bool:
         return scan_type == "gemma" and _same_leaf_name(item.name, target_name)
@@ -585,7 +596,9 @@ def _run_scan_job(job: ScanJob, extra_paths: str):
                     scan_type, target_name = related_specs[key]
                     _store_scan_results(scan_type, target_name, paths)
         elif job.scan_type == "ltx2":
-            results = _scan_ltx_checkpoints(roots, target_name=job.target_name, should_cancel=should_cancel, on_progress=on_progress)
+            results = _scan_ltx_checkpoints(
+                roots, target_name=job.target_name, should_cancel=should_cancel, on_progress=on_progress
+            )
             if not should_cancel():
                 _store_scan_results(job.scan_type, job.target_name, results)
         elif job.scan_type == "gemma":
@@ -593,7 +606,9 @@ def _run_scan_job(job: ScanJob, extra_paths: str):
             if not should_cancel():
                 _store_scan_results(job.scan_type, job.target_name, results)
         elif job.scan_type == "gemma_safetensors":
-            results = _scan_exact_files(roots, job.target_name, _SAFETENSORS_SUFFIXES, should_cancel=should_cancel, on_progress=on_progress)
+            results = _scan_exact_files(
+                roots, job.target_name, _SAFETENSORS_SUFFIXES, should_cancel=should_cancel, on_progress=on_progress
+            )
             if not should_cancel():
                 _store_scan_results(job.scan_type, job.target_name, results)
         else:
@@ -806,6 +821,11 @@ class DownloadJob:
     error: str | None = None
     bytes_downloaded: int = 0
     total_bytes: int | None = None
+    current_file_path: str | None = None
+    current_file_index: int | None = None
+    total_files: int | None = None
+    current_file_bytes_downloaded: int = 0
+    current_file_total_bytes: int | None = None
     created_at: float = dataclasses.field(default_factory=time.time)
     updated_at: float = dataclasses.field(default_factory=time.time)
     cancel_event: threading.Event = dataclasses.field(default_factory=threading.Event)
@@ -826,10 +846,7 @@ def _get_download_jobs(request: Request) -> dict[str, DownloadJob]:
 
 
 def _prune_finished_downloads(jobs: dict[str, DownloadJob], keep: int = 20) -> None:
-    finished = [
-        job for job in jobs.values()
-        if job.state in {"completed", "failed", "cancelled"}
-    ]
+    finished = [job for job in jobs.values() if job.state in {"completed", "failed", "cancelled"}]
     finished.sort(key=lambda job: job.updated_at, reverse=True)
     for job in finished[keep:]:
         jobs.pop(job.job_id, None)
@@ -845,6 +862,7 @@ def _set_job_state(job: DownloadJob, **fields) -> None:
 def _add_job_progress(job: DownloadJob, chunk_size: int) -> None:
     with job.lock:
         job.bytes_downloaded += chunk_size
+        job.current_file_bytes_downloaded += chunk_size
         job.updated_at = time.time()
 
 
@@ -863,6 +881,11 @@ def _snapshot_download_job(job: DownloadJob) -> dict:
             "error": job.error,
             "bytes_downloaded": job.bytes_downloaded,
             "total_bytes": job.total_bytes,
+            "current_file_path": job.current_file_path,
+            "current_file_index": job.current_file_index,
+            "total_files": job.total_files,
+            "current_file_bytes_downloaded": job.current_file_bytes_downloaded,
+            "current_file_total_bytes": job.current_file_total_bytes,
             "progress_percent": progress_percent,
             "created_at": job.created_at,
             "updated_at": job.updated_at,
@@ -937,6 +960,11 @@ def _run_download_job(job: DownloadJob) -> None:
                 job,
                 message=f"Downloading {filename}",
                 total_bytes=metadata.size or None,
+                current_file_path=filename,
+                current_file_index=1,
+                total_files=1,
+                current_file_bytes_downloaded=0,
+                current_file_total_bytes=metadata.size or None,
                 path=str(target_path),
             )
             _download_file(
@@ -960,13 +988,22 @@ def _run_download_job(job: DownloadJob) -> None:
         _set_job_state(
             job,
             total_bytes=total_bytes,
+            total_files=len(repo_files),
             path=str(target_dir),
             message=f"Downloading {len(repo_files)} files",
         )
         for index, entry in enumerate(repo_files, start=1):
             if job.cancel_event.is_set():
                 raise DownloadCancelled()
-            _set_job_state(job, message=f"Downloading {entry.path} ({index}/{len(repo_files)})")
+            _set_job_state(
+                job,
+                message=f"Downloading {entry.path} ({index}/{len(repo_files)})",
+                current_file_path=entry.path,
+                current_file_index=index,
+                total_files=len(repo_files),
+                current_file_bytes_downloaded=0,
+                current_file_total_bytes=entry.size or None,
+            )
             _download_file(
                 session=session,
                 url=hf_hub_url(repo_id=repo, filename=entry.path),

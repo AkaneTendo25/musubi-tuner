@@ -932,7 +932,7 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
             cmd.append("--ltx2_remote_stage_prune_local_blocks")
     if t.blocks_to_swap is not None:
         cmd += ["--blocks_to_swap", str(t.blocks_to_swap)]
-    if t.gradient_checkpointing:
+    if t.gradient_checkpointing or t.blockwise_checkpointing:
         cmd.append("--gradient_checkpointing")
     if t.gradient_checkpointing_cpu_offload:
         cmd.append("--gradient_checkpointing_cpu_offload")
@@ -1714,7 +1714,7 @@ def build_full_finetune_cmd(config: ProjectConfig) -> list[str]:
     # Memory and execution
     if t.blocks_to_swap is not None:
         cmd += ["--blocks_to_swap", str(t.blocks_to_swap)]
-    if t.gradient_checkpointing:
+    if t.gradient_checkpointing or t.blockwise_checkpointing:
         cmd.append("--gradient_checkpointing")
     if t.gradient_checkpointing_cpu_offload:
         cmd.append("--gradient_checkpointing_cpu_offload")

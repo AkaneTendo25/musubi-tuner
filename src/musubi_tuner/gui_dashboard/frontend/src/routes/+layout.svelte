@@ -7,6 +7,7 @@
 	import { loadProject, loadProjectDefaults } from '$lib/stores/project.js';
 	import { connectProcessSSE, disconnectProcessSSE, connectProcessValidationAutoRefresh, disconnectProcessValidationAutoRefresh } from '$lib/stores/processes.js';
 	import Sidebar from '$lib/components/Sidebar.svelte';
+	import TopStatusBar from '$lib/components/TopStatusBar.svelte';
 
 	let { children } = $props();
 	let tooltipState = $state({ visible: false, text: '', left: 0, top: 0, placement: 'top' });
@@ -94,6 +95,7 @@
 <div class="h-screen flex overflow-hidden" style="background: var(--bg-base);">
 	<Sidebar />
 	<div class="flex-1 flex flex-col min-w-0 overflow-hidden">
+		<TopStatusBar />
 		<main class="flex-1 overflow-auto p-5">
 			{@render children()}
 		</main>

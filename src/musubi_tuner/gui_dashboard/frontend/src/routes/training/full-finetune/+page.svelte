@@ -9,10 +9,11 @@
 	import ModelPathStatus from '$lib/components/ModelPathStatus.svelte';
 	import ProcessControls from '$lib/components/ProcessControls.svelte';
 	import CommandPanel from '$lib/components/CommandPanel.svelte';
-	import { projectConfig, projectLoaded, updateSection } from '$lib/stores/project.js';
+	import { projectConfig, projectLoaded, updateSection, saveProjectNow } from '$lib/stores/project.js';
 	import { processStatuses, processValidation, startProcess, stopProcess, validateProcess } from '$lib/stores/processes.js';
 	import { defaultModelDir, describeExactModelScan, effectiveGemmaRoot, effectiveGemmaSafetensors, effectiveLtx2Checkpoint } from '$lib/utils/modelPaths.js';
-	import { startModelDownload, getModelDownloadStatus, cancelModelDownload, formatModelDownloadStatus, getModelDownloadTone, isActiveModelDownload, getModelDownloadPresets, checkPathExists, scanCheckpointsWithProgress, cancelCheckpointScan, formatCheckpointScanStatus, modelDownloadTooltip } from '$lib/utils/modelDownloads.js';
+	import { getModelDownloadPresets, checkPathExists, scanCheckpointsWithProgress, cancelCheckpointScan, formatCheckpointScanStatus, modelDownloadTooltip } from '$lib/utils/modelDownloads.js';
+	import { cancelSharedModelDownload, modelDownloadState, resumeModelDownloadPolling, startSharedModelDownload } from '$lib/stores/modelDownloads.js';
 	import { goto } from '$app/navigation';
 	import { onMount } from 'svelte';
 
@@ -47,10 +48,6 @@
 	let hasValidationIssues = $derived((validation.errors?.length || 0) > 0 || (validation.warnings?.length || 0) > 0);
 	let validationTimer = null;
 	let cwd = $state('');
-	let downloadJobId = $state('');
-	let downloadState = $state('');
-	let modelStatus = $state('');
-	let modelStatusTone = $state('muted');
 	let downloadPresets = $state({});
 	let ltxDownloadExists = $state(false);
 	let gemmaDownloadExists = $state(false);
@@ -70,7 +67,6 @@
 	let ltxScanJobId = $state('');
 	let gemmaScanJobId = $state('');
 	let gemmaSafetensorsScanJobId = $state('');
-	let downloadPollTimer = null;
 
 	onMount(async () => {
 		try {
@@ -80,8 +76,8 @@
 		try {
 			downloadPresets = await getModelDownloadPresets();
 		} catch {}
+		resumeModelDownloadPolling();
 		return () => {
-			clearTimeout(downloadPollTimer);
 			if (ltxScanJobId) cancelCheckpointScan(ltxScanJobId).catch(() => {});
 			if (gemmaScanJobId) cancelCheckpointScan(gemmaScanJobId).catch(() => {});
 			if (gemmaSafetensorsScanJobId) cancelCheckpointScan(gemmaSafetensorsScanJobId).catch(() => {});
@@ -94,7 +90,10 @@
 	let gemmaRootDisabled = $derived(Boolean(activeGemmaSafetensors));
 	let resolvedGemma = $derived(effectiveGemmaRoot(cwd, $projectConfig, t.gemma_root || '', activeGemmaSafetensors));
 	let scanTargetGemmaRoot = $derived(effectiveGemmaRoot(cwd, $projectConfig, t.gemma_root || '', ''));
-	let hasActiveDownload = $derived(Boolean(downloadJobId) && ['queued', 'running', 'cancelling'].includes(downloadState));
+	let downloadState = $derived($modelDownloadState.state || '');
+	let modelStatus = $derived($modelDownloadState.message || '');
+	let modelStatusTone = $derived($modelDownloadState.tone || 'muted');
+	let hasActiveDownload = $derived(Boolean($modelDownloadState.jobId) && ['queued', 'running', 'cancelling'].includes(downloadState));
 
 	function update(key, value) {
 		updateSection(section, key, value);
@@ -120,50 +119,16 @@
 		};
 	}
 
-	function setModelStatus(status) {
-		modelStatus = formatModelDownloadStatus(status);
-		modelStatusTone = getModelDownloadTone(status);
-		downloadState = status?.state || '';
-		if (!isActiveModelDownload(status)) {
-			downloadJobId = '';
-		}
-	}
-
-	async function pollDownload(jobId) {
-		clearTimeout(downloadPollTimer);
-		if (!jobId) return;
-		try {
-			const status = await getModelDownloadStatus(jobId);
-			setModelStatus(status);
-			if (isActiveModelDownload(status)) {
-				downloadPollTimer = setTimeout(() => pollDownload(jobId), 1000);
-			}
-		} catch (e) {
-			setModelStatus({ state: 'failed', error: e.message || 'Download status failed' });
-		}
-	}
-
 	async function downloadModel(preset) {
 		const targetPath = preset === 'ltxav' ? resolvedLtx : resolvedGemma;
 		if (!targetPath) return;
-		try {
-			const status = await startModelDownload(preset, targetPath);
-			downloadJobId = status.job_id || '';
-			setModelStatus(status);
-			if (downloadJobId) pollDownload(downloadJobId);
-		} catch (e) {
-			setModelStatus({ state: 'failed', error: e.message || 'Download failed' });
-		}
+		projectConfig.update((config) => config ? { ...config, model_dir: modelDir } : config);
+		await saveProjectNow();
+		await startSharedModelDownload({ preset, targetPath, modelDir, section });
 	}
 
 	async function stopDownload() {
-		if (!downloadJobId) return;
-		try {
-			const status = await cancelModelDownload(downloadJobId);
-			setModelStatus(status);
-		} catch (e) {
-			setModelStatus({ state: 'failed', error: e.message || 'Cancel failed' });
-		}
+		await cancelSharedModelDownload();
 	}
 
 	async function scanLtx() {
@@ -443,12 +408,6 @@
 	</div>
 {:else}
 <div class="space-y-4">
-	<div class="flex items-center justify-between gap-3">
-		<div>
-			<h2 class="text-base font-semibold" style="color: var(--text-primary);">Fine-tuning</h2>
-		</div>
-	</div>
-
 	{#if hasValidationIssues}
 		<div class="p-3 space-y-2" style="background: {validation.errors?.length ? 'var(--danger-muted)' : 'var(--bg-elevated)'}; border: 1px solid {validation.errors?.length ? 'var(--danger)' : 'var(--border)'}; border-radius: var(--radius-sm);">
 			<div class="text-[12px] font-medium" style="color: {validation.errors?.length ? 'var(--danger)' : 'var(--text-primary)'};">

@@ -84,10 +84,6 @@
 	</div>
 {:else if !$advancedMode}
 	<div class="space-y-4">
-		<div>
-			<h2 class="text-base font-semibold" style="color: var(--text-primary);">Training Techniques</h2>
-			<p class="text-[12px]" style="color: var(--text-muted);">This page is only shown in Advanced mode.</p>
-		</div>
 		<div class="p-5" style="background: var(--bg-surface); border: 1px solid var(--border-subtle); border-radius: var(--radius-md);">
 			<div class="text-[13px] font-semibold mb-1" style="color: var(--text-primary);">Advanced mode required</div>
 			<div class="text-[12px]" style="color: var(--text-secondary);">Switch the left sidebar to `Advanced` to access CREPA, Self-Flow, HFATO, slider targets, and the rest of the specialized training controls.</div>
@@ -95,11 +91,6 @@
 	</div>
 {:else}
 	<div class="space-y-5">
-		<div>
-			<h2 class="text-base font-semibold" style="color: var(--text-primary);">Training Techniques</h2>
-			<p class="text-[12px]" style="color: var(--text-muted);">Advanced training enhancements and specialized LoRA types.</p>
-		</div>
-
 		<!-- CREPA -->
 		<div style="background: var(--bg-surface); border: 1px solid var(--border-subtle); border-radius: var(--radius-md); position: relative; overflow: hidden;">
 			<div style="position: absolute; top: 0; left: 0; right: 0; height: 2px; background: linear-gradient(90deg, transparent, var(--accent), var(--secondary, var(--accent)), transparent); opacity: 0.5;"></div>

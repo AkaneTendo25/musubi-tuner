@@ -169,19 +169,6 @@
 	</div>
 {:else}
 	<div class="space-y-5">
-		<div class="flex items-center justify-between">
-			<div>
-				<h2 class="text-base font-semibold" style="color: var(--text-primary);">Dataset</h2>
-				<p class="text-[12px]" style="color: var(--text-muted);">Configure training and validation datasets.</p>
-			</div>
-			{#if $advancedMode}
-				<div class="flex items-center gap-5">
-					<FormToggle label="Enable Bucket" checked={general.enable_bucket ?? true} onchange={(e) => updateGeneral('enable_bucket', e.target.checked)} tooltip="Enable resolution bucketing for varied aspect ratios" />
-					<FormToggle label="No Upscale" checked={general.bucket_no_upscale ?? true} onchange={(e) => updateGeneral('bucket_no_upscale', e.target.checked)} tooltip="Prevent upscaling images smaller than bucket resolution" />
-				</div>
-			{/if}
-		</div>
-
 		{#if datasetValidationIssues.length}
 			<div class="p-3 space-y-1" style="background: {(trainingValidation.errors || []).some((issue) => issue.page === 'dataset') ? 'var(--danger-muted)' : 'var(--bg-elevated)'}; border: 1px solid {(trainingValidation.errors || []).some((issue) => issue.page === 'dataset') ? 'var(--danger)' : 'var(--border)'}; border-radius: var(--radius-sm);">
 				{#each datasetValidationIssues as issue}
@@ -194,13 +181,24 @@
 
 		<!-- Training Datasets -->
 		<div>
-			<div class="flex items-center justify-between mb-2">
+			<div class="flex flex-wrap items-center justify-between gap-2 mb-2">
 				<span class="text-[11px] font-medium uppercase tracking-wider" style="color: var(--text-muted);">Training</span>
-				<button
-					onclick={() => addDataset(false)}
-					class="px-3 py-1 text-[11px] font-medium"
-					style="color: var(--accent); border: 1px solid var(--accent-muted); border-radius: var(--radius-full); background: var(--accent-subtle-bg);"
-				>+ Add</button>
+				<div class="flex flex-wrap items-center gap-1.5">
+					{#if $advancedMode}
+						<div class="w-36">
+							<FormToggle label="Enable Bucket" checked={general.enable_bucket ?? true} onchange={(e) => updateGeneral('enable_bucket', e.target.checked)} tooltip="Enable resolution bucketing for varied aspect ratios" />
+						</div>
+						<div class="w-32">
+							<FormToggle label="No Upscale" checked={general.bucket_no_upscale ?? true} onchange={(e) => updateGeneral('bucket_no_upscale', e.target.checked)} tooltip="Prevent upscaling images smaller than bucket resolution" />
+						</div>
+					{/if}
+					<button
+						type="button"
+						onclick={() => addDataset(false)}
+						class="px-3 py-1 text-[11px] font-medium"
+						style="color: var(--accent); border: 1px solid var(--accent-muted); border-radius: var(--radius-full); background: var(--accent-subtle-bg);"
+					>+ Add</button>
+				</div>
 			</div>
 			<div class="grid grid-cols-1 xl:grid-cols-2 gap-3">
 				{#each datasets as entry, i}

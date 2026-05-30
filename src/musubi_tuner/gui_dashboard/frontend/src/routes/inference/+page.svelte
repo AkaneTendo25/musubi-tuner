@@ -10,18 +10,14 @@
 	import ProcessControls from '$lib/components/ProcessControls.svelte';
 	import CommandPanel from '$lib/components/CommandPanel.svelte';
 	import { defaultModelDir, describeExactModelScan, effectiveGemmaRoot, effectiveGemmaSafetensors, effectiveLtx2Checkpoint } from '$lib/utils/modelPaths.js';
-	import { startModelDownload, getModelDownloadStatus, cancelModelDownload, formatModelDownloadStatus, getModelDownloadTone, isActiveModelDownload, getModelDownloadPresets, getModelDownloadPreflight, checkPathExists, scanCheckpointsWithProgress, cancelCheckpointScan, formatCheckpointScanStatus, modelDownloadTooltip, formatModelPreflightStatus } from '$lib/utils/modelDownloads.js';
+	import { getModelDownloadPresets, checkPathExists, scanCheckpointsWithProgress, cancelCheckpointScan, formatCheckpointScanStatus, modelDownloadTooltip } from '$lib/utils/modelDownloads.js';
+	import { cancelSharedModelDownload, modelDownloadState, resumeModelDownloadPolling, startSharedModelDownload } from '$lib/stores/modelDownloads.js';
 	import { projectConfig, projectLoaded, updateSection, saveProjectNow } from '$lib/stores/project.js';
 	import { processStatuses, processLogs, startProcess, stopProcess, preloadLogsIfActive, startLogPolling } from '$lib/stores/processes.js';
 	import { advancedMode } from '$lib/stores/uiMode.js';
 	import { onMount } from 'svelte';
 
 	let cwd = $state('');
-	let downloading = $state('');
-	let downloadJobId = $state('');
-	let downloadState = $state('');
-	let modelStatus = $state('');
-	let modelStatusTone = $state('muted');
 	let downloadPresets = $state({});
 	let ltxDownloadExists = $state(false);
 	let gemmaDownloadExists = $state(false);
@@ -41,16 +37,15 @@
 	let ltxScanJobId = $state('');
 	let gemmaScanJobId = $state('');
 	let gemmaSafetensorsScanJobId = $state('');
-	let downloadPollTimer = null;
 
 	onMount(() => {
 		fetch('/api/fs/cwd').then((res) => res.ok ? res.json() : null).then((data) => { cwd = data?.cwd || ''; }).catch(() => {});
 		getModelDownloadPresets().then((presets) => { downloadPresets = presets; }).catch(() => {});
+		resumeModelDownloadPolling();
 		preloadLogsIfActive('inference');
 		const logInterval = startLogPolling('inference', 1000);
 		return () => {
 			clearInterval(logInterval);
-			if (downloadPollTimer) clearTimeout(downloadPollTimer);
 			if (ltxScanJobId) cancelCheckpointScan(ltxScanJobId).catch(() => {});
 			if (gemmaScanJobId) cancelCheckpointScan(gemmaScanJobId).catch(() => {});
 			if (gemmaSafetensorsScanJobId) cancelCheckpointScan(gemmaSafetensorsScanJobId).catch(() => {});
@@ -68,7 +63,10 @@
 	let gemmaRootDisabled = $derived(Boolean(activeGemmaSafetensors));
 	let resolvedGemma = $derived(effectiveGemmaRoot(cwd, $projectConfig, s.gemma_root || '', activeGemmaSafetensors));
 	let scanTargetGemmaRoot = $derived(effectiveGemmaRoot(cwd, $projectConfig, s.gemma_root || '', ''));
-	let hasActiveDownload = $derived(Boolean(downloadJobId) && ['queued', 'running', 'cancelling'].includes(downloadState));
+	let downloadState = $derived($modelDownloadState.state || '');
+	let modelStatus = $derived($modelDownloadState.message || '');
+	let modelStatusTone = $derived($modelDownloadState.tone || 'muted');
+	let hasActiveDownload = $derived(Boolean($modelDownloadState.jobId) && ['queued', 'running', 'cancelling'].includes(downloadState));
 
 	function relatedScanTargets() {
 		return {
@@ -238,75 +236,17 @@
 		}
 	}
 
-	function setModelStatus(status) {
-		modelStatus = formatModelDownloadStatus(status);
-		modelStatusTone = getModelDownloadTone(status);
-		downloadState = status?.state || '';
-	}
-
-	async function finalizeDownload(status) {
-		if (status.state === 'completed' && status.path) {
-			update('ltx2_checkpoint', downloading === 'ltxav' ? status.path : s.ltx2_checkpoint || '');
-			if (downloading === 'gemma-unsloth') {
-				update('gemma_root', status.path);
-				update('gemma_safetensors', '');
-			}
-			projectConfig.update((config) => config ? { ...config, model_dir: modelDir } : config);
-			await saveProjectNow();
-		}
-		downloadJobId = '';
-		downloading = '';
-	}
-
-	async function pollDownload(jobId) {
-		if (downloadPollTimer) clearTimeout(downloadPollTimer);
-		try {
-			const status = await getModelDownloadStatus(jobId);
-			setModelStatus(status);
-			if (!isActiveModelDownload(status)) {
-				await finalizeDownload(status);
-				return;
-			}
-			downloadPollTimer = setTimeout(() => pollDownload(jobId), 1000);
-		} catch (e) {
-			setModelStatus({ state: 'failed', error: e.message || 'Download status failed' });
-			downloadJobId = '';
-			downloading = '';
-		}
-	}
-
 	async function downloadModel(preset) {
-		if (downloadJobId) return;
+		if (hasActiveDownload) return;
 		const targetPath = preset === 'ltxav' ? resolvedLtx : resolvedGemma;
 		if (!targetPath) return;
-		try {
-			const preflight = await getModelDownloadPreflight(preset, targetPath);
-			setModelStatus({
-				state: preflight.ok ? 'queued' : 'failed',
-				message: formatModelPreflightStatus(preflight),
-				error: preflight.errors?.join('; ')
-			});
-			if (!preflight.ok) return;
-			const job = await startModelDownload(preset, targetPath);
-			downloading = preset;
-			downloadJobId = job.job_id || '';
-			setModelStatus(job);
-			if (downloadJobId) {
-				await pollDownload(downloadJobId);
-			}
-		} catch (e) {
-			setModelStatus({ state: 'failed', error: e.message || 'Download failed' });
-		}
+		projectConfig.update((config) => config ? { ...config, model_dir: modelDir } : config);
+		await saveProjectNow();
+		await startSharedModelDownload({ preset, targetPath, modelDir, section: 'inference' });
 	}
 
 	async function stopDownload() {
-		if (!downloadJobId) return;
-		try {
-			const status = await cancelModelDownload(downloadJobId);
-			setModelStatus(status);
-		} catch (e) {
-			setModelStatus({ state: 'failed', error: e.message || 'Cancel failed' });
-		}
+		await cancelSharedModelDownload();
 	}
 </script>
 
@@ -316,11 +256,6 @@
 	</div>
 {:else}
 	<div class="space-y-4">
-		<div>
-			<h2 class="text-base font-semibold" style="color: var(--text-primary);">Inference</h2>
-			<p class="text-[12px]" style="color: var(--text-muted);">Generate videos using your trained LoRA. Advanced mode exposes the full inference CLI surface.</p>
-		</div>
-
 		<!-- Two-column layout -->
 		<div class="grid grid-cols-1 xl:grid-cols-2 gap-4">
 			<!-- Left column -->
