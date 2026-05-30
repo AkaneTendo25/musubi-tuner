@@ -3697,15 +3697,21 @@ def main() -> None:
 
         _i8_group = int(getattr(args, "int8_weights_group_size", 0) or 0)
         _i8_outlier_q = float(getattr(args, "int8_weights_outlier_quantile", 1.0) or 1.0)
+        _i8_sparse = float(getattr(args, "int8_weights_sparse_ratio", 0.0) or 0.0)
         int8_weights_summary = convert_to_int8_training(
-            transformer, filter_fn=_i8_keep, group_size=_i8_group, outlier_clip_quantile=_i8_outlier_q
+            transformer,
+            filter_fn=_i8_keep,
+            group_size=_i8_group,
+            outlier_clip_quantile=_i8_outlier_q,
+            sparse_ratio=_i8_sparse,
         )
         logger.info(
-            "int8 weight-only QT: replaced %d Linear layers targets=%s group_size=%d outlier_clip_quantile=%g (1 byte/param, stochastic-rounding updates)",
+            "int8 weight-only QT: replaced %d Linear layers targets=%s group_size=%d outlier_clip_quantile=%g sparse_ratio=%g (1 byte/param, stochastic-rounding updates)",
             int8_weights_summary,
             getattr(args, "int8_weights_targets", "video"),
             _i8_group,
             _i8_outlier_q,
+            _i8_sparse,
         )
         if int8_weights_summary <= 0:
             raise ValueError(

@@ -900,6 +900,14 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         "useful when a heavy outlier tail inflates absmax and coarsens every other weight.",
     )
     parser.add_argument(
+        "--int8_weights_sparse_ratio",
+        type=float,
+        default=0.0,
+        help="Keep the top fraction of |w| as an exact fp32 side-vector, excluded from the int8 grid so "
+        "outliers don't coarsen the bulk weights. Default 0.0 = off; try 0.01. Alternative to "
+        "--int8_weights_outlier_quantile (which clips the tail); use one or the other.",
+    )
+    parser.add_argument(
         "--nf4_base",
         action="store_true",
         help="use NF4 4-bit quantization for base DiT model (reduces VRAM ~75%%)",

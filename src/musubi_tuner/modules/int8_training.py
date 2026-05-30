@@ -29,8 +29,12 @@ def quantize_int8(
     stochastic_rounding: bool = False,
     eps: float = 1e-12,
     outlier_clip_quantile: float = 1.0,
+    sparse_ratio: float = 0.0,
 ):
-    """Symmetric int8 quantization. Returns (int8 data [out,in], scale).
+    """Symmetric int8 quantization.
+
+    Returns (int8 data [out,in], scale) when sparse_ratio<=0, or
+    (int8 data, scale, sparse_idx, sparse_val) when sparse_ratio>0.
 
     group_size<=0 -> row-wise: scale shape (out,). group_size>0 -> group-wise along the
     input dim: scale shape (out, in//group_size). Stochastic rounding rounds up with
@@ -40,11 +44,31 @@ def quantize_int8(
     outlier_clip_quantile<1.0 sets the scale from a per-row/group quantile of |w| rather
     than the absmax: the top (1 - q) of weights gets clipped to ±127·scale, the rest gets
     a tighter grid. Default 1.0 uses the absmax.
+
+    sparse_ratio>0 (dense-and-sparse) holds the top
+    ``sparse_ratio`` fraction of |w| as an exact fp32 side-vector (sparse_idx flat
+    indices, sparse_val values) and zeroes those positions BEFORE computing the int8
+    scale, so a few heavy outliers no longer inflate the grid for the bulk. Outliers are
+    scattered back on dequantize. Returns the extra (sparse_idx int64, sparse_val fp32).
+    Orthogonal to outlier_clip_quantile (clip discards the tail; sparse preserves it
+    exactly) — use one or the other.
     """
     out_features, in_features = tensor.shape
+    sparse_idx = None
+    sparse_val = None
+    work = tensor
+    if sparse_ratio and sparse_ratio > 0.0:
+        flat = tensor.reshape(-1)
+        k = int(flat.numel() * float(sparse_ratio))
+        if k > 0:
+            sparse_idx = flat.abs().topk(k, sorted=False).indices
+            sparse_val = flat[sparse_idx].to(torch.float32).clone()
+            work = flat.clone()
+            work[sparse_idx] = 0.0  # exclude outliers from the dense int8 grid
+            work = work.reshape(out_features, in_features)
     use_group = bool(group_size) and group_size > 0 and in_features % group_size == 0 and group_size < in_features
     if use_group:
-        t = tensor.reshape(out_features, in_features // group_size, group_size)
+        t = work.reshape(out_features, in_features // group_size, group_size)
         if outlier_clip_quantile >= 1.0:
             scale = t.abs().amax(-1) / 127
         else:
@@ -53,16 +77,21 @@ def quantize_int8(
         q = t.float() * inv
     else:
         if outlier_clip_quantile >= 1.0:
-            scale = tensor.abs().amax(1) / 127
+            scale = work.abs().amax(1) / 127
         else:
-            scale = torch.quantile(tensor.abs().float(), outlier_clip_quantile, dim=1).to(tensor.dtype) / 127
+            scale = torch.quantile(work.abs().float(), outlier_clip_quantile, dim=1).to(work.dtype) / 127
         inv = (1.0 / scale.float().clamp(eps)).view(-1, 1)
-        q = tensor.float() * inv
+        q = work.float() * inv
     if stochastic_rounding:
         q = (q + torch.rand_like(q)).floor()
     else:
         q = q.round()
     q = q.clip(-128, 127).reshape(out_features, in_features).to(torch.int8)
+    if sparse_ratio and sparse_ratio > 0.0:
+        if sparse_idx is None:  # k==0 (tiny tensor): empty side-vectors
+            sparse_idx = tensor.new_empty(0, dtype=torch.int64)
+            sparse_val = tensor.new_empty(0, dtype=torch.float32)
+        return q, scale, sparse_idx, sparse_val
     return q, scale
 
 
@@ -118,29 +147,119 @@ class Int8QTWeight(Tensor):
     """
 
     @staticmethod
-    def __new__(cls, int_data: Tensor, scale: Tensor, group_size: int = 0, outlier_clip_quantile: float = 1.0):
+    def __new__(
+        cls,
+        int_data: Tensor,
+        scale: Tensor,
+        group_size: int = 0,
+        outlier_clip_quantile: float = 1.0,
+        sparse_idx: Tensor | None = None,
+        sparse_val: Tensor | None = None,
+        sparse_ratio: float = 0.0,
+    ):
         return Tensor._make_wrapper_subclass(cls, int_data.shape, dtype=scale.dtype, device=int_data.device, requires_grad=False)
 
-    def __init__(self, int_data: Tensor, scale: Tensor, group_size: int = 0, outlier_clip_quantile: float = 1.0):
+    def __init__(
+        self,
+        int_data: Tensor,
+        scale: Tensor,
+        group_size: int = 0,
+        outlier_clip_quantile: float = 1.0,
+        sparse_idx: Tensor | None = None,
+        sparse_val: Tensor | None = None,
+        sparse_ratio: float = 0.0,
+    ):
         assert int_data.dtype is torch.int8 and int_data.ndim == 2
         self.int_data = int_data
         self.scale = scale
         self.group_size = int(group_size)
         self.outlier_clip_quantile = float(outlier_clip_quantile)
+        self.sparse_ratio = float(sparse_ratio)
+        # dense-and-sparse outlier side-vectors (None when sparse_ratio<=0).
+        self.sparse_idx = sparse_idx
+        self.sparse_val = sparse_val
 
     def __tensor_flatten__(self):
-        return ["int_data", "scale"], [self.group_size, self.outlier_clip_quantile]
+        inner = ["int_data", "scale"]
+        if self.sparse_val is not None:
+            inner = inner + ["sparse_idx", "sparse_val"]
+        return inner, [self.group_size, self.outlier_clip_quantile, self.sparse_ratio]
 
     @classmethod
     def __tensor_unflatten__(cls, inner_tensors, meta, outer_size, outer_stride):
-        return cls(inner_tensors["int_data"], inner_tensors["scale"], meta[0], meta[1] if len(meta) > 1 else 1.0)
+        ocq = meta[1] if len(meta) > 1 else 1.0
+        sr = meta[2] if len(meta) > 2 else 0.0
+        return cls(
+            inner_tensors["int_data"],
+            inner_tensors["scale"],
+            meta[0],
+            ocq,
+            inner_tensors.get("sparse_idx"),
+            inner_tensors.get("sparse_val"),
+            sr,
+        )
 
     def dequantize(self) -> Tensor:
-        return _dequantize(self.int_data, self.scale)
+        w = _dequantize(self.int_data, self.scale)
+        if self.sparse_val is not None and self.sparse_val.numel() > 0:
+            # w is fresh (int_data*scale); scatter outliers in place, no clone
+            w = w.contiguous()
+            w.view(-1)[self.sparse_idx] = self.sparse_val.to(w.dtype)
+        return w
+
+    @torch.no_grad()
+    def requantize_(self, t: Tensor, stochastic_rounding: bool = True) -> "Int8QTWeight":
+        """In-place write of ``t`` into the int8 storage.
+
+        Replaces int_data/scale (and the dense-sparse outlier side-vectors when
+        sparse_ratio>0) with a fresh quantization of ``t`` using this weight's
+        group_size / outlier_clip_quantile / sparse_ratio. stochastic_rounding=True
+        (default) is the per-step SR update path; False writes deterministic
+        round-to-nearest, for optimizers that handle the rounding residual themselves.
+        """
+        if self.sparse_ratio > 0.0:
+            int_data, scale, sidx, sval = quantize_int8(
+                t,
+                self.group_size,
+                stochastic_rounding=stochastic_rounding,
+                outlier_clip_quantile=self.outlier_clip_quantile,
+                sparse_ratio=self.sparse_ratio,
+            )
+            self.int_data.copy_(int_data)
+            self.scale.copy_(scale)
+            # k = floor(numel*ratio) is constant for a fixed weight, so the side-vector
+            # sizes are stable across updates and copy_ is in place.
+            self.sparse_idx.copy_(sidx)
+            self.sparse_val.copy_(sval)
+            return self
+        int_data, scale = quantize_int8(
+            t,
+            self.group_size,
+            stochastic_rounding=stochastic_rounding,
+            outlier_clip_quantile=self.outlier_clip_quantile,
+        )
+        self.int_data.copy_(int_data)
+        self.scale.copy_(scale)
+        return self
 
     @classmethod
     @torch.no_grad()
-    def from_float(cls, weight: Tensor, group_size: int = 0, outlier_clip_quantile: float = 1.0) -> "Int8QTWeight":
+    def from_float(
+        cls,
+        weight: Tensor,
+        group_size: int = 0,
+        outlier_clip_quantile: float = 1.0,
+        sparse_ratio: float = 0.0,
+    ) -> "Int8QTWeight":
+        if sparse_ratio and sparse_ratio > 0.0:
+            int_data, scale, sidx, sval = quantize_int8(
+                weight.detach(),
+                group_size,
+                stochastic_rounding=False,
+                outlier_clip_quantile=outlier_clip_quantile,
+                sparse_ratio=sparse_ratio,
+            )
+            return cls(int_data, scale, group_size, outlier_clip_quantile, sidx, sval, sparse_ratio)
         int_data, scale = quantize_int8(
             weight.detach(), group_size, stochastic_rounding=False, outlier_clip_quantile=outlier_clip_quantile
         )
@@ -168,11 +287,17 @@ class Int8QTWeight(Tensor):
 
 @_implements([aten.detach.default, aten.clone.default])
 def _(func, types, args, kwargs):
+    a = args[0]
+    sidx = getattr(a, "sparse_idx", None)
+    sval = getattr(a, "sparse_val", None)
     out = Int8QTWeight(
-        func(args[0].int_data),
-        func(args[0].scale),
-        args[0].group_size,
-        getattr(args[0], "outlier_clip_quantile", 1.0),
+        func(a.int_data),
+        func(a.scale),
+        a.group_size,
+        getattr(a, "outlier_clip_quantile", 1.0),
+        func(sidx) if sidx is not None else None,
+        func(sval) if sval is not None else None,
+        getattr(a, "sparse_ratio", 0.0),
     )
     return return_and_correct_aliasing(func, args, kwargs, out)
 
@@ -181,11 +306,17 @@ def _(func, types, args, kwargs):
 def _(func, types, args, kwargs):
     device = kwargs.get("device", None)
     dtype = kwargs.get("dtype", None)
+    a = args[0]
+    sidx = getattr(a, "sparse_idx", None)
+    sval = getattr(a, "sparse_val", None)
     out = Int8QTWeight(
-        args[0].int_data.to(device=device),
-        args[0].scale.to(device=device, dtype=dtype),
-        args[0].group_size,
-        getattr(args[0], "outlier_clip_quantile", 1.0),
+        a.int_data.to(device=device),
+        a.scale.to(device=device, dtype=dtype),
+        a.group_size,
+        getattr(a, "outlier_clip_quantile", 1.0),
+        sidx.to(device=device) if sidx is not None else None,  # idx stays int64
+        sval.to(device=device) if sval is not None else None,  # val stays fp32
+        getattr(a, "sparse_ratio", 0.0),
     )
     return return_and_correct_aliasing(func, args, kwargs, out)
 
@@ -209,28 +340,61 @@ def _(func, types, args, kwargs):
     if isinstance(dst, Int8QTWeight) and isinstance(src, Int8QTWeight):
         dst.int_data.copy_(src.int_data)
         dst.scale.copy_(src.scale)
+        if getattr(dst, "sparse_val", None) is not None and getattr(src, "sparse_val", None) is not None:
+            dst.sparse_idx.copy_(src.sparse_idx)
+            dst.sparse_val.copy_(src.sparse_val)
     elif isinstance(dst, Int8QTWeight):
-        int_data, scale = quantize_int8(
-            src,
-            dst.group_size,
-            stochastic_rounding=True,  # SR on update
-            outlier_clip_quantile=getattr(dst, "outlier_clip_quantile", 1.0),
-        )
-        dst.int_data.copy_(int_data)
-        dst.scale.copy_(scale)
+        if getattr(dst, "sparse_ratio", 0.0) > 0.0:
+            int_data, scale, sidx, sval = quantize_int8(
+                src,
+                dst.group_size,
+                stochastic_rounding=True,  # SR on update
+                outlier_clip_quantile=getattr(dst, "outlier_clip_quantile", 1.0),
+                sparse_ratio=dst.sparse_ratio,
+            )
+            dst.int_data.copy_(int_data)
+            dst.scale.copy_(scale)
+            dst.sparse_idx.copy_(sidx)
+            dst.sparse_val.copy_(sval)
+        else:
+            int_data, scale = quantize_int8(
+                src,
+                dst.group_size,
+                stochastic_rounding=True,  # SR on update
+                outlier_clip_quantile=getattr(dst, "outlier_clip_quantile", 1.0),
+            )
+            dst.int_data.copy_(int_data)
+            dst.scale.copy_(scale)
     else:
         dst.copy_(src.dequantize())
     return dst
 
 
-@_implements([aten.add_.Tensor, aten.addcdiv_.default, aten.mul_.Tensor])
+@_implements(
+    [
+        aten.add_.Tensor,
+        aten.sub_.Tensor,
+        aten.addcdiv_.default,
+        aten.addcmul_.default,
+        aten.mul_.Tensor,
+        aten.div_.Tensor,
+        aten.lerp_.Scalar,
+        aten.lerp_.Tensor,
+    ]
+)
 def _(func, types, args, kwargs):
+    # Dequantize every Int8QTWeight in args, not just args[0]: ops like
+    # grad.sub_(param) put the weight at args[1], which would otherwise recurse
+    # through __torch_dispatch__ until the recursion limit.
     original = args[0]
-    out = func(args[0].dequantize(), *args[1:], **kwargs)
+    deq_args = tuple(a.dequantize() if isinstance(a, Int8QTWeight) else a for a in args)
+    out = func(*deq_args, **kwargs)
     return original.copy_(out)
 
 
-def convert_to_int8_training(model: nn.Module, *, filter_fn=None, group_size: int = 0, outlier_clip_quantile: float = 1.0) -> int:
+def convert_to_int8_training(
+    model: nn.Module, *, filter_fn=None, group_size: int = 0, outlier_clip_quantile: float = 1.0, sparse_ratio: float = 0.0
+) -> int:
     """Swap eligible nn.Linear weights to Int8QTWeight in place. Returns count."""
     replaced = 0
     for name, module in model.named_modules():
@@ -240,7 +404,7 @@ def convert_to_int8_training(model: nn.Module, *, filter_fn=None, group_size: in
             continue
         w = module.weight
         module.weight = nn.Parameter(
-            Int8QTWeight.from_float(w.data, group_size, outlier_clip_quantile=outlier_clip_quantile),
+            Int8QTWeight.from_float(w.data, group_size, outlier_clip_quantile=outlier_clip_quantile, sparse_ratio=sparse_ratio),
             requires_grad=w.requires_grad,
         )
         replaced += 1
