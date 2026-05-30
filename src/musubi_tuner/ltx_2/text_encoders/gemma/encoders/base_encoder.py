@@ -91,7 +91,7 @@ class GemmaTextEncoderModelBase(torch.nn.Module):
         return projected, attention_mask
 
     def _init_image_processor(self) -> None:
-        img_processor = AutoImageProcessor.from_pretrained(self._gemma_root, local_files_only=True)
+        img_processor = AutoImageProcessor.from_pretrained(self._gemma_root, local_files_only=True, use_fast=False)
         if not self.tokenizer:
             raise ValueError("Tokenizer is not loaded, cannot load image processor")
         self.processor = Gemma3Processor(image_processor=img_processor, tokenizer=self.tokenizer.tokenizer)
@@ -418,7 +418,7 @@ def apply_text_encoder_checkpoint_overrides(
         loaded = 0
         skipped_quantized: list[str] = []
         for key in override_keys:
-            module_key = key[len(prefix):]
+            module_key = key[len(prefix) :]
             try:
                 submodule, attr_name = _resolve_module_and_attr(text_encoder, module_key)
             except AttributeError:
@@ -565,6 +565,7 @@ def module_ops_from_gemma_root(
         else:
             if gemma_weights_path is not None:
                 from safetensors import safe_open
+
                 load_device = device or (torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
                 if keep_fp8 and load_device.type != "cuda":
                     raise ValueError("Float8 Gemma weights require CUDA; provide a GPU or use non-fp8 weights.")
@@ -573,46 +574,48 @@ def module_ops_from_gemma_root(
 
                 if gemma_root is not None:
                     from transformers import AutoConfig
+
                     config = AutoConfig.from_pretrained(gemma_root, local_files_only=True)
                 else:
                     from musubi_tuner.ltx_2.text_encoders.gemma.fp8_ops import infer_gemma3_config_from_safetensors
+
                     logger.info("No gemma_root — inferring config from safetensors header...")
                     inferred = infer_gemma3_config_from_safetensors(gemma_safetensors)
                     config_class = Gemma3ForConditionalGeneration.config_class
                     config = config_class(**inferred)
-                
+
                 # Initialize on meta device to avoid immediate allocation
                 with torch.device("meta"):
                     module.model = Gemma3ForConditionalGeneration(config).to(dtype=torch_dtype)
 
                 logger.info(f"Loading custom Gemma weights from {gemma_weights_path}...")
-                
+
                 # Memory-efficient loading: stream tensors directly to model
                 with safe_open(gemma_weights_path, framework="pt", device="cpu") as f:
                     keys = list(f.keys())
                     total_keys = len(keys)
                     logger.info(f"Found {total_keys} tensors in safetensors file")
-                    
+
                     # Print first 5 keys from safetensors for debugging
                     logger.info(f"First 5 safetensors keys: {keys[:5]}")
-                    
+
                     # Get model's expected keys for comparison
                     model_keys = set(name for name, _ in module.model.named_parameters())
                     logger.info(f"Model expects {len(model_keys)} parameters")
                     logger.info(f"First 5 model keys: {list(model_keys)[:5]}")
-                    
+
                     unmatched_keys = []
-                    
+
                     for i, key in enumerate(keys):
                         if i % 100 == 0:
                             logger.info(f"Loading Gemma weights: {i}/{total_keys}...")
-                        
+
                         # Skip ComfyUI quantization metadata keys (not actual weights)
                         if key.endswith(".comfy_quant") or key.endswith(".weight_scale") or key.endswith(".weight_scale_2"):
                             continue
-                            
+
                         new_key = key
-                        
+
                         # Key mapping for ComfyUI/flattened checkpoints
                         # ComfyUI uses model.* but HuggingFace Gemma3ForConditionalGeneration uses model.language_model.*
                         if key.startswith("model.embed_tokens."):
@@ -628,12 +631,12 @@ def module_ops_from_gemma_root(
                         elif key.startswith("language_model."):
                             # Some checkpoints use language_model.* instead of model.language_model.*
                             new_key = f"model.{key}"
-                        
+
                         try:
                             # Iterate to find the submodule and parameter
                             sub_mod, param_name = _resolve_module_and_attr(module.model, new_key)
                             param = getattr(sub_mod, param_name)
-                            
+
                             # Skip if already loaded (unlikely in this loop but good safety)
                             if param.device.type != "meta":
                                 pass
@@ -645,19 +648,16 @@ def module_ops_from_gemma_root(
                                     # Handle specialized shape mismatches if necessary, or error
                                     logger.warning(f"Shape mismatch for {new_key}: model {param.shape} vs ckpt {tensor.shape}")
                                     continue
-                                
+
                                 if tensor.dtype in (torch.float8_e4m3fn, torch.float8_e5m2) and not keep_fp8:
                                     # Cast fp8→compute dtype when not keeping fp8 in VRAM
                                     tensor = tensor.to(torch_dtype)
-                                
+
                                 # Materialize param on target device
-                                new_param = torch.nn.Parameter(
-                                    tensor.to(device=load_device), 
-                                    requires_grad=param.requires_grad
-                                )
+                                new_param = torch.nn.Parameter(tensor.to(device=load_device), requires_grad=param.requires_grad)
                                 # Replace the meta parameter with the materialized one
                                 setattr(sub_mod, param_name, new_param)
-                                
+
                         except AttributeError:
                             # Missing in model (unexpected key) - track for debugging
                             if i < 20:  # Only log first 20 unmatched
@@ -730,6 +730,7 @@ def module_ops_from_gemma_root(
 
                 if keep_fp8:
                     from musubi_tuner.ltx_2.text_encoders.gemma.fp8_ops import replace_linear_with_fp8
+
                     if fp8_weight_offload is None:
                         offload_fp8_weights = os.getenv("LTX2_GEMMA_SAFETENSORS_WEIGHT_OFFLOAD", "1").lower() in (
                             "1",
@@ -764,11 +765,11 @@ def module_ops_from_gemma_root(
                     torch_dtype=torch_dtype,
                 )
         module._gemma_root = module._gemma_root or gemma_root
-        
+
         # Ensure model is in eval mode
         if module.model is not None:
-             module.model.eval()
-             
+            module.model.eval()
+
         return module
 
     def load_tokenizer(module: GemmaTextEncoderModelBase) -> GemmaTextEncoderModelBase:
@@ -852,4 +853,3 @@ def _pad_inputs_for_attention_alignment(
             model_inputs["token_type_ids"] = _cat_with_padding(model_inputs["token_type_ids"], padding_length, 0)
 
     return model_inputs
-
