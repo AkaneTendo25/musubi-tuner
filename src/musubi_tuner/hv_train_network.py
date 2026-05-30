@@ -825,6 +825,15 @@ class NetworkTrainer:
             logger.info(f"use torch-optimi optimizer {optimizer_class.__name__} | {optimizer_kwargs}")
             optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
 
+        elif optimizer_type in ("lion", "lion8bit", "lion8bitint8"):
+            # before the bitsandbytes "8bit" branch since "lion8bit" ends in "8bit"
+            from musubi_tuner.optimizers.lion import Lion as _Lion, Lion8bit as _Lion8bit, Lion8bitInt8 as _Lion8bitInt8
+
+            _cls = {"lion": _Lion, "lion8bit": _Lion8bit, "lion8bitint8": _Lion8bitInt8}[optimizer_type]
+            logger.info(f"use {_cls.__name__} optimizer | {optimizer_kwargs}")
+            optimizer_class = _cls
+            optimizer = _cls(trainable_params, lr=lr, **optimizer_kwargs)
+
         elif optimizer_type.endswith("8bit".lower()):
             try:
                 import bitsandbytes as bnb

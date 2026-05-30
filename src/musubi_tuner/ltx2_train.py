@@ -4400,10 +4400,16 @@ def main() -> None:
                             base_optimizer.__class__.__name__,
                         )
                     logger.info("%s fused backward pass enabled.", base_optimizer.__class__.__name__)
+                elif base_optimizer_name in {"lion", "lion8bit", "lion8bitint8"}:
+                    if not _attach_fused_step_param(optimizer, base_optimizer):
+                        raise ValueError(
+                            f"{base_optimizer.__class__.__name__} fused backward pass requires optimizer.step_param support"
+                        )
+                    logger.info("%s fused backward pass enabled.", base_optimizer.__class__.__name__)
                 else:
                     raise ValueError(
                         f"--fused_backward_pass requires Adafactor, CAME/CAME8bit, SinkSGD, Q-GaLore, APOLLO, "
-                        f"torchao Adam, torch-optimi, or BAdam with badam_use_gradient_release=True; "
+                        f"torchao Adam, torch-optimi, Lion/Lion8bit/Lion8bitInt8, or BAdam with badam_use_gradient_release=True; "
                         f"got {base_optimizer.__class__.__name__}"
                     )
 
