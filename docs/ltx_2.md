@@ -113,10 +113,11 @@ Caching scripts (`ltx2_cache_latents.py`, `ltx2_cache_text_encoder_outputs.py`) 
   - [Dashboard Usage](#dashboard-usage)
 - [Appendix: Full-Parameter Fine-Tuning](#appendix-full-parameter-fine-tuning)
   - [Dataset Preparation](#dataset-preparation)
-  - [Adafactor](#adafactor)
+  - [Dense bf16 (Adafactor)](#dense-bf16-adafactor)
   - [BAdam Block-Coordinate](#badam-block-coordinate)
   - [Q-GaLore Quantized](#q-galore-quantized)
   - [APOLLO and QAPOLLO](#apollo-and-qapollo)
+  - [Int8 Weight Training](#int8-weight-training)
   - [Optimizing VRAM Usage](#optimizing-vram-usage)
 - [References](#references)
 
@@ -3203,7 +3204,7 @@ Use `ltx2_train.py` for these commands. `ltx2_train_network.py` is the LoRA/netw
 
 Dataset preparation is the same as LoRA training: create the dataset TOML, cache latents, cache text encoder outputs, and optionally save a dataset manifest. See [Caching Latents](#1-caching-latents), [Caching Text Encoder Outputs](#2-caching-text-encoder-outputs), and [Optional: Source-Free Training from Cache](#optional-source-free-training-from-cache).
 
-### Adafactor
+### Dense bf16 (Adafactor)
 <sub>[↑ contents](#table-of-contents)</sub>
 
 Adafactor is the dense bf16 full-parameter optimizer path documented here. It reduces optimizer-state memory by storing factored row and column second-moment statistics for matrix-shaped parameters, rather than full Adam-style moment tensors. This path originates from the Qwen-Image full fine-tuning implemented by kohya-ss in [PR #492](https://github.com/kohya-ss/musubi-tuner/pull/492). The LTX-2.3 Adafactor path uses `--fused_backward_pass`, which adds a per-parameter `step_param` path related to the [optimizer-step-in-backward pattern](https://docs.pytorch.org/tutorials/intermediate/optimizer_step_in_backward_tutorial.html). When `--max_grad_norm 0` is used, the trainer can step and clear gradients from backward hooks. When global gradient clipping is enabled, as in the benchmark table below, the trainer delays per-parameter stepping until the gradient synchronization point to preserve clipping correctness. The fused Adafactor implementation applies stochastic rounding when fp32 updates are written back into bf16 parameters.
@@ -3287,6 +3288,9 @@ Here is the measured Adafactor full-parameter benchmark matrix on a cached 32-cl
 | 1280x720 | 161 | 62.3 GB / 17.73 s | OOM (>80 GB) | 72.2 GB / 33.85 s | OOM (>80 GB) |
 | 1280x720 | 193 | 64.1 GB / 21.56 s | OOM (>80 GB) | 75.5 GB / 42.50 s | OOM (>80 GB) |
 | 1280x720 | 241 | 66.5 GB / 27.96 s | OOM (>80 GB) | OOM (>80 GB) | OOM (>80 GB) |
+
+> [!WARNING]
+> The example command above uses `--max_grad_norm 1.0` (gradient clipping on). With the fused backward pass, clipping requires all gradients to be resident at once to compute the global norm; setting `--max_grad_norm 0` disables it and lets each gradient be freed as its parameter is stepped, lowering peak VRAM by roughly one copy of the trainable gradients (about 2 bytes per parameter in bf16, on the order of 25 GB for this model). Gradient clipping is a standard safeguard against exploding gradients, so keep `--max_grad_norm 1.0` unless VRAM requires disabling it.
 
 ### BAdam Block-Coordinate
 <sub>[↑ contents](#table-of-contents)</sub>
@@ -3554,6 +3558,15 @@ The `optim_bits=8` QAPOLLO path was checked for finite loss and non-noise previe
 | 1280x720 | 161 | 34.4 GB / 18.07 s | 51.4 GB / 21.88 s | 49.8 GB / 33.23 s | 72.2 GB / 39.40 s |
 | 1280x720 | 193 | 38.1 GB / 21.76 s | 55.4 GB / 26.22 s | 57.3 GB / 42.16 s | 79.0 GB / 48.74 s |
 | 1280x720 | 241 | 43.3 GB / 28.27 s | 61.8 GB / 32.95 s | 66.2 GB / 57.67 s | OOM (>80 GB) |
+### Int8 Weight Training
+<sub>[↑ contents](#table-of-contents)</sub>
+
+`--int8_weights` (experimental) stores trainable `Linear` weights as int8 (symmetric, per-row or per-group scale) with no bf16 master; the optimizer updates the int8 storage in place via stochastic rounding, while forward/backward dequantize to bf16 for the GEMM. Requires `--fused_backward_pass` and a factored optimizer (Adafactor by default). With `--max_grad_norm 0` (gradient clipping off), short-context video-only training fits in roughly 21-23 GB: int8 storage roughly halves the trainable weight bytes, and without the global-norm clip the gradient buffer need not stay resident. `--max_grad_norm 1.0` keeps that buffer resident and raises peak VRAM. Validate save/resume on the target GPU before long runs.
+
+The loss trajectory diverges from a bf16 run; `--int8_weights_group_size` and `--int8_weights_outlier_quantile` are tuning knobs that change the per-step quantization grid.
+
+Flags: `--int8_weights_targets` (same tokens as `--qgalore_targets`), `--int8_weights_group_size N` (`0` = row-wise, `>0` = group-wise along the input dim), `--int8_weights_outlier_quantile q` (`1.0` = absmax, `<1.0` = clip the scale to a per-row/group quantile of `|w|`), `--int8_weights_sparse_ratio r` (dense-and-sparse, [arXiv:2310.07147](https://arxiv.org/abs/2310.07147): keep the top fraction `r` of `|w|` as an exact fp32 side-vector excluded from the int8 grid; an alternative to `--int8_weights_outlier_quantile`, use one or the other), `--int8_weights_min_numel` to skip small layers. Mutually exclusive with `--fp8_gemm`, `--qgalore_full_ft`, `--fp8_scaled`.
+
 ### Optimizing VRAM Usage
 <sub>[↑ contents](#table-of-contents)</sub>
 
@@ -3620,9 +3633,10 @@ accelerate launch --num_processes 1 --num_cpu_threads_per_process 1 --mixed_prec
 
 For longer runs, start with video-only short-context training until checkpoint save and resume have been validated on the target GPU.
 
-**FP8 full fine-tuning (`--fp8_gemm`).** Replaces attention/FFN `Linear` layers with FP8 forward/backward GEMMs (`torch._scaled_mm`, per-tensor dynamic scaling) over bf16 master weights; optimizer-agnostic. Requires FP8 tensor cores (compute capability ≥ 8.9; Ada/Hopper). At `832x480x49`: ~10 GB less than bf16, ~1.05x step time with the region-compiled GEMM (`--fp8_gemm_compile`, default on; ~1.4x without). Not a 24 GB-class path — use the int8 routes above for that. Flags: `--fp8_gemm_targets` (same tokens as `--qgalore_targets`), `--fp8_gemm_grad_dtype {e4m3,e5m2}`, `--fp8_gemm_min_numel`, `--fp8_gemm_compile`. Mutually exclusive with `--qgalore_full_ft`, `--fp8_scaled`, `--ltx2_model_parallel`.
+**FP8 full fine-tuning (`--fp8_gemm`, experimental).** Replaces attention/FFN `Linear` layers with FP8 forward/backward GEMMs (`torch._scaled_mm`, per-tensor dynamic scaling) over bf16 master weights; optimizer-agnostic. Requires FP8 tensor cores (compute capability ≥ 8.9; Ada/Hopper). At `832x480x49`: ~10 GB less than bf16, ~1.05x step time with the region-compiled GEMM (`--fp8_gemm_compile`, default on; ~1.4x without). Not a 24 GB-class path — use the int8 routes above for that. Flags: `--fp8_gemm_targets` (same tokens as `--qgalore_targets`), `--fp8_gemm_grad_dtype {e4m3,e5m2}`, `--fp8_gemm_min_numel`, `--fp8_gemm_compile`. Mutually exclusive with `--qgalore_full_ft`, `--fp8_scaled`, `--ltx2_model_parallel`.
 
-**Int8 full fine-tuning (`--int8_weights`).** Stores trainable `Linear` weights as int8 (symmetric, per-row or per-group scale) with no bf16 master; the optimizer updates the int8 storage in place via stochastic rounding, while forward/backward dequantize to bf16 for the GEMM. Requires `--fused_backward_pass` and a factored optimizer (Adafactor) so bf16 gradients do not all materialize at once. At `832x480x49`: ~43 GB peak / ~3.4 s/step on the video target set. Flags: `--int8_weights_targets` (same tokens as `--qgalore_targets`), `--int8_weights_group_size 128` for group-wise scales (finer grid, lower per-step quantization noise), `--int8_weights_outlier_quantile 0.999` to set the scale from a per-row/group quantile of `|w|` rather than the absmax (clips a heavy outlier tail to tighten the bulk grid), `--int8_weights_min_numel` to skip small layers. Mutually exclusive with `--fp8_gemm`, `--qgalore_full_ft`, `--fp8_scaled`.
+> [!CAUTION]
+> **Experimental.** Loss parity with bf16 has been confirmed on limited runs; long-run stability and final sample quality are not yet validated. Validate on your own long runs (and monitor gradient norms) before relying on it for production.
 
 ---
 
