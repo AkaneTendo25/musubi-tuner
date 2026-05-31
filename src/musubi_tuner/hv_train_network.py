@@ -834,6 +834,13 @@ class NetworkTrainer:
             optimizer_class = _cls
             optimizer = _cls(trainable_params, lr=lr, **optimizer_kwargs)
 
+        elif optimizer_type == "smmf":
+            from musubi_tuner.optimizers.smmf import SMMF as _SMMF
+
+            logger.info(f"use SMMF optimizer | {optimizer_kwargs}")
+            optimizer_class = _SMMF
+            optimizer = _SMMF(trainable_params, lr=lr, **optimizer_kwargs)
+
         elif optimizer_type.endswith("8bit".lower()):
             try:
                 import bitsandbytes as bnb
