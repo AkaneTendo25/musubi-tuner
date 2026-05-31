@@ -39,7 +39,11 @@
 		'optimi_adamw',
 		'optimi_stableadamw',
 		'optimi_lion',
-		'optimi_adan'
+		'optimi_adan',
+		'lion',
+		'lion8bit',
+		'lion8bitint8',
+		'smmf'
 	];
 
 	let t = $derived($projectConfig?.full_finetune || {});
@@ -629,6 +633,7 @@
 					<FormField type="number" fieldPath="full_finetune.int8_weights_group_size" value={t.int8_weights_group_size ?? 0} oninput={(e) => update('int8_weights_group_size', Number(e.target.value))} min={0} tooltip="0 = row-wise (one scale per output channel); >0 = group-wise along input dim (128/256 = finer scales, less drift)." />
 					<FormField type="number" fieldPath="full_finetune.int8_weights_min_numel" value={t.int8_weights_min_numel ?? 16384} oninput={(e) => update('int8_weights_min_numel', Number(e.target.value))} min={0} tooltip="Skip Linear layers with fewer than this many weight elements." />
 					<FormField type="number" fieldPath="full_finetune.int8_weights_outlier_quantile" value={t.int8_weights_outlier_quantile ?? 1.0} oninput={(e) => update('int8_weights_outlier_quantile', Number(e.target.value))} min={0} max={1} step="0.001" tooltip="Set the int8 scale from a per-row/group quantile of |w| (default 1.0 = absmax). 0.999 clips the top 0.1% to give the bulk a tighter grid." />
+					<FormField type="number" fieldPath="full_finetune.int8_weights_sparse_ratio" value={t.int8_weights_sparse_ratio ?? 0.0} oninput={(e) => update('int8_weights_sparse_ratio', Number(e.target.value))} min={0} max={1} step="0.001" tooltip="Keep the top fraction of |w| as an exact fp32 side-vector, excluded from the int8 grid so outliers don't coarsen the bulk weights. Default 0.0 = off; try 0.01. Alternative to outlier quantile." />
 				</div>
 			</div>
 		</FormGroup>

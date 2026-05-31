@@ -8,6 +8,7 @@
 	let actionMessage = $state('');
 	let actionTone = $state('muted');
 	let openingSetup = $state(false);
+	let openingRepair = $state(false);
 	let openingRepo = $state(false);
 	let selectedBranch = $state('ltx-2');
 
@@ -42,6 +43,13 @@
 		if (doctor.error_count > 0) return 'danger';
 		if (doctor.warning_count > 0) return 'warning';
 		return 'success';
+	}
+
+	function problemTone(problem) {
+		if (!problem) return 'muted';
+		if (problem.severity === 'error') return 'danger';
+		if (problem.severity === 'warning') return 'warning';
+		return 'muted';
 	}
 
 	function relatedPageLabel(page) {
@@ -113,7 +121,11 @@
 	}
 
 	async function postAction(url, which) {
-		const setter = which === 'setup' ? (v) => openingSetup = v : (v) => openingRepo = v;
+		const setter = which === 'setup'
+			? (v) => openingSetup = v
+			: which === 'repair'
+				? (v) => openingRepair = v
+				: (v) => openingRepo = v;
 		setter(true);
 		actionMessage = '';
 		try {
@@ -128,6 +140,8 @@
 			actionTone = 'success';
 			actionMessage = which === 'setup'
 				? 'Setup / Update opened in a new window.'
+				: which === 'repair'
+					? 'Setup / Update repair mode opened in a new window.'
 				: 'Repository folder opened.';
 		} catch (e) {
 			actionTone = 'danger';
@@ -200,8 +214,12 @@
 							<div style="color: var(--text-primary);">{management.repo.remote_ahead_count}</div>
 						</div>
 						<div class="col-span-2">
-							<div style="color: var(--text-muted);">Remote URL</div>
+							<div style="color: var(--text-muted);">Configured Repo URL</div>
 							<div class="font-mono break-all" style="color: var(--text-primary);">{management.remote_url || '--'}</div>
+						</div>
+						<div class="col-span-2">
+							<div style="color: var(--text-muted);">Git Origin</div>
+							<div class="font-mono break-all" style="color: {management.repo.origin_url ? 'var(--text-primary)' : 'var(--warning)'};">{management.repo.origin_url || 'missing'}</div>
 						</div>
 					</div>
 				</div>
@@ -430,6 +448,54 @@
 					Use Setup / Update for repository sync, branch switching, dependency repair, frontend rebuilds, and shortcut recreation. The dashboard intentionally does not mutate the environment directly.
 				</div>
 			</div>
+		</div>
+
+		<div class="p-5 space-y-3" style="background: var(--bg-surface); border: 1px solid var(--border-subtle); border-radius: var(--radius-md);">
+			<div class="flex flex-col gap-2 md:flex-row md:items-start md:justify-between">
+				<div class="space-y-1">
+					<div class="text-[11px] font-semibold uppercase tracking-wider" style="color: var(--text-muted); font-family: var(--font-label);">Detected Setup Problems</div>
+					<div class="text-[12px]" style="color: var(--text-secondary);">
+						{management.problem_count || 0} issue(s) found, {management.repairable_problem_count || 0} repairable through Setup / Update.
+					</div>
+				</div>
+				<button
+					type="button"
+					onclick={() => postAction(`/api/system/management/open-setup?branch=${encodeURIComponent(selectedBranch)}&repair=true`, 'repair')}
+					disabled={openingRepair || processesBusy || !management.actions.can_launch_setup}
+					class="px-3 py-2 text-[12px] font-semibold disabled:opacity-40"
+					style="background: color-mix(in srgb, var(--warning) 18%, var(--bg-elevated)); color: var(--text-primary); border: 1px solid color-mix(in srgb, var(--warning) 34%, var(--border)); border-radius: var(--radius-sm);"
+				>
+					{openingRepair ? 'Opening...' : 'Open Repair'}
+				</button>
+			</div>
+
+			{#if management.problems?.length}
+				<div style="background: color-mix(in srgb, var(--bg-elevated) 88%, transparent); border: 1px solid var(--border); border-radius: var(--radius-sm); overflow: hidden;">
+					{#each management.problems as problem, index}
+						<div class="px-3 py-2" style="border-bottom: {index < management.problems.length - 1 ? '1px solid var(--border-subtle)' : 'none'};">
+							<div class="flex items-start gap-2.5">
+								<span class="w-2 h-2 rounded-full flex-shrink-0 mt-1.5" style="background: {accentTone(problemTone(problem))};"></span>
+								<div class="min-w-0 flex-1 space-y-0.5">
+									<div class="flex flex-wrap items-center gap-x-2 gap-y-1">
+										<div class="text-[11px] font-medium" style="color: var(--text-primary);">{problem.area}</div>
+										{#if problem.repairable}
+											<div class="px-1.5 py-0.5 text-[9px] font-semibold uppercase" style="color: var(--warning); background: color-mix(in srgb, var(--warning) 11%, transparent); border-radius: var(--radius-sm);">Repairable</div>
+										{/if}
+									</div>
+									<div class="text-[10px]" style="color: var(--text-secondary);">{problem.message}</div>
+									{#if problem.repair}
+										<div class="text-[10px]" style="color: var(--text-muted);">{problem.repair}</div>
+									{/if}
+								</div>
+							</div>
+						</div>
+					{/each}
+				</div>
+			{:else}
+				<div class="px-3 py-2 text-[12px]" style="background: var(--bg-elevated); border-radius: var(--radius-sm); color: var(--text-secondary);">
+					No setup problems detected.
+				</div>
+			{/if}
 		</div>
 
 		{#if management.doctor}

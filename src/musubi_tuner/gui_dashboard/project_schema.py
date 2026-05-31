@@ -696,6 +696,7 @@ class FullFinetuneConfig(TrainingConfig):
     int8_weights_min_numel: int = 16384
     int8_weights_group_size: int = 0
     int8_weights_outlier_quantile: float = 1.0
+    int8_weights_sparse_ratio: float = 0.0
 
     # Q-GaLore full fine-tune.
     qgalore_full_ft: bool = False

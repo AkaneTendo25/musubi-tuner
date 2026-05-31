@@ -19,6 +19,7 @@ DASHBOARD_SHORTCUT_NAME = "Musubi Tuner Dashboard.lnk"
 SETUP_SHORTCUT_NAME = "Musubi Tuner Setup and Update.lnk"
 CHECK_CACHE_WINDOW = timedelta(minutes=15)
 DEFAULT_BRANCH = "ltx-2"
+DEFAULT_REPO_URL = "https://github.com/AkaneTendo25/musubi-tuner.git"
 SUPPORTED_BRANCHES = ("ltx-2", "ltx-2-dev")
 PROCESS_LABELS: dict[str, tuple[str, str]] = {
     "cache_latents": ("Cache Latents", "/caching"),
@@ -628,6 +629,8 @@ def get_repository_status(repo_root: Path, branch: str, remote_url: str, state: 
         "fetch_succeeded": False,
         "offline": False,
         "origin_error": "",
+        "origin_url": "",
+        "expected_remote_url": remote_url.strip(),
         "summary": "Repository not found",
     }
 
@@ -637,13 +640,13 @@ def get_repository_status(repo_root: Path, branch: str, remote_url: str, state: 
         result["summary"] = "Repository exists but is not a git checkout"
         return result
 
+    result["is_git_repo"] = True
     head = _git_run(repo_root, "rev-parse", "HEAD")
     if not head or head.returncode != 0:
         result["summary"] = "Git is not available"
         return result
 
     result["git_available"] = True
-    result["is_git_repo"] = True
     result["head"] = head.stdout.strip()
     result["head_short"] = _short_sha(result["head"])
 
@@ -663,7 +666,8 @@ def get_repository_status(repo_root: Path, branch: str, remote_url: str, state: 
         result["has_untracked"] = bool(untracked_lines)
         result["dirty"] = bool(tracked_lines)
 
-    origin_url = remote_url.strip() or _git_value(repo_root, "remote", "get-url", "origin")
+    origin_url = _git_value(repo_root, "remote", "get-url", "origin")
+    result["origin_url"] = origin_url
     result["origin_configured"] = bool(origin_url)
 
     repo_state = state.get("repo", {})
@@ -672,7 +676,7 @@ def get_repository_status(repo_root: Path, branch: str, remote_url: str, state: 
 
     offline = False
 
-    if cached_recent:
+    if cached_recent and result["origin_configured"]:
         result["remote_head"] = repo_state.get("remote_head", "") or ""
         result["remote_head_short"] = repo_state.get("remote_head_short", "") or _short_sha(result["remote_head"])
         result["local_ahead_count"] = int(repo_state.get("local_ahead_count") or 0)
@@ -681,7 +685,7 @@ def get_repository_status(repo_root: Path, branch: str, remote_url: str, state: 
         result["update_available"] = bool(repo_state.get("update_available"))
     elif not result["origin_configured"]:
         result["origin_error"] = "No origin remote is configured"
-    elif _github_reachable(origin_url):
+    elif _github_reachable(origin_url or remote_url):
         result["fetch_attempted"] = True
         fetch_proc = _git_run(repo_root, "fetch", "--quiet", "origin", branch, timeout=20)
         if fetch_proc and fetch_proc.returncode == 0:
@@ -729,11 +733,222 @@ def get_repository_status(repo_root: Path, branch: str, remote_url: str, state: 
     return result
 
 
+def _setup_problem(
+    severity: str,
+    area: str,
+    message: str,
+    *,
+    repairable: bool = False,
+    repair: str = "",
+) -> dict[str, Any]:
+    return {
+        "severity": severity,
+        "area": area,
+        "message": message,
+        "repairable": repairable,
+        "repair": repair,
+    }
+
+
+def _build_setup_problems(
+    *,
+    repo_root: Path,
+    branch: str,
+    remote_url: str,
+    repo_status: dict[str, Any],
+    install_state_present: bool,
+    install_state_error: str,
+    venv_exists: bool,
+    frontend_dist_exists: bool,
+    deps_recommended: bool,
+    frontend_recommended: bool,
+    dashboard_shortcut_exists: bool,
+    setup_shortcut_exists: bool,
+) -> list[dict[str, Any]]:
+    problems: list[dict[str, Any]] = []
+
+    if not repo_status["exists"]:
+        problems.append(
+            _setup_problem(
+                "error",
+                "Repository",
+                f"Repository directory does not exist: {repo_root}",
+                repairable=True,
+                repair="Open Setup / Update to clone the repository.",
+            )
+        )
+    elif not repo_status["is_git_repo"]:
+        problems.append(
+            _setup_problem(
+                "error",
+                "Repository",
+                f"Repository directory exists but is not a Git checkout: {repo_root}",
+                repair="Move the folder aside or choose a clean install path before cloning.",
+            )
+        )
+    else:
+        if not repo_status["git_available"]:
+            problems.append(
+                _setup_problem(
+                    "error",
+                    "Git",
+                    "Git is not available or cannot read this repository.",
+                    repairable=True,
+                    repair="Install Git, then rerun Setup / Update.",
+                )
+            )
+        else:
+            if not repo_status["origin_configured"]:
+                repair = f"Repair setup can add origin -> {remote_url}." if remote_url else "Set a repository URL, then add origin."
+                problems.append(
+                    _setup_problem(
+                        "warning",
+                        "Repository",
+                        "The Git origin remote is missing, so update checks cannot fetch remote commits.",
+                        repairable=bool(remote_url),
+                        repair=repair,
+                    )
+                )
+            elif repo_status["fetch_attempted"] and not repo_status["fetch_succeeded"]:
+                problems.append(
+                    _setup_problem(
+                        "warning",
+                        "Repository",
+                        f"Fetching origin/{branch} failed.",
+                        repair="Check network access, credentials, remote URL, and branch name.",
+                    )
+                )
+            elif repo_status["offline"]:
+                problems.append(
+                    _setup_problem(
+                        "warning",
+                        "Network",
+                        "The origin host was not reachable during the update check.",
+                        repair="Reconnect to the network and refresh status.",
+                    )
+                )
+
+            if repo_status["branch"] and repo_status["branch"] != branch:
+                problems.append(
+                    _setup_problem(
+                        "warning",
+                        "Repository",
+                        f"Setup is configured for '{branch}', but the checkout is on '{repo_status['branch']}'.",
+                        repairable=not repo_status["tracked_dirty"],
+                        repair="Setup / Update can switch branches when tracked local changes do not block checkout.",
+                    )
+                )
+            if repo_status["diverged"]:
+                problems.append(
+                    _setup_problem(
+                        "warning",
+                        "Repository",
+                        f"The local branch and origin/{branch} have diverged.",
+                        repair="Resolve the Git history manually; setup only performs fast-forward updates.",
+                    )
+                )
+            elif repo_status["update_available"]:
+                problems.append(
+                    _setup_problem(
+                        "info",
+                        "Repository",
+                        f"origin/{branch} is {repo_status['remote_ahead_count']} commit(s) ahead.",
+                        repairable=True,
+                        repair="Open Setup / Update to fast-forward the checkout.",
+                    )
+                )
+            if repo_status["tracked_dirty"]:
+                problems.append(
+                    _setup_problem(
+                        "warning",
+                        "Repository",
+                        f"Tracked local changes are present: {_format_file_list(repo_status['changed_files'])}",
+                        repairable=True,
+                        repair="Use StashAndUpdate to back them up before updating, or handle them manually.",
+                    )
+                )
+
+    if not venv_exists:
+        problems.append(
+            _setup_problem(
+                "error",
+                "Python",
+                "Virtual environment Python is missing.",
+                repairable=True,
+                repair="Open Setup / Update to create the virtual environment and install dependencies.",
+            )
+        )
+    elif deps_recommended:
+        problems.append(
+            _setup_problem(
+                "warning",
+                "Python",
+                "Python dependency inputs changed or the CUDA target changed.",
+                repairable=True,
+                repair="Open Setup / Update to reinstall Python dependencies.",
+            )
+        )
+
+    if not frontend_dist_exists:
+        problems.append(
+            _setup_problem(
+                "warning",
+                "Dashboard",
+                "Dashboard frontend build is missing.",
+                repairable=True,
+                repair="Open Setup / Update to rebuild the dashboard frontend.",
+            )
+        )
+    elif frontend_recommended:
+        problems.append(
+            _setup_problem(
+                "warning",
+                "Dashboard",
+                "Dashboard frontend sources changed since the recorded build.",
+                repairable=True,
+                repair="Open Setup / Update to rebuild the dashboard frontend.",
+            )
+        )
+
+    if not dashboard_shortcut_exists or not setup_shortcut_exists:
+        problems.append(
+            _setup_problem(
+                "warning",
+                "Shortcuts",
+                "One or more desktop shortcuts are missing.",
+                repairable=True,
+                repair="Open Setup / Update to recreate desktop shortcuts.",
+            )
+        )
+    if not install_state_present:
+        problems.append(
+            _setup_problem(
+                "warning",
+                "Setup State",
+                "Install state has not been recorded yet.",
+                repairable=True,
+                repair="Completing Setup / Update will recreate .musubi_install_state.json.",
+            )
+        )
+    if install_state_error:
+        problems.append(
+            _setup_problem(
+                "warning",
+                "Setup State",
+                install_state_error,
+                repairable=True,
+                repair="Completing Setup / Update will rewrite the install state file.",
+            )
+        )
+
+    return problems
+
+
 def get_management_status(repo_root: Path | None = None, project_config: ProjectConfig | None = None) -> dict[str, Any]:
     root = find_repo_root(repo_root)
     state, state_error = load_install_state_info(root)
     branch = str(state.get("branch") or "").strip() or _git_value(root, "rev-parse", "--abbrev-ref", "HEAD") or DEFAULT_BRANCH
-    remote_url = str(state.get("repo_url") or "").strip() or _git_value(root, "remote", "get-url", "origin")
+    remote_url = str(state.get("repo_url") or "").strip() or _git_value(root, "remote", "get-url", "origin") or DEFAULT_REPO_URL
     repo_status = get_repository_status(root, branch, remote_url, state)
 
     install_state = state.get("install", {})
@@ -767,6 +982,21 @@ def get_management_status(repo_root: Path | None = None, project_config: Project
     deps_recommended = (not venv_python.exists()) or bool(deps_changed)
     frontend_recommended = (not frontend_dist.exists()) or bool(frontend_changed)
     backup_status = _build_backup_status(root, install_state)
+    setup_problems = _build_setup_problems(
+        repo_root=root,
+        branch=branch,
+        remote_url=remote_url,
+        repo_status=repo_status,
+        install_state_present=bool(state),
+        install_state_error=state_error,
+        venv_exists=venv_python.exists(),
+        frontend_dist_exists=frontend_dist.exists(),
+        deps_recommended=deps_recommended,
+        frontend_recommended=frontend_recommended,
+        dashboard_shortcut_exists=dashboard_shortcut.exists(),
+        setup_shortcut_exists=setup_shortcut.exists(),
+    )
+    repairable_problem_count = sum(1 for item in setup_problems if item["repairable"])
 
     notices: list[str] = []
     recommendations: list[str] = []
@@ -855,11 +1085,16 @@ def get_management_status(repo_root: Path | None = None, project_config: Project
         },
         "actions": {
             "can_launch_setup": (setup_launcher.exists() or (root / "scripts" / "install.ps1").exists()),
+            "can_repair_setup": (setup_launcher.exists() or (root / "scripts" / "install.ps1").exists())
+            and repairable_problem_count > 0,
             "can_open_repo": root.exists(),
             "setup_launch_mode": "launcher"
             if setup_launcher.exists()
             else ("direct" if (root / "scripts" / "install.ps1").exists() else "unavailable"),
         },
+        "problems": setup_problems,
+        "problem_count": len(setup_problems),
+        "repairable_problem_count": repairable_problem_count,
         "notices": notices,
         "warnings": warnings,
         "recommendations": recommendations,
@@ -869,7 +1104,11 @@ def get_management_status(repo_root: Path | None = None, project_config: Project
     return result
 
 
-def launch_setup_tool(repo_root: Path | None = None, branch_override: str | None = None) -> dict[str, Any]:
+def launch_setup_tool(
+    repo_root: Path | None = None,
+    branch_override: str | None = None,
+    repair_mode: bool = False,
+) -> dict[str, Any]:
     root = find_repo_root(repo_root)
     state, _ = load_install_state_info(root)
     setup_launcher = root / SETUP_LAUNCHER_NAME
@@ -887,7 +1126,7 @@ def launch_setup_tool(repo_root: Path | None = None, branch_override: str | None
         install_script = root / "scripts" / "install.ps1"
         if not install_script.exists():
             raise FileNotFoundError(f"Installer script not found at {install_script}")
-        remote_url = str(state.get("repo_url") or "").strip() or _git_value(root, "remote", "get-url", "origin")
+        remote_url = str(state.get("repo_url") or "").strip() or _git_value(root, "remote", "get-url", "origin") or DEFAULT_REPO_URL
         cmd = [
             "powershell.exe",
             "-NoProfile",
@@ -913,13 +1152,15 @@ def launch_setup_tool(repo_root: Path | None = None, branch_override: str | None
             str(state.get("port") or 7860),
         ]
         mode = "direct"
+    if repair_mode:
+        cmd.append("-RepairMode")
 
     creationflags = getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
     try:
         subprocess.Popen(cmd, cwd=str(root), creationflags=creationflags)
     except OSError as exc:
         raise RuntimeError(f"Could not start Setup / Update: {exc}") from exc
-    return {"launched": True, "mode": mode, "repo_root": str(root), "branch": branch}
+    return {"launched": True, "mode": mode, "repo_root": str(root), "branch": branch, "repair_mode": repair_mode}
 
 
 def open_repo_in_file_browser(repo_root: Path | None = None) -> dict[str, Any]:

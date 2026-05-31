@@ -66,15 +66,18 @@ async def get_management_status_route(request: Request):
 async def open_setup_tool(
     request: Request,
     branch: Literal["ltx-2", "ltx-2-dev"] | None = Query(default=None),
+    repair: bool = Query(default=False),
 ):
     process_manager = getattr(request.app.state, "process_manager", None)
     if process_manager:
         statuses = process_manager.get_all_statuses()
         active = [name for name, status in statuses.items() if status.get("state") in {"running", "stopping"}]
         if active:
-            raise HTTPException(status_code=409, detail=f"Cannot open Setup / Update while processes are active: {', '.join(active)}")
+            raise HTTPException(
+                status_code=409, detail=f"Cannot open Setup / Update while processes are active: {', '.join(active)}"
+            )
     try:
-        return launch_setup_tool(branch_override=branch)
+        return launch_setup_tool(branch_override=branch, repair_mode=repair)
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except Exception as exc:

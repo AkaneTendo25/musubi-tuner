@@ -14,7 +14,8 @@ param(
     [string]$UpdatePolicy = "Safe",
     [switch]$NonInteractive,
     [switch]$StrictPreflight,
-    [switch]$PreflightOnly
+    [switch]$PreflightOnly,
+    [switch]$RepairMode
 )
 
 Set-StrictMode -Version Latest
@@ -699,16 +700,16 @@ function Get-RepositoryStatus {
     if (-not $status.exists) {
         return [pscustomobject]$status
     }
-    if (-not $status.git_available) {
-        $status.summary = "Git is not available"
-        return [pscustomobject]$status
-    }
     if (-not (Test-Path (Join-Path $RepoPath ".git"))) {
         $status.summary = "Repository exists but is not a git checkout"
         return [pscustomobject]$status
     }
 
     $status.is_git_repo = $true
+    if (-not $status.git_available) {
+        $status.summary = "Git is not available"
+        return [pscustomobject]$status
+    }
 
     $head = (& $GitExe -C $RepoPath rev-parse HEAD 2>$null | Select-Object -First 1)
     if ($LASTEXITCODE -eq 0 -and $head) {
@@ -806,6 +807,220 @@ function Get-RepositoryStatus {
 
     $status.can_auto_update = $status.update_available -and (-not $status.tracked_dirty) -and (-not $status.diverged)
     return [pscustomobject]$status
+}
+
+function New-SetupProblem {
+    param(
+        [ValidateSet("error", "warning", "info")][string]$Severity = "info",
+        [Parameter(Mandatory = $true)][string]$Area,
+        [Parameter(Mandatory = $true)][string]$Message,
+        [bool]$Repairable = $false,
+        [string]$Repair = ""
+    )
+
+    return [pscustomobject]@{
+        Severity = $Severity
+        Area = $Area
+        Message = $Message
+        Repairable = $Repairable
+        Repair = $Repair
+    }
+}
+
+function Get-SetupProblems {
+    param(
+        [Parameter(Mandatory = $true)]$RepoStatus,
+        [Parameter(Mandatory = $true)][string]$RepoPath,
+        [Parameter(Mandatory = $true)][string]$RemoteUrl,
+        [Parameter(Mandatory = $true)][string]$BranchName,
+        [bool]$VenvExists = $false,
+        [bool]$FrontendDistExists = $false,
+        [bool]$DepsRecommended = $false,
+        [bool]$FrontendRecommended = $false,
+        [bool]$DashboardShortcutExists = $false,
+        [bool]$SetupShortcutExists = $false,
+        [bool]$InstallStatePresent = $false,
+        [string]$InstallStateError = ""
+    )
+
+    $problems = [System.Collections.ArrayList]::new()
+
+    if (-not $RepoStatus.exists) {
+        [void]$problems.Add((New-SetupProblem -Severity "error" -Area "Repository" -Message "Repository directory does not exist: $RepoPath" -Repairable $true -Repair "Clone/update repository will create it."))
+    } elseif (-not $RepoStatus.is_git_repo) {
+        [void]$problems.Add((New-SetupProblem -Severity "error" -Area "Repository" -Message "Repository directory exists but is not a Git checkout: $RepoPath" -Repairable $false -Repair "Move the folder aside or choose a clean install path before cloning."))
+    } else {
+        if (-not $RepoStatus.git_available) {
+            [void]$problems.Add((New-SetupProblem -Severity "error" -Area "Git" -Message "Git is not available or cannot read this repository." -Repairable $true -Repair "Install Git, then rerun setup."))
+        } else {
+            if (-not $RepoStatus.origin_configured) {
+                $repairText = if ([string]::IsNullOrWhiteSpace($RemoteUrl)) { "Set a repository URL, then add the origin remote." } else { "Repair setup metadata can add origin -> $RemoteUrl." }
+                [void]$problems.Add((New-SetupProblem -Severity "warning" -Area "Repository" -Message "The Git origin remote is missing, so update checks cannot fetch remote commits." -Repairable (-not [string]::IsNullOrWhiteSpace($RemoteUrl)) -Repair $repairText))
+            } elseif ($RepoStatus.fetch_attempted -and (-not $RepoStatus.fetch_succeeded)) {
+                [void]$problems.Add((New-SetupProblem -Severity "warning" -Area "Repository" -Message "Setup tried to fetch origin/$BranchName but Git fetch failed." -Repairable $false -Repair "Check network access, credentials, remote URL, and branch name."))
+            } elseif ($RepoStatus.offline) {
+                [void]$problems.Add((New-SetupProblem -Severity "warning" -Area "Network" -Message "The origin host was not reachable during the update check." -Repairable $false -Repair "Reconnect to the network and rerun setup."))
+            }
+            if (-not [string]::IsNullOrWhiteSpace($RepoStatus.branch) -and $RepoStatus.branch -ne $BranchName) {
+                $repairableBranch = -not $RepoStatus.tracked_dirty
+                [void]$problems.Add((New-SetupProblem -Severity "warning" -Area "Repository" -Message "Setup is configured for '$BranchName', but the checkout is on '$($RepoStatus.branch)'." -Repairable $repairableBranch -Repair "Clone/update repository can switch branches when tracked local changes do not block checkout."))
+            }
+            if ($RepoStatus.diverged) {
+                [void]$problems.Add((New-SetupProblem -Severity "warning" -Area "Repository" -Message "The local branch and origin/$BranchName have diverged." -Repairable $false -Repair "Resolve the Git history manually; setup only performs fast-forward updates."))
+            } elseif ($RepoStatus.update_available) {
+                [void]$problems.Add((New-SetupProblem -Severity "info" -Area "Repository" -Message "origin/$BranchName is $($RepoStatus.remote_ahead_count) commit(s) ahead." -Repairable $true -Repair "Clone/update repository can fast-forward the checkout."))
+            }
+            if ($RepoStatus.tracked_dirty) {
+                $changeSummary = Format-StatusFileList -Items $RepoStatus.changed_files
+                [void]$problems.Add((New-SetupProblem -Severity "warning" -Area "Repository" -Message "Tracked local changes are present: $changeSummary" -Repairable $true -Repair "Use StashAndUpdate to back them up before updating, or handle them manually."))
+            }
+        }
+    }
+
+    if (-not $VenvExists) {
+        [void]$problems.Add((New-SetupProblem -Severity "error" -Area "Python" -Message "Virtual environment Python is missing." -Repairable $true -Repair "Create/reuse virtual environment and install dependencies."))
+    } elseif ($DepsRecommended) {
+        [void]$problems.Add((New-SetupProblem -Severity "warning" -Area "Python" -Message "Python dependency inputs changed or the CUDA target changed." -Repairable $true -Repair "Install Python dependencies."))
+    }
+
+    if (-not $FrontendDistExists) {
+        [void]$problems.Add((New-SetupProblem -Severity "warning" -Area "Dashboard" -Message "Dashboard frontend build is missing." -Repairable $true -Repair "Build dashboard frontend."))
+    } elseif ($FrontendRecommended) {
+        [void]$problems.Add((New-SetupProblem -Severity "warning" -Area "Dashboard" -Message "Dashboard frontend sources changed since the recorded build." -Repairable $true -Repair "Build dashboard frontend."))
+    }
+
+    if (-not ($DashboardShortcutExists -and $SetupShortcutExists)) {
+        [void]$problems.Add((New-SetupProblem -Severity "warning" -Area "Shortcuts" -Message "One or more desktop shortcuts are missing." -Repairable $true -Repair "Create desktop shortcuts."))
+    }
+
+    if (-not $InstallStatePresent) {
+        [void]$problems.Add((New-SetupProblem -Severity "warning" -Area "Setup State" -Message "Install state has not been recorded yet." -Repairable $true -Repair "Completing setup will recreate .musubi_install_state.json."))
+    }
+    if (-not [string]::IsNullOrWhiteSpace($InstallStateError)) {
+        [void]$problems.Add((New-SetupProblem -Severity "warning" -Area "Setup State" -Message $InstallStateError -Repairable $true -Repair "Completing setup will rewrite the install state file."))
+    }
+
+    return @($problems)
+}
+
+function Write-SetupProblems {
+    param([object[]]$Problems = @())
+
+    $items = @($Problems)
+    if ($items.Count -eq 0) {
+        Write-Host "Detected Problems" -ForegroundColor DarkGray
+        Write-Host " - none detected" -ForegroundColor DarkGray
+        return
+    }
+
+    Write-Host "Detected Problems" -ForegroundColor DarkGray
+    for ($i = 0; $i -lt $items.Count; $i++) {
+        $problem = $items[$i]
+        $tag = switch ($problem.Severity) {
+            "error" { "ERROR" }
+            "warning" { "WARN" }
+            default { "INFO" }
+        }
+        $color = switch ($problem.Severity) {
+            "error" { "Red" }
+            "warning" { "Yellow" }
+            default { "DarkGray" }
+        }
+        $repairTag = if ($problem.Repairable) { " repairable" } else { "" }
+        Write-Host (" - [{0}] {1}: {2}{3}" -f $tag, $problem.Area, $problem.Message, $repairTag) -ForegroundColor $color
+        if (-not [string]::IsNullOrWhiteSpace($problem.Repair)) {
+            Write-Host ("   fix: {0}" -f $problem.Repair) -ForegroundColor DarkGray
+        }
+    }
+}
+
+function Repair-SetupMetadata {
+    param(
+        [Parameter(Mandatory = $true)][string]$GitExe,
+        [Parameter(Mandatory = $true)][string]$RepoPath,
+        [Parameter(Mandatory = $true)][string]$RemoteUrl,
+        [Parameter(Mandatory = $true)][string]$BranchName
+    )
+
+    if (-not (Test-Path $RepoPath)) {
+        Write-Log "Repository path is missing; clone/update must create it." "WARN"
+        return
+    }
+    if (-not (Test-Path (Join-Path $RepoPath ".git"))) {
+        Write-Log "Repository path is not a Git checkout; repair will not overwrite it: $RepoPath" "WARN"
+        return
+    }
+    if ([string]::IsNullOrWhiteSpace($RemoteUrl)) {
+        Write-Log "Repository URL is empty; cannot repair the origin remote automatically." "WARN"
+        return
+    }
+
+    $changed = $false
+    $originResult = Invoke-ExternalCapture -FilePath $GitExe -Arguments @("-C", $RepoPath, "remote", "get-url", "origin")
+    $originUrl = ""
+    if ($originResult.ExitCode -eq 0) {
+        $originUrl = [string](@($originResult.Output) | Select-Object -First 1)
+    }
+    if ([string]::IsNullOrWhiteSpace($originUrl)) {
+        Write-Log "Git origin remote is missing. Adding origin: $RemoteUrl" "WARN"
+        $addResult = Invoke-ExternalCapture -FilePath $GitExe -Arguments @("-C", $RepoPath, "remote", "add", "origin", $RemoteUrl)
+        if ($addResult.ExitCode -ne 0) {
+            Write-Log "Could not add origin. Trying to set origin URL instead." "WARN"
+            Write-ExternalOutputLines -Output $addResult.Output -Level "WARN"
+            $setResult = Invoke-ExternalCapture -FilePath $GitExe -Arguments @("-C", $RepoPath, "remote", "set-url", "origin", $RemoteUrl)
+            if ($setResult.ExitCode -ne 0) {
+                Write-Log "Could not repair origin remote." "WARN"
+                Write-ExternalOutputLines -Output $setResult.Output -Level "WARN"
+                return
+            }
+        }
+        $changed = $true
+        Write-Log "Origin remote repaired." "OK"
+    } else {
+        Write-Log "Origin remote is configured: $originUrl"
+        if ($originUrl.Trim() -ne $RemoteUrl.Trim()) {
+            Write-Log "Configured setup URL differs from origin. Repair leaves the existing origin unchanged." "WARN"
+            Write-Log "Setup URL: $RemoteUrl" "WARN"
+        }
+    }
+
+    Write-Log "Fetching origin/$BranchName to refresh remote refs..."
+    $fetchResult = Invoke-ExternalCapture -FilePath $GitExe -Arguments @("-C", $RepoPath, "fetch", "origin", $BranchName)
+    if ($fetchResult.ExitCode -ne 0) {
+        Write-Log "Fetch failed after repair. Check remote URL, branch, credentials, and network access." "WARN"
+        Write-ExternalOutputLines -Output $fetchResult.Output -Level "WARN"
+        return
+    }
+    Write-ExternalOutputLines -Output $fetchResult.Output -Level "INFO"
+
+    $remoteRef = "origin/$BranchName"
+    $verifyResult = Invoke-ExternalCapture -FilePath $GitExe -Arguments @("-C", $RepoPath, "rev-parse", "--verify", $remoteRef)
+    if ($verifyResult.ExitCode -ne 0) {
+        Write-Log "Remote ref $remoteRef is still unavailable after fetch." "WARN"
+        return
+    }
+
+    $branchResult = Invoke-ExternalCapture -FilePath $GitExe -Arguments @("-C", $RepoPath, "rev-parse", "--abbrev-ref", "HEAD")
+    $currentBranch = if ($branchResult.ExitCode -eq 0) { ([string](@($branchResult.Output) | Select-Object -First 1)).Trim() } else { "" }
+    if ($currentBranch -eq $BranchName) {
+        $upstreamResult = Invoke-ExternalCapture -FilePath $GitExe -Arguments @("-C", $RepoPath, "branch", "--set-upstream-to", $remoteRef, $BranchName)
+        if ($upstreamResult.ExitCode -eq 0) {
+            Write-Log "Branch upstream repaired: $BranchName -> $remoteRef" "OK"
+            $changed = $true
+        } else {
+            Write-Log "Could not set branch upstream automatically." "WARN"
+            Write-ExternalOutputLines -Output $upstreamResult.Output -Level "WARN"
+        }
+    } elseif ([string]::IsNullOrWhiteSpace($currentBranch) -or $currentBranch -eq "HEAD") {
+        Write-Log "Repository appears to be in detached HEAD state. Repair refreshed remote refs but did not switch branches." "WARN"
+        Write-Log "Enable Clone/update repository to switch to $BranchName safely." "WARN"
+    } else {
+        Write-Log "Repository is on '$currentBranch'; repair did not switch branches. Enable Clone/update repository to switch to '$BranchName'." "WARN"
+    }
+
+    if (-not $changed) {
+        Write-Log "Repair completed; no setup metadata changes were required." "OK"
+    }
 }
 
 function Test-GitPathsChanged {
@@ -1850,6 +2065,7 @@ function Select-Actions {
         [Parameter(Mandatory = $true)][string]$RepositoryPath,
         [Parameter(Mandatory = $true)][string]$VenvPath,
         [string[]]$OverviewLines = @(),
+        [object[]]$Problems = @(),
         [switch]$SkipPrompt
     )
 
@@ -1865,6 +2081,7 @@ function Select-Actions {
         Write-Host " Musubi LTX-2 Setup / Update - Action Selection" -ForegroundColor Cyan
         Write-Host "============================================================" -ForegroundColor Cyan
         Write-InstallerOverview -Lines $OverviewLines
+        Write-SetupProblems -Problems $Problems
         for ($i = 0; $i -lt $Actions.Count; $i++) {
             $item = $Actions[$i]
             $mark = if ($item.Selected) { "x" } else { " " }
@@ -1881,12 +2098,8 @@ function Select-Actions {
         Write-Host "Press number to toggle immediately. [Enter]/[C] Continue, [A]ll, [N]one, [Q]uit" -ForegroundColor DarkGray
         $choice = (Read-SelectionInput).Trim()
 
-        if ([string]::IsNullOrWhiteSpace($choice)) {
-            continue
-        }
-
         $upper = $choice.ToUpperInvariant()
-        if ($upper -eq "C") {
+        if ([string]::IsNullOrWhiteSpace($choice) -or $upper -eq "C") {
             if ($Actions.Where({ $_.Selected }).Count -eq 0) {
                 Write-Host "At least one action must be selected." -ForegroundColor Yellow
                 continue
@@ -1982,6 +2195,11 @@ function Update-ActionConstraints {
         $installGitAction.Locked = $true
         $installGitAction.Reason = "required because git is needed for clone/update"
     }
+    if ($installGitAction -and (Get-ActionState -Actions $Actions -Key "RepairSetup") -and (-not $InitialScan.GitInstalled)) {
+        $installGitAction.Selected = $true
+        $installGitAction.Locked = $true
+        $installGitAction.Reason = "required because git is needed for setup repair"
+    }
 
     $needsPython = (Get-ActionState -Actions $Actions -Key "CreateVenv") -or (Get-ActionState -Actions $Actions -Key "InstallDeps")
     $installPythonAction = Get-ActionItem -Actions $Actions -Key "InstallPython"
@@ -2047,6 +2265,7 @@ try {
     Write-Log "Preferred Python: $PythonVersion"
     Write-Log "Dashboard host: $DashboardHost"
     Write-Log "Update policy: $UpdatePolicy"
+    Write-Log ("Repair mode: {0}" -f ([bool]$RepairMode))
     Write-Log ("Browser URL: {0}" -f (Get-BrowserUrl -HostValue $DashboardHost -PortValue $Port))
     Ensure-Tls12ForLegacyPowerShell
 
@@ -2141,6 +2360,20 @@ try {
     $defaultInstallDeps = (-not $venvExists) -or $depsChanged -or (($stateCuda) -and ($stateCuda -ne $Cuda))
     $defaultBuildFrontend = ($repoExists -and (-not $frontendDistExists)) -or $frontendChanged
     $defaultCreateShortcut = -not ($dashboardShortcutExists -and $setupShortcutExists)
+    $setupProblems = @(Get-SetupProblems `
+        -RepoStatus $repoStatus `
+        -RepoPath $RepoDir `
+        -RemoteUrl $RepoUrl `
+        -BranchName $Branch `
+        -VenvExists $venvExists `
+        -FrontendDistExists $frontendDistExists `
+        -DepsRecommended $defaultInstallDeps `
+        -FrontendRecommended $defaultBuildFrontend `
+        -DashboardShortcutExists $dashboardShortcutExists `
+        -SetupShortcutExists $setupShortcutExists `
+        -InstallStatePresent ($null -ne $existingState))
+    $repairableSetupProblems = @($setupProblems | Where-Object { $_.Repairable })
+    $defaultRepairSetup = [bool]$RepairMode -or ($repoStatus.is_git_repo -and (-not $repoStatus.origin_configured))
     $localChangeSummary = Format-StatusFileList -Items $repoStatus.changed_files -MaxItems 3
 
     $cloneBaseReason = if (-not $repoExists) {
@@ -2201,6 +2434,16 @@ try {
         "recommended"
     }
 
+    $repairSetupBaseReason = if ($RepairMode) {
+        "repair mode requested from dashboard or command line"
+    } elseif ($repoStatus.is_git_repo -and (-not $repoStatus.origin_configured)) {
+        "origin remote is missing and can usually be restored"
+    } elseif ($repairableSetupProblems.Count -gt 0) {
+        "optional; $($repairableSetupProblems.Count) repairable issue(s) detected"
+    } else {
+        "optional"
+    }
+
     $overviewLines = @(
         ("Mode: {0}" -f $(if ($repoExists) { "manage existing install" } else { "first-time setup" })),
         ("Configured branch: {0}" -f $Branch),
@@ -2211,6 +2454,7 @@ try {
         ("Python deps: {0}" -f $(if ($defaultInstallDeps) { $installDepsBaseReason } else { "no reinstall recommended" })),
         ("Frontend: {0}" -f $(if ($defaultBuildFrontend) { $buildFrontendBaseReason } else { "no rebuild recommended" })),
         ("Shortcuts: dashboard={0}, setup={1}" -f $(if ($dashboardShortcutExists) { "present" } else { "missing" }), $(if ($setupShortcutExists) { "present" } else { "missing" })),
+        ("Detected problems: {0} ({1} repairable)" -f $setupProblems.Count, $repairableSetupProblems.Count),
         ("Last successful setup: {0}" -f (Format-StateTimestamp -Timestamp $stateLastSuccessUtc))
     )
     if (@($repoStatus.changed_files).Count -gt 0) {
@@ -2225,6 +2469,12 @@ try {
     [void]$actions.Add([pscustomobject]@{
             Key = "InstallGit"; Label = "Install Git"; Selected = $defaultInstallGit
             BaseReason = if ($defaultInstallGit) { "missing (auto-selected)" } else { "already installed" }
+            Reason = ""
+            Locked = $false
+        })
+    [void]$actions.Add([pscustomobject]@{
+            Key = "RepairSetup"; Label = "Repair setup/repository metadata"; Selected = $defaultRepairSetup
+            BaseReason = $repairSetupBaseReason
             Reason = ""
             Locked = $false
         })
@@ -2277,7 +2527,7 @@ try {
             Locked = $false
         })
 
-    Select-Actions -Actions $actions -InitialScan $initialScan -RepositoryPath $RepoDir -VenvPath $VenvDir -OverviewLines $overviewLines -SkipPrompt:$NonInteractive
+    Select-Actions -Actions $actions -InitialScan $initialScan -RepositoryPath $RepoDir -VenvPath $VenvDir -OverviewLines $overviewLines -Problems $setupProblems -SkipPrompt:$NonInteractive
 
     Write-Log "Final action set:"
     foreach ($action in $actions) {
@@ -2306,6 +2556,15 @@ try {
     Invoke-Step -Name "RefreshPath" -Action { Refresh-Path }
 
     $gitExeObj = Get-Command git -ErrorAction SilentlyContinue
+    if (Get-ActionState -Actions $actions -Key "RepairSetup") {
+        if (-not $gitExeObj) {
+            throw "git is required for setup repair. Enable 'Install Git' or install git manually."
+        }
+        Invoke-Step -Name "RepairSetup" -Action {
+            Repair-SetupMetadata -GitExe $gitExeObj.Source -RepoPath $RepoDir -RemoteUrl $RepoUrl -BranchName $Branch
+        }
+    }
+
     $stateData = [ordered]@{
         schema_version = 1
         install_root = $InstallRoot

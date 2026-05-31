@@ -1782,6 +1782,8 @@ def build_full_finetune_cmd(config: ProjectConfig) -> list[str]:
             cmd += ["--int8_weights_group_size", str(t.int8_weights_group_size)]
         if getattr(t, "int8_weights_outlier_quantile", 1.0) != 1.0:
             cmd += ["--int8_weights_outlier_quantile", str(t.int8_weights_outlier_quantile)]
+        if getattr(t, "int8_weights_sparse_ratio", 0.0) != 0.0:
+            cmd += ["--int8_weights_sparse_ratio", str(t.int8_weights_sparse_ratio)]
 
     if getattr(t, "preserve_audio_timing", False):
         cmd.append("--preserve_audio_timing")
