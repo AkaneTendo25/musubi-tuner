@@ -180,6 +180,37 @@ def _move_apollo_projector_to_device(projector: Any, device: torch.device) -> No
     projector.ortho_matrix = _move_apollo_projector_value(projector.ortho_matrix, device)
 
 
+def _apollo_random_projector_project_back(self, low_rank_grad: torch.Tensor) -> torch.Tensor:
+    """``project_back`` for the random ``GradientProjector``.
+
+    apollo-torch's ``GradientProjector`` (``--apollo_proj random``) ships ``project``
+    but no ``project_back``, so the Fira update rule (which needs the full-rank
+    residual ``G - P P^T G``) cannot run on it. The projection is a plain matmul by
+    ``ortho_matrix``, so the inverse mapping mirrors ``GaLoreProjector.project_back``
+    exactly (same ``ortho_matrix`` / ``proj_type`` / ``scale`` conventions and the
+    same branch on the low-rank shape).
+    """
+    proj_type = getattr(self, "proj_type", "std")
+    ortho = self.ortho_matrix
+    if proj_type == "std":
+        if low_rank_grad.shape[0] >= low_rank_grad.shape[1]:
+            full_rank_grad = torch.matmul(low_rank_grad, ortho)
+        else:
+            full_rank_grad = torch.matmul(ortho, low_rank_grad)
+    elif proj_type == "reverse_std":
+        if low_rank_grad.shape[0] <= low_rank_grad.shape[1]:
+            full_rank_grad = torch.matmul(ortho, low_rank_grad)
+        else:
+            full_rank_grad = torch.matmul(low_rank_grad, ortho)
+    elif proj_type == "right":
+        full_rank_grad = torch.matmul(low_rank_grad, ortho)
+    elif proj_type == "left":
+        full_rank_grad = torch.matmul(ortho, low_rank_grad)
+    else:
+        raise NotImplementedError(f"random projector project_back is not supported for proj_type={proj_type!r}")
+    return full_rank_grad * float(getattr(self, "scale", 1.0))
+
+
 def patch_apollo_projector_device_transfer() -> None:
     """Make APOLLO projector checkpoints device-safe after optimizer resume."""
     try:
@@ -187,6 +218,12 @@ def patch_apollo_projector_device_transfer() -> None:
         from apollo_torch.svd_projector import GaLoreProjector
     except ImportError:
         return
+
+    # The random projector lacks project_back; supply one so Fira works with
+    # --apollo_proj random (no SVD init cost). Added before the device-safety wrap
+    # below so it gets the same device-transfer treatment as the native methods.
+    if not hasattr(GradientProjector, "project_back"):
+        GradientProjector.project_back = _apollo_random_projector_project_back
 
     for projector_class in (GradientProjector, GaLoreProjector):
         if not getattr(projector_class, "_musubi_device_safe_project", False):
