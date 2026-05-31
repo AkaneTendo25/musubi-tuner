@@ -3257,6 +3257,8 @@ For audio-video runs, use `target=both` if both token streams should be routed:
 
 The benchmark matrices below are 100-step single-GPU capacity/speed runs on cached video benchmark subsets with dataset `batch_size = 1` and no gradient accumulation. Unless stated otherwise, the tables use bf16 weights/training, FlashAttention, gradient checkpointing, and `blocks_to_swap=0`; runs were checked for finite loss, and resulting checkpoints were separately checked with non-noise previews where sampling was run.
 
+Each row reports **peak VRAM** as the peak resident process GPU memory during the run — the allocator high-water mark, i.e. what must actually fit on the card — and **speed** as the median wall-clock seconds per optimizer step.
+
 > [!NOTE]
 > Each benchmark row in this and later benchmark tables was measured on one NVIDIA H100 80GB HBM3 GPU unless explicitly labeled otherwise.
 
@@ -3560,6 +3562,9 @@ The `optim_bits=8` QAPOLLO path was checked for finite loss and non-noise previe
 | 1280x720 | 241 | 43.3 GB / 28.27 s | 61.8 GB / 32.95 s | 66.2 GB / 57.67 s | OOM (>80 GB) |
 ### Int8 Weight Training
 <sub>[↑ contents](#table-of-contents)</sub>
+
+> [!CAUTION]
+> **Experimental.** Storing trainable weights in int8 is a quantization-lossy training path that trades some output fidelity for a lower VRAM footprint, so it is not recommended for final-quality runs. Treat it as a VRAM-of-last-resort option for fitting full fine-tuning into ~24 GB, and train in bf16 when quality matters.
 
 `--int8_weights` (experimental) stores trainable `Linear` weights as int8 (symmetric, per-row or per-group scale) with no bf16 master; the optimizer updates the int8 storage in place via stochastic rounding, while forward/backward dequantize to bf16 for the GEMM. Requires `--fused_backward_pass` and a factored optimizer (Adafactor by default). With `--max_grad_norm 0` (gradient clipping off), short-context video-only training fits in roughly 21-23 GB: int8 storage roughly halves the trainable weight bytes, and without the global-norm clip the gradient buffer need not stay resident. `--max_grad_norm 1.0` keeps that buffer resident and raises peak VRAM. Validate save/resume on the target GPU before long runs.
 
