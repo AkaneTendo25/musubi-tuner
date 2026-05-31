@@ -266,7 +266,14 @@ class QGaLoreProjector:
 
 class QGaLoreLinearFunction(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x: Tensor, weight: Parameter, bias: Parameter | None) -> Tensor:
+    def forward(ctx, x: Tensor, weight: Parameter, bias: Parameter | None, anchor: Tensor) -> Tensor:
+        # `anchor` is a tiny float tensor that requires grad and is deliberately UNUSED in the
+        # computation. The quantized weight is requires_grad=False, so if neither `x` nor `bias`
+        # requires grad (e.g. a quantized layer at the head of an otherwise-frozen subgraph),
+        # autograd would build no backward node: backward() would never run, weight.float_grad
+        # would stay None, and the optimizer (QGaLoreAdamW8bit / QAPOLLOAdamW, both consume
+        # float_grad) would silently skip this layer. The anchor forces the node to exist so
+        # float_grad is always produced. Do NOT remove it or "clean up" the unused argument.
         float_weight = _dequantize_affine_uint(
             weight,
             dtype=x.dtype,
@@ -312,7 +319,8 @@ class QGaLoreLinearFunction(torch.autograd.Function):
         if callable(backward_hook):
             backward_hook(weight)
 
-        return grad_input, None, grad_bias
+        # Grad slots: (x, weight, bias, anchor). weight is frozen (None); anchor is unused (None).
+        return grad_input, None, grad_bias, None
 
 
 class QGaLoreLinear(nn.Module):
@@ -372,7 +380,13 @@ class QGaLoreLinear(nn.Module):
 
     def forward(self, input: Tensor) -> Tensor:
         self._refresh_weight_attrs()
-        return QGaLoreLinearFunction.apply(input, self.weight, self.bias)
+        # See QGaLoreLinearFunction.forward: the anchor guarantees the custom backward (and thus
+        # weight.float_grad) runs even when `input` does not require grad. It is a scalar leaf, not
+        # an nn.Parameter/buffer, so the optimizer never sees it, checkpoints are unchanged, and it
+        # costs ~nothing. Created fresh per call on input.device; its dtype is the layer compute
+        # dtype (a float, so it can carry grad), independent of the input dtype.
+        anchor = torch.zeros((), dtype=self.compute_dtype, device=input.device, requires_grad=True)
+        return QGaLoreLinearFunction.apply(input, self.weight, self.bias, anchor)
 
     @torch.no_grad()
     def dequantized_weight(
