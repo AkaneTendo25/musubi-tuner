@@ -1378,10 +1378,12 @@ class LTX2SliderTrainer:
                 else:
                     raise FileNotFoundError(f"resume state directory is missing or incomplete: {args.resume}")
 
+        _resume_state_dir = None
         if getattr(args, "resume", None):
             self._net_trainer._register_optimizer_resume_safe_globals(args)
             logger.info(f"Resuming slider training from state: {args.resume}")
             accelerator.load_state(args.resume)
+            _resume_state_dir = args.resume
             resume_step = self._net_trainer._recover_global_step(args.resume)
             if resume_step > 0:
                 initial_global_step = resume_step
@@ -1561,6 +1563,31 @@ class LTX2SliderTrainer:
         # -- Save / remove helpers ---------------------------------------------
         save_dtype = dit_dtype
 
+        def _build_checkpoint_metadata() -> dict:
+            """Build the training-settings sidecar dict (shared by checkpoints and state dirs)."""
+            from datetime import datetime
+
+            _training = {
+                "step": global_step,
+                "epoch": 0,
+                "timestamp": datetime.now().isoformat(timespec="seconds"),
+            }
+            try:
+                _training["loss"] = float(loss)
+            except Exception:
+                pass
+            if loss_recorder.loss_list:
+                _training["loss_avg"] = loss_recorder.moving_average
+            try:
+                _training["lr"] = float(lr_scheduler.get_last_lr()[0])
+            except Exception:
+                pass
+            return {
+                "training": _training,
+                "command": _argv_to_command_list(),
+                "slider_config": asdict(self.slider_config),
+            }
+
         def save_model(ckpt_name: str, unwrapped_nw, steps, epoch_no, force_sync_upload=False):
             os.makedirs(args.output_dir, exist_ok=True)
             ckpt_file = os.path.join(args.output_dir, ckpt_name)
@@ -1580,29 +1607,7 @@ class LTX2SliderTrainer:
                 huggingface_utils.upload(args, ckpt_file, "/" + ckpt_name, force_sync_upload=force_sync_upload)
 
             if getattr(args, "save_checkpoint_metadata", False):
-                from datetime import datetime
-
-                _training = {
-                    "step": steps,
-                    "epoch": epoch_no,
-                    "timestamp": datetime.now().isoformat(timespec="seconds"),
-                }
-                try:
-                    _training["loss"] = float(loss)
-                except Exception:
-                    pass
-                if loss_recorder.loss_list:
-                    _training["loss_avg"] = loss_recorder.moving_average
-                try:
-                    _training["lr"] = float(lr_scheduler.get_last_lr()[0])
-                except Exception:
-                    pass
-                _md = {
-                    "training": _training,
-                    "command": _argv_to_command_list(),
-                    "slider_config": asdict(self.slider_config),
-                }
-                train_utils.save_checkpoint_metadata(ckpt_file, _md)
+                train_utils.save_checkpoint_metadata(ckpt_file, _build_checkpoint_metadata())
 
         def remove_model(old_ckpt_name):
             old_ckpt_file = os.path.join(args.output_dir, old_ckpt_name)
@@ -1664,6 +1669,7 @@ class LTX2SliderTrainer:
                         "interrupted": True,
                     },
                 )
+                train_utils.save_state_metadata(state_dir, _build_checkpoint_metadata())
                 if gui_metrics is not None:
                     gui_metrics.log_event("interrupt_state", global_step, path=str(state_dir))
             train_utils.clear_dashboard_stop_request()
@@ -1674,6 +1680,7 @@ class LTX2SliderTrainer:
         # -- Training loop -----------------------------------------------------
         progress_bar = tqdm(
             range(args.max_train_steps),
+            initial=initial_global_step,
             smoothing=0,
             disable=not accelerator.is_local_main_process,
             desc="steps",
@@ -1681,13 +1688,17 @@ class LTX2SliderTrainer:
 
         global_step = initial_global_step
         loss_recorder = train_utils.LossRecorder()
+        if initial_global_step > 0 and _resume_state_dir is not None:
+            _meta = train_utils.load_resume_metadata(_resume_state_dir)
+            if _meta and "loss_avg" in _meta:
+                loss_recorder.prefill(_meta["loss_avg"], _meta.get("loss_count", 0))
+                accelerator.print(f"  restored loss average: {_meta['loss_avg']:.4f} (from {_meta.get('loss_count', 0)} steps)")
 
         clean_memory_on_device(accelerator.device)
         optimizer_train_fn()
         optimizer.zero_grad(set_to_none=True)
 
         if initial_global_step > 0:
-            progress_bar.update(initial_global_step)
             logger.info("Resuming slider training from step %d", initial_global_step)
         else:
             logger.info("Starting slider training")
@@ -1835,6 +1846,18 @@ class LTX2SliderTrainer:
                             train_utils.save_and_remove_state_stepwise(
                                 args, accelerator, global_step, epoch=0, step_in_epoch=global_step
                             )
+                            _state_dir = os.path.join(
+                                args.output_dir,
+                                train_utils.STEP_STATE_NAME.format(args.output_name, global_step),
+                            )
+                            train_utils.update_resume_metadata(
+                                _state_dir,
+                                {
+                                    "loss_avg": loss_recorder.moving_average,
+                                    "loss_count": len(loss_recorder.loss_list),
+                                },
+                            )
+                            train_utils.save_state_metadata(_state_dir, _build_checkpoint_metadata())
 
                         remove_step_no = train_utils.get_remove_step_no(args, global_step)
                         if remove_step_no is not None:
@@ -1852,6 +1875,18 @@ class LTX2SliderTrainer:
 
         if is_main_process and (getattr(args, "save_state", False) or getattr(args, "save_state_on_train_end", False)):
             train_utils.save_state_on_train_end(args, accelerator, global_step=global_step, epoch=0, step_in_epoch=global_step)
+            _state_dir = os.path.join(
+                args.output_dir,
+                train_utils.LAST_STATE_NAME.format(args.output_name),
+            )
+            train_utils.update_resume_metadata(
+                _state_dir,
+                {
+                    "loss_avg": loss_recorder.moving_average,
+                    "loss_count": len(loss_recorder.loss_list),
+                },
+            )
+            train_utils.save_state_metadata(_state_dir, _build_checkpoint_metadata())
 
         if is_main_process:
             ckpt_name = train_utils.get_last_ckpt_name(args.output_name)
