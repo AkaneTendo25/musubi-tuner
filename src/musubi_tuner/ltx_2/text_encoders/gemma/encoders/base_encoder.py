@@ -644,6 +644,23 @@ def module_ops_from_gemma_root(
                             tensor = f.get_tensor(key)
 
                             with torch.no_grad():
+                                # Dequantize NVFP4 packed weights (uint8 with two-level scales)
+                                if tensor.dtype == torch.uint8 and key.endswith(".weight"):
+                                    prefix = key[:-len(".weight")]
+                                    wscale_k = prefix + ".weight_scale"
+                                    wscale2_k = prefix + ".weight_scale_2"
+                                    if wscale_k in keys and wscale2_k in keys:
+                                        from musubi_tuner.modules.nvfp4_utils import dequantize_nvfp4_weight
+                                        block_scale = f.get_tensor(wscale_k)
+                                        tensor_scale = f.get_tensor(wscale2_k)
+                                        tensor = dequantize_nvfp4_weight(tensor, block_scale, tensor_scale, dtype=torch_dtype)
+                                # Dequantize ComfyUI FP8 weights with per-tensor scale
+                                elif tensor.dtype.itemsize == 1 and tensor.dtype != torch.uint8 and key.endswith(".weight"):
+                                    wscale_k = key.replace(".weight", ".weight_scale")
+                                    if wscale_k in keys:
+                                        scale = f.get_tensor(wscale_k)
+                                        tensor = tensor.to(torch_dtype) * scale.to(torch_dtype)
+
                                 if param.shape != tensor.shape:
                                     # Handle specialized shape mismatches if necessary, or error
                                     logger.warning(f"Shape mismatch for {new_key}: model {param.shape} vs ckpt {tensor.shape}")

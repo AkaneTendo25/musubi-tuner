@@ -64,8 +64,8 @@
 	let modelDir = $derived(defaultModelDir(cwd, $projectConfig));
 	let resolvedLtx = $derived(effectiveLtx2Checkpoint(cwd, $projectConfig, caching.ltx2_checkpoint || ''));
 	let activeGemmaSafetensors = $derived(effectiveGemmaSafetensors($projectConfig, caching.gemma_safetensors || ''));
-	let gemmaRootDisabled = $derived(Boolean(activeGemmaSafetensors));
-	let resolvedGemma = $derived(effectiveGemmaRoot(cwd, $projectConfig, caching.gemma_root || '', activeGemmaSafetensors));
+	let gemmaRootDisabled = $derived(Boolean(caching.gemma_safetensors));
+	let resolvedGemma = $derived(effectiveGemmaRoot(cwd, $projectConfig, caching.gemma_root || '', caching.gemma_safetensors || ''));
 	let scanTargetGemmaRoot = $derived(effectiveGemmaRoot(cwd, $projectConfig, caching.gemma_root || '', ''));
 	let downloadState = $derived($modelDownloadState.state || '');
 	let modelStatus = $derived($modelDownloadState.message || '');

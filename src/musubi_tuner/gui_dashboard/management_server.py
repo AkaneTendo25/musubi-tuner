@@ -206,7 +206,14 @@ def _get_run_dir(app: FastAPI) -> Optional[str]:
         return None
 
     pm: ProcessManager = app.state.process_manager
-    process_type = "full_finetune" if pm.get_status("full_finetune").get("state") in {"running", "stopping"} else "training"
+    active_states = {"running", "stopping"}
+    if pm.get_status("full_finetune").get("state") in active_states:
+        process_type = "full_finetune"
+    elif pm.get_status("slider_training").get("state") in active_states:
+        process_type = "slider_training"
+    else:
+        process_type = "training"
+    # Slider training inherits output_dir from the training config section.
     section = config.full_finetune if process_type == "full_finetune" else config.training
     if section.output_dir:
         run_dir = Path(section.output_dir)
@@ -219,5 +226,6 @@ def _get_run_dir(app: FastAPI) -> Optional[str]:
 def _training_dashboard_active(app: FastAPI) -> bool:
     pm: ProcessManager = app.state.process_manager
     return any(
-        pm.get_status(process_type).get("state") in {"running", "stopping"} for process_type in ("training", "full_finetune")
+        pm.get_status(process_type).get("state") in {"running", "stopping"}
+        for process_type in ("training", "full_finetune", "slider_training")
     )

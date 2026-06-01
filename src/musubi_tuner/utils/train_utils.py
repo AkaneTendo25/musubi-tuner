@@ -224,6 +224,16 @@ def save_checkpoint_metadata(ckpt_file: str, metadata: dict) -> None:
         json.dump(clean, f, indent=2)
 
 
+def save_state_metadata(state_dir: str, metadata: dict) -> None:
+    """Write a JSON sidecar with training settings inside a state directory."""
+    path = os.path.join(state_dir, "slider_metadata.json")
+    clean = {k: v for k, v in metadata.items() if v is not None}
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(clean, f, indent=2)
+    os.replace(tmp, path)
+
+
 def remove_checkpoint_metadata(ckpt_file: str) -> None:
     """Remove JSON sidecar if it exists."""
     json_path = os.path.splitext(ckpt_file)[0] + ".json"

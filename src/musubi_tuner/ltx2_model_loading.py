@@ -156,6 +156,13 @@ def detect_ltx2_dtype(model_path: str) -> torch.dtype:
     if not os.path.isfile(model_path):
         raise FileNotFoundError(f"LTX-2 weights must be a .safetensors file. Got: {model_path}")
 
+    # NVFP4 checkpoints store weight_scale tensors as float8_e4m3fn which would
+    # be misidentified as fp8 model weights.  Detect NVFP4 early and skip those
+    # quantization-internal keys so we return the true model dtype (bf16),
+    # mirroring the behaviour of NF4 checkpoints.
+    from musubi_tuner.modules.nvfp4_utils import detect_nvfp4_checkpoint
+    _is_nvfp4 = detect_nvfp4_checkpoint(model_path)
+
     with MemoryEfficientSafeOpen(model_path) as handle:
         keys = list(handle.keys())
         if not keys:
@@ -166,6 +173,9 @@ def detect_ltx2_dtype(model_path: str) -> torch.dtype:
 
         # Avoid loading tensors: inspect header dtype for each key.
         for key in keys:
+            # Skip NVFP4 quantization metadata keys — these are not model weights.
+            if _is_nvfp4 and (key.endswith(".weight_scale") or key.endswith(".weight_scale_2")):
+                continue
             meta = handle.header.get(key)
             if not isinstance(meta, dict) or "dtype" not in meta:
                 continue
@@ -422,7 +432,9 @@ def load_ltx2_model(
 
     def _cast_non_fp8_params(model: torch.nn.Module, target_dtype: torch.dtype) -> None:
         for module in model.modules():
-            is_quantized_linear = isinstance(module, torch.nn.Linear) and hasattr(module, "scale_weight")
+            is_quantized_linear = isinstance(module, torch.nn.Linear) and (
+                hasattr(module, "scale_weight") or hasattr(module, "_nvfp4_quantized")
+            )
             if is_quantized_linear:
                 continue
             for _, param in module.named_parameters(recurse=False):
@@ -477,6 +489,8 @@ def load_ltx2_model(
         attn_type = "flash_attention_3"
     elif attn_mode in {"flash", "flash_attention_2"}:
         attn_type = "flash_attention_2"
+    elif attn_mode in {"sageattn", "sage_attention"}:
+        attn_type = "sage_attention"
     elif attn_mode in {"torch", "sdpa"}:
         attn_type = "pytorch"
     if attn_type is not None:
@@ -554,7 +568,23 @@ def load_ltx2_model(
 
     _awq_scales = None  # populated if AWQ calibration is used
 
-    if nf4_base:
+    # --- Auto-detect NVFP4 (Lightricks pre-quantized FP4 E2M1) ---
+    _is_nvfp4 = False
+    if not nf4_base and not fp8_scaled:
+        from musubi_tuner.modules.nvfp4_utils import detect_nvfp4_checkpoint
+        _check_path = model_path if isinstance(model_path, str) else model_path[0]
+        _is_nvfp4 = detect_nvfp4_checkpoint(_check_path)
+
+    if _is_nvfp4:
+        from musubi_tuner.modules.nvfp4_utils import load_nvfp4_state_dict, apply_nvfp4_monkey_patch
+        logger.info("Detected NVFP4 (Lightricks FP4 E2M1) checkpoint — loading with on-the-fly dequantization")
+        sd = load_nvfp4_state_dict(
+            model_files=model_path if isinstance(model_path, list) else [model_path],
+            state_dict_key_filter=state_dict_key_filter,
+            move_to_device=not load_weights_on_cpu and load_device == target_device,
+            target_device=load_device if (not load_weights_on_cpu and load_device == target_device) else None,
+        )
+    elif nf4_base:
         nf4_calc_device = _resolved_quant_device
         logger.info("LTX-2 nf4: quantization device = %s", nf4_calc_device)
         model_files = model_path if isinstance(model_path, list) else [model_path]
@@ -760,7 +790,10 @@ def load_ltx2_model(
             logger.info(f"[VRAM_TRACE_LTX2] {tag}: alloc={a:.2f}GB res={r:.2f}GB max={m:.2f}GB")
 
     _trace_vram_ltx2(f"AFTER state dict loading (state_device={state_device}, quantize_device={_resolved_quant_device})")
-    if nf4_base:
+    if _is_nvfp4:
+        from musubi_tuner.modules.nvfp4_utils import apply_nvfp4_monkey_patch
+        apply_nvfp4_monkey_patch(base_model, sd)
+    elif nf4_base:
         apply_nf4_monkey_patch(base_model, sd, block_size=nf4_block_size, awq_scales=_awq_scales)
     elif fp8_scaled:
         apply_fp8_monkey_patch(base_model, sd, use_scaled_mm=False)

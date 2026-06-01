@@ -50,7 +50,12 @@ def _effective_gemma_root(config: ProjectConfig, explicit: str, gemma_safetensor
     return explicit or config.default_gemma_root or str(_default_model_dir(config) / DEFAULT_GEMMA_ROOT_NAME)
 
 
-def _effective_gemma_safetensors(config: ProjectConfig, explicit: str) -> str:
+def _effective_gemma_safetensors(config: ProjectConfig, explicit: str, explicit_gemma_root: str = "") -> str:
+    # If the user has explicitly set gemma_root on this section AND it points to
+    # a real directory, suppress the default_gemma_safetensors fallback so that
+    # gemma_root takes priority.
+    if explicit_gemma_root and Path(explicit_gemma_root).is_dir():
+        return explicit or ""
     return explicit or config.default_gemma_safetensors or ""
 
 
@@ -305,7 +310,7 @@ def build_cache_text_cmd(config: ProjectConfig) -> list[str]:
     c = config.caching
     t = config.training
     ltx2_checkpoint = _effective_ltx2_checkpoint(config, c.ltx2_checkpoint)
-    gemma_safetensors = _effective_gemma_safetensors(config, c.gemma_safetensors)
+    gemma_safetensors = _effective_gemma_safetensors(config, c.gemma_safetensors, c.gemma_root)
     gemma_root = _effective_gemma_root(config, c.gemma_root, gemma_safetensors)
     sample_prompts = _effective_caching_sample_prompts(config)
 
@@ -387,7 +392,7 @@ def build_cache_text_cmd(config: ProjectConfig) -> list[str]:
 def build_inference_cmd(config: ProjectConfig) -> list[str]:
     """Build CLI args for ltx2_generate_video.py."""
     s = config.inference
-    gemma_safetensors = _effective_gemma_safetensors(config, s.gemma_safetensors)
+    gemma_safetensors = _effective_gemma_safetensors(config, s.gemma_safetensors, s.gemma_root)
     gemma_root = _effective_gemma_root(config, s.gemma_root, gemma_safetensors)
 
     cmd = [
@@ -625,7 +630,7 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
     toml_path = export_dataset_toml(config)
     t = config.training
     ltx2_checkpoint = _effective_ltx2_checkpoint(config, t.ltx2_checkpoint)
-    gemma_safetensors = _effective_gemma_safetensors(config, t.gemma_safetensors)
+    gemma_safetensors = _effective_gemma_safetensors(config, t.gemma_safetensors, t.gemma_root)
     gemma_root = _effective_gemma_root(config, t.gemma_root, gemma_safetensors)
     network_module = _effective_network_module(t.network_module or "")
     sample_prompts = _effective_training_sample_prompts(config)
@@ -1567,7 +1572,7 @@ def build_full_finetune_cmd(config: ProjectConfig) -> list[str]:
     toml_path = export_dataset_toml(config)
     t = config.full_finetune
     ltx2_checkpoint = _effective_ltx2_checkpoint(config, t.ltx2_checkpoint)
-    gemma_safetensors = _effective_gemma_safetensors(config, t.gemma_safetensors)
+    gemma_safetensors = _effective_gemma_safetensors(config, t.gemma_safetensors, t.gemma_root)
     gemma_root = _effective_gemma_root(config, t.gemma_root, gemma_safetensors)
     sample_prompts = _effective_full_finetune_sample_prompts(config)
 
@@ -1601,8 +1606,12 @@ def build_full_finetune_cmd(config: ProjectConfig) -> list[str]:
         cmd.append("--fp8_base")
     if t.fp8_scaled:
         cmd.append("--fp8_scaled")
-    if t.fp8_keep_blocks:
+    if getattr(t, "fp8_keep_blocks", ""):
         cmd += ["--fp8_keep_blocks", t.fp8_keep_blocks]
+    if t.nf4_base:
+        cmd.append("--nf4_base")
+    if getattr(t, "nf4_block_size", 32) != 32:
+        cmd += ["--nf4_block_size", str(t.nf4_block_size)]
     if t.flash_attn:
         cmd.append("--flash_attn")
     if t.flash3:
@@ -2176,7 +2185,7 @@ def build_slider_training_cmd(config: ProjectConfig) -> list[str]:
     t = config.training
     slider_toml = _write_slider_toml(config, build_slider_toml_path(config))
     ltx2_checkpoint = _effective_ltx2_checkpoint(config, t.ltx2_checkpoint)
-    gemma_safetensors = _effective_gemma_safetensors(config, t.gemma_safetensors)
+    gemma_safetensors = _effective_gemma_safetensors(config, t.gemma_safetensors, t.gemma_root)
     gemma_root = _effective_gemma_root(config, t.gemma_root, gemma_safetensors)
 
     cmd = _accelerate_launch_prefix(t.mixed_precision, s.accelerate_extra_args)
@@ -2193,6 +2202,10 @@ def build_slider_training_cmd(config: ProjectConfig) -> list[str]:
         cmd += ["--gemma_safetensors", gemma_safetensors]
     if t.ltx2_mode:
         cmd += ["--ltx2_mode", t.ltx2_mode]
+    if t.ltx_version:
+        cmd += ["--ltx_version", t.ltx_version]
+    if t.vae_dtype:
+        cmd += ["--vae_dtype", t.vae_dtype]
     if s.mode == "ic_reference":
         cmd += ["--lora_target_preset", "v2v"]
         cmd += ["--ic_lora_strategy", "v2v"]
@@ -2206,6 +2219,14 @@ def build_slider_training_cmd(config: ProjectConfig) -> list[str]:
         cmd += ["--fp8_keep_blocks", t.fp8_keep_blocks]
     if t.flash_attn:
         cmd.append("--flash_attn")
+    if t.flash3:
+        cmd.append("--flash3")
+    if t.sdpa:
+        cmd.append("--sdpa")
+    if t.sage_attn:
+        cmd.append("--sage_attn")
+    if t.xformers:
+        cmd.append("--xformers")
     if t.gemma_load_in_8bit:
         cmd.append("--gemma_load_in_8bit")
     if t.gemma_load_in_4bit:
@@ -2222,6 +2243,10 @@ def build_slider_training_cmd(config: ProjectConfig) -> list[str]:
         cmd += ["--latent_frames", str(s.latent_frames)]
         cmd += ["--latent_height", str(s.latent_height)]
         cmd += ["--latent_width", str(s.latent_width)]
+    else:
+        # First-frame conditioning probability — only meaningful for reference
+        # (image/video pair) sliders, read by the reference training step.
+        cmd += ["--ltx2_first_frame_conditioning_p", str(t.ltx2_first_frame_conditioning_p)]
     if s.guidance_strength != 1.0:
         cmd += ["--guidance_strength", str(s.guidance_strength)]
     if s.sample_slider_range != "-2,-1,0,1,2":
@@ -2233,6 +2258,30 @@ def build_slider_training_cmd(config: ProjectConfig) -> list[str]:
     if t.network_alpha != 1:
         cmd += ["--network_alpha", str(t.network_alpha)]
 
+    # Network module + args — from training config.
+    # The slider trainer only defaults network_module when it is None, so forwarding
+    # the GUI value (and ic_reference override above) is safe.
+    network_args_parts = _split_cli_args(t.network_args)
+    _append_network_arg(network_args_parts, "rank_dropout", t.rank_dropout)
+    _append_network_arg(network_args_parts, "module_dropout", t.module_dropout)
+    _append_network_arg(network_args_parts, "use_dora", t.use_dora)
+    _append_network_arg(network_args_parts, "adaptive_rank", t.adaptive_rank)
+    _append_network_arg(network_args_parts, "adaptive_rank_target", t.adaptive_rank_target)
+    _append_network_arg(network_args_parts, "adaptive_rank_min_rank", t.adaptive_rank_min_rank)
+    _append_network_arg(network_args_parts, "adaptive_rank_init_rank", t.adaptive_rank_init_rank)
+    _append_network_arg(network_args_parts, "adaptive_rank_quantile", t.adaptive_rank_quantile)
+    _append_network_arg(network_args_parts, "adaptive_rank_weight", t.adaptive_rank_weight)
+    if t.network_module:
+        cmd += ["--network_module", _effective_network_module(t.network_module)]
+    if network_args_parts:
+        cmd += ["--network_args"] + network_args_parts
+    if t.network_weights:
+        cmd += ["--network_weights", t.network_weights]
+    if t.network_dropout is not None:
+        cmd += ["--network_dropout", str(t.network_dropout)]
+    if t.scale_weight_norms is not None:
+        cmd += ["--scale_weight_norms", str(t.scale_weight_norms)]
+
     # Optimizer — from training config
     cmd += ["--learning_rate", str(t.learning_rate)]
     if t.optimizer_type:
@@ -2242,10 +2291,56 @@ def build_slider_training_cmd(config: ProjectConfig) -> list[str]:
     cmd += ["--gradient_accumulation_steps", str(t.gradient_accumulation_steps)]
     cmd += ["--max_grad_norm", str(t.max_grad_norm)]
 
+    # LR scheduler — from training config
+    cmd += ["--lr_scheduler", t.lr_scheduler]
+    cmd += ["--lr_warmup_steps", str(t.lr_warmup_steps)]
+    if t.lr_decay_steps is not None:
+        cmd += ["--lr_decay_steps", str(t.lr_decay_steps)]
+    if t.lr_scheduler_num_cycles is not None:
+        cmd += ["--lr_scheduler_num_cycles", str(t.lr_scheduler_num_cycles)]
+    if t.lr_scheduler_power is not None:
+        cmd += ["--lr_scheduler_power", str(t.lr_scheduler_power)]
+    if t.lr_scheduler_min_lr_ratio is not None:
+        cmd += ["--lr_scheduler_min_lr_ratio", str(t.lr_scheduler_min_lr_ratio)]
+    if t.lr_scheduler_type:
+        cmd += ["--lr_scheduler_type", t.lr_scheduler_type]
+    if t.lr_scheduler_args:
+        cmd += ["--lr_scheduler_args"] + _split_cli_args(t.lr_scheduler_args)
+    if t.lr_scheduler_timescale is not None:
+        cmd += ["--lr_scheduler_timescale", str(t.lr_scheduler_timescale)]
+
     # Schedule — slider override for steps
     cmd += ["--max_train_steps", str(s.max_train_steps)]
     if t.seed is not None:
         cmd += ["--seed", str(t.seed)]
+
+    # Timestep / sigma distribution — slider reads these via getattr in its loop.
+    # Excludes timestep_sampling/discrete_flow_shift/weighting_scheme (slider hardcodes
+    # shifted_logit_normal sampling) and guidance_scale (slider uses its own guidance_strength).
+    # --logit_mean is intentionally NOT forwarded: it belongs to the standard
+    # logit_normal weighting scheme. The slider's shifted_logit_normal sampler takes
+    # its mean from the per-sequence-length shift (or --shifted_logit_shift), so
+    # logit_mean would be inert for sliders. --shifted_logit_shift is the equivalent.
+    if t.logit_std is not None:
+        cmd += ["--logit_std", str(t.logit_std)]
+    if t.min_timestep is not None:
+        cmd += ["--min_timestep", str(t.min_timestep)]
+    if t.max_timestep is not None:
+        cmd += ["--max_timestep", str(t.max_timestep)]
+    if t.shifted_logit_mode:
+        cmd += ["--shifted_logit_mode", t.shifted_logit_mode]
+    if t.shifted_logit_eps != 1e-3:
+        cmd += ["--shifted_logit_eps", str(t.shifted_logit_eps)]
+    if t.shifted_logit_uniform_prob != 0.1:
+        cmd += ["--shifted_logit_uniform_prob", str(t.shifted_logit_uniform_prob)]
+    if t.shifted_logit_shift is not None:
+        cmd += ["--shifted_logit_shift", str(t.shifted_logit_shift)]
+    if t.shifted_logit_clamp_auto_shift:
+        cmd.append("--shifted_logit_clamp_auto_shift")
+    if t.shifted_logit_min_shift != 0.95:
+        cmd += ["--shifted_logit_min_shift", str(t.shifted_logit_min_shift)]
+    if t.shifted_logit_max_shift != 2.05:
+        cmd += ["--shifted_logit_max_shift", str(t.shifted_logit_max_shift)]
 
     # Memory — from training config
     if t.blocks_to_swap is not None:
@@ -2253,12 +2348,129 @@ def build_slider_training_cmd(config: ProjectConfig) -> list[str]:
     if t.gradient_checkpointing:
         cmd.append("--gradient_checkpointing")
 
+    # Compile / dynamo — from training config
+    if t.compile:
+        cmd.append("--compile")
+        if t.compile_backend:
+            cmd += ["--compile_backend", t.compile_backend]
+        if t.compile_mode:
+            cmd += ["--compile_mode", t.compile_mode]
+        compile_dynamic = _compile_dynamic_value(t.compile_dynamic)
+        if compile_dynamic:
+            cmd += ["--compile_dynamic", compile_dynamic]
+        if t.compile_fullgraph:
+            cmd.append("--compile_fullgraph")
+        if t.compile_cache_size_limit is not None:
+            cmd += ["--compile_cache_size_limit", str(t.compile_cache_size_limit)]
+    if t.dynamo_backend != "NO":
+        cmd += ["--dynamo_backend", t.dynamo_backend]
+        if t.dynamo_mode:
+            cmd += ["--dynamo_mode", t.dynamo_mode]
+        if t.dynamo_fullgraph:
+            cmd.append("--dynamo_fullgraph")
+        if t.dynamo_dynamic:
+            cmd.append("--dynamo_dynamic")
+
+    # CUDA performance — from training config
+    if t.cuda_allow_tf32:
+        cmd.append("--cuda_allow_tf32")
+    if t.cuda_cudnn_benchmark:
+        cmd.append("--cuda_cudnn_benchmark")
+    if t.cuda_memory_fraction is not None:
+        cmd += ["--cuda_memory_fraction", str(t.cuda_memory_fraction)]
+
     # Output — dir from training, name from slider
     cmd += ["--output_dir", _effective_output_dir(t.output_dir)]
     if s.output_name:
         cmd += ["--output_name", s.output_name]
     if t.save_every_n_steps:
         cmd += ["--save_every_n_steps", str(t.save_every_n_steps)]
+    if t.save_last_n_steps is not None:
+        cmd += ["--save_last_n_steps", str(t.save_last_n_steps)]
+    if t.save_last_n_steps_state is not None:
+        cmd += ["--save_last_n_steps_state", str(t.save_last_n_steps_state)]
+    if t.save_state:
+        cmd.append("--save_state")
+    if t.save_state_on_train_end:
+        cmd.append("--save_state_on_train_end")
+    if t.resume:
+        cmd += ["--resume", t.resume]
+    if t.reset_optimizer:
+        cmd.append("--reset_optimizer")
+    if t.reset_optimizer_params:
+        cmd.append("--reset_optimizer_params")
+    if t.autoresume:
+        cmd.append("--autoresume")
+
+    # Model metadata — embedded in saved safetensors, useful for distribution
+    if t.metadata_title:
+        cmd += ["--metadata_title", t.metadata_title]
+    if t.metadata_author:
+        cmd += ["--metadata_author", t.metadata_author]
+    if t.metadata_description:
+        cmd += ["--metadata_description", t.metadata_description]
+    if t.metadata_license:
+        cmd += ["--metadata_license", t.metadata_license]
+    if t.metadata_tags:
+        cmd += ["--metadata_tags", t.metadata_tags]
+    if t.metadata_reso:
+        cmd += ["--metadata_reso", t.metadata_reso]
+    if t.metadata_arch:
+        cmd += ["--metadata_arch", t.metadata_arch]
+
+    # Sampling — inherited from training config (same pattern as build_training_cmd)
+    sample_prompts = _effective_training_sample_prompts(config)
+    if t.sample_every_n_steps:
+        cmd += ["--sample_every_n_steps", str(t.sample_every_n_steps)]
+    if t.sample_every_n_epochs:
+        cmd += ["--sample_every_n_epochs", str(t.sample_every_n_epochs)]
+    if sample_prompts:
+        cmd += ["--sample_prompts", sample_prompts]
+    if t.sample_at_first:
+        cmd.append("--sample_at_first")
+    cmd += ["--sample_sampling_preset", t.sample_sampling_preset]
+    if t.sample_sigma_schedule != "auto":
+        cmd += ["--sample_sigma_schedule", t.sample_sigma_schedule]
+    if t.sample_sampler != "auto":
+        cmd += ["--sample_sampler", t.sample_sampler]
+    if t.sample_use_default_negative_prompt is True:
+        cmd.append("--sample_use_default_negative_prompt")
+    elif t.sample_use_default_negative_prompt is False:
+        cmd.append("--no-sample_use_default_negative_prompt")
+    if t.sample_with_offloading:
+        cmd.append("--sample_with_offloading")
+    _append_optional(cmd, "--height", t.height)
+    _append_optional(cmd, "--width", t.width)
+    _append_optional(cmd, "--sample_num_frames", t.sample_num_frames)
+    _append_optional(cmd, "--video_cfg_scale", t.video_cfg_scale)
+
+    # Logging — inherited from training config (same pattern as build_training_cmd)
+    if t.log_with:
+        cmd += ["--log_with", t.log_with]
+    if t.log_with and t.logging_dir:
+        cmd += ["--logging_dir", t.logging_dir]
+    if t.log_prefix:
+        cmd += ["--log_prefix", t.log_prefix]
+    if t.log_tracker_name:
+        cmd += ["--log_tracker_name", t.log_tracker_name]
+    if t.log_tracker_config:
+        cmd += ["--log_tracker_config", t.log_tracker_config]
+    if t.log_config:
+        cmd.append("--log_config")
+    if t.wandb_run_name:
+        cmd += ["--wandb_run_name", t.wandb_run_name]
+    if t.wandb_api_key:
+        cmd += ["--wandb_api_key", t.wandb_api_key]
+    if t.log_cuda_memory_every_n_steps is not None:
+        cmd += ["--log_cuda_memory_every_n_steps", str(t.log_cuda_memory_every_n_steps)]
+    if t.save_checkpoint_metadata:
+        cmd.append("--save_checkpoint_metadata")
+    if t.no_metadata:
+        cmd.append("--no_metadata")
+    if t.no_convert_to_comfy:
+        cmd.append("--no_convert_to_comfy")
+    if not t.save_original_lora:
+        cmd.append("--no_save_original_lora")
 
     cmd += _split_cli_args(s.extra_args)
     return cmd

@@ -74,6 +74,7 @@
 
 	let targets = $derived($projectConfig?.slider?.targets || [{ positive: '', negative: '', target_class: '', weight: 1.0 }]);
 	let sliderStatus = $derived($processStatuses.slider_training || { state: 'idle', exit_code: null });
+	let sliderLogs = $derived($processLogs.slider_training || []);
 	let dinoStatus = $derived($processStatuses.cache_dino || { state: 'idle', exit_code: null });
 	let dinoLogs = $derived($processLogs.cache_dino || []);
 </script>
@@ -900,7 +901,7 @@
 				<div class="pt-2">
 					<ProcessControls processType="slider_training" status={sliderStatus} onStart={() => startProcess('slider_training')} onStop={() => stopProcess('slider_training')} />
 				</div>
-
+				<ProcessConsole lines={sliderLogs} processType="slider_training" />
 				<CommandPanel processType="slider_training" defaultFilename="slider_train.bat" />
 			</div>
 		</div>

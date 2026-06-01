@@ -16,7 +16,7 @@ import re
 import random
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 import toml
@@ -46,6 +46,36 @@ from musubi_tuner.ltx2_train_network import (
 )
 from musubi_tuner.ltx_2.env import apply_ltx2_tweaks
 from musubi_tuner.utils import model_utils, train_utils
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _argv_to_command_list() -> list:
+    """Group ``sys.argv`` into ``[flag, value]`` pairs for JSON metadata.
+
+    Boolean flags (``--gradient_checkpointing``) become single-element lists.
+    Flags with values (``--learning_rate 0.0002``) become two-element lists.
+    Positional tokens (script path) become single-element lists.
+    """
+    result: list[list[str]] = []
+    argv = sys.argv
+    i = 0
+    while i < len(argv):
+        token = argv[i]
+        if token.startswith("--"):
+            if i + 1 < len(argv) and not argv[i + 1].startswith("--"):
+                result.append([token, argv[i + 1]])
+                i += 2
+            else:
+                result.append([token])
+                i += 1
+        else:
+            result.append([token])
+            i += 1
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -532,8 +562,11 @@ class LTX2SliderTrainer:
         sigma_exp = sigma.view(1, 1, 1, 1, 1)
         noisy = sigma_exp * noise  # pure noise scaled by sigma
 
-        # Timestep for model: sigma as [B, 1]
-        model_ts = sigma.unsqueeze(1)
+        # Timestep for model: sigma as [B, 1]. Cast to dit_dtype so attention
+        # backends that require fp16/bf16 inputs (SageAttention, FlashAttention3)
+        # receive matching-precision hidden states. Mirrors call_dit in the
+        # standard trainer, which casts timesteps to network_dtype.
+        model_ts = sigma.unsqueeze(1).to(dtype=dit_dtype)
 
         # Get cached embeddings
         pos_e, pos_m = self.cached_embeds[target.positive]
@@ -662,7 +695,8 @@ class LTX2SliderTrainer:
         # Create noisy versions (flow matching interpolation)
         noisy_pos = ((1.0 - sigma_exp) * pos_latents + sigma_exp * noise).to(dtype=dit_dtype)
         noisy_neg = ((1.0 - sigma_exp) * neg_latents + sigma_exp * noise).to(dtype=dit_dtype)
-        model_ts = sigma.unsqueeze(1)
+        # Cast timestep to dit_dtype for fp16/bf16-only attention backends (see text step).
+        model_ts = sigma.unsqueeze(1).to(dtype=dit_dtype)
 
         # Flow matching velocity targets
         target_pos = (noise - pos_latents).to(dtype=dit_dtype)
@@ -908,7 +942,9 @@ class LTX2SliderTrainer:
         sigma_exp = sigma.view(-1, 1, 1, 1, 1)
         noisy_pos = ((1.0 - sigma_exp) * pos_latents + sigma_exp * noise).to(dtype=dit_dtype)
         noisy_neg = ((1.0 - sigma_exp) * neg_latents + sigma_exp * noise).to(dtype=dit_dtype)
-        model_ts = sigma.unsqueeze(1)
+        # call_dit casts timesteps to network_dtype internally, but cast here too
+        # for consistency with the other slider paths.
+        model_ts = sigma.unsqueeze(1).to(dtype=dit_dtype)
 
         ic_batch = {
             "text": text_embeds,
@@ -1110,20 +1146,31 @@ class LTX2SliderTrainer:
         session_id = random.randint(0, 2**32)
         training_started_at = time.time()
 
-        # Model-specific init (sets _ltx_mode, _audio_video, etc.)
-        self._net_trainer.handle_model_specific_args(args)
-
-        # Prepare accelerator
+        # Prepare accelerator FIRST so args.mixed_precision is resolved before
+        # handle_model_specific_args runs. handle_model_specific_args casts an
+        # fp32 checkpoint's compute dtype to bf16/fp16, but only when
+        # args.mixed_precision is already set — otherwise dit_dtype stays fp32
+        # and the model loads/computes in full fp32 (slower, more VRAM, and
+        # incompatible with fp16/bf16-only attention backends like SageAttention).
         accelerator = prepare_accelerator(args)
         if args.mixed_precision is None:
             args.mixed_precision = accelerator.mixed_precision
+
+        # Model-specific init (sets _ltx_mode, _audio_video, dit_dtype, etc.)
+        self._net_trainer.handle_model_specific_args(args)
+
         is_main_process = accelerator.is_main_process
+        dashboard_metrics_enabled = getattr(args, "gui", False) or os.getenv("MUSUBI_DASHBOARD_METRICS") == "1"
 
         # Precision
         dit_dtype = torch.bfloat16 if args.dit_dtype is None else model_utils.str_to_dtype(args.dit_dtype)
         dit_weight_dtype = (
             (None if getattr(args, "fp8_scaled", False) else torch.float8_e4m3fn) if getattr(args, "fp8_base", False) else dit_dtype
         )
+
+        # -- Pre-cache slider prompt embeddings (before DiT to avoid VRAM collision) --
+        if self.slider_config.mode == "text":
+            self._precache_slider_prompts(args, accelerator)
 
         # -- Sample prompt setup (for preview during training) ----------------
         vae_dtype = torch.float16 if args.vae_dtype is None else model_utils.str_to_dtype(args.vae_dtype)
@@ -1135,6 +1182,24 @@ class LTX2SliderTrainer:
             vae.requires_grad_(False)
             vae.eval()
 
+        # -- Pre-cache sample prompt embeddings (before DiT to avoid VRAM collision) --
+        if sample_parameters is not None:
+            needs_encoding = any(p.get("prompt_embeds") is None for p in sample_parameters)
+            if needs_encoding:
+                te_dtype = self._net_trainer._build_text_encoder(args, accelerator)
+                for sp in sample_parameters:
+                    if sp.get("prompt_embeds") is None:
+                        embed, mask = self._net_trainer._encode_prompt_text(accelerator, sp.get("prompt", ""), te_dtype)
+                        sp["prompt_embeds"] = embed
+                        sp["prompt_attention_mask"] = mask
+                        neg = sp.get("negative_prompt")
+                        if neg:
+                            ne, nm = self._net_trainer._encode_prompt_text(accelerator, neg, te_dtype)
+                            sp["negative_prompt_embeds"] = ne
+                            sp["negative_prompt_attention_mask"] = nm
+                self._net_trainer._cleanup_text_encoder(accelerator)
+                clean_memory_on_device(accelerator.device)
+
         # -- Load transformer -------------------------------------------------
         blocks_to_swap = int(getattr(args, "blocks_to_swap", 0) or 0)
         self._net_trainer.blocks_to_swap = blocks_to_swap
@@ -1144,8 +1209,21 @@ class LTX2SliderTrainer:
             torch.cuda.reset_peak_memory_stats()
 
         logger.info("Loading DiT model from %s", args.dit)
+        # Determine attention mode from args (mirror LTX2NetworkTrainer.load_transformer)
+        if getattr(args, "sdpa", False):
+            attn_mode = "torch"
+        elif getattr(args, "flash_attn", False):
+            attn_mode = "flash"
+        elif getattr(args, "flash3", False):
+            attn_mode = "flash3"
+        elif getattr(args, "sage_attn", False):
+            attn_mode = "sageattn"
+        elif getattr(args, "xformers", False):
+            attn_mode = "xformers"
+        else:
+            attn_mode = "torch"
         transformer = self._net_trainer.load_transformer(
-            accelerator, args, args.dit, "torch", False, loading_device, dit_weight_dtype
+            accelerator, args, args.dit, attn_mode, False, loading_device, dit_weight_dtype
         )
         transformer.eval()
         transformer.requires_grad_(False)
@@ -1227,29 +1305,6 @@ class LTX2SliderTrainer:
             except TypeError:
                 network.enable_gradient_checkpointing()
 
-        # -- Pre-cache slider prompt embeddings --------------------------------
-        if self.slider_config.mode == "text":
-            self._precache_slider_prompts(args, accelerator)
-
-        # -- Pre-cache sample prompt embeddings --------------------------------
-        if sample_parameters is not None:
-            # Encode sample prompts if they don't already have embeddings
-            needs_encoding = any(p.get("prompt_embeds") is None for p in sample_parameters)
-            if needs_encoding:
-                te_dtype = self._net_trainer._build_text_encoder(args, accelerator)
-                for sp in sample_parameters:
-                    if sp.get("prompt_embeds") is None:
-                        embed, mask = self._net_trainer._encode_prompt_text(accelerator, sp.get("prompt", ""), te_dtype)
-                        sp["prompt_embeds"] = embed
-                        sp["prompt_attention_mask"] = mask
-                        neg = sp.get("negative_prompt")
-                        if neg:
-                            ne, nm = self._net_trainer._encode_prompt_text(accelerator, neg, te_dtype)
-                            sp["negative_prompt_embeds"] = ne
-                            sp["negative_prompt_attention_mask"] = nm
-                self._net_trainer._cleanup_text_encoder(accelerator)
-                clean_memory_on_device(accelerator.device)
-
         # -- Optimizer & scheduler ---------------------------------------------
         trainable_params, lr_descriptions = network.prepare_optimizer_params(unet_lr=args.learning_rate)
         optimizer_name, optimizer_args_str, optimizer, optimizer_train_fn, optimizer_eval_fn = NetworkTrainer().get_optimizer(
@@ -1257,6 +1312,14 @@ class LTX2SliderTrainer:
         )
 
         lr_scheduler = NetworkTrainer().get_lr_scheduler(args, optimizer, accelerator.num_processes)
+
+        # Save base param_groups (from CLI) before any resume so we can restore them
+        # if --reset_optimizer_params is set. Mirrors NetworkTrainer.train(); the
+        # slider has its own loop and must replicate this resume-time behavior.
+        inner_optimizer = optimizer.optimizer if hasattr(optimizer, "optimizer") else optimizer
+        saved_param_groups = None
+        if getattr(args, "reset_optimizer_params", False):
+            saved_param_groups = [{k: v for k, v in pg.items() if k != "params"} for pg in inner_optimizer.param_groups]
 
         # -- Prepare with accelerator ------------------------------------------
         if dit_weight_dtype != dit_dtype and dit_weight_dtype is not None:
@@ -1269,6 +1332,21 @@ class LTX2SliderTrainer:
         else:
             transformer = accelerator.prepare(transformer)
 
+        # The frozen base transformer was added to accelerator._models by prepare(),
+        # which means save_state() would serialize it (~13 GB) even though its weights
+        # never change during LoRA/slider training.  Remove it so only the LoRA
+        # network (prepared below) is included in state checkpoints.
+        _unwrapped_transformer = accelerator.unwrap_model(transformer)
+        accelerator._models = [m for m in accelerator._models if accelerator.unwrap_model(m) is not _unwrapped_transformer]
+
+        # torch.compile the DiT blocks (mirrors LTX2NetworkTrainer in ltx2_train_network.py).
+        # Must run after prepare()/_models filtering and before the network is prepared.
+        # blocks_to_swap was set on _net_trainer above, so its disable_linear path is correct.
+        # Compilation is lazy: it triggers on the first forward pass, not here.
+        if args.compile:
+            transformer = self._net_trainer.compile_transformer(args, transformer)
+            transformer.__dict__["_orig_mod"] = transformer  # for annoying accelerator checks
+
         network, optimizer, lr_scheduler = accelerator.prepare(network, optimizer, lr_scheduler)
 
         if args.gradient_checkpointing:
@@ -1277,6 +1355,110 @@ class LTX2SliderTrainer:
             transformer.eval()
 
         accelerator.unwrap_model(network).prepare_grad_etc(transformer)
+
+        # -- Resume from saved state (autoresume / --resume) --------------------
+        initial_global_step = 0
+        if getattr(args, "autoresume", False) and not getattr(args, "resume", None):
+            latest = self._net_trainer._find_latest_state_dir(args)
+            if latest:
+                logger.info(f"autoresume: found latest state directory: {latest}")
+                args.resume = latest
+                args._autoresume_selected = True
+            else:
+                logger.info("autoresume: no saved state found in output_dir, starting from scratch")
+                args._autoresume_selected = False
+        else:
+            args._autoresume_selected = getattr(args, "_autoresume_selected", False)
+
+        if getattr(args, "resume", None):
+            if not train_utils.is_complete_state_dir(args.resume):
+                if getattr(args, "_autoresume_selected", False):
+                    logger.warning("autoresume: selected state directory is missing or incomplete, starting from scratch: %s", args.resume)
+                    args.resume = None
+                else:
+                    raise FileNotFoundError(f"resume state directory is missing or incomplete: {args.resume}")
+
+        _resume_state_dir = None
+        if getattr(args, "resume", None):
+            self._net_trainer._register_optimizer_resume_safe_globals(args)
+            logger.info(f"Resuming slider training from state: {args.resume}")
+            accelerator.load_state(args.resume)
+            _resume_state_dir = args.resume
+            resume_step = self._net_trainer._recover_global_step(args.resume)
+            if resume_step > 0:
+                initial_global_step = resume_step
+                logger.info(f"Recovered global_step={initial_global_step} from resume state")
+
+            # Optimizer/scheduler resets after a state-dir resume (mirrors
+            # NetworkTrainer.train()). Only meaningful when optimizer state was
+            # actually loaded (initial_global_step > 0); the weights-only fallback
+            # below re-initializes the optimizer anyway.
+            if initial_global_step > 0:
+                if getattr(args, "reset_optimizer", False):
+                    inner_optimizer.state.clear()
+                    accelerator.print("reset optimizer state (cleared momentum/variance)")
+
+                if getattr(args, "reset_optimizer_params", False) and saved_param_groups is not None:
+                    for pg, saved in zip(inner_optimizer.param_groups, saved_param_groups):
+                        for k, v in saved.items():
+                            pg[k] = v
+                    accelerator.print("reset optimizer param groups to CLI values")
+
+                if getattr(args, "reset_optimizer", False) or getattr(args, "reset_optimizer_params", False):
+                    # reset lr to base value so the new scheduler starts from the correct base
+                    # (scheduler __init__ uses current group['lr'], not initial_lr)
+                    for pg in inner_optimizer.param_groups:
+                        if "initial_lr" in pg:
+                            pg["lr"] = pg["initial_lr"]
+                            del pg["initial_lr"]
+                    new_inner_scheduler = NetworkTrainer().get_lr_scheduler(args, inner_optimizer, accelerator.num_processes)
+                    # replace the inner scheduler while keeping the AcceleratedScheduler wrapper
+                    # (the wrapper gates stepping on sync_gradients for gradient accumulation)
+                    if hasattr(lr_scheduler, "scheduler"):
+                        lr_scheduler.scheduler = new_inner_scheduler
+                    else:
+                        lr_scheduler = new_inner_scheduler
+                    accelerator.print("recreated LR scheduler (restarting schedule from step 0)")
+
+        # -- Fallback: resume from latest LoRA checkpoint if no state dir ------
+        # If autoresume is enabled but no state directory was found (e.g. crash
+        # without graceful save), scan output_dir for the highest-step LoRA
+        # checkpoint matching output_name and load its weights.
+        if (
+            initial_global_step == 0
+            and getattr(args, "autoresume", False)
+            and getattr(args, "network_weights", None) is None
+            and args.output_dir
+            and os.path.isdir(args.output_dir)
+        ):
+            import re as _re
+
+            best_step = 0
+            best_path = None
+            step_pattern = _re.compile(
+                _re.escape(args.output_name) + r"-step(\d+)\.safetensors$"
+            )
+            for entry in os.listdir(args.output_dir):
+                m = step_pattern.match(entry)
+                if m:
+                    step = int(m.group(1))
+                    full = os.path.join(args.output_dir, entry)
+                    if step > best_step and os.path.isfile(full):
+                        best_step = step
+                        best_path = full
+            if best_path is not None:
+                logger.info(
+                    "autoresume: no state dir found, but found LoRA checkpoint at step %d: %s",
+                    best_step,
+                    best_path,
+                )
+                info = accelerator.unwrap_model(network).load_weights(best_path)
+                logger.info("Loaded LoRA weights for resume: %s", info)
+                initial_global_step = best_step
+                logger.info(
+                    "Resuming from step %d (optimizer/scheduler re-initialized — weights only)",
+                    initial_global_step,
+                )
 
         # -- Reference dataloader (if reference mode) -------------------------
         ref_dataloader = None
@@ -1319,6 +1501,32 @@ class LTX2SliderTrainer:
 
         metadata = {k: str(v) for k, v in metadata.items()}
 
+        # User-facing SAI model-spec metadata (title/author/license/tags/etc.),
+        # embedded in saved safetensors for distribution. Mirrors the standard trainer.
+        from musubi_tuner.utils import sai_model_spec
+
+        sai_title = getattr(args, "metadata_title", None) or args.output_name
+        if getattr(args, "min_timestep", None) is not None or getattr(args, "max_timestep", None) is not None:
+            md_min = args.min_timestep if args.min_timestep is not None else 0
+            md_max = args.max_timestep if args.max_timestep is not None else 1000
+            md_timesteps = (md_min, md_max)
+        else:
+            md_timesteps = None
+        sai_metadata = sai_model_spec.build_metadata(
+            None,
+            self._net_trainer.architecture,
+            time.time(),
+            sai_title,
+            getattr(args, "metadata_reso", None),
+            getattr(args, "metadata_author", None),
+            getattr(args, "metadata_description", None),
+            getattr(args, "metadata_license", None),
+            getattr(args, "metadata_tags", None),
+            timesteps=md_timesteps,
+            custom_arch=getattr(args, "metadata_arch", None),
+        )
+        metadata.update(sai_metadata)
+
         minimum_metadata = {}
         for key in ["ss_base_model_version", "ss_network_module", "ss_network_dim", "ss_network_alpha", "ss_network_args"]:
             if key in metadata:
@@ -1331,15 +1539,54 @@ class LTX2SliderTrainer:
                 init_kwargs["wandb"] = {"name": args.wandb_run_name}
             if getattr(args, "log_tracker_config", None) is not None:
                 init_kwargs = toml.load(args.log_tracker_config)
-            tracker_name = getattr(args, "log_tracker_name", None) or "slider_train"
+            tracker_name = getattr(args, "log_tracker_name", None) or getattr(args, "output_name", "slider_train")
             accelerator.init_trackers(
                 tracker_name,
                 config=train_utils.get_sanitized_config_or_none(args),
                 init_kwargs=init_kwargs,
             )
 
+        # -- Dashboard metrics writer (Parquet for GUI charts) -----------------
+        gui_metrics = None
+        if dashboard_metrics_enabled and accelerator.is_main_process:
+            from musubi_tuner.gui_dashboard import create_metrics_writer
+
+            gui_metrics = create_metrics_writer(args.output_dir, reset=initial_global_step == 0)
+            gui_metrics.update_status(
+                step=initial_global_step,
+                max_steps=args.max_train_steps,
+                epoch=0,
+                max_epochs=0,
+                status="starting",
+            )
+
         # -- Save / remove helpers ---------------------------------------------
         save_dtype = dit_dtype
+
+        def _build_checkpoint_metadata() -> dict:
+            """Build the training-settings sidecar dict (shared by checkpoints and state dirs)."""
+            from datetime import datetime
+
+            _training = {
+                "step": global_step,
+                "epoch": 0,
+                "timestamp": datetime.now().isoformat(timespec="seconds"),
+            }
+            try:
+                _training["loss"] = float(loss)
+            except Exception:
+                pass
+            if loss_recorder.loss_list:
+                _training["loss_avg"] = loss_recorder.moving_average
+            try:
+                _training["lr"] = float(lr_scheduler.get_last_lr()[0])
+            except Exception:
+                pass
+            return {
+                "training": _training,
+                "command": _argv_to_command_list(),
+                "slider_config": asdict(self.slider_config),
+            }
 
         def save_model(ckpt_name: str, unwrapped_nw, steps, epoch_no, force_sync_upload=False):
             os.makedirs(args.output_dir, exist_ok=True)
@@ -1360,24 +1607,7 @@ class LTX2SliderTrainer:
                 huggingface_utils.upload(args, ckpt_file, "/" + ckpt_name, force_sync_upload=force_sync_upload)
 
             if getattr(args, "save_checkpoint_metadata", False):
-                from datetime import datetime
-
-                _md = {
-                    "step": steps,
-                    "epoch": epoch_no,
-                    "timestamp": datetime.now().isoformat(timespec="seconds"),
-                }
-                try:
-                    _md["loss"] = float(loss)
-                except Exception:
-                    pass
-                if loss_recorder.loss_list:
-                    _md["loss_avg"] = loss_recorder.moving_average
-                try:
-                    _md["lr"] = float(lr_scheduler.get_last_lr()[0])
-                except Exception:
-                    pass
-                train_utils.save_checkpoint_metadata(ckpt_file, _md)
+                train_utils.save_checkpoint_metadata(ckpt_file, _build_checkpoint_metadata())
 
         def remove_model(old_ckpt_name):
             old_ckpt_file = os.path.join(args.output_dir, old_ckpt_name)
@@ -1391,6 +1621,17 @@ class LTX2SliderTrainer:
                     os.remove(comfy_old_ckpt_file)
             train_utils.remove_checkpoint_metadata(old_ckpt_file)
 
+        def _close_gui_metrics(status: str = "stopped"):
+            if gui_metrics is not None:
+                gui_metrics.update_status(
+                    step=global_step,
+                    max_steps=args.max_train_steps,
+                    epoch=0,
+                    max_epochs=0,
+                    status=status,
+                )
+                gui_metrics.close()
+
         def handle_dashboard_stop_request(global_step: int) -> bool:
             if not train_utils.dashboard_stop_requested():
                 return False
@@ -1398,12 +1639,14 @@ class LTX2SliderTrainer:
             if train_utils.dashboard_stop_mode() == "force":
                 accelerator.print("\nDashboard force stop requested; exiting without saving interrupt state.")
                 train_utils.clear_dashboard_stop_request()
+                _close_gui_metrics("stopped")
                 accelerator.end_training()
                 return True
 
             if global_step <= 0:
                 accelerator.print("\nDashboard stop requested before training steps completed; exiting without saving state.")
                 train_utils.clear_dashboard_stop_request()
+                _close_gui_metrics("stopped")
                 accelerator.end_training()
                 return True
 
@@ -1426,26 +1669,39 @@ class LTX2SliderTrainer:
                         "interrupted": True,
                     },
                 )
+                train_utils.save_state_metadata(state_dir, _build_checkpoint_metadata())
+                if gui_metrics is not None:
+                    gui_metrics.log_event("interrupt_state", global_step, path=str(state_dir))
             train_utils.clear_dashboard_stop_request()
+            _close_gui_metrics("stopped")
             accelerator.end_training()
             return True
 
         # -- Training loop -----------------------------------------------------
         progress_bar = tqdm(
             range(args.max_train_steps),
+            initial=initial_global_step,
             smoothing=0,
             disable=not accelerator.is_local_main_process,
             desc="steps",
         )
 
-        global_step = 0
+        global_step = initial_global_step
         loss_recorder = train_utils.LossRecorder()
+        if initial_global_step > 0 and _resume_state_dir is not None:
+            _meta = train_utils.load_resume_metadata(_resume_state_dir)
+            if _meta and "loss_avg" in _meta:
+                loss_recorder.prefill(_meta["loss_avg"], _meta.get("loss_count", 0))
+                accelerator.print(f"  restored loss average: {_meta['loss_avg']:.4f} (from {_meta.get('loss_count', 0)} steps)")
 
         clean_memory_on_device(accelerator.device)
         optimizer_train_fn()
         optimizer.zero_grad(set_to_none=True)
 
-        logger.info("Starting slider training")
+        if initial_global_step > 0:
+            logger.info("Resuming slider training from step %d", initial_global_step)
+        else:
+            logger.info("Starting slider training")
         logger.info("  mode: %s", self.slider_config.mode)
         logger.info("  max_train_steps: %d", args.max_train_steps)
         logger.info("  learning_rate: %s", args.learning_rate)
@@ -1463,6 +1719,8 @@ class LTX2SliderTrainer:
             self._sample_slider(
                 accelerator, args, transformer, vae, accelerator.unwrap_model(network), sample_parameters, dit_dtype, 0
             )
+            if gui_metrics is not None:
+                gui_metrics.log_event("sample", 0)
             optimizer_train_fn()
 
         ref_iter = None
@@ -1474,6 +1732,9 @@ class LTX2SliderTrainer:
                 return
 
             accelerator.unwrap_model(network).on_step_start()
+
+            grad_norm_value = None
+            _step_start_time = time.perf_counter()
 
             with accelerator.accumulate(network):
                 if self.slider_config.mode == "text":
@@ -1495,12 +1756,20 @@ class LTX2SliderTrainer:
                 # Gradient clipping
                 if accelerator.sync_gradients and getattr(args, "max_grad_norm", 0.0) != 0.0:
                     params_to_clip = accelerator.unwrap_model(network).get_trainable_params()
-                    accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
+                    grad_norm_value = accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
 
                 if accelerator.sync_gradients:
                     optimizer.step()
                     lr_scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
+
+                    # LoRA max-norm regularization (mirrors hv_train_network.py).
+                    # The slider has its own loop, so this must be applied here;
+                    # the network method self-guards for non-LoRA networks.
+                    if getattr(args, "scale_weight_norms", None):
+                        accelerator.unwrap_model(network).apply_max_norm_regularization(
+                            args.scale_weight_norms, accelerator.device
+                        )
 
             if not accelerator.sync_gradients:
                 continue
@@ -1521,7 +1790,28 @@ class LTX2SliderTrainer:
                     "loss/average": avr_loss,
                     "lr/unet": float(lrs[0]) if lrs else 0.0,
                 }
+                if grad_norm_value is not None:
+                    logs["grad_norm"] = float(grad_norm_value) if not isinstance(grad_norm_value, float) else grad_norm_value
                 accelerator.log(logs, step=global_step)
+
+            if gui_metrics is not None:
+                step_time = time.perf_counter() - _step_start_time
+                gui_metrics.log(
+                    step=global_step,
+                    epoch=0,
+                    loss=loss,
+                    avr_loss=avr_loss,
+                    grad_norm=float(grad_norm_value) if grad_norm_value is not None else None,
+                    lr=float(lr_scheduler.get_last_lr()[0]) if lr_scheduler.get_last_lr() else 0.0,
+                    step_time=step_time,
+                )
+                gui_metrics.update_status(
+                    step=global_step,
+                    max_steps=args.max_train_steps,
+                    epoch=0,
+                    max_epochs=0,
+                    status="training",
+                )
 
             # Sampling
             should_sampling = should_sample_images(args, global_step, epoch=None)
@@ -1541,17 +1831,33 @@ class LTX2SliderTrainer:
                         dit_dtype,
                         global_step,
                     )
+                    if gui_metrics is not None:
+                        gui_metrics.log_event("sample", global_step)
 
                 if should_saving:
                     accelerator.wait_for_everyone()
                     if accelerator.is_main_process:
                         ckpt_name = train_utils.get_step_ckpt_name(args.output_name, global_step)
                         save_model(ckpt_name, accelerator.unwrap_model(network), global_step, 0)
+                        if gui_metrics is not None:
+                            gui_metrics.log_event("checkpoint", global_step)
 
                         if getattr(args, "save_state", False):
                             train_utils.save_and_remove_state_stepwise(
                                 args, accelerator, global_step, epoch=0, step_in_epoch=global_step
                             )
+                            _state_dir = os.path.join(
+                                args.output_dir,
+                                train_utils.STEP_STATE_NAME.format(args.output_name, global_step),
+                            )
+                            train_utils.update_resume_metadata(
+                                _state_dir,
+                                {
+                                    "loss_avg": loss_recorder.moving_average,
+                                    "loss_count": len(loss_recorder.loss_list),
+                                },
+                            )
+                            train_utils.save_state_metadata(_state_dir, _build_checkpoint_metadata())
 
                         remove_step_no = train_utils.get_remove_step_no(args, global_step)
                         if remove_step_no is not None:
@@ -1569,11 +1875,27 @@ class LTX2SliderTrainer:
 
         if is_main_process and (getattr(args, "save_state", False) or getattr(args, "save_state_on_train_end", False)):
             train_utils.save_state_on_train_end(args, accelerator, global_step=global_step, epoch=0, step_in_epoch=global_step)
+            _state_dir = os.path.join(
+                args.output_dir,
+                train_utils.LAST_STATE_NAME.format(args.output_name),
+            )
+            train_utils.update_resume_metadata(
+                _state_dir,
+                {
+                    "loss_avg": loss_recorder.moving_average,
+                    "loss_count": len(loss_recorder.loss_list),
+                },
+            )
+            train_utils.save_state_metadata(_state_dir, _build_checkpoint_metadata())
 
         if is_main_process:
             ckpt_name = train_utils.get_last_ckpt_name(args.output_name)
             save_model(ckpt_name, accelerator.unwrap_model(network), global_step, 0, force_sync_upload=True)
+            if gui_metrics is not None:
+                gui_metrics.log_event("checkpoint", global_step)
             logger.info("Slider training complete. Model saved.")
+
+        _close_gui_metrics("completed")
 
 
 # ---------------------------------------------------------------------------

@@ -13,6 +13,7 @@ logging.basicConfig(level=logging.INFO)
 _warned_flash2_mask_fallback = False
 _warned_flash2_query_mask_fallback = False
 _warned_flash3_mask_fallback = False
+_warned_sage_mask_fallback = False
 
 memory_efficient_attention = None
 flash_attn_interface = None
@@ -35,6 +36,11 @@ try:
         import flash_attn_interface
 except ImportError:
     flash_attn_interface = None
+sage_attn_func = None
+try:
+    from sageattention import sageattn as sage_attn_func
+except ImportError:
+    sage_attn_func = None
 
 
 class AttentionCallable(Protocol):
@@ -233,11 +239,42 @@ class FlashAttention2(AttentionCallable):
         return out
 
 
+class SageAttention(AttentionCallable):
+    def __call__(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        heads: int,
+        mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if sage_attn_func is None:
+            raise RuntimeError("SageAttention was selected but `sageattention` is not installed.")
+
+        b, _, dim_head = q.shape
+        dim_head //= heads
+
+        if mask is not None:
+            global _warned_sage_mask_fallback
+            if not _warned_sage_mask_fallback:
+                logger.warning("SageAttention does not support attention masks; falling back to PyTorch SDPA.")
+                _warned_sage_mask_fallback = True
+            return PytorchAttention()(q, k, v, heads, mask)
+
+        # SageAttention expects [B, H, L, D] layout with tensor_layout="NHD" meaning [B, L, H, D]
+        q, k, v = (t.view(b, -1, heads, dim_head) for t in (q, k, v))
+
+        out = sage_attn_func(q, k, v, tensor_layout="NHD", is_causal=False)
+        out = out.reshape(b, -1, heads * dim_head)
+        return out
+
+
 class AttentionFunction(Enum):
     PYTORCH = "pytorch"
     XFORMERS = "xformers"
     FLASH_ATTENTION_2 = "flash_attention_2"
     FLASH_ATTENTION_3 = "flash_attention_3"
+    SAGE_ATTENTION = "sage_attention"
     DEFAULT = "default"
 
     def to_callable(self) -> AttentionCallable:
@@ -250,6 +287,8 @@ class AttentionFunction(Enum):
             return FlashAttention2()
         elif self is AttentionFunction.FLASH_ATTENTION_3:
             return FlashAttention3()
+        elif self is AttentionFunction.SAGE_ATTENTION:
+            return SageAttention()
         else:
             # Default behavior: XFormers if installed else - PyTorch
             return XFormersAttention() if memory_efficient_attention is not None else PytorchAttention()

@@ -239,9 +239,13 @@ def _has_cache_text_checkpoint(config: ProjectConfig) -> bool:
     return _has_text(config.caching.ltx2_checkpoint) or _has_text(config.default_ltx2_checkpoint)
 
 
-def _effective_gemma_safetensors(raw_path: str | None, default_path: str | None) -> str:
+def _effective_gemma_safetensors(raw_path: str | None, default_path: str | None, explicit_gemma_root: str | None = None) -> str:
     if _has_text(raw_path):
         return str(raw_path).strip()
+    # If the user explicitly set gemma_root to a valid directory, suppress the
+    # default_gemma_safetensors fallback so gemma_root takes priority.
+    if _has_text(explicit_gemma_root) and Path(str(explicit_gemma_root).strip()).is_dir():
+        return ""
     if _has_text(default_path):
         return str(default_path).strip()
     return ""
@@ -301,7 +305,7 @@ def validate_training_config(config: ProjectConfig) -> dict[str, Any]:
     t = config.training
     errors: list[dict[str, Any]] = []
     warnings: list[dict[str, Any]] = []
-    effective_gemma_safetensors = _effective_gemma_safetensors(t.gemma_safetensors, config.default_gemma_safetensors)
+    effective_gemma_safetensors = _effective_gemma_safetensors(t.gemma_safetensors, config.default_gemma_safetensors, t.gemma_root)
 
     if not _has_training_checkpoint(config):
         errors.append(
@@ -1102,7 +1106,7 @@ def validate_full_finetune_config(config: ProjectConfig) -> dict[str, Any]:
     t = config.full_finetune
     errors: list[dict[str, Any]] = []
     warnings: list[dict[str, Any]] = []
-    effective_gemma_safetensors = _effective_gemma_safetensors(t.gemma_safetensors, config.default_gemma_safetensors)
+    effective_gemma_safetensors = _effective_gemma_safetensors(t.gemma_safetensors, config.default_gemma_safetensors, t.gemma_root)
 
     if not _has_full_finetune_checkpoint(config):
         errors.append(
@@ -1612,7 +1616,7 @@ def validate_cache_text_config(config: ProjectConfig) -> dict[str, Any]:
     c = config.caching
     errors: list[dict[str, Any]] = []
     warnings: list[dict[str, Any]] = []
-    effective_gemma_safetensors = _effective_gemma_safetensors(c.gemma_safetensors, config.default_gemma_safetensors)
+    effective_gemma_safetensors = _effective_gemma_safetensors(c.gemma_safetensors, config.default_gemma_safetensors, c.gemma_root)
 
     if not _has_cache_text_checkpoint(config):
         errors.append(
@@ -1673,7 +1677,7 @@ def validate_inference_config(config: ProjectConfig) -> dict[str, Any]:
     i = config.inference
     errors: list[dict[str, Any]] = []
     warnings: list[dict[str, Any]] = []
-    effective_gemma_safetensors = _effective_gemma_safetensors(i.gemma_safetensors, config.default_gemma_safetensors)
+    effective_gemma_safetensors = _effective_gemma_safetensors(i.gemma_safetensors, config.default_gemma_safetensors, i.gemma_root)
 
     if not _has_inference_checkpoint(config):
         errors.append(
