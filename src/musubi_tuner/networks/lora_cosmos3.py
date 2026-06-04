@@ -17,6 +17,7 @@ logging.basicConfig(level=logging.INFO)
 COSMOS3_TARGET_REPLACE_MODULES = ["MoTDecoderLayer"]
 COSMOS3_DEFAULT_INCLUDE_PATTERNS = [
     r".*self_attn\.(q_proj_moe_gen|k_proj_moe_gen|v_proj_moe_gen|o_proj_moe_gen)$",
+    r".*mlp_moe_gen\.(gate_proj|up_proj|down_proj)$",
 ]
 
 

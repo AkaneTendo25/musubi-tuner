@@ -125,29 +125,6 @@ python -m accelerate.commands.launch cosmos3_train_network.py `
   --discrete_flow_shift 10.0
 ```
 
-### LoRA target modules
-
-By default, Cosmos3 LoRA training only adds adapters inside `MoTDecoderLayer`, and only for the generation-path self-attention projections:
-
-```text
-self_attn.q_proj_moe_gen
-self_attn.k_proj_moe_gen
-self_attn.v_proj_moe_gen
-self_attn.o_proj_moe_gen
-```
-
-The base Cosmos3 transformer weights, VAE, text tokenizer, and sound tokenizer are frozen. Cosmos3-Nano does not have a standalone text encoder to train; prompt tokens are handled by the model's own MoT/VLM transformer.
-
-To also target direct generation-path MoT MLP projections, pass an explicit include pattern:
-
-```powershell
---network_args "include_patterns=['.*self_attn[.](q_proj_moe_gen|k_proj_moe_gen|v_proj_moe_gen|o_proj_moe_gen)$','.*mlp_moe_gen[.](gate_proj|up_proj|down_proj)$']"
-```
-
-This MLP target set has not been validated yet. It may need a lower learning rate, lower rank, or more VRAM than the default attention-only target set. Some Cosmos3 layers can use sparse MoE MLP blocks instead of direct `gate_proj`, `up_proj`, and `down_proj` children; targeting those expert internals is also unvalidated and may require different include patterns.
-
-The reasoner/understanding path can also be matched with module names such as `self_attn.q_proj`, `self_attn.k_proj`, `self_attn.v_proj`, `self_attn.o_proj`, `mlp.gate_proj`, `mlp.up_proj`, and `mlp.down_proj`, but this is not recommended as the first experiment because it can affect prompt/language understanding. Bridge modules outside `MoTDecoderLayer`, such as `vae2llm`, `llm2vae`, `sound2llm`, and `llm2sound`, are not selectable with `include_patterns` alone in the current Cosmos3 LoRA implementation.
-
 ## Inference
 
 Text-to-video:
