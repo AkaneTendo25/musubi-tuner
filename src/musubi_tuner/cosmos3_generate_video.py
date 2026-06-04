@@ -376,9 +376,12 @@ def sample_one(
     dtype: torch.dtype,
     device: torch.device,
 ):
-    width = (int(prompt["width"]) // 16) * 16
-    height = (int(prompt["height"]) // 16) * 16
-    frame_count = max(1, int(prompt["frame_count"]))
+    width, height, frame_count = cosmos3_utils.normalize_sample_dimensions(
+        prompt["width"],
+        prompt["height"],
+        prompt["frame_count"],
+        args.vae_scale_factor_temporal,
+    )
     sample_steps = int(prompt["sample_steps"])
     fps = float(prompt.get("fps", args.fps))
     guidance_scale = float(prompt["guidance_scale"]) if prompt.get("guidance_scale") is not None else None

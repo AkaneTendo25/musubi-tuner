@@ -13,7 +13,7 @@ Official weights:
 Example local layout:
 
 ```text
-G:\storage\cosmos3-nano
+path\to\cosmos3-nano\weights\
 ├── scheduler
 ├── sound_tokenizer
 ├── text_tokenizer
@@ -43,7 +43,7 @@ Cosmos3-Nano does not use a separate text encoder. This cache stores Qwen token 
 ```powershell
 python cosmos3_cache_text_encoder_outputs.py `
   --dataset_config path\to\dataset.toml `
-  --model G:\storage\cosmos3-nano `
+  --model path\to\cosmos3-nano\weights `
   --tokenizer_subfolder text_tokenizer `
   --fps 24
 ```
@@ -57,7 +57,7 @@ Video-only:
 ```powershell
 python cosmos3_cache_latents.py `
   --dataset_config path\to\dataset.toml `
-  --vae G:\storage\cosmos3-nano `
+  --vae path\to\cosmos3-nano\weights `
   --vae_subfolder vae `
   --vae_dtype bfloat16
 ```
@@ -67,11 +67,11 @@ Video+audio:
 ```powershell
 python cosmos3_cache_latents.py `
   --dataset_config path\to\dataset.toml `
-  --vae G:\storage\cosmos3-nano `
+  --vae path\to\cosmos3-nano\weights `
   --vae_subfolder vae `
   --vae_dtype bfloat16 `
   --cache_audio `
-  --sound_tokenizer G:\storage\cosmos3-nano `
+  --sound_tokenizer path\to\cosmos3-nano\weights `
   --sound_tokenizer_subfolder sound_tokenizer `
   --sound_sample_rate 48000 `
   --sound_channels 2 `
@@ -87,12 +87,12 @@ Video+audio LoRA, scaled FP8 base, gradient checkpointing, block swap, samples/c
 ```powershell
 python -m accelerate.commands.launch cosmos3_train_network.py `
   --dataset_config path\to\dataset.toml `
-  --dit G:\storage\cosmos3-nano `
-  --vae G:\storage\cosmos3-nano `
+  --dit path\to\cosmos3-nano\weights `
+  --vae path\to\cosmos3-nano\weights `
   --transformer_subfolder transformer `
   --vae_subfolder vae `
   --tokenizer_subfolder text_tokenizer `
-  --sound_tokenizer G:\storage\cosmos3-nano `
+  --sound_tokenizer path\to\cosmos3-nano\weights `
   --sound_tokenizer_subfolder sound_tokenizer `
   --sound_dtype bfloat16 `
   --mixed_precision bf16 `
@@ -125,12 +125,28 @@ python -m accelerate.commands.launch cosmos3_train_network.py `
   --discrete_flow_shift 10.0
 ```
 
-Notes:
+### LoRA target modules
 
-- `--audio` requires latent caches with `sound_latents_*`.
-- `--fp8_base --fp8_scaled` quantizes base weights; LoRA weights remain trainable.
-- `--blocks_to_swap 12` is the tested 24 GB setting for 512x288 / 49-frame smoke training.
-- `--offload_dit_during_sampling` avoids holding DiT, VAE, and AVAE on GPU at the same time during previews.
+By default, Cosmos3 LoRA training only adds adapters inside `MoTDecoderLayer`, and only for the generation-path self-attention projections:
+
+```text
+self_attn.q_proj_moe_gen
+self_attn.k_proj_moe_gen
+self_attn.v_proj_moe_gen
+self_attn.o_proj_moe_gen
+```
+
+The base Cosmos3 transformer weights, VAE, text tokenizer, and sound tokenizer are frozen. Cosmos3-Nano does not have a standalone text encoder to train; prompt tokens are handled by the model's own MoT/VLM transformer.
+
+To also target direct generation-path MoT MLP projections, pass an explicit include pattern:
+
+```powershell
+--network_args "include_patterns=['.*self_attn[.](q_proj_moe_gen|k_proj_moe_gen|v_proj_moe_gen|o_proj_moe_gen)$','.*mlp_moe_gen[.](gate_proj|up_proj|down_proj)$']"
+```
+
+This MLP target set has not been validated yet. It may need a lower learning rate, lower rank, or more VRAM than the default attention-only target set. Some Cosmos3 layers can use sparse MoE MLP blocks instead of direct `gate_proj`, `up_proj`, and `down_proj` children; targeting those expert internals is also unvalidated and may require different include patterns.
+
+The reasoner/understanding path can also be matched with module names such as `self_attn.q_proj`, `self_attn.k_proj`, `self_attn.v_proj`, `self_attn.o_proj`, `mlp.gate_proj`, `mlp.up_proj`, and `mlp.down_proj`, but this is not recommended as the first experiment because it can affect prompt/language understanding. Bridge modules outside `MoTDecoderLayer`, such as `vae2llm`, `llm2vae`, `sound2llm`, and `llm2sound`, are not selectable with `include_patterns` alone in the current Cosmos3 LoRA implementation.
 
 ## Inference
 
@@ -138,8 +154,8 @@ Text-to-video:
 
 ```powershell
 python cosmos3_generate_video.py `
-  --dit G:\storage\cosmos3-nano `
-  --vae G:\storage\cosmos3-nano `
+  --dit path\to\cosmos3-nano\weights `
+  --vae path\to\cosmos3-nano\weights `
   --prompt "a person walking through a quiet town at dusk" `
   --negative_prompt "blurry, distorted, low quality" `
   --video_size 512 288 `
@@ -157,8 +173,8 @@ With LoRA:
 
 ```powershell
 python cosmos3_generate_video.py `
-  --dit G:\storage\cosmos3-nano `
-  --vae G:\storage\cosmos3-nano `
+  --dit path\to\cosmos3-nano\weights `
+  --vae path\to\cosmos3-nano\weights `
   --lora_weight output\cosmos3_lora\cosmos3_lora.safetensors `
   --prompt "a person walking through a quiet town at dusk" `
   --negative_prompt "blurry, distorted, low quality" `
@@ -173,4 +189,4 @@ python cosmos3_generate_video.py `
   --save_path output\cosmos3_lora_sample.mp4
 ```
 
-Add `--audio --sound_tokenizer G:\storage\cosmos3-nano --sound_tokenizer_subfolder sound_tokenizer` to decode AVAE audio and write a WAV next to the video.
+Add `--audio --sound_tokenizer path\to\cosmos3-nano\weights --sound_tokenizer_subfolder sound_tokenizer` to decode AVAE audio and write a WAV next to the video.

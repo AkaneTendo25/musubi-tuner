@@ -760,6 +760,21 @@ def decode_latents_to_video(vae: Any, latents: torch.Tensor) -> torch.Tensor:
     return (video / 2 + 0.5).clamp_(0, 1)
 
 
+def normalize_sample_dimensions(
+    width: int,
+    height: int,
+    frame_count: int,
+    vae_scale_factor_temporal: int = 4,
+) -> tuple[int, int, int]:
+    if vae_scale_factor_temporal < 1:
+        raise ValueError("vae_scale_factor_temporal must be positive.")
+    width = max(16, (int(width) // 16) * 16)
+    height = max(16, (int(height) // 16) * 16)
+    frame_count = max(1, int(frame_count))
+    frame_count = (frame_count - 1) // vae_scale_factor_temporal * vae_scale_factor_temporal + 1
+    return width, height, frame_count
+
+
 def make_flow_timesteps(
     sample_steps: int,
     device: torch.device | str,

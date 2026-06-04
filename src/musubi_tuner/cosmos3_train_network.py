@@ -119,6 +119,27 @@ class Cosmos3NetworkTrainer(NetworkTrainer):
             vae.to("cpu")
             clean_memory_on_device(device)
 
+    def on_before_sample_images(
+        self, accelerator, args, epoch, steps, vae, transformer, network, sample_parameters, dit_dtype
+    ) -> None:
+        self._cosmos3_sample_network_was_training = None
+        if network is not None:
+            unwrapped_network = accelerator.unwrap_model(network)
+            self._cosmos3_sample_network_was_training = unwrapped_network.training
+            unwrapped_network.eval()
+
+    def on_after_sample_images(
+        self, accelerator, args, epoch, steps, vae, transformer, network, sample_parameters, dit_dtype
+    ) -> None:
+        was_training = getattr(self, "_cosmos3_sample_network_was_training", None)
+        if network is not None and was_training is not None:
+            unwrapped_network = accelerator.unwrap_model(network)
+            if was_training:
+                unwrapped_network.train()
+            else:
+                unwrapped_network.eval()
+        self._cosmos3_sample_network_was_training = None
+
     def sample_images(self, accelerator: Accelerator, args, epoch, steps, vae, transformer, sample_parameters, dit_dtype):
         if not should_sample_images(args, steps, epoch):
             return
@@ -337,9 +358,12 @@ class Cosmos3NetworkTrainer(NetworkTrainer):
         cfg_scale = sample_parameter.get("cfg_scale", None)
         negative_prompt = sample_parameter.get("negative_prompt", None)
 
-        width = (width // 8) * 8
-        height = (height // 8) * 8
-        frame_count = (frame_count - 1) // self.vae_frame_stride * self.vae_frame_stride + 1
+        width, height, frame_count = cosmos3_utils.normalize_sample_dimensions(
+            width,
+            height,
+            frame_count,
+            args.vae_scale_factor_temporal,
+        )
 
         if self.i2v_training:
             image_path = sample_parameter.get("image_path", None)
