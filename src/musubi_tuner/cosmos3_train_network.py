@@ -1,4 +1,5 @@
 import argparse
+import copy
 import os
 import sys
 import time
@@ -9,6 +10,7 @@ import numpy as np
 import torch
 from accelerate import Accelerator, PartialState
 
+from musubi_tuner import cosmos3_generate_video
 from musubi_tuner.cosmos3 import cosmos3_utils
 from musubi_tuner.dataset.image_video_dataset import ARCHITECTURE_COSMOS3, ARCHITECTURE_COSMOS3_FULL
 from musubi_tuner.hv_train_network import (
@@ -123,22 +125,31 @@ class Cosmos3NetworkTrainer(NetworkTrainer):
         self, accelerator, args, epoch, steps, vae, transformer, network, sample_parameters, dit_dtype
     ) -> None:
         self._cosmos3_sample_network_was_training = None
+        self._cosmos3_sample_network_dtype = None
         if network is not None:
             unwrapped_network = accelerator.unwrap_model(network)
             self._cosmos3_sample_network_was_training = unwrapped_network.training
+            first_param = next((p for p in unwrapped_network.parameters() if p.is_floating_point()), None)
+            self._cosmos3_sample_network_dtype = first_param.dtype if first_param is not None else None
             unwrapped_network.eval()
+            if dit_dtype is not None and self._cosmos3_sample_network_dtype is not None:
+                unwrapped_network.to(dtype=dit_dtype)
 
     def on_after_sample_images(
         self, accelerator, args, epoch, steps, vae, transformer, network, sample_parameters, dit_dtype
     ) -> None:
         was_training = getattr(self, "_cosmos3_sample_network_was_training", None)
+        network_dtype = getattr(self, "_cosmos3_sample_network_dtype", None)
         if network is not None and was_training is not None:
             unwrapped_network = accelerator.unwrap_model(network)
+            if network_dtype is not None:
+                unwrapped_network.to(dtype=network_dtype)
             if was_training:
                 unwrapped_network.train()
             else:
                 unwrapped_network.eval()
         self._cosmos3_sample_network_was_training = None
+        self._cosmos3_sample_network_dtype = None
 
     def sample_images(self, accelerator: Accelerator, args, epoch, steps, vae, transformer, sample_parameters, dit_dtype):
         if not should_sample_images(args, steps, epoch):
@@ -155,6 +166,11 @@ class Cosmos3NetworkTrainer(NetworkTrainer):
         was_training = transformer.training
         transformer.eval()
         transformer.switch_block_swap_for_inference()
+        accelerator_wrapped_forward = None
+        if hasattr(transformer, "_original_forward"):
+            accelerator_wrapped_forward = transformer.forward
+            transformer.forward = transformer._original_forward
+            logger.info("Cosmos3 sampling: using original DiT forward without Accelerate mixed-precision wrapper")
 
         offload_dit = accelerator.device.type == "cuda" and (
             bool(getattr(args, "offload_dit_during_sampling", False)) or (self.blocks_to_swap or 0) > 0
@@ -176,7 +192,7 @@ class Cosmos3NetworkTrainer(NetworkTrainer):
 
         try:
             if distributed_state.num_processes <= 1:
-                with torch.no_grad(), accelerator.autocast():
+                with torch.no_grad():
                     for sample_parameter in sample_parameters:
                         self.sample_image_inference(
                             accelerator, args, transformer, dit_dtype, vae, save_dir, sample_parameter, epoch, steps
@@ -201,6 +217,8 @@ class Cosmos3NetworkTrainer(NetworkTrainer):
 
             if offload_dit:
                 self._move_transformer_to_sampling_device(transformer, accelerator.device)
+            if accelerator_wrapped_forward is not None:
+                transformer.forward = accelerator_wrapped_forward
             transformer.switch_block_swap_for_training()
             if was_training:
                 transformer.train()
@@ -229,121 +247,45 @@ class Cosmos3NetworkTrainer(NetworkTrainer):
         tokenizer_path = args.tokenizer if args.tokenizer is not None else args.dit
         tokenizer = cosmos3_utils.load_tokenizer(tokenizer_path, args.tokenizer_subfolder)
 
-        cfg = None
-        if do_classifier_free_guidance:
-            cfg = guidance_scale if cfg_scale is None else cfg_scale
-        fps = float(sample_parameter.get("fps", args.fps))
         device = accelerator.device
         latent_dtype = dit_dtype if dit_dtype is not None else self.dit_dtype
-        offload_dit = device.type == "cuda" and (
-            bool(getattr(args, "offload_dit_during_sampling", False)) or (self.blocks_to_swap or 0) > 0
-        )
-        use_system_prompt = bool(sample_parameter.get("use_system_prompt", False))
-        add_resolution_template = bool(sample_parameter.get("add_resolution_template", True))
-        add_duration_template = bool(sample_parameter.get("add_duration_template", True))
-        negative_metadata_mode = str(
-            sample_parameter.get("negative_metadata_mode", cosmos3_utils.DEFAULT_NEGATIVE_METADATA_MODE)
-        )
         scheduler = cosmos3_utils.load_scheduler(args.dit, flow_shift=discrete_flow_shift)
 
-        with torch.no_grad(), accelerator.autocast():
-            image_condition_latent = None
-            if image_path is not None:
-                self._use_vae_on_sampling_device(vae, device, offload_dit)
-                image_condition_latent = cosmos3_utils.encode_image_to_condition_latent(
-                    vae, image_path, width, height, device, latent_dtype
-                )
-                self._offload_vae_after_sampling_step(vae, device, offload_dit)
+        sample_args = copy.copy(args)
+        sample_args.output_type = "video"
+        sample_args.flow_shift = discrete_flow_shift
+        sample_args.system_prompt = False
+        sample_args.no_system_prompt = getattr(args, "no_system_prompt", False)
+        sample_args.no_resolution_template = getattr(args, "no_resolution_template", False)
+        sample_args.no_duration_template = getattr(args, "no_duration_template", False)
+        sample_args.negative_metadata_mode = cosmos3_utils.DEFAULT_NEGATIVE_METADATA_MODE
+        sample_args.sound_latent_length = sample_parameter.get("sound_latent_length", None)
 
-            if offload_dit:
-                self._move_transformer_to_sampling_device(transformer, device)
+        prompt_args = copy.deepcopy(sample_parameter)
+        prompt_args["width"] = width
+        prompt_args["height"] = height
+        prompt_args["frame_count"] = frame_count
+        prompt_args["sample_steps"] = sample_steps
+        prompt_args["guidance_scale"] = guidance_scale if cfg_scale is None else cfg_scale
+        prompt_args["discrete_flow_shift"] = discrete_flow_shift
+        if image_path is not None:
+            prompt_args["image_path"] = image_path
 
-            if self._audio_training:
-                sound_latent_length = sample_parameter.get("sound_latent_length", None)
-                if sound_latent_length is None:
-                    sound_latent_length = max(1, int(np.ceil(frame_count / fps * float(args.sound_latent_fps))))
-                generated = cosmos3_utils.generate_latents(
-                    transformer,
-                    tokenizer,
-                    scheduler,
-                    prompt=sample_parameter.get("prompt", ""),
-                    negative_prompt=sample_parameter.get("negative_prompt", ""),
-                    width=width,
-                    height=height,
-                    frame_count=frame_count,
-                    fps=fps,
-                    sample_steps=sample_steps,
-                    flow_shift=discrete_flow_shift,
-                    guidance_scale=cfg,
-                    generator=generator,
-                    device=device,
-                    dtype=latent_dtype,
-                    vae_scale_factor_temporal=args.vae_scale_factor_temporal,
-                    image_condition_latent=image_condition_latent,
-                    use_system_prompt=use_system_prompt,
-                    add_resolution_template=add_resolution_template,
-                    add_duration_template=add_duration_template,
-                    negative_metadata_mode=negative_metadata_mode,
-                    sound_latent_length=int(sound_latent_length),
-                    sound_fps=float(args.sound_latent_fps),
-                    progress=False,
-                )
-                latents, sound_latents = generated
-                self._offload_transformer_after_sampling_step(transformer, device, offload_dit)
-
-                self._use_vae_on_sampling_device(vae, device, offload_dit)
-                video = cosmos3_utils.decode_latents_to_video(vae, latents.detach().to(vae.device, dtype=torch.float32)).cpu()
-                self._offload_vae_after_sampling_step(vae, device, offload_dit)
-
-                sound_source = args.sound_tokenizer if args.sound_tokenizer is not None else args.dit
-                sound_dtype = model_utils.str_to_dtype(args.sound_dtype)
-                sound_tokenizer = cosmos3_utils.load_sound_tokenizer(
-                    sound_source,
-                    args.sound_tokenizer_subfolder,
-                    dtype=sound_dtype,
-                    device=device,
-                )
-                audio = cosmos3_utils.decode_sound_latents_to_audio(
-                    sound_tokenizer,
-                    sound_latents.detach().to(sound_tokenizer.device, dtype=sound_tokenizer.dtype),
-                ).cpu()
-                sound_tokenizer.model.to("cpu")
-                del sound_tokenizer
-                video = (video, audio)
-            else:
-                latents = cosmos3_utils.generate_latents(
-                    transformer,
-                    tokenizer,
-                    scheduler,
-                    prompt=sample_parameter.get("prompt", ""),
-                    negative_prompt=sample_parameter.get("negative_prompt", ""),
-                    width=width,
-                    height=height,
-                    frame_count=frame_count,
-                    fps=fps,
-                    sample_steps=sample_steps,
-                    flow_shift=discrete_flow_shift,
-                    guidance_scale=cfg,
-                    generator=generator,
-                    device=device,
-                    dtype=latent_dtype,
-                    vae_scale_factor_temporal=args.vae_scale_factor_temporal,
-                    image_condition_latent=image_condition_latent,
-                    use_system_prompt=use_system_prompt,
-                    add_resolution_template=add_resolution_template,
-                    add_duration_template=add_duration_template,
-                    negative_metadata_mode=negative_metadata_mode,
-                    progress=False,
-                )
-                self._offload_transformer_after_sampling_step(transformer, device, offload_dit)
-
-                self._use_vae_on_sampling_device(vae, device, offload_dit)
-                video = cosmos3_utils.decode_latents_to_video(vae, latents.detach().to(vae.device, dtype=torch.float32))
-                self._offload_vae_after_sampling_step(vae, device, offload_dit)
+        _, video, _, audio = cosmos3_generate_video.sample_one(
+            sample_args,
+            prompt_args,
+            transformer,
+            tokenizer,
+            scheduler,
+            vae,
+            None,
+            latent_dtype,
+            device,
+        )
         clean_memory_on_device(accelerator.device)
 
-        if isinstance(video, tuple):
-            return video[0].to(torch.float32).cpu(), video[1].to(torch.float32).cpu()
+        if audio is not None:
+            return video.to(torch.float32).cpu(), audio.to(torch.float32).cpu()
         return video.to(torch.float32).cpu()
 
     def sample_image_inference(self, accelerator, args, transformer, dit_dtype, vae, save_dir, sample_parameter, epoch, steps):
@@ -357,6 +299,8 @@ class Cosmos3NetworkTrainer(NetworkTrainer):
         prompt: str = sample_parameter.get("prompt", "")
         cfg_scale = sample_parameter.get("cfg_scale", None)
         negative_prompt = sample_parameter.get("negative_prompt", None)
+        if not negative_prompt:
+            negative_prompt = cosmos3_utils.load_default_negative_prompt()
 
         width, height, frame_count = cosmos3_utils.normalize_sample_dimensions(
             width,
