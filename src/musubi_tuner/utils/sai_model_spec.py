@@ -21,6 +21,7 @@ from musubi_tuner.dataset.image_video_dataset import (
     ARCHITECTURE_FLUX_2_KLEIN_9B,
     ARCHITECTURE_KANDINSKY5,
     ARCHITECTURE_Z_IMAGE,
+    ARCHITECTURE_COSMOS3,
 )
 
 logger = logging.getLogger(__name__)
@@ -88,6 +89,7 @@ ARCH_QWEN_IMAGE_LAYERED = "Qwen-Image-Layered"
 ARCH_KANDINSKY5 = "Kandinsky-5"
 ARCH_HUNYUAN_VIDEO_1_5 = "hunyuan-video-1.5"
 ARCH_Z_IMAGE = "Z-Image"
+ARCH_COSMOS3 = "Cosmos3"
 
 ADAPTER_LORA = "lora"
 
@@ -102,6 +104,7 @@ IMPL_QWEN_IMAGE_LAYERED = "https://github.com/QwenLM/Qwen-Image-Layered"
 IMPL_KANDINSKY5 = "https://github.com/kandinskylab/kandinsky-5"
 IMPL_HUNYUAN_VIDEO_1_5 = "https://github.com/Tencent-Hunyuan/HunyuanVideo-1.5"
 IMPL_Z_IMAGE = "https://github.com/Tongyi-MAI/Z-Image"
+IMPL_COSMOS3 = "https://github.com/NVIDIA/cosmos-framework"
 
 PRED_TYPE_EPSILON = "epsilon"
 # PRED_TYPE_V = "v"
@@ -213,6 +216,9 @@ def build_metadata(
     elif architecture == ARCHITECTURE_Z_IMAGE:
         arch = ARCH_Z_IMAGE
         impl = IMPL_Z_IMAGE
+    elif architecture == ARCHITECTURE_COSMOS3:
+        arch = ARCH_COSMOS3
+        impl = IMPL_COSMOS3
     else:
         raise ValueError(f"Unknown architecture: {architecture}")
 

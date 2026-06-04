@@ -259,3 +259,95 @@ def load_video(
                 video.append(image)
 
     return video
+
+
+def _get_video_fps(container, fallback_fps: Optional[float]) -> float:
+    if fallback_fps is not None and fallback_fps > 0:
+        return float(fallback_fps)
+    video_streams = [stream for stream in container.streams if stream.type == "video"]
+    if video_streams:
+        rate = video_streams[0].average_rate or video_streams[0].base_rate
+        if rate is not None:
+            return float(rate)
+    raise ValueError("Could not determine video FPS for audio crop alignment. Pass source_fps/target_fps in dataset config.")
+
+
+def _audio_frame_to_channels_first(frame: av.AudioFrame, channels: int) -> np.ndarray:
+    array = frame.to_ndarray()
+    if array.ndim == 1:
+        array = array[None, :]
+    elif array.shape[0] != channels and array.shape[-1] == channels:
+        array = array.T
+
+    if array.shape[0] == 1 and channels == 2:
+        array = np.repeat(array, 2, axis=0)
+    elif array.shape[0] > channels:
+        array = array[:channels]
+    elif array.shape[0] < channels:
+        pad = np.zeros((channels - array.shape[0], array.shape[1]), dtype=array.dtype)
+        array = np.concatenate([array, pad], axis=0)
+    return array.astype(np.float32, copy=False)
+
+
+def load_audio(
+    video_path: str,
+    start_frame: Optional[int] = None,
+    end_frame: Optional[int] = None,
+    sample_rate: int = 48000,
+    channels: int = 2,
+    video_fps: Optional[float] = None,
+) -> np.ndarray:
+    """Load audio from a video file as float32 [channels, samples].
+
+    ``start_frame`` and ``end_frame`` use the same frame coordinates as the
+    video crop. ``video_fps`` should be the FPS used for those coordinates.
+    """
+    if not os.path.isfile(video_path):
+        raise ValueError(f"Audio extraction requires a video file, got directory: {video_path}")
+
+    container = av.open(video_path)
+    try:
+        audio_streams = [stream for stream in container.streams if stream.type == "audio"]
+        if not audio_streams:
+            raise ValueError(f"No audio stream found in video: {video_path}")
+
+        crop_fps = _get_video_fps(container, video_fps)
+        start_sample = 0 if start_frame is None else int(round(start_frame / crop_fps * sample_rate))
+        end_sample = None if end_frame is None else int(round(end_frame / crop_fps * sample_rate))
+        target_samples = None if end_sample is None else max(0, end_sample - start_sample)
+
+        layout = "stereo" if channels == 2 else "mono"
+        resampler = av.AudioResampler(format="fltp", layout=layout, rate=sample_rate)
+        chunks: list[np.ndarray] = []
+        for frame in container.decode(audio=0):
+            frames = resampler.resample(frame)
+            if frames is None:
+                continue
+            if not isinstance(frames, list):
+                frames = [frames]
+            for resampled in frames:
+                chunks.append(_audio_frame_to_channels_first(resampled, channels))
+
+        flushed = resampler.resample(None)
+        if flushed is not None:
+            if not isinstance(flushed, list):
+                flushed = [flushed]
+            for resampled in flushed:
+                chunks.append(_audio_frame_to_channels_first(resampled, channels))
+
+        if chunks:
+            audio = np.concatenate(chunks, axis=1)
+        else:
+            audio = np.zeros((channels, 0), dtype=np.float32)
+
+        if start_sample > audio.shape[1]:
+            audio = np.zeros((channels, 0), dtype=np.float32)
+        else:
+            audio = audio[:, start_sample:end_sample]
+
+        if target_samples is not None and audio.shape[1] < target_samples:
+            pad = np.zeros((channels, target_samples - audio.shape[1]), dtype=np.float32)
+            audio = np.concatenate([audio, pad], axis=1)
+        return audio
+    finally:
+        container.close()

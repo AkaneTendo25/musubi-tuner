@@ -34,6 +34,7 @@ from musubi_tuner.dataset.architectures import (  # explicit imports for local u
     ARCHITECTURE_KANDINSKY5,
     ARCHITECTURE_QWEN_IMAGE_EDIT,
     ARCHITECTURE_WAN,
+    ARCHITECTURE_COSMOS3,
 )
 from musubi_tuner.dataset.media_utils import *  # noqa: F401,F403
 from musubi_tuner.dataset.media_utils import resize_image_to_bucket  # explicit import for local use
@@ -49,6 +50,9 @@ class ItemInfo:
         frame_count: Optional[int] = None,
         content: Optional[Union[np.ndarray, list[np.ndarray]]] = None,
         latent_cache_path: Optional[str] = None,
+        source_path: Optional[str] = None,
+        frame_start: Optional[int] = None,
+        audio_fps: Optional[float] = None,
     ) -> None:
         self.item_key = item_key
         self.caption = caption
@@ -58,6 +62,9 @@ class ItemInfo:
         self.content = content
         self.latent_cache_path = latent_cache_path
         self.text_encoder_output_cache_path: Optional[str] = None
+        self.source_path = source_path
+        self.frame_start = frame_start
+        self.audio_fps = audio_fps
 
         # np.ndarray for video, list[np.ndarray] for image with multiple controls
         self.control_content: Optional[Union[np.ndarray, list[np.ndarray]]] = None
@@ -567,6 +574,7 @@ class VideoDataset(BaseDataset):
     TARGET_FPS_FRAMEPACK = 30.0
     TARGET_FPS_FLUX_KONTEXT = 1.0  # VideoDataset is not used for Flux Kontext, but this is a placeholder
     TARGET_FPS_HUNYUAN_VIDEO_1_5 = 24.0
+    TARGET_FPS_COSMOS3 = 24.0
 
     def __init__(
         self,
@@ -624,6 +632,8 @@ class VideoDataset(BaseDataset):
             self.target_fps = VideoDataset.TARGET_FPS_HUNYUAN
         elif self.architecture == ARCHITECTURE_HUNYUAN_VIDEO_1_5:
             self.target_fps = VideoDataset.TARGET_FPS_HUNYUAN_VIDEO_1_5
+        elif self.architecture == ARCHITECTURE_COSMOS3:
+            self.target_fps = VideoDataset.TARGET_FPS_COSMOS3
         else:
             raise ValueError(f"Unsupported architecture: {self.architecture}")
 
@@ -772,7 +782,15 @@ class VideoDataset(BaseDataset):
                             cropped_control = control_video[crop_pos : crop_pos + target_frame]
 
                         item_info = ItemInfo(
-                            item_key, caption, original_frame_size, batch_key, frame_count=target_frame, content=cropped_video
+                            item_key,
+                            caption,
+                            original_frame_size,
+                            batch_key,
+                            frame_count=target_frame,
+                            content=cropped_video,
+                            source_path=video_key,
+                            frame_start=crop_pos,
+                            audio_fps=self.target_fps if self.source_fps is not None else None,
                         )
                         item_info.latent_cache_path = self.get_latent_cache_path(item_info)
                         item_info.control_content = cropped_control  # None is allowed
@@ -859,7 +877,13 @@ class VideoDataset(BaseDataset):
             frame_pos, frame_count = int(frame_pos), int(frame_count)
 
             item_key = "_".join(tokens[:-3])
-            text_encoder_output_cache_file = os.path.join(self.cache_directory, f"{item_key}_{self.architecture}_te.safetensors")
+            if self.architecture == ARCHITECTURE_COSMOS3:
+                crop_item_key = "_".join(tokens[:-2])
+                text_encoder_output_cache_file = os.path.join(
+                    self.cache_directory, f"{crop_item_key}_{self.architecture}_te.safetensors"
+                )
+            else:
+                text_encoder_output_cache_file = os.path.join(self.cache_directory, f"{item_key}_{self.architecture}_te.safetensors")
             if not os.path.exists(text_encoder_output_cache_file):
                 logger.warning(f"Text encoder output cache file not found: {text_encoder_output_cache_file}")
                 continue

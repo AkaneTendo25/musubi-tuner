@@ -15,6 +15,7 @@ from musubi_tuner.dataset.architectures import (
     ARCHITECTURE_QWEN_IMAGE_FULL,
     ARCHITECTURE_WAN_FULL,
     ARCHITECTURE_Z_IMAGE_FULL,
+    ARCHITECTURE_COSMOS3_FULL,
 )
 from musubi_tuner.utils import safetensors_utils
 from musubi_tuner.utils.model_utils import dtype_to_str
@@ -242,19 +243,54 @@ def save_latent_cache_z_image(item_info: ItemInfo, latent: torch.Tensor):
     save_latent_cache_common(item_info, sd, ARCHITECTURE_Z_IMAGE_FULL)
 
 
-def save_latent_cache_common(item_info: ItemInfo, sd: dict[str, torch.Tensor], arch_fullname: str):
+def save_latent_cache_cosmos3(
+    item_info: ItemInfo,
+    latent: torch.Tensor,
+    sound_latent: Optional[torch.Tensor] = None,
+    sound_sample_rate: Optional[int] = None,
+    sound_latent_fps: Optional[float] = None,
+):
+    """Cosmos3 architecture. Stores normalized Wan-VAE latents as C,F,H,W."""
+    assert latent.dim() == 4, "latent should be 4D tensor (channel, frame, height, width)"
+
+    _, F, H, W = latent.shape
+    dtype_str = dtype_to_str(latent.dtype)
+    sd = {f"latents_{F}x{H}x{W}_{dtype_str}": latent.detach().cpu().contiguous()}
+    if sound_latent is not None:
+        assert sound_latent.dim() == 2, "sound_latent should be 2D tensor (channel, frame)"
+        _, T = sound_latent.shape
+        sound_dtype_str = dtype_to_str(sound_latent.dtype)
+        sd[f"sound_latents_{T}_{sound_dtype_str}"] = sound_latent.detach().cpu().contiguous()
+
+    metadata_extra = {}
+    if sound_sample_rate is not None:
+        metadata_extra["sound_sample_rate"] = f"{sound_sample_rate}"
+    if sound_latent_fps is not None:
+        metadata_extra["sound_latent_fps"] = f"{sound_latent_fps}"
+
+    save_latent_cache_common(item_info, sd, ARCHITECTURE_COSMOS3_FULL, metadata_extra=metadata_extra)
+
+
+def save_latent_cache_common(
+    item_info: ItemInfo,
+    sd: dict[str, torch.Tensor],
+    arch_fullname: str,
+    metadata_extra: Optional[dict[str, str]] = None,
+):
     metadata = {
         "architecture": arch_fullname,
         "width": f"{item_info.original_size[0]}",
         "height": f"{item_info.original_size[1]}",
         "format_version": "1.0.1",
     }
+    if metadata_extra:
+        metadata.update(metadata_extra)
     if item_info.frame_count is not None:
         metadata["frame_count"] = f"{item_info.frame_count}"
 
     for key, value in sd.items():
         # NaN check and show warning, replace NaN with 0
-        if torch.isnan(value).any():
+        if (value.is_floating_point() or value.is_complex()) and torch.isnan(value).any():
             logger.warning(f"{key} tensor has NaN: {item_info.item_key}, replace NaN with 0")
             value[torch.isnan(value)] = 0
 
@@ -370,10 +406,16 @@ def save_text_encoder_output_cache_z_image(item_info: ItemInfo, embed: torch.Ten
     save_text_encoder_output_cache_common(item_info, sd, ARCHITECTURE_Z_IMAGE_FULL)
 
 
+def save_text_encoder_output_cache_cosmos3(item_info: ItemInfo, input_ids: torch.Tensor):
+    """Cosmos3 stores tokenizer IDs. The joint transformer embeds tokens itself."""
+    sd = {"varlen_input_ids_int64": input_ids.detach().cpu().to(torch.int64)}
+    save_text_encoder_output_cache_common(item_info, sd, ARCHITECTURE_COSMOS3_FULL)
+
+
 def save_text_encoder_output_cache_common(item_info: ItemInfo, sd: dict[str, torch.Tensor], arch_fullname: str):
     for key, value in sd.items():
         # NaN check and show warning, replace NaN with 0
-        if torch.isnan(value).any():
+        if (value.is_floating_point() or value.is_complex()) and torch.isnan(value).any():
             logger.warning(f"{key} tensor has NaN: {item_info.item_key}, replace NaN with 0")
             value[torch.isnan(value)] = 0
 

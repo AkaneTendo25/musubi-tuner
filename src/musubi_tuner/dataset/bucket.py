@@ -22,6 +22,7 @@ from musubi_tuner.dataset.architectures import (
     ARCHITECTURE_QWEN_IMAGE_LAYERED,
     ARCHITECTURE_WAN,
     ARCHITECTURE_Z_IMAGE,
+    ARCHITECTURE_COSMOS3,
 )
 from musubi_tuner.dataset.media_utils import divisible_by
 
@@ -44,6 +45,7 @@ class BucketSelector:
     RESOLUTION_STEPS_KANDINSKY5 = 16
     RESOLUTION_STEPS_HUNYUAN_VIDEO_1_5 = 16
     RESOLUTION_STEPS_Z_IMAGE = 16
+    RESOLUTION_STEPS_COSMOS3 = 16
 
     ARCHITECTURE_STEPS_MAP = {
         ARCHITECTURE_HUNYUAN_VIDEO: RESOLUTION_STEPS_HUNYUAN,
@@ -59,6 +61,7 @@ class BucketSelector:
         ARCHITECTURE_KANDINSKY5: RESOLUTION_STEPS_KANDINSKY5,
         ARCHITECTURE_HUNYUAN_VIDEO_1_5: RESOLUTION_STEPS_HUNYUAN_VIDEO_1_5,
         ARCHITECTURE_Z_IMAGE: RESOLUTION_STEPS_Z_IMAGE,
+        ARCHITECTURE_COSMOS3: RESOLUTION_STEPS_COSMOS3,
     }
 
     def __init__(
@@ -253,6 +256,8 @@ class BucketBatchManager:
                     content_key = content_key.rsplit("_", 1)[0]  # remove dtype
                     if content_key.startswith("latents_"):
                         content_key = content_key.rsplit("_", 1)[0]  # remove FxHxW
+                    if content_key.startswith("sound_latents_"):
+                        content_key = content_key.rsplit("_", 1)[0]  # remove T
 
                 if content_key not in batch_tensor_data:
                     batch_tensor_data[content_key] = []
