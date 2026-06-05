@@ -13,7 +13,6 @@ from PIL import Image
 from safetensors import safe_open
 from transformers import AutoTokenizer
 from tqdm import tqdm
-from diffusers.schedulers.scheduling_unipc_multistep import UniPCMultistepScheduler
 from musubi_tuner.cosmos3.cosmos_framework.model.vfm.diffusion.samplers.fm_solvers_unipc import FlowUniPCMultistepScheduler
 
 from musubi_tuner.cosmos3.cosmos_framework.data.vfm.sequence_packing import ModalityData, PackedSequence, SequencePlan, pack_input_sequence
@@ -796,19 +795,47 @@ def load_scheduler(
     model_path: str,
     subfolder: str = "scheduler",
     flow_shift: float = 10.0,
-) -> UniPCMultistepScheduler:
-    scheduler = UniPCMultistepScheduler.from_pretrained(model_path, subfolder=subfolder)
-    return UniPCMultistepScheduler.from_config(scheduler.config, flow_shift=float(flow_shift))
+) -> FlowUniPCMultistepScheduler:
+    config_path = Path(_component_path(model_path, subfolder)) / "scheduler_config.json"
+    if not config_path.exists():
+        raise FileNotFoundError(f"Cosmos3 scheduler config not found: {config_path}")
+    return _flow_unipc_from_config(_read_json(config_path), shift=float(flow_shift))
 
 
-def _clone_scheduler(scheduler: UniPCMultistepScheduler | FlowUniPCMultistepScheduler):
-    if isinstance(scheduler, UniPCMultistepScheduler):
-        return UniPCMultistepScheduler.from_config(scheduler.config)
+def _config_get(config: Any, key: str, default: Any) -> Any:
+    if isinstance(config, dict):
+        return config.get(key, default)
+    return getattr(config, key, default)
+
+
+def _flow_unipc_from_config(config: Any, shift: Optional[float] = None) -> FlowUniPCMultistepScheduler:
+    config_shift = _config_get(config, "shift", None)
+    if config_shift is None:
+        config_shift = _config_get(config, "flow_shift", 1.0)
+    disable_corrector = _config_get(config, "disable_corrector", [])
+    if disable_corrector is None:
+        disable_corrector = []
     return FlowUniPCMultistepScheduler(
-        num_train_timesteps=int(getattr(scheduler.config, "num_train_timesteps", 1000)),
-        shift=float(getattr(scheduler.config, "shift", 1.0)),
-        use_dynamic_shifting=bool(getattr(scheduler.config, "use_dynamic_shifting", False)),
+        num_train_timesteps=int(_config_get(config, "num_train_timesteps", 1000)),
+        solver_order=int(_config_get(config, "solver_order", 2)),
+        prediction_type=str(_config_get(config, "prediction_type", "flow_prediction")),
+        shift=float(config_shift if shift is None else shift),
+        use_dynamic_shifting=bool(_config_get(config, "use_dynamic_shifting", False)),
+        thresholding=bool(_config_get(config, "thresholding", False)),
+        dynamic_thresholding_ratio=float(_config_get(config, "dynamic_thresholding_ratio", 0.995)),
+        sample_max_value=float(_config_get(config, "sample_max_value", 1.0)),
+        predict_x0=bool(_config_get(config, "predict_x0", True)),
+        solver_type=str(_config_get(config, "solver_type", "bh2")),
+        lower_order_final=bool(_config_get(config, "lower_order_final", True)),
+        disable_corrector=list(disable_corrector),
+        timestep_spacing=str(_config_get(config, "timestep_spacing", "linspace")),
+        steps_offset=int(_config_get(config, "steps_offset", 0)),
+        final_sigmas_type=str(_config_get(config, "final_sigmas_type", "zero")),
     )
+
+
+def _clone_scheduler(scheduler: FlowUniPCMultistepScheduler) -> FlowUniPCMultistepScheduler:
+    return _flow_unipc_from_config(scheduler.config)
 
 
 def encode_image_to_condition_latent(
@@ -832,7 +859,7 @@ def encode_image_to_condition_latent(
 def generate_latents(
     transformer: nn.Module,
     tokenizer,
-    scheduler: UniPCMultistepScheduler | FlowUniPCMultistepScheduler,
+    scheduler: FlowUniPCMultistepScheduler,
     prompt: str,
     negative_prompt: Optional[str],
     width: int,
@@ -905,17 +932,9 @@ def generate_latents(
     uncond_ids = torch.tensor(uncond_ids, dtype=torch.long, device=device)
     vision_scheduler = _clone_scheduler(scheduler)
     sound_scheduler = _clone_scheduler(scheduler) if sound_latents is not None else None
-    if isinstance(vision_scheduler, FlowUniPCMultistepScheduler):
-        vision_scheduler.set_timesteps(sample_steps, device=device, shift=float(flow_shift))
-    else:
-        vision_scheduler = UniPCMultistepScheduler.from_config(vision_scheduler.config, flow_shift=float(flow_shift))
-        vision_scheduler.set_timesteps(sample_steps, device=device)
+    vision_scheduler.set_timesteps(sample_steps, device=device, shift=float(flow_shift))
     if sound_scheduler is not None:
-        if isinstance(sound_scheduler, FlowUniPCMultistepScheduler):
-            sound_scheduler.set_timesteps(sample_steps, device=device, shift=float(flow_shift))
-        else:
-            sound_scheduler = UniPCMultistepScheduler.from_config(sound_scheduler.config, flow_shift=float(flow_shift))
-            sound_scheduler.set_timesteps(sample_steps, device=device)
+        sound_scheduler.set_timesteps(sample_steps, device=device, shift=float(flow_shift))
     use_cfg = guidance_scale is not None and guidance_scale != 1.0
 
     def normalize_vision_prediction(prediction: torch.Tensor) -> torch.Tensor:
@@ -1002,7 +1021,7 @@ def generate_video(
     transformer: nn.Module,
     vae: Any,
     tokenizer,
-    scheduler: UniPCMultistepScheduler | FlowUniPCMultistepScheduler,
+    scheduler: FlowUniPCMultistepScheduler,
     prompt: str,
     negative_prompt: Optional[str],
     width: int,

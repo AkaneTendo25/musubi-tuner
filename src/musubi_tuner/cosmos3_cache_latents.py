@@ -18,23 +18,26 @@ logging.basicConfig(level=logging.INFO)
 
 
 def _encode_sound_latent(sound_tokenizer, item: ItemInfo, sample_rate: int, channels: int, allow_missing_audio: bool):
-    if item.source_path is None:
-        raise ValueError(f"Audio caching requires source_path for {item.item_key}")
-    assert item.frame_count is not None
+    frame_count = item.frame_count or 1
     start_frame = item.frame_start or 0
-    try:
-        audio = load_audio(
-            item.source_path,
-            start_frame=start_frame,
-            end_frame=start_frame + item.frame_count,
-            sample_rate=sample_rate,
-            channels=channels,
-            video_fps=item.audio_fps,
-        )
-    except ValueError:
+    audio = None
+    if item.source_path is not None:
+        try:
+            audio = load_audio(
+                item.source_path,
+                start_frame=start_frame,
+                end_frame=start_frame + frame_count,
+                sample_rate=sample_rate,
+                channels=channels,
+                video_fps=item.audio_fps,
+            )
+        except ValueError:
+            audio = None
+
+    if audio is None:
         if not allow_missing_audio:
-            raise
-        samples = int(round(item.frame_count / float(item.audio_fps or 24.0) * sample_rate))
+            raise ValueError(f"Audio caching requires source audio for {item.item_key}")
+        samples = int(round(frame_count / float(item.audio_fps or 24.0) * sample_rate))
         audio = torch.zeros((channels, samples), dtype=torch.float32).numpy()
 
     audio_tensor = torch.from_numpy(audio).unsqueeze(0).to(sound_tokenizer.device, dtype=sound_tokenizer.dtype)
