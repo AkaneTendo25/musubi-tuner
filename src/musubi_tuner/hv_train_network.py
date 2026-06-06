@@ -404,6 +404,11 @@ def line_to_prompt_dict(line: str) -> dict:
                 prompt_dict["discrete_flow_shift"] = float(m.group(1))
                 continue
 
+            m = re.match(r"fr ([\d\.]+)", parg, re.IGNORECASE)
+            if m:  # frame rate (fps) for architectures that condition on it (e.g. LTX-2)
+                prompt_dict["frame_rate"] = float(m.group(1))
+                continue
+
             m = re.match(r"l ([\d\.]+)", parg, re.IGNORECASE)
             if m:  # scale
                 prompt_dict["cfg_scale"] = float(m.group(1))
