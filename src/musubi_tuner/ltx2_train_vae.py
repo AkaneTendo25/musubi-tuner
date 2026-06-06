@@ -102,6 +102,35 @@ def _load_prefixed_tensors(path: str, prefixes: Sequence[str], *, dtype: Optiona
     return tensors
 
 
+def _load_vae_state_tensors(path: str, component_prefix: str, *, dtype: Optional[torch.dtype] = None) -> dict[str, torch.Tensor]:
+    tensors = _load_prefixed_tensors(path, (component_prefix,), dtype=dtype)
+    stats = _load_prefixed_tensors(path, ("vae.per_channel_statistics.",), dtype=dtype)
+    tensors.update({f"per_channel_statistics.{key}": tensor for key, tensor in stats.items()})
+    return tensors
+
+
+def _load_compatible_state_dict(module: torch.nn.Module, tensors: dict[str, torch.Tensor], *, label: str) -> None:
+    current = module.state_dict()
+    compatible = {}
+    skipped = []
+    for key, tensor in tensors.items():
+        if key not in current:
+            skipped.append((key, "missing-in-target"))
+            continue
+        if tuple(current[key].shape) != tuple(tensor.shape):
+            skipped.append((key, f"shape {tuple(tensor.shape)} -> {tuple(current[key].shape)}"))
+            continue
+        compatible[key] = tensor
+
+    missing_keys, unexpected_keys = module.load_state_dict(compatible, strict=False)
+    if skipped:
+        logger.info("%s partial load skipped %d incompatible tensors; first few: %s", label, len(skipped), skipped[:8])
+    if unexpected_keys:
+        logger.warning("%s partial load ignored unexpected keys: %s", label, sorted(unexpected_keys)[:20])
+    if missing_keys:
+        logger.info("%s partial load left %d parameters/buffers randomly initialized", label, len(missing_keys))
+
+
 def _amp_context(device: torch.device, dtype: torch.dtype):
     if device.type in {"cuda", "xpu"} and dtype in {torch.float16, torch.bfloat16}:
         try:
@@ -182,7 +211,7 @@ def _mask_to_tensor(mask, frame_count: int) -> torch.Tensor:
     return mask_tensor.clamp(0.0, 1.0)
 
 
-def prepare_batch(batch: list[ItemInfo], device: torch.device, dtype: torch.dtype) -> PreparedBatch:
+def prepare_batch(batch: list[ItemInfo], device: torch.device, dtype: torch.dtype, temporal_compression: int = 8) -> PreparedBatch:
     contents = [_content_to_tensor(item.content) for item in batch]
     frame_counts = {int(content.shape[0]) for content in contents}
     if len(frame_counts) != 1:
@@ -205,9 +234,9 @@ def prepare_batch(batch: list[ItemInfo], device: torch.device, dtype: torch.dtyp
     pixels = pixels / 127.5 - 1.0
 
     frames = int(pixels.shape[2])
-    remainder = (frames - 1) % 8
+    remainder = (frames - 1) % temporal_compression
     if remainder != 0:
-        pad = 8 - remainder
+        pad = temporal_compression - remainder
         pixels = torch.cat([pixels, pixels[:, :, -1:].expand(-1, -1, pad, -1, -1)], dim=2)
         if has_masks:
             padded_masks = []
@@ -270,6 +299,43 @@ def _sample_frame_indices(frame_count: int, sample_count: int) -> list[int]:
 
 _LPIPS_MEAN = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(1, 3, 1, 1)
 _LPIPS_STD = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(1, 3, 1, 1)
+
+
+def _sobel_laplacian_features(x: torch.Tensor) -> torch.Tensor:
+    gray = x.mean(dim=1, keepdim=True)
+    kx = torch.tensor(
+        [[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]],
+        device=x.device,
+        dtype=x.dtype,
+    ).view(1, 1, 3, 3)
+    ky = torch.tensor(
+        [[-1.0, -2.0, -1.0], [0.0, 0.0, 0.0], [1.0, 2.0, 1.0]],
+        device=x.device,
+        dtype=x.dtype,
+    ).view(1, 1, 3, 3)
+    lap = torch.tensor(
+        [[0.0, 1.0, 0.0], [1.0, -4.0, 1.0], [0.0, 1.0, 0.0]],
+        device=x.device,
+        dtype=x.dtype,
+    ).view(1, 1, 3, 3)
+    fx = F.conv2d(gray, kx, padding=1)
+    fy = F.conv2d(gray, ky, padding=1)
+    fl = F.conv2d(gray, lap, padding=1)
+    blur = F.avg_pool2d(x, kernel_size=3, stride=1, padding=1)
+    return torch.cat([x, blur, fx, fy, fl], dim=1)
+
+
+def _edge_pyramid_loss(recon: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    total = torch.zeros((), device=recon.device, dtype=recon.dtype)
+    recon_level = recon
+    target_level = target
+    for _ in range(3):
+        total = total + F.l1_loss(_sobel_laplacian_features(recon_level), _sobel_laplacian_features(target_level))
+        if min(int(recon_level.shape[-2]), int(recon_level.shape[-1])) < 8:
+            break
+        recon_level = F.avg_pool2d(recon_level, kernel_size=2, stride=2)
+        target_level = F.avg_pool2d(target_level, kernel_size=2, stride=2)
+    return total
 
 
 @lru_cache(maxsize=4)
@@ -364,42 +430,7 @@ def _feature_pyramid_loss(recon: torch.Tensor, target: torch.Tensor, backend: st
     elif backend != "proxy":
         raise RuntimeError(f"feature_loss_backend={backend} is unavailable")
 
-    def _gray(x: torch.Tensor) -> torch.Tensor:
-        return x.mean(dim=1, keepdim=True)
-
-    def _sobel_features(x: torch.Tensor) -> torch.Tensor:
-        gray = _gray(x)
-        kx = torch.tensor(
-            [[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]],
-            device=x.device,
-            dtype=x.dtype,
-        ).view(1, 1, 3, 3)
-        ky = torch.tensor(
-            [[-1.0, -2.0, -1.0], [0.0, 0.0, 0.0], [1.0, 2.0, 1.0]],
-            device=x.device,
-            dtype=x.dtype,
-        ).view(1, 1, 3, 3)
-        lap = torch.tensor(
-            [[0.0, 1.0, 0.0], [1.0, -4.0, 1.0], [0.0, 1.0, 0.0]],
-            device=x.device,
-            dtype=x.dtype,
-        ).view(1, 1, 3, 3)
-        fx = F.conv2d(gray, kx, padding=1)
-        fy = F.conv2d(gray, ky, padding=1)
-        fl = F.conv2d(gray, lap, padding=1)
-        blur = F.avg_pool2d(x, kernel_size=3, stride=1, padding=1)
-        return torch.cat([x, blur, fx, fy, fl], dim=1)
-
-    total = torch.zeros((), device=recon.device, dtype=recon.dtype)
-    recon_level = recon
-    target_level = target
-    for _ in range(3):
-        total = total + F.l1_loss(_sobel_features(recon_level), _sobel_features(target_level))
-        if min(int(recon_level.shape[-2]), int(recon_level.shape[-1])) < 8:
-            break
-        recon_level = F.avg_pool2d(recon_level, kernel_size=2, stride=2)
-        target_level = F.avg_pool2d(target_level, kernel_size=2, stride=2)
-    return total
+    return _edge_pyramid_loss(recon, target)
 
 
 def _frequency_distribution_loss(recon: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -636,7 +667,7 @@ def load_vae_components(
 
     if source_is_decoder_only:
         logger.info("Overlaying decoder-only weights from %s", source_path)
-        decoder_sd = _load_prefixed_tensors(source_path, ("vae.decoder.", "vae.per_channel_statistics."), dtype=dtype)
+        decoder_sd = _load_vae_state_tensors(source_path, "vae.decoder.", dtype=dtype)
         missing_keys, unexpected_keys = decoder.load_state_dict(decoder_sd, strict=False)
         if unexpected_keys:
             logger.warning("Unexpected decoder-only checkpoint keys ignored: %s", sorted(unexpected_keys))
@@ -1103,7 +1134,10 @@ def train(args: argparse.Namespace) -> None:
 
                     if args.log_every_n_steps > 0 and global_step % args.log_every_n_steps == 0:
                         logger.info(
-                            "step=%d epoch=%d loss=%.6f recon=%.6f temporal=%.6f latent_reg=%.6f feature=%.6f freq=%.6f gan=%.6f lr=%.3e",
+                            (
+                                "step=%d epoch=%d loss=%.6f recon=%.6f temporal=%.6f latent_reg=%.6f "
+                                "feature=%.6f freq=%.6f gan=%.6f lr=%.3e"
+                            ),
                             global_step,
                             epoch,
                             metrics["loss"],
@@ -1244,7 +1278,6 @@ def setup_parser() -> argparse.ArgumentParser:
         choices=["full", "decoder"],
         help="full saves frozen/trained encoder plus decoder; decoder saves decoder-only weights with base metadata.",
     )
-
     parser.add_argument(
         "--vae_dtype", type=str, default="bfloat16", choices=["float32", "fp32", "bfloat16", "bf16", "float16", "fp16"]
     )
