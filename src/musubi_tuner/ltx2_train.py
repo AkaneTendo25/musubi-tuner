@@ -4088,6 +4088,19 @@ def main() -> None:
     if is_badam_run:
         from musubi_tuner.optimizers.badam import create_badam_optimizer
 
+        def parse_badam_wrapper_value(raw_value: str) -> Any:
+            normalized = raw_value.strip().lower()
+            if normalized in {"1", "true", "yes", "y", "on"}:
+                return True
+            if normalized in {"0", "false", "no", "n", "off"}:
+                return False
+            if normalized in {"none", "null"}:
+                return None
+            try:
+                return ast.literal_eval(raw_value)
+            except (ValueError, SyntaxError):
+                return raw_value
+
         # Parse wrapper kwargs from --optimizer_args. base_optimizer_type is consumed by
         # the factory and must be excluded here. Values fall back to raw string when
         # they are not Python literals.
@@ -4096,10 +4109,7 @@ def main() -> None:
             if "=" not in entry:
                 raise ValueError(f"Invalid --optimizer_args entry (expected key=value): {entry}")
             k, v = entry.split("=", 1)
-            try:
-                wrapper_kwargs[k] = ast.literal_eval(v)
-            except (ValueError, SyntaxError):
-                wrapper_kwargs[k] = v
+            wrapper_kwargs[k] = parse_badam_wrapper_value(v)
         wrapper_kwargs.pop("base_optimizer_type", None)
         if wrapper_kwargs.get("use_gradient_release", False) and not wrapper_kwargs.get("use_fp32_active_copy", True):
             raise ValueError(
@@ -4116,6 +4126,7 @@ def main() -> None:
             ("start_block", None),
             ("block_prefix_mode", "transformer_blocks"),
             ("block_prefixes", []),
+            ("block_group_size", 1),
             ("always_active_prefixes", []),
             ("active_modules", []),
             ("include_non_block", True),

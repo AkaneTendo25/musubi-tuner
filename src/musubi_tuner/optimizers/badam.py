@@ -67,6 +67,27 @@ def normalize_block_prefixes(
     return normalized
 
 
+def group_block_prefixes(
+    block_prefixes: Sequence[tuple[str, ...]],
+    group_size: int = 1,
+) -> list[tuple[str, ...]]:
+    """Merge consecutive BAdam block groups into larger active windows."""
+
+    group_size = int(group_size)
+    if group_size < 1:
+        raise ValueError("BAdam block_group_size must be >= 1")
+    if group_size == 1:
+        return list(block_prefixes)
+
+    grouped: list[tuple[str, ...]] = []
+    for start in range(0, len(block_prefixes), group_size):
+        merged: list[str] = []
+        for group in block_prefixes[start : start + group_size]:
+            merged.extend(group)
+        grouped.append(tuple(merged))
+    return grouped
+
+
 def infer_indexed_block_prefixes(
     named_parameters: Sequence[tuple[str, torch.nn.Parameter]],
 ) -> list[tuple[str, ...]]:
@@ -147,6 +168,18 @@ def _matches_any(name: str, prefixes: Iterable[str]) -> bool:
     return False
 
 
+def _as_bool(value: Any, *, name: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "y", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "n", "off"}:
+            return False
+    raise ValueError(f"BAdam {name} must be a boolean value, got {value!r}")
+
+
 class BlockOptimizer(torch.optim.Optimizer):
     """Block-coordinate wrapper for a base optimizer.
 
@@ -189,10 +222,16 @@ class BlockOptimizer(torch.optim.Optimizer):
         self.switch_block_every = int(switch_block_every)
         self.switch_mode = switch_mode
         self.always_active_prefixes = tuple(always_active_prefixes or ())
-        self.include_non_block = bool(include_non_block)
-        self.use_fp32_active_copy = bool(use_fp32_active_copy)
-        self.purge_inactive_state = bool(purge_inactive_state)
-        self.reset_state_on_switch = bool(reset_state_on_switch)
+        self.include_non_block = _as_bool(include_non_block, name="include_non_block")
+        self.use_fp32_active_copy = _as_bool(use_fp32_active_copy, name="use_fp32_active_copy")
+        self.purge_inactive_state = _as_bool(purge_inactive_state, name="purge_inactive_state")
+        self.reset_state_on_switch = _as_bool(reset_state_on_switch, name="reset_state_on_switch")
+        if self.use_fp32_active_copy and not self.reset_state_on_switch:
+            raise ValueError(
+                "BAdam use_fp32_active_copy=True requires reset_state_on_switch=True. "
+                "The base optimizer state is attached to temporary fp32 active copies "
+                "and cannot be safely reused across block switches without remapping."
+            )
         self.verbose = int(verbose)
         self.logger = logger
         self.global_step = 0
@@ -207,11 +246,11 @@ class BlockOptimizer(torch.optim.Optimizer):
         self._gr_max_grad_norm: float = 0.0
         self._gr_fused_step_state: dict[str, Any] | None = None
         self._gr_hook_handles: list[Any] = []
-        self.bread_sgd_enabled = bool(bread_sgd_enabled)
+        self.bread_sgd_enabled = _as_bool(bread_sgd_enabled, name="bread_sgd")
         self.bread_sgd_mode = str(bread_sgd_mode).lower()
         self.bread_sgd_window_blocks = int(bread_sgd_window_blocks)
         self.bread_sgd_lr_scale = float(bread_sgd_lr_scale)
-        self.bread_sgd_use_sign = bool(bread_sgd_use_sign)
+        self.bread_sgd_use_sign = _as_bool(bread_sgd_use_sign, name="bread_sgd_use_sign")
         if not self.bread_sgd_enabled:
             self.bread_sgd_mode = "disabled"
         if self.bread_sgd_mode in {"off", "false", "0", "none"}:
@@ -238,9 +277,10 @@ class BlockOptimizer(torch.optim.Optimizer):
             )
 
         if start_block is not None:
-            if start_block >= len(self.block_prefixes):
+            start_block = int(start_block)
+            if start_block < 0 or start_block >= len(self.block_prefixes):
                 raise ValueError(f"start_block={start_block} is outside {len(self.block_prefixes)} BAdam blocks")
-            self.current_block_idx = int(start_block)
+            self.current_block_idx = start_block
         elif self.switch_mode == "descending":
             self.current_block_idx = len(self.block_prefixes) - 1
         elif self.switch_mode == "random":
@@ -710,7 +750,7 @@ def create_badam_optimizer(
 
     distributed_context = distributed_context or {}
     world_size = int(distributed_context.get("world_size", 1) or 1)
-    if world_size > 1 and not bool(getattr(args, "badam_allow_distributed", False)):
+    if world_size > 1 and not _as_bool(getattr(args, "badam_allow_distributed", False), name="allow_distributed"):
         raise ValueError(
             "BAdam changes requires_grad between blocks and is currently supported "
             "only for single-process training. Set badam_allow_distributed only "
@@ -723,7 +763,7 @@ def create_badam_optimizer(
 
     matched_ids = {id(param) for _name, param in named_parameters}
     unmatched_count = len(trainable_ids - matched_ids)
-    allow_unmatched = bool(getattr(args, "badam_allow_unmatched_params", False))
+    allow_unmatched = _as_bool(getattr(args, "badam_allow_unmatched_params", False), name="allow_unmatched_params")
     if unmatched_count and not allow_unmatched:
         raise ValueError(
             "BAdam requires trainable parameters to be named by the transformer. "
@@ -753,8 +793,8 @@ def create_badam_optimizer(
     elif prefix_mode in {"auto", "transformer_blocks"}:
         block_prefixes = infer_transformer_block_prefixes(
             named_parameters,
-            include_embedding=bool(getattr(args, "badam_include_embedding", False)),
-            include_lm_head=bool(getattr(args, "badam_include_lm_head", False)),
+            include_embedding=_as_bool(getattr(args, "badam_include_embedding", False), name="include_embedding"),
+            include_lm_head=_as_bool(getattr(args, "badam_include_lm_head", False), name="include_lm_head"),
         )
     else:
         block_prefixes = []
@@ -762,6 +802,10 @@ def create_badam_optimizer(
         raise ValueError(
             "BAdam could not infer any transformer block prefixes from trainable parameters. Set badam_block_prefixes explicitly."
         )
+    block_prefixes = group_block_prefixes(
+        block_prefixes,
+        int(getattr(args, "badam_block_group_size", 1)),
+    )
 
     wrapper = BlockOptimizer(
         base_optimizer,
@@ -773,15 +817,15 @@ def create_badam_optimizer(
         always_active_prefixes=(
             list(getattr(args, "badam_always_active_prefixes", []) or []) + list(getattr(args, "badam_active_modules", []) or [])
         ),
-        include_non_block=bool(getattr(args, "badam_include_non_block", True)),
-        use_fp32_active_copy=bool(getattr(args, "badam_use_fp32_active_copy", True)),
-        purge_inactive_state=bool(getattr(args, "badam_purge_inactive_state", True)),
-        reset_state_on_switch=bool(getattr(args, "badam_reset_state_on_switch", True)),
-        bread_sgd_enabled=bool(getattr(args, "badam_bread_sgd", False)),
+        include_non_block=_as_bool(getattr(args, "badam_include_non_block", True), name="include_non_block"),
+        use_fp32_active_copy=_as_bool(getattr(args, "badam_use_fp32_active_copy", True), name="use_fp32_active_copy"),
+        purge_inactive_state=_as_bool(getattr(args, "badam_purge_inactive_state", True), name="purge_inactive_state"),
+        reset_state_on_switch=_as_bool(getattr(args, "badam_reset_state_on_switch", True), name="reset_state_on_switch"),
+        bread_sgd_enabled=_as_bool(getattr(args, "badam_bread_sgd", False), name="bread_sgd"),
         bread_sgd_mode=str(getattr(args, "badam_bread_sgd_mode", "all")).lower(),
         bread_sgd_window_blocks=int(getattr(args, "badam_bread_sgd_window_blocks", 0)),
         bread_sgd_lr_scale=float(getattr(args, "badam_bread_sgd_lr_scale", 1.0)),
-        bread_sgd_use_sign=bool(getattr(args, "badam_bread_sgd_use_sign", False)),
+        bread_sgd_use_sign=_as_bool(getattr(args, "badam_bread_sgd_use_sign", False), name="bread_sgd_use_sign"),
         verbose=int(getattr(args, "badam_verbose", 1)),
         logger=logger,
     )
