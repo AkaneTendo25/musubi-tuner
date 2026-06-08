@@ -4,6 +4,7 @@
 # https://github.com/cloneofsimo/lora/blob/master/lora_diffusion/lora.py
 
 import ast
+import contextlib
 import json
 import math
 import os
@@ -349,6 +350,14 @@ class LoRAModule(AdaptiveRankLoRAModuleMixin, torch.nn.Module):
         self.dropout = dropout
         self.rank_dropout = rank_dropout
         self.module_dropout = module_dropout
+        # RL hooks (default-on so supervised / slider training is unchanged):
+        #   enabled=False         -> bypass the adapter entirely (NFT `ref` forward). DoRA-safe:
+        #                            returns org_forward, skipping the magnitude path (multiplier=0
+        #                            would NOT, because magnitude still rescales the base).
+        #   dropout_enabled=False -> deterministic forward even under .train() (NFT old/default/ref
+        #                            must be bit-comparable policy evaluations).
+        self.enabled = True
+        self.dropout_enabled = True
 
     def apply_to(self):
         self.org_forward = self.org_module.forward
@@ -356,10 +365,12 @@ class LoRAModule(AdaptiveRankLoRAModuleMixin, torch.nn.Module):
         del self.org_module
 
     def forward(self, x):
+        if not self.enabled:
+            return self.org_forward(x)
         org_forwarded = self.org_forward(x)
 
         # module dropout
-        if self.module_dropout is not None and self.training:
+        if self.module_dropout is not None and self.training and self.dropout_enabled:
             if torch.rand(1) < self.module_dropout:
                 return org_forwarded
 
@@ -367,11 +378,11 @@ class LoRAModule(AdaptiveRankLoRAModuleMixin, torch.nn.Module):
             lx = self.lora_down(x)
 
             # normal dropout
-            if self.dropout is not None and self.training:
+            if self.dropout is not None and self.training and self.dropout_enabled:
                 lx = torch.nn.functional.dropout(lx, p=self.dropout)
 
             # rank dropout
-            if self.rank_dropout is not None and self.training:
+            if self.rank_dropout is not None and self.training and self.dropout_enabled:
                 mask = torch.rand((lx.size(0), self.lora_dim), device=lx.device) > self.rank_dropout
                 if len(lx.size()) == 3:
                     mask = mask.unsqueeze(1)  # for Text Encoder
@@ -395,11 +406,11 @@ class LoRAModule(AdaptiveRankLoRAModuleMixin, torch.nn.Module):
             lxs = [lora_down(x) for lora_down in self.lora_down]
 
             # normal dropout
-            if self.dropout is not None and self.training:
+            if self.dropout is not None and self.training and self.dropout_enabled:
                 lxs = [torch.nn.functional.dropout(lx, p=self.dropout) for lx in lxs]
 
             # rank dropout
-            if self.rank_dropout is not None and self.training:
+            if self.rank_dropout is not None and self.training and self.dropout_enabled:
                 masks = [torch.rand((lx.size(0), self.lora_dim), device=lx.device) > self.rank_dropout for lx in lxs]
                 for i in range(len(lxs)):
                     if len(lx.size()) == 3:
@@ -633,10 +644,10 @@ class DoRAModule(LoRAModule):
         if self.split_dims is None:
             lx = self.lora_down(x)
 
-            if self.dropout is not None and self.training:
+            if self.dropout is not None and self.training and self.dropout_enabled:
                 lx = torch.nn.functional.dropout(lx, p=self.dropout)
 
-            if self.rank_dropout is not None and self.training:
+            if self.rank_dropout is not None and self.training and self.dropout_enabled:
                 mask = torch.rand((lx.size(0), self.lora_dim), device=lx.device) > self.rank_dropout
                 if len(lx.size()) == 3:
                     mask = mask.unsqueeze(1)
@@ -655,10 +666,10 @@ class DoRAModule(LoRAModule):
 
         lxs = [lora_down(x) for lora_down in self.lora_down]
 
-        if self.dropout is not None and self.training:
+        if self.dropout is not None and self.training and self.dropout_enabled:
             lxs = [torch.nn.functional.dropout(lx, p=self.dropout) for lx in lxs]
 
-        if self.rank_dropout is not None and self.training:
+        if self.rank_dropout is not None and self.training and self.dropout_enabled:
             masks = [torch.rand((lx.size(0), self.lora_dim), device=lx.device) > self.rank_dropout for lx in lxs]
             for i in range(len(lxs)):
                 if len(lxs[i].size()) == 3:
@@ -683,9 +694,11 @@ class DoRAModule(LoRAModule):
         return state_dict
 
     def forward(self, x):
+        if not self.enabled:
+            return self.org_forward(x)
         org_forwarded = self.org_forward(x)
 
-        if self.module_dropout is not None and self.training:
+        if self.module_dropout is not None and self.training and self.dropout_enabled:
             if torch.rand(1, device=x.device) < self.module_dropout:
                 return org_forwarded
 
@@ -1259,6 +1272,44 @@ class LoRANetwork(AdaptiveRankLoRANetworkMixin, torch.nn.Module):
     def set_enabled(self, is_enabled):
         for lora in self.text_encoder_loras + self.unet_loras:
             lora.enabled = is_enabled
+
+    def set_dropout_enabled(self, is_enabled):
+        """Toggle LoRA dropout independently of ``.train()`` mode.
+
+        RL forwards (NFT old/default/ref) must be deterministic to be comparable, so the
+        driver calls ``set_dropout_enabled(False)`` while leaving the module in train mode.
+        Default is True (no change to supervised training).
+        """
+        for lora in self.text_encoder_loras + self.unet_loras:
+            lora.dropout_enabled = is_enabled
+
+    def trainable_lora_params(self):
+        """Canonical, stably-ordered list of every trainable adapter param.
+
+        Includes lora_down/lora_up, DoRA magnitude vectors, and adaptive-rank lambdas
+        (everything with ``requires_grad``) — so the NFT ``old`` EMA snapshot covers all
+        trainable tensors, not a hardcoded {down, up, magnitude} subset.
+        """
+        return [p for _, p in self.named_parameters() if p.requires_grad]
+
+    @contextlib.contextmanager
+    def swapped_weights(self, ema_tensors):
+        """Temporarily replace trainable params' ``.data`` with ``ema_tensors`` (aligned to
+        ``trainable_lora_params()`` order), restoring the originals on exit **even if the body
+        raises**. Used to run the NFT ``old`` (EMA) forward without a second full model copy.
+        """
+        params = self.trainable_lora_params()
+        ema_tensors = list(ema_tensors)
+        if len(params) != len(ema_tensors):
+            raise ValueError(f"swapped_weights: got {len(ema_tensors)} ema tensors for {len(params)} trainable params")
+        saved = [p.data for p in params]
+        try:
+            for param, ema in zip(params, ema_tensors):
+                param.data = ema
+            yield
+        finally:
+            for param, original in zip(params, saved):
+                param.data = original
 
     def load_weights(self, file):
         if os.path.splitext(file)[1] == ".safetensors":

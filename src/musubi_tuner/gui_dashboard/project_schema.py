@@ -972,6 +972,65 @@ class SliderConfig(BaseModel):
     extra_args: str = ""
 
 
+class RLConfig(BaseModel):
+    """NFT/GRPO RL post-training (Phase A rollout cache + Phase B NFT loop).
+
+    Shared model/LoRA/optimizer/memory settings are inherited from ``TrainingConfig``;
+    only RL-specific values live here. Mirrors the flags registered by
+    ``musubi_tuner.ltx2_rl_args`` (which themselves mirror the two RL drivers).
+    """
+
+    model_config = ConfigDict(extra="ignore")  # old projects may have moved fields
+
+    # Two-phase workflow toggle
+    phase: Literal["cache_rollouts", "train_rl"] = "cache_rollouts"
+    online: bool = False  # Phase B: generate rollouts inline instead of replaying a cache
+
+    # Rollout cache + prompts (Phase A writes, Phase B reads; online reads prompts directly)
+    rl_rollout_cache: str = ""
+    rl_prompts: str = ""
+    rl_save_old_lora: str = ""  # Phase A: save the `old` fp32 snapshot for the Phase B invariant
+    rl_dump_cache: str = ""  # online: also dump the inline rollouts (equivalence harness)
+
+    # Reward zoo
+    reward_fn: str = "iqa_quality:1.0,anti_noise:0.1"
+    reward_args: str = ""  # key=value entries passed to each reward's setup()
+    reward_plugins: str = ""  # whitespace-separated custom-reward .py paths (--reward_plugins)
+
+    # Update rule (Phase B) + its hyperparameters
+    rl_loss: Literal["nft", "rwr", "dpo", "ppo"] = "nft"
+    rwr_temperature: float = 1.0
+    dpo_beta: float = 5.0
+    ppo_clip_eps: float = 0.2
+    # ppo is trajectory-faithful DDPO: selecting it makes Phase A sample with the SDE sampler so the
+    # per-step trajectory is cached; rl_sde_eta is the per-step noise level (shared by both phases).
+    rl_sde_eta: float = 1.0
+
+    # NFT loss coefficients (also supply the shared KL + advantage-clip for the other rules)
+    nft_beta_mix: float = 1.0
+    nft_kl_beta: float = 1e-4
+    nft_adv_clip_max: float = 5.0
+
+    # GRPO / loop schedule
+    rl_group_size: int = 8  # K samples per prompt (== GRPO group size)
+    rl_timesteps_per_sample: int = 1
+    rl_max_steps: int = 0  # 0 = ~one pass over the cache
+    rl_decay_type: int = 1
+    rl_log_vram: bool = False
+
+    # Sample dimensions (rollout generation)
+    sample_width: int = 768
+    sample_height: int = 512
+    sample_frames: int = 49
+    sample_cfg: float = 1.0
+    sample_steps: int = 20
+
+    # RL-specific overrides (output name; everything else inherits from training config)
+    output_name: str = "ltx2_rl_lora"
+    accelerate_extra_args: str = ""
+    extra_args: str = ""
+
+
 class ProjectConfig(BaseModel):
     version: int = 2
     name: str = "New Project"
@@ -988,6 +1047,7 @@ class ProjectConfig(BaseModel):
     remote_stage_server: RemoteStageServerConfig = Field(default_factory=RemoteStageServerConfig)
     inference: InferenceConfig = Field(default_factory=InferenceConfig)
     slider: SliderConfig = Field(default_factory=SliderConfig)
+    rl: RLConfig = Field(default_factory=RLConfig)
 
     @model_validator(mode="before")
     @classmethod

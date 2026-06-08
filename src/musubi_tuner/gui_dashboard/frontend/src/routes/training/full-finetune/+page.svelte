@@ -257,7 +257,7 @@
 
 	function applyBadamRecommendation() {
 		update('optimizer_type', 'BAdam');
-		update('optimizer_args', 'base_optimizer_type=AdamW8bit switch_block_every=25 switch_mode=ascending include_non_block=True use_fp32_active_copy=True purge_inactive_state=True reset_state_on_switch=True use_gradient_release=True');
+		update('optimizer_args', 'base_optimizer_type=AdamW8bit switch_block_every=25 switch_mode=ascending block_group_size=2 include_non_block=True use_fp32_active_copy=True purge_inactive_state=True reset_state_on_switch=True use_gradient_release=True');
 		update('base_optimizer_args', '');
 		update('qgalore_full_ft', false);
 		update('learning_rate', 1e-6);

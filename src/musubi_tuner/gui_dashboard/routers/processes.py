@@ -20,6 +20,8 @@ from musubi_tuner.gui_dashboard.command_builder import (
     build_inference_cmd,
     build_remote_stage_launcher_cmd,
     build_remote_stage_server_cmd,
+    build_rl_cache_rollouts_cmd,
+    build_rl_train_cmd,
     build_slider_training_cmd,
     build_training_cmd,
 )
@@ -44,6 +46,8 @@ VALID_TYPES = (
     "remote_stage_server",
     "inference",
     "slider_training",
+    "rl_cache_rollouts",
+    "rl_train",
 )
 
 
@@ -83,6 +87,10 @@ def _build_cmd(proc_type: str, config):
         return build_inference_cmd(config)
     elif proc_type == "slider_training":
         return build_slider_training_cmd(config)
+    elif proc_type == "rl_cache_rollouts":
+        return build_rl_cache_rollouts_cmd(config)
+    elif proc_type == "rl_train":
+        return build_rl_train_cmd(config)
     else:
         raise HTTPException(status_code=400, detail=f"Unknown type: {proc_type}")
 

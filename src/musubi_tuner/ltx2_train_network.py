@@ -3548,6 +3548,43 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
         self._latent_norm_base = (mean, std.reciprocal())
         self._latent_norm_cache.clear()
 
+    def prepare_forward_inputs(
+        self,
+        transformer,
+        args: argparse.Namespace,
+        *,
+        model_input,
+        model_timesteps,
+        text_embeds,
+        text_mask,
+        frame_rate,
+        audio_timestep=None,
+        transformer_options=None,
+    ):
+        """Assemble the exact ``(args, kwargs)`` passed to the DiT ``transformer(...)`` forward.
+
+        Single source of truth for the plain video / AV forward-input contract, shared by the
+        supervised ``call_dit`` path and the RL trainer — so the RL loop never hand-rolls
+        transformer inputs (which would silently desync token layout). Ensures fp8 weight
+        buffers are resident on-device; call this immediately before invoking the transformer.
+
+        Returns ``(forward_args, forward_kwargs)``; invoke as ``transformer(*forward_args, **forward_kwargs)``.
+        Scope: the plain T2V/AV forward boundary only. AV/IC/reference-conditioning *input*
+        construction is NOT factored here (deferred to its own slice).
+        """
+        if getattr(args, "fp8_base", False) or getattr(args, "fp8_scaled", False):
+            self._ensure_fp8_buffers_on_device(transformer)
+        forward_args = (model_input,)
+        forward_kwargs = {
+            "timestep": model_timesteps,
+            "audio_timestep": audio_timestep,
+            "context": text_embeds,
+            "attention_mask": text_mask,
+            "frame_rate": frame_rate,
+            "transformer_options": transformer_options,
+        }
+        return forward_args, forward_kwargs
+
     # ======== Training loop methods ========
 
     def call_dit(
@@ -5744,23 +5781,24 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                 resolved_transformer_options["audio_features"] = audio_features.to(device=accelerator.device, dtype=network_dtype)
             resolved_transformer_options["features_attention_mask"] = text_mask
 
-        if getattr(args, "fp8_base", False) or getattr(args, "fp8_scaled", False):
-            self._ensure_fp8_buffers_on_device(transformer)
+        forward_args, forward_kwargs = self.prepare_forward_inputs(
+            transformer,
+            args,
+            model_input=model_input,
+            model_timesteps=model_timesteps,
+            text_embeds=text_embeds,
+            text_mask=text_mask,
+            frame_rate=frame_rate,
+            audio_timestep=audio_timestep_for_model if audio_enabled_for_batch else None,
+            transformer_options=resolved_transformer_options,
+        )
         if is_ltx2_remote_stage_enabled(args):
             set_ltx2_remote_stage_cache_key(
                 transformer,
                 build_ltx2_remote_stage_cache_key(args, batch, timesteps=model_timesteps, noise=noise),
             )
         with accelerator.autocast():
-            model_pred = transformer(
-                model_input,
-                timestep=model_timesteps,
-                audio_timestep=audio_timestep_for_model if audio_enabled_for_batch else None,
-                context=text_embeds,
-                attention_mask=text_mask,
-                frame_rate=frame_rate,
-                transformer_options=resolved_transformer_options,
-            )
+            model_pred = transformer(*forward_args, **forward_kwargs)
 
         video_pred = model_pred
         audio_pred = None

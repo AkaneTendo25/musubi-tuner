@@ -109,6 +109,13 @@ Caching scripts (`ltx2_cache_latents.py`, `ltx2_cache_text_encoder_outputs.py`) 
   - [4b. Reference Mode](#4b-reference-mode)
   - [4c. IC-slider](#4c-ic-slider)
   - [Slider Tips](#slider-tips)
+- [5. Reinforcement-learning post-training (RL-LoRA)](#5-reinforcement-learning-post-training-rl-lora)
+  - [Overview](#overview)
+  - [How to use](#how-to-use)
+  - [Update rules](#update-rules)
+  - [The reward zoo](#the-reward-zoo)
+  - [Tips](#tips-1)
+  - [Writing a custom reward](#writing-a-custom-reward)
 - [Windows Setup / Update Script](#windows-setup--update-script)
   - [Dashboard Usage](#dashboard-usage)
 - [Appendix: Full-Parameter Fine-Tuning](#appendix-full-parameter-fine-tuning)
@@ -3032,7 +3039,7 @@ accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 ltx2_tr
   --lr_scheduler constant_with_warmup --lr_warmup_steps 20 ^
   --max_train_steps 500 ^
   --sample_audio_only ^
-  --output_dir output --output_name audio_energy_slider ^
+  --output_dir output --output_name audio_reference_slider ^
   --slider_config ltx2_slider_audio_reference.toml
 ```
 
@@ -3111,6 +3118,292 @@ Additional notes:
 - **Guidance strength**: For text-only mode, the default is `1.0`. Values of `2.0-3.0` increase direction strength but may reduce convergence stability.
 - **Multiple targets**: Text-only mode supports multiple `[[targets]]` blocks. Each step randomly selects one target, so all directions get trained evenly.
 - **Inference**: Use the trained LoRA with any multiplier value. Positive multipliers enhance the positive attribute, negative multipliers enhance the negative attribute. Values beyond `[-1, +1]` extrapolate the effect.
+
+---
+
+## 5. Reinforcement-learning post-training (RL-LoRA)
+<sub>[↑ contents](#table-of-contents)</sub>
+
+**Scripts:** `ltx2_cache_rollouts.py` (Phase A), `ltx2_train_rl.py` (Phase B), `ltx2_rl_rounds.py` (round-loop driver running both).
+
+> This is an **initial implementation** of RL post-training for LTX-2 LoRAs on consumer-level GPUs; interfaces and defaults may still change.
+
+> [!WARNING]
+> RL post-training for video generation is a young area — the methods this implementation builds on were published in 2025 ([Flow-GRPO](https://arxiv.org/abs/2505.05470), [DanceGRPO](https://arxiv.org/abs/2505.07818)) — and it inherits the long-documented practical realities of RL in general: results are sensitive to configuration (reward choice and weights, group size, learning rate, number of rounds); a reward is *maximized*, not *understood*, so it can be exploited instead of satisfied (reward hacking); training can pass its optimum and degrade in later rounds (pick the round by held-out score, not the last one); and a reward that barely separates the samples within a group produces noise, not signal. Expect to iterate on the setup rather than to get the target behavior from a single run.
+
+### Overview
+<sub>[↑ contents](#table-of-contents)</sub>
+
+A LoRA trained the usual, supervised way needs examples of the result you want. RL post-training removes that requirement: it needs only a **score**. The model generates candidate videos, each one gets a number from a reward function, and training pushes the model toward what scores higher. That makes it the tool for properties you can *measure* but cannot *collect a dataset of*: human preference, physical plausibility, audio-video sync, prompt adherence — any metric you can compute on a generated sample (see [Writing a custom reward](#writing-a-custom-reward)). The output is an ordinary LoRA file — this document calls it an **RL-LoRA**: a LoRA whose weights come from reward scores rather than from a supervised dataset. The name describes how the weights were obtained, not the file format; it loads anywhere a regular LTX-2 LoRA does.
+
+The learning loop: sample `K` rollouts per prompt with the current policy → score each with the reward → compare scores **within each prompt group**: samples above their group's mean get reinforced, samples below get pushed away (group-relative **GRPO** advantages, `(reward − group_mean) / (group_std + 1e-4)`) → update the LoRA, anchored to a frozen reference by a KL term so the policy cannot drift arbitrarily far.
+
+The starting LoRA is either fresh (no `--network_weights`; round 0 samples the bare base model) or an existing LoRA to refine. Either way RL reweights toward the better samples the current policy already produces — it **sharpens existing capability, it does not add new**. Two consequences: a group whose `K` samples score equally gives no signal (zero-variance groups are flagged and skipped — raise `K` or prompt diversity if many do), and the KL term keeps the policy near the base model (runaway KL = drift/collapse).
+
+**This implementation runs the loop as offline rollouts** — two separate processes instead of one:
+
+- **Phase A** (`ltx2_cache_rollouts.py`) — data collection and scoring. It generates `K` rollouts per prompt with the current LoRA, runs the selected rewards, and writes a disk cache plus the `old` snapshot LoRA that generated it. It does **not** update weights.
+- **Phase B** (`ltx2_train_rl.py`) — optimisation. It replays that exact cache, checks that the warm-start LoRA matches the cache's `old` snapshot, and applies the update rule (`--rl_loss`). In the offline path it does **not** call reward models again; it trains from the scores stored by Phase A.
+
+The generator, the reward models, and the training step therefore never share the GPU — one heavy model holds it at a time — which is what makes RL post-training fit consumer-level GPUs. An online (single-process) loop instead has to co-host all three at once: the generator's inference memory, every reward model, and the training step's gradients and optimizer state — pushing the requirement far past consumer cards. The decoupling buys more than VRAM:
+
+- the two phases can run on different GPUs, different machines, or different days;
+- one cache serves many experiments — switch between the `nft`/`rwr`/`dpo` update rules or their hyperparameters and retrain without regenerating anything (`ppo` instead needs a cache recorded with Phase-A `--rl_sde_sampler`); generation dominates the wall-clock, the training step is cheap;
+- rollouts and their scores sit on disk, so you can inspect what the reward is actually rewarding before spending any training compute;
+- an interrupted run loses at most one round — every round's cache and LoRA are ordinary files.
+
+The cache is tied to the snapshot that generated it; Phase B refuses a mismatched warm-start LoRA. The primary mode is a video LoRA; `--ltx2_mode av` generates video + audio and decodes both (audio via a subprocess vocoder) so audio/sync rewards can score (the file-based readers have dependency fallbacks — e.g. the stdlib wav module for audio when torchcodec is absent). An inline single-process mode (`--rl_online`) also exists, but it holds the generator, the rewards, and the training step on one GPU at once.
+
+You configure three independent things; everything else has defaults:
+
+1. **Reward** (`--reward_fn`) — what to optimise: the composable [reward zoo](#the-reward-zoo).
+2. **Update rule** (`--rl_loss`) — how advantages become gradients: `nft` (default), `rwr`, `dpo`, `ppo` — see [Update rules](#update-rules).
+3. **The round loop** — how many generate→train rounds, at what learning rate — see [How to use](#how-to-use) and [Tips](#tips-1).
+
+The design rests on four pieces:
+
+- **GRPO group-relative advantages** (developed by DeepSeek) — the learning signal comes from comparing the `K` samples within each group, so no value/critic model has to be trained or held in memory. The advantage scheme is always on and is not itself an update rule: the full DeepSeek "GRPO algorithm" is these advantages plus a PPO-clip loss — `--rl_loss ppo` here — while the default `nft` applies the same advantages through a negative-aware update;
+- **offline rollouts** — sample generation and reward scoring are decoupled from the training step, and rollouts are reusable files on disk;
+- **interchangeable update rules** over one cached-rollout contract — `nft` (negative-aware update, after DiffusionNFT), `rwr`, Diffusion-DPO, and trajectory-faithful PPO/DDPO can be swapped and compared on identical rollouts;
+- a **composable black-box reward zoo** — any computable per-sample metric can drive training, alone or in a weighted mix, with no paired dataset required.
+
+Algorithm papers are listed under [References](#references).
+
+### How to use
+<sub>[↑ contents](#table-of-contents)</sub>
+
+**1. Prerequisites.** The same LTX-2 checkpoint and Gemma as supervised training — no dataset is needed. Pick a reward from [the zoo](#the-reward-zoo) — install the extra deps listed at the top of its file (if any) and download its checkpoint (if model-backed) — or write your own metric and pass it via `--reward_plugins` (see [Writing a custom reward](#writing-a-custom-reward)).
+
+**2. Write a prompt file** (`rl_prompts.txt`) — 8–16 diverse prompts in the domain you are training, one per line.
+
+**3. Phase A — generate + score rollouts, write the cache:**
+
+```bash
+python ltx2_cache_rollouts.py ^
+  --ltx2_checkpoint /path/to/ltx-2.3.safetensors ^
+  --gemma_root /path/to/gemma ^
+  --fp8_base --fp8_scaled --blocks_to_swap 10 ^
+  --network_module networks.lora_ltx2 ^
+  --network_dim 16 --network_alpha 16 ^
+  --network_weights output/my_lora.safetensors ^
+  --rl_prompts rl_prompts.txt ^
+  --rl_group_size 8 ^
+  --reward_fn "hpsv3:1.0" ^
+  --reward_args checkpoint_path=/models/hpsv3 config_path=/models/hpsv3/config.json ^
+  --rl_rollout_cache output/rollouts_r0 ^
+  --rl_save_old_lora output/old_snapshot_r0.safetensors ^
+  --seed 42
+```
+
+`--rl_save_old_lora` writes the fp32 `old` snapshot that generated this cache; load it as `--network_weights` in Phase B so `default` starts exactly equal to `old` (the snapshot-hash invariant). `--network_weights` here is the LoRA being refined — omit it to start from the bare base model.
+
+**4. Phase B — replay the cache, update the LoRA:**
+
+```bash
+accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 ltx2_train_rl.py ^
+  --ltx2_checkpoint /path/to/ltx-2.3.safetensors ^
+  --gemma_root /path/to/gemma ^
+  --fp8_base --fp8_scaled --blocks_to_swap 10 --gradient_checkpointing ^
+  --network_module networks.lora_ltx2 ^
+  --network_dim 16 --network_alpha 16 ^
+  --network_weights output/old_snapshot_r0.safetensors ^
+  --rl_rollout_cache output/rollouts_r0 ^
+  --rl_loss nft ^
+  --learning_rate 2e-4 --optimizer_type AdamW8bit --max_grad_norm 1.0 ^
+  --output_dir output --output_name my_lora_rl_r0 ^
+  --seed 42
+```
+
+The result, `output/my_lora_rl_r0.safetensors`, is an ordinary LoRA file — usable as-is, or as the warm start for the next round. With `--logging_dir`, the per-step loss/policy/KL scalars are written to TensorBoard.
+
+Swap the update rule with `--rl_loss rwr|dpo` — nothing else changes; the same cache is reused. **`--rl_loss ppo`** (trajectory-faithful DDPO) instead needs a cache built with Phase-A `--rl_sde_sampler` (records the per-step trajectory):
+
+```bash
+# Phase A — add --rl_sde_sampler so the per-step SDE trajectory is cached (CFG stays off):
+python ltx2_cache_rollouts.py ... --reward_fn "hpsv3:1.0" ^
+  --rl_sde_sampler --rl_sde_eta 1.0 ^
+  --rl_rollout_cache output/rollouts_ppo_r0 --rl_save_old_lora output/old_ppo_r0.safetensors
+
+# Phase B — trajectory-faithful PPO on that cache:
+accelerate launch ... ltx2_train_rl.py ... --network_weights output/old_ppo_r0.safetensors ^
+  --rl_rollout_cache output/rollouts_ppo_r0 --rl_loss ppo --rl_sde_eta 1.0 --ppo_clip_eps 0.2
+```
+
+**5. The round loop.** RL proceeds in rounds: *generate → train → warm-start the next round from the new LoRA*. `ltx2_rl_rounds.py` runs the whole loop from one command — pass it the union of the Phase A and Phase B arguments (each flag is forwarded to the phase that owns it) plus `--rl_rounds`:
+
+```bash
+python ltx2_rl_rounds.py <the Phase A and Phase B arguments from above> ^
+  --rl_rounds 10 ^
+  --output_dir output --output_name my_lora_rl ^
+  --rl_heldout_prompts heldout_prompts.txt   # optional evaluation/model selection
+```
+
+Omit `--rl_rollout_cache` / `--rl_save_old_lora` — the driver sets them per round and wires the warm-start/`old`-snapshot chain itself; `--network_weights` (optional) is the LoRA round 1 starts from. Rounds land in `output/my_lora_rl_rounds/round_NN/` (cache, `old` snapshot, the round's LoRA), and `progress.log` collects every `ROUND_REWARD`; the same per-round train/held-out reward curves are also written as TensorBoard scalars to `output/my_lora_rl_rounds/tb`. Re-running the same command resumes: finished rounds are skipped. `--rl_heldout_prompts` is optional: it does not affect the loss, but scores the starting point and each round's LoRA on fixed-seed prompts that were not used for training, so you can detect reward hacking/collapse and pick the round at the held-out peak (see [Tips](#tips-1)). `--rl_delete_round_caches` reclaims disk after each round.
+
+The round driver is the recommended automated path. After the initial command, it repeats this chain without user intervention:
+
+```text
+round N Phase A: generate and score rollouts with the current LoRA, save cache + old.safetensors
+round N Phase B: train from that exact old.safetensors on that exact cache, save output_name_rNN.safetensors
+round N+1: use output_name_rNN.safetensors as the warm start for the next rollout generation
+```
+
+Do not pass a per-round cache path to `ltx2_rl_rounds.py`; doing so is managed internally so the cache, `old` snapshot, and warm-start LoRA cannot drift apart. If the process stops, run the same command again: completed round LoRAs are skipped, and the next missing round continues from the latest completed LoRA.
+
+Driving the phases manually works too. Because `old` is frozen per cache, advance the behavior policy by regenerating the cache rather than training many passes over a stale one:
+
+```text
+round 0:  Phase A (--network_weights my_lora.safetensors    --rl_save_old_lora old_r0)  -> cache_r0
+          Phase B (--network_weights old_r0 --rl_rollout_cache cache_r0)                -> my_lora_rl_r0
+round 1:  Phase A (--network_weights my_lora_rl_r0           --rl_save_old_lora old_r1) -> cache_r1
+          Phase B (--network_weights old_r1 --rl_rollout_cache cache_r1)                -> my_lora_rl_r1
+...
+```
+
+Any round's Phase-B output is an RL-LoRA you can ship. If you enabled held-out scoring, pick the held-out peak; otherwise choose by visual review and any external evaluation you trust (see [Tips](#tips-1)).
+
+### Update rules
+<sub>[↑ contents](#table-of-contents)</sub>
+
+`nft`/`rwr`/`dpo` consume the **same** cached rollouts, the same GRPO advantages, and the same three-forward `states` dict (`fwd`/`old`/`ref`/`x0`); only the final loss differs. `ppo` (trajectory-faithful DDPO) instead reads the per-step trajectory recorded by Phase-A `--rl_sde_sampler`. Switch with `--rl_loss` (`ltx2_rl_objectives.py`):
+
+| `--rl_loss` | What it does | Key flags |
+|---|---|---|
+| `nft` *(default)* | Negative-aware fine-tuning: reinforce high-advantage samples, push away from low ones. | `--nft_beta_mix`, `--nft_adv_clip_max` |
+| `rwr` | Advantage-weighted regression: pull each sample toward its own clean `x0`, weighted by advantage. | `--rwr_temperature` |
+| `dpo` | Diffusion-DPO on each group's best vs worst sample (preference; reward only ranks). | `--dpo_beta` |
+| `ppo` | Trajectory-faithful DDPO: exact per-step importance ratio. Needs a Phase-A `--rl_sde_sampler` cache; run with CFG off. | `--ppo_clip_eps`, `--rl_sde_eta` |
+
+`nft`/`rwr`/`ppo` add a KL term to the frozen reference (`--nft_kl_beta`, default `1e-4`); `dpo` is its own anchor. Start with `nft`.
+
+### The reward zoo
+<sub>[↑ contents](#table-of-contents)</sub>
+
+Rewards are **composable plugins** (`ltx2_rewards/`). Each plugin declares three things: a `score(samples) -> ([float per sample], info)` method (always higher-is-better — any inversion such as desync→`1/(1+d)` is applied inside `score`), an explicit **`route`** (`video` | `audio` | `sync`), and a **`needs`** set of per-sample inputs (e.g. `{"video"}`, `{"audio_waveform"}`) that tells the generator which media to decode for scoring.
+
+Select rewards with `--reward_fn "name:weight,name2:weight2,..."` (a bare `name` defaults to weight `1.0`). Built-in user-facing rewards:
+
+| Reward | Route | What it scores | Source |
+|--------|-------|----------------|--------|
+| `hpsv3` | video | Frame-quality / human-preference (vendored Qwen2-VL) | MizzenAI HPSv3, via OmniNFT reward series |
+| `videoreward` | video | VideoAlign visual-quality / motion-quality / text-alignment | KwaiVGI VideoAlign, via OmniNFT reward series |
+| `videoscore2` | video | VideoScore2 VLM judge (VQ / TA / PC); `--reward_args dims=pc` selects its **Physical/common-sense Consistency** head | TIGER-Lab VideoScore2 |
+| `iqa_quality` | video | No-reference frame IQA detail/quality via IQA-PyTorch; default `topiq_nr` | TOPIQ/LIQE/MUSIQ/etc. through IQA-PyTorch |
+| `anti_noise` | video | Guardrail for detail rewards: penalizes flat-area speckle and temporal high-frequency flicker | in-repo |
+| `clap` | audio | CLAP audio–text similarity | LAION CLAP, via OmniNFT reward series |
+| `audiobox` | audio | Audiobox-Aesthetics audio quality (fully vendored) | Meta Audiobox-Aesthetics, via OmniNFT reward series |
+| `av_align` | sync | Algorithmic AV peak-IoU onset alignment | AV-Align (Yariv et al.), via OmniNFT reward series |
+| `av_desync` | sync | Synchformer AV desync, scored as `1/(1+d)` | Synchformer, via OmniNFT reward series |
+| `imagebind` | sync | ImageBind multimodal similarity | Meta ImageBind, via OmniNFT reward series |
+
+- **Routing.** `video` rewards drive the video branch, `audio` the audio branch, `sync` both. `audio`/`sync` rewards require `--ltx2_mode av`.
+- **Composition.** Combine rewards with weights — GRPO normalises each within its group, so different raw scales mix fine. Example: `--reward_fn "hpsv3:1.0,videoreward:0.5"`. When a low-level reward (e.g. `iqa_quality`) can be satisfied by adding high-frequency noise, pair it with the `anti_noise` guardrail and a learned visual-quality reward; over-weighting `anti_noise` prefers smooth/flat video.
+- **Physics.** Use the learned `videoscore2 dims=pc` head for semantic physical commonsense (gravity, collisions, object permanence). A frame statistic cannot tell that a ball should fall down.
+
+Reward model code is vendored (`ltx2_rewards/vendor/`), but the runtime libraries of the model-backed rewards are **not** installed with this package — each reward file lists its own `pip install` line at the top of its docstring (`iqa_quality` → `pyiqa`; `hpsv3`/`videoreward`/`videoscore2` → `qwen-vl-utils` (+`peft` for `videoreward`); `imagebind` → `ftfy regex`; `av_align`/`imagebind` have optional exact-parity extras). Checkpoints come from [`huggingface.co/zghhui/OmniNFT-Reward-Series`](https://huggingface.co/zghhui/OmniNFT-Reward-Series) where applicable; pull only the rewards your `--reward_fn` uses.
+
+### Tips
+<sub>[↑ contents](#table-of-contents)</sub>
+
+- **Prompts / K.** 8–16 diverse prompts at `K = --rl_group_size` 8 is a working scale. Small `K` gets more groups excluded for zero variance; more diverse prompts reduce those exclusions.
+- **Learning rate.** Start at `2e-4` with rank 16. Collapse shows as a falling held-out reward (over-optimization) — lower the LR if seen.
+- **Gains are gradual**, bounded by what the policy already sometimes produces. A weak or saturated reward, or too few rounds/prompts, may not move it.
+- **Judge by held-out when possible, not by the train reward.** For serious runs, score a fixed-seed **held-out** prompt set between rounds — the train-side reward can climb while the policy degenerates.
+- **Keep the peak round, not the last one.** Learned rewards can climb for a stretch and then collapse — every round's LoRA is saved, so pick the one at the held-out peak.
+- **Check for hacking.** A composite can be gamed. Pair a low-level objective with a guardrail (e.g. `anti_noise`) and a learned visual-quality reward, score the final RL-LoRA on rewards it was **not** trained on, and look at the samples.
+- **Watch:** `ROUND_REWARD` should trend up across rounds; the `policy` term should fall within a round; `kl` should stay small and finite (rising KL means the policy is drifting from the reference).
+
+### Writing a custom reward
+<sub>[↑ contents](#table-of-contents)</sub>
+
+Custom rewards are the reward-design part of RL-LoRA. The reward becomes the language you use to describe the model behavior you want: a detail reward can pull toward richer frames, an anti-noise reward can keep that detail from turning into speckle, a preference model can anchor overall visual quality, and a motion reward can discourage frozen outputs. You are not limited to one score — `--reward_fn` lets you compose several rewards with weights. The creative, testable work is finding a combination whose optimum matches the behavior you actually want.
+
+That freedom still needs discipline. Any metric you can compute per sample can be a reward, and it does not have to be differentiable, because the update never backpropagates through `score()`: GRPO only compares the `K` scores within a group. But the policy maximizes the number you wrote, not the intent behind it (*reward hacking* — e.g. a consistency metric alone is maximized by a frozen frame); check a trained LoRA against rewards it was **not** trained on. And a metric that scores a group's samples identically (binary or rarely-triggering checks) produces zero-variance groups, which are excluded — no learning signal; prefer dense scores over pass/fail thresholds.
+
+A reward is a small plugin satisfying the `Reward` interface (`ltx2_rewards/registry.py`). It exposes:
+
+- **`score(samples) -> ([float per sample], info)`** — must be higher-is-better (apply any inversion such as `1/(1+distance)` here);
+- a **`route`** (`"video"` | `"audio"` | `"sync"`) — which branch the advantage feeds;
+- a **`needs`** frozenset of per-sample keys the generator must provide (declaring `"video"` or `"audio_waveform"` makes the generator decode that media for scoring);
+- optional `setup(device, **reward_args)` / `teardown()` to load and free a model (called once each, never co-resident with another reward or the DiT).
+
+Register it with the `@register_reward("<name>")` decorator, then select it with `--reward_fn "<name>:<weight>"`. Two ways to make the file importable:
+
+- **Drop-in (no repo edit):** keep the `.py` file anywhere and pass `--reward_plugins path/to/my_reward.py` to Phase A — it is imported before `--reward_fn` is parsed, so the name is usable immediately. With `ltx2_rl_rounds.py`, pass the same flag to the round driver; it forwards the plugin to Phase A and held-out scoring. If you train from an already-created offline rollout cache, the plugin must have been used when that cache was generated, because Phase B replays the stored rewards. Import from the installed package: `from musubi_tuner.ltx2_rewards import BaseReward, register_reward`.
+- **Built-in:** place the file in `ltx2_rewards/zoo/` and add one import line in `ltx2_rewards/zoo/__init__.py`.
+
+GRPO advantages, the rollout cache, the loss, VRAM-sequenced setup/teardown, and routing all happen automatically. This complete `saturation.py` plugin is a useful calibration example: it is intentionally simple, dense, and easy to verify visually. It rewards more vivid color, so it is not a general quality objective, but it proves that custom reward loading, scoring, GRPO grouping, and LoRA updates are wired correctly.
+
+```python
+from __future__ import annotations
+
+from typing import List, Tuple
+
+from musubi_tuner.ltx2_rewards import BaseReward, register_reward
+
+
+def _mean_saturation(video, num_frames: int = 5) -> float:
+    import torch
+
+    # Decoded videos are usually [C,T,H,W]; some callers keep a leading batch dim.
+    t = video[0] if video.dim() == 5 else video
+    if t.dim() != 4:
+        raise ValueError(f"saturation: expected decoded video [C,T,H,W], got {tuple(video.shape)}")
+    # Reward code does not need gradients. Move to CPU to keep GPU memory for generation/training.
+    t = t.detach().to("cpu", torch.float32).clamp(0.0, 1.0)
+    c, frames, _h, _w = t.shape
+    if c < 3:
+        return 0.0
+
+    rgb = t[:3]
+    # Score a small uniform frame sample; dense enough for a demo, cheap enough for rollouts.
+    frame_count = min(int(num_frames), frames)
+    idx = [round(i * (frames - 1) / max(1, frame_count - 1)) for i in range(frame_count)]
+    values = []
+    for f in idx:
+        frame = rgb[:, f]
+        # HSV saturation for RGB can be computed from per-pixel channel max/min.
+        cmax = frame.max(dim=0).values
+        cmin = frame.min(dim=0).values
+        values.append(float(((cmax - cmin) / (cmax + 1e-6)).mean()))
+    return sum(values) / len(values) if values else 0.0
+
+
+@register_reward("saturation")
+class SaturationReward(BaseReward):
+    kind = "blackbox"
+    # route/needs tell the rollout code to decode video and route advantages to the video branch.
+    route = "video"
+    needs = frozenset({"video"})
+
+    def __init__(self) -> None:
+        self._num_frames = 5
+
+    def setup(self, device, *, num_frames=5, **_ignored) -> None:
+        # Values passed through --reward_args are delivered here once before scoring.
+        self._num_frames = int(num_frames)
+
+    def score(self, samples: List[dict]) -> Tuple[List[float], dict]:
+        # Return exactly one higher-is-better scalar per generated sample.
+        scores = []
+        for sample in samples:
+            video = sample.get("video")
+            scores.append(_mean_saturation(video, self._num_frames) if video is not None else 0.0)
+        return scores, {"reward": "saturation", "num_frames": self._num_frames}
+```
+
+Use it as a drop-in file:
+
+```bash
+python ltx2_rl_rounds.py ... ^
+  --reward_plugins path/to/saturation.py ^
+  --reward_fn "saturation:1.0" ^
+  --reward_args num_frames=5
+```
+
+The NFT update and several of the reward checkpoints derive from [OmniNFT](https://github.com/zghhui/OmniNFT), a DiffusionNFT-based AV RL project; algorithm references are listed under [References](#references).
+
+RL post-training is a large and fast-moving field, and what is implemented here covers a small part of it.
 
 ---
 
@@ -3303,11 +3596,15 @@ Every training step still runs the full transformer forward through all blocks a
 
 Inactive block parameters are frozen with `requires_grad=False`, and their optimizer state can be purged at block switches. The frozen blocks remain part of the transformer computation. For a step with active block `k`, the full model runs forward; later operations are still needed by autograd so gradients can reach block `k`, while frozen parameters do not receive parameter gradients. As a result, BAdam `s/step` values are full-model training-step timings for the active-block schedule.
 
-With `switch_block_every=25` on the measured 48-block LTX-2.3 transformer, the optimizer trains one block group for 25 steps, then advances to the next group. A 100-step benchmark covers four sequential block windows. One pass over the 48 block groups takes 1,200 steps. This schedule lowers active gradient and optimizer-state memory. It also means a given block is updated less often than in dense Adafactor, where every trainable tensor receives an update every optimizer step.
+With `switch_block_every=25` on the measured 48-block LTX-2.3 transformer, the optimizer trains one block group for 25 steps, then advances to the next group. With `block_group_size=1`, a 100-step benchmark covers four sequential block windows and one pass over the 48 block groups takes 1,200 steps. This schedule lowers active gradient and optimizer-state memory. It also means a given block is updated less often than in dense Adafactor, where every trainable tensor receives an update every optimizer step.
 
-**Technical tradeoffs**. BAdam reduces active optimizer and gradient state by updating only the active block window. A full block sweep takes many optimizer steps, so learning is distributed over the model more slowly than dense Adafactor. In the LTX-2.3 long runs measured for this section, BAdam reached a loss plateau and reduced loss more slowly than Adafactor. The [BREAD paper](https://openreview.net/pdf?id=zs6bRl05g8) analyzes suboptimal landscapes in block-coordinate LLM fine-tuning and proposes inactive-block correction as a mitigation.
+`block_group_size` controls how many consecutive inferred transformer blocks are placed into one active BAdam group. `block_group_size=1` gives the lowest active gradient/optimizer-state memory. Larger values such as `2`, `4`, or `8` train more blocks at once, use more VRAM, reduce the number of block windows per full sweep, and move the run closer to dense full-parameter fine-tuning. This is the main BAdam quality/speed/VRAM tradeoff: if full dense fine-tuning fits, BAdam is usually unnecessary; if dense training does not fit, increase `block_group_size` until you hit your VRAM budget.
 
-BREAD-SGD is available here for convergence experiments, not as a confirmed fix for LTX-2.3. In the measured LTX-2.3 runs, memory-bounded BREAD did not remove the observed BAdam plateau behavior. `bread_sgd_mode=all` applies the BREAD correction to all inactive parameters and has the highest extra memory cost. `bread_sgd_mode=partial` applies it only to downstream block groups that already sit on the backward path after the active block. `bread_sgd_mode=window` bounds that correction to `bread_sgd_window_blocks` downstream block groups. The `partial` and `window` modes reduce extra weight-gradient pressure compared with `all`, but they still need quality and convergence validation.
+When `use_fp32_active_copy=True` (the recommended memory-safe path), keep `reset_state_on_switch=True`. The base optimizer state is attached to temporary fp32 copies of the active block parameters; this implementation does not remap Adam state from one active window to the next.
+
+**Technical tradeoffs**. BAdam reduces active optimizer and gradient state by updating only the active block window. It does not remove the dense base weights, and it still runs the full transformer computation every step. A full block sweep takes many optimizer steps, so learning is distributed over the model more slowly than dense Adafactor. In the LTX-2.3 long runs measured for this section, BAdam reached a loss plateau and reduced loss more slowly than Adafactor. For LTX-2.3 FFT, treat BAdam as an experimental low-VRAM fallback, not the preferred path; prefer dense Adafactor when it fits, or Q-GaLore/QAPOLLO/int8-weight training for 24 GB-class video-only experiments. The [BREAD paper](https://openreview.net/pdf?id=zs6bRl05g8) analyzes suboptimal landscapes in block-coordinate LLM fine-tuning and proposes inactive-block correction as a mitigation.
+
+BREAD-SGD is available here for convergence experiments, not as a confirmed fix for LTX-2.3. The in-repo path is a lightweight BREAD-SGD-style correction implemented through post-accumulate gradient hooks, so treat it as an ablation rather than a validated replacement for dense FFT. In the measured LTX-2.3 runs, memory-bounded BREAD did not remove the observed BAdam plateau behavior. `bread_sgd_mode=all` applies the correction to all inactive parameters and has the highest extra memory cost. `bread_sgd_mode=partial` applies it only to downstream block groups that already sit on the backward path after the active block. `bread_sgd_mode=window` bounds that correction to `bread_sgd_window_blocks` downstream block groups. The `partial` and `window` modes reduce extra weight-gradient pressure compared with `all`, but they still need quality and convergence validation.
 
 References: [BAdam paper](https://arxiv.org/abs/2404.02827), [BREAD paper](https://openreview.net/forum?id=zs6bRl05g8), [BlockOptimizers implementation](https://github.com/microsoft/BlockOptimizers).
 
@@ -3329,7 +3626,7 @@ accelerate launch --num_processes 1 --num_cpu_threads_per_process 1 --mixed_prec
   --blocks_to_swap 0 \
   --learning_rate 1e-5 \
   --optimizer_type BAdam \
-  --optimizer_args base_optimizer_type=AdamW8bit switch_block_every=25 switch_mode=ascending include_non_block=True use_fp32_active_copy=True purge_inactive_state=True reset_state_on_switch=True use_gradient_release=True \
+  --optimizer_args base_optimizer_type=AdamW8bit switch_block_every=25 switch_mode=ascending block_group_size=2 include_non_block=True use_fp32_active_copy=True purge_inactive_state=True reset_state_on_switch=True use_gradient_release=True \
   --max_grad_norm 1.0 \
   --lr_scheduler constant_with_warmup \
   --lr_warmup_steps 500 \
@@ -3349,7 +3646,7 @@ Memory-bounded BREAD-SGD ablation, for convergence experiments only:
 --optimizer_args base_optimizer_type=AdamW8bit switch_block_every=25 switch_mode=descending include_non_block=True use_fp32_active_copy=True purge_inactive_state=True reset_state_on_switch=True use_gradient_release=True bread_sgd=True bread_sgd_mode=window bread_sgd_window_blocks=1 bread_sgd_lr_scale=5.0
 ```
 
-Measured BAdam full-parameter benchmark matrix on the exact-resolution cached video subset used for the BAdam/Q-GaLore/QAPOLLO sweeps. It used bf16 model weights, gradient checkpointing, FlashAttention, BAdam with bitsandbytes AdamW8bit, `switch_block_every=25`, `include_non_block=True`, `use_fp32_active_copy=True`, `purge_inactive_state=True`, `reset_state_on_switch=True`, `use_gradient_release=True`, and no block swapping.
+Measured BAdam full-parameter benchmark matrix on the exact-resolution cached video subset used for the BAdam/Q-GaLore/QAPOLLO sweeps. It used bf16 model weights, gradient checkpointing, FlashAttention, BAdam with bitsandbytes AdamW8bit, `switch_block_every=25`, `block_group_size=1`, `include_non_block=True`, `use_fp32_active_copy=True`, `purge_inactive_state=True`, `reset_state_on_switch=True`, `use_gradient_release=True`, and no block swapping.
 Each row is `peak VRAM / median s per optimizer step`; `OOM (>80 GB)` means the configuration OOMed. These timings do not measure full-model convergence rate because BAdam updates only the active block window.
 
 | Resolution | Frames | video | av | v2v | v2v_av |
@@ -3677,6 +3974,15 @@ For longer runs, start with video-only short-context training until checkpoint s
 - [G2D (arXiv 2506.21514)](https://arxiv.org/abs/2506.21514) — Sequential Modality Prioritization inspiration for modality freezing
 - [UniAVGen (arXiv 2511.03334)](https://arxiv.org/abs/2511.03334) — Joint audio-video generation reference for lower-LR AV training guidance
 - [Harmony (arXiv 2511.21579)](https://arxiv.org/abs/2511.21579) — Cross-Task Synergy; basis for `--cts_lambda_video_driven` and `--cts_lambda_audio_driven`
+- [OmniNFT](https://github.com/zghhui/OmniNFT) — DiffusionNFT-based audio-video RL project; initial reference for the NFT update lineage and several reward checkpoints
+- [DeepSeekMath / GRPO (arXiv 2402.03300)](https://arxiv.org/abs/2402.03300) — Shao et al.; group-relative policy optimization, the basis for the per-prompt group-relative advantages
+- [Flow-GRPO (arXiv 2505.05470)](https://arxiv.org/abs/2505.05470) — Online policy-gradient RL for flow-matching models via ODE→SDE conversion; background for the `--rl_sde_sampler` trajectory sampling
+- [DanceGRPO (arXiv 2505.07818)](https://arxiv.org/abs/2505.07818) — GRPO applied across visual generation paradigms including video models; field background for video RL
+- [DDPO (arXiv 2305.13301)](https://arxiv.org/abs/2305.13301) — Black et al., "Training Diffusion Models with Reinforcement Learning"; policy-gradient RL for diffusion samplers background for the `ppo` rule
+- [DPOK (arXiv 2305.16381)](https://arxiv.org/abs/2305.16381) — Fan et al.; KL-regularized RL fine-tuning of diffusion models background for the KL-anchored update
+- [Diffusion-DPO (arXiv 2311.12908)](https://arxiv.org/abs/2311.12908) — Wallace et al.; basis for the `dpo` (`--rl_loss dpo`) preference update
+- [PPO (arXiv 1707.06347)](https://arxiv.org/abs/1707.06347) — Schulman et al., "Proximal Policy Optimization Algorithms"; basis for the clipped-ratio objective in the `ppo` rule
+- RWR — Peters & Schaal (2007), "Reinforcement learning by reward-weighted regression" (ICML); basis for the `rwr` (`--rl_loss rwr`) update
 
 **LTX Resources**
 - [LTX-2](https://github.com/Lightricks/LTX-2) — LTX-2/2.3 model and pipeline resources

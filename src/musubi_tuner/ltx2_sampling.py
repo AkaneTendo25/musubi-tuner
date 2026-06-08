@@ -988,6 +988,13 @@ class LTX2SamplingMixin:
         if hasattr(self._text_encoder, "feature_extractor_linear"):
             self._text_encoder.feature_extractor_linear = None
         self._text_encoder = None
+        # The HF Gemma model holds cyclic references, so dropping the Python names above is NOT
+        # enough to release its (~20 GB) CUDA tensors — empty_cache() only returns already-free
+        # blocks. A generational GC pass is required to actually collect it before the next big
+        # model (e.g. the DiT) is moved onto the GPU. Without this, generation peaks ~20 GB higher.
+        import gc
+
+        gc.collect()
         if accelerator.device.type == "cuda":
             torch.cuda.empty_cache()
 
@@ -2257,8 +2264,19 @@ class LTX2SamplingMixin:
         ref_audio_latents: Optional[torch.Tensor] = None,
         latent_idx_guides: Optional[List[Any]] = None,
         keyframe_guides: Optional[List[Any]] = None,
+        return_latents: bool = False,
+        rl_trajectory_sink: Optional[List[Dict[str, Any]]] = None,
     ):
-        """Generate sample video during training using LTX-2 denoising loop"""
+        """Generate sample video during training using LTX-2 denoising loop.
+
+        When ``return_latents`` is True, also return the clean generated latents + the real sigma
+        schedule as ``(video, audio_waveform, video_x0, audio_x0, sigmas)`` — the NFT regression
+        targets in model latent space (``video_x0`` = the final denoised ``latents``; ``audio_x0`` =
+        ``audio_latents`` or None) and the actual shifted/preset schedule the rollout was denoised
+        with (so Phase B re-noises at the timesteps the model really visited). Used by the RL rollout
+        generator. Default False preserves the ``(video, audio_waveform)`` contract for all existing
+        callers.
+        """
         from musubi_tuner.ltx_2.types import AudioLatentShape, VideoPixelShape
 
         transformer_device = next(transformer.parameters()).device
@@ -2918,6 +2936,15 @@ class LTX2SamplingMixin:
             sampler_name = "euler"
         logger.info("Sampling sampler: %s", sampler_name)
 
+        # Authentic-PPO (DDPO) rollout: replace the deterministic video step with a stochastic SDE step
+        # and record the per-step (x_t -> x_next, sigma) trajectory so Phase B can score the exact
+        # per-step log-prob ratio. Gated by --rl_sde_sampler AND a sink being supplied (RL generator
+        # only); otherwise the deterministic sampler below is untouched. See ltx2_rl_sde.
+        _rl_sde = bool(getattr(args, "rl_sde_sampler", False)) and rl_trajectory_sink is not None
+        _rl_sde_eta = float(getattr(args, "rl_sde_eta", 1.0))
+        if _rl_sde:
+            from musubi_tuner.ltx2_rl_sde import sde_step as _rl_sde_step
+
         def _predict_video_x0_res2s(video_state: torch.Tensor, sigma_value: torch.Tensor) -> torch.Tensor:
             latent_input = torch.cat([video_state, video_state], dim=0) if do_classifier_free_guidance else video_state
             latent_input = latent_input.to(dtype=dit_dtype)
@@ -3414,7 +3441,25 @@ class LTX2SamplingMixin:
                 # --- Video: denoise mask blend + Euler step + hard-lock ---
                 if denoise_mask is not None and clean_latent is not None:
                     video_x0 = video_x0 * denoise_mask + clean_latent * (1.0 - denoise_mask)
-                if sampler_name == "res_2s":
+                if _rl_sde:
+                    # Stochastic SDE step (DDPO): action x_next ~ N(mean(x0), (sigma_next*eta)^2). Record
+                    # (x_t, x_next, x0_gen, sigma, sigma_next) on CPU; Phase B scores the exact per-step
+                    # importance ratio at this action. At eta=0 this equals the deterministic Euler step.
+                    x_next, _sde_mean, _sde_std = _rl_sde_step(
+                        latents, video_x0, sigmas[step_idx], sigmas[step_idx + 1], _rl_sde_eta, generator=generator
+                    )
+                    rl_trajectory_sink.append(
+                        {
+                            "x_t": latents.detach().to("cpu", torch.float32),
+                            "x_next": x_next.detach().to("cpu", torch.float32),
+                            # x0 prediction that produced this step's action = the Phase-B behavior policy pi_old.
+                            "x0_gen": video_x0.detach().to("cpu", torch.float32),
+                            "sigma": float(sigmas[step_idx]),
+                            "sigma_next": float(sigmas[step_idx + 1]),
+                        }
+                    )
+                    latents = x_next
+                elif sampler_name == "res_2s":
                     midpoint = res2s_midpoint(latents, video_x0, sigmas[step_idx], sigmas[step_idx + 1])
                     if midpoint is None:
                         latents = video_x0
@@ -3429,9 +3474,21 @@ class LTX2SamplingMixin:
                 if denoise_mask is not None and clean_latent is not None:
                     latents = latents * denoise_mask + clean_latent * (1.0 - denoise_mask)
 
-                # --- Audio: Euler step ---
+                # --- Audio: Euler step (or SDE step + trajectory for authentic AV PPO) ---
                 if audio_x0 is not None and audio_latents is not None:
-                    audio_latents = stepper.step(audio_latents, audio_x0, sigmas, step_idx)
+                    if _rl_sde:
+                        a_next, _am, _astd = _rl_sde_step(
+                            audio_latents, audio_x0, sigmas[step_idx], sigmas[step_idx + 1], _rl_sde_eta, generator=generator
+                        )
+                        if rl_trajectory_sink:
+                            # attach to THIS step's entry (appended by the video branch above) so the
+                            # audio + video actions stay aligned at the same denoise step + sigma.
+                            rl_trajectory_sink[-1]["audio_x_t"] = audio_latents.detach().to("cpu", torch.float32)
+                            rl_trajectory_sink[-1]["audio_x_next"] = a_next.detach().to("cpu", torch.float32)
+                            rl_trajectory_sink[-1]["audio_x0_gen"] = audio_x0.detach().to("cpu", torch.float32)
+                        audio_latents = a_next
+                    else:
+                        audio_latents = stepper.step(audio_latents, audio_x0, sigmas, step_idx)
 
         # Free I2V conditioning tensors to reclaim memory before VAE decode
         if denoise_mask is not None or clean_latent is not None:
@@ -3562,6 +3619,16 @@ class LTX2SamplingMixin:
         vae.to_device(original_vae_device)
         vae.to_dtype(original_vae_dtype)
 
+        if return_latents:
+            # clean generated latents (model latent space) = the NFT regression targets
+            video_x0 = latents.detach() if isinstance(latents, torch.Tensor) else None
+            audio_x0 = audio_latents.detach() if isinstance(audio_latents, torch.Tensor) else None
+            # Also return the ACTUAL sigma schedule this rollout was denoised with (the real
+            # shifted/preset schedule from build_ltx2_sigmas), so Phase B re-noises the NFT target at
+            # timesteps the model genuinely visited — not a placeholder linspace. Only the RL rollout
+            # generator passes return_latents=True, so this 5-tuple does not affect any other caller.
+            real_sigmas = sigmas.detach().to("cpu", torch.float32) if isinstance(sigmas, torch.Tensor) else None
+            return video, audio_waveform, video_x0, audio_x0, real_sigmas
         return video, audio_waveform
 
     def _do_v2v_denoising(

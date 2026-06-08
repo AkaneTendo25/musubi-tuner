@@ -2264,6 +2264,196 @@ def build_slider_training_cmd(config: ProjectConfig) -> list[str]:
     return cmd
 
 
+def _rl_common_model_args(config: ProjectConfig) -> list[str]:
+    """Model + LoRA + memory args shared by both RL phases (inherited from training config).
+
+    Mirrors the slider builder: RL is a standalone driver that reuses the supervised
+    setup, so model/precision/network/memory all come from ``config.training``.
+    """
+    t = config.training
+    ltx2_checkpoint = _effective_ltx2_checkpoint(config, t.ltx2_checkpoint)
+    gemma_safetensors = _effective_gemma_safetensors(config, t.gemma_safetensors)
+    gemma_root = _effective_gemma_root(config, t.gemma_root, gemma_safetensors)
+    network_module = _effective_network_module(t.network_module or "")
+
+    args: list[str] = ["--ltx2_checkpoint", ltx2_checkpoint]
+    if gemma_root:
+        args += ["--gemma_root", gemma_root]
+    if gemma_safetensors:
+        args += ["--gemma_safetensors", gemma_safetensors]
+    if t.ltx2_mode:
+        args += ["--ltx2_mode", t.ltx2_mode]
+    args += ["--network_module", network_module]
+    if t.network_dim is not None:
+        args += ["--network_dim", str(t.network_dim)]
+    if t.network_alpha != 1:
+        args += ["--network_alpha", str(t.network_alpha)]
+    if t.lora_target_preset:
+        args += ["--lora_target_preset", t.lora_target_preset]
+    # warm-start LoRA: Phase A `old` snapshot; Phase B `default`==`old` snapshot (the cache invariant)
+    if t.network_weights:
+        args += ["--network_weights", t.network_weights]
+    if t.fp8_base:
+        args.append("--fp8_base")
+    if t.fp8_scaled:
+        args.append("--fp8_scaled")
+    if getattr(t, "fp8_keep_blocks", ""):
+        args += ["--fp8_keep_blocks", t.fp8_keep_blocks]
+    if t.flash_attn:
+        args.append("--flash_attn")
+    if t.gemma_load_in_8bit:
+        args.append("--gemma_load_in_8bit")
+    if t.gemma_load_in_4bit:
+        args.append("--gemma_load_in_4bit")
+    if t.gemma_fp8_weight_offload:
+        args.append("--gemma_fp8_weight_offload")
+    else:
+        args.append("--no-gemma_fp8_weight_offload")
+    if t.blocks_to_swap is not None:
+        args += ["--blocks_to_swap", str(t.blocks_to_swap)]
+    if t.use_pinned_memory_for_block_swap:
+        args.append("--use_pinned_memory_for_block_swap")
+    if t.gradient_checkpointing:
+        args.append("--gradient_checkpointing")
+    if t.seed is not None:
+        args += ["--seed", str(t.seed)]
+    return args
+
+
+def _rl_sample_dim_args(rl) -> list[str]:
+    """Sample-dimension flags shared by Phase A and Phase B (online)."""
+    args: list[str] = []
+    if rl.sample_width != 768:
+        args += ["--sample_width", str(rl.sample_width)]
+    if rl.sample_height != 512:
+        args += ["--sample_height", str(rl.sample_height)]
+    if rl.sample_frames != 49:
+        args += ["--sample_frames", str(rl.sample_frames)]
+    if rl.sample_cfg != 1.0:
+        args += ["--sample_cfg", str(rl.sample_cfg)]
+    if rl.sample_steps != 20:
+        args += ["--sample_steps", str(rl.sample_steps)]
+    return args
+
+
+def _rl_reward_args(rl) -> list[str]:
+    """Reward-spec flags shared by both phases."""
+    args = ["--reward_fn", rl.reward_fn]
+    reward_args_parts = _split_cli_args(rl.reward_args)
+    if reward_args_parts:
+        args += ["--reward_args"] + reward_args_parts
+    plugin_parts = _split_cli_args(getattr(rl, "reward_plugins", ""))
+    if plugin_parts:
+        args += ["--reward_plugins"] + plugin_parts
+    return args
+
+
+def build_rl_cache_rollouts_cmd(config: ProjectConfig) -> list[str]:
+    """Build CLI args for ltx2_cache_rollouts.py (RL Phase A: rollout generation + scoring)."""
+    rl = config.rl
+    cmd = [
+        sys.executable,
+        "-u",
+        _find_script("ltx2_cache_rollouts.py"),
+    ]
+    cmd += _rl_common_model_args(config)
+    cmd += ["--rl_rollout_cache", rl.rl_rollout_cache]
+    cmd += ["--rl_prompts", rl.rl_prompts]
+    cmd += _rl_reward_args(rl)
+    cmd += ["--rl_group_size", str(rl.rl_group_size)]
+    cmd += _rl_sample_dim_args(rl)
+    if rl.rl_save_old_lora:
+        cmd += ["--rl_save_old_lora", rl.rl_save_old_lora]
+    # ppo (trajectory-faithful DDPO) needs the SDE sampler so the per-step trajectory is cached.
+    if getattr(rl, "rl_loss", "nft") == "ppo":
+        cmd += ["--rl_sde_sampler"]
+        if rl.rl_sde_eta != 1.0:
+            cmd += ["--rl_sde_eta", str(rl.rl_sde_eta)]
+    cmd += _split_cli_args(rl.extra_args)
+    return cmd
+
+
+def build_rl_train_cmd(config: ProjectConfig) -> list[str]:
+    """Build CLI args for ltx2_train_rl.py (RL Phase B: NFT cache-replay / online loop).
+
+    Mirrors the slider builder: optimizer + schedule + output inherit from the training
+    config, RL-specific values come from ``config.rl``.
+    """
+    rl = config.rl
+    t = config.training
+    cmd = _accelerate_launch_prefix(t.mixed_precision, rl.accelerate_extra_args)
+    cmd.append(_find_script("ltx2_train_rl.py"))
+    cmd += _rl_common_model_args(config)
+
+    # Optimizer — from training config
+    cmd += ["--learning_rate", str(t.learning_rate)]
+    if t.optimizer_type:
+        cmd += ["--optimizer_type", t.optimizer_type]
+    if t.optimizer_args:
+        cmd += ["--optimizer_args"] + _split_cli_args(t.optimizer_args)
+    cmd += ["--lr_scheduler", t.lr_scheduler]
+    if t.lr_warmup_steps:
+        cmd += ["--lr_warmup_steps", str(t.lr_warmup_steps)]
+    cmd += ["--max_grad_norm", str(t.max_grad_norm)]
+
+    # Rollout source: offline cache replay (default) or inline online generation
+    if rl.online:
+        cmd.append("--rl_online")
+        if rl.rl_prompts:
+            cmd += ["--rl_prompts", rl.rl_prompts]
+        cmd += _rl_reward_args(rl)
+        cmd += ["--rl_group_size", str(rl.rl_group_size)]
+        cmd += _rl_sample_dim_args(rl)
+        if rl.rl_dump_cache:
+            cmd += ["--rl_dump_cache", rl.rl_dump_cache]
+    else:
+        cmd += ["--rl_rollout_cache", rl.rl_rollout_cache]
+
+    # Update rule + its hyperparameters (default nft is implicit, so emit only when switched)
+    rl_loss = getattr(rl, "rl_loss", "nft") or "nft"
+    if rl_loss != "nft":
+        cmd += ["--rl_loss", rl_loss]
+    if rl_loss == "rwr" and rl.rwr_temperature != 1.0:
+        cmd += ["--rwr_temperature", str(rl.rwr_temperature)]
+    if rl_loss == "dpo" and rl.dpo_beta != 5.0:
+        cmd += ["--dpo_beta", str(rl.dpo_beta)]
+    if rl_loss == "ppo":
+        # ppo is trajectory-faithful DDPO: needs the SDE-sampled trajectory (Phase A
+        # --rl_sde_sampler for offline; the same flag on inline generation for online).
+        if rl.online:
+            cmd += ["--rl_sde_sampler"]
+        if rl.ppo_clip_eps != 0.2:
+            cmd += ["--ppo_clip_eps", str(rl.ppo_clip_eps)]
+        if rl.rl_sde_eta != 1.0:
+            cmd += ["--rl_sde_eta", str(rl.rl_sde_eta)]
+
+    # NFT loss coefficients
+    if rl.nft_beta_mix != 1.0:
+        cmd += ["--nft_beta_mix", str(rl.nft_beta_mix)]
+    if rl.nft_kl_beta != 1e-4:
+        cmd += ["--nft_kl_beta", str(rl.nft_kl_beta)]
+    if rl.nft_adv_clip_max != 5.0:
+        cmd += ["--nft_adv_clip_max", str(rl.nft_adv_clip_max)]
+
+    # Loop schedule
+    if rl.rl_timesteps_per_sample != 1:
+        cmd += ["--rl_timesteps_per_sample", str(rl.rl_timesteps_per_sample)]
+    if rl.rl_max_steps != 0:
+        cmd += ["--rl_max_steps", str(rl.rl_max_steps)]
+    if rl.rl_decay_type != 1:
+        cmd += ["--rl_decay_type", str(rl.rl_decay_type)]
+    if rl.rl_log_vram:
+        cmd.append("--rl_log_vram")
+
+    # Output — dir from training, name from RL
+    cmd += ["--output_dir", _effective_output_dir(t.output_dir)]
+    if rl.output_name:
+        cmd += ["--output_name", rl.output_name]
+
+    cmd += _split_cli_args(rl.extra_args)
+    return cmd
+
+
 def build_cache_dino_cmd(config: ProjectConfig) -> list[str]:
     """Build CLI args for ltx2_cache_dino_features.py."""
     toml_path = export_dataset_toml(config)

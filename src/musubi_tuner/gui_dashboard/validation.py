@@ -13,6 +13,37 @@ from musubi_tuner.ltx2_av_cross_grad_surgery import parse_av_cross_grad_surgery_
 from musubi_tuner.tread import default_ltx_tread_route, parse_tread_args
 
 
+def _parse_reward_spec_for_validation(spec: str, reward_plugins: str = "") -> tuple[dict[str, float] | None, str | None]:
+    """Parse a reward spec, returning ``(weights, error)``.
+
+    Defers the ``ltx2_rewards`` import (which pulls in the zoo registry) into the function
+    so importing this validation module stays lightweight. ``reward_plugins`` (whitespace-
+    separated .py paths) is loaded first so plugin-defined reward names resolve, mirroring
+    the drivers. ``parse_reward_spec`` raises ``KeyError`` for an unregistered reward name
+    and ``ValueError`` for a malformed weight.
+    """
+    try:
+        from musubi_tuner.ltx2_rewards import load_reward_plugins, parse_reward_spec, registered_rewards
+    except Exception as exc:  # pragma: no cover - registry import should always succeed
+        return None, f"could not import the reward registry: {exc}"
+    for plugin in (reward_plugins or "").split():
+        try:
+            load_reward_plugins([plugin])
+        except FileNotFoundError:
+            return None, f"reward plugin file not found: {plugin}"
+        except ValueError:
+            pass  # already registered (validation may run repeatedly in one process)
+        except Exception as exc:
+            return None, f"reward plugin {plugin} failed to load: {exc}"
+    try:
+        return parse_reward_spec(spec), None
+    except KeyError as exc:
+        registered = ", ".join(registered_rewards())
+        return None, f"{exc.args[0] if exc.args else exc}. Registered rewards: {registered}"
+    except (ValueError, TypeError) as exc:
+        return None, f"reward spec is malformed: {exc}"
+
+
 def _has_text(value: str | None) -> bool:
     return bool(value and value.strip())
 
@@ -1751,6 +1782,264 @@ def validate_inference_config(config: ProjectConfig) -> dict[str, Any]:
     return _build_report(errors, warnings)
 
 
+def _reward_routes(weights: dict[str, float]) -> dict[str, str]:
+    """Map each selected reward name to its declared route (video|audio|sync)."""
+    try:
+        from musubi_tuner.ltx2_rewards import get_reward_cls
+    except Exception:  # pragma: no cover - registry import should always succeed
+        return {}
+    routes: dict[str, str] = {}
+    for name in weights:
+        try:
+            routes[name] = getattr(get_reward_cls(name), "route", "")
+        except Exception:
+            routes[name] = ""
+    return routes
+
+
+def validate_rl_config(config: ProjectConfig, phase: str | None = None) -> dict[str, Any]:
+    """Validate the NFT/GRPO RL post-training config before launch.
+
+    ``phase`` ("cache_rollouts" | "train_rl") selects which phase's path requirements to check;
+    when omitted it falls back to ``config.rl.phase``. The dashboard passes it per process type so
+    the Phase A and Phase B forms each validate their own phase independently.
+    """
+    rl = config.rl
+    t = config.training
+    effective_phase = phase or rl.phase
+    errors: list[dict[str, Any]] = []
+    warnings: list[dict[str, Any]] = []
+
+    if not _has_training_checkpoint(config):
+        errors.append(
+            _make_issue(
+                "error",
+                "training.ltx2_checkpoint",
+                "LTX-2 Checkpoint is required.",
+                label="LTX-2 Checkpoint",
+                page="rl",
+            )
+        )
+
+    # Phase A may start from either an existing LoRA or a fresh adapter. Offline Phase B is stricter:
+    # it must load the exact `old` snapshot that generated the cache, or the snapshot hash invariant
+    # will fail before training.
+    if effective_phase == "train_rl" and not rl.online and not _has_text(t.network_weights):
+        errors.append(
+            _make_issue(
+                "error",
+                "training.network_weights",
+                "Offline Phase B requires Network Weights to point at the Phase A `old` snapshot "
+                "(the cache snapshot hash must match before training starts).",
+                label="Network Weights",
+                page="rl",
+            )
+        )
+    elif effective_phase == "cache_rollouts" and not _has_text(t.network_weights):
+        warnings.append(
+            _make_issue(
+                "warning",
+                "training.network_weights",
+                "Phase A will start from a fresh LoRA because Network Weights is empty. Set Save `old` "
+                "Snapshot, then load that snapshot as Network Weights for Phase B.",
+                label="Network Weights",
+                page="rl",
+            )
+        )
+
+    # Reward spec must be parseable and reference only registered rewards (incl. plugins).
+    weights, reward_error = _parse_reward_spec_for_validation(rl.reward_fn, getattr(rl, "reward_plugins", ""))
+    if reward_error is not None:
+        errors.append(
+            _make_issue(
+                "error",
+                "rl.reward_fn",
+                f"Reward spec is invalid: {reward_error}",
+                label="Reward Function",
+                page="rl",
+            )
+        )
+    elif not weights:
+        errors.append(
+            _make_issue(
+                "error",
+                "rl.reward_fn",
+                "Reward spec must select at least one reward (e.g. 'hpsv3:1.0').",
+                label="Reward Function",
+                page="rl",
+            )
+        )
+    else:
+        # Branch-aware: audio/sync rewards need an audio-enabled (AV) transformer to route their
+        # advantage to the audio branch.
+        routes = _reward_routes(weights)
+        needs_audio = {name for name, route in routes.items() if route in {"audio", "sync"}}
+        if needs_audio and t.ltx2_mode == "video":
+            errors.append(
+                _make_issue(
+                    "error",
+                    "rl.reward_fn",
+                    f"Reward(s) {sorted(needs_audio)} route to the audio/sync branch and require LTX2 Mode = av "
+                    "(or audio). The narrow video-only RL path supports video-route rewards only.",
+                    label="Reward Function",
+                    page="rl",
+                )
+            )
+
+    # --reward_args must be parseable key=value entries.
+    for entry in _split_cli_args(rl.reward_args):
+        if "=" not in entry:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "rl.reward_args",
+                    f"Reward Args entry '{entry}' must be key=value.",
+                    label="Reward Args",
+                    page="rl",
+                )
+            )
+
+    # K == GRPO group size: group-relative advantages need at least 2 samples for non-zero variance.
+    if rl.rl_group_size < 2:
+        errors.append(
+            _make_issue(
+                "error",
+                "rl.rl_group_size",
+                "RL Group Size (K) must be at least 2 for GRPO group-relative advantages.",
+                label="RL Group Size",
+                page="rl",
+            )
+        )
+
+    # NFT coefficients
+    if rl.nft_beta_mix <= 0.0:
+        errors.append(_make_issue("error", "rl.nft_beta_mix", "NFT Beta Mix must be > 0.", label="NFT Beta Mix", page="rl"))
+    if rl.nft_kl_beta < 0.0:
+        errors.append(_make_issue("error", "rl.nft_kl_beta", "NFT KL Beta must be >= 0.", label="NFT KL Beta", page="rl"))
+    if rl.nft_adv_clip_max <= 0.0:
+        errors.append(
+            _make_issue(
+                "error",
+                "rl.nft_adv_clip_max",
+                "NFT Advantage Clip Max must be > 0.",
+                label="NFT Adv Clip Max",
+                page="rl",
+            )
+        )
+
+    # Update-rule hyperparameters (only the active rule's value is used at train time).
+    rl_loss = getattr(rl, "rl_loss", "nft") or "nft"
+    if rl_loss == "rwr" and rl.rwr_temperature <= 0.0:
+        errors.append(
+            _make_issue("error", "rl.rwr_temperature", "RWR Temperature must be > 0.", label="RWR Temperature", page="rl")
+        )
+    if rl_loss == "dpo" and rl.dpo_beta <= 0.0:
+        errors.append(_make_issue("error", "rl.dpo_beta", "DPO Beta must be > 0.", label="DPO Beta", page="rl"))
+    if rl_loss == "ppo":
+        if rl.ppo_clip_eps <= 0.0:
+            errors.append(_make_issue("error", "rl.ppo_clip_eps", "PPO Clip Epsilon must be > 0.", label="PPO Clip Eps", page="rl"))
+        if not (0.0 < getattr(rl, "rl_sde_eta", 1.0) <= 1.0):
+            errors.append(
+                _make_issue(
+                    "error",
+                    "rl.rl_sde_eta",
+                    "SDE eta must be in (0, 1] for PPO: at eta=0 the step is deterministic and the PPO gradient is zero.",
+                    label="SDE eta",
+                    page="rl",
+                )
+            )
+
+    if rl.rl_timesteps_per_sample < 1:
+        errors.append(
+            _make_issue(
+                "error",
+                "rl.rl_timesteps_per_sample",
+                "RL Timesteps Per Sample must be at least 1.",
+                label="RL Timesteps Per Sample",
+                page="rl",
+            )
+        )
+    if rl.rl_max_steps < 0:
+        errors.append(
+            _make_issue("error", "rl.rl_max_steps", "RL Max Steps must be >= 0 (0 = one pass).", label="RL Max Steps", page="rl")
+        )
+
+    # Phase-specific path requirements.
+    if effective_phase == "cache_rollouts":
+        if not _has_text(rl.rl_rollout_cache):
+            errors.append(
+                _make_issue(
+                    "error",
+                    "rl.rl_rollout_cache",
+                    "Rollout Cache directory is required for Phase A (cache_rollouts).",
+                    label="Rollout Cache",
+                    page="rl",
+                )
+            )
+        if not _has_text(rl.rl_prompts):
+            errors.append(
+                _make_issue(
+                    "error",
+                    "rl.rl_prompts",
+                    "Prompts file is required for Phase A (cache_rollouts).",
+                    label="RL Prompts",
+                    page="rl",
+                )
+            )
+        else:
+            prompts_path = _resolve_project_path(config, rl.rl_prompts)
+            if prompts_path is not None and not prompts_path.exists():
+                errors.append(
+                    _make_issue(
+                        "error",
+                        "rl.rl_prompts",
+                        f"RL Prompts file not found: {prompts_path}",
+                        label="RL Prompts",
+                        page="rl",
+                    )
+                )
+        if not _has_training_gemma_source(config):
+            message = "Gemma Root or Gemma Safetensors is required to encode RL prompts in Phase A."
+            errors.append(_make_issue("error", "training.gemma_root", message, label="Gemma Root", page="rl"))
+            errors.append(_make_issue("error", "training.gemma_safetensors", message, label="Gemma Safetensors", page="rl"))
+    else:  # train_rl
+        if rl.online:
+            if not _has_text(rl.rl_prompts):
+                errors.append(
+                    _make_issue(
+                        "error",
+                        "rl.rl_prompts",
+                        "Prompts file is required for online RL training.",
+                        label="RL Prompts",
+                        page="rl",
+                    )
+                )
+            warnings.append(
+                _make_issue(
+                    "warning",
+                    "rl.online",
+                    "Online RL is experimental and not cleanly VRAM-flat. Prefer the offline (cache replay) path: "
+                    "run Phase A (cache_rollouts) then Phase B with a rollout cache.",
+                    label="Online RL",
+                    page="rl",
+                )
+            )
+        else:
+            if not _has_text(rl.rl_rollout_cache):
+                errors.append(
+                    _make_issue(
+                        "error",
+                        "rl.rl_rollout_cache",
+                        "Rollout Cache directory is required for offline Phase B (train_rl). "
+                        "Generate it with Phase A, or enable Online RL.",
+                        label="Rollout Cache",
+                        page="rl",
+                    )
+                )
+
+    return _build_report(errors, warnings)
+
+
 def validate_process_config(proc_type: str, config: ProjectConfig) -> dict[str, Any]:
     if proc_type == "training":
         return validate_training_config(config)
@@ -1766,4 +2055,7 @@ def validate_process_config(proc_type: str, config: ProjectConfig) -> dict[str, 
         return validate_cache_text_config(config)
     if proc_type == "inference":
         return validate_inference_config(config)
+    if proc_type in ("rl", "rl_cache_rollouts", "rl_train"):
+        phase = {"rl_cache_rollouts": "cache_rollouts", "rl_train": "train_rl"}.get(proc_type)
+        return validate_rl_config(config, phase=phase)
     return _build_report([], [])
