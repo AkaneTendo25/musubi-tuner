@@ -188,7 +188,7 @@ def _precache_sample_prompts(
     autocast_dtype: torch.dtype | None,
     device: torch.device,
 ) -> None:
-    from musubi_tuner.hv_train_network import load_prompts
+    from musubi_tuner.training.sampling_prompts import load_prompts
 
     if args.sample_prompts is None:
         raise ValueError("--sample_prompts is required when --precache_sample_prompts is set")
@@ -312,9 +312,12 @@ def _precache_preservation_prompts(
     # Always encode as video-only for preservation (even in AV mode)
     def _encode_video_only(prompt_text: str) -> tuple[torch.Tensor, torch.Tensor]:
         embed, mask = _encode_prompt_text_ltx2(
-            text_encoder, prompt_text,
-            audio_video=audio_video, ltx_mode="video",  # force video-only encoding
-            autocast_dtype=autocast_dtype, device=device,
+            text_encoder,
+            prompt_text,
+            audio_video=audio_video,
+            ltx_mode="video",  # force video-only encoding
+            autocast_dtype=autocast_dtype,
+            device=device,
         )
         return embed, mask
 
@@ -375,12 +378,8 @@ def main() -> None:
             "general": user_config.get("general", {}),
             "datasets": user_config.get("validation_datasets", []),
         }
-        validation_blueprint = blueprint_generator.generate(
-            validation_user_config, args, architecture=ARCHITECTURE_LTX2
-        )
-        validation_dataset_group = config_utils.generate_dataset_group_by_blueprint(
-            validation_blueprint.dataset_group
-        )
+        validation_blueprint = blueprint_generator.generate(validation_user_config, args, architecture=ARCHITECTURE_LTX2)
+        validation_dataset_group = config_utils.generate_dataset_group_by_blueprint(validation_blueprint.dataset_group)
         datasets.extend(validation_dataset_group.datasets)
 
     all_cache_files_for_dataset, all_cache_paths_for_dataset = cache_text_encoder_outputs.prepare_cache_files_and_paths(datasets)
@@ -391,8 +390,6 @@ def main() -> None:
         dtype = torch.bfloat16
     else:
         dtype = torch.float32
-
-
 
     if getattr(args, "gemma_load_in_8bit", False) or getattr(args, "gemma_load_in_4bit", False):
         if device.type != "cuda":
@@ -560,7 +557,8 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         help="Path to a single Gemma safetensors file (e.g. fp8 from ComfyUI). Loads weights, config, and tokenizer from one file. No --gemma_root needed.",
     )
     parser.add_argument(
-        "--ltx2_mode", "--ltx_mode",
+        "--ltx2_mode",
+        "--ltx_mode",
         dest="ltx_mode",
         type=str,
         default="v",

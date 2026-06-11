@@ -24,11 +24,11 @@ from accelerate import Accelerator, PartialState
 
 from musubi_tuner.utils.device_utils import clean_memory_on_device
 from musubi_tuner.utils import model_utils
-from musubi_tuner.hv_train_network import load_prompts, should_sample_images
 from musubi_tuner.hv_generate_video import save_images_grid, save_videos_grid
 from musubi_tuner.ltx2_inference import LTX2Inferencer, InferenceConfig
 from musubi_tuner.ltx2_defaults import get_ltx2_sampling_preset
 from musubi_tuner.ltx2_samplers import resolve_ltx2_sampler, res2s_midpoint, res2s_step
+from musubi_tuner.training.sampling_prompts import load_prompts, should_sample_images
 from musubi_tuner.ltx2_lycoris_runtime import (
     ensure_adapters_enabled_for_sampling,
     get_adapter_norm_samples,

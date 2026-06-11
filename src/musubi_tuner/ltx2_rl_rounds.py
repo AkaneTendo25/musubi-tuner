@@ -29,10 +29,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-from musubi_tuner.hv_train_network import setup_parser_common
 from musubi_tuner.ltx2_cache_rollouts import rollout_setup_parser
 from musubi_tuner.ltx2_train_network import ltx2_setup_parser
 from musubi_tuner.ltx2_train_rl import rl_setup_parser
+from musubi_tuner.training.parser_common import setup_parser_common
 
 # Flags the driver owns per round (stripped from the passthrough and re-injected with managed
 # values): the warm-start chain, the cache/snapshot paths, the output naming, and the seed

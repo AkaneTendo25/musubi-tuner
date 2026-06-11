@@ -11,9 +11,9 @@ from musubi_tuner.kandinsky5.configs import TASK_CONFIGS
 from musubi_tuner.kandinsky5.generation_utils import generate_sample_latents_only, decode_latents, get_first_frame_from_image
 from musubi_tuner.kandinsky5.models.text_embedders import get_text_embedder
 from musubi_tuner.kandinsky5_train_network import Kandinsky5NetworkTrainer
-from musubi_tuner.hv_train_network import clean_memory_on_device
 from musubi_tuner.hv_generate_video import save_videos_grid
 from musubi_tuner.networks import lora_kandinsky
+from musubi_tuner.training.accelerator_setup import clean_memory_on_device
 
 
 def _get_device(device_arg: Optional[str]) -> torch.device:

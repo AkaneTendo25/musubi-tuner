@@ -27,13 +27,11 @@ from musubi_tuner.hunyuan_video_1_5.hunyuan_video_1_5_models import (
     detect_hunyuan_video_1_5_sd_dtype,
 )
 from musubi_tuner.hunyuan_video_1_5.hunyuan_video_1_5_vae import VAE_LATENT_CHANNELS
-from musubi_tuner.hv_train_network import (
-    NetworkTrainer,
-    clean_memory_on_device,
-    load_prompts,
-    read_config_from_file,
-    setup_parser_common,
-)
+from musubi_tuner.training.accelerator_setup import clean_memory_on_device
+from musubi_tuner.training.outputs import DiTOutput
+from musubi_tuner.training.parser_common import read_config_from_file, setup_parser_common
+from musubi_tuner.training.sampling_prompts import load_prompts
+from musubi_tuner.training.trainer_base import NetworkTrainer
 from musubi_tuner.qwen_image import qwen_image_utils
 from musubi_tuner.utils import model_utils
 
@@ -380,7 +378,8 @@ class HunyuanVideo15NetworkTrainer(NetworkTrainer):
         noisy_model_input: torch.Tensor,
         timesteps: torch.Tensor,
         network_dtype: torch.dtype,
-    ):
+        **kwargs,
+    ) -> DiTOutput:
         transformer: HunyuanVideo_1_5_DiffusionTransformer = transformer_arg
 
         # Check if this batch has I2V conditioning (first frame latents)
@@ -455,7 +454,7 @@ class HunyuanVideo15NetworkTrainer(NetworkTrainer):
         # Flow matching target: predict the velocity (noise - clean)
         # This is different from DDPM which predicts noise directly
         target = noise - latents
-        return model_pred, target
+        return DiTOutput(pred=model_pred, target=target)
 
     # endregion model specific
 

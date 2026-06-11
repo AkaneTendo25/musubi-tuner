@@ -1100,7 +1100,7 @@ def encode_and_save_reference_audio_latents(
 
 def _precache_sample_latents(args: argparse.Namespace, device: torch.device) -> None:
     """Cache I2V / V2V / reference-audio conditioning latents for sample prompts."""
-    from musubi_tuner.hv_train_network import load_prompts
+    from musubi_tuner.training.sampling_prompts import load_prompts
     from PIL import Image
     import torchvision.transforms.functional as TF
     import os

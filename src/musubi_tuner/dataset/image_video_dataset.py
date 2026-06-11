@@ -408,10 +408,7 @@ class ItemInfo:
 def select_caption_from_metadata(data: dict[str, Any], caption_field: Optional[str] = None) -> str:
     field = caption_field or "caption"
     if field not in data:
-        raise KeyError(
-            f"Caption field {field!r} was not found in metadata item. "
-            f"Available keys: {sorted(data.keys())}"
-        )
+        raise KeyError(f"Caption field {field!r} was not found in metadata item. Available keys: {sorted(data.keys())}")
     caption = data[field]
     if caption is None:
         return ""
@@ -888,6 +885,13 @@ def save_text_encoder_output_cache_common(
     safetensors_utils.mem_eff_save_file(sd, item_info.text_encoder_output_cache_path, metadata=metadata, atomic=atomic)
 
 
+from musubi_tuner.dataset import cache_io as _cache_io  # noqa: E402
+
+save_latent_cache_ltx2 = _cache_io.save_latent_cache_ltx2  # noqa: F811
+save_text_encoder_output_cache_ltx2 = _cache_io.save_text_encoder_output_cache_ltx2  # noqa: F811
+save_text_encoder_output_cache_ltx2_gemma = _cache_io.save_text_encoder_output_cache_ltx2_gemma  # noqa: F811
+
+
 class BucketSelector:
     RESOLUTION_STEPS_HUNYUAN = 16
     RESOLUTION_STEPS_WAN = 16
@@ -1027,6 +1031,11 @@ class BucketSelector:
         return bucket_width, bucket_height
 
 
+from musubi_tuner.dataset import bucket as _bucket  # noqa: E402
+
+BucketSelector = _bucket.BucketSelector  # noqa: F811
+
+
 def load_video(
     video_path: str,
     start_frame: Optional[int] = None,
@@ -1057,11 +1066,7 @@ def load_video(
     from musubi_tuner.ltx_2.env import get_ltx2_env
 
     fps_threshold = get_ltx2_env().fps_resampling_threshold
-    needs_resampling = (
-        source_fps is not None
-        and target_fps is not None
-        and abs(math.ceil(source_fps) - target_fps) > fps_threshold
-    )
+    needs_resampling = source_fps is not None and target_fps is not None and abs(math.ceil(source_fps) - target_fps) > fps_threshold
 
     if not needs_resampling and source_fps is not None and target_fps is not None and source_fps != target_fps:
         logger.info(
@@ -1296,10 +1301,7 @@ class BucketBatchManager:
         ref_audio_latents_per_item = []
         ref_audio_lengths_per_item = []
         dino_features_per_item = []
-        collect_item_keys = (
-            os.getenv("LTX2_COLLECT_BATCH_ITEM_KEYS", "0") == "1"
-            or os.getenv("LTX2_NAN_DIAG", "0") == "1"
-        )
+        collect_item_keys = os.getenv("LTX2_COLLECT_BATCH_ITEM_KEYS", "0") == "1" or os.getenv("LTX2_NAN_DIAG", "0") == "1"
         item_keys = []
         latent_cache_paths = []
         audio_cache_paths = []
@@ -1354,7 +1356,7 @@ class BucketBatchManager:
                     _sd_guide = {}
                     for _k, _v in _sd_guide_raw.items():
                         if _k.startswith("latents_"):
-                            _sd_guide[_key_prefix + _k[len("latents_"):]] = _v
+                            _sd_guide[_key_prefix + _k[len("latents_") :]] = _v
                     if not _sd_guide:
                         raise ValueError(f"No latent tensors in guide cache: {_guide_path}")
                     sd_latent = {**sd_latent, **_sd_guide}
@@ -1371,7 +1373,7 @@ class BucketBatchManager:
                 _extra_prefix = f"keyframe_guide_extra_{_ix}_latents_"
                 for _k, _v in _sd_extra_raw.items():
                     if _k.startswith("latents_"):
-                        _sd_extra[_extra_prefix + _k[len("latents_"):]] = _v
+                        _sd_extra[_extra_prefix + _k[len("latents_") :]] = _v
                 if not _sd_extra:
                     raise ValueError(f"No latent tensors in extra keyframe guide cache: {_kf_path}")
                 sd_latent = {**sd_latent, **_sd_extra}
@@ -1384,9 +1386,7 @@ class BucketBatchManager:
             if reference_audio_latent_cache_paths:
                 for ref_index, reference_audio_latent_cache_path in enumerate(reference_audio_latent_cache_paths):
                     if not os.path.exists(reference_audio_latent_cache_path):
-                        raise FileNotFoundError(
-                            f"Reference audio latent cache file not found: {reference_audio_latent_cache_path}"
-                        )
+                        raise FileNotFoundError(f"Reference audio latent cache file not found: {reference_audio_latent_cache_path}")
                     sd_ref_audio_raw = load_file(reference_audio_latent_cache_path)
                     sd_ref_audio = {}
                     for key, value in sd_ref_audio_raw.items():
@@ -1656,7 +1656,9 @@ class BucketBatchManager:
                         if isinstance(lat, list) and lat:
                             for ref_lat in lat:
                                 if ref_lat.dim() != 3:
-                                    raise ValueError(f"Expected reference audio latents to be 3D [C, T, F], got {tuple(ref_lat.shape)}")
+                                    raise ValueError(
+                                        f"Expected reference audio latents to be 3D [C, T, F], got {tuple(ref_lat.shape)}"
+                                    )
                                 if int(ref_lat.shape[0]) != ref_channels or int(ref_lat.shape[2]) != ref_mel_bins:
                                     raise ValueError(
                                         "Reference audio latents shape mismatch in batch: "
@@ -1665,7 +1667,9 @@ class BucketBatchManager:
                                 item_refs.append(ref_lat[:, :quantized_t, :].to(device=ref_device, dtype=ref_dtype))
                                 item_lengths.append(quantized_t)
                         while len(item_refs) < max_ref_count:
-                            item_refs.append(torch.zeros((ref_channels, quantized_t, ref_mel_bins), device=ref_device, dtype=ref_dtype))
+                            item_refs.append(
+                                torch.zeros((ref_channels, quantized_t, ref_mel_bins), device=ref_device, dtype=ref_dtype)
+                            )
                             item_lengths.append(0)
                         truncated_ref.append(torch.stack(item_refs))
                         truncated_ref_lengths.append(torch.tensor(item_lengths, device=ref_device, dtype=torch.int32))
@@ -1682,7 +1686,9 @@ class BucketBatchManager:
                     for i, lat in enumerate(ref_audio_latents_per_item):
                         item_lengths = []
                         if isinstance(lat, list) and lat:
-                            cached_lengths = ref_audio_lengths_per_item[i] if isinstance(ref_audio_lengths_per_item[i], list) else []
+                            cached_lengths = (
+                                ref_audio_lengths_per_item[i] if isinstance(ref_audio_lengths_per_item[i], list) else []
+                            )
                             for ref_idx, ref_lat in enumerate(lat):
                                 t = int(ref_lat.shape[1])
                                 length_val = t
@@ -1705,7 +1711,9 @@ class BucketBatchManager:
                         if isinstance(lat, list) and lat:
                             for ref_idx, ref_lat in enumerate(lat):
                                 if ref_lat.dim() != 3:
-                                    raise ValueError(f"Expected reference audio latents to be 3D [C, T, F], got {tuple(ref_lat.shape)}")
+                                    raise ValueError(
+                                        f"Expected reference audio latents to be 3D [C, T, F], got {tuple(ref_lat.shape)}"
+                                    )
                                 if int(ref_lat.shape[0]) != ref_channels or int(ref_lat.shape[2]) != ref_mel_bins:
                                     raise ValueError(
                                         "Reference audio latents shape mismatch in batch: "
@@ -1722,7 +1730,9 @@ class BucketBatchManager:
                                 length_val = base_lengths[ref_idx] if ref_idx < len(base_lengths) else 0
                                 item_lengths.append(int(min(max(0, length_val), ref_max_t)))
                         while len(item_refs) < max_ref_count:
-                            item_refs.append(torch.zeros((ref_channels, ref_max_t, ref_mel_bins), device=ref_device, dtype=ref_dtype))
+                            item_refs.append(
+                                torch.zeros((ref_channels, ref_max_t, ref_mel_bins), device=ref_device, dtype=ref_dtype)
+                            )
                             item_lengths.append(0)
                         padded_ref.append(torch.stack(item_refs))
                         padded_ref_lengths.append(torch.tensor(item_lengths, device=ref_device, dtype=torch.int32))
@@ -1761,11 +1771,7 @@ class BucketBatchManager:
                     and isinstance(virtual_height, torch.Tensor)
                     and isinstance(virtual_width, torch.Tensor)
                 ):
-                    if (
-                        virtual_num_frames.numel() == bsz
-                        and virtual_height.numel() == bsz
-                        and virtual_width.numel() == bsz
-                    ):
+                    if virtual_num_frames.numel() == bsz and virtual_height.numel() == bsz and virtual_width.numel() == bsz:
                         num_frames_tensor = virtual_num_frames.to(dtype=torch.int32).view(-1)
                         height_tensor = virtual_height.to(dtype=torch.int32).view(-1)
                         width_tensor = virtual_width.to(dtype=torch.int32).view(-1)
@@ -1814,11 +1820,13 @@ class BucketBatchManager:
                     _key = f"keyframe_guide_extra_{_ix}_latents"
                     _t = batch_tensor_data.pop(_key, None)
                     if isinstance(_t, torch.Tensor) and _t.dim() == 5:
-                        extras_batch.append({
-                            "latents": _t,
-                            "frame_idx": int(spec.get("frame_idx", -1)),
-                            "strength": float(spec.get("strength", 1.0)),
-                        })
+                        extras_batch.append(
+                            {
+                                "latents": _t,
+                                "frame_idx": int(spec.get("frame_idx", -1)),
+                                "strength": float(spec.get("strength", 1.0)),
+                            }
+                        )
                 if extras_batch:
                     batch_tensor_data["keyframe_guide_extras"] = extras_batch
 
@@ -1889,6 +1897,9 @@ class BucketBatchManager:
         batch_tensor_data["captions"] = captions
 
         return batch_tensor_data
+
+
+BucketBatchManager = _bucket.BucketBatchManager  # noqa: F811
 
 
 class ContentDatasource:
@@ -2874,16 +2885,17 @@ class BaseDataset(torch.utils.data.Dataset):
                 )
             if not self.keyframe_guide_directory:
                 raise ValueError(
-                    "keyframe_guide_extra_* set but keyframe_guide_directory (primary) is empty. "
-                    "Set the primary keyframe first."
+                    "keyframe_guide_extra_* set but keyframe_guide_directory (primary) is empty. Set the primary keyframe first."
                 )
             for d, c, fi, st in zip(extra_dirs, extra_caches, extra_fis, extra_sts):
-                self.keyframe_guide_extras.append({
-                    "directory": str(d),
-                    "cache_directory": str(c),
-                    "frame_idx": int(fi),
-                    "strength": float(st),
-                })
+                self.keyframe_guide_extras.append(
+                    {
+                        "directory": str(d),
+                        "cache_directory": str(c),
+                        "frame_idx": int(fi),
+                        "strength": float(st),
+                    }
+                )
         self.separate_audio_buckets = separate_audio_buckets
         self.loss_mask_directory = loss_mask_directory
         self.default_loss_mask_path = default_loss_mask_path
@@ -2954,12 +2966,14 @@ class BaseDataset(torch.utils.data.Dataset):
         """
         specs: List[Dict[str, Any]] = []
         if getattr(self, "keyframe_guide_directory", None):
-            specs.append({
-                "directory": self.keyframe_guide_directory,
-                "cache_directory": getattr(self, "keyframe_guide_cache_directory", None),
-                "frame_idx": int(getattr(self, "keyframe_guide_frame_idx", -1)),
-                "strength": float(getattr(self, "keyframe_guide_strength", 1.0)),
-            })
+            specs.append(
+                {
+                    "directory": self.keyframe_guide_directory,
+                    "cache_directory": getattr(self, "keyframe_guide_cache_directory", None),
+                    "frame_idx": int(getattr(self, "keyframe_guide_frame_idx", -1)),
+                    "strength": float(getattr(self, "keyframe_guide_strength", 1.0)),
+                }
+            )
         for extra in getattr(self, "keyframe_guide_extras", []) or []:
             specs.append(dict(extra))
         return specs
@@ -2982,9 +2996,7 @@ class BaseDataset(torch.utils.data.Dataset):
             return bucket_key
         # Round strength to 4 decimals so near-equal floats from config / float32
         # round-trips don't accidentally split into separate buckets.
-        kf_signature = tuple(
-            (int(s["frame_idx"]), round(float(s["strength"]), 4)) for s in kf_specs
-        )
+        kf_signature = tuple((int(s["frame_idx"]), round(float(s["strength"]), 4)) for s in kf_specs)
         latidx_strength = round(float(getattr(self, "latent_idx_guide_strength", 1.0)), 4)
         return (
             *bucket_key,
@@ -3030,9 +3042,7 @@ class BaseDataset(torch.utils.data.Dataset):
     def get_reference_latent_cache_paths(self, item_info: ItemInfo) -> list[str]:
         w, h = item_info.original_size
         basename = os.path.splitext(os.path.basename(item_info.item_key))[0]
-        assert self.reference_cache_directories, (
-            "reference_cache_directories is required / reference_cache_directoriesは必須です"
-        )
+        assert self.reference_cache_directories, "reference_cache_directories is required / reference_cache_directoriesは必須です"
         return [
             os.path.join(directory, f"{basename}_{w:04d}x{h:04d}_{self.architecture}.safetensors")
             for directory in self.reference_cache_directories
@@ -3097,9 +3107,7 @@ class BaseDataset(torch.utils.data.Dataset):
         for spec in extras:
             cache_dir = spec.get("cache_directory")
             assert cache_dir, "keyframe_guide_extra cache_directory is required for every extra keyframe"
-            paths.append(
-                os.path.join(cache_dir, f"{basename}_{w:04d}x{h:04d}_{self.architecture}_kf_guide.safetensors")
-            )
+            paths.append(os.path.join(cache_dir, f"{basename}_{w:04d}x{h:04d}_{self.architecture}_kf_guide.safetensors"))
         return paths
 
     def get_text_encoder_output_cache_path(self, item_info: ItemInfo) -> str:
@@ -3413,7 +3421,7 @@ class ImageDataset(BaseDataset):
                         item_info.latent_idx_guide_cache_path = self.get_latent_idx_guide_cache_path(item_info)
                     if self.keyframe_guide_cache_directory:
                         item_info.keyframe_guide_cache_path = self.get_keyframe_guide_cache_path(item_info)
-                    if getattr(self, 'keyframe_guide_extras', None):
+                    if getattr(self, "keyframe_guide_extras", None):
                         item_info.keyframe_guide_extra_cache_paths = self.get_keyframe_guide_extra_cache_paths(item_info)
 
                     # for VLM, which require image in addition to text, like Qwen-Image-Edit
@@ -3464,7 +3472,9 @@ class ImageDataset(BaseDataset):
 
         for fetch_op in self.datasource:
             # fetch and resize image in a separate thread
-            def fetch_and_resize(op: callable) -> tuple[tuple[int, int], str, list[np.ndarray], str, Optional[list[np.ndarray]], Optional[np.ndarray]]:
+            def fetch_and_resize(
+                op: callable,
+            ) -> tuple[tuple[int, int], str, list[np.ndarray], str, Optional[list[np.ndarray]], Optional[np.ndarray]]:
                 result = op()
                 if len(result) == 4:
                     image_key, images, caption, controls = result
@@ -3618,11 +3628,11 @@ class ImageDataset(BaseDataset):
                 guide_cache_path = self.get_keyframe_guide_cache_path(item_info)
                 if os.path.exists(guide_cache_path):
                     item_info.keyframe_guide_cache_path = guide_cache_path
-                    if getattr(self, 'keyframe_guide_extras', None):
+                    if getattr(self, "keyframe_guide_extras", None):
                         _extra_paths = self.get_keyframe_guide_extra_cache_paths(item_info)
                         for _xp in _extra_paths:
                             if not os.path.exists(_xp):
-                                raise FileNotFoundError(f'Extra keyframe guide cache file not found: {_xp}')
+                                raise FileNotFoundError(f"Extra keyframe guide cache file not found: {_xp}")
                         item_info.keyframe_guide_extra_cache_paths = _extra_paths
                 else:
                     logger.warning("keyframe guide cache not found, skipping item: %s", guide_cache_path)
@@ -3662,7 +3672,7 @@ class ImageDataset(BaseDataset):
             latent_idx_guide_strength=self.latent_idx_guide_strength,
             keyframe_guide_frame_idx=self.keyframe_guide_frame_idx,
             keyframe_guide_strength=self.keyframe_guide_strength,
-            keyframe_guide_extras=getattr(self, 'keyframe_guide_extras', None),
+            keyframe_guide_extras=getattr(self, "keyframe_guide_extras", None),
         )
         self.batch_manager.show_bucket_info()
 
@@ -3926,7 +3936,9 @@ class AudioDataset(BaseDataset):
                         except ValueError:
                             item_key = latent_stem
 
-                text_encoder_output_cache_file = os.path.join(self.cache_directory, f"{item_key}_{self.architecture}_te.safetensors")
+                text_encoder_output_cache_file = os.path.join(
+                    self.cache_directory, f"{item_key}_{self.architecture}_te.safetensors"
+                )
                 if not os.path.exists(text_encoder_output_cache_file):
                     logger.warning(f"Text encoder output cache file not found: {text_encoder_output_cache_file}")
                     continue
@@ -3941,7 +3953,9 @@ class AudioDataset(BaseDataset):
                 if not os.path.exists(latent_cache_file):
                     logger.warning(f"Video latent cache file not found: {latent_cache_file}")
                     continue
-                text_encoder_output_cache_file = os.path.join(self.cache_directory, f"{item_key}_{self.architecture}_te.safetensors")
+                text_encoder_output_cache_file = os.path.join(
+                    self.cache_directory, f"{item_key}_{self.architecture}_te.safetensors"
+                )
                 if not os.path.exists(text_encoder_output_cache_file):
                     logger.warning(f"Text encoder output cache file not found: {text_encoder_output_cache_file}")
                     continue
@@ -4002,7 +4016,7 @@ class AudioDataset(BaseDataset):
             latent_idx_guide_strength=self.latent_idx_guide_strength,
             keyframe_guide_frame_idx=self.keyframe_guide_frame_idx,
             keyframe_guide_strength=self.keyframe_guide_strength,
-            keyframe_guide_extras=getattr(self, 'keyframe_guide_extras', None),
+            keyframe_guide_extras=getattr(self, "keyframe_guide_extras", None),
         )
         self.batch_manager.show_bucket_info()
 
@@ -4128,9 +4142,7 @@ class VideoDataset(BaseDataset):
             reference_audio_directory,
             reference_audio_directories,
         )
-        self.reference_audio_directory = (
-            self.reference_audio_directories[0] if self.reference_audio_directories else None
-        )
+        self.reference_audio_directory = self.reference_audio_directories[0] if self.reference_audio_directories else None
         self.frame_extraction = frame_extraction
         self.frame_stride = frame_stride
         self.frame_sample = frame_sample
@@ -4374,7 +4386,9 @@ class VideoDataset(BaseDataset):
 
         for operator in self.datasource:
 
-            def fetch_and_resize(op: callable) -> tuple[tuple[int, int], str, list[np.ndarray], str, Optional[list[np.ndarray]], Optional[np.ndarray]]:
+            def fetch_and_resize(
+                op: callable,
+            ) -> tuple[tuple[int, int], str, list[np.ndarray], str, Optional[list[np.ndarray]], Optional[np.ndarray]]:
                 result = op()
 
                 if len(result) == 3:  # for backward compatibility TODO remove this in the future
@@ -4492,11 +4506,11 @@ class VideoDataset(BaseDataset):
                 guide_cache_path = self.get_keyframe_guide_cache_path(item_info)
                 if os.path.exists(guide_cache_path):
                     item_info.keyframe_guide_cache_path = guide_cache_path
-                    if getattr(self, 'keyframe_guide_extras', None):
+                    if getattr(self, "keyframe_guide_extras", None):
                         _extra_paths = self.get_keyframe_guide_extra_cache_paths(item_info)
                         for _xp in _extra_paths:
                             if not os.path.exists(_xp):
-                                raise FileNotFoundError(f'Extra keyframe guide cache file not found: {_xp}')
+                                raise FileNotFoundError(f"Extra keyframe guide cache file not found: {_xp}")
                         item_info.keyframe_guide_extra_cache_paths = _extra_paths
                 else:
                     logger.warning("keyframe guide cache not found, skipping item: %s", guide_cache_path)
@@ -4559,7 +4573,7 @@ class VideoDataset(BaseDataset):
             latent_idx_guide_strength=self.latent_idx_guide_strength,
             keyframe_guide_frame_idx=self.keyframe_guide_frame_idx,
             keyframe_guide_strength=self.keyframe_guide_strength,
-            keyframe_guide_extras=getattr(self, 'keyframe_guide_extras', None),
+            keyframe_guide_extras=getattr(self, "keyframe_guide_extras", None),
         )
         self.batch_manager.show_bucket_info()
 
@@ -4595,4 +4609,3 @@ class DatasetGroup(torch.utils.data.ConcatDataset):
     def set_max_train_steps(self, max_train_steps):
         for dataset in self.datasets:
             dataset.set_max_train_steps(max_train_steps)
-

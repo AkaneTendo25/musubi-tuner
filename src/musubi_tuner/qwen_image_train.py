@@ -11,6 +11,7 @@ import toml
 import torch
 from tqdm import tqdm
 from accelerate import Accelerator
+from accelerate.utils import set_seed
 from safetensors.torch import save_file
 
 from musubi_tuner import qwen_image_train_network
@@ -18,18 +19,18 @@ from musubi_tuner.dataset import config_utils
 from musubi_tuner.dataset.config_utils import BlueprintGenerator, ConfigSanitizer
 from musubi_tuner.modules.scheduling_flow_match_discrete import FlowMatchDiscreteScheduler
 from musubi_tuner.qwen_image import qwen_image_model, qwen_image_utils
-from musubi_tuner.hv_train_network import (
+from musubi_tuner.training.accelerator_setup import (
+    clean_memory_on_device,
+    collator_class,
+    prepare_accelerator,
+)
+from musubi_tuner.training.metadata import (
     SS_METADATA_KEY_BASE_MODEL_VERSION,
     SS_METADATA_MINIMUM_KEYS,
-    collator_class,
-    compute_loss_weighting_for_sd3,
-    clean_memory_on_device,
-    prepare_accelerator,
-    setup_parser_common,
-    read_config_from_file,
-    should_sample_images,
-    set_seed,
 )
+from musubi_tuner.training.parser_common import read_config_from_file, setup_parser_common
+from musubi_tuner.training.sampling_prompts import should_sample_images
+from musubi_tuner.training.timesteps import compute_loss_weighting_for_sd3
 import logging
 
 from musubi_tuner.qwen_image_train_network import QwenImageNetworkTrainer
@@ -616,10 +617,10 @@ class QwenImageTrainer(QwenImageNetworkTrainer):
                         args.weighting_scheme, noise_scheduler, timesteps, accelerator.device, dit_dtype
                     )
 
-                    model_pred, target = self.call_dit(
+                    output = self.call_dit(
                         args, accelerator, transformer, latents, batch, noise, noisy_model_input, timesteps, dit_dtype
                     )
-                    loss = torch.nn.functional.mse_loss(model_pred.to(dit_dtype), target, reduction="none")
+                    loss = torch.nn.functional.mse_loss(output.pred.to(dit_dtype), output.target, reduction="none")
 
                     if weighting is not None:
                         loss = loss * weighting

@@ -10,13 +10,11 @@ from accelerate import Accelerator
 
 from musubi_tuner.dataset.image_video_dataset import ARCHITECTURE_WAN, ARCHITECTURE_WAN_FULL, load_video
 from musubi_tuner.hv_generate_video import resize_image_to_bucket
-from musubi_tuner.hv_train_network import (
-    NetworkTrainer,
-    load_prompts,
-    clean_memory_on_device,
-    setup_parser_common,
-    read_config_from_file,
-)
+from musubi_tuner.training.accelerator_setup import clean_memory_on_device
+from musubi_tuner.training.outputs import DiTOutput
+from musubi_tuner.training.parser_common import read_config_from_file, setup_parser_common
+from musubi_tuner.training.sampling_prompts import load_prompts
+from musubi_tuner.training.trainer_base import NetworkTrainer
 from musubi_tuner.utils.device_utils import synchronize_device
 from musubi_tuner.modules.scheduling_flow_match_discrete import FlowMatchDiscreteScheduler
 from musubi_tuner.wan_generate_video import parse_one_frame_inference_args
@@ -631,13 +629,16 @@ class WanNetworkTrainer(NetworkTrainer):
         noisy_model_input: torch.Tensor,
         timesteps: torch.Tensor,
         network_dtype: torch.dtype,
-    ):
+        **kwargs,
+    ) -> DiTOutput:
         if self.high_low_training:
             # high-low training case
             self.swap_high_low_weights(args, accelerator, transformer)
 
         # Call the DiT model
-        return self._call_dit(args, accelerator, transformer, latents, batch, noise, noisy_model_input, timesteps, network_dtype)
+        return self._call_dit(
+            args, accelerator, transformer, latents, batch, noise, noisy_model_input, timesteps, network_dtype, **kwargs
+        )
 
     def _call_dit(
         self,
@@ -650,7 +651,8 @@ class WanNetworkTrainer(NetworkTrainer):
         noisy_model_input: torch.Tensor,
         timesteps: torch.Tensor,
         network_dtype: torch.dtype,
-    ):
+        **kwargs,
+    ) -> DiTOutput:
         model: WanModel = transformer
 
         # I2V training and Control training
@@ -705,7 +707,7 @@ class WanNetworkTrainer(NetworkTrainer):
         # flow matching loss
         target = noise - latents
 
-        return model_pred, target
+        return DiTOutput(pred=model_pred, target=target)
 
     # endregion model specific
 

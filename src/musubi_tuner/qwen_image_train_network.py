@@ -17,13 +17,11 @@ from musubi_tuner.dataset.image_video_dataset import (
     ARCHITECTURE_QWEN_IMAGE_LAYERED_FULL,
 )
 from musubi_tuner.qwen_image import qwen_image_autoencoder_kl, qwen_image_model, qwen_image_utils
-from musubi_tuner.hv_train_network import (
-    NetworkTrainer,
-    load_prompts,
-    clean_memory_on_device,
-    setup_parser_common,
-    read_config_from_file,
-)
+from musubi_tuner.training.accelerator_setup import clean_memory_on_device
+from musubi_tuner.training.outputs import DiTOutput
+from musubi_tuner.training.parser_common import read_config_from_file, setup_parser_common
+from musubi_tuner.training.sampling_prompts import load_prompts
+from musubi_tuner.training.trainer_base import NetworkTrainer
 from musubi_tuner.utils import model_utils
 from musubi_tuner.utils.sai_model_spec import CUSTOM_ARCH_QWEN_IMAGE_EDIT_PLUS, CUSTOM_ARCH_QWEN_IMAGE_EDIT_2511
 
@@ -435,7 +433,8 @@ class QwenImageNetworkTrainer(NetworkTrainer):
         noisy_model_input: torch.Tensor,
         timesteps: torch.Tensor,
         network_dtype: torch.dtype,
-    ):
+        **kwargs,
+    ) -> DiTOutput:
         model: qwen_image_model.QwenImageTransformer2DModel = transformer
         is_edit = self.is_edit
 
@@ -580,7 +579,7 @@ class QwenImageNetworkTrainer(NetworkTrainer):
         target = noise - latents
 
         # print(model_pred.dtype, target.dtype)
-        return model_pred, target
+        return DiTOutput(pred=model_pred, target=target)
 
     # endregion model specific
 

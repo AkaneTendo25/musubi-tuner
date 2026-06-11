@@ -6,8 +6,8 @@ import argparse
 from functools import lru_cache
 from typing import Any
 
-from musubi_tuner.hv_train_network import setup_parser_common
 from musubi_tuner.ltx2_args import ltx2_setup_parser
+from musubi_tuner.training.parser_common import setup_parser_common
 
 
 @lru_cache(maxsize=1)

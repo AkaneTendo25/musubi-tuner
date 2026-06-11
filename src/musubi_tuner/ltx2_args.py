@@ -6,10 +6,10 @@ import os
 import sys
 import logging
 
-from musubi_tuner.hv_train_network import read_config_from_file, setup_parser_common
 from musubi_tuner.ltx_2.env import apply_ltx2_tweaks
 from musubi_tuner.ltx2_model_parallel import add_ltx2_model_parallel_args
 from musubi_tuner.ltx2_remote_stage import add_ltx2_remote_stage_args
+from musubi_tuner.training.parser_common import read_config_from_file, setup_parser_common
 from musubi_tuner.ltx2_lycoris_runtime import (
     apply_lycoris_preset_before_network_creation,
     is_lycoris_requested,

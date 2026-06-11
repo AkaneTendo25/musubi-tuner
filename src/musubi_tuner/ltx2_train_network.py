@@ -14,9 +14,7 @@ import logging
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
-from musubi_tuner.hv_train_network import (
-    NetworkTrainer,
-)
+from musubi_tuner.training.trainer_base import NetworkTrainer
 from musubi_tuner.audio_supervision import (
     AudioSupervisionState,
     format_audio_supervision_alert,
@@ -3598,6 +3596,7 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
         noisy_model_input: torch.Tensor,
         timesteps: torch.Tensor,
         network_dtype: torch.dtype,
+        **kwargs,
     ) -> Tuple[object, torch.Tensor]:
         """Forward pass through LTX-2 (video or audio-video) model
 

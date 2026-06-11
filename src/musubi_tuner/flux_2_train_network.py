@@ -8,13 +8,11 @@ from einops import rearrange
 from diffusers.utils.torch_utils import randn_tensor
 
 from musubi_tuner.flux_2 import flux2_models, flux2_utils
-from musubi_tuner.hv_train_network import (
-    NetworkTrainer,
-    load_prompts,
-    clean_memory_on_device,
-    setup_parser_common,
-    read_config_from_file,
-)
+from musubi_tuner.training.accelerator_setup import clean_memory_on_device
+from musubi_tuner.training.outputs import DiTOutput
+from musubi_tuner.training.parser_common import read_config_from_file, setup_parser_common
+from musubi_tuner.training.sampling_prompts import load_prompts
+from musubi_tuner.training.trainer_base import NetworkTrainer
 
 import logging
 
@@ -266,7 +264,8 @@ class Flux2NetworkTrainer(NetworkTrainer):
         noisy_model_input: torch.Tensor,
         timesteps: torch.Tensor,
         network_dtype: torch.dtype,
-    ):
+        **kwargs,
+    ) -> DiTOutput:
         model: flux2_models.Flux2 = transformer
 
         bsize = latents.shape[0]
@@ -330,7 +329,7 @@ class Flux2NetworkTrainer(NetworkTrainer):
         latents = latents.to(device=accelerator.device, dtype=network_dtype)
         target = noise - latents
 
-        return model_pred, target
+        return DiTOutput(pred=model_pred, target=target)
 
     # endregion model specific
 
