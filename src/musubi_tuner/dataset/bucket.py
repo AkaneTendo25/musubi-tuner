@@ -15,6 +15,7 @@ from musubi_tuner.dataset.architectures import (
     ARCHITECTURE_FLUX_2_KLEIN_4B,
     ARCHITECTURE_FLUX_2_KLEIN_9B,
     ARCHITECTURE_FLUX_KONTEXT,
+    ARCHITECTURE_HIDREAM_O1,
     ARCHITECTURE_HUNYUAN_VIDEO,
     ARCHITECTURE_HUNYUAN_VIDEO_1_5,
     ARCHITECTURE_KANDINSKY5,
@@ -27,6 +28,7 @@ from musubi_tuner.dataset.architectures import (
     ARCHITECTURE_Z_IMAGE,
 )
 from musubi_tuner.dataset.media_utils import divisible_by
+from musubi_tuner.utils.model_utils import remove_dtype_suffix
 
 if TYPE_CHECKING:
     from musubi_tuner.dataset.image_video_dataset import ItemInfo
@@ -48,6 +50,7 @@ class BucketSelector:
     RESOLUTION_STEPS_KANDINSKY5 = 16
     RESOLUTION_STEPS_HUNYUAN_VIDEO_1_5 = 16
     RESOLUTION_STEPS_Z_IMAGE = 16
+    RESOLUTION_STEPS_HIDREAM_O1 = 32
 
     ARCHITECTURE_STEPS_MAP = {
         ARCHITECTURE_HUNYUAN_VIDEO: RESOLUTION_STEPS_HUNYUAN,
@@ -64,6 +67,7 @@ class BucketSelector:
         ARCHITECTURE_KANDINSKY5: RESOLUTION_STEPS_KANDINSKY5,
         ARCHITECTURE_HUNYUAN_VIDEO_1_5: RESOLUTION_STEPS_HUNYUAN_VIDEO_1_5,
         ARCHITECTURE_Z_IMAGE: RESOLUTION_STEPS_Z_IMAGE,
+        ARCHITECTURE_HIDREAM_O1: RESOLUTION_STEPS_HIDREAM_O1,
     }
 
     @classmethod
@@ -462,7 +466,7 @@ class BucketBatchManager:
                 if content_key.endswith("_mask"):
                     pass
                 else:
-                    content_key = content_key.rsplit("_", 1)[0]  # remove dtype
+                    content_key = remove_dtype_suffix(content_key)
                     if (
                         content_key.startswith("latents_")
                         or content_key.startswith("audio_latents_")

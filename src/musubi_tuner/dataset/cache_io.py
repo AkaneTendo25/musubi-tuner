@@ -9,6 +9,7 @@ from safetensors.torch import save_file
 from musubi_tuner.dataset.architectures import (
     ARCHITECTURE_FRAMEPACK_FULL,
     ARCHITECTURE_FLUX_KONTEXT_FULL,
+    ARCHITECTURE_HIDREAM_O1_FULL,
     ARCHITECTURE_HUNYUAN_VIDEO_FULL,
     ARCHITECTURE_HUNYUAN_VIDEO_1_5_FULL,
     ARCHITECTURE_KANDINSKY5_FULL,
@@ -18,7 +19,7 @@ from musubi_tuner.dataset.architectures import (
     ARCHITECTURE_Z_IMAGE_FULL,
 )
 from musubi_tuner.utils import safetensors_utils
-from musubi_tuner.utils.model_utils import dtype_to_str
+from musubi_tuner.utils.model_utils import dtype_to_str, remove_dtype_suffix
 
 if TYPE_CHECKING:
     from musubi_tuner.dataset.image_video_dataset import ItemInfo
@@ -262,6 +263,34 @@ def save_latent_cache_z_image(item_info: ItemInfo, latent: torch.Tensor):
     save_latent_cache_common(item_info, sd, ARCHITECTURE_Z_IMAGE_FULL)
 
 
+def save_pixel_cache_hidream_o1(
+    item_info: ItemInfo,
+    pixel_tokens: torch.Tensor,
+    control_pixel_tokens: Optional[torch.Tensor | list[torch.Tensor]] = None,
+):
+    """HiDream-O1 pixel-token cache."""
+    height_patches, width_patches, _ = pixel_tokens.shape
+    dtype_str = dtype_to_str(pixel_tokens.dtype)
+    sd = {f"latents_1x{height_patches}x{width_patches}_{dtype_str}": pixel_tokens.detach().cpu().contiguous()}
+
+    if control_pixel_tokens is not None:
+        if torch.is_tensor(control_pixel_tokens):
+            assert control_pixel_tokens.dim() == 4, (
+                "control_pixel_tokens should be 4D tensor (num_controls, height_patches, width_patches, patch_dim)"
+            )
+            control_iter = list(control_pixel_tokens)
+        else:
+            control_iter = control_pixel_tokens
+        for i, cl in enumerate(control_iter):
+            control_height_patches, control_width_patches, _ = cl.shape
+            control_dtype_str = dtype_to_str(cl.dtype)
+            sd[f"latents_control_{i}_{control_height_patches}x{control_width_patches}_{control_dtype_str}"] = (
+                cl.detach().cpu().contiguous()
+            )
+
+    save_latent_cache_common(item_info, sd, ARCHITECTURE_HIDREAM_O1_FULL)
+
+
 def save_latent_cache_common(item_info: ItemInfo, sd: dict[str, torch.Tensor], arch_fullname: str, *, atomic: bool = False):
     metadata = {
         "architecture": arch_fullname,
@@ -453,8 +482,34 @@ def save_text_encoder_output_cache_z_image(item_info: ItemInfo, embed: torch.Ten
     save_text_encoder_output_cache_common(item_info, sd, ARCHITECTURE_Z_IMAGE_FULL)
 
 
+def save_text_encoder_output_cache_hidream_o1(
+    item_info: ItemInfo,
+    input_ids: torch.Tensor,
+    input_embeds: Optional[torch.Tensor] = None,
+    position_ids: Optional[torch.Tensor] = None,
+    token_types: Optional[torch.Tensor] = None,
+    image_grid_thw: Optional[torch.Tensor] = None,
+):
+    """HiDream-O1 architecture."""
+    tensors = {
+        "varlen_input_ids": input_ids,
+        "varlen_input_embeds": input_embeds,
+        "varlen_position_ids": position_ids,
+        "varlen_token_types": token_types,
+        "varlen_image_grid_thw": image_grid_thw,
+    }
+    sd = {f"{name}_{dtype_to_str(t.dtype)}": t.detach().cpu() for name, t in tensors.items() if t is not None}
+
+    save_text_encoder_output_cache_common(item_info, sd, ARCHITECTURE_HIDREAM_O1_FULL, merge_existing=False)
+
+
 def save_text_encoder_output_cache_common(
-    item_info: ItemInfo, sd: dict[str, torch.Tensor], arch_fullname: str, *, atomic: bool = False
+    item_info: ItemInfo,
+    sd: dict[str, torch.Tensor],
+    arch_fullname: str,
+    *,
+    atomic: bool = False,
+    merge_existing: bool = True,
 ):
     for key, value in sd.items():
         # NaN check and show warning, replace NaN with 0
@@ -468,12 +523,13 @@ def save_text_encoder_output_cache_common(
         "format_version": "1.0.1",
     }
 
-    if os.path.exists(item_info.text_encoder_output_cache_path):
+    if merge_existing and os.path.exists(item_info.text_encoder_output_cache_path):
         # load existing cache and update metadata
+        new_key_bases = {remove_dtype_suffix(key) for key in sd}
         with safetensors_utils.MemoryEfficientSafeOpen(item_info.text_encoder_output_cache_path) as f:
             existing_metadata = f.metadata()
             for key in f.keys():
-                if key not in sd:  # avoid overwriting by existing cache, we keep the new one
+                if remove_dtype_suffix(key) not in new_key_bases:
                     sd[key] = f.get_tensor(key)
 
         assert existing_metadata["architecture"] == metadata["architecture"], "architecture mismatch"

@@ -22,7 +22,7 @@ import cv2
 import av
 
 from musubi_tuner.utils import safetensors_utils
-from musubi_tuner.utils.model_utils import dtype_to_str
+from musubi_tuner.utils.model_utils import dtype_to_str, remove_dtype_suffix
 
 import logging
 
@@ -99,6 +99,8 @@ ARCHITECTURE_HUNYUAN_VIDEO_1_5 = "hv15"
 ARCHITECTURE_HUNYUAN_VIDEO_1_5_FULL = "hunyuan_video_1_5"
 ARCHITECTURE_Z_IMAGE = "zi"
 ARCHITECTURE_Z_IMAGE_FULL = "z_image"
+ARCHITECTURE_HIDREAM_O1 = "ho1"
+ARCHITECTURE_HIDREAM_O1_FULL = "hidream_o1_image"
 
 
 def glob_images(directory, base="*", caption_extension=None):
@@ -651,6 +653,34 @@ def save_latent_cache_z_image(item_info: ItemInfo, latent: torch.Tensor):
     save_latent_cache_common(item_info, sd, ARCHITECTURE_Z_IMAGE_FULL)
 
 
+def save_pixel_cache_hidream_o1(
+    item_info: ItemInfo,
+    pixel_tokens: torch.Tensor,
+    control_pixel_tokens: Optional[Union[torch.Tensor, list[torch.Tensor]]] = None,
+):
+    """HiDream-O1 pixel-token cache."""
+    height_patches, width_patches, _ = pixel_tokens.shape
+    dtype_str = dtype_to_str(pixel_tokens.dtype)
+    sd = {f"latents_1x{height_patches}x{width_patches}_{dtype_str}": pixel_tokens.detach().cpu().contiguous()}
+
+    if control_pixel_tokens is not None:
+        if torch.is_tensor(control_pixel_tokens):
+            assert control_pixel_tokens.dim() == 4, (
+                "control_pixel_tokens should be 4D tensor (num_controls, height_patches, width_patches, patch_dim)"
+            )
+            control_iter = list(control_pixel_tokens)
+        else:
+            control_iter = control_pixel_tokens
+        for i, cl in enumerate(control_iter):
+            control_height_patches, control_width_patches, _ = cl.shape
+            control_dtype_str = dtype_to_str(cl.dtype)
+            sd[f"latents_control_{i}_{control_height_patches}x{control_width_patches}_{control_dtype_str}"] = (
+                cl.detach().cpu().contiguous()
+            )
+
+    save_latent_cache_common(item_info, sd, ARCHITECTURE_HIDREAM_O1_FULL)
+
+
 def save_latent_cache_common(item_info: ItemInfo, sd: dict[str, torch.Tensor], arch_fullname: str, *, atomic: bool = False):
     metadata = {
         "architecture": arch_fullname,
@@ -843,12 +873,34 @@ def save_text_encoder_output_cache_z_image(item_info: ItemInfo, embed: torch.Ten
     save_text_encoder_output_cache_common(item_info, sd, ARCHITECTURE_Z_IMAGE_FULL)
 
 
+def save_text_encoder_output_cache_hidream_o1(
+    item_info: ItemInfo,
+    input_ids: torch.Tensor,
+    input_embeds: Optional[torch.Tensor] = None,
+    position_ids: Optional[torch.Tensor] = None,
+    token_types: Optional[torch.Tensor] = None,
+    image_grid_thw: Optional[torch.Tensor] = None,
+):
+    """HiDream-O1 architecture."""
+    tensors = {
+        "varlen_input_ids": input_ids,
+        "varlen_input_embeds": input_embeds,
+        "varlen_position_ids": position_ids,
+        "varlen_token_types": token_types,
+        "varlen_image_grid_thw": image_grid_thw,
+    }
+    sd = {f"{name}_{dtype_to_str(t.dtype)}": t.detach().cpu() for name, t in tensors.items() if t is not None}
+
+    save_text_encoder_output_cache_common(item_info, sd, ARCHITECTURE_HIDREAM_O1_FULL, merge_existing=False)
+
+
 def save_text_encoder_output_cache_common(
     item_info: ItemInfo,
     sd: dict[str, torch.Tensor],
     arch_fullname: str,
     *,
     atomic: bool = False,
+    merge_existing: bool = True,
 ):
     for key, value in sd.items():
         # NaN check and show warning, replace NaN with 0
@@ -862,12 +914,13 @@ def save_text_encoder_output_cache_common(
         "format_version": "1.0.1",
     }
 
-    if os.path.exists(item_info.text_encoder_output_cache_path):
+    if merge_existing and os.path.exists(item_info.text_encoder_output_cache_path):
         # load existing cache and update metadata
+        new_key_bases = {remove_dtype_suffix(key) for key in sd}
         with safetensors_utils.MemoryEfficientSafeOpen(item_info.text_encoder_output_cache_path) as f:
             existing_metadata = f.metadata()
             for key in f.keys():
-                if key not in sd:  # avoid overwriting by existing cache, we keep the new one
+                if remove_dtype_suffix(key) not in new_key_bases:
                     sd[key] = f.get_tensor(key)
 
         assert existing_metadata["architecture"] == metadata["architecture"], "architecture mismatch"
@@ -904,6 +957,7 @@ class BucketSelector:
     RESOLUTION_STEPS_KANDINSKY5 = 16
     RESOLUTION_STEPS_HUNYUAN_VIDEO_1_5 = 16
     RESOLUTION_STEPS_Z_IMAGE = 16
+    RESOLUTION_STEPS_HIDREAM_O1 = 32
 
     ARCHITECTURE_STEPS_MAP = {
         ARCHITECTURE_HUNYUAN_VIDEO: RESOLUTION_STEPS_HUNYUAN,
@@ -920,6 +974,7 @@ class BucketSelector:
         ARCHITECTURE_KANDINSKY5: RESOLUTION_STEPS_KANDINSKY5,
         ARCHITECTURE_HUNYUAN_VIDEO_1_5: RESOLUTION_STEPS_HUNYUAN_VIDEO_1_5,
         ARCHITECTURE_Z_IMAGE: RESOLUTION_STEPS_Z_IMAGE,
+        ARCHITECTURE_HIDREAM_O1: RESOLUTION_STEPS_HIDREAM_O1,
     }
 
     @classmethod
@@ -1475,7 +1530,7 @@ class BucketBatchManager:
                 if content_key.endswith("_mask"):
                     pass
                 else:
-                    content_key = content_key.rsplit("_", 1)[0]  # remove dtype
+                    content_key = remove_dtype_suffix(content_key)
                     if (
                         content_key.startswith("latents_")
                         or content_key.startswith("audio_latents_")
@@ -3323,6 +3378,8 @@ class ImageDataset(BaseDataset):
             control_count_per_image = None  # can be multiple control images
         elif self.architecture == ARCHITECTURE_QWEN_IMAGE_EDIT:
             control_count_per_image = None  # can be multiple control images
+        elif self.architecture == ARCHITECTURE_HIDREAM_O1:
+            control_count_per_image = None  # can be multiple control/reference images
 
         if self.cache_only:
             self.datasource = None
@@ -3602,10 +3659,10 @@ class ImageDataset(BaseDataset):
                 bucket_reso = tuple(bucket_reso)
             if self.no_resize_control or self.control_resolution is not None:
                 # we also need to split the bucket with control resolutions
-                control_key = safetensors_utils.find_key(cache_file, starts_with="latents_control_")  # latents_control_FxHxW_dtype
-                if control_key is not None:
-                    control_shape = control_key.rsplit("_", 3)[-2]  # FxHxW
-                    bucket_reso = tuple(list(bucket_reso) + [control_shape])  # (int, int, str)
+                control_keys = safetensors_utils.find_keys(cache_file, starts_with="latents_control_")
+                if control_keys:
+                    control_shapes = [remove_dtype_suffix(key) for key in control_keys]
+                    bucket_reso = tuple(list(bucket_reso) + control_shapes)  # (int, int, str...)
 
             has_audio = os.path.exists(audio_latent_cache_file)
             bucket_reso = self._append_audio_bucket_key(tuple(bucket_reso), has_audio)

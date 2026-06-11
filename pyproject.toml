@@ -1,9 +1,9 @@
 [project]
 name = "musubi-tuner"
-version = "0.3.0"
+version = "0.3.1"
 description = "Musubi Tuner by kohya_ss"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.10, <3.13"
 dependencies = [
     "accelerate==1.6.0",
     "adv_optm==2.2.3",
@@ -23,7 +23,7 @@ dependencies = [
     "toml==0.10.2",
     "tqdm==4.67.1",
     "torch-optimi==0.3.3",
-    "transformers==4.56.1",
+    "transformers==4.57.6",
     "voluptuous==0.15.2",
     # Wan2.1
     "ftfy==6.3.1",
@@ -50,6 +50,9 @@ cu130 = [
 ]
 gui = [
     "gradio>=4.0.0, <6.0.0",
+]
+hidream_o1 = [
+    "sensecraft[dinov3]>=0.3.11",
 ]
 dashboard = [
     "fastapi>=0.115.0",

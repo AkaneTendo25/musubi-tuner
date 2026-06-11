@@ -413,6 +413,9 @@ def _add_lr_scheduler_args(parser: argparse.ArgumentParser) -> None:
 
 def _add_memory_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--fp8_base", action="store_true", help="use fp8 for base model / base modelにfp8を使う")
+    # The base trainer reads args.fp8_scaled in shared code. Most trainers add
+    # --fp8_scaled themselves, but HunyuanVideo does not, so keep a default here.
+    parser.set_defaults(fp8_scaled=False)
     parser.add_argument(
         "--full_fp16",
         action="store_true",
