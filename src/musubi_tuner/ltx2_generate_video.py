@@ -8,6 +8,7 @@ Supports single-stage and two-stage inference, LoRA merging, block swap,
 staged offloading (text encoder → transformer → VAE), audio+video generation,
 image-to-video conditioning, and video-to-video reference conditioning.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -23,6 +24,12 @@ from safetensors.torch import load_file
 
 from musubi_tuner.hv_generate_video import setup_parser_compile
 from musubi_tuner.ltx2_defaults import get_ltx2_sampling_preset
+from musubi_tuner.ltx2_lora_utils import (
+    apply_lora_network_for_inference,
+    import_lora_network_module,
+    infer_lora_network_module,
+    load_lora_metadata,
+)
 from musubi_tuner.model_defaults import default_gemma_root_path, default_ltx2_checkpoint_path
 from musubi_tuner.ltx2_train_network import LTX2NetworkTrainer
 from musubi_tuner.networks import lora_ltx2
@@ -55,8 +62,7 @@ def _apply_reference_conditioning_overrides(
 
     if reference_image and reference_video:
         logger.warning(
-            "Both --reference_image and --reference_video given; "
-            "--reference_video takes priority (V2V), --reference_image ignored."
+            "Both --reference_image and --reference_video given; --reference_video takes priority (V2V), --reference_image ignored."
         )
 
     ref_path = reference_video or reference_image
@@ -64,6 +70,7 @@ def _apply_reference_conditioning_overrides(
     # Auto-detect: if an --reference_image path is actually a video by ext, use V2V slot.
     try:
         from musubi_tuner.dataset.image_video_dataset import VIDEO_EXTENSIONS
+
         video_exts = {e.lower() for e in VIDEO_EXTENSIONS}
     except Exception:
         video_exts = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
@@ -92,6 +99,7 @@ def _apply_reference_conditioning_overrides(
 # Arg parsing — mirrors training script arg names so configs are portable
 # ---------------------------------------------------------------------------
 
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="LTX-2 video generation (inference only)",
@@ -118,7 +126,8 @@ def parse_args() -> argparse.Namespace:
         help="VAE dtype (default: bfloat16). Options: bfloat16, float16, float32.",
     )
     parser.add_argument(
-        "--ltx2_mode", "--ltx_mode",
+        "--ltx2_mode",
+        "--ltx_mode",
         dest="ltx_mode",
         type=str,
         default="video",
@@ -136,10 +145,15 @@ def parse_args() -> argparse.Namespace:
     )
 
     # -- Gemma text encoder --
-    parser.add_argument("--gemma_root", type=str, default=default_gemma_root_path(),
-                        help="Local directory containing Gemma weights/tokenizer")
-    parser.add_argument("--gemma_safetensors", type=str, default=None,
-                        help="Single Gemma safetensors file (for example, an fp8 export). No --gemma_root needed.")
+    parser.add_argument(
+        "--gemma_root", type=str, default=default_gemma_root_path(), help="Local directory containing Gemma weights/tokenizer"
+    )
+    parser.add_argument(
+        "--gemma_safetensors",
+        type=str,
+        default=None,
+        help="Single Gemma safetensors file (for example, an fp8 export). No --gemma_root needed.",
+    )
     parser.add_argument("--gemma_load_in_8bit", action="store_true", help="Load Gemma in 8-bit (bitsandbytes). CUDA only.")
     parser.add_argument("--gemma_load_in_4bit", action="store_true", help="Load Gemma in 4-bit (bitsandbytes). CUDA only.")
     parser.add_argument("--gemma_bnb_4bit_quant_type", type=str, default="nf4", choices=["nf4", "fp4"])
@@ -156,16 +170,23 @@ def parse_args() -> argparse.Namespace:
 
     # -- LoRA (merged into transformer for inference) --
     parser.add_argument("--lora_weight", type=str, nargs="*", default=None, help="LoRA weight path(s) to merge")
-    parser.add_argument("--lora_multiplier", type=float, nargs="*", default=None,
-                        help="LoRA multiplier(s), aligned with --lora_weight order")
+    parser.add_argument(
+        "--lora_multiplier", type=float, nargs="*", default=None, help="LoRA multiplier(s), aligned with --lora_weight order"
+    )
     parser.add_argument("--include_patterns", type=str, nargs="*", default=None, help="LoRA module include patterns")
     parser.add_argument("--exclude_patterns", type=str, nargs="*", default=None, help="LoRA module exclude patterns")
 
     # -- Prompt input --
     parser.add_argument("--prompt", type=str, default=None, help="Text prompt for generation")
     parser.add_argument("--negative_prompt", type=str, default=None, help="Negative prompt (enables CFG)")
-    parser.add_argument("--sample_prompts", "--from_file", type=str, default=None, dest="sample_prompts",
-                        help="Read prompts from a .txt file (one per line or TOML-style; same format as training --sample_prompts)")
+    parser.add_argument(
+        "--sample_prompts",
+        "--from_file",
+        type=str,
+        default=None,
+        dest="sample_prompts",
+        help="Read prompts from a .txt file (one per line or TOML-style; same format as training --sample_prompts)",
+    )
 
     # -- Output --
     parser.add_argument("--output_dir", type=str, default="output", help="Directory to save outputs")
@@ -189,8 +210,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--height", type=int, default=None, help="Output height in pixels (rounded to multiple of 32)")
     parser.add_argument("--width", type=int, default=None, help="Output width in pixels (rounded to multiple of 32)")
-    parser.add_argument("--frame_count", "--sample_num_frames", type=int, default=None, dest="frame_count",
-                        help="Number of frames (rounded to 8k+1)")
+    parser.add_argument(
+        "--frame_count",
+        "--sample_num_frames",
+        type=int,
+        default=None,
+        dest="frame_count",
+        help="Number of frames (rounded to 8k+1)",
+    )
     parser.add_argument("--frame_rate", type=float, default=None, help="Output FPS")
     parser.add_argument("--sample_steps", type=int, default=None, help="Number of denoising steps")
     parser.add_argument(
@@ -225,7 +252,7 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=None,
         help="Spatio-Temporal Guidance scale (0.0 = disabled). Recommended default is 1.0. "
-             "Costs one extra transformer forward per denoising step.",
+        "Costs one extra transformer forward per denoising step.",
     )
     parser.add_argument(
         "--stg_blocks",
@@ -251,9 +278,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--av_bimodal_scale", type=float, default=None)
 
     # -- Attention / DiT quantization --
-    parser.add_argument("--attn_mode", type=str, default="torch",
-                        choices=["flash", "flash2", "flash3", "torch", "xformers", "sdpa"],
-                        help="Attention backend")
+    parser.add_argument(
+        "--attn_mode",
+        type=str,
+        default="torch",
+        choices=["flash", "flash2", "flash3", "torch", "xformers", "sdpa"],
+        help="Attention backend",
+    )
     # Training-style boolean attention flags (for config portability)
     parser.add_argument("--flash_attn", action="store_true", help="Use FlashAttention (same as --attn_mode flash)")
     parser.add_argument("--flash3", action="store_true", help="Use FlashAttention 3 (same as --attn_mode flash3)")
@@ -289,22 +320,34 @@ def parse_args() -> argparse.Namespace:
     # -- Block swap / VRAM management --
     parser.add_argument("--blocks_to_swap", type=int, default=0, help="Number of DiT blocks to swap to CPU")
     parser.add_argument("--use_pinned_memory_for_block_swap", action="store_true")
-    parser.add_argument("--sample_with_offloading", action="store_true",
-                        help="Staged offloading: text encoder → CPU, then transformer → CPU before VAE decode. Saves ~10GB VRAM.")
+    parser.add_argument(
+        "--sample_with_offloading",
+        action="store_true",
+        help="Staged offloading: text encoder → CPU, then transformer → CPU before VAE decode. Saves ~10GB VRAM.",
+    )
 
     # -- I2V / V2V conditioning --
-    parser.add_argument("--sample_i2v_token_timestep_mask", action=argparse.BooleanOptionalAction, default=True,
-                        help="Use LTX I2V token timestep masking during sampling")
-    parser.add_argument("--reference_downscale", type=int, default=1,
-                        help="Spatial downscale factor for V2V references (1=same res)")
+    parser.add_argument(
+        "--sample_i2v_token_timestep_mask",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use LTX I2V token timestep masking during sampling",
+    )
+    parser.add_argument(
+        "--reference_downscale", type=int, default=1, help="Spatial downscale factor for V2V references (1=same res)"
+    )
     parser.add_argument("--reference_frames", type=int, default=1, help="Number of V2V reference frames")
-    parser.add_argument("--sample_include_reference", action="store_true",
-                        help="Show V2V reference side-by-side in output")
-    parser.add_argument("--reference_image", type=str, default=None,
-                        help="Path to reference image for I2V conditioning (single frame). "
-                             "If path points to a video file by extension, treated as V2V.")
-    parser.add_argument("--reference_video", type=str, default=None,
-                        help="Path to reference video file for V2V conditioning (multi-frame).")
+    parser.add_argument("--sample_include_reference", action="store_true", help="Show V2V reference side-by-side in output")
+    parser.add_argument(
+        "--reference_image",
+        type=str,
+        default=None,
+        help="Path to reference image for I2V conditioning (single frame). "
+        "If path points to a video file by extension, treated as V2V.",
+    )
+    parser.add_argument(
+        "--reference_video", type=str, default=None, help="Path to reference video file for V2V conditioning (multi-frame)."
+    )
 
     # -- Audio (AV mode) --
     parser.add_argument("--sample_disable_audio", action="store_true", help="Disable audio decoding in AV mode")
@@ -318,20 +361,26 @@ def parse_args() -> argparse.Namespace:
     )
 
     # -- Two-stage inference --
-    parser.add_argument("--sample_two_stage", action="store_true",
-                        help="Two-stage: generate at half res, upsample, refine with distilled LoRA.")
-    parser.add_argument("--spatial_upsampler_path", type=str, default=None,
-                        help="Path to spatial upsampler model for two-stage inference.")
-    parser.add_argument("--distilled_lora_path", type=str, default=None,
-                        help="Path to distilled LoRA for two-stage refinement.")
-    parser.add_argument("--sample_stage2_steps", type=int, default=3,
-                        help="Number of stage-2 refinement steps (default: 3)")
-    parser.add_argument("--sample_stage1_distilled_lora_multiplier", type=float, default=None,
-                        help="Stage-1 distilled LoRA multiplier for two-stage. "
-                             "Default: 0.25 with res_2s, 0.0 with Euler.")
-    parser.add_argument("--sample_stage2_distilled_lora_multiplier", type=float, default=None,
-                        help="Stage-2 distilled LoRA multiplier for two-stage. "
-                             "Default: 0.5 with res_2s, 1.0 with Euler.")
+    parser.add_argument(
+        "--sample_two_stage", action="store_true", help="Two-stage: generate at half res, upsample, refine with distilled LoRA."
+    )
+    parser.add_argument(
+        "--spatial_upsampler_path", type=str, default=None, help="Path to spatial upsampler model for two-stage inference."
+    )
+    parser.add_argument("--distilled_lora_path", type=str, default=None, help="Path to distilled LoRA for two-stage refinement.")
+    parser.add_argument("--sample_stage2_steps", type=int, default=3, help="Number of stage-2 refinement steps (default: 3)")
+    parser.add_argument(
+        "--sample_stage1_distilled_lora_multiplier",
+        type=float,
+        default=None,
+        help="Stage-1 distilled LoRA multiplier for two-stage. Default: 0.25 with res_2s, 0.0 with Euler.",
+    )
+    parser.add_argument(
+        "--sample_stage2_distilled_lora_multiplier",
+        type=float,
+        default=None,
+        help="Stage-2 distilled LoRA multiplier for two-stage. Default: 0.5 with res_2s, 1.0 with Euler.",
+    )
 
     # -- Tiled VAE decode --
     parser.add_argument("--sample_tiled_vae", action="store_true", help="Enable tiled VAE decoding")
@@ -341,19 +390,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sample_vae_temporal_tile_overlap", type=int, default=8, help="Temporal tile overlap")
 
     # -- Flash attn override --
-    parser.add_argument("--sample_disable_flash_attn", action="store_true",
-                        help="Disable FlashAttention during sampling (force SDPA)")
+    parser.add_argument(
+        "--sample_disable_flash_attn", action="store_true", help="Disable FlashAttention during sampling (force SDPA)"
+    )
 
     # -- Precached embeddings (skip Gemma at inference) --
-    parser.add_argument("--use_precached_sample_prompts", "--precache_sample_prompts",
-                        action="store_true", dest="use_precached_sample_prompts",
-                        help="Use precached Gemma embeddings instead of loading Gemma at inference time.")
-    parser.add_argument("--sample_prompts_cache", type=str, default=None,
-                        help="Path to precached sample prompt embeddings (.pt)")
-    parser.add_argument("--use_precached_sample_latents", action="store_true",
-                        help="Use precached I2V conditioning latents.")
-    parser.add_argument("--sample_latents_cache", type=str, default=None,
-                        help="Path to precached I2V conditioning latents (.pt)")
+    parser.add_argument(
+        "--use_precached_sample_prompts",
+        "--precache_sample_prompts",
+        action="store_true",
+        dest="use_precached_sample_prompts",
+        help="Use precached Gemma embeddings instead of loading Gemma at inference time.",
+    )
+    parser.add_argument("--sample_prompts_cache", type=str, default=None, help="Path to precached sample prompt embeddings (.pt)")
+    parser.add_argument("--use_precached_sample_latents", action="store_true", help="Use precached I2V conditioning latents.")
+    parser.add_argument("--sample_latents_cache", type=str, default=None, help="Path to precached I2V conditioning latents (.pt)")
 
     # -- Compile --
     setup_parser_compile(parser)
@@ -434,6 +485,7 @@ def parse_args() -> argparse.Namespace:
 # Attention flag setup — same as training script's load_transformer expects
 # ---------------------------------------------------------------------------
 
+
 def _configure_attention_flags(args: argparse.Namespace) -> None:
     # If a training-style boolean flag was explicitly set, it takes priority
     if args.flash_attn or args.flash3 or args.sdpa or args.xformers:
@@ -456,6 +508,7 @@ def _configure_attention_flags(args: argparse.Namespace) -> None:
 # LoRA merging
 # ---------------------------------------------------------------------------
 
+
 def _merge_lora_weights(
     transformer: torch.nn.Module,
     weights: list[str],
@@ -469,14 +522,16 @@ def _merge_lora_weights(
         multiplier = multipliers[idx] if multipliers and len(multipliers) > idx else 1.0
         logger.info("Merging LoRA: %s (multiplier=%.3f)", path, multiplier)
         lora_sd = load_file(path)
+        metadata = load_lora_metadata(path)
+        network_module_name = infer_lora_network_module(metadata, lora_sd)
+        network_module = import_lora_network_module(network_module_name)
 
         # Auto-detect connector LoRA and attach connectors to wrapper for merge
         has_connector_lora = any("embeddings_connector" in k for k in lora_sd.keys())
         if has_connector_lora and not getattr(transformer, "has_connectors", lambda: False)():
             if ltx2_checkpoint is None:
                 logger.warning(
-                    "LoRA contains connector weights but --ltx2_checkpoint not provided; "
-                    "connector LoRA will be skipped."
+                    "LoRA contains connector weights but --ltx2_checkpoint not provided; connector LoRA will be skipped."
                 )
             else:
                 from musubi_tuner.ltx_2.loader.sft_loader import SafetensorsModelStateDictLoader
@@ -492,7 +547,7 @@ def _merge_lora_weights(
                 transformer.load_connectors(video_conn, audio_conn)
                 logger.info("Attached connectors to wrapper for connector LoRA merge")
 
-        net = lora_ltx2.create_arch_network_from_weights(
+        net = network_module.create_arch_network_from_weights(
             multiplier,
             lora_sd,
             unet=transformer,
@@ -500,14 +555,26 @@ def _merge_lora_weights(
             include_patterns=include_patterns,
             exclude_patterns=exclude_patterns,
         )
-        net.merge_to(None, transformer, lora_sd, device=next(transformer.parameters()).device, non_blocking=True)
+        module_count = len(getattr(net, "text_encoder_loras", [])) + len(getattr(net, "unet_loras", []))
+        if module_count == 0:
+            raise ValueError(
+                f"LoRA {path} matched zero modules using {network_module_name}. "
+                "Check --include_patterns/--exclude_patterns and adapter metadata."
+            )
+        apply_mode = apply_lora_network_for_inference(
+            net,
+            transformer,
+            lora_sd,
+            merge_device=next(transformer.parameters()).device,
+            non_blocking=True,
+            prefer_merge=True,
+        )
+        logger.info("Applied LoRA via %s using %s", apply_mode, network_module_name)
 
         # Copy merged connector weights back to text encoder if available
         if has_connector_lora and text_encoder is not None and getattr(transformer, "has_connectors", lambda: False)():
             if hasattr(text_encoder, "embeddings_connector"):
-                text_encoder.embeddings_connector.load_state_dict(
-                    transformer.embeddings_connector.state_dict(), strict=False
-                )
+                text_encoder.embeddings_connector.load_state_dict(transformer.embeddings_connector.state_dict(), strict=False)
                 logger.info("Copied merged connector LoRA weights to text encoder (video)")
             if hasattr(text_encoder, "audio_embeddings_connector") and hasattr(transformer, "audio_embeddings_connector"):
                 text_encoder.audio_embeddings_connector.load_state_dict(
@@ -519,6 +586,7 @@ def _merge_lora_weights(
 # ---------------------------------------------------------------------------
 # Prompt list construction — same format as training sampling
 # ---------------------------------------------------------------------------
+
 
 def _build_prompt_list(
     trainer: LTX2NetworkTrainer,
@@ -557,6 +625,7 @@ def _build_prompt_list(
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
+
 
 def main() -> None:
     _configure_windows_cli_encoding()
@@ -641,10 +710,7 @@ def main() -> None:
         except FileNotFoundError as exc:
             logger.error(str(exc))
             return
-        logger.info(
-            "Reference conditioning: %s via %s slot",
-            ref_path, "V2V (v2v_ref_path)" if use_v2v else "I2V (image_path)"
-        )
+        logger.info("Reference conditioning: %s via %s slot", ref_path, "V2V (v2v_ref_path)" if use_v2v else "I2V (image_path)")
 
     logger.info("Generating %d sample(s)...", len(prompts))
 
@@ -666,7 +732,7 @@ def main() -> None:
         args=args,
         epoch=0,
         steps=0,
-        vae=None,           # lazy-loaded by sample_image_inference()
+        vae=None,  # lazy-loaded by sample_image_inference()
         transformer=transformer,
         sample_parameters=prompts,
         dit_dtype=trainer.dit_dtype or torch.float32,
