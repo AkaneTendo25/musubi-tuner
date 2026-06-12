@@ -494,6 +494,14 @@ def refresh_prodigy_plus_late_param_group_state(
             group["running_d_denom"] = torch.tensor(0.0, dtype=torch.float32, device=device)
 
 
+def get_prodigy_plus_split_groups(optimizer: torch.optim.Optimizer) -> Optional[bool]:
+    inner_optimizer = optimizer.optimizer if hasattr(optimizer, "optimizer") else optimizer
+    for group in getattr(inner_optimizer, "param_groups", []):
+        if "split_groups" in group:
+            return bool(group["split_groups"])
+    return None
+
+
 def refresh_optimizer_after_adaptive_rank_prune(
     self,
     args: argparse.Namespace,
@@ -510,6 +518,7 @@ def refresh_optimizer_after_adaptive_rank_prune(
     new_network_param_groups, lr_descriptions = self._prepare_network_optimizer_params(args, unwrapped_network)
 
     inner_optimizer = optimizer.optimizer if hasattr(optimizer, "optimizer") else optimizer
+    prodigy_plus_split_groups = self._get_prodigy_plus_split_groups(inner_optimizer)
 
     preserved_extra_groups = []
     preserved_extra_param_ids: set[int] = set()
@@ -541,7 +550,7 @@ def refresh_optimizer_after_adaptive_rank_prune(
         inner_optimizer.add_param_group(group)
     for group in preserved_extra_groups:
         inner_optimizer.add_param_group(group)
-    self._refresh_prodigy_plus_late_param_group_state(inner_optimizer)
+    self._refresh_prodigy_plus_late_param_group_state(inner_optimizer, split_groups=prodigy_plus_split_groups)
 
     for group in inner_optimizer.param_groups:
         if "initial_lr" in group:
@@ -568,6 +577,54 @@ def refresh_optimizer_after_adaptive_rank_prune(
         refreshed_scheduler = new_inner_scheduler
 
     return refreshed_scheduler, lr_descriptions
+
+
+def refresh_optimizer_param_groups_after_adaptive_rank_resume(
+    self,
+    args: argparse.Namespace,
+    accelerator,
+    network: Any,
+    optimizer: torch.optim.Optimizer,
+    *,
+    old_network_param_ids: set[int],
+) -> list[str]:
+    unwrapped_network = accelerator.unwrap_model(network)
+    new_network_param_groups, lr_descriptions = self._prepare_network_optimizer_params(args, unwrapped_network)
+
+    inner_optimizer = optimizer.optimizer if hasattr(optimizer, "optimizer") else optimizer
+    prodigy_plus_split_groups = self._get_prodigy_plus_split_groups(inner_optimizer)
+
+    preserved_extra_groups = []
+    preserved_extra_param_ids: set[int] = set()
+    for group in inner_optimizer.param_groups:
+        extra_params = [param for param in group["params"] if id(param) not in old_network_param_ids]
+        if not extra_params:
+            continue
+        group_copy = {k: v for k, v in group.items() if k != "params"}
+        group_copy["params"] = extra_params
+        preserved_extra_groups.append(group_copy)
+        preserved_extra_param_ids.update(id(param) for param in extra_params)
+
+    normalized_network_groups = []
+    new_network_param_ids: set[int] = set()
+    for group in new_network_param_groups:
+        group_copy = {k: v for k, v in group.items() if k != "params"}
+        params = list(group["params"])
+        group_copy["params"] = params
+        normalized_network_groups.append(group_copy)
+        new_network_param_ids.update(id(param) for param in params)
+
+    keep_param_ids = new_network_param_ids | preserved_extra_param_ids
+    inner_optimizer.state = self._copy_optimizer_state_subset(inner_optimizer.state, keep_param_ids)
+    inner_optimizer.param_groups = []
+
+    for group in normalized_network_groups:
+        inner_optimizer.add_param_group(group)
+    for group in preserved_extra_groups:
+        inner_optimizer.add_param_group(group)
+    self._refresh_prodigy_plus_late_param_group_state(inner_optimizer, split_groups=prodigy_plus_split_groups)
+
+    return lr_descriptions
 
 
 def register_optimizer_resume_safe_globals(args: argparse.Namespace) -> None:

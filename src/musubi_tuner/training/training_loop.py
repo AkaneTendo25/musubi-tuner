@@ -760,6 +760,8 @@ def train(self, args):
                     logger.warning(f"Failed to save uncertainty log-variance params: {e}")
 
     def load_model_hook(models, input_dir):
+        nonlocal lr_descriptions
+
         # remove models except network
         remove_indices = []
         for i, model in enumerate(models):
@@ -773,6 +775,8 @@ def train(self, args):
             try:
                 runtime_state_path = None
                 adaptive_rank_runtime_state = None
+                adaptive_rank_model = None
+                old_adaptive_rank_param_ids = None
                 for model in models:
                     unwrapped_model = accelerator.unwrap_model(model)
                     if not hasattr(unwrapped_model, "load_adaptive_rank_runtime_state"):
@@ -782,6 +786,9 @@ def train(self, args):
                         continue
                     with open(runtime_state_path, "r", encoding="utf-8") as f:
                         adaptive_rank_runtime_state = json.load(f)
+                    adaptive_rank_model = model
+                    if hasattr(unwrapped_model, "get_trainable_params"):
+                        old_adaptive_rank_param_ids = {id(param) for param in unwrapped_model.get_trainable_params()}
                     break
 
                 if adaptive_rank_runtime_state is not None:
@@ -789,6 +796,15 @@ def train(self, args):
                         unwrapped_model = accelerator.unwrap_model(model)
                         if hasattr(unwrapped_model, "load_adaptive_rank_runtime_state"):
                             unwrapped_model.load_adaptive_rank_runtime_state(adaptive_rank_runtime_state)
+                    if adaptive_rank_model is not None and old_adaptive_rank_param_ids is not None:
+                        lr_descriptions = self._refresh_optimizer_param_groups_after_adaptive_rank_resume(
+                            args,
+                            accelerator,
+                            adaptive_rank_model,
+                            optimizer,
+                            old_network_param_ids=old_adaptive_rank_param_ids,
+                        )
+                        logger.info("Refreshed optimizer param groups after adaptive rank runtime state resume")
                     logger.info("Loaded adaptive rank runtime state from %s", runtime_state_path)
             except Exception as e:
                 logger.warning(f"Failed to load adaptive rank runtime state: {e}")
