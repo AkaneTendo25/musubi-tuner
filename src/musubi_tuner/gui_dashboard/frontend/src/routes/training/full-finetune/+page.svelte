@@ -289,7 +289,7 @@
 		update('qgalore_proj_bits', 4);
 		update('qgalore_proj_group_size', 256);
 		update('qgalore_weight_bits', 8);
-		update('qgalore_weight_group_size', 256);
+		update('qgalore_weight_group_size', 0);
 		update('qgalore_stochastic_round', true);
 		update('qgalore_load_device', 'cuda');
 		update('qgalore_svd_method', 'lowrank');
@@ -327,7 +327,7 @@
 			update('qgalore_targets', 'video');
 			update('qgalore_load_device', 'cuda');
 			update('qgalore_weight_bits', 8);
-			update('qgalore_weight_group_size', 256);
+			update('qgalore_weight_group_size', 0);
 			update('qgalore_stochastic_round', true);
 			update('qgalore_dequantize_save', true);
 			update('qgalore_streaming_dequantize_save', true);
@@ -595,7 +595,7 @@
 					<FormField type="number" fieldPath="full_finetune.qgalore_proj_bits" value={t.qgalore_proj_bits ?? 4} oninput={(e) => update('qgalore_proj_bits', Number(e.target.value))} min={1} />
 					<FormField type="number" fieldPath="full_finetune.qgalore_proj_group_size" value={t.qgalore_proj_group_size ?? 256} oninput={(e) => update('qgalore_proj_group_size', Number(e.target.value))} min={1} />
 					<FormField type="number" fieldPath="full_finetune.qgalore_weight_bits" value={t.qgalore_weight_bits ?? 8} oninput={(e) => update('qgalore_weight_bits', Number(e.target.value))} min={1} />
-					<FormField type="number" fieldPath="full_finetune.qgalore_weight_group_size" value={t.qgalore_weight_group_size ?? 256} oninput={(e) => update('qgalore_weight_group_size', Number(e.target.value))} min={1} />
+					<FormField type="number" fieldPath="full_finetune.qgalore_weight_group_size" value={t.qgalore_weight_group_size ?? 0} oninput={(e) => update('qgalore_weight_group_size', Number(e.target.value))} min={0} tooltip="0 = row-wise (one scale per output channel, recommended); >0 = flattened groups." />
 				</div>
 				<div class="grid grid-cols-2 gap-2">
 					<FormField type="number" fieldPath="full_finetune.qgalore_min_weight_numel" value={t.qgalore_min_weight_numel ?? 16384} oninput={(e) => update('qgalore_min_weight_numel', Number(e.target.value))} min={0} />

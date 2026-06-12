@@ -710,7 +710,7 @@ class FullFinetuneConfig(TrainingConfig):
     qgalore_proj_bits: int = 4
     qgalore_proj_group_size: int = 256
     qgalore_weight_bits: int = 8
-    qgalore_weight_group_size: int = 256
+    qgalore_weight_group_size: int = 0
     qgalore_stochastic_round: bool = True
     qgalore_min_weight_numel: int = 16384
     qgalore_max_modules: Optional[int] = None

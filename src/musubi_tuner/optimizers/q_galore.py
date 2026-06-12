@@ -329,7 +329,7 @@ class QGaLoreLinear(nn.Module):
         source: nn.Linear,
         *,
         weight_bits: int = 8,
-        group_size: int = 256,
+        group_size: int = 0,
         stochastic_round: bool = True,
     ) -> None:
         super().__init__()
@@ -462,7 +462,7 @@ def replace_ltx2_linear_with_qgalore(
     *,
     targets: str | Iterable[str] = "video",
     weight_bits: int = 8,
-    weight_group_size: int = 256,
+    weight_group_size: int = 0,
     stochastic_round: bool = True,
     min_weight_numel: int = 16384,
     max_modules: int | None = None,

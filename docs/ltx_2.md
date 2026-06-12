@@ -3727,7 +3727,7 @@ If the base optimizer supports its own stochastic rounding or optimizer-specific
 
 Q-GaLore is a quantized full-parameter fine-tuning path. Eligible LTX-2 `Linear` modules are replaced with `QGaLoreLinear` wrappers that store 8-bit quantized base weights. During training, wrapped weights are dequantized for forward/backward, dense gradients are computed for those weights, gradients are projected to rank `--qgalore_rank`, and bitsandbytes AdamW8bit applies the projected update back to the base weight shape. The updated weights are quantized again for runtime storage. With `--qgalore_dequantize_save`, enabled by default, checkpoints are saved as standard checkpoint tensors. `--qgalore_streaming_dequantize_save` is an optional lower-VRAM checkpoint export path that dequantizes and writes one selected `Linear` weight at a time; its default temporary dequantization device is CPU.
 
-**Technical tradeoffs**. Rank, projection refresh interval, projection scale, projection quantization, and target selection are training hyperparameters. Lower rank reduces memory and constrains the projected update. The `QGaLoreLinear` wrapper stores selected base weights in 8-bit form; projection matrices can be quantized separately with `--qgalore_proj_quant`, `--qgalore_proj_bits`, and `--qgalore_proj_group_size`. In the measured tables this is a VRAM reduction path, not a speed path: wrapped weights are dequantized for forward/backward, dense gradients are computed, and projection/update/requantization work is added around the optimizer step. Narrower target sets reduce the number of Q-GaLore-wrapped weights. Unwrapped trainable parameters remain in standard optimizer groups unless another freeze or learning-rate-scale option disables them. `--qgalore_load_device cpu` lowers the initial GPU peak by loading, replacing, and quantizing the transformer on CPU before moving the quantized modules to GPU. `--qgalore_targets video` Q-GaLore-wraps eligible Linear weights in the video stream inside each transformer block: `attn1`, `attn2`, and `ff`. It does not Q-GaLore-wrap audio/cross-audio modules or non-block Linear layers. `--qgalore_targets all` wraps every eligible Linear layer, including non-block layers and audio-side layers when they are present.
+**Technical tradeoffs**. Rank, projection refresh interval, projection scale, projection quantization, and target selection are training hyperparameters. Lower rank reduces memory and constrains the projected update. The `QGaLoreLinear` wrapper stores selected base weights in 8-bit form; `--qgalore_weight_group_size 0` uses row-wise scales for those weights (one scale per output channel) and is the recommended default; values greater than 0 use flattened groups. Projection matrices can be quantized separately with `--qgalore_proj_quant`, `--qgalore_proj_bits`, and `--qgalore_proj_group_size`. In the measured tables this is a VRAM reduction path, not a speed path: wrapped weights are dequantized for forward/backward, dense gradients are computed, and projection/update/requantization work is added around the optimizer step. Narrower target sets reduce the number of Q-GaLore-wrapped weights. Unwrapped trainable parameters remain in standard optimizer groups unless another freeze or learning-rate-scale option disables them. `--qgalore_load_device cpu` lowers the initial GPU peak by loading, replacing, and quantizing the transformer on CPU before moving the quantized modules to GPU. `--qgalore_targets video` Q-GaLore-wraps eligible Linear weights in the video stream inside each transformer block: `attn1`, `attn2`, and `ff`. It does not Q-GaLore-wrap audio/cross-audio modules or non-block Linear layers. `--qgalore_targets all` wraps every eligible Linear layer, including non-block layers and audio-side layers when they are present.
 
 Required constraints are enforced by the trainer:
 
@@ -3766,7 +3766,7 @@ accelerate launch --num_processes 1 --num_cpu_threads_per_process 1 --mixed_prec
   --qgalore_svd_oversampling 32 \
   --qgalore_svd_niter 1 \
   --qgalore_weight_bits 8 \
-  --qgalore_weight_group_size 256 \
+  --qgalore_weight_group_size 0 \
   --qgalore_stochastic_round \
   --max_grad_norm 0 \
   --lr_scheduler constant_with_warmup \
@@ -3840,7 +3840,7 @@ accelerate launch --num_processes 1 --num_cpu_threads_per_process 1 --mixed_prec
   --qgalore_full_ft \
   --qgalore_targets all \
   --qgalore_weight_bits 8 \
-  --qgalore_weight_group_size 256 \
+  --qgalore_weight_group_size 0 \
   --qgalore_stochastic_round \
   --apollo_rank 256 \
   --apollo_update_proj_gap 200 \
@@ -3959,7 +3959,7 @@ accelerate launch --num_processes 1 --num_cpu_threads_per_process 1 --mixed_prec
   --qgalore_svd_oversampling 32 \
   --qgalore_svd_niter 1 \
   --qgalore_weight_bits 8 \
-  --qgalore_weight_group_size 256 \
+  --qgalore_weight_group_size 0 \
   --qgalore_stochastic_round \
   --max_grad_norm 0 \
   --lr_scheduler constant_with_warmup \

@@ -2215,7 +2215,12 @@ def ltx2_finetune_setup_parser(parser: argparse.ArgumentParser) -> argparse.Argu
     parser.add_argument("--qgalore_proj_bits", type=int, default=4, help="Projection matrix quantization bits.")
     parser.add_argument("--qgalore_proj_group_size", type=int, default=256, help="Projection quantization group size.")
     parser.add_argument("--qgalore_weight_bits", type=int, default=8, help="Q-GaLore Linear weight quantization bits.")
-    parser.add_argument("--qgalore_weight_group_size", type=int, default=256, help="Q-GaLore Linear weight group size.")
+    parser.add_argument(
+        "--qgalore_weight_group_size",
+        type=int,
+        default=0,
+        help="Q-GaLore Linear weight quantization granularity: 0 = row-wise; >0 = flattened groups of this many values.",
+    )
     parser.add_argument(
         "--qgalore_stochastic_round",
         action=argparse.BooleanOptionalAction,
@@ -3605,11 +3610,14 @@ def main() -> None:
     if bool(getattr(args, "qgalore_full_ft", False)):
         from musubi_tuner.optimizers.q_galore import replace_ltx2_linear_with_qgalore
 
+        qgalore_weight_group_size = getattr(args, "qgalore_weight_group_size", 0)
+        if qgalore_weight_group_size is None:
+            qgalore_weight_group_size = 0
         qgalore_summary = replace_ltx2_linear_with_qgalore(
             transformer,
             targets=getattr(args, "qgalore_targets", "video"),
             weight_bits=int(getattr(args, "qgalore_weight_bits", 8) or 8),
-            weight_group_size=int(getattr(args, "qgalore_weight_group_size", 256) or 256),
+            weight_group_size=int(qgalore_weight_group_size),
             stochastic_round=bool(getattr(args, "qgalore_stochastic_round", True)),
             min_weight_numel=int(getattr(args, "qgalore_min_weight_numel", 16384) or 0),
             max_modules=getattr(args, "qgalore_max_modules", None),

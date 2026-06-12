@@ -645,6 +645,12 @@ def _patch_apollo_adamw_fused_step_param(optimizer: Any) -> bool:
 
 
 def _patch_qapollo_adamw_fused_step_param(optimizer: Any) -> bool:
+    def _qapollo_group_size(p: torch.nn.Parameter) -> int:
+        group_size = int(getattr(p, "group_size", -1))
+        if group_size == 0 and p.dim() == 2:
+            return int(p.shape[-1])
+        return group_size
+
     def step_param(self, p: torch.nn.Parameter, group: dict[str, Any]) -> None:
         with torch.no_grad():
             uses_float_grad = getattr(p, "float_grad", None) is not None
@@ -662,6 +668,7 @@ def _patch_qapollo_adamw_fused_step_param(optimizer: Any) -> bool:
                 self.initialized = True
 
             if uses_float_grad:
+                q_group_size = _qapollo_group_size(p)
                 if torch.distributed.is_available() and torch.distributed.is_initialized():
                     world_size = torch.distributed.get_world_size()
                     if world_size > 1:
@@ -669,7 +676,7 @@ def _patch_qapollo_adamw_fused_step_param(optimizer: Any) -> bool:
                         torch.distributed.all_gather(grad_list, p.float_grad)
                         p.float_grad.copy_(sum(grad_list) / float(world_size))
 
-                p.data = self._dequantize(p.data, p.float_grad.dtype, p.group_size, p.scales, p.zeros).clone().to(p.device)
+                p.data = self._dequantize(p.data, p.float_grad.dtype, q_group_size, p.scales, p.zeros).clone().to(p.device)
 
             state = self.state[p]
             if "step" not in state:
@@ -728,10 +735,11 @@ def _patch_qapollo_adamw_fused_step_param(optimizer: Any) -> bool:
 
             if uses_float_grad:
                 float_weight = p.data.clone()
+                q_group_size = _qapollo_group_size(p)
                 if bool(getattr(p, "stochastic_round", False)):
-                    p.data, p.scales, p.zeros = self._quantize_stochastic_round(float_weight, q_group_size=p.group_size)
+                    p.data, p.scales, p.zeros = self._quantize_stochastic_round(float_weight, q_group_size=q_group_size)
                 else:
-                    p.data, p.scales, p.zeros = self._quantize(float_weight, q_group_size=p.group_size)
+                    p.data, p.scales, p.zeros = self._quantize(float_weight, q_group_size=q_group_size)
                 p.float_grad = None
                 owner_ref = getattr(p, "_qgalore_owner", None)
                 owner = owner_ref() if callable(owner_ref) else None
