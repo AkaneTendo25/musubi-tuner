@@ -19,7 +19,7 @@ import pyarrow.parquet as pq
 
 from musubi_tuner.gui_dashboard.process_manager import ProcessManager
 from musubi_tuner.gui_dashboard.project_schema import ProjectConfig
-from musubi_tuner.gui_dashboard.routers import datasets, filesystem, processes, projects, stats, system
+from musubi_tuner.gui_dashboard.routers import datasets, filesystem, processes, projects, stats, system, tools
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +60,7 @@ def create_management_app(project_path: Optional[str] = None, dev_frontend_url: 
     app.include_router(filesystem.router)
     app.include_router(system.router)
     app.include_router(stats.router)
+    app.include_router(tools.router)
 
     # Metrics router — dynamically bound to training output_dir
     @app.get("/data/metrics.parquet")

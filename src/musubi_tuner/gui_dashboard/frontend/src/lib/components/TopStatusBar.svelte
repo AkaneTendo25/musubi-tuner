@@ -16,6 +16,7 @@
 		'/': 'Overview',
 		'/dataset': 'Dataset',
 		'/caching': 'Caching',
+		'/tools': 'Tools',
 		'/samples': 'Samples',
 		'/training': 'Training',
 		'/training/techniques': 'Methods',
