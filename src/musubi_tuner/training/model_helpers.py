@@ -67,3 +67,14 @@ def load_network_weights(self, file: str, network_module: lora_module) -> dict[s
     else:
         weights_sd = torch.load(file, map_location="cpu")
     return self.convert_weight_keys(weights_sd, network_module)
+
+
+def load_network_state_dict(
+    network: torch.nn.Module,
+    weights_sd: dict[str, torch.Tensor],
+    strict: bool = False,
+):
+    custom_loader = getattr(network, "load_weights_state_dict", None)
+    if callable(custom_loader):
+        return custom_loader(weights_sd, strict)
+    return network.load_state_dict(weights_sd, strict)

@@ -37,6 +37,7 @@ from musubi_tuner.modules.scheduling_flow_match_discrete import FlowMatchDiscret
 from musubi_tuner.ogm_ge import compute_ogm_ge_coefficients, maybe_add_ogm_ge_gradient_noise
 from musubi_tuner.training.accelerator_setup import clean_memory_on_device, collator_class, prepare_accelerator
 from musubi_tuner.training.losses import apply_loss_mask, per_element_loss as _per_element_loss
+from musubi_tuner.training.model_helpers import load_network_state_dict
 from musubi_tuner.training.metadata import (
     SS_METADATA_KEY_BASE_MODEL_VERSION,
     SS_METADATA_KEY_NETWORK_ALPHA,
@@ -444,7 +445,7 @@ def train(self, args):
     if args.network_weights is not None:
         # FIXME consider alpha of weights: this assumes that the alpha is not changed
         weights_sd = self.load_network_weights(args.network_weights, network_module)
-        info = network.load_state_dict(weights_sd, False)
+        info = load_network_state_dict(network, weights_sd, False)
         accelerator.print(f"load network weights from {args.network_weights}: {info}")
 
     # LyCORIS + FP8 backend compatibility:

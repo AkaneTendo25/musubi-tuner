@@ -66,6 +66,7 @@ from musubi_tuner.ltx2_remote_stage import (
     prune_ltx2_blocks_to_range,
 )
 from musubi_tuner.modules.nf4_optimization_utils import DEFAULT_NF4_BLOCK_SIZE
+from musubi_tuner.training.model_helpers import load_network_state_dict
 
 logger = logging.getLogger(__name__)
 
@@ -158,7 +159,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--network_args", type=str, nargs="*", default=None, help="Remote LoRA network args, key=value")
     parser.add_argument("--network_weights", type=str, default=None, help="Optional remote LoRA weights to load")
     parser.add_argument("--network_lr", type=float, default=None, help="Remote LoRA learning rate. Defaults to --learning_rate.")
-    parser.add_argument("--ltx2_mode", "--ltx_mode", dest="ltx_mode", choices=["video", "av", "audio", "v", "a", "va"], default="video")
+    parser.add_argument(
+        "--ltx2_mode", "--ltx_mode", dest="ltx_mode", choices=["video", "av", "audio", "v", "a", "va"], default="video"
+    )
     parser.add_argument("--ltx2_audio_only_model", action="store_true")
     parser.add_argument("--attn_mode", choices=["torch", "sdpa", "flash", "flash3", "xformers"], default="torch")
     parser.add_argument("--fp8_scaled", action="store_true")
@@ -381,8 +384,7 @@ def _load_ltx2_remote_block_only_model(
     missing_owned = [
         key
         for key in incompatible.missing_keys
-        if _REMOTE_BLOCK_KEY_RE.search(key)
-        and start <= int(_REMOTE_BLOCK_KEY_RE.search(key).group(1)) < resolved_end
+        if _REMOTE_BLOCK_KEY_RE.search(key) and start <= int(_REMOTE_BLOCK_KEY_RE.search(key).group(1)) < resolved_end
     ]
     if missing_owned:
         preview = ", ".join(missing_owned[:8])
@@ -451,7 +453,7 @@ def _build_remote_network(args: argparse.Namespace, model: torch.nn.Module, devi
         raise RuntimeError(f"network module {args.network_module!r} returned None")
     network.apply_to(None, model, apply_text_encoder=False, apply_unet=True)
     if args.network_weights is not None:
-        info = network.load_state_dict(_load_network_weights(args.network_weights), strict=False)
+        info = load_network_state_dict(network, _load_network_weights(args.network_weights), strict=False)
         logger.info("Loaded remote network weights from %s: %s", args.network_weights, info)
     network.to(device)
     network.train()
@@ -513,11 +515,7 @@ def main() -> None:
             "Loading shared/non-stage LTX tensors on CUDA can OOM small remote GPUs before pruning."
         )
     end_index = None if int(args.end) < 0 else int(args.end)
-    stage_load_range = (
-        (int(args.split), end_index)
-        if bool(args.prune_non_stage_blocks or args.network_module)
-        else None
-    )
+    stage_load_range = (int(args.split), end_index) if bool(args.prune_non_stage_blocks or args.network_module) else None
     if args.block_only_load:
         if not stage_only_device_placement:
             raise ValueError("--block_only_load requires --stage_only_device_placement or --prune_non_stage_blocks")

@@ -10,6 +10,7 @@ from safetensors import safe_open
 
 from musubi_tuner.networks import lora
 from musubi_tuner.networks import lora_ltx2
+from musubi_tuner.training.model_helpers import load_network_state_dict
 
 logger = logging.getLogger(__name__)
 
@@ -100,10 +101,7 @@ def apply_lora_network_for_inference(
         return "merged"
 
     net.apply_to(None, transformer, apply_text_encoder=False, apply_unet=True)
-    if hasattr(net, "load_weights_state_dict"):
-        info = net.load_weights_state_dict(lora_sd, False)
-    else:
-        info = net.load_state_dict(lora_sd, False)
+    info = load_network_state_dict(net, lora_sd, False)
     net.eval()
     net.requires_grad_(False)
     for module in iter_lora_modules(net):

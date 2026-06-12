@@ -38,6 +38,7 @@ from musubi_tuner.ltx2_train_network import LTX2NetworkTrainer, ltx2_setup_parse
 from musubi_tuner.modules.nf4_optimization_utils import dequantize_nf4_block, is_nf4_module
 from musubi_tuner.modules.scheduling_flow_match_discrete import FlowMatchDiscreteScheduler
 from musubi_tuner.networks.lora_ltx2 import LTX2_LORA_TARGET_PRESETS
+from musubi_tuner.training.model_helpers import load_network_state_dict
 from musubi_tuner.training.parser_common import read_config_from_file, setup_parser_common
 from musubi_tuner.training.timesteps import compute_loss_weighting_for_sd3
 
@@ -350,7 +351,7 @@ def _apply_estimation_network(
         for_inference=False,
     )
     network.apply_to(None, transformer, apply_text_encoder=False, apply_unet=True)
-    info = network.load_state_dict(weights_sd, False)
+    info = load_network_state_dict(network, weights_sd, False)
     network.train()
     network.requires_grad_(False)
 
