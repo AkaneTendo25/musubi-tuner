@@ -474,6 +474,30 @@ accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 ltx2_tr
 
 DokR is also opt-in. Without `use_dora=true`, `networks.lokr` keeps the regular LoKr path.
 
+DoRA-OFT and DoKr-OFT add an opt-in OFT rotation to the DoRA/DokR magnitude path. Use `use_dora_oft=true` instead of `use_dora=true`; the two modes are mutually exclusive, and adaptive rank is not supported with DoRA-OFT/DoKr-OFT.
+
+```bash
+# Native LoRA + DoRA-OFT
+accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 ltx2_train_network.py ^
+  ... (same args as standard LoRA) ^
+  --network_module networks.lora_ltx2 ^
+  --network_dim 32 ^
+  --network_alpha 16 ^
+  --network_args "use_dora_oft=true" ^
+  --output_name ltx2_dora_oft
+
+# Native LoKr + DoKr-OFT
+accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 ltx2_train_network.py ^
+  ... (same args as standard LoRA) ^
+  --network_module networks.lokr ^
+  --network_dim 16 ^
+  --network_alpha 16 ^
+  --network_args "use_dora_oft=true" ^
+  --output_name ltx2_dokr_oft
+```
+
+In the dashboard, enable **DoRA-OFT / DoKr-OFT** in the LoRA section. When disabled, the generated command does not include `use_dora_oft=true`.
+
 ### Advanced: LyCORIS/LoKR Training
 <sub>[↑ contents](#table-of-contents)</sub>
 
@@ -2252,7 +2276,7 @@ Prompt-level `--w`, `--h`, `--f`, and `--s` values override preset defaults. For
 #### Checkpoint Output Format
 <sub>[↑ contents](#table-of-contents)</sub>
 
-Saved LoRA checkpoints are converted to ComfyUI format by default. Both the original musubi-tuner format and the ComfyUI format are kept. For the standalone conversion utility, see `convert_lora.py`.
+Saved LoRA checkpoints are converted to ComfyUI format by default. Both the original musubi-tuner format and the ComfyUI format are kept. For standalone LTX-2 conversion, use `python -m musubi_tuner.ltx2_convert_lora_to_comfy`.
 
 | Flag | Behavior |
 |------|----------|
@@ -2265,6 +2289,24 @@ Saved LoRA checkpoints are converted to ComfyUI format by default. Both the orig
 > ComfyUI-only LoRA files can still be used for warm-starting via `--network_weights`, `--base_weights`, or `--dim_from_weights`; only full `--resume` requires the original checkpoint plus saved training state.
 
 For DoRA LoRA and DokR LoKr, keep the original `*.safetensors` file for Musubi loading and resume. The training-time ComfyUI export is intended for ComfyUI and stores `dora_scale`; converting that file back to native Musubi DoRA/DokR requires base-weight information that is not present in the standalone ComfyUI checkpoint.
+
+DoRA-OFT and DoKr-OFT exports preserve the native OFT tensors (`.oft_R.*` plus OFT metadata). DoRA-OFT reverse conversion can keep the native `dora_scale`; DoKr-OFT reverse conversion requires the original base transformer to reconstruct Musubi's `lora_magnitude_vector.weight` exactly.
+
+```bash
+# Musubi -> ComfyUI, standalone
+python -m musubi_tuner.ltx2_convert_lora_to_comfy output/adapter.safetensors ^
+  --output output/adapter.comfy.safetensors ^
+  --base_model /models/ltx-2.3-22b-dev.safetensors ^
+  --dora_ff_only
+
+# ComfyUI -> Musubi, standalone
+python -m musubi_tuner.ltx2_convert_comfy_to_musubi ^
+  --input output/adapter.comfy.safetensors ^
+  --output output/adapter.musubi.safetensors ^
+  --base_model /models/ltx-2.3-22b-dev.safetensors
+```
+
+The dashboard **Tools** tab includes a **ComfyUI Conversion** panel for one-shot conversion of an existing Musubi adapter. It uses the loaded project's LTX-2 mode, audio-only, FP8/W8A8, NF4, and quantization settings when a base transformer is needed for DoRA/DokR conversion.
 
 Checkpoint rotation (`--save_last_n_epochs`) cleans up old ComfyUI checkpoints alongside originals. HuggingFace upload (`--huggingface_repo_id`) uploads both formats by default. Use `--no_save_original_lora` to upload only the ComfyUI checkpoint.
 
