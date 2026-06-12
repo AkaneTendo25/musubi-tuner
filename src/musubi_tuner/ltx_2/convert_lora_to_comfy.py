@@ -1,5 +1,8 @@
 """
-Convert LTX-2 LoRA from training format to ComfyUI format
+Convert LTX-2 LoRA from training format to ComfyUI format.
+
+Compatibility module for existing training-time imports. New standalone
+one-shot workflows should prefer ``python -m musubi_tuner.ltx2_convert_lora_to_comfy``.
 
 Training format:
   - Keys: lora_unet_model_transformer_blocks_0_attn1_to_k.lora_down.weight
@@ -17,12 +20,24 @@ ComfyUI format:
 
 import safetensors.torch
 import argparse
+import gc
 import os
 from pathlib import Path
 import torch
 
 from musubi_tuner.networks import lora as lora_module
 from musubi_tuner.networks import lokr as lokr_module
+from musubi_tuner.utils import model_utils
+
+
+def _release_torch_memory():
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    if hasattr(torch, "xpu") and torch.xpu.is_available():
+        torch.xpu.empty_cache()
+    if hasattr(torch, "mps") and hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        torch.mps.empty_cache()
 
 
 def _group_lora_keys_by_module(state_dict):
@@ -50,6 +65,24 @@ def _build_lora_base_module_lookup(network):
     return lookup
 
 
+def _build_lora_module_lookup(base_model):
+    if base_model is None:
+        return {}
+
+    lookup = {}
+    for name, module in base_model.named_modules():
+        if not name:
+            continue
+        if module.__class__.__name__ not in {"Linear", "Conv2d"}:
+            continue
+        normalized = name.replace(".", "_")
+        lookup[f"lora_unet_{normalized}"] = module
+        lookup[f"lora_unet_model_{normalized}"] = module
+        if name.startswith("model."):
+            lookup[f"lora_unet_{name[len('model.') :].replace('.', '_')}"] = module
+    return lookup
+
+
 def _get_comfy_output_axis_norm(weight):
     return weight.reshape(weight.shape[0], -1).norm(dim=1, keepdim=True).reshape(weight.shape[0], *([1] * (weight.dim() - 1)))
 
@@ -64,6 +97,14 @@ def _reshape_dora_scale_for_comfy_output_axis(dora_scale, base_weight):
 
 def _module_state_is_lokr(module_state):
     return any(key in module_state for key in ("lokr_w1", "lokr_w2", "lokr_w2_a", "lokr_w2_b"))
+
+
+def _module_state_is_oft(module_state):
+    return any(key.startswith("oft_") or key.startswith("oft_R.") for key in module_state.keys())
+
+
+def _state_dict_has_native_oft_adapter(state_dict):
+    return any(".oft_R.weight" in key for key in state_dict.keys())
 
 
 def _resolve_lokr_scale(module_state):
@@ -107,7 +148,7 @@ def _convert_dora_magnitude_to_comfy_scale(module_name, module_state, base_modul
         scale = _resolve_lokr_scale(module_state)
         diff_weight = lokr_module._materialize_lokr_weight_from_state_dict(module_state, scale, base_weight.device)
         diff_weight = diff_weight.to(device=base_weight.device, dtype=base_weight.dtype)
-        weight_norm = torch.linalg.vector_norm(base_weight + diff_weight, dim=1)
+        weight_norm = lokr_module._get_dokr_weight_norm(base_weight, diff_weight)
     else:
         raise ValueError(f"DoRA/DokR module {module_name} is missing supported adapter weights")
 
@@ -203,6 +244,7 @@ def convert_key_to_comfy(key, preserve_alpha=False):
     converted = re.sub(r"_to_k($|\.)", r".to_k\1", converted)
     converted = re.sub(r"_to_q($|\.)", r".to_q\1", converted)
     converted = re.sub(r"_to_v($|\.)", r".to_v\1", converted)
+    converted = re.sub(r"_to_gate_logits($|\.)", r".to_gate_logits\1", converted)
     converted = re.sub(r"_to_out\.", r".to_out.", converted)
     converted = re.sub(r"_to_out_", r".to_out.", converted)
 
@@ -252,6 +294,30 @@ def convert_key_from_comfy(key):
     elif key.endswith(".dora_scale"):
         weight_part = "lora_magnitude_vector.weight"
         path = key[: -len(".dora_scale")]
+    elif key.endswith(".initial_norm"):
+        weight_part = "initial_norm"
+        path = key[: -len(".initial_norm")]
+    elif key.endswith(".oft_R.weight"):
+        weight_part = "oft_R.weight"
+        path = key[: -len(".oft_R.weight")]
+    elif key.endswith(".oft_R.scaled_oft"):
+        weight_part = "oft_R.scaled_oft"
+        path = key[: -len(".oft_R.scaled_oft")]
+    elif key.endswith(".oft_block_size_metadata"):
+        weight_part = "oft_block_size_metadata"
+        path = key[: -len(".oft_block_size_metadata")]
+    elif key.endswith(".oft_block_share_metadata"):
+        weight_part = "oft_block_share_metadata"
+        path = key[: -len(".oft_block_share_metadata")]
+    elif key.endswith(".oft_coft_metadata"):
+        weight_part = "oft_coft_metadata"
+        path = key[: -len(".oft_coft_metadata")]
+    elif key.endswith(".coft_eps_metadata"):
+        weight_part = "coft_eps_metadata"
+        path = key[: -len(".coft_eps_metadata")]
+    elif key.endswith(".scaled_oft_metadata"):
+        weight_part = "scaled_oft_metadata"
+        path = key[: -len(".scaled_oft_metadata")]
     elif key.endswith(".lokr_w1"):
         weight_part = "lokr_w1"
         path = key[: -len(".lokr_w1")]
@@ -287,13 +353,51 @@ def is_comfy_lora_state_dict(weights_sd):
     """Return True if the state dict looks like an LTX-2 ComfyUI LoRA."""
     if not weights_sd:
         return False
-    keys = list(weights_sd.keys())
-    return any(
-        key.startswith("diffusion_model.") and (".lora_" in key or ".lokr_" in key or key.endswith(".dora_scale")) for key in keys
+    recognized_suffixes = (
+        ".lora_A.weight",
+        ".lora_B.weight",
+        ".alpha",
+        ".dora_scale",
+        ".initial_norm",
+        ".oft_R.weight",
+        ".oft_R.scaled_oft",
+        ".oft_block_size_metadata",
+        ".oft_block_share_metadata",
+        ".oft_coft_metadata",
+        ".coft_eps_metadata",
+        ".scaled_oft_metadata",
+        ".lokr_w1",
+        ".lokr_w2",
+        ".lokr_w2_a",
+        ".lokr_w2_b",
     )
+    return any(key.startswith("diffusion_model.") and key.endswith(recognized_suffixes) for key in weights_sd.keys())
 
 
-def convert_lora_to_comfy_state_dict(trained_state_dict, verbose=False, network=None):
+def _is_ltx2_gate_logits_module(module_name: str) -> bool:
+    return module_name.endswith("_to_gate_logits")
+
+
+def _is_ltx2_feed_forward_module(module_name: str) -> bool:
+    return "_ff_" in module_name
+
+
+def _should_skip_comfy_dora_scale(module_name: str, *, skip_gate_logits_dora: bool, dora_ff_only: bool) -> bool:
+    if dora_ff_only and not _is_ltx2_feed_forward_module(module_name):
+        return True
+    if skip_gate_logits_dora and _is_ltx2_gate_logits_module(module_name):
+        return True
+    return False
+
+
+def convert_lora_to_comfy_state_dict(
+    trained_state_dict,
+    verbose=False,
+    network=None,
+    base_model=None,
+    skip_gate_logits_dora=False,
+    dora_ff_only=False,
+):
     """Convert a training-format LTX-2 LoRA state dict to ComfyUI format."""
     # Collect alpha and rank per LoRA module to fold scale into weights
     lora_alpha = {}
@@ -315,7 +419,17 @@ def convert_lora_to_comfy_state_dict(trained_state_dict, verbose=False, network=
     dora_scales = {}
     if dora_modules:
         base_modules = _build_lora_base_module_lookup(network)
-        missing = [module_name for module_name in dora_modules if module_name not in base_modules]
+        base_modules.update(_build_lora_module_lookup(base_model))
+        modules_needing_base = [
+            module_name
+            for module_name in dora_modules
+            if not _should_skip_comfy_dora_scale(
+                module_name,
+                skip_gate_logits_dora=skip_gate_logits_dora,
+                dora_ff_only=dora_ff_only,
+            )
+        ]
+        missing = [module_name for module_name in modules_needing_base if module_name not in base_modules]
         if missing:
             missing_list = ", ".join(missing[:3])
             if len(missing) > 3:
@@ -325,10 +439,28 @@ def convert_lora_to_comfy_state_dict(trained_state_dict, verbose=False, network=
                 f"native magnitude vectors can be translated to dora_scale. Missing base modules: {missing_list}"
             )
         for module_name in dora_modules:
+            module_state = grouped_modules[module_name]
+            is_stock_comfy_dokr = _module_state_is_lokr(module_state) and not _module_state_is_oft(module_state)
+            if dora_ff_only and not _is_ltx2_feed_forward_module(module_name):
+                trained_state_dict = dict(trained_state_dict)
+                trained_state_dict.pop(f"{module_name}.lora_magnitude_vector.weight", None)
+                if is_stock_comfy_dokr:
+                    trained_state_dict.pop(f"{module_name}.initial_norm", None)
+                if verbose:
+                    print(f"Skipped ComfyUI DoRA scale for non-FF LTX-2 module: {module_name}")
+                continue
+            if skip_gate_logits_dora and _is_ltx2_gate_logits_module(module_name):
+                trained_state_dict = dict(trained_state_dict)
+                trained_state_dict.pop(f"{module_name}.lora_magnitude_vector.weight", None)
+                if is_stock_comfy_dokr:
+                    trained_state_dict.pop(f"{module_name}.initial_norm", None)
+                if verbose:
+                    print(f"Skipped ComfyUI DoRA scale for LTX-2 gate logits: {module_name}")
+                continue
             magnitude_key = f"{module_name}.lora_magnitude_vector.weight"
             dora_scales[magnitude_key] = _convert_dora_magnitude_to_comfy_scale(
                 module_name,
-                grouped_modules[module_name],
+                module_state,
                 base_modules[module_name],
             )
 
@@ -421,7 +553,28 @@ def convert_lora_from_comfy_state_dict(comfy_state_dict):
     return converted_state_dict
 
 
-def convert_lora_to_comfy(input_path, output_path=None, verbose=False, network=None):
+def convert_lora_to_comfy(
+    input_path,
+    output_path=None,
+    verbose=False,
+    network=None,
+    base_model=None,
+    base_model_path=None,
+    audio_video=False,
+    audio_only_model=False,
+    base_dtype="float32",
+    device="cpu",
+    fp8_base=False,
+    fp8_scaled=False,
+    fp8_w8a8=False,
+    w8a8_mode="int8",
+    fp8_keep_blocks=None,
+    nf4_base=False,
+    nf4_block_size=32,
+    quantize_device=None,
+    skip_gate_logits_dora=False,
+    dora_ff_only=False,
+):
     """
     Convert a LoRA file from training format to ComfyUI format
 
@@ -435,37 +588,100 @@ def convert_lora_to_comfy(input_path, output_path=None, verbose=False, network=N
         Path to the output file
     """
     print(f"Loading LoRA from: {input_path}")
+    loaded_base_model = False
+    trained_state_dict = None
+    comfy_state_dict = None
 
-    # Load the trained LoRA
-    trained_state_dict = safetensors.torch.load_file(input_path)
-
-    print(f"Input LoRA has {len(trained_state_dict)} keys")
-
-    comfy_state_dict = convert_lora_to_comfy_state_dict(trained_state_dict, verbose=verbose, network=network)
-    print(f"Output LoRA has {len(comfy_state_dict)} keys")
-
-    # Determine output path
-    if output_path is None:
-        input_file = Path(input_path)
-        output_path = input_file.parent / f"{input_file.stem}.comfy{input_file.suffix}"
-
-    # Load metadata from the original file
-    metadata = None
     try:
-        with safetensors.safe_open(input_path, framework="pt") as f:
-            metadata = f.metadata()
-        if metadata:
-            print(f"Preserving {len(metadata)} metadata entries")
-    except Exception as e:
-        print(f"Warning: Could not read metadata: {e}")
+        trained_state_dict = safetensors.torch.load_file(input_path)
+        print(f"Input LoRA has {len(trained_state_dict)} keys")
 
-    # Save the converted LoRA
-    print(f"\nSaving ComfyUI-compatible LoRA to: {output_path}")
-    safetensors.torch.save_file(comfy_state_dict, output_path, metadata=metadata)
+        needs_base = (
+            base_model is None
+            and network is None
+            and any(".lora_magnitude_vector.weight" in key for key in trained_state_dict.keys())
+        )
+        if needs_base and base_model_path is not None:
+            from musubi_tuner.ltx2_model_loading import load_ltx2_model
 
-    print("[OK] Conversion complete!")
+            print(f"Loading base LTX-2 transformer from: {base_model_path}")
+            if nf4_base and fp8_base:
+                raise ValueError("nf4_base and fp8_base are mutually exclusive")
+            if fp8_scaled and not fp8_base:
+                raise ValueError("fp8_scaled requires fp8_base")
+            if fp8_w8a8 and not fp8_scaled:
+                raise ValueError("fp8_w8a8 requires fp8_scaled")
 
-    return output_path
+            base_torch_dtype = model_utils.str_to_dtype(base_dtype, torch.float32)
+            weight_dtype = torch.float8_e4m3fn if fp8_base and not fp8_scaled else base_torch_dtype
+            base_model = load_ltx2_model(
+                model_path=base_model_path,
+                device=torch.device(device),
+                load_device=torch.device(device),
+                torch_dtype=weight_dtype,
+                audio_video=audio_video,
+                audio_only_model=audio_only_model,
+                fp8_scaled=fp8_scaled,
+                fp8_w8a8=fp8_w8a8,
+                w8a8_mode=w8a8_mode,
+                fp8_keep_blocks=fp8_keep_blocks,
+                nf4_base=nf4_base,
+                nf4_block_size=nf4_block_size,
+                quantize_device=quantize_device,
+                lora_rank=0,
+                attn_mode="torch",
+                ffn_chunk_target=None,
+                ffn_chunk_size=0,
+                split_attn_target=None,
+                split_attn_mode=None,
+                split_attn_chunk_size=0,
+            )
+            loaded_base_model = True
+
+        comfy_state_dict = convert_lora_to_comfy_state_dict(
+            trained_state_dict,
+            verbose=verbose,
+            network=network,
+            base_model=base_model,
+            skip_gate_logits_dora=skip_gate_logits_dora,
+            dora_ff_only=dora_ff_only,
+        )
+        print(f"Output LoRA has {len(comfy_state_dict)} keys")
+        if _state_dict_has_native_oft_adapter(comfy_state_dict):
+            print(
+                "Note: this export preserves native Musubi DoRA-OFT/DoKr-OFT tensors "
+                "(.oft_R.*). Stock ComfyUI's OFT loader expects .oft_blocks and will not "
+                "apply these OFT rotations without a patched/custom loader."
+            )
+
+        if output_path is None:
+            input_file = Path(input_path)
+            output_path = input_file.parent / f"{input_file.stem}.comfy{input_file.suffix}"
+
+        metadata = None
+        try:
+            with safetensors.safe_open(input_path, framework="pt") as f:
+                metadata = f.metadata()
+            if metadata:
+                print(f"Preserving {len(metadata)} metadata entries")
+        except Exception as e:
+            print(f"Warning: Could not read metadata: {e}")
+
+        print(f"\nSaving ComfyUI-compatible LoRA to: {output_path}")
+        comfy_state_dict = {
+            key: tensor.to(dtype=torch.float32) if tensor.is_floating_point() else tensor
+            for key, tensor in comfy_state_dict.items()
+        }
+        safetensors.torch.save_file(comfy_state_dict, output_path, metadata=metadata)
+
+        print("[OK] Conversion complete!")
+        return output_path
+    finally:
+        trained_state_dict = None
+        comfy_state_dict = None
+        if loaded_base_model:
+            base_model = None
+        _release_torch_memory()
 
 
 def main():
@@ -475,6 +691,42 @@ def main():
         "-o", "--output", type=str, default=None, help="Path to save the converted LoRA (default: <input>.comfy.safetensors)"
     )
     parser.add_argument("-v", "--verbose", action="store_true", help="Print detailed conversion information")
+    parser.add_argument(
+        "--skip_gate_logits_dora",
+        action="store_true",
+        help="Do not export DoRA dora_scale for LTX-2 to_gate_logits modules. Keeps the LoKr weights for those modules.",
+    )
+    parser.add_argument(
+        "--dora_ff_only",
+        action="store_true",
+        help="Export ComfyUI DoRA dora_scale only for LTX-2 feed-forward modules. Keeps LoKr weights everywhere.",
+    )
+    parser.add_argument(
+        "--base_model",
+        "--dit",
+        dest="base_model",
+        type=str,
+        default=None,
+        help="Path to the original LTX-2 base transformer. Required for standalone DoRA/DokR conversion.",
+    )
+    parser.add_argument("--audio_video", action="store_true", help="Load the audio-video LTX-2 transformer variant.")
+    parser.add_argument("--audio_only_model", action="store_true", help="Load the audio-only LTX-2 transformer variant.")
+    parser.add_argument("--base_dtype", type=str, default="float32", help="Dtype used when loading the base transformer.")
+    parser.add_argument("--device", type=str, default="cpu", help="Device used when loading the base transformer.")
+    parser.add_argument("--fp8_base", action="store_true", help="Load base transformer weights in non-scaled FP8 mode.")
+    parser.add_argument("--fp8_scaled", action="store_true", help="Load base transformer weights using scaled FP8.")
+    parser.add_argument("--fp8_w8a8", action="store_true", help="Apply W8A8 patch after scaled FP8 loading.")
+    parser.add_argument("--w8a8_mode", type=str, default="int8", choices=["int8", "fp8"], help="W8A8 format.")
+    parser.add_argument("--fp8_keep_blocks", type=str, default=None, help="FP8 high-precision transformer blocks.")
+    parser.add_argument("--nf4_base", action="store_true", help="Load base transformer weights using NF4.")
+    parser.add_argument("--nf4_block_size", type=int, default=32, help="NF4 block size.")
+    parser.add_argument(
+        "--quantize_device",
+        type=str,
+        default=None,
+        choices=["cpu", "cuda", "gpu"],
+        help="Device for FP8/NF4 quantization math.",
+    )
 
     args = parser.parse_args()
 
@@ -483,7 +735,26 @@ def main():
         return 1
 
     try:
-        output_path = convert_lora_to_comfy(args.input, args.output, args.verbose)
+        output_path = convert_lora_to_comfy(
+            args.input,
+            args.output,
+            args.verbose,
+            base_model_path=args.base_model,
+            audio_video=args.audio_video,
+            audio_only_model=args.audio_only_model,
+            base_dtype=args.base_dtype,
+            device=args.device,
+            fp8_base=args.fp8_base,
+            fp8_scaled=args.fp8_scaled,
+            fp8_w8a8=args.fp8_w8a8,
+            w8a8_mode=args.w8a8_mode,
+            fp8_keep_blocks=args.fp8_keep_blocks,
+            nf4_base=args.nf4_base,
+            nf4_block_size=args.nf4_block_size,
+            quantize_device=args.quantize_device,
+            skip_gate_logits_dora=args.skip_gate_logits_dora,
+            dora_ff_only=args.dora_ff_only,
+        )
         return 0
     except Exception as e:
         print(f"Error during conversion: {e}")
