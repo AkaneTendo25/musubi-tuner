@@ -439,6 +439,7 @@
 						</div>
 						<div class="grid grid-cols-3 gap-x-4 gap-y-1">
 							<FormToggle label="DoRA / DokR" fieldPath="training.use_dora" checked={t.use_dora ?? false} onchange={(e) => update('use_dora', e.target.checked)} tooltip="Train LoRA or LoKr with a separate magnitude vector. Passed as use_dora=true in network args." />
+							<FormToggle label="DoRA-OFT / DoKr-OFT" fieldPath="training.use_dora_oft" checked={t.use_dora_oft ?? false} onchange={(e) => update('use_dora_oft', e.target.checked)} tooltip="Train native LoRA or LoKr with OFT rotation plus DoRA-style magnitude scaling. Passed as use_dora_oft=true in network args." />
 						</div>
 						{#if $advancedMode}
 							<div class="grid grid-cols-2 gap-2">

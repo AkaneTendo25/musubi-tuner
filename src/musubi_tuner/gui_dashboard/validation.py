@@ -397,6 +397,27 @@ def validate_training_config(config: ProjectConfig) -> dict[str, Any]:
                 )
             )
 
+    if t.use_dora_oft:
+        network_module = t.network_module or get_ltx2_training_network_module_default()
+        if network_module in {"networks.loha", "lycoris.kohya"}:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.use_dora_oft",
+                    "DoRA-OFT/DoKr-OFT is currently available only with the native LoRA or native LoKr backend.",
+                    label="DoRA-OFT/DoKr-OFT",
+                    page="training",
+                )
+            )
+        if t.use_dora:
+            message = "DoRA/DokR and DoRA-OFT/DoKr-OFT cannot be enabled together."
+            errors.append(_make_issue("error", "training.use_dora", message, label="DoRA/DokR", page="training"))
+            errors.append(_make_issue("error", "training.use_dora_oft", message, label="DoRA-OFT/DoKr-OFT", page="training"))
+        if t.adaptive_rank:
+            message = "Adaptive rank is not supported with DoRA-OFT/DoKr-OFT."
+            errors.append(_make_issue("error", "training.use_dora_oft", message, label="DoRA-OFT/DoKr-OFT", page="training"))
+            errors.append(_make_issue("error", "training.adaptive_rank", message, label="Adaptive Rank", page="training"))
+
     if t.blockwise_checkpointing:
         warnings.append(
             _make_issue(
