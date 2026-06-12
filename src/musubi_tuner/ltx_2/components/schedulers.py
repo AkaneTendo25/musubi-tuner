@@ -25,7 +25,8 @@ def build_ltx2_sigmas(
 
     ``auto`` uses the exact LTX-2.3 distilled schedule for the distilled
     two-stage preset at 8 steps. Otherwise it uses ``LTX2Scheduler`` with the
-    latent tensor for token-count-dependent shifting.
+    latent tensor for token-count-dependent shifting. ``ltx_latent`` is kept as
+    an explicit compatibility spelling for the latent-aware LTX schedule.
     """
 
     schedule = str(sigma_schedule or "auto").lower()
@@ -39,12 +40,12 @@ def build_ltx2_sigmas(
         if int(steps) != expected_steps:
             raise ValueError(
                 f"LTX-2.3 distilled sigma schedule requires {expected_steps} steps, got {steps}. "
-                "Use --sample_sigma_schedule ltx or --sample_steps 8."
+                "Use --sample_sigma_schedule ltx, --sample_sigma_schedule ltx_latent, or --sample_steps 8."
             )
         return torch.tensor(LTX23_DISTILLED_SIGMAS, dtype=torch.float32)
 
-    if schedule not in {"auto", "ltx"}:
-        raise ValueError("sigma_schedule must be one of: auto, ltx, ltx23_distilled")
+    if schedule not in {"auto", "ltx", "ltx_latent"}:
+        raise ValueError("sigma_schedule must be one of: auto, ltx, ltx_latent, ltx23_distilled")
 
     return LTX2Scheduler().execute(steps=int(steps), latent=latent)
 
@@ -101,9 +102,7 @@ class LinearQuadraticScheduler(SchedulerProtocol):
     then follows a quadratic curve for the remaining steps.
     """
 
-    def execute(
-        self, steps: int, threshold_noise: float = 0.025, linear_steps: int | None = None, **_kwargs
-    ) -> torch.FloatTensor:
+    def execute(self, steps: int, threshold_noise: float = 0.025, linear_steps: int | None = None, **_kwargs) -> torch.FloatTensor:
         if steps == 1:
             return torch.FloatTensor([1.0, 0.0])
 
@@ -117,9 +116,7 @@ class LinearQuadraticScheduler(SchedulerProtocol):
             quadratic_coef = threshold_noise_step_diff / (linear_steps * quadratic_steps**2)
             linear_coef = threshold_noise / linear_steps - 2 * threshold_noise_step_diff / (quadratic_steps**2)
             const = quadratic_coef * (linear_steps**2)
-            quadratic_sigma_schedule = [
-                quadratic_coef * (i**2) + linear_coef * i + const for i in range(linear_steps, steps)
-            ]
+            quadratic_sigma_schedule = [quadratic_coef * (i**2) + linear_coef * i + const for i in range(linear_steps, steps)]
         sigma_schedule = linear_sigma_schedule + quadratic_sigma_schedule + [1.0]
         sigma_schedule = [1.0 - x for x in sigma_schedule]
         return torch.FloatTensor(sigma_schedule)

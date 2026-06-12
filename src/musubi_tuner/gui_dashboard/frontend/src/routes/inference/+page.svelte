@@ -420,8 +420,9 @@
 							<FormSelect fieldPath="inference.sample_sigma_schedule" value={s.sample_sigma_schedule || 'auto'} options={[
 								{ value: 'auto', label: 'Auto' },
 								{ value: 'ltx', label: 'LTX Shifted' },
+								{ value: 'ltx_latent', label: 'LTX Latent Shift' },
 								{ value: 'ltx23_distilled', label: 'LTX 2.3 Distilled' }
-							]} onchange={(e) => update('sample_sigma_schedule', e.target.value)} tooltip="Sigma schedule. Auto uses latent-aware LTX sigmas, with the distilled schedule for distilled presets." />
+							]} onchange={(e) => update('sample_sigma_schedule', e.target.value)} tooltip="Sigma schedule. Auto uses latent-aware LTX sigmas, LTX Latent Shift is the explicit compatibility spelling, and distilled presets can use the distilled schedule." />
 						</div>
 						<div class="grid grid-cols-3 gap-2">
 							<FormField type="number" fieldPath="inference.width" value={s.width ?? ''} oninput={(e) => update('width', e.target.value ? Number(e.target.value) : null)} min={64} step={64} placeholder="Preset" tooltip="Output width override" />

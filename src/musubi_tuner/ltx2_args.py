@@ -308,10 +308,11 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         "--sample_sigma_schedule",
         type=str,
         default="auto",
-        choices=["auto", "ltx", "ltx23_distilled"],
+        choices=["auto", "ltx", "ltx_latent", "ltx23_distilled"],
         help=(
             "Sigma schedule for LTX-2 previews. 'auto' uses LTX token-shifted sigmas, "
-            "and uses the exact LTX-2.3 distilled sigmas for the distilled_two_stage preset."
+            "'ltx_latent' is an explicit latent-aware LTX schedule, and the exact "
+            "LTX-2.3 distilled sigmas are used for the distilled_two_stage preset."
         ),
     )
     parser.add_argument(

@@ -224,10 +224,11 @@ def parse_args() -> argparse.Namespace:
         "--sample_sigma_schedule",
         type=str,
         default="auto",
-        choices=["auto", "ltx", "ltx23_distilled"],
+        choices=["auto", "ltx", "ltx_latent", "ltx23_distilled"],
         help=(
-            "Sigma schedule. 'auto' uses LTX token-shifted sigmas, and the exact "
-            "LTX-2.3 distilled sigmas for the distilled_two_stage preset."
+            "Sigma schedule. 'auto' uses LTX token-shifted sigmas, 'ltx_latent' is an "
+            "explicit latent-aware LTX schedule, and the exact LTX-2.3 distilled sigmas "
+            "are used for the distilled_two_stage preset."
         ),
     )
     parser.add_argument(

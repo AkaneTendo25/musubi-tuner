@@ -709,7 +709,7 @@
 					<FormField type="number" fieldPath="full_finetune.sample_every_n_steps" value={t.sample_every_n_steps ?? ''} oninput={(e) => update('sample_every_n_steps', numberOrNull(e.target.value))} min={1} />
 					<FormField type="number" fieldPath="full_finetune.sample_every_n_epochs" value={t.sample_every_n_epochs ?? ''} oninput={(e) => update('sample_every_n_epochs', numberOrNull(e.target.value))} min={1} />
 					<FormSelect fieldPath="full_finetune.sample_sampling_preset" value={t.sample_sampling_preset || 'defaults'} options={['legacy', 'defaults', 'ltx20', 'ltx23', 'ltx23_hq', 'distilled_two_stage']} onchange={(e) => update('sample_sampling_preset', e.target.value)} />
-					<FormSelect fieldPath="full_finetune.sample_sigma_schedule" value={t.sample_sigma_schedule || 'auto'} options={['auto', 'ltx', 'ltx23_distilled']} onchange={(e) => update('sample_sigma_schedule', e.target.value)} />
+					<FormSelect fieldPath="full_finetune.sample_sigma_schedule" value={t.sample_sigma_schedule || 'auto'} options={['auto', 'ltx', 'ltx_latent', 'ltx23_distilled']} onchange={(e) => update('sample_sigma_schedule', e.target.value)} />
 				</div>
 				<PathInput fieldPath="full_finetune.sample_prompts" value={t.sample_prompts || ''} oninput={(e) => update('sample_prompts', e.target.value)} showFiles={true} />
 				<FormField fieldPath="full_finetune.sample_prompts_text" value={t.sample_prompts_text || ''} oninput={(e) => update('sample_prompts_text', e.target.value)} placeholder="prompt --n negative prompt --w 768 --h 512 --f 33" />

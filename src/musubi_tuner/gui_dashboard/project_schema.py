@@ -15,7 +15,7 @@ from musubi_tuner.model_defaults import default_gemma_root_path, default_ltx2_ch
 
 
 SamplingPreset = Literal["legacy", "defaults", "ltx20", "ltx23", "ltx23_hq", "distilled_two_stage"]
-SampleSigmaSchedule = Literal["auto", "ltx", "ltx23_distilled"]
+SampleSigmaSchedule = Literal["auto", "ltx", "ltx_latent", "ltx23_distilled"]
 SampleSampler = Literal["auto", "euler", "res_2s"]
 LTX2BoundaryCodec = Literal["none", "int8", "int4"]
 LTX2RemoteActivationCodec = Literal["none", "int8", "int4", "aq-int8", "aq-int4"]

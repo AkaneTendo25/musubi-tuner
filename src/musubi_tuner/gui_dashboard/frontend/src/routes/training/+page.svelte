@@ -955,8 +955,9 @@
 							<FormSelect fieldPath="training.sample_sigma_schedule" value={t.sample_sigma_schedule || 'auto'} options={[
 								{ value: 'auto', label: 'Auto' },
 								{ value: 'ltx', label: 'LTX Shifted' },
+								{ value: 'ltx_latent', label: 'LTX Latent Shift' },
 								{ value: 'ltx23_distilled', label: 'LTX 2.3 Distilled' }
-							]} onchange={(e) => update('sample_sigma_schedule', e.target.value)} tooltip="Validation sigma schedule. Auto uses latent-aware LTX sigmas." />
+							]} onchange={(e) => update('sample_sigma_schedule', e.target.value)} tooltip="Validation sigma schedule. Auto uses latent-aware LTX sigmas; LTX Latent Shift is the explicit compatibility spelling." />
 						</div>
 						<div class="grid grid-cols-2 gap-2">
 							<FormField type="number" fieldPath="training.sample_every_n_steps" value={t.sample_every_n_steps ?? ''} oninput={(e) => update('sample_every_n_steps', e.target.value ? Number(e.target.value) : null)} placeholder="Optional" tooltip="Sample every N steps" />
