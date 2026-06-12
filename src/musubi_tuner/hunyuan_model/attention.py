@@ -14,15 +14,45 @@ except ImportError:
     _flash_attn_forward = None
     flash_attn_func = None
 
-try:
-    print("Trying to import sageattention")
-    from sageattention import sageattn_varlen, sageattn
+_sageattention_import_attempted = False
+_sageattn_varlen = None
+_sageattn = None
 
-    print("Successfully imported sageattention")
-except ImportError:
-    print("Failed to import sageattention")
-    sageattn_varlen = None
-    sageattn = None
+
+def _ensure_sageattention():
+    global _sageattention_import_attempted, _sageattn_varlen, _sageattn
+
+    if not _sageattention_import_attempted:
+        _sageattention_import_attempted = True
+        try:
+            from sageattention import sageattn_varlen as imported_sageattn_varlen
+            from sageattention import sageattn as imported_sageattn
+        except ImportError:
+            _sageattn_varlen = None
+            _sageattn = None
+        else:
+            _sageattn_varlen = imported_sageattn_varlen
+            _sageattn = imported_sageattn
+
+    return _sageattn_varlen, _sageattn
+
+
+def __getattr__(name):
+    if name == "sageattn_varlen":
+        _sageattn_varlen, _ = _ensure_sageattention()
+        return _sageattn_varlen
+    if name == "sageattn":
+        _, _sageattn = _ensure_sageattention()
+        return _sageattn
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def _require_sageattention():
+    _sageattn_varlen, _sageattn = _ensure_sageattention()
+    if _sageattn_varlen is None or _sageattn is None:
+        raise ImportError("SageAttention is required for attention mode 'sageattn', but it is not installed.")
+    return _sageattn_varlen, _sageattn
+
 
 try:
     import xformers.ops as xops
@@ -202,22 +232,24 @@ def attention(
             del q, k, v  # this causes error in compiled mode with fullgraph=True
 
     elif mode == "sageattn":
-        x = sageattn_varlen(q, k, v, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv)
+        _sageattn_varlen, _ = _require_sageattention()
+        x = _sageattn_varlen(q, k, v, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv)
         del q, k, v
         # x with shape [(bxs), a, d]
         x = x.view(batch_size, max_seqlen_q, x.shape[-2], x.shape[-1])  # reshape x to [b, s, a, d]
 
     elif mode == "sageattn_fixlen":
+        _, _sageattn = _require_sageattention()
         if split_attn:
             x = []
             for i in range(len(q)):
                 # HND seems to cause an error
-                x_i = sageattn(q[i], k[i], v[i])  # (batch_size, seq_len, head_num, head_dim)
+                x_i = _sageattn(q[i], k[i], v[i])  # (batch_size, seq_len, head_num, head_dim)
                 q[i], k[i], v[i] = None, None, None
                 x.append(x_i)
             del q, k, v
         else:
-            x = sageattn(q, k, v)
+            x = _sageattn(q, k, v)
             del q, k, v
 
     elif mode == "vanilla":
