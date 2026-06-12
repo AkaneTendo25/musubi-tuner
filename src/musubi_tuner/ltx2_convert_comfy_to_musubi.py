@@ -11,6 +11,7 @@ from safetensors import safe_open
 from musubi_tuner.networks import lora as lora_module
 from musubi_tuner.networks import lokr as lokr_module
 from musubi_tuner.networks.lora_ltx2 import load_ltx2_transformer
+from musubi_tuner.networks.lora_shared import _get_dense_weight_norm
 from musubi_tuner.utils import model_utils
 
 
@@ -130,7 +131,7 @@ def _module_state_is_lokr(module_state: Dict[str, torch.Tensor]) -> bool:
 
 def _get_comfy_base_weight_norm(base_weight: torch.Tensor) -> torch.Tensor:
     zero_delta = torch.zeros_like(base_weight)
-    return lora_module._get_dense_weight_norm(base_weight, zero_delta, 0.0)
+    return _get_dense_weight_norm(base_weight, zero_delta, 0.0)
 
 
 def _translate_comfy_dora_scale_to_musubi_magnitude(
