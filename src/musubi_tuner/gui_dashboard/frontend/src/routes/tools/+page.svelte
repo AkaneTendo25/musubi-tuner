@@ -1,5 +1,6 @@
 <script>
 	import ComfyConversionPanel from '$lib/components/ComfyConversionPanel.svelte';
+	import LoRAConversionPanel from '$lib/components/LoRAConversionPanel.svelte';
 	import { projectLoaded } from '$lib/stores/project.js';
 </script>
 
@@ -15,6 +16,7 @@
 
 		<div class="grid grid-cols-1 xl:grid-cols-2 gap-4 items-start">
 			<ComfyConversionPanel />
+			<LoRAConversionPanel />
 		</div>
 	</div>
 {/if}

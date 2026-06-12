@@ -35,12 +35,35 @@ class ConvertComfyRequest(BaseModel):
     device: str = "cpu"
 
 
+class ConvertLoRARequest(BaseModel):
+    checkpoint_path: str
+    output_path: str = ""
+    target_format: str = "other"
+    diffusers_prefix: str = ""
+
+
 @dataclasses.dataclass
 class ConvertComfyJob:
     job_id: str
     checkpoint_path: str
     output_path: str = ""
     base_model_path: str = ""
+    state: str = "queued"
+    message: str = "Queued"
+    error: str = ""
+    created_at: float = dataclasses.field(default_factory=time.time)
+    updated_at: float = dataclasses.field(default_factory=time.time)
+    finished_at: float | None = None
+    lock: threading.Lock = dataclasses.field(default_factory=threading.Lock)
+
+
+@dataclasses.dataclass
+class ConvertLoRAJob:
+    job_id: str
+    checkpoint_path: str
+    output_path: str = ""
+    target_format: str = "other"
+    diffusers_prefix: str = ""
     state: str = "queued"
     message: str = "Queued"
     error: str = ""
@@ -65,13 +88,20 @@ def _get_jobs(request: Request) -> dict[str, ConvertComfyJob]:
     return jobs
 
 
+def _get_lora_jobs(request: Request) -> dict[str, ConvertLoRAJob]:
+    jobs = getattr(request.app.state, "convert_lora_jobs", None)
+    if jobs is None:
+        jobs = {}
+        request.app.state.convert_lora_jobs = jobs
+    return jobs
+
+
 def _snapshot_job(job: ConvertComfyJob) -> dict:
     with job.lock:
-        return {
+        snapshot = {
             "job_id": job.job_id,
             "checkpoint_path": job.checkpoint_path,
             "output_path": job.output_path,
-            "base_model_path": job.base_model_path,
             "state": job.state,
             "message": job.message,
             "error": job.error,
@@ -79,6 +109,13 @@ def _snapshot_job(job: ConvertComfyJob) -> dict:
             "updated_at": job.updated_at,
             "finished_at": job.finished_at,
         }
+        if hasattr(job, "base_model_path"):
+            snapshot["base_model_path"] = job.base_model_path
+        if hasattr(job, "target_format"):
+            snapshot["target_format"] = job.target_format
+        if hasattr(job, "diffusers_prefix"):
+            snapshot["diffusers_prefix"] = job.diffusers_prefix
+        return snapshot
 
 
 def _set_job_state(job: ConvertComfyJob, **fields) -> None:
@@ -125,6 +162,12 @@ def _converter_env() -> dict[str, str]:
 def _default_comfy_output_path(input_path: str) -> str:
     path = Path(input_path)
     return str(path.parent / f"{path.stem}.comfy{path.suffix}")
+
+
+def _default_lora_output_path(input_path: str, target_format: str) -> str:
+    path = Path(input_path)
+    suffix = "musubi" if target_format == "default" else "diffusers"
+    return str(path.parent / f"{path.stem}.{suffix}{path.suffix}")
 
 
 def _checkpoint_needs_base_model(path: Path) -> bool:
@@ -225,6 +268,48 @@ def _run_convert_comfy_job(job: ConvertComfyJob, config: ProjectConfig, device: 
         _set_job_state(job, state="failed", message=str(exc), error=str(exc), finished_at=time.time())
 
 
+def _run_convert_lora_job(job: ConvertLoRAJob, config: ProjectConfig) -> None:
+    try:
+        _set_job_state(job, state="running", message="Converting adapter checkpoint")
+        cmd = [
+            sys.executable,
+            "-m",
+            "musubi_tuner.convert_lora",
+            "--input",
+            job.checkpoint_path,
+            "--output",
+            job.output_path,
+            "--target",
+            job.target_format,
+        ]
+        if job.diffusers_prefix:
+            cmd += ["--diffusers_prefix", job.diffusers_prefix]
+
+        result = subprocess.run(
+            cmd,
+            cwd=config.project_dir or None,
+            env=_converter_env(),
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+        if result.returncode != 0:
+            output_tail = "\n".join((result.stdout or "").splitlines()[-40:])
+            raise RuntimeError(output_tail or f"Converter exited with code {result.returncode}")
+
+        _set_job_state(
+            job,
+            state="completed",
+            message=f"Saved to {job.output_path}",
+            finished_at=time.time(),
+        )
+    except Exception as exc:
+        logger.exception("Generic LoRA conversion failed")
+        _set_job_state(job, state="failed", message=str(exc), error=str(exc), finished_at=time.time())
+
+
 @router.post("/convert-comfy")
 async def start_convert_comfy(req: ConvertComfyRequest, request: Request):
     config = _get_config(request)
@@ -278,6 +363,58 @@ async def start_convert_comfy(req: ConvertComfyRequest, request: Request):
 @router.get("/convert-comfy/{job_id}")
 async def get_convert_comfy_status(job_id: str, request: Request):
     jobs = _get_jobs(request)
+    job = jobs.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Conversion job not found")
+    return _snapshot_job(job)
+
+
+@router.post("/convert-lora")
+async def start_convert_lora(req: ConvertLoRARequest, request: Request):
+    config = _get_config(request)
+    try:
+        checkpoint_path = _resolve_project_path(config, req.checkpoint_path)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    if not checkpoint_path.is_file():
+        raise HTTPException(status_code=404, detail=f"Checkpoint not found: {checkpoint_path}")
+    if checkpoint_path.suffix.casefold() != ".safetensors":
+        raise HTTPException(status_code=400, detail="Checkpoint must be a .safetensors file")
+
+    target_format = (req.target_format or "other").strip().lower()
+    if target_format not in {"other", "default"}:
+        raise HTTPException(status_code=400, detail="Target format must be 'other' or 'default'")
+
+    try:
+        output_path = (
+            _resolve_project_path(config, req.output_path)
+            if req.output_path.strip()
+            else Path(_default_lora_output_path(str(checkpoint_path), target_format))
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    if output_path.suffix.casefold() != ".safetensors":
+        raise HTTPException(status_code=400, detail="Output path must be a .safetensors file")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    jobs = _get_lora_jobs(request)
+    _prune_finished_jobs(jobs)
+    job = ConvertLoRAJob(
+        job_id=uuid.uuid4().hex,
+        checkpoint_path=str(checkpoint_path),
+        output_path=str(output_path),
+        target_format=target_format,
+        diffusers_prefix=(req.diffusers_prefix or "").strip(),
+    )
+    jobs[job.job_id] = job
+    thread = threading.Thread(target=_run_convert_lora_job, args=(job, config), daemon=True)
+    thread.start()
+    return _snapshot_job(job)
+
+
+@router.get("/convert-lora/{job_id}")
+async def get_convert_lora_status(job_id: str, request: Request):
+    jobs = _get_lora_jobs(request)
     job = jobs.get(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Conversion job not found")
