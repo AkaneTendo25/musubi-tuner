@@ -6,7 +6,7 @@ buffers instead of full-size dequantized weights, eliminating ~32MB per linear
 layer from the autograd graph.
 
 Two modes:
-  - int8 (default): Converts FP8 weights to int8 tensorwise, uses torch._int_mm.
+  - int8 (default): Converts FP8 weights to row-wise int8, uses torch._int_mm.
     Requires SM 7.5+ (Turing: RTX 2080+, T4, A100, etc.)
   - fp8: Keeps FP8 weights as-is, uses transient dequantization.
     Works on any GPU that supports FP8 (same as --fp8_scaled).
@@ -93,12 +93,48 @@ def _dequantized_weight_abs_max_chunked(weight, scale_weight):
     return abs_max
 
 
+def _dequantized_weight_row_abs_max_chunked(weight, scale_weight):
+    if weight.ndim != 2:
+        return _dequantized_weight_abs_max_chunked(weight, scale_weight).reshape(1)
+
+    row_abs_max = torch.empty((weight.shape[0], 1), device=weight.device, dtype=torch.float32)
+    for row_slice in _iter_weight_row_slices(weight):
+        scale_chunk = _slice_scale_weight_for_rows(scale_weight, row_slice)
+        chunk = _dequantize_weight_chunk(weight[row_slice], scale_chunk)
+        if chunk.numel() == 0:
+            continue
+        row_abs_max[row_slice] = chunk.abs_().amax(dim=1, keepdim=True)
+    return row_abs_max
+
+
+def _output_scale_view(weight_scale):
+    scale = weight_scale.float()
+    if scale.numel() == 1:
+        return scale.reshape(1, 1)
+    if scale.ndim == 1:
+        return scale.reshape(1, -1)
+    if scale.ndim == 2 and scale.shape[1] == 1:
+        return scale.transpose(0, 1)
+    raise ValueError(f"Expected scalar or row-wise W8A8 int8 weight scale, got shape {tuple(weight_scale.shape)}")
+
+
+def _slice_int8_scale_for_rows(int8_scale, row_slice):
+    if int8_scale.numel() == 1:
+        return int8_scale
+    if int8_scale.ndim == 1:
+        return int8_scale[row_slice].reshape(-1, 1)
+    if int8_scale.shape[0] == 1:
+        return int8_scale
+    return int8_scale[row_slice]
+
+
 def _quantize_dequantized_weight_to_int8_chunked(weight, scale_weight, int8_scale):
     weight_int8 = torch.empty(weight.shape, device=weight.device, dtype=torch.int8)
     for row_slice in _iter_weight_row_slices(weight):
         scale_chunk = _slice_scale_weight_for_rows(scale_weight, row_slice)
+        int8_scale_chunk = _slice_int8_scale_for_rows(int8_scale, row_slice)
         chunk = _dequantize_weight_chunk(weight[row_slice], scale_chunk)
-        chunk.div_(int8_scale)
+        chunk.div_(int8_scale_chunk)
         chunk.round_()
         chunk.clamp_(min=-127, max=127)
         weight_int8[row_slice].copy_(chunk.to(torch.int8))
@@ -168,7 +204,7 @@ def _supports_triton_mm(device):
 class _W8A8Int8Function(torch.autograd.Function):
     """int8 W8A8: per-token input quantization + torch._int_mm.
 
-    Saves only int8 weight and float32 tensor scale in the autograd graph
+    Saves only int8 weight and float32 row-wise scale in the autograd graph
     (both are existing module buffers, so 0 extra bytes).
     """
 
@@ -176,7 +212,7 @@ class _W8A8Int8Function(torch.autograd.Function):
     def forward(ctx, x, weight_int8, weight_int8_t, weight_scale, bias, triton_mm):
         # weight_int8: [out, in] int8
         # weight_int8_t: optional [in, out] contiguous int8 fallback for fast backward RHS layout
-        # weight_scale: [1] float32
+        # weight_scale: [out, 1] float32
         original_shape = x.shape
         x_2d = x.reshape(-1, x.shape[-1])
 
@@ -187,8 +223,8 @@ class _W8A8Int8Function(torch.autograd.Function):
         # no .contiguous() needed on weight_int8.t(), which avoids a 16MB transient copy.
         out_int32 = _int_mm_allow_small_m(x_int8.contiguous(), weight_int8.t())
 
-        # Rescale: x_scale [M,1] * scalar weight_scale broadcasts to [M, out]
-        output = out_int32.float() * x_scale * weight_scale.float().view(1, 1)
+        # Rescale: x_scale [M,1] * row-wise weight_scale [1,out]
+        output = out_int32.float() * x_scale * _output_scale_view(weight_scale)
 
         if bias is not None:
             output = output + bias.float()
@@ -216,6 +252,9 @@ class _W8A8Int8Function(torch.autograd.Function):
         weight_saved, weight_scale = ctx.saved_tensors
         go_2d = grad_output.reshape(-1, grad_output.shape[-1]).float()
 
+        # Row-wise weight scales live on the contraction dimension for grad_input,
+        # so fold them into grad_output before the int8 matmul.
+        go_2d = go_2d * _output_scale_view(weight_scale)
         grad_int8, grad_scale = _quantize_int8_per_token(go_2d)
         if ctx.triton_mm is None:
             grad_int32 = _int_mm_allow_small_m(grad_int8.contiguous(), weight_saved.t())
@@ -227,7 +266,7 @@ class _W8A8Int8Function(torch.autograd.Function):
                 logger.exception("W8A8 Triton backward failed; falling back to torch._int_mm.")
                 grad_int32 = _int_mm_allow_small_m(grad_int8.contiguous(), weight_saved)
             in_features = weight_saved.shape[1]
-        grad_input = grad_int32.float() * grad_scale * weight_scale.float().view(1, 1)
+        grad_input = grad_int32.float() * grad_scale
         grad_input = grad_input.to(ctx.input_dtype).reshape(*grad_output.shape[:-1], in_features)
         return grad_input, None, None, None, None, None
 
@@ -268,16 +307,16 @@ class _W8A8TransientDequantFunction(torch.autograd.Function):
 
 
 def _convert_fp8_to_int8_weights(module, *, keep_transpose_buffer: bool):
-    """One-time conversion: FP8 weight + scale -> int8 weight + tensor scale.
+    """One-time conversion: FP8 weight + scale -> int8 weight + row-wise scale.
 
     After conversion:
       module.weight.data  = int8 [out, in]
-      module.scale_weight = float32 [1]
+      module.scale_weight = float32 [out, 1]
     """
     with torch.no_grad():
         weight = module.weight.detach()
         scale_weight = module.scale_weight.detach()
-        abs_max = _dequantized_weight_abs_max_chunked(weight, scale_weight)
+        abs_max = _dequantized_weight_row_abs_max_chunked(weight, scale_weight)
         scale = (abs_max / 127.0).clamp(min=1e-30).float()
         weight_int8 = _quantize_dequantized_weight_to_int8_chunked(weight, scale_weight, scale)
 
@@ -285,7 +324,7 @@ def _convert_fp8_to_int8_weights(module, *, keep_transpose_buffer: bool):
         module.weight = torch.nn.Parameter(weight_int8, requires_grad=False)
         if module.bias is not None:
             module.bias.requires_grad_(False)
-        module.scale_weight = scale.reshape(1).to(device=weight_int8.device, dtype=torch.float32)
+        module.scale_weight = scale.reshape(weight_int8.shape[0], 1).to(device=weight_int8.device, dtype=torch.float32)
         if keep_transpose_buffer:
             weight_int8_t = weight_int8.t().contiguous()
             if "weight_int8_t" in module._buffers:
@@ -322,7 +361,7 @@ def _make_w8a8_int8_forward(use_int_mm, triton_mm):
         def forward(self, x):
             num_tokens = x.reshape(-1, x.shape[-1]).shape[0]
             if num_tokens <= SMALL_BATCH_THRESHOLD:
-                w = (self.weight.detach().float() * self.scale_weight.float()).to(x.dtype)
+                w = _dequantize_weight(self.weight.detach(), self.scale_weight).to(x.dtype)
                 return F.linear(x, w, self.bias)
             return _W8A8TransientDequantFunction.apply(x, self.weight, self.scale_weight, self.bias)
 
@@ -353,7 +392,7 @@ def apply_w8a8_monkey_patch(model, w8a8_mode="int8", state_dict: dict[str, torch
     Must be called AFTER apply_fp8_monkey_patch + load_state_dict
     (needs scale_weight buffers and loaded FP8 weights).
 
-    For int8 mode: also converts FP8 weights to int8 tensorwise.
+    For int8 mode: also converts FP8 weights to row-wise int8.
 
     Args:
         model: nn.Module with FP8-patched linear layers
