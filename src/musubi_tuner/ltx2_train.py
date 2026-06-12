@@ -4409,7 +4409,7 @@ def main() -> None:
                             f"{base_optimizer.__class__.__name__} fused backward pass requires APOLLO step_param support"
                         )
                     logger.info("%s APOLLO fused backward pass enabled.", base_optimizer.__class__.__name__)
-                elif base_optimizer_name in {"came", "came8bit", "sinksgd"}:
+                elif base_optimizer_name in {"came", "came8bit", "sinksgd", "prodigyplusschedulefree"}:
                     if not _attach_fused_step_param(optimizer, base_optimizer):
                         raise ValueError(
                             f"{base_optimizer.__class__.__name__} fused backward pass requires optimizer.step_param support"
@@ -4432,7 +4432,7 @@ def main() -> None:
                     logger.info("%s fused backward pass enabled.", base_optimizer.__class__.__name__)
                 else:
                     raise ValueError(
-                        f"--fused_backward_pass requires Adafactor, CAME/CAME8bit, SinkSGD, Q-GaLore, APOLLO, "
+                        f"--fused_backward_pass requires Adafactor, CAME/CAME8bit, SinkSGD, ProdigyPlusScheduleFree, Q-GaLore, APOLLO, "
                         f"torchao Adam, torch-optimi, Lion/Lion8bit/Lion8bitInt8, SMMF, or BAdam with badam_use_gradient_release=True; "
                         f"got {base_optimizer.__class__.__name__}"
                     )
@@ -5998,6 +5998,7 @@ def main() -> None:
         uncertainty_lr = float(getattr(args, "uncertainty_lr", None) or args.learning_rate)
         try:
             optimizer.add_param_group({"params": [uncertainty_log_var_video, uncertainty_log_var_audio], "lr": uncertainty_lr})
+            trainer._refresh_prodigy_plus_late_param_group_state(optimizer)
             logger.info(
                 "Uncertainty weighting enabled: 2 learnable log-variance params added to optimizer, lr=%g",
                 uncertainty_lr,

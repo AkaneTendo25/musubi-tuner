@@ -46,6 +46,7 @@
 		'adadelta',
 		'adamax',
 		'prodigy',
+		'ProdigyPlusScheduleFree',
 		'came',
 		'came8bit',
 		'SinkSGD_adv',
@@ -59,6 +60,7 @@
 		'optimi_lion',
 		'optimi_adan',
 	];
+	const prodigyPlusOptimizerArgs = 'betas=(0.9,0.99) beta3=None weight_decay=0.0 weight_decay_by_lr=True use_bias_correction=False d0=1e-6 d_coef=1.0 prodigy_steps=0 use_speed=False eps=1e-8 split_groups=True split_groups_mean=False factored=True factored_fp32=True use_stableadamw=True use_cautious=False use_grams=False use_adopt=False d_limiter=True stochastic_rounding=True use_schedulefree=True schedulefree_c=0.0 use_orthograd=False';
 	const boundaryCodecOptions = ['none', 'int8', 'int4'];
 	const remoteActivationCodecOptions = ['none', 'int8', 'int4', 'aq-int8', 'aq-int4'];
 
@@ -304,6 +306,27 @@
 
 	async function stopDownload() {
 		await cancelSharedModelDownload();
+	}
+
+	function optimizerAlias(value) {
+		return String(value || '').toLowerCase().replace(/[-_\s]/g, '');
+	}
+
+	function isProdigyPlusOptimizer(value) {
+		const alias = optimizerAlias(value);
+		return alias === 'pplus' || alias === 'prodigyplus' || alias === 'prodigyplusschedulefree';
+	}
+
+	function applyRecommendedOptimizerArgs() {
+		if (isProdigyPlusOptimizer(t.optimizer_type)) {
+			update('optimizer_type', 'ProdigyPlusScheduleFree');
+			update('optimizer_args', prodigyPlusOptimizerArgs);
+			update('learning_rate', 1.0);
+			update('lr_scheduler', 'constant');
+			update('lr_warmup_steps', 0);
+			update('lr_decay_steps', 0);
+			update('max_grad_norm', 0.0);
+		}
 	}
 
 	function fieldError(field) {
@@ -565,9 +588,19 @@
 
 				<FormGroup title="Optimizer">
 					<div class="space-y-2 pt-2">
-						<div class="grid grid-cols-2 gap-2">
+						<div class="grid grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto] items-end gap-2">
 							<FormField type="number" fieldPath="training.learning_rate" value={t.learning_rate ?? 2e-6} oninput={(e) => update('learning_rate', Number(e.target.value))} step="any" tooltip="Learning rate" />
 							<FormCombobox fieldPath="training.optimizer_type" value={t.optimizer_type || ''} oninput={(e) => update('optimizer_type', e.target.value)} options={optimizerOptions} placeholder="AdamW" tooltip="Optimizer type. Blank uses the default `AdamW`." />
+							<button
+								type="button"
+								onclick={applyRecommendedOptimizerArgs}
+								disabled={!isProdigyPlusOptimizer(t.optimizer_type)}
+								data-tooltip="Set recommended settings for the selected optimizer"
+								class="text-sm font-medium disabled:opacity-40 flex-shrink-0"
+								style="height: 38px; min-width: 36px; padding: 0 10px; background: var(--bg-elevated); border: 1px solid var(--border); color: var(--text-secondary); border-radius: var(--radius-sm);"
+								onmouseenter={(e) => e.currentTarget.style.background = 'var(--border)'}
+								onmouseleave={(e) => e.currentTarget.style.background = 'var(--bg-elevated)'}
+							>Set</button>
 						</div>
 						<div class="grid grid-cols-3 gap-2">
 							<FormSelect fieldPath="training.lr_scheduler" value={t.lr_scheduler || 'constant'} options={['constant', 'constant_with_warmup', 'cosine', 'cosine_with_restarts', 'linear', 'polynomial', 'rex']} onchange={(e) => update('lr_scheduler', e.target.value)} tooltip="LR schedule" />

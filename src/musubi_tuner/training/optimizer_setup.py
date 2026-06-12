@@ -24,6 +24,54 @@ from musubi_tuner.networks.optimizer_params_compat import prepare_optimizer_para
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_PRODIGY_PLUS_OPTIMIZER_TYPE = "ProdigyPlusScheduleFree"
+DEFAULT_PRODIGY_PLUS_OPTIMIZER_ARGS = (
+    "betas=(0.9,0.99)",
+    "beta3=None",
+    "weight_decay=0.0",
+    "weight_decay_by_lr=True",
+    "use_bias_correction=False",
+    "d0=1e-6",
+    "d_coef=1.0",
+    "prodigy_steps=0",
+    "use_speed=False",
+    "eps=1e-8",
+    "split_groups=True",
+    "split_groups_mean=False",
+    "factored=True",
+    "factored_fp32=True",
+    "use_stableadamw=True",
+    "use_cautious=False",
+    "use_grams=False",
+    "use_adopt=False",
+    "d_limiter=True",
+    "stochastic_rounding=True",
+    "use_schedulefree=True",
+    "schedulefree_c=0.0",
+    "use_orthograd=False",
+)
+PRODIGY_PLUS_OPTIMIZER_ALIASES = {
+    "pplus",
+    "prodigyplus",
+    "prodigyplusschedulefree",
+}
+
+
+def _optimizer_alias_key(value: str | None) -> str:
+    normalized = str(value or "").strip().lower()
+    return "".join(ch for ch in normalized if ch not in {"-", "_", " "})
+
+
+def is_prodigy_plus_optimizer(value: str | None) -> bool:
+    return _optimizer_alias_key(value) in PRODIGY_PLUS_OPTIMIZER_ALIASES
+
+
+def _literal_or_raw(value: str) -> Any:
+    try:
+        return ast.literal_eval(value)
+    except (ValueError, SyntaxError):
+        return value
+
 
 def get_optimizer(self, args, trainable_params: list[torch.nn.Parameter]) -> tuple[str, str, torch.optim.Optimizer]:
     optimizer_type = args.optimizer_type.lower()
@@ -44,7 +92,24 @@ def get_optimizer(self, args, trainable_params: list[torch.nn.Parameter]) -> tup
     optimizer = None
     optimizer_class = None
 
-    if optimizer_type in {"sinksgd", "sink_sgd", "sinksgd_adv", "sinksgdadv"}:
+    if is_prodigy_plus_optimizer(args.optimizer_type):
+        try:
+            from prodigyplus.prodigy_plus_schedulefree import ProdigyPlusScheduleFree
+        except ImportError as exc:
+            raise ImportError(
+                "Prodigy Plus requires the 'prodigy-plus-schedule-free' package. "
+                "Install it with `pip install prodigy-plus-schedule-free==2.0.1`."
+            ) from exc
+
+        args.optimizer_type = DEFAULT_PRODIGY_PLUS_OPTIMIZER_TYPE
+        for default_arg in DEFAULT_PRODIGY_PLUS_OPTIMIZER_ARGS:
+            key, value = default_arg.split("=", 1)
+            optimizer_kwargs.setdefault(key, _literal_or_raw(value))
+        logger.info("use Prodigy Plus Schedule-Free optimizer | lr=%s | %s", lr, optimizer_kwargs)
+        optimizer_class = ProdigyPlusScheduleFree
+        optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
+
+    elif optimizer_type in {"sinksgd", "sink_sgd", "sinksgd_adv", "sinksgdadv"}:
         from musubi_tuner.optimizers.sink_sgd import SinkSGD
 
         def pop_bool_arg(*names: str) -> bool:
@@ -369,6 +434,66 @@ def copy_optimizer_state_subset(state: dict, keep_param_ids: set[int]) -> dict:
     return copied
 
 
+def refresh_prodigy_plus_late_param_group_state(
+    optimizer: torch.optim.Optimizer,
+    *,
+    split_groups: Optional[bool] = None,
+) -> None:
+    """Initialize Prodigy Plus bookkeeping for param groups added after construction."""
+    inner_optimizer = optimizer.optimizer if hasattr(optimizer, "optimizer") else optimizer
+    param_groups = getattr(inner_optimizer, "param_groups", None)
+    defaults = getattr(inner_optimizer, "defaults", None)
+    if not param_groups or not isinstance(defaults, dict):
+        return
+
+    optimizer_module = type(inner_optimizer).__module__
+    is_prodigy_plus = optimizer_module.startswith("prodigyplus") or any(
+        "running_d_numerator" in group or "running_d_denom" in group for group in param_groups
+    )
+    if not is_prodigy_plus:
+        return
+
+    # Match Prodigy Plus semantics for the final pre-step group layout. If
+    # setup adds groups before the first step, honor the requested default;
+    # once training has started, preserve the active split-groups mode.
+    if split_groups is None:
+        default_split_groups = bool(defaults.get("split_groups", False))
+        optimizer_started = bool(getattr(inner_optimizer, "state", None)) or any(group.get("k", 1) != 1 for group in param_groups)
+        if default_split_groups and len(param_groups) > 1 and not optimizer_started:
+            split_groups = True
+        else:
+            for group in param_groups:
+                if "split_groups" in group:
+                    split_groups = bool(group["split_groups"])
+                    break
+            else:
+                split_groups = default_split_groups
+                if split_groups and len(param_groups) == 1:
+                    split_groups = False
+
+    def first_param_device(group: dict[str, Any]) -> torch.device:
+        for param in group.get("params", []):
+            if isinstance(param, torch.Tensor):
+                return param.device
+        first_group = param_groups[0]
+        tensor = first_group.get("running_d_numerator")
+        if tensor is None:
+            tensor = first_group.get("running_d_denom")
+        if isinstance(tensor, torch.Tensor):
+            return tensor.device
+        return torch.device("cpu")
+
+    groups_requiring_running_state = param_groups if split_groups else param_groups[:1]
+    for group in param_groups:
+        group["split_groups"] = split_groups
+    for group in groups_requiring_running_state:
+        device = first_param_device(group)
+        if "running_d_numerator" not in group:
+            group["running_d_numerator"] = torch.tensor(0.0, dtype=torch.float32, device=device)
+        if "running_d_denom" not in group:
+            group["running_d_denom"] = torch.tensor(0.0, dtype=torch.float32, device=device)
+
+
 def refresh_optimizer_after_adaptive_rank_prune(
     self,
     args: argparse.Namespace,
@@ -416,6 +541,7 @@ def refresh_optimizer_after_adaptive_rank_prune(
         inner_optimizer.add_param_group(group)
     for group in preserved_extra_groups:
         inner_optimizer.add_param_group(group)
+    self._refresh_prodigy_plus_late_param_group_state(inner_optimizer)
 
     for group in inner_optimizer.param_groups:
         if "initial_lr" in group:

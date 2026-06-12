@@ -507,6 +507,7 @@ def train(self, args):
             }
         )
         logger.info("Added uncertainty log-variance params to optimizer (lr=%.2e)", uncertainty_lr)
+        self._refresh_prodigy_plus_late_param_group_state(optimizer)
 
     def set_trainer_train_mode() -> None:
         optimizer_train_fn()
@@ -652,6 +653,7 @@ def train(self, args):
                 f"Self-Flow: added {sum(p.numel() for p in self_flow_params):,} projector params to optimizer "
                 f"(lr={effective_projector_lr:g})"
             )
+    self._refresh_prodigy_plus_late_param_group_state(optimizer)
 
     # prepare lr_scheduler (must happen after all optimizer param groups are added)
     lr_scheduler = self.get_lr_scheduler(args, optimizer, accelerator.num_processes)

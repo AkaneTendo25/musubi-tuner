@@ -26,6 +26,7 @@
 		'APOLLOAdamW',
 		'QAPOLLOAdamW',
 		'BAdam',
+		'ProdigyPlusScheduleFree',
 		'AdamW8bit',
 		'PagedAdamW8bit',
 		'AdamW',
@@ -45,6 +46,7 @@
 		'lion8bitint8',
 		'smmf'
 	];
+	const prodigyPlusOptimizerArgs = 'betas=(0.9,0.99) beta3=None weight_decay=0.0 weight_decay_by_lr=True use_bias_correction=False d0=1e-6 d_coef=1.0 prodigy_steps=0 use_speed=False eps=1e-8 split_groups=True split_groups_mean=False factored=True factored_fp32=True use_stableadamw=True use_cautious=False use_grams=False use_adopt=False d_limiter=True stochastic_rounding=True use_schedulefree=True schedulefree_c=0.0 use_orthograd=False';
 
 	let t = $derived($projectConfig?.full_finetune || {});
 	let status = $derived($processStatuses.full_finetune || { state: 'idle', exit_code: null });
@@ -335,9 +337,35 @@
 		}
 	}
 
+	function optimizerAlias(value) {
+		return String(value || '').toLowerCase().replace(/[-_\s]/g, '');
+	}
+
+	function isProdigyPlusOptimizer(value) {
+		const alias = optimizerAlias(value);
+		return alias === 'pplus' || alias === 'prodigyplus' || alias === 'prodigyplusschedulefree';
+	}
+
+	function applyProdigyPlusRecommendation() {
+		update('optimizer_type', 'ProdigyPlusScheduleFree');
+		update('optimizer_args', prodigyPlusOptimizerArgs);
+		update('base_optimizer_args', '');
+		update('qgalore_full_ft', false);
+		update('learning_rate', 1.0);
+		update('lr_scheduler', 'constant');
+		update('lr_warmup_steps', 0);
+		update('lr_decay_steps', 0);
+		update('max_grad_norm', 0.0);
+		update('fused_backward_pass', true);
+		update('full_bf16', true);
+		update('full_fp16', false);
+	}
+
 	function applyRecommendedOptimizerArgs() {
 		const optimizer = (t.optimizer_type || '').toLowerCase();
-		if (optimizer.includes('qapollo')) {
+		if (isProdigyPlusOptimizer(optimizer)) {
+			applyProdigyPlusRecommendation();
+		} else if (optimizer.includes('qapollo')) {
 			applyApolloRecommendation(true);
 		} else if (optimizer.includes('apollo')) {
 			applyApolloRecommendation(false);

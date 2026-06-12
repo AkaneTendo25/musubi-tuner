@@ -938,6 +938,17 @@ LTX-2 training accepts optimizer selection through `--optimizer_type`; optimizer
 | `CAME`, `CAMESimple`, `came_simple` | You want CAME without 8-bit optimizer-state quantization. | No | Yes | Supports `stochastic_rounding`, `use_cautious`, and related CAME args through `--optimizer_args`. |
 | `CAME8bit`, `came_8bit` | You want CAME with block-wise 8-bit optimizer state for eligible tensors. | No | Yes | Supports the same CAME args plus 8-bit state settings such as `min_8bit_size` and `quant_block_size`. |
 | `SinkSGD`, `SinkSGD_adv`, `sinksgd`, `sink_sgd`, `sinksgdadv` | You want Sinkhorn-normalized SGD with momentum for LoRA-style training. | No | Yes | Supports `momentum`, `nesterov`, `nesterov_coef`, `normed_momentum`, `weight_decay`, `sinkhorn_iterations`, `orthogonal_sinkhorn`, `orthogonal_gradient`, `spectral_normalization`, and `state_precision`. State precision modes are `auto`, `fp32`, and `bf16_sr`. Optional LR scaling requires explicit args such as `scale_lr_with_grad_accum=True` or `scale_lr_with_effective_batch=True`. |
+| `ProdigyPlusScheduleFree`, `ProdigyPlus`, `PPlus` | You want the Prodigy Plus schedule-free optimizer. | `prodigy-plus-schedule-free` | Yes | Opt-in only. The trainer fills missing Prodigy Plus constructor args with the recommended defaults below, but does not change `--learning_rate`, `--lr_scheduler`, or clipping unless you pass those values or use the dashboard preset. |
+
+Recommended Prodigy Plus LoRA starting point:
+
+```bash
+--optimizer_type ProdigyPlusScheduleFree ^
+--learning_rate 1.0 ^
+--lr_scheduler constant ^
+--max_grad_norm 0 ^
+--optimizer_args betas=(0.9,0.99) beta3=None weight_decay=0.0 weight_decay_by_lr=True use_bias_correction=False d0=1e-6 d_coef=1.0 prodigy_steps=0 use_speed=False eps=1e-8 split_groups=True split_groups_mean=False factored=True factored_fp32=True use_stableadamw=True use_cautious=False use_grams=False use_adopt=False d_limiter=True stochastic_rounding=True use_schedulefree=True schedulefree_c=0.0 use_orthograd=False
+```
 
 #### Per-Module Learning Rates
 <sub>[↑ contents](#table-of-contents)</sub>
