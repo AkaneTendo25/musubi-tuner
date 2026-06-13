@@ -3823,7 +3823,11 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             text_mask = fallback_text_mask
             conditions["prompt_embeds"] = text_embeds
 
-        base_model = transformer.model if hasattr(transformer, "model") else transformer
+        # Unwrap DDP/FSDP first: those wrappers expose `.module`, not `.model`, so reading
+        # cross_attention_dim off a still-wrapped transformer yields 0 and silently halves the
+        # video context (DDP-only crash). unwrap_model is a no-op on a single process.
+        base_model = accelerator.unwrap_model(transformer)
+        base_model = base_model.model if hasattr(base_model, "model") else base_model
         expected_video_dim = int(getattr(base_model, "cross_attention_dim", 0) or 0)
         expected_audio_dim = int(getattr(base_model, "audio_cross_attention_dim", 0) or 0)
 
@@ -5187,7 +5191,8 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
 
         caption_channels = getattr(transformer, "caption_channels", None)
         if caption_channels is None:
-            base_model = transformer.model if hasattr(transformer, "model") else transformer
+            base_model = accelerator.unwrap_model(transformer)
+            base_model = base_model.model if hasattr(base_model, "model") else base_model
             _caption_proj = getattr(base_model, "caption_projection", None)
             if _caption_proj is not None:
                 caption_channels = getattr(getattr(_caption_proj, "linear_1", None), "in_features", None)
