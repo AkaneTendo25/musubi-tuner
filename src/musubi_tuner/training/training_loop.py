@@ -2033,6 +2033,27 @@ def train(self, args):
                                     )
                                 )
 
+                    # --- Video per-sigma-bucket loss diagnostic (mirrors the audio block, negligible cost) ---
+                    _vp = out.get("video_pred") if isinstance(out, dict) else None
+                    _vt = out.get("video_target") if isinstance(out, dict) else None
+                    _vsig = out.get("video_sigma") if isinstance(out, dict) else None
+                    if _vp is not None and _vt is not None and _vsig is not None:
+                        with torch.no_grad():
+                            vp = _vp.detach().float()
+                            vt = _vt.detach().float()
+                            vsig = _vsig.detach().float().reshape(-1)
+                            if vp.shape == vt.shape and vp.dim() >= 1 and vp.shape[0] == vsig.shape[0]:
+                                per_sample = ((vp - vt) ** 2).mean(dim=list(range(1, vp.dim())))
+                                high_mask = vsig > 0.5
+                                mid_mask = (vsig >= 0.1) & (vsig <= 0.5)
+                                low_mask = vsig < 0.1
+                                if high_mask.any():
+                                    audio_diagnostics["loss_v/sigma_high"] = per_sample[high_mask].mean().item()
+                                if mid_mask.any():
+                                    audio_diagnostics["loss_v/sigma_mid"] = per_sample[mid_mask].mean().item()
+                                if low_mask.any():
+                                    audio_diagnostics["loss_v/sigma_low"] = per_sample[low_mask].mean().item()
+
                 else:
                     if isinstance(target, torch.Tensor):
                         model_pred = model_pred.to(device=target.device, dtype=network_dtype)

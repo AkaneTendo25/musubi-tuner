@@ -5827,6 +5827,7 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             "video_target": video_target,
             "video_loss_mask": video_loss_mask,
             "video_loss_weight": _resolve_loss_weight("video_loss_weight", "video_loss_weight"),
+            "video_sigma": sigma,  # per-sample [B] flow-matching sigma, for per-sigma-bucket loss logging
         }
 
         # HFATO: pass metadata for x0-prediction loss in the training loop
