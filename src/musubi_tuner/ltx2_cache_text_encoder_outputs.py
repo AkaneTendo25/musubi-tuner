@@ -14,6 +14,7 @@ import logging
 from contextlib import nullcontext
 import torch
 
+import musubi_tuner.cache_latents as cache_latents
 import musubi_tuner.cache_text_encoder_outputs as cache_text_encoder_outputs
 from musubi_tuner.dataset import config_utils
 from musubi_tuner.dataset.config_utils import BlueprintGenerator, ConfigSanitizer
@@ -355,6 +356,11 @@ def main() -> None:
 
     device = torch.device(args.device if args.device is not None else ("cuda" if torch.cuda.is_available() else "cpu"))
 
+    # Opt-in multi-process cache sharding (default off → single process, no change).
+    device, _shard = cache_latents.resolve_distributed_cache_shard(args, device)
+    args._cache_shard = _shard
+    shard_rank, shard_world = _shard
+
     blueprint_generator = BlueprintGenerator(ConfigSanitizer())
     logger.info("Load dataset config from %s", args.dataset_config)
     user_config = config_utils.load_user_config(args.dataset_config)
@@ -495,26 +501,29 @@ def main() -> None:
     # often hurts throughput or appears to hang due to thread contention. Default to 1 unless specified.
     num_workers = 1 if args.num_workers is None else args.num_workers
 
-    if getattr(args, "precache_sample_prompts", False):
-        _precache_sample_prompts(
-            args,
-            datasets=datasets,
-            text_encoder=text_encoder,
-            audio_video=audio_video,
-            ltx_mode=ltx_mode,
-            autocast_dtype=autocast_dtype,
-            device=device,
-        )
+    # Sample/preservation prompt precaching writes shared (non-partitioned) caches, so under
+    # distributed sharding only rank 0 runs them to avoid concurrent identical writes.
+    if shard_rank == 0:
+        if getattr(args, "precache_sample_prompts", False):
+            _precache_sample_prompts(
+                args,
+                datasets=datasets,
+                text_encoder=text_encoder,
+                audio_video=audio_video,
+                ltx_mode=ltx_mode,
+                autocast_dtype=autocast_dtype,
+                device=device,
+            )
 
-    if getattr(args, "precache_preservation_prompts", False):
-        _precache_preservation_prompts(
-            args,
-            datasets=datasets,
-            text_encoder=text_encoder,
-            audio_video=audio_video,
-            autocast_dtype=autocast_dtype,
-            device=device,
-        )
+        if getattr(args, "precache_preservation_prompts", False):
+            _precache_preservation_prompts(
+                args,
+                datasets=datasets,
+                text_encoder=text_encoder,
+                audio_video=audio_video,
+                autocast_dtype=autocast_dtype,
+                device=device,
+            )
 
     cache_text_encoder_outputs.process_text_encoder_batches(
         num_workers,
@@ -524,14 +533,22 @@ def main() -> None:
         all_cache_files_for_dataset,
         all_cache_paths_for_dataset,
         encode_fn,
+        shard=_shard,
     )
 
     cache_text_encoder_outputs.post_process_cache_files(
-        datasets, all_cache_files_for_dataset, all_cache_paths_for_dataset, args.keep_cache
+        datasets, all_cache_files_for_dataset, all_cache_paths_for_dataset, args.keep_cache, shard=_shard
     )
 
 
 def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
+    parser.add_argument(
+        "--cache_distributed",
+        action="store_true",
+        help="Shard text-encoder caching across processes for multi-GPU preprocessing. Launch with "
+        "torchrun/accelerate (sets WORLD_SIZE/RANK/LOCAL_RANK); each rank caches a disjoint subset "
+        "on its own GPU. Off by default (single process, unchanged).",
+    )
     parser.add_argument(
         "--ltx2_checkpoint",
         type=str,

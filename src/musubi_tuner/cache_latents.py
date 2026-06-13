@@ -1,5 +1,6 @@
 import argparse
 import os
+import zlib
 from typing import Optional, Union
 
 import numpy as np
@@ -289,9 +290,46 @@ def encode_and_save_batch(vae: AutoencoderKLCausal3D, batch: list[ItemInfo]):
         save_latent_cache(item, l)
 
 
+def cache_shard_takes(key: str, rank: int, world: int) -> bool:
+    """Deterministic, order-independent shard assignment for a stable per-item key.
+
+    Maps every key to exactly one rank, so the union over ranks is a disjoint cover even
+    when processes iterate buckets in different orders. Positional ``index % world`` is NOT
+    safe here (orders can differ → dropped/duplicated items). ``zlib.crc32`` is used instead
+    of ``hash()`` because the latter is per-process salted (PYTHONHASHSEED).
+    """
+    return (zlib.crc32(os.path.normpath(key).encode("utf-8")) % world) == rank
+
+
+def resolve_distributed_cache_shard(args: argparse.Namespace, device):
+    """Opt-in multi-process cache sharding via torchrun/accelerate env vars.
+
+    Returns ``(device, (rank, world_size))``. When ``--cache_distributed`` is set and the
+    launcher provides ``WORLD_SIZE > 1``, picks a per-rank CUDA device (unless ``--device``
+    was given explicitly) and returns the shard tuple. Off by default → ``(device, (0, 1))``,
+    so single-process callers are unchanged.
+    """
+    if not getattr(args, "cache_distributed", False):
+        return device, (0, 1)
+    world = int(os.environ.get("WORLD_SIZE", "1"))
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    if world > 1 and getattr(args, "device", None) is None and torch.cuda.is_available():
+        device = torch.device(f"cuda:{local_rank}")
+    if world > 1:
+        logger.info("Distributed cache sharding enabled: rank %d/%d on %s", rank, world, device)
+    else:
+        logger.warning("--cache_distributed set but WORLD_SIZE<=1; running single-process. Launch with torchrun/accelerate.")
+    return device, (rank, world)
+
+
 def encode_datasets(datasets: list[BaseDataset], encode: callable, args: argparse.Namespace, supports_alpha: bool = False):
     """Common function to encode datasets. This function is called from multiple architecture scripts."""
     num_workers = args.num_workers if args.num_workers is not None else max(1, os.cpu_count() - 1)
+    # Opt-in multi-process cache sharding: (rank, world_size). Default (0, 1) = single
+    # process → no behavior change. When world_size > 1, each rank processes a disjoint
+    # subset of items (assigned by a stable hash of the cache path) so N GPUs cache in parallel.
+    shard_rank, shard_world = getattr(args, "_cache_shard", (0, 1)) or (0, 1)
     progress_writer = create_cache_progress_writer_from_env()
     for i, dataset in enumerate(datasets):
         logger.info(f"Encoding dataset [{i}]")
@@ -303,6 +341,11 @@ def encode_datasets(datasets: list[BaseDataset], encode: callable, args: argpars
             progress_writer.update(dataset_index=i, current_items=0, total_items=total_items)
         for _, batch in tqdm(dataset.retrieve_latent_cache_batches(num_workers)):
             batch: list[ItemInfo] = batch
+            if shard_world > 1:
+                # Stable per-item assignment by cache path → order-independent disjoint cover.
+                batch = [it for it in batch if cache_shard_takes(it.latent_cache_path, shard_rank, shard_world)]
+                if not batch:
+                    continue
             original_batch_size = len(batch)
             if not supports_alpha:
                 # make sure content has 3 channels
@@ -346,14 +389,19 @@ def encode_datasets(datasets: list[BaseDataset], encode: callable, args: argpars
         all_latent_cache_paths = set(all_latent_cache_paths)
 
         # remove old cache files not in the dataset
-        all_cache_files = dataset.get_all_latent_cache_files()
-        for cache_file in all_cache_files:
-            if os.path.normpath(cache_file) not in all_latent_cache_paths:
-                if args.keep_cache:
-                    logger.info(f"Keep cache file not in the dataset: {cache_file}")
-                else:
-                    os.remove(cache_file)
-                    logger.info(f"Removed old cache file: {cache_file}")
+        if shard_world > 1:
+            # Under sharding each rank only sees its own subset, so it cannot tell a stale
+            # file from another rank's valid cache. Skip cleanup to avoid deleting siblings.
+            logger.info("Distributed cache sharding active (world_size=%d): skipping stale-cache cleanup", shard_world)
+        else:
+            all_cache_files = dataset.get_all_latent_cache_files()
+            for cache_file in all_cache_files:
+                if os.path.normpath(cache_file) not in all_latent_cache_paths:
+                    if args.keep_cache:
+                        logger.info(f"Keep cache file not in the dataset: {cache_file}")
+                    else:
+                        os.remove(cache_file)
+                        logger.info(f"Removed old cache file: {cache_file}")
 
 
 def main():

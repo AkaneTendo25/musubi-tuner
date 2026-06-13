@@ -1,5 +1,6 @@
 import argparse
 import os
+import zlib
 from typing import Optional, Union
 
 import torch
@@ -84,12 +85,17 @@ def process_text_encoder_batches(
     all_cache_paths_for_dataset: list[set],
     encode: callable,
     requires_content: Optional[bool] = False,
+    shard: Optional[tuple] = None,
 ):
     """
     Architecture independent processing of text encoder batches.
+
+    shard: optional (rank, world_size) for opt-in multi-process sharding. Default None →
+    single process, no change. When world_size > 1 each rank encodes a disjoint subset.
     """
 
     num_workers = num_workers if num_workers is not None else max(1, os.cpu_count() - 1)
+    shard_rank, shard_world = shard if shard else (0, 1)
     progress_writer = create_cache_progress_writer_from_env()
     for i, dataset in enumerate(datasets):
         logger.info(f"Encoding dataset [{i}]")
@@ -110,6 +116,15 @@ def process_text_encoder_batches(
             # update cache files (it's ok if we update it multiple times)
             if requires_content:
                 batch = batch[1]  # batch is (key, items), so use items
+            if shard_world > 1:
+                # Stable per-item assignment by cache path → order-independent disjoint cover.
+                batch = [
+                    it
+                    for it in batch
+                    if (zlib.crc32(os.path.normpath(it.text_encoder_output_cache_path).encode("utf-8")) % shard_world) == shard_rank
+                ]
+                if not batch:
+                    continue
             original_batch_size = len(batch)
             all_cache_paths.update([os.path.normpath(item.text_encoder_output_cache_path) for item in batch])
 
@@ -142,8 +157,18 @@ def process_text_encoder_batches(
 
 
 def post_process_cache_files(
-    datasets: list[BaseDataset], all_cache_files_for_dataset: list[set], all_cache_paths_for_dataset: list[set], keep_cache: bool
+    datasets: list[BaseDataset],
+    all_cache_files_for_dataset: list[set],
+    all_cache_paths_for_dataset: list[set],
+    keep_cache: bool,
+    shard: Optional[tuple] = None,
 ):
+    _, shard_world = shard if shard else (0, 1)
+    if shard_world > 1:
+        # Each rank only saw its own subset; it cannot distinguish a stale file from another
+        # rank's valid cache. Skip cleanup under sharding to avoid deleting siblings' work.
+        logger.info("Distributed cache sharding active (world_size=%d): skipping stale-cache cleanup", shard_world)
+        return
     for i, dataset in enumerate(datasets):
         all_cache_files = all_cache_files_for_dataset[i]
         all_cache_paths = all_cache_paths_for_dataset[i]

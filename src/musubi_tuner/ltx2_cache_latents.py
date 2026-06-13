@@ -1408,6 +1408,11 @@ def main() -> None:
 
     device = torch.device(args.device) if args.device else torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    # Opt-in multi-process cache sharding (default off → single process, no change).
+    device, _shard = cache_latents.resolve_distributed_cache_shard(args, device)
+    args._cache_shard = _shard
+    shard_rank, shard_world = _shard
+
     # Handle I2V sample latent precaching if requested.
     # This is additive: continue with normal dataset latent caching afterward.
     if getattr(args, "precache_sample_latents", False):
@@ -1501,13 +1506,18 @@ def main() -> None:
         # content=None (no visual frames) and are handled separately below.
         cache_latents.encode_datasets(list(non_audio_datasets), encode_fn, args)
 
-        # Cache reference latents for IC-LoRA / v2v training (auto-detected from TOML config)
-        # Runs when any dataset has reference_cache_directory and a matching reference source directory.
-        encode_and_save_reference_latents(vae, datasets, args, device, tiling_config)
+        # Reference/guide caching is not shard-partitioned (cross-item path derivation), so
+        # under distributed sharding only rank 0 runs it to avoid concurrent identical writes.
+        if shard_rank == 0:
+            # Cache reference latents for IC-LoRA / v2v training (auto-detected from TOML config)
+            # Runs when any dataset has reference_cache_directory and a matching reference source directory.
+            encode_and_save_reference_latents(vae, datasets, args, device, tiling_config)
 
-        # Cache latent guides (latent_idx + keyframe). Auto-detected from TOML:
-        # runs when any dataset has *_guide_directory + *_guide_cache_directory set.
-        encode_and_save_latent_guides(vae, datasets, args, device, tiling_config)
+            # Cache latent guides (latent_idx + keyframe). Auto-detected from TOML:
+            # runs when any dataset has *_guide_directory + *_guide_cache_directory set.
+            encode_and_save_latent_guides(vae, datasets, args, device, tiling_config)
+        elif shard_world > 1:
+            logger.info("rank %d: skipping reference/guide caching (rank-0 only under sharding)", shard_rank)
 
     if audio_only:
         if getattr(args, "ltx2_checkpoint", None) is None:
@@ -1645,6 +1655,9 @@ def main() -> None:
             for _bucket_key, batch in ds.retrieve_latent_cache_batches(num_workers):
                 for item_info in batch:
                     audio_cache_path = _audio_cache_path(item_info)
+                    # Stable per-item assignment by cache path → order-independent disjoint cover.
+                    if shard_world > 1 and not cache_latents.cache_shard_takes(audio_cache_path, shard_rank, shard_world):
+                        continue
                     if args.skip_existing and os.path.exists(audio_cache_path):
                         audio_skipped_count += 1
                         continue
@@ -1695,16 +1708,24 @@ def main() -> None:
             audio_skipped_count,
         )
 
-        encode_and_save_reference_audio_latents(
-            encoder,
-            processor,
-            datasets,
-            args,
-            dtype=audio_dtype,
-        )
+        if shard_rank == 0:
+            encode_and_save_reference_audio_latents(
+                encoder,
+                processor,
+                datasets,
+                args,
+                dtype=audio_dtype,
+            )
 
 
 def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
+    parser.add_argument(
+        "--cache_distributed",
+        action="store_true",
+        help="Shard latent caching across processes for multi-GPU preprocessing. Launch with "
+        "torchrun/accelerate (sets WORLD_SIZE/RANK/LOCAL_RANK); each rank caches a disjoint "
+        "subset on its own GPU. Off by default (single process, unchanged).",
+    )
     parser.add_argument(
         "--ltx2_mode",
         "--ltx_mode",
