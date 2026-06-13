@@ -25,6 +25,7 @@ from musubi_tuner.training.metadata import (
     SS_METADATA_MINIMUM_KEYS,
 )
 from musubi_tuner.training.outputs import DiTOutput as DiTOutput
+from musubi_tuner.training.timesteps import compute_loss_weighting_for_sd3
 
 
 class NetworkTrainer:
@@ -112,8 +113,114 @@ class NetworkTrainer:
         noisy_model_input: torch.Tensor,
         timesteps: torch.Tensor,
         network_dtype: torch.dtype,
+        **kwargs,
     ) -> DiTOutput:
-        raise NotImplementedError
+        raise NotImplementedError("subclass must implement `call_dit`")
+
+    def process_batch(
+        self,
+        args: argparse.Namespace,
+        accelerator: Accelerator,
+        transformer,
+        network,
+        batch: dict[str, torch.Tensor],
+        latents: torch.Tensor,
+        noise: torch.Tensor,
+        noise_scheduler,
+        dit_dtype: torch.dtype,
+        network_dtype: torch.dtype,
+        vae,
+        global_step: int,
+    ) -> tuple[torch.Tensor, dict[str, float]]:
+        noisy_model_input, timesteps = self.get_noisy_model_input_and_timesteps(
+            args, noise, latents, batch["timesteps"], noise_scheduler, accelerator.device, dit_dtype
+        )
+        output = self.call_dit(args, accelerator, transformer, latents, batch, noise, noisy_model_input, timesteps, network_dtype)
+        return self.compute_loss(args, output, timesteps, noise_scheduler, dit_dtype, network_dtype, global_step)
+
+    def compute_loss(
+        self,
+        args: argparse.Namespace,
+        output: DiTOutput,
+        timesteps: torch.Tensor,
+        noise_scheduler,
+        dit_dtype: torch.dtype,
+        network_dtype: torch.dtype,
+        global_step: int,
+    ) -> tuple[torch.Tensor, dict[str, float]]:
+        weighting = compute_loss_weighting_for_sd3(args.weighting_scheme, noise_scheduler, timesteps, timesteps.device, dit_dtype)
+        loss = torch.nn.functional.mse_loss(output.pred.to(network_dtype), output.target, reduction="none")
+        if weighting is not None:
+            loss = loss * weighting
+        return loss.mean(), {}
+
+    def on_transformer_loaded(
+        self,
+        args: argparse.Namespace,
+        accelerator: Accelerator,
+        transformer,
+    ) -> None:
+        pass
+
+    def on_train_start(
+        self,
+        args: argparse.Namespace,
+        accelerator: Accelerator,
+        network,
+        transformer,
+        optimizer,
+    ) -> None:
+        pass
+
+    def on_post_optimizer_step(
+        self,
+        args: argparse.Namespace,
+        accelerator: Accelerator,
+        network,
+        transformer,
+        sync_gradients: bool,
+        global_step: int,
+    ) -> None:
+        pass
+
+    def on_post_save(
+        self,
+        args: argparse.Namespace,
+        accelerator: Accelerator,
+        network,
+        transformer,
+        ckpt_name: str,
+        save_dtype,
+        metadata: dict,
+        force_sync_upload: bool,
+    ) -> None:
+        pass
+
+    def on_before_sample_images(
+        self, accelerator, args, epoch, steps, vae, transformer, network, sample_parameters, dit_dtype
+    ) -> None:
+        pass
+
+    def on_after_sample_images(
+        self, accelerator, args, epoch, steps, vae, transformer, network, sample_parameters, dit_dtype
+    ) -> None:
+        pass
+
+    def extra_trainable_params(
+        self,
+        args: argparse.Namespace,
+        accelerator: Accelerator,
+        network,
+        transformer,
+        trainable_params: list,
+    ) -> list:
+        return trainable_params
+
+    def extra_metadata(self, args: argparse.Namespace) -> dict:
+        return {}
+
+    def extra_step_logs(self, args: argparse.Namespace, logs: dict) -> dict:
+        return {}
 
 
 NetworkTrainer.train = _training_loop.train
