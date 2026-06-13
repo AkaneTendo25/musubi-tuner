@@ -49,6 +49,7 @@ DEFAULT_PRODIGY_PLUS_OPTIMIZER_ARGS = (
     "use_schedulefree=True",
     "schedulefree_c=0.0",
     "use_orthograd=False",
+    "use_focus=False",
 )
 PRODIGY_PLUS_OPTIMIZER_ALIASES = {
     "pplus",
