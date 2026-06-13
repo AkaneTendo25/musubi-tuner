@@ -4277,9 +4277,14 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
         # since there are no subsequent frames to generate from frame 0
         num_frames = latents.shape[2]
         if first_frame_p > 0.0 and num_frames > 1:
-            enable_conditioning = bool(torch.rand((), device=accelerator.device) < first_frame_p)
-            if enable_conditioning:
-                video_conditioning_enabled = torch.ones((latents.shape[0],), device=accelerator.device, dtype=torch.bool)
+            # Per-sample Bernoulli (matches the official LTX-2 recipe): each sample is
+            # independently conditioned, so a batch mixes conditioned/unconditioned items
+            # instead of toggling all-or-nothing. Downstream indexing already supports a
+            # per-sample boolean mask. Collapse to None when nothing is selected so the
+            # no-conditioning fast path (skip clone) is preserved.
+            video_conditioning_enabled = torch.rand((latents.shape[0],), device=accelerator.device) < first_frame_p
+            if not bool(video_conditioning_enabled.any()):
+                video_conditioning_enabled = None
 
         model_noisy_video = noisy_model_input
         if video_conditioning_enabled is not None and model_noisy_video.shape[2] > 0:
