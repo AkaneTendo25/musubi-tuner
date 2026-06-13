@@ -67,6 +67,12 @@ from musubi_tuner.ltx2_model_parallel import (
     is_ltx2_model_parallel_enabled,
     validate_ltx2_model_parallel_setup,
 )
+from musubi_tuner.ltx2_fsdp import (
+    add_ltx2_fsdp_args,
+    gather_fsdp_full_state_dict,
+    is_ltx2_fsdp_enabled,
+    validate_ltx2_fsdp_setup,
+)
 from musubi_tuner.ltx2_remote_stage import (
     enable_ltx2_remote_stage,
     is_ltx2_remote_stage_enabled,
@@ -2343,6 +2349,7 @@ def ltx2_finetune_setup_parser(parser: argparse.ArgumentParser) -> argparse.Argu
         ),
     )
     add_ltx2_model_parallel_args(parser)
+    add_ltx2_fsdp_args(parser)
     # EMA arguments
     parser.add_argument(
         "--use_ema",
@@ -3322,10 +3329,17 @@ def main() -> None:
         args.mixed_precision = accelerator.mixed_precision
     ltx2_model_parallel = is_ltx2_model_parallel_enabled(args)
     ltx2_remote_stage = is_ltx2_remote_stage_enabled(args)
+    ltx2_fsdp = is_ltx2_fsdp_enabled(args)
     if ltx2_model_parallel and ltx2_remote_stage:
         raise RuntimeError("--ltx2_model_parallel and --ltx2_remote_stage are experimental paths and cannot be combined")
     if ltx2_model_parallel:
         validate_ltx2_model_parallel_setup(args, accelerator)
+    if ltx2_fsdp:
+        validate_ltx2_fsdp_setup(args, accelerator)
+        if bool(getattr(args, "ltx2_fsdp_activation_checkpointing", False)):
+            # FSDP-native activation checkpointing; disable the model's own gradient checkpointing
+            # to avoid double-wrapping the transformer blocks.
+            args.gradient_checkpointing = False
     if ltx2_remote_stage:
         if int(getattr(accelerator, "num_processes", 1)) != 1:
             raise RuntimeError("LTX2 remote stage is single-process only; use accelerate --num_processes 1")
@@ -4182,7 +4196,12 @@ def main() -> None:
     lr_scheduler = trainer.get_lr_scheduler(args, optimizer, accelerator.num_processes)
 
     # prepare accelerator
-    if ltx2_model_parallel:
+    if ltx2_fsdp:
+        # FSDP: prepare model + optimizer together so the optimizer binds to the sharded params.
+        transformer, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+            transformer, optimizer, train_dataloader, lr_scheduler
+        )
+    elif ltx2_model_parallel:
         transformer = accelerator.prepare(transformer, device_placement=[False])
         if text_encoder is not None:
             text_encoder = accelerator.prepare(text_encoder)
@@ -4202,7 +4221,9 @@ def main() -> None:
         transformer = trainer.compile_transformer(args, transformer)
         transformer.__dict__["_orig_mod"] = transformer
 
-    optimizer, train_dataloader, lr_scheduler = accelerator.prepare(optimizer, train_dataloader, lr_scheduler)
+    if not ltx2_fsdp:
+        # Under FSDP these were already prepared together with the model above.
+        optimizer, train_dataloader, lr_scheduler = accelerator.prepare(optimizer, train_dataloader, lr_scheduler)
 
     if getattr(trainer, "_self_flow", None) is not None:
         trainer._self_flow_network = accelerator.unwrap_model(transformer)
@@ -4798,9 +4819,18 @@ def main() -> None:
             metadata_to_save.update(checkpoint_extra_metadata)
 
         save_model_ref = getattr(unwrapped_model, "_orig_mod", None) or unwrapped_model
-        # Build a zero-copy dict referencing live parameters (avoids state_dict() VRAM duplication)
-        state_dict = {name: param.data for name, param in save_model_ref.named_parameters()}
-        state_dict.update({name: buf for name, buf in save_model_ref.named_buffers()})
+        if ltx2_fsdp:
+            # FSDP shards params across ranks, so the per-rank named_parameters() below would each
+            # write only a shard (and race the write). Gather a full unsharded state dict — a
+            # COLLECTIVE that must run on every rank — then let only the main process continue to
+            # the write. (text_encoder / qgalore / int8 paths below are forbidden under FSDP.)
+            state_dict = gather_fsdp_full_state_dict(accelerator, transformer)
+            if not accelerator.is_main_process:
+                return
+        else:
+            # Build a zero-copy dict referencing live parameters (avoids state_dict() VRAM duplication)
+            state_dict = {name: param.data for name, param in save_model_ref.named_parameters()}
+            state_dict.update({name: buf for name, buf in save_model_ref.named_buffers()})
         if text_encoder is not None:
             unwrapped_text_encoder = accelerator.unwrap_model(text_encoder)
             text_encoder_ref = getattr(unwrapped_text_encoder, "_orig_mod", None) or unwrapped_text_encoder

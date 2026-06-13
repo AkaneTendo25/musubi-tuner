@@ -142,6 +142,12 @@ def prepare_accelerator(args: argparse.Namespace) -> Accelerator:
         # Opt-in: enable non_blocking H2D for Accelerate's prepared DataLoader (pairs with
         # base-loader pin_memory). Off by default -> kwargs unchanged from the prior call.
         accelerator_kwargs["dataloader_config"] = DataLoaderConfiguration(non_blocking=True)
+    # Opt-in FSDP1/ZeRO sharding (--ltx2_fsdp).
+    from musubi_tuner.ltx2_fsdp import build_ltx2_fsdp_plugin
+
+    fsdp_plugin = build_ltx2_fsdp_plugin(args)
+    if fsdp_plugin is not None:
+        accelerator_kwargs["fsdp_plugin"] = fsdp_plugin
     accelerator = Accelerator(**accelerator_kwargs)
     print("accelerator device:", accelerator.device)
     if (
