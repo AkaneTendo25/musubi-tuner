@@ -215,10 +215,16 @@ class TrainingConfig(BaseModel):
     base_weights: str = ""
     base_weights_multiplier: str = ""
     lycoris_config: str = ""
+    lycoris_algo: Literal["", "lora", "loha", "lokr", "locon", "ia3", "full"] = ""
+    lycoris_factor: Optional[int] = None
+    lycoris_conv_dim: Optional[int] = None
+    lycoris_conv_alpha: Optional[float] = None
+    lycoris_dropout: Optional[float] = None
     lycoris_quantized_base_check_mode: Literal["off", "warn", "error"] = "warn"
     init_lokr_norm: Optional[float] = None
     use_dora: bool = False
     use_dora_oft: bool = False
+    use_rslora: bool = False
     rank_dropout: Optional[float] = None
     module_dropout: Optional[float] = None
     adaptive_rank: bool = False

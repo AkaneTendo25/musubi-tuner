@@ -63,6 +63,15 @@
 	const prodigyPlusOptimizerArgs = 'betas=(0.9,0.99) beta3=None weight_decay=0.0 weight_decay_by_lr=True use_bias_correction=False d0=1e-6 d_coef=1.0 prodigy_steps=0 use_speed=False eps=1e-8 split_groups=True split_groups_mean=False factored=True factored_fp32=True use_stableadamw=True use_cautious=False use_grams=False use_adopt=False d_limiter=True stochastic_rounding=True use_schedulefree=True schedulefree_c=0.0 use_orthograd=False';
 	const boundaryCodecOptions = ['none', 'int8', 'int4'];
 	const remoteActivationCodecOptions = ['none', 'int8', 'int4', 'aq-int8', 'aq-int4'];
+	const lycorisAlgoOptions = [
+		{ value: '', label: 'Disabled' },
+		{ value: 'lora', label: 'LoRA' },
+		{ value: 'loha', label: 'LoHa' },
+		{ value: 'lokr', label: 'LoKr' },
+		{ value: 'locon', label: 'LoCon' },
+		{ value: 'ia3', label: 'IA3' },
+		{ value: 'full', label: 'Full' },
+	];
 
 	let t = $derived($projectConfig?.training || {});
 	let rl = $derived($projectConfig?.remote_stage_launcher || {});
@@ -336,6 +345,26 @@
 	function fieldInvalid(field) {
 		return Boolean(fieldError(field));
 	}
+	function enableLycorisMode() {
+		if (!String(t.network_module || '').toLowerCase().includes('lycoris')) {
+			update('network_module', 'lycoris.kohya');
+		}
+		if ((t.lora_target_preset || 't2v') !== 'lycoris') {
+			update('lora_target_preset', 'lycoris');
+		}
+	}
+	function updateLoraTargetPreset(value) {
+		update('lora_target_preset', value);
+		if (value === 'lycoris') enableLycorisMode();
+	}
+	function updateLycorisAlgo(value) {
+		update('lycoris_algo', value);
+		if (value) enableLycorisMode();
+	}
+	function updateLycorisConfig(value) {
+		update('lycoris_config', value);
+		if (value) enableLycorisMode();
+	}
 
 	function remoteFieldError(field) {
 		if (!remoteStageEnabled) return '';
@@ -458,11 +487,12 @@
 								{ value: 'av_ic', label: 'AV IC' },
 								{ value: 'video_ref_only_av', label: 'AV video-ref' },
 								{ value: 'full', label: 'full (all)' }
-							]} onchange={(e) => update('lora_target_preset', e.target.value)} tooltip="Target layers" />
+							]} onchange={(e) => updateLoraTargetPreset(e.target.value)} tooltip="Target layers" />
 						</div>
 						<div class="grid grid-cols-3 gap-x-4 gap-y-1">
 							<FormToggle label="DoRA / DokR" fieldPath="training.use_dora" checked={t.use_dora ?? false} onchange={(e) => update('use_dora', e.target.checked)} tooltip="Train LoRA or LoKr with a separate magnitude vector. Passed as use_dora=true in network args." />
 							<FormToggle label="DoRA-OFT / DoKr-OFT" fieldPath="training.use_dora_oft" checked={t.use_dora_oft ?? false} onchange={(e) => update('use_dora_oft', e.target.checked)} tooltip="Train native LoRA or LoKr with OFT rotation plus DoRA-style magnitude scaling. Passed as use_dora_oft=true in network args." />
+							<FormToggle label="rsLoRA" fieldPath="training.use_rslora" checked={t.use_rslora ?? false} onchange={(e) => update('use_rslora', e.target.checked)} tooltip="Use rank-stabilized LoRA scaling alpha/sqrt(rank). Native LoRA backend only; exported alpha is saved in standard-loader-compatible form." />
 						</div>
 						{#if $advancedMode}
 							<div class="grid grid-cols-2 gap-2">
@@ -537,10 +567,22 @@
 						<PathInput fieldPath="training.network_weights" value={t.network_weights || ''} oninput={(e) => update('network_weights', e.target.value)} showFiles tooltip="Warm-start from existing LoRA weights" />
 						<FormField fieldPath="training.base_weights" value={t.base_weights || ''} oninput={(e) => update('base_weights', e.target.value)} placeholder="path1 path2 ..." tooltip="Space-separated base weights passed through to the trainer." />
 						<FormField fieldPath="training.base_weights_multiplier" value={t.base_weights_multiplier || ''} oninput={(e) => update('base_weights_multiplier', e.target.value)} placeholder="1.0 0.5 ..." tooltip="Optional multipliers paired with Base Weights." />
-						<PathInput fieldPath="training.lycoris_config" value={t.lycoris_config || ''} oninput={(e) => update('lycoris_config', e.target.value)} showFiles tooltip="Path to LyCORIS TOML config (enables LyCORIS mode)" />
-						<FormSelect fieldPath="training.lycoris_quantized_base_check_mode" value={t.lycoris_quantized_base_check_mode || 'warn'} options={['off', 'warn', 'error']} onchange={(e) => update('lycoris_quantized_base_check_mode', e.target.value)} tooltip="Check for quantized base with LyCORIS" />
+						<div class="p-2 space-y-2" style="background: var(--bg-elevated); border-radius: var(--radius-sm); border: 1px solid var(--border-subtle);">
+							<span class="text-[11px] font-medium" style="color: var(--text-muted);">LyCORIS</span>
+							<div class="grid grid-cols-3 gap-2">
+								<FormSelect fieldPath="training.lycoris_algo" value={t.lycoris_algo || ''} options={lycorisAlgoOptions} onchange={(e) => updateLycorisAlgo(e.target.value)} tooltip="Optional LyCORIS algorithm. Selecting one switches the generated command to lycoris.kohya and the LyCORIS target preset." />
+								<FormField type="number" fieldPath="training.lycoris_factor" value={t.lycoris_factor ?? ''} oninput={(e) => update('lycoris_factor', e.target.value ? Number(e.target.value) : null)} placeholder="Auto" min={1} tooltip="LyCORIS factor for LoKr/LoHa-style decompositions." invalid={fieldInvalid('training.lycoris_factor')} error={fieldError('training.lycoris_factor')} />
+								<FormField type="number" fieldPath="training.lycoris_dropout" value={t.lycoris_dropout ?? ''} oninput={(e) => update('lycoris_dropout', e.target.value ? Number(e.target.value) : null)} placeholder="None" step="0.05" min={0} max={1} tooltip="LyCORIS adapter dropout passed as dropout=..." invalid={fieldInvalid('training.lycoris_dropout')} error={fieldError('training.lycoris_dropout')} />
+							</div>
+							<div class="grid grid-cols-3 gap-2">
+								<FormField type="number" fieldPath="training.lycoris_conv_dim" value={t.lycoris_conv_dim ?? ''} oninput={(e) => update('lycoris_conv_dim', e.target.value ? Number(e.target.value) : null)} placeholder="LoCon conv dim" min={1} tooltip="LoCon convolution rank, passed as conv_dim=... when set." invalid={fieldInvalid('training.lycoris_conv_dim')} error={fieldError('training.lycoris_conv_dim')} />
+								<FormField type="number" fieldPath="training.lycoris_conv_alpha" value={t.lycoris_conv_alpha ?? ''} oninput={(e) => update('lycoris_conv_alpha', e.target.value ? Number(e.target.value) : null)} placeholder="LoCon conv alpha" step="0.1" min={0} tooltip="LoCon convolution alpha, passed as conv_alpha=... when set." invalid={fieldInvalid('training.lycoris_conv_alpha')} error={fieldError('training.lycoris_conv_alpha')} />
+								<FormField type="number" fieldPath="training.init_lokr_norm" value={t.init_lokr_norm ?? ''} oninput={(e) => update('init_lokr_norm', e.target.value ? Number(e.target.value) : null)} placeholder="LoKr norm" step="0.1" tooltip="Initial LoKr norm for LyCORIS/LoKr variants." />
+							</div>
+							<PathInput fieldPath="training.lycoris_config" value={t.lycoris_config || ''} oninput={(e) => updateLycorisConfig(e.target.value)} showFiles tooltip="Path to LyCORIS TOML config. Selecting a file switches the generated command to lycoris.kohya." />
+							<FormSelect fieldPath="training.lycoris_quantized_base_check_mode" value={t.lycoris_quantized_base_check_mode || 'warn'} options={['off', 'warn', 'error']} onchange={(e) => update('lycoris_quantized_base_check_mode', e.target.value)} tooltip="Compatibility check for LyCORIS with quantized base weights." />
+						</div>
 						<div class="grid grid-cols-2 gap-2">
-							<FormField type="number" fieldPath="training.init_lokr_norm" value={t.init_lokr_norm ?? ''} oninput={(e) => update('init_lokr_norm', e.target.value ? Number(e.target.value) : null)} placeholder="Disabled" step="0.1" tooltip="Initial LoKr norm, mainly for LyCORIS/LoKr variants." />
 							<FormToggle fieldPath="training.adaptive_rank" checked={t.adaptive_rank ?? false} onchange={(e) => update('adaptive_rank', e.target.checked)} tooltip="Enable adaptive-rank LoRA arguments." />
 						</div>
 						{#if t.adaptive_rank}

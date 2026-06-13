@@ -62,6 +62,49 @@ def _effective_network_module(explicit: str) -> str:
     return explicit or get_ltx2_training_network_module_default()
 
 
+def _training_requests_lycoris(t, network_module: str) -> bool:
+    return (
+        "lycoris" in (network_module or "").lower()
+        or bool(getattr(t, "lycoris_config", ""))
+        or bool(getattr(t, "lycoris_algo", ""))
+        or getattr(t, "lycoris_factor", None) is not None
+        or getattr(t, "lycoris_conv_dim", None) is not None
+        or getattr(t, "lycoris_conv_alpha", None) is not None
+        or getattr(t, "lycoris_dropout", None) is not None
+        or str(getattr(t, "lora_target_preset", "") or "").lower() == "lycoris"
+    )
+
+
+def _effective_training_network_module(t) -> str:
+    network_module = _effective_network_module(t.network_module or "")
+    if _training_requests_lycoris(t, network_module):
+        return "lycoris.kohya"
+    return network_module
+
+
+def _training_network_args_parts(t) -> list[str]:
+    network_args_parts = _split_cli_args(t.network_args)
+
+    _append_network_arg(network_args_parts, "rank_dropout", t.rank_dropout)
+    _append_network_arg(network_args_parts, "module_dropout", t.module_dropout)
+    _append_network_arg(network_args_parts, "use_dora", t.use_dora)
+    _append_network_arg(network_args_parts, "use_dora_oft", t.use_dora_oft)
+    _append_network_arg(network_args_parts, "use_rslora", getattr(t, "use_rslora", False))
+    _append_network_arg(network_args_parts, "adaptive_rank", t.adaptive_rank)
+    _append_network_arg(network_args_parts, "adaptive_rank_target", t.adaptive_rank_target)
+    _append_network_arg(network_args_parts, "adaptive_rank_min_rank", t.adaptive_rank_min_rank)
+    _append_network_arg(network_args_parts, "adaptive_rank_init_rank", t.adaptive_rank_init_rank)
+    _append_network_arg(network_args_parts, "adaptive_rank_quantile", t.adaptive_rank_quantile)
+    _append_network_arg(network_args_parts, "adaptive_rank_weight", t.adaptive_rank_weight)
+    _append_network_arg(network_args_parts, "algo", getattr(t, "lycoris_algo", "") or None)
+    _append_network_arg(network_args_parts, "factor", getattr(t, "lycoris_factor", None))
+    _append_network_arg(network_args_parts, "conv_dim", getattr(t, "lycoris_conv_dim", None))
+    _append_network_arg(network_args_parts, "conv_alpha", getattr(t, "lycoris_conv_alpha", None))
+    _append_network_arg(network_args_parts, "dropout", getattr(t, "lycoris_dropout", None))
+
+    return network_args_parts
+
+
 def _generated_sample_prompts_path(config: ProjectConfig) -> Path:
     return Path(config.project_dir) / "sample_prompts.generated.txt"
 
@@ -627,20 +670,9 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
     ltx2_checkpoint = _effective_ltx2_checkpoint(config, t.ltx2_checkpoint)
     gemma_safetensors = _effective_gemma_safetensors(config, t.gemma_safetensors)
     gemma_root = _effective_gemma_root(config, t.gemma_root, gemma_safetensors)
-    network_module = _effective_network_module(t.network_module or "")
+    network_module = _effective_training_network_module(t)
     sample_prompts = _effective_training_sample_prompts(config)
-    network_args_parts = _split_cli_args(t.network_args)
-
-    _append_network_arg(network_args_parts, "rank_dropout", t.rank_dropout)
-    _append_network_arg(network_args_parts, "module_dropout", t.module_dropout)
-    _append_network_arg(network_args_parts, "use_dora", t.use_dora)
-    _append_network_arg(network_args_parts, "use_dora_oft", t.use_dora_oft)
-    _append_network_arg(network_args_parts, "adaptive_rank", t.adaptive_rank)
-    _append_network_arg(network_args_parts, "adaptive_rank_target", t.adaptive_rank_target)
-    _append_network_arg(network_args_parts, "adaptive_rank_min_rank", t.adaptive_rank_min_rank)
-    _append_network_arg(network_args_parts, "adaptive_rank_init_rank", t.adaptive_rank_init_rank)
-    _append_network_arg(network_args_parts, "adaptive_rank_quantile", t.adaptive_rank_quantile)
-    _append_network_arg(network_args_parts, "adaptive_rank_weight", t.adaptive_rank_weight)
+    network_args_parts = _training_network_args_parts(t)
 
     # Use accelerate launch. The Python module form is equivalent to the
     # console script and avoids PATH issues with Windows virtualenvs.
@@ -2179,6 +2211,8 @@ def build_slider_training_cmd(config: ProjectConfig) -> list[str]:
     ltx2_checkpoint = _effective_ltx2_checkpoint(config, t.ltx2_checkpoint)
     gemma_safetensors = _effective_gemma_safetensors(config, t.gemma_safetensors)
     gemma_root = _effective_gemma_root(config, t.gemma_root, gemma_safetensors)
+    network_module = _effective_training_network_module(t)
+    network_args_parts = _training_network_args_parts(t)
 
     cmd = _accelerate_launch_prefix(t.mixed_precision, s.accelerate_extra_args)
     cmd.append(_find_script("ltx2_train_slider.py"))
@@ -2229,10 +2263,13 @@ def build_slider_training_cmd(config: ProjectConfig) -> list[str]:
         cmd += ["--sample_slider_range", s.sample_slider_range]
 
     # LoRA — from training config
+    cmd += ["--network_module", network_module]
     if t.network_dim is not None:
         cmd += ["--network_dim", str(t.network_dim)]
     if t.network_alpha != 1:
         cmd += ["--network_alpha", str(t.network_alpha)]
+    if network_args_parts:
+        cmd += ["--network_args"] + network_args_parts
 
     # Optimizer — from training config
     cmd += ["--learning_rate", str(t.learning_rate)]
@@ -2275,7 +2312,8 @@ def _rl_common_model_args(config: ProjectConfig) -> list[str]:
     ltx2_checkpoint = _effective_ltx2_checkpoint(config, t.ltx2_checkpoint)
     gemma_safetensors = _effective_gemma_safetensors(config, t.gemma_safetensors)
     gemma_root = _effective_gemma_root(config, t.gemma_root, gemma_safetensors)
-    network_module = _effective_network_module(t.network_module or "")
+    network_module = _effective_training_network_module(t)
+    network_args_parts = _training_network_args_parts(t)
 
     args: list[str] = ["--ltx2_checkpoint", ltx2_checkpoint]
     if gemma_root:
@@ -2291,6 +2329,8 @@ def _rl_common_model_args(config: ProjectConfig) -> list[str]:
         args += ["--network_alpha", str(t.network_alpha)]
     if t.lora_target_preset:
         args += ["--lora_target_preset", t.lora_target_preset]
+    if network_args_parts:
+        args += ["--network_args"] + network_args_parts
     # warm-start LoRA: Phase A `old` snapshot; Phase B `default`==`old` snapshot (the cache invariant)
     if t.network_weights:
         args += ["--network_weights", t.network_weights]

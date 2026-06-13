@@ -133,8 +133,16 @@ class LoRAModule(AdaptiveRankLoRAModuleMixin, torch.nn.Module):
         if type(alpha) == torch.Tensor:
             alpha = alpha.detach().float().numpy()  # without casting, bf16 causes error
         alpha = self.lora_dim if alpha is None or alpha == 0 else alpha
-        self.scale = alpha / self.lora_dim
-        self.register_buffer("alpha", torch.tensor(alpha))  # for save/load
+        alpha = float(alpha)
+        self.use_rslora = _parse_bool_network_arg(kwargs.get("use_rslora", kwargs.get("rslora", False)))
+        if self.use_rslora:
+            self.scale = alpha / math.sqrt(self.lora_dim)
+            # Store the effective alpha so regular LoRA loaders apply the same alpha/r scale.
+            saved_alpha = alpha * math.sqrt(self.lora_dim)
+        else:
+            self.scale = alpha / self.lora_dim
+            saved_alpha = alpha
+        self.register_buffer("alpha", torch.tensor(saved_alpha))  # for save/load
         # same as microsoft's
         self.multiplier = multiplier
         self.org_module = org_module  # remove in applying
@@ -699,10 +707,13 @@ def create_network(
     use_dora = _parse_bool_network_arg(kwargs.get("use_dora", False))
     use_dora_oft = _parse_bool_network_arg(kwargs.get("use_dora_oft", False))
     use_oft = _parse_bool_network_arg(kwargs.get("use_oft", False)) or use_dora_oft
+    use_rslora = _parse_bool_network_arg(kwargs.get("use_rslora", kwargs.get("rslora", False)))
     if use_dora and use_dora_oft:
         raise ValueError("use_dora and use_dora_oft cannot both be enabled")
     if use_dora_oft and _parse_bool_network_arg(kwargs.get("adaptive_rank", False)):
         raise ValueError("adaptive_rank is not supported with use_dora_oft")
+    if use_rslora and use_oft:
+        raise ValueError("use_rslora is not supported with use_oft or use_dora_oft")
 
     # extract dim/alpha for conv2d, and block dim
     conv_dim = kwargs.get("conv_dim", None)
@@ -770,6 +781,8 @@ def create_network(
             module_class = DoRAModule if use_dora else LoRAModule
 
     effective_module_kwargs = dict(module_kwargs or {})
+    if use_rslora:
+        effective_module_kwargs["use_rslora"] = True
     if use_oft:
         if use_dora_oft:
             effective_module_kwargs["scaled_oft"] = True
@@ -881,6 +894,7 @@ class LoRANetwork(AdaptiveRankLoRANetworkMixin, torch.nn.Module):
         per_module_kwargs = raw_module_kwargs.pop("per_module_kwargs", {})
         self.module_kwargs = raw_module_kwargs
         self.per_module_kwargs = per_module_kwargs if isinstance(per_module_kwargs, dict) else {}
+        self.use_rslora = _parse_bool_network_arg(raw_module_kwargs.get("use_rslora", raw_module_kwargs.get("rslora", False)))
         self.audio_dim = audio_dim
         self.audio_alpha = audio_alpha
         self.audio_dropout = audio_dropout
@@ -913,6 +927,8 @@ class LoRANetwork(AdaptiveRankLoRANetworkMixin, torch.nn.Module):
             logger.info(
                 f"neuron dropout: p={self.dropout}, rank dropout: p={self.rank_dropout}, module dropout: p={self.module_dropout}"
             )
+            if self.use_rslora:
+                logger.info("rsLoRA scaling enabled: alpha / sqrt(rank)")
             if self.audio_dropout is not None or self.video_dropout is not None or self.cross_modal_dropout is not None:
                 logger.info(
                     f"per-modality dropout overrides: video={self.video_dropout}, audio={self.audio_dropout}, cross-modal={self.cross_modal_dropout}"

@@ -40,12 +40,14 @@ Caching scripts (`ltx2_cache_latents.py`, `ltx2_cache_text_encoder_outputs.py`) 
   - [Optional: Source-Free Training from Cache](#optional-source-free-training-from-cache)
   - [Standard LoRA Training](#standard-lora-training)
   - [DoRA LoRA Training](#dora-lora-training)
+  - [Rank-Stabilized LoRA (rsLoRA)](#rank-stabilized-lora-rslora)
   - [Advanced: LyCORIS/LoKR Training](#advanced-lycorislokr-training)
   - [Full-Parameter Fine-Tuning Overview](#full-parameter-fine-tuning-overview)
   - [Training Arguments](#training-arguments)
     - [Memory Optimization](#memory-optimization)
       - [Quantization Options](#quantization-options)
       - [Other Memory Options](#other-memory-options)
+    - [Blockwise Checkpointing](#blockwise-checkpointing)
     - [Aggressive VRAM Optimization (8-16GB GPUs)](#aggressive-vram-optimization-8-16gb-gpus)
     - [NF4 Quantization](#nf4-quantization)
     - [Model Version](#model-version)
@@ -54,15 +56,30 @@ Caching scripts (`ltx2_cache_latents.py`, `ltx2_cache_text_encoder_outputs.py`) 
     - [Loss Weighting](#loss-weighting)
     - [Additional Audio Training Flags](#additional-audio-training-flags)
     - [Modality Freezing (G2D)](#modality-freezing-g2d)
+    - [Optimizers](#optimizers)
     - [Per-Module Learning Rates](#per-module-learning-rates)
     - [Per-Module LoRA Rank](#per-module-lora-rank)
     - [Adaptive LoRA Rank](#adaptive-lora-rank)
     - [Per-Module LoRA Dropout](#per-module-lora-dropout)
     - [Preservation & Regularization](#preservation--regularization)
     - [CREPA (Cross-frame Representation Alignment)](#crepa-cross-frame-representation-alignment)
+      - [CREPA CLI Flags](#crepa-cli-flags)
+      - [CREPA Parameters (`--crepa_args`)](#crepa-parameters---crepa_args)
+      - [CREPA Checkpoint & Resume](#crepa-checkpoint--resume)
+      - [CREPA Monitoring](#crepa-monitoring)
+      - [CREPA Compatibility](#crepa-compatibility)
+      - [Caching DINOv2 Features (Dino Mode)](#caching-dinov2-features-dino-mode)
     - [Self-Flow (Self-Supervised Flow Matching)](#self-flow-self-supervised-flow-matching)
+      - [CLI Flags](#cli-flags)
+      - [Self-Flow Parameters (`--self_flow_args`)](#self-flow-parameters---self_flow_args)
+      - [Notes](#notes)
     - [HFATO (High-Frequency Awareness Training Objective)](#hfato-high-frequency-awareness-training-objective)
+      - [CLI Flags](#cli-flags-1)
+      - [HFATO Parameters (`--hfato_args`)](#hfato-parameters---hfato_args)
+      - [Relay LoRA Workflow (Image-Only Training)](#relay-lora-workflow-image-only-training)
     - [Latent Temporal Objectives](#latent-temporal-objectives)
+      - [Weighting Args](#weighting-args)
+      - [Delta Loss Args](#delta-loss-args)
     - [Standalone Inference Overrides](#standalone-inference-overrides)
     - [Audio Quality Metrics](#audio-quality-metrics)
     - [Timestep Sampling](#timestep-sampling)
@@ -70,8 +87,33 @@ Caching scripts (`ltx2_cache_latents.py`, `ltx2_cache_text_encoder_outputs.py`) 
       - [LoRA Target Estimation (`ltx2_estimate.py`)](#lora-target-estimation-ltx2_estimatepy)
       - [Connector LoRA (`--train_connectors`)](#connector-lora---train_connectors)
     - [IC-LoRA / Video-to-Video Training](#ic-lora--video-to-video-training)
+      - [Step 1: Prepare Dataset](#step-1-prepare-dataset)
+      - [Step 2: Dataset Config](#step-2-dataset-config)
+      - [Step 3: Cache Latents](#step-3-cache-latents)
+      - [Step 4: Cache Text Encoder Outputs](#step-4-cache-text-encoder-outputs)
+      - [Step 5: Train](#step-5-train)
+      - [Step 6: Sample Prompts](#step-6-sample-prompts)
+      - [IC-LoRA Arguments](#ic-lora-arguments)
+      - [Dataset Config Options](#dataset-config-options)
+      - [Notes](#notes-1)
     - [Audio-Reference IC-LoRA](#audio-reference-ic-lora)
+      - [Recommended settings](#recommended-settings)
+      - [How it works](#how-it-works)
+      - [Step 1: Prepare Data](#step-1-prepare-data)
+      - [Step 2: Dataset Config](#step-2-dataset-config-1)
+      - [Step 3: Cache Latents](#step-3-cache-latents-1)
+      - [Step 4: Cache Text Encoder Outputs](#step-4-cache-text-encoder-outputs-1)
+      - [Step 5: Train](#step-5-train-1)
+      - [Step 6: Sample Prompts](#step-6-sample-prompts-1)
+      - [Audio-Reference IC-LoRA Arguments](#audio-reference-ic-lora-arguments)
+      - [Dataset Config Options](#dataset-config-options-1)
+      - [Notes](#notes-2)
     - [Latent Guides](#latent-guides)
+      - [Dataset Config Options](#dataset-config-options-2)
+      - [IC-LoRA Compatibility Matrix](#ic-lora-compatibility-matrix)
+      - [Endpoint Keyframe Training](#endpoint-keyframe-training)
+      - [Video Anchor Training](#video-anchor-training)
+      - [Sample Prompt Flags](#sample-prompt-flags)
     - [Sampling with Tiled VAE](#sampling-with-tiled-vae)
     - [Precached Sample Prompts](#precached-sample-prompts)
     - [Two-Stage Sampling](#two-stage-sampling)
@@ -91,6 +133,10 @@ Caching scripts (`ltx2_cache_latents.py`, `ltx2_cache_text_encoder_outputs.py`) 
   - [Masked Loss Datasets](#masked-loss-datasets)
   - [Example TOML](#example-toml)
   - [Frame Rate (FPS) Handling](#frame-rate-fps-handling)
+    - [How It Works](#how-it-works-1)
+    - [Common Scenarios](#common-scenarios)
+    - [Log Messages](#log-messages)
+    - [Quick Reference](#quick-reference)
 - [Validation Datasets](#validation-datasets)
   - [Configuration](#configuration)
   - [Caching](#caching)
@@ -106,8 +152,19 @@ Caching scripts (`ltx2_cache_latents.py`, `ltx2_cache_text_encoder_outputs.py`) 
   - [Technical Notes](#technical-notes)
 - [4. Slider LoRA Training](#4-slider-lora-training)
   - [4a. Text-Only Mode](#4a-text-only-mode)
+    - [Slider Config (`ltx2_slider.toml`)](#slider-config-ltx2_slidertoml)
+    - [Example Command (Text-Only)](#example-command-text-only)
+    - [Text-Only Arguments](#text-only-arguments)
   - [4b. Reference Mode](#4b-reference-mode)
+    - [Step 1: Prepare Paired Data](#step-1-prepare-paired-data)
+    - [Step 2: Cache Latents and Text](#step-2-cache-latents-and-text)
+    - [Step 3: Configure and Train](#step-3-configure-and-train)
+      - [Slider Config (`ltx2_slider_reference.toml`)](#slider-config-ltx2_slider_referencetoml)
+      - [Example Command (Reference)](#example-command-reference)
+      - [Audio Reference Sliders](#audio-reference-sliders)
   - [4c. IC-slider](#4c-ic-slider)
+    - [Slider Config (`ltx2_slider_ic_reference.toml`)](#slider-config-ltx2_slider_ic_referencetoml)
+      - [Example Command (IC-Aware Reference)](#example-command-ic-aware-reference)
   - [Slider Tips](#slider-tips)
 - [5. Reinforcement-learning post-training (RL-LoRA)](#5-reinforcement-learning-post-training-rl-lora)
   - [Overview](#overview)
@@ -456,9 +513,24 @@ accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 ltx2_tr
   --output_name ltx2_dora
 ```
 
-In the dashboard, enable the **DoRA** toggle in the LoRA section. When disabled, the generated command does not include `use_dora=true`.
-
 Training-time ComfyUI export is supported for DoRA LoRA. The native Musubi checkpoint stores `lora_magnitude_vector.weight`; the generated `*.comfy.safetensors` file stores the equivalent ComfyUI `dora_scale` tensors.
+
+### Rank-Stabilized LoRA (rsLoRA)
+<sub>[↑ contents](#table-of-contents)</sub>
+
+rsLoRA keeps the standard LoRA tensor layout but changes the adapter scale from `alpha / rank` to `alpha / sqrt(rank)`. This is useful for higher-rank LoRA runs where the regular `alpha / rank` scale can become too small. It is opt-in and currently applies to the native LoRA/DoRA backend only; it is not supported with OFT, DoRA-OFT, DoKr-OFT, LyCORIS, LoHa, or LoKr.
+
+```bash
+accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 ltx2_train_network.py ^
+  ... (same args as standard LoRA) ^
+  --network_module networks.lora_ltx2 ^
+  --network_dim 64 ^
+  --network_alpha 32 ^
+  --network_args "use_rslora=true" ^
+  --output_name ltx2_rslora
+```
+
+When `use_rslora=true` is not supplied, training uses the standard `alpha / rank` LoRA scale. Exported rsLoRA adapters remain standard LoRA checkpoints: the saved `alpha` value is adjusted so regular LoRA loaders apply the same effective scale.
 
 The same `use_dora=true` flag enables DokR when the native LoKr backend is selected:
 
@@ -495,8 +567,6 @@ accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 ltx2_tr
   --network_args "use_dora_oft=true" ^
   --output_name ltx2_dokr_oft
 ```
-
-In the dashboard, enable **DoRA-OFT / DoKr-OFT** in the LoRA section. When disabled, the generated command does not include `use_dora_oft=true`.
 
 ### Advanced: LyCORIS/LoKR Training
 <sub>[↑ contents](#table-of-contents)</sub>
@@ -546,6 +616,12 @@ accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 ltx2_tr
 - Pass args as space-separated `key=value` pairs.
 - Each pair is one argument token: `--network_args "key1=value1" "key2=value2"`.
 - Common LyCORIS keys: `algo`, `factor`, `conv_dim`, `conv_alpha`, `dropout`.
+- Project config fields map to CLI as follows: `training.lycoris_algo` -> `algo`, `training.lycoris_factor` -> `factor`, `training.lycoris_conv_dim` -> `conv_dim`, `training.lycoris_conv_alpha` -> `conv_alpha`, and `training.lycoris_dropout` -> `dropout`.
+- `training.lycoris_config` emits `--lycoris_config`; `training.init_lokr_norm` emits `--init_lokr_norm`; `training.lycoris_quantized_base_check_mode` emits `--lycoris_quantized_base_check_mode` when changed from the default `warn`.
+- Supported algorithm values: `lora`, `loha`, `lokr`, `locon`, `ia3`, and `full`.
+- `locon` uses the LoRA-style path plus convolution parameters (`conv_dim`, `conv_alpha`) when the selected targets include compatible convolutional layers. LTX-2 transformer training is mostly linear-layer focused, so LoCon is primarily exposed for LyCORIS compatibility.
+- `ia3` is a tiny multiplicative adapter exposed through LyCORIS; it usually needs a higher learning rate than LoRA-style adapters.
+- `full` is LyCORIS native full-matrix adapter mode, not the same as LTX-2 full-parameter fine-tuning.
 - Use `--init_lokr_norm` only with LoKR (`algo=lokr`).
 - If both TOML and `--network_args` are used, `--network_args` can override nested TOML keys with:
   - `modules.<name>.<param>=...`
@@ -1600,6 +1676,7 @@ Use `--lora_target_preset` to control which layers LoRA targets. For custom laye
 |--------|--------|----------------|----------|
 | `t2v` (default) | All attention (`to_q`, `to_k`, `to_v`, `to_out.0`) | Video + audio + cross-modal | Text-to-video default |
 | `v2v` | All attention + video FFN + audio FFN | Video + audio + cross-modal | Video-to-video / IC-LoRA style |
+| `lycoris` | Attention modules only | Depends on LyCORIS algorithm/config | LyCORIS adapter runs via `--network_module lycoris.kohya` |
 | `video_sa` | Video self-attention (`attn1`) | Video only | Spatially-aligned controls (depth, pose, canny, inpaint) |
 | `video_sa_ff` | Video self-attention + video FFN (`attn1`, `ff`) | Video only | Controls needing more capacity (local edit, cut-on-action) |
 | `video_sa_ca_ff` | Video self-attention + cross-attention + video FFN (`attn1`, `attn2`, `ff`) | Video only | Text-guided controls (video detailing, camera-from-image, sparse tracks) |

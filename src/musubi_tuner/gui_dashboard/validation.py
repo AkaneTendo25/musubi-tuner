@@ -384,9 +384,20 @@ def validate_training_config(config: ProjectConfig) -> dict[str, Any]:
         errors.append(_make_issue("error", "training.loftq_init", message, label="LoftQ Init", page="training"))
         errors.append(_make_issue("error", "training.nf4_base", message, label="NF4 Base", page="training"))
 
+    network_module = t.network_module or get_ltx2_training_network_module_default()
+    lycoris_requested = (
+        "lycoris" in network_module.lower()
+        or bool(getattr(t, "lycoris_config", ""))
+        or bool(getattr(t, "lycoris_algo", ""))
+        or getattr(t, "lycoris_factor", None) is not None
+        or getattr(t, "lycoris_conv_dim", None) is not None
+        or getattr(t, "lycoris_conv_alpha", None) is not None
+        or getattr(t, "lycoris_dropout", None) is not None
+        or str(getattr(t, "lora_target_preset", "") or "").lower() == "lycoris"
+    )
+
     if t.use_dora:
-        network_module = t.network_module or get_ltx2_training_network_module_default()
-        if network_module in {"networks.loha", "lycoris.kohya"}:
+        if network_module in {"networks.loha", "lycoris.kohya"} or lycoris_requested:
             errors.append(
                 _make_issue(
                     "error",
@@ -398,8 +409,7 @@ def validate_training_config(config: ProjectConfig) -> dict[str, Any]:
             )
 
     if t.use_dora_oft:
-        network_module = t.network_module or get_ltx2_training_network_module_default()
-        if network_module in {"networks.loha", "lycoris.kohya"}:
+        if network_module in {"networks.loha", "lycoris.kohya"} or lycoris_requested:
             errors.append(
                 _make_issue(
                     "error",
@@ -417,6 +427,68 @@ def validate_training_config(config: ProjectConfig) -> dict[str, Any]:
             message = "Adaptive rank is not supported with DoRA-OFT/DoKr-OFT."
             errors.append(_make_issue("error", "training.use_dora_oft", message, label="DoRA-OFT/DoKr-OFT", page="training"))
             errors.append(_make_issue("error", "training.adaptive_rank", message, label="Adaptive Rank", page="training"))
+
+    if getattr(t, "use_rslora", False):
+        if t.use_dora_oft:
+            message = "rsLoRA is not supported with DoRA-OFT/DoKr-OFT."
+            errors.append(_make_issue("error", "training.use_rslora", message, label="rsLoRA", page="training"))
+            errors.append(_make_issue("error", "training.use_dora_oft", message, label="DoRA-OFT/DoKr-OFT", page="training"))
+        if lycoris_requested or network_module not in {
+            "networks.lora",
+            "networks.lora_ltx2",
+            "musubi_tuner.networks.lora",
+            "musubi_tuner.networks.lora_ltx2",
+        }:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.use_rslora",
+                    "rsLoRA is currently available only with the native LoRA backend.",
+                    label="rsLoRA",
+                    page="training",
+                )
+            )
+
+    if getattr(t, "lycoris_factor", None) is not None and t.lycoris_factor <= 0:
+        errors.append(
+            _make_issue(
+                "error",
+                "training.lycoris_factor",
+                "LyCORIS factor must be greater than 0.",
+                label="LyCORIS Factor",
+                page="training",
+            )
+        )
+    if getattr(t, "lycoris_conv_dim", None) is not None and t.lycoris_conv_dim <= 0:
+        errors.append(
+            _make_issue(
+                "error",
+                "training.lycoris_conv_dim",
+                "LyCORIS conv dim must be greater than 0.",
+                label="LyCORIS Conv Dim",
+                page="training",
+            )
+        )
+    if getattr(t, "lycoris_conv_alpha", None) is not None and t.lycoris_conv_alpha < 0:
+        errors.append(
+            _make_issue(
+                "error",
+                "training.lycoris_conv_alpha",
+                "LyCORIS conv alpha cannot be negative.",
+                label="LyCORIS Conv Alpha",
+                page="training",
+            )
+        )
+    if getattr(t, "lycoris_dropout", None) is not None and not (0 <= t.lycoris_dropout <= 1):
+        errors.append(
+            _make_issue(
+                "error",
+                "training.lycoris_dropout",
+                "LyCORIS dropout must be between 0 and 1.",
+                label="LyCORIS Dropout",
+                page="training",
+            )
+        )
 
     if t.blockwise_checkpointing:
         warnings.append(
