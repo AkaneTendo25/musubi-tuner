@@ -26,6 +26,7 @@ from musubi_tuner.dataset.config_utils import BlueprintGenerator, ConfigSanitize
 from musubi_tuner.training.accelerator_setup import (
     clean_memory_on_device,
     collator_class,
+    dataloader_extra_kwargs,
     prepare_accelerator,
 )
 from musubi_tuner.ltx2_train import (
@@ -390,6 +391,7 @@ def _build_dataloader(args: argparse.Namespace, trainer: LTX2NetworkTrainer) -> 
         collate_fn=collator,
         num_workers=n_workers,
         persistent_workers=args.persistent_data_loader_workers,
+        **dataloader_extra_kwargs(args, n_workers),
     )
 
 

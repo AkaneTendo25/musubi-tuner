@@ -9,7 +9,7 @@ import time
 
 import torch
 from packaging.version import Version
-from accelerate import Accelerator, InitProcessGroupKwargs, DistributedDataParallelKwargs
+from accelerate import Accelerator, InitProcessGroupKwargs, DistributedDataParallelKwargs, DataLoaderConfiguration
 from accelerate.utils import TorchDynamoPlugin, DynamoBackend
 
 logger = logging.getLogger(__name__)
@@ -47,6 +47,21 @@ class collator_class:
         # set epoch for validation
         dataset.set_current_epoch(self.current_epoch.value)
         return examples[0]  # batch size is always 1, so we unwrap it here
+
+
+def dataloader_extra_kwargs(args: argparse.Namespace, n_workers: int) -> dict:
+    """Opt-in DataLoader kwargs derived from CLI args (default off -> baseline behavior).
+
+    With --dataloader_pin_memory unset this returns {"pin_memory": False}, which equals the
+    torch DataLoader default, so the constructed loader is behaviorally identical to the
+    pre-feature call. --dataloader_prefetch_factor is only forwarded when explicitly set AND
+    n_workers > 0 (torch raises if prefetch_factor is passed with num_workers == 0).
+    """
+    extra = {"pin_memory": bool(getattr(args, "dataloader_pin_memory", False))}
+    prefetch_factor = getattr(args, "dataloader_prefetch_factor", None)
+    if prefetch_factor is not None and n_workers > 0:
+        extra["prefetch_factor"] = prefetch_factor
+    return extra
 
 
 def prepare_accelerator(args: argparse.Namespace) -> Accelerator:
@@ -115,7 +130,7 @@ def prepare_accelerator(args: argparse.Namespace) -> Accelerator:
             dynamic=args.dynamo_dynamic,
         )
 
-    accelerator = Accelerator(
+    accelerator_kwargs = dict(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision=args.mixed_precision if args.mixed_precision else None,
         log_with=log_with,
@@ -123,6 +138,11 @@ def prepare_accelerator(args: argparse.Namespace) -> Accelerator:
         dynamo_plugin=dynamo_plugin,
         kwargs_handlers=kwargs_handlers,
     )
+    if getattr(args, "dataloader_pin_memory", False):
+        # Opt-in: enable non_blocking H2D for Accelerate's prepared DataLoader (pairs with
+        # base-loader pin_memory). Off by default -> kwargs unchanged from the prior call.
+        accelerator_kwargs["dataloader_config"] = DataLoaderConfiguration(non_blocking=True)
+    accelerator = Accelerator(**accelerator_kwargs)
     print("accelerator device:", accelerator.device)
     if (
         args.log_cuda_memory_every_n_steps is not None

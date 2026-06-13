@@ -191,6 +191,20 @@ def _add_training_args(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help="persistent DataLoader workers (useful for reduce time gap between epoch, but may use more memory) / DataLoader のワーカーを持続させる (エポック間の時間差を少なくするのに有効だが、より多くのメモリを消費する可能性がある)",
     )
+    parser.add_argument(
+        "--dataloader_pin_memory",
+        action="store_true",
+        help="opt-in: page-lock DataLoader host buffers and enable non_blocking host-to-device copies "
+        "(overlaps data transfer with compute). Off by default. Increases pinned host RAM; use with care "
+        "alongside block swap, which also pins host buffers.",
+    )
+    parser.add_argument(
+        "--dataloader_prefetch_factor",
+        type=int,
+        default=None,
+        help="opt-in: DataLoader prefetch_factor (batches prefetched per worker). Only applied when set "
+        "and num_workers > 0. Off by default (uses the PyTorch default).",
+    )
     parser.add_argument("--seed", type=int, default=None, help="random seed for training / 学習時の乱数のseed")
     parser.add_argument(
         "--gradient_checkpointing", action="store_true", help="enable gradient checkpointing / gradient checkpointingを有効にする"

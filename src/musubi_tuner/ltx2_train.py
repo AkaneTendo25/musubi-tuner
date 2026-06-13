@@ -33,6 +33,7 @@ from musubi_tuner.dataset.image_video_dataset import ARCHITECTURE_LTX2
 from musubi_tuner.training.accelerator_setup import (
     clean_memory_on_device,
     collator_class,
+    dataloader_extra_kwargs,
     prepare_accelerator,
 )
 from musubi_tuner.training.metadata import (
@@ -3487,6 +3488,7 @@ def main() -> None:
             collate_fn=collator,
             num_workers=n_workers,
             persistent_workers=args.persistent_data_loader_workers,
+            **dataloader_extra_kwargs(args, n_workers),
         )
     else:
         logger.info(
@@ -3508,6 +3510,7 @@ def main() -> None:
             collate_fn=collator,
             num_workers=n_workers,
             persistent_workers=args.persistent_data_loader_workers,
+            **dataloader_extra_kwargs(args, n_workers),
         )
     train_dataset_group_for_audio_sampler = train_dataset_group if train_audio_sampler is not None else None
 
@@ -3535,6 +3538,7 @@ def main() -> None:
                 collate_fn=val_collator,
                 num_workers=n_workers,
                 persistent_workers=False,
+                **dataloader_extra_kwargs(args, n_workers),
             )
             logger.info("Validation dataset loaded with %d items", val_dataset_group.num_train_items)
         else:
@@ -3550,6 +3554,7 @@ def main() -> None:
                 collate_fn=val_collator,
                 num_workers=n_workers,
                 persistent_workers=False,
+                **dataloader_extra_kwargs(args, n_workers),
             )
             logger.info("Validation dataset loaded from manifest with %d items", val_dataset_group.num_train_items)
         else:
@@ -4240,6 +4245,7 @@ def main() -> None:
                 collate_fn=_col,
                 num_workers=n_workers,
                 persistent_workers=False,
+                **dataloader_extra_kwargs(args, n_workers),
             )
             _dl = accelerator.prepare(_dl)
             extra_val_dataloaders[_cat] = _dl
