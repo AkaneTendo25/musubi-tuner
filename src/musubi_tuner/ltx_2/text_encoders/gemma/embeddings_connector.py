@@ -85,6 +85,8 @@ class Embeddings1DConnector(torch.nn.Module):
             register replacement. (default=128)
         rope_type (LTXRopeType): The RoPE variant to use (default=DEFAULT_ROPE_TYPE).
         double_precision_rope (bool): Use double precision rope calculation (default=False).
+        register_padding_mode (str): Register replacement mode. "legacy" preserves the original behavior, while
+            "batch_safe" supports batched right-padded inputs. (default="legacy")
     """
 
     _supports_gradient_checkpointing = True
@@ -101,17 +103,21 @@ class Embeddings1DConnector(torch.nn.Module):
         rope_type: LTXRopeType = LTXRopeType.INTERLEAVED,
         double_precision_rope: bool = False,
         apply_gated_attention: bool = False,
+        register_padding_mode: str = "legacy",
     ):
         super().__init__()
         self.num_attention_heads = num_attention_heads
         self.inner_dim = num_attention_heads * attention_head_dim
         self.causal_temporal_positioning = causal_temporal_positioning
         self.positional_embedding_theta = positional_embedding_theta
-        self.positional_embedding_max_pos = (
-            positional_embedding_max_pos if positional_embedding_max_pos is not None else [1]
-        )
+        self.positional_embedding_max_pos = positional_embedding_max_pos if positional_embedding_max_pos is not None else [1]
         self.rope_type = rope_type
         self.double_precision_rope = double_precision_rope
+        if register_padding_mode not in {"legacy", "batch_safe"}:
+            raise ValueError(
+                f"Unsupported register_padding_mode: {register_padding_mode}. Expected one of: 'legacy', 'batch_safe'."
+            )
+        self.register_padding_mode = register_padding_mode
         self.transformer_1d_blocks = torch.nn.ModuleList(
             [
                 _BasicTransformerBlock1D(
@@ -132,6 +138,13 @@ class Embeddings1DConnector(torch.nn.Module):
             )
 
     def _replace_padded_with_learnable_registers(
+        self, hidden_states: torch.Tensor, attention_mask: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.register_padding_mode == "batch_safe":
+            return self._replace_padded_with_learnable_registers_batch_safe(hidden_states, attention_mask)
+        return self._replace_padded_with_learnable_registers_legacy(hidden_states, attention_mask)
+
+    def _replace_padded_with_learnable_registers_legacy(
         self, hidden_states: torch.Tensor, attention_mask: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
         assert hidden_states.shape[1] % self.num_learnable_registers == 0, (
@@ -159,6 +172,37 @@ class Embeddings1DConnector(torch.nn.Module):
 
         return hidden_states, attention_mask
 
+    def _replace_padded_with_learnable_registers_batch_safe(
+        self, hidden_states: torch.Tensor, attention_mask: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        batch_size, seq_len, _ = hidden_states.shape
+        assert seq_len % self.num_learnable_registers == 0, (
+            f"Hidden states sequence length {seq_len} must be divisible by num_learnable_registers {self.num_learnable_registers}."
+        )
+
+        learnable_registers = self.learnable_registers.repeat(seq_len // self.num_learnable_registers, 1)
+        learnable_registers = learnable_registers.to(device=hidden_states.device, dtype=hidden_states.dtype)
+        learnable_registers = learnable_registers.unsqueeze(0).expand(batch_size, -1, -1)
+
+        valid_mask = attention_mask[:, 0, 0, :] >= 0
+        token_indices = torch.arange(seq_len, device=hidden_states.device).unsqueeze(0)
+        valid_counts = valid_mask.sum(dim=1)
+
+        right_padding_mask = token_indices < valid_counts.unsqueeze(1)
+        is_right_padded = torch.all(valid_mask == right_padding_mask, dim=1)
+
+        right_padded_states = torch.where(valid_mask.unsqueeze(-1), hidden_states, learnable_registers)
+
+        compact_order = torch.argsort(valid_mask.to(torch.int32), dim=1, descending=True, stable=True)
+        compact_states = torch.gather(hidden_states, 1, compact_order.unsqueeze(-1).expand_as(hidden_states))
+        compact_valid_mask = token_indices < valid_counts.unsqueeze(1)
+        legacy_left_padded_states = torch.where(compact_valid_mask.unsqueeze(-1), compact_states, learnable_registers)
+
+        hidden_states = torch.where(is_right_padded.view(batch_size, 1, 1), right_padded_states, legacy_left_padded_states)
+        attention_mask = torch.zeros_like(attention_mask)
+
+        return hidden_states, attention_mask
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -177,6 +221,8 @@ class Embeddings1DConnector(torch.nn.Module):
 
         indices_grid = torch.arange(hidden_states.shape[1], dtype=torch.float32, device=hidden_states.device)
         indices_grid = indices_grid[None, None, :]
+        if self.register_padding_mode == "batch_safe":
+            indices_grid = indices_grid.expand(hidden_states.shape[0], -1, -1)
         freq_grid_generator = generate_freq_grid_np if self.double_precision_rope else generate_freq_grid_pytorch
         freqs_cis = precompute_freqs_cis(
             indices_grid=indices_grid,
@@ -216,6 +262,7 @@ class Embeddings1DConnectorConfigurator(ModelConfigurator[Embeddings1DConnector]
             rope_type=rope_type,
             double_precision_rope=double_precision_rope,
             apply_gated_attention=transformer_config.get("connector_apply_gated_attention", False),
+            register_padding_mode=transformer_config.get("connector_register_padding_mode", "legacy"),
         )
         return connector
 
@@ -243,5 +290,9 @@ class AudioEmbeddings1DConnectorConfigurator(ModelConfigurator[Embeddings1DConne
             rope_type=rope_type,
             double_precision_rope=double_precision_rope,
             apply_gated_attention=transformer_config.get("connector_apply_gated_attention", False),
+            register_padding_mode=transformer_config.get(
+                "audio_connector_register_padding_mode",
+                transformer_config.get("connector_register_padding_mode", "legacy"),
+            ),
         )
         return connector
