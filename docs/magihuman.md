@@ -1,16 +1,16 @@
 # MagiHuman
 
-This page describes the current **base-model MagiHuman LoRA training** flow in this fork.
+This page describes **base-model MagiHuman LoRA training**.
 
-What is supported now:
+Covered:
 - Base `daVinci-MagiHuman` LoRA training
 - Cached text embeddings
 - Cached video/audio/image latents
 - Single-GPU training with FP8 + block swap
 
-What is not covered here:
+Not covered:
 - SR-stage training
-- Full standalone inference workflow
+- Standalone inference workflow
 
 ## 1. Download the weights
 
@@ -43,9 +43,20 @@ Notes:
 - `sao` must contain both `model.safetensors` and `model_config.json`.
 - `ffmpeg` must be available in `PATH`.
 
+If you start from the original sharded checkpoint instead of the single-file
+`base_bf16.safetensors`, convert it with
+[`magihuman_convert_checkpoint.py`](../magihuman_convert_checkpoint.py):
+
+```bat
+python magihuman_convert_checkpoint.py ^
+  --input path/to/magihuman_checkpoint_dir ^
+  --output path/to/daVinci-MagiHuman/base_bf16.safetensors ^
+  --dtype bf16
+```
+
 ## 2. Prepare the dataset config
 
-Edit [`_magihuman_lora_dataset.toml`](G:\samples\musubi-tuner\_original\musubi-tuner\_magihuman_lora_dataset.toml).
+Create a dataset config, for example `magihuman_lora_dataset.toml`.
 
 Set:
 - `video_directory`
@@ -53,7 +64,7 @@ Set:
 
 Captions are expected as `.txt` files next to each video.
 
-Current example:
+Example:
 
 ```toml
 [general]
@@ -73,11 +84,11 @@ frame_extraction = "head"
 
 ## 3. Cache text embeddings
 
-Use [`magihuman_cache_text_encoder_outputs.py`](G:\samples\musubi-tuner\_original\musubi-tuner\magihuman_cache_text_encoder_outputs.py):
+Use [`magihuman_cache_text_encoder_outputs.py`](../magihuman_cache_text_encoder_outputs.py):
 
 ```bat
 python magihuman_cache_text_encoder_outputs.py ^
-  --dataset_config _magihuman_lora_dataset.toml ^
+  --dataset_config magihuman_lora_dataset.toml ^
   --text_encoder path/to/daVinci-MagiHuman/t5gemma ^
   --device cuda ^
   --weight_dtype bfloat16 ^
@@ -89,11 +100,11 @@ python magihuman_cache_text_encoder_outputs.py ^
 
 ## 4. Cache latents
 
-Use [`magihuman_cache_latents.py`](G:\samples\musubi-tuner\_original\musubi-tuner\magihuman_cache_latents.py):
+Use [`magihuman_cache_latents.py`](../magihuman_cache_latents.py):
 
 ```bat
 python magihuman_cache_latents.py ^
-  --dataset_config _magihuman_lora_dataset.toml ^
+  --dataset_config magihuman_lora_dataset.toml ^
   --vae path/to/daVinci-MagiHuman/wan22_vae/Wan2.2_VAE.pth ^
   --audio_model path/to/daVinci-MagiHuman/sao ^
   --device cuda ^
@@ -115,16 +126,11 @@ Example training settings:
 ```bat
 accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 magihuman_train_network.py ^
   --optimizer_type AdamW8bit ^
-  --dataset_config _magihuman_lora_dataset.toml ^
+  --dataset_config magihuman_lora_dataset.toml ^
   --dit path/to/daVinci-MagiHuman/base_bf16.safetensors ^
   --dit_dtype bfloat16 ^
   --magihuman_fp8_quant_device cuda ^
-  --magihuman_t_patch_size 1 ^
-  --magihuman_patch_size 2 ^
   --magihuman_frame_receptive_field -1 ^
-  --magihuman_spatial_rope_interpolation extra ^
-  --magihuman_text_offset 0 ^
-  --magihuman_coords_style v2 ^
   --sdpa ^
   --network_module networks.lora_magihuman ^
   --network_dim 32 ^
@@ -133,8 +139,8 @@ accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 magihum
   --max_data_loader_n_workers 0 ^
   --max_train_steps 5000 ^
   --save_every_n_steps 500 ^
-  --output_dir output/magihuman_first_run ^
-  --output_name magihuman_first_run ^
+  --output_dir output/magihuman_lora ^
+  --output_name magihuman_lora ^
   --gradient_checkpointing ^
   --blocks_to_swap 10 ^
   --fp8_base ^
@@ -143,14 +149,20 @@ accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 magihum
 
 ## 6. Run order
 
-1. Edit [`_magihuman_lora_dataset.toml`](path/to/your/dataset_config.toml)
-2. Run [`magihuman_cache_text_encoder_outputs.py`](path/to/magihuman_cache_text_encoder_outputs.py)
-3. Run [`magihuman_cache_latents.py`](path/to/magihuman_cache_latents.py)
-4. Run [`magihuman_train_network.py`](path/to/magihuman_train_network.py)
+1. Edit `magihuman_lora_dataset.toml`
+2. Run [`magihuman_cache_text_encoder_outputs.py`](../magihuman_cache_text_encoder_outputs.py)
+3. Run [`magihuman_cache_latents.py`](../magihuman_cache_latents.py)
+4. Run [`magihuman_train_network.py`](../magihuman_train_network.py)
 
 ## 7. Notes
 
 - The example command uses `batch_size = 1`.
 - If VRAM is insufficient, reducing resolution reduces token count and activation memory.
-- The current training path is for the **base model**, not the SR stack.
-- If you want training-time samples later, add `--sample_prompts ...` plus `--vae`, `--text_encoder`, and `--audio_model`.
+- This training path targets the **base model**, not the SR stack.
+- `--magihuman_t_patch_size`, `--magihuman_patch_size`, `--magihuman_spatial_rope_interpolation`
+  and `--magihuman_coords_style` default to the base-model values and can be omitted.
+  `--magihuman_text_offset` applies only with `--magihuman_coords_style v1`; setting it to a
+  non-default value under `v2` is rejected.
+- Base training does not enable local-attention layers, so `frame_receptive_field` is forced
+  to `-1`; passing `--magihuman_frame_receptive_field -1` explicitly just avoids the warning.
+- For training-time samples, add `--sample_prompts ...` plus `--vae`, `--text_encoder`, and `--audio_model`.

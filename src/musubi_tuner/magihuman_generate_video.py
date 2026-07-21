@@ -17,9 +17,7 @@ def parse_args() -> argparse.Namespace:
 
 def main():
     parse_args()
-    raise NotImplementedError(
-        "Vendored MagiHuman sample generation is not wired yet. The pipeline entry/runtime still needs to be copied and adapted."
-    )
+    raise NotImplementedError("Standalone MagiHuman video generation is not available in this package.")
 
 
 if __name__ == "__main__":

@@ -5,7 +5,6 @@ from typing import Any, Optional
 
 
 LOCAL_MAGIHUMAN_PACKAGE = "musubi_tuner.magihuman"
-DEFAULT_MAGIHUMAN_REPO_ENV = "MAGIHUMAN_REPO"
 
 
 def resolve_magihuman_module_name(module_name: str) -> str:
@@ -18,23 +17,11 @@ def resolve_magihuman_module_name(module_name: str) -> str:
     return f"{LOCAL_MAGIHUMAN_PACKAGE}.{module_name}"
 
 
-def resolve_magihuman_repo(repo_root: Optional[str] = None) -> str:
-    del repo_root
-    return LOCAL_MAGIHUMAN_PACKAGE
-
-
-def ensure_magihuman_repo_on_path(repo_root: Optional[str] = None) -> str:
-    del repo_root
-    return LOCAL_MAGIHUMAN_PACKAGE
-
-
-def import_magihuman_module(module_name: str, repo_root: Optional[str] = None) -> ModuleType:
-    del repo_root
+def import_magihuman_module(module_name: str) -> ModuleType:
     return importlib.import_module(resolve_magihuman_module_name(module_name))
 
 
-def parse_magihuman_config(repo_root: Optional[str] = None, config_load_path: Optional[str] = None) -> Any:
-    del repo_root
+def parse_magihuman_config(config_load_path: Optional[str] = None) -> Any:
     common_module = import_magihuman_module("common")
 
     original_argv = None

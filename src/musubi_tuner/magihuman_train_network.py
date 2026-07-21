@@ -68,7 +68,7 @@ def _validate_magihuman_args(args: argparse.Namespace):
 
     data_proxy_defaults = DataProxyConfig()
     if args.magihuman_coords_style != "v1" and args.magihuman_text_offset != data_proxy_defaults.text_offset:
-        raise ValueError("--magihuman_text_offset only affects --magihuman_coords_style v1 in the current MagiHuman trainer.")
+        raise ValueError("--magihuman_text_offset only applies with --magihuman_coords_style v1.")
     if args.t5gemma_load_in_8bit and args.t5gemma_load_in_4bit:
         raise ValueError("Only one of --t5gemma_load_in_8bit or --t5gemma_load_in_4bit can be enabled.")
 

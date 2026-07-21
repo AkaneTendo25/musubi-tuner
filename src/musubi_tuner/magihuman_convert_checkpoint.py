@@ -72,7 +72,7 @@ def main():
 
     metadata = {
         "format": "musubi_tuner.magihuman.dit",
-        "source": str(args.input),
+        "source": Path(args.input).name,
         "dtype": args.dtype,
     }
     logger.info("Saving single-file checkpoint to %s", output_path)

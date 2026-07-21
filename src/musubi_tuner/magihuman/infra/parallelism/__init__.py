@@ -1,3 +1,10 @@
+"""Sequence-parallel scheduling for a single-process run.
+
+Ulysses sequence parallelism splits attention inputs across a context-parallel
+group; with a group of one, dispatch and undispatch are identities.
+"""
+
+
 class _IdentityUlyssesScheduler:
     cp_split_sizes = None
 
