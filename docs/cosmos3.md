@@ -25,7 +25,7 @@ Download example:
 
 ```powershell
 huggingface-cli login
-huggingface-cli download nvidia/Cosmos3-Nano --local-dir G:\storage\cosmos3-nano
+huggingface-cli download nvidia/Cosmos3-Nano --local-dir path\to\cosmos3-nano\weights
 ```
 
 The scripts accept either a local path or a Hugging Face repo id. Local paths are recommended for training.
@@ -79,6 +79,44 @@ python cosmos3_cache_latents.py `
 ```
 
 If video-only caches already exist, rerun latent caching without `--skip_existing` to add `sound_latents_*`.
+
+## Cache Reasoner K/V (optional)
+
+Each decoder layer holds a frozen "reasoner" tower beside the trained generation
+tower. The reasoner reads only the caption, so its K/V does not depend on the
+latent, timestep, resolution or frame count. Caching it per caption lets training
+skip loading those ~8B parameters, bit-identical to a normal bf16 run.
+
+```powershell
+python -m musubi_tuner.cosmos3_cache_reasoner_kv `
+  --dataset_config path\to\dataset.toml `
+  --dit path\to\cosmos3-nano\weights `
+  --reasoner_kv_cache_dir path\to\reasoner_cache `
+  --sample_prompts path\to\sample_prompts.txt `
+  --fps 24
+```
+
+Then add `--reasoner_kv_cache_dir path\to\reasoner_cache` when training.
+
+| DiT parameters | Without | With |
+| --- | --- | --- |
+| bf16 | 28.3 GiB | 15.3 GiB |
+| `--fp8_scaled` | 15.3 GiB | 8.9 GiB |
+
+Disk cost is ~144 KiB per text token: ~33 MiB for a 235-token caption, ~3.2 GiB
+per 100 captions. Entries are content-addressed by token IDs, so cost scales with
+*unique* captions, not samples.
+
+Pass `--sample_prompts` if training uses it; sampling needs its own prompts
+cached, including the CFG unconditional branch. Training checks for them at
+startup.
+
+The cache key is the tokenized caption, so `--fps` and the `--no_*_template`
+flags must match between caching and training. Rerun this cache after changing
+captions or prompt template flags, as with the text token cache.
+
+Works with `--fp8_scaled`, `--blocks_to_swap` and `--gradient_checkpointing`.
+Multi-GPU context parallel is not supported.
 
 ## Train
 

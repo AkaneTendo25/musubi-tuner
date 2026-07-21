@@ -11,7 +11,7 @@ import torch
 from accelerate import Accelerator, PartialState
 
 from musubi_tuner import cosmos3_generate_video
-from musubi_tuner.cosmos3 import cosmos3_utils
+from musubi_tuner.cosmos3 import cosmos3_utils, reasoner_kv_cache
 from musubi_tuner.dataset.image_video_dataset import ARCHITECTURE_COSMOS3, ARCHITECTURE_COSMOS3_FULL
 from musubi_tuner.hv_train_network import (
     DiTOutput,
@@ -55,6 +55,8 @@ class Cosmos3NetworkTrainer(NetworkTrainer):
     def __init__(self):
         super().__init__()
         self.vae_frame_stride = 4
+        self.reasoner_kv_store = None
+        self.reasoner_fps_modulation = True
 
     @property
     def architecture(self) -> str:
@@ -71,6 +73,23 @@ class Cosmos3NetworkTrainer(NetworkTrainer):
         self._control_training = False
         self.default_guidance_scale = 6.0
         self.default_discrete_flow_shift = 10.0
+
+        if getattr(args, "reasoner_kv_cache_dir", None):
+            if not os.path.isdir(args.reasoner_kv_cache_dir):
+                raise ValueError(
+                    f"--reasoner_kv_cache_dir {args.reasoner_kv_cache_dir} does not exist. "
+                    "Build it with cosmos3_cache_reasoner_kv.py first."
+                )
+            # Sample-prompt verification happens in load_transformer, once the
+            # model config has told us the real fps-modulation setting that the
+            # cache key depends on.
+            self.reasoner_kv_store = reasoner_kv_cache.ReasonerKVStore(
+                args.reasoner_kv_cache_dir,
+                device=None,
+                dtype=None,
+                lru_size=args.reasoner_kv_cache_lru,
+            )
+            logger.info(f"Cosmos3 training: replaying reasoner K/V from {args.reasoner_kv_cache_dir}")
 
         if args.network_module is None:
             args.network_module = "musubi_tuner.networks.lora_cosmos3"
@@ -425,6 +444,37 @@ class Cosmos3NetworkTrainer(NetworkTrainer):
         vae_source = args.vae if args.vae is not None else args.dit
         return cosmos3_utils.load_vae(vae_source, args.vae_subfolder, dtype=vae_dtype, device="cpu")
 
+    def _verify_sample_prompts_cached(self, args: argparse.Namespace):
+        """Fail at startup if any sample prompt lacks a cached reasoner K/V.
+
+        Mirrors the tokenization that ``do_inference`` performs, so a mismatch in
+        fps or template flags between caching and training surfaces here rather
+        than at the first sample step.
+        """
+        entries = reasoner_kv_cache.sample_prompt_cache_entries(
+            args, args.sample_prompts, args.vae_scale_factor_temporal
+        )
+        missing = []
+        checked = 0
+        for ids, label in entries:
+            key = reasoner_kv_cache.text_ids_cache_key(ids, self.reasoner_fps_modulation)
+            checked += 1
+            if not reasoner_kv_cache.cache_path_for(args.reasoner_kv_cache_dir, key).exists():
+                missing.append(label)
+
+        if missing:
+            raise ValueError(
+                f"{len(missing)} of {checked} sample-prompt reasoner K/V entries are missing from "
+                f"{args.reasoner_kv_cache_dir}:\n  "
+                + "\n  ".join(missing[:10])
+                + "\n\nCache them with:\n"
+                f"  python -m musubi_tuner.cosmos3_cache_reasoner_kv --dit {args.dit} "
+                f"--reasoner_kv_cache_dir {args.reasoner_kv_cache_dir} "
+                f"--sample_prompts {args.sample_prompts} --fps {args.fps}\n"
+                "(the fps and --no_*_template flags must match this training run)"
+            )
+        logger.info(f"Cosmos3 training: all {checked} sample-prompt reasoner K/V entries present")
+
     def load_transformer(
         self,
         accelerator: Accelerator,
@@ -436,7 +486,34 @@ class Cosmos3NetworkTrainer(NetworkTrainer):
         dit_weight_dtype: Optional[torch.dtype],
     ):
         dtype = self.dit_dtype if args.fp8_scaled else dit_weight_dtype
-        model = cosmos3_utils.load_transformer(dit_path, args.transformer_subfolder, dtype, loading_device)
+        if getattr(args, "reasoner_kv_cache_dir", None):
+            # The reasoner (und) tower is replayed from cache, so its weights are
+            # never read; skip loading them entirely.
+            reasoner_kv_cache.install_patches()
+            model, removed = reasoner_kv_cache.load_transformer_gen_only(
+                dit_path, args.transformer_subfolder, dtype, loading_device
+            )
+            reasoner_kv_cache.rebind_dispatch(model)
+            # Resolve the cache key's fps-modulation component from the real
+            # config: it selects float vs long text mrope positions, which changes
+            # the RoPE baked into the cached keys.
+            self.reasoner_fps_modulation = bool(getattr(model.config, "enable_fps_modulation", True))
+            # Keep cached K/V resident on the compute device in the model dtype,
+            # otherwise every layer of every step pays a host-to-device copy.
+            if self.reasoner_kv_store is not None:
+                self.reasoner_kv_store.device = accelerator.device
+                self.reasoner_kv_store.dtype = self.dit_dtype
+                # Attach inside run_transformer_for_sample so the training step,
+                # in-training sampling, and both CFG branches are all covered by
+                # one hook.
+                reasoner_kv_cache.install_auto_attach(model, self.reasoner_kv_store, self.reasoner_fps_modulation)
+            if getattr(args, "sample_prompts", None):
+                self._verify_sample_prompts_cached(args)
+            logger.info(
+                f"Cosmos3 training: reasoner K/V cache enabled; omitted {removed} und parameter tensors."
+            )
+        else:
+            model = cosmos3_utils.load_transformer(dit_path, args.transformer_subfolder, dtype, loading_device)
         cosmos3_utils.set_attention_backend(model, attn_mode)
         if args.fp8_scaled:
             keep_fp8_weights_on_cpu = (self.blocks_to_swap or 0) > 0
@@ -580,6 +657,8 @@ class Cosmos3NetworkTrainer(NetworkTrainer):
             sound_noisy_model_input = kwargs.get("sound_noisy_model_input")
             for i in range(bsize):
                 input_ids = input_ids_batch[i] if isinstance(input_ids_batch, list) else input_ids_batch[i]
+                # Cached und K/V is attached inside run_transformer_for_sample by
+                # install_auto_attach, keyed on the input_ids passed below.
                 outputs_i = cosmos3_utils.run_transformer_for_sample(
                     model,
                     input_ids=input_ids,
@@ -635,6 +714,19 @@ def cosmos3_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentPa
         help="temporal compression factor of the Cosmos3/Wan VAE",
     )
     parser.add_argument("--offload_dit_during_sampling", action="store_true", help="offload Cosmos3 DiT while VAE/AVAE sampling decode runs")
+    parser.add_argument(
+        "--reasoner_kv_cache_dir",
+        type=str,
+        default=None,
+        help="replay pre-computed reasoner (und) tower K/V from this directory and skip loading the ~8B "
+        "reasoner weights; build it with cosmos3_cache_reasoner_kv.py",
+    )
+    parser.add_argument(
+        "--reasoner_kv_cache_lru",
+        type=int,
+        default=32,
+        help="number of reasoner K/V entries to keep in RAM (each is a few MiB)",
+    )
     return parser
 
 
