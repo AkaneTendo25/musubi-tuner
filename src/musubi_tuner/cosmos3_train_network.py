@@ -199,6 +199,17 @@ class Cosmos3NetworkTrainer(NetworkTrainer):
             transformer.to("cpu")
             clean_memory_on_device(accelerator.device)
 
+        sound_tokenizer = None
+        if getattr(args, "audio", False):
+            sound_source = args.sound_tokenizer if args.sound_tokenizer is not None else args.dit
+            sound_device = "cpu" if offload_dit else accelerator.device
+            sound_tokenizer = cosmos3_utils.load_sound_tokenizer(
+                sound_source,
+                args.sound_tokenizer_subfolder,
+                dtype=model_utils.str_to_dtype(getattr(args, "sound_dtype", "bfloat16")),
+                device=sound_device,
+            )
+
         save_dir = os.path.join(args.output_dir, "sample")
         os.makedirs(save_dir, exist_ok=True)
 
@@ -214,7 +225,16 @@ class Cosmos3NetworkTrainer(NetworkTrainer):
                 with torch.no_grad():
                     for sample_parameter in sample_parameters:
                         self.sample_image_inference(
-                            accelerator, args, transformer, dit_dtype, vae, save_dir, sample_parameter, epoch, steps
+                            accelerator,
+                            args,
+                            transformer,
+                            dit_dtype,
+                            vae,
+                            sound_tokenizer,
+                            save_dir,
+                            sample_parameter,
+                            epoch,
+                            steps,
                         )
                         clean_memory_on_device(accelerator.device)
             else:
@@ -226,7 +246,16 @@ class Cosmos3NetworkTrainer(NetworkTrainer):
                     with distributed_state.split_between_processes(per_process_params) as sample_parameter_lists:
                         for sample_parameter in sample_parameter_lists[0]:
                             self.sample_image_inference(
-                                accelerator, args, transformer, dit_dtype, vae, save_dir, sample_parameter, epoch, steps
+                                accelerator,
+                                args,
+                                transformer,
+                                dit_dtype,
+                                vae,
+                                sound_tokenizer,
+                                save_dir,
+                                sample_parameter,
+                                epoch,
+                                steps,
                             )
                             clean_memory_on_device(accelerator.device)
         finally:
@@ -234,6 +263,8 @@ class Cosmos3NetworkTrainer(NetworkTrainer):
             if cuda_rng_state is not None:
                 torch.cuda.set_rng_state(cuda_rng_state)
 
+            if sound_tokenizer is not None:
+                cosmos3_generate_video.move_sound_tokenizer(sound_tokenizer, "cpu")
             if offload_dit:
                 self._move_transformer_to_sampling_device(transformer, accelerator.device)
             if accelerator_wrapped_forward is not None:
@@ -260,6 +291,7 @@ class Cosmos3NetworkTrainer(NetworkTrainer):
         do_classifier_free_guidance,
         guidance_scale,
         cfg_scale,
+        sound_tokenizer=None,
         image_path=None,
         control_video_path=None,
     ):
@@ -297,7 +329,7 @@ class Cosmos3NetworkTrainer(NetworkTrainer):
             tokenizer,
             scheduler,
             vae,
-            None,
+            sound_tokenizer,
             latent_dtype,
             device,
         )
@@ -307,7 +339,9 @@ class Cosmos3NetworkTrainer(NetworkTrainer):
             return video.to(torch.float32).cpu(), audio.to(torch.float32).cpu()
         return video.to(torch.float32).cpu()
 
-    def sample_image_inference(self, accelerator, args, transformer, dit_dtype, vae, save_dir, sample_parameter, epoch, steps):
+    def sample_image_inference(
+        self, accelerator, args, transformer, dit_dtype, vae, sound_tokenizer, save_dir, sample_parameter, epoch, steps
+    ):
         sample_steps = sample_parameter.get("sample_steps", 35)
         width = sample_parameter.get("width", 256)
         height = sample_parameter.get("height", 256)
@@ -385,6 +419,7 @@ class Cosmos3NetworkTrainer(NetworkTrainer):
             do_classifier_free_guidance,
             guidance_scale,
             cfg_scale,
+            sound_tokenizer=sound_tokenizer,
             image_path=image_path,
             control_video_path=control_video_path,
         )
