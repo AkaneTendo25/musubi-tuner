@@ -85,6 +85,7 @@ Caching scripts (`ltx2_cache_latents.py`, `ltx2_cache_text_encoder_outputs.py`) 
     - [Dashboard Usage](#dashboard-usage)
 - [Part III — Advanced](#part-iii--advanced)
   - [Advanced Training](#advanced-training)
+    - [Forward Explorative Modeling (XM)](#forward-explorative-modeling-xm)
     - [Optional: Source-Free Training from Cache](#optional-source-free-training-from-cache)
     - [DoRA LoRA Training](#dora-lora-training)
     - [Rank-Stabilized LoRA (rsLoRA)](#rank-stabilized-lora-rslora)
@@ -1496,6 +1497,35 @@ When a cache, training, slider training, or inference job is started from the da
 <sub>[↑ contents](#table-of-contents)</sub>
 
 All training arguments can be placed in a `.toml` config file instead of on the command line via `--config_file config.toml`. See the [configuration files guide](./advanced_config.md) for format details.
+
+### Forward Explorative Modeling (XM)
+<sub>[↑ contents](#table-of-contents)</sub>
+
+`--ltx2_xm_k K` enables the hybrid Forward Explorative Modeling objective from
+[Explorative Modeling](https://arxiv.org/abs/2607.27372). For each training sample, LTX keeps the same timestep and
+conditioning, evaluates `K` independent noise candidates without gradients, and replays only the
+lowest-reconstruction-loss candidate with gradients. This changes training only; saved LoRAs and full-finetune
+checkpoints use the ordinary LTX inference path.
+
+`K=1` is the default and preserves normal flow-matching training. A practical first experiment is:
+
+```bash
+--ltx2_xm_k 2
+```
+
+The memory-saving implementation retains only the current and best candidate payloads, so activation memory does not
+scale with `K`. Training compute increases by approximately one extra forward pass for every additional candidate,
+plus the winner replay. Video and audio noise vary together in AV training, and one joint video/audio loss selects both
+modalities' winner.
+
+The winner replay is verified against the no-gradient selection loss on every XM step. Training stops if the selected
+loss cannot be reproduced, rather than silently backpropagating through a different stochastic condition.
+
+XM training loss is a hard minimum and therefore is not directly comparable between different values of `K`. Compare
+held-out generation quality at equal optimizer updates and equal total compute. Values above `1` currently cannot be
+combined with Self-Flow, HFATO, Differential Guidance, CREPA, TREAD, latent temporal objectives, AV attention loss
+weighting, preservation objectives, Cross-Task Synergy, adaptive audio-loss balancing, FSDP, model parallelism, or
+remote-stage training.
 
 ### Optional: Source-Free Training from Cache
 <sub>[↑ contents](#table-of-contents)</sub>
@@ -5650,6 +5680,7 @@ For longer runs, start with video-only short-context training until checkpoint s
 - [LyCORIS Algorithm List](https://github.com/KohakuBlueleaf/LyCORIS/blob/main/docs/Algo-List.md) and [Guidelines](https://github.com/KohakuBlueleaf/LyCORIS/blob/main/docs/Guidelines.md) — LoKR, LoHA, LoCoN and other algorithm details (used via `pip install lycoris-lora`)
 
 **Research**
+- [Explorative Modeling (arXiv 2607.27372)](https://arxiv.org/abs/2607.27372) — Forward XM hard-min exploration over multiple noise candidates; basis for `--ltx2_xm_k`
 - ID-LoRA — In-context identity LoRA; the audio-reference IC-LoRA implementation in this trainer is based on this approach
 - [Adaptive LoRA Ranks / "Not All Layers Are Created Equal" (arXiv 2603.21884)](https://arxiv.org/abs/2603.21884) — Adaptive per-layer LoRA rank allocation; basis for the adaptive LoRA rank feature
 - [Adafactor (ICML 2018)](https://proceedings.mlr.press/v80/shazeer18a.html) — Factored second-moment optimizer-state background for the Adafactor full-parameter path

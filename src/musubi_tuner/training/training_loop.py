@@ -2259,6 +2259,9 @@ def train(self, args):
 
                 if dict_output:
                     out = model_pred
+                    xm_metrics = out.get("_xm_metrics")
+                    if isinstance(xm_metrics, dict):
+                        mask_metrics.update({str(key): float(value) for key, value in xm_metrics.items()})
 
                     def _masked_loss(
                         pred: torch.Tensor,

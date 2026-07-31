@@ -153,6 +153,10 @@ def _append_ltx2_performance_args(cmd: list[str], config_section) -> None:
         if getattr(config_section, enabled_by, False) and value is not None:
             cmd += [f"--{name}", str(value)]
 
+    xm_k = int(getattr(config_section, "ltx2_xm_k", 1) or 1)
+    if xm_k > 1:
+        cmd += ["--ltx2_xm_k", str(xm_k)]
+
 
 def _training_requests_lycoris(t, network_module: str) -> bool:
     return (

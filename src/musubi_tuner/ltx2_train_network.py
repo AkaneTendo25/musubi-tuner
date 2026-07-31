@@ -95,6 +95,14 @@ from musubi_tuner.ltx2_train_direction import (
     validate_train_direction_setup,
 )
 from musubi_tuner.ltx2_conditioning import _PER_SAMPLE_LOSS_EXPLICIT, apply_conditioning_config
+from musubi_tuner.ltx2_explorative import (
+    RNGSnapshot,
+    build_xm_metrics,
+    score_ltx2_candidate,
+    seeded_randn_like,
+    update_streaming_winner,
+    validate_ltx2_xm_args,
+)
 from musubi_tuner.ltx2_av_attention_loss import (
     AVAttentionLossConfig,
     apply_av_attention_loss_weighting,
@@ -3642,6 +3650,7 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
 
     def handle_model_specific_args(self, args: argparse.Namespace) -> None:
         """Handle LTX-2-specific command line arguments"""
+        validate_ltx2_xm_args(args)
         self.dit_dtype = detect_ltx2_dtype(args.ltx2_checkpoint)
         if self.dit_dtype is not None and self.dit_dtype.itemsize == 1:
             if args.mixed_precision == "fp16":
@@ -4302,6 +4311,8 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             md["ss_lora_target_preset"] = preset
         if bool(getattr(args, "ltx2_causal_temporal_attention", False)):
             md["ss_ltx2_causal_temporal_attention"] = True
+        if int(getattr(args, "ltx2_xm_k", 1) or 1) > 1:
+            md["ss_ltx2_xm_k"] = int(args.ltx2_xm_k)
         if bool(getattr(args, "ltx2_bounded_activation_offload", False)):
             md["ss_ltx2_bounded_activation_offload"] = True
             md["ss_ltx2_activation_offload_max_inflight"] = int(getattr(args, "ltx2_activation_offload_max_inflight", None) or 2)
@@ -4773,6 +4784,182 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
         network_dtype: torch.dtype,
         **kwargs,
     ) -> Tuple[object, torch.Tensor]:
+        """Run one ordinary LTX forward or memory-saving Forward XM selection."""
+
+        xm_k = int(getattr(args, "ltx2_xm_k", 1) or 1)
+        if xm_k <= 1 or not self.training or kwargs.get("_xm_internal", False):
+            return self._call_dit_once(
+                args,
+                accelerator,
+                transformer,
+                latents,
+                batch,
+                noise,
+                noisy_model_input,
+                timesteps,
+                network_dtype,
+                **kwargs,
+            )
+        return self._call_dit_forward_xm(
+            args,
+            accelerator,
+            transformer,
+            latents,
+            batch,
+            noise,
+            noisy_model_input,
+            timesteps,
+            network_dtype,
+        )
+
+    def _call_dit_forward_xm(
+        self,
+        args: argparse.Namespace,
+        accelerator: Accelerator,
+        transformer,
+        latents: torch.Tensor,
+        batch: Dict[str, torch.Tensor],
+        noise: torch.Tensor,
+        noisy_model_input: torch.Tensor,
+        timesteps: torch.Tensor,
+        network_dtype: torch.dtype,
+    ) -> Tuple[object, torch.Tensor]:
+        """Select the lowest reconstruction-loss noise per sample, then replay it with gradients."""
+
+        xm_k = int(args.ltx2_xm_k)
+        batch_size = int(latents.shape[0])
+        if int(getattr(accelerator, "num_processes", 1) or 1) != 1:
+            raise ValueError("Forward XM currently supports single-process training only")
+        if timesteps.dim() != 1 or int(timesteps.shape[0]) != batch_size:
+            raise ValueError("Forward XM currently requires one scalar LTX timestep per sample")
+
+        # Private seeds make exploratory noise independent without advancing the condition RNG.
+        seeds = torch.randint(0, 2**31 - 1, (xm_k, 2), device="cpu", dtype=torch.int64)
+        condition_rng = RNGSnapshot.capture(accelerator.device)
+        loss_type = str(getattr(args, "loss_type", "mse") or "mse")
+        huber_delta = float(getattr(args, "huber_delta", 1.0))
+        per_sample_loss = bool(getattr(args, "ltx2_per_sample_loss", False))
+
+        best_score = torch.full((batch_size,), float("inf"), device=accelerator.device, dtype=torch.float32)
+        best_index = torch.zeros((batch_size,), device=accelerator.device, dtype=torch.long)
+        best_video_noise = noise.detach().clone()
+        best_audio_noise: Optional[torch.Tensor] = None
+        candidate0_score: Optional[torch.Tensor] = None
+
+        for candidate_index in range(xm_k):
+            condition_rng.restore()
+            if candidate_index == 0:
+                candidate_noise = noise
+                candidate_noisy_input = noisy_model_input
+            else:
+                candidate_noise = seeded_randn_like(noise, int(seeds[candidate_index, 0].item()))
+                sigma = (timesteps.to(device=accelerator.device, dtype=torch.float32) / 1000.0).view(-1, 1, 1, 1, 1)
+                candidate_noisy_input = (1.0 - sigma) * latents.to(
+                    device=accelerator.device, dtype=torch.float32
+                ) + sigma * candidate_noise.to(device=accelerator.device, dtype=torch.float32)
+
+            with torch.no_grad():
+                candidate_output, _ = self._call_dit_once(
+                    args,
+                    accelerator,
+                    transformer,
+                    latents,
+                    batch,
+                    candidate_noise,
+                    candidate_noisy_input,
+                    timesteps,
+                    network_dtype,
+                    _xm_internal=True,
+                    _xm_audio_seed=int(seeds[candidate_index, 1].item()),
+                    _xm_capture_audio_noise=True,
+                )
+            if not isinstance(candidate_output, dict):
+                raise TypeError("Forward XM requires the structured LTX output path")
+            if candidate_output.get("_skip_step"):
+                candidate_score = torch.full((batch_size,), float("inf"), device=accelerator.device, dtype=torch.float32)
+            else:
+                candidate_score = score_ltx2_candidate(
+                    candidate_output,
+                    loss_type=loss_type,
+                    huber_delta=huber_delta,
+                    per_sample_loss=per_sample_loss,
+                ).to(device=accelerator.device)
+            if candidate0_score is None:
+                candidate0_score = candidate_score.detach().clone()
+            candidate_audio_noise = candidate_output.get("_xm_audio_noise")
+            best_score, best_index, best_video_noise, best_audio_noise = update_streaming_winner(
+                best_score,
+                candidate_score,
+                candidate_index,
+                best_index,
+                best_video_noise,
+                candidate_noise,
+                best_audio_noise,
+                candidate_audio_noise if isinstance(candidate_audio_noise, torch.Tensor) else None,
+            )
+
+        if candidate0_score is None:
+            raise RuntimeError("Forward XM did not evaluate any candidates")
+        if not torch.isfinite(best_score).all():
+            raise FloatingPointError("All Forward XM candidates were non-finite for at least one sample")
+
+        sigma = (timesteps.to(device=accelerator.device, dtype=torch.float32) / 1000.0).view(-1, 1, 1, 1, 1)
+        selected_noisy_input = (1.0 - sigma) * latents.to(
+            device=accelerator.device, dtype=torch.float32
+        ) + sigma * best_video_noise.to(device=accelerator.device, dtype=torch.float32)
+        # Match the reference memory-saving XM path: do not let an autocast
+        # weight cached during no-grad exploration leak into the graph replay.
+        torch.clear_autocast_cache()
+        condition_rng.restore()
+        output, target = self._call_dit_once(
+            args,
+            accelerator,
+            transformer,
+            latents,
+            batch,
+            best_video_noise,
+            selected_noisy_input,
+            timesteps,
+            network_dtype,
+            _xm_internal=True,
+            _xm_audio_noise_override=best_audio_noise,
+        )
+        if not isinstance(output, dict) or output.get("_skip_step"):
+            raise RuntimeError("Forward XM winner replay did not produce a finite structured LTX output")
+        replay_score = score_ltx2_candidate(
+            output,
+            loss_type=loss_type,
+            huber_delta=huber_delta,
+            per_sample_loss=per_sample_loss,
+        ).to(device=accelerator.device)
+        if not torch.allclose(best_score, replay_score, rtol=1e-5, atol=1e-8):
+            max_abs_error = float((best_score - replay_score).abs().max().item())
+            raise RuntimeError(
+                "Forward XM winner replay changed the selected per-sample loss "
+                f"(max_abs_error={max_abs_error:.8g}); candidate-independent conditioning must be replayed exactly"
+            )
+        output["_xm_metrics"] = build_xm_metrics(
+            k=xm_k,
+            candidate0_score=candidate0_score,
+            best_score=best_score,
+            best_index=best_index,
+            replay_score=replay_score,
+        )
+        return output, target
+
+    def _call_dit_once(
+        self,
+        args: argparse.Namespace,
+        accelerator: Accelerator,
+        transformer,
+        latents: torch.Tensor,
+        batch: Dict[str, torch.Tensor],
+        noise: torch.Tensor,
+        noisy_model_input: torch.Tensor,
+        timesteps: torch.Tensor,
+        network_dtype: torch.dtype,
+        **kwargs,
+    ) -> Tuple[object, torch.Tensor]:
         """Forward pass through LTX-2 (video or audio-video) model
 
         Args:
@@ -4793,6 +4980,23 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
         validate_training_tensors = bool(getattr(args, "ltx2_validate_training_tensors", False))
         skip_nonfinite = validate_training_tensors or bool(getattr(args, "skip_nonfinite_steps", False))
         nonfinite_flag = {"hit": False, "tag": None}
+        xm_audio_noise_override = kwargs.get("_xm_audio_noise_override")
+        xm_audio_seed = kwargs.get("_xm_audio_seed")
+        xm_capture_audio_noise = bool(kwargs.get("_xm_capture_audio_noise", False))
+
+        def _sample_audio_noise(audio_latents: torch.Tensor) -> torch.Tensor:
+            if xm_audio_noise_override is not None:
+                if not isinstance(xm_audio_noise_override, torch.Tensor):
+                    raise TypeError("Forward XM audio-noise override must be a tensor")
+                if tuple(xm_audio_noise_override.shape) != tuple(audio_latents.shape):
+                    raise ValueError(
+                        "Forward XM audio-noise shape mismatch: "
+                        f"override={tuple(xm_audio_noise_override.shape)} expected={tuple(audio_latents.shape)}"
+                    )
+                return xm_audio_noise_override.to(device=audio_latents.device, dtype=audio_latents.dtype)
+            if xm_audio_seed is not None:
+                return seeded_randn_like(audio_latents, int(xm_audio_seed))
+            return torch.randn_like(audio_latents)
 
         def _check_finite(tag: str, tensor: Optional[torch.Tensor]) -> None:
             if not skip_nonfinite or tensor is None:
@@ -5286,7 +5490,7 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                 )
 
             audio_latents = audio_latents.to(device=accelerator.device, dtype=network_dtype)
-            audio_noise = torch.randn_like(audio_latents)
+            audio_noise = _sample_audio_noise(audio_latents)
             sigma_audio = audio_sigma.view(-1, 1, 1, 1)
             noisy_audio = (1.0 - sigma_audio) * audio_latents + sigma_audio * audio_noise
             teacher_noisy_audio_for_self_flow = None
@@ -5609,6 +5813,8 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                     "audio_sigma": audio_sigma,
                 }
             )
+            if xm_capture_audio_noise:
+                out_audio["_xm_audio_noise"] = audio_noise.detach()
             if out_audio["audio_loss_weight"] < 0.0:
                 raise ValueError(f"audio_loss_weight must be >= 0. Got: {out_audio['audio_loss_weight']}")
 
@@ -6271,7 +6477,7 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                 )
                 av_ic_audio_latents = self._adjust_audio_latent_duration(av_ic_audio_latents, expected_length)
 
-            av_ic_audio_noise = torch.randn_like(av_ic_audio_latents)
+            av_ic_audio_noise = _sample_audio_noise(av_ic_audio_latents)
             av_ic_sigma_audio = audio_sigma.view(-1, 1, 1, 1)
             av_ic_noisy_audio = (1.0 - av_ic_sigma_audio) * av_ic_audio_latents + av_ic_sigma_audio * av_ic_audio_noise
             av_ic_audio_target_raw = av_ic_audio_noise - av_ic_audio_latents  # velocity target
@@ -6678,6 +6884,8 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                 "audio_loss_weight": _resolve_loss_weight("audio_loss_weight", "audio_loss_weight"),
                 "audio_sigma": audio_sigma,
             }
+            if xm_capture_audio_noise:
+                out_av_ic["_xm_audio_noise"] = av_ic_audio_noise.detach()
             self._last_dit_inputs = None  # av_ic path — skip preservation
             return out_av_ic, torch.tensor(0.0, device=accelerator.device)
 
@@ -6767,7 +6975,7 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                 )
 
                 audio_enabled_for_batch = True
-                audio_noise = torch.randn_like(audio_latents)
+                audio_noise = _sample_audio_noise(audio_latents)
                 sigma_audio = audio_sigma.view(-1, 1, 1, 1)
                 noisy_audio = (1.0 - sigma_audio) * audio_latents + sigma_audio * audio_noise
                 sf_ctx = self._self_flow_step_context if self._self_flow_active else None
@@ -7927,6 +8135,9 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
             elif frozen_modality == "audio":
                 out["audio_loss_weight"] = 0.0
         # --- end directional training (loss-weight) ---
+
+        if xm_capture_audio_noise and isinstance(audio_noise, torch.Tensor):
+            out["_xm_audio_noise"] = audio_noise.detach()
 
         if skip_nonfinite and distributed_any(accelerator, nonfinite_flag["hit"], device=accelerator.device):
             reason = nonfinite_flag["tag"] if nonfinite_flag["hit"] else "nonfinite_target_on_peer_rank"

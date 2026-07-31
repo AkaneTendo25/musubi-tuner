@@ -451,6 +451,7 @@ class TrainingConfig(BaseModel):
     ltx2_block_swap_async_backward: bool = False
     ltx2_block_swap_trainable_ring: bool = False
     ltx2_validate_training_tensors: bool = False
+    ltx2_xm_k: int = Field(default=1, ge=1, le=32)
     ltx2_model_parallel: bool = False
     ltx2_model_parallel_devices: str = ""
     ltx2_model_parallel_splits: str = ""

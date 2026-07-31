@@ -142,6 +142,21 @@ def add_ltx2_performance_args(parser: argparse.ArgumentParser) -> argparse.Argum
     return parser
 
 
+def add_ltx2_explorative_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
+    group = parser.add_argument_group("LTX-2 Explorative Modeling")
+    group.add_argument(
+        "--ltx2_xm_k",
+        type=int,
+        default=1,
+        metavar="K",
+        help=(
+            "Use memory-saving Forward Explorative Modeling with K noise candidates per sample. "
+            "K=1 preserves ordinary flow-matching training (default)."
+        ),
+    )
+    return parser
+
+
 def add_ltx2_differential_guidance_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     group = parser.add_argument_group("LTX-2 Differential Guidance")
     group.add_argument(
@@ -214,6 +229,7 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
 
     parser.set_defaults(network_module="networks.lora_ltx2")
     add_ltx2_differential_guidance_args(parser)
+    add_ltx2_explorative_args(parser)
 
     parser.add_argument(
         "--ltx2_checkpoint",
