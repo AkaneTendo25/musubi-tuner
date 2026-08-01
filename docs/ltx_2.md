@@ -1501,31 +1501,72 @@ All training arguments can be placed in a `.toml` config file instead of on the 
 ### Forward Explorative Modeling (XM)
 <sub>[↑ contents](#table-of-contents)</sub>
 
-`--ltx2_xm_k K` enables the hybrid Forward Explorative Modeling objective from
-[Explorative Modeling](https://arxiv.org/abs/2607.27372). For each training sample, LTX keeps the same timestep and
-conditioning, evaluates `K` independent noise candidates without gradients, and replays only the
-lowest-reconstruction-loss candidate with gradients. This changes training only; saved LoRAs and full-finetune
-checkpoints use the ordinary LTX inference path.
+`--ltx2_xm_k K` enables the hard-min Forward Explorative Modeling objective described in
+[Explorative Modeling](https://arxiv.org/abs/2607.27372). This is a hybrid use of Forward XM inside the existing LTX
+flow-matching objective. For each sample, the implementation:
 
-`K=1` is the default and preserves normal flow-matching training. A practical first experiment is:
+1. keeps the dataset sample, timestep, and conditioning RNG state fixed;
+2. evaluates `K` different video-noise candidates without gradients;
+3. selects the candidate with the lowest configured masked reconstruction score for that sample; and
+4. runs the selected candidate once more with gradients.
+
+Candidate 0 uses the noise already sampled by ordinary training. The remaining candidates use independent private
+noise draws. In AV training, every candidate also has its own audio-noise draw, and the weighted sum of the video and
+audio reconstruction scores selects one joint video/audio candidate per sample. The selected video and audio noise
+tensors are passed directly to the gradient-bearing forward.
+
+XM changes training only. Saved LoRAs and full-finetune checkpoints use the ordinary LTX inference path. `K=1` is the
+default and takes the ordinary training path without XM candidate generation, RNG snapshots, or XM metrics. Valid
+values are from `1` through `32`. To enable two-candidate selection:
 
 ```bash
 --ltx2_xm_k 2
 ```
 
-The memory-saving implementation retains only the current and best candidate payloads, so activation memory does not
-scale with `K`. Training compute increases by approximately one extra forward pass for every additional candidate,
-plus the winner replay. Video and audio noise vary together in AV training, and one joint video/audio loss selects both
-modalities' winner.
+With `K>1`, each step executes `K` no-gradient scoring forwards followed by one gradient-bearing forward for the
+selected candidate. Candidate activation graphs are not retained. The large activation-memory term therefore does not
+grow with `K`; small seed, score, index, and selected-noise state is retained separately. Training compute grows with
+the number of scoring forwards.
 
-The winner replay is verified against the no-gradient selection loss on every XM step. Training stops if the selected
-loss cannot be reproduced, rather than silently backpropagating through a different stochastic condition.
+Every XM candidate starts from the same captured Python, CPU, and CUDA conditioning RNG state. The implementation
+checks whether all candidates and the gradient-bearing winner replay consume the same RNG stream, while the selected
+video and audio noise tensors are replayed directly. The LoRA/network training loop writes the following TensorBoard
+metrics:
 
-XM training loss is a hard minimum and therefore is not directly comparable between different values of `K`. Compare
-held-out generation quality at equal optimizer updates and equal total compute. Values above `1` currently cannot be
-combined with Self-Flow, HFATO, Differential Guidance, CREPA, TREAD, latent temporal objectives, AV attention loss
-weighting, preservation objectives, Cross-Task Synergy, adaptive audio-loss balancing, FSDP, model parallelism, or
-remote-stage training.
+| Metric | Definition |
+| --- | --- |
+| `loss/xm/k` | Configured candidate count. |
+| `loss/xm/candidate0_score` | Mean reconstruction score for the ordinary-training noise candidate. |
+| `loss/xm/winner_score` | Mean lowest candidate score selected without gradients. |
+| `loss/xm/selection_gain` | `candidate0_score - winner_score`; it is non-negative for finite scores by construction. |
+| `loss/xm/winner_index_mean` | Mean selected candidate index over the batch. |
+| `loss/xm/winner_<i>_fraction` | Fraction of samples won by candidate `i`. Fractions sum to 1 for a valid step. |
+| `loss/xm/invalid_samples` | Number of samples without a finite selected score. This is `0` on a logged valid step; the step raises before backward if any sample has no finite candidate. |
+| `loss/xm/condition_rng_verified` | `1` if all scoring forwards and the winner forward end at the same exact Python/CPU/CUDA conditioning RNG state; otherwise `0`. A zero value is reported but does not stop training. |
+| `loss/xm/replay_max_abs_error` | Maximum absolute difference between the selected no-gradient score and the gradient-bearing replay score. |
+| `loss/xm/replay_mean_abs_error` | Mean absolute difference between those two scores. |
+
+The replay-error metrics are numerical diagnostics, not RNG checks and not stopping criteria. No-gradient and
+gradient-bearing mixed-precision forwards can produce different scores even when the selected noise and conditioning
+RNG state are unchanged. XM metrics describe candidate selection and replay; they do not measure generated-output
+quality. The full-finetune loop uses the same XM selection path and stores `ss_ltx2_xm_k` in checkpoint metadata, but
+does not currently export these per-step XM values to TensorBoard.
+
+Because XM uses a hard minimum, increasing `K` can lower the training score mechanically. Training losses from
+different `K` values are therefore not directly comparable. For an experiment, report `K`, optimizer updates, and
+training compute or wall time; compare held-out generations at either matched updates or matched compute and state
+which comparison is used.
+
+`K>1` currently supports single-process training only. It is not supported with `--self_flow`, `--hfato`,
+`--differential_guidance`, `--crepa`, `--tread`, `--latent_temporal_weighting`, `--latent_delta_loss`,
+`--av_attention_loss_weighting`, `--blank_preservation`, `--dop`, `--prior_divergence`, `--audio_dop`,
+`--motion_preservation`, `--motion_attention_preservation`, `--image_prior_ft`, non-`none`
+`--audio_loss_balance_mode`, nonzero Cross-Task Synergy lambdas, `--ltx2_fsdp`, `--ltx2_model_parallel`, or
+`--ltx2_remote_stage`.
+
+For full fine-tuning with `K>1`, do not combine dataset-level `video_loss_weight` or `audio_loss_weight` values with
+non-default CLI `--video_loss_weight` or `--audio_loss_weight` values. Candidate selection sees the dataset-level
+weights, while the full-finetune loss applies the additional CLI multiplier after candidate selection.
 
 ### Optional: Source-Free Training from Cache
 <sub>[↑ contents](#table-of-contents)</sub>

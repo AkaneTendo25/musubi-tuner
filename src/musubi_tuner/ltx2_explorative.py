@@ -74,6 +74,17 @@ class RNGSnapshot:
         if self.cuda_state is not None and self.cuda_device is not None:
             torch.cuda.set_rng_state(self.cuda_state, self.cuda_device)
 
+    def matches(self, other: "RNGSnapshot") -> bool:
+        """Return whether two snapshots describe the exact same RNG state."""
+
+        if self.python_state != other.python_state or self.cuda_device != other.cuda_device:
+            return False
+        if not torch.equal(self.cpu_state, other.cpu_state):
+            return False
+        if self.cuda_state is None or other.cuda_state is None:
+            return self.cuda_state is None and other.cuda_state is None
+        return torch.equal(self.cuda_state, other.cuda_state)
+
 
 def seeded_randn_like(tensor: torch.Tensor, seed: int) -> torch.Tensor:
     """Draw noise from a private generator without advancing the process RNG."""
