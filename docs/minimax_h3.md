@@ -68,11 +68,20 @@ boundary. The conditioning cache contains variable-length hidden states and toke
 ## Backend boundary
 
 Upstream model source and its license belong under `src/musubi_tuner/minimax_h3/vendor/official/`. Musubi-specific checkpoint
-loading, tensor conversion, quantization, block swapping, cache conversion, and training behavior remain in the surrounding H3
-modules. `src/musubi_tuner/minimax_h3/integration.py` is the single adapter between those two layers.
+loading, tensor conversion, cache conversion, and training behavior remain in the surrounding H3 modules.
+`src/musubi_tuner/minimax_h3/integration.py` is the single adapter between those two layers. Its component-specific factories keep
+latent caching, conditioning caching, generation, and training on separate loading paths.
 
-The adapter must use strict checkpoint loading and explain every supported key conversion. Unsupported quantization and attention
-modes must fail explicitly.
+| Script | Integration factory | Components loaded |
+| --- | --- | --- |
+| `minimax_h3_cache_latents.py` | `create_latent_encoder` | Video VAE and audio VAE |
+| `minimax_h3_cache_text_encoder_outputs.py` | `create_conditioning_encoder` | Understanding encoder and its processor |
+| `minimax_h3_generate_video.py` | `create_generator` | Only the transformer variant and decoding components required by the request |
+| `minimax_h3_train_network.py` | `create_training_backend` | Only the selected `t2va` or `ref2va` transformer; latents and conditioning come from caches |
+
+The adapter must use strict checkpoint loading and explain every supported key conversion. H3-specific quantization, block
+swapping, and compilation remain disabled until the released checkpoint keys and module boundaries can be validated with real
+forward and backward passes.
 
 ## LoRA training
 

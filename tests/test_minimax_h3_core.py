@@ -33,11 +33,12 @@ from musubi_tuner.dataset.config_utils import (
     ConfigSanitizer,
 )
 from musubi_tuner.dataset.image_video_dataset import ItemInfo
+from musubi_tuner.minimax_h3 import backend as h3_backend
+from musubi_tuner.minimax_h3 import integration as h3_integration
 from musubi_tuner.minimax_h3.cache import save_latent_cache_minimax_h3
 from musubi_tuner.minimax_h3.dataset import create_h3_dataset_group
-from musubi_tuner.minimax_h3.load_options import H3LoadOptions, H3Quantization
-from musubi_tuner.minimax_h3.quantization import H3FP8Policy
 from musubi_tuner.minimax_h3_cache_latents import create_parser as create_cache_latents_parser
+from musubi_tuner.minimax_h3_cache_text_encoder_outputs import create_parser as create_cache_text_parser
 from musubi_tuner.minimax_h3.request import H3GenerationRequest, H3Reference, ReferenceKind, ReferenceRole
 from musubi_tuner.minimax_h3.weights import CheckpointInspectionError, inspect_checkpoint
 from musubi_tuner.minimax_h3_generate_video import create_parser, request_from_args
@@ -443,43 +444,32 @@ def test_cache_cli_uses_native_musubi_dataset_config(tmp_path):
     assert not hasattr(args, "dataset_manifest")
 
 
-def test_h3_load_options_follow_musubi_quantization_flags(tmp_path):
-    parser = create_cache_latents_parser()
-    args = parser.parse_args(
-        [
-            "--dataset_config",
-            str(tmp_path / "dataset.toml"),
-            "--model",
-            str(tmp_path / "model"),
-            "--fp8_scaled",
-            "--allow_prequantized_fp8",
-            "--blocks_to_swap",
-            "12",
-        ]
-    )
-    options = H3LoadOptions.from_namespace(args, dtype="bfloat16")
-    assert options.quantization is H3Quantization.FP8_SCALED
-    assert options.allow_prequantized_fp8
-    assert options.blocks_to_swap == 12
+def test_h3_cache_and_generation_parsers_do_not_advertise_unimplemented_loading_modes():
+    unsupported = {"--fp8", "--fp8_scaled", "--fp8_text_encoder", "--int8", "--allow_prequantized_fp8", "--blocks_to_swap"}
+    for parser in (create_cache_latents_parser(), create_cache_text_parser(), create_parser()):
+        assert unsupported.isdisjoint(parser._option_string_actions)
 
 
-def test_h3_load_options_reject_conflicting_or_incomplete_flags():
-    with pytest.raises(ValueError, match="cannot be combined"):
-        H3LoadOptions(fp8=True, int8=True)
-    with pytest.raises(ValueError, match="requires --fp8"):
-        H3LoadOptions(allow_prequantized_fp8=True)
+@pytest.mark.parametrize(
+    ("factory_name", "extra"),
+    [
+        ("create_latent_encoder", {}),
+        ("create_conditioning_encoder", {}),
+        ("create_generator", {"request": H3GenerationRequest("prompt", Path("out.mp4"))}),
+        ("create_training_backend", {"mode": "ref2va", "attention_mode": "torch", "split_attention": False}),
+    ],
+)
+def test_h3_component_factories_route_only_explicit_loading_inputs(monkeypatch, tmp_path, factory_name, extra):
+    sentinel = object()
+    captured = {}
 
+    def create_component(**kwargs):
+        captured.update(kwargs)
+        return sentinel
 
-def test_h3_fp8_policy_requires_matching_keys():
-    with pytest.raises(ValueError, match="must match transformer parameter names"):
-        H3FP8Policy(())
+    monkeypatch.setattr(h3_integration, factory_name, create_component)
+    factory = getattr(h3_backend, factory_name)
+    result = factory(model=tmp_path, device="cpu", dtype="float32", **extra)
 
-    policy = H3FP8Policy(("transformer.blocks",), ("audio_head",))
-    selected = policy.validate_checkpoint_keys(
-        (
-            "transformer.blocks.0.attn.to_q.weight",
-            "transformer.blocks.0.audio_head.weight",
-            "vae.decoder.weight",
-        )
-    )
-    assert selected == ("transformer.blocks.0.attn.to_q.weight",)
+    assert result is sentinel
+    assert captured == {"model": tmp_path, "device": "cpu", "dtype": "float32", **extra}

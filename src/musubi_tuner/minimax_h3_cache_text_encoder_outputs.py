@@ -10,10 +10,9 @@ import torch
 import musubi_tuner.cache_text_encoder_outputs as cache_text_encoder_outputs
 from musubi_tuner.dataset import config_utils
 from musubi_tuner.dataset.image_video_dataset import ItemInfo
-from musubi_tuner.minimax_h3.backend import create_backend
+from musubi_tuner.minimax_h3.backend import create_conditioning_encoder
 from musubi_tuner.minimax_h3.cache import normalize_batch_tensors, save_text_encoder_output_cache_minimax_h3
 from musubi_tuner.minimax_h3.dataset import attach_h3_media, create_h3_dataset_group
-from musubi_tuner.minimax_h3.load_options import H3LoadOptions, add_h3_load_arguments
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +26,6 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         action="store_true",
         help="also cache H3's empty-text conditioning for the optional guidance-consistent training objective",
     )
-    add_h3_load_arguments(parser)
     return parser
 
 
@@ -47,13 +45,12 @@ def main(argv: Sequence[str] | None = None) -> None:
     datasets = dataset_group.datasets
 
     all_cache_files, all_cache_paths = cache_text_encoder_outputs.prepare_cache_files_and_paths(datasets)
-    load_options = H3LoadOptions.from_namespace(args, dtype=args.text_encoder_dtype)
-    backend = create_backend(model=args.model, device=str(device), load_options=load_options)
+    encoder = create_conditioning_encoder(model=args.model, device=str(device), dtype=args.text_encoder_dtype)
 
     def encode(batch: list[ItemInfo]) -> None:
         attach_h3_media(batch, dataset_adapter)
         results = normalize_batch_tensors(
-            backend.encode_conditioning(batch, include_empty=args.cache_guidance_empty), len(batch), "conditioning encoder"
+            encoder.encode_conditioning(batch, include_empty=args.cache_guidance_empty), len(batch), "conditioning encoder"
         )
         for item, tensors in zip(batch, results):
             save_text_encoder_output_cache_minimax_h3(item, tensors)
@@ -66,7 +63,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         all_cache_files,
         all_cache_paths,
         encode,
-        requires_content=bool(getattr(backend, "conditioning_requires_content", False)),
+        requires_content=encoder.conditioning_requires_content,
     )
     cache_text_encoder_outputs.post_process_cache_files(datasets, all_cache_files, all_cache_paths, args.keep_cache)
 

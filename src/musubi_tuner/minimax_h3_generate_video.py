@@ -5,8 +5,7 @@ import json
 from pathlib import Path
 from typing import Sequence
 
-from musubi_tuner.minimax_h3.backend import create_backend
-from musubi_tuner.minimax_h3.load_options import H3LoadOptions, add_h3_load_arguments
+from musubi_tuner.minimax_h3.backend import create_generator
 from musubi_tuner.minimax_h3.request import H3GenerationRequest, SUPPORTED_RATIOS, make_references
 from musubi_tuner.minimax_h3.weights import inspect_checkpoint
 
@@ -26,7 +25,6 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument("--reference_audio", action="append", default=[])
     parser.add_argument("--device")
     parser.add_argument("--dtype", choices=("bfloat16", "float16", "float32"), default="bfloat16")
-    add_h3_load_arguments(parser)
     parser.add_argument(
         "--inspect",
         action="store_true",
@@ -57,9 +55,8 @@ def main(argv: Sequence[str] | None = None) -> None:
             print(json.dumps({"mode": request.mode, "checkpoint": inventory.to_dict()}, indent=2))
             return
         request.output.parent.mkdir(parents=True, exist_ok=True)
-        load_options = H3LoadOptions.from_namespace(args, dtype=args.dtype)
-        backend = create_backend(model=args.model, device=args.device, load_options=load_options)
-        backend.generate(request)
+        generator = create_generator(model=args.model, device=args.device, dtype=args.dtype, request=request)
+        generator.generate(request)
         if not request.output.is_file():
             raise RuntimeError(f"H3 implementation returned without creating {request.output}")
     except (FileNotFoundError, ValueError) as error:

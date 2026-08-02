@@ -15,14 +15,13 @@ from musubi_tuner.dataset.architectures import ARCHITECTURE_MINIMAX_H3, ARCHITEC
 from musubi_tuner.hv_train import get_sigmas
 from musubi_tuner.hv_train_network import NetworkTrainer, read_config_from_file, setup_parser_common
 from musubi_tuner.minimax_h3.architecture import VIDEO_FLOW_SHIFT
-from musubi_tuner.minimax_h3.backend import H3Backend, create_backend
+from musubi_tuner.minimax_h3.backend import H3TrainingBackend, create_training_backend
 from musubi_tuner.minimax_h3.cache import (
     H3_AUDIO_LATENTS_KEY,
     H3_EMPTY_TEXT_HIDDEN_KEY,
     H3_EMPTY_TEXT_TOKEN_TAGS_KEY,
 )
 from musubi_tuner.minimax_h3.dataset import create_h3_dataset_group
-from musubi_tuner.minimax_h3.load_options import H3LoadOptions
 from musubi_tuner.minimax_h3.training import (
     H3ModelPrediction,
     guidance_consistent_prediction,
@@ -53,7 +52,7 @@ _DIRECT_SIGMA_SAMPLING = {
 class MiniMaxH3NetworkTrainer(NetworkTrainer):
     def __init__(self):
         super().__init__()
-        self.backend: H3Backend | None = None
+        self.backend: H3TrainingBackend | None = None
 
     @property
     def architecture(self) -> str:
@@ -109,8 +108,20 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             )
         if args.h3_guidance_distillation_scale is not None and args.h3_guidance_distillation_scale <= 1.0:
             raise ValueError("--h3_guidance_distillation_scale must be greater than 1, or omitted for one-pass training")
-        if args.int8:
-            raise ValueError("MiniMax H3 INT8 training is not supported; use native, FP8, or scaled FP8 weights")
+        if args.fp8_base or args.fp8_scaled:
+            raise ValueError("MiniMax H3 FP8 training requires a validated released checkpoint layout and is not supported yet")
+        if args.blocks_to_swap:
+            raise ValueError("MiniMax H3 block swapping requires the released transformer block layout and is not supported yet")
+        if args.compile:
+            raise ValueError("MiniMax H3 compilation requires the released transformer block layout and is not supported yet")
+        if not args.sdpa:
+            raise ValueError(
+                "MiniMax H3 currently supports only --sdpa; other attention backends require a validated training forward"
+            )
+        if args.split_attn:
+            raise ValueError(
+                "MiniMax H3 split attention requires a validated released transformer forward and is not supported yet"
+            )
 
     def process_sample_prompts(self, args: argparse.Namespace, accelerator: Accelerator, sample_prompts: str):
         del args, accelerator, sample_prompts
@@ -134,37 +145,23 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         loading_device: str,
         dit_weight_dtype: Optional[torch.dtype],
     ):
-        del dit_weight_dtype
-        options = H3LoadOptions(
+        del accelerator, dit_weight_dtype
+        self.backend = create_training_backend(
+            model=Path(dit_path),
+            device=str(loading_device),
             dtype=model_utils.dtype_to_str(self.dit_dtype),
-            fp8=bool(args.fp8_base),
-            fp8_scaled=bool(args.fp8_scaled),
-            int8=bool(args.int8),
-            allow_prequantized_fp8=bool(args.allow_prequantized_fp8),
-            blocks_to_swap=int(args.blocks_to_swap or 0),
+            mode=args.h3_training_mode,
             attention_mode=attn_mode,
             split_attention=split_attn,
         )
-        self.backend = create_backend(model=Path(dit_path), device=str(loading_device), load_options=options)
-        transformer = self.backend.get_training_transformer(args.h3_training_mode)
+        transformer = self.backend.get_training_transformer()
         if not isinstance(transformer, torch.nn.Module):
             raise TypeError("H3 backend get_training_transformer() must return a torch.nn.Module")
-        block_swap_methods = (
-            "enable_block_swap",
-            "move_to_device_except_swap_blocks",
-            "prepare_block_swap_before_forward",
-        )
-        if args.blocks_to_swap and not all(hasattr(transformer, name) for name in block_swap_methods):
-            raise ValueError("the selected H3 backend does not implement Musubi block swapping")
         return transformer
 
     def compile_transformer(self, args, transformer):
-        if self.backend is not None and hasattr(self.backend, "compile_training_transformer"):
-            return self.backend.compile_training_transformer(args, transformer)
-        blocks = getattr(transformer, "transformer_blocks", None)
-        if blocks is None:
-            raise ValueError("H3 backend must expose transformer_blocks or compile_training_transformer()")
-        return model_utils.compile_transformer(args, transformer, [blocks], disable_linear=self.blocks_to_swap > 0)
+        del args, transformer
+        raise RuntimeError("MiniMax H3 compilation is unavailable")
 
     def scale_shift_latents(self, latents):
         # H3 latent caches are written in the model's normalized latent space.
@@ -314,9 +311,6 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
 
 def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     parser.description = "Train a MiniMax H3 LoRA with synchronized video and audio flow matching"
-    parser.add_argument("--fp8_scaled", action="store_true", help="use Musubi scaled FP8 for supported H3 transformer weights")
-    parser.add_argument("--allow_prequantized_fp8", action="store_true", help="accept a prequantized H3 FP8 checkpoint")
-    parser.add_argument("--int8", action="store_true", help="reserved for inference; INT8 training is rejected")
     parser.add_argument(
         "--h3_training_mode",
         choices=("t2va", "ref2va"),

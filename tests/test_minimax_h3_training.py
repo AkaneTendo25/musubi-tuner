@@ -1,5 +1,4 @@
 from contextlib import nullcontext
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -322,38 +321,70 @@ def test_h3_trainer_build_dataset_routes_through_h3_adapter(monkeypatch):
     }
 
 
-class _IncompleteBlockSwapBackend:
-    @staticmethod
-    def get_training_transformer(mode):
-        del mode
-        transformer = nn.Linear(2, 2)
-        transformer.enable_block_swap = lambda *args, **kwargs: None
-        transformer.move_to_device_except_swap_blocks = lambda *args, **kwargs: None
-        return transformer
+class _TrainingBackend:
+    def __init__(self, transformer):
+        self.transformer = transformer
+
+    def get_training_transformer(self):
+        return self.transformer
 
 
-def test_h3_trainer_rejects_incomplete_block_swap_backend(monkeypatch):
-    monkeypatch.setattr(h3_train_network, "create_backend", lambda **kwargs: _IncompleteBlockSwapBackend())
+def test_h3_trainer_loads_only_the_selected_training_transformer(monkeypatch, tmp_path):
+    transformer = nn.Linear(2, 2)
+    backend = _TrainingBackend(transformer)
+    captured = {}
+
+    def create_backend(**kwargs):
+        captured.update(kwargs)
+        return backend
+
+    monkeypatch.setattr(h3_train_network, "create_training_backend", create_backend)
     trainer = MiniMaxH3NetworkTrainer()
     trainer.dit_dtype = torch.bfloat16
-    args = SimpleNamespace(
-        fp8_base=False,
-        fp8_scaled=False,
-        int8=False,
-        allow_prequantized_fp8=False,
-        blocks_to_swap=2,
-        h3_training_mode="t2va",
-    )
+    args = SimpleNamespace(h3_training_mode="ref2va")
 
-    with pytest.raises(ValueError, match="block swapping"):
-        trainer.load_transformer(None, args, str(Path("model")), "torch", False, "cpu", None)
+    loaded = trainer.load_transformer(None, args, str(tmp_path), "torch", False, "cpu", torch.bfloat16)
+
+    assert loaded is transformer
+    assert captured == {
+        "model": tmp_path,
+        "device": "cpu",
+        "dtype": "bfloat16",
+        "mode": "ref2va",
+        "attention_mode": "torch",
+        "split_attention": False,
+    }
+
+
+@pytest.mark.parametrize(
+    ("option", "value", "message"),
+    [
+        ("--fp8_base", None, "FP8 training"),
+        ("--blocks_to_swap", "2", "block swapping"),
+        ("--compile", None, "compilation"),
+        ("--flash_attn", None, "only --sdpa"),
+        ("--sdpa", "--split_attn", "split attention"),
+    ],
+)
+def test_h3_trainer_rejects_release_dependent_common_loading_modes(option, value, message):
+    argv = [option] if value is None else [option, value]
+    args = create_parser().parse_args(argv)
+    with pytest.raises(ValueError, match=message):
+        MiniMaxH3NetworkTrainer().handle_model_specific_args(args)
 
 
 def test_h3_training_parser_defaults_to_native_t2va_contract():
-    args = create_parser().parse_args([])
+    parser = create_parser()
+    args = parser.parse_args(["--sdpa"])
     assert args.network_module == "networks.lora_minimax_h3"
     assert args.h3_training_mode == "t2va"
     assert args.mixed_precision == "bf16"
     assert args.timestep_sampling == "shift"
     assert args.discrete_flow_shift == 12.0
     assert args.h3_guidance_distillation_scale is None
+    assert args.fp8_scaled is False
+    assert "--fp8_base" in parser._option_string_actions
+    assert "--blocks_to_swap" in parser._option_string_actions
+    assert "--fp8_scaled" not in parser._option_string_actions
+    assert "--int8" not in parser._option_string_actions
+    assert "--allow_prequantized_fp8" not in parser._option_string_actions
