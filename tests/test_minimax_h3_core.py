@@ -65,16 +65,19 @@ def test_public_request_modes_and_limits(tmp_path):
         H3GenerationRequest("prompt", tmp_path / "out.mp4", duration=16)
 
 
-def test_public_request_requires_paired_audio_and_caps_total_references(tmp_path):
+def test_public_request_allows_standalone_audio_and_independent_reference_caps(tmp_path):
     audio = H3Reference(tmp_path / "voice.wav", ReferenceKind.AUDIO)
-    with pytest.raises(ValueError, match="paired"):
-        H3GenerationRequest("prompt", tmp_path / "out.mp4", references=(audio,))
+    request = H3GenerationRequest("prompt", tmp_path / "out.mp4", references=(audio,))
+    assert request.mode == "reference"
 
     references = tuple(H3Reference(tmp_path / f"image_{index}.png", ReferenceKind.IMAGE) for index in range(9))
     references += tuple(H3Reference(tmp_path / f"video_{index}.mp4", ReferenceKind.VIDEO) for index in range(3))
-    references += (audio,)
-    with pytest.raises(ValueError, match="12 ordinary references"):
-        H3GenerationRequest("prompt", tmp_path / "out.mp4", references=references)
+    references += tuple(H3Reference(tmp_path / f"audio_{index}.wav", ReferenceKind.AUDIO) for index in range(3))
+    assert H3GenerationRequest("prompt", tmp_path / "out.mp4", references=references).mode == "reference"
+
+    too_many_images = references + (H3Reference(tmp_path / "image_9.png", ReferenceKind.IMAGE),)
+    with pytest.raises(ValueError, match="9 reference images"):
+        H3GenerationRequest("prompt", tmp_path / "out.mp4", references=too_many_images)
 
 
 def test_verified_h3_temporal_contract():
