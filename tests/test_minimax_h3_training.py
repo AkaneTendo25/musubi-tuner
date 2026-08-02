@@ -261,7 +261,7 @@ def test_h3_trainer_joint_process_batch_routes_optional_guidance(guidance_scale,
     video = torch.zeros(1, 24, 2, 2, 2)
     batch = {
         H3_AUDIO_LATENTS_KEY: torch.zeros(1, 2, 32, 3),
-        H3_AUDIO_LOSS_MASK_KEY: torch.ones(1, 3, dtype=torch.bool),
+        H3_AUDIO_LOSS_MASK_KEY: torch.zeros(1, 3, dtype=torch.bool),
         "timesteps": [0.5],
     }
     if guidance_scale is not None:
@@ -289,6 +289,7 @@ def test_h3_trainer_joint_process_batch_routes_optional_guidance(guidance_scale,
     assert torch.isfinite(loss)
     assert transformer.scale.grad is not None and torch.isfinite(transformer.scale.grad)
     assert set(metrics) == {"loss/video", "loss/audio", "h3/sigma_video", "h3/sigma_audio"}
+    assert metrics["loss/audio"] == 0.0
 
 
 def test_h3_trainer_build_dataset_routes_through_h3_adapter(monkeypatch):

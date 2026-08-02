@@ -1,8 +1,9 @@
 import json
 import struct
-from argparse import Namespace
 import wave
+from argparse import Namespace
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -17,13 +18,19 @@ from musubi_tuner.minimax_h3.architecture import (
     AUDIO_FLOW_SHIFT,
     temporal_shape,
 )
-from musubi_tuner.minimax_h3.audio import audio_valid_mask_to_latent_mask, load_audio_asset, target_audio_processing_spec
+from musubi_tuner.minimax_h3.audio import (
+    AudioDecodeError,
+    audio_valid_mask_to_latent_mask,
+    load_audio_asset,
+    target_audio_processing_spec,
+)
 from musubi_tuner.minimax_h3.media import (
     AudioProcessingSpec,
     CropMode,
-    MediaModality,
-    PadMode,
     MediaAsset,
+    MediaModality,
+    MissingMediaPolicy,
+    PadMode,
     fit_audio_length,
     slice_media_asset,
 )
@@ -369,7 +376,53 @@ def test_audio_file_decode_resample_and_mask(tmp_path):
     target_clip = load_audio_asset(target, target_audio_processing_spec(target))
     assert target_clip is not None
     assert target_clip.waveform.shape == (2, temporal_shape(22).audio_samples)
+    assert int(target_clip.valid_mask.sum()) == round(target.duration_seconds * AUDIO_SAMPLE_RATE)
     assert not target_clip.valid_mask[-1]
+
+
+def test_target_video_without_audio_stream_becomes_fully_masked_silence(monkeypatch, tmp_path):
+    import av
+
+    path = tmp_path / "silent.mp4"
+    path.write_bytes(b"container placeholder")
+
+    class NoAudioContainer:
+        streams = SimpleNamespace(audio=())
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            return False
+
+    monkeypatch.setattr(av, "open", lambda source: NoAudioContainer())
+    target = MediaAsset(path, MediaModality.VIDEO, "target", metadata={"frame_count": 22, "fps": 24.0})
+    spec = target_audio_processing_spec(target)
+    clip = load_audio_asset(target, spec)
+
+    assert spec.missing is MissingMediaPolicy.ZERO
+    assert clip is not None
+    assert clip.waveform.shape == (2, temporal_shape(22).audio_samples)
+    assert not clip.waveform.any()
+    assert not clip.valid_mask.any()
+    assert not audio_valid_mask_to_latent_mask(clip.valid_mask).any()
+
+    reference = MediaAsset(path, MediaModality.VIDEO, "reference")
+    reference_spec = AudioProcessingSpec(AUDIO_SAMPLE_RATE, 2, missing=MissingMediaPolicy.DROP)
+    assert load_audio_asset(reference, reference_spec) is None
+
+
+def test_missing_policy_does_not_hide_corrupt_audio(tmp_path):
+    path = tmp_path / "corrupt.mp4"
+    path.write_bytes(b"not a media container")
+    target = MediaAsset(path, MediaModality.VIDEO, "target", metadata={"frame_count": 22, "fps": 24.0})
+
+    with pytest.raises(AudioDecodeError, match="cannot decode audio"):
+        load_audio_asset(target, target_audio_processing_spec(target))
+
+    drop_spec = AudioProcessingSpec(AUDIO_SAMPLE_RATE, 2, missing=MissingMediaPolicy.DROP)
+    with pytest.raises(AudioDecodeError, match="cannot decode audio"):
+        load_audio_asset(target, drop_spec)
 
 
 def test_native_cache_io_records_audio_tensor_and_architecture(tmp_path):
@@ -380,12 +433,13 @@ def test_native_cache_io_records_audio_tensor_and_architecture(tmp_path):
         {
             "latents_2x2x3_float32": torch.ones(24, 2, 2, 3),
             "audio_latents_float32": torch.zeros(2, 32, 4),
-            "audio_loss_mask": torch.ones(4, dtype=torch.bool),
+            "audio_loss_mask": torch.zeros(4, dtype=torch.bool),
         },
     )
 
     with safe_open(cache, framework="pt") as handle:
         assert set(handle.keys()) == {"audio_latents_float32", "audio_loss_mask", "latents_2x2x3_float32"}
+        assert not handle.get_tensor("audio_loss_mask").any()
         assert handle.metadata()["architecture"] == "minimax_h3"
         assert handle.metadata()["frame_count"] == "22"
 

@@ -68,6 +68,7 @@ def save_latent_cache_minimax_h3(item_info: ItemInfo, tensors: dict[str, torch.T
 
     Audio is stereo-major ``[2, 32, T]``. Backends are responsible for
     converting native model layouts such as ``[B, 32, 2, T]`` at this boundary.
+    Silent targets retain audio latents and use an all-false audio loss mask.
     """
     cache_tensors = _validated_cache_tensors(item_info, tensors, operation="latent encoder")
     primary_latents = [key for key in cache_tensors if re.fullmatch(r"latents_\d+x\d+x\d+_.+", key)]

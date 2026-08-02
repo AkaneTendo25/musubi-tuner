@@ -100,12 +100,10 @@ def load_audio_asset(
     except AudioDecodeError:
         raise
     except Exception as error:
-        if spec.missing is not MissingMediaPolicy.ERROR:
-            return _handle_missing(spec, f"cannot decode audio from {asset.path}: {error}")
         raise AudioDecodeError(f"cannot decode audio from {asset.path}: {error}") from error
 
     if not chunks:
-        return _handle_missing(spec, f"audio stream in {asset.path} produced no samples")
+        raise AudioDecodeError(f"audio stream in {asset.path} produced no samples")
     waveform = torch.from_numpy(np.concatenate(chunks, axis=1)).to(torch.float32)
     start = round(asset.start_seconds * spec.sample_rate)
     if start >= waveform.shape[1]:
@@ -154,5 +152,5 @@ def target_audio_processing_spec(asset: MediaAsset) -> AudioProcessingSpec:
         clip_duration_seconds=shape.audio_samples / AUDIO_SAMPLE_RATE,
         crop_mode=CropMode.BEGINNING,
         pad_mode=PadMode.ZERO,
-        missing=MissingMediaPolicy.ERROR,
+        missing=MissingMediaPolicy.ZERO,
     )

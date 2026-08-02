@@ -10,7 +10,9 @@ from musubi_tuner.minimax_h3.training import H3ModelPrediction, H3TrainingMode
 
 
 class H3LatentEncoder(Protocol):
-    def encode_latents(self, batch: list[Any]) -> Any: ...
+    def encode_latents(self, batch: list[Any]) -> Any:
+        """Encode joint AV caches, retaining silent audio latents with an all-false audio loss mask."""
+        ...
 
 
 class H3ConditioningEncoder(Protocol):

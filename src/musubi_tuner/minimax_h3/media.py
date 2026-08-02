@@ -29,6 +29,11 @@ class PadMode(str, Enum):
 
 
 class MissingMediaPolicy(str, Enum):
+    """How to handle an absent media source or stream.
+
+    Decode failures remain errors regardless of this policy.
+    """
+
     ERROR = "error"
     DROP = "drop"
     ZERO = "zero"

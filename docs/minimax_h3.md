@@ -33,8 +33,10 @@ It reports checkpoint components, shards, tensor counts, parameter counts, dtype
 ## Dataset and cache layout
 
 H3 reuses Musubi's standard video dataset and control fields. A target video's embedded soundtrack is the synchronized audio target.
-Reference image, video, or audio assets use `control_directory`, `control_path`, or numbered `control_path_N` fields; no H3-specific
-dataset schema is required.
+When a target video has no audio stream, latent caching encodes duration-matched silence and marks its entire audio loss mask invalid,
+so both `t2va` and `ref2va` can train on video-only examples. A present but corrupt audio stream remains an error. Reference image,
+video, or audio assets use `control_directory`, `control_path`, or numbered `control_path_N` fields; no H3-specific dataset schema is
+required.
 
 The public inference integrations default to a 1344x768 canvas, while their model path accepts other 32-pixel-aligned dimensions.
 The 832x480 example below is therefore grid-valid, although the official training-resolution distribution is not yet public.
