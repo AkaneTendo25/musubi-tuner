@@ -34,6 +34,7 @@ from musubi_tuner.dataset.architectures import (  # explicit imports for local u
     ARCHITECTURE_HUNYUAN_VIDEO,
     ARCHITECTURE_HUNYUAN_VIDEO_1_5,
     ARCHITECTURE_KANDINSKY5,
+    ARCHITECTURE_MINIMAX_H3,
     ARCHITECTURE_QWEN_IMAGE_EDIT,
     ARCHITECTURE_WAN,
 )
@@ -581,6 +582,7 @@ class VideoDataset(BaseDataset):
     TARGET_FPS_FRAMEPACK = 30.0
     TARGET_FPS_FLUX_KONTEXT = 1.0  # VideoDataset is not used for Flux Kontext, but this is a placeholder
     TARGET_FPS_HUNYUAN_VIDEO_1_5 = 24.0
+    TARGET_FPS_MINIMAX_H3 = 24.0
 
     def __init__(
         self,
@@ -625,7 +627,8 @@ class VideoDataset(BaseDataset):
         self.source_fps = source_fps
         self.fp_latent_window_size = fp_latent_window_size
 
-        self.vae_frame_stride = 4  # all architectures require frames to be divisible by 4
+        self.vae_frame_stride = 4
+        self.vae_frame_base = 1
         if self.architecture == ARCHITECTURE_HUNYUAN_VIDEO:
             self.target_fps = VideoDataset.TARGET_FPS_HUNYUAN
         elif self.architecture == ARCHITECTURE_WAN:
@@ -638,6 +641,10 @@ class VideoDataset(BaseDataset):
             self.target_fps = VideoDataset.TARGET_FPS_HUNYUAN
         elif self.architecture == ARCHITECTURE_HUNYUAN_VIDEO_1_5:
             self.target_fps = VideoDataset.TARGET_FPS_HUNYUAN_VIDEO_1_5
+        elif self.architecture == ARCHITECTURE_MINIMAX_H3:
+            self.target_fps = VideoDataset.TARGET_FPS_MINIMAX_H3
+            self.vae_frame_stride = 17
+            self.vae_frame_base = 5
         else:
             raise ValueError(f"Unsupported architecture: {self.architecture}")
 
@@ -645,8 +652,10 @@ class VideoDataset(BaseDataset):
             target_frames = list(set(target_frames))
             target_frames.sort()
 
-            # round each value to N*4+1
-            rounded_target_frames = [(f - 1) // self.vae_frame_stride * self.vae_frame_stride + 1 for f in target_frames]
+            rounded_target_frames = [
+                (f - self.vae_frame_base) // self.vae_frame_stride * self.vae_frame_stride + self.vae_frame_base
+                for f in target_frames
+            ]
             rounded_target_frames = list(set(rounded_target_frames))
             rounded_target_frames.sort()
 
@@ -765,7 +774,9 @@ class VideoDataset(BaseDataset):
                     elif self.frame_extraction == "full":
                         # select all frames
                         target_frame = min(frame_count, self.max_frames)
-                        target_frame = (target_frame - 1) // self.vae_frame_stride * self.vae_frame_stride + 1  # round to N*4+1
+                        target_frame = (
+                            target_frame - self.vae_frame_base
+                        ) // self.vae_frame_stride * self.vae_frame_stride + self.vae_frame_base
                         crop_pos_and_frames.append((0, target_frame))
                     else:
                         raise ValueError(f"frame_extraction {self.frame_extraction} is not supported")
