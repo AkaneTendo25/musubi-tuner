@@ -72,9 +72,9 @@ def _load_bnb_text_conditioner(
             bnb_4bit_use_double_quant=True,
         )
 
-    # Qwen3VLModel constructs its final RMSNorm even though H3 removes it to
-    # consume the raw layer-50 state. Supply a disposable value so Transformers
-    # can still report a clean, fully accounted load before we replace the norm.
+    # Qwen3VLModel constructs its final RMSNorm even though H3 consumes the raw
+    # layer-50 state. A disposable value preserves strict load accounting; the
+    # H3 adapter then exposes the pre-norm language model.
     state_dict["language_model.norm.weight"] = torch.ones(
         full_config.text_config.hidden_size,
         dtype=torch.bfloat16,
@@ -233,6 +233,11 @@ class MiniMaxH3ConditioningEncoder:
         if not isinstance(content, np.ndarray) or content.ndim != 4 or content.shape[0] < 2:
             raise ValueError("MiniMax H3 FL2VA conditioning requires a decoded target video with at least two frames")
         return [Image.fromarray(content[0].astype(np.uint8)), Image.fromarray(content[-1].astype(np.uint8))]
+
+    def encode_prompt(self, prompt: str) -> dict[str, torch.Tensor]:
+        """Encode one text-only prompt for native T2VA inference."""
+        hidden, tags = self._encode_prompt(prompt)
+        return {H3_TEXT_HIDDEN_KEY: hidden, H3_TEXT_TOKEN_TAGS_KEY: tags}
 
     def encode_conditioning(self, batch: list[Any], *, include_empty: bool = False) -> tuple[dict[str, torch.Tensor], ...]:
         dtype_name = dtype_to_str(self.output_dtype)

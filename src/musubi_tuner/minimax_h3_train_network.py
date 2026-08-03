@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import logging
 import math
+import time
 from collections.abc import Sequence
 from multiprocessing import Value
 from pathlib import Path
@@ -14,14 +16,18 @@ from musubi_tuner.dataset import config_utils
 from musubi_tuner.dataset.architectures import ARCHITECTURE_MINIMAX_H3, ARCHITECTURE_MINIMAX_H3_FULL
 from musubi_tuner.hv_train import get_sigmas
 from musubi_tuner.hv_train_network import NetworkTrainer, read_config_from_file, setup_parser_common
-from musubi_tuner.minimax_h3.architecture import VIDEO_FLOW_SHIFT
-from musubi_tuner.minimax_h3.backend import H3TrainingBackend, create_training_backend
+from musubi_tuner.minimax_h3.architecture import VIDEO_FLOW_SHIFT, align_frame_count
+from musubi_tuner.minimax_h3.backend import H3TrainingBackend, create_conditioning_encoder, create_training_backend
 from musubi_tuner.minimax_h3.cache import (
     H3_AUDIO_LATENTS_KEY,
     H3_EMPTY_TEXT_HIDDEN_KEY,
     H3_EMPTY_TEXT_TOKEN_TAGS_KEY,
+    H3_TEXT_HIDDEN_KEY,
+    H3_TEXT_TOKEN_TAGS_KEY,
 )
+from musubi_tuner.minimax_h3.component_loader import load_audio_vae_decoder, load_video_vae_decoder
 from musubi_tuner.minimax_h3.dataset import create_h3_dataset_group
+from musubi_tuner.minimax_h3.inference import decode_latents_sequentially, denoise_t2va, save_av_mp4
 from musubi_tuner.minimax_h3.training import (
     H3ModelPrediction,
     guidance_consistent_prediction,
@@ -29,7 +35,9 @@ from musubi_tuner.minimax_h3.training import (
     prepare_joint_noisy_inputs,
 )
 from musubi_tuner.training.accelerator_setup import collator_class
+from musubi_tuner.training.sampling_prompts import load_prompts
 from musubi_tuner.utils import model_utils
+from musubi_tuner.utils.device_utils import clean_memory_on_device
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +54,13 @@ _DIRECT_SIGMA_SAMPLING = {
     "qinglong_qwen",
     "flux2_shift",
 }
+
+
+class _H3DecoderBundle(torch.nn.Module):
+    def __init__(self, video_decoder: torch.nn.Module, audio_decoder: torch.nn.Module) -> None:
+        super().__init__()
+        self.video_decoder = video_decoder
+        self.audio_decoder = audio_decoder
 
 
 class MiniMaxH3NetworkTrainer(NetworkTrainer):
@@ -126,18 +141,166 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             raise ValueError("MiniMax H3 training supports only --sdpa")
         if args.split_attn:
             raise ValueError("MiniMax H3 training does not support split attention")
+        if args.sample_prompts:
+            required = {
+                "--text_encoder": args.text_encoder,
+                "--tokenizer": args.tokenizer,
+                "--vae": args.vae,
+                "--audio_vae": args.audio_vae,
+            }
+            missing = [name for name, value in required.items() if value is None]
+            if missing:
+                raise ValueError("MiniMax H3 sampling during training requires " + ", ".join(missing))
 
     def process_sample_prompts(self, args: argparse.Namespace, accelerator: Accelerator, sample_prompts: str):
-        del args, accelerator, sample_prompts
-        raise ValueError("MiniMax H3 sampling during training requires a backend with native audio-video decoding")
+        prompts = load_prompts(sample_prompts)
+        logger.info("Encoding %d MiniMax H3 sampling prompt(s)", len(prompts))
+        encoder = create_conditioning_encoder(
+            text_encoder=Path(args.text_encoder),
+            tokenizer=Path(args.tokenizer),
+            task="t2va",
+            device=str(accelerator.device),
+            dtype="bfloat16",
+            quantization=args.text_encoder_quantization,
+        )
+        for prompt in prompts:
+            prompt.update(encoder.encode_prompt(prompt.get("prompt", "")))
+        del encoder
+        gc.collect()
+        clean_memory_on_device(accelerator.device)
+        return prompts
+
+    def _generate_sample(
+        self,
+        accelerator: Accelerator,
+        transformer: torch.nn.Module,
+        decoder_bundle: _H3DecoderBundle,
+        sample_parameter: dict,
+    ):
+        device = accelerator.device
+        height = sample_parameter.get("height", 192)
+        width = sample_parameter.get("width", 320)
+        frame_count = align_frame_count(sample_parameter.get("frame_count", 124))
+        sample_steps = sample_parameter.get("sample_steps", 20)
+        seed = sample_parameter.get("seed", 42)
+        generator = torch.Generator(device=device).manual_seed(seed)
+        conditioning = {
+            H3_TEXT_HIDDEN_KEY: sample_parameter[H3_TEXT_HIDDEN_KEY],
+            H3_TEXT_TOKEN_TAGS_KEY: sample_parameter[H3_TEXT_TOKEN_TAGS_KEY],
+        }
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+            torch.cuda.reset_peak_memory_stats(device)
+        denoise_started = time.perf_counter()
+        video_latents, audio_latents = denoise_t2va(
+            transformer,
+            conditioning,
+            height=height,
+            width=width,
+            frame_count=frame_count,
+            num_inference_steps=sample_steps,
+            generator=generator,
+            device=device,
+        )
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        sample_metrics = {
+            "joint_denoising": {
+                "seconds": time.perf_counter() - denoise_started,
+                "peak_allocated_gib": torch.cuda.max_memory_allocated(device) / 2**30 if device.type == "cuda" else None,
+                "peak_reserved_gib": torch.cuda.max_memory_reserved(device) / 2**30 if device.type == "cuda" else None,
+            }
+        }
+        video_latents = video_latents.cpu()
+        audio_latents = audio_latents.cpu()
+
+        block_swap_suspended = bool(self.blocks_to_swap)
+        if block_swap_suspended:
+            transformer.offload_block_swap_to_cpu()
+        else:
+            transformer.to("cpu")
+        clean_memory_on_device(device)
+        if device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(device)
+        decode_started = time.perf_counter()
+        try:
+            media = decode_latents_sequentially(
+                decoder_bundle.video_decoder,
+                decoder_bundle.audio_decoder,
+                video_latents,
+                audio_latents,
+                device,
+            )
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+            sample_metrics["sequential_av_decode"] = {
+                "seconds": time.perf_counter() - decode_started,
+                "peak_allocated_gib": torch.cuda.max_memory_allocated(device) / 2**30 if device.type == "cuda" else None,
+                "peak_reserved_gib": torch.cuda.max_memory_reserved(device) / 2**30 if device.type == "cuda" else None,
+            }
+            self._last_sample_metrics = sample_metrics
+            logger.info("MiniMax H3 training sample metrics: %s", sample_metrics)
+        finally:
+            if block_swap_suspended:
+                transformer.move_to_device_except_swap_blocks(device)
+                transformer.switch_block_swap_for_inference()
+            else:
+                transformer.to(device)
+        return media, height, width, frame_count, sample_steps, seed
+
+    def sample_image_inference(
+        self,
+        accelerator,
+        args,
+        transformer,
+        dit_dtype,
+        vae,
+        save_dir,
+        sample_parameter,
+        epoch,
+        steps,
+    ):
+        del dit_dtype
+        media, height, width, frame_count, sample_steps, seed = self._generate_sample(
+            accelerator,
+            transformer,
+            vae,
+            sample_parameter,
+        )
+        timestamp = time.strftime("%Y%m%d%H%M%S", time.localtime())
+        checkpoint = f"e{epoch:06d}" if epoch is not None else f"{steps:06d}"
+        prompt_index = sample_parameter.get("enum", 0)
+        prefix = "" if args.output_name is None else args.output_name + "_"
+        output = Path(save_dir) / f"{prefix}{checkpoint}_{prompt_index:02d}_{timestamp}_{seed}.mp4"
+        save_av_mp4(
+            media,
+            output,
+            {
+                "training_step": steps,
+                "epoch": epoch,
+                "prompt": sample_parameter.get("prompt", ""),
+                "seed": seed,
+                "height": height,
+                "width": width,
+                "frames": frame_count,
+                "sigma_points": sample_steps,
+                "model_evaluations": sample_steps - 1,
+                "metrics": self._last_sample_metrics,
+            },
+        )
+        logger.info("Saved MiniMax H3 AV sample to %s", output)
 
     def do_inference(self, *args, **kwargs):
         del args, kwargs
-        raise RuntimeError("MiniMax H3 training inference must be provided by the selected backend")
+        raise RuntimeError("MiniMax H3 sampling uses its AV-aware sample_image_inference implementation")
 
     def load_vae(self, args: argparse.Namespace, vae_dtype: torch.dtype, vae_path: str):
-        del args, vae_dtype, vae_path
-        raise RuntimeError("MiniMax H3 uses separate video and audio VAEs through its backend")
+        del vae_dtype, vae_path
+        logger.info("Loading MiniMax H3 video/audio decoders on CPU for sampling")
+        return _H3DecoderBundle(
+            load_video_vae_decoder(Path(args.vae), "cpu"),
+            load_audio_vae_decoder(Path(args.audio_vae), "cpu"),
+        )
 
     def load_transformer(
         self,
@@ -324,6 +487,15 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         default="fl2va",
         help="select the first/last-frame base transformer or the separate reference-conditioned transformer",
     )
+    parser.add_argument("--text_encoder", type=str, help="Qwen3-VL H3 BF16 checkpoint used only for sampling prompts")
+    parser.add_argument("--tokenizer", type=str, help="official FL2VA tokenizer/processor metadata used only for sampling")
+    parser.add_argument("--audio_vae", type=str, help="MiniMax H3 audio VAE checkpoint used only for sampling")
+    parser.add_argument(
+        "--text_encoder_quantization",
+        choices=("none", "int8", "nf4"),
+        default="none",
+        help="optional Qwen3-VL quantization while pre-encoding sampling prompts",
+    )
     parser.add_argument(
         "--h3_loss_balance",
         choices=("token", "modality"),
@@ -336,7 +508,7 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         "--h3_guidance_distillation_scale",
         type=float,
         default=None,
-        help="experimental: enable two-pass guidance-consistent training with a user-supplied distillation scale",
+        help="enable optional two-pass guidance-consistent training with an authoritative distillation scale",
     )
     parser.set_defaults(
         network_module="networks.lora_minimax_h3",

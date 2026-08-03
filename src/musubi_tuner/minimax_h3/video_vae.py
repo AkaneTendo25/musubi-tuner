@@ -385,3 +385,285 @@ class MiniMaxH3VideoEncoderModel(nn.Module):
         mean = self.latents_mean.view(1, -1, 1, 1, 1)
         std = self.latents_std.view(1, -1, 1, 1, 1)
         return (latent - mean) / std
+
+
+class MiniMaxH3VideoRotaryPosEmbed(nn.Module):
+    """Three-axis rotary embedding used by the released ViT decoder."""
+
+    def __init__(self, dim: int, theta: float = 100.0, num_axes: int = 3) -> None:
+        super().__init__()
+        if dim % (2 * num_axes):
+            raise ValueError(f"rotary dimension {dim} must be divisible by {2 * num_axes}")
+        inv_freq = 1.0 / theta ** torch.arange(0, 1, 2 * num_axes / dim, dtype=torch.float32)
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+    def forward(self, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        angles = 2.0 * math.pi * position_ids[:, :, :, None] * self.inv_freq[None, None, None, :]
+        angles = angles.flatten(2, 3).tile(2).unsqueeze(2)
+        return angles.cos(), angles.sin()
+
+
+class MiniMaxH3VideoDecoderAttention(nn.Module):
+    def __init__(self, dim: int, heads: int, head_dim: int, eps: float = 1e-5) -> None:
+        super().__init__()
+        self.heads = heads
+        self.head_dim = head_dim
+        self.norm_q = nn.RMSNorm(head_dim, eps=eps, elementwise_affine=False)
+        self.norm_k = nn.RMSNorm(head_dim, eps=eps, elementwise_affine=False)
+        self.to_qkv = nn.Linear(dim, 3 * heads * head_dim)
+        self.to_out = nn.Linear(heads * head_dim, dim)
+
+    @staticmethod
+    def _rotary(hidden_states: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+        rotary_dim = cos.shape[-1]
+        rotary, remainder = hidden_states[..., :rotary_dim], hidden_states[..., rotary_dim:]
+        first, second = rotary.chunk(2, dim=-1)
+        rotated = torch.cat((-second, first), dim=-1)
+        return torch.cat((rotary * cos + rotated * sin, remainder), dim=-1)
+
+    def forward(self, hidden_states: torch.Tensor, rotary_emb: tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
+        batch_size, sequence_length, _ = hidden_states.shape
+        qkv = self.to_qkv(hidden_states).view(batch_size, sequence_length, self.heads, 3, self.head_dim)
+        query, key, value = qkv.unbind(dim=3)
+        query = self.norm_q(query.float()).to(query.dtype)
+        key = self.norm_k(key.float()).to(key.dtype)
+        cos, sin = (value.to(query.dtype) for value in rotary_emb)
+        query = self._rotary(query, cos, sin)
+        key = self._rotary(key, cos, sin)
+        hidden_states = F.scaled_dot_product_attention(
+            query.transpose(1, 2),
+            key.transpose(1, 2),
+            value.transpose(1, 2),
+        )
+        return self.to_out(hidden_states.transpose(1, 2).flatten(2, 3))
+
+
+class MiniMaxH3VideoDecoderFeedForward(nn.Module):
+    def __init__(self, dim: int, mult: int = 4) -> None:
+        super().__init__()
+        self.w1 = nn.Linear(dim, 2 * dim * mult)
+        self.w2 = nn.Linear(dim * mult, dim)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        gate, value = self.w1(hidden_states).chunk(2, dim=-1)
+        return self.w2(F.silu(gate) * value)
+
+
+class MiniMaxH3VideoDecoderTransformerBlock(nn.Module):
+    def __init__(self, dim: int, heads: int, head_dim: int, ffn_mult: int = 4, eps: float = 1e-5) -> None:
+        super().__init__()
+        self.norm1 = nn.RMSNorm(dim, eps=eps)
+        self.attn = MiniMaxH3VideoDecoderAttention(dim, heads, head_dim, eps)
+        self.scale1 = nn.Parameter(torch.zeros(dim))
+        self.norm2 = nn.RMSNorm(dim, eps=eps)
+        self.ff = MiniMaxH3VideoDecoderFeedForward(dim, ffn_mult)
+        self.scale2 = nn.Parameter(torch.zeros(dim))
+
+    def forward(self, hidden_states: torch.Tensor, rotary_emb: tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
+        norm = F.rms_norm(
+            hidden_states.float(),
+            self.norm1.normalized_shape,
+            self.norm1.weight.float(),
+            self.norm1.eps,
+        ).to(hidden_states.dtype)
+        hidden_states = hidden_states + self.attn(norm, rotary_emb) * self.scale1
+        norm = F.rms_norm(
+            hidden_states.float(),
+            self.norm2.normalized_shape,
+            self.norm2.weight.float(),
+            self.norm2.eps,
+        ).to(hidden_states.dtype)
+        return hidden_states + self.ff(norm) * self.scale2
+
+
+class MiniMaxH3VideoViTDecoder3d(nn.Module):
+    """Non-causal tiled ViT decoder with original Comfy checkpoint module names."""
+
+    def __init__(
+        self,
+        in_channels: int = 24,
+        out_channels: int = 3,
+        patch_size: int = 16,
+        patch_size_t: int = 4,
+        num_layers: int = 36,
+        num_attention_heads: int = 32,
+        attention_head_dim: int = 64,
+        num_register_tokens: int = 4,
+        ffn_mult: int = 4,
+        rope_theta: float = 100.0,
+        rope_dim_ratio: float = 0.75,
+        norm_eps: float = 1e-5,
+    ) -> None:
+        super().__init__()
+        dim = num_attention_heads * attention_head_dim
+        self.patch_size = patch_size
+        self.patch_size_t = patch_size_t
+        self.out_channels = out_channels
+        self.num_register_tokens = num_register_tokens
+        self.rope = MiniMaxH3VideoRotaryPosEmbed(int(attention_head_dim * rope_dim_ratio), theta=rope_theta)
+        self.x_embedder = nn.Linear(in_channels, dim)
+        self.register_tokens = nn.Parameter(torch.zeros(1, num_register_tokens, dim))
+        self.transformer_blocks = nn.ModuleList(
+            [
+                MiniMaxH3VideoDecoderTransformerBlock(
+                    dim,
+                    num_attention_heads,
+                    attention_head_dim,
+                    ffn_mult,
+                    norm_eps,
+                )
+                for _ in range(num_layers)
+            ]
+        )
+        self.norm_out = nn.LayerNorm(dim, eps=norm_eps)
+        self.proj_out = nn.Linear(dim, out_channels * patch_size_t * patch_size * patch_size)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        batch_size, channels, frames, height, width = hidden_states.shape
+        hidden_states = hidden_states.permute(0, 2, 3, 4, 1).reshape(batch_size, frames * height * width, channels)
+        hidden_states = self.x_embedder(hidden_states)
+        num_patches = hidden_states.shape[1]
+        register_tokens = self.register_tokens.expand(batch_size, -1, -1)
+        hidden_states = torch.cat((hidden_states, register_tokens, torch.zeros_like(hidden_states[:, :1])), dim=1)
+
+        grids = [
+            2.0 * (torch.arange(0.5, size, dtype=torch.float32, device=hidden_states.device) / size) - 1.0
+            for size in (frames, height, width)
+        ]
+        position_ids = torch.stack(torch.meshgrid(*grids, indexing="ij"), dim=-1).flatten(0, 2)
+        position_ids = position_ids.unsqueeze(0).expand(batch_size, -1, -1)
+        suffix = position_ids.new_zeros((batch_size, self.num_register_tokens + 1, 3))
+        rotary_emb = self.rope(torch.cat((position_ids, suffix), dim=1))
+        for block in self.transformer_blocks:
+            hidden_states = block(hidden_states, rotary_emb)
+
+        hidden_states = self.proj_out(self.norm_out(hidden_states[:, :num_patches]))
+        hidden_states = hidden_states.view(
+            batch_size,
+            frames,
+            height,
+            width,
+            self.out_channels,
+            self.patch_size_t,
+            self.patch_size,
+            self.patch_size,
+        )
+        hidden_states = hidden_states.permute(0, 4, 1, 5, 2, 6, 3, 7).contiguous()
+        return hidden_states.reshape(
+            batch_size,
+            self.out_channels,
+            frames * self.patch_size_t,
+            height * self.patch_size,
+            width * self.patch_size,
+        )
+
+
+class MiniMaxH3VideoDecoderModel(nn.Module):
+    """Decoder-only MiniMax H3 video VAE with released temporal and spatial tiling."""
+
+    spatial_compression_ratio = 16
+    temporal_compression_ratio = 4
+    clip_length = 17
+    token_drop = 3
+
+    def __init__(self, latents_mean: tuple[float, ...], latents_std: tuple[float, ...]) -> None:
+        super().__init__()
+        if len(latents_mean) != 24 or len(latents_std) != 24:
+            raise ValueError("MiniMax H3 video latent statistics must contain 24 channels")
+        self.post_quant_conv = nn.Conv3d(24, 24, 1)
+        self.decoder = MiniMaxH3VideoViTDecoder3d()
+        self.register_buffer("latents_mean", torch.tensor(latents_mean, dtype=torch.float32), persistent=False)
+        self.register_buffer("latents_std", torch.tensor(latents_std, dtype=torch.float32), persistent=False)
+        self.frame_pre_padding = (-self.clip_length) % self.temporal_compression_ratio
+        self.tokens_chunk_size = math.ceil(self.clip_length / self.temporal_compression_ratio)
+        self.token_overlap = (-self.token_drop) % self.tokens_chunk_size
+        self.frame_overlap = max(
+            self.token_overlap * self.temporal_compression_ratio - self.frame_pre_padding,
+            0,
+        )
+        self.tile_sample_min_height = 256
+        self.tile_sample_min_width = 256
+        self.tile_sample_min_overlap_height = 64
+        self.tile_sample_min_overlap_width = 64
+
+    _split_tiles = MiniMaxH3VideoEncoderModel._split_tiles
+    _blend = staticmethod(MiniMaxH3VideoEncoderModel._blend)
+    _stitch_tiles = MiniMaxH3VideoEncoderModel._stitch_tiles
+
+    def _decode_clip(self, latents: torch.Tensor) -> torch.Tensor:
+        height = latents.shape[-2] * self.spatial_compression_ratio
+        width = latents.shape[-1] * self.spatial_compression_ratio
+        y_starts, y_lengths, y_overlaps = self._split_tiles(
+            height,
+            self.tile_sample_min_height,
+            self.tile_sample_min_overlap_height,
+        )
+        x_starts, x_lengths, x_overlaps = self._split_tiles(
+            width,
+            self.tile_sample_min_width,
+            self.tile_sample_min_overlap_width,
+        )
+        ratio = self.spatial_compression_ratio
+        rows = []
+        for y_start, y_length in zip(y_starts, y_lengths):
+            row = []
+            for x_start, x_length in zip(x_starts, x_lengths):
+                tile = latents[
+                    ...,
+                    y_start // ratio : y_start // ratio + y_length // ratio,
+                    x_start // ratio : x_start // ratio + x_length // ratio,
+                ]
+                row.append(self.decoder(self.post_quant_conv(tile)))
+            rows.append(row)
+        return self._stitch_tiles(rows, y_overlaps, x_overlaps)
+
+    def _decode_temporal(self, latents: torch.Tensor) -> torch.Tensor:
+        chunk_size = self.tokens_chunk_size
+        temporal_ratio = self.temporal_compression_ratio
+        chunk_frames = chunk_size * temporal_ratio
+        num_tokens = latents.shape[2] + self.token_drop
+        pad_tokens = (-num_tokens) % chunk_size
+        num_chunks = (num_tokens + pad_tokens) // chunk_size - int(self.token_drop > 0)
+        if pad_tokens:
+            latents = torch.cat((latents, latents[:, :, -1:].repeat(1, 1, pad_tokens, 1, 1)), dim=2)
+
+        decoded_chunks = []
+        overlap = None
+        for index in range(num_chunks):
+            start = index * chunk_size
+            clip = self._decode_clip(latents[:, :, start : start + chunk_size + self.token_overlap])
+            for part in range(int(self.token_drop > 0) + 1):
+                chunk = clip[:, :, part * chunk_frames : (part + 1) * chunk_frames]
+                chunk = chunk[:, :, self.frame_pre_padding :]
+                if part == 0:
+                    if overlap is not None:
+                        chunk = self._blend(overlap, chunk, self.frame_overlap, -3)
+                    decoded_chunks.append(chunk)
+                else:
+                    overlap = chunk
+        if overlap is not None:
+            decoded_chunks.append(overlap)
+        decoded = torch.cat(decoded_chunks, dim=2)
+        if pad_tokens:
+            intra_tail = self.clip_length % temporal_ratio
+            tokens_before_pad = latents.shape[2] - pad_tokens
+            pad_frames = sum(
+                intra_tail if intra_tail and (tokens_before_pad + offset) % chunk_size == 0 else temporal_ratio
+                for offset in range(pad_tokens)
+            )
+            decoded = decoded[:, :, :-pad_frames]
+        return decoded
+
+    def decode(self, latents: torch.Tensor) -> torch.Tensor:
+        """Decode normalized ``[B, 24, T, H, W]`` latents into RGB values in ``[0, 1]``."""
+        if latents.ndim != 5 or latents.shape[1] != 24:
+            raise ValueError(f"video latents must have shape [B, 24, T, H, W], got {tuple(latents.shape)}")
+        mean = self.latents_mean.view(1, -1, 1, 1, 1)
+        std = self.latents_std.view(1, -1, 1, 1, 1)
+        latents = latents.float() * std + mean
+        device = latents.device
+        with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=device.type == "cuda"):
+            video = self._decode_temporal(latents)
+        pixel_mean = video.new_tensor((0.485, 0.456, 0.406), dtype=torch.float32).view(1, 3, 1, 1, 1)
+        pixel_std = video.new_tensor((0.229, 0.224, 0.225), dtype=torch.float32).view(1, 3, 1, 1, 1)
+        return (video.float() * pixel_std + pixel_mean).clamp(0.0, 1.0)

@@ -9,8 +9,8 @@ import torch
 from accelerate import init_empty_weights
 from safetensors import safe_open
 
-from musubi_tuner.minimax_h3.audio_vae import MiniMaxH3AudioEncoderModel
-from musubi_tuner.minimax_h3.video_vae import MiniMaxH3VideoEncoderModel
+from musubi_tuner.minimax_h3.audio_vae import MiniMaxH3AudioDecoderModel, MiniMaxH3AudioEncoderModel
+from musubi_tuner.minimax_h3.video_vae import MiniMaxH3VideoDecoderModel, MiniMaxH3VideoEncoderModel
 
 logger = logging.getLogger(__name__)
 
@@ -116,7 +116,7 @@ def load_video_vae_encoder(source: Path, device: str | torch.device) -> MiniMaxH
     metadata = _metadata(path, "minimax_h3_video_vae")
     if metadata.get("vae_clip_length") != 17 or metadata.get("vae_token_drop") != 3:
         raise ValueError("unsupported MiniMax H3 video VAE temporal geometry")
-    with init_empty_weights(include_buffers=True):
+    with init_empty_weights(include_buffers=False):
         model = MiniMaxH3VideoEncoderModel(
             tuple(metadata["latents_mean"]),
             tuple(metadata["latents_std"]),
@@ -156,7 +156,7 @@ def load_audio_vae_encoder(source: Path, device: str | torch.device) -> MiniMaxH
     disagreements = {key: (kwargs.get(key), value) for key, value in expected.items() if kwargs.get(key) != value}
     if disagreements:
         raise ValueError(f"unsupported MiniMax H3 audio VAE config: {disagreements}")
-    with init_empty_weights(include_buffers=True):
+    with init_empty_weights(include_buffers=False):
         model = MiniMaxH3AudioEncoderModel(
             tuple(metadata["latents_mean"]),
             tuple(metadata["latents_std"]),
@@ -173,6 +173,66 @@ def load_audio_vae_encoder(source: Path, device: str | torch.device) -> MiniMaxH
         device=torch.device(device),
         select_key=select,
         allowed_ignored_prefixes=("decoder.", "dec_in_proj."),
+        allowed_ignored_keys=frozenset(("latents_mean", "latents_std")),
+        required_dtype=torch.float32,
+    )
+    model.latents_mean = torch.tensor(metadata["latents_mean"], dtype=torch.float32, device=device)
+    model.latents_std = torch.tensor(metadata["latents_std"], dtype=torch.float32, device=device)
+    return model
+
+
+def load_video_vae_decoder(source: Path, device: str | torch.device) -> MiniMaxH3VideoDecoderModel:
+    """Load only the released video VAE decoder for sequential inference."""
+    path = resolve_video_vae_checkpoint(source)
+    metadata = _metadata(path, "minimax_h3_video_vae")
+    if metadata.get("vae_clip_length") != 17 or metadata.get("vae_token_drop") != 3:
+        raise ValueError("unsupported MiniMax H3 video VAE temporal geometry")
+    # Keep derived, non-persistent rotary buffers materialized. They have no
+    # checkpoint key and would otherwise remain meta tensors after an
+    # assign-based strict load.
+    with init_empty_weights(include_buffers=False):
+        model = MiniMaxH3VideoDecoderModel(tuple(metadata["latents_mean"]), tuple(metadata["latents_std"]))
+
+    def select(source_key: str) -> str | None:
+        if source_key.startswith(("decoder.", "post_quant_conv.")) and source_key != "decoder.mask_token":
+            return source_key
+        return None
+
+    model = _load_subset(
+        model,
+        path,
+        device=torch.device(device),
+        select_key=select,
+        allowed_ignored_prefixes=("encoder.", "quant_conv."),
+        allowed_ignored_keys=frozenset(("decoder.mask_token", "latents_mean", "latents_std")),
+        required_dtype=(torch.float16, torch.float32),
+    )
+    model.latents_mean = torch.tensor(metadata["latents_mean"], dtype=torch.float32, device=device)
+    model.latents_std = torch.tensor(metadata["latents_std"], dtype=torch.float32, device=device)
+    return model
+
+
+def load_audio_vae_decoder(source: Path, device: str | torch.device) -> MiniMaxH3AudioDecoderModel:
+    """Load only the released FP32 audio VAE decoder for sequential inference."""
+    path = resolve_audio_vae_checkpoint(source)
+    metadata = _metadata(path, "minimax_h3_audio_vae")
+    kwargs = metadata.get("kwargs", {})
+    if kwargs.get("decoder_type") not in (None, "bigvgan") or kwargs.get("sample_rate") != 32_000:
+        raise ValueError("unsupported MiniMax H3 audio decoder configuration")
+    with init_empty_weights(include_buffers=False):
+        model = MiniMaxH3AudioDecoderModel(tuple(metadata["latents_mean"]), tuple(metadata["latents_std"]))
+
+    def select(source_key: str) -> str | None:
+        if source_key.startswith(("decoder.", "dec_in_proj.")):
+            return source_key
+        return None
+
+    model = _load_subset(
+        model,
+        path,
+        device=torch.device(device),
+        select_key=select,
+        allowed_ignored_prefixes=("encoder.", "pre_block.", "mean_proj.", "logs_proj."),
         allowed_ignored_keys=frozenset(("latents_mean", "latents_std")),
         required_dtype=torch.float32,
     )

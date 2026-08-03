@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import gc
+import logging
+import time
 from pathlib import Path
 from typing import Any, Literal, NoReturn
 
@@ -20,7 +23,13 @@ from musubi_tuner.minimax_h3.cache import (
     H3_TEXT_HIDDEN_KEY,
     H3_TEXT_TOKEN_TAGS_KEY,
 )
-from musubi_tuner.minimax_h3.component_loader import load_audio_vae_encoder, load_video_vae_encoder
+from musubi_tuner.minimax_h3.component_loader import (
+    load_audio_vae_decoder,
+    load_audio_vae_encoder,
+    load_video_vae_decoder,
+    load_video_vae_encoder,
+)
+from musubi_tuner.minimax_h3.inference import decode_latents_sequentially, denoise_t2va, resolve_canvas_size, save_av_mp4
 from musubi_tuner.minimax_h3.media import MediaModality
 from musubi_tuner.minimax_h3.model import MiniMaxH3TokenTag
 from musubi_tuner.minimax_h3.packing import (
@@ -33,7 +42,11 @@ from musubi_tuner.minimax_h3.packing import (
 )
 from musubi_tuner.minimax_h3.request import H3GenerationRequest
 from musubi_tuner.minimax_h3.training import H3ModelPrediction, H3TrainingMode
+from musubi_tuner.modules.custom_offloading_utils import BlockSwapConfig
+from musubi_tuner.utils.device_utils import clean_memory_on_device
 from musubi_tuner.utils.model_utils import dtype_to_str, str_to_dtype
+
+logger = logging.getLogger(__name__)
 
 
 def _raise_unavailable(component: str) -> NoReturn:
@@ -80,10 +93,255 @@ def create_conditioning_encoder(
     return MiniMaxH3ConditioningEncoder(processor, model, output_dtype, task)
 
 
-def create_generator(*, model: Path, device: str | None, dtype: str, request: H3GenerationRequest):
-    """Load the released inference components and adapt generation to Musubi."""
-    del model, device, dtype, request
-    _raise_unavailable("generation")
+def create_generator(
+    *,
+    model: Path,
+    text_encoder: Path,
+    tokenizer: Path,
+    video_vae: Path,
+    audio_vae: Path,
+    device: str | None,
+    dtype: str,
+    request: H3GenerationRequest,
+    num_inference_steps: int = 20,
+    height: int | None = None,
+    width: int | None = None,
+    fp8_scaled: bool = False,
+    text_encoder_quantization: Literal["none", "int8", "nf4"] = "none",
+    blocks_to_swap: int = 0,
+    block_swap_h2d_only: bool = False,
+    block_swap_ring_size: int = 2,
+    block_swap_granularity: Literal["block", "layer"] = "block",
+    use_pinned_memory_for_block_swap: bool = False,
+    lora_weights: tuple[Path, ...] = (),
+    lora_multipliers: tuple[float, ...] = (),
+):
+    """Create a sequentially-loaded native T2VA generator."""
+    if request.mode != "text_to_video":
+        _raise_unavailable("reference-conditioned generation")
+    if dtype != "bfloat16":
+        raise ValueError("MiniMax H3 native generation requires bfloat16 transformer compute")
+    return _NativeGenerator(
+        model=model,
+        text_encoder=text_encoder,
+        tokenizer=tokenizer,
+        video_vae=video_vae,
+        audio_vae=audio_vae,
+        device=torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu")),
+        num_inference_steps=num_inference_steps,
+        height=height,
+        width=width,
+        fp8_scaled=fp8_scaled,
+        text_encoder_quantization=text_encoder_quantization,
+        blocks_to_swap=blocks_to_swap,
+        block_swap_h2d_only=block_swap_h2d_only,
+        block_swap_ring_size=block_swap_ring_size,
+        block_swap_granularity=block_swap_granularity,
+        use_pinned_memory_for_block_swap=use_pinned_memory_for_block_swap,
+        lora_weights=lora_weights,
+        lora_multipliers=lora_multipliers,
+    )
+
+
+class _NativeGenerator:
+    def __init__(
+        self,
+        *,
+        model: Path,
+        text_encoder: Path,
+        tokenizer: Path,
+        video_vae: Path,
+        audio_vae: Path,
+        device: torch.device,
+        num_inference_steps: int,
+        height: int | None,
+        width: int | None,
+        fp8_scaled: bool,
+        text_encoder_quantization: Literal["none", "int8", "nf4"],
+        blocks_to_swap: int,
+        block_swap_h2d_only: bool,
+        block_swap_ring_size: int,
+        block_swap_granularity: Literal["block", "layer"],
+        use_pinned_memory_for_block_swap: bool,
+        lora_weights: tuple[Path, ...],
+        lora_multipliers: tuple[float, ...],
+    ) -> None:
+        self.model = Path(model)
+        self.text_encoder = Path(text_encoder)
+        self.tokenizer = Path(tokenizer)
+        self.video_vae = Path(video_vae)
+        self.audio_vae = Path(audio_vae)
+        self.device = device
+        self.num_inference_steps = num_inference_steps
+        if (height is None) != (width is None):
+            raise ValueError("MiniMax H3 height and width must be provided together")
+        self.height = height
+        self.width = width
+        self.fp8_scaled = fp8_scaled
+        self.text_encoder_quantization = text_encoder_quantization
+        self.blocks_to_swap = blocks_to_swap
+        self.block_swap_h2d_only = block_swap_h2d_only
+        self.block_swap_ring_size = block_swap_ring_size
+        self.block_swap_granularity = block_swap_granularity
+        self.use_pinned_memory_for_block_swap = use_pinned_memory_for_block_swap
+        self.lora_weights = tuple(Path(path) for path in lora_weights)
+        self.lora_multipliers = lora_multipliers
+
+    def _measure(self, name: str, operation, metrics: dict[str, dict]):
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+            torch.cuda.reset_peak_memory_stats(self.device)
+        started = time.perf_counter()
+        result = operation()
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+        values = {"seconds": time.perf_counter() - started}
+        if self.device.type == "cuda":
+            values.update(
+                allocated_gib=torch.cuda.memory_allocated(self.device) / 2**30,
+                reserved_gib=torch.cuda.memory_reserved(self.device) / 2**30,
+                peak_allocated_gib=torch.cuda.max_memory_allocated(self.device) / 2**30,
+                peak_reserved_gib=torch.cuda.max_memory_reserved(self.device) / 2**30,
+            )
+        metrics[name] = values
+        logger.info("MiniMax H3 inference stage %s: %s", name, values)
+        return result
+
+    def _encode_prompt(self, prompt: str) -> dict[str, torch.Tensor]:
+        encoder = create_conditioning_encoder(
+            text_encoder=self.text_encoder,
+            tokenizer=self.tokenizer,
+            task="t2va",
+            device=str(self.device),
+            dtype="bfloat16",
+            quantization=self.text_encoder_quantization,
+        )
+        conditioning = encoder.encode_prompt(prompt)
+        del encoder
+        gc.collect()
+        clean_memory_on_device(self.device)
+        return conditioning
+
+    def _load_transformer(self):
+        from safetensors.torch import load_file
+
+        from musubi_tuner.minimax_h3.model_loader import load_transformer
+        from musubi_tuner.networks import lora_minimax_h3
+
+        loading_device = torch.device("cpu") if self.blocks_to_swap else self.device
+        transformer = load_transformer(
+            self.model,
+            mode="fl2va",
+            loading_device=loading_device,
+            fp8_scaled=self.fp8_scaled,
+            quantization_device=self.device if self.fp8_scaled else None,
+        )
+        transformer.requires_grad_(False).eval()
+        if self.blocks_to_swap:
+            swap_config = BlockSwapConfig(
+                device=self.device,
+                supports_backward=False,
+                use_pinned_memory=self.use_pinned_memory_for_block_swap,
+                h2d_only=self.block_swap_h2d_only,
+                ring_size=self.block_swap_ring_size,
+                granularity=self.block_swap_granularity,
+            )
+            transformer.enable_block_swap(self.blocks_to_swap, swap_config)
+
+        networks = []
+        for index, weights_path in enumerate(self.lora_weights):
+            multiplier = self.lora_multipliers[index] if index < len(self.lora_multipliers) else 1.0
+            weights = load_file(weights_path)
+            network = lora_minimax_h3.create_arch_network_from_weights(
+                multiplier,
+                weights,
+                unet=transformer,
+                for_inference=True,
+            )
+            network.apply_to(None, transformer, apply_text_encoder=False, apply_unet=True)
+            info = network.load_state_dict(weights, strict=True)
+            if info.missing_keys or info.unexpected_keys:
+                raise RuntimeError(f"strict H3 LoRA load failed: {info}")
+            network.to(self.device).eval()
+            networks.append(network)
+        if self.blocks_to_swap:
+            transformer.move_to_device_except_swap_blocks(self.device)
+            transformer.switch_block_swap_for_inference()
+        else:
+            transformer.to(self.device)
+        return transformer, networks
+
+    @torch.no_grad()
+    def generate(self, request: H3GenerationRequest) -> None:
+        if request.mode != "text_to_video":
+            _raise_unavailable("reference-conditioned generation")
+        metrics: dict[str, dict] = {}
+        total_started = time.perf_counter()
+        conditioning = self._measure("text_conditioning", lambda: self._encode_prompt(request.prompt), metrics)
+        loaded_transformer = self._measure("transformer_load", self._load_transformer, metrics)
+        transformer, networks = loaded_transformer
+        del loaded_transformer
+        height, width = (self.height, self.width) if self.height is not None else resolve_canvas_size(request.ratio)
+        shape = request.temporal_shape
+        generator = torch.Generator(device=self.device).manual_seed(request.seed)
+        video_latents, audio_latents = self._measure(
+            "joint_denoising",
+            lambda: denoise_t2va(
+                transformer,
+                conditioning,
+                height=height,
+                width=width,
+                frame_count=shape.frame_count,
+                num_inference_steps=self.num_inference_steps,
+                generator=generator,
+                device=self.device,
+            ),
+            metrics,
+        )
+        video_latents = video_latents.cpu()
+        audio_latents = audio_latents.cpu()
+        del networks
+        transformer = None
+        gc.collect()
+        clean_memory_on_device(self.device)
+
+        video_decoder, audio_decoder = self._measure(
+            "decoder_load",
+            lambda: (
+                load_video_vae_decoder(self.video_vae, "cpu"),
+                load_audio_vae_decoder(self.audio_vae, "cpu"),
+            ),
+            metrics,
+        )
+        media = self._measure(
+            "sequential_av_decode",
+            lambda: decode_latents_sequentially(
+                video_decoder,
+                audio_decoder,
+                video_latents,
+                audio_latents,
+                self.device,
+            ),
+            metrics,
+        )
+        metrics["total"] = {"seconds": time.perf_counter() - total_started}
+        save_av_mp4(
+            media,
+            request.output,
+            {
+                "prompt": request.prompt,
+                "seed": request.seed,
+                "height": height,
+                "width": width,
+                "frames": shape.frame_count,
+                "fps": media.fps,
+                "sample_rate": media.sample_rate,
+                "sigma_points": self.num_inference_steps,
+                "model_evaluations": self.num_inference_steps - 1,
+                "lora_weights": [path.name for path in self.lora_weights],
+                "metrics": metrics,
+            },
+        )
 
 
 def create_training_backend(

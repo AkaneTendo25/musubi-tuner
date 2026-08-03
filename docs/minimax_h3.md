@@ -50,7 +50,7 @@ video, or audio assets use `control_directory`, `control_path`, or numbered `con
 required.
 
 The released processor uses a 768-pixel short edge with a 1344x768 area cap. Other 32-pixel-aligned dimensions are structurally
-valid, but should be treated as experimental training canvases.
+valid, but are outside the released processor's native canvas distribution.
 
 ```toml
 [general]
@@ -82,8 +82,8 @@ python minimax_h3_cache_text_encoder_outputs.py \\
 
 The default loads Qwen3-VL in BF16. Add `--text_encoder_quantization int8` or
 `--text_encoder_quantization nf4` to quantize its Linear weights directly from the same BF16 checkpoint while loading.
-INT8 is intended for approximately 32 GB GPUs; NF4 targets 24 GB GPUs. Non-Linear parameters and the cached raw
-layer-50 hidden states remain BF16. Both modes are explicit memory/conditioning-precision tradeoffs rather than
+INT8 reduces conditioner weight residency, while NF4 reduces it further. Non-Linear parameters and the cached raw layer-50 hidden
+states remain BF16. Both modes are explicit memory/conditioning-precision tradeoffs rather than
 numerically equivalent replacements for BF16.
 
 The native loader preserves the released component precision: the Comfy video encoder is FP16 and the audio encoder is FP32.
@@ -146,8 +146,8 @@ block swapping can be enabled with the common Musubi options:
 ```
 
 Pinned host memory is strongly recommended for H2D-only swapping: it permits direct asynchronous host-to-device copies and lets
-the two-buffer ring overlap transfers with transformer computation. The unpinned path remains available, but uses staged copies
-and can be substantially slower for H3's unusually large blocks. H2D-only swapping is valid only while the base transformer is
+the two-buffer ring overlap transfers with transformer computation. The unpinned path remains available and uses staged copies.
+H2D-only swapping is valid only while the base transformer is
 frozen; the offloader checks this invariant. Block granularity keeps at least two of H3's 50 transformer blocks resident.
 
 For the lowest transformer-weight residency, the same common offloader can stream individual frozen `Linear` layers:
@@ -173,8 +173,54 @@ H3-specific command-line option.
 The training backend rejects `--h3_training_mode ref2va`. Reference training requires distinct context and target media; a target
 must not be reused as its own reference.
 
+## Inference and sampling during training
+
+The standalone generator uses the same native transformer forward as training. It loads the text encoder, transformer, video
+decoder, and audio decoder sequentially, then writes a synchronized H.264/AAC MP4 and a JSON sidecar containing the prompt,
+geometry, schedule, LoRA names, stage timings, and CUDA memory peaks. The generator supports T2VA; first/last-frame and Ref2VA
+generation are rejected explicitly.
+
+```shell
+python minimax_h3_generate_video.py \
+  --model /path/to/minimax_h3_fl2va_bf16.safetensors \
+  --text_encoder /path/to/qwen3vl_32b_minimax_h3_bf16.safetensors \
+  --tokenizer /path/to/MiniMax-H3/FL2VA/text_encoder \
+  --vae /path/to/minimax_h3_video_vae_fp16.safetensors \
+  --audio_vae /path/to/minimax_h3_audio_vae_fp32.safetensors \
+  --prompt "A traveler walks through a sunlit mountain valley while birds sing in the distance." \
+  --duration 5 --ratio 16:9 --steps 20 --seed 42 \
+  --output output.mp4
+```
+
+Here `--steps 20` follows the released Diffusers scheduler contract: it creates 20 sigma points including terminal zero and runs
+19 transformer evaluations. Add one or more `--lora_weight` options (and matching `--lora_multiplier` values when needed) to
+evaluate saved adapters. The common `--fp8_base` and block-swap options are also available for constrained inference.
+
+For samples during training, add the decoder and conditioner paths plus Musubi's common sampling options to the training command:
+
+```shell
+  --text_encoder /path/to/qwen3vl_32b_minimax_h3_bf16.safetensors \
+  --tokenizer /path/to/MiniMax-H3/FL2VA/text_encoder \
+  --vae /path/to/minimax_h3_video_vae_fp16.safetensors \
+  --audio_vae /path/to/minimax_h3_audio_vae_fp32.safetensors \
+  --sample_prompts sample_prompts.txt \
+  --sample_at_first --sample_every_n_steps 50
+```
+
+An H3 prompt-file entry can use the shared Musubi syntax:
+
+```text
+A traveler walks through a sunlit mountain valley while birds sing in the distance. --w 672 --h 384 --f 124 --d 42 --s 20
+```
+
+Samples are written to `OUTPUT_DIR/sample` as synchronized MP4 files with JSON metric sidecars. Sampling uses the LoRA currently
+attached to the training transformer, so identical prompt and seed settings provide a direct step-by-step learning trace. The
+transformer remains reusable after sampling but is evacuated to CPU before decoding, including any active block-swap ring. The video
+and audio decoders are then moved to the GPU one at a time, after which the inference ring is rebuilt and normal training swap state
+is restored.
+
 The official model card identifies the released weights as CFG-distilled. H3 inference uses one model evaluation per sampling step,
 without a negative-prompt branch. Normal LoRA training therefore uses one conditional
 forward and the model's joint flow target. If an authoritative distillation scale is known, `--h3_guidance_distillation_scale` can
-enable an experimental two-pass guidance-consistent objective using cached empty-text conditioning. This does not reconstruct an
+enable an optional two-pass guidance-consistent objective using cached empty-text conditioning. This does not reconstruct an
 unconditional model or add negative-prompt inference.

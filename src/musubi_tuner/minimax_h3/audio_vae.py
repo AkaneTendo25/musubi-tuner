@@ -346,3 +346,115 @@ class MiniMaxH3AudioEncoderModel(nn.Module):
         mean = self.latents_mean.view(1, -1, 1)
         std = self.latents_std.view(1, -1, 1)
         return (latent - mean) / std
+
+
+class MiniMaxH3AudioAMPBlock(nn.Module):
+    """BigVGAN anti-aliased multi-periodicity residual block."""
+
+    def __init__(self, channels: int, kernel_size: int, dilation: tuple[int, ...]) -> None:
+        super().__init__()
+        self.convs1 = nn.ModuleList(
+            [
+                _wn_conv1d(channels, channels, kernel_size, dilation=value, padding=(kernel_size * value - value) // 2)
+                for value in dilation
+            ]
+        )
+        self.convs2 = nn.ModuleList(
+            [_wn_conv1d(channels, channels, kernel_size, dilation=1, padding=(kernel_size - 1) // 2) for _ in dilation]
+        )
+        self.activations = nn.ModuleList(
+            [MiniMaxH3AudioActivation1d(MiniMaxH3AudioSnakeBeta(channels)) for _ in range(2 * len(dilation))]
+        )
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        for conv1, conv2, activation1, activation2 in zip(
+            self.convs1,
+            self.convs2,
+            self.activations[::2],
+            self.activations[1::2],
+        ):
+            residual = conv2(activation2(conv1(activation1(hidden_states))))
+            hidden_states = hidden_states + residual
+        return hidden_states
+
+
+class MiniMaxH3AudioBigVGANDecoder(nn.Module):
+    """Decode mono latent batches to 32 kHz waveforms."""
+
+    def __init__(
+        self,
+        in_channels: int = 2048,
+        upsample_initial_channel: int = 1024,
+        upsample_rates: tuple[int, ...] = (5, 5, 2, 2, 2, 2, 2),
+        upsample_kernel_sizes: tuple[int, ...] = (9, 9, 4, 4, 4, 4, 4),
+        resblock_kernel_sizes: tuple[int, ...] = (3, 7, 11),
+        resblock_dilation_sizes: tuple[tuple[int, ...], ...] = ((1, 3, 5), (1, 3, 5), (1, 3, 5)),
+    ) -> None:
+        super().__init__()
+        if len(upsample_rates) != len(upsample_kernel_sizes):
+            raise ValueError("MiniMax H3 audio decoder requires one kernel size per upsampling rate")
+        self.num_kernels = len(resblock_kernel_sizes)
+        self.num_upsamples = len(upsample_rates)
+        self.conv_pre = _wn_conv1d(in_channels, upsample_initial_channel, 7, padding=3)
+        self.ups = nn.ModuleList()
+        for index, (rate, kernel) in enumerate(zip(upsample_rates, upsample_kernel_sizes)):
+            self.ups.append(
+                nn.ModuleList(
+                    [
+                        nn.ConvTranspose1d(
+                            upsample_initial_channel // (2**index),
+                            upsample_initial_channel // (2 ** (index + 1)),
+                            kernel,
+                            rate,
+                            padding=(kernel - rate) // 2,
+                        )
+                    ]
+                )
+            )
+
+        self.resblocks = nn.ModuleList()
+        channels = upsample_initial_channel
+        for index in range(self.num_upsamples):
+            channels = upsample_initial_channel // (2 ** (index + 1))
+            for kernel, dilation in zip(resblock_kernel_sizes, resblock_dilation_sizes):
+                self.resblocks.append(MiniMaxH3AudioAMPBlock(channels, kernel, dilation))
+        self.activation_post = MiniMaxH3AudioActivation1d(MiniMaxH3AudioSnakeBeta(channels))
+        self.conv_post = _wn_conv1d(channels, 1, 7, padding=3, bias=False)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        hidden_states = self.conv_pre(hidden_states)
+        for index in range(self.num_upsamples):
+            hidden_states = self.ups[index][0](hidden_states)
+            residual = sum(
+                self.resblocks[index * self.num_kernels + block_index](hidden_states)
+                for block_index in range(self.num_kernels)
+            )
+            hidden_states = residual / self.num_kernels
+        hidden_states = self.conv_post(self.activation_post(hidden_states))
+        return hidden_states.clamp(-1.0, 1.0)
+
+
+class MiniMaxH3AudioDecoderModel(nn.Module):
+    """Decoder-only FP32 MiniMax H3 audio VAE for sequential inference."""
+
+    sample_rate = 32_000
+    hop_length = 800
+
+    def __init__(self, latents_mean: tuple[float, ...], latents_std: tuple[float, ...]) -> None:
+        super().__init__()
+        if len(latents_mean) != 32 or len(latents_std) != 32:
+            raise ValueError("MiniMax H3 audio latent statistics must contain 32 channels")
+        self.dec_in_proj = nn.Conv1d(32, 2048, 1)
+        self.decoder = MiniMaxH3AudioBigVGANDecoder()
+        self.register_buffer("latents_mean", torch.tensor(latents_mean, dtype=torch.float32), persistent=False)
+        self.register_buffer("latents_std", torch.tensor(latents_std, dtype=torch.float32), persistent=False)
+
+    def decode(self, latents: torch.Tensor) -> torch.Tensor:
+        """Decode normalized stereo latents ``[B, 2, 32, T]`` to ``[B, 2, samples]``."""
+        if latents.ndim != 4 or latents.shape[1:3] != (2, 32):
+            raise ValueError(f"audio latents must have shape [B, 2, 32, T], got {tuple(latents.shape)}")
+        batch_size, channels, latent_channels, frames = latents.shape
+        latents = latents.reshape(batch_size * channels, latent_channels, frames).float()
+        latents = latents * self.latents_std.view(1, -1, 1) + self.latents_mean.view(1, -1, 1)
+        waveform = self.decoder(self.dec_in_proj(latents))
+        return waveform.reshape(batch_size, channels, -1).float()

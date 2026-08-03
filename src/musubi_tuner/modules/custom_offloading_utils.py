@@ -4,10 +4,10 @@ import gc
 import time
 import types
 from collections import defaultdict
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Optional
 
 import torch
 from torch import nn
@@ -91,7 +91,7 @@ class BlockSwapConfig:
     debug: bool = False
 
     @classmethod
-    def from_args(cls, args, device: torch.device, supports_backward: bool) -> "BlockSwapConfig":
+    def from_args(cls, args, device: torch.device, supports_backward: bool) -> BlockSwapConfig:
         """Build from a parsed-args namespace, tolerating scripts whose parser lacks the optional knobs."""
         h2d_only = getattr(args, "block_swap_h2d_only", False)
 
@@ -347,10 +347,9 @@ class Offloader:
                 events, self.pinned_buffer, weight_swap_jobs
             ):
                 # CUDA to CPU, non-blocking copy
-                with torch.cuda.stream(self.stream):
-                    with T.section("cuda to cpu"):
-                        module_pin_buf.copy_(cuda_data_view, non_blocking=True)
-                        event.record(self.stream)
+                with torch.cuda.stream(self.stream), T.section("cuda to cpu"):
+                    module_pin_buf.copy_(cuda_data_view, non_blocking=True)
+                    event.record(self.stream)
 
             # CPU to CUDA
             for event, (module_to_cpu, module_to_cuda, cuda_data_view, cpu_data_view) in zip(events, weight_swap_jobs):
@@ -488,12 +487,20 @@ class ModelOffloader(Offloader):
 
         self.forward_only = forward_only
 
+    def offload_to_cpu(self, blocks: list[nn.Module]):
+        """Finish pending swaps and evacuate every block before another large module uses the device."""
+        self.set_forward_only(self.forward_only)
+        _synchronize_device(self.device)
+        for block in blocks:
+            block.to("cpu")
+        _clean_memory_on_device(self.device)
+
     def __del__(self):
         if self.supports_backward:
             for handle in self.remove_handles:
                 handle.remove()
 
-    def create_backward_hook(self, blocks: list[nn.Module], block_index: int) -> Optional[callable]:
+    def create_backward_hook(self, blocks: list[nn.Module], block_index: int) -> Callable | None:
         # -1 for 0-based index
         num_blocks_propagated = self.num_blocks - block_index - 1
         swapping = num_blocks_propagated > 0 and num_blocks_propagated <= self.blocks_to_swap
@@ -515,7 +522,6 @@ class ModelOffloader(Offloader):
                 self._submit_move_blocks(blocks, block_idx_to_cpu, block_idx_to_cuda)
             if waiting:
                 self._wait_blocks_move(block_idx_to_wait)
-            return None
 
         return backward_hook
 
@@ -948,7 +954,42 @@ class LoRALinearStreamOffloader:
         self.copier.sync()
         self.forward_only = forward_only
 
+    def offload_to_cpu(self, blocks: list[nn.Module]):
+        """Release the layer ring and evacuate non-streamed block state to CPU."""
+        self.copier.sync()
+        _synchronize_device(self.device)
+        for block in blocks:
+            block.to("cpu")
+        self.ring_flat = None
+        self.in_slot = [None] * self.B
+        self.free_event = [None] * self.B
+        self.copier.reset()
+        self._suspended = True
+        _clean_memory_on_device(self.device)
+
+    def _restore_blocks_after_suspend(self, blocks: list[nn.Module]) -> None:
+        saved_payloads = []
+        for layer in self.layers:
+            scale_weight = getattr(layer, "scale_weight", None)
+            saved_payloads.append((layer, layer.weight, layer.bias, scale_weight))
+            layer.weight = None
+            layer.bias = None
+            if "scale_weight" in layer._buffers:
+                layer._buffers["scale_weight"] = None
+        try:
+            for block in blocks:
+                block.to(self.device)
+        finally:
+            for layer, weight, bias, scale_weight in saved_payloads:
+                layer.weight = weight
+                layer.bias = bias
+                if "scale_weight" in layer._buffers:
+                    layer._buffers["scale_weight"] = scale_weight
+        self._suspended = False
+
     def prepare_block_devices_before_forward(self, blocks: list[nn.Module]):
+        if getattr(self, "_suspended", False):
+            self._restore_blocks_after_suspend(blocks)
         if not self._prepared:
             cpu_device = torch.device("cpu")
             max_bytes = 0
@@ -979,8 +1020,10 @@ class LoRALinearStreamOffloader:
             if layer_rank != len(self.layers):
                 raise RuntimeError(f"prepared {layer_rank} streamed Linear layers, expected {len(self.layers)}")
             self.copier.reserve(max_bytes)
-            self.ring_flat = [torch.empty(max_bytes, dtype=torch.uint8, device=self.device) for _ in range(self.B)]
             self._prepared = True
+        if self.ring_flat is None:
+            max_bytes = max(flat.numel() for flat in self.cpu_flat)
+            self.ring_flat = [torch.empty(max_bytes, dtype=torch.uint8, device=self.device) for _ in range(self.B)]
         self.free_event = [None] * self.B
         self.copier.reset()
         for rank in range(self.B):
@@ -1188,6 +1231,39 @@ class LoRAStreamOffloader:
         self.copier.sync()
         self.forward_only = forward_only
 
+    def offload_to_cpu(self, blocks: list[nn.Module]):
+        """Release the block ring and evacuate resident block state to CPU."""
+        self.copier.sync()
+        _synchronize_device(self.device)
+        for block_index in self.stream_idx:
+            self._bind(block_index, self.cpu_master[block_index])
+        for block in blocks:
+            block.to("cpu")
+        self.ring_param = None
+        self.ring_flat = None
+        self.in_slot = [None] * self.B
+        self.free_event = [None] * self.B
+        self.copier.reset()
+        self._suspended = True
+        _clean_memory_on_device(self.device)
+
+    def _restore_blocks_after_suspend(self, blocks: list[nn.Module]) -> None:
+        for block_index, block in enumerate(blocks):
+            if not self.is_stream[block_index]:
+                block.to(self.device)
+                weighs_to_device(block, self.device)
+                continue
+            modules = self._modules(block_index)
+            weights = [module.weight for module in modules]
+            for module in modules:
+                module.weight = None
+            try:
+                block.to(self.device)
+            finally:
+                for module, weight in zip(modules, weights):
+                    module.weight = weight
+        self._suspended = False
+
     def __del__(self):
         if getattr(self, "supports_backward", False):
             for handle in getattr(self, "remove_handles", []):
@@ -1196,6 +1272,9 @@ class LoRAStreamOffloader:
     def prepare_block_devices_before_forward(self, blocks: list[nn.Module]):
         if self.S == 0:
             return
+
+        if getattr(self, "_suspended", False):
+            self._restore_blocks_after_suspend(blocks)
 
         if self.debug:
             print(f"[{self.block_type}] Prepare block devices before forward (H2D-only)")
@@ -1333,7 +1412,6 @@ class LoRAStreamOffloader:
                 self._wait_ctx = "bwd"
                 self.wait_for_block(block_index - 1)  # ensure the next block to run is ready
                 self._wait_ctx = "fwd"
-            return None
 
         return backward_hook
 

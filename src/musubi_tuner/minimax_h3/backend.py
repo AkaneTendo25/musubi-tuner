@@ -96,12 +96,55 @@ def create_conditioning_encoder(
     )
 
 
-def create_generator(*, model: Path, device: str | None, dtype: str, request: H3GenerationRequest) -> H3Generator:
+def create_generator(
+    *,
+    model: Path,
+    text_encoder: Path,
+    tokenizer: Path,
+    video_vae: Path,
+    audio_vae: Path,
+    device: str | None,
+    dtype: str,
+    request: H3GenerationRequest,
+    num_inference_steps: int = 20,
+    height: int | None = None,
+    width: int | None = None,
+    fp8_scaled: bool = False,
+    text_encoder_quantization: Literal["none", "int8", "nf4"] = "none",
+    blocks_to_swap: int = 0,
+    block_swap_h2d_only: bool = False,
+    block_swap_ring_size: int = 2,
+    block_swap_granularity: Literal["block", "layer"] = "block",
+    use_pinned_memory_for_block_swap: bool = False,
+    lora_weights: tuple[Path, ...] = (),
+    lora_multipliers: tuple[float, ...] = (),
+) -> H3Generator:
     """Load only the inference variant and components required by the request."""
     _validate_dtype(dtype)
     from musubi_tuner.minimax_h3.integration import create_generator as create_integrated_generator
 
-    return create_integrated_generator(model=model, device=device, dtype=dtype, request=request)
+    return create_integrated_generator(
+        model=model,
+        text_encoder=text_encoder,
+        tokenizer=tokenizer,
+        video_vae=video_vae,
+        audio_vae=audio_vae,
+        device=device,
+        dtype=dtype,
+        request=request,
+        num_inference_steps=num_inference_steps,
+        height=height,
+        width=width,
+        fp8_scaled=fp8_scaled,
+        text_encoder_quantization=text_encoder_quantization,
+        blocks_to_swap=blocks_to_swap,
+        block_swap_h2d_only=block_swap_h2d_only,
+        block_swap_ring_size=block_swap_ring_size,
+        block_swap_granularity=block_swap_granularity,
+        use_pinned_memory_for_block_swap=use_pinned_memory_for_block_swap,
+        lora_weights=lora_weights,
+        lora_multipliers=lora_multipliers,
+    )
 
 
 def create_training_backend(

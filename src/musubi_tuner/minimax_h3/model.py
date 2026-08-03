@@ -348,8 +348,7 @@ class MiniMaxH3Transformer(nn.Module):
         max_blocks_to_swap = num_blocks if layer_streaming else num_blocks - 2
         if blocks_to_swap > max_blocks_to_swap:
             raise ValueError(
-                f"MiniMax H3 cannot swap more than {max_blocks_to_swap} of {num_blocks} blocks; "
-                f"requested {blocks_to_swap}"
+                f"MiniMax H3 cannot swap more than {max_blocks_to_swap} of {num_blocks} blocks; requested {blocks_to_swap}"
             )
         self.blocks_to_swap = blocks_to_swap
         self.offloader = create_offloader(
@@ -367,6 +366,16 @@ class MiniMaxH3Transformer(nn.Module):
         self.to(device)
         if self.blocks_to_swap:
             self.blocks = saved_blocks
+
+    def offload_block_swap_to_cpu(self) -> None:
+        """Evacuate the transformer, including the active swap ring, between sequential inference stages."""
+        if not self.blocks_to_swap:
+            self.to("cpu")
+            return
+        if self.offloader is None:
+            raise RuntimeError("MiniMax H3 block swap is enabled without an offloader")
+        self.offloader.offload_to_cpu(self.blocks)
+        self.move_to_device_except_swap_blocks(torch.device("cpu"))
 
     def prepare_block_swap_before_forward(self) -> None:
         if not self.blocks_to_swap:

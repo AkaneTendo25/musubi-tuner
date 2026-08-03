@@ -149,9 +149,7 @@ def _quantize_tiny_h3_state(model: MiniMaxH3Transformer) -> dict[str, torch.Tens
     return state_dict
 
 
-def _load_tiny_h3_scaled_fp8(
-    config: MiniMaxH3TransformerConfig, state_dict: dict[str, torch.Tensor]
-) -> MiniMaxH3Transformer:
+def _load_tiny_h3_scaled_fp8(config: MiniMaxH3TransformerConfig, state_dict: dict[str, torch.Tensor]) -> MiniMaxH3Transformer:
     model = MiniMaxH3Transformer(config)
     cloned_state = {name: tensor.detach().clone() for name, tensor in state_dict.items()}
     apply_fp8_monkey_patch(model, cloned_state, use_scaled_mm=False)
@@ -177,6 +175,9 @@ def test_h3_block_swap_uses_complete_offloader_lifecycle(monkeypatch):
         def set_forward_only(self, value):
             events.append(("forward_only", value))
 
+        def offload_to_cpu(self, blocks):
+            events.append(("offload", len(blocks)))
+
     captured = {}
 
     def fake_create_offloader(block_type, blocks, num_blocks, blocks_to_swap, config):
@@ -198,6 +199,7 @@ def test_h3_block_swap_uses_complete_offloader_lifecycle(monkeypatch):
     model.move_to_device_except_swap_blocks(torch.device("cpu"))
     model.prepare_block_swap_before_forward()
     model.switch_block_swap_for_inference()
+    model.offload_block_swap_to_cpu()
     model.switch_block_swap_for_training()
 
     assert captured == {
@@ -207,10 +209,11 @@ def test_h3_block_swap_uses_complete_offloader_lifecycle(monkeypatch):
         "blocks_to_swap": 2,
         "config": swap_config,
     }
-    assert events[:5] == [
+    assert events[:6] == [
         ("prepare", 4),
         ("forward_only", True),
         ("prepare", 4),
+        ("offload", 4),
         ("forward_only", False),
         ("prepare", 4),
     ]
@@ -296,9 +299,7 @@ def test_layer_granularity_requires_h2d_only():
         (True, 2, True, "layer", 4),
     ],
 )
-def test_h3_real_block_swap_forward_backward_parity(
-    h2d_only, ring_size, use_pinned_memory, granularity, blocks_to_swap
-):
+def test_h3_real_block_swap_forward_backward_parity(h2d_only, ring_size, use_pinned_memory, granularity, blocks_to_swap):
     torch.manual_seed(3)
     device = torch.device("cuda")
     config = _tiny_config(num_layers=4)
@@ -312,9 +313,7 @@ def test_h3_real_block_swap_forward_backward_parity(
     reference.requires_grad_(False)
     reference.enable_gradient_checkpointing()
     reference_inputs = {
-        key: value.to(device).requires_grad_(key == "encoder_hidden_states")
-        if value.is_floating_point()
-        else value.to(device)
+        key: value.to(device).requires_grad_(key == "encoder_hidden_states") if value.is_floating_point() else value.to(device)
         for key, value in source_inputs.items()
     }
     reference_output = reference(**reference_inputs)
@@ -341,10 +340,22 @@ def test_h3_real_block_swap_forward_backward_parity(
     swapped.enable_block_swap(blocks_to_swap, swap_config)
     swapped.move_to_device_except_swap_blocks(device)
     swapped.prepare_block_swap_before_forward()
+    swapped.switch_block_swap_for_inference()
+    with torch.no_grad():
+        sample_inputs = {key: value.to(device) for key, value in source_inputs.items()}
+        sample_output = swapped(**sample_inputs)
+    torch.testing.assert_close(sample_output.video, reference_video)
+    torch.testing.assert_close(sample_output.audio, reference_audio)
+    del sample_inputs, sample_output
+
+    swapped.offload_block_swap_to_cpu()
+    assert all(parameter.device.type == "cpu" for parameter in swapped.parameters())
+    if hasattr(swapped.offloader, "ring_flat"):
+        assert swapped.offloader.ring_flat is None
+    swapped.move_to_device_except_swap_blocks(device)
+    swapped.switch_block_swap_for_training()
     swapped_inputs = {
-        key: value.to(device).requires_grad_(key == "encoder_hidden_states")
-        if value.is_floating_point()
-        else value.to(device)
+        key: value.to(device).requires_grad_(key == "encoder_hidden_states") if value.is_floating_point() else value.to(device)
         for key, value in source_inputs.items()
     }
     swapped_output = swapped(**swapped_inputs)
@@ -373,9 +384,7 @@ def test_h3_scaled_fp8_block_swap_forward_backward_parity(h2d_only, use_pinned_m
 
     reference = _load_tiny_h3_scaled_fp8(config, quantized_state).to(device)
     reference_inputs = {
-        key: value.to(device).requires_grad_(key == "encoder_hidden_states")
-        if value.is_floating_point()
-        else value.to(device)
+        key: value.to(device).requires_grad_(key == "encoder_hidden_states") if value.is_floating_point() else value.to(device)
         for key, value in source_inputs.items()
     }
     reference_output = reference(**reference_inputs)
@@ -399,10 +408,22 @@ def test_h3_scaled_fp8_block_swap_forward_backward_parity(h2d_only, use_pinned_m
     swapped.enable_block_swap(blocks_to_swap, swap_config)
     swapped.move_to_device_except_swap_blocks(device)
     swapped.prepare_block_swap_before_forward()
+    swapped.switch_block_swap_for_inference()
+    with torch.no_grad():
+        sample_inputs = {key: value.to(device) for key, value in source_inputs.items()}
+        sample_output = swapped(**sample_inputs)
+    torch.testing.assert_close(sample_output.video, reference_video)
+    torch.testing.assert_close(sample_output.audio, reference_audio)
+    del sample_inputs, sample_output
+
+    swapped.offload_block_swap_to_cpu()
+    assert all(parameter.device.type == "cpu" for parameter in swapped.parameters())
+    if hasattr(swapped.offloader, "ring_flat"):
+        assert swapped.offloader.ring_flat is None
+    swapped.move_to_device_except_swap_blocks(device)
+    swapped.switch_block_swap_for_training()
     swapped_inputs = {
-        key: value.to(device).requires_grad_(key == "encoder_hidden_states")
-        if value.is_floating_point()
-        else value.to(device)
+        key: value.to(device).requires_grad_(key == "encoder_hidden_states") if value.is_floating_point() else value.to(device)
         for key, value in source_inputs.items()
     }
     swapped_output = swapped(**swapped_inputs)

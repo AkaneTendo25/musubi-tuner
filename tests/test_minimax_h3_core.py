@@ -566,10 +566,26 @@ def test_cache_cli_uses_native_musubi_dataset_config(tmp_path):
     assert quantized_text_args.text_encoder_quantization == "nf4"
 
 
-def test_h3_cache_and_generation_parsers_do_not_advertise_unimplemented_loading_modes():
+def test_h3_cache_parsers_do_not_advertise_transformer_loading_modes():
     unsupported = {"--fp8", "--fp8_scaled", "--fp8_text_encoder", "--int8", "--allow_prequantized_fp8", "--blocks_to_swap"}
-    for parser in (create_cache_latents_parser(), create_cache_text_parser(), create_parser()):
+    for parser in (create_cache_latents_parser(), create_cache_text_parser()):
         assert unsupported.isdisjoint(parser._option_string_actions)
+
+
+def test_h3_generation_parser_exposes_native_inference_controls():
+    parser = create_parser()
+    for option in (
+        "--text_encoder",
+        "--tokenizer",
+        "--vae",
+        "--audio_vae",
+        "--fp8_base",
+        "--blocks_to_swap",
+        "--block_swap_granularity",
+        "--lora_weight",
+    ):
+        assert option in parser._option_string_actions
+    assert "--fp8_scaled" not in parser._option_string_actions
 
 
 @pytest.mark.parametrize(
@@ -581,7 +597,6 @@ def test_h3_cache_and_generation_parsers_do_not_advertise_unimplemented_loading_
             {"text_encoder": Path("text"), "tokenizer": Path("tokenizer")},
             {"task": "t2va", "quantization": "none"},
         ),
-        ("create_generator", {"model": Path("model")}, {"request": H3GenerationRequest("prompt", Path("out.mp4"))}),
         (
             "create_training_backend",
             {"model": Path("model")},
@@ -609,3 +624,36 @@ def test_h3_component_factories_route_only_explicit_loading_inputs(monkeypatch, 
 
     assert result is sentinel
     assert captured == {**inputs, "device": "cpu", "dtype": "float32", **extra}
+
+
+def test_h3_generator_factory_routes_all_native_components(monkeypatch):
+    sentinel = object()
+    captured = {}
+
+    def create_component(**kwargs):
+        captured.update(kwargs)
+        return sentinel
+
+    monkeypatch.setattr(h3_integration, "create_generator", create_component)
+    request = H3GenerationRequest("prompt", Path("out.mp4"))
+    result = h3_backend.create_generator(
+        model=Path("model"),
+        text_encoder=Path("text"),
+        tokenizer=Path("tokenizer"),
+        video_vae=Path("video"),
+        audio_vae=Path("audio"),
+        device="cpu",
+        dtype="bfloat16",
+        request=request,
+    )
+
+    assert result is sentinel
+    assert captured["model"] == Path("model")
+    assert captured["text_encoder"] == Path("text")
+    assert captured["tokenizer"] == Path("tokenizer")
+    assert captured["video_vae"] == Path("video")
+    assert captured["audio_vae"] == Path("audio")
+    assert captured["request"] is request
+    assert captured["num_inference_steps"] == 20
+    assert captured["fp8_scaled"] is False
+    assert captured["blocks_to_swap"] == 0

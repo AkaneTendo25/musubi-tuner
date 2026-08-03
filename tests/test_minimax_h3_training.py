@@ -695,3 +695,49 @@ def test_h3_training_parser_defaults_to_native_fl2va_contract():
     assert "--fp8_scaled" not in parser._option_string_actions
     assert "--int8" not in parser._option_string_actions
     assert "--allow_prequantized_fp8" not in parser._option_string_actions
+
+
+def test_h3_training_sampling_evacuates_and_restores_block_swap(monkeypatch):
+    events = []
+
+    class FakeTransformer:
+        def offload_block_swap_to_cpu(self):
+            events.append("offload")
+
+        def move_to_device_except_swap_blocks(self, device):
+            events.append(("restore", device.type))
+
+        def switch_block_swap_for_inference(self):
+            events.append("inference")
+
+    def fake_denoise(*args, **kwargs):
+        del args, kwargs
+        events.append("denoise")
+        return torch.zeros(1), torch.zeros(1)
+
+    def fake_decode(*args, **kwargs):
+        del args, kwargs
+        events.append("decode")
+        return SimpleNamespace(video=torch.zeros(1), audio=torch.zeros(1), sample_rate=32_000)
+
+    monkeypatch.setattr(h3_train_network, "denoise_t2va", fake_denoise)
+    monkeypatch.setattr(h3_train_network, "decode_latents_sequentially", fake_decode)
+
+    trainer = MiniMaxH3NetworkTrainer()
+    trainer.blocks_to_swap = 2
+    trainer._generate_sample(
+        SimpleNamespace(device=torch.device("cpu")),
+        FakeTransformer(),
+        SimpleNamespace(video_decoder=object(), audio_decoder=object()),
+        {
+            "height": 32,
+            "width": 32,
+            "frame_count": 5,
+            "sample_steps": 3,
+            "seed": 1,
+            H3_TEXT_HIDDEN_KEY: torch.zeros(1, 5120),
+            H3_TEXT_TOKEN_TAGS_KEY: torch.ones(1, dtype=torch.long),
+        },
+    )
+
+    assert events == ["denoise", "offload", "decode", ("restore", "cpu"), "inference"]
