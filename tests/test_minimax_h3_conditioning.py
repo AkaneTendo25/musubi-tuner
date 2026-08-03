@@ -21,7 +21,12 @@ class _Tokenizer:
         return {"input_ids": list(range(length))}
 
     def convert_tokens_to_ids(self, token):
-        return {"<|vision_start|>": 100, "<|image_pad|>": 101, "<|vision_end|>": 102}[token]
+        return {
+            "<|vision_start|>": 100,
+            "<|image_pad|>": 101,
+            "<|vision_end|>": 102,
+            "<|video_pad|>": 103,
+        }[token]
 
 
 class _ImageProcessor:
@@ -45,6 +50,7 @@ class _TextModel(torch.nn.Module):
         super().__init__()
         self.anchor = torch.nn.Parameter(torch.zeros(()), requires_grad=False)
         self.config = SimpleNamespace(text_config=SimpleNamespace(hidden_size=5120))
+        self.last_mm_token_type_ids = None
 
     @property
     def device(self):
@@ -54,14 +60,16 @@ class _TextModel(torch.nn.Module):
     def dtype(self):
         return torch.bfloat16
 
-    def forward(self, input_ids, attention_mask, **kwargs):
+    def forward(self, input_ids, attention_mask, mm_token_type_ids, **kwargs):
         del attention_mask, kwargs
+        self.last_mm_token_type_ids = mm_token_type_ids.detach().cpu()
         shape = (input_ids.shape[0], input_ids.shape[1], self.config.text_config.hidden_size)
         return SimpleNamespace(last_hidden_state=torch.ones(shape, dtype=torch.bfloat16))
 
 
 def test_conditioning_cache_is_raw_text_rows_with_text_tags():
-    encoder = MiniMaxH3ConditioningEncoder(_Processor(), _TextModel(), torch.bfloat16, "t2va")
+    model = _TextModel()
+    encoder = MiniMaxH3ConditioningEncoder(_Processor(), model, torch.bfloat16, "t2va")
     item = SimpleNamespace(caption="two tokens")
     result = encoder.encode_conditioning([item])[0]
 
@@ -70,6 +78,7 @@ def test_conditioning_cache_is_raw_text_rows_with_text_tags():
     assert hidden.shape == (2, 5120)
     assert hidden.dtype is torch.bfloat16
     assert torch.equal(tags, torch.ones(2, dtype=torch.long))
+    assert torch.equal(model.last_mm_token_type_ids, torch.zeros(1, 2, dtype=torch.long))
 
 
 def test_empty_conditioning_is_a_zero_row_sequence():
@@ -83,7 +92,8 @@ def test_empty_conditioning_is_a_zero_row_sequence():
 
 
 def test_fl2va_conditioning_includes_first_last_vision_rows():
-    encoder = MiniMaxH3ConditioningEncoder(_Processor(), _TextModel(), torch.bfloat16, "fl2va")
+    model = _TextModel()
+    encoder = MiniMaxH3ConditioningEncoder(_Processor(), model, torch.bfloat16, "fl2va")
     content = np.zeros((2, 4, 4, 3), dtype=np.uint8)
     result = encoder.encode_conditioning([SimpleNamespace(caption="prompt", content=content)])[0]
 
@@ -91,6 +101,7 @@ def test_fl2va_conditioning_includes_first_last_vision_rows():
     tags = result[f"varlen_{H3_TEXT_TOKEN_TAGS_KEY}_int64"]
     assert hidden.shape == (11, 5120)
     assert torch.equal(tags, torch.tensor([1, 1, 0, 0, 0, 1, 1, 0, 0, 0, 1]))
+    assert torch.equal(model.last_mm_token_type_ids, torch.tensor([[0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0]]))
     assert encoder.conditioning_requires_content
 
 

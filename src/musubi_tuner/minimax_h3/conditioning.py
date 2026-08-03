@@ -130,10 +130,16 @@ class MiniMaxH3ConditioningEncoder:
         if len(token_ids) > 32_768:
             raise ValueError(f"MiniMax H3 Qwen3-VL presentation has {len(token_ids)} tokens; maximum is 32768")
         input_ids = torch.tensor([token_ids], dtype=torch.long, device=self.model.device)
+        mm_token_type_ids = torch.zeros_like(input_ids)
+        image_pad_id = self.tokenizer.convert_tokens_to_ids("<|image_pad|>")
+        video_pad_id = self.tokenizer.convert_tokens_to_ids("<|video_pad|>")
+        mm_token_type_ids[input_ids == image_pad_id] = 1
+        mm_token_type_ids[input_ids == video_pad_id] = 2
         with torch.no_grad():
             hidden = self.model(
                 input_ids=input_ids,
                 attention_mask=torch.ones_like(input_ids),
+                mm_token_type_ids=mm_token_type_ids,
                 pixel_values=None if pixel_values is None else pixel_values.to(self.model.device, dtype=self.model.dtype),
                 image_grid_thw=None if image_grid_thw is None else image_grid_thw.to(self.model.device),
                 use_cache=False,
