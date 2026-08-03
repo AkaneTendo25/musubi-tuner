@@ -10,7 +10,7 @@ from accelerate import init_empty_weights
 from PIL import Image
 from safetensors import safe_open
 from torch import nn
-from transformers import AutoProcessor, Qwen3VLConfig, Qwen3VLModel
+from transformers import AutoProcessor, BitsAndBytesConfig, Qwen3VLConfig, Qwen3VLModel
 
 from musubi_tuner.minimax_h3.cache import (
     H3_EMPTY_TEXT_HIDDEN_KEY,
@@ -24,28 +24,17 @@ from musubi_tuner.utils.model_utils import dtype_to_str
 
 logger = logging.getLogger(__name__)
 
+H3TextEncoderQuantization = Literal["none", "int8", "nf4"]
 
-def load_text_conditioner(
-    checkpoint: Path,
-    tokenizer: Path,
+
+def _mapped_text_encoder_state_dict(
+    checkpoint_path: Path,
+    expected: set[str],
     *,
-    device: str | torch.device,
-    dtype: torch.dtype,
-) -> tuple[Any, Qwen3VLModel]:
-    if dtype is not torch.bfloat16:
-        raise ValueError("MiniMax H3 Qwen3-VL conditioning requires bfloat16")
-    checkpoint_path, _ = text_encoder_metadata(checkpoint)
-    full_config = Qwen3VLConfig.from_pretrained(tokenizer, local_files_only=True)
-    full_config.text_config.num_hidden_layers = 50
-    full_config.text_config.use_cache = False
-    with init_empty_weights(include_buffers=True):
-        model = Qwen3VLModel(full_config)
-        model.language_model.norm = nn.Identity()
-
-    expected = set(model.state_dict())
+    device: torch.device,
+) -> dict[str, torch.Tensor]:
     state_dict: dict[str, torch.Tensor] = {}
-    target_device = torch.device(device)
-    with safe_open(checkpoint_path, framework="pt", device=str(target_device)) as handle:
+    with safe_open(checkpoint_path, framework="pt", device=str(device)) as handle:
         for source_key in handle.keys():  # noqa: SIM118 - safetensors.safe_open is not iterable
             if source_key.startswith("visual."):
                 target_key = source_key
@@ -62,9 +51,90 @@ def load_text_conditioner(
     missing = sorted(expected - set(state_dict))
     if missing:
         raise ValueError(f"{checkpoint_path.name} is missing {len(missing)} text tensor(s), examples: {missing[:5]}")
-    info = model.load_state_dict(state_dict, strict=True, assign=True)
-    if info.missing_keys or info.unexpected_keys:
-        raise RuntimeError(f"strict Qwen3-VL load failed: {info}")
+    return state_dict
+
+
+def _load_bnb_text_conditioner(
+    full_config: Qwen3VLConfig,
+    state_dict: dict[str, torch.Tensor],
+    target_device: torch.device,
+    quantization: Literal["int8", "nf4"],
+) -> Qwen3VLModel:
+    if target_device.type != "cuda":
+        raise ValueError("MiniMax H3 bitsandbytes text-encoder quantization requires a CUDA device")
+    if quantization == "int8":
+        quantization_config = BitsAndBytesConfig(load_in_8bit=True)
+    else:
+        quantization_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=torch.bfloat16,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_use_double_quant=True,
+        )
+
+    # Qwen3VLModel constructs its final RMSNorm even though H3 removes it to
+    # consume the raw layer-50 state. Supply a disposable value so Transformers
+    # can still report a clean, fully accounted load before we replace the norm.
+    state_dict["language_model.norm.weight"] = torch.ones(
+        full_config.text_config.hidden_size,
+        dtype=torch.bfloat16,
+    )
+
+    model, loading_info = Qwen3VLModel.from_pretrained(
+        None,
+        config=full_config,
+        state_dict=state_dict,
+        quantization_config=quantization_config,
+        device_map={"": target_device},
+        dtype=torch.bfloat16,
+        local_files_only=True,
+        output_loading_info=True,
+    )
+    # H3 deliberately consumes the unnormalized layer-50 hidden state, so the
+    # final Qwen RMSNorm is absent from the released conditioner checkpoint.
+    missing = set(loading_info["missing_keys"])
+    if missing or loading_info["unexpected_keys"] or loading_info["mismatched_keys"] or loading_info["error_msgs"]:
+        raise RuntimeError(
+            "strict quantized Qwen3-VL load failed: "
+            f"missing={sorted(missing)[:5]}, unexpected={loading_info['unexpected_keys'][:5]}, "
+            f"mismatched={loading_info['mismatched_keys'][:5]}, errors={loading_info['error_msgs'][:5]}"
+        )
+    model.language_model.norm = nn.Identity()
+    return model
+
+
+def load_text_conditioner(
+    checkpoint: Path,
+    tokenizer: Path,
+    *,
+    device: str | torch.device,
+    dtype: torch.dtype,
+    quantization: H3TextEncoderQuantization = "none",
+) -> tuple[Any, Qwen3VLModel]:
+    if dtype is not torch.bfloat16:
+        raise ValueError("MiniMax H3 Qwen3-VL conditioning requires bfloat16")
+    if quantization not in ("none", "int8", "nf4"):
+        raise ValueError(f"unsupported MiniMax H3 text-encoder quantization: {quantization}")
+    checkpoint_path, _ = text_encoder_metadata(checkpoint)
+    full_config = Qwen3VLConfig.from_pretrained(tokenizer, local_files_only=True)
+    full_config.text_config.num_hidden_layers = 50
+    full_config.text_config.use_cache = False
+    with init_empty_weights(include_buffers=True):
+        model = Qwen3VLModel(full_config)
+        model.language_model.norm = nn.Identity()
+
+    expected = set(model.state_dict())
+    target_device = torch.device(device)
+    checkpoint_device = target_device if quantization == "none" else torch.device("cpu")
+    state_dict = _mapped_text_encoder_state_dict(checkpoint_path, expected, device=checkpoint_device)
+    if quantization == "none":
+        info = model.load_state_dict(state_dict, strict=True, assign=True)
+        if info.missing_keys or info.unexpected_keys:
+            raise RuntimeError(f"strict Qwen3-VL load failed: {info}")
+    else:
+        del model
+        model = _load_bnb_text_conditioner(full_config, state_dict, target_device, quantization)
+    del state_dict
     vision_config = full_config.vision_config
     vision_head_dim = vision_config.hidden_size // vision_config.num_heads
     model.visual.rotary_pos_emb = type(model.visual.rotary_pos_emb)(vision_head_dim // 2).to(target_device)
@@ -75,8 +145,8 @@ def load_text_conditioner(
     model.requires_grad_(False).eval()
     processor = AutoProcessor.from_pretrained(tokenizer, local_files_only=True, use_fast=True)
     logger.info(
-        "Loaded raw-layer-50 Qwen3-VL conditioner: %d tensors on %s",
-        len(state_dict),
+        "Loaded raw-layer-50 Qwen3-VL conditioner using %s weights on %s",
+        quantization,
         target_device,
     )
     return processor, model
@@ -136,15 +206,22 @@ class MiniMaxH3ConditioningEncoder:
         mm_token_type_ids[input_ids == image_pad_id] = 1
         mm_token_type_ids[input_ids == video_pad_id] = 2
         with torch.no_grad():
-            hidden = self.model(
-                input_ids=input_ids,
-                attention_mask=torch.ones_like(input_ids),
-                mm_token_type_ids=mm_token_type_ids,
-                pixel_values=None if pixel_values is None else pixel_values.to(self.model.device, dtype=self.model.dtype),
-                image_grid_thw=None if image_grid_thw is None else image_grid_thw.to(self.model.device),
-                use_cache=False,
-                return_dict=True,
-            ).last_hidden_state[0]
+            bnb_logger = logging.getLogger("bitsandbytes.autograd._functions")
+            previous_bnb_level = bnb_logger.level
+            if getattr(self.model, "is_loaded_in_8bit", False):
+                bnb_logger.setLevel(logging.ERROR)
+            try:
+                hidden = self.model(
+                    input_ids=input_ids,
+                    attention_mask=torch.ones_like(input_ids),
+                    mm_token_type_ids=mm_token_type_ids,
+                    pixel_values=None if pixel_values is None else pixel_values.to(self.model.device, dtype=self.model.dtype),
+                    image_grid_thw=None if image_grid_thw is None else image_grid_thw.to(self.model.device),
+                    use_cache=False,
+                    return_dict=True,
+                ).last_hidden_state[0]
+            finally:
+                bnb_logger.setLevel(previous_bnb_level)
         hidden = hidden.to(dtype=self.output_dtype, device="cpu")
         tags = torch.tensor(token_tags, dtype=torch.long)
         return hidden, tags

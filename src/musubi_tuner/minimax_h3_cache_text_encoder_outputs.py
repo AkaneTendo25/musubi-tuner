@@ -29,6 +29,12 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     )
     parser.add_argument("--text_encoder_dtype", default="bfloat16")
     parser.add_argument(
+        "--text_encoder_quantization",
+        choices=("none", "int8", "nf4"),
+        default="none",
+        help="quantize Qwen3-VL Linear weights while loading; INT8 targets 32 GB GPUs and NF4 targets 24 GB GPUs",
+    )
+    parser.add_argument(
         "--cache_guidance_empty",
         action="store_true",
         help="also cache H3's empty-text conditioning for the optional guidance-consistent training objective",
@@ -58,6 +64,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         task=args.task,
         device=str(device),
         dtype=args.text_encoder_dtype,
+        quantization=args.text_encoder_quantization,
     )
 
     def encode(batch: list[ItemInfo]) -> None:

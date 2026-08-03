@@ -64,6 +64,7 @@ def create_conditioning_encoder(
     task: Literal["t2va", "fl2va"],
     device: str | None,
     dtype: str,
+    quantization: Literal["none", "int8", "nf4"] = "none",
 ):
     """Load the released understanding encoder and adapt its hidden-state output to Musubi."""
     from musubi_tuner.minimax_h3.conditioning import MiniMaxH3ConditioningEncoder, load_text_conditioner
@@ -74,6 +75,7 @@ def create_conditioning_encoder(
         tokenizer,
         device=device or "cpu",
         dtype=output_dtype,
+        quantization=quantization,
     )
     return MiniMaxH3ConditioningEncoder(processor, model, output_dtype, task)
 

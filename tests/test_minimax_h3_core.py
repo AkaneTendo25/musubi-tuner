@@ -549,6 +549,21 @@ def test_cache_cli_uses_native_musubi_dataset_config(tmp_path):
         ]
     )
     assert text_args.task == "t2va"
+    assert text_args.text_encoder_quantization == "none"
+
+    quantized_text_args = create_cache_text_parser().parse_args(
+        [
+            "--dataset_config",
+            str(tmp_path / "dataset.toml"),
+            "--text_encoder",
+            str(tmp_path / "text_encoder.safetensors"),
+            "--tokenizer",
+            str(tmp_path / "processor"),
+            "--text_encoder_quantization",
+            "nf4",
+        ]
+    )
+    assert quantized_text_args.text_encoder_quantization == "nf4"
 
 
 def test_h3_cache_and_generation_parsers_do_not_advertise_unimplemented_loading_modes():
@@ -564,7 +579,7 @@ def test_h3_cache_and_generation_parsers_do_not_advertise_unimplemented_loading_
         (
             "create_conditioning_encoder",
             {"text_encoder": Path("text"), "tokenizer": Path("tokenizer")},
-            {"task": "t2va"},
+            {"task": "t2va", "quantization": "none"},
         ),
         ("create_generator", {"model": Path("model")}, {"request": H3GenerationRequest("prompt", Path("out.mp4"))}),
         (

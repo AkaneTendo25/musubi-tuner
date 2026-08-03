@@ -80,6 +80,12 @@ python minimax_h3_cache_text_encoder_outputs.py \\
   --task t2va
 ```
 
+The default loads Qwen3-VL in BF16. Add `--text_encoder_quantization int8` or
+`--text_encoder_quantization nf4` to quantize its Linear weights directly from the same BF16 checkpoint while loading.
+INT8 is intended for approximately 32 GB GPUs; NF4 targets 24 GB GPUs. Non-Linear parameters and the cached raw
+layer-50 hidden states remain BF16. Both modes are explicit memory/conditioning-precision tradeoffs rather than
+numerically equivalent replacements for BF16.
+
 The native loader preserves the released component precision: the Comfy video encoder is FP16 and the audio encoder is FP32.
 Normalized cache tensors default to float32, and target video/audio caches use the posterior mean for deterministic reuse. Cache
 filenames use Musubi's `mmh3` architecture short name. The latent cache contains normalized video latents, normalized stereo audio

@@ -80,6 +80,7 @@ def create_conditioning_encoder(
     task: str,
     device: str | None,
     dtype: str,
+    quantization: Literal["none", "int8", "nf4"] = "none",
 ) -> H3ConditioningEncoder:
     """Load only the understanding encoder required for conditioning caches."""
     _validate_dtype(dtype)
@@ -91,6 +92,7 @@ def create_conditioning_encoder(
         task=task,
         device=device,
         dtype=dtype,
+        quantization=quantization,
     )
 
 
