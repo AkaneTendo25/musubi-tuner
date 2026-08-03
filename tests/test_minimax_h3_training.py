@@ -639,6 +639,7 @@ def test_h3_training_parser_defaults_to_native_fl2va_contract():
     assert args.mixed_precision == "bf16"
     assert args.timestep_sampling == "shift"
     assert args.discrete_flow_shift == 12.0
+    assert args.h3_loss_balance == "modality"
     assert args.h3_guidance_distillation_scale is None
     assert args.fp8_scaled is False
     assert "--fp8_base" in parser._option_string_actions

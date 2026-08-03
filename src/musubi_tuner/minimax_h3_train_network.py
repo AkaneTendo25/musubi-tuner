@@ -315,7 +315,7 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     parser.add_argument(
         "--h3_loss_balance",
         choices=("token", "modality"),
-        default="token",
+        default="modality",
         help="combine joint AV loss over all valid latent elements or equally by modality means",
     )
     parser.add_argument("--h3_video_loss_weight", type=float, default=1.0)

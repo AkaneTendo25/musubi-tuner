@@ -1,28 +1,30 @@
 # based on https://github.com/Stability-AI/ModelSpec
 import datetime
 import hashlib
-from io import BytesIO
-import os
-from typing import List, Optional, Tuple, Union
-import safetensors
 import logging
+import os
+from io import BytesIO
+from typing import List, Optional, Tuple, Union
+
+import safetensors
 
 from musubi_tuner.dataset.image_video_dataset import (
+    ARCHITECTURE_FLUX_2_DEV,
+    ARCHITECTURE_FLUX_2_KLEIN_4B,
+    ARCHITECTURE_FLUX_2_KLEIN_9B,
+    ARCHITECTURE_FLUX_KONTEXT,
+    ARCHITECTURE_FRAMEPACK,
+    ARCHITECTURE_HIDREAM_O1,
     ARCHITECTURE_HUNYUAN_VIDEO,
     ARCHITECTURE_HUNYUAN_VIDEO_1_5,
-    ARCHITECTURE_HIDREAM_O1,
     ARCHITECTURE_IDEOGRAM4,
+    ARCHITECTURE_KANDINSKY5,
+    ARCHITECTURE_KREA2,
+    ARCHITECTURE_MINIMAX_H3,
     ARCHITECTURE_QWEN_IMAGE,
     ARCHITECTURE_QWEN_IMAGE_EDIT,
     ARCHITECTURE_QWEN_IMAGE_LAYERED,
     ARCHITECTURE_WAN,
-    ARCHITECTURE_FRAMEPACK,
-    ARCHITECTURE_FLUX_KONTEXT,
-    ARCHITECTURE_FLUX_2_DEV,
-    ARCHITECTURE_FLUX_2_KLEIN_4B,
-    ARCHITECTURE_FLUX_2_KLEIN_9B,
-    ARCHITECTURE_KANDINSKY5,
-    ARCHITECTURE_KREA2,
     ARCHITECTURE_Z_IMAGE,
 )
 
@@ -94,6 +96,7 @@ ARCH_Z_IMAGE = "Z-Image"
 ARCH_HIDREAM_O1 = "HiDream-O1-Image"
 ARCH_IDEOGRAM4 = "Ideogram-4"
 ARCH_KREA2 = "Krea-2"
+ARCH_MINIMAX_H3 = "MiniMax-H3"
 
 ADAPTER_LORA = "lora"
 
@@ -111,6 +114,7 @@ IMPL_Z_IMAGE = "https://github.com/Tongyi-MAI/Z-Image"
 IMPL_HIDREAM_O1 = "https://github.com/HiDream-ai/HiDream-O1-Image"
 IMPL_IDEOGRAM4 = "https://huggingface.co/Comfy-Org/Ideogram-4"
 IMPL_KREA2 = "https://github.com/krea-ai/krea-2"
+IMPL_MINIMAX_H3 = "https://huggingface.co/MiniMaxAI/MiniMax-H3"
 
 PRED_TYPE_EPSILON = "epsilon"
 # PRED_TYPE_V = "v"
@@ -231,6 +235,9 @@ def build_metadata(
     elif architecture == ARCHITECTURE_KREA2:
         arch = ARCH_KREA2
         impl = IMPL_KREA2
+    elif architecture == ARCHITECTURE_MINIMAX_H3:
+        arch = ARCH_MINIMAX_H3
+        impl = IMPL_MINIMAX_H3
     else:
         raise ValueError(f"Unknown architecture: {architecture}")
 
@@ -302,6 +309,8 @@ def build_metadata(
             reso = (1024, 1024)
         elif architecture == ARCHITECTURE_KREA2:
             reso = (1024, 1024)
+        elif architecture == ARCHITECTURE_MINIMAX_H3:
+            reso = (1344, 768)
         else:
             reso = (1280, 720)
     if isinstance(reso, int):

@@ -113,8 +113,8 @@ and audio, maps the video sigma onto the synchronized audio schedule, and applie
 feed-forward projections are adapter targets; norms and timestep/modality calibration stay frozen. First/last-frame latent
 conditioning and Ref2VA training are unsupported and rejected rather than silently omitted.
 
-The default `token` loss mode is an element-weighted reduction over valid latent values; `modality` gives the video and audio means
-equal weight before applying their explicit loss weights. LoHa/LoKr architecture detection is unsupported.
+The default `modality` loss mode gives the video and audio means equal weight before applying their explicit loss weights.
+`token` is an optional element-weighted reduction over all valid latent values. LoHa/LoKr architecture detection is unsupported.
 
 ```shell
 accelerate launch minimax_h3_train_network.py \
