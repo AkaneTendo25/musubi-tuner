@@ -9,13 +9,22 @@ import numpy as np
 import pytest
 import torch
 from safetensors import safe_open
+from safetensors.torch import save_file
 
+from musubi_tuner.dataset.architectures import ARCHITECTURE_MINIMAX_H3
+from musubi_tuner.dataset.config_utils import (
+    BlueprintGenerator,
+    ConfigSanitizer,
+)
+from musubi_tuner.dataset.image_video_dataset import ItemInfo
+from musubi_tuner.minimax_h3 import backend as h3_backend
+from musubi_tuner.minimax_h3 import integration as h3_integration
 from musubi_tuner.minimax_h3.architecture import (
+    AUDIO_FLOW_SHIFT,
     AUDIO_LATENT_FPS,
     AUDIO_SAMPLE_RATE,
     CANVAS_MULTIPLE,
     VIDEO_FLOW_SHIFT,
-    AUDIO_FLOW_SHIFT,
     temporal_shape,
 )
 from musubi_tuner.minimax_h3.audio import (
@@ -24,6 +33,8 @@ from musubi_tuner.minimax_h3.audio import (
     load_audio_asset,
     target_audio_processing_spec,
 )
+from musubi_tuner.minimax_h3.cache import save_latent_cache_minimax_h3
+from musubi_tuner.minimax_h3.dataset import create_h3_dataset_group
 from musubi_tuner.minimax_h3.media import (
     AudioProcessingSpec,
     CropMode,
@@ -34,20 +45,10 @@ from musubi_tuner.minimax_h3.media import (
     fit_audio_length,
     slice_media_asset,
 )
-from musubi_tuner.dataset.architectures import ARCHITECTURE_MINIMAX_H3
-from musubi_tuner.dataset.config_utils import (
-    BlueprintGenerator,
-    ConfigSanitizer,
-)
-from musubi_tuner.dataset.image_video_dataset import ItemInfo
-from musubi_tuner.minimax_h3 import backend as h3_backend
-from musubi_tuner.minimax_h3 import integration as h3_integration
-from musubi_tuner.minimax_h3.cache import save_latent_cache_minimax_h3
-from musubi_tuner.minimax_h3.dataset import create_h3_dataset_group
-from musubi_tuner.minimax_h3_cache_latents import create_parser as create_cache_latents_parser
-from musubi_tuner.minimax_h3_cache_text_encoder_outputs import create_parser as create_cache_text_parser
 from musubi_tuner.minimax_h3.request import H3GenerationRequest, H3Reference, ReferenceKind, ReferenceRole
 from musubi_tuner.minimax_h3.weights import CheckpointInspectionError, inspect_checkpoint
+from musubi_tuner.minimax_h3_cache_latents import create_parser as create_cache_latents_parser
+from musubi_tuner.minimax_h3_cache_text_encoder_outputs import create_parser as create_cache_text_parser
 from musubi_tuner.minimax_h3_generate_video import create_parser, request_from_args
 
 
@@ -96,6 +97,10 @@ def test_verified_h3_temporal_contract():
     assert AUDIO_LATENT_FPS == 40
     assert CANVAS_MULTIPLE == 32
     assert (VIDEO_FLOW_SHIFT, AUDIO_FLOW_SHIFT) == (12.0, 3.0)
+    assert temporal_shape(5).audio_latent_frames == 8
+    assert temporal_shape(22).audio_latent_frames == 37
+    assert temporal_shape(39).audio_latent_frames == 65
+    assert temporal_shape(56).audio_latent_frames == 93
 
     assert H3GenerationRequest("prompt", Path("out.mp4"), duration=5).temporal_shape == shape
     with pytest.raises(ValueError, match="% 17 == 5"):
@@ -426,22 +431,51 @@ def test_missing_policy_does_not_hide_corrupt_audio(tmp_path):
 
 
 def test_native_cache_io_records_audio_tensor_and_architecture(tmp_path):
-    cache = tmp_path / "sample_h3.safetensors"
+    cache = tmp_path / "sample_mmh3.safetensors"
     item = ItemInfo("sample", "caption", (1280, 720), (1280, 720), frame_count=22, latent_cache_path=str(cache))
     save_latent_cache_minimax_h3(
         item,
         {
             "latents_2x2x3_float32": torch.ones(24, 2, 2, 3),
-            "audio_latents_float32": torch.zeros(2, 32, 4),
+            "latents_audio_2x32x4_float32": torch.zeros(2, 32, 4),
             "audio_loss_mask": torch.zeros(4, dtype=torch.bool),
         },
     )
 
     with safe_open(cache, framework="pt") as handle:
-        assert set(handle.keys()) == {"audio_latents_float32", "audio_loss_mask", "latents_2x2x3_float32"}
+        assert set(handle.keys()) == {"latents_audio_2x32x4_float32", "audio_loss_mask", "latents_2x2x3_float32"}
         assert not handle.get_tensor("audio_loss_mask").any()
         assert handle.metadata()["architecture"] == "minimax_h3"
         assert handle.metadata()["frame_count"] == "22"
+
+
+def test_h3_training_uses_crop_specific_text_cache_identity(tmp_path):
+    video_directory = tmp_path / "videos"
+    cache_directory = tmp_path / "cache"
+    video_directory.mkdir()
+    cache_directory.mkdir()
+    (video_directory / "sample.mp4").write_bytes(b"placeholder")
+    config = {
+        "general": {"resolution": [256, 256], "batch_size": 1},
+        "datasets": [
+            {
+                "video_directory": str(video_directory),
+                "cache_directory": str(cache_directory),
+                "target_frames": [5],
+            }
+        ],
+    }
+    dataset_group, _ = create_h3_dataset_group(config, Namespace(debug_dataset=False))
+    latent_path = cache_directory / "sample_00000-005_0256x0256_mmh3.safetensors"
+    text_path = cache_directory / "sample_00000-005_mmh3_te.safetensors"
+    save_file({"latents_2x16x16_float32": torch.zeros(24, 2, 16, 16)}, latent_path)
+    save_file({"varlen_mmh3_hidden_states_float32": torch.zeros(1, 5120)}, text_path)
+
+    dataset = dataset_group.datasets[0]
+    dataset.prepare_for_training()
+    cached_item = next(iter(next(iter(dataset.batch_manager.buckets.values()))))
+
+    assert cached_item.text_encoder_output_cache_path == str(text_path)
 
 
 def test_h3_latent_cache_requires_native_primary_latent_key(tmp_path):
@@ -449,7 +483,7 @@ def test_h3_latent_cache_requires_native_primary_latent_key(tmp_path):
     with pytest.raises(ValueError, match="latents_FxHxW"):
         save_latent_cache_minimax_h3(item, {"video_latents_float32": torch.ones(1)})
 
-    with pytest.raises(ValueError, match="audio_latents"):
+    with pytest.raises(ValueError, match="latents_audio"):
         save_latent_cache_minimax_h3(item, {"latents_2x2x2_float32": torch.zeros(24, 2, 2, 2)})
 
     with pytest.raises(ValueError, match="audio_loss_mask"):
@@ -457,7 +491,7 @@ def test_h3_latent_cache_requires_native_primary_latent_key(tmp_path):
             item,
             {
                 "latents_2x2x2_float32": torch.zeros(24, 2, 2, 2),
-                "audio_latents_float32": torch.zeros(2, 32, 4),
+                "latents_audio_2x32x4_float32": torch.zeros(2, 32, 4),
             },
         )
 
@@ -491,14 +525,30 @@ def test_cache_cli_uses_native_musubi_dataset_config(tmp_path):
         [
             "--dataset_config",
             str(tmp_path / "dataset.toml"),
-            "--model",
-            str(tmp_path / "model"),
+            "--vae",
+            str(tmp_path / "video_vae.safetensors"),
+            "--audio_vae",
+            str(tmp_path / "audio_vae.safetensors"),
         ]
     )
 
     assert args.dataset_config.endswith("dataset.toml")
     assert args.vae_dtype == "float32"
+    assert args.vae.endswith("video_vae.safetensors")
+    assert args.audio_vae.name == "audio_vae.safetensors"
     assert not hasattr(args, "dataset_manifest")
+
+    text_args = create_cache_text_parser().parse_args(
+        [
+            "--dataset_config",
+            str(tmp_path / "dataset.toml"),
+            "--text_encoder",
+            str(tmp_path / "text_encoder.safetensors"),
+            "--tokenizer",
+            str(tmp_path / "processor"),
+        ]
+    )
+    assert text_args.task == "t2va"
 
 
 def test_h3_cache_and_generation_parsers_do_not_advertise_unimplemented_loading_modes():
@@ -508,15 +558,23 @@ def test_h3_cache_and_generation_parsers_do_not_advertise_unimplemented_loading_
 
 
 @pytest.mark.parametrize(
-    ("factory_name", "extra"),
+    ("factory_name", "inputs", "extra"),
     [
-        ("create_latent_encoder", {}),
-        ("create_conditioning_encoder", {}),
-        ("create_generator", {"request": H3GenerationRequest("prompt", Path("out.mp4"))}),
-        ("create_training_backend", {"mode": "ref2va", "attention_mode": "torch", "split_attention": False}),
+        ("create_latent_encoder", {"video_vae": Path("video"), "audio_vae": Path("audio")}, {}),
+        (
+            "create_conditioning_encoder",
+            {"text_encoder": Path("text"), "tokenizer": Path("tokenizer")},
+            {"task": "t2va"},
+        ),
+        ("create_generator", {"model": Path("model")}, {"request": H3GenerationRequest("prompt", Path("out.mp4"))}),
+        (
+            "create_training_backend",
+            {"model": Path("model")},
+            {"mode": "ref2va", "attention_mode": "torch", "split_attention": False},
+        ),
     ],
 )
-def test_h3_component_factories_route_only_explicit_loading_inputs(monkeypatch, tmp_path, factory_name, extra):
+def test_h3_component_factories_route_only_explicit_loading_inputs(monkeypatch, factory_name, inputs, extra):
     sentinel = object()
     captured = {}
 
@@ -526,7 +584,7 @@ def test_h3_component_factories_route_only_explicit_loading_inputs(monkeypatch, 
 
     monkeypatch.setattr(h3_integration, factory_name, create_component)
     factory = getattr(h3_backend, factory_name)
-    result = factory(model=tmp_path, device="cpu", dtype="float32", **extra)
+    result = factory(device="cpu", dtype="float32", **inputs, **extra)
 
     assert result is sentinel
-    assert captured == {"model": tmp_path, "device": "cpu", "dtype": "float32", **extra}
+    assert captured == {**inputs, "device": "cpu", "dtype": "float32", **extra}

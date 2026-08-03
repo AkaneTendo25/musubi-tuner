@@ -2,7 +2,7 @@
 # each target video.
 
 [general]
-resolution = [832, 480]
+resolution = [1344, 768]
 caption_extension = ".txt"
 batch_size = 1
 enable_bucket = true

@@ -7,9 +7,8 @@ import torch
 
 from musubi_tuner.minimax_h3.architecture import AUDIO_FLOW_SHIFT, VIDEO_FLOW_SHIFT
 
-
 LossBalance = Literal["token", "modality"]
-H3TrainingMode = Literal["t2va", "ref2va"]
+H3TrainingMode = Literal["fl2va", "ref2va"]
 
 
 @dataclass(frozen=True)

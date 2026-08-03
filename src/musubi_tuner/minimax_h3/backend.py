@@ -54,20 +54,44 @@ def _validate_dtype(dtype: str) -> None:
         raise ValueError(f"unsupported H3 compute dtype: {dtype}")
 
 
-def create_latent_encoder(*, model: Path, device: str | None, dtype: str) -> H3LatentEncoder:
+def create_latent_encoder(
+    *,
+    video_vae: Path,
+    audio_vae: Path,
+    device: str | None,
+    dtype: str,
+) -> H3LatentEncoder:
     """Load only the video and audio VAEs required for latent caching."""
     _validate_dtype(dtype)
     from musubi_tuner.minimax_h3.integration import create_latent_encoder as create_integrated_latent_encoder
 
-    return create_integrated_latent_encoder(model=model, device=device, dtype=dtype)
+    return create_integrated_latent_encoder(
+        video_vae=video_vae,
+        audio_vae=audio_vae,
+        device=device,
+        dtype=dtype,
+    )
 
 
-def create_conditioning_encoder(*, model: Path, device: str | None, dtype: str) -> H3ConditioningEncoder:
+def create_conditioning_encoder(
+    *,
+    text_encoder: Path,
+    tokenizer: Path,
+    task: str,
+    device: str | None,
+    dtype: str,
+) -> H3ConditioningEncoder:
     """Load only the understanding encoder required for conditioning caches."""
     _validate_dtype(dtype)
     from musubi_tuner.minimax_h3.integration import create_conditioning_encoder as create_integrated_conditioning_encoder
 
-    return create_integrated_conditioning_encoder(model=model, device=device, dtype=dtype)
+    return create_integrated_conditioning_encoder(
+        text_encoder=text_encoder,
+        tokenizer=tokenizer,
+        task=task,
+        device=device,
+        dtype=dtype,
+    )
 
 
 def create_generator(*, model: Path, device: str | None, dtype: str, request: H3GenerationRequest) -> H3Generator:
@@ -89,8 +113,8 @@ def create_training_backend(
 ) -> H3TrainingBackend:
     """Load only the transformer required for cache-backed LoRA training.
 
-    Upstream source is copied under ``vendor/official`` and adapted by the
-    Musubi-owned ``integration`` module. Checkpoints never select Python code.
+    The native implementation is adapted through the Musubi-owned
+    ``integration`` module. Checkpoints never select Python code.
     """
     _validate_dtype(dtype)
     if attention_mode not in _SUPPORTED_ATTENTION_MODES:

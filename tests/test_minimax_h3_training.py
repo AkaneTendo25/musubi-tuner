@@ -6,6 +6,7 @@ import torch
 from safetensors import safe_open
 from torch import nn
 
+import musubi_tuner.minimax_h3_train_network as h3_train_network
 from musubi_tuner.dataset.bucket import BucketBatchManager
 from musubi_tuner.dataset.image_video_dataset import ItemInfo
 from musubi_tuner.minimax_h3.cache import (
@@ -13,6 +14,8 @@ from musubi_tuner.minimax_h3.cache import (
     H3_AUDIO_LOSS_MASK_KEY,
     H3_EMPTY_TEXT_HIDDEN_KEY,
     H3_EMPTY_TEXT_TOKEN_TAGS_KEY,
+    H3_TEXT_HIDDEN_KEY,
+    H3_TEXT_TOKEN_TAGS_KEY,
     save_text_encoder_output_cache_minimax_h3,
 )
 from musubi_tuner.minimax_h3.training import (
@@ -25,7 +28,6 @@ from musubi_tuner.minimax_h3.training import (
     unshift_sigma,
 )
 from musubi_tuner.minimax_h3_train_network import MiniMaxH3NetworkTrainer, create_parser
-import musubi_tuner.minimax_h3_train_network as h3_train_network
 from musubi_tuner.networks import lora_minimax_h3
 
 
@@ -120,14 +122,14 @@ def test_joint_loss_masks_audio_padding_and_supports_both_balances():
 
 
 def test_h3_text_cache_contract_and_optional_empty_pair(tmp_path):
-    path = tmp_path / "sample_h3_te.safetensors"
+    path = tmp_path / "sample_mmh3_te.safetensors"
     item = ItemInfo("sample", "caption", (0, 0), (0, 0))
     item.text_encoder_output_cache_path = str(path)
     tensors = {
-        "varlen_h3_text_hidden_float32": torch.zeros(3, 5120),
-        "varlen_h3_text_token_tags_int64": torch.tensor([1, 1, 1]),
-        "varlen_h3_empty_text_hidden_float32": torch.zeros(1, 5120),
-        "varlen_h3_empty_text_token_tags_int64": torch.tensor([1]),
+        f"varlen_{H3_TEXT_HIDDEN_KEY}_float32": torch.zeros(3, 5120),
+        f"varlen_{H3_TEXT_TOKEN_TAGS_KEY}_int64": torch.tensor([1, 1, 1]),
+        f"varlen_{H3_EMPTY_TEXT_HIDDEN_KEY}_float32": torch.zeros(1, 5120),
+        f"varlen_{H3_EMPTY_TEXT_TOKEN_TAGS_KEY}_int64": torch.tensor([1]),
     }
 
     save_text_encoder_output_cache_minimax_h3(item, tensors)
@@ -136,14 +138,14 @@ def test_h3_text_cache_contract_and_optional_empty_pair(tmp_path):
         assert set(handle.keys()) == set(tensors)
         assert handle.metadata()["architecture"] == "minimax_h3"
 
-    tensors.pop("varlen_h3_empty_text_token_tags_int64")
+    tensors.pop(f"varlen_{H3_EMPTY_TEXT_TOKEN_TAGS_KEY}_int64")
     with pytest.raises(ValueError, match="both hidden states and token tags"):
         save_text_encoder_output_cache_minimax_h3(item, tensors)
 
 
 def test_standard_bucket_manager_loads_h3_joint_cache_without_shared_schema_changes(tmp_path):
-    latent_path = tmp_path / "sample_h3.safetensors"
-    text_path = tmp_path / "sample_h3_te.safetensors"
+    latent_path = tmp_path / "sample_mmh3.safetensors"
+    text_path = tmp_path / "sample_mmh3_te.safetensors"
     item = ItemInfo("sample", "caption", (64, 64), (64, 64), latent_cache_path=str(latent_path))
     item.text_encoder_output_cache_path = str(text_path)
     from musubi_tuner.minimax_h3.cache import save_latent_cache_minimax_h3
@@ -152,15 +154,15 @@ def test_standard_bucket_manager_loads_h3_joint_cache_without_shared_schema_chan
         item,
         {
             "latents_2x2x2_float32": torch.zeros(24, 2, 2, 2),
-            "audio_latents_float32": torch.zeros(2, 32, 3),
+            "latents_audio_2x32x3_float32": torch.zeros(2, 32, 3),
             "audio_loss_mask": torch.tensor([True, True, False]),
         },
     )
     save_text_encoder_output_cache_minimax_h3(
         item,
         {
-            "varlen_h3_text_hidden_float32": torch.zeros(2, 5120),
-            "varlen_h3_text_token_tags_int64": torch.ones(2, dtype=torch.long),
+            f"varlen_{H3_TEXT_HIDDEN_KEY}_float32": torch.zeros(2, 5120),
+            f"varlen_{H3_TEXT_TOKEN_TAGS_KEY}_int64": torch.ones(2, dtype=torch.long),
         },
     )
 
@@ -169,8 +171,8 @@ def test_standard_bucket_manager_loads_h3_joint_cache_without_shared_schema_chan
     assert batch["latents"].shape == (1, 24, 2, 2, 2)
     assert batch[H3_AUDIO_LATENTS_KEY].shape == (1, 2, 32, 3)
     assert batch[H3_AUDIO_LOSS_MASK_KEY].shape == (1, 3)
-    assert isinstance(batch["h3_text_hidden"], list)
-    assert batch["h3_text_hidden"][0].shape == (2, 5120)
+    assert isinstance(batch[H3_TEXT_HIDDEN_KEY], list)
+    assert batch[H3_TEXT_HIDDEN_KEY][0].shape == (2, 5120)
 
 
 class MiniMaxH3TransformerBlock(nn.Module):
@@ -374,11 +376,11 @@ def test_h3_trainer_rejects_release_dependent_common_loading_modes(option, value
         MiniMaxH3NetworkTrainer().handle_model_specific_args(args)
 
 
-def test_h3_training_parser_defaults_to_native_t2va_contract():
+def test_h3_training_parser_defaults_to_native_fl2va_contract():
     parser = create_parser()
     args = parser.parse_args(["--sdpa"])
     assert args.network_module == "networks.lora_minimax_h3"
-    assert args.h3_training_mode == "t2va"
+    assert args.h3_training_mode == "fl2va"
     assert args.mixed_precision == "bf16"
     assert args.timestep_sampling == "shift"
     assert args.discrete_flow_shift == 12.0

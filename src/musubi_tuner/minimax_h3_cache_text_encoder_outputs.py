@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import argparse
 import logging
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Sequence
 
 import torch
 
-import musubi_tuner.cache_text_encoder_outputs as cache_text_encoder_outputs
+from musubi_tuner import cache_text_encoder_outputs
 from musubi_tuner.dataset import config_utils
 from musubi_tuner.dataset.image_video_dataset import ItemInfo
 from musubi_tuner.minimax_h3.backend import create_conditioning_encoder
@@ -19,7 +19,14 @@ logger = logging.getLogger(__name__)
 
 def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     parser.description = "Cache MiniMax H3 conditioning with Musubi's dataset and cache pipeline"
-    parser.add_argument("--model", type=Path, required=True, help="H3 model directory or checkpoint")
+    parser.add_argument("--text_encoder", type=Path, required=True, help="H3 Qwen3-VL checkpoint or Comfy model directory")
+    parser.add_argument("--tokenizer", type=Path, required=True, help="released H3 FL2VA text_encoder directory")
+    parser.add_argument(
+        "--task",
+        choices=("t2va", "fl2va"),
+        default="t2va",
+        help="conditioning presentation to cache; FL2VA includes the target crop's first and last frames",
+    )
     parser.add_argument("--text_encoder_dtype", default="bfloat16")
     parser.add_argument(
         "--cache_guidance_empty",
@@ -45,7 +52,13 @@ def main(argv: Sequence[str] | None = None) -> None:
     datasets = dataset_group.datasets
 
     all_cache_files, all_cache_paths = cache_text_encoder_outputs.prepare_cache_files_and_paths(datasets)
-    encoder = create_conditioning_encoder(model=args.model, device=str(device), dtype=args.text_encoder_dtype)
+    encoder = create_conditioning_encoder(
+        text_encoder=args.text_encoder,
+        tokenizer=args.tokenizer,
+        task=args.task,
+        device=str(device),
+        dtype=args.text_encoder_dtype,
+    )
 
     def encode(batch: list[ItemInfo]) -> None:
         attach_h3_media(batch, dataset_adapter)

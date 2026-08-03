@@ -3,9 +3,9 @@ from __future__ import annotations
 import argparse
 import logging
 import math
+from collections.abc import Sequence
 from multiprocessing import Value
 from pathlib import Path
-from typing import Optional, Sequence
 
 import torch
 from accelerate import Accelerator
@@ -30,7 +30,6 @@ from musubi_tuner.minimax_h3.training import (
 )
 from musubi_tuner.training.accelerator_setup import collator_class
 from musubi_tuner.utils import model_utils
-
 
 logger = logging.getLogger(__name__)
 
@@ -143,7 +142,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         attn_mode: str,
         split_attn: bool,
         loading_device: str,
-        dit_weight_dtype: Optional[torch.dtype],
+        dit_weight_dtype: torch.dtype | None,
     ):
         del accelerator, dit_weight_dtype
         self.backend = create_training_backend(
@@ -313,9 +312,9 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     parser.description = "Train a MiniMax H3 LoRA with synchronized video and audio flow matching"
     parser.add_argument(
         "--h3_training_mode",
-        choices=("t2va", "ref2va"),
-        default="t2va",
-        help="select the base transformer or the separate reference-conditioned transformer",
+        choices=("fl2va", "ref2va"),
+        default="fl2va",
+        help="select the first/last-frame base transformer or the separate reference-conditioned transformer",
     )
     parser.add_argument(
         "--h3_loss_balance",

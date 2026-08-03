@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-
 VIDEO_FPS = 24
 VIDEO_LATENT_CHANNELS = 24
 VIDEO_SPATIAL_COMPRESSION = 16
@@ -48,8 +47,7 @@ def is_valid_frame_count(frame_count: int) -> bool:
 
 
 def align_frame_count(frame_count: int) -> int:
-    if frame_count < FRAME_GRID_REMAINDER:
-        frame_count = FRAME_GRID_REMAINDER
+    frame_count = max(frame_count, FRAME_GRID_REMAINDER)
     remainder = frame_count % FRAME_GRID_PERIOD
     return frame_count + (FRAME_GRID_REMAINDER - remainder) % FRAME_GRID_PERIOD
 
@@ -63,5 +61,7 @@ def temporal_shape(frame_count: int, *, align: bool = False) -> H3TemporalShape:
         raise ValueError("H3 frame_count must be at least 5 and satisfy frame_count % 17 == 5")
 
     video_latent_frames = 2 if frame_count <= 5 else ((frame_count - 5) // 17) * 5 + 2
-    audio_latent_frames = round(frame_count / VIDEO_FPS * AUDIO_LATENT_FPS)
+    # Exact nearest-grid form of frame_count / 24 * 40 for the valid 17n+5
+    # frame grid. Integer arithmetic keeps cache identities platform-stable.
+    audio_latent_frames = (10 * frame_count + 3) // 6
     return H3TemporalShape(frame_count, video_latent_frames, audio_latent_frames)

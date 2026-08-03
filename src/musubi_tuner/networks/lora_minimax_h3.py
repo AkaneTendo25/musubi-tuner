@@ -1,24 +1,23 @@
+from __future__ import annotations
+
 import ast
-from typing import Dict, List, Optional
 
 import torch
-import torch.nn as nn
+from torch import nn
 
-import musubi_tuner.networks.lora as lora
+from musubi_tuner.networks import lora
 
-
-# The backend must expose or map its main transformer blocks to these public implementation names.
-MINIMAX_H3_TARGET_REPLACE_MODULES = ["MiniMaxH3TransformerBlock", "DiTBlock"]
+MINIMAX_H3_TARGET_REPLACE_MODULES = ["MiniMaxH3TransformerBlock"]
 
 
 def create_arch_network(
     multiplier: float,
-    network_dim: Optional[int],
-    network_alpha: Optional[float],
+    network_dim: int | None,
+    network_alpha: float | None,
     vae: nn.Module,
-    text_encoders: List[nn.Module],
+    text_encoders: list[nn.Module],
     unet: nn.Module,
-    neuron_dropout: Optional[float] = None,
+    neuron_dropout: float | None = None,
     **kwargs,
 ):
     exclude_patterns = kwargs.get("exclude_patterns")
@@ -48,9 +47,9 @@ def create_arch_network(
 
 def create_arch_network_from_weights(
     multiplier: float,
-    weights_sd: Dict[str, torch.Tensor],
-    text_encoders: Optional[List[nn.Module]] = None,
-    unet: Optional[nn.Module] = None,
+    weights_sd: dict[str, torch.Tensor],
+    text_encoders: list[nn.Module] | None = None,
+    unet: nn.Module | None = None,
     for_inference: bool = False,
     **kwargs,
 ) -> lora.LoRANetwork:

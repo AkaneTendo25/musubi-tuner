@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import argparse
 import logging
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Sequence
 
 import torch
 
-import musubi_tuner.cache_latents as cache_latents
+from musubi_tuner import cache_latents
 from musubi_tuner.dataset import config_utils
 from musubi_tuner.dataset.image_video_dataset import ItemInfo
 from musubi_tuner.minimax_h3.backend import create_latent_encoder
@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     parser.description = "Cache MiniMax H3 latents with Musubi's dataset and cache pipeline"
-    parser.add_argument("--model", type=Path, help="H3 model directory or checkpoint")
+    parser.add_argument("--audio_vae", type=Path, help="H3 audio VAE checkpoint or Comfy model directory")
     parser.set_defaults(vae_dtype="float32")
     return parser
 
@@ -48,10 +48,17 @@ def main(argv: Sequence[str] | None = None) -> None:
         cache_latents.show_datasets(datasets, args.debug_mode, args.console_width, args.console_back, args.console_num_images)
         return
 
-    if args.model is None:
-        parser.error("--model is required unless --debug_mode is used")
+    if args.vae is None:
+        parser.error("--vae is required unless --debug_mode is used")
+    if args.audio_vae is None:
+        parser.error("--audio_vae is required unless --debug_mode is used")
 
-    encoder = create_latent_encoder(model=args.model, device=str(device), dtype=args.vae_dtype or "float32")
+    encoder = create_latent_encoder(
+        video_vae=Path(args.vae),
+        audio_vae=args.audio_vae,
+        device=str(device),
+        dtype=args.vae_dtype or "float32",
+    )
 
     def encode(batch: list[ItemInfo]) -> None:
         attach_h3_media(batch, dataset_adapter)

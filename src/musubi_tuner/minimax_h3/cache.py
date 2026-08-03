@@ -11,13 +11,12 @@ from musubi_tuner.dataset.image_video_dataset import ItemInfo
 from musubi_tuner.minimax_h3.architecture import AUDIO_CHANNELS, AUDIO_LATENT_CHANNELS, TEXT_DIM, VIDEO_LATENT_CHANNELS
 from musubi_tuner.utils.model_utils import dtype_to_str, remove_dtype_suffix
 
-
-H3_AUDIO_LATENTS_KEY = "audio_latents"
+H3_AUDIO_LATENTS_KEY = "latents_audio"
 H3_AUDIO_LOSS_MASK_KEY = "audio_loss_mask"
-H3_TEXT_HIDDEN_KEY = "h3_text_hidden"
-H3_TEXT_TOKEN_TAGS_KEY = "h3_text_token_tags"
-H3_EMPTY_TEXT_HIDDEN_KEY = "h3_empty_text_hidden"
-H3_EMPTY_TEXT_TOKEN_TAGS_KEY = "h3_empty_text_token_tags"
+H3_TEXT_HIDDEN_KEY = "mmh3_hidden_states"
+H3_TEXT_TOKEN_TAGS_KEY = "mmh3_token_tags"
+H3_EMPTY_TEXT_HIDDEN_KEY = "mmh3_empty_hidden_states"
+H3_EMPTY_TEXT_TOKEN_TAGS_KEY = "mmh3_empty_token_tags"
 
 
 def normalize_batch_tensors(results: Any, expected: int, operation: str) -> tuple[dict[str, torch.Tensor], ...]:
@@ -74,9 +73,9 @@ def save_latent_cache_minimax_h3(item_info: ItemInfo, tensors: dict[str, torch.T
     primary_latents = [key for key in cache_tensors if re.fullmatch(r"latents_\d+x\d+x\d+_.+", key)]
     if len(primary_latents) != 1:
         raise ValueError(f"H3 latent cache for {item_info.item_key} must contain exactly one latents_FxHxW_<dtype> tensor")
-    audio_latents = [key for key in cache_tensors if re.fullmatch(r"audio_latents_.+", key)]
+    audio_latents = [key for key in cache_tensors if re.fullmatch(r"latents_audio_2x32x\d+_.+", key)]
     if len(audio_latents) != 1:
-        raise ValueError(f"H3 latent cache for {item_info.item_key} must contain exactly one audio_latents_<dtype> tensor")
+        raise ValueError(f"H3 latent cache for {item_info.item_key} must contain exactly one latents_audio_2x32xT_<dtype> tensor")
 
     primary_key = primary_latents[0]
     primary_match = re.fullmatch(r"latents_(\d+)x(\d+)x(\d+)_.+", primary_key)
@@ -90,8 +89,11 @@ def save_latent_cache_minimax_h3(item_info: ItemInfo, tensors: dict[str, torch.T
     audio = cache_tensors[audio_latents[0]]
     if audio.ndim != 3 or tuple(audio.shape[:2]) != (AUDIO_CHANNELS, AUDIO_LATENT_CHANNELS):
         raise ValueError(
-            f"H3 audio_latents must have shape [{AUDIO_CHANNELS}, {AUDIO_LATENT_CHANNELS}, T], got {tuple(audio.shape)}"
+            f"H3 latents_audio must have shape [{AUDIO_CHANNELS}, {AUDIO_LATENT_CHANNELS}, T], got {tuple(audio.shape)}"
         )
+    audio_geometry = int(audio_latents[0].split("_2x32x", 1)[1].split("_", 1)[0])
+    if audio.shape[-1] != audio_geometry:
+        raise ValueError(f"H3 {audio_latents[0]} has audio length {audio.shape[-1]}, expected {audio_geometry}")
     audio_mask = cache_tensors.get(H3_AUDIO_LOSS_MASK_KEY)
     if audio_mask is None:
         raise ValueError(f"H3 latent cache for {item_info.item_key} must contain {H3_AUDIO_LOSS_MASK_KEY}")

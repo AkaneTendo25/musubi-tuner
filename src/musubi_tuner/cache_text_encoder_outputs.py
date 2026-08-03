@@ -99,6 +99,11 @@ def process_text_encoder_batches(
             # update cache files (it's ok if we update it multiple times)
             if requires_content:
                 batch = batch[1]  # batch is (key, items), so use items
+                # Video latent-cache batches do not populate this path, unlike
+                # caption-only batches and image content batches.
+                for item in batch:
+                    if item.text_encoder_output_cache_path is None:
+                        item.text_encoder_output_cache_path = dataset.get_text_encoder_output_cache_path(item)
             all_cache_paths.update([os.path.normpath(item.text_encoder_output_cache_path) for item in batch])
 
             # skip existing cache files

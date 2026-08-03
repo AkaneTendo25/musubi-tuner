@@ -884,7 +884,11 @@ class VideoDataset(BaseDataset):
             frame_pos, frame_count = int(frame_pos), int(frame_count)
 
             item_key = "_".join(tokens[:-3])
-            text_encoder_output_cache_file = os.path.join(self.cache_directory, f"{item_key}_{self.architecture}_te.safetensors")
+            text_item_key = f"{item_key}_{tokens[-3]}" if self.architecture == ARCHITECTURE_MINIMAX_H3 else item_key
+            text_encoder_output_cache_file = os.path.join(
+                self.cache_directory,
+                f"{text_item_key}_{self.architecture}_te.safetensors",
+            )
             if not os.path.exists(text_encoder_output_cache_file):
                 logger.warning(f"Text encoder output cache file not found: {text_encoder_output_cache_file}")
                 continue
