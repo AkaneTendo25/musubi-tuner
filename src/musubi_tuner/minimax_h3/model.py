@@ -341,10 +341,11 @@ class MiniMaxH3Transformer(nn.Module):
         num_blocks = len(self.blocks)
         if blocks_to_swap <= 0:
             raise ValueError("MiniMax H3 blocks_to_swap must be positive")
-        # Keep two blocks resident, matching the modern single-stack Musubi
-        # implementations and leaving useful overlap headroom for a two-slot
-        # H2D-only ring.
-        max_blocks_to_swap = num_blocks - 2
+        # Whole-block rings retain two blocks to preserve overlap headroom.
+        # Layer streaming owns an independent, smaller ring and can therefore
+        # offload the Linear weights from every transformer block.
+        layer_streaming = config.h2d_only and config.granularity == "layer"
+        max_blocks_to_swap = num_blocks if layer_streaming else num_blocks - 2
         if blocks_to_swap > max_blocks_to_swap:
             raise ValueError(
                 f"MiniMax H3 cannot swap more than {max_blocks_to_swap} of {num_blocks} blocks; "

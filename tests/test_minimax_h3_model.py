@@ -238,6 +238,27 @@ def test_h3_block_swap_requires_two_resident_blocks(monkeypatch):
         model.enable_block_swap(3, config)
 
 
+def test_h3_layer_streaming_allows_every_block_to_be_offloaded(monkeypatch):
+    captured = {}
+
+    def fake_create_offloader(block_type, blocks, num_blocks, blocks_to_swap, config):
+        captured.update(num_blocks=num_blocks, blocks_to_swap=blocks_to_swap, config=config)
+        return SimpleNamespace()
+
+    monkeypatch.setattr(h3_model, "create_offloader", fake_create_offloader)
+    model = MiniMaxH3Transformer(_tiny_config(num_layers=4))
+    config = BlockSwapConfig(
+        device=torch.device("cuda"),
+        supports_backward=True,
+        h2d_only=True,
+        granularity="layer",
+    )
+
+    model.enable_block_swap(4, config)
+
+    assert captured == {"num_blocks": 4, "blocks_to_swap": 4, "config": config}
+
+
 def test_h3_h2d_only_block_swap_requires_gradient_checkpointing():
     args = SimpleNamespace(
         block_swap_h2d_only=True,
@@ -250,17 +271,34 @@ def test_h3_h2d_only_block_swap_requires_gradient_checkpointing():
         BlockSwapConfig.from_args(args, torch.device("cpu"), supports_backward=True)
 
 
+def test_layer_granularity_requires_h2d_only():
+    args = SimpleNamespace(
+        block_swap_h2d_only=False,
+        block_swap_ring_size=2,
+        block_swap_granularity="layer",
+        use_pinned_memory_for_block_swap=False,
+        gradient_checkpointing=True,
+    )
+
+    with pytest.raises(ValueError, match="requires --block_swap_h2d_only"):
+        BlockSwapConfig.from_args(args, torch.device("cuda"), supports_backward=True)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for the real block offloaders")
 @pytest.mark.parametrize(
-    ("h2d_only", "ring_size", "use_pinned_memory"),
+    ("h2d_only", "ring_size", "use_pinned_memory", "granularity", "blocks_to_swap"),
     [
-        (False, 2, False),
-        (True, 1, False),
-        (True, 2, False),
-        (True, 2, True),
+        (False, 2, False, "block", 2),
+        (True, 1, False, "block", 2),
+        (True, 2, False, "block", 2),
+        (True, 2, True, "block", 2),
+        (True, 1, False, "layer", 4),
+        (True, 2, True, "layer", 4),
     ],
 )
-def test_h3_real_block_swap_forward_backward_parity(h2d_only, ring_size, use_pinned_memory):
+def test_h3_real_block_swap_forward_backward_parity(
+    h2d_only, ring_size, use_pinned_memory, granularity, blocks_to_swap
+):
     torch.manual_seed(3)
     device = torch.device("cuda")
     config = _tiny_config(num_layers=4)
@@ -295,11 +333,12 @@ def test_h3_real_block_swap_forward_backward_parity(h2d_only, ring_size, use_pin
     args = SimpleNamespace(
         block_swap_h2d_only=h2d_only,
         block_swap_ring_size=ring_size,
+        block_swap_granularity=granularity,
         use_pinned_memory_for_block_swap=use_pinned_memory,
         gradient_checkpointing=True,
     )
     swap_config = BlockSwapConfig.from_args(args, device, supports_backward=True)
-    swapped.enable_block_swap(2, swap_config)
+    swapped.enable_block_swap(blocks_to_swap, swap_config)
     swapped.move_to_device_except_swap_blocks(device)
     swapped.prepare_block_swap_before_forward()
     swapped_inputs = {
@@ -320,10 +359,10 @@ def test_h3_real_block_swap_forward_backward_parity(h2d_only, ring_size, use_pin
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for the real block offloaders")
 @pytest.mark.parametrize(
-    ("h2d_only", "use_pinned_memory"),
-    [(False, False), (True, False), (True, True)],
+    ("h2d_only", "use_pinned_memory", "granularity", "blocks_to_swap"),
+    [(False, False, "block", 2), (True, False, "block", 2), (True, True, "block", 2), (True, True, "layer", 4)],
 )
-def test_h3_scaled_fp8_block_swap_forward_backward_parity(h2d_only, use_pinned_memory):
+def test_h3_scaled_fp8_block_swap_forward_backward_parity(h2d_only, use_pinned_memory, granularity, blocks_to_swap):
     torch.manual_seed(4)
     device = torch.device("cuda")
     config = _tiny_config(num_layers=4)
@@ -352,11 +391,12 @@ def test_h3_scaled_fp8_block_swap_forward_backward_parity(h2d_only, use_pinned_m
     args = SimpleNamespace(
         block_swap_h2d_only=h2d_only,
         block_swap_ring_size=2,
+        block_swap_granularity=granularity,
         use_pinned_memory_for_block_swap=use_pinned_memory,
         gradient_checkpointing=True,
     )
     swap_config = BlockSwapConfig.from_args(args, device, supports_backward=True)
-    swapped.enable_block_swap(2, swap_config)
+    swapped.enable_block_swap(blocks_to_swap, swap_config)
     swapped.move_to_device_except_swap_blocks(device)
     swapped.prepare_block_swap_before_forward()
     swapped_inputs = {

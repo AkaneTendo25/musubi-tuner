@@ -642,6 +642,8 @@ def test_h3_trainer_maps_common_fp8_switch_to_scaled_loading_and_accepts_swap():
             "--block_swap_h2d_only",
             "--block_swap_ring_size",
             "1",
+            "--block_swap_granularity",
+            "layer",
             "--use_pinned_memory_for_block_swap",
             "--gradient_checkpointing",
         ]
@@ -654,6 +656,7 @@ def test_h3_trainer_maps_common_fp8_switch_to_scaled_loading_and_accepts_swap():
     assert args.blocks_to_swap == 2
     assert args.block_swap_h2d_only is True
     assert args.block_swap_ring_size == 1
+    assert args.block_swap_granularity == "layer"
     assert args.use_pinned_memory_for_block_swap is True
 
 
@@ -687,6 +690,8 @@ def test_h3_training_parser_defaults_to_native_fl2va_contract():
     assert "--blocks_to_swap" in parser._option_string_actions
     assert "--block_swap_h2d_only" in parser._option_string_actions
     assert "--block_swap_ring_size" in parser._option_string_actions
+    assert "--block_swap_granularity" in parser._option_string_actions
+    assert args.block_swap_granularity == "block"
     assert "--fp8_scaled" not in parser._option_string_actions
     assert "--int8" not in parser._option_string_actions
     assert "--allow_prequantized_fp8" not in parser._option_string_actions

@@ -1,12 +1,16 @@
+from __future__ import annotations
+
+import gc
+import time
+import types
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
-import gc
-import time
 from typing import Optional
+
 import torch
-import torch.nn as nn
+from torch import nn
 
 
 # Keep these functions here for portability, and private to avoid confusion with the ones in device_utils.py
@@ -83,6 +87,7 @@ class BlockSwapConfig:
     use_pinned_memory: bool = False
     h2d_only: bool = False  # frozen-base (LoRA / LoHa / LoKr) only: H2D-only streaming, no device->host copy
     ring_size: int = 2  # (h2d_only) number of GPU ring buffers for streamed blocks; 2 = double buffering
+    granularity: str = "block"  # (h2d_only) transfer packed blocks or individual frozen Linear layers
     debug: bool = False
 
     @classmethod
@@ -108,6 +113,11 @@ class BlockSwapConfig:
         ring_size = getattr(args, "block_swap_ring_size", 2)
         if ring_size < 1:
             raise ValueError("--block_swap_ring_size must be >= 1")
+        granularity = getattr(args, "block_swap_granularity", "block")
+        if granularity not in ("block", "layer"):
+            raise ValueError("--block_swap_granularity must be 'block' or 'layer'")
+        if granularity == "layer" and not h2d_only:
+            raise ValueError("--block_swap_granularity layer requires --block_swap_h2d_only")
 
         return cls(
             device=device,
@@ -115,6 +125,7 @@ class BlockSwapConfig:
             use_pinned_memory=getattr(args, "use_pinned_memory_for_block_swap", False),
             h2d_only=h2d_only,
             ring_size=ring_size,
+            granularity=granularity,
         )
 
 
@@ -125,6 +136,18 @@ def create_offloader(block_type: str, blocks: list[nn.Module], num_blocks: int, 
     offloader type plugs in here without touching any architecture.
     """
     if config.h2d_only:
+        if config.granularity == "layer":
+            return LoRALinearStreamOffloader(
+                block_type,
+                blocks,
+                num_blocks,
+                blocks_to_swap,
+                config.supports_backward,
+                config.device,
+                ring_size=config.ring_size,
+                use_pinned_memory=config.use_pinned_memory,
+                debug=config.debug,
+            )
         # H2D-only streaming for frozen-base (LoRA) training: keep a CPU master, copy Host->Device only.
         return LoRAStreamOffloader(
             block_type,
@@ -598,6 +621,9 @@ class _DirectCopier:
                 self._xfer[key] = (ev_a, ev_b)
         self._events[key] = self.copy_stream.record_event()
 
+    def reserve(self, nbytes: int):
+        del nbytes
+
     def wait(self, key):
         """Return the H2D-completion event for ``key`` (None if nothing is in flight for it)."""
         return self._events.get(key)
@@ -652,6 +678,9 @@ class _StagedCopier:
             self._staging = [torch.empty(nbytes, dtype=torch.uint8).pin_memory(device=self.device) for _ in range(self.num_staging)]
             self._staging_free = [None] * self.num_staging
 
+    def reserve(self, nbytes: int):
+        self._ensure_staging(nbytes)
+
     def _run(self, dst_flat: torch.Tensor, src_flat: torch.Tensor, gate_event):
         # runs on the worker thread: pageable->pinned memcpy, then enqueue the async pinned->device H2D
         idx = self._rr
@@ -662,6 +691,7 @@ class _StagedCopier:
         if free_ev is not None:
             free_ev.synchronize()  # CPU(worker) waits until the prior H2D released this buffer -- off main thread
 
+        staging = staging[: src_flat.numel()]
         staging.copy_(src_flat)  # pageable -> pinned, plain CPU memcpy
 
         ev_a = ev_b = None
@@ -715,6 +745,254 @@ class _StagedCopier:
         pool = getattr(self, "_pool", None)
         if pool is not None:
             pool.shutdown(wait=False)
+
+
+def _linear_with_streamed_weight(
+    inputs: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    scale_weight: torch.Tensor | None,
+) -> torch.Tensor:
+    """Apply a frozen Linear weight using Musubi's scaled-FP8 storage contract."""
+    if scale_weight is None:
+        compute_weight = weight
+    elif scale_weight.ndim < 3:
+        compute_weight = weight.to(scale_weight.dtype) * scale_weight
+    else:
+        out_features, num_blocks, _ = scale_weight.shape
+        compute_weight = weight.to(scale_weight.dtype).contiguous().view(out_features, num_blocks, -1)
+        compute_weight = (compute_weight * scale_weight).view(weight.shape)
+    return torch.nn.functional.linear(inputs, compute_weight, bias)
+
+
+class _FrozenLinearStreamFunction(torch.autograd.Function):
+    """Autograd boundary that reloads an immutable base weight for grad-input."""
+
+    @staticmethod
+    def forward(ctx, inputs: torch.Tensor, offloader, layer_rank: int):
+        ctx.offloader = offloader
+        ctx.layer_rank = layer_rank
+        weight, bias, scale_weight = offloader.acquire(layer_rank)
+        output = _linear_with_streamed_weight(inputs, weight, bias, scale_weight)
+        offloader.release_and_prefetch(layer_rank)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        offloader = ctx.offloader
+        layer_rank = ctx.layer_rank
+        weight, _, scale_weight = offloader.acquire(layer_rank, backward=True)
+        if scale_weight is None:
+            compute_weight = weight
+        elif scale_weight.ndim < 3:
+            compute_weight = weight.to(scale_weight.dtype) * scale_weight
+        else:
+            out_features, num_blocks, _ = scale_weight.shape
+            compute_weight = weight.to(scale_weight.dtype).contiguous().view(out_features, num_blocks, -1)
+            compute_weight = (compute_weight * scale_weight).view(weight.shape)
+        grad_input = torch.matmul(grad_output, compute_weight)
+        offloader.release_and_prefetch(layer_rank, backward=True)
+        return grad_input, None, None
+
+
+class LoRALinearStreamOffloader:
+    """H2D-only streaming of individual frozen Linear layers through a GPU ring.
+
+    This is the low-residency counterpart to :class:`LoRAStreamOffloader`.
+    Whole-block streaming remains preferable when its ring fits: packing each
+    block into one transfer minimizes launch and scheduling overhead. Layer
+    streaming instead keeps only ``ring_size`` Linear payloads resident and
+    reloads the immutable base weight in its custom backward, allowing every
+    transformer block to be offloaded safely during LoRA training.
+    """
+
+    def __init__(
+        self,
+        block_type: str,
+        blocks: list[nn.Module],
+        num_blocks: int,
+        blocks_to_swap: int,
+        supports_backward: bool,
+        device: torch.device,
+        ring_size: int = 2,
+        use_pinned_memory: bool = True,
+        debug: bool = False,
+    ):
+        if device.type != "cuda":
+            raise ValueError("LoRALinearStreamOffloader currently supports CUDA only")
+        self.block_type = block_type
+        self._blocks = blocks
+        self.num_blocks = num_blocks
+        self.blocks_to_swap = blocks_to_swap
+        self.supports_backward = supports_backward
+        self.forward_only = not supports_backward
+        self.device = device
+        self.use_pinned_memory = use_pinned_memory
+        self.debug = debug
+
+        stream_blocks = sorted({((2 * i + 1) * num_blocks) // (2 * blocks_to_swap) for i in range(blocks_to_swap)})
+        self.stream_blocks = set(stream_blocks)
+        self.layers: list[nn.Linear] = []
+        self.layer_names: list[str] = []
+        for block_index in stream_blocks:
+            block = blocks[block_index]
+            for name, module in block.named_modules():
+                if not isinstance(module, nn.Linear) or module.weight is None:
+                    continue
+                if module.weight.requires_grad or (module.bias is not None and module.bias.requires_grad):
+                    raise ValueError(
+                        "layer-granular H2D streaming requires frozen base Linear parameters; "
+                        f"found a trainable parameter in block {block_index}.{name}"
+                    )
+                self.layers.append(module)
+                self.layer_names.append(f"{block_index}.{name}")
+
+        if not self.layers:
+            raise ValueError("layer-granular H2D streaming found no frozen Linear layers")
+        self.B = min(ring_size, len(self.layers))
+        self.copier = _DirectCopier(device, debug=debug) if use_pinned_memory else _StagedCopier(device, self.B, debug=debug)
+        self.cpu_flat: list[torch.Tensor] = []
+        self.layouts: list[list[tuple[str, int, torch.dtype, torch.Size]]] = []
+        self.ring_flat: list[torch.Tensor] | None = None
+        self.in_slot: list[int | None] = [None] * self.B
+        self.free_event = [None] * self.B
+        self._prepared = False
+
+        for rank, module in enumerate(self.layers):
+            module.forward = types.MethodType(self._make_forward(rank), module)
+
+        print(
+            f"LoRALinearStreamOffloader[{block_type}]: H2D-only layer streaming. "
+            f"{len(self.layers)} Linear layers across {len(stream_blocks)} / {num_blocks} blocks, "
+            f"ring={self.B}, pinned={use_pinned_memory}."
+        )
+
+    def _make_forward(self, layer_rank: int):
+        def forward(module, inputs):
+            del module
+            return _FrozenLinearStreamFunction.apply(inputs, self, layer_rank)
+
+        return forward
+
+    @staticmethod
+    def _tensor_layout(module: nn.Linear) -> tuple[list[tuple[str, int, torch.dtype, torch.Size]], int]:
+        tensors = [("weight", module.weight)]
+        if module.bias is not None:
+            tensors.append(("bias", module.bias))
+        scale_weight = getattr(module, "scale_weight", None)
+        if scale_weight is not None:
+            tensors.append(("scale_weight", scale_weight))
+        align = 256
+        layout = []
+        total = 0
+        for name, tensor in tensors:
+            total = (total + align - 1) // align * align
+            layout.append((name, total, tensor.dtype, tensor.shape))
+            total += tensor.numel() * tensor.element_size()
+        return layout, total
+
+    @staticmethod
+    def _view(flat: torch.Tensor, entry: tuple[str, int, torch.dtype, torch.Size]) -> torch.Tensor:
+        _, offset, dtype, shape = entry
+        nbytes = shape.numel() * dtype.itemsize
+        return flat[offset : offset + nbytes].view(dtype).view(shape)
+
+    def _bind_cpu_views(self, rank: int, flat: torch.Tensor, layout) -> None:
+        module = self.layers[rank]
+        for entry in layout:
+            name = entry[0]
+            view = self._view(flat, entry)
+            if name == "weight":
+                module.weight.data = view
+            elif name == "bias":
+                module.bias.data = view
+            else:
+                module._buffers[name] = view
+
+    def _gpu_payload(self, rank: int, slot: int):
+        flat = self.ring_flat[slot]
+        payload = {entry[0]: self._view(flat, entry) for entry in self.layouts[rank]}
+        return payload["weight"], payload.get("bias"), payload.get("scale_weight")
+
+    def _load(self, rank: int, slot: int):
+        if self.in_slot[slot] == rank:
+            return
+        src = self.cpu_flat[rank]
+        dst = self.ring_flat[slot][: src.numel()]
+        self.copier.submit(rank, dst, src, self.free_event[slot])
+        self.in_slot[slot] = rank
+
+    def acquire(self, rank: int, backward: bool = False):
+        del backward
+        if not self._prepared:
+            raise RuntimeError("layer-granular H2D streaming was not prepared before forward")
+        slot = rank % self.B
+        if self.in_slot[slot] != rank:
+            self._load(rank, slot)
+        event = self.copier.wait(rank)
+        if event is not None:
+            torch.cuda.current_stream(self.device).wait_event(event)
+        return self._gpu_payload(rank, slot)
+
+    def release_and_prefetch(self, rank: int, backward: bool = False):
+        slot = rank % self.B
+        self.free_event[slot] = torch.cuda.current_stream(self.device).record_event()
+        next_rank = rank - self.B if backward else rank + self.B
+        if 0 <= next_rank < len(self.layers):
+            self._load(next_rank, slot)
+        elif self.forward_only and not backward and rank == len(self.layers) - 1 and len(self.layers) > self.B:
+            for first_rank in range(self.B):
+                self._load(first_rank, first_rank)
+
+    def set_forward_only(self, forward_only: bool):
+        self.copier.sync()
+        self.forward_only = forward_only
+
+    def prepare_block_devices_before_forward(self, blocks: list[nn.Module]):
+        if not self._prepared:
+            cpu_device = torch.device("cpu")
+            max_bytes = 0
+            layer_rank = 0
+            for block_index, block in enumerate(blocks):
+                if layer_rank == len(self.layers):
+                    break
+                block.to(self.device)
+                if block_index not in self.stream_blocks:
+                    continue
+                for module in block.modules():
+                    if not isinstance(module, nn.Linear) or module is not self.layers[layer_rank]:
+                        continue
+                    layout, total = self._tensor_layout(module)
+                    flat = torch.empty(total, dtype=torch.uint8, device=cpu_device)
+                    if self.use_pinned_memory:
+                        flat = flat.pin_memory()
+                    for entry in layout:
+                        source = getattr(module, entry[0])
+                        self._view(flat, entry).copy_(source.detach())
+                    self.layouts.append(layout)
+                    self.cpu_flat.append(flat)
+                    self._bind_cpu_views(layer_rank, flat, layout)
+                    max_bytes = max(max_bytes, total)
+                    layer_rank += 1
+                    if layer_rank == len(self.layers):
+                        break
+            if layer_rank != len(self.layers):
+                raise RuntimeError(f"prepared {layer_rank} streamed Linear layers, expected {len(self.layers)}")
+            self.copier.reserve(max_bytes)
+            self.ring_flat = [torch.empty(max_bytes, dtype=torch.uint8, device=self.device) for _ in range(self.B)]
+            self._prepared = True
+        self.free_event = [None] * self.B
+        self.copier.reset()
+        for rank in range(self.B):
+            self._load(rank, rank)
+        _synchronize_device(self.device)
+        _clean_memory_on_device(self.device)
+
+    def wait_for_block(self, block_idx: int):
+        del block_idx
+
+    def submit_move_blocks_forward(self, blocks: list[nn.Module], block_idx: int):
+        del blocks, block_idx
 
 
 class LoRAStreamOffloader:

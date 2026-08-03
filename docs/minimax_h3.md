@@ -148,7 +148,23 @@ block swapping can be enabled with the common Musubi options:
 Pinned host memory is strongly recommended for H2D-only swapping: it permits direct asynchronous host-to-device copies and lets
 the two-buffer ring overlap transfers with transformer computation. The unpinned path remains available, but uses staged copies
 and can be substantially slower for H3's unusually large blocks. H2D-only swapping is valid only while the base transformer is
-frozen; the offloader checks this invariant. At least two of H3's 50 transformer blocks must remain resident.
+frozen; the offloader checks this invariant. Block granularity keeps at least two of H3's 50 transformer blocks resident.
+
+For the lowest transformer-weight residency, the same common offloader can stream individual frozen `Linear` layers:
+
+```shell
+  --fp8_base \
+  --blocks_to_swap 50 \
+  --block_swap_h2d_only \
+  --block_swap_granularity layer \
+  --block_swap_ring_size 2 \
+  --use_pinned_memory_for_block_swap
+```
+
+Layer granularity supports offloading all 50 H3 blocks. It reloads each immutable base weight during backward while LoRA weights
+remain resident and trainable. This reduces the GPU ring from complete transformer blocks to individual `Linear` payloads, at the
+cost of more transfers and dispatch overhead. Use the default `block` granularity when it fits; select `layer` for extreme-offload
+training.
 
 For memory-constrained CUDA training, PyTorch's expandable allocator segments can reduce reservation fragmentation. Set
 `PYTORCH_ALLOC_CONF=expandable_segments:True` before launching the process. This is a PyTorch environment setting rather than an

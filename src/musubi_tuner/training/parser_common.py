@@ -13,7 +13,6 @@ import pathlib
 import toml
 from accelerate.utils import DynamoBackend
 
-
 logger = logging.getLogger(__name__)
 
 
@@ -421,6 +420,14 @@ def _add_memory_args(parser: argparse.ArgumentParser) -> None:
         help="(used with --block_swap_h2d_only) number of GPU ring buffers for streamed blocks. 2 = double buffering"
         " (one computed on, one prefetched); 1 = minimal memory but no transfer/compute overlap."
         " / (--block_swap_h2d_only用) ストリーミング用GPUリングバッファ数。2でダブルバッファ、1で最小メモリ(オーバーラップなし)。",
+    )
+    parser.add_argument(
+        "--block_swap_granularity",
+        choices=("block", "layer"),
+        default="block",
+        help="(used with --block_swap_h2d_only) stream packed transformer blocks (faster) or individual frozen"
+        " Linear layers (lower VRAM). Layer mode is intended for extreme-offload LoRA training."
+        " / (--block_swap_h2d_only用) ブロック単位（高速）または凍結Linear層単位（低VRAM）で転送する。",
     )
     parser.add_argument(
         "--img_in_txt_in_offloading",
