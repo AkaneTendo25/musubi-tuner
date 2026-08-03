@@ -108,19 +108,15 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         if args.h3_guidance_distillation_scale is not None and args.h3_guidance_distillation_scale <= 1.0:
             raise ValueError("--h3_guidance_distillation_scale must be greater than 1, or omitted for one-pass training")
         if args.fp8_base or args.fp8_scaled:
-            raise ValueError("MiniMax H3 FP8 training requires a validated released checkpoint layout and is not supported yet")
+            raise ValueError("MiniMax H3 does not support FP8 training")
         if args.blocks_to_swap:
-            raise ValueError("MiniMax H3 block swapping requires the released transformer block layout and is not supported yet")
+            raise ValueError("MiniMax H3 training does not support block swapping")
         if args.compile:
-            raise ValueError("MiniMax H3 compilation requires the released transformer block layout and is not supported yet")
+            raise ValueError("MiniMax H3 training does not support compilation")
         if not args.sdpa:
-            raise ValueError(
-                "MiniMax H3 currently supports only --sdpa; other attention backends require a validated training forward"
-            )
+            raise ValueError("MiniMax H3 training supports only --sdpa")
         if args.split_attn:
-            raise ValueError(
-                "MiniMax H3 split attention requires a validated released transformer forward and is not supported yet"
-            )
+            raise ValueError("MiniMax H3 training does not support split attention")
 
     def process_sample_prompts(self, args: argparse.Namespace, accelerator: Accelerator, sample_prompts: str):
         del args, accelerator, sample_prompts

@@ -118,9 +118,9 @@ def create_training_backend(
     """
     _validate_dtype(dtype)
     if attention_mode not in _SUPPORTED_ATTENTION_MODES:
-        raise ValueError("MiniMax H3 currently supports only Musubi's --sdpa attention path")
+        raise ValueError("MiniMax H3 supports only Musubi's --sdpa attention path")
     if split_attention:
-        raise ValueError("MiniMax H3 split attention is not supported until the released transformer forward is validated")
+        raise ValueError("MiniMax H3 does not support split attention")
     from musubi_tuner.minimax_h3.integration import create_training_backend as create_integrated_training_backend
 
     return create_integrated_training_backend(

@@ -16,7 +16,7 @@
 The implementation follows the released Diffusers H3 port at revision
 ``abc5e9bf71fd38f53cd471bc3acaa84bc5ecbfdc`` while retaining the original
 checkpoint module names and fused projections. This keeps H3 independent of
-unreleased Diffusers APIs and lets Musubi load the Comfy BF16 repack directly.
+Diffusers model APIs and lets Musubi load the Comfy BF16 repack directly.
 """
 
 from __future__ import annotations

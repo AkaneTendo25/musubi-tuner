@@ -18,6 +18,17 @@ checkpoint configuration and reject incompatible layouts.
 
 ## Checkpoint inspection
 
+For T2VA training, the native loaders use these four Comfy-Org checkpoint files:
+
+- `diffusion_models/minimax_h3_fl2va_bf16.safetensors`;
+- `text_encoders/qwen3vl_32b_minimax_h3_bf16.safetensors`;
+- `vae/minimax_h3_video_vae_fp16.safetensors`;
+- `vae/minimax_h3_audio_vae_fp32.safetensors`.
+
+The text-cache command also needs the small tokenizer and processor metadata from the official
+`FL2VA/text_encoder` directory. The 14 official text-model shards are not needed when the Comfy-Org BF16 text encoder is used. Pass
+that metadata directory to `--tokenizer`; Musubi does not import ComfyUI's bundled tokenizer or hard-coded processor classes.
+
 The inspector reads safetensors headers without allocating tensor storage:
 
 ```shell
@@ -34,7 +45,7 @@ It reports checkpoint components, shards, tensor counts, parameter counts, dtype
 
 H3 reuses Musubi's standard video dataset and control fields. A target video's embedded soundtrack is the synchronized audio target.
 When a target video has no audio stream, latent caching encodes duration-matched silence and marks its entire audio loss mask invalid,
-so both `fl2va` and `ref2va` can train on video-only examples. A present but corrupt audio stream remains an error. Reference image,
+so T2VA can train on video-only examples. A present but corrupt audio stream remains an error. Reference image,
 video, or audio assets use `control_directory`, `control_path`, or numbered `control_path_N` fields; no H3-specific dataset schema is
 required.
 
@@ -74,7 +85,8 @@ Normalized cache tensors default to float32, and target video/audio caches use t
 filenames use Musubi's `mmh3` architecture short name. The latent cache contains normalized video latents, normalized stereo audio
 latents as `latents_audio_2x32xT_*` in stereo-major `[2, 32, T]` layout, and explicit loss masks. The conditioning cache is
 crop-specific and uses `varlen_mmh3_*` tensors. `--task t2va` stores the raw-caption layer-50 output; `--task fl2va` adds the selected
-crop's first and last images, including their vision rows and modality tags. Empty-text conditioning is stored only when
+crop's first and last images, including their vision rows and modality tags. Training accepts only `--task t2va` caches and rejects
+FL2VA caches because keyframe VAE conditioning rows are unsupported. Empty-text conditioning is stored only when
 `--cache_guidance_empty` is requested.
 
 ## Backend boundary
@@ -88,22 +100,21 @@ latent caching, conditioning caching, generation, and training on separate loadi
 | `minimax_h3_cache_latents.py` | `create_latent_encoder` | Video VAE and audio VAE |
 | `minimax_h3_cache_text_encoder_outputs.py` | `create_conditioning_encoder` | Understanding encoder and its processor |
 | `minimax_h3_generate_video.py` | `create_generator` | Only the transformer variant and decoding components required by the request |
-| `minimax_h3_train_network.py` | `create_training_backend` | Only the selected `fl2va` or `ref2va` transformer; latents and conditioning come from caches |
+| `minimax_h3_train_network.py` | `create_training_backend` | The base `fl2va` transformer in text-only T2VA mode; latents and conditioning come from caches |
 
-The adapter must use strict checkpoint loading and explain every supported key conversion. H3-specific quantization, block
-swapping, and compilation remain disabled until the released checkpoint keys and module boundaries can be validated with real
-forward and backward passes.
+The adapter uses strict checkpoint loading and preserves the released mixed-precision layout. H3-specific quantization, block
+swapping, and compilation are unsupported.
 
 ## LoRA training
 
-The H3 trainer follows Musubi's `NetworkTrainer` and LoRA module contracts. The default `fl2va` mode uses the released base
-transformer, which handles text-only, first-frame, last-frame, and first-and-last-frame conditioning. It jointly noises cached video
+The H3 trainer follows Musubi's `NetworkTrainer` and LoRA module contracts. The default `fl2va` mode selects the released base
+transformer and trains its text-only T2VA path. It packs `[text | target audio | target video]`, jointly noises cached video
 and audio, maps the video sigma onto the synchronized audio schedule, and applies a masked joint velocity loss. Attention and
-feed-forward projections are adapter targets; norms and timestep/modality calibration remain frozen.
+feed-forward projections are adapter targets; norms and timestep/modality calibration stay frozen. First/last-frame latent
+conditioning and Ref2VA training are unsupported and rejected rather than silently omitted.
 
 The default `token` loss mode is an element-weighted reduction over valid latent values; `modality` gives the video and audio means
-equal weight before applying their explicit loss weights. LoHa/LoKr architecture detection remains unavailable until the released
-backend provides its exact class and state-dict mapping.
+equal weight before applying their explicit loss weights. LoHa/LoKr architecture detection is unsupported.
 
 ```shell
 accelerate launch minimax_h3_train_network.py \
@@ -116,8 +127,8 @@ accelerate launch minimax_h3_train_network.py \
   --output_dir output --output_name h3_style
 ```
 
-`--h3_training_mode ref2va` selects a separate reference-conditioned transformer when the backend provides one. Reference training
-requires distinct context and target media; a target must not be reused as its own reference.
+The training backend rejects `--h3_training_mode ref2va`. Reference training requires distinct context and target media; a target
+must not be reused as its own reference.
 
 The official model card identifies the released weights as CFG-distilled. H3 inference uses one model evaluation per sampling step,
 without a negative-prompt branch. Normal LoRA training therefore uses one conditional

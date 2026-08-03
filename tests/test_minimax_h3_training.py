@@ -9,6 +9,7 @@ from torch import nn
 import musubi_tuner.minimax_h3_train_network as h3_train_network
 from musubi_tuner.dataset.bucket import BucketBatchManager
 from musubi_tuner.dataset.image_video_dataset import ItemInfo
+from musubi_tuner.minimax_h3.backend import H3BackendUnavailableError
 from musubi_tuner.minimax_h3.cache import (
     H3_AUDIO_LATENTS_KEY,
     H3_AUDIO_LOSS_MASK_KEY,
@@ -17,6 +18,16 @@ from musubi_tuner.minimax_h3.cache import (
     H3_TEXT_HIDDEN_KEY,
     H3_TEXT_TOKEN_TAGS_KEY,
     save_text_encoder_output_cache_minimax_h3,
+)
+from musubi_tuner.minimax_h3.integration import _NativeTrainingBackend, create_training_backend
+from musubi_tuner.minimax_h3.model import MiniMaxH3Transformer, MiniMaxH3TransformerConfig
+from musubi_tuner.minimax_h3.packing import (
+    build_row_timesteps,
+    build_t2va_packed_sequence,
+    pack_audio_latents,
+    patchify_video_latents,
+    unpack_audio_tokens,
+    unpatchify_video_tokens,
 )
 from musubi_tuner.minimax_h3.training import (
     H3ModelPrediction,
@@ -59,6 +70,147 @@ def test_h3_joint_noising_uses_data_ward_velocity_and_model_time():
     torch.testing.assert_close(result.audio_target, audio - audio_noise)
     torch.testing.assert_close(result.video_timestep, 1 - video_sigma)
     torch.testing.assert_close(result.audio_timestep, 1 - audio_sigma)
+
+
+def test_h3_t2va_packing_matches_released_row_order_rope_clock_and_inverses():
+    video = torch.arange(1 * 4 * 2 * 4 * 4, dtype=torch.float32).reshape(1, 4, 2, 4, 4)
+    audio = torch.arange(1 * 2 * 6 * 3, dtype=torch.float32).reshape(1, 2, 6, 3)
+    video_rows = patchify_video_latents(video, (1, 2, 2))
+    audio_rows = pack_audio_latents(audio)
+    layout = build_t2va_packed_sequence(
+        torch.ones(4, dtype=torch.long),
+        num_latent_frames=2,
+        latent_height=4,
+        latent_width=4,
+        num_audio_latents=3,
+        patch_size=(1, 2, 2),
+    )
+
+    assert video_rows.shape == (1, 8, 16)
+    assert audio_rows.shape == (1, 6, 6)
+    assert layout.sequence_length == 18
+    torch.testing.assert_close(layout.text_indices, torch.arange(4))
+    torch.testing.assert_close(layout.audio_indices, torch.arange(4, 10))
+    torch.testing.assert_close(layout.video_indices, torch.arange(10, 18))
+    torch.testing.assert_close(layout.position_ids[layout.audio_indices, 0], torch.tensor([4, 5, 6, 4, 5, 6], dtype=torch.float64))
+    torch.testing.assert_close(
+        layout.position_ids[layout.audio_indices, 2], torch.tensor([0, 0, 0, 16, 16, 16], dtype=torch.float64)
+    )
+    torch.testing.assert_close(layout.position_ids[layout.video_indices[:4], 0], torch.full((4,), 4.0, dtype=torch.float64))
+    torch.testing.assert_close(
+        layout.position_ids[layout.video_indices[4:], 0],
+        torch.full((4,), 4.0 + 5.0 / 3.0, dtype=torch.float64),
+    )
+
+    timesteps, timestep_indices = build_row_timesteps(layout, torch.tensor([0.3]), torch.tensor([0.7]))
+    torch.testing.assert_close(timesteps, torch.tensor([0.3, 0.7]))
+    assert bool((timestep_indices[layout.audio_indices] == 1).all())
+    assert bool((timestep_indices[layout.text_indices] == 0).all())
+    assert bool((timestep_indices[layout.video_indices] == 0).all())
+    torch.testing.assert_close(
+        unpatchify_video_tokens(video_rows, latent_shape=(4, 2, 4, 4), patch_size=(1, 2, 2)),
+        video,
+    )
+    torch.testing.assert_close(unpack_audio_tokens(audio_rows, num_audio_latents=3), audio)
+
+
+def test_native_h3_t2va_backend_runs_joint_forward_and_backward():
+    config = MiniMaxH3TransformerConfig(
+        num_attention_heads=2,
+        attention_head_dim=16,
+        hidden_size=24,
+        num_layers=2,
+        num_refiner_layers=2,
+        ffn_dim=32,
+        in_channels=4,
+        audio_in_channels=6,
+        patch_size=(1, 2, 2),
+        text_dim=8,
+        freq_dim=8,
+        time_embed_hidden_dim=24,
+        time_embed_dim=16,
+        rope_freq_dim=2,
+    )
+    transformer = MiniMaxH3Transformer(config)
+    transformer.enable_gradient_checkpointing()
+    backend = _NativeTrainingBackend(transformer)
+    video_latents = torch.randn(1, 4, 2, 4, 4)
+    audio_latents = torch.randn(1, 2, 6, 3)
+    inputs = prepare_joint_noisy_inputs(
+        video_latents,
+        audio_latents,
+        torch.randn_like(video_latents),
+        torch.randn_like(audio_latents),
+        torch.tensor([0.6]),
+    )
+    batch = {
+        H3_TEXT_HIDDEN_KEY: [torch.randn(4, 8)],
+        H3_TEXT_TOKEN_TAGS_KEY: [torch.ones(4, dtype=torch.long)],
+    }
+
+    prediction = backend.predict_training(
+        transformer,
+        batch,
+        inputs.video,
+        inputs.audio,
+        inputs.video_timestep,
+        inputs.audio_timestep,
+    )
+    result = joint_velocity_loss(prediction, inputs)
+    result.loss.backward()
+
+    assert prediction.video.shape == video_latents.shape
+    assert prediction.audio.shape == audio_latents.shape
+    assert torch.isfinite(result.loss)
+    assert transformer.blocks[0].attn.qkv_proj.weight.grad is not None
+    assert torch.isfinite(transformer.blocks[0].attn.qkv_proj.weight.grad).all()
+
+
+def test_native_h3_t2va_backend_rejects_visual_conditioning_without_keyframe_latents():
+    config = MiniMaxH3TransformerConfig(
+        num_attention_heads=1,
+        attention_head_dim=8,
+        hidden_size=8,
+        num_layers=1,
+        num_refiner_layers=1,
+        ffn_dim=16,
+        in_channels=4,
+        audio_in_channels=6,
+        patch_size=(1, 2, 2),
+        text_dim=8,
+        freq_dim=8,
+        time_embed_hidden_dim=8,
+        time_embed_dim=8,
+        rope_freq_dim=1,
+    )
+    transformer = MiniMaxH3Transformer(config)
+    backend = _NativeTrainingBackend(transformer)
+    batch = {
+        H3_TEXT_HIDDEN_KEY: [torch.randn(2, 8)],
+        H3_TEXT_TOKEN_TAGS_KEY: [torch.tensor([1, 0])],
+    }
+
+    with pytest.raises(ValueError, match="--task t2va"):
+        backend.predict_training(
+            transformer,
+            batch,
+            torch.randn(1, 4, 1, 2, 2),
+            torch.randn(1, 2, 6, 1),
+            torch.tensor([0.5]),
+            torch.tensor([0.5]),
+        )
+
+
+def test_native_h3_training_backend_rejects_ref2va_forward(tmp_path):
+    with pytest.raises(H3BackendUnavailableError, match="reference-conditioned training"):
+        create_training_backend(
+            model=tmp_path,
+            device="cpu",
+            dtype="bfloat16",
+            mode="ref2va",
+            attention_mode="torch",
+            split_attention=False,
+        )
 
 
 def test_guidance_consistent_prediction_reconstructs_conditional_and_stops_empty_gradient():
