@@ -107,10 +107,19 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             )
         if args.h3_guidance_distillation_scale is not None and args.h3_guidance_distillation_scale <= 1.0:
             raise ValueError("--h3_guidance_distillation_scale must be greater than 1, or omitted for one-pass training")
-        if args.fp8_base or args.fp8_scaled:
-            raise ValueError("MiniMax H3 does not support FP8 training")
-        if args.blocks_to_swap:
-            raise ValueError("MiniMax H3 training does not support block swapping")
+        if args.fp8_base:
+            # H3 supports only weight-only scaled FP8. Reuse the common
+            # --fp8_base switch without exposing an H3-only parser field, and
+            # prevent the base trainer from casting the mixed-precision shell
+            # and norms directly to float8.
+            args.fp8_scaled = True
+        if args.blocks_to_swap is not None and args.blocks_to_swap < 0:
+            raise ValueError("MiniMax H3 --blocks_to_swap must be non-negative")
+        if args.block_swap_h2d_only and not args.use_pinned_memory_for_block_swap:
+            logger.warning(
+                "MiniMax H3 H2D-only block swap without pinned host memory uses staged copies and can be substantially slower; "
+                "add --use_pinned_memory_for_block_swap for direct asynchronous transfers"
+            )
         if args.compile:
             raise ValueError("MiniMax H3 training does not support compilation")
         if not args.sdpa:
@@ -140,7 +149,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         loading_device: str,
         dit_weight_dtype: torch.dtype | None,
     ):
-        del accelerator, dit_weight_dtype
+        if args.fp8_base and dit_weight_dtype is not None:
+            raise ValueError("MiniMax H3 scaled FP8 loading requires dit_weight_dtype=None")
         self.backend = create_training_backend(
             model=Path(dit_path),
             device=str(loading_device),
@@ -148,6 +158,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             mode=args.h3_training_mode,
             attention_mode=attn_mode,
             split_attention=split_attn,
+            fp8_scaled=bool(args.fp8_base),
+            quantization_device=str(accelerator.device),
         )
         transformer = self.backend.get_training_transformer()
         if not isinstance(transformer, torch.nn.Module):

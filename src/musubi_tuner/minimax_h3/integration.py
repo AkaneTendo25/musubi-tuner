@@ -92,6 +92,8 @@ def create_training_backend(
     mode: H3TrainingMode,
     attention_mode: str,
     split_attention: bool,
+    fp8_scaled: bool = False,
+    quantization_device: str | None = None,
 ):
     """Load the released BF16 transformer and adapt its training forward to Musubi."""
     if mode != "fl2va":
@@ -102,7 +104,13 @@ def create_training_backend(
         raise ValueError("the native MiniMax H3 backend supports only unsplit PyTorch SDPA")
     from musubi_tuner.minimax_h3.model_loader import load_transformer
 
-    transformer = load_transformer(model, mode=mode, loading_device=device or "cpu")
+    transformer = load_transformer(
+        model,
+        mode=mode,
+        loading_device=device or "cpu",
+        fp8_scaled=fp8_scaled,
+        quantization_device=quantization_device,
+    )
     return _NativeTrainingBackend(transformer)
 
 

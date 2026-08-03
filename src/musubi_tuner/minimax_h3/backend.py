@@ -110,6 +110,8 @@ def create_training_backend(
     mode: H3TrainingMode,
     attention_mode: str,
     split_attention: bool,
+    fp8_scaled: bool = False,
+    quantization_device: str | None = None,
 ) -> H3TrainingBackend:
     """Load only the transformer required for cache-backed LoRA training.
 
@@ -130,4 +132,6 @@ def create_training_backend(
         mode=mode,
         attention_mode=attention_mode,
         split_attention=split_attention,
+        fp8_scaled=fp8_scaled,
+        quantization_device=quantization_device,
     )

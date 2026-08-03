@@ -30,6 +30,8 @@ from torch import nn
 from torch.nn import functional as F
 from torch.utils.checkpoint import checkpoint
 
+from musubi_tuner.modules.custom_offloading_utils import BlockSwapConfig, create_offloader
+
 MINIMAX_H3_MODALITY_COUNT = 3
 
 
@@ -125,7 +127,12 @@ class MiniMaxH3AdaLNProjection(nn.Module):
         self.linear = nn.Linear(input_dim, output_dim)
 
     def forward(self, timestep_embedding: torch.Tensor) -> torch.Tensor:
-        activated = F.silu(timestep_embedding).to(self.linear.weight.dtype)
+        # Scaled FP8 stores the frozen weight in E4M3 but dequantizes it to the
+        # scale buffer's dtype for the matmul. Casting the activation to the
+        # storage dtype would bypass that compute contract and make F.linear see
+        # mismatched FP8/BF16 operands.
+        compute_dtype = getattr(self.linear, "scale_weight", self.linear.weight).dtype
+        activated = F.silu(timestep_embedding).to(compute_dtype)
         return self.linear(activated)
 
 
@@ -311,6 +318,8 @@ class MiniMaxH3Transformer(nn.Module):
         self.blocks = nn.ModuleList([MiniMaxH3TransformerBlock(config) for _ in range(config.num_layers)])
         self.final_layer = MiniMaxH3FinalLayer(config)
         self.gradient_checkpointing = False
+        self.blocks_to_swap = 0
+        self.offloader = None
 
     @property
     def device(self) -> torch.device:
@@ -327,6 +336,57 @@ class MiniMaxH3Transformer(nn.Module):
 
     def disable_gradient_checkpointing(self) -> None:
         self.gradient_checkpointing = False
+
+    def enable_block_swap(self, blocks_to_swap: int, config: BlockSwapConfig) -> None:
+        num_blocks = len(self.blocks)
+        if blocks_to_swap <= 0:
+            raise ValueError("MiniMax H3 blocks_to_swap must be positive")
+        # Keep two blocks resident, matching the modern single-stack Musubi
+        # implementations and leaving useful overlap headroom for a two-slot
+        # H2D-only ring.
+        max_blocks_to_swap = num_blocks - 2
+        if blocks_to_swap > max_blocks_to_swap:
+            raise ValueError(
+                f"MiniMax H3 cannot swap more than {max_blocks_to_swap} of {num_blocks} blocks; "
+                f"requested {blocks_to_swap}"
+            )
+        self.blocks_to_swap = blocks_to_swap
+        self.offloader = create_offloader(
+            "minimax-h3-block",
+            self.blocks,
+            num_blocks,
+            blocks_to_swap,
+            config,
+        )
+
+    def move_to_device_except_swap_blocks(self, device: torch.device) -> None:
+        if self.blocks_to_swap:
+            saved_blocks = self.blocks
+            self.blocks = nn.ModuleList()
+        self.to(device)
+        if self.blocks_to_swap:
+            self.blocks = saved_blocks
+
+    def prepare_block_swap_before_forward(self) -> None:
+        if not self.blocks_to_swap:
+            return
+        if self.offloader is None:
+            raise RuntimeError("MiniMax H3 block swap is enabled without an offloader")
+        self.offloader.prepare_block_devices_before_forward(self.blocks)
+
+    def switch_block_swap_for_inference(self) -> None:
+        if self.blocks_to_swap:
+            if self.offloader is None:
+                raise RuntimeError("MiniMax H3 block swap is enabled without an offloader")
+            self.offloader.set_forward_only(True)
+            self.prepare_block_swap_before_forward()
+
+    def switch_block_swap_for_training(self) -> None:
+        if self.blocks_to_swap:
+            if self.offloader is None:
+                raise RuntimeError("MiniMax H3 block swap is enabled without an offloader")
+            self.offloader.set_forward_only(False)
+            self.prepare_block_swap_before_forward()
 
     def _checkpointed_block(
         self,
@@ -379,7 +439,9 @@ class MiniMaxH3Transformer(nn.Module):
         if bool(is_padding.any()):
             attention_mask = is_padding[None, :] == is_padding[:, None]
 
-        for block in self.blocks:
+        for block_index, block in enumerate(self.blocks):
+            if self.blocks_to_swap:
+                self.offloader.wait_for_block(block_index)
             if torch.is_grad_enabled() and self.gradient_checkpointing:
                 hidden_states = self._checkpointed_block(
                     block,
@@ -397,5 +459,7 @@ class MiniMaxH3Transformer(nn.Module):
                     rotary_emb,
                     attention_mask,
                 )
+            if self.blocks_to_swap:
+                self.offloader.submit_move_blocks_forward(self.blocks, block_index)
 
         return self.final_layer(hidden_states, timestep_embedding, timestep_indices, video_indices, audio_indices)

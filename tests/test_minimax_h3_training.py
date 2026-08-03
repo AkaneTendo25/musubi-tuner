@@ -599,9 +599,10 @@ def test_h3_trainer_loads_only_the_selected_training_transformer(monkeypatch, tm
     monkeypatch.setattr(h3_train_network, "create_training_backend", create_backend)
     trainer = MiniMaxH3NetworkTrainer()
     trainer.dit_dtype = torch.bfloat16
-    args = SimpleNamespace(h3_training_mode="ref2va")
+    args = SimpleNamespace(h3_training_mode="ref2va", fp8_base=False)
+    accelerator = SimpleNamespace(device=torch.device("cuda", 0))
 
-    loaded = trainer.load_transformer(None, args, str(tmp_path), "torch", False, "cpu", torch.bfloat16)
+    loaded = trainer.load_transformer(accelerator, args, str(tmp_path), "torch", False, "cpu", torch.bfloat16)
 
     assert loaded is transformer
     assert captured == {
@@ -611,14 +612,14 @@ def test_h3_trainer_loads_only_the_selected_training_transformer(monkeypatch, tm
         "mode": "ref2va",
         "attention_mode": "torch",
         "split_attention": False,
+        "fp8_scaled": False,
+        "quantization_device": "cuda:0",
     }
 
 
 @pytest.mark.parametrize(
     ("option", "value", "message"),
     [
-        ("--fp8_base", None, "FP8 training"),
-        ("--blocks_to_swap", "2", "block swapping"),
         ("--compile", None, "compilation"),
         ("--flash_attn", None, "only --sdpa"),
         ("--sdpa", "--split_attn", "split attention"),
@@ -628,6 +629,46 @@ def test_h3_trainer_rejects_release_dependent_common_loading_modes(option, value
     argv = [option] if value is None else [option, value]
     args = create_parser().parse_args(argv)
     with pytest.raises(ValueError, match=message):
+        MiniMaxH3NetworkTrainer().handle_model_specific_args(args)
+
+
+def test_h3_trainer_maps_common_fp8_switch_to_scaled_loading_and_accepts_swap():
+    args = create_parser().parse_args(
+        [
+            "--sdpa",
+            "--fp8_base",
+            "--blocks_to_swap",
+            "2",
+            "--block_swap_h2d_only",
+            "--block_swap_ring_size",
+            "1",
+            "--use_pinned_memory_for_block_swap",
+            "--gradient_checkpointing",
+        ]
+    )
+
+    MiniMaxH3NetworkTrainer().handle_model_specific_args(args)
+
+    assert args.fp8_base is True
+    assert args.fp8_scaled is True
+    assert args.blocks_to_swap == 2
+    assert args.block_swap_h2d_only is True
+    assert args.block_swap_ring_size == 1
+    assert args.use_pinned_memory_for_block_swap is True
+
+
+def test_h3_trainer_warns_when_h2d_swap_uses_unpinned_host_memory(caplog):
+    args = create_parser().parse_args(["--sdpa", "--blocks_to_swap", "2", "--block_swap_h2d_only"])
+
+    MiniMaxH3NetworkTrainer().handle_model_specific_args(args)
+
+    assert "can be substantially slower" in caplog.text
+
+
+def test_h3_trainer_rejects_negative_block_swap_count():
+    args = create_parser().parse_args(["--sdpa", "--blocks_to_swap", "-1"])
+
+    with pytest.raises(ValueError, match="non-negative"):
         MiniMaxH3NetworkTrainer().handle_model_specific_args(args)
 
 
@@ -644,6 +685,8 @@ def test_h3_training_parser_defaults_to_native_fl2va_contract():
     assert args.fp8_scaled is False
     assert "--fp8_base" in parser._option_string_actions
     assert "--blocks_to_swap" in parser._option_string_actions
+    assert "--block_swap_h2d_only" in parser._option_string_actions
+    assert "--block_swap_ring_size" in parser._option_string_actions
     assert "--fp8_scaled" not in parser._option_string_actions
     assert "--int8" not in parser._option_string_actions
     assert "--allow_prequantized_fp8" not in parser._option_string_actions

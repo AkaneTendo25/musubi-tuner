@@ -1,19 +1,29 @@
 from pathlib import Path
+from types import SimpleNamespace
 
+import pytest
 import torch
 from accelerate import init_empty_weights
 from safetensors.torch import save_file
 
+import musubi_tuner.minimax_h3.model as h3_model
 from musubi_tuner.minimax_h3.model import MiniMaxH3Transformer, MiniMaxH3TransformerConfig
-from musubi_tuner.minimax_h3.model_loader import resolve_transformer_checkpoint, validate_transformer_checkpoint
+from musubi_tuner.minimax_h3.model_loader import (
+    H3_FP8_OPTIMIZATION_EXCLUDE_KEYS,
+    H3_FP8_OPTIMIZATION_TARGET_KEYS,
+    resolve_transformer_checkpoint,
+    validate_transformer_checkpoint,
+)
+from musubi_tuner.modules.custom_offloading_utils import BlockSwapConfig
+from musubi_tuner.modules.fp8_optimization_utils import apply_fp8_monkey_patch, optimize_state_dict_with_fp8
 
 
-def _tiny_config() -> MiniMaxH3TransformerConfig:
+def _tiny_config(*, num_layers: int = 2) -> MiniMaxH3TransformerConfig:
     return MiniMaxH3TransformerConfig(
         num_attention_heads=2,
         attention_head_dim=16,
         hidden_size=32,
-        num_layers=2,
+        num_layers=num_layers,
         num_refiner_layers=1,
         ffn_dim=64,
         in_channels=4,
@@ -25,6 +35,21 @@ def _tiny_config() -> MiniMaxH3TransformerConfig:
         time_embed_dim=16,
         rope_freq_dim=2,
     )
+
+
+def _tiny_inputs(*, dtype: torch.dtype = torch.float32) -> dict[str, torch.Tensor]:
+    return {
+        "video_hidden_states": torch.randn(1, 2, 16, dtype=dtype),
+        "audio_hidden_states": torch.randn(1, 4, 8, dtype=dtype),
+        "encoder_hidden_states": torch.randn(1, 3, 12, dtype=dtype),
+        "timestep": torch.tensor([0.25, 0.75]),
+        "timestep_indices": torch.tensor([0, 0, 0, 1, 1, 1, 1, 0, 0]),
+        "token_tags": torch.tensor([1, 1, 1, 2, 2, 2, 2, 0, 0]),
+        "position_ids": torch.arange(27, dtype=torch.float32).reshape(9, 3) / 10,
+        "video_indices": torch.tensor([7, 8]),
+        "audio_indices": torch.tensor([3, 4, 5, 6]),
+        "text_indices": torch.tensor([0, 1, 2]),
+    }
 
 
 def test_native_h3_model_matches_released_full_checkpoint_key_count():
@@ -43,25 +68,7 @@ def test_native_h3_tiny_forward_and_backward():
     torch.manual_seed(1)
     config = _tiny_config()
     model = MiniMaxH3Transformer(config)
-    text_indices = torch.tensor([0, 1, 2])
-    audio_indices = torch.tensor([3, 4, 5, 6])
-    video_indices = torch.tensor([7, 8])
-    token_tags = torch.tensor([1, 1, 1, 2, 2, 2, 2, 0, 0])
-    timestep_indices = torch.tensor([0, 0, 0, 1, 1, 1, 1, 0, 0])
-    position_ids = torch.arange(27, dtype=torch.float32).reshape(9, 3) / 10
-
-    output = model(
-        video_hidden_states=torch.randn(1, 2, 16),
-        audio_hidden_states=torch.randn(1, 4, 8),
-        encoder_hidden_states=torch.randn(1, 3, 12),
-        timestep=torch.tensor([0.25, 0.75]),
-        timestep_indices=timestep_indices,
-        token_tags=token_tags,
-        position_ids=position_ids,
-        video_indices=video_indices,
-        audio_indices=audio_indices,
-        text_indices=text_indices,
-    )
+    output = model(**_tiny_inputs())
 
     assert output.video.shape == (1, 2, 16)
     assert output.audio.shape == (1, 4, 8)
@@ -71,6 +78,301 @@ def test_native_h3_tiny_forward_and_backward():
     assert gradient is not None
     assert torch.isfinite(gradient).all()
     assert torch.count_nonzero(gradient) > 0
+
+
+def test_h3_scaled_fp8_scope_and_forward_backward():
+    torch.manual_seed(2)
+    config = _tiny_config()
+    model = MiniMaxH3Transformer(config)
+    fp32_prefixes = (
+        "video_patch_proj.",
+        "audio_patch_proj.",
+        "time_embedder.",
+        "final_layer.video_out.",
+        "final_layer.audio_out.",
+        "rope.",
+    )
+    state_dict = {
+        name: tensor.detach().to(torch.float32 if name.startswith(fp32_prefixes) else torch.bfloat16).contiguous()
+        for name, tensor in model.state_dict().items()
+    }
+    optimize_state_dict_with_fp8(
+        state_dict,
+        calc_device=torch.device("cpu"),
+        target_layer_keys=H3_FP8_OPTIMIZATION_TARGET_KEYS,
+        exclude_layer_keys=H3_FP8_OPTIMIZATION_EXCLUDE_KEYS,
+    )
+    apply_fp8_monkey_patch(model, state_dict, use_scaled_mm=False)
+    model.load_state_dict(state_dict, strict=True, assign=True)
+    model.requires_grad_(False)
+
+    scale_keys = sorted(key for key in state_dict if key.endswith(".scale_weight"))
+    assert len(scale_keys) == config.num_layers * 5
+    assert model.blocks[0].adaln_proj.linear.weight.dtype == torch.float8_e4m3fn
+    assert model.blocks[0].adaln_proj.linear.scale_weight.dtype == torch.bfloat16
+    assert model.blocks[0].norm1.weight.dtype == torch.bfloat16
+    assert model.token_refiner.blocks[0].attn.qkv_proj.weight.dtype == torch.bfloat16
+    assert model.condition_proj.weight.dtype == torch.bfloat16
+    assert model.time_embedder.proj_in.weight.dtype == torch.float32
+
+    inputs = _tiny_inputs(dtype=torch.bfloat16)
+    inputs["encoder_hidden_states"].requires_grad_(True)
+    output = model(**inputs)
+    loss = output.video.float().square().mean() + output.audio.float().square().mean()
+    loss.backward()
+
+    assert torch.isfinite(output.video).all()
+    assert torch.isfinite(output.audio).all()
+    assert inputs["encoder_hidden_states"].grad is not None
+    assert torch.isfinite(inputs["encoder_hidden_states"].grad).all()
+
+
+def _quantize_tiny_h3_state(model: MiniMaxH3Transformer) -> dict[str, torch.Tensor]:
+    fp32_prefixes = (
+        "video_patch_proj.",
+        "audio_patch_proj.",
+        "time_embedder.",
+        "final_layer.video_out.",
+        "final_layer.audio_out.",
+        "rope.",
+    )
+    state_dict = {
+        name: tensor.detach().to(torch.float32 if name.startswith(fp32_prefixes) else torch.bfloat16).contiguous()
+        for name, tensor in model.state_dict().items()
+    }
+    optimize_state_dict_with_fp8(
+        state_dict,
+        calc_device=torch.device("cpu"),
+        target_layer_keys=H3_FP8_OPTIMIZATION_TARGET_KEYS,
+        exclude_layer_keys=H3_FP8_OPTIMIZATION_EXCLUDE_KEYS,
+    )
+    return state_dict
+
+
+def _load_tiny_h3_scaled_fp8(
+    config: MiniMaxH3TransformerConfig, state_dict: dict[str, torch.Tensor]
+) -> MiniMaxH3Transformer:
+    model = MiniMaxH3Transformer(config)
+    cloned_state = {name: tensor.detach().clone() for name, tensor in state_dict.items()}
+    apply_fp8_monkey_patch(model, cloned_state, use_scaled_mm=False)
+    model.load_state_dict(cloned_state, strict=True, assign=True)
+    model.requires_grad_(False)
+    model.enable_gradient_checkpointing()
+    return model
+
+
+def test_h3_block_swap_uses_complete_offloader_lifecycle(monkeypatch):
+    events = []
+
+    class FakeOffloader:
+        def prepare_block_devices_before_forward(self, blocks):
+            events.append(("prepare", len(blocks)))
+
+        def wait_for_block(self, block_index):
+            events.append(("wait", block_index))
+
+        def submit_move_blocks_forward(self, blocks, block_index):
+            events.append(("submit", block_index, len(blocks)))
+
+        def set_forward_only(self, value):
+            events.append(("forward_only", value))
+
+    captured = {}
+
+    def fake_create_offloader(block_type, blocks, num_blocks, blocks_to_swap, config):
+        captured.update(
+            block_type=block_type,
+            blocks=blocks,
+            num_blocks=num_blocks,
+            blocks_to_swap=blocks_to_swap,
+            config=config,
+        )
+        return FakeOffloader()
+
+    monkeypatch.setattr(h3_model, "create_offloader", fake_create_offloader)
+    config = _tiny_config(num_layers=4)
+    model = MiniMaxH3Transformer(config)
+    swap_config = BlockSwapConfig(device=torch.device("cpu"), supports_backward=True)
+
+    model.enable_block_swap(2, swap_config)
+    model.move_to_device_except_swap_blocks(torch.device("cpu"))
+    model.prepare_block_swap_before_forward()
+    model.switch_block_swap_for_inference()
+    model.switch_block_swap_for_training()
+
+    assert captured == {
+        "block_type": "minimax-h3-block",
+        "blocks": model.blocks,
+        "num_blocks": 4,
+        "blocks_to_swap": 2,
+        "config": swap_config,
+    }
+    assert events[:5] == [
+        ("prepare", 4),
+        ("forward_only", True),
+        ("prepare", 4),
+        ("forward_only", False),
+        ("prepare", 4),
+    ]
+
+    events.clear()
+    model(**_tiny_inputs())
+    assert events == [
+        ("wait", 0),
+        ("submit", 0, 4),
+        ("wait", 1),
+        ("submit", 1, 4),
+        ("wait", 2),
+        ("submit", 2, 4),
+        ("wait", 3),
+        ("submit", 3, 4),
+    ]
+
+
+def test_h3_block_swap_requires_two_resident_blocks(monkeypatch):
+    monkeypatch.setattr(h3_model, "create_offloader", lambda *args, **kwargs: SimpleNamespace())
+    model = MiniMaxH3Transformer(_tiny_config(num_layers=4))
+    config = BlockSwapConfig(device=torch.device("cpu"), supports_backward=True)
+
+    with pytest.raises(ValueError, match="cannot swap more than 2"):
+        model.enable_block_swap(3, config)
+
+
+def test_h3_h2d_only_block_swap_requires_gradient_checkpointing():
+    args = SimpleNamespace(
+        block_swap_h2d_only=True,
+        block_swap_ring_size=2,
+        use_pinned_memory_for_block_swap=False,
+        gradient_checkpointing=False,
+    )
+
+    with pytest.raises(ValueError, match="requires --gradient_checkpointing"):
+        BlockSwapConfig.from_args(args, torch.device("cpu"), supports_backward=True)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for the real block offloaders")
+@pytest.mark.parametrize(
+    ("h2d_only", "ring_size", "use_pinned_memory"),
+    [
+        (False, 2, False),
+        (True, 1, False),
+        (True, 2, False),
+        (True, 2, True),
+    ],
+)
+def test_h3_real_block_swap_forward_backward_parity(h2d_only, ring_size, use_pinned_memory):
+    torch.manual_seed(3)
+    device = torch.device("cuda")
+    config = _tiny_config(num_layers=4)
+    source = MiniMaxH3Transformer(config)
+    source_state = {name: tensor.detach().clone() for name, tensor in source.state_dict().items()}
+    source_inputs = _tiny_inputs()
+    del source
+
+    reference = MiniMaxH3Transformer(config).to(device)
+    reference.load_state_dict(source_state, strict=True)
+    reference.requires_grad_(False)
+    reference.enable_gradient_checkpointing()
+    reference_inputs = {
+        key: value.to(device).requires_grad_(key == "encoder_hidden_states")
+        if value.is_floating_point()
+        else value.to(device)
+        for key, value in source_inputs.items()
+    }
+    reference_output = reference(**reference_inputs)
+    reference_loss = reference_output.video.square().mean() + reference_output.audio.square().mean()
+    reference_loss.backward()
+    reference_video = reference_output.video.detach().clone()
+    reference_audio = reference_output.audio.detach().clone()
+    reference_gradient = reference_inputs["encoder_hidden_states"].grad.detach().clone()
+    del reference, reference_inputs, reference_output, reference_loss
+    torch.cuda.empty_cache()
+
+    swapped = MiniMaxH3Transformer(config)
+    swapped.load_state_dict(source_state, strict=True)
+    swapped.requires_grad_(False)
+    swapped.enable_gradient_checkpointing()
+    args = SimpleNamespace(
+        block_swap_h2d_only=h2d_only,
+        block_swap_ring_size=ring_size,
+        use_pinned_memory_for_block_swap=use_pinned_memory,
+        gradient_checkpointing=True,
+    )
+    swap_config = BlockSwapConfig.from_args(args, device, supports_backward=True)
+    swapped.enable_block_swap(2, swap_config)
+    swapped.move_to_device_except_swap_blocks(device)
+    swapped.prepare_block_swap_before_forward()
+    swapped_inputs = {
+        key: value.to(device).requires_grad_(key == "encoder_hidden_states")
+        if value.is_floating_point()
+        else value.to(device)
+        for key, value in source_inputs.items()
+    }
+    swapped_output = swapped(**swapped_inputs)
+    swapped_loss = swapped_output.video.square().mean() + swapped_output.audio.square().mean()
+    swapped_loss.backward()
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(swapped_output.video, reference_video)
+    torch.testing.assert_close(swapped_output.audio, reference_audio)
+    torch.testing.assert_close(swapped_inputs["encoder_hidden_states"].grad, reference_gradient)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for the real block offloaders")
+@pytest.mark.parametrize(
+    ("h2d_only", "use_pinned_memory"),
+    [(False, False), (True, False), (True, True)],
+)
+def test_h3_scaled_fp8_block_swap_forward_backward_parity(h2d_only, use_pinned_memory):
+    torch.manual_seed(4)
+    device = torch.device("cuda")
+    config = _tiny_config(num_layers=4)
+    source = MiniMaxH3Transformer(config)
+    quantized_state = _quantize_tiny_h3_state(source)
+    source_inputs = _tiny_inputs(dtype=torch.bfloat16)
+    del source
+
+    reference = _load_tiny_h3_scaled_fp8(config, quantized_state).to(device)
+    reference_inputs = {
+        key: value.to(device).requires_grad_(key == "encoder_hidden_states")
+        if value.is_floating_point()
+        else value.to(device)
+        for key, value in source_inputs.items()
+    }
+    reference_output = reference(**reference_inputs)
+    reference_loss = reference_output.video.square().mean() + reference_output.audio.square().mean()
+    reference_loss.backward()
+    reference_video = reference_output.video.detach().clone()
+    reference_audio = reference_output.audio.detach().clone()
+    reference_gradient = reference_inputs["encoder_hidden_states"].grad.detach().clone()
+    del reference, reference_inputs, reference_output, reference_loss
+    torch.cuda.empty_cache()
+
+    swapped = _load_tiny_h3_scaled_fp8(config, quantized_state)
+    args = SimpleNamespace(
+        block_swap_h2d_only=h2d_only,
+        block_swap_ring_size=2,
+        use_pinned_memory_for_block_swap=use_pinned_memory,
+        gradient_checkpointing=True,
+    )
+    swap_config = BlockSwapConfig.from_args(args, device, supports_backward=True)
+    swapped.enable_block_swap(2, swap_config)
+    swapped.move_to_device_except_swap_blocks(device)
+    swapped.prepare_block_swap_before_forward()
+    swapped_inputs = {
+        key: value.to(device).requires_grad_(key == "encoder_hidden_states")
+        if value.is_floating_point()
+        else value.to(device)
+        for key, value in source_inputs.items()
+    }
+    swapped_output = swapped(**swapped_inputs)
+    swapped_loss = swapped_output.video.square().mean() + swapped_output.audio.square().mean()
+    swapped_loss.backward()
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(swapped_output.video, reference_video)
+    torch.testing.assert_close(swapped_output.audio, reference_audio)
+    torch.testing.assert_close(swapped_inputs["encoder_hidden_states"].grad, reference_gradient)
 
 
 def test_h3_checkpoint_validator_accepts_exact_native_mixed_precision_layout(tmp_path: Path):

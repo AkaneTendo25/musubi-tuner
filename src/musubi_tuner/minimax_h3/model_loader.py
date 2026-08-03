@@ -9,6 +9,7 @@ from accelerate import init_empty_weights
 from musubi_tuner.minimax_h3.model import MiniMaxH3Transformer, MiniMaxH3TransformerConfig
 from musubi_tuner.minimax_h3.training import H3TrainingMode
 from musubi_tuner.minimax_h3.weights import CheckpointInspectionError, tensor_metadata
+from musubi_tuner.modules.fp8_optimization_utils import apply_fp8_monkey_patch
 from musubi_tuner.utils.lora_utils import load_safetensors_with_lora_and_fp8
 
 logger = logging.getLogger(__name__)
@@ -26,6 +27,15 @@ _FP32_PREFIXES = (
     "final_layer.audio_out.",
     "rope.",
 )
+
+# Quantize only the 50 repeated denoising blocks. ``blocks.`` also occurs in
+# ``token_refiner.blocks.*``, so that path must be excluded explicitly. Norms
+# are excluded because the shared state-dict quantizer matches tensor names,
+# while its forward patch applies only to nn.Linear modules. AdaLN remains in
+# scope intentionally: it is 13.0B parameters, and the public H3 weight-only
+# quantization implementations also convert the main-block AdaLN linears.
+H3_FP8_OPTIMIZATION_TARGET_KEYS = ["blocks."]
+H3_FP8_OPTIMIZATION_EXCLUDE_KEYS = ["token_refiner", "norm"]
 
 
 def resolve_transformer_checkpoint(source: Path, mode: H3TrainingMode) -> Path:
@@ -92,6 +102,8 @@ def load_transformer(
     *,
     mode: H3TrainingMode,
     loading_device: str | torch.device,
+    fp8_scaled: bool = False,
+    quantization_device: str | torch.device | None = None,
 ) -> MiniMaxH3Transformer:
     checkpoint_path = resolve_transformer_checkpoint(source, mode)
     config = MiniMaxH3TransformerConfig()
@@ -107,19 +119,32 @@ def load_transformer(
         model = MiniMaxH3Transformer(config)
 
     device = torch.device(loading_device)
+    calc_device = torch.device(quantization_device) if quantization_device is not None else device
     state_dict = load_safetensors_with_lora_and_fp8(
         model_files=str(checkpoint_path),
         lora_weights_list=None,
         lora_multipliers=None,
-        fp8_optimization=False,
-        calc_device=device,
-        move_to_device=device.type != "cpu",
+        fp8_optimization=fp8_scaled,
+        calc_device=calc_device,
+        move_to_device=device.type != "cpu" and device == calc_device,
         # Preserve the checkpoint's BF16 blocks and required FP32 islands.
         dit_weight_dtype=None,
+        target_keys=H3_FP8_OPTIMIZATION_TARGET_KEYS if fp8_scaled else None,
+        exclude_keys=H3_FP8_OPTIMIZATION_EXCLUDE_KEYS if fp8_scaled else None,
     )
+    if fp8_scaled:
+        apply_fp8_monkey_patch(model, state_dict, use_scaled_mm=False)
+    if device.type != "cpu" and device != calc_device:
+        state_dict = {key: value.to(device) for key, value in state_dict.items()}
     info = model.load_state_dict(state_dict, strict=True, assign=True)
     if info.missing_keys or info.unexpected_keys:
         raise RuntimeError(f"strict H3 load failed: {info}")
     del state_dict
-    logger.info("Loaded MiniMax H3 %s transformer from %s on %s", mode, checkpoint_path, device)
+    logger.info(
+        "Loaded MiniMax H3 %s transformer from %s on %s%s",
+        mode,
+        checkpoint_path,
+        device,
+        " with scaled FP8 block weights" if fp8_scaled else "",
+    )
     return model

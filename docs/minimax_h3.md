@@ -102,8 +102,8 @@ latent caching, conditioning caching, generation, and training on separate loadi
 | `minimax_h3_generate_video.py` | `create_generator` | Only the transformer variant and decoding components required by the request |
 | `minimax_h3_train_network.py` | `create_training_backend` | The base `fl2va` transformer in text-only T2VA mode; latents and conditioning come from caches |
 
-The adapter uses strict checkpoint loading and preserves the released mixed-precision layout. H3-specific quantization, block
-swapping, and compilation are unsupported.
+The adapter uses strict checkpoint loading and preserves the released mixed-precision layout. Training supports Musubi's common
+`--fp8_base` and block-swap options. Compilation remains unsupported.
 
 ## LoRA training
 
@@ -126,6 +126,27 @@ accelerate launch minimax_h3_train_network.py \
   --max_train_epochs 10 --save_every_n_epochs 1 \
   --output_dir output --output_name h3_style
 ```
+
+`--fp8_base` enables weight-only scaled FP8 for the transformer's block `Linear` weights while keeping the surrounding model in
+its normal mixed-precision dtypes. This includes the large per-block AdaLN projections. For frozen-base LoRA training, H2D-only
+block swapping can be enabled with the common Musubi options:
+
+```shell
+  --fp8_base \
+  --blocks_to_swap 40 \
+  --block_swap_h2d_only \
+  --block_swap_ring_size 2 \
+  --use_pinned_memory_for_block_swap
+```
+
+Pinned host memory is strongly recommended for H2D-only swapping: it permits direct asynchronous host-to-device copies and lets
+the two-buffer ring overlap transfers with transformer computation. The unpinned path remains available, but uses staged copies
+and can be substantially slower for H3's unusually large blocks. H2D-only swapping is valid only while the base transformer is
+frozen; the offloader checks this invariant. At least two of H3's 50 transformer blocks must remain resident.
+
+For memory-constrained CUDA training, PyTorch's expandable allocator segments can reduce reservation fragmentation. Set
+`PYTORCH_ALLOC_CONF=expandable_segments:True` before launching the process. This is a PyTorch environment setting rather than an
+H3-specific command-line option.
 
 The training backend rejects `--h3_training_mode ref2va`. Reference training requires distinct context and target media; a target
 must not be reused as its own reference.

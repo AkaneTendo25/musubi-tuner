@@ -570,7 +570,13 @@ def test_h3_cache_and_generation_parsers_do_not_advertise_unimplemented_loading_
         (
             "create_training_backend",
             {"model": Path("model")},
-            {"mode": "ref2va", "attention_mode": "torch", "split_attention": False},
+            {
+                "mode": "ref2va",
+                "attention_mode": "torch",
+                "split_attention": False,
+                "fp8_scaled": False,
+                "quantization_device": None,
+            },
         ),
     ],
 )
