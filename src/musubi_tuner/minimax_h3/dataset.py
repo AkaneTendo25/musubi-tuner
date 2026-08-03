@@ -4,9 +4,10 @@ import copy
 import json
 import os
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any
 
 from musubi_tuner.dataset import config_utils
 from musubi_tuner.dataset.architectures import ARCHITECTURE_MINIMAX_H3
@@ -15,7 +16,6 @@ from musubi_tuner.dataset.image_video_dataset import DatasetGroup, ItemInfo
 from musubi_tuner.dataset.media_utils import IMAGE_EXTENSIONS, VIDEO_EXTENSIONS, glob_videos
 from musubi_tuner.minimax_h3.architecture import is_valid_frame_count
 from musubi_tuner.minimax_h3.media import MediaAsset, MediaModality, slice_media_asset
-
 
 AUDIO_EXTENSIONS = (".wav", ".flac", ".mp3", ".m4a", ".aac", ".ogg", ".opus")
 _CONTROL_PATH_PATTERN = re.compile(r"^control_path_(\d+)$")

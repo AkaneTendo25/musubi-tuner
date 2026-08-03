@@ -5,6 +5,12 @@ import random
 import numpy as np
 import torch
 
+from musubi_tuner.minimax_h3.architecture import (
+    AUDIO_CHANNELS,
+    AUDIO_HOP_LENGTH,
+    AUDIO_SAMPLE_RATE,
+    temporal_shape,
+)
 from musubi_tuner.minimax_h3.media import (
     AudioClip,
     AudioProcessingSpec,
@@ -14,12 +20,6 @@ from musubi_tuner.minimax_h3.media import (
     MissingMediaPolicy,
     PadMode,
     fit_audio_length,
-)
-from musubi_tuner.minimax_h3.architecture import (
-    AUDIO_CHANNELS,
-    AUDIO_HOP_LENGTH,
-    AUDIO_SAMPLE_RATE,
-    temporal_shape,
 )
 
 
@@ -144,7 +144,7 @@ def target_audio_processing_spec(asset: MediaAsset) -> AudioProcessingSpec:
         raise ValueError("target_audio_processing_spec requires an H3 target video")
     frame_count = asset.metadata.get("frame_count")
     if not isinstance(frame_count, int):
-        raise ValueError("H3 target video metadata must contain an integer frame_count")
+        raise TypeError("H3 target video metadata must contain an integer frame_count")
     shape = temporal_shape(frame_count)
     return AudioProcessingSpec(
         sample_rate=AUDIO_SAMPLE_RATE,

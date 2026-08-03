@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 from safetensors import safe_open
+from safetensors.torch import load_file
 from torch import nn
 
 import musubi_tuner.minimax_h3_train_network as h3_train_network
@@ -364,6 +365,108 @@ def test_h3_lora_targets_main_attention_and_ff_only():
     adapter_grads = [parameter.grad for parameter in network.parameters()]
     assert any(gradient is not None and torch.isfinite(gradient).all() and bool(gradient.abs().sum()) for gradient in adapter_grads)
     assert all(parameter.grad is None for parameter in transformer.transformer_blocks[0].adaln_proj.parameters())
+
+
+def test_native_h3_lora_optimizer_step_and_save_reload_are_equivalent(tmp_path):
+    torch.manual_seed(7)
+    config = MiniMaxH3TransformerConfig(
+        num_attention_heads=2,
+        attention_head_dim=16,
+        hidden_size=24,
+        num_layers=2,
+        num_refiner_layers=1,
+        ffn_dim=32,
+        in_channels=4,
+        audio_in_channels=6,
+        patch_size=(1, 2, 2),
+        text_dim=8,
+        freq_dim=8,
+        time_embed_hidden_dim=24,
+        time_embed_dim=16,
+        rope_freq_dim=2,
+    )
+    transformer = MiniMaxH3Transformer(config).requires_grad_(False)
+    base_state = {name: value.detach().clone() for name, value in transformer.state_dict().items()}
+    network = lora_minimax_h3.create_arch_network(1.0, 2, 2.0, None, [], transformer)
+    assert len(network.unet_loras) == config.num_layers * 4
+    assert all(
+        module.lora_name.endswith(("_attn_qkv_proj", "_attn_out_proj", "_mlp_fc1", "_mlp_fc2")) for module in network.unet_loras
+    )
+    network.apply_to(None, transformer, apply_text_encoder=False, apply_unet=True)
+
+    optimizer_groups, descriptions = network.prepare_optimizer_params(unet_lr=1e-2)
+    assert descriptions == ["unet"]
+    optimizer = torch.optim.AdamW(optimizer_groups, weight_decay=0.0)
+    backend = _NativeTrainingBackend(transformer)
+    video_latents = torch.randn(1, 4, 2, 4, 4)
+    audio_latents = torch.randn(1, 2, 6, 3)
+    inputs = prepare_joint_noisy_inputs(
+        video_latents,
+        audio_latents,
+        torch.randn_like(video_latents),
+        torch.randn_like(audio_latents),
+        torch.tensor([0.6]),
+    )
+    batch = {
+        H3_TEXT_HIDDEN_KEY: [torch.randn(4, 8)],
+        H3_TEXT_TOKEN_TAGS_KEY: [torch.ones(4, dtype=torch.long)],
+    }
+
+    prediction = backend.predict_training(
+        transformer,
+        batch,
+        inputs.video,
+        inputs.audio,
+        inputs.video_timestep,
+        inputs.audio_timestep,
+    )
+    joint_velocity_loss(prediction, inputs).loss.backward()
+    adapter_gradients = [parameter.grad for parameter in network.parameters()]
+    assert all(gradient is not None and torch.isfinite(gradient).all() for gradient in adapter_gradients)
+    assert any(bool(gradient.abs().sum()) for gradient in adapter_gradients)
+    assert all(parameter.grad is None for parameter in transformer.parameters())
+
+    before_step = {name: parameter.detach().clone() for name, parameter in network.named_parameters()}
+    optimizer.step()
+    assert any(not torch.equal(before_step[name], parameter) for name, parameter in network.named_parameters())
+    for name, value in transformer.state_dict().items():
+        torch.testing.assert_close(value, base_state[name])
+
+    with torch.no_grad():
+        trained_prediction = backend.predict_training(
+            transformer,
+            batch,
+            inputs.video,
+            inputs.audio,
+            inputs.video_timestep,
+            inputs.audio_timestep,
+        )
+
+    checkpoint = tmp_path / "h3_lora.safetensors"
+    network.save_weights(checkpoint, torch.float32, {"architecture": "minimax_h3"})
+    weights = load_file(checkpoint)
+    assert len(weights) == len(network.unet_loras) * 3
+    assert not any("adaln" in name or "norm" in name for name in weights)
+
+    restored_transformer = MiniMaxH3Transformer(config).requires_grad_(False)
+    restored_transformer.load_state_dict(base_state)
+    restored_network = lora_minimax_h3.create_arch_network_from_weights(1.0, weights, unet=restored_transformer)
+    restored_network.apply_to(None, restored_transformer, apply_text_encoder=False, apply_unet=True)
+    load_info = restored_network.load_weights(checkpoint)
+    assert not load_info.missing_keys
+    assert not load_info.unexpected_keys
+    with torch.no_grad():
+        restored_prediction = _NativeTrainingBackend(restored_transformer).predict_training(
+            restored_transformer,
+            batch,
+            inputs.video,
+            inputs.audio,
+            inputs.video_timestep,
+            inputs.audio_timestep,
+        )
+
+    torch.testing.assert_close(restored_prediction.video, trained_prediction.video)
+    torch.testing.assert_close(restored_prediction.audio, trained_prediction.audio)
 
 
 class _FakeAccelerator:

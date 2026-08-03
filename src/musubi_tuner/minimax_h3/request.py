@@ -1,11 +1,11 @@
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Iterable
 
-from musubi_tuner.minimax_h3.architecture import H3TemporalShape, VIDEO_FPS, temporal_shape
+from musubi_tuner.minimax_h3.architecture import VIDEO_FPS, H3TemporalShape, temporal_shape
 
 
 class ReferenceKind(str, Enum):
