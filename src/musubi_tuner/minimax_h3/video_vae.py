@@ -386,6 +386,21 @@ class MiniMaxH3VideoEncoderModel(nn.Module):
         std = self.latents_std.view(1, -1, 1, 1, 1)
         return (latent - mean) / std
 
+    def encode_image(self, pixels: torch.Tensor) -> torch.Tensor:
+        """Encode a still directly as one causal VAE frame.
+
+        Image training must not route through :meth:`encode_moments`, which
+        pads inputs to a 17-frame video clip. The released causal encoder can
+        consume one frame directly; its final moments row is the image latent.
+        """
+        if pixels.ndim != 5 or pixels.shape[1] != 3 or pixels.shape[2] != 1:
+            raise ValueError(f"image pixels must have shape [B, 3, 1, H, W], got {tuple(pixels.shape)}")
+        moments = self._encode_clip(pixels)[:, :, -1:]
+        latent = moments.chunk(2, dim=1)[0].float()
+        mean = self.latents_mean.view(1, -1, 1, 1, 1)
+        std = self.latents_std.view(1, -1, 1, 1, 1)
+        return (latent - mean) / std
+
     def encode_reference(self, pixels: torch.Tensor, *, image: bool) -> torch.Tensor:
         """Encode FL2VA/Ref2VA visual conditioning with the released sampled-posterior recipe."""
         if pixels.ndim != 5 or pixels.shape[1] != 3:

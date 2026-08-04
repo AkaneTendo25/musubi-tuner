@@ -13,7 +13,7 @@ from musubi_tuner.dataset import config_utils
 from musubi_tuner.dataset.architectures import ARCHITECTURE_MINIMAX_H3
 from musubi_tuner.dataset.config_utils import BlueprintGenerator, ConfigSanitizer
 from musubi_tuner.dataset.image_video_dataset import DatasetGroup, ItemInfo
-from musubi_tuner.dataset.media_utils import IMAGE_EXTENSIONS, VIDEO_EXTENSIONS, glob_videos
+from musubi_tuner.dataset.media_utils import IMAGE_EXTENSIONS, VIDEO_EXTENSIONS, glob_images, glob_videos
 from musubi_tuner.minimax_h3.architecture import is_valid_frame_count
 from musubi_tuner.minimax_h3.media import MediaAsset, MediaModality, slice_media_asset
 
@@ -84,7 +84,7 @@ def _references_from_directory(control_directory: str, target_paths: Sequence[st
     return result
 
 
-def _read_video_jsonl(path: str) -> list[dict[str, Any]]:
+def _read_media_jsonl(path: str) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     with open(path, "r", encoding="utf-8") as stream:
         for line_number, line in enumerate(stream, 1):
@@ -120,6 +120,7 @@ class H3DatasetAdapter:
         self._targets: dict[str, _ResolvedTarget] = {}
         self._target_groups: list[tuple[str, ...]] = []
         self._target_fps: dict[str, float] = {}
+        self._target_modalities: dict[str, MediaModality] = {}
         general = user_config.get("general", {})
         clean_general = self.musubi_config.get("general", {})
         clean_general.pop("control_directory", None)
@@ -127,23 +128,42 @@ class H3DatasetAdapter:
         source_datasets = user_config.get("datasets", [])
         clean_datasets = self.musubi_config.get("datasets", [])
         for source, clean in zip(source_datasets, clean_datasets):
-            target_frames = _effective(source, general, "target_frames")
-            invalid_frames = [frame_count for frame_count in target_frames or () if not is_valid_frame_count(frame_count)]
-            if invalid_frames:
-                raise ValueError(f"MiniMax H3 target_frames must satisfy frame_count % 17 == 5; invalid values: {invalid_frames}")
             control_directory = _effective(source, general, "control_directory")
             clean.pop("control_directory", None)
             video_directory = _effective(source, general, "video_directory")
             video_jsonl_file = _effective(source, general, "video_jsonl_file")
+            image_directory = _effective(source, general, "image_directory")
+            image_jsonl_file = _effective(source, general, "image_jsonl_file")
 
             records: list[dict[str, Any]] | None = None
             if video_directory:
+                target_frames = _effective(source, general, "target_frames")
+                invalid_frames = [frame_count for frame_count in target_frames or () if not is_valid_frame_count(frame_count)]
+                if invalid_frames:
+                    raise ValueError(
+                        "MiniMax H3 video target_frames must satisfy frame_count % 17 == 5; "
+                        f"invalid values: {invalid_frames}"
+                    )
                 target_paths = tuple(glob_videos(video_directory))
             elif video_jsonl_file:
-                records = _read_video_jsonl(video_jsonl_file)
+                target_frames = _effective(source, general, "target_frames")
+                invalid_frames = [frame_count for frame_count in target_frames or () if not is_valid_frame_count(frame_count)]
+                if invalid_frames:
+                    raise ValueError(
+                        "MiniMax H3 video target_frames must satisfy frame_count % 17 == 5; "
+                        f"invalid values: {invalid_frames}"
+                    )
+                records = _read_media_jsonl(video_jsonl_file)
                 target_paths = tuple(record["video_path"] for record in records)
+            elif image_directory:
+                target_paths = tuple(glob_images(image_directory))
+            elif image_jsonl_file:
+                records = _read_media_jsonl(image_jsonl_file)
+                target_paths = tuple(record.get("image_path") or record.get("image_path_0") for record in records)
+                if any(not target for target in target_paths):
+                    raise ValueError("H3 image JSONL records must contain image_path or image_path_0")
             else:
-                raise ValueError("MiniMax H3 requires a Musubi video dataset")
+                raise ValueError("MiniMax H3 requires a Musubi image or video dataset")
 
             if control_directory and records and any(_ordered_control_paths(record) for record in records):
                 raise ValueError("specify H3 controls in control_directory or video JSONL, not both")
@@ -154,11 +174,19 @@ class H3DatasetAdapter:
                 for record in records:
                     controls = _ordered_control_paths(record)
                     if controls:
-                        reference_paths[record["video_path"]] = controls
+                        target_key = record.get("video_path") or record.get("image_path") or record.get("image_path_0")
+                        if target_key is None:
+                            raise ValueError("H3 media JSONL records must contain a target path")
+                        reference_paths[target_key] = controls
             else:
                 reference_paths = {}
 
             for target in target_paths:
+                modality = _modality_for_path(Path(target))
+                if (video_directory or video_jsonl_file) and modality is not MediaModality.VIDEO:
+                    raise ValueError(f"MiniMax H3 video datasets must resolve video targets, got {target}")
+                if (image_directory or image_jsonl_file) and modality is not MediaModality.IMAGE:
+                    raise ValueError(f"MiniMax H3 image datasets must resolve image targets, got {target}")
                 references = tuple(
                     MediaAsset(path, _modality_for_path(path), "reference") for path in reference_paths.get(target, ())
                 )
@@ -167,7 +195,14 @@ class H3DatasetAdapter:
                 if normal in self._targets:
                     raise ValueError(f"duplicate H3 target path across datasets: {target}")
                 self._targets[normal] = resolved
+                self._target_modalities[normal] = modality
             self._target_groups.append(tuple(_normal_path(target) for target in target_paths))
+
+        self.requires_audio = any(modality is MediaModality.VIDEO for modality in self._target_modalities.values()) or any(
+            reference.modality is MediaModality.AUDIO
+            for resolved in self._targets.values()
+            for reference in resolved.references
+        )
 
     def adapt_dataset_group(self, dataset_group: DatasetGroup) -> None:
         if len(dataset_group.datasets) != len(self._target_groups):
@@ -176,12 +211,15 @@ class H3DatasetAdapter:
             datasource = dataset.datasource
             if hasattr(datasource, "data"):
                 for record in datasource.data:
-                    record.pop("control_path", None)
+                    for key in tuple(record):
+                        if key == "control_path" or _CONTROL_PATH_PATTERN.fullmatch(key):
+                            record.pop(key, None)
                 datasource.has_control = False
             dataset.control_directory = None
             dataset.has_control = False
             for target in target_group:
-                self._target_fps[target] = dataset.target_fps
+                if self._target_modalities[target] is MediaModality.VIDEO:
+                    self._target_fps[target] = dataset.target_fps
 
     def _resolve_target(self, item_key: str) -> tuple[_ResolvedTarget, int | None, int | None]:
         exact = self._targets.get(_normal_path(item_key))
@@ -195,19 +233,25 @@ class H3DatasetAdapter:
             resolved = self._targets.get(_normal_path(candidate))
             if resolved is not None:
                 return resolved, int(match.group("start")), int(match.group("frames"))
-        raise KeyError(f"H3 dataset adapter cannot map ItemInfo key to a source video: {item_key}")
+        raise KeyError(f"H3 dataset adapter cannot map ItemInfo key to source media: {item_key}")
 
     def attach(self, item: ItemInfo) -> tuple[MediaAsset, ...]:
         resolved, start_frame, frame_count = self._resolve_target(item.item_key)
-        target_fps = self._target_fps[_normal_path(resolved.path)]
+        normal = _normal_path(resolved.path)
+        modality = self._target_modalities[normal]
+        target_fps = self._target_fps.get(normal)
         target_frame_count = frame_count if frame_count is not None else item.frame_count
         target = MediaAsset(
             resolved.path,
-            MediaModality.VIDEO,
+            modality,
             "target",
-            metadata={"frame_count": target_frame_count, "fps": target_fps},
+            metadata=(
+                {"frame_count": target_frame_count, "fps": target_fps}
+                if modality is MediaModality.VIDEO
+                else {"frame_count": 1}
+            ),
         )
-        if start_frame is not None and frame_count is not None:
+        if modality is MediaModality.VIDEO and start_frame is not None and frame_count is not None:
             target = slice_media_asset(
                 target,
                 start_seconds=start_frame / target_fps,
@@ -253,8 +297,8 @@ def attach_h3_media(
 
 def validate_h3_media_assets(key: str, assets: tuple[MediaAsset, ...], *, check_files: bool = True) -> None:
     targets = tuple(asset for asset in assets if asset.role == "target")
-    if len(targets) != 1 or targets[0].modality is not MediaModality.VIDEO:
-        raise ValueError(f"H3 item {key!r} must contain exactly one target video")
+    if len(targets) != 1 or targets[0].modality not in {MediaModality.IMAGE, MediaModality.VIDEO}:
+        raise ValueError(f"H3 item {key!r} must contain exactly one target image or video")
     unsupported_roles = sorted({asset.role for asset in assets if asset.role not in {"target", "reference"}})
     if unsupported_roles:
         raise ValueError(f"H3 item {key!r} contains unsupported roles: {unsupported_roles}")

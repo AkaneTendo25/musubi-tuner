@@ -11,7 +11,7 @@ from musubi_tuner.minimax_h3.training import H3ModelPrediction, H3TrainingMode
 
 class H3LatentEncoder(Protocol):
     def encode_latents(self, batch: list[Any]) -> Any:
-        """Encode joint AV caches, retaining silent audio latents with an all-false audio loss mask."""
+        """Encode image or joint AV caches; image caches contain no audio tensors."""
         ...
 
 
@@ -57,11 +57,11 @@ def _validate_dtype(dtype: str) -> None:
 def create_latent_encoder(
     *,
     video_vae: Path,
-    audio_vae: Path,
+    audio_vae: Path | None,
     device: str | None,
     dtype: str,
 ) -> H3LatentEncoder:
-    """Load only the video and audio VAEs required for latent caching."""
+    """Load the video VAE and, for video datasets, the audio VAE used by latent caching."""
     _validate_dtype(dtype)
     from musubi_tuner.minimax_h3.integration import create_latent_encoder as create_integrated_latent_encoder
 

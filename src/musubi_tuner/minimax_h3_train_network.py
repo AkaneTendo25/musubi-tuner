@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import gc
 import logging
 import math
@@ -17,7 +18,14 @@ from musubi_tuner.dataset import config_utils
 from musubi_tuner.dataset.architectures import ARCHITECTURE_MINIMAX_H3, ARCHITECTURE_MINIMAX_H3_FULL
 from musubi_tuner.hv_train import get_sigmas
 from musubi_tuner.hv_train_network import NetworkTrainer, read_config_from_file, setup_parser_common
-from musubi_tuner.minimax_h3.architecture import AUDIO_FLOW_SHIFT, VIDEO_FLOW_SHIFT, align_frame_count
+from musubi_tuner.minimax_h3.architecture import (
+    AUDIO_CHANNELS,
+    AUDIO_FLOW_SHIFT,
+    AUDIO_LATENT_CHANNELS,
+    VIDEO_DIT_PATCH_SIZE,
+    VIDEO_FLOW_SHIFT,
+    align_frame_count,
+)
 from musubi_tuner.minimax_h3.backend import H3TrainingBackend, create_conditioning_encoder, create_training_backend
 from musubi_tuner.minimax_h3.cache import (
     H3_AUDIO_LATENTS_KEY,
@@ -136,6 +144,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             value = float(getattr(args, name))
             if not 0.01 <= value <= 100.0:
                 raise ValueError(f"--{name} must be in [0.01, 100.0], got {value}")
+        if args.h3_image_flow_shift is not None and args.h3_image_flow_shift <= 0:
+            raise ValueError("MiniMax H3 --h3_image_flow_shift must be positive when specified")
         if args.h3_guidance_distillation_scale is not None and args.h3_guidance_distillation_scale <= 1.0:
             raise ValueError("--h3_guidance_distillation_scale must be greater than 1, or omitted for one-pass training")
         if args.fp8_base:
@@ -454,26 +464,49 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         del network, network_dtype, vae, global_step
         if latents.shape[0] != 1:
             raise ValueError("MiniMax H3 training requires dataset batch_size = 1")
-        if H3_AUDIO_LATENTS_KEY not in batch:
-            raise KeyError(f"MiniMax H3 cache is missing {H3_AUDIO_LATENTS_KEY}")
-
         latents = latents.to(device=accelerator.device, dtype=dit_dtype)
         noise = noise.to(device=accelerator.device, dtype=dit_dtype)
-        audio_latents = batch[H3_AUDIO_LATENTS_KEY].to(device=accelerator.device, dtype=dit_dtype)
+        is_image = H3_AUDIO_LATENTS_KEY not in batch
+        if is_image:
+            if latents.shape[2] != 1:
+                raise KeyError(
+                    f"MiniMax H3 video cache is missing {H3_AUDIO_LATENTS_KEY}; "
+                    "only one-frame image caches may omit audio"
+                )
+            audio_latents = latents.new_zeros((latents.shape[0], AUDIO_CHANNELS, AUDIO_LATENT_CHANNELS, 0))
+        else:
+            audio_latents = batch[H3_AUDIO_LATENTS_KEY].to(device=accelerator.device, dtype=dit_dtype)
         audio_noise = torch.randn_like(audio_latents)
 
+        scheduler_args = args
+        if is_image:
+            patch_h, patch_w = VIDEO_DIT_PATCH_SIZE[-2:]
+            latent_height, latent_width = latents.shape[-2:]
+            if latent_height % patch_h or latent_width % patch_w:
+                raise ValueError("MiniMax H3 image latent dimensions must be divisible by the spatial patch size")
+            scheduler_args = copy.copy(args)
+            if args.h3_image_flow_shift is None:
+                # Use the common logit-normal density with a
+                # resolution-aware shift for image batches.
+                scheduler_args.timestep_sampling = "krea2_shift"
+            else:
+                scheduler_args.timestep_sampling = "shift"
+                scheduler_args.discrete_flow_shift = args.h3_image_flow_shift
+
         _, scheduler_timesteps = super().get_noisy_model_input_and_timesteps(
-            args, noise, latents, batch["timesteps"], noise_scheduler, accelerator.device, dit_dtype
+            scheduler_args, noise, latents, batch["timesteps"], noise_scheduler, accelerator.device, dit_dtype
         )
-        base_sigma = self._base_sigma(args, noise_scheduler, scheduler_timesteps, accelerator.device, dit_dtype)
+        base_sigma = self._base_sigma(scheduler_args, noise_scheduler, scheduler_timesteps, accelerator.device, dit_dtype)
         inputs = prepare_joint_noisy_inputs(
             latents,
             audio_latents,
             noise,
             audio_noise,
             base_sigma,
-            video_shift=args.h3_shift_video,
-            audio_shift=args.h3_shift_audio,
+            # Image sampling already returned its final shifted sigma. Video
+            # batches instead receive H3's synchronized 12/3 shifts here.
+            video_shift=1.0 if is_image else args.h3_shift_video,
+            audio_shift=1.0 if is_image else args.h3_shift_audio,
         )
 
         if args.h3_guidance_distillation_scale is not None:
@@ -534,6 +567,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             "ss_h3_loss_balance": args.h3_loss_balance,
             "ss_h3_video_loss_weight": str(args.h3_video_loss_weight),
             "ss_h3_audio_loss_weight": str(args.h3_audio_loss_weight),
+            "ss_h3_image_flow_shift": str(args.h3_image_flow_shift or "resolution_aware"),
             "ss_h3_guidance_distillation_scale": str(args.h3_guidance_distillation_scale or "one_pass"),
             "ss_h3_shift_video": str(args.h3_shift_video),
             "ss_h3_shift_audio": str(args.h3_shift_audio),
@@ -566,6 +600,15 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     )
     parser.add_argument("--h3_video_loss_weight", type=float, default=1.0)
     parser.add_argument("--h3_audio_loss_weight", type=float, default=1.0)
+    parser.add_argument(
+        "--h3_image_flow_shift",
+        type=float,
+        default=None,
+        help=(
+            "override the default logit-normal, resolution-aware flow shift for image batches; "
+            "video batches continue to use the released synchronized H3 schedule"
+        ),
+    )
     parser.add_argument(
         "--h3_guidance_distillation_scale",
         type=float,

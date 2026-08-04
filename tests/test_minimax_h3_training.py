@@ -168,6 +168,22 @@ def test_h3_t2va_packing_matches_released_row_order_rope_clock_and_inverses():
     torch.testing.assert_close(unpack_audio_tokens(audio_rows, num_audio_latents=3), audio)
 
 
+def test_h3_image_packing_has_no_audio_rows():
+    layout = build_t2va_packed_sequence(
+        torch.ones(4, dtype=torch.long),
+        num_latent_frames=1,
+        latent_height=4,
+        latent_width=4,
+        num_audio_latents=0,
+        patch_size=(1, 2, 2),
+    )
+
+    assert layout.audio_indices.numel() == 0
+    assert layout.num_condition_audio_rows == 0
+    assert layout.video_indices.numel() == 4
+    assert layout.sequence_length == 8
+
+
 def test_h3_fl2va_keyframes_precede_targets_and_share_target_rotary_anchors():
     layout = build_t2va_packed_sequence(
         torch.tensor([1, 0, 1, 0]),
@@ -302,6 +318,60 @@ def test_native_h3_t2va_backend_runs_joint_forward_and_backward():
     assert torch.isfinite(result.loss)
     assert transformer.blocks[0].attn.qkv_proj.weight.grad is not None
     assert torch.isfinite(transformer.blocks[0].attn.qkv_proj.weight.grad).all()
+
+
+def test_native_h3_image_backend_runs_video_only_forward_and_backward():
+    config = MiniMaxH3TransformerConfig(
+        num_attention_heads=2,
+        attention_head_dim=16,
+        hidden_size=24,
+        num_layers=2,
+        num_refiner_layers=1,
+        ffn_dim=32,
+        in_channels=4,
+        audio_in_channels=6,
+        patch_size=(1, 2, 2),
+        text_dim=8,
+        freq_dim=8,
+        time_embed_hidden_dim=24,
+        time_embed_dim=16,
+        rope_freq_dim=2,
+    )
+    transformer = MiniMaxH3Transformer(config)
+    backend = _NativeTrainingBackend(transformer)
+    video = torch.randn(1, 4, 1, 4, 4)
+    audio = torch.empty(1, 2, 6, 0)
+    inputs = prepare_joint_noisy_inputs(
+        video,
+        audio,
+        torch.randn_like(video),
+        torch.empty_like(audio),
+        torch.tensor([0.6]),
+        video_shift=1.0,
+        audio_shift=1.0,
+    )
+    batch = {
+        H3_TEXT_HIDDEN_KEY: [torch.randn(4, 8)],
+        H3_TEXT_TOKEN_TAGS_KEY: [torch.ones(4, dtype=torch.long)],
+        H3_CONDITIONING_TASK_KEY: [torch.tensor(H3_CONDITIONING_TASK_IDS["t2va"])],
+    }
+
+    prediction = backend.predict_training(
+        transformer,
+        batch,
+        inputs.video,
+        inputs.audio,
+        inputs.video_timestep,
+        inputs.audio_timestep,
+    )
+    result = joint_velocity_loss(prediction, inputs)
+    result.loss.backward()
+
+    assert prediction.video.shape == video.shape
+    assert prediction.audio.shape == audio.shape
+    assert result.audio_elements == 0
+    assert torch.isfinite(result.loss)
+    assert transformer.blocks[0].attn.qkv_proj.weight.grad is not None
 
 
 def test_native_h3_t2va_backend_rejects_visual_conditioning_without_keyframe_latents():
@@ -822,6 +892,41 @@ def test_h3_trainer_joint_process_batch_routes_optional_guidance(guidance_scale,
     assert transformer.scale.grad is not None and torch.isfinite(transformer.scale.grad)
     assert set(metrics) == {"loss/video", "loss/audio", "h3/sigma_video", "h3/sigma_audio"}
     assert metrics["loss/audio"] == 0.0
+
+
+def test_h3_trainer_image_process_batch_uses_resolution_schedule_without_audio():
+    args = create_parser().parse_args([])
+    trainer = MiniMaxH3NetworkTrainer()
+    trainer.dit_dtype = torch.float32
+    backend = _FakeBackend()
+    trainer.backend = backend
+    transformer = _ScaleTransformer()
+    video = torch.zeros(1, 24, 1, 4, 4)
+    batch = {"timesteps": [0.5]}
+
+    loss, metrics = trainer.process_batch(
+        args,
+        _FakeAccelerator(),
+        transformer,
+        None,
+        batch,
+        video,
+        torch.ones_like(video),
+        None,
+        torch.float32,
+        torch.float32,
+        None,
+        0,
+    )
+    loss.backward()
+
+    expected_shift = torch.exp(torch.tensor(0.5 + (4 - 256) * (1.15 - 0.5) / (6400 - 256)))
+    expected_sigma = expected_shift / (1.0 + expected_shift)
+    assert metrics["h3/sigma_video"] == pytest.approx(float(expected_sigma))
+    assert metrics["h3/sigma_audio"] == pytest.approx(float(expected_sigma))
+    assert metrics["loss/audio"] == 0.0
+    assert backend.calls == [("prompt", True)]
+    assert transformer.scale.grad is not None
 
 
 def test_h3_trainer_build_dataset_routes_through_h3_adapter(monkeypatch):

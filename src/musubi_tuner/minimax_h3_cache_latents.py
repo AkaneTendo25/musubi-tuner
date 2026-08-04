@@ -19,7 +19,11 @@ logger = logging.getLogger(__name__)
 
 def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     parser.description = "Cache MiniMax H3 latents with Musubi's dataset and cache pipeline"
-    parser.add_argument("--audio_vae", type=Path, help="H3 audio VAE checkpoint or Comfy model directory")
+    parser.add_argument(
+        "--audio_vae",
+        type=Path,
+        help="H3 audio VAE checkpoint or Comfy model directory (required for videos, omitted for images)",
+    )
     parser.set_defaults(vae_dtype="float32")
     return parser
 
@@ -50,8 +54,8 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     if args.vae is None:
         parser.error("--vae is required unless --debug_mode is used")
-    if args.audio_vae is None:
-        parser.error("--audio_vae is required unless --debug_mode is used")
+    if dataset_adapter.requires_audio and args.audio_vae is None:
+        parser.error("--audio_vae is required for H3 video datasets; omit it for image-only datasets")
 
     encoder = create_latent_encoder(
         video_vae=Path(args.vae),

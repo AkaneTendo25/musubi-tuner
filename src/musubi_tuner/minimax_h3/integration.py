@@ -11,7 +11,7 @@ import numpy as np
 import torch
 from PIL import Image
 
-from musubi_tuner.minimax_h3.architecture import temporal_shape
+from musubi_tuner.minimax_h3.architecture import IMAGE_FRAME_COUNT, temporal_shape
 from musubi_tuner.minimax_h3.audio import (
     audio_valid_mask_to_latent_mask,
     load_audio_asset,
@@ -74,15 +74,15 @@ logger = logging.getLogger(__name__)
 def create_latent_encoder(
     *,
     video_vae: Path,
-    audio_vae: Path,
+    audio_vae: Path | None,
     device: str | None,
     dtype: str,
 ):
-    """Load the released video and audio VAEs and adapt their encoders to Musubi."""
+    """Load the released video VAE and the optional target/reference audio VAE."""
     target_device = torch.device(device or "cpu")
     output_dtype = str_to_dtype(dtype)
     video_encoder = load_video_vae_encoder(video_vae, target_device)
-    audio_encoder = load_audio_vae_encoder(audio_vae, target_device)
+    audio_encoder = load_audio_vae_encoder(audio_vae, target_device) if audio_vae is not None else None
     return _NativeLatentEncoder(video_encoder, audio_encoder, output_dtype)
 
 
@@ -545,6 +545,8 @@ class _NativeTrainingBackend:
         audio_rows = pack_audio_latents(audio_hidden_states)
         _, _, latent_frames, latent_height, latent_width = video_hidden_states.shape
         num_audio_latents = audio_hidden_states.shape[-1]
+        if num_audio_latents == 0 and (self.mode != "fl2va" or task != "t2va"):
+            raise ValueError("MiniMax H3 image training currently requires the FL2VA transformer with --task t2va caches")
         model_device = video_hidden_states.device
         if self.mode == "ref2va":
             references, reference_video, reference_audio = self._reference_cache(
@@ -724,7 +726,7 @@ class _NativeLatentEncoder:
     def __init__(
         self,
         video_encoder: torch.nn.Module,
-        audio_encoder: torch.nn.Module,
+        audio_encoder: torch.nn.Module | None,
         output_dtype: torch.dtype,
     ) -> None:
         self.video_encoder = video_encoder
@@ -734,14 +736,18 @@ class _NativeLatentEncoder:
     @staticmethod
     def _target_asset(item: Any):
         assets = getattr(item, "h3_media_assets", ())
-        targets = [asset for asset in assets if asset.role == "target" and asset.modality is MediaModality.VIDEO]
+        targets = [
+            asset
+            for asset in assets
+            if asset.role == "target" and asset.modality in {MediaModality.IMAGE, MediaModality.VIDEO}
+        ]
         if len(targets) != 1:
-            raise ValueError(f"H3 item {item.item_key!r} must have one attached target video")
+            raise ValueError(f"H3 item {item.item_key!r} must have one attached target image or video")
         return targets[0]
 
-    def _encode_video(self, content: np.ndarray) -> torch.Tensor:
+    def _encode_video(self, content: np.ndarray, *, is_image: bool) -> torch.Tensor:
         if not isinstance(content, np.ndarray):
-            raise TypeError("MiniMax H3 latent caching requires a numpy video array")
+            raise TypeError("MiniMax H3 latent caching requires a numpy image or video array")
         if content.ndim == 3:
             content = content[None]
         if content.ndim != 4 or content.shape[-1] != 3:
@@ -754,7 +760,8 @@ class _NativeLatentEncoder:
         pixel_std = pixels.new_tensor((0.229, 0.224, 0.225)).view(1, 3, 1, 1, 1)
         pixels = ((pixels - pixel_mean) / pixel_std).to(weight_dtype)
         with torch.no_grad():
-            return self.video_encoder.encode(pixels)[0].to(self.output_dtype)
+            encode = self.video_encoder.encode_image if is_image else self.video_encoder.encode
+            return encode(pixels)[0].to(self.output_dtype)
 
     def _encode_reference_video(self, content: np.ndarray, *, image: bool) -> torch.Tensor:
         if content.ndim == 3:
@@ -770,6 +777,8 @@ class _NativeLatentEncoder:
             return self.video_encoder.encode_reference(pixels, image=image)[0].to(self.output_dtype)
 
     def _encode_reference_audio(self, waveform: torch.Tensor) -> torch.Tensor:
+        if self.audio_encoder is None:
+            raise ValueError("MiniMax H3 audio references require --audio_vae during latent caching")
         device = next(self.audio_encoder.parameters()).device
         with torch.no_grad():
             latents = self.audio_encoder.encode(waveform.to(device=device, dtype=torch.float32).unsqueeze(1))
@@ -825,6 +834,10 @@ class _NativeLatentEncoder:
 
     def _encode_audio(self, item: Any) -> tuple[torch.Tensor, torch.Tensor]:
         target = self._target_asset(item)
+        if target.modality is not MediaModality.VIDEO:
+            raise ValueError("MiniMax H3 target audio is defined only for video targets")
+        if self.audio_encoder is None:
+            raise ValueError("MiniMax H3 video latent caching requires --audio_vae")
         clip = load_audio_asset(target, target_audio_processing_spec(target))
         if clip is None:
             raise RuntimeError("H3 target audio policy unexpectedly dropped the target")
@@ -841,31 +854,38 @@ class _NativeLatentEncoder:
         dtype_name = dtype_to_str(self.output_dtype)
         results = []
         for item in batch:
-            video = self._encode_video(item.content)
-            expected = temporal_shape(video_frame_count := int(item.content.shape[0]))
-            if video.shape[1] != expected.video_latent_frames:
+            target = self._target_asset(item)
+            is_image = target.modality is MediaModality.IMAGE
+            video = self._encode_video(item.content, is_image=is_image)
+            video_frame_count = IMAGE_FRAME_COUNT if is_image else int(item.content.shape[0])
+            expected_video_frames = IMAGE_FRAME_COUNT if is_image else temporal_shape(video_frame_count).video_latent_frames
+            if video.shape[1] != expected_video_frames:
                 raise ValueError(
                     f"H3 video VAE produced {video.shape[1]} latent frames for {video_frame_count} pixels; "
-                    f"expected {expected.video_latent_frames}"
+                    f"expected {expected_video_frames}"
                 )
-            audio, audio_mask = self._encode_audio(item)
-            if audio.shape[-1] != expected.audio_latent_frames:
-                raise ValueError(f"H3 audio VAE produced {audio.shape[-1]} rows; expected {expected.audio_latent_frames}")
             frame_shape = "x".join(str(value) for value in video.shape[-3:])
-            tensors = {
-                f"latents_{frame_shape}_{dtype_name}": video,
-                f"{H3_AUDIO_LATENTS_KEY}_2x32x{audio.shape[-1]}_{dtype_name}": audio,
-                H3_AUDIO_LOSS_MASK_KEY: audio_mask,
-            }
-            first = self._encode_reference_video(item.content[0], image=True)
-            last = self._encode_reference_video(item.content[-1], image=True)
-            keyframe_rows = torch.cat(
-                (
-                    patchify_video_latents(first[None], (1, 2, 2))[0],
-                    patchify_video_latents(last[None], (1, 2, 2))[0],
+            tensors = {f"latents_{frame_shape}_{dtype_name}": video}
+            if not is_image:
+                expected = temporal_shape(video_frame_count)
+                audio, audio_mask = self._encode_audio(item)
+                if audio.shape[-1] != expected.audio_latent_frames:
+                    raise ValueError(f"H3 audio VAE produced {audio.shape[-1]} rows; expected {expected.audio_latent_frames}")
+                tensors.update(
+                    {
+                        f"{H3_AUDIO_LATENTS_KEY}_2x32x{audio.shape[-1]}_{dtype_name}": audio,
+                        H3_AUDIO_LOSS_MASK_KEY: audio_mask,
+                    }
                 )
-            )
-            tensors[f"varlen_{H3_KEYFRAME_VIDEO_ROWS_KEY}_{dtype_name}"] = keyframe_rows
+                first = self._encode_reference_video(item.content[0], image=True)
+                last = self._encode_reference_video(item.content[-1], image=True)
+                keyframe_rows = torch.cat(
+                    (
+                        patchify_video_latents(first[None], (1, 2, 2))[0],
+                        patchify_video_latents(last[None], (1, 2, 2))[0],
+                    )
+                )
+                tensors[f"varlen_{H3_KEYFRAME_VIDEO_ROWS_KEY}_{dtype_name}"] = keyframe_rows
             tensors.update(self._encode_references(item))
             results.append(tensors)
         return tuple(results)

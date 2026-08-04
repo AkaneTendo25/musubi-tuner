@@ -110,16 +110,20 @@ It reports checkpoint components, shards, tensor counts, parameter counts, dtype
 
 ## Dataset and cache layout
 
-The complete workflow is: install Musubi, download the five required component/metadata groups, create the dataset configuration,
-cache AV latents, cache Qwen conditioning, launch training, inspect TensorBoard, and evaluate checkpoints through training-time or
+The complete workflow is: install Musubi, download the required component/metadata groups, create the dataset configuration,
+cache latents, cache Qwen conditioning, launch training, inspect TensorBoard, and evaluate checkpoints through training-time or
 standalone sampling. Latent and conditioning caches must both be created before training; the trainer does not load either VAE or
-Qwen merely to reconstruct missing caches.
+Qwen merely to reconstruct missing caches. Image-only training does not require the audio VAE.
 
 H3 reuses Musubi's standard video dataset and control fields. A target video's embedded soundtrack is the synchronized audio target.
 When a target video has no audio stream, latent caching encodes duration-matched silence and marks its entire audio loss mask invalid,
 so T2VA can train on video-only examples. A present but corrupt audio stream remains an error. Reference image,
 video, or audio assets use `control_directory`, `control_path`, or numbered `control_path_N` fields; no H3-specific dataset schema is
 required.
+
+Still-image training likewise reuses Musubi's standard `image_directory` or `image_jsonl_file` fields. Each target is encoded
+directly as one causal video-VAE frame and produces no target-audio cache. Image and video datasets may coexist in one training
+configuration; only configurations containing video targets or audio references require `--audio_vae` while caching latents.
 
 The released processor uses a 768-pixel short edge with a 1344x768 area cap. Other 32-pixel-aligned dimensions are structurally
 valid, but are outside the released processor's native canvas distribution.
@@ -128,6 +132,7 @@ Complete dataset examples are provided for every implemented training task:
 
 | Training task | Dataset example | Transformer | Text-cache task | Training mode |
 | --- | --- | --- | --- | --- |
+| Text-conditioned image | [`image.toml`](../examples/minimax_h3/image.toml) | FL2VA | `t2va` | `fl2va` (default) |
 | Text-conditioned T2VA | [`t2va.toml`](../examples/minimax_h3/t2va.toml) | FL2VA | `t2va` | `fl2va` (default) |
 | First-frame I2V | [`i2va.toml`](../examples/minimax_h3/i2va.toml) | FL2VA | `i2va` | `fl2va` (default) |
 | First+last-frame video | [`fl2va.toml`](../examples/minimax_h3/fl2va.toml) | FL2VA | `fl2va` | `fl2va` (default) |
@@ -172,6 +177,20 @@ python minimax_h3_cache_text_encoder_outputs.py \\
   --tokenizer /models/MiniMax-H3-metadata/FL2VA/text_encoder \\
   --task t2va \\
   --device cuda
+```
+
+For an image-only dataset, use the same commands but omit `--audio_vae` from latent caching. Use `--task t2va` for its text cache:
+
+```shell
+python minimax_h3_cache_latents.py \
+  --dataset_config examples/minimax_h3/image.toml \
+  --vae /models/MiniMax-H3/vae/minimax_h3_video_vae_fp16.safetensors \
+  --device cuda
+python minimax_h3_cache_text_encoder_outputs.py \
+  --dataset_config examples/minimax_h3/image.toml \
+  --text_encoder /models/MiniMax-H3/text_encoders/qwen3vl_32b_minimax_h3_bf16.safetensors \
+  --tokenizer /models/MiniMax-H3-metadata/FL2VA/text_encoder \
+  --task t2va --device cuda
 ```
 
 For Ref2VA, the latent-cache command is unchanged and automatically encodes attached references. Change the text-cache command to
@@ -227,7 +246,7 @@ latent caching, conditioning caching, generation, and training on separate loadi
 
 | Script | Integration factory | Components loaded |
 | --- | --- | --- |
-| `minimax_h3_cache_latents.py` | `create_latent_encoder` | Video VAE and audio VAE |
+| `minimax_h3_cache_latents.py` | `create_latent_encoder` | Video VAE; audio VAE only for video targets or audio references |
 | `minimax_h3_cache_text_encoder_outputs.py` | `create_conditioning_encoder` | Understanding encoder and its processor |
 | `minimax_h3_generate_video.py` | `create_generator` | Only the transformer variant and decoding components required by the request |
 | `minimax_h3_train_network.py` | `create_training_backend` | The selected `fl2va` or `ref2va` transformer; target and reference latents and conditioning come from caches |
@@ -244,11 +263,12 @@ keyframe conditions between text and target audio. Keyframes use the released fi
 jointly noise the target video and audio from one shared schedule coordinate and apply the same masked joint velocity loss.
 Attention and feed-forward projections are adapter targets; norms and timestep/modality calibration stay frozen.
 
-The first-frame `i2va` path is independently corroborated by the public
-[AI Toolkit implementation](https://github.com/ostris/ai-toolkit/blob/18f5810d6c3248dc7edd8f79f3b6cc8c15c2fc98/extensions_built_in/diffusion_models/minimax_h3/minimax_h3.py).
-The `fl2va` first+last variant uses the same released keyframe representation and public
-[ComfyUI inference contract](https://github.com/Comfy-Org/ComfyUI/blob/9a9fdb10ed144ce760d9682cb247526ea23cc525/comfy_extras/nodes_minimax_h3.py),
-but remains experimental for training until it has a controlled real-weight backward and sampling comparison.
+An image batch packs `[text | target image latent]`, has no audio rows, and applies loss only to its one target video-latent frame.
+It requires the FL2VA transformer and a `--task t2va` conditioning cache. Target stills use the deterministic posterior
+mean from a direct causal `T=1` VAE encode; they are not repeated into a synthetic 17-frame video clip.
+
+The first-frame `i2va` path uses the released keyframe representation. The `fl2va` first+last variant uses the same representation
+and public [ComfyUI inference contract](https://github.com/Comfy-Org/ComfyUI/blob/9a9fdb10ed144ce760d9682cb247526ea23cc525/comfy_extras/nodes_minimax_h3.py).
 
 Ref2VA selects the dedicated released transformer with `--h3_training_mode ref2va`. References are packed in dataset order as
 `[text | ordered reference blocks | target audio | target video]`. Image and video anchors use the released sampled-posterior VAE
@@ -293,6 +313,12 @@ it near the middle, which combined with a large video shift leaves very few step
 (`flux_shift`, `qwen_shift`, `krea2_shift`, `ideogram4_shift`, `qinglong_*`) derive a shift of their own from the latent shape and
 apply it before H3's, giving a doubly-shifted schedule; they also read only the two trailing latent dimensions, so they ignore
 H3's temporal extent entirely and are not meaningful here.
+
+Image batches are the deliberate exception. They use Musubi's existing `krea2_shift` implementation: a logit-normal base density
+followed by a resolution-aware `exp(mu)` shift over the spatial DiT-token count. This image sigma is already final and is therefore
+not shifted by H3's video schedule a second time. Video batches in the
+same run continue to use the synchronized released 12/3 AV schedule. `--h3_image_flow_shift` optionally replaces the automatic
+image shift with a fixed positive value; it does not affect video batches.
 
 ```shell
 accelerate launch minimax_h3_train_network.py \

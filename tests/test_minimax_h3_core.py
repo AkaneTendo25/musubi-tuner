@@ -293,6 +293,62 @@ def test_h3_reuses_numbered_jsonl_control_paths(tmp_path):
     assert group.datasets[0].datasource.has_control is False
 
 
+def test_h3_image_dataset_uses_existing_musubi_fields_and_needs_no_audio_vae(tmp_path):
+    images = tmp_path / "images"
+    images.mkdir()
+    target = images / "target.png"
+    target.write_bytes(b"image fixture")
+    config = {
+        "general": {"resolution": [512, 512], "batch_size": 1},
+        "datasets": [
+            {
+                "image_directory": str(images),
+                "cache_directory": str(tmp_path / "cache"),
+            }
+        ],
+    }
+
+    group, adapter = create_h3_dataset_group(config, Namespace(debug_dataset=False))
+    item = ItemInfo(str(target), "prompt", (512, 512), (512, 512), frame_count=1)
+    assets = adapter.attach(item)
+
+    assert group.datasets[0].architecture == ARCHITECTURE_MINIMAX_H3
+    assert adapter.requires_audio is False
+    assert [(asset.modality, asset.role) for asset in assets] == [(MediaModality.IMAGE, "target")]
+    assert assets[0].metadata == {"frame_count": 1}
+
+
+def test_h3_mixed_image_video_dataset_requires_audio_only_for_video_items(tmp_path):
+    images = tmp_path / "images"
+    videos = tmp_path / "videos"
+    images.mkdir()
+    videos.mkdir()
+    image = images / "image.png"
+    video = videos / "video.mp4"
+    image.write_bytes(b"image fixture")
+    video.write_bytes(b"video fixture")
+    config = {
+        "general": {"resolution": [512, 512], "batch_size": 1},
+        "datasets": [
+            {"image_directory": str(images), "cache_directory": str(tmp_path / "image_cache")},
+            {
+                "video_directory": str(videos),
+                "cache_directory": str(tmp_path / "video_cache"),
+                "target_frames": [22],
+            },
+        ],
+    }
+
+    group, adapter = create_h3_dataset_group(config, Namespace(debug_dataset=False))
+    image_item = ItemInfo(str(image), "image", (512, 512), (512, 512), frame_count=1)
+    video_item = ItemInfo(str(video), "video", (512, 512), (512, 512, 22), frame_count=22)
+
+    assert len(group.datasets) == 2
+    assert adapter.requires_audio is True
+    assert adapter.attach(image_item)[0].modality is MediaModality.IMAGE
+    assert adapter.attach(video_item)[0].modality is MediaModality.VIDEO
+
+
 def test_h3_dataset_adapter_does_not_add_shared_config_fields(tmp_path):
     config = {
         "general": {"resolution": [512, 512]},
@@ -474,6 +530,18 @@ def test_native_cache_io_records_audio_tensor_and_architecture(tmp_path):
         assert handle.metadata()["frame_count"] == "22"
 
 
+def test_native_cache_io_accepts_one_frame_image_without_audio(tmp_path):
+    cache = tmp_path / "image_mmh3.safetensors"
+    item = ItemInfo("image.png", "caption", (512, 512), (512, 512), frame_count=1, latent_cache_path=str(cache))
+    item.h3_media_assets = (MediaAsset(Path("image.png"), MediaModality.IMAGE, "target"),)
+
+    save_latent_cache_minimax_h3(item, {"latents_1x2x3_float32": torch.ones(24, 1, 2, 3)})
+
+    with safe_open(cache, framework="pt") as handle:
+        assert set(handle.keys()) == {"latents_1x2x3_float32"}
+        assert handle.metadata()["frame_count"] == "1"
+
+
 def test_native_latent_encoder_caches_first_and_last_fl2va_keyframe_rows():
     class VideoEncoder(torch.nn.Module):
         def __init__(self):
@@ -498,7 +566,11 @@ def test_native_latent_encoder_caches_first_and_last_fl2va_keyframe_rows():
     encoder._encode_references = lambda item: {}
     content = np.zeros((5, 32, 32, 3), dtype=np.uint8)
     content[-1] = 255
-    item = SimpleNamespace(content=content, item_key="sample")
+    item = SimpleNamespace(
+        content=content,
+        item_key="sample",
+        h3_media_assets=(MediaAsset(Path("sample.mp4"), MediaModality.VIDEO, "target"),),
+    )
 
     (tensors,) = encoder.encode_latents([item])
 
@@ -506,6 +578,36 @@ def test_native_latent_encoder_caches_first_and_last_fl2va_keyframe_rows():
     assert tensors[key].shape == (2, 96)
     assert len(video_encoder.anchor_values) == 2
     assert video_encoder.anchor_values[0] != video_encoder.anchor_values[1]
+
+
+def test_native_latent_encoder_uses_direct_image_vae_path_and_omits_audio():
+    class VideoEncoder(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.marker = torch.nn.Parameter(torch.zeros(()), requires_grad=False)
+            self.image_calls = 0
+
+        def encode_image(self, pixels):
+            assert pixels.shape == (1, 3, 1, 32, 32)
+            self.image_calls += 1
+            return torch.zeros(1, 24, 1, 2, 2)
+
+        def encode(self, pixels):
+            raise AssertionError("image target must not use padded video encoding")
+
+    video_encoder = VideoEncoder()
+    encoder = h3_integration._NativeLatentEncoder(video_encoder, None, torch.float32)
+    encoder._encode_references = lambda item: {}
+    item = SimpleNamespace(
+        content=np.zeros((32, 32, 3), dtype=np.uint8),
+        item_key="image.png",
+        h3_media_assets=(MediaAsset(Path("image.png"), MediaModality.IMAGE, "target"),),
+    )
+
+    (tensors,) = encoder.encode_latents([item])
+
+    assert video_encoder.image_calls == 1
+    assert set(tensors) == {"latents_1x2x2_float32"}
 
 
 def test_h3_training_uses_crop_specific_text_cache_identity(tmp_path):

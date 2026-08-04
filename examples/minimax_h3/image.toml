@@ -1,0 +1,14 @@
+# MiniMax H3 still-image LoRA training. Images are encoded directly as one
+# causal video-VAE frame; no target audio cache or audio VAE is required.
+
+[general]
+resolution = [768, 768]
+caption_extension = ".txt"
+batch_size = 1
+enable_bucket = true
+bucket_no_upscale = false
+
+[[datasets]]
+image_directory = "/path/to/images"
+cache_directory = "/path/to/cache"
+num_repeats = 1
