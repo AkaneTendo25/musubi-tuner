@@ -25,6 +25,7 @@ from musubi_tuner.minimax_h3.cache import (
     H3_REFERENCE_VIDEO_SHAPES_KEY,
     H3_TEXT_HIDDEN_KEY,
     H3_TEXT_TOKEN_TAGS_KEY,
+    H3_VIDEO_GEOMETRY_KEY,
     save_text_encoder_output_cache_minimax_h3,
 )
 from musubi_tuner.minimax_h3.integration import _NativeTrainingBackend
@@ -182,6 +183,43 @@ def test_h3_image_packing_has_no_audio_rows():
     assert layout.num_condition_audio_rows == 0
     assert layout.video_indices.numel() == 4
     assert layout.sequence_length == 8
+
+
+def test_h3_audio_only_packing_has_no_video_rows():
+    layout = build_t2va_packed_sequence(
+        torch.ones(4, dtype=torch.long),
+        num_latent_frames=0,
+        latent_height=4,
+        latent_width=4,
+        num_audio_latents=3,
+        patch_size=(1, 2, 2),
+    )
+
+    assert layout.video_indices.numel() == 0
+    assert layout.audio_indices.numel() == 6
+    assert layout.sequence_length == 10
+
+
+@pytest.mark.parametrize("target", ["video", "audio"])
+def test_h3_modality_only_noising_and_loss(target):
+    video = torch.zeros(1, 4, 1, 2, 2) if target == "video" else None
+    audio = torch.zeros(1, 2, 6, 3) if target == "audio" else None
+    inputs = prepare_joint_noisy_inputs(
+        video,
+        audio,
+        torch.ones_like(video) if video is not None else None,
+        torch.ones_like(audio) if audio is not None else None,
+        torch.tensor([0.5]),
+    )
+    prediction = H3ModelPrediction(
+        video=inputs.video_target.clone() if inputs.video_target is not None else None,
+        audio=inputs.audio_target.clone() if inputs.audio_target is not None else None,
+    )
+    result = joint_velocity_loss(prediction, inputs)
+
+    assert result.loss == 0
+    assert (result.video_elements > 0) == (target == "video")
+    assert (result.audio_elements > 0) == (target == "audio")
 
 
 def test_h3_fl2va_keyframes_precede_targets_and_share_target_rotary_anchors():
@@ -526,6 +564,53 @@ def test_native_h3_ref2va_backend_runs_target_only_forward_and_backward():
     assert transformer.blocks[0].attn.qkv_proj.weight.grad is not None
 
 
+@pytest.mark.parametrize("target", ["video", "audio"])
+def test_native_h3_backend_runs_modality_only_forward_and_backward(target):
+    config = MiniMaxH3TransformerConfig(
+        num_attention_heads=2,
+        attention_head_dim=16,
+        hidden_size=24,
+        num_layers=2,
+        num_refiner_layers=2,
+        ffn_dim=32,
+        in_channels=4,
+        audio_in_channels=6,
+        patch_size=(1, 2, 2),
+        text_dim=8,
+        freq_dim=8,
+        time_embed_hidden_dim=24,
+        time_embed_dim=16,
+        rope_freq_dim=2,
+    )
+    transformer = MiniMaxH3Transformer(config)
+    backend = _NativeTrainingBackend(transformer)
+    video = torch.randn(1, 4, 1, 2, 2) if target == "video" else None
+    audio = torch.randn(1, 2, 6, 2) if target == "audio" else None
+    batch = {
+        H3_TEXT_HIDDEN_KEY: [torch.randn(3, 8)],
+        H3_TEXT_TOKEN_TAGS_KEY: [torch.ones(3, dtype=torch.long)],
+        H3_CONDITIONING_TASK_KEY: [torch.tensor(H3_CONDITIONING_TASK_IDS["t2va"])],
+    }
+    if target == "audio":
+        batch[H3_VIDEO_GEOMETRY_KEY] = [torch.tensor([2, 2])]
+
+    prediction = backend.predict_training(
+        transformer,
+        batch,
+        video,
+        audio,
+        torch.tensor([0.4]),
+        torch.tensor([0.7]),
+    )
+    output = prediction.video if target == "video" else prediction.audio
+    loss = output.square().mean()
+    loss.backward()
+
+    assert prediction.video is None if target == "audio" else prediction.video.shape == video.shape
+    assert prediction.audio is None if target == "video" else prediction.audio.shape == audio.shape
+    assert transformer.blocks[0].attn.qkv_proj.weight.grad is not None
+
+
 def test_native_h3_ref2va_backend_rejects_text_only_conditioning_cache():
     transformer = SimpleNamespace(config=SimpleNamespace(in_channels=4, audio_in_channels=6, text_dim=8))
     backend = _NativeTrainingBackend(transformer, mode="ref2va")
@@ -845,7 +930,10 @@ class _FakeBackend:
     ):
         del batch, video_timestep, audio_timestep
         self.calls.append((conditioning, torch.is_grad_enabled()))
-        return H3ModelPrediction(video_hidden_states * transformer.scale, audio_hidden_states * transformer.scale)
+        return H3ModelPrediction(
+            video_hidden_states * transformer.scale if video_hidden_states is not None else None,
+            audio_hidden_states * transformer.scale if audio_hidden_states is not None else None,
+        )
 
 
 @pytest.mark.parametrize(

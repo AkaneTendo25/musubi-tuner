@@ -1174,6 +1174,10 @@ class NetworkTrainer:
         output = self.call_dit(args, accelerator, transformer, latents, batch, noise, noisy_model_input, timesteps, network_dtype)
         return self.compute_loss(args, output, timesteps, noise_scheduler, dit_dtype, network_dtype, global_step)
 
+    def get_primary_latents(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
+        """Return the tensor used by the common loop for noise/schedule setup."""
+        return batch["latents"]
+
     def compute_loss(
         self,
         args: argparse.Namespace,
@@ -2048,7 +2052,7 @@ class NetworkTrainer:
             for step, batch in enumerate(train_dataloader):
                 # torch.compiler.cudagraph_mark_step_begin() # for cudagraphs
 
-                latents = batch["latents"]
+                latents = self.get_primary_latents(batch)
 
                 with accelerator.accumulate(training_model):
                     accelerator.unwrap_model(network).on_step_start()

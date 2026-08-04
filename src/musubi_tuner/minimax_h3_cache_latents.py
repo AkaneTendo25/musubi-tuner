@@ -52,13 +52,13 @@ def main(argv: Sequence[str] | None = None) -> None:
         cache_latents.show_datasets(datasets, args.debug_mode, args.console_width, args.console_back, args.console_num_images)
         return
 
-    if args.vae is None:
-        parser.error("--vae is required unless --debug_mode is used")
+    if dataset_adapter.requires_video and args.vae is None:
+        parser.error("--vae is required for H3 visual targets or references")
     if dataset_adapter.requires_audio and args.audio_vae is None:
         parser.error("--audio_vae is required for H3 video datasets; omit it for image-only datasets")
 
     encoder = create_latent_encoder(
-        video_vae=Path(args.vae),
+        video_vae=Path(args.vae) if args.vae is not None else None,
         audio_vae=args.audio_vae,
         device=str(device),
         dtype=args.vae_dtype or "float32",

@@ -205,8 +205,12 @@ def build_t2va_packed_sequence(
         raise ValueError(f"the released H3 transformer requires temporal patch size 1, got {patch_t}")
     if latent_height % patch_h or latent_width % patch_w:
         raise ValueError("H3 latent height and width must be divisible by the spatial patch")
-    if num_latent_frames < 1 or num_audio_latents < 0:
-        raise ValueError("H3 video latent length must be positive and audio latent length cannot be negative")
+    if num_latent_frames < 0 or num_audio_latents < 0:
+        raise ValueError("H3 target latent lengths cannot be negative")
+    if num_latent_frames == 0 and num_audio_latents == 0:
+        raise ValueError("H3 packed sequences require at least one target modality")
+    if keyframe_anchors and num_latent_frames == 0:
+        raise ValueError("H3 keyframe conditioning requires a video target")
 
     rows_per_frame = (latent_height // patch_h) * (latent_width // patch_w)
     if any(anchor not in ("first", "last") for anchor in keyframe_anchors):

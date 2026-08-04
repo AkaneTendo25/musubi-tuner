@@ -140,7 +140,14 @@ required.
 
 Still-image training likewise reuses Musubi's standard `image_directory` or `image_jsonl_file` fields. Each target is encoded
 directly as one causal video-VAE frame and produces no target-audio cache. Image and video datasets may coexist in one training
-configuration; only configurations containing video targets or audio references require `--audio_vae` while caching latents.
+configuration; joint AV/video soundtracks, audio-only targets, and audio references require `--audio_vae` while caching latents.
+
+True modality-only training is explicit and does not use masked dummy targets. Set `h3_target_mode = "video"` on a normal
+video dataset to omit audio decoding, audio caching, and audio transformer rows. For audio-only training, set
+`h3_target_mode = "audio"` and provide either `audio_directory` (same-stem `.txt` captions) or `audio_jsonl_file` (records with
+`audio_path` and `caption`). Audio-only datasets reuse `target_frames` to define duration on H3's 24-fps temporal grid; currently
+exactly one valid `17k+5` value is required. Their `resolution` defines only the latent canvas used for H3's audio rotary positions.
+Use `--task t2va` for both modality-only modes. Video-only latent caching omits `--audio_vae`; audio-only caching omits `--vae`.
 
 The released processor uses a 768-pixel short edge with a 1344x768 area cap. Other 32-pixel-aligned dimensions are structurally
 valid, but are outside the released processor's native canvas distribution.
@@ -151,6 +158,8 @@ Complete dataset examples are provided for every implemented training task:
 | --- | --- | --- | --- | --- |
 | Text-conditioned image | [`image.toml`](../examples/minimax_h3/image.toml) | FL2VA | `t2va` | `fl2va` (default) |
 | Text-conditioned T2VA | [`t2va.toml`](../examples/minimax_h3/t2va.toml) | FL2VA | `t2va` | `fl2va` (default) |
+| Video-only T2V | [`video_only.toml`](../examples/minimax_h3/video_only.toml) | FL2VA | `t2va` | `fl2va` (default) |
+| Audio-only T2A | [`audio_only.toml`](../examples/minimax_h3/audio_only.toml) | FL2VA | `t2va` | `fl2va` (default) |
 | First-frame I2V | [`i2va.toml`](../examples/minimax_h3/i2va.toml) | FL2VA | `i2va` | `fl2va` (default) |
 | First+last-frame video | [`fl2va.toml`](../examples/minimax_h3/fl2va.toml) | FL2VA | `fl2va` | `fl2va` (default) |
 | Arbitrary references | [`ref2va.toml`](../examples/minimax_h3/ref2va.toml) | Ref2VA | `ref2va` | `ref2va` |

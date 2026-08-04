@@ -13,10 +13,10 @@ H3TrainingMode = Literal["fl2va", "ref2va"]
 
 @dataclass(frozen=True)
 class H3JointNoisyInputs:
-    video: torch.Tensor
-    audio: torch.Tensor
-    video_target: torch.Tensor
-    audio_target: torch.Tensor
+    video: torch.Tensor | None
+    audio: torch.Tensor | None
+    video_target: torch.Tensor | None
+    audio_target: torch.Tensor | None
     video_sigma: torch.Tensor
     audio_sigma: torch.Tensor
     video_timestep: torch.Tensor
@@ -25,8 +25,8 @@ class H3JointNoisyInputs:
 
 @dataclass(frozen=True)
 class H3ModelPrediction:
-    video: torch.Tensor
-    audio: torch.Tensor
+    video: torch.Tensor | None
+    audio: torch.Tensor | None
 
 
 @dataclass(frozen=True)
@@ -79,10 +79,10 @@ def _expand_batch_values(values: torch.Tensor, target: torch.Tensor) -> torch.Te
 
 
 def prepare_joint_noisy_inputs(
-    video_latents: torch.Tensor,
-    audio_latents: torch.Tensor,
-    video_noise: torch.Tensor,
-    audio_noise: torch.Tensor,
+    video_latents: torch.Tensor | None,
+    audio_latents: torch.Tensor | None,
+    video_noise: torch.Tensor | None,
+    audio_noise: torch.Tensor | None,
     base_sigma: torch.Tensor,
     *,
     video_shift: float = VIDEO_FLOW_SHIFT,
@@ -98,29 +98,36 @@ def prepare_joint_noisy_inputs(
     H3 uses ``x_t = (1 - sigma) * x0 + sigma * noise`` and predicts the
     data-pointing velocity ``x0 - noise``.
     """
-    if video_latents.shape != video_noise.shape:
+    if video_latents is None and audio_latents is None:
+        raise ValueError("H3 training requires at least one target modality")
+    if (video_latents is None) != (video_noise is None):
+        raise ValueError("H3 video latents and noise must either both be present or both be absent")
+    if (audio_latents is None) != (audio_noise is None):
+        raise ValueError("H3 audio latents and noise must either both be present or both be absent")
+    if video_latents is not None and video_latents.shape != video_noise.shape:
         raise ValueError("H3 video latents and noise must have identical shapes")
-    if audio_latents.shape != audio_noise.shape:
+    if audio_latents is not None and audio_latents.shape != audio_noise.shape:
         raise ValueError("H3 audio latents and noise must have identical shapes")
-    if video_latents.shape[0] != audio_latents.shape[0]:
+    present = video_latents if video_latents is not None else audio_latents
+    if video_latents is not None and audio_latents is not None and video_latents.shape[0] != audio_latents.shape[0]:
         raise ValueError("H3 video and audio batch sizes must match")
     if video_shift <= 0 or audio_shift <= 0:
         raise ValueError("H3 flow shifts must be positive")
     _validate_sigma(base_sigma)
-    if base_sigma.shape[0] != video_latents.shape[0]:
+    if base_sigma.shape[0] != present.shape[0]:
         raise ValueError("H3 base sigma batch size must match the latents")
 
     base_sigma = base_sigma.float()
     video_sigma = _shift_unchecked(base_sigma, video_shift)
     audio_sigma = _shift_unchecked(base_sigma, audio_shift)
-    video_sigma_expanded = _expand_batch_values(video_sigma, video_latents)
-    audio_sigma_expanded = _expand_batch_values(audio_sigma, audio_latents)
+    video_sigma_expanded = _expand_batch_values(video_sigma, video_latents) if video_latents is not None else None
+    audio_sigma_expanded = _expand_batch_values(audio_sigma, audio_latents) if audio_latents is not None else None
 
     return H3JointNoisyInputs(
-        video=(1.0 - video_sigma_expanded) * video_latents + video_sigma_expanded * video_noise,
-        audio=(1.0 - audio_sigma_expanded) * audio_latents + audio_sigma_expanded * audio_noise,
-        video_target=video_latents - video_noise,
-        audio_target=audio_latents - audio_noise,
+        video=(1.0 - video_sigma_expanded) * video_latents + video_sigma_expanded * video_noise if video_latents is not None else None,
+        audio=(1.0 - audio_sigma_expanded) * audio_latents + audio_sigma_expanded * audio_noise if audio_latents is not None else None,
+        video_target=video_latents - video_noise if video_latents is not None else None,
+        audio_target=audio_latents - audio_noise if audio_latents is not None else None,
         video_sigma=video_sigma,
         audio_sigma=audio_sigma,
         video_timestep=1.0 - video_sigma,
@@ -142,14 +149,18 @@ def guidance_consistent_prediction(
     """
     if guidance_scale < 1.0:
         raise ValueError("H3 guidance distillation scale must be at least 1")
-    if guided.video.shape != empty.video.shape or guided.audio.shape != empty.audio.shape:
-        raise ValueError("H3 prompt and empty predictions must have matching shapes")
-    empty_video = empty.video.detach() if detach_empty else empty.video
-    empty_audio = empty.audio.detach() if detach_empty else empty.audio
+    if (guided.video is None) != (empty.video is None) or (guided.audio is None) != (empty.audio is None):
+        raise ValueError("H3 prompt and empty predictions must contain the same modalities")
+    if guided.video is not None and guided.video.shape != empty.video.shape:
+        raise ValueError("H3 prompt and empty video predictions must have matching shapes")
+    if guided.audio is not None and guided.audio.shape != empty.audio.shape:
+        raise ValueError("H3 prompt and empty audio predictions must have matching shapes")
+    empty_video = empty.video.detach() if detach_empty and empty.video is not None else empty.video
+    empty_audio = empty.audio.detach() if detach_empty and empty.audio is not None else empty.audio
     empty_weight = guidance_scale - 1.0
     return H3ModelPrediction(
-        video=(guided.video + empty_weight * empty_video) / guidance_scale,
-        audio=(guided.audio + empty_weight * empty_audio) / guidance_scale,
+        video=(guided.video + empty_weight * empty_video) / guidance_scale if guided.video is not None else None,
+        audio=(guided.audio + empty_weight * empty_audio) / guidance_scale if guided.audio is not None else None,
     )
 
 
@@ -205,8 +216,22 @@ def joint_velocity_loss(
     if video_weight < 0 or audio_weight < 0 or video_weight + audio_weight <= 0:
         raise ValueError("H3 video/audio loss weights must be non-negative and not both zero")
 
-    video_mean, video_total, video_elements = _modality_loss(prediction.video, inputs.video_target, video_mask, sample_weight)
-    audio_mean, audio_total, audio_elements = _modality_loss(prediction.audio, inputs.audio_target, audio_mask, sample_weight)
+    zero_source = prediction.video if prediction.video is not None else prediction.audio
+    if zero_source is None:
+        raise ValueError("H3 prediction contains no target modality")
+    zero = zero_source.sum() * 0.0
+    if prediction.video is None or inputs.video_target is None:
+        if prediction.video is not None or inputs.video_target is not None:
+            raise ValueError("H3 video prediction and target presence differ")
+        video_mean, video_total, video_elements = zero, zero, 0
+    else:
+        video_mean, video_total, video_elements = _modality_loss(prediction.video, inputs.video_target, video_mask, sample_weight)
+    if prediction.audio is None or inputs.audio_target is None:
+        if prediction.audio is not None or inputs.audio_target is not None:
+            raise ValueError("H3 audio prediction and target presence differ")
+        audio_mean, audio_total, audio_elements = zero, zero, 0
+    else:
+        audio_mean, audio_total, audio_elements = _modality_loss(prediction.audio, inputs.audio_target, audio_mask, sample_weight)
 
     active_video_weight = video_weight if video_elements else 0.0
     active_audio_weight = audio_weight if audio_elements else 0.0

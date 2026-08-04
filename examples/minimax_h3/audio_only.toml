@@ -1,0 +1,12 @@
+# Resolution supplies H3's audio rotary canvas; no video target is cached.
+[general]
+resolution = [832, 480]
+caption_extension = ".txt"
+batch_size = 1
+
+[[datasets]]
+audio_directory = "/path/to/audio"
+cache_directory = "/path/to/cache"
+h3_target_mode = "audio"
+target_frames = [124]
+num_repeats = 1

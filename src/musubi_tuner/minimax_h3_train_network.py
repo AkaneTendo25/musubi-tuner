@@ -19,9 +19,7 @@ from musubi_tuner.dataset.architectures import ARCHITECTURE_MINIMAX_H3, ARCHITEC
 from musubi_tuner.hv_train import get_sigmas
 from musubi_tuner.hv_train_network import NetworkTrainer, read_config_from_file, setup_parser_common
 from musubi_tuner.minimax_h3.architecture import (
-    AUDIO_CHANNELS,
     AUDIO_FLOW_SHIFT,
-    AUDIO_LATENT_CHANNELS,
     VIDEO_DIT_PATCH_SIZE,
     VIDEO_FLOW_SHIFT,
     align_frame_count,
@@ -439,11 +437,13 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
     ) -> H3ModelPrediction:
         if self.backend is None:
             raise RuntimeError("H3 training backend is not loaded")
-        video = inputs.video.to(device=accelerator.device, dtype=self.dit_dtype)
-        audio = inputs.audio.to(device=accelerator.device, dtype=self.dit_dtype)
+        video = inputs.video.to(device=accelerator.device, dtype=self.dit_dtype) if inputs.video is not None else None
+        audio = inputs.audio.to(device=accelerator.device, dtype=self.dit_dtype) if inputs.audio is not None else None
         if gradient_checkpointing:
-            video.requires_grad_(True)
-            audio.requires_grad_(True)
+            if video is not None:
+                video.requires_grad_(True)
+            if audio is not None:
+                audio.requires_grad_(True)
         with accelerator.autocast():
             prediction = self.backend.predict_training(
                 transformer,
@@ -457,6 +457,13 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         if not isinstance(prediction, H3ModelPrediction):
             raise TypeError("H3 backend predict_training() must return H3ModelPrediction")
         return prediction
+
+    def get_primary_latents(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
+        if "latents" in batch:
+            return batch["latents"]
+        if H3_AUDIO_LATENTS_KEY in batch:
+            return batch[H3_AUDIO_LATENTS_KEY]
+        raise KeyError("MiniMax H3 cache contains neither video nor audio target latents")
 
     def process_batch(
         self,
@@ -476,23 +483,25 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         del network, network_dtype, vae, global_step
         if latents.shape[0] != 1:
             raise ValueError("MiniMax H3 training requires dataset batch_size = 1")
-        latents = latents.to(device=accelerator.device, dtype=dit_dtype)
-        noise = noise.to(device=accelerator.device, dtype=dit_dtype)
-        is_image = H3_AUDIO_LATENTS_KEY not in batch
-        if is_image:
-            if latents.shape[2] != 1:
-                raise KeyError(
-                    f"MiniMax H3 video cache is missing {H3_AUDIO_LATENTS_KEY}; only one-frame image caches may omit audio"
-                )
-            audio_latents = latents.new_zeros((latents.shape[0], AUDIO_CHANNELS, AUDIO_LATENT_CHANNELS, 0))
-        else:
-            audio_latents = batch[H3_AUDIO_LATENTS_KEY].to(device=accelerator.device, dtype=dit_dtype)
-        audio_noise = torch.randn_like(audio_latents)
+        has_video = "latents" in batch or latents.ndim == 5
+        has_audio = H3_AUDIO_LATENTS_KEY in batch
+        if not has_video and not has_audio:
+            raise KeyError("MiniMax H3 cache contains no target modality")
+        video_source = batch.get("latents", latents if latents.ndim == 5 else None)
+        video_latents = video_source.to(device=accelerator.device, dtype=dit_dtype) if has_video else None
+        audio_latents = batch[H3_AUDIO_LATENTS_KEY].to(device=accelerator.device, dtype=dit_dtype) if has_audio else None
+        video_noise = noise.to(device=accelerator.device, dtype=dit_dtype) if video_latents is not None else None
+        audio_noise = (
+            noise.to(device=accelerator.device, dtype=dit_dtype)
+            if audio_latents is not None and not has_video
+            else torch.randn_like(audio_latents) if audio_latents is not None else None
+        )
+        is_image = has_video and not has_audio and video_latents.shape[2] == 1
 
         scheduler_args = args
         if is_image:
             patch_h, patch_w = VIDEO_DIT_PATCH_SIZE[-2:]
-            latent_height, latent_width = latents.shape[-2:]
+            latent_height, latent_width = video_latents.shape[-2:]
             if latent_height % patch_h or latent_width % patch_w:
                 raise ValueError("MiniMax H3 image latent dimensions must be divisible by the spatial patch size")
             scheduler_args = copy.copy(args)
@@ -509,9 +518,9 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         )
         base_sigma = self._base_sigma(scheduler_args, noise_scheduler, scheduler_timesteps, accelerator.device, dit_dtype)
         inputs = prepare_joint_noisy_inputs(
-            latents,
+            video_latents,
             audio_latents,
-            noise,
+            video_noise,
             audio_noise,
             base_sigma,
             # Image sampling already returned its final shifted sigma. Video
@@ -555,7 +564,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             audio_mask=batch.get("audio_loss_mask"),
             # Weighting keys on the shifted video sigma the model actually saw,
             # not the shared unshifted coordinate.
-            sample_weight=self._sample_weight(args, inputs.video_sigma),
+            sample_weight=self._sample_weight(args, inputs.video_sigma if has_video else inputs.audio_sigma),
             balance=args.h3_loss_balance,
             video_weight=args.h3_video_loss_weight,
             audio_weight=args.h3_audio_loss_weight,

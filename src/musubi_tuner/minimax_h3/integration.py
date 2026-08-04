@@ -32,6 +32,7 @@ from musubi_tuner.minimax_h3.cache import (
     H3_REFERENCE_VIDEO_SHAPES_KEY,
     H3_TEXT_HIDDEN_KEY,
     H3_TEXT_TOKEN_TAGS_KEY,
+    H3_VIDEO_GEOMETRY_KEY,
 )
 from musubi_tuner.minimax_h3.component_loader import (
     load_audio_vae_decoder,
@@ -73,7 +74,7 @@ logger = logging.getLogger(__name__)
 
 def create_latent_encoder(
     *,
-    video_vae: Path,
+    video_vae: Path | None,
     audio_vae: Path | None,
     device: str | None,
     dtype: str,
@@ -81,7 +82,7 @@ def create_latent_encoder(
     """Load the released video VAE and the optional target/reference audio VAE."""
     target_device = torch.device(device or "cpu")
     output_dtype = str_to_dtype(dtype)
-    video_encoder = load_video_vae_encoder(video_vae, target_device)
+    video_encoder = load_video_vae_encoder(video_vae, target_device) if video_vae is not None else None
     audio_encoder = load_audio_vae_encoder(audio_vae, target_device) if audio_vae is not None else None
     return _NativeLatentEncoder(video_encoder, audio_encoder, output_dtype)
 
@@ -464,6 +465,7 @@ def create_training_backend(
     fp8_scaled: bool = False,
     quantization_device: str | None = None,
     int8_convrot: bool = False,
+    adaln_rank: int | None = None,
 ):
     """Load the selected released transformer and adapt its training forward to Musubi."""
     if dtype != "bfloat16":
@@ -479,6 +481,7 @@ def create_training_backend(
         fp8_scaled=fp8_scaled,
         quantization_device=quantization_device,
         int8_convrot=int8_convrot,
+        adaln_rank=adaln_rank,
     )
     return _NativeTrainingBackend(transformer, mode)
 
@@ -495,23 +498,26 @@ class _NativeTrainingBackend:
         self,
         transformer: torch.nn.Module,
         batch: dict,
-        video_hidden_states: torch.Tensor,
-        audio_hidden_states: torch.Tensor,
+        video_hidden_states: torch.Tensor | None,
+        audio_hidden_states: torch.Tensor | None,
         video_timestep: torch.Tensor,
         audio_timestep: torch.Tensor,
         *,
         conditioning: Literal["prompt", "empty"] = "prompt",
     ) -> H3ModelPrediction:
-        if video_hidden_states.shape[0] != 1 or audio_hidden_states.shape[0] != 1:
+        present = video_hidden_states if video_hidden_states is not None else audio_hidden_states
+        if present is None:
+            raise ValueError("MiniMax H3 training requires at least one target modality")
+        if present.shape[0] != 1 or (video_hidden_states is not None and audio_hidden_states is not None and audio_hidden_states.shape[0] != 1):
             raise ValueError("MiniMax H3 training requires batch size 1")
         config = getattr(transformer, "config", getattr(self.transformer, "config", None))
         if config is None:
             raise TypeError("MiniMax H3 transformer must expose its released config")
-        if video_hidden_states.ndim != 5 or video_hidden_states.shape[1] != config.in_channels:
+        if video_hidden_states is not None and (video_hidden_states.ndim != 5 or video_hidden_states.shape[1] != config.in_channels):
             raise ValueError(
                 f"H3 video input must have shape [1, {config.in_channels}, T, H, W], got {tuple(video_hidden_states.shape)}"
             )
-        if audio_hidden_states.ndim != 4 or audio_hidden_states.shape[1:3] != (2, config.audio_in_channels):
+        if audio_hidden_states is not None and (audio_hidden_states.ndim != 4 or audio_hidden_states.shape[1:3] != (2, config.audio_in_channels)):
             raise ValueError(
                 f"H3 audio input must have shape [1, 2, {config.audio_in_channels}, T], got {tuple(audio_hidden_states.shape)}"
             )
@@ -548,13 +554,26 @@ class _NativeTrainingBackend:
             raise ValueError("MiniMax H3 Ref2VA training requires a reference presentation; re-cache with --task ref2va")
 
         patch_size = tuple(config.patch_size)
-        video_rows = patchify_video_latents(video_hidden_states, patch_size)
-        audio_rows = pack_audio_latents(audio_hidden_states)
-        _, _, latent_frames, latent_height, latent_width = video_hidden_states.shape
-        num_audio_latents = audio_hidden_states.shape[-1]
+        model_device = present.device
+        if video_hidden_states is None:
+            geometry = self._one_conditioning_item(batch, H3_VIDEO_GEOMETRY_KEY, expected_ndim=1)
+            if geometry.shape != (2,):
+                raise ValueError(f"H3 {H3_VIDEO_GEOMETRY_KEY} must contain latent height and width")
+            latent_frames = 0
+            latent_height, latent_width = (int(value) for value in geometry.detach().cpu())
+            video_width = config.in_channels * int(np.prod(patch_size))
+            video_rows = torch.empty((1, 0, video_width), device=model_device, dtype=present.dtype)
+        else:
+            video_rows = patchify_video_latents(video_hidden_states, patch_size)
+            _, _, latent_frames, latent_height, latent_width = video_hidden_states.shape
+        if audio_hidden_states is None:
+            num_audio_latents = 0
+            audio_rows = torch.empty((1, 0, config.audio_in_channels), device=model_device, dtype=present.dtype)
+        else:
+            audio_rows = pack_audio_latents(audio_hidden_states)
+            num_audio_latents = audio_hidden_states.shape[-1]
         if num_audio_latents == 0 and (self.mode != "fl2va" or task != "t2va"):
             raise ValueError("MiniMax H3 image training currently requires the FL2VA transformer with --task t2va caches")
-        model_device = video_hidden_states.device
         if self.mode == "ref2va":
             references, reference_video, reference_audio = self._reference_cache(
                 batch,
@@ -644,12 +663,16 @@ class _NativeTrainingBackend:
         )
         target_video = output.video[:, layout.num_condition_video_rows :]
         target_audio = output.audio[:, layout.num_condition_audio_rows :]
-        video = unpatchify_video_tokens(
-            target_video,
-            latent_shape=(config.in_channels, latent_frames, latent_height, latent_width),
-            patch_size=patch_size,
+        video = (
+            unpatchify_video_tokens(
+                target_video,
+                latent_shape=(config.in_channels, latent_frames, latent_height, latent_width),
+                patch_size=patch_size,
+            )
+            if video_hidden_states is not None
+            else None
         )
-        audio = unpack_audio_tokens(target_audio, num_audio_latents=num_audio_latents)
+        audio = unpack_audio_tokens(target_audio, num_audio_latents=num_audio_latents) if audio_hidden_states is not None else None
         return H3ModelPrediction(video=video, audio=audio)
 
     def _keyframe_cache(
@@ -732,7 +755,7 @@ class _NativeTrainingBackend:
 class _NativeLatentEncoder:
     def __init__(
         self,
-        video_encoder: torch.nn.Module,
+        video_encoder: torch.nn.Module | None,
         audio_encoder: torch.nn.Module | None,
         output_dtype: torch.dtype,
     ) -> None:
@@ -746,13 +769,15 @@ class _NativeLatentEncoder:
         targets = [
             asset
             for asset in assets
-            if asset.role == "target" and asset.modality in {MediaModality.IMAGE, MediaModality.VIDEO}
+            if asset.role == "target" and asset.modality in {MediaModality.IMAGE, MediaModality.VIDEO, MediaModality.AUDIO}
         ]
         if len(targets) != 1:
-            raise ValueError(f"H3 item {item.item_key!r} must have one attached target image or video")
+            raise ValueError(f"H3 item {item.item_key!r} must have one attached target image, video, or audio clip")
         return targets[0]
 
     def _encode_video(self, content: np.ndarray, *, is_image: bool) -> torch.Tensor:
+        if self.video_encoder is None:
+            raise ValueError("MiniMax H3 visual latent caching requires --vae")
         if not isinstance(content, np.ndarray):
             raise TypeError("MiniMax H3 latent caching requires a numpy image or video array")
         if content.ndim == 3:
@@ -771,6 +796,8 @@ class _NativeLatentEncoder:
             return encode(pixels)[0].to(self.output_dtype)
 
     def _encode_reference_video(self, content: np.ndarray, *, image: bool) -> torch.Tensor:
+        if self.video_encoder is None:
+            raise ValueError("MiniMax H3 visual references require --vae during latent caching")
         if content.ndim == 3:
             content = content[None]
         pixels = torch.from_numpy(np.array(content, copy=True, order="C")).permute(3, 0, 1, 2).unsqueeze(0)
@@ -841,8 +868,8 @@ class _NativeLatentEncoder:
 
     def _encode_audio(self, item: Any) -> tuple[torch.Tensor, torch.Tensor]:
         target = self._target_asset(item)
-        if target.modality is not MediaModality.VIDEO:
-            raise ValueError("MiniMax H3 target audio is defined only for video targets")
+        if target.modality not in {MediaModality.VIDEO, MediaModality.AUDIO}:
+            raise ValueError("MiniMax H3 target audio is defined only for video or audio targets")
         if self.audio_encoder is None:
             raise ValueError("MiniMax H3 video latent caching requires --audio_vae")
         clip = load_audio_asset(target, target_audio_processing_spec(target))
@@ -862,6 +889,22 @@ class _NativeLatentEncoder:
         results = []
         for item in batch:
             target = self._target_asset(item)
+            target_mode = getattr(item, "h3_target_mode", "av")
+            if target_mode == "audio":
+                expected = temporal_shape(int(target.metadata["frame_count"]))
+                audio, audio_mask = self._encode_audio(item)
+                if audio.shape[-1] != expected.audio_latent_frames:
+                    raise ValueError(f"H3 audio VAE produced {audio.shape[-1]} rows; expected {expected.audio_latent_frames}")
+                latent_height = int(item.original_size[1]) // 16
+                latent_width = int(item.original_size[0]) // 16
+                results.append(
+                    {
+                        f"{H3_AUDIO_LATENTS_KEY}_2x32x{audio.shape[-1]}_{dtype_name}": audio,
+                        H3_AUDIO_LOSS_MASK_KEY: audio_mask,
+                        f"{H3_VIDEO_GEOMETRY_KEY}_int64": torch.tensor([latent_height, latent_width], dtype=torch.long),
+                    }
+                )
+                continue
             is_image = target.modality is MediaModality.IMAGE
             video = self._encode_video(item.content, is_image=is_image)
             video_frame_count = IMAGE_FRAME_COUNT if is_image else int(item.content.shape[0])
@@ -873,7 +916,7 @@ class _NativeLatentEncoder:
                 )
             frame_shape = "x".join(str(value) for value in video.shape[-3:])
             tensors = {f"latents_{frame_shape}_{dtype_name}": video}
-            if not is_image:
+            if not is_image and target_mode != "video":
                 expected = temporal_shape(video_frame_count)
                 audio, audio_mask = self._encode_audio(item)
                 if audio.shape[-1] != expected.audio_latent_frames:

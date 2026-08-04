@@ -140,11 +140,11 @@ def load_audio_asset(
 
 def target_audio_processing_spec(asset: MediaAsset) -> AudioProcessingSpec:
     """Build the exact target-audio shape paired with an H3 target video crop."""
-    if asset.role != "target" or asset.modality is not MediaModality.VIDEO:
-        raise ValueError("target_audio_processing_spec requires an H3 target video")
+    if asset.role != "target" or asset.modality not in {MediaModality.VIDEO, MediaModality.AUDIO}:
+        raise ValueError("target_audio_processing_spec requires an H3 target video or audio clip")
     frame_count = asset.metadata.get("frame_count")
     if not isinstance(frame_count, int):
-        raise TypeError("H3 target video metadata must contain an integer frame_count")
+        raise TypeError("H3 target media metadata must contain an integer frame_count")
     shape = temporal_shape(frame_count)
     return AudioProcessingSpec(
         sample_rate=AUDIO_SAMPLE_RATE,

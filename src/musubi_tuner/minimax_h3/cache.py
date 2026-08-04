@@ -14,6 +14,7 @@ from musubi_tuner.utils.model_utils import dtype_to_str, remove_dtype_suffix
 
 H3_AUDIO_LATENTS_KEY = "latents_audio"
 H3_AUDIO_LOSS_MASK_KEY = "audio_loss_mask"
+H3_VIDEO_GEOMETRY_KEY = "mmh3_video_geometry"
 H3_TEXT_HIDDEN_KEY = "mmh3_hidden_states"
 H3_TEXT_TOKEN_TAGS_KEY = "mmh3_token_tags"
 H3_EMPTY_TEXT_HIDDEN_KEY = "mmh3_empty_hidden_states"
@@ -76,32 +77,37 @@ def save_latent_cache_minimax_h3(item_info: ItemInfo, tensors: dict[str, torch.T
 
     Audio is stereo-major ``[2, 32, T]``. Backends are responsible for
     converting native model layouts such as ``[B, 32, 2, T]`` at this boundary.
-    Silent video targets retain audio latents and use an all-false audio loss
-    mask. Image targets contain only their one-frame video latent.
+    Modality-only caches omit the unused target tensor entirely.
     """
     cache_tensors = _validated_cache_tensors(item_info, tensors, operation="latent encoder")
     primary_latents = [key for key in cache_tensors if re.fullmatch(r"latents_\d+x\d+x\d+_.+", key)]
-    if len(primary_latents) != 1:
-        raise ValueError(f"H3 latent cache for {item_info.item_key} must contain exactly one latents_FxHxW_<dtype> tensor")
+    target_mode = getattr(item_info, "h3_target_mode", "av")
+    if len(primary_latents) > 1 or (target_mode != "audio" and len(primary_latents) != 1):
+        raise ValueError(
+            f"H3 latent cache for {item_info.item_key} must contain exactly one latents_FxHxW_<dtype> tensor"
+        )
     audio_latents = [key for key in cache_tensors if re.fullmatch(r"latents_audio_2x32x\d+_.+", key)]
     is_image = any(
         getattr(asset, "role", None) == "target" and getattr(asset, "modality", None) is MediaModality.IMAGE
         for asset in getattr(item_info, "h3_media_assets", ())
     )
-    if len(audio_latents) > 1 or (not audio_latents and not is_image):
+    audio_required = target_mode in {"av", "audio"} and not is_image
+    if len(audio_latents) > 1 or (audio_required and not audio_latents) or (target_mode == "video" and audio_latents):
         raise ValueError(
             f"H3 latent cache for {item_info.item_key} must contain exactly one "
             "latents_audio_2x32xT_<dtype> tensor unless it is an image item"
         )
 
-    primary_key = primary_latents[0]
-    primary_match = re.fullmatch(r"latents_(\d+)x(\d+)x(\d+)_.+", primary_key)
-    video = cache_tensors[primary_key]
-    expected_video_shape = tuple(int(value) for value in primary_match.groups())
-    if video.ndim != 4 or video.shape[0] != VIDEO_LATENT_CHANNELS or tuple(video.shape[-3:]) != expected_video_shape:
-        raise ValueError(
-            f"H3 {primary_key} must have shape [{VIDEO_LATENT_CHANNELS}, F, H, W] matching its cache key, got {tuple(video.shape)}"
-        )
+    video = None
+    if primary_latents:
+        primary_key = primary_latents[0]
+        primary_match = re.fullmatch(r"latents_(\d+)x(\d+)x(\d+)_.+", primary_key)
+        video = cache_tensors[primary_key]
+        expected_video_shape = tuple(int(value) for value in primary_match.groups())
+        if video.ndim != 4 or video.shape[0] != VIDEO_LATENT_CHANNELS or tuple(video.shape[-3:]) != expected_video_shape:
+            raise ValueError(
+                f"H3 {primary_key} must have shape [{VIDEO_LATENT_CHANNELS}, F, H, W] matching its cache key, got {tuple(video.shape)}"
+            )
 
     if audio_latents:
         audio = cache_tensors[audio_latents[0]]
@@ -120,8 +126,12 @@ def save_latent_cache_minimax_h3(item_info: ItemInfo, tensors: dict[str, torch.T
     elif H3_AUDIO_LOSS_MASK_KEY in cache_tensors:
         raise ValueError(f"H3 {H3_AUDIO_LOSS_MASK_KEY} requires cached audio latents")
 
+    geometry_matches = [tensor for key, tensor in cache_tensors.items() if _logical_key(key) == H3_VIDEO_GEOMETRY_KEY]
+    geometry = geometry_matches[0] if len(geometry_matches) == 1 else None
+    if target_mode == "audio" and (geometry is None or geometry.dtype is not torch.long or geometry.shape != (2,)):
+        raise ValueError(f"H3 audio-only cache requires int64 {H3_VIDEO_GEOMETRY_KEY} with shape [2]")
     video_mask = cache_tensors.get("video_loss_mask")
-    if video_mask is not None and (video_mask.dtype is not torch.bool or video_mask.shape != video.shape[-3:]):
+    if video_mask is not None and (video is None or video_mask.dtype is not torch.bool or video_mask.shape != video.shape[-3:]):
         raise ValueError(f"H3 video_loss_mask must be bool with shape {tuple(video.shape[-3:])}")
     save_latent_cache_common(item_info, cache_tensors, ARCHITECTURE_MINIMAX_H3_FULL)
 

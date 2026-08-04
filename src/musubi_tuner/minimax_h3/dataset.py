@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import random
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -15,6 +16,7 @@ from musubi_tuner.dataset.config_utils import BlueprintGenerator, ConfigSanitize
 from musubi_tuner.dataset.image_video_dataset import DatasetGroup, ItemInfo
 from musubi_tuner.dataset.media_utils import IMAGE_EXTENSIONS, VIDEO_EXTENSIONS, glob_images, glob_videos
 from musubi_tuner.minimax_h3.architecture import is_valid_frame_count
+from musubi_tuner.minimax_h3.audio_dataset import H3AudioDataset
 from musubi_tuner.minimax_h3.media import MediaAsset, MediaModality, slice_media_asset
 
 AUDIO_EXTENSIONS = (".wav", ".flac", ".mp3", ".m4a", ".aac", ".ogg", ".opus")
@@ -121,13 +123,43 @@ class H3DatasetAdapter:
         self._target_groups: list[tuple[str, ...]] = []
         self._target_fps: dict[str, float] = {}
         self._target_modalities: dict[str, MediaModality] = {}
+        self._target_modes: dict[str, str] = {}
+        self.audio_datasets: list[H3AudioDataset] = []
+        self.dataset_kinds: list[str] = []
         general = user_config.get("general", {})
         clean_general = self.musubi_config.get("general", {})
         clean_general.pop("control_directory", None)
+        for key in ("h3_target_mode", "audio_directory", "audio_jsonl_file"):
+            clean_general.pop(key, None)
 
         source_datasets = user_config.get("datasets", [])
         clean_datasets = self.musubi_config.get("datasets", [])
         for source, clean in zip(source_datasets, clean_datasets):
+            target_mode = _effective(source, general, "h3_target_mode") or "av"
+            if target_mode not in {"av", "video", "audio"}:
+                raise ValueError("h3_target_mode must be av, video, or audio")
+            clean.pop("h3_target_mode", None)
+            audio_directory = _effective(source, general, "audio_directory")
+            audio_jsonl_file = _effective(source, general, "audio_jsonl_file")
+            clean.pop("audio_directory", None)
+            clean.pop("audio_jsonl_file", None)
+            if audio_directory or audio_jsonl_file:
+                if target_mode != "audio":
+                    raise ValueError("audio_directory/audio_jsonl_file require h3_target_mode = 'audio'")
+                audio_dataset = H3AudioDataset(source, general)
+                self.audio_datasets.append(audio_dataset)
+                self.dataset_kinds.append("audio")
+                paths = tuple(str(path) for path, _ in audio_dataset.records)
+                for target in paths:
+                    normal = _normal_path(target)
+                    self._targets[normal] = _ResolvedTarget(Path(target), ())
+                    self._target_modalities[normal] = MediaModality.AUDIO
+                    self._target_modes[normal] = "audio"
+                self._target_groups.append(tuple(_normal_path(target) for target in paths))
+                continue
+            if target_mode == "audio":
+                raise ValueError("h3_target_mode = 'audio' requires audio_directory or audio_jsonl_file")
+            self.dataset_kinds.append("regular")
             control_directory = _effective(source, general, "control_directory")
             clean.pop("control_directory", None)
             video_directory = _effective(source, general, "video_directory")
@@ -196,10 +228,19 @@ class H3DatasetAdapter:
                     raise ValueError(f"duplicate H3 target path across datasets: {target}")
                 self._targets[normal] = resolved
                 self._target_modalities[normal] = modality
+                self._target_modes[normal] = target_mode
             self._target_groups.append(tuple(_normal_path(target) for target in target_paths))
 
-        self.requires_audio = any(modality is MediaModality.VIDEO for modality in self._target_modalities.values()) or any(
+        self.requires_audio = any(
+            modality in {MediaModality.VIDEO, MediaModality.AUDIO} and self._target_modes[path] != "video"
+            for path, modality in self._target_modalities.items()
+        ) or any(
             reference.modality is MediaModality.AUDIO
+            for resolved in self._targets.values()
+            for reference in resolved.references
+        )
+        self.requires_video = any(mode != "audio" for mode in self._target_modes.values()) or any(
+            reference.modality in {MediaModality.IMAGE, MediaModality.VIDEO}
             for resolved in self._targets.values()
             for reference in resolved.references
         )
@@ -208,6 +249,8 @@ class H3DatasetAdapter:
         if len(dataset_group.datasets) != len(self._target_groups):
             raise ValueError("H3 dataset adapter and Musubi dataset group have different lengths")
         for dataset, target_group in zip(dataset_group.datasets, self._target_groups):
+            if isinstance(dataset, H3AudioDataset):
+                continue
             datasource = dataset.datasource
             if hasattr(datasource, "data"):
                 for record in datasource.data:
@@ -247,7 +290,7 @@ class H3DatasetAdapter:
             "target",
             metadata=(
                 {"frame_count": target_frame_count, "fps": target_fps}
-                if modality is MediaModality.VIDEO
+                if modality in {MediaModality.VIDEO, MediaModality.AUDIO}
                 else {"frame_count": 1}
             ),
         )
@@ -260,6 +303,7 @@ class H3DatasetAdapter:
         assets = (target, *resolved.references)
         validate_h3_media_assets(item.item_key, assets)
         item.h3_media_assets = assets
+        item.h3_target_mode = self._target_modes[normal]
         return assets
 
 
@@ -272,17 +316,33 @@ def create_h3_dataset_group(
     shared_epoch: Any = None,
 ) -> tuple[DatasetGroup, H3DatasetAdapter]:
     adapter = H3DatasetAdapter(user_config)
-    blueprint = BlueprintGenerator(ConfigSanitizer()).generate(
-        adapter.musubi_config,
-        args,
-        architecture=ARCHITECTURE_MINIMAX_H3,
-    )
-    dataset_group = config_utils.generate_dataset_group_by_blueprint(
-        blueprint.dataset_group,
-        training=training,
-        num_timestep_buckets=num_timestep_buckets,
-        shared_epoch=shared_epoch,
-    )
+    regular_config = copy.deepcopy(adapter.musubi_config)
+    regular_config["datasets"] = [
+        dataset for dataset, kind in zip(regular_config.get("datasets", []), adapter.dataset_kinds) if kind == "regular"
+    ]
+    regular_datasets = []
+    if regular_config["datasets"]:
+        blueprint = BlueprintGenerator(ConfigSanitizer()).generate(
+            regular_config,
+            args,
+            architecture=ARCHITECTURE_MINIMAX_H3,
+        )
+        regular_group = config_utils.generate_dataset_group_by_blueprint(
+            blueprint.dataset_group,
+            training=training,
+            num_timestep_buckets=num_timestep_buckets,
+            shared_epoch=shared_epoch,
+        )
+        regular_datasets = list(regular_group.datasets)
+    regular_iter = iter(regular_datasets)
+    audio_iter = iter(adapter.audio_datasets)
+    ordered_datasets = [next(audio_iter) if kind == "audio" else next(regular_iter) for kind in adapter.dataset_kinds]
+    seed = random.randint(0, 2**31)
+    for dataset in adapter.audio_datasets:
+        dataset.set_seed(seed, shared_epoch)
+        if training:
+            dataset.prepare_for_training(num_timestep_buckets=num_timestep_buckets)
+    dataset_group = DatasetGroup(ordered_datasets)
     adapter.adapt_dataset_group(dataset_group)
     return dataset_group, adapter
 
@@ -297,8 +357,8 @@ def attach_h3_media(
 
 def validate_h3_media_assets(key: str, assets: tuple[MediaAsset, ...], *, check_files: bool = True) -> None:
     targets = tuple(asset for asset in assets if asset.role == "target")
-    if len(targets) != 1 or targets[0].modality not in {MediaModality.IMAGE, MediaModality.VIDEO}:
-        raise ValueError(f"H3 item {key!r} must contain exactly one target image or video")
+    if len(targets) != 1 or targets[0].modality not in {MediaModality.IMAGE, MediaModality.VIDEO, MediaModality.AUDIO}:
+        raise ValueError(f"H3 item {key!r} must contain exactly one target image, video, or audio clip")
     unsupported_roles = sorted({asset.role for asset in assets if asset.role not in {"target", "reference"}})
     if unsupported_roles:
         raise ValueError(f"H3 item {key!r} contains unsupported roles: {unsupported_roles}")

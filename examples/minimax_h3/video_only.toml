@@ -1,0 +1,15 @@
+# True video-only H3 training. No audio target rows are cached or processed.
+[general]
+resolution = [832, 480]
+caption_extension = ".txt"
+batch_size = 1
+enable_bucket = true
+
+[[datasets]]
+video_directory = "/path/to/videos"
+cache_directory = "/path/to/cache"
+h3_target_mode = "video"
+source_fps = 24.0
+target_frames = [124]
+frame_extraction = "uniform"
+num_repeats = 1

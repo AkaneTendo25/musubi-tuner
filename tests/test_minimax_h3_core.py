@@ -19,6 +19,7 @@ from musubi_tuner.dataset.config_utils import (
 from musubi_tuner.dataset.image_video_dataset import ItemInfo
 from musubi_tuner.minimax_h3 import backend as h3_backend
 from musubi_tuner.minimax_h3 import integration as h3_integration
+from musubi_tuner.minimax_h3.audio_dataset import H3AudioDataset
 from musubi_tuner.minimax_h3.architecture import (
     AUDIO_FLOW_SHIFT,
     AUDIO_LATENT_FPS,
@@ -541,6 +542,60 @@ def test_native_cache_io_accepts_one_frame_image_without_audio(tmp_path):
     with safe_open(cache, framework="pt") as handle:
         assert set(handle.keys()) == {"latents_1x2x3_float32"}
         assert handle.metadata()["frame_count"] == "1"
+
+
+def test_native_cache_io_accepts_video_only_without_silent_audio(tmp_path):
+    cache = tmp_path / "video_only_mmh3.safetensors"
+    item = ItemInfo("clip.mp4", "caption", (512, 512), (512, 512), frame_count=22, latent_cache_path=str(cache))
+    item.h3_target_mode = "video"
+    save_latent_cache_minimax_h3(item, {"latents_7x2x3_float32": torch.ones(24, 7, 2, 3)})
+
+    with safe_open(cache, framework="pt") as handle:
+        assert set(handle.keys()) == {"latents_7x2x3_float32"}
+
+
+def test_native_cache_io_accepts_audio_only_without_dummy_video(tmp_path):
+    cache = tmp_path / "audio_only_mmh3.safetensors"
+    item = ItemInfo("clip.wav", "caption", (512, 512), (512, 512), frame_count=22, latent_cache_path=str(cache))
+    item.h3_target_mode = "audio"
+    save_latent_cache_minimax_h3(
+        item,
+        {
+            "latents_audio_2x32x37_float32": torch.ones(2, 32, 37),
+            "audio_loss_mask": torch.ones(37, dtype=torch.bool),
+            "mmh3_video_geometry_int64": torch.tensor([32, 32], dtype=torch.long),
+        },
+    )
+
+    with safe_open(cache, framework="pt") as handle:
+        assert "latents" not in {key.rsplit("_", 1)[0] for key in handle.keys()}
+        assert "latents_audio_2x32x37_float32" in handle.keys()
+
+
+def test_h3_audio_dataset_builds_cache_paths_and_duration_contract(tmp_path):
+    audio = tmp_path / "tone.wav"
+    audio.write_bytes(b"fixture")
+    audio.with_suffix(".txt").write_text("a clean tone", encoding="utf-8")
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    dataset = H3AudioDataset(
+        {
+            "audio_directory": str(tmp_path),
+            "cache_directory": str(cache),
+            "h3_target_mode": "audio",
+            "target_frames": [124],
+            "resolution": [832, 480],
+        },
+        {},
+    )
+
+    _, batch = next(iter(dataset.retrieve_latent_cache_batches(1)))
+    item = batch[0]
+    assert item.caption == "a clean tone"
+    assert item.frame_count == 124
+    assert item.original_size == (832, 480)
+    assert Path(item.latent_cache_path).name == "tone_00000-124_0832x0480_mmh3.safetensors"
+    assert Path(item.text_encoder_output_cache_path).name == "tone_00000-124_mmh3_te.safetensors"
 
 
 def test_native_latent_encoder_caches_first_and_last_fl2va_keyframe_rows():
