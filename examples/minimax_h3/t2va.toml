@@ -1,0 +1,17 @@
+# Text-conditioned joint video/audio training. Cache text with --task t2va.
+
+[general]
+resolution = [1344, 768]
+caption_extension = ".txt"
+batch_size = 1
+enable_bucket = true
+bucket_no_upscale = false
+
+[[datasets]]
+video_directory = "/path/to/target_videos"
+cache_directory = "/path/to/t2va_cache"
+source_fps = 24.0
+target_frames = [124, 175, 243, 294, 362]
+frame_extraction = "uniform"
+frame_sample = 4
+num_repeats = 1

@@ -1,0 +1,19 @@
+# Ref2VA training with one basename-matched reference per target.
+# Cache text with --task ref2va and train with --h3_training_mode ref2va.
+
+[general]
+resolution = [1344, 768]
+caption_extension = ".txt"
+batch_size = 1
+enable_bucket = true
+bucket_no_upscale = false
+
+[[datasets]]
+video_directory = "/path/to/target_videos"
+control_directory = "/path/to/references"
+cache_directory = "/path/to/ref2va_cache"
+source_fps = 24.0
+target_frames = [124, 175, 243, 294, 362]
+frame_extraction = "uniform"
+frame_sample = 4
+num_repeats = 1

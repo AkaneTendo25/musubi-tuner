@@ -22,6 +22,7 @@ from pathlib import Path
 import av
 import numpy as np
 import torch
+from PIL import Image
 from tqdm import tqdm
 
 from musubi_tuner.minimax_h3.architecture import (
@@ -34,6 +35,7 @@ from musubi_tuner.minimax_h3.architecture import (
     temporal_shape,
 )
 from musubi_tuner.minimax_h3.cache import H3_TEXT_HIDDEN_KEY, H3_TEXT_TOKEN_TAGS_KEY
+from musubi_tuner.minimax_h3.component_loader import load_video_vae_encoder
 from musubi_tuner.minimax_h3.packing import (
     build_row_timesteps,
     build_t2va_packed_sequence,
@@ -115,8 +117,59 @@ def _validate_geometry(height: int, width: int, frame_count: int) -> None:
     temporal_shape(frame_count)
 
 
+def prepare_keyframe_image(image: Image.Image, height: int, width: int, *, stretch: bool) -> Image.Image:
+    """Place an FL2VA keyframe on the target canvas using the released resize policy."""
+    image = image.convert("RGB")
+    if image.size == (width, height):
+        return image
+    if stretch:
+        return image.resize((width, height), Image.Resampling.LANCZOS)
+    scale = max(width / image.width, height / image.height)
+    resized_width = max(width, round(image.width * scale))
+    resized_height = max(height, round(image.height * scale))
+    image = image.resize((resized_width, resized_height), Image.Resampling.LANCZOS)
+    left = (resized_width - width) // 2
+    top = (resized_height - height) // 2
+    return image.crop((left, top, left + width, top + height))
+
+
+def _augment_keyframe_rows(rows: torch.Tensor, rows_per_anchor: int, seed: int) -> torch.Tensor:
+    """Apply the released fixed-timestep condition noise, restarting the RNG for each anchor."""
+    augmented = []
+    for anchor_rows in rows.split(rows_per_anchor):
+        generator = torch.Generator(device="cpu").manual_seed(seed)
+        noise = torch.randn(anchor_rows.shape, generator=generator, dtype=torch.float32)
+        augmented.append(0.999 * anchor_rows.float() + 0.001 * noise.to(anchor_rows.device))
+    return torch.cat(augmented)
+
+
 @torch.no_grad()
-def denoise_t2va(
+def encode_keyframe_images(
+    video_vae: Path,
+    images: list[Image.Image],
+    device: torch.device,
+) -> tuple[torch.Tensor, ...]:
+    """Sequentially load the video encoder and return patchified FL2VA rows for each image."""
+    if not images:
+        return ()
+    video_encoder = load_video_vae_encoder(video_vae, device)
+    rows = []
+    for image in images:
+        content = np.array(image, dtype=np.uint8, copy=True, order="C")
+        pixels = torch.from_numpy(content).permute(2, 0, 1).unsqueeze(0).unsqueeze(2)
+        weight_dtype = next(video_encoder.parameters()).dtype
+        pixels = pixels.to(device=device, dtype=torch.float32).div_(255.0)
+        mean = pixels.new_tensor((0.485, 0.456, 0.406)).view(1, 3, 1, 1, 1)
+        std = pixels.new_tensor((0.229, 0.224, 0.225)).view(1, 3, 1, 1, 1)
+        latent = video_encoder.encode_reference(((pixels - mean) / std).to(weight_dtype), image=True)[0]
+        rows.append(patchify_video_latents(latent[None], (1, 2, 2))[0].cpu())
+    del video_encoder
+    clean_memory_on_device(device)
+    return tuple(rows)
+
+
+@torch.no_grad()
+def denoise_fl2va(
     transformer: torch.nn.Module,
     conditioning: dict[str, torch.Tensor],
     *,
@@ -126,9 +179,12 @@ def denoise_t2va(
     num_inference_steps: int,
     generator: torch.Generator,
     device: torch.device,
+    keyframe_rows: torch.Tensor | None = None,
+    keyframe_anchors: tuple[str, ...] = (),
+    condition_seed: int = 0,
     show_progress: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Generate normalized joint video/audio latents with one model evaluation per schedule interval."""
+    """Generate FL2VA joint latents with optional first/last keyframe conditioning."""
     _validate_geometry(height, width, frame_count)
     shape = temporal_shape(frame_count)
     config = transformer.config
@@ -152,6 +208,16 @@ def denoise_t2va(
         raise ValueError(f"MiniMax H3 conditioning must have shape [tokens, {config.text_dim}]")
     if text_tags.shape != (text_hidden.shape[0],) or text_tags.dtype != torch.long:
         raise ValueError("MiniMax H3 conditioning tags must be int64 with one entry per text row")
+    rows_per_anchor = (latent_height // config.patch_size[1]) * (latent_width // config.patch_size[2])
+    expected_keyframe_rows = len(keyframe_anchors) * rows_per_anchor
+    keyframe_width = config.in_channels * config.patch_size[0] * config.patch_size[1] * config.patch_size[2]
+    if expected_keyframe_rows:
+        if keyframe_rows is None or keyframe_rows.shape != (expected_keyframe_rows, keyframe_width):
+            actual = None if keyframe_rows is None else tuple(keyframe_rows.shape)
+            raise ValueError(f"MiniMax H3 keyframe rows have shape {actual}, expected {(expected_keyframe_rows, keyframe_width)}")
+        keyframe_rows = _augment_keyframe_rows(keyframe_rows, rows_per_anchor, condition_seed).to(device)
+    elif keyframe_rows is not None:
+        raise ValueError("MiniMax H3 keyframe rows require first/last anchors")
     layout = build_t2va_packed_sequence(
         text_tags,
         num_latent_frames=shape.video_latent_frames,
@@ -159,6 +225,7 @@ def denoise_t2va(
         latent_width=latent_width,
         num_audio_latents=shape.audio_latent_frames,
         patch_size=tuple(config.patch_size),
+        keyframe_anchors=keyframe_anchors,
     )
     text_hidden = text_hidden[None].to(device)
     token_tags = layout.token_tags.to(device)
@@ -177,8 +244,18 @@ def denoise_t2va(
     autocast_enabled = device.type == "cuda"
     for index, (video_timestep, audio_timestep) in enumerate(iterator):
         video_rows = patchify_video_latents(video, tuple(config.patch_size))
+        if keyframe_rows is not None:
+            video_rows = torch.cat((keyframe_rows[None], video_rows), dim=1)
         audio_rows = pack_audio_latents(audio)
-        timestep, timestep_indices = build_row_timesteps(layout, video_timestep, audio_timestep)
+        condition_timestep = (
+            torch.maximum(video_timestep.reshape(1), torch.tensor([0.999], device=device)) if keyframe_rows is not None else None
+        )
+        timestep, timestep_indices = build_row_timesteps(
+            layout,
+            video_timestep,
+            audio_timestep,
+            condition_timestep,
+        )
         with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=autocast_enabled):
             output = transformer(
                 video_hidden_states=video_rows,
@@ -193,7 +270,7 @@ def denoise_t2va(
                 text_indices=text_indices,
             )
         video_prediction = unpatchify_video_tokens(
-            output.video,
+            output.video[:, layout.num_condition_video_rows :],
             latent_shape=(config.in_channels, shape.video_latent_frames, latent_height, latent_width),
             patch_size=tuple(config.patch_size),
         )

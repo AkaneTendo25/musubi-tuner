@@ -2,6 +2,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import torch
+from PIL import Image
 
 from musubi_tuner.cache_text_encoder_outputs import process_text_encoder_batches
 from musubi_tuner.dataset.image_video_dataset import ItemInfo
@@ -12,6 +13,7 @@ from musubi_tuner.minimax_h3.cache import (
     H3_TEXT_TOKEN_TAGS_KEY,
 )
 from musubi_tuner.minimax_h3.conditioning import MiniMaxH3ConditioningEncoder
+from musubi_tuner.minimax_h3.references import H3PreparedReference, H3ReferenceKind
 
 
 class _Tokenizer:
@@ -43,6 +45,32 @@ class _ImageProcessor:
 class _Processor:
     tokenizer = _Tokenizer()
     image_processor = _ImageProcessor()
+
+
+class _RecordingTokenizer(_Tokenizer):
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, prompt, **kwargs):
+        self.calls.append(prompt)
+        return super().__call__(prompt, **kwargs)
+
+
+class _VideoProcessor:
+    def __call__(self, videos, **kwargs):
+        del kwargs
+        assert len(videos) == 1
+        return {
+            "pixel_values_videos": torch.zeros(3, 3, 2, 2),
+            "video_grid_thw": torch.tensor([[2, 2, 2]]),
+        }
+
+
+class _RefProcessor:
+    def __init__(self):
+        self.tokenizer = _RecordingTokenizer()
+        self.image_processor = _ImageProcessor()
+        self.video_processor = _VideoProcessor()
 
 
 class _TextModel(torch.nn.Module):
@@ -103,6 +131,51 @@ def test_fl2va_conditioning_includes_first_last_vision_rows():
     assert torch.equal(tags, torch.tensor([1, 1, 0, 0, 0, 1, 1, 0, 0, 0, 1]))
     assert torch.equal(model.last_mm_token_type_ids, torch.tensor([[0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0]]))
     assert encoder.conditioning_requires_content
+
+
+def test_i2va_conditioning_includes_only_first_frame_vision_rows():
+    model = _TextModel()
+    encoder = MiniMaxH3ConditioningEncoder(_Processor(), model, torch.bfloat16, "i2va")
+    item = SimpleNamespace(content=np.zeros((2, 4, 4, 3), dtype=np.uint8))
+
+    hidden, tags = encoder._encode_prompt("prompt", encoder._images_for_item(item))
+
+    assert hidden.shape == (6, 5120)
+    assert tags.tolist() == [1, 1, 0, 0, 0, 1]
+    assert int((model.last_mm_token_type_ids == 1).sum()) == 1
+    assert encoder.conditioning_requires_content
+
+
+def test_ref2va_conditioning_matches_released_ordered_presentation():
+    processor = _RefProcessor()
+    model = _TextModel()
+    encoder = MiniMaxH3ConditioningEncoder(processor, model, torch.bfloat16, "ref2va")
+    references = (
+        H3PreparedReference(kind=H3ReferenceKind.IMAGE, image=Image.new("RGB", (4, 4))),
+        H3PreparedReference(
+            kind=H3ReferenceKind.VIDEO,
+            frames=np.zeros((25, 4, 4, 3), dtype=np.uint8),
+            waveform=torch.zeros(2, 32),
+        ),
+        H3PreparedReference(kind=H3ReferenceKind.AUDIO, waveform=torch.zeros(2, 32)),
+    )
+
+    hidden, tags = encoder._encode_prompt("final prompt", references=references)
+
+    assert hidden.shape == (tags.shape[0], 5120)
+    assert processor.tokenizer.calls == [
+        "<Picture 1>: ",
+        "<Audio 1>: ",
+        "<Video 1>: ",
+        "<0.2 seconds>",
+        "<1.0 seconds>",
+        "<Audio 2>: ",
+        "final prompt",
+    ]
+    assert references[1].block_timestamps == (0.25, 1.0)
+    assert int((model.last_mm_token_type_ids == 1).sum()) == 1
+    assert int((model.last_mm_token_type_ids == 2).sum()) == 2
+    assert set(tags.tolist()) == {0, 1}
 
 
 def test_content_conditioning_populates_video_text_cache_path(tmp_path):

@@ -23,9 +23,9 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     parser.add_argument("--tokenizer", type=Path, required=True, help="released H3 FL2VA text_encoder directory")
     parser.add_argument(
         "--task",
-        choices=("t2va", "fl2va"),
+        choices=("t2va", "i2va", "fl2va", "ref2va"),
         default="t2va",
-        help="conditioning presentation to cache; FL2VA includes the target crop's first and last frames",
+        help="conditioning presentation: text only, first-frame I2V, first+last-frame FL2VA, or ordered references",
     )
     parser.add_argument("--text_encoder_dtype", default="bfloat16")
     parser.add_argument(

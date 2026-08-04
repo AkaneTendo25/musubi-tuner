@@ -13,6 +13,8 @@ from torch import nn
 from transformers import AutoProcessor, BitsAndBytesConfig, Qwen3VLConfig, Qwen3VLModel
 
 from musubi_tuner.minimax_h3.cache import (
+    H3_CONDITIONING_TASK_IDS,
+    H3_CONDITIONING_TASK_KEY,
     H3_EMPTY_TEXT_HIDDEN_KEY,
     H3_EMPTY_TEXT_TOKEN_TAGS_KEY,
     H3_TEXT_HIDDEN_KEY,
@@ -20,6 +22,12 @@ from musubi_tuner.minimax_h3.cache import (
 )
 from musubi_tuner.minimax_h3.component_loader import text_encoder_metadata
 from musubi_tuner.minimax_h3.model import MiniMaxH3TokenTag
+from musubi_tuner.minimax_h3.references import (
+    H3PreparedReference,
+    H3ReferenceKind,
+    prepare_references,
+    sample_reference_video_frames,
+)
 from musubi_tuner.utils.model_utils import dtype_to_str
 
 logger = logging.getLogger(__name__)
@@ -158,7 +166,7 @@ class MiniMaxH3ConditioningEncoder:
         processor: Any,
         model: Qwen3VLModel,
         output_dtype: torch.dtype,
-        task: Literal["t2va", "fl2va"],
+        task: Literal["t2va", "i2va", "fl2va", "ref2va"],
     ) -> None:
         self.processor = processor
         self.tokenizer = processor.tokenizer
@@ -169,21 +177,92 @@ class MiniMaxH3ConditioningEncoder:
         # the same crop identity as FL2VA and the corresponding latent cache.
         self.conditioning_requires_content = True
 
-    def _encode_prompt(self, prompt: str, images: list[Image.Image] | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+    def _encode_prompt(
+        self,
+        prompt: str,
+        images: list[Image.Image] | None = None,
+        references: tuple[H3PreparedReference, ...] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if images and references:
+            raise ValueError("H3 conditioning accepts keyframes or Ref2VA references, not both")
         token_ids: list[int] = []
         token_tags: list[int] = []
         pixel_values = None
         image_grid_thw = None
-        if images:
-            vision = self.processor.image_processor(images=images, return_tensors="pt")
+        pixel_values_videos = None
+        video_grid_thw = None
+        merge_size = self.processor.image_processor.merge_size**2
+        vision_start = self.tokenizer.convert_tokens_to_ids("<|vision_start|>")
+        image_pad = self.tokenizer.convert_tokens_to_ids("<|image_pad|>")
+        video_pad = self.tokenizer.convert_tokens_to_ids("<|video_pad|>")
+        vision_end = self.tokenizer.convert_tokens_to_ids("<|vision_end|>")
+
+        prepared_images = images or []
+        if references:
+            prepared_images = []
+            for reference in references:
+                if reference.kind is H3ReferenceKind.IMAGE:
+                    if reference.image is None:
+                        raise ValueError("H3 prepared image reference has no image")
+                    prepared_images.append(reference.image)
+        image_token_counts: list[int] = []
+        if prepared_images:
+            vision = self.processor.image_processor(images=prepared_images, return_tensors="pt")
             pixel_values = vision["pixel_values"]
             image_grid_thw = vision["image_grid_thw"]
-            merge_size = self.processor.image_processor.merge_size**2
-            vision_start = self.tokenizer.convert_tokens_to_ids("<|vision_start|>")
-            image_pad = self.tokenizer.convert_tokens_to_ids("<|image_pad|>")
-            vision_end = self.tokenizer.convert_tokens_to_ids("<|vision_end|>")
-            for index, grid in enumerate(image_grid_thw):
-                image_tokens = int(grid.prod()) // merge_size
+            image_token_counts = [int(grid.prod()) // merge_size for grid in image_grid_thw]
+
+        video_token_counts: list[int] = []
+        if references:
+            videos = [reference for reference in references if reference.kind is H3ReferenceKind.VIDEO]
+            if videos:
+                if any(reference.frames is None for reference in videos):
+                    raise ValueError("H3 prepared video reference has no frames")
+                sampled = [sample_reference_video_frames(reference.frames) for reference in videos]
+                for reference, (_, timestamps) in zip(videos, sampled):
+                    reference.block_timestamps = timestamps
+                vision = self.processor.video_processor(
+                    videos=[np.stack(frames) for frames, _ in sampled],
+                    do_sample_frames=False,
+                    return_tensors="pt",
+                )
+                pixel_values_videos = vision["pixel_values_videos"]
+                video_grid_thw = vision["video_grid_thw"]
+                video_token_counts = [int(grid[1]) * int(grid[2]) // merge_size for grid in video_grid_thw]
+                for reference, grid in zip(videos, video_grid_thw):
+                    if int(grid[0]) != len(reference.block_timestamps):
+                        raise ValueError("H3 reference video timestamps do not match Qwen3-VL vision blocks")
+
+        def emit_text(value: str) -> None:
+            ids = self.tokenizer(value, add_special_tokens=False)["input_ids"]
+            token_ids.extend(ids)
+            token_tags.extend([int(MiniMaxH3TokenTag.TEXT)] * len(ids))
+
+        def emit_vision(pad_token: int, count: int) -> None:
+            ids = [vision_start, *([pad_token] * count), vision_end]
+            token_ids.extend(ids)
+            token_tags.extend([int(MiniMaxH3TokenTag.VIDEO)] * len(ids))
+
+        if references:
+            counts = {H3ReferenceKind.IMAGE: 0, H3ReferenceKind.VIDEO: 0, H3ReferenceKind.AUDIO: 0}
+            for reference in references:
+                if reference.has_audio:
+                    counts[H3ReferenceKind.AUDIO] += 1
+                    emit_text(f"<Audio {counts[H3ReferenceKind.AUDIO]}>: ")
+                if reference.kind is H3ReferenceKind.IMAGE:
+                    counts[H3ReferenceKind.IMAGE] += 1
+                    index = counts[H3ReferenceKind.IMAGE] - 1
+                    emit_text(f"<Picture {index + 1}>: ")
+                    emit_vision(image_pad, image_token_counts[index])
+                elif reference.kind is H3ReferenceKind.VIDEO:
+                    counts[H3ReferenceKind.VIDEO] += 1
+                    index = counts[H3ReferenceKind.VIDEO] - 1
+                    emit_text(f"<Video {index + 1}>: ")
+                    for timestamp in reference.block_timestamps:
+                        emit_text(f"<{timestamp:.1f} seconds>")
+                        emit_vision(video_pad, video_token_counts[index])
+        elif images:
+            for index, image_tokens in enumerate(image_token_counts):
                 label_ids = self.tokenizer(f"<Picture {index + 1}>: ", add_special_tokens=False)["input_ids"]
                 vision_ids = [vision_start, *([image_pad] * image_tokens), vision_end]
                 token_ids.extend(label_ids)
@@ -217,6 +296,10 @@ class MiniMaxH3ConditioningEncoder:
                     mm_token_type_ids=mm_token_type_ids,
                     pixel_values=None if pixel_values is None else pixel_values.to(self.model.device, dtype=self.model.dtype),
                     image_grid_thw=None if image_grid_thw is None else image_grid_thw.to(self.model.device),
+                    pixel_values_videos=(
+                        None if pixel_values_videos is None else pixel_values_videos.to(self.model.device, dtype=self.model.dtype)
+                    ),
+                    video_grid_thw=None if video_grid_thw is None else video_grid_thw.to(self.model.device),
                     use_cache=False,
                     return_dict=True,
                 ).last_hidden_state[0]
@@ -227,30 +310,40 @@ class MiniMaxH3ConditioningEncoder:
         return hidden, tags
 
     def _images_for_item(self, item: Any) -> list[Image.Image] | None:
-        if self.task == "t2va":
+        if self.task in ("t2va", "ref2va"):
             return None
         content = item.content
-        if not isinstance(content, np.ndarray) or content.ndim != 4 or content.shape[0] < 2:
-            raise ValueError("MiniMax H3 FL2VA conditioning requires a decoded target video with at least two frames")
-        return [Image.fromarray(content[0].astype(np.uint8)), Image.fromarray(content[-1].astype(np.uint8))]
+        minimum_frames = 1 if self.task == "i2va" else 2
+        if not isinstance(content, np.ndarray) or content.ndim != 4 or content.shape[0] < minimum_frames:
+            raise ValueError(
+                f"MiniMax H3 {self.task.upper()} conditioning requires a decoded target video with at least "
+                f"{minimum_frames} frame(s)"
+            )
+        images = [Image.fromarray(content[0].astype(np.uint8))]
+        if self.task == "fl2va":
+            images.append(Image.fromarray(content[-1].astype(np.uint8)))
+        return images
 
-    def encode_prompt(self, prompt: str) -> dict[str, torch.Tensor]:
-        """Encode one text-only prompt for native T2VA inference."""
-        hidden, tags = self._encode_prompt(prompt)
+    def encode_prompt(self, prompt: str, images: list[Image.Image] | None = None) -> dict[str, torch.Tensor]:
+        """Encode one FL2VA prompt with optional prepared first/last keyframes."""
+        hidden, tags = self._encode_prompt(prompt, images)
         return {H3_TEXT_HIDDEN_KEY: hidden, H3_TEXT_TOKEN_TAGS_KEY: tags}
 
     def encode_conditioning(self, batch: list[Any], *, include_empty: bool = False) -> tuple[dict[str, torch.Tensor], ...]:
         dtype_name = dtype_to_str(self.output_dtype)
-        empty = self._encode_prompt("") if include_empty else None
         results = []
         for item in batch:
-            hidden, tags = self._encode_prompt(item.caption, self._images_for_item(item))
+            references = prepare_references(item) if self.task == "ref2va" else None
+            if self.task == "ref2va" and not references:
+                raise ValueError("MiniMax H3 Ref2VA conditioning requires at least one reference")
+            hidden, tags = self._encode_prompt(item.caption, self._images_for_item(item), references)
             tensors = {
                 f"varlen_{H3_TEXT_HIDDEN_KEY}_{dtype_name}": hidden,
                 f"varlen_{H3_TEXT_TOKEN_TAGS_KEY}_int64": tags,
+                H3_CONDITIONING_TASK_KEY: torch.tensor(H3_CONDITIONING_TASK_IDS[self.task], dtype=torch.long),
             }
-            if empty is not None:
-                empty_hidden, empty_tags = empty
+            if include_empty:
+                empty_hidden, empty_tags = self._encode_prompt("", self._images_for_item(item), references)
                 tensors[f"varlen_{H3_EMPTY_TEXT_HIDDEN_KEY}_{dtype_name}"] = empty_hidden
                 tensors[f"varlen_{H3_EMPTY_TEXT_TOKEN_TAGS_KEY}_int64"] = empty_tags
             results.append(tensors)

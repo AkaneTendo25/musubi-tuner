@@ -17,6 +17,14 @@ H3_TEXT_HIDDEN_KEY = "mmh3_hidden_states"
 H3_TEXT_TOKEN_TAGS_KEY = "mmh3_token_tags"
 H3_EMPTY_TEXT_HIDDEN_KEY = "mmh3_empty_hidden_states"
 H3_EMPTY_TEXT_TOKEN_TAGS_KEY = "mmh3_empty_token_tags"
+H3_CONDITIONING_TASK_KEY = "mmh3_conditioning_task"
+H3_CONDITIONING_TASK_IDS = {"t2va": 0, "i2va": 1, "fl2va": 2, "ref2va": 3}
+H3_KEYFRAME_VIDEO_ROWS_KEY = "mmh3_keyframe_video_rows"
+H3_REFERENCE_KINDS_KEY = "mmh3_reference_kinds"
+H3_REFERENCE_VIDEO_SHAPES_KEY = "mmh3_reference_video_shapes"
+H3_REFERENCE_AUDIO_LENGTHS_KEY = "mmh3_reference_audio_lengths"
+H3_REFERENCE_VIDEO_ROWS_KEY = "mmh3_reference_video_rows"
+H3_REFERENCE_AUDIO_ROWS_KEY = "mmh3_reference_audio_rows"
 
 
 def normalize_batch_tensors(results: Any, expected: int, operation: str) -> tuple[dict[str, torch.Tensor], ...]:
@@ -112,7 +120,7 @@ def save_text_encoder_output_cache_minimax_h3(
 ) -> None:
     cache_tensors = _validated_cache_tensors(item_info, tensors, operation="conditioning encoder")
     logical_keys = {_logical_key(key) for key in cache_tensors}
-    required = {H3_TEXT_HIDDEN_KEY, H3_TEXT_TOKEN_TAGS_KEY}
+    required = {H3_TEXT_HIDDEN_KEY, H3_TEXT_TOKEN_TAGS_KEY, H3_CONDITIONING_TASK_KEY}
     missing = sorted(required - logical_keys)
     if missing:
         raise ValueError(f"H3 conditioning cache for {item_info.item_key} is missing: {', '.join(missing)}")
@@ -135,6 +143,9 @@ def save_text_encoder_output_cache_minimax_h3(
             raise ValueError(f"H3 {tags_key} must be int64 with shape [{hidden.shape[0]}]")
 
     validate_pair(H3_TEXT_HIDDEN_KEY, H3_TEXT_TOKEN_TAGS_KEY)
+    task = tensor_for(H3_CONDITIONING_TASK_KEY)
+    if task.dtype != torch.long or task.ndim != 0 or int(task) not in H3_CONDITIONING_TASK_IDS.values():
+        raise ValueError(f"H3 {H3_CONDITIONING_TASK_KEY} must be a scalar int64 task id")
     if empty_keys <= logical_keys:
         validate_pair(H3_EMPTY_TEXT_HIDDEN_KEY, H3_EMPTY_TEXT_TOKEN_TAGS_KEY)
     save_text_encoder_output_cache_common(

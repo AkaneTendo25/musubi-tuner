@@ -4,6 +4,7 @@ from pathlib import Path
 
 import av
 import torch
+from PIL import Image
 
 from musubi_tuner.minimax_h3.audio_vae import MiniMaxH3AudioBigVGANDecoder
 from musubi_tuner.minimax_h3.cache import H3_TEXT_HIDDEN_KEY, H3_TEXT_TOKEN_TAGS_KEY
@@ -11,7 +12,8 @@ from musubi_tuner.minimax_h3.inference import (
     H3GeneratedMedia,
     data_ward_euler_step,
     decode_latents_sequentially,
-    denoise_t2va,
+    denoise_fl2va,
+    prepare_keyframe_image,
     resolve_canvas_size,
     save_av_mp4,
     shifted_flow_schedule,
@@ -80,7 +82,7 @@ def test_tiny_joint_denoising_is_finite_and_shape_correct() -> None:
         H3_TEXT_TOKEN_TAGS_KEY: torch.ones(3, dtype=torch.long),
     }
 
-    video, audio = denoise_t2va(
+    video, audio = denoise_fl2va(
         transformer,
         conditioning,
         height=32,
@@ -96,6 +98,44 @@ def test_tiny_joint_denoising_is_finite_and_shape_correct() -> None:
     assert audio.shape == (1, 2, 8, 8)
     assert torch.isfinite(video).all()
     assert torch.isfinite(audio).all()
+
+
+def test_tiny_first_frame_denoising_is_finite_and_returns_only_target_rows() -> None:
+    transformer = _tiny_transformer()
+    conditioning = {
+        H3_TEXT_HIDDEN_KEY: torch.randn(3, 12),
+        H3_TEXT_TOKEN_TAGS_KEY: torch.tensor([1, 0, 1]),
+    }
+
+    video, audio = denoise_fl2va(
+        transformer,
+        conditioning,
+        height=32,
+        width=32,
+        frame_count=5,
+        num_inference_steps=3,
+        generator=torch.Generator().manual_seed(1),
+        device=torch.device("cpu"),
+        keyframe_rows=torch.randn(1, 16),
+        keyframe_anchors=("first",),
+        condition_seed=7,
+        show_progress=False,
+    )
+
+    assert video.shape == (1, 4, 2, 2, 2)
+    assert audio.shape == (1, 2, 8, 8)
+    assert torch.isfinite(video).all()
+    assert torch.isfinite(audio).all()
+
+
+def test_keyframe_canvas_uses_stretch_for_first_and_cover_crop_for_last() -> None:
+    image = Image.new("RGB", (8, 4))
+
+    first = prepare_keyframe_image(image, 8, 8, stretch=True)
+    last = prepare_keyframe_image(image, 8, 8, stretch=False)
+
+    assert first.size == (8, 8)
+    assert last.size == (8, 8)
 
 
 def test_tiny_video_decoder_restores_patch_geometry() -> None:

@@ -386,6 +386,21 @@ class MiniMaxH3VideoEncoderModel(nn.Module):
         std = self.latents_std.view(1, -1, 1, 1, 1)
         return (latent - mean) / std
 
+    def encode_reference(self, pixels: torch.Tensor, *, image: bool) -> torch.Tensor:
+        """Encode FL2VA/Ref2VA visual conditioning with the released sampled-posterior recipe."""
+        if pixels.ndim != 5 or pixels.shape[1] != 3:
+            raise ValueError(f"reference pixels must have shape [B, 3, F, H, W], got {tuple(pixels.shape)}")
+        moments = self._encode_clip(pixels) if image else self.encode_moments(pixels)
+        latent_mean, latent_logvar = moments.chunk(2, dim=1)
+        generator = torch.Generator(device="cpu").manual_seed(42)
+        noise = torch.randn(latent_mean.shape, generator=generator, dtype=torch.float32).to(latent_mean.device)
+        latent = latent_mean.float() + torch.exp(0.5 * latent_logvar.float().clamp(-30.0, 20.0)) * noise
+        # Ref2VA intentionally rounds the posterior sample before normalization.
+        latent = latent.to(torch.float16).float()
+        mean = self.latents_mean.view(1, -1, 1, 1, 1)
+        std = self.latents_std.view(1, -1, 1, 1, 1)
+        return (latent - mean) / std
+
 
 class MiniMaxH3VideoRotaryPosEmbed(nn.Module):
     """Three-axis rotary embedding used by the released ViT decoder."""

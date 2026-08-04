@@ -33,7 +33,7 @@ from musubi_tuner.minimax_h3.audio import (
     load_audio_asset,
     target_audio_processing_spec,
 )
-from musubi_tuner.minimax_h3.cache import save_latent_cache_minimax_h3
+from musubi_tuner.minimax_h3.cache import H3_KEYFRAME_VIDEO_ROWS_KEY, save_latent_cache_minimax_h3
 from musubi_tuner.minimax_h3.dataset import create_h3_dataset_group
 from musubi_tuner.minimax_h3.media import (
     AudioProcessingSpec,
@@ -44,6 +44,12 @@ from musubi_tuner.minimax_h3.media import (
     PadMode,
     fit_audio_length,
     slice_media_asset,
+)
+from musubi_tuner.minimax_h3.references import (
+    resample_reference_frames,
+    resolve_reference_image_size,
+    resolve_reference_video_size,
+    trim_reference_frames,
 )
 from musubi_tuner.minimax_h3.request import H3GenerationRequest, H3Reference, ReferenceKind, ReferenceRole
 from musubi_tuner.minimax_h3.weights import CheckpointInspectionError, inspect_checkpoint
@@ -351,6 +357,19 @@ def test_h3_media_slice_is_architecture_local(tmp_path):
     assert sliced.duration_seconds == 3.0
 
 
+def test_ref2va_reference_geometry_matches_released_preprocessing():
+    assert resolve_reference_image_size(80, 48) == (2048, 3424)
+    assert resolve_reference_image_size(48, 80) == (3424, 2048)
+    assert resolve_reference_video_size(1344, 768) == (768, 1344)
+    assert trim_reference_frames(1) == 22
+    assert trim_reference_frames(25) == 22
+    assert trim_reference_frames(124) == 124
+
+    frames = np.arange(30, dtype=np.uint8).reshape(-1, 1, 1, 1) * np.ones((1, 2, 2, 3), dtype=np.uint8)
+    resampled = resample_reference_frames(frames, 30.0)
+    assert [int(frame[0, 0, 0]) for frame in resampled] == [index for index in range(30) if index not in (2, 7, 12, 17, 22, 27)]
+
+
 def test_audio_file_decode_resample_and_mask(tmp_path):
     path = tmp_path / "tone.wav"
     samples = (np.sin(np.arange(8000) * 2 * np.pi * 220 / 8000) * 16000).astype(np.int16)
@@ -447,6 +466,40 @@ def test_native_cache_io_records_audio_tensor_and_architecture(tmp_path):
         assert not handle.get_tensor("audio_loss_mask").any()
         assert handle.metadata()["architecture"] == "minimax_h3"
         assert handle.metadata()["frame_count"] == "22"
+
+
+def test_native_latent_encoder_caches_first_and_last_fl2va_keyframe_rows():
+    class VideoEncoder(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.anchor_values = []
+            self.marker = torch.nn.Parameter(torch.zeros((), dtype=torch.float32), requires_grad=False)
+
+        def encode(self, pixels):
+            del pixels
+            return torch.zeros(1, 24, 2, 2, 2)
+
+        def encode_reference(self, pixels, *, image):
+            assert image
+            value = float(pixels.mean())
+            self.anchor_values.append(value)
+            return torch.full((1, 24, 1, 2, 2), value)
+
+    video_encoder = VideoEncoder()
+    audio_encoder = torch.nn.Linear(1, 1, bias=False)
+    encoder = h3_integration._NativeLatentEncoder(video_encoder, audio_encoder, torch.float32)
+    encoder._encode_audio = lambda item: (torch.zeros(2, 32, 8), torch.ones(8, dtype=torch.bool))
+    encoder._encode_references = lambda item: {}
+    content = np.zeros((5, 32, 32, 3), dtype=np.uint8)
+    content[-1] = 255
+    item = SimpleNamespace(content=content, item_key="sample")
+
+    (tensors,) = encoder.encode_latents([item])
+
+    key = f"varlen_{H3_KEYFRAME_VIDEO_ROWS_KEY}_float32"
+    assert tensors[key].shape == (2, 96)
+    assert len(video_encoder.anchor_values) == 2
+    assert video_encoder.anchor_values[0] != video_encoder.anchor_values[1]
 
 
 def test_h3_training_uses_crop_specific_text_cache_identity(tmp_path):

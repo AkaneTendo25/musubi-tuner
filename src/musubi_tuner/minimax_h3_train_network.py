@@ -11,6 +11,7 @@ from pathlib import Path
 
 import torch
 from accelerate import Accelerator
+from PIL import Image
 
 from musubi_tuner.dataset import config_utils
 from musubi_tuner.dataset.architectures import ARCHITECTURE_MINIMAX_H3, ARCHITECTURE_MINIMAX_H3_FULL
@@ -27,7 +28,13 @@ from musubi_tuner.minimax_h3.cache import (
 )
 from musubi_tuner.minimax_h3.component_loader import load_audio_vae_decoder, load_video_vae_decoder
 from musubi_tuner.minimax_h3.dataset import create_h3_dataset_group
-from musubi_tuner.minimax_h3.inference import decode_latents_sequentially, denoise_t2va, save_av_mp4
+from musubi_tuner.minimax_h3.inference import (
+    decode_latents_sequentially,
+    denoise_fl2va,
+    encode_keyframe_images,
+    prepare_keyframe_image,
+    save_av_mp4,
+)
 from musubi_tuner.minimax_h3.training import (
     H3ModelPrediction,
     guidance_consistent_prediction,
@@ -40,6 +47,9 @@ from musubi_tuner.utils import model_utils
 from musubi_tuner.utils.device_utils import clean_memory_on_device
 
 logger = logging.getLogger(__name__)
+
+_SAMPLE_KEYFRAME_ROWS = "_h3_keyframe_rows"
+_SAMPLE_KEYFRAME_ANCHORS = "_h3_keyframe_anchors"
 
 _DIRECT_SIGMA_SAMPLING = {
     "uniform",
@@ -163,11 +173,31 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             dtype="bfloat16",
             quantization=args.text_encoder_quantization,
         )
+        prepared_images: list[list[Image.Image]] = []
         for prompt in prompts:
-            prompt.update(encoder.encode_prompt(prompt.get("prompt", "")))
+            height = prompt.get("height", 192)
+            width = prompt.get("width", 320)
+            images = []
+            anchors = []
+            if prompt.get("image_path"):
+                with Image.open(prompt["image_path"]) as image:
+                    images.append(prepare_keyframe_image(image, height, width, stretch=True))
+                anchors.append("first")
+            if prompt.get("end_image_path"):
+                with Image.open(prompt["end_image_path"]) as image:
+                    images.append(prepare_keyframe_image(image, height, width, stretch=False))
+                anchors.append("last")
+            prompt.update(encoder.encode_prompt(prompt.get("prompt", ""), images))
+            prompt[_SAMPLE_KEYFRAME_ANCHORS] = tuple(anchors)
+            prepared_images.append(images)
         del encoder
         gc.collect()
         clean_memory_on_device(accelerator.device)
+        all_images = [image for images in prepared_images for image in images]
+        encoded = iter(encode_keyframe_images(Path(args.vae), all_images, accelerator.device))
+        for prompt, images in zip(prompts, prepared_images):
+            rows = [next(encoded) for _ in images]
+            prompt[_SAMPLE_KEYFRAME_ROWS] = torch.cat(rows) if rows else None
         return prompts
 
     def _generate_sample(
@@ -192,7 +222,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             torch.cuda.synchronize(device)
             torch.cuda.reset_peak_memory_stats(device)
         denoise_started = time.perf_counter()
-        video_latents, audio_latents = denoise_t2va(
+        video_latents, audio_latents = denoise_fl2va(
             transformer,
             conditioning,
             height=height,
@@ -201,6 +231,9 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             num_inference_steps=sample_steps,
             generator=generator,
             device=device,
+            keyframe_rows=sample_parameter.get(_SAMPLE_KEYFRAME_ROWS),
+            keyframe_anchors=sample_parameter.get(_SAMPLE_KEYFRAME_ANCHORS, ()),
+            condition_seed=seed,
         )
         if device.type == "cuda":
             torch.cuda.synchronize(device)
@@ -285,6 +318,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 "frames": frame_count,
                 "sigma_points": sample_steps,
                 "model_evaluations": sample_steps - 1,
+                "keyframe_anchors": list(sample_parameter.get(_SAMPLE_KEYFRAME_ANCHORS, ())),
                 "metrics": self._last_sample_metrics,
             },
         )
