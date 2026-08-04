@@ -123,6 +123,7 @@ def create_generator(
     height: int | None = None,
     width: int | None = None,
     fp8_scaled: bool = False,
+    int8_convrot: bool = False,
     text_encoder_quantization: Literal["none", "int8", "nf4", "nvfp4_awq"] = "none",
     blocks_to_swap: int = 0,
     block_swap_h2d_only: bool = False,
@@ -146,6 +147,7 @@ def create_generator(
         height=height,
         width=width,
         fp8_scaled=fp8_scaled,
+        int8_convrot=int8_convrot,
         text_encoder_quantization=text_encoder_quantization,
         blocks_to_swap=blocks_to_swap,
         block_swap_h2d_only=block_swap_h2d_only,
@@ -172,6 +174,7 @@ class _NativeGenerator:
         height: int | None,
         width: int | None,
         fp8_scaled: bool,
+        int8_convrot: bool,
         text_encoder_quantization: Literal["none", "int8", "nf4", "nvfp4_awq"],
         blocks_to_swap: int,
         block_swap_h2d_only: bool,
@@ -194,6 +197,7 @@ class _NativeGenerator:
         self.height = height
         self.width = width
         self.fp8_scaled = fp8_scaled
+        self.int8_convrot = int8_convrot
         self.text_encoder_quantization = text_encoder_quantization
         self.blocks_to_swap = blocks_to_swap
         self.block_swap_h2d_only = block_swap_h2d_only
@@ -286,6 +290,7 @@ class _NativeGenerator:
             loading_device=loading_device,
             fp8_scaled=self.fp8_scaled,
             quantization_device=self.device if self.fp8_scaled else None,
+            int8_convrot=self.int8_convrot,
         )
         transformer.requires_grad_(False).eval()
         if self.blocks_to_swap:
@@ -458,8 +463,9 @@ def create_training_backend(
     split_attention: bool,
     fp8_scaled: bool = False,
     quantization_device: str | None = None,
+    int8_convrot: bool = False,
 ):
-    """Load the released BF16 transformer and adapt its training forward to Musubi."""
+    """Load the selected released transformer and adapt its training forward to Musubi."""
     if dtype != "bfloat16":
         raise ValueError("MiniMax H3 full-checkpoint training requires bfloat16 compute")
     if attention_mode != "torch" or split_attention:
@@ -472,6 +478,7 @@ def create_training_backend(
         loading_device=device or "cpu",
         fp8_scaled=fp8_scaled,
         quantization_device=quantization_device,
+        int8_convrot=int8_convrot,
     )
     return _NativeTrainingBackend(transformer, mode)
 

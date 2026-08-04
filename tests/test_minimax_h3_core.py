@@ -766,6 +766,7 @@ def test_h3_generation_parser_exposes_native_inference_controls():
         "--vae",
         "--audio_vae",
         "--fp8_base",
+        "--int8_convrot_base",
         "--blocks_to_swap",
         "--block_swap_granularity",
         "--lora_weight",
@@ -806,6 +807,7 @@ def test_h3_bundled_text_encoder_assets_are_complete():
                 "split_attention": False,
                 "fp8_scaled": False,
                 "quantization_device": None,
+                "int8_convrot": False,
             },
         ),
     ],
@@ -856,6 +858,7 @@ def test_h3_generator_factory_routes_all_native_components(monkeypatch):
     assert captured["request"] is request
     assert captured["num_inference_steps"] == 20
     assert captured["fp8_scaled"] is False
+    assert captured["int8_convrot"] is False
     assert captured["blocks_to_swap"] == 0
 
 

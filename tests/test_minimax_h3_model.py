@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -7,6 +8,12 @@ from accelerate import init_empty_weights
 from safetensors.torch import save_file
 
 import musubi_tuner.minimax_h3.model as h3_model
+from musubi_tuner.minimax_h3.int8_convrot import (
+    enable_int8_convrot,
+    load_comfy_int8_convrot_state_dict,
+    prepare_int8_convrot_modules,
+    rotate_activation,
+)
 from musubi_tuner.minimax_h3.model import MiniMaxH3Transformer, MiniMaxH3TransformerConfig
 from musubi_tuner.minimax_h3.model_loader import (
     H3_FP8_OPTIMIZATION_EXCLUDE_KEYS,
@@ -459,3 +466,63 @@ def test_h3_checkpoint_validator_accepts_exact_native_mixed_precision_layout(tmp
     assert tensor_count == len(state_dict)
     assert parameter_count == sum(tensor.numel() for tensor in state_dict.values())
     assert resolve_transformer_checkpoint(checkpoint_path, "fl2va") == checkpoint_path
+
+
+def test_h3_pruned_int8_convrot_checkpoint_contract_and_adapter_gradient(tmp_path: Path):
+    torch.manual_seed(11)
+    config = _tiny_config(num_layers=1)
+    config = MiniMaxH3TransformerConfig(**{**config.__dict__, "time_embed_dim": 4, "adaln_t_table_size": 5})
+    model = MiniMaxH3Transformer(config)
+    fp32_prefixes = (
+        "video_patch_proj.",
+        "audio_patch_proj.",
+        "final_layer.video_out.",
+        "final_layer.audio_out.",
+        "rope.",
+        "adaln_t_table",
+    )
+    state_dict = {}
+    for name, tensor in model.state_dict().items():
+        dtype = torch.float32 if name.startswith(fp32_prefixes) else torch.float16 if ".adaln_proj.linear." in name else torch.bfloat16
+        state_dict[name] = tensor.detach().to(dtype).contiguous()
+
+    quantized_name = "blocks.0.attn.qkv_proj"
+    weight = state_dict[f"{quantized_name}.weight"].float()
+    rotated = rotate_activation(weight, 4)
+    scale = (rotated.abs().amax(dim=1, keepdim=True) / 127.0).clamp(min=1e-30)
+    state_dict[f"{quantized_name}.weight"] = (rotated / scale).round().clamp(-127, 127).to(torch.int8)
+    state_dict[f"{quantized_name}.weight_scale"] = scale.float()
+    marker = {"format": "int8_tensorwise", "convrot": True, "convrot_groupsize": 4}
+    state_dict[f"{quantized_name}.comfy_quant"] = torch.tensor(list(json.dumps(marker).encode()), dtype=torch.uint8)
+    checkpoint = tmp_path / "minimax_h3_fl2va_pruned_int8_convrot.safetensors"
+    save_file(state_dict, checkpoint)
+
+    tensor_count, _ = validate_transformer_checkpoint(checkpoint, config)
+    assert tensor_count == len(state_dict)
+
+    loaded_state, quantized_layers = load_comfy_int8_convrot_state_dict(checkpoint, device=torch.device("cpu"))
+    loaded = MiniMaxH3Transformer(config).requires_grad_(False)
+    assert prepare_int8_convrot_modules(loaded, loaded_state) == quantized_layers == 1
+    info = loaded.load_state_dict(loaded_state, strict=True, assign=True)
+    assert not info.missing_keys and not info.unexpected_keys
+    assert enable_int8_convrot(loaded) == 1
+
+    inputs = _tiny_inputs()
+    inputs["encoder_hidden_states"].requires_grad_(True)
+    output = loaded(**inputs)
+    (output.video.square().mean() + output.audio.square().mean()).backward()
+    assert inputs["encoder_hidden_states"].grad is not None
+    assert torch.isfinite(inputs["encoder_hidden_states"].grad).all()
+    assert loaded.blocks[0].attn.qkv_proj.weight.grad is None
+
+
+def test_h3_checkpoint_directory_resolution_keeps_existing_bf16_default(tmp_path: Path):
+    model_dir = tmp_path / "diffusion_models"
+    model_dir.mkdir()
+    full = model_dir / "minimax_h3_fl2va_bf16.safetensors"
+    pruned = model_dir / "minimax_h3_fl2va_pruned_int8_convrot.safetensors"
+    full.touch()
+    pruned.touch()
+
+    assert resolve_transformer_checkpoint(tmp_path, "fl2va") == full
+    assert resolve_transformer_checkpoint(tmp_path, "fl2va", int8_convrot=True) == pruned

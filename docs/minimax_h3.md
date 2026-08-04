@@ -32,6 +32,8 @@ Comfy-Org conditioner checkpoints below:
 
 - [FL2VA BF16 transformer](https://huggingface.co/Comfy-Org/MiniMax-H3/blob/main/diffusion_models/minimax_h3_fl2va_bf16.safetensors),
   `diffusion_models/minimax_h3_fl2va_bf16.safetensors`;
+- [FL2VA pruned INT8 ConvRot transformer](https://huggingface.co/Comfy-Org/MiniMax-H3/blob/main/diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors),
+  `diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors`;
 - [Qwen3-VL BF16 text encoder](https://huggingface.co/Comfy-Org/MiniMax-H3/blob/main/text_encoders/qwen3vl_32b_minimax_h3_bf16.safetensors),
   `text_encoders/qwen3vl_32b_minimax_h3_bf16.safetensors`;
 - [Qwen3-VL NVFP4/AWQ text encoder](https://huggingface.co/Comfy-Org/MiniMax-H3/blob/main/text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors),
@@ -78,12 +80,21 @@ hf download Comfy-Org/MiniMax-H3 \
   --local-dir /models/MiniMax-H3
 ```
 
+To train with the pruned INT8 ConvRot transformer, download it instead of the BF16 transformer:
+
+```shell
+hf download Comfy-Org/MiniMax-H3 \
+  diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors \
+  --local-dir /models/MiniMax-H3
+```
+
 The resulting layout used by the commands below is:
 
 ```text
 /models/MiniMax-H3/
 ├── diffusion_models/
 │   ├── minimax_h3_fl2va_bf16.safetensors
+│   ├── minimax_h3_fl2va_pruned_int8_convrot.safetensors  # optional compressed alternative
 │   └── minimax_h3_ref2va_bf16.safetensors       # Ref2VA only
 ├── text_encoders/
 │   ├── qwen3vl_32b_minimax_h3_bf16.safetensors
@@ -244,6 +255,23 @@ This path keeps the 350 language-model Linear layers in their packed NVFP4/AWQ r
 INT8. Each Linear weight is dequantized only for its BF16 operation, so the full dense BF16 text encoder is never materialized.
 Vision modules and cached layer-50 hidden states remain BF16. The mode is explicit and accepts only the matching checkpoint format.
 
+The pruned transformer replaces the full timestep MLP and 2,688-wide AdaLN inputs with a sampled timestep table and narrow AdaLN
+projections. Its eligible attention and feed-forward Linear weights remain frozen in the checkpoint's row-wise INT8 ConvRot form.
+Use it for LoRA training with:
+
+```shell
+python minimax_h3_train_network.py \
+  --dit /models/MiniMax-H3/diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors \
+  --int8_convrot_base --sdpa --mixed_precision bf16 \
+  --dataset_config dataset.toml \
+  --network_module networks.lora_minimax_h3 \
+  --network_dim 16 --network_alpha 16
+```
+
+`--int8_convrot_base` is explicit and cannot be combined with `--fp8_base`. The loader validates the AdaLN table, every model key,
+the complete marker/scale/INT8-weight sets, and each mixed-precision tensor before loading. Omitting the flag continues to resolve and
+load the full BF16 checkpoint through the unchanged BF16/FP8 path.
+
 The native loader preserves the released component precision: the Comfy video encoder is FP16 and the audio encoder is FP32.
 Normalized cache tensors default to float32, and target video/audio caches use the posterior mean for deterministic reuse. Cache
 filenames use Musubi's `mmh3` architecture short name. The latent cache contains normalized video latents, normalized stereo audio
@@ -369,8 +397,8 @@ For Ref2VA, use the dedicated checkpoint and add the mode switch after caching w
 > observed block-like artifacts in a rank-16 concept LoRA. The cause is unresolved: overfitting, guidance-distillation breakdown,
 > AdaLN quantization, data/recipe choice, and implementation error have not yet been separated experimentally. FP8 in this branch
 > quantizes the frozen 13B block AdaLN projections; use BF16 as the quality reference when investigating artifacts. The released
-> full checkpoint is the only training checkpoint validated here; AdaLN-pruned checkpoints remain experimental and are not accepted
-> as equivalent until controlled gradient and output comparisons are complete.
+> The pruned INT8 ConvRot checkpoint now passes strict loading and training-path gradient smoke tests, but it remains experimental:
+> controlled LoRA-quality and output comparisons against the full checkpoint are still required before treating the two as equivalent.
 
 `--fp8_base` enables weight-only scaled FP8 for the transformer's block `Linear` weights while keeping the surrounding model in
 its normal mixed-precision dtypes. This includes the large per-block AdaLN projections. For frozen-base LoRA training, H2D-only
@@ -551,6 +579,7 @@ python minimax_h3_generate_video.py \
 Here `--steps 20` follows the released Diffusers scheduler contract: it creates 20 sigma points including terminal zero and runs
 19 transformer evaluations. Add one or more `--lora_weight` options (and matching `--lora_multiplier` values when needed) to
 evaluate saved adapters. The common `--fp8_base` and block-swap options are also available for constrained inference.
+Pass the pruned transformer together with `--int8_convrot_base` to use the same frozen ConvRot runtime for inference.
 
 For samples during training, add the decoder and conditioner paths plus Musubi's common sampling options to the training command:
 

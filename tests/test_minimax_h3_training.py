@@ -979,7 +979,7 @@ def test_h3_trainer_loads_only_the_selected_training_transformer(monkeypatch, tm
     monkeypatch.setattr(h3_train_network, "create_training_backend", create_backend)
     trainer = MiniMaxH3NetworkTrainer()
     trainer.dit_dtype = torch.bfloat16
-    args = SimpleNamespace(h3_training_mode="ref2va", fp8_base=False)
+    args = SimpleNamespace(h3_training_mode="ref2va", fp8_base=False, int8_convrot_base=False)
     accelerator = SimpleNamespace(device=torch.device("cuda", 0))
 
     loaded = trainer.load_transformer(accelerator, args, str(tmp_path), "torch", False, "cpu", torch.bfloat16)
@@ -994,6 +994,7 @@ def test_h3_trainer_loads_only_the_selected_training_transformer(monkeypatch, tm
         "split_attention": False,
         "fp8_scaled": False,
         "quantization_device": "cuda:0",
+        "int8_convrot": False,
     }
 
 
@@ -1085,6 +1086,7 @@ def test_h3_training_parser_defaults_to_native_fl2va_contract():
     assert args.h3_loss_balance == "modality"
     assert args.h3_guidance_distillation_scale is None
     assert args.fp8_scaled is False
+    assert args.int8_convrot_base is False
     assert "--fp8_base" in parser._option_string_actions
     assert "--blocks_to_swap" in parser._option_string_actions
     assert "--block_swap_h2d_only" in parser._option_string_actions

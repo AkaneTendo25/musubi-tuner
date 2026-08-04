@@ -155,6 +155,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             # prevent the base trainer from casting the mixed-precision shell
             # and norms directly to float8.
             args.fp8_scaled = True
+        if args.int8_convrot_base and args.fp8_base:
+            raise ValueError("MiniMax H3 --int8_convrot_base cannot be combined with --fp8_base")
         if args.blocks_to_swap is not None and args.blocks_to_swap < 0:
             raise ValueError("MiniMax H3 --blocks_to_swap must be non-negative")
         if args.block_swap_h2d_only and not args.use_pinned_memory_for_block_swap:
@@ -373,6 +375,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             split_attention=split_attn,
             fp8_scaled=bool(args.fp8_base),
             quantization_device=str(accelerator.device),
+            int8_convrot=bool(args.int8_convrot_base),
         )
         transformer = self.backend.get_training_transformer()
         if not isinstance(transformer, torch.nn.Module):
@@ -619,6 +622,11 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         type=float,
         default=None,
         help="enable optional two-pass guidance-consistent training with an authoritative distillation scale",
+    )
+    parser.add_argument(
+        "--int8_convrot_base",
+        action="store_true",
+        help="load the pruned Comfy INT8 ConvRot transformer for LoRA training",
     )
     parser.add_argument(
         "--h3_shift_video",

@@ -56,6 +56,7 @@ class MiniMaxH3TransformerConfig:
     freq_dim: int = 256
     time_embed_hidden_dim: int = 5376
     time_embed_dim: int = 2688
+    adaln_t_table_size: int | None = None
     rope_freq_dim: int = 16
     rope_theta: float = 10000.0
     norm_eps: float = 1e-5
@@ -122,9 +123,10 @@ class MiniMaxH3TimeEmbedder(nn.Module):
 
 
 class MiniMaxH3AdaLNProjection(nn.Module):
-    def __init__(self, input_dim: int, output_dim: int):
+    def __init__(self, input_dim: int, output_dim: int, *, apply_silu: bool = True):
         super().__init__()
         self.linear = nn.Linear(input_dim, output_dim)
+        self.apply_silu = apply_silu
 
     def forward(self, timestep_embedding: torch.Tensor) -> torch.Tensor:
         # Scaled FP8 stores the frozen weight in E4M3 but dequantizes it to the
@@ -132,7 +134,8 @@ class MiniMaxH3AdaLNProjection(nn.Module):
         # storage dtype would bypass that compute contract and make F.linear see
         # mismatched FP8/BF16 operands.
         compute_dtype = getattr(self.linear, "scale_weight", self.linear.weight).dtype
-        activated = F.silu(timestep_embedding).to(compute_dtype)
+        activated = F.silu(timestep_embedding) if self.apply_silu else timestep_embedding
+        activated = activated.to(compute_dtype)
         return self.linear(activated)
 
 
@@ -238,6 +241,7 @@ class MiniMaxH3TransformerBlock(nn.Module):
         self.adaln_proj = MiniMaxH3AdaLNProjection(
             config.time_embed_dim,
             6 * config.hidden_size * MINIMAX_H3_MODALITY_COUNT,
+            apply_silu=config.adaln_t_table_size is None,
         )
         self.hidden_size = config.hidden_size
 
@@ -251,6 +255,13 @@ class MiniMaxH3TransformerBlock(nn.Module):
     ) -> torch.Tensor:
         modulation = self.adaln_proj(timestep_embedding).view(-1, 6 * self.hidden_size)
         shift_attn, scale_attn, gate_attn, shift_mlp, scale_mlp, gate_mlp = modulation.chunk(6, dim=-1)
+        hidden_dtype = hidden_states.dtype
+        shift_attn = shift_attn.to(hidden_dtype)
+        scale_attn = scale_attn.to(hidden_dtype)
+        gate_attn = gate_attn.to(hidden_dtype)
+        shift_mlp = shift_mlp.to(hidden_dtype)
+        scale_mlp = scale_mlp.to(hidden_dtype)
+        gate_mlp = gate_mlp.to(hidden_dtype)
 
         norm_hidden_states = self.norm1(hidden_states)
         norm_hidden_states = norm_hidden_states * (1.0 + scale_attn.index_select(0, adaln_indices))
@@ -270,7 +281,11 @@ class MiniMaxH3FinalLayer(nn.Module):
         super().__init__()
         video_patch_dim = config.in_channels * torch.Size(config.patch_size).numel()
         self.norm = nn.RMSNorm(config.hidden_size, eps=config.final_norm_eps)
-        self.adaln_proj = MiniMaxH3AdaLNProjection(config.time_embed_dim, 2 * config.hidden_size)
+        self.adaln_proj = MiniMaxH3AdaLNProjection(
+            config.time_embed_dim,
+            2 * config.hidden_size,
+            apply_silu=config.adaln_t_table_size is None,
+        )
         self.video_out = nn.Linear(config.hidden_size, video_patch_dim)
         self.audio_out = nn.Linear(config.hidden_size, config.audio_in_channels)
 
@@ -283,6 +298,8 @@ class MiniMaxH3FinalLayer(nn.Module):
         audio_indices: torch.Tensor,
     ) -> MiniMaxH3TransformerOutput:
         shift, scale = self.adaln_proj(timestep_embedding).chunk(2, dim=-1)
+        shift = shift.to(hidden_states.dtype)
+        scale = scale.to(hidden_states.dtype)
         hidden_states = self.norm(hidden_states)
         hidden_states = hidden_states * (1.0 + scale.index_select(0, timestep_indices))
         hidden_states = hidden_states + shift.index_select(0, timestep_indices)
@@ -308,11 +325,21 @@ class MiniMaxH3Transformer(nn.Module):
         self.video_patch_proj = nn.Linear(video_patch_dim, config.hidden_size)
         self.audio_patch_proj = nn.Linear(config.audio_in_channels, config.hidden_size)
         self.condition_proj = nn.Linear(config.text_dim, config.hidden_size)
-        self.time_embedder = MiniMaxH3TimeEmbedder(
-            config.freq_dim,
-            config.time_embed_hidden_dim,
-            config.time_embed_dim,
-        )
+        if config.adaln_t_table_size is None:
+            self.time_embedder = MiniMaxH3TimeEmbedder(
+                config.freq_dim,
+                config.time_embed_hidden_dim,
+                config.time_embed_dim,
+            )
+        else:
+            if config.adaln_t_table_size < 2:
+                raise ValueError("H3 AdaLN timestep table must contain at least two rows")
+            self.time_embedder = None
+            self.register_buffer(
+                "adaln_t_table",
+                torch.zeros(config.adaln_t_table_size, config.time_embed_dim),
+                persistent=True,
+            )
         self.rope = MiniMaxH3RotaryPosEmbed(config.rope_freq_dim, config.rope_theta)
         self.token_refiner = MiniMaxH3TokenRefiner(config)
         self.blocks = nn.ModuleList([MiniMaxH3TransformerBlock(config) for _ in range(config.num_layers)])
@@ -412,6 +439,17 @@ class MiniMaxH3Transformer(nn.Module):
 
         return checkpoint(forward, hidden_states, use_reentrant=False)
 
+    def _time_embedding(self, timestep: torch.Tensor) -> torch.Tensor:
+        if self.time_embedder is not None:
+            return self.time_embedder(timestep)
+        table = self.adaln_t_table.float()
+        position = timestep.to(device=table.device, dtype=torch.float32).clamp(0.0, 1.0) * (table.shape[0] - 1)
+        lower = position.floor().long()
+        upper = (lower + 1).clamp(max=table.shape[0] - 1)
+        fraction = (position - lower.float()).unsqueeze(1)
+        embedding = table.index_select(0, lower) * (1.0 - fraction) + table.index_select(0, upper) * fraction
+        return embedding.to(timestep.device)
+
     def forward(
         self,
         video_hidden_states: torch.Tensor,
@@ -442,7 +480,7 @@ class MiniMaxH3Transformer(nn.Module):
         hidden_states = hidden_states.index_copy(1, video_indices, video.to(text.dtype))
         hidden_states = hidden_states.index_copy(1, audio_indices, audio.to(text.dtype))
 
-        timestep_embedding = self.time_embedder(timestep)
+        timestep_embedding = self._time_embedding(timestep)
         adaln_indices = timestep_indices * MINIMAX_H3_MODALITY_COUNT + token_tags.clamp(min=0)
         is_padding = token_tags < 0
         attention_mask = None

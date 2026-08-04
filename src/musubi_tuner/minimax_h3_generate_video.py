@@ -40,6 +40,11 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dtype", choices=("bfloat16", "float16", "float32"), default="bfloat16")
     parser.add_argument("--fp8_base", action="store_true", help="use weight-only scaled FP8 transformer blocks")
     parser.add_argument(
+        "--int8_convrot_base",
+        action="store_true",
+        help="load the pruned Comfy INT8 ConvRot transformer",
+    )
+    parser.add_argument(
         "--text_encoder_quantization",
         choices=("none", "int8", "nf4", "nvfp4_awq"),
         default="none",
@@ -75,6 +80,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser = create_parser()
     args = parser.parse_args(argv)
     try:
+        if args.fp8_base and args.int8_convrot_base:
+            raise ValueError("--int8_convrot_base cannot be combined with --fp8_base")
         request = request_from_args(args)
         request.validate(check_files=True)
         inventory = inspect_checkpoint(args.model)
@@ -103,6 +110,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             height=args.height,
             width=args.width,
             fp8_scaled=args.fp8_base,
+            int8_convrot=args.int8_convrot_base,
             text_encoder_quantization=args.text_encoder_quantization,
             blocks_to_swap=args.blocks_to_swap,
             block_swap_h2d_only=args.block_swap_h2d_only,
