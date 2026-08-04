@@ -6,8 +6,12 @@ they never select or execute Python code.
 > [!WARNING]
 > This branch is an experimental proof of concept associated with [issue #106](https://github.com/AkaneTendo25/musubi-tuner/issues/106).
 > A separate implementation is being developed for upstream Musubi in [kohya-ss/musubi-tuner PR #1018](https://github.com/kohya-ss/musubi-tuner/pull/1018).
-> Users who need future mainline support should follow that PR. Checkpoint formats, commands, and LoRA compatibility in this branch
-> may continue to change while H3 training quality is being validated.
+> Users who need future mainline support should follow that PR.
+>
+> **This document is rewritten continuously and describes a moving target.** The branch is under active development: checkpoint
+> formats, command-line flags, defaults, dataset fields, and LoRA compatibility all change without deprecation periods while H3
+> training quality is being validated. Anything here may be outdated, superseded, or removed. Pin a commit if you need stability,
+> and re-read this page after every update rather than relying on remembered behaviour.
 
 The implementation models a 50-block packed transformer that jointly processes video and stereo audio. Its media contract is:
 
@@ -383,26 +387,28 @@ These projections are the largest single group of parameters in the transformer 
 
 | base precision | default | with `--h3_adaln_rank 16` |
 |---|---|---|
-| BF16 | 66.2 GB | 40.2 GB |
-| scaled FP8 (`--fp8_base`) | 33.1 GB | 20.1 GB |
+| BF16 | 66.2 GB | 40.5 GB |
+| scaled FP8 (`--fp8_base`) | 33.1 GB | 20.4 GB |
 
-The reduced projections are deliberately kept in BF16 and excluded from FP8 quantization: at that
-size quantizing them saves nothing measurable, while leaving them unquantized removes their
-quantization error entirely. Because AdaLN depends only on the timestep, any error there is a
-systematic distortion of the modulation curve rather than noise that averages away across tokens.
+The reduced projections are stored in float32 and excluded from FP8 quantization: at that size
+neither quantizing nor narrowing them saves anything measurable, while the stored precision is what
+bounds the reduction. Storing them at the checkpoint's own BF16 would put a relative floor under the
+modulation orders of magnitude above the basis error, capping every rank at the same accuracy.
+Because AdaLN depends only on the timestep, any error there is a systematic distortion of the
+modulation curve rather than noise that averages away across tokens. The modulation is computed in
+float32 and cast back to the activation dtype, so the extra precision costs one narrow matmul.
 
 Rank 16 reproduces the modulation to a relative error far below BF16's own rounding step, so the
-reduction is not the limiting approximation anywhere in the pipeline. Rank 8, which is what the
-released pruned transformers use, is also well below it.
+reduction is not the limiting approximation anywhere in the pipeline. On the AdaLN path it is in
+fact more accurate than the BF16 transformer, which computes its own modulation in BF16.
 
-The published pruned checkpoints apply the same reduction, but ship it together with INT8 ConvRot
-quantization, which cannot be combined with scaled FP8 (see below). `--h3_adaln_rank` instead
-performs the reduction on the released BF16 transformer, leaving the choice of quantization open, and
-works for both `fl2va` and `ref2va`. It composes with block swapping and gradient checkpointing, and
-also shrinks the swap ring buffers, which are otherwise sized by the full-width AdaLN weights.
+The published pruned checkpoints apply the same reduction at rank 8, storing the reduced projections
+in FP16 and quantizing the rest of the transformer. `--h3_adaln_rank` instead performs the reduction
+on the released BF16 transformer, leaving the choice of quantization open, and works for both
+`fl2va` and `ref2va`. It composes with block swapping and gradient checkpointing, and also shrinks
+the swap ring buffers, which are otherwise sized by the full-width AdaLN weights.
 
-The option is rejected on a checkpoint that is already pruned, and on INT8 ConvRot checkpoints, which
-ship pre-reduced.
+The option is rejected on a checkpoint that is already pruned, and on INT8 ConvRot checkpoints.
 
 > [!NOTE]
 > Measured against the BF16 transformer, forwarding identical fixed-seed inputs through all 50 blocks,

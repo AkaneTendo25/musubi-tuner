@@ -18,6 +18,10 @@ uncentered (``center=False``) makes the mean zero, so biases pass through
 untouched -- which is what the streaming load hook uses, since it removes any
 dependence on the order weights and biases arrive in. By rank 16 the uncentered
 fit is no less accurate.
+
+The contracted weight is stored in float32. The basis reproduces the modulation
+far below bf16's own rounding step, so the storage dtype rather than the rank is
+what bounds the result; storing bf16 would cap every rank at the same accuracy.
 """
 
 from __future__ import annotations
@@ -194,7 +198,7 @@ def build_timestep_table(embedder: torch.nn.Module, basis: AdaLNBasis, points: i
     return basis.coefficients(activated)
 
 
-def make_adaln_split_hook(basis: AdaLNBasis, table: torch.Tensor, *, storage_dtype=torch.bfloat16):
+def make_adaln_split_hook(basis: AdaLNBasis, table: torch.Tensor, *, storage_dtype=torch.float32):
     """A ``WeightTransformHooks.split_hook`` that reduces AdaLN as weights stream in.
 
     The timestep embedder is dropped and replaced by the interpolated table, and
@@ -220,14 +224,22 @@ def make_adaln_split_hook(basis: AdaLNBasis, table: torch.Tensor, *, storage_dty
             if tensor is None:
                 return [key], None
             reduced, _ = factorize_adaln_weight(tensor.to(torch.float32), None, basis)
-            # Keep the checkpoint's own dtype: the model computes the modulation
-            # in it, and imposing float32 here mismatches the bf16 activation.
-            return [key], [reduced.to(tensor.dtype).contiguous()]
+            # Store float32, not the checkpoint's bf16. The stored dtype is what
+            # bounds the reduction: bf16's 8-bit mantissa puts a ~1e-3 relative
+            # floor under the modulation, orders of magnitude above the basis
+            # error, so rounding here discards the accuracy the rank buys and
+            # makes every rank score alike. Raising only the matmul precision
+            # does not help -- the error is committed at the cast. The reduced
+            # weight is a negligible fraction of the model, and
+            # MiniMaxH3AdaLNProjection derives its compute dtype from this
+            # weight while callers cast the modulation back to the activation
+            # dtype, so float32 costs one narrow matmul and no dtype mismatch.
+            return [key], [reduced.to(storage_dtype).contiguous()]
         if key.endswith(f"{ADALN_INFIX}bias"):
             if tensor is None:
                 return [key], None
             # Pure cast: the uncentered basis leaves the value alone, but the bias
-            # must share the weight's dtype. F.linear dispatches to
+            # must share the weight's storage dtype. F.linear dispatches to
             # addmm(bias, input, weight.T), so a mismatch surfaces as a confusing
             # "self and mat2" error that names the bias as `self`.
             return [key], [tensor.to(storage_dtype).contiguous()]
