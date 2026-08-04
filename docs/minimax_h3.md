@@ -437,11 +437,10 @@ reference length.
 
 ## Inference and sampling during training
 
-The standalone generator uses the same native transformer forward as training. It loads the text encoder, keyframe VAE encoder,
-transformer, video
-decoder, and audio decoder sequentially, then writes a synchronized H.264/AAC MP4 and a JSON sidecar containing the prompt,
-geometry, schedule, LoRA names, stage timings, and CUDA memory peaks. It supports T2VA plus first- and last-keyframe FL2VA
-generation. Arbitrary-reference Ref2VA generation is not yet exposed by the standalone script.
+The standalone generator uses the same native transformer forward as training. It loads the text encoder, reference encoders,
+transformer, video decoder, and audio decoder sequentially, then writes a synchronized H.264/AAC MP4 and a JSON sidecar
+containing the prompt, geometry, schedule, LoRA names, stage timings, and CUDA memory peaks. It supports T2VA, first- and
+last-keyframe FL2VA, and arbitrary-reference Ref2VA generation.
 
 ```shell
 python minimax_h3_generate_video.py \
@@ -468,6 +467,23 @@ python minimax_h3_generate_video.py \
   --first_frame start.png --last_frame end.png \
   --duration 5 --ratio 16:9 --steps 20 --seed 42 \
   --output conditioned.mp4
+```
+
+Ref2VA uses the dedicated Ref2VA transformer checkpoint. Add one or more `--reference_image`, `--reference_video`, or
+`--reference_audio` options; a reference video's embedded soundtrack is included automatically. Standalone audio references must
+be paired with at least one reference image or video.
+
+```shell
+python minimax_h3_generate_video.py \
+  --model /path/to/minimax_h3_ref2va_bf16.safetensors \
+  --text_encoder /path/to/qwen3vl_32b_minimax_h3_bf16.safetensors \
+  --tokenizer /path/to/MiniMax-H3-metadata/Ref2VA/text_encoder \
+  --vae /path/to/minimax_h3_video_vae_fp16.safetensors \
+  --audio_vae /path/to/minimax_h3_audio_vae_fp32.safetensors \
+  --prompt "A small sailboat crosses a calm bay at sunrise." \
+  --reference_image subject.png \
+  --duration 5 --ratio 16:9 --steps 20 --seed 42 \
+  --output reference_conditioned.mp4
 ```
 
 Here `--steps 20` follows the released Diffusers scheduler contract: it creates 20 sigma points including terminal zero and runs

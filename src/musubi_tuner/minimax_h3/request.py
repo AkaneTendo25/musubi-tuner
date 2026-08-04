@@ -72,6 +72,10 @@ class H3GenerationRequest:
             raise ValueError("at most 3 reference videos are supported")
         if counts[ReferenceKind.AUDIO] > 3:
             raise ValueError("at most 3 reference audio clips are supported")
+        if len(ordinary) > 12:
+            raise ValueError("at most 12 references are supported")
+        if ordinary and all(ref.kind is ReferenceKind.AUDIO for ref in ordinary):
+            raise ValueError("reference audio requires at least one reference image or video")
         if (first_frames or last_frames) and ordinary:
             raise ValueError("first/last-frame conditioning and ordinary multimodal references are separate H3 modes")
 

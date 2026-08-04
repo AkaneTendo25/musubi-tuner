@@ -329,6 +329,17 @@ class MiniMaxH3ConditioningEncoder:
         hidden, tags = self._encode_prompt(prompt, images)
         return {H3_TEXT_HIDDEN_KEY: hidden, H3_TEXT_TOKEN_TAGS_KEY: tags}
 
+    def encode_reference_prompt(
+        self,
+        prompt: str,
+        references: tuple[H3PreparedReference, ...],
+    ) -> dict[str, torch.Tensor]:
+        """Encode one Ref2VA prompt and its ordered multimodal presentation."""
+        if not references:
+            raise ValueError("MiniMax H3 Ref2VA conditioning requires at least one reference")
+        hidden, tags = self._encode_prompt(prompt, references=references)
+        return {H3_TEXT_HIDDEN_KEY: hidden, H3_TEXT_TOKEN_TAGS_KEY: tags}
+
     def encode_conditioning(self, batch: list[Any], *, include_empty: bool = False) -> tuple[dict[str, torch.Tensor], ...]:
         dtype_name = dtype_to_str(self.output_dtype)
         results = []

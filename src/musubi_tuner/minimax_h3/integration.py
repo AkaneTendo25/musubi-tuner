@@ -4,7 +4,8 @@ import gc
 import logging
 import time
 from pathlib import Path
-from typing import Any, Literal, NoReturn
+from types import SimpleNamespace
+from typing import Any, Literal
 
 import numpy as np
 import torch
@@ -41,12 +42,14 @@ from musubi_tuner.minimax_h3.component_loader import (
 from musubi_tuner.minimax_h3.inference import (
     decode_latents_sequentially,
     denoise_fl2va,
+    denoise_ref2va,
     encode_keyframe_images,
+    encode_reference_media,
     prepare_keyframe_image,
     resolve_canvas_size,
     save_av_mp4,
 )
-from musubi_tuner.minimax_h3.media import MediaModality
+from musubi_tuner.minimax_h3.media import MediaAsset, MediaModality
 from musubi_tuner.minimax_h3.model import MiniMaxH3TokenTag
 from musubi_tuner.minimax_h3.packing import (
     MiniMaxH3ReferenceGeometry,
@@ -59,19 +62,13 @@ from musubi_tuner.minimax_h3.packing import (
     unpatchify_video_tokens,
 )
 from musubi_tuner.minimax_h3.references import H3ReferenceKind, prepare_references, trim_reference_frames
-from musubi_tuner.minimax_h3.request import H3GenerationRequest, ReferenceRole
+from musubi_tuner.minimax_h3.request import H3GenerationRequest, ReferenceKind, ReferenceRole
 from musubi_tuner.minimax_h3.training import H3ModelPrediction, H3TrainingMode
 from musubi_tuner.modules.custom_offloading_utils import BlockSwapConfig
 from musubi_tuner.utils.device_utils import clean_memory_on_device
 from musubi_tuner.utils.model_utils import dtype_to_str, str_to_dtype
 
 logger = logging.getLogger(__name__)
-
-
-def _raise_unavailable(component: str) -> NoReturn:
-    from musubi_tuner.minimax_h3.backend import H3BackendUnavailableError
-
-    raise H3BackendUnavailableError(f"MiniMax H3 {component} is unsupported")
 
 
 def create_latent_encoder(
@@ -135,9 +132,7 @@ def create_generator(
     lora_weights: tuple[Path, ...] = (),
     lora_multipliers: tuple[float, ...] = (),
 ):
-    """Create a sequentially-loaded native FL2VA generator."""
-    if request.mode == "reference":
-        _raise_unavailable("Ref2VA generation")
+    """Create a sequentially-loaded native FL2VA or Ref2VA generator."""
     if dtype != "bfloat16":
         raise ValueError("MiniMax H3 native generation requires bfloat16 transformer compute")
     return _NativeGenerator(
@@ -159,6 +154,7 @@ def create_generator(
         use_pinned_memory_for_block_swap=use_pinned_memory_for_block_swap,
         lora_weights=lora_weights,
         lora_multipliers=lora_multipliers,
+        mode="ref2va" if request.mode == "reference" else "fl2va",
     )
 
 
@@ -184,6 +180,7 @@ class _NativeGenerator:
         use_pinned_memory_for_block_swap: bool,
         lora_weights: tuple[Path, ...],
         lora_multipliers: tuple[float, ...],
+        mode: H3TrainingMode,
     ) -> None:
         self.model = Path(model)
         self.text_encoder = Path(text_encoder)
@@ -205,6 +202,7 @@ class _NativeGenerator:
         self.use_pinned_memory_for_block_swap = use_pinned_memory_for_block_swap
         self.lora_weights = tuple(Path(path) for path in lora_weights)
         self.lora_multipliers = lora_multipliers
+        self.mode = mode
 
     def _measure(self, name: str, operation, metrics: dict[str, dict]):
         if self.device.type == "cuda":
@@ -226,8 +224,8 @@ class _NativeGenerator:
         logger.info("MiniMax H3 inference stage %s: %s", name, values)
         return result
 
-    def _encode_prompt(self, prompt: str, images) -> dict[str, torch.Tensor]:
-        task = "t2va" if not images else "i2va" if len(images) == 1 else "fl2va"
+    def _encode_prompt(self, prompt: str, images=(), references=()) -> dict[str, torch.Tensor]:
+        task = "ref2va" if references else "t2va" if not images else "i2va" if len(images) == 1 else "fl2va"
         encoder = create_conditioning_encoder(
             text_encoder=self.text_encoder,
             tokenizer=self.tokenizer,
@@ -236,7 +234,7 @@ class _NativeGenerator:
             dtype="bfloat16",
             quantization=self.text_encoder_quantization,
         )
-        conditioning = encoder.encode_prompt(prompt, images)
+        conditioning = encoder.encode_reference_prompt(prompt, references) if references else encoder.encode_prompt(prompt, images)
         del encoder
         gc.collect()
         clean_memory_on_device(self.device)
@@ -261,6 +259,20 @@ class _NativeGenerator:
                 anchors.append("last")
         return images, tuple(anchors)
 
+    @staticmethod
+    def _prepare_references(request: H3GenerationRequest):
+        modality_by_kind = {
+            ReferenceKind.IMAGE: MediaModality.IMAGE,
+            ReferenceKind.VIDEO: MediaModality.VIDEO,
+            ReferenceKind.AUDIO: MediaModality.AUDIO,
+        }
+        assets = tuple(
+            MediaAsset(reference.path, modality_by_kind[reference.kind], "reference")
+            for reference in request.references
+            if reference.role is ReferenceRole.REFERENCE
+        )
+        return prepare_references(SimpleNamespace(h3_media_assets=assets, frame_count=request.temporal_shape.frame_count))
+
     def _load_transformer(self):
         from safetensors.torch import load_file
 
@@ -270,7 +282,7 @@ class _NativeGenerator:
         loading_device = torch.device("cpu") if self.blocks_to_swap else self.device
         transformer = load_transformer(
             self.model,
-            mode="fl2va",
+            mode=self.mode,
             loading_device=loading_device,
             fp8_scaled=self.fp8_scaled,
             quantization_device=self.device if self.fp8_scaled else None,
@@ -312,30 +324,65 @@ class _NativeGenerator:
 
     @torch.no_grad()
     def generate(self, request: H3GenerationRequest) -> None:
-        if request.mode == "reference":
-            _raise_unavailable("Ref2VA generation")
         metrics: dict[str, dict] = {}
         total_started = time.perf_counter()
         height, width = (self.height, self.width) if self.height is not None else resolve_canvas_size(request.ratio)
-        images, anchors = self._prepare_keyframes(request, height, width)
-        conditioning = self._measure("text_conditioning", lambda: self._encode_prompt(request.prompt, images), metrics)
-        keyframe_rows = (
-            self._measure(
-                "keyframe_encoding",
-                lambda: torch.cat(encode_keyframe_images(self.video_vae, images, self.device)),
+        shape = request.temporal_shape
+        references = None
+        prepared_references = ()
+        if request.mode == "reference":
+            prepared_references = self._prepare_references(request)
+            conditioning = self._measure(
+                "text_conditioning",
+                lambda: self._encode_prompt(request.prompt, references=prepared_references),
                 metrics,
             )
-            if images
-            else None
-        )
+            references = self._measure(
+                "reference_encoding",
+                lambda: encode_reference_media(
+                    self.video_vae,
+                    self.audio_vae,
+                    prepared_references,
+                    self.device,
+                ),
+                metrics,
+            )
+            images, anchors, keyframe_rows = [], (), None
+            reference_kinds = [reference.kind.name.lower() for reference in prepared_references]
+            prepared_references = ()
+            gc.collect()
+        else:
+            images, anchors = self._prepare_keyframes(request, height, width)
+            conditioning = self._measure("text_conditioning", lambda: self._encode_prompt(request.prompt, images), metrics)
+            keyframe_rows = (
+                self._measure(
+                    "keyframe_encoding",
+                    lambda: torch.cat(encode_keyframe_images(self.video_vae, images, self.device)),
+                    metrics,
+                )
+                if images
+                else None
+            )
+            reference_kinds = []
         loaded_transformer = self._measure("transformer_load", self._load_transformer, metrics)
         transformer, networks = loaded_transformer
         del loaded_transformer
-        shape = request.temporal_shape
         generator = torch.Generator(device=self.device).manual_seed(request.seed)
-        video_latents, audio_latents = self._measure(
-            "joint_denoising",
-            lambda: denoise_fl2va(
+        if references is not None:
+            denoise = lambda: denoise_ref2va(
+                transformer,
+                conditioning,
+                references,
+                height=height,
+                width=width,
+                frame_count=shape.frame_count,
+                num_inference_steps=self.num_inference_steps,
+                generator=generator,
+                device=self.device,
+                condition_seed=request.seed,
+            )
+        else:
+            denoise = lambda: denoise_fl2va(
                 transformer,
                 conditioning,
                 height=height,
@@ -347,7 +394,10 @@ class _NativeGenerator:
                 keyframe_rows=keyframe_rows,
                 keyframe_anchors=anchors,
                 condition_seed=request.seed,
-            ),
+            )
+        video_latents, audio_latents = self._measure(
+            "joint_denoising",
+            denoise,
             metrics,
         )
         video_latents = video_latents.cpu()
@@ -392,6 +442,7 @@ class _NativeGenerator:
                 "model_evaluations": self.num_inference_steps - 1,
                 "lora_weights": [path.name for path in self.lora_weights],
                 "keyframe_anchors": list(anchors),
+                "reference_kinds": reference_kinds,
                 "metrics": metrics,
             },
         )

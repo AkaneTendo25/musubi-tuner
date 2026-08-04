@@ -79,15 +79,21 @@ def test_public_request_modes_and_limits(tmp_path):
         H3GenerationRequest("prompt", tmp_path / "out.mp4", duration=16)
 
 
-def test_public_request_allows_standalone_audio_and_independent_reference_caps(tmp_path):
+def test_public_request_enforces_released_reference_caps_and_audio_pairing(tmp_path):
     audio = H3Reference(tmp_path / "voice.wav", ReferenceKind.AUDIO)
-    request = H3GenerationRequest("prompt", tmp_path / "out.mp4", references=(audio,))
-    assert request.mode == "reference"
+    with pytest.raises(ValueError, match="requires at least one reference image or video"):
+        H3GenerationRequest("prompt", tmp_path / "out.mp4", references=(audio,))
 
     references = tuple(H3Reference(tmp_path / f"image_{index}.png", ReferenceKind.IMAGE) for index in range(9))
     references += tuple(H3Reference(tmp_path / f"video_{index}.mp4", ReferenceKind.VIDEO) for index in range(3))
-    references += tuple(H3Reference(tmp_path / f"audio_{index}.wav", ReferenceKind.AUDIO) for index in range(3))
     assert H3GenerationRequest("prompt", tmp_path / "out.mp4", references=references).mode == "reference"
+
+    with pytest.raises(ValueError, match="at most 12 references"):
+        H3GenerationRequest(
+            "prompt",
+            tmp_path / "out.mp4",
+            references=references + (H3Reference(tmp_path / "audio.wav", ReferenceKind.AUDIO),),
+        )
 
     too_many_images = references + (H3Reference(tmp_path / "image_9.png", ReferenceKind.IMAGE),)
     with pytest.raises(ValueError, match="9 reference images"):
@@ -710,3 +716,24 @@ def test_h3_generator_factory_routes_all_native_components(monkeypatch):
     assert captured["num_inference_steps"] == 20
     assert captured["fp8_scaled"] is False
     assert captured["blocks_to_swap"] == 0
+
+
+def test_native_generator_selects_ref2va_checkpoint_contract(tmp_path):
+    request = H3GenerationRequest(
+        "prompt",
+        tmp_path / "out.mp4",
+        references=(H3Reference(tmp_path / "reference.png", ReferenceKind.IMAGE),),
+    )
+
+    generator = h3_integration.create_generator(
+        model=tmp_path / "model.safetensors",
+        text_encoder=tmp_path / "text.safetensors",
+        tokenizer=tmp_path / "tokenizer",
+        video_vae=tmp_path / "video_vae.safetensors",
+        audio_vae=tmp_path / "audio_vae.safetensors",
+        device="cpu",
+        dtype="bfloat16",
+        request=request,
+    )
+
+    assert generator.mode == "ref2va"

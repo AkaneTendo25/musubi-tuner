@@ -14,7 +14,7 @@ def create_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="MiniMax H3 local inference entrypoint")
     parser.add_argument("--model", type=Path, required=True, help="Local H3 checkpoint directory, index, or safetensors file")
     parser.add_argument("--text_encoder", type=Path, help="Qwen3-VL H3 BF16 checkpoint or component directory")
-    parser.add_argument("--tokenizer", type=Path, help="Official FL2VA text_encoder tokenizer/processor metadata directory")
+    parser.add_argument("--tokenizer", type=Path, help="Official matching text_encoder tokenizer/processor metadata directory")
     parser.add_argument("--vae", type=Path, help="MiniMax H3 video VAE checkpoint or component directory")
     parser.add_argument("--audio_vae", type=Path, help="MiniMax H3 audio VAE checkpoint or component directory")
     parser.add_argument("--prompt", required=True)

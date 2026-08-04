@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import gc
 import json
 from dataclasses import dataclass
 from fractions import Fraction
@@ -35,8 +36,10 @@ from musubi_tuner.minimax_h3.architecture import (
     temporal_shape,
 )
 from musubi_tuner.minimax_h3.cache import H3_TEXT_HIDDEN_KEY, H3_TEXT_TOKEN_TAGS_KEY
-from musubi_tuner.minimax_h3.component_loader import load_video_vae_encoder
+from musubi_tuner.minimax_h3.component_loader import load_audio_vae_encoder, load_video_vae_encoder
 from musubi_tuner.minimax_h3.packing import (
+    MiniMaxH3ReferenceGeometry,
+    build_ref2va_packed_sequence,
     build_row_timesteps,
     build_t2va_packed_sequence,
     pack_audio_latents,
@@ -44,6 +47,7 @@ from musubi_tuner.minimax_h3.packing import (
     unpack_audio_tokens,
     unpatchify_video_tokens,
 )
+from musubi_tuner.minimax_h3.references import H3PreparedReference, H3ReferenceKind, trim_reference_frames
 from musubi_tuner.utils.device_utils import clean_memory_on_device
 
 _SHORT_EDGE = 768
@@ -56,6 +60,13 @@ class H3GeneratedMedia:
     audio: torch.Tensor
     fps: int = VIDEO_FPS
     sample_rate: int = AUDIO_SAMPLE_RATE
+
+
+@dataclass(frozen=True)
+class H3EncodedReferences:
+    geometries: tuple[MiniMaxH3ReferenceGeometry, ...]
+    video_rows: torch.Tensor
+    audio_rows: torch.Tensor
 
 
 def resolve_canvas_size(ratio: str) -> tuple[int, int]:
@@ -168,6 +179,125 @@ def encode_keyframe_images(
     return tuple(rows)
 
 
+def _reference_pixels(content: np.ndarray, device: torch.device) -> torch.Tensor:
+    if content.ndim == 3:
+        content = content[None]
+    pixels = torch.from_numpy(np.array(content, copy=True, order="C")).permute(3, 0, 1, 2).unsqueeze(0)
+    return pixels.to(device=device, dtype=torch.float32).div_(255.0)
+
+
+@torch.no_grad()
+def encode_reference_media(
+    video_vae: Path,
+    audio_vae: Path,
+    references: tuple[H3PreparedReference, ...],
+    device: torch.device,
+) -> H3EncodedReferences:
+    """Sequentially encode Ref2VA visual and audio payloads without co-resident VAEs."""
+    if not references:
+        raise ValueError("MiniMax H3 Ref2VA encoding requires at least one reference")
+    video_shapes: list[tuple[int, int, int] | None] = [None] * len(references)
+    video_rows_by_reference: list[torch.Tensor | None] = [None] * len(references)
+    audio_lengths = [0] * len(references)
+    audio_rows_by_reference: list[torch.Tensor | None] = [None] * len(references)
+
+    if any(reference.kind is not H3ReferenceKind.AUDIO for reference in references):
+        video_encoder = load_video_vae_encoder(video_vae, device)
+        weight_dtype = next(video_encoder.parameters()).dtype
+        for index, reference in enumerate(references):
+            if reference.kind is H3ReferenceKind.IMAGE:
+                if reference.image is None:
+                    raise ValueError("H3 prepared image reference has no image")
+                content = np.asarray(reference.image)
+                image = True
+            elif reference.kind is H3ReferenceKind.VIDEO:
+                if reference.frames is None:
+                    raise ValueError("H3 prepared video reference has no frames")
+                content = reference.frames[: trim_reference_frames(reference.frames.shape[0])]
+                image = False
+            else:
+                continue
+            pixels = _reference_pixels(content, device)
+            mean = pixels.new_tensor((0.485, 0.456, 0.406)).view(1, 3, 1, 1, 1)
+            std = pixels.new_tensor((0.229, 0.224, 0.225)).view(1, 3, 1, 1, 1)
+            latent = video_encoder.encode_reference(((pixels - mean) / std).to(weight_dtype), image=image)[0]
+            video_shapes[index] = tuple(int(value) for value in latent.shape[-3:])
+            video_rows_by_reference[index] = patchify_video_latents(latent[None], (1, 2, 2))[0].float().cpu()
+            del pixels, latent
+        del video_encoder
+        gc.collect()
+        clean_memory_on_device(device)
+
+    if any(reference.waveform is not None for reference in references):
+        audio_encoder = load_audio_vae_encoder(audio_vae, device)
+        for index, reference in enumerate(references):
+            if reference.waveform is not None:
+                waveform = reference.waveform.to(device=device, dtype=torch.float32).unsqueeze(1)
+                latent = audio_encoder.encode(waveform)
+                audio_lengths[index] = int(latent.shape[-1])
+                audio_rows_by_reference[index] = pack_audio_latents(latent[None])[0].float().cpu()
+                del waveform, latent
+        del audio_encoder
+        gc.collect()
+        clean_memory_on_device(device)
+
+    geometries = []
+    video_rows = []
+    audio_rows = []
+    for reference, video_shape, video_rows_item, audio_length, audio_rows_item in zip(
+        references,
+        video_shapes,
+        video_rows_by_reference,
+        audio_lengths,
+        audio_rows_by_reference,
+    ):
+        if video_shape is None:
+            latent_frames = latent_height = latent_width = 0
+        else:
+            latent_frames, latent_height, latent_width = video_shape
+            if video_rows_item is None:
+                raise RuntimeError("MiniMax H3 reference video shape has no packed rows")
+            video_rows.append(video_rows_item)
+        if audio_rows_item is not None:
+            audio_rows.append(audio_rows_item)
+        geometries.append(
+            MiniMaxH3ReferenceGeometry(
+                kind=int(reference.kind),
+                num_latent_frames=latent_frames,
+                latent_height=latent_height,
+                latent_width=latent_width,
+                num_audio_latents=audio_length,
+            )
+        )
+    return H3EncodedReferences(
+        geometries=tuple(geometries),
+        video_rows=torch.cat(video_rows) if video_rows else torch.empty((0, 96), dtype=torch.float32),
+        audio_rows=torch.cat(audio_rows) if audio_rows else torch.empty((0, 32), dtype=torch.float32),
+    )
+
+
+def _augment_reference_video_rows(
+    rows: torch.Tensor,
+    references: tuple[MiniMaxH3ReferenceGeometry, ...],
+    patch_size: tuple[int, int, int],
+    seed: int,
+) -> torch.Tensor:
+    augmented = []
+    cursor = 0
+    for reference in references:
+        count = reference.num_video_rows(patch_size)
+        if not count:
+            continue
+        reference_rows = rows[cursor : cursor + count]
+        cursor += count
+        generator = torch.Generator(device="cpu").manual_seed(seed)
+        noise = torch.randn(reference_rows.shape, generator=generator, dtype=torch.float32)
+        augmented.append(0.999 * reference_rows.float() + 0.001 * noise.to(reference_rows.device))
+    if cursor != rows.shape[0]:
+        raise ValueError("MiniMax H3 Ref2VA video rows do not match their reference geometry")
+    return torch.cat(augmented) if augmented else rows
+
+
 @torch.no_grad()
 def denoise_fl2va(
     transformer: torch.nn.Module,
@@ -275,6 +405,147 @@ def denoise_fl2va(
             patch_size=tuple(config.patch_size),
         )
         audio_prediction = unpack_audio_tokens(output.audio, num_audio_latents=shape.audio_latent_frames)
+        video = data_ward_euler_step(
+            video,
+            video_prediction,
+            video_timestep,
+            video_sigmas[index],
+            video_sigmas[index + 1],
+        )
+        audio = data_ward_euler_step(
+            audio,
+            audio_prediction,
+            audio_timestep,
+            audio_sigmas[index],
+            audio_sigmas[index + 1],
+        )
+    return video, audio
+
+
+@torch.no_grad()
+def denoise_ref2va(
+    transformer: torch.nn.Module,
+    conditioning: dict[str, torch.Tensor],
+    references: H3EncodedReferences,
+    *,
+    height: int,
+    width: int,
+    frame_count: int,
+    num_inference_steps: int,
+    generator: torch.Generator,
+    device: torch.device,
+    condition_seed: int = 0,
+    show_progress: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Generate joint AV latents with ordered Ref2VA image, video, and audio context."""
+    _validate_geometry(height, width, frame_count)
+    if not references.geometries:
+        raise ValueError("MiniMax H3 Ref2VA denoising requires at least one reference")
+    shape = temporal_shape(frame_count)
+    config = transformer.config
+    patch_size = tuple(config.patch_size)
+    latent_height = height // VIDEO_SPATIAL_COMPRESSION
+    latent_width = width // VIDEO_SPATIAL_COMPRESSION
+    video = torch.randn(
+        (1, config.in_channels, shape.video_latent_frames, latent_height, latent_width),
+        generator=generator,
+        device=device,
+        dtype=torch.float32,
+    )
+    audio = torch.randn(
+        (1, 2, config.audio_in_channels, shape.audio_latent_frames),
+        generator=generator,
+        device=device,
+        dtype=torch.float32,
+    )
+    text_hidden = conditioning[H3_TEXT_HIDDEN_KEY]
+    text_tags = conditioning[H3_TEXT_TOKEN_TAGS_KEY]
+    if text_hidden.ndim != 2 or text_hidden.shape[-1] != config.text_dim:
+        raise ValueError(f"MiniMax H3 conditioning must have shape [tokens, {config.text_dim}]")
+    if text_tags.shape != (text_hidden.shape[0],) or text_tags.dtype != torch.long:
+        raise ValueError("MiniMax H3 conditioning tags must be int64 with one entry per text row")
+    layout = build_ref2va_packed_sequence(
+        text_tags,
+        references.geometries,
+        num_latent_frames=shape.video_latent_frames,
+        latent_height=latent_height,
+        latent_width=latent_width,
+        num_audio_latents=shape.audio_latent_frames,
+        patch_size=patch_size,
+    )
+    video_width = config.in_channels * patch_size[0] * patch_size[1] * patch_size[2]
+    expected_video_rows = layout.num_condition_video_rows
+    expected_audio_rows = layout.num_condition_audio_rows
+    if references.video_rows.shape != (expected_video_rows, video_width):
+        raise ValueError(
+            f"MiniMax H3 reference video rows have shape {tuple(references.video_rows.shape)}, "
+            f"expected {(expected_video_rows, video_width)}"
+        )
+    if references.audio_rows.shape != (expected_audio_rows, config.audio_in_channels):
+        raise ValueError(
+            f"MiniMax H3 reference audio rows have shape {tuple(references.audio_rows.shape)}, "
+            f"expected {(expected_audio_rows, config.audio_in_channels)}"
+        )
+    reference_video = _augment_reference_video_rows(
+        references.video_rows,
+        references.geometries,
+        patch_size,
+        condition_seed,
+    ).to(device)
+    reference_audio = references.audio_rows.to(device)
+    text_hidden = text_hidden[None].to(device)
+    token_tags = layout.token_tags.to(device)
+    position_ids = layout.position_ids.to(device)
+    video_indices = layout.video_indices.to(device)
+    audio_indices = layout.audio_indices.to(device)
+    text_indices = layout.text_indices.to(device)
+    video_sigmas, video_timesteps = shifted_flow_schedule(num_inference_steps, VIDEO_FLOW_SHIFT, device)
+    audio_sigmas, audio_timesteps = shifted_flow_schedule(num_inference_steps, AUDIO_FLOW_SHIFT, device)
+    if video_timesteps.shape != audio_timesteps.shape:
+        raise RuntimeError("MiniMax H3 video and audio schedules produced different step counts")
+
+    iterator = zip(video_timesteps, audio_timesteps)
+    if show_progress:
+        iterator = tqdm(iterator, total=video_timesteps.numel(), desc="MiniMax H3 denoising")
+    autocast_enabled = device.type == "cuda"
+    for index, (video_timestep, audio_timestep) in enumerate(iterator):
+        target_video_rows = patchify_video_latents(video, patch_size)
+        target_audio_rows = pack_audio_latents(audio)
+        video_rows = torch.cat((reference_video[None], target_video_rows), dim=1)
+        audio_rows = torch.cat((reference_audio[None], target_audio_rows), dim=1)
+        condition_video_timestep = torch.maximum(
+            video_timestep.reshape(1),
+            torch.tensor([0.999], device=device),
+        )
+        timestep, timestep_indices = build_row_timesteps(
+            layout,
+            video_timestep,
+            audio_timestep,
+            condition_video_timestep,
+            torch.ones(1, device=device),
+        )
+        with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=autocast_enabled):
+            output = transformer(
+                video_hidden_states=video_rows,
+                audio_hidden_states=audio_rows,
+                encoder_hidden_states=text_hidden,
+                timestep=timestep.to(device),
+                timestep_indices=timestep_indices.to(device),
+                token_tags=token_tags,
+                position_ids=position_ids,
+                video_indices=video_indices,
+                audio_indices=audio_indices,
+                text_indices=text_indices,
+            )
+        video_prediction = unpatchify_video_tokens(
+            output.video[:, layout.num_condition_video_rows :],
+            latent_shape=(config.in_channels, shape.video_latent_frames, latent_height, latent_width),
+            patch_size=patch_size,
+        )
+        audio_prediction = unpack_audio_tokens(
+            output.audio[:, layout.num_condition_audio_rows :],
+            num_audio_latents=shape.audio_latent_frames,
+        )
         video = data_ward_euler_step(
             video,
             video_prediction,

@@ -9,16 +9,19 @@ from PIL import Image
 from musubi_tuner.minimax_h3.audio_vae import MiniMaxH3AudioBigVGANDecoder
 from musubi_tuner.minimax_h3.cache import H3_TEXT_HIDDEN_KEY, H3_TEXT_TOKEN_TAGS_KEY
 from musubi_tuner.minimax_h3.inference import (
+    H3EncodedReferences,
     H3GeneratedMedia,
     data_ward_euler_step,
     decode_latents_sequentially,
     denoise_fl2va,
+    denoise_ref2va,
     prepare_keyframe_image,
     resolve_canvas_size,
     save_av_mp4,
     shifted_flow_schedule,
 )
 from musubi_tuner.minimax_h3.model import MiniMaxH3Transformer, MiniMaxH3TransformerConfig
+from musubi_tuner.minimax_h3.packing import MiniMaxH3ReferenceGeometry
 from musubi_tuner.minimax_h3.video_vae import MiniMaxH3VideoViTDecoder3d
 
 
@@ -118,6 +121,46 @@ def test_tiny_first_frame_denoising_is_finite_and_returns_only_target_rows() -> 
         device=torch.device("cpu"),
         keyframe_rows=torch.randn(1, 16),
         keyframe_anchors=("first",),
+        condition_seed=7,
+        show_progress=False,
+    )
+
+    assert video.shape == (1, 4, 2, 2, 2)
+    assert audio.shape == (1, 2, 8, 8)
+    assert torch.isfinite(video).all()
+    assert torch.isfinite(audio).all()
+
+
+def test_tiny_ref2va_denoising_is_finite_and_returns_only_target_rows() -> None:
+    transformer = _tiny_transformer()
+    conditioning = {
+        H3_TEXT_HIDDEN_KEY: torch.randn(3, 12),
+        H3_TEXT_TOKEN_TAGS_KEY: torch.tensor([1, 0, 1]),
+    }
+    references = H3EncodedReferences(
+        geometries=(
+            MiniMaxH3ReferenceGeometry(
+                kind=0,
+                num_latent_frames=1,
+                latent_height=2,
+                latent_width=2,
+                num_audio_latents=0,
+            ),
+        ),
+        video_rows=torch.randn(1, 16),
+        audio_rows=torch.empty(0, 8),
+    )
+
+    video, audio = denoise_ref2va(
+        transformer,
+        conditioning,
+        references,
+        height=32,
+        width=32,
+        frame_count=5,
+        num_inference_steps=3,
+        generator=torch.Generator().manual_seed(1),
+        device=torch.device("cpu"),
         condition_seed=7,
         show_progress=False,
     )
