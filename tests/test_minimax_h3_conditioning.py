@@ -17,6 +17,8 @@ from musubi_tuner.minimax_h3.references import H3PreparedReference, H3ReferenceK
 
 
 class _Tokenizer:
+    pad_token_id = 151643
+
     def __call__(self, prompt, **kwargs):
         del kwargs
         length = len(prompt.split())
@@ -79,6 +81,7 @@ class _TextModel(torch.nn.Module):
         self.anchor = torch.nn.Parameter(torch.zeros(()), requires_grad=False)
         self.config = SimpleNamespace(text_config=SimpleNamespace(hidden_size=5120))
         self.last_mm_token_type_ids = None
+        self.calls: list[tuple[torch.Tensor, torch.Tensor]] = []
 
     @property
     def device(self):
@@ -91,6 +94,7 @@ class _TextModel(torch.nn.Module):
     def forward(self, input_ids, attention_mask, mm_token_type_ids, **kwargs):
         del attention_mask, kwargs
         self.last_mm_token_type_ids = mm_token_type_ids.detach().cpu()
+        self.calls.append((input_ids.detach().cpu(), self.last_mm_token_type_ids))
         shape = (input_ids.shape[0], input_ids.shape[1], self.config.text_config.hidden_size)
         return SimpleNamespace(last_hidden_state=torch.ones(shape, dtype=torch.bfloat16))
 
@@ -109,14 +113,47 @@ def test_conditioning_cache_is_raw_text_rows_with_text_tags():
     assert torch.equal(model.last_mm_token_type_ids, torch.zeros(1, 2, dtype=torch.long))
 
 
-def test_empty_conditioning_is_a_zero_row_sequence():
-    encoder = MiniMaxH3ConditioningEncoder(_Processor(), _TextModel(), torch.bfloat16, "t2va")
-    result = encoder.encode_conditioning([SimpleNamespace(caption="prompt")], include_empty=True)[0]
+def test_empty_conditioning_preserves_the_prompt_row_count():
+    """The null branch drops the instruction without dropping its rows.
 
+    H3's media rotary clock starts at the number of text rows, so a shorter null
+    branch moves every audio and video coordinate. For T2VA, where the prompt is
+    the whole presentation, encoding "" collapsed it to nothing at all.
+    """
+    model = _TextModel()
+    encoder = MiniMaxH3ConditioningEncoder(_Processor(), model, torch.bfloat16, "t2va")
+    result = encoder.encode_conditioning([SimpleNamespace(caption="three tokens here")], include_empty=True)[0]
+
+    hidden = result[f"varlen_{H3_TEXT_HIDDEN_KEY}_bfloat16"]
     empty_hidden = result[f"varlen_{H3_EMPTY_TEXT_HIDDEN_KEY}_bfloat16"]
     empty_tags = result[f"varlen_{H3_EMPTY_TEXT_TOKEN_TAGS_KEY}_int64"]
-    assert empty_hidden.shape == (0, 5120)
-    assert empty_tags.shape == (0,)
+    assert empty_hidden.shape == hidden.shape
+    assert torch.equal(empty_tags, result[f"varlen_{H3_TEXT_TOKEN_TAGS_KEY}_int64"])
+    # Instruction rows carry the filler token, not the caption.
+    positive_ids, null_ids = model.calls[0][0], model.calls[1][0]
+    assert not torch.equal(positive_ids, null_ids)
+    assert torch.equal(null_ids, torch.full((1, 3), _Tokenizer.pad_token_id, dtype=torch.long))
+
+
+def test_null_conditioning_keeps_the_vision_prefix_intact():
+    """Only the instruction is replaced; media labels and vision rows are untouched."""
+    model = _TextModel()
+    encoder = MiniMaxH3ConditioningEncoder(_Processor(), model, torch.bfloat16, "fl2va")
+    content = np.zeros((2, 4, 4, 3), dtype=np.uint8)
+    result = encoder.encode_conditioning(
+        [SimpleNamespace(caption="two tokens", content=content)], include_empty=True
+    )[0]
+
+    hidden = result[f"varlen_{H3_TEXT_HIDDEN_KEY}_bfloat16"]
+    empty_hidden = result[f"varlen_{H3_EMPTY_TEXT_HIDDEN_KEY}_bfloat16"]
+    assert empty_hidden.shape == hidden.shape
+    # The trailing two instruction rows became filler; everything before them,
+    # including both vision blocks, is byte-identical to the positive branch.
+    prefix = hidden.shape[0] - 2
+    (positive_ids, positive_types), (null_ids, null_types) = model.calls[0], model.calls[1]
+    assert torch.equal(null_ids[0, prefix:], torch.full((2,), _Tokenizer.pad_token_id, dtype=torch.long))
+    assert torch.equal(null_ids[0, :prefix], positive_ids[0, :prefix])
+    assert torch.equal(null_types, positive_types)
 
 
 def test_fl2va_conditioning_includes_first_last_vision_rows():

@@ -208,6 +208,7 @@ class MiniMaxH3ConditioningEncoder:
         prompt: str,
         images: list[Image.Image] | None = None,
         references: tuple[H3PreparedReference, ...] | None = None,
+        null_instruction: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if images and references:
             raise ValueError("H3 conditioning accepts keyframes or Ref2VA references, not both")
@@ -296,6 +297,16 @@ class MiniMaxH3ConditioningEncoder:
                 token_tags.extend([int(MiniMaxH3TokenTag.TEXT)] * len(label_ids))
                 token_tags.extend([int(MiniMaxH3TokenTag.VIDEO)] * len(vision_ids))
         prompt_ids = self.tokenizer(prompt, add_special_tokens=False)["input_ids"]
+        if null_instruction:
+            # The unconditional branch must drop the instruction without dropping
+            # its rows. H3's media rotary clock originates at the number of text
+            # rows (packing.py, num_text_rows), so a null branch encoded from ""
+            # is shorter and silently relocates every audio and video coordinate
+            # -- and for T2VA, where the instruction is the entire presentation,
+            # it collapses to zero tokens. Substituting padding in place keeps the
+            # row count, the tags and every media coordinate identical between
+            # branches while carrying no instruction content.
+            prompt_ids = [self._null_token_id()] * len(prompt_ids)
         token_ids.extend(prompt_ids)
         token_tags.extend([int(MiniMaxH3TokenTag.TEXT)] * len(prompt_ids))
         if not token_ids:
@@ -334,6 +345,13 @@ class MiniMaxH3ConditioningEncoder:
         hidden = hidden.to(dtype=self.output_dtype, device="cpu")
         tags = torch.tensor(token_tags, dtype=torch.long)
         return hidden, tags
+
+    def _null_token_id(self) -> int:
+        """The filler token that stands in for a removed instruction."""
+        for candidate in (getattr(self.tokenizer, "pad_token_id", None), getattr(self.tokenizer, "eos_token_id", None)):
+            if candidate is not None:
+                return int(candidate)
+        raise ValueError("H3 null conditioning needs a pad or eos token; this tokenizer defines neither")
 
     def _images_for_item(self, item: Any) -> list[Image.Image] | None:
         if self.task in ("t2va", "ref2va"):
@@ -380,7 +398,9 @@ class MiniMaxH3ConditioningEncoder:
                 H3_CONDITIONING_TASK_KEY: torch.tensor(H3_CONDITIONING_TASK_IDS[self.task], dtype=torch.long),
             }
             if include_empty:
-                empty_hidden, empty_tags = self._encode_prompt("", self._images_for_item(item), references)
+                empty_hidden, empty_tags = self._encode_prompt(
+                    item.caption, self._images_for_item(item), references, null_instruction=True
+                )
                 tensors[f"varlen_{H3_EMPTY_TEXT_HIDDEN_KEY}_{dtype_name}"] = empty_hidden
                 tensors[f"varlen_{H3_EMPTY_TEXT_TOKEN_TAGS_KEY}_int64"] = empty_tags
             results.append(tensors)

@@ -151,6 +151,10 @@ def save_text_encoder_output_cache_minimax_h3(
         tags = tensor_for(tags_key)
         if hidden.ndim != 2 or hidden.shape[-1] != TEXT_DIM:
             raise ValueError(f"H3 {hidden_key} must have shape [tokens, {TEXT_DIM}], got {tuple(hidden.shape)}")
+        # A zero-row presentation is structurally well formed and therefore used to
+        # cache cleanly, only to fail much later when packing built the sequence.
+        if hidden.shape[0] == 0:
+            raise ValueError(f"H3 {hidden_key} carries no tokens; conditioning cannot be empty")
         if tags.dtype != torch.long or tags.shape != (hidden.shape[0],):
             raise ValueError(f"H3 {tags_key} must be int64 with shape [{hidden.shape[0]}]")
 
