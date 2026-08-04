@@ -241,8 +241,8 @@ The H3 trainer follows Musubi's `NetworkTrainer` and LoRA module contracts. The 
 transformer. A `--task t2va` cache packs `[text | target audio | target video]`; `--task i2va` and `--task fl2va` insert one or two
 keyframe conditions between text and target audio. Keyframes use the released fixed-seed sampled-posterior VAE encode, fixed
 `t=0.999` noise augmentation, and first/last target rotary anchors. Keyframe rows never contribute to the loss. All three tasks
-jointly noise the target video and audio, map the video sigma onto the synchronized audio schedule, and apply the same masked joint
-velocity loss. Attention and feed-forward projections are adapter targets; norms and timestep/modality calibration stay frozen.
+jointly noise the target video and audio from one shared schedule coordinate and apply the same masked joint velocity loss.
+Attention and feed-forward projections are adapter targets; norms and timestep/modality calibration stay frozen.
 
 The first-frame `i2va` path is independently corroborated by the public
 [AI Toolkit implementation](https://github.com/ostris/ai-toolkit/blob/18f5810d6c3248dc7edd8f79f3b6cc8c15c2fc98/extensions_built_in/diffusion_models/minimax_h3/minimax_h3.py).
@@ -270,6 +270,29 @@ loss.
 
 The default `modality` loss mode gives the video and audio means equal weight before applying their explicit loss weights.
 `token` is an optional element-weighted reduction over all valid latent values. LoHa/LoKr architecture detection is unsupported.
+
+### Flow schedules
+
+Each step draws one unshifted schedule coordinate and derives both modality sigmas from it independently, so video and audio
+always sit at the same underlying schedule position:
+
+```
+video_sigma = shift(u, --h3_shift_video)
+audio_sigma = shift(u, --h3_shift_audio)
+```
+
+`--h3_shift_video` defaults to `12.0` and `--h3_shift_audio` to `3.0`, matching the released H3 schedules. Both accept any value
+in `[0.01, 100.0]`, and changing one never desynchronizes the other.
+
+Because H3 applies its own shifts, the common `--discrete_flow_shift` must stay at its default of `1.0`; passing anything else is
+rejected.
+
+`--timestep_sampling` selects the shape of the unshifted coordinate and defaults to `uniform`. Use `uniform`, `sigmoid`, or
+`logsnr`: these leave the coordinate unshifted, so the per-modality shifts above are the only ones applied. `sigmoid` concentrates
+it near the middle, which combined with a large video shift leaves very few steps at low sigma. The dynamic-shift modes
+(`flux_shift`, `qwen_shift`, `krea2_shift`, `ideogram4_shift`, `qinglong_*`) derive a shift of their own from the latent shape and
+apply it before H3's, giving a doubly-shifted schedule; they also read only the two trailing latent dimensions, so they ignore
+H3's temporal extent entirely and are not meaningful here.
 
 ```shell
 accelerate launch minimax_h3_train_network.py \

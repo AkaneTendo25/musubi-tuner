@@ -32,8 +32,8 @@ _FP32_PREFIXES = (
 # ``token_refiner.blocks.*``, so that path must be excluded explicitly. Norms
 # are excluded because the shared state-dict quantizer matches tensor names,
 # while its forward patch applies only to nn.Linear modules. AdaLN remains in
-# scope intentionally: it is 13.0B parameters, and the public H3 weight-only
-# quantization implementations also convert the main-block AdaLN linears.
+# scope intentionally: it dominates the block parameter mass, and the public H3
+# weight-only quantization implementations also convert the main-block AdaLN linears.
 H3_FP8_OPTIMIZATION_TARGET_KEYS = ["blocks."]
 H3_FP8_OPTIMIZATION_EXCLUDE_KEYS = ["token_refiner", "norm"]
 

@@ -72,14 +72,58 @@ def test_h3_joint_noising_uses_data_ward_velocity_and_model_time():
     video_sigma = shift_sigma(base_sigma, 12.0)
     audio_sigma = shift_sigma(base_sigma, 3.0)
 
-    result = prepare_joint_noisy_inputs(video, audio, video_noise, audio_noise, video_sigma)
+    result = prepare_joint_noisy_inputs(video, audio, video_noise, audio_noise, base_sigma)
 
+    torch.testing.assert_close(result.video_sigma, video_sigma)
+    torch.testing.assert_close(result.audio_sigma, audio_sigma)
     torch.testing.assert_close(result.video, (1 - video_sigma.item()) * video + video_sigma.item() * video_noise)
     torch.testing.assert_close(result.audio, (1 - audio_sigma.item()) * audio + audio_sigma.item() * audio_noise)
     torch.testing.assert_close(result.video_target, video - video_noise)
     torch.testing.assert_close(result.audio_target, audio - audio_noise)
     torch.testing.assert_close(result.video_timestep, 1 - video_sigma)
     torch.testing.assert_close(result.audio_timestep, 1 - audio_sigma)
+
+
+@pytest.mark.parametrize("video_shift", [12.0, 6.0, 3.0, 1.0])
+def test_h3_joint_noising_keeps_audio_synchronized_at_any_video_shift(video_shift):
+    # Both modalities sit at the same underlying schedule position, so each sigma
+    # is the shared base coordinate shifted by that modality's own shift.
+    video = torch.zeros(1, 1, 1, 1, 2)
+    audio = torch.zeros(1, 1, 1, 2)
+    base = torch.tensor([0.5])
+
+    result = prepare_joint_noisy_inputs(
+        video,
+        audio,
+        torch.ones_like(video),
+        torch.ones_like(audio),
+        base,
+        video_shift=video_shift,
+        audio_shift=3.0,
+    )
+
+    torch.testing.assert_close(result.video_sigma, shift_sigma(base, video_shift))
+    torch.testing.assert_close(result.audio_sigma, shift_sigma(base, 3.0))
+
+
+def test_h3_joint_noising_gives_equal_sigmas_for_equal_shifts():
+    # At video_shift == audio_shift the two schedules are the same schedule, so
+    # the two sigmas must coincide for any base coordinate.
+    video = torch.zeros(1, 1, 1, 1, 2)
+    audio = torch.zeros(1, 1, 1, 2)
+    base = torch.tensor([0.5])
+
+    result = prepare_joint_noisy_inputs(
+        video,
+        audio,
+        torch.ones_like(video),
+        torch.ones_like(audio),
+        base,
+        video_shift=3.0,
+        audio_shift=3.0,
+    )
+
+    torch.testing.assert_close(result.video_sigma, result.audio_sigma)
 
 
 def test_h3_t2va_packing_matches_released_row_order_rope_clock_and_inverses():
@@ -899,6 +943,23 @@ def test_h3_trainer_warns_when_h2d_swap_uses_unpinned_host_memory(caplog):
     assert "can be substantially slower" in caplog.text
 
 
+def test_h3_trainer_rejects_composed_discrete_flow_shift():
+    # The common sampler must hand H3 an *unshifted* coordinate; composing
+    # --discrete_flow_shift on top would shift video twice and desynchronize audio.
+    args = create_parser().parse_args(["--sdpa", "--discrete_flow_shift", "12.0"])
+
+    with pytest.raises(ValueError, match="h3_shift_video"):
+        MiniMaxH3NetworkTrainer().handle_model_specific_args(args)
+
+
+@pytest.mark.parametrize("bad_shift", ["0.0", "0.001", "1000.0"])
+def test_h3_trainer_rejects_out_of_range_modality_shift(bad_shift):
+    args = create_parser().parse_args(["--sdpa", "--h3_shift_video", bad_shift])
+
+    with pytest.raises(ValueError, match="h3_shift_video"):
+        MiniMaxH3NetworkTrainer().handle_model_specific_args(args)
+
+
 def test_h3_trainer_rejects_negative_block_swap_count():
     args = create_parser().parse_args(["--sdpa", "--blocks_to_swap", "-1"])
 
@@ -912,8 +973,10 @@ def test_h3_training_parser_defaults_to_native_fl2va_contract():
     assert args.network_module == "networks.lora_minimax_h3"
     assert args.h3_training_mode == "fl2va"
     assert args.mixed_precision == "bf16"
-    assert args.timestep_sampling == "shift"
-    assert args.discrete_flow_shift == 12.0
+    assert args.timestep_sampling == "uniform"
+    assert args.discrete_flow_shift == 1.0
+    assert args.h3_shift_video == 12.0
+    assert args.h3_shift_audio == 3.0
     assert args.h3_loss_balance == "modality"
     assert args.h3_guidance_distillation_scale is None
     assert args.fp8_scaled is False

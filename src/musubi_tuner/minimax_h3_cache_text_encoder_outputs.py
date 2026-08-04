@@ -32,7 +32,7 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         "--text_encoder_quantization",
         choices=("none", "int8", "nf4"),
         default="none",
-        help="quantize Qwen3-VL Linear weights while loading; INT8 targets 32 GB GPUs and NF4 targets 24 GB GPUs",
+        help="quantize Qwen3-VL Linear weights while loading; INT8 preserves more precision, NF4 reduces the footprint further",
     )
     parser.add_argument(
         "--cache_guidance_empty",

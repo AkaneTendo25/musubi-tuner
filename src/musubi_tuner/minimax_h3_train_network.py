@@ -17,7 +17,7 @@ from musubi_tuner.dataset import config_utils
 from musubi_tuner.dataset.architectures import ARCHITECTURE_MINIMAX_H3, ARCHITECTURE_MINIMAX_H3_FULL
 from musubi_tuner.hv_train import get_sigmas
 from musubi_tuner.hv_train_network import NetworkTrainer, read_config_from_file, setup_parser_common
-from musubi_tuner.minimax_h3.architecture import VIDEO_FLOW_SHIFT, align_frame_count
+from musubi_tuner.minimax_h3.architecture import AUDIO_FLOW_SHIFT, VIDEO_FLOW_SHIFT, align_frame_count
 from musubi_tuner.minimax_h3.backend import H3TrainingBackend, create_conditioning_encoder, create_training_backend
 from musubi_tuner.minimax_h3.cache import (
     H3_AUDIO_LATENTS_KEY,
@@ -119,17 +119,23 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         self._i2v_training = False
         self._control_training = False
         self.default_guidance_scale = 1.0
-        self.default_discrete_flow_shift = VIDEO_FLOW_SHIFT
+        self.default_discrete_flow_shift = 1.0
         self.vae_frame_stride = 17
 
-        if args.discrete_flow_shift <= 0:
-            raise ValueError("MiniMax H3 --discrete_flow_shift must be positive")
-        if not math.isclose(args.discrete_flow_shift, VIDEO_FLOW_SHIFT):
-            logger.warning(
-                "MiniMax H3 uses video flow shift %.1f; training requested %.4g",
-                VIDEO_FLOW_SHIFT,
-                args.discrete_flow_shift,
+        # H3 owns its own flow shifts because video and audio ride different
+        # schedules (12 and 3) off one shared unshifted coordinate. The common
+        # sampler must therefore hand us that coordinate *unshifted*: applying
+        # --discrete_flow_shift as well would shift video twice and leave audio
+        # on a schedule the model was never trained for.
+        if not math.isclose(args.discrete_flow_shift, 1.0):
+            raise ValueError(
+                "MiniMax H3 requires --discrete_flow_shift 1.0; set the per-modality shifts with "
+                "--h3_shift_video / --h3_shift_audio instead (defaults 12.0 / 3.0)"
             )
+        for name in ("h3_shift_video", "h3_shift_audio"):
+            value = float(getattr(args, name))
+            if not 0.01 <= value <= 100.0:
+                raise ValueError(f"--{name} must be in [0.01, 100.0], got {value}")
         if args.h3_guidance_distillation_scale is not None and args.h3_guidance_distillation_scale <= 1.0:
             raise ValueError("--h3_guidance_distillation_scale must be greater than 1, or omitted for one-pass training")
         if args.fp8_base:
@@ -371,7 +377,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         # H3 latent caches are written in the model's normalized latent space.
         return latents
 
-    def _video_sigma(
+    def _base_sigma(
         self,
         args: argparse.Namespace,
         noise_scheduler,
@@ -379,6 +385,15 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         device: torch.device,
         dtype: torch.dtype,
     ) -> torch.Tensor:
+        """Recover the *unshifted* schedule coordinate for this step.
+
+        Both branches are unshifted only because ``--discrete_flow_shift`` is
+        pinned to 1.0 (enforced in ``handle_model_specific_args``): the direct
+        modes never apply it, and the scheduler branch builds
+        ``FlowMatchDiscreteScheduler(shift=discrete_flow_shift)``. The chosen
+        ``--timestep_sampling`` therefore only picks the *shape* of the base
+        distribution; H3's own shifts are applied downstream.
+        """
         if args.timestep_sampling in _DIRECT_SIGMA_SAMPLING:
             return ((timesteps.to(device=device, dtype=torch.float32) - 1.0) / 1000.0).clamp(0.0, 1.0)
         return get_sigmas(noise_scheduler, timesteps, device, n_dim=1, dtype=dtype).to(torch.float32)
@@ -450,8 +465,16 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         _, scheduler_timesteps = super().get_noisy_model_input_and_timesteps(
             args, noise, latents, batch["timesteps"], noise_scheduler, accelerator.device, dit_dtype
         )
-        video_sigma = self._video_sigma(args, noise_scheduler, scheduler_timesteps, accelerator.device, dit_dtype)
-        inputs = prepare_joint_noisy_inputs(latents, audio_latents, noise, audio_noise, video_sigma)
+        base_sigma = self._base_sigma(args, noise_scheduler, scheduler_timesteps, accelerator.device, dit_dtype)
+        inputs = prepare_joint_noisy_inputs(
+            latents,
+            audio_latents,
+            noise,
+            audio_noise,
+            base_sigma,
+            video_shift=args.h3_shift_video,
+            audio_shift=args.h3_shift_audio,
+        )
 
         if args.h3_guidance_distillation_scale is not None:
             missing_empty = [key for key in (H3_EMPTY_TEXT_HIDDEN_KEY, H3_EMPTY_TEXT_TOKEN_TAGS_KEY) if key not in batch]
@@ -460,7 +483,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                     "guidance-consistent H3 training requires --cache_guidance_empty; missing " + ", ".join(missing_empty)
                 )
             # The empty branch calibrates the distilled field but is not itself
-            # optimized. Evaluate it first without retaining a 33B-model graph.
+            # optimized. Evaluate it first without retaining its autograd graph.
             with torch.no_grad():
                 empty_prediction = self._predict(
                     accelerator,
@@ -486,7 +509,9 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             inputs,
             video_mask=batch.get("video_loss_mask"),
             audio_mask=batch.get("audio_loss_mask"),
-            sample_weight=self._sample_weight(args, video_sigma),
+            # Weighting keys on the shifted video sigma the model actually saw,
+            # not the shared unshifted coordinate.
+            sample_weight=self._sample_weight(args, inputs.video_sigma),
             balance=args.h3_loss_balance,
             video_weight=args.h3_video_loss_weight,
             audio_weight=args.h3_audio_loss_weight,
@@ -510,6 +535,9 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             "ss_h3_video_loss_weight": str(args.h3_video_loss_weight),
             "ss_h3_audio_loss_weight": str(args.h3_audio_loss_weight),
             "ss_h3_guidance_distillation_scale": str(args.h3_guidance_distillation_scale or "one_pass"),
+            "ss_h3_shift_video": str(args.h3_shift_video),
+            "ss_h3_shift_audio": str(args.h3_shift_audio),
+            "ss_h3_timestep_sampling": args.timestep_sampling,
         }
 
 
@@ -544,11 +572,27 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         default=None,
         help="enable optional two-pass guidance-consistent training with an authoritative distillation scale",
     )
+    parser.add_argument(
+        "--h3_shift_video",
+        type=float,
+        default=VIDEO_FLOW_SHIFT,
+        help="exponential flow shift for the target video stream (H3 released schedule: 12.0)",
+    )
+    parser.add_argument(
+        "--h3_shift_audio",
+        type=float,
+        default=AUDIO_FLOW_SHIFT,
+        help="exponential flow shift for the target audio stream (H3 released schedule: 3.0)",
+    )
     parser.set_defaults(
         network_module="networks.lora_minimax_h3",
         mixed_precision="bf16",
-        timestep_sampling="shift",
-        discrete_flow_shift=VIDEO_FLOW_SHIFT,
+        # --timestep_sampling selects only the shape of the unshifted
+        # coordinate; H3's per-modality shifts are applied on top of it. A
+        # uniform base keeps usable sampling density at low sigma once the
+        # video shift is applied.
+        timestep_sampling="uniform",
+        discrete_flow_shift=1.0,
         vae_dtype="float32",
     )
     return parser

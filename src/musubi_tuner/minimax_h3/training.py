@@ -47,12 +47,16 @@ def _validate_sigma(sigma: torch.Tensor) -> None:
         raise ValueError("H3 sigma values must be in [0, 1]")
 
 
+def _shift_unchecked(sigma: torch.Tensor, shift: float) -> torch.Tensor:
+    return shift * sigma / (1.0 + (shift - 1.0) * sigma)
+
+
 def shift_sigma(sigma: torch.Tensor, shift: float) -> torch.Tensor:
     """Apply H3's exponential flow shift to an unshifted noise level."""
     if shift <= 0:
         raise ValueError("H3 flow shift must be positive")
     _validate_sigma(sigma)
-    return shift * sigma / (1.0 + (shift - 1.0) * sigma)
+    return _shift_unchecked(sigma, shift)
 
 
 def unshift_sigma(sigma: torch.Tensor, shift: float) -> torch.Tensor:
@@ -79,13 +83,20 @@ def prepare_joint_noisy_inputs(
     audio_latents: torch.Tensor,
     video_noise: torch.Tensor,
     audio_noise: torch.Tensor,
-    video_sigma: torch.Tensor,
+    base_sigma: torch.Tensor,
+    *,
+    video_shift: float = VIDEO_FLOW_SHIFT,
+    audio_shift: float = AUDIO_FLOW_SHIFT,
 ) -> H3JointNoisyInputs:
     """Construct synchronized H3 video/audio flow inputs and data-pointing targets.
 
+    ``base_sigma`` is the *unshifted* schedule coordinate shared by both
+    modalities. Each modality derives its own sigma from it independently, so
+    the two schedules stay synchronized for any pair of shifts. Passing an
+    already-shifted sigma here would shift it twice.
+
     H3 uses ``x_t = (1 - sigma) * x0 + sigma * noise`` and predicts the
-    data-pointing velocity ``x0 - noise``. Video and audio share the same
-    unshifted schedule coordinate but use shifts 12 and 3 respectively.
+    data-pointing velocity ``x0 - noise``.
     """
     if video_latents.shape != video_noise.shape:
         raise ValueError("H3 video latents and noise must have identical shapes")
@@ -93,11 +104,15 @@ def prepare_joint_noisy_inputs(
         raise ValueError("H3 audio latents and noise must have identical shapes")
     if video_latents.shape[0] != audio_latents.shape[0]:
         raise ValueError("H3 video and audio batch sizes must match")
-    _validate_sigma(video_sigma)
-    if video_sigma.shape[0] != video_latents.shape[0]:
-        raise ValueError("H3 video sigma batch size must match the latents")
+    if video_shift <= 0 or audio_shift <= 0:
+        raise ValueError("H3 flow shifts must be positive")
+    _validate_sigma(base_sigma)
+    if base_sigma.shape[0] != video_latents.shape[0]:
+        raise ValueError("H3 base sigma batch size must match the latents")
 
-    audio_sigma = map_sigma_between_shifts(video_sigma.float(), source_shift=VIDEO_FLOW_SHIFT, target_shift=AUDIO_FLOW_SHIFT)
+    base_sigma = base_sigma.float()
+    video_sigma = _shift_unchecked(base_sigma, video_shift)
+    audio_sigma = _shift_unchecked(base_sigma, audio_shift)
     video_sigma_expanded = _expand_batch_values(video_sigma, video_latents)
     audio_sigma_expanded = _expand_batch_values(audio_sigma, audio_latents)
 
