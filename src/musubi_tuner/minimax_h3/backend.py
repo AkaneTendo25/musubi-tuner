@@ -111,6 +111,7 @@ def create_generator(
     width: int | None = None,
     fp8_scaled: bool = False,
     int8_convrot: bool = False,
+    adaln_rank: int | None = None,
     text_encoder_quantization: Literal["none", "int8", "nf4", "nvfp4_awq"] = "none",
     blocks_to_swap: int = 0,
     block_swap_h2d_only: bool = False,
@@ -138,6 +139,7 @@ def create_generator(
         width=width,
         fp8_scaled=fp8_scaled,
         int8_convrot=int8_convrot,
+        adaln_rank=adaln_rank,
         text_encoder_quantization=text_encoder_quantization,
         blocks_to_swap=blocks_to_swap,
         block_swap_h2d_only=block_swap_h2d_only,
@@ -160,6 +162,7 @@ def create_training_backend(
     fp8_scaled: bool = False,
     quantization_device: str | None = None,
     int8_convrot: bool = False,
+    adaln_rank: int | None = None,
 ) -> H3TrainingBackend:
     """Load only the transformer required for cache-backed LoRA training.
 
@@ -183,4 +186,5 @@ def create_training_backend(
         fp8_scaled=fp8_scaled,
         quantization_device=quantization_device,
         int8_convrot=int8_convrot,
+        adaln_rank=adaln_rank,
     )

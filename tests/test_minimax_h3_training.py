@@ -979,7 +979,7 @@ def test_h3_trainer_loads_only_the_selected_training_transformer(monkeypatch, tm
     monkeypatch.setattr(h3_train_network, "create_training_backend", create_backend)
     trainer = MiniMaxH3NetworkTrainer()
     trainer.dit_dtype = torch.bfloat16
-    args = SimpleNamespace(h3_training_mode="ref2va", fp8_base=False, int8_convrot_base=False)
+    args = SimpleNamespace(h3_training_mode="ref2va", fp8_base=False, int8_convrot_base=False, h3_adaln_rank=None)
     accelerator = SimpleNamespace(device=torch.device("cuda", 0))
 
     loaded = trainer.load_transformer(accelerator, args, str(tmp_path), "torch", False, "cpu", torch.bfloat16)
@@ -995,6 +995,7 @@ def test_h3_trainer_loads_only_the_selected_training_transformer(monkeypatch, tm
         "fp8_scaled": False,
         "quantization_device": "cuda:0",
         "int8_convrot": False,
+        "adaln_rank": None,
     }
 
 

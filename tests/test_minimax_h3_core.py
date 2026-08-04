@@ -808,6 +808,7 @@ def test_h3_bundled_text_encoder_assets_are_complete():
                 "fp8_scaled": False,
                 "quantization_device": None,
                 "int8_convrot": False,
+                "adaln_rank": None,
             },
         ),
     ],

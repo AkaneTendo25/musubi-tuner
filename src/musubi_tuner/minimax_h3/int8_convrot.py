@@ -75,9 +75,11 @@ def _int_mm(left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
     if not hasattr(torch, "_int_mm"):
         raise RuntimeError("INT8 ConvRot requires torch._int_mm on CUDA")
     rows = left.shape[0]
-    if rows >= 16:
+    # torch._int_mm requires strictly more than 16 rows, so 16 itself must be
+    # padded as well; zero rows contribute nothing and are sliced back off.
+    if rows > 16:
         return torch._int_mm(left.contiguous(), right)
-    padded = F.pad(left, (0, 0, 0, 16 - rows))
+    padded = F.pad(left, (0, 0, 0, 17 - rows))
     return torch._int_mm(padded.contiguous(), right)[:rows]
 
 

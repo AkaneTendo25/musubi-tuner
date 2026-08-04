@@ -149,6 +149,14 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             raise ValueError("MiniMax H3 --h3_image_flow_shift must be positive when specified")
         if args.h3_guidance_distillation_scale is not None and args.h3_guidance_distillation_scale <= 1.0:
             raise ValueError("--h3_guidance_distillation_scale must be greater than 1, or omitted for one-pass training")
+        if args.fp8_base and args.h3_adaln_rank is None:
+            # AdaLN is ~39% of the transformer and is quantized by default, yet
+            # measured against the BF16 reference the reduction is both smaller
+            # and more faithful than quantizing it.
+            logger.info(
+                "MiniMax H3: --fp8_base quantizes the AdaLN projections. Reducing them instead with "
+                "--h3_adaln_rank 16 is both smaller and closer to the BF16 reference; consider adding it."
+            )
         if args.fp8_base:
             # H3 supports only weight-only scaled FP8. Reuse the common
             # --fp8_base switch without exposing an H3-only parser field, and
@@ -374,6 +382,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             attention_mode=attn_mode,
             split_attention=split_attn,
             fp8_scaled=bool(args.fp8_base),
+            adaln_rank=args.h3_adaln_rank,
             quantization_device=str(accelerator.device),
             int8_convrot=bool(args.int8_convrot_base),
         )
@@ -473,8 +482,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         if is_image:
             if latents.shape[2] != 1:
                 raise KeyError(
-                    f"MiniMax H3 video cache is missing {H3_AUDIO_LATENTS_KEY}; "
-                    "only one-frame image caches may omit audio"
+                    f"MiniMax H3 video cache is missing {H3_AUDIO_LATENTS_KEY}; only one-frame image caches may omit audio"
                 )
             audio_latents = latents.new_zeros((latents.shape[0], AUDIO_CHANNELS, AUDIO_LATENT_CHANNELS, 0))
         else:
@@ -627,6 +635,15 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         "--int8_convrot_base",
         action="store_true",
         help="load the pruned Comfy INT8 ConvRot transformer for LoRA training",
+    )
+    parser.add_argument(
+        "--h3_adaln_rank",
+        type=int,
+        default=None,
+        help=(
+            "reduce the AdaLN timestep projection to this rank while loading, shrinking the frozen base by ~13B "
+            "parameters; the reduced weights stay in BF16 because they are no longer large enough to be worth quantizing"
+        ),
     )
     parser.add_argument(
         "--h3_shift_video",

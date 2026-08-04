@@ -358,6 +358,64 @@ it near the middle, which combined with a large video shift leaves very few step
 apply it before H3's, giving a doubly-shifted schedule; they also read only the two trailing latent dimensions, so they ignore
 H3's temporal extent entirely and are not meaningful here.
 
+### AdaLN reduction
+
+Each block's AdaLN projection reads only the timestep. It never sees tokens or content, so its
+2688-wide input traces a smooth one-dimensional curve as the timestep varies, and the projection can
+be stored against a small basis of that curve rather than the full width. `--h3_adaln_rank` performs
+that reduction while the checkpoint streams in, so no separate file is produced or required:
+
+```shell
+accelerate launch minimax_h3_train_network.py ... --fp8_base --h3_adaln_rank 16
+```
+
+These projections are the largest single group of parameters in the transformer -- roughly 13.0B of
+33.1B. At rank 16 they become about 77M, which changes the resident base as follows:
+
+| base precision | default | with `--h3_adaln_rank 16` |
+|---|---|---|
+| BF16 | 66.2 GB | 40.2 GB |
+| scaled FP8 (`--fp8_base`) | 33.1 GB | 20.1 GB |
+
+The reduced projections are deliberately kept in BF16 and excluded from FP8 quantization: at that
+size quantizing them saves nothing measurable, while leaving them unquantized removes their
+quantization error entirely. Because AdaLN depends only on the timestep, any error there is a
+systematic distortion of the modulation curve rather than noise that averages away across tokens.
+
+Rank 16 reproduces the modulation to a relative error far below BF16's own rounding step, so the
+reduction is not the limiting approximation anywhere in the pipeline. Rank 8, which is what the
+released pruned transformers use, is also well below it.
+
+The published pruned checkpoints apply the same reduction, but ship it together with INT8 ConvRot
+quantization, which cannot be combined with scaled FP8 (see below). `--h3_adaln_rank` instead
+performs the reduction on the released BF16 transformer, leaving the choice of quantization open, and
+works for both `fl2va` and `ref2va`. It composes with block swapping and gradient checkpointing, and
+also shrinks the swap ring buffers, which are otherwise sized by the full-width AdaLN weights.
+
+The option is rejected on a checkpoint that is already pruned, and on INT8 ConvRot checkpoints, which
+ship pre-reduced.
+
+> [!NOTE]
+> Measured against the BF16 transformer, forwarding identical fixed-seed inputs through all 50 blocks,
+> the reduction is the most faithful of the memory-saving options and the only one that improves on
+> the reference rather than departing from it:
+>
+> | configuration | video relative L2 | audio relative L2 |
+> |---|---|---|
+> | `--h3_adaln_rank 16` | **4.30e-02** | **5.71e-02** |
+> | INT8 ConvRot checkpoint | 8.08e-02 | 1.41e-01 |
+> | `--fp8_base` | 1.25e-01 | 2.39e-01 |
+>
+> Every option here changes the output at the percent level, because fifty residual blocks amplify any
+> small weight perturbation; that is normal rather than a defect. AdaLN reduction is roughly twice as
+> close to the reference as the INT8 checkpoint and three times as close as scaled FP8, while also
+> being the largest saving of the three on that tensor. Combining it with `--fp8_base` is therefore
+> preferable to `--fp8_base` alone, which quantizes the AdaLN projections instead of reducing them.
+>
+> These figures compare forward predictions. Whether an adapter trained against one base transfers to
+> a differently quantized or reduced base is a separate question that applies to every row of the
+> table and has not been measured here.
+
 Image batches are the deliberate exception. They use Musubi's existing `krea2_shift` implementation: a logit-normal base density
 followed by a resolution-aware `exp(mu)` shift over the spatial DiT-token count. This image sigma is already final and is therefore
 not shifted by H3's video schedule a second time. Video batches in the

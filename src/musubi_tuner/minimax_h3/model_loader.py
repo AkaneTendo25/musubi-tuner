@@ -12,11 +12,20 @@ from musubi_tuner.minimax_h3.int8_convrot import (
     load_comfy_int8_convrot_state_dict,
     prepare_int8_convrot_modules,
 )
-from musubi_tuner.minimax_h3.model import MiniMaxH3Transformer, MiniMaxH3TransformerConfig
+from musubi_tuner.minimax_h3.adaln_lowrank import (
+    DEFAULT_TABLE_POINTS,
+    build_adaln_basis,
+    build_timestep_table,
+    make_adaln_split_hook,
+    read_time_embedder,
+    reconstruction_error,
+)
+from musubi_tuner.minimax_h3.model import MiniMaxH3TimeEmbedder, MiniMaxH3Transformer, MiniMaxH3TransformerConfig
 from musubi_tuner.minimax_h3.training import H3TrainingMode
 from musubi_tuner.minimax_h3.weights import CheckpointInspectionError, tensor_metadata
 from musubi_tuner.modules.fp8_optimization_utils import apply_fp8_monkey_patch
 from musubi_tuner.utils.lora_utils import load_safetensors_with_lora_and_fp8
+from musubi_tuner.utils.safetensors_utils import WeightTransformHooks
 
 logger = logging.getLogger(__name__)
 
@@ -101,11 +110,7 @@ def infer_transformer_config(
 def _int8_checkpoint_bases(actual: dict[str, object]) -> tuple[set[str], set[str], set[str]]:
     markers = {name[: -len(".comfy_quant")] for name in actual if name.endswith(".comfy_quant")}
     scales = {name[: -len(".weight_scale")] for name in actual if name.endswith(".weight_scale")}
-    weights = {
-        name[: -len(".weight")]
-        for name, tensor in actual.items()
-        if name.endswith(".weight") and tensor.dtype == "I8"
-    }
+    weights = {name[: -len(".weight")] for name, tensor in actual.items() if name.endswith(".weight") and tensor.dtype == "I8"}
     return markers, scales, weights
 
 
@@ -145,8 +150,8 @@ def validate_transformer_checkpoint(
         if tensor.shape != expected_shape:
             disagreements.append(f"{name}: shape {tensor.shape}, expected {expected_shape}")
         base = name[: -len(".weight")] if name.endswith(".weight") else ""
-        expected_dtype = "I8" if base in quantized_bases else _expected_checkpoint_dtype(
-            name, pruned=config.adaln_t_table_size is not None
+        expected_dtype = (
+            "I8" if base in quantized_bases else _expected_checkpoint_dtype(name, pruned=config.adaln_t_table_size is not None)
         )
         if tensor.dtype != expected_dtype:
             disagreements.append(f"{name}: dtype {tensor.dtype}, expected {expected_dtype}")
@@ -173,6 +178,7 @@ def load_transformer(
     fp8_scaled: bool = False,
     quantization_device: str | torch.device | None = None,
     int8_convrot: bool = False,
+    adaln_rank: int | None = None,
 ) -> MiniMaxH3Transformer:
     checkpoint_path = resolve_transformer_checkpoint(source, mode, int8_convrot=int8_convrot)
     config = infer_transformer_config(checkpoint_path)
@@ -191,6 +197,28 @@ def load_transformer(
         tensor_count,
         parameter_count / 1e9,
     )
+
+    # AdaLN reads only the timestep, so its 13.0B parameters describe a smooth
+    # one-dimensional curve that a rank-r basis reproduces far below BF16's own
+    # rounding floor. Reducing it as the weights stream in keeps the released
+    # checkpoint as the only artifact anyone needs.
+    weight_transform_hooks = None
+    if adaln_rank is not None:
+        if config.adaln_t_table_size is not None:
+            raise ValueError("MiniMax H3 checkpoint is already pruned; --h3_adaln_rank cannot apply again")
+        if int8_convrot:
+            raise ValueError("MiniMax H3 INT8 ConvRot checkpoints ship pre-pruned; --h3_adaln_rank cannot apply")
+        embedder = read_time_embedder(checkpoint_path, embedder_factory=MiniMaxH3TimeEmbedder)
+        # Uncentered so the projections' biases pass through untouched.
+        basis = build_adaln_basis(embedder, adaln_rank, center=False)
+        table = build_timestep_table(embedder, basis, DEFAULT_TABLE_POINTS)
+        logger.info(
+            "Reducing AdaLN to rank %d (curve relative RMS error %.3e)",
+            adaln_rank,
+            reconstruction_error(embedder, basis),
+        )
+        config = replace(config, adaln_t_table_size=DEFAULT_TABLE_POINTS, time_embed_dim=adaln_rank)
+        weight_transform_hooks = WeightTransformHooks(split_hook=make_adaln_split_hook(basis, table))
 
     with init_empty_weights(include_buffers=True):
         model = MiniMaxH3Transformer(config)
@@ -212,7 +240,10 @@ def load_transformer(
             move_to_device=device.type != "cpu" and device == calc_device,
             dit_weight_dtype=None,
             target_keys=H3_FP8_OPTIMIZATION_TARGET_KEYS if fp8_scaled else None,
-            exclude_keys=H3_FP8_OPTIMIZATION_EXCLUDE_KEYS if fp8_scaled else None,
+            exclude_keys=(
+                H3_FP8_OPTIMIZATION_EXCLUDE_KEYS + (["adaln_proj"] if adaln_rank is not None else []) if fp8_scaled else None
+            ),
+            weight_transform_hooks=weight_transform_hooks,
         )
         if fp8_scaled:
             apply_fp8_monkey_patch(model, state_dict, use_scaled_mm=False)
