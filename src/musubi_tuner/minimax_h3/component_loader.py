@@ -17,6 +17,7 @@ logger = logging.getLogger(__name__)
 _VIDEO_FILENAME = "minimax_h3_video_vae_fp16.safetensors"
 _AUDIO_FILENAME = "minimax_h3_audio_vae_fp32.safetensors"
 _TEXT_FILENAME = "qwen3vl_32b_minimax_h3_bf16.safetensors"
+_TEXT_NVFP4_AWQ_FILENAME = "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors"
 
 
 def _resolve_component(source: Path, subdirectory: str, filename: str) -> Path:
@@ -41,6 +42,10 @@ def resolve_audio_vae_checkpoint(source: Path) -> Path:
 
 def resolve_text_encoder_checkpoint(source: Path) -> Path:
     return _resolve_component(source, "text_encoders", _TEXT_FILENAME)
+
+
+def resolve_nvfp4_awq_text_encoder_checkpoint(source: Path) -> Path:
+    return _resolve_component(source, "text_encoders", _TEXT_NVFP4_AWQ_FILENAME)
 
 
 def _metadata(path: Path, key: str) -> dict:

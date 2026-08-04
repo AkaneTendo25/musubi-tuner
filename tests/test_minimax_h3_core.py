@@ -33,6 +33,7 @@ from musubi_tuner.minimax_h3.audio import (
     load_audio_asset,
     target_audio_processing_spec,
 )
+from musubi_tuner.minimax_h3.assets import default_text_encoder_assets
 from musubi_tuner.minimax_h3.cache import H3_KEYFRAME_VIDEO_ROWS_KEY, save_latent_cache_minimax_h3
 from musubi_tuner.minimax_h3.dataset import create_h3_dataset_group
 from musubi_tuner.minimax_h3.media import (
@@ -712,6 +713,16 @@ def test_cache_cli_uses_native_musubi_dataset_config(tmp_path):
     assert text_args.task == "t2va"
     assert text_args.text_encoder_quantization == "none"
 
+    bundled_text_args = create_cache_text_parser().parse_args(
+        [
+            "--dataset_config",
+            str(tmp_path / "dataset.toml"),
+            "--text_encoder",
+            str(tmp_path / "text_encoder.safetensors"),
+        ]
+    )
+    assert bundled_text_args.tokenizer == default_text_encoder_assets()
+
     quantized_text_args = create_cache_text_parser().parse_args(
         [
             "--dataset_config",
@@ -725,6 +736,20 @@ def test_cache_cli_uses_native_musubi_dataset_config(tmp_path):
         ]
     )
     assert quantized_text_args.text_encoder_quantization == "nf4"
+
+    nvfp4_text_args = create_cache_text_parser().parse_args(
+        [
+            "--dataset_config",
+            str(tmp_path / "dataset.toml"),
+            "--text_encoder",
+            str(tmp_path / "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors"),
+            "--tokenizer",
+            str(tmp_path / "processor"),
+            "--text_encoder_quantization",
+            "nvfp4_awq",
+        ]
+    )
+    assert nvfp4_text_args.text_encoder_quantization == "nvfp4_awq"
 
 
 def test_h3_cache_parsers_do_not_advertise_transformer_loading_modes():
@@ -747,6 +772,20 @@ def test_h3_generation_parser_exposes_native_inference_controls():
     ):
         assert option in parser._option_string_actions
     assert "--fp8_scaled" not in parser._option_string_actions
+    assert parser.parse_args(["--model", "model", "--prompt", "prompt", "--output", "out.mp4"]).tokenizer == (
+        default_text_encoder_assets()
+    )
+
+
+def test_h3_bundled_text_encoder_assets_are_complete():
+    asset_dir = default_text_encoder_assets()
+    assert {path.name for path in asset_dir.iterdir() if path.suffix == ".json"} >= {
+        "config.json",
+        "preprocessor_config.json",
+        "tokenizer_config.json",
+        "tokenizer.json",
+        "video_preprocessor_config.json",
+    }
 
 
 @pytest.mark.parametrize(

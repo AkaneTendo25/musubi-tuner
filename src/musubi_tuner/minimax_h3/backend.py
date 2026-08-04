@@ -80,7 +80,7 @@ def create_conditioning_encoder(
     task: str,
     device: str | None,
     dtype: str,
-    quantization: Literal["none", "int8", "nf4"] = "none",
+    quantization: Literal["none", "int8", "nf4", "nvfp4_awq"] = "none",
 ) -> H3ConditioningEncoder:
     """Load only the understanding encoder required for conditioning caches."""
     _validate_dtype(dtype)
@@ -110,7 +110,7 @@ def create_generator(
     height: int | None = None,
     width: int | None = None,
     fp8_scaled: bool = False,
-    text_encoder_quantization: Literal["none", "int8", "nf4"] = "none",
+    text_encoder_quantization: Literal["none", "int8", "nf4", "nvfp4_awq"] = "none",
     blocks_to_swap: int = 0,
     block_swap_h2d_only: bool = False,
     block_swap_ring_size: int = 2,

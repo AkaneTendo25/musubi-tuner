@@ -5,6 +5,7 @@ import json
 from collections.abc import Sequence
 from pathlib import Path
 
+from musubi_tuner.minimax_h3.assets import default_text_encoder_assets
 from musubi_tuner.minimax_h3.backend import create_generator
 from musubi_tuner.minimax_h3.request import SUPPORTED_RATIOS, H3GenerationRequest, make_references
 from musubi_tuner.minimax_h3.weights import inspect_checkpoint
@@ -14,7 +15,12 @@ def create_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="MiniMax H3 local inference entrypoint")
     parser.add_argument("--model", type=Path, required=True, help="Local H3 checkpoint directory, index, or safetensors file")
     parser.add_argument("--text_encoder", type=Path, help="Qwen3-VL H3 BF16 checkpoint or component directory")
-    parser.add_argument("--tokenizer", type=Path, help="Official matching text_encoder tokenizer/processor metadata directory")
+    parser.add_argument(
+        "--tokenizer",
+        type=Path,
+        default=default_text_encoder_assets(),
+        help="H3 tokenizer/processor directory; defaults to the metadata bundled with Musubi",
+    )
     parser.add_argument("--vae", type=Path, help="MiniMax H3 video VAE checkpoint or component directory")
     parser.add_argument("--audio_vae", type=Path, help="MiniMax H3 audio VAE checkpoint or component directory")
     parser.add_argument("--prompt", required=True)
@@ -35,7 +41,7 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument("--fp8_base", action="store_true", help="use weight-only scaled FP8 transformer blocks")
     parser.add_argument(
         "--text_encoder_quantization",
-        choices=("none", "int8", "nf4"),
+        choices=("none", "int8", "nf4", "nvfp4_awq"),
         default="none",
         help="quantize the Qwen3-VL conditioner while encoding the prompt",
     )
@@ -77,7 +83,6 @@ def main(argv: Sequence[str] | None = None) -> None:
             return
         required = {
             "--text_encoder": args.text_encoder,
-            "--tokenizer": args.tokenizer,
             "--vae": args.vae,
             "--audio_vae": args.audio_vae,
         }

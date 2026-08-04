@@ -10,6 +10,7 @@ import torch
 from musubi_tuner import cache_text_encoder_outputs
 from musubi_tuner.dataset import config_utils
 from musubi_tuner.dataset.image_video_dataset import ItemInfo
+from musubi_tuner.minimax_h3.assets import default_text_encoder_assets
 from musubi_tuner.minimax_h3.backend import create_conditioning_encoder
 from musubi_tuner.minimax_h3.cache import normalize_batch_tensors, save_text_encoder_output_cache_minimax_h3
 from musubi_tuner.minimax_h3.dataset import attach_h3_media, create_h3_dataset_group
@@ -20,7 +21,12 @@ logger = logging.getLogger(__name__)
 def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     parser.description = "Cache MiniMax H3 conditioning with Musubi's dataset and cache pipeline"
     parser.add_argument("--text_encoder", type=Path, required=True, help="H3 Qwen3-VL checkpoint or Comfy model directory")
-    parser.add_argument("--tokenizer", type=Path, required=True, help="released H3 FL2VA text_encoder directory")
+    parser.add_argument(
+        "--tokenizer",
+        type=Path,
+        default=default_text_encoder_assets(),
+        help="H3 tokenizer/processor directory; defaults to the metadata bundled with Musubi",
+    )
     parser.add_argument(
         "--task",
         choices=("t2va", "i2va", "fl2va", "ref2va"),
@@ -30,9 +36,12 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     parser.add_argument("--text_encoder_dtype", default="bfloat16")
     parser.add_argument(
         "--text_encoder_quantization",
-        choices=("none", "int8", "nf4"),
+        choices=("none", "int8", "nf4", "nvfp4_awq"),
         default="none",
-        help="quantize Qwen3-VL Linear weights while loading; INT8 preserves more precision, NF4 reduces the footprint further",
+        help=(
+            "text-encoder weight mode: INT8/NF4 quantize the BF16 checkpoint while loading; "
+            "NVFP4_AWQ loads the matching Comfy-Org checkpoint directly"
+        ),
     )
     parser.add_argument(
         "--cache_guidance_empty",

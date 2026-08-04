@@ -20,7 +20,8 @@ from musubi_tuner.minimax_h3.cache import (
     H3_TEXT_HIDDEN_KEY,
     H3_TEXT_TOKEN_TAGS_KEY,
 )
-from musubi_tuner.minimax_h3.component_loader import text_encoder_metadata
+from musubi_tuner.minimax_h3.comfy_quant import has_comfy_quantized_layers, load_comfy_quantized_state_dict
+from musubi_tuner.minimax_h3.component_loader import resolve_nvfp4_awq_text_encoder_checkpoint, text_encoder_metadata
 from musubi_tuner.minimax_h3.model import MiniMaxH3TokenTag
 from musubi_tuner.minimax_h3.references import (
     H3PreparedReference,
@@ -32,7 +33,17 @@ from musubi_tuner.utils.model_utils import dtype_to_str
 
 logger = logging.getLogger(__name__)
 
-H3TextEncoderQuantization = Literal["none", "int8", "nf4"]
+H3TextEncoderQuantization = Literal["none", "int8", "nf4", "nvfp4_awq"]
+
+
+def _text_encoder_key(source_prefix: str) -> str:
+    if source_prefix.startswith("visual"):
+        return source_prefix
+    if source_prefix == "model":
+        return "language_model"
+    if source_prefix.startswith("model."):
+        return f"language_model.{source_prefix.removeprefix('model.')}"
+    return source_prefix
 
 
 def _mapped_text_encoder_state_dict(
@@ -44,10 +55,9 @@ def _mapped_text_encoder_state_dict(
     state_dict: dict[str, torch.Tensor] = {}
     with safe_open(checkpoint_path, framework="pt", device=str(device)) as handle:
         for source_key in handle.keys():  # noqa: SIM118 - safetensors.safe_open is not iterable
-            if source_key.startswith("visual."):
-                target_key = source_key
-            elif source_key.startswith("model."):
-                target_key = f"language_model.{source_key.removeprefix('model.')}"
+            if source_key.startswith(("visual.", "model.")):
+                source_prefix, _, suffix = source_key.rpartition(".")
+                target_key = f"{_text_encoder_key(source_prefix)}.{suffix}"
             else:
                 raise ValueError(f"{checkpoint_path.name} contains unexpected key {source_key!r}")
             if target_key not in expected:
@@ -121,9 +131,15 @@ def load_text_conditioner(
 ) -> tuple[Any, Qwen3VLModel]:
     if dtype is not torch.bfloat16:
         raise ValueError("MiniMax H3 Qwen3-VL conditioning requires bfloat16")
-    if quantization not in ("none", "int8", "nf4"):
+    if quantization not in ("none", "int8", "nf4", "nvfp4_awq"):
         raise ValueError(f"unsupported MiniMax H3 text-encoder quantization: {quantization}")
-    checkpoint_path, _ = text_encoder_metadata(checkpoint)
+    checkpoint_source = Path(checkpoint)
+    if quantization == "nvfp4_awq":
+        checkpoint_path = resolve_nvfp4_awq_text_encoder_checkpoint(checkpoint_source)
+        if not has_comfy_quantized_layers(checkpoint_path):
+            raise ValueError("NVFP4/AWQ text-encoder mode requires the Comfy-Org quantized Qwen3-VL checkpoint")
+    else:
+        checkpoint_path, _ = text_encoder_metadata(checkpoint_source)
     full_config = Qwen3VLConfig.from_pretrained(tokenizer, local_files_only=True)
     full_config.text_config.num_hidden_layers = 50
     full_config.text_config.use_cache = False
@@ -131,18 +147,26 @@ def load_text_conditioner(
         model = Qwen3VLModel(full_config)
         model.language_model.norm = nn.Identity()
 
-    expected = set(model.state_dict())
     target_device = torch.device(device)
-    checkpoint_device = target_device if quantization == "none" else torch.device("cpu")
-    state_dict = _mapped_text_encoder_state_dict(checkpoint_path, expected, device=checkpoint_device)
-    if quantization == "none":
-        info = model.load_state_dict(state_dict, strict=True, assign=True)
-        if info.missing_keys or info.unexpected_keys:
-            raise RuntimeError(f"strict Qwen3-VL load failed: {info}")
+    if quantization == "nvfp4_awq":
+        load_comfy_quantized_state_dict(
+            model,
+            checkpoint_path,
+            key_map=_text_encoder_key,
+            output_dtype=dtype,
+        )
     else:
-        del model
-        model = _load_bnb_text_conditioner(full_config, state_dict, target_device, quantization)
-    del state_dict
+        expected = set(model.state_dict())
+        checkpoint_device = target_device if quantization == "none" else torch.device("cpu")
+        state_dict = _mapped_text_encoder_state_dict(checkpoint_path, expected, device=checkpoint_device)
+        if quantization == "none":
+            info = model.load_state_dict(state_dict, strict=True, assign=True)
+            if info.missing_keys or info.unexpected_keys:
+                raise RuntimeError(f"strict Qwen3-VL load failed: {info}")
+        else:
+            del model
+            model = _load_bnb_text_conditioner(full_config, state_dict, target_device, quantization)
+        del state_dict
     vision_config = full_config.vision_config
     vision_head_dim = vision_config.hidden_size // vision_config.num_heads
     model.visual.rotary_pos_emb = type(model.visual.rotary_pos_emb)(vision_head_dim // 2).to(target_device)
@@ -150,6 +174,8 @@ def load_text_conditioner(
         full_config.text_config,
         device=target_device,
     )
+    if quantization == "nvfp4_awq":
+        model.to(target_device)
     model.requires_grad_(False).eval()
     processor = AutoProcessor.from_pretrained(tokenizer, local_files_only=True, use_fast=True)
     logger.info(

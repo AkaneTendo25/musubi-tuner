@@ -27,12 +27,15 @@ checkpoint configuration and reject incompatible layouts.
 Follow the repository's main [installation instructions](../README.md#installation) first. The H3 scripts require Python 3.10,
 3.11, or 3.12; the profiled environment uses Python 3.12 and the dependency versions pinned by `pyproject.toml`.
 
-For FL2VA text-to-video or image-to-video training, the native loaders use these four Comfy-Org checkpoint files:
+For FL2VA text-to-video or image-to-video training, the native loaders use the transformer, both VAEs, and one of the two
+Comfy-Org conditioner checkpoints below:
 
 - [FL2VA BF16 transformer](https://huggingface.co/Comfy-Org/MiniMax-H3/blob/main/diffusion_models/minimax_h3_fl2va_bf16.safetensors),
   `diffusion_models/minimax_h3_fl2va_bf16.safetensors`;
 - [Qwen3-VL BF16 text encoder](https://huggingface.co/Comfy-Org/MiniMax-H3/blob/main/text_encoders/qwen3vl_32b_minimax_h3_bf16.safetensors),
   `text_encoders/qwen3vl_32b_minimax_h3_bf16.safetensors`;
+- [Qwen3-VL NVFP4/AWQ text encoder](https://huggingface.co/Comfy-Org/MiniMax-H3/blob/main/text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors),
+  `text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors`;
 - [FP16 video VAE](https://huggingface.co/Comfy-Org/MiniMax-H3/blob/main/vae/minimax_h3_video_vae_fp16.safetensors),
   `vae/minimax_h3_video_vae_fp16.safetensors`;
 - [FP32 audio VAE](https://huggingface.co/Comfy-Org/MiniMax-H3/blob/main/vae/minimax_h3_audio_vae_fp32.safetensors),
@@ -43,9 +46,9 @@ Ref2VA training uses the same conditioner and VAEs but selects the separate rele
 `diffusion_models/minimax_h3_ref2va_bf16.safetensors`. The loader validates the requested variant and does not alias a base FL2VA
 checkpoint to Ref2VA.
 
-The text-cache command also needs the small tokenizer and processor metadata from the official
-`FL2VA/text_encoder` directory. The 14 official text-model shards are not needed when the Comfy-Org BF16 text encoder is used. Pass
-that metadata directory to `--tokenizer`; Musubi does not import ComfyUI's bundled tokenizer or hard-coded processor classes.
+The official H3 tokenizer, Qwen3-VL configuration, and image/video processor metadata are bundled as package assets. The commands
+therefore do not download the 14 official text-model shards and do not require `--tokenizer`. An explicit `--tokenizer` path remains
+available when testing different processor metadata.
 
 With `huggingface-hub` installed, download only the T2VA files instead of the complete model repositories:
 
@@ -57,10 +60,6 @@ hf download Comfy-Org/MiniMax-H3 \
   vae/minimax_h3_audio_vae_fp32.safetensors \
   --local-dir /models/MiniMax-H3
 
-hf download MiniMaxAI/MiniMax-H3 \
-  --include "FL2VA/text_encoder/*" \
-  --exclude "FL2VA/text_encoder/model-*.safetensors" "FL2VA/text_encoder/model.safetensors.index.json" \
-  --local-dir /models/MiniMax-H3-metadata
 ```
 
 For Ref2VA, download its transformer in addition to the common files:
@@ -68,6 +67,14 @@ For Ref2VA, download its transformer in addition to the common files:
 ```shell
 hf download Comfy-Org/MiniMax-H3 \
   diffusion_models/minimax_h3_ref2va_bf16.safetensors \
+  --local-dir /models/MiniMax-H3
+```
+
+To use the directly quantized conditioner, download it instead of the BF16 text encoder:
+
+```shell
+hf download Comfy-Org/MiniMax-H3 \
+  text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors \
   --local-dir /models/MiniMax-H3
 ```
 
@@ -79,12 +86,11 @@ The resulting layout used by the commands below is:
 │   ├── minimax_h3_fl2va_bf16.safetensors
 │   └── minimax_h3_ref2va_bf16.safetensors       # Ref2VA only
 ├── text_encoders/
-│   └── qwen3vl_32b_minimax_h3_bf16.safetensors
+│   ├── qwen3vl_32b_minimax_h3_bf16.safetensors
+│   └── qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors  # optional quantized alternative
 └── vae/
     ├── minimax_h3_video_vae_fp16.safetensors
     └── minimax_h3_audio_vae_fp32.safetensors
-/models/MiniMax-H3-metadata/
-└── FL2VA/text_encoder/                           # config/tokenizer/processor files only
 ```
 
 > [!NOTE]
@@ -174,7 +180,6 @@ python minimax_h3_cache_latents.py \\
 python minimax_h3_cache_text_encoder_outputs.py \\
   --dataset_config dataset.toml \\
   --text_encoder /models/MiniMax-H3/text_encoders/qwen3vl_32b_minimax_h3_bf16.safetensors \\
-  --tokenizer /models/MiniMax-H3-metadata/FL2VA/text_encoder \\
   --task t2va \\
   --device cuda
 ```
@@ -189,7 +194,6 @@ python minimax_h3_cache_latents.py \
 python minimax_h3_cache_text_encoder_outputs.py \
   --dataset_config examples/minimax_h3/image.toml \
   --text_encoder /models/MiniMax-H3/text_encoders/qwen3vl_32b_minimax_h3_bf16.safetensors \
-  --tokenizer /models/MiniMax-H3-metadata/FL2VA/text_encoder \
   --task t2va --device cuda
 ```
 
@@ -205,14 +209,12 @@ they do not use `control_directory` or the Ref2VA reference fields.
 python minimax_h3_cache_text_encoder_outputs.py \
   --dataset_config dataset.toml \
   --text_encoder /models/MiniMax-H3/text_encoders/qwen3vl_32b_minimax_h3_bf16.safetensors \
-  --tokenizer /models/MiniMax-H3-metadata/FL2VA/text_encoder \
   --task i2va --device cuda
 
 # Experimental first+last-frame FL2VA
 python minimax_h3_cache_text_encoder_outputs.py \
   --dataset_config dataset.toml \
   --text_encoder /models/MiniMax-H3/text_encoders/qwen3vl_32b_minimax_h3_bf16.safetensors \
-  --tokenizer /models/MiniMax-H3-metadata/FL2VA/text_encoder \
   --task fl2va --device cuda
 ```
 
@@ -227,6 +229,20 @@ INT8 reduces conditioner weight residency, while NF4 reduces it further. Non-Lin
 states remain BF16. Both modes are explicit memory/conditioning-precision tradeoffs rather than
 numerically equivalent replacements for BF16. Quantization reduces text-caching VRAM, but the complete BF16 checkpoint remains
 memory-mapped in CPU address space while weights are converted; it does not remove the host RAM/address-space requirement.
+
+The released NVFP4/AWQ conditioner is loaded directly with:
+
+```shell
+python minimax_h3_cache_text_encoder_outputs.py \
+  --dataset_config dataset.toml \
+  --text_encoder /models/MiniMax-H3/text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors \
+  --text_encoder_quantization nvfp4_awq \
+  --task t2va --device cuda
+```
+
+This path keeps the 350 language-model Linear layers in their packed NVFP4/AWQ representation and the token embedding in row-wise
+INT8. Each Linear weight is dequantized only for its BF16 operation, so the full dense BF16 text encoder is never materialized.
+Vision modules and cached layer-50 hidden states remain BF16. The mode is explicit and accepts only the matching checkpoint format.
 
 The native loader preserves the released component precision: the Comfy video encoder is FP16 and the audio encoder is FP32.
 Normalized cache tensors default to float32, and target video/audio caches use the posterior mean for deterministic reuse. Cache
@@ -495,7 +511,6 @@ last-keyframe FL2VA, and arbitrary-reference Ref2VA generation.
 python minimax_h3_generate_video.py \
   --model /path/to/minimax_h3_fl2va_bf16.safetensors \
   --text_encoder /path/to/qwen3vl_32b_minimax_h3_bf16.safetensors \
-  --tokenizer /path/to/MiniMax-H3/FL2VA/text_encoder \
   --vae /path/to/minimax_h3_video_vae_fp16.safetensors \
   --audio_vae /path/to/minimax_h3_audio_vae_fp32.safetensors \
   --prompt "A traveler walks through a sunlit mountain valley while birds sing in the distance." \
@@ -509,7 +524,6 @@ Add `--first_frame start.png` for ordinary first-frame I2V. Add `--last_frame en
 python minimax_h3_generate_video.py \
   --model /path/to/minimax_h3_fl2va_bf16.safetensors \
   --text_encoder /path/to/qwen3vl_32b_minimax_h3_bf16.safetensors \
-  --tokenizer /path/to/MiniMax-H3-metadata/FL2VA/text_encoder \
   --vae /path/to/minimax_h3_video_vae_fp16.safetensors \
   --audio_vae /path/to/minimax_h3_audio_vae_fp32.safetensors \
   --prompt "A slow camera move across a quiet coastal landscape." \
@@ -526,7 +540,6 @@ be paired with at least one reference image or video.
 python minimax_h3_generate_video.py \
   --model /path/to/minimax_h3_ref2va_bf16.safetensors \
   --text_encoder /path/to/qwen3vl_32b_minimax_h3_bf16.safetensors \
-  --tokenizer /path/to/MiniMax-H3-metadata/Ref2VA/text_encoder \
   --vae /path/to/minimax_h3_video_vae_fp16.safetensors \
   --audio_vae /path/to/minimax_h3_audio_vae_fp32.safetensors \
   --prompt "A small sailboat crosses a calm bay at sunrise." \
@@ -543,7 +556,6 @@ For samples during training, add the decoder and conditioner paths plus Musubi's
 
 ```shell
   --text_encoder /path/to/qwen3vl_32b_minimax_h3_bf16.safetensors \
-  --tokenizer /path/to/MiniMax-H3/FL2VA/text_encoder \
   --vae /path/to/minimax_h3_video_vae_fp16.safetensors \
   --audio_vae /path/to/minimax_h3_audio_vae_fp32.safetensors \
   --sample_prompts sample_prompts.txt \

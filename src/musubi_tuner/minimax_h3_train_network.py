@@ -26,6 +26,7 @@ from musubi_tuner.minimax_h3.architecture import (
     VIDEO_FLOW_SHIFT,
     align_frame_count,
 )
+from musubi_tuner.minimax_h3.assets import default_text_encoder_assets
 from musubi_tuner.minimax_h3.backend import H3TrainingBackend, create_conditioning_encoder, create_training_backend
 from musubi_tuner.minimax_h3.cache import (
     H3_AUDIO_LATENTS_KEY,
@@ -170,7 +171,6 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         if args.sample_prompts:
             required = {
                 "--text_encoder": args.text_encoder,
-                "--tokenizer": args.tokenizer,
                 "--vae": args.vae,
                 "--audio_vae": args.audio_vae,
             }
@@ -584,11 +584,16 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         help="select the first/last-frame base transformer or the separate reference-conditioned transformer",
     )
     parser.add_argument("--text_encoder", type=str, help="Qwen3-VL H3 BF16 checkpoint used only for sampling prompts")
-    parser.add_argument("--tokenizer", type=str, help="official FL2VA tokenizer/processor metadata used only for sampling")
+    parser.add_argument(
+        "--tokenizer",
+        type=Path,
+        default=default_text_encoder_assets(),
+        help="H3 tokenizer/processor directory used for sampling; defaults to the metadata bundled with Musubi",
+    )
     parser.add_argument("--audio_vae", type=str, help="MiniMax H3 audio VAE checkpoint used only for sampling")
     parser.add_argument(
         "--text_encoder_quantization",
-        choices=("none", "int8", "nf4"),
+        choices=("none", "int8", "nf4", "nvfp4_awq"),
         default="none",
         help="optional Qwen3-VL quantization while pre-encoding sampling prompts",
     )

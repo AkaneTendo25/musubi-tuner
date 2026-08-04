@@ -93,7 +93,7 @@ def create_conditioning_encoder(
     task: Literal["t2va", "i2va", "fl2va", "ref2va"],
     device: str | None,
     dtype: str,
-    quantization: Literal["none", "int8", "nf4"] = "none",
+    quantization: Literal["none", "int8", "nf4", "nvfp4_awq"] = "none",
 ):
     """Load the released understanding encoder and adapt its hidden-state output to Musubi."""
     from musubi_tuner.minimax_h3.conditioning import MiniMaxH3ConditioningEncoder, load_text_conditioner
@@ -123,7 +123,7 @@ def create_generator(
     height: int | None = None,
     width: int | None = None,
     fp8_scaled: bool = False,
-    text_encoder_quantization: Literal["none", "int8", "nf4"] = "none",
+    text_encoder_quantization: Literal["none", "int8", "nf4", "nvfp4_awq"] = "none",
     blocks_to_swap: int = 0,
     block_swap_h2d_only: bool = False,
     block_swap_ring_size: int = 2,
@@ -172,7 +172,7 @@ class _NativeGenerator:
         height: int | None,
         width: int | None,
         fp8_scaled: bool,
-        text_encoder_quantization: Literal["none", "int8", "nf4"],
+        text_encoder_quantization: Literal["none", "int8", "nf4", "nvfp4_awq"],
         blocks_to_swap: int,
         block_swap_h2d_only: bool,
         block_swap_ring_size: int,
