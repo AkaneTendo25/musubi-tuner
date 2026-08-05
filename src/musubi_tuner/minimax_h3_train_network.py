@@ -114,6 +114,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         self._crepa: H3CREPA | None = None
         self._extension_video_frames = 0
         self._extension_audio_latents = 0
+        self._extension_route = "condition_rows"
         self._validation_dataloader = None
 
     @property
@@ -375,6 +376,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             raise ValueError("H3 extension context lengths must be non-negative")
         self._extension_video_frames = args.h3_extension_video_frames
         self._extension_audio_latents = args.h3_extension_audio_latents
+        self._extension_route = args.h3_extension_route
         if (args.h3_extension_video_frames or args.h3_extension_audio_latents) and args.h3_training_mode != "fl2va":
             raise ValueError("H3 extension training requires --h3_training_mode fl2va with --task t2va caches")
         if args.fp8_base and args.h3_adaln_rank is None:
@@ -685,6 +687,24 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         return get_sigmas(noise_scheduler, timesteps, device, n_dim=1, dtype=dtype).to(torch.float32)
 
     @staticmethod
+    def _clean_context(noisy, target, sigma, context_length: int, *, axis: int):
+        """Recover the clean leading latents the observed context must present.
+
+        The packed rows are already noised, so the context has to be rebuilt.
+        H3's flow gives it exactly: ``x_t = (1 - s) * x0 + s * noise`` and
+        ``target = x0 - noise`` imply ``x0 = x_t + s * target``, so no separate
+        cache of the clean span is needed.
+        """
+        if noisy is None or target is None:
+            raise ValueError("H3 extension needs both the noisy latents and their flow target")
+        shape = [1] * noisy.ndim
+        shape[0] = sigma.shape[0]
+        clean = noisy + sigma.to(device=noisy.device, dtype=noisy.dtype).view(shape) * target
+        index = [slice(None)] * noisy.ndim
+        index[axis] = slice(0, context_length)
+        return clean[tuple(index)].contiguous()
+
+    @staticmethod
     def _extension_masked(mask, target, context_length: int, *, axis: int):
         """Drop the observed leading context from a modality's loss mask."""
         if not context_length or target is None:
@@ -728,10 +748,18 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             if audio is not None:
                 audio.requires_grad_(True)
         extension_kwargs = {}
+        if self._extension_video_frames or self._extension_audio_latents:
+            extension_kwargs["extension_route"] = self._extension_route
         if self._extension_video_frames:
             extension_kwargs["extension_video_frames"] = self._extension_video_frames
+            extension_kwargs["extension_video_context"] = self._clean_context(
+                inputs.video, inputs.video_target, inputs.video_sigma, self._extension_video_frames, axis=-3
+            )
         if self._extension_audio_latents:
             extension_kwargs["extension_audio_latents"] = self._extension_audio_latents
+            extension_kwargs["extension_audio_context"] = self._clean_context(
+                inputs.audio, inputs.audio_target, inputs.audio_sigma, self._extension_audio_latents, axis=-1
+            )
         with accelerator.autocast():
             prediction = self.backend.predict_training(
                 transformer,
@@ -999,6 +1027,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             "ss_h3_caption_dropout_rate": str(args.h3_caption_dropout_rate),
             "ss_h3_extension_video_frames": str(args.h3_extension_video_frames),
             "ss_h3_extension_audio_latents": str(args.h3_extension_audio_latents),
+            "ss_h3_extension_route": args.h3_extension_route,
             "ss_h3_base_preservation_loss_weight": str(args.h3_base_preservation_loss_weight),
             "ss_h3_shift_video": str(args.h3_shift_video),
             "ss_h3_shift_audio": str(args.h3_shift_audio),
@@ -1078,6 +1107,16 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         type=int,
         default=0,
         help="leading audio latents observed as context instead of generated, training audio extension",
+    )
+    parser.add_argument(
+        "--h3_extension_route",
+        choices=("condition_rows", "per_row_sigma"),
+        default="condition_rows",
+        help=(
+            "how the observed context is presented. condition_rows duplicates it as clean rows, generalizing the "
+            "released keyframe contract. per_row_sigma pins the observed rows inside the target block, costing no "
+            "extra tokens but placing intra-block noise levels outside what the released weights have seen"
+        ),
     )
     parser.add_argument(
         "--h3_caption_dropout_rate",

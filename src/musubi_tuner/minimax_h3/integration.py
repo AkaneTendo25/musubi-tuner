@@ -508,6 +508,9 @@ class _NativeTrainingBackend:
         conditioning: Literal["prompt", "empty"] = "prompt",
         extension_video_frames: int = 0,
         extension_audio_latents: int = 0,
+        extension_video_context: torch.Tensor | None = None,
+        extension_audio_context: torch.Tensor | None = None,
+        extension_route: Literal["condition_rows", "per_row_sigma"] = "condition_rows",
     ) -> H3ModelPrediction:
         present = video_hidden_states if video_hidden_states is not None else audio_hidden_states
         if present is None:
@@ -656,10 +659,10 @@ class _NativeTrainingBackend:
                 condition_video_timestep,
             )
         else:
-            # Extension observes a leading run of the target itself, so the
-            # condition rows are sliced from the already-packed target rows
-            # rather than cached separately. The target keeps its full length;
-            # the observed span is removed from the loss by the caller.
+            # Extension observes a leading run of the target. The observed rows
+            # must be the *clean* latents: the packed target rows are already
+            # noised, so slicing them would present noise as context. The caller
+            # supplies the clean span separately.
             if extension_video_frames and extension_video_frames >= latent_frames:
                 raise ValueError(
                     f"H3 video extension needs a shorter context than the target: "
@@ -670,6 +673,24 @@ class _NativeTrainingBackend:
                     f"H3 audio extension needs a shorter context than the target: "
                     f"{extension_audio_latents} of {num_audio_latents} audio latents"
                 )
+            if extension_video_frames and extension_video_context is None:
+                raise ValueError("H3 video extension requires the clean context latents")
+            if extension_audio_latents and extension_audio_context is None:
+                raise ValueError("H3 audio extension requires the clean context latents")
+
+            # condition_rows duplicates the observed span as extra clean rows,
+            # generalizing the released keyframe contract. per_row_sigma instead
+            # pins the observed rows inside the target block, which costs no
+            # extra tokens but is not something the released weights have seen.
+            duplicate_context = extension_route == "condition_rows"
+            context_video_rows = None
+            context_audio_rows = None
+            if extension_video_frames:
+                context_video_rows = patchify_video_latents(extension_video_context, patch_size)
+                context_video_rows = 0.999 * context_video_rows + 0.001 * torch.randn_like(context_video_rows)
+            if extension_audio_latents:
+                context_audio_rows = pack_audio_latents(extension_audio_context)
+
             layout = build_t2va_packed_sequence(
                 text_tags,
                 num_latent_frames=latent_frames,
@@ -677,38 +698,61 @@ class _NativeTrainingBackend:
                 latent_width=latent_width,
                 num_audio_latents=num_audio_latents,
                 patch_size=patch_size,
-                keyframe_anchors=tuple(range(extension_video_frames)),
-                num_condition_audio_latents=extension_audio_latents,
+                keyframe_anchors=tuple(range(extension_video_frames)) if duplicate_context else (),
+                num_condition_audio_latents=extension_audio_latents if duplicate_context else 0,
             )
             condition_video_timestep = None
             condition_audio_timestep = None
-            if extension_video_frames:
-                context_rows = video_rows[:, : layout.num_condition_video_rows]
-                context_rows = 0.999 * context_rows + 0.001 * torch.randn_like(context_rows)
-                video_rows = torch.cat((context_rows, video_rows), dim=1)
-                condition_video_timestep = torch.maximum(
-                    video_timestep.reshape(1).to(model_device, torch.float32),
-                    torch.tensor([0.999], device=model_device),
-                )
-            if extension_audio_latents:
-                # Audio rows are channel-major, so the observed prefix is the
-                # opening latents of each channel rather than a flat slice.
-                per_channel = audio_rows.shape[1] // AUDIO_CHANNELS
-                context_audio = torch.cat(
-                    [
-                        audio_rows[:, channel * per_channel : channel * per_channel + extension_audio_latents]
+            row_video_timestep = video_timestep
+            row_audio_timestep = audio_timestep
+            per_row = False
+            observed_video_timestep = torch.maximum(
+                video_timestep.reshape(1).to(model_device, torch.float32),
+                torch.tensor([0.999], device=model_device),
+            )
+            observed_audio_timestep = torch.ones(1, device=model_device)
+
+            if duplicate_context:
+                if context_video_rows is not None:
+                    video_rows = torch.cat((context_video_rows, video_rows), dim=1)
+                    condition_video_timestep = observed_video_timestep
+                if context_audio_rows is not None:
+                    audio_rows = torch.cat((context_audio_rows, audio_rows), dim=1)
+                    condition_audio_timestep = observed_audio_timestep
+            else:
+                rows_per_frame = (latent_height // patch_size[1]) * (latent_width // patch_size[2])
+                if context_video_rows is not None:
+                    observed = extension_video_frames * rows_per_frame
+                    video_rows = torch.cat((context_video_rows, video_rows[:, observed:]), dim=1)
+                    row_video_timestep = video_timestep.reshape(1).expand(latent_frames * rows_per_frame).clone()
+                    row_video_timestep[:observed] = observed_video_timestep[0]
+                    per_row = True
+                if context_audio_rows is not None:
+                    per_channel = num_audio_latents
+                    kept = [
+                        torch.cat(
+                            (
+                                context_audio_rows[:, channel * extension_audio_latents : (channel + 1) * extension_audio_latents],
+                                audio_rows[:, channel * per_channel + extension_audio_latents : (channel + 1) * per_channel],
+                            ),
+                            dim=1,
+                        )
                         for channel in range(AUDIO_CHANNELS)
-                    ],
-                    dim=1,
-                )
-                audio_rows = torch.cat((context_audio, audio_rows), dim=1)
-                condition_audio_timestep = torch.ones(1, device=model_device)
+                    ]
+                    audio_rows = torch.cat(kept, dim=1)
+                    row_audio_timestep = audio_timestep.reshape(1).expand(AUDIO_CHANNELS * per_channel).clone()
+                    for channel in range(AUDIO_CHANNELS):
+                        start = channel * per_channel
+                        row_audio_timestep[start : start + extension_audio_latents] = observed_audio_timestep[0]
+                    per_row = True
+
             timestep, timestep_indices = build_row_timesteps(
                 layout,
-                video_timestep,
-                audio_timestep,
+                row_video_timestep,
+                row_audio_timestep,
                 condition_video_timestep,
                 condition_audio_timestep,
+                per_row_timesteps=per_row,
             )
         crepa = getattr(transformer, "_h3_crepa_controller", None)
         if crepa is not None and video_hidden_states is not None:

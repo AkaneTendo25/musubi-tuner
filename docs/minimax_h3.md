@@ -317,6 +317,10 @@ python minimax_h3_train_network.py \
 the complete marker/scale/INT8-weight sets, and each mixed-precision tensor before loading. Omitting the flag continues to resolve and
 load the full BF16 checkpoint through the unchanged BF16/FP8 path.
 
+For additional VRAM savings during training, pass `--gradient_checkpointing --gradient_checkpointing_cpu_offload`. H3 offloads the
+large unified video/audio activation between transformer blocks and moves it back to each block's device for recomputation. CPU
+offloading is slower than gradient checkpointing alone and should be used when sequence length would otherwise exceed available VRAM.
+
 The native loader preserves the released component precision: the Comfy video encoder is FP16 and the audio encoder is FP32.
 Normalized cache tensors default to float32, and target video/audio caches use the posterior mean for deterministic reuse. Cache
 filenames use Musubi's `mmh3` architecture short name. The latent cache contains normalized video latents, normalized stereo audio
@@ -848,9 +852,20 @@ accelerate launch minimax_h3_train_network.py ... --h3_extension_video_frames 8 
 ```
 
 The observed span is taken from the target itself, so no additional caching or dataset field is needed; an ordinary `--task t2va`
-cache is enough. Those latents are packed a second time as clean condition rows at the coordinates of the frames they duplicate,
-which is the same arrangement first-frame conditioning already uses, generalized from one anchor to a run. Video context carries
-the released conditioning noise level at timestep 0.999 and audio context passes through at timestep 1.0.
+cache is enough. The packed target rows are already noised, so the context is reconstructed from the flow identity
+`x0 = x_t + sigma * target` rather than sliced from them. Video context then carries the released conditioning noise level at
+timestep 0.999 and audio context passes through at timestep 1.0.
+
+`--h3_extension_route` selects how the context is presented:
+
+| Route | Presentation | Trade-off |
+| --- | --- | --- |
+| `condition_rows` (default) | duplicated as extra clean rows at the coordinates of the frames they observe | the released keyframe contract generalized from one anchor to a run |
+| `per_row_sigma` | pinned in place inside the target block | no extra tokens, but intra-block noise levels are outside what the released weights have seen |
+
+`condition_rows` costs sequence length proportional to the context, which matters because attention is quadratic in it.
+`per_row_sigma` avoids that entirely at the cost of leaving the released distribution. Both are available so the two can be
+compared on the same data.
 
 The observed span is removed from the loss, intersecting any mask the dataset already provides. Without that the context would
 dominate the objective whenever the continuation is short, and the model would be scored on frames it was given.

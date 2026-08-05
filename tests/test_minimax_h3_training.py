@@ -820,7 +820,8 @@ def test_h3_ref2va_packing_accepts_text_only_presentation():
     torch.testing.assert_close(layout.video_indices, torch.arange(8, 12))
 
 
-def test_native_h3_t2va_backend_runs_joint_forward_and_backward():
+@pytest.mark.parametrize("activation_cpu_offloading", [False, True])
+def test_native_h3_t2va_backend_runs_joint_forward_and_backward(activation_cpu_offloading):
     config = MiniMaxH3TransformerConfig(
         num_attention_heads=2,
         attention_head_dim=16,
@@ -838,7 +839,7 @@ def test_native_h3_t2va_backend_runs_joint_forward_and_backward():
         rope_freq_dim=2,
     )
     transformer = MiniMaxH3Transformer(config)
-    transformer.enable_gradient_checkpointing()
+    transformer.enable_gradient_checkpointing(activation_cpu_offloading)
     backend = _NativeTrainingBackend(transformer)
     video_latents = torch.randn(1, 4, 2, 4, 4)
     audio_latents = torch.randn(1, 2, 6, 3)
@@ -871,6 +872,7 @@ def test_native_h3_t2va_backend_runs_joint_forward_and_backward():
     assert torch.isfinite(result.loss)
     assert transformer.blocks[0].attn.qkv_proj.weight.grad is not None
     assert torch.isfinite(transformer.blocks[0].attn.qkv_proj.weight.grad).all()
+    assert transformer.activation_cpu_offloading is activation_cpu_offloading
 
 
 def test_native_h3_image_backend_runs_video_only_forward_and_backward():
@@ -2168,3 +2170,54 @@ def test_h3_extension_context_must_be_shorter_than_the_target():
 
     with pytest.raises(ValueError, match="covers the whole"):
         trainer._extension_masked(None, target, 7, axis=-3)
+
+
+def test_h3_extension_context_reconstructs_the_clean_latents():
+    # The packed rows are noised, so the observed context must be rebuilt from
+    # the flow identity x0 = x_t + sigma * target. Slicing the noisy rows would
+    # hand the model noise as context, which at high sigma carries no signal.
+    trainer = MiniMaxH3NetworkTrainer()
+    clean = torch.arange(1 * 2 * 4 * 1 * 1, dtype=torch.float32).reshape(1, 2, 4, 1, 1)
+    noise = torch.randn(1, 2, 4, 1, 1)
+    sigma = torch.tensor([0.8])
+    noisy = (1 - sigma) * clean + sigma * noise
+    target = clean - noise
+
+    context = trainer._clean_context(noisy, target, sigma, 2, axis=-3)
+
+    torch.testing.assert_close(context, clean[:, :, :2], rtol=1e-4, atol=1e-4)
+
+
+def test_h3_extension_context_reconstruction_holds_at_extreme_sigma():
+    # At sigma near 1 the noisy rows are almost pure noise, which is exactly the
+    # case where reusing them as context would be silently useless.
+    trainer = MiniMaxH3NetworkTrainer()
+    clean = torch.full((1, 2, 3, 1, 1), 5.0)
+    noise = torch.randn(1, 2, 3, 1, 1)
+    sigma = torch.tensor([0.999])
+    noisy = (1 - sigma) * clean + sigma * noise
+    target = clean - noise
+
+    context = trainer._clean_context(noisy, target, sigma, 1, axis=-3)
+
+    torch.testing.assert_close(context, clean[:, :, :1], rtol=1e-3, atol=1e-3)
+    assert not torch.allclose(context, noisy[:, :, :1], atol=1e-2)
+
+
+def test_h3_extension_audio_context_slices_the_latent_axis():
+    trainer = MiniMaxH3NetworkTrainer()
+    clean = torch.arange(1 * 2 * 3 * 5, dtype=torch.float32).reshape(1, 2, 3, 5)
+    noise = torch.zeros_like(clean)
+    sigma = torch.tensor([0.0])
+    target = clean - noise
+
+    context = trainer._clean_context(clean, target, sigma, 2, axis=-1)
+
+    assert context.shape == (1, 2, 3, 2)
+    torch.testing.assert_close(context, clean[..., :2])
+
+
+def test_h3_extension_route_defaults_to_the_released_contract():
+    args = create_parser().parse_args(["--dataset_config", "x", "--dit", "y"])
+
+    assert args.h3_extension_route == "condition_rows"
