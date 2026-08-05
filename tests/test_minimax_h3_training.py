@@ -41,6 +41,8 @@ from musubi_tuner.minimax_h3.packing import (
     unpatchify_video_tokens,
 )
 from musubi_tuner.minimax_h3.training import (
+    OBSERVED_AUDIO_SIGMA,
+    OBSERVED_VIDEO_SIGMA,
     H3ModelPrediction,
     guidance_consistent_prediction,
     joint_velocity_loss,
@@ -105,6 +107,76 @@ def test_h3_joint_noising_keeps_audio_synchronized_at_any_video_shift(video_shif
 
     torch.testing.assert_close(result.video_sigma, shift_sigma(base, video_shift))
     torch.testing.assert_close(result.audio_sigma, shift_sigma(base, 3.0))
+
+
+@pytest.mark.parametrize(
+    ("observed", "pinned_sigma"),
+    [("video", OBSERVED_VIDEO_SIGMA), ("audio", OBSERVED_AUDIO_SIGMA)],
+)
+def test_h3_observed_modality_is_pinned_to_the_released_conditioning_level(observed, pinned_sigma):
+    # The observed modality is read, not generated, so it leaves the sampled
+    # schedule and sits at the noise level the released transformer uses for
+    # conditioning. The generated modality keeps its own shifted schedule.
+    video = torch.zeros(1, 1, 1, 1, 2)
+    audio = torch.zeros(1, 1, 1, 2)
+    base = torch.tensor([0.5])
+
+    result = prepare_joint_noisy_inputs(
+        video,
+        audio,
+        torch.ones_like(video),
+        torch.ones_like(audio),
+        base,
+        video_shift=12.0,
+        audio_shift=3.0,
+        observed=observed,
+    )
+
+    if observed == "video":
+        torch.testing.assert_close(result.video_sigma, torch.full_like(base, pinned_sigma))
+        torch.testing.assert_close(result.audio_sigma, shift_sigma(base, 3.0))
+    else:
+        torch.testing.assert_close(result.audio_sigma, torch.full_like(base, pinned_sigma))
+        torch.testing.assert_close(result.video_sigma, shift_sigma(base, 12.0))
+
+
+def test_h3_observed_audio_passes_through_untouched():
+    # Audio conditioning rides sigma 0, so the packed rows must be the clean
+    # latents themselves and the timestep must be exactly 1.0.
+    video = torch.zeros(1, 1, 1, 1, 2)
+    audio = torch.full((1, 1, 1, 2), 0.25)
+    base = torch.tensor([0.5])
+
+    result = prepare_joint_noisy_inputs(
+        video,
+        audio,
+        torch.ones_like(video),
+        torch.ones_like(audio),
+        base,
+        observed="audio",
+    )
+
+    torch.testing.assert_close(result.audio, audio)
+    torch.testing.assert_close(result.audio_timestep, torch.ones_like(base))
+
+
+def test_h3_observed_modality_requires_both_modalities():
+    video = torch.zeros(1, 1, 1, 1, 2)
+    base = torch.tensor([0.5])
+
+    with pytest.raises(ValueError, match="requires both video and audio"):
+        prepare_joint_noisy_inputs(video, None, torch.ones_like(video), None, base, observed="audio")
+
+
+def test_h3_joint_loss_ignores_the_observed_modality():
+    # Zeroing the observed modality's weight must remove it from the objective
+    # entirely, leaving the generated modality's own mean.
+    prediction = H3ModelPrediction(video=torch.ones(1, 4), audio=torch.zeros(1, 4))
+    inputs = SimpleNamespace(video_target=torch.zeros(1, 4), audio_target=torch.ones(1, 4))
+
+    result = joint_velocity_loss(prediction, inputs, video_weight=0.0, audio_weight=1.0)
+
+    torch.testing.assert_close(result.loss, result.audio_loss)
 
 
 def test_h3_joint_noising_gives_equal_sigmas_for_equal_shifts():

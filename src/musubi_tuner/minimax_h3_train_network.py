@@ -498,6 +498,14 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         )
         is_image = has_video and not has_audio and video_latents.shape[2] == 1
 
+        observed = args.h3_observed_modality
+        if observed is not None and not (has_video and has_audio):
+            present = "video" if has_video else "audio" if has_audio else "neither"
+            raise ValueError(
+                f"--h3_observed_modality reads one modality while training the other, so batches must "
+                f"carry both; this batch carries {present}. Cache the dataset with h3_target_mode = 'av'."
+            )
+
         scheduler_args = args
         if is_image:
             patch_h, patch_w = VIDEO_DIT_PATCH_SIZE[-2:]
@@ -527,6 +535,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             # batches instead receive H3's synchronized 12/3 shifts here.
             video_shift=1.0 if is_image else args.h3_shift_video,
             audio_shift=1.0 if is_image else args.h3_shift_audio,
+            observed=observed,
         )
 
         if args.h3_guidance_distillation_scale is not None:
@@ -562,12 +571,17 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             inputs,
             video_mask=batch.get("video_loss_mask"),
             audio_mask=batch.get("audio_loss_mask"),
-            # Weighting keys on the shifted video sigma the model actually saw,
-            # not the shared unshifted coordinate.
-            sample_weight=self._sample_weight(args, inputs.video_sigma if has_video else inputs.audio_sigma),
+            # Weighting keys on the shifted sigma the model actually saw for the
+            # modality being generated, not the shared unshifted coordinate. An
+            # observed modality sits at a pinned constant and would carry no
+            # schedule information.
+            sample_weight=self._sample_weight(
+                args, inputs.audio_sigma if observed == "video" or not has_video else inputs.video_sigma
+            ),
             balance=args.h3_loss_balance,
-            video_weight=args.h3_video_loss_weight,
-            audio_weight=args.h3_audio_loss_weight,
+            # The observed modality is conditioning, not a target.
+            video_weight=0.0 if observed == "video" else args.h3_video_loss_weight,
+            audio_weight=0.0 if observed == "audio" else args.h3_audio_loss_weight,
         )
         metrics = {
             "loss/video": float(result.video_loss.detach()),
@@ -587,6 +601,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             "ss_h3_loss_balance": args.h3_loss_balance,
             "ss_h3_video_loss_weight": str(args.h3_video_loss_weight),
             "ss_h3_audio_loss_weight": str(args.h3_audio_loss_weight),
+            "ss_h3_observed_modality": str(args.h3_observed_modality or "none"),
             "ss_h3_image_flow_shift": str(args.h3_image_flow_shift or "resolution_aware"),
             "ss_h3_guidance_distillation_scale": str(args.h3_guidance_distillation_scale or "one_pass"),
             "ss_h3_shift_video": str(args.h3_shift_video),
@@ -625,6 +640,18 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     )
     parser.add_argument("--h3_video_loss_weight", type=float, default=1.0)
     parser.add_argument("--h3_audio_loss_weight", type=float, default=1.0)
+    parser.add_argument(
+        "--h3_observed_modality",
+        type=str,
+        default=None,
+        choices=["video", "audio"],
+        help=(
+            "Train one modality while the other is read as clean conditioning at the released "
+            "transformer's own conditioning noise level. 'video' trains audio from video "
+            "(video-to-audio / Foley); 'audio' trains video from audio. Requires datasets that "
+            "cache both modalities, and overrides the observed modality's loss weight to zero."
+        ),
+    )
     parser.add_argument(
         "--h3_image_flow_shift",
         type=float,

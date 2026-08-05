@@ -9,6 +9,16 @@ from musubi_tuner.minimax_h3.architecture import AUDIO_FLOW_SHIFT, VIDEO_FLOW_SH
 
 LossBalance = Literal["token", "modality"]
 H3TrainingMode = Literal["fl2va", "ref2va", "ref2va_omni"]
+ObservedModality = Literal["video", "audio"]
+
+# Noise levels the released transformer uses for a modality it reads rather than
+# generates. Video conditioning carries a trace of noise and rides timestep
+# 0.999; audio conditioning is passed through untouched at timestep 1.0.
+# ``x_t = (1 - sigma) * x0 + sigma * noise`` reproduces both exactly, so an
+# observed modality is expressed by pinning its sigma rather than by a separate
+# code path.
+OBSERVED_VIDEO_SIGMA = 0.001
+OBSERVED_AUDIO_SIGMA = 0.0
 
 
 @dataclass(frozen=True)
@@ -87,6 +97,7 @@ def prepare_joint_noisy_inputs(
     *,
     video_shift: float = VIDEO_FLOW_SHIFT,
     audio_shift: float = AUDIO_FLOW_SHIFT,
+    observed: ObservedModality | None = None,
 ) -> H3JointNoisyInputs:
     """Construct synchronized H3 video/audio flow inputs and data-pointing targets.
 
@@ -97,6 +108,11 @@ def prepare_joint_noisy_inputs(
 
     H3 uses ``x_t = (1 - sigma) * x0 + sigma * noise`` and predicts the
     data-pointing velocity ``x0 - noise``.
+
+    ``observed`` pins one modality to the noise level the released transformer
+    uses for conditioning, leaving the other on the sampled schedule. Both
+    modalities must be present, and the observed one carries no training signal,
+    so its loss weight has to be zeroed by the caller.
     """
     if video_latents is None and audio_latents is None:
         raise ValueError("H3 training requires at least one target modality")
@@ -117,9 +133,19 @@ def prepare_joint_noisy_inputs(
     if base_sigma.shape[0] != present.shape[0]:
         raise ValueError("H3 base sigma batch size must match the latents")
 
+    if observed is not None:
+        if observed not in ("video", "audio"):
+            raise ValueError(f"H3 observed modality must be 'video' or 'audio', got {observed!r}")
+        if video_latents is None or audio_latents is None:
+            raise ValueError("H3 observed-modality training requires both video and audio targets")
+
     base_sigma = base_sigma.float()
     video_sigma = _shift_unchecked(base_sigma, video_shift)
     audio_sigma = _shift_unchecked(base_sigma, audio_shift)
+    if observed == "video":
+        video_sigma = torch.full_like(base_sigma, OBSERVED_VIDEO_SIGMA)
+    elif observed == "audio":
+        audio_sigma = torch.full_like(base_sigma, OBSERVED_AUDIO_SIGMA)
     video_sigma_expanded = _expand_batch_values(video_sigma, video_latents) if video_latents is not None else None
     audio_sigma_expanded = _expand_batch_values(audio_sigma, audio_latents) if audio_latents is not None else None
 

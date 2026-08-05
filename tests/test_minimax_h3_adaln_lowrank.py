@@ -189,15 +189,17 @@ def test_factorization_follows_the_weight_device():
 
 
 def test_streaming_hook_stores_the_reduced_projection_in_the_default_dtype():
-    # Measured against the BF16 reference the reduction is already more faithful
-    # than the FP8 and INT8 paths, so bf16 storage costs nothing here.
+    # The stored dtype bounds the reduction: bf16's mantissa puts a floor under
+    # the modulation orders of magnitude above the basis error, which would cap
+    # every rank at the same accuracy. The reduced weight is small enough that
+    # float32 costs nothing worth trading that away for.
     embedder = _embedder()
     basis = build_adaln_basis(embedder, rank=8, center=False)
     hook = make_adaln_split_hook(basis, build_timestep_table(embedder, basis, 65))
 
     _, tensors = hook("blocks.0.adaln_proj.linear.weight", torch.randn(32, 96).to(torch.bfloat16))
 
-    assert tensors[0].dtype == torch.bfloat16
+    assert tensors[0].dtype == torch.float32
 
 
 def test_streaming_hook_aligns_bias_dtype_with_weight():
