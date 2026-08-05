@@ -50,8 +50,17 @@ from musubi_tuner.minimax_h3.training import (
     joint_velocity_loss,
     prepare_joint_noisy_inputs,
 )
+from musubi_tuner.minimax_h3.validation import (
+    H3ValidationAccumulator,
+    image_validation_sigma,
+    masked_squared_error_sum,
+    preserve_rng_state,
+    seed_validation_forward,
+    validation_sigma_bins,
+)
 from musubi_tuner.training.accelerator_setup import collator_class
 from musubi_tuner.training.sampling_prompts import load_prompts
+from musubi_tuner.training.validation import derive_validation_seed
 from musubi_tuner.utils import model_utils
 from musubi_tuner.utils.device_utils import clean_memory_on_device
 
@@ -82,12 +91,28 @@ class _H3DecoderBundle(torch.nn.Module):
         self.audio_decoder = audio_decoder
 
 
+class _IndexedValidationDataset(torch.utils.data.Dataset):
+    def __init__(self, dataset, indices: Sequence[int]) -> None:
+        self.dataset = dataset
+        self.indices = tuple(indices)
+
+    def __len__(self) -> int:
+        return len(self.indices)
+
+    def __getitem__(self, index: int):
+        dataset_index = self.indices[index]
+        return dataset_index, self.dataset[dataset_index]
+
+
 class MiniMaxH3NetworkTrainer(NetworkTrainer):
+    supports_validation = True
+
     def __init__(self):
         super().__init__()
         self.backend: H3TrainingBackend | None = None
         self._crepa_config: H3CREPAConfig | None = None
         self._crepa: H3CREPA | None = None
+        self._validation_dataloader = None
 
     @property
     def architecture(self) -> str:
@@ -121,6 +146,197 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         ds_for_collator = train_dataset_group if args.max_data_loader_n_workers == 0 else None
         collator = collator_class(current_epoch, ds_for_collator)
         return train_dataset_group, collator, current_epoch
+
+    def _build_validation_dataloader(self, args, accelerator):
+        validation_seed = args.validation_seed if args.validation_seed is not None else args.seed
+        with preserve_rng_state():
+            seed_validation_forward(validation_seed)
+            validation_args = copy.copy(args)
+            validation_args.h3_load_dino_features = False
+            current_epoch = Value("i", 0)
+            user_config = config_utils.load_user_config(args.validation_dataset_config)
+            dataset_group, _ = create_h3_dataset_group(
+                user_config,
+                validation_args,
+                training=True,
+                num_timestep_buckets=None,
+                shared_epoch=current_epoch,
+            )
+        if dataset_group.num_train_items == 0 or len(dataset_group) == 0:
+            raise ValueError("MiniMax H3 validation dataset contains no cached items")
+        item_count = len(dataset_group)
+        if args.max_validation_items is not None:
+            item_count = min(item_count, args.max_validation_items)
+        indices = range(accelerator.process_index, item_count, accelerator.num_processes)
+        loader_generator = torch.Generator(device="cpu")
+        loader_generator.manual_seed(validation_seed)
+        return torch.utils.data.DataLoader(
+            _IndexedValidationDataset(dataset_group, indices),
+            batch_size=None,
+            num_workers=0,
+            generator=loader_generator,
+        )
+
+    @torch.no_grad()
+    def validate(
+        self,
+        accelerator,
+        args,
+        transformer,
+        network,
+        global_step,
+        epoch,
+    ) -> None:
+        del network, epoch
+        if self.backend is None:
+            raise RuntimeError("H3 training backend is not loaded")
+        if self._validation_dataloader is None:
+            self._validation_dataloader = self._build_validation_dataloader(args, accelerator)
+
+        bins = validation_sigma_bins(
+            args.validation_timestep_bins,
+            minimum=args.validation_min_timestep / 1000.0,
+            maximum=args.validation_max_timestep / 1000.0,
+            video_shift=args.h3_shift_video,
+            audio_shift=args.h3_shift_audio,
+        )
+        observed = args.h3_observed_modality
+        video_weight = 0.0 if observed == "video" else args.h3_video_loss_weight
+        audio_weight = 0.0 if observed == "audio" else args.h3_audio_loss_weight
+        accumulator = H3ValidationAccumulator(
+            len(bins),
+            balance=args.h3_loss_balance,
+            video_weight=video_weight,
+            audio_weight=audio_weight,
+        )
+        validation_seed = args.validation_seed if args.validation_seed is not None else args.seed
+
+        with preserve_rng_state():
+            for dataset_index, batch in self._validation_dataloader:
+                latents = self.get_primary_latents(batch)
+                if latents.shape[0] != 1:
+                    raise ValueError("MiniMax H3 validation requires dataset batch_size = 1")
+                has_video = "latents" in batch or latents.ndim == 5
+                has_audio = H3_AUDIO_LATENTS_KEY in batch
+                video_source = batch.get("latents", latents if latents.ndim == 5 else None)
+                video_latents = video_source.to(accelerator.device, dtype=self.dit_dtype) if has_video else None
+                audio_latents = (
+                    batch[H3_AUDIO_LATENTS_KEY].to(accelerator.device, dtype=self.dit_dtype) if has_audio else None
+                )
+                is_image = has_video and not has_audio and video_latents.shape[2] == 1
+                if observed is not None and not (has_video and has_audio):
+                    raise ValueError("H3 observed-modality validation requires cached video and audio targets")
+
+                for sigma_bin in bins:
+                    if video_latents is not None:
+                        video_noise_seed = derive_validation_seed(
+                            validation_seed,
+                            dataset_index=dataset_index,
+                            bin_index=sigma_bin.index,
+                            stream="video-noise",
+                        )
+                        seed_validation_forward(video_noise_seed)
+                        video_noise = torch.randn_like(video_latents)
+                    else:
+                        video_noise = None
+                    if audio_latents is not None:
+                        audio_noise_seed = derive_validation_seed(
+                            validation_seed,
+                            dataset_index=dataset_index,
+                            bin_index=sigma_bin.index,
+                            stream="audio-noise",
+                        )
+                        seed_validation_forward(audio_noise_seed)
+                        audio_noise = torch.randn_like(audio_latents)
+                    else:
+                        audio_noise = None
+
+                    base_sigma = torch.tensor([sigma_bin.base_sigma], device=accelerator.device, dtype=torch.float32)
+                    if is_image:
+                        base_sigma = image_validation_sigma(
+                            base_sigma,
+                            latent_height=video_latents.shape[-2],
+                            latent_width=video_latents.shape[-1],
+                            flow_shift=args.h3_image_flow_shift,
+                        )
+                    inputs = prepare_joint_noisy_inputs(
+                        video_latents,
+                        audio_latents,
+                        video_noise,
+                        audio_noise,
+                        base_sigma,
+                        video_shift=1.0 if is_image else args.h3_shift_video,
+                        audio_shift=1.0 if is_image else args.h3_shift_audio,
+                        observed=observed,
+                    )
+
+                    forward_seed = derive_validation_seed(
+                        validation_seed,
+                        dataset_index=dataset_index,
+                        bin_index=sigma_bin.index,
+                        stream="model-forward",
+                    )
+                    seed_validation_forward(forward_seed)
+                    if args.h3_guidance_distillation_scale is not None:
+                        missing_empty = [
+                            key
+                            for key in (H3_EMPTY_TEXT_HIDDEN_KEY, H3_EMPTY_TEXT_TOKEN_TAGS_KEY)
+                            if key not in batch
+                        ]
+                        if missing_empty:
+                            raise KeyError("guidance-consistent H3 validation is missing " + ", ".join(missing_empty))
+                        empty_prediction = self._predict(
+                            accelerator,
+                            transformer,
+                            batch,
+                            inputs,
+                            conditioning="empty",
+                            gradient_checkpointing=False,
+                        )
+                    prediction = self._predict(
+                        accelerator,
+                        transformer,
+                        batch,
+                        inputs,
+                        conditioning="prompt",
+                        gradient_checkpointing=False,
+                    )
+                    guidance_multiplier = 1.0
+                    if args.h3_guidance_distillation_scale is not None:
+                        prediction = guidance_consistent_prediction(
+                            prediction, empty_prediction, args.h3_guidance_distillation_scale
+                        )
+                        if args.h3_guidance_loss_form == "contrastive":
+                            guidance_multiplier = args.h3_guidance_distillation_scale**2
+
+                    sample_weight = self._sample_weight(
+                        args, inputs.audio_sigma if observed == "video" or not has_video else inputs.video_sigma
+                    )
+                    if prediction.video is not None and inputs.video_target is not None and video_weight > 0:
+                        total, count = masked_squared_error_sum(
+                            prediction.video,
+                            inputs.video_target,
+                            batch.get("video_loss_mask"),
+                            sample_weight=sample_weight,
+                        )
+                        accumulator.add(sigma_bin.index, "video", total * guidance_multiplier, count)
+                    if prediction.audio is not None and inputs.audio_target is not None and audio_weight > 0:
+                        total, count = masked_squared_error_sum(
+                            prediction.audio,
+                            inputs.audio_target,
+                            batch.get("audio_loss_mask"),
+                            sample_weight=sample_weight,
+                        )
+                        accumulator.add(sigma_bin.index, "audio", total * guidance_multiplier, count)
+
+        reduced = accelerator.reduce(accumulator.reduction_tensor(device=accelerator.device), reduction="sum")
+        accumulator.load_reduced_tensor(reduced)
+        metrics = {f"val/{key}": value for key, value in accumulator.metrics().items()}
+        if metrics and len(accelerator.trackers) > 0:
+            accelerator.log(metrics, step=global_step)
+        accelerator.print(
+            "MiniMax H3 validation: " + ", ".join(f"{key}={value:.6g}" for key, value in metrics.items())
+        )
 
     def handle_model_specific_args(self, args: argparse.Namespace):
         self.dit_dtype = (

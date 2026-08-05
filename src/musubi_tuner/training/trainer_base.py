@@ -58,6 +58,7 @@ from musubi_tuner.training.accelerator_setup import (
     prepare_accelerator,
 )
 from musubi_tuner.training.sampling_prompts import should_sample_images
+from musubi_tuner.training.validation import ValidationEventDeduplicator, should_validate, validate_validation_args
 from musubi_tuner.training.timesteps import (
     compute_density_for_timestep_sampling,
     compute_ideogram4_shift_timestep,
@@ -100,6 +101,8 @@ class DiTOutput:
 
 
 class NetworkTrainer:
+    supports_validation = False
+
     def __init__(self):
         self.blocks_to_swap = None
         self.timestep_range_pool = []
@@ -1298,6 +1301,23 @@ class NetworkTrainer:
         """
         pass
 
+    def validate(
+        self,
+        accelerator,
+        args,
+        transformer,
+        network,
+        global_step,
+        epoch,
+    ) -> None:
+        """Run architecture-specific validation loss metrics.
+
+        Subclasses that set ``supports_validation`` must override this hook.
+        The shared loop owns scheduling and guarantees validation runs before
+        sampling when both are due.
+        """
+        raise NotImplementedError("subclass must implement `validate`")
+
     def extra_trainable_params(
         self,
         args: argparse.Namespace,
@@ -1439,6 +1459,7 @@ class NetworkTrainer:
 
         # check model specific arguments
         self.handle_model_specific_args(args)
+        validate_validation_args(args, supported=self.supports_validation)
 
         # show timesteps for debugging
         if args.show_timesteps:
@@ -2023,10 +2044,32 @@ class NetworkTrainer:
                     accelerator, args, epoch_arg, steps_arg, vae, transformer, network, sample_parameters, dit_dtype
                 )
 
-        # For --sample_at_first
-        if should_sample_images(args, global_step, epoch=0):
+        validation_events = ValidationEventDeduplicator()
+
+        def _do_validation(epoch_arg, steps_arg, *, at_start=False):
+            if not should_validate(args, steps_arg, epoch_arg, at_start=at_start):
+                return False
+            if not validation_events.claim(steps_arg, epoch_arg, at_start=at_start):
+                return False
+            self.validate(
+                accelerator,
+                args,
+                transformer,
+                network,
+                steps_arg,
+                epoch_arg,
+            )
+            return True
+
+        # Validation intentionally precedes sampling when both run at startup.
+        should_validate_at_start = should_validate(args, global_step, epoch=0, at_start=True)
+        should_sample_at_start = should_sample_images(args, global_step, epoch=0)
+        if should_validate_at_start or should_sample_at_start:
             optimizer_eval_fn()
-            _do_sample(0, global_step)
+            if should_validate_at_start:
+                _do_validation(0, global_step, at_start=True)
+            if should_sample_at_start:
+                _do_sample(0, global_step)
             optimizer_train_fn()
         if len(accelerator.trackers) > 0:
             # log empty object to commit the sample images to wandb
@@ -2125,9 +2168,12 @@ class NetworkTrainer:
                     # to avoid calling optimizer_eval_fn() too frequently, we call it only when we need to sample images or save the model
                     should_sampling = should_sample_images(args, global_step, epoch=None)
                     should_saving = args.save_every_n_steps is not None and global_step % args.save_every_n_steps == 0
+                    should_validating = should_validate(args, global_step, epoch=None)
 
-                    if should_sampling or should_saving:
+                    if should_validating or should_sampling or should_saving:
                         optimizer_eval_fn()
+                        if should_validating:
+                            _do_validation(None, global_step)
                         if should_sampling:
                             _do_sample(None, global_step)
 
@@ -2189,6 +2235,7 @@ class NetworkTrainer:
                     if args.save_state:
                         train_utils.save_and_remove_state_on_epoch_end(args, accelerator, epoch + 1)
 
+            _do_validation(epoch + 1, global_step)
             _do_sample(epoch + 1, global_step)
             optimizer_train_fn()
 

@@ -13,6 +13,8 @@ import pathlib
 import toml
 from accelerate.utils import DynamoBackend
 
+from musubi_tuner.training.validation import add_validation_args
+
 logger = logging.getLogger(__name__)
 
 
@@ -779,6 +781,7 @@ def setup_parser_common() -> argparse.ArgumentParser:
     _add_logging_args(parser)
     _add_ddp_args(parser)
     _add_sampling_args(parser)
+    add_validation_args(parser)
     _add_optimizer_args(parser)
     _add_lr_scheduler_args(parser)
     _add_memory_args(parser)

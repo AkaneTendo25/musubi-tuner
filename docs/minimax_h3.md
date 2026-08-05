@@ -470,6 +470,38 @@ it near the middle, which combined with a large video shift leaves very few step
 apply it before H3's, giving a doubly-shifted schedule; they also read only the two trailing latent dimensions, so they ignore
 H3's temporal extent entirely and are not meaningful here.
 
+### Validation loss
+
+H3 can evaluate a separate cached dataset at fixed points on the flow schedule while training:
+
+```shell
+accelerate launch minimax_h3_train_network.py ... \
+  --validation_dataset_config path/to/validation.toml \
+  --validate_at_start \
+  --validate_every_n_steps 100 \
+  --validation_timestep_bins 4 \
+  --validation_min_timestep 100 \
+  --validation_max_timestep 900 \
+  --max_validation_items 8
+```
+
+The validation TOML uses the same dataset format, target modes, and prebuilt latent/text caches as training and must use
+`batch_size = 1`. Validation is deterministic: each dataset index and timestep bin receives stable video noise, audio noise,
+and model-forward RNG streams derived from `--validation_seed` (or the training seed when omitted). Constructing or running
+validation restores the Python, NumPy, CPU Torch, and CUDA Torch RNG states, so enabling it does not change subsequent training
+randomness.
+
+Bins are equal-width midpoints between `--validation_min_timestep` and `--validation_max_timestep` in the shared *unshifted*
+base-sigma coordinate. Video and audio then receive their exact configured H3 shifts independently. Image validation uses the
+same explicit `--h3_image_flow_shift` or resolution-aware image shift as image training. Distributed workers evaluate disjoint
+dataset indices and sum exact squared-error numerators and valid-element counts before logging.
+
+TensorBoard receives `val/loss`, available `val/loss/video` and `val/loss/audio` metrics, and `val/loss/bin_NN` for every
+non-empty bin. Fully masked modalities are omitted rather than reported as NaN. `val/loss` follows the primary training flow
+objective, including loss balancing, modality weights, timestep weighting, observed-modality masking, and optional
+guidance-consistent/contrastive prediction. It intentionally excludes CREPA and base-preservation losses: those are auxiliary
+training regularizers, not held-out reconstruction quality.
+
 ### AdaLN reduction
 
 Each block's AdaLN projection reads only the timestep. It never sees tokens or content, so its
