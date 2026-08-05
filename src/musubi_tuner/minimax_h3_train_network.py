@@ -398,8 +398,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             )
         if args.compile:
             raise ValueError("MiniMax H3 training does not support compilation")
-        if not args.sdpa:
-            raise ValueError("MiniMax H3 training supports only --sdpa")
+        if not (args.sdpa or args.flash_attn or args.flash3):
+            raise ValueError("MiniMax H3 training requires --sdpa, --flash_attn, or --flash3")
         if args.split_attn:
             raise ValueError("MiniMax H3 training does not support split attention")
         if args.sample_prompts:

@@ -470,8 +470,8 @@ def create_training_backend(
     """Load the selected released transformer and adapt its training forward to Musubi."""
     if dtype != "bfloat16":
         raise ValueError("MiniMax H3 full-checkpoint training requires bfloat16 compute")
-    if attention_mode != "torch" or split_attention:
-        raise ValueError("the native MiniMax H3 backend supports only unsplit PyTorch SDPA")
+    if attention_mode not in {"torch", "flash", "flash3"} or split_attention:
+        raise ValueError("the native MiniMax H3 backend supports only unsplit SDPA, FlashAttention 2, or FlashAttention 3")
     from musubi_tuner.minimax_h3.model_loader import load_transformer
 
     transformer = load_transformer(
@@ -482,6 +482,7 @@ def create_training_backend(
         quantization_device=quantization_device,
         int8_convrot=int8_convrot,
         adaln_rank=adaln_rank,
+        attention_mode=attention_mode,
     )
     return _NativeTrainingBackend(transformer, mode)
 

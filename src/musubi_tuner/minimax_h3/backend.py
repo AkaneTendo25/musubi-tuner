@@ -46,7 +46,7 @@ class H3BackendUnavailableError(RuntimeError):
 
 
 _SUPPORTED_DTYPES = {"bfloat16", "float16", "float32"}
-_SUPPORTED_ATTENTION_MODES = {"torch"}
+_SUPPORTED_ATTENTION_MODES = {"torch", "flash", "flash3"}
 
 
 def _validate_dtype(dtype: str) -> None:
@@ -171,7 +171,7 @@ def create_training_backend(
     """
     _validate_dtype(dtype)
     if attention_mode not in _SUPPORTED_ATTENTION_MODES:
-        raise ValueError("MiniMax H3 supports only Musubi's --sdpa attention path")
+        raise ValueError("MiniMax H3 supports only --sdpa, --flash_attn, or --flash3")
     if split_attention:
         raise ValueError("MiniMax H3 does not support split attention")
     from musubi_tuner.minimax_h3.integration import create_training_backend as create_integrated_training_backend

@@ -1,14 +1,14 @@
 # Unified attention function supporting various implementations
 
+from __future__ import annotations
+
 from dataclasses import dataclass
+
 import torch
-from typing import Optional, Union
 
 try:
     import flash_attn
-    from flash_attn.flash_attn_interface import _flash_attn_forward
-    from flash_attn.flash_attn_interface import flash_attn_varlen_func
-    from flash_attn.flash_attn_interface import flash_attn_func
+    from flash_attn.flash_attn_interface import _flash_attn_forward, flash_attn_func, flash_attn_varlen_func
 except ImportError:
     flash_attn = None
     flash_attn_varlen_func = None
@@ -16,7 +16,15 @@ except ImportError:
     flash_attn_func = None
 
 try:
-    from sageattention import sageattn_varlen, sageattn
+    from flash_attn_3.flash_attn_interface import flash_attn_func as flash_attn_3_func
+except ImportError:
+    try:
+        from flash_attn_interface import flash_attn_func as flash_attn_3_func
+    except ImportError:
+        flash_attn_3_func = None
+
+try:
+    from sageattention import sageattn, sageattn_varlen
 except ImportError:
     sageattn_varlen = None
     sageattn = None
@@ -29,22 +37,22 @@ except ImportError:
 
 @dataclass
 class AttentionParams:
-    attn_mode: Optional[str] = None
+    attn_mode: str | None = None
     split_attn: bool = False
-    img_len: Optional[int] = None
-    attention_mask: Optional[torch.Tensor] = None
-    seqlens: Optional[torch.Tensor] = None
-    cu_seqlens: Optional[torch.Tensor] = None
-    max_seqlen: Optional[int] = None
+    img_len: int | None = None
+    attention_mask: torch.Tensor | None = None
+    seqlens: torch.Tensor | None = None
+    cu_seqlens: torch.Tensor | None = None
+    max_seqlen: int | None = None
 
     @staticmethod
-    def create_attention_params(attn_mode: Optional[str], split_attn: bool) -> "AttentionParams":
+    def create_attention_params(attn_mode: str | None, split_attn: bool) -> AttentionParams:
         return AttentionParams(attn_mode, split_attn)
 
     @staticmethod
     def create_attention_params_from_mask(
-        attn_mode: Optional[str], split_attn: bool, img_len: Optional[int], attention_mask: Optional[torch.Tensor]
-    ) -> "AttentionParams":
+        attn_mode: str | None, split_attn: bool, img_len: int | None, attention_mask: torch.Tensor | None
+    ) -> AttentionParams:
         if attention_mask is None:
             # No attention mask provided: assume all tokens are valid
             return AttentionParams(attn_mode, split_attn, None, None, None, None, None)
@@ -80,10 +88,10 @@ class AttentionParams:
 
 
 def attention(
-    qkv_or_q: Union[torch.Tensor, list],
-    k: Optional[torch.Tensor] = None,
-    v: Optional[torch.Tensor] = None,
-    attn_params: Optional[AttentionParams] = None,
+    qkv_or_q: torch.Tensor | list,
+    k: torch.Tensor | None = None,
+    v: torch.Tensor | None = None,
+    attn_params: AttentionParams | None = None,
     drop_rate: float = 0.0,
 ) -> torch.Tensor:
     """
@@ -104,7 +112,6 @@ def attention(
     """
     if isinstance(qkv_or_q, list):
         q, k, v = qkv_or_q
-        q: torch.Tensor = q
         qkv_or_q.clear()
         del qkv_or_q
     else:
@@ -130,16 +137,16 @@ def attention(
         and attn_params.attention_mask is not None
         and attn_params.seqlens is not None
         and (attn_params.attn_mode != "flash" and attn_params.attn_mode != "sageattn")
+        and torch.all(attn_params.seqlens == attn_params.seqlens[0])
     ):
-        if torch.all(attn_params.seqlens == attn_params.seqlens[0]):
-            seqlen = attn_params.seqlens[0].item()
-            q = q[:, :seqlen]
-            k = k[:, :seqlen]
-            v = v[:, :seqlen]
-            max_seqlen = attn_params.max_seqlen
-            attn_params = AttentionParams.create_attention_params(attn_params.attn_mode, False)  # do not in-place modify
-            attn_params.max_seqlen = max_seqlen  # keep max_seqlen for padding
-            seqlen_trimmed = True
+        seqlen = attn_params.seqlens[0].item()
+        q = q[:, :seqlen]
+        k = k[:, :seqlen]
+        v = v[:, :seqlen]
+        max_seqlen = attn_params.max_seqlen
+        attn_params = AttentionParams.create_attention_params(attn_params.attn_mode, False)  # do not in-place modify
+        attn_params.max_seqlen = max_seqlen  # keep max_seqlen for padding
+        seqlen_trimmed = True
 
     # Determine tensor layout based on attention implementation
     if attn_params.attn_mode == "torch" or (
@@ -252,6 +259,8 @@ def attention(
             x = x.view(batch_size, seqlen, x.shape[-2], x.shape[-1])  # B, L, H, D
 
     elif attn_params.attn_mode == "flash":
+        if flash_attn_func is None or flash_attn_varlen_func is None:
+            raise RuntimeError("FlashAttention was selected, but the flash-attn package is not installed")
         if attn_params.split_attn:
             x = []
             for i in range(len(q)):
@@ -283,6 +292,25 @@ def attention(
 
             # Reshape x with shape [(bxs), a, d] to [b, s, a, d]
             x = x.view(batch_size, seqlen, x.shape[-2], x.shape[-1])  # B, L, H, D
+
+    elif attn_params.attn_mode == "flash3":
+        if flash_attn_3_func is None:
+            raise RuntimeError("FlashAttention-3 was selected, but the flash-attn-3 package is not installed")
+        if attn_params.cu_seqlens is not None:
+            raise ValueError("FlashAttention-3 does not support padded batches in this attention path")
+        if attn_params.split_attn:
+            x = []
+            for i in range(len(q)):
+                x_i = flash_attn_3_func(q[i], k[i], v[i])  # B, L, H, D
+                q[i] = None
+                k[i] = None
+                v[i] = None
+                x.append(pad_fn(x_i, attn_params.max_seqlen))
+            x = torch.cat(x, dim=0)
+            q, k, v = None, None, None
+        else:
+            x = flash_attn_3_func(q, k, v)  # B, L, H, D
+            q, k, v = None, None, None
 
     else:
         # Currently only PyTorch SDPA and xformers are implemented

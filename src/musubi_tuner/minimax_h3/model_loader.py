@@ -184,6 +184,7 @@ def load_transformer(
     quantization_device: str | torch.device | None = None,
     int8_convrot: bool = False,
     adaln_rank: int | None = None,
+    attention_mode: str = "torch",
 ) -> MiniMaxH3Transformer:
     checkpoint_path = resolve_transformer_checkpoint(source, mode, int8_convrot=int8_convrot)
     config = infer_transformer_config(checkpoint_path)
@@ -226,7 +227,7 @@ def load_transformer(
         weight_transform_hooks = WeightTransformHooks(split_hook=make_adaln_split_hook(basis, table))
 
     with init_empty_weights(include_buffers=True):
-        model = MiniMaxH3Transformer(config)
+        model = MiniMaxH3Transformer(config, attention_mode=attention_mode)
 
     device = torch.device(loading_device)
     calc_device = torch.device(quantization_device) if quantization_device is not None else device

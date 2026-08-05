@@ -30,6 +30,8 @@ from torch import nn
 from torch.nn import functional as F
 from torch.utils.checkpoint import checkpoint
 
+from musubi_tuner.modules.attention import AttentionParams
+from musubi_tuner.modules.attention import attention as musubi_attention
 from musubi_tuner.modules.custom_offloading_utils import BlockSwapConfig, create_offloader
 
 MINIMAX_H3_MODALITY_COUNT = 3
@@ -140,10 +142,13 @@ class MiniMaxH3AdaLNProjection(nn.Module):
 
 
 class MiniMaxH3Attention(nn.Module):
-    def __init__(self, hidden_size: int, heads: int, head_dim: int, qk_norm_eps: float):
+    def __init__(self, hidden_size: int, heads: int, head_dim: int, qk_norm_eps: float, attention_mode: str = "torch"):
         super().__init__()
+        if attention_mode not in {"torch", "flash", "flash3"}:
+            raise ValueError(f"unsupported MiniMax H3 attention mode: {attention_mode}")
         self.heads = heads
         self.head_dim = head_dim
+        self.attention_mode = attention_mode
         self.inner_dim = heads * head_dim
         self.qkv_proj = nn.Linear(hidden_size, 3 * self.inner_dim, bias=False)
         self.q_norm = nn.RMSNorm(head_dim, eps=qk_norm_eps)
@@ -165,20 +170,29 @@ class MiniMaxH3Attention(nn.Module):
             query = _apply_rotary_emb(query, *rotary_emb)
             key = _apply_rotary_emb(key, *rotary_emb)
 
-        query = query.transpose(1, 2)
-        key = key.transpose(1, 2)
-        value = value.transpose(1, 2)
-        if attention_mask is not None:
-            attention_mask = attention_mask[None, None, :, :]
-        hidden_states = F.scaled_dot_product_attention(
-            query,
-            key,
-            value,
-            attn_mask=attention_mask,
-            dropout_p=0.0,
-            is_causal=False,
-        )
-        hidden_states = hidden_states.transpose(1, 2).flatten(2, 3).to(query.dtype)
+        if self.attention_mode in {"flash", "flash3"} and attention_mask is None:
+            hidden_states = musubi_attention(
+                [query, key, value],
+                attn_params=AttentionParams.create_attention_params(self.attention_mode, False),
+            )
+        else:
+            # Padding uses a pairwise mask which FlashAttention cannot express.
+            # Keep the exact SDPA path for that rare case instead of changing
+            # the packed-sequence semantics.
+            query = query.transpose(1, 2)
+            key = key.transpose(1, 2)
+            value = value.transpose(1, 2)
+            if attention_mask is not None:
+                attention_mask = attention_mask[None, None, :, :]
+            hidden_states = F.scaled_dot_product_attention(
+                query,
+                key,
+                value,
+                attn_mask=attention_mask,
+                dropout_p=0.0,
+                is_causal=False,
+            )
+            hidden_states = hidden_states.transpose(1, 2).flatten(2, 3).to(query.dtype)
         return self.out_proj(hidden_states)
 
 
@@ -194,7 +208,7 @@ class MiniMaxH3FeedForward(nn.Module):
 
 
 class MiniMaxH3TokenRefinerBlock(nn.Module):
-    def __init__(self, config: MiniMaxH3TransformerConfig):
+    def __init__(self, config: MiniMaxH3TransformerConfig, attention_mode: str = "torch"):
         super().__init__()
         self.norm1 = nn.RMSNorm(config.hidden_size, eps=config.norm_eps)
         self.attn = MiniMaxH3Attention(
@@ -202,6 +216,7 @@ class MiniMaxH3TokenRefinerBlock(nn.Module):
             config.num_attention_heads,
             config.attention_head_dim,
             config.qk_norm_eps,
+            attention_mode,
         )
         self.norm2 = nn.RMSNorm(config.hidden_size, eps=config.norm_eps)
         self.mlp = MiniMaxH3FeedForward(config.hidden_size, config.ffn_dim)
@@ -212,9 +227,11 @@ class MiniMaxH3TokenRefinerBlock(nn.Module):
 
 
 class MiniMaxH3TokenRefiner(nn.Module):
-    def __init__(self, config: MiniMaxH3TransformerConfig):
+    def __init__(self, config: MiniMaxH3TransformerConfig, attention_mode: str = "torch"):
         super().__init__()
-        self.blocks = nn.ModuleList([MiniMaxH3TokenRefinerBlock(config) for _ in range(config.num_refiner_layers)])
+        self.blocks = nn.ModuleList(
+            [MiniMaxH3TokenRefinerBlock(config, attention_mode) for _ in range(config.num_refiner_layers)]
+        )
         self.final_norm = nn.RMSNorm(config.hidden_size, eps=config.final_norm_eps)
 
     def forward(self, hidden_states: torch.Tensor, gradient_checkpointing: bool = False) -> torch.Tensor:
@@ -227,7 +244,7 @@ class MiniMaxH3TokenRefiner(nn.Module):
 
 
 class MiniMaxH3TransformerBlock(nn.Module):
-    def __init__(self, config: MiniMaxH3TransformerConfig):
+    def __init__(self, config: MiniMaxH3TransformerConfig, attention_mode: str = "torch"):
         super().__init__()
         self.norm1 = nn.RMSNorm(config.hidden_size, eps=config.norm_eps)
         self.attn = MiniMaxH3Attention(
@@ -235,6 +252,7 @@ class MiniMaxH3TransformerBlock(nn.Module):
             config.num_attention_heads,
             config.attention_head_dim,
             config.qk_norm_eps,
+            attention_mode,
         )
         self.norm2 = nn.RMSNorm(config.hidden_size, eps=config.norm_eps)
         self.mlp = MiniMaxH3FeedForward(config.hidden_size, config.ffn_dim)
@@ -313,7 +331,7 @@ class MiniMaxH3FinalLayer(nn.Module):
 class MiniMaxH3Transformer(nn.Module):
     """Single-stream MiniMax H3 video-audio transformer in the released key layout."""
 
-    def __init__(self, config: MiniMaxH3TransformerConfig | None = None):
+    def __init__(self, config: MiniMaxH3TransformerConfig | None = None, *, attention_mode: str = "torch"):
         super().__init__()
         self.config = config or MiniMaxH3TransformerConfig()
         config = self.config
@@ -341,8 +359,8 @@ class MiniMaxH3Transformer(nn.Module):
                 persistent=True,
             )
         self.rope = MiniMaxH3RotaryPosEmbed(config.rope_freq_dim, config.rope_theta)
-        self.token_refiner = MiniMaxH3TokenRefiner(config)
-        self.blocks = nn.ModuleList([MiniMaxH3TransformerBlock(config) for _ in range(config.num_layers)])
+        self.token_refiner = MiniMaxH3TokenRefiner(config, attention_mode)
+        self.blocks = nn.ModuleList([MiniMaxH3TransformerBlock(config, attention_mode) for _ in range(config.num_layers)])
         self.final_layer = MiniMaxH3FinalLayer(config)
         self.gradient_checkpointing = False
         self.blocks_to_swap = 0

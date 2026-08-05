@@ -7,6 +7,7 @@ from safetensors import safe_open
 from safetensors.torch import load_file, save_file
 from torch import nn
 
+import musubi_tuner.minimax_h3.model as h3_model
 import musubi_tuner.minimax_h3_train_network as h3_train_network
 from musubi_tuner.dataset.bucket import BucketBatchManager
 from musubi_tuner.dataset.image_video_dataset import ItemInfo
@@ -30,8 +31,7 @@ from musubi_tuner.minimax_h3.cache import (
 )
 from musubi_tuner.minimax_h3.crepa import H3CREPA, H3CREPAConfig, parse_crepa_config
 from musubi_tuner.minimax_h3.integration import _NativeTrainingBackend
-from musubi_tuner.minimax_h3_cache_dino_features import _save_features, dino_cache_path
-from musubi_tuner.minimax_h3.model import MiniMaxH3Transformer, MiniMaxH3TransformerConfig
+from musubi_tuner.minimax_h3.model import MiniMaxH3Attention, MiniMaxH3Transformer, MiniMaxH3TransformerConfig
 from musubi_tuner.minimax_h3.packing import (
     MiniMaxH3ReferenceGeometry,
     build_ref2va_packed_sequence,
@@ -54,6 +54,7 @@ from musubi_tuner.minimax_h3.training import (
     shift_sigma,
     unshift_sigma,
 )
+from musubi_tuner.minimax_h3_cache_dino_features import _save_features, dino_cache_path
 from musubi_tuner.minimax_h3_train_network import MiniMaxH3NetworkTrainer, create_parser
 from musubi_tuner.networks import lora_minimax_h3
 
@@ -1792,7 +1793,6 @@ def test_h3_trainer_loads_only_the_selected_training_transformer(monkeypatch, tm
     ("option", "value", "message"),
     [
         ("--compile", None, "compilation"),
-        ("--flash_attn", None, "only --sdpa"),
         ("--sdpa", "--split_attn", "split attention"),
     ],
 )
@@ -1801,6 +1801,63 @@ def test_h3_trainer_rejects_release_dependent_common_loading_modes(option, value
     args = create_parser().parse_args(argv)
     with pytest.raises(ValueError, match=message):
         MiniMaxH3NetworkTrainer().handle_model_specific_args(args)
+
+
+@pytest.mark.parametrize("option", ["--flash_attn", "--flash3"])
+def test_h3_trainer_accepts_flash_attention(option):
+    args = create_parser().parse_args([option])
+
+    MiniMaxH3NetworkTrainer().handle_model_specific_args(args)
+
+    assert args.flash_attn or args.flash3
+
+
+@pytest.mark.parametrize("attention_mode", ["flash", "flash3"])
+def test_h3_flash_attention_uses_common_maskless_backend(monkeypatch, attention_mode):
+    captured = {}
+
+    def flash_attention(qkv, *, attn_params, drop_rate=0.0):
+        query, key, value = qkv
+        captured.update(
+            query_shape=query.shape,
+            key_shape=key.shape,
+            value_shape=value.shape,
+            mode=attn_params.attn_mode,
+            split=attn_params.split_attn,
+            drop_rate=drop_rate,
+        )
+        return query.flatten(2, 3)
+
+    monkeypatch.setattr(h3_model, "musubi_attention", flash_attention)
+    module = MiniMaxH3Attention(hidden_size=16, heads=2, head_dim=8, qk_norm_eps=1e-5, attention_mode=attention_mode)
+    hidden_states = torch.randn(1, 5, 16)
+
+    output = module(hidden_states)
+
+    assert output.shape == hidden_states.shape
+    assert captured == {
+        "query_shape": torch.Size([1, 5, 2, 8]),
+        "key_shape": torch.Size([1, 5, 2, 8]),
+        "value_shape": torch.Size([1, 5, 2, 8]),
+        "mode": attention_mode,
+        "split": False,
+        "drop_rate": 0.0,
+    }
+
+
+@pytest.mark.parametrize("attention_mode", ["flash", "flash3"])
+def test_h3_flash_attention_preserves_sdpa_padding_mask_fallback(monkeypatch, attention_mode):
+    def forbidden_flash(*_args, **_kwargs):
+        raise AssertionError("pairwise padding masks must not enter FlashAttention")
+
+    monkeypatch.setattr(h3_model, "musubi_attention", forbidden_flash)
+    module = MiniMaxH3Attention(hidden_size=16, heads=2, head_dim=8, qk_norm_eps=1e-5, attention_mode=attention_mode)
+    hidden_states = torch.randn(1, 4, 16)
+    attention_mask = torch.eye(4, dtype=torch.bool)
+
+    output = module(hidden_states, attention_mask=attention_mask)
+
+    assert output.shape == hidden_states.shape
 
 
 def test_h3_trainer_maps_common_fp8_switch_to_scaled_loading_and_accepts_swap():

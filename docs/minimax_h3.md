@@ -580,6 +580,9 @@ accelerate launch minimax_h3_train_network.py \
   --logging_dir logs --log_with tensorboard --log_grad_metrics
 ```
 
+Use `--flash_attn` for FlashAttention 2 or `--flash3` for FlashAttention 3 on Hopper GPUs. Both are optional, require their
+corresponding package, and fall back to SDPA when a batch contains explicit padding.
+
 Launch TensorBoard in a second terminal while training:
 
 ```shell
