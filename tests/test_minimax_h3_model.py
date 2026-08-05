@@ -483,7 +483,9 @@ def test_h3_pruned_int8_convrot_checkpoint_contract_and_adapter_gradient(tmp_pat
     )
     state_dict = {}
     for name, tensor in model.state_dict().items():
-        dtype = torch.float32 if name.startswith(fp32_prefixes) else torch.float16 if ".adaln_proj.linear." in name else torch.bfloat16
+        dtype = (
+            torch.float32 if name.startswith(fp32_prefixes) else torch.float16 if ".adaln_proj.linear." in name else torch.bfloat16
+        )
         state_dict[name] = tensor.detach().to(dtype).contiguous()
 
     quantized_name = "blocks.0.attn.qkv_proj"
@@ -526,3 +528,56 @@ def test_h3_checkpoint_directory_resolution_keeps_existing_bf16_default(tmp_path
 
     assert resolve_transformer_checkpoint(tmp_path, "fl2va") == full
     assert resolve_transformer_checkpoint(tmp_path, "fl2va", int8_convrot=True) == pruned
+
+
+def test_h3_attention_mask_defaults_to_none_and_changes_nothing():
+    torch.manual_seed(1)
+    model = MiniMaxH3Transformer(_tiny_config())
+    inputs = _tiny_inputs()
+
+    without = model(**inputs)
+    allow_all = torch.ones(9, 9, dtype=torch.bool)
+    with_open_mask = model(**inputs, attention_mask=allow_all)
+
+    torch.testing.assert_close(without.video, with_open_mask.video)
+    torch.testing.assert_close(without.audio, with_open_mask.audio)
+
+
+def test_h3_attention_mask_actually_restricts_attention():
+    torch.manual_seed(1)
+    model = MiniMaxH3Transformer(_tiny_config())
+    inputs = _tiny_inputs()
+    causal = torch.tril(torch.ones(9, 9, dtype=torch.bool))
+
+    open_output = model(**inputs)
+    causal_output = model(**inputs, attention_mask=causal)
+
+    assert not torch.allclose(open_output.video, causal_output.video)
+
+
+def test_h3_attention_mask_cannot_re_expose_padding():
+    # The padding mask is applied on top of any caller topology, so a mask that
+    # permits everything still cannot let real tokens attend to padding.
+    torch.manual_seed(1)
+    model = MiniMaxH3Transformer(_tiny_config())
+    inputs = _tiny_inputs()
+    inputs["token_tags"] = torch.tensor([1, 1, 1, 2, 2, 2, 2, 0, -1])
+
+    padded = model(**inputs)
+    with_open_mask = model(**inputs, attention_mask=torch.ones(9, 9, dtype=torch.bool))
+
+    torch.testing.assert_close(padded.video, with_open_mask.video)
+
+
+@pytest.mark.parametrize(
+    ("mask", "message"),
+    [
+        (torch.ones(9, 9, dtype=torch.float32), "boolean"),
+        (torch.ones(4, 4, dtype=torch.bool), r"\[9, 9\]"),
+    ],
+)
+def test_h3_attention_mask_is_validated(mask, message):
+    model = MiniMaxH3Transformer(_tiny_config())
+
+    with pytest.raises(ValueError, match=message):
+        model(**_tiny_inputs(), attention_mask=mask)

@@ -482,6 +482,7 @@ class MiniMaxH3Transformer(nn.Module):
         video_indices: torch.Tensor,
         audio_indices: torch.Tensor,
         text_indices: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
     ) -> MiniMaxH3TransformerOutput:
         sequence_length = position_ids.shape[0]
         if position_ids.shape != (sequence_length, 3):
@@ -503,9 +504,20 @@ class MiniMaxH3Transformer(nn.Module):
         timestep_embedding = self._time_embedding(timestep)
         adaln_indices = timestep_indices * MINIMAX_H3_MODALITY_COUNT + token_tags.clamp(min=0)
         is_padding = token_tags < 0
-        attention_mask = None
+        # A caller-supplied topology narrows attention further; the padding mask
+        # is always applied on top so a custom mask cannot re-expose padding.
+        # ``True`` means the pair may attend, matching SDPA's boolean contract.
+        if attention_mask is not None:
+            if attention_mask.dtype is not torch.bool:
+                raise ValueError(f"H3 attention mask must be boolean, got {attention_mask.dtype}")
+            if attention_mask.shape != (sequence_length, sequence_length):
+                raise ValueError(
+                    f"H3 attention mask must be [{sequence_length}, {sequence_length}], got {tuple(attention_mask.shape)}"
+                )
+            attention_mask = attention_mask.to(device=hidden_states.device)
         if bool(is_padding.any()):
-            attention_mask = is_padding[None, :] == is_padding[:, None]
+            padding_mask = is_padding[None, :] == is_padding[:, None]
+            attention_mask = padding_mask if attention_mask is None else attention_mask & padding_mask
 
         for block_index, block in enumerate(self.blocks):
             if self.blocks_to_swap:
