@@ -2291,3 +2291,127 @@ def test_h3_masking_rejects_unsupported_modes_and_fractions():
         sample_video_mask(mode="spiral", latent_frames=2, latent_height=4, latent_width=4, generator=g)
     with pytest.raises(ValueError, match="fractions"):
         sample_video_mask(mode="box", latent_frames=2, latent_height=4, latent_width=4, generator=g, minimum=0.8, maximum=0.2)
+
+
+class _MaskRecordingBackend(_FakeBackend):
+    def __init__(self):
+        super().__init__()
+        self.observed = []
+
+    def predict_training(
+        self, transformer, batch, video_hidden_states, audio_hidden_states, video_timestep, audio_timestep, **kwargs
+    ):
+        self.observed.append(
+            (
+                kwargs.get("observed_video_rows"),
+                kwargs.get("observed_audio_rows"),
+                kwargs.get("clean_video_latents"),
+            )
+        )
+        return super().predict_training(
+            transformer,
+            batch,
+            video_hidden_states,
+            audio_hidden_states,
+            video_timestep,
+            audio_timestep,
+            conditioning=kwargs.get("conditioning", "prompt"),
+        )
+
+
+def _run_masked(mode, *, mask_audio=False, guidance_scale=None):
+    args = create_parser().parse_args([])
+    args.h3_mask_mode = mode
+    args.h3_mask_audio = mask_audio
+    args.h3_guidance_distillation_scale = guidance_scale
+    trainer = MiniMaxH3NetworkTrainer()
+    trainer.dit_dtype = torch.float32
+    backend = _MaskRecordingBackend()
+    trainer.backend = backend
+    trainer._mask_mode = mode
+    trainer._mask_audio = mask_audio
+    # A realistic patch grid: at 2x2 patches a box spanning up to 75% of each
+    # axis touches every patch, so the any() reduction would mark all rows
+    # generated and the mask would carry no information.
+    video = torch.zeros(1, 24, 4, 16, 16)
+    batch = {
+        H3_AUDIO_LATENTS_KEY: torch.zeros(1, 2, 32, 8),
+        H3_AUDIO_LOSS_MASK_KEY: torch.ones(1, 8, dtype=torch.bool),
+        "timesteps": [0.5],
+    }
+    if guidance_scale is not None:
+        batch[H3_EMPTY_TEXT_HIDDEN_KEY] = [torch.zeros(1, 5120)]
+        batch[H3_EMPTY_TEXT_TOKEN_TAGS_KEY] = [torch.ones(1, dtype=torch.long)]
+    torch.manual_seed(0)
+    loss, metrics = trainer.process_batch(
+        args,
+        _FakeAccelerator(),
+        _ScaleTransformer(),
+        None,
+        batch,
+        video,
+        torch.ones_like(video),
+        None,
+        torch.float32,
+        torch.float32,
+        None,
+        0,
+    )
+    return trainer, backend, loss
+
+
+def test_h3_masked_conditioning_marks_some_rows_observed():
+    trainer, backend, loss = _run_masked("box")
+
+    observed_video, _, clean = backend.observed[0]
+    assert observed_video is not None and clean is not None
+    assert bool(observed_video.any()) and not bool(observed_video.all())
+    assert torch.isfinite(loss)
+
+
+def test_h3_masked_conditioning_is_absent_when_disabled():
+    trainer, backend, _ = _run_masked("off")
+
+    observed_video, observed_audio, clean = backend.observed[0]
+    assert observed_video is None and observed_audio is None and clean is None
+    assert trainer._step_mask is None
+
+
+def test_h3_masked_conditioning_shares_one_mask_across_every_forward():
+    # The empty and trainable branches must agree on what is observed, or the
+    # guidance correction compares two different problems.
+    _, backend, _ = _run_masked("box", guidance_scale=4.0)
+
+    assert len(backend.observed) == 2
+    first, second = backend.observed[0][0], backend.observed[1][0]
+    torch.testing.assert_close(first, second)
+
+
+def test_h3_masked_audio_is_opt_in_alongside_video():
+    _, backend, _ = _run_masked("box", mask_audio=True)
+
+    _, observed_audio, _ = backend.observed[0]
+    assert observed_audio is not None
+    assert bool(observed_audio.any()) and not bool(observed_audio.all())
+
+
+def test_h3_mask_loss_restricts_scoring_to_the_generated_region():
+    trainer = MiniMaxH3NetworkTrainer()
+    target = torch.ones(1, 24, 4, 2, 2)
+    generated = torch.zeros(4, 2, 2, dtype=torch.bool)
+    generated[1:3] = True
+
+    mask = trainer._mask_to_loss(None, target, generated, axis=-3)
+
+    assert mask.shape == target.shape
+    assert not bool(mask[:, :, 0].any()) and bool(mask[:, :, 1:3].all())
+
+
+def test_h3_mask_rejects_combining_with_extension():
+    args = create_parser().parse_args([])
+    args.h3_mask_mode = "box"
+    args.h3_extension_video_frames = 2
+    trainer = MiniMaxH3NetworkTrainer()
+
+    with pytest.raises(ValueError, match="only one"):
+        trainer.handle_model_specific_args(args)

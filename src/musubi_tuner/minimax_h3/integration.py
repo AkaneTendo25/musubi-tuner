@@ -511,6 +511,10 @@ class _NativeTrainingBackend:
         extension_video_context: torch.Tensor | None = None,
         extension_audio_context: torch.Tensor | None = None,
         extension_route: Literal["condition_rows", "per_row_sigma"] = "condition_rows",
+        observed_video_rows: torch.Tensor | None = None,
+        observed_audio_rows: torch.Tensor | None = None,
+        clean_video_latents: torch.Tensor | None = None,
+        clean_audio_latents: torch.Tensor | None = None,
     ) -> H3ModelPrediction:
         present = video_hidden_states if video_hidden_states is not None else audio_hidden_states
         if present is None:
@@ -745,6 +749,36 @@ class _NativeTrainingBackend:
                         start = channel * per_channel
                         row_audio_timestep[start : start + extension_audio_latents] = observed_audio_timestep[0]
                     per_row = True
+
+            # A conditioning mask observes an arbitrary subset rather than a
+            # leading run, so it can only be expressed by pinning rows in place.
+            if observed_video_rows is not None:
+                if clean_video_latents is None:
+                    raise ValueError("H3 masked conditioning requires the clean video latents")
+                clean_rows = patchify_video_latents(clean_video_latents, patch_size)
+                clean_rows = 0.999 * clean_rows + 0.001 * torch.randn_like(clean_rows)
+                selected = observed_video_rows.to(video_rows.device)
+                if selected.shape != (video_rows.shape[1],):
+                    raise ValueError(
+                        f"H3 observed video mask has {tuple(selected.shape)} rows for {video_rows.shape[1]} packed rows"
+                    )
+                video_rows = torch.where(selected[None, :, None], clean_rows, video_rows)
+                row_video_timestep = video_timestep.reshape(1).expand(video_rows.shape[1]).clone()
+                row_video_timestep[selected] = observed_video_timestep[0]
+                per_row = True
+            if observed_audio_rows is not None:
+                if clean_audio_latents is None:
+                    raise ValueError("H3 masked conditioning requires the clean audio latents")
+                clean_audio = pack_audio_latents(clean_audio_latents)
+                selected = observed_audio_rows.to(audio_rows.device)
+                if selected.shape != (audio_rows.shape[1],):
+                    raise ValueError(
+                        f"H3 observed audio mask has {tuple(selected.shape)} rows for {audio_rows.shape[1]} packed rows"
+                    )
+                audio_rows = torch.where(selected[None, :, None], clean_audio, audio_rows)
+                row_audio_timestep = audio_timestep.reshape(1).expand(audio_rows.shape[1]).clone()
+                row_audio_timestep[selected] = observed_audio_timestep[0]
+                per_row = True
 
             timestep, timestep_indices = build_row_timesteps(
                 layout,

@@ -7,6 +7,7 @@ import logging
 import math
 import time
 from collections.abc import Sequence
+from types import SimpleNamespace
 from multiprocessing import Value
 from pathlib import Path
 
@@ -36,6 +37,14 @@ from musubi_tuner.minimax_h3.cache import (
 from musubi_tuner.minimax_h3.component_loader import load_audio_vae_decoder, load_video_vae_decoder
 from musubi_tuner.minimax_h3.crepa import H3CREPA, H3CREPAConfig, parse_crepa_config
 from musubi_tuner.minimax_h3.dataset import create_h3_dataset_group
+from musubi_tuner.minimax_h3.packing import AUDIO_CHANNELS
+from musubi_tuner.minimax_h3.masking import (
+    audio_mask_to_rows,
+    rows_to_latent_video_mask,
+    sample_audio_mask,
+    sample_video_mask,
+    video_mask_to_rows,
+)
 from musubi_tuner.minimax_h3.inference import (
     decode_latents_sequentially,
     denoise_fl2va,
@@ -115,6 +124,10 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         self._extension_video_frames = 0
         self._extension_audio_latents = 0
         self._extension_route = "condition_rows"
+        self._mask_mode = "off"
+        self._mask_audio = False
+        self._mask_bounds = (0.25, 0.75)
+        self._step_mask = None
         self._validation_dataloader = None
 
     @property
@@ -377,6 +390,16 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         self._extension_video_frames = args.h3_extension_video_frames
         self._extension_audio_latents = args.h3_extension_audio_latents
         self._extension_route = args.h3_extension_route
+        self._mask_mode = args.h3_mask_mode
+        self._mask_audio = args.h3_mask_audio
+        self._mask_bounds = (args.h3_mask_min_fraction, args.h3_mask_max_fraction)
+        if not 0.0 < args.h3_mask_min_fraction <= args.h3_mask_max_fraction <= 1.0:
+            raise ValueError("H3 mask fractions must satisfy 0 < min <= max <= 1")
+        masking = args.h3_mask_mode != "off" or args.h3_mask_audio
+        if masking and (args.h3_extension_video_frames or args.h3_extension_audio_latents):
+            raise ValueError("H3 masked conditioning and extension both claim the observed rows; enable only one")
+        if masking and args.h3_training_mode != "fl2va":
+            raise ValueError("H3 masked conditioning requires --h3_training_mode fl2va with --task t2va caches")
         if (args.h3_extension_video_frames or args.h3_extension_audio_latents) and args.h3_training_mode != "fl2va":
             raise ValueError("H3 extension training requires --h3_training_mode fl2va with --task t2va caches")
         if args.fp8_base and args.h3_adaln_rank is None:
@@ -687,6 +710,70 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         return get_sigmas(noise_scheduler, timesteps, device, n_dim=1, dtype=dtype).to(torch.float32)
 
     @staticmethod
+    def _clean_latents(noisy, target, sigma):
+        """Recover x0 from the noised latents and their flow target."""
+        shape = [1] * noisy.ndim
+        shape[0] = sigma.shape[0]
+        return noisy + sigma.to(device=noisy.device, dtype=noisy.dtype).view(shape) * target
+
+    def _draw_step_mask(self, inputs, patch_size):
+        """Draw one conditioning mask per step, shared by every forward it needs.
+
+        The teacher, empty and trainable branches must all see the same observed
+        region; drawing per forward would let them disagree about what is given.
+        """
+        if self._mask_mode == "off" and not self._mask_audio:
+            return None
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(int(torch.randint(0, 2**31 - 1, (1,)).item()))
+        video_rows = audio_rows = video_latent = audio_latent = None
+        if self._mask_mode != "off" and inputs.video is not None:
+            frames, height, width = inputs.video.shape[-3:]
+            latent = sample_video_mask(
+                mode=self._mask_mode,
+                latent_frames=frames,
+                latent_height=height,
+                latent_width=width,
+                generator=generator,
+                minimum=self._mask_bounds[0],
+                maximum=self._mask_bounds[1],
+            )
+            rows = video_mask_to_rows(latent, patch_size)
+            # A patch counts as generated when any latent inside it is, so the
+            # loss must score the whole patch rather than the drawn region.
+            video_latent = rows_to_latent_video_mask(
+                rows, latent_frames=frames, latent_height=height, latent_width=width, patch_size=patch_size
+            )
+            video_rows = ~rows
+        if self._mask_audio and inputs.audio is not None:
+            latent = sample_audio_mask(
+                num_audio_latents=inputs.audio.shape[-1],
+                generator=generator,
+                minimum=self._mask_bounds[0],
+                maximum=self._mask_bounds[1],
+            )
+            audio_rows = ~audio_mask_to_rows(latent, channels=AUDIO_CHANNELS)
+            audio_latent = latent
+        if video_rows is None and audio_rows is None:
+            return None
+        return SimpleNamespace(video_rows=video_rows, audio_rows=audio_rows, video_latent=video_latent, audio_latent=audio_latent)
+
+    @staticmethod
+    def _mask_to_loss(mask, target, generated, *, axis: int):
+        """Restrict a modality's loss to the generated region."""
+        if generated is None or target is None:
+            return mask
+        shape = [1] * target.ndim
+        if generated.ndim == 1:
+            shape[axis] = generated.shape[0]
+        else:
+            shape[-generated.ndim :] = list(generated.shape)
+        keep = generated.to(device=target.device).view(shape).expand_as(target)
+        if mask is None:
+            return keep
+        return keep & mask.to(device=target.device, dtype=torch.bool)
+
+    @staticmethod
     def _clean_context(noisy, target, sigma, context_length: int, *, axis: int):
         """Recover the clean leading latents the observed context must present.
 
@@ -748,6 +835,13 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             if audio is not None:
                 audio.requires_grad_(True)
         extension_kwargs = {}
+        if self._step_mask is not None:
+            if self._step_mask.video_rows is not None:
+                extension_kwargs["observed_video_rows"] = self._step_mask.video_rows
+                extension_kwargs["clean_video_latents"] = self._clean_latents(inputs.video, inputs.video_target, inputs.video_sigma)
+            if self._step_mask.audio_rows is not None:
+                extension_kwargs["observed_audio_rows"] = self._step_mask.audio_rows
+                extension_kwargs["clean_audio_latents"] = self._clean_latents(inputs.audio, inputs.audio_target, inputs.audio_sigma)
         if self._extension_video_frames or self._extension_audio_latents:
             extension_kwargs["extension_route"] = self._extension_route
         if self._extension_video_frames:
@@ -859,6 +953,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             observed=observed,
         )
 
+        self._step_mask = self._draw_step_mask(inputs, tuple(VIDEO_DIT_PATCH_SIZE))
+
         # H3 trains one item per step, so caption dropout is a single draw rather
         # than a per-sample mask. A dropped step trains the unconditional branch,
         # which is what gives the adapter a null prompt to contrast against at
@@ -950,11 +1046,17 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             inputs,
             # The observed context is given, not predicted, so it carries no
             # training signal and would otherwise dominate a short continuation.
-            video_mask=self._extension_masked(
-                batch.get("video_loss_mask"), inputs.video_target, self._extension_video_frames, axis=-3
+            video_mask=self._mask_to_loss(
+                self._extension_masked(batch.get("video_loss_mask"), inputs.video_target, self._extension_video_frames, axis=-3),
+                inputs.video_target,
+                None if self._step_mask is None else self._step_mask.video_latent,
+                axis=-3,
             ),
-            audio_mask=self._extension_masked(
-                batch.get("audio_loss_mask"), inputs.audio_target, self._extension_audio_latents, axis=-1
+            audio_mask=self._mask_to_loss(
+                self._extension_masked(batch.get("audio_loss_mask"), inputs.audio_target, self._extension_audio_latents, axis=-1),
+                inputs.audio_target,
+                None if self._step_mask is None else self._step_mask.audio_latent,
+                axis=-1,
             ),
             # Weighting keys on the shifted sigma the model actually saw for the
             # modality being generated, not the shared unshifted coordinate. An
@@ -1028,6 +1130,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             "ss_h3_extension_video_frames": str(args.h3_extension_video_frames),
             "ss_h3_extension_audio_latents": str(args.h3_extension_audio_latents),
             "ss_h3_extension_route": args.h3_extension_route,
+            "ss_h3_mask_mode": args.h3_mask_mode,
+            "ss_h3_mask_audio": str(args.h3_mask_audio),
             "ss_h3_base_preservation_loss_weight": str(args.h3_base_preservation_loss_weight),
             "ss_h3_shift_video": str(args.h3_shift_video),
             "ss_h3_shift_audio": str(args.h3_shift_audio),
@@ -1107,6 +1211,32 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         type=int,
         default=0,
         help="leading audio latents observed as context instead of generated, training audio extension",
+    )
+    parser.add_argument(
+        "--h3_mask_mode",
+        choices=("off", "box", "border", "segment"),
+        default="off",
+        help=(
+            "procedural video conditioning mask drawn per step: box trains inpainting, border trains outpainting, "
+            "segment hides a run of frames. The observed region is presented as clean context and excluded from the loss"
+        ),
+    )
+    parser.add_argument(
+        "--h3_mask_audio",
+        action="store_true",
+        help="also hide a contiguous run of audio latents, training audio inpainting alongside the video mask",
+    )
+    parser.add_argument(
+        "--h3_mask_min_fraction",
+        type=float,
+        default=0.25,
+        help="smallest fraction of each masked axis the generated region may cover",
+    )
+    parser.add_argument(
+        "--h3_mask_max_fraction",
+        type=float,
+        default=0.75,
+        help="largest fraction of each masked axis the generated region may cover",
     )
     parser.add_argument(
         "--h3_extension_route",

@@ -873,6 +873,35 @@ dominate the objective whenever the continuation is short, and the model would b
 Both counts are in **latent** units, not pixel frames, and each must be shorter than its target. The two are independent: setting
 only one trains extension for that modality while the other is generated in full from scratch.
 
+### Masked conditioning
+
+`--h3_mask_mode` hides part of the target and presents the rest as clean context, training inpainting, outpainting, and temporal
+infilling:
+
+| Mode | Hides | Task |
+| --- | --- | --- |
+| `box` | a spatial region, constant across time | inpainting |
+| `border` | everything outside an interior crop | outpainting |
+| `segment` | a contiguous run of frames | temporal infilling |
+
+```shell
+accelerate launch minimax_h3_train_network.py ... --h3_mask_mode box --h3_mask_audio
+```
+
+Masks are drawn per step rather than read from the dataset, so an ordinary `--task t2va` cache is enough and the occlusion
+distribution can be changed without re-caching. `--h3_mask_min_fraction` and `--h3_mask_max_fraction` bound the fraction of each
+masked axis the generated region covers. `--h3_mask_audio` additionally hides a run of audio latents.
+
+The observed region is presented at the released conditioning noise level, as reference media already is, and the loss scores only
+the generated region. One mask is drawn per step and shared by every forward that step needs, so the guidance and base-preservation
+branches agree with the trainable branch about what was given.
+
+Masks are reduced to the transformer's `(1, 2, 2)` patch grid, and a patch counts as generated when any latent inside it is. That
+keeps region boundaries inside the generated set, where a seam would otherwise appear, but it also coarsens the mask: at small
+latent resolutions a wide fraction range can mark every patch generated and leave nothing observed.
+
+Masked conditioning and extension both claim the observed rows, so enabling both is rejected.
+
 ### Caption dropout
 
 `--h3_caption_dropout_rate` replaces the prompt with the cached empty conditioning for a fraction of steps, so the adapter also
