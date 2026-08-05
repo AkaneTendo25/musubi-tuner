@@ -215,6 +215,26 @@ def test_ref2va_conditioning_matches_released_ordered_presentation():
     assert set(tags.tolist()) == {0, 1}
 
 
+def test_ref2va_omni_conditioning_accepts_text_only_presentation():
+    processor = _RefProcessor()
+    model = _TextModel()
+    encoder = MiniMaxH3ConditioningEncoder(processor, model, torch.bfloat16, "ref2va_omni")
+
+    result = encoder.encode_reference_prompt("text only", ())
+
+    assert result[H3_TEXT_HIDDEN_KEY].shape == (2, 5120)
+    assert result[H3_TEXT_TOKEN_TAGS_KEY].tolist() == [1, 1]
+    assert processor.tokenizer.calls == ["text only"]
+
+    item = SimpleNamespace(
+        caption="text only",
+        content=np.zeros((2, 4, 4, 3), dtype=np.uint8),
+        h3_media_assets=(),
+    )
+    cached = encoder.encode_conditioning([item])[0]
+    assert cached["varlen_mmh3_token_tags_int64"].tolist() == [1, 1]
+
+
 def test_content_conditioning_populates_video_text_cache_path(tmp_path):
     item = ItemInfo("sample.mp4", "prompt", (4, 4), (4, 4), content=np.zeros((2, 4, 4, 3), dtype=np.uint8))
 

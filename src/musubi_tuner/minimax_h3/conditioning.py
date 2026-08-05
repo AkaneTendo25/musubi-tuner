@@ -192,7 +192,7 @@ class MiniMaxH3ConditioningEncoder:
         processor: Any,
         model: Qwen3VLModel,
         output_dtype: torch.dtype,
-        task: Literal["t2va", "i2va", "fl2va", "ref2va"],
+        task: Literal["t2va", "i2va", "fl2va", "ref2va", "ref2va_omni"],
     ) -> None:
         self.processor = processor
         self.tokenizer = processor.tokenizer
@@ -354,7 +354,7 @@ class MiniMaxH3ConditioningEncoder:
         raise ValueError("H3 null conditioning needs a pad or eos token; this tokenizer defines neither")
 
     def _images_for_item(self, item: Any) -> list[Image.Image] | None:
-        if self.task in ("t2va", "ref2va"):
+        if self.task in ("t2va", "ref2va", "ref2va_omni"):
             return None
         content = item.content
         minimum_frames = 1 if self.task == "i2va" else 2
@@ -378,8 +378,8 @@ class MiniMaxH3ConditioningEncoder:
         prompt: str,
         references: tuple[H3PreparedReference, ...],
     ) -> dict[str, torch.Tensor]:
-        """Encode one Ref2VA prompt and its ordered multimodal presentation."""
-        if not references:
+        """Encode one Ref2VA prompt and its optional ordered reference presentation."""
+        if not references and self.task != "ref2va_omni":
             raise ValueError("MiniMax H3 Ref2VA conditioning requires at least one reference")
         hidden, tags = self._encode_prompt(prompt, references=references)
         return {H3_TEXT_HIDDEN_KEY: hidden, H3_TEXT_TOKEN_TAGS_KEY: tags}
@@ -388,7 +388,7 @@ class MiniMaxH3ConditioningEncoder:
         dtype_name = dtype_to_str(self.output_dtype)
         results = []
         for item in batch:
-            references = prepare_references(item) if self.task == "ref2va" else None
+            references = prepare_references(item) if self.task in ("ref2va", "ref2va_omni") else None
             if self.task == "ref2va" and not references:
                 raise ValueError("MiniMax H3 Ref2VA conditioning requires at least one reference")
             hidden, tags = self._encode_prompt(item.caption, self._images_for_item(item), references)

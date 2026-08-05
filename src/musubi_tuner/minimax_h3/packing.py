@@ -282,8 +282,6 @@ def build_ref2va_packed_sequence(
     patch_size: tuple[int, int, int],
 ) -> MiniMaxH3PackedSequence:
     """Build Ref2VA's ordered ``[text | references | target audio | target video]`` layout."""
-    if not references:
-        raise ValueError("H3 Ref2VA packing requires at least one reference")
     if text_token_tags.ndim != 1 or text_token_tags.numel() == 0:
         raise ValueError("H3 Ref2VA text token tags must be a non-empty vector")
     patch_t, patch_h, patch_w = patch_size

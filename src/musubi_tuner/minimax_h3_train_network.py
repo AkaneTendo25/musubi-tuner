@@ -599,9 +599,9 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     parser.description = "Train a MiniMax H3 LoRA with synchronized video and audio flow matching"
     parser.add_argument(
         "--h3_training_mode",
-        choices=("fl2va", "ref2va"),
+        choices=("fl2va", "ref2va", "ref2va_omni"),
         default="fl2va",
-        help="select the first/last-frame base transformer or the separate reference-conditioned transformer",
+        help="select FL2VA, strict Ref2VA, or experimental zero-or-more-reference Ref2VA training",
     )
     parser.add_argument("--text_encoder", type=str, help="Qwen3-VL H3 BF16 checkpoint used only for sampling prompts")
     parser.add_argument(

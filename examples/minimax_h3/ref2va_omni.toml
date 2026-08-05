@@ -1,0 +1,15 @@
+# Experimental Ref2VA training with zero-or-more ordered references per target.
+# Cache text with --task ref2va_omni and train with --h3_training_mode ref2va_omni.
+# JSONL rows may omit control_path_N entirely or provide contiguous control_path_0, control_path_1, ... fields.
+
+[general]
+resolution = [1344, 768]
+caption_extension = ".txt"
+batch_size = 1
+enable_bucket = true
+
+[[datasets]]
+video_jsonl_file = "/path/to/ref2va_omni.jsonl"
+cache_directory = "/path/to/ref2va_omni_cache"
+target_frames = [124]
+frame_extraction = "head"

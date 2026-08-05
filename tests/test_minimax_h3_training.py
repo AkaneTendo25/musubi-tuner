@@ -305,6 +305,24 @@ def test_h3_ref2va_packing_preserves_reference_order_and_shared_rotary_clock():
     assert bool((indices[layout.audio_indices[10:]] == 1).all())
 
 
+def test_h3_ref2va_packing_accepts_text_only_presentation():
+    layout = build_ref2va_packed_sequence(
+        torch.ones(4, dtype=torch.long),
+        (),
+        num_latent_frames=1,
+        latent_height=4,
+        latent_width=4,
+        num_audio_latents=2,
+        patch_size=(1, 2, 2),
+    )
+
+    assert layout.sequence_length == 12
+    assert layout.num_condition_video_rows == 0
+    assert layout.num_condition_audio_rows == 0
+    torch.testing.assert_close(layout.audio_indices, torch.arange(4, 8))
+    torch.testing.assert_close(layout.video_indices, torch.arange(8, 12))
+
+
 def test_native_h3_t2va_backend_runs_joint_forward_and_backward():
     config = MiniMaxH3TransformerConfig(
         num_attention_heads=2,
@@ -515,7 +533,8 @@ def test_native_h3_i2va_backend_requires_recached_keyframe_latents():
         )
 
 
-def test_native_h3_ref2va_backend_runs_target_only_forward_and_backward():
+@pytest.mark.parametrize("mode", ["ref2va", "ref2va_omni"])
+def test_native_h3_ref2va_backend_runs_target_only_forward_and_backward(mode):
     config = MiniMaxH3TransformerConfig(
         num_attention_heads=2,
         attention_head_dim=16,
@@ -533,13 +552,13 @@ def test_native_h3_ref2va_backend_runs_target_only_forward_and_backward():
         rope_freq_dim=2,
     )
     transformer = MiniMaxH3Transformer(config)
-    backend = _NativeTrainingBackend(transformer, mode="ref2va")
+    backend = _NativeTrainingBackend(transformer, mode=mode)
     video = torch.randn(1, 4, 1, 2, 2)
     audio = torch.randn(1, 2, 6, 1)
     batch = {
         H3_TEXT_HIDDEN_KEY: [torch.randn(3, 8)],
         H3_TEXT_TOKEN_TAGS_KEY: [torch.tensor([1, 0, 1])],
-        H3_CONDITIONING_TASK_KEY: [torch.tensor(H3_CONDITIONING_TASK_IDS["ref2va"])],
+        H3_CONDITIONING_TASK_KEY: [torch.tensor(H3_CONDITIONING_TASK_IDS[mode])],
         H3_REFERENCE_KINDS_KEY: [torch.tensor([0, 2])],
         H3_REFERENCE_VIDEO_SHAPES_KEY: [torch.tensor([[1, 2, 2], [0, 0, 0]])],
         H3_REFERENCE_AUDIO_LENGTHS_KEY: [torch.tensor([0, 1])],
@@ -611,7 +630,47 @@ def test_native_h3_backend_runs_modality_only_forward_and_backward(target):
     assert transformer.blocks[0].attn.qkv_proj.weight.grad is not None
 
 
-def test_native_h3_ref2va_backend_rejects_text_only_conditioning_cache():
+def test_native_h3_ref2va_omni_backend_runs_text_only_forward_and_backward():
+    config = MiniMaxH3TransformerConfig(
+        num_attention_heads=2,
+        attention_head_dim=16,
+        hidden_size=24,
+        num_layers=2,
+        num_refiner_layers=2,
+        ffn_dim=32,
+        in_channels=4,
+        audio_in_channels=6,
+        patch_size=(1, 2, 2),
+        text_dim=8,
+        freq_dim=8,
+        time_embed_hidden_dim=24,
+        time_embed_dim=16,
+        rope_freq_dim=2,
+    )
+    transformer = MiniMaxH3Transformer(config)
+    backend = _NativeTrainingBackend(transformer, mode="ref2va_omni")
+    batch = {
+        H3_TEXT_HIDDEN_KEY: [torch.randn(2, 8)],
+        H3_TEXT_TOKEN_TAGS_KEY: [torch.ones(2, dtype=torch.long)],
+        H3_CONDITIONING_TASK_KEY: [torch.tensor(H3_CONDITIONING_TASK_IDS["ref2va_omni"])],
+    }
+
+    prediction = backend.predict_training(
+        transformer,
+        batch,
+        torch.randn(1, 4, 1, 2, 2),
+        torch.randn(1, 2, 6, 1),
+        torch.tensor([0.5]),
+        torch.tensor([0.5]),
+    )
+    loss = prediction.video.square().mean() + prediction.audio.square().mean()
+    loss.backward()
+
+    assert torch.isfinite(loss)
+    assert transformer.blocks[0].attn.qkv_proj.weight.grad is not None
+
+
+def test_native_h3_strict_ref2va_still_rejects_text_only_conditioning():
     transformer = SimpleNamespace(config=SimpleNamespace(in_channels=4, audio_in_channels=6, text_dim=8))
     backend = _NativeTrainingBackend(transformer, mode="ref2va")
     batch = {
@@ -620,7 +679,7 @@ def test_native_h3_ref2va_backend_rejects_text_only_conditioning_cache():
         H3_CONDITIONING_TASK_KEY: [torch.tensor(H3_CONDITIONING_TASK_IDS["ref2va"])],
     }
 
-    with pytest.raises(ValueError, match="--task ref2va"):
+    with pytest.raises(ValueError, match="reference presentation"):
         backend.predict_training(
             transformer,
             batch,

@@ -167,6 +167,7 @@ Complete dataset examples are provided for every implemented training task:
 | First-frame I2V | [`i2va.toml`](../examples/minimax_h3/i2va.toml) | FL2VA | `i2va` | `fl2va` (default) |
 | First+last-frame video | [`fl2va.toml`](../examples/minimax_h3/fl2va.toml) | FL2VA | `fl2va` | `fl2va` (default) |
 | Arbitrary references | [`ref2va.toml`](../examples/minimax_h3/ref2va.toml) | Ref2VA | `ref2va` | `ref2va` |
+| Mixed zero-or-more references (experimental) | [`ref2va_omni.toml`](../examples/minimax_h3/ref2va_omni.toml) | Ref2VA | `ref2va_omni` | `ref2va_omni` |
 
 The first three tasks use the target video alone. Ref2VA additionally resolves ordered reference media through Musubi's existing
 control fields.
@@ -223,6 +224,13 @@ python minimax_h3_cache_text_encoder_outputs.py \
 
 For Ref2VA, the latent-cache command is unchanged and automatically encodes attached references. Change the text-cache command to
 `--task ref2va`; it builds the ordered reference presentation and caches its Qwen3-VL vision/text rows.
+
+Experimental `ref2va_omni` training uses the same released Ref2VA checkpoint and packing, but permits each item to contain zero,
+one, or multiple ordered references. Cache its conditioning with `--task ref2va_omni`, then train with
+`--h3_training_mode ref2va_omni`. A zero-reference item is packed as `[text | target audio | target video]`; non-empty items keep
+the released Ref2VA layout. This mode does not reinterpret one or two arbitrary references as FL2VA's native first/last keyframe
+anchors, and it does not combine the FL2VA and Ref2VA transformers. It is an experimental way to teach one Ref2VA adapter across
+mixed conditioning presentations; output quality and semantic equivalence to native FL2VA still require sampling evaluation.
 
 For ordinary first-frame I2V, use the same FL2VA transformer and latent-cache command, but cache text conditioning with
 `--task i2va`. Use `--task fl2va` for first+last-frame conditioning. Both modes take their keyframes from the target video itself;
@@ -293,7 +301,8 @@ crop-specific and uses `varlen_mmh3_*` tensors. `--task t2va` stores the raw-cap
 crop's first image, and `--task fl2va` adds its first and last images, including their vision rows and modality tags. The latent
 cache always stores both target keyframe rows so it can be paired with either conditioning task. `--task ref2va` stores the released ordered
 `<Picture i>` / `<Audio j>` / `<Video k>` presentation, while its VAE cache stores the corresponding clean reference rows and
-geometry. Empty-text conditioning is stored only when `--cache_guidance_empty` is requested.
+geometry. `--task ref2va_omni` uses the same presentation when references exist and stores text-only conditioning when they do not.
+Empty-text conditioning is stored only when `--cache_guidance_empty` is requested.
 
 ## Backend boundary
 
@@ -331,6 +340,10 @@ Ref2VA selects the dedicated released transformer with `--h3_training_mode ref2v
 `[text | ordered reference blocks | target audio | target video]`. Image and video anchors use the released sampled-posterior VAE
 recipe and fixed `t=0.999` noise augmentation; reference audio stays clean at `t=1`. Only generated target rows contribute to the
 loss.
+
+`--h3_training_mode ref2va_omni` is an opt-in extension of that path. It accepts matching `--task ref2va_omni` caches with
+zero-or-more references while strict `ref2va` continues to require at least one reference. The standard `fl2va`, `i2va`, and
+`ref2va` contracts are unchanged.
 
 > [!IMPORTANT]
 > Ref2VA uses the same transformer parameter count as T2VA, so its fixed weight residency is unchanged. Its activation memory can

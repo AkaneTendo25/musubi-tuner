@@ -541,7 +541,12 @@ class _NativeTrainingBackend:
         task_id = int(conditioning_task.detach().cpu())
         task_by_id = {value: key for key, value in H3_CONDITIONING_TASK_IDS.items()}
         task = task_by_id.get(task_id)
-        accepted_tasks = {"ref2va"} if self.mode == "ref2va" else {"t2va", "i2va", "fl2va"}
+        if self.mode == "ref2va":
+            accepted_tasks = {"ref2va"}
+        elif self.mode == "ref2va_omni":
+            accepted_tasks = {"ref2va_omni"}
+        else:
+            accepted_tasks = {"t2va", "i2va", "fl2va"}
         if task not in accepted_tasks:
             expected = ", ".join(f"--task {name}" for name in sorted(accepted_tasks))
             raise ValueError(f"MiniMax H3 {self.mode} training requires {expected} conditioning; re-cache text outputs")
@@ -574,7 +579,7 @@ class _NativeTrainingBackend:
             num_audio_latents = audio_hidden_states.shape[-1]
         if num_audio_latents == 0 and (self.mode != "fl2va" or task != "t2va"):
             raise ValueError("MiniMax H3 image training currently requires the FL2VA transformer with --task t2va caches")
-        if self.mode == "ref2va":
+        if self.mode in ("ref2va", "ref2va_omni"):
             references, reference_video, reference_audio = self._reference_cache(
                 batch,
                 patch_size=patch_size,
@@ -702,12 +707,31 @@ class _NativeTrainingBackend:
         device: torch.device,
         dtype: torch.dtype,
     ) -> tuple[tuple[MiniMaxH3ReferenceGeometry, ...], torch.Tensor, torch.Tensor]:
+        reference_keys = {
+            H3_REFERENCE_KINDS_KEY,
+            H3_REFERENCE_VIDEO_SHAPES_KEY,
+            H3_REFERENCE_AUDIO_LENGTHS_KEY,
+            H3_REFERENCE_VIDEO_ROWS_KEY,
+            H3_REFERENCE_AUDIO_ROWS_KEY,
+        }
+        present_keys = reference_keys.intersection(batch)
+        if not present_keys:
+            if self.mode != "ref2va_omni":
+                raise KeyError(f"MiniMax H3 Ref2VA training cache is missing {H3_REFERENCE_KINDS_KEY}")
+            return (
+                (),
+                torch.empty((0, video_width), device=device, dtype=dtype),
+                torch.empty((0, audio_width), device=device, dtype=dtype),
+            )
+        if present_keys != reference_keys:
+            missing = ", ".join(sorted(reference_keys - present_keys))
+            raise KeyError(f"H3 Ref2VA cache has a partial reference bundle; missing {missing}")
         kinds = self._one_conditioning_item(batch, H3_REFERENCE_KINDS_KEY, expected_ndim=1).to(torch.long)
         video_shapes = self._one_conditioning_item(batch, H3_REFERENCE_VIDEO_SHAPES_KEY, expected_ndim=2).to(torch.long)
         audio_lengths = self._one_conditioning_item(batch, H3_REFERENCE_AUDIO_LENGTHS_KEY, expected_ndim=1).to(torch.long)
         video_rows = self._one_conditioning_item(batch, H3_REFERENCE_VIDEO_ROWS_KEY, expected_ndim=2)
         audio_rows = self._one_conditioning_item(batch, H3_REFERENCE_AUDIO_ROWS_KEY, expected_ndim=2)
-        if kinds.numel() == 0 or video_shapes.shape != (kinds.numel(), 3) or audio_lengths.shape != kinds.shape:
+        if video_shapes.shape != (kinds.numel(), 3) or audio_lengths.shape != kinds.shape:
             raise ValueError("H3 Ref2VA cache has inconsistent reference metadata")
         kind_values = kinds.detach().cpu().tolist()
         shape_values = video_shapes.detach().cpu().tolist()

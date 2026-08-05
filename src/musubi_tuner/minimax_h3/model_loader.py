@@ -7,11 +7,6 @@ from pathlib import Path
 import torch
 from accelerate import init_empty_weights
 
-from musubi_tuner.minimax_h3.int8_convrot import (
-    enable_int8_convrot,
-    load_comfy_int8_convrot_state_dict,
-    prepare_int8_convrot_modules,
-)
 from musubi_tuner.minimax_h3.adaln_lowrank import (
     DEFAULT_TABLE_POINTS,
     build_adaln_basis,
@@ -19,6 +14,11 @@ from musubi_tuner.minimax_h3.adaln_lowrank import (
     make_adaln_split_hook,
     read_time_embedder,
     reconstruction_error,
+)
+from musubi_tuner.minimax_h3.int8_convrot import (
+    enable_int8_convrot,
+    load_comfy_int8_convrot_state_dict,
+    prepare_int8_convrot_modules,
 )
 from musubi_tuner.minimax_h3.model import MiniMaxH3TimeEmbedder, MiniMaxH3Transformer, MiniMaxH3TransformerConfig
 from musubi_tuner.minimax_h3.training import H3TrainingMode
@@ -35,6 +35,10 @@ _CHECKPOINT_FILENAMES: dict[H3TrainingMode, dict[bool, str]] = {
         True: "minimax_h3_fl2va_pruned_int8_convrot.safetensors",
     },
     "ref2va": {
+        False: "minimax_h3_ref2va_bf16.safetensors",
+        True: "minimax_h3_ref2va_pruned_int8_convrot.safetensors",
+    },
+    "ref2va_omni": {
         False: "minimax_h3_ref2va_bf16.safetensors",
         True: "minimax_h3_ref2va_pruned_int8_convrot.safetensors",
     },
@@ -127,12 +131,13 @@ def validate_transformer_checkpoint(
     actual = {tensor.name: tensor for tensor in actual_tensors}
 
     marker_bases, scale_bases, quantized_bases = _int8_checkpoint_bases(actual)
-    if marker_bases or scale_bases or quantized_bases:
-        if not marker_bases or marker_bases != scale_bases or marker_bases != quantized_bases:
-            raise CheckpointInspectionError(
-                "MiniMax H3 INT8 checkpoint has inconsistent marker, scale, or weight sets: "
-                f"markers={len(marker_bases)}, scales={len(scale_bases)}, weights={len(quantized_bases)}"
-            )
+    if (marker_bases or scale_bases or quantized_bases) and (
+        not marker_bases or marker_bases != scale_bases or marker_bases != quantized_bases
+    ):
+        raise CheckpointInspectionError(
+            "MiniMax H3 INT8 checkpoint has inconsistent marker, scale, or weight sets: "
+            f"markers={len(marker_bases)}, scales={len(scale_bases)}, weights={len(quantized_bases)}"
+        )
     auxiliary = {name for name in actual if name.endswith((".comfy_quant", ".weight_scale"))}
     actual_model_keys = set(actual) - auxiliary
 
