@@ -951,8 +951,11 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             "loss/audio": float((result.audio_loss * guidance_loss_multiplier).detach()),
             "h3/sigma_video": float(inputs.video_sigma.mean().detach()),
             "h3/sigma_audio": float(inputs.audio_sigma.mean().detach()),
-            "h3/caption_dropped": float(conditioning == "empty"),
         }
+        if args.h3_caption_dropout_rate > 0:
+            # Only reported when the feature is on, so an existing run's metric
+            # set is unchanged.
+            metrics["h3/caption_dropped"] = float(conditioning == "empty")
         loss = result.loss * guidance_loss_multiplier
         if reference_prediction is not None:
             preservation = joint_prediction_loss(

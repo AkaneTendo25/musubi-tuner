@@ -1601,7 +1601,7 @@ def test_h3_trainer_joint_process_batch_routes_optional_guidance(guidance_scale,
     assert backend.calls == expected_calls
     assert torch.isfinite(loss)
     assert transformer.scale.grad is not None and torch.isfinite(transformer.scale.grad)
-    assert set(metrics) == {"loss/video", "loss/audio", "h3/sigma_video", "h3/sigma_audio", "h3/caption_dropped"}
+    assert set(metrics) == {"loss/video", "loss/audio", "h3/sigma_video", "h3/sigma_audio"}
     assert metrics["loss/audio"] == 0.0
 
 
@@ -1649,7 +1649,11 @@ def test_h3_caption_dropout_selects_the_conditioning_branch(rate, expected):
     backend, _, metrics = _run_caption_dropout(rate)
 
     assert backend.calls == [(expected, True)]
-    assert metrics["h3/caption_dropped"] == float(expected == "empty")
+    if rate > 0:
+        assert metrics["h3/caption_dropped"] == float(expected == "empty")
+    else:
+        # A run that does not use dropout keeps exactly its previous metric set.
+        assert "h3/caption_dropped" not in metrics
 
 
 def test_h3_caption_dropout_skips_the_guidance_correction():
