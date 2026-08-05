@@ -113,6 +113,22 @@ class _IndexedValidationDataset(torch.utils.data.Dataset):
         return dataset_index, self.dataset[dataset_index]
 
 
+def _parse_keyframe_anchors(spec: str) -> tuple[int | str, ...]:
+    """Parse a keyframe anchor spec into 'first'/'last' markers and frame indices."""
+    if not spec:
+        return ()
+    anchors: list[int | str] = []
+    for piece in spec.split(","):
+        token = piece.strip()
+        if token in ("first", "last"):
+            anchors.append(token)
+        elif token.lstrip("-").isdigit():
+            anchors.append(int(token))
+        else:
+            raise ValueError(f"H3 keyframe anchor {token!r} must be 'first', 'last', or a latent frame index")
+    return tuple(anchors)
+
+
 class MiniMaxH3NetworkTrainer(NetworkTrainer):
     supports_validation = True
 
@@ -124,6 +140,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         self._extension_video_frames = 0
         self._extension_audio_latents = 0
         self._extension_route = "condition_rows"
+        self._keyframe_anchors: tuple[int | str, ...] = ()
+        self._keyframe_random_count = 0
         self._mask_mode = "off"
         self._mask_audio = False
         self._mask_bounds = (0.25, 0.75)
@@ -392,6 +410,19 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         self._extension_video_frames = args.h3_extension_video_frames
         self._extension_audio_latents = args.h3_extension_audio_latents
         self._extension_route = args.h3_extension_route
+        self._keyframe_anchors = _parse_keyframe_anchors(args.h3_keyframe_anchors)
+        self._keyframe_random_count = args.h3_keyframe_random_count
+        if args.h3_keyframe_random_count < 0:
+            raise ValueError("--h3_keyframe_random_count cannot be negative")
+        if self._keyframe_anchors and args.h3_keyframe_random_count:
+            raise ValueError("H3 keyframe anchors are either listed or drawn at random, not both")
+        keyframes = bool(self._keyframe_anchors) or bool(args.h3_keyframe_random_count)
+        if keyframes and (args.h3_extension_video_frames or args.h3_extension_audio_latents):
+            raise ValueError("H3 keyframe conditioning and extension both claim the observed rows; enable only one")
+        if keyframes and (args.h3_mask_mode != "off" or args.h3_mask_audio):
+            raise ValueError("H3 keyframe conditioning and masked conditioning both claim the observed rows; enable only one")
+        if keyframes and args.h3_training_mode != "fl2va":
+            raise ValueError("H3 keyframe conditioning requires --h3_training_mode fl2va with --task t2va caches")
         self._mask_mode = args.h3_mask_mode
         self._mask_audio = args.h3_mask_audio
         self._mask_bounds = (args.h3_mask_min_fraction, args.h3_mask_max_fraction)
@@ -711,6 +742,25 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             return ((timesteps.to(device=device, dtype=torch.float32) - 1.0) / 1000.0).clamp(0.0, 1.0)
         return get_sigmas(noise_scheduler, timesteps, device, n_dim=1, dtype=dtype).to(torch.float32)
 
+    def _resolve_keyframe_anchors(self, video) -> tuple[int, ...]:
+        """Resolve this step's conditioning anchors to sorted latent-frame indices."""
+        if video is None:
+            return ()
+        frames = video.shape[-3]
+        if self._keyframe_random_count:
+            count = min(self._keyframe_random_count, frames)
+            drawn = torch.randperm(frames, device="cpu")[:count]
+            return tuple(sorted(int(index) for index in drawn))
+        resolved = []
+        for anchor in self._keyframe_anchors:
+            index = 0 if anchor == "first" else frames - 1 if anchor == "last" else int(anchor)
+            if not 0 <= index < frames:
+                raise ValueError(f"H3 keyframe anchor {anchor} is outside the {frames} target latent frames")
+            resolved.append(index)
+        if len(set(resolved)) != len(resolved):
+            raise ValueError("H3 keyframe anchors resolved to duplicate latent frames")
+        return tuple(sorted(resolved))
+
     @staticmethod
     def _clean_latents(noisy, target, sigma):
         """Recover x0 from the noised latents and their flow target."""
@@ -837,6 +887,12 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             if audio is not None:
                 audio.requires_grad_(True)
         extension_kwargs = {}
+        anchors = self._resolve_keyframe_anchors(inputs.video)
+        if anchors:
+            extension_kwargs["condition_video_anchors"] = anchors
+            extension_kwargs["extension_video_context"] = self._clean_latents(
+                inputs.video, inputs.video_target, inputs.video_sigma
+            ).index_select(-3, torch.tensor(anchors, device=inputs.video.device))
         if self._step_mask is not None:
             if self._step_mask.video_rows is not None:
                 extension_kwargs["observed_video_rows"] = self._step_mask.video_rows
@@ -1137,6 +1193,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             "ss_h3_extension_video_frames": str(args.h3_extension_video_frames),
             "ss_h3_extension_audio_latents": str(args.h3_extension_audio_latents),
             "ss_h3_extension_route": args.h3_extension_route,
+            "ss_h3_keyframe_anchors": args.h3_keyframe_anchors or "none",
+            "ss_h3_keyframe_random_count": str(args.h3_keyframe_random_count),
             "ss_h3_mask_mode": args.h3_mask_mode,
             "ss_h3_mask_audio": str(args.h3_mask_audio),
             "ss_h3_base_preservation_loss_weight": str(args.h3_base_preservation_loss_weight),
@@ -1220,6 +1278,22 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         type=int,
         default=0,
         help="leading audio latents observed as context instead of generated, training audio extension",
+    )
+    parser.add_argument(
+        "--h3_keyframe_anchors",
+        type=str,
+        default="",
+        help=(
+            "comma-separated conditioning frames given as clean context, each 'first', 'last', or a latent frame "
+            "index, for example 'first,last' or '0,11,21'. Generalizes first/last keyframe conditioning to any set, "
+            "training interpolation between arbitrary anchors"
+        ),
+    )
+    parser.add_argument(
+        "--h3_keyframe_random_count",
+        type=int,
+        default=0,
+        help="draw this many distinct conditioning frames at random each step instead of listing them",
     )
     parser.add_argument(
         "--h3_mask_mode",

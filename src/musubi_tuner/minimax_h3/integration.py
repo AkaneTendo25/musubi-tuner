@@ -508,6 +508,7 @@ class _NativeTrainingBackend:
         conditioning: Literal["prompt", "empty"] = "prompt",
         extension_video_frames: int = 0,
         extension_audio_latents: int = 0,
+        condition_video_anchors: tuple[int, ...] = (),
         extension_video_context: torch.Tensor | None = None,
         extension_audio_context: torch.Tensor | None = None,
         extension_route: Literal["condition_rows", "per_row_sigma"] = "condition_rows",
@@ -677,8 +678,16 @@ class _NativeTrainingBackend:
                     f"H3 audio extension needs a shorter context than the target: "
                     f"{extension_audio_latents} of {num_audio_latents} audio latents"
                 )
-            if extension_video_frames and extension_video_context is None:
-                raise ValueError("H3 video extension requires the clean context latents")
+            # Extension observes a leading run; keyframe conditioning observes an
+            # arbitrary set. Both present the same clean rows at the coordinates
+            # of the frames they duplicate, so they share one path.
+            anchors = condition_video_anchors or tuple(range(extension_video_frames))
+            if anchors and extension_video_context is None:
+                raise ValueError("H3 conditioning anchors require the clean context latents")
+            if any(not 0 <= anchor < latent_frames for anchor in anchors):
+                raise ValueError(f"H3 conditioning anchors must lie inside the {latent_frames} target latent frames")
+            if len(set(anchors)) != len(anchors):
+                raise ValueError("H3 conditioning anchors must be unique")
             if extension_audio_latents and extension_audio_context is None:
                 raise ValueError("H3 audio extension requires the clean context latents")
 
@@ -686,10 +695,10 @@ class _NativeTrainingBackend:
             # generalizing the released keyframe contract. per_row_sigma instead
             # pins the observed rows inside the target block, which costs no
             # extra tokens but is not something the released weights have seen.
-            duplicate_context = extension_route == "condition_rows"
+            duplicate_context = extension_route == "condition_rows" or bool(condition_video_anchors)
             context_video_rows = None
             context_audio_rows = None
-            if extension_video_frames:
+            if anchors:
                 context_video_rows = patchify_video_latents(extension_video_context, patch_size)
                 context_video_rows = 0.999 * context_video_rows + 0.001 * torch.randn_like(context_video_rows)
             if extension_audio_latents:
@@ -702,7 +711,7 @@ class _NativeTrainingBackend:
                 latent_width=latent_width,
                 num_audio_latents=num_audio_latents,
                 patch_size=patch_size,
-                keyframe_anchors=tuple(range(extension_video_frames)) if duplicate_context else (),
+                keyframe_anchors=anchors if duplicate_context else (),
                 num_condition_audio_latents=extension_audio_latents if duplicate_context else 0,
             )
             condition_video_timestep = None
@@ -726,7 +735,7 @@ class _NativeTrainingBackend:
             else:
                 rows_per_frame = (latent_height // patch_size[1]) * (latent_width // patch_size[2])
                 if context_video_rows is not None:
-                    observed = extension_video_frames * rows_per_frame
+                    observed = len(anchors) * rows_per_frame
                     video_rows = torch.cat((context_video_rows, video_rows[:, observed:]), dim=1)
                     row_video_timestep = video_timestep.reshape(1).expand(latent_frames * rows_per_frame).clone()
                     row_video_timestep[:observed] = observed_video_timestep[0]

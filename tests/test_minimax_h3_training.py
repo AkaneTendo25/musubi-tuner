@@ -2466,3 +2466,80 @@ def test_h3_observed_modality_random_is_accepted_by_the_parser():
     args = create_parser().parse_args(["--dataset_config", "x", "--dit", "y", "--h3_observed_modality", "random"])
 
     assert args.h3_observed_modality == "random"
+
+
+def _keyframe_trainer(spec="", random_count=0):
+    trainer = MiniMaxH3NetworkTrainer()
+    trainer._keyframe_anchors = h3_train_network._parse_keyframe_anchors(spec)
+    trainer._keyframe_random_count = random_count
+    return trainer
+
+
+def test_h3_keyframe_spec_resolves_named_and_indexed_anchors():
+    trainer = _keyframe_trainer("first,11,last")
+    video = torch.zeros(1, 24, 22, 2, 2)
+
+    assert trainer._resolve_keyframe_anchors(video) == (0, 11, 21)
+
+
+def test_h3_keyframe_anchors_are_sorted_and_deduplicated_against_the_clip():
+    trainer = _keyframe_trainer("last,first")
+    video = torch.zeros(1, 24, 8, 2, 2)
+
+    assert trainer._resolve_keyframe_anchors(video) == (0, 7)
+
+    duplicate = _keyframe_trainer("first,0")
+    with pytest.raises(ValueError, match="duplicate"):
+        duplicate._resolve_keyframe_anchors(video)
+
+
+def test_h3_keyframe_anchor_outside_the_clip_is_rejected():
+    trainer = _keyframe_trainer("30")
+    video = torch.zeros(1, 24, 8, 2, 2)
+
+    with pytest.raises(ValueError, match="outside"):
+        trainer._resolve_keyframe_anchors(video)
+
+
+def test_h3_keyframe_random_draw_is_distinct_and_within_range():
+    trainer = _keyframe_trainer(random_count=3)
+    video = torch.zeros(1, 24, 10, 2, 2)
+
+    torch.manual_seed(0)
+    anchors = trainer._resolve_keyframe_anchors(video)
+
+    assert len(anchors) == 3 and len(set(anchors)) == 3
+    assert all(0 <= a < 10 for a in anchors)
+    assert list(anchors) == sorted(anchors)
+
+
+def test_h3_keyframe_random_count_is_clamped_to_the_clip_length():
+    trainer = _keyframe_trainer(random_count=99)
+    video = torch.zeros(1, 24, 4, 2, 2)
+
+    assert len(trainer._resolve_keyframe_anchors(video)) == 4
+
+
+def test_h3_keyframe_spec_rejects_nonsense():
+    with pytest.raises(ValueError, match="must be"):
+        h3_train_network._parse_keyframe_anchors("first,middle")
+
+
+def test_h3_keyframe_anchors_are_absent_by_default():
+    trainer = _keyframe_trainer()
+
+    assert trainer._resolve_keyframe_anchors(torch.zeros(1, 24, 8, 2, 2)) == ()
+
+
+@pytest.mark.parametrize("conflicting", ["extension", "mask"])
+def test_h3_keyframe_conditioning_rejects_competing_observers(conflicting):
+    args = create_parser().parse_args([])
+    args.h3_keyframe_anchors = "first,last"
+    if conflicting == "extension":
+        args.h3_extension_video_frames = 2
+    else:
+        args.h3_mask_mode = "box"
+    trainer = MiniMaxH3NetworkTrainer()
+
+    with pytest.raises(ValueError, match="only one"):
+        trainer.handle_model_specific_args(args)

@@ -878,6 +878,27 @@ dominate the objective whenever the continuation is short, and the model would b
 Both counts are in **latent** units, not pixel frames, and each must be shorter than its target. The two are independent: setting
 only one trains extension for that modality while the other is generated in full from scratch.
 
+### Keyframe interpolation
+
+`--h3_keyframe_anchors` generalizes first/last keyframe conditioning to any set of frames, training interpolation between
+arbitrary anchors:
+
+```shell
+accelerate launch minimax_h3_train_network.py ... --h3_keyframe_anchors first,11,last
+accelerate launch minimax_h3_train_network.py ... --h3_keyframe_random_count 3
+```
+
+Each entry is `first`, `last`, or a latent frame index. `--h3_keyframe_random_count` instead draws that many distinct anchors per
+step, which trains one adapter to interpolate from whatever anchors it is later given rather than from a fixed pattern; the count
+is clamped to the clip length.
+
+Anchors are presented exactly as released keyframe conditioning is: the clean latents of those frames, packed a second time as
+condition rows at their own coordinates. Unlike extension, anchor frames remain in the loss, matching the released contract where
+a conditioned first frame is still predicted; a handful of anchors does not dominate the objective the way a long observed prefix
+would.
+
+Keyframe conditioning, extension, and masked conditioning all claim the observed rows, so only one may be enabled at a time.
+
 ### Masked conditioning
 
 `--h3_mask_mode` hides part of the target and presents the rest as clean context, training inpainting, outpainting, and temporal
