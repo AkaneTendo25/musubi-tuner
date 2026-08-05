@@ -19,7 +19,6 @@ from musubi_tuner.dataset.config_utils import (
 from musubi_tuner.dataset.image_video_dataset import ItemInfo
 from musubi_tuner.minimax_h3 import backend as h3_backend
 from musubi_tuner.minimax_h3 import integration as h3_integration
-from musubi_tuner.minimax_h3.audio_dataset import H3AudioDataset
 from musubi_tuner.minimax_h3.architecture import (
     AUDIO_FLOW_SHIFT,
     AUDIO_LATENT_FPS,
@@ -28,14 +27,15 @@ from musubi_tuner.minimax_h3.architecture import (
     VIDEO_FLOW_SHIFT,
     temporal_shape,
 )
+from musubi_tuner.minimax_h3.assets import default_text_encoder_assets
 from musubi_tuner.minimax_h3.audio import (
     AudioDecodeError,
     audio_valid_mask_to_latent_mask,
     load_audio_asset,
     target_audio_processing_spec,
 )
-from musubi_tuner.minimax_h3.assets import default_text_encoder_assets
-from musubi_tuner.minimax_h3.cache import H3_KEYFRAME_VIDEO_ROWS_KEY, save_latent_cache_minimax_h3
+from musubi_tuner.minimax_h3.audio_dataset import H3AudioDataset
+from musubi_tuner.minimax_h3.cache import H3_AUDIO_LATENTS_KEY, H3_KEYFRAME_VIDEO_ROWS_KEY, save_latent_cache_minimax_h3
 from musubi_tuner.minimax_h3.dataset import create_h3_dataset_group
 from musubi_tuner.minimax_h3.media import (
     AudioProcessingSpec,
@@ -598,7 +598,7 @@ def test_h3_audio_dataset_builds_cache_paths_and_duration_contract(tmp_path):
     assert Path(item.text_encoder_output_cache_path).name == "tone_00000-124_mmh3_te.safetensors"
 
 
-def test_native_latent_encoder_caches_first_and_last_fl2va_keyframe_rows():
+def test_native_latent_encoder_caches_fl2va_keyframes_for_video_only_target():
     class VideoEncoder(torch.nn.Module):
         def __init__(self):
             super().__init__()
@@ -618,13 +618,14 @@ def test_native_latent_encoder_caches_first_and_last_fl2va_keyframe_rows():
     video_encoder = VideoEncoder()
     audio_encoder = torch.nn.Linear(1, 1, bias=False)
     encoder = h3_integration._NativeLatentEncoder(video_encoder, audio_encoder, torch.float32)
-    encoder._encode_audio = lambda item: (torch.zeros(2, 32, 8), torch.ones(8, dtype=torch.bool))
+    encoder._encode_audio = lambda item: (_ for _ in ()).throw(AssertionError("video-only target must not encode audio"))
     encoder._encode_references = lambda item: {}
     content = np.zeros((5, 32, 32, 3), dtype=np.uint8)
     content[-1] = 255
     item = SimpleNamespace(
         content=content,
         item_key="sample",
+        h3_target_mode="video",
         h3_media_assets=(MediaAsset(Path("sample.mp4"), MediaModality.VIDEO, "target"),),
     )
 
@@ -634,6 +635,7 @@ def test_native_latent_encoder_caches_first_and_last_fl2va_keyframe_rows():
     assert tensors[key].shape == (2, 96)
     assert len(video_encoder.anchor_values) == 2
     assert video_encoder.anchor_values[0] != video_encoder.anchor_values[1]
+    assert not any(key.startswith(H3_AUDIO_LATENTS_KEY) for key in tensors)
 
 
 def test_native_latent_encoder_uses_direct_image_vae_path_and_omits_audio():

@@ -572,12 +572,11 @@ class _NativeTrainingBackend:
             video_rows = patchify_video_latents(video_hidden_states, patch_size)
             _, _, latent_frames, latent_height, latent_width = video_hidden_states.shape
         if audio_hidden_states is None:
-            num_audio_latents = 0
             audio_rows = torch.empty((1, 0, config.audio_in_channels), device=model_device, dtype=present.dtype)
         else:
             audio_rows = pack_audio_latents(audio_hidden_states)
-            num_audio_latents = audio_hidden_states.shape[-1]
-        if num_audio_latents == 0 and (self.mode != "fl2va" or task != "t2va"):
+        is_image_target = video_hidden_states is not None and latent_frames == 1 and audio_hidden_states is None
+        if is_image_target and (self.mode != "fl2va" or task != "t2va"):
             raise ValueError("MiniMax H3 image training currently requires the FL2VA transformer with --task t2va caches")
         if self.mode in ("ref2va", "ref2va_omni"):
             references, reference_video, reference_audio = self._reference_cache(
@@ -951,6 +950,7 @@ class _NativeLatentEncoder:
                         H3_AUDIO_LOSS_MASK_KEY: audio_mask,
                     }
                 )
+            if not is_image:
                 first = self._encode_reference_video(item.content[0], image=True)
                 last = self._encode_reference_video(item.content[-1], image=True)
                 keyframe_rows = torch.cat(

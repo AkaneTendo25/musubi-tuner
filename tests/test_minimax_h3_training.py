@@ -467,7 +467,8 @@ def test_native_h3_t2va_backend_rejects_visual_conditioning_without_keyframe_lat
 
 
 @pytest.mark.parametrize(("task", "text_tags"), (("i2va", [1, 0, 1]), ("fl2va", [1, 0, 0, 1])))
-def test_native_h3_fl2va_backend_runs_keyframe_conditioned_target_only_backward(task, text_tags):
+@pytest.mark.parametrize("with_audio", [True, False])
+def test_native_h3_fl2va_backend_runs_keyframe_conditioned_target_only_backward(task, text_tags, with_audio):
     config = MiniMaxH3TransformerConfig(
         num_attention_heads=2,
         attention_head_dim=16,
@@ -486,8 +487,8 @@ def test_native_h3_fl2va_backend_runs_keyframe_conditioned_target_only_backward(
     )
     transformer = MiniMaxH3Transformer(config)
     backend = _NativeTrainingBackend(transformer, mode="fl2va")
-    video = torch.randn(1, 4, 1, 2, 2)
-    audio = torch.randn(1, 2, 6, 1)
+    video = torch.randn(1, 4, 2, 2, 2)
+    audio = torch.randn(1, 2, 6, 1) if with_audio else None
     batch = {
         H3_TEXT_HIDDEN_KEY: [torch.randn(len(text_tags), 8)],
         H3_TEXT_TOKEN_TAGS_KEY: [torch.tensor(text_tags)],
@@ -504,11 +505,13 @@ def test_native_h3_fl2va_backend_runs_keyframe_conditioned_target_only_backward(
         torch.tensor([0.4]),
         torch.tensor([0.7]),
     )
-    loss = prediction.video.square().mean() + prediction.audio.square().mean()
+    loss = prediction.video.square().mean()
+    if prediction.audio is not None:
+        loss = loss + prediction.audio.square().mean()
     loss.backward()
 
     assert prediction.video.shape == video.shape
-    assert prediction.audio.shape == audio.shape
+    assert prediction.audio is None if audio is None else prediction.audio.shape == audio.shape
     assert torch.isfinite(loss)
     assert transformer.blocks[0].attn.qkv_proj.weight.grad is not None
 
