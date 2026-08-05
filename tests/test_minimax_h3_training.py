@@ -629,7 +629,9 @@ def test_h3_row_timesteps_can_pin_the_text_prefix_independently():
     layout = _row_timestep_layout()
     per_row = torch.linspace(0.1, 0.8, int(layout.video_indices.numel()))
 
-    timesteps, indices = build_row_timesteps(layout, per_row, torch.tensor([0.9]), per_row_timesteps=True, text_timestep=torch.tensor([0.5]))
+    timesteps, indices = build_row_timesteps(
+        layout, per_row, torch.tensor([0.9]), per_row_timesteps=True, text_timestep=torch.tensor([0.5])
+    )
 
     assert bool((timesteps[indices[layout.text_indices]] == 0.5).all())
 
@@ -1599,8 +1601,104 @@ def test_h3_trainer_joint_process_batch_routes_optional_guidance(guidance_scale,
     assert backend.calls == expected_calls
     assert torch.isfinite(loss)
     assert transformer.scale.grad is not None and torch.isfinite(transformer.scale.grad)
-    assert set(metrics) == {"loss/video", "loss/audio", "h3/sigma_video", "h3/sigma_audio"}
+    assert set(metrics) == {"loss/video", "loss/audio", "h3/sigma_video", "h3/sigma_audio", "h3/caption_dropped"}
     assert metrics["loss/audio"] == 0.0
+
+
+def _caption_dropout_batch():
+    return {
+        H3_AUDIO_LATENTS_KEY: torch.zeros(1, 2, 32, 3),
+        H3_AUDIO_LOSS_MASK_KEY: torch.zeros(1, 3, dtype=torch.bool),
+        "timesteps": [0.5],
+        H3_EMPTY_TEXT_HIDDEN_KEY: [torch.zeros(1, 5120)],
+        H3_EMPTY_TEXT_TOKEN_TAGS_KEY: [torch.ones(1, dtype=torch.long)],
+    }
+
+
+def _run_caption_dropout(rate, *, guidance_scale=None, network=None, backend=None):
+    args = create_parser().parse_args([])
+    args.h3_caption_dropout_rate = rate
+    args.h3_guidance_distillation_scale = guidance_scale
+    trainer = MiniMaxH3NetworkTrainer()
+    trainer.dit_dtype = torch.float32
+    trainer.backend = backend or _FakeBackend()
+    transformer = _ScaleTransformer()
+    video = torch.zeros(1, 24, 2, 2, 2)
+    torch.manual_seed(0)
+    loss, metrics = trainer.process_batch(
+        args,
+        _FakeAccelerator(),
+        transformer,
+        network,
+        _caption_dropout_batch(),
+        video,
+        torch.ones_like(video),
+        None,
+        torch.float32,
+        torch.float32,
+        None,
+        0,
+    )
+    return trainer.backend, loss, metrics
+
+
+@pytest.mark.parametrize(("rate", "expected"), [(0.0, "prompt"), (1.0, "empty")])
+def test_h3_caption_dropout_selects_the_conditioning_branch(rate, expected):
+    # Rate 0 must leave the prompt branch untouched; rate 1 must train the
+    # unconditional branch, which is what gives inference a null prompt.
+    backend, _, metrics = _run_caption_dropout(rate)
+
+    assert backend.calls == [(expected, True)]
+    assert metrics["h3/caption_dropped"] == float(expected == "empty")
+
+
+def test_h3_caption_dropout_skips_the_guidance_correction():
+    # A dropped step is already unconditional, so there is no guided field to
+    # invert and the empty branch would duplicate the trainable one.
+    backend, _, _ = _run_caption_dropout(1.0, guidance_scale=4.0)
+
+    assert backend.calls == [("empty", True)]
+
+
+def test_h3_caption_dropout_keeps_guidance_when_the_prompt_survives():
+    backend, _, _ = _run_caption_dropout(0.0, guidance_scale=4.0)
+
+    assert backend.calls == [("empty", False), ("prompt", True)]
+
+
+def test_h3_caption_dropout_requires_the_empty_cache():
+    args = create_parser().parse_args([])
+    args.h3_caption_dropout_rate = 0.5
+    trainer = MiniMaxH3NetworkTrainer()
+    trainer.dit_dtype = torch.float32
+    trainer.backend = _FakeBackend()
+    video = torch.zeros(1, 24, 2, 2, 2)
+
+    with pytest.raises(KeyError, match="cache_guidance_empty"):
+        trainer.process_batch(
+            args,
+            _FakeAccelerator(),
+            _ScaleTransformer(),
+            None,
+            {"timesteps": [0.5]},
+            video,
+            torch.ones_like(video),
+            None,
+            torch.float32,
+            torch.float32,
+            None,
+            0,
+        )
+
+
+@pytest.mark.parametrize("rate", [-0.1, 1.5])
+def test_h3_caption_dropout_rate_is_validated(rate):
+    args = create_parser().parse_args([])
+    args.h3_caption_dropout_rate = rate
+    trainer = MiniMaxH3NetworkTrainer()
+
+    with pytest.raises(ValueError, match=r"h3_caption_dropout_rate"):
+        trainer.handle_model_specific_args(args)
 
 
 def test_h3_trainer_base_preservation_replays_rng_and_restores_network():

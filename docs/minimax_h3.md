@@ -838,6 +838,26 @@ loss directly to the extrapolated target `u + scale × (target - u)`. Both have 
 contrastive loss and gradient are `scale²` larger (`9×` at scale `3`). This changes its strength relative to base preservation,
 weight decay, gradient clipping, and other auxiliary objectives, so their hyperparameters are not directly interchangeable.
 
+### Caption dropout
+
+`--h3_caption_dropout_rate` replaces the prompt with the cached empty conditioning for a fraction of steps, so the adapter also
+trains its unconditional branch:
+
+```shell
+accelerate launch minimax_h3_train_network.py ... --cache_guidance_empty --h3_caption_dropout_rate 0.1
+```
+
+Training every step with a prompt leaves the adapter with no null-prompt behaviour of its own, so anything that contrasts a
+conditional against an unconditional prediction has nothing to contrast against. The rate is a probability in `[0, 1]`; H3 trains
+one item per step, so it is a single draw per step rather than a per-sample mask, and the `h3/caption_dropped` metric records which
+steps dropped.
+
+Cached empty-text conditioning is required, so `--cache_guidance_empty` must have been passed when caching. A dropped step is
+already unconditional and therefore skips the guidance-consistent correction, which has no guided field to invert; combining the
+two options is allowed and simply means the correction applies to the steps that kept their prompt. When
+`--h3_base_preservation_loss_weight` is active, the frozen branch follows the same conditioning as the trainable one, so a dropped
+step compares like with like.
+
 ### Optional base-preservation loss
 
 Longer LoRA runs may drift away from the behavior of H3's released guidance-distilled base. The opt-in

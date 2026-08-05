@@ -220,9 +220,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 has_audio = H3_AUDIO_LATENTS_KEY in batch
                 video_source = batch.get("latents", latents if latents.ndim == 5 else None)
                 video_latents = video_source.to(accelerator.device, dtype=self.dit_dtype) if has_video else None
-                audio_latents = (
-                    batch[H3_AUDIO_LATENTS_KEY].to(accelerator.device, dtype=self.dit_dtype) if has_audio else None
-                )
+                audio_latents = batch[H3_AUDIO_LATENTS_KEY].to(accelerator.device, dtype=self.dit_dtype) if has_audio else None
                 is_image = has_video and not has_audio and video_latents.shape[2] == 1
                 if observed is not None and not (has_video and has_audio):
                     raise ValueError("H3 observed-modality validation requires cached video and audio targets")
@@ -279,9 +277,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                     seed_validation_forward(forward_seed)
                     if args.h3_guidance_distillation_scale is not None:
                         missing_empty = [
-                            key
-                            for key in (H3_EMPTY_TEXT_HIDDEN_KEY, H3_EMPTY_TEXT_TOKEN_TAGS_KEY)
-                            if key not in batch
+                            key for key in (H3_EMPTY_TEXT_HIDDEN_KEY, H3_EMPTY_TEXT_TOKEN_TAGS_KEY) if key not in batch
                         ]
                         if missing_empty:
                             raise KeyError("guidance-consistent H3 validation is missing " + ", ".join(missing_empty))
@@ -334,9 +330,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         metrics = {f"val/{key}": value for key, value in accumulator.metrics().items()}
         if metrics and len(accelerator.trackers) > 0:
             accelerator.log(metrics, step=global_step)
-        accelerator.print(
-            "MiniMax H3 validation: " + ", ".join(f"{key}={value:.6g}" for key, value in metrics.items())
-        )
+        accelerator.print("MiniMax H3 validation: " + ", ".join(f"{key}={value:.6g}" for key, value in metrics.items()))
 
     def handle_model_specific_args(self, args: argparse.Namespace):
         self.dit_dtype = (
@@ -373,6 +367,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             raise ValueError("--h3_guidance_loss_form contrastive requires --h3_guidance_distillation_scale")
         if not math.isfinite(args.h3_base_preservation_loss_weight) or args.h3_base_preservation_loss_weight < 0:
             raise ValueError("--h3_base_preservation_loss_weight must be finite and non-negative")
+        if not 0.0 <= args.h3_caption_dropout_rate <= 1.0:
+            raise ValueError("--h3_caption_dropout_rate must lie in [0, 1]")
         if args.fp8_base and args.h3_adaln_rank is None:
             # AdaLN is ~39% of the transformer and is quantized by default, yet
             # measured against the BF16 reference the reduction is both smaller
@@ -756,7 +752,9 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         audio_noise = (
             noise.to(device=accelerator.device, dtype=dit_dtype)
             if audio_latents is not None and not has_video
-            else torch.randn_like(audio_latents) if audio_latents is not None else None
+            else torch.randn_like(audio_latents)
+            if audio_latents is not None
+            else None
         )
         is_image = has_video and not has_audio and video_latents.shape[2] == 1
 
@@ -800,7 +798,22 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             observed=observed,
         )
 
-        if args.h3_guidance_distillation_scale is not None:
+        # H3 trains one item per step, so caption dropout is a single draw rather
+        # than a per-sample mask. A dropped step trains the unconditional branch,
+        # which is what gives the adapter a null prompt to contrast against at
+        # inference; without it the model has never seen one.
+        conditioning = "prompt"
+        if args.h3_caption_dropout_rate > 0:
+            missing_empty = [key for key in (H3_EMPTY_TEXT_HIDDEN_KEY, H3_EMPTY_TEXT_TOKEN_TAGS_KEY) if key not in batch]
+            if missing_empty:
+                raise KeyError("--h3_caption_dropout_rate requires --cache_guidance_empty; missing " + ", ".join(missing_empty))
+            if float(torch.rand((), device="cpu")) < args.h3_caption_dropout_rate:
+                conditioning = "empty"
+
+        # A dropped step is already unconditional, so there is no guided field to
+        # invert and both branches would evaluate the same empty prompt.
+        use_guidance = args.h3_guidance_distillation_scale is not None and conditioning == "prompt"
+        if use_guidance:
             missing_empty = [key for key in (H3_EMPTY_TEXT_HIDDEN_KEY, H3_EMPTY_TEXT_TOKEN_TAGS_KEY) if key not in batch]
             if missing_empty:
                 raise KeyError(
@@ -837,7 +850,10 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                             transformer,
                             batch,
                             inputs,
-                            conditioning="prompt",
+                            # Match the student's conditioning, or a dropped step
+                            # would pull the unconditional branch toward the
+                            # frozen base's conditional prediction.
+                            conditioning=conditioning,
                             gradient_checkpointing=False,
                         )
                 finally:
@@ -852,7 +868,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 transformer,
                 batch,
                 inputs,
-                conditioning="prompt",
+                conditioning=conditioning,
                 gradient_checkpointing=args.gradient_checkpointing,
             )
         except Exception:
@@ -860,7 +876,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 self._crepa.clear_step()
             raise
         prediction = raw_prediction
-        if args.h3_guidance_distillation_scale is not None:
+        if use_guidance:
             prediction = guidance_consistent_prediction(prediction, empty_prediction, args.h3_guidance_distillation_scale)
 
         sample_weight = self._sample_weight(
@@ -889,13 +905,14 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         # contrastive loss is exactly s^2 larger, so scaling the normalized
         # result reproduces it without another forward or target allocation.
         guidance_loss_multiplier = 1.0
-        if args.h3_guidance_distillation_scale is not None and args.h3_guidance_loss_form == "contrastive":
+        if use_guidance and args.h3_guidance_loss_form == "contrastive":
             guidance_loss_multiplier = args.h3_guidance_distillation_scale**2
         metrics = {
             "loss/video": float((result.video_loss * guidance_loss_multiplier).detach()),
             "loss/audio": float((result.audio_loss * guidance_loss_multiplier).detach()),
             "h3/sigma_video": float(inputs.video_sigma.mean().detach()),
             "h3/sigma_audio": float(inputs.audio_sigma.mean().detach()),
+            "h3/caption_dropped": float(conditioning == "empty"),
         }
         loss = result.loss * guidance_loss_multiplier
         if reference_prediction is not None:
@@ -937,6 +954,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             "ss_h3_image_flow_shift": str(args.h3_image_flow_shift or "resolution_aware"),
             "ss_h3_guidance_distillation_scale": str(args.h3_guidance_distillation_scale or "one_pass"),
             "ss_h3_guidance_loss_form": args.h3_guidance_loss_form,
+            "ss_h3_caption_dropout_rate": str(args.h3_caption_dropout_rate),
             "ss_h3_base_preservation_loss_weight": str(args.h3_base_preservation_loss_weight),
             "ss_h3_shift_video": str(args.h3_shift_video),
             "ss_h3_shift_audio": str(args.h3_shift_audio),
@@ -1003,6 +1021,16 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         help="enable optional two-pass guidance-consistent training with an authoritative distillation scale",
     )
     parser.add_argument(
+        "--h3_caption_dropout_rate",
+        type=float,
+        default=0.0,
+        help=(
+            "probability of replacing the prompt with the cached empty conditioning for a step, training the "
+            "unconditional branch; requires --cache_guidance_empty. Steps that drop the caption skip the "
+            "guidance-consistent correction, which has nothing to invert without a prompt"
+        ),
+    )
+    parser.add_argument(
         "--h3_guidance_loss_form",
         choices=("normalized", "contrastive"),
         default="normalized",
@@ -1015,9 +1043,7 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         "--h3_base_preservation_loss_weight",
         type=float,
         default=0.0,
-        help=(
-            "optional frozen-base prediction-preservation loss weight; adds one no-grad transformer forward per batch"
-        ),
+        help=("optional frozen-base prediction-preservation loss weight; adds one no-grad transformer forward per batch"),
     )
     parser.add_argument(
         "--crepa",
