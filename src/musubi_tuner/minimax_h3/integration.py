@@ -685,7 +685,10 @@ class _NativeTrainingBackend:
             anchors = condition_video_anchors or tuple(range(extension_video_frames))
             if anchors and extension_video_context is None:
                 raise ValueError("H3 conditioning anchors require the clean context latents")
-            if any(not 0 <= anchor < latent_frames for anchor in anchors):
+            # Anchors may be the released "first"/"last" tokens as well as latent
+            # frame indices, so only the indices carry a range to check; the
+            # packer validates the tokens themselves.
+            if any(isinstance(anchor, int) and not 0 <= anchor < latent_frames for anchor in anchors):
                 raise ValueError(f"H3 conditioning anchors must lie inside the {latent_frames} target latent frames")
             if len(set(anchors)) != len(anchors):
                 raise ValueError("H3 conditioning anchors must be unique")

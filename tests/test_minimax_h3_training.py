@@ -2658,3 +2658,47 @@ def test_h3_keyframe_last_and_final_index_are_distinct_anchors():
 
     assert set(anchors) == {"last", 7}
     assert indices == (7, 7)
+
+
+@pytest.mark.parametrize("anchors", [("first", "last"), (0, 1), ("first", 1)])
+def test_native_h3_backend_accepts_named_and_indexed_condition_anchors(anchors):
+    # The released "first"/"last" tokens reach the packer as themselves, so the
+    # backend must not range-check them as integers. A unit test of the anchor
+    # resolver alone cannot catch this; only the packing path can.
+    config = MiniMaxH3TransformerConfig(
+        num_attention_heads=2,
+        attention_head_dim=16,
+        hidden_size=24,
+        num_layers=2,
+        num_refiner_layers=2,
+        ffn_dim=32,
+        in_channels=4,
+        audio_in_channels=6,
+        patch_size=(1, 2, 2),
+        text_dim=8,
+        freq_dim=8,
+        time_embed_hidden_dim=24,
+        time_embed_dim=16,
+        rope_freq_dim=2,
+    )
+    transformer = MiniMaxH3Transformer(config)
+    backend = _NativeTrainingBackend(transformer, mode="fl2va")
+    video = torch.randn(1, 4, 3, 2, 2)
+    batch = {
+        H3_TEXT_HIDDEN_KEY: [torch.randn(3, 8)],
+        H3_TEXT_TOKEN_TAGS_KEY: [torch.tensor([1, 1, 1])],
+        H3_CONDITIONING_TASK_KEY: [torch.tensor(H3_CONDITIONING_TASK_IDS["t2va"])],
+    }
+
+    prediction = backend.predict_training(
+        transformer,
+        batch,
+        video,
+        torch.randn(1, 2, 6, 1),
+        torch.tensor([0.4]),
+        torch.tensor([0.7]),
+        condition_video_anchors=anchors,
+        extension_video_context=torch.randn(1, 4, len(anchors), 2, 2),
+    )
+
+    assert prediction.video.shape == video.shape
