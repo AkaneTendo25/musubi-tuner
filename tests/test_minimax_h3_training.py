@@ -2479,14 +2479,18 @@ def test_h3_keyframe_spec_resolves_named_and_indexed_anchors():
     trainer = _keyframe_trainer("first,11,last")
     video = torch.zeros(1, 24, 22, 2, 2)
 
-    assert trainer._resolve_keyframe_anchors(video) == (0, 11, 21)
+    anchors, indices = trainer._resolve_keyframe_anchors(video)
+    # "last" survives as itself: the packer needs the released final-pixel-frame
+    # coordinate, while the content comes from the final latent window.
+    assert anchors == ("first", 11, "last")
+    assert indices == (0, 11, 21)
 
 
 def test_h3_keyframe_anchors_are_sorted_and_deduplicated_against_the_clip():
     trainer = _keyframe_trainer("last,first")
     video = torch.zeros(1, 24, 8, 2, 2)
 
-    assert trainer._resolve_keyframe_anchors(video) == (0, 7)
+    assert trainer._resolve_keyframe_anchors(video) == (("first", "last"), (0, 7))
 
     duplicate = _keyframe_trainer("first,0")
     with pytest.raises(ValueError, match="duplicate"):
@@ -2506,7 +2510,7 @@ def test_h3_keyframe_random_draw_is_distinct_and_within_range():
     video = torch.zeros(1, 24, 10, 2, 2)
 
     torch.manual_seed(0)
-    anchors = trainer._resolve_keyframe_anchors(video)
+    anchors, _ = trainer._resolve_keyframe_anchors(video)
 
     assert len(anchors) == 3 and len(set(anchors)) == 3
     assert all(0 <= a < 10 for a in anchors)
@@ -2517,7 +2521,7 @@ def test_h3_keyframe_random_count_is_clamped_to_the_clip_length():
     trainer = _keyframe_trainer(random_count=99)
     video = torch.zeros(1, 24, 4, 2, 2)
 
-    assert len(trainer._resolve_keyframe_anchors(video)) == 4
+    assert len(trainer._resolve_keyframe_anchors(video)[0]) == 4
 
 
 def test_h3_keyframe_spec_rejects_nonsense():
@@ -2528,7 +2532,7 @@ def test_h3_keyframe_spec_rejects_nonsense():
 def test_h3_keyframe_anchors_are_absent_by_default():
     trainer = _keyframe_trainer()
 
-    assert trainer._resolve_keyframe_anchors(torch.zeros(1, 24, 8, 2, 2)) == ()
+    assert trainer._resolve_keyframe_anchors(torch.zeros(1, 24, 8, 2, 2)) == ((), ())
 
 
 @pytest.mark.parametrize("conflicting", ["extension", "mask"])
@@ -2632,3 +2636,25 @@ def test_h3_frame_sigma_jitter_is_validated(jitter):
 
     with pytest.raises(ValueError, match="h3_frame_sigma_jitter"):
         trainer.handle_model_specific_args(args)
+
+
+def test_h3_keyframe_last_is_not_collapsed_to_the_final_index():
+    # "last" names the final pixel frame and index N-1 the final latent window
+    # start; collapsing them would silently move the released anchor.
+    trainer = _keyframe_trainer("last")
+    video = torch.zeros(1, 24, 8, 2, 2)
+
+    anchors, indices = trainer._resolve_keyframe_anchors(video)
+
+    assert anchors == ("last",)
+    assert indices == (7,)
+
+
+def test_h3_keyframe_last_and_final_index_are_distinct_anchors():
+    trainer = _keyframe_trainer("last,7")
+    video = torch.zeros(1, 24, 8, 2, 2)
+
+    anchors, indices = trainer._resolve_keyframe_anchors(video)
+
+    assert set(anchors) == {"last", 7}
+    assert indices == (7, 7)

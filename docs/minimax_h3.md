@@ -907,10 +907,15 @@ Each entry is `first`, `last`, or a latent frame index. `--h3_keyframe_random_co
 step, which trains one adapter to interpolate from whatever anchors it is later given rather than from a fixed pattern; the count
 is clamped to the clip length.
 
-Anchors are presented exactly as released keyframe conditioning is: the clean latents of those frames, packed a second time as
-condition rows at their own coordinates. Unlike extension, anchor frames remain in the loss, matching the released contract where
-a conditioned first frame is still predicted; a handful of anchors does not dominate the objective the way a long observed prefix
-would.
+Anchors are presented as the clean latents of those frames, packed a second time as condition rows at their own coordinates.
+`first` and `last` keep the released coordinates -- `last` is the final *pixel* frame, which is one latent window beyond the final
+window's start, so it is deliberately not the same anchor as the integer `frames - 1`. Anchor frames remain in the loss, matching
+the released contract where a conditioned first frame is still predicted; a handful of anchors does not dominate the objective the
+way a long observed prefix would.
+
+This is not identical to released keyframe conditioning: the content is the target's own latent window rather than a separately
+encoded keyframe image, and `--task t2va` conditioning carries no vision rows. Treat it as a related but distinct interface, and
+check whether the released model already interpolates from interior anchors before training an adapter to do it.
 
 Keyframe conditioning, extension, and masked conditioning all claim the observed rows, so only one may be enabled at a time.
 

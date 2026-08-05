@@ -149,6 +149,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         self._mask_mode = "off"
         self._mask_audio = False
         self._mask_bounds = (0.25, 0.75)
+        self._step_keyframes = None
         self._step_mask = None
         self._validation_dataloader = None
 
@@ -228,6 +229,12 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         del network, epoch
         if self.backend is None:
             raise RuntimeError("H3 training backend is not loaded")
+        # Per-step conditioning belongs to the training step that drew it. Left
+        # in place it would make validation forward under the last batch's mask
+        # or jitter schedule while scoring the full target, so the numbers would
+        # not describe any coherent objective.
+        self._step_mask = None
+        self._step_row_video_timestep = None
         if self._validation_dataloader is None:
             self._validation_dataloader = self._build_validation_dataloader(args, accelerator)
 
@@ -442,6 +449,20 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             raise ValueError("H3 masked conditioning requires --h3_training_mode fl2va with --task t2va caches")
         if (args.h3_extension_video_frames or args.h3_extension_audio_latents) and args.h3_training_mode != "fl2va":
             raise ValueError("H3 extension training requires --h3_training_mode fl2va with --task t2va caches")
+        # Jitter re-noises the whole video at per-frame levels, which silently
+        # overwrites any row a conditioning mode pinned as observed and leaves
+        # the row timesteps disagreeing with the noise actually applied.
+        conditioning = (
+            keyframes
+            or masking
+            or bool(args.h3_extension_video_frames or args.h3_extension_audio_latents)
+            or args.h3_observed_modality is not None
+        )
+        if args.h3_frame_sigma_jitter > 0 and conditioning:
+            raise ValueError(
+                "--h3_frame_sigma_jitter re-noises every frame, so it cannot be combined with a conditioning mode "
+                "that presents part of the target as observed (--h3_observed_modality, extension, keyframes, or masking)"
+            )
         if args.fp8_base and args.h3_adaln_rank is None:
             # AdaLN is ~39% of the transformer and is quantized by default, yet
             # measured against the BF16 reference the reduction is both smaller
@@ -772,24 +793,39 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         row_timestep = (1.0 - frame_sigma).repeat_interleave(rows_per_frame)
         return replace(inputs, video=noisy), row_timestep
 
-    def _resolve_keyframe_anchors(self, video) -> tuple[int, ...]:
-        """Resolve this step's conditioning anchors to sorted latent-frame indices."""
+    def _resolve_keyframe_anchors(self, video):
+        """Resolve this step's conditioning anchors.
+
+        Returns ``(anchors, indices)``. ``anchors`` is what the packer receives
+        and keeps ``"first"``/``"last"`` as themselves, because ``"last"`` names
+        the final *pixel* frame while the integer ``frames - 1`` names the final
+        latent window's start -- collapsing them would silently move the released
+        anchor. ``indices`` says which latent frame supplies the content, where
+        ``"last"`` does take the final window.
+        """
         if video is None:
-            return ()
+            return (), ()
         frames = video.shape[-3]
         if self._keyframe_random_count:
             count = min(self._keyframe_random_count, frames)
-            drawn = torch.randperm(frames, device="cpu")[:count]
-            return tuple(sorted(int(index) for index in drawn))
-        resolved = []
+            drawn = sorted(int(index) for index in torch.randperm(frames, device="cpu")[:count])
+            return tuple(drawn), tuple(drawn)
+        anchors: list[int | str] = []
+        indices: list[int] = []
         for anchor in self._keyframe_anchors:
             index = 0 if anchor == "first" else frames - 1 if anchor == "last" else int(anchor)
             if not 0 <= index < frames:
                 raise ValueError(f"H3 keyframe anchor {anchor} is outside the {frames} target latent frames")
-            resolved.append(index)
-        if len(set(resolved)) != len(resolved):
+            anchors.append(anchor)
+            indices.append(index)
+        # Mirror the packer's identity rule: "first" and an explicit 0 name the
+        # same coordinate and collide, while "last" is its own coordinate and
+        # never collides with an index.
+        identities = [0 if anchor == "first" else anchor for anchor in anchors]
+        if len(set(identities)) != len(identities):
             raise ValueError("H3 keyframe anchors resolved to duplicate latent frames")
-        return tuple(sorted(resolved))
+        order = sorted(range(len(indices)), key=lambda position: indices[position])
+        return tuple(anchors[position] for position in order), tuple(indices[position] for position in order)
 
     @staticmethod
     def _clean_latents(noisy, target, sigma):
@@ -919,12 +955,12 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         extension_kwargs = {}
         if self._step_row_video_timestep is not None:
             extension_kwargs["video_row_schedule"] = self._step_row_video_timestep
-        anchors = self._resolve_keyframe_anchors(inputs.video)
+        anchors, anchor_indices = self._step_keyframes or ((), ())
         if anchors:
             extension_kwargs["condition_video_anchors"] = anchors
             extension_kwargs["extension_video_context"] = self._clean_latents(
                 inputs.video, inputs.video_target, inputs.video_sigma
-            ).index_select(-3, torch.tensor(anchors, device=inputs.video.device))
+            ).index_select(-3, torch.tensor(anchor_indices, device=inputs.video.device))
         if self._step_mask is not None:
             if self._step_mask.video_rows is not None:
                 extension_kwargs["observed_video_rows"] = self._step_mask.video_rows
@@ -1052,6 +1088,10 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             args, inputs, video_latents, video_noise, base_sigma, is_image
         )
         self._step_mask = self._draw_step_mask(inputs, tuple(VIDEO_DIT_PATCH_SIZE))
+        # Drawn once per step for the same reason the mask is: the guidance and
+        # base-preservation branches must condition on the same anchors as the
+        # trainable branch, or the guidance correction inverts a different field.
+        self._step_keyframes = self._resolve_keyframe_anchors(inputs.video)
 
         # H3 trains one item per step, so caption dropout is a single draw rather
         # than a per-sample mask. A dropped step trains the unconditional branch,
@@ -1208,6 +1248,10 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         # gradient checkpointing recomputes hooked blocks during backward and
         # requires the hook to perform the same tensor operations as forward.
         # begin_step() clears the captures before the next trainable pass.
+        # Every consumer has run; nothing beyond this step may inherit the draw.
+        self._step_mask = None
+        self._step_row_video_timestep = None
+        self._step_keyframes = None
         return loss, metrics
 
     def call_dit(self, *args, **kwargs):
