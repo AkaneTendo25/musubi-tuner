@@ -31,6 +31,11 @@ from musubi_tuner.minimax_h3.cache import (
 )
 from musubi_tuner.minimax_h3.crepa import H3CREPA, H3CREPAConfig, parse_crepa_config
 from musubi_tuner.minimax_h3.integration import _NativeTrainingBackend
+from musubi_tuner.minimax_h3.masking import (
+    audio_mask_to_rows,
+    sample_video_mask,
+    video_mask_to_rows,
+)
 from musubi_tuner.minimax_h3.model import MiniMaxH3Attention, MiniMaxH3Transformer, MiniMaxH3TransformerConfig
 from musubi_tuner.minimax_h3.packing import (
     MiniMaxH3ReferenceGeometry,
@@ -822,6 +827,7 @@ def test_h3_ref2va_packing_accepts_text_only_presentation():
 
 @pytest.mark.parametrize("activation_cpu_offloading", [False, True])
 def test_native_h3_t2va_backend_runs_joint_forward_and_backward(activation_cpu_offloading):
+    device = torch.device("cuda" if activation_cpu_offloading and torch.cuda.is_available() else "cpu")
     config = MiniMaxH3TransformerConfig(
         num_attention_heads=2,
         attention_head_dim=16,
@@ -838,11 +844,11 @@ def test_native_h3_t2va_backend_runs_joint_forward_and_backward(activation_cpu_o
         time_embed_dim=16,
         rope_freq_dim=2,
     )
-    transformer = MiniMaxH3Transformer(config)
+    transformer = MiniMaxH3Transformer(config).to(device)
     transformer.enable_gradient_checkpointing(activation_cpu_offloading)
     backend = _NativeTrainingBackend(transformer)
-    video_latents = torch.randn(1, 4, 2, 4, 4)
-    audio_latents = torch.randn(1, 2, 6, 3)
+    video_latents = torch.randn(1, 4, 2, 4, 4, device=device)
+    audio_latents = torch.randn(1, 2, 6, 3, device=device)
     inputs = prepare_joint_noisy_inputs(
         video_latents,
         audio_latents,
@@ -851,9 +857,9 @@ def test_native_h3_t2va_backend_runs_joint_forward_and_backward(activation_cpu_o
         torch.tensor([0.6]),
     )
     batch = {
-        H3_TEXT_HIDDEN_KEY: [torch.randn(4, 8)],
-        H3_TEXT_TOKEN_TAGS_KEY: [torch.ones(4, dtype=torch.long)],
-        H3_CONDITIONING_TASK_KEY: [torch.tensor(H3_CONDITIONING_TASK_IDS["t2va"])],
+        H3_TEXT_HIDDEN_KEY: [torch.randn(4, 8, device=device)],
+        H3_TEXT_TOKEN_TAGS_KEY: [torch.ones(4, dtype=torch.long, device=device)],
+        H3_CONDITIONING_TASK_KEY: [torch.tensor(H3_CONDITIONING_TASK_IDS["t2va"], device=device)],
     }
 
     prediction = backend.predict_training(
@@ -2221,3 +2227,67 @@ def test_h3_extension_route_defaults_to_the_released_contract():
     args = create_parser().parse_args(["--dataset_config", "x", "--dit", "y"])
 
     assert args.h3_extension_route == "condition_rows"
+
+
+def test_h3_masking_box_generates_an_interior_region():
+    g = torch.Generator().manual_seed(0)
+    mask = sample_video_mask(mode="box", latent_frames=3, latent_height=8, latent_width=8, generator=g)
+
+    assert mask.shape == (3, 8, 8)
+    assert bool(mask.any()) and not bool(mask.all())
+    # A box is constant over time and contiguous in space.
+    assert bool((mask[0] == mask[1]).all())
+    rows = mask[0].any(dim=1).nonzero().flatten()
+    assert bool((rows.diff() == 1).all())
+
+
+def test_h3_masking_border_is_the_complement_of_a_box():
+    g = torch.Generator().manual_seed(0)
+    border = sample_video_mask(mode="border", latent_frames=2, latent_height=8, latent_width=8, generator=g)
+    g = torch.Generator().manual_seed(0)
+    box = sample_video_mask(mode="box", latent_frames=2, latent_height=8, latent_width=8, generator=g)
+
+    torch.testing.assert_close(border, ~box)
+
+
+def test_h3_masking_segment_selects_whole_frames():
+    g = torch.Generator().manual_seed(3)
+    mask = sample_video_mask(mode="segment", latent_frames=6, latent_height=4, latent_width=4, generator=g)
+
+    per_frame = mask.reshape(6, -1)
+    assert bool(((per_frame.all(dim=1)) | (~per_frame.any(dim=1))).all())
+
+
+def test_h3_masking_rows_flag_a_patch_when_any_latent_inside_it_is_generated():
+    # Reducing with any rather than all keeps the boundary inside the generated
+    # set, which is where an inpainting seam would otherwise land.
+    mask = torch.zeros(1, 4, 4, dtype=torch.bool)
+    mask[0, 0, 0] = True
+
+    rows = video_mask_to_rows(mask, (1, 2, 2))
+
+    assert rows.shape == (4,)
+    assert bool(rows[0]) and not bool(rows[1:].any())
+
+
+def test_h3_masking_audio_rows_repeat_across_channels():
+    mask = torch.tensor([True, False, True])
+
+    rows = audio_mask_to_rows(mask, channels=2)
+
+    assert rows.tolist() == [True, False, True, True, False, True]
+
+
+def test_h3_masking_is_reproducible_from_a_seed():
+    a = sample_video_mask(mode="box", latent_frames=2, latent_height=8, latent_width=8, generator=torch.Generator().manual_seed(7))
+    b = sample_video_mask(mode="box", latent_frames=2, latent_height=8, latent_width=8, generator=torch.Generator().manual_seed(7))
+
+    torch.testing.assert_close(a, b)
+
+
+def test_h3_masking_rejects_unsupported_modes_and_fractions():
+    g = torch.Generator().manual_seed(0)
+    with pytest.raises(ValueError, match="unsupported"):
+        sample_video_mask(mode="spiral", latent_frames=2, latent_height=4, latent_width=4, generator=g)
+    with pytest.raises(ValueError, match="fractions"):
+        sample_video_mask(mode="box", latent_frames=2, latent_height=4, latent_width=4, generator=g, minimum=0.8, maximum=0.2)
