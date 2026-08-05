@@ -162,6 +162,7 @@ trains one of them while the other is read as conditioning:
 | --- | --- | --- | --- |
 | `--h3_observed_modality video` | audio | video | video-to-audio, Foley, dubbing |
 | `--h3_observed_modality audio` | video | audio | audio-driven video |
+| `--h3_observed_modality random` | redrawn per step | redrawn per step | one adapter covering joint, A2V and V2A |
 
 ```shell
 accelerate launch minimax_h3_train_network.py ... --h3_observed_modality video
@@ -171,6 +172,10 @@ The observed modality is pinned to the noise level the released transformer alre
 conditioning carries a trace of noise at timestep 0.999, and audio conditioning passes through untouched at timestep 1.0. Because
 H3 forms its inputs as `(1 - sigma) * x0 + sigma * noise`, both are reached by fixing that modality's sigma rather than by any
 separate code path, so an observed modality is presented exactly as reference media of the same modality already is.
+
+`random` redraws the task each step across joint generation, video-observed and audio-observed in equal proportion, so a single
+adapter keeps all three instead of specialising on whichever task was fixed for the run. Validation reports the joint objective
+rather than a different draw each time, so its numbers stay comparable across runs.
 
 The observed modality carries no training signal: its loss weight is forced to zero, overriding `--h3_video_loss_weight` or
 `--h3_audio_loss_weight`. Sample weighting keys on the generated modality's sigma, since the observed one no longer follows the

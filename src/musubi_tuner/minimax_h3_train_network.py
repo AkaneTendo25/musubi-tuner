@@ -216,7 +216,9 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             video_shift=args.h3_shift_video,
             audio_shift=args.h3_shift_audio,
         )
-        observed = args.h3_observed_modality
+        # Validation measures a fixed task, so a randomised observed modality is
+        # reported as the joint objective rather than a different draw each run.
+        observed = None if args.h3_observed_modality == "random" else args.h3_observed_modality
         video_weight = 0.0 if observed == "video" else args.h3_video_loss_weight
         audio_weight = 0.0 if observed == "audio" else args.h3_audio_loss_weight
         accumulator = H3ValidationAccumulator(
@@ -914,6 +916,11 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         is_image = has_video and not has_audio and video_latents.shape[2] == 1
 
         observed = args.h3_observed_modality
+        if observed == "random":
+            # One adapter covering joint generation, audio-driven video and
+            # video-to-audio: the task is redrawn per step rather than fixed for
+            # the run, so the model keeps all three rather than specialising.
+            observed = (None, "video", "audio")[int(torch.randint(0, 3, (1,), device="cpu").item())]
         if observed is not None and not (has_video and has_audio):
             present = "video" if has_video else "audio" if has_audio else "neither"
             raise ValueError(
@@ -1174,12 +1181,14 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         "--h3_observed_modality",
         type=str,
         default=None,
-        choices=["video", "audio"],
+        choices=["video", "audio", "random"],
         help=(
             "Train one modality while the other is read as clean conditioning at the released "
             "transformer's own conditioning noise level. 'video' trains audio from video "
-            "(video-to-audio / Foley); 'audio' trains video from audio. Requires datasets that "
-            "cache both modalities, and overrides the observed modality's loss weight to zero."
+            "(video-to-audio / Foley); 'audio' trains video from audio; 'random' redraws the task "
+            "each step across joint, video-observed and audio-observed, producing one adapter that "
+            "keeps all three. Requires datasets that cache both modalities, and overrides the "
+            "observed modality's loss weight to zero."
         ),
     )
     parser.add_argument(

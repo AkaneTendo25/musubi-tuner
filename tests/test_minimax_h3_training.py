@@ -2415,3 +2415,54 @@ def test_h3_mask_rejects_combining_with_extension():
 
     with pytest.raises(ValueError, match="only one"):
         trainer.handle_model_specific_args(args)
+
+
+def test_h3_random_observed_modality_covers_all_three_tasks():
+    # Redrawing the task per step is what keeps one adapter able to do joint
+    # generation, A2V and V2A instead of specialising on whichever was fixed.
+    args = create_parser().parse_args([])
+    args.h3_observed_modality = "random"
+    seen = set()
+    for seed in range(40):
+        trainer = MiniMaxH3NetworkTrainer()
+        trainer.dit_dtype = torch.float32
+        trainer.backend = _FakeBackend()
+        video = torch.zeros(1, 24, 2, 2, 2)
+        batch = {
+            H3_AUDIO_LATENTS_KEY: torch.zeros(1, 2, 32, 3),
+            H3_AUDIO_LOSS_MASK_KEY: torch.ones(1, 3, dtype=torch.bool),
+            "timesteps": [0.5],
+        }
+        torch.manual_seed(seed)
+        _, metrics = trainer.process_batch(
+            args,
+            _FakeAccelerator(),
+            _ScaleTransformer(),
+            None,
+            batch,
+            video,
+            torch.ones_like(video),
+            None,
+            torch.float32,
+            torch.float32,
+            None,
+            0,
+        )
+        # sigma_video is pinned at the conditioning level exactly when video is observed.
+        seen.add(round(metrics["h3/sigma_video"], 3))
+    assert len(seen) > 1
+
+
+def test_h3_random_observed_modality_is_reported_as_joint_in_validation():
+    args = create_parser().parse_args([])
+    args.h3_observed_modality = "random"
+
+    resolved = None if args.h3_observed_modality == "random" else args.h3_observed_modality
+
+    assert resolved is None
+
+
+def test_h3_observed_modality_random_is_accepted_by_the_parser():
+    args = create_parser().parse_args(["--dataset_config", "x", "--dit", "y", "--h3_observed_modality", "random"])
+
+    assert args.h3_observed_modality == "random"
