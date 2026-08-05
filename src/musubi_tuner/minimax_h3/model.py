@@ -33,6 +33,7 @@ from torch.utils.checkpoint import checkpoint
 from musubi_tuner.modules.attention import AttentionParams
 from musubi_tuner.modules.attention import attention as musubi_attention
 from musubi_tuner.modules.custom_offloading_utils import BlockSwapConfig, create_offloader
+from musubi_tuner.utils.model_utils import create_cpu_offloading_wrapper
 
 MINIMAX_H3_MODALITY_COUNT = 3
 
@@ -229,9 +230,7 @@ class MiniMaxH3TokenRefinerBlock(nn.Module):
 class MiniMaxH3TokenRefiner(nn.Module):
     def __init__(self, config: MiniMaxH3TransformerConfig, attention_mode: str = "torch"):
         super().__init__()
-        self.blocks = nn.ModuleList(
-            [MiniMaxH3TokenRefinerBlock(config, attention_mode) for _ in range(config.num_refiner_layers)]
-        )
+        self.blocks = nn.ModuleList([MiniMaxH3TokenRefinerBlock(config, attention_mode) for _ in range(config.num_refiner_layers)])
         self.final_norm = nn.RMSNorm(config.hidden_size, eps=config.final_norm_eps)
 
     def forward(self, hidden_states: torch.Tensor, gradient_checkpointing: bool = False) -> torch.Tensor:
@@ -363,6 +362,7 @@ class MiniMaxH3Transformer(nn.Module):
         self.blocks = nn.ModuleList([MiniMaxH3TransformerBlock(config, attention_mode) for _ in range(config.num_layers)])
         self.final_layer = MiniMaxH3FinalLayer(config)
         self.gradient_checkpointing = False
+        self.activation_cpu_offloading = False
         self.blocks_to_swap = 0
         self.offloader = None
 
@@ -375,12 +375,12 @@ class MiniMaxH3Transformer(nn.Module):
         return next(self.parameters()).dtype
 
     def enable_gradient_checkpointing(self, activation_cpu_offloading: bool = False) -> None:
-        if activation_cpu_offloading:
-            raise NotImplementedError("MiniMax H3 does not support activation CPU offloading")
         self.gradient_checkpointing = True
+        self.activation_cpu_offloading = activation_cpu_offloading
 
     def disable_gradient_checkpointing(self) -> None:
         self.gradient_checkpointing = False
+        self.activation_cpu_offloading = False
 
     def enable_block_swap(self, blocks_to_swap: int, config: BlockSwapConfig) -> None:
         num_blocks = len(self.blocks)
@@ -455,6 +455,8 @@ class MiniMaxH3Transformer(nn.Module):
         def forward(value: torch.Tensor) -> torch.Tensor:
             return block(value, timestep_embedding, adaln_indices, rotary_emb, attention_mask)
 
+        if self.activation_cpu_offloading:
+            forward = create_cpu_offloading_wrapper(forward, block.attn.qkv_proj.weight.device)
         return checkpoint(forward, hidden_states, use_reentrant=False)
 
     def _time_embedding(self, timestep: torch.Tensor) -> torch.Tensor:
@@ -528,4 +530,6 @@ class MiniMaxH3Transformer(nn.Module):
             if self.blocks_to_swap:
                 self.offloader.submit_move_blocks_forward(self.blocks, block_index)
 
+        if self.activation_cpu_offloading:
+            hidden_states = hidden_states.to(self.final_layer.norm.weight.device)
         return self.final_layer(hidden_states, timestep_embedding, timestep_indices, video_indices, audio_indices)
