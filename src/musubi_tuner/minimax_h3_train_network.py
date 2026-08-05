@@ -45,6 +45,7 @@ from musubi_tuner.minimax_h3.inference import (
 from musubi_tuner.minimax_h3.training import (
     H3ModelPrediction,
     guidance_consistent_prediction,
+    joint_prediction_loss,
     joint_velocity_loss,
     prepare_joint_noisy_inputs,
 )
@@ -147,6 +148,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             raise ValueError("MiniMax H3 --h3_image_flow_shift must be positive when specified")
         if args.h3_guidance_distillation_scale is not None and args.h3_guidance_distillation_scale <= 1.0:
             raise ValueError("--h3_guidance_distillation_scale must be greater than 1, or omitted for one-pass training")
+        if not math.isfinite(args.h3_base_preservation_loss_weight) or args.h3_base_preservation_loss_weight < 0:
+            raise ValueError("--h3_base_preservation_loss_weight must be finite and non-negative")
         if args.fp8_base and args.h3_adaln_rank is None:
             # AdaLN is ~39% of the transformer and is quantized by default, yet
             # measured against the BF16 reference the reduction is both smaller
@@ -480,7 +483,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         vae,
         global_step: int,
     ) -> tuple[torch.Tensor, dict[str, float]]:
-        del network, network_dtype, vae, global_step
+        del network_dtype, vae, global_step
         if latents.shape[0] != 1:
             raise ValueError("MiniMax H3 training requires dataset batch_size = 1")
         has_video = "latents" in batch or latents.ndim == 5
@@ -555,7 +558,33 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                     conditioning="empty",
                     gradient_checkpointing=False,
                 )
-        prediction = self._predict(
+        reference_prediction = None
+        if args.h3_base_preservation_loss_weight > 0:
+            if network is None:
+                raise ValueError("--h3_base_preservation_loss_weight requires a trainable network")
+            unwrapped_network = accelerator.unwrap_model(network)
+            set_enabled = getattr(unwrapped_network, "set_enabled", None)
+            if not callable(set_enabled):
+                raise TypeError("H3 base-preservation loss requires a network with set_enabled()")
+            fork_devices = [accelerator.device] if accelerator.device.type == "cuda" else []
+            # Restoring the RNG state makes the following trainable pass reuse
+            # the stochastic conditioning rows sampled by the frozen branch.
+            with torch.random.fork_rng(devices=fork_devices):
+                set_enabled(False)
+                try:
+                    with torch.no_grad():
+                        reference_prediction = self._predict(
+                            accelerator,
+                            transformer,
+                            batch,
+                            inputs,
+                            conditioning="prompt",
+                            gradient_checkpointing=False,
+                        )
+                finally:
+                    set_enabled(True)
+
+        raw_prediction = self._predict(
             accelerator,
             transformer,
             batch,
@@ -563,9 +592,15 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             conditioning="prompt",
             gradient_checkpointing=args.gradient_checkpointing,
         )
+        prediction = raw_prediction
         if args.h3_guidance_distillation_scale is not None:
             prediction = guidance_consistent_prediction(prediction, empty_prediction, args.h3_guidance_distillation_scale)
 
+        sample_weight = self._sample_weight(
+            args, inputs.audio_sigma if observed == "video" or not has_video else inputs.video_sigma
+        )
+        video_weight = 0.0 if observed == "video" else args.h3_video_loss_weight
+        audio_weight = 0.0 if observed == "audio" else args.h3_audio_loss_weight
         result = joint_velocity_loss(
             prediction,
             inputs,
@@ -575,13 +610,11 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             # modality being generated, not the shared unshifted coordinate. An
             # observed modality sits at a pinned constant and would carry no
             # schedule information.
-            sample_weight=self._sample_weight(
-                args, inputs.audio_sigma if observed == "video" or not has_video else inputs.video_sigma
-            ),
+            sample_weight=sample_weight,
             balance=args.h3_loss_balance,
             # The observed modality is conditioning, not a target.
-            video_weight=0.0 if observed == "video" else args.h3_video_loss_weight,
-            audio_weight=0.0 if observed == "audio" else args.h3_audio_loss_weight,
+            video_weight=video_weight,
+            audio_weight=audio_weight,
         )
         metrics = {
             "loss/video": float(result.video_loss.detach()),
@@ -589,7 +622,21 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             "h3/sigma_video": float(inputs.video_sigma.mean().detach()),
             "h3/sigma_audio": float(inputs.audio_sigma.mean().detach()),
         }
-        return result.loss, metrics
+        loss = result.loss
+        if reference_prediction is not None:
+            preservation = joint_prediction_loss(
+                raw_prediction,
+                reference_prediction,
+                video_mask=batch.get("video_loss_mask"),
+                audio_mask=batch.get("audio_loss_mask"),
+                sample_weight=sample_weight,
+                balance=args.h3_loss_balance,
+                video_weight=video_weight,
+                audio_weight=audio_weight,
+            )
+            loss = loss + args.h3_base_preservation_loss_weight * preservation.loss
+            metrics["loss/base_preservation"] = float(preservation.loss.detach())
+        return loss, metrics
 
     def call_dit(self, *args, **kwargs):
         del args, kwargs
@@ -604,6 +651,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             "ss_h3_observed_modality": str(args.h3_observed_modality or "none"),
             "ss_h3_image_flow_shift": str(args.h3_image_flow_shift or "resolution_aware"),
             "ss_h3_guidance_distillation_scale": str(args.h3_guidance_distillation_scale or "one_pass"),
+            "ss_h3_base_preservation_loss_weight": str(args.h3_base_preservation_loss_weight),
             "ss_h3_shift_video": str(args.h3_shift_video),
             "ss_h3_shift_audio": str(args.h3_shift_audio),
             "ss_h3_timestep_sampling": args.timestep_sampling,
@@ -666,6 +714,14 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         type=float,
         default=None,
         help="enable optional two-pass guidance-consistent training with an authoritative distillation scale",
+    )
+    parser.add_argument(
+        "--h3_base_preservation_loss_weight",
+        type=float,
+        default=0.0,
+        help=(
+            "optional frozen-base prediction-preservation loss weight; adds one no-grad transformer forward per batch"
+        ),
     )
     parser.add_argument(
         "--int8_convrot_base",

@@ -724,3 +724,23 @@ without a negative-prompt branch. Normal LoRA training therefore uses one condit
 forward and the model's joint flow target. If an authoritative distillation scale is known, `--h3_guidance_distillation_scale` can
 enable an optional two-pass guidance-consistent objective using cached empty-text conditioning. This does not reconstruct an
 unconditional model or add negative-prompt inference.
+
+### Optional base-preservation loss
+
+Longer LoRA runs may drift away from the behavior of H3's released guidance-distilled base. The opt-in
+`--h3_base_preservation_loss_weight` objective evaluates the same conditional input once with the LoRA disabled and penalizes the
+trainable prediction for moving away from that frozen-base prediction. This is function-space preservation, not CFG distillation or
+de-distillation, and it does not add negative-prompt inference.
+
+```text
+--h3_base_preservation_loss_weight 0.05
+```
+
+The default is `0`, so ordinary training is unchanged. Enabling it adds one no-gradient transformer forward per microbatch. VRAM
+growth should be modest, but the extra forward can be expensive with extensive block swapping because the swapped blocks must be
+streamed again. The loss preserves whichever base is loaded: with FP8, INT8 ConvRot, or reduced AdaLN it anchors to that transformed
+base rather than to the original BF16 checkpoint.
+
+Community experiments by [@Ada123-a](https://github.com/Ada123-a) reported weights around `0.05`–`0.10` together with guidance scale
+`3`. Treat these as preliminary starting points rather than a validated recipe: preservation strength interacts with the guidance
+scale, model quantization, dataset, rank, and learning rate.

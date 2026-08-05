@@ -225,9 +225,9 @@ def _modality_loss(
     return total / elements, total, elements
 
 
-def joint_velocity_loss(
+def _joint_loss(
     prediction: H3ModelPrediction,
-    inputs: H3JointNoisyInputs,
+    target: H3ModelPrediction,
     *,
     video_mask: torch.Tensor | None = None,
     audio_mask: torch.Tensor | None = None,
@@ -236,7 +236,6 @@ def joint_velocity_loss(
     video_weight: float = 1.0,
     audio_weight: float = 1.0,
 ) -> H3JointLoss:
-    """Reduce video and audio velocity errors with explicit modality balancing."""
     if balance not in {"token", "modality"}:
         raise ValueError(f"unsupported H3 loss balance: {balance}")
     if video_weight < 0 or audio_weight < 0 or video_weight + audio_weight <= 0:
@@ -246,18 +245,18 @@ def joint_velocity_loss(
     if zero_source is None:
         raise ValueError("H3 prediction contains no target modality")
     zero = zero_source.sum() * 0.0
-    if prediction.video is None or inputs.video_target is None:
-        if prediction.video is not None or inputs.video_target is not None:
+    if prediction.video is None or target.video is None:
+        if prediction.video is not None or target.video is not None:
             raise ValueError("H3 video prediction and target presence differ")
         video_mean, video_total, video_elements = zero, zero, 0
     else:
-        video_mean, video_total, video_elements = _modality_loss(prediction.video, inputs.video_target, video_mask, sample_weight)
-    if prediction.audio is None or inputs.audio_target is None:
-        if prediction.audio is not None or inputs.audio_target is not None:
+        video_mean, video_total, video_elements = _modality_loss(prediction.video, target.video, video_mask, sample_weight)
+    if prediction.audio is None or target.audio is None:
+        if prediction.audio is not None or target.audio is not None:
             raise ValueError("H3 audio prediction and target presence differ")
         audio_mean, audio_total, audio_elements = zero, zero, 0
     else:
-        audio_mean, audio_total, audio_elements = _modality_loss(prediction.audio, inputs.audio_target, audio_mask, sample_weight)
+        audio_mean, audio_total, audio_elements = _modality_loss(prediction.audio, target.audio, audio_mask, sample_weight)
 
     active_video_weight = video_weight if video_elements else 0.0
     active_audio_weight = audio_weight if audio_elements else 0.0
@@ -271,3 +270,59 @@ def joint_velocity_loss(
         loss = (active_video_weight * video_total + active_audio_weight * audio_total) / weighted_elements
 
     return H3JointLoss(loss, video_mean, audio_mean, video_elements, audio_elements)
+
+
+def joint_velocity_loss(
+    prediction: H3ModelPrediction,
+    inputs: H3JointNoisyInputs,
+    *,
+    video_mask: torch.Tensor | None = None,
+    audio_mask: torch.Tensor | None = None,
+    sample_weight: torch.Tensor | None = None,
+    balance: LossBalance = "token",
+    video_weight: float = 1.0,
+    audio_weight: float = 1.0,
+) -> H3JointLoss:
+    """Reduce video and audio velocity errors with explicit modality balancing."""
+    return _joint_loss(
+        prediction,
+        H3ModelPrediction(inputs.video_target, inputs.audio_target),
+        video_mask=video_mask,
+        audio_mask=audio_mask,
+        sample_weight=sample_weight,
+        balance=balance,
+        video_weight=video_weight,
+        audio_weight=audio_weight,
+    )
+
+
+def joint_prediction_loss(
+    prediction: H3ModelPrediction,
+    reference: H3ModelPrediction,
+    *,
+    video_mask: torch.Tensor | None = None,
+    audio_mask: torch.Tensor | None = None,
+    sample_weight: torch.Tensor | None = None,
+    balance: LossBalance = "token",
+    video_weight: float = 1.0,
+    audio_weight: float = 1.0,
+) -> H3JointLoss:
+    """Measure drift from a detached base-model prediction.
+
+    This is function-space preservation, not CFG distillation: callers must
+    evaluate both branches on identical noisy inputs and conditioning.
+    """
+    detached_reference = H3ModelPrediction(
+        reference.video.detach() if reference.video is not None else None,
+        reference.audio.detach() if reference.audio is not None else None,
+    )
+    return _joint_loss(
+        prediction,
+        detached_reference,
+        video_mask=video_mask,
+        audio_mask=audio_mask,
+        sample_weight=sample_weight,
+        balance=balance,
+        video_weight=video_weight,
+        audio_weight=audio_weight,
+    )
