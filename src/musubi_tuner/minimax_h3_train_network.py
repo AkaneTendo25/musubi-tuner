@@ -7,6 +7,7 @@ import logging
 import math
 import time
 from collections.abc import Sequence
+from dataclasses import replace
 from types import SimpleNamespace
 from multiprocessing import Value
 from pathlib import Path
@@ -58,6 +59,7 @@ from musubi_tuner.minimax_h3.training import (
     joint_prediction_loss,
     joint_velocity_loss,
     prepare_joint_noisy_inputs,
+    shift_sigma,
 )
 from musubi_tuner.minimax_h3.validation import (
     H3ValidationAccumulator,
@@ -140,6 +142,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         self._extension_video_frames = 0
         self._extension_audio_latents = 0
         self._extension_route = "condition_rows"
+        self._frame_sigma_jitter = 0.0
+        self._step_row_video_timestep = None
         self._keyframe_anchors: tuple[int | str, ...] = ()
         self._keyframe_random_count = 0
         self._mask_mode = "off"
@@ -410,6 +414,9 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         self._extension_video_frames = args.h3_extension_video_frames
         self._extension_audio_latents = args.h3_extension_audio_latents
         self._extension_route = args.h3_extension_route
+        self._frame_sigma_jitter = args.h3_frame_sigma_jitter
+        if not 0.0 <= args.h3_frame_sigma_jitter <= 1.0:
+            raise ValueError("--h3_frame_sigma_jitter must lie in [0, 1]")
         self._keyframe_anchors = _parse_keyframe_anchors(args.h3_keyframe_anchors)
         self._keyframe_random_count = args.h3_keyframe_random_count
         if args.h3_keyframe_random_count < 0:
@@ -742,6 +749,29 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             return ((timesteps.to(device=device, dtype=torch.float32) - 1.0) / 1000.0).clamp(0.0, 1.0)
         return get_sigmas(noise_scheduler, timesteps, device, n_dim=1, dtype=dtype).to(torch.float32)
 
+    def _apply_frame_sigma_jitter(self, args, inputs, video_latents, video_noise, base_sigma, is_image):
+        """Give each latent frame its own noise level around the shared schedule.
+
+        One sigma per step supervises one point of the schedule per step. Drawing
+        a nearby sigma per frame supervises a spread of the schedule in the same
+        forward, which is worth most when data is scarce. The flow target
+        ``x0 - noise`` does not depend on sigma, so only the noised input and the
+        per-row timesteps change.
+        """
+        if self._frame_sigma_jitter <= 0 or inputs.video is None or is_image:
+            return inputs, None
+        frames = video_latents.shape[2]
+        rows_per_frame_h, rows_per_frame_w = VIDEO_DIT_PATCH_SIZE[-2:]
+        rows_per_frame = (video_latents.shape[-2] // rows_per_frame_h) * (video_latents.shape[-1] // rows_per_frame_w)
+        offsets = (torch.rand(frames, device="cpu") * 2 - 1) * self._frame_sigma_jitter
+        base = float(base_sigma.reshape(-1)[0])
+        frame_base = (base + offsets).clamp(0.0, 1.0)
+        frame_sigma = shift_sigma(frame_base, 1.0 if is_image else args.h3_shift_video)
+        sigma = frame_sigma.to(device=video_latents.device, dtype=video_latents.dtype).view(1, 1, frames, 1, 1)
+        noisy = (1.0 - sigma) * video_latents + sigma * video_noise
+        row_timestep = (1.0 - frame_sigma).repeat_interleave(rows_per_frame)
+        return replace(inputs, video=noisy), row_timestep
+
     def _resolve_keyframe_anchors(self, video) -> tuple[int, ...]:
         """Resolve this step's conditioning anchors to sorted latent-frame indices."""
         if video is None:
@@ -887,6 +917,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             if audio is not None:
                 audio.requires_grad_(True)
         extension_kwargs = {}
+        if self._step_row_video_timestep is not None:
+            extension_kwargs["video_row_schedule"] = self._step_row_video_timestep
         anchors = self._resolve_keyframe_anchors(inputs.video)
         if anchors:
             extension_kwargs["condition_video_anchors"] = anchors
@@ -1016,6 +1048,9 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             observed=observed,
         )
 
+        inputs, self._step_row_video_timestep = self._apply_frame_sigma_jitter(
+            args, inputs, video_latents, video_noise, base_sigma, is_image
+        )
         self._step_mask = self._draw_step_mask(inputs, tuple(VIDEO_DIT_PATCH_SIZE))
 
         # H3 trains one item per step, so caption dropout is a single draw rather
@@ -1193,6 +1228,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             "ss_h3_extension_video_frames": str(args.h3_extension_video_frames),
             "ss_h3_extension_audio_latents": str(args.h3_extension_audio_latents),
             "ss_h3_extension_route": args.h3_extension_route,
+            "ss_h3_frame_sigma_jitter": str(args.h3_frame_sigma_jitter),
             "ss_h3_keyframe_anchors": args.h3_keyframe_anchors or "none",
             "ss_h3_keyframe_random_count": str(args.h3_keyframe_random_count),
             "ss_h3_mask_mode": args.h3_mask_mode,
@@ -1278,6 +1314,15 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         type=int,
         default=0,
         help="leading audio latents observed as context instead of generated, training audio extension",
+    )
+    parser.add_argument(
+        "--h3_frame_sigma_jitter",
+        type=float,
+        default=0.0,
+        help=(
+            "spread each latent frame's noise level around the step's shared schedule position by up to this much, "
+            "so one forward supervises a range of the schedule instead of a single point"
+        ),
     )
     parser.add_argument(
         "--h3_keyframe_anchors",

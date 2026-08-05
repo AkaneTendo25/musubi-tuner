@@ -2543,3 +2543,92 @@ def test_h3_keyframe_conditioning_rejects_competing_observers(conflicting):
 
     with pytest.raises(ValueError, match="only one"):
         trainer.handle_model_specific_args(args)
+
+
+def _jitter_inputs(clean, noise):
+    from musubi_tuner.minimax_h3.training import H3JointNoisyInputs
+
+    return H3JointNoisyInputs(
+        video=clean,
+        audio=None,
+        video_target=clean - noise,
+        audio_target=None,
+        video_sigma=torch.tensor([0.5]),
+        audio_sigma=torch.tensor([0.5]),
+        video_timestep=torch.tensor([0.5]),
+        audio_timestep=torch.tensor([0.5]),
+    )
+
+
+def _jitter_trainer(jitter):
+    trainer = MiniMaxH3NetworkTrainer()
+    trainer._frame_sigma_jitter = jitter
+    return trainer
+
+
+def test_h3_frame_sigma_jitter_is_inert_at_zero():
+    trainer = _jitter_trainer(0.0)
+    args = create_parser().parse_args([])
+    inputs = SimpleNamespace(video=torch.zeros(1, 4, 3, 2, 2))
+
+    result, schedule = trainer._apply_frame_sigma_jitter(
+        args, inputs, torch.zeros(1, 4, 3, 2, 2), torch.ones(1, 4, 3, 2, 2), torch.tensor([0.5]), False
+    )
+
+    assert result is inputs and schedule is None
+
+
+def test_h3_frame_sigma_jitter_gives_each_frame_its_own_noise_level():
+    trainer = _jitter_trainer(0.2)
+    args = create_parser().parse_args([])
+    clean = torch.zeros(1, 4, 3, 2, 2)
+    noise = torch.ones(1, 4, 3, 2, 2)
+
+    torch.manual_seed(0)
+    result, schedule = trainer._apply_frame_sigma_jitter(
+        args, _jitter_inputs(clean, noise), clean, noise, torch.tensor([0.5]), False
+    )
+
+    # With clean zeros the noised frame equals its own sigma, so the frames must differ.
+    per_frame = result.video[0, 0, :, 0, 0]
+    assert len(set(per_frame.tolist())) > 1
+    # One timestep per packed row, and each frame's rows share a value.
+    assert schedule.numel() == 3 * 1
+    torch.testing.assert_close(schedule, 1.0 - per_frame.to(schedule.dtype), rtol=1e-4, atol=1e-4)
+
+
+def test_h3_frame_sigma_jitter_leaves_the_flow_target_alone():
+    # The target x0 - noise does not depend on sigma, so jitter must not change it.
+    trainer = _jitter_trainer(0.3)
+    args = create_parser().parse_args([])
+    clean = torch.randn(1, 4, 3, 2, 2)
+    noise = torch.randn(1, 4, 3, 2, 2)
+    inputs = _jitter_inputs(clean, noise)
+
+    torch.manual_seed(0)
+    result, _ = trainer._apply_frame_sigma_jitter(args, inputs, clean, noise, torch.tensor([0.4]), False)
+
+    torch.testing.assert_close(result.video_target, clean - noise)
+
+
+def test_h3_frame_sigma_jitter_skips_image_batches():
+    # An image batch is one frame, so a per-frame spread has nothing to spread.
+    trainer = _jitter_trainer(0.5)
+    args = create_parser().parse_args([])
+    inputs = SimpleNamespace(video=torch.zeros(1, 4, 1, 2, 2))
+
+    result, schedule = trainer._apply_frame_sigma_jitter(
+        args, inputs, torch.zeros(1, 4, 1, 2, 2), torch.ones(1, 4, 1, 2, 2), torch.tensor([0.5]), True
+    )
+
+    assert result is inputs and schedule is None
+
+
+@pytest.mark.parametrize("jitter", [-0.1, 1.5])
+def test_h3_frame_sigma_jitter_is_validated(jitter):
+    args = create_parser().parse_args([])
+    args.h3_frame_sigma_jitter = jitter
+    trainer = MiniMaxH3NetworkTrainer()
+
+    with pytest.raises(ValueError, match="h3_frame_sigma_jitter"):
+        trainer.handle_model_specific_args(args)

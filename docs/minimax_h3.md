@@ -878,6 +878,21 @@ dominate the objective whenever the continuation is short, and the model would b
 Both counts are in **latent** units, not pixel frames, and each must be shorter than its target. The two are independent: setting
 only one trains extension for that modality while the other is generated in full from scratch.
 
+### Per-frame noise spread
+
+`--h3_frame_sigma_jitter` gives each latent frame its own noise level around the step's shared schedule position:
+
+```shell
+accelerate launch minimax_h3_train_network.py ... --h3_frame_sigma_jitter 0.2
+```
+
+One sigma per step supervises one point of the schedule per step. Spreading it across frames supervises a range of the schedule
+in the same forward, which is worth most when the dataset is small. The flow target `x0 - noise` does not depend on sigma, so only
+the noised input and the per-row timesteps change; the loss is untouched.
+
+Image batches are skipped, since a single frame has nothing to spread across. `0` disables the spread and reproduces the shared
+schedule exactly.
+
 ### Keyframe interpolation
 
 `--h3_keyframe_anchors` generalizes first/last keyframe conditioning to any set of frames, training interpolation between

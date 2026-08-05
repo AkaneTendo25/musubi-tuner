@@ -512,6 +512,7 @@ class _NativeTrainingBackend:
         extension_video_context: torch.Tensor | None = None,
         extension_audio_context: torch.Tensor | None = None,
         extension_route: Literal["condition_rows", "per_row_sigma"] = "condition_rows",
+        video_row_schedule: torch.Tensor | None = None,
         observed_video_rows: torch.Tensor | None = None,
         observed_audio_rows: torch.Tensor | None = None,
         clean_video_latents: torch.Tensor | None = None,
@@ -758,6 +759,18 @@ class _NativeTrainingBackend:
                         start = channel * per_channel
                         row_audio_timestep[start : start + extension_audio_latents] = observed_audio_timestep[0]
                     per_row = True
+
+            # A caller-supplied schedule gives every target video row its own
+            # noise level, which the transformer already supports because it
+            # selects modulation through timestep_indices.
+            if video_row_schedule is not None:
+                if video_row_schedule.numel() != video_rows.shape[1]:
+                    raise ValueError(
+                        f"H3 per-row video timesteps have {video_row_schedule.numel()} entries "
+                        f"for {video_rows.shape[1]} packed rows"
+                    )
+                row_video_timestep = video_row_schedule.to(device=model_device, dtype=torch.float32)
+                per_row = True
 
             # A conditioning mask observes an arbitrary subset rather than a
             # leading run, so it can only be expressed by pinning rows in place.
