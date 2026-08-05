@@ -847,6 +847,27 @@ loss directly to the extrapolated target `u + scale × (target - u)`. Both have 
 contrastive loss and gradient are `scale²` larger (`9×` at scale `3`). This changes its strength relative to base preservation,
 weight decay, gradient clipping, and other auxiliary objectives, so their hyperparameters are not directly interchangeable.
 
+#### Cost
+
+Each auxiliary objective adds a full forward over the whole packed sequence:
+
+| Enabled | Forwards per step | Notes |
+| --- | --- | --- |
+| neither | 1 trainable | the baseline |
+| `--h3_guidance_distillation_scale` | + 1 no-grad | the empty-prompt branch |
+| `--h3_base_preservation_loss_weight` | + 1 no-grad | the frozen base |
+| both | 3 total | one trainable, two no-grad |
+
+The extra passes carry no gradients, so they cost compute rather than memory: with gradient checkpointing a trainable step is
+roughly four forward-equivalents, and each auxiliary branch adds one, so guidance alone is about `1.25×` a plain step and both
+together about `1.5×`.
+
+This matters most for `ref2va`. References inflate the packed sequence, and every auxiliary pass re-processes them along with the
+target, so the multiplier applies to the enlarged sequence rather than the target alone. The empty-prompt branch is also not
+shorter than the prompt branch -- the null conditioning is padded to the same length -- so it costs the same as the branch it
+calibrates. When reference conditioning is already expensive, turning both objectives on triples the most expensive part of the
+step.
+
 ### Extension training
 
 `--h3_extension_video_frames` and `--h3_extension_audio_latents` train continuation: a leading run of the target is observed as
