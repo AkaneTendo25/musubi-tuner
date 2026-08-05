@@ -398,34 +398,79 @@ def build_ref2va_packed_sequence(
     )
 
 
+def _target_timestep_values(name: str, values: torch.Tensor, rows: int) -> torch.Tensor:
+    """Validate a target-block timestep as either one shared value or one per row."""
+    if values.numel() == 1 or values.numel() == rows:
+        return values
+    raise ValueError(f"H3 {name} timesteps must be a scalar or one value per target {name} row, got {values.numel()} for {rows}")
+
+
 def build_row_timesteps(
     layout: MiniMaxH3PackedSequence,
     video_timestep: torch.Tensor,
     audio_timestep: torch.Tensor,
     condition_video_timestep: torch.Tensor | None = None,
     condition_audio_timestep: torch.Tensor | None = None,
+    *,
+    per_row_timesteps: bool = False,
+    text_timestep: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Assign synchronized video/audio times and return unique values plus row indices."""
-    if video_timestep.numel() != 1 or audio_timestep.numel() != 1:
+    """Assign video/audio times per row and return unique values plus row indices.
+
+    By default each modality contributes one value shared by its whole target
+    block, and anything else is rejected exactly as before.
+
+    ``per_row_timesteps`` opts into the general form, where ``video_timestep``
+    and ``audio_timestep`` may instead carry one value per target row of that
+    modality. A single packed sequence can then span a range of noise levels --
+    rising along the frame axis, pinned on an observed prefix, or drawn
+    independently per token -- which the transformer already supports because it
+    selects modulation through ``timestep_indices``. The opt-in exists so a
+    caller cannot reach that behaviour by accidentally passing a vector whose
+    length happens to match the row count.
+
+    Rows that are neither target nor condition media, meaning the text prefix,
+    follow ``text_timestep``. It defaults to the first video value, which is the
+    shared value whenever the video block carries one.
+    """
+    if not per_row_timesteps and (video_timestep.numel() != 1 or audio_timestep.numel() != 1):
         raise ValueError("H3 T2VA packed forward requires one video and audio timestep")
-    video_timestep = video_timestep.reshape(1).to(torch.float32)
-    audio_timestep = audio_timestep.reshape(1).to(device=video_timestep.device, dtype=torch.float32)
-    row_timesteps = video_timestep.expand(layout.sequence_length).clone()
-    video_indices = layout.video_indices.to(row_timesteps.device)
-    audio_indices = layout.audio_indices.to(row_timesteps.device)
+    video_timestep = video_timestep.reshape(-1).to(torch.float32)
+    audio_timestep = audio_timestep.reshape(-1).to(device=video_timestep.device, dtype=torch.float32)
+    if video_timestep.numel() == 0 or audio_timestep.numel() == 0:
+        raise ValueError("H3 packed forward requires at least one video and audio timestep")
+
+    device = video_timestep.device
+    video_indices = layout.video_indices.to(device)
+    audio_indices = layout.audio_indices.to(device)
+    target_video = video_indices[layout.num_condition_video_rows :]
+    target_audio = audio_indices[layout.num_condition_audio_rows :]
+    video_timestep = _target_timestep_values("video", video_timestep, int(target_video.numel()))
+    audio_timestep = _target_timestep_values("audio", audio_timestep, int(target_audio.numel()))
+
+    if text_timestep is None:
+        base = video_timestep[0]
+    else:
+        text_timestep = text_timestep.reshape(-1).to(device=device, dtype=torch.float32)
+        if text_timestep.numel() != 1:
+            raise ValueError("H3 text rows require a single timestep")
+        base = text_timestep[0]
+
+    row_timesteps = base.expand(layout.sequence_length).clone()
+    row_timesteps[target_video] = video_timestep[0] if video_timestep.numel() == 1 else video_timestep
+    row_timesteps[target_audio] = audio_timestep[0] if audio_timestep.numel() == 1 else audio_timestep
     if layout.num_condition_video_rows:
         if condition_video_timestep is None or condition_video_timestep.numel() != 1:
             raise ValueError("H3 visual conditioning requires one video timestep")
         row_timesteps[video_indices[: layout.num_condition_video_rows]] = condition_video_timestep.reshape(1).to(
-            device=row_timesteps.device,
+            device=device,
             dtype=torch.float32,
         )[0]
-    row_timesteps[audio_indices[layout.num_condition_audio_rows :]] = audio_timestep[0]
     if layout.num_condition_audio_rows:
         if condition_audio_timestep is None or condition_audio_timestep.numel() != 1:
             raise ValueError("H3 reference-audio conditioning requires one timestep")
         row_timesteps[audio_indices[: layout.num_condition_audio_rows]] = condition_audio_timestep.reshape(1).to(
-            device=row_timesteps.device,
+            device=device,
             dtype=torch.float32,
         )[0]
     return torch.unique(row_timesteps, sorted=True, return_inverse=True)

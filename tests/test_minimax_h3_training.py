@@ -241,6 +241,81 @@ def test_h3_t2va_packing_matches_released_row_order_rope_clock_and_inverses():
     torch.testing.assert_close(unpack_audio_tokens(audio_rows, num_audio_latents=3), audio)
 
 
+def _row_timestep_layout():
+    return build_t2va_packed_sequence(
+        torch.ones(4, dtype=torch.long),
+        num_latent_frames=2,
+        latent_height=4,
+        latent_width=4,
+        num_audio_latents=3,
+        patch_size=(1, 2, 2),
+    )
+
+
+def test_h3_row_timesteps_accept_one_value_per_target_video_row():
+    # A packed sequence may carry a different noise level on every video row.
+    # The transformer selects modulation through timestep_indices, so the only
+    # requirement here is that each row recovers the value it was given.
+    layout = _row_timestep_layout()
+    per_row = torch.linspace(0.1, 0.8, int(layout.video_indices.numel()))
+
+    timesteps, indices = build_row_timesteps(layout, per_row, torch.tensor([0.9]), per_row_timesteps=True)
+
+    torch.testing.assert_close(timesteps[indices[layout.video_indices]], per_row)
+    assert bool((timesteps[indices[layout.audio_indices]] == 0.9).all())
+    # Text follows the first video value unless told otherwise.
+    assert bool((timesteps[indices[layout.text_indices]] == per_row[0]).all())
+
+
+def test_h3_row_timesteps_accept_one_value_per_target_audio_row():
+    layout = _row_timestep_layout()
+    per_row = torch.linspace(0.2, 0.6, int(layout.audio_indices.numel()))
+
+    timesteps, indices = build_row_timesteps(layout, torch.tensor([0.4]), per_row, per_row_timesteps=True)
+
+    torch.testing.assert_close(timesteps[indices[layout.audio_indices]], per_row)
+    assert bool((timesteps[indices[layout.video_indices]] == 0.4).all())
+
+
+def test_h3_row_timesteps_can_pin_the_text_prefix_independently():
+    layout = _row_timestep_layout()
+    per_row = torch.linspace(0.1, 0.8, int(layout.video_indices.numel()))
+
+    timesteps, indices = build_row_timesteps(layout, per_row, torch.tensor([0.9]), per_row_timesteps=True, text_timestep=torch.tensor([0.5]))
+
+    assert bool((timesteps[indices[layout.text_indices]] == 0.5).all())
+
+
+def test_h3_row_timesteps_reject_vectors_without_the_opt_in():
+    # Without per_row_timesteps the function keeps its original contract, so a
+    # vector cannot reach the per-row path by accident even when its length
+    # happens to match a target block.
+    layout = _row_timestep_layout()
+    per_row = torch.linspace(0.1, 0.8, int(layout.video_indices.numel()))
+
+    with pytest.raises(ValueError, match="requires one video and audio timestep"):
+        build_row_timesteps(layout, per_row, torch.tensor([0.9]))
+
+
+def test_h3_row_timesteps_reject_a_length_that_matches_no_target_block():
+    layout = _row_timestep_layout()
+
+    with pytest.raises(ValueError, match="one value per target video row"):
+        build_row_timesteps(layout, torch.tensor([0.1, 0.2, 0.3]), torch.tensor([0.9]), per_row_timesteps=True)
+
+
+def test_h3_row_timesteps_are_unchanged_by_a_scalar_that_repeats_per_row():
+    # Passing the same value once or once per row must produce the same packing,
+    # so the generalization cannot alter any existing caller.
+    layout = _row_timestep_layout()
+    scalar_timesteps, scalar_indices = build_row_timesteps(layout, torch.tensor([0.3]), torch.tensor([0.7]))
+    expanded = torch.full((int(layout.video_indices.numel()),), 0.3)
+    vector_timesteps, vector_indices = build_row_timesteps(layout, expanded, torch.tensor([0.7]), per_row_timesteps=True)
+
+    torch.testing.assert_close(scalar_timesteps, vector_timesteps)
+    torch.testing.assert_close(scalar_indices, vector_indices)
+
+
 def test_h3_image_packing_has_no_audio_rows():
     layout = build_t2va_packed_sequence(
         torch.ones(4, dtype=torch.long),
