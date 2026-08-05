@@ -404,7 +404,13 @@ def denoise_fl2va(
             latent_shape=(config.in_channels, shape.video_latent_frames, latent_height, latent_width),
             patch_size=tuple(config.patch_size),
         )
-        audio_prediction = unpack_audio_tokens(output.audio, num_audio_latents=shape.audio_latent_frames)
+        # Strip observed audio the same way Ref2VA does. The FL2VA layout carries
+        # no condition audio until extension supplies some, at which point
+        # unpacking the whole block would misalign every remaining latent.
+        audio_prediction = unpack_audio_tokens(
+            output.audio[:, layout.num_condition_audio_rows :],
+            num_audio_latents=shape.audio_latent_frames,
+        )
         video = data_ward_euler_step(
             video,
             video_prediction,
