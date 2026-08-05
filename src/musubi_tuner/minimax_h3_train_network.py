@@ -34,6 +34,7 @@ from musubi_tuner.minimax_h3.cache import (
     H3_TEXT_TOKEN_TAGS_KEY,
 )
 from musubi_tuner.minimax_h3.component_loader import load_audio_vae_decoder, load_video_vae_decoder
+from musubi_tuner.minimax_h3.crepa import H3CREPA, H3CREPAConfig, parse_crepa_config
 from musubi_tuner.minimax_h3.dataset import create_h3_dataset_group
 from musubi_tuner.minimax_h3.inference import (
     decode_latents_sequentially,
@@ -85,6 +86,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
     def __init__(self):
         super().__init__()
         self.backend: H3TrainingBackend | None = None
+        self._crepa_config: H3CREPAConfig | None = None
+        self._crepa: H3CREPA | None = None
 
     @property
     def architecture(self) -> str:
@@ -129,6 +132,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         self.default_guidance_scale = 1.0
         self.default_discrete_flow_shift = 1.0
         self.vae_frame_stride = 17
+        self._crepa_config = parse_crepa_config(args.crepa)
 
         # H3 owns its own flow shifts because video and audio ride different
         # schedules (12 and 3) off one shared unshifted coordinate. The common
@@ -190,6 +194,42 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             missing = [name for name, value in required.items() if value is None]
             if missing:
                 raise ValueError("MiniMax H3 sampling during training requires " + ", ".join(missing))
+
+    def on_transformer_loaded(self, args, accelerator, transformer) -> None:
+        del args
+        if self._crepa_config is None:
+            return
+        config = getattr(transformer, "config", None)
+        hidden_size = getattr(config, "hidden_size", None)
+        if hidden_size is None:
+            raise TypeError("MiniMax H3 CREPA requires transformer.config.hidden_size")
+        self._crepa = H3CREPA(hidden_size, self._crepa_config)
+        self._crepa.install(transformer)
+        object.__setattr__(transformer, "_h3_crepa_controller", self._crepa)
+
+        def save_crepa_state(_models, _weights, output_dir):
+            if accelerator.is_main_process:
+                self._crepa.save_state(output_dir)
+
+        def load_crepa_state(_models, input_dir):
+            self._crepa.load_state(input_dir)
+
+        accelerator.register_save_state_pre_hook(save_crepa_state)
+        accelerator.register_load_state_pre_hook(load_crepa_state)
+
+    def extra_trainable_params(self, args, accelerator, network, transformer, trainable_params):
+        del args, network, transformer
+        if self._crepa is None:
+            return trainable_params
+        self._crepa.projector.to(device=accelerator.device, dtype=torch.float32)
+        if not trainable_params or not isinstance(trainable_params[0], dict) or "params" not in trainable_params[0]:
+            raise TypeError("MiniMax H3 CREPA requires the network optimizer parameters to use named parameter groups")
+        groups = [dict(group) for group in trainable_params]
+        groups[0]["params"] = [*groups[0]["params"], *self._crepa.projector.parameters()]
+        return groups
+
+    def extra_gradient_params(self) -> list[torch.nn.Parameter]:
+        return [] if self._crepa is None else list(self._crepa.projector.parameters())
 
     def process_sample_prompts(self, args: argparse.Namespace, accelerator: Accelerator, sample_prompts: str):
         prompts = load_prompts(sample_prompts)
@@ -586,14 +626,22 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 finally:
                     set_enabled(True)
 
-        raw_prediction = self._predict(
-            accelerator,
-            transformer,
-            batch,
-            inputs,
-            conditioning="prompt",
-            gradient_checkpointing=args.gradient_checkpointing,
-        )
+        use_crepa = self._crepa is not None and has_video and not is_image and observed != "video"
+        if self._crepa is not None:
+            self._crepa.begin_step(use_crepa)
+        try:
+            raw_prediction = self._predict(
+                accelerator,
+                transformer,
+                batch,
+                inputs,
+                conditioning="prompt",
+                gradient_checkpointing=args.gradient_checkpointing,
+            )
+        except Exception:
+            if self._crepa is not None:
+                self._crepa.clear_step()
+            raise
         prediction = raw_prediction
         if args.h3_guidance_distillation_scale is not None:
             prediction = guidance_consistent_prediction(prediction, empty_prediction, args.h3_guidance_distillation_scale)
@@ -646,6 +694,14 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             )
             loss = loss + args.h3_base_preservation_loss_weight * preservation.loss
             metrics["loss/base_preservation"] = float(preservation.loss.detach())
+        if use_crepa:
+            crepa_loss, crepa_metrics = self._crepa.loss()
+            loss = loss + crepa_loss
+            metrics.update(crepa_metrics)
+        # Keep capture active until backward has completed. Non-reentrant
+        # gradient checkpointing recomputes hooked blocks during backward and
+        # requires the hook to perform the same tensor operations as forward.
+        # begin_step() clears the captures before the next trainable pass.
         return loss, metrics
 
     def call_dit(self, *args, **kwargs):
@@ -666,6 +722,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             "ss_h3_shift_video": str(args.h3_shift_video),
             "ss_h3_shift_audio": str(args.h3_shift_audio),
             "ss_h3_timestep_sampling": args.timestep_sampling,
+            "ss_h3_crepa": self._crepa_config.to_json() if self._crepa_config is not None else "disabled",
         }
 
 
@@ -741,6 +798,16 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         default=0.0,
         help=(
             "optional frozen-base prediction-preservation loss weight; adds one no-grad transformer forward per batch"
+        ),
+    )
+    parser.add_argument(
+        "--crepa",
+        nargs="*",
+        metavar="KEY=VALUE",
+        default=None,
+        help=(
+            "enable temporal representation alignment; optional values: student_block=16 teacher_block=33 "
+            "weight=0.05 tau=1 neighbors=2"
         ),
     )
     parser.add_argument(

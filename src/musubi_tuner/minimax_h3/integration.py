@@ -655,6 +655,15 @@ class _NativeTrainingBackend:
                 patch_size=patch_size,
             )
             timestep, timestep_indices = build_row_timesteps(layout, video_timestep, audio_timestep)
+        crepa = getattr(transformer, "_h3_crepa_controller", None)
+        if crepa is not None and video_hidden_states is not None:
+            patch_h, patch_w = patch_size[-2:]
+            target_video_indices = layout.video_indices[layout.num_condition_video_rows :]
+            crepa.set_layout(
+                target_video_indices,
+                latent_frames,
+                (latent_height // patch_h) * (latent_width // patch_w),
+            )
         output = transformer(
             video_hidden_states=video_rows,
             audio_hidden_states=audio_rows,

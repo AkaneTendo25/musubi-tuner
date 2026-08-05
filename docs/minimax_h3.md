@@ -385,6 +385,24 @@ zero-or-more references while strict `ref2va` continues to require at least one 
 The default `modality` loss mode gives the video and audio means equal weight before applying their explicit loss weights.
 `token` is an optional element-weighted reduction over all valid latent values. LoHa/LoKr architecture detection is unsupported.
 
+### CREPA
+
+CREPA is an optional temporal representation-alignment loss for video training. It aligns projected features from an earlier
+transformer block with detached features from a later block across the same and neighboring latent frames. Only generated video
+rows participate: text, audio, keyframes, and Ref2VA reference rows are excluded before spatial pooling.
+
+Enable the default configuration with `--crepa`, or override its fields through the same option:
+
+```shell
+accelerate launch minimax_h3_train_network.py ... \
+  --crepa student_block=16 teacher_block=33 weight=0.05 tau=1 neighbors=2
+```
+
+The option is absent by default and then installs no hooks, projection parameters, or auxiliary loss. It applies to video clips
+with more than one latent frame and is skipped for image-only batches, audio-only batches, and batches where video is the observed
+conditioning modality. CREPA's projection head is training state rather than part of the inference LoRA; Accelerate state saves
+store it separately as `h3_crepa.safetensors` so interrupted runs can resume exactly.
+
 ### Flow schedules
 
 Each step draws one unshifted schedule coordinate and derives both modality sigmas from it independently, so video and audio

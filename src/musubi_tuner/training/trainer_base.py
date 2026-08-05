@@ -1315,6 +1315,10 @@ class NetworkTrainer:
         """
         return trainable_params
 
+    def extra_gradient_params(self) -> list[torch.nn.Parameter]:
+        """Return extension-owned parameters that need reduction, logging, and clipping."""
+        return []
+
     def extra_metadata(self, args: argparse.Namespace) -> dict:
         """Returns extra ``ss_*`` metadata keys to embed in saved safetensors.
 
@@ -2083,15 +2087,18 @@ class NetworkTrainer:
                         # self.all_reduce_network(accelerator, network)  # sync DDP grad manually
                         state = accelerate.PartialState()
                         if state.distributed_type != accelerate.DistributedType.NO:
-                            for param in network.parameters():
+                            for param in (*network.parameters(), *self.extra_gradient_params()):
                                 if param.grad is not None:
                                     param.grad = accelerator.reduce(param.grad, reduction="mean")
 
                         if args.log_grad_metrics and len(accelerator.trackers) > 0:
-                            grad_metrics = self.collect_grad_metrics(network.parameters())
+                            grad_metrics = self.collect_grad_metrics((*network.parameters(), *self.extra_gradient_params()))
 
                         if args.max_grad_norm != 0.0:
-                            params_to_clip = accelerator.unwrap_model(network).get_trainable_params()
+                            params_to_clip = [
+                                *accelerator.unwrap_model(network).get_trainable_params(),
+                                *self.extra_gradient_params(),
+                            ]
                             accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
 
                     optimizer.step()

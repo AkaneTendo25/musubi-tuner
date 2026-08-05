@@ -28,6 +28,7 @@ from musubi_tuner.minimax_h3.cache import (
     H3_VIDEO_GEOMETRY_KEY,
     save_text_encoder_output_cache_minimax_h3,
 )
+from musubi_tuner.minimax_h3.crepa import H3CREPA, H3CREPAConfig, parse_crepa_config
 from musubi_tuner.minimax_h3.integration import _NativeTrainingBackend
 from musubi_tuner.minimax_h3.model import MiniMaxH3Transformer, MiniMaxH3TransformerConfig
 from musubi_tuner.minimax_h3.packing import (
@@ -54,6 +55,118 @@ from musubi_tuner.minimax_h3.training import (
 )
 from musubi_tuner.minimax_h3_train_network import MiniMaxH3NetworkTrainer, create_parser
 from musubi_tuner.networks import lora_minimax_h3
+
+
+class _CREPABlock(nn.Module):
+    def __init__(self, scale: float):
+        super().__init__()
+        self.scale = scale
+
+    def forward(self, hidden_states):
+        return hidden_states * self.scale
+
+
+class _CREPATransformer(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.blocks = nn.ModuleList([_CREPABlock(1.0), _CREPABlock(2.0), _CREPABlock(3.0)])
+
+    def forward(self, hidden_states, checkpoint_blocks=False):
+        for block in self.blocks:
+            if checkpoint_blocks:
+                hidden_states = torch.utils.checkpoint.checkpoint(block, hidden_states, use_reentrant=False)
+            else:
+                hidden_states = block(hidden_states)
+        return hidden_states
+
+
+def test_h3_crepa_single_flag_parses_defaults_and_overrides():
+    assert create_parser().parse_args([]).crepa is None
+    assert create_parser().parse_args(["--crepa"]).crepa == []
+    values = create_parser().parse_args(["--crepa", "student_block=4", "weight=0.02"]).crepa
+    config = parse_crepa_config(values)
+    assert config.student_block == 4
+    assert config.teacher_block == 33
+    assert config.weight == pytest.approx(0.02)
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        ["unknown=1"],
+        ["weight=0"],
+        ["weight=0.1", "weight=0.2"],
+        ["student_block=3", "teacher_block=2"],
+        ["neighbors=-1"],
+        ["weight"],
+    ],
+)
+def test_h3_crepa_rejects_invalid_configuration(values):
+    with pytest.raises(ValueError):
+        parse_crepa_config(values)
+
+
+def test_h3_crepa_extracts_only_target_video_rows_and_backpropagates(tmp_path):
+    config = H3CREPAConfig(student_block=0, teacher_block=2, weight=0.1, tau=1.0, neighbors=1)
+    transformer = _CREPATransformer()
+    crepa = H3CREPA(hidden_size=4, config=config)
+    crepa.install(transformer)
+    # Packed rows 0/1 are text or references. Target video is frame-major at
+    # rows 2..5, with two spatial rows per latent frame.
+    crepa.set_layout(torch.tensor([2, 3, 4, 5]), frames=2, rows_per_frame=2)
+    crepa.begin_step(True)
+    hidden = torch.arange(24, dtype=torch.float32).reshape(1, 6, 4).requires_grad_()
+    transformer(hidden)
+
+    expected_student = hidden[:, 2:].reshape(1, 2, 2, 4).mean(dim=2)
+    torch.testing.assert_close(crepa._student, expected_student)
+    assert not crepa._teacher.requires_grad
+    loss, metrics = crepa.loss()
+    loss.backward()
+    assert metrics["crepa/alignment"] <= 1.0
+    assert hidden.grad is not None and hidden.grad[:, 2:].abs().sum() > 0
+    assert hidden.grad[:, :2].abs().sum() == 0
+    assert all(parameter.grad is not None for parameter in crepa.projector.parameters())
+
+    crepa.save_state(tmp_path)
+    restored = H3CREPA(hidden_size=4, config=config)
+    assert restored.load_state(tmp_path)
+    for expected, actual in zip(crepa.projector.parameters(), restored.projector.parameters()):
+        torch.testing.assert_close(actual, expected)
+
+
+def test_h3_crepa_is_inert_when_disabled():
+    transformer = _CREPATransformer()
+    crepa = H3CREPA(4, H3CREPAConfig(student_block=0, teacher_block=2))
+    crepa.install(transformer)
+    crepa.set_layout(torch.tensor([0, 1]), frames=1, rows_per_frame=2)
+    crepa.begin_step(False)
+    transformer(torch.ones(1, 2, 4, requires_grad=True))
+    assert crepa._student is None
+    assert crepa._teacher is None
+
+
+def test_h3_crepa_hooks_are_symmetric_during_checkpoint_recomputation():
+    transformer = _CREPATransformer()
+    crepa = H3CREPA(4, H3CREPAConfig(student_block=0, teacher_block=2))
+    crepa.install(transformer)
+    crepa.set_layout(torch.tensor([0, 1, 2, 3]), frames=2, rows_per_frame=2)
+    crepa.begin_step(True)
+    hidden = torch.randn(1, 4, 4, requires_grad=True)
+    transformer(hidden, checkpoint_blocks=True)
+    loss, _ = crepa.loss()
+    loss.backward()
+    assert hidden.grad is not None and torch.isfinite(hidden.grad).all()
+
+
+def test_h3_crepa_uses_existing_optimizer_group():
+    trainer = MiniMaxH3NetworkTrainer()
+    trainer._crepa = H3CREPA(4, H3CREPAConfig(student_block=0, teacher_block=2))
+    original = nn.Parameter(torch.ones(1))
+    groups = trainer.extra_trainable_params(None, SimpleNamespace(device=torch.device("cpu")), None, None, [{"params": [original]}])
+    assert len(groups) == 1
+    assert groups[0]["params"][0] is original
+    assert len(groups[0]["params"]) == 1 + len(list(trainer._crepa.projector.parameters()))
 
 
 def test_h3_shift_round_trip_and_cross_modality_mapping():
