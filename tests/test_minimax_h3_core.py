@@ -351,6 +351,63 @@ def test_h3_mixed_image_video_dataset_requires_audio_only_for_video_items(tmp_pa
     assert adapter.attach(video_item)[0].modality is MediaModality.VIDEO
 
 
+def test_h3_allows_same_video_directory_for_different_resolution_caches(tmp_path):
+    videos = tmp_path / "videos"
+    videos.mkdir()
+    target = videos / "target.mp4"
+    target.write_bytes(b"video fixture")
+    config = {
+        "general": {"batch_size": 1},
+        "datasets": [
+            {
+                "video_directory": str(videos),
+                "cache_directory": str(tmp_path / "cache_512"),
+                "resolution": [512, 512],
+                "target_frames": [22],
+            },
+            {
+                "video_directory": str(videos),
+                "cache_directory": str(tmp_path / "cache_768"),
+                "resolution": [768, 768],
+                "target_frames": [22],
+            },
+        ],
+    }
+
+    group, adapter = create_h3_dataset_group(config, Namespace(debug_dataset=False))
+    item = ItemInfo(str(target), "video", (768, 768), (768, 768, 22), frame_count=22)
+
+    assert len(group.datasets) == 2
+    assert [dataset.resolution for dataset in group.datasets] == [(512, 512), (768, 768)]
+    assert adapter.attach(item)[0].path == target
+
+
+def test_h3_rejects_conflicting_modes_for_duplicate_target_path(tmp_path):
+    videos = tmp_path / "videos"
+    videos.mkdir()
+    (videos / "target.mp4").write_bytes(b"video fixture")
+    config = {
+        "general": {"resolution": [512, 512]},
+        "datasets": [
+            {
+                "video_directory": str(videos),
+                "cache_directory": str(tmp_path / "cache_av"),
+                "target_frames": [22],
+                "h3_target_mode": "av",
+            },
+            {
+                "video_directory": str(videos),
+                "cache_directory": str(tmp_path / "cache_video"),
+                "target_frames": [22],
+                "h3_target_mode": "video",
+            },
+        ],
+    }
+
+    with pytest.raises(ValueError, match="conflicting h3_target_mode"):
+        create_h3_dataset_group(config, Namespace(debug_dataset=False))
+
+
 def test_h3_dataset_adapter_does_not_add_shared_config_fields(tmp_path):
     config = {
         "general": {"resolution": [512, 512]},

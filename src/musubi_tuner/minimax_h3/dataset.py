@@ -173,8 +173,7 @@ class H3DatasetAdapter:
                 invalid_frames = [frame_count for frame_count in target_frames or () if not is_valid_frame_count(frame_count)]
                 if invalid_frames:
                     raise ValueError(
-                        "MiniMax H3 video target_frames must satisfy frame_count % 17 == 5; "
-                        f"invalid values: {invalid_frames}"
+                        f"MiniMax H3 video target_frames must satisfy frame_count % 17 == 5; invalid values: {invalid_frames}"
                     )
                 target_paths = tuple(glob_videos(video_directory))
             elif video_jsonl_file:
@@ -182,8 +181,7 @@ class H3DatasetAdapter:
                 invalid_frames = [frame_count for frame_count in target_frames or () if not is_valid_frame_count(frame_count)]
                 if invalid_frames:
                     raise ValueError(
-                        "MiniMax H3 video target_frames must satisfy frame_count % 17 == 5; "
-                        f"invalid values: {invalid_frames}"
+                        f"MiniMax H3 video target_frames must satisfy frame_count % 17 == 5; invalid values: {invalid_frames}"
                     )
                 records = _read_media_jsonl(video_jsonl_file)
                 target_paths = tuple(record["video_path"] for record in records)
@@ -224,20 +222,26 @@ class H3DatasetAdapter:
                 )
                 resolved = _ResolvedTarget(Path(target), references)
                 normal = _normal_path(target)
-                if normal in self._targets:
-                    raise ValueError(f"duplicate H3 target path across datasets: {target}")
-                self._targets[normal] = resolved
-                self._target_modalities[normal] = modality
-                self._target_modes[normal] = target_mode
+                existing = self._targets.get(normal)
+                if existing is not None:
+                    if existing != resolved or self._target_modalities[normal] is not modality:
+                        raise ValueError(f"conflicting H3 media metadata for target path across datasets: {target}")
+                    if self._target_modes[normal] != target_mode:
+                        raise ValueError(f"conflicting h3_target_mode for target path across datasets: {target}")
+                else:
+                    # A source directory may intentionally be repeated with different
+                    # resolutions and cache directories. Those dataset-level settings
+                    # do not change the H3 media attached to an item.
+                    self._targets[normal] = resolved
+                    self._target_modalities[normal] = modality
+                    self._target_modes[normal] = target_mode
             self._target_groups.append(tuple(_normal_path(target) for target in target_paths))
 
         self.requires_audio = any(
             modality in {MediaModality.VIDEO, MediaModality.AUDIO} and self._target_modes[path] != "video"
             for path, modality in self._target_modalities.items()
         ) or any(
-            reference.modality is MediaModality.AUDIO
-            for resolved in self._targets.values()
-            for reference in resolved.references
+            reference.modality is MediaModality.AUDIO for resolved in self._targets.values() for reference in resolved.references
         )
         self.requires_video = any(mode != "audio" for mode in self._target_modes.values()) or any(
             reference.modality in {MediaModality.IMAGE, MediaModality.VIDEO}
@@ -262,6 +266,9 @@ class H3DatasetAdapter:
             dataset.has_control = False
             for target in target_group:
                 if self._target_modalities[target] is MediaModality.VIDEO:
+                    existing_fps = self._target_fps.get(target)
+                    if existing_fps is not None and existing_fps != dataset.target_fps:
+                        raise ValueError(f"conflicting target FPS for H3 target path across datasets: {target}")
                     self._target_fps[target] = dataset.target_fps
 
     def _resolve_target(self, item_key: str) -> tuple[_ResolvedTarget, int | None, int | None]:
