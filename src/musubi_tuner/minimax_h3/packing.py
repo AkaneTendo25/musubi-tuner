@@ -193,9 +193,23 @@ def build_t2va_packed_sequence(
     latent_width: int,
     num_audio_latents: int,
     patch_size: tuple[int, int, int],
-    keyframe_anchors: tuple[str, ...] = (),
+    keyframe_anchors: tuple[str | int, ...] = (),
+    num_condition_audio_latents: int = 0,
 ) -> MiniMaxH3PackedSequence:
-    """Build FL2VA's ``[text | keyframes | target audio | target video]`` layout."""
+    """Build FL2VA's ``[text | keyframes | condition audio | target audio | target video]`` layout.
+
+    ``keyframe_anchors`` names the temporal position of each conditioning frame.
+    ``"first"`` and ``"last"`` are the released FL2VA anchors; ``"last"`` is the
+    final *pixel* frame, which is one latent window beyond the final latent
+    window's start, so it is deliberately not the same anchor as the integer
+    ``num_latent_frames - 1``. An integer anchor names a latent window by index
+    and lands on that window's start, exactly where the matching target row sits.
+
+    ``num_condition_audio_latents`` prepends clean audio latents to the audio
+    block. They occupy the first coordinates of the audio timeline and push the
+    target audio after them, so no coordinate is used twice -- the same
+    arrangement Ref2VA uses for reference audio.
+    """
     if text_token_tags.ndim != 1 or text_token_tags.numel() == 0:
         raise ValueError("H3 text token tags must be a non-empty one-dimensional tensor")
     if bool(((text_token_tags < 0) | (text_token_tags > int(MiniMaxH3TokenTag.AUDIO))).any()):
@@ -211,18 +225,39 @@ def build_t2va_packed_sequence(
         raise ValueError("H3 packed sequences require at least one target modality")
     if keyframe_anchors and num_latent_frames == 0:
         raise ValueError("H3 keyframe conditioning requires a video target")
+    if num_condition_audio_latents < 0:
+        raise ValueError("H3 audio conditioning length cannot be negative")
+    if num_condition_audio_latents and num_audio_latents == 0:
+        raise ValueError("H3 audio conditioning requires an audio target")
 
     rows_per_frame = (latent_height // patch_h) * (latent_width // patch_w)
-    if any(anchor not in ("first", "last") for anchor in keyframe_anchors):
-        raise ValueError("H3 keyframe anchors must be 'first' or 'last'")
-    if len(set(keyframe_anchors)) != len(keyframe_anchors):
-        raise ValueError("H3 keyframe anchors must be unique")
     num_text_rows = int(text_token_tags.shape[0])
+    # "first" and an explicit index 0 name the same coordinate, so they collide;
+    # "last" names the final pixel frame and never collides with an index.
+    anchor_identities: list[object] = []
+    for anchor in keyframe_anchors:
+        if isinstance(anchor, bool) or not isinstance(anchor, (str, int)):
+            raise ValueError("H3 keyframe anchors must be 'first', 'last', or a latent frame index")
+        if anchor == "first":
+            anchor_identities.append(0)
+        elif anchor == "last":
+            anchor_identities.append("last")
+        elif isinstance(anchor, int):
+            if not 0 <= anchor < num_latent_frames:
+                raise ValueError(f"H3 keyframe anchor {anchor} is outside the {num_latent_frames} target latent frames")
+            anchor_identities.append(int(anchor))
+        else:
+            raise ValueError("H3 keyframe anchors must be 'first', 'last', or a latent frame index")
+    if len(set(anchor_identities)) != len(anchor_identities):
+        raise ValueError("H3 keyframe anchors must be unique")
+
     num_condition_video_rows = len(keyframe_anchors) * rows_per_frame
-    num_audio_rows = _AUDIO_CHANNELS * num_audio_latents
+    num_condition_audio_rows = _AUDIO_CHANNELS * num_condition_audio_latents
+    num_audio_rows = num_condition_audio_rows + _AUDIO_CHANNELS * num_audio_latents
     num_video_rows = num_latent_frames * rows_per_frame
     condition_start = num_text_rows
     audio_start = condition_start + num_condition_video_rows
+    target_audio_start = audio_start + num_condition_audio_rows
     video_start = audio_start + num_audio_rows
     sequence_length = video_start + num_video_rows
 
@@ -238,22 +273,31 @@ def build_t2va_packed_sequence(
     position_ids[text_indices, 0] = torch.arange(num_text_rows, dtype=torch.float64)
     frame_grid, width_grid = _frame_position_grid(latent_height, latent_width, patch_h, patch_w)
 
-    for index, anchor in enumerate(keyframe_anchors):
-        if anchor == "first":
-            anchor_time = float(num_text_rows)
-        else:
+    latent_starts = _temporal_position_grid(num_latent_frames, float(num_text_rows)) if num_latent_frames else None
+    for index, identity in enumerate(anchor_identities):
+        if identity == "last":
             anchor_time = float(num_text_rows) + _temporal_position_span(num_latent_frames) - _ROPE_FRAME_RESCALE
+        else:
+            anchor_time = float(latent_starts[identity])
         rows = slice(condition_start + index * rows_per_frame, condition_start + (index + 1) * rows_per_frame)
         position_ids[rows, 0] = anchor_time
         position_ids[rows, 1:] = frame_grid
 
-    audio_time = float(num_text_rows) + torch.arange(num_audio_latents, dtype=torch.float64)
-    position_ids[audio_indices, 0] = audio_time.repeat(_AUDIO_CHANNELS)
-    position_ids[audio_indices, 2] = torch.cat(
-        (
-            torch.full((num_audio_latents,), float(width_grid[0]), dtype=torch.float64),
-            torch.full((num_audio_latents,), float(width_grid[-1]), dtype=torch.float64),
-        )
+    # Condition audio takes the opening coordinates and the target follows it, so
+    # the two never share a position.
+    _fill_audio_positions(
+        position_ids,
+        slice(audio_start, target_audio_start),
+        num_condition_audio_latents,
+        float(num_text_rows),
+        width_grid,
+    )
+    _fill_audio_positions(
+        position_ids,
+        slice(target_audio_start, video_start),
+        num_audio_latents,
+        float(num_text_rows + num_condition_audio_latents),
+        width_grid,
     )
 
     video_positions = torch.empty(num_latent_frames, rows_per_frame, 3, dtype=torch.float64)
@@ -268,6 +312,7 @@ def build_t2va_packed_sequence(
         audio_indices=audio_indices,
         text_indices=text_indices,
         num_condition_video_rows=num_condition_video_rows,
+        num_condition_audio_rows=num_condition_audio_rows,
     )
 
 

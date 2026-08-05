@@ -45,6 +45,7 @@ from musubi_tuner.minimax_h3.training import (
     OBSERVED_VIDEO_SIGMA,
     H3ModelPrediction,
     guidance_consistent_prediction,
+    joint_prediction_loss,
     joint_velocity_loss,
     map_sigma_between_shifts,
     prepare_joint_noisy_inputs,
@@ -179,6 +180,28 @@ def test_h3_joint_loss_ignores_the_observed_modality():
     torch.testing.assert_close(result.loss, result.audio_loss)
 
 
+def test_h3_prediction_preservation_detaches_reference_and_ignores_observed_modality():
+    video = torch.ones(1, 2, requires_grad=True)
+    audio = torch.ones(1, 3, requires_grad=True)
+    reference_video = torch.zeros_like(video, requires_grad=True)
+    reference_audio = torch.zeros_like(audio, requires_grad=True)
+
+    result = joint_prediction_loss(
+        H3ModelPrediction(video, audio),
+        H3ModelPrediction(reference_video, reference_audio),
+        balance="modality",
+        video_weight=0.0,
+        audio_weight=1.0,
+    )
+    result.loss.backward()
+
+    torch.testing.assert_close(result.loss, result.audio_loss)
+    assert video.grad is not None and torch.count_nonzero(video.grad) == 0
+    assert audio.grad is not None and torch.count_nonzero(audio.grad) > 0
+    assert reference_video.grad is None
+    assert reference_audio.grad is None
+
+
 def test_h3_joint_noising_gives_equal_sigmas_for_equal_shifts():
     # At video_shift == audio_shift the two schedules are the same schedule, so
     # the two sigmas must coincide for any base coordinate.
@@ -239,6 +262,112 @@ def test_h3_t2va_packing_matches_released_row_order_rope_clock_and_inverses():
         video,
     )
     torch.testing.assert_close(unpack_audio_tokens(audio_rows, num_audio_latents=3), audio)
+
+
+def _anchor_layout(anchors=(), *, condition_audio=0, frames=7):
+    return build_t2va_packed_sequence(
+        torch.ones(4, dtype=torch.long),
+        num_latent_frames=frames,
+        latent_height=4,
+        latent_width=4,
+        num_audio_latents=3,
+        patch_size=(1, 2, 2),
+        keyframe_anchors=anchors,
+        num_condition_audio_latents=condition_audio,
+    )
+
+
+def _anchor_times(layout, count, rows_per_frame=4):
+    return [float(layout.position_ids[layout.video_indices[index * rows_per_frame], 0]) for index in range(count)]
+
+
+def test_h3_released_keyframe_anchors_keep_their_exact_positions():
+    # "first" sits at the text boundary and "last" one latent window past the
+    # final window's start, which is the released FL2VA contract.
+    layout = _anchor_layout(("first", "last"))
+    span = sum(5.0 / 3.0 * (1, 4, 4, 4, 4)[index % 5] for index in range(7))
+
+    assert _anchor_times(layout, 2) == [4.0, 4.0 + span - 5.0 / 3.0]
+
+
+def test_h3_integer_keyframe_anchor_lands_on_its_target_latent_window():
+    # An integer anchor names a latent window, so it must coincide with the
+    # position of that window's own target rows.
+    layout = _anchor_layout((3,))
+    target_start = layout.video_indices[layout.num_condition_video_rows :]
+
+    assert _anchor_times(layout, 1)[0] == float(layout.position_ids[target_start[3 * 4], 0])
+
+
+def test_h3_last_anchor_is_not_the_final_latent_index():
+    # "last" is the final pixel frame; index N-1 is the final latent window's
+    # start. Collapsing them would silently move the released anchor.
+    string_layout = _anchor_layout(("last",))
+    index_layout = _anchor_layout((6,))
+
+    assert _anchor_times(string_layout, 1) != _anchor_times(index_layout, 1)
+
+
+def test_h3_keyframe_anchors_reject_duplicate_first_and_zero():
+    with pytest.raises(ValueError, match="unique"):
+        _anchor_layout(("first", 0))
+
+
+@pytest.mark.parametrize("anchor", [7, -1, True, 1.5])
+def test_h3_keyframe_anchors_reject_invalid_indices(anchor):
+    with pytest.raises(ValueError):
+        _anchor_layout((anchor,))
+
+
+def test_h3_condition_audio_precedes_the_target_without_sharing_coordinates():
+    # Condition audio takes the opening coordinates and the target starts after
+    # them, matching how Ref2VA places reference audio.
+    layout = _anchor_layout(condition_audio=2)
+    audio = layout.audio_indices
+
+    assert layout.num_condition_audio_rows == 4
+    condition_times = layout.position_ids[audio[: layout.num_condition_audio_rows], 0]
+    target_times = layout.position_ids[audio[layout.num_condition_audio_rows :], 0]
+    torch.testing.assert_close(condition_times, torch.tensor([4.0, 5.0, 4.0, 5.0], dtype=torch.float64))
+    torch.testing.assert_close(target_times, torch.tensor([6.0, 7.0, 8.0, 6.0, 7.0, 8.0], dtype=torch.float64))
+    assert not set(condition_times.tolist()) & set(target_times.tolist())
+
+
+def test_h3_condition_audio_is_absent_by_default():
+    # The default layout must be untouched: no condition rows, and the target
+    # audio still opens at the text boundary.
+    layout = _anchor_layout()
+
+    assert layout.num_condition_audio_rows == 0
+    torch.testing.assert_close(
+        layout.position_ids[layout.audio_indices, 0],
+        torch.tensor([4.0, 5.0, 6.0, 4.0, 5.0, 6.0], dtype=torch.float64),
+    )
+
+
+def test_h3_condition_audio_rows_take_the_condition_timestep():
+    layout = _anchor_layout(condition_audio=2)
+
+    timesteps, indices = build_row_timesteps(
+        layout, torch.tensor([0.3]), torch.tensor([0.7]), condition_audio_timestep=torch.tensor([1.0])
+    )
+
+    audio = layout.audio_indices
+    assert bool((timesteps[indices[audio[: layout.num_condition_audio_rows]]] == 1.0).all())
+    assert bool((timesteps[indices[audio[layout.num_condition_audio_rows :]]] == 0.7).all())
+
+
+def test_h3_condition_audio_requires_an_audio_target():
+    with pytest.raises(ValueError, match="audio conditioning requires an audio target"):
+        build_t2va_packed_sequence(
+            torch.ones(4, dtype=torch.long),
+            num_latent_frames=7,
+            latent_height=4,
+            latent_width=4,
+            num_audio_latents=0,
+            patch_size=(1, 2, 2),
+            num_condition_audio_latents=2,
+        )
 
 
 def _row_timestep_layout():
@@ -1115,11 +1244,53 @@ class _FakeAccelerator:
     def autocast():
         return nullcontext()
 
+    @staticmethod
+    def unwrap_model(model):
+        return model
+
 
 class _ScaleTransformer(nn.Module):
     def __init__(self):
         super().__init__()
         self.scale = nn.Parameter(torch.tensor(0.5))
+
+
+class _ToggleNetwork:
+    def __init__(self, transformer):
+        self.transformer = transformer
+        self.events = []
+
+    def set_enabled(self, enabled):
+        self.events.append(enabled)
+        self.transformer.adapter_enabled = enabled
+
+
+class _StochasticPreservationBackend:
+    def __init__(self):
+        self.calls = []
+        self.random_draws = []
+
+    def predict_training(
+        self,
+        transformer,
+        batch,
+        video_hidden_states,
+        audio_hidden_states,
+        video_timestep,
+        audio_timestep,
+        *,
+        conditioning="prompt",
+    ):
+        del batch, video_timestep, audio_timestep
+        source = video_hidden_states if video_hidden_states is not None else audio_hidden_states
+        draw = torch.rand((), device=source.device)
+        self.calls.append((conditioning, torch.is_grad_enabled()))
+        self.random_draws.append(float(draw))
+        scale = transformer.scale if getattr(transformer, "adapter_enabled", True) else transformer.scale.detach() * 0 + 1.0
+        return H3ModelPrediction(
+            video_hidden_states * scale + draw if video_hidden_states is not None else None,
+            audio_hidden_states * scale + draw if audio_hidden_states is not None else None,
+        )
 
 
 class _FakeBackend:
@@ -1189,6 +1360,48 @@ def test_h3_trainer_joint_process_batch_routes_optional_guidance(guidance_scale,
     assert transformer.scale.grad is not None and torch.isfinite(transformer.scale.grad)
     assert set(metrics) == {"loss/video", "loss/audio", "h3/sigma_video", "h3/sigma_audio"}
     assert metrics["loss/audio"] == 0.0
+
+
+def test_h3_trainer_base_preservation_replays_rng_and_restores_network():
+    args = create_parser().parse_args([])
+    args.h3_base_preservation_loss_weight = 0.1
+    args.h3_guidance_distillation_scale = 3.0
+    trainer = MiniMaxH3NetworkTrainer()
+    trainer.dit_dtype = torch.float32
+    backend = _StochasticPreservationBackend()
+    trainer.backend = backend
+    transformer = _ScaleTransformer()
+    network = _ToggleNetwork(transformer)
+    video = torch.zeros(1, 24, 2, 2, 2)
+
+    torch.manual_seed(0)
+    batch = {
+        "timesteps": [0.5],
+        H3_EMPTY_TEXT_HIDDEN_KEY: [torch.zeros(1, 5120)],
+        H3_EMPTY_TEXT_TOKEN_TAGS_KEY: [torch.ones(1, dtype=torch.long)],
+    }
+    loss, metrics = trainer.process_batch(
+        args,
+        _FakeAccelerator(),
+        transformer,
+        network,
+        batch,
+        video,
+        torch.ones_like(video),
+        None,
+        torch.float32,
+        torch.float32,
+        None,
+        0,
+    )
+    loss.backward()
+
+    assert backend.calls == [("empty", False), ("prompt", False), ("prompt", True)]
+    assert backend.random_draws[1] == backend.random_draws[2]
+    assert network.events == [False, True]
+    assert transformer.adapter_enabled is True
+    assert metrics["loss/base_preservation"] > 0
+    assert transformer.scale.grad is not None and torch.isfinite(transformer.scale.grad)
 
 
 def test_h3_trainer_image_process_batch_uses_resolution_schedule_without_audio():
@@ -1383,6 +1596,7 @@ def test_h3_training_parser_defaults_to_native_fl2va_contract():
     assert args.h3_shift_audio == 3.0
     assert args.h3_loss_balance == "modality"
     assert args.h3_guidance_distillation_scale is None
+    assert args.h3_base_preservation_loss_weight == 0.0
     assert args.fp8_scaled is False
     assert args.int8_convrot_base is False
     assert "--fp8_base" in parser._option_string_actions
