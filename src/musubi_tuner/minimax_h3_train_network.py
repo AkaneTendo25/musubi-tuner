@@ -112,6 +112,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         self.backend: H3TrainingBackend | None = None
         self._crepa_config: H3CREPAConfig | None = None
         self._crepa: H3CREPA | None = None
+        self._extension_video_frames = 0
+        self._extension_audio_latents = 0
         self._validation_dataloader = None
 
     @property
@@ -369,6 +371,12 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             raise ValueError("--h3_base_preservation_loss_weight must be finite and non-negative")
         if not 0.0 <= args.h3_caption_dropout_rate <= 1.0:
             raise ValueError("--h3_caption_dropout_rate must lie in [0, 1]")
+        if args.h3_extension_video_frames < 0 or args.h3_extension_audio_latents < 0:
+            raise ValueError("H3 extension context lengths must be non-negative")
+        self._extension_video_frames = args.h3_extension_video_frames
+        self._extension_audio_latents = args.h3_extension_audio_latents
+        if (args.h3_extension_video_frames or args.h3_extension_audio_latents) and args.h3_training_mode != "fl2va":
+            raise ValueError("H3 extension training requires --h3_training_mode fl2va with --task t2va caches")
         if args.fp8_base and args.h3_adaln_rank is None:
             # AdaLN is ~39% of the transformer and is quantized by default, yet
             # measured against the BF16 reference the reduction is both smaller
@@ -676,6 +684,23 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             return ((timesteps.to(device=device, dtype=torch.float32) - 1.0) / 1000.0).clamp(0.0, 1.0)
         return get_sigmas(noise_scheduler, timesteps, device, n_dim=1, dtype=dtype).to(torch.float32)
 
+    @staticmethod
+    def _extension_masked(mask, target, context_length: int, *, axis: int):
+        """Drop the observed leading context from a modality's loss mask."""
+        if not context_length or target is None:
+            return mask
+        length = target.shape[axis]
+        if context_length >= length:
+            raise ValueError(f"H3 extension context {context_length} covers the whole {length}-long target")
+        keep = torch.ones(length, dtype=torch.bool, device=target.device)
+        keep[:context_length] = False
+        shape = [1] * target.ndim
+        shape[axis] = length
+        keep = keep.view(shape).expand_as(target)
+        if mask is None:
+            return keep
+        return keep & mask.to(device=target.device, dtype=torch.bool)
+
     def _sample_weight(self, args: argparse.Namespace, sigma: torch.Tensor) -> torch.Tensor | None:
         if args.weighting_scheme == "sigma_sqrt":
             return sigma.clamp_min(1e-6).pow(-2.0)
@@ -702,6 +727,11 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 video.requires_grad_(True)
             if audio is not None:
                 audio.requires_grad_(True)
+        extension_kwargs = {}
+        if self._extension_video_frames:
+            extension_kwargs["extension_video_frames"] = self._extension_video_frames
+        if self._extension_audio_latents:
+            extension_kwargs["extension_audio_latents"] = self._extension_audio_latents
         with accelerator.autocast():
             prediction = self.backend.predict_training(
                 transformer,
@@ -711,6 +741,9 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 inputs.video_timestep.to(accelerator.device),
                 inputs.audio_timestep.to(accelerator.device),
                 conditioning=conditioning,
+                # Forwarded only when extension is active so a backend that does
+                # not implement it keeps its existing signature.
+                **extension_kwargs,
             )
         if not isinstance(prediction, H3ModelPrediction):
             raise TypeError("H3 backend predict_training() must return H3ModelPrediction")
@@ -887,8 +920,14 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         result = joint_velocity_loss(
             prediction,
             inputs,
-            video_mask=batch.get("video_loss_mask"),
-            audio_mask=batch.get("audio_loss_mask"),
+            # The observed context is given, not predicted, so it carries no
+            # training signal and would otherwise dominate a short continuation.
+            video_mask=self._extension_masked(
+                batch.get("video_loss_mask"), inputs.video_target, self._extension_video_frames, axis=-3
+            ),
+            audio_mask=self._extension_masked(
+                batch.get("audio_loss_mask"), inputs.audio_target, self._extension_audio_latents, axis=-1
+            ),
             # Weighting keys on the shifted sigma the model actually saw for the
             # modality being generated, not the shared unshifted coordinate. An
             # observed modality sits at a pinned constant and would carry no
@@ -955,6 +994,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             "ss_h3_guidance_distillation_scale": str(args.h3_guidance_distillation_scale or "one_pass"),
             "ss_h3_guidance_loss_form": args.h3_guidance_loss_form,
             "ss_h3_caption_dropout_rate": str(args.h3_caption_dropout_rate),
+            "ss_h3_extension_video_frames": str(args.h3_extension_video_frames),
+            "ss_h3_extension_audio_latents": str(args.h3_extension_audio_latents),
             "ss_h3_base_preservation_loss_weight": str(args.h3_base_preservation_loss_weight),
             "ss_h3_shift_video": str(args.h3_shift_video),
             "ss_h3_shift_audio": str(args.h3_shift_audio),
@@ -1019,6 +1060,21 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         type=float,
         default=None,
         help="enable optional two-pass guidance-consistent training with an authoritative distillation scale",
+    )
+    parser.add_argument(
+        "--h3_extension_video_frames",
+        type=int,
+        default=0,
+        help=(
+            "leading latent video frames observed as context instead of generated, training video extension. "
+            "The observed span is packed as clean condition rows and removed from the loss"
+        ),
+    )
+    parser.add_argument(
+        "--h3_extension_audio_latents",
+        type=int,
+        default=0,
+        help="leading audio latents observed as context instead of generated, training audio extension",
     )
     parser.add_argument(
         "--h3_caption_dropout_rate",

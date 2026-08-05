@@ -38,6 +38,10 @@ class H3TrainingBackend(Protocol):
         audio_timestep: torch.Tensor,
         *,
         conditioning: Literal["prompt", "empty"] = "prompt",
+        # Extension context. Only forwarded when non-zero, so a backend that
+        # does not support it may omit these parameters entirely.
+        extension_video_frames: int = 0,
+        extension_audio_latents: int = 0,
     ) -> H3ModelPrediction: ...
 
 

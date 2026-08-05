@@ -838,6 +838,26 @@ loss directly to the extrapolated target `u + scale × (target - u)`. Both have 
 contrastive loss and gradient are `scale²` larger (`9×` at scale `3`). This changes its strength relative to base preservation,
 weight decay, gradient clipping, and other auxiliary objectives, so their hyperparameters are not directly interchangeable.
 
+### Extension training
+
+`--h3_extension_video_frames` and `--h3_extension_audio_latents` train continuation: a leading run of the target is observed as
+context and the rest is generated.
+
+```shell
+accelerate launch minimax_h3_train_network.py ... --h3_extension_video_frames 8 --h3_extension_audio_latents 20
+```
+
+The observed span is taken from the target itself, so no additional caching or dataset field is needed; an ordinary `--task t2va`
+cache is enough. Those latents are packed a second time as clean condition rows at the coordinates of the frames they duplicate,
+which is the same arrangement first-frame conditioning already uses, generalized from one anchor to a run. Video context carries
+the released conditioning noise level at timestep 0.999 and audio context passes through at timestep 1.0.
+
+The observed span is removed from the loss, intersecting any mask the dataset already provides. Without that the context would
+dominate the objective whenever the continuation is short, and the model would be scored on frames it was given.
+
+Both counts are in **latent** units, not pixel frames, and each must be shorter than its target. The two are independent: setting
+only one trains extension for that modality while the other is generated in full from scratch.
+
 ### Caption dropout
 
 `--h3_caption_dropout_rate` replaces the prompt with the cached empty conditioning for a fraction of steps, so the adapter also

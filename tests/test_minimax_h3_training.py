@@ -2089,3 +2089,78 @@ def test_h3_training_sampling_evacuates_and_restores_block_swap(monkeypatch):
     )
 
     assert events == ["denoise", "offload", "decode", ("restore", "cpu"), "inference"]
+
+
+def _extension_layout(video_context=0, audio_context=0):
+    return build_t2va_packed_sequence(
+        torch.ones(4, dtype=torch.long),
+        num_latent_frames=7,
+        latent_height=4,
+        latent_width=4,
+        num_audio_latents=5,
+        patch_size=(1, 2, 2),
+        keyframe_anchors=tuple(range(video_context)),
+        num_condition_audio_latents=audio_context,
+    )
+
+
+def test_h3_extension_context_rows_anchor_on_their_own_target_frames():
+    # Extension observes a leading run of the target, so each condition frame
+    # must sit exactly where the target frame it duplicates sits.
+    layout = _extension_layout(video_context=3)
+    rows_per_frame = 4
+    target = layout.video_indices[layout.num_condition_video_rows :]
+
+    for index in range(3):
+        condition_time = layout.position_ids[layout.video_indices[index * rows_per_frame], 0]
+        target_time = layout.position_ids[target[index * rows_per_frame], 0]
+        torch.testing.assert_close(condition_time, target_time)
+
+
+def test_h3_extension_audio_context_precedes_the_target_timeline():
+    layout = _extension_layout(audio_context=2)
+
+    assert layout.num_condition_audio_rows == 4
+    audio = layout.audio_indices
+    condition = layout.position_ids[audio[: layout.num_condition_audio_rows], 0]
+    target = layout.position_ids[audio[layout.num_condition_audio_rows :], 0]
+    assert float(condition.max()) < float(target.min())
+
+
+def test_h3_extension_loss_mask_drops_the_observed_video_frames():
+    trainer = MiniMaxH3NetworkTrainer()
+    target = torch.ones(1, 24, 7, 2, 2)
+
+    mask = trainer._extension_masked(None, target, 3, axis=-3)
+
+    assert mask.shape == target.shape
+    assert not bool(mask[:, :, :3].any())
+    assert bool(mask[:, :, 3:].all())
+
+
+def test_h3_extension_loss_mask_intersects_an_existing_mask():
+    trainer = MiniMaxH3NetworkTrainer()
+    target = torch.ones(1, 24, 7, 2, 2)
+    existing = torch.ones(1, 24, 7, 2, 2, dtype=torch.bool)
+    existing[:, :, 5:] = False
+
+    mask = trainer._extension_masked(existing, target, 3, axis=-3)
+
+    assert not bool(mask[:, :, :3].any())
+    assert bool(mask[:, :, 3:5].all())
+    assert not bool(mask[:, :, 5:].any())
+
+
+def test_h3_extension_loss_mask_is_absent_without_context():
+    trainer = MiniMaxH3NetworkTrainer()
+    target = torch.ones(1, 24, 7, 2, 2)
+
+    assert trainer._extension_masked(None, target, 0, axis=-3) is None
+
+
+def test_h3_extension_context_must_be_shorter_than_the_target():
+    trainer = MiniMaxH3NetworkTrainer()
+    target = torch.ones(1, 24, 7, 2, 2)
+
+    with pytest.raises(ValueError, match="covers the whole"):
+        trainer._extension_masked(None, target, 7, axis=-3)

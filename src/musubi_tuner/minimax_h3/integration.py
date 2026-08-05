@@ -53,6 +53,7 @@ from musubi_tuner.minimax_h3.inference import (
 from musubi_tuner.minimax_h3.media import MediaAsset, MediaModality
 from musubi_tuner.minimax_h3.model import MiniMaxH3TokenTag
 from musubi_tuner.minimax_h3.packing import (
+    AUDIO_CHANNELS,
     MiniMaxH3ReferenceGeometry,
     build_ref2va_packed_sequence,
     build_row_timesteps,
@@ -505,20 +506,28 @@ class _NativeTrainingBackend:
         audio_timestep: torch.Tensor,
         *,
         conditioning: Literal["prompt", "empty"] = "prompt",
+        extension_video_frames: int = 0,
+        extension_audio_latents: int = 0,
     ) -> H3ModelPrediction:
         present = video_hidden_states if video_hidden_states is not None else audio_hidden_states
         if present is None:
             raise ValueError("MiniMax H3 training requires at least one target modality")
-        if present.shape[0] != 1 or (video_hidden_states is not None and audio_hidden_states is not None and audio_hidden_states.shape[0] != 1):
+        if present.shape[0] != 1 or (
+            video_hidden_states is not None and audio_hidden_states is not None and audio_hidden_states.shape[0] != 1
+        ):
             raise ValueError("MiniMax H3 training requires batch size 1")
         config = getattr(transformer, "config", getattr(self.transformer, "config", None))
         if config is None:
             raise TypeError("MiniMax H3 transformer must expose its released config")
-        if video_hidden_states is not None and (video_hidden_states.ndim != 5 or video_hidden_states.shape[1] != config.in_channels):
+        if video_hidden_states is not None and (
+            video_hidden_states.ndim != 5 or video_hidden_states.shape[1] != config.in_channels
+        ):
             raise ValueError(
                 f"H3 video input must have shape [1, {config.in_channels}, T, H, W], got {tuple(video_hidden_states.shape)}"
             )
-        if audio_hidden_states is not None and (audio_hidden_states.ndim != 4 or audio_hidden_states.shape[1:3] != (2, config.audio_in_channels)):
+        if audio_hidden_states is not None and (
+            audio_hidden_states.ndim != 4 or audio_hidden_states.shape[1:3] != (2, config.audio_in_channels)
+        ):
             raise ValueError(
                 f"H3 audio input must have shape [1, 2, {config.audio_in_channels}, T], got {tuple(audio_hidden_states.shape)}"
             )
@@ -647,6 +656,20 @@ class _NativeTrainingBackend:
                 condition_video_timestep,
             )
         else:
+            # Extension observes a leading run of the target itself, so the
+            # condition rows are sliced from the already-packed target rows
+            # rather than cached separately. The target keeps its full length;
+            # the observed span is removed from the loss by the caller.
+            if extension_video_frames and extension_video_frames >= latent_frames:
+                raise ValueError(
+                    f"H3 video extension needs a shorter context than the target: "
+                    f"{extension_video_frames} of {latent_frames} latent frames"
+                )
+            if extension_audio_latents and extension_audio_latents >= num_audio_latents:
+                raise ValueError(
+                    f"H3 audio extension needs a shorter context than the target: "
+                    f"{extension_audio_latents} of {num_audio_latents} audio latents"
+                )
             layout = build_t2va_packed_sequence(
                 text_tags,
                 num_latent_frames=latent_frames,
@@ -654,8 +677,39 @@ class _NativeTrainingBackend:
                 latent_width=latent_width,
                 num_audio_latents=num_audio_latents,
                 patch_size=patch_size,
+                keyframe_anchors=tuple(range(extension_video_frames)),
+                num_condition_audio_latents=extension_audio_latents,
             )
-            timestep, timestep_indices = build_row_timesteps(layout, video_timestep, audio_timestep)
+            condition_video_timestep = None
+            condition_audio_timestep = None
+            if extension_video_frames:
+                context_rows = video_rows[:, : layout.num_condition_video_rows]
+                context_rows = 0.999 * context_rows + 0.001 * torch.randn_like(context_rows)
+                video_rows = torch.cat((context_rows, video_rows), dim=1)
+                condition_video_timestep = torch.maximum(
+                    video_timestep.reshape(1).to(model_device, torch.float32),
+                    torch.tensor([0.999], device=model_device),
+                )
+            if extension_audio_latents:
+                # Audio rows are channel-major, so the observed prefix is the
+                # opening latents of each channel rather than a flat slice.
+                per_channel = audio_rows.shape[1] // AUDIO_CHANNELS
+                context_audio = torch.cat(
+                    [
+                        audio_rows[:, channel * per_channel : channel * per_channel + extension_audio_latents]
+                        for channel in range(AUDIO_CHANNELS)
+                    ],
+                    dim=1,
+                )
+                audio_rows = torch.cat((context_audio, audio_rows), dim=1)
+                condition_audio_timestep = torch.ones(1, device=model_device)
+            timestep, timestep_indices = build_row_timesteps(
+                layout,
+                video_timestep,
+                audio_timestep,
+                condition_video_timestep,
+                condition_audio_timestep,
+            )
         crepa = getattr(transformer, "_h3_crepa_controller", None)
         if crepa is not None and video_hidden_states is not None:
             patch_h, patch_w = patch_size[-2:]

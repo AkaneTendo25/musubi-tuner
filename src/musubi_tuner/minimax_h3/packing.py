@@ -29,6 +29,9 @@ import torch
 from musubi_tuner.minimax_h3.model import MiniMaxH3TokenTag
 
 _AUDIO_CHANNELS = 2
+# Public alias: callers outside this module slice packed audio by channel and
+# need the stereo count to do it.
+AUDIO_CHANNELS = _AUDIO_CHANNELS
 _ROPE_FRAME_RESCALE = 5.0 / 3.0
 _ROPE_FRAMES_PER_LATENT = (1, 4, 4, 4, 4)
 _ROPE_SPATIAL_SCALE = 32.0
