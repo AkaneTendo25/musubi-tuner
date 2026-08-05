@@ -148,6 +148,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             raise ValueError("MiniMax H3 --h3_image_flow_shift must be positive when specified")
         if args.h3_guidance_distillation_scale is not None and args.h3_guidance_distillation_scale <= 1.0:
             raise ValueError("--h3_guidance_distillation_scale must be greater than 1, or omitted for one-pass training")
+        if args.h3_guidance_loss_form == "contrastive" and args.h3_guidance_distillation_scale is None:
+            raise ValueError("--h3_guidance_loss_form contrastive requires --h3_guidance_distillation_scale")
         if not math.isfinite(args.h3_base_preservation_loss_weight) or args.h3_base_preservation_loss_weight < 0:
             raise ValueError("--h3_base_preservation_loss_weight must be finite and non-negative")
         if args.fp8_base and args.h3_adaln_rank is None:
@@ -616,13 +618,21 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             video_weight=video_weight,
             audio_weight=audio_weight,
         )
+        # normalized:  MSE((g + (s - 1)u) / s, target)
+        # contrastive: MSE(g, u + s(target - u))
+        # The objectives have the same optimum and gradient direction. The
+        # contrastive loss is exactly s^2 larger, so scaling the normalized
+        # result reproduces it without another forward or target allocation.
+        guidance_loss_multiplier = 1.0
+        if args.h3_guidance_distillation_scale is not None and args.h3_guidance_loss_form == "contrastive":
+            guidance_loss_multiplier = args.h3_guidance_distillation_scale**2
         metrics = {
-            "loss/video": float(result.video_loss.detach()),
-            "loss/audio": float(result.audio_loss.detach()),
+            "loss/video": float((result.video_loss * guidance_loss_multiplier).detach()),
+            "loss/audio": float((result.audio_loss * guidance_loss_multiplier).detach()),
             "h3/sigma_video": float(inputs.video_sigma.mean().detach()),
             "h3/sigma_audio": float(inputs.audio_sigma.mean().detach()),
         }
-        loss = result.loss
+        loss = result.loss * guidance_loss_multiplier
         if reference_prediction is not None:
             preservation = joint_prediction_loss(
                 raw_prediction,
@@ -651,6 +661,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             "ss_h3_observed_modality": str(args.h3_observed_modality or "none"),
             "ss_h3_image_flow_shift": str(args.h3_image_flow_shift or "resolution_aware"),
             "ss_h3_guidance_distillation_scale": str(args.h3_guidance_distillation_scale or "one_pass"),
+            "ss_h3_guidance_loss_form": args.h3_guidance_loss_form,
             "ss_h3_base_preservation_loss_weight": str(args.h3_base_preservation_loss_weight),
             "ss_h3_shift_video": str(args.h3_shift_video),
             "ss_h3_shift_audio": str(args.h3_shift_audio),
@@ -714,6 +725,15 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         type=float,
         default=None,
         help="enable optional two-pass guidance-consistent training with an authoritative distillation scale",
+    )
+    parser.add_argument(
+        "--h3_guidance_loss_form",
+        choices=("normalized", "contrastive"),
+        default="normalized",
+        help=(
+            "normalized applies flow loss to the reconstructed conditional field; contrastive applies the equivalent "
+            "scale-squared loss magnitude of a direct extrapolated target"
+        ),
     )
     parser.add_argument(
         "--h3_base_preservation_loss_weight",

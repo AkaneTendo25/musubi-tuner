@@ -725,6 +725,18 @@ forward and the model's joint flow target. If an authoritative distillation scal
 enable an optional two-pass guidance-consistent objective using cached empty-text conditioning. This does not reconstruct an
 unconditional model or add negative-prompt inference.
 
+The guidance objective has two equivalent forms:
+
+```text
+--h3_guidance_distillation_scale 3 --h3_guidance_loss_form normalized
+--h3_guidance_distillation_scale 3 --h3_guidance_loss_form contrastive
+```
+
+`normalized` reconstructs the conditional-field estimate and applies the flow loss to that estimate. `contrastive` applies the flow
+loss directly to the extrapolated target `u + scale × (target - u)`. Both have the same optimum and gradient direction, but the
+contrastive loss and gradient are `scale²` larger (`9×` at scale `3`). This changes its strength relative to base preservation,
+weight decay, gradient clipping, and other auxiliary objectives, so their hyperparameters are not directly interchangeable.
+
 ### Optional base-preservation loss
 
 Longer LoRA runs may drift away from the behavior of H3's released guidance-distilled base. The opt-in

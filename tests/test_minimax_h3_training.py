@@ -1404,6 +1404,45 @@ def test_h3_trainer_base_preservation_replays_rng_and_restores_network():
     assert transformer.scale.grad is not None and torch.isfinite(transformer.scale.grad)
 
 
+def test_h3_contrastive_guidance_form_is_scale_squared_larger():
+    def run(form):
+        args = create_parser().parse_args([])
+        args.h3_guidance_distillation_scale = 3.0
+        args.h3_guidance_loss_form = form
+        trainer = MiniMaxH3NetworkTrainer()
+        trainer.dit_dtype = torch.float32
+        trainer.backend = _FakeBackend()
+        transformer = _ScaleTransformer()
+        video = torch.zeros(1, 24, 2, 2, 2)
+        batch = {
+            "timesteps": [0.5],
+            H3_EMPTY_TEXT_HIDDEN_KEY: [torch.zeros(1, 5120)],
+            H3_EMPTY_TEXT_TOKEN_TAGS_KEY: [torch.ones(1, dtype=torch.long)],
+        }
+        torch.manual_seed(0)
+        loss, metrics = trainer.process_batch(
+            args,
+            _FakeAccelerator(),
+            transformer,
+            None,
+            batch,
+            video,
+            torch.ones_like(video),
+            None,
+            torch.float32,
+            torch.float32,
+            None,
+            0,
+        )
+        return loss, metrics
+
+    normalized_loss, normalized_metrics = run("normalized")
+    contrastive_loss, contrastive_metrics = run("contrastive")
+
+    torch.testing.assert_close(contrastive_loss, normalized_loss * 9.0)
+    assert contrastive_metrics["loss/video"] == pytest.approx(normalized_metrics["loss/video"] * 9.0)
+
+
 def test_h3_trainer_image_process_batch_uses_resolution_schedule_without_audio():
     args = create_parser().parse_args([])
     trainer = MiniMaxH3NetworkTrainer()
@@ -1596,6 +1635,7 @@ def test_h3_training_parser_defaults_to_native_fl2va_contract():
     assert args.h3_shift_audio == 3.0
     assert args.h3_loss_balance == "modality"
     assert args.h3_guidance_distillation_scale is None
+    assert args.h3_guidance_loss_form == "normalized"
     assert args.h3_base_preservation_loss_weight == 0.0
     assert args.fp8_scaled is False
     assert args.int8_convrot_base is False
