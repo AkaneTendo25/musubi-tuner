@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 from safetensors import safe_open
-from safetensors.torch import load_file
+from safetensors.torch import load_file, save_file
 from torch import nn
 
 import musubi_tuner.minimax_h3_train_network as h3_train_network
@@ -30,6 +30,7 @@ from musubi_tuner.minimax_h3.cache import (
 )
 from musubi_tuner.minimax_h3.crepa import H3CREPA, H3CREPAConfig, parse_crepa_config
 from musubi_tuner.minimax_h3.integration import _NativeTrainingBackend
+from musubi_tuner.minimax_h3_cache_dino_features import _save_features, dino_cache_path
 from musubi_tuner.minimax_h3.model import MiniMaxH3Transformer, MiniMaxH3TransformerConfig
 from musubi_tuner.minimax_h3.packing import (
     MiniMaxH3ReferenceGeometry,
@@ -90,6 +91,23 @@ def test_h3_crepa_single_flag_parses_defaults_and_overrides():
     assert config.weight == pytest.approx(0.02)
 
 
+def test_h3_dino_cache_path_follows_the_native_architecture_suffix(tmp_path):
+    assert dino_cache_path(tmp_path / "clip_mmh3.safetensors").name == "clip_mmh3_dino.safetensors"
+    with pytest.raises(ValueError, match="latent-cache name"):
+        dino_cache_path(tmp_path / "clip.safetensors")
+
+
+@pytest.mark.parametrize("atomic", [False, True])
+def test_h3_dino_cache_write_is_complete_and_metadata_bearing(tmp_path, atomic):
+    path = tmp_path / "clip_mmh3_dino.safetensors"
+    expected = torch.randn(2, 3, 4, dtype=torch.float16)
+    _save_features(path, expected, {"dino_model": "probe"}, atomic=atomic)
+    torch.testing.assert_close(load_file(path)["h3_dino_features"], expected)
+    with safe_open(path, framework="pt") as handle:
+        assert handle.metadata() == {"dino_model": "probe"}
+    assert list(tmp_path.glob("*.tmp")) == []
+
+
 @pytest.mark.parametrize(
     "values",
     [
@@ -118,12 +136,13 @@ def test_h3_crepa_extracts_only_target_video_rows_and_backpropagates(tmp_path):
     hidden = torch.arange(24, dtype=torch.float32).reshape(1, 6, 4).requires_grad_()
     transformer(hidden)
 
-    expected_student = hidden[:, 2:].reshape(1, 2, 2, 4).mean(dim=2)
+    expected_student = hidden[:, 2:].reshape(1, 2, 2, 4)
     torch.testing.assert_close(crepa._student, expected_student)
     assert not crepa._teacher.requires_grad
     loss, metrics = crepa.loss()
     loss.backward()
     assert metrics["crepa/alignment"] <= 1.0
+    assert metrics["crepa/similarity_self"] <= 1.0
     assert hidden.grad is not None and hidden.grad[:, 2:].abs().sum() > 0
     assert hidden.grad[:, :2].abs().sum() == 0
     assert all(parameter.grad is not None for parameter in crepa.projector.parameters())
@@ -167,6 +186,92 @@ def test_h3_crepa_uses_existing_optimizer_group():
     assert len(groups) == 1
     assert groups[0]["params"][0] is original
     assert len(groups[0]["params"]) == 1 + len(list(trainer._crepa.projector.parameters()))
+
+
+def test_h3_crepa_schedule_cutoff_and_resume_state(tmp_path):
+    config = H3CREPAConfig(
+        student_block=0,
+        teacher_block=2,
+        weight=0.2,
+        schedule="linear",
+        warmup_steps=2,
+        max_steps=10,
+        cutoff_step=9,
+        similarity_threshold=0.5,
+        similarity_ema_decay=0.0,
+    )
+    crepa = H3CREPA(4, config)
+    crepa.begin_step(True, 1)
+    assert crepa.active
+    assert crepa._effective_weight == pytest.approx(0.1)
+    assert crepa.status_metrics()["crepa/cutoff"] == 0
+    crepa.begin_step(True, 6)
+    assert crepa._effective_weight == pytest.approx(0.1)
+    crepa._similarity_ema = 0.75
+    crepa._cutoff_triggered = True
+    crepa.save_state(tmp_path)
+    restored = H3CREPA(4, config)
+    assert restored.load_state(tmp_path)
+    assert restored._similarity_ema == pytest.approx(0.75)
+    restored.begin_step(True, 7)
+    assert not restored.active
+    assert restored.status_metrics()["crepa/cutoff"] == 1
+
+
+def test_h3_crepa_zero_warmup_weight_is_not_reported_as_cutoff():
+    config = H3CREPAConfig(
+        student_block=0,
+        teacher_block=2,
+        schedule="cosine",
+        warmup_steps=2,
+        max_steps=10,
+    )
+    crepa = H3CREPA(4, config)
+    crepa.begin_step(True, 0)
+    assert not crepa.active
+    assert crepa.status_metrics() == {"crepa/weight": 0.0, "crepa/cutoff": 0.0}
+
+
+def test_h3_crepa_dino_mode_aligns_cached_frame_features():
+    config = H3CREPAConfig(mode="dino", dino_model="dinov2_vits14", student_block=0, teacher_block=2)
+    transformer = _CREPATransformer()
+    crepa = H3CREPA(4, config)
+    assert crepa.projector[0].weight.shape == (4, 4)
+    assert crepa.projector[2].weight.shape == (384, 4)
+    crepa.install(transformer)
+    crepa.set_layout(torch.tensor([1, 2, 3, 4]), frames=2, rows_per_frame=2)
+    crepa.begin_step(True)
+    hidden = torch.randn(1, 5, 4, requires_grad=True)
+    transformer(hidden)
+    dino = torch.randn(1, 4, 3, 384)
+    loss, metrics = crepa.loss(dino)
+    loss.backward()
+    assert torch.isfinite(loss)
+    assert -1 <= metrics["crepa/alignment"] <= 1
+    assert hidden.grad is not None and hidden.grad[:, 1:].abs().sum() > 0
+
+
+def test_h3_crepa_neighbor_objective_matches_valid_comparison_normalization():
+    config = H3CREPAConfig(
+        student_block=0,
+        teacher_block=2,
+        weight=0.2,
+        tau=1.0,
+        neighbors=1,
+        normalize=False,
+    )
+    crepa = H3CREPA(1, config)
+    crepa.projector = nn.Identity()
+    crepa._student = torch.tensor([[[[1.0]], [[2.0]]]])
+    crepa._teacher = torch.tensor([[[3.0], [4.0]]])
+    crepa._effective_weight = config.weight
+    loss, metrics = crepa.loss()
+    expected = -config.weight * (11.0 + 10.0 / torch.e) / 2.0
+    torch.testing.assert_close(loss, loss.new_tensor(expected))
+    expected_alignment = ((3.0 + 4.0 / torch.e) + (8.0 + 6.0 / torch.e)) / (2.0 * (1.0 + 1.0 / torch.e))
+    assert metrics["crepa/alignment"] == pytest.approx(float(expected_alignment))
+    assert metrics["crepa/similarity_self"] == pytest.approx(5.5)
+    assert "crepa/alignment_ema" not in metrics
 
 
 def test_h3_shift_round_trip_and_cross_modality_mapping():
@@ -1165,9 +1270,11 @@ def test_h3_text_cache_contract_and_optional_empty_pair(tmp_path):
         save_text_encoder_output_cache_minimax_h3(item, tensors)
 
 
-def test_standard_bucket_manager_loads_h3_joint_cache_without_shared_schema_changes(tmp_path):
+@pytest.mark.parametrize("load_dino", [False, True])
+def test_standard_bucket_manager_loads_h3_joint_cache_without_shared_schema_changes(tmp_path, load_dino):
     latent_path = tmp_path / "sample_mmh3.safetensors"
     text_path = tmp_path / "sample_mmh3_te.safetensors"
+    dino_path = tmp_path / "sample_mmh3_dino.safetensors"
     item = ItemInfo("sample", "caption", (64, 64), (64, 64), latent_cache_path=str(latent_path))
     item.text_encoder_output_cache_path = str(text_path)
     from musubi_tuner.minimax_h3.cache import save_latent_cache_minimax_h3
@@ -1194,8 +1301,11 @@ def test_standard_bucket_manager_loads_h3_joint_cache_without_shared_schema_chan
             H3_CONDITIONING_TASK_KEY: torch.tensor(H3_CONDITIONING_TASK_IDS["t2va"]),
         },
     )
+    save_file({"h3_dino_features": torch.zeros(2, 4, 384, dtype=torch.float16)}, dino_path)
 
-    batch = BucketBatchManager({(64, 64): [item]}, batch_size=1)[0]
+    manager = BucketBatchManager({(64, 64): [item]}, batch_size=1)
+    manager.load_h3_dino_features = load_dino
+    batch = manager[0]
 
     assert batch["latents"].shape == (1, 24, 2, 2, 2)
     assert batch[H3_AUDIO_LATENTS_KEY].shape == (1, 2, 32, 3)
@@ -1206,6 +1316,23 @@ def test_standard_bucket_manager_loads_h3_joint_cache_without_shared_schema_chan
     assert batch[H3_REFERENCE_VIDEO_ROWS_KEY][0].shape == (1, 96)
     assert batch[H3_REFERENCE_AUDIO_ROWS_KEY][0].shape == (2, 32)
     assert batch[H3_KEYFRAME_VIDEO_ROWS_KEY][0].shape == (2, 96)
+    if load_dino:
+        assert batch["h3_dino_features"].shape == (1, 2, 4, 384)
+    else:
+        assert "h3_dino_features" not in batch
+
+
+def test_standard_bucket_manager_requires_dino_cache_only_when_enabled(tmp_path):
+    latent_path = tmp_path / "sample_mmh3.safetensors"
+    text_path = tmp_path / "sample_mmh3_te.safetensors"
+    save_file({"latents_float32": torch.zeros(1)}, latent_path)
+    save_file({"text_float32": torch.zeros(1)}, text_path)
+    item = ItemInfo("sample", "caption", (64, 64), (64, 64), latent_cache_path=str(latent_path))
+    item.text_encoder_output_cache_path = str(text_path)
+    manager = BucketBatchManager({(64, 64): [item]}, batch_size=1)
+    manager.load_h3_dino_features = True
+    with pytest.raises(FileNotFoundError, match="cache_dino_features"):
+        manager[0]
 
 
 class MiniMaxH3TransformerBlock(nn.Module):

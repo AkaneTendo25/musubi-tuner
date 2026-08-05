@@ -387,21 +387,65 @@ The default `modality` loss mode gives the video and audio means equal weight be
 
 ### CREPA
 
-CREPA is an optional temporal representation-alignment loss for video training. It aligns projected features from an earlier
-transformer block with detached features from a later block across the same and neighboring latent frames. Only generated video
-rows participate: text, audio, keyframes, and Ref2VA reference rows are excluded before spatial pooling.
+CREPA is an optional temporal representation-alignment loss for video training. Backbone mode aligns projected features from an
+earlier transformer block with detached features from a later block. DINO mode aligns them with frozen per-frame DINOv2 patch
+features. Both compare the same and neighboring latent frames. Only generated video rows participate: text, audio, keyframes,
+and Ref2VA reference rows are excluded.
 
 Enable the default configuration with `--crepa`, or override its fields through the same option:
 
 ```shell
 accelerate launch minimax_h3_train_network.py ... \
-  --crepa student_block=16 teacher_block=33 weight=0.05 tau=1 neighbors=2
+  --crepa mode=backbone student_block=16 teacher_block=33 weight=0.05 tau=1 neighbors=2
 ```
+
+All values following `--crepa` use `key=value` syntax:
+
+| Field | Default | Meaning |
+| --- | ---: | --- |
+| `mode` | `backbone` | `backbone` uses a detached later H3 block as teacher. `dino` uses pre-cached DINOv2 frame features. |
+| `student_block` | `16` | Zero-based transformer block whose generated-video features remain attached to the training graph and are passed through the CREPA projector. It must be non-negative and earlier than `teacher_block`. |
+| `teacher_block` | `33` | Zero-based later transformer block providing the detached alignment target. It must be smaller than the transformer's 50-block count. |
+| `dino_model` | `dinov2_vitb14` | DINOv2 teacher variant for `mode=dino`: `dinov2_vits14`, `dinov2_vitb14`, `dinov2_vitl14`, or `dinov2_vitg14`. |
+| `weight` | `0.05` | Multiplier applied to the auxiliary negative cosine-similarity objective. It must be finite and greater than zero. Larger values give representation alignment more influence relative to the normal flow loss. |
+| `tau` | `1.0` | Positive temporal-distance temperature. A comparison at frame offset `d` receives weight `exp(-abs(d) / tau)`; larger values retain more influence from distant neighbors. |
+| `neighbors` | `2` | Number of preceding and following latent frames compared with each student frame, in addition to its same-frame teacher target. It must be non-negative and is automatically limited by the available latent-frame count. |
+| `schedule` | `constant` | Auxiliary-weight schedule: `constant`, `linear`, or `cosine`. |
+| `warmup_steps` | `0` | Number of optimizer steps used to ramp the CREPA weight from zero. |
+| `max_steps` | `0` | End step for linear/cosine decay. It is required for those schedules. |
+| `normalize` | `true` | L2-normalize student and teacher representations before alignment. `false` uses their raw dot product. |
+| `cutoff_step` | `0` | Disable CREPA at this step; zero leaves it enabled. |
+| `similarity_threshold` | unset | Disable CREPA when the EMA alignment reaches this value in `[0, 1]`. |
+| `similarity_ema_decay` | `0.99` | EMA decay used by the similarity threshold. |
+| `threshold_mode` | `permanent` | `permanent` keeps CREPA disabled after crossing the threshold; `recoverable` reevaluates it every step. |
+
+Bare `--crepa` enables exactly these defaults. Unknown fields, duplicate fields, malformed values, invalid block order, and
+non-positive `weight` or `tau` are rejected before loading the transformer.
 
 The option is absent by default and then installs no hooks, projection parameters, or auxiliary loss. It applies to video clips
 with more than one latent frame and is skipped for image-only batches, audio-only batches, and batches where video is the observed
 conditioning modality. CREPA's projection head is training state rather than part of the inference LoRA; Accelerate state saves
 store it separately as `h3_crepa.safetensors` so interrupted runs can resume exactly.
+
+For a DINOv2 teacher, create the companion caches after the normal latent cache:
+
+```shell
+python minimax_h3_cache_dino_features.py \
+  --dataset_config path/to/dataset.toml \
+  --dino_model dinov2_vitb14 \
+  --device cuda \
+  --atomic_cache_writes \
+  --skip_existing
+
+accelerate launch minimax_h3_train_network.py ... \
+  --crepa mode=dino dino_model=dinov2_vitb14 weight=0.05
+```
+
+The cache command downloads DINOv2 through Torch Hub by default. Use `--dino_repo` for a local DINOv2 checkout and
+`--torch_hub_dir` to select a persistent model-cache directory. It stores frozen per-frame patch features next to each H3 latent
+cache; the DINO model is not loaded during training. `validation_datasets` entries are cached in the same invocation. Atomic
+writes prevent an interrupted extraction from leaving a partial cache at its final name. The selected `dino_model` must match
+the cache.
 
 ### Flow schedules
 
@@ -569,6 +613,10 @@ Reference media must remain distinct from the target. Musubi reuses its existing
 reuses the target as its own reference.
 
 ## Training benchmarks and capacity estimates
+
+> [!CAUTION]
+> These measurements are historical baselines and may be outdated. They do not include several newer memory and throughput
+> optimizations, so they should not be interpreted as the current minimum VRAM or best achievable training speed.
 
 The following measurements are real LoRA optimizer steps on an NVIDIA H100 80 GB. They are intended to make memory planning
 reproducible, not to predict RTX throughput. The benchmark used Python 3.12.13, PyTorch 2.9.1 with CUDA 12.8, Transformers 4.57.6,

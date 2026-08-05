@@ -13,7 +13,7 @@ from typing import Any
 from musubi_tuner.dataset import config_utils
 from musubi_tuner.dataset.architectures import ARCHITECTURE_MINIMAX_H3
 from musubi_tuner.dataset.config_utils import BlueprintGenerator, ConfigSanitizer
-from musubi_tuner.dataset.image_video_dataset import DatasetGroup, ItemInfo
+from musubi_tuner.dataset.image_video_dataset import DatasetGroup, ItemInfo, VideoDataset
 from musubi_tuner.dataset.media_utils import IMAGE_EXTENSIONS, VIDEO_EXTENSIONS, glob_images, glob_videos
 from musubi_tuner.minimax_h3.architecture import is_valid_frame_count
 from musubi_tuner.minimax_h3.audio_dataset import H3AudioDataset
@@ -342,6 +342,12 @@ def create_h3_dataset_group(
         dataset.set_seed(seed, shared_epoch)
         if training:
             dataset.prepare_for_training(num_timestep_buckets=num_timestep_buckets)
+    if training:
+        load_dino_features = bool(getattr(args, "h3_load_dino_features", False))
+        for dataset in ordered_datasets:
+            batch_manager = getattr(dataset, "batch_manager", None)
+            if batch_manager is not None:
+                batch_manager.load_h3_dino_features = load_dino_features and isinstance(dataset, VideoDataset)
     dataset_group = DatasetGroup(ordered_datasets)
     adapter.adapt_dataset_group(dataset_group)
     return dataset_group, adapter

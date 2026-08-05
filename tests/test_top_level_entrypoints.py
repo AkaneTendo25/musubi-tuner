@@ -22,6 +22,7 @@ def test_minimax_h3_top_level_entrypoint_exists():
     expected = {
         "minimax_h3_generate_video.py": "musubi_tuner.minimax_h3_generate_video",
         "minimax_h3_cache_latents.py": "musubi_tuner.minimax_h3_cache_latents",
+        "minimax_h3_cache_dino_features.py": "musubi_tuner.minimax_h3_cache_dino_features",
         "minimax_h3_cache_text_encoder_outputs.py": "musubi_tuner.minimax_h3_cache_text_encoder_outputs",
         "minimax_h3_train_network.py": "musubi_tuner.minimax_h3_train_network",
     }

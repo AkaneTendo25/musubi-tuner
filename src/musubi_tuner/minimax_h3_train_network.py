@@ -133,6 +133,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         self.default_discrete_flow_shift = 1.0
         self.vae_frame_stride = 17
         self._crepa_config = parse_crepa_config(args.crepa)
+        args.h3_load_dino_features = self._crepa_config is not None and self._crepa_config.mode == "dino"
 
         # H3 owns its own flow shifts because video and audio ride different
         # schedules (12 and 3) off one shared unshifted coordinate. The common
@@ -525,7 +526,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         vae,
         global_step: int,
     ) -> tuple[torch.Tensor, dict[str, float]]:
-        del network_dtype, vae, global_step
+        del network_dtype, vae
         if latents.shape[0] != 1:
             raise ValueError("MiniMax H3 training requires dataset batch_size = 1")
         has_video = "latents" in batch or latents.ndim == 5
@@ -628,7 +629,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
 
         use_crepa = self._crepa is not None and has_video and not is_image and observed != "video"
         if self._crepa is not None:
-            self._crepa.begin_step(use_crepa)
+            self._crepa.begin_step(use_crepa, global_step)
         try:
             raw_prediction = self._predict(
                 accelerator,
@@ -694,10 +695,12 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             )
             loss = loss + args.h3_base_preservation_loss_weight * preservation.loss
             metrics["loss/base_preservation"] = float(preservation.loss.detach())
-        if use_crepa:
-            crepa_loss, crepa_metrics = self._crepa.loss()
+        if use_crepa and self._crepa.active:
+            crepa_loss, crepa_metrics = self._crepa.loss(batch.get("h3_dino_features"))
             loss = loss + crepa_loss
             metrics.update(crepa_metrics)
+        elif use_crepa:
+            metrics.update(self._crepa.status_metrics())
         # Keep capture active until backward has completed. Non-reentrant
         # gradient checkpointing recomputes hooked blocks during backward and
         # requires the hook to perform the same tensor operations as forward.
@@ -807,7 +810,8 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         default=None,
         help=(
             "enable temporal representation alignment; optional values: student_block=16 teacher_block=33 "
-            "weight=0.05 tau=1 neighbors=2"
+            "weight=0.05 tau=1 neighbors=2 schedule=constant warmup_steps=0 max_steps=0 normalize=true "
+            "cutoff_step=0 similarity_ema_decay=0.99 threshold_mode=permanent"
         ),
     )
     parser.add_argument(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 import random
 from typing import Any, Optional, Tuple, TYPE_CHECKING
 
@@ -178,6 +179,7 @@ class BucketBatchManager:
         self.bucket_resos.sort()
         self.num_timestep_buckets = num_timestep_buckets
         self.timestep_pool = None
+        self.load_h3_dino_features = False
 
         # indices for enumerating batches. each batch is reso + batch_idx. reso is (width, height) or (width, height, frames)
         self.bucket_batch_indices: list[tuple[tuple[Any], int]] = []
@@ -251,6 +253,14 @@ class BucketBatchManager:
             sd_latent = load_file(item_info.latent_cache_path)
             sd_te = load_file(item_info.text_encoder_output_cache_path)
             sd = {**sd_latent, **sd_te}
+            if self.load_h3_dino_features and item_info.latent_cache_path.endswith("_mmh3.safetensors"):
+                dino_path = item_info.latent_cache_path[: -len("_mmh3.safetensors")] + "_mmh3_dino.safetensors"
+                if not os.path.isfile(dino_path):
+                    raise FileNotFoundError(
+                        f"MiniMax H3 CREPA DINO cache not found: {dino_path}. "
+                        "Run minimax_h3_cache_dino_features.py before training with CREPA mode=dino."
+                    )
+                sd["h3_dino_features_float16"] = load_file(dino_path)["h3_dino_features"]
 
             # TODO refactor this
             for key in sd.keys():
