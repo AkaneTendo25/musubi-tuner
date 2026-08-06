@@ -33,6 +33,16 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--first_frame")
     parser.add_argument("--last_frame")
+    parser.add_argument(
+        "--keyframe",
+        action="append",
+        default=[],
+        metavar="INDEX:PATH",
+        help=(
+            "condition latent frame INDEX on an image, repeatable. The transformer places the conditioning row at "
+            "that temporal position, which it honours for interior positions as well as for the first and the last"
+        ),
+    )
     parser.add_argument("--reference_image", action="append", default=[])
     parser.add_argument("--reference_video", action="append", default=[])
     parser.add_argument("--reference_audio", action="append", default=[])
@@ -65,10 +75,18 @@ def create_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _parse_keyframe(entry: str) -> tuple[int, str]:
+    index, separator, path = entry.partition(":")
+    if not separator or not path or not index.strip().isdigit():
+        raise ValueError(f"--keyframe expects INDEX:PATH with a non-negative index, got {entry!r}")
+    return int(index), path
+
+
 def request_from_args(args: argparse.Namespace) -> H3GenerationRequest:
     references = make_references(
         first_frame=args.first_frame,
         last_frame=args.last_frame,
+        keyframes=[_parse_keyframe(entry) for entry in args.keyframe],
         images=args.reference_image,
         videos=args.reference_video,
         audio=args.reference_audio,

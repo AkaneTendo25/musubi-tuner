@@ -81,6 +81,55 @@ def test_public_request_modes_and_limits(tmp_path):
         H3GenerationRequest("prompt", tmp_path / "out.mp4", duration=16)
 
 
+def test_keyframe_conditioning_carries_its_latent_index(tmp_path):
+    # Measured on the release: an interior anchor is honoured about as strongly
+    # as the trained ends, so the index has to survive to the packing.
+    from musubi_tuner.minimax_h3.request import make_references
+
+    references = make_references(keyframes=[(11, str(tmp_path / "k.png"))])
+    request = H3GenerationRequest("prompt", tmp_path / "out.mp4", references=references)
+
+    assert request.mode == "first_last_frame"
+    assert [(ref.role, ref.latent_index) for ref in request.references] == [(ReferenceRole.KEYFRAME, 11)]
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"role": ReferenceRole.KEYFRAME}, "requires a latent index"),
+        ({"role": ReferenceRole.KEYFRAME, "latent_index": -1}, "non-negative integer"),
+        ({"latent_index": 3}, "only to keyframe"),
+    ],
+)
+def test_keyframe_index_is_validated(tmp_path, kwargs, message):
+    from musubi_tuner.minimax_h3.request import H3Reference
+
+    with pytest.raises(ValueError, match=message):
+        H3Reference(tmp_path / "k.png", ReferenceKind.IMAGE, **kwargs)
+
+
+def test_keyframe_indices_must_be_distinct(tmp_path):
+    from musubi_tuner.minimax_h3.request import make_references
+
+    references = make_references(keyframes=[(4, str(tmp_path / "a.png")), (4, str(tmp_path / "b.png"))])
+    with pytest.raises(ValueError, match="only once"):
+        H3GenerationRequest("prompt", tmp_path / "out.mp4", references=references)
+
+
+def test_keyframe_cli_parses_index_and_path(tmp_path):
+    args = create_parser().parse_args(
+        ["--model", str(tmp_path), "--prompt", "p", "--output", str(tmp_path / "o.mp4"), "--keyframe", "11:/k.png"]
+    )
+    request = request_from_args(args)
+    assert [(ref.role, ref.latent_index) for ref in request.references] == [(ReferenceRole.KEYFRAME, 11)]
+
+    bad = create_parser().parse_args(
+        ["--model", str(tmp_path), "--prompt", "p", "--output", str(tmp_path / "o.mp4"), "--keyframe", "/k.png"]
+    )
+    with pytest.raises(ValueError, match="INDEX:PATH"):
+        request_from_args(bad)
+
+
 def test_public_request_enforces_released_reference_caps_and_audio_pairing(tmp_path):
     audio = H3Reference(tmp_path / "voice.wav", ReferenceKind.AUDIO)
     with pytest.raises(ValueError, match="requires at least one reference image or video"):

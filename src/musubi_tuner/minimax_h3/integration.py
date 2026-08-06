@@ -252,7 +252,7 @@ class _NativeGenerator:
         request: H3GenerationRequest,
         height: int,
         width: int,
-    ) -> tuple[list[Image.Image], tuple[str, ...]]:
+    ) -> tuple[list[Image.Image], tuple[str | int, ...]]:
         images = []
         anchors = []
         for reference in request.references:
@@ -264,6 +264,12 @@ class _NativeGenerator:
                 with Image.open(reference.path) as image:
                     images.append(prepare_keyframe_image(image, height, width, stretch=False))
                 anchors.append("last")
+            elif reference.role is ReferenceRole.KEYFRAME:
+                # An anchor is a clean row carrying a temporal position, and the
+                # packing treats an interior index exactly as it treats the ends.
+                with Image.open(reference.path) as image:
+                    images.append(prepare_keyframe_image(image, height, width, stretch=False))
+                anchors.append(reference.latent_index)
         return images, tuple(anchors)
 
     @staticmethod

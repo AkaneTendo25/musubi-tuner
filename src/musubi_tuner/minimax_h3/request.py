@@ -17,6 +17,7 @@ class ReferenceKind(str, Enum):
 class ReferenceRole(str, Enum):
     FIRST_FRAME = "first_frame"
     LAST_FRAME = "last_frame"
+    KEYFRAME = "keyframe"
     REFERENCE = "reference"
 
 
@@ -28,11 +29,23 @@ class H3Reference:
     path: Path
     kind: ReferenceKind
     role: ReferenceRole = ReferenceRole.REFERENCE
+    #: Latent frame the image conditions, for ``KEYFRAME`` only. The transformer
+    #: places a conditioning row at its temporal position, and nothing in the
+    #: packing distinguishes an interior position from the first or the last.
+    latent_index: int | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "path", Path(self.path))
-        if self.role in (ReferenceRole.FIRST_FRAME, ReferenceRole.LAST_FRAME) and self.kind is not ReferenceKind.IMAGE:
-            raise ValueError(f"{self.role.value} must be an image")
+        if self.role in (ReferenceRole.FIRST_FRAME, ReferenceRole.LAST_FRAME, ReferenceRole.KEYFRAME):
+            if self.kind is not ReferenceKind.IMAGE:
+                raise ValueError(f"{self.role.value} must be an image")
+        if self.role is ReferenceRole.KEYFRAME:
+            if self.latent_index is None:
+                raise ValueError("keyframe conditioning requires a latent index")
+            if isinstance(self.latent_index, bool) or not isinstance(self.latent_index, int) or self.latent_index < 0:
+                raise ValueError("keyframe latent index must be a non-negative integer")
+        elif self.latent_index is not None:
+            raise ValueError("latent_index applies only to keyframe conditioning")
 
 
 @dataclass(frozen=True)
@@ -61,8 +74,12 @@ class H3GenerationRequest:
 
         first_frames = self._with_role(ReferenceRole.FIRST_FRAME)
         last_frames = self._with_role(ReferenceRole.LAST_FRAME)
+        keyframes = self._with_role(ReferenceRole.KEYFRAME)
         if len(first_frames) > 1 or len(last_frames) > 1:
             raise ValueError("at most one first-frame and one last-frame image are supported")
+        indices = [ref.latent_index for ref in keyframes]
+        if len(set(indices)) != len(indices):
+            raise ValueError("each keyframe latent index may be conditioned only once")
 
         ordinary = self._with_role(ReferenceRole.REFERENCE)
         counts = {kind: sum(ref.kind is kind for ref in ordinary) for kind in ReferenceKind}
@@ -76,7 +93,7 @@ class H3GenerationRequest:
             raise ValueError("at most 12 references are supported")
         if ordinary and all(ref.kind is ReferenceKind.AUDIO for ref in ordinary):
             raise ValueError("reference audio requires at least one reference image or video")
-        if (first_frames or last_frames) and ordinary:
+        if (first_frames or last_frames or keyframes) and ordinary:
             raise ValueError("first/last-frame conditioning and ordinary multimodal references are separate H3 modes")
 
         if check_files:
@@ -90,7 +107,7 @@ class H3GenerationRequest:
     @property
     def mode(self) -> str:
         roles = {ref.role for ref in self.references}
-        if roles & {ReferenceRole.FIRST_FRAME, ReferenceRole.LAST_FRAME}:
+        if roles & {ReferenceRole.FIRST_FRAME, ReferenceRole.LAST_FRAME, ReferenceRole.KEYFRAME}:
             return "first_last_frame"
         if self.references:
             return "reference"
@@ -105,6 +122,7 @@ def make_references(
     *,
     first_frame: str | None = None,
     last_frame: str | None = None,
+    keyframes: Iterable[tuple[int, str]] = (),
     images: Iterable[str] = (),
     videos: Iterable[str] = (),
     audio: Iterable[str] = (),
@@ -114,6 +132,9 @@ def make_references(
         references.append(H3Reference(Path(first_frame), ReferenceKind.IMAGE, ReferenceRole.FIRST_FRAME))
     if last_frame:
         references.append(H3Reference(Path(last_frame), ReferenceKind.IMAGE, ReferenceRole.LAST_FRAME))
+    references.extend(
+        H3Reference(Path(path), ReferenceKind.IMAGE, ReferenceRole.KEYFRAME, latent_index=int(index)) for index, path in keyframes
+    )
     references.extend(H3Reference(Path(path), ReferenceKind.IMAGE) for path in images)
     references.extend(H3Reference(Path(path), ReferenceKind.VIDEO) for path in videos)
     references.extend(H3Reference(Path(path), ReferenceKind.AUDIO) for path in audio)
