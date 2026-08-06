@@ -1123,6 +1123,39 @@ def _patched_convrot_linear(reference, quantized, scale, *, fwd_mode):
     return layer
 
 
+def _convrot_int8_kernel_available() -> bool:
+    import torch
+
+    from musubi_tuner.modules.convrot_int8_kernels import HAS_TRITON
+
+    return HAS_TRITON and torch.cuda.is_available()
+
+
+@pytest.mark.skipif(not _convrot_int8_kernel_available(), reason="the fused ConvRot kernel needs CUDA and triton")
+def test_h3_convrot_bf16_forward_is_at_least_as_accurate_as_the_fused_kernel():
+    # The fused kernel quantizes the activations as well as the weights; undoing
+    # the rotation on the weight instead leaves them in BF16. Both share the same
+    # weight error, so the BF16 route can only be the closer of the two, and this
+    # is the assertion the CPU tests cannot make: without CUDA the INT8 branch
+    # takes an eager fallback that does no activation quantization either.
+    import torch
+
+    reference, quantized, scale = _convrot_linear(in_features=512, out_features=512)
+    reference = reference.cuda().to(torch.bfloat16)
+    quantized, scale = quantized.cuda(), scale.cuda()
+    x = torch.randn(64, 512, device="cuda", dtype=torch.bfloat16)
+
+    expected = reference(x).detach().float()
+    error = {
+        mode: float(
+            (_patched_convrot_linear(reference, quantized, scale, fwd_mode=mode).cuda()(x).detach().float() - expected).norm()
+        )
+        for mode in ("int8", "bf16")
+    }
+
+    assert error["bf16"] <= error["int8"]
+
+
 def test_h3_convrot_bf16_forward_matches_the_rotated_path():
     # Undoing an orthogonal rotation on the weight and rotating the activations
     # into it are the same arithmetic, so the two forward modes must agree. The
