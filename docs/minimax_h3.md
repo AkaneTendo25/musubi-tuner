@@ -903,6 +903,28 @@ dominate the objective whenever the continuation is short, and the model would b
 Both counts are in **latent** units, not pixel frames, and each must be shorter than its target. The two are independent: setting
 only one trains extension for that modality while the other is generated in full from scratch.
 
+### ConvRot INT8
+
+`--h3_convrot_int8` quantizes the released BF16 transformer to ConvRot INT8 while it loads, instead of reading a checkpoint that
+was quantized offline:
+
+```shell
+accelerate launch minimax_h3_train_network.py ... --h3_convrot_int8 --h3_adaln_rank 16
+```
+
+ConvRot applies a block-diagonal Hadamard rotation before per-channel INT8, which spreads activation outliers so the quantization
+error falls. The frozen base halves in size against BF16, and the forward runs an INT8 kernel; `--h3_convrot_int8_bwd int8`
+additionally computes the backward in INT8, which is faster and coarser.
+
+Quantizing at load rather than reading a pre-quantized file matters for more than convenience. The transform hooks run first, so
+this path composes with `--h3_adaln_rank`: it quantizes an AdaLN that has already been reduced, whereas the published pruned
+checkpoints carry the projections at full width and quantize them there. The reduced projections are excluded from quantization
+entirely, as they are on the FP8 path.
+
+It replaces the other quantizations rather than combining with them, so `--fp8_base` and `--int8_convrot_base` are rejected
+alongside it. The upstream implementation notes its main benefit is speed on GPUs without FP8 support; where FP8 is available,
+compare the two rather than assuming.
+
 ### FP8 matmul
 
 Scaled FP8 stores the frozen weights in E4M3 but dequantizes them to bf16 before each matmul, so by default it saves memory and

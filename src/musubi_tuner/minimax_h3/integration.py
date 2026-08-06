@@ -470,6 +470,8 @@ def create_training_backend(
     adaln_rank: int | None = None,
     fp8_quantization_mode: str = "block",
     fp8_fast: bool = False,
+    convrot_int8: bool = False,
+    convrot_int8_bwd: str = "bf16",
 ):
     """Load the selected released transformer and adapt its training forward to Musubi."""
     if dtype != "bfloat16":
@@ -489,6 +491,8 @@ def create_training_backend(
         attention_mode=attention_mode,
         fp8_quantization_mode=fp8_quantization_mode,
         fp8_fast=fp8_fast,
+        convrot_int8=convrot_int8,
+        convrot_int8_bwd=convrot_int8_bwd,
     )
     return _NativeTrainingBackend(transformer, mode)
 

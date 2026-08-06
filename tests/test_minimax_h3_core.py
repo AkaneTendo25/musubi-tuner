@@ -1106,3 +1106,49 @@ def test_h3_fp8_fast_reports_when_nothing_was_patched():
 
     with pytest.raises(RuntimeError, match="no quantized expansion projections"):
         enable_fp8_fast_matmul(nn.Linear(4, 4))
+
+
+def test_h3_online_convrot_excludes_the_reduced_adaln():
+    # The reduced AdaLN is tiny and its error is systematic across the whole
+    # modulation curve, so it must stay out of the quantized set exactly as it
+    # does on the FP8 path.
+    from musubi_tuner.minimax_h3.model_loader import H3_FP8_OPTIMIZATION_EXCLUDE_KEYS
+    from musubi_tuner.modules.convrot_int8_utils import ConvRotInt8Quantizer
+
+    quantizer = ConvRotInt8Quantizer(["blocks."], H3_FP8_OPTIMIZATION_EXCLUDE_KEYS + ["adaln_proj"])
+
+    assert not quantizer.is_target_key("blocks.0.adaln_proj.linear.weight")
+    assert quantizer.is_target_key("blocks.0.attn.qkv_proj.weight")
+
+
+def test_h3_online_convrot_targets_only_transformer_weights():
+    from musubi_tuner.minimax_h3.model_loader import (
+        H3_FP8_OPTIMIZATION_EXCLUDE_KEYS,
+        H3_FP8_OPTIMIZATION_TARGET_KEYS,
+    )
+    from musubi_tuner.modules.convrot_int8_utils import ConvRotInt8Quantizer
+
+    quantizer = ConvRotInt8Quantizer(H3_FP8_OPTIMIZATION_TARGET_KEYS, H3_FP8_OPTIMIZATION_EXCLUDE_KEYS)
+
+    # Biases and non-weight tensors are never quantized.
+    assert not quantizer.is_target_key("blocks.0.attn.qkv_proj.bias")
+    assert not quantizer.is_target_key("adaln_t_table")
+
+
+@pytest.mark.parametrize(
+    ("flags", "message"),
+    [
+        ({"h3_convrot_int8": True, "fp8_base": True}, "drop --fp8_base"),
+        ({"h3_convrot_int8": True, "int8_convrot_base": True}, "drop --fp8_base"),
+        ({"h3_convrot_int8_bwd": "int8"}, "requires --h3_convrot_int8"),
+    ],
+)
+def test_h3_online_convrot_rejects_conflicting_quantization(flags, message):
+    from musubi_tuner.minimax_h3_train_network import MiniMaxH3NetworkTrainer, create_parser
+
+    args = create_parser().parse_args([])
+    for key, value in flags.items():
+        setattr(args, key, value)
+
+    with pytest.raises(ValueError, match=message):
+        MiniMaxH3NetworkTrainer().handle_model_specific_args(args)

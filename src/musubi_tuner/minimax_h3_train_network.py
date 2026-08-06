@@ -414,6 +414,10 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             raise ValueError("--h3_guidance_loss_form contrastive requires --h3_guidance_distillation_scale")
         if not math.isfinite(args.h3_base_preservation_loss_weight) or args.h3_base_preservation_loss_weight < 0:
             raise ValueError("--h3_base_preservation_loss_weight must be finite and non-negative")
+        if args.h3_convrot_int8 and (args.fp8_base or args.int8_convrot_base):
+            raise ValueError("--h3_convrot_int8 quantizes the BF16 checkpoint itself; drop --fp8_base/--int8_convrot_base")
+        if args.h3_convrot_int8_bwd == "int8" and not args.h3_convrot_int8:
+            raise ValueError("--h3_convrot_int8_bwd int8 requires --h3_convrot_int8")
         if args.h3_fp8_fast and not args.fp8_base:
             raise ValueError("--h3_fp8_fast has nothing to accelerate without --fp8_base")
         if args.h3_fp8_fast and args.h3_fp8_quantization_mode != "tensor":
@@ -741,6 +745,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             adaln_rank=args.h3_adaln_rank,
             fp8_quantization_mode=args.h3_fp8_quantization_mode,
             fp8_fast=bool(args.h3_fp8_fast),
+            convrot_int8=bool(args.h3_convrot_int8),
+            convrot_int8_bwd=args.h3_convrot_int8_bwd,
             quantization_device=str(accelerator.device),
             int8_convrot=bool(args.int8_convrot_base),
         )
@@ -1282,6 +1288,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             "ss_h3_caption_dropout_rate": str(args.h3_caption_dropout_rate),
             "ss_h3_fp8_quantization_mode": args.h3_fp8_quantization_mode,
             "ss_h3_fp8_fast": str(args.h3_fp8_fast),
+            "ss_h3_convrot_int8": str(args.h3_convrot_int8),
+            "ss_h3_convrot_int8_bwd": args.h3_convrot_int8_bwd,
             "ss_h3_extension_video_frames": str(args.h3_extension_video_frames),
             "ss_h3_extension_audio_latents": str(args.h3_extension_audio_latents),
             "ss_h3_extension_route": args.h3_extension_route,
@@ -1481,6 +1489,22 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         "--int8_convrot_base",
         action="store_true",
         help="load the pruned Comfy INT8 ConvRot transformer for LoRA training",
+    )
+    parser.add_argument(
+        "--h3_convrot_int8",
+        action="store_true",
+        help=(
+            "quantize the released BF16 transformer to ConvRot INT8 as it loads, rather than reading a checkpoint "
+            "that was quantized offline. Because the quantization happens after the weight transforms, it composes "
+            "with --h3_adaln_rank and so quantizes a reduced AdaLN instead of the full-width projections the "
+            "published pruned checkpoints carry"
+        ),
+    )
+    parser.add_argument(
+        "--h3_convrot_int8_bwd",
+        choices=("bf16", "int8"),
+        default="bf16",
+        help="precision of the ConvRot backward pass; int8 is faster and coarser",
     )
     parser.add_argument(
         "--h3_fp8_quantization_mode",

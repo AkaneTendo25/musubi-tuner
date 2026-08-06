@@ -23,6 +23,7 @@ from musubi_tuner.minimax_h3.int8_convrot import (
 from musubi_tuner.minimax_h3.model import MiniMaxH3TimeEmbedder, MiniMaxH3Transformer, MiniMaxH3TransformerConfig
 from musubi_tuner.minimax_h3.training import H3TrainingMode
 from musubi_tuner.minimax_h3.weights import CheckpointInspectionError, tensor_metadata
+from musubi_tuner.modules.convrot_int8_utils import ConvRotInt8Quantizer, apply_convrot_int8_monkey_patch
 from musubi_tuner.modules.fp8_optimization_utils import apply_fp8_monkey_patch, fp8_linear_forward_patch
 from musubi_tuner.utils.lora_utils import load_safetensors_with_lora_and_fp8
 from musubi_tuner.utils.safetensors_utils import WeightTransformHooks
@@ -221,6 +222,8 @@ def load_transformer(
     attention_mode: str = "torch",
     fp8_quantization_mode: str = "block",
     fp8_fast: bool = False,
+    convrot_int8: bool = False,
+    convrot_int8_bwd: str = "bf16",
 ) -> MiniMaxH3Transformer:
     checkpoint_path = resolve_transformer_checkpoint(source, mode, int8_convrot=int8_convrot)
     config = infer_transformer_config(checkpoint_path)
@@ -273,11 +276,23 @@ def load_transformer(
         if registered_layers != quantized_layers:
             raise RuntimeError(f"prepared {registered_layers} INT8 modules for {quantized_layers} checkpoint layers")
     else:
+        # ConvRot quantizes the released BF16 weights as they stream, so it sees
+        # the same reduced AdaLN the transform hook produces rather than the
+        # full-rank projections a pre-quantized checkpoint carries.
+        quantizer = (
+            ConvRotInt8Quantizer(
+                H3_FP8_OPTIMIZATION_TARGET_KEYS,
+                H3_FP8_OPTIMIZATION_EXCLUDE_KEYS + (["adaln_proj"] if adaln_rank is not None else []),
+            )
+            if convrot_int8
+            else None
+        )
         state_dict = load_safetensors_with_lora_and_fp8(
             model_files=str(checkpoint_path),
             lora_weights_list=None,
             lora_multipliers=None,
             fp8_optimization=fp8_scaled,
+            quantizer=quantizer,
             calc_device=calc_device,
             move_to_device=device.type != "cpu" and device == calc_device,
             dit_weight_dtype=None,
@@ -292,6 +307,12 @@ def load_transformer(
             apply_fp8_monkey_patch(model, state_dict, use_scaled_mm=False)
             if fp8_fast:
                 enable_fp8_fast_matmul(model)
+        elif convrot_int8:
+            apply_convrot_int8_monkey_patch(model, state_dict, bwd_mode=convrot_int8_bwd)
+            # int8 tensors cannot carry requires_grad, and load_state_dict(assign=True)
+            # re-applies the meta parameters' requires_grad to whatever arrives. The base
+            # is frozen for LoRA training regardless, so clear it before the load.
+            model.requires_grad_(False)
     if not int8_convrot and device.type != "cpu" and device != calc_device:
         state_dict = {key: value.to(device) for key, value in state_dict.items()}
     info = model.load_state_dict(state_dict, strict=True, assign=True)
