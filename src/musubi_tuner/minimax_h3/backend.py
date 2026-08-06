@@ -64,16 +64,20 @@ def create_latent_encoder(
     audio_vae: Path | None,
     device: str | None,
     dtype: str,
+    reference_scales: tuple[float, ...] | None = None,
 ) -> H3LatentEncoder:
     """Load the video VAE and, for video datasets, the audio VAE used by latent caching."""
     _validate_dtype(dtype)
     from musubi_tuner.minimax_h3.integration import create_latent_encoder as create_integrated_latent_encoder
 
+    # Forwarded only when set, so the wrapper routes exactly what it was given.
+    optional = {} if reference_scales is None else {"reference_scales": tuple(reference_scales)}
     return create_integrated_latent_encoder(
         video_vae=video_vae,
         audio_vae=audio_vae,
         device=device,
         dtype=dtype,
+        **optional,
     )
 
 
