@@ -902,6 +902,11 @@ timestep 0.999 and audio context passes through at timestep 1.0.
 `per_row_sigma` avoids that entirely at the cost of leaving the released distribution. Both are available so the two can be
 compared on the same data.
 
+The released weights already continue from an observed prefix, but barely: the error at the first unobserved frame falls to
+0.923x and is back to ~0.99x four frames later. Of every conditioning mode measured in
+[What the base already does](#what-the-base-already-does) this one has the widest gap between a mechanism that demonstrably
+works and an effect that is nearly absent, which makes it the most promising thing to train.
+
 The observed span is removed from the loss, intersecting any mask the dataset already provides. Without that the context would
 dominate the objective whenever the continuation is short, and the model would be scored on frames it was given.
 
@@ -1039,10 +1044,42 @@ the released contract where a conditioned first frame is still predicted; a hand
 way a long observed prefix would.
 
 This is not identical to released keyframe conditioning: the content is the target's own latent window rather than a separately
-encoded keyframe image, and `--task t2va` conditioning carries no vision rows. Treat it as a related but distinct interface, and
-check whether the released model already interpolates from interior anchors before training an adapter to do it.
+encoded keyframe image, and `--task t2va` conditioning carries no vision rows. Treat it as a related but distinct interface.
+
+The released model does interpolate from interior anchors without any training -- see
+[What the base already does](#what-the-base-already-does) -- so an adapter here strengthens an existing behaviour rather than
+introducing one. `--keyframe INDEX:PATH` exposes the same conditioning at inference.
 
 Keyframe conditioning, extension, and masked conditioning all claim the observed rows, so only one may be enabled at a time.
+
+### What the base already does
+
+Whether a conditioning mode is worth training depends on what the released weights do untrained, which is a measurable question
+rather than a matter of opinion. Each row below reconstructs `x0 = x_t + sigma * prediction` at sigma 0.6 and compares the error
+in the region the mode governs against the same run without that conditioning. Lower is better; `1.0x` means the conditioning
+changed nothing.
+
+| conditioning | effect | reading |
+| --- | --- | --- |
+| keyframe at frame 0 | 0.212x at that frame | honoured strongly |
+| keyframe at interior frame 18 | 0.458x at that frame | honoured, and more strongly than `last` |
+| keyframe at `last` | 0.638x at that frame | honoured |
+| observed prefix (extension) | 0.923x at the first unobserved frame | honoured weakly, decaying to ~0.99x within four frames |
+| clean audio (A2V) | no effect | see below |
+| clean video (V2A) | no effect from content | see below |
+
+Two consequences worth stating plainly. Interior keyframes work natively, so nothing had to be taught for them -- only the request
+API withheld them. Extension is the opposite case: the mechanism demonstrably exists but buys only a few percent over roughly half
+a second, which leaves the most room for training to improve.
+
+The cross-modal rows need the sharper test. Handing over a clean track lowers the error slightly, but the clip's **own** track is
+no better than **another clip's** -- so the model is exploiting the presence of a low-noise modality in the packed sequence, not
+its content. For A2V the improved and worsened positions match each other across all 30,932 latent positions (0.80% against
+0.83%), which rules out a benefit hiding in a narrow region such as a speaker's mouth. Training A2V or V2A therefore teaches a
+correspondence the base does not use, which is a legitimate goal but a harder one than strengthening keyframes.
+
+Measured on one clip at one noise level, so treat the ordering as indicative rather than exact; the A2V symmetry is the one result
+with enough positions behind it to stand on its own.
 
 ### Masked conditioning
 
