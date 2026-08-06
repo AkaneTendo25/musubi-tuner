@@ -899,6 +899,30 @@ dominate the objective whenever the continuation is short, and the model would b
 Both counts are in **latent** units, not pixel frames, and each must be shorter than its target. The two are independent: setting
 only one trains extension for that modality while the other is generated in full from scratch.
 
+### Reference cost
+
+Ref2VA references inflate the packed sequence in two places at once: as transformer rows, and as Qwen3-VL vision tokens inside the
+text prefix. Attention is quadratic in the packed length and the feed-forward layers linear in it, so a large reference is
+expensive in both terms. A multi-second video reference can contribute several times more rows than the target it conditions.
+
+`--reference_scales` draws a reference resolution per item at caching time:
+
+```shell
+python src/musubi_tuner/minimax_h3_cache_latents.py ... --reference_scales 1.0,0.75,0.5
+```
+
+Each reference carries its own latent height and width, independent of the target, and H3's spatial rotary grid is
+area-normalized, so a smaller reference occupies the same coordinate field with fewer samples rather than a different one. Packed
+rows fall roughly with the square of the scale, and because the conditioner is fed the same prepared media, its vision tokens fall
+with it.
+
+Draw a range rather than fixing one value, and keep `1.0` in the list. Generation always prepares references at the released full
+resolution, so an adapter trained only on smaller ones would meet a presentation it never saw; including `1.0` keeps that case
+inside the training distribution while the smaller draws still lower the average cost. Scales are bounded to `[0.25, 1.0]`, below
+which too few patches remain to carry identity.
+
+Both auxiliary objectives multiply this cost, since each adds a full forward over the same reference-inflated sequence.
+
 ### Per-frame noise spread
 
 `--h3_frame_sigma_jitter` gives each latent frame its own noise level around the step's shared schedule position:
