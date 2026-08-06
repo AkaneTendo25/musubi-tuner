@@ -490,6 +490,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             raise ValueError("MiniMax H3 training does not support compilation")
         if not (args.sdpa or args.flash_attn or args.flash3):
             raise ValueError("MiniMax H3 training requires --sdpa, --flash_attn, or --flash3")
+        if args.h3_attn_auto_dispatch and not args.sdpa:
+            raise ValueError("--h3_attn_auto_dispatch requires --sdpa")
         if args.split_attn:
             raise ValueError("MiniMax H3 training does not support split attention")
         if args.sample_prompts:
@@ -739,6 +741,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         transformer = self.backend.get_training_transformer()
         if not isinstance(transformer, torch.nn.Module):
             raise TypeError("H3 backend get_training_transformer() must return a torch.nn.Module")
+        if args.h3_attn_auto_dispatch:
+            transformer.enable_attention_auto_dispatch()
         return transformer
 
     def compile_transformer(self, args, transformer):
@@ -1264,6 +1268,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             "ss_h3_loss_balance": args.h3_loss_balance,
             "ss_h3_video_loss_weight": str(args.h3_video_loss_weight),
             "ss_h3_audio_loss_weight": str(args.h3_audio_loss_weight),
+            "ss_h3_attn_auto_dispatch": str(args.h3_attn_auto_dispatch),
             "ss_h3_observed_modality": str(args.h3_observed_modality or "none"),
             "ss_h3_image_flow_shift": str(args.h3_image_flow_shift or "resolution_aware"),
             "ss_h3_guidance_distillation_scale": str(args.h3_guidance_distillation_scale or "one_pass"),
@@ -1315,6 +1320,14 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     )
     parser.add_argument("--h3_video_loss_weight", type=float, default=1.0)
     parser.add_argument("--h3_audio_loss_weight", type=float, default=1.0)
+    parser.add_argument(
+        "--h3_attn_auto_dispatch",
+        action="store_true",
+        help=(
+            "prioritize cuDNN SDPA for large maskless CUDA BF16/FP16 attention shapes; "
+            "short, masked, CPU, and FP32 workloads retain ordinary SDPA"
+        ),
+    )
     parser.add_argument(
         "--h3_observed_modality",
         type=str,

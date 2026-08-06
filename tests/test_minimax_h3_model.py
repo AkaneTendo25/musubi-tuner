@@ -44,6 +44,66 @@ def _tiny_config(*, num_layers: int = 2) -> MiniMaxH3TransformerConfig:
     )
 
 
+def test_h3_attention_auto_dispatch_threshold_is_shape_aware():
+    assert not h3_model._cudnn_auto_workload_is_large(1023, 4096, 128)
+    assert not h3_model._cudnn_auto_workload_is_large(1024, 1024, 128)
+    assert h3_model._cudnn_auto_workload_is_large(1449, 1449, 128)
+
+
+def test_h3_attention_auto_dispatch_is_opt_in_and_sdpa_only():
+    model = MiniMaxH3Transformer(_tiny_config())
+    attentions = [module for module in model.modules() if isinstance(module, h3_model.MiniMaxH3Attention)]
+
+    assert attentions
+    assert not any(module.auto_dispatch for module in attentions)
+
+    model.enable_attention_auto_dispatch()
+
+    assert all(module.auto_dispatch for module in attentions)
+
+    flash_model = MiniMaxH3Transformer(_tiny_config(), attention_mode="flash")
+    with pytest.raises(ValueError, match="requires SDPA"):
+        flash_model.enable_attention_auto_dispatch()
+
+
+def test_h3_attention_auto_dispatch_keeps_cpu_on_ordinary_sdpa(monkeypatch):
+    def forbidden_priority(*_args, **_kwargs):
+        raise AssertionError("CPU attention must not enter the cuDNN priority context")
+
+    monkeypatch.setattr(h3_model, "sdpa_kernel", forbidden_priority)
+    module = h3_model.MiniMaxH3Attention(hidden_size=16, heads=2, head_dim=8, qk_norm_eps=1e-5)
+    module.auto_dispatch = True
+
+    output = module(torch.randn(1, 16, 16))
+
+    assert output.shape == (1, 16, 16)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA SDPA")
+def test_h3_attention_auto_dispatch_runs_cudnn_priority_forward_backward(monkeypatch):
+    original_sdpa_kernel = h3_model.sdpa_kernel
+    calls = []
+
+    def recorded_priority(backends, *, set_priority=False):
+        calls.append((backends, set_priority))
+        return original_sdpa_kernel(backends, set_priority=set_priority)
+
+    monkeypatch.setattr(h3_model, "sdpa_kernel", recorded_priority)
+    monkeypatch.setattr(h3_model, "_CUDNN_AUTO_WORK_THRESHOLD", 1)
+    monkeypatch.setattr(h3_model, "_CUDNN_AUTO_MIN_SEQUENCE", 1)
+    module = h3_model.MiniMaxH3Attention(hidden_size=128, heads=1, head_dim=128, qk_norm_eps=1e-5).cuda().bfloat16()
+    module.auto_dispatch = True
+    hidden_states = torch.randn(1, 32, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+
+    output = module(hidden_states)
+    output.float().square().mean().backward()
+
+    assert calls and calls[0][1] is True
+    assert torch.isfinite(output).all()
+    assert hidden_states.grad is not None
+    assert torch.isfinite(hidden_states.grad).all()
+
+
 def _tiny_inputs(*, dtype: torch.dtype = torch.float32) -> dict[str, torch.Tensor]:
     return {
         "video_hidden_states": torch.randn(1, 2, 16, dtype=dtype),

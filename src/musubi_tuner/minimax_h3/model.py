@@ -21,6 +21,7 @@ Diffusers model APIs and lets Musubi load the Comfy BF16 repack directly.
 
 from __future__ import annotations
 
+import inspect
 from dataclasses import dataclass
 from enum import IntEnum
 
@@ -36,6 +37,47 @@ from musubi_tuner.modules.custom_offloading_utils import BlockSwapConfig, create
 from musubi_tuner.utils.model_utils import create_cpu_offloading_wrapper
 
 MINIMAX_H3_MODALITY_COUNT = 3
+_CUDNN_AUTO_WORK_THRESHOLD = 1 << 28
+_CUDNN_AUTO_MIN_SEQUENCE = 1024
+
+try:
+    from torch.nn.attention import SDPBackend, sdpa_kernel
+
+    _CUDNN_SDPA_ORDER = [
+        SDPBackend.CUDNN_ATTENTION,
+        SDPBackend.FLASH_ATTENTION,
+        SDPBackend.EFFICIENT_ATTENTION,
+        SDPBackend.MATH,
+    ]
+    _SDPA_HAS_SET_PRIORITY = "set_priority" in inspect.signature(sdpa_kernel).parameters
+except (ImportError, AttributeError, TypeError, ValueError):
+    SDPBackend = None
+    sdpa_kernel = None
+    _CUDNN_SDPA_ORDER = None
+    _SDPA_HAS_SET_PRIORITY = False
+
+
+def _cudnn_auto_workload_is_large(query_length: int, key_length: int, head_dim: int) -> bool:
+    return (
+        min(query_length, key_length) >= _CUDNN_AUTO_MIN_SEQUENCE
+        and query_length * key_length * head_dim >= _CUDNN_AUTO_WORK_THRESHOLD
+    )
+
+
+def _use_cudnn_auto_dispatch(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, attention_mask) -> bool:
+    is_compiling = getattr(getattr(torch, "compiler", None), "is_compiling", lambda: False)
+    compiling = bool(is_compiling())
+    return (
+        attention_mask is None
+        and not compiling
+        and SDPBackend is not None
+        and _SDPA_HAS_SET_PRIORITY
+        and query.device.type == "cuda"
+        and query.dtype in {torch.float16, torch.bfloat16}
+        and key.dtype == query.dtype
+        and value.dtype == query.dtype
+        and _cudnn_auto_workload_is_large(query.shape[-2], key.shape[-2], query.shape[-1])
+    )
 
 
 class MiniMaxH3TokenTag(IntEnum):
@@ -150,6 +192,7 @@ class MiniMaxH3Attention(nn.Module):
         self.heads = heads
         self.head_dim = head_dim
         self.attention_mode = attention_mode
+        self.auto_dispatch = False
         self.inner_dim = heads * head_dim
         self.qkv_proj = nn.Linear(hidden_size, 3 * self.inner_dim, bias=False)
         self.q_norm = nn.RMSNorm(head_dim, eps=qk_norm_eps)
@@ -185,14 +228,20 @@ class MiniMaxH3Attention(nn.Module):
             value = value.transpose(1, 2)
             if attention_mask is not None:
                 attention_mask = attention_mask[None, None, :, :]
-            hidden_states = F.scaled_dot_product_attention(
-                query,
-                key,
-                value,
-                attn_mask=attention_mask,
-                dropout_p=0.0,
-                is_causal=False,
-            )
+            if self.auto_dispatch and _use_cudnn_auto_dispatch(query, key, value, attention_mask):
+                with sdpa_kernel(_CUDNN_SDPA_ORDER, set_priority=True):
+                    hidden_states = F.scaled_dot_product_attention(
+                        query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False
+                    )
+            else:
+                hidden_states = F.scaled_dot_product_attention(
+                    query,
+                    key,
+                    value,
+                    attn_mask=attention_mask,
+                    dropout_p=0.0,
+                    is_causal=False,
+                )
             hidden_states = hidden_states.transpose(1, 2).flatten(2, 3).to(query.dtype)
         return self.out_proj(hidden_states)
 
@@ -381,6 +430,13 @@ class MiniMaxH3Transformer(nn.Module):
     def disable_gradient_checkpointing(self) -> None:
         self.gradient_checkpointing = False
         self.activation_cpu_offloading = False
+
+    def enable_attention_auto_dispatch(self) -> None:
+        for module in self.modules():
+            if isinstance(module, MiniMaxH3Attention):
+                if module.attention_mode != "torch":
+                    raise ValueError("MiniMax H3 attention auto-dispatch requires SDPA attention")
+                module.auto_dispatch = True
 
     def enable_block_swap(self, blocks_to_swap: int, config: BlockSwapConfig) -> None:
         num_blocks = len(self.blocks)

@@ -326,6 +326,10 @@ For additional VRAM savings during training, pass `--gradient_checkpointing --gr
 large unified video/audio activation between transformer blocks and moves it back to each block's device for recomputation. CPU
 offloading is slower than gradient checkpointing alone and should be used when sequence length would otherwise exceed available VRAM.
 
+With `--sdpa`, `--h3_attn_auto_dispatch` prioritizes cuDNN SDPA for large maskless CUDA BF16/FP16 attention workloads. Short
+sequences, padded or custom attention masks, FP32, and CPU execution retain ordinary PyTorch SDPA. The option is disabled by default
+because backend selection can change numerical rounding; benchmark throughput and training quality on the intended shape.
+
 The native loader preserves the released component precision: the Comfy video encoder is FP16 and the audio encoder is FP32.
 Normalized cache tensors default to float32, and target video/audio caches use the posterior mean for deterministic reuse. Cache
 filenames use Musubi's `mmh3` architecture short name. The latent cache contains normalized video latents, normalized stereo audio

@@ -1996,6 +1996,14 @@ def test_h3_trainer_maps_common_fp8_switch_to_scaled_loading_and_accepts_swap():
     assert args.block_swap_ring_size == 1
     assert args.block_swap_granularity == "layer"
     assert args.use_pinned_memory_for_block_swap is True
+    assert args.h3_attn_auto_dispatch is False
+
+
+def test_h3_attention_auto_dispatch_requires_sdpa():
+    args = create_parser().parse_args(["--flash_attn", "--h3_attn_auto_dispatch"])
+
+    with pytest.raises(ValueError, match="requires --sdpa"):
+        MiniMaxH3NetworkTrainer().handle_model_specific_args(args)
 
 
 def test_h3_trainer_warns_when_h2d_swap_uses_unpinned_host_memory(caplog):
