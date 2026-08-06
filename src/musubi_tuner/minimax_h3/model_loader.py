@@ -24,7 +24,7 @@ from musubi_tuner.minimax_h3.model import MiniMaxH3TimeEmbedder, MiniMaxH3Transf
 from musubi_tuner.minimax_h3.training import H3TrainingMode
 from musubi_tuner.minimax_h3.weights import CheckpointInspectionError, tensor_metadata
 from musubi_tuner.modules.convrot_int8_utils import ConvRotInt8Quantizer, apply_convrot_int8_monkey_patch
-from musubi_tuner.modules.fp8_optimization_utils import apply_fp8_monkey_patch, fp8_linear_forward_patch
+from musubi_tuner.modules.fp8_optimization_utils import apply_fp8_monkey_patch
 from musubi_tuner.utils.lora_utils import load_safetensors_with_lora_and_fp8
 from musubi_tuner.utils.safetensors_utils import WeightTransformHooks
 
@@ -184,6 +184,58 @@ def validate_transformer_checkpoint(
 # hand the entire gain back. So the fast path is applied to those two alone.
 FP8_FAST_MATMUL_SUFFIXES = ("attn.qkv_proj", "mlp.fc1")
 
+# torch._scaled_mm tiles the operands, so every dimension it contracts or emits
+# has to land on a tile boundary.
+_SCALED_MM_ALIGNMENT = 16
+
+
+class _Fp8ScaledMatmul(torch.autograd.Function):
+    """FP8 matmul against a frozen per-tensor-scaled weight.
+
+    ``torch._scaled_mm`` carries no derivative, so calling it directly severs the
+    graph that LoRA training needs. The weight is frozen, leaving only the input
+    gradient to supply, and that one is an ordinary matmul against the
+    dequantized weight.
+    """
+
+    @staticmethod
+    def forward(ctx, x, weight, scale_weight, bias, fp8_max):
+        ctx.save_for_backward(weight, scale_weight)
+        ctx.input_dtype = x.dtype
+
+        flat = x.reshape(-1, x.shape[-1])
+        rows = flat.shape[0]
+        padding = -rows % _SCALED_MM_ALIGNMENT
+        if padding:
+            flat = torch.nn.functional.pad(flat, (0, 0, 0, padding))
+
+        # Casting bf16 straight to FP8 would saturate every activation above the
+        # format's 448 ceiling, so the row block carries its own scale.
+        scale_x = (flat.abs().amax().float() / fp8_max).clamp_min(torch.finfo(torch.float32).tiny)
+        quantized = (flat.float() / scale_x).clamp(-fp8_max, fp8_max).to(weight.dtype)
+
+        out = torch._scaled_mm(
+            quantized,
+            weight.t(),
+            scale_a=scale_x,
+            scale_b=scale_weight.float().reshape(()),
+            out_dtype=torch.bfloat16,
+        )
+        if padding:
+            out = out[:rows]
+        if bias is not None:
+            out = out + bias.to(out.dtype)
+        return out.reshape(*x.shape[:-1], -1).to(ctx.input_dtype)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        weight, scale_weight = ctx.saved_tensors
+        grad_input = None
+        if ctx.needs_input_grad[0]:
+            dequantized = weight.to(torch.bfloat16) * scale_weight.to(torch.bfloat16)
+            grad_input = (grad_output.to(torch.bfloat16) @ dequantized).to(ctx.input_dtype)
+        return grad_input, None, None, None, None
+
 
 def enable_fp8_fast_matmul(model: torch.nn.Module) -> int:
     """Re-bind the expansion projections to the FP8 matmul path.
@@ -196,11 +248,17 @@ def enable_fp8_fast_matmul(model: torch.nn.Module) -> int:
     for name, module in model.named_modules():
         if not name.endswith(FP8_FAST_MATMUL_SUFFIXES) or not hasattr(module, "scale_weight"):
             continue
-        if module.scale_weight.ndim != 1:
+        # Per-channel and blockwise scales vary along the output, which the
+        # single scale_b of a tensorwise _scaled_mm cannot express.
+        if module.scale_weight.numel() != 1:
             raise ValueError("H3 fast FP8 matmul needs a per-tensor weight scale; load with fp8_quantization_mode='tensor'")
+        rows, columns = module.weight.shape
+        if rows % _SCALED_MM_ALIGNMENT or columns % _SCALED_MM_ALIGNMENT:
+            raise ValueError(f"H3 fast FP8 matmul needs {name} shaped in multiples of {_SCALED_MM_ALIGNMENT}, got {rows}x{columns}")
+        fp8_max = float(torch.finfo(module.weight.dtype).max)
 
-        def fast_forward(self, x):
-            return fp8_linear_forward_patch(self, x, True, None)
+        def fast_forward(self, x, _fp8_max=fp8_max):
+            return _Fp8ScaledMatmul.apply(x, self.weight, self.scale_weight, self.bias, _fp8_max)
 
         module.forward = fast_forward.__get__(module, type(module))
         patched += 1

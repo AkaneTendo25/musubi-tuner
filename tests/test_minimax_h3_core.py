@@ -1052,25 +1052,58 @@ def test_h3_fp8_fast_targets_only_the_expansion_projections():
     assert not any(suffix.endswith(("out_proj", "fc2")) for suffix in FP8_FAST_MATMUL_SUFFIXES)
 
 
-def test_h3_fp8_fast_rebinds_the_selected_layers():
+def _fp8_matmul_available() -> bool:
+    import torch
+
+    return torch.cuda.is_available() and torch.cuda.get_device_capability() >= (8, 9)
+
+
+def _fp8_fast_block():
     import torch
     from torch import nn
-
-    from musubi_tuner.minimax_h3.model_loader import enable_fp8_fast_matmul
 
     class Block(nn.Module):
         def __init__(self):
             super().__init__()
             self.attn = nn.Module()
-            self.attn.qkv_proj = nn.Linear(4, 12, bias=False)
-            self.attn.out_proj = nn.Linear(4, 4, bias=False)
+            self.attn.qkv_proj = nn.Linear(16, 48, bias=False)
+            self.attn.out_proj = nn.Linear(16, 16, bias=False)
             self.mlp = nn.Module()
-            self.mlp.fc1 = nn.Linear(4, 8, bias=False)
-            self.mlp.fc2 = nn.Linear(4, 4, bias=False)
+            self.mlp.fc1 = nn.Linear(16, 32, bias=False)
+            self.mlp.fc2 = nn.Linear(16, 16, bias=False)
 
     model = Block()
     for module in (model.attn.qkv_proj, model.attn.out_proj, model.mlp.fc1, model.mlp.fc2):
-        module.register_buffer("scale_weight", torch.ones(1))
+        # The shape the per-tensor quantizer actually emits, asserted by
+        # test_h3_fp8_per_tensor_scale_is_a_bare_scalar.
+        module.register_buffer("scale_weight", torch.tensor(1.0))
+    return model
+
+
+def test_h3_fp8_per_tensor_scale_is_a_bare_scalar():
+    # Every fast-path guard is written against this shape, so it is pinned here
+    # rather than assumed. The scale carries no dimensions at all, which is why
+    # a check for a one-dimensional scale rejects the one mode that works.
+    import torch
+
+    from musubi_tuner.modules.fp8_optimization_utils import quantize_weight
+
+    _, scale = quantize_weight(
+        "layer.weight",
+        torch.randn(32, 16),
+        torch.float8_e4m3fn,
+        448.0,
+        -448.0,
+        "tensor",
+        64,
+    )
+    assert scale.ndim == 0
+
+
+def test_h3_fp8_fast_rebinds_the_selected_layers():
+    from musubi_tuner.minimax_h3.model_loader import enable_fp8_fast_matmul
+
+    model = _fp8_fast_block()
     assert enable_fp8_fast_matmul(model) == 2
 
     # A rebound module carries forward as an instance attribute; an untouched one
@@ -1097,6 +1130,55 @@ def test_h3_fp8_fast_requires_a_per_tensor_scale():
 
     with pytest.raises(ValueError, match="per-tensor weight scale"):
         enable_fp8_fast_matmul(model)
+
+
+def test_h3_fp8_fast_rejects_shapes_the_fp8_matmul_cannot_tile():
+    import torch
+    from torch import nn
+
+    from musubi_tuner.minimax_h3.model_loader import enable_fp8_fast_matmul
+
+    class Block(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.attn = nn.Module()
+            self.attn.qkv_proj = nn.Linear(20, 48, bias=False)
+
+    model = Block()
+    model.attn.qkv_proj.register_buffer("scale_weight", torch.tensor(1.0))
+
+    with pytest.raises(ValueError, match="multiples of 16"):
+        enable_fp8_fast_matmul(model)
+
+
+@pytest.mark.skipif(not _fp8_matmul_available(), reason="FP8 matmul needs an SM 8.9+ GPU")
+def test_h3_fp8_fast_matches_the_dequantized_reference_and_carries_gradients():
+    # The fast path replaces a dequantize-then-matmul with an FP8 matmul, so it
+    # has to agree with what it replaced and stay differentiable for the LoRA
+    # branch that sits on top of it.
+    import torch
+
+    from musubi_tuner.minimax_h3.model_loader import enable_fp8_fast_matmul
+
+    model = _fp8_fast_block().cuda()
+    layer = model.mlp.fc1
+    reference_weight = layer.weight.detach().clone()
+    scale = reference_weight.abs().max() / torch.finfo(torch.float8_e4m3fn).max
+    layer.weight = torch.nn.Parameter((reference_weight / scale).to(torch.float8_e4m3fn), requires_grad=False)
+    layer.scale_weight = scale.reshape(())
+    enable_fp8_fast_matmul(model)
+
+    # 24 rows exercise the padding to the matmul's tile boundary.
+    x = torch.randn(1, 24, 16, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    out = layer(x)
+    assert out.shape == (1, 24, 32)
+
+    dequantized = layer.weight.to(torch.bfloat16) * scale.to(torch.bfloat16)
+    expected = x.detach() @ dequantized.t()
+    assert (out - expected).norm() / expected.norm() < 0.05
+
+    out.sum().backward()
+    assert x.grad is not None and torch.isfinite(x.grad).all()
 
 
 def test_h3_fp8_fast_reports_when_nothing_was_patched():
