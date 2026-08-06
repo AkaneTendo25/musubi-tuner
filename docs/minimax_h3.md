@@ -913,21 +913,24 @@ only one trains extension for that modality while the other is generated in full
 Both quantizations store the frozen base at one byte per weight, so neither has a memory advantage over the other. They differ in
 what that byte buys. Measured against the same BF16 reference on FL2VA, one forward at rank 16, relative L2 of the model output:
 
-| frozen base | video | audio | s/it |
-| --- | --- | --- | --- |
-| ConvRot INT8 (`--h3_convrot_int8`) | **7.85e-02** | **1.25e-01** | 7.43 |
-| ConvRot INT8 + `--h3_adaln_rank 16` | 7.85e-02 | 1.25e-01 | 6.21 |
-| scaled FP8, per-block scale | 1.17e-01 | 2.30e-01 | **3.94** |
-| scaled FP8, per-channel scale | 1.40e-01 | 2.19e-01 | — |
-| scaled FP8, per-tensor scale | 1.41e-01 | 2.04e-01 | 5.06 |
+| frozen base | video | audio |
+| --- | --- | --- |
+| ConvRot INT8, `--h3_convrot_int8_fwd bf16` | **6.69e-02** | **9.66e-02** |
+| ConvRot INT8, fused INT8 forward | 7.85e-02 | 1.25e-01 |
+| scaled FP8, per-block scale | 1.17e-01 | 2.30e-01 |
+| scaled FP8, per-channel scale | 1.40e-01 | 2.19e-01 |
+| scaled FP8, per-tensor scale | 1.41e-01 | 2.04e-01 |
 
-ConvRot is roughly one and a half times closer to BF16 on video and rather more than that on audio, at the same byte budget. The
-rotation is what earns it: spreading the outliers lets uniform INT8 levels carry more of the distribution than E4M3 does with its
-three mantissa bits. **Prefer ConvRot INT8 unless the wall clock forbids it.** Times above are 608x352x124 on one H100; the
-1.9x is a real cost, and pairing ConvRot with `--h3_adaln_rank 16` recovers a third of it for nothing.
+ConvRot is the closer of the two at the same byte budget, and the rotation is what earns it: spreading the outliers lets uniform
+INT8 levels carry more of the distribution than E4M3 does with its three mantissa bits. **Prefer ConvRot INT8.**
 
-FP8 remains the faster option and stays available unchanged. Reach for it when a run is throughput-bound rather than
-fidelity-bound.
+The two ConvRot rows store identical weights and differ only in how the matmul is evaluated, which is explained under
+[ConvRot INT8](#convrot-int8) below. The BF16 route is the more accurate of them because it leaves the activations alone;
+the fused kernel quantizes those as well.
+
+On speed, the fused INT8 forward is the expensive one: 6.21 s/it against scaled FP8's 3.94 at 608x352x124 on one H100, both with
+`--h3_adaln_rank 16`. That is a property of the kernel rather than of INT8 arithmetic, which an H100 runs at the same rate as
+FP8, and it is the cost the BF16 route exists to avoid.
 
 ### ConvRot INT8
 
@@ -949,6 +952,15 @@ parameters to move.
 
 It replaces the other quantizations rather than combining with them, so `--fp8_base` and `--int8_convrot_base` are rejected
 alongside it.
+
+`--h3_convrot_int8_fwd bf16` changes how the matmul is evaluated without changing a single stored weight. The rotation is
+orthogonal, so undoing it on the weight and rotating the activations into it are the same arithmetic; the first route hands the
+vendor BF16 GEMM an ordinary matrix instead of running the fused INT8 kernel, and drops the gradient's rotation as well.
+
+It is the **more accurate** of the two, which is not the trade one expects from the name. The quantization error the rotation
+buys is fixed when the weight is stored, so both routes carry it identically; but the fused kernel additionally quantizes the
+activations per row on every call, and the BF16 route never does. That is worth 1.17x on video and 1.30x on audio, measured
+above.
 
 `--h3_convrot_int8_bwd int8` additionally computes the backward in INT8. It is **slower** than the BF16 backward it replaces on an
 H100, 8.67 s/it against 6.21, so it is off by default and worth measuring before enabling. Upstream describes the INT8 backward as
