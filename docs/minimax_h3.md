@@ -903,6 +903,26 @@ dominate the objective whenever the continuation is short, and the model would b
 Both counts are in **latent** units, not pixel frames, and each must be shorter than its target. The two are independent: setting
 only one trains extension for that modality while the other is generated in full from scratch.
 
+### FP8 matmul
+
+Scaled FP8 stores the frozen weights in E4M3 but dequantizes them to bf16 before each matmul, so by default it saves memory and
+nothing else. `--h3_fp8_fast` computes those matmuls in FP8 instead:
+
+```shell
+accelerate launch minimax_h3_train_network.py ... --fp8_base --h3_fp8_quantization_mode tensor --h3_fp8_fast
+```
+
+The FP8 path charges a per-call quantization of the layer's input, which grows with the input size, while the matmul saving grows
+with the output width. Only the expansion projections come out ahead, so the fast path is applied to the attention QKV projection
+and the feed-forward gate alone; the two contracting projections keep the ordinary path, because measured on the released shapes
+they spend the entire saving on quantizing their own input.
+
+`--h3_fp8_quantization_mode` selects how finely the weight scale is stored: `block` (the default, one scale per 64 elements),
+`channel`, or `tensor`. The fast path needs `tensor`, since the FP8 matmul takes a single scale per operand. Measured against the
+BF16 reference, the granularities differ less than their names suggest, and not consistently: per-tensor is somewhat worse on
+video and somewhat better on audio than per-block. That is what one would expect if the error comes mostly from E4M3's three
+mantissa bits rather than from the scale, so treat the choice as a small trade rather than a quality cliff.
+
 ### Reference cost
 
 Ref2VA references inflate the packed sequence in two places at once: as transformer rows, and as Qwen3-VL vision tokens inside the

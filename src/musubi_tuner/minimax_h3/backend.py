@@ -171,6 +171,8 @@ def create_training_backend(
     quantization_device: str | None = None,
     int8_convrot: bool = False,
     adaln_rank: int | None = None,
+    fp8_quantization_mode: str = "block",
+    fp8_fast: bool = False,
 ) -> H3TrainingBackend:
     """Load only the transformer required for cache-backed LoRA training.
 
@@ -195,4 +197,8 @@ def create_training_backend(
         quantization_device=quantization_device,
         int8_convrot=int8_convrot,
         adaln_rank=adaln_rank,
+        # Forwarded only when they differ from the released defaults, so the
+        # wrapper still routes exactly what it was given.
+        **({} if fp8_quantization_mode == "block" else {"fp8_quantization_mode": fp8_quantization_mode}),
+        **({} if not fp8_fast else {"fp8_fast": True}),
     )

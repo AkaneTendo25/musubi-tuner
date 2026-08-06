@@ -23,7 +23,7 @@ from musubi_tuner.minimax_h3.int8_convrot import (
 from musubi_tuner.minimax_h3.model import MiniMaxH3TimeEmbedder, MiniMaxH3Transformer, MiniMaxH3TransformerConfig
 from musubi_tuner.minimax_h3.training import H3TrainingMode
 from musubi_tuner.minimax_h3.weights import CheckpointInspectionError, tensor_metadata
-from musubi_tuner.modules.fp8_optimization_utils import apply_fp8_monkey_patch
+from musubi_tuner.modules.fp8_optimization_utils import apply_fp8_monkey_patch, fp8_linear_forward_patch
 from musubi_tuner.utils.lora_utils import load_safetensors_with_lora_and_fp8
 from musubi_tuner.utils.safetensors_utils import WeightTransformHooks
 
@@ -175,6 +175,40 @@ def validate_transformer_checkpoint(
     return len(actual), sum(tensor.parameters for tensor in actual_tensors)
 
 
+# torch._scaled_mm computes in FP8 rather than dequantizing to bf16 first, but it
+# charges a per-call activation quantization proportional to the input, while the
+# matmul saving grows with the output width. Measured on the released shapes, only
+# the expansion projections come out ahead: qkv_proj 1.61x and the feed-forward
+# gate 1.55x, against 0.97x and 1.01x for the two contracting projections, which
+# hand the entire gain back. So the fast path is applied to those two alone.
+FP8_FAST_MATMUL_SUFFIXES = ("attn.qkv_proj", "mlp.fc1")
+
+
+def enable_fp8_fast_matmul(model: torch.nn.Module) -> int:
+    """Re-bind the expansion projections to the FP8 matmul path.
+
+    ``apply_fp8_monkey_patch`` captures its ``use_scaled_mm`` choice in a closure
+    per module, so the selection is made by rebinding afterwards rather than by
+    changing the shared patch.
+    """
+    patched = 0
+    for name, module in model.named_modules():
+        if not name.endswith(FP8_FAST_MATMUL_SUFFIXES) or not hasattr(module, "scale_weight"):
+            continue
+        if module.scale_weight.ndim != 1:
+            raise ValueError("H3 fast FP8 matmul needs a per-tensor weight scale; load with fp8_quantization_mode='tensor'")
+
+        def fast_forward(self, x):
+            return fp8_linear_forward_patch(self, x, True, None)
+
+        module.forward = fast_forward.__get__(module, type(module))
+        patched += 1
+    if patched == 0:
+        raise RuntimeError("H3 fast FP8 matmul found no quantized expansion projections to patch")
+    logger.info("Enabled FP8 fast matmul on %d expansion projections", patched)
+    return patched
+
+
 def load_transformer(
     source: Path,
     *,
@@ -185,6 +219,8 @@ def load_transformer(
     int8_convrot: bool = False,
     adaln_rank: int | None = None,
     attention_mode: str = "torch",
+    fp8_quantization_mode: str = "block",
+    fp8_fast: bool = False,
 ) -> MiniMaxH3Transformer:
     checkpoint_path = resolve_transformer_checkpoint(source, mode, int8_convrot=int8_convrot)
     config = infer_transformer_config(checkpoint_path)
@@ -250,9 +286,12 @@ def load_transformer(
                 H3_FP8_OPTIMIZATION_EXCLUDE_KEYS + (["adaln_proj"] if adaln_rank is not None else []) if fp8_scaled else None
             ),
             weight_transform_hooks=weight_transform_hooks,
+            quantization_mode=fp8_quantization_mode,
         )
         if fp8_scaled:
             apply_fp8_monkey_patch(model, state_dict, use_scaled_mm=False)
+            if fp8_fast:
+                enable_fp8_fast_matmul(model)
     if not int8_convrot and device.type != "cpu" and device != calc_device:
         state_dict = {key: value.to(device) for key, value in state_dict.items()}
     info = model.load_state_dict(state_dict, strict=True, assign=True)

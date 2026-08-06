@@ -414,6 +414,10 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             raise ValueError("--h3_guidance_loss_form contrastive requires --h3_guidance_distillation_scale")
         if not math.isfinite(args.h3_base_preservation_loss_weight) or args.h3_base_preservation_loss_weight < 0:
             raise ValueError("--h3_base_preservation_loss_weight must be finite and non-negative")
+        if args.h3_fp8_fast and not args.fp8_base:
+            raise ValueError("--h3_fp8_fast has nothing to accelerate without --fp8_base")
+        if args.h3_fp8_fast and args.h3_fp8_quantization_mode != "tensor":
+            raise ValueError("--h3_fp8_fast requires --h3_fp8_quantization_mode tensor for a per-tensor weight scale")
         if not 0.0 <= args.h3_caption_dropout_rate <= 1.0:
             raise ValueError("--h3_caption_dropout_rate must lie in [0, 1]")
         if args.h3_extension_video_frames < 0 or args.h3_extension_audio_latents < 0:
@@ -735,6 +739,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             split_attention=split_attn,
             fp8_scaled=bool(args.fp8_base),
             adaln_rank=args.h3_adaln_rank,
+            fp8_quantization_mode=args.h3_fp8_quantization_mode,
+            fp8_fast=bool(args.h3_fp8_fast),
             quantization_device=str(accelerator.device),
             int8_convrot=bool(args.int8_convrot_base),
         )
@@ -1274,6 +1280,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             "ss_h3_guidance_distillation_scale": str(args.h3_guidance_distillation_scale or "one_pass"),
             "ss_h3_guidance_loss_form": args.h3_guidance_loss_form,
             "ss_h3_caption_dropout_rate": str(args.h3_caption_dropout_rate),
+            "ss_h3_fp8_quantization_mode": args.h3_fp8_quantization_mode,
+            "ss_h3_fp8_fast": str(args.h3_fp8_fast),
             "ss_h3_extension_video_frames": str(args.h3_extension_video_frames),
             "ss_h3_extension_audio_latents": str(args.h3_extension_audio_latents),
             "ss_h3_extension_route": args.h3_extension_route,
@@ -1473,6 +1481,25 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         "--int8_convrot_base",
         action="store_true",
         help="load the pruned Comfy INT8 ConvRot transformer for LoRA training",
+    )
+    parser.add_argument(
+        "--h3_fp8_quantization_mode",
+        choices=("block", "channel", "tensor"),
+        default="block",
+        help=(
+            "granularity of the scale that accompanies each FP8 weight. Block is the finest and the default; the "
+            "measured difference between them is small because FP8 error is dominated by the mantissa rather than "
+            "the scale, and the fast matmul path requires 'tensor'"
+        ),
+    )
+    parser.add_argument(
+        "--h3_fp8_fast",
+        action="store_true",
+        help=(
+            "compute the expansion projections in FP8 instead of dequantizing them to bf16 first. Applied to the "
+            "attention QKV and feed-forward gate alone, because the contracting projections spend the whole saving "
+            "on quantizing their own input. Requires --h3_fp8_quantization_mode tensor"
+        ),
     )
     parser.add_argument(
         "--h3_adaln_rank",

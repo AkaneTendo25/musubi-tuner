@@ -1041,3 +1041,68 @@ def test_h3_reference_scale_spec_parsing():
     assert parse_reference_scales("1.0,0.75,0.5") == (1.0, 0.75, 0.5)
     with pytest.raises(ValueError, match="at least one scale"):
         parse_reference_scales(",")
+
+
+def test_h3_fp8_fast_targets_only_the_expansion_projections():
+    # The contracting projections spend the whole matmul saving on quantizing
+    # their own input, so patching them would cost accuracy for nothing.
+    from musubi_tuner.minimax_h3.model_loader import FP8_FAST_MATMUL_SUFFIXES
+
+    assert FP8_FAST_MATMUL_SUFFIXES == ("attn.qkv_proj", "mlp.fc1")
+    assert not any(suffix.endswith(("out_proj", "fc2")) for suffix in FP8_FAST_MATMUL_SUFFIXES)
+
+
+def test_h3_fp8_fast_rebinds_the_selected_layers():
+    import torch
+    from torch import nn
+
+    from musubi_tuner.minimax_h3.model_loader import enable_fp8_fast_matmul
+
+    class Block(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.attn = nn.Module()
+            self.attn.qkv_proj = nn.Linear(4, 12, bias=False)
+            self.attn.out_proj = nn.Linear(4, 4, bias=False)
+            self.mlp = nn.Module()
+            self.mlp.fc1 = nn.Linear(4, 8, bias=False)
+            self.mlp.fc2 = nn.Linear(4, 4, bias=False)
+
+    model = Block()
+    for module in (model.attn.qkv_proj, model.attn.out_proj, model.mlp.fc1, model.mlp.fc2):
+        module.register_buffer("scale_weight", torch.ones(1))
+    assert enable_fp8_fast_matmul(model) == 2
+
+    # A rebound module carries forward as an instance attribute; an untouched one
+    # still resolves it from the class. Comparing bound methods would not work,
+    # since attribute access builds a fresh one every time.
+    rebound = {name for name, module in model.named_modules() if "forward" in module.__dict__}
+    assert rebound == {"attn.qkv_proj", "mlp.fc1"}
+
+
+def test_h3_fp8_fast_requires_a_per_tensor_scale():
+    import torch
+    from torch import nn
+
+    from musubi_tuner.minimax_h3.model_loader import enable_fp8_fast_matmul
+
+    class Block(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.attn = nn.Module()
+            self.attn.qkv_proj = nn.Linear(4, 12, bias=False)
+
+    model = Block()
+    model.attn.qkv_proj.register_buffer("scale_weight", torch.ones(3, 1))
+
+    with pytest.raises(ValueError, match="per-tensor weight scale"):
+        enable_fp8_fast_matmul(model)
+
+
+def test_h3_fp8_fast_reports_when_nothing_was_patched():
+    from torch import nn
+
+    from musubi_tuner.minimax_h3.model_loader import enable_fp8_fast_matmul
+
+    with pytest.raises(RuntimeError, match="no quantized expansion projections"):
+        enable_fp8_fast_matmul(nn.Linear(4, 4))
