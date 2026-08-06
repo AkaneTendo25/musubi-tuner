@@ -176,98 +176,6 @@ def validate_transformer_checkpoint(
     return len(actual), sum(tensor.parameters for tensor in actual_tensors)
 
 
-# torch._scaled_mm computes in FP8 rather than dequantizing to bf16 first, but it
-# charges a per-call activation quantization proportional to the input, while the
-# matmul saving grows with the output width. Measured on the released shapes, only
-# the expansion projections come out ahead: qkv_proj 1.61x and the feed-forward
-# gate 1.55x, against 0.97x and 1.01x for the two contracting projections, which
-# hand the entire gain back. So the fast path is applied to those two alone.
-FP8_FAST_MATMUL_SUFFIXES = ("attn.qkv_proj", "mlp.fc1")
-
-# torch._scaled_mm tiles the operands, so every dimension it contracts or emits
-# has to land on a tile boundary.
-_SCALED_MM_ALIGNMENT = 16
-
-
-class _Fp8ScaledMatmul(torch.autograd.Function):
-    """FP8 matmul against a frozen per-tensor-scaled weight.
-
-    ``torch._scaled_mm`` carries no derivative, so calling it directly severs the
-    graph that LoRA training needs. The weight is frozen, leaving only the input
-    gradient to supply, and that one is an ordinary matmul against the
-    dequantized weight.
-    """
-
-    @staticmethod
-    def forward(ctx, x, weight, scale_weight, bias, fp8_max):
-        ctx.save_for_backward(weight, scale_weight)
-        ctx.input_dtype = x.dtype
-
-        flat = x.reshape(-1, x.shape[-1])
-        rows = flat.shape[0]
-        padding = -rows % _SCALED_MM_ALIGNMENT
-        if padding:
-            flat = torch.nn.functional.pad(flat, (0, 0, 0, padding))
-
-        # Casting bf16 straight to FP8 would saturate every activation above the
-        # format's 448 ceiling, so the row block carries its own scale.
-        scale_x = (flat.abs().amax().float() / fp8_max).clamp_min(torch.finfo(torch.float32).tiny)
-        quantized = (flat.float() / scale_x).clamp(-fp8_max, fp8_max).to(weight.dtype)
-
-        out = torch._scaled_mm(
-            quantized,
-            weight.t(),
-            scale_a=scale_x,
-            scale_b=scale_weight.float().reshape(()),
-            out_dtype=torch.bfloat16,
-        )
-        if padding:
-            out = out[:rows]
-        if bias is not None:
-            out = out + bias.to(out.dtype)
-        return out.reshape(*x.shape[:-1], -1).to(ctx.input_dtype)
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        weight, scale_weight = ctx.saved_tensors
-        grad_input = None
-        if ctx.needs_input_grad[0]:
-            dequantized = weight.to(torch.bfloat16) * scale_weight.to(torch.bfloat16)
-            grad_input = (grad_output.to(torch.bfloat16) @ dequantized).to(ctx.input_dtype)
-        return grad_input, None, None, None, None
-
-
-def enable_fp8_fast_matmul(model: torch.nn.Module) -> int:
-    """Re-bind the expansion projections to the FP8 matmul path.
-
-    ``apply_fp8_monkey_patch`` captures its ``use_scaled_mm`` choice in a closure
-    per module, so the selection is made by rebinding afterwards rather than by
-    changing the shared patch.
-    """
-    patched = 0
-    for name, module in model.named_modules():
-        if not name.endswith(FP8_FAST_MATMUL_SUFFIXES) or not hasattr(module, "scale_weight"):
-            continue
-        # Per-channel and blockwise scales vary along the output, which the
-        # single scale_b of a tensorwise _scaled_mm cannot express.
-        if module.scale_weight.numel() != 1:
-            raise ValueError("H3 fast FP8 matmul needs a per-tensor weight scale; load with fp8_quantization_mode='tensor'")
-        rows, columns = module.weight.shape
-        if rows % _SCALED_MM_ALIGNMENT or columns % _SCALED_MM_ALIGNMENT:
-            raise ValueError(f"H3 fast FP8 matmul needs {name} shaped in multiples of {_SCALED_MM_ALIGNMENT}, got {rows}x{columns}")
-        fp8_max = float(torch.finfo(module.weight.dtype).max)
-
-        def fast_forward(self, x, _fp8_max=fp8_max):
-            return _Fp8ScaledMatmul.apply(x, self.weight, self.scale_weight, self.bias, _fp8_max)
-
-        module.forward = fast_forward.__get__(module, type(module))
-        patched += 1
-    if patched == 0:
-        raise RuntimeError("H3 fast FP8 matmul found no quantized expansion projections to patch")
-    logger.info("Enabled FP8 fast matmul on %d expansion projections", patched)
-    return patched
-
-
 def load_transformer(
     source: Path,
     *,
@@ -279,7 +187,6 @@ def load_transformer(
     adaln_rank: int | None = None,
     attention_mode: str = "torch",
     fp8_quantization_mode: str = "block",
-    fp8_fast: bool = False,
     convrot_int8: bool = False,
     convrot_int8_bwd: str = "bf16",
 ) -> MiniMaxH3Transformer:
@@ -363,8 +270,6 @@ def load_transformer(
         )
         if fp8_scaled:
             apply_fp8_monkey_patch(model, state_dict, use_scaled_mm=False)
-            if fp8_fast:
-                enable_fp8_fast_matmul(model)
         elif convrot_int8:
             apply_convrot_int8_monkey_patch(model, state_dict, bwd_mode=convrot_int8_bwd)
             # int8 tensors cannot carry requires_grad, and load_state_dict(assign=True)

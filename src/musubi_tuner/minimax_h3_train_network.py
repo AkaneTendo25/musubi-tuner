@@ -418,10 +418,6 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             raise ValueError("--h3_convrot_int8 quantizes the BF16 checkpoint itself; drop --fp8_base/--int8_convrot_base")
         if args.h3_convrot_int8_bwd == "int8" and not args.h3_convrot_int8:
             raise ValueError("--h3_convrot_int8_bwd int8 requires --h3_convrot_int8")
-        if args.h3_fp8_fast and not args.fp8_base:
-            raise ValueError("--h3_fp8_fast has nothing to accelerate without --fp8_base")
-        if args.h3_fp8_fast and args.h3_fp8_quantization_mode != "tensor":
-            raise ValueError("--h3_fp8_fast requires --h3_fp8_quantization_mode tensor for a per-tensor weight scale")
         if not 0.0 <= args.h3_caption_dropout_rate <= 1.0:
             raise ValueError("--h3_caption_dropout_rate must lie in [0, 1]")
         if args.h3_extension_video_frames < 0 or args.h3_extension_audio_latents < 0:
@@ -744,7 +740,6 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             fp8_scaled=bool(args.fp8_base),
             adaln_rank=args.h3_adaln_rank,
             fp8_quantization_mode=args.h3_fp8_quantization_mode,
-            fp8_fast=bool(args.h3_fp8_fast),
             convrot_int8=bool(args.h3_convrot_int8),
             convrot_int8_bwd=args.h3_convrot_int8_bwd,
             quantization_device=str(accelerator.device),
@@ -1287,7 +1282,6 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             "ss_h3_guidance_loss_form": args.h3_guidance_loss_form,
             "ss_h3_caption_dropout_rate": str(args.h3_caption_dropout_rate),
             "ss_h3_fp8_quantization_mode": args.h3_fp8_quantization_mode,
-            "ss_h3_fp8_fast": str(args.h3_fp8_fast),
             "ss_h3_convrot_int8": str(args.h3_convrot_int8),
             "ss_h3_convrot_int8_bwd": args.h3_convrot_int8_bwd,
             "ss_h3_extension_video_frames": str(args.h3_extension_video_frames),
@@ -1513,16 +1507,7 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         help=(
             "granularity of the scale that accompanies each FP8 weight. Block is the finest and the default; the "
             "measured difference between them is small because FP8 error is dominated by the mantissa rather than "
-            "the scale, and the fast matmul path requires 'tensor'"
-        ),
-    )
-    parser.add_argument(
-        "--h3_fp8_fast",
-        action="store_true",
-        help=(
-            "compute the expansion projections in FP8 instead of dequantizing them to bf16 first. Applied to the "
-            "attention QKV and feed-forward gate alone, because the contracting projections spend the whole saving "
-            "on quantizing their own input. Requires --h3_fp8_quantization_mode tensor"
+            "the scale"
         ),
     )
     parser.add_argument(

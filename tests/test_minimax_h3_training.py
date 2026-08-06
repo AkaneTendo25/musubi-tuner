@@ -1885,7 +1885,6 @@ def test_h3_trainer_loads_only_the_selected_training_transformer(monkeypatch, tm
         int8_convrot_base=False,
         h3_adaln_rank=None,
         h3_fp8_quantization_mode="block",
-        h3_fp8_fast=False,
         h3_convrot_int8=False,
         h3_convrot_int8_bwd="bf16",
         h3_attn_auto_dispatch=False,
@@ -1907,7 +1906,6 @@ def test_h3_trainer_loads_only_the_selected_training_transformer(monkeypatch, tm
         "int8_convrot": False,
         "adaln_rank": None,
         "fp8_quantization_mode": "block",
-        "fp8_fast": False,
         "convrot_int8": False,
         "convrot_int8_bwd": "bf16",
     }

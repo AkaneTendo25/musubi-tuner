@@ -523,7 +523,7 @@ be stored against a small basis of that curve rather than the full width. `--h3_
 that reduction while the checkpoint streams in, so no separate file is produced or required:
 
 ```shell
-accelerate launch minimax_h3_train_network.py ... --fp8_base --h3_adaln_rank 16
+accelerate launch minimax_h3_train_network.py ... --h3_convrot_int8 --h3_adaln_rank 16
 ```
 
 These projections are the largest single group of parameters in the transformer -- roughly 13.0B of
@@ -532,9 +532,11 @@ These projections are the largest single group of parameters in the transformer 
 | base precision | default | with `--h3_adaln_rank 16` |
 |---|---|---|
 | BF16 | 66.2 GB | 40.5 GB |
-| scaled FP8 (`--fp8_base`) | 33.1 GB | 20.4 GB |
+| one byte per weight (`--h3_convrot_int8` or `--fp8_base`) | 33.1 GB | 20.4 GB |
 
-The reduced projections are stored in float32 and excluded from FP8 quantization: at that size
+ConvRot INT8 and scaled FP8 occupy the same space; see [Choosing a quantization](#choosing-a-quantization) for how they differ.
+
+The reduced projections are stored in float32 and excluded from quantization: at that size
 neither quantizing nor narrowing them saves anything measurable, while the stored precision is what
 bounds the reduction. Storing them at the checkpoint's own BF16 would put a relative floor under the
 modulation orders of magnitude above the basis error, capping every rank at the same accuracy.
@@ -562,14 +564,17 @@ The option is rejected on a checkpoint that is already pruned, and on INT8 ConvR
 > | configuration | video relative L2 | audio relative L2 |
 > |---|---|---|
 > | `--h3_adaln_rank 16` | **4.30e-02** | **5.71e-02** |
-> | INT8 ConvRot checkpoint | 8.08e-02 | 1.41e-01 |
+> | pruned INT8 ConvRot checkpoint | 8.08e-02 | 1.41e-01 |
 > | `--fp8_base` | 1.25e-01 | 2.39e-01 |
+>
+> The middle row is the published pre-quantized checkpoint, which carries its own rank-8 FP16 AdaLN. Quantizing the released
+> BF16 weights at load with `--h3_convrot_int8` is measured separately in [Choosing a quantization](#choosing-a-quantization).
 >
 > Every option here changes the output at the percent level, because fifty residual blocks amplify any
 > small weight perturbation; that is normal rather than a defect. AdaLN reduction is roughly twice as
 > close to the reference as the INT8 checkpoint and three times as close as scaled FP8, while also
-> being the largest saving of the three on that tensor. Combining it with `--fp8_base` is therefore
-> preferable to `--fp8_base` alone, which quantizes the AdaLN projections instead of reducing them.
+> being the largest saving of the three on that tensor. Combining it with a quantization is therefore preferable to that
+> quantization alone, which quantizes the AdaLN projections instead of reducing them.
 >
 > These figures compare forward predictions. Whether an adapter trained against one base transfers to
 > a differently quantized or reduced base is a separate question that applies to every row of the
@@ -903,6 +908,27 @@ dominate the objective whenever the continuation is short, and the model would b
 Both counts are in **latent** units, not pixel frames, and each must be shorter than its target. The two are independent: setting
 only one trains extension for that modality while the other is generated in full from scratch.
 
+### Choosing a quantization
+
+Both quantizations store the frozen base at one byte per weight, so neither has a memory advantage over the other. They differ in
+what that byte buys. Measured against the same BF16 reference on FL2VA, one forward at rank 16, relative L2 of the model output:
+
+| frozen base | video | audio | s/it |
+| --- | --- | --- | --- |
+| ConvRot INT8 (`--h3_convrot_int8`) | **7.85e-02** | **1.25e-01** | 7.43 |
+| ConvRot INT8 + `--h3_adaln_rank 16` | 7.85e-02 | 1.25e-01 | 6.21 |
+| scaled FP8, per-block scale | 1.17e-01 | 2.30e-01 | **3.94** |
+| scaled FP8, per-channel scale | 1.40e-01 | 2.19e-01 | — |
+| scaled FP8, per-tensor scale | 1.41e-01 | 2.04e-01 | 5.06 |
+
+ConvRot is roughly one and a half times closer to BF16 on video and rather more than that on audio, at the same byte budget. The
+rotation is what earns it: spreading the outliers lets uniform INT8 levels carry more of the distribution than E4M3 does with its
+three mantissa bits. **Prefer ConvRot INT8 unless the wall clock forbids it.** Times above are 608x352x124 on one H100; the
+1.9x is a real cost, and pairing ConvRot with `--h3_adaln_rank 16` recovers a third of it for nothing.
+
+FP8 remains the faster option and stays available unchanged. Reach for it when a run is throughput-bound rather than
+fidelity-bound.
+
 ### ConvRot INT8
 
 `--h3_convrot_int8` quantizes the released BF16 transformer to ConvRot INT8 while it loads, instead of reading a checkpoint that
@@ -913,37 +939,32 @@ accelerate launch minimax_h3_train_network.py ... --h3_convrot_int8 --h3_adaln_r
 ```
 
 ConvRot applies a block-diagonal Hadamard rotation before per-channel INT8, which spreads activation outliers so the quantization
-error falls. The frozen base halves in size against BF16, and the forward runs an INT8 kernel; `--h3_convrot_int8_bwd int8`
-additionally computes the backward in INT8, which is faster and coarser.
+error falls. The frozen base halves in size against BF16, and the forward runs an INT8 kernel.
 
 Quantizing at load rather than reading a pre-quantized file matters for more than convenience. The transform hooks run first, so
 this path composes with `--h3_adaln_rank`: it quantizes an AdaLN that has already been reduced, whereas the published pruned
 checkpoints carry the projections at full width and quantize them there. The reduced projections are excluded from quantization
-entirely, as they are on the FP8 path.
+entirely, as they are on the FP8 path. That pairing is also the cheapest way to run ConvRot, since the reduced AdaLN is 13B fewer
+parameters to move.
 
 It replaces the other quantizations rather than combining with them, so `--fp8_base` and `--int8_convrot_base` are rejected
-alongside it. The upstream implementation notes its main benefit is speed on GPUs without FP8 support; where FP8 is available,
-compare the two rather than assuming.
+alongside it.
 
-### FP8 matmul
+`--h3_convrot_int8_bwd int8` additionally computes the backward in INT8. It is **slower** than the BF16 backward it replaces on an
+H100, 8.67 s/it against 6.21, so it is off by default and worth measuring before enabling. Upstream describes the INT8 backward as
+a speed win, which holds on the GPUs without FP8 support it targets.
 
-Scaled FP8 stores the frozen weights in E4M3 but dequantizes them to bf16 before each matmul, so by default it saves memory and
-nothing else. `--h3_fp8_fast` computes those matmuls in FP8 instead:
+### FP8 granularity
 
-```shell
-accelerate launch minimax_h3_train_network.py ... --fp8_base --h3_fp8_quantization_mode tensor --h3_fp8_fast
-```
+`--h3_fp8_quantization_mode` selects how finely the weight scale accompanying `--fp8_base` is stored: `block` (the default, one
+scale per 64 elements), `channel`, or `tensor`. The granularities differ less than their names suggest, and not consistently:
+per-tensor is somewhat worse on video and somewhat better on audio than per-block, as the table above shows. That is what one
+would expect if the error comes mostly from E4M3's three mantissa bits rather than from the scale, so treat the choice as a small
+trade rather than a quality cliff. Per-block is measurably the fastest of the three and remains the default.
 
-The FP8 path charges a per-call quantization of the layer's input, which grows with the input size, while the matmul saving grows
-with the output width. Only the expansion projections come out ahead, so the fast path is applied to the attention QKV projection
-and the feed-forward gate alone; the two contracting projections keep the ordinary path, because measured on the released shapes
-they spend the entire saving on quantizing their own input.
-
-`--h3_fp8_quantization_mode` selects how finely the weight scale is stored: `block` (the default, one scale per 64 elements),
-`channel`, or `tensor`. The fast path needs `tensor`, since the FP8 matmul takes a single scale per operand. Measured against the
-BF16 reference, the granularities differ less than their names suggest, and not consistently: per-tensor is somewhat worse on
-video and somewhat better on audio than per-block. That is what one would expect if the error comes mostly from E4M3's three
-mantissa bits rather than from the scale, so treat the choice as a small trade rather than a quality cliff.
+Scaled FP8 stores the frozen weights in E4M3 but dequantizes them to bf16 before each matmul, so it saves memory rather than
+compute. Computing the matmuls in FP8 directly was tried and withdrawn: it requires the per-tensor scale, and per-tensor already
+costs more wall clock against per-block than the FP8 matmul could return.
 
 ### Reference cost
 
