@@ -418,6 +418,10 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             raise ValueError("--h3_convrot_int8 quantizes the BF16 checkpoint itself; drop --fp8_base/--int8_convrot_base")
         if args.h3_convrot_int8_bwd == "int8" and not args.h3_convrot_int8:
             raise ValueError("--h3_convrot_int8_bwd int8 requires --h3_convrot_int8")
+        if args.h3_convrot_int8_fwd == "bf16" and not args.h3_convrot_int8:
+            raise ValueError("--h3_convrot_int8_fwd bf16 requires --h3_convrot_int8")
+        if args.h3_convrot_int8_fwd == "bf16" and args.h3_convrot_int8_bwd == "int8":
+            raise ValueError("--h3_convrot_int8_fwd bf16 leaves no rotated activations for --h3_convrot_int8_bwd int8")
         if not 0.0 <= args.h3_caption_dropout_rate <= 1.0:
             raise ValueError("--h3_caption_dropout_rate must lie in [0, 1]")
         if args.h3_extension_video_frames < 0 or args.h3_extension_audio_latents < 0:
@@ -742,6 +746,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             fp8_quantization_mode=args.h3_fp8_quantization_mode,
             convrot_int8=bool(args.h3_convrot_int8),
             convrot_int8_bwd=args.h3_convrot_int8_bwd,
+            convrot_int8_fwd=args.h3_convrot_int8_fwd,
             quantization_device=str(accelerator.device),
             int8_convrot=bool(args.int8_convrot_base),
         )
@@ -1284,6 +1289,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             "ss_h3_fp8_quantization_mode": args.h3_fp8_quantization_mode,
             "ss_h3_convrot_int8": str(args.h3_convrot_int8),
             "ss_h3_convrot_int8_bwd": args.h3_convrot_int8_bwd,
+            "ss_h3_convrot_int8_fwd": args.h3_convrot_int8_fwd,
             "ss_h3_extension_video_frames": str(args.h3_extension_video_frames),
             "ss_h3_extension_audio_latents": str(args.h3_extension_audio_latents),
             "ss_h3_extension_route": args.h3_extension_route,
@@ -1499,6 +1505,17 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         choices=("bf16", "int8"),
         default="bf16",
         help="precision of the ConvRot backward pass; int8 is faster and coarser",
+    )
+    parser.add_argument(
+        "--h3_convrot_int8_fwd",
+        choices=("int8", "bf16"),
+        default="int8",
+        help=(
+            "how the ConvRot forward evaluates its matmul. 'int8' rotates the activations and runs the fused "
+            "INT8 kernel; 'bf16' undoes the rotation on the weight instead and hands the vendor GEMM an ordinary "
+            "matrix. The stored weights and the arithmetic result are the same either way, so this trades "
+            "quantized compute for a better-tuned kernel and is worth measuring on GPUs with fast BF16"
+        ),
     )
     parser.add_argument(
         "--h3_fp8_quantization_mode",

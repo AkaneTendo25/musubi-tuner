@@ -1076,6 +1076,11 @@ def test_h3_online_convrot_targets_only_transformer_weights():
         ({"h3_convrot_int8": True, "fp8_base": True}, "drop --fp8_base"),
         ({"h3_convrot_int8": True, "int8_convrot_base": True}, "drop --fp8_base"),
         ({"h3_convrot_int8_bwd": "int8"}, "requires --h3_convrot_int8"),
+        ({"h3_convrot_int8_fwd": "bf16"}, "requires --h3_convrot_int8"),
+        (
+            {"h3_convrot_int8": True, "h3_convrot_int8_fwd": "bf16", "h3_convrot_int8_bwd": "int8"},
+            "no rotated activations",
+        ),
     ],
 )
 def test_h3_online_convrot_rejects_conflicting_quantization(flags, message):
@@ -1087,3 +1092,74 @@ def test_h3_online_convrot_rejects_conflicting_quantization(flags, message):
 
     with pytest.raises(ValueError, match=message):
         MiniMaxH3NetworkTrainer().handle_model_specific_args(args)
+
+
+def _convrot_linear(in_features=256, out_features=128, bias=True, seed=0):
+    import torch
+    from torch import nn
+
+    from musubi_tuner.modules.convrot_int8_kernels import quantize_int8_convrot_weight
+    from musubi_tuner.modules.convrot_int8_utils import CONVROT_GROUPSIZE
+
+    torch.manual_seed(seed)
+    reference = nn.Linear(in_features, out_features, bias=bias)
+    quantized, scale = quantize_int8_convrot_weight(reference.weight.detach(), CONVROT_GROUPSIZE)
+    return reference, quantized, scale
+
+
+def _patched_convrot_linear(reference, quantized, scale, *, fwd_mode):
+    from torch import nn
+
+    from musubi_tuner.modules.convrot_int8_utils import apply_convrot_int8_monkey_patch
+
+    layer = nn.Linear(reference.in_features, reference.out_features, bias=reference.bias is not None)
+    model = nn.Module()
+    model.inner = layer
+    apply_convrot_int8_monkey_patch(model, {"inner.scale_weight": scale}, fwd_mode=fwd_mode)
+    layer.weight = nn.Parameter(quantized, requires_grad=False)
+    layer.scale_weight = scale
+    if reference.bias is not None:
+        layer.bias = nn.Parameter(reference.bias.detach().clone())
+    return layer
+
+
+def test_h3_convrot_bf16_forward_matches_the_rotated_path():
+    # Undoing an orthogonal rotation on the weight and rotating the activations
+    # into it are the same arithmetic, so the two forward modes must agree. The
+    # quantization error was fixed when the weight was stored, not here.
+    #
+    # Without CUDA the rotated mode takes its eager fallback rather than the fused
+    # kernel, so this pins the identity rather than the kernel; the kernel is
+    # covered by the on-device fidelity ladder in the docs.
+    import torch
+
+    reference, quantized, scale = _convrot_linear()
+    x = torch.randn(4, 256)
+
+    rotated = _patched_convrot_linear(reference, quantized, scale, fwd_mode="int8")(x)
+    unrotated = _patched_convrot_linear(reference, quantized, scale, fwd_mode="bf16")(x)
+
+    assert torch.allclose(rotated, unrotated, atol=2e-3, rtol=2e-3)
+
+
+def test_h3_convrot_bf16_forward_stays_close_to_the_unquantized_weight():
+    import torch
+
+    reference, quantized, scale = _convrot_linear()
+    x = torch.randn(4, 256)
+
+    unrotated = _patched_convrot_linear(reference, quantized, scale, fwd_mode="bf16")(x)
+    expected = reference(x)
+    assert (unrotated - expected).norm() / expected.norm() < 0.05
+
+
+def test_h3_convrot_bf16_forward_carries_gradients():
+    import torch
+
+    reference, quantized, scale = _convrot_linear()
+    layer = _patched_convrot_linear(reference, quantized, scale, fwd_mode="bf16")
+    x = torch.randn(4, 256, requires_grad=True)
+
+    layer(x).sum().backward()
+
+    assert x.grad is not None and torch.isfinite(x.grad).all()

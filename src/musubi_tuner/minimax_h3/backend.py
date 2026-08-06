@@ -174,6 +174,7 @@ def create_training_backend(
     fp8_quantization_mode: str = "block",
     convrot_int8: bool = False,
     convrot_int8_bwd: str = "bf16",
+    convrot_int8_fwd: str = "int8",
 ) -> H3TrainingBackend:
     """Load only the transformer required for cache-backed LoRA training.
 
@@ -201,5 +202,9 @@ def create_training_backend(
         # Forwarded only when they differ from the released defaults, so the
         # wrapper still routes exactly what it was given.
         **({} if fp8_quantization_mode == "block" else {"fp8_quantization_mode": fp8_quantization_mode}),
-        **({} if not convrot_int8 else {"convrot_int8": True, "convrot_int8_bwd": convrot_int8_bwd}),
+        **(
+            {}
+            if not convrot_int8
+            else {"convrot_int8": True, "convrot_int8_bwd": convrot_int8_bwd, "convrot_int8_fwd": convrot_int8_fwd}
+        ),
     )

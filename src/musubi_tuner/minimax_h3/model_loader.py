@@ -189,6 +189,7 @@ def load_transformer(
     fp8_quantization_mode: str = "block",
     convrot_int8: bool = False,
     convrot_int8_bwd: str = "bf16",
+    convrot_int8_fwd: str = "int8",
 ) -> MiniMaxH3Transformer:
     checkpoint_path = resolve_transformer_checkpoint(source, mode, int8_convrot=int8_convrot)
     config = infer_transformer_config(checkpoint_path)
@@ -271,7 +272,7 @@ def load_transformer(
         if fp8_scaled:
             apply_fp8_monkey_patch(model, state_dict, use_scaled_mm=False)
         elif convrot_int8:
-            apply_convrot_int8_monkey_patch(model, state_dict, bwd_mode=convrot_int8_bwd)
+            apply_convrot_int8_monkey_patch(model, state_dict, bwd_mode=convrot_int8_bwd, fwd_mode=convrot_int8_fwd)
             # int8 tensors cannot carry requires_grad, and load_state_dict(assign=True)
             # re-applies the meta parameters' requires_grad to whatever arrives. The base
             # is frozen for LoRA training regardless, so clear it before the load.

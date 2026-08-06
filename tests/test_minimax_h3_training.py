@@ -1887,6 +1887,7 @@ def test_h3_trainer_loads_only_the_selected_training_transformer(monkeypatch, tm
         h3_fp8_quantization_mode="block",
         h3_convrot_int8=False,
         h3_convrot_int8_bwd="bf16",
+        h3_convrot_int8_fwd="int8",
         h3_attn_auto_dispatch=False,
     )
     accelerator = SimpleNamespace(device=torch.device("cuda", 0))
@@ -1908,6 +1909,7 @@ def test_h3_trainer_loads_only_the_selected_training_transformer(monkeypatch, tm
         "fp8_quantization_mode": "block",
         "convrot_int8": False,
         "convrot_int8_bwd": "bf16",
+        "convrot_int8_fwd": "int8",
     }
 
 
