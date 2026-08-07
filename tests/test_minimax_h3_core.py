@@ -933,6 +933,10 @@ def test_h3_generation_parser_exposes_native_inference_controls():
         "--blocks_to_swap",
         "--block_swap_granularity",
         "--lora_weight",
+        "--compile",
+        "--compile_fallback_to_eager",
+        "--inductor_config",
+        "--h3_fused_qk_norm_rope",
     ):
         assert option in parser._option_string_actions
     assert "--fp8_scaled" not in parser._option_string_actions
@@ -1024,6 +1028,80 @@ def test_h3_generator_factory_routes_all_native_components(monkeypatch):
     assert captured["fp8_scaled"] is False
     assert captured["int8_convrot"] is False
     assert captured["blocks_to_swap"] == 0
+
+
+def test_native_generator_compiles_all_inference_block_regions(monkeypatch, tmp_path):
+    from musubi_tuner.minimax_h3 import model_loader
+    from musubi_tuner.utils import model_utils
+
+    class Transformer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.blocks = torch.nn.ModuleList([torch.nn.Identity(), torch.nn.Identity()])
+            self.token_refiner = SimpleNamespace(blocks=torch.nn.ModuleList([torch.nn.Identity()]))
+            self.fused_enabled = False
+
+        def enable_fused_qk_norm_rope(self):
+            self.fused_enabled = True
+
+    transformer = Transformer()
+    captured = {}
+
+    monkeypatch.setattr(model_loader, "load_transformer", lambda *args, **kwargs: transformer)
+
+    def compile_transformer(args, compiled_transformer, targets, disable_linear):
+        captured["args"] = args
+        captured["transformer"] = compiled_transformer
+        captured["targets"] = targets
+        captured["disable_linear"] = disable_linear
+        return compiled_transformer
+
+    monkeypatch.setattr(model_utils, "compile_transformer", compile_transformer)
+    generator = h3_integration._NativeGenerator(
+        model=tmp_path / "model.safetensors",
+        text_encoder=tmp_path / "text.safetensors",
+        tokenizer=tmp_path / "tokenizer",
+        video_vae=tmp_path / "video.safetensors",
+        audio_vae=tmp_path / "audio.safetensors",
+        device=torch.device("cpu"),
+        num_inference_steps=20,
+        height=None,
+        width=None,
+        fp8_scaled=False,
+        int8_convrot=False,
+        text_encoder_quantization="none",
+        blocks_to_swap=0,
+        block_swap_h2d_only=False,
+        block_swap_ring_size=2,
+        block_swap_granularity="block",
+        use_pinned_memory_for_block_swap=False,
+        lora_weights=(),
+        lora_multipliers=(),
+        compile_model=True,
+        compile_backend="eager",
+        compile_mode="default",
+        compile_dynamic="false",
+        compile_fullgraph=True,
+        compile_cache_size_limit=123,
+        compile_auto_cache_size_limit=True,
+        compile_fallback_to_eager=True,
+        inductor_config=("max_autotune=false",),
+        fused_qk_norm_rope=True,
+        mode="fl2va",
+    )
+
+    loaded, networks = generator._load_transformer()
+
+    assert loaded is transformer
+    assert networks == []
+    assert transformer.fused_enabled
+    assert [len(blocks) for blocks in captured["targets"]] == [2, 1]
+    assert captured["disable_linear"] is False
+    assert captured["args"].compile_backend == "eager"
+    assert captured["args"].compile_dynamic == "false"
+    assert captured["args"].compile_fullgraph is True
+    assert captured["args"].compile_cache_size_limit == 123
+    assert captured["args"].compile_fallback_to_eager is True
 
 
 def test_native_generator_selects_ref2va_checkpoint_contract(tmp_path):

@@ -8,6 +8,7 @@ from accelerate import init_empty_weights
 from safetensors.torch import save_file
 
 import musubi_tuner.minimax_h3.model as h3_model
+import musubi_tuner.minimax_h3.model_loader as h3_model_loader
 from musubi_tuner.minimax_h3.int8_convrot import (
     enable_int8_convrot,
     load_comfy_int8_convrot_state_dict,
@@ -18,6 +19,7 @@ from musubi_tuner.minimax_h3.model import MiniMaxH3Transformer, MiniMaxH3Transfo
 from musubi_tuner.minimax_h3.model_loader import (
     H3_FP8_OPTIMIZATION_EXCLUDE_KEYS,
     H3_FP8_OPTIMIZATION_TARGET_KEYS,
+    build_block_swap_placement,
     resolve_transformer_checkpoint,
     validate_transformer_checkpoint,
 )
@@ -42,6 +44,31 @@ def _tiny_config(*, num_layers: int = 2) -> MiniMaxH3TransformerConfig:
         time_embed_dim=16,
         rope_freq_dim=2,
     )
+
+
+def test_h3_low_ram_block_swap_placement_matches_offloader_policy():
+    target = torch.device("cuda", 0)
+    placement, offloaded = build_block_swap_placement(
+        target_device=target,
+        num_blocks=10,
+        blocks_to_swap=4,
+        h2d_only=True,
+    )
+
+    assert offloaded == (1, 3, 6, 8)
+    assert placement("blocks.1.attn.qkv_proj.weight", target).type == "cpu"
+    assert placement("blocks.2.attn.qkv_proj.weight", torch.device("cpu")) == target
+    assert placement("token_refiner.blocks.0.attn.qkv_proj.weight", torch.device("cpu")) == target
+    assert placement("final_layer.video_out.weight", torch.device("cpu")) == target
+
+    classic, classic_offloaded = build_block_swap_placement(
+        target_device=target,
+        num_blocks=10,
+        blocks_to_swap=4,
+        h2d_only=False,
+    )
+    assert classic_offloaded == (6, 7, 8, 9)
+    assert classic("blocks.6.mlp.fc1.weight", target).type == "cpu"
 
 
 def test_h3_attention_auto_dispatch_threshold_is_shape_aware():
@@ -77,6 +104,23 @@ def test_h3_attention_auto_dispatch_keeps_cpu_on_ordinary_sdpa(monkeypatch):
     output = module(torch.randn(1, 16, 16))
 
     assert output.shape == (1, 16, 16)
+
+
+def test_h3_fused_qk_norm_rope_cpu_falls_back_exactly():
+    torch.manual_seed(12)
+    reference = MiniMaxH3Transformer(_tiny_config(num_layers=1))
+    fused = MiniMaxH3Transformer(_tiny_config(num_layers=1))
+    fused.load_state_dict(reference.state_dict())
+    fused.requires_grad_(False)
+    fused.enable_fused_qk_norm_rope()
+    inputs = _tiny_inputs()
+
+    expected = reference(**inputs)
+    actual = fused(**inputs)
+
+    torch.testing.assert_close(actual.video, expected.video)
+    torch.testing.assert_close(actual.audio, expected.audio)
+    assert all(module.fused_qk_norm_rope for module in fused.modules() if isinstance(module, h3_model.MiniMaxH3Attention))
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA SDPA")
@@ -145,6 +189,87 @@ def test_native_h3_tiny_forward_and_backward():
     assert gradient is not None
     assert torch.isfinite(gradient).all()
     assert torch.count_nonzero(gradient) > 0
+
+
+def test_h3_partial_gradient_checkpointing_targets_last_blocks(monkeypatch):
+    model = MiniMaxH3Transformer(_tiny_config(num_layers=4))
+    model.enable_gradient_checkpointing()
+    model.set_gradient_checkpointing_blocks(2)
+    original = model._checkpointed_block
+    seen = []
+
+    def recorded(block, *args):
+        seen.append(next(index for index, candidate in enumerate(model.blocks) if candidate is block))
+        return original(block, *args)
+
+    monkeypatch.setattr(model, "_checkpointed_block", recorded)
+
+    model(**_tiny_inputs())
+
+    assert seen == [2, 3]
+
+
+def test_h3_partial_gradient_checkpointing_validates_depth():
+    model = MiniMaxH3Transformer(_tiny_config(num_layers=4))
+
+    with pytest.raises(ValueError, match=r"\[0, 4\]"):
+        model.set_gradient_checkpointing_blocks(5)
+
+
+def test_h3_final_layer_projects_only_requested_media_rows():
+    model = MiniMaxH3Transformer(_tiny_config(num_layers=0))
+    seen = {}
+
+    def capture(name):
+        def hook(_module, inputs, _output):
+            seen[name] = inputs[0].shape[1]
+
+        return hook
+
+    model.final_layer.video_out.register_forward_hook(capture("video"))
+    model.final_layer.audio_out.register_forward_hook(capture("audio"))
+
+    output = model(**_tiny_inputs())
+
+    assert seen == {"video": 2, "audio": 4}
+    assert output.video.shape[1] == 2
+    assert output.audio.shape[1] == 4
+
+
+def test_h3_regional_compile_forward_backward_parity():
+    from musubi_tuner.minimax_h3_train_network import MiniMaxH3NetworkTrainer
+
+    torch.manual_seed(11)
+    config = _tiny_config(num_layers=1)
+    reference = MiniMaxH3Transformer(config)
+    compiled = MiniMaxH3Transformer(config)
+    compiled.load_state_dict(reference.state_dict())
+    args = SimpleNamespace(
+        compile_backend="eager",
+        compile_mode="default",
+        compile_dynamic="false",
+        compile_fullgraph=True,
+        compile_cache_size_limit=None,
+        compile_auto_cache_size_limit=True,
+        compile_fallback_to_eager=False,
+        inductor_config=None,
+    )
+    trainer = MiniMaxH3NetworkTrainer()
+    trainer.blocks_to_swap = 0
+    compiled = trainer.compile_transformer(args, compiled)
+
+    reference_inputs = _tiny_inputs()
+    compiled_inputs = {name: value.detach().clone() for name, value in reference_inputs.items()}
+    reference_inputs["encoder_hidden_states"].requires_grad_(True)
+    compiled_inputs["encoder_hidden_states"].requires_grad_(True)
+    expected = reference(**reference_inputs)
+    actual = compiled(**compiled_inputs)
+    (expected.video.square().mean() + expected.audio.square().mean()).backward()
+    (actual.video.square().mean() + actual.audio.square().mean()).backward()
+
+    torch.testing.assert_close(actual.video, expected.video)
+    torch.testing.assert_close(actual.audio, expected.audio)
+    torch.testing.assert_close(compiled_inputs["encoder_hidden_states"].grad, reference_inputs["encoder_hidden_states"].grad)
 
 
 def test_h3_scaled_fp8_scope_and_forward_backward():
@@ -526,6 +651,42 @@ def test_h3_checkpoint_validator_accepts_exact_native_mixed_precision_layout(tmp
     assert tensor_count == len(state_dict)
     assert parameter_count == sum(tensor.numel() for tensor in state_dict.values())
     assert resolve_transformer_checkpoint(checkpoint_path, "fl2va") == checkpoint_path
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="low-RAM split placement requires CUDA")
+def test_h3_loader_streams_resident_and_offloaded_blocks_to_final_devices(monkeypatch, tmp_path: Path):
+    config = _tiny_config(num_layers=2)
+    model = MiniMaxH3Transformer(config)
+    fp32_prefixes = (
+        "video_patch_proj.",
+        "audio_patch_proj.",
+        "time_embedder.",
+        "final_layer.video_out.",
+        "final_layer.audio_out.",
+        "rope.",
+    )
+    state_dict = {
+        name: tensor.detach().to(torch.float32 if name.startswith(fp32_prefixes) else torch.bfloat16).contiguous()
+        for name, tensor in model.state_dict().items()
+    }
+    checkpoint = tmp_path / "minimax_h3_fl2va_bf16.safetensors"
+    save_file(state_dict, checkpoint)
+    monkeypatch.setattr(h3_model_loader, "infer_transformer_config", lambda *_args, **_kwargs: config)
+
+    loaded = h3_model_loader.load_transformer(
+        checkpoint,
+        mode="fl2va",
+        loading_device="cpu",
+        quantization_device="cuda:0",
+        target_device="cuda:0",
+        blocks_to_swap=1,
+        block_swap_h2d_only=True,
+    )
+
+    assert loaded.blocks[0].attn.qkv_proj.weight.device.type == "cuda"
+    assert loaded.blocks[1].attn.qkv_proj.weight.device.type == "cpu"
+    assert loaded.token_refiner.blocks[0].attn.qkv_proj.weight.device.type == "cuda"
+    assert loaded.final_layer.video_out.weight.device.type == "cuda"
 
 
 def test_h3_pruned_int8_convrot_checkpoint_contract_and_adapter_gradient(tmp_path: Path):

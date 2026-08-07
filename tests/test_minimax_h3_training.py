@@ -1910,20 +1910,43 @@ def test_h3_trainer_loads_only_the_selected_training_transformer(monkeypatch, tm
         "convrot_int8": False,
         "convrot_int8_bwd": "bf16",
         "convrot_int8_fwd": "int8",
+        "target_device": "cuda:0",
+        "blocks_to_swap": 0,
+        "block_swap_h2d_only": False,
     }
 
 
-@pytest.mark.parametrize(
-    ("option", "value", "message"),
-    [
-        ("--compile", None, "compilation"),
-        ("--sdpa", "--split_attn", "split attention"),
-    ],
-)
+@pytest.mark.parametrize(("option", "value", "message"), [("--sdpa", "--split_attn", "split attention")])
 def test_h3_trainer_rejects_release_dependent_common_loading_modes(option, value, message):
     argv = [option] if value is None else [option, value]
     args = create_parser().parse_args(argv)
     with pytest.raises(ValueError, match=message):
+        MiniMaxH3NetworkTrainer().handle_model_specific_args(args)
+
+
+def test_h3_trainer_accepts_compile_and_exposes_fallback_controls():
+    args = create_parser().parse_args(["--sdpa", "--compile", "--compile_fallback_to_eager", "--compile_auto_cache_size_limit"])
+
+    MiniMaxH3NetworkTrainer().handle_model_specific_args(args)
+
+    assert args.compile
+    assert args.compile_fallback_to_eager
+    assert args.compile_auto_cache_size_limit
+
+
+def test_h3_partial_checkpointing_requires_gradient_checkpointing():
+    args = create_parser().parse_args(["--sdpa", "--h3_gradient_checkpointing_blocks", "25"])
+
+    with pytest.raises(ValueError, match="requires --gradient_checkpointing"):
+        MiniMaxH3NetworkTrainer().handle_model_specific_args(args)
+
+
+def test_h3_partial_checkpointing_rejects_compile():
+    args = create_parser().parse_args(
+        ["--sdpa", "--gradient_checkpointing", "--h3_gradient_checkpointing_blocks", "25", "--compile"]
+    )
+
+    with pytest.raises(ValueError, match="cannot be combined with --compile"):
         MiniMaxH3NetworkTrainer().handle_model_specific_args(args)
 
 
