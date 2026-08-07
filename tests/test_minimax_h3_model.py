@@ -191,6 +191,37 @@ def test_native_h3_tiny_forward_and_backward():
     assert torch.count_nonzero(gradient) > 0
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA activation offload")
+def test_h3_checkpoint_input_cpu_offload_preserves_forward_and_gradients():
+    torch.manual_seed(17)
+    reference = MiniMaxH3Transformer(_tiny_config()).cuda()
+    offloaded = MiniMaxH3Transformer(_tiny_config()).cuda()
+    offloaded.load_state_dict(reference.state_dict())
+    reference.enable_gradient_checkpointing(False)
+    offloaded.enable_gradient_checkpointing(True)
+
+    reference_inputs = {key: value.cuda() for key, value in _tiny_inputs().items()}
+    offloaded_inputs = {key: value.clone() for key, value in reference_inputs.items()}
+    reference_inputs["video_hidden_states"].requires_grad_(True)
+    offloaded_inputs["video_hidden_states"].requires_grad_(True)
+
+    expected = reference(**reference_inputs)
+    actual = offloaded(**offloaded_inputs)
+    (expected.video.square().mean() + expected.audio.square().mean()).backward()
+    (actual.video.square().mean() + actual.audio.square().mean()).backward()
+
+    torch.testing.assert_close(actual.video, expected.video)
+    torch.testing.assert_close(actual.audio, expected.audio)
+    torch.testing.assert_close(
+        offloaded_inputs["video_hidden_states"].grad,
+        reference_inputs["video_hidden_states"].grad,
+    )
+    torch.testing.assert_close(
+        offloaded.blocks[0].attn.qkv_proj.weight.grad,
+        reference.blocks[0].attn.qkv_proj.weight.grad,
+    )
+
+
 def test_h3_partial_gradient_checkpointing_targets_last_blocks(monkeypatch):
     model = MiniMaxH3Transformer(_tiny_config(num_layers=4))
     model.enable_gradient_checkpointing()

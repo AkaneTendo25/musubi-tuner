@@ -35,7 +35,6 @@ from musubi_tuner.modules.attention import AttentionParams
 from musubi_tuner.modules.attention import attention as musubi_attention
 from musubi_tuner.modules.custom_offloading_utils import BlockSwapConfig, create_offloader
 from musubi_tuner.minimax_h3.triton_kernels import try_fused_qk_norm_rope
-from musubi_tuner.utils.model_utils import create_cpu_offloading_wrapper
 
 MINIMAX_H3_MODALITY_COUNT = 3
 _CUDNN_AUTO_WORK_THRESHOLD = 1 << 28
@@ -548,8 +547,13 @@ class MiniMaxH3Transformer(nn.Module):
             return block(value, timestep_embedding, adaln_indices, rotary_emb, attention_mask)
 
         if self.activation_cpu_offloading:
-            compute_device = self.offloader.device if self.layer_streaming else block.attn.qkv_proj.weight.device
-            forward = create_cpu_offloading_wrapper(forward, compute_device)
+            # Let checkpoint keep its saved input on CPU while the live block
+            # output stays on CUDA for the next block. Wrapping ``forward`` and
+            # returning a CPU output would immediately copy that tensor back to
+            # CUDA in the following block, adding a full D2H+H2D round trip per
+            # layer without reducing the tensors retained for backward.
+            with torch.autograd.graph.save_on_cpu(pin_memory=False):
+                return checkpoint(forward, hidden_states, use_reentrant=False)
         return checkpoint(forward, hidden_states, use_reentrant=False)
 
     def _time_embedding(self, timestep: torch.Tensor) -> torch.Tensor:
