@@ -66,11 +66,8 @@ def _cudnn_auto_workload_is_large(query_length: int, key_length: int, head_dim: 
 
 
 def _use_cudnn_auto_dispatch(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, attention_mask) -> bool:
-    is_compiling = getattr(getattr(torch, "compiler", None), "is_compiling", lambda: False)
-    compiling = bool(is_compiling())
     return (
         attention_mask is None
-        and not compiling
         and SDPBackend is not None
         and _SDPA_HAS_SET_PRIORITY
         and query.device.type == "cuda"
