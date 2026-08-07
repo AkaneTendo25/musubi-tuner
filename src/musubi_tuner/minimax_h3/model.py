@@ -34,6 +34,7 @@ from torch.utils.checkpoint import checkpoint
 from musubi_tuner.modules.attention import AttentionParams
 from musubi_tuner.modules.attention import attention as musubi_attention
 from musubi_tuner.modules.custom_offloading_utils import BlockSwapConfig, create_offloader
+from musubi_tuner.minimax_h3.triton_kernels import try_fused_qk_norm_rope
 from musubi_tuner.utils.model_utils import create_cpu_offloading_wrapper
 
 MINIMAX_H3_MODALITY_COUNT = 3
@@ -126,8 +127,8 @@ class MiniMaxH3TransformerOutput:
 def _apply_rotary_emb(hidden_states: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
     rotary_dim = cos.shape[-1]
     rotary, passthrough = hidden_states[..., :rotary_dim], hidden_states[..., rotary_dim:]
-    cos = cos.to(hidden_states.dtype)[None, :, None, :]
-    sin = sin.to(hidden_states.dtype)[None, :, None, :]
+    cos = cos[None, :, None, :]
+    sin = sin[None, :, None, :]
     first, second = rotary.chunk(2, dim=-1)
     rotated = torch.cat((-second, first), dim=-1)
     return torch.cat((rotary * cos + rotated * sin, passthrough), dim=-1).contiguous()
@@ -193,6 +194,7 @@ class MiniMaxH3Attention(nn.Module):
         self.head_dim = head_dim
         self.attention_mode = attention_mode
         self.auto_dispatch = False
+        self.fused_qk_norm_rope = False
         self.inner_dim = heads * head_dim
         self.qkv_proj = nn.Linear(hidden_size, 3 * self.inner_dim, bias=False)
         self.q_norm = nn.RMSNorm(head_dim, eps=qk_norm_eps)
@@ -206,13 +208,29 @@ class MiniMaxH3Attention(nn.Module):
         attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         query, key, value = self.qkv_proj(hidden_states).chunk(3, dim=-1)
-        query = self.q_norm(query.unflatten(-1, (self.heads, self.head_dim)))
-        key = self.k_norm(key.unflatten(-1, (self.heads, self.head_dim)))
+        query = query.unflatten(-1, (self.heads, self.head_dim))
+        key = key.unflatten(-1, (self.heads, self.head_dim))
         value = value.unflatten(-1, (self.heads, self.head_dim))
 
-        if rotary_emb is not None:
-            query = _apply_rotary_emb(query, *rotary_emb)
-            key = _apply_rotary_emb(key, *rotary_emb)
+        fused_qk = None
+        if self.fused_qk_norm_rope and rotary_emb is not None:
+            fused_qk = try_fused_qk_norm_rope(
+                query,
+                key,
+                self.q_norm.weight,
+                self.k_norm.weight,
+                rotary_emb[0],
+                rotary_emb[1],
+                self.q_norm.eps,
+            )
+        if fused_qk is not None:
+            query, key = fused_qk
+        else:
+            query = self.q_norm(query)
+            key = self.k_norm(key)
+            if rotary_emb is not None:
+                query = _apply_rotary_emb(query, *rotary_emb)
+                key = _apply_rotary_emb(key, *rotary_emb)
 
         if self.attention_mode in {"flash", "flash3"} and attention_mask is None:
             hidden_states = musubi_attention(
@@ -242,7 +260,7 @@ class MiniMaxH3Attention(nn.Module):
                     dropout_p=0.0,
                     is_causal=False,
                 )
-            hidden_states = hidden_states.transpose(1, 2).flatten(2, 3).to(query.dtype)
+            hidden_states = hidden_states.transpose(1, 2).flatten(2, 3)
         return self.out_proj(hidden_states)
 
 
@@ -319,15 +337,8 @@ class MiniMaxH3TransformerBlock(nn.Module):
         rotary_emb: tuple[torch.Tensor, torch.Tensor],
         attention_mask: torch.Tensor | None,
     ) -> torch.Tensor:
-        modulation = self.adaln_proj(timestep_embedding).view(-1, 6 * self.hidden_size)
+        modulation = self.adaln_proj(timestep_embedding).view(-1, 6 * self.hidden_size).to(hidden_states.dtype)
         shift_attn, scale_attn, gate_attn, shift_mlp, scale_mlp, gate_mlp = modulation.chunk(6, dim=-1)
-        hidden_dtype = hidden_states.dtype
-        shift_attn = shift_attn.to(hidden_dtype)
-        scale_attn = scale_attn.to(hidden_dtype)
-        gate_attn = gate_attn.to(hidden_dtype)
-        shift_mlp = shift_mlp.to(hidden_dtype)
-        scale_mlp = scale_mlp.to(hidden_dtype)
-        gate_mlp = gate_mlp.to(hidden_dtype)
 
         norm_hidden_states = self.norm1(hidden_states)
         norm_hidden_states = norm_hidden_states * (1.0 + scale_attn.index_select(0, adaln_indices))
@@ -363,16 +374,17 @@ class MiniMaxH3FinalLayer(nn.Module):
         video_indices: torch.Tensor,
         audio_indices: torch.Tensor,
     ) -> MiniMaxH3TransformerOutput:
-        shift, scale = self.adaln_proj(timestep_embedding).chunk(2, dim=-1)
-        shift = shift.to(hidden_states.dtype)
-        scale = scale.to(hidden_states.dtype)
-        hidden_states = self.norm(hidden_states)
-        hidden_states = hidden_states * (1.0 + scale.index_select(0, timestep_indices))
-        hidden_states = hidden_states + shift.index_select(0, timestep_indices)
+        shift, scale = self.adaln_proj(timestep_embedding).to(hidden_states.dtype).chunk(2, dim=-1)
+        media_indices = torch.cat((video_indices, audio_indices))
+        media_timestep_indices = timestep_indices.index_select(0, media_indices)
+        media = self.norm(hidden_states.index_select(1, media_indices))
+        media = media * (1.0 + scale.index_select(0, media_timestep_indices))
+        media = media + shift.index_select(0, media_timestep_indices)
+        video_hidden, audio_hidden = media.split((video_indices.numel(), audio_indices.numel()), dim=1)
         video_dtype = self.video_out.weight.dtype
         audio_dtype = self.audio_out.weight.dtype
-        video = self.video_out(hidden_states.to(video_dtype)).index_select(1, video_indices)
-        audio = self.audio_out(hidden_states.to(audio_dtype)).index_select(1, audio_indices)
+        video = self.video_out(video_hidden.to(video_dtype))
+        audio = self.audio_out(audio_hidden.to(audio_dtype))
         return MiniMaxH3TransformerOutput(video=video, audio=audio)
 
 
@@ -411,6 +423,7 @@ class MiniMaxH3Transformer(nn.Module):
         self.blocks = nn.ModuleList([MiniMaxH3TransformerBlock(config, attention_mode) for _ in range(config.num_layers)])
         self.final_layer = MiniMaxH3FinalLayer(config)
         self.gradient_checkpointing = False
+        self.gradient_checkpointing_blocks: int | None = None
         self.activation_cpu_offloading = False
         self.blocks_to_swap = 0
         self.offloader = None
@@ -431,12 +444,22 @@ class MiniMaxH3Transformer(nn.Module):
         self.gradient_checkpointing = False
         self.activation_cpu_offloading = False
 
+    def set_gradient_checkpointing_blocks(self, blocks: int | None) -> None:
+        if blocks is not None and not 0 <= blocks <= len(self.blocks):
+            raise ValueError(f"H3 gradient checkpoint block count must be in [0, {len(self.blocks)}], got {blocks}")
+        self.gradient_checkpointing_blocks = blocks
+
     def enable_attention_auto_dispatch(self) -> None:
         for module in self.modules():
             if isinstance(module, MiniMaxH3Attention):
                 if module.attention_mode != "torch":
                     raise ValueError("MiniMax H3 attention auto-dispatch requires SDPA attention")
                 module.auto_dispatch = True
+
+    def enable_fused_qk_norm_rope(self) -> None:
+        for module in self.modules():
+            if isinstance(module, MiniMaxH3Attention):
+                module.fused_qk_norm_rope = True
 
     def enable_block_swap(self, blocks_to_swap: int, config: BlockSwapConfig) -> None:
         num_blocks = len(self.blocks)
@@ -553,9 +576,12 @@ class MiniMaxH3Transformer(nn.Module):
         text = self.token_refiner(text, self.gradient_checkpointing)
 
         hidden_states = text.new_zeros((text.shape[0], sequence_length, text.shape[-1]))
-        hidden_states = hidden_states.index_copy(1, text_indices, text)
-        hidden_states = hidden_states.index_copy(1, video_indices, video.to(text.dtype))
-        hidden_states = hidden_states.index_copy(1, audio_indices, audio.to(text.dtype))
+        hidden_states.index_copy_(1, text_indices, text)
+        hidden_states.index_copy_(1, video_indices, video.to(text.dtype))
+        hidden_states.index_copy_(1, audio_indices, audio.to(text.dtype))
+        # RoPE is shared by all 50 blocks. Cast it once here instead of casting
+        # cos/sin independently for Q and K inside every attention call.
+        rotary_emb = tuple(component.to(hidden_states.dtype) for component in rotary_emb)
 
         timestep_embedding = self._time_embedding(timestep)
         adaln_indices = timestep_indices * MINIMAX_H3_MODALITY_COUNT + token_tags.clamp(min=0)
@@ -575,10 +601,13 @@ class MiniMaxH3Transformer(nn.Module):
             padding_mask = is_padding[None, :] == is_padding[:, None]
             attention_mask = padding_mask if attention_mask is None else attention_mask & padding_mask
 
+        checkpoint_start = (
+            0 if self.gradient_checkpointing_blocks is None else len(self.blocks) - self.gradient_checkpointing_blocks
+        )
         for block_index, block in enumerate(self.blocks):
             if self.blocks_to_swap:
                 self.offloader.wait_for_block(block_index)
-            if torch.is_grad_enabled() and self.gradient_checkpointing:
+            if torch.is_grad_enabled() and self.gradient_checkpointing and block_index >= checkpoint_start:
                 hidden_states = self._checkpointed_block(
                     block,
                     hidden_states,

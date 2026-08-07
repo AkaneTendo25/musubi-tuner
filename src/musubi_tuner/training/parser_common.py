@@ -103,6 +103,13 @@ def _add_compile_and_dynamo_args(parser: argparse.ArgumentParser) -> None:
         help="torch.compile mode (default: default) / torch.compileのモード（デフォルト: default）",
     )
     parser.add_argument(
+        "--inductor_config",
+        nargs="*",
+        default=None,
+        metavar="KEY=VALUE",
+        help="Set torch._inductor.config / torch._dynamo.config attributes (dotted keys allowed).",
+    )
+    parser.add_argument(
         "--compile_dynamic",
         type=str,
         default=None,
@@ -120,6 +127,16 @@ def _add_compile_and_dynamo_args(parser: argparse.ArgumentParser) -> None:
         type=int,
         default=None,
         help="Set torch._dynamo.config.cache_size_limit (default: PyTorch default, typically 8-32) / torch._dynamo.config.cache_size_limitを設定（デフォルト: PyTorchのデフォルト、通常8-32）",
+    )
+    parser.add_argument(
+        "--compile_auto_cache_size_limit",
+        action="store_true",
+        help="Raise the Dynamo cache limit to at least twice the number of compiled blocks.",
+    )
+    parser.add_argument(
+        "--compile_fallback_to_eager",
+        action="store_true",
+        help="Restore eager blocks and continue if torch.compile setup fails.",
     )
     parser.add_argument(
         "--cuda_allow_tf32",

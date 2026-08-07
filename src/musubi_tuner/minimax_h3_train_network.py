@@ -489,13 +489,21 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             raise ValueError("MiniMax H3 --int8_convrot_base cannot be combined with --fp8_base")
         if args.blocks_to_swap is not None and args.blocks_to_swap < 0:
             raise ValueError("MiniMax H3 --blocks_to_swap must be non-negative")
+        if args.h3_gradient_checkpointing_blocks is not None:
+            checkpoint_blocks = args.h3_gradient_checkpointing_blocks
+            if not 0 <= checkpoint_blocks <= 50:
+                raise ValueError("--h3_gradient_checkpointing_blocks must be in [0, 50]")
+            if not args.gradient_checkpointing:
+                raise ValueError("--h3_gradient_checkpointing_blocks requires --gradient_checkpointing")
+            if checkpoint_blocks < 50 and (args.blocks_to_swap or 0) > 0:
+                raise ValueError("partial H3 gradient checkpointing cannot be combined with block swap")
+            if checkpoint_blocks < 50 and args.compile:
+                raise ValueError("partial H3 gradient checkpointing cannot be combined with --compile")
         if args.block_swap_h2d_only and not args.use_pinned_memory_for_block_swap:
             logger.warning(
                 "MiniMax H3 H2D-only block swap without pinned host memory uses staged copies and can be substantially slower; "
                 "add --use_pinned_memory_for_block_swap for direct asynchronous transfers"
             )
-        if args.compile:
-            raise ValueError("MiniMax H3 training does not support compilation")
         if not (args.sdpa or args.flash_attn or args.flash3):
             raise ValueError("MiniMax H3 training requires --sdpa, --flash_attn, or --flash3")
         if args.h3_attn_auto_dispatch and not args.sdpa:
@@ -513,7 +521,14 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 raise ValueError("MiniMax H3 sampling during training requires " + ", ".join(missing))
 
     def on_transformer_loaded(self, args, accelerator, transformer) -> None:
-        del args
+        transformer.set_gradient_checkpointing_blocks(args.h3_gradient_checkpointing_blocks)
+        if args.h3_fused_qk_norm_rope:
+            transformer.enable_fused_qk_norm_rope()
+            if args.compile:
+                logger.info(
+                    "--h3_fused_qk_norm_rope requested with --compile: compiled blocks use Inductor fusion; "
+                    "the explicit Triton kernel remains active for eager calls"
+                )
         if self._crepa_config is None:
             return
         config = getattr(transformer, "config", None)
@@ -749,6 +764,9 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             convrot_int8_fwd=args.h3_convrot_int8_fwd,
             quantization_device=str(accelerator.device),
             int8_convrot=bool(args.int8_convrot_base),
+            target_device=str(accelerator.device),
+            blocks_to_swap=int(getattr(args, "blocks_to_swap", 0) or 0),
+            block_swap_h2d_only=bool(getattr(args, "block_swap_h2d_only", False)),
         )
         transformer = self.backend.get_training_transformer()
         if not isinstance(transformer, torch.nn.Module):
@@ -758,8 +776,17 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         return transformer
 
     def compile_transformer(self, args, transformer):
-        del args, transformer
-        raise RuntimeError("MiniMax H3 compilation is unavailable")
+        target_blocks = model_utils.resolve_compile_block_lists(transformer, ("blocks", "token_refiner.blocks"))
+        count = sum(len(blocks) for blocks in target_blocks)
+        logger.info("MiniMax H3: resolved %d regional torch.compile blocks", count)
+        if count == 0:
+            raise RuntimeError("--compile set but no H3 transformer blocks were resolved")
+        return model_utils.compile_transformer(
+            args,
+            transformer,
+            target_blocks,
+            disable_linear=self.blocks_to_swap > 0,
+        )
 
     def scale_shift_latents(self, latents):
         # H3 latent caches are written in the model's normalized latent space.
@@ -1534,6 +1561,23 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         help=(
             "reduce the AdaLN timestep projection to this rank while loading, shrinking the frozen base by ~13B "
             "parameters; the reduced weights stay in BF16 because they are no longer large enough to be worth quantizing"
+        ),
+    )
+    parser.add_argument(
+        "--h3_fused_qk_norm_rope",
+        action="store_true",
+        help=(
+            "use the opt-in Triton kernel that fuses H3 per-head Q/K RMSNorm with split RoPE; "
+            "unsupported shapes and torch.compile automatically use the eager/Inductor path"
+        ),
+    )
+    parser.add_argument(
+        "--h3_gradient_checkpointing_blocks",
+        type=int,
+        default=None,
+        help=(
+            "checkpoint only the last N of H3's 50 main blocks; default checkpoints all blocks. "
+            "Lower values trade more VRAM for less recomputation and require resident eager blocks"
         ),
     )
     parser.add_argument(

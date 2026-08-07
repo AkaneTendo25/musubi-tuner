@@ -135,6 +135,16 @@ def create_generator(
     use_pinned_memory_for_block_swap: bool = False,
     lora_weights: tuple[Path, ...] = (),
     lora_multipliers: tuple[float, ...] = (),
+    compile_model: bool = False,
+    compile_backend: str = "inductor",
+    compile_mode: str = "max-autotune-no-cudagraphs",
+    compile_dynamic: str | None = None,
+    compile_fullgraph: bool = False,
+    compile_cache_size_limit: int | None = None,
+    compile_auto_cache_size_limit: bool = False,
+    compile_fallback_to_eager: bool = False,
+    inductor_config: tuple[str, ...] = (),
+    fused_qk_norm_rope: bool = False,
 ):
     """Create a sequentially-loaded native FL2VA or Ref2VA generator."""
     if dtype != "bfloat16":
@@ -159,6 +169,16 @@ def create_generator(
         use_pinned_memory_for_block_swap=use_pinned_memory_for_block_swap,
         lora_weights=lora_weights,
         lora_multipliers=lora_multipliers,
+        compile_model=compile_model,
+        compile_backend=compile_backend,
+        compile_mode=compile_mode,
+        compile_dynamic=compile_dynamic,
+        compile_fullgraph=compile_fullgraph,
+        compile_cache_size_limit=compile_cache_size_limit,
+        compile_auto_cache_size_limit=compile_auto_cache_size_limit,
+        compile_fallback_to_eager=compile_fallback_to_eager,
+        inductor_config=inductor_config,
+        fused_qk_norm_rope=fused_qk_norm_rope,
         mode="ref2va" if request.mode == "reference" else "fl2va",
     )
 
@@ -186,6 +206,16 @@ class _NativeGenerator:
         use_pinned_memory_for_block_swap: bool,
         lora_weights: tuple[Path, ...],
         lora_multipliers: tuple[float, ...],
+        compile_model: bool,
+        compile_backend: str,
+        compile_mode: str,
+        compile_dynamic: str | None,
+        compile_fullgraph: bool,
+        compile_cache_size_limit: int | None,
+        compile_auto_cache_size_limit: bool,
+        compile_fallback_to_eager: bool,
+        inductor_config: tuple[str, ...],
+        fused_qk_norm_rope: bool,
         mode: H3TrainingMode,
     ) -> None:
         self.model = Path(model)
@@ -209,6 +239,18 @@ class _NativeGenerator:
         self.use_pinned_memory_for_block_swap = use_pinned_memory_for_block_swap
         self.lora_weights = tuple(Path(path) for path in lora_weights)
         self.lora_multipliers = lora_multipliers
+        self.compile_model = compile_model
+        self.compile_options = SimpleNamespace(
+            compile_backend=compile_backend,
+            compile_mode=compile_mode,
+            compile_dynamic=compile_dynamic,
+            compile_fullgraph=compile_fullgraph,
+            compile_cache_size_limit=compile_cache_size_limit,
+            compile_auto_cache_size_limit=compile_auto_cache_size_limit,
+            compile_fallback_to_eager=compile_fallback_to_eager,
+            inductor_config=inductor_config,
+        )
+        self.fused_qk_norm_rope = fused_qk_norm_rope
         self.mode = mode
 
     def _measure(self, name: str, operation, metrics: dict[str, dict]):
@@ -300,8 +342,13 @@ class _NativeGenerator:
             fp8_scaled=self.fp8_scaled,
             quantization_device=self.device if self.fp8_scaled else None,
             int8_convrot=self.int8_convrot,
+            target_device=self.device,
+            blocks_to_swap=self.blocks_to_swap,
+            block_swap_h2d_only=self.block_swap_h2d_only,
         )
         transformer.requires_grad_(False).eval()
+        if self.fused_qk_norm_rope:
+            transformer.enable_fused_qk_norm_rope()
         if self.blocks_to_swap:
             swap_config = BlockSwapConfig(
                 device=self.device,
@@ -334,6 +381,16 @@ class _NativeGenerator:
             transformer.switch_block_swap_for_inference()
         else:
             transformer.to(self.device)
+        if self.compile_model:
+            from musubi_tuner.utils import model_utils
+
+            targets = model_utils.resolve_compile_block_lists(transformer, ("blocks", "token_refiner.blocks"))
+            transformer = model_utils.compile_transformer(
+                self.compile_options,
+                transformer,
+                targets,
+                disable_linear=self.blocks_to_swap > 0,
+            )
         return transformer, networks
 
     @torch.no_grad()
@@ -478,6 +535,10 @@ def create_training_backend(
     convrot_int8: bool = False,
     convrot_int8_bwd: str = "bf16",
     convrot_int8_fwd: str = "int8",
+    target_device: str | None = None,
+    blocks_to_swap: int = 0,
+    block_swap_h2d_only: bool = False,
+    low_ram_load: bool = True,
 ):
     """Load the selected released transformer and adapt its training forward to Musubi."""
     if dtype != "bfloat16":
@@ -499,6 +560,10 @@ def create_training_backend(
         convrot_int8=convrot_int8,
         convrot_int8_bwd=convrot_int8_bwd,
         convrot_int8_fwd=convrot_int8_fwd,
+        target_device=target_device,
+        blocks_to_swap=blocks_to_swap,
+        block_swap_h2d_only=block_swap_h2d_only,
+        low_ram_load=low_ram_load,
     )
     return _NativeTrainingBackend(transformer, mode)
 

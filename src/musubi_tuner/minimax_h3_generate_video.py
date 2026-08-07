@@ -67,6 +67,20 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument("--use_pinned_memory_for_block_swap", action="store_true")
     parser.add_argument("--lora_weight", type=Path, action="append", default=[])
     parser.add_argument("--lora_multiplier", type=float, action="append", default=[])
+    parser.add_argument("--compile", action="store_true", help="regionally compile H3 transformer blocks")
+    parser.add_argument("--compile_backend", default="inductor")
+    parser.add_argument(
+        "--compile_mode",
+        default="max-autotune-no-cudagraphs",
+        choices=("default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"),
+    )
+    parser.add_argument("--compile_dynamic", choices=("true", "false", "auto"))
+    parser.add_argument("--compile_fullgraph", action="store_true")
+    parser.add_argument("--compile_cache_size_limit", type=int)
+    parser.add_argument("--compile_auto_cache_size_limit", action="store_true")
+    parser.add_argument("--compile_fallback_to_eager", action="store_true")
+    parser.add_argument("--inductor_config", nargs="*", default=[])
+    parser.add_argument("--h3_fused_qk_norm_rope", action="store_true")
     parser.add_argument(
         "--inspect",
         action="store_true",
@@ -137,6 +151,16 @@ def main(argv: Sequence[str] | None = None) -> None:
             use_pinned_memory_for_block_swap=args.use_pinned_memory_for_block_swap,
             lora_weights=tuple(args.lora_weight),
             lora_multipliers=tuple(args.lora_multiplier),
+            compile_model=args.compile,
+            compile_backend=args.compile_backend,
+            compile_mode=args.compile_mode,
+            compile_dynamic=args.compile_dynamic,
+            compile_fullgraph=args.compile_fullgraph,
+            compile_cache_size_limit=args.compile_cache_size_limit,
+            compile_auto_cache_size_limit=args.compile_auto_cache_size_limit,
+            compile_fallback_to_eager=args.compile_fallback_to_eager,
+            inductor_config=tuple(args.inductor_config),
+            fused_qk_norm_rope=args.h3_fused_qk_norm_rope,
         )
         generator.generate(request)
         if not request.output.is_file():

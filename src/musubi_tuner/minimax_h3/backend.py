@@ -128,6 +128,16 @@ def create_generator(
     use_pinned_memory_for_block_swap: bool = False,
     lora_weights: tuple[Path, ...] = (),
     lora_multipliers: tuple[float, ...] = (),
+    compile_model: bool = False,
+    compile_backend: str = "inductor",
+    compile_mode: str = "max-autotune-no-cudagraphs",
+    compile_dynamic: str | None = None,
+    compile_fullgraph: bool = False,
+    compile_cache_size_limit: int | None = None,
+    compile_auto_cache_size_limit: bool = False,
+    compile_fallback_to_eager: bool = False,
+    inductor_config: tuple[str, ...] = (),
+    fused_qk_norm_rope: bool = False,
 ) -> H3Generator:
     """Load only the inference variant and components required by the request."""
     _validate_dtype(dtype)
@@ -156,6 +166,16 @@ def create_generator(
         use_pinned_memory_for_block_swap=use_pinned_memory_for_block_swap,
         lora_weights=lora_weights,
         lora_multipliers=lora_multipliers,
+        compile_model=compile_model,
+        compile_backend=compile_backend,
+        compile_mode=compile_mode,
+        compile_dynamic=compile_dynamic,
+        compile_fullgraph=compile_fullgraph,
+        compile_cache_size_limit=compile_cache_size_limit,
+        compile_auto_cache_size_limit=compile_auto_cache_size_limit,
+        compile_fallback_to_eager=compile_fallback_to_eager,
+        inductor_config=inductor_config,
+        fused_qk_norm_rope=fused_qk_norm_rope,
     )
 
 
@@ -175,6 +195,10 @@ def create_training_backend(
     convrot_int8: bool = False,
     convrot_int8_bwd: str = "bf16",
     convrot_int8_fwd: str = "int8",
+    target_device: str | None = None,
+    blocks_to_swap: int = 0,
+    block_swap_h2d_only: bool = False,
+    low_ram_load: bool = True,
 ) -> H3TrainingBackend:
     """Load only the transformer required for cache-backed LoRA training.
 
@@ -207,4 +231,8 @@ def create_training_backend(
             if not convrot_int8
             else {"convrot_int8": True, "convrot_int8_bwd": convrot_int8_bwd, "convrot_int8_fwd": convrot_int8_fwd}
         ),
+        **({} if target_device is None else {"target_device": target_device}),
+        **({} if blocks_to_swap == 0 else {"blocks_to_swap": blocks_to_swap}),
+        **({} if not block_swap_h2d_only else {"block_swap_h2d_only": True}),
+        **({} if low_ram_load else {"low_ram_load": False}),
     )
