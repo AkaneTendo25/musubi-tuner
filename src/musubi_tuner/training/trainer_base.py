@@ -1758,7 +1758,6 @@ class NetworkTrainer:
 
         if args.compile:
             transformer = self.compile_transformer(args, transformer)
-            transformer.__dict__["_orig_mod"] = transformer  # for annoying accelerator checks
 
         network, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(network, optimizer, train_dataloader, lr_scheduler)
         training_model = network

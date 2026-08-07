@@ -1934,6 +1934,45 @@ def test_h3_trainer_accepts_compile_and_exposes_fallback_controls():
     assert args.compile_auto_cache_size_limit
 
 
+def test_h3_regional_compile_does_not_self_reference_transformer_root(monkeypatch):
+    class Accelerator:
+        def prepare(self, *objects, **_kwargs):
+            return objects[0] if len(objects) == 1 else objects
+
+        @staticmethod
+        def unwrap_model(model):
+            return model
+
+    class Network(nn.Module):
+        def prepare_grad_etc(self, _transformer):
+            pass
+
+    trainer = MiniMaxH3NetworkTrainer()
+    monkeypatch.setattr(trainer, "compile_transformer", lambda _args, transformer: transformer)
+    args = SimpleNamespace(compile=True, gradient_checkpointing=False)
+    transformer = nn.Linear(2, 2)
+    network = Network()
+
+    prepared = trainer._prepare_with_accelerator(
+        args,
+        Accelerator(),
+        transformer,
+        network,
+        object(),
+        object(),
+        object(),
+        torch.float32,
+        torch.float32,
+        torch.float32,
+    )
+    prepared_transformer = prepared[0]
+
+    assert prepared_transformer is transformer
+    assert prepared_transformer.__dict__.get("_orig_mod") is not prepared_transformer
+    assert prepared_transformer._modules.get("_orig_mod") is not prepared_transformer
+    assert set(prepared_transformer.state_dict()) == {"weight", "bias"}
+
+
 def test_h3_partial_checkpointing_requires_gradient_checkpointing():
     args = create_parser().parse_args(["--sdpa", "--h3_gradient_checkpointing_blocks", "25"])
 
