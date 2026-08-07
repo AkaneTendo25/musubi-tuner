@@ -115,6 +115,7 @@ def factorize_adaln_weight(
     basis: AdaLNBasis,
     *,
     chunk_rows: int = 8192,
+    compute_device: torch.device | str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Contract one AdaLN projection onto the basis.
 
@@ -128,8 +129,8 @@ def factorize_adaln_weight(
     if in_features != basis.basis.shape[0]:
         raise ValueError(f"H3 AdaLN weight has {in_features} input features, basis expects {basis.basis.shape[0]}")
 
-    # Weights stream in on whatever device the loader quantizes on, so follow them.
-    device = weight.device
+    source_device = weight.device
+    device = torch.device(compute_device) if compute_device is not None else source_device
     u = basis.basis.to(device=device, dtype=torch.float64)
     mean = basis.mean.to(device=device, dtype=torch.float64)
     reduced = torch.empty((out_features, basis.rank), dtype=torch.float64, device=device)
@@ -137,12 +138,15 @@ def factorize_adaln_weight(
 
     for start in range(0, out_features, max(1, chunk_rows)):
         stop = min(start + max(1, chunk_rows), out_features)
-        rows = weight[start:stop].to(torch.float64)
+        rows = weight[start:stop].to(device=device, dtype=torch.float64)
         reduced[start:stop] = rows @ u
         shift[start:stop] = rows @ mean
 
-    folded = shift if bias is None else bias.to(torch.float64) + shift
-    return reduced.to(weight.dtype), folded.to(weight.dtype if bias is None else bias.dtype)
+    folded = shift if bias is None else bias.to(device=device, dtype=torch.float64) + shift
+    return (
+        reduced.to(device=source_device, dtype=weight.dtype),
+        folded.to(device=source_device, dtype=weight.dtype if bias is None else bias.dtype),
+    )
 
 
 def reconstruction_error(time_embedder: torch.nn.Module, basis: AdaLNBasis, *, grid: torch.Tensor | None = None) -> float:
@@ -187,7 +191,8 @@ def read_time_embedder(checkpoint_path, *, embedder_factory) -> torch.nn.Module:
 
 def build_timestep_table(embedder: torch.nn.Module, basis: AdaLNBasis, points: int) -> torch.Tensor:
     """Basis coefficients on the uniform grid the model interpolates between."""
-    grid = torch.linspace(0.0, 1.0, points, dtype=torch.float64)
+    device = next(embedder.parameters()).device
+    grid = torch.linspace(0.0, 1.0, points, dtype=torch.float64, device=device)
     original = next(embedder.parameters()).dtype
     embedder.to(torch.float64)
     try:
@@ -195,10 +200,16 @@ def build_timestep_table(embedder: torch.nn.Module, basis: AdaLNBasis, points: i
             activated = F.silu(embedder(grid))
     finally:
         embedder.to(original)
-    return basis.coefficients(activated)
+    return basis.coefficients(activated).cpu()
 
 
-def make_adaln_split_hook(basis: AdaLNBasis, table: torch.Tensor, *, storage_dtype=torch.float32):
+def make_adaln_split_hook(
+    basis: AdaLNBasis,
+    table: torch.Tensor,
+    *,
+    storage_dtype=torch.float32,
+    compute_device: torch.device | str | None = None,
+):
     """A ``WeightTransformHooks.split_hook`` that reduces AdaLN as weights stream in.
 
     The timestep embedder is dropped and replaced by the interpolated table, and
@@ -223,7 +234,12 @@ def make_adaln_split_hook(basis: AdaLNBasis, table: torch.Tensor, *, storage_dty
         if key.endswith(f"{ADALN_INFIX}weight"):
             if tensor is None:
                 return [key], None
-            reduced, _ = factorize_adaln_weight(tensor.to(torch.float32), None, basis)
+            reduced, _ = factorize_adaln_weight(
+                tensor.to(torch.float32),
+                None,
+                basis,
+                compute_device=compute_device,
+            )
             # Store float32, not the checkpoint's bf16. The stored dtype is what
             # bounds the reduction: bf16's 8-bit mantissa puts a ~1e-3 relative
             # floor under the modulation, orders of magnitude above the basis

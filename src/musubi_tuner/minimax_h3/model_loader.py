@@ -254,6 +254,8 @@ def load_transformer(
         if int8_convrot:
             raise ValueError("MiniMax H3 INT8 ConvRot checkpoints ship pre-pruned; --h3_adaln_rank cannot apply")
         embedder = read_time_embedder(checkpoint_path, embedder_factory=MiniMaxH3TimeEmbedder)
+        factor_device = torch.device(quantization_device) if quantization_device is not None else torch.device(loading_device)
+        embedder.to(factor_device)
         # Uncentered so the projections' biases pass through untouched.
         basis = build_adaln_basis(embedder, adaln_rank, center=False)
         table = build_timestep_table(embedder, basis, DEFAULT_TABLE_POINTS)
@@ -263,7 +265,7 @@ def load_transformer(
             reconstruction_error(embedder, basis),
         )
         config = replace(config, adaln_t_table_size=DEFAULT_TABLE_POINTS, time_embed_dim=adaln_rank)
-        weight_transform_hooks = WeightTransformHooks(split_hook=make_adaln_split_hook(basis, table))
+        weight_transform_hooks = WeightTransformHooks(split_hook=make_adaln_split_hook(basis, table, compute_device=factor_device))
 
     with init_empty_weights(include_buffers=True):
         model = MiniMaxH3Transformer(config, attention_mode=attention_mode)

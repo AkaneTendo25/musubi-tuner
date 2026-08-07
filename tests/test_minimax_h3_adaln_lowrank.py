@@ -188,6 +188,20 @@ def test_factorization_follows_the_weight_device():
     assert folded.device == weight.device
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA factorization")
+def test_factorization_can_compute_on_cuda_and_return_to_source_device():
+    basis = build_adaln_basis(_embedder(), rank=4)
+    weight = torch.randn(8, 96)
+    expected = factorize_adaln_weight(weight, None, basis)
+
+    actual = factorize_adaln_weight(weight, None, basis, compute_device="cuda")
+
+    assert actual[0].device.type == "cpu"
+    assert actual[1].device.type == "cpu"
+    torch.testing.assert_close(actual[0], expected[0])
+    torch.testing.assert_close(actual[1], expected[1])
+
+
 def test_streaming_hook_stores_the_reduced_projection_in_the_default_dtype():
     # The stored dtype bounds the reduction: bf16's mantissa puts a floor under
     # the modulation orders of magnitude above the basis error, which would cap
