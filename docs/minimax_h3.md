@@ -2,11 +2,6 @@
 
 LoRA training and inference for MiniMax H3, a 50-block transformer that generates video and stereo audio jointly.
 
-> [!WARNING]
-> Experimental proof of concept for [issue #106](https://github.com/AkaneTendo25/musubi-tuner/issues/106). Flags, defaults, cache
-> formats, and LoRA compatibility change without deprecation. Pin a commit if you need stability, and re-cache after updating.
-> For future mainline support follow [kohya-ss/musubi-tuner PR #1018](https://github.com/kohya-ss/musubi-tuner/pull/1018).
-
 Media contract: 24 fps video on the `17k+5` frame grid, 24-channel latents at spatial compression 16 with a `(1, 2, 2)` patch;
 32 kHz stereo audio, 32-channel latents at 40 latent frames per second; video and audio flow shifts 12.0 and 3.0.
 
@@ -193,8 +188,9 @@ accelerate launch minimax_h3_train_network.py \
 For Ref2VA, swap the checkpoint and add `--h3_training_mode ref2va` (or `ref2va_omni`).
 
 Adapters target attention and feed-forward projections; norms and timestep/modality calibration stay frozen. LoHa/LoKr are
-unsupported, and `torch.compile` is rejected. Reference media must be distinct from the target; the target is never reused as its
-own reference.
+unsupported. Regional `torch.compile` covers all 50 main blocks and both text-refiner blocks; use `--compile` and optionally
+`--compile_auto_cache_size_limit`, `--compile_fallback_to_eager`, or `--inductor_config KEY=VALUE ...`. Reference media must be
+distinct from the target; the target is never reused as its own reference.
 
 Watch progress with `tensorboard --logdir logs`. When training remotely, bind it to a protected interface or reach its loopback
 address through an SSH forward rather than exposing it publicly.
@@ -205,6 +201,9 @@ address through an SSH forward rather than exposing it publicly.
 | --- | --- | --- |
 | `--sdpa`, `--flash_attn`, `--flash3` | `--sdpa` | Attention backend. Each FlashAttention flag needs its package, and `--flash3` needs a Hopper GPU. Both fall back to SDPA on padded batches. |
 | `--h3_attn_auto_dispatch` | off | Prefer cuDNN SDPA for large maskless workloads. Changes rounding; benchmark first. |
+| `--compile` | off | Regionally compile all H3 blocks with the selected backend/mode. Compatible with full gradient checkpointing and block swap; swapped Linear calls stay eager. |
+| `--h3_fused_qk_norm_rope` | off | Use the custom Triton Q/K RMSNorm+RoPE kernel outside compiled graphs. It is faster but changes BF16 rounding, so it is opt-in. |
+| `--h3_gradient_checkpointing_blocks N` | all 50 | Checkpoint only the last N main blocks. This explicit speed/VRAM trade-off requires `--gradient_checkpointing` and resident eager blocks. |
 | `--h3_shift_video` / `--h3_shift_audio` | `12.0` / `3.0` | Per-modality flow shift. Both derive from one shared coordinate, so changing one never desynchronizes the other. |
 | `--timestep_sampling` | `uniform` | Use `uniform`, `sigmoid`, or `logsnr`. The dynamic-shift modes double-shift the schedule and ignore H3's temporal extent. |
 | `--discrete_flow_shift` | `1.0` | Must stay at the default; H3 applies its own shifts. |
@@ -219,23 +218,15 @@ Quantize the frozen base, reduce AdaLN, then swap blocks — in that order.
   --h3_convrot_int8 --h3_convrot_int8_fwd bf16 --h3_adaln_rank 16
 ```
 
-**This is the recommended configuration.** Measured on one H100 at 608×352×124 against the BF16 reference:
-
-| Frozen base | Video error | Audio error | s/it |
-| --- | --- | --- | --- |
-| ConvRot INT8 + `--h3_convrot_int8_fwd bf16` | **6.69e-02** | **9.66e-02** | 4.10 |
-| ConvRot INT8, fused INT8 forward | 7.85e-02 | 1.25e-01 | 6.22 |
-| Scaled FP8 (`--fp8_base`) | 1.17e-01 | 2.30e-01 | **3.92** |
-
-Both store one byte per weight, so neither saves more memory. ConvRot's Hadamard rotation spreads outliers, which buys 1.8× lower
-video error and 2.4× lower audio error for 4.6% more wall clock. `--h3_convrot_int8_fwd bf16` is both the more accurate and the
-faster ConvRot route, because it leaves activations unquantized and hands the matmul to the vendor GEMM.
+**This is the recommended configuration.** ConvRot INT8 stores the frozen linear weights at one byte per value,
+`--h3_convrot_int8_fwd bf16` evaluates those weights with BF16 activations, and rank 16 replaces the full AdaLN projections with
+compact factors.
 
 | Option | Purpose |
 | --- | --- |
 | `--h3_convrot_int8` | Quantize the released BF16 checkpoint to ConvRot INT8 at load. Rejects `--fp8_base` and `--int8_convrot_base`. |
 | `--h3_convrot_int8_fwd bf16` | Recommended. Evaluates the matmul in BF16 without changing stored weights. |
-| `--h3_convrot_int8_bwd int8` | INT8 backward. **Slower** on H100 (8.67 vs 6.21 s/it); intended for GPUs without FP8. |
+| `--h3_convrot_int8_bwd int8` | INT8 input-gradient path for GPUs without FP8 support. |
 | `--fp8_base` | Scaled FP8. `--h3_fp8_quantization_mode` selects `block` (default, fastest), `channel`, or `tensor`. |
 | `--int8_convrot_base` | Load the released pre-quantized checkpoint instead of quantizing at load (see below). |
 | `--h3_adaln_rank 16` | Reduce the AdaLN projections, the largest parameter group (13.0B of 33.1B), to ~77M. |
@@ -259,14 +250,42 @@ Block swapping streams frozen weights from host memory. It is valid only while t
 ```shell
   --blocks_to_swap 40 \
   --block_swap_h2d_only \
-  --block_swap_ring_size 2 \
-  --use_pinned_memory_for_block_swap
+  --block_swap_ring_size 2
 ```
 
-Pinned memory is strongly recommended. `--block_swap_granularity layer` streams individual `Linear` layers and supports all 50
+`--use_pinned_memory_for_block_swap` can improve transfer bandwidth when the host has enough available memory; leave it disabled
+when pinned allocations stall or fail. `--block_swap_granularity layer` streams individual `Linear` layers and supports all 50
 blocks, at the cost of more transfers; use the default `block` granularity when it fits. Add
 `--gradient_checkpointing_cpu_offload` when sequence length would otherwise exceed VRAM, and set
 `PYTORCH_ALLOC_CONF=expandable_segments:True` to reduce fragmentation.
+
+For low host RAM and low VRAM, start with the released BF16 checkpoint and let the loader reduce and quantize weights while
+placing swapped blocks on CPU:
+
+```shell
+PYTORCH_ALLOC_CONF=expandable_segments:True accelerate launch minimax_h3_train_network.py \
+  --dit /models/MiniMax-H3/diffusion_models/minimax_h3_fl2va_bf16.safetensors \
+  --dataset_config dataset.toml \
+  --network_module networks.lora_minimax_h3 \
+  --network_dim 16 --network_alpha 16 \
+  --sdpa --mixed_precision bf16 --gradient_checkpointing \
+  --h3_adaln_rank 16 \
+  --h3_convrot_int8 --h3_convrot_int8_fwd bf16 \
+  --blocks_to_swap 48 --block_swap_h2d_only --block_swap_ring_size 2 \
+  --optimizer_type AdamW8bit --learning_rate 1e-4 \
+  --max_train_epochs 10 --save_every_n_epochs 1 \
+  --output_dir output --output_name h3_style
+```
+
+This is the balanced minimum-memory preset. If it still exceeds available VRAM, add
+`--block_swap_granularity layer`, raise `--blocks_to_swap` to `50`, and use `--block_swap_ring_size 1`; those settings trade
+throughput for lower device residency. The BF16 checkpoint itself contains about 61.7 GiB of tensor data, so a full CPU-staging
+loader can exceed a 64 GB host after process overhead. H3 block-swap loading instead materializes only CPU-master blocks on the
+host. The number of swapped blocks therefore controls both host and device residency.
+
+For the command above, loading the BF16 FL2VA checkpoint peaked at 21.09 GiB process RSS and left 3.02 GiB of model and swap
+buffers allocated on the GPU. These are loader figures, not total training requirements: activations, attention workspaces, LoRA
+parameters, gradients, and optimizer state are added according to the largest packed batch.
 
 ### Training modes
 
@@ -425,34 +444,6 @@ python minimax_h3_generate_video.py \
 with a JSON sidecar recording prompt, geometry, schedule, LoRA names, timings, and memory peaks.
 
 The released weights are CFG-distilled: inference runs one evaluation per step with no negative-prompt branch.
-
-## What the base does untrained
-
-Whether a mode is worth training depends on what the released weights already do. Each row reconstructs
-`x0 = x_t + sigma * prediction` at sigma 0.6 and compares the error in the region the mode governs against the same run without
-that conditioning. Lower is better; `1.0×` means the conditioning changed nothing.
-
-| Conditioning | Effect | Reading |
-| --- | --- | --- |
-| Keyframe at frame 0 | 0.212× at that frame | Honoured strongly |
-| Keyframe at interior frame 18 | 0.458× at that frame | Honoured, more strongly than `last` |
-| Keyframe at `last` | 0.638× at that frame | Honoured |
-| Observed prefix (extension) | 0.923× at the first unobserved frame | Weak, back to ~0.99× within four frames |
-| Clean audio (A2V) | none | Own audio no better than another clip's |
-| Clean video (V2A) | none from content | Own video no better than another clip's |
-
-Interior keyframes work natively, so training strengthens an existing behaviour. Extension is the opposite: the mechanism exists
-but buys only a few percent over roughly half a second, which leaves the most room to improve. The cross-modal modes respond to a
-clean track's *presence*, not its content — for A2V, improved and worsened positions match across all 30,932 latent positions
-(0.80% against 0.83%), ruling out a benefit hidden in a narrow region. Training those teaches a correspondence the base does not
-use, which is legitimate but harder.
-
-Measured on one clip at one noise level; treat the ordering as indicative.
-
-> [!CAUTION]
-> Passing technical tests does not establish LoRA quality. A [community report](https://github.com/AkaneTendo25/musubi-tuner/issues/106#issuecomment-5170840323)
-> observed block-like artifacts in a rank-16 concept LoRA, and the cause is unresolved. Use BF16 as the quality reference when
-> investigating artifacts. Whether an adapter trained against one quantized base transfers to another has not been measured.
 
 ## Dataset configuration reference
 
