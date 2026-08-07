@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import replace
 from pathlib import Path
 
@@ -25,6 +26,7 @@ from musubi_tuner.minimax_h3.training import H3TrainingMode
 from musubi_tuner.minimax_h3.weights import CheckpointInspectionError, tensor_metadata
 from musubi_tuner.modules.convrot_int8_utils import ConvRotInt8Quantizer, apply_convrot_int8_monkey_patch
 from musubi_tuner.modules.fp8_optimization_utils import apply_fp8_monkey_patch
+from musubi_tuner.modules.custom_offloading_utils import compute_offload_block_indices
 from musubi_tuner.utils.lora_utils import load_safetensors_with_lora_and_fp8
 from musubi_tuner.utils.safetensors_utils import WeightTransformHooks
 
@@ -63,6 +65,34 @@ _FP32_PREFIXES = (
 # weight-only quantization implementations also convert the main-block AdaLN linears.
 H3_FP8_OPTIMIZATION_TARGET_KEYS = ["blocks."]
 H3_FP8_OPTIMIZATION_EXCLUDE_KEYS = ["token_refiner", "norm"]
+
+
+def build_block_swap_placement(
+    *,
+    target_device: torch.device,
+    num_blocks: int,
+    blocks_to_swap: int,
+    h2d_only: bool,
+):
+    """Place resident H3 blocks on GPU and initial swap blocks on CPU while loading."""
+    offloaded = set(
+        compute_offload_block_indices(
+            num_blocks,
+            blocks_to_swap,
+            h2d_only=h2d_only,
+        )
+    )
+    block_pattern = re.compile(r"^blocks\.(\d+)\.")
+    cpu_device = torch.device("cpu")
+
+    def placement(key: str, default_device: torch.device) -> torch.device:
+        del default_device
+        match = block_pattern.match(key)
+        if match is not None and int(match.group(1)) in offloaded:
+            return cpu_device
+        return target_device
+
+    return placement, tuple(sorted(offloaded))
 
 
 def resolve_transformer_checkpoint(source: Path, mode: H3TrainingMode, *, int8_convrot: bool = False) -> Path:
@@ -190,6 +220,10 @@ def load_transformer(
     convrot_int8: bool = False,
     convrot_int8_bwd: str = "bf16",
     convrot_int8_fwd: str = "int8",
+    target_device: str | torch.device | None = None,
+    blocks_to_swap: int = 0,
+    block_swap_h2d_only: bool = False,
+    low_ram_load: bool = True,
 ) -> MiniMaxH3Transformer:
     checkpoint_path = resolve_transformer_checkpoint(source, mode, int8_convrot=int8_convrot)
     config = infer_transformer_config(checkpoint_path)
@@ -236,8 +270,27 @@ def load_transformer(
 
     device = torch.device(loading_device)
     calc_device = torch.device(quantization_device) if quantization_device is not None else device
+    placement_fn = None
+    offloaded_blocks: tuple[int, ...] = ()
+    resolved_target_device = torch.device(target_device) if target_device is not None else calc_device
+    if low_ram_load and blocks_to_swap > 0 and device.type == "cpu" and resolved_target_device.type != "cpu":
+        placement_fn, offloaded_blocks = build_block_swap_placement(
+            target_device=resolved_target_device,
+            num_blocks=len(model.blocks),
+            blocks_to_swap=blocks_to_swap,
+            h2d_only=block_swap_h2d_only,
+        )
+        logger.info(
+            "MiniMax H3 low-RAM load: streaming %d initial swap blocks to CPU and resident tensors to %s",
+            len(offloaded_blocks),
+            resolved_target_device,
+        )
     if int8_convrot:
-        state_dict, quantized_layers = load_comfy_int8_convrot_state_dict(checkpoint_path, device=device)
+        state_dict, quantized_layers = load_comfy_int8_convrot_state_dict(
+            checkpoint_path,
+            device=device,
+            placement_fn=placement_fn,
+        )
         registered_layers = prepare_int8_convrot_modules(model, state_dict)
         if registered_layers != quantized_layers:
             raise RuntimeError(f"prepared {registered_layers} INT8 modules for {quantized_layers} checkpoint layers")
@@ -268,6 +321,7 @@ def load_transformer(
             ),
             weight_transform_hooks=weight_transform_hooks,
             quantization_mode=fp8_quantization_mode,
+            placement_fn=placement_fn,
         )
         if fp8_scaled:
             apply_fp8_monkey_patch(model, state_dict, use_scaled_mm=False)
@@ -277,7 +331,7 @@ def load_transformer(
             # re-applies the meta parameters' requires_grad to whatever arrives. The base
             # is frozen for LoRA training regardless, so clear it before the load.
             model.requires_grad_(False)
-    if not int8_convrot and device.type != "cpu" and device != calc_device:
+    if placement_fn is None and not int8_convrot and device.type != "cpu" and device != calc_device:
         state_dict = {key: value.to(device) for key, value in state_dict.items()}
     info = model.load_state_dict(state_dict, strict=True, assign=True)
     if info.missing_keys or info.unexpected_keys:
@@ -289,7 +343,7 @@ def load_transformer(
         "Loaded MiniMax H3 %s transformer from %s on %s%s",
         mode,
         checkpoint_path,
-        device,
+        f"split CPU/{resolved_target_device}" if placement_fn is not None else device,
         " with pruned INT8 ConvRot weights" if int8_convrot else " with scaled FP8 block weights" if fp8_scaled else "",
     )
     return model

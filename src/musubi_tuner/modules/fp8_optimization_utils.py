@@ -1,5 +1,5 @@
 import os
-from typing import List, Optional, Union
+from typing import Callable, List, Optional, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -248,6 +248,7 @@ def load_safetensors_with_fp8_optimization(
     disable_numpy_memmap: bool = False,
     weight_transform_hooks: Optional[WeightTransformHooks] = None,
     allow_prequantized_fp8: bool = False,
+    placement_fn: Optional[Callable[[str, torch.device], torch.device]] = None,
 ) -> dict:
     """
     Load weight tensors from safetensors files and merge LoRA weights into the state dict with explicit FP8 optimization.
@@ -311,6 +312,8 @@ def load_safetensors_with_fp8_optimization(
 
                 if not is_target_key(key):
                     target_device = calc_device if (calc_device is not None and move_to_device) else original_device
+                    if placement_fn is not None:
+                        target_device = placement_fn(key, target_device)
                     value = value.to(target_device)
                     state_dict[key] = value
                     continue
@@ -327,6 +330,8 @@ def load_safetensors_with_fp8_optimization(
                         # (e.g. renamed to `.scale_weight` via weight_transform_hooks).
                         if not move_to_device:
                             value = value.to(original_device)
+                        if placement_fn is not None:
+                            value = value.to(placement_fn(key, value.device))
                         state_dict[key] = value
                         optimized_count += 1
                         continue
@@ -345,6 +350,8 @@ def load_safetensors_with_fp8_optimization(
 
                 if not move_to_device:
                     quantized_weight = quantized_weight.to(original_device)
+                if placement_fn is not None:
+                    quantized_weight = quantized_weight.to(placement_fn(fp8_key, quantized_weight.device))
 
                 # keep scale shape: [1] or [out,1] or [out, num_blocks, 1]. We can determine the quantization mode from the shape of scale_weight in the patched model.
                 scale_tensor = scale_tensor.to(dtype=original_dtype, device=quantized_weight.device)

@@ -94,6 +94,7 @@ class ConvRotInt8Quantizer:
         weight_hook: Optional[callable] = None,
         disable_numpy_memmap: bool = False,
         weight_transform_hooks: Optional[WeightTransformHooks] = None,
+        placement_fn=None,
     ) -> dict:
         """Load state dict from safetensors files, quantizing target weights to ConvRot INT8.
 
@@ -116,6 +117,8 @@ class ConvRotInt8Quantizer:
 
                     if not self.is_target_key(key):
                         target_device = calc_device if (calc_device is not None and move_to_device) else original_device
+                        if placement_fn is not None:
+                            target_device = placement_fn(key, target_device)
                         state_dict[key] = value.to(target_device)
                         continue
 
@@ -135,6 +138,8 @@ class ConvRotInt8Quantizer:
                         # leave the layer unquantized (bf16)
                         if not move_to_device:
                             value = value.to(original_device)
+                        if placement_fn is not None:
+                            value = value.to(placement_fn(key, value.device))
                         state_dict[key] = value
                         continue
                     quantized_weight, scale_tensor = result
@@ -144,6 +149,8 @@ class ConvRotInt8Quantizer:
 
                     if not move_to_device:
                         quantized_weight = quantized_weight.to(original_device)
+                    if placement_fn is not None:
+                        quantized_weight = quantized_weight.to(placement_fn(key, quantized_weight.device))
 
                     # scale stays float32 [N, 1]: the Triton epilogue and the backward want fp32,
                     # and the shape maps 1:1 to ComfyUI's `weight_scale`

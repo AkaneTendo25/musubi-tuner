@@ -1,6 +1,6 @@
 import os
 import re
-from typing import Dict, List, Optional, Union
+from typing import Callable, Dict, List, Optional, Union
 import torch
 
 import logging
@@ -77,6 +77,7 @@ def load_safetensors_with_lora_and_fp8(
     allow_prequantized_fp8: bool = False,
     quantization_mode: str = "block",
     quantizer=None,
+    placement_fn: Optional[Callable[[str, torch.device], torch.device]] = None,
 ) -> dict[str, torch.Tensor]:
     """
     Merge LoRA weights into the state dict of a model with fp8 optimization if needed.
@@ -236,6 +237,7 @@ def load_safetensors_with_lora_and_fp8(
         allow_prequantized_fp8=allow_prequantized_fp8,
         quantization_mode=quantization_mode,
         quantizer=quantizer,
+        placement_fn=placement_fn,
     )
 
     for lora_weight_keys in list_of_lora_weight_keys:
@@ -262,6 +264,7 @@ def load_safetensors_with_fp8_optimization_and_hook(
     allow_prequantized_fp8: bool = False,
     quantization_mode: str = "block",
     quantizer=None,
+    placement_fn: Optional[Callable[[str, torch.device], torch.device]] = None,
 ) -> dict[str, torch.Tensor]:
     """
     Load state dict from safetensors files and merge LoRA weights into the state dict with fp8 optimization if needed.
@@ -276,6 +279,7 @@ def load_safetensors_with_fp8_optimization_and_hook(
             weight_hook=weight_hook,
             disable_numpy_memmap=disable_numpy_memmap,
             weight_transform_hooks=weight_transform_hooks,
+            placement_fn=placement_fn,
         )
     if fp8_optimization:
         logger.info(
@@ -293,6 +297,7 @@ def load_safetensors_with_fp8_optimization_and_hook(
             weight_transform_hooks=weight_transform_hooks,
             allow_prequantized_fp8=allow_prequantized_fp8,
             quantization_mode=quantization_mode,
+            placement_fn=placement_fn,
         )
     else:
         logger.info(
@@ -314,6 +319,8 @@ def load_safetensors_with_fp8_optimization_and_hook(
                         elif dit_weight_dtype is not None:
                             value = value.to(dit_weight_dtype)
 
+                    if placement_fn is not None:
+                        value = value.to(placement_fn(key, value.device))
                     state_dict[key] = value
         if move_to_device:
             synchronize_device(calc_device)

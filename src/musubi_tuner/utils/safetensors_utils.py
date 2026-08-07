@@ -126,6 +126,12 @@ class MemoryEfficientSafeOpen:
         """
         return self.header.get("__metadata__", {})
 
+    def tensor_dtype(self, key: str) -> torch.dtype:
+        """Return a tensor's dtype from the safetensors header without reading its payload."""
+        if key not in self.header or key == "__metadata__":
+            raise KeyError(f"Tensor '{key}' not found in the file")
+        return self._get_torch_dtype(self.header[key]["dtype"])
+
     def _read_header(self):
         """Read and parse the header from the safetensors file.
 

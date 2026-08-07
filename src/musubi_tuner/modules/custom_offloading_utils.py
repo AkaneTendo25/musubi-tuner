@@ -69,6 +69,27 @@ def weighs_to_device(layer: nn.Module, device: torch.device):
             module.weight.data = module.weight.data.to(device, non_blocking=device.type != "cpu")
 
 
+def compute_offload_block_indices(
+    num_blocks: int,
+    blocks_to_swap: int,
+    *,
+    h2d_only: bool,
+) -> tuple[int, ...]:
+    """Return the initial CPU-resident blocks for a block-swap policy.
+
+    Loaders use this same mapping to stream weights directly to their final
+    initial device, avoiding a full-model CPU staging copy before block swap is
+    configured.
+    """
+    if blocks_to_swap <= 0:
+        return ()
+    if blocks_to_swap > num_blocks:
+        raise ValueError(f"cannot offload {blocks_to_swap} of {num_blocks} blocks")
+    if h2d_only:
+        return tuple(sorted({((2 * index + 1) * num_blocks) // (2 * blocks_to_swap) for index in range(blocks_to_swap)}))
+    return tuple(range(num_blocks - blocks_to_swap, num_blocks))
+
+
 @dataclass
 class BlockSwapConfig:
     """
@@ -538,8 +559,23 @@ class ModelOffloader(Offloader):
 
         cpu_device = torch.device("cpu")
         for b in blocks[self.num_blocks - self.blocks_to_swap :]:
-            b.to(self.device)  # move block to device first. this makes sure that buffers (non weights) are on the device
-            weighs_to_device(b, cpu_device)  # make sure weights are on cpu
+            weighted_modules = [
+                module
+                for module in b.modules()
+                if hasattr(module, "weight") and module.weight is not None and module.__class__.__name__.endswith("Linear")
+            ]
+            parameters = [module.weight for module in weighted_modules]
+            if parameters and all(parameter.device.type == "cpu" for parameter in parameters):
+                for module in weighted_modules:
+                    module.weight = None
+                try:
+                    b.to(self.device)  # move buffers, norms, and biases without round-tripping streamed weights
+                finally:
+                    for module, parameter in zip(weighted_modules, parameters):
+                        module.weight = parameter
+            else:
+                b.to(self.device)
+                weighs_to_device(b, cpu_device)
 
         _synchronize_device(self.device)
         _clean_memory_on_device(self.device)
@@ -836,7 +872,7 @@ class LoRALinearStreamOffloader:
         self.use_pinned_memory = use_pinned_memory
         self.debug = debug
 
-        stream_blocks = sorted({((2 * i + 1) * num_blocks) // (2 * blocks_to_swap) for i in range(blocks_to_swap)})
+        stream_blocks = list(compute_offload_block_indices(num_blocks, blocks_to_swap, h2d_only=True))
         self.stream_blocks = set(stream_blocks)
         self.layers: list[nn.Linear] = []
         self.layer_names: list[str] = []
@@ -997,7 +1033,30 @@ class LoRALinearStreamOffloader:
             for block_index, block in enumerate(blocks):
                 if layer_rank == len(self.layers):
                     break
-                block.to(self.device)
+                streamed_modules = [module for module in block.modules() if module in self.layers]
+                payloads = []
+                all_streamed_payloads_cpu = bool(streamed_modules)
+                for module in streamed_modules:
+                    scale_weight = getattr(module, "scale_weight", None)
+                    tensors = (module.weight, module.bias, scale_weight)
+                    all_streamed_payloads_cpu &= all(tensor is None or tensor.device.type == "cpu" for tensor in tensors)
+                    payloads.append((module, *tensors))
+                if all_streamed_payloads_cpu:
+                    for module, _, _, _ in payloads:
+                        module.weight = None
+                        module.bias = None
+                        if "scale_weight" in module._buffers:
+                            module._buffers["scale_weight"] = None
+                    try:
+                        block.to(self.device)
+                    finally:
+                        for module, weight, bias, scale_weight in payloads:
+                            module.weight = weight
+                            module.bias = bias
+                            if "scale_weight" in module._buffers:
+                                module._buffers["scale_weight"] = scale_weight
+                else:
+                    block.to(self.device)
                 if block_index not in self.stream_blocks:
                     continue
                 for module in block.modules():
@@ -1104,7 +1163,7 @@ class LoRAStreamOffloader:
         assert device.type == "cuda", "LoRAStreamOffloader currently supports CUDA only"
 
         # ---- streaming placement: S evenly spaced block indices (midpoint formula -> distinct for S <= N) ----
-        stream_idx = sorted({((2 * i + 1) * num_blocks) // (2 * blocks_to_swap) for i in range(blocks_to_swap)})
+        stream_idx = list(compute_offload_block_indices(num_blocks, blocks_to_swap, h2d_only=True))
         self.stream_idx = stream_idx
         self.S = len(stream_idx)  # actual streaming count (>=1; dedup is a no-op unless S is close to N)
         self.rank = {b: k for k, b in enumerate(stream_idx)}  # block_idx -> position in stream_idx
@@ -1289,11 +1348,24 @@ class LoRAStreamOffloader:
                 continue
 
             if first_time:
-                # move the whole block to device (buffers, norms, bias), then pull the swap weights back to
-                # the CPU into one flat (pinned) buffer per block as the persistent masters
-                b.to(self.device)
                 mods = self._modules(i)
-                weights = [m.weight.data for m in mods]
+                parameters = [m.weight for m in mods]
+                weights = [parameter.data for parameter in parameters]
+                if all(weight.device.type == "cpu" for weight in weights):
+                    # A low-RAM loader can place streamed Linear weights directly
+                    # on CPU and everything else on the target device. Preserve
+                    # those weights while moving norms/biases/buffers, avoiding a
+                    # pointless full-block H2D followed immediately by D2H.
+                    for module in mods:
+                        module.weight = None
+                    try:
+                        b.to(self.device)
+                    finally:
+                        for module, parameter in zip(mods, parameters):
+                            module.weight = parameter
+                else:
+                    b.to(self.device)
+                    weights = [m.weight.data for m in mods]
                 if self._layout is None:
                     self._layout = self._compute_layout(weights)  # first streaming block defines the shared layout
                 flat = torch.empty(self._layout[1], dtype=torch.uint8, device=cpu_device)

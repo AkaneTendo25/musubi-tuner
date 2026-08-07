@@ -138,7 +138,12 @@ def _int8_linear_forward(module: nn.Linear, inputs: torch.Tensor) -> torch.Tenso
     return operation.apply(inputs, module.weight, module.scale_weight, module.bias, group_size)
 
 
-def load_comfy_int8_convrot_state_dict(checkpoint_path, *, device: torch.device) -> tuple[dict[str, torch.Tensor], int]:
+def load_comfy_int8_convrot_state_dict(
+    checkpoint_path,
+    *,
+    device: torch.device,
+    placement_fn=None,
+) -> tuple[dict[str, torch.Tensor], int]:
     state_dict: dict[str, torch.Tensor] = {}
     marker_config: dict[str, dict] = {}
     with MemoryEfficientSafeOpen(str(checkpoint_path)) as handle:
@@ -156,9 +161,7 @@ def load_comfy_int8_convrot_state_dict(checkpoint_path, *, device: torch.device)
 
         scale_bases = {key[: -len(".weight_scale")] for key in keys if key.endswith(".weight_scale")}
         weight_bases = {
-            key[: -len(".weight")]
-            for key in keys
-            if key.endswith(".weight") and handle.get_tensor(key).dtype is torch.int8
+            key[: -len(".weight")] for key in keys if key.endswith(".weight") and handle.tensor_dtype(key) is torch.int8
         }
         if not marker_config or set(marker_config) != scale_bases or set(marker_config) != weight_bases:
             raise ValueError(
@@ -173,20 +176,21 @@ def load_comfy_int8_convrot_state_dict(checkpoint_path, *, device: torch.device)
             if key.endswith(".weight_scale"):
                 base = key[: -len(".weight_scale")]
                 scale = value.float().reshape(-1, 1)
-                state_dict[f"{base}.scale_weight"] = scale.to(device)
+                scale_key = f"{base}.scale_weight"
+                target_device = placement_fn(scale_key, device) if placement_fn is not None else device
+                state_dict[scale_key] = scale.to(target_device)
                 state_dict[f"{base}.int8_convrot_groupsize"] = torch.tensor(
-                    int(marker_config[base]["convrot_groupsize"]), device=device, dtype=torch.int32
+                    int(marker_config[base]["convrot_groupsize"]), device=target_device, dtype=torch.int32
                 )
             else:
-                state_dict[key] = value.to(device)
+                target_device = placement_fn(key, device) if placement_fn is not None else device
+                state_dict[key] = value.to(target_device)
     return state_dict, len(marker_config)
 
 
 def prepare_int8_convrot_modules(model: nn.Module, state_dict: dict[str, torch.Tensor]) -> int:
     scale_shapes = {
-        key[: -len(".scale_weight")]: tuple(value.shape)
-        for key, value in state_dict.items()
-        if key.endswith(".scale_weight")
+        key[: -len(".scale_weight")]: tuple(value.shape) for key, value in state_dict.items() if key.endswith(".scale_weight")
     }
     registered = 0
     for name, module in model.named_modules():
