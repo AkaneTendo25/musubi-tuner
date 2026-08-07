@@ -576,6 +576,13 @@ class ImageDataset(BaseDataset):
         return self.batch_manager[idx]
 
 
+def _full_extraction_frame_count(frame_count: int, max_frames: int, base: int, stride: int) -> int | None:
+    bounded = min(frame_count, max_frames)
+    if bounded < base:
+        return None
+    return (bounded - base) // stride * stride + base
+
+
 class VideoDataset(BaseDataset):
     TARGET_FPS_HUNYUAN = 24.0
     TARGET_FPS_WAN = 16.0
@@ -648,7 +655,13 @@ class VideoDataset(BaseDataset):
         else:
             raise ValueError(f"Unsupported architecture: {self.architecture}")
 
-        if target_frames is not None:
+        # Full extraction derives a valid length from each source video. Its
+        # configured/default target_frames value is unused; rounding H3's
+        # generic default of 1 with base=5 previously produced the misleading
+        # sentinel -12 in logs.
+        if self.frame_extraction == "full":
+            target_frames = None
+        elif target_frames is not None:
             target_frames = list(set(target_frames))
             target_frames.sort()
 
@@ -773,11 +786,19 @@ class VideoDataset(BaseDataset):
                                     crop_pos_and_frames.append((i, target_frame))
                     elif self.frame_extraction == "full":
                         # select all frames
-                        target_frame = min(frame_count, self.max_frames)
-                        target_frame = (
-                            target_frame - self.vae_frame_base
-                        ) // self.vae_frame_stride * self.vae_frame_stride + self.vae_frame_base
-                        crop_pos_and_frames.append((0, target_frame))
+                        target_frame = _full_extraction_frame_count(
+                            frame_count,
+                            self.max_frames,
+                            self.vae_frame_base,
+                            self.vae_frame_stride,
+                        )
+                        if target_frame is not None:
+                            crop_pos_and_frames.append((0, target_frame))
+                        else:
+                            logger.warning(
+                                f"video {video_key} has {frame_count} frame(s), fewer than the minimum "
+                                f"{self.vae_frame_base} required by {self.architecture}; skipping"
+                            )
                     else:
                         raise ValueError(f"frame_extraction {self.frame_extraction} is not supported")
 
