@@ -424,6 +424,7 @@ class MiniMaxH3Transformer(nn.Module):
         self.activation_cpu_offloading = False
         self.blocks_to_swap = 0
         self.offloader = None
+        self.layer_streaming = False
 
     @property
     def device(self) -> torch.device:
@@ -472,6 +473,7 @@ class MiniMaxH3Transformer(nn.Module):
                 f"MiniMax H3 cannot swap more than {max_blocks_to_swap} of {num_blocks} blocks; requested {blocks_to_swap}"
             )
         self.blocks_to_swap = blocks_to_swap
+        self.layer_streaming = layer_streaming
         self.offloader = create_offloader(
             "minimax-h3-block",
             self.blocks,
@@ -487,6 +489,18 @@ class MiniMaxH3Transformer(nn.Module):
         self.to(device)
         if self.blocks_to_swap:
             self.blocks = saved_blocks
+            if self.layer_streaming:
+                self._move_layer_streaming_non_linears(device)
+
+    def _move_layer_streaming_non_linears(self, device: torch.device) -> None:
+        for block in self.blocks:
+            for module in block.modules():
+                if isinstance(module, nn.Linear):
+                    continue
+                for parameter in module.parameters(recurse=False):
+                    parameter.data = parameter.data.to(device)
+                for name, buffer in module.named_buffers(recurse=False):
+                    setattr(module, name, buffer.to(device))
 
     def offload_block_swap_to_cpu(self) -> None:
         """Evacuate the transformer, including the active swap ring, between sequential inference stages."""
@@ -504,6 +518,8 @@ class MiniMaxH3Transformer(nn.Module):
         if self.offloader is None:
             raise RuntimeError("MiniMax H3 block swap is enabled without an offloader")
         self.offloader.prepare_block_devices_before_forward(self.blocks)
+        if self.layer_streaming:
+            self._move_layer_streaming_non_linears(self.offloader.device)
 
     def switch_block_swap_for_inference(self) -> None:
         if self.blocks_to_swap:
@@ -532,7 +548,8 @@ class MiniMaxH3Transformer(nn.Module):
             return block(value, timestep_embedding, adaln_indices, rotary_emb, attention_mask)
 
         if self.activation_cpu_offloading:
-            forward = create_cpu_offloading_wrapper(forward, block.attn.qkv_proj.weight.device)
+            compute_device = self.offloader.device if self.layer_streaming else block.attn.qkv_proj.weight.device
+            forward = create_cpu_offloading_wrapper(forward, compute_device)
         return checkpoint(forward, hidden_states, use_reentrant=False)
 
     def _time_embedding(self, timestep: torch.Tensor) -> torch.Tensor:
