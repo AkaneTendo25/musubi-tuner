@@ -1950,6 +1950,22 @@ def test_h3_partial_checkpointing_rejects_compile():
         MiniMaxH3NetworkTrainer().handle_model_specific_args(args)
 
 
+def test_h3_pinned_activation_offload_requires_cpu_checkpoint_offload():
+    valid = create_parser().parse_args(
+        [
+            "--sdpa",
+            "--gradient_checkpointing",
+            "--gradient_checkpointing_cpu_offload",
+            "--h3_gradient_checkpointing_cpu_offload_pin_memory",
+        ]
+    )
+    MiniMaxH3NetworkTrainer().handle_model_specific_args(valid)
+
+    invalid = create_parser().parse_args(["--sdpa", "--h3_gradient_checkpointing_cpu_offload_pin_memory"])
+    with pytest.raises(ValueError, match="requires --gradient_checkpointing"):
+        MiniMaxH3NetworkTrainer().handle_model_specific_args(invalid)
+
+
 @pytest.mark.parametrize("option", ["--flash_attn", "--flash3"])
 def test_h3_trainer_accepts_flash_attention(option):
     args = create_parser().parse_args([option])

@@ -499,6 +499,13 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 raise ValueError("partial H3 gradient checkpointing cannot be combined with block swap")
             if checkpoint_blocks < 50 and args.compile:
                 raise ValueError("partial H3 gradient checkpointing cannot be combined with --compile")
+        if args.h3_gradient_checkpointing_cpu_offload_pin_memory and not (
+            args.gradient_checkpointing and args.gradient_checkpointing_cpu_offload
+        ):
+            raise ValueError(
+                "--h3_gradient_checkpointing_cpu_offload_pin_memory requires "
+                "--gradient_checkpointing and --gradient_checkpointing_cpu_offload"
+            )
         if args.block_swap_h2d_only and not args.use_pinned_memory_for_block_swap:
             logger.warning(
                 "MiniMax H3 H2D-only block swap without pinned host memory uses staged copies and can be substantially slower; "
@@ -522,6 +529,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
 
     def on_transformer_loaded(self, args, accelerator, transformer) -> None:
         transformer.set_gradient_checkpointing_blocks(args.h3_gradient_checkpointing_blocks)
+        transformer.set_activation_cpu_offload_pin_memory(args.h3_gradient_checkpointing_cpu_offload_pin_memory)
         if args.h3_fused_qk_norm_rope:
             transformer.enable_fused_qk_norm_rope()
             if args.compile:
@@ -1578,6 +1586,14 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         help=(
             "checkpoint only the last N of H3's 50 main blocks; default checkpoints all blocks. "
             "Lower values trade more VRAM for less recomputation and require resident eager blocks"
+        ),
+    )
+    parser.add_argument(
+        "--h3_gradient_checkpointing_cpu_offload_pin_memory",
+        action="store_true",
+        help=(
+            "pin H3 CPU-offloaded checkpoint activations for faster transfers; requires substantial non-pageable host RAM "
+            "and --gradient_checkpointing --gradient_checkpointing_cpu_offload"
         ),
     )
     parser.add_argument(

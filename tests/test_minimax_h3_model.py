@@ -199,6 +199,7 @@ def test_h3_checkpoint_input_cpu_offload_preserves_forward_and_gradients():
     offloaded.load_state_dict(reference.state_dict())
     reference.enable_gradient_checkpointing(False)
     offloaded.enable_gradient_checkpointing(True)
+    offloaded.set_activation_cpu_offload_pin_memory(True)
 
     reference_inputs = {key: value.cuda() for key, value in _tiny_inputs().items()}
     offloaded_inputs = {key: value.clone() for key, value in reference_inputs.items()}
@@ -220,6 +221,7 @@ def test_h3_checkpoint_input_cpu_offload_preserves_forward_and_gradients():
         offloaded.blocks[0].attn.qkv_proj.weight.grad,
         reference.blocks[0].attn.qkv_proj.weight.grad,
     )
+    assert offloaded.activation_cpu_offload_pin_memory
 
 
 def test_h3_partial_gradient_checkpointing_targets_last_blocks(monkeypatch):

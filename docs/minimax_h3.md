@@ -189,8 +189,9 @@ For Ref2VA, swap the checkpoint and add `--h3_training_mode ref2va` (or `ref2va_
 
 Adapters target attention and feed-forward projections; norms and timestep/modality calibration stay frozen. LoHa/LoKr are
 unsupported. Regional `torch.compile` covers all 50 main blocks and both text-refiner blocks; use `--compile` and optionally
-`--compile_auto_cache_size_limit`, `--compile_fallback_to_eager`, or `--inductor_config KEY=VALUE ...`. Reference media must be
-distinct from the target; the target is never reused as its own reference.
+`--compile_auto_cache_size_limit`, `--compile_fallback_to_eager`, or `--inductor_config KEY=VALUE ...`. GPU compilation requires
+a working Triton installation; on Windows, install a `triton-windows` build compatible with the installed PyTorch and Python
+versions.
 
 Watch progress with `tensorboard --logdir logs`. When training remotely, bind it to a protected interface or reach its loopback
 address through an SSH forward rather than exposing it publicly.
@@ -203,6 +204,7 @@ address through an SSH forward rather than exposing it publicly.
 | `--h3_attn_auto_dispatch` | off | Prefer cuDNN SDPA for large maskless workloads. Changes rounding; benchmark first. |
 | `--compile` | off | Regionally compile all H3 blocks with the selected backend/mode. Compatible with full gradient checkpointing and block swap; swapped Linear calls stay eager. |
 | `--h3_fused_qk_norm_rope` | off | Use the custom Triton Q/K RMSNorm+RoPE kernel outside compiled graphs. It is faster but changes BF16 rounding, so it is opt-in. |
+| `--h3_gradient_checkpointing_cpu_offload_pin_memory` | off | Pin CPU-offloaded checkpoint activations for faster transfers. Requires `--gradient_checkpointing --gradient_checkpointing_cpu_offload` and substantial free system RAM. |
 | `--h3_gradient_checkpointing_blocks N` | all 50 | Checkpoint only the last N main blocks. This explicit speed/VRAM trade-off requires `--gradient_checkpointing` and resident eager blocks. |
 | `--h3_shift_video` / `--h3_shift_audio` | `12.0` / `3.0` | Per-modality flow shift. Both derive from one shared coordinate, so changing one never desynchronizes the other. |
 | `--timestep_sampling` | `uniform` | Use `uniform`, `sigmoid`, or `logsnr`. The dynamic-shift modes double-shift the schedule and ignore H3's temporal extent. |
@@ -286,6 +288,9 @@ host. The number of swapped blocks therefore controls both host and device resid
 For the command above, loading the BF16 FL2VA checkpoint peaked at 21.09 GiB process RSS and left 3.02 GiB of model and swap
 buffers allocated on the GPU. These are loader figures, not total training requirements: activations, attention workspaces, LoRA
 parameters, gradients, and optimizer state are added according to the largest packed batch.
+
+Use `--h3_gradient_checkpointing_cpu_offload_pin_memory` only when the host has substantial free RAM. A 38.9k-row Ref2VA
+batch requires about 20–21 GiB of pinned RAM in addition to model-loading and dataset memory.
 
 ### Training modes
 

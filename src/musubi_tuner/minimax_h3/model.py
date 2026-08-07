@@ -421,6 +421,7 @@ class MiniMaxH3Transformer(nn.Module):
         self.gradient_checkpointing = False
         self.gradient_checkpointing_blocks: int | None = None
         self.activation_cpu_offloading = False
+        self.activation_cpu_offload_pin_memory = False
         self.blocks_to_swap = 0
         self.offloader = None
         self.layer_streaming = False
@@ -440,6 +441,9 @@ class MiniMaxH3Transformer(nn.Module):
     def disable_gradient_checkpointing(self) -> None:
         self.gradient_checkpointing = False
         self.activation_cpu_offloading = False
+
+    def set_activation_cpu_offload_pin_memory(self, enabled: bool) -> None:
+        self.activation_cpu_offload_pin_memory = bool(enabled)
 
     def set_gradient_checkpointing_blocks(self, blocks: int | None) -> None:
         if blocks is not None and not 0 <= blocks <= len(self.blocks):
@@ -552,7 +556,7 @@ class MiniMaxH3Transformer(nn.Module):
             # returning a CPU output would immediately copy that tensor back to
             # CUDA in the following block, adding a full D2H+H2D round trip per
             # layer without reducing the tensors retained for backward.
-            with torch.autograd.graph.save_on_cpu(pin_memory=False):
+            with torch.autograd.graph.save_on_cpu(pin_memory=self.activation_cpu_offload_pin_memory):
                 return checkpoint(forward, hidden_states, use_reentrant=False)
         return checkpoint(forward, hidden_states, use_reentrant=False)
 
