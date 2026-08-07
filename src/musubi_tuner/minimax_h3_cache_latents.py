@@ -17,33 +17,12 @@ from musubi_tuner.minimax_h3.dataset import attach_h3_media, create_h3_dataset_g
 logger = logging.getLogger(__name__)
 
 
-def parse_reference_scales(spec: str | None) -> tuple[float, ...] | None:
-    """Parse the reference scale spec into the fractions drawn per item."""
-    if not spec:
-        return None
-    scales = tuple(float(piece) for piece in spec.split(",") if piece.strip())
-    if not scales:
-        raise ValueError("--reference_scales must list at least one scale")
-    return scales
-
-
 def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     parser.description = "Cache MiniMax H3 latents with Musubi's dataset and cache pipeline"
     parser.add_argument(
         "--audio_vae",
         type=Path,
         help="H3 audio VAE checkpoint or Comfy model directory (required for videos, omitted for images)",
-    )
-    parser.add_argument(
-        "--reference_scales",
-        type=str,
-        default=None,
-        help=(
-            "comma-separated reference resolution scales drawn per item, for example '1.0,0.75,0.5'. Packed reference "
-            "rows fall roughly with the square of the scale, and H3's spatial rotary grid is area-normalized so a "
-            "smaller reference occupies the same coordinate field with fewer samples. Keep 1.0 in the list so the "
-            "released full-resolution presentation stays inside the training distribution"
-        ),
     )
     parser.set_defaults(vae_dtype="float32")
     return parser
@@ -83,7 +62,6 @@ def main(argv: Sequence[str] | None = None) -> None:
         audio_vae=args.audio_vae,
         device=str(device),
         dtype=args.vae_dtype or "float32",
-        reference_scales=parse_reference_scales(args.reference_scales),
     )
 
     def encode(batch: list[ItemInfo]) -> None:

@@ -1125,51 +1125,6 @@ def test_native_generator_selects_ref2va_checkpoint_contract(tmp_path):
     assert generator.mode == "ref2va"
 
 
-def test_h3_reference_scale_shrinks_the_prepared_size():
-    from musubi_tuner.minimax_h3.references import resolve_reference_video_size
-
-    full_h, full_w = resolve_reference_video_size(1920, 1080)
-    half_h, half_w = resolve_reference_video_size(1920, 1080, scale=0.5)
-
-    # Rows fall with the square of the scale, so halving the edge quarters them.
-    assert half_h * half_w == pytest.approx(full_h * full_w / 4, rel=0.05)
-    assert half_h % 32 == 0 and half_w % 32 == 0
-
-
-def test_h3_reference_scale_preserves_aspect_ratio():
-    from musubi_tuner.minimax_h3.references import resolve_reference_video_size
-
-    full_h, full_w = resolve_reference_video_size(1920, 1080)
-    half_h, half_w = resolve_reference_video_size(1920, 1080, scale=0.5)
-
-    assert (full_w / full_h) == pytest.approx(half_w / half_h, rel=0.05)
-
-
-@pytest.mark.parametrize("scale", [0.1, 1.5, 0.0])
-def test_h3_reference_scale_is_bounded(scale):
-    from musubi_tuner.minimax_h3.references import resolve_reference_video_size
-
-    with pytest.raises(ValueError, match=r"\[0.25, 1.0\]"):
-        resolve_reference_video_size(1920, 1080, scale=scale)
-
-
-def test_h3_reference_scale_defaults_to_the_released_size():
-    from musubi_tuner.minimax_h3.references import REFERENCE_VIDEO_SHORT_EDGE, resolve_reference_video_size
-
-    height, width = resolve_reference_video_size(1920, 1080)
-
-    assert min(height, width) == pytest.approx(REFERENCE_VIDEO_SHORT_EDGE, abs=32)
-
-
-def test_h3_reference_scale_spec_parsing():
-    from musubi_tuner.minimax_h3_cache_latents import parse_reference_scales
-
-    assert parse_reference_scales(None) is None
-    assert parse_reference_scales("1.0,0.75,0.5") == (1.0, 0.75, 0.5)
-    with pytest.raises(ValueError, match="at least one scale"):
-        parse_reference_scales(",")
-
-
 def test_h3_online_convrot_excludes_the_reduced_adaln():
     # The reduced AdaLN is tiny and its error is systematic across the whole
     # modulation curve, so it must stay out of the quantized set exactly as it

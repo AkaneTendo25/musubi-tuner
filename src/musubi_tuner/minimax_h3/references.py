@@ -86,39 +86,27 @@ def _multiple_size(width: float, height: float) -> tuple[int, int]:
     )
 
 
-def resolve_reference_image_size(width: int, height: int, *, scale: float = 1.0) -> tuple[int, int]:
+def resolve_reference_image_size(width: int, height: int) -> tuple[int, int]:
     if width <= 0 or height <= 0 or width > 4 * height or height > 4 * width:
         raise ValueError(f"H3 reference image must have a positive 1:4 to 4:1 aspect ratio, got {width}x{height}")
-    _validate_scale(scale)
-    resolved = REFERENCE_IMAGE_SHORT_EDGE * scale / min(width, height)
-    return _multiple_size(width * resolved, height * resolved)
+    scale = REFERENCE_IMAGE_SHORT_EDGE / min(width, height)
+    return _multiple_size(width * scale, height * scale)
 
 
-def resolve_reference_video_size(width: int, height: int, *, scale: float = 1.0) -> tuple[int, int]:
+def resolve_reference_video_size(width: int, height: int) -> tuple[int, int]:
     if width <= 0 or height <= 0 or width > 4 * height or height > 4 * width:
         raise ValueError(f"H3 reference video must have a positive 1:4 to 4:1 aspect ratio, got {width}x{height}")
-    _validate_scale(scale)
-    short_edge = REFERENCE_VIDEO_SHORT_EDGE * scale
     ratio = width / height
     if ratio >= 1:
-        resolved_width, resolved_height = short_edge * ratio, float(short_edge)
+        resolved_width, resolved_height = REFERENCE_VIDEO_SHORT_EDGE * ratio, float(REFERENCE_VIDEO_SHORT_EDGE)
     else:
-        resolved_width, resolved_height = float(short_edge), short_edge / ratio
+        resolved_width, resolved_height = float(REFERENCE_VIDEO_SHORT_EDGE), REFERENCE_VIDEO_SHORT_EDGE / ratio
     area = resolved_width * resolved_height
-    limit = REFERENCE_VIDEO_MAX_PIXELS * scale * scale
-    if area > limit:
-        shrink = math.sqrt(limit / area)
-        resolved_width *= shrink
-        resolved_height *= shrink
+    if area > REFERENCE_VIDEO_MAX_PIXELS:
+        scale = math.sqrt(REFERENCE_VIDEO_MAX_PIXELS / area)
+        resolved_width *= scale
+        resolved_height *= scale
     return _multiple_size(resolved_width, resolved_height)
-
-
-def _validate_scale(scale: float) -> None:
-    # H3's spatial rotary grid is area-normalized, so a reference occupies the
-    # same coordinate field at any resolution and only its sampling density
-    # changes. Scaling below a quarter leaves too few patches to carry identity.
-    if not 0.25 <= scale <= 1.0:
-        raise ValueError(f"H3 reference scale must lie in [0.25, 1.0], got {scale}")
 
 
 def _decode_video(path: Path) -> tuple[np.ndarray, float]:
@@ -153,20 +141,20 @@ def resample_reference_frames(frames: np.ndarray, source_fps: float) -> np.ndarr
     return np.repeat(frames, repeats, axis=0)
 
 
-def _prepare_image(asset: MediaAsset, scale: float = 1.0) -> Image.Image:
+def _prepare_image(asset: MediaAsset) -> Image.Image:
     with Image.open(asset.path) as source:
         image = ImageOps.exif_transpose(source).convert("RGB")
-        height, width = resolve_reference_image_size(*image.size, scale=scale)
+        height, width = resolve_reference_image_size(*image.size)
         if image.size != (width, height):
             image = image.resize((width, height), Image.Resampling.LANCZOS)
         return image.copy()
 
 
-def _prepare_video(asset: MediaAsset, target_frames: int, scale: float = 1.0) -> np.ndarray:
+def _prepare_video(asset: MediaAsset, target_frames: int) -> np.ndarray:
     frames, source_fps = _decode_video(asset.path)
     frames = resample_reference_frames(frames, source_fps)
     frames = frames[:target_frames]
-    height, width = resolve_reference_video_size(frames.shape[2], frames.shape[1], scale=scale)
+    height, width = resolve_reference_video_size(frames.shape[2], frames.shape[1])
     if frames.shape[1:3] != (height, width):
         frames = np.stack(
             [np.asarray(Image.fromarray(frame).resize((width, height), Image.Resampling.LANCZOS)) for frame in frames]
@@ -212,7 +200,7 @@ def trim_reference_frames(frame_count: int) -> int:
     return max(1, (frame_count - 5) // 17) * 17 + 5
 
 
-def prepare_references(item: Any, *, scale: float = 1.0) -> tuple[H3PreparedReference, ...]:
+def prepare_references(item: Any) -> tuple[H3PreparedReference, ...]:
     assets = reference_assets(item)
     target_frames = int(getattr(item, "frame_count", 0) or getattr(item, "content", np.empty((0,))).shape[0])
     if target_frames <= 0:
@@ -225,12 +213,12 @@ def prepare_references(item: Any, *, scale: float = 1.0) -> tuple[H3PreparedRefe
     for asset in assets:
         kind = _kind(asset)
         if kind is H3ReferenceKind.IMAGE:
-            prepared.append(H3PreparedReference(kind=kind, image=_prepare_image(asset, scale)))
+            prepared.append(H3PreparedReference(kind=kind, image=_prepare_image(asset)))
         elif kind is H3ReferenceKind.VIDEO:
             prepared.append(
                 H3PreparedReference(
                     kind=kind,
-                    frames=_prepare_video(asset, target_frames, scale),
+                    frames=_prepare_video(asset, target_frames),
                     waveform=_prepare_audio(asset, target_frames),
                 )
             )

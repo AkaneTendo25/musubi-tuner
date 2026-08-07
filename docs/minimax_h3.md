@@ -323,18 +323,6 @@ cost of intra-block noise levels the released weights have not seen. The observe
 `(1, 2, 2)` patch grid and a patch counts as generated when any latent inside it is, so at small latent resolutions a wide
 fraction range can leave nothing observed.
 
-### Reference cost
-
-References enter the sequence twice — as transformer rows and as Qwen vision tokens — so a large reference is expensive in both
-attention and feed-forward terms. `--reference_scales` draws a per-item reference resolution at caching time:
-
-```shell
-python minimax_h3_cache_latents.py ... --reference_scales 1.0,0.75,0.5
-```
-
-Keep `1.0` in the list: generation always prepares references at full resolution, so an adapter trained only on smaller ones would
-meet a presentation it never saw. Scales are bounded to `[0.25, 1.0]`.
-
 ### Auxiliary objectives
 
 Each adds a full no-gradient forward over the whole packed sequence — roughly `1.25×` a plain step for one, `1.5×` for both. This

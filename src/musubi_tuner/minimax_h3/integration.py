@@ -79,14 +79,13 @@ def create_latent_encoder(
     audio_vae: Path | None,
     device: str | None,
     dtype: str,
-    reference_scales: tuple[float, ...] = (1.0,),
 ):
     """Load the released video VAE and the optional target/reference audio VAE."""
     target_device = torch.device(device or "cpu")
     output_dtype = str_to_dtype(dtype)
     video_encoder = load_video_vae_encoder(video_vae, target_device) if video_vae is not None else None
     audio_encoder = load_audio_vae_encoder(audio_vae, target_device) if audio_vae is not None else None
-    return _NativeLatentEncoder(video_encoder, audio_encoder, output_dtype, reference_scales)
+    return _NativeLatentEncoder(video_encoder, audio_encoder, output_dtype)
 
 
 def create_conditioning_encoder(
@@ -1030,14 +1029,10 @@ class _NativeLatentEncoder:
         video_encoder: torch.nn.Module | None,
         audio_encoder: torch.nn.Module | None,
         output_dtype: torch.dtype,
-        reference_scales: tuple[float, ...] = (1.0,),
     ) -> None:
         self.video_encoder = video_encoder
         self.audio_encoder = audio_encoder
         self.output_dtype = output_dtype
-        if not reference_scales:
-            raise ValueError("H3 reference scales must contain at least one value")
-        self.reference_scales = tuple(float(scale) for scale in reference_scales)
 
     @staticmethod
     def _target_asset(item: Any):
@@ -1095,14 +1090,7 @@ class _NativeLatentEncoder:
         return latents.to(self.output_dtype)
 
     def _encode_references(self, item: Any) -> dict[str, torch.Tensor]:
-        # Reference resolution is drawn per item. H3's spatial rotary grid is
-        # area-normalized, so a smaller reference occupies the same coordinate
-        # field with fewer samples rather than a different one, and packed rows
-        # fall roughly with the square of the scale. Drawing a range rather than
-        # fixing one keeps the released full-resolution presentation inside the
-        # training distribution, so the adapter still meets it at inference.
-        scale = self.reference_scales[int(torch.randint(0, len(self.reference_scales), (1,)).item())]
-        references = prepare_references(item, scale=scale)
+        references = prepare_references(item)
         if not references:
             return {}
         video_rows: list[torch.Tensor] = []
