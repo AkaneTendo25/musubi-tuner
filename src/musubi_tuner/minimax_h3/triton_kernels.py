@@ -192,6 +192,121 @@ if HAS_TRITON:
         dx = inverse * grad_normalized - values * (inverse * inverse * inverse / dim) * dot
         tl.store(grad_x + row * dim + offsets, dx, mask=mask)
 
+    @triton.jit
+    def _combined_qk_fwd(
+        q,
+        k,
+        qw,
+        kw,
+        cos,
+        sin,
+        qo,
+        ko,
+        qinv,
+        kinv,
+        stride_b,
+        stride_s,
+        stride_h,
+        stride_d,
+        stride_cs,
+        stride_cd,
+        sequence: tl.constexpr,
+        heads: tl.constexpr,
+        dim: tl.constexpr,
+        rotary_dim: tl.constexpr,
+        eps: tl.constexpr,
+        block: tl.constexpr,
+    ):
+        row = tl.program_id(0)
+        h = row % heads
+        s = (row // heads) % sequence
+        b = row // (heads * sequence)
+        offsets = tl.arange(0, block)
+        mask = offsets < dim
+        base = b * stride_b + s * stride_s + h * stride_h
+        qv = tl.load(q + base + offsets * stride_d, mask=mask, other=0.0).to(tl.float32)
+        kv = tl.load(k + base + offsets * stride_d, mask=mask, other=0.0).to(tl.float32)
+        qweight = tl.load(qw + offsets, mask=mask, other=0.0).to(tl.float32)
+        kweight = tl.load(kw + offsets, mask=mask, other=0.0).to(tl.float32)
+        qi = tl.rsqrt(tl.sum(qv * qv, axis=0) / dim + eps)
+        ki = tl.rsqrt(tl.sum(kv * kv, axis=0) / dim + eps)
+        qn = qv * qi * qweight
+        kn = kv * ki * kweight
+        half = rotary_dim // 2
+        partner_offsets = tl.where(offsets < half, offsets + half, offsets - half)
+        qp = tl.load(q + base + partner_offsets * stride_d, mask=offsets < rotary_dim, other=0.0).to(tl.float32)
+        kp = tl.load(k + base + partner_offsets * stride_d, mask=offsets < rotary_dim, other=0.0).to(tl.float32)
+        qpw = tl.load(qw + partner_offsets, mask=offsets < rotary_dim, other=0.0).to(tl.float32)
+        kpw = tl.load(kw + partner_offsets, mask=offsets < rotary_dim, other=0.0).to(tl.float32)
+        qp = qp * qi * qpw
+        kp = kp * ki * kpw
+        cv = tl.load(cos + s * stride_cs + offsets * stride_cd, mask=offsets < rotary_dim, other=1.0)
+        sv = tl.load(sin + s * stride_cs + offsets * stride_cd, mask=offsets < rotary_dim, other=0.0)
+        qr = tl.where(offsets < half, -qp, qp)
+        kr = tl.where(offsets < half, -kp, kp)
+        tl.store(qo + row * dim + offsets, tl.where(offsets < rotary_dim, qn * cv + qr * sv, qn), mask=mask)
+        tl.store(ko + row * dim + offsets, tl.where(offsets < rotary_dim, kn * cv + kr * sv, kn), mask=mask)
+        tl.store(qinv + row, qi)
+        tl.store(kinv + row, ki)
+
+    @triton.jit
+    def _combined_qk_bwd(
+        qgo,
+        kgo,
+        q,
+        k,
+        qw,
+        kw,
+        cos,
+        sin,
+        qinv,
+        kinv,
+        qgx,
+        kgx,
+        stride_b,
+        stride_s,
+        stride_h,
+        stride_d,
+        stride_cs,
+        stride_cd,
+        sequence: tl.constexpr,
+        heads: tl.constexpr,
+        dim: tl.constexpr,
+        rotary_dim: tl.constexpr,
+        block: tl.constexpr,
+    ):
+        row = tl.program_id(0)
+        h = row % heads
+        s = (row // heads) % sequence
+        b = row // (heads * sequence)
+        offsets = tl.arange(0, block)
+        mask = offsets < dim
+        half = rotary_dim // 2
+        partner_offsets = tl.where(offsets < half, offsets + half, offsets - half)
+        qg = tl.load(qgo + row * dim + offsets, mask=mask, other=0.0).to(tl.float32)
+        kg = tl.load(kgo + row * dim + offsets, mask=mask, other=0.0).to(tl.float32)
+        qpg = tl.load(qgo + row * dim + partner_offsets, mask=offsets < rotary_dim, other=0.0).to(tl.float32)
+        kpg = tl.load(kgo + row * dim + partner_offsets, mask=offsets < rotary_dim, other=0.0).to(tl.float32)
+        cv = tl.load(cos + s * stride_cs + offsets * stride_cd, mask=offsets < rotary_dim, other=1.0)
+        psv = tl.load(sin + s * stride_cs + partner_offsets * stride_cd, mask=offsets < rotary_dim, other=0.0)
+        qrg = tl.where(offsets < half, qg * cv + qpg * psv, qg * cv - qpg * psv)
+        krg = tl.where(offsets < half, kg * cv + kpg * psv, kg * cv - kpg * psv)
+        qrg = tl.where(offsets < rotary_dim, qrg, qg)
+        krg = tl.where(offsets < rotary_dim, krg, kg)
+        base = b * stride_b + s * stride_s + h * stride_h
+        qv = tl.load(q + base + offsets * stride_d, mask=mask, other=0.0).to(tl.float32)
+        kv = tl.load(k + base + offsets * stride_d, mask=mask, other=0.0).to(tl.float32)
+        qweight = tl.load(qw + offsets, mask=mask, other=0.0).to(tl.float32)
+        kweight = tl.load(kw + offsets, mask=mask, other=0.0).to(tl.float32)
+        qi = tl.load(qinv + row)
+        ki = tl.load(kinv + row)
+        qgn = qrg * qweight
+        kgn = krg * kweight
+        qdot = tl.sum(qgn * qv, axis=0)
+        kdot = tl.sum(kgn * kv, axis=0)
+        tl.store(qgx + row * dim + offsets, qi * qgn - qv * (qi * qi * qi / dim) * qdot, mask=mask)
+        tl.store(kgx + row * dim + offsets, ki * kgn - kv * (ki * ki * ki / dim) * kdot, mask=mask)
+
 
 class _FusedRMSNormSplitRoPE(torch.autograd.Function):
     @staticmethod
@@ -245,6 +360,70 @@ class _FusedRMSNormSplitRoPE(torch.autograd.Function):
         return grad_x, None, None, None, None
 
 
+class _CombinedFusedQKRMSNormSplitRoPE(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, query, key, q_weight, k_weight, cos, sin, eps):
+        batch, sequence, heads, dim = query.shape
+        rows = batch * sequence * heads
+        query_output = torch.empty_like(query)
+        key_output = torch.empty_like(key)
+        query_inv_rms = torch.empty(rows, device=query.device, dtype=torch.float32)
+        key_inv_rms = torch.empty_like(query_inv_rms)
+        block = triton.next_power_of_2(dim)
+        _combined_qk_fwd[(rows,)](
+            query,
+            key,
+            q_weight,
+            k_weight,
+            cos,
+            sin,
+            query_output,
+            key_output,
+            query_inv_rms,
+            key_inv_rms,
+            *query.stride(),
+            *cos.stride(),
+            sequence=sequence,
+            heads=heads,
+            dim=dim,
+            rotary_dim=cos.shape[-1],
+            eps=float(eps),
+            block=block,
+        )
+        ctx.save_for_backward(query, key, q_weight, k_weight, cos, sin, query_inv_rms, key_inv_rms)
+        ctx.block = block
+        return query_output, key_output
+
+    @staticmethod
+    def backward(ctx, query_grad_output, key_grad_output):
+        query, key, q_weight, k_weight, cos, sin, query_inv_rms, key_inv_rms = ctx.saved_tensors
+        batch, sequence, heads, dim = query.shape
+        query_grad = torch.empty_like(query)
+        key_grad = torch.empty_like(key)
+        _combined_qk_bwd[(batch * sequence * heads,)](
+            query_grad_output.contiguous(),
+            key_grad_output.contiguous(),
+            query,
+            key,
+            q_weight,
+            k_weight,
+            cos,
+            sin,
+            query_inv_rms,
+            key_inv_rms,
+            query_grad,
+            key_grad,
+            *query.stride(),
+            *cos.stride(),
+            sequence=sequence,
+            heads=heads,
+            dim=dim,
+            rotary_dim=cos.shape[-1],
+            block=ctx.block,
+        )
+        return query_grad, key_grad, None, None, None, None, None
+
+
 def try_fused_qk_norm_rope(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -278,6 +457,8 @@ def try_fused_qk_norm_rope(
     if not _LOGGED:
         logger.info("MiniMax H3: using fused Triton Q/K RMSNorm + split RoPE")
         _LOGGED = True
+    if query.stride() == key.stride():
+        return _CombinedFusedQKRMSNormSplitRoPE.apply(query, key, q_weight, k_weight, cos, sin, eps)
     return (
         _FusedRMSNormSplitRoPE.apply(query, q_weight, cos, sin, eps),
         _FusedRMSNormSplitRoPE.apply(key, k_weight, cos, sin, eps),
