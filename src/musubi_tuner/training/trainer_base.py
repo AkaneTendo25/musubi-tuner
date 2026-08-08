@@ -57,6 +57,7 @@ from musubi_tuner.training.accelerator_setup import (
     collator_class,
     prepare_accelerator,
 )
+from musubi_tuner.training.resume_utils import recover_global_step
 from musubi_tuner.training.sampling_prompts import should_sample_images
 from musubi_tuner.training.validation import ValidationEventDeduplicator, should_validate, validate_validation_args
 from musubi_tuner.training.timesteps import (
@@ -451,14 +452,20 @@ class NetworkTrainer:
             **lr_scheduler_kwargs,
         )
 
-    def resume_from_local_or_hf_if_specified(self, accelerator: Accelerator, args: argparse.Namespace) -> bool:
+    @staticmethod
+    def recover_global_step(state_dir: str) -> int:
+        return recover_global_step(state_dir)
+
+    def resume_from_local_or_hf_if_specified(self, accelerator: Accelerator, args: argparse.Namespace) -> int:
         if not args.resume:
-            return False
+            self._resume_state_dir = None
+            return 0
 
         if not args.resume_from_huggingface:
             logger.info(f"resume training from local state: {args.resume}")
             accelerator.load_state(args.resume)
-            return True
+            self._resume_state_dir = args.resume
+            return self.recover_global_step(args.resume)
 
         logger.info(f"resume training from huggingface state: {args.resume}")
         repo_id = args.resume.split("/")[0] + "/" + args.resume.split("/")[1]
@@ -502,8 +509,9 @@ class NetworkTrainer:
             )
         dirname = os.path.dirname(results[0])
         accelerator.load_state(dirname)
+        self._resume_state_dir = dirname
 
-        return True
+        return self.recover_global_step(dirname)
 
     def get_bucketed_timestep(self) -> float:
         if self.num_timestep_buckets is None or self.num_timestep_buckets <= 1:
@@ -1399,7 +1407,7 @@ class NetworkTrainer:
             dit_dtype,
             dit_weight_dtype,
         )
-        self._register_hooks_and_resume(args, accelerator, network)
+        initial_global_step = self._register_hooks_and_resume(args, accelerator, network)
         self._run_training_loop(
             args,
             accelerator,
@@ -1422,6 +1430,7 @@ class NetworkTrainer:
             sample_parameters,
             dit_dtype,
             network_dtype,
+            initial_global_step=initial_global_step,
         )
 
     def _validate_args_and_init(self, args) -> bool:
@@ -1809,8 +1818,7 @@ class NetworkTrainer:
         accelerator.register_save_state_pre_hook(save_model_hook)
         accelerator.register_load_state_pre_hook(load_model_hook)
 
-        # resume from local or huggingface. accelerator.step is set
-        self.resume_from_local_or_hf_if_specified(accelerator, args)  # accelerator.load_state(args.resume)
+        return self.resume_from_local_or_hf_if_specified(accelerator, args)
 
     def _run_training_loop(
         self,
@@ -1835,6 +1843,7 @@ class NetworkTrainer:
         sample_parameters,
         dit_dtype,
         network_dtype,
+        initial_global_step=0,
     ):
         is_main_process = accelerator.is_main_process
 
@@ -1964,11 +1973,31 @@ class NetworkTrainer:
                 init_kwargs=init_kwargs,
             )
 
-        # TODO skip until initial step
-        progress_bar = tqdm(range(args.max_train_steps), smoothing=0, disable=not accelerator.is_local_main_process, desc="steps")
+        resume_metadata = None
+        resume_state_dir = getattr(self, "_resume_state_dir", None)
+        if initial_global_step > 0 and resume_state_dir is not None:
+            resume_metadata = train_utils.load_resume_metadata(resume_state_dir)
 
-        epoch_to_start = 0
-        global_step = 0
+        epoch_to_start, steps_to_skip_in_epoch = train_utils.get_resume_position(
+            initial_global_step,
+            num_update_steps_per_epoch,
+            resume_metadata,
+        )
+
+        global_step = initial_global_step
+        progress_bar = tqdm(
+            total=args.max_train_steps,
+            initial=initial_global_step,
+            smoothing=0,
+            disable=not accelerator.is_local_main_process,
+            desc="steps",
+        )
+        if initial_global_step > 0:
+            message = f"  resuming from step {initial_global_step}, epoch {epoch_to_start + 1}/{num_train_epochs}"
+            if steps_to_skip_in_epoch > 0:
+                message += f", skipping {steps_to_skip_in_epoch} batches in epoch"
+            accelerator.print(message)
+
         noise_scheduler = FlowMatchDiscreteScheduler(shift=args.discrete_flow_shift, reverse=True, solver="euler")
 
         loss_recorder = train_utils.LossRecorder()
@@ -2062,7 +2091,7 @@ class NetworkTrainer:
 
         # Validation intentionally precedes sampling when both run at startup.
         should_validate_at_start = should_validate(args, global_step, epoch=0, at_start=True)
-        should_sample_at_start = should_sample_images(args, global_step, epoch=0)
+        should_sample_at_start = global_step == 0 and should_sample_images(args, global_step, epoch=0)
         if should_validate_at_start or should_sample_at_start:
             optimizer_eval_fn()
             if should_validate_at_start:
@@ -2072,7 +2101,7 @@ class NetworkTrainer:
             optimizer_train_fn()
         if len(accelerator.trackers) > 0:
             # log empty object to commit the sample images to wandb
-            accelerator.log({}, step=0)
+            accelerator.log({}, step=global_step)
 
         # training loop
 
@@ -2087,7 +2116,19 @@ class NetworkTrainer:
 
         optimizer_train_fn()  # Set training mode
 
+        last_epoch = epoch_to_start
+        last_step_in_epoch = 0
+        if resume_metadata is not None:
+            try:
+                if int(resume_metadata.get("global_step", 0)) > 0:
+                    last_epoch = int(resume_metadata.get("epoch", last_epoch))
+                    last_step_in_epoch = int(resume_metadata.get("step_in_epoch", 0))
+            except (TypeError, ValueError):
+                last_epoch = epoch_to_start
+                last_step_in_epoch = 0
         for epoch in range(epoch_to_start, num_train_epochs):
+            if global_step >= args.max_train_steps:
+                break
             accelerator.print(f"\nepoch {epoch + 1}/{num_train_epochs}")
             current_epoch.value = epoch + 1
 
@@ -2096,6 +2137,10 @@ class NetworkTrainer:
             accelerator.unwrap_model(network).on_epoch_start(transformer)
 
             for step, batch in enumerate(train_dataloader):
+                if steps_to_skip_in_epoch > 0:
+                    steps_to_skip_in_epoch -= 1
+                    continue
+
                 # torch.compiler.cudagraph_mark_step_begin() # for cudagraphs
 
                 latents = self.get_primary_latents(batch)
@@ -2183,7 +2228,13 @@ class NetworkTrainer:
                                 save_model(ckpt_name, accelerator.unwrap_model(network), global_step, epoch)
 
                                 if args.save_state:
-                                    train_utils.save_and_remove_state_stepwise(args, accelerator, global_step)
+                                    train_utils.save_and_remove_state_stepwise(
+                                        args,
+                                        accelerator,
+                                        global_step,
+                                        epoch=epoch + 1,
+                                        step_in_epoch=step + 1,
+                                    )
 
                                 remove_step_no = train_utils.get_remove_step_no(args, global_step)
                                 if remove_step_no is not None:
@@ -2209,8 +2260,14 @@ class NetworkTrainer:
                     logs.update(self.extra_step_logs(args, logs))
                     accelerator.log(logs, step=global_step)
 
+                last_epoch = epoch + 1
+                last_step_in_epoch = step + 1
+
                 if global_step >= args.max_train_steps:
                     break
+
+            if last_epoch == epoch + 1 and last_step_in_epoch >= len(train_dataloader):
+                last_step_in_epoch = 0
 
             if len(accelerator.trackers) > 0:
                 logs = {"loss/epoch": loss_recorder.moving_average}
@@ -2232,7 +2289,13 @@ class NetworkTrainer:
                         remove_model(remove_ckpt_name)
 
                     if args.save_state:
-                        train_utils.save_and_remove_state_on_epoch_end(args, accelerator, epoch + 1)
+                        train_utils.save_and_remove_state_on_epoch_end(
+                            args,
+                            accelerator,
+                            epoch + 1,
+                            global_step=global_step,
+                            step_in_epoch=0,
+                        )
 
             _do_validation(epoch + 1, global_step)
             _do_sample(epoch + 1, global_step)
@@ -2250,7 +2313,13 @@ class NetworkTrainer:
         optimizer_eval_fn()
 
         if is_main_process and (args.save_state or args.save_state_on_train_end):
-            train_utils.save_state_on_train_end(args, accelerator)
+            train_utils.save_state_on_train_end(
+                args,
+                accelerator,
+                global_step=global_step,
+                epoch=last_epoch,
+                step_in_epoch=last_step_in_epoch,
+            )
 
         if is_main_process:
             ckpt_name = train_utils.get_last_ckpt_name(args.output_name)
