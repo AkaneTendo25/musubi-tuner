@@ -19,9 +19,15 @@ from musubi_tuner.minimax_h3.model import MiniMaxH3Transformer, MiniMaxH3Transfo
 from musubi_tuner.minimax_h3.model_loader import (
     H3_FP8_OPTIMIZATION_EXCLUDE_KEYS,
     H3_FP8_OPTIMIZATION_TARGET_KEYS,
+    _merge_base_loras_into_int8_state_dict,
+    _validate_base_lora_matches,
     build_block_swap_placement,
     resolve_transformer_checkpoint,
     validate_transformer_checkpoint,
+)
+from musubi_tuner.modules.convrot_int8_kernels import (
+    dequantize_int8_convrot_weight,
+    quantize_int8_convrot_weight,
 )
 from musubi_tuner.modules.custom_offloading_utils import BlockSwapConfig
 from musubi_tuner.modules.fp8_optimization_utils import apply_fp8_monkey_patch, optimize_state_dict_with_fp8
@@ -44,6 +50,71 @@ def _tiny_config(*, num_layers: int = 2) -> MiniMaxH3TransformerConfig:
         time_embed_dim=16,
         rope_freq_dim=2,
     )
+
+
+def test_h3_base_lora_merge_requantizes_each_int8_layer_once(monkeypatch):
+    torch.manual_seed(7)
+    group_size = 4
+    model_key = "blocks.0.attn.qkv_proj.weight"
+    lora_name = "lora_unet_blocks_0_attn_qkv_proj"
+    base = torch.randn(8, 8)
+    quantized, scale = quantize_int8_convrot_weight(base, group_size)
+    state_dict = {
+        model_key: quantized,
+        "blocks.0.attn.qkv_proj.scale_weight": scale,
+        "blocks.0.attn.qkv_proj.int8_convrot_groupsize": torch.tensor(group_size),
+    }
+    first = {
+        f"{lora_name}.lora_down.weight": torch.randn(2, 8),
+        f"{lora_name}.lora_up.weight": torch.randn(8, 2),
+        f"{lora_name}.alpha": torch.tensor(1.0),
+    }
+    second = {
+        f"{lora_name}.lora_down.weight": torch.randn(3, 8),
+        f"{lora_name}.lora_up.weight": torch.randn(8, 3),
+    }
+    dequantized_base = dequantize_int8_convrot_weight(quantized, scale, group_size).float()
+    expected = dequantized_base.clone()
+    expected.addmm_(first[f"{lora_name}.lora_up.weight"], first[f"{lora_name}.lora_down.weight"], alpha=0.25)
+    expected.addmm_(second[f"{lora_name}.lora_up.weight"], second[f"{lora_name}.lora_down.weight"], alpha=1.5)
+
+    calls = 0
+    original_quantize = h3_model_loader.quantize_int8_convrot_weight
+
+    def counted_quantize(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original_quantize(*args, **kwargs)
+
+    monkeypatch.setattr(h3_model_loader, "quantize_int8_convrot_weight", counted_quantize)
+    matched, requantized = _merge_base_loras_into_int8_state_dict(
+        state_dict,
+        [first, second],
+        [0.5, 1.5],
+        calc_device=torch.device("cpu"),
+    )
+    actual = dequantize_int8_convrot_weight(
+        state_dict[model_key],
+        state_dict["blocks.0.attn.qkv_proj.scale_weight"],
+        group_size,
+    ).float()
+
+    assert matched == [1, 1]
+    assert requantized == calls == 1
+    assert state_dict[model_key].dtype is torch.int8
+    torch.testing.assert_close(actual, expected, rtol=0.03, atol=0.04)
+
+
+def test_h3_base_lora_validation_rejects_unpaired_and_unmatched_weights():
+    model_keys = {"blocks.0.mlp.fc1.weight"}
+    name = "lora_unet_blocks_0_mlp_fc1"
+    with pytest.raises(ValueError, match="missing paired"):
+        _validate_base_lora_matches(model_keys, [{f"{name}.lora_down.weight": torch.ones(2, 2)}])
+    with pytest.raises(ValueError, match="did not match"):
+        _validate_base_lora_matches(
+            model_keys,
+            [{"lora_unet_blocks_9_mlp_fc1.lora_down.weight": torch.ones(2, 2), "unused": torch.ones(1)}],
+        )
 
 
 def test_h3_low_ram_block_swap_placement_matches_offloader_policy():

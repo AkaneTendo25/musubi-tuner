@@ -150,8 +150,12 @@ def prepare_joint_noisy_inputs(
     audio_sigma_expanded = _expand_batch_values(audio_sigma, audio_latents) if audio_latents is not None else None
 
     return H3JointNoisyInputs(
-        video=(1.0 - video_sigma_expanded) * video_latents + video_sigma_expanded * video_noise if video_latents is not None else None,
-        audio=(1.0 - audio_sigma_expanded) * audio_latents + audio_sigma_expanded * audio_noise if audio_latents is not None else None,
+        video=(1.0 - video_sigma_expanded) * video_latents + video_sigma_expanded * video_noise
+        if video_latents is not None
+        else None,
+        audio=(1.0 - audio_sigma_expanded) * audio_latents + audio_sigma_expanded * audio_noise
+        if audio_latents is not None
+        else None,
         video_target=video_latents - video_noise if video_latents is not None else None,
         audio_target=audio_latents - audio_noise if audio_latents is not None else None,
         video_sigma=video_sigma,
@@ -164,8 +168,9 @@ def prepare_joint_noisy_inputs(
 def guidance_consistent_prediction(
     guided: H3ModelPrediction,
     empty: H3ModelPrediction,
-    guidance_scale: float,
+    guidance_scale: float | torch.Tensor,
     *,
+    audio_guidance_scale: float | torch.Tensor | None = None,
     detach_empty: bool = True,
 ) -> H3ModelPrediction:
     """Estimate the raw conditional field from a guidance-distilled prediction.
@@ -173,8 +178,13 @@ def guidance_consistent_prediction(
     With ``g = u + s * (c - u)`` and ``g(empty) ~= u``, this returns
     ``c_hat = (g + (s - 1) * g(empty)) / s``.
     """
-    if guidance_scale < 1.0:
-        raise ValueError("H3 guidance distillation scale must be at least 1")
+    audio_guidance_scale = guidance_scale if audio_guidance_scale is None else audio_guidance_scale
+    for scale in (guidance_scale, audio_guidance_scale):
+        if isinstance(scale, torch.Tensor):
+            if bool((scale < 1.0).any()):
+                raise ValueError("H3 guidance distillation scale must be at least 1")
+        elif scale < 1.0:
+            raise ValueError("H3 guidance distillation scale must be at least 1")
     if (guided.video is None) != (empty.video is None) or (guided.audio is None) != (empty.audio is None):
         raise ValueError("H3 prompt and empty predictions must contain the same modalities")
     if guided.video is not None and guided.video.shape != empty.video.shape:
@@ -183,10 +193,55 @@ def guidance_consistent_prediction(
         raise ValueError("H3 prompt and empty audio predictions must have matching shapes")
     empty_video = empty.video.detach() if detach_empty and empty.video is not None else empty.video
     empty_audio = empty.audio.detach() if detach_empty and empty.audio is not None else empty.audio
-    empty_weight = guidance_scale - 1.0
+    video_scale = (
+        _expand_batch_values(guidance_scale, guided.video)
+        if isinstance(guidance_scale, torch.Tensor) and guided.video is not None
+        else guidance_scale
+    )
+    audio_scale = (
+        _expand_batch_values(audio_guidance_scale, guided.audio)
+        if isinstance(audio_guidance_scale, torch.Tensor) and guided.audio is not None
+        else audio_guidance_scale
+    )
     return H3ModelPrediction(
-        video=(guided.video + empty_weight * empty_video) / guidance_scale if guided.video is not None else None,
-        audio=(guided.audio + empty_weight * empty_audio) / guidance_scale if guided.audio is not None else None,
+        video=(guided.video + (video_scale - 1.0) * empty_video) / video_scale if guided.video is not None else None,
+        audio=(guided.audio + (audio_scale - 1.0) * empty_audio) / audio_scale if guided.audio is not None else None,
+    )
+
+
+def guidance_scale_for_sigma(configured_scale: float, sigma: torch.Tensor, schedule: str) -> torch.Tensor:
+    """Resolve the per-example guidance scale for one H3 modality."""
+    if configured_scale < 1.0:
+        raise ValueError("H3 guidance distillation scale must be at least 1")
+    if schedule == "constant":
+        return torch.full_like(sigma, configured_scale)
+    if schedule == "sigma":
+        return 1.0 + (configured_scale - 1.0) * sigma
+    raise ValueError(f"unsupported H3 guidance loss schedule: {schedule}")
+
+
+def contrastive_guidance_target(
+    target: H3ModelPrediction,
+    empty: H3ModelPrediction,
+    guidance_scale: float | torch.Tensor,
+    *,
+    audio_guidance_scale: float | torch.Tensor | None = None,
+) -> H3ModelPrediction:
+    """Construct the guided-field target equivalent to the normalized objective."""
+    audio_guidance_scale = guidance_scale if audio_guidance_scale is None else audio_guidance_scale
+    video_scale = (
+        _expand_batch_values(guidance_scale, target.video)
+        if isinstance(guidance_scale, torch.Tensor) and target.video is not None
+        else guidance_scale
+    )
+    audio_scale = (
+        _expand_batch_values(audio_guidance_scale, target.audio)
+        if isinstance(audio_guidance_scale, torch.Tensor) and target.audio is not None
+        else audio_guidance_scale
+    )
+    return H3ModelPrediction(
+        video=(empty.video + video_scale * (target.video - empty.video)) if target.video is not None else None,
+        audio=(empty.audio + audio_scale * (target.audio - empty.audio)) if target.audio is not None else None,
     )
 
 

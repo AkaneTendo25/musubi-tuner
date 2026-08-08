@@ -195,6 +195,8 @@ def create_training_backend(
     blocks_to_swap: int = 0,
     block_swap_h2d_only: bool = False,
     low_ram_load: bool = True,
+    base_lora_weights: list[dict[str, torch.Tensor]] | None = None,
+    base_lora_multipliers: list[float] | None = None,
 ) -> H3TrainingBackend:
     """Load only the transformer required for cache-backed LoRA training.
 
@@ -231,4 +233,9 @@ def create_training_backend(
         **({} if blocks_to_swap == 0 else {"blocks_to_swap": blocks_to_swap}),
         **({} if not block_swap_h2d_only else {"block_swap_h2d_only": True}),
         **({} if low_ram_load else {"low_ram_load": False}),
+        **(
+            {}
+            if not base_lora_weights
+            else {"base_lora_weights": base_lora_weights, "base_lora_multipliers": base_lora_multipliers}
+        ),
     )

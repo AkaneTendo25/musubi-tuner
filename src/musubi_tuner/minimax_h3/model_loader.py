@@ -25,6 +25,7 @@ from musubi_tuner.minimax_h3.model import MiniMaxH3TimeEmbedder, MiniMaxH3Transf
 from musubi_tuner.minimax_h3.training import H3TrainingMode
 from musubi_tuner.minimax_h3.weights import CheckpointInspectionError, tensor_metadata
 from musubi_tuner.modules.convrot_int8_utils import ConvRotInt8Quantizer, apply_convrot_int8_monkey_patch
+from musubi_tuner.modules.convrot_int8_kernels import dequantize_int8_convrot_weight, quantize_int8_convrot_weight
 from musubi_tuner.modules.fp8_optimization_utils import apply_fp8_monkey_patch
 from musubi_tuner.modules.custom_offloading_utils import compute_offload_block_indices
 from musubi_tuner.utils.lora_utils import load_safetensors_with_lora_and_fp8
@@ -65,6 +66,120 @@ _FP32_PREFIXES = (
 # weight-only quantization implementations also convert the main-block AdaLN linears.
 H3_FP8_OPTIMIZATION_TARGET_KEYS = ["blocks."]
 H3_FP8_OPTIMIZATION_EXCLUDE_KEYS = ["token_refiner", "norm"]
+
+
+def _lora_name_for_model_weight(model_weight_key: str) -> str:
+    return "lora_unet_" + model_weight_key[: -len(".weight")].replace(".", "_")
+
+
+def _validate_base_lora_matches(
+    model_keys: set[str],
+    lora_weights_list: list[dict[str, torch.Tensor]],
+) -> list[int]:
+    matched_counts = []
+    model_weight_keys = [key for key in model_keys if key.endswith(".weight")]
+    for index, lora_weights in enumerate(lora_weights_list):
+        matched = 0
+        for model_weight_key in model_weight_keys:
+            lora_name = _lora_name_for_model_weight(model_weight_key)
+            down_key = f"{lora_name}.lora_down.weight"
+            up_key = f"{lora_name}.lora_up.weight"
+            has_down = down_key in lora_weights
+            has_up = up_key in lora_weights
+            if has_down != has_up:
+                missing = up_key if has_down else down_key
+                raise ValueError(f"MiniMax H3 base LoRA #{index + 1} is missing paired tensor {missing!r}")
+            matched += int(has_down)
+        if matched == 0:
+            raise ValueError(
+                f"MiniMax H3 base LoRA #{index + 1} did not match any transformer weights; expected Musubi lora_unet_* keys"
+            )
+        matched_counts.append(matched)
+    return matched_counts
+
+
+@torch.no_grad()
+def _merge_base_loras_into_int8_state_dict(
+    state_dict: dict[str, torch.Tensor],
+    lora_weights_list: list[dict[str, torch.Tensor]],
+    lora_multipliers: list[float] | None,
+    *,
+    calc_device: torch.device,
+) -> tuple[list[int], int]:
+    """Merge generic base LoRAs and requantize each affected ConvRot layer once."""
+    matched_counts = _validate_base_lora_matches(set(state_dict), lora_weights_list)
+    multipliers = list(lora_multipliers or [])
+    multipliers.extend([1.0] * (len(lora_weights_list) - len(multipliers)))
+    multipliers = multipliers[: len(lora_weights_list)]
+    remaining_keys = [set(weights) for weights in lora_weights_list]
+    requantized_layers = 0
+
+    for model_weight_key, model_weight in tuple(state_dict.items()):
+        if not model_weight_key.endswith(".weight"):
+            continue
+        lora_name = _lora_name_for_model_weight(model_weight_key)
+        matches = []
+        for index, lora_weights in enumerate(lora_weights_list):
+            down_key = f"{lora_name}.lora_down.weight"
+            up_key = f"{lora_name}.lora_up.weight"
+            if down_key in lora_weights and up_key in lora_weights:
+                matches.append((index, down_key, up_key, f"{lora_name}.alpha"))
+        if not matches:
+            continue
+
+        if model_weight.dtype is not torch.int8:
+            raise TypeError(f"MiniMax H3 INT8 base LoRA target {model_weight_key!r} is not INT8")
+        base = model_weight_key[: -len(".weight")]
+        scale_key = f"{base}.scale_weight"
+        group_size_key = f"{base}.int8_convrot_groupsize"
+        if scale_key not in state_dict or group_size_key not in state_dict:
+            raise ValueError(f"INT8 ConvRot base LoRA target {model_weight_key!r} is missing scale or group size")
+        original_device = model_weight.device
+        group_size = int(state_dict[group_size_key].detach().cpu().item())
+        merged_weight = dequantize_int8_convrot_weight(
+            model_weight.to(calc_device),
+            state_dict[scale_key].to(calc_device),
+            group_size,
+        ).float()
+
+        for index, down_key, up_key, alpha_key in matches:
+            lora_weights = lora_weights_list[index]
+            down = lora_weights[down_key].to(device=calc_device, dtype=torch.float32)
+            up = lora_weights[up_key].to(device=calc_device, dtype=torch.float32)
+            if down.ndim == 4 and down.shape[2:] == (1, 1):
+                down = down.squeeze(3).squeeze(2)
+            if up.ndim == 4 and up.shape[2:] == (1, 1):
+                up = up.squeeze(3).squeeze(2)
+            if down.ndim != 2 or up.ndim != 2:
+                raise ValueError(
+                    f"MiniMax H3 base LoRA supports linear weights, got {down_key}={tuple(down.shape)} "
+                    f"and {up_key}={tuple(up.shape)}"
+                )
+            if up.shape[1] != down.shape[0] or (up.shape[0], down.shape[1]) != tuple(merged_weight.shape):
+                raise ValueError(
+                    f"MiniMax H3 base LoRA shape mismatch for {model_weight_key}: base={tuple(merged_weight.shape)}, "
+                    f"down={tuple(down.shape)}, up={tuple(up.shape)}"
+                )
+            rank = int(down.shape[0])
+            alpha_tensor = lora_weights.get(alpha_key)
+            alpha = float(alpha_tensor.detach().float().cpu().item()) if alpha_tensor is not None else float(rank)
+            merged_weight.addmm_(up, down, beta=1.0, alpha=multipliers[index] * alpha / rank)
+            remaining_keys[index].difference_update((down_key, up_key, alpha_key))
+
+        quantized, scale = quantize_int8_convrot_weight(merged_weight, group_size)
+        state_dict[model_weight_key] = quantized.to(original_device)
+        state_dict[scale_key] = scale.to(state_dict[scale_key].device)
+        requantized_layers += 1
+
+    for index, unused in enumerate(remaining_keys):
+        if unused:
+            logger.warning(
+                "MiniMax H3 base LoRA #%d has %d unused tensor(s); examples: %s",
+                index + 1,
+                len(unused),
+                sorted(unused)[:8],
+            )
+    return matched_counts, requantized_layers
 
 
 def build_block_swap_placement(
@@ -224,6 +339,8 @@ def load_transformer(
     blocks_to_swap: int = 0,
     block_swap_h2d_only: bool = False,
     low_ram_load: bool = True,
+    base_lora_weights: list[dict[str, torch.Tensor]] | None = None,
+    base_lora_multipliers: list[float] | None = None,
 ) -> MiniMaxH3Transformer:
     checkpoint_path = resolve_transformer_checkpoint(source, mode, int8_convrot=int8_convrot)
     config = infer_transformer_config(checkpoint_path)
@@ -272,6 +389,9 @@ def load_transformer(
 
     device = torch.device(loading_device)
     calc_device = torch.device(quantization_device) if quantization_device is not None else device
+    base_lora_weights = list(base_lora_weights or [])
+    if base_lora_weights:
+        _validate_base_lora_matches(set(model.state_dict()), base_lora_weights)
     placement_fn = None
     offloaded_blocks: tuple[int, ...] = ()
     resolved_target_device = torch.device(target_device) if target_device is not None else calc_device
@@ -293,6 +413,19 @@ def load_transformer(
             device=device,
             placement_fn=placement_fn,
         )
+        if base_lora_weights:
+            matched_counts, requantized_layers = _merge_base_loras_into_int8_state_dict(
+                state_dict,
+                base_lora_weights,
+                base_lora_multipliers,
+                calc_device=calc_device,
+            )
+            logger.info(
+                "Merged %d MiniMax H3 base LoRA(s) into %d module(s), requantizing %d INT8 ConvRot layer(s)",
+                len(base_lora_weights),
+                sum(matched_counts),
+                requantized_layers,
+            )
         registered_layers = prepare_int8_convrot_modules(model, state_dict)
         if registered_layers != quantized_layers:
             raise RuntimeError(f"prepared {registered_layers} INT8 modules for {quantized_layers} checkpoint layers")
@@ -310,8 +443,8 @@ def load_transformer(
         )
         state_dict = load_safetensors_with_lora_and_fp8(
             model_files=str(checkpoint_path),
-            lora_weights_list=None,
-            lora_multipliers=None,
+            lora_weights_list=base_lora_weights,
+            lora_multipliers=base_lora_multipliers,
             fp8_optimization=fp8_scaled,
             quantizer=quantizer,
             calc_device=calc_device,

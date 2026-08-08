@@ -239,6 +239,10 @@ To train against the released pre-quantized transformer instead, pass it with `-
 accelerate launch minimax_h3_train_network.py   --dit /models/MiniMax-H3/diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors   --int8_convrot_base --sdpa --mixed_precision bf16   --dataset_config dataset.toml   --network_module networks.lora_minimax_h3   --network_dim 16 --network_alpha 16
 ```
 
+Generic LoRAs passed through `--base_weights` are merged while H3 loads. With a pre-quantized ConvRot base, only affected layers
+are dequantized, all requested LoRAs and `--base_weights_multiplier` values are accumulated in FP32, and each layer is
+requantized once. The resulting frozen base is then used for ordinary LoRA training.
+
 `--h3_adaln_rank` is more faithful than quantizing those projections and composes with either quantization. It is rejected on
 already-pruned and INT8 ConvRot checkpoints.
 
@@ -331,7 +335,9 @@ matters most for Ref2VA, where the enlarged sequence is re-processed every pass.
 | Option | Purpose |
 | --- | --- |
 | `--h3_guidance_distillation_scale 3` | Guidance-consistent objective using cached empty-text conditioning. `--h3_guidance_loss_form` selects `normalized` or `contrastive`; both share an optimum, but contrastive is `scale²` larger. |
+| `--h3_guidance_loss_schedule {sigma,constant}` | `sigma` (default) scales guidance from `1` at the clean endpoint to the configured value at maximum noise, independently for video and audio. `constant` retains the configured scale everywhere. |
 | `--h3_base_preservation_loss_weight 0.05` | Penalizes drift from the frozen base's prediction. Anchors to whichever base is loaded, quantized or not. |
+| `--crepa` | Temporal representation alignment for video training. |
 
 The H3 base-preservation/distillation-loss technique was proposed by [@Ada123-a](https://github.com/Ada123-a). Ada's community
 experiments reported weights around `0.05`–`0.10` with guidance scale `3`. Treat these only as starting points: the appropriate
@@ -339,7 +345,6 @@ weight also depends on training length, as well as quantization, rank, dataset, 
 short run can anchor a long run too strongly to the frozen model and eventually prevent the adapter from learning the dataset.
 Monitor training and validation samples, and reduce or disable the weight when preservation begins to dominate; changing it when
 resuming training is supported.
-| `--crepa` | Temporal representation alignment for video training. |
 
 CREPA aligns projected features from an earlier block with a later block (`mode=backbone`) or with frozen DINOv2 features
 (`mode=dino`). Only generated video rows participate; image, audio-only, and video-observed batches are skipped.

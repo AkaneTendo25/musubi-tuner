@@ -15,7 +15,9 @@ from pathlib import Path
 import torch
 from accelerate import Accelerator
 from PIL import Image
+from safetensors.torch import load_file
 
+from musubi_tuner import convert_lora
 from musubi_tuner.dataset import config_utils
 from musubi_tuner.dataset.architectures import ARCHITECTURE_MINIMAX_H3, ARCHITECTURE_MINIMAX_H3_FULL
 from musubi_tuner.hv_train import get_sigmas
@@ -55,7 +57,9 @@ from musubi_tuner.minimax_h3.inference import (
 )
 from musubi_tuner.minimax_h3.training import (
     H3ModelPrediction,
+    contrastive_guidance_target,
     guidance_consistent_prediction,
+    guidance_scale_for_sigma,
     joint_prediction_loss,
     joint_velocity_loss,
     prepare_joint_noisy_inputs,
@@ -160,6 +164,21 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
     @property
     def architecture_full_name(self) -> str:
         return ARCHITECTURE_MINIMAX_H3_FULL
+
+    def convert_weight_keys(self, weights_sd: dict[str, torch.Tensor], network_module):
+        del network_module
+        if not weights_sd:
+            return weights_sd
+        first_key = next(iter(weights_sd))
+        if first_key.startswith("lora_"):
+            return weights_sd
+        if first_key.startswith(("diffusion_model.", "transformer.")):
+            logger.info("Converting MiniMax H3 base LoRA weights from Diffusers format")
+            return convert_lora.convert_from_diffusers("lora_unet_", weights_sd)
+        return weights_sd
+
+    def load_network_weights(self, path: str, network_module_name: str) -> dict[str, torch.Tensor]:
+        return self.convert_weight_keys(load_file(path), network_module_name)
 
     def _build_dataset(self, args):
         if args.num_timestep_buckets is not None:
@@ -344,33 +363,30 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                         conditioning="prompt",
                         gradient_checkpointing=False,
                     )
-                    guidance_multiplier = 1.0
                     if args.h3_guidance_distillation_scale is not None:
-                        prediction = guidance_consistent_prediction(
-                            prediction, empty_prediction, args.h3_guidance_distillation_scale
-                        )
-                        if args.h3_guidance_loss_form == "contrastive":
-                            guidance_multiplier = args.h3_guidance_distillation_scale**2
+                        prediction, loss_inputs = self._guidance_loss_inputs(args, prediction, empty_prediction, inputs)
+                    else:
+                        loss_inputs = inputs
 
                     sample_weight = self._sample_weight(
                         args, inputs.audio_sigma if observed == "video" or not has_video else inputs.video_sigma
                     )
-                    if prediction.video is not None and inputs.video_target is not None and video_weight > 0:
+                    if prediction.video is not None and loss_inputs.video_target is not None and video_weight > 0:
                         total, count = masked_squared_error_sum(
                             prediction.video,
-                            inputs.video_target,
+                            loss_inputs.video_target,
                             batch.get("video_loss_mask"),
                             sample_weight=sample_weight,
                         )
-                        accumulator.add(sigma_bin.index, "video", total * guidance_multiplier, count)
-                    if prediction.audio is not None and inputs.audio_target is not None and audio_weight > 0:
+                        accumulator.add(sigma_bin.index, "video", total, count)
+                    if prediction.audio is not None and loss_inputs.audio_target is not None and audio_weight > 0:
                         total, count = masked_squared_error_sum(
                             prediction.audio,
-                            inputs.audio_target,
+                            loss_inputs.audio_target,
                             batch.get("audio_loss_mask"),
                             sample_weight=sample_weight,
                         )
-                        accumulator.add(sigma_bin.index, "audio", total * guidance_multiplier, count)
+                        accumulator.add(sigma_bin.index, "audio", total, count)
 
         reduced = accelerator.reduce(accumulator.reduction_tensor(device=accelerator.device), reduction="sum")
         accumulator.load_reduced_tensor(reduced)
@@ -770,7 +786,12 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
     ):
         if args.fp8_base and dit_weight_dtype is not None:
             raise ValueError("MiniMax H3 scaled FP8 loading requires dit_weight_dtype=None")
-        self.backend = create_training_backend(
+        base_weight_paths = list(getattr(args, "base_weights", None) or [])
+        base_lora_weights = [self.load_network_weights(path, "musubi_tuner.networks.lora_minimax_h3") for path in base_weight_paths]
+        base_lora_multipliers = list(getattr(args, "base_weights_multiplier", None) or [])
+        base_lora_multipliers.extend([1.0] * (len(base_lora_weights) - len(base_lora_multipliers)))
+        base_lora_multipliers = base_lora_multipliers[: len(base_lora_weights)]
+        backend_kwargs = dict(
             model=Path(dit_path),
             device=str(loading_device),
             dtype=model_utils.dtype_to_str(self.dit_dtype),
@@ -789,11 +810,19 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             blocks_to_swap=int(getattr(args, "blocks_to_swap", 0) or 0),
             block_swap_h2d_only=bool(getattr(args, "block_swap_h2d_only", False)),
         )
+        if base_lora_weights:
+            backend_kwargs["base_lora_weights"] = base_lora_weights
+            backend_kwargs["base_lora_multipliers"] = base_lora_multipliers
+        self.backend = create_training_backend(**backend_kwargs)
         transformer = self.backend.get_training_transformer()
         if not isinstance(transformer, torch.nn.Module):
             raise TypeError("H3 backend get_training_transformer() must return a torch.nn.Module")
         if args.h3_attn_auto_dispatch:
             transformer.enable_attention_auto_dispatch()
+        if base_weight_paths:
+            args.base_weights = None
+            args.base_weights_multiplier = None
+            accelerator.print("all H3 base weights merged during model loading: " + ", ".join(base_weight_paths))
         return transformer
 
     def compile_transformer(self, args, transformer):
@@ -996,6 +1025,36 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         if args.weighting_scheme == "cosmap":
             return 2.0 / (math.pi * (1.0 - 2.0 * sigma + 2.0 * sigma.square()))
         return None
+
+    @staticmethod
+    def _guidance_loss_inputs(args, prediction, empty_prediction, inputs):
+        video_scale = guidance_scale_for_sigma(
+            args.h3_guidance_distillation_scale,
+            inputs.video_sigma,
+            args.h3_guidance_loss_schedule,
+        )
+        audio_scale = guidance_scale_for_sigma(
+            args.h3_guidance_distillation_scale,
+            inputs.audio_sigma,
+            args.h3_guidance_loss_schedule,
+        )
+        if args.h3_guidance_loss_form == "contrastive":
+            target = contrastive_guidance_target(
+                H3ModelPrediction(inputs.video_target, inputs.audio_target),
+                empty_prediction,
+                video_scale,
+                audio_guidance_scale=audio_scale,
+            )
+            return prediction, replace(inputs, video_target=target.video, audio_target=target.audio)
+        return (
+            guidance_consistent_prediction(
+                prediction,
+                empty_prediction,
+                video_scale,
+                audio_guidance_scale=audio_scale,
+            ),
+            inputs,
+        )
 
     def _predict(
         self,
@@ -1235,8 +1294,9 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 self._crepa.clear_step()
             raise
         prediction = raw_prediction
+        loss_inputs = inputs
         if use_guidance:
-            prediction = guidance_consistent_prediction(prediction, empty_prediction, args.h3_guidance_distillation_scale)
+            prediction, loss_inputs = self._guidance_loss_inputs(args, prediction, empty_prediction, inputs)
 
         sample_weight = self._sample_weight(
             args, inputs.audio_sigma if observed == "video" or not has_video else inputs.video_sigma
@@ -1245,7 +1305,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         audio_weight = 0.0 if observed == "audio" else args.h3_audio_loss_weight
         result = joint_velocity_loss(
             prediction,
-            inputs,
+            loss_inputs,
             # The observed context is given, not predicted, so it carries no
             # training signal and would otherwise dominate a short continuation.
             video_mask=self._mask_to_loss(
@@ -1270,17 +1330,9 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             video_weight=video_weight,
             audio_weight=audio_weight,
         )
-        # normalized:  MSE((g + (s - 1)u) / s, target)
-        # contrastive: MSE(g, u + s(target - u))
-        # The objectives have the same optimum and gradient direction. The
-        # contrastive loss is exactly s^2 larger, so scaling the normalized
-        # result reproduces it without another forward or target allocation.
-        guidance_loss_multiplier = 1.0
-        if use_guidance and args.h3_guidance_loss_form == "contrastive":
-            guidance_loss_multiplier = args.h3_guidance_distillation_scale**2
         metrics = {
-            "loss/video": float((result.video_loss * guidance_loss_multiplier).detach()),
-            "loss/audio": float((result.audio_loss * guidance_loss_multiplier).detach()),
+            "loss/video": float(result.video_loss.detach()),
+            "loss/audio": float(result.audio_loss.detach()),
             "h3/sigma_video": float(inputs.video_sigma.mean().detach()),
             "h3/sigma_audio": float(inputs.audio_sigma.mean().detach()),
         }
@@ -1288,7 +1340,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             # Only reported when the feature is on, so an existing run's metric
             # set is unchanged.
             metrics["h3/caption_dropped"] = float(conditioning == "empty")
-        loss = result.loss * guidance_loss_multiplier
+        loss = result.loss
         if reference_prediction is not None:
             preservation = joint_prediction_loss(
                 raw_prediction,
@@ -1333,6 +1385,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             "ss_h3_image_flow_shift": str(args.h3_image_flow_shift or "resolution_aware"),
             "ss_h3_guidance_distillation_scale": str(args.h3_guidance_distillation_scale or "one_pass"),
             "ss_h3_guidance_loss_form": args.h3_guidance_loss_form,
+            "ss_h3_guidance_loss_schedule": args.h3_guidance_loss_schedule,
             "ss_h3_caption_dropout_rate": str(args.h3_caption_dropout_rate),
             "ss_h3_fp8_quantization_mode": args.h3_fp8_quantization_mode,
             "ss_h3_convrot_int8": str(args.h3_convrot_int8),
@@ -1515,6 +1568,15 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         help=(
             "normalized applies flow loss to the reconstructed conditional field; contrastive applies the equivalent "
             "scale-squared loss magnitude of a direct extrapolated target"
+        ),
+    )
+    parser.add_argument(
+        "--h3_guidance_loss_schedule",
+        choices=("sigma", "constant"),
+        default="sigma",
+        help=(
+            "sigma uses effective_scale = 1 + (configured_scale - 1) * modality_sigma; "
+            "constant applies the configured guidance scale at every noise level"
         ),
     )
     parser.add_argument(

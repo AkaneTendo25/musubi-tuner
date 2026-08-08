@@ -51,7 +51,9 @@ from musubi_tuner.minimax_h3.training import (
     OBSERVED_AUDIO_SIGMA,
     OBSERVED_VIDEO_SIGMA,
     H3ModelPrediction,
+    contrastive_guidance_target,
     guidance_consistent_prediction,
+    guidance_scale_for_sigma,
     joint_prediction_loss,
     joint_velocity_loss,
     map_sigma_between_shifts,
@@ -1222,6 +1224,31 @@ def test_guidance_consistent_prediction_reconstructs_conditional_and_stops_empty
     assert unconditional_audio.grad is None
 
 
+def test_h3_guidance_schedule_and_modality_specific_targets():
+    sigma = torch.tensor([0.0, 0.25, 1.0])
+    torch.testing.assert_close(guidance_scale_for_sigma(3.0, sigma, "sigma"), torch.tensor([1.0, 1.5, 3.0]))
+    torch.testing.assert_close(guidance_scale_for_sigma(3.0, sigma, "constant"), torch.full_like(sigma, 3.0))
+    with pytest.raises(ValueError, match="schedule"):
+        guidance_scale_for_sigma(3.0, sigma, "unknown")
+
+    target = H3ModelPrediction(torch.tensor([[2.0], [4.0]]), torch.tensor([[3.0], [5.0]]))
+    empty = H3ModelPrediction(torch.tensor([[1.0], [1.0]]), torch.tensor([[2.0], [2.0]]))
+    guided = contrastive_guidance_target(
+        target,
+        empty,
+        torch.tensor([1.0, 2.0]),
+        audio_guidance_scale=torch.tensor([2.0, 3.0]),
+    )
+    reconstructed = guidance_consistent_prediction(
+        guided,
+        empty,
+        torch.tensor([1.0, 2.0]),
+        audio_guidance_scale=torch.tensor([2.0, 3.0]),
+    )
+    torch.testing.assert_close(reconstructed.video, target.video)
+    torch.testing.assert_close(reconstructed.audio, target.audio)
+
+
 def test_joint_loss_masks_audio_padding_and_supports_both_balances():
     video = torch.zeros(1, 1, 1, 1, 2)
     audio = torch.zeros(1, 1, 1, 3)
@@ -1755,11 +1782,13 @@ def test_h3_trainer_base_preservation_replays_rng_and_restores_network():
     assert transformer.scale.grad is not None and torch.isfinite(transformer.scale.grad)
 
 
-def test_h3_contrastive_guidance_form_is_scale_squared_larger():
+@pytest.mark.parametrize("schedule", ["constant", "sigma"])
+def test_h3_contrastive_guidance_form_is_scale_squared_larger(schedule):
     def run(form):
         args = create_parser().parse_args([])
         args.h3_guidance_distillation_scale = 3.0
         args.h3_guidance_loss_form = form
+        args.h3_guidance_loss_schedule = schedule
         trainer = MiniMaxH3NetworkTrainer()
         trainer.dit_dtype = torch.float32
         trainer.backend = _FakeBackend()
@@ -1790,8 +1819,11 @@ def test_h3_contrastive_guidance_form_is_scale_squared_larger():
     normalized_loss, normalized_metrics = run("normalized")
     contrastive_loss, contrastive_metrics = run("contrastive")
 
-    torch.testing.assert_close(contrastive_loss, normalized_loss * 9.0)
-    assert contrastive_metrics["loss/video"] == pytest.approx(normalized_metrics["loss/video"] * 9.0)
+    effective_scale = 3.0
+    if schedule == "sigma":
+        effective_scale = 1.0 + 2.0 * normalized_metrics["h3/sigma_video"]
+    torch.testing.assert_close(contrastive_loss, normalized_loss * effective_scale**2)
+    assert contrastive_metrics["loss/video"] == pytest.approx(normalized_metrics["loss/video"] * effective_scale**2)
 
 
 def test_h3_trainer_image_process_batch_uses_resolution_schedule_without_audio():
@@ -1914,6 +1946,45 @@ def test_h3_trainer_loads_only_the_selected_training_transformer(monkeypatch, tm
         "blocks_to_swap": 0,
         "block_swap_h2d_only": False,
     }
+
+
+def test_h3_trainer_routes_base_loras_through_model_loading(monkeypatch, tmp_path):
+    transformer = nn.Linear(2, 2)
+    captured = {}
+    messages = []
+    lora_state = {"lora_unet_blocks_0_mlp_fc1.lora_down.weight": torch.ones(1, 2)}
+
+    def create_backend(**kwargs):
+        captured.update(kwargs)
+        return _TrainingBackend(transformer)
+
+    monkeypatch.setattr(h3_train_network, "create_training_backend", create_backend)
+    trainer = MiniMaxH3NetworkTrainer()
+    trainer.dit_dtype = torch.bfloat16
+    monkeypatch.setattr(trainer, "load_network_weights", lambda _path, _module: lora_state)
+    args = SimpleNamespace(
+        h3_training_mode="fl2va",
+        fp8_base=False,
+        int8_convrot_base=True,
+        h3_adaln_rank=None,
+        h3_fp8_quantization_mode="block",
+        h3_convrot_int8=False,
+        h3_convrot_int8_bwd="bf16",
+        h3_convrot_int8_fwd="int8",
+        h3_attn_auto_dispatch=False,
+        base_weights=["base.safetensors"],
+        base_weights_multiplier=[0.75],
+    )
+    accelerator = SimpleNamespace(device=torch.device("cuda", 0), print=messages.append)
+
+    loaded = trainer.load_transformer(accelerator, args, str(tmp_path), "torch", False, "cpu", torch.bfloat16)
+
+    assert loaded is transformer
+    assert captured["base_lora_weights"] == [lora_state]
+    assert captured["base_lora_multipliers"] == [0.75]
+    assert args.base_weights is None
+    assert args.base_weights_multiplier is None
+    assert messages == ["all H3 base weights merged during model loading: base.safetensors"]
 
 
 @pytest.mark.parametrize(("option", "value", "message"), [("--sdpa", "--split_attn", "split attention")])
@@ -2143,6 +2214,7 @@ def test_h3_training_parser_defaults_to_native_fl2va_contract():
     assert args.h3_loss_balance == "modality"
     assert args.h3_guidance_distillation_scale is None
     assert args.h3_guidance_loss_form == "normalized"
+    assert args.h3_guidance_loss_schedule == "sigma"
     assert args.h3_base_preservation_loss_weight == 0.0
     assert args.fp8_scaled is False
     assert args.int8_convrot_base is False

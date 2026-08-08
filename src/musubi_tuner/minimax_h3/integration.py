@@ -538,6 +538,8 @@ def create_training_backend(
     blocks_to_swap: int = 0,
     block_swap_h2d_only: bool = False,
     low_ram_load: bool = True,
+    base_lora_weights: list[dict[str, torch.Tensor]] | None = None,
+    base_lora_multipliers: list[float] | None = None,
 ):
     """Load the selected released transformer and adapt its training forward to Musubi."""
     if dtype != "bfloat16":
@@ -563,6 +565,8 @@ def create_training_backend(
         blocks_to_swap=blocks_to_swap,
         block_swap_h2d_only=block_swap_h2d_only,
         low_ram_load=low_ram_load,
+        base_lora_weights=base_lora_weights,
+        base_lora_multipliers=base_lora_multipliers,
     )
     return _NativeTrainingBackend(transformer, mode)
 
