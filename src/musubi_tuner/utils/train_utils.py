@@ -179,6 +179,18 @@ def save_state_on_train_end(args: argparse.Namespace, accelerator: accelerate.Ac
         huggingface_utils.upload(args, state_dir, "/" + LAST_STATE_NAME.format(model_name))
 
 
+def is_complete_state_dir(state_dir: str) -> bool:
+    """Return whether an Accelerate state directory has the files needed to resume."""
+    if not os.path.isdir(state_dir):
+        return False
+
+    def has_file(*names: str) -> bool:
+        return any(os.path.isfile(os.path.join(state_dir, name)) for name in names)
+
+    has_model = has_file("model.safetensors", "pytorch_model.bin")
+    return has_model and has_file("optimizer.bin") and has_file("scheduler.bin")
+
+
 def get_lin_function(x1: float = 256, y1: float = 0.5, x2: float = 4096, y2: float = 1.15) -> Callable[[float], float]:
     m = (y2 - y1) / (x2 - x1)
     b = y1 - m * x1
