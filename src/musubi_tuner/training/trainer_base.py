@@ -85,6 +85,37 @@ SS_METADATA_MINIMUM_KEYS = [
 ]
 
 
+def check_base_weights_coverage(weight_path: str, weights_sd: dict[str, torch.Tensor], network) -> None:
+    """Fail when a ``--base_weights`` file merges into nothing.
+
+    ``create_network_from_weights`` derives its module list from key names, so a
+    file written in an unrecognised convention yields a network of zero modules.
+    ``merge_to`` then iterates an empty list and still logs "weights are merged",
+    and training continues against an unmodified base -- an entire run silently
+    doing something other than what was asked for. Refusing here turns that into
+    an immediate error.
+
+    A partial match is legitimate: an adapter may target modules this project
+    does not wrap with LoRA, and those simply stay unmerged. That only warrants a
+    warning, but it is worth naming, since a convention mismatch affecting only
+    part of the file looks exactly like this.
+    """
+    lora_names = {lora.lora_name for lora in getattr(network, "text_encoder_loras", []) + getattr(network, "unet_loras", [])}
+    if not lora_names:
+        raise ValueError(
+            f"{weight_path} merged into nothing: none of its {len(weights_sd)} tensors match a LoRA module of this "
+            "model. Its key convention is probably not the one this project expects "
+            "(`lora_unet_<module_path_with_underscores>.lora_down.weight`)."
+        )
+
+    unmatched = sorted({key for key in weights_sd if key.split(".")[0] not in lora_names})
+    if unmatched:
+        logger.warning(
+            f"{weight_path}: {len(unmatched)} of {len(weights_sd)} tensors have no matching module and stay unmerged, "
+            f"e.g. {', '.join(unmatched[:3])}"
+        )
+
+
 @dataclass
 class DiTOutput:
     """Return type for ``NetworkTrainer.call_dit``.
@@ -1601,6 +1632,7 @@ class NetworkTrainer:
                 module = network_module.create_arch_network_from_weights(
                     multiplier, weights_sd, unet=transformer, for_inference=True
                 )
+                check_base_weights_coverage(weight_path, weights_sd, module)
                 module.merge_to(None, transformer, weights_sd, weight_dtype, "cpu")
 
             accelerator.print(f"all weights merged: {', '.join(args.base_weights)}")
