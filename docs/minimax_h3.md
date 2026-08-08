@@ -334,13 +334,14 @@ matters most for Ref2VA, where the enlarged sequence is re-processed every pass.
 
 | Option | Purpose |
 | --- | --- |
-| `--h3_guidance_distillation_scale 3` | Guidance-consistent objective using cached empty-text conditioning. `--h3_guidance_loss_form` selects `normalized` or `contrastive`; both share an optimum, but contrastive is `scale²` larger. |
+| `--h3_guidance_distillation_scale 4` | Guidance-consistent objective using cached empty-text conditioning. A scale of `4` is recommended; `3` is generally too weak. `--h3_guidance_loss_form` selects `normalized` or `contrastive`; both share an optimum, but contrastive is `scale²` larger. |
 | `--h3_guidance_loss_schedule {sigma,constant}` | `sigma` (default) scales guidance from `1` at the clean endpoint to the configured value at maximum noise, independently for video and audio. `constant` retains the configured scale everywhere. |
 | `--h3_base_preservation_loss_weight 0.05` | Penalizes drift from the frozen base's prediction. Anchors to whichever base is loaded, quantized or not. |
 | `--crepa` | Temporal representation alignment for video training. |
 
 The H3 base-preservation/distillation-loss technique was proposed by [@Ada123-a](https://github.com/Ada123-a). Ada's community
-experiments reported weights around `0.05`–`0.10` with guidance scale `3`. Treat these only as starting points: the appropriate
+experiments reported weights around `0.05`–`0.10` with guidance scale `3`; the current guidance-scale recommendation is `4` because
+`3` is generally too weak. Treat the reported weights only as starting points: the appropriate
 weight also depends on training length, as well as quantization, rank, dataset, and learning rate. A weight that is useful for a
 short run can anchor a long run too strongly to the frozen model and eventually prevent the adapter from learning the dataset.
 Monitor training and validation samples, and reduce or disable the weight when preservation begins to dominate; changing it when
