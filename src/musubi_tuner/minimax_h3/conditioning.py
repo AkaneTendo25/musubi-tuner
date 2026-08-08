@@ -24,6 +24,7 @@ from musubi_tuner.minimax_h3.comfy_quant import has_comfy_quantized_layers, load
 from musubi_tuner.minimax_h3.component_loader import resolve_nvfp4_awq_text_encoder_checkpoint, text_encoder_metadata
 from musubi_tuner.minimax_h3.model import MiniMaxH3TokenTag
 from musubi_tuner.minimax_h3.references import (
+    REFERENCE_IMAGE_SHORT_EDGE,
     H3PreparedReference,
     H3ReferenceKind,
     prepare_references,
@@ -193,12 +194,14 @@ class MiniMaxH3ConditioningEncoder:
         model: Qwen3VLModel,
         output_dtype: torch.dtype,
         task: Literal["t2va", "i2va", "fl2va", "ref2va", "ref2va_omni"],
+        reference_image_short_edge: int = REFERENCE_IMAGE_SHORT_EDGE,
     ) -> None:
         self.processor = processor
         self.tokenizer = processor.tokenizer
         self.model = model
         self.output_dtype = output_dtype
         self.task = task
+        self.reference_image_short_edge = reference_image_short_edge
         # Even T2VA enumerates decoded video crops so its cache filename shares
         # the same crop identity as FL2VA and the corresponding latent cache.
         self.conditioning_requires_content = True
@@ -388,7 +391,9 @@ class MiniMaxH3ConditioningEncoder:
         dtype_name = dtype_to_str(self.output_dtype)
         results = []
         for item in batch:
-            references = prepare_references(item) if self.task in ("ref2va", "ref2va_omni") else None
+            references = (
+                prepare_references(item, self.reference_image_short_edge) if self.task in ("ref2va", "ref2va_omni") else None
+            )
             if self.task == "ref2va" and not references:
                 raise ValueError("MiniMax H3 Ref2VA conditioning requires at least one reference")
             hidden, tags = self._encode_prompt(item.caption, self._images_for_item(item), references)

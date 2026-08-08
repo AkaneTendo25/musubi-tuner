@@ -55,6 +55,7 @@ from musubi_tuner.minimax_h3.inference import (
     prepare_keyframe_image,
     save_av_mp4,
 )
+from musubi_tuner.minimax_h3.references import REFERENCE_IMAGE_SHORT_EDGE
 from musubi_tuner.minimax_h3.training import (
     H3ModelPrediction,
     contrastive_guidance_target,
@@ -148,6 +149,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         self._extension_route = "condition_rows"
         self._frame_sigma_jitter = 0.0
         self._step_row_video_timestep = None
+        self._spatial_density_jitter = 0.0
+        self._step_spatial_density_scale = None
         self._keyframe_anchors: tuple[int | str, ...] = ()
         self._keyframe_random_count = 0
         self._mask_mode = "off"
@@ -254,6 +257,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         # not describe any coherent objective.
         self._step_mask = None
         self._step_row_video_timestep = None
+        self._step_spatial_density_scale = None
         if self._validation_dataloader is None:
             self._validation_dataloader = self._build_validation_dataloader(args, accelerator)
 
@@ -455,6 +459,9 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         self._frame_sigma_jitter = args.h3_frame_sigma_jitter
         if not 0.0 <= args.h3_frame_sigma_jitter <= 1.0:
             raise ValueError("--h3_frame_sigma_jitter must lie in [0, 1]")
+        self._spatial_density_jitter = args.h3_spatial_density_jitter
+        if not math.isfinite(args.h3_spatial_density_jitter) or args.h3_spatial_density_jitter < 0:
+            raise ValueError("--h3_spatial_density_jitter must be finite and non-negative")
         self._keyframe_anchors = _parse_keyframe_anchors(args.h3_keyframe_anchors)
         self._keyframe_random_count = args.h3_keyframe_random_count
         if args.h3_keyframe_random_count < 0:
@@ -810,6 +817,9 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             blocks_to_swap=int(getattr(args, "blocks_to_swap", 0) or 0),
             block_swap_h2d_only=bool(getattr(args, "block_swap_h2d_only", False)),
         )
+        reference_image_short_edge = int(getattr(args, "reference_image_short_edge", REFERENCE_IMAGE_SHORT_EDGE))
+        if reference_image_short_edge != REFERENCE_IMAGE_SHORT_EDGE:
+            backend_kwargs["reference_image_short_edge"] = reference_image_short_edge
         if base_lora_weights:
             backend_kwargs["base_lora_weights"] = base_lora_weights
             backend_kwargs["base_lora_multipliers"] = base_lora_multipliers
@@ -885,6 +895,23 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         noisy = (1.0 - sigma) * video_latents + sigma * video_noise
         row_timestep = (1.0 - frame_sigma).repeat_interleave(rows_per_frame)
         return replace(inputs, video=noisy), row_timestep
+
+    def _draw_spatial_density_scale(self):
+        """Draw this step's spatial packing density.
+
+        H3's spatial RoPE is area-normalized, so token spacing is fixed by the
+        latent area and a single-resolution dataset teaches exactly one spacing.
+        Perturbing the effective area per step synthesizes the range of spacings
+        a multi-resolution dataset would supply, without re-caching anything.
+
+        The factor is drawn log-uniformly so denser and sparser packing are
+        equally likely, and one draw covers every spatial grid in the sequence so
+        reference and target rows stay in coordinate correspondence.
+        """
+        if self._spatial_density_jitter <= 0:
+            return None
+        span = math.log1p(self._spatial_density_jitter)
+        return float(torch.exp((torch.rand((), device="cpu") * 2 - 1) * span))
 
     def _resolve_keyframe_anchors(self, video):
         """Resolve this step's conditioning anchors.
@@ -1078,6 +1105,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         extension_kwargs = {}
         if self._step_row_video_timestep is not None:
             extension_kwargs["video_row_schedule"] = self._step_row_video_timestep
+        if self._step_spatial_density_scale is not None:
+            extension_kwargs["spatial_density_scale"] = self._step_spatial_density_scale
         anchors, anchor_indices = self._step_keyframes or ((), ())
         if anchors:
             extension_kwargs["condition_video_anchors"] = anchors
@@ -1210,6 +1239,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         inputs, self._step_row_video_timestep = self._apply_frame_sigma_jitter(
             args, inputs, video_latents, video_noise, base_sigma, is_image
         )
+        self._step_spatial_density_scale = self._draw_spatial_density_scale()
         self._step_mask = self._draw_step_mask(inputs, tuple(VIDEO_DIT_PATCH_SIZE))
         # Drawn once per step for the same reason the mask is: the guidance and
         # base-preservation branches must condition on the same anchors as the
@@ -1367,6 +1397,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         # Every consumer has run; nothing beyond this step may inherit the draw.
         self._step_mask = None
         self._step_row_video_timestep = None
+        self._step_spatial_density_scale = None
         self._step_keyframes = None
         return loss, metrics
 
@@ -1396,6 +1427,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             "ss_h3_extension_audio_latents": str(args.h3_extension_audio_latents),
             "ss_h3_extension_route": args.h3_extension_route,
             "ss_h3_frame_sigma_jitter": str(args.h3_frame_sigma_jitter),
+            "ss_h3_spatial_density_jitter": str(args.h3_spatial_density_jitter),
             "ss_h3_keyframe_anchors": args.h3_keyframe_anchors or "none",
             "ss_h3_keyframe_random_count": str(args.h3_keyframe_random_count),
             "ss_h3_mask_mode": args.h3_mask_mode,
@@ -1500,6 +1532,16 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--h3_spatial_density_jitter",
+        type=float,
+        default=0.0,
+        help=(
+            "perturb the area normalization of the spatial RoPE grids by up to this fraction each step, drawn "
+            "log-uniformly from [1/(1+j), 1+j], so fixed-resolution data still trains a range of token spacings. "
+            "0 disables it"
+        ),
+    )
+    parser.add_argument(
         "--h3_keyframe_anchors",
         type=str,
         default="",
@@ -1514,6 +1556,15 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         type=int,
         default=0,
         help="draw this many distinct conditioning frames at random each step instead of listing them",
+    )
+    parser.add_argument(
+        "--reference_image_short_edge",
+        type=int,
+        default=REFERENCE_IMAGE_SHORT_EDGE,
+        help=(
+            "short edge in pixels the Ref2VA reference caches were built with; it selects the matching reference "
+            "cache keys and must equal the value given to latent caching"
+        ),
     )
     parser.add_argument(
         "--h3_mask_mode",

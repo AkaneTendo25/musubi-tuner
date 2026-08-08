@@ -10,6 +10,7 @@ from musubi_tuner.dataset.cache_io import save_latent_cache_common, save_text_en
 from musubi_tuner.dataset.image_video_dataset import ItemInfo
 from musubi_tuner.minimax_h3.architecture import AUDIO_CHANNELS, AUDIO_LATENT_CHANNELS, TEXT_DIM, VIDEO_LATENT_CHANNELS
 from musubi_tuner.minimax_h3.media import MediaModality
+from musubi_tuner.minimax_h3.references import REFERENCE_IMAGE_SHORT_EDGE, validate_reference_image_short_edge
 from musubi_tuner.utils.model_utils import dtype_to_str, remove_dtype_suffix
 
 H3_AUDIO_LATENTS_KEY = "latents_audio"
@@ -27,6 +28,12 @@ H3_REFERENCE_VIDEO_SHAPES_KEY = "mmh3_reference_video_shapes"
 H3_REFERENCE_AUDIO_LENGTHS_KEY = "mmh3_reference_audio_lengths"
 H3_REFERENCE_VIDEO_ROWS_KEY = "mmh3_reference_video_rows"
 H3_REFERENCE_AUDIO_ROWS_KEY = "mmh3_reference_audio_rows"
+
+
+def reference_key_suffix(image_short_edge: int) -> str:
+    """Name reference caches whose pixels were scaled to a non-released short edge."""
+    validate_reference_image_short_edge(image_short_edge)
+    return "" if image_short_edge == REFERENCE_IMAGE_SHORT_EDGE else f"_se{image_short_edge}"
 
 
 def normalize_batch_tensors(results: Any, expected: int, operation: str) -> tuple[dict[str, torch.Tensor], ...]:
@@ -83,9 +90,7 @@ def save_latent_cache_minimax_h3(item_info: ItemInfo, tensors: dict[str, torch.T
     primary_latents = [key for key in cache_tensors if re.fullmatch(r"latents_\d+x\d+x\d+_.+", key)]
     target_mode = getattr(item_info, "h3_target_mode", "av")
     if len(primary_latents) > 1 or (target_mode != "audio" and len(primary_latents) != 1):
-        raise ValueError(
-            f"H3 latent cache for {item_info.item_key} must contain exactly one latents_FxHxW_<dtype> tensor"
-        )
+        raise ValueError(f"H3 latent cache for {item_info.item_key} must contain exactly one latents_FxHxW_<dtype> tensor")
     audio_latents = [key for key in cache_tensors if re.fullmatch(r"latents_audio_2x32x\d+_.+", key)]
     is_image = any(
         getattr(asset, "role", None) == "target" and getattr(asset, "modality", None) is MediaModality.IMAGE

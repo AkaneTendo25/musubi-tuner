@@ -1,4 +1,5 @@
 import json
+import math
 import struct
 import wave
 from argparse import Namespace
@@ -35,7 +36,12 @@ from musubi_tuner.minimax_h3.audio import (
     target_audio_processing_spec,
 )
 from musubi_tuner.minimax_h3.audio_dataset import H3AudioDataset
-from musubi_tuner.minimax_h3.cache import H3_AUDIO_LATENTS_KEY, H3_KEYFRAME_VIDEO_ROWS_KEY, save_latent_cache_minimax_h3
+from musubi_tuner.minimax_h3.cache import (
+    H3_AUDIO_LATENTS_KEY,
+    H3_KEYFRAME_VIDEO_ROWS_KEY,
+    reference_key_suffix,
+    save_latent_cache_minimax_h3,
+)
 from musubi_tuner.minimax_h3.dataset import create_h3_dataset_group
 from musubi_tuner.minimax_h3.media import (
     AudioProcessingSpec,
@@ -47,11 +53,18 @@ from musubi_tuner.minimax_h3.media import (
     fit_audio_length,
     slice_media_asset,
 )
+from musubi_tuner.minimax_h3.packing import (
+    MiniMaxH3ReferenceGeometry,
+    build_ref2va_packed_sequence,
+    build_t2va_packed_sequence,
+)
 from musubi_tuner.minimax_h3.references import (
+    REFERENCE_IMAGE_SHORT_EDGE,
     resample_reference_frames,
     resolve_reference_image_size,
     resolve_reference_video_size,
     trim_reference_frames,
+    validate_reference_image_short_edge,
 )
 from musubi_tuner.minimax_h3.request import H3GenerationRequest, H3Reference, ReferenceKind, ReferenceRole
 from musubi_tuner.minimax_h3.weights import CheckpointInspectionError, inspect_checkpoint
@@ -538,6 +551,51 @@ def test_ref2va_reference_geometry_matches_released_preprocessing():
     frames = np.arange(30, dtype=np.uint8).reshape(-1, 1, 1, 1) * np.ones((1, 2, 2, 3), dtype=np.uint8)
     resampled = resample_reference_frames(frames, 30.0)
     assert [int(frame[0, 0, 0]) for frame in resampled] == [index for index in range(30) if index not in (2, 7, 12, 17, 22, 27)]
+
+
+def test_reference_image_short_edge_default_matches_released_preprocessing():
+    assert REFERENCE_IMAGE_SHORT_EDGE == 2048
+    for width, height in ((512, 512), (80, 48), (48, 80), (1344, 768)):
+        assert resolve_reference_image_size(width, height) == resolve_reference_image_size(
+            width, height, REFERENCE_IMAGE_SHORT_EDGE
+        )
+    assert resolve_reference_image_size(512, 512) == (2048, 2048)
+    assert resolve_reference_image_size(80, 48) == (2048, 3424)
+    assert reference_key_suffix(REFERENCE_IMAGE_SHORT_EDGE) == ""
+
+
+def test_reference_image_short_edge_scales_and_names_the_cache():
+    assert resolve_reference_image_size(512, 512, 768) == (768, 768)
+    assert resolve_reference_image_size(80, 48, 768) == (768, 1280)
+    assert resolve_reference_image_size(48, 80, 768) == (1280, 768)
+    assert resolve_reference_image_size(96, 96, CANVAS_MULTIPLE) == (CANVAS_MULTIPLE, CANVAS_MULTIPLE)
+    assert reference_key_suffix(768) == "_se768"
+
+
+@pytest.mark.parametrize("short_edge", (0, -1, -768, CANVAS_MULTIPLE - 1))
+def test_reference_image_short_edge_rejects_unusable_values(short_edge):
+    with pytest.raises(ValueError, match="short edge"):
+        validate_reference_image_short_edge(short_edge)
+    with pytest.raises(ValueError, match="short edge"):
+        resolve_reference_image_size(512, 512, short_edge)
+    with pytest.raises(ValueError, match="short edge"):
+        reference_key_suffix(short_edge)
+
+
+def test_reference_image_aspect_guard_precedes_the_short_edge():
+    with pytest.raises(ValueError, match="1:4 to 4:1"):
+        resolve_reference_image_size(400, 80)
+    with pytest.raises(ValueError, match="1:4 to 4:1"):
+        resolve_reference_image_size(80, 400, 768)
+    with pytest.raises(ValueError, match="1:4 to 4:1"):
+        resolve_reference_image_size(0, 512, 768)
+
+
+def test_reference_image_short_edge_flag_is_registered_on_every_entrypoint():
+    for parser in (create_cache_latents_parser(), create_cache_text_parser(), create_parser()):
+        action = next(a for a in parser._actions if a.dest == "reference_image_short_edge")
+        assert action.type is int
+        assert action.default == REFERENCE_IMAGE_SHORT_EDGE
 
 
 def test_audio_file_decode_resample_and_mask(tmp_path):
@@ -1278,3 +1336,107 @@ def test_h3_convrot_bf16_forward_carries_gradients():
     layer(x).sum().backward()
 
     assert x.grad is not None and torch.isfinite(x.grad).all()
+
+
+# Every area-normalized grid spans an interval centered on _ROPE_SPATIAL_SCALE / 2,
+# whatever the latent shape or the density scale, so scaling the area normalization
+# contracts each coordinate toward that center by exactly the same factor.
+_SPATIAL_GRID_CENTER = 16.0
+
+
+def _centered_rescale(coordinates, scale):
+    return _SPATIAL_GRID_CENTER + (coordinates - _SPATIAL_GRID_CENTER) / scale
+
+
+def _t2va_density_layout(scale=None):
+    return build_t2va_packed_sequence(
+        torch.ones(4, dtype=torch.long),
+        num_latent_frames=2,
+        latent_height=4,
+        latent_width=4,
+        num_audio_latents=3,
+        patch_size=(1, 2, 2),
+        **({} if scale is None else {"spatial_density_scale": scale}),
+    )
+
+
+def _ref2va_density_layout(scale=None):
+    return build_ref2va_packed_sequence(
+        torch.ones(4, dtype=torch.long),
+        (MiniMaxH3ReferenceGeometry(kind=0, num_latent_frames=1, latent_height=8, latent_width=8),),
+        num_latent_frames=2,
+        latent_height=4,
+        latent_width=4,
+        num_audio_latents=2,
+        patch_size=(1, 2, 2),
+        **({} if scale is None else {"spatial_density_scale": scale}),
+    )
+
+
+def test_h3_spatial_density_scale_is_inert_at_its_default():
+    assert torch.equal(_t2va_density_layout().position_ids, _t2va_density_layout(1.0).position_ids)
+    assert torch.equal(_ref2va_density_layout().position_ids, _ref2va_density_layout(1.0).position_ids)
+
+
+def test_h3_spatial_density_scale_contracts_only_the_spatial_grids():
+    baseline = _t2va_density_layout()
+    dense = _t2va_density_layout(2.0)
+
+    assert torch.equal(dense.position_ids[:, 0], baseline.position_ids[:, 0])
+    assert torch.equal(dense.position_ids[dense.text_indices], baseline.position_ids[baseline.text_indices])
+    torch.testing.assert_close(
+        dense.position_ids[dense.video_indices, 1:],
+        _centered_rescale(baseline.position_ids[baseline.video_indices, 1:], 2.0),
+    )
+    # Audio rows sit at the outer coordinates of the video width grid, so they
+    # follow the same contraction; their own timeline stays where it was.
+    torch.testing.assert_close(
+        dense.position_ids[dense.audio_indices, 2],
+        _centered_rescale(baseline.position_ids[baseline.audio_indices, 2], 2.0),
+    )
+    assert torch.equal(dense.position_ids[dense.audio_indices, 1], baseline.position_ids[baseline.audio_indices, 1])
+
+
+def test_h3_spatial_density_scale_moves_ref2va_references_with_their_target():
+    baseline = _ref2va_density_layout()
+    dense = _ref2va_density_layout(2.0)
+
+    # Reference and target rows carry different latent areas, so a shared factor
+    # is the only thing that contracts both grids by the same amount.
+    assert baseline.num_condition_video_rows == 16
+    assert torch.equal(dense.position_ids[:, 0], baseline.position_ids[:, 0])
+    torch.testing.assert_close(
+        dense.position_ids[dense.video_indices, 1:],
+        _centered_rescale(baseline.position_ids[baseline.video_indices, 1:], 2.0),
+    )
+
+
+@pytest.mark.parametrize("scale", [0.0, -1.0, float("nan")])
+def test_h3_spatial_density_scale_rejects_values_that_are_not_positive(scale):
+    with pytest.raises(ValueError, match="spatial density scale"):
+        _t2va_density_layout(scale)
+    with pytest.raises(ValueError, match="spatial density scale"):
+        _ref2va_density_layout(scale)
+
+
+def test_h3_spatial_density_jitter_rejects_negative_values():
+    from musubi_tuner.minimax_h3_train_network import MiniMaxH3NetworkTrainer, create_parser
+
+    args = create_parser().parse_args([])
+    args.h3_spatial_density_jitter = -0.1
+
+    with pytest.raises(ValueError, match="h3_spatial_density_jitter"):
+        MiniMaxH3NetworkTrainer().handle_model_specific_args(args)
+
+
+def test_h3_spatial_density_jitter_draws_log_uniformly_inside_its_bounds():
+    from musubi_tuner.minimax_h3_train_network import MiniMaxH3NetworkTrainer
+
+    trainer = MiniMaxH3NetworkTrainer()
+    assert trainer._draw_spatial_density_scale() is None
+
+    trainer._spatial_density_jitter = 0.5
+    draws = [trainer._draw_spatial_density_scale() for _ in range(64)]
+
+    assert all(abs(math.log(draw)) <= math.log(1.5) + 1e-12 for draw in draws)
+    assert len(set(draws)) > 1

@@ -7,6 +7,7 @@ from pathlib import Path
 
 from musubi_tuner.minimax_h3.assets import default_text_encoder_assets
 from musubi_tuner.minimax_h3.backend import create_generator
+from musubi_tuner.minimax_h3.references import REFERENCE_IMAGE_SHORT_EDGE
 from musubi_tuner.minimax_h3.request import SUPPORTED_RATIOS, H3GenerationRequest, make_references
 from musubi_tuner.minimax_h3.weights import inspect_checkpoint
 
@@ -46,6 +47,12 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument("--reference_image", action="append", default=[])
     parser.add_argument("--reference_video", action="append", default=[])
     parser.add_argument("--reference_audio", action="append", default=[])
+    parser.add_argument(
+        "--reference_image_short_edge",
+        type=int,
+        default=REFERENCE_IMAGE_SHORT_EDGE,
+        help=("scale every reference image so its short edge reaches this many pixels; match the value the LoRA was trained with"),
+    )
     parser.add_argument("--device")
     parser.add_argument("--dtype", choices=("bfloat16", "float16", "float32"), default="bfloat16")
     parser.add_argument("--fp8_base", action="store_true", help="use weight-only scaled FP8 transformer blocks")
@@ -161,6 +168,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             compile_fallback_to_eager=args.compile_fallback_to_eager,
             inductor_config=tuple(args.inductor_config),
             fused_qk_norm_rope=args.h3_fused_qk_norm_rope,
+            reference_image_short_edge=args.reference_image_short_edge,
         )
         generator.generate(request)
         if not request.output.is_file():

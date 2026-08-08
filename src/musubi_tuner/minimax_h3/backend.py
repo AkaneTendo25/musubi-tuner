@@ -5,6 +5,7 @@ from typing import Any, Literal, Protocol
 
 import torch
 
+from musubi_tuner.minimax_h3.references import REFERENCE_IMAGE_SHORT_EDGE, validate_reference_image_short_edge
 from musubi_tuner.minimax_h3.request import H3GenerationRequest
 from musubi_tuner.minimax_h3.training import H3ModelPrediction, H3TrainingMode
 
@@ -58,15 +59,24 @@ def _validate_dtype(dtype: str) -> None:
         raise ValueError(f"unsupported H3 compute dtype: {dtype}")
 
 
+def _reference_short_edge_kwargs(reference_image_short_edge: int) -> dict[str, int]:
+    """Route the reference short edge only when it differs from the released one."""
+    if reference_image_short_edge == REFERENCE_IMAGE_SHORT_EDGE:
+        return {}
+    return {"reference_image_short_edge": reference_image_short_edge}
+
+
 def create_latent_encoder(
     *,
     video_vae: Path,
     audio_vae: Path | None,
     device: str | None,
     dtype: str,
+    reference_image_short_edge: int = REFERENCE_IMAGE_SHORT_EDGE,
 ) -> H3LatentEncoder:
     """Load the video VAE and, for video datasets, the audio VAE used by latent caching."""
     _validate_dtype(dtype)
+    validate_reference_image_short_edge(reference_image_short_edge)
     from musubi_tuner.minimax_h3.integration import create_latent_encoder as create_integrated_latent_encoder
 
     return create_integrated_latent_encoder(
@@ -74,6 +84,7 @@ def create_latent_encoder(
         audio_vae=audio_vae,
         device=device,
         dtype=dtype,
+        **_reference_short_edge_kwargs(reference_image_short_edge),
     )
 
 
@@ -85,9 +96,11 @@ def create_conditioning_encoder(
     device: str | None,
     dtype: str,
     quantization: Literal["none", "int8", "nf4", "nvfp4_awq"] = "none",
+    reference_image_short_edge: int = REFERENCE_IMAGE_SHORT_EDGE,
 ) -> H3ConditioningEncoder:
     """Load only the understanding encoder required for conditioning caches."""
     _validate_dtype(dtype)
+    validate_reference_image_short_edge(reference_image_short_edge)
     from musubi_tuner.minimax_h3.integration import create_conditioning_encoder as create_integrated_conditioning_encoder
 
     return create_integrated_conditioning_encoder(
@@ -97,6 +110,7 @@ def create_conditioning_encoder(
         device=device,
         dtype=dtype,
         quantization=quantization,
+        **_reference_short_edge_kwargs(reference_image_short_edge),
     )
 
 
@@ -134,9 +148,11 @@ def create_generator(
     compile_fallback_to_eager: bool = False,
     inductor_config: tuple[str, ...] = (),
     fused_qk_norm_rope: bool = False,
+    reference_image_short_edge: int = REFERENCE_IMAGE_SHORT_EDGE,
 ) -> H3Generator:
     """Load only the inference variant and components required by the request."""
     _validate_dtype(dtype)
+    validate_reference_image_short_edge(reference_image_short_edge)
     from musubi_tuner.minimax_h3.integration import create_generator as create_integrated_generator
 
     return create_integrated_generator(
@@ -172,6 +188,7 @@ def create_generator(
         compile_fallback_to_eager=compile_fallback_to_eager,
         inductor_config=inductor_config,
         fused_qk_norm_rope=fused_qk_norm_rope,
+        **_reference_short_edge_kwargs(reference_image_short_edge),
     )
 
 
@@ -197,6 +214,7 @@ def create_training_backend(
     low_ram_load: bool = True,
     base_lora_weights: list[dict[str, torch.Tensor]] | None = None,
     base_lora_multipliers: list[float] | None = None,
+    reference_image_short_edge: int = REFERENCE_IMAGE_SHORT_EDGE,
 ) -> H3TrainingBackend:
     """Load only the transformer required for cache-backed LoRA training.
 
@@ -208,6 +226,7 @@ def create_training_backend(
         raise ValueError("MiniMax H3 supports only --sdpa, --flash_attn, or --flash3")
     if split_attention:
         raise ValueError("MiniMax H3 does not support split attention")
+    validate_reference_image_short_edge(reference_image_short_edge)
     from musubi_tuner.minimax_h3.integration import create_training_backend as create_integrated_training_backend
 
     return create_integrated_training_backend(
@@ -238,4 +257,5 @@ def create_training_backend(
             if not base_lora_weights
             else {"base_lora_weights": base_lora_weights, "base_lora_multipliers": base_lora_multipliers}
         ),
+        **_reference_short_edge_kwargs(reference_image_short_edge),
     )

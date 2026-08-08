@@ -86,10 +86,17 @@ def _multiple_size(width: float, height: float) -> tuple[int, int]:
     )
 
 
-def resolve_reference_image_size(width: int, height: int) -> tuple[int, int]:
+def validate_reference_image_short_edge(short_edge: int) -> int:
+    if short_edge < CANVAS_MULTIPLE:
+        raise ValueError(f"H3 reference image short edge must be at least {CANVAS_MULTIPLE}, got {short_edge}")
+    return short_edge
+
+
+def resolve_reference_image_size(width: int, height: int, short_edge: int = REFERENCE_IMAGE_SHORT_EDGE) -> tuple[int, int]:
     if width <= 0 or height <= 0 or width > 4 * height or height > 4 * width:
         raise ValueError(f"H3 reference image must have a positive 1:4 to 4:1 aspect ratio, got {width}x{height}")
-    scale = REFERENCE_IMAGE_SHORT_EDGE / min(width, height)
+    validate_reference_image_short_edge(short_edge)
+    scale = short_edge / min(width, height)
     return _multiple_size(width * scale, height * scale)
 
 
@@ -141,10 +148,10 @@ def resample_reference_frames(frames: np.ndarray, source_fps: float) -> np.ndarr
     return np.repeat(frames, repeats, axis=0)
 
 
-def _prepare_image(asset: MediaAsset) -> Image.Image:
+def _prepare_image(asset: MediaAsset, short_edge: int) -> Image.Image:
     with Image.open(asset.path) as source:
         image = ImageOps.exif_transpose(source).convert("RGB")
-        height, width = resolve_reference_image_size(*image.size)
+        height, width = resolve_reference_image_size(*image.size, short_edge)
         if image.size != (width, height):
             image = image.resize((width, height), Image.Resampling.LANCZOS)
         return image.copy()
@@ -200,8 +207,9 @@ def trim_reference_frames(frame_count: int) -> int:
     return max(1, (frame_count - 5) // 17) * 17 + 5
 
 
-def prepare_references(item: Any) -> tuple[H3PreparedReference, ...]:
+def prepare_references(item: Any, image_short_edge: int = REFERENCE_IMAGE_SHORT_EDGE) -> tuple[H3PreparedReference, ...]:
     assets = reference_assets(item)
+    validate_reference_image_short_edge(image_short_edge)
     target_frames = int(getattr(item, "frame_count", 0) or getattr(item, "content", np.empty((0,))).shape[0])
     if target_frames <= 0:
         targets = [asset for asset in getattr(item, "h3_media_assets", ()) if asset.role == "target"]
@@ -213,7 +221,7 @@ def prepare_references(item: Any) -> tuple[H3PreparedReference, ...]:
     for asset in assets:
         kind = _kind(asset)
         if kind is H3ReferenceKind.IMAGE:
-            prepared.append(H3PreparedReference(kind=kind, image=_prepare_image(asset)))
+            prepared.append(H3PreparedReference(kind=kind, image=_prepare_image(asset, image_short_edge)))
         elif kind is H3ReferenceKind.VIDEO:
             prepared.append(
                 H3PreparedReference(

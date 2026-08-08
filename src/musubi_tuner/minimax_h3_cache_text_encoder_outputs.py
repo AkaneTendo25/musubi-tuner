@@ -14,6 +14,7 @@ from musubi_tuner.minimax_h3.assets import default_text_encoder_assets
 from musubi_tuner.minimax_h3.backend import create_conditioning_encoder
 from musubi_tuner.minimax_h3.cache import normalize_batch_tensors, save_text_encoder_output_cache_minimax_h3
 from musubi_tuner.minimax_h3.dataset import attach_h3_media, create_h3_dataset_group
+from musubi_tuner.minimax_h3.references import REFERENCE_IMAGE_SHORT_EDGE
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +48,15 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--reference_image_short_edge",
+        type=int,
+        default=REFERENCE_IMAGE_SHORT_EDGE,
+        help=(
+            "scale every Ref2VA reference image so its short edge reaches this many pixels before it is presented to "
+            "the understanding encoder; keep it equal to the value given to latent caching"
+        ),
+    )
+    parser.add_argument(
         "--cache_guidance_empty",
         action="store_true",
         help="also cache H3's empty-text conditioning for the optional guidance-consistent training objective",
@@ -77,6 +87,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         device=str(device),
         dtype=args.text_encoder_dtype,
         quantization=args.text_encoder_quantization,
+        reference_image_short_edge=args.reference_image_short_edge,
     )
 
     def encode(batch: list[ItemInfo]) -> None:

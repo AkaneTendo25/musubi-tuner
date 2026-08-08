@@ -21,6 +21,7 @@ the training boundary; H3 training itself remains batch-size one.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import numpy as np
@@ -134,11 +135,18 @@ def unpack_audio_tokens(rows: torch.Tensor, *, num_audio_latents: int) -> torch.
     return rows.permute(0, 1, 3, 2).contiguous()
 
 
-def _spatial_position_grid(dim: int, patch: int, sqrt_area: float) -> torch.Tensor:
-    ratio = dim / sqrt_area
+def _spatial_position_grid(dim: int, patch: int, sqrt_area: float, density_scale: float = 1.0) -> torch.Tensor:
+    ratio = dim / (sqrt_area * density_scale)
     left = (1.0 - ratio) / 2.0
     grid = np.linspace(left, left + ratio, dim // patch, endpoint=False) * _ROPE_SPATIAL_SCALE
     return torch.from_numpy(grid).to(torch.float64)
+
+
+def _validated_density_scale(spatial_density_scale: float) -> float:
+    scale = float(spatial_density_scale)
+    if not math.isfinite(scale) or scale <= 0.0:
+        raise ValueError(f"H3 spatial density scale must be finite and positive, got {spatial_density_scale}")
+    return scale
 
 
 def _temporal_position_grid(num_latent_frames: int, origin: float) -> torch.Tensor:
@@ -160,10 +168,19 @@ def _frame_position_grid(
     latent_width: int,
     patch_h: int,
     patch_w: int,
+    spatial_density_scale: float = 1.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build one frame's spatial RoPE coordinates, area-normalized as released.
+
+    ``spatial_density_scale`` multiplies the area normalization, so token spacing
+    is ``patch * _ROPE_SPATIAL_SCALE / (sqrt_area * scale)``. A scale above 1.0
+    therefore packs the frame *more densely* -- smaller spacing, the coordinates
+    a higher-resolution frame of the same content would receive -- and a scale
+    below 1.0 spreads it out. ``1.0`` reproduces the released grid exactly.
+    """
     sqrt_area = float(np.sqrt(latent_height * latent_width))
-    height_grid = _spatial_position_grid(latent_height, patch_h, sqrt_area)
-    width_grid = _spatial_position_grid(latent_width, patch_w, sqrt_area)
+    height_grid = _spatial_position_grid(latent_height, patch_h, sqrt_area, spatial_density_scale)
+    width_grid = _spatial_position_grid(latent_width, patch_w, sqrt_area, spatial_density_scale)
     frame_grid = torch.stack(
         [grid.reshape(-1) for grid in torch.meshgrid(height_grid, width_grid, indexing="ij")],
         dim=-1,
@@ -198,6 +215,7 @@ def build_t2va_packed_sequence(
     patch_size: tuple[int, int, int],
     keyframe_anchors: tuple[str | int, ...] = (),
     num_condition_audio_latents: int = 0,
+    spatial_density_scale: float = 1.0,
 ) -> MiniMaxH3PackedSequence:
     """Build FL2VA's ``[text | keyframes | condition audio | target audio | target video]`` layout.
 
@@ -212,6 +230,10 @@ def build_t2va_packed_sequence(
     block. They occupy the first coordinates of the audio timeline and push the
     target audio after them, so no coordinate is used twice -- the same
     arrangement Ref2VA uses for reference audio.
+
+    ``spatial_density_scale`` rescales the area normalization of every spatial
+    grid in the sequence, keyframe rows included, so a scale above 1.0 packs the
+    frames more densely; see :func:`_frame_position_grid`.
     """
     if text_token_tags.ndim != 1 or text_token_tags.numel() == 0:
         raise ValueError("H3 text token tags must be a non-empty one-dimensional tensor")
@@ -232,6 +254,7 @@ def build_t2va_packed_sequence(
         raise ValueError("H3 audio conditioning length cannot be negative")
     if num_condition_audio_latents and num_audio_latents == 0:
         raise ValueError("H3 audio conditioning requires an audio target")
+    density_scale = _validated_density_scale(spatial_density_scale)
 
     rows_per_frame = (latent_height // patch_h) * (latent_width // patch_w)
     num_text_rows = int(text_token_tags.shape[0])
@@ -274,7 +297,7 @@ def build_t2va_packed_sequence(
 
     position_ids = torch.zeros(sequence_length, 3, dtype=torch.float64)
     position_ids[text_indices, 0] = torch.arange(num_text_rows, dtype=torch.float64)
-    frame_grid, width_grid = _frame_position_grid(latent_height, latent_width, patch_h, patch_w)
+    frame_grid, width_grid = _frame_position_grid(latent_height, latent_width, patch_h, patch_w, density_scale)
 
     latent_starts = _temporal_position_grid(num_latent_frames, float(num_text_rows)) if num_latent_frames else None
     for index, identity in enumerate(anchor_identities):
@@ -328,8 +351,14 @@ def build_ref2va_packed_sequence(
     latent_width: int,
     num_audio_latents: int,
     patch_size: tuple[int, int, int],
+    spatial_density_scale: float = 1.0,
 ) -> MiniMaxH3PackedSequence:
-    """Build Ref2VA's ordered ``[text | references | target audio | target video]`` layout."""
+    """Build Ref2VA's ordered ``[text | references | target audio | target video]`` layout.
+
+    ``spatial_density_scale`` rescales the area normalization of every spatial
+    grid in the sequence. References and target share the one factor, so their
+    coordinates stay in correspondence; see :func:`_frame_position_grid`.
+    """
     if text_token_tags.ndim != 1 or text_token_tags.numel() == 0:
         raise ValueError("H3 Ref2VA text token tags must be a non-empty vector")
     patch_t, patch_h, patch_w = patch_size
@@ -344,6 +373,7 @@ def build_ref2va_packed_sequence(
             raise ValueError(f"invalid H3 visual reference geometry: {reference}")
         if reference.num_audio_latents < 0:
             raise ValueError(f"invalid H3 audio reference geometry: {reference}")
+    density_scale = _validated_density_scale(spatial_density_scale)
 
     num_text_rows = int(text_token_tags.numel())
     num_reference_video_rows = sum(reference.num_video_rows(patch_size) for reference in references)
@@ -353,7 +383,7 @@ def build_ref2va_packed_sequence(
     sequence_length = num_text_rows + num_reference_video_rows + num_reference_audio_rows + target_audio_rows + target_video_rows
     position_ids = torch.zeros(sequence_length, 3, dtype=torch.float64)
     position_ids[:num_text_rows, 0] = torch.arange(num_text_rows, dtype=torch.float64)
-    target_frame_grid, target_width_grid = _frame_position_grid(latent_height, latent_width, patch_h, patch_w)
+    target_frame_grid, target_width_grid = _frame_position_grid(latent_height, latent_width, patch_h, patch_w, density_scale)
 
     video_indices: list[torch.Tensor] = []
     audio_indices: list[torch.Tensor] = []
@@ -369,6 +399,7 @@ def build_ref2va_packed_sequence(
                 reference.latent_width,
                 patch_h,
                 patch_w,
+                density_scale,
             )
             position_ids[rows, 0] = rotary_time
             position_ids[rows, 1:] = frame_grid
@@ -396,6 +427,7 @@ def build_ref2va_packed_sequence(
                 reference.latent_width,
                 patch_h,
                 patch_w,
+                density_scale,
             )
             _fill_audio_positions(
                 position_ids,

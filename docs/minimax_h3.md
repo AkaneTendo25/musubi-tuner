@@ -158,6 +158,12 @@ use caption dropout or the guidance objective.
 `--task` must match how you intend to train: `t2va` (text only), `i2va` (first frame), `fl2va` (first+last), `ref2va`,
 `ref2va_omni`. Keyframe tasks take their frames from the target video itself, not from control fields.
 
+`--reference_image_short_edge` (default 2048) resizes Ref2VA reference images to the given short edge before encoding.
+The released pipeline uses 2048; lowering it (e.g. to 768, the reference-video size) cuts the reference token count
+roughly quadratically at the cost of fine reference detail. The same value must be passed to both caching scripts,
+training, and inference — non-default caches carry the value in their keys, and the trainer refuses a mismatched
+reference cache.
+
 ```shell
 # First-frame I2V
 python minimax_h3_cache_text_encoder_outputs.py \
@@ -326,6 +332,7 @@ loss weight is forced to zero; this isolates direct supervision, not H3's shared
 | `--h3_keyframe_anchors first,11,last` / `--h3_keyframe_random_count N` | Interpolation from arbitrary anchors |
 | `--h3_mask_mode {box,border,segment}` | Inpainting, outpainting, temporal infilling |
 | `--h3_frame_sigma_jitter 0.2` | Spreads noise level across frames, supervising a range of the schedule per step. Skipped for image batches, which have one frame; `0` disables it |
+| `--h3_spatial_density_jitter 0.2` | Perturbs the area normalization of the spatial RoPE grids each step, drawn log-uniformly from `[1/1.2, 1.2]`, so fixed-resolution data still trains a range of token spacings. One factor covers every grid in the packed sequence; `0` disables it |
 | `--h3_caption_dropout_rate 0.1` | Trains the unconditional branch; requires `--cache_guidance_empty` |
 
 Extension, keyframes, and masking all claim the observed rows, so **only one may be enabled at a time**.
@@ -455,6 +462,7 @@ python minimax_h3_generate_video.py \
 | `--first_frame` / `--last_frame` | Keyframe conditioning at the ends. |
 | `--keyframe INDEX:PATH` | Keyframe at an arbitrary latent frame, repeatable. |
 | `--reference_image` / `--reference_video` / `--reference_audio` | Ref2VA references; audio must accompany an image or video. A reference video's own soundtrack is included automatically, so do not also pass it as `--reference_audio`. Requires the Ref2VA checkpoint. |
+| `--reference_image_short_edge` | Short edge reference images are resized to (default 2048). Use the value the LoRA was trained with. |
 | `--lora_weight` / `--lora_multiplier` | Attach saved adapters. |
 | `--steps` | Sigma grid points including terminal zero, so `20` runs 19 evaluations. |
 
