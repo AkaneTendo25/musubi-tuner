@@ -136,6 +136,24 @@ class LoRAModule(torch.nn.Module):
         del self.org_module
 
     def forward(self, x):
+        base_module = getattr(self.org_forward, "__self__", None)
+        if (
+            getattr(base_module, "_convrot_lora_fused", False)
+            and self.split_dims is None
+            and self.dropout is None
+            and self.rank_dropout is None
+            and self.module_dropout is None
+            and (self._autocast_enabled_for(x) or (x.dtype == self.lora_down.weight.dtype == self.lora_up.weight.dtype))
+        ):
+            from musubi_tuner.modules.convrot_int8_utils import convrot_int8_lora_forward
+
+            return convrot_int8_lora_forward(
+                base_module,
+                x,
+                self.lora_down.weight,
+                self.lora_up.weight,
+                self.multiplier * self.scale,
+            )
         org_forwarded = self.org_forward(x)
 
         # module dropout

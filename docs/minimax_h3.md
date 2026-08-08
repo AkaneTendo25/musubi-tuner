@@ -333,9 +333,12 @@ matters most for Ref2VA, where the enlarged sequence is re-processed every pass.
 | `--h3_guidance_distillation_scale 3` | Guidance-consistent objective using cached empty-text conditioning. `--h3_guidance_loss_form` selects `normalized` or `contrastive`; both share an optimum, but contrastive is `scale²` larger. |
 | `--h3_base_preservation_loss_weight 0.05` | Penalizes drift from the frozen base's prediction. Anchors to whichever base is loaded, quantized or not. |
 
-Community experiments by [@Ada123-a](https://github.com/Ada123-a) reported base-preservation weights around `0.05`–`0.10` with
-guidance scale `3`. Treat these as starting points: the two interact, and both interact with quantization, rank, dataset, and
-learning rate.
+The H3 base-preservation/distillation-loss technique was proposed by [@Ada123-a](https://github.com/Ada123-a). Ada's community
+experiments reported weights around `0.05`–`0.10` with guidance scale `3`. Treat these only as starting points: the appropriate
+weight also depends on training length, as well as quantization, rank, dataset, and learning rate. A weight that is useful for a
+short run can anchor a long run too strongly to the frozen model and eventually prevent the adapter from learning the dataset.
+Monitor training and validation samples, and reduce or disable the weight when preservation begins to dominate; changing it when
+resuming training is supported.
 | `--crepa` | Temporal representation alignment for video training. |
 
 CREPA aligns projected features from an earlier block with a later block (`mode=backbone`) or with frozen DINOv2 features

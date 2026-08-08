@@ -528,6 +528,128 @@ if HAS_TRITON:
 
         return output.reshape(*orig_shape[:-1], n)
 
+    @triton.autotune(
+        configs=[
+            triton.Config({"block_m": 128, "block_n": 256, "block_k": 64, "group_size_m": 8}, num_stages=3, num_warps=8),
+            triton.Config({"block_m": 64, "block_n": 256, "block_k": 32, "group_size_m": 8}, num_stages=4, num_warps=4),
+            triton.Config({"block_m": 128, "block_n": 128, "block_k": 32, "group_size_m": 8}, num_stages=4, num_warps=4),
+            triton.Config({"block_m": 128, "block_n": 64, "block_k": 32, "group_size_m": 8}, num_stages=4, num_warps=4),
+            triton.Config({"block_m": 64, "block_n": 128, "block_k": 32, "group_size_m": 8}, num_stages=4, num_warps=4),
+            triton.Config({"block_m": 128, "block_n": 32, "block_k": 32, "group_size_m": 8}, num_stages=4, num_warps=4),
+        ],
+        key=["m", "n", "k", "rank"],
+    )
+    @triton.jit
+    def _int8_matmul_dequant_lora_kernel(
+        a,
+        b,
+        c,
+        a_scale,
+        b_scale,
+        down,
+        up,
+        m,
+        n,
+        k,
+        rank: tl.constexpr,
+        stride_am,
+        stride_ak,
+        stride_bk,
+        stride_bn,
+        stride_cm,
+        stride_cn,
+        stride_dm,
+        stride_dr,
+        stride_ur,
+        stride_un,
+        block_m: tl.constexpr,
+        block_n: tl.constexpr,
+        block_k: tl.constexpr,
+        block_r: tl.constexpr,
+        group_size_m: tl.constexpr,
+    ):
+        pid = tl.program_id(0)
+        num_m = tl.cdiv(m, block_m)
+        num_n = tl.cdiv(n, block_n)
+        programs_per_group = group_size_m * num_n
+        group = pid // programs_per_group
+        first_m = group * group_size_m
+        actual_group_m = min(num_m - first_m, group_size_m)
+        pid_m = first_m + (pid % programs_per_group) % actual_group_m
+        pid_n = (pid % programs_per_group) // actual_group_m
+        om = pid_m * block_m + tl.arange(0, block_m)
+        on = pid_n * block_n + tl.arange(0, block_n)
+        ok = tl.arange(0, block_k)
+        acc = tl.zeros((block_m, block_n), tl.int32)
+        ap = a + om[:, None] * stride_am + ok[None, :] * stride_ak
+        bp = b + ok[:, None] * stride_bk + on[None, :] * stride_bn
+        for ki in range(tl.cdiv(k, block_k)):
+            rem = k - ki * block_k
+            av = tl.load(ap, mask=(om[:, None] < m) & (ok[None, :] < rem), other=0)
+            bv = tl.load(bp, mask=(on[None, :] < n) & (ok[:, None] < rem), other=0)
+            acc += tl.dot(av, bv)
+            ap += block_k * stride_ak
+            bp += block_k * stride_bk
+        sm = tl.load(a_scale + om, mask=om < m, other=0.0)
+        sn = tl.load(b_scale + on, mask=on < n, other=0.0)
+        result = acc.to(tl.float32) * sm[:, None] * sn[None, :]
+        ora = tl.arange(0, block_r)
+        dv = tl.load(
+            down + om[:, None] * stride_dm + ora[None, :] * stride_dr,
+            mask=(om[:, None] < m) & (ora[None, :] < rank),
+            other=0.0,
+        )
+        uv = tl.load(
+            up + ora[:, None] * stride_ur + on[None, :] * stride_un,
+            mask=(ora[:, None] < rank) & (on[None, :] < n),
+            other=0.0,
+        )
+        result += tl.dot(dv, uv)
+        cp = c + om[:, None] * stride_cm + on[None, :] * stride_cn
+        tl.store(cp, result, mask=(om[:, None] < m) & (on[None, :] < n))
+
+    def int8_lora_linear(x, weight, weight_scale, down_output, up_transposed, out_dtype=torch.bfloat16):
+        """INT8 GEMM with dequantization and an already-computed LoRA-down epilogue."""
+        x2d = x.reshape(-1, x.shape[-1])
+        q, x_scale = triton_quantize_rowwise(x2d)
+        m, k = q.shape
+        n, rank = weight.shape[0], down_output.shape[-1]
+        scales = weight_scale.reshape(-1).to(torch.float32).contiguous()
+        if scales.numel() == 1:
+            scales = scales.expand(n).contiguous()
+        output = torch.empty((m, n), device=x.device, dtype=out_dtype)
+        down2d = down_output.reshape(m, rank)
+
+        def grid(meta):
+            return (triton.cdiv(m, meta["block_m"]) * triton.cdiv(n, meta["block_n"]),)
+
+        _int8_matmul_dequant_lora_kernel[grid](
+            q,
+            weight,
+            output,
+            x_scale,
+            scales,
+            down2d,
+            up_transposed,
+            m,
+            n,
+            k,
+            rank=rank,
+            stride_am=q.stride(0),
+            stride_ak=q.stride(1),
+            stride_bk=weight.stride(1),
+            stride_bn=weight.stride(0),
+            stride_cm=output.stride(0),
+            stride_cn=output.stride(1),
+            stride_dm=down2d.stride(0),
+            stride_dr=down2d.stride(1),
+            stride_ur=up_transposed.stride(0),
+            stride_un=up_transposed.stride(1),
+            block_r=triton.next_power_of_2(rank),
+        )
+        return output.reshape(*x.shape[:-1], n)
+
 else:
     triton_quantize_rowwise = None
     int8_linear = None
+    int8_lora_linear = None

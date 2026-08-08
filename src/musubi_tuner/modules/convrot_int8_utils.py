@@ -31,6 +31,7 @@ from musubi_tuner.modules.convrot_int8_kernels import (
     _build_hadamard,
     _rotate_activation,
     int8_linear,
+    int8_lora_linear,
     quantize_int8_convrot_weight,
 )
 from musubi_tuner.utils.safetensors_utils import MemoryEfficientSafeOpen, TensorWeightAdapter, WeightTransformHooks
@@ -245,6 +246,56 @@ class ConvRotInt8LinearFn(torch.autograd.Function):
         return grad_x, None, None, grad_bias, None, None, None
 
 
+class ConvRotInt8LoRAFn(torch.autograd.Function):
+    @staticmethod
+    @torch.amp.custom_fwd(device_type="cuda")
+    def forward(ctx, x, wq, w_scale, bias, groupsize, down, up, lora_scale):
+        if torch.is_autocast_enabled(x.device.type):
+            x = x.to(torch.get_autocast_dtype(x.device.type))
+        h = _build_hadamard(int(groupsize), device=x.device, dtype=x.dtype)
+        rotated = _rotate_activation(x, h, int(groupsize))
+        down_compute = down.to(x.dtype)
+        up_compute = up.to(x.dtype)
+        down_output = F.linear(x, down_compute)
+        scaled_up = up_compute.t() * lora_scale
+        output = int8_lora_linear(rotated, wq, w_scale, down_output, scaled_up, x.dtype)
+        if bias is not None:
+            output = output + bias.to(output.dtype)
+        ctx.save_for_backward(x, wq, w_scale, down, up, down_output)
+        ctx.groupsize = int(groupsize)
+        ctx.lora_scale = lora_scale
+        return output
+
+    @staticmethod
+    @torch.amp.custom_bwd(device_type="cuda")
+    def backward(ctx, grad_output):
+        x, wq, w_scale, down, up, down_output = ctx.saved_tensors
+        grad2d = grad_output.reshape(-1, grad_output.shape[-1])
+        scale = ctx.lora_scale
+        grad_down_output = F.linear(grad2d, up.to(grad2d.dtype).t()) * scale
+        h = _build_hadamard(ctx.groupsize, device=grad_output.device, dtype=grad_output.dtype)
+        rotated_down = _rotate_activation(down.to(grad_output.dtype), h, ctx.groupsize)
+        base_input = grad2d * w_scale.reshape(1, -1).to(grad2d.dtype)
+        combined_rotated = int8_lora_linear(
+            base_input,
+            wq.t().contiguous(),
+            torch.ones(wq.shape[1], device=wq.device, dtype=torch.float32),
+            grad_down_output,
+            rotated_down,
+            grad_output.dtype,
+        )
+        grad_x = _rotate_activation(combined_rotated, h, ctx.groupsize).reshape_as(x)
+        x2d = x.reshape(-1, x.shape[-1]).to(grad_down_output.dtype)
+        grad_down = (grad_down_output.t() @ x2d).to(down.dtype)
+        grad_up = ((grad2d.t() @ down_output.to(grad2d.dtype)) * scale).to(up.dtype)
+        grad_bias = grad2d.sum(0) if ctx.needs_input_grad[3] else None
+        return grad_x, None, None, grad_bias, None, grad_down, grad_up, None
+
+
+def convrot_int8_lora_forward(module, x, down, up, scale):
+    return ConvRotInt8LoRAFn.apply(x, module.weight, module.scale_weight, module.bias, module._convrot_groupsize, down, up, scale)
+
+
 def convrot_int8_linear_forward_patch(self: nn.Linear, x):
     return ConvRotInt8LinearFn.apply(
         x,
@@ -313,6 +364,7 @@ def apply_convrot_int8_monkey_patch(
             module._convrot_groupsize = groupsize
             module._convrot_bwd_mode = bwd_mode
             module._convrot_fwd_mode = fwd_mode
+            module._convrot_lora_fused = False
 
             def new_forward(self, x):
                 return convrot_int8_linear_forward_patch(self, x)
@@ -323,3 +375,13 @@ def apply_convrot_int8_monkey_patch(
 
     logger.info(f"Number of ConvRot INT8 monkey-patched Linear layers: {patched_count}")
     return model
+
+
+def enable_convrot_int8_lora_fusion(model) -> int:
+    count = 0
+    for module in model.modules():
+        if isinstance(module, nn.Linear) and hasattr(module, "_convrot_groupsize"):
+            module._convrot_lora_fused = True
+            count += 1
+    logger.info("Enabled fused ConvRot INT8 LoRA epilogues on %d Linear layers", count)
+    return count

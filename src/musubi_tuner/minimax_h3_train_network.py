@@ -422,6 +422,13 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             raise ValueError("--h3_convrot_int8_fwd bf16 requires --h3_convrot_int8")
         if args.h3_convrot_int8_fwd == "bf16" and args.h3_convrot_int8_bwd == "int8":
             raise ValueError("--h3_convrot_int8_fwd bf16 leaves no rotated activations for --h3_convrot_int8_bwd int8")
+        if args.h3_convrot_int8_lora_fused and not (
+            args.h3_convrot_int8 and args.h3_convrot_int8_fwd == "int8" and args.h3_convrot_int8_bwd == "int8"
+        ):
+            raise ValueError(
+                "--h3_convrot_int8_lora_fused requires --h3_convrot_int8 with "
+                "--h3_convrot_int8_fwd int8 and --h3_convrot_int8_bwd int8"
+            )
         if not 0.0 <= args.h3_caption_dropout_rate <= 1.0:
             raise ValueError("--h3_caption_dropout_rate must lie in [0, 1]")
         if args.h3_extension_video_frames < 0 or args.h3_extension_audio_latents < 0:
@@ -537,6 +544,12 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                     "--h3_fused_qk_norm_rope requested with --compile: compiled blocks use Inductor fusion; "
                     "the explicit Triton kernel remains active for eager calls"
                 )
+        if args.h3_convrot_int8_lora_fused:
+            from musubi_tuner.modules.convrot_int8_utils import enable_convrot_int8_lora_fusion
+
+            enabled = enable_convrot_int8_lora_fusion(transformer)
+            if enabled == 0:
+                raise RuntimeError("--h3_convrot_int8_lora_fused found no ConvRot INT8 Linear layers")
         if self._crepa_config is None:
             return
         config = getattr(transformer, "config", None)
@@ -1325,6 +1338,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             "ss_h3_convrot_int8": str(args.h3_convrot_int8),
             "ss_h3_convrot_int8_bwd": args.h3_convrot_int8_bwd,
             "ss_h3_convrot_int8_fwd": args.h3_convrot_int8_fwd,
+            "ss_h3_convrot_int8_lora_fused": str(args.h3_convrot_int8_lora_fused),
             "ss_h3_extension_video_frames": str(args.h3_extension_video_frames),
             "ss_h3_extension_audio_latents": str(args.h3_extension_audio_latents),
             "ss_h3_extension_route": args.h3_extension_route,
@@ -1550,6 +1564,14 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
             "INT8 kernel; 'bf16' undoes the rotation on the weight instead and hands the vendor GEMM an ordinary "
             "matrix. The stored weights and the arithmetic result are the same either way, so this trades "
             "quantized compute for a better-tuned kernel and is worth measuring on GPUs with fast BF16"
+        ),
+    )
+    parser.add_argument(
+        "--h3_convrot_int8_lora_fused",
+        action="store_true",
+        help=(
+            "fuse the LoRA-up projection into the ConvRot INT8 dequantization epilogue; requires online ConvRot "
+            "with INT8 forward and backward, and automatically falls back for LoRA dropout or split dimensions"
         ),
     )
     parser.add_argument(
