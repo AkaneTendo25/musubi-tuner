@@ -12,6 +12,29 @@ Two released transformers, with different conditioning contracts:
 | **FL2VA** | text-to-video, first-frame I2V, first+last keyframes, video-only, audio-only, still images |
 | **Ref2VA** | arbitrary image, video, and audio references |
 
+## Task contracts
+
+Each training objective has a fixed dataset, conditioning-cache, and transformer contract. `--task` is passed to
+`minimax_h3_cache_text_encoder_outputs.py`; the final column lists task-specific arguments for
+`minimax_h3_train_network.py`. “None” means that the default trainer contract applies.
+
+| Training objective | Example and dataset contract | Transformer | Cache `--task` | Trainer contract |
+| --- | --- | --- | --- | --- |
+| Text-to-image | [`image.toml`](../examples/minimax_h3/image.toml): `image_directory` or `image_jsonl_file` | FL2VA | `t2va` | None |
+| Text-to-video+audio | [`t2va.toml`](../examples/minimax_h3/t2va.toml): `video_directory` or `video_jsonl_file`; `h3_target_mode = "av"` is the default | FL2VA | `t2va` | None |
+| Text-to-video only | [`video_only.toml`](../examples/minimax_h3/video_only.toml): video source plus `h3_target_mode = "video"` | FL2VA | `t2va` | None |
+| Text-to-audio only | [`audio_only.toml`](../examples/minimax_h3/audio_only.toml): `audio_directory` or `audio_jsonl_file` plus `h3_target_mode = "audio"` | FL2VA | `t2va` | None |
+| Video-to-audio | [`av.toml`](../examples/minimax_h3/av.toml): synchronized video source; `h3_target_mode = "av"` is the default | FL2VA | `t2va` | `--h3_observed_modality video` |
+| Audio-to-video | [`av.toml`](../examples/minimax_h3/av.toml): synchronized video source; `h3_target_mode = "av"` is the default | FL2VA | `t2va` | `--h3_observed_modality audio` |
+| First-frame image-to-video+audio | [`i2va.toml`](../examples/minimax_h3/i2va.toml): video source; first frame comes from the target | FL2VA | `i2va` | None |
+| First+last-frame-to-video+audio | [`fl2va.toml`](../examples/minimax_h3/fl2va.toml): video source; keyframes come from the target | FL2VA | `fl2va` | None |
+| Fixed arbitrary references | [`ref2va.toml`](../examples/minimax_h3/ref2va.toml): target video plus `control_directory`, `control_path`, or numbered `control_path_N` | Ref2VA | `ref2va` | `--h3_training_mode ref2va` |
+| Zero-or-more arbitrary references | [`ref2va_omni.toml`](../examples/minimax_h3/ref2va_omni.toml): target video; JSONL may omit references or use numbered `control_path_N` | Ref2VA | `ref2va_omni` | `--h3_training_mode ref2va_omni` |
+
+For observed-modality objectives, the option names the modality supplied as clean **conditioning**, not the prediction target.
+Consequently, `--h3_observed_modality video` defines video-to-audio training. See [Training modes](#training-modes) for the
+corresponding noise and loss contracts.
+
 ## Model download
 
 Follow the repository's [installation instructions](../README.md#installation) first. Python 3.10–3.12.
@@ -73,7 +96,7 @@ python minimax_h3_generate_video.py \
 
 ## Dataset
 
-H3 uses Musubi's standard video, image, and control fields. A target video's embedded soundtrack is the audio target; a video with
+H3 uses Musubi's [shared dataset schema](./dataset_config.md) for video, image, and control fields. A target video's embedded soundtrack is the audio target; a video with
 no audio stream trains as video-only with its audio loss masked. References use `control_directory`, `control_path`, or numbered
 `control_path_N` (contiguous from zero — order sets both prompt labels and the rotary timeline):
 
@@ -109,19 +132,6 @@ An audio-only dataset needs **exactly one** `target_frames` value, and it must b
 the example above is video-only. `audio_directory` takes same-stem `.txt` captions; `audio_jsonl_file` takes records with
 `audio_path` and `caption`.
 
-Ready-made examples for every task:
-
-| Task | Example | Transformer | `--task` | `--h3_training_mode` |
-| --- | --- | --- | --- | --- |
-| Text-conditioned image | [`image.toml`](../examples/minimax_h3/image.toml) | FL2VA | `t2va` | default |
-| Text-to-video+audio | [`t2va.toml`](../examples/minimax_h3/t2va.toml) | FL2VA | `t2va` | default |
-| Video-only | [`video_only.toml`](../examples/minimax_h3/video_only.toml) | FL2VA | `t2va` | default |
-| Audio-only | [`audio_only.toml`](../examples/minimax_h3/audio_only.toml) | FL2VA | `t2va` | default |
-| First-frame I2V | [`i2va.toml`](../examples/minimax_h3/i2va.toml) | FL2VA | `i2va` | default |
-| First+last frame | [`fl2va.toml`](../examples/minimax_h3/fl2va.toml) | FL2VA | `fl2va` | default |
-| Arbitrary references | [`ref2va.toml`](../examples/minimax_h3/ref2va.toml) | Ref2VA | `ref2va` | `ref2va` |
-| Zero-or-more references | [`ref2va_omni.toml`](../examples/minimax_h3/ref2va_omni.toml) | Ref2VA | `ref2va_omni` | `ref2va_omni` |
-
 The released processor uses a 768-pixel short edge with a 1344×768 area cap. Other 32-pixel-aligned sizes work but sit outside
 the released canvas distribution.
 
@@ -150,10 +160,16 @@ use caption dropout or the guidance objective.
 
 ```shell
 # First-frame I2V
-python minimax_h3_cache_text_encoder_outputs.py   --dataset_config dataset.toml   --text_encoder /models/MiniMax-H3/text_encoders/qwen3vl_32b_minimax_h3_bf16.safetensors   --task i2va --device cuda
+python minimax_h3_cache_text_encoder_outputs.py \
+  --dataset_config dataset.toml \
+  --text_encoder /models/MiniMax-H3/text_encoders/qwen3vl_32b_minimax_h3_bf16.safetensors \
+  --task i2va --device cuda
 
 # First+last frame
-python minimax_h3_cache_text_encoder_outputs.py   --dataset_config dataset.toml   --text_encoder /models/MiniMax-H3/text_encoders/qwen3vl_32b_minimax_h3_bf16.safetensors   --task fl2va --device cuda
+python minimax_h3_cache_text_encoder_outputs.py \
+  --dataset_config dataset.toml \
+  --text_encoder /models/MiniMax-H3/text_encoders/qwen3vl_32b_minimax_h3_bf16.safetensors \
+  --task fl2va --device cuda
 ```
 
 > [!IMPORTANT]
@@ -164,7 +180,11 @@ To reduce conditioner VRAM, add `--text_encoder_quantization int8` or `nf4` to t
 pre-quantized file with `--text_encoder_quantization nvfp4_awq`:
 
 ```shell
-python minimax_h3_cache_text_encoder_outputs.py   --dataset_config dataset.toml   --text_encoder /models/MiniMax-H3/text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors   --text_encoder_quantization nvfp4_awq   --task t2va --device cuda
+python minimax_h3_cache_text_encoder_outputs.py \
+  --dataset_config dataset.toml \
+  --text_encoder /models/MiniMax-H3/text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors \
+  --text_encoder_quantization nvfp4_awq \
+  --task t2va --device cuda
 ```
 
 All three are precision trade-offs, not equivalents. They reduce GPU residency only: the BF16 checkpoint is still memory-mapped
@@ -210,7 +230,7 @@ address through an SSH forward rather than exposing it publicly.
 | `--timestep_sampling` | `uniform` | Use `uniform`, `sigmoid`, or `logsnr`. The dynamic-shift modes double-shift the schedule and ignore H3's temporal extent. |
 | `--discrete_flow_shift` | `1.0` | Must stay at the default; H3 applies its own shifts. |
 | `--h3_image_flow_shift` | auto | Fixed shift for image batches only. |
-| `--h3_video_loss_weight` / `--h3_audio_loss_weight` | `1.0` | Modality weights. `--h3_loss_mode token` switches to element weighting. |
+| `--h3_video_loss_weight` / `--h3_audio_loss_weight` | `1.0` | Modality weights. `--h3_loss_balance token` switches from equal modality means to element weighting. |
 
 ### Memory and speed
 
@@ -220,7 +240,7 @@ Quantize the frozen base, reduce AdaLN, then swap blocks — in that order.
   --h3_convrot_int8 --h3_convrot_int8_fwd bf16 --h3_adaln_rank 16
 ```
 
-**This is the recommended configuration.** ConvRot INT8 stores the frozen linear weights at one byte per value,
+This is the recommended configuration. ConvRot INT8 stores the frozen linear weights at one byte per value,
 `--h3_convrot_int8_fwd bf16` evaluates those weights with BF16 activations, and rank 16 replaces the full AdaLN projections with
 compact factors.
 
@@ -236,20 +256,20 @@ compact factors.
 To train against the released pre-quantized transformer instead, pass it with `--int8_convrot_base`:
 
 ```shell
-accelerate launch minimax_h3_train_network.py   --dit /models/MiniMax-H3/diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors   --int8_convrot_base --sdpa --mixed_precision bf16   --dataset_config dataset.toml   --network_module networks.lora_minimax_h3   --network_dim 16 --network_alpha 16
+accelerate launch minimax_h3_train_network.py \
+  --dit /models/MiniMax-H3/diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors \
+  --int8_convrot_base --sdpa --mixed_precision bf16 \
+  --dataset_config dataset.toml \
+  --network_module networks.lora_minimax_h3 \
+  --network_dim 16 --network_alpha 16
 ```
 
 Generic LoRAs passed through `--base_weights` are merged while H3 loads. With a pre-quantized ConvRot base, only affected layers
 are dequantized, all requested LoRAs and `--base_weights_multiplier` values are accumulated in FP32, and each layer is
 requantized once. The resulting frozen base is then used for ordinary LoRA training.
 
-`--h3_adaln_rank` is more faithful than quantizing those projections and composes with either quantization. It is rejected on
+`--h3_adaln_rank` avoids quantizing the AdaLN projections and composes with either quantization mode. It is rejected on
 already-pruned and INT8 ConvRot checkpoints.
-
-| Base | Default | With `--h3_adaln_rank 16` |
-| --- | --- | --- |
-| BF16 | 66.2 GB | 40.5 GB |
-| One byte per weight | 33.1 GB | 20.4 GB |
 
 Block swapping streams frozen weights from host memory. It is valid only while the base is frozen:
 
@@ -283,22 +303,21 @@ PYTORCH_ALLOC_CONF=expandable_segments:True accelerate launch minimax_h3_train_n
   --output_dir output --output_name h3_style
 ```
 
-This is the balanced minimum-memory preset. If it still exceeds available VRAM, add
+If this configuration exceeds available VRAM, add
 `--block_swap_granularity layer`, raise `--blocks_to_swap` to `50`, and use `--block_swap_ring_size 1`; those settings trade
-throughput for lower device residency. The BF16 checkpoint itself contains about 61.7 GiB of tensor data, so a full CPU-staging
-loader can exceed a 64 GB host after process overhead. H3 block-swap loading instead materializes only CPU-master blocks on the
-host. The number of swapped blocks therefore controls both host and device residency.
+throughput for lower device residency. Block-swap loading materializes CPU-master copies only for swapped blocks, so
+`--blocks_to_swap` affects both host and device residency. Total training memory also depends on packed sequence length,
+attention workspaces, adapter rank, gradients, and optimizer state.
 
-For the command above, loading the BF16 FL2VA checkpoint peaked at 21.09 GiB process RSS and left 3.02 GiB of model and swap
-buffers allocated on the GPU. These are loader figures, not total training requirements: activations, attention workspaces, LoRA
-parameters, gradients, and optimizer state are added according to the largest packed batch.
-
-Use `--h3_gradient_checkpointing_cpu_offload_pin_memory` only when the host has substantial free RAM. A 38.9k-row Ref2VA
-batch requires about 20–21 GiB of pinned RAM in addition to model-loading and dataset memory.
+Use `--h3_gradient_checkpointing_cpu_offload_pin_memory` only when the host has substantial free RAM. Long Ref2VA sequences can
+require substantial pinned memory in addition to model-loading and dataset memory.
 
 ### Training modes
 
-All of these draw their conditioning from the target itself, so an ordinary `--task t2va` cache is enough.
+These modes use target-derived conditioning and therefore use a `t2va` conditioning cache. For observed-modality training,
+`h3_target_mode = "av"` is required and each target video must contain its synchronized soundtrack. An audio-only dataset has no
+video rows and cannot train video-to-audio conditioning. The observed modality remains in the packed attention sequence but its
+loss weight is forced to zero; this isolates direct supervision, not H3's shared attention parameters.
 
 | Option | Trains |
 | --- | --- |
@@ -329,8 +348,8 @@ fraction range can leave nothing observed.
 
 ### Auxiliary objectives
 
-Each adds a full no-gradient forward over the whole packed sequence — roughly `1.25×` a plain step for one, `1.5×` for both. This
-matters most for Ref2VA, where the enlarged sequence is re-processed every pass.
+Each auxiliary objective adds a no-gradient forward over the packed sequence. The overhead increases with packed sequence length
+and is therefore larger for reference-conditioned batches.
 
 | Option | Purpose |
 | --- | --- |
@@ -339,13 +358,10 @@ matters most for Ref2VA, where the enlarged sequence is re-processed every pass.
 | `--h3_base_preservation_loss_weight 0.05` | Penalizes drift from the frozen base's prediction. Anchors to whichever base is loaded, quantized or not. |
 | `--crepa` | Temporal representation alignment for video training. |
 
-The H3 base-preservation/distillation-loss technique was proposed by [@Ada123-a](https://github.com/Ada123-a). Ada's community
-experiments reported weights around `0.05`–`0.10` with guidance scale `3`; the current guidance-scale recommendation is `4` because
-`3` is generally too weak. Treat the reported weights only as starting points: the appropriate
-weight also depends on training length, as well as quantization, rank, dataset, and learning rate. A weight that is useful for a
-short run can anchor a long run too strongly to the frozen model and eventually prevent the adapter from learning the dataset.
-Monitor training and validation samples, and reduce or disable the weight when preservation begins to dominate; changing it when
-resuming training is supported.
+Treat `--h3_base_preservation_loss_weight 0.05` as an initial value rather than a universal setting. Its effect depends on
+training length, quantization, adapter rank, dataset, and learning rate. Excessive weight anchors the adapter to the frozen base
+and can prevent it from fitting the dataset. Monitor training and validation samples, and reduce or disable the objective when
+preservation dominates. The value can be changed when resuming training.
 
 CREPA aligns projected features from an earlier block with a later block (`mode=backbone`) or with frozen DINOv2 features
 (`mode=dino`). Only generated video rows participate; image, audio-only, and video-observed batches are skipped.
@@ -446,7 +462,3 @@ python minimax_h3_generate_video.py \
 with a JSON sidecar recording prompt, geometry, schedule, LoRA names, timings, and memory peaks.
 
 The released weights are CFG-distilled: inference runs one evaluation per step with no negative-prompt branch.
-
-## Dataset configuration reference
-
-See [dataset_config.md](./dataset_config.md) for the shared dataset schema.
