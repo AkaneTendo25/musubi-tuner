@@ -105,6 +105,34 @@ def test_h3_base_lora_merge_requantizes_each_int8_layer_once(monkeypatch):
     torch.testing.assert_close(actual, expected, rtol=0.03, atol=0.04)
 
 
+def test_h3_base_lora_merge_preserves_floating_targets_in_mixed_checkpoint():
+    torch.manual_seed(11)
+    model_key = "final_layer.video_out.weight"
+    lora_name = "lora_unet_final_layer_video_out"
+    base = torch.randn(6, 8, dtype=torch.bfloat16)
+    down = torch.randn(2, 8)
+    up = torch.randn(6, 2)
+    state_dict = {model_key: base.clone()}
+    lora = {
+        f"{lora_name}.lora_down.weight": down,
+        f"{lora_name}.lora_up.weight": up,
+        f"{lora_name}.alpha": torch.tensor(1.0),
+    }
+    expected = base.float().addmm(up, down, alpha=0.25).to(torch.bfloat16)
+
+    matched, requantized = _merge_base_loras_into_int8_state_dict(
+        state_dict,
+        [lora],
+        [0.5],
+        calc_device=torch.device("cpu"),
+    )
+
+    assert matched == [1]
+    assert requantized == 0
+    assert state_dict[model_key].dtype is torch.bfloat16
+    torch.testing.assert_close(state_dict[model_key], expected)
+
+
 def test_h3_base_lora_validation_rejects_unpaired_and_unmatched_weights():
     model_keys = {"blocks.0.mlp.fc1.weight"}
     name = "lora_unet_blocks_0_mlp_fc1"

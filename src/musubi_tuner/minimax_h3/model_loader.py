@@ -106,7 +106,12 @@ def _merge_base_loras_into_int8_state_dict(
     *,
     calc_device: torch.device,
 ) -> tuple[list[int], int]:
-    """Merge generic base LoRAs and requantize each affected ConvRot layer once."""
+    """Merge generic base LoRAs into a mixed-precision ConvRot checkpoint.
+
+    Pre-quantized H3 checkpoints keep excluded projections and other sensitive
+    tensors floating point.  Accumulate every matching LoRA in FP32, then
+    requantize only weights that are actually stored as ConvRot INT8.
+    """
     matched_counts = _validate_base_lora_matches(set(state_dict), lora_weights_list)
     multipliers = list(lora_multipliers or [])
     multipliers.extend([1.0] * (len(lora_weights_list) - len(multipliers)))
@@ -127,20 +132,26 @@ def _merge_base_loras_into_int8_state_dict(
         if not matches:
             continue
 
-        if model_weight.dtype is not torch.int8:
-            raise TypeError(f"MiniMax H3 INT8 base LoRA target {model_weight_key!r} is not INT8")
         base = model_weight_key[: -len(".weight")]
         scale_key = f"{base}.scale_weight"
         group_size_key = f"{base}.int8_convrot_groupsize"
-        if scale_key not in state_dict or group_size_key not in state_dict:
-            raise ValueError(f"INT8 ConvRot base LoRA target {model_weight_key!r} is missing scale or group size")
         original_device = model_weight.device
-        group_size = int(state_dict[group_size_key].detach().cpu().item())
-        merged_weight = dequantize_int8_convrot_weight(
-            model_weight.to(calc_device),
-            state_dict[scale_key].to(calc_device),
-            group_size,
-        ).float()
+        is_int8 = model_weight.dtype is torch.int8
+        if is_int8:
+            if scale_key not in state_dict or group_size_key not in state_dict:
+                raise ValueError(f"INT8 ConvRot base LoRA target {model_weight_key!r} is missing scale or group size")
+            group_size = int(state_dict[group_size_key].detach().cpu().item())
+            merged_weight = dequantize_int8_convrot_weight(
+                model_weight.to(calc_device),
+                state_dict[scale_key].to(calc_device),
+                group_size,
+            ).float()
+        elif model_weight.is_floating_point():
+            merged_weight = model_weight.to(device=calc_device, dtype=torch.float32)
+        else:
+            raise TypeError(
+                f"MiniMax H3 base LoRA target {model_weight_key!r} must be floating point or ConvRot INT8, got {model_weight.dtype}"
+            )
 
         for index, down_key, up_key, alpha_key in matches:
             lora_weights = lora_weights_list[index]
@@ -166,10 +177,13 @@ def _merge_base_loras_into_int8_state_dict(
             merged_weight.addmm_(up, down, beta=1.0, alpha=multipliers[index] * alpha / rank)
             remaining_keys[index].difference_update((down_key, up_key, alpha_key))
 
-        quantized, scale = quantize_int8_convrot_weight(merged_weight, group_size)
-        state_dict[model_weight_key] = quantized.to(original_device)
-        state_dict[scale_key] = scale.to(state_dict[scale_key].device)
-        requantized_layers += 1
+        if is_int8:
+            quantized, scale = quantize_int8_convrot_weight(merged_weight, group_size)
+            state_dict[model_weight_key] = quantized.to(original_device)
+            state_dict[scale_key] = scale.to(state_dict[scale_key].device)
+            requantized_layers += 1
+        else:
+            state_dict[model_weight_key] = merged_weight.to(device=original_device, dtype=model_weight.dtype)
 
     for index, unused in enumerate(remaining_keys):
         if unused:
