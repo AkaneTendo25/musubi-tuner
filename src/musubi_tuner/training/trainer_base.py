@@ -1964,11 +1964,32 @@ class NetworkTrainer:
                 init_kwargs=init_kwargs,
             )
 
-        # TODO skip until initial step
-        progress_bar = tqdm(range(args.max_train_steps), smoothing=0, disable=not accelerator.is_local_main_process, desc="steps")
+        global_step = train_utils.get_resume_step(
+            args.resume,
+            lr_scheduler=lr_scheduler,
+            optimizer=optimizer,
+            num_processes=accelerator.num_processes,
+        )
+        epoch_to_start, resume_batches_to_skip = train_utils.get_resume_position(
+            global_step,
+            num_update_steps_per_epoch,
+            args.gradient_accumulation_steps,
+            len(train_dataloader),
+        )
+        if global_step:
+            accelerator.print(
+                f"resuming from optimization step {global_step}: epoch {epoch_to_start + 1}, "
+                f"skipping {resume_batches_to_skip} completed batches"
+            )
 
-        epoch_to_start = 0
-        global_step = 0
+        progress_bar = tqdm(
+            range(args.max_train_steps),
+            initial=min(global_step, args.max_train_steps),
+            smoothing=0,
+            disable=not accelerator.is_local_main_process,
+            desc="steps",
+        )
+
         noise_scheduler = FlowMatchDiscreteScheduler(shift=args.discrete_flow_shift, reverse=True, solver="euler")
 
         loss_recorder = train_utils.LossRecorder()
@@ -2060,10 +2081,14 @@ class NetworkTrainer:
             )
             return True
 
+        # A dashboard stop is polled at batch boundaries. Keep the flag local
+        # so the normal final-state save path can run before exiting.
+        dashboard_stop_requested = train_utils.is_dashboard_stop_requested()
+
         # Validation intentionally precedes sampling when both run at startup.
         should_validate_at_start = should_validate(args, global_step, epoch=0, at_start=True)
         should_sample_at_start = should_sample_images(args, global_step, epoch=0)
-        if should_validate_at_start or should_sample_at_start:
+        if not dashboard_stop_requested and (should_validate_at_start or should_sample_at_start):
             optimizer_eval_fn()
             if should_validate_at_start:
                 _do_validation(0, global_step, at_start=True)
@@ -2088,6 +2113,10 @@ class NetworkTrainer:
         optimizer_train_fn()  # Set training mode
 
         for epoch in range(epoch_to_start, num_train_epochs):
+            if train_utils.is_dashboard_stop_requested():
+                dashboard_stop_requested = True
+                break
+
             accelerator.print(f"\nepoch {epoch + 1}/{num_train_epochs}")
             current_epoch.value = epoch + 1
 
@@ -2095,7 +2124,19 @@ class NetworkTrainer:
 
             accelerator.unwrap_model(network).on_epoch_start(transformer)
 
-            for step, batch in enumerate(train_dataloader):
+            if hasattr(train_dataloader, "set_epoch"):
+                train_dataloader.set_epoch(epoch)
+            epoch_dataloader = train_dataloader
+            if epoch == epoch_to_start and resume_batches_to_skip:
+                epoch_dataloader = accelerator.skip_first_batches(train_dataloader, resume_batches_to_skip)
+            if hasattr(epoch_dataloader, "set_epoch"):
+                epoch_dataloader.set_epoch(epoch)
+
+            for step, batch in enumerate(epoch_dataloader):
+                if train_utils.is_dashboard_stop_requested():
+                    dashboard_stop_requested = True
+                    break
+
                 # torch.compiler.cudagraph_mark_step_begin() # for cudagraphs
 
                 latents = self.get_primary_latents(batch)
@@ -2209,8 +2250,16 @@ class NetworkTrainer:
                     logs.update(self.extra_step_logs(args, logs))
                     accelerator.log(logs, step=global_step)
 
+                if train_utils.is_dashboard_stop_requested():
+                    dashboard_stop_requested = True
+                    break
+
                 if global_step >= args.max_train_steps:
                     break
+
+            if dashboard_stop_requested:
+                accelerator.print("\nDashboard stop requested; finishing and saving training state.")
+                break
 
             if len(accelerator.trackers) > 0:
                 logs = {"loss/epoch": loss_recorder.moving_average}
@@ -2254,6 +2303,7 @@ class NetworkTrainer:
 
         if is_main_process:
             ckpt_name = train_utils.get_last_ckpt_name(args.output_name)
-            save_model(ckpt_name, network, global_step, num_train_epochs, force_sync_upload=True)
+            final_epoch = current_epoch.value if dashboard_stop_requested else num_train_epochs
+            save_model(ckpt_name, network, global_step, final_epoch, force_sync_upload=True)
 
             logger.info("model saved.")

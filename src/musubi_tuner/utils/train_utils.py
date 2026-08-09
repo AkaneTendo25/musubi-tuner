@@ -1,7 +1,9 @@
 import argparse
 import logging
 import os
+import re
 import shutil
+from pathlib import Path
 from typing import Callable
 
 import accelerate
@@ -12,6 +14,74 @@ from musubi_tuner.utils.model_utils import str_to_dtype
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
+
+
+def is_dashboard_stop_requested() -> bool:
+    """Return whether the dashboard requested a graceful training stop."""
+    stop_file = os.environ.get("MUSUBI_DASHBOARD_STOP_FILE")
+    if not stop_file:
+        return False
+    try:
+        return Path(stop_file).is_file()
+    except OSError:
+        return False
+
+
+_STEP_STATE_DIR_RE = re.compile(r"-step(?P<step>\d+)-state$")
+
+
+def get_resume_step(
+    resume_path: str | None,
+    lr_scheduler=None,
+    optimizer=None,
+    num_processes: int = 1,
+) -> int:
+    """Recover the completed optimization step from a loaded training state."""
+    if not resume_path:
+        return 0
+
+    candidates: list[int] = []
+    match = _STEP_STATE_DIR_RE.search(Path(resume_path).name)
+    if match:
+        candidates.append(int(match.group("step")))
+
+    scheduler = getattr(lr_scheduler, "scheduler", lr_scheduler)
+    scheduler_step = getattr(scheduler, "last_epoch", None)
+    if scheduler_step is not None:
+        try:
+            candidates.append(max(0, int(scheduler_step) // max(1, int(num_processes))))
+        except (TypeError, ValueError):
+            pass
+
+    raw_optimizer = getattr(optimizer, "optimizer", optimizer)
+    optimizer_steps = []
+    for state in getattr(raw_optimizer, "state", {}).values():
+        step = state.get("step") if isinstance(state, dict) else None
+        if step is None:
+            continue
+        try:
+            optimizer_steps.append(int(step.item() if hasattr(step, "item") else step))
+        except (TypeError, ValueError):
+            continue
+    if optimizer_steps:
+        candidates.append(max(optimizer_steps))
+
+    return max(candidates, default=0)
+
+
+def get_resume_position(
+    completed_steps: int,
+    update_steps_per_epoch: int,
+    gradient_accumulation_steps: int,
+    batches_per_epoch: int,
+) -> tuple[int, int]:
+    """Return the zero-based epoch and batch count already consumed there."""
+    if update_steps_per_epoch <= 0:
+        raise ValueError("update_steps_per_epoch must be positive")
+    epoch = completed_steps // update_steps_per_epoch
+    steps_into_epoch = completed_steps % update_steps_per_epoch
+    batches_to_skip = min(batches_per_epoch, steps_into_epoch * gradient_accumulation_steps)
+    return epoch, batches_to_skip
 
 
 # checkpointファイル名
