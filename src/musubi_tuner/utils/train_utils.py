@@ -1,4 +1,7 @@
+from __future__ import annotations
+
 import argparse
+import json
 import logging
 import os
 import shutil
@@ -15,6 +18,7 @@ logging.basicConfig(level=logging.INFO)
 
 
 # checkpointファイル名
+RESUME_METADATA_NAME = "resume_metadata.json"
 EPOCH_STATE_NAME = "{}-{:06d}-state"
 EPOCH_FILE_NAME = "{}-{:06d}"
 EPOCH_DIFFUSERS_DIR_NAME = "{}-{:06d}"
@@ -22,6 +26,83 @@ LAST_STATE_NAME = "{}-state"
 STEP_STATE_NAME = "{}-step{:08d}-state"
 STEP_FILE_NAME = "{}-step{:08d}"
 STEP_DIFFUSERS_DIR_NAME = "{}-step{:08d}"
+
+
+def save_resume_metadata(
+    state_dir: str,
+    global_step: int,
+    step_in_epoch: int,
+    epoch: int,
+    data_seed: int | None = None,
+) -> None:
+    """Atomically save Musubi's training position beside an Accelerate state."""
+    metadata = {
+        "global_step": int(global_step),
+        "step_in_epoch": int(step_in_epoch),
+        "epoch": int(epoch),
+    }
+    if data_seed is not None:
+        metadata["data_seed"] = int(data_seed)
+    path = os.path.join(state_dir, RESUME_METADATA_NAME)
+    tmp_path = path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(metadata, f)
+    os.replace(tmp_path, path)
+
+
+def load_resume_metadata(state_dir: str) -> dict | None:
+    """Load Musubi training-position metadata, if this state has it."""
+    path = os.path.join(state_dir, RESUME_METADATA_NAME)
+    if not os.path.exists(path):
+        return None
+
+    try:
+        with open(path, encoding="utf-8") as f:
+            metadata = json.load(f)
+        if not isinstance(metadata, dict):
+            logger.warning("Resume metadata in %s must be a JSON object", path)
+            return None
+        return metadata
+    except (OSError, UnicodeError, json.JSONDecodeError, TypeError) as e:
+        logger.warning("Could not read resume metadata from %s: %s", path, e)
+        return None
+
+
+def get_resume_position(
+    initial_global_step: int,
+    num_update_steps_per_epoch: int,
+    metadata: dict | None,
+    num_batches_per_epoch: int | None = None,
+) -> tuple[int, int]:
+    """Return the zero-based epoch and number of already-consumed batches to skip."""
+    if initial_global_step <= 0:
+        return 0, 0
+
+    try:
+        metadata_global_step = int(metadata.get("global_step", 0)) if metadata is not None else 0
+    except (TypeError, ValueError):
+        metadata_global_step = 0
+
+    if metadata_global_step > 0:
+        try:
+            saved_epoch = int(metadata.get("epoch", 1))
+            step_in_epoch = int(metadata.get("step_in_epoch", 0))
+        except (TypeError, ValueError):
+            return initial_global_step // max(num_update_steps_per_epoch, 1), 0
+        if num_batches_per_epoch is not None and step_in_epoch >= num_batches_per_epoch:
+            return max(saved_epoch, 0), 0
+        if step_in_epoch > 0:
+            return max(saved_epoch - 1, 0), step_in_epoch
+        return max(saved_epoch, 0), 0
+
+    return initial_global_step // max(num_update_steps_per_epoch, 1), 0
+
+
+def normalize_step_in_epoch(step_in_epoch: int, num_batches_per_epoch: int) -> int:
+    """Represent an epoch-boundary checkpoint as the start of the following epoch."""
+    if step_in_epoch >= num_batches_per_epoch:
+        return 0
+    return max(step_in_epoch, 0)
 
 
 def get_sanitized_config_or_none(args: argparse.Namespace):
@@ -116,7 +197,13 @@ def get_remove_step_no(args: argparse.Namespace, step_no: int):
     return remove_step_no
 
 
-def save_and_remove_state_on_epoch_end(args: argparse.Namespace, accelerator: accelerate.Accelerator, epoch_no: int):
+def save_and_remove_state_on_epoch_end(
+    args: argparse.Namespace,
+    accelerator: accelerate.Accelerator,
+    epoch_no: int,
+    global_step: int = 0,
+    step_in_epoch: int = 0,
+):
     model_name = args.output_name
 
     logger.info("")
@@ -125,6 +212,7 @@ def save_and_remove_state_on_epoch_end(args: argparse.Namespace, accelerator: ac
 
     state_dir = os.path.join(args.output_dir, EPOCH_STATE_NAME.format(model_name, epoch_no))
     accelerator.save_state(state_dir)
+    save_resume_metadata(state_dir, global_step, step_in_epoch, epoch_no, data_seed=getattr(args, "seed", None))
     if args.save_state_to_huggingface:
         logger.info("uploading state to huggingface.")
         huggingface_utils.upload(args, state_dir, "/" + EPOCH_STATE_NAME.format(model_name, epoch_no))
@@ -138,7 +226,13 @@ def save_and_remove_state_on_epoch_end(args: argparse.Namespace, accelerator: ac
             shutil.rmtree(state_dir_old)
 
 
-def save_and_remove_state_stepwise(args: argparse.Namespace, accelerator: accelerate.Accelerator, step_no: int):
+def save_and_remove_state_stepwise(
+    args: argparse.Namespace,
+    accelerator: accelerate.Accelerator,
+    step_no: int,
+    epoch: int = 0,
+    step_in_epoch: int = 0,
+):
     model_name = args.output_name
 
     logger.info("")
@@ -147,6 +241,7 @@ def save_and_remove_state_stepwise(args: argparse.Namespace, accelerator: accele
 
     state_dir = os.path.join(args.output_dir, STEP_STATE_NAME.format(model_name, step_no))
     accelerator.save_state(state_dir)
+    save_resume_metadata(state_dir, step_no, step_in_epoch, epoch, data_seed=getattr(args, "seed", None))
     if args.save_state_to_huggingface:
         logger.info("uploading state to huggingface.")
         huggingface_utils.upload(args, state_dir, "/" + STEP_STATE_NAME.format(model_name, step_no))
@@ -164,7 +259,13 @@ def save_and_remove_state_stepwise(args: argparse.Namespace, accelerator: accele
                 shutil.rmtree(state_dir_old)
 
 
-def save_state_on_train_end(args: argparse.Namespace, accelerator: accelerate.Accelerator):
+def save_state_on_train_end(
+    args: argparse.Namespace,
+    accelerator: accelerate.Accelerator,
+    global_step: int = 0,
+    epoch: int = 0,
+    step_in_epoch: int = 0,
+):
     model_name = args.output_name
 
     logger.info("")
@@ -173,6 +274,7 @@ def save_state_on_train_end(args: argparse.Namespace, accelerator: accelerate.Ac
 
     state_dir = os.path.join(args.output_dir, LAST_STATE_NAME.format(model_name))
     accelerator.save_state(state_dir)
+    save_resume_metadata(state_dir, global_step, step_in_epoch, epoch, data_seed=getattr(args, "seed", None))
 
     if args.save_state_to_huggingface:
         logger.info("uploading last state to huggingface.")

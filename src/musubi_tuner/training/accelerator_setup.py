@@ -9,7 +9,7 @@ import time
 import torch
 from packaging.version import Version
 from accelerate import Accelerator, InitProcessGroupKwargs, DistributedDataParallelKwargs
-from accelerate.utils import TorchDynamoPlugin, DynamoBackend
+from accelerate.utils import DataLoaderConfiguration, TorchDynamoPlugin, DynamoBackend
 
 
 def clean_memory_on_device(device: torch.device):
@@ -115,6 +115,7 @@ def prepare_accelerator(args: argparse.Namespace) -> Accelerator:
         mixed_precision=args.mixed_precision if args.mixed_precision else None,
         log_with=log_with,
         project_dir=logging_dir,
+        dataloader_config=DataLoaderConfiguration(use_seedable_sampler=True, data_seed=args.seed),
         dynamo_plugin=dynamo_plugin,
         kwargs_handlers=kwargs_handlers,
     )
