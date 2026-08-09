@@ -572,7 +572,11 @@ def _add_network_args(parser: argparse.ArgumentParser) -> None:
         "--no_metadata", action="store_true", help="do not save metadata in output model / メタデータを出力先モデルに保存しない"
     )
     parser.add_argument(
-        "--network_weights", type=str, default=None, help="pretrained weights for network / 学習するネットワークの初期重み"
+        "--network_weights",
+        type=str,
+        default=None,
+        help="initial network/LoRA weights only; optimizer, scheduler, and step start fresh at 0 / "
+        "学習するネットワークの初期重みのみ（optimizer、scheduler、stepは0から開始）",
     )
     parser.add_argument(
         "--network_module", type=str, default=None, help="network module to train / 学習対象のネットワークのモジュール"
@@ -645,7 +649,19 @@ def _add_save_load_args(parser: argparse.ArgumentParser) -> None:
         default=None,
         help="base name of trained model file / 学習後のモデルの拡張子を除くファイル名",
     )
-    parser.add_argument("--resume", type=str, default=None, help="saved state to resume training / 学習再開するモデルのstate")
+    parser.add_argument(
+        "--resume",
+        type=str,
+        default=None,
+        help="Accelerate *-state directory saved with --save_state (not a .safetensors file) / "
+        "--save_stateで保存したAccelerateの*-stateディレクトリ（.safetensorsファイルではない）",
+    )
+    parser.add_argument(
+        "--autoresume",
+        action="store_true",
+        help="resume from the latest complete state for output_name in output_dir; explicit --resume wins / "
+        "output_dir内のoutput_nameに一致する最新の完全なstateから再開（--resumeを優先）",
+    )
 
     parser.add_argument(
         "--save_every_n_epochs",

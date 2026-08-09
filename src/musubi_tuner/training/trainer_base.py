@@ -57,7 +57,14 @@ from musubi_tuner.training.accelerator_setup import (
     collator_class,
     prepare_accelerator,
 )
-from musubi_tuner.training.resume_utils import configure_dataloader_for_epoch, recover_global_step
+from musubi_tuner.training.resume_utils import (
+    capture_training_rng_state,
+    configure_dataloader_for_epoch,
+    find_latest_state_dir,
+    recover_global_step,
+    restore_training_rng_state,
+    validate_resume_state_dir,
+)
 from musubi_tuner.training.sampling_prompts import should_sample_images
 from musubi_tuner.training.validation import ValidationEventDeduplicator, should_validate, validate_validation_args
 from musubi_tuner.training.timesteps import (
@@ -490,13 +497,16 @@ class NetworkTrainer:
     def resume_from_local_or_hf_if_specified(self, accelerator: Accelerator, args: argparse.Namespace) -> int:
         if not args.resume:
             self._resume_state_dir = None
+            self._resume_rng_state = None
             return 0
 
         if not args.resume_from_huggingface:
             logger.info(f"resume training from local state: {args.resume}")
+            validate_resume_state_dir(args.resume, accelerator.process_index, accelerator.num_processes)
             accelerator.load_state(args.resume)
+            self._resume_rng_state = capture_training_rng_state()
             self._resume_state_dir = args.resume
-            return self.recover_global_step(args.resume)
+            return recover_global_step(args.resume, strict=True)
 
         logger.info(f"resume training from huggingface state: {args.resume}")
         repo_id = args.resume.split("/")[0] + "/" + args.resume.split("/")[1]
@@ -539,10 +549,12 @@ class NetworkTrainer:
                 "No files found in the specified repo id/path/revision / 指定されたリポジトリID/パス/リビジョンにファイルが見つかりませんでした"
             )
         dirname = os.path.dirname(results[0])
+        validate_resume_state_dir(dirname, accelerator.process_index, accelerator.num_processes)
         accelerator.load_state(dirname)
+        self._resume_rng_state = capture_training_rng_state()
         self._resume_state_dir = dirname
 
-        return self.recover_global_step(dirname)
+        return recover_global_step(dirname, strict=True)
 
     def get_bucketed_timestep(self) -> float:
         if self.num_timestep_buckets is None or self.num_timestep_buckets <= 1:
@@ -1694,6 +1706,7 @@ class NetworkTrainer:
             # FIXME consider alpha of weights: this assumes that the alpha is not changed
             info = network.load_weights(args.network_weights)
             accelerator.print(f"load network weights from {args.network_weights}: {info}")
+            accelerator.print("--network_weights loads LoRA weights only; optimizer, scheduler, and global step start at 0")
 
         if args.gradient_checkpointing:
             transformer.enable_gradient_checkpointing(args.gradient_checkpointing_cpu_offload)
@@ -1852,6 +1865,14 @@ class NetworkTrainer:
 
         accelerator.register_save_state_pre_hook(save_model_hook)
         accelerator.register_load_state_pre_hook(load_model_hook)
+
+        if getattr(args, "autoresume", False) and not args.resume:
+            latest_state = find_latest_state_dir(args, accelerator.num_processes)
+            if latest_state is None:
+                logger.info("autoresume: no complete state found in output_dir; starting from scratch")
+            else:
+                logger.info("autoresume: resuming from latest complete state: %s", latest_state)
+                args.resume = latest_state
 
         return self.resume_from_local_or_hf_if_specified(accelerator, args)
 
@@ -2160,6 +2181,7 @@ class NetworkTrainer:
 
         last_epoch = epoch_to_start
         last_step_in_epoch = 0
+        resume_rng_state = getattr(self, "_resume_rng_state", None)
         if resume_metadata is not None:
             try:
                 if int(resume_metadata.get("global_step", 0)) > 0:
@@ -2180,9 +2202,18 @@ class NetworkTrainer:
 
             configure_dataloader_for_epoch(train_dataloader, epoch, data_seed)
 
+            if resume_rng_state is not None and steps_to_skip_in_epoch == 0:
+                restore_training_rng_state(resume_rng_state)
+                resume_rng_state = None
+                self._resume_rng_state = None
+
             for step, batch in enumerate(train_dataloader):
                 if steps_to_skip_in_epoch > 0:
                     steps_to_skip_in_epoch -= 1
+                    if steps_to_skip_in_epoch == 0 and resume_rng_state is not None:
+                        restore_training_rng_state(resume_rng_state)
+                        resume_rng_state = None
+                        self._resume_rng_state = None
                     continue
 
                 # torch.compiler.cudagraph_mark_step_begin() # for cudagraphs
@@ -2271,16 +2302,17 @@ class NetworkTrainer:
                                 ckpt_name = train_utils.get_step_ckpt_name(args.output_name, global_step)
                                 save_model(ckpt_name, accelerator.unwrap_model(network), global_step, epoch)
 
-                                if args.save_state:
-                                    step_in_epoch = train_utils.normalize_step_in_epoch(step + 1, len(train_dataloader))
-                                    train_utils.save_and_remove_state_stepwise(
-                                        args,
-                                        accelerator,
-                                        global_step,
-                                        epoch=epoch + 1,
-                                        step_in_epoch=step_in_epoch,
-                                    )
+                            if args.save_state:
+                                step_in_epoch = train_utils.normalize_step_in_epoch(step + 1, len(train_dataloader))
+                                train_utils.save_and_remove_state_stepwise(
+                                    args,
+                                    accelerator,
+                                    global_step,
+                                    epoch=epoch + 1,
+                                    step_in_epoch=step_in_epoch,
+                                )
 
+                            if accelerator.is_main_process:
                                 remove_step_no = train_utils.get_remove_step_no(args, global_step)
                                 if remove_step_no is not None:
                                     remove_ckpt_name = train_utils.get_step_ckpt_name(args.output_name, remove_step_no)
@@ -2324,14 +2356,15 @@ class NetworkTrainer:
             optimizer_eval_fn()
             if args.save_every_n_epochs is not None:
                 saving = (epoch + 1) % args.save_every_n_epochs == 0 and (epoch + 1) < num_train_epochs
-                if is_main_process and saving:
-                    ckpt_name = train_utils.get_epoch_ckpt_name(args.output_name, epoch + 1)
-                    save_model(ckpt_name, accelerator.unwrap_model(network), global_step, epoch + 1)
+                if saving:
+                    if is_main_process:
+                        ckpt_name = train_utils.get_epoch_ckpt_name(args.output_name, epoch + 1)
+                        save_model(ckpt_name, accelerator.unwrap_model(network), global_step, epoch + 1)
 
-                    remove_epoch_no = train_utils.get_remove_epoch_no(args, epoch + 1)
-                    if remove_epoch_no is not None:
-                        remove_ckpt_name = train_utils.get_epoch_ckpt_name(args.output_name, remove_epoch_no)
-                        remove_model(remove_ckpt_name)
+                        remove_epoch_no = train_utils.get_remove_epoch_no(args, epoch + 1)
+                        if remove_epoch_no is not None:
+                            remove_ckpt_name = train_utils.get_epoch_ckpt_name(args.output_name, remove_epoch_no)
+                            remove_model(remove_ckpt_name)
 
                     if args.save_state:
                         train_utils.save_and_remove_state_on_epoch_end(
@@ -2357,7 +2390,7 @@ class NetworkTrainer:
         accelerator.end_training()
         optimizer_eval_fn()
 
-        if is_main_process and (args.save_state or args.save_state_on_train_end):
+        if args.save_state or args.save_state_on_train_end:
             train_utils.save_state_on_train_end(
                 args,
                 accelerator,

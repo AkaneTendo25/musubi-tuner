@@ -4,7 +4,9 @@ import argparse
 import json
 import logging
 import os
+import re
 import shutil
+import time
 from typing import Callable
 
 import accelerate
@@ -18,6 +20,7 @@ logging.basicConfig(level=logging.INFO)
 
 
 # checkpointファイル名
+STATE_MANIFEST_NAME = "state_manifest.json"
 RESUME_METADATA_NAME = "resume_metadata.json"
 EPOCH_STATE_NAME = "{}-{:06d}-state"
 EPOCH_FILE_NAME = "{}-{:06d}"
@@ -66,6 +69,79 @@ def load_resume_metadata(state_dir: str) -> dict | None:
     except (OSError, UnicodeError, json.JSONDecodeError, TypeError) as e:
         logger.warning("Could not read resume metadata from %s: %s", path, e)
         return None
+
+
+def save_state_manifest(
+    state_dir: str,
+    *,
+    state_type: str,
+    global_step: int,
+    step_in_epoch: int,
+    epoch: int,
+) -> None:
+    """Write an atomic completion marker after every process finishes saving."""
+    files = sorted(
+        name for name in os.listdir(state_dir) if os.path.isfile(os.path.join(state_dir, name)) and name != STATE_MANIFEST_NAME
+    )
+    manifest = {
+        "format_version": 1,
+        "complete": True,
+        "state_type": state_type,
+        "global_step": int(global_step),
+        "step_in_epoch": int(step_in_epoch),
+        "epoch": int(epoch),
+        "files": files,
+        "saved_at": time.time(),
+    }
+    path = os.path.join(state_dir, STATE_MANIFEST_NAME)
+    tmp_path = path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2, sort_keys=True)
+    os.replace(tmp_path, path)
+
+
+def load_state_manifest(state_dir: str) -> dict | None:
+    path = os.path.join(state_dir, STATE_MANIFEST_NAME)
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, encoding="utf-8") as f:
+            manifest = json.load(f)
+    except (OSError, UnicodeError, json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(manifest, dict) or not manifest.get("complete"):
+        return None
+    return manifest
+
+
+def is_complete_state_dir(state_dir: str, process_index: int | None = None) -> bool:
+    """Return whether a directory contains a complete, resumable Accelerate state."""
+    if not os.path.isdir(state_dir):
+        return False
+
+    try:
+        names = os.listdir(state_dir)
+    except OSError:
+        return False
+
+    manifest = load_state_manifest(state_dir)
+    if manifest is not None:
+        files = manifest.get("files")
+        if not isinstance(files, list) or not all(
+            isinstance(name, str) and os.path.isfile(os.path.join(state_dir, name)) for name in files
+        ):
+            return False
+
+    has_model = any(
+        name in {"model.safetensors", "pytorch_model.bin"} or re.match(r"model_\d+\.(safetensors|bin)$", name) for name in names
+    )
+    has_optimizer = any(name == "optimizer.bin" or re.match(r"optimizer_\d+\.bin$", name) for name in names)
+    has_position = RESUME_METADATA_NAME in names or "scheduler.bin" in names
+    if not (has_model and has_optimizer and has_position):
+        return False
+    if process_index is not None and f"random_states_{process_index}.pkl" not in names:
+        return False
+    return True
 
 
 def get_resume_position(
@@ -206,24 +282,38 @@ def save_and_remove_state_on_epoch_end(
 ):
     model_name = args.output_name
 
-    logger.info("")
-    logger.info(f"saving state at epoch {epoch_no}")
-    os.makedirs(args.output_dir, exist_ok=True)
+    is_main_process = accelerator.is_main_process
+    if is_main_process:
+        logger.info("")
+        logger.info(f"saving state at epoch {epoch_no}")
+        os.makedirs(args.output_dir, exist_ok=True)
+    accelerator.wait_for_everyone()
 
     state_dir = os.path.join(args.output_dir, EPOCH_STATE_NAME.format(model_name, epoch_no))
     accelerator.save_state(state_dir)
-    save_resume_metadata(state_dir, global_step, step_in_epoch, epoch_no, data_seed=getattr(args, "seed", None))
-    if args.save_state_to_huggingface:
-        logger.info("uploading state to huggingface.")
-        huggingface_utils.upload(args, state_dir, "/" + EPOCH_STATE_NAME.format(model_name, epoch_no))
+    accelerator.wait_for_everyone()
+    if is_main_process:
+        save_resume_metadata(state_dir, global_step, step_in_epoch, epoch_no, data_seed=getattr(args, "seed", None))
+        save_state_manifest(
+            state_dir,
+            state_type="epoch",
+            global_step=global_step,
+            step_in_epoch=step_in_epoch,
+            epoch=epoch_no,
+        )
+        logger.info("state saved to %s; resume with --resume %s", state_dir, state_dir)
+        if args.save_state_to_huggingface:
+            logger.info("uploading state to huggingface.")
+            huggingface_utils.upload(args, state_dir, "/" + EPOCH_STATE_NAME.format(model_name, epoch_no))
 
-    last_n_epochs = args.save_last_n_epochs_state if args.save_last_n_epochs_state else args.save_last_n_epochs
-    if last_n_epochs is not None:
-        remove_epoch_no = epoch_no - args.save_every_n_epochs * last_n_epochs
-        state_dir_old = os.path.join(args.output_dir, EPOCH_STATE_NAME.format(model_name, remove_epoch_no))
-        if os.path.exists(state_dir_old):
-            logger.info(f"removing old state: {state_dir_old}")
-            shutil.rmtree(state_dir_old)
+        last_n_epochs = args.save_last_n_epochs_state if args.save_last_n_epochs_state else args.save_last_n_epochs
+        if last_n_epochs is not None:
+            remove_epoch_no = epoch_no - args.save_every_n_epochs * last_n_epochs
+            state_dir_old = os.path.join(args.output_dir, EPOCH_STATE_NAME.format(model_name, remove_epoch_no))
+            if os.path.exists(state_dir_old):
+                logger.info(f"removing old state: {state_dir_old}")
+                shutil.rmtree(state_dir_old)
+    accelerator.wait_for_everyone()
 
 
 def save_and_remove_state_stepwise(
@@ -235,28 +325,36 @@ def save_and_remove_state_stepwise(
 ):
     model_name = args.output_name
 
-    logger.info("")
-    logger.info(f"saving state at step {step_no}")
-    os.makedirs(args.output_dir, exist_ok=True)
+    is_main_process = accelerator.is_main_process
+    if is_main_process:
+        logger.info("")
+        logger.info(f"saving state at step {step_no}")
+        os.makedirs(args.output_dir, exist_ok=True)
+    accelerator.wait_for_everyone()
 
     state_dir = os.path.join(args.output_dir, STEP_STATE_NAME.format(model_name, step_no))
     accelerator.save_state(state_dir)
-    save_resume_metadata(state_dir, step_no, step_in_epoch, epoch, data_seed=getattr(args, "seed", None))
-    if args.save_state_to_huggingface:
-        logger.info("uploading state to huggingface.")
-        huggingface_utils.upload(args, state_dir, "/" + STEP_STATE_NAME.format(model_name, step_no))
+    accelerator.wait_for_everyone()
+    if is_main_process:
+        save_resume_metadata(state_dir, step_no, step_in_epoch, epoch, data_seed=getattr(args, "seed", None))
+        save_state_manifest(state_dir, state_type="step", global_step=step_no, step_in_epoch=step_in_epoch, epoch=epoch)
+        logger.info("state saved to %s; resume with --resume %s", state_dir, state_dir)
+        if args.save_state_to_huggingface:
+            logger.info("uploading state to huggingface.")
+            huggingface_utils.upload(args, state_dir, "/" + STEP_STATE_NAME.format(model_name, step_no))
 
-    last_n_steps = args.save_last_n_steps_state if args.save_last_n_steps_state else args.save_last_n_steps
-    if last_n_steps is not None:
-        # last_n_steps前のstep_noから、save_every_n_stepsの倍数のstep_noを計算して削除する
-        remove_step_no = step_no - last_n_steps - 1
-        remove_step_no = remove_step_no - (remove_step_no % args.save_every_n_steps)
+        last_n_steps = args.save_last_n_steps_state if args.save_last_n_steps_state else args.save_last_n_steps
+        if last_n_steps is not None:
+            # last_n_steps前のstep_noから、save_every_n_stepsの倍数のstep_noを計算して削除する
+            remove_step_no = step_no - last_n_steps - 1
+            remove_step_no = remove_step_no - (remove_step_no % args.save_every_n_steps)
 
-        if remove_step_no > 0:
-            state_dir_old = os.path.join(args.output_dir, STEP_STATE_NAME.format(model_name, remove_step_no))
-            if os.path.exists(state_dir_old):
-                logger.info(f"removing old state: {state_dir_old}")
-                shutil.rmtree(state_dir_old)
+            if remove_step_no > 0:
+                state_dir_old = os.path.join(args.output_dir, STEP_STATE_NAME.format(model_name, remove_step_no))
+                if os.path.exists(state_dir_old):
+                    logger.info(f"removing old state: {state_dir_old}")
+                    shutil.rmtree(state_dir_old)
+    accelerator.wait_for_everyone()
 
 
 def save_state_on_train_end(
@@ -268,17 +366,31 @@ def save_state_on_train_end(
 ):
     model_name = args.output_name
 
-    logger.info("")
-    logger.info("saving last state.")
-    os.makedirs(args.output_dir, exist_ok=True)
+    is_main_process = accelerator.is_main_process
+    if is_main_process:
+        logger.info("")
+        logger.info("saving last state.")
+        os.makedirs(args.output_dir, exist_ok=True)
+    accelerator.wait_for_everyone()
 
     state_dir = os.path.join(args.output_dir, LAST_STATE_NAME.format(model_name))
     accelerator.save_state(state_dir)
-    save_resume_metadata(state_dir, global_step, step_in_epoch, epoch, data_seed=getattr(args, "seed", None))
+    accelerator.wait_for_everyone()
+    if is_main_process:
+        save_resume_metadata(state_dir, global_step, step_in_epoch, epoch, data_seed=getattr(args, "seed", None))
+        save_state_manifest(
+            state_dir,
+            state_type="final",
+            global_step=global_step,
+            step_in_epoch=step_in_epoch,
+            epoch=epoch,
+        )
+        logger.info("state saved to %s; resume with --resume %s", state_dir, state_dir)
 
-    if args.save_state_to_huggingface:
-        logger.info("uploading last state to huggingface.")
-        huggingface_utils.upload(args, state_dir, "/" + LAST_STATE_NAME.format(model_name))
+        if args.save_state_to_huggingface:
+            logger.info("uploading last state to huggingface.")
+            huggingface_utils.upload(args, state_dir, "/" + LAST_STATE_NAME.format(model_name))
+    accelerator.wait_for_everyone()
 
 
 def get_lin_function(x1: float = 256, y1: float = 0.5, x2: float = 4096, y2: float = 1.15) -> Callable[[float], float]:

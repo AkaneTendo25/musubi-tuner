@@ -206,7 +206,7 @@ accelerate launch minimax_h3_train_network.py \
   --network_dim 16 --network_alpha 16 \
   --sdpa --mixed_precision bf16 --gradient_checkpointing \
   --optimizer_type AdamW8bit --learning_rate 1e-4 \
-  --max_train_epochs 10 --save_every_n_epochs 1 \
+  --max_train_epochs 10 --save_every_n_epochs 1 --save_state --autoresume \
   --output_dir output --output_name h3_style \
   --logging_dir logs --log_with tensorboard --log_grad_metrics
 ```
@@ -221,6 +221,23 @@ versions.
 
 Watch progress with `tensorboard --logdir logs`. When training remotely, bind it to a protected interface or reach its loopback
 address through an SSH forward rather than exposing it publicly.
+
+### Saving and resuming
+
+The recommended command above uses `--save_state --autoresume`: every periodic checkpoint gets a resumable `*-state`
+directory, and restarting the same command automatically selects the highest-step complete state matching `--output_name`.
+More generally, add `--save_state` alongside `--save_every_n_steps N` or `--save_every_n_epochs N` to create resumable states.
+Resume by pointing `--resume` at that directory, not at its neighboring `.safetensors` LoRA file:
+
+```shell
+--resume output/h3_style-step00001000-state
+```
+
+`--resume` restores the optimizer, scheduler, dataloader position, RNG streams, epoch, and displayed global step.
+`--network_weights output/h3_style-step00001000.safetensors` only initializes LoRA weights for a new run; its optimizer,
+scheduler, and step start at zero. Use `--save_state_on_train_end` if only the final state is needed. An incomplete state is
+rejected instead of silently restarting at step zero. Add `--autoresume` to select the highest-step complete state matching
+`--output_name` in `--output_dir`; an explicit `--resume` path takes priority.
 
 ### Key options
 
@@ -305,7 +322,7 @@ PYTORCH_ALLOC_CONF=expandable_segments:True accelerate launch minimax_h3_train_n
   --h3_convrot_int8 --h3_convrot_int8_fwd bf16 \
   --blocks_to_swap 48 --block_swap_h2d_only --block_swap_ring_size 2 \
   --optimizer_type AdamW8bit --learning_rate 1e-4 \
-  --max_train_epochs 10 --save_every_n_epochs 1 \
+  --max_train_epochs 10 --save_every_n_epochs 1 --save_state --autoresume \
   --output_dir output --output_name h3_style
 ```
 
@@ -362,13 +379,13 @@ and is therefore larger for reference-conditioned batches.
 | --- | --- |
 | `--h3_guidance_distillation_scale 4` | Guidance-consistent objective using cached empty-text conditioning. A scale of `4` is recommended; `3` is generally too weak. `--h3_guidance_loss_form` selects `normalized` or `contrastive`; both share an optimum, but contrastive is `scale²` larger. |
 | `--h3_guidance_loss_schedule {sigma,constant}` | `sigma` (default) scales guidance from `1` at the clean endpoint to the configured value at maximum noise, independently for video and audio. `constant` retains the configured scale everywhere. |
-| `--h3_base_preservation_loss_weight 0.05` | Penalizes drift from the frozen base's prediction. Anchors to whichever base is loaded, quantized or not. |
+| `--h3_base_preservation_loss_weight 0.02` | Recommended starting value. Penalizes drift from the frozen base's prediction and anchors to whichever base is loaded, quantized or not. |
 | `--crepa` | Temporal representation alignment for video training. |
 
-Treat `--h3_base_preservation_loss_weight 0.05` as an initial value rather than a universal setting. Its effect depends on
-training length, quantization, adapter rank, dataset, and learning rate. Excessive weight anchors the adapter to the frozen base
-and can prevent it from fitting the dataset. Monitor training and validation samples, and reduce or disable the objective when
-preservation dominates. The value can be changed when resuming training.
+Treat `--h3_base_preservation_loss_weight 0.02` as an initial value rather than a universal setting. Its effect depends on
+training length, quantization, adapter rank, dataset, and learning rate. Higher values such as `0.05` can preserve the base very
+strongly but substantially slow concept learning. Monitor training and validation samples, and reduce or disable the objective
+when preservation dominates. The value can be changed when resuming training.
 
 CREPA aligns projected features from an earlier block with a later block (`mode=backbone`) or with frozen DINOv2 features
 (`mode=dino`). Only generated video rows participate; image, audio-only, and video-observed batches are skipped.
