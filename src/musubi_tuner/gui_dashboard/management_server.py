@@ -1,5 +1,9 @@
 """Standalone management FastAPI app for the full training dashboard."""
 
+# Imported dashboard code intentionally treats malformed project/metrics files
+# as recoverable UI state rather than crashing the management server.
+# ruff: noqa: BLE001, UP045
+
 from __future__ import annotations
 
 import logging
@@ -13,9 +17,9 @@ from typing import Optional
 mimetypes.add_type("application/javascript", ".js")
 mimetypes.add_type("text/css", ".css")
 
+import pyarrow.parquet as pq
 from fastapi import FastAPI
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
-import pyarrow.parquet as pq
 
 from musubi_tuner.gui_dashboard.process_manager import ProcessManager
 from musubi_tuner.gui_dashboard.project_schema import ProjectConfig
@@ -33,7 +37,7 @@ NO_CACHE_HEADERS = {
 
 def create_management_app(project_path: Optional[str] = None, dev_frontend_url: Optional[str] = None) -> FastAPI:
     """Create the management FastAPI application."""
-    app = FastAPI(title="LTX-2 Training Manager")
+    app = FastAPI(title="Musubi Training Manager")
 
     # App state
     app.state.process_manager = ProcessManager()
@@ -66,8 +70,6 @@ def create_management_app(project_path: Optional[str] = None, dev_frontend_url: 
     # Metrics router — dynamically bound to training output_dir
     @app.get("/data/metrics.parquet")
     async def get_metrics():
-        if not _training_dashboard_active(app):
-            return Response(status_code=204)
         run_dir = _get_run_dir(app)
         if not run_dir:
             return Response(status_code=204)
@@ -78,8 +80,6 @@ def create_management_app(project_path: Optional[str] = None, dev_frontend_url: 
 
     @app.get("/data/status.json")
     async def get_status():
-        if not _training_dashboard_active(app):
-            return Response(status_code=204)
         run_dir = _get_run_dir(app)
         if not run_dir:
             return Response(status_code=204)
@@ -90,8 +90,6 @@ def create_management_app(project_path: Optional[str] = None, dev_frontend_url: 
 
     @app.get("/data/events.json")
     async def get_events():
-        if not _training_dashboard_active(app):
-            return Response(status_code=204)
         run_dir = _get_run_dir(app)
         if not run_dir:
             return Response(status_code=204)
@@ -102,8 +100,6 @@ def create_management_app(project_path: Optional[str] = None, dev_frontend_url: 
 
     @app.get("/api/dashboard/metrics")
     async def get_metrics_json():
-        if not _training_dashboard_active(app):
-            return Response(status_code=204)
         run_dir = _get_run_dir(app)
         if not run_dir:
             return Response(status_code=204)
@@ -127,18 +123,22 @@ def create_management_app(project_path: Optional[str] = None, dev_frontend_url: 
 
     @app.api_route("/data/samples/{file_path:path}", methods=["GET", "HEAD"])
     async def get_sample(file_path: str):
-        if not _training_dashboard_active(app):
-            return HTMLResponse("no active training run", status_code=404)
         run_dir = _get_run_dir(app)
         if not run_dir:
             return HTMLResponse("no training output configured", status_code=404)
-        full_path = os.path.join(run_dir, "sample", file_path)
-        if not os.path.exists(full_path):
+        sample_dir = (Path(run_dir) / "sample").resolve()
+        full_path = (sample_dir / file_path).resolve()
+        try:
+            full_path.relative_to(sample_dir)
+        except ValueError:
+            return HTMLResponse("not found", status_code=404)
+        if not full_path.is_file():
             return HTMLResponse("not found", status_code=404)
         return FileResponse(full_path)
 
     # SSE for metrics updates
     import asyncio
+
     from sse_starlette.sse import EventSourceResponse
 
     @app.get("/sse")
@@ -147,8 +147,6 @@ def create_management_app(project_path: Optional[str] = None, dev_frontend_url: 
             last_mtime = 0.0
             while True:
                 await asyncio.sleep(2)
-                if not _training_dashboard_active(app):
-                    continue
                 run_dir = _get_run_dir(app)
                 if not run_dir:
                     continue
@@ -170,7 +168,7 @@ def create_management_app(project_path: Optional[str] = None, dev_frontend_url: 
         return EventSourceResponse(event_generator())
 
     # SvelteKit frontend (must be last — catches all routes)
-    if os.path.isdir(FRONTEND_DIST):
+    if dev_frontend_url or os.path.isdir(FRONTEND_DIST):
 
         @app.get("/{full_path:path}")
         async def serve_frontend(full_path: str):
@@ -194,7 +192,7 @@ def create_management_app(project_path: Optional[str] = None, dev_frontend_url: 
         @app.get("/")
         async def no_frontend():
             return HTMLResponse(
-                "<h2>LTX-2 Training Manager</h2>"
+                "<h2>Musubi Training Manager</h2>"
                 "<p>Frontend not built. Run <code>npm run build</code> in <code>gui_dashboard/frontend/</code></p>"
             )
 
@@ -213,8 +211,10 @@ def _get_run_dir(app: FastAPI) -> Optional[str]:
         process_type = "full_finetune"
     elif pm.get_status("slider_training").get("state") in active_states:
         process_type = "slider_training"
-    else:
+    elif pm.get_status("training").get("state") in active_states:
         process_type = "training"
+    else:
+        process_type = pm.get_last_training_process_type() or "training"
     # Slider training inherits output_dir from the training config section.
     section = config.full_finetune if process_type == "full_finetune" else config.training
     if section.output_dir:
@@ -223,11 +223,3 @@ def _get_run_dir(app: FastAPI) -> Optional[str]:
             run_dir = Path(config.project_dir) / run_dir
         return str(run_dir)
     return None
-
-
-def _training_dashboard_active(app: FastAPI) -> bool:
-    pm: ProcessManager = app.state.process_manager
-    return any(
-        pm.get_status(process_type).get("state") in {"running", "stopping"}
-        for process_type in ("training", "full_finetune", "slider_training")
-    )

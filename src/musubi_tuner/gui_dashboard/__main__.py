@@ -18,7 +18,7 @@ FRONTEND_DIR = os.path.join(os.path.dirname(__file__), "frontend")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="LTX-2 Training Manager")
+    parser = argparse.ArgumentParser(description="Musubi Training Manager")
     parser.add_argument("--port", type=int, default=7860, help="Server port (default: 7860)")
     parser.add_argument("--host", type=str, default="0.0.0.0", help="Server host (default: 0.0.0.0)")
     parser.add_argument("--project", type=str, default=None, help="Path to project.json to load on startup")
@@ -34,7 +34,7 @@ def main():
     app = create_management_app(project_path=args.project, dev_frontend_url=dev_frontend_url)
 
     url = f"http://127.0.0.1:{args.dev_port}" if args.dev else f"http://{args.host}:{args.port}"
-    logger.info(f"Starting LTX-2 Training Manager — open {url}")
+    logger.info(f"Starting Musubi Training Manager — open {url}")
 
     try:
         uvicorn.run(app, host=args.host, port=args.port, log_level="info")

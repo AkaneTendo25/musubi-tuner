@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import hashlib
 import copy
+import hashlib
 import shlex
 import sys
 import tempfile
@@ -13,19 +13,19 @@ from musubi_tuner.gui_dashboard.cli_defaults import (
     get_ltx2_training_network_module_default,
     get_ltx2_training_output_dir_default,
 )
-from musubi_tuner.model_defaults import (
-    DEFAULT_GEMMA_ROOT_NAME,
-    DEFAULT_LTX2_CHECKPOINT_NAME,
-    DEFAULT_MODEL_DIR_NAME,
-)
 from musubi_tuner.gui_dashboard.project_schema import ProjectConfig
-from musubi_tuner.gui_dashboard.training_dashboard_state import get_latest_local_autoresume_state
 from musubi_tuner.gui_dashboard.toml_export import (
     _write_slider_toml,
     build_slider_toml_path,
     conditioning_recipe_is_active,
     export_conditioning_toml,
     export_dataset_toml,
+)
+from musubi_tuner.gui_dashboard.training_dashboard_state import get_latest_local_autoresume_state
+from musubi_tuner.model_defaults import (
+    DEFAULT_GEMMA_ROOT_NAME,
+    DEFAULT_LTX2_CHECKPOINT_NAME,
+    DEFAULT_MODEL_DIR_NAME,
 )
 
 
@@ -81,11 +81,21 @@ def _effective_gemma_safetensors(config: ProjectConfig, explicit: str, explicit_
     return explicit or config.default_gemma_safetensors or ""
 
 
-def _append_resume_args(cmd: list[str], config: ProjectConfig, section, process_type: str = "training") -> None:
+def _append_resume_args(
+    cmd: list[str],
+    config: ProjectConfig,
+    section,
+    process_type: str = "training",
+    *,
+    native_autoresume: bool = False,
+) -> None:
     if section.resume:
         cmd += ["--resume", section.resume]
         return
     if section.autoresume:
+        if native_autoresume:
+            cmd.append("--autoresume")
+            return
         state_dir = get_latest_local_autoresume_state(config, process_type)
         if state_dir is not None:
             cmd += ["--resume", str(state_dir)]
@@ -544,7 +554,7 @@ def _build_h3_training_cmd(config: ProjectConfig) -> list[str]:
         cmd += ["--wandb_api_key", t.wandb_api_key]
     if t.log_cuda_memory_every_n_steps is not None:
         cmd += ["--log_cuda_memory_every_n_steps", str(t.log_cuda_memory_every_n_steps)]
-    _append_resume_args(cmd, config, t)
+    _append_resume_args(cmd, config, t, native_autoresume=True)
     if t.sample_every_n_steps:
         cmd += ["--sample_every_n_steps", str(t.sample_every_n_steps)]
     if t.sample_every_n_epochs:

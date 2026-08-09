@@ -28,6 +28,34 @@ if not exist "%REPO_ROOT%\src\musubi_tuner\gui_dashboard\__main__.py" (
   exit /b 1
 )
 
+set "FRONTEND_DIR=%REPO_ROOT%\src\musubi_tuner\gui_dashboard\frontend"
+if not exist "%FRONTEND_DIR%\dist\index.html" (
+  where npm >nul 2>nul
+  if errorlevel 1 (
+    echo [launch_musubi_dashboard] ERROR: The dashboard frontend is not built and npm was not found.
+    echo Install Node.js, then run this launcher again.
+    pause
+    exit /b 1
+  )
+  echo [launch_musubi_dashboard] Building dashboard frontend...
+  pushd "%FRONTEND_DIR%"
+  call npm ci --no-audit --no-fund
+  if errorlevel 1 (
+    popd
+    echo [launch_musubi_dashboard] ERROR: Dashboard frontend dependency install failed.
+    pause
+    exit /b 1
+  )
+  call npm run build
+  if errorlevel 1 (
+    popd
+    echo [launch_musubi_dashboard] ERROR: Dashboard frontend build failed.
+    pause
+    exit /b 1
+  )
+  popd
+)
+
 rem torch.compile on Windows needs the MSVC include and library paths from vcvars64.bat.
 set "VCVARS64="
 set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"

@@ -76,6 +76,17 @@ def test_h3_base_preservation_rejects_negative_weight(tmp_path: Path) -> None:
     assert "training.h3_base_preservation_loss_weight" in report["field_errors"]
 
 
+def test_h3_exact_resume_controls_are_forwarded(tmp_path: Path) -> None:
+    config = _h3_config(tmp_path)
+    config.training.save_state = True
+    config.training.autoresume = True
+
+    command = build_training_cmd(config)
+
+    assert "--save_state" in command
+    assert "--autoresume" in command
+
+
 def test_h3_compile_controls_are_forwarded_and_allowed(tmp_path: Path) -> None:
     config = _h3_config(tmp_path)
     config.training.compile = True

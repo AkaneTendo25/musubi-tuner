@@ -1,11 +1,15 @@
 """Subprocess manager for caching and training processes."""
 
+# Process-tree cleanup is best-effort across platforms and must catch OS/library
+# failures that do not share one stable exception hierarchy.
+# ruff: noqa: BLE001, SIM103, UP045
+
 from __future__ import annotations
 
 import json
+import locale
 import logging
 import os
-import locale
 import re
 import signal
 import subprocess
@@ -418,9 +422,7 @@ class ManagedProcess:
             exit_code = self._proc.returncode if self._proc else -1
             already_reported = self.state in (ProcessState.FINISHED, ProcessState.ERROR) and self.exit_code == exit_code
             self.exit_code = exit_code
-            if self.state in (ProcessState.STOPPING, ProcessState.FINISHED):
-                self.state = ProcessState.FINISHED
-            elif self.exit_code == 0:
+            if self.state in (ProcessState.STOPPING, ProcessState.FINISHED) or self.exit_code == 0:
                 self.state = ProcessState.FINISHED
             else:
                 self.state = ProcessState.ERROR
@@ -592,6 +594,7 @@ class ProcessManager:
     def __init__(self):
         self._processes: dict[str, ManagedProcess] = {}
         self._lock = threading.Lock()
+        self._last_training_proc_type: str | None = None
 
     def start(self, proc_type: ProcessType, cmd: list[str], cwd: Optional[str] = None):
         with self._lock:
@@ -626,6 +629,7 @@ class ProcessManager:
             mp = ManagedProcess(cmd, cwd=cwd, env=env, proc_type=proc_type, progress_file=progress_file)
             if proc_type in _TRAINING_LIKE_PROC_TYPES:
                 mp._stop_file = Path(env["MUSUBI_DASHBOARD_STOP_FILE"])
+                self._last_training_proc_type = proc_type
             self._processes[proc_type] = mp
 
         mp.start()
@@ -668,3 +672,6 @@ class ProcessManager:
         ):
             result[pt] = self.get_status(pt)
         return result
+
+    def get_last_training_process_type(self) -> str | None:
+        return self._last_training_proc_type
