@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 import time
+from pathlib import Path
 from typing import Callable
 
 import accelerate
@@ -17,6 +18,17 @@ from musubi_tuner.utils.model_utils import str_to_dtype
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
+
+
+def is_dashboard_stop_requested() -> bool:
+    """Return whether the dashboard requested a graceful training stop."""
+    stop_file = os.environ.get("MUSUBI_DASHBOARD_STOP_FILE")
+    if not stop_file:
+        return False
+    try:
+        return Path(stop_file).is_file()
+    except OSError:
+        return False
 
 
 # checkpointファイル名

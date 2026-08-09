@@ -1,0 +1,318 @@
+import { writable } from 'svelte/store';
+import { get } from 'svelte/store';
+import { projectConfig, saveProjectNow } from '$lib/stores/project.js';
+import { clearMetrics } from '$lib/stores/metrics.js';
+import { ignoreStatusBefore } from '$lib/stores/status.js';
+
+export const processStatuses = writable({
+	cache_latents: { state: 'idle', exit_code: null },
+	cache_text: { state: 'idle', exit_code: null },
+	cache_dino: { state: 'idle', exit_code: null },
+	cache_preview: { state: 'idle', exit_code: null },
+	training: { state: 'idle', exit_code: null },
+	full_finetune: { state: 'idle', exit_code: null },
+	remote_stage_launcher: { state: 'idle', exit_code: null },
+	remote_stage_server: { state: 'idle', exit_code: null },
+	inference: { state: 'idle', exit_code: null },
+	slider_training: { state: 'idle', exit_code: null }
+});
+
+export const processLogs = writable({
+	cache_latents: [],
+	cache_text: [],
+	cache_dino: [],
+	cache_preview: [],
+	training: [],
+	full_finetune: [],
+	remote_stage_launcher: [],
+	remote_stage_server: [],
+	inference: [],
+	slider_training: []
+});
+
+export const processConsoleUi = writable({
+	cache_latents: { collapsed: null },
+	cache_text: { collapsed: null },
+	cache_dino: { collapsed: null },
+	cache_preview: { collapsed: null },
+	training: { collapsed: null },
+	full_finetune: { collapsed: null },
+	remote_stage_launcher: { collapsed: null },
+	remote_stage_server: { collapsed: null },
+	inference: { collapsed: null },
+	slider_training: { collapsed: null }
+});
+
+function emptyValidation() {
+	return {
+		ok: true,
+		summary: '',
+		errors: [],
+		warnings: [],
+		field_errors: {},
+		field_warnings: {}
+	};
+}
+
+export const processValidation = writable({
+	cache_latents: emptyValidation(),
+	cache_text: emptyValidation(),
+	cache_dino: emptyValidation(),
+	cache_preview: emptyValidation(),
+	training: emptyValidation(),
+	full_finetune: emptyValidation(),
+	remote_stage_launcher: emptyValidation(),
+	remote_stage_server: emptyValidation(),
+	inference: emptyValidation(),
+	slider_training: emptyValidation()
+});
+
+let _evtSource = null;
+let _reconnectTimer = null;
+
+function isActiveState(state) {
+	return state === 'running' || state === 'stopping';
+}
+
+function normalizeValidationReport(payload) {
+	if (!payload || typeof payload !== 'object') {
+		return null;
+	}
+
+	return {
+		ok: payload.ok ?? false,
+		summary: payload.summary || '',
+		errors: Array.isArray(payload.errors) ? payload.errors : [],
+		warnings: Array.isArray(payload.warnings) ? payload.warnings : [],
+		field_errors: payload.field_errors || {},
+		field_warnings: payload.field_warnings || {}
+	};
+}
+
+function extractErrorMessage(payload, fallback) {
+	if (!payload) return fallback;
+	if (typeof payload.detail === 'string') return payload.detail;
+	if (typeof payload.detail?.summary === 'string') return payload.detail.summary;
+	if (typeof payload.summary === 'string') return payload.summary;
+	return fallback;
+}
+
+export function connectProcessSSE() {
+	if (_evtSource) return;
+
+	function open() {
+		_evtSource = new EventSource('/sse/processes');
+
+		_evtSource.addEventListener('status', (e) => {
+			try {
+				const data = JSON.parse(e.data);
+				processStatuses.set(data);
+			} catch { /* ignore */ }
+		});
+
+		_evtSource.onerror = () => {
+			_evtSource.close();
+			_evtSource = null;
+			_reconnectTimer = setTimeout(open, 3000);
+		};
+	}
+
+	open();
+}
+
+export function disconnectProcessSSE() {
+	if (_evtSource) {
+		_evtSource.close();
+		_evtSource = null;
+	}
+	if (_reconnectTimer) {
+		clearTimeout(_reconnectTimer);
+		_reconnectTimer = null;
+	}
+}
+
+let _validationAutoTimer = null;
+let _validationAutoUnsub = null;
+
+// Re-run validation for any process type that currently has errors whenever
+// the project config changes. Lets sidebar badges clear on their own once the
+// underlying setting is fixed, instead of only on the next launch attempt.
+export function connectProcessValidationAutoRefresh() {
+	if (_validationAutoUnsub) return;
+	_validationAutoUnsub = projectConfig.subscribe((config) => {
+		if (!config) return;
+		if (_validationAutoTimer) clearTimeout(_validationAutoTimer);
+		_validationAutoTimer = setTimeout(async () => {
+			const reports = get(processValidation);
+			const typesWithErrors = Object.keys(reports).filter(
+				(t) => Array.isArray(reports[t]?.errors) && reports[t].errors.length > 0
+			);
+			for (const t of typesWithErrors) {
+				try {
+					await validateProcess(t, config);
+				} catch {
+					// keep prior report on failure
+				}
+			}
+		}, 1500);
+	});
+}
+
+export function disconnectProcessValidationAutoRefresh() {
+	if (_validationAutoUnsub) {
+		_validationAutoUnsub();
+		_validationAutoUnsub = null;
+	}
+	if (_validationAutoTimer) {
+		clearTimeout(_validationAutoTimer);
+		_validationAutoTimer = null;
+	}
+}
+
+export function clearProcessLogs(type = null) {
+	processLogs.update((current) => {
+		if (!type) {
+			return {
+				cache_latents: [],
+				cache_text: [],
+				cache_dino: [],
+				cache_preview: [],
+				training: [],
+				full_finetune: [],
+				remote_stage_launcher: [],
+				remote_stage_server: [],
+				inference: [],
+				slider_training: []
+			};
+		}
+		return { ...current, [type]: [] };
+	});
+}
+
+export function setProcessConsoleCollapsed(type, collapsed) {
+	processConsoleUi.update((current) => ({
+		...current,
+		[type]: {
+			...(current[type] || {}),
+			collapsed
+		}
+	}));
+}
+
+function setProcessStatus(type, status) {
+	processStatuses.update((current) => ({
+		...current,
+		[type]: status
+	}));
+}
+
+export async function validateProcess(type, configOverride = null) {
+	const init = { method: 'POST' };
+	if (configOverride) {
+		init.headers = { 'Content-Type': 'application/json' };
+		init.body = JSON.stringify(configOverride);
+	}
+
+	const res = await fetch(`/api/processes/${type}/validate`, init);
+	const payload = await res.json().catch(() => null);
+	const report = normalizeValidationReport(res.ok ? payload : payload?.detail || payload);
+
+	if (report) {
+		processValidation.update((current) => ({ ...current, [type]: report }));
+	}
+
+	if (!res.ok) {
+		throw new Error(extractErrorMessage(payload, `Failed to validate ${type}`));
+	}
+
+	return report || emptyValidation();
+}
+
+export async function startProcess(type) {
+	await saveProjectNow();
+	await validateProcess(type, get(projectConfig));
+	if (type === 'training' || type === 'full_finetune') {
+		clearMetrics();
+		ignoreStatusBefore(Date.now() / 1000);
+		clearProcessLogs(type);
+		setProcessStatus(type, { state: 'running', exit_code: null });
+	}
+
+	const res = await fetch(`/api/processes/${type}/start`, { method: 'POST' });
+	if (!res.ok) {
+		await refreshStatuses();
+		const err = await res.json().catch(() => null);
+		const report = normalizeValidationReport(err?.detail || err);
+		if (report) {
+			processValidation.update((current) => ({ ...current, [type]: report }));
+		}
+		throw new Error(extractErrorMessage(err, `Failed to start ${type}`));
+	}
+	// Clear logs for fresh start
+	processLogs.update((current) => ({ ...current, [type]: [] }));
+	// Refresh status
+	await refreshStatuses();
+}
+
+export async function stopProcess(type) {
+	const res = await fetch(`/api/processes/${type}/stop`, { method: 'POST' });
+	if (!res.ok) {
+		const err = await res.json();
+		throw new Error(err.detail || `Failed to stop ${type}`);
+	}
+	await refreshStatuses();
+}
+
+export async function refreshStatuses() {
+	try {
+		const res = await fetch('/api/processes/status');
+		if (res.ok) {
+			const data = await res.json();
+			processStatuses.set(data);
+			return data;
+		}
+	} catch { /* ignore */ }
+	return null;
+}
+
+export async function fetchLogs(type, lastN = null) {
+	try {
+		const url = lastN ? `/api/processes/${type}/logs?last_n=${lastN}` : `/api/processes/${type}/logs`;
+		const res = await fetch(url);
+		if (res.ok) {
+			const data = await res.json();
+			processLogs.update((current) => ({ ...current, [type]: data.lines }));
+		}
+	} catch { /* ignore */ }
+}
+
+export async function preloadLogsIfActive(types) {
+	const targets = Array.isArray(types) ? types : [types];
+	const statuses = (await refreshStatuses()) || get(processStatuses);
+
+	for (const type of targets) {
+		const state = statuses?.[type]?.state;
+		if (isActiveState(state)) {
+			await fetchLogs(type);
+		} else {
+			clearProcessLogs(type);
+		}
+	}
+}
+
+export function startLogPolling(types, intervalMs = 1000) {
+	const targets = Array.isArray(types) ? types : [types];
+
+	const poll = async () => {
+		const statuses = get(processStatuses);
+		for (const type of targets) {
+			const state = statuses?.[type]?.state;
+			if (isActiveState(state)) {
+				await fetchLogs(type);
+			}
+		}
+	};
+
+	poll();
+	return setInterval(poll, intervalMs);
+}

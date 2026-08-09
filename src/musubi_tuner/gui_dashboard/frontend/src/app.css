@@ -1,0 +1,703 @@
+@import "tailwindcss";
+
+/* ══════════════════════════════════════════════════
+   MUSUBI TUNER — 5 UNIQUE THEME PALETTES
+   ══════════════════════════════════════════════════ */
+
+/* ── 1. Warm Terminal (default) — Cozy retro-futurism ── */
+:root {
+	color-scheme: dark;
+	--font-label: 'JetBrains Mono', monospace;
+	--bg-base: #1a1714;
+	--bg-surface: #242018;
+	--bg-elevated: #2e2820;
+	--bg-input: #1e1a14;
+	--bg-hover: #342e24;
+	--border: #3a3228;
+	--border-subtle: #2e2820;
+	--text-primary: #e8ddd0;
+	--text-secondary: #b0a090;
+	--text-muted: #787060;
+	--accent: #f0a030;
+	--accent-hover: #fbb040;
+	--accent-muted: rgba(240,160,48,.15);
+	--accent-subtle-bg: rgba(240,160,48,.06);
+	--accent-dim: #d89028;
+	--secondary: #c47a7a;
+	--success: #70a860;
+	--success-muted: rgba(112,168,96,.15);
+	--warning: #f0b040;
+	--warning-muted: rgba(240,176,64,.15);
+	--danger: #d45050;
+	--danger-muted: rgba(212,80,80,.12);
+	--info: #6090c0;
+	--sidebar-bg: #1e1a14;
+	--sidebar-active: #2e2820;
+	--sidebar-hover: #282218;
+	--toggle-bg: #3a3228;
+	--toggle-active: #f0a030;
+	--console-bg: #141210;
+	--console-text: #b0a090;
+	--console-text-muted: #787060;
+	--shadow-sm: 0 1px 3px rgba(0,0,0,.3);
+	--shadow-md: 0 4px 12px rgba(0,0,0,.4);
+	--shadow-lg: 0 12px 32px rgba(0,0,0,.5);
+	--glow-accent: 0 0 20px rgba(240,160,48,.12);
+	--radius-sm: 8px;
+	--radius-md: 10px;
+	--radius-lg: 12px;
+	--radius-xl: 16px;
+	--radius-full: 9999px;
+	--toggle-radius: 10px;
+	--toggle-knob-radius: 50%;
+	--toggle-knob-shadow: 0 1px 3px rgba(0,0,0,.4);
+	--logo-bg: #f0a030;
+	--logo-shadow: 0 0 20px rgba(240,160,48,.2);
+	--logo-radius: 8px;
+	--logo-clip: none;
+}
+
+/* ── 2. Aurora — Northern Lights ── */
+:root.theme-aurora {
+	color-scheme: dark;
+	--font-label: 'Inter', -apple-system, sans-serif;
+	--bg-base: #080c18;
+	--bg-surface: #0e1428;
+	--bg-elevated: #141a34;
+	--bg-input: #0a1020;
+	--bg-hover: #1a2040;
+	--border: #1e2848;
+	--border-subtle: #161e38;
+	--text-primary: #e0e8f0;
+	--text-secondary: #8090b0;
+	--text-muted: #4a5878;
+	--accent: #64ffb4;
+	--accent-hover: #80ffc4;
+	--accent-muted: rgba(100,255,180,.08);
+	--accent-subtle-bg: rgba(100,255,180,.04);
+	--accent-dim: #50e0a0;
+	--secondary: #7c8aff;
+	--success: #64ffb4;
+	--success-muted: rgba(100,255,180,.1);
+	--warning: #ffd060;
+	--warning-muted: rgba(255,208,96,.1);
+	--danger: #ff7a8a;
+	--danger-muted: rgba(255,122,138,.08);
+	--info: #7c8aff;
+	--sidebar-bg: #0a0f20;
+	--sidebar-active: #141a34;
+	--sidebar-hover: #121830;
+	--toggle-bg: #1e2848;
+	--toggle-active: #64ffb4;
+	--console-bg: #060a14;
+	--console-text: #8090b0;
+	--console-text-muted: #4a5878;
+	--shadow-sm: 0 1px 4px rgba(0,0,0,.3);
+	--shadow-md: 0 4px 16px rgba(0,0,0,.4);
+	--shadow-lg: 0 12px 32px rgba(0,0,0,.5);
+	--glow-accent: 0 0 24px rgba(100,255,180,.08);
+	--radius-sm: 10px;
+	--radius-md: 14px;
+	--radius-lg: 16px;
+	--radius-xl: 20px;
+	--radius-full: 9999px;
+	--toggle-radius: 10px;
+	--toggle-knob-radius: 50%;
+	--toggle-knob-shadow: 0 1px 4px rgba(0,0,0,.3);
+	--logo-bg: linear-gradient(135deg, #64ffb4, #7c8aff);
+	--logo-shadow: 0 0 24px rgba(100,255,180,.15);
+	--logo-radius: 10px;
+	--logo-clip: none;
+}
+
+/* ── 3. Matcha Latte — Japanese Minimal ── */
+:root.theme-matcha {
+	color-scheme: light;
+	--font-label: 'Inter', -apple-system, sans-serif;
+	--bg-base: #f5f2eb;
+	--bg-surface: #ffffff;
+	--bg-elevated: #f0ede6;
+	--bg-input: #fafaf6;
+	--bg-hover: #e8e4dc;
+	--border: #e0dbd0;
+	--border-subtle: #e8e2d8;
+	--text-primary: #2c2420;
+	--text-secondary: #6b6058;
+	--text-muted: #9c9488;
+	--accent: #5b8c5a;
+	--accent-hover: #4a7a49;
+	--accent-muted: rgba(91,140,90,.08);
+	--accent-subtle-bg: rgba(91,140,90,.04);
+	--accent-dim: #4a7a49;
+	--secondary: #8c7a5b;
+	--success: #5b8c5a;
+	--success-muted: rgba(91,140,90,.1);
+	--warning: #c08820;
+	--warning-muted: rgba(192,136,32,.08);
+	--danger: #c45040;
+	--danger-muted: rgba(196,80,64,.08);
+	--info: #507898;
+	--sidebar-bg: #ffffff;
+	--sidebar-active: #f0ede6;
+	--sidebar-hover: #f5f2eb;
+	--toggle-bg: #d0ccc4;
+	--toggle-active: #5b8c5a;
+	--console-bg: #2c2420;
+	--console-text: #b0a898;
+	--console-text-muted: #787068;
+	--shadow-sm: 0 1px 2px rgba(0,0,0,.04);
+	--shadow-md: 0 2px 8px rgba(0,0,0,.06);
+	--shadow-lg: 0 8px 24px rgba(0,0,0,.08);
+	--glow-accent: none;
+	--radius-sm: 4px;
+	--radius-md: 4px;
+	--radius-lg: 6px;
+	--radius-xl: 8px;
+	--radius-full: 9999px;
+	--toggle-radius: 9px;
+	--toggle-knob-radius: 50%;
+	--toggle-knob-shadow: 0 1px 2px rgba(0,0,0,.15);
+	--logo-bg: #5b8c5a;
+	--logo-shadow: none;
+	--logo-radius: 4px;
+	--logo-clip: none;
+}
+
+/* ── 4. Neon Brutalist — Cyberpunk Raw ── */
+:root.theme-brutalist {
+	color-scheme: dark;
+	--font-label: 'JetBrains Mono', monospace;
+	--bg-base: #000000;
+	--bg-surface: #111111;
+	--bg-elevated: #1a1a1a;
+	--bg-input: #0a0a0a;
+	--bg-hover: #222222;
+	--border: #333333;
+	--border-subtle: #222222;
+	--text-primary: #e0e0e0;
+	--text-secondary: #999999;
+	--text-muted: #555555;
+	--accent: #c8ff00;
+	--accent-hover: #d8ff40;
+	--accent-muted: rgba(200,255,0,.06);
+	--accent-subtle-bg: rgba(200,255,0,.03);
+	--accent-dim: #a0cc00;
+	--secondary: #ff2d7b;
+	--success: #c8ff00;
+	--success-muted: rgba(200,255,0,.08);
+	--warning: #ff9900;
+	--warning-muted: rgba(255,153,0,.08);
+	--danger: #ff2d2d;
+	--danger-muted: rgba(255,45,45,.08);
+	--info: #00aaff;
+	--sidebar-bg: #111111;
+	--sidebar-active: #1a1a1a;
+	--sidebar-hover: #181818;
+	--toggle-bg: #333333;
+	--toggle-active: #c8ff00;
+	--console-bg: #050505;
+	--console-text: #999999;
+	--console-text-muted: #555555;
+	--shadow-sm: none;
+	--shadow-md: none;
+	--shadow-lg: none;
+	--glow-accent: 0 0 12px rgba(200,255,0,.1);
+	--radius-sm: 0px;
+	--radius-md: 0px;
+	--radius-lg: 0px;
+	--radius-xl: 0px;
+	--radius-full: 0px;
+	--toggle-radius: 0px;
+	--toggle-knob-radius: 0px;
+	--toggle-knob-shadow: none;
+	--logo-bg: #c8ff00;
+	--logo-shadow: none;
+	--logo-radius: 0px;
+	--logo-clip: polygon(0 0, calc(100% - 6px) 0, 100% 6px, 100% 100%, 6px 100%, 0 calc(100% - 6px));
+}
+
+/* ── 5. Twilight Garden — Soft & Dreamy ── */
+:root.theme-twilight {
+	color-scheme: dark;
+	--font-label: 'Inter', -apple-system, sans-serif;
+	--bg-base: #140e1a;
+	--bg-surface: #1c1424;
+	--bg-elevated: #241a30;
+	--bg-input: #120c18;
+	--bg-hover: #2a1e38;
+	--border: #2e2240;
+	--border-subtle: #241a30;
+	--text-primary: #e8e0f0;
+	--text-secondary: #a898b8;
+	--text-muted: #685878;
+	--accent: #ffb088;
+	--accent-hover: #ffc0a0;
+	--accent-muted: rgba(255,176,136,.08);
+	--accent-subtle-bg: rgba(255,176,136,.04);
+	--accent-dim: #e09870;
+	--secondary: #b8a0d4;
+	--success: #88c4a0;
+	--success-muted: rgba(136,196,160,.1);
+	--warning: #e0c080;
+	--warning-muted: rgba(224,192,128,.1);
+	--danger: #e06070;
+	--danger-muted: rgba(224,96,112,.08);
+	--info: #80a8d0;
+	--sidebar-bg: #1c1424;
+	--sidebar-active: #241a30;
+	--sidebar-hover: #201828;
+	--toggle-bg: #2e2240;
+	--toggle-active: #ffb088;
+	--console-bg: #0e0a14;
+	--console-text: #a898b8;
+	--console-text-muted: #685878;
+	--shadow-sm: 0 2px 6px rgba(100,60,140,.08);
+	--shadow-md: 0 4px 16px rgba(100,60,140,.12);
+	--shadow-lg: 0 12px 32px rgba(100,60,140,.15);
+	--glow-accent: 0 0 16px rgba(255,176,136,.1);
+	--radius-sm: 10px;
+	--radius-md: 14px;
+	--radius-lg: 18px;
+	--radius-xl: 22px;
+	--radius-full: 9999px;
+	--toggle-radius: 11px;
+	--toggle-knob-radius: 50%;
+	--toggle-knob-shadow: 0 2px 6px rgba(0,0,0,.3);
+	--logo-bg: linear-gradient(135deg, #ffb088, #e08080);
+	--logo-shadow: 0 4px 16px rgba(255,176,136,.2);
+	--logo-radius: 12px;
+	--logo-clip: none;
+}
+
+
+/* ── 6. Synthwave — 80s Retrowave Neon ── */
+:root.theme-synthwave {
+	color-scheme: dark;
+	--font-label: 'JetBrains Mono', monospace;
+	--bg-base: #0a0418;
+	--bg-surface: #150828;
+	--bg-elevated: #1c0e34;
+	--bg-input: #0f0620;
+	--bg-hover: #240e44;
+	--border: #3c1a5c;
+	--border-subtle: #261040;
+	--text-primary: #f0e0ff;
+	--text-secondary: #b890d8;
+	--text-muted: #7060a0;
+	--accent: #ff2dca;
+	--accent-hover: #ff5ad8;
+	--accent-muted: rgba(255,45,202,.12);
+	--accent-subtle-bg: rgba(255,45,202,.05);
+	--accent-dim: #d428a8;
+	--secondary: #00f0ff;
+	--success: #00ffaa;
+	--success-muted: rgba(0,255,170,.1);
+	--warning: #ffd000;
+	--warning-muted: rgba(255,208,0,.1);
+	--danger: #ff4060;
+	--danger-muted: rgba(255,64,96,.1);
+	--info: #00f0ff;
+	--sidebar-bg: #0e0620;
+	--sidebar-active: #1c0e34;
+	--sidebar-hover: #180a2c;
+	--toggle-bg: #3c1a5c;
+	--toggle-active: #ff2dca;
+	--console-bg: #050210;
+	--console-text: #b890d8;
+	--console-text-muted: #7060a0;
+	--shadow-sm: 0 1px 4px rgba(0,0,0,.4);
+	--shadow-md: 0 4px 16px rgba(80,0,80,.3);
+	--shadow-lg: 0 12px 36px rgba(80,0,80,.4);
+	--glow-accent: 0 0 24px rgba(255,45,202,.18);
+	--radius-sm: 6px;
+	--radius-md: 8px;
+	--radius-lg: 10px;
+	--radius-xl: 14px;
+	--radius-full: 9999px;
+	--toggle-radius: 8px;
+	--toggle-knob-radius: 50%;
+	--toggle-knob-shadow: 0 1px 4px rgba(0,0,0,.4);
+	--logo-bg: linear-gradient(135deg, #ff2dca, #00f0ff);
+	--logo-shadow: 0 0 24px rgba(255,45,202,.25);
+	--logo-radius: 8px;
+	--logo-clip: none;
+}
+
+/* ── 7. Sakura — Cherry Blossom Light ── */
+:root.theme-sakura {
+	color-scheme: light;
+	--font-label: 'Inter', -apple-system, sans-serif;
+	--bg-base: #fdf5f7;
+	--bg-surface: #ffffff;
+	--bg-elevated: #fae8ed;
+	--bg-input: #fffafc;
+	--bg-hover: #f5dde4;
+	--border: #f0d0d8;
+	--border-subtle: #f8e0e8;
+	--text-primary: #3a1f28;
+	--text-secondary: #6e4858;
+	--text-muted: #a87888;
+	--accent: #d4546e;
+	--accent-hover: #c44058;
+	--accent-muted: rgba(212,84,110,.08);
+	--accent-subtle-bg: rgba(212,84,110,.04);
+	--accent-dim: #b84058;
+	--secondary: #8c5870;
+	--success: #6ba868;
+	--success-muted: rgba(107,168,104,.1);
+	--warning: #d09030;
+	--warning-muted: rgba(208,144,48,.1);
+	--danger: #c43048;
+	--danger-muted: rgba(196,48,72,.08);
+	--info: #6890b0;
+	--sidebar-bg: #ffffff;
+	--sidebar-active: #fae8ed;
+	--sidebar-hover: #fdf0f3;
+	--toggle-bg: #e8c8d0;
+	--toggle-active: #d4546e;
+	--console-bg: #2a1820;
+	--console-text: #c8a8b4;
+	--console-text-muted: #806068;
+	--shadow-sm: 0 1px 2px rgba(180,80,110,.06);
+	--shadow-md: 0 4px 12px rgba(180,80,110,.08);
+	--shadow-lg: 0 12px 28px rgba(180,80,110,.12);
+	--glow-accent: none;
+	--radius-sm: 8px;
+	--radius-md: 12px;
+	--radius-lg: 16px;
+	--radius-xl: 20px;
+	--radius-full: 9999px;
+	--toggle-radius: 10px;
+	--toggle-knob-radius: 50%;
+	--toggle-knob-shadow: 0 1px 3px rgba(180,80,110,.15);
+	--logo-bg: linear-gradient(135deg, #ffb0c4, #d4546e);
+	--logo-shadow: 0 4px 14px rgba(212,84,110,.18);
+	--logo-radius: 10px;
+	--logo-clip: none;
+}
+
+/* ── 8. Deep Sea — Bioluminescent Abyss ── */
+:root.theme-deep-sea {
+	color-scheme: dark;
+	--font-label: 'Inter', -apple-system, sans-serif;
+	--bg-base: #04101a;
+	--bg-surface: #08182a;
+	--bg-elevated: #0e2238;
+	--bg-input: #06121e;
+	--bg-hover: #122c44;
+	--border: #1c3a52;
+	--border-subtle: #142c40;
+	--text-primary: #d8eef8;
+	--text-secondary: #80a0b8;
+	--text-muted: #486878;
+	--accent: #00d4d4;
+	--accent-hover: #20e8e8;
+	--accent-muted: rgba(0,212,212,.1);
+	--accent-subtle-bg: rgba(0,212,212,.04);
+	--accent-dim: #00b0b0;
+	--secondary: #80a8e0;
+	--success: #40e0a0;
+	--success-muted: rgba(64,224,160,.1);
+	--warning: #f0c060;
+	--warning-muted: rgba(240,192,96,.1);
+	--danger: #ff7888;
+	--danger-muted: rgba(255,120,136,.08);
+	--info: #80a8e0;
+	--sidebar-bg: #06121e;
+	--sidebar-active: #0e2238;
+	--sidebar-hover: #0a1c30;
+	--toggle-bg: #1c3a52;
+	--toggle-active: #00d4d4;
+	--console-bg: #020a14;
+	--console-text: #80a0b8;
+	--console-text-muted: #486878;
+	--shadow-sm: 0 1px 4px rgba(0,0,0,.4);
+	--shadow-md: 0 4px 16px rgba(0,40,60,.4);
+	--shadow-lg: 0 12px 36px rgba(0,40,60,.5);
+	--glow-accent: 0 0 28px rgba(0,212,212,.15);
+	--radius-sm: 8px;
+	--radius-md: 12px;
+	--radius-lg: 14px;
+	--radius-xl: 18px;
+	--radius-full: 9999px;
+	--toggle-radius: 10px;
+	--toggle-knob-radius: 50%;
+	--toggle-knob-shadow: 0 1px 4px rgba(0,0,0,.4);
+	--logo-bg: linear-gradient(135deg, #00d4d4, #80a8e0);
+	--logo-shadow: 0 0 22px rgba(0,212,212,.22);
+	--logo-radius: 10px;
+	--logo-clip: none;
+}
+
+/* ── 9. Mono Slate — Minimal Monochrome ── */
+:root.theme-mono {
+	color-scheme: dark;
+	--font-label: 'Inter', -apple-system, sans-serif;
+	--bg-base: #0e0e10;
+	--bg-surface: #18181a;
+	--bg-elevated: #222226;
+	--bg-input: #131315;
+	--bg-hover: #2a2a2e;
+	--border: #2e2e32;
+	--border-subtle: #1f1f22;
+	--text-primary: #f0f0f2;
+	--text-secondary: #a0a0a4;
+	--text-muted: #606064;
+	--accent: #4a90ff;
+	--accent-hover: #68a4ff;
+	--accent-muted: rgba(74,144,255,.1);
+	--accent-subtle-bg: rgba(74,144,255,.04);
+	--accent-dim: #3878dd;
+	--secondary: #a0a0a4;
+	--success: #50d090;
+	--success-muted: rgba(80,208,144,.1);
+	--warning: #f0c060;
+	--warning-muted: rgba(240,192,96,.1);
+	--danger: #ff6068;
+	--danger-muted: rgba(255,96,104,.08);
+	--info: #4a90ff;
+	--sidebar-bg: #131315;
+	--sidebar-active: #222226;
+	--sidebar-hover: #1c1c1e;
+	--toggle-bg: #2e2e32;
+	--toggle-active: #4a90ff;
+	--console-bg: #08080a;
+	--console-text: #a0a0a4;
+	--console-text-muted: #606064;
+	--shadow-sm: 0 1px 2px rgba(0,0,0,.4);
+	--shadow-md: 0 4px 12px rgba(0,0,0,.5);
+	--shadow-lg: 0 12px 32px rgba(0,0,0,.6);
+	--glow-accent: none;
+	--radius-sm: 6px;
+	--radius-md: 8px;
+	--radius-lg: 10px;
+	--radius-xl: 12px;
+	--radius-full: 9999px;
+	--toggle-radius: 8px;
+	--toggle-knob-radius: 50%;
+	--toggle-knob-shadow: 0 1px 3px rgba(0,0,0,.5);
+	--logo-bg: #4a90ff;
+	--logo-shadow: none;
+	--logo-radius: 6px;
+	--logo-clip: none;
+}
+
+
+/* ══════════════════════════════════════════════════
+   THEME-SPECIFIC STRUCTURAL OVERRIDES
+   ══════════════════════════════════════════════════ */
+
+/* Brutalist: thick 2px borders on inputs, selects, cards */
+:root.theme-brutalist input:not([type="checkbox"]),
+:root.theme-brutalist select,
+:root.theme-brutalist textarea {
+	border-width: 2px !important;
+}
+
+/* Brutalist: monospace uppercase on nav links */
+:root.theme-brutalist nav a {
+	text-transform: uppercase;
+	letter-spacing: 1px;
+	font-family: 'JetBrains Mono', monospace;
+	font-size: 11px;
+}
+
+/* Brutalist: monospace on buttons */
+:root.theme-brutalist button {
+	font-family: 'JetBrains Mono', monospace;
+	letter-spacing: 0.3px;
+}
+
+/* Brutalist: sidebar active uses left border accent */
+:root.theme-brutalist nav a[style*="sidebar-active"] {
+	border-left: 2px solid var(--accent) !important;
+}
+
+/* Twilight: underline-style inputs */
+:root.theme-twilight input:not([type="checkbox"]),
+:root.theme-twilight select {
+	border: none !important;
+	border-bottom: 2px solid var(--border) !important;
+	border-radius: 8px 8px 0 0 !important;
+}
+:root.theme-twilight input:not([type="checkbox"]):focus,
+:root.theme-twilight select:focus {
+	border-bottom-color: var(--accent) !important;
+	box-shadow: 0 2px 8px rgba(255,176,136,.1) !important;
+}
+
+/* Twilight: buttons lift on hover */
+:root.theme-twilight button:not(:disabled):hover {
+	transform: translateY(-1px);
+}
+
+/* Aurora: subtle glow on focused inputs */
+:root.theme-aurora input:focus,
+:root.theme-aurora select:focus {
+	box-shadow: 0 0 0 2px var(--accent-muted), 0 0 16px rgba(100,255,180,.08) !important;
+}
+
+
+/* ══════════════════════════════════════════════════
+   BASE STYLES
+   ══════════════════════════════════════════════════ */
+
+body {
+	font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Segoe UI', sans-serif;
+	background: var(--bg-base);
+	color: var(--text-primary);
+	margin: 0;
+	-webkit-font-smoothing: antialiased;
+	-moz-osx-font-smoothing: grayscale;
+	font-size: 14px;
+	line-height: 1.55;
+	letter-spacing: 0.01em;
+}
+
+/* Scrollbar */
+::-webkit-scrollbar { width: 5px; height: 5px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: var(--radius-full); }
+::-webkit-scrollbar-thumb:hover { background: var(--text-muted); }
+
+/* Tooltip */
+[data-tooltip] { position: relative; }
+[data-tooltip]::after {
+	display: none;
+}
+.global-tooltip {
+	position: fixed;
+	padding: 5px 10px;
+	border-radius: var(--radius-sm);
+	font-size: 11px;
+	line-height: 1.4;
+	font-weight: 400;
+	white-space: normal;
+	max-width: 260px;
+	width: max-content;
+	background: var(--bg-elevated);
+	color: var(--text-secondary);
+	border: 1px solid var(--border);
+	box-shadow: var(--shadow-md);
+	pointer-events: none;
+	z-index: 10000;
+}
+
+/* Focus */
+input:focus, select:focus, textarea:focus {
+	outline: none;
+	border-color: var(--accent) !important;
+	box-shadow: 0 0 0 2px var(--accent-muted), var(--glow-accent);
+}
+
+/* Compact app alerts */
+.app-alert {
+	display: flex;
+	align-items: flex-start;
+	gap: 0.5rem;
+	padding: 0.45rem 0.6rem;
+	background: color-mix(in srgb, var(--bg-elevated) 58%, transparent);
+	border: 1px solid color-mix(in srgb, var(--border-subtle) 82%, transparent);
+	border-left: 2px solid var(--border);
+	border-radius: var(--radius-sm);
+	color: var(--text-secondary);
+	font-size: 11.5px;
+	line-height: 1.35;
+}
+
+.app-alert-icon {
+	width: 7px;
+	min-width: 7px;
+	height: 7px;
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	margin-top: 0.28rem;
+	background: var(--text-muted);
+	border-radius: var(--radius-full);
+}
+
+.app-alert-danger {
+	border-color: color-mix(in srgb, var(--danger) 18%, var(--border-subtle));
+	border-left-color: var(--danger);
+	background: color-mix(in srgb, var(--danger-muted) 28%, var(--bg-elevated));
+}
+
+.app-alert-warning {
+	border-color: color-mix(in srgb, var(--warning) 17%, var(--border-subtle));
+	border-left-color: var(--warning);
+	background: color-mix(in srgb, var(--warning-muted) 24%, var(--bg-elevated));
+}
+
+.app-alert-danger .app-alert-icon {
+	background: var(--danger);
+}
+
+.app-alert-warning .app-alert-icon {
+	background: var(--warning);
+}
+
+.app-alert-title {
+	color: var(--text-primary);
+	font-weight: 700;
+}
+
+.app-alert-body {
+	color: var(--text-secondary);
+}
+
+.app-field-error {
+	margin-top: 0.35rem;
+	padding: 0.25rem 0.45rem;
+	background: color-mix(in srgb, var(--danger-muted) 28%, transparent);
+	border-left: 2px solid var(--danger);
+	border-radius: var(--radius-sm);
+	color: color-mix(in srgb, var(--danger) 72%, var(--text-secondary));
+	font-size: 11px;
+	line-height: 1.3;
+}
+
+.app-status-badge {
+	width: 0.9rem;
+	height: 0.9rem;
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	border-radius: var(--radius-full);
+	background: transparent;
+	border: 0;
+	line-height: 0;
+}
+
+.app-status-badge::before {
+	content: "";
+	width: 7px;
+	height: 7px;
+	border-radius: var(--radius-full);
+	background: var(--text-muted);
+}
+
+.app-status-badge-danger {
+	background: transparent;
+}
+
+.app-status-badge-danger::before {
+	background: var(--danger);
+}
+
+.app-status-badge-warning {
+	background: transparent;
+}
+
+.app-status-badge-warning::before {
+	background: var(--warning);
+}
+
+/* Transitions */
+button, a { transition: all 0.12s ease; }
+
+/* Selection */
+::selection {
+	background: var(--accent-muted);
+	color: var(--text-primary);
+}
