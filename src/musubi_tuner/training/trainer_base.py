@@ -57,7 +57,7 @@ from musubi_tuner.training.accelerator_setup import (
     collator_class,
     prepare_accelerator,
 )
-from musubi_tuner.training.resume_utils import recover_global_step
+from musubi_tuner.training.resume_utils import configure_dataloader_for_epoch, recover_global_step
 from musubi_tuner.training.sampling_prompts import should_sample_images
 from musubi_tuner.training.validation import ValidationEventDeduplicator, should_validate, validate_validation_args
 from musubi_tuner.training.timesteps import (
@@ -1716,11 +1716,14 @@ class NetworkTrainer:
 
         # num workers for data loader: if 0, persistent_workers is not available
         n_workers = min(args.max_data_loader_n_workers, os.cpu_count())  # cpu_count or max_data_loader_n_workers
+        dataloader_generator = torch.Generator()
+        dataloader_generator.manual_seed(args.seed)
 
         train_dataloader = torch.utils.data.DataLoader(
             train_dataset_group,
             batch_size=1,
             shuffle=True,
+            generator=dataloader_generator,
             collate_fn=collator,
             num_workers=n_workers,
             persistent_workers=args.persistent_data_loader_workers,
@@ -2014,7 +2017,14 @@ class NetworkTrainer:
             initial_global_step,
             num_update_steps_per_epoch,
             resume_metadata,
+            num_batches_per_epoch=len(train_dataloader),
         )
+        data_seed = args.seed
+        if resume_metadata is not None:
+            try:
+                data_seed = int(resume_metadata["data_seed"])
+            except (KeyError, TypeError, ValueError):
+                pass
 
         global_step = initial_global_step
         progress_bar = tqdm(
@@ -2131,9 +2141,9 @@ class NetworkTrainer:
             if should_sample_at_start:
                 _do_sample(0, global_step)
             optimizer_train_fn()
-        if len(accelerator.trackers) > 0:
+        if should_sample_at_start and len(accelerator.trackers) > 0:
             # log empty object to commit the sample images to wandb
-            accelerator.log({}, step=global_step)
+            accelerator.log({}, step=0)
 
         # training loop
 
@@ -2167,6 +2177,8 @@ class NetworkTrainer:
             metadata["ss_epoch"] = str(epoch + 1)
 
             accelerator.unwrap_model(network).on_epoch_start(transformer)
+
+            configure_dataloader_for_epoch(train_dataloader, epoch, data_seed)
 
             for step, batch in enumerate(train_dataloader):
                 if steps_to_skip_in_epoch > 0:
@@ -2260,12 +2272,13 @@ class NetworkTrainer:
                                 save_model(ckpt_name, accelerator.unwrap_model(network), global_step, epoch)
 
                                 if args.save_state:
+                                    step_in_epoch = train_utils.normalize_step_in_epoch(step + 1, len(train_dataloader))
                                     train_utils.save_and_remove_state_stepwise(
                                         args,
                                         accelerator,
                                         global_step,
                                         epoch=epoch + 1,
-                                        step_in_epoch=step + 1,
+                                        step_in_epoch=step_in_epoch,
                                     )
 
                                 remove_step_no = train_utils.get_remove_step_no(args, global_step)

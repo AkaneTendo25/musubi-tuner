@@ -11,6 +11,38 @@ from musubi_tuner.utils import train_utils
 logger = logging.getLogger(__name__)
 
 
+def _restore_dataset_seed(dataset, data_seed: int) -> None:
+    """Restore Musubi dataset seeds before resumed workers are started."""
+    child_datasets = getattr(dataset, "datasets", None)
+    if child_datasets is not None:
+        for child_dataset in child_datasets:
+            _restore_dataset_seed(child_dataset, data_seed)
+        return
+
+    set_seed = getattr(dataset, "set_seed", None)
+    shared_epoch = getattr(dataset, "shared_epoch", None)
+    if set_seed is not None and shared_epoch is not None:
+        set_seed(data_seed, shared_epoch)
+
+
+def configure_dataloader_for_epoch(dataloader, epoch: int, data_seed: int | None = None) -> None:
+    """Select a reproducible epoch order and optionally restore its saved data seed."""
+    if data_seed is not None:
+        data_seed = int(data_seed)
+        get_sampler = getattr(dataloader, "get_sampler", None)
+        sampler = get_sampler() if get_sampler is not None else getattr(dataloader, "sampler", None)
+        if hasattr(sampler, "initial_seed"):
+            sampler.initial_seed = data_seed
+        generator = getattr(sampler, "generator", None)
+        if isinstance(generator, torch.Generator):
+            generator.manual_seed(data_seed + epoch)
+        _restore_dataset_seed(dataloader.dataset, data_seed)
+
+    set_epoch = getattr(dataloader, "set_epoch", None)
+    if set_epoch is not None:
+        set_epoch(epoch)
+
+
 def recover_global_step(state_dir: str) -> int:
     """Recover Musubi's optimization step from new or legacy state directories."""
     metadata = train_utils.load_resume_metadata(state_dir)
