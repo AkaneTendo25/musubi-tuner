@@ -46,8 +46,8 @@
 		getModelDownloadPresets().then((presets) => { downloadPresets = presets; }).catch(() => {});
 		resumeModelDownloadPolling();
 		refreshCacheStatus().catch(() => {});
-		preloadLogsIfActive(['cache_latents', 'cache_text', 'cache_dino', 'cache_preview']);
-		const logInterval = startLogPolling(['cache_latents', 'cache_text', 'cache_dino', 'cache_preview'], 1000);
+		preloadLogsIfActive(['cache_latents', 'cache_text', 'cache_dino']);
+		const logInterval = startLogPolling(['cache_latents', 'cache_text', 'cache_dino'], 1000);
 		return () => {
 			clearInterval(logInterval);
 			if (ltxScanJobId) cancelCheckpointScan(ltxScanJobId).catch(() => {});
@@ -62,11 +62,9 @@
 	let latentStatus = $derived($processStatuses.cache_latents || { state: 'idle', exit_code: null });
 	let textStatus = $derived($processStatuses.cache_text || { state: 'idle', exit_code: null });
 	let dinoStatus = $derived($processStatuses.cache_dino || { state: 'idle', exit_code: null });
-	let previewStatus = $derived($processStatuses.cache_preview || { state: 'idle', exit_code: null });
 	let latentLogs = $derived($processLogs.cache_latents || []);
 	let textLogs = $derived($processLogs.cache_text || []);
 	let dinoLogs = $derived($processLogs.cache_dino || []);
-	let previewLogs = $derived($processLogs.cache_preview || []);
 	let modelDir = $derived(defaultModelDir(cwd, $projectConfig));
 	let resolvedLtx = $derived(effectiveLtx2Checkpoint(cwd, $projectConfig, caching.ltx2_checkpoint || ''));
 	let activeGemmaSafetensors = $derived(effectiveGemmaSafetensors($projectConfig, caching.gemma_safetensors || '', caching.gemma_root || ''));
@@ -402,7 +400,7 @@
 		<!-- Shared Settings -->
 		<div class="p-4 space-y-3" style="background: var(--bg-surface); border: 1px solid var(--border-subtle); border-radius: var(--radius-md);">
 			<div class="grid grid-cols-2 xl:grid-cols-3 gap-3">
-				<FormSelect fieldPath="caching.model_type" value={caching.model_type || 'ltx2'} options={[{ value: 'ltx2', label: 'LTX-2' }, { value: 'minimax_h3', label: 'MiniMax H3' }]} onchange={(e) => updateCaching('model_type', e.target.value)} tooltip="Model used for latent and text cache commands" />
+				<div class="text-[12px] font-semibold" style="color: var(--text-primary);">MiniMax H3</div>
 				{#if caching.model_type === 'minimax_h3'}
 					<PathInput fieldPath="caching.h3_video_vae" value={caching.h3_video_vae || ''} oninput={(e) => updateCaching('h3_video_vae', e.target.value)} showFiles tooltip="MiniMax H3 video VAE checkpoint" />
 					<PathInput fieldPath="caching.h3_audio_vae" value={caching.h3_audio_vae || ''} oninput={(e) => updateCaching('h3_audio_vae', e.target.value)} showFiles tooltip="MiniMax H3 audio VAE checkpoint; optional for image-only datasets" />
@@ -424,6 +422,8 @@
 					<PathInput fieldPath="caching.h3_tokenizer" value={caching.h3_tokenizer || ''} oninput={(e) => updateCaching('h3_tokenizer', e.target.value)} showFiles tooltip="MiniMax H3 tokenizer and processor directory" />
 					<FormSelect fieldPath="caching.h3_task" value={caching.h3_task || 't2va'} options={['t2va', 'fl2va']} onchange={(e) => updateCaching('h3_task', e.target.value)} tooltip="H3 conditioning cache task" />
 					<FormSelect fieldPath="caching.h3_text_encoder_dtype" value={caching.h3_text_encoder_dtype || 'bfloat16'} options={[{ value: 'bfloat16', label: 'BF16' }]} onchange={(e) => updateCaching('h3_text_encoder_dtype', e.target.value)} tooltip="MiniMax H3 Qwen3-VL conditioning and cached layer-50 outputs require BF16." />
+					<FormField type="number" fieldPath="caching.cache_batch_size" value={caching.cache_batch_size ?? ''} oninput={(e) => updateCaching('cache_batch_size', e.target.value ? Number(e.target.value) : null)} min={1} placeholder="Automatic" tooltip="Batch size passed to both H3 cache stages" />
+					<FormField type="number" fieldPath="caching.h3_reference_image_short_edge" value={caching.h3_reference_image_short_edge ?? 384} oninput={(e) => updateCaching('h3_reference_image_short_edge', Number(e.target.value || 384))} min={64} step={8} tooltip="Reference image size shared by caching, training, and inference" />
 					<FormToggle fieldPath="caching.h3_cache_guidance_empty" checked={caching.h3_cache_guidance_empty ?? false} onchange={(e) => updateCaching('h3_cache_guidance_empty', e.target.checked)} tooltip="Also cache empty-text conditioning for guidance distillation" />
 				</div>
 			{:else}
@@ -459,7 +459,7 @@
 				<FormToggle fieldPath="caching.skip_existing" checked={caching.skip_existing ?? false} onchange={(e) => updateCaching('skip_existing', e.target.checked)} tooltip="Skip files that already have cached outputs" />
 				<FormToggle fieldPath="caching.atomic_cache_writes" checked={caching.atomic_cache_writes ?? false} onchange={(e) => updateCaching('atomic_cache_writes', e.target.checked)} tooltip="Write cache files through a temporary sibling file, then atomically replace the final cache path after a successful save." />
 				<FormToggle fieldPath="caching.cache_distributed" checked={caching.cache_distributed ?? false} onchange={(e) => updateCaching('cache_distributed', e.target.checked)} tooltip="Shard caching work across multiple processes (opt-in multi-process cache sharding)." />
-				<FormToggle fieldPath="caching.cpu_staged_checkpoint_loading" checked={caching.cpu_staged_checkpoint_loading ?? false} onchange={(e) => updateCaching('cpu_staged_checkpoint_loading', e.target.checked)} tooltip="Load LTX checkpoint tensors through CPU before moving them to the selected device. This may avoid direct CUDA safetensors loading errors, but initial loading is slower and uses additional CPU RAM." />
+				<FormToggle fieldPath="caching.cpu_staged_checkpoint_loading" checked={caching.cpu_staged_checkpoint_loading ?? false} onchange={(e) => updateCaching('cpu_staged_checkpoint_loading', e.target.checked)} tooltip="Stage checkpoint tensors through CPU before moving them to the selected device." />
 			</div>
 			{#if $advancedMode}
 				<div class="grid grid-cols-2 xl:grid-cols-4 gap-3">
@@ -494,13 +494,16 @@
 						</div>
 					</FormGroup>
 
+					{#if caching.model_type !== 'minimax_h3'}
 					<FormGroup title="Reference (V2V)">
 						<div class="grid grid-cols-2 gap-3 pt-2">
 							<FormField type="number" fieldPath="caching.reference_frames" value={caching.reference_frames ?? 1} oninput={(e) => updateCaching('reference_frames', Number(e.target.value))} min={1} tooltip="Reference frames for V2V" />
 							<FormField type="number" fieldPath="caching.reference_downscale" value={caching.reference_downscale ?? 1} oninput={(e) => updateCaching('reference_downscale', Number(e.target.value))} min={1} tooltip="Reference downscale factor" />
 						</div>
 					</FormGroup>
+					{/if}
 
+					{#if caching.model_type !== 'minimax_h3'}
 					<FormGroup title="Precache I2V Latents">
 						<div class="space-y-2 pt-2">
 							<FormToggle fieldPath="caching.precache_sample_latents" checked={caching.precache_sample_latents ?? false} onchange={(e) => updateCaching('precache_sample_latents', e.target.checked)} tooltip="Pre-encode I2V conditioning latents from prompts defined on the Samples page." />
@@ -510,6 +513,7 @@
 							{/if}
 						</div>
 					</FormGroup>
+					{/if}
 				{/if}
 
 				{#if caching.ltx2_mode === 'av' || caching.ltx2_mode === 'audio'}
@@ -563,7 +567,7 @@
 				{#if caching.model_type === 'minimax_h3'}
 					<FormGroup title="Qwen3-VL Quantization" collapsed={false}>
 						<div class="pt-2">
-							<FormSelect fieldPath="caching.h3_text_encoder_quantization" value={caching.h3_text_encoder_quantization || 'none'} options={[{ value: 'none', label: 'BF16' }, { value: 'int8', label: 'INT8 (32 GB)' }, { value: 'nf4', label: 'NF4 (24 GB)' }, { value: 'nvfp4_awq', label: 'Prequantized NVFP4/AWQ' }]} onchange={(e) => updateCaching('h3_text_encoder_quantization', e.target.value)} tooltip="Choose the released BF16 encoder, quantize BF16 at load time, or directly load the Comfy NVFP4/AWQ encoder. Cache outputs remain BF16." />
+							<FormSelect fieldPath="caching.h3_text_encoder_quantization" value={caching.h3_text_encoder_quantization || 'none'} options={[{ value: 'none', label: 'BF16 (~52 GB peak)' }, { value: 'int8', label: 'INT8 (~28 GB peak)' }, { value: 'nf4', label: 'NF4 (~17 GB peak)' }, { value: 'nvfp4_awq', label: 'NVFP4/AWQ (~18 GB peak)' }]} onchange={(e) => updateCaching('h3_text_encoder_quantization', e.target.value)} tooltip="Peak estimates include the official 32B H3 conditioner weights and encode workspace. Cache outputs remain BF16." />
 						</div>
 					</FormGroup>
 				{:else}
@@ -637,44 +641,6 @@
 					<CommandPanel processType="cache_text" defaultFilename="cache_text.bat" />
 				{/if}
 			</div>
-		</div>
-
-		<!-- Cache Preview -->
-		<div class="space-y-3">
-			<span class="text-[11px] font-medium uppercase tracking-wider" style="color: var(--text-muted);">Cache Preview</span>
-
-			<FormGroup title="Latent Cache Verification" collapsed={false}>
-				<div class="space-y-2 pt-2">
-					<div class="grid grid-cols-1 xl:grid-cols-2 gap-3">
-						<PathInput fieldPath="caching.cache_preview_input" value={caching.cache_preview_input || ''} oninput={(e) => updateCaching('cache_preview_input', e.target.value)} showFiles tooltip="Cache file or directory. Blank uses the first dataset cache directory." />
-						<PathInput fieldPath="caching.cache_preview_output" value={caching.cache_preview_output || ''} oninput={(e) => updateCaching('cache_preview_output', e.target.value)} tooltip="Output directory for summary.json and decoded previews. Blank uses project_dir/cache_preview." />
-					</div>
-					<div class="grid grid-cols-2 xl:grid-cols-4 gap-3">
-						<FormToggle fieldPath="caching.cache_preview_stats" checked={caching.cache_preview_stats ?? true} onchange={(e) => updateCaching('cache_preview_stats', e.target.checked)} tooltip="Include finite min/max stats in summary.json." />
-						<FormToggle fieldPath="caching.cache_preview_fail_on_error" checked={caching.cache_preview_fail_on_error ?? true} onchange={(e) => updateCaching('cache_preview_fail_on_error', e.target.checked)} tooltip="Return a failed exit code when any cache file has validation or decode errors." />
-						<FormToggle fieldPath="caching.cache_preview_check_source" checked={caching.cache_preview_check_source ?? true} onchange={(e) => updateCaching('cache_preview_check_source', e.target.checked)} tooltip="Compare source size and modification time with stored freshness metadata." />
-						<FormToggle fieldPath="caching.cache_preview_decode" checked={caching.cache_preview_decode ?? false} onchange={(e) => updateCaching('cache_preview_decode', e.target.checked)} tooltip="Decode MP4/PNG/WAV previews with the configured LTX-2 checkpoint." />
-						<FormField type="number" fieldPath="caching.cache_preview_limit" value={caching.cache_preview_limit ?? ''} oninput={(e) => updateCaching('cache_preview_limit', e.target.value ? Number(e.target.value) : null)} min={1} placeholder="All" tooltip="Maximum number of cache files to inspect." />
-					</div>
-					<div class="grid grid-cols-2 xl:grid-cols-4 gap-3">
-						<FormField fieldPath="caching.cache_preview_require_companions" value={caching.cache_preview_require_companions || ''} oninput={(e) => updateCaching('cache_preview_require_companions', e.target.value)} placeholder="video,audio,text" tooltip="Comma-separated companion cache roles required for every logical item." />
-						<FormField type="number" fieldPath="caching.cache_preview_av_duration_tolerance" value={caching.cache_preview_av_duration_tolerance ?? 0.05} oninput={(e) => updateCaching('cache_preview_av_duration_tolerance', Number(e.target.value))} min={0} step="0.01" tooltip="Maximum allowed video/audio duration difference in seconds." />
-					</div>
-					{#if caching.cache_preview_decode}
-						<div class="grid grid-cols-2 xl:grid-cols-4 gap-3">
-							<FormSelect fieldPath="caching.cache_preview_device" value={caching.cache_preview_device || 'auto'} options={['auto', 'cpu', 'cuda']} onchange={(e) => updateCaching('cache_preview_device', e.target.value)} tooltip="Decode device." />
-							<FormSelect fieldPath="caching.cache_preview_dtype" value={caching.cache_preview_dtype || ''} options={[{ value: '', label: 'auto' }, 'float16', 'bfloat16', 'float32']} onchange={(e) => updateCaching('cache_preview_dtype', e.target.value || null)} tooltip="Decode dtype." />
-							<FormField type="number" fieldPath="caching.cache_preview_fps" value={caching.cache_preview_fps ?? 25} oninput={(e) => updateCaching('cache_preview_fps', Number(e.target.value))} min={0.1} step="0.1" tooltip="FPS for decoded video previews." />
-						</div>
-					{/if}
-				</div>
-			</FormGroup>
-
-			<ProcessControls processType="cache_preview" status={previewStatus} onStart={() => startProcess('cache_preview')} onStop={(options) => stopProcess('cache_preview', options)} />
-			<ProcessConsole lines={previewLogs} processType="cache_preview" initiallyCollapsed={false} />
-			{#if $advancedMode}
-				<CommandPanel processType="cache_preview" defaultFilename="cache_preview.bat" />
-			{/if}
 		</div>
 	</div>
 {/if}

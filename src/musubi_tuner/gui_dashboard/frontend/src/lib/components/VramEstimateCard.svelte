@@ -13,7 +13,7 @@
 	let over = $derived(value > capacity);
 	let barColor = $derived(over ? 'var(--danger)' : color);
 	let parts = $derived(estimate?.parts ?? []);
-	let hasNotes = $derived(!!(estimate?.swap > 0 || estimate?.noGemma || estimate?.samplingSpike || estimate?.preservationGemmaSpike));
+	let hasNotes = $derived(!!(estimate?.swap > 0 || estimate?.samplingSpike || estimate?.basis));
 </script>
 
 <div class="min-h-[156px] p-4 flex flex-col justify-between" style="background: var(--bg-elevated); border: 1px solid var(--border-subtle); border-radius: var(--radius-sm);">
@@ -49,14 +49,11 @@
 			{#if estimate.swap > 0}
 				<div class="text-[11px]" style="color: var(--success);">-{estimate.swap.toFixed(1)}G block swap</div>
 			{/if}
-			{#if estimate.noGemma}
-				<div class="text-[11px]" style="color: var(--info);">steady-state excludes VAE/Gemma</div>
-			{/if}
 			{#if estimate.samplingSpike}
-				<div class="text-[11px]" style="color: var(--text-muted);">sampling can temporarily load VAE/Gemma</div>
+				<div class="text-[11px]" style="color: var(--text-muted);">sampling can temporarily load the H3 VAEs and Qwen3-VL</div>
 			{/if}
-			{#if estimate.preservationGemmaSpike}
-				<div class="text-[11px]" style="color: var(--text-muted);">preservation encoding loads Gemma if not precached</div>
+			{#if estimate.basis}
+				<div class="text-[11px]" style="color: var(--text-muted);">{estimate.basis} · {estimate.confidence || 'estimated'} confidence</div>
 			{/if}
 		</div>
 	{/if}

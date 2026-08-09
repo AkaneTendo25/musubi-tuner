@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -90,6 +91,37 @@ def test_training_process_stop_uses_graceful_stop_file(tmp_path: Path) -> None:
     assert status["state"] == "finished"
     assert status["exit_code"] == 0
     assert status["stop_requested"] is True
+
+
+def test_process_uses_absolute_checkout_src_before_inherited_pythonpath(tmp_path: Path, monkeypatch) -> None:
+    manager = ProcessManager()
+    output = tmp_path / "pythonpath.txt"
+    monkeypatch.setenv("PYTHONPATH", "src")
+    script = f"import os,pathlib; pathlib.Path({str(output)!r}).write_text(os.environ['PYTHONPATH'])"
+
+    manager.start("inference", [sys.executable, "-c", script], cwd=str(tmp_path))
+    deadline = time.time() + 5
+    while manager.get_status("inference")["state"] == "running" and time.time() < deadline:
+        time.sleep(0.01)
+
+    pythonpath = output.read_text(encoding="utf-8").split(os.pathsep)
+    expected_src = Path(__file__).resolve().parents[1] / "src"
+    assert Path(pythonpath[0]) == expected_src
+    assert pythonpath[1] == "src"
+
+
+def test_process_does_not_inherit_empty_cuda_visible_devices(tmp_path: Path, monkeypatch) -> None:
+    manager = ProcessManager()
+    output = tmp_path / "cuda_visible_devices.txt"
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
+    script = f"import os,pathlib; pathlib.Path({str(output)!r}).write_text(os.environ.get('CUDA_VISIBLE_DEVICES', 'missing'))"
+
+    manager.start("inference", [sys.executable, "-c", script], cwd=str(tmp_path))
+    deadline = time.time() + 5
+    while manager.get_status("inference")["state"] == "running" and time.time() < deadline:
+        time.sleep(0.01)
+
+    assert output.read_text(encoding="utf-8") == "missing"
 
 
 def test_dashboard_autoresume_recognizes_manifest_state(tmp_path: Path) -> None:

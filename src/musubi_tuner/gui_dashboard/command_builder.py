@@ -327,6 +327,10 @@ def _append_optional(cmd: list[str], flag: str, value) -> None:
 
 
 def _h3_cache_common_args(cmd: list[str], section) -> None:
+    if section.cache_batch_size is not None:
+        cmd += ["--batch_size", str(section.cache_batch_size)]
+    if section.h3_reference_image_short_edge != 384:
+        cmd += ["--reference_image_short_edge", str(section.h3_reference_image_short_edge)]
     if section.device:
         cmd += ["--device", section.device]
     if section.skip_existing:
@@ -387,6 +391,7 @@ def _build_h3_cache_text_cmd(config: ProjectConfig) -> list[str]:
 
 def _build_h3_inference_cmd(config: ProjectConfig) -> list[str]:
     s = config.inference
+    c = config.caching
     output_dir = Path(s.output_dir or "output")
     output_name = s.output_name or "h3_sample"
     output_path = output_dir / output_name
@@ -398,6 +403,14 @@ def _build_h3_inference_cmd(config: ProjectConfig) -> list[str]:
         _find_script("minimax_h3_generate_video.py"),
         "--model",
         s.h3_model,
+        "--text_encoder",
+        s.h3_text_encoder or c.h3_text_encoder,
+        "--tokenizer",
+        s.h3_tokenizer or c.h3_tokenizer,
+        "--vae",
+        s.h3_video_vae or c.h3_video_vae,
+        "--audio_vae",
+        s.h3_audio_vae or c.h3_audio_vae,
         "--prompt",
         s.prompt,
         "--output",
@@ -407,14 +420,32 @@ def _build_h3_inference_cmd(config: ProjectConfig) -> list[str]:
         "--ratio",
         s.h3_ratio,
     ]
+    text_encoder_quantization = (
+        s.h3_text_encoder_quantization if s.h3_text_encoder_quantization != "none" else c.h3_text_encoder_quantization
+    )
+    if text_encoder_quantization != "none":
+        cmd += ["--text_encoder_quantization", text_encoder_quantization]
+    for weight in _split_cli_args(s.lora_weight):
+        cmd += ["--lora_weight", weight]
+    multipliers = _split_cli_args(str(s.lora_multiplier)) if s.lora_weight else []
+    for multiplier in multipliers:
+        cmd += ["--lora_multiplier", multiplier]
     if s.device:
         cmd += ["--device", s.device]
     if s.seed is not None:
         cmd += ["--seed", str(s.seed)]
+    if s.sample_steps is not None:
+        cmd += ["--steps", str(s.sample_steps)]
+    if s.height is not None:
+        cmd += ["--height", str(s.height)]
+    if s.width is not None:
+        cmd += ["--width", str(s.width)]
     if s.h3_first_frame:
         cmd += ["--first_frame", s.h3_first_frame]
     if s.h3_last_frame:
         cmd += ["--last_frame", s.h3_last_frame]
+    for keyframe in _split_cli_args(s.h3_keyframes):
+        cmd += ["--keyframe", keyframe]
     for flag, raw in (
         ("--reference_image", s.h3_reference_image),
         ("--reference_video", s.h3_reference_video),
@@ -422,6 +453,44 @@ def _build_h3_inference_cmd(config: ProjectConfig) -> list[str]:
     ):
         for path in _split_cli_args(raw):
             cmd += [flag, path]
+    if s.h3_reference_image_short_edge != 384:
+        cmd += ["--reference_image_short_edge", str(s.h3_reference_image_short_edge)]
+    if s.h3_dtype != "bfloat16":
+        cmd += ["--dtype", s.h3_dtype]
+    if s.fp8_base:
+        cmd.append("--fp8_base")
+    if s.h3_int8_convrot_base:
+        cmd.append("--int8_convrot_base")
+    if s.h3_blocks_to_swap:
+        cmd += ["--blocks_to_swap", str(s.h3_blocks_to_swap)]
+    if s.h3_block_swap_h2d_only:
+        cmd.append("--block_swap_h2d_only")
+    if s.h3_block_swap_ring_size != 2:
+        cmd += ["--block_swap_ring_size", str(s.h3_block_swap_ring_size)]
+    if s.h3_block_swap_granularity != "block":
+        cmd += ["--block_swap_granularity", s.h3_block_swap_granularity]
+    if s.h3_use_pinned_memory_for_block_swap:
+        cmd.append("--use_pinned_memory_for_block_swap")
+    if s.h3_compile:
+        cmd.append("--compile")
+        if s.h3_compile_backend != "inductor":
+            cmd += ["--compile_backend", s.h3_compile_backend]
+        if s.h3_compile_mode != "max-autotune-no-cudagraphs":
+            cmd += ["--compile_mode", s.h3_compile_mode]
+        if s.h3_compile_dynamic:
+            cmd += ["--compile_dynamic", s.h3_compile_dynamic]
+        if s.h3_compile_fullgraph:
+            cmd.append("--compile_fullgraph")
+        if s.h3_compile_cache_size_limit is not None:
+            cmd += ["--compile_cache_size_limit", str(s.h3_compile_cache_size_limit)]
+        if s.h3_compile_auto_cache_size_limit:
+            cmd.append("--compile_auto_cache_size_limit")
+        if s.h3_compile_fallback_to_eager:
+            cmd.append("--compile_fallback_to_eager")
+        if s.h3_inductor_config:
+            cmd += ["--inductor_config", *_split_cli_args(s.h3_inductor_config)]
+    if s.h3_fused_qk_norm_rope:
+        cmd.append("--h3_fused_qk_norm_rope")
     cmd += _split_cli_args(s.extra_args)
     return cmd
 
@@ -475,6 +544,53 @@ def _build_h3_training_cmd(config: ProjectConfig) -> list[str]:
     if t.h3_audio_loss_weight != 1.0:
         cmd += ["--h3_audio_loss_weight", str(t.h3_audio_loss_weight)]
     cmd += ["--h3_spatial_density_jitter", str(t.h3_spatial_density_jitter)]
+    if t.h3_shift_video != 12.0:
+        cmd += ["--h3_shift_video", str(t.h3_shift_video)]
+    if t.h3_shift_audio != 3.0:
+        cmd += ["--h3_shift_audio", str(t.h3_shift_audio)]
+    if t.h3_frame_sigma_jitter:
+        cmd += ["--h3_frame_sigma_jitter", str(t.h3_frame_sigma_jitter)]
+    if t.h3_caption_dropout_rate:
+        cmd += ["--h3_caption_dropout_rate", str(t.h3_caption_dropout_rate)]
+    if t.h3_observed_modality:
+        cmd += ["--h3_observed_modality", t.h3_observed_modality]
+    if t.h3_image_flow_shift is not None:
+        cmd += ["--h3_image_flow_shift", str(t.h3_image_flow_shift)]
+    if t.h3_extension_video_frames:
+        cmd += ["--h3_extension_video_frames", str(t.h3_extension_video_frames)]
+    if t.h3_extension_audio_latents:
+        cmd += ["--h3_extension_audio_latents", str(t.h3_extension_audio_latents)]
+    if t.h3_extension_route != "condition_rows":
+        cmd += ["--h3_extension_route", t.h3_extension_route]
+    if t.h3_keyframe_anchors:
+        cmd += ["--h3_keyframe_anchors", t.h3_keyframe_anchors]
+    if t.h3_keyframe_random_count:
+        cmd += ["--h3_keyframe_random_count", str(t.h3_keyframe_random_count)]
+    if t.reference_image_short_edge != 384:
+        cmd += ["--reference_image_short_edge", str(t.reference_image_short_edge)]
+    if t.h3_mask_mode != "off":
+        cmd += ["--h3_mask_mode", t.h3_mask_mode]
+        if t.h3_mask_audio:
+            cmd.append("--h3_mask_audio")
+        if t.h3_mask_min_fraction != 0.25:
+            cmd += ["--h3_mask_min_fraction", str(t.h3_mask_min_fraction)]
+        if t.h3_mask_max_fraction != 0.75:
+            cmd += ["--h3_mask_max_fraction", str(t.h3_mask_max_fraction)]
+    if t.crepa:
+        crepa_args: list[str] = []
+        _append_key_value_args(crepa_args, t.crepa_args)
+        if t.crepa_mode != "backbone":
+            crepa_args.append(f"mode={t.crepa_mode}")
+        if t.crepa_student_block_idx != 16:
+            crepa_args.append(f"student_block={t.crepa_student_block_idx}")
+        if t.crepa_mode == "backbone" and t.h3_crepa_teacher_block_idx != 33:
+            crepa_args.append(f"teacher_block={t.h3_crepa_teacher_block_idx}")
+        if t.crepa_mode == "dino" and t.crepa_dino_model != "dinov2_vitb14":
+            crepa_args.append(f"dino_model={t.crepa_dino_model}")
+        if t.crepa_lambda != 0.1:
+            crepa_args.append(f"weight={t.crepa_lambda}")
+        cmd.append("--crepa")
+        cmd += crepa_args
     if t.h3_guidance_distillation_scale is not None:
         cmd += ["--h3_guidance_distillation_scale", str(t.h3_guidance_distillation_scale)]
         if t.h3_guidance_loss_form != "normalized":
@@ -586,24 +702,12 @@ def _build_h3_training_cmd(config: ProjectConfig) -> list[str]:
     return cmd
 
 
-def _accelerate_executable() -> str:
-    executable_name = "accelerate.exe" if sys.platform == "win32" else "accelerate"
-    executable = Path(sys.executable).parent / executable_name
-    if executable.exists():
-        return str(executable)
-    repo_venv_executable = (
-        Path(__file__).resolve().parents[3] / "venv" / ("Scripts" if sys.platform == "win32" else "bin") / executable_name
-    )
-    if repo_venv_executable.exists():
-        return str(repo_venv_executable)
-    return "accelerate"
-
-
 def _accelerate_launch_prefix(mixed_precision: str, extra_args: str) -> list[str]:
     extra = _split_cli_args(extra_args)
     cmd = [
-        _accelerate_executable(),
-        "launch",
+        sys.executable,
+        "-m",
+        "accelerate.commands.launch",
         *extra,
         "--mixed_precision",
         mixed_precision,

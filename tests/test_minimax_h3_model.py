@@ -760,6 +760,20 @@ def test_h3_scaled_fp8_block_swap_forward_backward_parity(h2d_only, use_pinned_m
     torch.testing.assert_close(swapped_inputs["encoder_hidden_states"].grad, reference_gradient)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for the cross-device FP8 scale regression")
+def test_h3_scaled_fp8_forward_tolerates_cpu_scale_buffer():
+    layer = torch.nn.Linear(4, 3, bias=True, device="cpu", dtype=torch.bfloat16)
+    layer.weight = torch.nn.Parameter(layer.weight.to(torch.float8_e4m3fn), requires_grad=False)
+    model = torch.nn.Sequential(layer)
+    state_dict = {"0.scale_weight": torch.ones(3, 1, dtype=torch.bfloat16)}
+    apply_fp8_monkey_patch(model, state_dict, use_scaled_mm=False)
+    layer.scale_weight = state_dict["0.scale_weight"]
+
+    output = layer(torch.ones(2, 4, device="cuda", dtype=torch.bfloat16))
+
+    assert output.device.type == "cuda"
+
+
 def test_h3_checkpoint_validator_accepts_exact_native_mixed_precision_layout(tmp_path: Path):
     config = _tiny_config()
     model = MiniMaxH3Transformer(config)

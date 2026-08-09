@@ -488,11 +488,11 @@
 			<div class="space-y-3">
 				<FormGroup title="Model">
 					<div class="space-y-2 pt-2">
-						<FormSelect fieldPath="training.model_type" value={t.model_type || 'ltx2'} options={[{ value: 'ltx2', label: 'LTX-2' }, { value: 'minimax_h3', label: 'MiniMax H3' }]} onchange={(e) => update('model_type', e.target.value)} tooltip="Model backend used for training" />
+						<div class="text-[12px] font-semibold" style="color: var(--text-primary);">MiniMax H3</div>
 						{#if t.model_type === 'minimax_h3'}
 							<PathInput fieldPath="training.h3_model" value={t.h3_model || ''} oninput={(e) => update('h3_model', e.target.value)} showFiles tooltip="MiniMax H3 DiT checkpoint" invalid={fieldInvalid('training.h3_model')} error={fieldError('training.h3_model')} />
 							<div class="grid grid-cols-2 gap-2">
-								<FormSelect fieldPath="training.h3_training_mode" value={t.h3_training_mode || 'fl2va'} options={['fl2va']} onchange={(e) => update('h3_training_mode', e.target.value)} tooltip="MiniMax H3 training mode (the current backend supports first/last-frame conditioning)" />
+							<FormSelect fieldPath="training.h3_training_mode" value={t.h3_training_mode || 'fl2va'} options={['fl2va', 'ref2va', 'ref2va_omni']} onchange={(e) => update('h3_training_mode', e.target.value)} tooltip="FL2VA, strict reference conditioning, or experimental zero-or-more-reference training" />
 								<FormSelect fieldPath="training.h3_loss_balance" value={t.h3_loss_balance || 'modality'} options={['modality', 'token']} onchange={(e) => update('h3_loss_balance', e.target.value)} tooltip="Balance video and audio loss by modality or token count" />
 							</div>
 							<div class="grid grid-cols-2 gap-2">
@@ -501,6 +501,43 @@
 							</div>
 							<FormField label="Spatial Density Jitter" type="number" fieldPath="training.h3_spatial_density_jitter" value={t.h3_spatial_density_jitter ?? 0.2} oninput={(e) => update('h3_spatial_density_jitter', Number(e.target.value))} min={0} step="0.05" tooltip="Perturb spatial RoPE density each step; 0 disables it. The dashboard default is 0.2." invalid={fieldInvalid('training.h3_spatial_density_jitter')} error={fieldError('training.h3_spatial_density_jitter')} />
 							{#if $advancedMode}
+								<div class="h3-control-cluster">
+									<div class="h3-control-cluster-title">H3 conditioning curriculum</div>
+									<div class="grid grid-cols-1 md:grid-cols-2 gap-2">
+										<FormSelect fieldPath="training.h3_observed_modality" value={t.h3_observed_modality || ''} options={[{value:'',label:'Joint video + audio'},{value:'video',label:'Observe video · train audio'},{value:'audio',label:'Observe audio · train video'},{value:'random',label:'Random task each step'}]} onchange={(e) => update('h3_observed_modality', e.target.value || null)} tooltip="Train joint generation, Foley, audio-driven video, or randomly mix all three tasks" />
+										<FormField type="number" fieldPath="training.h3_caption_dropout_rate" value={t.h3_caption_dropout_rate ?? 0} oninput={(e) => update('h3_caption_dropout_rate', Number(e.target.value || 0))} min={0} max={1} step="0.05" tooltip="Probability of using cached empty conditioning; requires Cache Guidance Empty" />
+										<FormField type="number" fieldPath="training.h3_frame_sigma_jitter" value={t.h3_frame_sigma_jitter ?? 0} oninput={(e) => update('h3_frame_sigma_jitter', Number(e.target.value || 0))} min={0} step="0.01" tooltip="Spread per-frame noise positions around the shared schedule" />
+										<FormField type="number" fieldPath="training.h3_image_flow_shift" value={t.h3_image_flow_shift ?? ''} oninput={(e) => update('h3_image_flow_shift', e.target.value ? Number(e.target.value) : null)} min={0} step="0.1" placeholder="Automatic" tooltip="Optional image-batch flow-shift override" />
+										<FormField type="number" fieldPath="training.h3_shift_video" value={t.h3_shift_video ?? 12} oninput={(e) => update('h3_shift_video', Number(e.target.value || 12))} min={0} step="0.1" tooltip="Released H3 video flow shift" />
+										<FormField type="number" fieldPath="training.h3_shift_audio" value={t.h3_shift_audio ?? 3} oninput={(e) => update('h3_shift_audio', Number(e.target.value || 3))} min={0} step="0.1" tooltip="Released H3 audio flow shift" />
+										<FormField type="number" fieldPath="training.h3_extension_video_frames" value={t.h3_extension_video_frames ?? 0} oninput={(e) => update('h3_extension_video_frames', Number(e.target.value || 0))} min={0} tooltip="Leading latent video frames observed as extension context" />
+										<FormField type="number" fieldPath="training.h3_extension_audio_latents" value={t.h3_extension_audio_latents ?? 0} oninput={(e) => update('h3_extension_audio_latents', Number(e.target.value || 0))} min={0} tooltip="Leading audio latents observed as extension context" />
+										<FormSelect fieldPath="training.h3_extension_route" value={t.h3_extension_route || 'condition_rows'} options={['condition_rows', 'per_row_sigma']} onchange={(e) => update('h3_extension_route', e.target.value)} tooltip="How observed extension context is represented" />
+										<FormField type="number" fieldPath="training.reference_image_short_edge" value={t.reference_image_short_edge ?? 384} oninput={(e) => update('reference_image_short_edge', Number(e.target.value || 384))} min={64} step={8} tooltip="Must match the reference-image size used by latent caching" />
+									</div>
+								</div>
+								<div class="h3-control-cluster">
+									<div class="h3-control-cluster-title">Temporal representation alignment</div>
+									<div class="grid grid-cols-1 md:grid-cols-2 gap-2">
+										<FormToggle label="Enable H3 CREPA" fieldPath="training.crepa" checked={t.crepa ?? false} onchange={(e) => update('crepa', e.target.checked)} tooltip="Align temporal representations between H3 student and teacher blocks" />
+										<FormSelect fieldPath="training.crepa_mode" value={t.crepa_mode || 'backbone'} options={['backbone', 'dino']} onchange={(e) => update('crepa_mode', e.target.value)} disabled={!t.crepa} />
+										<FormField type="number" fieldPath="training.crepa_student_block_idx" value={t.crepa_student_block_idx ?? 16} oninput={(e) => update('crepa_student_block_idx', Number(e.target.value || 16))} min={0} max={49} disabled={!t.crepa} />
+										<FormField type="number" fieldPath="training.h3_crepa_teacher_block_idx" value={t.h3_crepa_teacher_block_idx ?? 33} oninput={(e) => update('h3_crepa_teacher_block_idx', Number(e.target.value || 33))} min={0} max={49} disabled={!t.crepa || t.crepa_mode !== 'backbone'} />
+										<FormField type="number" fieldPath="training.crepa_lambda" value={t.crepa_lambda ?? 0.1} oninput={(e) => update('crepa_lambda', Number(e.target.value || 0.1))} min={0} step="0.01" disabled={!t.crepa} />
+										<FormField fieldPath="training.crepa_args" value={t.crepa_args || ''} oninput={(e) => update('crepa_args', e.target.value)} placeholder="tau=1.0 num_neighbors=2" disabled={!t.crepa} tooltip="Additional H3 CREPA KEY=VALUE options" />
+									</div>
+								</div>
+								<div class="h3-control-cluster">
+									<div class="h3-control-cluster-title">Keyframes and masks</div>
+									<div class="grid grid-cols-1 md:grid-cols-2 gap-2">
+										<FormField fieldPath="training.h3_keyframe_anchors" value={t.h3_keyframe_anchors || ''} oninput={(e) => update('h3_keyframe_anchors', e.target.value)} placeholder="first,last or 0,11,21" tooltip="Clean conditioning frames used as interpolation anchors" />
+										<FormField type="number" fieldPath="training.h3_keyframe_random_count" value={t.h3_keyframe_random_count ?? 0} oninput={(e) => update('h3_keyframe_random_count', Number(e.target.value || 0))} min={0} tooltip="Random conditioning frames drawn each step" />
+										<FormSelect fieldPath="training.h3_mask_mode" value={t.h3_mask_mode || 'off'} options={['off', 'box', 'border', 'segment']} onchange={(e) => update('h3_mask_mode', e.target.value)} tooltip="Procedural H3 inpaint, outpaint, or temporal mask" />
+										<FormToggle fieldPath="training.h3_mask_audio" checked={t.h3_mask_audio ?? false} onchange={(e) => update('h3_mask_audio', e.target.checked)} disabled={t.h3_mask_mode === 'off'} tooltip="Mask a contiguous audio span alongside the video mask" />
+										<FormField type="number" fieldPath="training.h3_mask_min_fraction" value={t.h3_mask_min_fraction ?? 0.25} oninput={(e) => update('h3_mask_min_fraction', Number(e.target.value))} min={0} max={1} step="0.05" disabled={t.h3_mask_mode === 'off'} />
+										<FormField type="number" fieldPath="training.h3_mask_max_fraction" value={t.h3_mask_max_fraction ?? 0.75} oninput={(e) => update('h3_mask_max_fraction', Number(e.target.value))} min={0} max={1} step="0.05" disabled={t.h3_mask_mode === 'off'} />
+									</div>
+								</div>
 								<div class="grid grid-cols-1 md:grid-cols-2 gap-2">
 									<FormField type="number" fieldPath="training.h3_guidance_distillation_scale" value={t.h3_guidance_distillation_scale ?? ''} oninput={(e) => update('h3_guidance_distillation_scale', e.target.value ? Number(e.target.value) : null)} min={1.01} step="0.1" placeholder="Optional" tooltip="Enable two-pass guidance-consistent training at this target scale" />
 									<FormSelect fieldPath="training.h3_guidance_loss_form" value={t.h3_guidance_loss_form || 'normalized'} options={['normalized', 'contrastive']} onchange={(e) => update('h3_guidance_loss_form', e.target.value)} tooltip="Contrastive directly supervises the extrapolated guided target; normalized has the same optimum with normalized gradients" />
@@ -584,6 +621,16 @@
 
 				<FormGroup title="LoRA">
 					<div class="space-y-2 pt-2">
+						{#if t.model_type === 'minimax_h3'}
+							<div class="grid grid-cols-2 gap-2">
+								<FormField type="number" fieldPath="training.network_dim" value={t.network_dim ?? 32} oninput={(e) => update('network_dim', e.target.value ? Number(e.target.value) : null)} min={1} tooltip="MiniMax H3 LoRA rank" />
+								<FormField type="number" fieldPath="training.network_alpha" value={t.network_alpha ?? 32} oninput={(e) => update('network_alpha', Number(e.target.value))} min={0} step="0.1" tooltip="MiniMax H3 LoRA alpha" />
+							</div>
+							{#if $advancedMode}
+								<FormField fieldPath="training.base_weights" value={t.base_weights || ''} oninput={(e) => update('base_weights', e.target.value)} placeholder="path1 path2 ..." tooltip="Optional H3 base adapters merged before training." />
+								<FormField fieldPath="training.base_weights_multiplier" value={t.base_weights_multiplier || ''} oninput={(e) => update('base_weights_multiplier', e.target.value)} placeholder="1.0 0.5 ..." tooltip="Optional multipliers paired with H3 base adapters." />
+							{/if}
+						{:else}
 						{#if $advancedMode}
 							<FormField fieldPath="training.network_module" value={t.network_module || ''} oninput={(e) => update('network_module', e.target.value || 'networks.lora_ltx2')} placeholder="networks.lora_ltx2" tooltip="LTX-2 LoRA network module. Clearing this resets it to the LTX-2 default." />
 						{/if}
@@ -703,6 +750,7 @@
 							<FormToggle fieldPath="training.save_original_lora" checked={t.save_original_lora ?? true} onchange={(e) => update('save_original_lora', e.target.checked)} tooltip="Save original LoRA format" />
 							<FormToggle fieldPath="training.train_connectors" checked={t.train_connectors ?? false} onchange={(e) => update('train_connectors', e.target.checked)} tooltip="Also apply LoRA to text connector modules. Requires caching with 'Cache Pre-Connector Features' enabled. Not compatible with LyCORIS." />
 						</div>
+						{/if}
 						{/if}
 					</div>
 				</FormGroup>
@@ -1067,7 +1115,7 @@
 				<FormGroup title="Output">
 					<div class="space-y-2 pt-2">
 						<PathInput fieldPath="training.output_dir" value={t.output_dir || ''} oninput={(e) => update('output_dir', e.target.value)} tooltip="Checkpoint save directory" invalid={fieldInvalid('training.output_dir')} error={fieldError('training.output_dir')} />
-						<FormField fieldPath="training.output_name" value={t.output_name || 'ltx2_lora'} oninput={(e) => update('output_name', e.target.value)} tooltip="Checkpoint filename" />
+						<FormField fieldPath="training.output_name" value={t.output_name || 'minimax_h3_lora'} oninput={(e) => update('output_name', e.target.value)} tooltip="Checkpoint filename" />
 						<div class="grid grid-cols-2 gap-2">
 							<FormField type="number" fieldPath="training.save_every_n_epochs" value={t.save_every_n_epochs ?? ''} oninput={(e) => update('save_every_n_epochs', e.target.value ? Number(e.target.value) : null)} placeholder="Optional" tooltip="Save every N epochs" />
 							<FormField type="number" fieldPath="training.save_every_n_steps" value={t.save_every_n_steps ?? ''} oninput={(e) => update('save_every_n_steps', e.target.value ? Number(e.target.value) : null)} placeholder="Optional" tooltip="Save every N steps" />
@@ -1168,6 +1216,17 @@
 
 				<FormGroup title="Sampling">
 					<div class="space-y-2 pt-2">
+						{#if t.model_type === 'minimax_h3'}
+							<div class="grid grid-cols-2 gap-2">
+								<FormField type="number" fieldPath="training.sample_every_n_steps" value={t.sample_every_n_steps ?? ''} oninput={(e) => update('sample_every_n_steps', e.target.value ? Number(e.target.value) : null)} placeholder="Optional" tooltip="Generate an H3 validation sample every N steps" />
+								<FormField type="number" fieldPath="training.sample_every_n_epochs" value={t.sample_every_n_epochs ?? ''} oninput={(e) => update('sample_every_n_epochs', e.target.value ? Number(e.target.value) : null)} placeholder="Optional" tooltip="Generate an H3 validation sample every N epochs" />
+							</div>
+							<PathInput fieldPath="training.sample_prompts" value={t.sample_prompts || ''} oninput={(e) => update('sample_prompts', e.target.value)} showFiles tooltip="H3 sample prompts file" invalid={fieldInvalid('training.sample_prompts')} error={fieldError('training.sample_prompts')} />
+							<div class="grid grid-cols-2 gap-x-4 gap-y-1">
+								<FormToggle fieldPath="training.sample_at_first" checked={t.sample_at_first ?? false} onchange={(e) => update('sample_at_first', e.target.checked)} tooltip="Generate an H3 sample before training" />
+								<FormToggle label="Optimizer Offload Val" fieldPath="training.offload_optimizer_during_validation" checked={t.offload_optimizer_during_validation ?? false} onchange={(e) => update('offload_optimizer_during_validation', e.target.checked)} tooltip="Move optimizer state to CPU while generating H3 validation samples" />
+							</div>
+						{:else}
 						<div class="grid grid-cols-2 gap-2">
 							<FormSelect fieldPath="training.sample_sampling_preset" value={t.sample_sampling_preset || 'defaults'} options={[
 								{ value: 'legacy', label: 'Legacy' },
@@ -1274,6 +1333,7 @@
 							<FormField type="number" fieldPath="training.height" value={t.height ?? ''} oninput={(e) => update('height', e.target.value ? Number(e.target.value) : null)} min={64} step={64} placeholder="Preset" tooltip="Sample height override" />
 							<FormField type="number" fieldPath="training.sample_num_frames" value={t.sample_num_frames ?? ''} oninput={(e) => update('sample_num_frames', e.target.value ? Number(e.target.value) : null)} min={1} placeholder="Preset" tooltip="Sample frame count override" />
 						</div>
+						{/if}
 					</div>
 				</FormGroup>
 
@@ -1350,7 +1410,7 @@
 			<FormGroup title="CLI Passthrough">
 				<div class="space-y-2 pt-2">
 					<FormField fieldPath="training.accelerate_extra_args" value={t.accelerate_extra_args || ''} oninput={(e) => update('accelerate_extra_args', e.target.value)} placeholder="--num_processes 2 --main_process_port 29501" tooltip="Extra arguments appended to `accelerate launch` before the training script path." />
-					<FormField fieldPath="training.extra_args" value={t.extra_args || ''} oninput={(e) => update('extra_args', e.target.value)} placeholder="--flag value --other_flag" tooltip="Extra arguments appended to the LTX-2 training script command. Use this for any CLI option without a dedicated dashboard control." />
+					<FormField fieldPath="training.extra_args" value={t.extra_args || ''} oninput={(e) => update('extra_args', e.target.value)} placeholder="--flag value --other_flag" tooltip="Extra arguments appended to the MiniMax H3 training command." />
 				</div>
 			</FormGroup>
 		{/if}

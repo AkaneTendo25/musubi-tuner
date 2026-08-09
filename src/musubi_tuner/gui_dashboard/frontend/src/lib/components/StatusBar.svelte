@@ -95,7 +95,7 @@ let statusLabel = $derived(active ? 'Live Status' : 'Inactive');
 		content: '';
 		position: absolute;
 		inset: 0;
-		background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.18), transparent);
+		background: rgba(255, 255, 255, 0.18);
 		animation: training-status-progress-glow 1800ms ease-in-out infinite;
 		transform: translateX(-100%);
 	}

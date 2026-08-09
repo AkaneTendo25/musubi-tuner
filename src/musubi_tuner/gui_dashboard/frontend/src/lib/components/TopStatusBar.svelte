@@ -77,7 +77,6 @@
 			['cache_latents', 'Cache latents'],
 			['cache_text', 'Cache text'],
 			['cache_dino', 'Cache DINO'],
-			['cache_preview', 'Cache preview'],
 			['inference', 'Inference'],
 			['remote_stage_launcher', 'Remote stage'],
 			['remote_stage_server', 'Remote server'],
@@ -125,7 +124,7 @@
 	function meterStyle(percent) {
 		const value = clampPercent(percent) ?? 0;
 		const color = meterColor(value);
-		return `background: conic-gradient(${color} ${value}%, var(--border) 0);`;
+		return `background: ${value > 0 ? color : 'var(--border)'};`;
 	}
 
 	function meterText(percent) {

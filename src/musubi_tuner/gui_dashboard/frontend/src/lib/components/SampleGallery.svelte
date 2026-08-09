@@ -100,7 +100,7 @@
 					{:else}
 						<img src={sample.url} alt="Step {sample.step} prompt {sample.promptIdx}" class="w-full h-full object-cover" />
 					{/if}
-					<div class="absolute bottom-0 left-0 right-0 bg-gradient-to-t from-black/80 to-transparent
+					<div class="absolute bottom-0 left-0 right-0 bg-black/80
 								p-1.5 text-[11px] text-gray-300 opacity-0 group-hover:opacity-100 transition-opacity">
 						{sample.isEpoch ? 'Epoch' : 'Step'} {sample.step} · #{String(sample.promptIdx).padStart(2, '0')}
 					</div>

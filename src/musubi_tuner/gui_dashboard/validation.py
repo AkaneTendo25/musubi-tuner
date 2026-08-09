@@ -10,12 +10,16 @@ from typing import Any
 
 from musubi_tuner.gui_dashboard.cli_defaults import get_ltx2_training_network_module_default
 from musubi_tuner.gui_dashboard.project_schema import DatasetEntry, ProjectConfig
+
 try:
     from musubi_tuner.ltx2_av_cross_grad_surgery import parse_av_cross_grad_surgery_args
 except ModuleNotFoundError:  # LTX-2 is optional on the minimax-h3 branch.
+
     def parse_av_cross_grad_surgery_args(*args, **kwargs):
         del args, kwargs
         return None
+
+
 from musubi_tuner.modules.group_lr_scheduler import parse_group_lr_scheduler_args
 from musubi_tuner.tread import default_ltx_tread_route, parse_tread_args
 
@@ -435,14 +439,26 @@ def validate_training_config(config: ProjectConfig) -> dict[str, Any]:
     warnings: list[dict[str, Any]] = []
     if t.model_type == "minimax_h3":
         if not _has_text(t.h3_model):
-            errors.append(_make_issue("error", "training.h3_model", "MiniMax H3 DiT checkpoint is required.", label="H3 Model", page="training"))
-        if t.h3_training_mode != "fl2va":
-            errors.append(_make_issue("error", "training.h3_training_mode", "This H3 backend supports fl2va training only.", label="H3 Training Mode", page="training"))
+            errors.append(
+                _make_issue(
+                    "error", "training.h3_model", "MiniMax H3 DiT checkpoint is required.", label="H3 Model", page="training"
+                )
+            )
         if t.split_attn:
-            errors.append(_make_issue("error", "training.split_attn", "MiniMax H3 training does not support split attention.", label="Split Attention", page="training"))
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.split_attn",
+                    "MiniMax H3 training does not support split attention.",
+                    label="Split Attention",
+                    page="training",
+                )
+            )
         if t.int8_convrot_base and (t.fp8_base or t.fp8_scaled):
             message = "MiniMax H3 INT8 ConvRot and FP8 base loading are mutually exclusive."
-            errors.append(_make_issue("error", "training.int8_convrot_base", message, label="Pruned INT8 ConvRot Base", page="training"))
+            errors.append(
+                _make_issue("error", "training.int8_convrot_base", message, label="Pruned INT8 ConvRot Base", page="training")
+            )
             errors.append(_make_issue("error", "training.fp8_base", message, label="FP8 Base", page="training"))
         if t.h3_guidance_distillation_scale is not None:
             scale = float(t.h3_guidance_distillation_scale)
@@ -488,6 +504,51 @@ def validate_training_config(config: ProjectConfig) -> dict[str, Any]:
                     page="training",
                 )
             )
+        for field, value, label in (
+            ("h3_frame_sigma_jitter", t.h3_frame_sigma_jitter, "H3 Frame Sigma Jitter"),
+            ("h3_caption_dropout_rate", t.h3_caption_dropout_rate, "H3 Caption Dropout"),
+        ):
+            numeric = float(value)
+            if not math.isfinite(numeric) or numeric < 0 or (field == "h3_caption_dropout_rate" and numeric > 1):
+                errors.append(
+                    _make_issue(
+                        "error",
+                        f"training.{field}",
+                        f"{label} must be finite and between 0 and {1 if field == 'h3_caption_dropout_rate' else 'infinity'}.",
+                        label=label,
+                        page="training",
+                    )
+                )
+        if t.h3_caption_dropout_rate > 0 and not config.caching.h3_cache_guidance_empty:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "caching.h3_cache_guidance_empty",
+                    "H3 caption dropout requires cached empty-text conditioning.",
+                    label="H3 Cache Guidance Empty",
+                    page="caching",
+                )
+            )
+        if t.h3_mask_mode != "off" and not 0 <= t.h3_mask_min_fraction <= t.h3_mask_max_fraction <= 1:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.h3_mask_min_fraction",
+                    "H3 mask fractions must satisfy 0 <= minimum <= maximum <= 1.",
+                    label="H3 Mask Fractions",
+                    page="training",
+                )
+            )
+        if t.h3_keyframe_anchors and t.h3_keyframe_random_count:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.h3_keyframe_random_count",
+                    "Choose explicit H3 keyframe anchors or a random count, not both.",
+                    label="H3 Keyframes",
+                    page="training",
+                )
+            )
         if t.h3_adaln_rank is not None and t.h3_adaln_rank < 1:
             errors.append(
                 _make_issue(
@@ -499,7 +560,9 @@ def validate_training_config(config: ProjectConfig) -> dict[str, Any]:
                 )
             )
         if t.h3_convrot_int8 and (t.fp8_base or t.fp8_scaled or t.int8_convrot_base):
-            message = "Online H3 ConvRot INT8 requires the BF16 checkpoint and cannot be combined with FP8 or a pruned INT8 checkpoint."
+            message = (
+                "Online H3 ConvRot INT8 requires the BF16 checkpoint and cannot be combined with FP8 or a pruned INT8 checkpoint."
+            )
             errors.append(_make_issue("error", "training.h3_convrot_int8", message, label="Online ConvRot INT8", page="training"))
         if t.h3_convrot_int8_bwd == "int8" and not t.h3_convrot_int8:
             errors.append(
@@ -2822,10 +2885,18 @@ def validate_cache_latents_config(config: ProjectConfig) -> dict[str, Any]:
     warnings: list[dict[str, Any]] = []
     if c.model_type == "minimax_h3":
         if not _has_text(c.h3_video_vae):
-            errors.append(_make_issue("error", "caching.h3_video_vae", "MiniMax H3 video VAE is required.", label="H3 Video VAE", page="caching"))
+            errors.append(
+                _make_issue(
+                    "error", "caching.h3_video_vae", "MiniMax H3 video VAE is required.", label="H3 Video VAE", page="caching"
+                )
+            )
         image_only = bool(config.dataset.datasets) and all(entry.type == "image" for entry in config.dataset.datasets)
         if not image_only and not _has_text(c.h3_audio_vae):
-            errors.append(_make_issue("error", "caching.h3_audio_vae", "MiniMax H3 audio VAE is required.", label="H3 Audio VAE", page="caching"))
+            errors.append(
+                _make_issue(
+                    "error", "caching.h3_audio_vae", "MiniMax H3 audio VAE is required.", label="H3 Audio VAE", page="caching"
+                )
+            )
         return _build_report(errors, warnings)
 
     if c.precache_sample_latents and not _has_any_sample_prompts(config):
@@ -2865,9 +2936,25 @@ def validate_cache_text_config(config: ProjectConfig) -> dict[str, Any]:
     warnings: list[dict[str, Any]] = []
     if c.model_type == "minimax_h3":
         if not _has_text(c.h3_text_encoder):
-            errors.append(_make_issue("error", "caching.h3_text_encoder", "MiniMax H3 text encoder is required.", label="H3 Text Encoder", page="caching"))
+            errors.append(
+                _make_issue(
+                    "error",
+                    "caching.h3_text_encoder",
+                    "MiniMax H3 text encoder is required.",
+                    label="H3 Text Encoder",
+                    page="caching",
+                )
+            )
         if not _has_text(c.h3_tokenizer):
-            errors.append(_make_issue("error", "caching.h3_tokenizer", "MiniMax H3 tokenizer directory is required.", label="H3 Tokenizer", page="caching"))
+            errors.append(
+                _make_issue(
+                    "error",
+                    "caching.h3_tokenizer",
+                    "MiniMax H3 tokenizer directory is required.",
+                    label="H3 Tokenizer",
+                    page="caching",
+                )
+            )
         if c.h3_text_encoder_dtype != "bfloat16":
             errors.append(
                 _make_issue(
@@ -3041,12 +3128,75 @@ def validate_inference_config(config: ProjectConfig) -> dict[str, Any]:
     warnings: list[dict[str, Any]] = []
     if i.model_type == "minimax_h3":
         if not _has_text(i.h3_model):
-            errors.append(_make_issue("error", "inference.h3_model", "MiniMax H3 model checkpoint is required.", label="H3 Model", page="inference"))
+            errors.append(
+                _make_issue(
+                    "error", "inference.h3_model", "MiniMax H3 model checkpoint is required.", label="H3 Model", page="inference"
+                )
+            )
         if not _has_text(i.prompt):
-            errors.append(_make_issue("error", "inference.prompt", "Prompt is required for MiniMax H3 inference.", label="Prompt", page="inference"))
+            errors.append(
+                _make_issue(
+                    "error", "inference.prompt", "Prompt is required for MiniMax H3 inference.", label="Prompt", page="inference"
+                )
+            )
+        for field, fallback, label in (
+            ("h3_text_encoder", config.caching.h3_text_encoder, "H3 Text Encoder"),
+            ("h3_tokenizer", config.caching.h3_tokenizer, "H3 Tokenizer"),
+            ("h3_video_vae", config.caching.h3_video_vae, "H3 Video VAE"),
+            ("h3_audio_vae", config.caching.h3_audio_vae, "H3 Audio VAE"),
+        ):
+            if not _has_text(getattr(i, field)) and not _has_text(fallback):
+                errors.append(_make_issue("error", f"inference.{field}", f"{label} is required.", label=label, page="inference"))
         if not 5 <= i.h3_duration <= 15:
-            errors.append(_make_issue("error", "inference.h3_duration", "MiniMax H3 duration must be between 5 and 15 seconds.", label="Duration", page="inference"))
-        warnings.append(_make_issue("warning", "inference.model_type", "The imported MiniMax H3 branch does not provide a native generation backend yet.", label="Model", page="inference"))
+            errors.append(
+                _make_issue(
+                    "error",
+                    "inference.h3_duration",
+                    "MiniMax H3 duration must be between 5 and 15 seconds.",
+                    label="Duration",
+                    page="inference",
+                )
+            )
+        if (i.width is None) != (i.height is None):
+            errors.append(
+                _make_issue(
+                    "error",
+                    "inference.width",
+                    "H3 explicit canvas requires both width and height.",
+                    label="H3 Canvas",
+                    page="inference",
+                )
+            )
+        if i.fp8_base and i.h3_int8_convrot_base:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "inference.h3_int8_convrot_base",
+                    "Choose scaled FP8 or pruned INT8 ConvRot, not both.",
+                    label="H3 Quantized Base",
+                    page="inference",
+                )
+            )
+        if not 0 <= i.h3_blocks_to_swap <= 50:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "inference.h3_blocks_to_swap",
+                    "H3 inference block swap count must be between 0 and 50.",
+                    label="H3 Blocks To Swap",
+                    page="inference",
+                )
+            )
+        if i.h3_block_swap_ring_size < 1:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "inference.h3_block_swap_ring_size",
+                    "H3 block-swap ring size must be at least 1.",
+                    label="H3 Block Swap Ring Size",
+                    page="inference",
+                )
+            )
         return _build_report(errors, warnings)
     effective_gemma_safetensors = _effective_gemma_safetensors(i.gemma_safetensors, config.default_gemma_safetensors, i.gemma_root)
 

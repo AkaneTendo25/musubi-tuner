@@ -408,12 +408,13 @@ def fp8_linear_forward_patch(self: nn.Linear, x, use_scaled_mm=False, max_value=
         original_shape = x.shape
         x = x.reshape(-1, x.shape[-1]).to(target_dtype)
 
-        weight = self.weight.t()
-        scale_weight = self.scale_weight.to(torch.float32)
+        weight = self.weight.to(x.device).t()
+        scale_weight = self.scale_weight.to(device=x.device, dtype=torch.float32)
+        bias = self.bias.to(x.device) if self.bias is not None else None
 
-        if self.bias is not None:
+        if bias is not None:
             # float32 is not supported with bias in scaled_mm
-            o = torch._scaled_mm(x, weight, out_dtype=original_weight_dtype, bias=self.bias, scale_a=scale_x, scale_b=scale_weight)
+            o = torch._scaled_mm(x, weight, out_dtype=original_weight_dtype, bias=bias, scale_a=scale_x, scale_b=scale_weight)
         else:
             o = torch._scaled_mm(x, weight, out_dtype=input_dtype, scale_a=scale_x, scale_b=scale_weight)
 
@@ -423,19 +424,22 @@ def fp8_linear_forward_patch(self: nn.Linear, x, use_scaled_mm=False, max_value=
     else:
         # Dequantize the weight
         original_dtype = self.scale_weight.dtype
+        scale_weight = self.scale_weight.to(device=x.device, dtype=original_dtype)
         if self.scale_weight.ndim < 3:
             # per-tensor or per-channel quantization, we can broadcast
-            dequantized_weight = self.weight.to(original_dtype) * self.scale_weight
+            dequantized_weight = self.weight.to(device=x.device, dtype=original_dtype) * scale_weight
         else:
             # block-wise quantization, need to reshape weight to match scale shape for broadcasting
             out_features, num_blocks, _ = self.scale_weight.shape
-            dequantized_weight = self.weight.to(original_dtype).contiguous().view(out_features, num_blocks, -1)
-            dequantized_weight = dequantized_weight * self.scale_weight
+            dequantized_weight = (
+                self.weight.to(device=x.device, dtype=original_dtype).contiguous().view(out_features, num_blocks, -1)
+            )
+            dequantized_weight = dequantized_weight * scale_weight
             dequantized_weight = dequantized_weight.view(self.weight.shape)
 
         # Perform linear transformation
         if self.bias is not None:
-            output = F.linear(x, dequantized_weight, self.bias)
+            output = F.linear(x, dequantized_weight, self.bias.to(x.device))
         else:
             output = F.linear(x, dequantized_weight)
 

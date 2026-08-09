@@ -12,6 +12,29 @@ Two released transformers, with different conditioning contracts:
 | **FL2VA** | text-to-video, first-frame I2V, first+last keyframes, video-only, audio-only, still images |
 | **Ref2VA** | arbitrary image, video, and audio references |
 
+## Contents
+
+- [Quick start](#quick-start)
+- [Task contracts](#task-contracts)
+- [Model download](#model-download)
+- [Dataset](#dataset)
+- [Pre-caching](#pre-caching)
+- [Training](#training)
+- [Inference](#inference)
+- [Training dashboard](#training-dashboard)
+
+## Quick start
+
+> [!TIP]
+> Upstream [Musubi Tuner](https://github.com/kohya-ss/musubi-tuner) also supports MiniMax H3. Try the upstream implementation first unless you specifically need this fork's H3 extensions or dashboard.
+
+1. Follow the upstream Musubi Tuner [installation instructions](https://github.com/kohya-ss/musubi-tuner#installation), including its Python and PyTorch requirements.
+2. Prepare a TOML dataset using the shared upstream [dataset configuration guide](https://github.com/kohya-ss/musubi-tuner/blob/main/docs/dataset_config.md). The H3-specific task and media requirements are listed in [Task contracts](#task-contracts) and [Dataset](#dataset) below.
+3. Configure Accelerate as described in the upstream [usage guide](https://github.com/kohya-ss/musubi-tuner#configuration-of-accelerate).
+4. Download the H3 checkpoints, run [Pre-caching](#pre-caching), and then start [Training](#training). The [training dashboard](#training-dashboard) is an optional proof-of-concept interface for the same commands.
+
+Common installation, dataset, Accelerate, and environment setup is intentionally not duplicated here. This page documents only the MiniMax H3 files, contracts, and commands that differ from upstream Musubi Tuner.
+
 ## Task contracts
 
 Each training objective has a fixed dataset, conditioning-cache, and transformer contract. `--task` is passed to
@@ -487,3 +510,29 @@ python minimax_h3_generate_video.py \
 with a JSON sidecar recording prompt, geometry, schedule, LoRA names, timings, and memory peaks.
 
 The released weights are CFG-distilled: inference runs one evaluation per step with no negative-prompt branch.
+
+## Training dashboard
+
+> [!WARNING]
+> The dashboard is a proof of concept and is not guaranteed to be maintained. Review every generated command before starting a long or expensive job. The original dashboard was created by [@Ada123-a](https://github.com/Ada123-a) in [PR #112](https://github.com/AkaneTendo25/musubi-tuner/pull/112).
+
+The H3 web dashboard creates project configurations, runs H3 caching, training, and inference commands, shows live process output and training metrics, previews samples, and stops training gracefully.
+
+Install the dashboard Python dependencies. Release checkouts include the prebuilt frontend, so users do not need Node.js or npm:
+
+```bash
+pip install -e ".[dashboard]"
+```
+
+Start it from the repository root and open <http://127.0.0.1:7860>:
+
+```bash
+python -m musubi_tuner.gui_dashboard --host 127.0.0.1 --port 7860
+```
+
+On Windows, run `launch_musubi_dashboard.bat`. Create or load an H3 project, fill in the DiT, video/audio VAE, Qwen3-VL encoder, tokenizer, and dataset paths, review the generated commands, then cache and train. **Stop** requests a graceful shutdown so a state checkpoint can be written; keep `--save_state --autoresume` enabled to resume from the latest complete matching state.
+
+> [!WARNING]
+> The dashboard can launch arbitrary training processes with the permissions of its user. Do not bind it to a public interface unless access is protected. For remote use, keep `--host 127.0.0.1` and use an SSH tunnel.
+
+Frontend developers can rebuild the bundled assets with `npm ci && npm run build` in `src/musubi_tuner/gui_dashboard/frontend`. Node.js is only a development dependency.

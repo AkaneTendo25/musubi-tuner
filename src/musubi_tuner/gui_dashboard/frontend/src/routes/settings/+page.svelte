@@ -178,7 +178,7 @@
 	{:else if management}
 		<div class="grid grid-cols-1 xl:grid-cols-2 gap-4">
 			<div class="p-5 space-y-4" style="background: var(--bg-surface); border: 1px solid var(--border-subtle); border-radius: var(--radius-md); position: relative; overflow: hidden;">
-				<div style="position: absolute; top: 0; left: 0; right: 0; height: 2px; background: linear-gradient(90deg, transparent, var(--accent), transparent); opacity: 0.45;"></div>
+				<div style="position: absolute; top: 0; left: 0; right: 0; height: 2px; background: var(--accent); opacity: 0.45;"></div>
 				<div class="text-[11px] font-semibold uppercase tracking-wider" style="color: var(--text-muted); font-family: var(--font-label);">Repository</div>
 				<div class="space-y-2">
 					<div class="px-3 py-2 text-[12px]" style="color: {accentTone(repoTone(management.repo))}; background: {accentBg(repoTone(management.repo))}; border-radius: var(--radius-sm);">
@@ -226,7 +226,7 @@
 			</div>
 
 			<div class="p-5 space-y-4" style="background: var(--bg-surface); border: 1px solid var(--border-subtle); border-radius: var(--radius-md); position: relative; overflow: hidden;">
-				<div style="position: absolute; top: 0; left: 0; right: 0; height: 2px; background: linear-gradient(90deg, transparent, var(--accent), transparent); opacity: 0.45;"></div>
+				<div style="position: absolute; top: 0; left: 0; right: 0; height: 2px; background: var(--accent); opacity: 0.45;"></div>
 				<div class="text-[11px] font-semibold uppercase tracking-wider" style="color: var(--text-muted); font-family: var(--font-label);">Install Health</div>
 				<div class="grid grid-cols-2 gap-3 text-[12px]">
 					<div>

@@ -104,7 +104,7 @@
 	--toggle-radius: 10px;
 	--toggle-knob-radius: 50%;
 	--toggle-knob-shadow: 0 1px 4px rgba(0,0,0,.3);
-	--logo-bg: linear-gradient(135deg, #64ffb4, #7c8aff);
+	--logo-bg: #64ffb4;
 	--logo-shadow: 0 0 24px rgba(100,255,180,.15);
 	--logo-radius: 10px;
 	--logo-clip: none;
@@ -263,7 +263,7 @@
 	--toggle-radius: 11px;
 	--toggle-knob-radius: 50%;
 	--toggle-knob-shadow: 0 2px 6px rgba(0,0,0,.3);
-	--logo-bg: linear-gradient(135deg, #ffb088, #e08080);
+	--logo-bg: #ffb088;
 	--logo-shadow: 0 4px 16px rgba(255,176,136,.2);
 	--logo-radius: 12px;
 	--logo-clip: none;
@@ -317,7 +317,7 @@
 	--toggle-radius: 8px;
 	--toggle-knob-radius: 50%;
 	--toggle-knob-shadow: 0 1px 4px rgba(0,0,0,.4);
-	--logo-bg: linear-gradient(135deg, #ff2dca, #00f0ff);
+	--logo-bg: #ff2dca;
 	--logo-shadow: 0 0 24px rgba(255,45,202,.25);
 	--logo-radius: 8px;
 	--logo-clip: none;
@@ -370,7 +370,7 @@
 	--toggle-radius: 10px;
 	--toggle-knob-radius: 50%;
 	--toggle-knob-shadow: 0 1px 3px rgba(180,80,110,.15);
-	--logo-bg: linear-gradient(135deg, #ffb0c4, #d4546e);
+	--logo-bg: #ffb0c4;
 	--logo-shadow: 0 4px 14px rgba(212,84,110,.18);
 	--logo-radius: 10px;
 	--logo-clip: none;
@@ -423,7 +423,7 @@
 	--toggle-radius: 10px;
 	--toggle-knob-radius: 50%;
 	--toggle-knob-shadow: 0 1px 4px rgba(0,0,0,.4);
-	--logo-bg: linear-gradient(135deg, #00d4d4, #80a8e0);
+	--logo-bg: #00d4d4;
 	--logo-shadow: 0 0 22px rgba(0,212,212,.22);
 	--logo-radius: 10px;
 	--logo-clip: none;
@@ -647,14 +647,53 @@ input:focus, select:focus, textarea:focus {
 }
 
 .app-field-error {
-	margin-top: 0.35rem;
-	padding: 0.25rem 0.45rem;
-	background: color-mix(in srgb, var(--danger-muted) 28%, transparent);
-	border-left: 2px solid var(--danger);
+	position: relative;
+	margin-top: 0.4rem;
+	padding: 0.38rem 0.55rem 0.38rem 0.7rem;
+	max-width: 100%;
+	overflow-wrap: anywhere;
+	background: color-mix(in srgb, var(--danger-muted) 52%, var(--bg-elevated));
+	border: 1px solid color-mix(in srgb, var(--danger) 42%, var(--border));
+	border-left-width: 3px;
 	border-radius: var(--radius-sm);
-	color: color-mix(in srgb, var(--danger) 72%, var(--text-secondary));
+	color: color-mix(in srgb, var(--danger) 82%, var(--text-primary));
 	font-size: 11px;
-	line-height: 1.3;
+	line-height: 1.4;
+	box-shadow: inset 0 1px 0 color-mix(in srgb, var(--danger) 10%, transparent);
+}
+
+.h3-control-cluster {
+	padding: 0.7rem;
+	border: 1px solid color-mix(in srgb, var(--accent) 22%, var(--border-subtle));
+	border-radius: var(--radius-md);
+	background: color-mix(in srgb, var(--accent-muted) 32%, var(--bg-elevated));
+}
+
+.h3-control-cluster-title {
+	margin-bottom: 0.55rem;
+	color: color-mix(in srgb, var(--accent) 78%, var(--text-primary));
+	font-family: var(--font-label);
+	font-size: 10px;
+	font-weight: 700;
+	letter-spacing: 0.12em;
+	text-transform: uppercase;
+}
+
+.h3-sidebar {
+	position: relative;
+	background: var(--bg-surface) !important;
+}
+
+.h3-sidebar::before {
+	position: absolute;
+	top: 0;
+	right: -1px;
+	bottom: 0;
+	width: 2px;
+	background: var(--accent);
+	content: '';
+	opacity: 0.45;
+	pointer-events: none;
 }
 
 .app-status-badge {

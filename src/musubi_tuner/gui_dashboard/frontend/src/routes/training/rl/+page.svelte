@@ -73,7 +73,7 @@
 
 		<!-- Phase A: rollout caching -->
 		<div style="background: var(--bg-surface); border: 1px solid var(--border-subtle); border-radius: var(--radius-md); position: relative; overflow: hidden;">
-			<div style="position: absolute; top: 0; left: 0; right: 0; height: 2px; background: linear-gradient(90deg, transparent, var(--accent), var(--secondary, var(--accent)), transparent); opacity: 0.5;"></div>
+			<div style="position: absolute; top: 0; left: 0; right: 0; height: 2px; background: var(--accent); opacity: 0.5;"></div>
 
 			<div class="p-5 pb-0">
 				<div class="flex items-center gap-3 mb-2">
@@ -136,7 +136,7 @@
 
 		<!-- Phase B: training -->
 		<div style="background: var(--bg-surface); border: 1px solid var(--border-subtle); border-radius: var(--radius-md); position: relative; overflow: hidden;">
-			<div style="position: absolute; top: 0; left: 0; right: 0; height: 2px; background: linear-gradient(90deg, transparent, var(--accent), var(--secondary, var(--accent)), transparent); opacity: 0.5;"></div>
+			<div style="position: absolute; top: 0; left: 0; right: 0; height: 2px; background: var(--accent); opacity: 0.5;"></div>
 
 			<div class="p-5 pb-0">
 				<div class="flex items-center gap-3 mb-2">

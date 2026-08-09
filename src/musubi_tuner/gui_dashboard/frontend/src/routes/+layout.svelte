@@ -12,6 +12,23 @@
 	let { children } = $props();
 	let tooltipState = $state({ visible: false, text: '', left: 0, top: 0, placement: 'top' });
 	let tooltipTarget = null;
+	let tooltipStateRevision = 0;
+	const h3BlockedRoutes = new Set([
+		'/samples',
+		'/settings',
+		'/tools',
+		'/training/conditioning',
+		'/training/full-finetune',
+		'/training/rl',
+		'/training/techniques'
+	]);
+
+	function commitTooltipState(nextState) {
+		const revision = ++tooltipStateRevision;
+		queueMicrotask(() => {
+			if (revision === tooltipStateRevision) tooltipState = nextState;
+		});
+	}
 
 	function updateTooltipPosition() {
 		if (typeof window === 'undefined') return;
@@ -29,18 +46,18 @@
 			window.innerWidth - margin - estimatedWidth / 2
 		);
 		const above = rect.top > 56;
-		tooltipState = {
+		commitTooltipState({
 			visible: true,
 			text,
 			left,
 			top: above ? rect.top - 8 : rect.bottom + 8,
 			placement: above ? 'top' : 'bottom'
-		};
+		});
 	}
 
 	function hideTooltip() {
 		tooltipTarget = null;
-		tooltipState = { visible: false, text: '', left: 0, top: 0, placement: 'top' };
+		commitTooltipState({ visible: false, text: '', left: 0, top: 0, placement: 'top' });
 	}
 
 	function handleTooltipOver(event) {
@@ -71,6 +88,10 @@
 		startMetricsPolling();
 		await loadProjectDefaults();
 		await loadProject();
+		if (h3BlockedRoutes.has(window.location.pathname)) {
+			window.location.replace('/');
+			return;
+		}
 		connectProcessSSE();
 		connectProcessValidationAutoRefresh();
 	});

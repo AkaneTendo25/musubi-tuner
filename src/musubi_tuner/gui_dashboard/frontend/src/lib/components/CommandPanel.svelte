@@ -164,8 +164,8 @@
 </script>
 
 <div style="background: var(--bg-surface); border: 1px solid var(--border-subtle); border-radius: var(--radius-md); box-shadow: var(--shadow-sm); position: relative; overflow: hidden;">
-	<!-- Accent gradient line -->
-	<div style="position: absolute; top: 0; left: 0; right: 0; height: 1px; background: linear-gradient(90deg, transparent, var(--accent), var(--secondary, var(--accent)), transparent); opacity: 0.4;"></div>
+	<!-- Accent line -->
+	<div style="position: absolute; top: 0; left: 0; right: 0; height: 1px; background: var(--accent); opacity: 0.4;"></div>
 
 	<div class="px-3 py-2 flex items-center justify-between" style="border-bottom: 1px solid var(--border-subtle);">
 		<span class="text-[10px] font-semibold uppercase tracking-wider" style="color: var(--text-muted); font-family: var(--font-label);">Command</span>

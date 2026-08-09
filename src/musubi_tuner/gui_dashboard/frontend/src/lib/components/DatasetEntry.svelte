@@ -65,7 +65,7 @@
 	);
 </script>
 
-<div class="overflow-hidden" style="background: var(--bg-surface); border: 1px solid var(--border-subtle); border-radius: var(--radius-md); box-shadow: var(--shadow-sm);">
+<div class="overflow-visible" style="background: var(--bg-surface); border: 1px solid var(--border-subtle); border-radius: var(--radius-md); box-shadow: var(--shadow-sm);">
 	<div class="flex items-center justify-between px-4 py-2.5" style="border-bottom: 1px solid var(--border-subtle);">
 		<span class="text-[13px] font-semibold" style="color: var(--text-primary);">{title || `Dataset #${index + 1}`}</span>
 		<button
@@ -414,7 +414,7 @@
 						type="number"
 						value={entry.keyframe_guide_frame_idx ?? -1}
 						oninput={(e) => updateNumberField('keyframe_guide_frame_idx', e.target.value)}
-						tooltip="Pixel-frame index (NOT latent-frame). -1 = global reference. For non-negative values multiply the latent-frame by VIDEO_SCALE_FACTORS.time first (×8 for LTX-2): e.g. last latent frame of a 9-frame video → 64."
+						tooltip="Pixel-frame index (NOT latent-frame). -1 = global reference. For non-negative values multiply the latent-frame by the H3 video VAE temporal scale (×4): e.g. latent frame 8 → pixel frame 32."
 					/>
 					<FormField
 						label="Strength (keyframe)"
@@ -451,7 +451,7 @@
 						value={entry.keyframe_guide_extra_frame_idxs || ''}
 						oninput={(e) => updateField('keyframe_guide_extra_frame_idxs', e.target.value)}
 						placeholder="-1;5"
-						tooltip="Semicolon-separated frame_idx values (PIXEL-frame units, not latent-frame). -1 = global reference. Multiply latent-frame by VIDEO_SCALE_FACTORS.time (×8 for LTX-2) for non-negative anchors."
+						tooltip="Semicolon-separated frame_idx values (PIXEL-frame units, not latent-frame). -1 = global reference. Multiply latent-frame by the H3 video VAE temporal scale (×4) for non-negative anchors."
 					/>
 					<FormField
 						label="Extra Strengths"

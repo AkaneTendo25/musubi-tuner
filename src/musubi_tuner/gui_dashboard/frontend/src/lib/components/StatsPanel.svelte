@@ -2,6 +2,8 @@
 	import { onMount } from 'svelte';
 	import { projectConfig } from '$lib/stores/project.js';
 
+	let { trainingVram = null } = $props();
+
 	let stats = $state(null);
 	let loading = $state(true);
 	let error = $state(null);
@@ -65,8 +67,8 @@
 </script>
 
 <div style="background: var(--bg-surface); border: 1px solid var(--border-subtle); border-radius: var(--radius-md); box-shadow: var(--shadow-sm); position: relative; overflow: hidden;">
-	<!-- Accent gradient -->
-	<div style="position: absolute; top: 0; left: 0; right: 0; height: 2px; background: linear-gradient(90deg, transparent, var(--accent), var(--secondary, var(--accent)), transparent); opacity: 0.4;"></div>
+	<!-- Accent line -->
+	<div style="position: absolute; top: 0; left: 0; right: 0; height: 2px; background: var(--accent); opacity: 0.4;"></div>
 
 	<div class="px-3 py-2 flex items-center justify-between" style="border-bottom: 1px solid var(--border-subtle);">
 		<span class="text-[10px] font-semibold uppercase tracking-wider" style="color: var(--text-muted); font-family: var(--font-label);">Project Statistics</span>
@@ -93,12 +95,14 @@
 					<div class="space-y-2">
 						<div class={statRowClass}>
 							<span class="text-[12px]" style="color: var(--text-muted);">Peak Training</span>
-							<span class="text-[16px] font-bold tabular-nums" style="color: var(--success);">{formatNumber(stats.vram.peak_training_gb)} GB</span>
+							<span class="text-[16px] font-bold tabular-nums" style="color: var(--success);">{formatNumber(trainingVram?.total ?? stats.vram.peak_training_gb)} GB</span>
 						</div>
+						{#if !trainingVram}
 						<div class={statRowClass}>
 							<span class="text-[12px]" style="color: var(--text-muted);">Peak Sampling</span>
 							<span class="text-[13px] font-semibold tabular-nums" style="color: var(--text-primary);">{formatNumber(stats.vram.peak_sampling_gb)} GB</span>
 						</div>
+						{/if}
 					</div>
 				</div>
 				<div class="mt-2 text-center text-[10px]" style="color: var(--text-muted);">
@@ -213,8 +217,9 @@
 					<div class="space-y-2 flex-1">
 						<div class={statRowClass}>
 							<span class="text-[12px]" style="color: var(--text-muted);">Peak Training</span>
-							<span class="text-[16px] font-bold tabular-nums" style="color: var(--success);">{formatNumber(stats.vram.peak_training_gb)} GB</span>
+							<span class="text-[16px] font-bold tabular-nums" style="color: var(--success);">{formatNumber(trainingVram?.total ?? stats.vram.peak_training_gb)} GB</span>
 						</div>
+						{#if !trainingVram}
 						<div class={statRowClass}>
 							<span class="text-[12px]" style="color: var(--text-muted);">Peak Sampling</span>
 							<span class="text-[13px] font-semibold tabular-nums" style="color: var(--text-primary);">{formatNumber(stats.vram.peak_sampling_gb)} GB</span>
@@ -241,6 +246,7 @@
 								</div>
 							</div>
 						</details>
+						{/if}
 					</div>
 				</div>
 			{/if}

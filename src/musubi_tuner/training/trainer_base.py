@@ -2056,6 +2056,21 @@ class NetworkTrainer:
                 pass
 
         global_step = initial_global_step
+        dashboard_metrics = None
+        if accelerator.is_main_process and os.environ.get("MUSUBI_DASHBOARD_METRICS") == "1":
+            try:
+                from musubi_tuner.gui_dashboard import create_metrics_writer
+
+                dashboard_metrics = create_metrics_writer(args.output_dir, flush_every=2)
+                dashboard_metrics.update_status(
+                    status="running",
+                    step=global_step,
+                    max_steps=args.max_train_steps,
+                    epoch=epoch_to_start,
+                    max_epochs=num_train_epochs,
+                )
+            except Exception as exc:
+                logger.warning("Could not initialize dashboard metrics: %s", exc)
         progress_bar = tqdm(
             total=args.max_train_steps,
             initial=initial_global_step,
@@ -2234,6 +2249,8 @@ class NetworkTrainer:
                     dashboard_stop_requested = True
                     break
 
+                dashboard_step_started_at = time.perf_counter()
+
                 # torch.compiler.cudagraph_mark_step_begin() # for cudagraphs
 
                 latents = self.get_primary_latents(batch)
@@ -2344,6 +2361,30 @@ class NetworkTrainer:
                 logs = {"avr_loss": avr_loss}  # , "lr": lr_scheduler.get_last_lr()[0]}
                 progress_bar.set_postfix(**logs)
 
+                if dashboard_metrics is not None and accelerator.sync_gradients:
+                    step_time = time.perf_counter() - dashboard_step_started_at
+                    current_lr = lr_scheduler.get_last_lr()[0]
+                    dashboard_metrics.log(
+                        step=global_step,
+                        epoch=epoch + 1,
+                        loss=current_loss,
+                        avr_loss=avr_loss,
+                        loss_v=loss_metrics.get("loss/video"),
+                        loss_a=loss_metrics.get("loss/audio"),
+                        grad_norm=grad_metrics.get("grad_norm"),
+                        grad_norm_v=grad_metrics.get("grad_norm/video"),
+                        grad_norm_a=grad_metrics.get("grad_norm/audio"),
+                        lr=current_lr,
+                        step_time=step_time,
+                    )
+                    dashboard_metrics.update_status(
+                        status="training",
+                        step=global_step,
+                        max_steps=args.max_train_steps,
+                        epoch=epoch + 1,
+                        max_epochs=num_train_epochs,
+                    )
+
                 if args.scale_weight_norms:
                     progress_bar.set_postfix(**{**max_mean_logs, **logs})
 
@@ -2430,3 +2471,13 @@ class NetworkTrainer:
             save_model(ckpt_name, network, global_step, final_epoch, force_sync_upload=True)
 
             logger.info("model saved.")
+
+        if dashboard_metrics is not None:
+            dashboard_metrics.update_status(
+                status="finished",
+                step=global_step,
+                max_steps=args.max_train_steps,
+                epoch=last_epoch,
+                max_epochs=num_train_epochs,
+            )
+            dashboard_metrics.close()

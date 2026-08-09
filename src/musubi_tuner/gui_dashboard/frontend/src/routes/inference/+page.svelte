@@ -262,12 +262,25 @@
 			<div class="space-y-3">
 				<FormGroup title="Model">
 					<div class="space-y-2 pt-2">
-						<FormSelect fieldPath="inference.model_type" value={s.model_type || 'ltx2'} options={[{ value: 'ltx2', label: 'LTX-2' }, { value: 'minimax_h3', label: 'MiniMax H3' }]} onchange={(e) => update('model_type', e.target.value)} tooltip="Model backend used for inference" />
+						<div class="text-[12px] font-semibold" style="color: var(--text-primary);">MiniMax H3</div>
 						{#if s.model_type === 'minimax_h3'}
 							<PathInput fieldPath="inference.h3_model" value={s.h3_model || ''} oninput={(e) => update('h3_model', e.target.value)} showFiles tooltip="MiniMax H3 model checkpoint" />
+							<PathInput fieldPath="inference.h3_text_encoder" value={s.h3_text_encoder || ''} oninput={(e) => update('h3_text_encoder', e.target.value)} showFiles placeholder="Uses Caching value when blank" tooltip="H3 Qwen3-VL text encoder; blank reuses the Caching page value" />
+							<PathInput fieldPath="inference.h3_tokenizer" value={s.h3_tokenizer || ''} oninput={(e) => update('h3_tokenizer', e.target.value)} showFiles placeholder="Uses Caching value when blank" tooltip="H3 tokenizer/processor directory; blank reuses the Caching page value" />
+							<div class="grid grid-cols-2 gap-2">
+								<PathInput fieldPath="inference.h3_video_vae" value={s.h3_video_vae || ''} oninput={(e) => update('h3_video_vae', e.target.value)} showFiles placeholder="Uses Caching value when blank" tooltip="H3 video VAE; blank reuses the Caching page value" />
+								<PathInput fieldPath="inference.h3_audio_vae" value={s.h3_audio_vae || ''} oninput={(e) => update('h3_audio_vae', e.target.value)} showFiles placeholder="Uses Caching value when blank" tooltip="H3 audio VAE; blank reuses the Caching page value" />
+							</div>
+							<FormSelect fieldPath="inference.h3_text_encoder_quantization" value={s.h3_text_encoder_quantization || 'none'} options={[{ value: 'none', label: 'Qwen3-VL BF16' }, { value: 'int8', label: 'Qwen3-VL INT8' }, { value: 'nf4', label: 'Qwen3-VL NF4' }, { value: 'nvfp4_awq', label: 'Qwen3-VL NVFP4/AWQ' }]} onchange={(e) => update('h3_text_encoder_quantization', e.target.value)} tooltip="H3 text encoder quantization" />
 							<div class="grid grid-cols-2 gap-2">
 								<FormField type="number" fieldPath="inference.h3_duration" value={s.h3_duration ?? 5} oninput={(e) => update('h3_duration', Number(e.target.value || 5))} min={5} max={15} tooltip="Video duration in seconds (5-15)" />
 								<FormSelect fieldPath="inference.h3_ratio" value={s.h3_ratio || '16:9'} options={['adaptive', '21:9', '16:9', '4:3', '1:1', '3:4', '9:16']} onchange={(e) => update('h3_ratio', e.target.value)} tooltip="Output aspect ratio" />
+								<FormField label="Steps" type="number" fieldPath="inference.sample_steps" value={s.sample_steps ?? 20} oninput={(e) => update('sample_steps', Number(e.target.value || 20))} min={2} tooltip="Sigma grid points including terminal zero" />
+								<FormSelect label="DiT dtype" fieldPath="inference.h3_dtype" value={s.h3_dtype || 'bfloat16'} options={['bfloat16', 'float16', 'float32']} onchange={(e) => update('h3_dtype', e.target.value)} />
+							</div>
+							<div class="grid grid-cols-2 gap-2">
+								<FormField type="number" fieldPath="inference.width" value={s.width ?? ''} oninput={(e) => update('width', e.target.value ? Number(e.target.value) : null)} min={64} step={32} placeholder="Native ratio" tooltip="Explicit width; set height too" />
+								<FormField type="number" fieldPath="inference.height" value={s.height ?? ''} oninput={(e) => update('height', e.target.value ? Number(e.target.value) : null)} min={64} step={32} placeholder="Native ratio" tooltip="Explicit height; set width too" />
 							</div>
 							<div class="grid grid-cols-2 gap-2">
 								<PathInput fieldPath="inference.h3_first_frame" value={s.h3_first_frame || ''} oninput={(e) => update('h3_first_frame', e.target.value)} showFiles tooltip="Optional first-frame image" />
@@ -278,6 +291,34 @@
 								<PathInput fieldPath="inference.h3_reference_video" value={s.h3_reference_video || ''} oninput={(e) => update('h3_reference_video', e.target.value)} showFiles tooltip="Optional reference video" />
 								<PathInput fieldPath="inference.h3_reference_audio" value={s.h3_reference_audio || ''} oninput={(e) => update('h3_reference_audio', e.target.value)} showFiles tooltip="Optional reference audio" />
 							</div>
+							<FormField label="Interior keyframes" fieldPath="inference.h3_keyframes" value={s.h3_keyframes || ''} oninput={(e) => update('h3_keyframes', e.target.value)} placeholder="4:/path/a.png 8:/path/b.png" tooltip="Repeatable INDEX:PATH entries; quote paths containing spaces" />
+							<FormField type="number" fieldPath="inference.h3_reference_image_short_edge" value={s.h3_reference_image_short_edge ?? 384} oninput={(e) => update('h3_reference_image_short_edge', Number(e.target.value || 384))} min={64} step={8} tooltip="Must match the reference size used to train the LoRA" />
+							<div class="grid grid-cols-2 gap-x-4 gap-y-1">
+								<FormToggle label="Scaled FP8 base" fieldPath="inference.fp8_base" checked={s.fp8_base ?? false} onchange={(e) => { update('fp8_base', e.target.checked); if (e.target.checked) update('h3_int8_convrot_base', false); }} tooltip="Quantize H3 transformer blocks to scaled FP8" />
+								<FormToggle label="Pruned INT8 ConvRot" fieldPath="inference.h3_int8_convrot_base" checked={s.h3_int8_convrot_base ?? false} onchange={(e) => { update('h3_int8_convrot_base', e.target.checked); if (e.target.checked) update('fp8_base', false); }} tooltip="Load the pruned H3 ConvRot checkpoint" />
+							</div>
+							{#if $advancedMode}
+								<div class="h3-control-cluster">
+									<div class="h3-control-cluster-title">H3 memory and compile</div>
+									<div class="grid grid-cols-1 md:grid-cols-2 gap-2">
+										<FormField type="number" fieldPath="inference.h3_blocks_to_swap" value={s.h3_blocks_to_swap ?? 0} oninput={(e) => update('h3_blocks_to_swap', Number(e.target.value || 0))} min={0} max={50} />
+										<FormField type="number" fieldPath="inference.h3_block_swap_ring_size" value={s.h3_block_swap_ring_size ?? 2} oninput={(e) => update('h3_block_swap_ring_size', Number(e.target.value || 2))} min={1} disabled={!s.h3_blocks_to_swap} />
+										<FormSelect fieldPath="inference.h3_block_swap_granularity" value={s.h3_block_swap_granularity || 'block'} options={['block', 'layer']} onchange={(e) => update('h3_block_swap_granularity', e.target.value)} disabled={!s.h3_blocks_to_swap} />
+										<FormToggle fieldPath="inference.h3_block_swap_h2d_only" checked={s.h3_block_swap_h2d_only ?? false} onchange={(e) => update('h3_block_swap_h2d_only', e.target.checked)} disabled={!s.h3_blocks_to_swap} />
+										<FormToggle fieldPath="inference.h3_use_pinned_memory_for_block_swap" checked={s.h3_use_pinned_memory_for_block_swap ?? false} onchange={(e) => update('h3_use_pinned_memory_for_block_swap', e.target.checked)} disabled={!s.h3_blocks_to_swap} />
+										<FormToggle fieldPath="inference.h3_fused_qk_norm_rope" checked={s.h3_fused_qk_norm_rope ?? false} onchange={(e) => update('h3_fused_qk_norm_rope', e.target.checked)} />
+										<FormToggle fieldPath="inference.h3_compile" checked={s.h3_compile ?? false} onchange={(e) => update('h3_compile', e.target.checked)} />
+										<FormSelect fieldPath="inference.h3_compile_mode" value={s.h3_compile_mode || 'max-autotune-no-cudagraphs'} options={['default', 'reduce-overhead', 'max-autotune', 'max-autotune-no-cudagraphs']} onchange={(e) => update('h3_compile_mode', e.target.value)} disabled={!s.h3_compile} />
+										<FormField fieldPath="inference.h3_compile_backend" value={s.h3_compile_backend || 'inductor'} oninput={(e) => update('h3_compile_backend', e.target.value)} disabled={!s.h3_compile} />
+										<FormSelect fieldPath="inference.h3_compile_dynamic" value={s.h3_compile_dynamic || ''} options={[{value:'',label:'Default'}, 'true', 'false', 'auto']} onchange={(e) => update('h3_compile_dynamic', e.target.value || null)} disabled={!s.h3_compile} />
+										<FormField type="number" fieldPath="inference.h3_compile_cache_size_limit" value={s.h3_compile_cache_size_limit ?? ''} oninput={(e) => update('h3_compile_cache_size_limit', e.target.value ? Number(e.target.value) : null)} placeholder="Automatic" disabled={!s.h3_compile} />
+										<FormToggle fieldPath="inference.h3_compile_fullgraph" checked={s.h3_compile_fullgraph ?? false} onchange={(e) => update('h3_compile_fullgraph', e.target.checked)} disabled={!s.h3_compile} />
+										<FormToggle fieldPath="inference.h3_compile_auto_cache_size_limit" checked={s.h3_compile_auto_cache_size_limit ?? false} onchange={(e) => update('h3_compile_auto_cache_size_limit', e.target.checked)} disabled={!s.h3_compile} />
+										<FormToggle fieldPath="inference.h3_compile_fallback_to_eager" checked={s.h3_compile_fallback_to_eager ?? false} onchange={(e) => update('h3_compile_fallback_to_eager', e.target.checked)} disabled={!s.h3_compile} />
+									</div>
+									<FormField fieldPath="inference.h3_inductor_config" value={s.h3_inductor_config || ''} oninput={(e) => update('h3_inductor_config', e.target.value)} placeholder="max_autotune=true" disabled={!s.h3_compile} />
+								</div>
+							{/if}
 							<FormField fieldPath="inference.device" value={s.device || ''} oninput={(e) => update('device', e.target.value)} placeholder="Auto" tooltip="Force cpu or cuda" />
 						{:else}
 						<CheckpointInput fieldPath="inference.ltx2_checkpoint" label="LTX-2 Checkpoint" value={s.ltx2_checkpoint || ''} onchange={(v) => update('ltx2_checkpoint', v)} showFiles tooltip="Path to LTX-2 checkpoint" actionLabel="D" actionBusyLabel="..." actionDisabled={hasActiveDownload || ltxDownloadExists} actionTooltip={modelDownloadTooltip(downloadPresets, 'ltxav', resolvedLtx, ltxDownloadExists)} onaction={() => downloadModel('ltxav')} />
@@ -359,7 +400,6 @@
 					</div>
 				</FormGroup>
 
-				{#if s.model_type !== 'minimax_h3'}
 				<FormGroup title="LoRA">
 					<div class="space-y-2 pt-2">
 						<PathInput fieldPath="inference.lora_weight" value={s.lora_weight || ''} oninput={(e) => update('lora_weight', e.target.value)} showFiles tooltip="Path to LoRA safetensors file" />
@@ -370,11 +410,16 @@
 						{/if}
 					</div>
 				</FormGroup>
-				{/if}
 
 				<FormGroup title="Prompt">
 					<div class="space-y-2 pt-2">
-						{#if s.model_type !== 'minimax_h3'}
+						{#if s.model_type === 'minimax_h3'}
+							<!-- svelte-ignore a11y_label_has_associated_control -->
+							<label class="block">
+								<span class="block text-[11px] font-medium mb-1" style="color: var(--text-muted);">Prompt</span>
+								<textarea class="w-full text-[12px] px-3 py-2 resize-y" rows="4" value={s.prompt || ''} oninput={(e) => update('prompt', e.target.value)} placeholder="Describe the MiniMax H3 video..." style="background: var(--bg-elevated); border: 1px solid var(--border); border-radius: var(--radius-sm); color: var(--text-primary); outline: none;"></textarea>
+							</label>
+						{:else}
 						<!-- svelte-ignore a11y_label_has_associated_control -->
 						<label class="block">
 							<span class="block text-[11px] font-medium mb-1" style="color: var(--text-muted);">Prompt</span>

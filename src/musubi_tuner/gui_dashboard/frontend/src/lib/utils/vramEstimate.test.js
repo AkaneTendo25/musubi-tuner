@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { estimateTraining } from './vramEstimate.js';
+import { estimateLatentCaching, estimateTextCaching, estimateTraining } from './vramEstimate.js';
 
 function config(training = {}) {
 	return {
@@ -39,10 +39,30 @@ test('H3 partial checkpointing estimates more activation memory', () => {
 	assert.ok(partValue(partial, 'Activ.') > partValue(full, 'Activ.'));
 });
 
-test('LTX-2 base estimates retain their existing constants', () => {
-	const bf16 = estimateTraining(config({ model_type: 'ltx2', ltx_version: '2.3', ltx2_mode: 'video' }));
-	const fp8 = estimateTraining(config({ model_type: 'ltx2', ltx_version: '2.3', ltx2_mode: 'video', fp8_base: true }));
+test('H3 text caching models Qwen3-VL quantization rather than Gemma', () => {
+	const base = { caching: { model_type: 'minimax_h3', h3_text_encoder_quantization: 'none' } };
+	const bf16 = estimateTextCaching(base);
+	const nf4 = estimateTextCaching({ caching: { ...base.caching, h3_text_encoder_quantization: 'nf4' } });
 
-	assert.equal(partValue(bf16, 'DiT'), 42);
-	assert.equal(partValue(fp8, 'DiT'), 21);
+	assert.equal(bf16.parts[0].label, 'Qwen3-VL 32B');
+	assert.equal(partValue(bf16, 'Qwen3-VL 32B'), 47.97);
+	assert.equal(partValue(nf4, 'Qwen3-VL 32B'), 14.0);
+	assert.ok(bf16.total >= 51.97);
+	assert.ok(nf4.total < bf16.total);
+});
+
+test('H3 long-sequence estimate stays near the measured 73.2 GiB workbox baseline', () => {
+	const estimate = estimateTraining(config());
+
+	// The production 100k-token BF16 checkpointed run peaked at 73.157 GiB.
+	// Keep the UI conservative but within 10% of that measured baseline.
+	assert.ok(estimate.total >= 73.157);
+	assert.ok(estimate.total <= 73.157 * 1.10);
+});
+
+test('H3 estimators reject non-H3 configurations', () => {
+	const ltx = { caching: { model_type: 'ltx2' }, training: { model_type: 'ltx2' } };
+	assert.equal(estimateLatentCaching(ltx), null);
+	assert.equal(estimateTextCaching(ltx), null);
+	assert.equal(estimateTraining(ltx), null);
 });

@@ -13,8 +13,8 @@
 	}
 </script>
 
-<label class="block">
-	<span class="flex items-center gap-1 text-xs font-medium uppercase tracking-wider" style="color: var(--text-muted); font-family: var(--font-label);">
+<label class="block min-w-0">
+    <span class="flex min-h-5 items-end gap-1 text-xs font-medium uppercase tracking-wider" style="color: var(--text-muted); font-family: var(--font-label);">
 		<span data-tooltip={tooltip || undefined}>{displayLabel}</span>
 		<FieldResetButton {fieldPath} {disabled} />
 	</span>

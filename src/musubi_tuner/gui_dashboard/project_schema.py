@@ -13,7 +13,6 @@ from musubi_tuner.gui_dashboard.cli_defaults import (
 )
 from musubi_tuner.model_defaults import default_gemma_root_path, default_ltx2_checkpoint_path
 
-
 SamplingPreset = Literal["legacy", "defaults", "ltx20", "ltx23", "ltx23_hq", "distilled_two_stage"]
 SampleSigmaSchedule = Literal["auto", "ltx", "ltx_latent", "ltx23_distilled"]
 SampleSampler = Literal["auto", "euler", "res_2s"]
@@ -125,7 +124,7 @@ class DatasetConfig(BaseModel):
 
 
 class CachingConfig(BaseModel):
-    model_type: Literal["ltx2", "minimax_h3"] = "ltx2"
+    model_type: Literal["ltx2", "minimax_h3"] = "minimax_h3"
     ltx2_checkpoint: str = ""
     h3_model: str = ""
     h3_video_vae: str = ""
@@ -136,6 +135,8 @@ class CachingConfig(BaseModel):
     h3_text_encoder_dtype: Literal["bfloat16", "float16", "float32"] = "bfloat16"
     h3_text_encoder_quantization: Literal["none", "int8", "nf4", "nvfp4_awq"] = "none"
     h3_cache_guidance_empty: bool = False
+    h3_reference_image_short_edge: int = 384
+    cache_batch_size: Optional[int] = None
     gemma_root: str = ""
     gemma_safetensors: str = ""
     ltx2_text_encoder_checkpoint: str = ""
@@ -226,14 +227,30 @@ class CachingConfig(BaseModel):
 
 class TrainingConfig(BaseModel):
     # Model
-    model_type: Literal["ltx2", "minimax_h3"] = "ltx2"
+    model_type: Literal["ltx2", "minimax_h3"] = "minimax_h3"
     ltx2_checkpoint: str = ""
     h3_model: str = ""
-    h3_training_mode: Literal["fl2va", "ref2va"] = "fl2va"
+    h3_training_mode: Literal["fl2va", "ref2va", "ref2va_omni"] = "fl2va"
     h3_loss_balance: Literal["token", "modality"] = "modality"
     h3_video_loss_weight: float = 1.0
     h3_audio_loss_weight: float = 1.0
     h3_spatial_density_jitter: float = 0.2
+    h3_shift_video: float = 12.0
+    h3_shift_audio: float = 3.0
+    h3_frame_sigma_jitter: float = 0.0
+    h3_caption_dropout_rate: float = 0.0
+    h3_observed_modality: Optional[Literal["video", "audio", "random"]] = None
+    h3_image_flow_shift: Optional[float] = None
+    h3_extension_video_frames: int = 0
+    h3_extension_audio_latents: int = 0
+    h3_extension_route: Literal["condition_rows", "per_row_sigma"] = "condition_rows"
+    h3_keyframe_anchors: str = ""
+    h3_keyframe_random_count: int = 0
+    h3_mask_mode: Literal["off", "box", "border", "segment"] = "off"
+    h3_mask_audio: bool = False
+    h3_mask_min_fraction: float = 0.25
+    h3_mask_max_fraction: float = 0.75
+    reference_image_short_edge: int = 384
     h3_guidance_distillation_scale: Optional[float] = None
     h3_guidance_loss_form: Literal["normalized", "contrastive"] = "normalized"
     h3_guidance_loss_schedule: Literal["sigma", "constant"] = "sigma"
@@ -610,7 +627,7 @@ class TrainingConfig(BaseModel):
 
     # Output
     output_dir: str = ""
-    output_name: str = "ltx2_lora"
+    output_name: str = "minimax_h3_lora"
     save_every_n_epochs: Optional[int] = None
     save_every_n_steps: Optional[int] = None
     save_last_n_epochs: Optional[int] = None
@@ -764,6 +781,7 @@ class TrainingConfig(BaseModel):
     crepa_mode: Literal["backbone", "dino"] = "backbone"
     crepa_student_block_idx: int = 16
     crepa_teacher_block_idx: int = 32
+    h3_crepa_teacher_block_idx: int = 33
     crepa_dino_model: Literal["dinov2_vits14", "dinov2_vitb14", "dinov2_vitl14", "dinov2_vitg14"] = "dinov2_vitb14"
     crepa_lambda: float = 0.1
     crepa_tau: float = 1.0
@@ -1092,9 +1110,14 @@ class FullFinetuneConfig(TrainingConfig):
 
 
 class InferenceConfig(BaseModel):
-    model_type: Literal["ltx2", "minimax_h3"] = "ltx2"
+    model_type: Literal["ltx2", "minimax_h3"] = "minimax_h3"
     ltx2_checkpoint: str = ""
     h3_model: str = ""
+    h3_text_encoder: str = ""
+    h3_tokenizer: str = ""
+    h3_video_vae: str = ""
+    h3_audio_vae: str = ""
+    h3_text_encoder_quantization: Literal["none", "int8", "nf4", "nvfp4_awq"] = "none"
     h3_duration: int = 5
     h3_ratio: Literal["adaptive", "21:9", "16:9", "4:3", "1:1", "3:4", "9:16"] = "16:9"
     h3_first_frame: str = ""
@@ -1102,6 +1125,27 @@ class InferenceConfig(BaseModel):
     h3_reference_image: str = ""
     h3_reference_video: str = ""
     h3_reference_audio: str = ""
+    h3_keyframes: str = ""
+    h3_reference_image_short_edge: int = 384
+    h3_dtype: Literal["bfloat16", "float16", "float32"] = "bfloat16"
+    h3_int8_convrot_base: bool = False
+    h3_blocks_to_swap: int = 0
+    h3_block_swap_h2d_only: bool = False
+    h3_block_swap_ring_size: int = 2
+    h3_block_swap_granularity: Literal["block", "layer"] = "block"
+    h3_use_pinned_memory_for_block_swap: bool = False
+    h3_compile: bool = False
+    h3_compile_backend: str = "inductor"
+    h3_compile_mode: Literal["default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"] = (
+        "max-autotune-no-cudagraphs"
+    )
+    h3_compile_dynamic: Optional[Literal["true", "false", "auto"]] = None
+    h3_compile_fullgraph: bool = False
+    h3_compile_cache_size_limit: Optional[int] = None
+    h3_compile_auto_cache_size_limit: bool = False
+    h3_compile_fallback_to_eager: bool = False
+    h3_inductor_config: str = ""
+    h3_fused_qk_norm_rope: bool = False
     vae: str = ""
     vae_dtype: Optional[Literal["bfloat16", "float16", "float32"]] = None
     device: Optional[str] = None
@@ -1115,7 +1159,7 @@ class InferenceConfig(BaseModel):
     negative_prompt: str = ""
     from_file: str = ""
     output_dir: str = "output"
-    output_name: str = "ltx2_sample"
+    output_name: str = "minimax_h3_sample"
     sampling_preset: SamplingPreset = "defaults"
     sample_sigma_schedule: SampleSigmaSchedule = "auto"
     sample_sampler: SampleSampler = "auto"

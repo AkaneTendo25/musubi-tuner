@@ -7,7 +7,7 @@
 	// Last-resort fallback when the API is unreachable (which is the typical
 	// reason this error page renders). When the API is reachable we replace
 	// this with the branch-aware URL the backend reports.
-	const DOCS_URL_FALLBACK = 'https://github.com/AkaneTendo25/musubi-tuner/blob/ltx-2/docs/ltx_2.md';
+	const DOCS_URL_FALLBACK = 'https://github.com/AkaneTendo25/musubi-tuner/blob/minimax-h3/docs/minimax_h3.md';
 
 	let docsUrl = $state(DOCS_URL_FALLBACK);
 	let status = $derived(page.status || 500);
@@ -72,7 +72,7 @@
 				class="px-3 py-1.5 text-[11px] font-medium"
 				style="background: var(--accent-muted); color: var(--accent); border: 1px solid color-mix(in srgb, var(--accent) 32%, var(--border)); border-radius: var(--radius-sm);"
 			>
-				LTX-2 docs
+				MiniMax H3 docs
 			</a>
 			<a
 				href="/settings"

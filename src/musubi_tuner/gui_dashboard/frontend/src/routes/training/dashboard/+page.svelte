@@ -265,7 +265,7 @@
 	}
 
 	let effectiveOutputDir = $derived(t.output_dir || 'output');
-	let effectiveOutputName = $derived(t.output_name || 'ltx2_lora');
+	let effectiveOutputName = $derived(t.output_name || 'minimax_h3_lora');
 	let effectiveBatchSize = $derived(runStats?.effective_batch_size ?? null);
 	let stepsPerEpoch = $derived(runStats?.steps_per_epoch ?? null);
 	let nextCheckpoint = $derived(nextStepEventLabel(Number(t.save_every_n_steps || 0), $status?.step, $status?.speed_steps_per_sec, 'Final only'));

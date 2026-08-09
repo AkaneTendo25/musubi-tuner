@@ -606,6 +606,16 @@ class ProcessManager:
             python_bin_dir = os.path.dirname(sys.executable)
             path_key = "Path" if "Path" in env else "PATH"
             env[path_key] = python_bin_dir + os.pathsep + env.get(path_key, "")
+            # Commands run from the project directory, so a relative PYTHONPATH
+            # such as ``src`` would resolve against the project instead of this
+            # checkout and can silently import another installed musubi_tuner.
+            repo_src = str(Path(__file__).resolve().parents[2])
+            env["PYTHONPATH"] = repo_src + os.pathsep + env.get("PYTHONPATH", "")
+            # A dashboard may be kept CPU-only by starting it with an empty
+            # CUDA_VISIBLE_DEVICES.  Do not pass that sentinel to the GPU jobs
+            # it launches; a non-empty device selection remains authoritative.
+            if env.get("CUDA_VISIBLE_DEVICES") == "":
+                env.pop("CUDA_VISIBLE_DEVICES")
             # Force UTF-8 stdio for dashboard-launched Python subprocesses so
             # trainer logs with Japanese text do not crash on localized Windows.
             env["PYTHONIOENCODING"] = "utf-8"

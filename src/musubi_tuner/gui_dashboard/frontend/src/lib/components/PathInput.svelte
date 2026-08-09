@@ -91,19 +91,19 @@
 	}
 </script>
 
-<label class="block">
-	<span class="flex items-center gap-1 text-xs font-medium uppercase tracking-wider" style="color: {invalid ? 'var(--danger)' : 'var(--text-muted)'}; font-family: var(--font-label);">
+<label class="block min-w-0">
+    <span class="flex min-h-5 items-end gap-1 text-xs font-medium uppercase tracking-wider" style="color: {invalid ? 'var(--danger)' : 'var(--text-muted)'}; font-family: var(--font-label);">
 		<span data-tooltip={tooltip || undefined}>{displayLabel}</span>
 		<FieldResetButton {fieldPath} {disabled} />
 	</span>
-	<div class="mt-1 flex gap-1.5">
+    <div class="mt-1 flex min-w-0 gap-1.5">
 		<input
 			type="text"
 			bind:value
 			{placeholder}
 			{disabled}
 			oninput={oninput}
-			class="flex-1 px-3 py-2 text-sm transition-colors disabled:opacity-40"
+            class="min-w-0 flex-1 px-3 py-2 text-sm transition-colors disabled:opacity-40"
 			style="background: var(--bg-input); border: 1px solid {invalid ? 'var(--danger)' : 'var(--border)'}; color: var(--text-primary); border-radius: var(--radius-sm);"
 		/>
 		{#if actionLabel}

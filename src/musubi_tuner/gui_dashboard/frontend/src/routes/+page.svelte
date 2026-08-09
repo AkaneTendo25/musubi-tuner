@@ -37,6 +37,7 @@
 	let workflowStatsTimer = null;
 
 	const LTX_DOCS_FALLBACK_URL = 'https://github.com/AkaneTendo25/musubi-tuner/blob/ltx-2/docs/ltx_2.md';
+	const H3_DOCS_FALLBACK_URL = 'https://github.com/AkaneTendo25/musubi-tuner/blob/minimax-h3/docs/minimax_h3.md';
 	const TEMPLATE_VARIANTS_DISABLED = false;
 	const CACHE_THEN_TRAIN_SESSION_KEY = 'musubi.cacheThenTrain.engaged';
 
@@ -117,17 +118,17 @@
 		{
 			id: 'high',
 			label: 'High VRAM',
-			blurb: 'Full-weight defaults with minimal memory-saving tradeoffs.'
+			blurb: 'Fast H3 defaults with BF16 ConvRot compute, rank-16 AdaLN, and no block swap.'
 		},
 		{
 			id: 'regular',
 			label: 'Regular',
-			blurb: 'Moderate memory savings with 8-bit Gemma and checkpointing enabled.'
+			blurb: 'Recommended H3 defaults with INT8 Qwen3-VL caching and moderate block swap.'
 		},
 		{
 			id: 'low',
 			label: 'Low VRAM',
-			blurb: 'FP8 / 4-bit oriented defaults for tighter cards.'
+			blurb: 'Recommended H3 quantization with 4-bit Qwen3-VL caching and aggressive block swap.'
 		}
 	];
 
@@ -135,6 +136,9 @@
 	let activeMemoryProfile = $derived(MEMORY_PROFILES.find((item) => item.id === selectedMemoryProfile) || MEMORY_PROFILES[1]);
 	let ltxDocsUrl = $derived(systemInfo?.repo?.docs_url || LTX_DOCS_FALLBACK_URL);
 	let ltxDocsBranch = $derived(systemInfo?.repo?.docs_branch || systemInfo?.repo?.branch || 'ltx-2');
+	let selectedDocsUrl = $derived(H3_DOCS_FALLBACK_URL);
+	let selectedDocsLabel = $derived('MiniMax H3 docs');
+	let selectedBranchLabel = $derived('minimax-h3');
 	let repoRoot = $derived(systemInfo?.repo?.root || cwd);
 	let newProjectSlug = $derived(slugProjectName(newProjectName));
 	let newProjectDir = $derived(repoRoot && newProjectSlug ? `${repoRoot}/projects/${newProjectSlug}` : '');
@@ -569,6 +573,60 @@
 		};
 	}
 
+	function buildH3TemplateConfig(memoryProfile) {
+		const repoOutputDir = repoRoot ? `${repoRoot}/output/${newProjectSlug}` : `output/${newProjectSlug}`;
+		const repoLoggingDir = repoRoot ? `${repoRoot}/logs/${newProjectSlug}` : `logs/${newProjectSlug}`;
+		const lowMemory = memoryProfile === 'low';
+		const highMemory = memoryProfile === 'high';
+		return {
+			version: 2,
+			caching: {
+				model_type: 'minimax_h3',
+				h3_task: 't2va',
+				h3_text_encoder_dtype: 'bfloat16',
+				h3_text_encoder_quantization: lowMemory ? 'nf4' : highMemory ? 'none' : 'int8',
+				mixed_precision: 'bf16',
+			},
+			training: {
+				model_type: 'minimax_h3',
+				h3_training_mode: 'fl2va',
+				h3_loss_balance: 'modality',
+				h3_base_preservation_loss_weight: 0.02,
+				mixed_precision: 'bf16',
+				fp8_base: false,
+				fp8_scaled: false,
+				h3_convrot_int8: true,
+				h3_convrot_int8_fwd: 'bf16',
+				h3_convrot_int8_bwd: 'bf16',
+				h3_adaln_rank: 16,
+				sdpa: true,
+				gradient_checkpointing: true,
+				blocks_to_swap: lowMemory ? 40 : highMemory ? 0 : 24,
+				network_dim: 32,
+				network_alpha: 32,
+				optimizer_type: 'adamw8bit',
+				learning_rate: 1e-4,
+				output_dir: repoOutputDir,
+				output_name: 'minimax_h3_lora',
+				autoresume: true,
+				save_every_n_steps: 400,
+				save_state: true,
+				logging_dir: repoLoggingDir,
+				accelerate_extra_args: '--num_processes 1 --num_machines 1 --num_cpu_threads_per_process 1',
+				max_data_loader_n_workers: 1,
+			},
+			inference: {
+				model_type: 'minimax_h3',
+				h3_duration: 5,
+				h3_ratio: '16:9',
+				output_name: 'minimax_h3_sample',
+				mixed_precision: 'bf16',
+				fp8_base: !highMemory,
+				sdpa: true,
+			},
+		};
+	}
+
 	async function handleCreate() {
 		error = '';
 		if (!newProjectName.trim()) {
@@ -585,7 +643,7 @@
 			const seedConfig = { model_dir: modelDir };
 			const defaultLtx = effectiveLtx2Checkpoint(cwd, seedConfig, '');
 			const defaultGemma = effectiveGemmaRoot(cwd, seedConfig, '', '');
-			const templateConfig = buildTemplateConfig(selectedLoraFamily, selectedMemoryProfile, defaultLtx, defaultGemma);
+			const templateConfig = buildH3TemplateConfig(selectedMemoryProfile);
 			await createProject({
 				name: newProjectName,
 				project_dir: newProjectDir,
@@ -1148,8 +1206,10 @@
 	let diagnostics = $derived.by(() => {
 		const errors = [];
 		const warnings = [];
-		const hasLtxPath = !!(c.ltx2_checkpoint || t.ltx2_checkpoint || cfg?.default_ltx2_checkpoint || cfg?.model_dir || cwd);
-		const hasGemmaPath = !!(c.gemma_root || t.gemma_root || cfg?.default_gemma_root || cfg?.default_gemma_safetensors || cfg?.model_dir || cwd);
+		const hasH3Model = !!(c.h3_model || t.h3_model);
+		const hasH3VideoVae = !!c.h3_video_vae;
+		const hasH3TextEncoder = !!c.h3_text_encoder;
+		const hasH3Tokenizer = !!c.h3_tokenizer;
 
 		// Dataset
 		if (datasets.length === 0) {
@@ -1162,19 +1222,19 @@
 		}
 
 		// Caching
-		if (!hasLtxPath) {
-			errors.push({ stage: 'Caching', msg: 'LTX-2 checkpoint path not set', href: '/caching' });
+		if (!hasH3VideoVae) {
+			errors.push({ stage: 'Caching', msg: 'H3 video VAE path not set', href: '/caching' });
 		}
-		if (!hasGemmaPath) {
-			errors.push({ stage: 'Caching', msg: 'Gemma text encoder path not set', href: '/caching' });
+		if (!hasH3TextEncoder) {
+			errors.push({ stage: 'Caching', msg: 'H3 text encoder path not set', href: '/caching' });
+		}
+		if (!hasH3Tokenizer) {
+			errors.push({ stage: 'Caching', msg: 'H3 tokenizer path not set', href: '/caching' });
 		}
 
 		// Training
-		if (!hasLtxPath) {
-			warnings.push({ stage: 'Training', msg: 'Training checkpoint not set', href: '/training' });
-		}
-		if (!hasGemmaPath) {
-			warnings.push({ stage: 'Training', msg: 'Training Gemma root not set', href: '/training' });
+		if (!hasH3Model) {
+			warnings.push({ stage: 'Training', msg: 'H3 model path not set', href: '/training' });
 		}
 		if (!t.output_dir) {
 			errors.push({ stage: 'Training', msg: 'Output directory not set', href: '/training' });
@@ -1194,20 +1254,20 @@
 				</div>
 				<div class="flex flex-wrap items-baseline gap-x-2 min-w-0">
 					<h2 class="text-base font-semibold" style="color: var(--text-primary);">Musubi Tuner</h2>
-					<span class="text-[12px]" style="color: var(--text-muted);">LTX-2 LoRA training management</span>
+					<span class="text-[12px]" style="color: var(--text-muted);">MiniMax H3 training management</span>
 				</div>
 			</div>
 			<div class="flex flex-wrap items-center gap-2 text-[11px]">
 				<a
-					href={ltxDocsUrl}
+					href={selectedDocsUrl}
 					target="_blank"
 					rel="noreferrer"
 					class="title-docs-link px-2 py-1 font-medium"
 					style="background: var(--bg-elevated); color: var(--accent); border: 1px solid color-mix(in srgb, var(--accent) 26%, var(--border)); border-radius: var(--radius-sm);"
 				>
-					LTX-2 docs
+					{selectedDocsLabel}
 				</a>
-				<span class="font-mono text-[10px] px-1.5 py-0.5" style="color: var(--text-muted); background: var(--bg-elevated); border: 1px solid var(--border); border-radius: var(--radius-sm);">{ltxDocsBranch}</span>
+				<span class="font-mono text-[10px] px-1.5 py-0.5" style="color: var(--text-muted); background: var(--bg-elevated); border: 1px solid var(--border); border-radius: var(--radius-sm);">{selectedBranchLabel}</span>
 			</div>
 		</div>
 
@@ -1215,7 +1275,7 @@
 		<div class="grid grid-cols-1 xl:grid-cols-2 gap-5 min-h-0 flex-1">
 			<!-- Left: Create New Project -->
 			<div class="p-5 space-y-4 min-h-0" style="background: var(--bg-surface); border: 1px solid var(--border-subtle); border-radius: var(--radius-md); position: relative; overflow: hidden;">
-				<div style="position: absolute; top: 0; left: 0; right: 0; height: 1px; background: linear-gradient(90deg, transparent, var(--accent), var(--secondary, var(--accent)), transparent); opacity: 0.4;"></div>
+				<div style="position: absolute; top: 0; left: 0; right: 0; height: 1px; background: var(--accent); opacity: 0.4;"></div>
 				<div class="flex items-center justify-between gap-4">
 					<div>
 						<div class="text-[11px] font-semibold uppercase tracking-wider" style="color: var(--text-muted); font-family: var(--font-label);">New Project</div>
@@ -1224,7 +1284,7 @@
 				</div>
 				<div class="space-y-3">
 					<div class="project-name-field">
-						<FormField label="Project Name" bind:value={newProjectName} placeholder="My LTX-2 LoRA" tooltip="Display name for your project" invalid={projectDirExists} />
+					<FormField label="Project Name" bind:value={newProjectName} placeholder="My MiniMax H3 LoRA" tooltip="Display name for your project" invalid={projectDirExists} />
 						<div class="project-name-status">
 							{#if projectDirExists}
 								<span style="color: var(--danger);">Name exists</span>
@@ -1238,28 +1298,6 @@
 						<strong>{newProjectDir || 'Waiting for repository path...'}</strong>
 					</div>
 
-					<div class="space-y-2">
-						<div class="flex items-center justify-between gap-3">
-							<div class="text-[11px] font-medium uppercase tracking-[0.18em]" style="color: var(--text-secondary); font-family: var(--font-label);">Conditioning Preset</div>
-							<div class="text-[10px]" style="color: var(--text-muted);">{activeLoraFamily.label}</div>
-						</div>
-						<div class="title-preset-grid">
-							{#each LORA_FAMILIES as family}
-								<button
-									type="button"
-									disabled={TEMPLATE_VARIANTS_DISABLED}
-									onclick={() => {
-										if (!TEMPLATE_VARIANTS_DISABLED) selectedLoraFamily = family.id;
-									}}
-									class="title-preset-choice"
-									style="background: {selectedLoraFamily === family.id ? 'color-mix(in srgb, var(--accent) 10%, var(--bg-elevated))' : 'var(--bg-elevated)'}; border: 1px solid {selectedLoraFamily === family.id ? 'color-mix(in srgb, var(--accent) 28%, var(--border))' : 'var(--border)'}; color: {selectedLoraFamily === family.id ? 'var(--text-primary)' : 'var(--text-secondary)'};"
-								>
-									{family.label}
-								</button>
-							{/each}
-						</div>
-						<div class="text-[11px]" style="color: var(--text-muted);">{activeLoraFamily.blurb}</div>
-					</div>
 
 					<div class="space-y-2">
 						<div class="flex items-center justify-between gap-3">
@@ -1295,7 +1333,7 @@
 
 			<!-- Right: Recent Projects + Load Existing -->
 			<div class="p-5 min-h-0 flex flex-col gap-4" style="background: var(--bg-surface); border: 1px solid var(--border-subtle); border-radius: var(--radius-md); position: relative; overflow: hidden;">
-				<div style="position: absolute; top: 0; left: 0; right: 0; height: 1px; background: linear-gradient(90deg, transparent, var(--accent), var(--secondary, var(--accent)), transparent); opacity: 0.4;"></div>
+				<div style="position: absolute; top: 0; left: 0; right: 0; height: 1px; background: var(--accent); opacity: 0.4;"></div>
 				<div class="text-[11px] font-semibold uppercase tracking-wider" style="color: var(--text-muted); font-family: var(--font-label);">Open Project</div>
 
 				{#if $recentProjects.length > 0}
@@ -1321,13 +1359,12 @@
 										{:else if summary}
 											<div class="recent-project-meta">
 												<span class="summary-dataset">{compactDatasetSummary(summary)}</span>
-												<span class="summary-version">LTX {summary.ltx_version}</span>
+												<span class="summary-version">MiniMax H3</span>
 												<span class="summary-mode">{summary.mode}</span>
-												<span class="summary-target">{summary.lora_target_preset}</span>
 												{#if summary.lora_kind !== 'LoRA'}
 													<span class="summary-kind">{summary.lora_kind}</span>
 												{/if}
-												<span class="summary-output">{summary.output_name || 'ltx2_lora'}</span>
+												<span class="summary-output">{summary.output_name || 'minimax_h3_lora'}</span>
 												<span class="summary-steps">{trainingLengthSummary(summary)}</span>
 												<span class="summary-rank">{rankSummary(summary)}</span>
 											</div>
@@ -1513,7 +1550,7 @@
 					<VramEstimateCard title="Latent Cache" subtitle="VAE encode pass" estimate={vramLatent} total={vramTotal} color="var(--accent)" />
 				{/if}
 				{#if vramText}
-					<VramEstimateCard title="Text Cache" subtitle="Gemma encode pass" estimate={vramText} total={vramTotal} color="var(--info)" />
+					<VramEstimateCard title="Text Cache" subtitle="Qwen3-VL encode pass" estimate={vramText} total={vramTotal} color="var(--info)" />
 				{/if}
 				{#if vramTrain}
 					<VramEstimateCard title="Training" subtitle="DiT + LoRA step" estimate={vramTrain} total={vramTotal} color="var(--warning)" />
@@ -1528,7 +1565,7 @@
 		</div>
 
 		<!-- Project Statistics -->
-		<StatsPanel />
+		<StatsPanel trainingVram={vramTrain} />
 
 		<!-- Training Progress (conditional) -->
 		{#if trainingProgress}
@@ -1879,7 +1916,7 @@
 		position: relative;
 		height: 100%;
 		min-width: 0;
-		background: linear-gradient(90deg, color-mix(in srgb, var(--accent) 70%, var(--info)), var(--accent));
+		background: var(--accent);
 		border-radius: inherit;
 		box-shadow:
 			0 0 10px color-mix(in srgb, var(--accent) 34%, transparent),
@@ -1891,7 +1928,7 @@
 		content: '';
 		position: absolute;
 		inset: 0;
-		background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.18), transparent);
+		background: rgba(255, 255, 255, 0.18);
 		animation: workflow-progress-glow 1800ms ease-in-out infinite;
 		transform: translateX(-100%);
 	}
@@ -2019,37 +2056,6 @@
 		transition: background-color 140ms ease, border-color 140ms ease, color 140ms ease;
 	}
 
-	.title-preset-grid {
-		display: grid;
-		grid-template-columns: repeat(auto-fit, minmax(8.25rem, 1fr));
-		gap: 0.4rem;
-	}
-
-	.title-preset-choice {
-		display: flex;
-		align-items: center;
-		justify-content: center;
-		min-height: 2.25rem;
-		padding: 0.38rem 0.45rem;
-		overflow: hidden;
-		border-radius: var(--radius-sm);
-		font-size: 10.5px;
-		font-weight: 650;
-		line-height: 1.15;
-		text-align: center;
-		text-overflow: ellipsis;
-		transition: background-color 140ms ease, border-color 140ms ease, color 140ms ease;
-	}
-
-	.title-preset-choice:hover {
-		border-color: color-mix(in srgb, var(--accent) 22%, var(--border));
-		color: var(--text-primary);
-	}
-
-	.title-preset-choice:disabled {
-		cursor: not-allowed;
-		opacity: 0.55;
-	}
 
 	.choice-pill:hover {
 		border-color: color-mix(in srgb, var(--accent) 22%, var(--border));
@@ -2152,11 +2158,6 @@
 		color: var(--accent);
 		font-weight: 650;
 		text-transform: uppercase;
-	}
-
-	.summary-target {
-		color: var(--text-secondary);
-		font-weight: 600;
 	}
 
 	.summary-kind {

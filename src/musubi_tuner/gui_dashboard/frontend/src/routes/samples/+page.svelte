@@ -352,7 +352,7 @@
 			<div class="space-y-3">
 				{#each entries as entry, i}
 					<div class="p-4 relative" style="background: var(--bg-surface); border: 1px solid var(--border-subtle); border-radius: var(--radius-md); overflow: hidden;">
-						<div style="position: absolute; top: 0; left: 0; right: 0; height: 1px; background: linear-gradient(90deg, transparent, var(--accent), var(--secondary, var(--accent)), transparent); opacity: 0.3;"></div>
+						<div style="position: absolute; top: 0; left: 0; right: 0; height: 1px; background: var(--accent); opacity: 0.3;"></div>
 
 						<div class="flex items-center justify-between mb-3">
 							<span class="text-[10px] font-semibold uppercase tracking-wider" style="color: var(--accent);">Prompt #{i + 1}</span>
@@ -428,8 +428,9 @@
 								{#each entry.guides as guide, gi}
 									<div class="grid grid-cols-12 gap-2 items-end">
 										<div class="col-span-2">
-											<label class="block text-[10px] font-medium mb-1" style="color: var(--text-muted);">Type</label>
+											<label for={`guide-type-${i}-${gi}`} class="block text-[10px] font-medium mb-1" style="color: var(--text-muted);">Type</label>
 											<select
+												id={`guide-type-${i}-${gi}`}
 												value={guide.type}
 												onchange={(e) => updateGuide(i, gi, 'type', e.target.value)}
 												class="w-full text-[12px] px-2 py-[7px]"
