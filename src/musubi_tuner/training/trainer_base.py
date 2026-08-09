@@ -84,6 +84,11 @@ SS_METADATA_MINIMUM_KEYS = [
     SS_METADATA_KEY_NETWORK_ARGS,
 ]
 
+# Reserved entry used by process_batch implementations when the optimization
+# loss contains a diagnostic or regularization term that should not affect the
+# reported moving average. It is consumed before metrics are sent to trackers.
+LOSS_FOR_AVERAGE_KEY = "_loss_for_average"
+
 
 @dataclass
 class DiTOutput:
@@ -1168,6 +1173,9 @@ class NetworkTrainer:
         Returns ``(scalar_loss, loss_metrics)`` — ``loss_metrics`` is merged
         into the per-step log dict alongside ``extra_step_logs``.
 
+        A subclass may provide ``LOSS_FOR_AVERAGE_KEY`` in ``loss_metrics``
+        when a regularization term should not affect the reported average.
+
         ``latents`` is already scale-shifted; ``noise`` is already sampled.
         """
         noisy_model_input, timesteps = self.get_noisy_model_input_and_timesteps(
@@ -2233,7 +2241,8 @@ class NetworkTrainer:
                         optimizer_train_fn()
 
                 current_loss = loss.detach().item()
-                loss_recorder.add(epoch=epoch, step=step, loss=current_loss)
+                loss_for_average = loss_metrics.pop(LOSS_FOR_AVERAGE_KEY, current_loss)
+                loss_recorder.add(epoch=epoch, step=step, loss=float(loss_for_average))
                 avr_loss: float = loss_recorder.moving_average
                 logs = {"avr_loss": avr_loss}  # , "lr": lr_scheduler.get_last_lr()[0]}
                 progress_bar.set_postfix(**logs)
