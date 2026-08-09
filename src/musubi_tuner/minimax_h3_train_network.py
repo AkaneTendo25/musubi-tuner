@@ -76,6 +76,7 @@ from musubi_tuner.minimax_h3.validation import (
 )
 from musubi_tuner.training.accelerator_setup import collator_class
 from musubi_tuner.training.sampling_prompts import load_prompts
+from musubi_tuner.training.trainer_base import LOSS_FOR_AVERAGE_KEY
 from musubi_tuner.training.validation import derive_validation_seed
 from musubi_tuner.utils import model_utils
 from musubi_tuner.utils.device_utils import clean_memory_on_device
@@ -1371,6 +1372,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             # set is unchanged.
             metrics["h3/caption_dropped"] = float(conditioning == "empty")
         loss = result.loss
+        base_preservation_term = None
         if reference_prediction is not None:
             preservation = joint_prediction_loss(
                 raw_prediction,
@@ -1382,7 +1384,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 video_weight=video_weight,
                 audio_weight=audio_weight,
             )
-            loss = loss + args.h3_base_preservation_loss_weight * preservation.loss
+            base_preservation_term = args.h3_base_preservation_loss_weight * preservation.loss
+            loss = loss + base_preservation_term
             metrics["loss/base_preservation"] = float(preservation.loss.detach())
         if use_crepa and self._crepa.active:
             crepa_loss, crepa_metrics = self._crepa.loss(batch.get("h3_dino_features"))
@@ -1390,6 +1393,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             metrics.update(crepa_metrics)
         elif use_crepa:
             metrics.update(self._crepa.status_metrics())
+        if base_preservation_term is not None:
+            metrics[LOSS_FOR_AVERAGE_KEY] = float((loss - base_preservation_term).detach())
         # Keep capture active until backward has completed. Non-reentrant
         # gradient checkpointing recomputes hooked blocks during backward and
         # requires the hook to perform the same tensor operations as forward.
