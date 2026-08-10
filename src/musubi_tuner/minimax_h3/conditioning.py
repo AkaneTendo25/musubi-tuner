@@ -17,6 +17,7 @@ from musubi_tuner.minimax_h3.cache import (
     H3_CONDITIONING_TASK_KEY,
     H3_EMPTY_TEXT_HIDDEN_KEY,
     H3_EMPTY_TEXT_TOKEN_TAGS_KEY,
+    H3_REFERENCE_IMAGE_SHORT_EDGE_KEY,
     H3_TEXT_HIDDEN_KEY,
     H3_TEXT_TOKEN_TAGS_KEY,
 )
@@ -406,6 +407,8 @@ class MiniMaxH3ConditioningEncoder:
                 f"varlen_{H3_TEXT_TOKEN_TAGS_KEY}_int64": tags,
                 H3_CONDITIONING_TASK_KEY: torch.tensor(H3_CONDITIONING_TASK_IDS[self.task], dtype=torch.long),
             }
+            if self.task in ("ref2va", "ref2va_omni"):
+                tensors[H3_REFERENCE_IMAGE_SHORT_EDGE_KEY] = torch.tensor(self.reference_image_short_edge, dtype=torch.long)
             if include_empty:
                 empty_hidden, empty_tags = self._encode_prompt(
                     item.caption, self._images_for_item(item), references, null_instruction=True

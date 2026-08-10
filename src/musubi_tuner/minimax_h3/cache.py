@@ -21,6 +21,7 @@ H3_TEXT_TOKEN_TAGS_KEY = "mmh3_token_tags"
 H3_EMPTY_TEXT_HIDDEN_KEY = "mmh3_empty_hidden_states"
 H3_EMPTY_TEXT_TOKEN_TAGS_KEY = "mmh3_empty_token_tags"
 H3_CONDITIONING_TASK_KEY = "mmh3_conditioning_task"
+H3_REFERENCE_IMAGE_SHORT_EDGE_KEY = "mmh3_reference_image_short_edge"
 H3_CONDITIONING_TASK_IDS = {"t2va": 0, "i2va": 1, "fl2va": 2, "ref2va": 3, "ref2va_omni": 4, "l2va": 5}
 H3_KEYFRAME_VIDEO_ROWS_KEY = "mmh3_keyframe_video_rows"
 H3_REFERENCE_KINDS_KEY = "mmh3_reference_kinds"
@@ -177,6 +178,16 @@ def save_text_encoder_output_cache_minimax_h3(
     task = tensor_for(H3_CONDITIONING_TASK_KEY)
     if task.dtype != torch.long or task.ndim != 0 or int(task) not in H3_CONDITIONING_TASK_IDS.values():
         raise ValueError(f"H3 {H3_CONDITIONING_TASK_KEY} must be a scalar int64 task id")
+    reference_size_matches = [
+        tensor for key, tensor in cache_tensors.items() if _logical_key(key) == H3_REFERENCE_IMAGE_SHORT_EDGE_KEY
+    ]
+    if reference_size_matches:
+        if len(reference_size_matches) != 1:
+            raise ValueError(f"H3 conditioning cache must contain at most one {H3_REFERENCE_IMAGE_SHORT_EDGE_KEY} tensor")
+        reference_size = reference_size_matches[0]
+        if reference_size.dtype != torch.long or reference_size.ndim != 0:
+            raise ValueError(f"H3 {H3_REFERENCE_IMAGE_SHORT_EDGE_KEY} must be a scalar int64 value")
+        validate_reference_image_short_edge(int(reference_size))
     if empty_keys <= logical_keys:
         validate_pair(H3_EMPTY_TEXT_HIDDEN_KEY, H3_EMPTY_TEXT_TOKEN_TAGS_KEY)
     save_text_encoder_output_cache_common(

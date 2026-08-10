@@ -35,12 +35,33 @@ def test_dashboard_project_defaults_are_h3_only() -> None:
 
 
 def test_dashboard_accepts_all_h3_conditioning_cache_tasks(tmp_path: Path) -> None:
-    for task in ("t2va", "i2va", "fl2va", "l2va"):
+    for task in ("t2va", "i2va", "fl2va", "l2va", "ref2va", "ref2va_omni"):
         config = _h3_config(tmp_path)
         config.caching.h3_task = task
         command = build_cache_text_cmd(config)
 
         assert command[command.index("--task") + 1] == task
+
+
+def test_dashboard_rejects_conditioning_cache_from_another_h3_partition(tmp_path: Path) -> None:
+    config = _h3_config(tmp_path)
+    config.training.h3_training_mode = "ref2va"
+    config.caching.h3_task = "fl2va"
+
+    report = validate_training_config(config)
+
+    assert "caching.h3_task" in report["field_errors"]
+
+
+def test_dashboard_reference_size_defaults_match_h3_cli(tmp_path: Path) -> None:
+    config = _h3_config(tmp_path)
+
+    assert config.caching.h3_reference_image_short_edge == 2048
+    assert config.training.reference_image_short_edge == 2048
+    assert config.inference.h3_reference_image_short_edge == 2048
+    assert "--reference_image_short_edge" not in build_cache_latents_cmd(config)
+    assert "--reference_image_short_edge" not in build_cache_text_cmd(config)
+    assert "--reference_image_short_edge" not in build_training_cmd(config)
 
 
 def test_dashboard_rejects_custom_keyframes_with_endpoint_task_cache(tmp_path: Path) -> None:

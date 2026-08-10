@@ -21,6 +21,7 @@ from musubi_tuner.minimax_h3.cache import (
     H3_KEYFRAME_VIDEO_ROWS_KEY,
     H3_REFERENCE_AUDIO_LENGTHS_KEY,
     H3_REFERENCE_AUDIO_ROWS_KEY,
+    H3_REFERENCE_IMAGE_SHORT_EDGE_KEY,
     H3_REFERENCE_KINDS_KEY,
     H3_REFERENCE_VIDEO_ROWS_KEY,
     H3_REFERENCE_VIDEO_SHAPES_KEY,
@@ -1247,6 +1248,27 @@ def test_native_h3_strict_ref2va_still_rejects_text_only_conditioning():
         )
 
 
+def test_native_h3_ref2va_rejects_mismatched_text_cache_reference_size():
+    transformer = SimpleNamespace(config=SimpleNamespace(in_channels=4, audio_in_channels=6, text_dim=8))
+    backend = _NativeTrainingBackend(transformer, mode="ref2va", reference_image_short_edge=384)
+    batch = {
+        H3_TEXT_HIDDEN_KEY: [torch.randn(2, 8)],
+        H3_TEXT_TOKEN_TAGS_KEY: [torch.ones(2, dtype=torch.long)],
+        H3_CONDITIONING_TASK_KEY: [torch.tensor(H3_CONDITIONING_TASK_IDS["ref2va"])],
+        H3_REFERENCE_IMAGE_SHORT_EDGE_KEY: [torch.tensor(2048)],
+    }
+
+    with pytest.raises(ValueError, match="text cache uses reference short edge 2048"):
+        backend.predict_training(
+            transformer,
+            batch,
+            torch.randn(1, 4, 1, 2, 2),
+            None,
+            torch.tensor([0.5]),
+            torch.tensor([0.5]),
+        )
+
+
 def test_guidance_consistent_prediction_reconstructs_conditional_and_stops_empty_gradient():
     scale = 4.0
     conditional_video = torch.tensor([2.0])
@@ -1822,11 +1844,20 @@ def test_h3_trainer_base_preservation_replays_rng_and_restores_network():
     loss.backward()
 
     assert backend.calls == [("empty", False), ("prompt", False), ("prompt", True)]
-    assert backend.random_draws[1] == backend.random_draws[2]
+    assert backend.random_draws[0] == backend.random_draws[1] == backend.random_draws[2]
     assert network.events == [False, True]
     assert transformer.adapter_enabled is True
     assert metrics["loss/base_preservation"] > 0
     assert transformer.scale.grad is not None and torch.isfinite(transformer.scale.grad)
+
+
+def test_h3_ref2va_rejects_training_time_sample_prompts():
+    args = create_parser().parse_args(["--sdpa"])
+    args.h3_training_mode = "ref2va"
+    args.sample_prompts = "samples.txt"
+
+    with pytest.raises(ValueError, match="minimax_h3_generate_video.py"):
+        MiniMaxH3NetworkTrainer().handle_model_specific_args(args)
 
 
 @pytest.mark.parametrize("schedule", ["constant", "sigma"])

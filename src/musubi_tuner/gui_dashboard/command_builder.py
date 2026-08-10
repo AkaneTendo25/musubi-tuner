@@ -329,7 +329,7 @@ def _append_optional(cmd: list[str], flag: str, value) -> None:
 def _h3_cache_common_args(cmd: list[str], section) -> None:
     if section.cache_batch_size is not None:
         cmd += ["--batch_size", str(section.cache_batch_size)]
-    if section.h3_reference_image_short_edge != 384:
+    if section.h3_reference_image_short_edge != 2048:
         cmd += ["--reference_image_short_edge", str(section.h3_reference_image_short_edge)]
     if section.device:
         cmd += ["--device", section.device]
@@ -453,7 +453,7 @@ def _build_h3_inference_cmd(config: ProjectConfig) -> list[str]:
     ):
         for path in _split_cli_args(raw):
             cmd += [flag, path]
-    if s.h3_reference_image_short_edge != 384:
+    if s.h3_reference_image_short_edge != 2048:
         cmd += ["--reference_image_short_edge", str(s.h3_reference_image_short_edge)]
     if s.h3_dtype != "bfloat16":
         cmd += ["--dtype", s.h3_dtype]
@@ -567,7 +567,7 @@ def _build_h3_training_cmd(config: ProjectConfig) -> list[str]:
         cmd += ["--h3_keyframe_anchors", t.h3_keyframe_anchors]
     if t.h3_keyframe_random_count:
         cmd += ["--h3_keyframe_random_count", str(t.h3_keyframe_random_count)]
-    if t.reference_image_short_edge != 384:
+    if t.reference_image_short_edge != 2048:
         cmd += ["--reference_image_short_edge", str(t.reference_image_short_edge)]
     if t.h3_mask_mode != "off":
         cmd += ["--h3_mask_mode", t.h3_mask_mode]

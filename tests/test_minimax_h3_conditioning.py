@@ -9,6 +9,7 @@ from musubi_tuner.dataset.image_video_dataset import ItemInfo
 from musubi_tuner.minimax_h3.cache import (
     H3_EMPTY_TEXT_HIDDEN_KEY,
     H3_EMPTY_TEXT_TOKEN_TAGS_KEY,
+    H3_REFERENCE_IMAGE_SHORT_EDGE_KEY,
     H3_TEXT_HIDDEN_KEY,
     H3_TEXT_TOKEN_TAGS_KEY,
 )
@@ -248,6 +249,7 @@ def test_ref2va_omni_conditioning_accepts_text_only_presentation():
     )
     cached = encoder.encode_conditioning([item])[0]
     assert cached["varlen_mmh3_token_tags_int64"].tolist() == [1, 1]
+    assert int(cached[H3_REFERENCE_IMAGE_SHORT_EDGE_KEY]) == 2048
 
 
 def test_content_conditioning_populates_video_text_cache_path(tmp_path):

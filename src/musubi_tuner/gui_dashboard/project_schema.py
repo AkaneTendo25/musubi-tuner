@@ -131,11 +131,11 @@ class CachingConfig(BaseModel):
     h3_audio_vae: str = ""
     h3_text_encoder: str = ""
     h3_tokenizer: str = ""
-    h3_task: Literal["t2va", "i2va", "fl2va", "l2va"] = "t2va"
+    h3_task: Literal["t2va", "i2va", "fl2va", "l2va", "ref2va", "ref2va_omni"] = "t2va"
     h3_text_encoder_dtype: Literal["bfloat16", "float16", "float32"] = "bfloat16"
     h3_text_encoder_quantization: Literal["none", "int8", "nf4", "nvfp4_awq"] = "none"
     h3_cache_guidance_empty: bool = False
-    h3_reference_image_short_edge: int = 384
+    h3_reference_image_short_edge: int = 2048
     cache_batch_size: Optional[int] = None
     gemma_root: str = ""
     gemma_safetensors: str = ""
@@ -250,7 +250,7 @@ class TrainingConfig(BaseModel):
     h3_mask_audio: bool = False
     h3_mask_min_fraction: float = 0.25
     h3_mask_max_fraction: float = 0.75
-    reference_image_short_edge: int = 384
+    reference_image_short_edge: int = 2048
     h3_guidance_distillation_scale: Optional[float] = None
     h3_guidance_loss_form: Literal["normalized", "contrastive"] = "normalized"
     h3_guidance_loss_schedule: Literal["sigma", "constant"] = "sigma"
@@ -1126,7 +1126,7 @@ class InferenceConfig(BaseModel):
     h3_reference_video: str = ""
     h3_reference_audio: str = ""
     h3_keyframes: str = ""
-    h3_reference_image_short_edge: int = 384
+    h3_reference_image_short_edge: int = 2048
     h3_dtype: Literal["bfloat16", "float16", "float32"] = "bfloat16"
     h3_int8_convrot_base: bool = False
     h3_blocks_to_swap: int = 0

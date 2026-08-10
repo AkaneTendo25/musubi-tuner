@@ -27,6 +27,7 @@ from musubi_tuner.minimax_h3.cache import (
     H3_KEYFRAME_VIDEO_ROWS_KEY,
     H3_REFERENCE_AUDIO_LENGTHS_KEY,
     H3_REFERENCE_AUDIO_ROWS_KEY,
+    H3_REFERENCE_IMAGE_SHORT_EDGE_KEY,
     H3_REFERENCE_KINDS_KEY,
     H3_REFERENCE_VIDEO_ROWS_KEY,
     H3_REFERENCE_VIDEO_SHAPES_KEY,
@@ -670,6 +671,21 @@ class _NativeTrainingBackend:
         text_hidden = self._one_conditioning_item(batch, hidden_key, expected_ndim=2)
         text_tags = self._one_conditioning_item(batch, tags_key, expected_ndim=1)
         conditioning_task = self._one_conditioning_item(batch, H3_CONDITIONING_TASK_KEY, expected_ndim=0)
+        if self.mode in ("ref2va", "ref2va_omni"):
+            cached_reference_size = batch.get(H3_REFERENCE_IMAGE_SHORT_EDGE_KEY)
+            if cached_reference_size is None:
+                if self.reference_image_short_edge != REFERENCE_IMAGE_SHORT_EDGE:
+                    raise ValueError(
+                        "Legacy H3 Ref2VA text cache has no reference-image size identity; "
+                        "re-cache text conditioning for a non-default reference_image_short_edge"
+                    )
+            else:
+                cached_reference_size = self._one_conditioning_item(batch, H3_REFERENCE_IMAGE_SHORT_EDGE_KEY, expected_ndim=0)
+                if cached_reference_size.dtype != torch.long or int(cached_reference_size) != self.reference_image_short_edge:
+                    raise ValueError(
+                        f"H3 Ref2VA text cache uses reference short edge {int(cached_reference_size)}, "
+                        f"but training requested {self.reference_image_short_edge}; re-cache text conditioning"
+                    )
         if text_hidden.ndim != 2 or text_hidden.shape[-1] != config.text_dim:
             raise ValueError(f"H3 {hidden_key} must have shape [tokens, {config.text_dim}]")
         if text_tags.dtype != torch.long or text_tags.shape != (text_hidden.shape[0],):

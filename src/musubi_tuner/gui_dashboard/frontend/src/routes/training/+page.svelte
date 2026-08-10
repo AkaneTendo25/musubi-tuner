@@ -513,7 +513,7 @@
 										<FormField type="number" fieldPath="training.h3_extension_video_frames" value={t.h3_extension_video_frames ?? 0} oninput={(e) => update('h3_extension_video_frames', Number(e.target.value || 0))} min={0} tooltip="Leading latent video frames observed as extension context" />
 										<FormField type="number" fieldPath="training.h3_extension_audio_latents" value={t.h3_extension_audio_latents ?? 0} oninput={(e) => update('h3_extension_audio_latents', Number(e.target.value || 0))} min={0} tooltip="Leading audio latents observed as extension context" />
 										<FormSelect fieldPath="training.h3_extension_route" value={t.h3_extension_route || 'condition_rows'} options={['condition_rows', 'per_row_sigma']} onchange={(e) => update('h3_extension_route', e.target.value)} tooltip="How observed extension context is represented" />
-										<FormField type="number" fieldPath="training.reference_image_short_edge" value={t.reference_image_short_edge ?? 384} oninput={(e) => update('reference_image_short_edge', Number(e.target.value || 384))} min={64} step={8} tooltip="Must match the reference-image size used by latent caching" />
+									<FormField type="number" fieldPath="training.reference_image_short_edge" value={t.reference_image_short_edge ?? 2048} oninput={(e) => update('reference_image_short_edge', Number(e.target.value || 2048))} min={64} step={8} tooltip="Must match the reference-image size used by latent caching" />
 									</div>
 								</div>
 								<div class="h3-control-cluster">

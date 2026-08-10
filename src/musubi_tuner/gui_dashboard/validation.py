@@ -438,6 +438,18 @@ def validate_training_config(config: ProjectConfig) -> dict[str, Any]:
     errors: list[dict[str, Any]] = []
     warnings: list[dict[str, Any]] = []
     if t.model_type == "minimax_h3":
+        cache_task = config.caching.h3_task
+        compatible_tasks = {"t2va", "i2va", "fl2va", "l2va"} if t.h3_training_mode == "fl2va" else {t.h3_training_mode}
+        if cache_task not in compatible_tasks:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "caching.h3_task",
+                    f"H3 {t.h3_training_mode.upper()} training is incompatible with {cache_task.upper()} text caches.",
+                    label="H3 Conditioning Task",
+                    page="caching",
+                )
+            )
         if not _has_text(t.h3_model):
             errors.append(
                 _make_issue(

@@ -33,12 +33,8 @@ def test_validation_sigma_bins_are_base_coordinate_midpoints_with_exact_modality
 
     assert [item.index for item in bins] == [0, 1, 2, 3]
     torch.testing.assert_close(torch.tensor([item.base_sigma for item in bins], dtype=torch.float64), base)
-    torch.testing.assert_close(
-        torch.tensor([item.video_sigma for item in bins], dtype=torch.float64), shift_sigma(base, 12.0)
-    )
-    torch.testing.assert_close(
-        torch.tensor([item.audio_sigma for item in bins], dtype=torch.float64), shift_sigma(base, 3.0)
-    )
+    torch.testing.assert_close(torch.tensor([item.video_sigma for item in bins], dtype=torch.float64), shift_sigma(base, 12.0))
+    torch.testing.assert_close(torch.tensor([item.audio_sigma for item in bins], dtype=torch.float64), shift_sigma(base, 3.0))
 
 
 def test_image_validation_sigma_matches_resolution_aware_and_explicit_training_math():
@@ -120,9 +116,7 @@ def test_validation_accumulator_serializes_for_sum_reduction_and_validates_shape
 def test_masked_squared_error_sum_matches_training_broadcast_and_handles_fully_masked_modality():
     prediction = torch.tensor([[[1.0, 2.0], [3.0, 4.0]]])
     target = torch.zeros_like(prediction)
-    total, count = masked_squared_error_sum(
-        prediction, target, torch.tensor([[True, False]]), sample_weight=torch.tensor([2.0])
-    )
+    total, count = masked_squared_error_sum(prediction, target, torch.tensor([[True, False]]), sample_weight=torch.tensor([2.0]))
     assert count == 2
     assert float(total) == pytest.approx(20.0)
     empty_total, empty_count = masked_squared_error_sum(prediction, target, torch.zeros(1, 2, dtype=torch.bool))
@@ -156,6 +150,7 @@ class _ValidationTransformer(nn.Module):
 class _ValidationBackend:
     def __init__(self):
         self.calls = []
+        self.random_draws = []
 
     def predict_training(
         self,
@@ -170,6 +165,7 @@ class _ValidationBackend:
     ):
         del batch, video_timestep, audio_timestep
         self.calls.append((conditioning, torch.is_grad_enabled()))
+        self.random_draws.append(float(torch.rand(())))
         scale = 0.0 if conditioning == "empty" else transformer.scale
         return H3ModelPrediction(
             video_hidden_states * scale if video_hidden_states is not None else None,
@@ -319,6 +315,8 @@ def test_h3_validation_omits_fully_masked_modality_and_uses_guidance_primary_obj
     assert "val/loss/audio" not in metrics
     assert not any("crepa" in key or "preservation" in key for key in metrics)
     assert trainer.backend.calls == [("empty", False), ("prompt", False)] * 2
+    assert trainer.backend.random_draws[0] == trainer.backend.random_draws[1]
+    assert trainer.backend.random_draws[2] == trainer.backend.random_draws[3]
     assert float(torch.rand(())) == expected_next
     trainer.backend.calls.clear()
     trainer.validate(accelerator, args, _ValidationTransformer(), None, 4, None)

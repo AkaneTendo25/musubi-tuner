@@ -352,14 +352,16 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                         ]
                         if missing_empty:
                             raise KeyError("guidance-consistent H3 validation is missing " + ", ".join(missing_empty))
-                        empty_prediction = self._predict(
-                            accelerator,
-                            transformer,
-                            batch,
-                            inputs,
-                            conditioning="empty",
-                            gradient_checkpointing=False,
-                        )
+                        fork_devices = [accelerator.device] if accelerator.device.type == "cuda" else []
+                        with torch.random.fork_rng(devices=fork_devices):
+                            empty_prediction = self._predict(
+                                accelerator,
+                                transformer,
+                                batch,
+                                inputs,
+                                conditioning="empty",
+                                gradient_checkpointing=False,
+                            )
                     prediction = self._predict(
                         accelerator,
                         transformer,
@@ -554,6 +556,11 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         if args.split_attn:
             raise ValueError("MiniMax H3 training does not support split attention")
         if args.sample_prompts:
+            if args.h3_training_mode != "fl2va":
+                raise ValueError(
+                    "MiniMax H3 training-time sampling currently supports only FL2VA; "
+                    "use minimax_h3_generate_video.py for Ref2VA samples"
+                )
             required = {
                 "--text_encoder": args.text_encoder,
                 "--vae": args.vae,
@@ -1277,7 +1284,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 )
             # The empty branch calibrates the distilled field but is not itself
             # optimized. Evaluate it first without retaining its autograd graph.
-            with torch.no_grad():
+            fork_devices = [accelerator.device] if accelerator.device.type == "cuda" else []
+            with torch.random.fork_rng(devices=fork_devices), torch.no_grad():
                 empty_prediction = self._predict(
                     accelerator,
                     transformer,
