@@ -20,6 +20,7 @@ Two released transformers, with different conditioning contracts:
 - [Dataset](#dataset)
 - [Pre-caching](#pre-caching)
 - [Training](#training)
+  - [Full-parameter BF16 training](#full-parameter-bf16-training)
 - [Inference](#inference)
 - [Training dashboard](#training-dashboard)
 
@@ -244,6 +245,58 @@ versions.
 
 Watch progress with `tensorboard --logdir logs`. When training remotely, bind it to a protected interface or reach its loopback
 address through an SSH forward rather than exposing it publicly.
+
+### Full-parameter BF16 training
+
+`minimax_h3_train.py` updates the entire transformer and writes a native MiniMax H3 BF16 checkpoint. It is separate from the
+LoRA entry point above. Full training requires the ordinary BF16 FL2VA or Ref2VA checkpoint; FP8, ConvRot INT8, pruned AdaLN,
+LoRA initialization/merge weights, and architecture-changing options are rejected.
+
+```shell
+PYTORCH_ALLOC_CONF=expandable_segments:True accelerate launch \
+  --num_processes 1 --num_cpu_threads_per_process 1 \
+  minimax_h3_train.py \
+  --dit /models/MiniMax-H3/diffusion_models/minimax_h3_fl2va_bf16.safetensors \
+  --dataset_config dataset.toml \
+  --h3_training_mode fl2va \
+  --sdpa \
+  --blocks_to_swap 8 \
+  --adafactor_triton \
+  --learning_rate 1e-6 \
+  --max_train_steps 1000 \
+  --save_every_n_steps 250 --save_state --autoresume \
+  --output_dir output/full --output_name h3_full
+```
+
+The dense entry point defaults to BF16 weights, gradient checkpointing, manual-learning-rate Adafactor
+(`scale_parameter=False relative_step=False warmup_init=False`), per-parameter optimizer steps during backward, stochastic
+rounding back to BF16, `max_grad_norm=0`, and memory-efficient checkpoint writing. `--adafactor_triton` accelerates supported
+contiguous BF16 matrices and falls back to the fused PyTorch Adafactor update for other tensors. It requires Triton and the
+manual-learning-rate Adafactor arguments; if you replace `--optimizer_args`, include those three values.
+
+| Option | Purpose |
+| --- | --- |
+| `--blocks_to_swap N` | Use backward-capable block swap for trainable weights. Increase `N` when the model or activations do not fit; unlike LoRA block swap, do not add `--block_swap_h2d_only`. |
+| `--block_swap_trainable_ring` | Use coalesced bidirectional block transfers and write updated weights back to pinned CPU masters. Requires block swap, gradient checkpointing, fused backward, and `--use_pinned_memory_for_block_swap`. |
+| `--block_swap_ring_size N` | Number of reusable GPU block buffers for the trainable ring; `2` enables double buffering. |
+| `--gradient_checkpointing_cpu_offload` | Offload checkpoint activations when long packed sequences still exceed VRAM. |
+| `--mem_eff_save` | Stream native transformer tensors during `.safetensors` output; enabled by default. |
+
+For a 24 GB-class GPU, start with `--blocks_to_swap 48`, the trainable ring, and `--block_swap_ring_size 2`. Keep activation
+CPU offload disabled initially so checkpoint recomputation stays on the GPU; add `--gradient_checkpointing_cpu_offload` only
+if the chosen resolution, frame length, or conditioning mode still exceeds available VRAM.
+
+For the trainable ring, add:
+
+```shell
+  --block_swap_trainable_ring \
+  --use_pinned_memory_for_block_swap \
+  --block_swap_ring_size 2
+```
+
+Pinned CPU allocation is substantial and depends on `--blocks_to_swap`; use ordinary backward-capable block swap when the host
+cannot provide it. Dense training currently supports one process/GPU. For Ref2VA, use the Ref2VA BF16 checkpoint, a `ref2va`
+conditioning cache plus reference latents, and `--h3_training_mode ref2va`.
 
 ### Saving and resuming
 

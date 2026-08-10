@@ -109,6 +109,7 @@ class BlockSwapConfig:
     h2d_only: bool = False  # frozen-base (LoRA / LoHa / LoKr) only: H2D-only streaming, no device->host copy
     ring_size: int = 2  # (h2d_only) number of GPU ring buffers for streamed blocks; 2 = double buffering
     granularity: str = "block"  # (h2d_only) transfer packed blocks or individual frozen Linear layers
+    trainable_ring: bool = False  # dense FFT: coalesced bidirectional ring with optimizer writeback
     debug: bool = False
 
     @classmethod
@@ -139,6 +140,18 @@ class BlockSwapConfig:
             raise ValueError("--block_swap_granularity must be 'block' or 'layer'")
         if granularity == "layer" and not h2d_only:
             raise ValueError("--block_swap_granularity layer requires --block_swap_h2d_only")
+        trainable_ring = bool(getattr(args, "block_swap_trainable_ring", False))
+        if trainable_ring:
+            if h2d_only:
+                raise ValueError("--block_swap_trainable_ring cannot be combined with --block_swap_h2d_only")
+            if not supports_backward:
+                raise ValueError("--block_swap_trainable_ring requires backward-capable block swap")
+            if not getattr(args, "use_pinned_memory_for_block_swap", False):
+                raise ValueError("--block_swap_trainable_ring requires --use_pinned_memory_for_block_swap")
+            if not getattr(args, "gradient_checkpointing", False):
+                raise ValueError("--block_swap_trainable_ring requires --gradient_checkpointing")
+            if not getattr(args, "fused_backward_pass", False):
+                raise ValueError("--block_swap_trainable_ring requires --fused_backward_pass")
 
         return cls(
             device=device,
@@ -147,6 +160,7 @@ class BlockSwapConfig:
             h2d_only=h2d_only,
             ring_size=ring_size,
             granularity=granularity,
+            trainable_ring=trainable_ring,
         )
 
 
@@ -156,6 +170,18 @@ def create_offloader(block_type: str, blocks: list[nn.Module], num_blocks: int, 
     implementation from ``config``; ``enable_block_swap`` only supplies the per-block-list arguments, so a new
     offloader type plugs in here without touching any architecture.
     """
+    if config.trainable_ring:
+        return TrainableBlockRingOffloader(
+            block_type,
+            blocks,
+            num_blocks,
+            blocks_to_swap,
+            config.supports_backward,
+            config.device,
+            ring_size=config.ring_size,
+            use_pinned_memory=config.use_pinned_memory,
+            debug=config.debug,
+        )
     if config.h2d_only:
         if config.granularity == "layer":
             return LoRALinearStreamOffloader(
@@ -469,6 +495,259 @@ class Offloader:
 
         if self.debug:
             print(f"[{self.block_type}] Waited for block {block_idx}: {time.perf_counter() - start_time:.2f}s")
+
+
+class TrainableBlockRingOffloader:
+    """Coalesced bidirectional block ring for fused-backward dense training.
+
+    Each streamed block has a pinned CPU master. A small number of equally laid
+    out blocks share preallocated GPU byte buffers, so a whole block transfers
+    with one copy instead of moving each parameter separately. Fused optimizer
+    hooks update a block while it owns a ring slot; eviction writes the updated
+    payload back to its CPU master before the slot is reused.
+    """
+
+    def __init__(
+        self,
+        block_type: str,
+        blocks: list[nn.Module],
+        num_blocks: int,
+        blocks_to_swap: int,
+        supports_backward: bool,
+        device: torch.device,
+        *,
+        ring_size: int = 2,
+        use_pinned_memory: bool = True,
+        debug: bool = False,
+    ) -> None:
+        if device.type != "cuda":
+            raise ValueError("trainable block ring requires CUDA")
+        if not supports_backward:
+            raise ValueError("trainable block ring requires backward block swapping")
+        if not use_pinned_memory:
+            raise ValueError("trainable block ring requires pinned host memory")
+        if not 0 < blocks_to_swap < num_blocks:
+            raise ValueError("trainable block ring requires at least one swapped and one resident block")
+
+        self.block_type = block_type
+        self._blocks = blocks
+        self.num_blocks = num_blocks
+        self.blocks_to_swap = blocks_to_swap
+        self.device = device
+        self.supports_backward = True
+        self.forward_only = False
+        self.recompute_requires_wait = True
+        self.debug = debug
+        self.B = min(max(1, ring_size), num_blocks - blocks_to_swap)
+        stream_count = min(num_blocks, blocks_to_swap + self.B)
+        self.stream_idx = list(range(num_blocks - stream_count, num_blocks))
+        self.rank = {block_idx: rank for rank, block_idx in enumerate(self.stream_idx)}
+        self.S = len(self.stream_idx)
+        self.B = min(self.B, self.S)
+
+        self.copy_stream = torch.cuda.Stream(device=device)
+        self.cpu_flat: dict[int, torch.Tensor] = {}
+        self.ring_flat: list[torch.Tensor] = []
+        self.in_slot: list[int | None] = [None] * self.B
+        self.free_event: list[torch.cuda.Event | None] = [None] * self.B
+        self.load_event: dict[int, torch.cuda.Event] = {}
+        self._entries: dict[int, list[tuple[nn.Module, str, nn.Parameter | None]]] = {}
+        self._layout: list[tuple[int, int, torch.dtype, torch.Size]] | None = None
+        self._total_bytes = 0
+        self._prepared = False
+        self._phase = "forward"
+        self._last_wait_rank: int | None = None
+
+    @staticmethod
+    def _block_tensors(block: nn.Module) -> list[tuple[nn.Module, str, nn.Parameter | None, torch.Tensor]]:
+        entries = []
+        seen = set()
+        for module in block.modules():
+            for name, parameter in module._parameters.items():
+                if parameter is None or id(parameter) in seen:
+                    continue
+                seen.add(id(parameter))
+                entries.append((module, name, parameter, parameter.data))
+            for name, buffer in module._buffers.items():
+                if buffer is None or id(buffer) in seen:
+                    continue
+                seen.add(id(buffer))
+                entries.append((module, name, None, buffer))
+        return entries
+
+    @staticmethod
+    def _make_layout(tensors: list[torch.Tensor]) -> tuple[list[tuple[int, int, torch.dtype, torch.Size]], int]:
+        layout = []
+        total = 0
+        for tensor in tensors:
+            total = (total + 255) // 256 * 256
+            size = tensor.numel() * tensor.element_size()
+            layout.append((total, size, tensor.dtype, tensor.shape))
+            total += size
+        return layout, total
+
+    def _views(self, flat: torch.Tensor) -> list[torch.Tensor]:
+        if self._layout is None:
+            raise RuntimeError("trainable block ring layout is not initialized")
+        return [flat[offset : offset + size].view(dtype).view(shape) for offset, size, dtype, shape in self._layout]
+
+    def _bind(self, block_idx: int, flat: torch.Tensor) -> None:
+        for (module, name, parameter), view in zip(self._entries[block_idx], self._views(flat)):
+            if parameter is not None:
+                parameter.data = view
+            else:
+                module._buffers[name] = view
+
+    def _evict(self, slot: int, *, writeback: bool) -> None:
+        block_idx = self.in_slot[slot]
+        if block_idx is None:
+            return
+        with torch.cuda.stream(self.copy_stream):
+            free_event = self.free_event[slot]
+            if free_event is not None:
+                self.copy_stream.wait_event(free_event)
+            if writeback:
+                self.cpu_flat[block_idx].copy_(self.ring_flat[slot], non_blocking=True)
+        self._bind(block_idx, self.cpu_flat[block_idx])
+        self.in_slot[slot] = None
+        self.free_event[slot] = None
+        self.load_event.pop(block_idx, None)
+
+    def _load(self, rank: int, slot: int, *, writeback_owner: bool = False) -> None:
+        block_idx = self.stream_idx[rank]
+        if self.in_slot[slot] == block_idx:
+            self._bind(block_idx, self.ring_flat[slot])
+            return
+        self._evict(slot, writeback=writeback_owner)
+        with torch.cuda.stream(self.copy_stream):
+            self.ring_flat[slot].copy_(self.cpu_flat[block_idx], non_blocking=True)
+            event = torch.cuda.Event()
+            event.record(self.copy_stream)
+        self._bind(block_idx, self.ring_flat[slot])
+        self.in_slot[slot] = block_idx
+        self.load_event[block_idx] = event
+
+    def prepare_block_devices_before_forward(self, blocks: list[nn.Module]) -> None:
+        if self._prepared:
+            self.copy_stream.synchronize()
+            for rank in range(min(self.B, self.S)):
+                self._load(rank, rank)
+            return
+
+        stream_set = set(self.stream_idx)
+        self.cpu_flat.clear()
+        self._entries.clear()
+        self._layout = None
+        for block_idx, block in enumerate(blocks):
+            if block_idx not in stream_set:
+                block.to(self.device)
+                continue
+
+            block.to("cpu")
+            entries = self._block_tensors(block)
+            tensors = [entry[3] for entry in entries]
+            layout, total_bytes = self._make_layout(tensors)
+            if self._layout is None:
+                self._layout = layout
+                self._total_bytes = total_bytes
+            elif [(size, dtype, shape) for _, size, dtype, shape in layout] != [
+                (size, dtype, shape) for _, size, dtype, shape in self._layout
+            ]:
+                raise ValueError(f"{self.block_type} block {block_idx} is incompatible with the trainable ring layout")
+
+            flat = torch.empty(self._total_bytes, dtype=torch.uint8, device="cpu", pin_memory=True)
+            for source, target in zip(tensors, self._views(flat)):
+                target.copy_(source)
+            self._entries[block_idx] = [(module, name, parameter) for module, name, parameter, _ in entries]
+            self.cpu_flat[block_idx] = flat
+            self._bind(block_idx, flat)
+
+        self.ring_flat = [torch.empty(self._total_bytes, dtype=torch.uint8, device=self.device) for _ in range(self.B)]
+        self.in_slot = [None] * self.B
+        self.free_event = [None] * self.B
+        self.load_event.clear()
+        for rank in range(self.B):
+            self._load(rank, rank)
+        self._prepared = True
+        torch.cuda.current_stream(self.device).wait_stream(self.copy_stream)
+        _clean_memory_on_device(self.device)
+
+    def wait_for_block(self, block_idx: int) -> None:
+        rank = self.rank.get(block_idx)
+        if rank is None:
+            if self._phase == "backward" and self._last_wait_rank == 0 and block_idx < self.stream_idx[0]:
+                self._finish_backward_rank(0)
+                self._last_wait_rank = None
+            if block_idx == 0:
+                self._phase = "forward"
+                self._last_wait_rank = None
+            return
+
+        if self.forward_only and self._last_wait_rank is not None and rank < self._last_wait_rank:
+            self._phase = "forward"
+            self._last_wait_rank = None
+        elif self._phase == "backward" and self._last_wait_rank == 0 and rank == 0:
+            self._finish_backward_rank(0)
+            self._phase = "forward"
+            self._last_wait_rank = None
+        elif self._phase == "forward" and self._last_wait_rank is not None and rank < self._last_wait_rank:
+            self._phase = "backward"
+            self._finish_backward_rank(self._last_wait_rank)
+        elif self._phase == "backward" and self._last_wait_rank is not None and rank < self._last_wait_rank:
+            self._finish_backward_rank(self._last_wait_rank)
+
+        slot = rank % self.B
+        if self.in_slot[slot] != block_idx:
+            self._load(rank, slot)
+        event = self.load_event.get(block_idx)
+        if event is not None:
+            torch.cuda.current_stream(self.device).wait_event(event)
+        self._last_wait_rank = rank
+
+    def submit_move_blocks_forward(self, blocks: list[nn.Module], block_idx: int) -> None:
+        del blocks
+        rank = self.rank.get(block_idx)
+        if rank is None:
+            return
+        slot = rank % self.B
+        self.free_event[slot] = torch.cuda.current_stream(self.device).record_event()
+        if rank + self.B < self.S:
+            self._load(rank + self.B, slot)
+
+    def _finish_backward_rank(self, rank: int) -> None:
+        slot = rank % self.B
+        self.free_event[slot] = torch.cuda.current_stream(self.device).record_event()
+        if rank >= self.B:
+            self._load(rank - self.B, slot, writeback_owner=True)
+        else:
+            self._evict(slot, writeback=True)
+            self._load(rank, slot)
+
+    def set_forward_only(self, forward_only: bool) -> None:
+        self.copy_stream.synchronize()
+        if forward_only and self._phase == "backward" and self._last_wait_rank == 0:
+            self._finish_backward_rank(0)
+            self.copy_stream.synchronize()
+        self.forward_only = forward_only
+        self._phase = "forward"
+        self._last_wait_rank = None
+
+    def synchronize(self) -> None:
+        self.copy_stream.synchronize()
+
+    def offload_to_cpu(self, blocks: list[nn.Module]) -> None:
+        self.copy_stream.synchronize()
+        for slot in range(self.B):
+            self._evict(slot, writeback=True)
+        self.copy_stream.synchronize()
+        for block in blocks:
+            block.to("cpu")
+        self.ring_flat.clear()
+        self.load_event.clear()
+        self._prepared = False
+        self._phase = "forward"
+        self._last_wait_rank = None
+        _clean_memory_on_device(self.device)
 
 
 class ModelOffloader(Offloader):

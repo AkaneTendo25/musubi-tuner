@@ -31,10 +31,10 @@ from torch import nn
 from torch.nn import functional as F
 from torch.utils.checkpoint import checkpoint
 
+from musubi_tuner.minimax_h3.triton_kernels import try_fused_qk_norm_rope
 from musubi_tuner.modules.attention import AttentionParams
 from musubi_tuner.modules.attention import attention as musubi_attention
 from musubi_tuner.modules.custom_offloading_utils import BlockSwapConfig, create_offloader
-from musubi_tuner.minimax_h3.triton_kernels import try_fused_qk_norm_rope
 
 MINIMAX_H3_MODALITY_COUNT = 3
 _CUDNN_AUTO_WORK_THRESHOLD = 1 << 28
@@ -541,6 +541,7 @@ class MiniMaxH3Transformer(nn.Module):
     def _checkpointed_block(
         self,
         block: MiniMaxH3TransformerBlock,
+        block_index: int,
         hidden_states: torch.Tensor,
         timestep_embedding: torch.Tensor,
         adaln_indices: torch.Tensor,
@@ -548,6 +549,11 @@ class MiniMaxH3Transformer(nn.Module):
         attention_mask: torch.Tensor | None,
     ) -> torch.Tensor:
         def forward(value: torch.Tensor) -> torch.Tensor:
+            # The dense trainable ring advances from forward order to reverse
+            # order during checkpoint recomputation. Classic block swap uses
+            # module backward hooks and does not need this second wait.
+            if self.blocks_to_swap and getattr(self.offloader, "recompute_requires_wait", False):
+                self.offloader.wait_for_block(block_index)
             return block(value, timestep_embedding, adaln_indices, rotary_emb, attention_mask)
 
         if self.activation_cpu_offloading:
@@ -632,6 +638,7 @@ class MiniMaxH3Transformer(nn.Module):
             if torch.is_grad_enabled() and self.gradient_checkpointing and block_index >= checkpoint_start:
                 hidden_states = self._checkpointed_block(
                     block,
+                    block_index,
                     hidden_states,
                     timestep_embedding,
                     adaln_indices,
