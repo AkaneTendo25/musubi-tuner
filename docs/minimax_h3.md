@@ -22,6 +22,12 @@ Two released transformers, with different conditioning contracts:
 - [Training](#training)
   - [Training a guidance-distilled model](#training-a-guidance-distilled-model)
   - [Full-parameter BF16 training](#full-parameter-bf16-training)
+  - [Saving and resuming](#saving-and-resuming)
+  - [Key options](#key-options)
+  - [Memory and speed](#memory-and-speed)
+  - [Training modes](#training-modes)
+  - [Auxiliary objectives](#auxiliary-objectives)
+  - [Validation](#validation)
 - [Inference](#inference)
 - [Training dashboard](#training-dashboard)
 
@@ -146,10 +152,6 @@ target_frames = [124, 175, 243, 294, 362]
 frame_extraction = "uniform"
 ```
 
-Training supports `batch_size > 1`. Because prompts and references have variable packed lengths, items are evaluated and
-backpropagated sequentially, then their gradients are averaged into one optimizer step. This preserves mixed caption/reference
-lengths and remains compatible with block swapping and activation offload; it improves batch semantics, not throughput.
-
 `h3_target_mode` selects which modalities are packed at all:
 
 | Value | Effect |
@@ -257,8 +259,8 @@ versions.
 
 ### Training a guidance-distilled model
 
-H3 is guidance-distilled, so direct LoRA training can be inefficient or destabilize its distilled behavior. Two mitigations are
-available:
+H3 is guidance-distilled, so direct LoRA training can be inefficient or alter its CFG-free, few-step behavior. Two optional
+strategies address different goals:
 
 1. `--h3_base_preservation_loss_weight 0.02` limits drift from the frozen base. Add
    `--h3_base_preservation_probability 0.25` to evaluate it on 25% of batches with automatic inverse-probability scaling.
@@ -266,8 +268,9 @@ available:
    LoRA, then remove it for inference. One community example is
    [ostris/minimax_h3_training_adapter](https://huggingface.co/ostris/minimax_h3_training_adapter).
 
-For concept LoRA training over a de-distillation adapter, preservation with probability `0.25`–`0.5` is the recommended faster
-starting point. The adapter remains loaded only during training; the resulting concept LoRA is used against stock H3.
+For concept LoRA training over a de-distillation adapter, sparse preservation can provide an additional anchor, but the two
+objectives are not equivalent: preservation retains the loaded base's predictions, while a de-distillation adapter deliberately
+changes them. The adapter remains loaded only during LoRA training; validate the resulting concept LoRA against stock H3.
 
 The training adapter is an approximation. The community does not have MiniMax's original undistilled teacher, so no adapter can
 reliably reconstruct the ideal undistilled prediction for every prompt, timestep, modality, and concept. Validate short runs and
@@ -376,6 +379,7 @@ compact factors.
 | `--h3_convrot_int8` | Quantize the released BF16 checkpoint to ConvRot INT8 at load. Rejects `--fp8_base` and `--int8_convrot_base`. |
 | `--h3_convrot_int8_fwd bf16` | Recommended. Evaluates the matmul in BF16 without changing stored weights. |
 | `--h3_convrot_int8_bwd int8` | INT8 input-gradient path for GPUs without FP8 support. |
+| `--h3_convrot_int8_lora_fused` | Fuse LoRA application into supported ConvRot INT8 linear calls. Requires an INT8 ConvRot base and `--h3_convrot_int8_fwd int8`. |
 | `--fp8_base` | Scaled FP8. `--h3_fp8_quantization_mode` selects `block` (default, fastest), `channel`, or `tensor`. |
 | `--int8_convrot_base` | Load the released pre-quantized checkpoint instead of quantizing at load (see below). |
 | `--h3_adaln_rank 16` | Reduce the AdaLN projections, the largest parameter group (13.0B of 33.1B), to ~77M. |
@@ -479,8 +483,9 @@ fraction range can leave nothing observed.
 
 ### Auxiliary objectives
 
-Each auxiliary objective adds a no-gradient forward over the packed sequence. The overhead increases with packed sequence length
-and is therefore larger for reference-conditioned batches.
+Guidance distillation and active base preservation add no-gradient transformer forwards over the packed sequence, so their cost
+grows with sequence length and is larger for reference-conditioned batches. CREPA reuses features from the main forward and does
+not add a complete H3 forward.
 
 | Option | Purpose |
 | --- | --- |

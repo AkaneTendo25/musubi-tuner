@@ -1812,7 +1812,10 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         "--h3_base_preservation_loss_weight",
         type=float,
         default=0.0,
-        help=("optional frozen-base prediction-preservation loss weight; adds one no-grad transformer forward per batch"),
+        help=(
+            "optional frozen-base prediction-preservation loss weight; adds one no-grad transformer forward on each "
+            "batch selected by --h3_base_preservation_probability"
+        ),
     )
     parser.add_argument(
         "--h3_base_preservation_probability",

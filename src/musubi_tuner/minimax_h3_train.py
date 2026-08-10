@@ -90,7 +90,7 @@ class MiniMaxH3Trainer(MiniMaxH3NetworkTrainer):
         if args.network_args or args.network_dropout is not None or args.scale_weight_norms:
             raise ValueError("MiniMax H3 full fine-tuning does not accept LoRA network/dropout/max-norm options")
         if args.h3_base_preservation_loss_weight > 0:
-            raise ValueError("--h3_base_preservation_loss_weight is defined for adapter training, not dense full fine-tuning")
+            raise ValueError("--h3_base_preservation_loss_weight is not supported by MiniMax H3 full fine-tuning")
         if args.crepa is not None:
             raise ValueError("--crepa is not currently part of the dense H3 checkpoint")
         if args.save_precision not in (None, "bf16"):
