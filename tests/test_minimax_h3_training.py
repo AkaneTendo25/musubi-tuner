@@ -827,8 +827,12 @@ def test_h3_ref2va_packing_accepts_text_only_presentation():
     torch.testing.assert_close(layout.video_indices, torch.arange(8, 12))
 
 
-@pytest.mark.parametrize("activation_cpu_offloading", [False, True])
-def test_native_h3_t2va_backend_runs_joint_forward_and_backward(activation_cpu_offloading):
+@pytest.mark.parametrize(
+    ("activation_cpu_offloading", "reusable_activation_offload"), [(False, False), (True, False), (True, True)]
+)
+def test_native_h3_t2va_backend_runs_joint_forward_and_backward(activation_cpu_offloading, reusable_activation_offload):
+    if reusable_activation_offload and not torch.cuda.is_available():
+        pytest.skip("reusable activation offload requires CUDA")
     device = torch.device("cuda" if activation_cpu_offloading and torch.cuda.is_available() else "cpu")
     config = MiniMaxH3TransformerConfig(
         num_attention_heads=2,
@@ -848,6 +852,8 @@ def test_native_h3_t2va_backend_runs_joint_forward_and_backward(activation_cpu_o
     )
     transformer = MiniMaxH3Transformer(config).to(device)
     transformer.enable_gradient_checkpointing(activation_cpu_offloading)
+    if reusable_activation_offload:
+        transformer.enable_reusable_activation_offload()
     backend = _NativeTrainingBackend(transformer)
     video_latents = torch.randn(1, 4, 2, 4, 4, device=device)
     audio_latents = torch.randn(1, 2, 6, 3, device=device)
@@ -881,6 +887,27 @@ def test_native_h3_t2va_backend_runs_joint_forward_and_backward(activation_cpu_o
     assert transformer.blocks[0].attn.qkv_proj.weight.grad is not None
     assert torch.isfinite(transformer.blocks[0].attn.qkv_proj.weight.grad).all()
     assert transformer.activation_cpu_offloading is activation_cpu_offloading
+    if reusable_activation_offload:
+        pooled_bytes = transformer.reusable_activation_offloader.pooled_bytes
+        assert pooled_bytes > 0
+        first_video = prediction.video.detach().clone()
+        first_audio = prediction.audio.detach().clone()
+        transformer.zero_grad(set_to_none=True)
+
+        repeated = backend.predict_training(
+            transformer,
+            batch,
+            inputs.video,
+            inputs.audio,
+            inputs.video_timestep,
+            inputs.audio_timestep,
+        )
+        repeated_loss = joint_velocity_loss(repeated, inputs)
+        repeated_loss.loss.backward()
+
+        torch.testing.assert_close(repeated.video, first_video, rtol=0, atol=0)
+        torch.testing.assert_close(repeated.audio, first_audio, rtol=0, atol=0)
+        assert transformer.reusable_activation_offloader.pooled_bytes == pooled_bytes
 
 
 def test_native_h3_image_backend_runs_video_only_forward_and_backward():
@@ -2097,6 +2124,17 @@ def test_h3_pinned_activation_offload_requires_cpu_checkpoint_offload():
     MiniMaxH3NetworkTrainer().handle_model_specific_args(valid)
 
     invalid = create_parser().parse_args(["--sdpa", "--h3_gradient_checkpointing_cpu_offload_pin_memory"])
+    with pytest.raises(ValueError, match="requires --gradient_checkpointing"):
+        MiniMaxH3NetworkTrainer().handle_model_specific_args(invalid)
+
+
+def test_h3_reusable_activation_offload_requires_cpu_checkpoint_offload():
+    valid = create_parser().parse_args(
+        ["--sdpa", "--gradient_checkpointing", "--gradient_checkpointing_cpu_offload", "--h3_reusable_activation_offload"]
+    )
+    MiniMaxH3NetworkTrainer().handle_model_specific_args(valid)
+
+    invalid = create_parser().parse_args(["--sdpa", "--h3_reusable_activation_offload"])
     with pytest.raises(ValueError, match="requires --gradient_checkpointing"):
         MiniMaxH3NetworkTrainer().handle_model_specific_args(invalid)
 

@@ -331,6 +331,7 @@ rejected instead of silently restarting at step zero. Add `--autoresume` to sele
 | `--compile` | off | Regionally compile all H3 blocks with the selected backend/mode. Compatible with full gradient checkpointing and block swap; swapped Linear calls stay eager. |
 | `--h3_fused_qk_norm_rope` | off | Use the custom Triton Q/K RMSNorm+RoPE kernel outside compiled graphs. It is faster but changes BF16 rounding, so it is opt-in. |
 | `--h3_gradient_checkpointing_cpu_offload_pin_memory` | off | Pin CPU-offloaded checkpoint activations for faster transfers. Requires `--gradient_checkpointing --gradient_checkpointing_cpu_offload` and substantial free system RAM. |
+| `--h3_reusable_activation_offload` | off | Reuse pinned CPU checkpoint buffers and prefetch activations in reverse block order. Requires `--gradient_checkpointing --gradient_checkpointing_cpu_offload` and sufficient free system RAM. |
 | `--h3_gradient_checkpointing_blocks N` | all 50 | Checkpoint only the last N main blocks. This explicit speed/VRAM trade-off requires `--gradient_checkpointing` and resident eager blocks. |
 | `--h3_shift_video` / `--h3_shift_audio` | `12.0` / `3.0` | Per-modality flow shift. Both derive from one shared coordinate, so changing one never desynchronizes the other. |
 | `--timestep_sampling` | `uniform` | Use `uniform`, `sigmoid`, or `logsnr`. The dynamic-shift modes double-shift the schedule and ignore H3's temporal extent. |
@@ -369,6 +370,9 @@ accelerate launch minimax_h3_train_network.py \
   --network_module networks.lora_minimax_h3 \
   --network_dim 16 --network_alpha 16
 ```
+
+`--h3_convrot_int8_fwd {int8,bf16}`, `--h3_convrot_int8_bwd`, and the fused ConvRot LoRA path also apply to this
+pre-quantized base. Its compact AdaLN projections are already baked into the checkpoint, so do not pass `--h3_adaln_rank`.
 
 Generic LoRAs passed through `--base_weights` are merged while H3 loads. With a pre-quantized ConvRot base, only affected layers
 are dequantized, all requested LoRAs and `--base_weights_multiplier` values are accumulated in FP32, and each layer is

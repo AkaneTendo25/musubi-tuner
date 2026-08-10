@@ -31,6 +31,7 @@ from torch import nn
 from torch.nn import functional as F
 from torch.utils.checkpoint import checkpoint
 
+from musubi_tuner.minimax_h3.activation_offload import ReusableActivationOffloader
 from musubi_tuner.minimax_h3.triton_kernels import try_fused_qk_norm_rope
 from musubi_tuner.modules.attention import AttentionParams
 from musubi_tuner.modules.attention import attention as musubi_attention
@@ -422,6 +423,7 @@ class MiniMaxH3Transformer(nn.Module):
         self.gradient_checkpointing_blocks: int | None = None
         self.activation_cpu_offloading = False
         self.activation_cpu_offload_pin_memory = False
+        self.reusable_activation_offloader: ReusableActivationOffloader | None = None
         self.blocks_to_swap = 0
         self.offloader = None
         self.layer_streaming = False
@@ -444,6 +446,9 @@ class MiniMaxH3Transformer(nn.Module):
 
     def set_activation_cpu_offload_pin_memory(self, enabled: bool) -> None:
         self.activation_cpu_offload_pin_memory = bool(enabled)
+
+    def enable_reusable_activation_offload(self) -> None:
+        self.reusable_activation_offloader = ReusableActivationOffloader()
 
     def set_gradient_checkpointing_blocks(self, blocks: int | None) -> None:
         if blocks is not None and not 0 <= blocks <= len(self.blocks):
@@ -562,6 +567,9 @@ class MiniMaxH3Transformer(nn.Module):
             # returning a CPU output would immediately copy that tensor back to
             # CUDA in the following block, adding a full D2H+H2D round trip per
             # layer without reducing the tensors retained for backward.
+            if self.reusable_activation_offloader is not None:
+                with self.reusable_activation_offloader.context(block_index):
+                    return checkpoint(forward, hidden_states, use_reentrant=False)
             with torch.autograd.graph.save_on_cpu(pin_memory=self.activation_cpu_offload_pin_memory):
                 return checkpoint(forward, hidden_states, use_reentrant=False)
         return checkpoint(forward, hidden_states, use_reentrant=False)
@@ -632,6 +640,8 @@ class MiniMaxH3Transformer(nn.Module):
         checkpoint_start = (
             0 if self.gradient_checkpointing_blocks is None else len(self.blocks) - self.gradient_checkpointing_blocks
         )
+        if self.reusable_activation_offloader is not None and torch.is_grad_enabled():
+            self.reusable_activation_offloader.begin_forward()
         for block_index, block in enumerate(self.blocks):
             if self.blocks_to_swap:
                 self.offloader.wait_for_block(block_index)
