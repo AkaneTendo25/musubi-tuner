@@ -193,7 +193,7 @@ class MiniMaxH3ConditioningEncoder:
         processor: Any,
         model: Qwen3VLModel,
         output_dtype: torch.dtype,
-        task: Literal["t2va", "i2va", "fl2va", "ref2va", "ref2va_omni"],
+        task: Literal["t2va", "i2va", "fl2va", "l2va", "ref2va", "ref2va_omni"],
         reference_image_short_edge: int = REFERENCE_IMAGE_SHORT_EDGE,
     ) -> None:
         self.processor = processor
@@ -360,19 +360,23 @@ class MiniMaxH3ConditioningEncoder:
         if self.task in ("t2va", "ref2va", "ref2va_omni"):
             return None
         content = item.content
-        minimum_frames = 1 if self.task == "i2va" else 2
+        minimum_frames = 2 if self.task == "fl2va" else 1
         if not isinstance(content, np.ndarray) or content.ndim != 4 or content.shape[0] < minimum_frames:
             raise ValueError(
                 f"MiniMax H3 {self.task.upper()} conditioning requires a decoded target video with at least "
                 f"{minimum_frames} frame(s)"
             )
-        images = [Image.fromarray(content[0].astype(np.uint8))]
-        if self.task == "fl2va":
-            images.append(Image.fromarray(content[-1].astype(np.uint8)))
-        return images
+        if self.task == "i2va":
+            return [Image.fromarray(content[0].astype(np.uint8))]
+        if self.task == "l2va":
+            return [Image.fromarray(content[-1].astype(np.uint8))]
+        return [
+            Image.fromarray(content[0].astype(np.uint8)),
+            Image.fromarray(content[-1].astype(np.uint8)),
+        ]
 
     def encode_prompt(self, prompt: str, images: list[Image.Image] | None = None) -> dict[str, torch.Tensor]:
-        """Encode one FL2VA prompt with optional prepared first/last keyframes."""
+        """Encode one FL2VA-family prompt with optional prepared endpoint keyframes."""
         hidden, tags = self._encode_prompt(prompt, images)
         return {H3_TEXT_HIDDEN_KEY: hidden, H3_TEXT_TOKEN_TAGS_KEY: tags}
 

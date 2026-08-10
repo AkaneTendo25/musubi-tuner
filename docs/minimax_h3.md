@@ -9,7 +9,7 @@ Two released transformers, with different conditioning contracts:
 
 | Checkpoint | Covers |
 | --- | --- |
-| **FL2VA** | text-to-video, first-frame I2V, first+last keyframes, video-only, audio-only, still images |
+| **FL2VA** | text-to-video, first-frame I2V, first+last keyframes, last-frame L2V, video-only, audio-only, still images |
 | **Ref2VA** | arbitrary image, video, and audio references |
 
 ## Contents
@@ -52,6 +52,7 @@ Each training objective has a fixed dataset, conditioning-cache, and transformer
 | Audio-to-video | [`av.toml`](../examples/minimax_h3/av.toml): synchronized video source; `h3_target_mode = "av"` is the default | FL2VA | `t2va` | `--h3_observed_modality audio` |
 | First-frame image-to-video+audio | [`i2va.toml`](../examples/minimax_h3/i2va.toml): video source; first frame comes from the target | FL2VA | `i2va` | None |
 | First+last-frame-to-video+audio | [`fl2va.toml`](../examples/minimax_h3/fl2va.toml): video source; keyframes come from the target | FL2VA | `fl2va` | None |
+| Last-frame image-to-video+audio | [`l2va.toml`](../examples/minimax_h3/l2va.toml): video source; last frame comes from the target | FL2VA | `l2va` | None |
 | Fixed arbitrary references | [`ref2va.toml`](../examples/minimax_h3/ref2va.toml): target video plus `control_directory`, `control_path`, or numbered `control_path_N` | Ref2VA | `ref2va` | `--h3_training_mode ref2va` |
 | Zero-or-more arbitrary references | [`ref2va_omni.toml`](../examples/minimax_h3/ref2va_omni.toml): target video; JSONL may omit references or use numbered `control_path_N` | Ref2VA | `ref2va_omni` | `--h3_training_mode ref2va_omni` |
 
@@ -179,8 +180,8 @@ python minimax_h3_cache_text_encoder_outputs.py \
 Omit `--audio_vae` for image-only or video-only datasets; omit `--vae` for audio-only. Add `--cache_guidance_empty` if you plan to
 use caption dropout or the guidance objective.
 
-`--task` must match how you intend to train: `t2va` (text only), `i2va` (first frame), `fl2va` (first+last), `ref2va`,
-`ref2va_omni`. Keyframe tasks take their frames from the target video itself, not from control fields.
+`--task` must match how you intend to train: `t2va` (text only), `i2va` (first frame), `fl2va` (first+last), `l2va`
+(last frame), `ref2va`, or `ref2va_omni`. Keyframe tasks take their frames from the target video itself, not from control fields.
 
 `--reference_image_short_edge` (default 2048) resizes Ref2VA reference images to the given short edge before encoding.
 The released pipeline uses 2048; lowering it (e.g. to 768, the reference-video size) cuts the reference token count
@@ -200,10 +201,16 @@ python minimax_h3_cache_text_encoder_outputs.py \
   --dataset_config dataset.toml \
   --text_encoder /models/MiniMax-H3/text_encoders/qwen3vl_32b_minimax_h3_bf16.safetensors \
   --task fl2va --device cuda
+
+# Last-frame L2V
+python minimax_h3_cache_text_encoder_outputs.py \
+  --dataset_config dataset.toml \
+  --text_encoder /models/MiniMax-H3/text_encoders/qwen3vl_32b_minimax_h3_bf16.safetensors \
+  --task l2va --device cuda
 ```
 
 > [!IMPORTANT]
-> Regenerate both caches with the same checkout used for training. An `i2va`/`fl2va` run rejects a cache without keyframe rows
+> Regenerate both caches with the same checkout used for training. An `i2va`/`fl2va`/`l2va` run rejects a cache without keyframe rows
 > rather than silently training as `t2va`.
 
 To reduce conditioner VRAM, add `--text_encoder_quantization int8` or `nf4` to the BF16 checkpoint, or load the released

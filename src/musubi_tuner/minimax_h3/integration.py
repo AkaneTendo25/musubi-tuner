@@ -99,7 +99,7 @@ def create_conditioning_encoder(
     *,
     text_encoder: Path,
     tokenizer: Path,
-    task: Literal["t2va", "i2va", "fl2va", "ref2va"],
+    task: Literal["t2va", "i2va", "fl2va", "l2va", "ref2va", "ref2va_omni"],
     device: str | None,
     dtype: str,
     quantization: Literal["none", "int8", "nf4", "nvfp4_awq"] = "none",
@@ -284,8 +284,20 @@ class _NativeGenerator:
         logger.info("MiniMax H3 inference stage %s: %s", name, values)
         return result
 
-    def _encode_prompt(self, prompt: str, images=(), references=()) -> dict[str, torch.Tensor]:
-        task = "ref2va" if references else "t2va" if not images else "i2va" if len(images) == 1 else "fl2va"
+    @staticmethod
+    def _conditioning_task(images=(), references=(), keyframe_anchors=()) -> str:
+        if references:
+            return "ref2va"
+        if not images:
+            return "t2va"
+        if tuple(keyframe_anchors) == ("last",):
+            return "l2va"
+        if tuple(keyframe_anchors) == ("first",):
+            return "i2va"
+        return "fl2va" if len(images) > 1 else "i2va"
+
+    def _encode_prompt(self, prompt: str, images=(), references=(), keyframe_anchors=()) -> dict[str, torch.Tensor]:
+        task = self._conditioning_task(images, references, keyframe_anchors)
         encoder = create_conditioning_encoder(
             text_encoder=self.text_encoder,
             tokenizer=self.tokenizer,
@@ -437,7 +449,11 @@ class _NativeGenerator:
             gc.collect()
         else:
             images, anchors = self._prepare_keyframes(request, height, width)
-            conditioning = self._measure("text_conditioning", lambda: self._encode_prompt(request.prompt, images), metrics)
+            conditioning = self._measure(
+                "text_conditioning",
+                lambda: self._encode_prompt(request.prompt, images, keyframe_anchors=anchors),
+                metrics,
+            )
             keyframe_rows = (
                 self._measure(
                     "keyframe_encoding",
@@ -670,14 +686,14 @@ class _NativeTrainingBackend:
         elif self.mode == "ref2va_omni":
             accepted_tasks = {"ref2va_omni"}
         else:
-            accepted_tasks = {"t2va", "i2va", "fl2va"}
+            accepted_tasks = {"t2va", "i2va", "fl2va", "l2va"}
         if task not in accepted_tasks:
             expected = ", ".join(f"--task {name}" for name in sorted(accepted_tasks))
             raise ValueError(f"MiniMax H3 {self.mode} training requires {expected} conditioning; re-cache text outputs")
         has_vision = bool((text_tags == int(MiniMaxH3TokenTag.VIDEO)).any())
         if task == "t2va" and has_vision:
             raise ValueError("MiniMax H3 T2VA training requires text-only conditioning; re-cache with --task t2va")
-        if task in ("i2va", "fl2va") and not has_vision:
+        if task in ("i2va", "fl2va", "l2va") and not has_vision:
             raise ValueError(f"MiniMax H3 {task.upper()} training requires keyframe vision rows; re-cache with --task {task}")
         if task == "ref2va" and not has_vision:
             raise ValueError("MiniMax H3 Ref2VA training requires a reference presentation; re-cache with --task ref2va")
@@ -739,8 +755,8 @@ class _NativeTrainingBackend:
                 condition_video_timestep,
                 torch.ones(1, device=model_device),
             )
-        elif task in ("i2va", "fl2va"):
-            anchors = ("first",) if task == "i2va" else ("first", "last")
+        elif task in ("i2va", "fl2va", "l2va"):
+            anchors = {"i2va": ("first",), "fl2va": ("first", "last"), "l2va": ("last",)}[task]
             layout = build_t2va_packed_sequence(
                 text_tags,
                 num_latent_frames=latent_frames,
@@ -753,7 +769,7 @@ class _NativeTrainingBackend:
             )
             keyframe_rows = self._keyframe_cache(
                 batch,
-                num_anchors=len(anchors),
+                anchors=anchors,
                 rows_per_anchor=layout.num_condition_video_rows // len(anchors),
                 row_width=video_rows.shape[-1],
                 device=model_device,
@@ -960,7 +976,7 @@ class _NativeTrainingBackend:
         self,
         batch: dict,
         *,
-        num_anchors: int,
+        anchors: tuple[str, ...],
         rows_per_anchor: int,
         row_width: int,
         device: torch.device,
@@ -970,8 +986,9 @@ class _NativeTrainingBackend:
         expected_all_rows = 2 * rows_per_anchor
         if rows.shape != (expected_all_rows, row_width):
             raise ValueError(f"H3 keyframe cache has shape {tuple(rows.shape)}, expected {(expected_all_rows, row_width)}")
-        selected_rows = rows[: num_anchors * rows_per_anchor]
-        return selected_rows.to(device=device, dtype=dtype)
+        chunks = rows.split(rows_per_anchor)
+        selected = torch.cat(tuple(chunks[0 if anchor == "first" else 1] for anchor in anchors))
+        return selected.to(device=device, dtype=dtype)
 
     def _reference_cache(
         self,

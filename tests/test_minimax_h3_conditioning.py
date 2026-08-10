@@ -140,9 +140,7 @@ def test_null_conditioning_keeps_the_vision_prefix_intact():
     model = _TextModel()
     encoder = MiniMaxH3ConditioningEncoder(_Processor(), model, torch.bfloat16, "fl2va")
     content = np.zeros((2, 4, 4, 3), dtype=np.uint8)
-    result = encoder.encode_conditioning(
-        [SimpleNamespace(caption="two tokens", content=content)], include_empty=True
-    )[0]
+    result = encoder.encode_conditioning([SimpleNamespace(caption="two tokens", content=content)], include_empty=True)[0]
 
     hidden = result[f"varlen_{H3_TEXT_HIDDEN_KEY}_bfloat16"]
     empty_hidden = result[f"varlen_{H3_EMPTY_TEXT_HIDDEN_KEY}_bfloat16"]
@@ -176,6 +174,23 @@ def test_i2va_conditioning_includes_only_first_frame_vision_rows():
     item = SimpleNamespace(content=np.zeros((2, 4, 4, 3), dtype=np.uint8))
 
     hidden, tags = encoder._encode_prompt("prompt", encoder._images_for_item(item))
+
+    assert hidden.shape == (6, 5120)
+    assert tags.tolist() == [1, 1, 0, 0, 0, 1]
+    assert int((model.last_mm_token_type_ids == 1).sum()) == 1
+    assert encoder.conditioning_requires_content
+
+
+def test_l2va_conditioning_includes_only_last_frame_vision_rows():
+    model = _TextModel()
+    encoder = MiniMaxH3ConditioningEncoder(_Processor(), model, torch.bfloat16, "l2va")
+    content = np.zeros((2, 4, 4, 3), dtype=np.uint8)
+    content[-1] = 255
+    images = encoder._images_for_item(SimpleNamespace(content=content))
+
+    assert len(images) == 1
+    assert np.asarray(images[0]).min() == 255
+    hidden, tags = encoder._encode_prompt("prompt", images)
 
     assert hidden.shape == (6, 5120)
     assert tags.tolist() == [1, 1, 0, 0, 0, 1]

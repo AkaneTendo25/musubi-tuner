@@ -1162,6 +1162,19 @@ def test_native_generator_compiles_all_inference_block_regions(monkeypatch, tmp_
     assert captured["args"].compile_fallback_to_eager is True
 
 
+@pytest.mark.parametrize(
+    ("images", "anchors", "expected"),
+    (
+        ((), (), "t2va"),
+        ((object(),), ("first",), "i2va"),
+        ((object(),), ("last",), "l2va"),
+        ((object(), object()), ("first", "last"), "fl2va"),
+    ),
+)
+def test_native_generator_routes_endpoint_conditioning_task(images, anchors, expected):
+    assert h3_integration._NativeGenerator._conditioning_task(images=images, keyframe_anchors=anchors) == expected
+
+
 def test_native_generator_selects_ref2va_checkpoint_contract(tmp_path):
     request = H3GenerationRequest(
         "prompt",

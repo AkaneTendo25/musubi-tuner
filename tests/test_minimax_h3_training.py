@@ -973,7 +973,7 @@ def test_native_h3_t2va_backend_rejects_visual_conditioning_without_keyframe_lat
         )
 
 
-@pytest.mark.parametrize(("task", "text_tags"), (("i2va", [1, 0, 1]), ("fl2va", [1, 0, 0, 1])))
+@pytest.mark.parametrize(("task", "text_tags"), (("i2va", [1, 0, 1]), ("fl2va", [1, 0, 0, 1]), ("l2va", [1, 0, 1])))
 @pytest.mark.parametrize("with_audio", [True, False])
 def test_native_h3_fl2va_backend_runs_keyframe_conditioned_target_only_backward(task, text_tags, with_audio):
     config = MiniMaxH3TransformerConfig(
@@ -1021,6 +1021,22 @@ def test_native_h3_fl2va_backend_runs_keyframe_conditioned_target_only_backward(
     assert prediction.audio is None if audio is None else prediction.audio.shape == audio.shape
     assert torch.isfinite(loss)
     assert transformer.blocks[0].attn.qkv_proj.weight.grad is not None
+
+
+def test_native_h3_l2va_selects_last_cached_keyframe_rows():
+    batch = {H3_KEYFRAME_VIDEO_ROWS_KEY: [torch.stack((torch.zeros(16), torch.ones(16)))]}
+    backend = _NativeTrainingBackend(SimpleNamespace(config=SimpleNamespace()), mode="fl2va")
+
+    selected = backend._keyframe_cache(
+        batch,
+        anchors=("last",),
+        rows_per_anchor=1,
+        row_width=16,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+
+    assert torch.equal(selected, torch.ones(1, 16))
 
 
 def test_native_h3_i2va_backend_requires_recached_keyframe_latents():
