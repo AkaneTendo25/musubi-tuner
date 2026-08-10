@@ -32,8 +32,6 @@ class H3AudioDataset(BaseDataset):
             cache_directory=value("cache_directory"),
             architecture=ARCHITECTURE_MINIMAX_H3,
         )
-        if self.batch_size != 1:
-            raise ValueError("MiniMax H3 audio training requires batch_size = 1")
         audio_directory = value("audio_directory")
         audio_jsonl_file = value("audio_jsonl_file")
         if bool(audio_directory) == bool(audio_jsonl_file):

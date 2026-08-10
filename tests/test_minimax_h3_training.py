@@ -1,4 +1,5 @@
 from contextlib import nullcontext
+import shutil
 from types import SimpleNamespace
 
 import pytest
@@ -1410,21 +1411,38 @@ def test_standard_bucket_manager_loads_h3_joint_cache_without_shared_schema_chan
     )
     save_file({"h3_dino_features": torch.zeros(2, 4, 384, dtype=torch.float16)}, dino_path)
 
-    manager = BucketBatchManager({(64, 64): [item]}, batch_size=1)
+    latent_path_2 = tmp_path / "sample2_mmh3.safetensors"
+    text_path_2 = tmp_path / "sample2_mmh3_te.safetensors"
+    dino_path_2 = tmp_path / "sample2_mmh3_dino.safetensors"
+    shutil.copyfile(latent_path, latent_path_2)
+    shutil.copyfile(dino_path, dino_path_2)
+    item_2 = ItemInfo("sample2", "longer caption", (64, 64), (64, 64), latent_cache_path=str(latent_path_2))
+    item_2.text_encoder_output_cache_path = str(text_path_2)
+    save_text_encoder_output_cache_minimax_h3(
+        item_2,
+        {
+            f"varlen_{H3_TEXT_HIDDEN_KEY}_float32": torch.zeros(3, 5120),
+            f"varlen_{H3_TEXT_TOKEN_TAGS_KEY}_int64": torch.ones(3, dtype=torch.long),
+            H3_CONDITIONING_TASK_KEY: torch.tensor(H3_CONDITIONING_TASK_IDS["t2va"]),
+        },
+    )
+
+    manager = BucketBatchManager({(64, 64): [item, item_2]}, batch_size=2)
     manager.load_h3_dino_features = load_dino
     batch = manager[0]
 
-    assert batch["latents"].shape == (1, 24, 2, 2, 2)
-    assert batch[H3_AUDIO_LATENTS_KEY].shape == (1, 2, 32, 3)
-    assert batch[H3_AUDIO_LOSS_MASK_KEY].shape == (1, 3)
+    assert batch["latents"].shape == (2, 24, 2, 2, 2)
+    assert batch[H3_AUDIO_LATENTS_KEY].shape == (2, 2, 32, 3)
+    assert batch[H3_AUDIO_LOSS_MASK_KEY].shape == (2, 3)
     assert isinstance(batch[H3_TEXT_HIDDEN_KEY], list)
     assert batch[H3_TEXT_HIDDEN_KEY][0].shape == (2, 5120)
+    assert batch[H3_TEXT_HIDDEN_KEY][1].shape == (3, 5120)
     assert batch[H3_REFERENCE_KINDS_KEY][0].tolist() == [0, 2]
     assert batch[H3_REFERENCE_VIDEO_ROWS_KEY][0].shape == (1, 96)
     assert batch[H3_REFERENCE_AUDIO_ROWS_KEY][0].shape == (2, 32)
     assert batch[H3_KEYFRAME_VIDEO_ROWS_KEY][0].shape == (2, 96)
     if load_dino:
-        assert batch["h3_dino_features"].shape == (1, 2, 4, 384)
+        assert batch["h3_dino_features"].shape == (2, 2, 4, 384)
     else:
         assert "h3_dino_features" not in batch
 
@@ -1595,6 +1613,10 @@ class _FakeAccelerator:
     def unwrap_model(model):
         return model
 
+    @staticmethod
+    def backward(loss):
+        loss.backward()
+
 
 class _ScaleTransformer(nn.Module):
     def __init__(self):
@@ -1707,6 +1729,75 @@ def test_h3_trainer_joint_process_batch_routes_optional_guidance(guidance_scale,
     assert transformer.scale.grad is not None and torch.isfinite(transformer.scale.grad)
     assert set(metrics) == {"loss/video", "loss/audio", "h3/sigma_video", "h3/sigma_audio"}
     assert metrics["loss/audio"] == 0.0
+
+
+def test_h3_batch_two_matches_two_independent_items_and_averages_gradients():
+    args = create_parser().parse_args([])
+    batch = {
+        H3_AUDIO_LATENTS_KEY: torch.zeros(2, 2, 32, 3),
+        H3_AUDIO_LOSS_MASK_KEY: torch.zeros(2, 3, dtype=torch.bool),
+        "timesteps": [0.5, 0.5],
+        H3_TEXT_HIDDEN_KEY: [torch.zeros(1, 5120), torch.zeros(3, 5120)],
+        H3_TEXT_TOKEN_TAGS_KEY: [torch.ones(1, dtype=torch.long), torch.ones(3, dtype=torch.long)],
+    }
+    video = torch.stack((torch.zeros(24, 2, 2, 2), torch.ones(24, 2, 2, 2)))
+    noise = torch.stack((torch.ones(24, 2, 2, 2), torch.full((24, 2, 2, 2), 2.0)))
+
+    batched_trainer = MiniMaxH3NetworkTrainer()
+    batched_trainer.dit_dtype = torch.float32
+    batched_backend = _FakeBackend()
+    batched_trainer.backend = batched_backend
+    batched_transformer = _ScaleTransformer()
+    torch.manual_seed(123)
+    batched_loss, batched_metrics = batched_trainer.process_batch(
+        args,
+        _FakeAccelerator(),
+        batched_transformer,
+        None,
+        batch,
+        video,
+        noise,
+        None,
+        torch.float32,
+        torch.float32,
+        None,
+        0,
+    )
+    batched_trainer.backward_loss(_FakeAccelerator(), batched_loss)
+
+    single_trainer = MiniMaxH3NetworkTrainer()
+    single_trainer.dit_dtype = torch.float32
+    single_backend = _FakeBackend()
+    single_trainer.backend = single_backend
+    single_transformer = _ScaleTransformer()
+    torch.manual_seed(123)
+    single_results = [
+        single_trainer.process_batch(
+            args,
+            _FakeAccelerator(),
+            single_transformer,
+            None,
+            single_trainer._slice_batch_item(batch, index, 2),
+            video[index : index + 1],
+            noise[index : index + 1],
+            None,
+            torch.float32,
+            torch.float32,
+            None,
+            0,
+        )
+        for index in range(2)
+    ]
+    single_loss = torch.stack([loss for loss, _ in single_results]).mean()
+    single_loss.backward()
+
+    torch.testing.assert_close(batched_loss, single_loss)
+    torch.testing.assert_close(batched_transformer.scale.grad, single_transformer.scale.grad)
+    assert batched_backend.calls == [("prompt", True), ("prompt", True)]
+    assert single_backend.calls == batched_backend.calls
+    for key in batched_metrics:
+        expected = sum(metrics.get(key, 0.0) for _, metrics in single_results) / 2
+        assert batched_metrics[key] == pytest.approx(expected)
 
 
 def _caption_dropout_batch():

@@ -1236,6 +1236,10 @@ class NetworkTrainer:
         output = self.call_dit(args, accelerator, transformer, latents, batch, noise, noisy_model_input, timesteps, network_dtype)
         return self.compute_loss(args, output, timesteps, noise_scheduler, dit_dtype, network_dtype, global_step)
 
+    def backward_loss(self, accelerator: Accelerator, loss: torch.Tensor) -> None:
+        """Backpropagate a loss returned by :meth:`process_batch`."""
+        accelerator.backward(loss)
+
     def get_primary_latents(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
         """Return the tensor used by the common loop for noise/schedule setup."""
         return batch["latents"]
@@ -2286,7 +2290,7 @@ class NetworkTrainer:
                     )
 
                     grad_metrics = {}
-                    accelerator.backward(loss)
+                    self.backward_loss(accelerator, loss)
                     if accelerator.sync_gradients:
                         # self.all_reduce_network(accelerator, network)  # sync DDP grad manually
                         state = accelerate.PartialState()

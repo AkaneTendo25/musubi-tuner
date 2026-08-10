@@ -1205,9 +1205,99 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         vae,
         global_step: int,
     ) -> tuple[torch.Tensor, dict[str, float]]:
+        self._batch_backward_performed = False
+        batch_size = int(latents.shape[0])
+        if batch_size < 1:
+            raise ValueError("MiniMax H3 training received an empty batch")
+        if batch_size == 1:
+            return self._process_single_batch(
+                args,
+                accelerator,
+                transformer,
+                network,
+                batch,
+                latents,
+                noise,
+                noise_scheduler,
+                dit_dtype,
+                network_dtype,
+                vae,
+                global_step,
+            )
+
+        # The released H3 transformer accepts one shared packed layout, while
+        # prompts, references and task presentations are variable-length. Run
+        # each packed item independently and backpropagate its scaled loss
+        # immediately, so padding cannot leak through attention and only one
+        # block-swap/checkpoint graph is alive at a time.
+        preservation_active = args.h3_base_preservation_loss_weight > 0 and self._base_preservation_active(
+            accelerator, args.h3_base_preservation_probability
+        )
+        losses: list[torch.Tensor] = []
+        item_metrics: list[dict[str, float]] = []
+        for index in range(batch_size):
+            item_loss, metrics = self._process_single_batch(
+                args,
+                accelerator,
+                transformer,
+                network,
+                self._slice_batch_item(batch, index, batch_size),
+                latents[index : index + 1],
+                noise[index : index + 1],
+                noise_scheduler,
+                dit_dtype,
+                network_dtype,
+                vae,
+                global_step,
+                preservation_active_override=preservation_active,
+            )
+            accelerator.backward(item_loss / batch_size)
+            losses.append(item_loss.detach())
+            item_metrics.append(metrics)
+
+        metric_keys = set().union(*(metrics.keys() for metrics in item_metrics))
+        averaged_metrics = {key: sum(metrics.get(key, 0.0) for metrics in item_metrics) / batch_size for key in metric_keys}
+        self._batch_backward_performed = True
+        return torch.stack(losses).mean(), averaged_metrics
+
+    def backward_loss(self, accelerator: Accelerator, loss: torch.Tensor) -> None:
+        if getattr(self, "_batch_backward_performed", False):
+            self._batch_backward_performed = False
+            return
+        super().backward_loss(accelerator, loss)
+
+    @staticmethod
+    def _slice_batch_item(batch: dict, index: int, batch_size: int) -> dict:
+        item = {}
+        for key, value in batch.items():
+            if isinstance(value, torch.Tensor) and value.ndim > 0 and value.shape[0] == batch_size:
+                item[key] = value[index : index + 1]
+            elif isinstance(value, list) and len(value) == batch_size:
+                item[key] = [value[index]]
+            elif isinstance(value, tuple) and len(value) == batch_size:
+                item[key] = (value[index],)
+            else:
+                item[key] = value
+        return item
+
+    def _process_single_batch(
+        self,
+        args: argparse.Namespace,
+        accelerator: Accelerator,
+        transformer,
+        network,
+        batch: dict[str, torch.Tensor],
+        latents: torch.Tensor,
+        noise: torch.Tensor,
+        noise_scheduler,
+        dit_dtype: torch.dtype,
+        network_dtype: torch.dtype,
+        vae,
+        global_step: int,
+        *,
+        preservation_active_override: bool | None = None,
+    ) -> tuple[torch.Tensor, dict[str, float]]:
         del network_dtype, vae
-        if latents.shape[0] != 1:
-            raise ValueError("MiniMax H3 training requires dataset batch_size = 1")
         has_video = "latents" in batch or latents.ndim == 5
         has_audio = H3_AUDIO_LATENTS_KEY in batch
         if not has_video and not has_audio:
@@ -1314,8 +1404,10 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                     gradient_checkpointing=False,
                 )
         reference_prediction = None
-        preservation_active = args.h3_base_preservation_loss_weight > 0 and self._base_preservation_active(
-            accelerator, args.h3_base_preservation_probability
+        preservation_active = args.h3_base_preservation_loss_weight > 0 and (
+            self._base_preservation_active(accelerator, args.h3_base_preservation_probability)
+            if preservation_active_override is None
+            else preservation_active_override
         )
         if preservation_active:
             if network is None:

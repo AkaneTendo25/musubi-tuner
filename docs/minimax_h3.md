@@ -146,6 +146,10 @@ target_frames = [124, 175, 243, 294, 362]
 frame_extraction = "uniform"
 ```
 
+Training supports `batch_size > 1`. Because prompts and references have variable packed lengths, items are evaluated and
+backpropagated sequentially, then their gradients are averaged into one optimizer step. This preserves mixed caption/reference
+lengths and remains compatible with block swapping and activation offload; it improves batch semantics, not throughput.
+
 `h3_target_mode` selects which modalities are packed at all:
 
 | Value | Effect |
