@@ -312,7 +312,7 @@
 						checked={entry.loss_mask_use_alpha ?? false}
 						onchange={(e) => updateField('loss_mask_use_alpha', e.target.checked)}
 						disabled={isAudio}
-						tooltip="Use the target image alpha channel as the mask when no mask directory is set."
+						tooltip="Use the target image alpha channel when no external mask is available. Mask files with alpha use it automatically."
 					/>
 					<FormToggle
 						label="Invert"
