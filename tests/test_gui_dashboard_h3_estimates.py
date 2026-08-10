@@ -1,6 +1,7 @@
 from musubi_tuner.gui_dashboard.routers.stats import (
     _calculate_training_stats,
     _estimate_training_step_time_sec,
+    _gpu_time_coefficient,
 )
 
 
@@ -57,7 +58,27 @@ def test_h3_extra_forwards_and_transfer_features_change_time_directionally():
     assert bidirectional_swap > base
 
 
-def test_h3_stats_identify_empirical_source():
+def test_h3_gpu_coefficients_scale_the_same_configuration():
+    fastest = _estimate_training_step_time_sec(_config(), "NVIDIA B200")
+    reference = _estimate_training_step_time_sec(_config(), "NVIDIA H100 80GB HBM3")
+    consumer = _estimate_training_step_time_sec(_config(), "NVIDIA GeForce RTX 4090")
+    older = _estimate_training_step_time_sec(_config(), "NVIDIA GeForce RTX 3090")
+    assert fastest < reference < consumer < older
+    assert _gpu_time_coefficient("NVIDIA A100-SXM4-80GB") == 1.45
+
+
+def test_h3_stats_identify_hardware_adjusted_source(monkeypatch):
+    monkeypatch.setattr("musubi_tuner.gui_dashboard.routers.stats._detect_local_gpu_name", lambda: None)
     stats = _calculate_training_stats(_config(), None)
     assert stats is not None
-    assert stats.estimated_time_source == "H3 H100 calibrated model"
+    assert stats.estimated_time_source == "Hardware-adjusted estimate"
+
+
+def test_h3_stats_include_detected_gpu_name(monkeypatch):
+    monkeypatch.setattr(
+        "musubi_tuner.gui_dashboard.routers.stats._detect_local_gpu_name",
+        lambda: "NVIDIA GeForce RTX 4090",
+    )
+    stats = _calculate_training_stats(_config(), None)
+    assert stats is not None
+    assert stats.estimated_time_source == "Hardware-adjusted estimate (NVIDIA GeForce RTX 4090)"

@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import subprocess
+from functools import lru_cache
 from pathlib import Path
 
 from fastapi import APIRouter, Request
@@ -92,14 +94,80 @@ def _first_training_dataset(config: dict) -> dict:
     return next((d for d in datasets if d.get("type") in ("video", "image")), datasets[0])
 
 
-def _estimate_training_step_time_sec(config: dict) -> float | None:
+@lru_cache(maxsize=1)
+def _detect_local_gpu_name() -> str | None:
+    """Return the selected CUDA GPU name without importing a CUDA runtime."""
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+        names = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+        if not names:
+            return None
+        visible = os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",", 1)[0].strip()
+        if visible.isdigit() and int(visible) < len(names):
+            return names[int(visible)]
+        return names[0]
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def _gpu_time_coefficient(gpu_name: str | None) -> float:
+    """Synthetic wall-time multiplier for common CUDA GPU families.
+
+    These coefficients intentionally combine tensor throughput and memory
+    bandwidth instead of using peak FLOPS alone. They are approximate and are
+    ordered from specific product matches to conservative family fallbacks.
+    """
+    name = (gpu_name or "").lower()
+    coefficients = (
+        (("b200",), 0.55),
+        (("b100",), 0.65),
+        (("h200",), 0.90),
+        (("h100",), 1.00),
+        (("rtx pro 6000 blackwell", "rtx 6000 blackwell"), 0.85),
+        (("geforce rtx 5090", "rtx 5090"), 0.80),
+        (("a100-sxm", "a100 sxm"), 1.45),
+        (("a100-pcie", "a100 pcie"), 1.65),
+        (("a100",), 1.55),
+        (("l40s",), 1.85),
+        (("rtx 6000 ada",), 1.90),
+        (("geforce rtx 4090", "rtx 4090"), 1.75),
+        (("l40",), 2.05),
+        (("geforce rtx 5080", "rtx 5080"), 1.55),
+        (("geforce rtx 4080", "rtx 4080"), 2.30),
+        (("a6000",), 2.75),
+        (("geforce rtx 3090", "rtx 3090"), 2.85),
+        (("geforce rtx 3080", "rtx 3080"), 3.55),
+        (("a40",), 3.00),
+        (("l4",), 4.10),
+    )
+    for aliases, coefficient in coefficients:
+        if any(alias in name for alias in aliases):
+            return coefficient
+    if "blackwell" in name:
+        return 0.90
+    if "hopper" in name:
+        return 1.05
+    if "ada" in name:
+        return 2.20
+    if "ampere" in name:
+        return 2.80
+    return 1.75 if gpu_name else 1.00
+
+
+def _estimate_training_step_time_sec(config: dict, gpu_name: str | None = None) -> float | None:
     """Estimate wall-clock seconds per optimizer step from the current config."""
     try:
         training = config.get("training", {})
         dataset = _first_training_dataset(config)
 
         if training.get("model_type") == "minimax_h3":
-            return _estimate_h3_training_step_time_sec(training, dataset)
+            return _estimate_h3_training_step_time_sec(training, dataset) * _gpu_time_coefficient(gpu_name)
 
         mode = str(training.get("ltx2_mode", "video")).lower()
         res_w = max(_coerce_int(dataset.get("resolution_w", 768), 768), 64)
@@ -154,7 +222,7 @@ def _estimate_training_step_time_sec(config: dict) -> float | None:
 
 
 def _estimate_h3_training_step_time_sec(training: dict, dataset: dict) -> float:
-    """Estimate an H3 LoRA optimizer step on an H100 80GB HBM3 GPU.
+    """Estimate an H3 LoRA optimizer step from the normalized reference curve.
 
     The 832x480x124 reference is calibrated from real BF16 LoRA runs. Factors
     describe average steady-state work; checkpoint loading and saving are not
@@ -379,7 +447,8 @@ def _calculate_training_stats(config: dict, dataset_stats: DatasetStats | None) 
 
         # Estimated time from the same shape/config heuristic used for iteration time.
         estimated_time_hours = None
-        estimated_step_time_sec = _estimate_training_step_time_sec(config)
+        gpu_name = _detect_local_gpu_name() if training.get("model_type") == "minimax_h3" else None
+        estimated_step_time_sec = _estimate_training_step_time_sec(config, gpu_name)
         estimated_steps_per_sec = (1.0 / estimated_step_time_sec) if estimated_step_time_sec else None
         if max_steps:
             estimated_time_hours = (max_steps * (estimated_step_time_sec or 0)) / 3600
@@ -419,7 +488,9 @@ def _calculate_training_stats(config: dict, dataset_stats: DatasetStats | None) 
             estimated_step_time_sec=round(estimated_step_time_sec, 3) if estimated_step_time_sec else None,
             estimated_steps_per_sec=round(estimated_steps_per_sec, 4) if estimated_steps_per_sec else None,
             estimated_time_source=(
-                "H3 H100 calibrated model"
+                f"Hardware-adjusted estimate ({gpu_name})"
+                if estimated_step_time_sec and training.get("model_type") == "minimax_h3" and gpu_name
+                else "Hardware-adjusted estimate"
                 if estimated_step_time_sec and training.get("model_type") == "minimax_h3"
                 else "heuristic"
                 if estimated_step_time_sec
