@@ -625,6 +625,8 @@ def _build_h3_training_cmd(config: ProjectConfig) -> list[str]:
         cmd += ["--h3_gradient_checkpointing_blocks", str(t.h3_gradient_checkpointing_blocks)]
     if t.h3_gradient_checkpointing_cpu_offload_pin_memory:
         cmd.append("--h3_gradient_checkpointing_cpu_offload_pin_memory")
+    if t.h3_reusable_activation_offload:
+        cmd.append("--h3_reusable_activation_offload")
     if t.use_pinned_memory_for_block_swap:
         cmd.append("--use_pinned_memory_for_block_swap")
     if getattr(t, "block_swap_h2d_only", False):

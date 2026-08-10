@@ -521,7 +521,7 @@ def validate_training_config(config: ProjectConfig) -> dict[str, Any]:
             ("h3_caption_dropout_rate", t.h3_caption_dropout_rate, "H3 Caption Dropout"),
         ):
             numeric = float(value)
-            if not math.isfinite(numeric) or numeric < 0 or (field == "h3_caption_dropout_rate" and numeric > 1):
+            if not math.isfinite(numeric) or numeric < 0 or numeric > 1:
                 errors.append(
                     _make_issue(
                         "error",
@@ -541,7 +541,7 @@ def validate_training_config(config: ProjectConfig) -> dict[str, Any]:
                     page="caching",
                 )
             )
-        if t.h3_mask_mode != "off" and not 0 <= t.h3_mask_min_fraction <= t.h3_mask_max_fraction <= 1:
+        if t.h3_mask_mode != "off" and not 0 < t.h3_mask_min_fraction <= t.h3_mask_max_fraction <= 1:
             errors.append(
                 _make_issue(
                     "error",
@@ -558,6 +558,69 @@ def validate_training_config(config: ProjectConfig) -> dict[str, Any]:
                     "training.h3_keyframe_random_count",
                     "Choose explicit H3 keyframe anchors or a random count, not both.",
                     label="H3 Keyframes",
+                    page="training",
+                )
+            )
+        keyframes = bool(t.h3_keyframe_anchors or t.h3_keyframe_random_count)
+        extension = bool(t.h3_extension_video_frames or t.h3_extension_audio_latents)
+        masking = bool(t.h3_mask_mode != "off" or t.h3_mask_audio)
+        if keyframes and extension:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.h3_keyframe_anchors",
+                    "H3 keyframes and extension both claim observed rows; enable only one.",
+                    label="H3 Conditioning",
+                    page="training",
+                )
+            )
+        if keyframes and masking:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.h3_keyframe_anchors",
+                    "H3 keyframes and masked conditioning both claim observed rows; enable only one.",
+                    label="H3 Conditioning",
+                    page="training",
+                )
+            )
+        if extension and masking:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.h3_extension_video_frames",
+                    "H3 extension and masked conditioning both claim observed rows; enable only one.",
+                    label="H3 Conditioning",
+                    page="training",
+                )
+            )
+        if (keyframes or extension or masking) and t.h3_training_mode != "fl2va":
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.h3_training_mode",
+                    "H3 keyframes, extension, and masked conditioning require FL2VA training mode.",
+                    label="H3 Training Mode",
+                    page="training",
+                )
+            )
+        if (extension or masking) and config.caching.h3_task != "t2va":
+            errors.append(
+                _make_issue(
+                    "error",
+                    "caching.h3_task",
+                    "H3 extension and masked conditioning require T2VA caches.",
+                    label="H3 Conditioning Task",
+                    page="caching",
+                )
+            )
+        if t.h3_frame_sigma_jitter > 0 and (keyframes or extension or masking or t.h3_observed_modality is not None):
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.h3_frame_sigma_jitter",
+                    "H3 frame sigma jitter cannot be combined with observed-modality, extension, keyframe, or masked conditioning.",
+                    label="H3 Frame Sigma Jitter",
                     page="training",
                 )
             )
@@ -677,6 +740,16 @@ def validate_training_config(config: ProjectConfig) -> dict[str, Any]:
                     page="training",
                 )
             )
+        if t.h3_reusable_activation_offload and not (t.gradient_checkpointing and t.gradient_checkpointing_cpu_offload):
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.h3_reusable_activation_offload",
+                    "Reusable H3 activation offload requires gradient checkpointing with CPU offload.",
+                    label="Reusable Activation Offload",
+                    page="training",
+                )
+            )
         unsupported_quantization = (
             ("int8_base", "int8 Base"),
             ("int8_base_dynamic", "int8 Base (dynamic)"),
@@ -702,6 +775,16 @@ def validate_training_config(config: ProjectConfig) -> dict[str, Any]:
                 )
         has_sample_prompts = _has_text(t.sample_prompts) or _has_text(t.sample_prompts_text)
         sampling_scheduled = bool(t.sample_at_first or t.sample_every_n_steps or t.sample_every_n_epochs)
+        if has_sample_prompts and t.h3_training_mode != "fl2va":
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.sample_prompts",
+                    "MiniMax H3 training-time sampling currently supports only FL2VA; use the Inference page for Ref2VA samples.",
+                    label="Sample Prompts",
+                    page="training",
+                )
+            )
         if sampling_scheduled and not has_sample_prompts:
             errors.append(
                 _make_issue(

@@ -265,6 +265,7 @@ class TrainingConfig(BaseModel):
     h3_convrot_int8_lora_fused: bool = False
     h3_gradient_checkpointing_blocks: Optional[int] = None
     h3_gradient_checkpointing_cpu_offload_pin_memory: bool = False
+    h3_reusable_activation_offload: bool = False
     vae: str = ""
     gemma_root: str = ""
     gemma_safetensors: str = ""

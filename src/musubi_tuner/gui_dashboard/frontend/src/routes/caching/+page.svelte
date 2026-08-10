@@ -57,6 +57,11 @@
 	});
 
 	function updateCaching(key, value) { updateSection('caching', key, value); }
+	function updateH3ReferenceShortEdge(value) {
+		updateSection('caching', 'h3_reference_image_short_edge', value);
+		updateSection('training', 'reference_image_short_edge', value);
+		updateSection('inference', 'h3_reference_image_short_edge', value);
+	}
 
 	let caching = $derived($projectConfig?.caching || {});
 	let latentStatus = $derived($processStatuses.cache_latents || { state: 'idle', exit_code: null });
@@ -420,11 +425,11 @@
 				<div class="grid grid-cols-2 xl:grid-cols-4 gap-3">
 					<PathInput fieldPath="caching.h3_text_encoder" value={caching.h3_text_encoder || ''} oninput={(e) => updateCaching('h3_text_encoder', e.target.value)} showFiles tooltip="MiniMax H3 Qwen3-VL checkpoint: released BF16 or prequantized Comfy NVFP4/AWQ safetensors." />
 					<PathInput fieldPath="caching.h3_tokenizer" value={caching.h3_tokenizer || ''} oninput={(e) => updateCaching('h3_tokenizer', e.target.value)} showFiles tooltip="MiniMax H3 tokenizer and processor directory" />
-					<FormSelect fieldPath="caching.h3_task" value={caching.h3_task || 't2va'} options={['t2va', 'i2va', 'fl2va', 'l2va', 'ref2va', 'ref2va_omni']} onchange={(e) => updateCaching('h3_task', e.target.value)} tooltip="H3 conditioning cache task" />
+					<FormSelect fieldPath="caching.h3_task" value={caching.h3_task || 't2va'} options={['t2va', 'i2va', 'fl2va', 'l2va', 'ref2va', 'ref2va_omni']} onchange={(e) => updateCaching('h3_task', e.target.value)} tooltip="FL2VA training accepts T2VA, I2VA, FL2VA, or L2VA caches. Ref2VA and Ref2VA Omni training require their matching cache task." />
 					<FormSelect fieldPath="caching.h3_text_encoder_dtype" value={caching.h3_text_encoder_dtype || 'bfloat16'} options={[{ value: 'bfloat16', label: 'BF16' }]} onchange={(e) => updateCaching('h3_text_encoder_dtype', e.target.value)} tooltip="MiniMax H3 Qwen3-VL conditioning and cached layer-50 outputs require BF16." />
 					<FormField type="number" fieldPath="caching.cache_batch_size" value={caching.cache_batch_size ?? ''} oninput={(e) => updateCaching('cache_batch_size', e.target.value ? Number(e.target.value) : null)} min={1} placeholder="Automatic" tooltip="Batch size passed to both H3 cache stages" />
-					<FormField type="number" fieldPath="caching.h3_reference_image_short_edge" value={caching.h3_reference_image_short_edge ?? 2048} oninput={(e) => updateCaching('h3_reference_image_short_edge', Number(e.target.value || 2048))} min={64} step={8} tooltip="Reference image size shared by caching, training, and inference" />
-					<FormToggle fieldPath="caching.h3_cache_guidance_empty" checked={caching.h3_cache_guidance_empty ?? false} onchange={(e) => updateCaching('h3_cache_guidance_empty', e.target.checked)} tooltip="Also cache empty-text conditioning for guidance distillation" />
+					<FormField type="number" fieldPath="caching.h3_reference_image_short_edge" value={caching.h3_reference_image_short_edge ?? 2048} oninput={(e) => updateH3ReferenceShortEdge(Number(e.target.value || 2048))} min={64} step={8} tooltip="Shared reference-image size for H3 caching, training, and inference. Changing it here updates all three stages." />
+					<FormToggle fieldPath="caching.h3_cache_guidance_empty" checked={caching.h3_cache_guidance_empty ?? false} onchange={(e) => updateCaching('h3_cache_guidance_empty', e.target.checked)} tooltip="Also cache empty-text conditioning required by guidance training and caption dropout." />
 				</div>
 			{:else}
 			{#if modelStatus}

@@ -20,6 +20,11 @@
 	import { onMount } from 'svelte';
 
 	function update(key, value) { updateSection('training', key, value); }
+	function updateH3ReferenceShortEdge(value) {
+		updateSection('caching', 'h3_reference_image_short_edge', value);
+		updateSection('training', 'reference_image_short_edge', value);
+		updateSection('inference', 'h3_reference_image_short_edge', value);
+	}
 	const quantizedBaseModeKeys = [
 		'int8_base',
 		'int8_base_dynamic',
@@ -506,14 +511,14 @@
 									<div class="grid grid-cols-1 md:grid-cols-2 gap-2">
 										<FormSelect fieldPath="training.h3_observed_modality" value={t.h3_observed_modality || ''} options={[{value:'',label:'Joint video + audio'},{value:'video',label:'Observe video · train audio'},{value:'audio',label:'Observe audio · train video'},{value:'random',label:'Random task each step'}]} onchange={(e) => update('h3_observed_modality', e.target.value || null)} tooltip="Train joint generation, Foley, audio-driven video, or randomly mix all three tasks" />
 										<FormField type="number" fieldPath="training.h3_caption_dropout_rate" value={t.h3_caption_dropout_rate ?? 0} oninput={(e) => update('h3_caption_dropout_rate', Number(e.target.value || 0))} min={0} max={1} step="0.05" tooltip="Probability of using cached empty conditioning; requires Cache Guidance Empty" />
-										<FormField type="number" fieldPath="training.h3_frame_sigma_jitter" value={t.h3_frame_sigma_jitter ?? 0} oninput={(e) => update('h3_frame_sigma_jitter', Number(e.target.value || 0))} min={0} step="0.01" tooltip="Spread per-frame noise positions around the shared schedule" />
+									<FormField type="number" fieldPath="training.h3_frame_sigma_jitter" value={t.h3_frame_sigma_jitter ?? 0} oninput={(e) => update('h3_frame_sigma_jitter', Number(e.target.value || 0))} min={0} max={1} step="0.01" tooltip="Spread per-frame noise positions around the shared schedule. Incompatible with observed-modality, extension, keyframe, and masked conditioning." />
 										<FormField type="number" fieldPath="training.h3_image_flow_shift" value={t.h3_image_flow_shift ?? ''} oninput={(e) => update('h3_image_flow_shift', e.target.value ? Number(e.target.value) : null)} min={0} step="0.1" placeholder="Automatic" tooltip="Optional image-batch flow-shift override" />
 										<FormField type="number" fieldPath="training.h3_shift_video" value={t.h3_shift_video ?? 12} oninput={(e) => update('h3_shift_video', Number(e.target.value || 12))} min={0} step="0.1" tooltip="Released H3 video flow shift" />
 										<FormField type="number" fieldPath="training.h3_shift_audio" value={t.h3_shift_audio ?? 3} oninput={(e) => update('h3_shift_audio', Number(e.target.value || 3))} min={0} step="0.1" tooltip="Released H3 audio flow shift" />
 										<FormField type="number" fieldPath="training.h3_extension_video_frames" value={t.h3_extension_video_frames ?? 0} oninput={(e) => update('h3_extension_video_frames', Number(e.target.value || 0))} min={0} tooltip="Leading latent video frames observed as extension context" />
 										<FormField type="number" fieldPath="training.h3_extension_audio_latents" value={t.h3_extension_audio_latents ?? 0} oninput={(e) => update('h3_extension_audio_latents', Number(e.target.value || 0))} min={0} tooltip="Leading audio latents observed as extension context" />
 										<FormSelect fieldPath="training.h3_extension_route" value={t.h3_extension_route || 'condition_rows'} options={['condition_rows', 'per_row_sigma']} onchange={(e) => update('h3_extension_route', e.target.value)} tooltip="How observed extension context is represented" />
-									<FormField type="number" fieldPath="training.reference_image_short_edge" value={t.reference_image_short_edge ?? 2048} oninput={(e) => update('reference_image_short_edge', Number(e.target.value || 2048))} min={64} step={8} tooltip="Must match the reference-image size used by latent caching" />
+									<FormField type="number" fieldPath="training.reference_image_short_edge" value={t.reference_image_short_edge ?? 2048} oninput={(e) => updateH3ReferenceShortEdge(Number(e.target.value || 2048))} min={64} step={8} tooltip="Shared reference-image size for caching, training, and inference. Changing it here updates all three stages." />
 									</div>
 								</div>
 								<div class="h3-control-cluster">
@@ -1070,6 +1075,7 @@
 								<FormToggle label="Online ConvRot INT8" fieldPath="training.h3_convrot_int8" checked={t.h3_convrot_int8 ?? false} onchange={(e) => update('h3_convrot_int8', e.target.checked)} disabled={t.fp8_base || t.fp8_scaled || t.int8_convrot_base} tooltip="Quantize a BF16 H3 checkpoint to ConvRot INT8 while loading. Incompatible with FP8 and pre-quantized INT8 checkpoints." />
 								<FormToggle label="Fused ConvRot LoRA" fieldPath="training.h3_convrot_int8_lora_fused" checked={t.h3_convrot_int8_lora_fused ?? false} onchange={(e) => update('h3_convrot_int8_lora_fused', e.target.checked)} disabled={!(t.h3_convrot_int8 || t.int8_convrot_base) || t.h3_convrot_int8_fwd !== 'int8' || t.h3_convrot_int8_bwd !== 'int8'} tooltip="Fuse the LoRA-up projection into the ConvRot INT8 dequantization epilogue. Works with online and pre-quantized ConvRot weights; requires INT8 forward and backward." />
 								<FormToggle label="Pinned checkpoint offload" fieldPath="training.h3_gradient_checkpointing_cpu_offload_pin_memory" checked={t.h3_gradient_checkpointing_cpu_offload_pin_memory ?? false} onchange={(e) => update('h3_gradient_checkpointing_cpu_offload_pin_memory', e.target.checked)} disabled={!t.gradient_checkpointing || !t.gradient_checkpointing_cpu_offload} tooltip="Pin CPU-offloaded H3 checkpoint activations for faster transfers. Uses substantial non-pageable host RAM." />
+								<FormToggle label="Reusable activation offload" fieldPath="training.h3_reusable_activation_offload" checked={t.h3_reusable_activation_offload ?? false} onchange={(e) => update('h3_reusable_activation_offload', e.target.checked)} disabled={!t.gradient_checkpointing || !t.gradient_checkpointing_cpu_offload} tooltip="Reuse pinned CPU checkpoint buffers and prefetch activations in reverse block order. Saves allocation overhead but requires sufficient free system RAM." />
 							</div>
 							<div class="grid grid-cols-3 gap-2">
 								<FormField label="AdaLN rank" type="number" fieldPath="training.h3_adaln_rank" value={t.int8_convrot_base ? '' : (t.h3_adaln_rank ?? '')} oninput={(e) => update('h3_adaln_rank', e.target.value ? Number(e.target.value) : null)} placeholder={t.int8_convrot_base ? 'Baked into checkpoint' : 'Full rank'} min={1} disabled={t.int8_convrot_base} tooltip={t.int8_convrot_base ? 'The released pruned INT8 checkpoint already contains its compact AdaLN table, so no --h3_adaln_rank argument is needed.' : 'Factor the frozen AdaLN timestep projections to this rank while loading. Rank 16 is the usual compact setting for a BF16 base.'} invalid={fieldInvalid('training.h3_adaln_rank')} error={fieldError('training.h3_adaln_rank')} />

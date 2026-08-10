@@ -202,6 +202,7 @@ def test_h3_performance_controls_are_forwarded_to_trainer(tmp_path: Path) -> Non
     training.gradient_checkpointing_cpu_offload = True
     training.h3_gradient_checkpointing_blocks = 50
     training.h3_gradient_checkpointing_cpu_offload_pin_memory = True
+    training.h3_reusable_activation_offload = True
     training.blocks_to_swap = 8
     training.block_swap_h2d_only = True
     training.block_swap_granularity = "layer"
@@ -216,7 +217,62 @@ def test_h3_performance_controls_are_forwarded_to_trainer(tmp_path: Path) -> Non
     assert parsed.gradient_checkpointing_cpu_offload is True
     assert parsed.h3_gradient_checkpointing_blocks == 50
     assert parsed.h3_gradient_checkpointing_cpu_offload_pin_memory is True
+    assert parsed.h3_reusable_activation_offload is True
     assert parsed.block_swap_granularity == "layer"
+
+
+def test_h3_reusable_activation_offload_requires_cpu_checkpoint_offload(tmp_path: Path) -> None:
+    config = _h3_config(tmp_path)
+    config.training.h3_reusable_activation_offload = True
+
+    report = validate_training_config(config)
+
+    assert "training.h3_reusable_activation_offload" in report["field_errors"]
+
+
+def test_h3_ref2va_training_sampling_is_rejected_by_dashboard(tmp_path: Path) -> None:
+    config = _h3_config(tmp_path)
+    config.caching.h3_task = "ref2va"
+    config.training.h3_training_mode = "ref2va"
+    config.training.sample_prompts_text = "a test prompt"
+
+    report = validate_training_config(config)
+
+    assert "training.sample_prompts" in report["field_errors"]
+
+
+def test_h3_frame_sigma_jitter_rejects_out_of_range_and_conditioning(tmp_path: Path) -> None:
+    config = _h3_config(tmp_path)
+    config.training.h3_frame_sigma_jitter = 1.01
+    report = validate_training_config(config)
+    assert "training.h3_frame_sigma_jitter" in report["field_errors"]
+
+    config.training.h3_frame_sigma_jitter = 0.1
+    config.training.h3_observed_modality = "video"
+    report = validate_training_config(config)
+    assert "training.h3_frame_sigma_jitter" in report["field_errors"]
+
+
+def test_h3_conditioning_modes_reject_conflicts_and_wrong_cache(tmp_path: Path) -> None:
+    config = _h3_config(tmp_path)
+    config.caching.h3_task = "i2va"
+    config.training.h3_extension_video_frames = 1
+    config.training.h3_mask_mode = "box"
+
+    report = validate_training_config(config)
+
+    assert "training.h3_extension_video_frames" in report["field_errors"]
+    assert "caching.h3_task" in report["field_errors"]
+
+
+def test_h3_mask_minimum_must_be_positive(tmp_path: Path) -> None:
+    config = _h3_config(tmp_path)
+    config.training.h3_mask_mode = "box"
+    config.training.h3_mask_min_fraction = 0.0
+
+    report = validate_training_config(config)
+
+    assert "training.h3_mask_min_fraction" in report["field_errors"]
 
 
 def test_h3_performance_quantization_controls_are_forwarded(tmp_path: Path) -> None:
