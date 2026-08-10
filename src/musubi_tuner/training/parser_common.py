@@ -278,6 +278,12 @@ def _add_logging_args(parser: argparse.ArgumentParser) -> None:
         " Adds a small per-step GPU sync overhead"
         " / 勾配ノルムのメトリクス（grad/norm, grad/mean_norm, grad/max、クリッピング前）をトラッカーに出力する。ステップごとにわずかなGPU同期のオーバーヘッドが発生する",
     )
+    parser.add_argument(
+        "--log_cuda_memory_every_n_steps",
+        type=int,
+        default=None,
+        help="emit a TRAIN_BENCHMARK JSON record with synchronized step time and CUDA peak memory every N optimizer steps",
+    )
 
 
 def _add_ddp_args(parser: argparse.ArgumentParser) -> None:

@@ -25,14 +25,19 @@ function h3BaseSize(t) {
 	// A rank-16 AdaLN replacement has about 77M parameters and scales linearly with rank.
 	const rank = Number(t?.h3_adaln_rank);
 	const hasReducedAdaln = Number.isFinite(rank) && rank > 0;
-	const paramsBillions = hasReducedAdaln
-		? 33.1 - 13.0 + (0.077 * rank / 16)
-		: 33.1;
+	const convRotBillions = 33.1 - 13.0;
+	const adaLnBillions = hasReducedAdaln ? (0.077 * rank / 16) : 13.0;
+	const paramsBillions = convRotBillions + adaLnBillions;
 	const gibPerBillionBytes = 1e9 / (1024 ** 3);
 
 	// The released pruned ConvRot checkpoint is 19.53 GiB, including quantization metadata.
 	if (t?.int8_convrot_base) return 19.53;
-	if (t?.fp8_base || t?.fp8_scaled || t?.h3_convrot_int8) {
+	if (t?.h3_convrot_int8) {
+		// Online ConvRot INT8 does not quantize the AdaLN projections. Without
+		// low-rank AdaLN those 13B parameters remain BF16 and must stay in the estimate.
+		return (convRotBillions * 1.04 + adaLnBillions * 2) * gibPerBillionBytes;
+	}
+	if (t?.fp8_base || t?.fp8_scaled) {
 		return paramsBillions * gibPerBillionBytes * 1.04;
 	}
 	return paramsBillions * gibPerBillionBytes * 2;
@@ -171,15 +176,21 @@ export function estimateTraining(cfg) {
 	const latentBytes = batchSize * 128 * latentFrames * latentHeight * latentWidth * 2 * 2;
 	const textEmbedBytes = batchSize * 256 * (isAV ? 7680 : 3840) * 2;
 	const bufferGB = (latentBytes + textEmbedBytes) / (1024 ** 3);
-	let activationBuffers = 0.5 + bufferGB;
-	if (t.img_in_txt_in_offloading) activationBuffers = Math.max(0.2, activationBuffers - 0.3);
+	// CUDA workspaces and allocator fragmentation contribute about 2.5 GiB on
+	// the calibrated 832x480x124 BF16 LoRA run (14.45 GiB allocated peak).
+	let activationBuffers = 2.5 + bufferGB;
+	if (t.img_in_txt_in_offloading) activationBuffers = Math.max(2.2, activationBuffers - 0.3);
 
 	const activationTotal = Math.max(0.3, activations + activationBuffers);
 	const gradAccum = Math.max(Number(t.gradient_accumulation_steps || 1), 1);
 	const gradAccumOverhead = gradAccum > 1 ? loraGrads * 0.4 : 0;
 
-	const preservationOverhead = Number(t.h3_base_preservation_loss_weight || 0) > 0 ? activationTotal * 0.35 : 0;
-	const guidanceOverhead = Number(t.h3_guidance_distillation_scale || 0) > 1 ? activationTotal * 0.45 : 0;
+	// The frozen-base pass is sequential/no-grad. Paired workbox measurements
+	// showed the same 14.45 GiB allocated peak with preservation on and off.
+	const preservationOverhead = 0;
+	// The empty-prompt teacher is also sequential/no-grad and reuses the same
+	// working-memory high-water mark as preservation.
+	const guidanceOverhead = 0;
 	const crepaOverhead = t.crepa ? 0.15 : 0;
 	const total = dit + loraParamsGB + optimStates + loraGrads + activationTotal + gradAccumOverhead + preservationOverhead + guidanceOverhead + crepaOverhead;
 
@@ -204,7 +215,7 @@ export function estimateTraining(cfg) {
 		swap: swapSavings,
 		blockwiseSavings: blockwiseWeightSavings,
 		confidence: 'medium',
-		basis: 'H3 33.1B weights + tensor-shape activation model',
+		basis: 'H3 parameter residency + calibrated tensor-shape activation model',
 		samplingSpike,
 		blockwise,
 	};

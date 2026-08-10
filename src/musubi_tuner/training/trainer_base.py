@@ -2250,6 +2250,13 @@ class NetworkTrainer:
                     break
 
                 dashboard_step_started_at = time.perf_counter()
+                measure_cuda_step = (
+                    args.log_cuda_memory_every_n_steps is not None
+                    and args.log_cuda_memory_every_n_steps > 0
+                    and accelerator.device.type == "cuda"
+                )
+                if measure_cuda_step:
+                    torch.cuda.reset_peak_memory_stats(accelerator.device)
 
                 # torch.compiler.cudagraph_mark_step_begin() # for cudagraphs
 
@@ -2318,6 +2325,24 @@ class NetworkTrainer:
                         progress_bar.reset()  # exclude first step from progress bar, because it may take long due to initializations
                     progress_bar.update(1)
                     global_step += 1
+
+                    if measure_cuda_step and global_step % args.log_cuda_memory_every_n_steps == 0:
+                        torch.cuda.synchronize(accelerator.device)
+                        accelerator.print(
+                            "TRAIN_BENCHMARK "
+                            + json.dumps(
+                                {
+                                    "step": global_step,
+                                    "step_time_sec": round(time.perf_counter() - dashboard_step_started_at, 6),
+                                    "allocated_gib": round(torch.cuda.memory_allocated(accelerator.device) / 2**30, 4),
+                                    "reserved_gib": round(torch.cuda.memory_reserved(accelerator.device) / 2**30, 4),
+                                    "peak_allocated_gib": round(torch.cuda.max_memory_allocated(accelerator.device) / 2**30, 4),
+                                    "peak_reserved_gib": round(torch.cuda.max_memory_reserved(accelerator.device) / 2**30, 4),
+                                    "base_preservation_active": loss_metrics.get("h3/base_preservation_active"),
+                                },
+                                sort_keys=True,
+                            )
+                        )
 
                     # to avoid calling optimizer_eval_fn() too frequently, we call it only when we need to sample images or save the model
                     should_sampling = should_sample_images(args, global_step, epoch=None)

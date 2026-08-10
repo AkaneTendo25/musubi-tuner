@@ -98,6 +98,9 @@ def _estimate_training_step_time_sec(config: dict) -> float | None:
         training = config.get("training", {})
         dataset = _first_training_dataset(config)
 
+        if training.get("model_type") == "minimax_h3":
+            return _estimate_h3_training_step_time_sec(training, dataset)
+
         mode = str(training.get("ltx2_mode", "video")).lower()
         res_w = max(_coerce_int(dataset.get("resolution_w", 768), 768), 64)
         res_h = max(_coerce_int(dataset.get("resolution_h", 512), 512), 64)
@@ -148,6 +151,88 @@ def _estimate_training_step_time_sec(config: dict) -> float | None:
     except Exception as e:
         logger.debug(f"Failed to estimate training step time: {e}")
         return None
+
+
+def _estimate_h3_training_step_time_sec(training: dict, dataset: dict) -> float:
+    """Estimate an H3 LoRA optimizer step on an H100 80GB HBM3 GPU.
+
+    The 832x480x124 reference is calibrated from real BF16 LoRA runs. Factors
+    describe average steady-state work; checkpoint loading and saving are not
+    part of an optimizer step. Extra no-grad teacher forwards affect time but
+    are deliberately not treated as equivalent activation-memory multipliers.
+    """
+    res_w = max(_coerce_int(dataset.get("resolution_w", 768), 768), 64)
+    res_h = max(_coerce_int(dataset.get("resolution_h", 512), 512), 64)
+    frames = max(_coerce_int(dataset.get("target_frames", 33), 33), 1)
+    batch_size = max(_coerce_int(dataset.get("batch_size", training.get("train_batch_size", 1)), 1), 1)
+    grad_accum = max(_coerce_int(training.get("gradient_accumulation_steps", 1), 1), 1)
+
+    work_scale = (res_w * res_h * frames) / (832 * 480 * 124)
+    # 10.6 s is the fitted unswapped compute intercept. The fully checkpointed,
+    # reusable-offload, pinned 48-block reference evaluates to ~22 s/step.
+    step_time = 10.6 * max(work_scale, 0.04) ** 0.90 * batch_size * grad_accum
+
+    checkpoint_blocks = _coerce_int(training.get("h3_gradient_checkpointing_blocks", -1), -1)
+    uses_checkpointing = bool(training.get("gradient_checkpointing", True)) and checkpoint_blocks != 0
+    if uses_checkpointing:
+        checkpoint_fraction = 1.0 if checkpoint_blocks < 0 else min(max(checkpoint_blocks, 0), 50) / 50
+        step_time *= 1.0 + 0.35 * checkpoint_fraction
+
+    if training.get("gradient_checkpointing_cpu_offload"):
+        step_time *= 1.12
+        if training.get("h3_reusable_activation_offload"):
+            step_time *= 0.92
+
+    blocks_to_swap = min(max(_coerce_int(training.get("blocks_to_swap", 0), 0), 0), 50)
+    if blocks_to_swap:
+        ring_size = max(_coerce_int(training.get("block_swap_ring_size", 2), 2), 1)
+        if training.get("block_swap_h2d_only") and training.get("use_pinned_memory_for_block_swap"):
+            # Direction-aware prefetch overlaps almost all transfer through 44
+            # blocks. The measured 44->48 tail crossed into a transfer-bound
+            # regime: 13.7 -> 22.0 s while saving 4.81 GiB.
+            overlap_limit = 44 + min(max(ring_size - 2, 0), 2)
+            if str(training.get("block_swap_granularity", "block")) == "layer":
+                overlap_limit += 1
+            step_time *= 1.0 + 0.15 * max(blocks_to_swap - overlap_limit, 0)
+        else:
+            # Bidirectional or pageable transfers cannot use the calibrated
+            # H2D-only overlap window as effectively.
+            transfer_cost = 0.010 if training.get("block_swap_h2d_only") else 0.016
+            step_time *= 1.0 + blocks_to_swap * transfer_cost
+
+    if training.get("h3_attn_auto_dispatch"):
+        step_time *= 0.94
+    if training.get("h3_fused_qk_norm_rope"):
+        step_time *= 0.95
+    if training.get("h3_convrot_int8"):
+        step_time *= 0.91 if training.get("h3_convrot_int8_fwd", "int8") == "int8" else 0.98
+        if training.get("h3_convrot_int8_bwd", "bf16") == "int8":
+            step_time *= 0.94
+    elif training.get("fp8_base") or training.get("fp8_scaled"):
+        step_time *= 0.96
+
+    # A frozen-base preservation pass is forward-only. Its Bernoulli
+    # probability changes average time, while peak VRAM remains unchanged.
+    if _coerce_float(training.get("h3_base_preservation_loss_weight", 0), 0.0) > 0:
+        probability = min(max(_coerce_float(training.get("h3_base_preservation_probability", 1), 1.0), 0.0), 1.0)
+        # Paired p=0.5 steps measured ~23% compute-only slowdown when active;
+        # cold cache I/O can hide part of it, so use the compute-side cost.
+        step_time *= 1.0 + 0.23 * probability
+
+    # Guidance distillation performs one additional no-grad conditional forward,
+    # the same execution shape as an active preservation teacher pass.
+    if training.get("h3_guidance_distillation_scale") is not None:
+        caption_dropout = min(max(_coerce_float(training.get("h3_caption_dropout_rate", 0), 0.0), 0.0), 1.0)
+        step_time *= 1.0 + 0.23 * (1.0 - caption_dropout)
+
+    sample_every_n_steps = _coerce_int(training.get("sample_every_n_steps", 0), 0)
+    if sample_every_n_steps:
+        # Sampling cost is amortized; this remains deliberately conservative
+        # until sampler benchmarks are available for each output shape.
+        sample_steps = max(_coerce_int(training.get("sample_steps", 1), 1), 1)
+        step_time += (2.0 * sample_steps * max(work_scale, 0.1)) / sample_every_n_steps
+
+    return max(step_time, 0.05)
 
 
 def _scan_dataset(dataset_path: str) -> DatasetStats | None:
@@ -333,7 +418,13 @@ def _calculate_training_stats(config: dict, dataset_stats: DatasetStats | None) 
             estimated_time_hours=estimated_time_hours,
             estimated_step_time_sec=round(estimated_step_time_sec, 3) if estimated_step_time_sec else None,
             estimated_steps_per_sec=round(estimated_steps_per_sec, 4) if estimated_steps_per_sec else None,
-            estimated_time_source="heuristic" if estimated_step_time_sec else None,
+            estimated_time_source=(
+                "H3 H100 calibrated model"
+                if estimated_step_time_sec and training.get("model_type") == "minimax_h3"
+                else "heuristic"
+                if estimated_step_time_sec
+                else None
+            ),
             checkpoint_size_mb=checkpoint_size_mb,
             total_checkpoints=total_checkpoints,
             total_storage_gb=total_storage_gb,

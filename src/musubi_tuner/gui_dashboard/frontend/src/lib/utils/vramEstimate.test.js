@@ -26,10 +26,30 @@ test('H3 ConvRot INT8 reduces the estimated resident base weights', () => {
 	const bf16 = estimateTraining(config());
 	const fp8 = estimateTraining(config({ fp8_base: true }));
 	const convrot = estimateTraining(config({ int8_convrot_base: true }));
+	const onlineConvrot = estimateTraining(config({ h3_convrot_int8: true }));
+	const onlineConvrotLowRank = estimateTraining(config({ h3_convrot_int8: true, h3_adaln_rank: 16 }));
 
 	assert.equal(partValue(convrot, 'DiT'), 19.53);
 	assert.ok(partValue(convrot, 'DiT') < partValue(fp8, 'DiT'));
 	assert.ok(partValue(fp8, 'DiT') < partValue(bf16, 'DiT'));
+	assert.ok(partValue(onlineConvrot, 'DiT') > partValue(fp8, 'DiT'));
+	assert.ok(partValue(onlineConvrotLowRank, 'DiT') < partValue(fp8, 'DiT'));
+});
+
+test('H3 guidance distillation does not add a parallel activation peak', () => {
+	const base = estimateTraining(config());
+	const guided = estimateTraining(config({ h3_guidance_distillation_scale: 4.0 }));
+
+	assert.equal(guided.total, base.total);
+	assert.equal(partValue(guided, 'Guidance'), undefined);
+});
+
+test('H3 preservation changes average time but not estimated peak VRAM', () => {
+	const base = estimateTraining(config({ h3_base_preservation_loss_weight: 0 }));
+	const preserved = estimateTraining(config({ h3_base_preservation_loss_weight: 0.02 }));
+
+	assert.equal(preserved.total, base.total);
+	assert.equal(partValue(preserved, 'Preserv.'), undefined);
 });
 
 test('H3 partial checkpointing estimates more activation memory', () => {
