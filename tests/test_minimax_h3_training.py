@@ -1088,7 +1088,8 @@ def test_native_h3_i2va_backend_requires_recached_keyframe_latents():
 
 
 @pytest.mark.parametrize("mode", ["ref2va", "ref2va_omni"])
-def test_native_h3_ref2va_backend_runs_target_only_forward_and_backward(mode):
+@pytest.mark.parametrize("with_target_audio", [False, True])
+def test_native_h3_ref2va_backend_runs_target_only_forward_and_backward(mode, with_target_audio):
     config = MiniMaxH3TransformerConfig(
         num_attention_heads=2,
         attention_head_dim=16,
@@ -1108,7 +1109,7 @@ def test_native_h3_ref2va_backend_runs_target_only_forward_and_backward(mode):
     transformer = MiniMaxH3Transformer(config)
     backend = _NativeTrainingBackend(transformer, mode=mode)
     video = torch.randn(1, 4, 1, 2, 2)
-    audio = torch.randn(1, 2, 6, 1)
+    audio = torch.randn(1, 2, 6, 1) if with_target_audio else None
     batch = {
         H3_TEXT_HIDDEN_KEY: [torch.randn(3, 8)],
         H3_TEXT_TOKEN_TAGS_KEY: [torch.tensor([1, 0, 1])],
@@ -1128,11 +1129,13 @@ def test_native_h3_ref2va_backend_runs_target_only_forward_and_backward(mode):
         torch.tensor([0.4]),
         torch.tensor([0.7]),
     )
-    loss = prediction.video.square().mean() + prediction.audio.square().mean()
+    loss = prediction.video.square().mean()
+    if prediction.audio is not None:
+        loss = loss + prediction.audio.square().mean()
     loss.backward()
 
     assert prediction.video.shape == video.shape
-    assert prediction.audio.shape == audio.shape
+    assert prediction.audio is None if audio is None else prediction.audio.shape == audio.shape
     assert torch.isfinite(loss)
     assert transformer.blocks[0].attn.qkv_proj.weight.grad is not None
 
@@ -1213,11 +1216,11 @@ def test_native_h3_ref2va_omni_backend_runs_text_only_forward_and_backward():
         transformer,
         batch,
         torch.randn(1, 4, 1, 2, 2),
-        torch.randn(1, 2, 6, 1),
+        None,
         torch.tensor([0.5]),
         torch.tensor([0.5]),
     )
-    loss = prediction.video.square().mean() + prediction.audio.square().mean()
+    loss = prediction.video.square().mean()
     loss.backward()
 
     assert torch.isfinite(loss)

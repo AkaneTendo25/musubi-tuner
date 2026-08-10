@@ -321,6 +321,35 @@ def test_h3_reuses_control_directory_for_mixed_reference_media(tmp_path):
     assert assets[0].metadata == {"frame_count": 22, "fps": 24.0}
 
 
+def test_h3_image_target_keeps_basename_matched_ref2va_reference(tmp_path):
+    images = tmp_path / "images"
+    controls = tmp_path / "controls"
+    images.mkdir()
+    controls.mkdir()
+    (images / "monster.png").write_bytes(b"target")
+    (controls / "monster.png").write_bytes(b"reference")
+
+    config = {
+        "general": {"resolution": [512, 512]},
+        "datasets": [
+            {
+                "image_directory": str(images),
+                "control_directory": str(controls),
+                "cache_directory": str(tmp_path / "cache"),
+            }
+        ],
+    }
+    group, adapter = create_h3_dataset_group(config, Namespace(debug_dataset=False))
+    item = ItemInfo(str(images / "monster.png"), "monster", (512, 512), (512, 512))
+
+    assets = adapter.attach(item)
+
+    assert [(asset.modality, asset.role) for asset in assets] == [
+        (MediaModality.IMAGE, "target"),
+        (MediaModality.IMAGE, "reference"),
+    ]
+
+
 def test_h3_reuses_numbered_jsonl_control_paths(tmp_path):
     target = tmp_path / "target.mp4"
     image = tmp_path / "reference.png"

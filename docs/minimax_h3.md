@@ -45,7 +45,7 @@ Each training objective has a fixed dataset, conditioning-cache, and transformer
 
 | Training objective | Example and dataset contract | Transformer | Cache `--task` | Trainer contract |
 | --- | --- | --- | --- | --- |
-| Text-to-image | [`image.toml`](../examples/minimax_h3/image.toml): `image_directory` or `image_jsonl_file` | FL2VA | `t2va` | None |
+| Text-to-image | [`image_fl2va.toml`](../examples/minimax_h3/image_fl2va.toml): `image_directory` or `image_jsonl_file` | FL2VA | `t2va` | None |
 | Text-to-video+audio | [`t2va.toml`](../examples/minimax_h3/t2va.toml): `video_directory` or `video_jsonl_file`; `h3_target_mode = "av"` is the default | FL2VA | `t2va` | None |
 | Text-to-video only | [`video_only.toml`](../examples/minimax_h3/video_only.toml): video source plus `h3_target_mode = "video"` | FL2VA | `t2va` | None |
 | Text-to-audio only | [`audio_only.toml`](../examples/minimax_h3/audio_only.toml): `audio_directory` or `audio_jsonl_file` plus `h3_target_mode = "audio"` | FL2VA | `t2va` | None |
@@ -54,8 +54,8 @@ Each training objective has a fixed dataset, conditioning-cache, and transformer
 | First-frame image-to-video+audio | [`i2va.toml`](../examples/minimax_h3/i2va.toml): video source; first frame comes from the target | FL2VA | `i2va` | None |
 | First+last-frame-to-video+audio | [`fl2va.toml`](../examples/minimax_h3/fl2va.toml): video source; keyframes come from the target | FL2VA | `fl2va` | None |
 | Last-frame image-to-video+audio | [`l2va.toml`](../examples/minimax_h3/l2va.toml): video source; last frame comes from the target | FL2VA | `l2va` | None |
-| Fixed arbitrary references | [`ref2va.toml`](../examples/minimax_h3/ref2va.toml): target video plus `control_directory`, `control_path`, or numbered `control_path_N` | Ref2VA | `ref2va` | `--h3_training_mode ref2va` |
-| Zero-or-more arbitrary references | [`ref2va_omni.toml`](../examples/minimax_h3/ref2va_omni.toml): target video; JSONL may omit references or use numbered `control_path_N` | Ref2VA | `ref2va_omni` | `--h3_training_mode ref2va_omni` |
+| Fixed arbitrary references | [`ref2va.toml`](../examples/minimax_h3/ref2va.toml): target video, or [`image_ref2va.toml`](../examples/minimax_h3/image_ref2va.toml): target image; add `control_directory`, `control_path`, or numbered `control_path_N` | Ref2VA | `ref2va` | `--h3_training_mode ref2va` |
+| Zero-or-more arbitrary references | [`ref2va_omni.toml`](../examples/minimax_h3/ref2va_omni.toml): target image or video; JSONL may omit references or use numbered `control_path_N` | Ref2VA | `ref2va_omni` | `--h3_training_mode ref2va_omni` |
 
 For observed-modality objectives, the option names the modality supplied as clean **conditioning**, not the prediction target.
 Consequently, `--h3_observed_modality video` defines video-to-audio training. See [Training modes](#training-modes) for the

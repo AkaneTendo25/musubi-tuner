@@ -1,0 +1,16 @@
+# Image-only concept LoRA for the strict Ref2VA transformer.
+# Cache text with --task ref2va and train with --h3_training_mode ref2va.
+# Each target image must have a separate basename-matched reference image.
+
+[general]
+resolution = [768, 768]
+caption_extension = ".txt"
+batch_size = 1
+enable_bucket = true
+bucket_no_upscale = false
+
+[[datasets]]
+image_directory = "/path/to/target_images"
+control_directory = "/path/to/reference_images"
+cache_directory = "/path/to/ref2va_image_cache"
+num_repeats = 1
