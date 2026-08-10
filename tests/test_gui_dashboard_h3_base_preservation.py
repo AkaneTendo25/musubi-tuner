@@ -147,12 +147,14 @@ def test_h3_base_preservation_default_is_not_forwarded(tmp_path: Path) -> None:
 def test_h3_base_preservation_is_forwarded_to_trainer(tmp_path: Path) -> None:
     config = _h3_config(tmp_path)
     config.training.h3_base_preservation_loss_weight = 0.05
+    config.training.h3_base_preservation_probability = 0.25
 
     command = build_training_cmd(config)
     script_index = next(index for index, value in enumerate(command) if value.endswith("minimax_h3_train_network.py"))
     parsed = create_parser().parse_args(command[script_index + 1 :])
 
     assert parsed.h3_base_preservation_loss_weight == 0.05
+    assert parsed.h3_base_preservation_probability == 0.25
 
 
 def test_h3_base_preservation_rejects_negative_weight(tmp_path: Path) -> None:
@@ -162,6 +164,15 @@ def test_h3_base_preservation_rejects_negative_weight(tmp_path: Path) -> None:
     report = validate_training_config(config)
 
     assert "training.h3_base_preservation_loss_weight" in report["field_errors"]
+
+
+def test_h3_base_preservation_rejects_invalid_probability(tmp_path: Path) -> None:
+    config = _h3_config(tmp_path)
+    config.training.h3_base_preservation_probability = 0.0
+
+    report = validate_training_config(config)
+
+    assert "training.h3_base_preservation_probability" in report["field_errors"]
 
 
 def test_h3_exact_resume_controls_are_forwarded(tmp_path: Path) -> None:

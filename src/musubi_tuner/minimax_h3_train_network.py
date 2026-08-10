@@ -138,6 +138,23 @@ def _parse_keyframe_anchors(spec: str) -> tuple[int | str, ...]:
 
 
 class MiniMaxH3NetworkTrainer(NetworkTrainer):
+    @staticmethod
+    def _base_preservation_active(accelerator: Accelerator, probability: float) -> bool:
+        """Draw one preservation decision shared by every distributed rank."""
+        device = accelerator.device
+        distributed = torch.distributed.is_available() and torch.distributed.is_initialized()
+        if not distributed or torch.distributed.get_rank() == 0:
+            fork_devices = [device] if device.type == "cuda" else []
+            # Sampling whether to run the teacher must not perturb the stochastic
+            # conditioning replay shared by empty, base, and trainable branches.
+            with torch.random.fork_rng(devices=fork_devices):
+                active = torch.rand((), device=device) < probability
+        else:
+            active = torch.zeros((), device=device, dtype=torch.bool)
+        if distributed:
+            torch.distributed.broadcast(active, src=0)
+        return bool(active.item())
+
     supports_validation = True
 
     def __init__(self):
@@ -437,6 +454,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             raise ValueError("--h3_guidance_loss_form contrastive requires --h3_guidance_distillation_scale")
         if not math.isfinite(args.h3_base_preservation_loss_weight) or args.h3_base_preservation_loss_weight < 0:
             raise ValueError("--h3_base_preservation_loss_weight must be finite and non-negative")
+        if not math.isfinite(args.h3_base_preservation_probability) or not 0 < args.h3_base_preservation_probability <= 1:
+            raise ValueError("--h3_base_preservation_probability must be finite and lie in (0, 1]")
         if args.h3_convrot_int8 and (args.fp8_base or args.int8_convrot_base):
             raise ValueError("--h3_convrot_int8 quantizes the BF16 checkpoint itself; drop --fp8_base/--int8_convrot_base")
         convrot_int8_active = args.h3_convrot_int8 or args.int8_convrot_base
@@ -1295,7 +1314,10 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                     gradient_checkpointing=False,
                 )
         reference_prediction = None
-        if args.h3_base_preservation_loss_weight > 0:
+        preservation_active = args.h3_base_preservation_loss_weight > 0 and self._base_preservation_active(
+            accelerator, args.h3_base_preservation_probability
+        )
+        if preservation_active:
             if network is None:
                 raise ValueError("--h3_base_preservation_loss_weight requires a trainable network")
             unwrapped_network = accelerator.unwrap_model(network)
@@ -1399,9 +1421,14 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 video_weight=video_weight,
                 audio_weight=audio_weight,
             )
-            base_preservation_term = args.h3_base_preservation_loss_weight * preservation.loss
+            base_preservation_term = (
+                args.h3_base_preservation_loss_weight / args.h3_base_preservation_probability
+            ) * preservation.loss
             loss = loss + base_preservation_term
-            metrics["loss/base_preservation"] = float(preservation.loss.detach())
+            metrics["loss/base_preservation"] = float(preservation.loss.detach() / args.h3_base_preservation_probability)
+        if args.h3_base_preservation_loss_weight > 0:
+            metrics["h3/base_preservation_active"] = float(preservation_active)
+            metrics.setdefault("loss/base_preservation", 0.0)
         if use_crepa and self._crepa.active:
             crepa_loss, crepa_metrics = self._crepa.loss(batch.get("h3_dino_features"))
             loss = loss + crepa_loss
@@ -1453,6 +1480,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             "ss_h3_mask_mode": args.h3_mask_mode,
             "ss_h3_mask_audio": str(args.h3_mask_audio),
             "ss_h3_base_preservation_loss_weight": str(args.h3_base_preservation_loss_weight),
+            "ss_h3_base_preservation_probability": str(args.h3_base_preservation_probability),
             "ss_h3_shift_video": str(args.h3_shift_video),
             "ss_h3_shift_audio": str(args.h3_shift_audio),
             "ss_h3_timestep_sampling": args.timestep_sampling,
@@ -1655,6 +1683,15 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         type=float,
         default=0.0,
         help=("optional frozen-base prediction-preservation loss weight; adds one no-grad transformer forward per batch"),
+    )
+    parser.add_argument(
+        "--h3_base_preservation_probability",
+        type=float,
+        default=1.0,
+        help=(
+            "probability of evaluating the frozen-base preservation branch on a batch; active losses are divided by "
+            "this probability to preserve the expected gradient, and the draw is synchronized across distributed ranks"
+        ),
     )
     parser.add_argument(
         "--crepa",

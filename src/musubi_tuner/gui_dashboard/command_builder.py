@@ -600,6 +600,8 @@ def _build_h3_training_cmd(config: ProjectConfig) -> list[str]:
             cmd += ["--h3_guidance_loss_schedule", t.h3_guidance_loss_schedule]
     if t.h3_base_preservation_loss_weight > 0:
         cmd += ["--h3_base_preservation_loss_weight", str(t.h3_base_preservation_loss_weight)]
+        if t.h3_base_preservation_probability != 1.0:
+            cmd += ["--h3_base_preservation_probability", str(t.h3_base_preservation_probability)]
     if t.learning_rate is not None:
         cmd += ["--learning_rate", str(t.learning_rate)]
     if t.optimizer_type:

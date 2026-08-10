@@ -256,11 +256,14 @@ versions.
 H3 is guidance-distilled, so direct LoRA training can be inefficient or destabilize its distilled behavior. Two mitigations are
 available:
 
-1. `--h3_base_preservation_loss_weight 0.02` limits drift from the frozen base, but adds one no-gradient transformer forward per
-   batch.
+1. `--h3_base_preservation_loss_weight 0.02` limits drift from the frozen base. Add
+   `--h3_base_preservation_probability 0.25` to evaluate it on 25% of batches with automatic inverse-probability scaling.
 2. If a compatible de-distillation training adapter is provided, load it through `--base_weights` while training the concept
    LoRA, then remove it for inference. One community example is
    [ostris/minimax_h3_training_adapter](https://huggingface.co/ostris/minimax_h3_training_adapter).
+
+For concept LoRA training over a de-distillation adapter, preservation with probability `0.25`–`0.5` is the recommended faster
+starting point. The adapter remains loaded only during training; the resulting concept LoRA is used against stock H3.
 
 The training adapter is an approximation. The community does not have MiniMax's original undistilled teacher, so no adapter can
 reliably reconstruct the ideal undistilled prediction for every prompt, timestep, modality, and concept. Validate short runs and
@@ -480,6 +483,7 @@ and is therefore larger for reference-conditioned batches.
 | `--h3_guidance_distillation_scale 4` | Guidance-consistent objective using cached empty-text conditioning. A scale of `4` is recommended; `3` is generally too weak. `--h3_guidance_loss_form` selects `normalized` or `contrastive`; both share an optimum, but contrastive is `scale²` larger. |
 | `--h3_guidance_loss_schedule {sigma,constant}` | `sigma` (default) scales guidance from `1` at the clean endpoint to the configured value at maximum noise, independently for video and audio. `constant` retains the configured scale everywhere. |
 | `--h3_base_preservation_loss_weight 0.02` | Recommended starting value. Penalizes drift from the frozen base's prediction and anchors to whichever base is loaded, quantized or not. |
+| `--h3_base_preservation_probability 0.25` | Evaluate preservation on a synchronized random fraction of batches and scale active losses by `1 / probability`. `1` is exact every-batch preservation; `0.25`–`0.5` is the recommended faster range. |
 | `--crepa` | Temporal representation alignment for video training. |
 
 Treat `--h3_base_preservation_loss_weight 0.02` as an initial value rather than a universal setting. Its effect depends on

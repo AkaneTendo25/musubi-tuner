@@ -1851,6 +1851,105 @@ def test_h3_trainer_base_preservation_replays_rng_and_restores_network():
     assert transformer.scale.grad is not None and torch.isfinite(transformer.scale.grad)
 
 
+def test_h3_sparse_base_preservation_skips_teacher_forward():
+    args = create_parser().parse_args([])
+    args.h3_base_preservation_loss_weight = 0.1
+    args.h3_base_preservation_probability = 0.25
+    trainer = MiniMaxH3NetworkTrainer()
+    trainer.dit_dtype = torch.float32
+    trainer._base_preservation_active = lambda accelerator, probability: False
+    backend = _StochasticPreservationBackend()
+    trainer.backend = backend
+    transformer = _ScaleTransformer()
+    network = _ToggleNetwork(transformer)
+    video = torch.zeros(1, 24, 2, 2, 2)
+
+    loss, metrics = trainer.process_batch(
+        args,
+        _FakeAccelerator(),
+        transformer,
+        network,
+        {"timesteps": [0.5]},
+        video,
+        torch.ones_like(video),
+        None,
+        torch.float32,
+        torch.float32,
+        None,
+        0,
+    )
+    loss.backward()
+
+    assert backend.calls == [("prompt", True)]
+    assert network.events == []
+    assert metrics["h3/base_preservation_active"] == 0.0
+    assert metrics["loss/base_preservation"] == 0.0
+
+
+def test_h3_sparse_base_preservation_uses_inverse_probability_weight():
+    def run(probability):
+        args = create_parser().parse_args([])
+        args.h3_base_preservation_loss_weight = 0.1
+        args.h3_base_preservation_probability = probability
+        trainer = MiniMaxH3NetworkTrainer()
+        trainer.dit_dtype = torch.float32
+        trainer._base_preservation_active = lambda accelerator, probability: True
+        backend = _StochasticPreservationBackend()
+        trainer.backend = backend
+        transformer = _ScaleTransformer()
+        network = _ToggleNetwork(transformer)
+        video = torch.zeros(1, 24, 2, 2, 2)
+        torch.manual_seed(123)
+        _, metrics = trainer.process_batch(
+            args,
+            _FakeAccelerator(),
+            transformer,
+            network,
+            {"timesteps": [0.5]},
+            video,
+            torch.ones_like(video),
+            None,
+            torch.float32,
+            torch.float32,
+            None,
+            0,
+        )
+        assert backend.calls == [("prompt", False), ("prompt", True)]
+        return metrics
+
+    dense = run(1.0)
+    sparse = run(0.25)
+
+    assert sparse["h3/base_preservation_active"] == 1.0
+    assert sparse["loss/base_preservation"] == pytest.approx(4 * dense["loss/base_preservation"])
+
+
+@pytest.mark.parametrize("probability", [0.0, -0.1, 1.1, float("nan")])
+def test_h3_base_preservation_probability_is_validated(probability):
+    args = create_parser().parse_args([])
+    args.h3_base_preservation_probability = probability
+
+    with pytest.raises(ValueError, match="h3_base_preservation_probability"):
+        MiniMaxH3NetworkTrainer().handle_model_specific_args(args)
+
+
+def test_h3_base_preservation_draw_is_rng_neutral_and_broadcast(monkeypatch):
+    broadcasts = []
+    monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
+    monkeypatch.setattr(torch.distributed, "broadcast", lambda value, src: broadcasts.append((value.clone(), src)))
+
+    torch.manual_seed(321)
+    expected_next = torch.rand(())
+    torch.manual_seed(321)
+    MiniMaxH3NetworkTrainer._base_preservation_active(_FakeAccelerator(), 0.5)
+    actual_next = torch.rand(())
+
+    assert actual_next == expected_next
+    assert len(broadcasts) == 1 and broadcasts[0][1] == 0
+
+
 def test_h3_ref2va_rejects_training_time_sample_prompts():
     args = create_parser().parse_args(["--sdpa"])
     args.h3_training_mode = "ref2va"

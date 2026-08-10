@@ -505,6 +505,17 @@ def validate_training_config(config: ProjectConfig) -> dict[str, Any]:
                     page="training",
                 )
             )
+        preservation_probability = float(t.h3_base_preservation_probability)
+        if not math.isfinite(preservation_probability) or not 0 < preservation_probability <= 1:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.h3_base_preservation_probability",
+                    "H3 base preservation probability must be finite and lie in (0, 1].",
+                    label="H3 Base Preservation Probability",
+                    page="training",
+                )
+            )
         spatial_density_jitter = float(t.h3_spatial_density_jitter)
         if not math.isfinite(spatial_density_jitter) or spatial_density_jitter < 0:
             errors.append(
