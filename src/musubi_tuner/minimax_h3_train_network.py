@@ -7,6 +7,7 @@ import logging
 import math
 import time
 from collections.abc import Sequence
+from contextlib import nullcontext
 from dataclasses import replace
 from types import SimpleNamespace
 from multiprocessing import Value
@@ -431,6 +432,14 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         self.vae_frame_stride = 17
         self._crepa_config = parse_crepa_config(args.crepa)
         args.h3_load_dino_features = self._crepa_config is not None and self._crepa_config.mode == "dino"
+        if args.validation_dataset_config:
+            validation_config = config_utils.load_user_config(args.validation_dataset_config)
+            general_batch_size = int(validation_config.get("general", {}).get("batch_size", 1))
+            validation_batch_sizes = [
+                int(dataset.get("batch_size", general_batch_size)) for dataset in validation_config.get("datasets", [])
+            ] or [general_batch_size]
+            if any(batch_size != 1 for batch_size in validation_batch_sizes):
+                raise ValueError("MiniMax H3 validation requires batch_size = 1 in --validation_dataset_config")
 
         # H3 owns its own flow shifts because video and audio ride different
         # schedules (12 and 3) off one shared unshifted coordinate. The common
@@ -1235,6 +1244,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         )
         losses: list[torch.Tensor] = []
         item_metrics: list[dict[str, float]] = []
+        crepa_alignments: list[float] = []
         for index in range(batch_size):
             item_loss, metrics = self._process_single_batch(
                 args,
@@ -1250,13 +1260,26 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 vae,
                 global_step,
                 preservation_active_override=preservation_active,
+                crepa_update_similarity_threshold=False,
             )
-            accelerator.backward(item_loss / batch_size)
+            if "crepa/alignment" in metrics:
+                crepa_alignments.append(metrics["crepa/alignment"])
+            sync_context = (
+                accelerator.no_sync(network if network is not None else transformer)
+                if index + 1 < batch_size and getattr(accelerator, "num_processes", 1) > 1
+                else nullcontext()
+            )
+            with sync_context:
+                accelerator.backward(item_loss / batch_size)
             losses.append(item_loss.detach())
             item_metrics.append(metrics)
 
-        metric_keys = set().union(*(metrics.keys() for metrics in item_metrics))
-        averaged_metrics = {key: sum(metrics.get(key, 0.0) for metrics in item_metrics) / batch_size for key in metric_keys}
+        averaged_metrics = self._average_batch_metrics(item_metrics)
+        if self._crepa is not None and crepa_alignments:
+            self._crepa.update_similarity_threshold(sum(crepa_alignments) / len(crepa_alignments))
+            averaged_metrics["crepa/cutoff"] = float(self._crepa._cutoff_active)
+            if self._crepa._similarity_ema is not None:
+                averaged_metrics["crepa/alignment_ema"] = self._crepa._similarity_ema
         self._batch_backward_performed = True
         return torch.stack(losses).mean(), averaged_metrics
 
@@ -1267,7 +1290,19 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         super().backward_loss(accelerator, loss)
 
     @staticmethod
+    def _average_batch_metrics(item_metrics: list[dict[str, float]]) -> dict[str, float]:
+        metric_keys = set().union(*(metrics.keys() for metrics in item_metrics))
+        return {
+            key: sum(metrics[key] for metrics in item_metrics if key in metrics) / sum(key in metrics for metrics in item_metrics)
+            for key in metric_keys
+        }
+
+    @staticmethod
     def _slice_batch_item(batch: dict, index: int, batch_size: int) -> dict:
+        # BucketBatchManager stacks every fixed-size cache field on its first
+        # dimension and leaves every varlen_ field as a list. Keep this rule in
+        # one place; new shared metadata must remain scalar or opt into one of
+        # those two dataset representations.
         item = {}
         for key, value in batch.items():
             if isinstance(value, torch.Tensor) and value.ndim > 0 and value.shape[0] == batch_size:
@@ -1296,6 +1331,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         global_step: int,
         *,
         preservation_active_override: bool | None = None,
+        crepa_update_similarity_threshold: bool = True,
     ) -> tuple[torch.Tensor, dict[str, float]]:
         del network_dtype, vae
         has_video = "latents" in batch or latents.ndim == 5
@@ -1522,7 +1558,9 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             metrics["h3/base_preservation_active"] = float(preservation_active)
             metrics.setdefault("loss/base_preservation", 0.0)
         if use_crepa and self._crepa.active:
-            crepa_loss, crepa_metrics = self._crepa.loss(batch.get("h3_dino_features"))
+            crepa_loss, crepa_metrics = self._crepa.loss(
+                batch.get("h3_dino_features"), update_similarity_threshold=crepa_update_similarity_threshold
+            )
             loss = loss + crepa_loss
             metrics.update(crepa_metrics)
         elif use_crepa:

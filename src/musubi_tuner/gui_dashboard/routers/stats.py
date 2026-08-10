@@ -584,6 +584,7 @@ def _calculate_vram_stats(config: dict) -> VRAMStats | None:
         res_h = max(_coerce_int(ds.get("resolution_h", 512), 512), 64)
         frames = max(_coerce_int(ds.get("target_frames", 33), 33), 1)
         batch_size = max(_coerce_int(ds.get("batch_size", 1), 1), 1)
+        memory_batch_size = 1 if training.get("model_type") == "minimax_h3" else batch_size
 
         # Correct VAE compression factors
         latent_f = max(1, (frames - 1) // 8 + 1)
@@ -602,7 +603,7 @@ def _calculate_vram_stats(config: dict) -> VRAMStats | None:
             activation_units = max(2, standard_blocks + 2)
         else:
             activation_units = total_blocks * 2
-        activations_gb = (batch_size * seq_len * hidden_dim * bytes_per_val * activation_units) / (1024**3)
+        activations_gb = (memory_batch_size * seq_len * hidden_dim * bytes_per_val * activation_units) / (1024**3)
         if is_av:
             activations_gb *= 1.25
         if _coerce_int(training.get("ffn_chunk_size", 0), 0) > 0:
@@ -613,8 +614,8 @@ def _calculate_vram_stats(config: dict) -> VRAMStats | None:
             activations_gb *= 0.35
 
         # Fixed buffers
-        latent_bytes = batch_size * 128 * latent_f * latent_h * latent_w * 2 * 2
-        text_bytes = batch_size * 256 * (7680 if is_av else 3840) * 2
+        latent_bytes = memory_batch_size * 128 * latent_f * latent_h * latent_w * 2 * 2
+        text_bytes = memory_batch_size * 256 * (7680 if is_av else 3840) * 2
         buffer_gb = (latent_bytes + text_bytes) / (1024**3) + 0.5
         if training.get("img_in_txt_in_offloading"):
             buffer_gb = max(0.2, buffer_gb - 0.3)

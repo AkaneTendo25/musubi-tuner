@@ -185,7 +185,13 @@ class H3CREPA(torch.nn.Module):
         self._step = global_step
         hard_cutoff = self.config.cutoff_step > 0 and global_step >= self.config.cutoff_step
         threshold_cutoff = self._cutoff_triggered and self.config.threshold_mode == "permanent"
-        self._cutoff_active = hard_cutoff or threshold_cutoff
+        dynamic_threshold_cutoff = (
+            self.config.similarity_threshold is not None
+            and self.config.threshold_mode != "permanent"
+            and self._similarity_ema is not None
+            and self._similarity_ema >= self.config.similarity_threshold
+        )
+        self._cutoff_active = hard_cutoff or threshold_cutoff or dynamic_threshold_cutoff
         self._effective_weight = 0.0 if hard_cutoff or threshold_cutoff else self._scheduled_weight(global_step)
         self._active = active and self._effective_weight > 0
 
@@ -228,7 +234,23 @@ class H3CREPA(torch.nn.Module):
         if self._active and torch.is_grad_enabled():
             self._teacher = self._pool_target_video(output).detach()
 
-    def loss(self, dino_features: torch.Tensor | None = None) -> tuple[torch.Tensor, dict[str, float]]:
+    def update_similarity_threshold(self, score: float) -> None:
+        threshold = self.config.similarity_threshold
+        if threshold is None:
+            return
+        if self._similarity_ema is None:
+            self._similarity_ema = score
+        else:
+            decay = self.config.similarity_ema_decay
+            self._similarity_ema = decay * self._similarity_ema + (1.0 - decay) * score
+        threshold_active = self._similarity_ema >= threshold
+        if threshold_active and self.config.threshold_mode == "permanent":
+            self._cutoff_triggered = True
+        self._cutoff_active = threshold_active
+
+    def loss(
+        self, dino_features: torch.Tensor | None = None, *, update_similarity_threshold: bool = True
+    ) -> tuple[torch.Tensor, dict[str, float]]:
         if self._student is None or (self.config.mode == "backbone" and self._teacher is None):
             raise RuntimeError("CREPA did not capture its configured transformer features")
         student = self.projector(self._student.float())
@@ -288,18 +310,9 @@ class H3CREPA(torch.nn.Module):
         similarity = (alignment_sum / alignment_weight.clamp_min(torch.finfo(student.dtype).eps)).mean()
         self_similarity = (self_sum / frame_count).mean()
         score = float(similarity.detach())
-        threshold = self.config.similarity_threshold
-        if threshold is not None:
-            if self._similarity_ema is None:
-                self._similarity_ema = score
-            else:
-                decay = self.config.similarity_ema_decay
-                self._similarity_ema = decay * self._similarity_ema + (1.0 - decay) * score
-        threshold_active = threshold is not None and self._similarity_ema >= threshold
-        if threshold_active and self.config.threshold_mode == "permanent":
-            self._cutoff_triggered = True
-        self._cutoff_active = threshold_active
-        effective_weight = 0.0 if threshold_active else self._effective_weight
+        if update_similarity_threshold:
+            self.update_similarity_threshold(score)
+        effective_weight = 0.0 if self._cutoff_active else self._effective_weight
         loss = effective_weight * unweighted_loss
         if not torch.isfinite(loss):
             logger.warning("CREPA loss is non-finite; skipping the auxiliary term")

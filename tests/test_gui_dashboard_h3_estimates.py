@@ -1,5 +1,6 @@
 from musubi_tuner.gui_dashboard.routers.stats import (
     _calculate_training_stats,
+    _calculate_vram_stats,
     _estimate_training_step_time_sec,
     _gpu_time_coefficient,
 )
@@ -82,3 +83,13 @@ def test_h3_stats_include_detected_gpu_name(monkeypatch):
     stats = _calculate_training_stats(_config(), None)
     assert stats is not None
     assert stats.estimated_time_source == "Hardware-adjusted estimate (NVIDIA GeForce RTX 4090)"
+
+
+def test_h3_sequential_dataset_batch_does_not_multiply_peak_vram():
+    batch_one = _calculate_vram_stats(_config())
+    config = _config()
+    config["dataset"]["datasets"][0]["batch_size"] = 4
+    batch_four = _calculate_vram_stats(config)
+    assert batch_one is not None and batch_four is not None
+    assert batch_four.peak_training_gb == batch_one.peak_training_gb
+    assert batch_four.activations_gb == batch_one.activations_gb

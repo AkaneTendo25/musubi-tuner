@@ -164,6 +164,29 @@ def test_h3_crepa_extracts_only_target_video_rows_and_backpropagates(tmp_path):
         torch.testing.assert_close(actual, expected)
 
 
+def test_h3_crepa_can_defer_one_ema_update_across_dataset_batch():
+    config = H3CREPAConfig(
+        student_block=0,
+        teacher_block=2,
+        weight=0.1,
+        similarity_threshold=0.5,
+        similarity_ema_decay=0.9,
+    )
+    transformer = _CREPATransformer()
+    crepa = H3CREPA(hidden_size=4, config=config)
+    crepa.install(transformer)
+    crepa.set_layout(torch.tensor([0, 1, 2, 3]), frames=2, rows_per_frame=2)
+    alignments = []
+    for _ in range(2):
+        crepa.begin_step(True)
+        transformer(torch.randn(1, 6, 4))
+        _, metrics = crepa.loss(update_similarity_threshold=False)
+        alignments.append(metrics["crepa/alignment"])
+    assert crepa._similarity_ema is None
+    crepa.update_similarity_threshold(sum(alignments) / len(alignments))
+    assert crepa._similarity_ema == pytest.approx(sum(alignments) / len(alignments))
+
+
 def test_h3_crepa_is_inert_when_disabled():
     transformer = _CREPATransformer()
     crepa = H3CREPA(4, H3CREPAConfig(student_block=0, teacher_block=2))
@@ -1798,6 +1821,19 @@ def test_h3_batch_two_matches_two_independent_items_and_averages_gradients():
     for key in batched_metrics:
         expected = sum(metrics.get(key, 0.0) for _, metrics in single_results) / 2
         assert batched_metrics[key] == pytest.approx(expected)
+
+
+def test_h3_batch_metrics_average_only_items_that_report_each_metric():
+    averaged = MiniMaxH3NetworkTrainer._average_batch_metrics([{"loss/total": 2.0, "crepa/alignment": 0.8}, {"loss/total": 4.0}])
+    assert averaged == {"loss/total": 3.0, "crepa/alignment": 0.8}
+
+
+def test_h3_validation_batch_size_fails_during_startup(tmp_path):
+    config = tmp_path / "validation.toml"
+    config.write_text('[general]\nbatch_size = 2\n[[datasets]]\nvideo_directory = "unused"\n', encoding="utf-8")
+    args = create_parser().parse_args(["--validation_dataset_config", str(config)])
+    with pytest.raises(ValueError, match="validation requires batch_size = 1"):
+        MiniMaxH3NetworkTrainer().handle_model_specific_args(args)
 
 
 def _caption_dropout_batch():
