@@ -958,6 +958,7 @@ def test_native_h3_image_backend_runs_video_only_forward_and_backward():
     result.loss.backward()
 
     assert prediction.video.shape == video.shape
+
     assert prediction.audio.shape == audio.shape
     assert result.audio_elements == 0
     assert torch.isfinite(result.loss)
@@ -2937,3 +2938,16 @@ def test_native_h3_backend_accepts_named_and_indexed_condition_anchors(anchors):
     )
 
     assert prediction.video.shape == video.shape
+
+    batch[H3_CONDITIONING_TASK_KEY] = [torch.tensor(H3_CONDITIONING_TASK_IDS["i2va"])]
+    with pytest.raises(ValueError, match="custom keyframe anchors require --task t2va caches"):
+        backend.predict_training(
+            transformer,
+            batch,
+            video,
+            torch.randn(1, 2, 6, 1),
+            torch.tensor([0.4]),
+            torch.tensor([0.7]),
+            condition_video_anchors=anchors,
+            extension_video_context=torch.randn(1, 4, len(anchors), 2, 2),
+        )

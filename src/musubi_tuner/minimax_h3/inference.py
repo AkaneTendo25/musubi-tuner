@@ -145,10 +145,10 @@ def prepare_keyframe_image(image: Image.Image, height: int, width: int, *, stret
 
 
 def _augment_keyframe_rows(rows: torch.Tensor, rows_per_anchor: int, seed: int) -> torch.Tensor:
-    """Apply the released fixed-timestep condition noise, restarting the RNG for each anchor."""
+    """Apply independent released fixed-timestep condition noise to each row."""
     augmented = []
+    generator = torch.Generator(device="cpu").manual_seed(seed)
     for anchor_rows in rows.split(rows_per_anchor):
-        generator = torch.Generator(device="cpu").manual_seed(seed)
         noise = torch.randn(anchor_rows.shape, generator=generator, dtype=torch.float32)
         augmented.append(0.999 * anchor_rows.float() + 0.001 * noise.to(anchor_rows.device))
     return torch.cat(augmented)

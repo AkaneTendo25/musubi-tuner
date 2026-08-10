@@ -294,7 +294,7 @@ class _NativeGenerator:
             return "l2va"
         if tuple(keyframe_anchors) == ("first",):
             return "i2va"
-        return "fl2va" if len(images) > 1 else "i2va"
+        return "fl2va"
 
     def _encode_prompt(self, prompt: str, images=(), references=(), keyframe_anchors=()) -> dict[str, torch.Tensor]:
         task = self._conditioning_task(images, references, keyframe_anchors)
@@ -690,6 +690,8 @@ class _NativeTrainingBackend:
         if task not in accepted_tasks:
             expected = ", ".join(f"--task {name}" for name in sorted(accepted_tasks))
             raise ValueError(f"MiniMax H3 {self.mode} training requires {expected} conditioning; re-cache text outputs")
+        if condition_video_anchors and task != "t2va":
+            raise ValueError("H3 custom keyframe anchors require --task t2va caches")
         has_vision = bool((text_tags == int(MiniMaxH3TokenTag.VIDEO)).any())
         if task == "t2va" and has_vision:
             raise ValueError("MiniMax H3 T2VA training requires text-only conditioning; re-cache with --task t2va")

@@ -11,6 +11,7 @@ from musubi_tuner.minimax_h3.cache import H3_TEXT_HIDDEN_KEY, H3_TEXT_TOKEN_TAGS
 from musubi_tuner.minimax_h3.inference import (
     H3EncodedReferences,
     H3GeneratedMedia,
+    _augment_keyframe_rows,
     data_ward_euler_step,
     decode_latents_sequentially,
     denoise_fl2va,
@@ -76,6 +77,16 @@ def test_data_ward_euler_full_step_recovers_clean_sample() -> None:
     )
 
     torch.testing.assert_close(result, clean)
+
+
+def test_keyframe_condition_noise_uses_one_continuous_rng_stream() -> None:
+    rows = torch.zeros(4, 3)
+    actual = _augment_keyframe_rows(rows, rows_per_anchor=2, seed=17)
+    generator = torch.Generator(device="cpu").manual_seed(17)
+    expected = 0.001 * torch.randn(rows.shape, generator=generator)
+
+    torch.testing.assert_close(actual, expected)
+    assert not torch.equal(actual[:2], actual[2:])
 
 
 def test_tiny_joint_denoising_is_finite_and_shape_correct() -> None:

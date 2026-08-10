@@ -549,6 +549,16 @@ def validate_training_config(config: ProjectConfig) -> dict[str, Any]:
                     page="training",
                 )
             )
+        if (t.h3_keyframe_anchors or t.h3_keyframe_random_count) and config.caching.h3_task != "t2va":
+            errors.append(
+                _make_issue(
+                    "error",
+                    "caching.h3_task",
+                    "Custom H3 keyframe anchors require T2VA caches.",
+                    label="H3 Conditioning Task",
+                    page="caching",
+                )
+            )
         if t.h3_adaln_rank is not None and t.h3_adaln_rank < 1:
             errors.append(
                 _make_issue(

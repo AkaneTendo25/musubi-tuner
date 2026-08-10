@@ -20,6 +20,7 @@ Two released transformers, with different conditioning contracts:
 - [Dataset](#dataset)
 - [Pre-caching](#pre-caching)
 - [Training](#training)
+  - [Training a guidance-distilled model](#training-a-guidance-distilled-model)
   - [Full-parameter BF16 training](#full-parameter-bf16-training)
 - [Inference](#inference)
 - [Training dashboard](#training-dashboard)
@@ -250,8 +251,20 @@ unsupported. Regional `torch.compile` covers all 50 main blocks and both text-re
 a working Triton installation; on Windows, install a `triton-windows` build compatible with the installed PyTorch and Python
 versions.
 
-Watch progress with `tensorboard --logdir logs`. When training remotely, bind it to a protected interface or reach its loopback
-address through an SSH forward rather than exposing it publicly.
+### Training a guidance-distilled model
+
+H3 is guidance-distilled, so direct LoRA training can be inefficient or destabilize its distilled behavior. Two mitigations are
+available:
+
+1. `--h3_base_preservation_loss_weight 0.02` limits drift from the frozen base, but adds one no-gradient transformer forward per
+   batch.
+2. If a compatible de-distillation training adapter is provided, load it through `--base_weights` while training the concept
+   LoRA, then remove it for inference. One community example is
+   [ostris/minimax_h3_training_adapter](https://huggingface.co/ostris/minimax_h3_training_adapter).
+
+The training adapter is an approximation. The community does not have MiniMax's original undistilled teacher, so no adapter can
+reliably reconstruct the ideal undistilled prediction for every prompt, timestep, modality, and concept. Validate short runs and
+check samples again after removing the adapter.
 
 ### Full-parameter BF16 training
 

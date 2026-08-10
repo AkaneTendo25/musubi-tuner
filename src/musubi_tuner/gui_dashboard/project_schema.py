@@ -131,7 +131,7 @@ class CachingConfig(BaseModel):
     h3_audio_vae: str = ""
     h3_text_encoder: str = ""
     h3_tokenizer: str = ""
-    h3_task: Literal["t2va", "fl2va"] = "t2va"
+    h3_task: Literal["t2va", "i2va", "fl2va", "l2va"] = "t2va"
     h3_text_encoder_dtype: Literal["bfloat16", "float16", "float32"] = "bfloat16"
     h3_text_encoder_quantization: Literal["none", "int8", "nf4", "nvfp4_awq"] = "none"
     h3_cache_guidance_empty: bool = False

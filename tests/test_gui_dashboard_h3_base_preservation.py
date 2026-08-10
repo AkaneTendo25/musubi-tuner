@@ -34,6 +34,25 @@ def test_dashboard_project_defaults_are_h3_only() -> None:
     assert config.inference.model_type == "minimax_h3"
 
 
+def test_dashboard_accepts_all_h3_conditioning_cache_tasks(tmp_path: Path) -> None:
+    for task in ("t2va", "i2va", "fl2va", "l2va"):
+        config = _h3_config(tmp_path)
+        config.caching.h3_task = task
+        command = build_cache_text_cmd(config)
+
+        assert command[command.index("--task") + 1] == task
+
+
+def test_dashboard_rejects_custom_keyframes_with_endpoint_task_cache(tmp_path: Path) -> None:
+    config = _h3_config(tmp_path)
+    config.caching.h3_task = "i2va"
+    config.training.h3_keyframe_anchors = "first,last"
+
+    report = validate_training_config(config)
+
+    assert "caching.h3_task" in report["field_errors"]
+
+
 def test_default_h3_workflow_never_builds_ltx_commands(tmp_path: Path) -> None:
     config = _h3_config(tmp_path)
     config.inference.model_type = "minimax_h3"

@@ -1168,6 +1168,7 @@ def test_native_generator_compiles_all_inference_block_regions(monkeypatch, tmp_
         ((), (), "t2va"),
         ((object(),), ("first",), "i2va"),
         ((object(),), ("last",), "l2va"),
+        ((object(),), (11,), "fl2va"),
         ((object(), object()), ("first", "last"), "fl2va"),
     ),
 )
