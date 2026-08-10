@@ -35,7 +35,7 @@ import pytest
 import torch
 import torch.nn as nn
 
-from musubi_tuner.networks.lora import LoRAModule
+from musubi_tuner.networks.lora import LoRAModule, LoRANetwork
 
 
 def _make_wrapped_lora(in_dim, out_dim, base_dtype, lora_dtype, *, strip_lora_input=False, strip_match=False):
@@ -56,6 +56,35 @@ def _make_wrapped_lora(in_dim, out_dim, base_dtype, lora_dtype, *, strip_lora_in
 
 def _autocast_ctx(enabled):
     return torch.autocast("cpu", dtype=torch.bfloat16) if enabled else contextlib.nullcontext()
+
+
+class _ToggleTarget(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.proj = nn.Linear(8, 8, bias=False)
+
+    def forward(self, x):
+        return self.proj(x)
+
+
+def test_lora_network_set_enabled_bypasses_training_adapters():
+    torch.manual_seed(0)
+    target = _ToggleTarget()
+    network = LoRANetwork(["_ToggleTarget"], "lora_unet", None, target, lora_dim=4, alpha=4)
+    network.apply_to(None, target, apply_text_encoder=False, apply_unet=True)
+    nn.init.normal_(network.unet_loras[0].lora_up.weight, std=1e-2)
+    x = torch.randn(2, 8)
+
+    enabled_output = target(x)
+    network.set_enabled(False)
+    disabled_output = target(x)
+    expected_base_output = network.unet_loras[0].org_forward(x)
+
+    assert not torch.equal(enabled_output, disabled_output)
+    torch.testing.assert_close(disabled_output, expected_base_output)
+
+    network.set_enabled(True)
+    torch.testing.assert_close(target(x), enabled_output)
 
 
 # --------------------------------------------------------------------------------------

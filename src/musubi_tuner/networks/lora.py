@@ -96,6 +96,7 @@ class LoRAModule(torch.nn.Module):
 
         # same as microsoft's
         self.multiplier = multiplier
+        self.enabled = True
         self.org_module = org_module  # remove in applying
         self.dropout = dropout
         self.rank_dropout = rank_dropout
@@ -136,6 +137,9 @@ class LoRAModule(torch.nn.Module):
         del self.org_module
 
     def forward(self, x):
+        if not self.enabled:
+            return self.org_forward(x)
+
         base_module = getattr(self.org_forward, "__self__", None)
         if (
             getattr(base_module, "_convrot_lora_fused", False)
