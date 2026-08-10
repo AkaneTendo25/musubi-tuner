@@ -523,13 +523,14 @@ def _build_h3_training_cmd(config: ProjectConfig) -> list[str]:
         cmd.append("--int8_convrot_base")
     if t.h3_convrot_int8:
         cmd.append("--h3_convrot_int8")
+    if t.h3_convrot_int8 or t.int8_convrot_base:
         if t.h3_convrot_int8_fwd != "int8":
             cmd += ["--h3_convrot_int8_fwd", t.h3_convrot_int8_fwd]
         if t.h3_convrot_int8_bwd != "bf16":
             cmd += ["--h3_convrot_int8_bwd", t.h3_convrot_int8_bwd]
         if t.h3_convrot_int8_lora_fused:
             cmd.append("--h3_convrot_int8_lora_fused")
-    if t.h3_adaln_rank is not None:
+    if t.h3_adaln_rank is not None and not t.int8_convrot_base:
         cmd += ["--h3_adaln_rank", str(t.h3_adaln_rank)]
     if t.h3_fused_qk_norm_rope:
         cmd.append("--h3_fused_qk_norm_rope")

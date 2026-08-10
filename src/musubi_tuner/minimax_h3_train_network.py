@@ -437,17 +437,18 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             raise ValueError("--h3_base_preservation_loss_weight must be finite and non-negative")
         if args.h3_convrot_int8 and (args.fp8_base or args.int8_convrot_base):
             raise ValueError("--h3_convrot_int8 quantizes the BF16 checkpoint itself; drop --fp8_base/--int8_convrot_base")
-        if args.h3_convrot_int8_bwd == "int8" and not args.h3_convrot_int8:
-            raise ValueError("--h3_convrot_int8_bwd int8 requires --h3_convrot_int8")
-        if args.h3_convrot_int8_fwd == "bf16" and not args.h3_convrot_int8:
-            raise ValueError("--h3_convrot_int8_fwd bf16 requires --h3_convrot_int8")
+        convrot_int8_active = args.h3_convrot_int8 or args.int8_convrot_base
+        if args.h3_convrot_int8_bwd == "int8" and not convrot_int8_active:
+            raise ValueError("--h3_convrot_int8_bwd int8 requires --h3_convrot_int8 or --int8_convrot_base")
+        if args.h3_convrot_int8_fwd == "bf16" and not convrot_int8_active:
+            raise ValueError("--h3_convrot_int8_fwd bf16 requires --h3_convrot_int8 or --int8_convrot_base")
         if args.h3_convrot_int8_fwd == "bf16" and args.h3_convrot_int8_bwd == "int8":
             raise ValueError("--h3_convrot_int8_fwd bf16 leaves no rotated activations for --h3_convrot_int8_bwd int8")
         if args.h3_convrot_int8_lora_fused and not (
-            args.h3_convrot_int8 and args.h3_convrot_int8_fwd == "int8" and args.h3_convrot_int8_bwd == "int8"
+            convrot_int8_active and args.h3_convrot_int8_fwd == "int8" and args.h3_convrot_int8_bwd == "int8"
         ):
             raise ValueError(
-                "--h3_convrot_int8_lora_fused requires --h3_convrot_int8 with "
+                "--h3_convrot_int8_lora_fused requires online or pre-quantized ConvRot INT8 weights with "
                 "--h3_convrot_int8_fwd int8 and --h3_convrot_int8_bwd int8"
             )
         if not 0.0 <= args.h3_caption_dropout_rate <= 1.0:

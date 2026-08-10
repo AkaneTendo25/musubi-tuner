@@ -208,6 +208,25 @@ def test_h3_performance_quantization_controls_are_forwarded(tmp_path: Path) -> N
     assert parsed.h3_fp8_quantization_mode == "channel"
 
 
+def test_h3_prequantized_convrot_controls_are_forwarded_without_reapplying_adaln(tmp_path: Path) -> None:
+    config = _h3_config(tmp_path)
+    training = config.training
+    training.int8_convrot_base = True
+    training.h3_adaln_rank = 16
+    training.h3_convrot_int8_fwd = "bf16"
+    training.h3_convrot_int8_bwd = "bf16"
+
+    command = build_training_cmd(config)
+    script_index = next(index for index, value in enumerate(command) if value.endswith("minimax_h3_train_network.py"))
+    parsed = create_parser().parse_args(command[script_index + 1 :])
+    report = validate_training_config(config)
+
+    assert parsed.int8_convrot_base is True
+    assert parsed.h3_adaln_rank is None
+    assert parsed.h3_convrot_int8_fwd == "bf16"
+    assert "training.h3_convrot_int8_fwd" not in report["field_errors"]
+
+
 def test_h3_performance_validation_matches_trainer_constraints(tmp_path: Path) -> None:
     config = _h3_config(tmp_path)
     training = config.training

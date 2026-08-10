@@ -564,22 +564,23 @@ def validate_training_config(config: ProjectConfig) -> dict[str, Any]:
                 "Online H3 ConvRot INT8 requires the BF16 checkpoint and cannot be combined with FP8 or a pruned INT8 checkpoint."
             )
             errors.append(_make_issue("error", "training.h3_convrot_int8", message, label="Online ConvRot INT8", page="training"))
-        if t.h3_convrot_int8_bwd == "int8" and not t.h3_convrot_int8:
+        convrot_int8_active = t.h3_convrot_int8 or t.int8_convrot_base
+        if t.h3_convrot_int8_bwd == "int8" and not convrot_int8_active:
             errors.append(
                 _make_issue(
                     "error",
                     "training.h3_convrot_int8_bwd",
-                    "INT8 ConvRot backward requires Online ConvRot INT8.",
+                    "INT8 ConvRot backward requires online or pre-quantized ConvRot INT8 weights.",
                     label="ConvRot Backward",
                     page="training",
                 )
             )
-        if t.h3_convrot_int8_fwd == "bf16" and not t.h3_convrot_int8:
+        if t.h3_convrot_int8_fwd == "bf16" and not convrot_int8_active:
             errors.append(
                 _make_issue(
                     "error",
                     "training.h3_convrot_int8_fwd",
-                    "BF16 ConvRot forward requires Online ConvRot INT8.",
+                    "BF16 ConvRot forward requires online or pre-quantized ConvRot INT8 weights.",
                     label="ConvRot Forward",
                     page="training",
                 )
@@ -589,13 +590,13 @@ def validate_training_config(config: ProjectConfig) -> dict[str, Any]:
             errors.append(_make_issue("error", "training.h3_convrot_int8_fwd", message, label="ConvRot Forward", page="training"))
             errors.append(_make_issue("error", "training.h3_convrot_int8_bwd", message, label="ConvRot Backward", page="training"))
         if t.h3_convrot_int8_lora_fused and not (
-            t.h3_convrot_int8 and t.h3_convrot_int8_fwd == "int8" and t.h3_convrot_int8_bwd == "int8"
+            convrot_int8_active and t.h3_convrot_int8_fwd == "int8" and t.h3_convrot_int8_bwd == "int8"
         ):
             errors.append(
                 _make_issue(
                     "error",
                     "training.h3_convrot_int8_lora_fused",
-                    "Fused ConvRot LoRA requires online ConvRot with INT8 forward and backward.",
+                    "Fused ConvRot LoRA requires online or pre-quantized ConvRot weights with INT8 forward and backward.",
                     label="Fused ConvRot LoRA",
                     page="training",
                 )

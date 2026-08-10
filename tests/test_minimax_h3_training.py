@@ -1995,6 +1995,15 @@ def test_h3_trainer_rejects_release_dependent_common_loading_modes(option, value
         MiniMaxH3NetworkTrainer().handle_model_specific_args(args)
 
 
+def test_h3_prequantized_convrot_base_accepts_bf16_forward_control():
+    args = create_parser().parse_args(["--sdpa", "--int8_convrot_base", "--h3_convrot_int8_fwd", "bf16"])
+
+    MiniMaxH3NetworkTrainer().handle_model_specific_args(args)
+
+    assert args.int8_convrot_base is True
+    assert args.h3_convrot_int8_fwd == "bf16"
+
+
 def test_h3_trainer_accepts_compile_and_exposes_fallback_controls():
     args = create_parser().parse_args(["--sdpa", "--compile", "--compile_fallback_to_eager", "--compile_auto_cache_size_limit"])
 
