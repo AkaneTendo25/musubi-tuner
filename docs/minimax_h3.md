@@ -138,6 +138,14 @@ no audio stream trains as video-only with its audio loss masked. References use 
 
 For a directory dataset, `control_directory` holds references whose basename matches each target.
 
+To restrict video or image loss to selected regions, set `loss_mask_directory` to a directory of masks with matching target
+basenames, or set `default_loss_mask_path` as a fallback. A JSONL item may override either with `loss_mask_path` (the alias
+`video_loss_mask_path` is also accepted). A mask may be a still image, video, or frame directory; still images repeat across the
+clip and shorter mask sequences repeat their last frame. White pixels contribute to loss and black pixels do not.
+Mask images with alpha use that channel automatically; `loss_mask_use_alpha = true` instead uses a target image's alpha when no
+external mask is available. `loss_mask_invert = true` reverses the mask. Masks are aligned
+with the target crop during caching and pooled over H3's 5/17-frame latent windows.
+
 ```toml
 [general]
 resolution = [1344, 768]
@@ -459,7 +467,7 @@ loss weight is forced to zero; this isolates direct supervision, not H3's shared
 | `--h3_extension_video_frames N` / `--h3_extension_audio_latents N` | Continuation from an observed prefix. Counts are in **latent** units and each must be shorter than its target; the two are independent, so setting one leaves the other generated in full |
 | `--h3_keyframe_anchors first,11,last` / `--h3_keyframe_random_count N` | Interpolation from arbitrary anchors |
 | `--h3_mask_mode {box,border,segment}` | Inpainting, outpainting, temporal infilling |
-| `--h3_frame_sigma_jitter 0.2` | Spreads noise level across frames, supervising a range of the schedule per step. Skipped for image batches, which have one frame; `0` disables it |
+| `--h3_frame_sigma_jitter 0.2` | Spreads target-frame noise levels across the schedule in one step. Supported by native T2VA/I2VA/FL2VA/L2VA/Ref2VA caches, including guidance-consistent loss, and skipped for images; cannot be combined with in-target observed-row options or sigma-dependent loss weighting; `0` disables it |
 | `--h3_spatial_density_jitter 0.2` | Perturbs the area normalization of the spatial RoPE grids each step, drawn log-uniformly from `[1/1.2, 1.2]`, so fixed-resolution data still trains a range of token spacings. One factor covers every grid in the packed sequence; `0` disables it |
 | `--h3_caption_dropout_rate 0.1` | Trains the unconditional branch; requires `--cache_guidance_empty` |
 

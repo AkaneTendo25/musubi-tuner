@@ -226,10 +226,9 @@ def build_t2va_packed_sequence(
     ``num_latent_frames - 1``. An integer anchor names a latent window by index
     and lands on that window's start, exactly where the matching target row sits.
 
-    ``num_condition_audio_latents`` prepends clean audio latents to the audio
-    block. They occupy the first coordinates of the audio timeline and push the
-    target audio after them, so no coordinate is used twice -- the same
-    arrangement Ref2VA uses for reference audio.
+    ``num_condition_audio_latents`` prepends clean duplicates of the target's
+    opening audio latents. The duplicates share the opening target coordinates,
+    just as keyframe rows share the coordinates of the target frames they show.
 
     ``spatial_density_scale`` rescales the area normalization of every spatial
     grid in the sequence, keyframe rows included, so a scale above 1.0 packs the
@@ -309,8 +308,9 @@ def build_t2va_packed_sequence(
         position_ids[rows, 0] = anchor_time
         position_ids[rows, 1:] = frame_grid
 
-    # Condition audio takes the opening coordinates and the target follows it, so
-    # the two never share a position.
+    # Condition audio duplicates the target's opening span and therefore shares
+    # its coordinates. Shifting the complete target by the context length would
+    # move audio relative to the unchanged video timeline.
     _fill_audio_positions(
         position_ids,
         slice(audio_start, target_audio_start),
@@ -322,7 +322,7 @@ def build_t2va_packed_sequence(
         position_ids,
         slice(target_audio_start, video_start),
         num_audio_latents,
-        float(num_text_rows + num_condition_audio_latents),
+        float(num_text_rows),
         width_grid,
     )
 

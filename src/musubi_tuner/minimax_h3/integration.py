@@ -9,7 +9,9 @@ from typing import Any, Literal
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from PIL import Image
+from safetensors import safe_open
 
 from musubi_tuner.minimax_h3.architecture import IMAGE_FRAME_COUNT, temporal_shape
 from musubi_tuner.minimax_h3.audio import (
@@ -78,6 +80,31 @@ from musubi_tuner.utils.device_utils import clean_memory_on_device
 from musubi_tuner.utils.model_utils import dtype_to_str, str_to_dtype
 
 logger = logging.getLogger(__name__)
+
+
+def _validate_inference_lora_metadata(path: Path, mode: str, reference_image_short_edge: int) -> None:
+    with safe_open(path, framework="pt") as handle:
+        metadata = handle.metadata() or {}
+    trained_mode = metadata.get("ss_h3_training_mode")
+    saved_reference_size = metadata.get("ss_h3_reference_image_short_edge")
+    if trained_mode in {"ref2va", "ref2va_omni"} and saved_reference_size is not None:
+        try:
+            saved_reference_size_int = int(saved_reference_size)
+        except ValueError as exc:
+            raise ValueError(f"invalid ss_h3_reference_image_short_edge metadata in {path}") from exc
+        if mode in {"ref2va", "ref2va_omni"} and saved_reference_size_int != reference_image_short_edge:
+            raise ValueError(
+                f"H3 LoRA {path} was trained with reference_image_short_edge={saved_reference_size_int}, "
+                f"but inference requested {reference_image_short_edge}"
+            )
+    adaln_rank = metadata.get("ss_h3_adaln_rank")
+    if adaln_rank not in {None, "full"}:
+        logger.warning(
+            "H3 LoRA %s was trained against a rank-%s frozen AdaLN approximation; inference uses the selected "
+            "checkpoint's AdaLN projections, so verify output fidelity against the training setup",
+            path,
+            adaln_rank,
+        )
 
 
 def create_latent_encoder(
@@ -389,6 +416,7 @@ class _NativeGenerator:
         networks = []
         for index, weights_path in enumerate(self.lora_weights):
             multiplier = self.lora_multipliers[index] if index < len(self.lora_multipliers) else 1.0
+            _validate_inference_lora_metadata(weights_path, self.mode, self.reference_image_short_edge)
             weights = load_file(weights_path)
             network = lora_minimax_h3.create_arch_network_from_weights(
                 multiplier,
@@ -708,6 +736,20 @@ class _NativeTrainingBackend:
             raise ValueError(f"MiniMax H3 {self.mode} training requires {expected} conditioning; re-cache text outputs")
         if condition_video_anchors and task != "t2va":
             raise ValueError("H3 custom keyframe anchors require --task t2va caches")
+        t2va_only_conditioning = {
+            "observed video rows": observed_video_rows,
+            "observed audio rows": observed_audio_rows,
+            "clean video latents": clean_video_latents,
+            "clean audio latents": clean_audio_latents,
+            "video extension context": extension_video_context,
+            "audio extension context": extension_audio_context,
+        }
+        requested_t2va_only = [name for name, value in t2va_only_conditioning.items() if value is not None]
+        if task != "t2va" and requested_t2va_only:
+            raise ValueError(
+                f"H3 {task.upper()} caches cannot represent {', '.join(requested_t2va_only)}; "
+                "disable that conditioning option, or use FL2VA training with --task t2va caches"
+            )
         has_vision = bool((text_tags == int(MiniMaxH3TokenTag.VIDEO)).any())
         if task == "t2va" and has_vision:
             raise ValueError("MiniMax H3 T2VA training requires text-only conditioning; re-cache with --task t2va")
@@ -766,12 +808,21 @@ class _NativeTrainingBackend:
                 video_rows = torch.cat((reference_video[None], video_rows), dim=1)
             if reference_audio.numel():
                 audio_rows = torch.cat((reference_audio[None], audio_rows), dim=1)
+            row_video_timestep = video_timestep
+            if video_row_schedule is not None:
+                if video_row_schedule.numel() != video_rows.shape[1] - layout.num_condition_video_rows:
+                    raise ValueError(
+                        f"H3 per-row video timesteps have {video_row_schedule.numel()} entries for "
+                        f"{video_rows.shape[1] - layout.num_condition_video_rows} target rows"
+                    )
+                row_video_timestep = video_row_schedule.to(device=model_device, dtype=torch.float32)
             timestep, timestep_indices = build_row_timesteps(
                 layout,
-                video_timestep,
+                row_video_timestep,
                 audio_timestep,
                 condition_video_timestep,
                 torch.ones(1, device=model_device),
+                per_row_timesteps=video_row_schedule is not None,
             )
         elif task in ("i2va", "fl2va", "l2va"):
             anchors = {"i2va": ("first",), "fl2va": ("first", "last"), "l2va": ("last",)}[task]
@@ -799,11 +850,20 @@ class _NativeTrainingBackend:
                 video_timestep.reshape(1).to(model_device, torch.float32),
                 torch.tensor([0.999], device=model_device),
             )
+            row_video_timestep = video_timestep
+            if video_row_schedule is not None:
+                target_rows = video_rows.shape[1] - layout.num_condition_video_rows
+                if video_row_schedule.numel() != target_rows:
+                    raise ValueError(
+                        f"H3 per-row video timesteps have {video_row_schedule.numel()} entries for {target_rows} target rows"
+                    )
+                row_video_timestep = video_row_schedule.to(device=model_device, dtype=torch.float32)
             timestep, timestep_indices = build_row_timesteps(
                 layout,
-                video_timestep,
+                row_video_timestep,
                 audio_timestep,
                 condition_video_timestep,
+                per_row_timesteps=video_row_schedule is not None,
             )
         else:
             # Extension observes a leading run of the target. The observed rows
@@ -1132,6 +1192,45 @@ class _NativeLatentEncoder:
             encode = self.video_encoder.encode_image if is_image else self.video_encoder.encode
             return encode(pixels)[0].to(self.output_dtype)
 
+    @staticmethod
+    def _video_loss_mask(item: Any, latent_shape: tuple[int, int, int]) -> torch.Tensor | None:
+        content = getattr(item, "loss_mask_content", None)
+        if content is None:
+            return None
+        mask = torch.as_tensor(np.asarray(content), dtype=torch.float32)
+        if mask.ndim == 2:
+            mask = mask.unsqueeze(0)
+        if mask.ndim != 3:
+            raise ValueError(f"H3 loss mask must have pixel shape [frames, height, width], got {tuple(mask.shape)}")
+        if mask.numel() and float(mask.max()) > 1.0:
+            mask = mask / 255.0
+        pixel_frames = int(mask.shape[0])
+        latent_frames, latent_height, latent_width = latent_shape
+        if latent_frames == 1:
+            chunks = ((0, pixel_frames, 1),)
+        else:
+            if pixel_frames < 5 or (pixel_frames - 5) % 17:
+                raise ValueError(f"H3 loss mask has {pixel_frames} frames, which is outside the 17n+5 video grid")
+            temporal_blocks = (pixel_frames - 5) // 17
+            expected_latents = 2 + 5 * temporal_blocks
+            if latent_frames != expected_latents:
+                raise ValueError(
+                    f"H3 loss mask has {pixel_frames} frames for {latent_frames} video latents; "
+                    f"expected {expected_latents} latent frames"
+                )
+            chunks = ((0, 5, 2),) + tuple((5 + 17 * index, 5 + 17 * (index + 1), 5) for index in range(temporal_blocks))
+        pooled = []
+        for start, end, output_frames in chunks:
+            if end <= start:
+                raise ValueError("H3 loss mask contains no frames")
+            spatial = F.adaptive_max_pool2d(mask[start:end, None], (latent_height, latent_width))
+            temporal = F.adaptive_max_pool1d(
+                spatial[:, 0].permute(1, 2, 0).reshape(1, latent_height * latent_width, end - start),
+                output_frames,
+            )
+            pooled.append(temporal.reshape(latent_height, latent_width, output_frames).permute(2, 0, 1))
+        return torch.cat(pooled).to(dtype=torch.bool)
+
     def _encode_reference_video(self, content: np.ndarray, *, image: bool) -> torch.Tensor:
         if self.video_encoder is None:
             raise ValueError("MiniMax H3 visual references require --vae during latent caching")
@@ -1254,6 +1353,9 @@ class _NativeLatentEncoder:
                 )
             frame_shape = "x".join(str(value) for value in video.shape[-3:])
             tensors = {f"latents_{frame_shape}_{dtype_name}": video}
+            video_loss_mask = self._video_loss_mask(item, tuple(int(value) for value in video.shape[-3:]))
+            if video_loss_mask is not None:
+                tensors["video_loss_mask"] = video_loss_mask
             if not is_image and target_mode != "video":
                 expected = temporal_shape(video_frame_count)
                 audio, audio_mask = self._encode_audio(item)

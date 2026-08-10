@@ -64,6 +64,7 @@ class ItemInfo:
 
         # np.ndarray for video, list[np.ndarray] for image with multiple controls
         self.control_content: Optional[Union[np.ndarray, list[np.ndarray]]] = None
+        self.loss_mask_content: Optional[np.ndarray] = None
 
         # FramePack architecture specific
         self.fp_latent_window_size: Optional[int] = None
@@ -116,6 +117,10 @@ class BaseDataset(torch.utils.data.Dataset):
         cache_directory: Optional[str] = None,
         debug_dataset: bool = False,
         architecture: str = "no_default",
+        loss_mask_directory: Optional[str] = None,
+        default_loss_mask_path: Optional[str] = None,
+        loss_mask_use_alpha: bool = False,
+        loss_mask_invert: bool = False,
     ):
         self.resolution = resolution
         self.caption_extension = caption_extension
@@ -126,6 +131,10 @@ class BaseDataset(torch.utils.data.Dataset):
         self.cache_directory = cache_directory
         self.debug_dataset = debug_dataset
         self.architecture = architecture
+        self.loss_mask_directory = loss_mask_directory
+        self.default_loss_mask_path = default_loss_mask_path
+        self.loss_mask_use_alpha = loss_mask_use_alpha
+        self.loss_mask_invert = loss_mask_invert
         self.seed = None
         self.current_epoch = 0
         self.shared_epoch = None
@@ -288,6 +297,10 @@ class ImageDataset(BaseDataset):
         control_resolution: Optional[Tuple[int, int]] = None,
         debug_dataset: bool = False,
         architecture: str = "no_default",
+        loss_mask_directory: Optional[str] = None,
+        default_loss_mask_path: Optional[str] = None,
+        loss_mask_use_alpha: bool = False,
+        loss_mask_invert: bool = False,
     ):
         super(ImageDataset, self).__init__(
             resolution,
@@ -299,6 +312,10 @@ class ImageDataset(BaseDataset):
             cache_directory,
             debug_dataset,
             architecture,
+            loss_mask_directory,
+            default_loss_mask_path,
+            loss_mask_use_alpha,
+            loss_mask_invert,
         )
         self.image_directory = image_directory
         self.image_jsonl_file = image_jsonl_file
@@ -330,12 +347,27 @@ class ImageDataset(BaseDataset):
         elif self.architecture == ARCHITECTURE_HIDREAM_O1:
             control_count_per_image = None  # can be multiple control/reference images
 
+        mask_kwargs = (
+            {
+                "loss_mask_directory": loss_mask_directory,
+                "default_loss_mask_path": default_loss_mask_path,
+                "loss_mask_use_alpha": loss_mask_use_alpha,
+                "loss_mask_invert": loss_mask_invert,
+            }
+            if loss_mask_directory or default_loss_mask_path or loss_mask_use_alpha or loss_mask_invert
+            else {}
+        )
         if image_directory is not None:
             self.datasource = ImageDirectoryDatasource(
-                image_directory, caption_extension, control_directory, control_count_per_image, multiple_target
+                image_directory,
+                caption_extension,
+                control_directory,
+                control_count_per_image,
+                multiple_target,
+                **mask_kwargs,
             )
         elif image_jsonl_file is not None:
-            self.datasource = ImageJsonlDatasource(image_jsonl_file, control_count_per_image, multiple_target)
+            self.datasource = ImageJsonlDatasource(image_jsonl_file, control_count_per_image, multiple_target, **mask_kwargs)
         else:
             raise ValueError("image_directory or image_jsonl_file must be specified")
 
@@ -379,7 +411,7 @@ class ImageDataset(BaseDataset):
                         break  # submit batch if possible
 
                 for future in completed_futures:
-                    original_size, item_key, images, caption, controls = future.result()
+                    original_size, item_key, images, caption, controls, loss_mask = future.result()
                     image = images[0]  # use the first image as the main content
                     bucket_height, bucket_width = image.shape[:2]
                     bucket_reso = (bucket_width, bucket_height)
@@ -388,6 +420,7 @@ class ImageDataset(BaseDataset):
                         item_key, caption, original_size, bucket_reso, content=image if len(images) == 1 else images
                     )
                     item_info.latent_cache_path = self.get_latent_cache_path(item_info)
+                    item_info.loss_mask_content = loss_mask
 
                     # for VLM, which require image in addition to text, like Qwen-Image-Edit
                     item_info.text_encoder_output_cache_path = self.get_text_encoder_output_cache_path(item_info)
@@ -437,14 +470,22 @@ class ImageDataset(BaseDataset):
 
         for fetch_op in self.datasource:
             # fetch and resize image in a separate thread
-            def fetch_and_resize(op: callable) -> tuple[tuple[int, int], str, Image.Image, str, Optional[Image.Image]]:
-                image_key, images, caption, controls = op()
+            def fetch_and_resize(
+                op: callable,
+            ) -> tuple[tuple[int, int], str, list[np.ndarray], str, Optional[list[np.ndarray]], Optional[np.ndarray]]:
+                result = op()
+                if len(result) == 4:
+                    image_key, images, caption, controls = result
+                    loss_mask = None
+                else:
+                    image_key, images, caption, controls, loss_mask = result
                 images: list[Image.Image]
                 image: Image.Image = images[0]  # use the first image as the main content
                 image_size = image.size
 
                 bucket_reso = bucket_selector.get_bucket_resolution(image_size)
                 images = [resize_image_to_bucket(img, bucket_reso) for img in images]  # list of np.ndarray
+                resized_loss_mask = resize_image_to_bucket(loss_mask, bucket_reso) if loss_mask is not None else None
 
                 resized_controls = None
                 if controls is not None:
@@ -479,7 +520,7 @@ class ImageDataset(BaseDataset):
                             resized_control = resize_image_to_bucket(control, bucket_reso)
                             resized_controls.append(resized_control)
 
-                return image_size, image_key, images, caption, resized_controls
+                return image_size, image_key, images, caption, resized_controls, resized_loss_mask
 
             future = executor.submit(fetch_and_resize, fetch_op)
             futures.append(future)
@@ -612,6 +653,10 @@ class VideoDataset(BaseDataset):
         fp_latent_window_size: Optional[int] = 9,
         debug_dataset: bool = False,
         architecture: str = "no_default",
+        loss_mask_directory: Optional[str] = None,
+        default_loss_mask_path: Optional[str] = None,
+        loss_mask_use_alpha: bool = False,
+        loss_mask_invert: bool = False,
     ):
         super(VideoDataset, self).__init__(
             resolution,
@@ -623,6 +668,10 @@ class VideoDataset(BaseDataset):
             cache_directory,
             debug_dataset,
             architecture,
+            loss_mask_directory,
+            default_loss_mask_path,
+            loss_mask_use_alpha,
+            loss_mask_invert,
         )
         self.video_directory = video_directory
         self.video_jsonl_file = video_jsonl_file
@@ -680,10 +729,20 @@ class VideoDataset(BaseDataset):
 
         self.target_frames = target_frames
 
+        mask_kwargs = (
+            {
+                "loss_mask_directory": loss_mask_directory,
+                "default_loss_mask_path": default_loss_mask_path,
+                "loss_mask_use_alpha": loss_mask_use_alpha,
+                "loss_mask_invert": loss_mask_invert,
+            }
+            if loss_mask_directory or default_loss_mask_path or loss_mask_use_alpha or loss_mask_invert
+            else {}
+        )
         if video_directory is not None:
-            self.datasource = VideoDirectoryDatasource(video_directory, caption_extension, control_directory)
+            self.datasource = VideoDirectoryDatasource(video_directory, caption_extension, control_directory, **mask_kwargs)
         elif video_jsonl_file is not None:
-            self.datasource = VideoJsonlDatasource(video_jsonl_file)
+            self.datasource = VideoJsonlDatasource(video_jsonl_file, **mask_kwargs)
 
         if self.frame_extraction == "uniform" and self.frame_sample == 1:
             self.frame_extraction = "head"
@@ -741,7 +800,7 @@ class VideoDataset(BaseDataset):
                         break  # submit batch if possible
 
                 for future in completed_futures:
-                    original_frame_size, video_key, video, caption, control = future.result()
+                    original_frame_size, video_key, video, caption, control, loss_mask = future.result()
 
                     frame_count = len(video)
                     video = np.stack(video, axis=0)
@@ -822,6 +881,9 @@ class VideoDataset(BaseDataset):
                         )
                         item_info.latent_cache_path = self.get_latent_cache_path(item_info)
                         item_info.control_content = cropped_control  # None is allowed
+                        item_info.loss_mask_content = (
+                            loss_mask[crop_pos : crop_pos + target_frame] if loss_mask is not None else None
+                        )
                         item_info.fp_latent_window_size = self.fp_latent_window_size
 
                         batch = batches.get(batch_key, [])
@@ -843,14 +905,27 @@ class VideoDataset(BaseDataset):
 
         for operator in self.datasource:
 
-            def fetch_and_resize(op: callable) -> tuple[tuple[int, int], str, list[np.ndarray], str, Optional[list[np.ndarray]]]:
+            def fetch_and_resize(
+                op: callable,
+            ) -> tuple[
+                tuple[int, int],
+                str,
+                list[np.ndarray],
+                str,
+                Optional[list[np.ndarray]],
+                Optional[list[np.ndarray]],
+            ]:
                 result = op()
 
                 if len(result) == 3:  # for backward compatibility TODO remove this in the future
                     video_key, video, caption = result
                     control = None
-                else:
+                    loss_mask = None
+                elif len(result) == 4:
                     video_key, video, caption, control = result
+                    loss_mask = None
+                else:
+                    video_key, video, caption, control, loss_mask = result
 
                 video: list[np.ndarray]
                 frame_size = (video[0].shape[1], video[0].shape[0])
@@ -863,7 +938,10 @@ class VideoDataset(BaseDataset):
                 if control is not None:
                     control = [resize_image_to_bucket(frame, bucket_reso) for frame in control]
 
-                return frame_size, video_key, video, caption, control
+                if loss_mask is not None:
+                    loss_mask = [resize_image_to_bucket(frame, bucket_reso) for frame in loss_mask]
+
+                return frame_size, video_key, video, caption, control, loss_mask
 
             future = executor.submit(fetch_and_resize, operator)
             futures.append(future)

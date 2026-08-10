@@ -1,5 +1,6 @@
-from contextlib import nullcontext
 import shutil
+from contextlib import nullcontext
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -299,7 +300,7 @@ def test_h3_crepa_neighbor_objective_matches_valid_comparison_normalization():
     crepa._teacher = torch.tensor([[[3.0], [4.0]]])
     crepa._effective_weight = config.weight
     loss, metrics = crepa.loss()
-    expected = -config.weight * (11.0 + 10.0 / torch.e) / 2.0
+    expected = -config.weight * (11.0 + 10.0 / torch.e) / 4.0
     torch.testing.assert_close(loss, loss.new_tensor(expected))
     expected_alignment = ((3.0 + 4.0 / torch.e) + (8.0 + 6.0 / torch.e)) / (2.0 * (1.0 + 1.0 / torch.e))
     assert metrics["crepa/alignment"] == pytest.approx(float(expected_alignment))
@@ -570,9 +571,9 @@ def test_h3_keyframe_anchors_reject_invalid_indices(anchor):
         _anchor_layout((anchor,))
 
 
-def test_h3_condition_audio_precedes_the_target_without_sharing_coordinates():
-    # Condition audio takes the opening coordinates and the target starts after
-    # them, matching how Ref2VA places reference audio.
+def test_h3_condition_audio_shares_the_opening_target_coordinates():
+    # Condition audio duplicates the opening target span, so both use the same
+    # rotary coordinates and remain aligned with the video timeline.
     layout = _anchor_layout(condition_audio=2)
     audio = layout.audio_indices
 
@@ -580,8 +581,9 @@ def test_h3_condition_audio_precedes_the_target_without_sharing_coordinates():
     condition_times = layout.position_ids[audio[: layout.num_condition_audio_rows], 0]
     target_times = layout.position_ids[audio[layout.num_condition_audio_rows :], 0]
     torch.testing.assert_close(condition_times, torch.tensor([4.0, 5.0, 4.0, 5.0], dtype=torch.float64))
-    torch.testing.assert_close(target_times, torch.tensor([6.0, 7.0, 8.0, 6.0, 7.0, 8.0], dtype=torch.float64))
-    assert not set(condition_times.tolist()) & set(target_times.tolist())
+    torch.testing.assert_close(target_times, torch.tensor([4.0, 5.0, 6.0, 4.0, 5.0, 6.0], dtype=torch.float64))
+    torch.testing.assert_close(condition_times[:2], target_times[:2])
+    torch.testing.assert_close(condition_times[2:], target_times[3:5])
 
 
 def test_h3_condition_audio_is_absent_by_default():
@@ -1064,6 +1066,7 @@ def test_native_h3_fl2va_backend_runs_keyframe_conditioned_target_only_backward(
         audio,
         torch.tensor([0.4]),
         torch.tensor([0.7]),
+        video_row_schedule=torch.linspace(0.2, 0.8, 2),
     )
     loss = prediction.video.square().mean()
     if prediction.audio is not None:
@@ -1153,6 +1156,7 @@ def test_native_h3_ref2va_backend_runs_target_only_forward_and_backward(mode, wi
         audio,
         torch.tensor([0.4]),
         torch.tensor([0.7]),
+        video_row_schedule=torch.tensor([0.6]),
     )
     loss = prediction.video.square().mean()
     if prediction.audio is not None:
@@ -1369,13 +1373,33 @@ def test_joint_loss_masks_audio_padding_and_supports_both_balances():
         balance="modality",
     )
     torch.testing.assert_close(video_only.loss, torch.tensor(5.0))
-    with pytest.raises(ValueError, match="exclude every"):
-        joint_velocity_loss(
-            prediction,
-            inputs,
-            video_mask=torch.zeros(1, 1, 1, 2, dtype=torch.bool),
-            audio_mask=torch.zeros_like(audio_mask),
-        )
+    skipped = joint_velocity_loss(
+        prediction,
+        inputs,
+        video_mask=torch.zeros(1, 1, 1, 2, dtype=torch.bool),
+        audio_mask=torch.zeros_like(audio_mask),
+    )
+    assert skipped.video_elements == skipped.audio_elements == 0
+    torch.testing.assert_close(skipped.loss, torch.tensor(0.0))
+
+
+def test_joint_loss_applies_modality_specific_sample_weights():
+    video = torch.zeros(2, 1, 1, 1, 1)
+    audio = torch.zeros(2, 1, 1, 1)
+    inputs = prepare_joint_noisy_inputs(video, audio, video.clone(), audio.clone(), torch.full((2,), 0.5))
+    prediction = H3ModelPrediction(torch.ones_like(video), torch.ones_like(audio))
+
+    result = joint_velocity_loss(
+        prediction,
+        inputs,
+        video_sample_weight=torch.tensor([1.0, 3.0]),
+        audio_sample_weight=torch.tensor([2.0, 4.0]),
+        balance="modality",
+    )
+
+    torch.testing.assert_close(result.video_loss, torch.tensor(2.0))
+    torch.testing.assert_close(result.audio_loss, torch.tensor(3.0))
+    torch.testing.assert_close(result.loss, torch.tensor(2.5))
 
 
 def test_h3_text_cache_contract_and_optional_empty_pair(tmp_path):
@@ -1481,6 +1505,70 @@ def test_standard_bucket_manager_requires_dino_cache_only_when_enabled(tmp_path)
     manager.load_h3_dino_features = True
     with pytest.raises(FileNotFoundError, match="cache_dino_features"):
         manager[0]
+
+
+def test_standard_bucket_manager_rejects_dino_cache_from_another_model(tmp_path):
+    latent_path = tmp_path / "sample_mmh3.safetensors"
+    text_path = tmp_path / "sample_mmh3_te.safetensors"
+    dino_path = tmp_path / "sample_mmh3_dino.safetensors"
+    save_file({"latents_float32": torch.zeros(1)}, latent_path)
+    save_file({"text_float32": torch.zeros(1)}, text_path)
+    save_file(
+        {"h3_dino_features": torch.zeros(2, 4, 384, dtype=torch.float16)},
+        dino_path,
+        metadata={"dino_model": "dinov2_vits14", "frames": "2", "patches": "4", "channels": "384"},
+    )
+    item = ItemInfo("sample", "caption", (64, 64), (64, 64), latent_cache_path=str(latent_path))
+    item.text_encoder_output_cache_path = str(text_path)
+    manager = BucketBatchManager({(64, 64): [item]}, batch_size=1)
+    manager.load_h3_dino_features = True
+    manager.h3_dino_model = "dinov2_vitb14"
+
+    with pytest.raises(ValueError, match="dinov2_vits14.*dinov2_vitb14"):
+        manager[0]
+
+
+def test_h3_timestep_bucket_pool_round_trips_through_accelerator_state_hooks(tmp_path):
+    class Transformer:
+        @staticmethod
+        def set_gradient_checkpointing_blocks(_value):
+            pass
+
+        @staticmethod
+        def set_activation_cpu_offload_pin_memory(_value):
+            pass
+
+    class Accelerator:
+        is_main_process = True
+
+        def __init__(self):
+            self.save_hooks = []
+            self.load_hooks = []
+
+        def register_save_state_pre_hook(self, hook):
+            self.save_hooks.append(hook)
+
+        def register_load_state_pre_hook(self, hook):
+            self.load_hooks.append(hook)
+
+    args = SimpleNamespace(
+        h3_gradient_checkpointing_blocks=None,
+        h3_gradient_checkpointing_cpu_offload_pin_memory=False,
+        h3_reusable_activation_offload=False,
+        h3_fused_qk_norm_rope=False,
+        h3_convrot_int8_lora_fused=False,
+    )
+    accelerator = Accelerator()
+    trainer = MiniMaxH3NetworkTrainer()
+    trainer.num_timestep_buckets = 4
+    trainer.timestep_range_pool = [(0.0, 0.25), (0.5, 0.75)]
+    trainer.on_transformer_loaded(args, accelerator, Transformer())
+
+    accelerator.save_hooks[0]([], [], tmp_path)
+    trainer.timestep_range_pool = []
+    accelerator.load_hooks[0]([], tmp_path)
+
+    assert trainer.timestep_range_pool == [(0.0, 0.25), (0.5, 0.75)]
 
 
 class MiniMaxH3TransformerBlock(nn.Module):
@@ -1978,6 +2066,57 @@ def test_h3_trainer_base_preservation_replays_rng_and_restores_network():
     assert transformer.scale.grad is not None and torch.isfinite(transformer.scale.grad)
 
 
+def test_h3_base_preservation_uses_the_primary_generated_region_mask(monkeypatch):
+    args = create_parser().parse_args([])
+    args.h3_base_preservation_loss_weight = 0.1
+    trainer = MiniMaxH3NetworkTrainer()
+    trainer.dit_dtype = torch.float32
+    trainer._mask_mode = "box"
+    generated = torch.zeros(2, 2, 2, dtype=torch.bool)
+    generated[1] = True
+    trainer._draw_step_mask = lambda inputs, patch_size: SimpleNamespace(
+        video_rows=torch.zeros(2, dtype=torch.bool),
+        audio_rows=None,
+        video_latent=generated,
+        audio_latent=None,
+    )
+    transformer = _ScaleTransformer()
+    network = _ToggleNetwork(transformer)
+
+    def predict(_accelerator, _transformer, _batch, inputs, **kwargs):
+        del kwargs
+        scale = transformer.scale if getattr(transformer, "adapter_enabled", True) else transformer.scale.detach() * 0 + 1.0
+        return H3ModelPrediction(inputs.video * scale, None)
+
+    trainer._predict = predict
+    captured = {}
+    original = h3_train_network.joint_prediction_loss
+
+    def capture(*args, **kwargs):
+        captured["video_mask"] = kwargs["video_mask"].clone()
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(h3_train_network, "joint_prediction_loss", capture)
+    video = torch.zeros(1, 24, 2, 2, 2)
+    trainer.process_batch(
+        args,
+        _FakeAccelerator(),
+        transformer,
+        network,
+        {"timesteps": [0.5], "video_loss_mask": torch.ones(1, 2, 2, 2, dtype=torch.bool)},
+        video,
+        torch.ones_like(video),
+        None,
+        torch.float32,
+        torch.float32,
+        None,
+        0,
+    )
+
+    assert not captured["video_mask"][:, :, 0].any()
+    assert captured["video_mask"][:, :, 1].all()
+
+
 def test_h3_sparse_base_preservation_skips_teacher_forward():
     args = create_parser().parse_args([])
     args.h3_base_preservation_loss_weight = 0.1
@@ -2060,7 +2199,21 @@ def test_h3_base_preservation_probability_is_validated(probability):
         MiniMaxH3NetworkTrainer().handle_model_specific_args(args)
 
 
-def test_h3_base_preservation_draw_is_rng_neutral_and_broadcast(monkeypatch):
+def test_h3_base_preservation_rejects_networks_without_runtime_disable_support():
+    args = create_parser().parse_args([])
+    args.h3_base_preservation_loss_weight = 0.1
+
+    with pytest.raises(TypeError, match="set_enabled"):
+        MiniMaxH3NetworkTrainer().extra_trainable_params(
+            args,
+            _FakeAccelerator(),
+            object(),
+            None,
+            [],
+        )
+
+
+def test_h3_base_preservation_draw_advances_cpu_rng_and_broadcasts(monkeypatch):
     broadcasts = []
     monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
     monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
@@ -2068,6 +2221,7 @@ def test_h3_base_preservation_draw_is_rng_neutral_and_broadcast(monkeypatch):
     monkeypatch.setattr(torch.distributed, "broadcast", lambda value, src: broadcasts.append((value.clone(), src)))
 
     torch.manual_seed(321)
+    torch.rand(())
     expected_next = torch.rand(())
     torch.manual_seed(321)
     MiniMaxH3NetworkTrainer._base_preservation_active(_FakeAccelerator(), 0.5)
@@ -2625,14 +2779,15 @@ def test_h3_extension_context_rows_anchor_on_their_own_target_frames():
         torch.testing.assert_close(condition_time, target_time)
 
 
-def test_h3_extension_audio_context_precedes_the_target_timeline():
+def test_h3_extension_audio_context_shares_the_opening_target_timeline():
     layout = _extension_layout(audio_context=2)
 
     assert layout.num_condition_audio_rows == 4
     audio = layout.audio_indices
     condition = layout.position_ids[audio[: layout.num_condition_audio_rows], 0]
     target = layout.position_ids[audio[layout.num_condition_audio_rows :], 0]
-    assert float(condition.max()) < float(target.min())
+    torch.testing.assert_close(condition[:2], target[:2])
+    torch.testing.assert_close(condition[2:], target[5:7])
 
 
 def test_h3_extension_loss_mask_drops_the_observed_video_frames():
@@ -3097,6 +3252,22 @@ def test_h3_frame_sigma_jitter_gives_each_frame_its_own_noise_level():
     torch.testing.assert_close(schedule, 1.0 - per_frame.to(schedule.dtype), rtol=1e-4, atol=1e-4)
 
 
+@pytest.mark.parametrize("base", [0.0, 1.0])
+def test_h3_frame_sigma_jitter_does_not_collapse_probability_at_schedule_endpoints(base):
+    trainer = _jitter_trainer(0.2)
+    args = create_parser().parse_args([])
+    clean = torch.zeros(1, 4, 8, 2, 2)
+    noise = torch.ones_like(clean)
+
+    result, _ = trainer._apply_frame_sigma_jitter(args, _jitter_inputs(clean, noise), clean, noise, torch.tensor([base]), False)
+
+    per_frame = result.video[0, 0, :, 0, 0]
+    assert bool(((per_frame > 0) & (per_frame < 1)).all())
+    assert len(set(per_frame.tolist())) > 1
+    torch.testing.assert_close(result.video_sigma, per_frame.mean().reshape(1))
+    torch.testing.assert_close(result.video_timestep, 1.0 - result.video_sigma)
+
+
 def test_h3_frame_sigma_jitter_leaves_the_flow_target_alone():
     # The target x0 - noise does not depend on sigma, so jitter must not change it.
     trainer = _jitter_trainer(0.3)
@@ -3132,6 +3303,31 @@ def test_h3_frame_sigma_jitter_is_validated(jitter):
 
     with pytest.raises(ValueError, match="h3_frame_sigma_jitter"):
         trainer.handle_model_specific_args(args)
+
+
+@pytest.mark.parametrize("conflict", ["sigma_sqrt", "cosmap"])
+def test_h3_frame_sigma_jitter_rejects_scalar_sigma_objectives(conflict):
+    args = create_parser().parse_args([])
+    args.h3_frame_sigma_jitter = 0.1
+    args.weighting_scheme = conflict
+
+    with pytest.raises(ValueError, match="h3_frame_sigma_jitter"):
+        MiniMaxH3NetworkTrainer().handle_model_specific_args(args)
+
+
+def test_h3_frame_sigma_jitter_supports_sigma_scheduled_guidance_per_frame():
+    args = create_parser().parse_args([])
+    args.h3_guidance_distillation_scale = 3.0
+    args.h3_guidance_loss_schedule = "sigma"
+    inputs = _jitter_inputs(torch.zeros(1, 4, 3, 1, 1), torch.ones(1, 4, 3, 1, 1))
+    inputs = replace(inputs, video_frame_sigma=torch.tensor([0.1, 0.5, 0.9]))
+    guided = H3ModelPrediction(torch.ones_like(inputs.video), None)
+    empty = H3ModelPrediction(torch.zeros_like(inputs.video), None)
+
+    corrected, _ = MiniMaxH3NetworkTrainer._guidance_loss_inputs(args, guided, empty, inputs)
+
+    expected = 1.0 / (1.0 + 2.0 * inputs.video_frame_sigma)
+    torch.testing.assert_close(corrected.video[0, 0, :, 0, 0], expected)
 
 
 def test_h3_keyframe_last_is_not_collapsed_to_the_final_index():
@@ -3210,4 +3406,15 @@ def test_native_h3_backend_accepts_named_and_indexed_condition_anchors(anchors):
             torch.tensor([0.7]),
             condition_video_anchors=anchors,
             extension_video_context=torch.randn(1, 4, len(anchors), 2, 2),
+        )
+
+    with pytest.raises(ValueError, match="cannot represent observed video rows"):
+        backend.predict_training(
+            transformer,
+            batch,
+            video,
+            torch.randn(1, 2, 6, 1),
+            torch.tensor([0.4]),
+            torch.tensor([0.7]),
+            observed_video_rows=torch.zeros(3, dtype=torch.bool),
         )

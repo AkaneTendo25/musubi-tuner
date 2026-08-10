@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
+from PIL import Image
 from safetensors import safe_open
 from safetensors.torch import save_file
 
@@ -17,6 +18,7 @@ from musubi_tuner.dataset.config_utils import (
     BlueprintGenerator,
     ConfigSanitizer,
 )
+from musubi_tuner.dataset.datasources import ImageDirectoryDatasource, VideoJsonlDatasource
 from musubi_tuner.dataset.image_video_dataset import ItemInfo
 from musubi_tuner.minimax_h3 import backend as h3_backend
 from musubi_tuner.minimax_h3 import integration as h3_integration
@@ -76,6 +78,25 @@ from musubi_tuner.minimax_h3_generate_video import create_parser, request_from_a
 def _write_safetensors_header(path: Path, tensors: dict) -> None:
     header = json.dumps(tensors).encode("utf-8")
     path.write_bytes(struct.pack("<Q", len(header)) + header)
+
+
+def test_h3_inference_validates_lora_training_metadata(tmp_path, caplog):
+    path = tmp_path / "adapter.safetensors"
+    save_file(
+        {"probe": torch.zeros(1)},
+        path,
+        metadata={
+            "ss_h3_training_mode": "ref2va",
+            "ss_h3_reference_image_short_edge": "448",
+            "ss_h3_adaln_rank": "16",
+        },
+    )
+
+    with pytest.raises(ValueError, match="trained with reference_image_short_edge=448"):
+        h3_integration._validate_inference_lora_metadata(path, "ref2va", 2048)
+    h3_integration._validate_inference_lora_metadata(path, "ref2va", 448)
+
+    assert "rank-16 frozen AdaLN approximation" in caplog.text
 
 
 def test_public_request_modes_and_limits(tmp_path):
@@ -573,7 +594,10 @@ def test_ref2va_reference_geometry_matches_released_preprocessing():
     assert resolve_reference_image_size(80, 48) == (2048, 3424)
     assert resolve_reference_image_size(48, 80) == (3424, 2048)
     assert resolve_reference_video_size(1344, 768) == (768, 1344)
-    assert trim_reference_frames(1) == 22
+    assert trim_reference_frames(1) == 1
+    assert trim_reference_frames(4) == 1
+    assert trim_reference_frames(5) == 5
+    assert trim_reference_frames(21) == 5
     assert trim_reference_frames(25) == 22
     assert trim_reference_frames(124) == 124
 
@@ -861,6 +885,45 @@ def test_native_latent_encoder_uses_direct_image_vae_path_and_omits_audio():
     assert set(tensors) == {"latents_1x2x2_float32"}
 
 
+def test_native_latent_encoder_pools_pixel_loss_masks_to_h3_latent_windows():
+    class VideoEncoder(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.marker = torch.nn.Parameter(torch.zeros(()), requires_grad=False)
+
+        def encode(self, pixels):
+            assert pixels.shape[2] == 39
+            return torch.zeros(1, 24, 12, 2, 2)
+
+        def encode_reference(self, pixels, *, image):
+            del pixels
+            assert image
+            return torch.zeros(1, 24, 1, 2, 2)
+
+    mask = np.zeros((39, 32, 32), dtype=np.uint8)
+    mask[0, 0, 0] = 255
+    mask[5, -1, -1] = 255
+    mask[22, 16, 16] = 255
+    item = SimpleNamespace(
+        content=np.zeros((39, 32, 32, 3), dtype=np.uint8),
+        loss_mask_content=mask,
+        item_key="masked.mp4",
+        h3_target_mode="video",
+        h3_media_assets=(MediaAsset(Path("masked.mp4"), MediaModality.VIDEO, "target"),),
+    )
+    encoder = h3_integration._NativeLatentEncoder(VideoEncoder(), None, torch.float32)
+    encoder._encode_references = lambda item: {}
+
+    (tensors,) = encoder.encode_latents([item])
+
+    cached = tensors["video_loss_mask"]
+    assert cached.shape == (12, 2, 2) and cached.dtype == torch.bool
+    assert cached[0, 0, 0]
+    assert cached[2:7, 1, 1].any()
+    assert cached[7:].any()
+    assert int(cached.sum()) == 3
+
+
 def test_h3_training_uses_crop_specific_text_cache_identity(tmp_path):
     video_directory = tmp_path / "videos"
     cache_directory = tmp_path / "cache"
@@ -908,7 +971,7 @@ def test_h3_latent_cache_requires_native_primary_latent_key(tmp_path):
         )
 
 
-def test_h3_uses_existing_video_dataset_fields_only(tmp_path):
+def test_h3_dataset_accepts_loss_mask_sources(tmp_path):
     manifest = tmp_path / "videos.jsonl"
     manifest.write_text(json.dumps({"video_path": "target.mp4", "caption": "prompt"}), encoding="utf-8")
     config = {
@@ -919,16 +982,84 @@ def test_h3_uses_existing_video_dataset_fields_only(tmp_path):
                 "cache_directory": str(tmp_path / "cache"),
                 "target_frames": [22],
                 "frame_extraction": "uniform",
+                "loss_mask_directory": str(tmp_path / "masks"),
+                "default_loss_mask_path": str(tmp_path / "default.png"),
+                "loss_mask_use_alpha": True,
+                "loss_mask_invert": True,
             }
         ],
     }
     dataset_group, _ = create_h3_dataset_group(config, Namespace(debug_dataset=False))
     dataset = dataset_group.datasets[0]
+    assert dataset.loss_mask_directory == str(tmp_path / "masks")
+    assert dataset.default_loss_mask_path == str(tmp_path / "default.png")
+    assert dataset.loss_mask_use_alpha and dataset.loss_mask_invert
     assert dataset.source_fps is None
     assert dataset.target_fps == 24.0
     assert dataset.vae_frame_stride == 17
     assert dataset.vae_frame_base == 5
     assert dataset.target_frames == (22,)
+
+
+def test_image_datasource_loads_stem_matched_alpha_loss_mask(tmp_path):
+    images = tmp_path / "images"
+    masks = tmp_path / "masks"
+    images.mkdir()
+    masks.mkdir()
+    Image.new("RGB", (2, 2), "black").save(images / "sample.png")
+    (images / "sample.txt").write_text("caption", encoding="utf-8")
+    alpha = np.array([[0, 255], [64, 128]], dtype=np.uint8)
+    rgba = np.zeros((2, 2, 4), dtype=np.uint8)
+    rgba[..., 3] = alpha
+    Image.fromarray(rgba).save(masks / "sample.png")
+    datasource = ImageDirectoryDatasource(
+        str(images),
+        ".txt",
+        loss_mask_directory=str(masks),
+        loss_mask_invert=True,
+    )
+
+    _, _, _, _, loss_mask = datasource.get_image_data(0)
+
+    np.testing.assert_array_equal(np.asarray(loss_mask), 255 - alpha)
+
+
+def test_image_datasource_uses_target_alpha_as_loss_mask_fallback(tmp_path):
+    images = tmp_path / "images"
+    images.mkdir()
+    alpha = np.array([[0, 255], [64, 128]], dtype=np.uint8)
+    rgba = np.zeros((2, 2, 4), dtype=np.uint8)
+    rgba[..., 3] = alpha
+    Image.fromarray(rgba).save(images / "sample.png")
+    (images / "sample.txt").write_text("caption", encoding="utf-8")
+    datasource = ImageDirectoryDatasource(str(images), ".txt", loss_mask_use_alpha=True)
+
+    _, _, _, _, loss_mask = datasource.get_image_data(0)
+
+    np.testing.assert_array_equal(np.asarray(loss_mask), alpha)
+
+
+def test_video_jsonl_datasource_aligns_and_extends_loss_mask_frames(tmp_path):
+    video_frames = tmp_path / "video"
+    mask_frames = tmp_path / "mask"
+    video_frames.mkdir()
+    mask_frames.mkdir()
+    for index in range(5):
+        Image.new("RGB", (2, 2), "black").save(video_frames / f"{index:03}.png")
+    Image.new("L", (2, 2), 0).save(mask_frames / "000.png")
+    Image.new("L", (2, 2), 255).save(mask_frames / "001.png")
+    manifest = tmp_path / "videos.jsonl"
+    manifest.write_text(
+        json.dumps({"video_path": str(video_frames), "caption": "caption", "loss_mask_path": str(mask_frames)}),
+        encoding="utf-8",
+    )
+
+    datasource = VideoJsonlDatasource(str(manifest))
+    _, video, _, _, loss_mask = datasource.get_video_data(0)
+
+    assert len(video) == len(loss_mask) == 5
+    assert not np.asarray(loss_mask[0]).any()
+    assert all(np.asarray(frame).all() for frame in loss_mask[1:])
 
 
 def test_cache_cli_uses_native_musubi_dataset_config(tmp_path):

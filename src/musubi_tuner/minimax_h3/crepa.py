@@ -305,8 +305,7 @@ class H3CREPA(torch.nn.Module):
                         alignment_sum[:, frame] += temporal_weight * nearby
                         alignment_weight[:, frame] += temporal_weight
                         comparison_count += 1
-        average_comparisons_per_frame = max(comparison_count / frame_count, 1.0)
-        unweighted_loss = loss_by_batch.mean() / average_comparisons_per_frame
+        unweighted_loss = loss_by_batch.mean() / max(comparison_count, 1)
         similarity = (alignment_sum / alignment_weight.clamp_min(torch.finfo(student.dtype).eps)).mean()
         self_similarity = (self_sum / frame_count).mean()
         score = float(similarity.detach())

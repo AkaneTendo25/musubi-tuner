@@ -3,15 +3,16 @@ from __future__ import annotations
 import argparse
 import copy
 import gc
+import json
 import logging
 import math
 import time
 from collections.abc import Sequence
 from contextlib import nullcontext
 from dataclasses import replace
-from types import SimpleNamespace
 from multiprocessing import Value
 from pathlib import Path
+from types import SimpleNamespace
 
 import torch
 from accelerate import Accelerator
@@ -41,14 +42,6 @@ from musubi_tuner.minimax_h3.cache import (
 from musubi_tuner.minimax_h3.component_loader import load_audio_vae_decoder, load_video_vae_decoder
 from musubi_tuner.minimax_h3.crepa import H3CREPA, H3CREPAConfig, parse_crepa_config
 from musubi_tuner.minimax_h3.dataset import create_h3_dataset_group
-from musubi_tuner.minimax_h3.packing import AUDIO_CHANNELS
-from musubi_tuner.minimax_h3.masking import (
-    audio_mask_to_rows,
-    rows_to_latent_video_mask,
-    sample_audio_mask,
-    sample_video_mask,
-    video_mask_to_rows,
-)
 from musubi_tuner.minimax_h3.inference import (
     decode_latents_sequentially,
     denoise_fl2va,
@@ -56,6 +49,14 @@ from musubi_tuner.minimax_h3.inference import (
     prepare_keyframe_image,
     save_av_mp4,
 )
+from musubi_tuner.minimax_h3.masking import (
+    audio_mask_to_rows,
+    rows_to_latent_video_mask,
+    sample_audio_mask,
+    sample_video_mask,
+    video_mask_to_rows,
+)
+from musubi_tuner.minimax_h3.packing import AUDIO_CHANNELS
 from musubi_tuner.minimax_h3.references import REFERENCE_IMAGE_SHORT_EDGE
 from musubi_tuner.minimax_h3.training import (
     H3ModelPrediction,
@@ -142,16 +143,15 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
     @staticmethod
     def _base_preservation_active(accelerator: Accelerator, probability: float) -> bool:
         """Draw one preservation decision shared by every distributed rank."""
+        if probability >= 1.0:
+            return True
         device = accelerator.device
         distributed = torch.distributed.is_available() and torch.distributed.is_initialized()
-        if not distributed or torch.distributed.get_rank() == 0:
-            fork_devices = [device] if device.type == "cuda" else []
-            # Sampling whether to run the teacher must not perturb the stochastic
-            # conditioning replay shared by empty, base, and trainable branches.
-            with torch.random.fork_rng(devices=fork_devices):
-                active = torch.rand((), device=device) < probability
-        else:
-            active = torch.zeros((), device=device, dtype=torch.bool)
+        # Draw on CPU before any replayed model branch. Every rank advances its
+        # own seeded CPU stream once; rank zero's decision is then authoritative.
+        # This keeps the CUDA replay untouched without restoring the Bernoulli
+        # generator to the same position after every call.
+        active = (torch.rand((), device="cpu") < probability).to(device=device)
         if distributed:
             torch.distributed.broadcast(active, src=0)
         return bool(active.item())
@@ -277,6 +277,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         self._step_mask = None
         self._step_row_video_timestep = None
         self._step_spatial_density_scale = None
+        self._step_keyframes = None
         if self._validation_dataloader is None:
             self._validation_dataloader = self._build_validation_dataloader(args, accelerator)
 
@@ -393,15 +394,14 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                     else:
                         loss_inputs = inputs
 
-                    sample_weight = self._sample_weight(
-                        args, inputs.audio_sigma if observed == "video" or not has_video else inputs.video_sigma
-                    )
+                    video_sample_weight = self._sample_weight(args, inputs.video_sigma) if has_video else None
+                    audio_sample_weight = self._sample_weight(args, inputs.audio_sigma) if has_audio else None
                     if prediction.video is not None and loss_inputs.video_target is not None and video_weight > 0:
                         total, count = masked_squared_error_sum(
                             prediction.video,
                             loss_inputs.video_target,
                             batch.get("video_loss_mask"),
-                            sample_weight=sample_weight,
+                            sample_weight=video_sample_weight,
                         )
                         accumulator.add(sigma_bin.index, "video", total, count)
                     if prediction.audio is not None and loss_inputs.audio_target is not None and audio_weight > 0:
@@ -409,7 +409,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                             prediction.audio,
                             loss_inputs.audio_target,
                             batch.get("audio_loss_mask"),
-                            sample_weight=sample_weight,
+                            sample_weight=audio_sample_weight,
                         )
                         accumulator.add(sigma_bin.index, "audio", total, count)
 
@@ -432,6 +432,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         self.vae_frame_stride = 17
         self._crepa_config = parse_crepa_config(args.crepa)
         args.h3_load_dino_features = self._crepa_config is not None and self._crepa_config.mode == "dino"
+        args.h3_dino_model = self._crepa_config.dino_model if args.h3_load_dino_features else None
         if args.validation_dataset_config:
             validation_config = config_utils.load_user_config(args.validation_dataset_config)
             general_batch_size = int(validation_config.get("general", {}).get("batch_size", 1))
@@ -533,6 +534,16 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 "--h3_frame_sigma_jitter re-noises every frame, so it cannot be combined with a conditioning mode "
                 "that presents part of the target as observed (--h3_observed_modality, extension, keyframes, or masking)"
             )
+        if args.h3_frame_sigma_jitter > 0 and args.weighting_scheme in {"sigma_sqrt", "cosmap"}:
+            raise ValueError(
+                f"--h3_frame_sigma_jitter cannot be combined with --weighting_scheme {args.weighting_scheme}: "
+                "per-frame weighting is not supported"
+            )
+        if args.h3_guidance_distillation_scale is not None and float(getattr(args, "network_dropout", 0.0) or 0.0) > 0:
+            raise ValueError(
+                "H3 guidance-consistent training cannot replay --network_dropout across different prompt lengths; "
+                "use rank_dropout or module_dropout instead"
+            )
         if args.fp8_base and args.h3_adaln_rank is None:
             # AdaLN is ~39% of the transformer and is quantized by default, yet
             # measured against the BF16 reference the reduction is both smaller
@@ -616,6 +627,35 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             enabled = enable_convrot_int8_lora_fusion(transformer)
             if enabled == 0:
                 raise RuntimeError("--h3_convrot_int8_lora_fused found no ConvRot INT8 Linear layers")
+
+        sampler_state_path = "h3_timestep_sampler.json"
+
+        def save_sampler_state(_models, _weights, output_dir):
+            if accelerator.is_main_process:
+                state = {
+                    "num_timestep_buckets": self.num_timestep_buckets,
+                    "timestep_range_pool": self.timestep_range_pool,
+                }
+                (Path(output_dir) / sampler_state_path).write_text(json.dumps(state), encoding="utf-8")
+
+        def load_sampler_state(_models, input_dir):
+            path = Path(input_dir) / sampler_state_path
+            if not path.exists():
+                # Older checkpoints did not save the partially consumed pool.
+                # Starting a fresh cycle is safe, but cannot exactly reproduce
+                # the pre-resume bucket ordering.
+                self.timestep_range_pool = []
+                return
+            state = json.loads(path.read_text(encoding="utf-8"))
+            if state.get("num_timestep_buckets") != self.num_timestep_buckets:
+                raise ValueError("saved H3 timestep sampler state does not match --num_timestep_buckets")
+            pool = state.get("timestep_range_pool")
+            if not isinstance(pool, list) or any(not isinstance(item, list) or len(item) != 2 for item in pool):
+                raise ValueError(f"invalid H3 timestep sampler state: {path}")
+            self.timestep_range_pool = [(float(lower), float(upper)) for lower, upper in pool]
+
+        accelerator.register_save_state_pre_hook(save_sampler_state)
+        accelerator.register_load_state_pre_hook(load_sampler_state)
         if self._crepa_config is None:
             return
         config = getattr(transformer, "config", None)
@@ -631,12 +671,19 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 self._crepa.save_state(output_dir)
 
         def load_crepa_state(_models, input_dir):
-            self._crepa.load_state(input_dir)
+            if not self._crepa.load_state(input_dir):
+                raise FileNotFoundError(f"CREPA resume state is missing: {Path(input_dir) / 'h3_crepa.safetensors'}")
 
         accelerator.register_save_state_pre_hook(save_crepa_state)
         accelerator.register_load_state_pre_hook(load_crepa_state)
 
     def extra_trainable_params(self, args, accelerator, network, transformer, trainable_params):
+        if args is not None and args.h3_base_preservation_loss_weight > 0:
+            if network is None:
+                raise ValueError("--h3_base_preservation_loss_weight requires a trainable network")
+            set_enabled = getattr(accelerator.unwrap_model(network), "set_enabled", None)
+            if not callable(set_enabled):
+                raise TypeError("H3 base-preservation loss requires a network with set_enabled()")
         del args, network, transformer
         if self._crepa is None:
             return trainable_params
@@ -930,14 +977,26 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         frames = video_latents.shape[2]
         rows_per_frame_h, rows_per_frame_w = VIDEO_DIT_PATCH_SIZE[-2:]
         rows_per_frame = (video_latents.shape[-2] // rows_per_frame_h) * (video_latents.shape[-1] // rows_per_frame_w)
-        offsets = (torch.rand(frames, device="cpu") * 2 - 1) * self._frame_sigma_jitter
         base = float(base_sigma.reshape(-1)[0])
-        frame_base = (base + offsets).clamp(0.0, 1.0)
+        epsilon = min(1e-4, self._frame_sigma_jitter * 0.5)
+        lower = max(epsilon, base - self._frame_sigma_jitter)
+        upper = min(1.0 - epsilon, base + self._frame_sigma_jitter)
+        frame_base = lower + torch.rand(frames, device="cpu") * (upper - lower)
         frame_sigma = shift_sigma(frame_base, 1.0 if is_image else args.h3_shift_video)
         sigma = frame_sigma.to(device=video_latents.device, dtype=video_latents.dtype).view(1, 1, frames, 1, 1)
         noisy = (1.0 - sigma) * video_latents + sigma * video_noise
         row_timestep = (1.0 - frame_sigma).repeat_interleave(rows_per_frame)
-        return replace(inputs, video=noisy), row_timestep
+        mean_sigma = frame_sigma.mean().reshape(1).to(device=inputs.video_sigma.device, dtype=inputs.video_sigma.dtype)
+        return (
+            replace(
+                inputs,
+                video=noisy,
+                video_sigma=mean_sigma,
+                video_timestep=1.0 - mean_sigma,
+                video_frame_sigma=frame_sigma,
+            ),
+            row_timestep,
+        )
 
     def _draw_spatial_density_scale(self):
         """Draw this step's spatial packing density.
@@ -1098,11 +1157,14 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
 
     @staticmethod
     def _guidance_loss_inputs(args, prediction, empty_prediction, inputs):
+        video_sigma = inputs.video_frame_sigma if inputs.video_frame_sigma is not None else inputs.video_sigma
         video_scale = guidance_scale_for_sigma(
             args.h3_guidance_distillation_scale,
-            inputs.video_sigma,
+            video_sigma,
             args.h3_guidance_loss_schedule,
         )
+        if inputs.video_frame_sigma is not None:
+            video_scale = video_scale.reshape(1, 1, -1, 1, 1)
         audio_scale = guidance_scale_for_sigma(
             args.h3_guidance_distillation_scale,
             inputs.audio_sigma,
@@ -1218,6 +1280,9 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         batch_size = int(latents.shape[0])
         if batch_size < 1:
             raise ValueError("MiniMax H3 training received an empty batch")
+        preservation_active = args.h3_base_preservation_loss_weight > 0 and self._base_preservation_active(
+            accelerator, args.h3_base_preservation_probability
+        )
         if batch_size == 1:
             return self._process_single_batch(
                 args,
@@ -1232,6 +1297,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 network_dtype,
                 vae,
                 global_step,
+                preservation_active_override=preservation_active,
             )
 
         # The released H3 transformer accepts one shared packed layout, while
@@ -1239,9 +1305,6 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         # each packed item independently and backpropagate its scaled loss
         # immediately, so padding cannot leak through attention and only one
         # block-swap/checkpoint graph is alive at a time.
-        preservation_active = args.h3_base_preservation_loss_weight > 0 and self._base_preservation_active(
-            accelerator, args.h3_base_preservation_probability
-        )
         losses: list[torch.Tensor] = []
         item_metrics: list[dict[str, float]] = []
         crepa_alignments: list[float] = []
@@ -1494,33 +1557,35 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         if use_guidance:
             prediction, loss_inputs = self._guidance_loss_inputs(args, prediction, empty_prediction, inputs)
 
-        sample_weight = self._sample_weight(
-            args, inputs.audio_sigma if observed == "video" or not has_video else inputs.video_sigma
-        )
+        video_sample_weight = self._sample_weight(args, inputs.video_sigma) if has_video else None
+        audio_sample_weight = self._sample_weight(args, inputs.audio_sigma) if has_audio else None
         video_weight = 0.0 if observed == "video" else args.h3_video_loss_weight
         audio_weight = 0.0 if observed == "audio" else args.h3_audio_loss_weight
+        effective_video_mask = self._mask_to_loss(
+            self._extension_masked(batch.get("video_loss_mask"), inputs.video_target, self._extension_video_frames, axis=-3),
+            inputs.video_target,
+            None if self._step_mask is None else self._step_mask.video_latent,
+            axis=-3,
+        )
+        effective_audio_mask = self._mask_to_loss(
+            self._extension_masked(batch.get("audio_loss_mask"), inputs.audio_target, self._extension_audio_latents, axis=-1),
+            inputs.audio_target,
+            None if self._step_mask is None else self._step_mask.audio_latent,
+            axis=-1,
+        )
         result = joint_velocity_loss(
             prediction,
             loss_inputs,
             # The observed context is given, not predicted, so it carries no
             # training signal and would otherwise dominate a short continuation.
-            video_mask=self._mask_to_loss(
-                self._extension_masked(batch.get("video_loss_mask"), inputs.video_target, self._extension_video_frames, axis=-3),
-                inputs.video_target,
-                None if self._step_mask is None else self._step_mask.video_latent,
-                axis=-3,
-            ),
-            audio_mask=self._mask_to_loss(
-                self._extension_masked(batch.get("audio_loss_mask"), inputs.audio_target, self._extension_audio_latents, axis=-1),
-                inputs.audio_target,
-                None if self._step_mask is None else self._step_mask.audio_latent,
-                axis=-1,
-            ),
+            video_mask=effective_video_mask,
+            audio_mask=effective_audio_mask,
             # Weighting keys on the shifted sigma the model actually saw for the
             # modality being generated, not the shared unshifted coordinate. An
             # observed modality sits at a pinned constant and would carry no
             # schedule information.
-            sample_weight=sample_weight,
+            video_sample_weight=video_sample_weight,
+            audio_sample_weight=audio_sample_weight,
             balance=args.h3_loss_balance,
             # The observed modality is conditioning, not a target.
             video_weight=video_weight,
@@ -1532,6 +1597,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             "h3/sigma_video": float(inputs.video_sigma.mean().detach()),
             "h3/sigma_audio": float(inputs.audio_sigma.mean().detach()),
         }
+        if result.video_elements == 0 and result.audio_elements == 0:
+            metrics["h3/no_active_target"] = 1.0
         if args.h3_caption_dropout_rate > 0:
             # Only reported when the feature is on, so an existing run's metric
             # set is unchanged.
@@ -1542,9 +1609,10 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             preservation = joint_prediction_loss(
                 raw_prediction,
                 reference_prediction,
-                video_mask=batch.get("video_loss_mask"),
-                audio_mask=batch.get("audio_loss_mask"),
-                sample_weight=sample_weight,
+                video_mask=effective_video_mask,
+                audio_mask=effective_audio_mask,
+                video_sample_weight=video_sample_weight,
+                audio_sample_weight=audio_sample_weight,
                 balance=args.h3_loss_balance,
                 video_weight=video_weight,
                 audio_weight=audio_weight,
@@ -1553,7 +1621,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 args.h3_base_preservation_loss_weight / args.h3_base_preservation_probability
             ) * preservation.loss
             loss = loss + base_preservation_term
-            metrics["loss/base_preservation"] = float(preservation.loss.detach() / args.h3_base_preservation_probability)
+            metrics["loss/base_preservation"] = float(base_preservation_term.detach())
         if args.h3_base_preservation_loss_weight > 0:
             metrics["h3/base_preservation_active"] = float(preservation_active)
             metrics.setdefault("loss/base_preservation", 0.0)
@@ -1600,6 +1668,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             "ss_h3_convrot_int8_bwd": args.h3_convrot_int8_bwd,
             "ss_h3_convrot_int8_fwd": args.h3_convrot_int8_fwd,
             "ss_h3_convrot_int8_lora_fused": str(args.h3_convrot_int8_lora_fused),
+            "ss_h3_adaln_rank": str(args.h3_adaln_rank if args.h3_adaln_rank is not None else "full"),
+            "ss_h3_reference_image_short_edge": str(args.reference_image_short_edge),
             "ss_h3_extension_video_frames": str(args.h3_extension_video_frames),
             "ss_h3_extension_audio_latents": str(args.h3_extension_audio_latents),
             "ss_h3_extension_route": args.h3_extension_route,

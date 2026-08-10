@@ -13,8 +13,7 @@ from musubi_tuner.minimax_h3.cache import (
     H3_EMPTY_TEXT_HIDDEN_KEY,
     H3_EMPTY_TEXT_TOKEN_TAGS_KEY,
 )
-from musubi_tuner.minimax_h3.training import H3ModelPrediction
-from musubi_tuner.minimax_h3.training import shift_sigma
+from musubi_tuner.minimax_h3.training import H3ModelPrediction, shift_sigma
 from musubi_tuner.minimax_h3.validation import (
     H3ValidationAccumulator,
     image_flow_shift,
@@ -379,3 +378,30 @@ def test_h3_validation_fully_masked_batch_produces_no_nan_or_fake_zero_metric():
     trainer.validate(accelerator, args, _ValidationTransformer(), None, 1, None)
 
     assert accelerator.logged == []
+
+
+def test_h3_validation_weights_each_modality_from_its_own_sigma_and_clears_keyframes():
+    args = _validation_args(mode="ref2va")
+    batch = {
+        "latents": torch.zeros(1, 24, 2, 2, 2),
+        H3_AUDIO_LATENTS_KEY: torch.zeros(1, 2, 32, 3),
+        "timesteps": None,
+    }
+    trainer = MiniMaxH3NetworkTrainer()
+    trainer.dit_dtype = torch.float32
+    trainer.backend = _ValidationBackend()
+    trainer._validation_dataloader = [(0, batch)]
+    trainer._step_keyframes = (("last",), (1,))
+    sampled_sigmas = []
+
+    def record_weight(_args, sigma):
+        sampled_sigmas.append(float(sigma))
+        return torch.ones_like(sigma)
+
+    trainer._sample_weight = record_weight
+    trainer.validate(_ValidationAccelerator(), args, _ValidationTransformer(), None, 1, None)
+
+    assert trainer._step_keyframes is None
+    assert len(sampled_sigmas) == 4
+    assert sampled_sigmas[0] != pytest.approx(sampled_sigmas[1])
+    assert sampled_sigmas[2] != pytest.approx(sampled_sigmas[3])

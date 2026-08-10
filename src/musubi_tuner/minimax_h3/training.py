@@ -31,6 +31,7 @@ class H3JointNoisyInputs:
     audio_sigma: torch.Tensor
     video_timestep: torch.Tensor
     audio_timestep: torch.Tensor
+    video_frame_sigma: torch.Tensor | None = None
 
 
 @dataclass(frozen=True)
@@ -86,6 +87,17 @@ def _expand_batch_values(values: torch.Tensor, target: torch.Tensor) -> torch.Te
     if values.shape != (target.shape[0],):
         raise ValueError(f"expected one value per batch item, got {tuple(values.shape)} for batch {target.shape[0]}")
     return values.to(device=target.device, dtype=target.dtype).view(target.shape[0], *([1] * (target.ndim - 1)))
+
+
+def _expand_scale_values(values: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """Expand either per-item values or an explicitly broadcastable scale grid."""
+    if values.ndim == 1:
+        return _expand_batch_values(values, target)
+    try:
+        torch.broadcast_shapes(values.shape, target.shape)
+    except RuntimeError as exc:
+        raise ValueError(f"H3 guidance scale shape {tuple(values.shape)} cannot broadcast to {tuple(target.shape)}") from exc
+    return values.to(device=target.device, dtype=target.dtype)
 
 
 def prepare_joint_noisy_inputs(
@@ -194,12 +206,12 @@ def guidance_consistent_prediction(
     empty_video = empty.video.detach() if detach_empty and empty.video is not None else empty.video
     empty_audio = empty.audio.detach() if detach_empty and empty.audio is not None else empty.audio
     video_scale = (
-        _expand_batch_values(guidance_scale, guided.video)
+        _expand_scale_values(guidance_scale, guided.video)
         if isinstance(guidance_scale, torch.Tensor) and guided.video is not None
         else guidance_scale
     )
     audio_scale = (
-        _expand_batch_values(audio_guidance_scale, guided.audio)
+        _expand_scale_values(audio_guidance_scale, guided.audio)
         if isinstance(audio_guidance_scale, torch.Tensor) and guided.audio is not None
         else audio_guidance_scale
     )
@@ -230,12 +242,12 @@ def contrastive_guidance_target(
     """Construct the guided-field target equivalent to the normalized objective."""
     audio_guidance_scale = guidance_scale if audio_guidance_scale is None else audio_guidance_scale
     video_scale = (
-        _expand_batch_values(guidance_scale, target.video)
+        _expand_scale_values(guidance_scale, target.video)
         if isinstance(guidance_scale, torch.Tensor) and target.video is not None
         else guidance_scale
     )
     audio_scale = (
-        _expand_batch_values(audio_guidance_scale, target.audio)
+        _expand_scale_values(audio_guidance_scale, target.audio)
         if isinstance(audio_guidance_scale, torch.Tensor) and target.audio is not None
         else audio_guidance_scale
     )
@@ -287,6 +299,8 @@ def _joint_loss(
     video_mask: torch.Tensor | None = None,
     audio_mask: torch.Tensor | None = None,
     sample_weight: torch.Tensor | None = None,
+    video_sample_weight: torch.Tensor | None = None,
+    audio_sample_weight: torch.Tensor | None = None,
     balance: LossBalance = "token",
     video_weight: float = 1.0,
     audio_weight: float = 1.0,
@@ -300,23 +314,27 @@ def _joint_loss(
     if zero_source is None:
         raise ValueError("H3 prediction contains no target modality")
     zero = zero_source.sum() * 0.0
+    if sample_weight is not None and (video_sample_weight is not None or audio_sample_weight is not None):
+        raise ValueError("pass either shared or per-modality H3 sample weights, not both")
+    video_sample_weight = sample_weight if video_sample_weight is None else video_sample_weight
+    audio_sample_weight = sample_weight if audio_sample_weight is None else audio_sample_weight
     if prediction.video is None or target.video is None:
         if prediction.video is not None or target.video is not None:
             raise ValueError("H3 video prediction and target presence differ")
         video_mean, video_total, video_elements = zero, zero, 0
     else:
-        video_mean, video_total, video_elements = _modality_loss(prediction.video, target.video, video_mask, sample_weight)
+        video_mean, video_total, video_elements = _modality_loss(prediction.video, target.video, video_mask, video_sample_weight)
     if prediction.audio is None or target.audio is None:
         if prediction.audio is not None or target.audio is not None:
             raise ValueError("H3 audio prediction and target presence differ")
         audio_mean, audio_total, audio_elements = zero, zero, 0
     else:
-        audio_mean, audio_total, audio_elements = _modality_loss(prediction.audio, target.audio, audio_mask, sample_weight)
+        audio_mean, audio_total, audio_elements = _modality_loss(prediction.audio, target.audio, audio_mask, audio_sample_weight)
 
     active_video_weight = video_weight if video_elements else 0.0
     active_audio_weight = audio_weight if audio_elements else 0.0
     if active_video_weight + active_audio_weight == 0:
-        raise ValueError("H3 loss masks exclude every video and audio element")
+        return H3JointLoss(zero, video_mean, audio_mean, video_elements, audio_elements)
 
     if balance == "modality":
         loss = (active_video_weight * video_mean + active_audio_weight * audio_mean) / (active_video_weight + active_audio_weight)
@@ -334,6 +352,8 @@ def joint_velocity_loss(
     video_mask: torch.Tensor | None = None,
     audio_mask: torch.Tensor | None = None,
     sample_weight: torch.Tensor | None = None,
+    video_sample_weight: torch.Tensor | None = None,
+    audio_sample_weight: torch.Tensor | None = None,
     balance: LossBalance = "token",
     video_weight: float = 1.0,
     audio_weight: float = 1.0,
@@ -345,6 +365,8 @@ def joint_velocity_loss(
         video_mask=video_mask,
         audio_mask=audio_mask,
         sample_weight=sample_weight,
+        video_sample_weight=video_sample_weight,
+        audio_sample_weight=audio_sample_weight,
         balance=balance,
         video_weight=video_weight,
         audio_weight=audio_weight,
@@ -358,6 +380,8 @@ def joint_prediction_loss(
     video_mask: torch.Tensor | None = None,
     audio_mask: torch.Tensor | None = None,
     sample_weight: torch.Tensor | None = None,
+    video_sample_weight: torch.Tensor | None = None,
+    audio_sample_weight: torch.Tensor | None = None,
     balance: LossBalance = "token",
     video_weight: float = 1.0,
     audio_weight: float = 1.0,
@@ -377,6 +401,8 @@ def joint_prediction_loss(
         video_mask=video_mask,
         audio_mask=audio_mask,
         sample_weight=sample_weight,
+        video_sample_weight=video_sample_weight,
+        audio_sample_weight=audio_sample_weight,
         balance=balance,
         video_weight=video_weight,
         audio_weight=audio_weight,

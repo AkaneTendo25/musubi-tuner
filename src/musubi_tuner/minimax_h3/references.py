@@ -204,7 +204,9 @@ def sample_reference_video_frames(frames: np.ndarray) -> tuple[list[np.ndarray],
 def trim_reference_frames(frame_count: int) -> int:
     if frame_count < 1:
         raise ValueError(f"H3 reference video must provide at least one prepared frame, got {frame_count}")
-    return max(1, (frame_count - 5) // 17) * 17 + 5
+    if frame_count < 5:
+        return 1
+    return (frame_count - 5) // 17 * 17 + 5
 
 
 def prepare_references(item: Any, image_short_edge: int = REFERENCE_IMAGE_SHORT_EDGE) -> tuple[H3PreparedReference, ...]:

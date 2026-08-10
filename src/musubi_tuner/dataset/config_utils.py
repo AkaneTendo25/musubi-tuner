@@ -40,6 +40,10 @@ class BaseDatasetParams:
     cache_directory: Optional[str] = None
     debug_dataset: bool = False
     architecture: str = "no_default"  # short style like "hv" or "wan"
+    loss_mask_directory: Optional[str] = None
+    default_loss_mask_path: Optional[str] = None
+    loss_mask_use_alpha: bool = False
+    loss_mask_invert: bool = False
 
 
 @dataclass
@@ -116,6 +120,10 @@ class ConfigSanitizer:
         "resolution": functools.partial(__validate_and_convert_scalar_or_twodim.__func__, int),
         "enable_bucket": bool,
         "bucket_no_upscale": bool,
+        "loss_mask_directory": str,
+        "default_loss_mask_path": str,
+        "loss_mask_use_alpha": bool,
+        "loss_mask_invert": bool,
     }
     IMAGE_DATASET_DISTINCT_SCHEMA = {
         "image_directory": str,
@@ -305,6 +313,10 @@ def generate_dataset_group_by_blueprint(
         caption_extension: "{dataset.caption_extension}"
         enable_bucket: {dataset.enable_bucket}
         bucket_no_upscale: {dataset.bucket_no_upscale}
+        loss_mask_directory: "{dataset.loss_mask_directory}"
+        default_loss_mask_path: "{dataset.default_loss_mask_path}"
+        loss_mask_use_alpha: {dataset.loss_mask_use_alpha}
+        loss_mask_invert: {dataset.loss_mask_invert}
         cache_directory: "{dataset.cache_directory}"
         debug_dataset: {dataset.debug_dataset}
     """

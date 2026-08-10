@@ -355,6 +355,7 @@ def create_h3_dataset_group(
             batch_manager = getattr(dataset, "batch_manager", None)
             if batch_manager is not None:
                 batch_manager.load_h3_dino_features = load_dino_features and isinstance(dataset, VideoDataset)
+                batch_manager.h3_dino_model = getattr(args, "h3_dino_model", None) if load_dino_features else None
     dataset_group = DatasetGroup(ordered_datasets)
     adapter.adapt_dataset_group(dataset_group)
     return dataset_group, adapter

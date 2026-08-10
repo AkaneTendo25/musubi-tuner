@@ -3,18 +3,19 @@ from __future__ import annotations
 import math
 import os
 import random
-from typing import Any, Optional, Tuple, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Optional, Tuple
 
 import numpy as np
 import torch
+from safetensors import safe_open
 from safetensors.torch import load_file
 
 from musubi_tuner.dataset.architectures import (
-    ARCHITECTURE_FRAMEPACK,
     ARCHITECTURE_FLUX_2_DEV,
     ARCHITECTURE_FLUX_2_KLEIN_4B,
     ARCHITECTURE_FLUX_2_KLEIN_9B,
     ARCHITECTURE_FLUX_KONTEXT,
+    ARCHITECTURE_FRAMEPACK,
     ARCHITECTURE_HIDREAM_O1,
     ARCHITECTURE_HUNYUAN_VIDEO,
     ARCHITECTURE_HUNYUAN_VIDEO_1_5,
@@ -180,6 +181,7 @@ class BucketBatchManager:
         self.num_timestep_buckets = num_timestep_buckets
         self.timestep_pool = None
         self.load_h3_dino_features = False
+        self.h3_dino_model: str | None = None
 
         # indices for enumerating batches. each batch is reso + batch_idx. reso is (width, height) or (width, height, frames)
         self.bucket_batch_indices: list[tuple[tuple[Any], int]] = []
@@ -260,7 +262,19 @@ class BucketBatchManager:
                         f"MiniMax H3 CREPA DINO cache not found: {dino_path}. "
                         "Run minimax_h3_cache_dino_features.py before training with CREPA mode=dino."
                     )
-                sd["h3_dino_features_float16"] = load_file(dino_path)["h3_dino_features"]
+                with safe_open(dino_path, framework="pt") as handle:
+                    metadata = handle.metadata() or {}
+                    if self.h3_dino_model is not None and metadata.get("dino_model") != self.h3_dino_model:
+                        raise ValueError(
+                            f"MiniMax H3 DINO cache {dino_path} was created for "
+                            f"{metadata.get('dino_model', 'an unknown model')}, but CREPA requested {self.h3_dino_model}. "
+                            "Re-run minimax_h3_cache_dino_features.py with the selected dino_model."
+                        )
+                    features = handle.get_tensor("h3_dino_features")
+                expected_shape = tuple(int(metadata[key]) for key in ("frames", "patches", "channels") if key in metadata)
+                if expected_shape and (len(expected_shape) != 3 or tuple(features.shape) != expected_shape):
+                    raise ValueError(f"MiniMax H3 DINO cache metadata does not match its tensor shape: {dino_path}")
+                sd["h3_dino_features_float16"] = features
 
             # TODO refactor this
             for key in sd.keys():

@@ -4,9 +4,10 @@ import json
 import os
 from typing import Optional, TYPE_CHECKING
 
+import numpy as np
 from PIL import Image
 
-from musubi_tuner.dataset.media_utils import glob_images, glob_videos, load_video, VIDEO_EXTENSIONS
+from musubi_tuner.dataset.media_utils import IMAGE_EXTENSIONS, VIDEO_EXTENSIONS, glob_images, glob_videos, load_video
 
 if TYPE_CHECKING:
     from musubi_tuner.dataset.bucket import BucketSelector
@@ -14,6 +15,67 @@ if TYPE_CHECKING:
 import logging
 
 logger = logging.getLogger(__name__)
+
+
+def _matching_loss_mask_path(source_path: str, mask_directory: Optional[str], default_path: Optional[str]) -> Optional[str]:
+    if mask_directory:
+        stem = os.path.splitext(os.path.basename(source_path))[0]
+        candidate_base = os.path.join(mask_directory, stem)
+        if os.path.isdir(candidate_base):
+            return candidate_base
+        for extension in IMAGE_EXTENSIONS + VIDEO_EXTENSIONS:
+            candidate = candidate_base + extension
+            if os.path.isfile(candidate):
+                return candidate
+    return default_path
+
+
+def _loss_mask_image(image: Image.Image | np.ndarray, *, invert: bool) -> Image.Image:
+    image = image if isinstance(image, Image.Image) else Image.fromarray(np.asarray(image))
+    mask = image.getchannel("A") if "A" in image.getbands() else image.convert("L")
+    return Image.eval(mask, lambda value: 255 - value) if invert else mask
+
+
+def _target_alpha_loss_mask(image: Image.Image, *, enabled: bool, invert: bool) -> Optional[Image.Image]:
+    if not enabled or "A" not in image.getbands():
+        return None
+    mask = image.getchannel("A")
+    return Image.eval(mask, lambda value: 255 - value) if invert else mask
+
+
+def _load_video_loss_mask(
+    path: Optional[str],
+    *,
+    frame_count: int,
+    bucket_reso: tuple[int, int],
+    start_frame: Optional[int],
+    end_frame: Optional[int],
+    source_fps: Optional[float],
+    target_fps: Optional[float],
+    invert: bool,
+) -> Optional[list[Image.Image]]:
+    if not path:
+        return None
+    if not os.path.exists(path):
+        raise ValueError(f"loss mask source not found: {path}")
+    if os.path.isfile(path) and os.path.splitext(path)[1] in IMAGE_EXTENSIONS:
+        with Image.open(path) as image:
+            frame = _loss_mask_image(image.copy(), invert=invert)
+        return [frame] * frame_count
+    frames = load_video(
+        path,
+        start_frame,
+        end_frame,
+        bucket_reso=bucket_reso,
+        source_fps=source_fps,
+        target_fps=target_fps,
+    )
+    if not frames:
+        raise ValueError(f"loss mask source contains no usable frames: {path}")
+    masks = [_loss_mask_image(frame, invert=invert) for frame in frames]
+    if len(masks) < frame_count:
+        masks.extend([masks[-1]] * (frame_count - len(masks)))
+    return masks[:frame_count]
 
 
 class ContentDatasource:
@@ -64,6 +126,10 @@ class ImageDirectoryDatasource(ImageDatasource):
         control_directory: Optional[str] = None,
         control_count_per_image: Optional[int] = None,
         multiple_target: bool = False,
+        loss_mask_directory: Optional[str] = None,
+        default_loss_mask_path: Optional[str] = None,
+        loss_mask_use_alpha: bool = False,
+        loss_mask_invert: bool = False,
     ):
         super().__init__()
         self.image_directory = image_directory
@@ -71,6 +137,10 @@ class ImageDirectoryDatasource(ImageDatasource):
         self.control_directory = control_directory
         self.control_count_per_image = control_count_per_image
         self.multiple_target = multiple_target
+        self.loss_mask_directory = loss_mask_directory
+        self.default_loss_mask_path = default_loss_mask_path
+        self.loss_mask_use_alpha = loss_mask_use_alpha
+        self.loss_mask_invert = loss_mask_invert
         self.current_idx = 0
 
         # glob images
@@ -211,7 +281,7 @@ class ImageDirectoryDatasource(ImageDatasource):
     def __len__(self):
         return len(self.image_paths)
 
-    def get_image_data(self, idx: int) -> tuple[str, list[Image.Image], str, Optional[list[Image.Image]]]:
+    def get_image_data(self, idx: int) -> tuple[str, list[Image.Image], str, Optional[list[Image.Image]], Optional[Image.Image]]:
         image_path = self.image_paths[idx]
         image_paths = [image_path]
         if self.multiple_target:
@@ -236,7 +306,17 @@ class ImageDirectoryDatasource(ImageDatasource):
                     control = control.convert("RGB")
                 controls.append(control)
 
-        return image_path, images, caption, controls
+        mask_path = _matching_loss_mask_path(image_path, self.loss_mask_directory, self.default_loss_mask_path)
+        loss_mask = None
+        if mask_path:
+            if not os.path.isfile(mask_path):
+                raise ValueError(f"image loss mask must be an image file: {mask_path}")
+            with Image.open(mask_path) as mask_image:
+                loss_mask = _loss_mask_image(mask_image.copy(), invert=self.loss_mask_invert)
+        if loss_mask is None:
+            loss_mask = _target_alpha_loss_mask(images[0], enabled=self.loss_mask_use_alpha, invert=self.loss_mask_invert)
+
+        return image_path, images, caption, controls, loss_mask
 
     def get_caption(self, idx: int) -> tuple[str, str]:
         image_path = self.image_paths[idx]
@@ -274,11 +354,24 @@ class ImageDirectoryDatasource(ImageDatasource):
 
 
 class ImageJsonlDatasource(ImageDatasource):
-    def __init__(self, image_jsonl_file: str, control_count_per_image: Optional[int] = None, multiple_target: bool = False):
+    def __init__(
+        self,
+        image_jsonl_file: str,
+        control_count_per_image: Optional[int] = None,
+        multiple_target: bool = False,
+        loss_mask_directory: Optional[str] = None,
+        default_loss_mask_path: Optional[str] = None,
+        loss_mask_use_alpha: bool = False,
+        loss_mask_invert: bool = False,
+    ):
         super().__init__()
         self.image_jsonl_file = image_jsonl_file
         self.control_count_per_image = control_count_per_image
         self.multiple_target = multiple_target
+        self.loss_mask_directory = loss_mask_directory
+        self.default_loss_mask_path = default_loss_mask_path
+        self.loss_mask_use_alpha = loss_mask_use_alpha
+        self.loss_mask_invert = loss_mask_invert
         self.current_idx = 0
 
         # load jsonl
@@ -330,7 +423,7 @@ class ImageJsonlDatasource(ImageDatasource):
     def __len__(self):
         return len(self.data)
 
-    def get_image_data(self, idx: int) -> tuple[str, list[Image.Image], str, Optional[list[Image.Image]]]:
+    def get_image_data(self, idx: int) -> tuple[str, list[Image.Image], str, Optional[list[Image.Image]], Optional[Image.Image]]:
         data = self.data[idx]
         image_path = data.get("image_path", data.get("image_path_0"))
         image_paths = [image_path]
@@ -367,7 +460,18 @@ class ImageJsonlDatasource(ImageDatasource):
                     control = control.convert("RGB")
                 controls.append(control)
 
-        return image_path, images, caption, controls
+        mask_path = data.get("loss_mask_path", data.get("image_loss_mask_path", data.get("video_loss_mask_path")))
+        mask_path = mask_path or _matching_loss_mask_path(image_path, self.loss_mask_directory, self.default_loss_mask_path)
+        loss_mask = None
+        if mask_path:
+            if not os.path.isfile(mask_path):
+                raise ValueError(f"image loss mask must be an image file: {mask_path}")
+            with Image.open(mask_path) as mask_image:
+                loss_mask = _loss_mask_image(mask_image.copy(), invert=self.loss_mask_invert)
+        if loss_mask is None:
+            loss_mask = _target_alpha_loss_mask(images[0], enabled=self.loss_mask_use_alpha, invert=self.loss_mask_invert)
+
+        return image_path, images, caption, controls, loss_mask
 
     def get_caption(self, idx: int) -> tuple[str, str]:
         data = self.data[idx]
@@ -470,11 +574,24 @@ class VideoDatasource(ContentDatasource):
 
 
 class VideoDirectoryDatasource(VideoDatasource):
-    def __init__(self, video_directory: str, caption_extension: Optional[str] = None, control_directory: Optional[str] = None):
+    def __init__(
+        self,
+        video_directory: str,
+        caption_extension: Optional[str] = None,
+        control_directory: Optional[str] = None,
+        loss_mask_directory: Optional[str] = None,
+        default_loss_mask_path: Optional[str] = None,
+        loss_mask_use_alpha: bool = False,
+        loss_mask_invert: bool = False,
+    ):
         super().__init__()
         self.video_directory = video_directory
         self.caption_extension = caption_extension
         self.control_directory = control_directory
+        self.loss_mask_directory = loss_mask_directory
+        self.default_loss_mask_path = default_loss_mask_path
+        self.loss_mask_use_alpha = loss_mask_use_alpha
+        self.loss_mask_invert = loss_mask_invert
         self.current_idx = 0
 
         # glob videos
@@ -534,7 +651,7 @@ class VideoDirectoryDatasource(VideoDatasource):
         start_frame: Optional[int] = None,
         end_frame: Optional[int] = None,
         bucket_selector: Optional[BucketSelector] = None,
-    ) -> tuple[str, list[Image.Image], str, Optional[list[Image.Image]]]:
+    ) -> tuple[str, list[Image.Image], str, Optional[list[Image.Image]], Optional[list[Image.Image]]]:
         video_path = self.video_paths[idx]
         video = self.get_video_data_from_path(video_path, start_frame, end_frame, bucket_selector)
 
@@ -545,7 +662,21 @@ class VideoDirectoryDatasource(VideoDatasource):
             control_path = self.control_paths[video_path]
             control = self.get_control_data_from_path(control_path, start_frame, end_frame, bucket_selector)
 
-        return video_path, video, caption, control
+        effective_start = start_frame if start_frame is not None else self.start_frame
+        effective_end = end_frame if end_frame is not None else self.end_frame
+        mask_path = _matching_loss_mask_path(video_path, self.loss_mask_directory, self.default_loss_mask_path)
+        loss_mask = _load_video_loss_mask(
+            mask_path,
+            frame_count=len(video),
+            bucket_reso=(video[0].shape[1], video[0].shape[0]),
+            start_frame=effective_start,
+            end_frame=effective_end,
+            source_fps=self.source_fps,
+            target_fps=self.target_fps,
+            invert=self.loss_mask_invert,
+        )
+
+        return video_path, video, caption, control, loss_mask
 
     def get_caption(self, idx: int) -> tuple[str, str]:
         video_path = self.video_paths[idx]
@@ -581,9 +712,20 @@ class VideoDirectoryDatasource(VideoDatasource):
 
 
 class VideoJsonlDatasource(VideoDatasource):
-    def __init__(self, video_jsonl_file: str):
+    def __init__(
+        self,
+        video_jsonl_file: str,
+        loss_mask_directory: Optional[str] = None,
+        default_loss_mask_path: Optional[str] = None,
+        loss_mask_use_alpha: bool = False,
+        loss_mask_invert: bool = False,
+    ):
         super().__init__()
         self.video_jsonl_file = video_jsonl_file
+        self.loss_mask_directory = loss_mask_directory
+        self.default_loss_mask_path = default_loss_mask_path
+        self.loss_mask_use_alpha = loss_mask_use_alpha
+        self.loss_mask_invert = loss_mask_invert
         self.current_idx = 0
 
         # load jsonl
@@ -617,7 +759,7 @@ class VideoJsonlDatasource(VideoDatasource):
         start_frame: Optional[int] = None,
         end_frame: Optional[int] = None,
         bucket_selector: Optional[BucketSelector] = None,
-    ) -> tuple[str, list[Image.Image], str, Optional[list[Image.Image]]]:
+    ) -> tuple[str, list[Image.Image], str, Optional[list[Image.Image]], Optional[list[Image.Image]]]:
         data = self.data[idx]
         video_path = data["video_path"]
         video = self.get_video_data_from_path(video_path, start_frame, end_frame, bucket_selector)
@@ -629,7 +771,22 @@ class VideoJsonlDatasource(VideoDatasource):
             control_path = data["control_path"]
             control = self.get_control_data_from_path(control_path, start_frame, end_frame, bucket_selector)
 
-        return video_path, video, caption, control
+        effective_start = start_frame if start_frame is not None else self.start_frame
+        effective_end = end_frame if end_frame is not None else self.end_frame
+        mask_path = data.get("loss_mask_path", data.get("video_loss_mask_path"))
+        mask_path = mask_path or _matching_loss_mask_path(video_path, self.loss_mask_directory, self.default_loss_mask_path)
+        loss_mask = _load_video_loss_mask(
+            mask_path,
+            frame_count=len(video),
+            bucket_reso=(video[0].shape[1], video[0].shape[0]),
+            start_frame=effective_start,
+            end_frame=effective_end,
+            source_fps=self.source_fps,
+            target_fps=self.target_fps,
+            invert=self.loss_mask_invert,
+        )
+
+        return video_path, video, caption, control, loss_mask
 
     def get_caption(self, idx: int) -> tuple[str, str]:
         data = self.data[idx]
