@@ -251,6 +251,11 @@ python minimax_h3_cache_text_encoder_outputs.py \
 All three are precision trade-offs, not equivalents. They reduce GPU residency only: the BF16 checkpoint is still memory-mapped
 into host address space while weights are converted, so the host RAM requirement is unchanged.
 
+If the conditioner still does not fit, `--h3_text_encoder_blocks_to_stream N` keeps `N` of its 50 frozen language layers in
+CPU memory and moves them through a fixed two-layer GPU ring during encoding. `50` minimizes weight residency; smaller values
+trade less transfer overhead for less memory saved. This is opt-in, requires CUDA, and currently supports BF16 and native
+`nvfp4_awq` checkpoints. It does not support the bitsandbytes `int8` or `nf4` loader.
+
 ## Training
 
 ```shell

@@ -131,6 +131,7 @@ def create_conditioning_encoder(
     device: str | None,
     dtype: str,
     quantization: Literal["none", "int8", "nf4", "nvfp4_awq"] = "none",
+    blocks_to_stream: int = 0,
     reference_image_short_edge: int = REFERENCE_IMAGE_SHORT_EDGE,
     text_visual_max_pixels: int = 0,
 ):
@@ -144,6 +145,7 @@ def create_conditioning_encoder(
         device=device or "cpu",
         dtype=output_dtype,
         quantization=quantization,
+        blocks_to_stream=blocks_to_stream,
     )
     return MiniMaxH3ConditioningEncoder(processor, model, output_dtype, task, reference_image_short_edge, text_visual_max_pixels)
 
@@ -164,6 +166,7 @@ def create_generator(
     fp8_scaled: bool = False,
     int8_convrot: bool = False,
     text_encoder_quantization: Literal["none", "int8", "nf4", "nvfp4_awq"] = "none",
+    text_encoder_blocks_to_stream: int = 0,
     blocks_to_swap: int = 0,
     block_swap_h2d_only: bool = False,
     block_swap_ring_size: int = 2,
@@ -200,6 +203,7 @@ def create_generator(
         fp8_scaled=fp8_scaled,
         int8_convrot=int8_convrot,
         text_encoder_quantization=text_encoder_quantization,
+        text_encoder_blocks_to_stream=text_encoder_blocks_to_stream,
         blocks_to_swap=blocks_to_swap,
         block_swap_h2d_only=block_swap_h2d_only,
         block_swap_ring_size=block_swap_ring_size,
@@ -257,6 +261,7 @@ class _NativeGenerator:
         inductor_config: tuple[str, ...],
         fused_qk_norm_rope: bool,
         mode: H3TrainingMode,
+        text_encoder_blocks_to_stream: int = 0,
         reference_image_short_edge: int = REFERENCE_IMAGE_SHORT_EDGE,
         text_visual_max_pixels: int = 0,
     ) -> None:
@@ -274,6 +279,7 @@ class _NativeGenerator:
         self.fp8_scaled = fp8_scaled
         self.int8_convrot = int8_convrot
         self.text_encoder_quantization = text_encoder_quantization
+        self.text_encoder_blocks_to_stream = text_encoder_blocks_to_stream
         self.blocks_to_swap = blocks_to_swap
         self.block_swap_h2d_only = block_swap_h2d_only
         self.block_swap_ring_size = block_swap_ring_size
@@ -338,10 +344,16 @@ class _NativeGenerator:
             device=str(self.device),
             dtype="bfloat16",
             quantization=self.text_encoder_quantization,
+            blocks_to_stream=self.text_encoder_blocks_to_stream,
             text_visual_max_pixels=self.text_visual_max_pixels,
         )
-        conditioning = encoder.encode_reference_prompt(prompt, references) if references else encoder.encode_prompt(prompt, images)
-        del encoder
+        try:
+            conditioning = (
+                encoder.encode_reference_prompt(prompt, references) if references else encoder.encode_prompt(prompt, images)
+            )
+        finally:
+            encoder.close()
+            del encoder
         gc.collect()
         clean_memory_on_device(self.device)
         return conditioning

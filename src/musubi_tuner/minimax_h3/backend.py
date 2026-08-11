@@ -96,6 +96,7 @@ def create_conditioning_encoder(
     device: str | None,
     dtype: str,
     quantization: Literal["none", "int8", "nf4", "nvfp4_awq"] = "none",
+    blocks_to_stream: int = 0,
     reference_image_short_edge: int = REFERENCE_IMAGE_SHORT_EDGE,
     text_visual_max_pixels: int = 0,
 ) -> H3ConditioningEncoder:
@@ -111,6 +112,7 @@ def create_conditioning_encoder(
         device=device,
         dtype=dtype,
         quantization=quantization,
+        **({} if blocks_to_stream == 0 else {"blocks_to_stream": blocks_to_stream}),
         **({} if text_visual_max_pixels == 0 else {"text_visual_max_pixels": text_visual_max_pixels}),
         **_reference_short_edge_kwargs(reference_image_short_edge),
     )
@@ -133,6 +135,7 @@ def create_generator(
     int8_convrot: bool = False,
     adaln_rank: int | None = None,
     text_encoder_quantization: Literal["none", "int8", "nf4", "nvfp4_awq"] = "none",
+    text_encoder_blocks_to_stream: int = 0,
     blocks_to_swap: int = 0,
     block_swap_h2d_only: bool = False,
     block_swap_ring_size: int = 2,
@@ -174,6 +177,7 @@ def create_generator(
         int8_convrot=int8_convrot,
         adaln_rank=adaln_rank,
         text_encoder_quantization=text_encoder_quantization,
+        text_encoder_blocks_to_stream=text_encoder_blocks_to_stream,
         blocks_to_swap=blocks_to_swap,
         block_swap_h2d_only=block_swap_h2d_only,
         block_swap_ring_size=block_swap_ring_size,

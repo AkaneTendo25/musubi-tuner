@@ -76,6 +76,12 @@ def create_parser() -> argparse.ArgumentParser:
         default="none",
         help="quantize the Qwen3-VL conditioner while encoding the prompt",
     )
+    parser.add_argument(
+        "--h3_text_encoder_blocks_to_stream",
+        type=int,
+        default=0,
+        help="stream this many of the 50 frozen Qwen3-VL layers from CPU while encoding prompts (CUDA only)",
+    )
     parser.add_argument("--blocks_to_swap", type=int, default=0)
     parser.add_argument("--block_swap_h2d_only", action="store_true")
     parser.add_argument("--block_swap_ring_size", type=int, default=2)
@@ -186,6 +192,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             fp8_scaled=args.fp8_base,
             int8_convrot=args.int8_convrot_base,
             text_encoder_quantization=args.text_encoder_quantization,
+            text_encoder_blocks_to_stream=args.h3_text_encoder_blocks_to_stream,
             blocks_to_swap=args.blocks_to_swap,
             block_swap_h2d_only=args.block_swap_h2d_only,
             block_swap_ring_size=args.block_swap_ring_size,

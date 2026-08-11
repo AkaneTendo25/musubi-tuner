@@ -722,6 +722,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             device=str(accelerator.device),
             dtype="bfloat16",
             quantization=args.text_encoder_quantization,
+            blocks_to_stream=args.h3_text_encoder_blocks_to_stream,
         )
         prepared_images: list[list[Image.Image]] = []
         for prompt in prompts:
@@ -740,6 +741,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             prompt.update(encoder.encode_prompt(prompt.get("prompt", ""), images))
             prompt[_SAMPLE_KEYFRAME_ANCHORS] = tuple(anchors)
             prepared_images.append(images)
+        encoder.close()
         del encoder
         gc.collect()
         clean_memory_on_device(accelerator.device)
@@ -1742,6 +1744,12 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         choices=("none", "int8", "nf4", "nvfp4_awq"),
         default="none",
         help="optional Qwen3-VL quantization while pre-encoding sampling prompts",
+    )
+    parser.add_argument(
+        "--h3_text_encoder_blocks_to_stream",
+        type=int,
+        default=0,
+        help="stream this many of the 50 frozen Qwen3-VL layers from CPU while encoding sample prompts (CUDA only)",
     )
     parser.add_argument(
         "--h3_loss_balance",

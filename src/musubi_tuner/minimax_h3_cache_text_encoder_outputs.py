@@ -49,6 +49,12 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--h3_text_encoder_blocks_to_stream",
+        type=int,
+        default=0,
+        help="stream this many of the 50 frozen Qwen3-VL layers from CPU during encoding (CUDA only)",
+    )
+    parser.add_argument(
         "--reference_image_short_edge",
         type=int,
         default=REFERENCE_IMAGE_SHORT_EDGE,
@@ -93,6 +99,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         device=str(device),
         dtype=args.text_encoder_dtype,
         quantization=args.text_encoder_quantization,
+        blocks_to_stream=args.h3_text_encoder_blocks_to_stream,
         reference_image_short_edge=args.reference_image_short_edge,
         text_visual_max_pixels=args.h3_text_visual_max_pixels,
     )
@@ -120,6 +127,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         requires_content=encoder.conditioning_requires_content,
         existing_cache_valid=existing_cache_valid if args.h3_image_mode != "none" else None,
     )
+    encoder.close()
     cache_text_encoder_outputs.post_process_cache_files(datasets, all_cache_files, all_cache_paths, args.keep_cache)
 
 

@@ -130,11 +130,20 @@ def load_text_conditioner(
     device: str | torch.device,
     dtype: torch.dtype,
     quantization: H3TextEncoderQuantization = "none",
+    blocks_to_stream: int = 0,
+    stream_ring_size: int = 2,
+    stream_pinned_memory: bool = False,
 ) -> tuple[Any, Qwen3VLModel]:
     if dtype is not torch.bfloat16:
         raise ValueError("MiniMax H3 Qwen3-VL conditioning requires bfloat16")
     if quantization not in ("none", "int8", "nf4", "nvfp4_awq"):
         raise ValueError(f"unsupported MiniMax H3 text-encoder quantization: {quantization}")
+    if not 0 <= blocks_to_stream <= 50:
+        raise ValueError("MiniMax H3 text-encoder blocks_to_stream must be between 0 and 50")
+    if blocks_to_stream and torch.device(device).type != "cuda":
+        raise ValueError("MiniMax H3 text-encoder layer streaming requires CUDA")
+    if blocks_to_stream and quantization in {"int8", "nf4"}:
+        raise ValueError("MiniMax H3 text-encoder layer streaming does not support bitsandbytes INT8/NF4")
     checkpoint_source = Path(checkpoint)
     if quantization == "nvfp4_awq":
         checkpoint_path = resolve_nvfp4_awq_text_encoder_checkpoint(checkpoint_source)
@@ -159,7 +168,7 @@ def load_text_conditioner(
         )
     else:
         expected = set(model.state_dict())
-        checkpoint_device = target_device if quantization == "none" else torch.device("cpu")
+        checkpoint_device = target_device if quantization == "none" and not blocks_to_stream else torch.device("cpu")
         state_dict = _mapped_text_encoder_state_dict(checkpoint_path, expected, device=checkpoint_device)
         if quantization == "none":
             info = model.load_state_dict(state_dict, strict=True, assign=True)
@@ -176,14 +185,35 @@ def load_text_conditioner(
         full_config.text_config,
         device=target_device,
     )
-    if quantization == "nvfp4_awq":
+    if quantization == "nvfp4_awq" and not blocks_to_stream:
         model.to(target_device)
+    if blocks_to_stream:
+        from musubi_tuner.modules.custom_offloading_utils import ForwardOnlyBlockStreamer
+
+        model.requires_grad_(False)
+        layers = model.language_model.layers
+        model.language_model.layers = nn.ModuleList()
+        try:
+            model.to(target_device)
+        finally:
+            model.language_model.layers = layers
+        streamer = ForwardOnlyBlockStreamer(
+            "h3_text_encoder",
+            list(layers),
+            blocks_to_stream,
+            target_device,
+            ring_size=stream_ring_size,
+            use_pinned_memory=stream_pinned_memory,
+        )
+        streamer.prepare()
+        model._h3_layer_streamer = streamer
     model.requires_grad_(False).eval()
     processor = AutoProcessor.from_pretrained(tokenizer, local_files_only=True, use_fast=True)
     logger.info(
-        "Loaded raw-layer-50 Qwen3-VL conditioner using %s weights on %s",
+        "Loaded raw-layer-50 Qwen3-VL conditioner using %s weights on %s%s",
         quantization,
         target_device,
+        f" with {blocks_to_stream} streamed layers" if blocks_to_stream else "",
     )
     return processor, model
 
@@ -208,6 +238,12 @@ class MiniMaxH3ConditioningEncoder:
         # Even T2VA enumerates decoded video crops so its cache filename shares
         # the same crop identity as FL2VA and the corresponding latent cache.
         self.conditioning_requires_content = True
+
+    def close(self) -> None:
+        streamer = getattr(self.model, "_h3_layer_streamer", None)
+        if streamer is not None:
+            streamer.close()
+            delattr(self.model, "_h3_layer_streamer")
 
     def _encode_prompt(
         self,

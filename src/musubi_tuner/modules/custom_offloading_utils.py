@@ -960,6 +960,9 @@ class _DirectCopier:
         self._events.clear()
         self._xfer.clear()
 
+    def close(self):
+        self.sync()
+
 
 class _StagedCopier:
     """
@@ -1054,6 +1057,10 @@ class _StagedCopier:
         self._flush()
         self.copy_stream.synchronize()
 
+    def close(self):
+        self.sync()
+        self._pool.shutdown(wait=True)
+
     def reset(self):
         self._flush()
         self.copy_stream.synchronize()  # ensure all in-flight H2D are done before clearing staging state
@@ -1114,6 +1121,197 @@ class _FrozenLinearStreamFunction(torch.autograd.Function):
         grad_input = torch.matmul(grad_output, compute_weight)
         offloader.release_and_prefetch(layer_rank, backward=True)
         return grad_input, None, None
+
+
+@dataclass(frozen=True)
+class _ForwardStreamBinding:
+    owner: nn.Module
+    name: str
+    parameter: bool
+
+
+class ForwardOnlyBlockStreamer:
+    """Stream immutable forward-only blocks through a fixed GPU payload ring.
+
+    Unlike the training offloaders, this owns no backward schedule. Every selected
+    parameter and buffer in a streamed block has a persistent CPU master; a pre-hook
+    binds GPU-ring views before the block runs and a post-hook releases the slot and
+    starts the next H2D copy. This also handles quantized modules whose payload lives
+    in buffers rather than in a conventional ``weight`` parameter.
+    """
+
+    def __init__(
+        self,
+        block_type: str,
+        blocks: list[nn.Module],
+        blocks_to_stream: int,
+        device: torch.device,
+        *,
+        ring_size: int = 2,
+        use_pinned_memory: bool = False,
+    ) -> None:
+        if device.type != "cuda":
+            raise ValueError("forward-only block streaming requires CUDA")
+        if not 1 <= blocks_to_stream <= len(blocks):
+            raise ValueError(f"blocks_to_stream must be between 1 and {len(blocks)}")
+        if ring_size < 1:
+            raise ValueError("forward-only block streaming ring_size must be positive")
+        self.block_type = block_type
+        self.blocks = blocks
+        self.device = device
+        self.stream_indices = list(compute_offload_block_indices(len(blocks), blocks_to_stream, h2d_only=True))
+        self.rank_by_block = {block: rank for rank, block in enumerate(self.stream_indices)}
+        self.ring_size = min(ring_size, len(self.stream_indices))
+        self.use_pinned_memory = use_pinned_memory
+        self.copier = _DirectCopier(device) if use_pinned_memory else _StagedCopier(device, num_staging=self.ring_size)
+        self.bindings: dict[int, list[_ForwardStreamBinding]] = {}
+        self.layouts: dict[int, list[tuple[int, torch.dtype, torch.Size]]] = {}
+        self.cpu_flat: dict[int, torch.Tensor] = {}
+        self.cpu_views: dict[int, list[torch.Tensor]] = {}
+        self.ring_flat: list[torch.Tensor] = []
+        self.ring_views: list[list[torch.Tensor]] = []
+        self.in_slot: list[int | None] = [None] * self.ring_size
+        self.free_events: list[torch.cuda.Event | None] = [None] * self.ring_size
+        self.handles: list[torch.utils.hooks.RemovableHandle] = []
+        self._prepared = False
+
+    @staticmethod
+    def _payload(block: nn.Module) -> tuple[list[_ForwardStreamBinding], list[torch.Tensor]]:
+        bindings: list[_ForwardStreamBinding] = []
+        tensors: list[torch.Tensor] = []
+        for module in block.modules():
+            for name, parameter in module.named_parameters(recurse=False):
+                if parameter is None:
+                    continue
+                if parameter.requires_grad:
+                    raise ValueError("forward-only block streaming requires frozen parameters")
+                bindings.append(_ForwardStreamBinding(module, name, True))
+                tensors.append(parameter.detach())
+            for name, buffer in module.named_buffers(recurse=False):
+                if buffer is None:
+                    continue
+                bindings.append(_ForwardStreamBinding(module, name, False))
+                tensors.append(buffer.detach())
+        if not tensors:
+            raise ValueError("forward-only block streaming found an empty block payload")
+        return bindings, tensors
+
+    @staticmethod
+    def _layout(tensors: list[torch.Tensor]) -> tuple[list[tuple[int, torch.dtype, torch.Size]], int]:
+        align = 256
+        entries = []
+        total = 0
+        for tensor in tensors:
+            total = (total + align - 1) // align * align
+            entries.append((total, tensor.dtype, tensor.shape))
+            total += tensor.numel() * tensor.element_size()
+        return entries, total
+
+    @staticmethod
+    def _views(flat: torch.Tensor, layout: list[tuple[int, torch.dtype, torch.Size]]) -> list[torch.Tensor]:
+        return [flat[offset : offset + shape.numel() * dtype.itemsize].view(dtype).view(shape) for offset, dtype, shape in layout]
+
+    def _bind(self, block_index: int, views: list[torch.Tensor]) -> None:
+        for binding, view in zip(self.bindings[block_index], views):
+            if binding.parameter:
+                binding.owner._parameters[binding.name] = nn.Parameter(view, requires_grad=False)
+            else:
+                binding.owner._buffers[binding.name] = view
+
+    def _load(self, rank: int, slot: int) -> None:
+        block_index = self.stream_indices[rank]
+        if self.in_slot[slot] == block_index:
+            self._bind(block_index, self.ring_views[slot])
+            return
+        previous = self.in_slot[slot]
+        if previous is not None:
+            self._bind(previous, self.cpu_views[previous])
+        source = self.cpu_flat[block_index]
+        destination = self.ring_flat[slot][: source.numel()]
+        self.copier.submit(block_index, destination, source, self.free_events[slot])
+        self._bind(block_index, self.ring_views[slot])
+        self.in_slot[slot] = block_index
+
+    def _before(self, block_index: int) -> None:
+        rank = self.rank_by_block[block_index]
+        slot = rank % self.ring_size
+        if self.in_slot[slot] != block_index:
+            self._load(rank, slot)
+        else:
+            self._bind(block_index, self.ring_views[slot])
+        event = self.copier.wait(block_index)
+        if event is not None:
+            torch.cuda.current_stream(self.device).wait_event(event)
+
+    def _after(self, block_index: int) -> None:
+        rank = self.rank_by_block[block_index]
+        slot = rank % self.ring_size
+        self.free_events[slot] = torch.cuda.current_stream(self.device).record_event()
+        self._bind(block_index, self.cpu_views[block_index])
+        next_rank = rank + self.ring_size
+        if next_rank < len(self.stream_indices):
+            self._load(next_rank, slot)
+        elif rank == len(self.stream_indices) - 1:
+            for first_rank in range(self.ring_size):
+                self._load(first_rank, first_rank)
+
+    def prepare(self) -> None:
+        if self._prepared:
+            return
+        stream_set = set(self.stream_indices)
+        maximum_bytes = 0
+        template_signature = None
+        for block_index, block in enumerate(self.blocks):
+            if block_index not in stream_set:
+                block.to(self.device)
+                continue
+            bindings, tensors = self._payload(block)
+            layout, total = self._layout(tensors)
+            signature = tuple((tensor.dtype, tensor.shape) for tensor in tensors)
+            if template_signature is None:
+                template_signature = signature
+            elif signature != template_signature:
+                raise ValueError("forward-only streamed blocks must have homogeneous payloads")
+            flat = torch.empty(total, dtype=torch.uint8, device="cpu")
+            if self.use_pinned_memory:
+                flat = flat.pin_memory(device=self.device)
+            views = self._views(flat, layout)
+            for destination, source in zip(views, tensors):
+                destination.copy_(source)
+            self.bindings[block_index] = bindings
+            self.layouts[block_index] = layout
+            self.cpu_flat[block_index] = flat
+            self.cpu_views[block_index] = views
+            self._bind(block_index, views)
+            maximum_bytes = max(maximum_bytes, total)
+
+        self.copier.reserve(maximum_bytes)
+        template_layout = self.layouts[self.stream_indices[0]]
+        self.ring_flat = [torch.empty(maximum_bytes, dtype=torch.uint8, device=self.device) for _ in range(self.ring_size)]
+        self.ring_views = [self._views(flat, template_layout) for flat in self.ring_flat]
+        for block_index in self.stream_indices:
+            block = self.blocks[block_index]
+            self.handles.append(block.register_forward_pre_hook(lambda _module, _inputs, index=block_index: self._before(index)))
+            self.handles.append(
+                block.register_forward_hook(lambda _module, _inputs, _output, index=block_index: self._after(index))
+            )
+        for rank in range(self.ring_size):
+            self._load(rank, rank)
+        _synchronize_device(self.device)
+        self._prepared = True
+        _clean_memory_on_device(self.device)
+        print(
+            f"ForwardOnlyBlockStreamer[{self.block_type}]: {len(self.stream_indices)} / {len(self.blocks)} blocks, "
+            f"ring={self.ring_size}, pinned={self.use_pinned_memory}."
+        )
+
+    def close(self) -> None:
+        self.copier.close()
+        for block_index in self.stream_indices:
+            self._bind(block_index, self.cpu_views[block_index])
+        for handle in self.handles:
+            handle.remove()
+        self.handles.clear()
 
 
 class LoRALinearStreamOffloader:
