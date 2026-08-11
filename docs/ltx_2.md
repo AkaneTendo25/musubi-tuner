@@ -1,6 +1,6 @@
-# LTX-2 / LTX-2.3
+# LTX-2 / LTX-2.3 / LTX-2.5
 
-Supports LoRA training for both **LTX-2 (19B)** and **LTX-2.3 (22B)** models with the following training modes: text-to-video, joint audio-video, audio-only, IC-LoRA / video-to-video, and audio-reference IC-LoRA.
+Supports LoRA training for **LTX-2**, **LTX-2.3**, and **LTX-2.5** in video, audio-video, and audio modes.
 
 Full-parameter fine-tuning for LTX-2.3 is documented in [Appendix: Full-Parameter Fine-Tuning](#appendix-full-parameter-fine-tuning).
 
@@ -11,8 +11,9 @@ Full-parameter fine-tuning for LTX-2.3 is documented in [Appendix: Full-Paramete
 |---------|-----------|-----------------|
 | LTX-2 (19B) | 19B | Single `aggregate_embed`, caption projection inside transformer |
 | LTX-2.3 (22B) | 22B | Dual `video_aggregate_embed`/`audio_aggregate_embed`, caption projection moved to feature extractor (`caption_proj_before_connector`), cross-attention AdaLN (`prompt_adaln`), separate audio connector dimensions, BigVGAN v2 vocoder with bandwidth extension |
+| LTX-2.5 (22B) | 22B | Split transformer, Gemma 4 text encoder, video VAE, and audio VAE checkpoints |
 
-Version choice for training is controlled by the `--ltx_version` flag (default: `2.3`): pass `--ltx_version 2.0` for the LTX-2 (19B) checkpoint and `--ltx_version 2.3` for the LTX-2.3 (22B) checkpoint. The trainer auto-detects the checkpoint version from metadata and warns on mismatch.
+Version choice is controlled by `--ltx_version` (default: `2.3`). Use `2.0`, `2.3`, or `2.5` to match the checkpoint. The trainer checks checkpoint metadata and warns on mismatch.
 
 Caching scripts (`ltx2_cache_latents.py`, `ltx2_cache_text_encoder_outputs.py`) also accept `--ltx_version`, but only for sample-prompt precaching defaults (`--precache_sample_latents` / `--precache_sample_prompts`). Dataset cache compatibility is still driven by `--ltx2_checkpoint` and `--ltx2_mode`.
 
@@ -272,12 +273,18 @@ Manual download is still supported, and is useful for managing checkpoints outsi
 **LTX-2 Checkpoint** — use as `--ltx2_checkpoint`:
 - LTX-2 (19B): [ltx-2-19b-dev.safetensors](https://huggingface.co/Lightricks/LTX-2/resolve/main/ltx-2-19b-dev.safetensors)
 - LTX-2.3 (22B): [ltx-2.3-22b-dev.safetensors](https://huggingface.co/Lightricks/LTX-2.3/resolve/main/ltx-2.3-22b-dev.safetensors)
+- LTX-2.5 (22B): [ltx-2.5-22b-dev-transformer-bf16.safetensors](https://huggingface.co/Lightricks/LTX-2.5/resolve/main/diffusion_models/ltx-2.5-22b-dev-transformer-bf16.safetensors)
 
-**Gemma Text Encoder** — pick one:
-- HF directory (`--gemma_root`): [gemma-3-12b-it-qat-q4_0-unquantized](https://huggingface.co/Lightricks/gemma-3-12b-it-qat-q4_0-unquantized)
-- Single file (`--gemma_safetensors`): [gemma_3_12B_it_fp8_e4m3fn.safetensors](https://huggingface.co/GitMylo/LTX-2-comfy_gemma_fp8_e4m3fn/resolve/main/gemma_3_12B_it_fp8_e4m3fn.safetensors)
+**Gemma Text Encoder**:
+- LTX-2 / LTX-2.3, HF directory (`--gemma_root`): [gemma-3-12b-it-qat-q4_0-unquantized](https://huggingface.co/Lightricks/gemma-3-12b-it-qat-q4_0-unquantized)
+- LTX-2 / LTX-2.3, single file (`--gemma_safetensors`): [gemma_3_12B_it_fp8_e4m3fn.safetensors](https://huggingface.co/GitMylo/LTX-2-comfy_gemma_fp8_e4m3fn/resolve/main/gemma_3_12B_it_fp8_e4m3fn.safetensors)
+- LTX-2.5, packed Gemma 4 and connector (`--ltx2_text_encoder_checkpoint`): [gemma4-12b-with-proj-ltx-2.5-bf16.safetensors](https://huggingface.co/Lightricks/LTX-2.5/resolve/main/text_encoders/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors)
 
-Other Gemma 3 12B variants may work but not all have been tested.
+**LTX-2.5 VAEs**:
+- Video (`--ltx2_video_vae`, or `--vae` during latent caching): [ltx-2.5-video-vae-bf16.safetensors](https://huggingface.co/Lightricks/LTX-2.5/resolve/main/vae/ltx-2.5-video-vae-bf16.safetensors)
+- Audio (`--ltx2_audio_vae` for audio or AV workflows): [ltx-2.5-audio-vae-bf16.safetensors](https://huggingface.co/Lightricks/LTX-2.5/resolve/main/vae/ltx-2.5-audio-vae-bf16.safetensors)
+
+Other Gemma 3 12B variants may work with LTX-2 / LTX-2.3 but not all have been tested. Use the packed Gemma 4 file for LTX-2.5.
 
 ---
 
@@ -520,6 +527,8 @@ python ltx2_cache_latents.py ^
   --ltx2_audio_source video
 ```
 
+For LTX-2.5, point `--ltx2_checkpoint` to its transformer, add `--vae /path/to/ltx-2.5-video-vae-bf16.safetensors`, add `--ltx2_audio_vae /path/to/ltx-2.5-audio-vae-bf16.safetensors` for audio or AV caching, and set `--ltx_version 2.5`.
+
 ### Latent Caching Arguments
 <sub>[↑ contents](#table-of-contents)</sub>
 
@@ -639,6 +648,8 @@ python ltx2_cache_text_encoder_outputs.py ^
   --batch_size 1
 ```
 
+For LTX-2.5, replace `--gemma_root` and `--gemma_load_in_8bit` with `--ltx2_text_encoder_checkpoint /path/to/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors`, point `--ltx2_checkpoint` to the 2.5 transformer, and set `--ltx_version 2.5`.
+
 ### Text Encoder Caching Arguments
 <sub>[↑ contents](#table-of-contents)</sub>
 
@@ -713,7 +724,7 @@ Recommended practice:
 - Pre-quantized FP8 checkpoints (e.g. `ltx-2.3-22b-dev-fp8.safetensors`) are supported. The loader auto-detects `weight_scale`/`input_scale` keys and dequantizes to bf16 before applying LoRA merges and any further quantization.
 
 When changing checkpoints (important):
-- If you change `--ltx2_checkpoint` (e.g., LTX-2 -> LTX-2.3, or different 2.3 variant), re-run **both** caches:
+- If you change `--ltx2_checkpoint` or model version, re-run **both** caches:
   - `ltx2_cache_latents.py`
   - `ltx2_cache_text_encoder_outputs.py`
 - Do not reuse old `*_ltx2_te.safetensors` from a different checkpoint. For LTX-2.3 audio/av training this can cause context/mask shape mismatches (for example FlashAttention varlen mask-length errors).
@@ -796,6 +807,8 @@ All flags above are off by default. `torch.compile` speedups are workload-depend
 For LTX-2 checkpoints, replace:
 - `--ltx2_checkpoint /path/to/ltx-2.3.safetensors` -> `--ltx2_checkpoint /path/to/ltx-2.safetensors`
 - `--ltx_version 2.3` -> `--ltx_version 2.0`
+
+For LTX-2.5, use the transformer with `--ltx2_checkpoint`, set `--ltx_version 2.5`, and provide the split text encoder and VAEs listed under [Downloading Required Models](#downloading-required-models). Existing LoRA, optimization, and block-swap options remain unchanged; use `--int8_base_dynamic` to quantize the official BF16 transformer at load time.
 
 > For DoRA, LyCORIS, quantization, optimizers, per-module settings, regularizers, conditioning (IC-LoRA / latent guides), and every other option, see [Part III — Advanced](#part-iii--advanced).
 

@@ -10,6 +10,18 @@ class VideoEncoderConfigurator(ModelConfigurator[VideoEncoder]):
     @classmethod
     def from_config(cls: type[VideoEncoder], config: dict) -> VideoEncoder:
         config = config.get("vae", {})
+        encoder_config = config.get("encoder")
+        if isinstance(encoder_config, dict):
+            config = {
+                "dims": config.get("dims", 3),
+                "in_channels": encoder_config.get("in_channels", 3),
+                "latent_channels": encoder_config.get("out_channels", 128),
+                "encoder_blocks": encoder_config.get("blocks", []),
+                "patch_size": encoder_config.get("patch_size", 4),
+                "norm_layer": encoder_config.get("norm_layer", "pixel_norm"),
+                "latent_log_var": encoder_config.get("latent_log_var", "constant"),
+                "encoder_spatial_padding_mode": encoder_config.get("spatial_padding_mode", "zeros"),
+            }
         convolution_dimensions = config.get("dims", 3)
         in_channels = config.get("in_channels", 3)
         latent_channels = config.get("latent_channels", 128)
@@ -74,6 +86,9 @@ VAE_ENCODER_COMFY_KEYS_FILTER = (
     SDOps("VAE_ENCODER_COMFY_KEYS_FILTER")
     .with_matching(prefix="vae.encoder.")
     .with_matching(prefix="vae.per_channel_statistics.")
+    .with_matching(prefix="encoder.")
+    .with_matching(prefix="per_channel_statistics.")
     .with_replacement("vae.encoder.", "")
     .with_replacement("vae.per_channel_statistics.", "per_channel_statistics.")
+    .with_replacement("encoder.", "")
 )

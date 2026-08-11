@@ -3,6 +3,7 @@
 import os
 import re
 import logging
+from collections import Counter
 
 import torch
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
@@ -226,11 +227,13 @@ def detect_ltx2_dtype(model_path: str) -> torch.dtype:
                 continue
             if dt.is_floating_point:
                 floating_dtypes.append(dt)
-                if dt.itemsize == 1:
+                if dt.itemsize == 1 and key.endswith(".weight"):
                     fp8_dtype = dt
                     break
 
-        dtype = fp8_dtype or (floating_dtypes[0] if floating_dtypes else handle.get_tensor(keys[0]).dtype)
+        dtype = fp8_dtype or (
+            Counter(floating_dtypes).most_common(1)[0][0] if floating_dtypes else handle.get_tensor(keys[0]).dtype
+        )
 
     logger.info("Detected LTX-2 dtype: %s", dtype)
     return dtype
@@ -378,10 +381,13 @@ def infer_ltx2_transformer_config_from_weights(model_path: str) -> Dict[str, Any
 
 
 def infer_ltx_version_from_checkpoint_config(config: Dict[str, Any]) -> Tuple[str, List[str]]:
-    """Infer checkpoint generation (2.0 vs 2.3) from metadata config markers."""
+    """Infer the LTX checkpoint generation from architecture metadata."""
     markers: List[str] = []
     transformer_cfg = config.get("transformer", {})
     vocoder_cfg = config.get("vocoder", {})
+
+    if bool(transformer_cfg.get("use_keyframes_abs_pos_embedding", False)):
+        markers.append("transformer.ltx25_keyframes_abs_pos_embedding=True")
 
     if bool(transformer_cfg.get("cross_attention_adaln", False)):
         markers.append("transformer.cross_attention_adaln=True")
@@ -399,7 +405,7 @@ def infer_ltx_version_from_checkpoint_config(config: Dict[str, Any]) -> Tuple[st
     if bool(transformer_cfg.get("caption_proj_before_connector", False)):
         markers.append("transformer.caption_proj_before_connector=True")
 
-    detected_version = "2.3" if markers else "2.0"
+    detected_version = "2.5" if any("ltx25" in marker for marker in markers) else ("2.3" if markers else "2.0")
     return detected_version, markers
 
 
@@ -574,15 +580,19 @@ def load_safetensors_dynamic_int8(
                 mkey = renamed if renamed is not None else key
                 if key_filter is not None and not key_filter(mkey):
                     continue
-                value = f.get_tensor(key)
+                shape = f.header[key]["shape"]
                 is_target = (
                     mkey.endswith(".weight")
-                    and value.ndim == 2
+                    and len(shape) == 2
                     and any(t in mkey for t in target_keys)
                     and not any(e in mkey for e in exclude_keys)
                 )
                 if is_target:
-                    w = value.to(device=calc_device, dtype=torch.float32)
+                    # Avoid staging each large BF16 matrix through numpy.fromfile and
+                    # pageable CPU memory when quantization is performed on CUDA.
+                    # MemoryEfficientSafeOpen uses its mmap transfer path when a CUDA
+                    # device is supplied, keeping the stream one tensor at a time.
+                    w = f.get_tensor(key, device=calc_device, dtype=torch.float32)
                     scale = (w.abs().amax(dim=1, keepdim=True) / 127.0).clamp_min(1e-12)
                     q = (w / scale).round_().clamp_(-127, 127).to(torch.int8)
                     sd[mkey] = q
@@ -590,6 +600,7 @@ def load_safetensors_dynamic_int8(
                     quantized += 1
                     del w
                 else:
+                    value = f.get_tensor(key)
                     if value.is_floating_point() and non_quant_dtype is not None:
                         value = value.to(non_quant_dtype)
                     if calc_device.type == "cuda":

@@ -153,7 +153,7 @@ class TREADRouter:
 def default_ltx_tread_route(ltx_version: str) -> dict[str, Any]:
     """Return the default TREAD route window for LTX training."""
     route: dict[str, Any] = {"selection_ratio": 0.5, "target": "video"}
-    if str(ltx_version) == "2.3":
+    if str(ltx_version) in {"2.3", "2.5"}:
         route["start_layer_idx"] = 3
         route["end_layer_idx"] = -4
     else:

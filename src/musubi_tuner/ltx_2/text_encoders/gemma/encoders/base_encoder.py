@@ -1,4 +1,5 @@
 import functools
+import json
 import logging
 import os
 from pathlib import Path
@@ -7,10 +8,74 @@ logger = logging.getLogger(__name__)
 
 import torch
 from einops import rearrange
-from transformers import AutoImageProcessor, Gemma3ForConditionalGeneration, Gemma3Processor
+from transformers import AutoImageProcessor, AutoModelForImageTextToText, Gemma3ForConditionalGeneration, Gemma3Processor
+from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+from transformers.models.auto.configuration_auto import CONFIG_MAPPING
 from musubi_tuner.ltx_2.loader.module_ops import ModuleOps
 from musubi_tuner.utils.safetensors_utils import MemoryEfficientSafeOpen
-from musubi_tuner.ltx_2.text_encoders.gemma.tokenizer import LTXVGemmaTokenizer
+from musubi_tuner.ltx_2.text_encoders.gemma.tokenizer import LTXVGemmaTokenizer, PackedTokenizerAssets
+
+
+def _packed_ltx25_assets(path: str) -> tuple[object | None, PackedTokenizerAssets | None]:
+    """Read Gemma 4 config/tokenizer assets without materializing model tensors."""
+
+    from safetensors import safe_open
+
+    with safe_open(path, framework="pt", device="cpu") as handle:
+        metadata = handle.metadata() or {}
+        raw_config = metadata.get("gemma_config")
+        keys = set(handle.keys())
+        if raw_config is None or "tokenizer_json" not in keys:
+            return None, None
+        config_dict = json.loads(raw_config)
+        model_type = config_dict.get("model_type")
+        if not model_type:
+            raise ValueError(f"Packed text encoder {path} has no model_type in gemma_config")
+        try:
+            config_class = CONFIG_MAPPING[model_type]
+        except KeyError as exc:
+            raise ValueError(
+                f"transformers does not support packed Gemma model_type={model_type!r}; LTX-2.5 requires transformers>=5.8.0"
+            ) from exc
+        config = config_class.from_dict(config_dict)
+        tokenizer_json = handle.get_tensor("tokenizer_json").cpu().numpy().astype("uint8", copy=False).tobytes()
+        sidecar_key = "hf_asset__tokenizer_config.json"
+        tokenizer_config = {}
+        if sidecar_key in keys:
+            raw = handle.get_tensor(sidecar_key).cpu().numpy().astype("uint8", copy=False).tobytes()
+            tokenizer_config = json.loads(raw)
+        return config, PackedTokenizerAssets(tokenizer_json, tokenizer_config)
+
+
+def _initialize_packed_gemma_runtime_buffers(model: torch.nn.Module) -> None:
+    """Materialize deterministic Gemma 4 buffers that are not stored in checkpoints."""
+
+    language_model = model.model.language_model
+    config = model.config.text_config
+    rotary = language_model.rotary_emb
+    for layer_type in dict.fromkeys(config.layer_types):
+        rope_parameters = config.rope_parameters[layer_type]
+        if rope_parameters is None:
+            continue
+        rope_type = rope_parameters["rope_type"]
+        # Transformers 5.15 resolves the matching heterogeneous per-layer
+        # config internally when layer_type is provided, including the wider
+        # full-attention head dimension used by Gemma 4. Its default RoPE
+        # initializer is model-specific rather than registered globally.
+        if rope_type == "default":
+            layer_config = config.per_layer_config[layer_type]
+            inv_freq, attention_scaling = rotary.compute_default_rope_parameters(
+                layer_config,
+                layer_type=layer_type,
+            )
+        else:
+            inv_freq, attention_scaling = ROPE_INIT_FUNCTIONS[rope_type](config, layer_type=layer_type)
+        rotary.register_buffer(f"{layer_type}_inv_freq", inv_freq, persistent=False)
+        rotary.register_buffer(f"{layer_type}_original_inv_freq", inv_freq.clone(), persistent=False)
+        setattr(rotary, f"{layer_type}_attention_scaling", attention_scaling)
+
+    embed_scale = torch.tensor(config.hidden_size**0.5, device="cpu")
+    language_model.embed_tokens.register_buffer("embed_scale", embed_scale, persistent=False)
 
 
 class GemmaTextEncoderModelBase(torch.nn.Module):
@@ -490,6 +555,8 @@ def module_ops_from_gemma_root(
 ) -> tuple[ModuleOps, ...]:
     # -- gemma_safetensors preprocessing --
     keep_fp8 = False
+    packed_config = None
+    packed_tokenizer = None
     if gemma_safetensors:
         if load_in_8bit or load_in_4bit:
             raise ValueError("--gemma_safetensors cannot be combined with --gemma_load_in_4bit/8bit")
@@ -498,6 +565,7 @@ def module_ops_from_gemma_root(
             raise FileNotFoundError(f"Gemma safetensors not found: {gemma_safetensors}")
         gemma_weights_path = gemma_safetensors
         gemma_root = None
+        packed_config, packed_tokenizer = _packed_ltx25_assets(gemma_safetensors)
         keep_fp8 = _has_fp8_weights(gemma_safetensors)
         if keep_fp8:
             logger.info("Detected fp8 weights in %s — will keep fp8 in VRAM", gemma_safetensors)
@@ -526,6 +594,8 @@ def module_ops_from_gemma_root(
     # Resolve tokenizer: from gemma_root directory or extracted from safetensors
     if gemma_root is not None:
         tokenizer_path: str | bytes = _find_matching_dir(gemma_root, "tokenizer.model")
+    elif packed_tokenizer is not None:
+        tokenizer_path = packed_tokenizer
     elif gemma_safetensors:
         logger.info("Extracting tokenizer from safetensors file...")
         tokenizer_path = _extract_spiece_model_bytes(gemma_safetensors)
@@ -577,16 +647,22 @@ def module_ops_from_gemma_root(
 
                     config = AutoConfig.from_pretrained(gemma_root, local_files_only=True)
                 else:
-                    from musubi_tuner.ltx_2.text_encoders.gemma.fp8_ops import infer_gemma3_config_from_safetensors
+                    if packed_config is not None:
+                        config = packed_config
+                    else:
+                        from musubi_tuner.ltx_2.text_encoders.gemma.fp8_ops import infer_gemma3_config_from_safetensors
 
-                    logger.info("No gemma_root — inferring config from safetensors header...")
-                    inferred = infer_gemma3_config_from_safetensors(gemma_safetensors)
-                    config_class = Gemma3ForConditionalGeneration.config_class
-                    config = config_class(**inferred)
+                        logger.info("No gemma_root — inferring Gemma 3 config from tensor topology...")
+                        inferred = infer_gemma3_config_from_safetensors(gemma_safetensors)
+                        config_class = Gemma3ForConditionalGeneration.config_class
+                        config = config_class(**inferred)
 
                 # Initialize on meta device to avoid immediate allocation
                 with torch.device("meta"):
-                    module.model = Gemma3ForConditionalGeneration(config).to(dtype=torch_dtype)
+                    if packed_config is not None:
+                        module.model = AutoModelForImageTextToText.from_config(config).to(dtype=torch_dtype)
+                    else:
+                        module.model = Gemma3ForConditionalGeneration(config).to(dtype=torch_dtype)
 
                 logger.info(f"Loading custom Gemma weights from {gemma_weights_path}...")
 
@@ -625,9 +701,21 @@ def module_ops_from_gemma_root(
                         elif key.startswith("model.norm."):
                             new_key = key.replace("model.norm.", "model.language_model.norm.", 1)
                         elif key.startswith("vision_model."):
-                            new_key = f"model.vision_tower.{key}"
+                            if packed_config is not None:
+                                new_key = key.replace("vision_model.", "model.embed_vision.", 1)
+                            else:
+                                new_key = f"model.vision_tower.{key}"
                         elif key.startswith("multi_modal_projector."):
-                            new_key = f"model.{key}"
+                            if packed_config is not None:
+                                new_key = key.replace(
+                                    "multi_modal_projector.",
+                                    "model.embed_vision.multimodal_embedder.",
+                                    1,
+                                )
+                            else:
+                                new_key = f"model.{key}"
+                        elif key.startswith("audio_projector."):
+                            new_key = key.replace("audio_projector.", "model.embed_audio.", 1)
                         elif key.startswith("language_model."):
                             # Some checkpoints use language_model.* instead of model.language_model.*
                             new_key = f"model.{key}"
@@ -646,11 +734,12 @@ def module_ops_from_gemma_root(
                             with torch.no_grad():
                                 # Dequantize NVFP4 packed weights (uint8 with two-level scales)
                                 if tensor.dtype == torch.uint8 and key.endswith(".weight"):
-                                    prefix = key[:-len(".weight")]
+                                    prefix = key[: -len(".weight")]
                                     wscale_k = prefix + ".weight_scale"
                                     wscale2_k = prefix + ".weight_scale_2"
                                     if wscale_k in keys and wscale2_k in keys:
                                         from musubi_tuner.modules.nvfp4_utils import dequantize_nvfp4_weight
+
                                         block_scale = f.get_tensor(wscale_k)
                                         tensor_scale = f.get_tensor(wscale2_k)
                                         tensor = dequantize_nvfp4_weight(tensor, block_scale, tensor_scale, dtype=torch_dtype)
@@ -695,6 +784,9 @@ def module_ops_from_gemma_root(
                     except Exception as e:
                         logger.warning("Failed to tie Gemma lm_head weights: %s", e)
 
+                if packed_config is not None:
+                    _initialize_packed_gemma_runtime_buffers(module.model)
+
                 meta_params = [(name, p) for name, p in module.model.named_parameters() if p.device.type == "meta"]
                 meta_buffers = [(name, b) for name, b in module.model.named_buffers() if b.device.type == "meta"]
                 total_params = sum(1 for _ in module.model.parameters())
@@ -709,7 +801,7 @@ def module_ops_from_gemma_root(
                 required_prefixes = ("model.language_model.", "lm_head.")
                 missing_required_params = [name for name, _ in meta_params if name.startswith(required_prefixes)]
                 missing_required_buffers = [name for name, _ in meta_buffers if name.startswith(required_prefixes)]
-                derivable_required_buffer_suffixes = (".embed_scale", ".inv_freq")
+                derivable_required_buffer_suffixes = (".embed_scale", "_inv_freq")
                 non_derivable_required_buffers = [
                     name for name in missing_required_buffers if not name.endswith(derivable_required_buffer_suffixes)
                 ]

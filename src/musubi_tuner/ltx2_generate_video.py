@@ -314,7 +314,7 @@ def parse_args() -> argparse.Namespace:
         "--ltx_version",
         type=str,
         default="2.3",
-        choices=["2.0", "2.3"],
+        choices=["2.0", "2.3", "2.5"],
         help="Target LTX version for default sampling presets.",
     )
 

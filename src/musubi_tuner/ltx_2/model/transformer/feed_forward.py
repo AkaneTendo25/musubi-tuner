@@ -4,12 +4,16 @@ from musubi_tuner.ltx_2.model.transformer.gelu_approx import GELUApprox
 
 
 class FeedForward(torch.nn.Module):
-    def __init__(self, dim: int, dim_out: int, mult: int = 4, chunk_size: int = 0) -> None:
+    def __init__(self, dim: int, dim_out: int, mult: int = 4, chunk_size: int = 0, bias: bool = True) -> None:
         super().__init__()
         inner_dim = int(dim * mult)
-        project_in = GELUApprox(dim, inner_dim)
+        project_in = GELUApprox(dim, inner_dim, bias=bias)
 
-        self.net = torch.nn.Sequential(project_in, torch.nn.Identity(), torch.nn.Linear(inner_dim, dim_out))
+        self.net = torch.nn.Sequential(
+            project_in,
+            torch.nn.Identity(),
+            torch.nn.Linear(inner_dim, dim_out, bias=bias),
+        )
         self.chunk_size = int(chunk_size) if chunk_size is not None else 0
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

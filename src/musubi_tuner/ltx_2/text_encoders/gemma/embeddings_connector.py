@@ -19,6 +19,7 @@ class _BasicTransformerBlock1D(torch.nn.Module):
         dim_head: int,
         rope_type: LTXRopeType = LTXRopeType.INTERLEAVED,
         apply_gated_attention: bool = False,
+        ff_bias: bool = True,
     ):
         super().__init__()
 
@@ -33,6 +34,7 @@ class _BasicTransformerBlock1D(torch.nn.Module):
         self.ff = FeedForward(
             dim,
             dim_out=dim,
+            bias=ff_bias,
         )
 
     def forward(
@@ -104,6 +106,7 @@ class Embeddings1DConnector(torch.nn.Module):
         double_precision_rope: bool = False,
         apply_gated_attention: bool = False,
         register_padding_mode: str = "legacy",
+        ff_bias: bool = True,
     ):
         super().__init__()
         self.num_attention_heads = num_attention_heads
@@ -126,6 +129,7 @@ class Embeddings1DConnector(torch.nn.Module):
                     dim_head=attention_head_dim,
                     rope_type=rope_type,
                     apply_gated_attention=apply_gated_attention,
+                    ff_bias=ff_bias,
                 )
                 for _ in range(num_layers)
             ]
@@ -263,6 +267,7 @@ class Embeddings1DConnectorConfigurator(ModelConfigurator[Embeddings1DConnector]
             double_precision_rope=double_precision_rope,
             apply_gated_attention=transformer_config.get("connector_apply_gated_attention", False),
             register_padding_mode=transformer_config.get("connector_register_padding_mode", "legacy"),
+            ff_bias=transformer_config.get("connector_ff_bias", True),
         )
         return connector
 
@@ -293,6 +298,10 @@ class AudioEmbeddings1DConnectorConfigurator(ModelConfigurator[Embeddings1DConne
             register_padding_mode=transformer_config.get(
                 "audio_connector_register_padding_mode",
                 transformer_config.get("connector_register_padding_mode", "legacy"),
+            ),
+            ff_bias=transformer_config.get(
+                "audio_connector_ff_bias",
+                transformer_config.get("connector_ff_bias", True),
             ),
         )
         return connector

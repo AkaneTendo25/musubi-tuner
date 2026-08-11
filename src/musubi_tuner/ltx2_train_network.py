@@ -35,6 +35,7 @@ from musubi_tuner.ltx_2.model.transformer.fp8_device_utils import (
     ensure_fp8_modules_on_device,
     prepare_fp8_placement_scope,
 )
+from musubi_tuner.ltx_2.model.transformer.ltx25_compat import build_generated_keyframe_mask
 from musubi_tuner.modules.nf4_optimization_utils import (
     is_nf4_module,
     DEFAULT_NF4_BLOCK_SIZE,
@@ -132,6 +133,15 @@ IC_LORA_STRATEGIES = (
 # keyframe is appended via `build_keyframe_extension`.
 AV_CROSS_ATTENTION_MODES = ("both", "a2v_only", "v2a_only", "none")
 VIDEO_ANCHOR_STRATEGIES = ("endpoints", "random", "endpoints_random")
+
+
+def _ltx25_generated_keyframe_mask(transformer, accelerator, tokens: torch.Tensor, keyframe_tokens: int):
+    """Build the LTX-2.5 marker only for checkpoints that own its embedding."""
+
+    model = accelerator.unwrap_model(transformer)
+    if keyframe_tokens <= 0 or not bool(getattr(model, "use_keyframes_abs_pos_embedding", False)):
+        return None
+    return build_generated_keyframe_mask(tokens.shape[0], tokens.shape[1], keyframe_tokens, tokens.device)
 
 
 def validate_ltx2_conditioning_setup(args, accelerator=None):
@@ -3330,7 +3340,7 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
 
         # Route defaults by selected LTX version for backward compatibility.
         ltx_version = str(getattr(args, "ltx_version", self._ltx_version))
-        return "stretched" if ltx_version == "2.3" else "legacy"
+        return "stretched" if ltx_version in {"2.3", "2.5"} else "legacy"
 
     def _resolve_audio_only_sequence_lengths(self, batch_size: int, device: torch.device) -> Optional[torch.Tensor]:
         latents_info = self.get_current_batch_latents_info()
@@ -3930,8 +3940,8 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
         self._ltx_mode = ltx_mode
 
         ltx_version = str(getattr(args, "ltx_version", "2.3"))
-        if ltx_version not in {"2.0", "2.3"}:
-            raise ValueError(f"Invalid ltx_version: {ltx_version}. Expected '2.0' or '2.3'.")
+        if ltx_version not in {"2.0", "2.3", "2.5"}:
+            raise ValueError(f"Invalid ltx_version: {ltx_version}. Expected '2.0', '2.3', or '2.5'.")
         self._ltx_version = ltx_version
         args.ltx_version = ltx_version
         ltx_version_check_mode = str(getattr(args, "ltx_version_check_mode", "warn") or "warn").lower()
@@ -6401,6 +6411,7 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                 context_mask=text_mask,
                 attention_mask=base_self_attention_mask,
                 force_keep_mask=force_keep_mask if self._tread_enabled else None,
+                keyframe_mask=_ltx25_generated_keyframe_mask(transformer, accelerator, combined_tokens, kf_count),
             )
 
             perturbations = BatchedPerturbationConfig.empty(bsz)
@@ -6818,6 +6829,7 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                 ),
                 a2v_cross_attention_mask=a2v_mask,
                 force_keep_mask=video_force_keep_mask if self._tread_enabled else None,
+                keyframe_mask=_ltx25_generated_keyframe_mask(transformer, accelerator, video_combined_tokens, kf_count),
             )
 
             audio_modality = Modality(
@@ -7509,6 +7521,7 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                 ),
                 a2v_cross_attention_mask=a2v_cross_attention_mask,
                 force_keep_mask=video_force_keep_mask if self._tread_enabled else None,
+                keyframe_mask=_ltx25_generated_keyframe_mask(transformer, accelerator, video_combined_tokens, kf_count),
             )
             if vroa_audio_active:
                 audio_modality = Modality(

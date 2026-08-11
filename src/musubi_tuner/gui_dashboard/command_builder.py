@@ -1161,6 +1161,12 @@ def build_training_cmd(config: ProjectConfig) -> list[str]:
     cmd += ["--ltx2_checkpoint", ltx2_checkpoint]
     if t.vae:
         cmd += ["--vae", t.vae]
+    if t.ltx2_video_vae:
+        cmd += ["--ltx2_video_vae", t.ltx2_video_vae]
+    if t.ltx2_audio_vae:
+        cmd += ["--ltx2_audio_vae", t.ltx2_audio_vae]
+    if t.ltx2_text_encoder_checkpoint:
+        cmd += ["--ltx2_text_encoder_checkpoint", t.ltx2_text_encoder_checkpoint]
     if gemma_root:
         cmd += ["--gemma_root", gemma_root]
     if gemma_safetensors:
@@ -2249,6 +2255,12 @@ def build_full_finetune_cmd(config: ProjectConfig) -> list[str]:
     cmd += ["--ltx2_checkpoint", ltx2_checkpoint]
     if t.vae:
         cmd += ["--vae", t.vae]
+    if t.ltx2_video_vae:
+        cmd += ["--ltx2_video_vae", t.ltx2_video_vae]
+    if t.ltx2_audio_vae:
+        cmd += ["--ltx2_audio_vae", t.ltx2_audio_vae]
+    if t.ltx2_text_encoder_checkpoint:
+        cmd += ["--ltx2_text_encoder_checkpoint", t.ltx2_text_encoder_checkpoint]
     if gemma_root:
         cmd += ["--gemma_root", gemma_root]
     if gemma_safetensors:

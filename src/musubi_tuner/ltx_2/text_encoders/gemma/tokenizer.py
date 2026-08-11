@@ -1,4 +1,15 @@
-from transformers import AutoTokenizer
+from dataclasses import dataclass
+
+from tokenizers import Tokenizer
+from transformers import AutoTokenizer, PreTrainedTokenizerFast
+
+
+@dataclass(frozen=True)
+class PackedTokenizerAssets:
+    """Tokenizer payload embedded in an LTX-2.5 text-encoder safetensors."""
+
+    tokenizer_json: bytes
+    tokenizer_config: dict
 
 
 class _SentencePieceTokenizerAdapter:
@@ -66,7 +77,7 @@ class LTXVGemmaTokenizer:
     ensuring correct settings and output formatting for downstream consumption.
     """
 
-    def __init__(self, tokenizer_path: str | bytes, max_length: int = 256):
+    def __init__(self, tokenizer_path: str | bytes | PackedTokenizerAssets, max_length: int = 256):
         """
         Initialize the tokenizer.
         Args:
@@ -74,12 +85,23 @@ class LTXVGemmaTokenizer:
                 or raw spiece_model bytes extracted from a safetensors file.
             max_length (int, optional): Max sequence length for encoding. Defaults to 256.
         """
-        if isinstance(tokenizer_path, bytes):
+        if isinstance(tokenizer_path, PackedTokenizerAssets):
+            config = tokenizer_path.tokenizer_config
+            self.tokenizer = PreTrainedTokenizerFast(
+                tokenizer_object=Tokenizer.from_buffer(tokenizer_path.tokenizer_json),
+                model_max_length=max_length,
+                bos_token=config.get("bos_token"),
+                eos_token=config.get("eos_token"),
+                pad_token=config.get("pad_token"),
+                unk_token=config.get("unk_token"),
+            )
+            self.tokenizer.padding_side = "left"
+            if self.tokenizer.pad_token is None:
+                self.tokenizer.pad_token = self.tokenizer.eos_token
+        elif isinstance(tokenizer_path, bytes):
             self.tokenizer = _SentencePieceTokenizerAdapter(tokenizer_path, max_length)
         else:
-            self.tokenizer = AutoTokenizer.from_pretrained(
-                tokenizer_path, local_files_only=True, model_max_length=max_length
-            )
+            self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, local_files_only=True, model_max_length=max_length)
             # Gemma expects left padding for chat-style prompts; for plain text it doesn't matter much.
             self.tokenizer.padding_side = "left"
             if self.tokenizer.pad_token is None:
@@ -114,9 +136,7 @@ class LTXVGemmaTokenizer:
         )
         input_ids = encoded.input_ids
         attention_mask = encoded.attention_mask
-        tuples = [
-            (token_id, attn, i) for i, (token_id, attn) in enumerate(zip(input_ids[0], attention_mask[0], strict=True))
-        ]
+        tuples = [(token_id, attn, i) for i, (token_id, attn) in enumerate(zip(input_ids[0], attention_mask[0], strict=True))]
         out = {"gemma": tuples}
 
         if not return_word_ids:

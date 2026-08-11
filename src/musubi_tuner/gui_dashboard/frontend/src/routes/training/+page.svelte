@@ -465,7 +465,10 @@
 					<div class="space-y-2 pt-2">
 						<CheckpointInput fieldPath="training.ltx2_checkpoint" label="LTX-2 Checkpoint" value={t.ltx2_checkpoint || ''} onchange={(v) => update('ltx2_checkpoint', v)} showFiles tooltip="Path to LTX-2 checkpoint" invalid={fieldInvalid('training.ltx2_checkpoint')} error={fieldError('training.ltx2_checkpoint')} actionLabel="D" actionBusyLabel="..." actionDisabled={hasActiveDownload || ltxDownloadExists} actionTooltip={modelDownloadTooltip(downloadPresets, 'ltxav', resolvedLtx, ltxDownloadExists)} onaction={() => downloadModel('ltxav')} />
 						{#if $advancedMode}
-							<PathInput fieldPath="training.vae" value={t.vae || ''} oninput={(e) => update('vae', e.target.value)} showFiles tooltip="Optional separate VAE checkpoint. Leave blank to use the VAE bundled with the LTX checkpoint." />
+						<PathInput fieldPath="training.vae" value={t.vae || ''} oninput={(e) => update('vae', e.target.value)} showFiles tooltip="Optional separate VAE checkpoint. Leave blank to use the VAE bundled with the LTX checkpoint." />
+						<PathInput fieldPath="training.ltx2_video_vae" value={t.ltx2_video_vae || ''} oninput={(e) => update('ltx2_video_vae', e.target.value)} showFiles tooltip="LTX-2.5 video VAE checkpoint." />
+						<PathInput fieldPath="training.ltx2_audio_vae" value={t.ltx2_audio_vae || ''} oninput={(e) => update('ltx2_audio_vae', e.target.value)} showFiles tooltip="LTX-2.5 audio VAE checkpoint." />
+						<PathInput fieldPath="training.ltx2_text_encoder_checkpoint" value={t.ltx2_text_encoder_checkpoint || ''} oninput={(e) => update('ltx2_text_encoder_checkpoint', e.target.value)} showFiles tooltip="LTX-2.5 packed Gemma text encoder checkpoint." />
 						{/if}
 						<ModelPathStatus exists={ltxDownloadExists} foundPath={foundLtxPath} disabled={hasActiveDownload} scanning={scanningLtx} scanMessage={ltxScanMessage} scanTone={ltxScanTone} onscan={scanLtx} oncancel={stopLtxScan} onusefound={(path) => update('ltx2_checkpoint', path)} />
 						<CheckpointInput fieldPath="training.gemma_root" label="Gemma Root" value={t.gemma_root || ''} onchange={(v) => update('gemma_root', v)} disabled={gemmaRootDisabled} tooltip={gemmaRootDisabled ? 'Ignored while Gemma Safetensors is set' : 'Gemma text encoder directory'} invalid={fieldInvalid('training.gemma_root')} error={fieldError('training.gemma_root')} actionLabel="D" actionBusyLabel="..." actionDisabled={gemmaRootDisabled || hasActiveDownload || gemmaDownloadExists} actionTooltip={gemmaRootDisabled ? 'Gemma Safetensors is active' : modelDownloadTooltip(downloadPresets, 'gemma-unsloth', resolvedGemma, gemmaDownloadExists)} onaction={() => downloadModel('gemma-unsloth')} />
@@ -498,7 +501,7 @@
 							<FormSelect fieldPath="training.mixed_precision" value={t.mixed_precision || 'no'} options={['no', 'fp16', 'bf16']} onchange={(e) => update('mixed_precision', e.target.value)} tooltip="Mixed precision mode" />
 						</div>
 						<div class="grid grid-cols-2 gap-2">
-							<FormSelect fieldPath="training.ltx_version" value={t.ltx_version || '2.3'} options={['2.0', '2.3']} onchange={(e) => update('ltx_version', e.target.value)} tooltip="Target LTX version behavior" />
+							<FormSelect fieldPath="training.ltx_version" value={t.ltx_version || '2.3'} options={['2.0', '2.3', '2.5']} onchange={(e) => update('ltx_version', e.target.value)} tooltip="Target LTX version behavior" />
 							<FormSelect fieldPath="training.ltx_version_check_mode" value={t.ltx_version_check_mode || 'warn'} options={['off', 'warn', 'error']} onchange={(e) => update('ltx_version_check_mode', e.target.value)} tooltip="Behavior when the checkpoint and selected LTX version do not match." />
 						</div>
 						<div class="grid grid-cols-3 gap-x-4 gap-y-1">

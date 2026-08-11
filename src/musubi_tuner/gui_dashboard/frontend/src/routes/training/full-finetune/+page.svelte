@@ -473,6 +473,9 @@
 			<div class="space-y-2 pt-2">
 				<CheckpointInput fieldPath="full_finetune.ltx2_checkpoint" label="LTX-2 Checkpoint" value={t.ltx2_checkpoint || ''} onchange={(value) => update('ltx2_checkpoint', value)} showFiles tooltip="Path to LTX-2 checkpoint" invalid={fieldInvalid('full_finetune.ltx2_checkpoint')} error={fieldError('full_finetune.ltx2_checkpoint')} actionLabel="D" actionBusyLabel="..." actionDisabled={hasActiveDownload || ltxDownloadExists} actionTooltip={modelDownloadTooltip(downloadPresets, 'ltxav', resolvedLtx, ltxDownloadExists)} onaction={() => downloadModel('ltxav')} />
 				<PathInput fieldPath="full_finetune.vae" value={t.vae || ''} oninput={(e) => update('vae', e.target.value)} showFiles tooltip="Optional separate VAE checkpoint. Leave blank to use the VAE bundled with the LTX checkpoint." />
+				<PathInput fieldPath="full_finetune.ltx2_video_vae" value={t.ltx2_video_vae || ''} oninput={(e) => update('ltx2_video_vae', e.target.value)} showFiles tooltip="LTX-2.5 video VAE checkpoint." />
+				<PathInput fieldPath="full_finetune.ltx2_audio_vae" value={t.ltx2_audio_vae || ''} oninput={(e) => update('ltx2_audio_vae', e.target.value)} showFiles tooltip="LTX-2.5 audio VAE checkpoint." />
+				<PathInput fieldPath="full_finetune.ltx2_text_encoder_checkpoint" value={t.ltx2_text_encoder_checkpoint || ''} oninput={(e) => update('ltx2_text_encoder_checkpoint', e.target.value)} showFiles tooltip="LTX-2.5 packed Gemma text encoder checkpoint." />
 				<ModelPathStatus exists={ltxDownloadExists} foundPath={foundLtxPath} disabled={hasActiveDownload} scanning={scanningLtx} scanMessage={ltxScanMessage} scanTone={ltxScanTone} onscan={scanLtx} oncancel={stopLtxScan} onusefound={(path) => update('ltx2_checkpoint', path)} />
 				<CheckpointInput fieldPath="full_finetune.gemma_root" label="Gemma Root" value={t.gemma_root || ''} onchange={(value) => update('gemma_root', value)} disabled={gemmaRootDisabled} tooltip={gemmaRootDisabled ? 'Ignored while Gemma Safetensors is set' : 'Gemma text encoder directory'} invalid={fieldInvalid('full_finetune.gemma_root')} error={fieldError('full_finetune.gemma_root')} actionLabel="D" actionBusyLabel="..." actionDisabled={gemmaRootDisabled || hasActiveDownload || gemmaDownloadExists} actionTooltip={gemmaRootDisabled ? 'Gemma Safetensors is active' : modelDownloadTooltip(downloadPresets, 'gemma-unsloth', resolvedGemma, gemmaDownloadExists)} onaction={() => downloadModel('gemma-unsloth')} />
 				<ModelPathStatus exists={gemmaRootDisabled || gemmaDownloadExists} foundPath={foundGemmaPath} disabled={gemmaRootDisabled || hasActiveDownload} scanning={scanningGemma} scanMessage={gemmaScanMessage} scanTone={gemmaScanTone} onscan={scanGemma} oncancel={stopGemmaScan} onusefound={(path) => { update('gemma_root', path); update('gemma_safetensors', ''); }} />
@@ -496,7 +499,7 @@
 				{/if}
 				<div class="grid grid-cols-2 gap-2">
 					<FormSelect fieldPath="full_finetune.ltx2_mode" value={t.ltx2_mode || 'video'} options={['video', 'av', 'audio']} onchange={(e) => update('ltx2_mode', e.target.value)} />
-					<FormSelect fieldPath="full_finetune.ltx_version" value={t.ltx_version || '2.3'} options={['2.0', '2.3']} onchange={(e) => update('ltx_version', e.target.value)} />
+					<FormSelect fieldPath="full_finetune.ltx_version" value={t.ltx_version || '2.3'} options={['2.0', '2.3', '2.5']} onchange={(e) => update('ltx_version', e.target.value)} />
 				</div>
 				<div class="grid grid-cols-2 gap-2">
 					<FormSelect fieldPath="full_finetune.ltx_version_check_mode" value={t.ltx_version_check_mode || 'warn'} options={['off', 'warn', 'error']} onchange={(e) => update('ltx_version_check_mode', e.target.value)} />

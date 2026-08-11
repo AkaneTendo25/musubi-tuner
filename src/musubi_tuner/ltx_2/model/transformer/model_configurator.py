@@ -7,6 +7,7 @@ from musubi_tuner.ltx_2.loader.sd_ops import KeyValueOperationResult, SDOps
 from musubi_tuner.ltx_2.model.model_protocol import ModelConfigurator
 from musubi_tuner.ltx_2.model.transformer.attention import AttentionFunction
 from musubi_tuner.ltx_2.model.transformer.model import LTXModel, LTXModelType
+from musubi_tuner.ltx_2.model.transformer.ltx25_compat import capabilities_from_config, enrich_config_from_state_dict
 from musubi_tuner.ltx_2.model.transformer.rope import LTXRopeType
 from musubi_tuner.ltx_2.utils import check_config_value
 
@@ -16,6 +17,10 @@ class LTXModelConfigurator(ModelConfigurator[LTXModel]):
     Configurator for LTX model.
     Used to create an LTX model from a configuration dictionary.
     """
+
+    @classmethod
+    def prepare_config_from_state_dict(cls, config: dict, keys) -> dict:
+        return enrich_config_from_state_dict(config, keys)
 
     @classmethod
     def from_config(cls: type[LTXModel], config: dict) -> LTXModel:
@@ -39,6 +44,7 @@ class LTXModelConfigurator(ModelConfigurator[LTXModel]):
         check_config_value(config, "share_ff", False)
         check_config_value(config, "av_cross_ada_norm", True)
         check_config_value(config, "use_middle_indices_grid", True)
+        capabilities = capabilities_from_config(config)
 
         return LTXModel(
             model_type=LTXModelType.AudioVideo,
@@ -67,6 +73,10 @@ class LTXModelConfigurator(ModelConfigurator[LTXModel]):
             apply_gated_attention=config.get("apply_gated_attention", False),
             caption_proj_before_connector=config.get("caption_proj_before_connector", False),
             cross_attention_adaln=config.get("cross_attention_adaln", False),
+            ff_bias=capabilities.ff_bias,
+            audio_ff_bias=capabilities.audio_ff_bias,
+            use_prompt_adaln_single=capabilities.use_prompt_adaln_single,
+            use_keyframes_abs_pos_embedding=capabilities.use_keyframes_abs_pos_embedding,
         )
 
 
@@ -75,6 +85,10 @@ class LTXVideoOnlyModelConfigurator(ModelConfigurator[LTXModel]):
     Configurator for LTX video only model.
     Used to create an LTX video only model from a configuration dictionary.
     """
+
+    @classmethod
+    def prepare_config_from_state_dict(cls, config: dict, keys) -> dict:
+        return enrich_config_from_state_dict(config, keys)
 
     @classmethod
     def from_config(cls: type[LTXModel], config: dict) -> LTXModel:
@@ -95,6 +109,7 @@ class LTXVideoOnlyModelConfigurator(ModelConfigurator[LTXModel]):
         check_config_value(config, "qk_norm", "rms_norm")
         check_config_value(config, "positional_embedding_type", "rope")
         check_config_value(config, "use_middle_indices_grid", True)
+        capabilities = capabilities_from_config(config)
 
         return LTXModel(
             model_type=LTXModelType.VideoOnly,
@@ -116,6 +131,9 @@ class LTXVideoOnlyModelConfigurator(ModelConfigurator[LTXModel]):
             apply_gated_attention=config.get("apply_gated_attention", False),
             caption_proj_before_connector=config.get("caption_proj_before_connector", False),
             cross_attention_adaln=config.get("cross_attention_adaln", False),
+            ff_bias=capabilities.ff_bias,
+            use_prompt_adaln_single=capabilities.use_prompt_adaln_single,
+            use_keyframes_abs_pos_embedding=capabilities.use_keyframes_abs_pos_embedding,
         )
 
 
@@ -124,6 +142,10 @@ class LTXAudioOnlyModelConfigurator(ModelConfigurator[LTXModel]):
     Configurator for LTX audio only model.
     Used to create an LTX audio only model from a configuration dictionary.
     """
+
+    @classmethod
+    def prepare_config_from_state_dict(cls, config: dict, keys) -> dict:
+        return enrich_config_from_state_dict(config, keys)
 
     @classmethod
     def from_config(cls: type[LTXModel], config: dict) -> LTXModel:
@@ -144,6 +166,7 @@ class LTXAudioOnlyModelConfigurator(ModelConfigurator[LTXModel]):
         check_config_value(config, "qk_norm", "rms_norm")
         check_config_value(config, "positional_embedding_type", "rope")
         check_config_value(config, "use_middle_indices_grid", True)
+        capabilities = capabilities_from_config(config)
 
         return LTXModel(
             model_type=LTXModelType.AudioOnly,
@@ -165,6 +188,8 @@ class LTXAudioOnlyModelConfigurator(ModelConfigurator[LTXModel]):
             apply_gated_attention=config.get("apply_gated_attention", False),
             caption_proj_before_connector=config.get("caption_proj_before_connector", False),
             cross_attention_adaln=config.get("cross_attention_adaln", False),
+            audio_ff_bias=capabilities.audio_ff_bias,
+            use_prompt_adaln_single=capabilities.use_prompt_adaln_single,
         )
 
 
@@ -210,9 +235,7 @@ class Fp8CastLinear(torch.nn.Linear):
     def forward(self, input: torch.Tensor) -> torch.Tensor:  # noqa: A002, type: ignore[override]
         w_up = _upcast_and_round(self.weight, input.dtype, self._with_stochastic_rounding, self._seed)
         b_up = (
-            _upcast_and_round(self.bias, input.dtype, self._with_stochastic_rounding, self._seed)
-            if self.bias is not None
-            else None
+            _upcast_and_round(self.bias, input.dtype, self._with_stochastic_rounding, self._seed) if self.bias is not None else None
         )
         return torch.nn.functional.linear(input, w_up, b_up)
 
@@ -228,9 +251,7 @@ def replace_fwd_with_upcast(layer: torch.nn.Linear, with_stochastic_rounding: bo
     layer._seed = seed
 
 
-def amend_forward_with_upcast(
-    model: torch.nn.Module, with_stochastic_rounding: bool = False, seed: int = 0
-) -> torch.nn.Module:
+def amend_forward_with_upcast(model: torch.nn.Module, with_stochastic_rounding: bool = False, seed: int = 0) -> torch.nn.Module:
     """
     Replace the forward method of the model's Linear layers to forward with
     upcast and optional stochastic rounding.
@@ -251,42 +272,20 @@ LTXV_MODEL_COMFY_RENAMING_WITH_TRANSFORMER_LINEAR_DOWNCAST_MAP = (
     SDOps("LTXV_MODEL_COMFY_PREFIX_MAP")
     .with_matching(prefix="model.diffusion_model.")
     .with_replacement("model.diffusion_model.", "")
-    .with_kv_operation(
-        key_prefix="transformer_blocks.", key_suffix=".to_q.weight", operation=_naive_weight_or_bias_downcast
-    )
-    .with_kv_operation(
-        key_prefix="transformer_blocks.", key_suffix=".to_q.bias", operation=_naive_weight_or_bias_downcast
-    )
-    .with_kv_operation(
-        key_prefix="transformer_blocks.", key_suffix=".to_k.weight", operation=_naive_weight_or_bias_downcast
-    )
-    .with_kv_operation(
-        key_prefix="transformer_blocks.", key_suffix=".to_k.bias", operation=_naive_weight_or_bias_downcast
-    )
-    .with_kv_operation(
-        key_prefix="transformer_blocks.", key_suffix=".to_v.weight", operation=_naive_weight_or_bias_downcast
-    )
-    .with_kv_operation(
-        key_prefix="transformer_blocks.", key_suffix=".to_v.bias", operation=_naive_weight_or_bias_downcast
-    )
-    .with_kv_operation(
-        key_prefix="transformer_blocks.", key_suffix=".to_out.0.weight", operation=_naive_weight_or_bias_downcast
-    )
-    .with_kv_operation(
-        key_prefix="transformer_blocks.", key_suffix=".to_out.0.bias", operation=_naive_weight_or_bias_downcast
-    )
+    .with_kv_operation(key_prefix="transformer_blocks.", key_suffix=".to_q.weight", operation=_naive_weight_or_bias_downcast)
+    .with_kv_operation(key_prefix="transformer_blocks.", key_suffix=".to_q.bias", operation=_naive_weight_or_bias_downcast)
+    .with_kv_operation(key_prefix="transformer_blocks.", key_suffix=".to_k.weight", operation=_naive_weight_or_bias_downcast)
+    .with_kv_operation(key_prefix="transformer_blocks.", key_suffix=".to_k.bias", operation=_naive_weight_or_bias_downcast)
+    .with_kv_operation(key_prefix="transformer_blocks.", key_suffix=".to_v.weight", operation=_naive_weight_or_bias_downcast)
+    .with_kv_operation(key_prefix="transformer_blocks.", key_suffix=".to_v.bias", operation=_naive_weight_or_bias_downcast)
+    .with_kv_operation(key_prefix="transformer_blocks.", key_suffix=".to_out.0.weight", operation=_naive_weight_or_bias_downcast)
+    .with_kv_operation(key_prefix="transformer_blocks.", key_suffix=".to_out.0.bias", operation=_naive_weight_or_bias_downcast)
     .with_kv_operation(
         key_prefix="transformer_blocks.", key_suffix=".ff.net.0.proj.weight", operation=_naive_weight_or_bias_downcast
     )
-    .with_kv_operation(
-        key_prefix="transformer_blocks.", key_suffix=".ff.net.0.proj.bias", operation=_naive_weight_or_bias_downcast
-    )
-    .with_kv_operation(
-        key_prefix="transformer_blocks.", key_suffix=".ff.net.2.weight", operation=_naive_weight_or_bias_downcast
-    )
-    .with_kv_operation(
-        key_prefix="transformer_blocks.", key_suffix=".ff.net.2.bias", operation=_naive_weight_or_bias_downcast
-    )
+    .with_kv_operation(key_prefix="transformer_blocks.", key_suffix=".ff.net.0.proj.bias", operation=_naive_weight_or_bias_downcast)
+    .with_kv_operation(key_prefix="transformer_blocks.", key_suffix=".ff.net.2.weight", operation=_naive_weight_or_bias_downcast)
+    .with_kv_operation(key_prefix="transformer_blocks.", key_suffix=".ff.net.2.bias", operation=_naive_weight_or_bias_downcast)
 )
 
 UPCAST_DURING_INFERENCE = ModuleOps(

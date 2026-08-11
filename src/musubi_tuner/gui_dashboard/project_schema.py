@@ -218,12 +218,15 @@ class TrainingConfig(BaseModel):
     # Model
     ltx2_checkpoint: str = ""
     vae: str = ""
+    ltx2_video_vae: str = ""
+    ltx2_audio_vae: str = ""
+    ltx2_text_encoder_checkpoint: str = ""
     gemma_root: str = ""
     gemma_safetensors: str = ""
     config_file: str = ""
     dataset_config: str = ""
     ltx2_mode: Literal["video", "av", "audio"] = "video"
-    ltx_version: Literal["2.0", "2.3"] = "2.3"
+    ltx_version: Literal["2.0", "2.3", "2.5"] = "2.3"
     ltx_version_check_mode: Literal["off", "warn", "error"] = "warn"
     debug_dataset: bool = False
     fp8_base: bool = False
@@ -1062,6 +1065,9 @@ class FullFinetuneConfig(TrainingConfig):
 class InferenceConfig(BaseModel):
     ltx2_checkpoint: str = ""
     vae: str = ""
+    ltx2_video_vae: str = ""
+    ltx2_audio_vae: str = ""
+    ltx2_text_encoder_checkpoint: str = ""
     vae_dtype: Optional[Literal["bfloat16", "float16", "float32"]] = None
     device: Optional[str] = None
     gemma_root: str = ""

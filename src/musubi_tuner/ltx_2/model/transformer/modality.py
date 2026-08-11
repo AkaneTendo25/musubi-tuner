@@ -23,3 +23,4 @@ class Modality:
     v2a_cross_attention_mask: torch.Tensor | None = None  # Shape: (B, Tq_audio, Tk_video)
     dcr_detach_mask: torch.Tensor | None = None  # DCR: Shape (B, 1, 1), 1.0=normal 0.0=detach
     force_keep_mask: torch.Tensor | None = None  # TREAD: Shape (B, T), True keeps the token routable
+    keyframe_mask: torch.Tensor | None = None  # Shape (B, T), marks standalone generated-keyframe tokens.

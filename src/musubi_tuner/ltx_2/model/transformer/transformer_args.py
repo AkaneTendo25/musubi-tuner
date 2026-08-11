@@ -5,6 +5,7 @@ import os
 import torch
 from musubi_tuner.ltx_2.model.transformer.adaln import AdaLayerNormSingle
 from musubi_tuner.ltx_2.model.transformer.modality import Modality
+from musubi_tuner.ltx_2.model.transformer.ltx25_compat import apply_generated_keyframe_embedding
 from musubi_tuner.ltx_2.model.transformer.rope import (
     LTXRopeType,
     generate_freq_grid_np,
@@ -52,6 +53,7 @@ class TransformerArgsPreprocessor:
         positional_embedding_theta: float,
         rope_type: LTXRopeType,
         prompt_adaln: AdaLayerNormSingle | None = None,
+        keyframes_abs_pos_embedding: torch.nn.Parameter | None = None,
     ) -> None:
         self.patchify_proj = patchify_proj
         self.adaln = adaln
@@ -65,6 +67,7 @@ class TransformerArgsPreprocessor:
         self.positional_embedding_theta = positional_embedding_theta
         self.rope_type = rope_type
         self.prompt_adaln = prompt_adaln
+        self.keyframes_abs_pos_embedding = keyframes_abs_pos_embedding
 
     def _prepare_timestep(
         self,
@@ -244,6 +247,10 @@ class TransformerArgsPreprocessor:
     ) -> TransformerArgs:
         self._ensure_modules_on_device(modality.latent.device)
         x = self.patchify_proj(modality.latent)
+        if modality.keyframe_mask is not None:
+            if self.keyframes_abs_pos_embedding is None:
+                raise ValueError("Generated-keyframe tokens require a checkpoint keyframes_abs_pos_embedding")
+            x = apply_generated_keyframe_embedding(x, modality.keyframe_mask, self.keyframes_abs_pos_embedding)
         timestep, embedded_timestep = self._prepare_timestep(modality.timesteps, x.shape[0], modality.latent.dtype)
         prompt_timestep = None
         if self.prompt_adaln is not None and getattr(modality, "sigma", None) is not None:
@@ -315,6 +322,7 @@ class MultiModalTransformerArgsPreprocessor:
         rope_type: LTXRopeType,
         av_ca_timestep_scale_multiplier: int,
         prompt_adaln: AdaLayerNormSingle | None = None,
+        keyframes_abs_pos_embedding: torch.nn.Parameter | None = None,
     ) -> None:
         self.simple_preprocessor = TransformerArgsPreprocessor(
             patchify_proj=patchify_proj,
@@ -329,6 +337,7 @@ class MultiModalTransformerArgsPreprocessor:
             positional_embedding_theta=positional_embedding_theta,
             rope_type=rope_type,
             prompt_adaln=prompt_adaln,
+            keyframes_abs_pos_embedding=keyframes_abs_pos_embedding,
         )
         self.cross_scale_shift_adaln = cross_scale_shift_adaln
         self.cross_gate_adaln = cross_gate_adaln

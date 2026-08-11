@@ -195,6 +195,10 @@ class LTXModel(torch.nn.Module):
         apply_gated_attention: bool = False,
         caption_proj_before_connector: bool = False,
         cross_attention_adaln: bool = False,
+        ff_bias: bool = True,
+        audio_ff_bias: bool = True,
+        use_prompt_adaln_single: bool = True,
+        use_keyframes_abs_pos_embedding: bool = False,
     ):
         super().__init__()
         self._enable_gradient_checkpointing = False
@@ -213,6 +217,10 @@ class LTXModel(torch.nn.Module):
         self.audio_cross_attention_dim = audio_cross_attention_dim
         self.caption_proj_before_connector = caption_proj_before_connector
         self.cross_attention_adaln = cross_attention_adaln
+        self.ff_bias = ff_bias
+        self.audio_ff_bias = audio_ff_bias
+        self.use_prompt_adaln_single = use_prompt_adaln_single
+        self.use_keyframes_abs_pos_embedding = use_keyframes_abs_pos_embedding
         self._tread_router: TREADRouter | None = None
         self._tread_routes: list[dict[str, Any]] | None = None
         cross_pe_max_pos = None
@@ -279,7 +287,12 @@ class LTXModel(torch.nn.Module):
             embedding_coefficient=adaln_embedding_coefficient(self.cross_attention_adaln),
         )
         self.prompt_adaln_single = (
-            AdaLayerNormSingle(self.inner_dim, embedding_coefficient=2) if self.cross_attention_adaln else None
+            AdaLayerNormSingle(self.inner_dim, embedding_coefficient=2)
+            if self.cross_attention_adaln and self.use_prompt_adaln_single
+            else None
+        )
+        self.keyframes_abs_pos_embedding = (
+            torch.nn.Parameter(torch.empty(1, self.inner_dim)) if self.use_keyframes_abs_pos_embedding else None
         )
 
         # Caption projection is baked into LTX-23 feature extractor before connectors.
@@ -313,7 +326,9 @@ class LTXModel(torch.nn.Module):
             embedding_coefficient=adaln_embedding_coefficient(self.cross_attention_adaln),
         )
         self.audio_prompt_adaln_single = (
-            AdaLayerNormSingle(self.audio_inner_dim, embedding_coefficient=2) if self.cross_attention_adaln else None
+            AdaLayerNormSingle(self.audio_inner_dim, embedding_coefficient=2)
+            if self.cross_attention_adaln and self.use_prompt_adaln_single
+            else None
         )
 
         # Caption projection is baked into LTX-23 feature extractor before connectors.
@@ -380,6 +395,7 @@ class LTXModel(torch.nn.Module):
                 rope_type=self.rope_type,
                 av_ca_timestep_scale_multiplier=self.av_ca_timestep_scale_multiplier,
                 prompt_adaln=self.prompt_adaln_single,
+                keyframes_abs_pos_embedding=self.keyframes_abs_pos_embedding,
             )
             self.audio_args_preprocessor = MultiModalTransformerArgsPreprocessor(
                 patchify_proj=self.audio_patchify_proj,
@@ -414,6 +430,7 @@ class LTXModel(torch.nn.Module):
                 positional_embedding_theta=self.positional_embedding_theta,
                 rope_type=self.rope_type,
                 prompt_adaln=self.prompt_adaln_single,
+                keyframes_abs_pos_embedding=self.keyframes_abs_pos_embedding,
             )
         elif self.model_type.is_audio_enabled():
             self.audio_args_preprocessor = TransformerArgsPreprocessor(
@@ -451,6 +468,7 @@ class LTXModel(torch.nn.Module):
                 context_dim=cross_attention_dim,
                 apply_gated_attention=apply_gated_attention,
                 cross_attention_adaln=self.cross_attention_adaln,
+                ff_bias=self.ff_bias,
             )
             if self.model_type.is_video_enabled()
             else None
@@ -463,6 +481,7 @@ class LTXModel(torch.nn.Module):
                 context_dim=audio_cross_attention_dim,
                 apply_gated_attention=apply_gated_attention,
                 cross_attention_adaln=self.cross_attention_adaln,
+                ff_bias=self.audio_ff_bias,
             )
             if self.model_type.is_audio_enabled()
             else None

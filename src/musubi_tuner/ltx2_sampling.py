@@ -901,6 +901,8 @@ class LTX2SamplingMixin:
     def _build_text_encoder(self, args: argparse.Namespace, accelerator: Accelerator) -> torch.dtype:
         logger.info("Loading Gemma text encoder for LTX-2 sampling")
         gemma_safetensors = getattr(args, "gemma_safetensors", None)
+        if not gemma_safetensors and str(getattr(args, "ltx_version", "")) == "2.5":
+            gemma_safetensors = getattr(args, "ltx2_text_encoder_checkpoint", None)
         if getattr(args, "gemma_root", None) is None and not gemma_safetensors:
             raise ValueError("--gemma_root or --gemma_safetensors is required for LTX-2 sample prompts")
         if getattr(args, "ltx2_checkpoint", None) is None:
@@ -942,8 +944,14 @@ class LTX2SamplingMixin:
             bnb_device_map = {"": local_rank}
             logger.info("Gemma quantized load: using LOCAL_RANK device_map %s", bnb_device_map)
 
+        text_encoder_checkpoint = getattr(args, "ltx2_text_encoder_checkpoint", None) or args.ltx2_checkpoint
+        builder_model_paths = (
+            (str(args.ltx2_checkpoint), str(text_encoder_checkpoint))
+            if str(text_encoder_checkpoint) != str(args.ltx2_checkpoint)
+            else str(args.ltx2_checkpoint)
+        )
         self._text_encoder = SingleGPUModelBuilder(
-            model_path=str(args.ltx2_checkpoint),
+            model_path=builder_model_paths,
             model_class_configurator=configurator,
             model_sd_ops=key_ops,
             module_ops=module_ops_from_gemma_root(
@@ -980,7 +988,7 @@ class LTX2SamplingMixin:
                 )
             except StopIteration:
                 pass
-        apply_text_encoder_checkpoint_overrides(self._text_encoder, str(args.ltx2_checkpoint))
+        apply_text_encoder_checkpoint_overrides(self._text_encoder, str(text_encoder_checkpoint))
         self._text_encoder.eval()
 
         # Connector LoRA: replace text encoder's connectors with the wrapper's
@@ -1217,7 +1225,7 @@ class LTX2SamplingMixin:
                 audio_decoder, vocoder = self._load_audio_components(
                     args,
                     audio_dtype=audio_dtype,
-                    checkpoint_path=args.ltx2_checkpoint,
+                    checkpoint_path=getattr(args, "ltx2_audio_vae", None) or args.ltx2_checkpoint,
                     device=accelerator.device,
                 )
                 logger.info("Sampling: pre-loaded audio decoder/vocoder to GPU (high VRAM mode)")
@@ -2024,7 +2032,7 @@ class LTX2SamplingMixin:
         if ref_audio_path and ref_audio_latent is None:
             logger.info("Audio-ref: encoding reference audio")
             try:
-                checkpoint_path = getattr(args, "ltx2_checkpoint", None)
+                checkpoint_path = getattr(args, "ltx2_audio_vae", None) or getattr(args, "ltx2_checkpoint", None)
                 if not checkpoint_path:
                     raise ValueError("--ltx2_checkpoint is required for reference-audio encoding")
                 ref_audio_latent = self._load_and_encode_reference_audio_latent(
@@ -2042,7 +2050,7 @@ class LTX2SamplingMixin:
         _audio_lock_path = sample_parameter.get("audio_lock_audio_path")
         if _audio_lock_path and not isinstance(sample_parameter.get("audio_lock_latent"), torch.Tensor):
             try:
-                _lock_ckpt = getattr(args, "ltx2_checkpoint", None)
+                _lock_ckpt = getattr(args, "ltx2_audio_vae", None) or getattr(args, "ltx2_checkpoint", None)
                 if not _lock_ckpt:
                     raise ValueError("--ltx2_checkpoint is required for audio-lock encoding")
                 sample_parameter["audio_lock_latent"] = self._load_and_encode_reference_audio_latent(
@@ -2141,7 +2149,7 @@ class LTX2SamplingMixin:
                     audio_decoder, vocoder = self._load_audio_components(
                         args,
                         audio_dtype=audio_dtype,
-                        checkpoint_path=args.ltx2_checkpoint,
+                        checkpoint_path=getattr(args, "ltx2_audio_vae", None) or args.ltx2_checkpoint,
                         device=accelerator.device,
                     )
                     loaded_audio = True
@@ -3970,7 +3978,7 @@ class LTX2SamplingMixin:
                     self._decode_audio_preview_subprocess(
                         audio_latents=audio_latents,
                         output_path=audio_output_path,
-                        checkpoint_path=args.ltx2_checkpoint,
+                        checkpoint_path=getattr(args, "ltx2_audio_vae", None) or args.ltx2_checkpoint,
                     )
                     # audio_waveform stays None — the .wav was written by the subprocess
                 else:
@@ -5063,7 +5071,7 @@ class LTX2SamplingMixin:
                     self._decode_audio_preview_subprocess(
                         audio_latents=audio_latents,
                         output_path=audio_output_path,
-                        checkpoint_path=args.ltx2_checkpoint,
+                        checkpoint_path=getattr(args, "ltx2_audio_vae", None) or args.ltx2_checkpoint,
                     )
                 except Exception as exc:
                     logger.warning("AV_IC sampling: subprocess audio decode failed: %s", exc)

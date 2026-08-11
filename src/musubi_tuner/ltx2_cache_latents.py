@@ -1327,13 +1327,14 @@ def _precache_sample_latents(args: argparse.Namespace, device: torch.device) -> 
         )
         from musubi_tuner.ltx_2.model.audio_vae.ops import AudioProcessor
 
-        if getattr(args, "ltx2_checkpoint", None) is None:
-            raise ValueError("--ltx2_checkpoint is required for reference-audio latent precaching")
+        audio_vae_path = getattr(args, "ltx2_audio_vae", None) or getattr(args, "ltx2_checkpoint", None)
+        if audio_vae_path is None:
+            raise ValueError("--ltx2_audio_vae or --ltx2_checkpoint is required for reference-audio latent precaching")
 
         audio_dtype = torch.float16 if args.ltx2_audio_dtype is None else str_to_dtype(args.ltx2_audio_dtype)
         logger.info("Loading audio encoder for reference-audio precaching")
         audio_encoder = SingleGPUModelBuilder(
-            model_path=str(args.ltx2_checkpoint),
+            model_path=str(audio_vae_path),
             model_class_configurator=AudioEncoderConfigurator,
             model_sd_ops=AUDIO_VAE_ENCODER_COMFY_KEYS_FILTER,
             model_loader=_checkpoint_model_loader(args),
@@ -1774,8 +1775,9 @@ def main() -> None:
 
         cache_latents.encode_datasets(list(audio_datasets), encode_audio_only_video_latents, args)
     if audio_video or audio_only:
-        if getattr(args, "ltx2_checkpoint", None) is None:
-            raise ValueError("--ltx2_checkpoint is required when audio latents are cached")
+        audio_vae_path = getattr(args, "ltx2_audio_vae", None) or getattr(args, "ltx2_checkpoint", None)
+        if audio_vae_path is None:
+            raise ValueError("--ltx2_audio_vae or --ltx2_checkpoint is required when audio latents are cached")
 
         audio_dtype = torch.float16 if args.ltx2_audio_dtype is None else str_to_dtype(args.ltx2_audio_dtype)
         from musubi_tuner.ltx_2.loader.single_gpu_model_builder import SingleGPUModelBuilder
@@ -1786,7 +1788,7 @@ def main() -> None:
         from musubi_tuner.ltx_2.model.audio_vae.ops import AudioProcessor
 
         encoder = SingleGPUModelBuilder(
-            model_path=str(args.ltx2_checkpoint),
+            model_path=str(audio_vae_path),
             model_class_configurator=AudioEncoderConfigurator,
             model_sd_ops=AUDIO_VAE_ENCODER_COMFY_KEYS_FILTER,
             model_loader=_checkpoint_model_loader(args),
@@ -1903,6 +1905,12 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         type=str,
         default=default_ltx2_checkpoint_path(),
         help="Path to LTX-2 checkpoint (.safetensors)",
+    )
+    parser.add_argument(
+        "--ltx2_audio_vae",
+        type=str,
+        default=None,
+        help="Standalone audio VAE for an LTX-2.5 split pack. Defaults to --ltx2_checkpoint for unified checkpoints.",
     )
     parser.add_argument(
         "--cpu_staged_checkpoint_loading",
@@ -2041,7 +2049,7 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         "--ltx_version",
         type=str,
         default="2.3",
-        choices=["2.0", "2.3"],
+        choices=["2.0", "2.3", "2.5"],
         help="LTX model version (used to resolve sampling-preset geometry for --precache_sample_latents).",
     )
     parser.add_argument(

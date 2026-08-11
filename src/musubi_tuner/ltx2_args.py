@@ -235,7 +235,19 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         "--ltx2_checkpoint",
         type=str,
         default=default_ltx2_checkpoint_path(),
-        help="Path to LTX-2 checkpoint (.safetensors)",
+        help="Path to a unified LTX checkpoint or an LTX-2.5 transformer safetensors file.",
+    )
+    parser.add_argument(
+        "--ltx2_video_vae",
+        type=str,
+        default=None,
+        help="Standalone video VAE for an LTX-2.5 split checkpoint pack. Unified checkpoints use --ltx2_checkpoint.",
+    )
+    parser.add_argument(
+        "--ltx2_audio_vae",
+        type=str,
+        default=None,
+        help="Standalone audio VAE/vocoder for an LTX-2.5 split checkpoint pack. Unified checkpoints use --ltx2_checkpoint.",
     )
     parser.add_argument(
         "--gemma_root",
@@ -302,10 +314,9 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         "--ltx_version",
         type=str,
         default="2.3",
-        choices=["2.0", "2.3"],
+        choices=["2.0", "2.3", "2.5"],
         help=(
-            "Target LTX major trainer behavior. "
-            "2.0 keeps legacy defaults; 2.3 enables 2.3-oriented defaults when mode is not explicitly overridden."
+            "Target LTX major trainer behavior. 2.0 keeps legacy defaults; 2.3 and 2.5 enable the current stretched-sigma defaults."
         ),
     )
     parser.add_argument(
@@ -2323,9 +2334,10 @@ def main() -> None:
         logger.warning("Ignoring --dit for LTX-2; using --ltx2_checkpoint instead")
     args.dit = args.ltx2_checkpoint
 
-    if getattr(args, "vae", None) is not None and args.vae != args.ltx2_checkpoint:
-        logger.warning("Ignoring --vae for LTX-2; using --ltx2_checkpoint instead")
-    args.vae = args.ltx2_checkpoint
+    video_vae = getattr(args, "ltx2_video_vae", None)
+    if getattr(args, "vae", None) is not None and args.vae not in {args.ltx2_checkpoint, video_vae}:
+        logger.warning("Ignoring generic --vae for LTX-2; use --ltx2_video_vae for split LTX-2.5 packs")
+    args.vae = video_vae or args.ltx2_checkpoint
 
     if getattr(args, "weighting_scheme", None) not in {None, "none"}:
         logger.warning("Ignoring --weighting_scheme for LTX-2; forcing weighting_scheme=none")

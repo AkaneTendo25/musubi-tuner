@@ -50,9 +50,7 @@ class SingleGPUModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType],
                 model = module_op.mutator(model)
         return model
 
-    def load_sd(
-        self, paths: list[str], registry: Registry, device: torch.device | None, sd_ops: SDOps | None = None
-    ) -> StateDict:
+    def load_sd(self, paths: list[str], registry: Registry, device: torch.device | None, sd_ops: SDOps | None = None) -> StateDict:
         state_dict = registry.get(paths, sd_ops)
         if state_dict is None:
             state_dict = self.model_loader.load(paths, sd_ops=sd_ops, device=device)
@@ -79,9 +77,14 @@ class SingleGPUModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType],
     def build(self, device: torch.device | None = None, dtype: torch.dtype | None = None) -> ModelType:
         device = torch.device("cuda") if device is None else device
         config = self.model_config()
+        model_paths = list(self.model_path) if isinstance(self.model_path, tuple) else [self.model_path]
+        prepare_config = getattr(self.model_class_configurator, "prepare_config_from_state_dict", None)
+        if callable(prepare_config):
+            model_state_dict = self.load_sd(model_paths, sd_ops=self.model_sd_ops, registry=self.registry, device=device)
+            config = prepare_config(config, model_state_dict.sd.keys())
         meta_model = self.meta_model(config, self.module_ops)
-        model_paths = self.model_path if isinstance(self.model_path, tuple) else [self.model_path]
-        model_state_dict = self.load_sd(model_paths, sd_ops=self.model_sd_ops, registry=self.registry, device=device)
+        if not callable(prepare_config):
+            model_state_dict = self.load_sd(model_paths, sd_ops=self.model_sd_ops, registry=self.registry, device=device)
 
         lora_strengths = [lora.strength for lora in self.loras]
         if not lora_strengths or (min(lora_strengths) == 0 and max(lora_strengths) == 0):
@@ -95,8 +98,7 @@ class SingleGPUModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType],
             self.load_sd([lora.path], sd_ops=lora.sd_ops, registry=self.registry, device=device) for lora in self.loras
         ]
         lora_sd_and_strengths = [
-            LoraStateDictWithStrength(sd, strength)
-            for sd, strength in zip(lora_state_dicts, lora_strengths, strict=True)
+            LoraStateDictWithStrength(sd, strength) for sd, strength in zip(lora_state_dicts, lora_strengths, strict=True)
         ]
         final_sd = apply_loras(
             model_sd=model_state_dict,

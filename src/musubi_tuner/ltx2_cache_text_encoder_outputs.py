@@ -491,7 +491,14 @@ def main() -> None:
 
     autocast_dtype = torch.float16 if args.mixed_precision == "fp16" else torch.bfloat16 if args.mixed_precision == "bf16" else None
 
+    text_encoder_checkpoint = (
+        args.ltx2_text_encoder_checkpoint
+        if getattr(args, "ltx2_text_encoder_checkpoint", None) is not None
+        else args.ltx2_checkpoint
+    )
     gemma_safetensors = getattr(args, "gemma_safetensors", None)
+    if not gemma_safetensors and str(getattr(args, "ltx_version", "")) == "2.5":
+        gemma_safetensors = text_encoder_checkpoint
     if args.gemma_root is None and not gemma_safetensors:
         raise ValueError("--gemma_root or --gemma_safetensors is required for LTX-2 Gemma text caching")
     if gemma_safetensors and (getattr(args, "gemma_load_in_8bit", False) or getattr(args, "gemma_load_in_4bit", False)):
@@ -512,10 +519,13 @@ def main() -> None:
         VideoGemmaTextEncoderModelConfigurator,
     )
 
-    text_encoder_checkpoint = (
-        args.ltx2_text_encoder_checkpoint
-        if getattr(args, "ltx2_text_encoder_checkpoint", None) is not None
-        else args.ltx2_checkpoint
+    # Split LTX-2.5 packs keep transformer architecture metadata/connectors in
+    # the DiT file and Gemma/projection tensors in the packed text-encoder file.
+    # Read both while preserving the unified-checkpoint path for older models.
+    builder_model_paths = (
+        (str(args.ltx2_checkpoint), str(text_encoder_checkpoint))
+        if args.ltx2_checkpoint is not None and str(text_encoder_checkpoint) != str(args.ltx2_checkpoint)
+        else str(text_encoder_checkpoint)
     )
 
     configurator = AVGemmaTextEncoderModelConfigurator if audio_video else VideoGemmaTextEncoderModelConfigurator
@@ -533,7 +543,7 @@ def main() -> None:
         bnb_compute_dtype = torch.float32
 
     text_encoder = SingleGPUModelBuilder(
-        model_path=str(text_encoder_checkpoint),
+        model_path=builder_model_paths,
         model_class_configurator=configurator,
         model_sd_ops=key_ops,
         model_loader=_checkpoint_model_loader(args),
@@ -681,7 +691,7 @@ def ltx2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
         "--ltx_version",
         type=str,
         default="2.3",
-        choices=["2.0", "2.3"],
+        choices=["2.0", "2.3", "2.5"],
         help="LTX model version used to resolve sample-prompt preset defaults.",
     )
     parser.add_argument(
