@@ -723,6 +723,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             dtype="bfloat16",
             quantization=args.text_encoder_quantization,
             blocks_to_stream=args.h3_text_encoder_blocks_to_stream,
+            nvfp4_scaled_mm=args.h3_nvfp4_scaled_mm,
         )
         prepared_images: list[list[Image.Image]] = []
         for prompt in prompts:
@@ -1750,6 +1751,12 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         type=int,
         default=0,
         help="stream this many of the 50 frozen Qwen3-VL layers from CPU while encoding sample prompts (CUDA only)",
+    )
+    parser.add_argument(
+        "--h3_nvfp4_scaled_mm",
+        "--nvfp4_scaled_mm",
+        action="store_true",
+        help="use Blackwell W4A4 scaled_mm for a native NVFP4/AWQ sampling text encoder (PyTorch 2.10+)",
     )
     parser.add_argument(
         "--h3_loss_balance",

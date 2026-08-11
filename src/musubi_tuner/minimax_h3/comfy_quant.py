@@ -16,6 +16,8 @@ logger = logging.getLogger(__name__)
 
 COMFY_QUANT_SUFFIX = ".comfy_quant"
 NVFP4_BLOCK_SIZE = 16
+NVFP4_VALUE_MAX = 6.0
+NVFP4_SCALE_MAX = 448.0
 _DEQUANT_CHUNK_ELEMENTS = 16 * 1024 * 1024
 
 
@@ -25,7 +27,7 @@ def has_comfy_quantized_layers(path: Path) -> bool:
     if not path.is_file():
         return False
     with safe_open(path, framework="pt", device="cpu") as handle:
-        source_keys = list(handle.keys())  # noqa: SIM118 - safetensors.safe_open is not iterable
+        source_keys = list(handle.keys())
         return any(key.endswith(COMFY_QUANT_SUFFIX) for key in source_keys)
 
 
@@ -58,6 +60,103 @@ def unswizzle_nvfp4_scales(scales: torch.Tensor, rows: int, columns: int) -> tor
     return values[:rows, :columns].contiguous()
 
 
+def swizzle_nvfp4_scales(scales: torch.Tensor) -> torch.Tensor:
+    """Pad and convert row-major per-16 scales to the cuBLAS 128x4 layout."""
+    rows, columns = scales.shape
+    padded_rows = ((rows + 127) // 128) * 128
+    padded_columns = ((columns + 3) // 4) * 4
+    padded = torch.zeros((padded_rows, padded_columns), device=scales.device, dtype=scales.dtype)
+    padded[:rows, :columns] = scales
+    row_blocks = padded_rows // 128
+    column_blocks = padded_columns // 4
+    values = padded.view(row_blocks, 128, column_blocks, 4).permute(0, 2, 1, 3)
+    return values.reshape(-1, 4, 32, 4).transpose(1, 2).reshape(padded_rows, padded_columns).contiguous()
+
+
+def _encode_e2m1(values: torch.Tensor) -> torch.Tensor:
+    """Encode float32 values as unpacked E2M1 nibbles with round-to-nearest-even."""
+    if values.dtype is not torch.float32:
+        raise TypeError("E2M1 encoding requires float32 input")
+    bits = values.view(torch.int32)
+    sign = bits & -0x80000000
+    magnitude = (bits ^ sign).view(torch.float32)
+    saturated = magnitude >= NVFP4_VALUE_MAX
+    denormal = (~saturated) & (magnitude < 1.0)
+    normal = ~(saturated | denormal)
+
+    # Adding 2**22 aligns the FP32 mantissa so subtracting the bias leaves the
+    # single E2M1 denormal bit, with the hardware FP32 add providing RNE.
+    denormal_bias_bits = 149 << 23
+    denormal_bias = torch.tensor(denormal_bias_bits, dtype=torch.int32, device=values.device).view(torch.float32)
+    denormal_code = ((magnitude + denormal_bias).view(torch.int32) - denormal_bias_bits).to(torch.uint8)
+
+    normal_bits = magnitude.view(torch.int32)
+    odd_mantissa = (normal_bits >> 22) & 1
+    normal_code = (normal_bits + ((1 - 127) << 23) + ((1 << 21) - 1) + odd_mantissa) >> 22
+    codes = torch.full_like(normal_code, 7, dtype=torch.uint8)
+    codes = torch.where(denormal, denormal_code, codes)
+    codes = torch.where(normal, normal_code.to(torch.uint8), codes)
+    return codes | ((sign >> 28).to(torch.uint8) & 8)
+
+
+def quantize_nvfp4_activations(inputs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+    """Quantize a 2D activation into packed E2M1 data and two-level scales."""
+    if inputs.ndim != 2:
+        raise ValueError("NVFP4 activation quantization requires a rank-2 tensor")
+    rows, columns = inputs.shape
+    if columns % NVFP4_BLOCK_SIZE:
+        raise ValueError(f"NVFP4 activation width must be divisible by {NVFP4_BLOCK_SIZE}")
+    padded_rows = ((rows + 15) // 16) * 16
+    if padded_rows != rows:
+        inputs = F.pad(inputs, (0, 0, 0, padded_rows - rows))
+
+    blocks = inputs.reshape(padded_rows, -1, NVFP4_BLOCK_SIZE).float()
+    tensor_scale = (blocks.abs().amax() / (NVFP4_SCALE_MAX * NVFP4_VALUE_MAX)).reshape(())
+    safe_tensor_scale = tensor_scale.clamp_min(torch.finfo(torch.float32).tiny)
+    row_scales = (blocks.abs().amax(dim=-1) / NVFP4_VALUE_MAX / safe_tensor_scale).clamp_max(NVFP4_SCALE_MAX)
+    row_scales = row_scales.to(torch.float8_e4m3fn)
+    decoded_scales = tensor_scale * row_scales.float()
+    safe_scales = torch.where(decoded_scales == 0, torch.ones_like(decoded_scales), decoded_scales)
+    normalized = (blocks / safe_scales.unsqueeze(-1)).clamp(-NVFP4_VALUE_MAX, NVFP4_VALUE_MAX)
+    normalized = torch.where(decoded_scales.unsqueeze(-1) == 0, 0, normalized).reshape(padded_rows, columns)
+    codes = _encode_e2m1(normalized)
+    packed = ((codes[:, 0::2] << 4) | codes[:, 1::2]).contiguous()
+    return packed, swizzle_nvfp4_scales(row_scales), tensor_scale, rows
+
+
+def nvfp4_scaled_mm_available(device: torch.device | None = None) -> bool:
+    if not hasattr(torch, "float4_e2m1fn_x2") or not hasattr(F, "scaled_mm"):
+        return False
+    if device is None:
+        return True
+    return device.type == "cuda" and torch.cuda.get_device_capability(device)[0] >= 10
+
+
+def _nvfp4_scaled_mm(
+    inputs: torch.Tensor,
+    packed_weight: torch.Tensor,
+    blocked_weight_scales: torch.Tensor,
+    weight_tensor_scale: torch.Tensor,
+    bias: torch.Tensor | None,
+) -> torch.Tensor:
+    from torch.nn.functional import ScalingType, SwizzleType
+
+    packed_inputs, input_scales, input_tensor_scale, original_rows = quantize_nvfp4_activations(inputs)
+    output = F.scaled_mm(
+        packed_inputs.view(torch.float4_e2m1fn_x2),
+        packed_weight.view(torch.float4_e2m1fn_x2).t(),
+        scale_a=[input_scales.reshape(-1), input_tensor_scale],
+        scale_recipe_a=[ScalingType.BlockWise1x16, ScalingType.TensorWise],
+        scale_b=[blocked_weight_scales.reshape(-1), weight_tensor_scale],
+        scale_recipe_b=[ScalingType.BlockWise1x16, ScalingType.TensorWise],
+        swizzle_a=[SwizzleType.SWIZZLE_32_4_4, SwizzleType.NO_SWIZZLE],
+        swizzle_b=[SwizzleType.SWIZZLE_32_4_4, SwizzleType.NO_SWIZZLE],
+        bias=bias,
+        output_dtype=inputs.dtype,
+    )
+    return output[:original_rows]
+
+
 class ComfyInt8Embedding(nn.Module):
     """Per-row INT8 embedding used by the quantized H3 Qwen3-VL checkpoint."""
 
@@ -85,7 +184,7 @@ class ComfyInt8Embedding(nn.Module):
 
 
 class ComfyNvfp4Linear(nn.Module):
-    """NVFP4/AWQ Linear that keeps packed weights and dequantizes each forward."""
+    """Frozen NVFP4/AWQ Linear with weight-only and optional W4A4 execution."""
 
     def __init__(
         self,
@@ -95,11 +194,13 @@ class ComfyNvfp4Linear(nn.Module):
         per_tensor_scale: torch.Tensor,
         pre_quant_scale: torch.Tensor | None,
         output_dtype: torch.dtype,
+        scaled_mm: bool = False,
     ) -> None:
         super().__init__()
         self.in_features = source.in_features
         self.out_features = source.out_features
         self.output_dtype = output_dtype
+        self.scaled_mm = scaled_mm
         if packed_weight.dtype is not torch.uint8 or packed_weight.shape != (
             self.out_features,
             self.in_features // 2,
@@ -122,6 +223,8 @@ class ComfyNvfp4Linear(nn.Module):
         )
         self.register_buffer("packed_weight", packed_weight.contiguous(), persistent=False)
         self.register_buffer("scales_u8", scales.view(torch.uint8), persistent=False)
+        if scaled_mm:
+            self.register_buffer("blocked_scales_u8", blocked_scales.contiguous().view(torch.uint8), persistent=False)
         self.register_buffer(
             "per_tensor_scale_u8",
             per_tensor_scale.detach().float().reshape(1).contiguous().view(torch.uint8),
@@ -171,6 +274,17 @@ class ComfyNvfp4Linear(nn.Module):
         pre_quant_scale = self._pre_quant_scale()
         if pre_quant_scale is not None:
             inputs = inputs * pre_quant_scale.to(dtype=inputs.dtype)
+        if self.scaled_mm:
+            original_shape = inputs.shape
+            inputs_2d = inputs.reshape(-1, original_shape[-1])
+            output = _nvfp4_scaled_mm(
+                inputs_2d,
+                self.packed_weight,
+                self.blocked_scales_u8.view(torch.float8_e4m3fn),
+                self.per_tensor_scale_u8.view(torch.float32).reshape(()),
+                self.bias,
+            )
+            return output.reshape(*original_shape[:-1], self.out_features)
         weight = self.dequantize_weight(inputs.dtype)
         return F.linear(inputs, weight, self.bias)
 
@@ -188,6 +302,7 @@ def load_comfy_quantized_state_dict(
     *,
     key_map: Callable[[str], str],
     output_dtype: torch.dtype,
+    nvfp4_scaled_mm: bool = False,
 ) -> int:
     """Load a Comfy NVFP4/INT8 safetensors checkpoint into a meta-initialized model."""
     checkpoint = Path(checkpoint)
@@ -234,6 +349,7 @@ def load_comfy_quantized_state_dict(
                     handle.get_tensor(scale_2_key),
                     handle.get_tensor(pre_scale_key) if pre_scale_key in source_keys else None,
                     output_dtype,
+                    nvfp4_scaled_mm,
                 )
                 consumed_keys.add(scale_2_key)
                 if pre_scale_key in source_keys:

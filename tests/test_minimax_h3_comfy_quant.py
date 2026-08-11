@@ -9,8 +9,11 @@ from torch import nn
 from musubi_tuner.minimax_h3.comfy_quant import (
     ComfyInt8Embedding,
     ComfyNvfp4Linear,
+    _encode_e2m1,
     has_comfy_quantized_layers,
     load_comfy_quantized_state_dict,
+    quantize_nvfp4_activations,
+    swizzle_nvfp4_scales,
     unswizzle_nvfp4_scales,
 )
 
@@ -37,6 +40,42 @@ def test_unswizzle_nvfp4_scales_restores_row_major_order():
     restored = unswizzle_nvfp4_scales(blocked, 256, 8)
 
     assert torch.equal(restored, row_major)
+
+
+def test_swizzle_nvfp4_scales_round_trips_with_padding():
+    row_major = torch.arange(131 * 7, dtype=torch.float32).reshape(131, 7)
+
+    blocked = swizzle_nvfp4_scales(row_major)
+    restored = unswizzle_nvfp4_scales(blocked, 131, 7)
+
+    assert blocked.shape == (256, 8)
+    assert torch.equal(restored, row_major)
+
+
+def test_e2m1_encoder_uses_expected_codes_and_saturates():
+    values = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 9.0])
+
+    positive = _encode_e2m1(values)
+    negative = _encode_e2m1(-values)
+
+    assert torch.equal(positive, torch.tensor([0, 1, 2, 3, 4, 5, 6, 7, 7], dtype=torch.uint8))
+    assert torch.equal(negative, positive | 8)
+
+    ties = _encode_e2m1(torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0]))
+    assert torch.equal(ties, torch.tensor([0, 2, 2, 4, 4, 6, 6], dtype=torch.uint8))
+
+
+def test_nvfp4_activation_quantization_pads_rows_and_handles_zero():
+    inputs = torch.zeros((17, 16), dtype=torch.bfloat16)
+
+    packed, blocked_scales, tensor_scale, original_rows = quantize_nvfp4_activations(inputs)
+
+    assert packed.shape == (32, 8)
+    assert blocked_scales.shape == (128, 4)
+    assert original_rows == 17
+    assert tensor_scale.item() == 0.0
+    assert not packed.any()
+    assert not blocked_scales.float().any()
 
 
 def test_int8_embedding_dequantizes_only_selected_rows():
@@ -70,6 +109,36 @@ def test_nvfp4_linear_decodes_e2m1_codes_and_applies_awq_scale():
 
     assert torch.equal(weight[0], torch.tensor([0.25, 0.5] * 8))
     assert torch.equal(output.float(), torch.tensor([[12.0, 12.0]]))
+
+
+def test_nvfp4_scaled_mm_path_is_opt_in_and_preserves_leading_dimensions(monkeypatch):
+    source = nn.Linear(16, 2, bias=True)
+    packed = torch.full((2, 8), 0x12, dtype=torch.uint8)
+    blocked_scales = torch.ones(512, dtype=torch.float8_e4m3fn)
+    calls = []
+
+    def fake_scaled_mm(inputs, packed_weight, scales, tensor_scale, bias):
+        calls.append((inputs.clone(), packed_weight, scales, tensor_scale, bias))
+        return torch.full((inputs.shape[0], 2), 3.0, dtype=inputs.dtype)
+
+    monkeypatch.setattr("musubi_tuner.minimax_h3.comfy_quant._nvfp4_scaled_mm", fake_scaled_mm)
+    linear = ComfyNvfp4Linear(
+        source,
+        packed,
+        blocked_scales,
+        torch.tensor(0.5),
+        torch.full((16,), 2.0, dtype=torch.bfloat16),
+        torch.bfloat16,
+        scaled_mm=True,
+    )
+
+    output = linear(torch.ones((2, 3, 16), dtype=torch.bfloat16))
+
+    assert output.shape == (2, 3, 2)
+    assert torch.equal(output, torch.full_like(output, 3.0))
+    assert len(calls) == 1
+    assert calls[0][0].shape == (6, 16)
+    assert torch.equal(calls[0][0], torch.full((6, 16), 2.0, dtype=torch.bfloat16))
 
 
 class _ToyConditioner(nn.Module):

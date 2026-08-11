@@ -55,6 +55,12 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         help="stream this many of the 50 frozen Qwen3-VL layers from CPU during encoding (CUDA only)",
     )
     parser.add_argument(
+        "--h3_nvfp4_scaled_mm",
+        "--nvfp4_scaled_mm",
+        action="store_true",
+        help="use Blackwell W4A4 scaled_mm for a native NVFP4/AWQ text encoder (PyTorch 2.10+)",
+    )
+    parser.add_argument(
         "--reference_image_short_edge",
         type=int,
         default=REFERENCE_IMAGE_SHORT_EDGE,
@@ -100,6 +106,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         dtype=args.text_encoder_dtype,
         quantization=args.text_encoder_quantization,
         blocks_to_stream=args.h3_text_encoder_blocks_to_stream,
+        nvfp4_scaled_mm=args.h3_nvfp4_scaled_mm,
         reference_image_short_edge=args.reference_image_short_edge,
         text_visual_max_pixels=args.h3_text_visual_max_pixels,
     )

@@ -30,6 +30,32 @@ def test_text_encoder_streaming_cli_defaults_are_disabled() -> None:
     generate_args = create_generate_parser().parse_args(["--model", "h3.safetensors", "--prompt", "test", "--output", "output.mp4"])
     assert cache_args.h3_text_encoder_blocks_to_stream == 0
     assert generate_args.h3_text_encoder_blocks_to_stream == 0
+    assert not cache_args.h3_nvfp4_scaled_mm
+    assert not generate_args.h3_nvfp4_scaled_mm
+
+
+def test_nvfp4_scaled_mm_rejects_incompatible_quantization_before_loading() -> None:
+    with pytest.raises(ValueError, match="requires --text_encoder_quantization nvfp4_awq"):
+        load_text_conditioner(
+            "missing",
+            "missing",
+            device="cpu",
+            dtype=torch.bfloat16,
+            quantization="none",
+            nvfp4_scaled_mm=True,
+        )
+
+
+def test_nvfp4_scaled_mm_rejects_unsupported_device_before_loading() -> None:
+    with pytest.raises(ValueError, match=r"requires PyTorch 2.10\+ and a Blackwell CUDA GPU"):
+        load_text_conditioner(
+            "missing",
+            "missing",
+            device="cpu",
+            dtype=torch.bfloat16,
+            quantization="nvfp4_awq",
+            nvfp4_scaled_mm=True,
+        )
 
 
 def test_conditioning_backend_routes_explicit_streaming(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -47,9 +73,11 @@ def test_conditioning_backend_routes_explicit_streaming(monkeypatch: pytest.Monk
         device="cuda",
         dtype="bfloat16",
         blocks_to_stream=50,
+        nvfp4_scaled_mm=True,
     )
 
     assert captured["blocks_to_stream"] == 50
+    assert captured["nvfp4_scaled_mm"] is True
 
 
 @pytest.mark.parametrize("blocks", [-1, 51])

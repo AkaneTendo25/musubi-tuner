@@ -256,6 +256,11 @@ CPU memory and moves them through a fixed two-layer GPU ring during encoding. `5
 trade less transfer overhead for less memory saved. This is opt-in, requires CUDA, and currently supports BF16 and native
 `nvfp4_awq` checkpoints. It does not support the bitsandbytes `int8` or `nf4` loader.
 
+On a Blackwell GPU with PyTorch 2.10 or newer, `--h3_nvfp4_scaled_mm` additionally quantizes Qwen activations to FP4 and
+uses the hardware W4A4 matrix kernel. It applies only to a native `nvfp4_awq` conditioner and fails early on unsupported
+hardware instead of changing execution silently. Leave it off when conditioning fidelity matters most: the default path
+keeps BF16 activations and uses NVFP4 only for stored weights.
+
 ## Training
 
 ```shell

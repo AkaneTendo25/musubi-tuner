@@ -21,7 +21,11 @@ from musubi_tuner.minimax_h3.cache import (
     H3_TEXT_HIDDEN_KEY,
     H3_TEXT_TOKEN_TAGS_KEY,
 )
-from musubi_tuner.minimax_h3.comfy_quant import has_comfy_quantized_layers, load_comfy_quantized_state_dict
+from musubi_tuner.minimax_h3.comfy_quant import (
+    has_comfy_quantized_layers,
+    load_comfy_quantized_state_dict,
+    nvfp4_scaled_mm_available,
+)
 from musubi_tuner.minimax_h3.component_loader import resolve_nvfp4_awq_text_encoder_checkpoint, text_encoder_metadata
 from musubi_tuner.minimax_h3.model import MiniMaxH3TokenTag
 from musubi_tuner.minimax_h3.references import (
@@ -133,6 +137,7 @@ def load_text_conditioner(
     blocks_to_stream: int = 0,
     stream_ring_size: int = 2,
     stream_pinned_memory: bool = False,
+    nvfp4_scaled_mm: bool = False,
 ) -> tuple[Any, Qwen3VLModel]:
     if dtype is not torch.bfloat16:
         raise ValueError("MiniMax H3 Qwen3-VL conditioning requires bfloat16")
@@ -144,6 +149,11 @@ def load_text_conditioner(
         raise ValueError("MiniMax H3 text-encoder layer streaming requires CUDA")
     if blocks_to_stream and quantization in {"int8", "nf4"}:
         raise ValueError("MiniMax H3 text-encoder layer streaming does not support bitsandbytes INT8/NF4")
+    if nvfp4_scaled_mm and quantization != "nvfp4_awq":
+        raise ValueError("NVFP4 scaled_mm requires --text_encoder_quantization nvfp4_awq")
+    target_device = torch.device(device)
+    if nvfp4_scaled_mm and not nvfp4_scaled_mm_available(target_device):
+        raise ValueError("NVFP4 scaled_mm requires PyTorch 2.10+ and a Blackwell CUDA GPU")
     checkpoint_source = Path(checkpoint)
     if quantization == "nvfp4_awq":
         checkpoint_path = resolve_nvfp4_awq_text_encoder_checkpoint(checkpoint_source)
@@ -158,13 +168,13 @@ def load_text_conditioner(
         model = Qwen3VLModel(full_config)
         model.language_model.norm = nn.Identity()
 
-    target_device = torch.device(device)
     if quantization == "nvfp4_awq":
         load_comfy_quantized_state_dict(
             model,
             checkpoint_path,
             key_map=_text_encoder_key,
             output_dtype=dtype,
+            nvfp4_scaled_mm=nvfp4_scaled_mm,
         )
     else:
         expected = set(model.state_dict())
