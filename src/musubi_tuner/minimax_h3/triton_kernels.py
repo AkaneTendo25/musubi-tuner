@@ -24,6 +24,65 @@ _LOGGED = False
 if HAS_TRITON:
 
     @triton.jit
+    def _indexed_adaln_rmsnorm_fwd(
+        x,
+        weight,
+        shift,
+        scale,
+        indices,
+        output,
+        inv_rms,
+        shift_stride,
+        scale_stride,
+        sequence: tl.constexpr,
+        hidden: tl.constexpr,
+        eps: tl.constexpr,
+        block: tl.constexpr,
+    ):
+        row = tl.program_id(0)
+        token = row % sequence
+        offsets = tl.arange(0, block)
+        mask = offsets < hidden
+        values = tl.load(x + row * hidden + offsets, mask=mask, other=0.0).to(tl.float32)
+        modulation_row = tl.load(indices + token)
+        weights = tl.load(weight + offsets, mask=mask, other=0.0).to(tl.float32)
+        shifts = tl.load(shift + modulation_row * shift_stride + offsets, mask=mask, other=0.0).to(tl.float32)
+        scales = tl.load(scale + modulation_row * scale_stride + offsets, mask=mask, other=0.0).to(tl.float32)
+        inverse = tl.rsqrt(tl.sum(values * values, axis=0) / hidden + eps)
+        result = values * inverse * weights * (1.0 + scales) + shifts
+        tl.store(output + row * hidden + offsets, result, mask=mask)
+        tl.store(inv_rms + row, inverse)
+
+    @triton.jit
+    def _indexed_adaln_rmsnorm_bwd(
+        grad_output,
+        x,
+        weight,
+        scale,
+        indices,
+        inv_rms,
+        grad_x,
+        scale_stride,
+        sequence: tl.constexpr,
+        hidden: tl.constexpr,
+        block: tl.constexpr,
+    ):
+        row = tl.program_id(0)
+        token = row % sequence
+        offsets = tl.arange(0, block)
+        mask = offsets < hidden
+        modulation_row = tl.load(indices + token)
+        grad = tl.load(grad_output + row * hidden + offsets, mask=mask, other=0.0).to(tl.float32)
+        values = tl.load(x + row * hidden + offsets, mask=mask, other=0.0).to(tl.float32)
+        weights = tl.load(weight + offsets, mask=mask, other=0.0).to(tl.float32)
+        scales = tl.load(scale + modulation_row * scale_stride + offsets, mask=mask, other=0.0).to(tl.float32)
+        inverse = tl.load(inv_rms + row)
+        grad_normalized = grad * weights * (1.0 + scales)
+        dot = tl.sum(grad_normalized * values, axis=0)
+        dx = inverse * grad_normalized - values * (inverse * inverse * inverse / hidden) * dot
+        tl.store(grad_x + row * hidden + offsets, dx, mask=mask)
+
+    @triton.jit
     def _reference_block_sparse_fwd(
         query,
         key,
@@ -308,6 +367,56 @@ if HAS_TRITON:
         tl.store(kgx + row * dim + offsets, ki * kgn - kv * (ki * ki * ki / dim) * kdot, mask=mask)
 
 
+class _FusedIndexedAdaLNRMSNorm(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, weight, shift, scale, indices, eps):
+        batch, sequence, hidden = x.shape
+        rows = batch * sequence
+        output = torch.empty_like(x)
+        inv_rms = torch.empty(rows, device=x.device, dtype=torch.float32)
+        block = triton.next_power_of_2(hidden)
+        _indexed_adaln_rmsnorm_fwd[(rows,)](
+            x,
+            weight,
+            shift,
+            scale,
+            indices,
+            output,
+            inv_rms,
+            shift.stride(0),
+            scale.stride(0),
+            sequence=sequence,
+            hidden=hidden,
+            eps=float(eps),
+            block=block,
+            num_warps=8,
+        )
+        ctx.save_for_backward(x, weight, scale, indices, inv_rms)
+        ctx.block = block
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        x, weight, scale, indices, inv_rms = ctx.saved_tensors
+        batch, sequence, hidden = x.shape
+        grad_x = torch.empty_like(x)
+        _indexed_adaln_rmsnorm_bwd[(batch * sequence,)](
+            grad_output.contiguous(),
+            x,
+            weight,
+            scale,
+            indices,
+            inv_rms,
+            grad_x,
+            scale.stride(0),
+            sequence=sequence,
+            hidden=hidden,
+            block=ctx.block,
+            num_warps=4,
+        )
+        return grad_x, None, None, None, None, None
+
+
 class _FusedRMSNormSplitRoPE(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, weight, cos, sin, eps):
@@ -463,6 +572,38 @@ def try_fused_qk_norm_rope(
         _FusedRMSNormSplitRoPE.apply(query, q_weight, cos, sin, eps),
         _FusedRMSNormSplitRoPE.apply(key, k_weight, cos, sin, eps),
     )
+
+
+def try_fused_indexed_adaln_rmsnorm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    shift: torch.Tensor,
+    scale: torch.Tensor,
+    indices: torch.Tensor,
+    eps: float,
+) -> torch.Tensor | None:
+    """Fuse RMSNorm with token-indexed AdaLN modulation for frozen H3 bases."""
+    is_compiling = getattr(getattr(torch, "compiler", None), "is_compiling", lambda: False)
+    if not HAS_TRITON or is_compiling() or x.device.type != "cuda":
+        return None
+    if x.ndim != 3 or x.dtype not in (torch.float16, torch.bfloat16) or not x.is_contiguous():
+        return None
+    hidden = x.shape[-1]
+    if hidden <= 0 or hidden > 8192:
+        return None
+    if weight.shape != (hidden,) or shift.ndim != 2 or scale.shape != shift.shape or shift.shape[1] != hidden:
+        return None
+    if indices.ndim != 1 or indices.shape[0] != x.shape[1] or indices.dtype not in (torch.int32, torch.int64):
+        return None
+    if any(t.device != x.device for t in (weight, shift, scale, indices)):
+        return None
+    if any(t.dtype != x.dtype for t in (weight, shift, scale)):
+        return None
+    if any(t.requires_grad for t in (weight, shift, scale)):
+        return None
+    if not weight.is_contiguous() or not indices.is_contiguous() or shift.stride(1) != 1 or scale.stride(1) != 1:
+        return None
+    return _FusedIndexedAdaLNRMSNorm.apply(x, weight, shift, scale, indices, eps)
 
 
 def reference_block_sparse_forward(

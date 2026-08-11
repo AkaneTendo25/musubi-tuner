@@ -222,6 +222,50 @@ def test_h3_fused_qk_norm_rope_cpu_falls_back_exactly():
     assert all(module.fused_qk_norm_rope for module in fused.modules() if isinstance(module, h3_model.MiniMaxH3Attention))
 
 
+def test_h3_fused_indexed_adaln_cpu_falls_back_exactly():
+    torch.manual_seed(13)
+    reference = MiniMaxH3Transformer(_tiny_config(num_layers=1)).requires_grad_(False)
+    fused = MiniMaxH3Transformer(_tiny_config(num_layers=1)).requires_grad_(False)
+    fused.load_state_dict(reference.state_dict())
+    fused.enable_fused_indexed_adaln()
+    inputs = _tiny_inputs()
+
+    expected = reference(**inputs)
+    actual = fused(**inputs)
+
+    torch.testing.assert_close(actual.video, expected.video)
+    torch.testing.assert_close(actual.audio, expected.audio)
+    assert all(block.fused_indexed_adaln for block in fused.blocks)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA Triton")
+def test_h3_fused_indexed_adaln_forward_and_input_gradient_match_eager():
+    from musubi_tuner.minimax_h3.triton_kernels import try_fused_indexed_adaln_rmsnorm
+
+    torch.manual_seed(14)
+    dtype = torch.bfloat16
+    x = torch.randn(1, 37, 128, device="cuda", dtype=dtype)
+    weight = torch.randn(128, device="cuda", dtype=dtype)
+    modulation = torch.randn(5, 256, device="cuda", dtype=dtype)
+    modulation[:, 128:].mul_(0.1)
+    shift, scale = modulation.chunk(2, dim=-1)
+    indices = torch.randint(0, 5, (37,), device="cuda")
+    upstream = torch.randn_like(x)
+    eager_x = x.detach().clone().requires_grad_(True)
+    fused_x = x.detach().clone().requires_grad_(True)
+
+    eager = torch.nn.functional.rms_norm(eager_x, (128,), weight, 1e-5)
+    eager = eager * (1 + scale.index_select(0, indices)) + shift.index_select(0, indices)
+    fused = try_fused_indexed_adaln_rmsnorm(fused_x, weight, shift, scale, indices, 1e-5)
+
+    assert fused is not None
+    assert not shift.is_contiguous() and not scale.is_contiguous()
+    torch.autograd.backward(eager, upstream)
+    torch.autograd.backward(fused, upstream)
+    torch.testing.assert_close(fused, eager, rtol=3e-2, atol=3e-2)
+    torch.testing.assert_close(fused_x.grad, eager_x.grad, rtol=3e-2, atol=3e-2)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA SDPA")
 def test_h3_attention_auto_dispatch_runs_cudnn_priority_forward_backward(monkeypatch):
     original_sdpa_kernel = h3_model.sdpa_kernel

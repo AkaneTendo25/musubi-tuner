@@ -34,7 +34,7 @@ from torch.utils.checkpoint import checkpoint
 
 from musubi_tuner.minimax_h3.activation_offload import ReusableActivationOffloader
 from musubi_tuner.minimax_h3.int8_attention import HAS_TRITON, int8_attention
-from musubi_tuner.minimax_h3.triton_kernels import try_fused_qk_norm_rope
+from musubi_tuner.minimax_h3.triton_kernels import try_fused_indexed_adaln_rmsnorm, try_fused_qk_norm_rope
 from musubi_tuner.modules.attention import AttentionParams
 from musubi_tuner.modules.attention import attention as musubi_attention
 from musubi_tuner.modules.custom_offloading_utils import BlockSwapConfig, create_offloader
@@ -333,6 +333,30 @@ class MiniMaxH3TransformerBlock(nn.Module):
             apply_silu=config.adaln_t_table_size is None,
         )
         self.hidden_size = config.hidden_size
+        self.fused_indexed_adaln = False
+
+    def _norm_and_modulate(
+        self,
+        norm: nn.RMSNorm,
+        hidden_states: torch.Tensor,
+        shift: torch.Tensor,
+        scale: torch.Tensor,
+        adaln_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.fused_indexed_adaln:
+            fused = try_fused_indexed_adaln_rmsnorm(
+                hidden_states,
+                norm.weight,
+                shift,
+                scale,
+                adaln_indices,
+                norm.eps,
+            )
+            if fused is not None:
+                return fused
+        normalized = norm(hidden_states)
+        normalized = normalized * (1.0 + scale.index_select(0, adaln_indices))
+        return normalized + shift.index_select(0, adaln_indices)
 
     def forward(
         self,
@@ -345,15 +369,11 @@ class MiniMaxH3TransformerBlock(nn.Module):
         modulation = self.adaln_proj(timestep_embedding).view(-1, 6 * self.hidden_size).to(hidden_states.dtype)
         shift_attn, scale_attn, gate_attn, shift_mlp, scale_mlp, gate_mlp = modulation.chunk(6, dim=-1)
 
-        norm_hidden_states = self.norm1(hidden_states)
-        norm_hidden_states = norm_hidden_states * (1.0 + scale_attn.index_select(0, adaln_indices))
-        norm_hidden_states = norm_hidden_states + shift_attn.index_select(0, adaln_indices)
+        norm_hidden_states = self._norm_and_modulate(self.norm1, hidden_states, shift_attn, scale_attn, adaln_indices)
         attention = self.attn(norm_hidden_states, rotary_emb, attention_mask)
         hidden_states = hidden_states + gate_attn.index_select(0, adaln_indices) * attention
 
-        norm_hidden_states = self.norm2(hidden_states)
-        norm_hidden_states = norm_hidden_states * (1.0 + scale_mlp.index_select(0, adaln_indices))
-        norm_hidden_states = norm_hidden_states + shift_mlp.index_select(0, adaln_indices)
+        norm_hidden_states = self._norm_and_modulate(self.norm2, hidden_states, shift_mlp, scale_mlp, adaln_indices)
         feed_forward = self.mlp(norm_hidden_states)
         return hidden_states + gate_mlp.index_select(0, adaln_indices) * feed_forward
 
@@ -475,6 +495,10 @@ class MiniMaxH3Transformer(nn.Module):
         for module in self.modules():
             if isinstance(module, MiniMaxH3Attention):
                 module.fused_qk_norm_rope = True
+
+    def enable_fused_indexed_adaln(self) -> None:
+        for module in self.blocks:
+            module.fused_indexed_adaln = True
 
     def set_int8_attention_mode(self, mode: str) -> None:
         if mode not in {"off", "aux", "train"}:

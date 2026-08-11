@@ -636,6 +636,10 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                     "--h3_fused_qk_norm_rope requested with --compile: compiled blocks use Inductor fusion; "
                     "the explicit Triton kernel remains active for eager calls"
                 )
+        if getattr(args, "h3_fused_indexed_adaln", False):
+            transformer.enable_fused_indexed_adaln()
+            if args.compile:
+                logger.warning("--h3_fused_indexed_adaln falls back to the Inductor path inside compiled blocks")
         if args.h3_convrot_int8_lora_fused:
             from musubi_tuner.modules.convrot_int8_utils import enable_convrot_int8_lora_fusion
 
@@ -1684,6 +1688,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             "ss_h3_video_loss_weight": str(args.h3_video_loss_weight),
             "ss_h3_audio_loss_weight": str(args.h3_audio_loss_weight),
             "ss_h3_attn_auto_dispatch": str(args.h3_attn_auto_dispatch),
+            "ss_h3_fused_indexed_adaln": str(args.h3_fused_indexed_adaln),
             "ss_h3_int8_attention": args.h3_int8_attention,
             "ss_h3_observed_modality": str(args.h3_observed_modality or "none"),
             "ss_h3_image_flow_shift": str(args.h3_image_flow_shift or "resolution_aware"),
@@ -2020,6 +2025,14 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         help=(
             "use the opt-in Triton kernel that fuses H3 per-head Q/K RMSNorm with split RoPE; "
             "unsupported shapes and torch.compile automatically use the eager/Inductor path"
+        ),
+    )
+    parser.add_argument(
+        "--h3_fused_indexed_adaln",
+        action="store_true",
+        help=(
+            "use an opt-in Triton kernel that fuses each main-block RMSNorm with token-indexed AdaLN shift/scale; "
+            "frozen LoRA bases use the fused forward/backward path and unsupported cases fall back safely"
         ),
     )
     parser.add_argument(
