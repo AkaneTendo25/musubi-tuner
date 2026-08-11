@@ -936,6 +936,43 @@ def test_native_h3_t2va_backend_runs_joint_forward_and_backward(activation_cpu_o
         torch.testing.assert_close(repeated.audio, first_audio, rtol=0, atol=0)
         assert transformer.reusable_activation_offloader.pooled_bytes == pooled_bytes
 
+        pool_entries = len(transformer.reusable_activation_offloader._pool)
+        transformer.zero_grad(set_to_none=True)
+        wider_video = torch.randn(1, 4, 2, 4, 6, device=device)
+        wider_inputs = prepare_joint_noisy_inputs(
+            wider_video,
+            audio_latents,
+            torch.randn_like(wider_video),
+            torch.randn_like(audio_latents),
+            torch.tensor([0.6]),
+        )
+        wider_prediction = backend.predict_training(
+            transformer,
+            batch,
+            wider_inputs.video,
+            wider_inputs.audio,
+            wider_inputs.video_timestep,
+            wider_inputs.audio_timestep,
+        )
+        joint_velocity_loss(wider_prediction, wider_inputs).loss.backward()
+
+        grown_bytes = transformer.reusable_activation_offloader.pooled_bytes
+        assert len(transformer.reusable_activation_offloader._pool) == pool_entries
+        assert grown_bytes > pooled_bytes
+
+        transformer.zero_grad(set_to_none=True)
+        smaller_again = backend.predict_training(
+            transformer,
+            batch,
+            inputs.video,
+            inputs.audio,
+            inputs.video_timestep,
+            inputs.audio_timestep,
+        )
+        joint_velocity_loss(smaller_again, inputs).loss.backward()
+        assert len(transformer.reusable_activation_offloader._pool) == pool_entries
+        assert transformer.reusable_activation_offloader.pooled_bytes == grown_bytes
+
 
 def test_native_h3_image_backend_runs_video_only_forward_and_backward():
     config = MiniMaxH3TransformerConfig(

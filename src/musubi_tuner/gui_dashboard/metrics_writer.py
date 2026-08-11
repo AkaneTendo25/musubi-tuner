@@ -1,13 +1,12 @@
-from collections import deque
 import json
 import os
 import threading
 import time
+from collections import deque
 from typing import Any, Optional
 
 import pyarrow as pa
 import pyarrow.parquet as pq
-
 
 SCHEMA = pa.schema(
     [
@@ -56,6 +55,7 @@ class MetricsWriter:
         self._metrics_lock = threading.Lock()
         self._status_lock = threading.Lock()
         self._events_lock = threading.Lock()
+        self._flush_thread: Optional[threading.Thread] = None
         self._start_time = time.monotonic()
         self._step_count = 0
         self._training_started_at: Optional[float] = None
@@ -148,10 +148,20 @@ class MetricsWriter:
         self._write_json(self.status_path, status, self._status_lock)
 
     def flush(self):
-        with self._lock:
-            if self._buffer:
-                self._do_flush(list(self._buffer))
-                self._buffer.clear()
+        # Preserve row ordering and avoid racing a background Parquet rewrite.
+        # The drain worker consumes anything appended while it is active; join
+        # it before taking the final synchronous remainder.
+        while True:
+            with self._lock:
+                worker = self._flush_thread
+                if worker is None or not worker.is_alive():
+                    self._flush_thread = None
+                    rows = list(self._buffer)
+                    self._buffer.clear()
+                    break
+            worker.join()
+        if rows:
+            self._do_flush(rows)
 
     def close(self):
         self.flush()
@@ -159,10 +169,30 @@ class MetricsWriter:
     # -- internals --
 
     def _flush_background(self):
-        rows = list(self._buffer)
-        self._buffer.clear()
-        t = threading.Thread(target=self._do_flush, args=(rows,), daemon=True)
-        t.start()
+        # Called with ``_lock`` held. Keep exactly one worker: the former code
+        # started a daemon thread every ``flush_every`` rows, so slow Parquet
+        # rewrites could leave an unbounded queue of threads and row batches in
+        # memory. The worker now drains all rows that arrive while it is active.
+        if self._flush_thread is not None and self._flush_thread.is_alive():
+            return
+        self._flush_thread = threading.Thread(target=self._drain_flush, daemon=True, name="dashboard-metrics-flush")
+        self._flush_thread.start()
+
+    def _drain_flush(self):
+        try:
+            while True:
+                with self._lock:
+                    if not self._buffer:
+                        self._flush_thread = None
+                        return
+                    rows = list(self._buffer)
+                    self._buffer.clear()
+                self._do_flush(rows)
+        finally:
+            # A failed write must not permanently prevent later flush attempts.
+            with self._lock:
+                if self._flush_thread is threading.current_thread():
+                    self._flush_thread = None
 
     def _do_flush(self, rows: list[dict]):
         with self._metrics_lock:

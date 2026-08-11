@@ -26,7 +26,12 @@ class ReusableActivationOffloader:
     def __init__(self) -> None:
         if not torch.cuda.is_available():
             raise RuntimeError("reusable H3 activation offload requires CUDA")
-        self._pool: dict[tuple[int, int, tuple[int, ...], torch.dtype], torch.Tensor] = {}
+        # Keep one geometrically grown allocation per saved-tensor position.
+        # Keying the pool by the exact shape retains a complete set of buffers
+        # for every sequence length encountered by a multi-bucket dataset.  A
+        # real H3 buffer is large enough that this can exhaust pinned host RAM
+        # after only a handful of distinct buckets (and once per DDP process).
+        self._pool: dict[tuple[int, int, torch.dtype], torch.Tensor] = {}
         self._handles: dict[tuple[int, int], _OffloadedTensor] = {}
         self._stream = torch.cuda.Stream()
 
@@ -45,11 +50,17 @@ class ReusableActivationOffloader:
                 return tensor
             current_ordinal = ordinal
             ordinal += 1
-            key = (block_index, current_ordinal, tuple(tensor.shape), tensor.dtype)
-            cpu = self._pool.get(key)
-            if cpu is None:
-                cpu = torch.empty(tensor.shape, dtype=tensor.dtype, device="cpu", pin_memory=True)
-                self._pool[key] = cpu
+            key = (block_index, current_ordinal, tensor.dtype)
+            storage = self._pool.get(key)
+            required = tensor.numel()
+            if storage is None or storage.numel() < required:
+                # Power-of-two growth avoids repeatedly leaving differently
+                # sized allocations in PyTorch's pinned-memory allocator while
+                # bounding retained capacity to less than 2x the largest input.
+                capacity = 1 << max(required - 1, 0).bit_length()
+                storage = torch.empty(capacity, dtype=tensor.dtype, device="cpu", pin_memory=True)
+                self._pool[key] = storage
+            cpu = storage[:required].view(tensor.shape)
             cpu.copy_(tensor, non_blocking=True)
             event = torch.cuda.Event()
             event.record(torch.cuda.current_stream(tensor.device))
