@@ -28,6 +28,7 @@ from musubi_tuner.minimax_h3.architecture import (
     AUDIO_SAMPLE_RATE,
     CANVAS_MULTIPLE,
     VIDEO_FLOW_SHIFT,
+    VIDEO_FPS,
     temporal_shape,
 )
 from musubi_tuner.minimax_h3.assets import default_text_encoder_assets
@@ -62,6 +63,7 @@ from musubi_tuner.minimax_h3.packing import (
 )
 from musubi_tuner.minimax_h3.references import (
     REFERENCE_IMAGE_SHORT_EDGE,
+    _source_frame_limit,
     resample_reference_frames,
     resolve_reference_image_size,
     resolve_reference_video_size,
@@ -604,6 +606,16 @@ def test_ref2va_reference_geometry_matches_released_preprocessing():
     frames = np.arange(30, dtype=np.uint8).reshape(-1, 1, 1, 1) * np.ones((1, 2, 2, 3), dtype=np.uint8)
     resampled = resample_reference_frames(frames, 30.0)
     assert [int(frame[0, 0, 0]) for frame in resampled] == [index for index in range(30) if index not in (2, 7, 12, 17, 22, 27)]
+
+
+@pytest.mark.parametrize("source_fps", [12.0, 24.0, 25.0, 30.0, 60.0])
+def test_reference_decode_limit_is_the_minimum_needed_for_target_duration(source_fps):
+    target_frames = 124
+    limit = _source_frame_limit(target_frames, source_fps)
+    scale = VIDEO_FPS / source_fps
+
+    assert math.floor(limit * scale + 0.5) >= target_frames
+    assert limit == 1 or math.floor((limit - 1) * scale + 0.5) < target_frames
 
 
 def test_reference_image_short_edge_default_matches_released_preprocessing():

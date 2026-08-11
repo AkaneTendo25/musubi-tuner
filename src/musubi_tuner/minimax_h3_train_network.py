@@ -1202,11 +1202,6 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             raise RuntimeError("H3 training backend is not loaded")
         video = inputs.video.to(device=accelerator.device, dtype=self.dit_dtype) if inputs.video is not None else None
         audio = inputs.audio.to(device=accelerator.device, dtype=self.dit_dtype) if inputs.audio is not None else None
-        if gradient_checkpointing:
-            if video is not None:
-                video.requires_grad_(True)
-            if audio is not None:
-                audio.requires_grad_(True)
         extension_kwargs = {}
         if self._step_row_video_timestep is not None:
             extension_kwargs["video_row_schedule"] = self._step_row_video_timestep
@@ -1347,10 +1342,17 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         return torch.stack(losses).mean(), averaged_metrics
 
     def backward_loss(self, accelerator: Accelerator, loss: torch.Tensor) -> None:
-        if getattr(self, "_batch_backward_performed", False):
-            self._batch_backward_performed = False
-            return
-        super().backward_loss(accelerator, loss)
+        try:
+            if getattr(self, "_batch_backward_performed", False):
+                self._batch_backward_performed = False
+                return
+            super().backward_loss(accelerator, loss)
+        finally:
+            # Checkpoint recomputation needs the hook capture through backward,
+            # but keeping it until the next step wastes the exact headroom used
+            # by validation and sampling between optimizer steps.
+            if self._crepa is not None:
+                self._crepa.clear_step()
 
     @staticmethod
     def _average_batch_metrics(item_metrics: list[dict[str, float]]) -> dict[str, float]:

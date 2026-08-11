@@ -66,8 +66,9 @@ def rotate_activation(value: torch.Tensor, group_size: int) -> torch.Tensor:
 
 
 def _quantize_rows(value: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    scale = (value.float().abs().amax(dim=-1, keepdim=True) / 127.0).clamp(min=1e-30)
-    quantized = (value.float() / scale).round().clamp(-127, 127).to(torch.int8)
+    float_value = value.float()
+    scale = (float_value.abs().amax(dim=-1, keepdim=True) / 127.0).clamp(min=1e-30)
+    quantized = float_value.div_(scale).round_().clamp_(-127, 127).to(torch.int8)
     return quantized, scale
 
 
@@ -90,10 +91,10 @@ class _Int8ConvRotFunction(torch.autograd.Function):
         rotated = rotate_activation(inputs, group_size)
         flat = rotated.reshape(-1, rotated.shape[-1])
         quantized, input_scale = _quantize_rows(flat)
-        output = _int_mm(quantized, weight.t())
-        output = output.float() * input_scale * scale.reshape(1, -1)
+        output = _int_mm(quantized, weight.t()).float()
+        output.mul_(input_scale).mul_(scale.reshape(1, -1))
         if bias is not None:
-            output = output + bias.float()
+            output.add_(bias.float())
         ctx.save_for_backward(weight, scale)
         ctx.input_dtype = inputs.dtype
         ctx.input_shape = inputs.shape
@@ -103,9 +104,11 @@ class _Int8ConvRotFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         weight, scale = ctx.saved_tensors
-        folded = grad_output.reshape(-1, grad_output.shape[-1]).float() * scale.reshape(1, -1)
+        folded = grad_output.reshape(-1, grad_output.shape[-1]).float()
+        folded.mul_(scale.reshape(1, -1))
         quantized, grad_scale = _quantize_rows(folded)
-        grad_input = _int_mm(quantized, weight).float() * grad_scale
+        grad_input = _int_mm(quantized, weight).float()
+        grad_input.mul_(grad_scale)
         grad_input = rotate_activation(grad_input.to(ctx.input_dtype), ctx.group_size)
         return grad_input.reshape(ctx.input_shape), None, None, None, None
 

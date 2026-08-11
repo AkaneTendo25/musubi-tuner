@@ -1766,6 +1766,18 @@ class _FakeAccelerator:
         loss.backward()
 
 
+def test_h3_backward_releases_crepa_capture_after_recomputation():
+    trainer = MiniMaxH3NetworkTrainer()
+    cleared = []
+    trainer._crepa = SimpleNamespace(clear_step=lambda: cleared.append(True))
+    value = torch.tensor(2.0, requires_grad=True)
+
+    trainer.backward_loss(_FakeAccelerator(), value.square())
+
+    assert value.grad == 4.0
+    assert cleared == [True]
+
+
 class _ScaleTransformer(nn.Module):
     def __init__(self):
         super().__init__()

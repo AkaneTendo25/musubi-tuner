@@ -116,7 +116,13 @@ def resolve_reference_video_size(width: int, height: int) -> tuple[int, int]:
     return _multiple_size(resolved_width, resolved_height)
 
 
-def _decode_video(path: Path) -> tuple[np.ndarray, float]:
+def _source_frame_limit(target_frames: int, source_fps: float) -> int:
+    if target_frames <= 0 or source_fps <= 0:
+        raise ValueError("H3 reference frame limits require positive frame counts and frame rates")
+    return max(1, math.ceil((target_frames - 0.5) / (VIDEO_FPS / source_fps)))
+
+
+def _decode_video(path: Path, target_frames: int | None = None) -> tuple[np.ndarray, float]:
     try:
         import av
 
@@ -127,14 +133,20 @@ def _decode_video(path: Path) -> tuple[np.ndarray, float]:
             rate = stream.average_rate or getattr(stream, "guessed_rate", None)
             if rate is None or float(rate) <= 0:
                 raise ValueError(f"H3 reference video has no usable frame rate: {path}")
-            frames = [frame.to_ndarray(format="rgb24") for frame in container.decode(stream)]
+            source_fps = float(rate)
+            source_limit = _source_frame_limit(target_frames, source_fps) if target_frames is not None else None
+            frames = []
+            for frame in container.decode(stream):
+                frames.append(frame.to_ndarray(format="rgb24"))
+                if source_limit is not None and len(frames) >= source_limit:
+                    break
     except ValueError:
         raise
     except Exception as error:
         raise RuntimeError(f"cannot decode H3 reference video {path}: {error}") from error
     if not frames:
         raise ValueError(f"H3 reference video produced no frames: {path}")
-    return np.stack(frames), float(rate)
+    return np.stack(frames), source_fps
 
 
 def resample_reference_frames(frames: np.ndarray, source_fps: float) -> np.ndarray:
@@ -158,7 +170,7 @@ def _prepare_image(asset: MediaAsset, short_edge: int) -> Image.Image:
 
 
 def _prepare_video(asset: MediaAsset, target_frames: int) -> np.ndarray:
-    frames, source_fps = _decode_video(asset.path)
+    frames, source_fps = _decode_video(asset.path, target_frames)
     frames = resample_reference_frames(frames, source_fps)
     frames = frames[:target_frames]
     height, width = resolve_reference_video_size(frames.shape[2], frames.shape[1])

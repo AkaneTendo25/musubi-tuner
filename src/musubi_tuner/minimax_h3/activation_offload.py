@@ -82,9 +82,15 @@ class ReusableActivationOffloader:
             yield
 
     def _schedule(self, handle: _OffloadedTensor) -> None:
+        # Allocate on the consuming compute stream. The private stream only
+        # performs the copy; after its event is waited below, allocation, use,
+        # free, and allocator reuse are all ordered on the compute stream.
+        # Allocating here inside ``self._stream`` without record_stream() lets
+        # the caching allocator recycle the block while recomputation is still
+        # reading it on the compute stream.
+        handle.gpu = torch.empty(handle.cpu.shape, dtype=handle.cpu.dtype, device=handle.device)
         with torch.cuda.stream(self._stream):
             self._stream.wait_event(handle.d2h_event)
-            handle.gpu = torch.empty(handle.cpu.shape, dtype=handle.cpu.dtype, device=handle.device)
             handle.gpu.copy_(handle.cpu, non_blocking=True)
             handle.h2d_event = torch.cuda.Event()
             handle.h2d_event.record(self._stream)

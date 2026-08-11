@@ -220,7 +220,8 @@ def encode_reference_media(
             pixels = _reference_pixels(content, device)
             mean = pixels.new_tensor((0.485, 0.456, 0.406)).view(1, 3, 1, 1, 1)
             std = pixels.new_tensor((0.229, 0.224, 0.225)).view(1, 3, 1, 1, 1)
-            latent = video_encoder.encode_reference(((pixels - mean) / std).to(weight_dtype), image=image)[0]
+            pixels.sub_(mean).div_(std)
+            latent = video_encoder.encode_reference(pixels.to(weight_dtype), image=image)[0]
             video_shapes[index] = tuple(int(value) for value in latent.shape[-3:])
             video_rows_by_reference[index] = patchify_video_latents(latent[None], (1, 2, 2))[0].float().cpu()
             del pixels, latent

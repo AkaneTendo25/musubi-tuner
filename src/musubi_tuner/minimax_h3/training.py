@@ -277,8 +277,8 @@ def _modality_loss(
 ) -> tuple[torch.Tensor, torch.Tensor, int]:
     if prediction.shape != target.shape:
         raise ValueError(f"H3 prediction shape {tuple(prediction.shape)} does not match target {tuple(target.shape)}")
-    valid = _broadcast_mask(mask, target)
-    elements = int(valid.sum().item())
+    valid = None if mask is None else _broadcast_mask(mask, target)
+    elements = target.numel() if valid is None else int(valid.sum().item())
     if elements == 0:
         zero = prediction.sum() * 0.0
         return zero, zero, 0
@@ -288,7 +288,7 @@ def _modality_loss(
         if sample_weight.shape != (target.shape[0],):
             raise ValueError("H3 sample weighting must contain one value per batch item")
         squared = squared * _expand_batch_values(sample_weight.float(), squared)
-    total = squared.masked_select(valid).sum()
+    total = squared.sum() if valid is None else squared.masked_select(valid).sum()
     return total / elements, total, elements
 
 
