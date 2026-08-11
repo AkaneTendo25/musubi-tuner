@@ -359,6 +359,7 @@ rejected instead of silently restarting at step zero. Add `--autoresume` to sele
 | --- | --- | --- |
 | `--sdpa`, `--flash_attn`, `--flash3` | `--sdpa` | Attention backend. Each FlashAttention flag needs its package, and `--flash3` needs a Hopper GPU. Both fall back to SDPA on padded batches. |
 | `--h3_attn_auto_dispatch` | off | Prefer cuDNN SDPA for large maskless workloads. Changes rounding; benchmark first. |
+| `--h3_int8_attention {off,aux,train}` | `off` | Experimental native INT8-QK forward with BF16/FP16 P×V and an optimized training backward. `aux` affects only guidance and base-preservation teacher forwards; `train` also affects the trainable forward. Requires CUDA, Triton, and head width 128; masked or padded batches use the selected regular backend. Incompatible with `--compile`. |
 | `--compile` | off | Regionally compile all H3 blocks with the selected backend/mode. Compatible with full gradient checkpointing and block swap; swapped Linear calls stay eager. |
 | `--h3_fused_qk_norm_rope` | off | Use the custom Triton Q/K RMSNorm+RoPE kernel outside compiled graphs. It is faster but changes BF16 rounding, so it is opt-in. |
 | `--h3_gradient_checkpointing_cpu_offload_pin_memory` | off | Pin CPU-offloaded checkpoint activations for faster transfers. Requires `--gradient_checkpointing --gradient_checkpointing_cpu_offload` and substantial free system RAM. |

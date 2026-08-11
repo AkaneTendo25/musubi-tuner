@@ -257,6 +257,7 @@ class TrainingConfig(BaseModel):
     h3_base_preservation_loss_weight: float = 0.0
     h3_base_preservation_probability: float = 1.0
     h3_attn_auto_dispatch: bool = False
+    h3_int8_attention: Literal["off", "aux", "train"] = "off"
     h3_fused_qk_norm_rope: bool = False
     h3_adaln_rank: Optional[int] = None
     h3_fp8_quantization_mode: Literal["block", "channel", "tensor"] = "block"

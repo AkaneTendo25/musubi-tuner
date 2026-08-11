@@ -655,6 +655,16 @@ def validate_training_config(config: ProjectConfig) -> dict[str, Any]:
                     page="training",
                 )
             )
+        if t.h3_int8_attention != "off" and t.compile:
+            errors.append(
+                _make_issue(
+                    "error",
+                    "training.h3_int8_attention",
+                    "H3 INT8 attention cannot currently be combined with torch.compile.",
+                    label="H3 INT8 Attention",
+                    page="training",
+                )
+            )
         if t.h3_convrot_int8 and (t.fp8_base or t.fp8_scaled or t.int8_convrot_base):
             message = (
                 "Online H3 ConvRot INT8 requires the BF16 checkpoint and cannot be combined with FP8 or a pruned INT8 checkpoint."

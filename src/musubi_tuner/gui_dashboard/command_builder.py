@@ -536,6 +536,8 @@ def _build_h3_training_cmd(config: ProjectConfig) -> list[str]:
         cmd.append("--h3_fused_qk_norm_rope")
     if t.h3_attn_auto_dispatch:
         cmd.append("--h3_attn_auto_dispatch")
+    if t.h3_int8_attention != "off":
+        cmd += ["--h3_int8_attention", t.h3_int8_attention]
     if t.h3_training_mode != "fl2va":
         cmd += ["--h3_training_mode", t.h3_training_mode]
     if t.h3_loss_balance != "modality":

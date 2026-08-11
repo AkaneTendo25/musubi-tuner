@@ -208,6 +208,7 @@ def test_h3_performance_controls_are_forwarded_to_trainer(tmp_path: Path) -> Non
     training = config.training
     training.h3_fused_qk_norm_rope = True
     training.h3_attn_auto_dispatch = True
+    training.h3_int8_attention = "train"
     training.h3_adaln_rank = 16
     training.gradient_checkpointing = True
     training.gradient_checkpointing_cpu_offload = True
@@ -224,12 +225,23 @@ def test_h3_performance_controls_are_forwarded_to_trainer(tmp_path: Path) -> Non
 
     assert parsed.h3_fused_qk_norm_rope is True
     assert parsed.h3_attn_auto_dispatch is True
+    assert parsed.h3_int8_attention == "train"
     assert parsed.h3_adaln_rank == 16
     assert parsed.gradient_checkpointing_cpu_offload is True
     assert parsed.h3_gradient_checkpointing_blocks == 50
     assert parsed.h3_gradient_checkpointing_cpu_offload_pin_memory is True
     assert parsed.h3_reusable_activation_offload is True
     assert parsed.block_swap_granularity == "layer"
+
+
+def test_h3_int8_attention_rejects_compile_in_dashboard(tmp_path: Path) -> None:
+    config = _h3_config(tmp_path)
+    config.training.h3_int8_attention = "train"
+    config.training.compile = True
+
+    report = validate_training_config(config)
+
+    assert "training.h3_int8_attention" in report["field_errors"]
 
 
 def test_h3_reusable_activation_offload_requires_cpu_checkpoint_offload(tmp_path: Path) -> None:

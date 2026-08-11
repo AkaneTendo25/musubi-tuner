@@ -592,6 +592,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             raise ValueError("MiniMax H3 training requires --sdpa, --flash_attn, or --flash3")
         if args.h3_attn_auto_dispatch and not args.sdpa:
             raise ValueError("--h3_attn_auto_dispatch requires --sdpa")
+        if getattr(args, "h3_int8_attention", "off") != "off" and args.compile:
+            raise ValueError("--h3_int8_attention cannot currently be combined with --compile")
         if args.split_attn:
             raise ValueError("MiniMax H3 training does not support split attention")
         if args.sample_prompts:
@@ -612,6 +614,9 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
     def on_transformer_loaded(self, args, accelerator, transformer) -> None:
         transformer.set_gradient_checkpointing_blocks(args.h3_gradient_checkpointing_blocks)
         transformer.set_activation_cpu_offload_pin_memory(args.h3_gradient_checkpointing_cpu_offload_pin_memory)
+        set_int8_attention_mode = getattr(transformer, "set_int8_attention_mode", None)
+        if callable(set_int8_attention_mode):
+            set_int8_attention_mode(getattr(args, "h3_int8_attention", "off"))
         if args.h3_reusable_activation_offload:
             transformer.enable_reusable_activation_offload()
         if args.h3_fused_qk_norm_rope:
@@ -1495,7 +1500,12 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             # The empty branch calibrates the distilled field but is not itself
             # optimized. Evaluate it first without retaining its autograd graph.
             fork_devices = [accelerator.device] if accelerator.device.type == "cuda" else []
-            with torch.random.fork_rng(devices=fork_devices), torch.no_grad():
+            int8_context = getattr(transformer, "int8_attention_context", None)
+            with (
+                torch.random.fork_rng(devices=fork_devices),
+                torch.no_grad(),
+                int8_context(auxiliary=True) if callable(int8_context) else nullcontext(),
+            ):
                 empty_prediction = self._predict(
                     accelerator,
                     transformer,
@@ -1523,7 +1533,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             with torch.random.fork_rng(devices=fork_devices):
                 set_enabled(False)
                 try:
-                    with torch.no_grad():
+                    int8_context = getattr(transformer, "int8_attention_context", None)
+                    with torch.no_grad(), int8_context(auxiliary=True) if callable(int8_context) else nullcontext():
                         reference_prediction = self._predict(
                             accelerator,
                             transformer,
@@ -1659,6 +1670,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             "ss_h3_video_loss_weight": str(args.h3_video_loss_weight),
             "ss_h3_audio_loss_weight": str(args.h3_audio_loss_weight),
             "ss_h3_attn_auto_dispatch": str(args.h3_attn_auto_dispatch),
+            "ss_h3_int8_attention": args.h3_int8_attention,
             "ss_h3_observed_modality": str(args.h3_observed_modality or "none"),
             "ss_h3_image_flow_shift": str(args.h3_image_flow_shift or "resolution_aware"),
             "ss_h3_guidance_distillation_scale": str(args.h3_guidance_distillation_scale or "one_pass"),
@@ -1999,6 +2011,16 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         help=(
             "reuse pinned CPU buffers for checkpoint activations and prefetch them in reverse block order; "
             "requires --gradient_checkpointing --gradient_checkpointing_cpu_offload"
+        ),
+    )
+    parser.add_argument(
+        "--h3_int8_attention",
+        choices=("off", "aux", "train"),
+        default="off",
+        help=(
+            "experimental H3-owned INT8 attention: 'aux' applies it only to guidance/base-preservation teacher "
+            "forwards, while 'train' also uses its optimized backward for the trainable forward; default 'off' "
+            "leaves the selected SDPA/FlashAttention backend unchanged"
         ),
     )
     parser.add_argument(

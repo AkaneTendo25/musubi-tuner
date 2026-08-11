@@ -22,6 +22,7 @@ Diffusers model APIs and lets Musubi load the Comfy BF16 repack directly.
 from __future__ import annotations
 
 import inspect
+from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import IntEnum
 
@@ -32,6 +33,7 @@ from torch.nn import functional as F
 from torch.utils.checkpoint import checkpoint
 
 from musubi_tuner.minimax_h3.activation_offload import ReusableActivationOffloader
+from musubi_tuner.minimax_h3.int8_attention import HAS_TRITON, int8_attention
 from musubi_tuner.minimax_h3.triton_kernels import try_fused_qk_norm_rope
 from musubi_tuner.modules.attention import AttentionParams
 from musubi_tuner.modules.attention import attention as musubi_attention
@@ -191,6 +193,7 @@ class MiniMaxH3Attention(nn.Module):
         self.head_dim = head_dim
         self.attention_mode = attention_mode
         self.auto_dispatch = False
+        self.int8_attention = False
         self.fused_qk_norm_rope = False
         self.inner_dim = heads * head_dim
         self.qkv_proj = nn.Linear(hidden_size, 3 * self.inner_dim, bias=False)
@@ -229,7 +232,12 @@ class MiniMaxH3Attention(nn.Module):
                 query = _apply_rotary_emb(query, *rotary_emb)
                 key = _apply_rotary_emb(key, *rotary_emb)
 
-        if self.attention_mode in {"flash", "flash3"} and attention_mask is None:
+        if self.int8_attention and attention_mask is None:
+            query = query.transpose(1, 2)
+            key = key.transpose(1, 2)
+            value = value.transpose(1, 2)
+            hidden_states = int8_attention(query, key, value).transpose(1, 2).flatten(2, 3)
+        elif self.attention_mode in {"flash", "flash3"} and attention_mask is None:
             hidden_states = musubi_attention(
                 [query, key, value],
                 attn_params=AttentionParams.create_attention_params(self.attention_mode, False),
@@ -427,6 +435,7 @@ class MiniMaxH3Transformer(nn.Module):
         self.blocks_to_swap = 0
         self.offloader = None
         self.layer_streaming = False
+        self.int8_attention_mode = "off"
 
     @property
     def device(self) -> torch.device:
@@ -466,6 +475,30 @@ class MiniMaxH3Transformer(nn.Module):
         for module in self.modules():
             if isinstance(module, MiniMaxH3Attention):
                 module.fused_qk_norm_rope = True
+
+    def set_int8_attention_mode(self, mode: str) -> None:
+        if mode not in {"off", "aux", "train"}:
+            raise ValueError(f"unsupported H3 INT8 attention mode: {mode}")
+        if mode != "off" and not HAS_TRITON:
+            raise RuntimeError("H3 INT8 attention requires Triton")
+        self.int8_attention_mode = mode
+        enabled = mode == "train"
+        for module in self.modules():
+            if isinstance(module, MiniMaxH3Attention):
+                module.int8_attention = enabled
+
+    @contextmanager
+    def int8_attention_context(self, *, auxiliary: bool):
+        enabled = self.int8_attention_mode == "train" or (auxiliary and self.int8_attention_mode == "aux")
+        modules = [module for module in self.modules() if isinstance(module, MiniMaxH3Attention)]
+        previous = [module.int8_attention for module in modules]
+        try:
+            for module in modules:
+                module.int8_attention = enabled
+            yield
+        finally:
+            for module, was_enabled in zip(modules, previous):
+                module.int8_attention = was_enabled
 
     def enable_block_swap(self, blocks_to_swap: int, config: BlockSwapConfig) -> None:
         num_blocks = len(self.blocks)
