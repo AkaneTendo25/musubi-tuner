@@ -52,6 +52,8 @@ Each training objective has a fixed dataset, conditioning-cache, and transformer
 | Training objective | Example and dataset contract | Transformer | Cache `--task` | Trainer contract |
 | --- | --- | --- | --- | --- |
 | Text-to-image | [`image_fl2va.toml`](../examples/minimax_h3/image_fl2va.toml): `image_directory` or `image_jsonl_file` | FL2VA | `t2va` | None |
+| First-image-conditioned image editing | [`image_fl2va_first.toml`](../examples/minimax_h3/image_fl2va_first.toml): one basename-matched control per target | FL2VA | `fl2va` | None |
+| First+last-conditioned image editing | [`image_fl2va_first_last.toml`](../examples/minimax_h3/image_fl2va_first_last.toml): two ordered controls per target | FL2VA | `fl2va` | None |
 | Text-to-video+audio | [`t2va.toml`](../examples/minimax_h3/t2va.toml): `video_directory` or `video_jsonl_file`; `h3_target_mode = "av"` is the default | FL2VA | `t2va` | None |
 | Text-to-video only | [`video_only.toml`](../examples/minimax_h3/video_only.toml): video source plus `h3_target_mode = "video"` | FL2VA | `t2va` | None |
 | Text-to-audio only | [`audio_only.toml`](../examples/minimax_h3/audio_only.toml): `audio_directory` or `audio_jsonl_file` plus `h3_target_mode = "audio"` | FL2VA | `t2va` | None |
@@ -197,6 +199,13 @@ use caption dropout or the guidance objective.
 
 `--task` must match how you intend to train: `t2va` (text only), `i2va` (first frame), `fl2va` (first+last), `l2va`
 (last frame), `ref2va`, or `ref2va_omni`. Keyframe tasks take their frames from the target video itself, not from control fields.
+
+For FL2VA conditioned-image training, pass the same `--h3_image_mode first` or `--h3_image_mode first_last` to both cache
+commands and use `--task fl2va` for text caching. `h3_image_frame_count` in the dataset, or the CLI override
+`--h3_image_frame_count`, selects a `17k+5` target grid and defaults to 5. A still target repeats across that grid;
+`multiple_target = true` instead resamples an ordered target-image sequence. The latent and text caches carry the same
+source fingerprint, so changed/reordered targets or controls are rebuilt under `--skip_existing` and mismatched cache pairs
+are rejected during training. `--h3_text_visual_max_pixels` limits only the images presented to Qwen3-VL.
 
 `--reference_image_short_edge` (default 2048) resizes Ref2VA reference images to the given short edge before encoding.
 The released pipeline uses 2048; lowering it (e.g. to 768, the reference-video size) cuts the reference token count
@@ -605,6 +614,10 @@ python minimax_h3_generate_video.py \
 | `--reference_image_short_edge` | Short edge reference images are resized to (default 2048). Use the value the LoRA was trained with. |
 | `--lora_weight` / `--lora_multiplier` | Attach saved adapters. |
 | `--steps` | Sigma grid points including terminal zero, so `20` runs 19 evaluations. |
+
+For a conditioned still image, select `--h3_image_mode first` with `--first_frame`, or `first_last` with both endpoint
+images, and use an image extension for `--output`. The default 5-frame grid is decoded through the video VAE and
+`--h3_select_frame` chooses the saved frame; the audio VAE is not required for image-file output.
 
 `--fp8_base`, `--int8_convrot_base`, and the block-swap options are available here too. Output is a synchronized H.264/AAC MP4
 with a JSON sidecar recording prompt, geometry, schedule, LoRA names, timings, and memory peaks.

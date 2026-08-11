@@ -97,6 +97,7 @@ def create_conditioning_encoder(
     dtype: str,
     quantization: Literal["none", "int8", "nf4", "nvfp4_awq"] = "none",
     reference_image_short_edge: int = REFERENCE_IMAGE_SHORT_EDGE,
+    text_visual_max_pixels: int = 0,
 ) -> H3ConditioningEncoder:
     """Load only the understanding encoder required for conditioning caches."""
     _validate_dtype(dtype)
@@ -110,6 +111,7 @@ def create_conditioning_encoder(
         device=device,
         dtype=dtype,
         quantization=quantization,
+        **({} if text_visual_max_pixels == 0 else {"text_visual_max_pixels": text_visual_max_pixels}),
         **_reference_short_edge_kwargs(reference_image_short_edge),
     )
 
@@ -120,7 +122,7 @@ def create_generator(
     text_encoder: Path,
     tokenizer: Path,
     video_vae: Path,
-    audio_vae: Path,
+    audio_vae: Path | None,
     device: str | None,
     dtype: str,
     request: H3GenerationRequest,
@@ -149,6 +151,7 @@ def create_generator(
     inductor_config: tuple[str, ...] = (),
     fused_qk_norm_rope: bool = False,
     reference_image_short_edge: int = REFERENCE_IMAGE_SHORT_EDGE,
+    text_visual_max_pixels: int = 0,
 ) -> H3Generator:
     """Load only the inference variant and components required by the request."""
     _validate_dtype(dtype)
@@ -188,6 +191,7 @@ def create_generator(
         compile_fallback_to_eager=compile_fallback_to_eager,
         inductor_config=inductor_config,
         fused_qk_norm_rope=fused_qk_norm_rope,
+        **({} if text_visual_max_pixels == 0 else {"text_visual_max_pixels": text_visual_max_pixels}),
         **_reference_short_edge_kwargs(reference_image_short_edge),
     )
 

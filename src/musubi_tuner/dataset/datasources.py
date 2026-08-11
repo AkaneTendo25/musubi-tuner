@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+from pathlib import Path
 from typing import Optional, TYPE_CHECKING
 
 import numpy as np
@@ -130,6 +131,7 @@ class ImageDirectoryDatasource(ImageDatasource):
         default_loss_mask_path: Optional[str] = None,
         loss_mask_use_alpha: bool = False,
         loss_mask_invert: bool = False,
+        allow_indexed_caption_alias: bool = False,
     ):
         super().__init__()
         self.image_directory = image_directory
@@ -141,11 +143,37 @@ class ImageDirectoryDatasource(ImageDatasource):
         self.default_loss_mask_path = default_loss_mask_path
         self.loss_mask_use_alpha = loss_mask_use_alpha
         self.loss_mask_invert = loss_mask_invert
+        self.allow_indexed_caption_alias = allow_indexed_caption_alias
         self.current_idx = 0
 
         # glob images
         logger.info(f"glob images in {self.image_directory}")
         self.image_paths = glob_images(self.image_directory, caption_extension=self.caption_extension)
+        self.caption_paths = {
+            path: os.path.splitext(path)[0] + self.caption_extension for path in self.image_paths if self.caption_extension
+        }
+        self.caption_alias_prefixes: dict[str, str] = {}
+        if self.multiple_target and self.caption_extension and self.allow_indexed_caption_alias:
+            existing = set(self.image_paths)
+            groups: dict[str, list[tuple[int, str]]] = {}
+            for candidate in glob_images(self.image_directory):
+                stem = os.path.splitext(candidate)[0]
+                prefix, separator, suffix = stem.rpartition("_")
+                if separator and suffix.isdigit():
+                    groups.setdefault(prefix, []).append((int(suffix), candidate))
+            for prefix, candidates in groups.items():
+                caption_path = prefix + self.caption_extension
+                if not os.path.isfile(caption_path) or any(path.startswith(prefix + ".") for path in existing):
+                    continue
+                candidates.sort()
+                index, primary = candidates[0]
+                if index not in (0, 1) or primary in existing:
+                    continue
+                self.image_paths.append(primary)
+                self.caption_paths[primary] = caption_path
+                self.caption_alias_prefixes[primary] = prefix
+                existing.add(primary)
+            self.image_paths.sort()
         logger.info(f"found {len(self.image_paths)} images")
 
         # check if multiple-target images exist
@@ -161,7 +189,7 @@ class ImageDirectoryDatasource(ImageDatasource):
             if len(multiple_target_candidates) > 0:
                 logger.info("checking for multiple-target images")
                 for image_path in sorted_image_paths:
-                    image_path_no_ext = os.path.splitext(image_path)[0]
+                    image_path_no_ext = self.caption_alias_prefixes.get(image_path, os.path.splitext(image_path)[0])
 
                     # find matching multiple-target images
                     potential_paths = [p for p in multiple_target_candidates if p.startswith(image_path_no_ext + "_")]
@@ -218,6 +246,8 @@ class ImageDirectoryDatasource(ImageDatasource):
             for image_path in image_paths_sorted:
                 image_basename = os.path.basename(image_path)
                 image_basename_no_ext = os.path.splitext(image_basename)[0]
+                if image_path in self.caption_alias_prefixes:
+                    image_basename_no_ext = os.path.basename(self.caption_alias_prefixes[image_path])
 
                 # find matching control images
                 potential_paths = [
@@ -320,7 +350,11 @@ class ImageDirectoryDatasource(ImageDatasource):
 
     def get_caption(self, idx: int) -> tuple[str, str]:
         image_path = self.image_paths[idx]
-        caption_path = os.path.splitext(image_path)[0] + self.caption_extension if self.caption_extension else ""
+        caption_path = (
+            self.caption_paths.get(image_path, os.path.splitext(image_path)[0] + self.caption_extension)
+            if self.caption_extension
+            else ""
+        )
         with open(caption_path, "r", encoding="utf-8") as f:
             caption = f.read().strip()
         return image_path, caption
@@ -363,9 +397,10 @@ class ImageJsonlDatasource(ImageDatasource):
         default_loss_mask_path: Optional[str] = None,
         loss_mask_use_alpha: bool = False,
         loss_mask_invert: bool = False,
+        normalize_indexed_paths: bool = False,
     ):
         super().__init__()
-        self.image_jsonl_file = image_jsonl_file
+        self.image_jsonl_file = str(Path(image_jsonl_file).expanduser().resolve())
         self.control_count_per_image = control_count_per_image
         self.multiple_target = multiple_target
         self.loss_mask_directory = loss_mask_directory
@@ -386,6 +421,34 @@ class ImageJsonlDatasource(ImageDatasource):
                     raise
                 self.data.append(data)
         logger.info(f"loaded {len(self.data)} images")
+
+        if normalize_indexed_paths:
+            # Conditioned-image sequences use numbered fields and define relative
+            # paths from the JSONL location. Other architectures retain their
+            # historical path handling.
+            base_directory = Path(self.image_jsonl_file).parent
+            for item in self.data:
+                for prefix in ("image_path", "control_path"):
+                    indexed = []
+                    for key in tuple(item):
+                        if key.startswith(prefix + "_"):
+                            suffix = key[len(prefix) + 1 :]
+                            if not suffix.isdigit():
+                                raise ValueError(f"{key} must end in a numeric index")
+                            indexed.append((int(suffix), key))
+                    indexed.sort()
+                    for index, key in indexed:
+                        canonical = f"{prefix}_{index}"
+                        if canonical in item and canonical != key:
+                            raise ValueError(f"duplicate {prefix} index {index}")
+                        if canonical != key:
+                            item[canonical] = item.pop(key)
+                for key in tuple(item):
+                    if key in {"image_path", "control_path"} or key.startswith(("image_path_", "control_path_")):
+                        path = Path(item[key]).expanduser()
+                        if not path.is_absolute():
+                            path = base_directory / path
+                        item[key] = str(path.resolve())
 
         # Normalize control paths
         for item in self.data:

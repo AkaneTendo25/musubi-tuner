@@ -56,6 +56,8 @@ class H3GenerationRequest:
     ratio: str = "16:9"
     seed: int = 42
     references: tuple[H3Reference, ...] = field(default_factory=tuple)
+    frame_count_override: int | None = None
+    selected_frame: int = 0
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "output", Path(self.output))
@@ -67,8 +69,19 @@ class H3GenerationRequest:
             raise ValueError("prompt must not be empty")
         if len(self.prompt) > 7000:
             raise ValueError("prompt must contain at most 7000 characters")
-        if not isinstance(self.duration, int) or isinstance(self.duration, bool) or not 5 <= self.duration <= 15:
+        if self.frame_count_override is None and (
+            not isinstance(self.duration, int) or isinstance(self.duration, bool) or not 5 <= self.duration <= 15
+        ):
             raise ValueError("duration must be an integer from 5 through 15 seconds")
+        if self.frame_count_override is not None and (
+            isinstance(self.frame_count_override, bool)
+            or not isinstance(self.frame_count_override, int)
+            or self.frame_count_override < 5
+            or (self.frame_count_override - 5) % 17
+        ):
+            raise ValueError("frame_count_override must satisfy frame_count % 17 == 5")
+        if isinstance(self.selected_frame, bool) or not isinstance(self.selected_frame, int) or self.selected_frame < 0:
+            raise ValueError("selected_frame must be a non-negative integer")
         if self.ratio not in SUPPORTED_RATIOS:
             raise ValueError(f"ratio must be one of: {', '.join(SUPPORTED_RATIOS)}")
 
@@ -115,7 +128,10 @@ class H3GenerationRequest:
 
     @property
     def temporal_shape(self) -> H3TemporalShape:
-        return temporal_shape(round(self.duration * VIDEO_FPS), align=True)
+        return temporal_shape(
+            self.frame_count_override if self.frame_count_override is not None else round(self.duration * VIDEO_FPS),
+            align=self.frame_count_override is None,
+        )
 
 
 def make_references(

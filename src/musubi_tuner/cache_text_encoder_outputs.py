@@ -1,6 +1,6 @@
 import argparse
 import os
-from typing import Optional, Union
+from typing import Callable, Optional, Union
 
 import torch
 from tqdm import tqdm
@@ -79,6 +79,7 @@ def process_text_encoder_batches(
     all_cache_paths_for_dataset: list[set],
     encode: callable,
     requires_content: Optional[bool] = False,
+    existing_cache_valid: Optional[Callable[[ItemInfo, str], bool]] = None,
 ):
     """
     Architecture independent processing of text encoder batches.
@@ -109,7 +110,10 @@ def process_text_encoder_batches(
             # skip existing cache files
             if skip_existing:
                 filtered_batch = [
-                    item for item in batch if os.path.normpath(item.text_encoder_output_cache_path) not in all_cache_files
+                    item
+                    for item in batch
+                    if os.path.normpath(item.text_encoder_output_cache_path) not in all_cache_files
+                    or (existing_cache_valid is not None and not existing_cache_valid(item, item.text_encoder_output_cache_path))
                 ]
                 # print(f"Filtered {len(batch) - len(filtered_batch)} existing cache files")
                 if len(filtered_batch) == 0:

@@ -14,6 +14,7 @@ from musubi_tuner.minimax_h3.assets import default_text_encoder_assets
 from musubi_tuner.minimax_h3.backend import create_conditioning_encoder
 from musubi_tuner.minimax_h3.cache import normalize_batch_tensors, save_text_encoder_output_cache_minimax_h3
 from musubi_tuner.minimax_h3.dataset import attach_h3_media, create_h3_dataset_group
+from musubi_tuner.minimax_h3.image_training import add_image_training_arguments, cache_matches_fingerprint
 from musubi_tuner.minimax_h3.references import REFERENCE_IMAGE_SHORT_EDGE
 
 logger = logging.getLogger(__name__)
@@ -61,6 +62,7 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         action="store_true",
         help="also cache H3's empty-text conditioning for the optional guidance-consistent training objective",
     )
+    add_image_training_arguments(parser, text_visual=True)
     return parser
 
 
@@ -71,6 +73,10 @@ def create_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> None:
     parser = create_parser()
     args = parser.parse_args(argv)
+    if args.h3_image_mode != "none" and args.task != "fl2va":
+        parser.error("--h3_image_mode requires --task fl2va")
+    if args.h3_text_visual_max_pixels < 0:
+        parser.error("--h3_text_visual_max_pixels must be non-negative")
     device_name = args.device if args.device is not None else "cuda" if torch.cuda.is_available() else "cpu"
     device = torch.device(device_name)
 
@@ -88,6 +94,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         dtype=args.text_encoder_dtype,
         quantization=args.text_encoder_quantization,
         reference_image_short_edge=args.reference_image_short_edge,
+        text_visual_max_pixels=args.h3_text_visual_max_pixels,
     )
 
     def encode(batch: list[ItemInfo]) -> None:
@@ -98,6 +105,10 @@ def main(argv: Sequence[str] | None = None) -> None:
         for item, tensors in zip(batch, results):
             save_text_encoder_output_cache_minimax_h3(item, tensors)
 
+    def existing_cache_valid(item: ItemInfo, path: str) -> bool:
+        attach_h3_media((item,), dataset_adapter)
+        return cache_matches_fingerprint(path, item.h3_cache_metadata["sample_fingerprint"])
+
     cache_text_encoder_outputs.process_text_encoder_batches(
         args.num_workers,
         args.skip_existing,
@@ -107,6 +118,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         all_cache_paths,
         encode,
         requires_content=encoder.conditioning_requires_content,
+        existing_cache_valid=existing_cache_valid if args.h3_image_mode != "none" else None,
     )
     cache_text_encoder_outputs.post_process_cache_files(datasets, all_cache_files, all_cache_paths, args.keep_cache)
 

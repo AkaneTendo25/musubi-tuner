@@ -196,6 +196,7 @@ class MiniMaxH3ConditioningEncoder:
         output_dtype: torch.dtype,
         task: Literal["t2va", "i2va", "fl2va", "l2va", "ref2va", "ref2va_omni"],
         reference_image_short_edge: int = REFERENCE_IMAGE_SHORT_EDGE,
+        text_visual_max_pixels: int = 0,
     ) -> None:
         self.processor = processor
         self.tokenizer = processor.tokenizer
@@ -203,6 +204,7 @@ class MiniMaxH3ConditioningEncoder:
         self.output_dtype = output_dtype
         self.task = task
         self.reference_image_short_edge = reference_image_short_edge
+        self.text_visual_max_pixels = text_visual_max_pixels
         # Even T2VA enumerates decoded video crops so its cache filename shares
         # the same crop identity as FL2VA and the corresponding latent cache.
         self.conditioning_requires_content = True
@@ -360,6 +362,13 @@ class MiniMaxH3ConditioningEncoder:
     def _images_for_item(self, item: Any) -> list[Image.Image] | None:
         if self.task in ("t2va", "ref2va", "ref2va_omni"):
             return None
+        if getattr(item, "h3_image_mode", "none") != "none":
+            if self.task != "fl2va":
+                raise ValueError("MiniMax H3 conditioned-image training requires --task fl2va")
+            from musubi_tuner.minimax_h3.image_training import read_text_visual
+
+            images = [read_text_visual(path, self.text_visual_max_pixels) for path in item.h3_condition_paths]
+            return [images[0], images[0]] if item.h3_image_mode == "first" else images
         content = item.content
         minimum_frames = 2 if self.task == "fl2va" else 1
         if not isinstance(content, np.ndarray) or content.ndim != 4 or content.shape[0] < minimum_frames:
@@ -378,6 +387,16 @@ class MiniMaxH3ConditioningEncoder:
 
     def encode_prompt(self, prompt: str, images: list[Image.Image] | None = None) -> dict[str, torch.Tensor]:
         """Encode one FL2VA-family prompt with optional prepared endpoint keyframes."""
+        if images and self.text_visual_max_pixels > 0:
+            resized = []
+            for image in images:
+                if image.width * image.height <= self.text_visual_max_pixels:
+                    resized.append(image)
+                    continue
+                scale = (self.text_visual_max_pixels / (image.width * image.height)) ** 0.5
+                size = (max(32, int(image.width * scale) // 32 * 32), max(32, int(image.height * scale) // 32 * 32))
+                resized.append(image.resize(size, Image.Resampling.LANCZOS))
+            images = resized
         hidden, tags = self._encode_prompt(prompt, images)
         return {H3_TEXT_HIDDEN_KEY: hidden, H3_TEXT_TOKEN_TAGS_KEY: tags}
 

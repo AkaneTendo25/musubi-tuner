@@ -1,0 +1,16 @@
+# FL2VA conditioned-image training with separate first and last controls.
+# Each target stem needs two controls: stem.png and stem_0.png.
+# Pass --h3_image_mode first_last to both cache commands and --task fl2va to text caching.
+
+[general]
+resolution = [768, 768]
+caption_extension = ".txt"
+batch_size = 1
+enable_bucket = true
+
+[[datasets]]
+image_directory = "/path/to/target_images"
+control_directory = "/path/to/first_last_images"
+cache_directory = "/path/to/fl2va_first_last_cache"
+h3_image_frame_count = 5
+num_repeats = 1

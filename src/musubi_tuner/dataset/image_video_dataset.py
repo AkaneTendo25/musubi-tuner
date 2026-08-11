@@ -2,6 +2,7 @@ from concurrent.futures import ThreadPoolExecutor
 import glob
 import os
 import random
+import re
 import time
 from typing import Any, Optional, Sequence, Tuple, Union, TYPE_CHECKING
 
@@ -14,6 +15,7 @@ SharedEpoch = Optional["Synchronized[int]"]
 import numpy as np
 import torch
 from PIL import Image
+from safetensors import safe_open
 
 from musubi_tuner.utils import safetensors_utils
 from musubi_tuner.utils.model_utils import remove_dtype_suffix
@@ -22,6 +24,19 @@ import logging
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
+
+
+def _validate_h3_cache_pair(latent_path: str, text_path: str) -> None:
+    with safe_open(latent_path, framework="pt", device="cpu") as handle:
+        latent_fingerprint = (handle.metadata() or {}).get("sample_fingerprint")
+    with safe_open(text_path, framework="pt", device="cpu") as handle:
+        text_fingerprint = (handle.metadata() or {}).get("sample_fingerprint")
+    if not latent_fingerprint or latent_fingerprint != text_fingerprint:
+        raise ValueError(
+            "MiniMax H3 conditioned-image latent/text caches do not describe the same sample; rebuild both caches: "
+            f"{latent_path} and {text_path}"
+        )
+
 
 from musubi_tuner.dataset.architectures import *  # noqa: F401,F403
 from musubi_tuner.dataset.architectures import (  # explicit imports for local use
@@ -289,6 +304,7 @@ class ImageDataset(BaseDataset):
         control_directory: Optional[str] = None,
         cache_directory: Optional[str] = None,
         multiple_target: bool = False,
+        h3_image_frame_count: Optional[int] = None,
         fp_latent_window_size: Optional[int] = 9,
         fp_1f_clean_indices: Optional[list[int]] = None,
         fp_1f_target_index: Optional[int] = None,
@@ -321,6 +337,7 @@ class ImageDataset(BaseDataset):
         self.image_jsonl_file = image_jsonl_file
         self.control_directory = control_directory
         self.multiple_target = multiple_target
+        self.h3_image_frame_count = h3_image_frame_count
         self.fp_latent_window_size = fp_latent_window_size
         self.fp_1f_clean_indices = fp_1f_clean_indices
         self.fp_1f_target_index = fp_1f_target_index
@@ -346,6 +363,8 @@ class ImageDataset(BaseDataset):
             control_count_per_image = None  # can be multiple control images
         elif self.architecture == ARCHITECTURE_HIDREAM_O1:
             control_count_per_image = None  # can be multiple control/reference images
+        elif self.architecture == ARCHITECTURE_MINIMAX_H3:
+            control_count_per_image = None
 
         mask_kwargs = (
             {
@@ -365,9 +384,18 @@ class ImageDataset(BaseDataset):
                 control_count_per_image,
                 multiple_target,
                 **mask_kwargs,
+                allow_indexed_caption_alias=(
+                    self.architecture == ARCHITECTURE_MINIMAX_H3 and self.h3_image_frame_count is not None
+                ),
             )
         elif image_jsonl_file is not None:
-            self.datasource = ImageJsonlDatasource(image_jsonl_file, control_count_per_image, multiple_target, **mask_kwargs)
+            self.datasource = ImageJsonlDatasource(
+                image_jsonl_file,
+                control_count_per_image,
+                multiple_target,
+                **mask_kwargs,
+                normalize_indexed_paths=(self.architecture == ARCHITECTURE_MINIMAX_H3 and self.h3_image_frame_count is not None),
+            )
         else:
             raise ValueError("image_directory or image_jsonl_file must be specified")
 
@@ -388,6 +416,23 @@ class ImageDataset(BaseDataset):
             metadata["control_directory"] = os.path.basename(self.control_directory)
         metadata["has_control"] = self.has_control
         return metadata
+
+    def get_latent_cache_path(self, item_info: ItemInfo) -> str:
+        path = super().get_latent_cache_path(item_info)
+        if self.architecture == ARCHITECTURE_MINIMAX_H3 and self.h3_image_frame_count is not None:
+            cache_path = os.path.basename(path)
+            suffix = f"_{self.architecture}.safetensors"
+            prefix = cache_path[: -len(suffix)]
+            base, size = prefix.rsplit("_", 1)
+            path = os.path.join(os.path.dirname(path), f"{base}_00000-{self.h3_image_frame_count:03d}_{size}{suffix}")
+        return path
+
+    def get_text_encoder_output_cache_path(self, item_info: ItemInfo) -> str:
+        path = super().get_text_encoder_output_cache_path(item_info)
+        if self.architecture == ARCHITECTURE_MINIMAX_H3 and self.h3_image_frame_count is not None:
+            marker = f"_{self.architecture}_te.safetensors"
+            path = path.replace(marker, f"_00000-{self.h3_image_frame_count:03d}{marker}")
+        return path
 
     def get_total_image_count(self):
         return len(self.datasource) if self.datasource.is_indexable() else None
@@ -564,6 +609,8 @@ class ImageDataset(BaseDataset):
             if not os.path.exists(text_encoder_output_cache_file):
                 logger.warning(f"Text encoder output cache file not found: {text_encoder_output_cache_file}")
                 continue
+            if self.architecture == ARCHITECTURE_MINIMAX_H3 and re.search(r"_00000-\d+$", item_key):
+                _validate_h3_cache_pair(cache_file, text_encoder_output_cache_file)
 
             bucket_reso = bucket_selector.get_bucket_resolution(image_size)
 

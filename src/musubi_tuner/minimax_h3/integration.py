@@ -132,6 +132,7 @@ def create_conditioning_encoder(
     dtype: str,
     quantization: Literal["none", "int8", "nf4", "nvfp4_awq"] = "none",
     reference_image_short_edge: int = REFERENCE_IMAGE_SHORT_EDGE,
+    text_visual_max_pixels: int = 0,
 ):
     """Load the released understanding encoder and adapt its hidden-state output to Musubi."""
     from musubi_tuner.minimax_h3.conditioning import MiniMaxH3ConditioningEncoder, load_text_conditioner
@@ -144,7 +145,7 @@ def create_conditioning_encoder(
         dtype=output_dtype,
         quantization=quantization,
     )
-    return MiniMaxH3ConditioningEncoder(processor, model, output_dtype, task, reference_image_short_edge)
+    return MiniMaxH3ConditioningEncoder(processor, model, output_dtype, task, reference_image_short_edge, text_visual_max_pixels)
 
 
 def create_generator(
@@ -153,7 +154,7 @@ def create_generator(
     text_encoder: Path,
     tokenizer: Path,
     video_vae: Path,
-    audio_vae: Path,
+    audio_vae: Path | None,
     device: str | None,
     dtype: str,
     request: H3GenerationRequest,
@@ -181,6 +182,7 @@ def create_generator(
     inductor_config: tuple[str, ...] = (),
     fused_qk_norm_rope: bool = False,
     reference_image_short_edge: int = REFERENCE_IMAGE_SHORT_EDGE,
+    text_visual_max_pixels: int = 0,
 ):
     """Create a sequentially-loaded native FL2VA or Ref2VA generator."""
     if dtype != "bfloat16":
@@ -217,6 +219,7 @@ def create_generator(
         fused_qk_norm_rope=fused_qk_norm_rope,
         mode="ref2va" if request.mode == "reference" else "fl2va",
         reference_image_short_edge=reference_image_short_edge,
+        text_visual_max_pixels=text_visual_max_pixels,
     )
 
 
@@ -228,7 +231,7 @@ class _NativeGenerator:
         text_encoder: Path,
         tokenizer: Path,
         video_vae: Path,
-        audio_vae: Path,
+        audio_vae: Path | None,
         device: torch.device,
         num_inference_steps: int,
         height: int | None,
@@ -255,12 +258,13 @@ class _NativeGenerator:
         fused_qk_norm_rope: bool,
         mode: H3TrainingMode,
         reference_image_short_edge: int = REFERENCE_IMAGE_SHORT_EDGE,
+        text_visual_max_pixels: int = 0,
     ) -> None:
         self.model = Path(model)
         self.text_encoder = Path(text_encoder)
         self.tokenizer = Path(tokenizer)
         self.video_vae = Path(video_vae)
-        self.audio_vae = Path(audio_vae)
+        self.audio_vae = Path(audio_vae) if audio_vae is not None else None
         self.device = device
         self.num_inference_steps = num_inference_steps
         if (height is None) != (width is None):
@@ -290,6 +294,7 @@ class _NativeGenerator:
         )
         self.fused_qk_norm_rope = fused_qk_norm_rope
         self.reference_image_short_edge = reference_image_short_edge
+        self.text_visual_max_pixels = text_visual_max_pixels
         self.mode = mode
 
     def _measure(self, name: str, operation, metrics: dict[str, dict]):
@@ -333,6 +338,7 @@ class _NativeGenerator:
             device=str(self.device),
             dtype="bfloat16",
             quantization=self.text_encoder_quantization,
+            text_visual_max_pixels=self.text_visual_max_pixels,
         )
         conditioning = encoder.encode_reference_prompt(prompt, references) if references else encoder.encode_prompt(prompt, images)
         del encoder
@@ -535,6 +541,18 @@ class _NativeGenerator:
         transformer = None
         gc.collect()
         clean_memory_on_device(self.device)
+
+        if request.output.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}:
+            video_decoder = self._measure("decoder_load", lambda: load_video_vae_decoder(self.video_vae, "cpu"), metrics)
+            video_decoder.to(self.device).eval()
+            video = self._measure("video_decode", lambda: video_decoder.decode(video_latents.to(self.device)).cpu(), metrics)
+            video_decoder.to("cpu")
+            clean_memory_on_device(self.device)
+            frame_index = min(max(int(getattr(request, "selected_frame", 0)), 0), int(video.shape[2]) - 1)
+            frame = video[0, :, frame_index].permute(1, 2, 0).clamp(0, 1).mul(255).round().to(torch.uint8).numpy()
+            request.output.parent.mkdir(parents=True, exist_ok=True)
+            Image.fromarray(frame).save(request.output)
+            return
 
         video_decoder, audio_decoder = self._measure(
             "decoder_load",
@@ -1342,7 +1360,8 @@ class _NativeLatentEncoder:
                     }
                 )
                 continue
-            is_image = target.modality is MediaModality.IMAGE
+            conditioned_image = getattr(item, "h3_image_mode", "none") != "none"
+            is_image = target.modality is MediaModality.IMAGE and not conditioned_image
             video = self._encode_video(item.content, is_image=is_image)
             video_frame_count = IMAGE_FRAME_COUNT if is_image else int(item.content.shape[0])
             expected_video_frames = IMAGE_FRAME_COUNT if is_image else temporal_shape(video_frame_count).video_latent_frames
@@ -1356,7 +1375,7 @@ class _NativeLatentEncoder:
             video_loss_mask = self._video_loss_mask(item, tuple(int(value) for value in video.shape[-3:]))
             if video_loss_mask is not None:
                 tensors["video_loss_mask"] = video_loss_mask
-            if not is_image and target_mode != "video":
+            if not is_image and not conditioned_image and target_mode != "video":
                 expected = temporal_shape(video_frame_count)
                 audio, audio_mask = self._encode_audio(item)
                 if audio.shape[-1] != expected.audio_latent_frames:
@@ -1368,8 +1387,19 @@ class _NativeLatentEncoder:
                     }
                 )
             if not is_image:
-                first = self._encode_reference_video(item.content[0], image=True)
-                last = self._encode_reference_video(item.content[-1], image=True)
+                if conditioned_image:
+                    from musubi_tuner.minimax_h3.image_training import condition_images
+
+                    height, width = int(item.content.shape[1]), int(item.content.shape[2])
+                    prepared = tuple(
+                        np.asarray(image.resize((width, height), Image.Resampling.LANCZOS)).copy()
+                        for image in condition_images(item.h3_image_mode, item.h3_condition_paths)
+                    )
+                    first_content, last_content = prepared
+                else:
+                    first_content, last_content = item.content[0], item.content[-1]
+                first = self._encode_reference_video(first_content, image=True)
+                last = self._encode_reference_video(last_content, image=True)
                 keyframe_rows = torch.cat(
                     (
                         patchify_video_latents(first[None], (1, 2, 2))[0],

@@ -17,6 +17,7 @@ from musubi_tuner.dataset.image_video_dataset import DatasetGroup, ItemInfo, Vid
 from musubi_tuner.dataset.media_utils import IMAGE_EXTENSIONS, VIDEO_EXTENSIONS, glob_images, glob_videos
 from musubi_tuner.minimax_h3.architecture import is_valid_frame_count
 from musubi_tuner.minimax_h3.audio_dataset import H3AudioDataset
+from musubi_tuner.minimax_h3.image_training import condition_paths, resample_image_targets, sample_fingerprint, validate_image_mode
 from musubi_tuner.minimax_h3.media import MediaAsset, MediaModality, slice_media_asset
 
 AUDIO_EXTENSIONS = (".wav", ".flac", ".mp3", ".m4a", ".aac", ".ogg", ".opus")
@@ -75,6 +76,11 @@ def _references_from_directory(control_directory: str, target_paths: Sequence[st
     for target in sorted(target_paths, key=lambda path: len(Path(path).name), reverse=True):
         stem = Path(target).stem
         matches = [path for path in available if path.stem == stem or path.stem.startswith(stem + "_")]
+        if not matches:
+            prefix, separator, suffix = stem.rpartition("_")
+            if separator and suffix.isdigit():
+                stem = prefix
+                matches = [path for path in available if path.stem == stem or path.stem.startswith(stem + "_")]
         matches.sort(key=lambda path: _control_sort_key(path, stem))
         order = [_control_sort_key(path, stem) for path in matches]
         if len(order) != len(set(order)):
@@ -86,12 +92,25 @@ def _references_from_directory(control_directory: str, target_paths: Sequence[st
     return result
 
 
-def _read_media_jsonl(path: str) -> list[dict[str, Any]]:
+def _read_media_jsonl(path: str, *, resolve_paths: bool = False) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     with open(path, "r", encoding="utf-8") as stream:
         for line_number, line in enumerate(stream, 1):
             try:
-                records.append(json.loads(line))
+                record = json.loads(line)
+                if resolve_paths:
+                    base = Path(path).expanduser().resolve().parent
+                    for key in tuple(record):
+                        if (
+                            key in {"image_path", "video_path", "control_path"}
+                            or _CONTROL_PATH_PATTERN.fullmatch(key)
+                            or re.fullmatch(r"image_path_\d+", key)
+                        ):
+                            media_path = Path(record[key]).expanduser()
+                            if not media_path.is_absolute():
+                                media_path = base / media_path
+                            record[key] = str(media_path.resolve())
+                records.append(record)
             except json.JSONDecodeError as error:
                 raise ValueError(f"invalid JSON on line {line_number} of {path}: {error}") from error
     return records
@@ -117,19 +136,25 @@ class H3DatasetAdapter:
     ControlNet video, then attaches them to each ItemInfo at the H3 boundary.
     """
 
-    def __init__(self, user_config: dict[str, Any]):
+    def __init__(self, user_config: dict[str, Any], args: Any | None = None):
         self.musubi_config = copy.deepcopy(user_config)
         self._targets: dict[str, _ResolvedTarget] = {}
         self._target_groups: list[tuple[str, ...]] = []
         self._target_fps: dict[str, float] = {}
         self._target_modalities: dict[str, MediaModality] = {}
         self._target_modes: dict[str, str] = {}
+        self._target_source_paths: dict[str, tuple[Path, ...]] = {}
+        self._image_frame_counts: dict[str, int] = {}
+        self.image_mode = str(getattr(args, "h3_image_mode", "none"))
+        self.image_frame_count = getattr(args, "h3_image_frame_count", None)
+        if self.image_mode not in {"none", "first", "first_last"}:
+            raise ValueError("MiniMax H3 image mode must be none, first, or first_last")
         self.audio_datasets: list[H3AudioDataset] = []
         self.dataset_kinds: list[str] = []
         general = user_config.get("general", {})
         clean_general = self.musubi_config.get("general", {})
         clean_general.pop("control_directory", None)
-        for key in ("h3_target_mode", "audio_directory", "audio_jsonl_file"):
+        for key in ("h3_target_mode", "h3_image_frame_count", "audio_directory", "audio_jsonl_file"):
             clean_general.pop(key, None)
 
         source_datasets = user_config.get("datasets", [])
@@ -139,6 +164,8 @@ class H3DatasetAdapter:
             if target_mode not in {"av", "video", "audio"}:
                 raise ValueError("h3_target_mode must be av, video, or audio")
             clean.pop("h3_target_mode", None)
+            configured_image_frames = _effective(source, general, "h3_image_frame_count")
+            clean.pop("h3_image_frame_count", None)
             audio_directory = _effective(source, general, "audio_directory")
             audio_jsonl_file = _effective(source, general, "audio_jsonl_file")
             clean.pop("audio_directory", None)
@@ -166,6 +193,8 @@ class H3DatasetAdapter:
             video_jsonl_file = _effective(source, general, "video_jsonl_file")
             image_directory = _effective(source, general, "image_directory")
             image_jsonl_file = _effective(source, general, "image_jsonl_file")
+            caption_extension = _effective(source, general, "caption_extension")
+            multiple_target = bool(_effective(source, general, "multiple_target"))
 
             records: list[dict[str, Any]] | None = None
             if video_directory:
@@ -186,14 +215,64 @@ class H3DatasetAdapter:
                 records = _read_media_jsonl(video_jsonl_file)
                 target_paths = tuple(record["video_path"] for record in records)
             elif image_directory:
-                target_paths = tuple(glob_images(image_directory))
+                target_paths = list(glob_images(image_directory, caption_extension=caption_extension))
+                all_images = tuple(Path(path) for path in glob_images(image_directory))
+                if self.image_mode != "none" and multiple_target and caption_extension:
+                    existing = set(target_paths)
+                    groups: dict[Path, list[tuple[int, Path]]] = {}
+                    for candidate in all_images:
+                        prefix, separator, suffix = candidate.stem.rpartition("_")
+                        if separator and suffix.isdigit():
+                            groups.setdefault(candidate.with_name(prefix), []).append((int(suffix), candidate))
+                    for prefix, candidates in groups.items():
+                        candidates.sort()
+                        if (prefix.parent / (prefix.name + caption_extension)).is_file() and candidates[0][0] in (0, 1):
+                            primary = str(candidates[0][1])
+                            if primary not in existing:
+                                target_paths.append(primary)
+                                existing.add(primary)
+                target_paths = tuple(sorted(target_paths))
+                target_sources = {}
+                for target_path in target_paths:
+                    primary = Path(target_path)
+                    indexed = []
+                    match_stem = primary.stem
+                    prefix, separator, suffix = primary.stem.rpartition("_")
+                    if separator and suffix.isdigit() and (primary.parent / (prefix + (caption_extension or ""))).is_file():
+                        match_stem = prefix
+                    for candidate in all_images:
+                        if not candidate.stem.startswith(match_stem + "_") or candidate == primary:
+                            continue
+                        suffix = candidate.stem[len(match_stem) + 1 :]
+                        if suffix.isdigit():
+                            indexed.append((int(suffix), candidate))
+                    indexed.sort()
+                    target_sources[target_path] = (primary, *(path for _, path in indexed)) if multiple_target else (primary,)
             elif image_jsonl_file:
-                records = _read_media_jsonl(image_jsonl_file)
+                records = _read_media_jsonl(image_jsonl_file, resolve_paths=self.image_mode != "none")
                 target_paths = tuple(record.get("image_path") or record.get("image_path_0") for record in records)
                 if any(not target for target in target_paths):
                     raise ValueError("H3 image JSONL records must contain image_path or image_path_0")
+                target_sources = {}
+                for target_path, record in zip(target_paths, records):
+                    paths = [Path(target_path)]
+                    if multiple_target:
+                        index = 1
+                        while record.get(f"image_path_{index}") is not None:
+                            paths.append(Path(record[f"image_path_{index}"]))
+                            index += 1
+                    target_sources[target_path] = tuple(paths)
             else:
                 raise ValueError("MiniMax H3 requires a Musubi image or video dataset")
+
+            if self.image_mode != "none":
+                if not (image_directory or image_jsonl_file):
+                    raise ValueError("MiniMax H3 conditioned-image mode accepts image datasets only")
+                frame_count = self.image_frame_count if self.image_frame_count is not None else (configured_image_frames or 5)
+                validate_image_mode(self.image_mode, frame_count)
+                clean["h3_image_frame_count"] = int(frame_count)
+            else:
+                frame_count = None
 
             if control_directory and records and any(_ordered_control_paths(record) for record in records):
                 raise ValueError("specify H3 controls in control_directory or video JSONL, not both")
@@ -235,6 +314,11 @@ class H3DatasetAdapter:
                     self._targets[normal] = resolved
                     self._target_modalities[normal] = modality
                     self._target_modes[normal] = target_mode
+                    self._target_source_paths[normal] = (
+                        target_sources[target] if (image_directory or image_jsonl_file) else (Path(target),)
+                    )
+                    if frame_count is not None:
+                        self._image_frame_counts[normal] = int(frame_count)
             self._target_groups.append(tuple(_normal_path(target) for target in target_paths))
 
         self.requires_audio = any(
@@ -264,6 +348,11 @@ class H3DatasetAdapter:
                 datasource.has_control = False
             dataset.control_directory = None
             dataset.has_control = False
+            image_frame_counts = {self._image_frame_counts[target] for target in target_group if target in self._image_frame_counts}
+            if image_frame_counts:
+                if len(image_frame_counts) != 1:
+                    raise ValueError("one H3 image dataset cannot use multiple image frame counts")
+                dataset.h3_image_frame_count = image_frame_counts.pop()
             for target in target_group:
                 if self._target_modalities[target] is MediaModality.VIDEO:
                     existing_fps = self._target_fps.get(target)
@@ -291,6 +380,7 @@ class H3DatasetAdapter:
         modality = self._target_modalities[normal]
         target_fps = self._target_fps.get(normal)
         target_frame_count = frame_count if frame_count is not None else item.frame_count
+        image_frame_count = self._image_frame_counts.get(normal)
         target = MediaAsset(
             resolved.path,
             modality,
@@ -298,7 +388,7 @@ class H3DatasetAdapter:
             metadata=(
                 {"frame_count": target_frame_count, "fps": target_fps}
                 if modality in {MediaModality.VIDEO, MediaModality.AUDIO}
-                else {"frame_count": 1}
+                else {"frame_count": image_frame_count or 1}
             ),
         )
         if modality is MediaModality.VIDEO and start_frame is not None and frame_count is not None:
@@ -307,10 +397,33 @@ class H3DatasetAdapter:
                 start_seconds=start_frame / target_fps,
                 duration_seconds=frame_count / target_fps,
             )
-        assets = (target, *resolved.references)
+        if image_frame_count is not None:
+            controls = condition_paths(self.image_mode, tuple(reference.path for reference in resolved.references))
+            if any(reference.modality is not MediaModality.IMAGE for reference in resolved.references):
+                raise ValueError("MiniMax H3 conditioned-image controls must all be images")
+            item.h3_image_mode = self.image_mode
+            item.h3_image_frame_count = image_frame_count
+            item.h3_condition_paths = controls
+            item.h3_target_paths = self._target_source_paths[normal]
+            item.content = resample_image_targets(item.content, image_frame_count)
+            item.frame_count = image_frame_count
+            item.h3_cache_metadata = {
+                "sample_fingerprint": sample_fingerprint(
+                    targets=item.h3_target_paths,
+                    controls=controls,
+                    mode=self.image_mode,
+                    frame_count=image_frame_count,
+                    original_size=item.original_size,
+                    bucket_size=item.bucket_size,
+                ),
+                "h3_image_mode": self.image_mode,
+            }
+            assets = (target,)
+        else:
+            assets = (target, *resolved.references)
         validate_h3_media_assets(item.item_key, assets)
         item.h3_media_assets = assets
-        item.h3_target_mode = self._target_modes[normal]
+        item.h3_target_mode = "video" if image_frame_count is not None else self._target_modes[normal]
         return assets
 
 
@@ -322,7 +435,7 @@ def create_h3_dataset_group(
     num_timestep_buckets: int | None = None,
     shared_epoch: Any = None,
 ) -> tuple[DatasetGroup, H3DatasetAdapter]:
-    adapter = H3DatasetAdapter(user_config)
+    adapter = H3DatasetAdapter(user_config, args)
     regular_config = copy.deepcopy(adapter.musubi_config)
     regular_config["datasets"] = [
         dataset for dataset, kind in zip(regular_config.get("datasets", []), adapter.dataset_kinds) if kind == "regular"

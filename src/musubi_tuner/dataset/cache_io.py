@@ -311,6 +311,7 @@ def save_latent_cache_common(item_info: ItemInfo, sd: dict[str, torch.Tensor], a
     }
     if item_info.frame_count is not None:
         metadata["frame_count"] = f"{item_info.frame_count}"
+    metadata.update(getattr(item_info, "h3_cache_metadata", {}))
 
     for key, value in sd.items():
         # NaN check and show warning, replace NaN with 0
@@ -504,6 +505,7 @@ def save_text_encoder_output_cache_common(
         "caption1": item_info.caption,
         "format_version": "1.0.1",
     }
+    metadata.update(getattr(item_info, "h3_cache_metadata", {}))
     if merge_existing and os.path.exists(item_info.text_encoder_output_cache_path):
         # load existing cache and update metadata
         new_key_bases = {remove_dtype_suffix(key) for key in sd}  # logical keys (dtype stripped) just written

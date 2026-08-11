@@ -1,0 +1,15 @@
+# FL2VA conditioned-image training with one source/control image.
+# Pass --h3_image_mode first to both cache commands and --task fl2va to text caching.
+
+[general]
+resolution = [768, 768]
+caption_extension = ".txt"
+batch_size = 1
+enable_bucket = true
+
+[[datasets]]
+image_directory = "/path/to/target_images"
+control_directory = "/path/to/first_images"
+cache_directory = "/path/to/fl2va_first_cache"
+h3_image_frame_count = 5
+num_repeats = 1

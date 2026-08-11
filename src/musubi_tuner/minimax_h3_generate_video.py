@@ -35,6 +35,15 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument("--first_frame")
     parser.add_argument("--last_frame")
     parser.add_argument(
+        "--h3_image_mode",
+        choices=("none", "first", "first_last"),
+        default="none",
+        help="generate a still image with one first-frame control or separate first/last controls",
+    )
+    parser.add_argument("--h3_image_frame_count", type=int, default=5)
+    parser.add_argument("--h3_select_frame", type=int, default=0)
+    parser.add_argument("--h3_text_visual_max_pixels", type=int, default=0)
+    parser.add_argument(
         "--keyframe",
         action="append",
         default=[],
@@ -104,15 +113,34 @@ def _parse_keyframe(entry: str) -> tuple[int, str]:
 
 
 def request_from_args(args: argparse.Namespace) -> H3GenerationRequest:
+    first_frame = args.first_frame
+    last_frame = args.last_frame
+    if args.h3_image_mode == "first":
+        if not first_frame:
+            raise ValueError("--h3_image_mode first requires --first_frame")
+        if last_frame and last_frame != first_frame:
+            raise ValueError("--h3_image_mode first does not accept a different --last_frame")
+        last_frame = first_frame
+    elif args.h3_image_mode == "first_last" and (not first_frame or not last_frame):
+        raise ValueError("--h3_image_mode first_last requires --first_frame and --last_frame")
     references = make_references(
-        first_frame=args.first_frame,
-        last_frame=args.last_frame,
+        first_frame=first_frame,
+        last_frame=last_frame,
         keyframes=[_parse_keyframe(entry) for entry in args.keyframe],
         images=args.reference_image,
         videos=args.reference_video,
         audio=args.reference_audio,
     )
-    return H3GenerationRequest(args.prompt, args.output, args.duration, args.ratio, args.seed, references)
+    return H3GenerationRequest(
+        args.prompt,
+        args.output,
+        args.duration,
+        args.ratio,
+        args.seed,
+        references,
+        args.h3_image_frame_count if args.h3_image_mode != "none" else None,
+        args.h3_select_frame,
+    )
 
 
 def main(argv: Sequence[str] | None = None) -> None:
@@ -123,15 +151,22 @@ def main(argv: Sequence[str] | None = None) -> None:
             raise ValueError("--int8_convrot_base cannot be combined with --fp8_base")
         request = request_from_args(args)
         request.validate(check_files=True)
+        image_suffixes = {".png", ".jpg", ".jpeg", ".webp"}
+        if args.output.suffix.lower() in image_suffixes and args.h3_image_mode == "none":
+            raise ValueError("image-file output requires --h3_image_mode first or first_last")
+        if args.h3_text_visual_max_pixels < 0:
+            raise ValueError("--h3_text_visual_max_pixels must be non-negative")
         inventory = inspect_checkpoint(args.model)
         if args.inspect:
             print(json.dumps({"mode": request.mode, "checkpoint": inventory.to_dict()}, indent=2))
             return
+        image_output = args.h3_image_mode != "none" and args.output.suffix.lower() in image_suffixes
         required = {
             "--text_encoder": args.text_encoder,
             "--vae": args.vae,
-            "--audio_vae": args.audio_vae,
         }
+        if not image_output:
+            required["--audio_vae"] = args.audio_vae
         missing = [name for name, value in required.items() if value is None]
         if missing:
             raise ValueError("native H3 generation requires " + ", ".join(missing))
@@ -169,6 +204,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             inductor_config=tuple(args.inductor_config),
             fused_qk_norm_rope=args.h3_fused_qk_norm_rope,
             reference_image_short_edge=args.reference_image_short_edge,
+            text_visual_max_pixels=args.h3_text_visual_max_pixels,
         )
         generator.generate(request)
         if not request.output.is_file():

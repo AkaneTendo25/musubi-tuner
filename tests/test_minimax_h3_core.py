@@ -18,8 +18,8 @@ from musubi_tuner.dataset.config_utils import (
     BlueprintGenerator,
     ConfigSanitizer,
 )
-from musubi_tuner.dataset.datasources import ImageDirectoryDatasource, VideoJsonlDatasource
-from musubi_tuner.dataset.image_video_dataset import ItemInfo
+from musubi_tuner.dataset.datasources import ImageDirectoryDatasource, ImageJsonlDatasource, VideoJsonlDatasource
+from musubi_tuner.dataset.image_video_dataset import ItemInfo, _validate_h3_cache_pair
 from musubi_tuner.minimax_h3 import backend as h3_backend
 from musubi_tuner.minimax_h3 import integration as h3_integration
 from musubi_tuner.minimax_h3.architecture import (
@@ -164,6 +164,31 @@ def test_keyframe_cli_parses_index_and_path(tmp_path):
     )
     with pytest.raises(ValueError, match="INDEX:PATH"):
         request_from_args(bad)
+
+
+def test_conditioned_image_cli_duplicates_first_control_and_uses_short_frame_grid(tmp_path):
+    first = tmp_path / "first.png"
+    args = create_parser().parse_args(
+        [
+            "--model",
+            str(tmp_path),
+            "--prompt",
+            "p",
+            "--output",
+            str(tmp_path / "out.png"),
+            "--h3_image_mode",
+            "first",
+            "--first_frame",
+            str(first),
+        ]
+    )
+
+    request = request_from_args(args)
+
+    assert request.frame_count_override == 5
+    assert request.temporal_shape.frame_count == 5
+    assert [reference.role for reference in request.references] == [ReferenceRole.FIRST_FRAME, ReferenceRole.LAST_FRAME]
+    assert request.references[0].path == request.references[1].path == first
 
 
 def test_public_request_enforces_released_reference_caps_and_audio_pairing(tmp_path):
@@ -371,6 +396,116 @@ def test_h3_image_target_keeps_basename_matched_ref2va_reference(tmp_path):
         (MediaModality.IMAGE, "target"),
         (MediaModality.IMAGE, "reference"),
     ]
+
+
+@pytest.mark.parametrize(
+    ("mode", "control_names"), [("first", ("portrait.png",)), ("first_last", ("portrait.png", "portrait_0.png"))]
+)
+def test_h3_conditioned_image_mode_builds_temporal_target_and_cache_identity(tmp_path, mode, control_names):
+    images = tmp_path / "images"
+    controls = tmp_path / "controls"
+    images.mkdir()
+    controls.mkdir()
+    target = images / "portrait.png"
+    target.write_bytes(b"target")
+    for name in control_names:
+        (controls / name).write_bytes(name.encode())
+    config = {
+        "general": {"resolution": [64, 64], "batch_size": 1},
+        "datasets": [
+            {
+                "image_directory": str(images),
+                "control_directory": str(controls),
+                "cache_directory": str(tmp_path / "cache"),
+                "h3_image_frame_count": 22,
+            }
+        ],
+    }
+    args = Namespace(debug_dataset=False, h3_image_mode=mode, h3_image_frame_count=None)
+    group, adapter = create_h3_dataset_group(config, args)
+    dataset = group.datasets[0]
+    item = ItemInfo(str(target), "portrait", (64, 64), (64, 64), content=np.full((64, 64, 3), 17, dtype=np.uint8))
+
+    assets = adapter.attach(item)
+
+    assert [(asset.modality, asset.role) for asset in assets] == [(MediaModality.IMAGE, "target")]
+    assert item.content.shape == (22, 64, 64, 3)
+    assert item.frame_count == 22
+    assert item.h3_image_mode == mode
+    assert len(item.h3_condition_paths) == len(control_names)
+    assert len(item.h3_cache_metadata["sample_fingerprint"]) == 64
+    assert dataset.h3_image_frame_count == 22
+    item.latent_cache_path = dataset.get_latent_cache_path(item)
+    item.text_encoder_output_cache_path = dataset.get_text_encoder_output_cache_path(item)
+    assert "_00000-022_0064x0064_" in item.latent_cache_path
+    assert "_00000-022_mmh3_te.safetensors" in item.text_encoder_output_cache_path
+
+
+def test_h3_conditioned_image_rejects_wrong_control_count(tmp_path):
+    images = tmp_path / "images"
+    controls = tmp_path / "controls"
+    images.mkdir()
+    controls.mkdir()
+    target = images / "portrait.png"
+    target.write_bytes(b"target")
+    (controls / "portrait.png").write_bytes(b"control")
+    config = {
+        "general": {"resolution": [64, 64]},
+        "datasets": [
+            {
+                "image_directory": str(images),
+                "control_directory": str(controls),
+                "cache_directory": str(tmp_path / "cache"),
+            }
+        ],
+    }
+    _, adapter = create_h3_dataset_group(config, Namespace(debug_dataset=False, h3_image_mode="first_last", h3_image_frame_count=5))
+    item = ItemInfo(str(target), "portrait", (64, 64), (64, 64), content=np.zeros((64, 64, 3), dtype=np.uint8))
+
+    with pytest.raises(ValueError, match="exactly 2 control"):
+        adapter.attach(item)
+
+
+def test_h3_indexed_image_sequence_accepts_caption_alias_and_ordered_controls(tmp_path):
+    images = tmp_path / "images"
+    controls = tmp_path / "controls"
+    images.mkdir()
+    controls.mkdir()
+    for index, value in enumerate((10, 20, 30)):
+        Image.fromarray(np.full((32, 32, 3), value, dtype=np.uint8)).save(images / f"scene_{index:02d}.png")
+    (images / "scene.txt").write_text("a transformation", encoding="utf-8")
+    Image.fromarray(np.zeros((32, 32, 3), dtype=np.uint8)).save(controls / "scene.png")
+    Image.fromarray(np.ones((32, 32, 3), dtype=np.uint8)).save(controls / "scene_00.png")
+
+    with pytest.raises(ValueError, match="no multiple-target images found"):
+        ImageDirectoryDatasource(str(images), ".txt", str(controls), None, True)
+
+    datasource = ImageDirectoryDatasource(
+        str(images),
+        ".txt",
+        str(controls),
+        None,
+        True,
+        allow_indexed_caption_alias=True,
+    )
+    key, targets, caption, condition_images, _mask = datasource.get_image_data(0)
+
+    assert Path(key).name == "scene_00.png"
+    assert [int(np.asarray(image)[0, 0, 0]) for image in targets] == [10, 20, 30]
+    assert caption == "a transformation"
+    assert len(condition_images) == 2
+
+
+def test_image_jsonl_keeps_legacy_relative_paths_without_conditioned_image_opt_in(tmp_path):
+    jsonl = tmp_path / "dataset.jsonl"
+    jsonl.write_text('{"image_path_0000":"relative/target.png","caption":"caption"}\n', encoding="utf-8")
+
+    legacy = ImageJsonlDatasource(str(jsonl), multiple_target=True)
+    conditioned = ImageJsonlDatasource(str(jsonl), multiple_target=True, normalize_indexed_paths=True)
+
+    assert legacy.data[0]["image_path_0000"] == "relative/target.png"
+    assert "image_path_0" not in legacy.data[0]
+    assert conditioned.data[0]["image_path_0"] == str((tmp_path / "relative/target.png").resolve())
 
 
 def test_h3_reuses_numbered_jsonl_control_paths(tmp_path):
@@ -761,6 +896,18 @@ def test_native_cache_io_records_audio_tensor_and_architecture(tmp_path):
         assert handle.metadata()["frame_count"] == "22"
 
 
+def test_h3_conditioned_image_cache_pair_requires_matching_sample_fingerprint(tmp_path):
+    latent = tmp_path / "latent.safetensors"
+    text = tmp_path / "text.safetensors"
+    save_file({"x": torch.zeros(1)}, latent, metadata={"sample_fingerprint": "same"})
+    save_file({"x": torch.zeros(1)}, text, metadata={"sample_fingerprint": "same"})
+    _validate_h3_cache_pair(str(latent), str(text))
+
+    save_file({"x": torch.zeros(1)}, text, metadata={"sample_fingerprint": "different"})
+    with pytest.raises(ValueError, match="do not describe the same sample"):
+        _validate_h3_cache_pair(str(latent), str(text))
+
+
 def test_native_cache_io_accepts_one_frame_image_without_audio(tmp_path):
     cache = tmp_path / "image_mmh3.safetensors"
     item = ItemInfo("image.png", "caption", (512, 512), (512, 512), frame_count=1, latent_cache_path=str(cache))
@@ -895,6 +1042,51 @@ def test_native_latent_encoder_uses_direct_image_vae_path_and_omits_audio():
 
     assert video_encoder.image_calls == 1
     assert set(tensors) == {"latents_1x2x2_float32"}
+
+
+def test_native_latent_encoder_uses_temporal_vae_and_external_controls_for_conditioned_image(tmp_path):
+    class VideoEncoder(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.marker = torch.nn.Parameter(torch.zeros(()), requires_grad=False)
+            self.video_calls = 0
+            self.control_values = []
+
+        def encode(self, pixels):
+            assert pixels.shape == (1, 3, 5, 32, 32)
+            self.video_calls += 1
+            return torch.zeros(1, 24, 2, 2, 2)
+
+        def encode_image(self, pixels):
+            raise AssertionError("conditioned image must use temporal video encoding")
+
+        def encode_reference(self, pixels, *, image):
+            assert image
+            self.control_values.append(float(pixels.mean()))
+            return torch.zeros(1, 24, 1, 2, 2)
+
+    first = tmp_path / "first.png"
+    last = tmp_path / "last.png"
+    Image.fromarray(np.zeros((32, 32, 3), dtype=np.uint8)).save(first)
+    Image.fromarray(np.full((32, 32, 3), 255, dtype=np.uint8)).save(last)
+    item = SimpleNamespace(
+        content=np.full((5, 32, 32, 3), 127, dtype=np.uint8),
+        item_key="image.png",
+        h3_image_mode="first_last",
+        h3_condition_paths=(first, last),
+        h3_media_assets=(MediaAsset(Path("image.png"), MediaModality.IMAGE, "target"),),
+    )
+    video_encoder = VideoEncoder()
+    encoder = h3_integration._NativeLatentEncoder(video_encoder, None, torch.float32)
+    encoder._encode_references = lambda item: {}
+
+    (tensors,) = encoder.encode_latents([item])
+
+    assert video_encoder.video_calls == 1
+    assert video_encoder.control_values[0] != video_encoder.control_values[1]
+    assert "latents_2x2x2_float32" in tensors
+    assert f"varlen_{H3_KEYFRAME_VIDEO_ROWS_KEY}_float32" in tensors
+    assert not any(key.startswith(H3_AUDIO_LATENTS_KEY) for key in tensors)
 
 
 def test_native_latent_encoder_pools_pixel_loss_masks_to_h3_latent_windows():
@@ -1170,9 +1362,10 @@ def test_h3_generation_parser_exposes_native_inference_controls():
     ):
         assert option in parser._option_string_actions
     assert "--fp8_scaled" not in parser._option_string_actions
-    assert parser.parse_args(["--model", "model", "--prompt", "prompt", "--output", "out.mp4"]).tokenizer == (
-        default_text_encoder_assets()
-    )
+    defaults = parser.parse_args(["--model", "model", "--prompt", "prompt", "--output", "out.mp4"])
+    assert defaults.tokenizer == default_text_encoder_assets()
+    assert defaults.h3_image_mode == "none"
+    assert defaults.h3_text_visual_max_pixels == 0
 
 
 def test_h3_bundled_text_encoder_assets_are_complete():

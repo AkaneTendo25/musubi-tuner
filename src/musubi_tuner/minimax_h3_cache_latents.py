@@ -13,6 +13,7 @@ from musubi_tuner.dataset.image_video_dataset import ItemInfo
 from musubi_tuner.minimax_h3.backend import create_latent_encoder
 from musubi_tuner.minimax_h3.cache import normalize_batch_tensors, save_latent_cache_minimax_h3
 from musubi_tuner.minimax_h3.dataset import attach_h3_media, create_h3_dataset_group
+from musubi_tuner.minimax_h3.image_training import add_image_training_arguments, cache_matches_fingerprint
 from musubi_tuner.minimax_h3.references import REFERENCE_IMAGE_SHORT_EDGE
 
 logger = logging.getLogger(__name__)
@@ -35,6 +36,7 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         ),
     )
     parser.set_defaults(vae_dtype="float32")
+    add_image_training_arguments(parser)
     return parser
 
 
@@ -81,7 +83,16 @@ def main(argv: Sequence[str] | None = None) -> None:
         for item, tensors in zip(batch, results):
             save_latent_cache_minimax_h3(item, tensors)
 
-    cache_latents.encode_datasets(datasets, encode, args)
+    def existing_cache_valid(item: ItemInfo, path: str) -> bool:
+        attach_h3_media((item,), dataset_adapter)
+        return cache_matches_fingerprint(path, item.h3_cache_metadata["sample_fingerprint"])
+
+    cache_latents.encode_datasets(
+        datasets,
+        encode,
+        args,
+        existing_cache_valid=existing_cache_valid if args.h3_image_mode != "none" else None,
+    )
 
 
 if __name__ == "__main__":
