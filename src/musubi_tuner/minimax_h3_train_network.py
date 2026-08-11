@@ -640,6 +640,10 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             transformer.enable_fused_indexed_adaln()
             if args.compile:
                 logger.warning("--h3_fused_indexed_adaln falls back to the Inductor path inside compiled blocks")
+        if getattr(args, "h3_fused_swiglu", False):
+            transformer.enable_fused_swiglu()
+            if args.compile:
+                logger.warning("--h3_fused_swiglu falls back to the Inductor path inside compiled blocks")
         if args.h3_convrot_int8_lora_fused:
             from musubi_tuner.modules.convrot_int8_utils import enable_convrot_int8_lora_fusion
 
@@ -1689,6 +1693,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             "ss_h3_audio_loss_weight": str(args.h3_audio_loss_weight),
             "ss_h3_attn_auto_dispatch": str(args.h3_attn_auto_dispatch),
             "ss_h3_fused_indexed_adaln": str(args.h3_fused_indexed_adaln),
+            "ss_h3_fused_swiglu": str(args.h3_fused_swiglu),
             "ss_h3_int8_attention": args.h3_int8_attention,
             "ss_h3_observed_modality": str(args.h3_observed_modality or "none"),
             "ss_h3_image_flow_shift": str(args.h3_image_flow_shift or "resolution_aware"),
@@ -2033,6 +2038,14 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         help=(
             "use an opt-in Triton kernel that fuses each main-block RMSNorm with token-indexed AdaLN shift/scale; "
             "frozen LoRA bases use the fused forward/backward path and unsupported cases fall back safely"
+        ),
+    )
+    parser.add_argument(
+        "--h3_fused_swiglu",
+        action="store_true",
+        help=(
+            "use an opt-in Triton kernel for the SwiGLU activation in H3 main and token-refiner feed-forward layers; "
+            "unsupported cases fall back safely and compiled blocks use their Inductor path"
         ),
     )
     parser.add_argument(

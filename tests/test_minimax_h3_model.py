@@ -266,6 +266,43 @@ def test_h3_fused_indexed_adaln_forward_and_input_gradient_match_eager():
     torch.testing.assert_close(fused_x.grad, eager_x.grad, rtol=3e-2, atol=3e-2)
 
 
+def test_h3_fused_swiglu_cpu_falls_back_exactly():
+    torch.manual_seed(15)
+    reference = MiniMaxH3Transformer(_tiny_config(num_layers=1)).requires_grad_(False)
+    fused = MiniMaxH3Transformer(_tiny_config(num_layers=1)).requires_grad_(False)
+    fused.load_state_dict(reference.state_dict())
+    fused.enable_fused_swiglu()
+    inputs = _tiny_inputs()
+
+    expected = reference(**inputs)
+    actual = fused(**inputs)
+
+    torch.testing.assert_close(actual.video, expected.video)
+    torch.testing.assert_close(actual.audio, expected.audio)
+    feed_forwards = [module for module in fused.modules() if isinstance(module, h3_model.MiniMaxH3FeedForward)]
+    assert feed_forwards and all(module.fused_swiglu for module in feed_forwards)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA Triton")
+def test_h3_fused_swiglu_forward_and_gradient_match_eager():
+    from musubi_tuner.minimax_h3.triton_kernels import try_fused_swiglu
+
+    torch.manual_seed(16)
+    projected = torch.randn(2, 37, 512, device="cuda", dtype=torch.bfloat16)
+    upstream = torch.randn(2, 37, 256, device="cuda", dtype=torch.bfloat16)
+    eager_x = projected.detach().clone().requires_grad_(True)
+    fused_x = projected.detach().clone().requires_grad_(True)
+    gate, value = eager_x.chunk(2, dim=-1)
+    eager = torch.nn.functional.silu(gate) * value
+    fused = try_fused_swiglu(fused_x)
+
+    assert fused is not None
+    torch.autograd.backward(eager, upstream)
+    torch.autograd.backward(fused, upstream)
+    torch.testing.assert_close(fused, eager, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(fused_x.grad, eager_x.grad, rtol=2e-2, atol=2e-2)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA SDPA")
 def test_h3_attention_auto_dispatch_runs_cudnn_priority_forward_backward(monkeypatch):
     original_sdpa_kernel = h3_model.sdpa_kernel

@@ -24,6 +24,34 @@ _LOGGED = False
 if HAS_TRITON:
 
     @triton.jit
+    def _swiglu_fwd(projected, output, elements, width: tl.constexpr, block: tl.constexpr):
+        offsets = tl.program_id(0) * block + tl.arange(0, block)
+        mask = offsets < elements
+        rows = offsets // width
+        columns = offsets - rows * width
+        base = rows * (2 * width) + columns
+        gate = tl.load(projected + base, mask=mask, other=0.0).to(tl.float32)
+        value = tl.load(projected + base + width, mask=mask, other=0.0).to(tl.float32)
+        sigmoid = tl.sigmoid(gate)
+        tl.store(output + offsets, gate * sigmoid * value, mask=mask)
+
+    @triton.jit
+    def _swiglu_bwd(grad_output, projected, grad_projected, elements, width: tl.constexpr, block: tl.constexpr):
+        offsets = tl.program_id(0) * block + tl.arange(0, block)
+        mask = offsets < elements
+        rows = offsets // width
+        columns = offsets - rows * width
+        base = rows * (2 * width) + columns
+        grad = tl.load(grad_output + offsets, mask=mask, other=0.0).to(tl.float32)
+        gate = tl.load(projected + base, mask=mask, other=0.0).to(tl.float32)
+        value = tl.load(projected + base + width, mask=mask, other=0.0).to(tl.float32)
+        sigmoid = tl.sigmoid(gate)
+        silu = gate * sigmoid
+        silu_grad = sigmoid * (1.0 + gate * (1.0 - sigmoid))
+        tl.store(grad_projected + base, grad * value * silu_grad, mask=mask)
+        tl.store(grad_projected + base + width, grad * silu, mask=mask)
+
+    @triton.jit
     def _indexed_adaln_rmsnorm_fwd(
         x,
         weight,
@@ -367,6 +395,37 @@ if HAS_TRITON:
         tl.store(kgx + row * dim + offsets, ki * kgn - kv * (ki * ki * ki / dim) * kdot, mask=mask)
 
 
+class _FusedSwiGLU(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, projected):
+        width = projected.shape[-1] // 2
+        output_shape = (*projected.shape[:-1], width)
+        output = torch.empty(output_shape, device=projected.device, dtype=projected.dtype)
+        elements = output.numel()
+        block = 256
+        _swiglu_fwd[(triton.cdiv(elements, block),)](projected, output, elements, width=width, block=block, num_warps=4)
+        ctx.save_for_backward(projected)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        (projected,) = ctx.saved_tensors
+        width = projected.shape[-1] // 2
+        elements = grad_output.numel()
+        grad_projected = torch.empty_like(projected)
+        block = 256
+        _swiglu_bwd[(triton.cdiv(elements, block),)](
+            grad_output.contiguous(),
+            projected,
+            grad_projected,
+            elements,
+            width=width,
+            block=block,
+            num_warps=4,
+        )
+        return grad_projected
+
+
 class _FusedIndexedAdaLNRMSNorm(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, weight, shift, scale, indices, eps):
@@ -604,6 +663,18 @@ def try_fused_indexed_adaln_rmsnorm(
     if not weight.is_contiguous() or not indices.is_contiguous() or shift.stride(1) != 1 or scale.stride(1) != 1:
         return None
     return _FusedIndexedAdaLNRMSNorm.apply(x, weight, shift, scale, indices, eps)
+
+
+def try_fused_swiglu(projected: torch.Tensor) -> torch.Tensor | None:
+    """Apply H3's fused-gate SwiGLU without materializing gate/value outputs."""
+    is_compiling = getattr(getattr(torch, "compiler", None), "is_compiling", lambda: False)
+    if not HAS_TRITON or is_compiling() or projected.device.type != "cuda":
+        return None
+    if projected.ndim < 2 or projected.shape[-1] % 2 or projected.shape[-1] == 0:
+        return None
+    if projected.dtype not in (torch.float16, torch.bfloat16) or not projected.is_contiguous():
+        return None
+    return _FusedSwiGLU.apply(projected)
 
 
 def reference_block_sparse_forward(

@@ -34,7 +34,11 @@ from torch.utils.checkpoint import checkpoint
 
 from musubi_tuner.minimax_h3.activation_offload import ReusableActivationOffloader
 from musubi_tuner.minimax_h3.int8_attention import HAS_TRITON, int8_attention
-from musubi_tuner.minimax_h3.triton_kernels import try_fused_indexed_adaln_rmsnorm, try_fused_qk_norm_rope
+from musubi_tuner.minimax_h3.triton_kernels import (
+    try_fused_indexed_adaln_rmsnorm,
+    try_fused_qk_norm_rope,
+    try_fused_swiglu,
+)
 from musubi_tuner.modules.attention import AttentionParams
 from musubi_tuner.modules.attention import attention as musubi_attention
 from musubi_tuner.modules.custom_offloading_utils import BlockSwapConfig, create_offloader
@@ -274,9 +278,15 @@ class MiniMaxH3FeedForward(nn.Module):
         super().__init__()
         self.fc1 = nn.Linear(hidden_size, 2 * ffn_dim, bias=False)
         self.fc2 = nn.Linear(ffn_dim, hidden_size, bias=False)
+        self.fused_swiglu = False
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        gate, value = self.fc1(hidden_states).chunk(2, dim=-1)
+        projected = self.fc1(hidden_states)
+        if self.fused_swiglu:
+            fused = try_fused_swiglu(projected)
+            if fused is not None:
+                return self.fc2(fused)
+        gate, value = projected.chunk(2, dim=-1)
         return self.fc2(F.silu(gate) * value)
 
 
@@ -499,6 +509,11 @@ class MiniMaxH3Transformer(nn.Module):
     def enable_fused_indexed_adaln(self) -> None:
         for module in self.blocks:
             module.fused_indexed_adaln = True
+
+    def enable_fused_swiglu(self) -> None:
+        for module in self.modules():
+            if isinstance(module, MiniMaxH3FeedForward):
+                module.fused_swiglu = True
 
     def set_int8_attention_mode(self, mode: str) -> None:
         if mode not in {"off", "aux", "train"}:
