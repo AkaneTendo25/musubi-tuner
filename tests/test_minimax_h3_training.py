@@ -1620,10 +1620,15 @@ class MiniMaxH3TransformerBlock(nn.Module):
         return hidden_states + self.attn(hidden_states) + self.ff(hidden_states)
 
 
+class MiniMaxH3TokenRefinerBlock(MiniMaxH3TransformerBlock):
+    pass
+
+
 class TinyH3Transformer(nn.Module):
     def __init__(self):
         super().__init__()
         self.transformer_blocks = nn.ModuleList([MiniMaxH3TransformerBlock()])
+        self.token_refiner = nn.ModuleList([MiniMaxH3TokenRefinerBlock()])
 
     def forward(self, hidden_states):
         for block in self.transformer_blocks:
@@ -1639,12 +1644,90 @@ def test_h3_lora_targets_main_attention_and_ff_only():
     assert any(name.endswith("_attn") for name in names)
     assert sum("_ff_" in name for name in names) == 2
     assert not any("adaln" in name or "norm" in name for name in names)
+    assert not any("token_refiner" in name for name in names)
 
     network.apply_to(None, transformer, apply_text_encoder=False, apply_unet=True)
     transformer(torch.ones(1, 4)).sum().backward()
     adapter_grads = [parameter.grad for parameter in network.parameters()]
     assert any(gradient is not None and torch.isfinite(gradient).all() and bool(gradient.abs().sum()) for gradient in adapter_grads)
     assert all(parameter.grad is None for parameter in transformer.transformer_blocks[0].adaln_proj.parameters())
+
+
+def test_h3_lora_can_add_token_refiner_targets():
+    transformer = TinyH3Transformer().requires_grad_(False)
+    network = lora_minimax_h3.create_arch_network(
+        1.0,
+        2,
+        2.0,
+        None,
+        [],
+        transformer,
+        h3_lora_token_refiner="true",
+    )
+    names = {module.lora_name for module in network.unet_loras}
+
+    refiner_names = {name for name in names if "token_refiner" in name}
+    assert len(refiner_names) == 3
+    assert any(name.endswith("_attn") for name in refiner_names)
+    assert sum("_ff_" in name for name in refiner_names) == 2
+    assert not any("adaln" in name or "norm" in name for name in names)
+
+
+def test_h3_token_refiner_lora_round_trips_from_weights(tmp_path):
+    config = MiniMaxH3TransformerConfig(
+        num_attention_heads=2,
+        attention_head_dim=16,
+        hidden_size=24,
+        num_layers=2,
+        num_refiner_layers=2,
+        ffn_dim=32,
+        in_channels=4,
+        audio_in_channels=6,
+        patch_size=(1, 2, 2),
+        text_dim=8,
+        freq_dim=8,
+        time_embed_hidden_dim=24,
+        time_embed_dim=16,
+        rope_freq_dim=2,
+    )
+    transformer = MiniMaxH3Transformer(config).requires_grad_(False)
+    network = lora_minimax_h3.create_arch_network(
+        1.0,
+        2,
+        2.0,
+        None,
+        [],
+        transformer,
+        h3_lora_token_refiner="true",
+    )
+    assert len(network.unet_loras) == config.num_layers * 4 + config.num_refiner_layers * 4
+    assert sum("token_refiner" in module.lora_name for module in network.unet_loras) == config.num_refiner_layers * 4
+    network.apply_to(None, transformer, apply_text_encoder=False, apply_unet=True)
+
+    checkpoint = tmp_path / "h3_token_refiner_lora.safetensors"
+    network.save_weights(checkpoint, torch.float32, {"ss_h3_lora_token_refiner": "True"})
+    weights = load_file(checkpoint)
+    restored = lora_minimax_h3.create_arch_network_from_weights(1.0, weights, unet=transformer)
+
+    assert len(restored.unet_loras) == len(network.unet_loras)
+    assert {module.lora_name for module in restored.unet_loras} == {module.lora_name for module in network.unet_loras}
+
+
+def test_h3_token_refiner_flag_is_forwarded_as_network_arg():
+    args = create_parser().parse_args(["--sdpa", "--h3_lora_token_refiner"])
+    trainer = MiniMaxH3NetworkTrainer()
+
+    trainer.handle_model_specific_args(args)
+
+    assert "h3_lora_token_refiner=true" in args.network_args
+    assert trainer.extra_metadata(args)["ss_h3_lora_token_refiner"] == "True"
+
+
+def test_h3_token_refiner_flag_rejects_other_network_modules():
+    args = create_parser().parse_args(["--h3_lora_token_refiner", "--network_module", "networks.lora"])
+
+    with pytest.raises(ValueError, match="networks.lora_minimax_h3"):
+        MiniMaxH3NetworkTrainer().handle_model_specific_args(args)
 
 
 def test_native_h3_lora_optimizer_step_and_save_reload_are_equivalent(tmp_path):

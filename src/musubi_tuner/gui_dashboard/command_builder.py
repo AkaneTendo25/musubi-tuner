@@ -538,6 +538,8 @@ def _build_h3_training_cmd(config: ProjectConfig) -> list[str]:
         cmd.append("--h3_attn_auto_dispatch")
     if t.h3_int8_attention != "off":
         cmd += ["--h3_int8_attention", t.h3_int8_attention]
+    if t.h3_lora_token_refiner:
+        cmd.append("--h3_lora_token_refiner")
     if t.h3_training_mode != "fl2va":
         cmd += ["--h3_training_mode", t.h3_training_mode]
     if t.h3_loss_balance != "modality":

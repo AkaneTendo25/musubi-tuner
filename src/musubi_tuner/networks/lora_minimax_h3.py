@@ -8,6 +8,7 @@ from torch import nn
 from musubi_tuner.networks import lora
 
 MINIMAX_H3_TARGET_REPLACE_MODULES = ["MiniMaxH3TransformerBlock"]
+MINIMAX_H3_TOKEN_REFINER_REPLACE_MODULES = ["MiniMaxH3TokenRefinerBlock"]
 
 
 def create_arch_network(
@@ -20,6 +21,7 @@ def create_arch_network(
     neuron_dropout: float | None = None,
     **kwargs,
 ):
+    train_token_refiner = str(kwargs.pop("h3_lora_token_refiner", "false")).lower() in {"1", "true", "yes", "on"}
     exclude_patterns = kwargs.get("exclude_patterns")
     if exclude_patterns is None:
         exclude_patterns = []
@@ -31,8 +33,12 @@ def create_arch_network(
     exclude_patterns.extend((r".*(adaln_proj|modulation).*", r".*norm.*"))
     kwargs["exclude_patterns"] = exclude_patterns
 
+    target_modules = list(MINIMAX_H3_TARGET_REPLACE_MODULES)
+    if train_token_refiner:
+        target_modules.extend(MINIMAX_H3_TOKEN_REFINER_REPLACE_MODULES)
+
     return lora.create_network(
-        MINIMAX_H3_TARGET_REPLACE_MODULES,
+        target_modules,
         "lora_unet",
         multiplier,
         network_dim,
@@ -54,7 +60,7 @@ def create_arch_network_from_weights(
     **kwargs,
 ) -> lora.LoRANetwork:
     return lora.create_network_from_weights(
-        MINIMAX_H3_TARGET_REPLACE_MODULES,
+        MINIMAX_H3_TARGET_REPLACE_MODULES + MINIMAX_H3_TOKEN_REFINER_REPLACE_MODULES,
         multiplier,
         weights_sd,
         text_encoders,

@@ -209,6 +209,7 @@ def test_h3_performance_controls_are_forwarded_to_trainer(tmp_path: Path) -> Non
     training.h3_fused_qk_norm_rope = True
     training.h3_attn_auto_dispatch = True
     training.h3_int8_attention = "train"
+    training.h3_lora_token_refiner = True
     training.h3_adaln_rank = 16
     training.gradient_checkpointing = True
     training.gradient_checkpointing_cpu_offload = True
@@ -226,6 +227,7 @@ def test_h3_performance_controls_are_forwarded_to_trainer(tmp_path: Path) -> Non
     assert parsed.h3_fused_qk_norm_rope is True
     assert parsed.h3_attn_auto_dispatch is True
     assert parsed.h3_int8_attention == "train"
+    assert parsed.h3_lora_token_refiner is True
     assert parsed.h3_adaln_rank == 16
     assert parsed.gradient_checkpointing_cpu_offload is True
     assert parsed.h3_gradient_checkpointing_blocks == 50

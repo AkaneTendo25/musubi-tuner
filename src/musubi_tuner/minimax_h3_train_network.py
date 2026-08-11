@@ -425,6 +425,16 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             torch.float16 if args.mixed_precision == "fp16" else torch.bfloat16 if args.mixed_precision == "bf16" else torch.float32
         )
         args.dit_dtype = model_utils.dtype_to_str(self.dit_dtype)
+        if args.h3_lora_token_refiner:
+            if not args.network_module.endswith("lora_minimax_h3"):
+                raise ValueError("--h3_lora_token_refiner requires --network_module networks.lora_minimax_h3")
+            network_args = list(args.network_args or [])
+            if any(value.startswith("h3_lora_token_refiner=") for value in network_args):
+                raise ValueError(
+                    "set H3 token-refiner targeting with --h3_lora_token_refiner, not a duplicate --network_args value"
+                )
+            network_args.append("h3_lora_token_refiner=true")
+            args.network_args = network_args
         self._i2v_training = False
         self._control_training = False
         self.default_guidance_scale = 1.0
@@ -1666,6 +1676,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
     def extra_metadata(self, args: argparse.Namespace) -> dict:
         return {
             "ss_h3_training_mode": args.h3_training_mode,
+            "ss_h3_lora_token_refiner": str(args.h3_lora_token_refiner),
             "ss_h3_loss_balance": args.h3_loss_balance,
             "ss_h3_video_loss_weight": str(args.h3_video_loss_weight),
             "ss_h3_audio_loss_weight": str(args.h3_audio_loss_weight),
@@ -1709,6 +1720,14 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         choices=("fl2va", "ref2va", "ref2va_omni"),
         default="fl2va",
         help="select FL2VA, strict Ref2VA, or experimental zero-or-more-reference Ref2VA training",
+    )
+    parser.add_argument(
+        "--h3_lora_token_refiner",
+        action="store_true",
+        help=(
+            "also train LoRA adapters on the two H3 text token-refiner blocks; "
+            "off by default and supported only by networks.lora_minimax_h3"
+        ),
     )
     parser.add_argument("--text_encoder", type=str, help="Qwen3-VL H3 BF16 checkpoint used only for sampling prompts")
     parser.add_argument(
