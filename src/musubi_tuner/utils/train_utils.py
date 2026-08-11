@@ -31,6 +31,36 @@ def is_dashboard_stop_requested() -> bool:
         return False
 
 
+def poll_checkpoint_request_files(
+    save_request_file: str | None,
+    save_and_stop_request_file: str | None,
+    accelerator: accelerate.Accelerator,
+) -> tuple[bool, bool]:
+    """Return synchronized save/stop requests observed by global rank zero."""
+    if not save_request_file and not save_and_stop_request_file:
+        return False, False
+    flags = torch.zeros(2, dtype=torch.uint8, device=accelerator.device)
+    if accelerator.is_main_process:
+        try:
+            flags[0] = bool(save_request_file and Path(save_request_file).is_file())
+            flags[1] = bool(save_and_stop_request_file and Path(save_and_stop_request_file).is_file())
+        except OSError as error:
+            logger.warning("Failed to inspect checkpoint request files: %s", error)
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        torch.distributed.broadcast(flags, src=0)
+    return bool(flags[0].item()), bool(flags[1].item())
+
+
+def consume_checkpoint_request_file(path: str | None) -> None:
+    """Remove a fulfilled request while tolerating a concurrent user deletion."""
+    if not path:
+        return
+    try:
+        Path(path).unlink(missing_ok=True)
+    except OSError as error:
+        logger.warning("Checkpoint was saved, but request file %s could not be removed: %s", path, error)
+
+
 # checkpointファイル名
 STATE_MANIFEST_NAME = "state_manifest.json"
 RESUME_METADATA_NAME = "resume_metadata.json"
@@ -334,6 +364,7 @@ def save_and_remove_state_stepwise(
     step_no: int,
     epoch: int = 0,
     step_in_epoch: int = 0,
+    apply_retention: bool = True,
 ):
     model_name = args.output_name
 
@@ -355,7 +386,9 @@ def save_and_remove_state_stepwise(
             logger.info("uploading state to huggingface.")
             huggingface_utils.upload(args, state_dir, "/" + STEP_STATE_NAME.format(model_name, step_no))
 
-        last_n_steps = args.save_last_n_steps_state if args.save_last_n_steps_state else args.save_last_n_steps
+        last_n_steps = (
+            (args.save_last_n_steps_state if args.save_last_n_steps_state else args.save_last_n_steps) if apply_retention else None
+        )
         if last_n_steps is not None:
             # last_n_steps前のstep_noから、save_every_n_stepsの倍数のstep_noを計算して削除する
             remove_step_no = step_no - last_n_steps - 1

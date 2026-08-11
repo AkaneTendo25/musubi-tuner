@@ -2182,6 +2182,10 @@ class NetworkTrainer:
         # A dashboard stop is polled at batch boundaries. Keep the flag local
         # so the normal final-state save path can run before exiting.
         dashboard_stop_requested = train_utils.is_dashboard_stop_requested()
+        save_request_file = getattr(args, "save_request_file", None)
+        save_and_stop_request_file = getattr(args, "save_and_stop_request_file", None)
+        checkpoint_stop_requested = False
+        consume_save_request_on_stop = False
 
         # Validation intentionally precedes sampling when both run at startup.
         should_validate_at_start = should_validate(args, global_step, epoch=0, at_start=True)
@@ -2350,8 +2354,22 @@ class NetworkTrainer:
 
                     # to avoid calling optimizer_eval_fn() too frequently, we call it only when we need to sample images or save the model
                     should_sampling = should_sample_images(args, global_step, epoch=None)
-                    should_saving = args.save_every_n_steps is not None and global_step % args.save_every_n_steps == 0
+                    scheduled_saving = args.save_every_n_steps is not None and global_step % args.save_every_n_steps == 0
+                    file_save_requested, file_stop_requested = train_utils.poll_checkpoint_request_files(
+                        save_request_file,
+                        save_and_stop_request_file,
+                        accelerator,
+                    )
+                    if file_stop_requested:
+                        checkpoint_stop_requested = True
+                        consume_save_request_on_stop = file_save_requested
+                        file_save_requested = False
+                        accelerator.print("\nSave-and-stop request detected; finishing this optimizer step and saving final state.")
+                    should_saving = scheduled_saving or file_save_requested
                     should_validating = should_validate(args, global_step, epoch=None)
+                    if file_stop_requested:
+                        should_sampling = False
+                        should_validating = False
 
                     if should_validating or should_sampling or should_saving:
                         optimizer_eval_fn()
@@ -2374,13 +2392,17 @@ class NetworkTrainer:
                                     global_step,
                                     epoch=epoch + 1,
                                     step_in_epoch=step_in_epoch,
+                                    apply_retention=scheduled_saving,
                                 )
 
                             if accelerator.is_main_process:
-                                remove_step_no = train_utils.get_remove_step_no(args, global_step)
+                                remove_step_no = train_utils.get_remove_step_no(args, global_step) if scheduled_saving else None
                                 if remove_step_no is not None:
                                     remove_ckpt_name = train_utils.get_step_ckpt_name(args.output_name, remove_step_no)
                                     remove_model(remove_ckpt_name)
+                            accelerator.wait_for_everyone()
+                            if file_save_requested and accelerator.is_main_process:
+                                train_utils.consume_checkpoint_request_file(save_request_file)
                         optimizer_train_fn()
 
                 current_loss = loss.detach().item()
@@ -2431,14 +2453,17 @@ class NetworkTrainer:
                 if train_utils.is_dashboard_stop_requested():
                     dashboard_stop_requested = True
                     break
+                if checkpoint_stop_requested:
+                    break
 
                 if global_step >= args.max_train_steps:
                     break
 
             if last_epoch == epoch + 1 and last_step_in_epoch >= len(train_dataloader):
                 last_step_in_epoch = 0
-            if dashboard_stop_requested:
-                accelerator.print("\nDashboard stop requested; finishing and saving training state.")
+            if dashboard_stop_requested or checkpoint_stop_requested:
+                if dashboard_stop_requested:
+                    accelerator.print("\nDashboard stop requested; finishing and saving training state.")
                 break
 
             if len(accelerator.trackers) > 0:
@@ -2496,10 +2521,16 @@ class NetworkTrainer:
 
         if is_main_process:
             ckpt_name = train_utils.get_last_ckpt_name(args.output_name)
-            final_epoch = current_epoch.value if dashboard_stop_requested else num_train_epochs
+            final_epoch = current_epoch.value if dashboard_stop_requested or checkpoint_stop_requested else num_train_epochs
             save_model(ckpt_name, network, global_step, final_epoch, force_sync_upload=True)
 
             logger.info("model saved.")
+
+        accelerator.wait_for_everyone()
+        if checkpoint_stop_requested and accelerator.is_main_process:
+            train_utils.consume_checkpoint_request_file(save_and_stop_request_file)
+            if consume_save_request_on_stop:
+                train_utils.consume_checkpoint_request_file(save_request_file)
 
         if dashboard_metrics is not None:
             dashboard_metrics.update_status(

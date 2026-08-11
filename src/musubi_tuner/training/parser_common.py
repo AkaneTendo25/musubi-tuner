@@ -682,6 +682,24 @@ def _add_save_load_args(parser: argparse.ArgumentParser) -> None:
         help="save checkpoint every N steps / 学習中のモデルを指定ステップごとに保存する",
     )
     parser.add_argument(
+        "--save_request_file",
+        type=str,
+        default=None,
+        help=(
+            "save a step checkpoint at the next completed optimizer step when this file exists, then remove it; "
+            "add --save_state to include resumable optimizer/scheduler/RNG state"
+        ),
+    )
+    parser.add_argument(
+        "--save_and_stop_request_file",
+        type=str,
+        default=None,
+        help=(
+            "finish the current optimizer step and stop through the normal final checkpoint path when this file exists, "
+            "then remove it after a successful save"
+        ),
+    )
+    parser.add_argument(
         "--save_last_n_epochs",
         type=int,
         default=None,

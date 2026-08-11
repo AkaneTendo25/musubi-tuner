@@ -372,6 +372,19 @@ scheduler, and step start at zero. Use `--save_state_on_train_end` if only the f
 rejected instead of silently restarting at step zero. Add `--autoresume` to select the highest-step complete state matching
 `--output_name` in `--output_dir`; an explicit `--resume` path takes priority.
 
+For an external save trigger, provide one or both request paths:
+
+```shell
+--save_request_file /workspace/save-now.flag \
+--save_and_stop_request_file /workspace/save-and-stop.flag
+```
+
+Creating the first file (for example, `touch /workspace/save-now.flag`) saves a step checkpoint after the current optimizer
+step and continues training. Creating the second finishes the current optimizer step and uses the normal final save path before
+exiting. Rank zero detects each request and broadcasts it to the other workers; the file is removed only after a successful save.
+With `--save_state`, either request also writes resumable optimizer, scheduler, RNG, and dataloader state; otherwise it saves only
+the model checkpoint. Requests received during gradient accumulation wait for the next completed optimizer step.
+
 ### Key options
 
 | Option | Default | Purpose |
