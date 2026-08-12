@@ -1413,18 +1413,41 @@ class LTX2Inferencer:
             self.vae.to_device(self.device)
             with torch.no_grad():
                 if use_tiled_vae and tiled_vae_config:
-                    from musubi_tuner.ltx_2.model.video_vae import TilingConfig, SpatialTilingConfig, TemporalTilingConfig
-
-                    tile_cfg = TilingConfig(
-                        spatial_config=SpatialTilingConfig(
-                            tile_size_in_pixels=tiled_vae_config.get("tile_size", 512),
-                            tile_overlap_in_pixels=tiled_vae_config.get("tile_overlap", 64),
-                        ),
-                        temporal_config=TemporalTilingConfig(
-                            tile_size_in_frames=tiled_vae_config.get("temporal_tile_size", 9999),
-                            tile_overlap_in_frames=tiled_vae_config.get("temporal_tile_overlap", 0),
-                        ),
+                    from musubi_tuner.ltx_2.model.video_vae import (
+                        DiffusionVideoDecoder,
+                        SpatialTilingConfig,
+                        TemporalTilingConfig,
+                        TilingConfig,
                     )
+
+                    decoder = getattr(self.vae, "decoder", None)
+                    if isinstance(decoder, DiffusionVideoDecoder):
+                        from musubi_tuner.ltx_2.tiling import DimensionSizeConfig, TileSizeConfig
+
+                        temporal_size = tiled_vae_config.get("temporal_tile_size", 0)
+                        temporal_overlap = tiled_vae_config.get("temporal_tile_overlap", 0) if temporal_size else 0
+                        tile_cfg = TileSizeConfig(
+                            frames=DimensionSizeConfig(tile_size=temporal_size, overlap=temporal_overlap),
+                            height=DimensionSizeConfig(
+                                tile_size=tiled_vae_config.get("tile_size", 512),
+                                overlap=tiled_vae_config.get("tile_overlap", 64),
+                            ),
+                            width=DimensionSizeConfig(
+                                tile_size=tiled_vae_config.get("tile_size", 512),
+                                overlap=tiled_vae_config.get("tile_overlap", 64),
+                            ),
+                        )
+                    else:
+                        tile_cfg = TilingConfig(
+                            spatial_config=SpatialTilingConfig(
+                                tile_size_in_pixels=tiled_vae_config.get("tile_size", 512),
+                                tile_overlap_in_pixels=tiled_vae_config.get("tile_overlap", 64),
+                            ),
+                            temporal_config=TemporalTilingConfig(
+                                tile_size_in_frames=tiled_vae_config.get("temporal_tile_size", 9999),
+                                tile_overlap_in_frames=tiled_vae_config.get("temporal_tile_overlap", 0),
+                            ),
+                        )
                     video = self.vae.tiled_decode(latents.squeeze(0), tile_cfg)
                 else:
                     video = self.vae.decode([latents.squeeze(0)])

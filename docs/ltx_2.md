@@ -850,6 +850,8 @@ The prompt file format (`--sample_prompts`) — including guidance scale, negati
 | `--sample_vae_tile_overlap` | 64 | Spatial tile overlap (pixels) |
 | `--sample_vae_temporal_tile_size` | 0 | Temporal tile size in frames (0 = disabled) |
 | `--sample_vae_temporal_tile_overlap` | 8 | Temporal tile overlap (frames) |
+
+The LTX-2.5 DiffVAE has a wider receptive field than the convolutional VAE. For long LTX-2.5 samples, use at least `--sample_vae_tile_overlap 160` and `--sample_vae_temporal_tile_overlap 40`; for example, `--sample_vae_tile_size 512 --sample_vae_temporal_tile_size 80`. The legacy convolutional VAE can continue to use 64-pixel and 8-frame overlaps.
 | `--sample_merge_audio` | off | Merge generated audio into the output `.mp4` |
 | `--sample_audio_only` | off | Generate audio-only preview outputs |
 | `--sample_disable_audio` | off | Disable audio preview generation during sampling |
