@@ -261,8 +261,7 @@ class VideoEncoder(nn.Module):
         frames_count = sample.shape[2]
         if ((frames_count - 1) % 8) != 0:
             raise ValueError(
-                "Invalid number of frames: Encode input must have 1 + 8 * x frames "
-                "(e.g., 1, 9, 17, ...). Please check your input."
+                "Invalid number of frames: Encode input must have 1 + 8 * x frames (e.g., 1, 9, 17, ...). Please check your input."
             )
 
         # Initial spatial compression: trade spatial resolution for channel depth
@@ -667,9 +666,7 @@ class VideoDecoder(nn.Module):
 
         if timestep_conditioning:
             self.timestep_scale_multiplier = nn.Parameter(torch.tensor(1000.0))
-            self.last_time_embedder = PixArtAlphaCombinedTimestepSizeEmbeddings(
-                embedding_dim=feature_channels * 2, size_emb_dim=0
-            )
+            self.last_time_embedder = PixArtAlphaCombinedTimestepSizeEmbeddings(embedding_dim=feature_channels * 2, size_emb_dim=0)
             self.last_scale_shift_table = nn.Parameter(torch.empty(2, feature_channels))
 
     # def forward(self, sample: torch.Tensor, target_shape) -> torch.Tensor:
@@ -877,14 +874,10 @@ class VideoDecoder(nn.Module):
                     # the masked values (buffer[...]) and the corresponding weights (curr_weights[...]) into the
                     # previous buffers, then later normalize by weights.
                     previous_chunk[:, :, temporal_overlap_slice, :, :] += buffer[:, :, slice(0, overlap_len), :, :]
-                    previous_weights[:, :, temporal_overlap_slice, :, :] += curr_weights[
-                        :, :, slice(0, overlap_len), :, :
-                    ]
+                    previous_weights[:, :, temporal_overlap_slice, :, :] += curr_weights[:, :, slice(0, overlap_len), :, :]
 
                     buffer[:, :, slice(0, overlap_len), :, :] = previous_chunk[:, :, temporal_overlap_slice, :, :]
-                    curr_weights[:, :, slice(0, overlap_len), :, :] = previous_weights[
-                        :, :, temporal_overlap_slice, :, :
-                    ]
+                    curr_weights[:, :, slice(0, overlap_len), :, :] = previous_weights[:, :, temporal_overlap_slice, :, :]
 
                 # Yield the non-overlapping part of the previous chunk
                 previous_weights = previous_weights.clamp(min=1e-8)
@@ -1182,3 +1175,14 @@ def map_spatial_interval_to_latent(
 
     mask_1d = compute_rectangular_mask_1d(stop - start, left_ramp, right_ramp)
     return slice(start, stop), mask_1d
+
+
+# Upstream names the convolutional implementation explicitly now that the
+# LTX-2.5 diffusion decoder is another VideoDecoder implementation.
+ConvVideoDecoder = VideoDecoder
+
+# Imported after the convolutional implementation is defined because the
+# diffusion decoder reuses its shared VAE operations and package utilities.
+from musubi_tuner.ltx_2.model.video_vae.diffusion_video_decoder import (  # noqa: E402, F401
+    DiffusionVideoDecoder as DiffusionVideoDecoder,
+)

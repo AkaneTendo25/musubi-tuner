@@ -1,4 +1,5 @@
 """Video VAE package."""
+
 from musubi_tuner.ltx_2.model.video_vae.model_configurator import (
     VAE_DECODER_COMFY_KEYS_FILTER,
     VAE_ENCODER_COMFY_KEYS_FILTER,
@@ -6,7 +7,14 @@ from musubi_tuner.ltx_2.model.video_vae.model_configurator import (
     VideoEncoderConfigurator,
 )
 from musubi_tuner.ltx_2.model.video_vae.tiling import SpatialTilingConfig, TemporalTilingConfig, TilingConfig
-from musubi_tuner.ltx_2.model.video_vae.video_vae import VideoDecoder, VideoEncoder, decode_video, get_video_chunks_number
+from musubi_tuner.ltx_2.model.video_vae.video_vae import (
+    ConvVideoDecoder,
+    DiffusionVideoDecoder,
+    VideoDecoder,
+    VideoEncoder,
+    decode_video,
+    get_video_chunks_number,
+)
 
 __all__ = [
     "VAE_DECODER_COMFY_KEYS_FILTER",
@@ -15,6 +23,8 @@ __all__ = [
     "TemporalTilingConfig",
     "TilingConfig",
     "VideoDecoder",
+    "ConvVideoDecoder",
+    "DiffusionVideoDecoder",
     "VideoDecoderConfigurator",
     "VideoEncoder",
     "VideoEncoderConfigurator",

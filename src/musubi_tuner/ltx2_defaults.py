@@ -88,6 +88,25 @@ LTX2_SAMPLING_PRESETS: dict[str, LTX2SamplingPreset] = {
         video_modality_scale=3.0,
         audio_modality_scale=3.0,
     ),
+    # Official LTX-2.5 distilled two-stage recipe. The two-stage inferencer
+    # halves this requested final size for its 960x544 first stage.
+    "ltx25": LTX2SamplingPreset(
+        sample_steps=8,
+        width=1920,
+        height=1088,
+        frame_count=121,
+        frame_rate=24.0,
+        video_cfg_scale=1.0,
+        audio_cfg_scale=1.0,
+        stg_scale=0.0,
+        stg_blocks=[],
+        stg_mode="both",
+        video_rescale_scale=0.0,
+        audio_rescale_scale=0.0,
+        video_modality_scale=1.0,
+        audio_modality_scale=1.0,
+        negative_prompt="",
+    ),
     # Distilled two-stage generation defaults. Callers still need the distilled
     # checkpoint/LoRA and spatial upsampler for the refinement stage.
     "distilled_two_stage": LTX2SamplingPreset(
@@ -114,7 +133,7 @@ def get_ltx2_sampling_preset(name: str | None, *, ltx_version: str = "2.3") -> L
     if not name or name == "legacy":
         return None
     if name == "defaults":
-        name = "ltx23" if str(ltx_version) == "2.3" else "ltx20"
+        name = {"2.3": "ltx23", "2.5": "ltx25"}.get(str(ltx_version), "ltx20")
     try:
         return LTX2_SAMPLING_PRESETS[name]
     except KeyError as exc:

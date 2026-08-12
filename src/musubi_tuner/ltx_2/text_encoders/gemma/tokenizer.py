@@ -27,6 +27,7 @@ class _SentencePieceTokenizerAdapter:
         self.model_max_length = max_length
         self.padding_side = "left"
         self.pad_token_id = self.sp.pad_id() if self.sp.pad_id() >= 0 else self.sp.eos_id()
+        self.bos_token_id = self.sp.bos_id()
         self.eos_token_id = self.sp.eos_id()
         self.pad_token = self.sp.IdToPiece(self.pad_token_id) if self.pad_token_id >= 0 else "<eos>"
         self.eos_token = self.sp.IdToPiece(self.eos_token_id) if self.eos_token_id >= 0 else "<eos>"
@@ -136,6 +137,21 @@ class LTXVGemmaTokenizer:
         )
         input_ids = encoded.input_ids
         attention_mask = encoded.attention_mask
+        bos_token_id = getattr(self.tokenizer, "bos_token_id", None)
+        if bos_token_id is not None:
+            active_ids = input_ids[0][attention_mask[0].bool()].tolist()
+            if not active_ids or active_ids[0] != bos_token_id:
+                active_ids = [bos_token_id, *active_ids[: self.max_length - 1]]
+                pad_len = self.max_length - len(active_ids)
+                pad_id = int(self.tokenizer.pad_token_id)
+                if getattr(self.tokenizer, "padding_side", "right") == "left":
+                    ids = [pad_id] * pad_len + active_ids
+                    mask = [0] * pad_len + [1] * len(active_ids)
+                else:
+                    ids = active_ids + [pad_id] * pad_len
+                    mask = [1] * len(active_ids) + [0] * pad_len
+                input_ids = input_ids.new_tensor([ids])
+                attention_mask = attention_mask.new_tensor([mask])
         tuples = [(token_id, attn, i) for i, (token_id, attn) in enumerate(zip(input_ids[0], attention_mask[0], strict=True))]
         out = {"gemma": tuples}
 

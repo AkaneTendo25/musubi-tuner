@@ -274,6 +274,7 @@ Manual download is still supported, and is useful for managing checkpoints outsi
 - LTX-2 (19B): [ltx-2-19b-dev.safetensors](https://huggingface.co/Lightricks/LTX-2/resolve/main/ltx-2-19b-dev.safetensors)
 - LTX-2.3 (22B): [ltx-2.3-22b-dev.safetensors](https://huggingface.co/Lightricks/LTX-2.3/resolve/main/ltx-2.3-22b-dev.safetensors)
 - LTX-2.5 (22B): [ltx-2.5-22b-dev-transformer-bf16.safetensors](https://huggingface.co/Lightricks/LTX-2.5/resolve/main/diffusion_models/ltx-2.5-22b-dev-transformer-bf16.safetensors)
+- LTX-2.5 distilled inference: [ltx-2.5-22b-distilled-transformer-bf16.safetensors](https://huggingface.co/Lightricks/LTX-2.5/resolve/main/diffusion_models/ltx-2.5-22b-distilled-transformer-bf16.safetensors)
 
 **Gemma Text Encoder**:
 - LTX-2 / LTX-2.3, HF directory (`--gemma_root`): [gemma-3-12b-it-qat-q4_0-unquantized](https://huggingface.co/Lightricks/gemma-3-12b-it-qat-q4_0-unquantized)
@@ -283,6 +284,8 @@ Manual download is still supported, and is useful for managing checkpoints outsi
 **LTX-2.5 VAEs**:
 - Video (`--ltx2_video_vae`, or `--vae` during latent caching): [ltx-2.5-video-vae-bf16.safetensors](https://huggingface.co/Lightricks/LTX-2.5/resolve/main/vae/ltx-2.5-video-vae-bf16.safetensors)
 - Audio (`--ltx2_audio_vae` for audio or AV workflows): [ltx-2.5-audio-vae-bf16.safetensors](https://huggingface.co/Lightricks/LTX-2.5/resolve/main/vae/ltx-2.5-audio-vae-bf16.safetensors)
+
+For official two-stage LTX-2.5 inference, also download the [LTX-2.3 x2 spatial upscaler](https://huggingface.co/Lightricks/LTX-2.3/resolve/main/ltx-2.3-spatial-upscaler-x2-1.1.safetensors). The optional [LTX-2.5 distilled LoRA](https://huggingface.co/Lightricks/LTX-2.5/resolve/main/loras/ltx-2.5-22b-distilled-lora-450-bf16.safetensors) is for applying the distilled recipe to the development transformer.
 
 Other Gemma 3 12B variants may work with LTX-2 / LTX-2.3 but not all have been tested. Use the packed Gemma 4 file for LTX-2.5.
 
@@ -853,7 +856,7 @@ The prompt file format (`--sample_prompts`) — including guidance scale, negati
 | `--sample_audio_subprocess` | on | Decode audio in a subprocess to avoid OOM crashes. Use `--no-sample_audio_subprocess` to decode in-process |
 | `--sample_disable_flash_attn` | off | Force SDPA instead of FlashAttention during sampling |
 | `--sample_i2v_token_timestep_mask` | on | Use I2V token timestep masking (conditioned tokens use t=0). Use `--no-sample_i2v_token_timestep_mask` to disable |
-| `--sample_sampling_preset` | `defaults` | Validation sampling preset. Named values: `defaults` (resolves per `--ltx_version`), `legacy` (bypass preset defaults), `ltx20`, `ltx23`, `ltx23_hq` (full-quality LTX-2.3), and `distilled_two_stage` (distilled two-stage sampling, see [Two-Stage Sampling](#two-stage-sampling)). For `--ltx_version 2.3`, `defaults` resolves to the LTX-2.3 defaults (`30` steps, `768x512`, `121` frames, CFG/STG defaults, CFG rescale `0.7`) |
+| `--sample_sampling_preset` | `defaults` | Validation sampling preset. Named values: `defaults` (resolves per `--ltx_version`), `legacy` (bypass preset defaults), `ltx20`, `ltx23`, `ltx23_hq`, `ltx25`, and `distilled_two_stage`; see [Two-Stage Sampling](#two-stage-sampling). LTX-2.5 defaults to its official distilled two-stage settings. |
 | `--sample_sampler` | `auto` | Denoising sampler. `auto` uses `res_2s` for full LTX presets and Euler for `distilled_two_stage` |
 | `--sample_sigma_schedule` | `auto` | Sigma schedule. `auto` uses latent-aware LTX shifted sigmas and the exact LTX-2.3 distilled schedule for the distilled preset |
 
@@ -2781,7 +2784,11 @@ python ltx2_generate_video.py ^
   --output_dir output/inference
 ```
 
-`--prompt` (or `--sample_prompts <file>`) and `--gemma_root` (or `--gemma_safetensors`) are required; omit `--lora_weight` to sample the base model. For LTX-2.0, pass the 2.0 checkpoint with `--ltx_version 2.0`.
+`--prompt` (or `--sample_prompts <file>`) and a matching Gemma checkpoint are required; omit `--lora_weight` to sample the base model. For LTX-2.0, pass the 2.0 checkpoint with `--ltx_version 2.0`.
+
+For LTX-2.5, use `--ltx_version 2.5`, pass the packed Gemma 4 file with `--ltx2_text_encoder_checkpoint`, and pass the DiffVAE with `--vae`. `--sampling_preset defaults` selects the official distilled two-stage settings: 1920x1088 output from a 960x544 first stage, 121 frames at 24 fps, 8 first-stage steps, 3 refinement steps, CFG 1, and STG 0. It also requires `--spatial_upsampler_path`; use the distilled transformer directly, or the development transformer together with `--distilled_lora_path`. Add `--sample_with_offloading` when the transformer, Gemma, and DiffVAE do not fit simultaneously in VRAM. Use `--sampling_preset legacy` for custom single-stage settings.
+
+Rebuild LTX-2.5 text caches created before Gemma 4 BOS handling was added, and rebuild latent and text caches whenever switching model versions.
 
 `ltx2_generate_video.py` also accepts a few standalone-inference-only overrides that are not part of the training sample table:
 

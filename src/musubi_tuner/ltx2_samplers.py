@@ -9,7 +9,7 @@ def resolve_ltx2_sampler(name: str | None, sampling_preset: str | None = None) -
     sampler = str(name or "auto").lower()
     preset = str(sampling_preset or "").lower()
     if sampler == "auto":
-        return "euler" if preset == "distilled_two_stage" else "res_2s"
+        return "euler" if preset in {"ltx25", "distilled_two_stage"} else "res_2s"
     if sampler not in {"euler", "res_2s"}:
         raise ValueError("sample_sampler must be one of: auto, euler, res_2s")
     return sampler

@@ -23,7 +23,7 @@ dependencies = [
     "toml==0.10.2",
     "tqdm==4.67.1",
     "torch-optimi==0.3.3",
-    "transformers==5.15.0",
+    "transformers>=5.8.0,<5.15",
     "voluptuous==0.15.2",
     # Wan2.1
     "ftfy==6.3.1",

@@ -513,6 +513,7 @@ def main() -> None:
     from musubi_tuner.ltx_2.text_encoders.gemma.encoders.base_encoder import (
         apply_text_encoder_checkpoint_overrides,
         module_ops_from_gemma_root,
+        validate_gemma_checkpoint_compatibility,
     )
     from musubi_tuner.ltx_2.text_encoders.gemma.encoders.video_only_encoder import (
         VIDEO_ONLY_GEMMA_TEXT_ENCODER_KEY_OPS,
@@ -527,6 +528,8 @@ def main() -> None:
         if args.ltx2_checkpoint is not None and str(text_encoder_checkpoint) != str(args.ltx2_checkpoint)
         else str(text_encoder_checkpoint)
     )
+    if args.ltx2_checkpoint is not None:
+        validate_gemma_checkpoint_compatibility(str(args.ltx2_checkpoint), str(text_encoder_checkpoint))
 
     configurator = AVGemmaTextEncoderModelConfigurator if audio_video else VideoGemmaTextEncoderModelConfigurator
     key_ops = AV_GEMMA_TEXT_ENCODER_KEY_OPS if audio_video else VIDEO_ONLY_GEMMA_TEXT_ENCODER_KEY_OPS

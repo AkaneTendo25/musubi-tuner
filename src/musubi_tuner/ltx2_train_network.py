@@ -4607,6 +4607,40 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
         from musubi_tuner.ltx_2.loader.single_gpu_model_builder import SingleGPUModelBuilder
         from musubi_tuner.ltx_2.model.video_vae import VideoDecoderConfigurator, VAE_DECODER_COMFY_KEYS_FILTER
 
+        decoder_configurator = VideoDecoderConfigurator
+        decoder_sd_ops = VAE_DECODER_COMFY_KEYS_FILTER
+        diffusion_vae = False
+        try:
+            from safetensors import safe_open
+
+            with safe_open(str(vae_path), framework="pt") as handle:
+                vae_metadata = json.loads((handle.metadata() or {}).get("config", "{}"))
+            vae_class_name = vae_metadata.get("vae", {}).get("_class_name", "CausalVideoAutoencoder")
+        except Exception as exc:
+            raise ValueError(f"Could not read video VAE metadata from {vae_path}: {exc}") from exc
+
+        if vae_class_name != "CausalVideoAutoencoder":
+            diffusion_vae = True
+            try:
+                from musubi_tuner.ltx_2.model.video_vae.diffusion_model_configurator import (
+                    _build_diffusion_video_decoder,
+                    video_decoder_sd_ops_for_checkpoint,
+                )
+            except ImportError as exc:
+                raise ImportError(
+                    "The vendored LTX-2.5 DiffVAE implementation could not be imported. "
+                    "Reinstall this project with `pip install -e .`."
+                ) from exc
+
+            class DiffusionVideoDecoderConfigurator:
+                @classmethod
+                def from_config(cls, config: dict):
+                    return _build_diffusion_video_decoder(config.get("vae", {}))
+
+            decoder_configurator = DiffusionVideoDecoderConfigurator
+            decoder_sd_ops = video_decoder_sd_ops_for_checkpoint(str(vae_path))
+            logger.info("Using the LTX-2.5 diffusion video decoder")
+
         class _LTX2VideoVAE(torch.nn.Module):
             def __init__(self, decoder: torch.nn.Module):
                 super().__init__()
@@ -4681,9 +4715,15 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
 
         decoder = SingleGPUModelBuilder(
             model_path=str(vae_path),
-            model_class_configurator=VideoDecoderConfigurator,
-            model_sd_ops=VAE_DECODER_COMFY_KEYS_FILTER,
+            model_class_configurator=decoder_configurator,
+            model_sd_ops=decoder_sd_ops,
         ).build(device=torch.device("cpu"), dtype=vae_dtype)
+        if diffusion_vae:
+            from musubi_tuner.ltx_2.model.video_vae.transformer import DiffVAEMode, apply_diffvae_mode
+
+            # Automatically uses the vendored Triton or tiled-SDPA fallback
+            # when an optional NATTEN installation is unavailable.
+            decoder = apply_diffvae_mode(decoder, DiffVAEMode.CHUNKED_EAGER)
         decoder.eval()
         decoder.requires_grad_(False)
 

@@ -1270,7 +1270,7 @@ class LTX2Inferencer:
                 audio_rescale_scale=config.audio_rescale_scale,
                 video_modality_scale=config.video_modality_scale,
                 audio_modality_scale=config.audio_modality_scale,
-                sample_sampler=config.sample_sampler,
+                sample_sampler=resolved_sampler,
             )
 
         # Stage 2: Upsample and refine (if two-stage)
@@ -1400,7 +1400,7 @@ class LTX2Inferencer:
                     audio_rescale_scale=0.0,
                     video_modality_scale=1.0,
                     audio_modality_scale=1.0,
-                    sample_sampler=config.sample_sampler,
+                    sample_sampler=resolved_sampler,
                 )
 
             # Remove distilled LoRA

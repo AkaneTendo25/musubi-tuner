@@ -33,7 +33,7 @@ def build_ltx2_sigmas(
     preset = str(sampling_preset or "").lower()
 
     use_distilled = schedule == "ltx23_distilled" or (
-        schedule == "auto" and preset == "distilled_two_stage" and int(steps) == len(LTX23_DISTILLED_SIGMAS) - 1
+        schedule == "auto" and preset in {"ltx25", "distilled_two_stage"} and int(steps) == len(LTX23_DISTILLED_SIGMAS) - 1
     )
     if use_distilled:
         expected_steps = len(LTX23_DISTILLED_SIGMAS) - 1

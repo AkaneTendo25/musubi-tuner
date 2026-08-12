@@ -599,13 +599,14 @@ class LTX2SamplingMixin:
 
         sample_parameters = []
         preset_key = str(preset_name or "").lower()
-        resolved_preset_key = "ltx23" if preset_key == "defaults" and ltx_version == "2.3" else preset_key
+        resolved_preset_key = {"2.3": "ltx23", "2.5": "ltx25"}.get(ltx_version, "ltx20") if preset_key == "defaults" else preset_key
         warn_ltx23_prompt_overrides = (
             preset is not None and ltx_version == "2.3" and resolved_preset_key in {"ltx23", "ltx23_hq", "distilled_two_stage"}
         )
         for prompt_index, prompt_data in enumerate(prompts):
             prompt_text = prompt_data.get("prompt", "")
             param = prompt_data.copy()
+            param.setdefault("sampling_preset", resolved_preset_key)
             param.setdefault("prompt", prompt_text)
             param.setdefault("negative_prompt", prompt_data.get("negative_prompt", default_negative_prompt))
             if "frame_count" not in param and "num_frames" in param:
@@ -915,6 +916,7 @@ class LTX2SamplingMixin:
         from musubi_tuner.ltx_2.text_encoders.gemma.encoders.base_encoder import (
             apply_text_encoder_checkpoint_overrides,
             module_ops_from_gemma_root,
+            validate_gemma_checkpoint_compatibility,
         )
         from musubi_tuner.ltx_2.text_encoders.gemma.encoders.video_only_encoder import (
             VIDEO_ONLY_GEMMA_TEXT_ENCODER_KEY_OPS,
@@ -944,7 +946,11 @@ class LTX2SamplingMixin:
             bnb_device_map = {"": local_rank}
             logger.info("Gemma quantized load: using LOCAL_RANK device_map %s", bnb_device_map)
 
-        text_encoder_checkpoint = getattr(args, "ltx2_text_encoder_checkpoint", None) or args.ltx2_checkpoint
+        text_encoder_checkpoint = getattr(args, "ltx2_text_encoder_checkpoint", None)
+        if text_encoder_checkpoint is None and str(getattr(args, "ltx_version", "")) == "2.5":
+            text_encoder_checkpoint = gemma_safetensors
+        text_encoder_checkpoint = text_encoder_checkpoint or args.ltx2_checkpoint
+        validate_gemma_checkpoint_compatibility(str(args.ltx2_checkpoint), str(text_encoder_checkpoint))
         builder_model_paths = (
             (str(args.ltx2_checkpoint), str(text_encoder_checkpoint))
             if str(text_encoder_checkpoint) != str(args.ltx2_checkpoint)

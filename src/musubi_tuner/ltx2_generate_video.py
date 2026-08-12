@@ -294,6 +294,18 @@ def parse_args() -> argparse.Namespace:
         help="Path to separate VAE checkpoint (defaults to --ltx2_checkpoint).",
     )
     parser.add_argument(
+        "--ltx2_text_encoder_checkpoint",
+        type=str,
+        default=None,
+        help="Packed LTX-2.5 Gemma text encoder and projection checkpoint.",
+    )
+    parser.add_argument(
+        "--ltx2_audio_vae",
+        type=str,
+        default=None,
+        help="Separate audio VAE/vocoder checkpoint for audio or AV generation.",
+    )
+    parser.add_argument(
         "--vae_dtype",
         type=str,
         default=None,
@@ -372,7 +384,7 @@ def parse_args() -> argparse.Namespace:
         "--sample_sampling_preset",
         type=str,
         default="defaults",
-        choices=["legacy", "defaults", "ltx20", "ltx23", "ltx23_hq", "distilled_two_stage"],
+        choices=["legacy", "defaults", "ltx20", "ltx23", "ltx23_hq", "ltx25", "distilled_two_stage"],
         help="Generation defaults. Use 'legacy' for the old 512x768/20-step/no-guidance defaults.",
     )
     parser.add_argument(
@@ -821,6 +833,9 @@ def parse_args() -> argparse.Namespace:
             raise ValueError("--ltx2_soft_av_alignment requires --sdpa or --attn_mode sdpa")
 
     preset = get_ltx2_sampling_preset(args.sampling_preset, ltx_version=args.ltx_version)
+    if args.sampling_preset == "defaults" and args.ltx_version == "2.5":
+        args.sampling_preset = "ltx25"
+        args.sample_sampling_preset = "ltx25"
     if preset is None:
         args.height = 512 if args.height is None else args.height
         args.width = 768 if args.width is None else args.width
@@ -858,7 +873,7 @@ def parse_args() -> argparse.Namespace:
             args.use_default_negative_prompt = bool(preset.negative_prompt)
         if args.negative_prompt is None and args.use_default_negative_prompt:
             args.negative_prompt = preset.negative_prompt
-        if args.sampling_preset == "distilled_two_stage":
+        if args.sampling_preset in {"ltx25", "distilled_two_stage"}:
             args.sample_two_stage = True
 
     args.video_cfg_scale = args.guidance_scale if args.video_cfg_scale is None else args.video_cfg_scale
@@ -1157,6 +1172,10 @@ def main() -> None:
             return
 
     logger.info("Generating %d sample(s)...", len(prompts))
+    sample_output_dir = os.path.join(args.output_dir, "sample")
+    outputs_before = set()
+    if os.path.isdir(sample_output_dir):
+        outputs_before = {entry.path for entry in os.scandir(sample_output_dir) if entry.is_file()}
 
     # Set sampling gate args so should_sample_images() passes at step 0
     args.sample_at_first = True
@@ -1182,7 +1201,12 @@ def main() -> None:
         dit_dtype=trainer.dit_dtype or torch.float32,
     )
 
-    logger.info("Generation complete. Outputs saved to %s", os.path.join(args.output_dir, "sample"))
+    outputs_after = (
+        {entry.path for entry in os.scandir(sample_output_dir) if entry.is_file()} if os.path.isdir(sample_output_dir) else set()
+    )
+    if not outputs_after.difference(outputs_before):
+        raise RuntimeError("Generation failed: no output file was produced. See the sampling error above.")
+    logger.info("Generation complete. Outputs saved to %s", sample_output_dir)
 
 
 if __name__ == "__main__":
