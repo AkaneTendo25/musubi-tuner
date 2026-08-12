@@ -4,7 +4,7 @@
 	import FormToggle from './FormToggle.svelte';
 	import PathInput from './PathInput.svelte';
 
-	let { entry = {}, index = 0, title = '', onRemove, onchange, advanced = false, sourceError = '' } = $props();
+	let { entry = {}, index = 0, title = '', onRemove, onchange, advanced = false, isH3 = false, sourceError = '' } = $props();
 
 	function emit(nextEntry) {
 		if (onchange) {
@@ -54,7 +54,9 @@
 		usesReferenceDirectory ? 'Extra Reference Dirs' : 'Extra Control Dirs'
 	);
 	const sourceDirectoryTooltip = $derived(
-		usesReferenceDirectory
+		isH3
+			? 'Stem-matched H3 reference images, videos, or audio. Set the reference modality below when a video should contribute only video or only audio.'
+			: usesReferenceDirectory
 			? 'Directory with reference images/videos. When Reference Cache Dir is set, this is exported as reference_directory for IC-LoRA datasets.'
 			: 'Directory with control images/videos (e.g. depth maps, edges).'
 	);
@@ -171,6 +173,84 @@
 			min={1}
 			tooltip="Number of times to repeat this dataset per epoch"
 		/>
+
+		{#if isH3}
+			<div class="pt-3 space-y-3" style="border-top: 1px solid var(--border-subtle);">
+				<span class="text-[11px] font-medium uppercase tracking-wider" style="color: var(--text-muted);">MiniMax H3</span>
+				<FormSelect
+					label="Target Modalities"
+					value={entry.h3_target_mode || 'av'}
+					onchange={(e) => updateField('h3_target_mode', e.target.value)}
+					options={[{value:'av',label:'Video + audio'},{value:'video',label:'Video only'},{value:'audio',label:'Audio only'}]}
+					tooltip="Outputs supervised by this dataset. Audio-only needs an audio dataset; image targets always train video."
+				/>
+				{#if !isVideo && !isAudio}
+					<div class="grid grid-cols-2 gap-3">
+						<FormField
+							label="Image Target Frames"
+							type="number"
+							value={entry.h3_image_frame_count ?? ''}
+							oninput={(e) => updateNumberField('h3_image_frame_count', e.target.value, true)}
+							min={5}
+							placeholder="Caching setting"
+							tooltip="Optional 17n+5 output frame count for conditioned image training; examples are 5, 22, and 39."
+						/>
+						<FormToggle
+							label="Ordered Image Targets"
+							checked={entry.multiple_target ?? false}
+							onchange={(e) => updateField('multiple_target', e.target.checked)}
+							tooltip="Use stem-numbered images as an ordered target sequence instead of repeating one still image."
+						/>
+					</div>
+				{/if}
+				{#if !isAudio}
+					<PathInput
+						label="H3 Reference Directory"
+						value={entry.control_directory || ''}
+						oninput={(e) => updateField('control_directory', e.target.value)}
+						placeholder="Optional"
+						tooltip={sourceDirectoryTooltip}
+					/>
+					<div class="grid grid-cols-2 gap-3">
+						<PathInput
+							label="Paired Reference Video"
+							value={entry.control_video_directory || ''}
+							oninput={(e) => updateField('control_video_directory', e.target.value)}
+							placeholder="Optional"
+							tooltip="Stem-matched reference videos. Set together with Paired Reference Audio to replace each video's soundtrack."
+						/>
+						<PathInput
+							label="Paired Reference Audio"
+							value={entry.control_audio_directory || ''}
+							oninput={(e) => updateField('control_audio_directory', e.target.value)}
+							placeholder="Optional"
+							tooltip="Stem-matched audio paired with the reference video directory. Both paired directories are required."
+						/>
+					</div>
+					<FormSelect
+						label="Reference Modality"
+						value={entry.control_modality || ''}
+						onchange={(e) => updateField('control_modality', e.target.value)}
+						options={[{value:'',label:'Use source modality'},{value:'av',label:'Video + audio'},{value:'video',label:'Visual only'},{value:'audio',label:'Audio only'}]}
+						tooltip="Apply one modality policy to every reference. Use the per-reference list below when references have different roles."
+					/>
+					{#if advanced}
+						<FormField
+							label="Per-Reference Modalities"
+							value={entry.control_modalities || ''}
+							oninput={(e) => updateField('control_modalities', e.target.value)}
+							placeholder="video;av;audio"
+							tooltip="Semicolon-separated role for each ordered reference. Do not combine with a fixed modality or probabilities."
+						/>
+						<div class="grid grid-cols-3 gap-3">
+							<FormField label="Random AV" type="number" value={entry.control_modality_probability_av ?? ''} oninput={(e) => updateNumberField('control_modality_probability_av', e.target.value, true)} min={0} max={1} step={0.05} placeholder="Off" tooltip="Probability of retaining video and audio from references. Set all three probabilities; they must sum to 1." />
+							<FormField label="Random Video" type="number" value={entry.control_modality_probability_video ?? ''} oninput={(e) => updateNumberField('control_modality_probability_video', e.target.value, true)} min={0} max={1} step={0.05} placeholder="Off" tooltip="Probability of visual-only reference conditioning." />
+							<FormField label="Random Audio" type="number" value={entry.control_modality_probability_audio ?? ''} oninput={(e) => updateNumberField('control_modality_probability_audio', e.target.value, true)} min={0} max={1} step={0.05} placeholder="Off" tooltip="Probability of audio-only reference conditioning." />
+						</div>
+					{/if}
+				{/if}
+			</div>
+		{/if}
 
 		{#if isVideo}
 			<div class="pt-3 space-y-3" style="border-top: 1px solid var(--border-subtle);">
@@ -324,7 +404,7 @@
 				</div>
 			</div>
 		{/if}
-		{#if advanced && !isAudio}
+		{#if advanced && !isAudio && !isH3}
 			<PathInput
 				label={sourceDirectoryLabel}
 				value={entry.control_directory}

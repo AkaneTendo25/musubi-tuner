@@ -71,6 +71,47 @@ test('H3 text caching models Qwen3-VL quantization rather than Gemma', () => {
 	assert.ok(nf4.total < bf16.total);
 });
 
+test('H3 sequential batches do not multiply peak activation memory', () => {
+	const one = estimateTraining(config());
+	const fourConfig = config();
+	fourConfig.dataset.datasets[0].batch_size = 4;
+	const four = estimateTraining(fourConfig);
+
+	assert.equal(four.total, one.total);
+});
+
+test('H3 mixed datasets use the largest packed sequence for peak VRAM', () => {
+	const mixed = config();
+	mixed.dataset.datasets.unshift({ type: 'image', resolution_w: 256, resolution_h: 256, h3_image_frame_count: 1 });
+	const videoOnly = config();
+
+	assert.equal(estimateTraining(mixed).total, estimateTraining(videoOnly).total);
+});
+
+test('H3 latent-cache estimate uses the largest pixel workload', () => {
+	const mixed = config();
+	mixed.caching = { model_type: 'minimax_h3' };
+	mixed.dataset.datasets = [
+		{ type: 'image', resolution_w: 256, resolution_h: 256 },
+		{ type: 'video', resolution_w: 832, resolution_h: 480, target_frames: 124 },
+	];
+	const videoOnly = config();
+	videoOnly.caching = { model_type: 'minimax_h3' };
+
+	assert.equal(estimateLatentCaching(mixed).total, estimateLatentCaching(videoOnly).total);
+});
+
+test('H3 reference-video conditioning increases the packed-sequence estimate', () => {
+	const base = estimateTraining(config());
+	const referenceConfig = config();
+	referenceConfig.caching = { model_type: 'minimax_h3', h3_task: 'ref2va' };
+	referenceConfig.dataset.datasets[0].reference_video_directory = '/references';
+	referenceConfig.dataset.datasets[0].reference_frames = 124;
+	const reference = estimateTraining(referenceConfig);
+
+	assert.ok(partValue(reference, 'Activ.') > partValue(base, 'Activ.'));
+});
+
 test('H3 long-sequence estimate stays near the measured 73.2 GiB workbox baseline', () => {
 	const estimate = estimateTraining(config());
 

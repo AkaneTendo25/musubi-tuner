@@ -4,7 +4,7 @@
 	import StatsPanel from '$lib/components/StatsPanel.svelte';
 	import VramEstimateCard from '$lib/components/VramEstimateCard.svelte';
 	import { CACHE_THEN_TRAIN_STAGES, buildCacheThenTrainIdleSummary, buildCacheThenTrainProgress, isProcessActive, prepareCacheThenTrainConfig } from '$lib/utils/cacheWorkflow.js';
-	import { defaultModelDir, effectiveGemmaRoot, effectiveLtx2Checkpoint } from '$lib/utils/modelPaths.js';
+	import { defaultModelDir } from '$lib/utils/modelPaths.js';
 	import { estimateLatentCaching as estimateLatentCachingVram, estimateTextCaching as estimateTextCachingVram, estimateTraining as estimateTrainingVram } from '$lib/utils/vramEstimate.js';
 	import { projectConfig, projectLoaded, createProject, loadProjectFromPath, saveProjectDebounced, saveProjectNow, recentProjects, removeRecentProject, restoreRecentProject, closeProject } from '$lib/stores/project.js';
 	import { processLogs, processStatuses, preloadLogsIfActive, startLogPolling, startProcess, stopProcess, refreshStatuses } from '$lib/stores/processes.js';
@@ -19,7 +19,6 @@
 	let projectDirCheckPending = $state(false);
 	let systemInfo = $state(null);
 	let cwd = $state('');
-	let selectedLoraFamily = $state('t2v');
 	let selectedMemoryProfile = $state('regular');
 	let removedRecentProjects = $state([]);
 	let recentProjectSummaries = $state({});
@@ -36,83 +35,8 @@
 	let workflowStatsSnapshot = '';
 	let workflowStatsTimer = null;
 
-	const LTX_DOCS_FALLBACK_URL = 'https://github.com/AkaneTendo25/musubi-tuner/blob/ltx-2/docs/ltx_2.md';
 	const H3_DOCS_FALLBACK_URL = 'https://github.com/AkaneTendo25/musubi-tuner/blob/minimax-h3/docs/minimax_h3.md';
-	const TEMPLATE_VARIANTS_DISABLED = false;
 	const CACHE_THEN_TRAIN_SESSION_KEY = 'musubi.cacheThenTrain.engaged';
-
-	const LORA_FAMILIES = [
-		{
-			id: 't2v',
-			label: 'T2V',
-			blurb: 'Flexible T2V: generate video and audio from text with no extra conditions.'
-		},
-		{
-			id: 'i2v',
-			label: 'I2V',
-			blurb: 'I2V: generate video and audio while using the first video frame as clean conditioning.'
-		},
-		{
-			id: 'video_extension',
-			label: 'Video Extension',
-			blurb: 'Generate video and audio while using clean video prefix or suffix frames as temporal context.'
-		},
-		{
-			id: 'v2v_ic',
-			label: 'V2V IC-LoRA',
-			blurb: 'Reference video/image conditioning for identity, subject, or style transfer.'
-		},
-		{
-			id: 'video_inpainting',
-			label: 'Video Inpainting',
-			blurb: 'Fill masked video regions; mask > threshold is clean conditioning and excluded from loss.'
-		},
-		{
-			id: 'video_outpainting',
-			label: 'Video Outpainting',
-			blurb: 'Keep a spatial crop clean and train the surrounding video content.'
-		},
-		{
-			id: 'a2v',
-			label: 'A2V',
-			blurb: 'Audio-to-video: freeze audio as clean conditioning and train video.'
-		},
-		{
-			id: 'v2a',
-			label: 'V2A',
-			blurb: 'Video-to-audio: freeze video as clean conditioning and train audio/foley.'
-		},
-		{
-			id: 't2a',
-			label: 'T2A',
-			blurb: 'Text-to-audio baseline with audio-only training defaults.'
-		},
-		{
-			id: 'audio_extension',
-			label: 'Audio Extension',
-			blurb: 'Train audio continuation from clean prefix or suffix context.'
-		},
-		{
-			id: 'audio_inpainting',
-			label: 'Audio Inpainting',
-			blurb: 'Fill masked audio regions; mask > threshold is clean conditioning and excluded from loss.'
-		},
-		{
-			id: 'a2a',
-			label: 'A2A',
-			blurb: 'Reference-audio conditioning for audio identity or timbre transfer.'
-		},
-		{
-			id: 'av2av_ic',
-			label: 'AV2AV IC-LoRA',
-			blurb: 'Joint video and audio reference conditioning.'
-		},
-		{
-			id: 'slider',
-			label: 'Slider',
-			blurb: 'Create a slider training project while keeping the standard LTX-2 project defaults available.'
-		}
-	];
 
 	const MEMORY_PROFILES = [
 		{
@@ -132,10 +56,7 @@
 		}
 	];
 
-	let activeLoraFamily = $derived(LORA_FAMILIES.find((item) => item.id === selectedLoraFamily) || LORA_FAMILIES[0]);
 	let activeMemoryProfile = $derived(MEMORY_PROFILES.find((item) => item.id === selectedMemoryProfile) || MEMORY_PROFILES[1]);
-	let ltxDocsUrl = $derived(systemInfo?.repo?.docs_url || LTX_DOCS_FALLBACK_URL);
-	let ltxDocsBranch = $derived(systemInfo?.repo?.docs_branch || systemInfo?.repo?.branch || 'ltx-2');
 	let selectedDocsUrl = $derived(H3_DOCS_FALLBACK_URL);
 	let selectedDocsLabel = $derived('MiniMax H3 docs');
 	let selectedBranchLabel = $derived('minimax-h3');
@@ -144,28 +65,6 @@
 	let newProjectDir = $derived(repoRoot && newProjectSlug ? `${repoRoot}/projects/${newProjectSlug}` : '');
 
 	let projectDirCheckSeq = 0;
-
-	function emptyConditioningModality() {
-		return { is_generated: true, conditions: [] };
-	}
-
-	function emptyConditioningRecipe() {
-		return { enabled: false, per_sample_loss: 'auto', video: emptyConditioningModality(), audio: emptyConditioningModality() };
-	}
-
-	function conditioningCondition(type, overrides = {}) {
-		return {
-			type,
-			probability: null,
-			invert: false,
-			threshold: 0.5,
-			prefix: type === 'extend' ? 1 : 0,
-			suffix: 0,
-			prefix_p: null,
-			suffix_p: null,
-			...overrides,
-		};
-	}
 
 	onMount(async () => {
 		try {
@@ -247,332 +146,6 @@
 		return slug || 'project';
 	}
 
-	function buildTemplateConfig(loraFamily, memoryProfile, defaultLtx, defaultGemma) {
-		const repoOutputDir = repoRoot ? `${repoRoot}/output/${newProjectSlug}` : `output/${newProjectSlug}`;
-		const repoLoggingDir = repoRoot ? `${repoRoot}/logs/${newProjectSlug}` : `logs/${newProjectSlug}`;
-		const shared = {
-			version: 2,
-			default_ltx2_checkpoint: defaultLtx,
-			default_gemma_root: defaultGemma,
-			default_gemma_safetensors: '',
-			caching: {
-				ltx2_checkpoint: defaultLtx,
-				gemma_root: defaultGemma,
-				ltx2_mode: 'video',
-				mixed_precision: 'bf16',
-			},
-			training: {
-				ltx2_checkpoint: defaultLtx,
-				gemma_root: defaultGemma,
-				ltx2_mode: 'video',
-				ltx_version: '2.3',
-				mixed_precision: 'bf16',
-				fp8_base: true,
-				fp8_scaled: true,
-				sdpa: true,
-				sample_sampling_preset: 'defaults',
-				lora_target_preset: 't2v',
-				ic_lora_strategy: 'auto',
-				ltx2_first_frame_conditioning_p: 0,
-				conditioning_recipe: emptyConditioningRecipe(),
-				network_dim: 32,
-				network_alpha: 32,
-				optimizer_type: 'adamw8bit',
-				learning_rate: 1e-4,
-				gradient_checkpointing: true,
-				timestep_sampling: 'shifted_logit_normal',
-				output_dir: repoOutputDir,
-				autoresume: true,
-				save_every_n_steps: 400,
-				save_state: true,
-				logging_dir: repoLoggingDir,
-				accelerate_extra_args: '--num_processes 1 --num_machines 1 --num_cpu_threads_per_process 1',
-				max_data_loader_n_workers: 1,
-			},
-			inference: {
-				ltx2_checkpoint: defaultLtx,
-				gemma_root: defaultGemma,
-				ltx2_mode: 'video',
-				sampling_preset: 'defaults',
-			},
-			slider: {
-				mode: 'text',
-				output_name: 'ltx2_slider',
-				accelerate_extra_args: '--num_processes 1 --num_machines 1 --num_cpu_threads_per_process 1',
-			},
-		};
-
-		let familyConfig = shared;
-		if (loraFamily === 't2v') {
-			familyConfig = {
-				...shared,
-				caching: { ...shared.caching, ltx2_mode: 'av' },
-				training: { ...shared.training, ltx2_mode: 'av' },
-				inference: { ...shared.inference, ltx2_mode: 'av' },
-			};
-		} else if (loraFamily === 'i2v') {
-			familyConfig = {
-				...shared,
-				caching: { ...shared.caching, ltx2_mode: 'av' },
-				training: {
-					...shared.training,
-					ltx2_mode: 'av',
-					conditioning_recipe: {
-						enabled: true,
-						per_sample_loss: 'auto',
-						video: { is_generated: true, conditions: [conditioningCondition('first_frame', { probability: 1.0 })] },
-						audio: emptyConditioningModality(),
-					},
-				},
-				inference: { ...shared.inference, sample_include_reference: true },
-			};
-		} else if (loraFamily === 'video_extension') {
-			familyConfig = {
-				...shared,
-				caching: { ...shared.caching, ltx2_mode: 'av' },
-				training: {
-					...shared.training,
-					ltx2_mode: 'av',
-					conditioning_recipe: {
-						enabled: true,
-						per_sample_loss: 'auto',
-						video: { is_generated: true, conditions: [conditioningCondition('extend', { prefix: 8, suffix: 0, probability: 1.0 })] },
-						audio: emptyConditioningModality(),
-					},
-				},
-			};
-		} else if (loraFamily === 'v2v_ic') {
-			familyConfig = {
-				...shared,
-				caching: { ...shared.caching, reference_frames: 1, reference_downscale: 1 },
-				training: {
-					...shared.training,
-					lora_target_preset: 'v2v',
-					ic_lora_strategy: 'v2v',
-					conditioning_recipe: {
-						enabled: true,
-						per_sample_loss: 'auto',
-						video: { is_generated: true, conditions: [conditioningCondition('reference', { probability: 1.0 })] },
-						audio: emptyConditioningModality(),
-					},
-				},
-				inference: { ...shared.inference, sample_include_reference: true },
-			};
-		} else if (loraFamily === 'video_inpainting') {
-			familyConfig = {
-				...shared,
-				training: {
-					...shared.training,
-					conditioning_recipe: {
-						enabled: true,
-						per_sample_loss: 'auto',
-						video: { is_generated: true, conditions: [conditioningCondition('inpaint', { probability: 1.0 })] },
-						audio: emptyConditioningModality(),
-					},
-				},
-			};
-		} else if (loraFamily === 'video_outpainting') {
-			familyConfig = {
-				...shared,
-				training: {
-					...shared.training,
-					conditioning_recipe: {
-						enabled: true,
-						per_sample_loss: 'auto',
-						video: { is_generated: true, conditions: [conditioningCondition('spatial_crop', { probability: 1.0 })] },
-						audio: emptyConditioningModality(),
-					},
-				},
-			};
-		} else if (loraFamily === 'a2v') {
-			familyConfig = {
-				...shared,
-				caching: { ...shared.caching, ltx2_mode: 'av' },
-				training: {
-					...shared.training,
-					ltx2_mode: 'av',
-					conditioning_recipe: {
-						enabled: true,
-						per_sample_loss: 'auto',
-						video: emptyConditioningModality(),
-						audio: { is_generated: false, conditions: [] },
-					},
-				},
-				inference: { ...shared.inference, ltx2_mode: 'av' },
-			};
-		} else if (loraFamily === 'v2a') {
-			familyConfig = {
-				...shared,
-				caching: { ...shared.caching, ltx2_mode: 'av' },
-				training: {
-					...shared.training,
-					ltx2_mode: 'av',
-					lora_target_preset: 'audio_v2a',
-					conditioning_recipe: {
-						enabled: true,
-						per_sample_loss: 'auto',
-						video: { is_generated: false, conditions: [] },
-						audio: emptyConditioningModality(),
-					},
-				},
-				inference: { ...shared.inference, ltx2_mode: 'av' },
-			};
-		} else if (loraFamily === 't2a') {
-			familyConfig = {
-				...shared,
-				caching: { ...shared.caching, ltx2_mode: 'audio' },
-				training: { ...shared.training, ltx2_mode: 'audio', lora_target_preset: 'audio' },
-				inference: { ...shared.inference, ltx2_mode: 'audio' },
-			};
-		} else if (loraFamily === 'audio_extension') {
-			familyConfig = {
-				...shared,
-				caching: { ...shared.caching, ltx2_mode: 'audio' },
-				training: {
-					...shared.training,
-					ltx2_mode: 'audio',
-					lora_target_preset: 'audio',
-					conditioning_recipe: {
-						enabled: true,
-						per_sample_loss: 'auto',
-						video: emptyConditioningModality(),
-						audio: { is_generated: true, conditions: [conditioningCondition('extend', { prefix: 8, suffix: 0, probability: 1.0 })] },
-					},
-				},
-				inference: { ...shared.inference, ltx2_mode: 'audio' },
-			};
-		} else if (loraFamily === 'audio_inpainting') {
-			familyConfig = {
-				...shared,
-				caching: { ...shared.caching, ltx2_mode: 'audio' },
-				training: {
-					...shared.training,
-					ltx2_mode: 'audio',
-					lora_target_preset: 'audio',
-					conditioning_recipe: {
-						enabled: true,
-						per_sample_loss: 'auto',
-						video: emptyConditioningModality(),
-						audio: { is_generated: true, conditions: [conditioningCondition('inpaint', { probability: 1.0 })] },
-					},
-				},
-				inference: { ...shared.inference, ltx2_mode: 'audio' },
-			};
-		} else if (loraFamily === 'a2a') {
-			familyConfig = {
-				...shared,
-				caching: { ...shared.caching, ltx2_mode: 'audio' },
-				training: {
-					...shared.training,
-					ltx2_mode: 'audio',
-					lora_target_preset: 'audio',
-					ic_lora_strategy: 'audio_ref_ic',
-					conditioning_recipe: {
-						enabled: true,
-						per_sample_loss: 'auto',
-						video: emptyConditioningModality(),
-						audio: { is_generated: true, conditions: [conditioningCondition('reference')] },
-					},
-				},
-				inference: { ...shared.inference, ltx2_mode: 'audio' },
-			};
-		} else if (loraFamily === 'av2av_ic') {
-			familyConfig = {
-				...shared,
-				caching: { ...shared.caching, ltx2_mode: 'av', reference_frames: 1, reference_downscale: 1 },
-				training: {
-					...shared.training,
-					ltx2_mode: 'av',
-					lora_target_preset: 'av_ic',
-					ic_lora_strategy: 'av_ic',
-					conditioning_recipe: {
-						enabled: true,
-						per_sample_loss: 'auto',
-						video: { is_generated: true, conditions: [conditioningCondition('reference', { probability: 1.0 })] },
-						audio: { is_generated: true, conditions: [conditioningCondition('reference')] },
-					},
-				},
-				inference: { ...shared.inference, ltx2_mode: 'av', sample_include_reference: true },
-			};
-		}
-
-		if (memoryProfile === 'high') {
-			return {
-				...familyConfig,
-				caching: {
-					...familyConfig.caching,
-					gemma_load_in_8bit: false,
-					gemma_load_in_4bit: false,
-				},
-				training: {
-					...familyConfig.training,
-					gradient_checkpointing: true,
-					fp8_base: true,
-					fp8_scaled: true,
-					gemma_load_in_8bit: false,
-					gemma_load_in_4bit: false,
-				},
-				inference: {
-					...familyConfig.inference,
-					fp8_base: false,
-					gemma_load_in_8bit: false,
-					gemma_load_in_4bit: false,
-					offloading: false,
-				},
-			};
-		}
-
-		if (memoryProfile === 'low') {
-			return {
-				...familyConfig,
-				caching: {
-					...familyConfig.caching,
-					gemma_load_in_8bit: false,
-					gemma_load_in_4bit: true,
-				},
-				training: {
-					...familyConfig.training,
-					gradient_checkpointing: true,
-					fp8_base: true,
-					fp8_scaled: true,
-					gemma_load_in_8bit: false,
-					gemma_load_in_4bit: true,
-				},
-				inference: {
-					...familyConfig.inference,
-					fp8_base: true,
-					gemma_load_in_8bit: false,
-					gemma_load_in_4bit: true,
-					offloading: true,
-				},
-			};
-		}
-
-		return {
-			...familyConfig,
-			caching: {
-				...familyConfig.caching,
-				gemma_load_in_8bit: true,
-				gemma_load_in_4bit: false,
-			},
-			training: {
-				...familyConfig.training,
-				gradient_checkpointing: true,
-				fp8_base: true,
-				fp8_scaled: true,
-				gemma_load_in_8bit: true,
-				gemma_load_in_4bit: false,
-			},
-			inference: {
-				...familyConfig.inference,
-				fp8_base: false,
-				gemma_load_in_8bit: true,
-				gemma_load_in_4bit: false,
-				offloading: false,
-			},
-		};
-	}
-
 	function buildH3TemplateConfig(memoryProfile) {
 		const repoOutputDir = repoRoot ? `${repoRoot}/output/${newProjectSlug}` : `output/${newProjectSlug}`;
 		const repoLoggingDir = repoRoot ? `${repoRoot}/logs/${newProjectSlug}` : `logs/${newProjectSlug}`;
@@ -591,7 +164,7 @@
 				model_type: 'minimax_h3',
 				h3_training_mode: 'fl2va',
 				h3_loss_balance: 'modality',
-				h3_base_preservation_loss_weight: 0.02,
+				h3_base_preservation_loss_weight: 0.0,
 				mixed_precision: 'bf16',
 				fp8_base: false,
 				fp8_scaled: false,
@@ -640,9 +213,6 @@
 		creating = true;
 		try {
 			const modelDir = defaultModelDir(cwd, null);
-			const seedConfig = { model_dir: modelDir };
-			const defaultLtx = effectiveLtx2Checkpoint(cwd, seedConfig, '');
-			const defaultGemma = effectiveGemmaRoot(cwd, seedConfig, '', '');
 			const templateConfig = buildH3TemplateConfig(selectedMemoryProfile);
 			await createProject({
 				name: newProjectName,
@@ -879,229 +449,6 @@
 		}
 	}
 
-	// VRAM estimation helpers
-	function gemmaSize(cfg) {
-		// Gemma 3 12B: ~24GB fp16, ~12GB 8bit, ~6GB 4bit
-		if (cfg?.gemma_load_in_4bit) return 6;
-		if (cfg?.gemma_load_in_8bit) return 12;
-		return 24;
-	}
-
-	function vaeSize(cfg) {
-		// LTX-2 VAE: ~1.5GB bf16/fp16, ~3GB fp32
-		const dtype = cfg?.vae_dtype || 'bfloat16';
-		return dtype === 'float32' ? 3.0 : 1.5;
-	}
-
-	// Three separate VRAM estimations
-	function estimateLatentCaching(cfg) {
-		if (!cfg?.caching) return null;
-		const c = cfg.caching;
-		const vae = vaeSize(c);
-		// VAE activation memory scales with input resolution and frames.
-		// Base: ~2.5 GB for 512x768x33f. Scales roughly proportional to pixel*frame count.
-		const allDatasets = cfg?.dataset?.datasets || [];
-		const ds = allDatasets.find((d) => d?.type === 'video' || d?.type === 'image') || allDatasets[0] || {};
-		const resW = Math.max(Number(ds.resolution_w || 768), 64);
-		const resH = Math.max(Number(ds.resolution_h || 512), 64);
-		const frames = Math.max(Number(ds.target_frames || 33), 1);
-		const basePixelFrames = 512 * 768 * 33;
-		const pixelFrames = resW * resH * frames;
-		const resScale = Math.max(0.5, Math.min(pixelFrames / basePixelFrames, 4.0));
-		// VAE tiling reduces activation memory significantly
-		const hasSpatialTiling = !!(c.vae_spatial_tile_size || c.vae_chunk_size);
-		const hasTemporalTiling = !!c.vae_temporal_tile_size;
-		const tilingFactor = (hasSpatialTiling && hasTemporalTiling) ? 0.2 :
-			hasSpatialTiling ? 0.3 : hasTemporalTiling ? 0.5 : 1.0;
-		const buffer = 2.5 * resScale * tilingFactor;
-		const total = vae + buffer;
-		return {
-			total: Math.max(total, 1),
-			parts: [
-				{ label: 'VAE', value: vae, color: 'var(--accent)' },
-				{ label: 'Activations', value: buffer, color: 'var(--info)' },
-			]
-		};
-	}
-
-	function estimateTextCaching(cfg) {
-		if (!cfg?.caching) return null;
-		const c = cfg.caching;
-		const gemma = gemmaSize(c);
-		// Buffer for embeddings and intermediate tensors
-		const buffer = 2.0;
-		const total = gemma + buffer;
-		return {
-			total: Math.max(total, 1),
-			parts: [
-				{ label: 'Gemma', value: gemma, color: 'var(--accent)' },
-				{ label: 'Buffer', value: buffer, color: 'var(--info)' },
-			]
-		};
-	}
-
-	function estimateTraining(cfg) {
-		if (!cfg?.training) return null;
-		const t = cfg.training;
-		const allDatasets = cfg?.dataset?.datasets || [];
-		const ds = allDatasets.find((d) => d?.type === 'video' || d?.type === 'image') || allDatasets[0] || {};
-
-		// ── DiT weights ──
-		// LTX-2 DiT: 48 transformer blocks. VAE/Gemma NOT resident during training.
-		// LTX 2.0: ~19.6B params → BF16 39 GB, FP8 19.5 GB, FP32 78 GB
-		// LTX 2.3: ~21.0B params → BF16 42 GB, FP8 21 GB, FP32 84 GB
-		const ltxVersion = String(t.ltx_version || '2.3');
-		const ditBF16 = ltxVersion === '2.3' ? 42 : 39;
-		const isFp8 = !!t.fp8_base;
-		const isW8A8 = !!t.fp8_w8a8;
-		const isNF4 = !!t.nf4_base;
-		let ditBase = isNF4 ? (ditBF16 / 4) : isFp8 ? (ditBF16 / 2) : ditBF16;
-
-		const totalBlocks = 48;
-		const blocksToSwap = Math.min(Math.max(Number(t.blocks_to_swap || 0), 0), totalBlocks - 1);
-		const blockSize = ditBase / totalBlocks;
-		const swapSavings = blocksToSwap * blockSize * 0.95;
-		const dit = Math.max(ditBase - swapSavings, 1.0);
-
-		// ── LoRA weights ──
-		// Per target linear: rank * (in_features + out_features) * 2 bytes (bf16).
-		// t2v (attn Q/K/V/Out): 8 linears/block * Linear(4096,4096) = rank * 131,072 bytes/block
-		//   + audio attn: rank * 65,536 bytes/block + cross-modal: rank * 81,920 bytes/block
-		//   48 blocks -> rank * 12.75 MB total (video-only ~rank * 6.0 MB)
-		// v2v adds FFN: +rank * 5.9 MB. full adds all remaining: +rank * ~8 MB.
-		const rank = Math.max(Number(t.network_dim || 16), 1);
-		const mode = String(t.ltx2_mode || 'video');
-		const isAV = mode === 'av';
-		// Base LoRA size in GB per unit rank (t2v preset, video-only)
-		const loraBasePerRank = isAV ? 12.75 / 1024 : 6.0 / 1024;  // GB per rank
-		const presetMultiplier = { t2v: 1.0, v2v: 1.44, video_sa: 0.37, video_sa_ff: 0.56, video_sa_ca_ff: 0.74, audio: 0.37, audio_v2a: 0.52, audio_ref_ic: 0.63, av_ic: 1.44, video_ref_only_av: 1.44, full: 2.1 }[t.lora_target_preset] || 1.0;
-		const loraParamsGB = rank * loraBasePerRank * presetMultiplier;
-
-		// ── Optimizer states ──
-		// AdamW fp32: 12 bytes/param (fp32 master + momentum + variance)
-		// AdamW 8-bit: 6 bytes/param (fp32 master + int8 momentum + int8 variance)
-		// Prodigy/ScheduleFree: ~14 bytes/param
-		const loraParamCount = loraParamsGB * (1024 ** 3) / 2;  // bf16 -> param count
-		const optType = String(t.optimizer_type || 'adamw8bit').toLowerCase();
-		const is8bitOpt = optType.includes('8bit');
-		const isScheduleFree = optType.includes('schedulefree') || optType === 'automagic';
-		const optBytesPerParam = is8bitOpt ? 6 : (isScheduleFree ? 14 : 12);
-		const optimStates = (loraParamCount * optBytesPerParam) / (1024 ** 3);
-
-		// ── Gradients ──
-		// One gradient per trainable param in training precision (bf16 = 2 bytes)
-		const loraGrads = loraParamsGB;  // same size as LoRA weights in bf16
-
-		// ── Activations ──
-		// LTX-2 VAE compression: temporal 8x, spatial 32x32.
-		// Latent shape: (B, 128, 1+(F-1)/8, H/32, W/32)
-		// Sequence length = latent_F * latent_H * latent_W (patch_size=1)
-		// DiT hidden_dim: 4096 (video), 2048 (audio)
-		const resolutionW = Math.max(Number(ds.resolution_w || 768), 64);
-		const resolutionH = Math.max(Number(ds.resolution_h || 512), 64);
-		const sourceFrames = Math.max(Number(ds.target_frames || 33), 1);
-		const batchSize = Math.max(Number(ds.batch_size || 1), 1);
-
-		const latentFrames = Math.max(1, Math.floor((sourceFrames - 1) / 8) + 1);
-		const latentHeight = Math.max(1, Math.floor(resolutionH / 32));
-		const latentWidth = Math.max(1, Math.floor(resolutionW / 32));
-		let seqTokens = latentFrames * latentHeight * latentWidth;
-
-		// Audio adds ~25 tokens per second of video (at 25fps)
-		const audioTokens = isAV ? Math.round(sourceFrames) : 0;
-		if (mode === 'audio') seqTokens = Math.round(sourceFrames);  // audio-only
-
-		const hiddenDim = mode === 'audio' ? 2048 : 4096;
-		const bytesPerValue = isW8A8 ? 1 : 2;
-
-		// Per-block activation: ~10 tensors of (batch, seq_len, hidden_dim) without checkpointing,
-		// ~2 with gradient checkpointing (only block boundaries stored, recomputed in backward).
-		// With blockwise checkpointing: ~1 (activations offloaded to CPU).
-		const activCoeff = (t.gradient_checkpointing === false) ? 10 : (t.blockwise_checkpointing ? 1 : 2);
-
-		// Effective stored layers: without checkpointing all 48; with checkpointing, 48 boundaries
-		// are stored but each is small (~1 tensor). Plus one block's full activations during recompute.
-		const effectiveLayers = (t.gradient_checkpointing === false) ? totalBlocks : (t.blockwise_checkpointing ? 2 : totalBlocks);
-
-		const perLayerBytes = activCoeff * batchSize * seqTokens * hiddenDim * bytesPerValue;
-		let activations = (perLayerBytes * effectiveLayers) / (1024 ** 3);
-
-		// Audio stream adds ~25% activation overhead in AV mode (hidden_dim=2048, separate path)
-		if (isAV) activations *= 1.25;
-
-		// Memory-saving techniques
-		if ((t.ffn_chunk_size || 0) > 0) activations *= 0.90;
-		if (t.split_attn_mode || t.split_attn_target) activations *= 0.92;
-		// GC CPU offload: activation checkpoints stored on CPU instead of GPU
-		if (t.gradient_checkpointing_cpu_offload && t.gradient_checkpointing !== false) activations *= 0.35;
-
-		// Fixed buffers: CUDA allocator overhead, latent tensors, noise, text embeddings
-		// Latents: batch * 128 * latentF * latentH * latentW * 2 bytes (small, ~tens of MB)
-		const latentBytes = batchSize * 128 * latentFrames * latentHeight * latentWidth * 2 * 2; // x2 for noise
-		const textEmbedBytes = batchSize * 256 * (isAV ? 7680 : 3840) * 2;  // 256 text tokens, caption_channels
-		const bufferGB = (latentBytes + textEmbedBytes) / (1024 ** 3);
-		let activationBuffers = 0.5 + bufferGB;  // 0.5 GB base CUDA allocator overhead
-		if (t.img_in_txt_in_offloading) activationBuffers = Math.max(0.2, activationBuffers - 0.3);
-
-		const activationTotal = Math.max(0.3, activations + activationBuffers);
-
-		// ── Gradient accumulation ──
-		const gradAccum = Math.max(Number(t.gradient_accumulation_steps || 1), 1);
-		const gradAccumOverhead = gradAccum > 1 ? loraGrads * 0.4 : 0;
-
-		// ── Preservation / DOP ──
-		let preservationOverhead = 0;
-		if (t.blank_preservation || t.dop) preservationOverhead += activationTotal * 0.35;
-		if (t.audio_dop) preservationOverhead += activationTotal * 0.35;
-		if (t.prior_divergence) preservationOverhead += activationTotal * 0.15;
-
-		// ── Self-Flow ──
-		// teacher_mode=base reuses the frozen base via zeroed LoRA multipliers.
-		// EMA modes keep shadow trainable params; offload_teacher_features only moves cached features.
-		let selfFlowOverhead = 0;
-		if (t.self_flow) {
-			const teacherMode = String(t.self_flow_teacher_mode || 'ema').toLowerCase();
-			if (teacherMode === 'ema') selfFlowOverhead += loraParamsGB;
-			else if (teacherMode === 'partial_ema') selfFlowOverhead += Math.max(loraParamsGB / totalBlocks, 0.01);
-
-			const hasAudioProjector = (mode === 'av' || mode === 'audio') && Number(t.self_flow_lambda_audio || 0) > 0;
-			selfFlowOverhead += hasAudioProjector ? 0.03 : 0.02;
-			selfFlowOverhead += activationTotal * (t.self_flow_offload_teacher_features ? 0.03 : 0.10);
-		}
-
-		// ── CREPA ──
-		const crepaOverhead = t.crepa ? (String(t.crepa_mode || 'backbone') === 'dino' ? 0.08 : 0.15) : 0;
-
-		const total = dit + loraParamsGB + optimStates + loraGrads + activationTotal + gradAccumOverhead + preservationOverhead + selfFlowOverhead + crepaOverhead;
-
-		// Temporary spikes (not steady-state)
-		const hasSamplePrompts = !!(t.sample_prompts || t.sample_prompts_text);
-		const samplingEnabled = hasSamplePrompts && !!(t.sample_at_first || t.sample_every_n_steps || t.sample_every_n_epochs);
-		const samplingSpike = samplingEnabled;
-		const preservationGemmaSpike = !!(t.blank_preservation || t.dop || t.audio_dop) && !t.use_precached_preservation;
-
-		const parts = [
-			{ label: 'DiT', value: dit, color: 'var(--accent)' },
-		];
-		parts.push({ label: 'LoRA', value: loraParamsGB, color: 'var(--warning)' });
-		parts.push({ label: 'Optimizer', value: optimStates, color: 'var(--warning)' });
-		parts.push({ label: 'Grads', value: loraGrads, color: 'var(--info)' });
-		parts.push({ label: 'Activ.', value: activationTotal, color: 'var(--success)' });
-		if (gradAccumOverhead > 0) parts.push({ label: 'GradAccum', value: gradAccumOverhead, color: 'var(--info)' });
-		if (preservationOverhead > 0) parts.push({ label: 'Preserv.', value: preservationOverhead, color: 'var(--danger)' });
-		if (selfFlowOverhead > 0) parts.push({ label: 'Self-Flow', value: selfFlowOverhead, color: 'var(--danger)' });
-		if (crepaOverhead > 0) parts.push({ label: 'CREPA', value: crepaOverhead, color: 'var(--secondary, var(--info))' });
-
-		return {
-			total: Math.max(total, 2),
-			parts,
-			swap: swapSavings,
-			noGemma: true,
-			samplingSpike,
-			preservationGemmaSpike,
-		};
-	}
-
 	let cfg = $derived($projectConfig);
 	let datasets = $derived(cfg?.dataset?.datasets || []);
 	let valDatasets = $derived(cfg?.dataset?.validation_datasets || []);
@@ -1164,17 +511,8 @@
 
 		const snapshot = JSON.stringify({
 			dataset: cfg.dataset,
-			caching: {
-				ltx2_mode: cfg.caching?.ltx2_mode,
-			},
-			training: {
-				ltx2_mode: cfg.training?.ltx2_mode,
-				max_train_steps: cfg.training?.max_train_steps,
-				gradient_accumulation_steps: cfg.training?.gradient_accumulation_steps,
-				network_dim: cfg.training?.network_dim,
-				lora_target_preset: cfg.training?.lora_target_preset,
-				fp8_base: cfg.training?.fp8_base,
-			},
+			caching: cfg.caching,
+			training: cfg.training,
 		});
 		if (snapshot === workflowStatsSnapshot) return;
 
@@ -1280,7 +618,7 @@
 					<div>
 						<div class="text-[11px] font-semibold uppercase tracking-wider" style="color: var(--text-muted); font-family: var(--font-label);">New Project</div>
 					</div>
-					<div class="text-[11px]" style="color: var(--text-muted);">{activeLoraFamily.label} • {activeMemoryProfile.label}</div>
+					<div class="text-[11px]" style="color: var(--text-muted);">MiniMax H3 • {activeMemoryProfile.label}</div>
 				</div>
 				<div class="space-y-3">
 					<div class="project-name-field">
@@ -1308,9 +646,8 @@
 							{#each MEMORY_PROFILES as profile}
 								<button
 									type="button"
-									disabled={TEMPLATE_VARIANTS_DISABLED}
 									onclick={() => {
-										if (!TEMPLATE_VARIANTS_DISABLED) selectedMemoryProfile = profile.id;
+										selectedMemoryProfile = profile.id;
 									}}
 									class="choice-pill"
 									style="background: {selectedMemoryProfile === profile.id ? 'color-mix(in srgb, var(--accent) 10%, var(--bg-elevated))' : 'var(--bg-elevated)'}; border: 1px solid {selectedMemoryProfile === profile.id ? 'color-mix(in srgb, var(--accent) 28%, var(--border))' : 'var(--border)'}; color: {selectedMemoryProfile === profile.id ? 'var(--text-primary)' : 'var(--text-secondary)'};"

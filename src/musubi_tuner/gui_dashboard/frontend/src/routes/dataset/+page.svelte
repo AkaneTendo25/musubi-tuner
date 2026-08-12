@@ -51,13 +51,23 @@
 				num_repeats: 1,
 				caption_extension: '.txt',
 				caption_field: '',
-				target_frames: 33,
+				target_frames: isH3 ? 124 : 33,
 				frame_extraction: 'head',
 				frame_sample: null,
 				max_frames: null,
 				frame_stride: null,
 				source_fps: null,
-				target_fps: null
+				target_fps: null,
+				h3_target_mode: 'av',
+				h3_image_frame_count: null,
+				multiple_target: false,
+				control_video_directory: '',
+				control_audio_directory: '',
+				control_modality: '',
+				control_modalities: '',
+				control_modality_probability_av: null,
+				control_modality_probability_video: null,
+				control_modality_probability_audio: null
 			};
 			const ds = { ...(c.dataset || {}) };
 			if (isValidation) {
@@ -167,6 +177,7 @@
 	let datasets = $derived($projectConfig?.dataset?.datasets || []);
 	let validationDatasets = $derived($projectConfig?.dataset?.validation_datasets || []);
 	let general = $derived($projectConfig?.dataset?.general || {});
+	let isH3 = $derived($projectConfig?.training?.model_type === 'minimax_h3');
 	let trainingValidation = $derived($processValidation.training || { errors: [], warnings: [], field_errors: {} });
 	let datasetValidationIssues = $derived(
 		[...(trainingValidation.errors || []), ...(trainingValidation.warnings || [])].filter((issue) => issue.page === 'dataset')
@@ -235,6 +246,7 @@
 						{entry}
 						index={i}
 						advanced={$advancedMode}
+						{isH3}
 						sourceError={datasetSourceError(i)}
 						onRemove={() => removeDataset(i, false)}
 						onchange={(nextEntry) => updateDataset(i, nextEntry, false)}
@@ -266,6 +278,7 @@
 						index={i}
 						title={`Validation dataset #${i + 1}`}
 						advanced={$advancedMode}
+						{isH3}
 						onRemove={() => removeDataset(i, true)}
 						onchange={(nextEntry) => updateDataset(i, nextEntry, true)}
 					/>
