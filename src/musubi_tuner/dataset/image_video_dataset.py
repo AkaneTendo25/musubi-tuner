@@ -2,7 +2,6 @@ from concurrent.futures import ThreadPoolExecutor
 import glob
 import os
 import random
-import re
 import time
 from typing import Any, Optional, Sequence, Tuple, Union, TYPE_CHECKING
 
@@ -27,14 +26,31 @@ logging.basicConfig(level=logging.INFO)
 
 
 def _validate_h3_cache_pair(latent_path: str, text_path: str) -> None:
+    reference_kinds_prefix = "varlen_mmh3_reference_kinds"
+    reference_contract_key = "mmh3_reference_temporal_contract"
+    reference_contract_version = 1
     with safe_open(latent_path, framework="pt", device="cpu") as handle:
         latent_fingerprint = (handle.metadata() or {}).get("sample_fingerprint")
+        latent_keys = set(handle.keys())
+        kinds_keys = [key for key in latent_keys if key.startswith(reference_kinds_prefix)]
+        has_video_reference = any(bool((handle.get_tensor(key) == 1).any()) for key in kinds_keys)
+        latent_reference_contract = (
+            int(handle.get_tensor(reference_contract_key)) if reference_contract_key in latent_keys else None
+        )
     with safe_open(text_path, framework="pt", device="cpu") as handle:
         text_fingerprint = (handle.metadata() or {}).get("sample_fingerprint")
-    if not latent_fingerprint or latent_fingerprint != text_fingerprint:
+        text_keys = set(handle.keys())
+        text_reference_contract = int(handle.get_tensor(reference_contract_key)) if reference_contract_key in text_keys else None
+    if (latent_fingerprint or text_fingerprint) and latent_fingerprint != text_fingerprint:
         raise ValueError(
-            "MiniMax H3 conditioned-image latent/text caches do not describe the same sample; rebuild both caches: "
-            f"{latent_path} and {text_path}"
+            f"MiniMax H3 latent/text caches do not describe the same sample; rebuild both caches: {latent_path} and {text_path}"
+        )
+    if has_video_reference and (
+        latent_reference_contract != reference_contract_version or text_reference_contract != reference_contract_version
+    ):
+        raise ValueError(
+            "MiniMax H3 reference-video preprocessing changed and the latent/text caches are stale or mismatched; "
+            f"rebuild both caches: {latent_path} and {text_path}"
         )
 
 
@@ -609,7 +625,7 @@ class ImageDataset(BaseDataset):
             if not os.path.exists(text_encoder_output_cache_file):
                 logger.warning(f"Text encoder output cache file not found: {text_encoder_output_cache_file}")
                 continue
-            if self.architecture == ARCHITECTURE_MINIMAX_H3 and re.search(r"_00000-\d+$", item_key):
+            if self.architecture == ARCHITECTURE_MINIMAX_H3:
                 _validate_h3_cache_pair(cache_file, text_encoder_output_cache_file)
 
             bucket_reso = bucket_selector.get_bucket_resolution(image_size)
@@ -1038,6 +1054,8 @@ class VideoDataset(BaseDataset):
             if not os.path.exists(text_encoder_output_cache_file):
                 logger.warning(f"Text encoder output cache file not found: {text_encoder_output_cache_file}")
                 continue
+            if self.architecture == ARCHITECTURE_MINIMAX_H3:
+                _validate_h3_cache_pair(cache_file, text_encoder_output_cache_file)
 
             bucket_reso = bucket_selector.get_bucket_resolution(image_size)
             bucket_reso = (*bucket_reso, frame_count)

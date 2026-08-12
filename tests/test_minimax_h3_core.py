@@ -22,6 +22,7 @@ from musubi_tuner.dataset.datasources import ImageDirectoryDatasource, ImageJson
 from musubi_tuner.dataset.image_video_dataset import ItemInfo, _validate_h3_cache_pair
 from musubi_tuner.minimax_h3 import backend as h3_backend
 from musubi_tuner.minimax_h3 import integration as h3_integration
+from musubi_tuner.minimax_h3 import references as h3_references
 from musubi_tuner.minimax_h3.architecture import (
     AUDIO_FLOW_SHIFT,
     AUDIO_LATENT_FPS,
@@ -42,6 +43,8 @@ from musubi_tuner.minimax_h3.audio_dataset import H3AudioDataset
 from musubi_tuner.minimax_h3.cache import (
     H3_AUDIO_LATENTS_KEY,
     H3_KEYFRAME_VIDEO_ROWS_KEY,
+    H3_REFERENCE_TEMPORAL_CONTRACT_KEY,
+    H3_REFERENCE_TEMPORAL_CONTRACT_VERSION,
     reference_key_suffix,
     save_latent_cache_minimax_h3,
 )
@@ -946,6 +949,29 @@ def test_ref2va_reference_geometry_matches_released_preprocessing():
     assert [int(frame[0, 0, 0]) for frame in resampled] == [index for index in range(30) if index not in (2, 7, 12, 17, 22, 27)]
 
 
+def test_h3_reference_video_is_trimmed_before_text_and_paired_audio_preparation(monkeypatch):
+    video_asset = MediaAsset(Path("reference.mp4"), MediaModality.VIDEO, "reference")
+    item = SimpleNamespace(h3_media_assets=(video_asset,), frame_count=30)
+    audio_frame_counts = []
+
+    monkeypatch.setattr(
+        h3_references,
+        "_prepare_video",
+        lambda _asset, _target_frames: np.zeros((30, 8, 8, 3), dtype=np.uint8),
+    )
+
+    def prepare_audio(_asset, target_frames):
+        audio_frame_counts.append(target_frames)
+        return torch.zeros(2, target_frames * 10)
+
+    monkeypatch.setattr(h3_references, "_prepare_audio", prepare_audio)
+
+    (reference,) = h3_references.prepare_references(item)
+
+    assert reference.frames.shape[0] == 22
+    assert audio_frame_counts == [22]
+
+
 @pytest.mark.parametrize("source_fps", [12.0, 24.0, 25.0, 30.0, 60.0])
 def test_reference_decode_limit_is_the_minimum_needed_for_target_duration(source_fps):
     target_frames = 124
@@ -1109,6 +1135,45 @@ def test_h3_conditioned_image_cache_pair_requires_matching_sample_fingerprint(tm
     save_file({"x": torch.zeros(1)}, text, metadata={"sample_fingerprint": "different"})
     with pytest.raises(ValueError, match="do not describe the same sample"):
         _validate_h3_cache_pair(str(latent), str(text))
+
+
+def test_h3_cache_pair_rejects_stale_reference_video_preprocessing(tmp_path):
+    latent = tmp_path / "latent.safetensors"
+    text = tmp_path / "text.safetensors"
+    kinds_key = "varlen_mmh3_reference_kinds_int64"
+    save_file({kinds_key: torch.tensor([1], dtype=torch.long)}, latent)
+    save_file({"x": torch.zeros(1)}, text)
+
+    with pytest.raises(ValueError, match="reference-video preprocessing changed"):
+        _validate_h3_cache_pair(str(latent), str(text))
+
+    contract = torch.tensor(H3_REFERENCE_TEMPORAL_CONTRACT_VERSION, dtype=torch.long)
+    save_file({kinds_key: torch.tensor([1], dtype=torch.long), H3_REFERENCE_TEMPORAL_CONTRACT_KEY: contract}, latent)
+    save_file({H3_REFERENCE_TEMPORAL_CONTRACT_KEY: contract}, text)
+    _validate_h3_cache_pair(str(latent), str(text))
+
+
+def test_h3_cache_pair_accepts_legacy_non_reference_cache(tmp_path):
+    latent = tmp_path / "latent.safetensors"
+    text = tmp_path / "text.safetensors"
+    save_file({"x": torch.zeros(1)}, latent)
+    save_file({"x": torch.zeros(1)}, text)
+
+    _validate_h3_cache_pair(str(latent), str(text))
+
+
+def test_h3_reference_video_latents_record_temporal_contract(monkeypatch):
+    reference = H3PreparedReference(
+        kind=H3ReferenceKind.VIDEO,
+        frames=np.zeros((5, 4, 4, 3), dtype=np.uint8),
+    )
+    monkeypatch.setattr(h3_integration, "prepare_references", lambda *_args, **_kwargs: (reference,))
+    encoder = h3_integration._NativeLatentEncoder(None, None, torch.float32)
+    monkeypatch.setattr(encoder, "_encode_reference_video", lambda *_args, **_kwargs: torch.zeros(24, 1, 2, 2))
+
+    cached = encoder._encode_references(SimpleNamespace())
+
+    assert int(cached[H3_REFERENCE_TEMPORAL_CONTRACT_KEY]) == H3_REFERENCE_TEMPORAL_CONTRACT_VERSION
 
 
 def test_native_cache_io_accepts_one_frame_image_without_audio(tmp_path):

@@ -251,11 +251,17 @@ def prepare_references(item: Any, image_short_edge: int = REFERENCE_IMAGE_SHORT_
             prepared.append(H3PreparedReference(kind=kind, image=_prepare_image(asset, image_short_edge)))
         elif kind is H3ReferenceKind.VIDEO:
             include_audio = bool(asset.metadata.get("include_audio", True))
+            frames = _prepare_video(asset, target_frames)
+            # The H3 video VAE accepts only 17n+5 frames (or a single image).
+            # Trim once at the shared preparation boundary so Qwen's visual
+            # presentation, the DiT latent rows, and any paired soundtrack all
+            # describe the same temporal span.
+            frames = frames[: trim_reference_frames(frames.shape[0])]
             prepared.append(
                 H3PreparedReference(
                     kind=kind,
-                    frames=_prepare_video(asset, target_frames),
-                    waveform=_prepare_audio(_reference_audio_asset(asset), target_frames) if include_audio else None,
+                    frames=frames,
+                    waveform=_prepare_audio(_reference_audio_asset(asset), frames.shape[0]) if include_audio else None,
                 )
             )
         else:

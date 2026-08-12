@@ -269,13 +269,12 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         global_step,
         epoch,
     ) -> None:
-        del network, epoch
+        del epoch
         if self.backend is None:
             raise RuntimeError("H3 training backend is not loaded")
-        # Per-step conditioning belongs to the training step that drew it. Left
-        # in place it would make validation forward under the last batch's mask
-        # or jitter schedule while scoring the full target, so the numbers would
-        # not describe any coherent objective.
+        # Discard conditioning from the last training step. Validation redraws
+        # its configured mask/keyframes deterministically below; jitter and
+        # spatial-density augmentation remain disabled for the canonical metric.
         self._step_mask = None
         self._step_row_video_timestep = None
         self._step_spatial_density_scale = None
@@ -304,117 +303,45 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         )
         validation_seed = args.validation_seed if args.validation_seed is not None else args.seed
 
-        with preserve_rng_state():
-            for dataset_index, batch in self._validation_dataloader:
-                latents = self.get_primary_latents(batch)
-                if latents.shape[0] != 1:
-                    raise ValueError("MiniMax H3 validation requires dataset batch_size = 1")
-                has_video = "latents" in batch or latents.ndim == 5
-                has_audio = H3_AUDIO_LATENTS_KEY in batch
-                video_source = batch.get("latents", latents if latents.ndim == 5 else None)
-                video_latents = video_source.to(accelerator.device, dtype=self.dit_dtype) if has_video else None
-                audio_latents = batch[H3_AUDIO_LATENTS_KEY].to(accelerator.device, dtype=self.dit_dtype) if has_audio else None
-                is_image = has_video and not has_audio and video_latents.shape[2] == 1
-                if observed is not None and not (has_video and has_audio):
-                    raise ValueError("H3 observed-modality validation requires cached video and audio targets")
-
-                for sigma_bin in bins:
-                    if video_latents is not None:
-                        video_noise_seed = derive_validation_seed(
-                            validation_seed,
-                            dataset_index=dataset_index,
-                            bin_index=sigma_bin.index,
-                            stream="video-noise",
-                        )
-                        seed_validation_forward(video_noise_seed)
-                        video_noise = torch.randn_like(video_latents)
-                    else:
-                        video_noise = None
-                    if audio_latents is not None:
-                        audio_noise_seed = derive_validation_seed(
-                            validation_seed,
-                            dataset_index=dataset_index,
-                            bin_index=sigma_bin.index,
-                            stream="audio-noise",
-                        )
-                        seed_validation_forward(audio_noise_seed)
-                        audio_noise = torch.randn_like(audio_latents)
-                    else:
-                        audio_noise = None
-
-                    base_sigma = torch.tensor([sigma_bin.base_sigma], device=accelerator.device, dtype=torch.float32)
-                    if is_image:
-                        base_sigma = image_validation_sigma(
-                            base_sigma,
-                            latent_height=video_latents.shape[-2],
-                            latent_width=video_latents.shape[-1],
-                            flow_shift=args.h3_image_flow_shift,
-                        )
-                    inputs = prepare_joint_noisy_inputs(
-                        video_latents,
-                        audio_latents,
-                        video_noise,
-                        audio_noise,
-                        base_sigma,
-                        video_shift=1.0 if is_image else args.h3_shift_video,
-                        audio_shift=1.0 if is_image else args.h3_shift_audio,
-                        observed=observed,
-                    )
-
-                    forward_seed = derive_validation_seed(
-                        validation_seed,
-                        dataset_index=dataset_index,
-                        bin_index=sigma_bin.index,
-                        stream="model-forward",
-                    )
-                    seed_validation_forward(forward_seed)
-                    if args.h3_guidance_distillation_scale is not None:
-                        missing_empty = [
-                            key for key in (H3_EMPTY_TEXT_HIDDEN_KEY, H3_EMPTY_TEXT_TOKEN_TAGS_KEY) if key not in batch
-                        ]
-                        if missing_empty:
-                            raise KeyError("guidance-consistent H3 validation is missing " + ", ".join(missing_empty))
-                        fork_devices = [accelerator.device] if accelerator.device.type == "cuda" else []
-                        with torch.random.fork_rng(devices=fork_devices):
-                            empty_prediction = self._predict(
-                                accelerator,
-                                transformer,
-                                batch,
-                                inputs,
-                                conditioning="empty",
-                                gradient_checkpointing=False,
-                            )
-                    prediction = self._predict(
+        block_swap_active = bool(self.blocks_to_swap)
+        transformer_was_training = transformer.training
+        network_was_training = network.training if network is not None else None
+        try:
+            transformer.eval()
+            if network is not None:
+                # LoRA modules are registered below the network but invoked by
+                # transformer forwards. Without this, network/rank/module
+                # dropout remains active and validation measures a regularized
+                # training draw rather than the saved adapter.
+                network.eval()
+            if block_swap_active:
+                # Validation has no backward pass. A training-mode offloader
+                # leaves the swapped prefix on CPU because it expects backward
+                # hooks to restore it before the next forward.
+                transformer.switch_block_swap_for_inference()
+            with preserve_rng_state():
+                for dataset_index, batch in self._validation_dataloader:
+                    self._validate_batch(
                         accelerator,
+                        args,
                         transformer,
+                        dataset_index,
                         batch,
-                        inputs,
-                        conditioning="prompt",
-                        gradient_checkpointing=False,
+                        bins,
+                        observed,
+                        video_weight,
+                        audio_weight,
+                        accumulator,
+                        validation_seed,
                     )
-                    if args.h3_guidance_distillation_scale is not None:
-                        prediction, loss_inputs = self._guidance_loss_inputs(args, prediction, empty_prediction, inputs)
-                    else:
-                        loss_inputs = inputs
-
-                    video_sample_weight = self._sample_weight(args, inputs.video_sigma) if has_video else None
-                    audio_sample_weight = self._sample_weight(args, inputs.audio_sigma) if has_audio else None
-                    if prediction.video is not None and loss_inputs.video_target is not None and video_weight > 0:
-                        total, count = masked_squared_error_sum(
-                            prediction.video,
-                            loss_inputs.video_target,
-                            batch.get("video_loss_mask"),
-                            sample_weight=video_sample_weight,
-                        )
-                        accumulator.add(sigma_bin.index, "video", total, count)
-                    if prediction.audio is not None and loss_inputs.audio_target is not None and audio_weight > 0:
-                        total, count = masked_squared_error_sum(
-                            prediction.audio,
-                            loss_inputs.audio_target,
-                            batch.get("audio_loss_mask"),
-                            sample_weight=audio_sample_weight,
-                        )
-                        accumulator.add(sigma_bin.index, "audio", total, count)
+        finally:
+            self._step_mask = None
+            self._step_keyframes = None
+            if block_swap_active:
+                transformer.switch_block_swap_for_training()
+            transformer.train(transformer_was_training)
+            if network is not None:
+                network.train(network_was_training)
 
         reduced = accelerator.reduce(accumulator.reduction_tensor(device=accelerator.device), reduction="sum")
         accumulator.load_reduced_tensor(reduced)
@@ -422,6 +349,160 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         if metrics and len(accelerator.trackers) > 0:
             accelerator.log(metrics, step=global_step)
         accelerator.print("MiniMax H3 validation: " + ", ".join(f"{key}={value:.6g}" for key, value in metrics.items()))
+
+    def _validate_batch(
+        self,
+        accelerator,
+        args,
+        transformer,
+        dataset_index,
+        batch,
+        bins,
+        observed,
+        video_weight,
+        audio_weight,
+        accumulator,
+        validation_seed,
+    ) -> None:
+        latents = self.get_primary_latents(batch)
+        if latents.shape[0] != 1:
+            raise ValueError("MiniMax H3 validation requires dataset batch_size = 1")
+        has_video = "latents" in batch or latents.ndim == 5
+        has_audio = H3_AUDIO_LATENTS_KEY in batch
+        video_source = batch.get("latents", latents if latents.ndim == 5 else None)
+        video_latents = video_source.to(accelerator.device, dtype=self.dit_dtype) if has_video else None
+        audio_latents = batch[H3_AUDIO_LATENTS_KEY].to(accelerator.device, dtype=self.dit_dtype) if has_audio else None
+        is_image = has_video and not has_audio and video_latents.shape[2] == 1
+        if observed is not None and not (has_video and has_audio):
+            raise ValueError("H3 observed-modality validation requires cached video and audio targets")
+
+        for sigma_bin in bins:
+            if video_latents is not None:
+                video_noise_seed = derive_validation_seed(
+                    validation_seed,
+                    dataset_index=dataset_index,
+                    bin_index=sigma_bin.index,
+                    stream="video-noise",
+                )
+                seed_validation_forward(video_noise_seed)
+                video_noise = torch.randn_like(video_latents)
+            else:
+                video_noise = None
+            if audio_latents is not None:
+                audio_noise_seed = derive_validation_seed(
+                    validation_seed,
+                    dataset_index=dataset_index,
+                    bin_index=sigma_bin.index,
+                    stream="audio-noise",
+                )
+                seed_validation_forward(audio_noise_seed)
+                audio_noise = torch.randn_like(audio_latents)
+            else:
+                audio_noise = None
+
+            base_sigma = torch.tensor([sigma_bin.base_sigma], device=accelerator.device, dtype=torch.float32)
+            if is_image:
+                base_sigma = image_validation_sigma(
+                    base_sigma,
+                    latent_height=video_latents.shape[-2],
+                    latent_width=video_latents.shape[-1],
+                    flow_shift=args.h3_image_flow_shift,
+                )
+            inputs = prepare_joint_noisy_inputs(
+                video_latents,
+                audio_latents,
+                video_noise,
+                audio_noise,
+                base_sigma,
+                video_shift=1.0 if is_image else args.h3_shift_video,
+                audio_shift=1.0 if is_image else args.h3_shift_audio,
+                observed=observed,
+            )
+
+            # Validation uses the configured task, not whichever random
+            # mask or keyframes happened to survive from the last train
+            # step. Re-draw them deterministically for this item/bin and
+            # use the same effective loss mask as training.
+            conditioning_seed = derive_validation_seed(
+                validation_seed,
+                dataset_index=dataset_index,
+                # Keep task conditioning fixed across sigma bins so per-bin
+                # metrics isolate noise level instead of a different random
+                # mask or keyframe selection.
+                bin_index=0,
+                stream="conditioning",
+            )
+            seed_validation_forward(conditioning_seed)
+            self._step_keyframes = self._resolve_keyframe_anchors(inputs.video)
+            self._step_mask = self._draw_step_mask(inputs, tuple(VIDEO_DIT_PATCH_SIZE))
+            effective_video_mask = self._mask_to_loss(
+                self._extension_masked(batch.get("video_loss_mask"), inputs.video_target, self._extension_video_frames, axis=-3),
+                inputs.video_target,
+                None if self._step_mask is None else self._step_mask.video_latent,
+                axis=-3,
+            )
+            effective_audio_mask = self._mask_to_loss(
+                self._extension_masked(batch.get("audio_loss_mask"), inputs.audio_target, self._extension_audio_latents, axis=-1),
+                inputs.audio_target,
+                None if self._step_mask is None else self._step_mask.audio_latent,
+                axis=-1,
+            )
+
+            forward_seed = derive_validation_seed(
+                validation_seed,
+                dataset_index=dataset_index,
+                bin_index=sigma_bin.index,
+                stream="model-forward",
+            )
+            seed_validation_forward(forward_seed)
+            if args.h3_guidance_distillation_scale is not None:
+                missing_empty = [key for key in (H3_EMPTY_TEXT_HIDDEN_KEY, H3_EMPTY_TEXT_TOKEN_TAGS_KEY) if key not in batch]
+                if missing_empty:
+                    raise KeyError("guidance-consistent H3 validation is missing " + ", ".join(missing_empty))
+                fork_devices = [accelerator.device] if accelerator.device.type == "cuda" else []
+                with torch.random.fork_rng(devices=fork_devices):
+                    empty_prediction = self._predict(
+                        accelerator,
+                        transformer,
+                        batch,
+                        inputs,
+                        conditioning="empty",
+                        gradient_checkpointing=False,
+                    )
+            prediction = self._predict(
+                accelerator,
+                transformer,
+                batch,
+                inputs,
+                conditioning="prompt",
+                gradient_checkpointing=False,
+            )
+            if args.h3_guidance_distillation_scale is not None:
+                prediction, loss_inputs = self._guidance_loss_inputs(args, prediction, empty_prediction, inputs)
+            else:
+                loss_inputs = inputs
+
+            video_sample_weight = self._sample_weight(args, inputs.video_sigma) if has_video else None
+            audio_sample_weight = self._sample_weight(args, inputs.audio_sigma) if has_audio else None
+            if prediction.video is not None and loss_inputs.video_target is not None and video_weight > 0:
+                total, count = masked_squared_error_sum(
+                    prediction.video,
+                    loss_inputs.video_target,
+                    effective_video_mask,
+                    sample_weight=video_sample_weight,
+                )
+                accumulator.add(sigma_bin.index, "video", total, count)
+            if prediction.audio is not None and loss_inputs.audio_target is not None and audio_weight > 0:
+                total, count = masked_squared_error_sum(
+                    prediction.audio,
+                    loss_inputs.audio_target,
+                    effective_audio_mask,
+                    sample_weight=audio_sample_weight,
+                )
+                accumulator.add(sigma_bin.index, "audio", total, count)
+
+            self._step_mask = None
+            self._step_keyframes = None
 
     def handle_model_specific_args(self, args: argparse.Namespace):
         self.dit_dtype = (
@@ -502,6 +583,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         self._extension_video_frames = args.h3_extension_video_frames
         self._extension_audio_latents = args.h3_extension_audio_latents
         self._extension_route = args.h3_extension_route
+        self._block_swap_h2d_only = bool(args.block_swap_h2d_only)
         self._frame_sigma_jitter = args.h3_frame_sigma_jitter
         if not 0.0 <= args.h3_frame_sigma_jitter <= 1.0:
             raise ValueError("--h3_frame_sigma_jitter must lie in [0, 1]")
@@ -735,6 +817,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             quantization=args.text_encoder_quantization,
             blocks_to_stream=args.h3_text_encoder_blocks_to_stream,
             nvfp4_scaled_mm=args.h3_nvfp4_scaled_mm,
+            text_visual_max_pixels=args.h3_text_visual_max_pixels,
         )
         prepared_images: list[list[Image.Image]] = []
         for prompt in prompts:
@@ -1411,6 +1494,21 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 item[key] = value
         return item
 
+    @staticmethod
+    def _target_has_valid_elements(batch: dict, key: str, present: bool) -> bool:
+        if not present:
+            return False
+        mask = batch.get(key)
+        if mask is None:
+            return True
+        if isinstance(mask, (list, tuple)):
+            if len(mask) != 1:
+                raise ValueError(f"H3 {key} must contain one batch item")
+            mask = mask[0]
+        if not isinstance(mask, torch.Tensor):
+            raise TypeError(f"H3 {key} must be a tensor")
+        return bool(mask.any())
+
     def _process_single_batch(
         self,
         args: argparse.Namespace,
@@ -1466,7 +1564,19 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             # One adapter covering joint generation, audio-driven video and
             # video-to-audio: the task is redrawn per step rather than fixed for
             # the run, so the model keeps all three rather than specialising.
-            observed = (None, "video", "audio")[int(torch.randint(0, 3, (1,), device="cpu").item())]
+            # Do not select a direction whose generated side is fully masked
+            # (most commonly video-to-audio on a silent clip), because that
+            # would spend a complete optimizer step on an exactly zero loss.
+            valid_video = self._target_has_valid_elements(batch, "video_loss_mask", has_video)
+            valid_audio = self._target_has_valid_elements(batch, "audio_loss_mask", has_audio)
+            candidates = []
+            if (valid_video and args.h3_video_loss_weight > 0) or (valid_audio and args.h3_audio_loss_weight > 0):
+                candidates.append(None)
+            if has_video and has_audio and valid_audio and args.h3_audio_loss_weight > 0:
+                candidates.append("video")
+            if has_video and has_audio and valid_video and args.h3_video_loss_weight > 0:
+                candidates.append("audio")
+            observed = candidates[int(torch.randint(0, len(candidates), (1,), device="cpu").item())] if candidates else None
         if observed is not None and not (has_video and has_audio):
             present = "video" if has_video else "audio" if has_audio else "neither"
             raise ValueError(
@@ -1531,63 +1641,81 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         # A dropped step is already unconditional, so there is no guided field to
         # invert and both branches would evaluate the same empty prompt.
         use_guidance = args.h3_guidance_distillation_scale is not None and conditioning == "prompt"
-        if use_guidance:
-            missing_empty = [key for key in (H3_EMPTY_TEXT_HIDDEN_KEY, H3_EMPTY_TEXT_TOKEN_TAGS_KEY) if key not in batch]
-            if missing_empty:
-                raise KeyError(
-                    "guidance-consistent H3 training requires --cache_guidance_empty; missing " + ", ".join(missing_empty)
-                )
-            # The empty branch calibrates the distilled field but is not itself
-            # optimized. Evaluate it first without retaining its autograd graph.
-            fork_devices = [accelerator.device] if accelerator.device.type == "cuda" else []
-            int8_context = getattr(transformer, "int8_attention_context", None)
-            with (
-                torch.random.fork_rng(devices=fork_devices),
-                torch.no_grad(),
-                int8_context(auxiliary=True) if callable(int8_context) else nullcontext(),
-            ):
-                empty_prediction = self._predict(
-                    accelerator,
-                    transformer,
-                    batch,
-                    inputs,
-                    conditioning="empty",
-                    gradient_checkpointing=False,
-                )
         reference_prediction = None
         preservation_active = args.h3_base_preservation_loss_weight > 0 and (
             self._base_preservation_active(accelerator, args.h3_base_preservation_probability)
             if preservation_active_override is None
             else preservation_active_override
         )
-        if preservation_active:
-            if network is None:
-                raise ValueError("--h3_base_preservation_loss_weight requires a trainable network")
-            unwrapped_network = accelerator.unwrap_model(network)
-            set_enabled = getattr(unwrapped_network, "set_enabled", None)
-            if not callable(set_enabled):
-                raise TypeError("H3 base-preservation loss requires a network with set_enabled()")
-            fork_devices = [accelerator.device] if accelerator.device.type == "cuda" else []
-            # Restoring the RNG state makes the following trainable pass reuse
-            # the stochastic conditioning rows sampled by the frozen branch.
-            with torch.random.fork_rng(devices=fork_devices):
-                set_enabled(False)
-                try:
-                    int8_context = getattr(transformer, "int8_attention_context", None)
-                    with torch.no_grad(), int8_context(auxiliary=True) if callable(int8_context) else nullcontext():
-                        reference_prediction = self._predict(
-                            accelerator,
-                            transformer,
-                            batch,
-                            inputs,
-                            # Match the student's conditioning, or a dropped step
-                            # would pull the unconditional branch toward the
-                            # frozen base's conditional prediction.
-                            conditioning=conditioning,
-                            gradient_checkpointing=False,
-                        )
-                finally:
-                    set_enabled(True)
+        # H2D-only LoRA rings self-heal at same-direction forward boundaries.
+        # Classic swap (and the dense trainable ring) instead expects backward
+        # to restore the training layout and must explicitly enter forward-only
+        # mode around no-grad teacher passes.
+        auxiliary_block_swap = (
+            bool(self.blocks_to_swap) and not getattr(self, "_block_swap_h2d_only", False) and (use_guidance or preservation_active)
+        )
+        if auxiliary_block_swap:
+            # Teacher branches have no backward pass. Classic block swap in
+            # training mode leaves the forward prefix on CPU for its backward
+            # hooks to restore, so every auxiliary forward must use the cyclic
+            # forward-only schedule and return to the training layout before
+            # the graph-carrying student forward.
+            transformer.switch_block_swap_for_inference()
+        try:
+            if use_guidance:
+                missing_empty = [key for key in (H3_EMPTY_TEXT_HIDDEN_KEY, H3_EMPTY_TEXT_TOKEN_TAGS_KEY) if key not in batch]
+                if missing_empty:
+                    raise KeyError(
+                        "guidance-consistent H3 training requires --cache_guidance_empty; missing " + ", ".join(missing_empty)
+                    )
+                # The empty branch calibrates the distilled field but is not itself
+                # optimized. Evaluate it first without retaining its autograd graph.
+                fork_devices = [accelerator.device] if accelerator.device.type == "cuda" else []
+                int8_context = getattr(transformer, "int8_attention_context", None)
+                with (
+                    torch.random.fork_rng(devices=fork_devices),
+                    torch.no_grad(),
+                    int8_context(auxiliary=True) if callable(int8_context) else nullcontext(),
+                ):
+                    empty_prediction = self._predict(
+                        accelerator,
+                        transformer,
+                        batch,
+                        inputs,
+                        conditioning="empty",
+                        gradient_checkpointing=False,
+                    )
+            if preservation_active:
+                if network is None:
+                    raise ValueError("--h3_base_preservation_loss_weight requires a trainable network")
+                unwrapped_network = accelerator.unwrap_model(network)
+                set_enabled = getattr(unwrapped_network, "set_enabled", None)
+                if not callable(set_enabled):
+                    raise TypeError("H3 base-preservation loss requires a network with set_enabled()")
+                fork_devices = [accelerator.device] if accelerator.device.type == "cuda" else []
+                # Restoring the RNG state makes the following trainable pass reuse
+                # the stochastic conditioning rows sampled by the frozen branch.
+                with torch.random.fork_rng(devices=fork_devices):
+                    set_enabled(False)
+                    try:
+                        int8_context = getattr(transformer, "int8_attention_context", None)
+                        with torch.no_grad(), int8_context(auxiliary=True) if callable(int8_context) else nullcontext():
+                            reference_prediction = self._predict(
+                                accelerator,
+                                transformer,
+                                batch,
+                                inputs,
+                                # Match the student's conditioning, or a dropped step
+                                # would pull the unconditional branch toward the
+                                # frozen base's conditional prediction.
+                                conditioning=conditioning,
+                                gradient_checkpointing=False,
+                            )
+                    finally:
+                        set_enabled(True)
+        finally:
+            if auxiliary_block_swap:
+                transformer.switch_block_swap_for_training()
 
         use_crepa = self._crepa is not None and has_video and not is_image and observed != "video"
         if self._crepa is not None:
@@ -1781,6 +1909,12 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         type=int,
         default=0,
         help="stream this many of the 50 frozen Qwen3-VL layers from CPU while encoding sample prompts (CUDA only)",
+    )
+    parser.add_argument(
+        "--h3_text_visual_max_pixels",
+        type=int,
+        default=0,
+        help="maximum pixels per sampling control image presented to Qwen3-VL; 0 disables the cap",
     )
     parser.add_argument(
         "--h3_nvfp4_scaled_mm",

@@ -31,6 +31,8 @@ from musubi_tuner.minimax_h3.cache import (
     H3_REFERENCE_AUDIO_ROWS_KEY,
     H3_REFERENCE_IMAGE_SHORT_EDGE_KEY,
     H3_REFERENCE_KINDS_KEY,
+    H3_REFERENCE_TEMPORAL_CONTRACT_KEY,
+    H3_REFERENCE_TEMPORAL_CONTRACT_VERSION,
     H3_REFERENCE_VIDEO_ROWS_KEY,
     H3_REFERENCE_VIDEO_SHAPES_KEY,
     H3_TEXT_HIDDEN_KEY,
@@ -168,6 +170,7 @@ def create_generator(
     width: int | None = None,
     fp8_scaled: bool = False,
     int8_convrot: bool = False,
+    adaln_rank: int | None = None,
     text_encoder_quantization: Literal["none", "int8", "nf4", "nvfp4_awq"] = "none",
     text_encoder_blocks_to_stream: int = 0,
     text_encoder_nvfp4_scaled_mm: bool = False,
@@ -192,6 +195,7 @@ def create_generator(
     text_visual_max_pixels: int = 0,
 ):
     """Create a sequentially-loaded native FL2VA or Ref2VA generator."""
+    del adaln_rank  # AdaLN pruning is a training-time approximation; inference loads the checkpoint as stored.
     if dtype != "bfloat16":
         raise ValueError("MiniMax H3 native generation requires bfloat16 transformer compute")
     return _NativeGenerator(
@@ -1380,7 +1384,7 @@ class _NativeLatentEncoder:
 
         dtype_name = dtype_to_str(self.output_dtype)
         suffix = reference_key_suffix(self.reference_image_short_edge)
-        return {
+        tensors = {
             f"varlen_{H3_REFERENCE_KINDS_KEY}{suffix}_int64": torch.tensor(kinds, dtype=torch.long),
             f"varlen_{H3_REFERENCE_VIDEO_SHAPES_KEY}{suffix}_int64": torch.tensor(video_shapes, dtype=torch.long),
             f"varlen_{H3_REFERENCE_AUDIO_LENGTHS_KEY}{suffix}_int64": torch.tensor(audio_lengths, dtype=torch.long),
@@ -1391,6 +1395,9 @@ class _NativeLatentEncoder:
                 torch.cat(audio_rows) if audio_rows else torch.empty((0, 32), dtype=self.output_dtype)
             ),
         }
+        if any(reference.kind is H3ReferenceKind.VIDEO for reference in references):
+            tensors[H3_REFERENCE_TEMPORAL_CONTRACT_KEY] = torch.tensor(H3_REFERENCE_TEMPORAL_CONTRACT_VERSION, dtype=torch.long)
+        return tensors
 
     def _encode_audio(self, item: Any) -> tuple[torch.Tensor, torch.Tensor]:
         target = self._target_asset(item)

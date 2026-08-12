@@ -1902,6 +1902,21 @@ class _ScaleTransformer(nn.Module):
         self.scale = nn.Parameter(torch.tensor(0.5))
 
 
+class _SwapAwareScaleTransformer(_ScaleTransformer):
+    def __init__(self):
+        super().__init__()
+        self.swap_mode = "training"
+        self.swap_events = []
+
+    def switch_block_swap_for_inference(self):
+        self.swap_mode = "inference"
+        self.swap_events.append("inference")
+
+    def switch_block_swap_for_training(self):
+        self.swap_mode = "training"
+        self.swap_events.append("training")
+
+
 class _ToggleNetwork:
     def __init__(self, transformer):
         self.transformer = transformer
@@ -1916,6 +1931,7 @@ class _StochasticPreservationBackend:
     def __init__(self):
         self.calls = []
         self.random_draws = []
+        self.swap_modes = []
 
     def predict_training(
         self,
@@ -1933,6 +1949,7 @@ class _StochasticPreservationBackend:
         draw = torch.rand((), device=source.device)
         self.calls.append((conditioning, torch.is_grad_enabled()))
         self.random_draws.append(float(draw))
+        self.swap_modes.append(getattr(transformer, "swap_mode", None))
         scale = transformer.scale if getattr(transformer, "adapter_enabled", True) else transformer.scale.detach() * 0 + 1.0
         return H3ModelPrediction(
             video_hidden_states * scale + draw if video_hidden_states is not None else None,
@@ -2231,6 +2248,119 @@ def test_h3_trainer_base_preservation_replays_rng_and_restores_network():
     assert transformer.adapter_enabled is True
     assert metrics["loss/base_preservation"] > 0
     assert transformer.scale.grad is not None and torch.isfinite(transformer.scale.grad)
+
+
+def test_h3_auxiliary_forwards_use_forward_only_block_swap_then_restore_training():
+    args = create_parser().parse_args([])
+    args.h3_base_preservation_loss_weight = 0.1
+    args.h3_guidance_distillation_scale = 3.0
+    trainer = MiniMaxH3NetworkTrainer()
+    trainer.dit_dtype = torch.float32
+    trainer.blocks_to_swap = 2
+    backend = _StochasticPreservationBackend()
+    trainer.backend = backend
+    transformer = _SwapAwareScaleTransformer()
+    network = _ToggleNetwork(transformer)
+    video = torch.zeros(1, 24, 2, 2, 2)
+    batch = {
+        "timesteps": [0.5],
+        H3_EMPTY_TEXT_HIDDEN_KEY: [torch.zeros(1, 5120)],
+        H3_EMPTY_TEXT_TOKEN_TAGS_KEY: [torch.ones(1, dtype=torch.long)],
+    }
+
+    loss, _ = trainer.process_batch(
+        args,
+        _FakeAccelerator(),
+        transformer,
+        network,
+        batch,
+        video,
+        torch.ones_like(video),
+        None,
+        torch.float32,
+        torch.float32,
+        None,
+        0,
+    )
+    loss.backward()
+
+    assert transformer.swap_events == ["inference", "training"]
+    assert backend.swap_modes == ["inference", "inference", "training"]
+
+
+def test_h3_h2d_only_auxiliary_forwards_avoid_per_step_mode_switches():
+    args = create_parser().parse_args([])
+    args.h3_guidance_distillation_scale = 3.0
+    trainer = MiniMaxH3NetworkTrainer()
+    trainer.dit_dtype = torch.float32
+    trainer.blocks_to_swap = 2
+    trainer._block_swap_h2d_only = True
+    backend = _StochasticPreservationBackend()
+    trainer.backend = backend
+    transformer = _SwapAwareScaleTransformer()
+    video = torch.zeros(1, 24, 2, 2, 2)
+    batch = {
+        "timesteps": [0.5],
+        H3_EMPTY_TEXT_HIDDEN_KEY: [torch.zeros(1, 5120)],
+        H3_EMPTY_TEXT_TOKEN_TAGS_KEY: [torch.ones(1, dtype=torch.long)],
+    }
+
+    trainer.process_batch(
+        args,
+        _FakeAccelerator(),
+        transformer,
+        None,
+        batch,
+        video,
+        torch.ones_like(video),
+        None,
+        torch.float32,
+        torch.float32,
+        None,
+        0,
+    )
+
+    assert transformer.swap_events == []
+    assert backend.swap_modes == ["training", "training"]
+
+
+def test_h3_auxiliary_forward_exception_restores_training_block_swap():
+    class FailingBackend(_StochasticPreservationBackend):
+        def predict_training(self, *args, **kwargs):
+            raise RuntimeError("teacher failed")
+
+    args = create_parser().parse_args([])
+    args.h3_guidance_distillation_scale = 3.0
+    trainer = MiniMaxH3NetworkTrainer()
+    trainer.dit_dtype = torch.float32
+    trainer.blocks_to_swap = 2
+    trainer.backend = FailingBackend()
+    transformer = _SwapAwareScaleTransformer()
+    video = torch.zeros(1, 24, 2, 2, 2)
+    batch = {
+        "timesteps": [0.5],
+        H3_EMPTY_TEXT_HIDDEN_KEY: [torch.zeros(1, 5120)],
+        H3_EMPTY_TEXT_TOKEN_TAGS_KEY: [torch.ones(1, dtype=torch.long)],
+    }
+
+    with pytest.raises(RuntimeError, match="teacher failed"):
+        trainer.process_batch(
+            args,
+            _FakeAccelerator(),
+            transformer,
+            None,
+            batch,
+            video,
+            torch.ones_like(video),
+            None,
+            torch.float32,
+            torch.float32,
+            None,
+            0,
+        )
+
+    assert transformer.swap_mode == "training"
+    assert transformer.swap_events == ["inference", "training"]
 
 
 def test_h3_base_preservation_uses_the_primary_generated_region_mask(monkeypatch):
@@ -3269,6 +3399,39 @@ def test_h3_random_observed_modality_covers_all_three_tasks():
         # sigma_video is pinned at the conditioning level exactly when video is observed.
         seen.add(round(metrics["h3/sigma_video"], 3))
     assert len(seen) > 1
+
+
+def test_h3_random_observed_modality_never_selects_a_fully_masked_audio_target():
+    args = create_parser().parse_args([])
+    args.h3_observed_modality = "random"
+    for seed in range(20):
+        trainer = MiniMaxH3NetworkTrainer()
+        trainer.dit_dtype = torch.float32
+        trainer.backend = _FakeBackend()
+        video = torch.zeros(1, 24, 2, 2, 2)
+        batch = {
+            H3_AUDIO_LATENTS_KEY: torch.zeros(1, 2, 32, 3),
+            H3_AUDIO_LOSS_MASK_KEY: torch.zeros(1, 3, dtype=torch.bool),
+            "timesteps": [0.5],
+        }
+        torch.manual_seed(seed)
+        loss, metrics = trainer.process_batch(
+            args,
+            _FakeAccelerator(),
+            _ScaleTransformer(),
+            None,
+            batch,
+            video,
+            torch.ones_like(video),
+            None,
+            torch.float32,
+            torch.float32,
+            None,
+            0,
+        )
+
+        assert float(loss.detach()) > 0
+        assert metrics["h3/sigma_video"] > 0.001
 
 
 def test_h3_random_observed_modality_is_reported_as_joint_in_validation():

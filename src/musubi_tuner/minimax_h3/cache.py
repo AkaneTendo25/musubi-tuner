@@ -30,6 +30,8 @@ H3_REFERENCE_AUDIO_LENGTHS_KEY = "mmh3_reference_audio_lengths"
 H3_REFERENCE_VIDEO_ROWS_KEY = "mmh3_reference_video_rows"
 H3_REFERENCE_AUDIO_ROWS_KEY = "mmh3_reference_audio_rows"
 H3_REFERENCE_MODALITY_PROBABILITIES_KEY = "mmh3_reference_modality_probabilities"
+H3_REFERENCE_TEMPORAL_CONTRACT_KEY = "mmh3_reference_temporal_contract"
+H3_REFERENCE_TEMPORAL_CONTRACT_VERSION = 1
 
 
 def reference_variant_key(key: str, modality: str) -> str:
@@ -195,6 +197,21 @@ def save_text_encoder_output_cache_minimax_h3(
         if reference_size.dtype != torch.long or reference_size.ndim != 0:
             raise ValueError(f"H3 {H3_REFERENCE_IMAGE_SHORT_EDGE_KEY} must be a scalar int64 value")
         validate_reference_image_short_edge(int(reference_size))
+    reference_contract_matches = [
+        tensor for key, tensor in cache_tensors.items() if _logical_key(key) == H3_REFERENCE_TEMPORAL_CONTRACT_KEY
+    ]
+    if reference_contract_matches:
+        if len(reference_contract_matches) != 1:
+            raise ValueError(f"H3 conditioning cache must contain at most one {H3_REFERENCE_TEMPORAL_CONTRACT_KEY} tensor")
+        reference_contract = reference_contract_matches[0]
+        if (
+            reference_contract.dtype is not torch.long
+            or reference_contract.ndim != 0
+            or int(reference_contract) != H3_REFERENCE_TEMPORAL_CONTRACT_VERSION
+        ):
+            raise ValueError(
+                f"H3 {H3_REFERENCE_TEMPORAL_CONTRACT_KEY} must be scalar int64 version {H3_REFERENCE_TEMPORAL_CONTRACT_VERSION}"
+            )
     if empty_keys <= logical_keys:
         validate_pair(H3_EMPTY_TEXT_HIDDEN_KEY, H3_EMPTY_TEXT_TOKEN_TAGS_KEY)
     probability_matches = [

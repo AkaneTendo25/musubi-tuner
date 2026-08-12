@@ -1,5 +1,6 @@
 import random
 from contextlib import nullcontext
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -144,12 +145,23 @@ class _ValidationTransformer(nn.Module):
     def __init__(self):
         super().__init__()
         self.scale = nn.Parameter(torch.tensor(0.5))
+        self.swap_mode = "training"
+        self.swap_events = []
+
+    def switch_block_swap_for_inference(self):
+        self.swap_mode = "inference"
+        self.swap_events.append("inference")
+
+    def switch_block_swap_for_training(self):
+        self.swap_mode = "training"
+        self.swap_events.append("training")
 
 
 class _ValidationBackend:
     def __init__(self):
         self.calls = []
         self.random_draws = []
+        self.swap_modes = []
 
     def predict_training(
         self,
@@ -161,10 +173,12 @@ class _ValidationBackend:
         audio_timestep,
         *,
         conditioning="prompt",
+        **_kwargs,
     ):
         del batch, video_timestep, audio_timestep
         self.calls.append((conditioning, torch.is_grad_enabled()))
         self.random_draws.append(float(torch.rand(())))
+        self.swap_modes.append(transformer.swap_mode)
         scale = 0.0 if conditioning == "empty" else transformer.scale
         return H3ModelPrediction(
             video_hidden_states * scale if video_hidden_states is not None else None,
@@ -286,6 +300,93 @@ def test_h3_validation_runs_all_target_shapes_and_modes_without_gradients(mode, 
     assert torch.isfinite(torch.tensor(list(metrics.values()))).all()
     assert {name for name in ("video", "audio") if f"val/loss/{name}" in metrics} == expected_modalities
     assert all(not grad_enabled for _, grad_enabled in trainer.backend.calls)
+
+
+def test_h3_validation_uses_forward_only_block_swap_and_restores_training_mode():
+    args = _validation_args()
+    trainer = MiniMaxH3NetworkTrainer()
+    trainer.dit_dtype = torch.float32
+    trainer.blocks_to_swap = 2
+    trainer.backend = _ValidationBackend()
+    trainer._validation_dataloader = [(0, {"latents": torch.zeros(1, 24, 2, 2, 2), "timesteps": None})]
+    transformer = _ValidationTransformer()
+
+    trainer.validate(_ValidationAccelerator(), args, transformer, None, 7, None)
+
+    assert transformer.swap_events == ["inference", "training"]
+    assert transformer.swap_mode == "training"
+    assert trainer.backend.swap_modes == ["inference", "inference"]
+
+
+def test_h3_validation_disables_network_dropout_and_restores_module_modes():
+    args = _validation_args()
+    trainer = MiniMaxH3NetworkTrainer()
+    trainer.dit_dtype = torch.float32
+    trainer.backend = _ValidationBackend()
+    trainer._validation_dataloader = [(0, {"latents": torch.zeros(1, 24, 2, 2, 2), "timesteps": None})]
+    transformer = _ValidationTransformer().train()
+    network = nn.Sequential(nn.Dropout(0.5)).train()
+    modes = []
+    original_predict = trainer._predict
+
+    def record_modes(*call_args, **call_kwargs):
+        modes.append((transformer.training, network.training))
+        return original_predict(*call_args, **call_kwargs)
+
+    trainer._predict = record_modes
+
+    trainer.validate(_ValidationAccelerator(), args, transformer, network, 7, None)
+
+    assert modes == [(False, False), (False, False)]
+    assert transformer.training and network.training
+
+
+def test_h3_validation_recreates_task_conditioning_and_scores_only_generated_region(monkeypatch):
+    args = _validation_args()
+    trainer = MiniMaxH3NetworkTrainer()
+    trainer.dit_dtype = torch.float32
+    trainer.backend = _ValidationBackend()
+    trainer._validation_dataloader = [
+        (
+            0,
+            {
+                "latents": torch.zeros(1, 24, 2, 2, 2),
+                "video_loss_mask": torch.ones(1, 2, 2, 2, dtype=torch.bool),
+                "timesteps": None,
+            },
+        )
+    ]
+    generated = torch.zeros(2, 2, 2, dtype=torch.bool)
+    generated[1] = True
+    step_mask = SimpleNamespace(video_rows=None, audio_rows=None, video_latent=generated, audio_latent=None)
+    trainer._resolve_keyframe_anchors = lambda _video: (("first",), (0,))
+    trainer._draw_step_mask = lambda _inputs, _patch: step_mask
+    observed_state = []
+    original_predict = trainer._predict
+
+    def record_predict(*call_args, **call_kwargs):
+        observed_state.append((trainer._step_keyframes, trainer._step_mask))
+        return original_predict(*call_args, **call_kwargs)
+
+    trainer._predict = record_predict
+    captured_masks = []
+    original_loss = h3_train_network.masked_squared_error_sum
+
+    def capture_mask(prediction, target, mask, **kwargs):
+        if prediction.ndim == 5:
+            captured_masks.append(mask.clone())
+        return original_loss(prediction, target, mask, **kwargs)
+
+    monkeypatch.setattr(h3_train_network, "masked_squared_error_sum", capture_mask)
+
+    trainer.validate(_ValidationAccelerator(), args, _ValidationTransformer(), None, 7, None)
+
+    assert observed_state == [((("first",), (0,)), step_mask)] * 2
+    assert len(captured_masks) == 2
+    for mask in captured_masks:
+        assert not bool(mask[:, :, 0].any())
+        assert bool(mask[:, :, 1].all())
+    assert trainer._step_mask is None and trainer._step_keyframes is None
 
 
 def test_h3_validation_omits_fully_masked_modality_and_uses_guidance_primary_objective_only():

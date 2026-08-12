@@ -252,6 +252,24 @@ def test_ref2va_omni_conditioning_accepts_text_only_presentation():
     assert int(cached[H3_REFERENCE_IMAGE_SHORT_EDGE_KEY]) == 2048
 
 
+def test_ref2va_video_conditioning_records_reference_temporal_contract(monkeypatch):
+    processor = _RefProcessor()
+    model = _TextModel()
+    encoder = MiniMaxH3ConditioningEncoder(processor, model, torch.bfloat16, "ref2va")
+    references = (H3PreparedReference(kind=H3ReferenceKind.VIDEO, frames=np.zeros((5, 4, 4, 3), dtype=np.uint8)),)
+    monkeypatch.setattr("musubi_tuner.minimax_h3.conditioning.prepare_references", lambda *_args, **_kwargs: references)
+    monkeypatch.setattr(
+        encoder,
+        "_encode_prompt",
+        lambda *_args, **_kwargs: (torch.zeros(2, 5120, dtype=torch.bfloat16), torch.ones(2, dtype=torch.long)),
+    )
+    item = SimpleNamespace(caption="video reference", content=np.zeros((5, 4, 4, 3), dtype=np.uint8))
+
+    cached = encoder.encode_conditioning([item])[0]
+
+    assert int(cached["mmh3_reference_temporal_contract"]) == 1
+
+
 def test_content_conditioning_populates_video_text_cache_path(tmp_path):
     item = ItemInfo("sample.mp4", "prompt", (4, 4), (4, 4), content=np.zeros((2, 4, 4, 3), dtype=np.uint8))
 
