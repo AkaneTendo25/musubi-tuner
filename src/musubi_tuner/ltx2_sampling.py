@@ -5190,6 +5190,7 @@ class LTX2SamplingMixin:
             sigma_schedule=sample_parameter.get("sigma_schedule") or getattr(args, "sample_sigma_schedule", "auto"),
             sample_sampler=sample_parameter.get("sample_sampler") or getattr(args, "sample_sampler", "auto"),
             sampling_preset=sample_parameter.get("sampling_preset") or getattr(args, "sample_sampling_preset", None),
+            ltx_version=str(getattr(args, "ltx_version", "2.3")),
             seed=seed,
             two_stage=True,
             spatial_upsampler_path=spatial_upsampler_path,

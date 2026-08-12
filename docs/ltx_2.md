@@ -859,7 +859,7 @@ The LTX-2.5 DiffVAE has a wider receptive field than the convolutional VAE. For 
 | `--sample_disable_flash_attn` | off | Force SDPA instead of FlashAttention during sampling |
 | `--sample_i2v_token_timestep_mask` | on | Use I2V token timestep masking (conditioned tokens use t=0). Use `--no-sample_i2v_token_timestep_mask` to disable |
 | `--sample_sampling_preset` | `defaults` | Validation sampling preset. Named values: `defaults` (resolves per `--ltx_version`), `legacy` (bypass preset defaults), `ltx20`, `ltx23`, `ltx23_hq`, `ltx25`, and `distilled_two_stage`; see [Two-Stage Sampling](#two-stage-sampling). LTX-2.5 defaults to its official distilled two-stage settings. |
-| `--sample_sampler` | `auto` | Denoising sampler. `auto` uses `res_2s` for full LTX presets and Euler for `distilled_two_stage` |
+| `--sample_sampler` | `auto` | Denoising sampler. The LTX-2.5 preset follows the official pipeline: Euler ancestral in stage 1 and deterministic Euler in stage 2. Other full LTX presets use `res_2s`; `distilled_two_stage` uses Euler. |
 | `--sample_sigma_schedule` | `auto` | Sigma schedule. `auto` uses latent-aware LTX shifted sigmas and the exact LTX-2.3 distilled schedule for the distilled preset |
 
 ### Precached Sample Prompts
@@ -2788,7 +2788,7 @@ python ltx2_generate_video.py ^
 
 `--prompt` (or `--sample_prompts <file>`) and a matching Gemma checkpoint are required; omit `--lora_weight` to sample the base model. For LTX-2.0, pass the 2.0 checkpoint with `--ltx_version 2.0`.
 
-For LTX-2.5, use `--ltx_version 2.5`, pass the packed Gemma 4 file with `--ltx2_text_encoder_checkpoint`, and pass the DiffVAE with `--vae`. `--sampling_preset defaults` selects the official distilled two-stage settings: 1920x1088 output from a 960x544 first stage, 121 frames at 24 fps, 8 first-stage steps, 3 refinement steps, CFG 1, and STG 0. It also requires `--spatial_upsampler_path`; use the distilled transformer directly, or the development transformer together with `--distilled_lora_path`. Add `--sample_with_offloading` when the transformer, Gemma, and DiffVAE do not fit simultaneously in VRAM. Use `--sampling_preset legacy` for custom single-stage settings.
+For LTX-2.5, use `--ltx_version 2.5`, pass the packed Gemma 4 file with `--ltx2_text_encoder_checkpoint`, and pass the DiffVAE with `--vae`. `--sampling_preset defaults` selects the official distilled two-stage settings: 1920x1088 output from a 960x544 first stage, 121 frames at 24 fps, 8 ancestral-Euler first-stage steps, 3 deterministic-Euler refinement steps, CFG 1, and STG 0. It also requires `--spatial_upsampler_path`; use the distilled transformer directly, or the development transformer together with `--distilled_lora_path`. Add `--sample_with_offloading` when the transformer, Gemma, and DiffVAE do not fit simultaneously in VRAM. Use `--sampling_preset legacy` for custom single-stage settings.
 
 For generated audio, add `--ltx2_mode av --ltx2_audio_vae /path/to/ltx-2.5-audio-vae-bf16.safetensors`. Standalone AV generation writes a WAV sidecar and an `_av.mp4` containing the generated audio track.
 

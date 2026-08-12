@@ -49,6 +49,7 @@ class InferenceConfig:
     sigma_schedule: str = "auto"
     sample_sampler: str = "auto"
     sampling_preset: Optional[str] = None
+    ltx_version: str = "2.3"
 
     # Two-stage inference
     two_stage: bool = False
@@ -443,6 +444,8 @@ class LTX2Inferencer:
         video_modality_scale: float = 1.0,
         audio_modality_scale: float = 1.0,
         sample_sampler: str = "euler",
+        use_ancestral_euler: bool = False,
+        ancestral_noise_seed: Optional[int] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Run the denoising loop with optional I2V conditioning.
 
@@ -450,9 +453,21 @@ class LTX2Inferencer:
             conditioning_latent: Optional first-frame conditioning latent [B, C, 1, H, W].
                                 If provided, first frame will be locked during denoising.
         """
-        from musubi_tuner.ltx_2.model.ltx2_scheduler import EulerDiffusionStep, X0PredictionWrapper
+        from musubi_tuner.ltx_2.model.ltx2_scheduler import (
+            EulerAncestralDiffusionStep,
+            EulerDiffusionStep,
+            X0PredictionWrapper,
+        )
 
         stepper = EulerDiffusionStep()
+        ancestral_stepper = EulerAncestralDiffusionStep(eta=1.0, s_noise=1.0) if use_ancestral_euler else None
+        ancestral_generator = None
+        if use_ancestral_euler:
+            if sample_sampler != "euler":
+                raise ValueError("Euler ancestral sampling requires the Euler sampler")
+            if ancestral_noise_seed is None:
+                raise ValueError("Euler ancestral sampling requires an explicit noise seed")
+            ancestral_generator = torch.Generator(device=latents.device).manual_seed(int(ancestral_noise_seed))
         effective_video_cfg = float(video_cfg_scale if video_cfg_scale is not None else cfg_scale)
         effective_audio_cfg = float(audio_cfg_scale if audio_cfg_scale is not None else cfg_scale)
         effective_video_rescale = float(video_rescale_scale if video_rescale_scale is not None else rescale_scale)
@@ -698,7 +713,8 @@ class LTX2Inferencer:
         if sampler_name == "res_2s" and audio_latents is not None:
             logger.warning("LTX-2 inference: res_2s is not wired for audio two-stage refinement yet; using Euler.")
             sampler_name = "euler"
-        logger.info("LTX-2 inference sampler: %s", sampler_name)
+        sampler_label = "euler_ancestral" if use_ancestral_euler else sampler_name
+        logger.info("LTX-2 inference sampler: %s", sampler_label)
 
         def _predict_video_x0_res2s(video_state: torch.Tensor, sigma_value: torch.Tensor) -> torch.Tensor:
             latent_input = torch.cat([video_state, video_state], dim=0) if do_cfg else video_state
@@ -993,6 +1009,17 @@ class LTX2Inferencer:
                     if denoise_mask is not None and clean_latent is not None:
                         midpoint_video_x0 = midpoint_video_x0 * denoise_mask + clean_latent * (1.0 - denoise_mask)
                     latents = res2s_step(latents, video_x0, midpoint_video_x0, sigmas[step_idx], sigmas[step_idx + 1])
+            elif ancestral_stepper is not None:
+                if sigmas[step_idx + 1].item() == 0.0:
+                    latents = video_x0
+                else:
+                    video_noise = torch.randn(
+                        latents.shape,
+                        dtype=latents.dtype,
+                        device=latents.device,
+                        generator=ancestral_generator,
+                    )
+                    latents = ancestral_stepper.step(latents, video_x0, sigmas, step_idx, video_noise)
             else:
                 latents = stepper.step(latents, video_x0, sigmas, step_idx)
 
@@ -1025,7 +1052,19 @@ class LTX2Inferencer:
                         factor = aud_x0_cond.std() / pred_std
                         factor = effective_audio_rescale * factor + (1.0 - effective_audio_rescale)
                         audio_x0 = audio_x0 * factor
-                audio_latents = stepper.step(audio_latents, audio_x0, sigmas, step_idx)
+                if ancestral_stepper is not None:
+                    if sigmas[step_idx + 1].item() == 0.0:
+                        audio_latents = audio_x0
+                    else:
+                        audio_noise = torch.randn(
+                            audio_latents.shape,
+                            dtype=audio_latents.dtype,
+                            device=audio_latents.device,
+                            generator=ancestral_generator,
+                        )
+                        audio_latents = ancestral_stepper.step(audio_latents, audio_x0, sigmas, step_idx, audio_noise)
+                else:
+                    audio_latents = stepper.step(audio_latents, audio_x0, sigmas, step_idx)
 
         # Free I2V conditioning tensors to reclaim memory
         if denoise_mask is not None or clean_latent is not None:
@@ -1104,11 +1143,12 @@ class LTX2Inferencer:
 
         # Seed
         if config.seed is not None:
-            torch.manual_seed(config.seed)
-            torch.cuda.manual_seed(config.seed)
-            generator = torch.Generator(device=self.device).manual_seed(config.seed)
+            sampling_seed = int(config.seed)
+            torch.manual_seed(sampling_seed)
+            torch.cuda.manual_seed(sampling_seed)
         else:
-            generator = torch.Generator(device=self.device).manual_seed(torch.initial_seed())
+            sampling_seed = int(torch.initial_seed())
+        generator = torch.Generator(device=self.device).manual_seed(sampling_seed)
 
         # Prepare prompt embeddings (handles dimension fixing internally)
         prompt_embeds, prompt_mask = self._prepare_prompt_embeds(config, do_cfg)
@@ -1244,6 +1284,12 @@ class LTX2Inferencer:
             self._apply_distilled_lora(stage1_lora_multiplier)
             stage1_lora_applied = True
 
+        try:
+            ltx_version = tuple(int(part) for part in str(config.ltx_version).split(".")[:2])
+        except ValueError:
+            ltx_version = (0, 0)
+        use_ltx25_ancestral = config.two_stage and (ltx_version >= (2, 5) or config.sampling_preset == "ltx25")
+
         with torch.no_grad():
             latents, audio_latents = self._denoise_loop(
                 latents,
@@ -1271,6 +1317,8 @@ class LTX2Inferencer:
                 video_modality_scale=config.video_modality_scale,
                 audio_modality_scale=config.audio_modality_scale,
                 sample_sampler=resolved_sampler,
+                use_ancestral_euler=use_ltx25_ancestral,
+                ancestral_noise_seed=sampling_seed + 10000,
             )
 
         # Stage 2: Upsample and refine (if two-stage)
