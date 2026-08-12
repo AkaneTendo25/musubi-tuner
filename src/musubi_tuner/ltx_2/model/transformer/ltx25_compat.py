@@ -16,6 +16,7 @@ class LTX25Capabilities:
     audio_ff_bias: bool = True
     use_prompt_adaln_single: bool = True
     use_keyframes_abs_pos_embedding: bool = False
+    native_dtype_adaln: bool = False
 
 
 def capabilities_from_config(config: Mapping[str, object]) -> LTX25Capabilities:
@@ -30,6 +31,7 @@ def capabilities_from_config(config: Mapping[str, object]) -> LTX25Capabilities:
         audio_ff_bias=bool(config.get("audio_ff_bias", True)),
         use_prompt_adaln_single=bool(config.get("use_prompt_adaln_single", True)),
         use_keyframes_abs_pos_embedding=bool(config.get("use_keyframes_abs_pos_embedding", False)),
+        native_dtype_adaln=bool(config.get("native_dtype_adaln", config.get("use_keyframes_abs_pos_embedding", False))),
     )
 
 
@@ -45,9 +47,13 @@ def capabilities_from_state_dict_keys(
     explicit = explicit_config or {}
     resolved = capabilities
 
+    has_keyframe_embedding = any(key.endswith("keyframes_abs_pos_embedding") for key in key_set)
     if "use_keyframes_abs_pos_embedding" not in explicit:
-        has_keyframe_embedding = any(key.endswith("keyframes_abs_pos_embedding") for key in key_set)
         resolved = replace(resolved, use_keyframes_abs_pos_embedding=has_keyframe_embedding)
+    # The released LTX-2.5 family carries this checkpoint-owned tensor. Detect
+    # it independently of whether metadata already declares the keyframe flag.
+    if has_keyframe_embedding and "native_dtype_adaln" not in explicit:
+        resolved = replace(resolved, native_dtype_adaln=True)
 
     # Quantized checkpoints may not expose ordinary Linear bias keys, so only
     # infer bias-free blocks when their corresponding dense weight is present.
@@ -80,6 +86,7 @@ def enrich_config_from_state_dict(config: dict, keys: Iterable[str]) -> dict:
     transformer.setdefault("audio_ff_bias", capabilities.audio_ff_bias)
     transformer.setdefault("use_prompt_adaln_single", capabilities.use_prompt_adaln_single)
     transformer.setdefault("use_keyframes_abs_pos_embedding", capabilities.use_keyframes_abs_pos_embedding)
+    transformer.setdefault("native_dtype_adaln", capabilities.native_dtype_adaln)
     enriched["transformer"] = transformer
     return enriched
 

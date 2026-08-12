@@ -311,7 +311,7 @@ def infer_ltx2_transformer_config_from_weights(model_path: str) -> Dict[str, Any
     """Reconstruct the nested transformer config for checkpoints that carry no
     config metadata (e.g. Optimum-Quanto exports).
 
-    Structural dims fall back to the configurator's defaults; the LTX-2.3 markers
+    Structural dims fall back to the configurator's defaults; checkpoint markers
     that change the architecture are auto-detected from weight keys/shapes:
       - apply_gated_attention      <- presence of ``to_gate_logits``
       - cross_attention_adaln      <- adaln_single.linear out-dim / inner-dim == 9
@@ -371,6 +371,27 @@ def infer_ltx2_transformer_config_from_weights(model_path: str) -> Dict[str, Any
 
         tcfg["caption_proj_before_connector"] = shape_of("caption_projection.linear_1.weight") is None
         tcfg["apply_gated_attention"] = any(k.endswith("to_gate_logits.weight") or k.endswith("to_gate_logits") for k in norm_keys)
+
+        # The released LTX-2.5 transformer is distributed as a standalone
+        # safetensors file without its JSON config. Its checkpoint-owned
+        # keyframe embedding is an unambiguous 2.5 marker, so restore the
+        # official positional/audio constants instead of silently inheriting
+        # the legacy configurator defaults. These values affect both inference
+        # and training forwards.
+        is_ltx25 = any(k.endswith("keyframes_abs_pos_embedding") for k in norm_keys)
+        if is_ltx25:
+            tcfg.update(
+                {
+                    "positional_embedding_theta": 10000.0,
+                    "positional_embedding_max_pos": [20, 2048, 2048],
+                    "audio_positional_embedding_max_pos": [20],
+                    "rope_type": "split",
+                    "frequencies_precision": "float64",
+                    "timestep_scale_multiplier": 1000,
+                    "av_ca_timestep_scale_multiplier": 1000.0,
+                    "causal_temporal_positioning": True,
+                }
+            )
 
         attn2_shape = shape_of("transformer_blocks.0.attn2.to_k.weight")
         if attn2_shape and len(attn2_shape) == 2:

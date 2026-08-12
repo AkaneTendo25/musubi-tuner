@@ -77,6 +77,7 @@ class LTXModelConfigurator(ModelConfigurator[LTXModel]):
             audio_ff_bias=capabilities.audio_ff_bias,
             use_prompt_adaln_single=capabilities.use_prompt_adaln_single,
             use_keyframes_abs_pos_embedding=capabilities.use_keyframes_abs_pos_embedding,
+            native_dtype_adaln=capabilities.native_dtype_adaln,
         )
 
 
@@ -134,6 +135,7 @@ class LTXVideoOnlyModelConfigurator(ModelConfigurator[LTXModel]):
             ff_bias=capabilities.ff_bias,
             use_prompt_adaln_single=capabilities.use_prompt_adaln_single,
             use_keyframes_abs_pos_embedding=capabilities.use_keyframes_abs_pos_embedding,
+            native_dtype_adaln=capabilities.native_dtype_adaln,
         )
 
 
@@ -190,6 +192,7 @@ class LTXAudioOnlyModelConfigurator(ModelConfigurator[LTXModel]):
             cross_attention_adaln=config.get("cross_attention_adaln", False),
             audio_ff_bias=capabilities.audio_ff_bias,
             use_prompt_adaln_single=capabilities.use_prompt_adaln_single,
+            native_dtype_adaln=capabilities.native_dtype_adaln,
         )
 
 

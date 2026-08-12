@@ -163,6 +163,7 @@ class TransformerConfig:
     apply_gated_attention: bool = False
     cross_attention_adaln: bool = False
     ff_bias: bool = True
+    native_dtype_adaln: bool = False
 
 
 def _move_non_linear_params(module: torch.nn.Module, device: torch.device, skip_trainable: bool = True) -> None:
@@ -298,6 +299,9 @@ class BasicAVTransformerBlock(torch.nn.Module):
         self.norm_eps = norm_eps
         self.cross_attention_adaln = bool(
             (video is not None and video.cross_attention_adaln) or (audio is not None and audio.cross_attention_adaln)
+        )
+        self.native_dtype_adaln = bool(
+            (video is not None and video.native_dtype_adaln) or (audio is not None and audio.native_dtype_adaln)
         )
         if self.cross_attention_adaln and video is not None:
             self.prompt_scale_shift_table = torch.nn.Parameter(torch.empty(2, video.dim))
@@ -482,6 +486,7 @@ class BasicAVTransformerBlock(torch.nn.Module):
                     context_mask,
                     self.norm_eps,
                     precomputed_kv,
+                    native_dtype_adaln=self.native_dtype_adaln,
                 )
             attn_input = (
                 rms_norm(x, eps=self.norm_eps).to(torch.float32) * (1 + scale_q.to(torch.float32)) + shift_q.to(torch.float32)
@@ -518,7 +523,14 @@ class BasicAVTransformerBlock(torch.nn.Module):
         table_name = "audio_prompt_scale_shift_table" if audio else "prompt_scale_shift_table"
         prompt_table = getattr(self, table_name, None)
         if self.cross_attention_adaln and prompt_table is not None and args.prompt_timestep is not None:
-            context = prepare_prompt_context(context, prompt_table, args.prompt_timestep, args.x.device, args.x.dtype)
+            context = prepare_prompt_context(
+                context,
+                prompt_table,
+                args.prompt_timestep,
+                args.x.device,
+                args.x.dtype,
+                native_dtype_adaln=self.native_dtype_adaln,
+            )
         return attn.prepare_kv(context)
 
     def forward(
@@ -826,11 +838,11 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 self.scale_shift_table, vx.shape[0], video.timesteps, slice(0, 3), num_tokens=vx.shape[1]
             )
             if not perturbations.all_in_batch(PerturbationType.SKIP_VIDEO_SELF_ATTN, self.idx):
-                # AdaLN Structural Fix: Force modulation to happen in Float32 to prevent overflow (10^18 issue)
-                norm_vx = (
-                    rms_norm(vx, eps=self.norm_eps).to(torch.float32) * (1 + vscale_msa.to(torch.float32))
-                    + vshift_msa.to(torch.float32)
-                ).to(vx.dtype)
+                if self.native_dtype_adaln:
+                    # LTX-2.5 official path keeps AdaLN modulation in model dtype.
+                    norm_vx = rms_norm(vx, eps=self.norm_eps) * (1 + vscale_msa) + vshift_msa
+                else:
+                    norm_vx = (rms_norm(vx, eps=self.norm_eps).float() * (1 + vscale_msa.float()) + vshift_msa.float()).to(vx.dtype)
                 v_mask = perturbations.mask_like(PerturbationType.SKIP_VIDEO_SELF_ATTN, self.idx, vx)
                 attn1_out = _attn_with_retry(
                     self.attn1,
@@ -869,11 +881,10 @@ class BasicAVTransformerBlock(torch.nn.Module):
             )
 
             if not perturbations.all_in_batch(PerturbationType.SKIP_AUDIO_SELF_ATTN, self.idx):
-                # AdaLN Structural Fix
-                norm_ax = (
-                    rms_norm(ax, eps=self.norm_eps).to(torch.float32) * (1 + ascale_msa.to(torch.float32))
-                    + ashift_msa.to(torch.float32)
-                ).to(ax.dtype)
+                if self.native_dtype_adaln:
+                    norm_ax = rms_norm(ax, eps=self.norm_eps) * (1 + ascale_msa) + ashift_msa
+                else:
+                    norm_ax = (rms_norm(ax, eps=self.norm_eps).float() * (1 + ascale_msa.float()) + ashift_msa.float()).to(ax.dtype)
                 a_mask = perturbations.mask_like(PerturbationType.SKIP_AUDIO_SELF_ATTN, self.idx, ax)
                 audio_attn1_out = _attn_with_retry(
                     self.audio_attn1,
@@ -945,15 +956,16 @@ class BasicAVTransformerBlock(torch.nn.Module):
             )
 
             if run_a2v and not perturbations.all_in_batch(PerturbationType.SKIP_A2V_CROSS_ATTN, self.idx):
-                # AdaLN Structural Fix
-                vx_scaled = (
-                    vx_norm3.to(torch.float32) * (1 + scale_ca_video_hidden_states_a2v.to(torch.float32))
-                    + shift_ca_video_hidden_states_a2v.to(torch.float32)
-                ).to(vx.dtype)
-                ax_scaled = (
-                    ax_norm3.to(torch.float32) * (1 + scale_ca_audio_hidden_states_a2v.to(torch.float32))
-                    + shift_ca_audio_hidden_states_a2v.to(torch.float32)
-                ).to(ax.dtype)
+                if self.native_dtype_adaln:
+                    vx_scaled = vx_norm3 * (1 + scale_ca_video_hidden_states_a2v) + shift_ca_video_hidden_states_a2v
+                    ax_scaled = ax_norm3 * (1 + scale_ca_audio_hidden_states_a2v) + shift_ca_audio_hidden_states_a2v
+                else:
+                    vx_scaled = (
+                        vx_norm3.float() * (1 + scale_ca_video_hidden_states_a2v.float()) + shift_ca_video_hidden_states_a2v.float()
+                    ).to(vx.dtype)
+                    ax_scaled = (
+                        ax_norm3.float() * (1 + scale_ca_audio_hidden_states_a2v.float()) + shift_ca_audio_hidden_states_a2v.float()
+                    ).to(ax.dtype)
                 # DCR: detach audio context AFTER AdaLN so scale/shift params also don't get noisy gradients
                 if dcr_audio_mask is not None:
                     ax_scaled = ax_scaled * dcr_audio_mask + ax_scaled.detach() * (1 - dcr_audio_mask)
@@ -975,15 +987,16 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 _check_finite_local("video_after_a2v", vx)
 
             if run_v2a and not perturbations.all_in_batch(PerturbationType.SKIP_V2A_CROSS_ATTN, self.idx):
-                # AdaLN Structural Fix
-                ax_scaled = (
-                    ax_norm3.to(torch.float32) * (1 + scale_ca_audio_hidden_states_v2a.to(torch.float32))
-                    + shift_ca_audio_hidden_states_v2a.to(torch.float32)
-                ).to(ax.dtype)
-                vx_scaled = (
-                    vx_norm3.to(torch.float32) * (1 + scale_ca_video_hidden_states_v2a.to(torch.float32))
-                    + shift_ca_video_hidden_states_v2a.to(torch.float32)
-                ).to(vx.dtype)
+                if self.native_dtype_adaln:
+                    ax_scaled = ax_norm3 * (1 + scale_ca_audio_hidden_states_v2a) + shift_ca_audio_hidden_states_v2a
+                    vx_scaled = vx_norm3 * (1 + scale_ca_video_hidden_states_v2a) + shift_ca_video_hidden_states_v2a
+                else:
+                    ax_scaled = (
+                        ax_norm3.float() * (1 + scale_ca_audio_hidden_states_v2a.float()) + shift_ca_audio_hidden_states_v2a.float()
+                    ).to(ax.dtype)
+                    vx_scaled = (
+                        vx_norm3.float() * (1 + scale_ca_video_hidden_states_v2a.float()) + shift_ca_video_hidden_states_v2a.float()
+                    ).to(vx.dtype)
                 # DCR: detach video context AFTER AdaLN
                 if dcr_video_mask is not None:
                     vx_scaled = vx_scaled * dcr_video_mask + vx_scaled.detach() * (1 - dcr_video_mask)
@@ -1025,11 +1038,10 @@ class BasicAVTransformerBlock(torch.nn.Module):
             vshift_mlp, vscale_mlp, vgate_mlp = self.get_ada_values(
                 self.scale_shift_table, vx.shape[0], video.timesteps, mlp_slice, num_tokens=vx.shape[1]
             )
-            # AdaLN Structural Fix
-            vx_scaled = (
-                rms_norm(vx, eps=self.norm_eps).to(torch.float32) * (1 + vscale_mlp.to(torch.float32))
-                + vshift_mlp.to(torch.float32)
-            ).to(vx.dtype)
+            if self.native_dtype_adaln:
+                vx_scaled = rms_norm(vx, eps=self.norm_eps) * (1 + vscale_mlp) + vshift_mlp
+            else:
+                vx_scaled = (rms_norm(vx, eps=self.norm_eps).float() * (1 + vscale_mlp.float()) + vshift_mlp.float()).to(vx.dtype)
             ff_out = self.ff(vx_scaled) * vgate_mlp
             if ffn_clamp > 0:
                 ff_out = ff_out.clamp(-ffn_clamp, ffn_clamp)
@@ -1043,11 +1055,10 @@ class BasicAVTransformerBlock(torch.nn.Module):
             ashift_mlp, ascale_mlp, agate_mlp = self.get_ada_values(
                 self.audio_scale_shift_table, ax.shape[0], audio.timesteps, mlp_slice, num_tokens=ax.shape[1]
             )
-            # AdaLN Structural Fix
-            ax_scaled = (
-                rms_norm(ax, eps=self.norm_eps).to(torch.float32) * (1 + ascale_mlp.to(torch.float32))
-                + ashift_mlp.to(torch.float32)
-            ).to(ax.dtype)
+            if self.native_dtype_adaln:
+                ax_scaled = rms_norm(ax, eps=self.norm_eps) * (1 + ascale_mlp) + ashift_mlp
+            else:
+                ax_scaled = (rms_norm(ax, eps=self.norm_eps).float() * (1 + ascale_mlp.float()) + ashift_mlp.float()).to(ax.dtype)
             audio_ff_out = self.audio_ff(ax_scaled) * agate_mlp
             if ffn_clamp > 0:
                 audio_ff_out = audio_ff_out.clamp(-ffn_clamp, ffn_clamp)
@@ -1133,8 +1144,9 @@ def prepare_prompt_context(
     prompt_timestep: torch.Tensor,
     target_device: torch.device,
     hidden_dtype: torch.dtype,
+    native_dtype_adaln: bool = False,
 ) -> torch.Tensor:
-    prompt_adaln_fp32 = os.getenv("LTX2_PROMPT_ADALN_FP32", "1") == "1"
+    prompt_adaln_fp32 = not native_dtype_adaln and os.getenv("LTX2_PROMPT_ADALN_FP32", "1") == "1"
     adaln_dtype = torch.float32 if prompt_adaln_fp32 else hidden_dtype
     shift_kv, scale_kv = (
         prompt_scale_shift_table[None, None].to(device=target_device, dtype=adaln_dtype)
@@ -1157,8 +1169,9 @@ def apply_cross_attention_adaln(
     context_mask: torch.Tensor | None = None,
     norm_eps: float = 1e-6,
     precomputed_kv: tuple[torch.Tensor, torch.Tensor] | None = None,
+    native_dtype_adaln: bool = False,
 ) -> torch.Tensor:
-    prompt_adaln_fp32 = os.getenv("LTX2_PROMPT_ADALN_FP32", "1") == "1"
+    prompt_adaln_fp32 = not native_dtype_adaln and os.getenv("LTX2_PROMPT_ADALN_FP32", "1") == "1"
     if prompt_adaln_fp32:
         attn_input = (rms_norm(x, eps=norm_eps).to(torch.float32) * (1 + q_scale.to(torch.float32)) + q_shift.to(torch.float32)).to(
             x.dtype
@@ -1173,6 +1186,7 @@ def apply_cross_attention_adaln(
             prompt_timestep,
             x.device,
             x.dtype,
+            native_dtype_adaln=native_dtype_adaln,
         )
     return (
         attn(

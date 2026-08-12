@@ -18,7 +18,7 @@ import torch
 import torch.nn.functional as F
 from tqdm import tqdm
 
-from musubi_tuner.ltx2_samplers import resolve_ltx2_sampler, res2s_midpoint, res2s_step
+from musubi_tuner.ltx2_samplers import res2s_midpoint, res2s_step, resolve_ltx2_sampler
 from musubi_tuner.utils.device_utils import clean_memory_on_device
 
 logger = logging.getLogger(__name__)
@@ -301,6 +301,30 @@ class LTX2Inferencer:
             device=self.device,
             generator=generator,
         )
+
+    @staticmethod
+    def _randn_video_token_order(latents: torch.Tensor, generator: torch.Generator) -> torch.Tensor:
+        """Draw noise in the token-major order used by official LTX-2.5."""
+        batch, channels, frames, height, width = latents.shape
+        noise = torch.randn(
+            (batch, frames * height * width, channels),
+            dtype=latents.dtype,
+            device=latents.device,
+            generator=generator,
+        )
+        return noise.reshape(batch, frames, height, width, channels).permute(0, 4, 1, 2, 3).contiguous()
+
+    @staticmethod
+    def _randn_audio_token_order(latents: torch.Tensor, generator: torch.Generator) -> torch.Tensor:
+        """Draw audio noise in the token-major order used by official LTX-2.5."""
+        batch, channels, frames, mel_bins = latents.shape
+        noise = torch.randn(
+            (batch, frames, channels * mel_bins),
+            dtype=latents.dtype,
+            device=latents.device,
+            generator=generator,
+        )
+        return noise.reshape(batch, frames, channels, mel_bins).permute(0, 2, 1, 3).contiguous()
 
     def _get_expected_embed_dim(self) -> Optional[int]:
         """Get expected embedding dimension based on mode."""
@@ -1013,12 +1037,7 @@ class LTX2Inferencer:
                 if sigmas[step_idx + 1].item() == 0.0:
                     latents = video_x0
                 else:
-                    video_noise = torch.randn(
-                        latents.shape,
-                        dtype=latents.dtype,
-                        device=latents.device,
-                        generator=ancestral_generator,
-                    )
+                    video_noise = self._randn_video_token_order(latents, ancestral_generator)
                     latents = ancestral_stepper.step(latents, video_x0, sigmas, step_idx, video_noise)
             else:
                 latents = stepper.step(latents, video_x0, sigmas, step_idx)
@@ -1056,12 +1075,7 @@ class LTX2Inferencer:
                     if sigmas[step_idx + 1].item() == 0.0:
                         audio_latents = audio_x0
                     else:
-                        audio_noise = torch.randn(
-                            audio_latents.shape,
-                            dtype=audio_latents.dtype,
-                            device=audio_latents.device,
-                            generator=ancestral_generator,
-                        )
+                        audio_noise = self._randn_audio_token_order(audio_latents, ancestral_generator)
                         audio_latents = ancestral_stepper.step(audio_latents, audio_x0, sigmas, step_idx, audio_noise)
                 else:
                     audio_latents = stepper.step(audio_latents, audio_x0, sigmas, step_idx)
@@ -1209,8 +1223,34 @@ class LTX2Inferencer:
         latent_width = gen_width // spatial_factor
         in_channels = getattr(self.transformer, "in_channels", 128)
 
-        # Initialize latents
-        latents = self._init_latents(1, in_channels, latent_frames, latent_height, latent_width, generator)
+        # The official LTX-2.5 DiffusionStage builds both modality states in the
+        # transformer dtype before GaussianNoiser draws from the shared RNG.
+        # Drawing FP32 here changes both the samples and every later ancestral
+        # RNG draw, even if the model input is subsequently cast to BF16.
+        initial_latent_dtype = self.dit_dtype if config.ltx_version >= "2.5" else torch.float32
+        if config.ltx_version >= "2.5":
+            # Official DiffusionStage noises the already-patchified latent. Draw
+            # in that exact token-major order, then restore our channel-first
+            # representation. Drawing channel-first and patchifying afterwards
+            # assigns the same RNG stream to different channels/positions.
+            latents = torch.randn(
+                (1, latent_frames * latent_height * latent_width, in_channels),
+                dtype=initial_latent_dtype,
+                device=self.device,
+                generator=generator,
+            )
+            latents = latents.reshape(1, latent_frames, latent_height, latent_width, in_channels)
+            latents = latents.permute(0, 4, 1, 2, 3).contiguous()
+        else:
+            latents = self._init_latents(
+                1,
+                in_channels,
+                latent_frames,
+                latent_height,
+                latent_width,
+                generator,
+                dtype=initial_latent_dtype,
+            )
 
         # I2V conditioning will be applied during denoising loop via denoise_mask
 
@@ -1231,12 +1271,24 @@ class LTX2Inferencer:
                     audio_latent_downsample_factor=audio_cfg.get("audio_latent_downsample_factor", 4),
                 )
                 audio_frames = max(int(audio_shape.frames), 1)
-                audio_latents = torch.randn(
-                    (1, audio_cfg.get("channels", 8), audio_frames, audio_cfg.get("mel_bins", 64)),
-                    dtype=torch.float32,
-                    device=self.device,
-                    generator=generator,
-                )
+                audio_channels = audio_cfg.get("channels", 8)
+                audio_mel_bins = audio_cfg.get("mel_bins", 64)
+                if config.ltx_version >= "2.5":
+                    audio_latents = torch.randn(
+                        (1, audio_frames, audio_channels * audio_mel_bins),
+                        dtype=initial_latent_dtype,
+                        device=self.device,
+                        generator=generator,
+                    )
+                    audio_latents = audio_latents.reshape(1, audio_frames, audio_channels, audio_mel_bins)
+                    audio_latents = audio_latents.permute(0, 2, 1, 3).contiguous()
+                else:
+                    audio_latents = torch.randn(
+                        (1, audio_channels, audio_frames, audio_mel_bins),
+                        dtype=initial_latent_dtype,
+                        device=self.device,
+                        generator=generator,
+                    )
 
         # Stage 1: Main generation
         from musubi_tuner.ltx_2.components.schedulers import build_ltx2_sigmas
@@ -1413,14 +1465,23 @@ class LTX2Inferencer:
             # Add noise at stage 2 starting sigma using flow matching formula:
             # noisy = (1 - sigma) * x0 + sigma * noise
             sigma = stage2_sigmas[0].item()
-            video_noise = torch.randn(latents.shape, dtype=latents.dtype, device=latents.device, generator=generator)
+            if config.ltx_version >= "2.5":
+                video_noise = self._randn_video_token_order(latents, generator)
+            else:
+                video_noise = torch.randn(latents.shape, dtype=latents.dtype, device=latents.device, generator=generator)
             latents = (1.0 - sigma) * latents + sigma * video_noise
 
             # Also add noise to audio latents if present.
             if audio_latents is not None:
-                audio_noise = torch.randn(
-                    audio_latents.shape, dtype=audio_latents.dtype, device=audio_latents.device, generator=generator
-                )
+                if config.ltx_version >= "2.5":
+                    audio_noise = self._randn_audio_token_order(audio_latents, generator)
+                else:
+                    audio_noise = torch.randn(
+                        audio_latents.shape,
+                        dtype=audio_latents.dtype,
+                        device=audio_latents.device,
+                        generator=generator,
+                    )
                 audio_latents = (1.0 - sigma) * audio_latents + sigma * audio_noise
 
             with torch.no_grad():
@@ -1460,17 +1521,18 @@ class LTX2Inferencer:
         if decode_video and not config.audio_only:
             self.vae.to_device(self.device)
             with torch.no_grad():
-                if use_tiled_vae and tiled_vae_config:
-                    from musubi_tuner.ltx_2.model.video_vae import (
-                        DiffusionVideoDecoder,
-                        SpatialTilingConfig,
-                        TemporalTilingConfig,
-                        TilingConfig,
-                    )
+                from musubi_tuner.ltx_2.model.video_vae import (
+                    DiffusionVideoDecoder,
+                    SpatialTilingConfig,
+                    TemporalTilingConfig,
+                    TilingConfig,
+                )
 
-                    decoder = getattr(self.vae, "decoder", None)
+                decoder = getattr(self.vae, "decoder", None)
+                auto_diffvae = isinstance(decoder, DiffusionVideoDecoder) and config.ltx_version >= "2.5"
+                if (use_tiled_vae and tiled_vae_config) or auto_diffvae:
                     if isinstance(decoder, DiffusionVideoDecoder):
-                        if tiled_vae_config.get("auto", False):
+                        if tiled_vae_config is None or tiled_vae_config.get("auto", False):
                             tile_cfg = self.vae.recommended_tiling_config(
                                 height=config.height,
                                 width=config.width,

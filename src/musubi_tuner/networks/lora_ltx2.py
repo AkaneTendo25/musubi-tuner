@@ -300,6 +300,14 @@ class LTX2Wrapper(nn.Module):
         )
         self.patch_size = patch_size
 
+    @property
+    def _positions_dtype(self) -> torch.dtype | None:
+        """Keep official FP32 coordinate precision for checkpoint-detected 2.5 models."""
+
+        if getattr(self.model, "keyframes_abs_pos_embedding", None) is not None:
+            return torch.float32
+        return None
+
     def enable_gradient_checkpointing(self, activation_cpu_offloading: bool = False, **kwargs):
         if hasattr(self.model, "enable_gradient_checkpointing"):
             # LTX2 core model supports blocks_to_checkpoint when provided.
@@ -602,7 +610,7 @@ class LTX2Wrapper(nn.Module):
                 latent_coords=latent_coords,
                 scale_factors=SpatioTemporalScaleFactors.default(),
                 causal_fix=True,
-            ).to(dtype=video_latents.dtype)
+            ).to(dtype=self._positions_dtype or video_latents.dtype)
             video_positions[:, 0, ...] = video_positions[:, 0, ...] / float(frame_rate)
             if isinstance(transformer_options, dict):
                 video_positions_override = transformer_options.get("video_positions_override")
@@ -760,7 +768,7 @@ class LTX2Wrapper(nn.Module):
                 enabled=(True if audio_enabled is None else bool(audio_enabled)),
                 latent=audio_tokens,
                 timesteps=audio_timesteps,
-                positions=audio_positions.to(dtype=audio_latents.dtype),
+                positions=audio_positions.to(dtype=self._positions_dtype or audio_latents.dtype),
                 context=audio_context,
                 sigma=audio_sigma,
                 context_mask=audio_context_mask,

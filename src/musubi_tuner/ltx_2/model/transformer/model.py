@@ -199,6 +199,7 @@ class LTXModel(torch.nn.Module):
         audio_ff_bias: bool = True,
         use_prompt_adaln_single: bool = True,
         use_keyframes_abs_pos_embedding: bool = False,
+        native_dtype_adaln: bool = False,
     ):
         super().__init__()
         self._enable_gradient_checkpointing = False
@@ -221,6 +222,7 @@ class LTXModel(torch.nn.Module):
         self.audio_ff_bias = audio_ff_bias
         self.use_prompt_adaln_single = use_prompt_adaln_single
         self.use_keyframes_abs_pos_embedding = use_keyframes_abs_pos_embedding
+        self.native_dtype_adaln = native_dtype_adaln
         self._tread_router: TREADRouter | None = None
         self._tread_routes: list[dict[str, Any]] | None = None
         cross_pe_max_pos = None
@@ -469,6 +471,7 @@ class LTXModel(torch.nn.Module):
                 apply_gated_attention=apply_gated_attention,
                 cross_attention_adaln=self.cross_attention_adaln,
                 ff_bias=self.ff_bias,
+                native_dtype_adaln=self.native_dtype_adaln,
             )
             if self.model_type.is_video_enabled()
             else None
@@ -482,6 +485,7 @@ class LTXModel(torch.nn.Module):
                 apply_gated_attention=apply_gated_attention,
                 cross_attention_adaln=self.cross_attention_adaln,
                 ff_bias=self.audio_ff_bias,
+                native_dtype_adaln=self.native_dtype_adaln,
             )
             if self.model_type.is_audio_enabled()
             else None
