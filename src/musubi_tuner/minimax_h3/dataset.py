@@ -22,6 +22,9 @@ from musubi_tuner.minimax_h3.media import MediaAsset, MediaModality, slice_media
 
 AUDIO_EXTENSIONS = (".wav", ".flac", ".mp3", ".m4a", ".aac", ".ogg", ".opus")
 _CONTROL_PATH_PATTERN = re.compile(r"^control_path_(\d+)$")
+_CONTROL_VIDEO_PATH_PATTERN = re.compile(r"^control_video_path_(\d+)$")
+_CONTROL_AUDIO_PATH_PATTERN = re.compile(r"^control_audio_path_(\d+)$")
+_CONTROL_MODALITY_PATTERN = re.compile(r"^control_modality_(\d+)$")
 _CROP_SUFFIX_PATTERN = re.compile(r"^(?P<stem>.+)_(?P<start>\d{5})-(?P<frames>\d+)$")
 
 
@@ -55,6 +58,75 @@ def _ordered_control_paths(record: dict[str, Any]) -> tuple[Path, ...]:
     if indices != list(range(len(indices))):
         raise ValueError(f"control_path_N indices must be contiguous from zero, got {indices}")
     return tuple(path for _, path in numbered)
+
+
+def _paired_control_assets(record: dict[str, Any]) -> tuple[MediaAsset, ...]:
+    video_paths: dict[int, Path] = {}
+    audio_paths: dict[int, Path] = {}
+    for key, value in record.items():
+        if not value:
+            continue
+        video_match = _CONTROL_VIDEO_PATH_PATTERN.fullmatch(key)
+        audio_match = _CONTROL_AUDIO_PATH_PATTERN.fullmatch(key)
+        if video_match:
+            video_paths[int(video_match.group(1))] = Path(value)
+        elif audio_match:
+            audio_paths[int(audio_match.group(1))] = Path(value)
+    if not video_paths and not audio_paths:
+        return ()
+    if set(video_paths) != set(audio_paths):
+        raise ValueError("control_video_path_N and control_audio_path_N must use the same indices")
+    indices = sorted(video_paths)
+    if indices != list(range(len(indices))):
+        raise ValueError(f"paired control indices must be contiguous from zero, got {indices}")
+    assets = []
+    for index in indices:
+        video_path = video_paths[index]
+        audio_path = audio_paths[index]
+        if _modality_for_path(video_path) is not MediaModality.VIDEO:
+            raise ValueError(f"control_video_path_{index} must be a video: {video_path}")
+        if _modality_for_path(audio_path) is not MediaModality.AUDIO:
+            raise ValueError(f"control_audio_path_{index} must be audio: {audio_path}")
+        assets.append(
+            MediaAsset(
+                video_path,
+                MediaModality.VIDEO,
+                "reference",
+                metadata={"audio_path": str(audio_path)},
+            )
+        )
+    return tuple(assets)
+
+
+def _reference_modes(record: dict[str, Any]) -> dict[int, str]:
+    modes: dict[int, str] = {}
+    for key, value in record.items():
+        match = _CONTROL_MODALITY_PATTERN.fullmatch(key)
+        if not match or value is None:
+            continue
+        mode = str(value).lower()
+        if mode not in {"av", "video", "audio"}:
+            raise ValueError(f"{key} must be av, video, or audio")
+        modes[int(match.group(1))] = mode
+    return modes
+
+
+def _select_reference_modality(asset: MediaAsset, mode: str, *, index: int) -> MediaAsset:
+    if mode == "av":
+        if asset.modality is not MediaModality.VIDEO:
+            raise ValueError(f"control_modality_{index}=av requires a video reference")
+        return asset
+    if mode == "video":
+        if asset.modality not in {MediaModality.IMAGE, MediaModality.VIDEO}:
+            raise ValueError(f"control_modality_{index}=video requires an image or video reference")
+        metadata = dict(asset.metadata)
+        metadata["include_audio"] = False
+        metadata.pop("audio_path", None)
+        return MediaAsset(asset.path, asset.modality, asset.role, metadata=metadata)
+    audio_path = Path(asset.metadata.get("audio_path", asset.path))
+    if _modality_for_path(audio_path) not in {MediaModality.VIDEO, MediaModality.AUDIO}:
+        raise ValueError(f"control_modality_{index}=audio requires a video or audio reference")
+    return MediaAsset(audio_path, MediaModality.AUDIO, asset.role)
 
 
 def _control_sort_key(path: Path, target_stem: str) -> int:
@@ -92,18 +164,73 @@ def _references_from_directory(control_directory: str, target_paths: Sequence[st
     return result
 
 
+def _paired_references_from_directories(
+    video_directory: str,
+    audio_directory: str,
+    target_paths: Sequence[str],
+) -> dict[str, tuple[MediaAsset, ...]]:
+    video_paths = _references_from_directory(video_directory, target_paths)
+    audio_paths = _references_from_directory(audio_directory, target_paths)
+    result = {}
+    for target in target_paths:
+        videos = video_paths[target]
+        audios = audio_paths[target]
+        if len(videos) != 1 or len(audios) != 1:
+            raise ValueError(f"paired H3 reference directories require one video and one audio match for {target!r}")
+        video_path, audio_path = videos[0], audios[0]
+        if _modality_for_path(video_path) is not MediaModality.VIDEO:
+            raise ValueError(f"control_video_directory must contain video references, got {video_path}")
+        if _modality_for_path(audio_path) is not MediaModality.AUDIO:
+            raise ValueError(f"control_audio_directory must contain audio references, got {audio_path}")
+        result[target] = (
+            MediaAsset(
+                video_path,
+                MediaModality.VIDEO,
+                "reference",
+                metadata={"audio_path": str(audio_path)},
+            ),
+        )
+    return result
+
+
+def _dataset_reference_modes(source: dict[str, Any], general: dict[str, Any], count: int) -> tuple[str | None, ...]:
+    mode = _effective(source, general, "control_modality")
+    modes = _effective(source, general, "control_modalities")
+    if mode is not None and modes is not None:
+        raise ValueError("use control_modality or control_modalities, not both")
+    if modes is not None:
+        if not isinstance(modes, list) or len(modes) != count:
+            raise ValueError(f"control_modalities must contain exactly {count} entries")
+        values = tuple(str(value).lower() for value in modes)
+    elif mode is not None:
+        values = (str(mode).lower(),) * count
+    else:
+        return (None,) * count
+    if any(value not in {"av", "video", "audio"} for value in values):
+        raise ValueError("control modality values must be av, video, or audio")
+    return values
+
+
 def _read_media_jsonl(path: str, *, resolve_paths: bool = False) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     with open(path, "r", encoding="utf-8") as stream:
         for line_number, line in enumerate(stream, 1):
             try:
                 record = json.loads(line)
+                base = Path(path).expanduser().resolve().parent
+                for key in tuple(record):
+                    if _CONTROL_VIDEO_PATH_PATTERN.fullmatch(key) or _CONTROL_AUDIO_PATH_PATTERN.fullmatch(key):
+                        media_path = Path(record[key]).expanduser()
+                        if not media_path.is_absolute():
+                            media_path = base / media_path
+                        record[key] = str(media_path.resolve())
                 if resolve_paths:
-                    base = Path(path).expanduser().resolve().parent
                     for key in tuple(record):
                         if (
                             key in {"image_path", "video_path", "control_path"}
                             or _CONTROL_PATH_PATTERN.fullmatch(key)
+                            or _CONTROL_VIDEO_PATH_PATTERN.fullmatch(key)
+                            or _CONTROL_AUDIO_PATH_PATTERN.fullmatch(key)
                             or re.fullmatch(r"image_path_\d+", key)
                         ):
                             media_path = Path(record[key]).expanduser()
@@ -154,6 +281,8 @@ class H3DatasetAdapter:
         general = user_config.get("general", {})
         clean_general = self.musubi_config.get("general", {})
         clean_general.pop("control_directory", None)
+        for key in ("control_video_directory", "control_audio_directory", "control_modality", "control_modalities"):
+            clean_general.pop(key, None)
         for key in ("h3_target_mode", "h3_image_frame_count", "audio_directory", "audio_jsonl_file"):
             clean_general.pop(key, None)
 
@@ -189,6 +318,12 @@ class H3DatasetAdapter:
             self.dataset_kinds.append("regular")
             control_directory = _effective(source, general, "control_directory")
             clean.pop("control_directory", None)
+            control_video_directory = _effective(source, general, "control_video_directory")
+            control_audio_directory = _effective(source, general, "control_audio_directory")
+            for key in ("control_video_directory", "control_audio_directory", "control_modality", "control_modalities"):
+                clean.pop(key, None)
+            if bool(control_video_directory) != bool(control_audio_directory):
+                raise ValueError("control_video_directory and control_audio_directory must be specified together")
             video_directory = _effective(source, general, "video_directory")
             video_jsonl_file = _effective(source, general, "video_jsonl_file")
             image_directory = _effective(source, general, "image_directory")
@@ -274,19 +409,46 @@ class H3DatasetAdapter:
             else:
                 frame_count = None
 
-            if control_directory and records and any(_ordered_control_paths(record) for record in records):
+            if (
+                (control_directory or control_video_directory)
+                and records
+                and any(_ordered_control_paths(record) or _paired_control_assets(record) for record in records)
+            ):
                 raise ValueError("specify H3 controls in control_directory or video JSONL, not both")
-            if control_directory:
-                reference_paths = _references_from_directory(control_directory, target_paths)
+            if control_directory or control_video_directory:
+                ordinary_reference_paths = _references_from_directory(control_directory, target_paths) if control_directory else {}
+                paired_reference_paths = (
+                    _paired_references_from_directories(
+                        control_video_directory,
+                        control_audio_directory,
+                        target_paths,
+                    )
+                    if control_video_directory
+                    else {}
+                )
+                reference_paths = {
+                    target: (*ordinary_reference_paths.get(target, ()), *paired_reference_paths.get(target, ()))
+                    for target in target_paths
+                }
             elif records is not None:
                 reference_paths = {}
                 for record in records:
                     controls = _ordered_control_paths(record)
-                    if controls:
+                    paired_controls = _paired_control_assets(record)
+                    modes = _reference_modes(record)
+                    if controls or paired_controls:
                         target_key = record.get("video_path") or record.get("image_path") or record.get("image_path_0")
                         if target_key is None:
                             raise ValueError("H3 media JSONL records must contain a target path")
-                        reference_paths[target_key] = controls
+                        ordinary_assets = tuple(MediaAsset(path, _modality_for_path(path), "reference") for path in controls)
+                        references = (*ordinary_assets, *paired_controls)
+                        unknown_modes = sorted(set(modes) - set(range(len(references))))
+                        if unknown_modes:
+                            raise ValueError(f"control_modality_N has no matching reference indices: {unknown_modes}")
+                        reference_paths[target_key] = tuple(
+                            _select_reference_modality(reference, modes[index], index=index) if index in modes else reference
+                            for index, reference in enumerate(references)
+                        )
             else:
                 reference_paths = {}
 
@@ -296,8 +458,17 @@ class H3DatasetAdapter:
                     raise ValueError(f"MiniMax H3 video datasets must resolve video targets, got {target}")
                 if (image_directory or image_jsonl_file) and modality is not MediaModality.IMAGE:
                     raise ValueError(f"MiniMax H3 image datasets must resolve image targets, got {target}")
+                raw_references = reference_paths.get(target, ())
                 references = tuple(
-                    MediaAsset(path, _modality_for_path(path), "reference") for path in reference_paths.get(target, ())
+                    reference
+                    if isinstance(reference, MediaAsset)
+                    else MediaAsset(reference, _modality_for_path(reference), "reference")
+                    for reference in raw_references
+                )
+                modes = _dataset_reference_modes(source, general, len(references))
+                references = tuple(
+                    _select_reference_modality(reference, mode, index=index) if mode is not None else reference
+                    for index, (reference, mode) in enumerate(zip(references, modes))
                 )
                 resolved = _ResolvedTarget(Path(target), references)
                 normal = _normal_path(target)
@@ -325,7 +496,9 @@ class H3DatasetAdapter:
             modality in {MediaModality.VIDEO, MediaModality.AUDIO} and self._target_modes[path] != "video"
             for path, modality in self._target_modalities.items()
         ) or any(
-            reference.modality is MediaModality.AUDIO for resolved in self._targets.values() for reference in resolved.references
+            reference.modality is MediaModality.AUDIO or bool(reference.metadata.get("audio_path"))
+            for resolved in self._targets.values()
+            for reference in resolved.references
         )
         self.requires_video = any(mode != "audio" for mode in self._target_modes.values()) or any(
             reference.modality in {MediaModality.IMAGE, MediaModality.VIDEO}
@@ -343,7 +516,13 @@ class H3DatasetAdapter:
             if hasattr(datasource, "data"):
                 for record in datasource.data:
                     for key in tuple(record):
-                        if key == "control_path" or _CONTROL_PATH_PATTERN.fullmatch(key):
+                        if (
+                            key == "control_path"
+                            or _CONTROL_PATH_PATTERN.fullmatch(key)
+                            or _CONTROL_VIDEO_PATH_PATTERN.fullmatch(key)
+                            or _CONTROL_AUDIO_PATH_PATTERN.fullmatch(key)
+                            or _CONTROL_MODALITY_PATTERN.fullmatch(key)
+                        ):
                             record.pop(key, None)
                 datasource.has_control = False
             dataset.control_directory = None
@@ -490,6 +669,8 @@ def validate_h3_media_assets(key: str, assets: tuple[MediaAsset, ...], *, check_
     if unsupported_roles:
         raise ValueError(f"H3 item {key!r} contains unsupported roles: {unsupported_roles}")
     if check_files:
-        missing = sorted({str(asset.path) for asset in assets if not asset.path.is_file()})
+        media_paths = {asset.path for asset in assets}
+        media_paths.update(Path(asset.metadata["audio_path"]) for asset in assets if asset.metadata.get("audio_path"))
+        missing = sorted(str(path) for path in media_paths if not path.is_file())
         if missing:
             raise FileNotFoundError(f"media file(s) not found for H3 item {key!r}: {', '.join(missing)}")

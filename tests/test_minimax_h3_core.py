@@ -63,6 +63,7 @@ from musubi_tuner.minimax_h3.packing import (
 )
 from musubi_tuner.minimax_h3.references import (
     REFERENCE_IMAGE_SHORT_EDGE,
+    _reference_audio_asset,
     _source_frame_limit,
     resample_reference_frames,
     resolve_reference_image_size,
@@ -542,6 +543,159 @@ def test_h3_reuses_numbered_jsonl_control_paths(tmp_path):
     assets = adapter.attach(item)
     assert [asset.path for asset in assets[1:]] == [image, audio]
     assert group.datasets[0].datasource.has_control is False
+
+
+def test_h3_paired_video_audio_paths_form_one_av_reference(tmp_path):
+    target = tmp_path / "target.mp4"
+    reference_video = tmp_path / "motion.mp4"
+    reference_audio = tmp_path / "voice.wav"
+    for path in (target, reference_video, reference_audio):
+        path.write_bytes(b"media")
+    manifest = tmp_path / "videos.jsonl"
+    manifest.write_text(
+        json.dumps(
+            {
+                "video_path": str(target),
+                "control_video_path_0": str(reference_video),
+                "control_audio_path_0": str(reference_audio),
+                "caption": "prompt",
+            }
+        ),
+        encoding="utf-8",
+    )
+    config = {
+        "general": {"resolution": [512, 512]},
+        "datasets": [
+            {
+                "video_jsonl_file": str(manifest),
+                "cache_directory": str(tmp_path / "cache"),
+                "target_frames": [22],
+                "frame_extraction": "uniform",
+            }
+        ],
+    }
+
+    group, adapter = create_h3_dataset_group(config, Namespace(debug_dataset=False))
+    item = ItemInfo(str(target), "prompt", (512, 512), (512, 512), frame_count=22)
+    assets = adapter.attach(item)
+
+    assert len(assets) == 2
+    assert assets[1].path == reference_video
+    assert assets[1].modality is MediaModality.VIDEO
+    assert assets[1].metadata == {"audio_path": str(reference_audio)}
+    assert adapter.requires_audio is True
+    assert group.datasets[0].datasource.has_control is False
+
+    audio_asset = _reference_audio_asset(assets[1])
+    assert audio_asset.path == reference_audio
+    assert audio_asset.modality is MediaModality.AUDIO
+
+
+def test_h3_paired_reference_requires_matching_indices(tmp_path):
+    target = tmp_path / "target.mp4"
+    target.write_bytes(b"media")
+    manifest = tmp_path / "videos.jsonl"
+    manifest.write_text(
+        json.dumps(
+            {
+                "video_path": str(target),
+                "control_video_path_0": str(tmp_path / "motion.mp4"),
+                "caption": "prompt",
+            }
+        ),
+        encoding="utf-8",
+    )
+    config = {
+        "general": {"resolution": [512, 512]},
+        "datasets": [
+            {
+                "video_jsonl_file": str(manifest),
+                "cache_directory": str(tmp_path / "cache"),
+                "target_frames": [22],
+            }
+        ],
+    }
+
+    with pytest.raises(ValueError, match="must use the same indices"):
+        create_h3_dataset_group(config, Namespace(debug_dataset=False))
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected_modality", "expected_path", "include_audio"),
+    [
+        ("av", MediaModality.VIDEO, "scene.mp4", True),
+        ("video", MediaModality.VIDEO, "scene.mp4", False),
+        ("audio", MediaModality.AUDIO, "scene.wav", None),
+    ],
+)
+def test_h3_toml_paired_reference_directories_select_modality(tmp_path, mode, expected_modality, expected_path, include_audio):
+    targets = tmp_path / "targets"
+    reference_video = tmp_path / "reference_video"
+    reference_audio = tmp_path / "reference_audio"
+    for directory in (targets, reference_video, reference_audio):
+        directory.mkdir()
+    (targets / "scene.mp4").write_bytes(b"target")
+    (reference_video / "scene.mp4").write_bytes(b"video")
+    (reference_audio / "scene.wav").write_bytes(b"audio")
+    config = {
+        "general": {"resolution": [512, 512]},
+        "datasets": [
+            {
+                "video_directory": str(targets),
+                "control_video_directory": str(reference_video),
+                "control_audio_directory": str(reference_audio),
+                "control_modality": mode,
+                "cache_directory": str(tmp_path / "cache"),
+                "target_frames": [22],
+            }
+        ],
+    }
+
+    group, adapter = create_h3_dataset_group(config, Namespace(debug_dataset=False))
+    item = ItemInfo(str(targets / "scene.mp4"), "prompt", (512, 512), (512, 512), frame_count=22)
+    reference = adapter.attach(item)[1]
+
+    assert reference.modality is expected_modality
+    assert reference.path.name == expected_path
+    if include_audio is not None:
+        assert bool(reference.metadata.get("include_audio", True)) is include_audio
+    assert not hasattr(group.datasets[0], "control_video_directory")
+
+
+def test_h3_toml_control_modalities_apply_per_reference(tmp_path):
+    videos = tmp_path / "videos"
+    controls = tmp_path / "controls"
+    videos.mkdir()
+    controls.mkdir()
+    target = videos / "scene.mp4"
+    target.write_bytes(b"target")
+    (controls / "scene.png").write_bytes(b"image")
+    (controls / "scene_0.mp4").write_bytes(b"video")
+    (controls / "scene_1.wav").write_bytes(b"audio")
+    config = {
+        "general": {"resolution": [512, 512]},
+        "datasets": [
+            {
+                "video_directory": str(videos),
+                "control_directory": str(controls),
+                "control_modalities": ["video", "video", "audio"],
+                "cache_directory": str(tmp_path / "cache"),
+                "target_frames": [22],
+            }
+        ],
+    }
+
+    _, adapter = create_h3_dataset_group(config, Namespace(debug_dataset=False))
+    item = ItemInfo(str(target), "prompt", (512, 512), (512, 512), frame_count=22)
+    references = adapter.attach(item)[1:]
+
+    assert [reference.modality for reference in references] == [
+        MediaModality.IMAGE,
+        MediaModality.VIDEO,
+        MediaModality.AUDIO,
+    ]
+    assert references[0].metadata["include_audio"] is False
+    assert references[1].metadata["include_audio"] is False
 
 
 def test_h3_image_dataset_uses_existing_musubi_fields_and_needs_no_audio_vae(tmp_path):

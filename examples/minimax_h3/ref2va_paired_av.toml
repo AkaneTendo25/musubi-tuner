@@ -1,0 +1,14 @@
+[general]
+resolution = [512, 512]
+batch_size = 1
+enable_bucket = true
+bucket_no_upscale = false
+
+[[datasets]]
+video_directory = "/path/to/targets"
+control_video_directory = "/path/to/reference_video"
+control_audio_directory = "/path/to/reference_audio"
+control_modality = "av"
+cache_directory = "/path/to/cache"
+target_frames = [33]
+frame_extraction = "head"

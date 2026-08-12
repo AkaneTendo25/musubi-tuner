@@ -131,14 +131,23 @@ python minimax_h3_generate_video.py \
 ## Dataset
 
 H3 uses Musubi's [shared dataset schema](./dataset_config.md) for video, image, and control fields. A target video's embedded soundtrack is the audio target; a video with
-no audio stream trains as video-only with its audio loss masked. References use `control_directory`, `control_path`, or numbered
-`control_path_N` (contiguous from zero — order sets both prompt labels and the rotary timeline):
+no audio stream trains as video-only with its audio loss masked. `control_directory` holds references whose basename matches
+each target. To combine separately stored video and audio as one synchronized AV reference, use matching directories:
 
-```json
-{"video_path":"/path/to/target.mp4","caption":"A cinematic scene","control_path_0":"/path/to/subject.png","control_path_1":"/path/to/motion.mp4","control_path_2":"/path/to/sound.wav"}
+```toml
+[[datasets]]
+video_directory = "/data/targets"
+control_video_directory = "/data/reference_video"
+control_audio_directory = "/data/reference_audio"
+control_modality = "av"
+cache_directory = "/data/cache"
+target_frames = [33]
 ```
 
-For a directory dataset, `control_directory` holds references whose basename matches each target.
+The three directories must contain basename-matched files. Set `control_modality = "video"` to omit reference soundtracks or
+`control_modality = "audio"` to retain only reference audio. For multiple references matched through `control_directory`, use an
+ordered `control_modalities = ["video", "audio", "av"]` list. The choice is part of latent and text caching; recache both after
+changing it. Ref2VA requires at least one visual reference, so an audio-only entry must accompany an image or video reference.
 
 To restrict video or image loss to selected regions, set `loss_mask_directory` to a directory of masks with matching target
 basenames, or set `default_loss_mask_path` as a fallback. A JSONL item may override either with `loss_mask_path` (the alias

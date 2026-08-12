@@ -196,6 +196,19 @@ def _prepare_audio(asset: MediaAsset, target_frames: int) -> torch.Tensor | None
     return clip.waveform[:, :maximum_samples].contiguous()
 
 
+def _reference_audio_asset(asset: MediaAsset) -> MediaAsset:
+    audio_path = asset.metadata.get("audio_path")
+    if not audio_path:
+        return asset
+    return MediaAsset(
+        Path(audio_path),
+        MediaModality.AUDIO,
+        asset.role,
+        start_seconds=asset.start_seconds,
+        duration_seconds=asset.duration_seconds,
+    )
+
+
 def sample_reference_video_frames(frames: np.ndarray) -> tuple[list[np.ndarray], tuple[float, ...]]:
     stride = VIDEO_FPS / REFERENCE_VIDEO_SAMPLE_FPS
     indices: list[int] = []
@@ -237,11 +250,12 @@ def prepare_references(item: Any, image_short_edge: int = REFERENCE_IMAGE_SHORT_
         if kind is H3ReferenceKind.IMAGE:
             prepared.append(H3PreparedReference(kind=kind, image=_prepare_image(asset, image_short_edge)))
         elif kind is H3ReferenceKind.VIDEO:
+            include_audio = bool(asset.metadata.get("include_audio", True))
             prepared.append(
                 H3PreparedReference(
                     kind=kind,
                     frames=_prepare_video(asset, target_frames),
-                    waveform=_prepare_audio(asset, target_frames),
+                    waveform=_prepare_audio(_reference_audio_asset(asset), target_frames) if include_audio else None,
                 )
             )
         else:
