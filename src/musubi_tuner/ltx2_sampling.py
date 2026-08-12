@@ -13,7 +13,6 @@ import sys
 import tempfile
 import time
 import wave
-from fractions import Fraction
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
@@ -25,7 +24,7 @@ from accelerate import Accelerator, PartialState
 from musubi_tuner.utils.device_utils import clean_memory_on_device
 from musubi_tuner.utils import model_utils
 from musubi_tuner.hv_generate_video import save_images_grid, save_videos_grid
-from musubi_tuner.ltx2_inference import LTX2Inferencer, InferenceConfig
+from musubi_tuner.ltx2_inference import LTX2Inferencer, InferenceConfig, mux_video_audio
 from musubi_tuner.ltx2_defaults import get_ltx2_sampling_preset
 from musubi_tuner.ltx2_samplers import resolve_ltx2_sampler, res2s_midpoint, res2s_step
 from musubi_tuner.training.sampling_prompts import load_prompts, should_sample_images
@@ -453,79 +452,7 @@ class LTX2SamplingMixin:
 
     @staticmethod
     def _mux_video_audio(video_path: str, audio_path: str, output_path: str) -> None:
-        if not os.path.exists(video_path) or not os.path.exists(audio_path):
-            return
-        try:
-            import av
-            import numpy as np
-        except Exception as exc:
-            logger.warning("Sampling: unable to mux audio/video (PyAV missing?): %s", exc)
-            return
-
-        with wave.open(audio_path, "rb") as wav_in:
-            sample_rate = wav_in.getframerate()
-            channels = wav_in.getnchannels()
-            frames = wav_in.readframes(wav_in.getnframes())
-        audio = np.frombuffer(frames, dtype=np.int16)
-        if channels > 1:
-            audio = audio.reshape(-1, channels)
-        else:
-            audio = audio.reshape(-1, 1)
-        if audio.shape[1] == 1:
-            audio = np.repeat(audio, 2, axis=1)
-        elif audio.shape[1] > 2:
-            audio = audio[:, :2]
-
-        container_in = av.open(video_path)
-        video_stream_in = next((s for s in container_in.streams if s.type == "video"), None)
-        if video_stream_in is None:
-            container_in.close()
-            return
-
-        os.makedirs(os.path.dirname(output_path), exist_ok=True)
-        container_out = av.open(output_path, mode="w")
-        video_stream_out = container_out.add_stream(
-            "libx264",
-            rate=video_stream_in.average_rate or video_stream_in.base_rate or 24,
-        )
-        video_stream_out.width = video_stream_in.width
-        video_stream_out.height = video_stream_in.height
-        video_stream_out.pix_fmt = "yuv420p"
-
-        audio_stream = container_out.add_stream("aac", rate=sample_rate)
-        audio_stream.codec_context.sample_rate = sample_rate
-        audio_stream.codec_context.layout = "stereo"
-        audio_stream.codec_context.time_base = Fraction(1, sample_rate)
-
-        for frame in container_in.decode(video_stream_in):
-            for packet in video_stream_out.encode(frame):
-                container_out.mux(packet)
-        for packet in video_stream_out.encode():
-            container_out.mux(packet)
-
-        frame_in = av.AudioFrame.from_ndarray(audio.reshape(1, -1), format="s16", layout="stereo")
-        frame_in.sample_rate = sample_rate
-        target_format = audio_stream.codec_context.format or "fltp"
-        target_layout = audio_stream.codec_context.layout or "stereo"
-        target_rate = audio_stream.codec_context.sample_rate or sample_rate
-        audio_resampler = av.audio.resampler.AudioResampler(
-            format=target_format,
-            layout=target_layout,
-            rate=target_rate,
-        )
-        audio_next_pts = 0
-        for rframe in audio_resampler.resample(frame_in):
-            if rframe.pts is None:
-                rframe.pts = audio_next_pts
-            audio_next_pts += rframe.samples
-            rframe.sample_rate = sample_rate
-            for packet in audio_stream.encode(rframe):
-                container_out.mux(packet)
-        for packet in audio_stream.encode():
-            container_out.mux(packet)
-
-        container_out.close()
-        container_in.close()
+        mux_video_audio(video_path, audio_path, output_path)
 
     @staticmethod
     def _override_attention_function(transformer, attention_function):

@@ -9,9 +9,10 @@ from __future__ import annotations
 import gc
 import logging
 import os
+import shutil
+import subprocess
 import wave
 from dataclasses import dataclass, field
-from fractions import Fraction
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
@@ -1618,70 +1619,41 @@ def save_audio_wav(path: str, audio: torch.Tensor, sample_rate: int) -> None:
 
 
 def mux_video_audio(video_path: str, audio_path: str, output_path: str) -> None:
-    """Mux video and audio files into a single file."""
+    """Mux audio while preserving the already encoded video bitstream."""
     if not os.path.exists(video_path) or not os.path.exists(audio_path):
         return
-
-    try:
-        import av
-        import numpy as np
-    except Exception as exc:
-        logger.warning("Unable to mux audio/video (PyAV missing?): %s", exc)
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None:
+        logger.warning("Unable to mux audio/video: ffmpeg is not available")
         return
-
-    with wave.open(audio_path, "rb") as wav_in:
-        sample_rate = wav_in.getframerate()
-        channels = wav_in.getnchannels()
-        frames = wav_in.readframes(wav_in.getnframes())
-
-    audio = np.frombuffer(frames, dtype=np.int16)
-    if channels > 1:
-        audio = audio.reshape(-1, channels)
-    else:
-        audio = audio.reshape(-1, 1)
-    if audio.shape[1] == 1:
-        audio = np.repeat(audio, 2, axis=1)
-    elif audio.shape[1] > 2:
-        audio = audio[:, :2]
-
-    container_in = av.open(video_path)
-    video_stream_in = next((s for s in container_in.streams if s.type == "video"), None)
-    if video_stream_in is None:
-        container_in.close()
-        return
-
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-    container_out = av.open(output_path, mode="w")
-    video_stream_out = container_out.add_stream(
-        "libx264",
-        rate=video_stream_in.average_rate or video_stream_in.base_rate or 24,
+    result = subprocess.run(
+        [
+            ffmpeg,
+            "-y",
+            "-i",
+            video_path,
+            "-i",
+            audio_path,
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a:0",
+            "-c:v",
+            "copy",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            "-shortest",
+            output_path,
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
     )
-    video_stream_out.width = video_stream_in.width
-    video_stream_out.height = video_stream_in.height
-    video_stream_out.pix_fmt = "yuv420p"
-
-    audio_stream = container_out.add_stream("aac", rate=sample_rate)
-    audio_stream.codec_context.sample_rate = sample_rate
-    audio_stream.codec_context.layout = "stereo"
-    audio_stream.codec_context.time_base = Fraction(1, sample_rate)
-
-    for frame in container_in.decode(video_stream_in):
-        for packet in video_stream_out.encode(frame):
-            container_out.mux(packet)
-    for packet in video_stream_out.encode():
-        container_out.mux(packet)
-
-    # PyAV s16p (planar) expects shape (channels, samples), must be C-contiguous
-    audio_planar = np.ascontiguousarray(audio.T)
-    audio_frame = av.AudioFrame.from_ndarray(audio_planar, format="s16p", layout="stereo")
-    audio_frame.sample_rate = sample_rate
-    for packet in audio_stream.encode(audio_frame):
-        container_out.mux(packet)
-    for packet in audio_stream.encode():
-        container_out.mux(packet)
-
-    container_out.close()
-    container_in.close()
+    if result.returncode != 0:
+        logger.warning("Unable to mux audio/video with ffmpeg: %s", result.stderr.strip())
 
 
 def cleanup_cuda(device: torch.device) -> None:
