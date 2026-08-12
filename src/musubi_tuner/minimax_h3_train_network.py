@@ -36,6 +36,7 @@ from musubi_tuner.minimax_h3.cache import (
     H3_AUDIO_LATENTS_KEY,
     H3_EMPTY_TEXT_HIDDEN_KEY,
     H3_EMPTY_TEXT_TOKEN_TAGS_KEY,
+    H3_REFERENCE_MODALITY_PROBABILITIES_KEY,
     H3_TEXT_HIDDEN_KEY,
     H3_TEXT_TOKEN_TAGS_KEY,
 )
@@ -176,6 +177,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         self._mask_audio = False
         self._mask_bounds = (0.25, 0.75)
         self._step_keyframes = None
+        self._step_reference_modality = "av"
         self._step_mask = None
         self._validation_dataloader = None
 
@@ -278,6 +280,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         self._step_row_video_timestep = None
         self._step_spatial_density_scale = None
         self._step_keyframes = None
+        self._step_reference_modality = "av"
         if self._validation_dataloader is None:
             self._validation_dataloader = self._build_validation_dataloader(args, accelerator)
 
@@ -1258,6 +1261,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             extension_kwargs["extension_audio_context"] = self._clean_context(
                 inputs.audio, inputs.audio_target, inputs.audio_sigma, self._extension_audio_latents, axis=-1
             )
+        if self._step_reference_modality != "av":
+            extension_kwargs["reference_modality"] = self._step_reference_modality
         with accelerator.autocast():
             prediction = self.backend.predict_training(
                 transformer,
@@ -1425,6 +1430,20 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         crepa_update_similarity_threshold: bool = True,
     ) -> tuple[torch.Tensor, dict[str, float]]:
         del network_dtype, vae
+        self._step_reference_modality = "av"
+        probabilities = batch.get(H3_REFERENCE_MODALITY_PROBABILITIES_KEY)
+        if probabilities is not None:
+            if isinstance(probabilities, (list, tuple)):
+                if len(probabilities) != 1:
+                    raise ValueError("H3 reference modality probabilities must contain one batch item")
+                probabilities = probabilities[0]
+            if probabilities.ndim == 2 and probabilities.shape[0] == 1:
+                probabilities = probabilities[0]
+            probabilities = probabilities.detach().to(device="cpu", dtype=torch.float32)
+            if probabilities.shape != (3,):
+                raise ValueError("H3 reference modality probabilities must have shape [3]")
+            selected = int(torch.multinomial(probabilities, 1).item())
+            self._step_reference_modality = ("av", "video", "audio")[selected]
         has_video = "latents" in batch or latents.ndim == 5
         has_audio = H3_AUDIO_LATENTS_KEY in batch
         if not has_video and not has_audio:
@@ -1678,6 +1697,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         self._step_row_video_timestep = None
         self._step_spatial_density_scale = None
         self._step_keyframes = None
+        self._step_reference_modality = "av"
         return loss, metrics
 
     def call_dit(self, *args, **kwargs):

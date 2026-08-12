@@ -18,8 +18,10 @@ from musubi_tuner.minimax_h3.cache import (
     H3_EMPTY_TEXT_HIDDEN_KEY,
     H3_EMPTY_TEXT_TOKEN_TAGS_KEY,
     H3_REFERENCE_IMAGE_SHORT_EDGE_KEY,
+    H3_REFERENCE_MODALITY_PROBABILITIES_KEY,
     H3_TEXT_HIDDEN_KEY,
     H3_TEXT_TOKEN_TAGS_KEY,
+    reference_variant_key,
 )
 from musubi_tuner.minimax_h3.comfy_quant import (
     has_comfy_quantized_layers,
@@ -33,6 +35,7 @@ from musubi_tuner.minimax_h3.references import (
     H3PreparedReference,
     H3ReferenceKind,
     prepare_references,
+    reference_modality_variant,
     sample_reference_video_frames,
 )
 from musubi_tuner.utils.model_utils import dtype_to_str
@@ -472,6 +475,22 @@ class MiniMaxH3ConditioningEncoder:
                 f"varlen_{H3_TEXT_TOKEN_TAGS_KEY}_int64": tags,
                 H3_CONDITIONING_TASK_KEY: torch.tensor(H3_CONDITIONING_TASK_IDS[self.task], dtype=torch.long),
             }
+            probabilities = getattr(item, "h3_reference_modality_probabilities", None)
+            if probabilities is not None:
+                if references is None:
+                    raise ValueError("control_modality_probabilities is only valid for Ref2VA conditioning")
+                tensors[f"{H3_REFERENCE_MODALITY_PROBABILITIES_KEY}_float32"] = torch.tensor(probabilities, dtype=torch.float32)
+                for modality, probability in zip(("av", "video", "audio"), probabilities):
+                    if modality == "av" or probability <= 0:
+                        continue
+                    variant = reference_modality_variant(references, modality)
+                    variant_hidden, variant_tags = self._encode_prompt(item.caption, references=variant)
+                    tensors[f"varlen_{reference_variant_key(H3_TEXT_HIDDEN_KEY, modality)}_{dtype_name}"] = variant_hidden
+                    tensors[f"varlen_{reference_variant_key(H3_TEXT_TOKEN_TAGS_KEY, modality)}_int64"] = variant_tags
+                    if include_empty:
+                        empty_hidden, empty_tags = self._encode_prompt(item.caption, references=variant, null_instruction=True)
+                        tensors[f"varlen_{reference_variant_key(H3_EMPTY_TEXT_HIDDEN_KEY, modality)}_{dtype_name}"] = empty_hidden
+                        tensors[f"varlen_{reference_variant_key(H3_EMPTY_TEXT_TOKEN_TAGS_KEY, modality)}_int64"] = empty_tags
             if self.task in ("ref2va", "ref2va_omni"):
                 tensors[H3_REFERENCE_IMAGE_SHORT_EDGE_KEY] = torch.tensor(self.reference_image_short_edge, dtype=torch.long)
             if include_empty:

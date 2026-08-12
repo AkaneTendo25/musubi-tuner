@@ -39,6 +39,7 @@ class H3TrainingBackend(Protocol):
         audio_timestep: torch.Tensor,
         *,
         conditioning: Literal["prompt", "empty"] = "prompt",
+        reference_modality: Literal["av", "video", "audio"] = "av",
         # Extension context. Only forwarded when non-zero, so a backend that
         # does not support it may omit these parameters entirely.
         extension_video_frames: int = 0,

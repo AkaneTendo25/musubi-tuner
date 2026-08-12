@@ -149,6 +149,17 @@ The three directories must contain basename-matched files. Set `control_modality
 ordered `control_modalities = ["video", "audio", "av"]` list. The choice is part of latent and text caching; recache both after
 changing it. Ref2VA requires at least one visual reference, so an audio-only entry must accompany an image or video reference.
 
+For modality dropout, replace the static modality setting with probabilities in `[av, video, audio]` order:
+
+```toml
+control_modality_probabilities = [0.5, 0.25, 0.25]
+```
+
+The text cache stores every enabled presentation and training draws one mode per item. The same draw is reused by the trainable,
+guidance, and preservation forwards. Video-only removes reference soundtracks; audio-only retains image references as visual
+anchors and uses the audio from paired AV references. Recache text outputs after changing the probabilities. Latent caches do not
+need to be rebuilt. Every enabled mode must leave at least one image or video reference, as required by the released Ref2VA model.
+
 To restrict video or image loss to selected regions, set `loss_mask_directory` to a directory of masks with matching target
 basenames, or set `default_loss_mask_path` as a fallback. A JSONL item may override either with `loss_mask_path` (the alias
 `video_loss_mask_path` is also accepted). A mask may be a still image, video, or frame directory; still images repeat across the

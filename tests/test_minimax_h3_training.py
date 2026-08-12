@@ -69,6 +69,41 @@ from musubi_tuner.minimax_h3_train_network import MiniMaxH3NetworkTrainer, creat
 from musubi_tuner.networks import lora_minimax_h3
 
 
+def test_ref2va_reference_cache_selects_matching_video_and_audio_variants():
+    backend = _NativeTrainingBackend(SimpleNamespace(), mode="ref2va")
+    batch = {
+        H3_REFERENCE_KINDS_KEY: [torch.tensor([0, 1, 2])],
+        H3_REFERENCE_VIDEO_SHAPES_KEY: [torch.tensor([[1, 2, 2], [1, 2, 2], [0, 0, 0]])],
+        H3_REFERENCE_AUDIO_LENGTHS_KEY: [torch.tensor([0, 1, 1])],
+        H3_REFERENCE_VIDEO_ROWS_KEY: [torch.arange(8, dtype=torch.float32).reshape(2, 4)],
+        H3_REFERENCE_AUDIO_ROWS_KEY: [torch.arange(8, dtype=torch.float32).reshape(4, 2)],
+    }
+
+    video_refs, video_rows, video_audio = backend._reference_cache(
+        batch,
+        patch_size=(1, 2, 2),
+        video_width=4,
+        audio_width=2,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        reference_modality="video",
+    )
+    audio_refs, audio_video, audio_rows = backend._reference_cache(
+        batch,
+        patch_size=(1, 2, 2),
+        video_width=4,
+        audio_width=2,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        reference_modality="audio",
+    )
+
+    assert [(ref.kind, ref.num_audio_latents) for ref in video_refs] == [(0, 0), (1, 0)]
+    assert video_rows.shape == (2, 4) and video_audio.shape == (0, 2)
+    assert [(ref.kind, ref.num_audio_latents) for ref in audio_refs] == [(0, 0), (2, 1), (2, 1)]
+    assert audio_video.shape == (1, 4) and audio_rows.shape == (4, 2)
+
+
 class _CREPABlock(nn.Module):
     def __init__(self, scale: float):
         super().__init__()

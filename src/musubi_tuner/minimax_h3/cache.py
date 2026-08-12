@@ -29,6 +29,13 @@ H3_REFERENCE_VIDEO_SHAPES_KEY = "mmh3_reference_video_shapes"
 H3_REFERENCE_AUDIO_LENGTHS_KEY = "mmh3_reference_audio_lengths"
 H3_REFERENCE_VIDEO_ROWS_KEY = "mmh3_reference_video_rows"
 H3_REFERENCE_AUDIO_ROWS_KEY = "mmh3_reference_audio_rows"
+H3_REFERENCE_MODALITY_PROBABILITIES_KEY = "mmh3_reference_modality_probabilities"
+
+
+def reference_variant_key(key: str, modality: str) -> str:
+    if modality not in {"video", "audio"}:
+        raise ValueError(f"unsupported H3 reference modality variant: {modality}")
+    return f"{key}_reference_{modality}"
 
 
 def reference_key_suffix(image_short_edge: int) -> str:
@@ -190,6 +197,29 @@ def save_text_encoder_output_cache_minimax_h3(
         validate_reference_image_short_edge(int(reference_size))
     if empty_keys <= logical_keys:
         validate_pair(H3_EMPTY_TEXT_HIDDEN_KEY, H3_EMPTY_TEXT_TOKEN_TAGS_KEY)
+    probability_matches = [
+        tensor for key, tensor in cache_tensors.items() if _logical_key(key) == H3_REFERENCE_MODALITY_PROBABILITIES_KEY
+    ]
+    if probability_matches:
+        if len(probability_matches) != 1:
+            raise ValueError(f"H3 conditioning cache must contain exactly one {H3_REFERENCE_MODALITY_PROBABILITIES_KEY}")
+        probabilities = probability_matches[0]
+        if probabilities.dtype is not torch.float32 or probabilities.shape != (3,):
+            raise ValueError(f"H3 {H3_REFERENCE_MODALITY_PROBABILITIES_KEY} must be float32 with shape [3]")
+        if bool((probabilities < 0).any()) or not torch.isclose(probabilities.sum(), torch.tensor(1.0)):
+            raise ValueError(f"H3 {H3_REFERENCE_MODALITY_PROBABILITIES_KEY} must be non-negative and sum to 1")
+        for index, modality in enumerate(("av", "video", "audio")):
+            if modality == "av" or float(probabilities[index]) == 0:
+                continue
+            validate_pair(
+                reference_variant_key(H3_TEXT_HIDDEN_KEY, modality),
+                reference_variant_key(H3_TEXT_TOKEN_TAGS_KEY, modality),
+            )
+            if empty_keys <= logical_keys:
+                validate_pair(
+                    reference_variant_key(H3_EMPTY_TEXT_HIDDEN_KEY, modality),
+                    reference_variant_key(H3_EMPTY_TEXT_TOKEN_TAGS_KEY, modality),
+                )
     save_text_encoder_output_cache_common(
         item_info,
         cache_tensors,

@@ -37,6 +37,7 @@ from musubi_tuner.minimax_h3.cache import (
     H3_TEXT_TOKEN_TAGS_KEY,
     H3_VIDEO_GEOMETRY_KEY,
     reference_key_suffix,
+    reference_variant_key,
 )
 from musubi_tuner.minimax_h3.component_loader import (
     load_audio_vae_decoder,
@@ -692,6 +693,7 @@ class _NativeTrainingBackend:
         audio_timestep: torch.Tensor,
         *,
         conditioning: Literal["prompt", "empty"] = "prompt",
+        reference_modality: Literal["av", "video", "audio"] = "av",
         extension_video_frames: int = 0,
         extension_audio_latents: int = 0,
         condition_video_anchors: tuple[int, ...] = (),
@@ -733,6 +735,11 @@ class _NativeTrainingBackend:
             if conditioning == "prompt"
             else (H3_EMPTY_TEXT_HIDDEN_KEY, H3_EMPTY_TEXT_TOKEN_TAGS_KEY)
         )
+        if reference_modality != "av":
+            if self.mode not in ("ref2va", "ref2va_omni"):
+                raise ValueError("reference modality selection is only valid for Ref2VA training")
+            hidden_key = reference_variant_key(hidden_key, reference_modality)
+            tags_key = reference_variant_key(tags_key, reference_modality)
         text_hidden = self._one_conditioning_item(batch, hidden_key, expected_ndim=2)
         text_tags = self._one_conditioning_item(batch, tags_key, expected_ndim=1)
         conditioning_task = self._one_conditioning_item(batch, H3_CONDITIONING_TASK_KEY, expected_ndim=0)
@@ -825,6 +832,7 @@ class _NativeTrainingBackend:
                 audio_width=audio_rows.shape[-1],
                 device=model_device,
                 dtype=video_rows.dtype,
+                reference_modality=reference_modality,
             )
             layout = build_ref2va_packed_sequence(
                 text_tags,
@@ -1114,6 +1122,7 @@ class _NativeTrainingBackend:
         audio_width: int,
         device: torch.device,
         dtype: torch.dtype,
+        reference_modality: Literal["av", "video", "audio"] = "av",
     ) -> tuple[tuple[MiniMaxH3ReferenceGeometry, ...], torch.Tensor, torch.Tensor]:
         suffix = reference_key_suffix(self.reference_image_short_edge)
         kinds_key = f"{H3_REFERENCE_KINDS_KEY}{suffix}"
@@ -1164,6 +1173,49 @@ class _NativeTrainingBackend:
             raise ValueError(
                 f"H3 Ref2VA audio cache has shape {tuple(audio_rows.shape)}, expected {(expected_audio_rows, audio_width)}"
             )
+        if reference_modality != "av":
+            selected_references = []
+            selected_video_rows = []
+            selected_audio_rows = []
+            video_offset = audio_offset = 0
+            for reference in references:
+                video_count = reference.num_video_rows(patch_size)
+                audio_count = reference.num_audio_rows
+                video_chunk = video_rows[video_offset : video_offset + video_count]
+                audio_chunk = audio_rows[audio_offset : audio_offset + audio_count]
+                video_offset += video_count
+                audio_offset += audio_count
+                if reference_modality == "video":
+                    if reference.kind != int(H3ReferenceKind.AUDIO):
+                        selected_references.append(
+                            MiniMaxH3ReferenceGeometry(
+                                kind=reference.kind,
+                                num_latent_frames=reference.num_latent_frames,
+                                latent_height=reference.latent_height,
+                                latent_width=reference.latent_width,
+                                num_audio_latents=0,
+                            )
+                        )
+                        selected_video_rows.append(video_chunk)
+                elif reference.kind == int(H3ReferenceKind.IMAGE):
+                    selected_references.append(reference)
+                    selected_video_rows.append(video_chunk)
+                elif audio_count:
+                    selected_references.append(
+                        MiniMaxH3ReferenceGeometry(
+                            kind=int(H3ReferenceKind.AUDIO),
+                            num_latent_frames=0,
+                            latent_height=0,
+                            latent_width=0,
+                            num_audio_latents=reference.num_audio_latents,
+                        )
+                    )
+                    selected_audio_rows.append(audio_chunk)
+            references = tuple(selected_references)
+            if not any(reference.kind != int(H3ReferenceKind.AUDIO) for reference in references):
+                raise ValueError(f"H3 stochastic {reference_modality}-reference variant has no visual reference")
+            video_rows = torch.cat(selected_video_rows) if selected_video_rows else video_rows.new_empty((0, video_width))
+            audio_rows = torch.cat(selected_audio_rows) if selected_audio_rows else audio_rows.new_empty((0, audio_width))
         return references, video_rows.to(device=device, dtype=dtype), audio_rows.to(device=device, dtype=dtype)
 
     @staticmethod

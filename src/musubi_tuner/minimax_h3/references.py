@@ -266,3 +266,28 @@ def prepare_references(item: Any, image_short_edge: int = REFERENCE_IMAGE_SHORT_
     if prepared and not any(reference.kind is not H3ReferenceKind.AUDIO for reference in prepared):
         raise ValueError("MiniMax H3 audio references require at least one image or video reference")
     return tuple(prepared)
+
+
+def reference_modality_variant(references: tuple[H3PreparedReference, ...], modality: str) -> tuple[H3PreparedReference, ...]:
+    if modality == "av":
+        return references
+    selected: list[H3PreparedReference] = []
+    for reference in references:
+        if reference.kind is H3ReferenceKind.IMAGE:
+            selected.append(reference)
+        elif modality == "video":
+            if reference.kind is H3ReferenceKind.VIDEO:
+                selected.append(
+                    H3PreparedReference(
+                        kind=reference.kind,
+                        frames=reference.frames,
+                        block_timestamps=reference.block_timestamps,
+                    )
+                )
+        elif reference.kind is H3ReferenceKind.AUDIO:
+            selected.append(reference)
+        elif reference.waveform is not None:
+            selected.append(H3PreparedReference(kind=H3ReferenceKind.AUDIO, waveform=reference.waveform))
+    if not any(reference.kind is not H3ReferenceKind.AUDIO for reference in selected):
+        raise ValueError(f"H3 stochastic {modality}-reference variant requires at least one visual reference")
+    return tuple(selected)

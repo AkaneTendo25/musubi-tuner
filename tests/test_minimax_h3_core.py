@@ -63,8 +63,11 @@ from musubi_tuner.minimax_h3.packing import (
 )
 from musubi_tuner.minimax_h3.references import (
     REFERENCE_IMAGE_SHORT_EDGE,
+    H3PreparedReference,
+    H3ReferenceKind,
     _reference_audio_asset,
     _source_frame_limit,
+    reference_modality_variant,
     resample_reference_frames,
     resolve_reference_image_size,
     resolve_reference_video_size,
@@ -696,6 +699,52 @@ def test_h3_toml_control_modalities_apply_per_reference(tmp_path):
     ]
     assert references[0].metadata["include_audio"] is False
     assert references[1].metadata["include_audio"] is False
+
+
+def test_h3_toml_reference_modality_probabilities_are_attached(tmp_path):
+    targets = tmp_path / "targets"
+    controls = tmp_path / "controls"
+    targets.mkdir()
+    controls.mkdir()
+    target = targets / "scene.mp4"
+    target.write_bytes(b"target")
+    (controls / "scene.png").write_bytes(b"reference")
+    config = {
+        "general": {"resolution": [512, 512]},
+        "datasets": [
+            {
+                "video_directory": str(targets),
+                "control_directory": str(controls),
+                "control_modality_probabilities": [0.5, 0.25, 0.25],
+                "cache_directory": str(tmp_path / "cache"),
+                "target_frames": [22],
+            }
+        ],
+    }
+
+    group, adapter = create_h3_dataset_group(config, Namespace(debug_dataset=False))
+    item = ItemInfo(str(target), "prompt", (512, 512), (512, 512), frame_count=22)
+    adapter.attach(item)
+
+    assert item.h3_reference_modality_probabilities == (0.5, 0.25, 0.25)
+    assert not hasattr(group.datasets[0], "control_modality_probabilities")
+
+
+def test_reference_modality_variants_keep_text_and_latent_geometry_aligned():
+    image = H3PreparedReference(kind=H3ReferenceKind.IMAGE, image=Image.new("RGB", (8, 8)))
+    video = H3PreparedReference(
+        kind=H3ReferenceKind.VIDEO,
+        frames=np.zeros((5, 8, 8, 3), dtype=np.uint8),
+        waveform=torch.zeros(2, 100),
+    )
+    audio = H3PreparedReference(kind=H3ReferenceKind.AUDIO, waveform=torch.zeros(2, 100))
+
+    video_only = reference_modality_variant((image, video, audio), "video")
+    audio_only = reference_modality_variant((image, video, audio), "audio")
+
+    assert [reference.kind for reference in video_only] == [0, 1]
+    assert all(reference.waveform is None for reference in video_only)
+    assert [reference.kind for reference in audio_only] == [0, 2, 2]
 
 
 def test_h3_image_dataset_uses_existing_musubi_fields_and_needs_no_audio_vae(tmp_path):

@@ -8,7 +8,8 @@ bucket_no_upscale = false
 video_directory = "/path/to/targets"
 control_video_directory = "/path/to/reference_video"
 control_audio_directory = "/path/to/reference_audio"
-control_modality = "av"
+# Draw AV, video-only, or audio-focused conditioning per training item.
+control_modality_probabilities = [0.5, 0.25, 0.25]
 cache_directory = "/path/to/cache"
 target_frames = [33]
 frame_extraction = "head"

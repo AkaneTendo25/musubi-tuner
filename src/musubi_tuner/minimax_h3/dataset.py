@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 import os
 import random
 import re
@@ -211,6 +212,20 @@ def _dataset_reference_modes(source: dict[str, Any], general: dict[str, Any], co
     return values
 
 
+def _dataset_reference_probabilities(source: dict[str, Any], general: dict[str, Any]) -> tuple[float, float, float] | None:
+    values = _effective(source, general, "control_modality_probabilities")
+    if values is None:
+        return None
+    if _effective(source, general, "control_modality") is not None or _effective(source, general, "control_modalities") is not None:
+        raise ValueError("control_modality_probabilities cannot be combined with control_modality/control_modalities")
+    if not isinstance(values, list) or len(values) != 3:
+        raise ValueError("control_modality_probabilities must be [av, video, audio]")
+    probabilities = tuple(float(value) for value in values)
+    if any(value < 0 for value in probabilities) or not math.isclose(sum(probabilities), 1.0, abs_tol=1e-6):
+        raise ValueError("control_modality_probabilities must be non-negative and sum to 1")
+    return probabilities
+
+
 def _read_media_jsonl(path: str, *, resolve_paths: bool = False) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     with open(path, "r", encoding="utf-8") as stream:
@@ -271,6 +286,7 @@ class H3DatasetAdapter:
         self._target_modalities: dict[str, MediaModality] = {}
         self._target_modes: dict[str, str] = {}
         self._target_source_paths: dict[str, tuple[Path, ...]] = {}
+        self._target_reference_probabilities: dict[str, tuple[float, float, float]] = {}
         self._image_frame_counts: dict[str, int] = {}
         self.image_mode = str(getattr(args, "h3_image_mode", "none"))
         self.image_frame_count = getattr(args, "h3_image_frame_count", None)
@@ -281,7 +297,13 @@ class H3DatasetAdapter:
         general = user_config.get("general", {})
         clean_general = self.musubi_config.get("general", {})
         clean_general.pop("control_directory", None)
-        for key in ("control_video_directory", "control_audio_directory", "control_modality", "control_modalities"):
+        for key in (
+            "control_video_directory",
+            "control_audio_directory",
+            "control_modality",
+            "control_modalities",
+            "control_modality_probabilities",
+        ):
             clean_general.pop(key, None)
         for key in ("h3_target_mode", "h3_image_frame_count", "audio_directory", "audio_jsonl_file"):
             clean_general.pop(key, None)
@@ -320,7 +342,13 @@ class H3DatasetAdapter:
             clean.pop("control_directory", None)
             control_video_directory = _effective(source, general, "control_video_directory")
             control_audio_directory = _effective(source, general, "control_audio_directory")
-            for key in ("control_video_directory", "control_audio_directory", "control_modality", "control_modalities"):
+            for key in (
+                "control_video_directory",
+                "control_audio_directory",
+                "control_modality",
+                "control_modalities",
+                "control_modality_probabilities",
+            ):
                 clean.pop(key, None)
             if bool(control_video_directory) != bool(control_audio_directory):
                 raise ValueError("control_video_directory and control_audio_directory must be specified together")
@@ -466,6 +494,9 @@ class H3DatasetAdapter:
                     for reference in raw_references
                 )
                 modes = _dataset_reference_modes(source, general, len(references))
+                probabilities = _dataset_reference_probabilities(source, general)
+                if probabilities is not None and not references:
+                    raise ValueError("control_modality_probabilities requires at least one reference")
                 references = tuple(
                     _select_reference_modality(reference, mode, index=index) if mode is not None else reference
                     for index, (reference, mode) in enumerate(zip(references, modes))
@@ -478,6 +509,8 @@ class H3DatasetAdapter:
                         raise ValueError(f"conflicting H3 media metadata for target path across datasets: {target}")
                     if self._target_modes[normal] != target_mode:
                         raise ValueError(f"conflicting h3_target_mode for target path across datasets: {target}")
+                    if self._target_reference_probabilities.get(normal) != probabilities:
+                        raise ValueError(f"conflicting control_modality_probabilities for target path: {target}")
                 else:
                     # A source directory may intentionally be repeated with different
                     # resolutions and cache directories. Those dataset-level settings
@@ -490,6 +523,8 @@ class H3DatasetAdapter:
                     )
                     if frame_count is not None:
                         self._image_frame_counts[normal] = int(frame_count)
+                    if probabilities is not None:
+                        self._target_reference_probabilities[normal] = probabilities
             self._target_groups.append(tuple(_normal_path(target) for target in target_paths))
 
         self.requires_audio = any(
@@ -602,6 +637,8 @@ class H3DatasetAdapter:
             assets = (target, *resolved.references)
         validate_h3_media_assets(item.item_key, assets)
         item.h3_media_assets = assets
+        if normal in self._target_reference_probabilities:
+            item.h3_reference_modality_probabilities = self._target_reference_probabilities[normal]
         item.h3_target_mode = "video" if image_frame_count is not None else self._target_modes[normal]
         return assets
 
