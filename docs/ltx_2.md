@@ -2790,6 +2790,8 @@ python ltx2_generate_video.py ^
 
 For LTX-2.5, use `--ltx_version 2.5`, pass the packed Gemma 4 file with `--ltx2_text_encoder_checkpoint`, and pass the DiffVAE with `--vae`. `--sampling_preset defaults` selects the official distilled two-stage settings: 1920x1088 output from a 960x544 first stage, 121 frames at 24 fps, 8 first-stage steps, 3 refinement steps, CFG 1, and STG 0. It also requires `--spatial_upsampler_path`; use the distilled transformer directly, or the development transformer together with `--distilled_lora_path`. Add `--sample_with_offloading` when the transformer, Gemma, and DiffVAE do not fit simultaneously in VRAM. Use `--sampling_preset legacy` for custom single-stage settings.
 
+For generated audio, add `--ltx2_mode av --ltx2_audio_vae /path/to/ltx-2.5-audio-vae-bf16.safetensors`. Standalone AV generation writes a WAV sidecar and an `_av.mp4` containing the generated audio track.
+
 Rebuild LTX-2.5 text caches created before Gemma 4 BOS handling was added, and rebuild latent and text caches whenever switching model versions.
 
 `ltx2_generate_video.py` also accepts a few standalone-inference-only overrides that are not part of the training sample table:

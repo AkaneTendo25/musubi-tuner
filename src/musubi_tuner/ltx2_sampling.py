@@ -2148,15 +2148,17 @@ class LTX2SamplingMixin:
             and enable_audio_preview
             and getattr(args, "ltx_mode", "video") in {"av", "audio"}
         ):
-            if not sample_with_offloading and not use_audio_subprocess:
-                # High VRAM mode without subprocess: load audio to GPU now (everything fits)
+            if (not sample_with_offloading and not use_audio_subprocess) or sample_with_offloading:
+                # Two-stage inference decodes audio before returning, so it must
+                # receive decoder components directly. In offload mode keep them
+                # on CPU until the inferencer reaches its decode phase.
                 audio_dtype = torch.bfloat16 if args.vae_dtype is None else model_utils.str_to_dtype(args.vae_dtype)
                 try:
                     audio_decoder, vocoder = self._load_audio_components(
                         args,
                         audio_dtype=audio_dtype,
                         checkpoint_path=getattr(args, "ltx2_audio_vae", None) or args.ltx2_checkpoint,
-                        device=accelerator.device,
+                        device=torch.device("cpu") if sample_with_offloading else accelerator.device,
                     )
                     loaded_audio = True
                 except Exception as exc:

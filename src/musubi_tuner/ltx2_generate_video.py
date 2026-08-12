@@ -1064,6 +1064,11 @@ def main() -> None:
     _configure_windows_cli_encoding()
     args = parse_args()
 
+    # Standalone AV generation should produce a playable file with its generated
+    # audio, rather than silently leaving audio disabled or as a sidecar WAV.
+    if args.ltx_mode in {"av", "va"} and not args.sample_disable_audio:
+        args.sample_merge_audio = True
+
     # Wire up aliases that the training code expects
     args.dit = args.ltx2_checkpoint
     args.sample_sampling_preset = args.sampling_preset
