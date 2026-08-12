@@ -705,6 +705,11 @@ class DiffusionVideoDecoder(nn.Module, Disposable):
             mode=mode,
             free_bytes=free_bytes,
             model_bytes=model_bytes,
+            stage5_channels=int(self.conv_in_x_t.out_features),
+            stage4_channels=int(self.stage_channels[3]),
+            upsample_strides=[tuple(module.stride) for module in self.upsamples],
+            natten_trailing_pad_latent_frames=self._natten_trailing_pad_latent_frames,
+            out_channels=int(self.out_channels),
         )
 
     def tiled_decode(

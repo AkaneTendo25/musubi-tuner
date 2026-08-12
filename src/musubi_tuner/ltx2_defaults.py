@@ -89,11 +89,11 @@ LTX2_SAMPLING_PRESETS: dict[str, LTX2SamplingPreset] = {
         audio_modality_scale=3.0,
     ),
     # Official LTX-2.5 distilled two-stage recipe. The two-stage inferencer
-    # halves this requested final size for its 960x544 first stage.
+    # halves this requested final size for its 768x512 first stage.
     "ltx25": LTX2SamplingPreset(
         sample_steps=8,
-        width=1920,
-        height=1088,
+        width=1536,
+        height=1024,
         frame_count=121,
         frame_rate=24.0,
         video_cfg_scale=1.0,

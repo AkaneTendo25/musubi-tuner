@@ -1470,21 +1470,29 @@ class LTX2Inferencer:
 
                     decoder = getattr(self.vae, "decoder", None)
                     if isinstance(decoder, DiffusionVideoDecoder):
-                        from musubi_tuner.ltx_2.tiling import DimensionSizeConfig, TileSizeConfig
+                        if tiled_vae_config.get("auto", False):
+                            tile_cfg = self.vae.recommended_tiling_config(
+                                height=config.height,
+                                width=config.width,
+                                num_frames=frame_count,
+                            )
+                            logger.info("Using DiffVAE AUTO_TILING: %s", tile_cfg)
+                        else:
+                            from musubi_tuner.ltx_2.tiling import DimensionSizeConfig, TileSizeConfig
 
-                        temporal_size = tiled_vae_config.get("temporal_tile_size", 0)
-                        temporal_overlap = tiled_vae_config.get("temporal_tile_overlap", 0) if temporal_size else 0
-                        tile_cfg = TileSizeConfig(
-                            frames=DimensionSizeConfig(tile_size=temporal_size, overlap=temporal_overlap),
-                            height=DimensionSizeConfig(
-                                tile_size=tiled_vae_config.get("tile_size", 512),
-                                overlap=tiled_vae_config.get("tile_overlap", 64),
-                            ),
-                            width=DimensionSizeConfig(
-                                tile_size=tiled_vae_config.get("tile_size", 512),
-                                overlap=tiled_vae_config.get("tile_overlap", 64),
-                            ),
-                        )
+                            temporal_size = tiled_vae_config.get("temporal_tile_size", 0)
+                            temporal_overlap = tiled_vae_config.get("temporal_tile_overlap", 0) if temporal_size else 0
+                            tile_cfg = TileSizeConfig(
+                                frames=DimensionSizeConfig(tile_size=temporal_size, overlap=temporal_overlap),
+                                height=DimensionSizeConfig(
+                                    tile_size=tiled_vae_config.get("tile_size", 512),
+                                    overlap=tiled_vae_config.get("tile_overlap", 64),
+                                ),
+                                width=DimensionSizeConfig(
+                                    tile_size=tiled_vae_config.get("tile_size", 512),
+                                    overlap=tiled_vae_config.get("tile_overlap", 64),
+                                ),
+                            )
                     else:
                         tile_cfg = TilingConfig(
                             spatial_config=SpatialTilingConfig(

@@ -4713,6 +4713,13 @@ class LTX2NetworkTrainer(LTX2SamplingMixin, NetworkTrainer):
                 video = torch.cat(chunks, dim=2)  # [B, C, T, H, W]
                 return video
 
+            def recommended_tiling_config(self, *, height: int, width: int, num_frames: int):
+                """Resolve the checkpoint-aware DiffVAE AUTO_TILING layout."""
+                recommended = getattr(self.decoder, "recommended_tiling_config", None)
+                if recommended is None:
+                    raise TypeError("This video VAE does not provide DiffVAE auto tiling")
+                return recommended(height=height, width=width, num_frames=num_frames)
+
         decoder = SingleGPUModelBuilder(
             model_path=str(vae_path),
             model_class_configurator=decoder_configurator,
